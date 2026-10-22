@@ -1,5 +1,6 @@
 //! IP › DNS › Zones (G4.1c): authoritative zones, BIND style, in WinBox
-//! windows. Opened from the Zones button of the DNS window.
+//! windows. The Zones button of the DNS window opens "DNS Zones" (found by
+//! its title).
 //!
 //! - **DNS Zones**: one row per zone (type, serial, records, status), New
 //!   and properties dialogs (SOA timers, who may transfer, NOTIFY targets,
@@ -577,11 +578,6 @@ fn open_window(app: &mut CoreRouterUi, win: &'static str) {
         app.floats.raise(crate::win_id(Win::Panel(win)));
     }
     app.cache.refreshed_at = None;
-}
-
-/// The DNS window's Zones button.
-pub(crate) fn open(app: &mut CoreRouterUi) {
-    open_window(app, WIN);
 }
 
 impl PanelState for ZonesPanel {

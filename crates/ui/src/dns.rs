@@ -2,9 +2,10 @@
 //!
 //! - **DNS** (Settings): servers, the LAN forwarder (Allow Remote Requests,
 //!   who may ask, per-client limit), upstream selection, serve-stale, cache
-//!   and limits, with Apply; buttons open Static, Cache and Zones
-//!   (`dns_zones.rs`). Statistics, Adlist and Forwarders are there greyed
-//!   out with the part that brings them.
+//!   and limits, with Apply; buttons open Static, Cache and Statistics
+//!   (`dns_statistics.rs`), and the windows of the later parts (Adlist…)
+//!   once their panel exists; the others are greyed out with the part
+//!   that brings them.
 //! - **DNS Static**: the static entries, with New/properties dialogs.
 //! - **DNS Cache**: what the cache holds, with hits, and Flush Cache.
 //!
@@ -36,9 +37,9 @@ const TYPES: [&str; 9] = [
 ];
 /// The buttons of parts still to come, with why they are greyed out.
 const LATER: [(&str, &str); 3] = [
-    ("Statistics", "Coming soon (G4.1e)"),
     ("Adlist", "Coming soon (G4.1d)"),
     ("Forwarders", "Coming soon (G4.1d)"),
+    ("Zones", "Coming soon (G4.1c)"),
 ];
 
 pub(crate) const PANEL: Panel = Panel {
@@ -653,17 +654,34 @@ impl DnsPanel {
         let dirty = self.form.set_params(&self.base).is_some();
         // WinBox: the buttons on top open the other windows.
         ui.horizontal_wrapped(|ui| {
-            for (label, win) in [("Static", WIN_STATIC), ("Cache", WIN_CACHE)] {
+            for (label, win) in [
+                ("Static", WIN_STATIC),
+                ("Cache", WIN_CACHE),
+                ("Statistics", crate::dns_statistics::WIN),
+            ] {
                 if ui.button(label).clicked() {
                     open_window(app, win);
                 }
             }
-            if ui.button("Zones").clicked() {
-                crate::dns_zones::open(app);
-            }
             for (label, why) in LATER {
-                ui.add_enabled(false, egui::Button::new(label))
-                    .on_disabled_hover_text(why);
+                // A part that landed has a window "DNS <label>" (its own
+                // panel): the button opens it.
+                let title = format!("DNS {label}");
+                let landed = crate::panel::all()
+                    .iter()
+                    .flat_map(|p| p.windows)
+                    .find(|w| w.title == title);
+                match landed {
+                    Some(w) => {
+                        if ui.button(label).clicked() {
+                            open_window(app, w.id);
+                        }
+                    }
+                    None => {
+                        ui.add_enabled(false, egui::Button::new(label))
+                            .on_disabled_hover_text(why);
+                    }
+                }
             }
         });
         ui.separator();

@@ -683,3 +683,22 @@ fn the_config_round_trips_and_transactions_work() {
         "{text}"
     );
 }
+
+#[test]
+fn dns_allowed_from_follows_the_pool() {
+    // G4.1e: a LAN numbered from a delegated prefix may ask the forwarder.
+    let mut l = Lab::new(Knobs::default());
+    l.add(json!({"interface": "ether1", "request": "prefix", "pool_name": "pd"}));
+    l.ok(
+        "ip.address.add",
+        json!({"address": "::1/64", "interface": "ether2", "from_pool": "pd"}),
+    );
+    l.ok(
+        "interface.list.member.add",
+        json!({"list": "LAN", "interface": "ether2"}),
+    );
+    let nets = |l: &mut Lab| l.ok("ip.dns.get", Value::Null)["allowed_networks"].clone();
+    assert_eq!(nets(&mut l), json!([]), "no prefix yet");
+    l.run(2_000);
+    assert_eq!(nets(&mut l), json!(["2001:db8:1:100::/64"]));
+}
