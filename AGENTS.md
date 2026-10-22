@@ -12,9 +12,36 @@ Este arquivo é idêntico a `CLAUDE.md` (`cargo xtask agents-sync` falha se dive
    item `aberto` de `docs/gaps.md` que não esteja `em andamento`.
 2. Se existir, leia `plan/STATUS.md` (pasta local, fora do git) e a tarefa em `plan/`.
 3. Leia `docs/architecture.md` antes de criar crate ou mexer em camadas.
-4. Ciclo por tarefa: orientar → planejar → implementar + testar → verificar → registrar → commit.
-   Pare e pergunte só para: licença, publicação, segredos, remotos novos, aplicar config em
-   kernel/hardware real.
+4. Ciclo por tarefa: orientar → **pesquisar** → planejar → implementar + testar → verificar →
+   registrar → commit. Pare e pergunte só para: licença, publicação, segredos, remotos novos,
+   aplicar config em kernel/hardware real.
+
+## Pesquisa antes de implementar (obrigatória em toda feature nova)
+
+Nenhuma feature nova começa pelo código. Antes de planejar:
+
+1. **MikroTik RouterOS v7 primeiro.** Leia a documentação oficial da versão estável mais recente
+   (help.mikrotik.com) sobre a feature, se existir: nomes de menus, parâmetros, padrões, flags,
+   comportamento em casos de borda e o que mudou nas versões 7.x. Ela é a referência de
+   comportamento e de nomes do CoreRouter (o usuário opera MikroTik).
+2. **Outros roteadores e projetos, para ideias.** Veja como pelo menos dois destes resolvem o mesmo
+   problema: VyOS, Juniper Junos, Cisco IOS-XE/NX-OS, Nokia SR Linux, Arista EOS, OPNsense/pfSense,
+   OpenWrt, FRR, Ubiquiti EdgeOS/UniFi e as RFCs/padrões envolvidos. Procure o que eles fazem
+   melhor que o MikroTik.
+3. **Proponha o que pode ser melhor.** Em cima da ideia principal: o que simplifica a operação, o
+   que evita erro do operador (lockout, conflito, regra inútil), diagnóstico, segurança por
+   padrão, e o que o nosso motor (tudo é comando, transações, Safe Mode, MCP) permite que os outros
+   não permitem. Separe "entra agora" de "vira gap depois".
+4. **Registre a pesquisa no corpo do PR**, seção `## Pesquisa`: links das fontes, como o MikroTik
+   faz, como os outros fazem, o que adotamos, as melhorias propostas e o que ficou de fora e por
+   quê. Feature grande (novo subsistema/protocolo) ganha também `docs/<feature>.md` com essa
+   seção.
+5. **Sem copiar.** Use a documentação para entender comportamento e nomes; escreva texto e código
+   próprios (o projeto é AGPL). Formatos proprietários sem especificação (MNDP, RoMON, WinBox)
+   não são clonados — veja a decisão do G5 em `docs/gaps.md`.
+
+Quando um humano pede uma feature, mostre a ele esse resumo (MikroTik, outros, melhorias
+propostas) **antes** de implementar e deixe-o escolher o escopo.
 
 ## Inegociáveis (cada um com o motivo e o que o impõe)
 
@@ -93,7 +120,8 @@ GitHub não impõe isso: esta regra impõe.
 2. Antes de cada commit: `cargo xtask ci`.
 3. Ao terminar: `git push -u origin <branch>` e
    `gh pr create --base main --title "<id>: <resumo>"`. O corpo do PR diz o que mudou, como
-   testar (comandos ou cliques) e o id da gap.
+   testar (comandos ou cliques), o id da gap e, em feature nova, a seção `## Pesquisa` (veja
+   "Pesquisa antes de implementar").
 4. O workflow `ci` (`.github/workflows/ci.yml`) roda no PR. Vermelho? Leia o log
    (`gh run view --log-failed`), corrija na mesma branch e faça push de novo.
 5. O merge é do usuário (**Squash and merge**: um commit por gap na `main`). Agente só faz merge
