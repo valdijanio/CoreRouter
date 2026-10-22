@@ -15,6 +15,6 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 ## Log e histórico
 
 O log do projeto (o que entrou, quando, e os números medidos) fica em `docs/log.md`; o histórico
-das mudanças na lista de gaps fica em `docs/gaps-history.md`. Os dois são **só de acrescentar** e
-estão marcados com `merge=union` no `.gitattributes`: o git junta as linhas de PRs paralelos
-sozinho, sem conflito.
+das mudanças na lista de gaps fica em `docs/gaps-history.md`. Os dois são gerados: cada PR grava
+`docs/changes/<id>.md` e a fila de entrada os consolida (`cargo xtask docs fold`) logo antes do
+merge, então PRs paralelos não conflitam neles.

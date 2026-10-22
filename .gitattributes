@@ -1,4 +1,0 @@
-# Append-only logs: git keeps the lines from both sides of a merge, so
-# parallel PRs never conflict here. Only ever add lines at the end.
-docs/log.md merge=union
-docs/gaps-history.md merge=union

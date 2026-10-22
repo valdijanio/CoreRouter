@@ -1,9 +1,9 @@
 # CoreRouter — log
 
-Só de acrescentar (`merge=union` no `.gitattributes`): cada PR adiciona sua entrada **no fim**, sem
-editar ou reordenar entradas antigas. Uma entrada = um item `- AAAA-MM-DD — <id>: …` (pode ter
-linhas de continuação indentadas). PRs paralelos se juntam sem conflito; a ordem entre entradas do
-mesmo dia pode variar.
+Gerado pela fila de entrada: cada PR grava `docs/changes/<id>.md` e `cargo xtask docs fold`
+acrescenta a entrada aqui, no fim, logo antes do merge (formato em `docs/changes/README.md`).
+**Não edite à mão.** Uma entrada = um item `- AAAA-MM-DD — <id>: …` (pode ter linhas de
+continuação indentadas).
 
 - 2026-10-21 — v0.1.0: workspace em 8 camadas, `Session::execute` com 14 comandos
   (interface, ip address, BGP instance, identity, config commit/rollback/diff/mode), guard de

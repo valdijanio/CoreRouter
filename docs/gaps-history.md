@@ -1,7 +1,7 @@
 # CoreRouter — histórico da lista de gaps
 
-Só de acrescentar (`merge=union` no `.gitattributes`): cada PR que adiciona, muda o status ou
-redefine um item de `docs/gaps.md` acrescenta **uma linha no fim**, sem editar linhas antigas.
+Gerado pela fila de entrada: a linha `history:` do `docs/changes/<id>.md` de cada PR entra aqui,
+no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.**
 
 - 2026-10-21 — lista inicial.
 - 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).

@@ -10,8 +10,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-  # pr-sync: depois de trazer a main para a branch de um PR (o push com GITHUB_TOKEN não dispara
-  # workflows), roda o ci nela; os checks exigidos saem no commit novo do PR.
+  # Rodar à mão numa branch (Actions → ci → Run workflow).
   workflow_dispatch:
 
 permissions:

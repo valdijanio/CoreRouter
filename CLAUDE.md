@@ -9,7 +9,7 @@ Este arquivo é idêntico a `CLAUDE.md` (`cargo xtask agents-sync` falha se dive
 ## Comece toda sessão aqui
 
 1. Leia `ROADMAP.md` e `docs/gaps.md` (lista ranqueada). Sem tarefa do usuário, pegue o primeiro
-   item `aberto` de `docs/gaps.md` que não esteja `em andamento`.
+   item `aberto` de `docs/gaps.md` (sessões em paralelo recebem o id no brief da sessão principal).
 2. Se existir, leia `plan/STATUS.md` (pasta local, fora do git) e a tarefa em `plan/`.
 3. Leia `docs/architecture.md` antes de criar crate ou mexer em camadas.
 4. Ciclo por tarefa: orientar → **pesquisar** → planejar → implementar + testar → verificar →
@@ -150,12 +150,12 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.
 
-## Integração: sempre por Pull Request
+## Integração: sempre por Pull Request, pela fila de entrada
 
-Nada entra na `main` sem PR com o CI verde. A proteção da `main` no GitHub impõe isso (PR
-obrigatório, os três checks do `ci`, vale para admin, sem force-push). Ela **não** exige que a
-branch esteja atualizada com a `main` (mais vazão); por isso o passo 3 traz a `main` antes do PR e
-a `main` vermelha tem prioridade (abaixo).
+Nada entra na `main` sem PR com o CI verde. A proteção da `main` no GitHub impõe isso: PR
+obrigatório, os três checks do `ci`, branch **atualizada** com a `main`, vale para admin, sem
+force-push. Quem faz o merge é a **fila de entrada** da sessão principal, com a aprovação do
+usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
 
 1. Trabalhe numa branch `stream/<id>-<slug>`, nunca na `main`. Nunca faça commit nem push na `main`.
 2. Antes de cada commit: `cargo xtask ci`.
@@ -166,26 +166,28 @@ a `main` vermelha tem prioridade (abaixo).
    "Pesquisa antes de implementar").
 4. O workflow `ci` (`.github/workflows/ci.yml`) roda no PR. Vermelho? Leia o log
    (`gh run view --log-failed`), corrija na mesma branch e faça push de novo.
-5. Merge por **Squash and merge** (um commit por gap na `main`). O usuário aprovou mesclar quando
-   o CI passar: ligue `gh pr merge <n> --auto --squash`; se a checagem de permissão bloquear,
-   avise no relato (a sessão principal liga). Nunca faça merge direto de PR com CI pendente.
-6. Depois do merge, apague a branch local e a remota.
+5. Com o CI verde, **pare** e diga no relato "pronto para a fila: #<n>". Não ligue
+   `gh pr merge --auto` nem faça merge.
 
-### PR em conflito depois de aberto (`pr-sync`)
+### Fila de entrada (sessão principal)
 
-O GitHub ignora o `merge=union` do `.gitattributes`: todo PR aberto vira CONFLICTING quando outro
-acrescenta ao `docs/log.md` ou `docs/gaps-history.md`, e o auto-merge para. O workflow `pr-sync`
-(`.github/workflows/pr-sync.yml`, `scripts/pr-sync.sh`) roda a cada push na `main` e, nos PRs com
-auto-merge que o GitHub marca CONFLICTING, faz o merge de verdade da `main` (com o union):
+Quando há PRs prontos, a sessão principal pergunta ao usuário **uma vez por lote** ("N features
+prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh <pr>...`. Para cada PR, em
+ordem: traz a `main` para a branch, roda `cargo xtask docs fold` (consolida os arquivos de
+`docs/changes/`), envia, espera os checks exigidos do commit novo e faz o squash merge
+(`--match-head-commit`). Como a branch tem de estar atualizada, o CI de cada PR roda sobre a
+`main` em que ele vai entrar: o "sozinho passa, junto quebra" para no PR, não na `main`.
 
-- **limpo** (o caso comum: só os arquivos de acréscimo): commit de merge do `github-actions[bot]`
-  na branch e o `ci` disparado nela; o auto-merge segue sozinho;
-- **conflito real**: nada é enviado; o PR ganha um comentário com os arquivos e o rótulo
-  `conflito`. Quem vê o rótulo (a sessão dona do PR, senão a principal) resolve:
-  `git fetch origin && git merge origin/main`, `cargo xtask ci`, push.
+A fila para no primeiro problema e diz qual PR e por quê:
 
-A branch pode receber esse commit do bot: antes de enviar mais trabalho num PR aberto, faça
-`git pull` (merge) da própria branch. Nunca force-push.
+- **conflito real com a `main`**: a sessão dona resolve na branch (`git merge origin/main`,
+  `cargo xtask ci`, push) e o PR volta para a próxima rodada;
+- **CI vermelho depois do merge da `main`**: idem; a quebra é de integração, quem conhece o código
+  corrige;
+- **`docs/changes` inválido**: corrija o arquivo (`cargo xtask docs` diz o que está errado).
+
+A fila envia commits na branch do PR (merge da `main`, fold). Antes de enviar mais trabalho num
+PR aberto, faça `git pull` (merge) da própria branch. Nunca force-push.
 
 ### `main` vermelha é prioridade zero
 
@@ -214,12 +216,11 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 - Edite só os crates da sua tarefa (a coluna "crates" de `docs/gaps.md`). Precisa mexer em
   `crates/model` ou `crates/engine/src/session.rs`? São compartilhados: mudanças pequenas,
   aditivas, e avise no PR.
-- Marque o item como `em andamento (<branch>)` em `docs/gaps.md` no primeiro commit.
 - Branch: `stream/<id-da-gap>-<slug>`, ex. `stream/G1.2-netlink-addresses`.
 - **Ids de gap vêm do brief ou da `main`.** Nunca invente um id: confira `docs/gaps.md` na
   `origin/main` atualizada antes de registrar um item novo (já houve colisão de G1.20).
-- **Não abra outras sessões por conta própria.** Trabalho extra que você descobrir vira um item em
-  `docs/gaps.md` e uma sugestão no seu relato; quem decide abrir sessão é o usuário ou a sessão
+- **Não abra outras sessões por conta própria.** Trabalho extra que você descobrir vira uma gap
+  nova no seu `docs/changes/<id>.md` e uma sugestão no seu relato; quem decide abrir sessão é o usuário ou a sessão
   principal (sessões não planejadas mexem nos mesmos arquivos e geram conflito).
 - **PRs pequenos e focados**: entram mais rápido e reduzem a janela de conflito. Feature grande
   vira vários PRs sequenciais, um por sessão.
@@ -240,17 +241,19 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 
 ## Progresso
 
-- Ao terminar, no mesmo PR:
-  - atualize **só a linha do seu item** em `docs/gaps.md` (status, critério) — nunca reescreva
-    linhas de outros itens;
-  - acrescente **no fim** de `docs/log.md` uma entrada `- AAAA-MM-DD — <id>: …` (o que entrou,
-    como testar, números medidos);
-  - acrescente **no fim** de `docs/gaps-history.md` uma linha se você criou, redefiniu ou mudou o
-    status de um item;
-  - se a arquitetura mudou, atualize `docs/architecture.md`.
-- `docs/log.md` e `docs/gaps-history.md` são **só de acrescentar** e usam `merge=union`
-  (`.gitattributes`): o git junta as entradas de PRs paralelos sem conflito. Por isso, só
-  acrescente no fim; nunca edite, reordene ou apague entradas antigas.
+- Ao terminar, no mesmo PR, grave **um arquivo só seu**: `docs/changes/<id>.md` (ou
+  `<id>-<slug>.md` se a gap tiver mais de um PR). Formato em `docs/changes/README.md`:
+  - `status:` o texto novo da coluna Status da sua linha em `docs/gaps.md`;
+  - `history:` uma linha para `docs/gaps-history.md`, se você criou, redefiniu ou mudou o status
+    de um item;
+  - o corpo é a entrada de `docs/log.md`: o que entrou, como testar, números (**medido** ou
+    **estimado**);
+  - linhas de tabela `| G… |` no corpo são gaps novas (id conferido na `origin/main`).
+- **Não edite** `docs/log.md`, `docs/gaps-history.md` nem a coluna Status de `docs/gaps.md`: a
+  fila de entrada consolida os arquivos de `docs/changes/` (`cargo xtask docs fold`) um PR por
+  vez, logo antes do merge, e nada conflita. `cargo xtask ci` confere o formato (passo `docs`).
+- Mudou o critério ou o texto de um item de `docs/gaps.md`, ou a arquitetura? Edite
+  `docs/gaps.md` (só a linha do item) ou `docs/architecture.md` direto; são mudanças raras.
 - Não crie seções de "histórico de revisão" no fim de outros documentos (geram conflito entre PRs
   paralelos); o histórico do projeto é o `docs/log.md`.
 - Notas e estimativas erram para baixo; marque cada número como **medido** ou **estimado**.
