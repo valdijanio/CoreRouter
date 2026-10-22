@@ -9,14 +9,16 @@
 //! 1. remove addresses that go away, or whose link is disabled, recreated or
 //!    changes master (Linux drops IPv6 addresses of a link that goes down or
 //!    joins a VRF);
-//! 2. detach bridge ports / VRF members that leave (or change) their master;
+//! 2. detach bridge ports / bond slaves / VRF members that leave (or change)
+//!    their master;
 //! 3. delete virtual links, VLAN children before their parents;
 //! 4. create virtual links, parents before VLAN children;
 //! 5. MTU: decreases children-first, then increases parents-first, so a VLAN
 //!    never exceeds its parent on the way (nor on the way back, in rollback);
-//! 6. attach bridge ports / VRF members;
+//! 6. attach bridge ports / bond slaves / VRF members;
 //! 7. add addresses;
-//! 8. admin state up/down, parents first;
+//! 8. admin state up/down, parents first (also of links whose master changed:
+//!    a bond brings a slave up when it takes it, and leaves it down after);
 //! 9. add static routes that arrive (or whose link was rebuilt).
 //!
 //! The kernel deletes routes by itself when their link goes down, is
@@ -38,7 +40,7 @@ use std::net::IpAddr;
 
 use corerouter_hal::HalError;
 use corerouter_model::route::{self, Reach};
-use corerouter_model::{Config, IfName, InterfaceKind};
+use corerouter_model::{BondMode, Config, HashPolicy, IfName, InterfaceKind, LacpRate};
 use ipnet::IpNet;
 
 /// A link CoreRouter creates and deletes itself.
@@ -56,6 +58,17 @@ pub enum LinkSpec {
     Vrf {
         table: u32,
     },
+    /// Linux `bond`. Every setting is part of the spec: changing one
+    /// recreates the bond (the kernel refuses a mode change while it has
+    /// slaves or is up), with its slaves released first and taken back after.
+    Bond {
+        mode: BondMode,
+        primary: Option<IfName>,
+        hash: HashPolicy,
+        lacp_rate: LacpRate,
+        mii_interval_ms: u32,
+        min_links: u32,
+    },
 }
 
 impl LinkSpec {
@@ -70,6 +83,21 @@ impl LinkSpec {
             InterfaceKind::Bridge => Some(Self::Bridge),
             InterfaceKind::Loopback => Some(Self::Dummy),
             InterfaceKind::Vrf { table } => Some(Self::Vrf { table: *table }),
+            InterfaceKind::Bonding {
+                mode,
+                primary,
+                transmit_hash_policy,
+                lacp_rate,
+                mii_interval_ms,
+                min_links,
+            } => Some(Self::Bond {
+                mode: *mode,
+                primary: primary.clone(),
+                hash: *transmit_hash_policy,
+                lacp_rate: *lacp_rate,
+                mii_interval_ms: *mii_interval_ms,
+                min_links: *min_links,
+            }),
         }
     }
 
@@ -80,6 +108,7 @@ impl LinkSpec {
             Self::Bridge => "bridge",
             Self::Dummy => "dummy",
             Self::Vrf { .. } => "vrf",
+            Self::Bond { .. } => "bond",
         }
     }
 }
@@ -91,6 +120,7 @@ impl fmt::Display for LinkSpec {
             Self::Bridge => f.write_str("bridge"),
             Self::Dummy => f.write_str("loopback (dummy)"),
             Self::Vrf { table } => write!(f, "vrf (table {table})"),
+            Self::Bond { mode, .. } => write!(f, "bonding ({mode})"),
         }
     }
 }
@@ -176,7 +206,7 @@ impl fmt::Display for Op {
         match self {
             Self::DelAddress { link, addr } => write!(f, "remove address {addr} from '{link}'"),
             Self::SetMaster { link, master: None } => {
-                write!(f, "detach '{link}' from its bridge/VRF")
+                write!(f, "detach '{link}' from its bridge/bond/VRF")
             }
             Self::SetMaster {
                 link,
@@ -229,10 +259,10 @@ fn active_addresses(cfg: &Config) -> BTreeSet<(IfName, IpNet)> {
         .collect()
 }
 
-/// Kernel master of `name` (`IFLA_MASTER`): its bridge or its VRF.
+/// Kernel master of `name` (`IFLA_MASTER`): its bridge, bond or VRF.
 fn master<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a IfName> {
     let i = cfg.interfaces.get(name)?;
-    i.bridge.as_ref().or(i.vrf.as_ref())
+    i.bridge.as_ref().or(i.bond.as_ref()).or(i.vrf.as_ref())
 }
 
 /// Static routes of `cfg` that belong in the kernel: the usable ones.
@@ -359,6 +389,7 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     }
 
     // 2. Ports and members that leave (or change) their bridge or VRF.
+    let mut detached = BTreeSet::new();
     for old in from.interfaces.values() {
         let stays = kept(&old.name)
             && to.interfaces.contains_key(&old.name)
@@ -368,6 +399,9 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
                 link: old.name.clone(),
                 master: None,
             });
+            if old.bond.is_some() {
+                detached.insert(&old.name);
+            }
         }
     }
 
@@ -425,6 +459,7 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     }
 
     // 6. Ports and members that join (or change) their bridge or VRF.
+    let mut attached = BTreeSet::new();
     for new in to.interfaces.values() {
         let Some(m) = master(to, &new.name) else {
             continue;
@@ -434,6 +469,9 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
                 link: new.name.clone(),
                 master: Some(m.clone()),
             });
+            if new.bond.is_some() {
+                attached.insert(&new.name);
+            }
         }
     }
 
@@ -450,12 +488,16 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         }
     }
 
-    // 8. Admin state, parents first.
+    // 8. Admin state, parents first. A bond brings a slave up when it takes
+    //    it and leaves it down when it lets it go, so a link that joined or
+    //    left a bond gets its state again.
     let mut states: Vec<(usize, &IfName, bool)> = to
         .interfaces
         .values()
         .filter(|new| {
             fresh.contains(&new.name)
+                || attached.contains(&new.name)
+                || detached.contains(&new.name)
                 || from
                     .interfaces
                     .get(&new.name)
@@ -889,6 +931,109 @@ mod tests {
                 },
             ]
         );
+    }
+
+    fn bond(mode: BondMode) -> InterfaceKind {
+        InterfaceKind::Bonding {
+            mode,
+            primary: None,
+            transmit_hash_policy: HashPolicy::Layer2,
+            lacp_rate: LacpRate::Slow,
+            mii_interval_ms: 100,
+            min_links: 0,
+        }
+    }
+
+    #[test]
+    fn bond_is_created_then_slaves_join_then_state_is_set() {
+        let from = base();
+        let mut to = from.clone();
+        add(&mut to, "bond1", bond(BondMode::Lacp));
+        to.interfaces.get_mut(&n("ether1")).unwrap().bond = Some(n("bond1"));
+        to.interfaces.get_mut(&n("ether2")).unwrap().bond = Some(n("bond1"));
+        to.interfaces.get_mut(&n("ether2")).unwrap().disabled = true;
+        addr(&mut to, "bond1", "10.0.0.1/30");
+        let ops = plan(&from, &to).unwrap();
+        let at = |op: &Op| ops.iter().position(|o| o == op).unwrap();
+        let create = at(&Op::CreateLink {
+            link: n("bond1"),
+            spec: LinkSpec::of(&bond(BondMode::Lacp)).unwrap(),
+        });
+        let join = at(&Op::SetMaster {
+            link: n("ether1"),
+            master: Some(n("bond1")),
+        });
+        // The kernel opens a slave it takes: a disabled one goes down again.
+        let down = at(&Op::SetUp {
+            link: n("ether2"),
+            up: false,
+        });
+        let up1 = at(&Op::SetUp {
+            link: n("ether1"),
+            up: true,
+        });
+        assert!(create < join && join < down && join < up1, "{ops:?}");
+        assert!(ops.contains(&Op::AddAddress {
+            link: n("bond1"),
+            addr: "10.0.0.1/30".parse().unwrap()
+        }));
+    }
+
+    #[test]
+    fn changing_a_bond_setting_recreates_it_and_rejoins_its_slaves() {
+        let mut from = base();
+        add(&mut from, "bond1", bond(BondMode::Lacp));
+        from.interfaces.get_mut(&n("ether1")).unwrap().bond = Some(n("bond1"));
+        let mut to = from.clone();
+        to.interfaces.get_mut(&n("bond1")).unwrap().kind = bond(BondMode::ActiveBackup);
+        let ops = plan(&from, &to).unwrap();
+        let at = |op: &Op| ops.iter().position(|o| o == op).unwrap();
+        let leave = at(&Op::SetMaster {
+            link: n("ether1"),
+            master: None,
+        });
+        let del = at(&Op::DeleteLink {
+            link: n("bond1"),
+            spec: LinkSpec::of(&bond(BondMode::Lacp)).unwrap(),
+        });
+        let create = at(&Op::CreateLink {
+            link: n("bond1"),
+            spec: LinkSpec::of(&bond(BondMode::ActiveBackup)).unwrap(),
+        });
+        let join = at(&Op::SetMaster {
+            link: n("ether1"),
+            master: Some(n("bond1")),
+        });
+        let up = at(&Op::SetUp {
+            link: n("ether1"),
+            up: true,
+        });
+        assert!(
+            leave < del && del < create && create < join && join < up,
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn removing_a_bond_releases_its_slaves_and_brings_them_back_up() {
+        let mut from = base();
+        add(&mut from, "bond1", bond(BondMode::ActiveBackup));
+        from.interfaces.get_mut(&n("ether1")).unwrap().bond = Some(n("bond1"));
+        let mut to = from.clone();
+        to.interfaces.remove(&n("bond1"));
+        to.interfaces.get_mut(&n("ether1")).unwrap().bond = None;
+        let ops = plan(&from, &to).unwrap();
+        assert_eq!(
+            ops.first(),
+            Some(&Op::SetMaster {
+                link: n("ether1"),
+                master: None
+            })
+        );
+        assert!(ops.contains(&Op::SetUp {
+            link: n("ether1"),
+            up: true
+        }));
     }
 
     #[test]

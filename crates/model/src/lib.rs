@@ -4,6 +4,7 @@
 //! candidate/running store with commit history. No I/O, no clock, no UI, so it
 //! compiles everywhere (including `wasm32-unknown-unknown`).
 
+pub mod bonding;
 pub mod config;
 pub mod dhcp_client;
 pub mod firewall;
@@ -17,6 +18,7 @@ pub mod types;
 pub mod users;
 pub mod validate;
 
+pub use bonding::{BondMode, HashPolicy, LacpRate};
 pub use config::{
     AddressEntry, BgpInstance, Config, DEFAULT_DISTANCE, EthernetSettings, FlowControl, Interface,
     InterfaceKind, Ip, RouteEntry, Routing, System,

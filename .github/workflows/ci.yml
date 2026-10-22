@@ -39,6 +39,8 @@ jobs:
       # G1.14: o teste de VRF em netns falha em vez de pular (e o passo netns
       # do xtask também) se o módulo `vrf` não estiver carregado.
       COREROUTER_REQUIRE_VRF: "1"
+      # G1.8: idem para o teste de bonding em netns (módulo `bonding`).
+      COREROUTER_REQUIRE_BOND: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -95,6 +97,12 @@ jobs:
             fi
           fi
           lsmod | grep -w '^vrf'
+
+      # G1.8: o `bonding` vem no linux-modules base; um user namespace também não o carrega.
+      - name: Carregar o módulo bonding
+        run: |
+          sudo modprobe bonding
+          lsmod | grep -w '^bonding'
 
       - name: cargo xtask ci
         run: cargo xtask ci
