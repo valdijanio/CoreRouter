@@ -456,8 +456,8 @@ enum Button {
 }
 
 enum Applied {
-    Zone(ZoneForm),
-    Record(RecordForm),
+    Zone(Box<ZoneForm>),
+    Record(Box<RecordForm>),
 }
 
 enum Reply {
@@ -1234,7 +1234,7 @@ impl ZonesPanel {
                 Some(p) => (
                     "ip.dns.zone.set",
                     p,
-                    Some(Applied::Zone((**form).clone())),
+                    Some(Applied::Zone(form.clone())),
                     b == Press::Ok,
                 ),
                 None => return b != Press::Ok,
@@ -1243,7 +1243,7 @@ impl ZonesPanel {
                 Some(p) => (
                     "ip.dns.zone.record.set",
                     p,
-                    Some(Applied::Record((**form).clone())),
+                    Some(Applied::Record(form.clone())),
                     b == Press::Ok,
                 ),
                 None => return b != Press::Ok,
@@ -1275,8 +1275,8 @@ impl ZonesPanel {
                 let close = d.status.replied(result);
                 if result.is_ok() {
                     match (applied, &mut d.dialog) {
-                        (Some(Applied::Zone(sent)), Dialog::Zone { base, .. }) => **base = sent,
-                        (Some(Applied::Record(sent)), Dialog::Record { base, .. }) => **base = sent,
+                        (Some(Applied::Zone(sent)), Dialog::Zone { base, .. }) => *base = sent,
+                        (Some(Applied::Record(sent)), Dialog::Record { base, .. }) => *base = sent,
                         _ => {}
                     }
                 }

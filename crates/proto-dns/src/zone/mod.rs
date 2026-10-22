@@ -264,7 +264,7 @@ impl ZoneData {
     /// Every record besides the SOA, the apex first, then by owner.
     pub fn records(&self) -> Vec<&Record> {
         let mut owners: Vec<&String> = self.sets.keys().collect();
-        owners.sort_by_key(|k| {
+        owners.sort_by_cached_key(|k| {
             (
                 k.as_str() != self.key,
                 k.split('.').rev().collect::<Vec<_>>(),
@@ -538,21 +538,20 @@ fn serial_of(soa: &Record) -> u32 {
 /// included: a new TTL is a removal and an addition).
 pub fn diff(old: &ZoneData, new: &ZoneData) -> Diff {
     let wire = |r: &Record| r.to_bytes().unwrap_or_default();
-    let before: HashSet<Vec<u8>> = old.records().into_iter().map(wire).collect();
-    let after: HashSet<Vec<u8>> = new.records().into_iter().map(wire).collect();
+    let (before, after) = (old.records(), new.records());
+    let had: HashSet<Vec<u8>> = before.iter().map(|r| wire(r)).collect();
+    let has: HashSet<Vec<u8>> = after.iter().map(|r| wire(r)).collect();
     Diff {
         from: old.soa.clone(),
         to: new.soa.clone(),
-        removed: old
-            .records()
+        removed: before
             .into_iter()
-            .filter(|r| !after.contains(&wire(r)))
+            .filter(|r| !has.contains(&wire(r)))
             .cloned()
             .collect(),
-        added: new
-            .records()
+        added: after
             .into_iter()
-            .filter(|r| !before.contains(&wire(r)))
+            .filter(|r| !had.contains(&wire(r)))
             .cloned()
             .collect(),
     }

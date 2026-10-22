@@ -541,3 +541,245 @@ expulsa as respostas do cache) num conjunto compacto medido; formatos de domíni
 além de hosts; `state`, `error`, `skipped` e "carregou há" por lista, para o operador saber por que
 uma lista não bloqueia; um download falho mantém os nomes anteriores; teto de nomes somando as
 listas, com aviso.
+
+## G4.1c — Zonas
+
+**Problema.** O RouterOS só tem `/ip dns static`: nomes soltos, sem SOA, sem delegação, sem
+transferência. Um ISP precisa servir as próprias zonas (a reversa dos blocos, a zona dos
+equipamentos, a da LAN de um cliente corporativo) e mantê-las em sincronia com outros servidores.
+Hoje isso exige um BIND ao lado do roteador, com uma config paralela e outro ponto de falha.
+
+**Agora (G4.1c-1).** Zonas autoritativas no próprio roteador, na mesma cadeia do encaminhador, por
+comandos e transações:
+
+```sh
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.set '{"allow_remote_requests":true}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.add '{"name":"example.com","allow_transfer":"192.0.2.0/24","notify":"192.0.2.2"}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.record.add '{"zone":"example.com","name":"www","address":"192.0.2.80"}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.record.add '{"zone":"example.com","type":"MX","target":"mail.example.com","priority":10}'
+dig @192.168.88.1 www.example.com             # flag aa
+dig +tcp @192.168.88.1 example.com AXFR       # de 192.0.2.0/24
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.add '{"name":"partner.example","type":"secondary","primaries":"192.0.2.53"}'
+```
+
+No terminal: `/ip dns zone add name=example.com`, `/ip dns zone record add zone=example.com
+name=www address=192.0.2.80`, `/ip dns zone print`, `/export` e `/import` levam as zonas e os
+registros. Na GUI, o botão Zones da janela IP › DNS abre **DNS Zones** (uma linha por zona: tipo,
+serial, registros, estado), e daí **DNS Zone Records** e **DNS Zone File** (o arquivo de zona para
+ler, copiar, editar e carregar de volta).
+
+| Comando | Parâmetros |
+|---|---|
+| `ip.dns.zone.add/set` | `name`, `type` (`primary` padrão, `secondary`), `primary_ns` (MNAME, padrão `ns1.<zona>`), `admin` (RNAME: `noc@example.com` ou `noc.example.com`; padrão `hostmaster.<zona>`), `serial`, `serial_policy` (`date` padrão, `increment`, `unixtime`), `refresh_secs` 86400, `retry_secs` 7200, `expire_secs` 3600000, `minimum_secs` 3600 (TTL negativo), `ttl_secs` 3600 (padrão dos registros), `allow_transfer` (prefixos; vazio = ninguém), `notify` (endereços), `primaries` (secundária), `disabled`, `comment`. `set` aceita `id` ou o nome da zona |
+| `ip.dns.zone.remove` | `id` ou nome; leva os registros junto |
+| `ip.dns.zone.print` | a config + `records`, `status` (`running`, `loaded`, `not-loaded`, `disabled`, `config-only` sem daemon), `loaded_serial`, `refreshed_unix`, `next_refresh_unix`, `error` |
+| `ip.dns.zone.record.add/set/remove/print` | `zone`, `name` (relativo: `@`, `www`, `*.dev`, `_sip._udp`; ou absoluto com ponto final), `type` (A, AAAA, CAA, CNAME, MX, NS, PTR, SRV, TXT), `address`, `target` (nome completo; `@` = a zona), `priority` (MX, SRV), `weight`, `port`, `text` (TXT; valor do CAA), `caa_flags`, `caa_tag`, `ttl_secs` (vazio = o da zona), `disabled`, `comment` |
+| `ip.dns.zone.file.get` | `zone` → `text`: o arquivo de zona do que a zona serve (a secundária: a cópia transferida) |
+| `ip.dns.zone.file.load` | `zone`, `text`: troca os registros da zona primária pelos do arquivo; SOA, `$TTL` e timers vêm dele |
+| `ip.dns.zone.refresh` | `zone` (secundária): pergunta aos primários agora |
+
+**O serial anda sozinho.** Todo comando que muda uma zona primária põe nela o próximo serial
+depois do que está **em execução** (`serial_policy`), então todas as mudanças de uma transação
+dividem um serial só, e o serial nunca volta (RFC 1982). `date` (o padrão, como o `DEFAULT` do
+PowerDNS) é `AAAAMMDDnn`; passou de 99 mudanças num dia, invade o dia seguinte, ainda maior. Um
+serial dado à mão, ou vindo de um `/export`, maior que o próximo, fica.
+
+**A busca** (`crates/proto-dns/src/zone/`, etapa `zones`, ordem 50): a zona mais próxima que
+contém o nome responde, pela RFC 1034 §4.3.2.
+
+- Registros do tipo pedido, com AA; para NS, MX e SRV, os endereços dos alvos dentro da zona vão
+  na seção adicional.
+- CNAME: respondido, e o alvo procurado de novo nas nossas zonas; fora delas, segue pela cadeia
+  (cache, upstream), com o CNAME na frente.
+- Nome que existe sem o tipo: NODATA; nome que não existe: NXDOMAIN. Os dois levam o SOA na
+  autoridade, com TTL = min(TTL, MINIMUM) (RFC 2308 §3).
+- Curinga: só quando o nome não existe, a partir do encontro mais próximo (RFC 4592 §3.3.1). O
+  dono da resposta é o nome perguntado. Um não terminal vazio existe e bloqueia o curinga.
+- NS abaixo do ápice é delegação. Sem RD, a resposta é uma referência sem AA, com glue. Com RD, a
+  pergunta vai às glue, como uma estática FWD (nós encaminhamos, não iteramos).
+- Zona primária sem NS no ápice: o MNAME faz as vezes de NS.
+- Secundária ainda não carregada, ou expirada: SERVFAIL.
+
+**Transferências e NOTIFY** são atendidos antes da cadeia (`zone::xfr::intercept`, chamado pelo
+`service/dns_server.rs`), com as ACLs próprias de cada zona, não o `allowed_from`. Assim, uma
+secundária em outro lugar transfere, e um cliente da LAN não.
+
+- **AXFR** (RFC 5936): só por TCP, para quem está em `allow_transfer`, que vem vazio (RFC 5936
+  §5; o BIND passou a negar por padrão na 9.20). Zona alheia: NOTAUTH; ACL: REFUSED. A resposta
+  vem em mensagens de ~16 KB, com o SOA no começo e no fim, a pergunta só na primeira e AA.
+- **IXFR** (RFC 1995): um diário em memória guarda as mudanças de cada zona (até 64, ou duas
+  vezes o tamanho da zona). Quem já tem o serial atual recebe só o SOA. Quem pede de um serial que
+  o diário não alcança recebe a zona inteira no formato AXFR (§4). Por UDP, a resposta só vai se
+  couber; senão vai o SOA, e o cliente refaz por TCP (§2).
+- **NOTIFY recebido** (RFC 1996): só de um dos `primaries` da secundária (§3.10; outro: REFUSED).
+  A resposta vem com AA (§4.7), e a secundária confere o SOA na hora (§3.11).
+- **NOTIFY enviado:** a cada serial novo de uma primária, cada endereço de `notify` é avisado por
+  UDP. Até 5 retransmissões (§3.6), com intervalo de 2, 4, 8, 16 e 32 s (a RFC sugere 60 s e
+  permite backoff). NOTIMP ou outro erro encerra (§3.12). O erro aparece no `error` da zona.
+- **Secundária** (serviço `dns zones` do daemon, `service/dns_zones.rs`): pede o SOA aos primários
+  a cada REFRESH (RETRY depois de uma falha, e na hora com NOTIFY ou `ip.dns.zone.refresh`). Serial
+  maior traz um IXFR, ou AXFR sem cópia ou se o IXFR falhar. Os timers vêm do SOA carregado,
+  limitados como no BIND (refresh de 300 s a 4 semanas, retry de 60 s a 2 semanas). Sem refresh
+  por EXPIRE, a cópia sai do ar. Uma transferência que falha mantém a cópia anterior (RFC 5936 §6).
+
+**Arquivo de zona** (RFC 1035 §5, `zone/file.rs`): `$ORIGIN`, `$TTL`, `@`, dono herdado da linha
+de cima, nomes relativos e absolutos, TTL e classe em qualquer ordem (TTL com unidades do BIND:
+`1h30m`), parênteses, comentários e strings com `\"`, `\\`, `\X` e `\DDD`. Tipos: os dez acima.
+Outro tipo é recusado com a linha, e `$INCLUDE` também: um texto importado nunca lê arquivo do
+roteador. O parser é nosso. O do `hickory-proto` 0.26.3 decodifica `\DDD` errado e o `$INCLUDE`
+dele lê qualquer caminho. Entrada hostil: até 8 MiB, tokens de 4 KiB, 50 000 registros, proptest
+com bytes e texto hostis. A ida e volta TXT export → import está em proptest.
+
+**Regras de RFC no código:**
+
+| Regra | Onde |
+|---|---|
+| RFC 1034 §4.3.2: delegação, nome exato, CNAME, curinga, seção adicional | `ZoneData::lookup` |
+| RFC 1034 §3.6.2 e RFC 2181 §10.1: CNAME não divide o nome, nem no ápice | `DnsZones::problem` |
+| RFC 2181 §5: registro repetido é recusado | `DnsZones::problem` |
+| RFC 2181 §8: TTL até 2^31−1 | `Zone::problem`, `ZoneRecord::problem`, `file::parse_ttl` |
+| RFC 2308 §3/§4: NXDOMAIN e NODATA com o SOA, TTL = min(TTL, MINIMUM) | `ZoneData::negative_soa` |
+| RFC 4592 §2.2.2/§3.3.1/§3.3.3: curinga do encontro mais próximo, não terminal vazio, dono = pergunta | `ZoneData::lookup` |
+| RFC 4035 §3.1.4.1: DS no corte fica com o pai | `ZoneData::lookup` |
+| RFC 1982 §3.1/§3.2: serial sempre maior, passo < 2^31 | `next_serial`, `serial_gt` |
+| RFC 1912 §2.2: retry ≤ refresh, expire ≥ refresh + retry | `Zone::problem` |
+| RFC 1035 §5: arquivo de zona | `zone/file.rs` |
+| RFC 1035 §3.3.14: TXT em strings de até 255 bytes | `zone::chunks` |
+| RFC 8659 §4.1: CAA com tag de letras e dígitos | `ZoneRecord::problem`, `zone::caa` |
+| RFC 5936 §2.2, §2.2.1, §4.2, §5, §6: formato, AA, NOTAUTH, só TCP, ACL, cópia mantida | `zone/xfr.rs`, `service/dns_zones.rs` |
+| RFC 1995 §2, §3, §4: IXFR, SOA do cliente, volta para AXFR, UDP só se couber | `xfr::serve`, `Transfer` |
+| RFC 1996 §3.6, §3.7, §3.10–§3.12, §4.7 | `xfr::notify_*`, `service/dns_zones.rs` |
+| RFC 1034 §4.3.5: secundária expira sem refresh | `service/dns_zones.rs` |
+
+**Testes.** Modelo: validação (CNAME, duplicados, timers, nomes, CAA, secundária), serial (datas,
+RFC 1982, volta do contador). `proto-dns`: busca (resposta, NODATA, NXDOMAIN, CNAME, curinga, não
+terminal vazio, delegação com glue, DS, NS do MNAME), a cadeia de ponta a ponta com AA, referência
+e encaminhamento às glue, secundária não carregada, AXFR (ACL, UDP, NOTAUTH, várias mensagens),
+IXFR (diário, cliente aplicando, em dia, serial desconhecido, UDP), NOTIFY (aceito, recusado),
+arquivo de zona (BIND, linhas com erro, unidades, `\DDD`) e proptests (texto e bytes hostis,
+pacotes danificados, ida e volta de TXT). Engine: comandos (sucesso, validação, rollback, um
+serial por transação). Shell: `/export` → `/import`. Daemon: dois daemons em loopback, primário e
+secundário (AXFR inicial, mudança → NOTIFY → IXFR, estado no `print`, saída da config). Namespace
+(`tests/netns_dns_zones.rs`): porta 53 de verdade, AA, NXDOMAIN com SOA, AXFR e IXFR pelo nosso
+cliente e pelo `dig` (quando instalado), REFUSED para quem está fora, arquivo carregado por
+comando. GUI: janelas e diálogos headless e screenshot nos temas claro e escuro.
+
+**Desempenho (medido, `benches/zones.rs`).** Uma resposta de uma zona de 1000 registros custa
+1,04 µs, o mesmo que um acerto de cache. Um NXDOMAIN com SOA custa 1,44 µs. Sem zonas, a etapa
+não custa nada. Com 100 zonas configuradas, um nome de fora paga +0,3 µs (o detalhe está no
+`docs/changes`).
+
+**Por que a busca é nossa e não do `hickory-server`.** O `hickory-server` 0.26.3 não tem IXFR,
+NOTIFY (enviado ou recebido), zona secundária nem ACL de IP para AXFR (só "todos", "ninguém" ou
+TSIG). A busca dele é async (tokio). A cadeia é síncrona e compila em wasm. Por isso, nesta parte,
+o Hickory entra pelo `hickory-proto` (mensagens, registros, codec), e a busca, as transferências e
+o arquivo de zona são nossos (`docs/architecture.md`, "DNS"). O `hickory-server` volta na
+assinatura DNSSEC (G4.1c-2), onde o `InMemoryZoneHandler::secure_zone_mut` (síncrono) monta
+NSEC3 e RRSIG.
+
+**Limites e o que fica para depois.**
+
+- As zonas são servidas pelo mesmo servidor da LAN: só com `allow_remote_requests`, e as
+  consultas só para quem está em `allowed_from`. Transferência e NOTIFY têm ACL própria. Modo só
+  autoritativo para a internet, `allow_query` por zona e RRL: G4.1j.
+- A cópia da secundária e o diário do IXFR ficam em memória: depois de um reinício, a secundária
+  transfere de novo, e o primário responde IXFR com a zona inteira. NOTIFY só para `notify`
+  (como o `notify explicit` do BIND), não para os NS da zona. Mais tipos de registro: G4.1k.
+- Sem TSIG (G4.1c-3) e sem DNSSEC (G4.1c-2). Os benchmarks contra Unbound e Knot com sockets são
+  a G4.1g.
+
+### Pesquisa da G4.1c-1
+
+Fontes, conferidas em 2026-10-22:
+
+- MikroTik RouterOS v7, DNS: <https://help.mikrotik.com/docs/spaces/ROS/pages/37748767/DNS>
+- BIND 9 ARM: <https://bind9.readthedocs.io/en/latest/reference.html> (`allow-transfer` negado por
+  padrão desde a série 9.20, ISC #4728)
+- Knot DNS: <https://www.knot-dns.cz/docs/latest/html/reference.html>
+- PowerDNS:
+  - <https://doc.powerdns.com/authoritative/settings.html>
+  - <https://doc.powerdns.com/authoritative/domainmetadata.html>
+  - <https://doc.powerdns.com/authoritative/dnsupdate.html>
+- NSD: <https://nsd.docs.nlnetlabs.nl/en/latest/manpages/nsd.conf.html>
+- VyOS: <https://docs.vyos.io/en/latest/configuration/service/dns.html>
+- Junos `dns-proxy`
+- RFCs:
+  - 1034 §3.6.2, §4.2.1, §4.3.2, §4.3.5
+  - 1035 §3.3.13, §3.3.14, §5
+  - 1912 §2.2
+  - 1982
+  - 1995
+  - 1996
+  - 2181 §5, §8, §10.1, §10.3
+  - 2308 §3, §4, §5
+  - 4035 §3.1.4.1
+  - 4592
+  - 5936
+  - 8659
+- RIPE-203.
+- Errata (<https://errata.rfc-editor.org/>), por RFC:
+  - RFC 1995: 3197 (verificada: as respostas incrementais levam RRsets parciais, como o nosso
+    diário) e 3196 (retida).
+  - RFC 1996, 5936 e 1982: nenhuma.
+  - RFC 2308: sete, todas editoriais.
+  - RFC 2181: 6446 (rejeitada).
+  - RFC 4592: 46 (retida) e 5119 (reportada: não sintetizar NSEC, importa na G4.1c-2).
+  - RFC 8659: 5934 (editorial) e 7139 (retida).
+- "Updated by": a RFC 1995 e a 5936 pela 9103 (XoT, transferência por TLS: fica de fora).
+
+**Como o MikroTik faz.** Não faz. O `/ip dns static` tem A, AAAA, CNAME, FWD, MX, NS, NXDOMAIN,
+SRV e TXT. Não tem SOA, PTR, CAA, zona, AXFR, IXFR nem NOTIFY.
+
+**Como os outros fazem.**
+
+- **BIND:**
+  - `zone { type primary|secondary; }`, `allow-transfer` (negado desde a 9.20), `also-notify`.
+  - `notify yes` avisa os NS da zona; `explicit` avisa só a lista.
+  - `allow-notify` vale só para os primários.
+  - `serial-update-method increment|unixtime|date`.
+  - `ixfr-from-differences`; journal de até duas vezes a zona.
+  - Timers do SOA limitados na secundária: refresh de 300 s a 4 semanas, retry de 500 s a 2
+    semanas.
+- **Knot:**
+  - `serial-policy increment|unixtime|dateserial`, `zonefile-load difference`, journal.
+  - ACL com ações `query`/`notify`/`transfer`/`update`.
+- **PowerDNS:**
+  - `allow-axfr-ips` padrão `127.0.0.0/8,::1`, metadados `ALSO-NOTIFY` e `ALLOW-AXFR-FROM`.
+  - `SOA-EDIT-API DEFAULT`: `AAAAMMDD01` se for maior, senão +1.
+  - A API cria a zona com os `nameservers`.
+- **NSD:** `provide-xfr`, `notify` com `notify-retry`, `allow-notify` (quem não está na lista é
+  descartado), `request-xfr` (IXFR por TCP com volta para AXFR).
+- **VyOS:** `authoritative-domain` com registros (A, AAAA, CNAME, MX, NS, PTR, TXT, SPF, SRV,
+  NAPTR), sem servir AXFR nem NOTIFY.
+- **Junos:** `dns-proxy` só faz cache e views com encaminhamento.
+
+**O que adotamos.**
+
+- Tipos de zona e timers de RIPE-203 do BIND/Knot. O mínimo do SOA é 3600 e não os 2 dias do
+  RIPE-203: desde a RFC 2308 o campo é o TTL negativo, e o §5 sugere 1 a 3 h.
+- `allow_transfer` vazio por padrão (BIND 9.20, RFC 5936 §5).
+- NOTIFY explícito, retransmitido como o NSD.
+- Serial `date` (o `DEFAULT` do PowerDNS), legível pelo operador.
+- IXFR com volta para AXFR, como o `request-xfr` do NSD.
+- Timers da secundária limitados como no BIND.
+
+**Melhorias sobre os outros.**
+
+- O serial anda sozinho e uma transação inteira vira um serial só. No BIND, um `rndc reload` com
+  o serial esquecido é o erro mais comum de quem edita zona à mão.
+- Zonas, registros e transferências passam por comandos: `config.diff`, Safe Mode, rollback e MCP.
+- A validação recusa antes do commit o que o BIND só avisa ao carregar: CNAME com outros dados,
+  CNAME no ápice, registro duplicado, retry maior que refresh, expire curto, TXT com caractere de
+  controle.
+- O arquivo de zona é editável na GUI e volta como comando, sem `$INCLUDE`.
+- O `print` mostra o estado de cada zona: serial carregado, último refresh, próximo refresh e o
+  erro, em vez de só um log.
+- A etapa `statistics` conta as respostas da etapa `zones`.
+
+**Fica de fora, e por quê.**
+
+- XoT (RFC 9103): exige TLS no servidor DNS.
+- Views (split-horizon): G4.1j se for preciso.
+- `$GENERATE` do BIND.
+- Catalog zones (RFC 9432).
+- Mais tipos de registro: G4.1k.

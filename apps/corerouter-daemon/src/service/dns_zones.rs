@@ -90,6 +90,8 @@ pub(crate) struct Zones {
     secs: Mutex<HashMap<String, Sec>>,
     /// The last NOTIFY failure per primary zone.
     notify_errors: Mutex<HashMap<String, String>>,
+    /// Zones with a NOTIFY sender running, and the change to send next.
+    notifying: Mutex<HashMap<String, Option<Changed>>>,
     shutdown: Shutdown,
 }
 
@@ -140,6 +142,7 @@ impl Zones {
             port,
             secs: Mutex::new(HashMap::new()),
             notify_errors: Mutex::new(HashMap::new()),
+            notifying: Mutex::new(HashMap::new()),
             shutdown,
         })
     }
@@ -154,12 +157,27 @@ impl Zones {
             if c.notify.is_empty() {
                 continue;
             }
+            // One sender per zone: a change while it runs waits for it (a
+            // script of 1000 commands is one NOTIFY round, not 1000).
+            {
+                let mut busy = self.notifying.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(pending) = busy.get_mut(&c.zone) {
+                    *pending = Some(c);
+                    continue;
+                }
+                busy.insert(c.zone.clone(), None);
+            }
             let me = self.clone();
+            let zone = c.zone.clone();
             let spawned = thread::Builder::new()
                 .name("dns-notify".into())
-                .spawn(move || me.notify(&c));
+                .spawn(move || me.notify_loop(c));
             if let Err(e) = spawned {
                 log::warn!("DNS: no thread for NOTIFY: {e}");
+                self.notifying
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&zone);
             }
         }
         let cfg = self.fwd().config();
@@ -222,6 +240,21 @@ impl Zones {
                     .get_mut(&name)
                 {
                     s.busy = false;
+                }
+            }
+        }
+    }
+
+    /// NOTIFY for `c`, then for the latest change that came meanwhile.
+    fn notify_loop(&self, mut c: Changed) {
+        loop {
+            self.notify(&c);
+            let mut busy = self.notifying.lock().unwrap_or_else(|e| e.into_inner());
+            match busy.get_mut(&c.zone).and_then(Option::take) {
+                Some(next) => c = next,
+                None => {
+                    busy.remove(&c.zone);
+                    return;
                 }
             }
         }
