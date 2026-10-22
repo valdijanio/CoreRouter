@@ -174,7 +174,16 @@ interface sem descoberta ativa. `expire_neighbors(now)` roda no daemon a cada se
   Comment, Save to list, Connect e "Virtual lab". Direita: abas Neighbors e Saved com Find.
   Clique num vizinho preenche Connect to; duplo clique preenche e conecta.
   - Nativo: escuta CRDP direto nas interfaces da máquina (`corerouter_discovery::Listener`,
-    nunca envia). Um vizinho que roda na própria máquina vira `127.0.0.1:<porta>`.
+    nunca envia). Um vizinho que roda na própria máquina vira `127.0.0.1:<porta>`. "Na própria
+    máquina" = o bind no endereço de origem funciona ou o endereço IPv6 é de uma interface local
+    (inclusive tentativo, em DAD). O veredito "não é local" vale só 2 s e a tabela de interfaces é
+    relida (no máximo 1×/s): um enlace que acabou de subir, depois da GUI, não fica marcado como
+    remoto para sempre (G5.4; antes o duplo clique ia para `[fe80::…%2]:<porta>` e era recusado).
+  - Vizinho em **outra máquina** fica cinza, com a linha "Greyed out: on another machine…" acima
+    da tabela: até a autenticação (G0.3) o canal de controle só aceita loopback. Clique/duplo
+    clique preenche Connect to e explica, sem tentar conectar; o botão Connect tenta o que estiver
+    no campo (nada bloqueia o endereço digitado). Na web, "outra máquina" = endereço que não é
+    loopback.
   - Web: o navegador não escuta UDP; a aba Neighbors mostra o `ip.neighbor.list` do daemon que
     serviu a página, e Connect to usa a porta WebSocket anunciada.
   - Login e senha ficam **desabilitados** até a autenticação (G0.3). Saved guarda só endereço,
@@ -197,3 +206,5 @@ interface sem descoberta ativa. `expire_neighbors(now)` roda no daemon a cada se
 - 2026-10-22 — v1 (G5.1).
 - 2026-10-22 — seção 5.1: lab virtual pelo loopback, portas de mesmo nome no mesmo fio,
   `ether1` ligada por padrão no lab (G5.4).
+- 2026-10-22 — seção 7: detecção de "vizinho local" sem cache negativo permanente; vizinho remoto
+  cinza com explicação (G5.4).

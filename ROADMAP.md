@@ -283,8 +283,19 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   ignora o fio do lab, e o mapeamento de porta (unitário). Teste manual (**medido**): dois
   daemons virtuais (`--control 7981`/`7983`, a 7979 estava ocupada por outro daemon) se listaram
   em `ip.neighbor.list` em `ether1`, e a `corerouter-gui --control 7990` sem `--connect` mostrou
-  os dois na aba Neighbors como `127.0.0.1 (this machine)` (screenshot conferido). Esforço do
-  agente ~1,5 h (**estimado**).
+  os dois na aba Neighbors como `127.0.0.1 (this machine)` (screenshot conferido).
+  No mesmo PR, a pedido do usuário: (a) o lab não tenta mais broadcast de endereços que só existem
+  na config (sumiu o `WARN cannot broadcast from 10.0.0.1 on ether1`); no linux o aviso sai uma vez
+  por problema (teste com logger que captura); (b) o `Listener` da GUI cacheava para sempre "não é
+  local" — a tabela de interfaces era lida antes de a veth existir (releitura a cada 10 s) e o
+  bind no link-local falha porque o datagrama chega com o escopo da outra ponta; o duplo clique ia
+  para `[fe80::…%2]:7981` e era recusado. Agora "não" vale 2 s, a tabela é relida (≤ 1×/s) e
+  endereço tentativo conta como local. Teste em netns (`netns_local`: GUI antes do enlace) falhou
+  antes da correção e passa 5/5 depois (**medido**); (c) vizinho de outra máquina fica cinza com o
+  motivo (G0.3) e o duplo clique explica em vez de tentar (teste headless); Connect continua
+  tentando o endereço do campo. Teste manual em netns descartável: daemon local + daemon num
+  namespace filho + GUI — local "(this machine)", remoto cinza com a dica (screenshot conferido).
+  Esforço do agente ~3 h (**estimado**).
 
 ## Histórico de revisão
 

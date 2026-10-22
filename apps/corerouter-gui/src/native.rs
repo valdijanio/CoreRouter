@@ -427,6 +427,7 @@ fn heard_row(h: &Heard) -> NeighborRow {
         board: a.board.clone(),
         uptime_secs: uptime,
         connect_to: h.connect_to(),
+        remote: !h.local,
     }
 }
 

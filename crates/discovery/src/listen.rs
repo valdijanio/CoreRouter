@@ -20,6 +20,13 @@ use crate::sock;
 const RESCAN: Duration = Duration::from_secs(10);
 /// Most routers remembered (a flood evicts the oldest).
 pub const MAX_HEARD: usize = 1024;
+/// How long "this source is not on this machine" is believed. Short: an
+/// address seen while its link was coming up (DAD, or our interface table
+/// read before the link existed) turns out to be ours a moment later.
+const NOT_LOCAL_TTL: Duration = Duration::from_secs(2);
+/// Shortest pause between two re-reads of the interface table for the
+/// local check (a flood of unknown sources costs one read a second).
+const LOCAL_RESCAN: Duration = Duration::from_secs(1);
 
 /// One router as last heard.
 #[derive(Debug, Clone)]
@@ -129,12 +136,16 @@ impl Listener {
 fn listen(sock: &UdpSocket, tx: &Sender<Heard>, stop: &AtomicBool) {
     let v6 = sock.local_addr().is_ok_and(|a| a.is_ipv6());
     let mut kernel = ifaces::read();
+    let mut read_at = Instant::now();
     let mut joined_at: Option<Instant> = None;
     let mut buf = [0u8; MAX_PACKET + 1];
-    let mut local: BTreeMap<(IpAddr, u32), bool> = BTreeMap::new();
+    // Source → (on this machine, when decided). "Yes" is kept; "no" only
+    // for NOT_LOCAL_TTL.
+    let mut local: BTreeMap<(IpAddr, u32), (bool, Instant)> = BTreeMap::new();
     while !stop.load(Ordering::Relaxed) {
         if v6 && joined_at.is_none_or(|t| t.elapsed() >= RESCAN) {
             kernel = ifaces::read();
+            read_at = Instant::now();
             sock::join_all_nodes(sock, 0);
             for (_, i) in kernel.iter() {
                 sock::join_all_nodes(sock, i.index);
@@ -151,12 +162,26 @@ fn listen(sock: &UdpSocket, tx: &Sender<Heard>, stop: &AtomicBool) {
         if local.len() > MAX_HEARD {
             local.clear();
         }
-        let is_local = *local.entry((from.ip(), scope)).or_insert_with(|| {
-            // A link-local address of this machine may arrive with the
-            // scope of another of its links (veth pairs, bridges).
-            sock::is_local(from.ip(), scope)
-                || matches!(from.ip(), IpAddr::V6(a) if kernel.has_address(&a))
-        });
+        let key = (from.ip(), scope);
+        let known = local
+            .get(&key)
+            .filter(|(yes, at)| *yes || at.elapsed() < NOT_LOCAL_TTL)
+            .map(|(yes, _)| *yes);
+        let is_local = match known {
+            Some(yes) => yes,
+            None => {
+                if read_at.elapsed() >= LOCAL_RESCAN {
+                    kernel = ifaces::read();
+                    read_at = Instant::now();
+                }
+                // A link-local address of this machine may arrive with the
+                // scope of another of its links (veth pairs, bridges).
+                let yes = sock::is_local(from.ip(), scope)
+                    || matches!(from.ip(), IpAddr::V6(a) if kernel.has_address(&a));
+                local.insert(key, (yes, Instant::now()));
+                yes
+            }
+        };
         let heard = Heard {
             announcement,
             from,

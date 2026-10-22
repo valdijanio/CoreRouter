@@ -189,6 +189,8 @@ const NETNS_TESTS: &[(&str, &str)] = &[
     ("corerouter-hal-linux", "netns_l2"),
     // G5.1: two daemons find each other with CRDP.
     ("corerouter-daemon", "netns"),
+    // G5.4: a router on this machine heard on a new link is local.
+    ("corerouter-discovery", "netns_local"),
 ];
 
 fn layers_step(root: &Path) -> Outcome {
