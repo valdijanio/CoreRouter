@@ -208,11 +208,16 @@ fn failure_rolls_back_every_done_step() {
     eth(&mut base, "b1eth1");
     eth(&mut base, "b1eth2");
     hal.apply(&Config::default(), &base).unwrap();
-    // Other tests share the namespace: look only at this test's links.
+    // Other tests share the namespace: look only at this test's links, by
+    // name (a MAC like `ce:b1:..` must not match).
     let mine = |args: &[&str]| -> String {
         ip(args)
             .lines()
-            .filter(|l| l.contains("b1"))
+            .filter(|l| {
+                l.split(':')
+                    .nth(1)
+                    .is_some_and(|name| name.trim().starts_with("b1"))
+            })
             .collect::<Vec<_>>()
             .join("\n")
     };
