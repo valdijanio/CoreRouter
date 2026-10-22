@@ -245,6 +245,27 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com o cursor no MTU, Ctrl+Enter aplica 9000 e fica aberto, Esc descarta, Esc em camadas na lista.
   Esforço do agente ~3 h (**estimado**).
 
+- 2026-10-22 — G1.16: ações indisponíveis ficam cinza com o motivo. Motivo real: GUI nova `--connect`
+  num daemon iniciado antes do Safe Mode; o clique dava "unknown command 'config.safe-mode.enter'" na
+  barra de status. Agora um ponto só (`crates/ui/src/avail.rs`, `CoreRouterUi::can`) responde, por
+  comando, a partir de `engine.list` + `server.info` + estado do link (G0.4): ausente no daemon
+  ("this router (corerouter X) has no <id>: its daemon is older than this GUI …; update or restart
+  it"), `enabled=false` (o `disabledReason` do engine, ex. "no pending changes") ou `connecting…`/
+  `disconnected` (mesmo texto do indicador). Lista ainda não carregada com o link de pé não bloqueia.
+  Usado em todas as ações: barras +/−/✓/✗/Comment, menus de contexto, botões dos diálogos (via
+  `Footer::ok` e `extra` do `dialog.rs` do G1.15: OK/Apply/Enable/Disable/Remove, Add Port, −),
+  barra superior (Safe Mode sem menu quando cinza, Commit, Discard), modo de commit, Rollback, Add/Apply
+  das janelas simples, Apply do Neighbors. Motivo da UI (seleção, porta física) combina com o do
+  roteador, o do roteador primeiro. `CoreRouterUi::run` confere de novo: atalho de tabela, Enter/
+  Ctrl+Enter de diálogo ou clique numa ação indisponível não envia nada (o motivo vai para o log e,
+  num diálogo, para o erro dele). Nenhuma lista fixa de comandos na UI. 8 testes novos (3 unitários
+  do `Avail`; 5 headless com um daemon falso: sem `config.safe-mode.*`, comando desabilitado pelo
+  engine, link caído com teclas, comando ausente em barra/menu, OK de diálogo cinza com Enter);
+  conferido que falham com o `check` neutralizado. Teste manual (**medido**): daemon compilado de
+  `6fbab48` (worktree temporária, `CARGO_TARGET_DIR` próprio) + GUI deste branch `--connect`
+  `--control`, xdotool para o hover e `screenshot`: Safe Mode cinza com o tooltip de versão.
+  Esforço do agente ~3 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -261,3 +282,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.4.
 - 2026-10-22 — log do G5.1.
 - 2026-10-22 — log do G1.15.
+- 2026-10-22 — log do G1.16.

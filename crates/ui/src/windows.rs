@@ -3,7 +3,7 @@
 use egui::{Grid, RichText, TextEdit};
 use serde_json::{Value, json};
 
-use crate::table::{self, Icon, Menu, Row, Shortcut, col, comment};
+use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment};
 use crate::{CoreRouterUi, err_color, value_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -182,13 +182,15 @@ impl CoreRouterUi {
         let selection = self.tables.addresses.selection(&rows);
         let mut remove: Option<Vec<String>> = None;
         let mut select_all = false;
+        let can = self.can();
         ui.horizontal(|ui| {
-            let can = if selection.is_empty() {
+            let picked = if selection.is_empty() {
                 Err("Select one or more addresses first".to_owned())
             } else {
                 Ok(())
             };
-            if table::tool(ui, "addresses", Icon::Remove, "Remove", can).clicked() {
+            let enabled = can.and("ip.address.remove", picked);
+            if table::tool(ui, "addresses", Icon::Remove, "Remove", enabled).clicked() {
                 remove = Some(selection.clone());
             }
             table::find_field(ui, "addresses", &mut self.tables.addresses);
@@ -203,7 +205,7 @@ impl CoreRouterUi {
             &rows,
             |ui, menu| match menu {
                 Menu::Rows(sel) => {
-                    if ui.button("Remove").clicked() {
+                    if action(ui, "Remove", can.check("ip.address.remove")) {
                         remove = Some(sel.to_vec());
                     }
                 }
@@ -243,7 +245,7 @@ impl CoreRouterUi {
                     .hint_text("comment")
                     .desired_width(120.0),
             );
-            add = ui.button("Add").clicked();
+            add = action(ui, "Add", can.check("ip.address.add"));
         });
         if add {
             let comment = &self.forms.addr_comment;
@@ -284,7 +286,7 @@ impl CoreRouterUi {
             ui.add(TextEdit::singleline(&mut self.forms.bgp_router_id).hint_text("10.255.0.1"));
             ui.end_row();
         });
-        if ui.button("Apply").clicked() {
+        if action(ui, "Apply", self.can.check("routing.bgp.instance.set")) {
             apply = true;
         }
         if apply {
@@ -312,10 +314,11 @@ impl CoreRouterUi {
                 .unwrap_or_default();
         }
         let mut apply = false;
+        let can = self.can();
         ui.horizontal(|ui| {
             ui.label("Identity");
             ui.text_edit_singleline(&mut self.forms.identity);
-            apply = ui.button("Apply").clicked();
+            apply = action(ui, "Apply", can.check("system.identity.set"));
         });
         if apply {
             let name = self.forms.identity.clone();
@@ -331,10 +334,15 @@ impl CoreRouterUi {
             .map(value_text)
             .unwrap_or_default();
         let mut set_mode: Option<&str> = None;
+        let can = self.can();
         ui.horizontal(|ui| {
             ui.label("Commit mode:");
+            let enabled = can.check("config.mode.set");
             for m in ["immediate", "transactional"] {
-                if ui.radio(mode == m, m).clicked() && mode != m {
+                let resp = ui.add_enabled(enabled.is_ok(), egui::RadioButton::new(mode == m, m));
+                if let Err(why) = &enabled {
+                    resp.on_disabled_hover_text(why.as_str());
+                } else if resp.clicked() && mode != m {
                     set_mode = Some(m);
                 }
             }
@@ -364,7 +372,7 @@ impl CoreRouterUi {
                 let n = rev.get("number").and_then(Value::as_u64).unwrap_or(0);
                 ui.label(n.to_string());
                 ui.label(rev.get("comment").map(value_text).unwrap_or_default());
-                if ui.small_button("Rollback").clicked() {
+                if action(ui, "Rollback", can.check("config.rollback")) {
                     rollback = Some(n);
                 }
                 ui.end_row();
