@@ -124,6 +124,9 @@ pub(crate) struct DnsForm {
     pub cache_size: String,
     pub cache_max_ttl_secs: String,
     pub address_list_extra_time_secs: String,
+    /// G4.1d: DoH (`https://…`) or DoT (`tls://…`); empty: off.
+    pub use_doh_server: String,
+    pub verify_doh_cert: bool,
 }
 
 /// `["a","b"]` as `a, b` (or one per line).
@@ -159,6 +162,8 @@ impl DnsForm {
             cache_size: text(v, "cache_size"),
             cache_max_ttl_secs: text(v, "cache_max_ttl_secs"),
             address_list_extra_time_secs: text(v, "address_list_extra_time_secs"),
+            use_doh_server: text(v, "use_doh_server"),
+            verify_doh_cert: flag(v, "verify_doh_cert"),
         }
     }
 
@@ -176,6 +181,12 @@ impl DnsForm {
         }
         if split(&self.allowed_from) != split(&base.allowed_from) {
             p.insert("allowed_from".into(), json!(split(&self.allowed_from)));
+        }
+        if self.use_doh_server.trim() != base.use_doh_server.trim() {
+            p.insert("use_doh_server".into(), json!(self.use_doh_server.trim()));
+        }
+        if self.verify_doh_cert != base.verify_doh_cert {
+            p.insert("verify_doh_cert".into(), json!(self.verify_doh_cert));
         }
         if self.server_selection != base.server_selection {
             p.insert("server_selection".into(), json!(self.server_selection));
@@ -750,6 +761,19 @@ impl DnsPanel {
         ui.label("Dynamic Servers");
         ui.label(list_text(s, "dynamic_servers", ", "));
         ui.end_row();
+        field(
+            ui,
+            "Use DoH Server",
+            "Encrypted upstream, asked instead of the servers above (which then only \
+             resolve its name): https://cloudflare-dns.com/dns-query (DoH) or \
+             tls://9.9.9.9#dns.quad9.net (DoT). Empty: plain DNS.",
+            &mut f.use_doh_server,
+            260.0,
+        );
+        ui.label("Verify DoH Certificate")
+            .on_hover_text("Check the server's certificate (built-in Mozilla roots). Off: still encrypted, any certificate.");
+        ui.checkbox(&mut f.verify_doh_cert, "");
+        ui.end_row();
         ui.label("Allow Remote Requests")
             .on_hover_text("Answer the LAN on UDP/TCP 53 (from the networks below only).");
         ui.checkbox(&mut f.allow_remote_requests, "");
@@ -1195,7 +1219,7 @@ fn static_body(ui: &mut Ui, f: &Form, d: &mut StaticDialog, can: &Avail) -> Foot
                 "A" => f.text(ui, "Address", "address", &mut form.address, "192.168.88.10"),
                 "AAAA" => f.text(ui, "Address", "address", &mut form.address, "2001:db8::10"),
                 "CNAME" => f.text(ui, "CNAME", "cname", &mut form.cname, "nas.lan"),
-                "FWD" => f.text(ui, "Forward To", "forward_to", &mut form.forward_to, "10.0.0.53"),
+                "FWD" => f.text(ui, "Forward To", "forward_to", &mut form.forward_to, "10.0.0.53 or a forwarders group"),
                 "MX" => {
                     f.text(ui, "MX Exchange", "mx_exchange", &mut form.mx_exchange, "mail.lan");
                     f.text(ui, "MX Preference", "mx_preference", &mut form.mx_preference, "10");

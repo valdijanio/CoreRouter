@@ -108,6 +108,10 @@ pub struct StaticEntry {
     pub cname: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub forward_to: Vec<IpAddr>,
+    /// FWD to a `/ip dns forwarders` group by name (G4.1d) instead of
+    /// `forward_to` (RouterOS writes both as `forward-to`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub forwarder: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub mx_exchange: String,
     #[serde(default, skip_serializing_if = "is_zero")]
@@ -149,6 +153,7 @@ impl StaticEntry {
             address: None,
             cname: String::new(),
             forward_to: Vec::new(),
+            forwarder: String::new(),
             mx_exchange: String::new(),
             mx_preference: 0,
             ns: String::new(),
@@ -204,6 +209,13 @@ impl StaticEntry {
             StaticType::Mx => target("mx_exchange", &self.mx_exchange),
             StaticType::Ns => target("ns", &self.ns),
             StaticType::Srv => target("srv_target", &self.srv_target),
+            StaticType::Fwd if !self.forwarder.is_empty() => {
+                if self.forward_to.is_empty() {
+                    None
+                } else {
+                    Some("forward_to: servers or one forwarders group, not both".into())
+                }
+            }
             StaticType::Fwd => {
                 if self.forward_to.is_empty() || self.forward_to.len() > MAX_FORWARD_TO {
                     Some(format!("type FWD needs forward_to: 1..={MAX_FORWARD_TO} servers"))
@@ -235,6 +247,7 @@ impl StaticEntry {
                 self.address.map(|a| a.to_string()).unwrap_or_default()
             }
             StaticType::Cname => self.cname.clone(),
+            StaticType::Fwd if !self.forwarder.is_empty() => self.forwarder.clone(),
             StaticType::Fwd => self
                 .forward_to
                 .iter()

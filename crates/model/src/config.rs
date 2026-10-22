@@ -239,6 +239,9 @@ pub struct Ip {
     /// `/ip dns adlist` (G4.1d): block lists of the LAN forwarder.
     #[serde(skip_serializing_if = "crate::dns_adlist::DnsAdlist::is_empty")]
     pub dns_adlist: crate::dns_adlist::DnsAdlist,
+    /// `/ip dns forwarders` (G4.1d): named groups of upstream servers.
+    #[serde(skip_serializing_if = "crate::dns_forwarders::DnsForwarders::is_empty")]
+    pub dns_forwarders: crate::dns_forwarders::DnsForwarders,
     /// `/ip dhcp-client` (G4.7): at most one per interface.
     pub dhcp_clients: Vec<DhcpClient>,
     /// Next id handed out by `next_dhcp_client_id`.

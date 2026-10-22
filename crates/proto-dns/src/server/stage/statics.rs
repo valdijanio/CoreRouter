@@ -27,7 +27,7 @@ use regex::{Regex, RegexBuilder};
 
 use crate::server::{Effect, Forwarder, Query, Reply, Stage, Step};
 use crate::message::QName;
-use crate::resolver::Transport;
+use crate::resolver::{Transport, Upstreams};
 
 pub(crate) const STAGE: Stage = Stage {
     name: "static",
@@ -217,7 +217,13 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
                 return Step::Reply(r);
             }
             StaticType::Fwd => {
-                q.forward_to = Some(first.forward_to.clone());
+                // A group (G4.1d) that is gone or disabled: the usual
+                // servers answer.
+                q.forward_to = if first.forwarder.is_empty() {
+                    Some(Upstreams::plain(first.forward_to.clone()))
+                } else {
+                    Upstreams::group(&q.config.config, &first.forwarder)
+                };
                 return Step::Next;
             }
             // A CNAME: answer it and go on with its target.
