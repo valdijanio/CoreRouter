@@ -22,7 +22,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
@@ -138,17 +138,17 @@ impl Prober for HostProber {
         }
     }
 
+    /// Never the host's resolver (`/etc/resolv.conf` points at a
+    /// `127.0.0.53` that the router's namespace and image do not have):
+    /// names come from the router's own resolver (G4.1a, `ip.dns`), which
+    /// the engine puts in front of this prober. Reaching here means it has
+    /// no server to ask.
     fn resolve(&self, name: &str) -> Result<Vec<IpAddr>, ProbeError> {
         let shown: String = name.chars().take(64).collect();
-        let addrs: Vec<IpAddr> = (name, 0)
-            .to_socket_addrs()
-            .map_err(|_| ProbeError::NotFound(shown.clone()))?
-            .map(|a| a.ip())
-            .collect();
-        if addrs.is_empty() {
-            return Err(ProbeError::NotFound(shown));
-        }
-        Ok(addrs)
+        Err(ProbeError::Unavailable(format!(
+            "cannot resolve '{shown}': no DNS server configured (ip.dns.set servers=…, \
+             or a DHCP client with use_peer_dns)"
+        )))
     }
 
     fn open(&self, options: &SocketOptions) -> Result<Box<dyn ProbeSocket>, ProbeError> {

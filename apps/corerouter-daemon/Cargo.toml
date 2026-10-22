@@ -18,6 +18,7 @@ corerouter-discovery.workspace = true
 corerouter-model.workspace = true
 corerouter-proto-lldp.workspace = true
 corerouter-proto-mndp.workspace = true
+corerouter-proto-dns.workspace = true
 corerouter-proto-ntp.workspace = true
 corerouter-proto-syslog.workspace = true
 log.workspace = true
@@ -27,6 +28,8 @@ serde_json.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true
+# service/dns.rs and netns_dns.rs: a test DNS server.
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 # netns_dhcp.rs: a DHCP server thread inside another network namespace.
 corerouter-proto-dhcp.workspace = true
 socket2 = { version = "0.6.5", features = ["all"] }

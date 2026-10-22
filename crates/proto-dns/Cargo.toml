@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-proto-dns"
-description = "L2: DNS resolver/cache and static records"
+description = "L2: DNS stub resolver over hickory-proto: queries, reply checks, TTL cache, server failover (no sockets: the caller brings the transport)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,18 @@ repository.workspace = true
 
 [dependencies]
 corerouter-model.workspace = true
+# Messages only: no async runtime, no resolver of its own (the daemon is
+# threads, docs/architecture.md "DNS").
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "resolver"
+harness = false
 
 [lints]
 workspace = true

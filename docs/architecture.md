@@ -68,7 +68,7 @@ backend.**
 
 | Serviço | Escolha | Observação |
 |---|---|---|
-| DNS cache/forwarder, registros estáticos | `hickory-server` + `hickory-resolver` | Embutido no daemon; DoT/DoH upstream via `rustls` |
+| DNS: resolvedor do roteador, encaminhador com cache, estáticos, servidor autoritativo | Hickory DNS, Rust puro (decisão do usuário, 2026-10-22): `hickory-proto` no resolvedor (G4.1a), `hickory-server` no servidor (G4.1c) | Num processo só, integrado aos comandos e às transações; veja "DNS (G4.1)" na seção 3 e `docs/dns.md` |
 | DHCPv4/DHCPv6 (+PD) e relay | DHCPv4: codec `dhcproto` atrás de um saneador; DHCPv6: codec próprio (G4.7b: o `dhcproto` 0.15 v6 dá panic/dessincroniza com bytes hostis); servidor e banco de leases próprios | Leases em `/config`, escrita atômica |
 | PPPoE / IPoE (BNG) | orquestrar `accel-ppp` | Não há BNG Rust maduro; mesmo padrão do FRR |
 | NTP | Cliente SNTP próprio (G4.6: `proto-ntp` L2 puro + thread no daemon); `ntpd-rs` fica como opção para o servidor NTP e a disciplina do relógio (G4.6b/G4.6c) | Medir o offset é um pacote de 48 bytes e quatro timestamps (RFC 5905 §8/§14): um processo externo a mais não paga isso, e o status vai direto para `system.ntp.client.get` sem parsear saída. Ajustar o relógio (slew/step, `CAP_SYS_TIME`) e servir hora são outra conversa: lá a maturidade do `ntpd-rs`/chrony pesa mais |
@@ -418,6 +418,36 @@ O engine não tem relógio nem threads (wasm32): o `Runner` dá a thread e o `Cl
 monotônico e `sleep`) do job; o RTT é medido pelo socket. Os jobs (`engine/src/tools/`) são
 lógica pura sobre `ProbeSocket` + `TaskCtx` e são testados com a rede simulada e um relógio
 falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools.md`.
+
+### DNS (G4.1)
+
+**Decisão do usuário (2026-10-22):** o DNS inteiro é **Hickory DNS, em Rust puro**, embutido no
+daemon. São três partes sobre a mesma config (`/ip dns`) e o mesmo cache:
+
+- **G4.1a**, resolvedor do próprio roteador: mensagens com `hickory-proto`, sem runtime async.
+- **G4.1b**, encaminhador com cache para a LAN (`allow_remote_requests`, `/ip dns static`).
+- **G4.1c**, servidor completo estilo BIND (zonas autoritativas, DNSSEC) com `hickory-server`.
+
+Por que não orquestrar Unbound, Knot ou PowerDNS, como o FRR no roteamento: um processo só
+elimina um ponto de falha e uma config paralela. Estáticos, servidores do DHCP e o cache viram
+comandos, entram em transações e no Safe Mode e aparecem no MCP. Os erros chegam estruturados,
+sem parsear saída. **Risco aceito:** o Hickory é menos testado em escala de ISP que
+Unbound/Knot/PowerDNS. Ele será medido com benchmarks (consultas/s, latência com cache quente e
+frio, memória por entrada) na G4.1c, e a decisão pode ser revista com esses números.
+
+```
+ping/MTR/MTU ─► Session::tool_prober ─► RouterResolver::resolve ─┐
+cliente NTP ─► service::dns::resolve ────────────────────────────┤ (sem lock do Session)
+                                                                 ▼
+               proto-dns::Resolver: cache (lock curto) ─► fetch: servidores um a um
+                                                                 │ Transport
+               service/dns.rs: UDP (+TCP no TC) ◄────────────────┘
+thread "dns" (1 s): Session::dns_settings (running ip.dns + DHCP use_peer_dns) ─► configure
+```
+
+O `proto-dns` não abre socket: compila em wasm e é testado com um transporte falso e um relógio
+falso. Sem daemon registrado, as ferramentas usam o resolvedor do prober (o simulado, no lab).
+Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
 
 ## Histórico de revisão
 

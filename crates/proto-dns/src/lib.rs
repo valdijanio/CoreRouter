@@ -1,15 +1,23 @@
-//! L2 — DNS resolver/cache and static records.
-//!
-//! Scope: forwarders, cache, static records, DoT/DoH upstreams; runtime on
-//! `hickory-server` + `hickory-resolver` embedded in the daemon (G4.1).
+//! L2 — DNS for the router itself (G4.1a): a stub resolver over
+//! `hickory-proto` messages, with a TTL cache and server failover. The LAN
+//! forwarder (G4.1b) and the full server on `hickory-server` (G4.1c) build
+//! on the same cache and config (`/ip dns`, docs/architecture.md "DNS").
 //!
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
+pub mod cache;
+pub mod message;
+pub mod resolver;
+
 use corerouter_model::{Config, Issue};
 
-/// Validate this subsystem's part of the candidate. No config section exists
-/// yet, so there is nothing to reject.
-pub fn validate(_cfg: &Config) -> Vec<Issue> {
-    Vec::new()
+/// Validate `/ip dns` in the candidate.
+pub fn validate(cfg: &Config) -> Vec<Issue> {
+    cfg.ip
+        .dns
+        .problem()
+        .map(|m| Issue::new("ip.dns", m))
+        .into_iter()
+        .collect()
 }

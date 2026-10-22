@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bonding::{BondMode, HashPolicy, LacpRate, default_mii_interval};
 use crate::dhcp_client::DhcpClient;
+use crate::dns::Dns;
 use crate::firewall::Firewall;
 use crate::interface_list::InterfaceLists;
 use crate::ipv6::Ipv6;
@@ -239,6 +240,9 @@ pub struct Ip {
     pub dhcp_clients: Vec<DhcpClient>,
     /// Next id handed out by `next_dhcp_client_id`.
     pub next_dhcp_client_id: u32,
+    /// `/ip dns` (G4.1a): the router's resolver and its cache.
+    #[serde(skip_serializing_if = "Dns::is_default")]
+    pub dns: Dns,
 }
 
 impl Ip {

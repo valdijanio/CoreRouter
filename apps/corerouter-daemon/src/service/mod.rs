@@ -1,5 +1,6 @@
-//! Services the daemon runs next to the control channel: NTP client, remote
-//! syslog, Prometheus metrics… One file each, `src/service/<name>.rs`, with a
+//! Services the daemon runs next to the control channel: DNS resolver, NTP
+//! client, remote syslog, Prometheus metrics… One file each,
+//! `src/service/<name>.rs`, with a
 //! `pub(crate) const SERVICE: Service`; `build.rs` finds them. A service
 //! declares its own command-line flags, so a new one does not touch
 //! `main.rs` (the hot spot of parallel features).
@@ -81,7 +82,7 @@ mod tests {
     #[test]
     fn services_are_found_and_flags_are_unique() {
         let names: Vec<&str> = ALL.iter().map(|s| s.name).collect();
-        for want in ["metrics", "ntp client", "remote logging"] {
+        for want in ["dns resolver", "metrics", "ntp client", "remote logging"] {
             assert!(names.contains(&want), "{want} not in {names:?}");
         }
         let mut flags: Vec<&str> = ALL.iter().flat_map(|s| s.flags).map(|f| f.name).collect();
