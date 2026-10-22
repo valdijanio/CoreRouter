@@ -67,7 +67,7 @@ impl Session {
     /// What the resolver must use now: the running `/ip dns` and the
     /// learned servers.
     pub fn dns_settings(&self) -> Settings {
-        Settings::new(&self.store().running().ip.dns, &self.dns_dynamic_servers())
+        Settings::from_config(self.store().running(), &self.dns_dynamic_servers())
     }
 
     /// A static DNS entry's `address_list` (G4.1b): `address` goes into

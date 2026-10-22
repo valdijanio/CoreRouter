@@ -482,7 +482,16 @@ ler e montar, 80–110 ns por consulta. O download usa um cliente HTTP/1.1 nosso
 (`service/https.rs`, rustls + raízes Mozilla do `webpki-roots`) e não o `ureq`/`reqwest`: o
 roteador não tem resolvedor do sistema nem loja de CAs, então o nome do servidor passa pelo
 resolvedor do roteador, e todos os limites (cabeçalho, corpo, redirecionamentos) são nossos. O
-mesmo cliente servirá o DoH da G4.1d-2.
+mesmo cliente serve o DoH da G4.1d-2.
+
+**DoT/DoH upstream (G4.1d-2): rustls e o nosso HTTP/1.1, sem tokio.** O `hickory-proto` tem
+clientes DoT/DoH, mas só sobre tokio; o daemon é por threads. O `proto-dns` monta a consulta (id 0,
+padding de 128 bytes) e o resolvedor escolhe o servidor; o daemon (`service/dns_secure.rs`) fala
+TLS (RFC 7858) ou `POST application/dns-message` (RFC 8484) e guarda até 4 conexões ociosas por
+servidor por 20 s. HTTP/1.1 em vez de HTTP/2 (que a RFC 8484 §5.2 recomenda): com a conexão
+reaproveitada a diferença some. **Medido** (2026-10-22, release, cache vazio, 15 nomes populares
+pelo 1.1.1.1 a ~48 ms de RTT): UDP 48–51 ms, DoT 47–49 ms, DoH 49–53 ms por consulta. Revisar se um
+servidor exigir HTTP/2 ou se o pipelining (várias consultas na mesma conexão) fizer falta.
 
 Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
 

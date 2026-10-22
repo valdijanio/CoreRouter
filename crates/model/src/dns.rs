@@ -114,6 +114,13 @@ pub struct Dns {
     /// How long one lookup may take in total, all servers included.
     pub query_total_timeout_ms: u32,
     pub max_udp_packet_size: u16,
+    /// G4.1d: ask this encrypted server instead of `servers` (which then
+    /// only resolve its name): `https://host/path` (DoH, RFC 8484) or
+    /// `tls://host[:853][#name]` (DoT, RFC 7858). Empty: off.
+    pub use_doh_server: String,
+    /// Check the encrypted server's certificate (RFC 8310 strict profile).
+    /// RouterOS defaults to no; the Mozilla roots are built in here.
+    pub verify_doh_cert: bool,
 }
 
 impl Default for Dns {
@@ -133,6 +140,8 @@ impl Default for Dns {
             query_server_timeout_ms: DEFAULT_SERVER_TIMEOUT_MS,
             query_total_timeout_ms: DEFAULT_TOTAL_TIMEOUT_MS,
             max_udp_packet_size: DEFAULT_MAX_UDP_PACKET_SIZE,
+            use_doh_server: String::new(),
+            verify_doh_cert: true,
         }
     }
 }
@@ -174,6 +183,9 @@ impl Dns {
                  not even the first server would get its full wait",
                 self.query_total_timeout_ms, self.query_server_timeout_ms
             ));
+        }
+        if let Some(why) = secure_url_problem(&self.use_doh_server) {
+            return Some(format!("use_doh_server: {why}"));
         }
         if !UDP_PACKET_SIZE.contains(&self.max_udp_packet_size) {
             return Some(format!("max_udp_packet_size must be {UDP_PACKET_SIZE:?}"));
@@ -234,6 +246,30 @@ impl AllowedFrom {
             Err("not a prefix or a list name".into())
         }
     }
+}
+
+/// Longest encrypted server address.
+pub const MAX_SECURE_URL_LEN: usize = 512;
+
+/// Why `url` cannot name an encrypted DNS server (`""` is fine: none).
+/// The full parse is `proto-dns` (`encrypted.rs`); this is the shape.
+pub fn secure_url_problem(url: &str) -> Option<String> {
+    if url.is_empty() {
+        return None;
+    }
+    let shown: String = url.chars().take(64).collect();
+    if url.len() > MAX_SECURE_URL_LEN {
+        return Some(format!("at most {MAX_SECURE_URL_LEN} characters"));
+    }
+    if !(url.starts_with("https://") || url.starts_with("tls://")) {
+        return Some(format!(
+            "'{shown}' must be https://host/path (DoH) or tls://host[#name] (DoT)"
+        ));
+    }
+    if url.bytes().any(|b| b <= b' ' || b == 0x7f) {
+        return Some(format!("'{shown}' has spaces or control characters"));
+    }
+    None
 }
 
 /// An address that can answer queries.
