@@ -33,7 +33,7 @@ use egui::{Color32, RichText};
 use serde_json::{Value, json};
 
 pub use backend::{Backend, Link, Local, Reply, RequestId};
-pub use connect::{ConnectAction, ConnectScreen, Credentials, NeighborRow, SavedRouter};
+pub use connect::{ConnectAction, ConnectScreen, Credentials, Failure, NeighborRow, SavedRouter};
 pub use neighbors::uptime_text;
 pub use prefs::stored_theme;
 pub use windows::Win;
@@ -641,7 +641,10 @@ impl CoreRouterUi {
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
         ask(self, Field::Commands, "engine.list", Value::Null);
-        ask(self, Field::Whoami, "auth.whoami", Value::Null);
+        // An old router has no auth.whoami: no question it cannot answer.
+        if !self.old_router() {
+            ask(self, Field::Whoami, "auth.whoami", Value::Null);
+        }
         if self.cache.info.is_null() {
             ask(self, Field::Info, "server.info", Value::Null);
         }
@@ -815,6 +818,26 @@ impl CoreRouterUi {
         ui.separator();
     }
 
+    /// A router older than the login (G0.3c), managed after "Connect
+    /// anyway": its `server.info` says nothing about `auth`.
+    pub fn old_router(&self) -> bool {
+        !matches!(self.link, Link::Local) && connect::old_router_info(&self.cache.info)
+    }
+
+    /// The top bar's warning while managing an old router.
+    fn old_router_warning(&self, ui: &mut egui::Ui) {
+        if !self.old_router() {
+            return;
+        }
+        ui.colored_label(ui.visuals().warn_fg_color, "old router: no login")
+            .on_hover_text(format!(
+                "{} Until then anyone on its machine can manage it, and what it does not \
+                 have yet is greyed out.",
+                connect::OLD_ROUTER
+            ));
+        ui.separator();
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let s = &self.cache.summary;
         let txt = |k: &str| s.get(k).map(value_text).unwrap_or_default();
@@ -834,6 +857,7 @@ impl CoreRouterUi {
         ui.horizontal(|ui| {
             self.link_label(ui);
             self.user_label(ui);
+            self.old_router_warning(ui);
             self.no_password_warning(ui);
             // Nothing heard from the router yet: no empty fields.
             if !known {
@@ -2589,6 +2613,26 @@ mod tests {
         // Commit is there and works.
         h.click(h.text("Commit"));
         assert_eq!(d.borrow().executed, ["config.commit"]);
+    }
+
+    #[test]
+    fn an_old_router_without_login_is_flagged_in_the_top_bar() {
+        // The fake daemon is 0.0.9: its server.info says nothing about auth.
+        let (mut h, _) = Harness::daemon(before_safe_mode());
+        assert!(h.app.old_router());
+        let at = h.text("old router: no login");
+        h.tooltip_at(at);
+        assert!(h.has_text_containing("Update and restart corerouter-daemon"));
+        // A router of this version says "auth": no warning.
+        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0", "auth": "required"});
+        h.idle();
+        assert!(!h.app.old_router());
+        assert!(!h.has_text("old router: no login"));
+        // Nor in the lab, which has no login at all.
+        let mut lab = Harness::new();
+        lab.idle();
+        assert!(!lab.app.old_router());
+        assert!(!lab.has_text("old router: no login"));
     }
 
     #[test]

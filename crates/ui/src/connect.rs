@@ -10,6 +10,13 @@
 //! list keeps the login name but never a password; "Remember password"
 //! is offered only where the operating system has a secure store
 //! ([`ConnectScreen::set_keyring`]), and the app keeps it there.
+//!
+//! G0.3c: Login comes filled with `admin`, as in WinBox. A failed connection
+//! is a [`Failure`]: one short sentence for the operator ([`explain`] turns
+//! the router's and the network's errors into one), and what the program
+//! saw under "Details". A router older than the login (G0.3) is told apart
+//! ([`old_router_info`], [`old_router_error`]) and, on this machine, can
+//! still be managed after "Connect anyway".
 
 use egui::{Key, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
@@ -61,6 +68,85 @@ pub struct NeighborRow {
 pub const REMOTE_HINT: &str = "Greyed out: on another machine without a TLS management port. \
      Start its daemon with --listen 0.0.0.0:8729 to manage it from here.";
 
+/// What Login holds on a fresh screen (the first account of every router).
+pub const DEFAULT_LOGIN: &str = "admin";
+
+/// A router older than G0.3: it has no login at all.
+pub const OLD_ROUTER: &str =
+    "This router runs an old version (without login). Update and restart corerouter-daemon.";
+/// The login was refused (the router never says which part was wrong).
+pub const BAD_LOGIN: &str = "Invalid user or password";
+/// A network login while an account of group full has no password (G0.3b).
+pub const SET_PASSWORD_FIRST: &str = "Set the admin password first: log in on the router's own \
+     machine (127.0.0.1, empty password) and set it; until then logins from the network are \
+     refused.";
+const TOO_MANY: &str = "Too many failed logins: wait a moment and try again";
+
+/// Why a connection failed, for the operator.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Failure {
+    /// One short sentence, shown in red.
+    pub text: String,
+    /// What the program saw (router errors, the local token's path…),
+    /// shown only under "Details".
+    pub detail: String,
+    /// An old router without login on this machine: offer "Connect anyway".
+    pub offer_anyway: bool,
+}
+
+impl Failure {
+    pub fn new(text: impl Into<String>, detail: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            detail: detail.into(),
+            offer_anyway: false,
+        }
+    }
+}
+
+impl From<String> for Failure {
+    fn from(text: String) -> Self {
+        Self::new(text, String::new())
+    }
+}
+
+/// `server.info` of a router older than G0.3: it answers but says nothing
+/// about `auth` (every router since then says `"auth": "required"`).
+pub fn old_router_info(info: &Value) -> bool {
+    info.get("version").is_some() && info.get("auth").is_none()
+}
+
+/// The error of a router that does not know the `auth.*` methods.
+pub fn old_router_error(error: &str) -> bool {
+    error.contains("unknown method 'auth.")
+}
+
+/// A connection or login error as one short sentence, the original kept
+/// as the detail. Matches the texts of `corerouter_control` (checked by
+/// the GUI's tests: this crate does not depend on the network code).
+pub fn explain(error: &str) -> Failure {
+    let lower = error.to_ascii_lowercase();
+    let text = if old_router_error(error) {
+        OLD_ROUTER.to_owned()
+    } else if lower.contains("invalid user or password") {
+        BAD_LOGIN.to_owned()
+    } else if lower.contains("login from the network is refused") {
+        SET_PASSWORD_FIRST.to_owned()
+    } else if lower.contains("too many failed logins") {
+        TOO_MANY.to_owned()
+    } else if lower.contains("connection refused") {
+        "Nothing answers at that address: is corerouter-daemon running, on that port?".to_owned()
+    } else if lower.contains("timed out") {
+        "The router did not answer in time".to_owned()
+    } else {
+        return Failure::from(error.chars().take(MAX_ERROR).collect::<String>());
+    };
+    Failure::new(text, error.chars().take(MAX_ERROR).collect::<String>())
+}
+
+/// Longest error text kept from the router or the network (hostile input).
+const MAX_ERROR: usize = 1000;
+
 /// An entry of the Saved tab. Deliberately no password: that goes only to
 /// the operating system's secure store ("Remember password").
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,7 +154,7 @@ pub struct SavedRouter {
     pub address: String,
     pub group: String,
     pub comment: String,
-    /// Login name (empty: the local token on this machine).
+    /// Login name (empty in lists saved before G0.3c: Login gets `admin`).
     pub user: String,
 }
 
@@ -76,11 +162,14 @@ pub struct SavedRouter {
 #[derive(Clone, Default, PartialEq, Eq)]
 pub struct Credentials {
     pub address: String,
-    /// Empty: no login (a router on this machine, with its local token).
+    /// On this machine the local token is tried first, then this user.
+    /// Empty: the local token only.
     pub user: String,
     pub password: String,
     /// Keep the password in the operating system's secure store.
     pub remember: bool,
+    /// The operator chose "Connect anyway" for an old router without login.
+    pub legacy: bool,
 }
 
 impl std::fmt::Debug for Credentials {
@@ -90,6 +179,7 @@ impl std::fmt::Debug for Credentials {
             .field("address", &self.address)
             .field("user", &self.user)
             .field("remember", &self.remember)
+            .field("legacy", &self.legacy)
             .finish_non_exhaustive()
     }
 }
@@ -148,6 +238,22 @@ pub enum ConnectAction {
     VirtualLab,
 }
 
+/// The line under the buttons.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Message {
+    ok: bool,
+    failure: Failure,
+}
+
+impl Message {
+    fn ok(text: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            failure: Failure::new(text, String::new()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     Neighbors,
@@ -172,7 +278,7 @@ pub struct ConnectScreen {
     saved: Vec<SavedRouter>,
     saved_changed: bool,
     /// Last message (error, or a hint) under the buttons.
-    message: Option<(bool, String)>,
+    message: Option<Message>,
     /// Where the Neighbors tab gets its rows, shown above the table.
     source: String,
     offer_lab: bool,
@@ -183,7 +289,7 @@ impl ConnectScreen {
     pub fn new(saved: Vec<SavedRouter>) -> Self {
         Self {
             connect_to: String::new(),
-            login: String::new(),
+            login: DEFAULT_LOGIN.into(),
             password: String::new(),
             remember: false,
             keyring: None,
@@ -208,7 +314,12 @@ impl ConnectScreen {
     }
 
     pub fn set_error(&mut self, text: impl Into<String>) {
-        self.message = Some((false, text.into()));
+        self.fail(Failure::from(text.into()));
+    }
+
+    /// Show why connecting failed (the detail under "Details").
+    pub fn fail(&mut self, failure: Failure) {
+        self.message = Some(Message { ok: false, failure });
     }
 
     /// Where "Remember password" keeps it (e.g. "the system keyring"), or
@@ -231,7 +342,7 @@ impl ConnectScreen {
         self.trust = Some((creds, fingerprint));
     }
 
-    /// Fill the Login field (e.g. from `--user`).
+    /// Fill the Login field (e.g. from `--user`; default `admin`).
     pub fn set_login(&mut self, user: &str) {
         self.login = user.to_owned();
     }
@@ -266,7 +377,7 @@ impl ConnectScreen {
         egui::CentralPanel::default().show(ui, |ui| self.lists(ui, neighbors, &mut action));
         self.trust_window(ui, &mut action);
         if let Some(ConnectAction::Connect(c) | ConnectAction::Trust { creds: c, .. }) = &action {
-            self.message = Some((true, format!("connecting to {}…", c.address)));
+            self.message = Some(Message::ok(format!("connecting to {}…", c.address)));
         }
         action
     }
@@ -329,6 +440,7 @@ impl ConnectScreen {
             user: self.login.trim().to_owned(),
             password: self.password.clone(),
             remember: self.remember && self.keyring.is_some(),
+            legacy: false,
         }
     }
 
@@ -345,11 +457,11 @@ impl ConnectScreen {
         ui.heading("CoreRouter");
         ui.weak("Connect to a router");
         ui.add_space(12.0);
-        let login_hint = "A router on this machine (127.0.0.1) needs no login when this \
-                          OS user runs it (local token). Any other address is TLS with a \
-                          user and password. A new router's admin has no password: log in \
-                          from this machine with an empty one and set it; until then \
-                          logins from the network are refused.";
+        let login_hint = "On this machine (127.0.0.1) the GUI gets in by itself when this \
+                          OS user runs the router; otherwise it logs in with Login and \
+                          Password. Any other address is TLS with a user and password. A \
+                          new router's admin has no password: leave Password empty here \
+                          and set one; until then logins from the network are refused.";
         let mut enter = false;
         egui::Grid::new("connect-grid")
             .num_columns(2)
@@ -428,14 +540,43 @@ impl ConnectScreen {
                 *action = Some(ConnectAction::VirtualLab);
             }
         }
-        if let Some((ok, text)) = &self.message {
-            ui.add_space(8.0);
-            let color = if *ok {
-                ui.visuals().text_color()
-            } else {
-                ui.visuals().error_fg_color
-            };
-            ui.colored_label(color, text.as_str());
+        self.message_ui(ui, action);
+    }
+
+    /// The message under the buttons: the sentence, then "Details" and
+    /// "Connect anyway" when they apply.
+    fn message_ui(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
+        let Some(Message { ok, failure }) = &self.message else {
+            return;
+        };
+        ui.add_space(8.0);
+        let color = if *ok {
+            ui.visuals().text_color()
+        } else {
+            ui.visuals().error_fg_color
+        };
+        let r = ui.colored_label(color, failure.text.as_str());
+        if !failure.detail.is_empty() {
+            r.on_hover_text(failure.detail.as_str());
+            egui::CollapsingHeader::new("Details")
+                .id_salt("connect-details")
+                .show(ui, |ui| {
+                    ui.weak(failure.detail.as_str());
+                });
+        }
+        if failure.offer_anyway
+            && ui
+                .button("Connect anyway")
+                .on_hover_text(
+                    "An old router has no login: anyone on its machine can already manage \
+                     it. The top bar warns until it is updated.",
+                )
+                .clicked()
+        {
+            *action = Some(ConnectAction::Connect(Credentials {
+                legacy: true,
+                ..self.credentials()
+            }));
         }
     }
 
@@ -462,7 +603,7 @@ impl ConnectScreen {
         }
         self.saved_changed = true;
         self.tab = Tab::Saved;
-        self.message = Some((true, format!("saved {address}")));
+        self.message = Some(Message::ok(format!("saved {address}")));
     }
 
     fn lists(
@@ -639,7 +780,11 @@ impl ConnectScreen {
             self.connect_to = s.address;
             self.group = s.group;
             self.comment = s.comment;
-            self.login = s.user;
+            self.login = if s.user.is_empty() {
+                DEFAULT_LOGIN.into()
+            } else {
+                s.user
+            };
             self.message = None;
             if opened.is_some() {
                 self.connect(action);
@@ -655,6 +800,7 @@ mod tests {
     fn conn(addr: &str) -> ConnectAction {
         ConnectAction::Connect(Credentials {
             address: addr.into(),
+            user: DEFAULT_LOGIN.into(),
             ..Credentials::default()
         })
     }
@@ -823,7 +969,7 @@ mod tests {
         );
         assert_eq!(a, None);
         assert!(
-            matches!(&s.message, Some((false, m)) if m.contains("no CoreRouter management port"))
+            matches!(&s.message, Some(Message { ok: false, failure }) if failure.text.contains("no CoreRouter management port"))
         );
     }
 
@@ -851,7 +997,9 @@ mod tests {
         }
         assert_eq!(action, None);
         assert_eq!(s.connect_to, "10.0.0.3:7979");
-        assert!(matches!(&s.message, Some((false, m)) if m.contains("no TLS management port")));
+        assert!(
+            matches!(&s.message, Some(Message { ok: false, failure }) if failure.text.contains("no TLS management port"))
+        );
         // The operator may still try it by hand.
         let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
         let mut action = frame(
@@ -893,7 +1041,7 @@ mod tests {
                 address: "10.0.0.1:7979".into(),
                 group: "pop-1".into(),
                 comment: "edge".into(),
-                user: String::new(),
+                user: DEFAULT_LOGIN.into(),
             }]
         );
         assert!(s.take_saved_change().is_none(), "reported once");
@@ -917,6 +1065,116 @@ mod tests {
     }
 
     #[test]
+    fn login_comes_filled_with_admin() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        s.connect_to = "127.0.0.1:7979".into();
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        // A value, not a placeholder: it goes with Connect.
+        assert!(texts.iter().any(|(x, _)| x == "admin"));
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Connect")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        assert_eq!(a, Some(conn("127.0.0.1:7979")));
+        // A list saved before G0.3c (no user) picks admin too.
+        let mut s = ConnectScreen::new(vec![SavedRouter {
+            address: "127.0.0.1:7980".into(),
+            group: "lab".into(),
+            ..SavedRouter::default()
+        }]);
+        s.login = "op".into();
+        s.tab = Tab::Saved;
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        frame(&ctx, &mut s, &[], click_events(at(&texts, "lab")), &mut t);
+        assert_eq!(s.login, DEFAULT_LOGIN);
+    }
+
+    #[test]
+    fn a_failure_shows_one_sentence_and_the_details_on_demand() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        s.connect_to = "127.0.0.1:7979".into();
+        let detail = "127.0.0.1:7979: no local token readable at /run/user/1/x.token";
+        s.fail(Failure::new(BAD_LOGIN, detail));
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        assert!(texts.iter().any(|(x, _)| x == BAD_LOGIN));
+        assert!(
+            !texts
+                .iter()
+                .any(|(x, _)| x.contains("local token readable"))
+        );
+        assert!(!texts.iter().any(|(x, _)| x == "Connect anyway"));
+        frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Details")),
+            &mut t,
+        );
+        let mut texts = Vec::new();
+        for _ in 0..10 {
+            texts = frame(&ctx, &mut s, &[], Vec::new(), &mut t).1;
+        }
+        assert!(texts.iter().any(|(x, _)| x == detail), "{texts:?}");
+        // The router's words become a sentence; unknown ones stay.
+        let f = explain("127.0.0.1:7979: unknown method 'auth.whoami'; methods: ping");
+        assert_eq!(f.text, OLD_ROUTER);
+        assert!(f.detail.contains("unknown method"));
+        assert_eq!(explain("odd").text, "odd");
+        assert!(explain(&"x".repeat(5000)).text.len() <= MAX_ERROR);
+    }
+
+    #[test]
+    fn an_old_router_offers_connect_anyway() {
+        assert!(old_router_info(
+            &json!({"name": "corerouter", "version": "0.1.0"})
+        ));
+        assert!(!old_router_info(
+            &json!({"version": "0.1.0", "auth": "required"})
+        ));
+        assert!(!old_router_info(&Value::Null));
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        s.connect_to = "127.0.0.1:7979".into();
+        s.fail(Failure {
+            text: OLD_ROUTER.into(),
+            detail: "corerouter-daemon 0.1.0".into(),
+            offer_anyway: true,
+        });
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        assert!(
+            texts
+                .iter()
+                .any(|(x, _)| x.starts_with("This router runs an old version"))
+        );
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Connect anyway")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        let Some(ConnectAction::Connect(c)) = a else {
+            panic!("{a:?}")
+        };
+        assert!(c.legacy);
+        assert_eq!(c.address, "127.0.0.1:7979");
+        // A plain Connect never is.
+        assert!(!s.credentials().legacy);
+    }
+
+    #[test]
     fn empty_connect_to_is_refused_and_lab_is_offered() {
         let ctx = egui::Context::default();
         let mut s = ConnectScreen::new(Vec::new());
@@ -930,7 +1188,7 @@ mod tests {
             &mut t,
         );
         assert_eq!(a, None);
-        assert!(matches!(&s.message, Some((false, _))));
+        assert!(matches!(&s.message, Some(Message { ok: false, .. })));
         let (a, _) = frame(
             &ctx,
             &mut s,
