@@ -1,0 +1,57 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "apps/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+# License intentionally unset: owner decision, see docs/gaps.md G0.1.
+
+[workspace.dependencies]
+# Workspace crates (path deps; the layer table lives in xtask/src/layers.rs).
+corerouter-model = { path = "crates/model" }
+corerouter-hal = { path = "crates/hal" }
+corerouter-hal-linux = { path = "crates/hal-linux" }
+corerouter-proto-bgp = { path = "crates/proto-bgp" }
+corerouter-proto-ospf = { path = "crates/proto-ospf" }
+corerouter-proto-mpls = { path = "crates/proto-mpls" }
+corerouter-proto-cgnat = { path = "crates/proto-cgnat" }
+corerouter-proto-dns = { path = "crates/proto-dns" }
+corerouter-proto-dhcp = { path = "crates/proto-dhcp" }
+corerouter-engine = { path = "crates/engine" }
+corerouter-control = { path = "crates/control" }
+corerouter-mcp = { path = "crates/mcp" }
+corerouter-ui = { path = "crates/ui" }
+
+# External: heavy crates enter with default-features = false.
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+log = "0.4.34"
+env_logger = { version = "0.11.11", default-features = false, features = ["auto-color"] }
+ipnet = { version = "2.12.2", features = ["serde"] }
+egui = { version = "0.37.0", default-features = false, features = ["default_fonts"] }
+eframe = { version = "0.37.0", default-features = false }
+png = "0.18.1"
+base64 = "0.23.1"
+proptest = "1.12.0"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+
+[profile.release]
+# Must stay "unwind": engine::guard relies on catch_unwind to roll back a command.
+panic = "unwind"
+lto = "thin"
+codegen-units = 1

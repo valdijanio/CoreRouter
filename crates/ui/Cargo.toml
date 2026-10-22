@@ -1,0 +1,15 @@
+[package]
+name = "corerouter-ui"
+description = "L5: WinBox-style panels in egui (no eframe, no winit): reads engine state, acts via run(id, params)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corerouter-engine.workspace = true
+egui.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

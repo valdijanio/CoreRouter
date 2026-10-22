@@ -1,0 +1,16 @@
+[package]
+name = "corerouter-control"
+description = "L4: control channel — JSON-per-line over loopback TCP, method dispatch, client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corerouter-engine.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[lints]
+workspace = true

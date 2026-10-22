@@ -1,0 +1,13 @@
+[package]
+name = "corerouter-proto-dhcp"
+description = "L2: DHCPv4/DHCPv6 server and relay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+
+[lints]
+workspace = true

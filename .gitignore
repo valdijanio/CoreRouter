@@ -1,0 +1,6 @@
+/target
+/target-*
+/plan/
+/dist
+*.png
+!docs/**/*.png

@@ -1,0 +1,27 @@
+[package]
+name = "corerouter-gui"
+description = "L6: graphical app (WinBox replacement natively, WebFig replacement on WASM)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corerouter-engine.workspace = true
+corerouter-ui.workspace = true
+eframe = { workspace = true, features = ["wgpu", "default_fonts", "accesskit"] }
+log.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+corerouter-control.workspace = true
+eframe = { workspace = true, features = ["wayland", "x11", "clipboard"] }
+env_logger.workspace = true
+png.workspace = true
+base64.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen-futures = "0.4"
+
+[lints]
+workspace = true

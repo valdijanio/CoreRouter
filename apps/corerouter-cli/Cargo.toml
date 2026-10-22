@@ -1,0 +1,19 @@
+[package]
+name = "corerouter-cli"
+description = "L6: command-line front end and MCP launcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corerouter-engine.workspace = true
+corerouter-control.workspace = true
+corerouter-mcp.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+log.workspace = true
+env_logger.workspace = true
+
+[lints]
+workspace = true

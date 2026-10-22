@@ -1,0 +1,13 @@
+[package]
+name = "corerouter-proto-mpls"
+description = "L2: MPLS/LDP config model, label ranges, validation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+
+[lints]
+workspace = true

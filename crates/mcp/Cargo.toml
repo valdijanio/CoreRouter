@@ -1,0 +1,19 @@
+[package]
+name = "corerouter-mcp"
+description = "L4: hand-written MCP server (JSON-RPC 2.0 over stdio) on top of the command registry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+corerouter-engine.workspace = true
+corerouter-control.workspace = true
+serde_json.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
