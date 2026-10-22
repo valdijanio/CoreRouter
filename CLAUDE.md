@@ -30,20 +30,53 @@ outros roteadores, RFCs, kernel, crates). Antes de planejar:
    problema: VyOS, Juniper Junos, Cisco IOS-XE/NX-OS, Nokia SR Linux, Arista EOS, OPNsense/pfSense,
    OpenWrt, FRR, Ubiquiti EdgeOS/UniFi e as RFCs/padrões envolvidos. Procure o que eles fazem
    melhor que o MikroTik.
-3. **Proponha o que pode ser melhor.** Em cima da ideia principal: o que simplifica a operação, o
+3. **A RFC original quando a feature fala um protocolo** (DHCP, LLDP, BGP, OSPF, IPv6/RA, NAT…),
+   ou quando a documentação do MikroTik é vaga, contraditória ou não cobre um caso de borda
+   (tempos, retransmissão, pacote malformado, interoperabilidade). Leia a cadeia completa: a RFC
+   base, as que a atualizam ("Updated by"/"Obsoleted by", no Datatracker) e a errata
+   (rfc-editor.org/errata). Siga os "MUST/SHOULD" (RFC 2119). Cite a seção no código e no teste
+   que implementa a regra (`// RFC 2131 §4.4.5: T1 = 0,5 × lease`) e transforme os exemplos de
+   pacote da RFC em testes quando houver.
+4. **Proponha o que pode ser melhor.** Em cima da ideia principal: o que simplifica a operação, o
    que evita erro do operador (lockout, conflito, regra inútil), diagnóstico, segurança por
    padrão, e o que o nosso motor (tudo é comando, transações, Safe Mode, MCP) permite que os outros
    não permitem. Separe "entra agora" de "vira gap depois".
-4. **Registre a pesquisa no corpo do PR**, seção `## Pesquisa`: links das fontes, como o MikroTik
-   faz, como os outros fazem, o que adotamos, as melhorias propostas e o que ficou de fora e por
-   quê. Feature grande (novo subsistema/protocolo) ganha também `docs/<feature>.md` com essa
-   seção.
-5. **Sem copiar.** Use a documentação para entender comportamento e nomes; escreva texto e código
+5. **Registre a pesquisa no corpo do PR**, seção `## Pesquisa`: links das fontes (inclusive as
+   RFCs e seções consultadas), como o MikroTik faz, como os outros fazem, o que adotamos, as
+   melhorias propostas e o que ficou de fora e por quê. Feature grande (novo
+   subsistema/protocolo) ganha também `docs/<feature>.md` com essa seção.
+6. **Sem copiar.** Use a documentação para entender comportamento e nomes; escreva texto e código
    próprios (o projeto é AGPL). Formatos proprietários sem especificação (MNDP, RoMON, WinBox)
    não são clonados — veja a decisão do G5 em `docs/gaps.md`.
 
 Quando um humano pede uma feature, mostre a ele esse resumo (MikroTik, outros, melhorias
 propostas) **antes** de implementar e deixe-o escolher o escopo.
+
+## Desempenho e escolha de implementação (Rust puro × ferramenta externa)
+
+Decisões de desempenho se tomam com números, não com preferência.
+
+- **Meça caminhos quentes antes e depois:** encaminhamento/filtragem de pacotes, aplicar
+  milhares de regras/rotas/endereços no kernel, o canal de controle, codecs e parsers de
+  protocolo, ferramentas (ping/MTR). Use os benchmarks do workspace (`cargo xtask bench`,
+  criterion) e registre o resultado em `docs/perf.md` marcado como **medido** (máquina, build
+  release, data). PR que toca caminho quente traz a seção "Desempenho" com antes/depois.
+- **O CI não reprova por benchmark** (máquinas compartilhadas variam). Só entram travas folgadas
+  contra regressões grandes, como o teste de latência do canal de controle.
+- **Orquestrar algo externo (FRR, `nft`, accel-ppp…) ou escrever em Rust puro:** compare com
+  números (vazão/pps, latência, memória, tempo para aplicar N itens) **e** com o que não é número
+  (maturidade e interoperabilidade do protocolo, risco de bug, superfície de segurança, esforço
+  de manutenção).
+  - **Rust puro ganha** quando é mensuravelmente melhor, ou quando elimina um processo externo e
+    um ponto de falha sem perder correção, ou quando o externo não serve (sem API
+    transacional, sem dados estruturados).
+  - **O externo fica** quando correção e interoperabilidade pesam mais que desempenho — o caso
+    típico é um protocolo de roteamento maduro (BGP/OSPF no FRR). O gargalo de um roteador
+    raramente é o plano de controle.
+  - **Rust puro costuma ganhar** no caminho de dados (XDP, G2.5), em codecs/parsers, no motor e
+    na aplicação em lote via netlink.
+- **Registre a decisão** em `docs/architecture.md`: o que foi comparado, os números e o porquê,
+  para poder ser revista com dados depois.
 
 ## Inegociáveis (cada um com o motivo e o que o impõe)
 
@@ -154,7 +187,17 @@ GitHub não impõe isso: esta regra impõe.
 
 ## Progresso
 
-- Ao terminar: atualize o status em `docs/gaps.md`, o log de `ROADMAP.md` e, se a arquitetura
-  mudou, `docs/architecture.md` — no mesmo PR.
+- Ao terminar, no mesmo PR:
+  - atualize **só a linha do seu item** em `docs/gaps.md` (status, critério) — nunca reescreva
+    linhas de outros itens;
+  - acrescente **no fim** de `docs/log.md` uma entrada `- AAAA-MM-DD — <id>: …` (o que entrou,
+    como testar, números medidos);
+  - acrescente **no fim** de `docs/gaps-history.md` uma linha se você criou, redefiniu ou mudou o
+    status de um item;
+  - se a arquitetura mudou, atualize `docs/architecture.md`.
+- `docs/log.md` e `docs/gaps-history.md` são **só de acrescentar** e usam `merge=union`
+  (`.gitattributes`): o git junta as entradas de PRs paralelos sem conflito. Por isso, só
+  acrescente no fim; nunca edite, reordene ou apague entradas antigas.
+- Não crie seções de "histórico de revisão" no fim de outros documentos (geram conflito entre PRs
+  paralelos); o histórico do projeto é o `docs/log.md`.
 - Notas e estimativas erram para baixo; marque cada número como **medido** ou **estimado**.
-- Documento tocado ganha linha no histórico de revisão no fim do arquivo.
