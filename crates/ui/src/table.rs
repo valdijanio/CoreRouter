@@ -13,7 +13,9 @@
 //! comment either in that column or, with "Inline Comments" ticked in its
 //! context menu, as a band above the item (WinBox v4 "Comment Type: header",
 //! the `;;;` line of the RouterOS terminal). The band belongs to the item:
-//! clicking, double clicking and right clicking it act on the item.
+//! clicking, double clicking and right clicking it act on the item. Both
+//! ways draw the comment with the same colours ([`comment_style`]): the
+//! accent blue for an enabled item, dark grey for a disabled (dimmed) one.
 
 use std::collections::BTreeSet;
 
@@ -30,6 +32,8 @@ pub(crate) const MAX_ROWS: usize = 10_000;
 const NOTE_INDENT: f32 = 30.0;
 /// Characters of a comment drawn inline; the rest is cut with "…".
 const NOTE_CHARS: usize = 512;
+/// Room for the speech-bubble icon before a comment in the Comment column.
+const CELL_ICON: f32 = 18.0;
 
 pub(crate) struct Column {
     pub title: &'static str,
@@ -425,7 +429,12 @@ pub(crate) fn show(
     for r in &visible {
         for (i, w) in &mut layout {
             if let Some(cell) = r.cells.get(*i) {
-                *w = w.max(text_width(ui, cell, &font));
+                let icon = if note_col == Some(*i) && !cell.trim().is_empty() {
+                    CELL_ICON
+                } else {
+                    0.0
+                };
+                *w = w.max(icon + text_width(ui, cell, &font));
             }
         }
     }
@@ -454,7 +463,10 @@ pub(crate) fn show(
                 &layout,
                 columns,
                 |i| columns.get(i).map_or("", |c| c.title),
-                visuals.strong_text_color(),
+                Ink {
+                    text: visuals.strong_text_color(),
+                    note: None,
+                },
                 &font,
             );
             ui.painter().hline(
@@ -495,8 +507,9 @@ pub(crate) fn show(
                 }
                 let rect = Rect::from_min_max(pos2(item.left(), item.bottom() - row_h), item.max);
                 let band = Rect::from_min_max(item.min, pos2(item.right(), rect.top()));
+                let style = comment_style(&visuals, row.dimmed, selected);
                 if let Some(note) = note {
-                    paint_note(ui, band, note, selected, row.dimmed, &font);
+                    paint_note(ui, band, note, &style, &font);
                 }
                 let color = match (selected, row.dimmed) {
                     (true, _) => visuals.selection.stroke.color,
@@ -509,7 +522,10 @@ pub(crate) fn show(
                     &layout,
                     columns,
                     |c| row.cells.get(c).map_or("", String::as_str),
-                    color,
+                    Ink {
+                        text: color,
+                        note: note_col.filter(|_| !inline).map(|c| (c, &style)),
+                    },
                     &font,
                 );
 
@@ -606,53 +622,75 @@ fn note_text(cell: &str) -> Option<String> {
     Some(cut)
 }
 
-/// Accent of the comment band: a calm blue that reads on both themes.
-fn note_accent(v: &Visuals) -> Color32 {
-    if v.dark_mode {
-        Color32::from_rgb(105, 160, 235)
-    } else {
-        Color32::from_rgb(35, 105, 200)
+/// Colours of an item's comment, the same in the inline band and in the
+/// Comment column: `ink` for the text, `accent` for the bar and the
+/// speech-bubble icon, `wash` behind the band (`None` on a selected item,
+/// which keeps the selection fill).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CommentStyle {
+    pub ink: Color32,
+    pub accent: Color32,
+    pub wash: Option<Color32>,
+}
+
+/// The one place comment colours are decided. An enabled item gets a calm
+/// blue that reads on both themes; a disabled one (the row's `dimmed`, the
+/// flag X greying the whole row) gets dark grey, so the comment fades with
+/// its item. On a selected row everything takes the selection's text
+/// colour, legible on the selection fill in both themes.
+pub(crate) fn comment_style(v: &Visuals, disabled: bool, selected: bool) -> CommentStyle {
+    let (ink, accent) = match (disabled, v.dark_mode) {
+        (false, true) => (
+            Color32::from_rgb(170, 205, 250),
+            Color32::from_rgb(105, 160, 235),
+        ),
+        (false, false) => (
+            Color32::from_rgb(25, 80, 160),
+            Color32::from_rgb(35, 105, 200),
+        ),
+        (true, true) => (Color32::from_gray(125), Color32::from_gray(100)),
+        (true, false) => (Color32::from_gray(85), Color32::from_gray(110)),
+    };
+    if selected {
+        let ink = v.selection.stroke.color;
+        return CommentStyle {
+            ink,
+            accent: ink,
+            wash: None,
+        };
+    }
+    let wash = accent.gamma_multiply(if v.dark_mode { 0.16 } else { 0.10 });
+    CommentStyle {
+        ink,
+        accent,
+        wash: Some(wash),
     }
 }
 
-/// The band above a commented item: a faint accent wash, an accent bar and
-/// a speech-bubble icon at the left, and the comment in italics.
-fn paint_note(ui: &Ui, band: Rect, text: &str, selected: bool, dimmed: bool, font: &egui::FontId) {
-    let v = ui.visuals();
-    let painter = ui.painter();
-    let accent = note_accent(v);
-    let ink = match (selected, v.dark_mode) {
-        (true, _) => v.selection.stroke.color,
-        (false, true) => Color32::from_rgb(170, 205, 250),
-        (false, false) => Color32::from_rgb(25, 80, 160),
-    };
-    let ink = if dimmed && !selected {
-        ink.gamma_multiply(0.6)
-    } else {
-        ink
-    };
-    if !selected {
-        let wash = accent.gamma_multiply(if v.dark_mode { 0.16 } else { 0.10 });
-        painter.rect_filled(band, 0.0, wash);
-    }
-    let bar = Rect::from_min_size(band.min, vec2(3.0, band.height()));
-    painter.rect_filled(bar, 0.0, if selected { ink } else { accent });
-
-    // Speech bubble: a rounded body with a tail at its lower left.
-    let c = pos2(band.left() + 16.0, band.center().y - 1.0);
+/// Speech bubble centred at `c`: a rounded body with a tail at its lower left.
+fn paint_bubble(painter: &egui::Painter, c: egui::Pos2, color: Color32) {
     let body = Rect::from_center_size(c, vec2(12.0, 8.0));
-    let icon = if selected { ink } else { accent };
-    painter.rect_filled(body, 2.5, icon);
+    painter.rect_filled(body, 2.5, color);
     painter.add(egui::Shape::convex_polygon(
         vec![
             pos2(body.left() + 2.0, body.bottom() - 0.5),
             pos2(body.left() + 6.0, body.bottom() - 0.5),
             pos2(body.left() + 1.5, body.bottom() + 3.5),
         ],
-        icon,
+        color,
         Stroke::NONE,
     ));
+}
 
+/// A comment in italics, its left edge at `x`, centred on `y`.
+fn paint_comment_text(
+    painter: &egui::Painter,
+    x: f32,
+    y: f32,
+    text: &str,
+    ink: Color32,
+    font: &egui::FontId,
+) {
     let job = egui::text::LayoutJob::single_section(
         text.to_owned(),
         egui::TextFormat {
@@ -663,11 +701,32 @@ fn paint_note(ui: &Ui, band: Rect, text: &str, selected: bool, dimmed: bool, fon
         },
     );
     let galley = painter.layout_job(job);
-    let at = pos2(
-        band.left() + NOTE_INDENT,
-        band.center().y - galley.size().y / 2.0,
-    );
+    let at = pos2(x, y - galley.size().y / 2.0);
     painter.galley(at, galley, ink);
+}
+
+/// The band above a commented item: a faint wash, a bar and a
+/// speech-bubble icon at the left, and the comment in italics.
+fn paint_note(ui: &Ui, band: Rect, text: &str, style: &CommentStyle, font: &egui::FontId) {
+    let painter = ui.painter();
+    if let Some(wash) = style.wash {
+        painter.rect_filled(band, 0.0, wash);
+    }
+    let bar = Rect::from_min_size(band.min, vec2(3.0, band.height()));
+    painter.rect_filled(bar, 0.0, style.accent);
+    paint_bubble(
+        painter,
+        pos2(band.left() + 16.0, band.center().y - 1.0),
+        style.accent,
+    );
+    paint_comment_text(
+        painter,
+        band.left() + NOTE_INDENT,
+        band.center().y,
+        text,
+        style.ink,
+        font,
+    );
 }
 
 /// Shortcuts act only while the table has keyboard focus (it gets it from a
@@ -734,6 +793,13 @@ fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
         .x
 }
 
+/// Colours of one line of cells: `text` for plain cells, `note` the Comment
+/// column and its colours (icon and italics, like the inline band).
+struct Ink<'s> {
+    text: Color32,
+    note: Option<(usize, &'s CommentStyle)>,
+}
+
 /// Paint one line of cells; `layout` is (column index, width) of the
 /// columns shown, `text` the cell of a column index.
 fn paint_cells<'a>(
@@ -742,11 +808,23 @@ fn paint_cells<'a>(
     layout: &[(usize, f32)],
     columns: &[Column],
     text: impl Fn(usize) -> &'a str,
-    color: egui::Color32,
+    ink: Ink<'_>,
     font: &egui::FontId,
 ) {
+    let color = ink.text;
     let mut x = rect.left();
     for &(i, w) in layout {
+        if let Some((_, style)) = ink.note.filter(|(c, _)| *c == i) {
+            let cell = text(i);
+            if !cell.trim().is_empty() {
+                let painter = ui.painter();
+                let y = rect.center().y;
+                paint_bubble(painter, pos2(x + CELL_PAD + 6.0, y - 1.0), style.accent);
+                paint_comment_text(painter, x + CELL_PAD + CELL_ICON, y, cell, style.ink, font);
+            }
+            x += w;
+            continue;
+        }
         let right = columns.get(i).is_some_and(|c| c.right);
         let (anchor, at) = if right {
             (

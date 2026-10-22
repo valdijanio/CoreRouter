@@ -1319,6 +1319,24 @@ mod tests {
             self.find_text(needle).is_some()
         }
 
+        /// Colour of the topmost text painted exactly as `needle`.
+        fn text_color(&self, needle: &str) -> egui::Color32 {
+            fn find(shape: &egui::Shape, needle: &str, out: &mut Option<egui::Color32>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == needle => {
+                        *out = t.galley.job.sections.first().map(|s| s.format.color);
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| find(s, needle, out)),
+                    _ => {}
+                }
+            }
+            let mut out = None;
+            for s in &self.shapes {
+                find(&s.shape, needle, &mut out);
+            }
+            out.unwrap_or_else(|| panic!("no text {needle:?} on screen"))
+        }
+
         fn selected(&self) -> Vec<String> {
             let rows: Vec<table::Row> = self
                 .app
@@ -2129,6 +2147,54 @@ mod tests {
         h.click(h.text("Inline Comments"));
         assert!(!h.app.tables.interfaces.inline_comments);
         assert!(h.has_text("Comment"));
+    }
+
+    #[test]
+    fn comments_are_blue_when_enabled_and_grey_when_disabled() {
+        let mut h = Harness::new();
+        {
+            let mut s = lock(&h.session);
+            s.execute(
+                "interface.set",
+                &json!({"name": "ether4", "comment": "queimou"}),
+            )
+            .unwrap();
+            s.execute(
+                "interface.set",
+                &json!({"name": "ether5", "comment": "reserva", "disabled": true}),
+            )
+            .unwrap();
+        }
+        h.app.cache.refreshed_at = None;
+        h.idle();
+        h.idle();
+        let blue = |c: egui::Color32| c.b() > c.r() + 40 && c.b() > c.g();
+        let grey = |c: egui::Color32| c.r() == c.g() && c.g() == c.b();
+        for inline in [false, true] {
+            h.app.tables.interfaces.inline_comments = inline;
+            for theme in [egui::Theme::Light, egui::Theme::Dark] {
+                h.ctx.set_theme(theme);
+                h.idle();
+                h.idle();
+                let v = h.ctx.global_style().visuals.clone();
+                let on = h.text_color("queimou");
+                let off = h.text_color("reserva");
+                let why = format!("inline={inline} {theme:?}: {on:?} {off:?}");
+                assert_eq!(on, table::comment_style(&v, false, false).ink, "{why}");
+                assert_eq!(off, table::comment_style(&v, true, false).ink, "{why}");
+                assert!(blue(on) && grey(off), "{why}");
+                // The grey still reads on the table's background.
+                let bg = v.panel_fill;
+                let gap = (i32::from(off.r()) - i32::from(bg.r())).abs();
+                assert!(gap > 60, "{why} on {bg:?}");
+
+                // A selected item's comment takes the selection's text colour.
+                h.click(h.row("ether5"));
+                assert_eq!(h.text_color("reserva"), v.selection.stroke.color, "{why}");
+                h.click(h.row("ether5") + egui::vec2(0.0, 200.0));
+                assert!(h.selected().is_empty());
+            }
+        }
     }
 
     #[test]
