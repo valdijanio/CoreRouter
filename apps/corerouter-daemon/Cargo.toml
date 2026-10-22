@@ -25,6 +25,11 @@ log.workspace = true
 env_logger.workspace = true
 signal-hook.workspace = true
 serde_json.workspace = true
+# service/https.rs: adlist downloads (G4.1d) without a system resolver or CA
+# store: the router's resolver and the Mozilla roots compiled in.
+rustls.workspace = true
+webpki-roots = "1.0.10"
+httparse = "1.10.1"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # service/dns_server.rs: IP_PKTINFO / IPV6_RECVPKTINFO (answer from the
@@ -33,6 +38,8 @@ nix = { version = "0.30.1", default-features = false, features = ["socket", "uio
 
 [dev-dependencies]
 serde_json.workspace = true
+# service/https.rs: a local TLS server with a self-signed certificate.
+rcgen.workspace = true
 # service/dns.rs and netns_dns.rs: a test DNS server.
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 # netns_dhcp.rs: a DHCP server thread inside another network namespace.

@@ -113,6 +113,13 @@ impl Statics {
     }
 }
 
+/// Whether an enabled static FWD entry matches `key`: RouterOS (7.17)
+/// takes it as an allowlist, the adlist leaves that name alone.
+pub(crate) fn forwarded(f: &Forwarder, q: &Query, key: &str) -> bool {
+    let statics = f.compiled(&q.config, Statics::build);
+    statics.matching(key).any(|e| e.rtype == StaticType::Fwd)
+}
+
 fn record_type(t: StaticType) -> Option<RecordType> {
     Some(match t {
         StaticType::A => RecordType::A,

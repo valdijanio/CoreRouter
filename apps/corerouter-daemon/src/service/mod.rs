@@ -190,11 +190,6 @@ impl Health {
         self.0.stop.store(true, Ordering::Release);
     }
 
-    /// The daemon's shutdown (for code that already takes one).
-    pub(crate) fn shutdown(&self) -> &Shutdown {
-        &self.0.shutdown
-    }
-
     /// Sleep `d`, waking early to stop; `false` when stopping.
     pub(crate) fn sleep(&self, d: Duration) -> bool {
         let until = Instant::now() + d;
@@ -299,6 +294,7 @@ mod tests {
     fn services_are_found_and_flags_are_unique() {
         let names: Vec<&str> = ALL.iter().map(|s| s.name).collect();
         for want in [
+            "dns-adlist",
             "dns-resolver",
             "dns-server",
             "metrics",

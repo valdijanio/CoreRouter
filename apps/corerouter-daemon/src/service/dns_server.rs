@@ -36,9 +36,7 @@ use std::time::Duration;
 use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::Config;
-use corerouter_proto_dns::server::{
-    Done, Effect, Forwarder, MAX_QUERY, Pending, Start, allowed_networks,
-};
+use corerouter_proto_dns::server::{Done, Effect, Forwarder, MAX_QUERY, Pending, Start, Statistics};
 use super::dns::RouterDns;
 use corerouter_model::service::Listen;
 use sock::{Udp, bind_tcp};
@@ -269,8 +267,14 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
     }
 }
 
-/// The sockets of one epoch; where they listen.
-fn open(srv: &Arc<Server>, port: u16, epoch: u64) -> Result<Vec<SocketAddr>, String> {
+/// The sockets of one epoch, their threads counted in `health`; where
+/// they listen.
+fn open(
+    srv: &Arc<Server>,
+    port: u16,
+    epoch: u64,
+    health: &super::Health,
+) -> Result<Vec<SocketAddr>, String> {
     let mut opened = Vec::new();
     for ip in [IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
         let addr = SocketAddr::new(ip, port);
@@ -289,14 +293,12 @@ fn open(srv: &Arc<Server>, port: u16, epoch: u64) -> Result<Vec<SocketAddr>, Str
     let at = opened.iter().map(|(_, _, a)| *a).collect();
     for (udp, tcp, _) in opened {
         let s = srv.clone();
-        thread::Builder::new()
-            .name("dns-udp".into())
-            .spawn(move || udp_loop(s, udp, epoch))
+        health
+            .spawn("dns-udp", move || udp_loop(s, udp, epoch))
             .map_err(|e| e.to_string())?;
         let s = srv.clone();
-        thread::Builder::new()
-            .name("dns-tcp-accept".into())
-            .spawn(move || tcp_loop(s, tcp, epoch))
+        health
+            .spawn("dns-tcp-accept", move || tcp_loop(s, tcp, epoch))
             .map_err(|e| e.to_string())?;
     }
     Ok(at)
@@ -327,13 +329,7 @@ pub(crate) fn spawn(
     port: u16,
     shutdown: Shutdown,
 ) -> std::io::Result<Arc<Server>> {
-    let (srv, rx) = server(dns, shutdown.clone());
-    {
-        let session = session.clone();
-        thread::Builder::new()
-            .name("dns-effects".into())
-            .spawn(move || apply_effects(&session, &rx))?;
-    }
+    let srv = prepare(&session, dns, shutdown.clone())?;
     let keep = srv.clone();
     let health = super::Health::new(shutdown);
     thread::Builder::new()
@@ -342,7 +338,14 @@ pub(crate) fn spawn(
     Ok(srv)
 }
 
-fn server(dns: Arc<RouterDns>, shutdown: Shutdown) -> (Arc<Server>, Receiver<Effect>) {
+/// The forwarder and its effects thread, registered in the session. One
+/// for the daemon's life: a restart of the service keeps its lists and
+/// counters (only the sockets and the follow loop are per run).
+fn prepare(
+    session: &Shared,
+    dns: Arc<RouterDns>,
+    shutdown: Shutdown,
+) -> std::io::Result<Arc<Server>> {
     let (tx, rx) = channel();
     let srv = Arc::new(Server {
         fwd: Forwarder::new(dns.resolver.clone()),
@@ -353,12 +356,23 @@ fn server(dns: Arc<RouterDns>, shutdown: Shutdown) -> (Arc<Server>, Receiver<Eff
         epoch: AtomicU64::new(0),
         shutdown,
     });
-    (srv, rx)
+    {
+        let session = session.clone();
+        thread::Builder::new()
+            .name("dns-effects".into())
+            .spawn(move || apply_effects(&session, &rx))?;
+    }
+    // `ip.dns.statistics.print` reads what the chain counts.
+    lock(session).set_dns_statistics(srv.fwd.state::<Statistics>());
+    Ok(srv)
 }
 
-/// Copies the config in when it changes; opens and closes the sockets.
+/// Copies the config in when it changes, or when what `allowed_from`
+/// stands for does (a DHCP lease, a delegated prefix); opens and closes the
+/// sockets.
 fn follow(session: &Shared, srv: &Arc<Server>, port: u16, health: &super::Health) {
     let mut last: Option<Config> = None;
+    let mut last_allowed = Vec::new();
     let mut listening = false;
     let mut retry_at = 0u64;
     loop {
@@ -367,25 +381,30 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, health: &super::Health
             return;
         }
         health.beat();
-        let changed = {
+        let (changed, allowed) = {
             let s = lock(session);
             let running = s.store().running();
+            let allowed = s.dns_allowed_networks(running);
             if last.as_ref() == Some(running) {
-                None
+                (None, allowed)
             } else {
-                Some(running.clone())
+                (Some(running.clone()), allowed)
             }
         };
-        if let Some(cfg) = changed {
-            let allowed = allowed_networks(&cfg);
-            srv.fwd.configure(Arc::new(cfg.clone()), allowed);
-            last = Some(cfg);
+        if changed.is_some() || allowed != last_allowed {
+            if let Some(cfg) = changed {
+                last = Some(cfg);
+            }
+            if let Some(cfg) = &last {
+                srv.fwd.configure(Arc::new(cfg.clone()), allowed.clone());
+            }
+            last_allowed = allowed;
         }
         let want = last.as_ref().is_some_and(|c| c.ip.dns.allow_remote_requests);
         let now = srv.dns.now_ms();
         if want && !listening && now >= retry_at {
             let epoch = srv.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-            match open(srv, port, epoch) {
+            match open(srv, port, epoch, health) {
                 Ok(at) => {
                     health.listen(at.iter().flat_map(|a| [Listen::new("udp", *a), Listen::new("tcp", *a)]).collect());
                     health.clear_error();
@@ -435,16 +454,28 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
             .map_err(|_| format!("--dns-port: '{p}' is not a port"))?,
     };
     let session = ctx.session.clone();
+    let shutdown = ctx.shutdown.clone();
     Ok(Box::new(move |health: &super::Health| {
-        let dns = super::dns::router().ok_or("the DNS resolver is not running")?;
-        let (srv, rx) = server(dns, health.shutdown().clone());
-        let effects = session.clone();
-        health
-            .spawn("dns-effects", move || apply_effects(&effects, &rx))
-            .map_err(|e| format!("cannot start its threads: {e}"))?;
+        let srv = match SERVER.get() {
+            Some(srv) => srv.clone(),
+            None => {
+                let dns = super::dns::router().ok_or("the DNS resolver is not running")?;
+                let srv = prepare(&session, dns, shutdown.clone())
+                    .map_err(|e| format!("cannot start its threads: {e}"))?;
+                SERVER.get_or_init(|| srv).clone()
+            }
+        };
         follow(&session, &srv, port, health);
         Ok(())
     }))
+}
+
+/// The forwarder, once started (the adlist loader fills its lists).
+static SERVER: std::sync::OnceLock<Arc<Server>> = std::sync::OnceLock::new();
+
+/// The block lists the forwarder matches (G4.1d), once it started.
+pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
+    SERVER.get().map(|s| s.fwd.state())
 }
 
 /// Linux: the destination address of each query (IP_PKTINFO /
@@ -760,6 +791,16 @@ mod tests {
                 .unwrap();
             rows.as_array().is_some_and(|r| r.len() == 1)
         });
+        // G4.1e: the chain counted all of it.
+        let st = lock(&session)
+            .execute("ip.dns.statistics.print", &json!({}))
+            .unwrap();
+        assert_eq!(st["resolver"], "router");
+        assert_eq!(st["tcp"], 1);
+        assert!(st["answered"]["static"].as_u64().unwrap() >= 1, "{st}");
+        assert!(st["answered"]["upstream"].as_u64().unwrap() >= 1, "{st}");
+        assert_eq!(st["answered"]["cache"], 1, "{st}");
+        assert_eq!(st["clients"][0]["address"], "127.0.0.1");
 
         lock(&session)
             .execute("ip.dns.set", &json!({"allow_remote_requests": false}))

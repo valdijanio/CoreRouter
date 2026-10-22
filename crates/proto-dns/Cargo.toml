@@ -31,5 +31,9 @@ harness = false
 name = "forwarder"
 harness = false
 
+[[bench]]
+name = "adlist"
+harness = false
+
 [lints]
 workspace = true

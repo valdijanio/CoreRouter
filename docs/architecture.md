@@ -473,6 +473,17 @@ UDP/TCP 53 ─► Forwarder::start (thread do socket) ─► acl, limit, special
 efeitos (address-list) ─► thread "dns-effects" ─► Session::dns_address_list
 ```
 
+**Adlist e HTTPS do daemon (G4.1d).** As listas de bloqueio ficam fora da config e fora do lock
+do `Session`: o serviço `service/dns_adlist.rs` baixa, lê e ordena cada lista numa thread própria
+e troca o conjunto da etapa `adlist` de uma vez (`proto-dns::adlist::Adlists`). O conjunto é uma
+arena de texto ordenada com deslocamentos (busca binária por rótulo), não um `HashSet<String>`:
+**medido** 31,8 MB para 1 M nomes (~32 B/nome, contra ~70 B estimados no `HashSet`), 230 ms para
+ler e montar, 80–110 ns por consulta. O download usa um cliente HTTP/1.1 nosso
+(`service/https.rs`, rustls + raízes Mozilla do `webpki-roots`) e não o `ureq`/`reqwest`: o
+roteador não tem resolvedor do sistema nem loja de CAs, então o nome do servidor passa pelo
+resolvedor do roteador, e todos os limites (cabeçalho, corpo, redirecionamentos) são nossos. O
+mesmo cliente servirá o DoH da G4.1d-2.
+
 Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
 
 ### Supervisor de serviços do daemon (G0.10)
