@@ -104,7 +104,7 @@ fn opt_allowed(p: &Value) -> Result<Option<Vec<AllowedServer>>> {
 }
 
 /// A list of strings, or one comma-separated string (outside quotes).
-fn opt_list(p: &Value, key: &str) -> Result<Option<Vec<String>>> {
+pub(super) fn opt_list(p: &Value, key: &str) -> Result<Option<Vec<String>>> {
     match p.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(s)) if s.trim().is_empty() => Ok(Some(Vec::new())),

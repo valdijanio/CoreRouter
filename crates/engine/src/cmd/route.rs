@@ -3,9 +3,11 @@
 
 use std::cmp::Ordering;
 
+use corerouter_hal::Learned;
 use corerouter_model::route::{self, Reach};
 use corerouter_model::{
-    Config, DEFAULT_DISTANCE, Gateway, ItemId, RouteEntry, RoutingTable, parse_destination,
+    Config, DEFAULT_DISTANCE, Gateway, InterfaceKind, ItemId, RouteEntry, RoutingTable,
+    parse_destination,
 };
 use ipnet::IpNet;
 use serde_json::{Value, json};
@@ -13,6 +15,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, req_str};
 use super::{CommandSpec, always};
 use crate::dhcp_client::is_dynamic;
+use crate::dhcp6_client::ra_id;
 use crate::validate::route_issues;
 use crate::{EngineError, Result, Session};
 
@@ -49,7 +52,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string} → [{id (null if connected), dst_address, gateway, distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static), active, static, connected, dynamic (from a DHCP lease or connected), disabled, immediate_gw, reason, comment}]",
+        "{routing_table?: string} → [{id (null if connected), dst_address, gateway, distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (static | connect | dhcp | ra), disabled, immediate_gw, reason, comment}]",
         always, list),
 ];
 
@@ -127,8 +130,9 @@ fn existing(cfg: &Config, p: &Value) -> Result<(usize, ItemId)> {
         return Err(EngineError::bad(
             "id",
             format!(
-                "{id} is dynamic (a DHCP client's route); change the client instead \
-                 (ip.dhcp-client.set add_default_route, default_route_distance)"
+                "{id} is dynamic (a DHCP client's route or a Router Advertisement); change the \
+                 client instead (ip.dhcp-client.set / ipv6.dhcp-client.set add_default_route, \
+                 default_route_distance) or stop accepting RA (ipv6.settings.set)"
             ),
         ));
     }
@@ -210,6 +214,8 @@ struct Line {
     immediate: Option<String>,
     reason: Option<String>,
     comment: String,
+    /// Learned from a Router Advertisement (G4.7b).
+    ra: bool,
 }
 
 /// Main table first, then VRFs by name; inside a table by destination,
@@ -227,6 +233,7 @@ fn order(a: &Line, b: &Line) -> Ordering {
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter: Option<RoutingTable> = opt_parse(p, "routing_table")?;
     // With the routes DHCP clients installed (flags DS, as in RouterOS v6).
+    let learned = s.hal_mut().ipv6_learned().unwrap_or_default();
     let cfg = s.effective(s.store().candidate());
     let cfg = cfg.as_ref();
     let mut lines: Vec<Line> = cfg
@@ -257,6 +264,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 immediate,
                 reason,
                 comment: r.comment.clone(),
+                ra: false,
             }
         })
         .collect();
@@ -273,7 +281,55 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         reason:
             (!c.active).then(|| format!("interface '{}' or its address is disabled", c.interface)),
         comment: String::new(),
+        ra: false,
     }));
+    // What the kernel learned from Router Advertisements: its metric (1024
+    // for a default router) is above every static distance, so they sort
+    // last and lose to a static route, as in the kernel.
+    for (n, l) in learned.into_iter().enumerate() {
+        let Learned::Route {
+            interface,
+            dst,
+            gateway,
+            table,
+            expires_secs,
+            ..
+        } = l
+        else {
+            continue;
+        };
+        let table = cfg
+            .interfaces
+            .iter()
+            .find_map(|(name, i)| match i.kind {
+                InterfaceKind::Vrf { table: t } if t == table => {
+                    Some(RoutingTable::Vrf(name.clone()))
+                }
+                _ => None,
+            })
+            .unwrap_or(RoutingTable::Main);
+        let via = match gateway {
+            Some(g) => format!("{g}%{interface}"),
+            None => interface.to_string(),
+        };
+        lines.push(Line {
+            id: Some(ra_id(n)),
+            dst: IpNet::V6(dst),
+            gateway: via.clone(),
+            distance: u8::MAX,
+            table,
+            usable: true,
+            connected: false,
+            disabled: false,
+            immediate: Some(via),
+            reason: None,
+            comment: match expires_secs {
+                Some(e) => format!("router advertisement, expires in {e}s"),
+                None => "router advertisement".into(),
+            },
+            ra: true,
+        });
+    }
     lines.sort_by(order);
 
     let mut rows = Vec::with_capacity(lines.len());
@@ -304,10 +360,11 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         if active {
             flags.push('A');
         }
-        flags.push_str(match (l.connected, dynamic) {
-            (true, _) => "DC",
-            (false, true) => "DS",
-            (false, false) => "S",
+        flags.push_str(match (l.connected, dynamic, l.ra) {
+            (true, _, _) => "DC",
+            (false, _, true) => "D",
+            (false, true, false) => "DS",
+            (false, false, false) => "S",
         });
         rows.push(json!({
             "id": l.id,
@@ -317,7 +374,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             "routing_table": l.table,
             "flags": flags,
             "active": active,
-            "static": !l.connected,
+            "static": !l.connected && !l.ra,
+            "origin": if l.ra { "ra" } else if l.connected { "connect" } else if dynamic { "dhcp" } else { "static" },
             "connected": l.connected,
             "dynamic": dynamic,
             "disabled": l.disabled,

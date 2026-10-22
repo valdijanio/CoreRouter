@@ -542,6 +542,20 @@ mesmo dia pode variar.
   (bloquear 127.0.0.1 pela própria GUI → janela → Safe Mode e aplicar) conferidos em screenshot.
   Esforço do agente ~6 h (**estimado**).
 - 2026-10-22 — processo: proteção da main sem "branch atualizada" (strict=false) para dar vazão; workflow `main-red` abre/fecha a issue "main quebrada" quando o CI da main falha/volta; AGENTS.md: trazer a main antes do PR, main vermelha é prioridade zero, ids de gap só do brief/main, sessões não abrem sessões, PRs pequenos, pontos quentes com mudanças mínimas. Medido antes: CI de PR mediana 2,0 min, 1,6 execuções por PR.
+- 2026-10-22 — G4.7b: cliente DHCPv6 estilo `/ipv6 dhcp-client` do RouterOS (RFC 9915): IA_NA +
+  IA_PD, Rapid Commit, retransmissão da §15, limite de taxa da §14.1, NoBinding/NotOnLink,
+  validades por binding, sem Release ao parar; codec próprio (`proto-dhcp::v6`; o `dhcproto` v6
+  dá panic com bytes hostis). Prefixo delegado vira pool; `ip.address.add address=::1/64
+  from_pool=pd` numera a LAN e renumera com o prefixo. `ipv6.settings` decide o `accept_ra` de
+  cada interface (padrão `auto`: só onde há cliente DHCPv6) e o hal-linux limpa na hora o que o
+  kernel aprendeu por RA onde ele deixa de valer (o caso do endereço do provedor na `eno1`).
+  Endereços/rotas de RA e DHCPv6 com flag D e origem nas listas; janelas IPv6 › DHCPv6 Client,
+  Pool e Settings; terminal `/ipv6 …`. Testes: 26 novos no `proto-dhcp` (codec + máquina com
+  relógio simulado + proptest), 10 de integração no engine, netns com daemon real, servidor
+  DHCPv6 e RAs em Rust (teste inteiro em ~4,3 s **medido**), UI headless e terminal. Como testar:
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-daemon --test netns_dhcp6`; no lab, `ipv6.dhcp-client.add interface=ether1
+  request=address,prefix pool_name=pd` e IPv6 › IPv6 Pool.
 - 2026-10-22 — processo: workflow `pr-sync` (`scripts/pr-sync.sh`): a cada push na `main`, os PRs
   com auto-merge que o GitHub marca CONFLICTING recebem o merge de verdade da `main` (o GitHub
   ignora o `merge=union` e marcava conflito só por causa de `docs/log.md`/`docs/gaps-history.md`);

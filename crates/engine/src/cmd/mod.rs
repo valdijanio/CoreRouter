@@ -85,6 +85,7 @@ mod interface;
 mod interface_info;
 mod interface_list;
 mod ip;
+mod ipv6;
 mod neighbor;
 mod route;
 mod routing;
@@ -102,6 +103,7 @@ static AREAS: &[&[CommandSpec]] = &[
     route::COMMANDS,
     vrf::COMMANDS,
     dhcp_client::COMMANDS,
+    ipv6::COMMANDS,
     firewall::COMMANDS,
     firewall_assist::COMMANDS,
     firewall_zone::COMMANDS,

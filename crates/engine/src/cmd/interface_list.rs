@@ -209,6 +209,15 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let cfg = s.store_mut().candidate_mut();
     let (pos, name) = existing_list(cfg, p, "name")?;
+    if cfg.ipv6.settings.accept_router_advertisements_on == name {
+        return Err(EngineError::bad(
+            "name",
+            format!(
+                "ipv6 settings accept RA on '{name}'; set accept_router_advertisements_on to \
+                 another list first (ipv6.settings.set)"
+            ),
+        ));
+    }
     let users = used_by(cfg, &name);
     if !users.is_empty() {
         return Err(EngineError::bad(
