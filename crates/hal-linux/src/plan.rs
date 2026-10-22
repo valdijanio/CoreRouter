@@ -543,6 +543,7 @@ mod tests {
             interface: n(iface),
             disabled: false,
             comment: String::new(),
+            from_pool: None,
         });
     }
 
@@ -820,6 +821,7 @@ mod tests {
             interface: n("host0"),
             disabled: false,
             comment: String::new(),
+            from_pool: None,
         });
         assert_eq!(
             plan(&from, &to).unwrap(),

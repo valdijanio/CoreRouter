@@ -80,14 +80,7 @@ impl LabServer {
 
     /// Network number N of `port`.
     pub fn net_of(port: &IfName) -> u8 {
-        let name = port.as_str();
-        let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
-        let n = name
-            .get(name.len().saturating_sub(digits)..)
-            .and_then(|d| d.parse::<u32>().ok())
-            .filter(|n| (1..=254).contains(n))
-            .unwrap_or_else(|| 1 + hash(name.as_bytes()) % 254);
-        u8::try_from(n).unwrap_or(1)
+        corerouter_hal::dhcp::lab_net(port)
     }
 
     /// The address the lab gives `mac` behind `port`.
@@ -107,9 +100,7 @@ impl LabServer {
 }
 
 fn hash(bytes: &[u8]) -> u32 {
-    bytes.iter().fold(2_166_136_261u32, |h, b| {
-        (h ^ u32::from(*b)).wrapping_mul(16_777_619)
-    })
+    corerouter_hal::dhcp::lab_hash(bytes)
 }
 
 impl DhcpResponder for LabServer {

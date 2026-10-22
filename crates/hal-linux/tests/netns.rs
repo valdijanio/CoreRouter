@@ -123,6 +123,7 @@ fn addr(cfg: &mut Config, iface: &str, a: &str) {
         interface: n(iface),
         disabled: false,
         comment: String::new(),
+        from_pool: None,
     });
 }
 

@@ -2,15 +2,20 @@
 
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName, InterfaceKind};
 
-use crate::dhcp::{Datagram, Dest, DhcpPort, SharedResponder};
+use crate::dhcp::{
+    Datagram, Datagram6, Dest, Dhcp6Port, DhcpPort, SharedResponder, SharedResponder6, eui64,
+    lab_net, lab_router_mac, link_local,
+};
 use crate::nic::{CounterGroup, EthernetMonitor, LinkCounters, NicHardware, Offload, base_t_modes};
-use crate::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState, SharedProber, SimProber};
+use crate::{
+    DynamicChange, Features, Hal, HalError, Learned, LinkInfo, LinkState, SharedProber, SimProber,
+};
 
 #[derive(Clone)]
 pub struct VirtualHal {
@@ -27,6 +32,8 @@ pub struct VirtualHal {
     prober: SharedProber,
     /// Simulated DHCP server answering the lab's DHCP clients (G4.7).
     dhcp: Option<SharedResponder>,
+    /// Simulated DHCPv6 server (G4.7b).
+    dhcp6: Option<SharedResponder6>,
     /// Times each port was enabled again (each one is a simulated link
     /// down and up, G1.19).
     reenabled: BTreeMap<IfName, u32>,
@@ -57,6 +64,7 @@ impl VirtualHal {
             dynamic: Vec::new(),
             prober: Arc::new(SimProber::default()),
             dhcp: None,
+            dhcp6: None,
             reenabled: BTreeMap::new(),
         }
     }
@@ -65,6 +73,12 @@ impl VirtualHal {
     /// the lab server the engine offers.
     pub fn with_dhcp_server(mut self, server: SharedResponder) -> Self {
         self.dhcp = Some(server);
+        self
+    }
+
+    /// Answer DHCPv6 clients with `server` instead of the lab's.
+    pub fn with_dhcp6_server(mut self, server: SharedResponder6) -> Self {
+        self.dhcp6 = Some(server);
         self
     }
 
@@ -459,6 +473,112 @@ impl Hal for VirtualHal {
         if self.dhcp.is_none() {
             self.dhcp = Some(server);
         }
+    }
+
+    fn dhcp6_port(&mut self, name: &IfName) -> Result<Box<dyn Dhcp6Port>, HalError> {
+        if !self.applied.interfaces.contains_key(name) && !self.ports.contains(name) {
+            return Err(HalError::Rejected(format!(
+                "no interface '{name}' in the lab"
+            )));
+        }
+        Ok(Box::new(SimDhcp6Port {
+            port: name.clone(),
+            mac: self.mac_of(name),
+            server: self.dhcp6.clone(),
+            inbox: VecDeque::new(),
+        }))
+    }
+
+    fn offer_dhcp6_lab_server(&mut self, server: SharedResponder6) {
+        if self.dhcp6.is_none() {
+            self.dhcp6 = Some(server);
+        }
+    }
+
+    /// The lab router behind port N sends Router Advertisements: prefix
+    /// `2001:db8:0:N::/64` (A and L set) and itself as default router, from
+    /// `fe80::` + the EUI-64 of `02:DC:00:00:00:N`. Ports that accept RA
+    /// (and are up) get a SLAAC address and the routes, like the kernel.
+    fn ipv6_learned(&mut self) -> Result<Vec<Learned>, HalError> {
+        let cfg = &self.applied;
+        let mut out = Vec::new();
+        for name in cfg.interfaces.keys() {
+            let (mode, _) = corerouter_model::ipv6::ra_mode(cfg, name);
+            // The lab forwards IPv6: `yes-if-forwarding-disabled` takes none.
+            let accepts = mode == corerouter_model::ipv6::RaMode::On;
+            let enslaved = cfg
+                .interfaces
+                .get(name)
+                .is_some_and(|i| i.bridge.is_some() || matches!(i.kind, InterfaceKind::Vrf { .. }));
+            if !accepts || enslaved || !corerouter_model::route::is_up(cfg, name) {
+                continue;
+            }
+            let n = lab_net(name);
+            let prefix = Ipv6Addr::new(0x2001, 0xdb8, 0, u16::from(n), 0, 0, 0, 0);
+            let Ok(net) = ipnet::Ipv6Net::new(prefix, 64) else {
+                continue;
+            };
+            let me = Ipv6Addr::from(u128::from(prefix) | u128::from(eui64(self.mac_of(name))));
+            let table = corerouter_model::route::table_id(
+                cfg,
+                &corerouter_model::route::table_of(cfg, name),
+            )
+            .unwrap_or(corerouter_model::route::MAIN_TABLE_ID);
+            if let Ok(address) = ipnet::Ipv6Net::new(me, 64) {
+                out.push(Learned::Address {
+                    interface: name.clone(),
+                    address,
+                    valid_secs: Some(2_592_000),
+                    preferred_secs: Some(604_800),
+                });
+            }
+            out.push(Learned::Route {
+                interface: name.clone(),
+                dst: net,
+                gateway: None,
+                metric: 256,
+                table,
+                expires_secs: Some(2_592_000),
+            });
+            out.push(Learned::Route {
+                interface: name.clone(),
+                dst: ipnet::Ipv6Net::default(),
+                gateway: Some(link_local(lab_router_mac(n))),
+                metric: 1024,
+                table,
+                expires_secs: Some(1_800),
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// A lab DHCPv6 client socket, like [`SimDhcpPort`].
+struct SimDhcp6Port {
+    port: IfName,
+    mac: [u8; 6],
+    server: Option<SharedResponder6>,
+    inbox: VecDeque<Datagram6>,
+}
+
+impl Dhcp6Port for SimDhcp6Port {
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    fn send(&mut self, payload: &[u8]) -> Result<(), HalError> {
+        if let Some(server) = &self.server {
+            for d in server.answer(&self.port, self.mac, payload) {
+                if self.inbox.len() < SIM_INBOX {
+                    self.inbox.push_back(d);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Result<Option<Datagram6>, HalError> {
+        Ok(self.inbox.pop_front())
     }
 }
 

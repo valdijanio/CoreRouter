@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::dhcp_client::DhcpClient;
 use crate::firewall::Firewall;
 use crate::interface_list::InterfaceLists;
+use crate::ipv6::Ipv6;
 use crate::neighbor::NeighborDiscovery;
 use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 
@@ -21,6 +22,8 @@ pub struct Config {
     /// `/interface list` (G2.1): named groups of interfaces.
     pub interface_lists: InterfaceLists,
     pub ip: Ip,
+    /// `/ipv6` (G4.7b): DHCPv6 clients and the Router Advertisement policy.
+    pub ipv6: Ipv6,
     pub routing: Routing,
 }
 
@@ -158,6 +161,12 @@ pub struct AddressEntry {
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+    /// IPv6 (G4.7b, RouterOS `from-pool`): `address` is a suffix inside the
+    /// prefix a DHCPv6 client delegated into this pool (`::1/64` →
+    /// `<prefix>::1/64`); see `ipv6::from_pool`. Not installed while the
+    /// pool has no prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_pool: Option<String>,
 }
 
 /// One static route. `distance` is RouterOS' administrative distance

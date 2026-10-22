@@ -202,6 +202,8 @@ const NETNS_TESTS: &[(&str, &str)] = &[
     ("corerouter-daemon", "netns_linux"),
     // G4.7a: the DHCP client of a linux-backend daemon against a test server.
     ("corerouter-daemon", "netns_dhcp"),
+    // G4.7b: DHCPv6 address + prefix delegation, accept_ra and RA flush.
+    ("corerouter-daemon", "netns_dhcp6"),
     // G5.4: a router on this machine heard on a new link is local.
     ("corerouter-discovery", "netns_local"),
 ];

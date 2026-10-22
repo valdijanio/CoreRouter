@@ -12,6 +12,9 @@ pub enum Win {
     InterfaceList,
     Addresses,
     DhcpClient,
+    Dhcp6Client,
+    Ipv6Pool,
+    Ipv6Settings,
     Neighbors,
     Routes,
     Vrf,
@@ -45,6 +48,10 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
             Win::Dhcp,
         ],
     ),
+    (
+        "IPv6",
+        &[Win::Dhcp6Client, Win::Ipv6Pool, Win::Ipv6Settings],
+    ),
     ("Routing", &[Win::Bgp, Win::Ospf]),
     ("MPLS", &[Win::Mpls]),
     ("CGNAT", &[Win::Cgnat]),
@@ -59,6 +66,9 @@ impl Win {
         Win::InterfaceList,
         Win::Addresses,
         Win::DhcpClient,
+        Win::Dhcp6Client,
+        Win::Ipv6Pool,
+        Win::Ipv6Settings,
         Win::Neighbors,
         Win::Routes,
         Win::Vrf,
@@ -82,6 +92,9 @@ impl Win {
             Win::InterfaceList => "Interface List",
             Win::Addresses => "Addresses",
             Win::DhcpClient => "DHCP Client",
+            Win::Dhcp6Client => "DHCPv6 Client",
+            Win::Ipv6Pool => "IPv6 Pool",
+            Win::Ipv6Settings => "IPv6 Settings",
             Win::Neighbors => "Neighbors",
             Win::Routes => "Routes",
             Win::Vrf => "VRF",
@@ -124,6 +137,8 @@ impl Win {
                 | Win::Vrf
                 | Win::Neighbors
                 | Win::DhcpClient
+                | Win::Dhcp6Client
+                | Win::Ipv6Pool
                 | Win::History
                 | Win::Log
         )
@@ -136,6 +151,9 @@ impl Win {
             Win::Addresses | Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
             Win::DhcpClient => [760.0, 260.0],
+            Win::Dhcp6Client => [860.0, 260.0],
+            Win::Ipv6Pool => [760.0, 220.0],
+            Win::Ipv6Settings => [620.0, 340.0],
             Win::Vrf => [600.0, 260.0],
             Win::Firewall => [980.0, 420.0],
             Win::InterfaceList => [520.0, 280.0],
@@ -159,6 +177,9 @@ impl CoreRouterUi {
             Win::Neighbors => self.neighbors(ui),
             Win::Routes => self.routes(ui),
             Win::DhcpClient => self.dhcp_clients(ui),
+            Win::Dhcp6Client => self.dhcp6_clients(ui),
+            Win::Ipv6Pool => self.ipv6_pools(ui),
+            Win::Ipv6Settings => self.ipv6_settings(ui),
             Win::Vrf => self.vrfs(ui),
             Win::Firewall => self.firewall(ui),
             Win::InterfaceList => self.interface_lists(ui),

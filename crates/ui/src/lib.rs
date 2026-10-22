@@ -15,6 +15,7 @@ mod first_login;
 mod float;
 mod iface_tabs;
 mod interfaces;
+mod ipv6;
 mod mtr;
 mod neighbors;
 mod ping;
@@ -79,6 +80,8 @@ enum Field {
     DhcpOptions,
     /// `ip.dhcp-client.history`: new events go to the Log.
     DhcpHistory,
+    /// The IPv6 menu's queries (G4.7b).
+    V6(ipv6::Feed),
 }
 
 /// Cached query results, refreshed every `REFRESH_SECS` or after an action.
@@ -136,12 +139,15 @@ struct Tables {
     if_members: table::TableState,
     if_lists: table::TableState,
     dhcp: table::TableState,
+    dhcp6: table::TableState,
+    pool6: table::TableState,
+    ra6: table::TableState,
 }
 
 impl Tables {
     /// Every table with the salt it is drawn with (stored preferences name
     /// tables by salt).
-    fn each(&mut self) -> [(&'static str, &mut table::TableState); 11] {
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 14] {
         [
             (interfaces::TABLE, &mut self.interfaces),
             ("addresses", &mut self.addresses),
@@ -154,6 +160,9 @@ impl Tables {
             (firewall::Feed::Members.salt(), &mut self.if_members),
             (firewall::Feed::Lists.salt(), &mut self.if_lists),
             (dhcp_client::TABLE, &mut self.dhcp),
+            (ipv6::TABLE, &mut self.dhcp6),
+            (ipv6::POOL_TABLE, &mut self.pool6),
+            (ipv6::RA_TABLE, &mut self.ra6),
         ]
     }
 
@@ -171,6 +180,9 @@ impl Tables {
             (firewall::Feed::Members.salt(), &self.if_members),
             (firewall::Feed::Lists.salt(), &self.if_lists),
             (dhcp_client::TABLE, &self.dhcp),
+            (ipv6::TABLE, &self.dhcp6),
+            (ipv6::POOL_TABLE, &self.pool6),
+            (ipv6::RA_TABLE, &self.ra6),
         ]
         .into_iter()
         .filter(|(_, t)| t.inline_comments)
@@ -232,6 +244,10 @@ pub(crate) enum Then {
         id: u64,
         effect: dhcp_client::Effect,
     },
+    Dhcp6 {
+        id: u64,
+        effect: ipv6::Effect,
+    },
     /// The first-login "Set a password" dialog's `user.set` (G0.3b).
     Password,
 }
@@ -274,6 +290,8 @@ pub struct CoreRouterUi {
     dhcp_dialogs: Vec<dhcp_client::DhcpDialogWin>,
     /// DHCP clients to open once an `ip.dhcp-client.list` after this id arrives.
     open_dhcp_after: Vec<(RequestId, String)>,
+    /// The IPv6 windows' data and dialogs (G4.7b).
+    v6: ipv6::State,
     /// What the router can run now (rebuilt when `engine.list`,
     /// `server.info` or the link change); every action asks it.
     can: Arc<avail::Avail>,
@@ -330,6 +348,7 @@ impl CoreRouterUi {
             fw: firewall::State::default(),
             dhcp_dialogs: Vec::new(),
             open_dhcp_after: Vec::new(),
+            v6: ipv6::State::default(),
             can,
             ping: ping::PingWin::default(),
             mtr: mtr::MtrWin::default(),
@@ -559,6 +578,7 @@ impl CoreRouterUi {
                 }
             }
             Field::DhcpHistory => self.dhcp_history_arrived(&value),
+            Field::V6(feed) => self.v6_arrived(feed, id, value),
         }
     }
 
@@ -581,6 +601,7 @@ impl CoreRouterUi {
             Then::Vrf { id, effect } => self.vrf_dialog_reply(id, effect, result),
             Then::Fw { id, effect } => self.fw_dialog_reply(id, effect, result),
             Then::Dhcp { id, effect } => self.dhcp_dialog_reply(id, effect, result),
+            Then::Dhcp6 { id, effect } => self.dhcp6_dialog_reply(id, effect, result),
             Then::Tool(req) => self.tool_started(req, result),
             Then::Password => self.password_reply(result),
         }
@@ -737,6 +758,20 @@ impl CoreRouterUi {
                 json!({"command": "ip.dhcp-client.history", "params": {"after_seq": after}}),
             );
         }
+        let history6 = self
+            .cache
+            .commands
+            .iter()
+            .any(|c| c.get("id").and_then(Value::as_str) == Some("ipv6.dhcp-client.history"))
+            && self.can.check("ipv6.dhcp-client.history").is_ok();
+        for (feed, command, params) in self.v6_queries(history6) {
+            ask(
+                self,
+                Field::V6(feed),
+                "engine.execute",
+                json!({"command": command, "params": params}),
+            );
+        }
         if self.open.contains(&Win::Neighbors) {
             ask(
                 self,
@@ -851,6 +886,7 @@ impl CoreRouterUi {
         self.vrf_dialogs(&ctx, area);
         self.fw_dialogs(&ctx, area);
         self.dhcp_dialogs(&ctx, area);
+        self.dhcp6_dialogs(&ctx, area);
         self.terminals(&ctx, area);
         self.password_window(&ctx);
     }
@@ -1129,6 +1165,9 @@ impl CoreRouterUi {
             Win::Vrf => &mut self.tables.vrfs,
             Win::Neighbors => &mut self.tables.neighbors,
             Win::DhcpClient => &mut self.tables.dhcp,
+            Win::Dhcp6Client => &mut self.tables.dhcp6,
+            Win::Ipv6Pool => &mut self.tables.pool6,
+            Win::Ipv6Settings => &mut self.tables.ra6,
             Win::Firewall => match self.fw.tab {
                 firewall::Tab::Filter => &mut self.tables.fw_filter,
                 firewall::Tab::Nat => &mut self.tables.fw_nat,
@@ -2569,8 +2608,13 @@ mod tests {
                 }
                 "engine.execute"
                     if command.ends_with(".list")
-                        || ["config.history", "config.diff", "ip.dhcp-client.history"]
-                            .contains(&command.as_str()) =>
+                        || [
+                            "config.history",
+                            "config.diff",
+                            "ip.dhcp-client.history",
+                            "ipv6.dhcp-client.history",
+                        ]
+                        .contains(&command.as_str()) =>
                 {
                     Ok(json!([]))
                 }

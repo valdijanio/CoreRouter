@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::auth::{self, Group, Login, Logins, Principal};
 use crate::cmd::{self, check_params, unknown_command};
 use crate::dhcp_client::DhcpRuntime;
+use crate::dhcp6_client::Dhcp6Runtime;
 use crate::firewall_dyn::DynamicLists;
 use crate::link_watch::LinkWatch;
 use crate::neighbors::NeighborTable;
@@ -70,6 +71,8 @@ pub struct Session {
     /// DHCP clients at run time: leases, what they installed, history
     /// (operational state, never saved; G4.7).
     pub(crate) dhcp: DhcpRuntime,
+    /// DHCPv6 clients at run time (G4.7b), like `dhcp`.
+    pub(crate) dhcp6: Dhcp6Runtime,
     /// Router accounts (G0.3): saved with the config, outside its revisions.
     users: Users,
     /// Logged-in sessions, for `user.active.list` (never saved).
@@ -107,6 +110,7 @@ impl Session {
     pub fn with_storage(mut hal: Box<dyn Hal>, mut storage: Box<dyn ConfigStorage>) -> Self {
         // The virtual lab's DHCP clients get leases from a simulated server.
         hal.offer_dhcp_lab_server(Arc::new(corerouter_proto_dhcp::lab::LabServer::default()));
+        hal.offer_dhcp6_lab_server(Arc::new(corerouter_proto_dhcp::lab6::LabServer6::default()));
         let (restored, boot_errors) = restore(storage.as_mut());
         let (restored, users) = match restored {
             Some((store, users, slot)) => (Some((store, slot)), users),
@@ -129,7 +133,10 @@ impl Session {
                 for issue in validate_all(store.running()) {
                     log::warn!("restored config: {issue}");
                 }
-                if let Err(e) = hal.apply(&Config::default(), store.running()) {
+                // No pool has a prefix yet: addresses taken from pools wait.
+                let mut boot = store.running().clone();
+                boot.ip.addresses.retain(|a| a.from_pool.is_none());
+                if let Err(e) = hal.apply(&Config::default(), &boot) {
                     log::error!("restored config not applied: {e}");
                 }
                 status.loaded_from = Some(slot.name());
@@ -151,6 +158,7 @@ impl Session {
             dynamic_addresses: DynamicLists::default(),
             tasks: Tasks::default(),
             dhcp: DhcpRuntime::default(),
+            dhcp6: Dhcp6Runtime::default(),
             users,
             logins: Logins::default(),
             links: LinkWatch::default(),
