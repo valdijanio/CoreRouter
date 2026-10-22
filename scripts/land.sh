@@ -87,6 +87,69 @@ checks_or_stop() {
   esac
 }
 
+# Documentos que só o fold escreve. Um conflito neles não é de verdade: vem de uma branch que
+# guardou um fold de uma rodada anterior da fila (que parou no meio). Log, histórico e perf só
+# recebem acréscimos: ficam as entradas dos dois lados. No gaps.md, uma linha de gap que mudou
+# dos dois lados fica uma só (a do PR, a mais nova).
+FOLD_DOCS="docs/log.md docs/gaps-history.md docs/perf.md docs/gaps.md"
+
+# `git merge` de $1 (mensagem $2) que resolve sozinho os conflitos só em FOLD_DOCS. 0: limpo ou
+# resolvido; 1: conflito de verdade (merge abortado; arquivos em $conflicts).
+conflicts=""
+merge_fold_aware() {
+  local f
+  conflicts=""
+  git merge --quiet --no-edit "$1" -m "$2" >/dev/null 2>&1 && return 0
+  conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+  for f in $conflicts; do
+    case " $FOLD_DOCS " in
+      *" $f "*) ;;
+      *) git merge --abort; return 1 ;;
+    esac
+  done
+  for f in $conflicts; do
+    git show ":1:$f" > "$f.base" 2>/dev/null || : > "$f.base"
+    git show ":2:$f" > "$f.ours"
+    git show ":3:$f" > "$f.theirs"
+    git merge-file -p --union "$f.ours" "$f.base" "$f.theirs" > "$f"
+    rm -f "$f.base" "$f.ours" "$f.theirs"
+    if [ "$f" = docs/gaps.md ]; then
+      # A mesma gap duas vezes: fica a última (o lado do PR vem depois no union).
+      awk -F' [|] ' '/^\| G[0-9]/ { id = $1; last[id] = NR } { line[NR] = $0; ids[NR] = (/^\| G[0-9]/ ? $1 : "") }
+        END { for (i = 1; i <= NR; i++) if (ids[i] == "" || last[ids[i]] == i) print line[i] }' "$f" > "$f.tmp"
+      mv "$f.tmp" "$f"
+    fi
+    git add "$f"
+  done
+  git commit --quiet --no-edit
+  say "  conflito só nos documentos do fold ($conflicts): resolvido, entradas dos dois lados"
+  return 0
+}
+
+# Um PR que o GitHub marca em conflito com a main não entraria no squash, mesmo que o lote o
+# resolva: se o conflito é só nos documentos do fold, a main entra na própria branch (push) antes.
+# Devolve o head novo em $head; 1 se o conflito é de verdade.
+refresh_if_conflicting() {
+  local n=$1 branch=$2 m="" w
+  for _ in 1 2 3 4 5 6; do
+    m=$(gh pr view "$n" --json mergeable --jq .mergeable)
+    [ "$m" != UNKNOWN ] && break
+    sleep 5
+  done
+  [ "$m" = CONFLICTING ] || return 0
+  w="$dir/refresh-$n"
+  git -C "$root" worktree remove --force "$w" 2>/dev/null || true
+  git -C "$root" worktree add --quiet --detach "$w" "origin/$branch"
+  if (cd "$w" && merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)" &&
+    git push --quiet origin "HEAD:refs/heads/$branch"); then
+    head=$(git -C "$w" rev-parse HEAD)
+    git -C "$root" worktree remove --force "$w"
+    return 0
+  fi
+  git -C "$root" worktree remove --force "$w"
+  return 1
+}
+
 pr_info() {
   gh pr view "$1" --json state,isCrossRepository,headRefName,headRefOid \
     --jq '"\(.state) \(.isCrossRepository) \(.headRefName) \(.headRefOid)"'
@@ -107,18 +170,20 @@ land_batch() {
       say "  #$n fora do lote: $state, fork=$cross"
       continue
     fi
+    if ! refresh_if_conflicting "$n" "$branch"; then
+      say "  #$n fora do lote: conflito com a $base em $conflicts— a sessão dona resolve"
+      continue
+    fi
     git fetch --quiet origin "$branch"
     if [ "$(git rev-parse "origin/$branch")" != "$head" ]; then
       say "  #$n fora do lote: a branch andou durante a fila"
       continue
     fi
-    if git merge --quiet --no-edit "origin/$branch" -m "lote: #$n" >/dev/null 2>&1; then
+    if merge_fold_aware "origin/$branch" "lote: #$n"; then
       included+=("$n")
       heads+=("$head")
     else
-      files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
-      git merge --abort
-      say "  #$n fora do lote: conflito com o lote em $files— a sessão dona resolve"
+      say "  #$n fora do lote: conflito com o lote em $conflicts— a sessão dona resolve"
     fi
   done
   [ ${#included[@]} -gt 0 ] || { cd "$root"; return 0; }
@@ -192,10 +257,8 @@ for n in "${serial[@]}"; do
   git -C "$root" worktree add --quiet --detach "$wt" "origin/$branch"
   cd "$wt"
 
-  if ! git merge --quiet --no-edit "origin/$base" -m "Merge origin/$base em $branch (fila de entrada)"; then
-    files=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
-    git merge --abort
-    stop "$n" "conflito real com a $base em: $files— a sessão dona resolve na branch"
+  if ! merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)"; then
+    stop "$n" "conflito real com a $base em: $conflicts— a sessão dona resolve na branch"
   fi
 
   cargo xtask docs fold >/dev/null || stop "$n" "docs/changes inválido (cargo xtask docs)"
