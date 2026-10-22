@@ -428,6 +428,7 @@ impl CoreRouterUi {
     /// Draw every open dialog as its own floating window.
     pub(crate) fn dialogs(&mut self, ctx: &egui::Context, area: egui::Rect) {
         let ifaces = self.ifaces();
+        let can = self.can();
         let mut dialogs = std::mem::take(&mut self.dialogs);
         dialogs.retain_mut(|d| {
             // A properties window whose interface is gone closes itself.
@@ -447,7 +448,7 @@ impl CoreRouterUi {
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, &mut d.dialog, &ifaces)
+                    dialog_body(ui, f, &mut d.dialog, &ifaces, &can)
                 });
             let keep = pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces));
             if !keep {
@@ -860,7 +861,13 @@ fn dialog_title(d: &Dialog) -> String {
 }
 
 /// The fields of one dialog, and the buttons it has under them.
-fn dialog_body(ui: &mut Ui, f: &Form, d: &mut Dialog, ifaces: &[Iface]) -> Footer<Button> {
+fn dialog_body(
+    ui: &mut Ui,
+    f: &Form,
+    d: &mut Dialog,
+    ifaces: &[Iface],
+    can: &Avail,
+) -> Footer<Button> {
     let names: Vec<String> = ifaces.iter().map(|i| i.name.clone()).collect();
     let mut port_op: Option<(bool, String, String)> = None;
     let mut toggle_label = None;
@@ -924,14 +931,15 @@ fn dialog_body(ui: &mut Ui, f: &Form, d: &mut Dialog, ifaces: &[Iface]) -> Foote
                     ui.label("Bridge");
                     ui.horizontal(|ui| {
                         ui.label(b);
-                        if ui.small_button("Remove from Bridge").clicked() {
+                        let ok = can.check("interface.bridge.port.remove");
+                        if small_action(ui, "Remove from Bridge", None, ok) {
                             port_op = Some((false, b.clone(), i.name.clone()));
                         }
                     });
                     ui.end_row();
                 }
                 if i.kind == "bridge" {
-                    bridge_ports(ui, p, ifaces, &mut port_op);
+                    bridge_ports(ui, p, ifaces, &mut port_op, can);
                 }
                 toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
                 ui.label("Status");
@@ -943,9 +951,19 @@ fn dialog_body(ui: &mut Ui, f: &Form, d: &mut Dialog, ifaces: &[Iface]) -> Foote
                 ui.end_row();
             }
         });
-    let mut footer = Footer::edit(!matches!(d, Dialog::Comment { .. }));
+    // What OK / Apply send.
+    let ok = can.check(match d {
+        Dialog::NewVlan { .. } => "interface.vlan.add",
+        Dialog::NewBridge { .. } => "interface.bridge.add",
+        Dialog::NewLoopback { .. } => "interface.loopback.add",
+        Dialog::Comment { .. } | Dialog::Props(_) => "interface.set",
+    });
+    let mut footer = Footer::edit(!matches!(d, Dialog::Comment { .. }), ok);
     if let Some(t) = toggle_label {
-        footer.extra = vec![(t, Button::Toggle), ("Remove", Button::Remove)];
+        footer.extra = vec![
+            (t, Button::Toggle, can.check("interface.set")),
+            ("Remove", Button::Remove, can.check("interface.remove")),
+        ];
     }
     footer.pressed = port_op.map(|(add, bridge, port)| Button::Port { add, bridge, port });
     footer
@@ -956,6 +974,7 @@ fn bridge_ports(
     p: &mut Props,
     ifaces: &[Iface],
     port_op: &mut Option<(bool, String, String)>,
+    can: &Avail,
 ) {
     let ports: Vec<&Iface> = ifaces
         .iter()
@@ -969,7 +988,8 @@ fn bridge_ports(
         for port in ports {
             ui.horizontal(|ui| {
                 ui.label(&port.name);
-                if ui.small_button("−").on_hover_text("Remove port").clicked() {
+                let ok = can.check("interface.bridge.port.remove");
+                if small_action(ui, "−", Some("Remove port"), ok) {
                     *port_op = Some((false, p.name.clone(), port.name.clone()));
                 }
             });
@@ -982,10 +1002,26 @@ fn bridge_ports(
             .collect();
         ui.horizontal(|ui| {
             crate::windows::combo(ui, "port-pick", "interface", &mut p.port_pick, &candidates);
-            if ui.button("Add Port").clicked() && !p.port_pick.is_empty() {
+            if action(ui, "Add Port", can.check("interface.bridge.port.add"))
+                && !p.port_pick.is_empty()
+            {
                 *port_op = Some((true, p.name.clone(), std::mem::take(&mut p.port_pick)));
             }
         });
     });
     ui.end_row();
+}
+
+/// A small button inside a dialog's fields, greyed out with the reason when
+/// the router cannot run what it sends.
+fn small_action(ui: &mut Ui, text: &str, tip: Option<&str>, can: Result<(), String>) -> bool {
+    let resp = ui.add_enabled(can.is_ok(), egui::Button::new(text).small());
+    match (can, tip) {
+        (Err(why), _) => {
+            resp.on_disabled_hover_text(why);
+            false
+        }
+        (Ok(()), Some(tip)) => resp.on_hover_text(tip).clicked(),
+        (Ok(()), None) => resp.clicked(),
+    }
 }

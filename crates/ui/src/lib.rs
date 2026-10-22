@@ -2395,6 +2395,47 @@ mod tests {
     }
 
     #[test]
+    fn dialog_ok_is_greyed_and_enter_sends_nothing_without_the_command() {
+        let list: Vec<Value> = before_safe_mode()
+            .into_iter()
+            .filter(|c| c["id"] != "interface.set")
+            .collect();
+        let (mut h, d) = Harness::daemon(list);
+        let at = h.row("ether1");
+        h.click(at);
+        h.click(at);
+        let win = match h.app.dialogs.first() {
+            Some(w) => interfaces::dialog_id(w.id),
+            None => panic!("properties window not open"),
+        };
+        let mtu = h
+            .ctx
+            .read_response(dialog::field_id(win, "mtu"))
+            .expect("mtu field")
+            .rect
+            .center();
+        h.click(mtu);
+        h.key(egui::Key::A, CTRL);
+        h.type_text("9000");
+        h.key(egui::Key::Enter, egui::Modifiers::NONE);
+        h.key(egui::Key::Enter, CTRL);
+        h.click(h.text("OK"));
+        h.click(h.text("Apply"));
+        h.click(h.text("Enable"));
+        assert!(d.borrow().executed.is_empty(), "{:?}", d.borrow().executed);
+        assert_eq!(h.app.dialogs.len(), 1, "still open, edits kept");
+        h.tooltip_at(h.text("OK"));
+        assert!(h.has_text_containing("has no interface.set"), "OK tooltip");
+
+        // What the router has still works from the same window.
+        h.click(h.text("Remove"));
+        assert_eq!(d.borrow().executed, ["interface.remove"]);
+        // Esc still closes it.
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.app.dialogs.is_empty());
+    }
+
+    #[test]
     fn bytes_are_human() {
         assert_eq!(human_bytes(10), "10 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");

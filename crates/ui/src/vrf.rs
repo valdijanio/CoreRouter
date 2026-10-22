@@ -372,9 +372,10 @@ impl CoreRouterUi {
                 pos: cascade(area, d.id),
             };
             let salt = d.id;
+            let can = self.can();
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, salt, &mut d.dialog, &vrfs, &ifaces)
+                    dialog_body(ui, f, salt, &mut d.dialog, &vrfs, &ifaces, &can)
                 });
             let keep = pressed.is_none_or(|b| self.vrf_button(d, b, &vrfs));
             if !keep {
@@ -636,6 +637,7 @@ fn dialog_body(
     d: &mut VrfDialog,
     vrfs: &[Vrf],
     ifaces: &[Iface],
+    can: &Avail,
 ) -> Footer<Button> {
     let mut toggle_label = None;
     Grid::new("fields")
@@ -662,9 +664,17 @@ fn dialog_body(
             }
             VrfDialog::Comment { text, .. } => f.text(ui, "Comment", "comment", text, ""),
         });
-    let mut footer = Footer::edit(!matches!(d, VrfDialog::Comment { .. }));
+    // What OK / Apply send.
+    let ok = can.check(match d {
+        VrfDialog::New(_) => "ip.vrf.add",
+        _ => "ip.vrf.set",
+    });
+    let mut footer = Footer::edit(!matches!(d, VrfDialog::Comment { .. }), ok);
     if let Some(t) = toggle_label {
-        footer.extra = vec![(t, Button::Toggle), ("Remove", Button::Remove)];
+        footer.extra = vec![
+            (t, Button::Toggle, can.check("ip.vrf.set")),
+            ("Remove", Button::Remove, can.check("ip.vrf.remove")),
+        ];
     }
     footer
 }

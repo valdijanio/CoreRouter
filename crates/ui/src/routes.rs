@@ -466,6 +466,7 @@ impl CoreRouterUi {
                 return false;
             }
             let title = dialog_title(&d.dialog, &routes);
+            let can = self.can();
             let head = Head {
                 id,
                 title: &title,
@@ -474,7 +475,7 @@ impl CoreRouterUi {
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, &mut d.dialog, &routes, &tables)
+                    dialog_body(ui, f, &mut d.dialog, &routes, &tables, &can)
                 });
             let keep = pressed.is_none_or(|b| self.route_button(d, b, &routes));
             if !keep {
@@ -752,6 +753,7 @@ fn dialog_body(
     d: &mut RouteDialog,
     routes: &[Route],
     tables: &[String],
+    can: &Avail,
 ) -> Footer<Button> {
     let mut toggle_label = None;
     let mut view_only = false;
@@ -792,13 +794,22 @@ fn dialog_body(
         ui.weak("Connected routes follow their IP address (IP › Addresses).");
         return Footer {
             buttons: Buttons::View,
+            ok: Ok(()),
             extra: Vec::new(),
             pressed: None,
         };
     }
-    let mut footer = Footer::edit(!matches!(d, RouteDialog::Comment { .. }));
+    // What OK / Apply send.
+    let ok = can.check(match d {
+        RouteDialog::New(_) => "ip.route.add",
+        _ => "ip.route.set",
+    });
+    let mut footer = Footer::edit(!matches!(d, RouteDialog::Comment { .. }), ok);
     if let Some(t) = toggle_label {
-        footer.extra = vec![(t, Button::Toggle), ("Remove", Button::Remove)];
+        footer.extra = vec![
+            (t, Button::Toggle, can.check("ip.route.set")),
+            ("Remove", Button::Remove, can.check("ip.route.remove")),
+        ];
     }
     footer
 }

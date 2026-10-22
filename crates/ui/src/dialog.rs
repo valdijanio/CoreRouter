@@ -74,16 +74,22 @@ pub(crate) enum Buttons {
 /// What a dialog body hands back to [`show`].
 pub(crate) struct Footer<B> {
     pub buttons: Buttons,
-    /// Extra buttons after OK / Cancel / Apply.
-    pub extra: Vec<(&'static str, B)>,
+    /// Whether the router can run what OK / Apply send
+    /// ([`crate::CoreRouterUi::can`]): `Err` greys them out with the reason,
+    /// and Enter / Ctrl+Enter do nothing.
+    pub ok: Result<(), String>,
+    /// Extra buttons after OK / Cancel / Apply, each with whether the
+    /// router can run what it sends.
+    pub extra: Vec<(&'static str, B, Result<(), String>)>,
     /// A button inside the fields was pressed.
     pub pressed: Option<B>,
 }
 
 impl<B> Footer<B> {
-    pub(crate) fn edit(apply: bool) -> Self {
+    pub(crate) fn edit(apply: bool, ok: Result<(), String>) -> Self {
         Self {
             buttons: Buttons::Edit { apply },
+            ok,
             extra: Vec::new(),
             pressed: None,
         }
@@ -176,6 +182,7 @@ pub(crate) fn show<B>(
     let error = status.error.as_deref();
     let mut open = true;
     let mut view = false;
+    let mut can_ok = true;
     let pressed = floats
         .show(
             ctx,
@@ -187,6 +194,7 @@ pub(crate) fn show<B>(
             |ui| {
                 let footer = body(ui, &form);
                 view = matches!(footer.buttons, Buttons::View);
+                can_ok = footer.ok.is_ok();
                 buttons(ui, footer, error, busy)
             },
         )
@@ -210,6 +218,8 @@ pub(crate) fn show<B>(
         Some(Press::Apply) if view => None,
         Some(Press::Cancel) => Some(Press::Cancel),
         Some(_) if busy => None,
+        // OK / Apply greyed out: the router cannot run what they send.
+        Some(Press::Ok | Press::Apply) if !can_ok => None,
         other => other,
     }
 }
@@ -233,22 +243,34 @@ fn buttons<B>(ui: &mut Ui, footer: Footer<B>, error: Option<&str>, busy: bool) -
             Buttons::Edit { apply } => apply,
         };
         let ok = if busy { "Saving…" } else { "OK" };
-        if default_button(ui, ok, !busy, "Enter").clicked() {
+        let can = &footer.ok;
+        if default_button(ui, ok, !busy && can.is_ok(), why(can, "Enter")).clicked() {
             pressed = Some(Press::Ok);
         }
         if hinted(ui, "Cancel", true, "Esc").clicked() {
             pressed = Some(Press::Cancel);
         }
-        if apply && hinted(ui, "Apply", !busy, "Ctrl+Enter").clicked() {
+        if apply && hinted(ui, "Apply", !busy && can.is_ok(), why(can, "Ctrl+Enter")).clicked() {
             pressed = Some(Press::Apply);
         }
-        for (text, b) in footer.extra {
-            if ui.add_enabled(!busy, Button::new(text)).clicked() {
+        for (text, b, can) in footer.extra {
+            let resp = ui.add_enabled(!busy && can.is_ok(), Button::new(text));
+            if let Err(why) = &can {
+                resp.on_disabled_hover_text(why.as_str());
+            } else if resp.clicked() {
                 pressed = Some(Press::Other(b));
             }
         }
     });
     pressed
+}
+
+/// The tooltip of a button: its key, or why the router cannot run it.
+fn why<'a>(can: &'a Result<(), String>, key: &'a str) -> &'a str {
+    match can {
+        Ok(()) => key,
+        Err(why) => why,
+    }
 }
 
 fn hinted(ui: &mut Ui, text: &str, enabled: bool, key: &str) -> egui::Response {
