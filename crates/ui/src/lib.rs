@@ -53,6 +53,8 @@ enum Field {
     Bgp,
     History,
     Diff,
+    /// `engine.list`: which commands the router allows now, and why not.
+    Commands,
     Neighbors,
     Discovery,
 }
@@ -68,6 +70,7 @@ struct Cache {
     bgp: Vec<Value>,
     history: Vec<Value>,
     diff: Vec<Value>,
+    commands: Vec<Value>,
     neighbors: Vec<Value>,
     discovery: Value,
     refreshed_at: Option<f64>,
@@ -245,6 +248,26 @@ impl CoreRouterUi {
         req
     }
 
+    /// Whether the router allows command `id` now, with its reason when
+    /// not (from `engine.list`; the engine decides). Unknown yet: allowed,
+    /// and the engine still answers for itself.
+    pub(crate) fn command_allowed(&self, id: &str) -> Result<(), String> {
+        let Some(c) = self
+            .cache
+            .commands
+            .iter()
+            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
+        else {
+            return Ok(());
+        };
+        if c.get("enabled").and_then(Value::as_bool) == Some(false) {
+            let why = c.get("disabledReason").and_then(Value::as_str);
+            Err(why.unwrap_or("not available on this router").to_owned())
+        } else {
+            Ok(())
+        }
+    }
+
     /// Actions sent and not answered yet.
     pub fn busy(&self) -> usize {
         self.pending
@@ -351,6 +374,7 @@ impl CoreRouterUi {
             Field::Bgp => self.cache.bgp = arr(value),
             Field::History => self.cache.history = arr(value),
             Field::Diff => self.cache.diff = arr(value),
+            Field::Commands => self.cache.commands = arr(value),
             Field::Neighbors => self.cache.neighbors = arr(value),
             Field::Discovery => self.cache.discovery = value,
         }
@@ -469,6 +493,7 @@ impl CoreRouterUi {
             exec("config.history"),
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
+        ask(self, Field::Commands, "engine.list", Value::Null);
         if self.open.contains(&Win::Neighbors) {
             ask(
                 self,
@@ -1106,7 +1131,11 @@ mod tests {
 
     impl Harness {
         fn new() -> Self {
-            let session = shared(Session::virtual_lab());
+            Self::with_session(Session::virtual_lab())
+        }
+
+        fn with_session(session: Session) -> Self {
+            let session = shared(session);
             let mut h = Self {
                 ctx: egui::Context::default(),
                 app: CoreRouterUi::new(session.clone()),
@@ -1669,6 +1698,69 @@ mod tests {
         );
         h.click(h.text("Cancel"));
         assert_eq!(h.app.vrf_dialogs.len(), 1, "only VRF <red> left");
+    }
+
+    /// The virtual lab on a "kernel" without CONFIG_NET_VRF (G1.14).
+    struct NoVrf(corerouter_hal::VirtualHal);
+
+    impl corerouter_hal::Hal for NoVrf {
+        fn describe(&self) -> String {
+            "virtual lab without vrf".into()
+        }
+        fn discover_links(
+            &mut self,
+        ) -> Result<Vec<corerouter_hal::LinkInfo>, corerouter_hal::HalError> {
+            self.0.discover_links()
+        }
+        fn apply(
+            &mut self,
+            from: &corerouter_model::Config,
+            to: &corerouter_model::Config,
+        ) -> Result<(), corerouter_hal::HalError> {
+            self.0.apply(from, to)
+        }
+        fn poll(&mut self) -> Vec<corerouter_hal::LinkState> {
+            self.0.poll()
+        }
+        fn now_unix(&self) -> Option<u64> {
+            None
+        }
+        fn features(&self) -> corerouter_hal::Features {
+            corerouter_hal::Features { vrf: false }
+        }
+    }
+
+    #[test]
+    fn vrf_add_is_greyed_out_with_the_reason_without_kernel_vrf() {
+        let session = Session::new(Box::new(NoVrf(corerouter_hal::VirtualHal::new(4))));
+        let mut h = Harness::with_session(session);
+        h.app.open.clear();
+        h.app.open(Win::Vrf);
+        h.idle();
+        h.idle();
+        let add = h
+            .ctx
+            .read_response(table::tool_id(vrf::TABLE, table::Icon::Add))
+            .expect("add tool drawn");
+        assert!(!add.sense.senses_click(), "+ is greyed out");
+        h.click(add.rect.center());
+        assert!(h.app.vrf_dialogs.is_empty());
+
+        // The tooltip gives the engine's reason (after a click, egui shows
+        // it only once the pointer has left and come back).
+        h.hover(add.rect.center() + egui::vec2(200.0, 200.0));
+        h.hover(add.rect.center());
+        h.time += 1.0;
+        h.idle();
+        h.idle();
+        let tip = format!("Add: {}", corerouter_hal::NO_VRF);
+        assert!(h.has_text(&tip), "tooltip");
+
+        // So does "Add VRF…" in the empty-space menu: clicking does nothing.
+        h.right_click(add.rect.center() + egui::vec2(0.0, 120.0));
+        h.click(h.text("Add VRF…"));
+        assert!(h.app.vrf_dialogs.is_empty());
+        assert!(!h.log_ids().contains(&"ip.vrf.add"));
     }
 
     #[test]

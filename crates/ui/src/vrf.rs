@@ -180,9 +180,11 @@ impl CoreRouterUi {
             .filter(|v| selection.contains(&v.name))
             .collect();
         let mut act: Option<Act> = None;
+        // A kernel without VRF support: the engine says so, and why.
+        let can_add = self.command_allowed("ip.vrf.add");
 
         ui.horizontal(|ui| {
-            if table::tool(ui, TABLE, Icon::Add, "Add", Ok(())).clicked() {
+            if table::tool(ui, TABLE, Icon::Add, "Add", can_add.clone()).clicked() {
                 act = Some(Act::New);
             }
             let tools = [
@@ -214,9 +216,9 @@ impl CoreRouterUi {
             &COLUMNS,
             &rows,
             |ui, menu| match menu {
-                Menu::Rows(sel) => row_menu(ui, &mut act, &vrfs, sel),
+                Menu::Rows(sel) => row_menu(ui, &mut act, &vrfs, sel, &can_add),
                 Menu::Empty => {
-                    if ui.button("Add VRF…").clicked() {
+                    if action(ui, "Add VRF…", can_add.clone()) {
                         act = Some(Act::New);
                     }
                     if ui.button("Select All").clicked() {
@@ -515,7 +517,13 @@ fn candidates(ifaces: &[Iface], vrf: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-fn row_menu(ui: &mut Ui, act: &mut Option<Act>, vrfs: &[Vrf], sel: &[String]) {
+fn row_menu(
+    ui: &mut Ui,
+    act: &mut Option<Act>,
+    vrfs: &[Vrf],
+    sel: &[String],
+    can_add: &Result<(), String>,
+) {
     let picked: Vec<&Vrf> = vrfs.iter().filter(|v| sel.contains(&v.name)).collect();
     let owned = || sel.to_vec();
     if action(ui, "Enable", can_enable(&picked, true)) {
@@ -534,7 +542,7 @@ fn row_menu(ui: &mut Ui, act: &mut Option<Act>, vrfs: &[Vrf], sel: &[String]) {
         *act = Some(Act::Open(owned()));
     }
     ui.separator();
-    if ui.button("Add VRF…").clicked() {
+    if action(ui, "Add VRF…", can_add.clone()) {
         *act = Some(Act::New);
     }
 }

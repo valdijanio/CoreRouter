@@ -129,8 +129,11 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   numa lista de caixas que deixa de fora VRFs, portas de bridge e membros de outra VRF (uma
   bridge entra inteira); Apply cria e abre "VRF <nome>", que edita membros (`ip.vrf.set`
   troca a lista inteira), comentário e Disabled e tem Disable/Remove. Recusas do engine
-  (nome `main`, VRF com endereço ou rota) aparecem no diálogo ou no log. 2 testes headless
-  dirigidos por eventos sintéticos.
+  (nome `main`, VRF com endereço ou rota) aparecem no diálogo ou no log. Num kernel sem VRF
+  (G1.14), + e "Add VRF…" ficam cinza com o motivo no tooltip: a UI consulta `engine.list`
+  pelo backend no refresh (`Field::Commands`, `CoreRouterUi::command_allowed`), sem detectar
+  nada por conta própria, e funciona igual na GUI remota. 3 testes headless dirigidos por
+  eventos sintéticos (um com HAL sem VRF).
 
 - 2026-10-21 — G5.2 (Parte 1): LLDP e escuta passiva de MNDP. `crates/proto-lldp` (L2): codec
   puro de LLDPDU do IEEE 802.1AB (Chassis ID, Port ID, TTL, End, Port/System Description,
