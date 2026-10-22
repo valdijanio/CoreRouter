@@ -623,6 +623,71 @@ fn firewall_export_import_round_trip() {
     b.ok("/ip firewall filter add chain=guard2 src-address=!10.0.0.0/8 action=drop");
 }
 
+/// The zone matrix exports as its cells (`/ip firewall zone set from=… to=…
+/// action=…`), and the filter rules it generates are not exported again:
+/// on import the matrix regenerates them, so they are not duplicated nor
+/// turned into loose rules (before: "# set: from is not exported", and the
+/// generated rules came out as ordinary `/ip firewall filter add` lines).
+#[test]
+fn zone_matrix_export_import_round_trip() {
+    let mut a = Term::new();
+    for (id, p) in [
+        (
+            "interface.list.member.add",
+            json!({"list": "LAN", "interface": "ether2"}),
+        ),
+        (
+            "interface.list.member.add",
+            json!({"list": "WAN", "interface": "ether1"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"protocol": "tcp", "dst_port": "22", "action": "drop", "comment": "manual"}),
+        ),
+        (
+            "ip.firewall.zone.set",
+            json!({"from": "LAN", "to": "WAN", "action": "allow"}),
+        ),
+        (
+            "ip.firewall.zone.set",
+            json!({"from": "WAN", "to": "router", "action": "block"}),
+        ),
+    ] {
+        a.router
+            .session
+            .execute(id, &p)
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+    }
+    let script = a.export();
+    assert!(
+        script.contains("set from=LAN to=WAN action=allow"),
+        "{script}"
+    );
+    assert!(
+        script.contains("set from=WAN to=router action=block"),
+        "{script}"
+    );
+    assert!(!script.contains("is not exported"), "{script}");
+    assert!(
+        !script.contains("zona "),
+        "generated rules are not exported:\n{script}"
+    );
+    assert!(script.contains("comment=manual"), "{script}");
+    let mut b = Term::new();
+    b.router.files.insert("z.rsc".into(), script.clone());
+    b.ok("/import file=z.rsc");
+    let rules = |t: &Term| {
+        let v = t
+            .router
+            .session
+            .inspect(Some("running.ip.firewall.filter"))
+            .unwrap();
+        v.as_array().map_or(0, Vec::len)
+    };
+    assert_eq!(rules(&b), rules(&a), "{script}");
+    assert_eq!(b.export(), script);
+}
+
 #[test]
 fn import_is_atomic_and_says_where_it_failed() {
     let mut t = Term::new();

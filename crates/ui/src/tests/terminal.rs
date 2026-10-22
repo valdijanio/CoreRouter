@@ -255,3 +255,25 @@ fn ping_streams_live_and_ctrl_c_stops_it() {
     let text = app.terminal_text(0);
     assert!(text.contains("^C") && text.contains("sent:"), "{text}");
 }
+
+/// A wide `print` fits the window (like RouterOS) instead of stretching it:
+/// the columns that do not fit are named on a last line.
+#[test]
+fn wide_print_does_not_stretch_the_window() {
+    let mut h = Harness::new();
+    let t = h.open_terminal();
+    let id = crate::terminal::term_id(h.app.terminals[t].id);
+    let before = h.win_rect(id).width();
+    h.enter("/ip firewall defaults apply wan=ether1 lan=ether2");
+    h.enter("/ip firewall filter print");
+    for _ in 0..5 {
+        h.idle();
+    }
+    let after = h.win_rect(id).width();
+    assert!(
+        (after - before).abs() < 1.0,
+        "window grew from {before} to {after}"
+    );
+    let out = h.app.terminal_text(t);
+    assert!(out.contains("more column"), "{out}");
+}
