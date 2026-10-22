@@ -36,6 +36,9 @@ const COLUMNS: [table::Column; 10] = [
 pub(crate) struct Iface {
     pub name: String,
     pub kind: String,
+    /// What the kernel says it is (`veth` for an `ether` port over a veth);
+    /// shown in the Type column. Older daemons send none: `kind`.
+    pub kernel_kind: String,
     pub mtu: String,
     pub disabled: bool,
     pub running: bool,
@@ -45,6 +48,9 @@ pub(crate) struct Iface {
     pub bridge: Option<String>,
     pub vrf: Option<String>,
     pub table: Option<String>,
+    /// `Some(why)`: a platform link CoreRouter does not manage (G1.18);
+    /// listed, never changed.
+    pub unmanaged: Option<String>,
 }
 
 impl Iface {
@@ -55,6 +61,7 @@ impl Iface {
         Self {
             name: text("name"),
             kind: text("type"),
+            kernel_kind: opt("kind").unwrap_or_else(|| text("type")),
             mtu: text("mtu"),
             disabled: flag("disabled"),
             running: flag("running"),
@@ -64,6 +71,9 @@ impl Iface {
             bridge: opt("bridge"),
             vrf: opt("vrf"),
             table: opt("table"),
+            // Older daemons send no `managed`: everything was theirs.
+            unmanaged: (row.get("managed").and_then(Value::as_bool) == Some(false))
+                .then(|| opt("unmanaged_reason").unwrap_or_else(|| "not managed".into())),
         }
     }
 
@@ -239,7 +249,7 @@ impl CoreRouterUi {
             .collect();
         let bridges: Vec<String> = ifaces
             .iter()
-            .filter(|i| i.kind == "bridge")
+            .filter(|i| i.kind == "bridge" && i.unmanaged.is_none())
             .map(|i| i.name.clone())
             .collect();
         let mut act: Option<Act> = None;
@@ -675,7 +685,7 @@ fn iface_row(row: &Value) -> Row {
         cells: vec![
             flag.to_owned(),
             i.name.clone(),
-            i.kind.clone(),
+            i.kernel_kind.clone(),
             i.mtu.clone(),
             human_bytes(n("rx_bytes")),
             human_bytes(n("tx_bytes")),
@@ -684,7 +694,7 @@ fn iface_row(row: &Value) -> Row {
             info(&i),
             i.comment.clone(),
         ],
-        dimmed: i.disabled,
+        dimmed: i.disabled || i.unmanaged.is_some(),
     }
 }
 
@@ -703,14 +713,22 @@ fn info(i: &Iface) -> String {
     if let Some(t) = &i.table {
         parts.push(format!("routing table {t}"));
     }
+    if let Some(why) = &i.unmanaged {
+        parts.push(format!("not managed: {why}"));
+    }
     parts.join(", ")
 }
 
 fn some(picked: &[&Iface]) -> Result<(), String> {
     if picked.is_empty() {
-        Err("Select one or more interfaces first".into())
-    } else {
-        Ok(())
+        return Err("Select one or more interfaces first".into());
+    }
+    match picked
+        .iter()
+        .find_map(|i| Some((&i.name, i.unmanaged.as_ref()?)))
+    {
+        Some((name, why)) => Err(format!("{name} is not managed by CoreRouter: {why}")),
+        None => Ok(()),
     }
 }
 
@@ -795,7 +813,7 @@ fn row_menu(
     match picked.as_slice() {
         [one] => {
             let label = format!("Add VLAN on {}", one.name);
-            if action(ui, &label, can.check("interface.vlan.add")) {
+            if action(ui, &label, can.and("interface.vlan.add", some(&[one]))) {
                 *act = Some(Act::NewVlan {
                     parent: Some(one.name.clone()),
                 });

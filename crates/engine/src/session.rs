@@ -509,7 +509,8 @@ impl Session {
     }
 }
 
-/// Default config: one Ethernet interface per discovered port, applied.
+/// Default config: one Ethernet interface per discovered (managed) port,
+/// with the kernel's MTU, MAC and admin state, applied (a kernel no-op).
 fn discovered(hal: &mut dyn Hal) -> Config {
     let mut initial = Config::default();
     match hal.discover_links() {
@@ -518,6 +519,8 @@ fn discovered(hal: &mut dyn Hal) -> Config {
                 let mut iface = Interface::new(l.name.clone(), InterfaceKind::Ethernet);
                 iface.mtu = l.mtu;
                 iface.mac = l.mac.and_then(|m| m.parse().ok());
+                // As the kernel has it, so the first apply changes nothing.
+                iface.disabled = !l.up;
                 initial.interfaces.insert(l.name, iface);
             }
         }

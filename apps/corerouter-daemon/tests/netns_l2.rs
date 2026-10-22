@@ -11,10 +11,10 @@
 //!
 //! (`cargo xtask netns` runs it.) Router A lives in the namespace the test
 //! runs in, router B in a child namespace (see `netns.rs`). The linux
-//! backend lists links from `/sys/class/net`, which shows the network
-//! namespace of whoever mounted sysfs — the host's. So each daemon runs in
-//! its own mount namespace with a fresh sysfs (`unshare --mount`, private
-//! propagation: the mount never reaches the host).
+//! backend lists links over netlink in its own namespace (G1.18). Each
+//! veth's peer lives in the other namespace, which the ownership policy
+//! takes for a container's link, so the daemons run with `--manage ether*`:
+//! these veths are the lab's cables.
 //!
 //! Links: `ether1` (A) ↔ `ether1` (B) with 10.99.0.0/24, discovery on both
 //! ends; `ether2` (A) ↔ `ether2` (B), discovery on B only.
@@ -42,16 +42,12 @@ const MNDP_ENV: &str = "G52_MNDP_SEND";
 
 fn daemon(netns: Option<u32>, dir: &Path, log: &str) -> Kill {
     let log = std::fs::File::create(std::env::temp_dir().join(log)).unwrap();
-    let mut c = in_ns(netns, "unshare");
+    let mut c = in_ns(netns, DAEMON);
     c.args([
-        "--mount",
-        "--",
-        "sh",
-        "-c",
-        "mount -t sysfs none /sys && exec \"$0\" \"$@\"",
-        DAEMON,
         "--backend",
         "linux",
+        "--manage",
+        "ether*",
         "--control",
         "7979",
         "--config-dir",
