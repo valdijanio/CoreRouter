@@ -153,7 +153,10 @@ impl CoreRouterUi {
             ui.label("Address");
             ui.add(
                 TextEdit::singleline(&mut f.address)
-                    .id(crate::dialog::field_id(crate::win_id(crate::Win::Mtr), "address"))
+                    .id(crate::dialog::field_id(
+                        crate::win_id(crate::Win::Mtr),
+                        "address",
+                    ))
                     .hint_text("8.8.8.8 or example.com")
                     .desired_width(260.0),
             );
@@ -184,7 +187,13 @@ impl CoreRouterUi {
                 names.extend(interfaces);
                 combo(ui, "mtr-iface", "any", &mut f.interface, &names);
                 ui.label("Routing table");
-                combo(ui, "mtr-routing-table", "main", &mut f.routing_table, &tables);
+                combo(
+                    ui,
+                    "mtr-routing-table",
+                    "main",
+                    &mut f.routing_table,
+                    &tables,
+                );
                 ui.end_row();
             });
         ui.separator();
