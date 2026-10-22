@@ -69,7 +69,11 @@ jobs:
       # G1.2: `cargo xtask netns` testa o hal-linux num network namespace sem root.
       # O Ubuntu 24.04 bloqueia user namespaces sem privilégio (AppArmor); isto só
       # muda a VM descartável do runner. Se não pegar, o passo netns vira "skip".
+      # Portão em duas camadas: no PR, `cargo xtask ci --fast` (determinístico, sem os testes
+      # contra o kernel); no lote da fila de entrada (workflow_dispatch) e na main, o completo.
+      # Teste que falha e passa ao repetir é marcado como instável e não reprova (docs/perf.md).
       - name: Liberar user namespaces sem root
+        if: github.event_name != 'pull_request'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       # G1.14: um user namespace não carrega módulos; carregamos o `vrf` aqui, na
@@ -79,15 +83,18 @@ jobs:
       # cache do Actions por versão do kernel; sem cache, o download tem teto de 2 min, e se
       # estourar o CI segue sem o teste de VRF, com aviso, em vez de travar a fila.
       - name: Versão do kernel
+        if: github.event_name != 'pull_request'
         id: kernel
         run: echo "release=$(uname -r)" >> "$GITHUB_OUTPUT"
 
       - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name != 'pull_request'
         with:
           path: ~/vrf-ko
           key: vrf-ko-${{ steps.kernel.outputs.release }}
 
       - name: Carregar o módulo vrf
+        if: github.event_name != 'pull_request'
         run: |
           # G1.14: com o módulo carregado, o teste de VRF em netns falha em vez de pular (e o
           # passo netns do xtask também).
@@ -115,7 +122,7 @@ jobs:
           fi
 
       - name: cargo xtask ci
-        run: cargo xtask ci
+        run: cargo xtask ci ${{ github.event_name == 'pull_request' && '--fast' || '' }}
 
   build:
     name: build (${{ matrix.os }})

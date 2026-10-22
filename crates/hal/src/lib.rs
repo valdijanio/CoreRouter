@@ -6,6 +6,7 @@
 //! Windows, macOS and iOS, without root.
 
 pub mod dhcp;
+pub mod drift;
 pub mod nic;
 pub mod probe;
 pub mod sff;
@@ -244,5 +245,26 @@ pub trait Hal: Send {
     /// (`corerouter_model::ipv6::ra_mode`).
     fn ipv6_learned(&mut self) -> Result<Vec<Learned>, HalError> {
         Ok(Vec::new())
+    }
+
+    /// What the data plane holds now of what `cfg` (the applied config)
+    /// manages, for the drift check (G1.3, see [`drift`]).
+    fn snapshot(&mut self, cfg: &Config) -> Result<drift::Snapshot, HalError> {
+        let _ = cfg;
+        Err(HalError::Unsupported(format!(
+            "{} cannot read its state back",
+            self.describe()
+        )))
+    }
+
+    /// Put back, where it drifted, what `cfg` (the applied config) puts in
+    /// the data plane. All or nothing, like `apply`; a port that is gone
+    /// is left to come back by itself.
+    fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
+        let _ = cfg;
+        Err(HalError::Unsupported(format!(
+            "{} cannot reconcile",
+            self.describe()
+        )))
     }
 }

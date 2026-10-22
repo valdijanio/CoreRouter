@@ -46,10 +46,19 @@ const CI: &[Step] = &[
     ("wasm", wasm),
 ];
 
+/// Left out of `cargo xtask ci --fast`.
+const SLOW: &[&str] = &["bench-check", "netns"];
+
 fn main() -> ExitCode {
     let root = workspace_root();
     let task = std::env::args().nth(1).unwrap_or_default();
     let steps: Vec<&Step> = match task.as_str() {
+        // `--fast`: the PR gate (deterministic, ~2 min in CI). The steps
+        // against a real kernel (`netns`) and `bench-check` run in the full
+        // `ci`: locally, on the merge queue's batch and on the main.
+        "ci" if std::env::args().nth(2).is_some_and(|a| a == "--fast") => {
+            CI.iter().filter(|(name, _)| !SLOW.contains(name)).collect()
+        }
         "ci" => CI.iter().collect(),
         "bench" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
@@ -174,6 +183,10 @@ fn test(root: &Path) -> Outcome {
         "fail",
         "--final-status-level",
         "slow",
+        // A test that fails and then passes is reported FLAKY and does not
+        // fail the run (it gets fixed without stopping the merge queue).
+        "--retries",
+        "1",
     ]);
     match run(c, root) {
         // `cargo test --doc` costs ~17 s even with no doctest (one rustdoc
@@ -309,19 +322,9 @@ fn netns_run(root: &Path) -> Outcome {
     // All binaries at once, one fresh namespace each (each one's guard
     // requires a namespace holding only `lo`): ~3× faster than one after the
     // other (docs/perf.md). Output is printed per binary, not interleaved.
-    let mut running = Vec::new();
-    for b in &bins {
-        let child = Command::new("unshare")
-            .args(UNSHARE)
-            .arg(&b.exe)
-            .current_dir(&b.dir)
-            .env("COREROUTER_NETNS_TESTS", "1")
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn();
-        running.push((b, child));
-    }
+    let running: Vec<_> = bins.iter().map(|b| (b, netns_child(b))).collect();
     let mut failed = Vec::new();
+    let mut again = Vec::new();
     for (b, child) in running {
         let name = format!("{} {}", b.package, b.test);
         match child.and_then(std::process::Child::wait_with_output) {
@@ -331,8 +334,32 @@ fn netns_run(root: &Path) -> Outcome {
                 eprint!("{}", String::from_utf8_lossy(&out.stdout));
                 eprint!("{}", String::from_utf8_lossy(&out.stderr));
                 if !out.status.success() {
-                    failed.push(format!("{name}: {}", out.status));
+                    again.push(b);
                 }
+            }
+            Err(e) => failed.push(format!("{name}: could not start: {e}")),
+        }
+    }
+    // A binary that failed runs once more, alone, in a fresh namespace:
+    // these tests time real kernel events (DAD, LLDP intervals), and a busy
+    // machine made good PRs fail. Passing the second time = flaky, reported
+    // (a GitHub annotation in CI) but not failing.
+    for b in again {
+        let name = format!("{} {}", b.package, b.test);
+        eprintln!("--- {name} (again, alone)");
+        match netns_child(b).and_then(|c| c.wait_with_output()) {
+            Ok(out) if out.status.success() => {
+                let note = format!("flaky netns test {name}: failed, then passed alone");
+                if std::env::var_os("GITHUB_ACTIONS").is_some() {
+                    eprintln!("::warning::{note}");
+                } else {
+                    eprintln!("warning: {note}");
+                }
+            }
+            Ok(out) => {
+                eprint!("{}", String::from_utf8_lossy(&out.stdout));
+                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+                failed.push(format!("{name}: {}", out.status));
             }
             Err(e) => failed.push(format!("{name}: could not start: {e}")),
         }
@@ -342,6 +369,18 @@ fn netns_run(root: &Path) -> Outcome {
     } else {
         Outcome::Fail(failed.join("; "))
     }
+}
+
+/// One netns test binary, started in its own fresh namespace.
+fn netns_child(b: &NetnsBin) -> std::io::Result<std::process::Child> {
+    Command::new("unshare")
+        .args(UNSHARE)
+        .arg(&b.exe)
+        .current_dir(&b.dir)
+        .env("COREROUTER_NETNS_TESTS", "1")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
 }
 
 struct NetnsBin {

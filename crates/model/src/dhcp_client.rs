@@ -7,6 +7,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
 use crate::DEFAULT_DISTANCE;
@@ -72,6 +73,53 @@ impl FromStr for AddDefaultRoute {
             })
     }
 }
+
+/// How the client checks the lease's gateway (RouterOS `check-gateway`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CheckGateway {
+    /// No check: the routes stay while the lease does.
+    #[default]
+    None,
+    /// An ARP request every 10 s: the gateway must answer it.
+    Arp,
+    /// An ICMP echo every 10 s from the lease's address.
+    Ping,
+}
+
+impl CheckGateway {
+    pub const ALL: [Self; 3] = [Self::None, Self::Arp, Self::Ping];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Arp => "arp",
+            Self::Ping => "ping",
+        }
+    }
+}
+
+impl fmt::Display for CheckGateway {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for CheckGateway {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|v| v.as_str() == s.trim())
+            .ok_or_else(|| ParseError::new("check-gateway", s, "expected none, arp or ping"))
+    }
+}
+
+/// `fallback_timeout` bounds and default, in seconds (dhcpcd waits 30 s
+/// before its fallback; **estimado** good for a WAN).
+pub const MIN_FALLBACK_TIMEOUT: u32 = 5;
+pub const MAX_FALLBACK_TIMEOUT: u32 = 3_600;
+pub const DEFAULT_FALLBACK_TIMEOUT: u32 = 30;
 
 /// A server the client accepts: by its IP (server identifier or packet
 /// source) or by the MAC its answers come from.
@@ -167,6 +215,20 @@ pub struct DhcpClient {
     /// Empty: any server.
     #[serde(default)]
     pub allowed_servers: Vec<AllowedServer>,
+    /// Withhold the lease's routes while their gateway does not answer.
+    #[serde(default)]
+    pub check_gateway: CheckGateway,
+    /// Address put on the interface while no server answers (a modem's
+    /// management network, say); removed when a lease comes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_address: Option<Ipv4Net>,
+    /// Seconds without a lease before the fallback address goes up.
+    #[serde(default = "default_fallback_timeout")]
+    pub fallback_timeout: u32,
+}
+
+fn default_fallback_timeout() -> u32 {
+    DEFAULT_FALLBACK_TIMEOUT
 }
 
 fn default_distance() -> u8 {
@@ -195,6 +257,9 @@ impl DhcpClient {
             vendor_class: String::new(),
             extra_options: Vec::new(),
             allowed_servers: Vec::new(),
+            check_gateway: CheckGateway::None,
+            fallback_address: None,
+            fallback_timeout: DEFAULT_FALLBACK_TIMEOUT,
         }
     }
 
