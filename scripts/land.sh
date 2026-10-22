@@ -150,6 +150,14 @@ refresh_if_conflicting() {
   return 1
 }
 
+# Squash com o título do PR: sem isso o GitHub usa a mensagem do primeiro commit quando a branch
+# tem um só autor de commits ("wip hotspots (#79)" foi parar na main).
+squash() {
+  local n=$1 sha=$2 title
+  title=$(gh pr view "$n" --json title --jq .title)
+  gh pr merge -R "$repo" "$n" --squash --subject "$title (#$n)" --match-head-commit "$sha"
+}
+
 pr_info() {
   gh pr view "$1" --json state,isCrossRepository,headRefName,headRefOid \
     --jq '"\(.state) \(.isCrossRepository) \(.headRefName) \(.headRefOid)"'
@@ -209,7 +217,7 @@ land_batch() {
   for i in "${!included[@]}"; do
     n=${included[$i]}
     checks_or_stop "$n" "${heads[$i]}"
-    gh pr merge -R "$repo" "$n" --squash --match-head-commit "${heads[$i]}" ||
+    squash "$n" "${heads[$i]}" ||
       stop "$n" "o merge foi recusado"
     say "  #$n entrou"
   done
@@ -287,7 +295,7 @@ for n in "${serial[@]}"; do
     checks_or_stop "$n" "$sha"
   fi
 
-  gh pr merge -R "$repo" "$n" --squash --match-head-commit "$sha" || stop "$n" "o merge foi recusado"
+  squash "$n" "$sha" || stop "$n" "o merge foi recusado"
   say "  #$n entrou"
 
   cd "$root"
