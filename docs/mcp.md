@@ -42,7 +42,47 @@ Erros de tool voltam como texto com `isError: true` ("unknown parameter 'adress'
 'address'?"), nunca como erro de protocolo — o agente lê e corrige.
 
 Limites: linha de até 16 MiB, lote JSON-RPC de até 64 mensagens, `command_batch` até 256 passos.
-Faltando (G0.7): resources, prompts, completions, progresso/cancelamento, `-32003` (ocupado).
+
+## Resources (G0.7)
+
+Leituras que o cliente anexa como contexto sem chamar tool (no Claude Code: `@corerouter:…`).
+Todas são `application/json` e passam pelos mesmos métodos do canal de controle das tools, com as
+permissões do usuário conectado.
+
+| URI | Conteúdo |
+|---|---|
+| `corerouter://state` | Resumo: identidade, backend, modo, revisão, mudanças pendentes, Safe Mode, contagens |
+| `corerouter://commands` | Registro inteiro (o mesmo de `list_commands`) |
+| `corerouter://diff` | `config.diff`: o que o `config.commit` aplicaria |
+| `corerouter://command/{id}` (template) | Um comando: `params`, resultado, enabled + motivo |
+| `corerouter://state/{path}` (template) | Uma subárvore: `interfaces`, `ip.addresses`, `running.ip`, `journal` |
+
+Recurso inexistente → erro `-32002` ("Resource not found", MCP 2025-06-18) com `data: {uri}`; um
+id de comando errado sugere os mais próximos. URI acima de 512 bytes → `-32602`. Sem
+`subscribe` nem `listChanged` por enquanto (G0.7b).
+
+## Prompts (G0.7)
+
+Fluxos prontos (no Claude Code viram `/mcp__corerouter__<nome>`). Só montam a mensagem que guia o
+agente; nada roda até o agente chamar as tools.
+
+| Prompt | Argumentos | Fluxo |
+|---|---|---|
+| `configure_address` | `interface`, `address`, `gateway?`, `dst_address?` | Confere interface e sobreposição, modo transacional, `command_batch` atômico (endereço + rota), mostra o diff, sugere Safe Mode se for a interface de gerência, commit só com o "sim" |
+| `review_and_commit` | `comment?` | Embute `corerouter://state` e `corerouter://diff`, explica cada mudança e o risco (lockout, sobreposição, regra inútil), commit só com o "sim" |
+| `diagnose_connectivity` | `target` | Rota, interface, endereço, `run_task` ping e MTR; não muda a configuração |
+
+Nome ou argumento inválido (faltando, desconhecido, não-string, mais de 128 bytes, aspas ou
+quebra de linha) → `-32602` com a mensagem dizendo o que corrigir.
+
+## Completions (G0.7)
+
+`completion/complete` sugere ids de comando (`corerouter://command/{id}`), caminhos de estado
+(`corerouter://state/{path}`) e nomes de interface (argumento `interface` de
+`configure_address`), até 100 valores com `total` e `hasMore`.
+
+Faltando (G0.7b): progresso e cancelamento (`notifications/progress`, `notifications/cancelled`),
+erro `-32003` (motor ocupado), `resources/subscribe` e `list_changed`.
 
 ## Histórico de revisão
 

@@ -692,6 +692,17 @@ continuação indentadas).
   testes instáveis em 2026-10-22 (latência, ping IPv6, DAD, `netns_l2`), cada um travando a fila
   por 5–10 min.
 
+- 2026-10-22 — G0.7: MCP, parte 1: o servidor declara `resources`, `prompts` e `completions` no `initialize`.
+  Resources `corerouter://state`, `corerouter://commands`, `corerouter://diff` e os templates
+  `corerouter://command/{id}` e `corerouter://state/{path}` (JSON, mesmas permissões das tools;
+  inexistente → `-32002` com `data.uri` e sugestão de id). Prompts `configure_address` (endereço
+  + rota numa transação revisada, Safe Mode se for a gerência), `review_and_commit` (embute estado
+  e diff, explica riscos, commit só com o "sim") e `diagnose_connectivity` (rota, interface, ping,
+  MTR, sem mudar nada); argumento inválido → `-32602`. `completion/complete` sugere ids de
+  comando, caminhos de estado e interfaces. Como testar: `cargo test -p corerouter-mcp` (6 testes
+  de protocolo novos + proptest de params hostis) ou, no Claude Code com
+  `claude mcp add corerouter -- corerouter-cli mcp`, `@corerouter:corerouter://state` e
+  `/mcp__corerouter__review_and_commit`. Detalhes em `docs/mcp.md`.
 - 2026-10-22 — G1.3: Drift, parte 1: `config.drift.list` diz onde o kernel não tem mais o que a config em execução
   (mais o que os clientes DHCP instalaram) pôs lá — link virtual apagado, porta derrubada, MTU
   trocado, porta tirada da bridge/VRF, endereço apagado ou a mais, rota estática apagada ou a mais
