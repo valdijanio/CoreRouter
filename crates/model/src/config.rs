@@ -264,6 +264,9 @@ pub struct Ip {
     /// `/ip dhcp-server` (G4.2a): servers, networks, static leases, options.
     #[serde(skip_serializing_if = "crate::dhcp_server::DhcpServers::is_empty")]
     pub dhcp_server: crate::dhcp_server::DhcpServers,
+    /// `/ip dhcp-relay` (G4.2b).
+    #[serde(skip_serializing_if = "crate::dhcp_relay::DhcpRelays::is_empty")]
+    pub dhcp_relays: crate::dhcp_relay::DhcpRelays,
 }
 
 impl Ip {

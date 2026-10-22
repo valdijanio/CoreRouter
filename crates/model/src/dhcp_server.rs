@@ -297,6 +297,15 @@ pub struct StaticLease {
     /// identifies the client instead of the MAC (RFC 2131 §4.2).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub client_id: String,
+    /// Option 82 circuit id (RFC 3046 §3.1) the request must carry: a
+    /// fixed address per port of the OLT or switch (RouterOS
+    /// `agent-circuit-id`). Text, or `0x…` for bytes.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_circuit_id: String,
+    /// Option 82 remote id (RFC 3046 §3.2): the subscriber's line (RouterOS
+    /// `agent-remote-id`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub agent_remote_id: String,
     /// `None`: the server's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lease_time: Option<u32>,
@@ -330,6 +339,8 @@ impl StaticLease {
             address,
             mac_address: None,
             client_id: String::new(),
+            agent_circuit_id: String::new(),
+            agent_remote_id: String::new(),
             lease_time: None,
             block_access: false,
             address_lists: Vec::new(),
@@ -464,8 +475,38 @@ pub struct DhcpServers {
     pub option_sets: Vec<OptionSet>,
     pub matchers: Vec<Matcher>,
     pub alerts: Vec<Alert>,
+    /// `/ip dhcp-server config` (G4.2b).
+    #[serde(skip_serializing_if = "ServerConfig::is_default")]
+    pub config: ServerConfig,
     /// One counter for every kind of item here (ids never reused).
     pub next_id: u32,
+}
+
+/// Default history retention: a year (the connection records an ISP keeps
+/// under Brazil's Marco Civil da Internet, art. 13).
+pub const DEFAULT_HISTORY_RETENTION: u32 = 365 * 86_400;
+
+/// `/ip dhcp-server config`: what applies to every server.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ServerConfig {
+    /// How long the lease history (who had which address when) is kept;
+    /// 0: no history.
+    pub history_retention: u32,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            history_retention: DEFAULT_HISTORY_RETENTION,
+        }
+    }
+}
+
+impl ServerConfig {
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 impl DhcpServers {
@@ -477,6 +518,7 @@ impl DhcpServers {
             && self.option_sets.is_empty()
             && self.matchers.is_empty()
             && self.alerts.is_empty()
+            && self.config.is_default()
     }
 
     pub fn next_id(&mut self) -> ItemId {
@@ -503,6 +545,39 @@ impl DhcpServers {
             .filter(|n| n.address.contains(&ip))
             .max_by_key(|n| n.address.prefix_len())
     }
+}
+
+/// A duration as RouterOS writes it (`30m`, `1d12h`, `52w`, `1h30m15s`)
+/// or plain seconds, up to ten years; `None` for anything else.
+pub fn parse_duration(text: &str) -> Option<u64> {
+    let t = text.trim();
+    if t.is_empty() || t.len() > 32 {
+        return None;
+    }
+    if let Ok(n) = t.parse::<u64>() {
+        return (n <= 10 * 365 * 86_400).then_some(n);
+    }
+    let mut total: u64 = 0;
+    let mut num: Option<u64> = None;
+    for c in t.chars() {
+        if let Some(d) = c.to_digit(10) {
+            num = Some(num.unwrap_or(0).checked_mul(10)?.checked_add(u64::from(d))?);
+            continue;
+        }
+        let unit = match c {
+            'w' => 7 * 86_400,
+            'd' => 86_400,
+            'h' => 3600,
+            'm' => 60,
+            's' => 1,
+            _ => return None,
+        };
+        total = total.checked_add(num.take()?.checked_mul(unit)?)?;
+    }
+    if num.is_some() {
+        return None;
+    }
+    (total <= 10 * 365 * 86_400).then_some(total)
 }
 
 /// RouterOS' client-id text (`1:aa:bb:cc:dd:ee:ff`, hex bytes separated by
@@ -577,6 +652,18 @@ mod tests {
             "after-10sec-delay".parse::<Authoritative>().unwrap(),
             Authoritative::After10SecDelay
         );
+    }
+
+    #[test]
+    fn durations_like_routeros() {
+        assert_eq!(parse_duration("30m"), Some(1800));
+        assert_eq!(parse_duration("1d12h"), Some(129_600));
+        assert_eq!(parse_duration("52w"), Some(52 * 7 * 86_400));
+        assert_eq!(parse_duration("0"), Some(0));
+        assert_eq!(parse_duration("90"), Some(90));
+        for bad in ["", "m", "10x", "1h30", "99999999999w"] {
+            assert_eq!(parse_duration(bad), None, "{bad}");
+        }
     }
 
     #[test]

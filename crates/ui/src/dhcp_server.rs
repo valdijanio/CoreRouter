@@ -226,6 +226,8 @@ const LEASE: ItemKind = ItemKind {
         text_field("address", "Address", "192.168.88.50"),
         text_field("mac_address", "MAC Address", "AA:BB:CC:DD:EE:FF"),
         text_field("client_id", "Client ID", "1:aa:bb:cc:dd:ee:ff"),
+        text_field("agent_circuit_id", "Agent Circuit ID", "the port (option 82)"),
+        text_field("agent_remote_id", "Agent Remote ID", "the line (option 82)"),
         text_field("server", "Server", "all"),
         text_field("lease_time", "Lease Time", "the server's"),
         text_field("host_name", "Host Name (DNS)", "the client's"),
@@ -398,6 +400,85 @@ pub(crate) struct DhcpServerPanel {
     tables: BTreeMap<Tab, TableState>,
     pub(crate) dialogs: Vec<ItemDialog>,
     reset_tables: TableState,
+    /// The History tab (G4.2b) instead of the item tabs.
+    pub(crate) show_history: bool,
+    pub(crate) history_form: HistoryForm,
+    /// `ip.dhcp-server.history.print`.
+    pub(crate) history: Option<Value>,
+    history_table: TableState,
+    /// A CSV to put on the clipboard (Export), and what to say about it.
+    export: Option<String>,
+    pub(crate) exported: Option<String>,
+}
+
+/// The History tab's search.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HistoryForm {
+    pub address: String,
+    pub mac: String,
+    /// An instant: who had the address then.
+    pub at: String,
+    pub text: String,
+}
+
+impl HistoryForm {
+    fn params(&self) -> Value {
+        let mut p = Map::new();
+        for (k, v) in [("address", &self.address), ("mac", &self.mac), ("at", &self.at), ("text", &self.text)] {
+            if !v.trim().is_empty() {
+                p.insert(k.into(), json!(v.trim()));
+            }
+        }
+        Value::Object(p)
+    }
+}
+
+struct Export;
+
+const HISTORY_TABLE: &str = "dhcp-server-history";
+const HISTORY_COLUMNS: [table::Column; 8] = [
+    col("Address"),
+    col("MAC Address"),
+    col("Host"),
+    col("Port (option 82)"),
+    col("Remote ID"),
+    col("From (UTC)"),
+    col("Until (UTC)"),
+    col("State"),
+];
+
+/// FNV-1a of a name, for its chip colour (docs/ui-style.md).
+fn hue_of(text: &str) -> usize {
+    let h = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    crate::chip::hashed(h)
+}
+
+fn history_row(r: &Value) -> Row {
+    let circuit = text(r, "circuit_id");
+    let port = if circuit.is_empty() {
+        String::new()
+    } else {
+        chip::cell("", &[(circuit.as_str(), Kind::Hashed(hue_of(&circuit)))])
+    };
+    let open = r.get("open").and_then(Value::as_bool) == Some(true);
+    Row {
+        key: format!("{}@{}", text(r, "address"), text(r, "start_unix")),
+        cells: vec![
+            text(r, "address"),
+            text(r, "mac"),
+            text(r, "host_name"),
+            port,
+            text(r, "remote_id"),
+            text(r, "start"),
+            text(r, "end"),
+            chip::cell("", &[if open { ("bound", Kind::Green) } else { ("ended", Kind::Neutral) }]),
+        ],
+        dimmed: false,
+        section: false,
+        tint: None,
+    }
 }
 
 /// Status chip of a lease.
@@ -507,7 +588,13 @@ pub(crate) fn row(tab: Tab, r: &Value) -> Row {
             if r.get("dns").is_some() {
                 host_chips.push(("DNS", Kind::Blue));
             }
-            if r.get("agent_info").is_some() {
+            // The port the client is on (option 82 circuit id), coloured by
+            // port so a whole PON or switch port stands out.
+            let circuit = text(r, "agent_circuit_id");
+            let short: String = circuit.chars().take(24).collect();
+            if !circuit.is_empty() {
+                host_chips.push((short.as_str(), Kind::Hashed(hue_of(&circuit))));
+            } else if r.get("agent_info").is_some() {
                 host_chips.push(("opt82", Kind::Neutral));
             }
             (
@@ -657,6 +744,13 @@ impl PanelState for DhcpServerPanel {
                 }
             }
         }
+        if main && self.show_history && app.has_command("ip.dhcp-server.history.print") {
+            out.push(Query {
+                key: "history",
+                command: "ip.dhcp-server.history.print",
+                params: self.history_form.params(),
+            });
+        }
         if (main || app.open.contains(&Win::Panel(WIN_STATS)))
             && app.has_command("ip.dhcp-server.statistics.print")
         {
@@ -672,6 +766,10 @@ impl PanelState for DhcpServerPanel {
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
         if key == "stats" {
             self.stats = Some(value);
+            return;
+        }
+        if key == "history" {
+            self.history = Some(value);
             return;
         }
         if let Some(tab) = Tab::ALL.into_iter().find(|t| t.kind().print == key)
@@ -700,6 +798,19 @@ impl PanelState for DhcpServerPanel {
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let then = match then.downcast::<Export>() {
+            Ok(_) => {
+                match result {
+                    Ok(v) => {
+                        self.export = Some(text(v, "csv"));
+                        self.exported = Some(format!("{} rows copied as CSV", text(v, "rows")));
+                    }
+                    Err(e) => self.exported = Some(format!("export failed: {e}")),
+                }
+                return;
+            }
+            Err(other) => other,
+        };
         if let Ok(r) = then.downcast::<Reply>()
             && let Some(pos) = self.dialogs.iter().position(|d| d.id == r.dialog)
             && let Some(d) = self.dialogs.get_mut(pos)
@@ -715,15 +826,23 @@ impl PanelState for DhcpServerPanel {
         if win == WIN_STATS {
             return self.reset_tables.escape();
         }
+        if self.show_history {
+            return self.history_table.escape();
+        }
         self.tables.entry(self.tab).or_default().escape()
     }
 
     fn tables(&self) -> Vec<(&'static str, &TableState)> {
-        self.tables.iter().map(|(t, s)| (t.salt(), s)).collect()
+        let mut v: Vec<(&'static str, &TableState)> = self.tables.iter().map(|(t, s)| (t.salt(), s)).collect();
+        v.push((HISTORY_TABLE, &self.history_table));
+        v
     }
 
     fn tables_mut(&mut self) -> Vec<(&'static str, &mut TableState)> {
-        self.tables.iter_mut().map(|(t, s)| (t.salt(), s)).collect()
+        let mut v: Vec<(&'static str, &mut TableState)> =
+            self.tables.iter_mut().map(|(t, s)| (t.salt(), s)).collect();
+        v.push((HISTORY_TABLE, &mut self.history_table));
+        v
     }
 }
 
@@ -731,12 +850,21 @@ impl DhcpServerPanel {
     fn main_window(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         ui.horizontal(|ui| {
             for t in Tab::ALL {
-                if ui.selectable_label(self.tab == t, t.title()).clicked() {
+                if ui.selectable_label(self.tab == t && !self.show_history, t.title()).clicked() {
                     self.tab = t;
+                    self.show_history = false;
                 }
+            }
+            if ui.selectable_label(self.show_history, "History").clicked() {
+                self.show_history = true;
+                app.cache.refreshed_at = None;
             }
         });
         ui.separator();
+        if self.show_history {
+            self.history_tab(app, ui);
+            return;
+        }
         let tab = self.tab;
         let kind = tab.kind();
         let rows: Vec<Row> = self
@@ -823,6 +951,56 @@ impl DhcpServerPanel {
         if stats {
             open_window(app, WIN_STATS);
         }
+    }
+
+    /// Who had which address when (G4.2b).
+    fn history_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        if let Some(csv) = self.export.take() {
+            ui.ctx().copy_text(csv);
+        }
+        let before = self.history_form.clone();
+        ui.horizontal(|ui| {
+            for (label, hint, v, w) in [
+                ("Address", "100.64.3.20", &mut self.history_form.address, 110.0),
+                ("MAC", "AA:BB:…", &mut self.history_form.mac, 130.0),
+                ("At", "2026-10-03T14:02:00-03:00", &mut self.history_form.at, 200.0),
+                ("Find", "host, port, line", &mut self.history_form.text, 130.0),
+            ] {
+                ui.label(label);
+                ui.add(egui::TextEdit::singleline(v).hint_text(hint).desired_width(w));
+            }
+            let can = app.can();
+            if action(ui, "Export CSV", can.check("ip.dhcp-server.history.export")) {
+                app.run_then(
+                    "ip.dhcp-server.history.export",
+                    self.history_form.params(),
+                    crate::panel::then(NAME, Export),
+                );
+            }
+        });
+        if self.history_form != before {
+            app.cache.refreshed_at = None;
+        }
+        let h = self.history.clone().unwrap_or(Value::Null);
+        ui.horizontal(|ui| {
+            let shown = h.get("rows").and_then(Value::as_array).map_or(0, Vec::len);
+            ui.weak(format!(
+                "{shown} shown of {} kept · retention {}",
+                text(&h, "total"),
+                text(&h, "retention")
+            ));
+            if let Some(m) = &self.exported {
+                ui.separator();
+                ui.weak(m.as_str());
+            }
+        });
+        ui.separator();
+        let rows: Vec<Row> = h
+            .get("rows")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(history_row).collect())
+            .unwrap_or_default();
+        table::show(ui, HISTORY_TABLE, 0.0, &mut self.history_table, &HISTORY_COLUMNS, &rows, |_, _| {});
     }
 
     /// The chips over the Leases table: how many in each state.

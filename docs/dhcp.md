@@ -1,7 +1,7 @@
 # Servidor DHCP (`/ip dhcp-server`, `/ip pool`)
 
-Status: **G4.2a** (servidor DHCPv4 completo) feito. G4.2b (`/ip dhcp-relay`, opção 82 e histórico
-de concessões) e G4.2c (servidor DHCPv6 com IA_NA e IA_PD) vêm em PRs seguintes. O cliente DHCP
+Status: **G4.2a** (servidor DHCPv4 completo) e **G4.2b** (`/ip dhcp-relay`, opção 82 no servidor e
+histórico de concessões, §11–§13) feitos. G4.2c (servidor DHCPv6 com IA_NA e IA_PD) vem no PR seguinte. O cliente DHCP
 (WAN) está em `docs/dhcp-client.md`.
 
 O roteador entrega endereços na LAN com os menus e nomes do RouterOS v7: pools, servidores,
@@ -186,9 +186,8 @@ tempestade cabe em poucas escritas por segundo. A sonda de 0,5 s atrasa a oferta
   desligados).
 - `block_access` entrega o endereço sem gateway nem DNS (no RouterOS o bloqueio é por ARP
   `reply-only`, que ainda não temos).
-- O alerta só escuta; o RouterOS também manda um DISCOVER por minuto (respostas unicast passariam
-  despercebidas). Fica para a G4.2b.
-- Sonda só ARP, só no enlace (pedido repassado por relay não é sondado: precisaria de ICMP).
+- Sonda só ARP, só no enlace (pedido repassado por relay não é sondado: precisaria de ICMP; gap
+  G4.2e).
 - Sem `lease-script`, `use-radius`, filas (`rate-limit`, `insert-queue-before`), `add-arp`,
   BOOTP, `delay-threshold`, `$(NETWORK_GATEWAY)`, sobrecarga de opções (52) na leitura e opção 118.
 - O `dhcproto` grava as opções em ordem de código, não na ordem da 55 (RFC 2132 §9.8 pede
@@ -196,7 +195,72 @@ tempestade cabe em poucas escritas por segundo. A sonda de 0,5 s atrasa a oferta
 - Tempo de concessão pedido pelo cliente (51) não é atendido: vale o do servidor (a RFC permite).
 - Sem alta disponibilidade (dois servidores com o mesmo pool): gap G4.2d.
 
+## 11. Relay (`/ip dhcp-relay`, G4.2b)
+
+| Propriedade | Padrão | Significado |
+|---|---|---|
+| `name` | `relayN` | |
+| `interface` | — | onde estão os clientes; um relay por interface, e não onde um servidor do roteador já responde |
+| `dhcp_server` | — | servidores (1..=8); cada pedido vai a todos, como no RouterOS |
+| `local_address` | o da interface | o `giaddr`: para onde o servidor responde e por onde escolhe a rede |
+| `add_relay_info` | `no` | acrescenta a opção 82: circuit id = o **nome da interface** (o RouterOS põe o MAC dela; o nome diz a porta), remote id = o MAC do cliente |
+| `relay_info_remote_id` | — | remote id fixo no lugar do MAC |
+
+Subida (RFC 1542 §4.1.1, RFC 2131 §4.1): `giaddr` posto quando zero (o de outro agente fica),
+`hops` + 1, descartado a partir de 16; opção 82 por último e só se couber (RFC 3046 §2.1); um pedido
+que já traz 82 não ganha outra. Descida (RFC 1542 §4.1.2, RFC 3046 §2.2): só respostas com o nosso
+`giaddr`, a 82 sai antes do cliente ver, broadcast se o cliente pediu (ou NAK), senão unicast ao
+`yiaddr`/`chaddr`. Se o servidor é o próprio roteador (um servidor com `relay` = o `giaddr`), a
+conversa é em memória, sem socket: o lab funciona assim. Para servidores de fora, um socket UDP 67
+sem interface (`hal-linux` `LinuxDhcpUplink`); os do servidor ficam presos às suas interfaces.
+`ip.dhcp-relay.print` traz pedidos subidos, respostas descidas e descartes por motivo
+(`malformed`, `hops`, `not-ours`, `send`, `no-uplink`). Checagens: interface e servidores
+existentes, `local_address` do roteador, um servidor do roteador na mesma interface é erro (o
+cliente teria duas respostas), servidor no mesmo enlace é aviso.
+
+## 12. Opção 82 no servidor
+
+- A concessão guarda a 82 (como chegou); `lease.print` mostra `agent_circuit_id` e
+  `agent_remote_id` (texto quando imprimível, `0x…` senão: a RFC 3046 §3.1/§3.2 diz que são opacos).
+- Concessão fixa por porta: `agent_circuit_id` e/ou `agent_remote_id` (RouterOS 7.21) no lugar de
+  MAC/client id, ou junto (todos os que estiverem preenchidos têm de bater). Um endereço por porta
+  de OLT ou switch, seja qual for o equipamento ligado.
+- A renovação vem direto ao servidor, sem relay e sem 82 (RFC 2131 §4.4.5): o servidor reconhece o
+  cliente pela concessão (o `ciaddr` e o client id) e usa a 82 guardada para casar a fixa. Também
+  por isso uma renovação unicast acha o servidor da concessão, chegue por qual interface for.
+- GUI: o host ganha um selo com a porta (circuit id), colorido por hash da porta.
+- O alerta agora também manda um DISCOVER próprio por minuto (RouterOS), para achar servidores que
+  só respondem por unicast.
+
+## 13. Histórico de concessões
+
+Cada vinculação vira uma entrada (endereço, MAC, client id, nome, servidor, circuit e remote id,
+início e fim), aberta no ACK de um cliente novo, estendida a cada renovação e fechada quando a
+concessão acaba. Diário próprio (`journal-dhcp-history.log`), mesmo esquema do de concessões
+(§7); compactação diária descarta o que passou da retenção. Na volta do daemon, entradas abertas
+cuja concessão não existe mais são fechadas no fim conhecido.
+
+- `ip.dhcp-server.config.set {history_retention}`: padrão **1 ano** (os registros de conexão que o
+  Marco Civil da Internet, art. 13, pede ao provedor); `0` desliga e apaga.
+- `ip.dhcp-server.history.print {address?, mac?, at?, from?, to?, text?, limit?}`: `at` responde
+  "quem tinha este IP neste instante" (`2026-10-03T14:02:00-03:00`, uma data ou segundos Unix);
+  horários em UTC.
+- `ip.dhcp-server.history.export {…}`: CSV (RFC 4180), até 10 000 linhas; a GUI copia para a área
+  de transferência (aba History, Export CSV).
+- Em memória até 500 000 entradas (**estimado** ~150 bytes cada); acima disso as mais antigas saem
+  da memória (o disco guarda até a retenção).
+
 ## Pesquisa
+
+**G4.2b.** RouterOS `/ip dhcp-relay` (`dhcp-server`, `local-address`, `add-relay-info` com circuit
+= MAC da interface e remote = MAC do cliente, `relay-info-remote-id`, `delay-threshold`,
+`dhcp-server-vrf`) e `agent-circuit-id`/`agent-remote-id` na concessão (7.21, hex desde 7.23);
+Kea: sub-opções 1, 2, 5 (link-selection), 6, 11, 19 e reservas por `circuit-id`; RFC 3046 (§2.1:
+por último, só se couber; §2.2: o servidor ecoa e o relay retira; §3.1/§3.2: opacos; §4: limite por
+remote id), RFC 1542 §4.1 (hops, giaddr), RFC 2131 §4.1/§4.4.5. Marco Civil da Internet (Lei
+12.965/2014), art. 13: registros de conexão por 1 ano. Melhorias: circuit id com o nome da
+interface (legível) em vez do MAC; histórico com consulta "quem tinha às HH:MM" e CSV, que nem o
+RouterOS nem o Kea trazem prontos; servidor e relay no mesmo roteador conversando em memória.
 
 **Fontes.** RouterOS v7: <https://manual.mikrotik.com/docs/cli-reference/ip/dhcp-server/> (e
 `/lease`, `/network`, `/option`, `/matcher`, `/alert`, `/config`),
@@ -246,6 +310,6 @@ por motivo; estatísticas (p99, ACK/s com pico, uso de pool com alerta) também 
 laboratório com hosts simulados.
 
 **Fora agora, e por quê.** Relay e opção 82 por porta, histórico de quem teve cada IP (Marco
-Civil): G4.2b. DHCPv6/PD: G4.2c. Alta disponibilidade (failover/HA como o Kea): G4.2d. RADIUS,
-filas e `lease-script`: dependem de subsistemas que não existem. ICMP na sonda (para relays) e o
-DISCOVER periódico do alerta: G4.2b.
+Civil): G4.2b (feito, §11–§13). DHCPv6/PD: G4.2c. Alta disponibilidade (failover/HA como o Kea):
+G4.2d. RADIUS, filas e `lease-script`: dependem de subsistemas que não existem. ICMP na sonda (para
+relays) e limite de concessões por remote id: G4.2e.

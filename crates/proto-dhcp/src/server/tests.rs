@@ -906,3 +906,129 @@ proptest! {
         let _ = super::checks::option_bytes(&text);
     }
 }
+
+/// G4.2b: a static lease by option 82 circuit id (a fixed address per OLT
+/// port), reached through a relay; the renewal comes straight (no option
+/// 82) and is still the same client's.
+#[test]
+fn static_leases_by_circuit_id_through_a_relay() {
+    let mut c = cfg();
+    c.ip.pools.pools.push(IpPool {
+        id: ItemId(5),
+        name: "far".into(),
+        ranges: vec!["10.50.0.10-10.50.0.20".parse().unwrap()],
+        next_pool: None,
+        comment: String::new(),
+    });
+    let mut s = DhcpServer::new(ItemId(6), "relay50".into(), "ether2".parse().unwrap());
+    s.address_pool = Some("far".into());
+    s.relay = Some(ip("10.50.0.1"));
+    c.ip.dhcp_server.servers.push(s);
+    let mut n = DhcpNetwork::new(ItemId(7), "10.50.0.0/24".parse().unwrap());
+    n.gateway = vec![ip("10.50.0.1")];
+    c.ip.dhcp_server.networks.push(n);
+    let mut st = StaticLease::new(ItemId(8), ip("10.50.0.77"));
+    st.agent_circuit_id = "olt1 0/1/3".into();
+    c.ip.dhcp_server.leases.push(st);
+    let mut lab = Lab::new(&c);
+    let relayed = |kind, requested: Option<Ipv4Addr>, server: Option<Ipv4Addr>| {
+        let mut m = msg(kind, mac(4), requested, server, Ipv4Addr::UNSPECIFIED);
+        m[24..28].copy_from_slice(&[10, 50, 0, 1]);
+        with_82(m, &agent::build(b"olt1 0/1/3", b"line-9").unwrap())
+    };
+    let fx = lab.send(
+        relayed(MessageType::Discover, None, None),
+        ip("192.168.88.1"),
+    );
+    let (bytes, to) = sent(&fx, Kind::Offer).unwrap();
+    assert_eq!(to, ReplyTo::Relay(ip("10.50.0.1")));
+    assert_eq!(v4::decode(&bytes).unwrap().yiaddr, ip("10.50.0.77"));
+    let fx = lab.send(
+        relayed(
+            MessageType::Request,
+            Some(ip("10.50.0.77")),
+            Some(ip("192.168.88.1")),
+        ),
+        ip("192.168.88.1"),
+    );
+    let b = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Bound(b) => Some(b.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(b.new);
+    // RENEWING: unicast straight from the client, no relay, no option 82:
+    // the lease says which server and that it is the same client.
+    let fx = lab.send(
+        msg(MessageType::Request, mac(4), None, None, ip("10.50.0.77")),
+        ip("192.168.88.1"),
+    );
+    let (_, to) = sent(&fx, Kind::Ack).unwrap_or_else(|| panic!("{fx:?}"));
+    assert_eq!(to, ReplyTo::Unicast(ip("10.50.0.77")));
+    let b = fx
+        .iter()
+        .find_map(|e| match e {
+            Effect::Bound(b) => Some(b.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(!b.new, "a renewal");
+    // Another port: not the static address.
+    let mut other = msg(
+        MessageType::Discover,
+        mac(5),
+        None,
+        None,
+        Ipv4Addr::UNSPECIFIED,
+    );
+    other[24..28].copy_from_slice(&[10, 50, 0, 1]);
+    let fx = lab.send(
+        with_82(other, &agent::build(b"olt1 0/1/4", b"x").unwrap()),
+        ip("192.168.88.1"),
+    );
+    assert_eq!(
+        v4::decode(&sent(&fx, Kind::Offer).unwrap().0)
+            .unwrap()
+            .yiaddr,
+        ip("10.50.0.10")
+    );
+}
+
+#[test]
+fn alerts_send_a_discover_a_minute() {
+    let mut c = cfg();
+    c.ip.dhcp_server.alerts.push(Alert {
+        id: ItemId(40),
+        interface: "ether1".parse().unwrap(),
+        valid_server: vec![],
+        alert_timeout: 3600,
+        disabled: false,
+        comment: String::new(),
+    });
+    let mut lab = Lab::new(&c);
+    let probes = |fx: &[Effect]| {
+        fx.iter()
+            .filter(|e| matches!(e, Effect::Discover { .. }))
+            .count()
+    };
+    assert_eq!(probes(&lab.later(1000)), 1);
+    assert_eq!(probes(&lab.later(30_000)), 0);
+    assert_eq!(probes(&lab.later(30_000)), 1);
+}
+
+#[test]
+fn relayed_replies_heard_on_67_are_not_counted() {
+    let mut lab = Lab::new(&cfg());
+    let mut reply = msg(
+        MessageType::Discover,
+        mac(1),
+        None,
+        None,
+        Ipv4Addr::UNSPECIFIED,
+    );
+    reply[0] = 2;
+    assert!(lab.send(reply, ip("192.168.88.1")).is_empty());
+    assert_eq!(lab.srv.stats().dropped_of(Drop::Malformed), 0);
+}

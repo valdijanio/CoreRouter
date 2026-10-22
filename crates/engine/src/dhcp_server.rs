@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr};
 
 use corerouter_hal::DynamicChange;
-use corerouter_hal::dhcp_server::DhcpServerPort;
+use corerouter_hal::dhcp_server::{DhcpServerPort, Heard, ReplyTo};
 use corerouter_model::IfName;
 use corerouter_model::firewall::{AddrMatch, Name};
 use corerouter_proto_dhcp::server::plan::Plan;
@@ -169,14 +169,21 @@ impl Session {
         let now = self.dhcp_now(now_ms);
         let mut fx: Vec<(Effect, Option<u64>)> = Vec::new();
         self.dhcp_server_sync(now, &mut fx);
+        self.dhcp_history_load(now);
+        // G4.2b: the relays first; requests for our own servers come back.
+        let mut relayed: Vec<(IfName, Heard)> = Vec::new();
+        let mut heard = self.dhcp_relay_poll(now, &mut relayed);
         let Some(rt) = self.ext_mut::<DhcpServerRuntime>() else {
-            return false;
+            return heard;
         };
         rt.last_ms = now_ms;
         let Some(core) = rt.core.as_mut() else {
-            return false;
+            return heard;
         };
-        let mut heard = false;
+        for (iface, h) in relayed {
+            let t0 = clock_us();
+            fx.extend(core.handle(now, &iface, &h).into_iter().map(|e| (e, Some(t0))));
+        }
         for (iface, slot) in rt.slots.iter_mut() {
             let Some(port) = slot.port.as_mut() else {
                 continue;
@@ -208,6 +215,7 @@ impl Session {
         fx.extend(core.tick(now).into_iter().map(|e| (e, None)));
         self.dhcp_server_apply(now, fx, clock_us);
         self.dhcp_server_compact(now, false);
+        self.dhcp_history_compact(now);
         heard
     }
 
@@ -328,10 +336,38 @@ impl Session {
             }
         }
         let mut later = Vec::new();
+        // Replies to the router's own relays go to them, not on the wire.
+        let mut to_relays: Vec<Vec<u8>> = Vec::new();
+        let relays: Vec<Ipv4Addr> = fx
+            .iter()
+            .filter_map(|(e, _)| match e {
+                Effect::Send { to: ReplyTo::Relay(ip), .. } => Some(*ip),
+                _ => None,
+            })
+            .filter(|ip| self.dhcp_relay_is_ours(*ip))
+            .collect();
         // 2. Replies and probes.
         if let Some(rt) = self.ext_mut::<DhcpServerRuntime>() {
             for (e, t0) in fx {
                 match e {
+                    Effect::Send { to: ReplyTo::Relay(ip), payload, .. } if relays.contains(&ip) => {
+                        if let (Some(t0), Some(core)) = (t0, rt.core.as_mut()) {
+                            core.stats_mut().latency(clock_us().saturating_sub(t0));
+                        }
+                        to_relays.push(payload);
+                    }
+                    Effect::Discover { interface } => {
+                        if let Some(port) = rt.slots.get_mut(&interface).and_then(|s| s.port.as_mut()) {
+                            let mac = port.mac();
+                            let xid = corerouter_hal::dhcp::lab_hash(&now.ms.to_be_bytes());
+                            let payload = corerouter_proto_dhcp::server::alert_discover(mac, xid);
+                            if let Some(p) = payload
+                                && let Err(err) = port.send_discover(&p)
+                            {
+                                log::debug!("dhcp-server: alert DISCOVER on {interface}: {err}");
+                            }
+                        }
+                    }
                     Effect::Send { interface, payload, src, to, .. } => {
                         let Some(slot) = rt.slots.get_mut(&interface) else {
                             continue;
@@ -357,11 +393,20 @@ impl Session {
                 }
             }
         }
+        for r in to_relays {
+            self.dhcp_relay_down(&r);
+        }
         // 3. and 4.
         for e in later {
             match e {
-                Effect::Bound(b) => self.dhcp_bound(&b, now),
-                Effect::Gone(l) => self.dhcp_gone(l.address, now),
+                Effect::Bound(b) => {
+                    self.dhcp_bound(&b, now);
+                    self.dhcp_history_bound(&b.lease, b.new, now);
+                }
+                Effect::Gone(l) => {
+                    self.dhcp_gone(l.address, now);
+                    self.dhcp_history_gone(l.address, now);
+                }
                 Effect::Log { level, text } => {
                     let topics: &[&str] = match level {
                         Level::Info => &["dhcp", "info"],

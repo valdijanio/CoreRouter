@@ -114,6 +114,9 @@ pub struct StaticPlan {
     pub cfg: StaticLease,
     /// Client id bytes, when it matches by client id.
     pub client_id: Option<Vec<u8>>,
+    /// Option 82 circuit and remote id it must carry (G4.2b).
+    pub circuit: Option<Vec<u8>>,
+    pub remote: Option<Vec<u8>>,
     pub options: Vec<OptPlan>,
 }
 
@@ -122,15 +125,29 @@ impl StaticPlan {
     /// §4.2 identity) and hardware address `mac`. RFC 4361 §6.3: a lease
     /// written by MAC matches that MAC even when the client sends a client
     /// id (RouterOS does the same).
-    pub fn matches(&self, server: &str, key: &[u8], mac: [u8; 6]) -> bool {
+    pub fn matches(&self, server: &str, key: &[u8], mac: [u8; 6], agent: Option<&[u8]>) -> bool {
         if self.cfg.server.as_deref().is_some_and(|s| s != server) {
             return false;
         }
-        match (&self.client_id, self.cfg.mac_address) {
-            (Some(id), _) => id.as_slice() == key,
-            (None, Some(m)) => m.0 == mac,
-            (None, None) => false,
-        }
+        // Every identity it names must match; it must name one.
+        let id = match (&self.client_id, self.cfg.mac_address) {
+            (Some(id), _) => Some(id.as_slice() == key),
+            (None, Some(m)) => Some(m.0 == mac),
+            (None, None) => None,
+        };
+        let sub = |want: &Option<Vec<u8>>, code: u8| {
+            want.as_ref().map(|w| {
+                agent
+                    .and_then(|a| crate::server::agent::get(a, code))
+                    .is_some_and(|got| got == w.as_slice())
+            })
+        };
+        let checks = [
+            id,
+            sub(&self.circuit, crate::server::agent::CIRCUIT_ID),
+            sub(&self.remote, crate::server::agent::REMOTE_ID),
+        ];
+        checks.iter().any(Option::is_some) && checks.iter().flatten().all(|ok| *ok)
     }
 }
 
@@ -291,6 +308,8 @@ impl Plan {
                 } else {
                     parse_client_id(&l.client_id)
                 },
+                circuit: crate::server::agent::parse(&l.agent_circuit_id),
+                remote: crate::server::agent::parse(&l.agent_remote_id),
                 options: options_of(d, &l.dhcp_option, l.dhcp_option_set.as_ref()),
             })
             .collect();
@@ -399,12 +418,22 @@ impl Plan {
     }
 
     /// The static lease of a client.
-    pub fn static_for(&self, server: &str, key: &[u8], mac: [u8; 6]) -> Option<&StaticPlan> {
+    pub fn static_for(
+        &self,
+        server: &str,
+        key: &[u8],
+        mac: [u8; 6],
+        agent: Option<&[u8]>,
+    ) -> Option<&StaticPlan> {
         // A client-id match beats a MAC match (the more specific identity).
         self.statics
             .iter()
-            .find(|s| s.client_id.is_some() && s.matches(server, key, mac))
-            .or_else(|| self.statics.iter().find(|s| s.matches(server, key, mac)))
+            .find(|s| s.client_id.is_some() && s.matches(server, key, mac, agent))
+            .or_else(|| {
+                self.statics
+                    .iter()
+                    .find(|s| s.matches(server, key, mac, agent))
+            })
     }
 
     /// The static lease of `ip` on `server`, whoever it is for.

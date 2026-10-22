@@ -31,7 +31,9 @@
 //!   RFC 4702 §4: option 81 answered with the S/O/N flags; the DNS is
 //!   updated on ACK only, never on DISCOVER (§4.1).
 
+pub mod agent;
 pub mod checks;
+pub mod history;
 pub mod leases;
 pub mod plan;
 pub mod reply;
@@ -64,6 +66,8 @@ pub const PROBE_TRIES: usize = 3;
 /// affinity; Kea's `hold-reclaimed-time` is an hour, a weekend away is
 /// more useful: **estimado**).
 pub const KEEP_FREE_SECS: u64 = 7 * 86_400;
+/// How often an alert sends its own DISCOVER (RouterOS: once a minute).
+pub const ALERT_PROBE_SECS: u64 = 60;
 /// Offers waiting for a probe at once (a DISCOVER flood is bounded here).
 pub const MAX_PARKED: usize = 4096;
 /// Clients the rate limiter remembers (random-MAC floods are bounded).
@@ -75,6 +79,27 @@ const PROBED_OK_MS: u64 = 60_000;
 /// (RFC 4702 §5, Kea).
 pub fn dns_ttl(lease_time: u32) -> u32 {
     (lease_time / 3).max(600)
+}
+
+/// The DISCOVER an alert sends from `mac` (broadcast reply asked for: a
+/// rogue server's answer reaches every listener).
+pub fn alert_discover(mac: [u8; 6], xid: u32) -> Option<Vec<u8>> {
+    crate::v4::Outgoing {
+        kind: dhcproto::v4::MessageType::Discover,
+        xid,
+        secs: 0,
+        mac,
+        ciaddr: Ipv4Addr::UNSPECIFIED,
+        broadcast: true,
+        requested: None,
+        server_id: None,
+        client_id: &[],
+        host_name: None,
+        vendor_class: None,
+        extra: &[],
+    }
+    .encode()
+    .ok()
 }
 
 /// The two clocks: monotonic milliseconds (probes, rate limits) and Unix
@@ -97,6 +122,8 @@ pub enum Level {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Binding {
     pub lease: Lease,
+    /// A new binding (not a renewal of the same client's).
+    pub new: bool,
     /// `<label>.<zone>` when the network names a zone and the client a
     /// name (and did not ask for no update, RFC 4702 N).
     pub dns: Option<(String, String)>,
@@ -124,6 +151,11 @@ pub enum Effect {
     Gone(Lease),
     /// A journal line to write before any reply of this round goes out.
     Journal(Record),
+    /// Send our own DISCOVER on `interface` (an alert looks for servers
+    /// that only answer by unicast, as RouterOS does once a minute).
+    Discover {
+        interface: IfName,
+    },
     Log {
         level: Level,
         text: String,
@@ -204,6 +236,11 @@ pub struct Server {
     /// never-used again).
     generation: u64,
     last_tick: u64,
+    /// Option 82 of the client being handled (its request's, or the one
+    /// its lease kept: a renewal comes straight, without the relay).
+    agent: Option<Vec<u8>>,
+    /// Last DISCOVER sent per alert interface (Unix time).
+    alert_probe: HashMap<IfName, u64>,
 }
 
 fn mac_text(m: &[u8; 6]) -> String {
@@ -252,6 +289,8 @@ impl Server {
             exhausted: HashMap::new(),
             generation: 0,
             last_tick: 0,
+            agent: None,
+            alert_probe: HashMap::new(),
         }
     }
 
@@ -352,6 +391,8 @@ impl Server {
         }
         let req = match request::parse(&heard.payload) {
             Ok(r) => r,
+            // A reply to a relay (ours, G4.2b): not for the server.
+            Err(Bad::Reply) => return out,
             Err(Bad::NoType) => {
                 self.stats.drop(Drop::Bootp);
                 return out;
@@ -362,7 +403,15 @@ impl Server {
             }
         };
         self.stats.got(req.kind);
-        let Some(si) = self.plan.server_for(iface, req.giaddr) else {
+        // A client renewing by unicast (`ciaddr`, no relay on the way: RFC
+        // 2131 §4.4.5) belongs to the server of its lease, wherever it
+        // arrives (a client behind a relay renews straight to us).
+        let by_lease = (req.giaddr.is_unspecified() && !req.ciaddr.is_unspecified())
+            .then(|| self.leases.get(req.ciaddr))
+            .flatten()
+            .filter(|l| l.client_key() == req.client_key())
+            .and_then(|l| self.plan.servers.iter().position(|s| s.name == l.server));
+        let Some(si) = by_lease.or_else(|| self.plan.server_for(iface, req.giaddr)) else {
             self.stats.drop(Drop::NoServer);
             return out;
         };
@@ -374,6 +423,7 @@ impl Server {
             self.stats.drop(Drop::RateLimited);
             return out;
         }
+        self.set_agent(&srv.name, &req);
         let unicast = !heard.dst.is_broadcast();
         match req.kind {
             Kind::Discover => self.discover(now, iface, &srv, req, None, &mut out),
@@ -384,6 +434,16 @@ impl Server {
             _ => self.stats.drop(Drop::Unexpected),
         }
         out
+    }
+
+    /// The option 82 a static lease is matched with: the request's, else
+    /// the one the client's lease kept (renewals come without a relay).
+    fn set_agent(&mut self, server: &str, req: &Request) {
+        self.agent = req.relay_info.clone().or_else(|| {
+            self.leases
+                .of_client(&req.client_key(), server)
+                .find_map(|l| l.relay_info.clone())
+        });
     }
 
     /// Token bucket: `client_rate_limit` messages a second, bursts of
@@ -495,7 +555,7 @@ impl Server {
         mac: [u8; 6],
     ) -> bool {
         if let Some(s) = self.plan.static_of(&srv.name, ip) {
-            return s.matches(&srv.name, key, mac);
+            return s.matches(&srv.name, key, mac, self.agent.as_deref());
         }
         if !self.usable(chain, ip) {
             return false;
@@ -585,7 +645,10 @@ impl Server {
     ) -> Option<(Ipv4Addr, bool)> {
         let key = req.client_key();
         let mac = req.mac();
-        if let Some(s) = self.plan.static_for(&srv.name, &key, mac) {
+        if let Some(s) = self
+            .plan
+            .static_for(&srv.name, &key, mac, self.agent.as_deref())
+        {
             return Some((s.cfg.address, false));
         }
         let mine: Vec<Lease> = self.leases.of_client(&key, &srv.name).cloned().collect();
@@ -634,7 +697,10 @@ impl Server {
             return;
         }
         let (chain, _) = self.chain_for(srv, &req);
-        let is_static = self.plan.static_for(&srv.name, &key, mac).is_some();
+        let is_static = self
+            .plan
+            .static_for(&srv.name, &key, mac, self.agent.as_deref())
+            .is_some();
         if chain.is_none() && !is_static {
             self.stats.drop(Drop::StaticOnly);
             return;
@@ -764,7 +830,10 @@ impl Server {
         out: &mut Vec<Effect>,
     ) {
         let key = req.client_key();
-        let st = self.plan.static_for(&srv.name, &key, req.mac()).cloned();
+        let st = self
+            .plan
+            .static_for(&srv.name, &key, req.mac(), self.agent.as_deref())
+            .cloned();
         let lt = self.lease_time(srv, st.as_ref());
         match self.leases.get(ip) {
             Some(l) if l.state == State::Bound && l.client_key() == key && l.server == srv.name => {
@@ -1083,7 +1152,7 @@ impl Server {
                 .is_some_and(|l| l.client_key() == key && l.server == srv.name && l.state.active());
             let is_static = self
                 .plan
-                .static_for(&srv.name, &key, mac)
+                .static_for(&srv.name, &key, mac, self.agent.as_deref())
                 .is_some_and(|s| s.cfg.address == ip);
             if ours || is_static {
                 self.ack(now, iface, srv, req, ip, out);
@@ -1119,7 +1188,7 @@ impl Server {
         let ok = self.free_for(srv, chain, ip, &key, mac)
             || self
                 .plan
-                .static_for(&srv.name, &key, mac)
+                .static_for(&srv.name, &key, mac, self.agent.as_deref())
                 .is_some_and(|s| s.cfg.address == ip);
         if ok && (known || may_nak) {
             // Ours, or (authoritative) free and valid for this client: the
@@ -1146,7 +1215,10 @@ impl Server {
         out: &mut Vec<Effect>,
     ) {
         let key = req.client_key();
-        let st = self.plan.static_for(&srv.name, &key, req.mac()).cloned();
+        let st = self
+            .plan
+            .static_for(&srv.name, &key, req.mac(), self.agent.as_deref())
+            .cloned();
         let lt = self.lease_time(srv, st.as_ref());
         // The client's other addresses on this server end (it moved).
         let old: Vec<Ipv4Addr> = self
@@ -1222,6 +1294,7 @@ impl Server {
             });
         }
         out.push(Effect::Bound(Binding {
+            new: !renewed,
             lease: rec,
             dns,
             ttl: dns_ttl(lt),
@@ -1311,7 +1384,12 @@ impl Server {
         }
         let st = self
             .plan
-            .static_for(&srv.name, &req.client_key(), req.mac())
+            .static_for(
+                &srv.name,
+                &req.client_key(),
+                req.mac(),
+                self.agent.as_deref(),
+            )
             .cloned();
         // §4.3.5: no lease time, no yiaddr.
         self.reply(
@@ -1364,6 +1442,7 @@ impl Server {
             return out;
         };
         self.stats.conflicts = self.stats.conflicts.saturating_add(1);
+        self.set_agent(&srv.name, &p.req);
         let mut rec = self.record_for(
             &srv,
             &p.req,
@@ -1409,6 +1488,7 @@ impl Server {
                 continue;
             };
             self.probed_ok.insert(p.ip, now.ms);
+            self.set_agent(&srv.name, &p.req);
             // Still free? (a static lease or another client may have taken
             // it while we waited)
             let key = p.req.client_key();
@@ -1488,6 +1568,17 @@ impl Server {
             self.generation += 1;
         }
         let alerts = self.plan.alerts.clone();
+        for a in &alerts {
+            let last = self.alert_probe.get(&a.interface).copied().unwrap_or(0);
+            if now.unix >= last.saturating_add(ALERT_PROBE_SECS) {
+                self.alert_probe.insert(a.interface.clone(), now.unix);
+                out.push(Effect::Discover {
+                    interface: a.interface.clone(),
+                });
+            }
+        }
+        self.alert_probe
+            .retain(|i, _| alerts.iter().any(|a| a.interface == *i));
         self.seen.retain(|(i, _), s| {
             let timeout = alerts
                 .iter()

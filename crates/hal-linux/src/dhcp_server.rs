@@ -354,6 +354,65 @@ impl DhcpServerPort for LinuxDhcpServerPort {
     fn describe(&self) -> String {
         format!("udp 67 on {}", self.name)
     }
+
+    fn send_discover(&mut self, payload: &[u8]) -> Result<(), HalError> {
+        let frame = crate::dhcp::udp_frame(
+            self.mac,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            payload,
+        )
+        .ok_or_else(|| HalError::Rejected(format!("DHCP message of {} bytes", payload.len())))?;
+        self.send_frame(&frame)
+    }
+}
+
+/// The relay's UDP socket on port 67, all interfaces (G4.2b). A server's
+/// own sockets are bound to their interfaces, so they keep what reaches
+/// them; this one gets the replies to the relay's `giaddr`.
+pub struct LinuxDhcpUplink {
+    udp: std::net::UdpSocket,
+}
+
+impl LinuxDhcpUplink {
+    pub fn open() -> io::Result<Self> {
+        let udp = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        udp.set_reuse_address(true)?;
+        udp.set_nonblocking(true)?;
+        udp.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, SERVER_PORT)).into())?;
+        Ok(Self { udp: udp.into() })
+    }
+}
+
+impl corerouter_hal::dhcp_server::DhcpUplink for LinuxDhcpUplink {
+    fn recv(&mut self) -> Result<Option<Heard>, HalError> {
+        let mut buf = vec![0u8; MAX_MESSAGE];
+        match self.udp.recv_from(&mut buf) {
+            Ok((n, from)) => {
+                buf.truncate(n);
+                let src = match from {
+                    SocketAddr::V4(a) => *a.ip(),
+                    SocketAddr::V6(_) => Ipv4Addr::UNSPECIFIED,
+                };
+                Ok(Some(Heard {
+                    payload: buf,
+                    src,
+                    dst: Ipv4Addr::UNSPECIFIED,
+                    src_mac: [0; 6],
+                    to_server: true,
+                }))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(e) => Err(HalError::Io(format!("relay uplink: {e}"))),
+        }
+    }
+
+    fn send(&mut self, payload: &[u8], server: Ipv4Addr) -> Result<(), HalError> {
+        self.udp
+            .send_to(payload, SocketAddr::from((server, SERVER_PORT)))
+            .map(|_| ())
+            .map_err(|e| HalError::Io(format!("relay → {server}: {e}")))
+    }
 }
 
 #[cfg(test)]

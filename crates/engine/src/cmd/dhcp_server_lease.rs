@@ -22,7 +22,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add DHCP Lease",
         ["IP", "DHCP Server"],
         None,
-        "{address: ipv4, mac_address?: mac, client_id?: string (option 61 as RouterOS prints it, 1:aa:bb:cc:dd:ee:ff, or 0x…; matches instead of the MAC), server?: string (all, the default, or a server's name), lease_time?: duration (empty or 0: the server's), block_access?: bool (the client gets its address but no gateway nor DNS), address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string (its name in the DNS; empty: the client's), disabled?: bool, comment?: string} → {id, warnings}",
+        "{address: ipv4, mac_address?: mac, client_id?: string (option 61 as RouterOS prints it, 1:aa:bb:cc:dd:ee:ff, or 0x…; matches instead of the MAC), agent_circuit_id?: string (option 82 circuit id the request must carry: a fixed address per OLT/switch port; text or 0x…), agent_remote_id?: string (option 82 remote id), server?: string (all, the default, or a server's name), lease_time?: duration (empty or 0: the server's), block_access?: bool (the client gets its address but no gateway nor DNS), address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string (its name in the DNS; empty: the client's), disabled?: bool, comment?: string} → {id, warnings}",
         always,
         add
     ),
@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set DHCP Lease",
         [],
         None,
-        "{id: *hex | address (a static lease; make a dynamic one static first), address?: ipv4, mac_address?: mac, client_id?: string, server?: string, lease_time?: duration, block_access?: bool, address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string, disabled?: bool, comment?: string} → {id, warnings}",
+        "{id: *hex | address (a static lease; make a dynamic one static first), address?: ipv4, mac_address?: mac, client_id?: string, agent_circuit_id?: string, agent_remote_id?: string, server?: string, lease_time?: duration, block_access?: bool, address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string, disabled?: bool, comment?: string} → {id, warnings}",
         always,
         set
     ),
@@ -81,7 +81,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         check_status
     ),
     cmd!(query "ip.dhcp-server.lease.print", "DHCP Leases", [], None,
-        "{server?: string, status?: string} → [{id? (static leases), address, dynamic, status (waiting | testing | offered | bound | conflict | declined), mac_address?, client_id?, host_name?, server?, expires_after?, expires_after_secs?, last_seen_secs?, vendor_class?, blocked, dns? (the name it has in the DNS), address_lists, reason? (of a conflict), lease_time?, always_broadcast, dhcp_option, dhcp_option_set?, disabled, comment?, agent_info? (option 82, hex)}]",
+        "{server?: string, status?: string} → [{id? (static leases), address, dynamic, status (waiting | testing | offered | bound | conflict | declined), mac_address?, client_id?, host_name?, server?, expires_after?, expires_after_secs?, last_seen_secs?, vendor_class?, blocked, dns? (the name it has in the DNS), address_lists, reason? (of a conflict), lease_time?, always_broadcast, dhcp_option, dhcp_option_set?, disabled, comment?, agent_info? (option 82, hex), agent_circuit_id? (the request's, or the static lease's), agent_remote_id?}]",
         always, print),
 ];
 
@@ -112,6 +112,18 @@ fn apply(l: &mut StaticLease, p: &Value) -> Result<()> {
             ));
         }
         l.client_id = c;
+    }
+    for (key, slot) in [
+        ("agent_circuit_id", &mut l.agent_circuit_id),
+        ("agent_remote_id", &mut l.agent_remote_id),
+    ] {
+        if let Some(t) = opt_text(p, key, 512)? {
+            let t = t.trim().to_owned();
+            if !t.is_empty() && corerouter_proto_dhcp::server::agent::parse(&t).is_none() {
+                return Err(EngineError::bad(key, "text, or 0x… bytes; at most 255"));
+            }
+            *slot = t;
+        }
     }
     if let Some(sv) = opt_ref(p, "server", &["all"])? {
         l.server = sv;
@@ -334,7 +346,13 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
                 o.insert("reason".into(), json!(l.reason));
             }
             if let Some(r) = &l.relay_info {
+                use corerouter_proto_dhcp::server::agent;
                 o.insert("agent_info".into(), json!(corerouter_proto_dhcp::v4::hex(r)));
+                for (key, code) in [("agent_circuit_id", agent::CIRCUIT_ID), ("agent_remote_id", agent::REMOTE_ID)] {
+                    if let Some(v) = agent::get(r, code) {
+                        o.insert(key.into(), json!(agent::text(v)));
+                    }
+                }
             }
         }
         v
@@ -361,6 +379,11 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
             }
             if !st.client_id.is_empty() {
                 o.insert("client_id".into(), json!(st.client_id));
+            }
+            for (key, v) in [("agent_circuit_id", &st.agent_circuit_id), ("agent_remote_id", &st.agent_remote_id)] {
+                if !v.is_empty() && !o.contains_key(key) {
+                    o.insert(key.into(), json!(v));
+                }
             }
             if !st.host_name.is_empty() && live.is_none_or(|l| l.host_name.is_empty()) {
                 o.insert("host_name".into(), json!(st.host_name));
