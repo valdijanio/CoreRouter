@@ -265,6 +265,18 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `6fbab48` (worktree temporária, `CARGO_TARGET_DIR` próprio) + GUI deste branch `--connect`
   `--control`, xdotool para o hover e `screenshot`: Safe Mode cinza com o tooltip de versão.
   Esforço do agente ~3 h (**estimado**).
+- 2026-10-22 — G5.2 (Parte 2): LLDP e MNDP na tabela de vizinhos. Com `--backend linux` o daemon
+  (`apps/corerouter-daemon/src/link_discovery.rs`, uma thread) envia LLDP nas interfaces da
+  descoberta a cada `interval_secs` com TTL 4 × (System Name = identity, System Description =
+  `CoreRouter <versão>`, Chassis ID = node id do CRDP, Port ID = nome, Port Description =
+  comentário, Management Address = endereços da interface), reenvia logo quando o conteúdo muda
+  e manda TTL 0 quando a interface sai; recebe LLDP e escuta MNDP (UDP 5678, **nunca**
+  anunciado) e grava `lldp`/`mndp` com `record_neighbor`. Sem `CAP_NET_RAW` o LLDP fica
+  desligado com um aviso claro e o daemon segue (conferido com `setpriv`). `hal-linux`:
+  `LldpIo::set_interval`/`ifindex`. Testes: 7 unitários de mapeamento e
+  `tests/netns_l2.rs` (dois daemons linux em namespaces, veth ×2; crdp + lldp com o mesmo
+  node id, filtro por protocolo, MNDP sintético, interface sem descoberta não grava, TTL 0
+  apaga; ~14 s **medido**); helpers dos testes netns do daemon em `tests/common`.
 
 - 2026-10-22 — G5.4: no lab virtual a descoberta CRDP usa o loopback do host. Antes, um
   `corerouter-daemon` virtual anunciava pelas interfaces **reais** com o nome das portas do lab
@@ -314,4 +326,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G5.1.
 - 2026-10-22 — log do G1.15.
 - 2026-10-22 — log do G1.16.
+- 2026-10-22 — log do G5.2 (Parte 2).
 - 2026-10-22 — log do G5.4.

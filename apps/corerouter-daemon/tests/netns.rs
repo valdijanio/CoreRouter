@@ -23,79 +23,18 @@
     clippy::indexing_slicing
 )]
 
+mod common;
+
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use common::*;
 use corerouter_control::Client;
 use corerouter_engine::Session;
 use corerouter_hal::VirtualHal;
 use corerouter_storage_fs::FileStorage;
 use serde_json::{Value, json};
-
-const ENV: &str = "COREROUTER_NETNS_TESTS";
-const QUERY_ENV: &str = "CRDP_NETNS_QUERY";
-const DAEMON: &str = env!("CARGO_BIN_EXE_corerouter-daemon");
-const CONTROL: &str = "127.0.0.1:7979";
-
-/// True when the test may touch the kernel; panics outside a fresh namespace.
-fn in_netns() -> bool {
-    if std::env::var_os(ENV).is_none_or(|v| v != "1") {
-        eprintln!(
-            "skipped: set {ENV}=1 and run inside `unshare --user --map-root-user --net` \
-             (cargo xtask netns)"
-        );
-        return false;
-    }
-    let names = link_names();
-    assert_eq!(
-        names,
-        ["lo"],
-        "{ENV}=1 but this network namespace has {names:?}, not just lo; refusing to touch it"
-    );
-    true
-}
-
-fn link_names() -> Vec<String> {
-    let out = Command::new("ip")
-        .args(["-o", "link", "show"])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| l.split(':').nth(1))
-        .map(|n| n.trim().split('@').next().unwrap_or("").to_owned())
-        .collect()
-}
-
-/// `ip …` here, or inside namespace `pid`.
-fn ip(pid: Option<u32>, args: &[&str]) {
-    let mut c = match pid {
-        Some(pid) => {
-            let mut c = Command::new("nsenter");
-            c.args(["--target", &pid.to_string(), "--net", "--", "ip"]);
-            c
-        }
-        None => Command::new("ip"),
-    };
-    let out = c.args(args).output().unwrap();
-    assert!(
-        out.status.success(),
-        "ip {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-/// Kills the process when the test ends, pass or fail.
-struct Kill(Child);
-
-impl Drop for Kill {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
 
 /// Seconds between announcements: hold is 4 × this.
 const INTERVAL: u64 = 2;
@@ -128,14 +67,7 @@ fn config_dir(name: &str, address: Option<&str>) -> PathBuf {
 
 fn daemon(netns: Option<u32>, dir: &Path, log: &str) -> Kill {
     let log = std::fs::File::create(std::env::temp_dir().join(log)).unwrap();
-    let mut c = match netns {
-        Some(pid) => {
-            let mut c = Command::new("nsenter");
-            c.args(["--target", &pid.to_string(), "--net", "--", DAEMON]);
-            c
-        }
-        None => Command::new(DAEMON),
-    };
+    let mut c = in_ns(netns, DAEMON);
     // Virtual ports over real veths: the interfaces transport, not the
     // lab's loopback default (G5.4).
     c.args(["--discovery-transport", "interfaces"]);
@@ -147,80 +79,10 @@ fn daemon(netns: Option<u32>, dir: &Path, log: &str) -> Kill {
     Kill(c.spawn().unwrap())
 }
 
-fn netns_of(pid: u32) -> Option<PathBuf> {
-    std::fs::read_link(format!("/proc/{pid}/ns/net")).ok()
-}
-
-/// `ip.neighbor.list` of router A (here) or B (inside `pid`).
-fn neighbors(netns: Option<u32>) -> Vec<Value> {
-    let result = match netns {
-        None => Client::connect(CONTROL, Duration::from_secs(1))
-            .and_then(|mut c| c.call("engine.execute", json!({"command": "ip.neighbor.list"}))),
-        Some(pid) => {
-            let out = Command::new("nsenter")
-                .args(["--target", &pid.to_string(), "--net", "--"])
-                .arg(std::env::current_exe().unwrap())
-                .args([
-                    "query_helper",
-                    "--exact",
-                    "--nocapture",
-                    "--test-threads",
-                    "1",
-                ])
-                .env(QUERY_ENV, CONTROL)
-                .env_remove(ENV)
-                .output()
-                .unwrap();
-            let text = String::from_utf8_lossy(&out.stdout).into_owned();
-            text.lines()
-                .find_map(|l| l.split_once("QUERY-RESULT ").map(|(_, j)| j))
-                .ok_or_else(|| format!("no result from B: {text}"))
-                .and_then(|j| serde_json::from_str::<Value>(j).map_err(|e| e.to_string()))
-                .and_then(|v| match v {
-                    Value::Object(mut o) if o.contains_key("error") => {
-                        Err(o.remove("error").map(|e| e.to_string()).unwrap_or_default())
-                    }
-                    other => Ok(other),
-                })
-        }
-    };
-    match result {
-        Ok(Value::Array(rows)) => rows,
-        other => {
-            eprintln!("ip.neighbor.list in {netns:?}: {other:?}");
-            Vec::new()
-        }
-    }
-}
-
-fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline {
-        if ok() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    panic!("timed out waiting for {what}");
-}
-
-fn sees<'a>(rows: &'a [Value], identity: &str) -> Option<&'a Value> {
-    rows.iter().find(|r| r["identity"] == identity)
-}
-
 /// Not a test: run inside B's namespace by `neighbors(Some(pid))`.
 #[test]
 fn query_helper() {
-    let Ok(addr) = std::env::var(QUERY_ENV) else {
-        return;
-    };
-    let answer = Client::connect(&addr, Duration::from_secs(1))
-        .and_then(|mut c| c.call("engine.execute", json!({"command": "ip.neighbor.list"})));
-    let line = match answer {
-        Ok(v) => v,
-        Err(e) => json!({ "error": e }),
-    };
-    println!("QUERY-RESULT {line}");
+    common::query_helper();
 }
 
 #[test]
@@ -237,17 +99,8 @@ fn two_daemons_see_each_other() {
 fn exchange(v4: bool) {
     let tag = if v4 { "dual" } else { "v6" };
     // B's namespace, held open by a sleeper; the daemon joins it later.
-    let holder = Kill(
-        Command::new("unshare")
-            .args(["--net", "--", "sleep", "300"])
-            .spawn()
-            .unwrap(),
-    );
+    let holder = namespace_b();
     let b = holder.0.id();
-    let here = netns_of(std::process::id());
-    wait_for("B's namespace", || {
-        netns_of(b).is_some_and(|ns| Some(ns) != here)
-    });
 
     let pid = b.to_string();
     ip(

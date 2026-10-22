@@ -160,10 +160,26 @@ let entry = NeighborEntry {
 corerouter_engine::lock(&shared).record_neighbor(entry); // false: interface sem descoberta
 ```
 
+Implementado assim em `apps/corerouter-daemon/src/link_discovery.rs` (G5.2).
+
 A chave da linha é `(interface, protocolo, node_id | MAC | primeiro endereço | identity)`. Quem
 chama `record_neighbor` não precisa filtrar por interface: a sessão já descarta o que chega por
 interface sem descoberta ativa. `expire_neighbors(now)` roda no daemon a cada segundo
 (`corerouter_discovery::Agent`).
+
+### LLDP e MNDP (G5.2)
+
+Com `--backend linux`, o daemon usa as **mesmas** configurações (`enabled`, `interfaces`,
+`interval_secs`) para o LLDP, e escuta MNDP nelas. Detalhes em `docs/lldp-mndp.md`.
+
+| | Enviado | Só lido | Por quê |
+|---|---|---|---|
+| **CRDP** | sim | sim | Nosso, documentado acima |
+| **LLDP** (802.1AB) | sim: a cada `interval_secs`, TTL 4 ×, System Name = identity, System Description = `CoreRouter <versão>`, Port ID = nome da interface, Chassis ID = node id, Management Address = endereços da interface; TTL 0 quando a interface sai | sim | Padrão aberto que switches, MikroTik, Cisco e `lldpd` falam |
+| **MNDP** (MikroTik) | **nunca** | sim, UDP 5678 | Proprietário e sem especificação; anunciar seria fingir ser um MikroTik. Um RouterOS já vê o CoreRouter pelo LLDP |
+
+No laboratório virtual (`--backend virtual`) só roda o CRDP: não há enlace de camada 2.
+`--no-discovery` desliga os três.
 
 ## 7. GUI
 
@@ -204,6 +220,7 @@ interface sem descoberta ativa. `expire_neighbors(now)` roda no daemon a cada se
 ## Histórico de revisão
 
 - 2026-10-22 — v1 (G5.1).
+- 2026-10-22 — LLDP e MNDP no §6 (G5.2 Parte 2).
 - 2026-10-22 — seção 5.1: lab virtual pelo loopback, portas de mesmo nome no mesmo fio,
   `ether1` ligada por padrão no lab (G5.4).
 - 2026-10-22 — seção 7: detecção de "vizinho local" sem cache negativo permanente; vizinho remoto

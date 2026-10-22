@@ -234,7 +234,10 @@ tabela. Os vizinhos são **estado operacional**, como os contadores de link: fic
 daemon: corerouter_discovery::Agent (3 threads std)
   tx (1 s): lock → expire_neighbors(now) + cópia da running → solta → anuncia nas interfaces ativas
   rx4/rx6: datagrama → proto_discovery::decode → interface de chegada → lock → record_neighbor
-G5.2 (LLDP/MNDP): mesmo record_neighbor(NeighborEntry { protocol: Lldp | Mndp, .. })
+daemon --backend linux: link_discovery (1 thread std, G5.2)
+  1 s: lock → expire + cópia da running → solta → hal_linux::l2::LldpIo abre/fecha portas,
+       proto_lldp::encode → send (TTL 0 na porta que sai)
+  200 ms: LldpIo::recv / MndpListener::recv → proto_lldp/proto_mndp::decode → lock → record_neighbor
 ip.neighbor.list ◄── Session::neighbors() filtrada pelas interfaces ativas da running
 ```
 
@@ -316,3 +319,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-22 — G1.14: `Hal::features` e a sonda de recursos do `hal-linux`.
 - 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).
 - 2026-10-22 — G5.1: crates `proto-discovery` (L2) e `discovery` (L4), tabela de vizinhos no engine, tela de conexão.
+- 2026-10-22 — G5.2 Parte 2: LLDP/MNDP no daemon (`link_discovery.rs`), cola L1+L2 na app.
