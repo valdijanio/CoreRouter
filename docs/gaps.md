@@ -35,6 +35,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G1.7 | Estatísticas via netlink | hal-linux | `poll` e `discover_links` via netlink (substituem sysfs, que mostra o netns de quem montou `/sys`, não o do processo) | 3 h | aberto |
 | G1.8 | Bonding (802.3ad, active-backup) | model, engine (`cmd/interface.rs`), ui | `interface.bonding.add {name, slaves, mode}`; slave não pode ser porta de bridge nem ter endereço; mesmo padrão de dependências do G1.1 | 4 h | aberto |
 | G1.9 | Tabelas estilo WinBox: seleção, menu de contexto, duplo clique | ui | Mecanismo reutilizável em `crates/ui` (`table.rs`): clique/Ctrl/Shift/espaço vazio/Ctrl+A/↑↓ selecionam; Delete, Ctrl+E/D/M, Enter (atalhos do WinBox v3/v4); barra +, −, ✓, ✗, comentário e Find, desabilitados com o motivo; menu do botão direito na linha (Enable/Disable, Remove, Comment…, Properties…, Add VLAN on <if>, Add to Bridge ▸) e no espaço vazio (Add ▸, Select All, Refresh); duplo clique abre "Interface <nome>" (OK/Cancel/Apply/Disable/Remove); diálogos New VLAN/Bridge/Loopback no lugar dos formulários fixos. Interfaces e Addresses usam; tudo via `CoreRouterUi::run`. Testes headless com eventos sintéticos | 6 h | feito (`stream/G1.9-winbox-tables`) |
+| G1.12 | Maximizar e restaurar as janelas internas | ui | Botão □ na barra de título de toda janela flutuante (Interfaces, Addresses, BGP, History, Log, "Interface <nome>", New VLAN/Bridge/Loopback), ao lado do ▼ e do ✕: maximiza na área central (sem cobrir barra superior, menu lateral e barra de status) e vira ❐, que devolve exatamente o retângulo anterior; duplo clique na barra e menu de contexto da barra (Maximize/Restore) alternam; maximizada acompanha o redimensionamento da janela do app; arrastar e recolher continuam. Wrapper único (`crates/ui/src/float.rs`); estado só da UI. Testes headless | 3 h | feito (`stream/G1.12-window-maximize`) |
 
 ## Fase 2 — Firewall / CGNAT
 
@@ -80,3 +81,4 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.
 - 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.
 - 2026-10-21 — G0.4 feito (GUI cliente do daemon, nativo e web; WebSocket com Origin; `--web-root`).
+- 2026-10-21 — G1.12 (maximizar/restaurar janelas internas) adicionado e feito.

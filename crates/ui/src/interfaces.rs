@@ -384,25 +384,37 @@ impl CoreRouterUi {
         let mut dialogs = std::mem::take(&mut self.dialogs);
         dialogs.retain_mut(|d| {
             // A properties window whose interface is gone closes itself.
+            let id = dialog_id(d.id);
             if let Dialog::Props(p) = &d.dialog
                 && !ifaces.iter().any(|i| i.name == p.name)
             {
+                self.floats.forget(id);
                 return false;
             }
             let mut open = true;
             let mut pressed = None;
-            egui::Window::new(dialog_title(&d.dialog))
-                .id(egui::Id::unique(("corerouter-dialog", d.id)))
-                .open(&mut open)
-                .constrain_to(area)
-                .default_pos(cascade(area, d.id))
-                .resizable(false)
-                .collapsible(false)
-                .show(ctx, |ui| {
+            let title = dialog_title(&d.dialog);
+            self.floats.show(
+                ctx,
+                area,
+                id,
+                &title,
+                &mut open,
+                |w| {
+                    w.default_pos(cascade(area, d.id))
+                        .resizable(false)
+                        .collapsible(false)
+                },
+                |ui| {
                     let busy = d.waiting > 0;
                     pressed = dialog_body(ui, &mut d.dialog, &ifaces, &d.error, busy);
-                });
-            open && pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces))
+                },
+            );
+            let keep = open && pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces));
+            if !keep {
+                self.floats.forget(id);
+            }
+            keep
         });
         // Dialogs opened while these were drawn (Apply on "New …") go last.
         dialogs.append(&mut self.dialogs);
@@ -523,6 +535,7 @@ impl CoreRouterUi {
         };
         if close {
             self.dialogs.remove(pos);
+            self.floats.forget(dialog_id(id));
         }
         if let Some(name) = open_created {
             // Opens when an `interface.list` that has it arrives.
@@ -594,6 +607,10 @@ fn props_sends(
 
 /// New windows open down and to the right of the previous one, like WinBox,
 /// instead of all on the same spot.
+pub(crate) fn dialog_id(id: u64) -> egui::Id {
+    egui::Id::unique(("corerouter-dialog", id))
+}
+
 fn cascade(area: egui::Rect, id: u64) -> egui::Pos2 {
     let step = (id % 8) as f32 * 28.0;
     area.center() + egui::vec2(-160.0 + step, -200.0 + step)

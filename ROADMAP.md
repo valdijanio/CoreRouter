@@ -79,6 +79,21 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   sozinha; pela GUI web servida com `--web-root`, ether3 reabilitada (revisão 3); página de
   outra origem recusada (403) até `--ws-origin`.
 
+- 2026-10-21 — G1.12: maximizar e restaurar as janelas internas, estilo WinBox. Todas as janelas
+  flutuantes (as do menu e os diálogos de interface) passam por um wrapper único,
+  `crates/ui/src/float.rs` (`Floats::show`): a barra de título continua a do egui (▼, arrastar, ✕) e
+  ganha, na mesma camada da janela, o botão □/❐ ao lado do ✕ (desenhado; a fonte não tem os
+  glifos) e uma faixa só de clique sobre o título — o arraste ainda chega ao egui, o duplo clique
+  maximiza em vez de recolher, o botão direito abre Maximize/Restore. Maximizada = `fixed_rect` da
+  área central a cada frame (acompanha o redimensionamento) e o corpo ocupa a área toda (o egui
+  dimensiona a janela pelo conteúdo). Restaurar usa `fixed_rect` sem `constrain` por um frame (com
+  `current_pos` o arraste da barra do egui desfaz a posição; com `constrain` o tamanho maximizado do
+  frame anterior empurra a janela para o canto) e corrige o tamanho pedido por até 3 frames, porque
+  o conteúdo pode ficar uns px abaixo do pedido (Interfaces: 5 px, **medido**). Recolhida, guarda o
+  tamanho expandido. Estado só da UI, não passa pelo engine. 6 testes headless (maximizar ocupa a
+  área, restaurar devolve o retângulo, duplo clique, menu, redimensionar a área, arrastar/recolher,
+  janela de propriedades); conferido na GUI real (xdotool + `screenshot`).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -86,3 +101,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.2.
 - 2026-10-21 — log do G1.9.
 - 2026-10-21 — log do G0.4.
+- 2026-10-21 — log do G1.12.
