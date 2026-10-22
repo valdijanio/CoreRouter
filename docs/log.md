@@ -556,6 +556,14 @@ mesmo dia pode variar.
   `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
   corerouter-daemon --test netns_dhcp6`; no lab, `ipv6.dhcp-client.add interface=ether1
   request=address,prefix pool_name=pd` e IPv6 › IPv6 Pool.
+- 2026-10-22 — processo: workflow `pr-sync` (`scripts/pr-sync.sh`): a cada push na `main`, os PRs
+  com auto-merge que o GitHub marca CONFLICTING recebem o merge de verdade da `main` (o GitHub
+  ignora o `merge=union` e marcava conflito só por causa de `docs/log.md`/`docs/gaps-history.md`);
+  merge limpo → push do bot e `ci` disparado por `workflow_dispatch` (push com GITHUB_TOKEN não
+  dispara workflows); conflito real → comentário com os arquivos e rótulo `conflito`, sem push.
+  O `ci` ganhou `workflow_dispatch`. Testado localmente com repositório e `gh` falsos (union limpo
+  enviado, conflito real só comentado). Observado antes: com o merge do #37, #40/#41/#42 viraram
+  CONFLICTING no GitHub e o merge local do #40 saiu limpo.
 - 2026-10-22 — G1.21: hierarquia das janelas internas, a pedido do usuário (com um diálogo aberto,
   clicar na lista o mandava para trás, e pedir os detalhes de novo não o trazia de volta). Um lugar
   só, `Floats` em `crates/ui/src/float.rs`: relação filho→pai por janela (`Floats::adopt`, ligada
