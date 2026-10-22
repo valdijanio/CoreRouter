@@ -232,14 +232,23 @@ fn rows_of(
 /// The entries of the first array in `value` whose items carry every
 /// parameter `set` requires.
 fn set_items<'a>(set: &Command, value: &'a Value) -> Option<&'a [Value]> {
-    value.as_object()?.values().find_map(|v| {
-        let items = v.as_array()?;
-        let fits = |i: &Value| {
-            set.required()
-                .all(|p| i.get(&p.key).is_some_and(|v| !v.is_null()))
-        };
-        (!items.is_empty() && items.iter().all(fits)).then_some(items.as_slice())
-    })
+    let fits = |i: &Value| {
+        set.required()
+            .all(|p| i.get(&p.key).is_some_and(|v| !v.is_null()))
+    };
+    let arrays = || {
+        value
+            .as_object()
+            .into_iter()
+            .flat_map(|o| o.values())
+            .filter_map(Value::as_array)
+    };
+    // A list of entries that fit `set`; or, if none has entries, an empty
+    // list: nothing configured (the zone matrix without cells), no line.
+    arrays()
+        .find(|items| !items.is_empty() && items.iter().all(fits))
+        .or_else(|| arrays().find(|items| items.is_empty()))
+        .map(Vec::as_slice)
 }
 
 /// One line for `cmd` from `row`; a note instead when something cannot be

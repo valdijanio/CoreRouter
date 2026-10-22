@@ -628,6 +628,19 @@ fn firewall_export_import_round_trip() {
 /// on import the matrix regenerates them, so they are not duplicated nor
 /// turned into loose rules (before: "# set: from is not exported", and the
 /// generated rules came out as ordinary `/ip firewall filter add` lines).
+/// An empty zone matrix is nothing to export: no line, no note (it came out
+/// as "# set: from is not exported").
+#[test]
+fn empty_zone_matrix_exports_nothing() {
+    let mut t = Term::new();
+    let script = t.export();
+    assert!(!script.contains("ip firewall zone"), "{script}");
+    assert!(
+        !script.contains("is not exported\n/ip neighbor"),
+        "{script}"
+    );
+}
+
 #[test]
 fn zone_matrix_export_import_round_trip() {
     let mut a = Term::new();
