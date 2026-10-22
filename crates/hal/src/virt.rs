@@ -1,10 +1,13 @@
 //! Virtual lab backend: deterministic fake ports and counters.
 
+use std::collections::VecDeque;
+use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 
+use crate::dhcp::{Datagram, Dest, DhcpPort, SharedResponder};
 use crate::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState, SharedProber, SimProber};
 
 #[derive(Clone)]
@@ -20,6 +23,8 @@ pub struct VirtualHal {
     /// Diagnostic tools: the simulated network unless the app swaps in the
     /// host's ICMP (`corerouter-daemon --lab-ping host`).
     prober: SharedProber,
+    /// Simulated DHCP server answering the lab's DHCP clients (G4.7).
+    dhcp: Option<SharedResponder>,
 }
 
 impl std::fmt::Debug for VirtualHal {
@@ -46,7 +51,33 @@ impl VirtualHal {
             ruleset: None,
             dynamic: Vec::new(),
             prober: Arc::new(SimProber::default()),
+            dhcp: None,
         }
+    }
+
+    /// Answer DHCP clients with `server` (a test's own scenario) instead of
+    /// the lab server the engine offers.
+    pub fn with_dhcp_server(mut self, server: SharedResponder) -> Self {
+        self.dhcp = Some(server);
+        self
+    }
+
+    /// MAC of `name`: the configured one, else the one the lab invents.
+    fn mac_of(&self, name: &IfName) -> [u8; 6] {
+        let configured = self
+            .applied
+            .interfaces
+            .get(name)
+            .and_then(|i| i.mac)
+            .map(|m| m.0);
+        configured.unwrap_or_else(|| {
+            let h = name
+                .as_str()
+                .bytes()
+                .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(u32::from(b)));
+            let [a, b, c, d] = h.to_be_bytes();
+            [0x02, 0x00, a, b, c, d]
+        })
     }
 
     /// Probe with `prober` instead of the simulated network.
@@ -158,6 +189,77 @@ impl Hal for VirtualHal {
 
     fn prober(&self) -> Result<SharedProber, String> {
         Ok(Arc::clone(&self.prober))
+    }
+
+    fn dhcp_port(&mut self, name: &IfName) -> Result<Box<dyn DhcpPort>, HalError> {
+        if !self.applied.interfaces.contains_key(name) && !self.ports.contains(name) {
+            return Err(HalError::Rejected(format!(
+                "no interface '{name}' in the lab"
+            )));
+        }
+        Ok(Box::new(SimDhcpPort {
+            port: name.clone(),
+            mac: self.mac_of(name),
+            server: self.dhcp.clone(),
+            inbox: VecDeque::new(),
+            probing: None,
+        }))
+    }
+
+    fn offer_dhcp_lab_server(&mut self, server: SharedResponder) {
+        if self.dhcp.is_none() {
+            self.dhcp = Some(server);
+        }
+    }
+}
+
+/// A lab DHCP client socket: what it sends reaches the simulated server at
+/// once, and the answers wait in `inbox` for the next `recv`.
+struct SimDhcpPort {
+    port: IfName,
+    mac: [u8; 6],
+    server: Option<SharedResponder>,
+    inbox: VecDeque<Datagram>,
+    probing: Option<Ipv4Addr>,
+}
+
+/// Answers kept per lab port (a misbehaving responder cannot fill memory).
+const SIM_INBOX: usize = 64;
+
+impl DhcpPort for SimDhcpPort {
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    fn send(&mut self, payload: &[u8], _src: Ipv4Addr, dest: Dest) -> Result<(), HalError> {
+        if let Some(server) = &self.server {
+            for d in server.answer(&self.port, self.mac, payload, dest) {
+                if self.inbox.len() < SIM_INBOX {
+                    self.inbox.push_back(d);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn recv(&mut self) -> Result<Option<Datagram>, HalError> {
+        Ok(self.inbox.pop_front())
+    }
+
+    fn probe(&mut self, ip: Ipv4Addr) -> Result<bool, HalError> {
+        self.probing = Some(ip);
+        Ok(true)
+    }
+
+    fn conflict(&mut self) -> Result<Option<[u8; 6]>, HalError> {
+        Ok(self
+            .probing
+            .zip(self.server.as_ref())
+            .and_then(|(ip, s)| s.conflict(&self.port, ip)))
+    }
+
+    fn end_probe(&mut self) {
+        self.probing = None;
     }
 }
 

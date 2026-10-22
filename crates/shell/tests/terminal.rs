@@ -186,7 +186,8 @@ fn add_print_where_and_remove_by_number() {
     assert_eq!(t.shell.prompt_text(), "[admin@CoreRouter] /ip/address> ");
     let table = t.ok("pr");
     let lines: Vec<&str> = table.lines().collect();
-    assert_eq!(lines[0], "Flags: X - disabled");
+    // G4.7a: DHCP leases list here too, flagged D.
+    assert_eq!(lines[0], "Flags: X - disabled, D - dynamic");
     assert!(lines[1].contains("ADDRESS") && lines[1].contains("INTERFACE"));
     assert!(lines[2].contains(";;; uplink A"), "{table}");
     assert!(lines[3].starts_with(" 0   10.0.0.1/24"), "{table}");
@@ -808,4 +809,41 @@ fn first_login_asks_for_the_admin_password() {
     // A router where every admin has a password: no question.
     let t = Term::new();
     assert!(!t.shell.asking_password());
+}
+
+/// G4.7a: `/ip dhcp-client` from the registry, RouterOS style, and the
+/// dynamic address it brings, flagged D.
+#[test]
+fn dhcp_client_add_print_and_dynamic_address() {
+    let mut t = Term::new();
+    t.ok("/ip dhcp-client add interface=ether1 add-default-route=special-classless use-peer-ntp=no allowed-servers=192.0.2.1,100.64.1.1 extra-options=77:'wan',224:0x01");
+    t.router.session.dhcp_service(0);
+    t.router.session.dhcp_service(1_000);
+    let table = t.ok("/ip dhcp-client print");
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines[0], "Flags: X - disabled, I - invalid", "{table}");
+    assert!(
+        lines[1].contains("INTERFACE") && lines[1].contains("STATUS"),
+        "{table}"
+    );
+    assert!(
+        lines[2].contains("ether1") && lines[2].contains("bound"),
+        "{table}"
+    );
+    let d = t.ok("/ip dhcp-client print detail");
+    assert!(d.contains("add-default-route=special-classless"), "{d}");
+    assert!(d.contains("gateway=100.64.1.1"), "{d}");
+    assert!(d.contains("extra-options=\"77:'wan',224:0x01\""), "{d}");
+    t.ok("/ip dhcp-client set 0 disabled=yes");
+    let off = t.ok("/ip dhcp-client print");
+    assert!(off.contains(" 0 X ") && off.contains("stopped"), "{off}");
+    t.ok("/ip dhcp-client set 0 disabled=no");
+    t.router.session.dhcp_service(2_000);
+    t.router.session.dhcp_service(3_000);
+    let a = t.ok("/ip address print");
+    assert!(a.contains("D - dynamic"), "{a}");
+    assert!(a.contains(" D 100.64.1."), "{a}");
+    let e = t.fails("/ip dhcp-client add interface=ether1");
+    assert!(e.contains("already has DHCP client"), "{e}");
+    t.ok("/ip dhcp-client renew 0");
 }

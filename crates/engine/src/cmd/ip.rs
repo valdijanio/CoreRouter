@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_text, req_parse};
 use super::{CommandSpec, always};
+use crate::dhcp_client::is_dynamic;
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
@@ -28,7 +29,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.address.list", "Addresses", ["IP", "Addresses"], None,
-        "{interface?: string} → [{id, address, network, interface, disabled, comment}]",
+        "{interface?: string} → [{id, flags (X disabled, D dynamic), address, network, interface, disabled, dynamic, comment}]",
         always, list),
 ];
 
@@ -78,6 +79,15 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let id: ItemId = req_parse(p, "id")?;
+    if is_dynamic(id) {
+        return Err(EngineError::bad(
+            "id",
+            format!(
+                "{id} is dynamic (a DHCP client's lease); release, disable or remove the client \
+                 instead (ip.dhcp-client.*)"
+            ),
+        ));
+    }
     let list = &mut s.store_mut().candidate_mut().ip.addresses;
     let before = list.len();
     list.retain(|a| a.id != id);
@@ -89,20 +99,30 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter: Option<IfName> = opt_parse(p, "interface")?;
-    let rows = s
-        .store()
-        .candidate()
+    // With the addresses DHCP clients obtained (flag D, as in RouterOS).
+    let cfg = s.effective(s.store().candidate());
+    let rows = cfg
         .ip
         .addresses
         .iter()
         .filter(|a| filter.as_ref().is_none_or(|f| *f == a.interface))
         .map(|a| {
+            let dynamic = is_dynamic(a.id);
+            let mut flags = String::new();
+            if a.disabled {
+                flags.push('X');
+            }
+            if dynamic {
+                flags.push('D');
+            }
             json!({
                 "id": a.id,
+                "flags": flags,
                 "address": a.address.to_string(),
                 "network": a.address.trunc().to_string(),
                 "interface": a.interface,
                 "disabled": a.disabled,
+                "dynamic": dynamic,
                 "comment": a.comment,
             })
         })

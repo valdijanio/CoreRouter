@@ -454,6 +454,19 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   a ponta, terminal, GUI headless (clique em "Not now", aviso aparece e some). Esforço do agente
   ~3 h (**estimado**).
 
+- 2026-10-22 — G4.7a: cliente DHCPv4 na WAN, estilo `/ip dhcp-client` do RouterOS, a pedido do
+  usuário (a porta real eno1 não pegava IP sozinha). `ip.dhcp-client.add/set/remove/list/renew/
+  release/options/history` (add-default-route yes/no/special-classless, distância, tabela/VRF,
+  use-peer-dns/ntp, host-name, client-id, vendor-class, opções extras na sintaxe do RouterOS,
+  servidores permitidos por IP/MAC). Máquina de estados pura em `proto-dhcp` (T1/T2, backoff,
+  NAK, DECLINE por ARP) rodando em `Session::dhcp_service` a cada 250 ms (`control::spawn_clock`);
+  endereço e rotas como entradas dinâmicas (flag D) que o HAL vê junto da config em todo apply;
+  `hal-linux::dhcp` sem unsafe (`AF_PACKET` + BPF, UDP 68, ARP); servidor simulado no lab;
+  janela IP › DHCP Client com abas DHCP/Status/Advanced/Options e histórico no Log. O proptest
+  achou dois `panic` no `dhcproto` 0.15 com pacotes malformados; o decode agora passa por um
+  saneador. Testes: 32 no `proto-dhcp`, 15 de integração no engine, netns com daemon real e
+  servidor DHCP em Rust (concessão + rotas no kernel em ~3 s **medido**), UI headless, terminal.
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -483,3 +496,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G6.3.
 - 2026-10-22 — log do G6.5.
 - 2026-10-22 — log do G0.3b.
+- 2026-10-22 — log do G4.7a.

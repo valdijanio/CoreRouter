@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, req_str};
 use super::{CommandSpec, always};
+use crate::dhcp_client::is_dynamic;
 use crate::validate::route_issues;
 use crate::{EngineError, Result, Session};
 
@@ -48,7 +49,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string} → [{id (null if connected), dst_address, gateway, distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static), active, static, connected, disabled, immediate_gw, reason, comment}]",
+        "{routing_table?: string} → [{id (null if connected), dst_address, gateway, distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static), active, static, connected, dynamic (from a DHCP lease or connected), disabled, immediate_gw, reason, comment}]",
         always, list),
 ];
 
@@ -122,6 +123,15 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 /// Parse `id` as a static route of the candidate.
 fn existing(cfg: &Config, p: &Value) -> Result<(usize, ItemId)> {
     let id: ItemId = req_parse(p, "id")?;
+    if is_dynamic(id) {
+        return Err(EngineError::bad(
+            "id",
+            format!(
+                "{id} is dynamic (a DHCP client's route); change the client instead \
+                 (ip.dhcp-client.set add_default_route, default_route_distance)"
+            ),
+        ));
+    }
     let pos = cfg
         .ip
         .routes
@@ -216,7 +226,9 @@ fn order(a: &Line, b: &Line) -> Ordering {
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter: Option<RoutingTable> = opt_parse(p, "routing_table")?;
-    let cfg = s.store().candidate();
+    // With the routes DHCP clients installed (flags DS, as in RouterOS v6).
+    let cfg = s.effective(s.store().candidate());
+    let cfg = cfg.as_ref();
     let mut lines: Vec<Line> = cfg
         .ip
         .routes
@@ -284,6 +296,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             }),
             (None, _) => None,
         };
+        let dynamic = l.connected || l.id.is_some_and(is_dynamic);
         let mut flags = String::new();
         if l.disabled {
             flags.push('X');
@@ -291,7 +304,11 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         if active {
             flags.push('A');
         }
-        flags.push_str(if l.connected { "DC" } else { "S" });
+        flags.push_str(match (l.connected, dynamic) {
+            (true, _) => "DC",
+            (false, true) => "DS",
+            (false, false) => "S",
+        });
         rows.push(json!({
             "id": l.id,
             "dst_address": l.dst.to_string(),
@@ -302,6 +319,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             "active": active,
             "static": !l.connected,
             "connected": l.connected,
+            "dynamic": dynamic,
             "disabled": l.disabled,
             "immediate_gw": l.immediate,
             "reason": reason,

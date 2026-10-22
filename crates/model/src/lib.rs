@@ -5,6 +5,7 @@
 //! compiles everywhere (including `wasm32-unknown-unknown`).
 
 pub mod config;
+pub mod dhcp_client;
 pub mod firewall;
 pub mod interface_list;
 pub mod neighbor;
@@ -19,6 +20,7 @@ pub use config::{
     AddressEntry, BgpInstance, Config, DEFAULT_DISTANCE, Interface, InterfaceKind, Ip, RouteEntry,
     Routing, System,
 };
+pub use dhcp_client::{AddDefaultRoute, AllowedServer, DhcpClient, ExtraOption};
 pub use firewall::{Firewall, FirewallRule, Table};
 pub use interface_list::InterfaceLists;
 pub use neighbor::{MgmtPorts, NeighborDiscovery, NeighborEntry, NeighborProtocol};

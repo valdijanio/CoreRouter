@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-proto-dhcp"
-description = "L2: DHCPv4/DHCPv6 server and relay"
+description = "L2: DHCP codec, DHCPv4 client state machine (G4.7), later server and relay (G4.2)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,20 @@ repository.workspace = true
 
 [dependencies]
 corerouter-model.workspace = true
+corerouter-hal.workspace = true
+# DHCPv4/v6 codec (no default features: no serde).
+dhcproto = { version = "0.15.0", default-features = false }
+ipnet.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
 
 [lints]
 workspace = true
+
+# dhcproto pulls `rand` (→ getrandom 0.4), which needs a backend picked on
+# wasm32-unknown-unknown: the browser's crypto (the in-browser lab).
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+getrandom-wasm = { package = "getrandom", version = "0.4.3", features = ["wasm_js"] }

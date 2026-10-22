@@ -5,6 +5,7 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod dhcp;
 pub mod probe;
 pub mod sim;
 pub mod virt;
@@ -13,6 +14,7 @@ use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 use serde::Serialize;
 
+pub use dhcp::{DhcpPort, DhcpResponder, SharedResponder};
 pub use probe::{Prober, SharedProber};
 pub use sim::SimProber;
 pub use virt::VirtualHal;
@@ -128,5 +130,20 @@ pub trait Hal: Send {
     /// is none. Cheap: backends build it once and hand out clones.
     fn prober(&self) -> Result<SharedProber, String> {
         Err(format!("{} cannot send probes", self.describe()))
+    }
+
+    /// Open the DHCP client socket of interface `name` (G4.7).
+    fn dhcp_port(&mut self, name: &IfName) -> Result<Box<dyn DhcpPort>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no DHCP client transport (asked for '{name}')",
+            self.describe()
+        )))
+    }
+
+    /// The simulated DHCP server of the lab, offered by the engine at
+    /// start-up. A backend on a real network ignores it; the virtual lab
+    /// uses it unless it already has one (a test's own).
+    fn offer_dhcp_lab_server(&mut self, server: SharedResponder) {
+        let _ = server;
     }
 }
