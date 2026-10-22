@@ -148,7 +148,8 @@ impl Win {
         match self {
             Win::Interfaces => [780.0, 520.0],
             Win::Neighbors => [820.0, 320.0],
-            Win::Addresses | Win::Log => [640.0, 260.0],
+            Win::Addresses => [760.0, 300.0],
+            Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
             Win::DhcpClient => [760.0, 260.0],
             Win::Dhcp6Client => [860.0, 260.0],
@@ -204,12 +205,13 @@ impl CoreRouterUi {
     }
 
     fn addresses(&mut self, ui: &mut egui::Ui) {
-        const COLUMNS: [table::Column; 6] = [
+        const COLUMNS: [table::Column; 7] = [
             col(""),
             col("#"),
             col("Address"),
             col("Network"),
             col("Interface"),
+            col("Origin"),
             comment(),
         ];
         let rows: Vec<Row> = self
@@ -218,11 +220,21 @@ impl CoreRouterUi {
             .iter()
             .map(|r| {
                 let get = |k: &str| r.get(k).map(value_text).unwrap_or_default();
+                // Where it comes from (G4.7b): a pool (and why it waits),
+                // a DHCP lease, a Router Advertisement; static says nothing.
+                let origin = match (get("origin").as_str(), r.get("from_pool")) {
+                    ("pool", Some(Value::String(pool))) => match r.get("reason") {
+                        Some(Value::String(why)) => format!("pool {pool}: {why}"),
+                        _ => format!("pool {pool}"),
+                    },
+                    ("static", _) => String::new(),
+                    (o, _) => o.to_owned(),
+                };
+                let [flags, id, address, network, interface, comment] =
+                    ["flags", "id", "address", "network", "interface", "comment"].map(get);
                 Row {
-                    key: get("id"),
-                    cells: ["flags", "id", "address", "network", "interface", "comment"]
-                        .map(get)
-                        .to_vec(),
+                    key: id.clone(),
+                    cells: vec![flags, id, address, network, interface, origin, comment],
                     dimmed: r.get("disabled").and_then(Value::as_bool).unwrap_or(false),
                     section: false,
                     tint: None,
@@ -242,8 +254,9 @@ impl CoreRouterUi {
                 Err("Select one or more addresses first".to_owned())
             } else if dynamic {
                 Err(
-                    "Dynamic addresses come from a DHCP client: release or disable it \
-                     (IP › DHCP Client)"
+                    "Dynamic addresses come from a DHCP client or a Router Advertisement: \
+                     release or disable the client (IP › DHCP Client, IPv6 › DHCPv6 Client) \
+                     or stop accepting RA (IPv6 › IPv6 Settings)"
                         .to_owned(),
                 )
             } else {
@@ -301,6 +314,12 @@ impl CoreRouterUi {
                 &names,
             );
             ui.add(
+                TextEdit::singleline(&mut self.forms.addr_pool)
+                    .hint_text("from pool")
+                    .desired_width(80.0),
+            )
+            .on_hover_text("IPv6 pool of a DHCPv6 client: ::1/64 takes the delegated prefix");
+            ui.add(
                 TextEdit::singleline(&mut self.forms.addr_comment)
                     .hint_text("comment")
                     .desired_width(120.0),
@@ -309,10 +328,12 @@ impl CoreRouterUi {
         });
         if add {
             let comment = &self.forms.addr_comment;
+            let pool = self.forms.addr_pool.trim();
             let p = json!({
                 "address": self.forms.addr_address.trim(),
                 "interface": self.forms.addr_interface,
                 "comment": (!comment.is_empty()).then_some(comment),
+                "from_pool": (!pool.is_empty()).then_some(pool),
             });
             self.run_then("ip.address.add", p, crate::Then::ClearAddressForm);
         }

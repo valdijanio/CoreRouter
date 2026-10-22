@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 
 use crate::avail::Avail;
 use crate::backend::RequestId;
-use crate::dhcp_client::{flag, text, yes_no};
+use crate::dhcp_client::{flag, text};
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::interfaces::{cascade, dialog_id};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment};
@@ -1254,7 +1254,6 @@ fn status_tab(ui: &mut Ui, row: Option<&Value>) {
     if !error.is_empty() {
         ui.colored_label(ui.visuals().error_fg_color, error);
     }
-    ui.weak(format!("Use peer DNS: {}", yes_no(flag(r, "use_peer_dns"))));
 }
 
 fn options_tab(ui: &mut Ui, row: Option<&Value>, options: Option<&Value>) {

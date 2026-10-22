@@ -116,6 +116,7 @@ struct Forms {
     addr_address: String,
     addr_interface: String,
     addr_comment: String,
+    addr_pool: String,
     bgp_name: String,
     bgp_asn: String,
     bgp_router_id: String,

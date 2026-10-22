@@ -185,9 +185,10 @@ pub fn ra_mode(cfg: &Config, iface: &IfName) -> (RaMode, String) {
     }
 }
 
-/// What a client asks the server for (RouterOS `request`).
+/// What a client asks the server for (RouterOS `request`), written as
+/// RouterOS does: `address`, `prefix`, `address,prefix`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(try_from = "String", into = "String")]
 pub enum Request6 {
     Address,
     Prefix,
@@ -218,6 +219,19 @@ impl Request6 {
 impl fmt::Display for Request6 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
+    }
+}
+
+impl TryFrom<String> for Request6 {
+    type Error = ParseError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        s.parse()
+    }
+}
+
+impl From<Request6> for String {
+    fn from(r: Request6) -> Self {
+        r.as_str().to_owned()
     }
 }
 
@@ -497,6 +511,10 @@ mod tests {
             Request6::Both
         );
         assert_eq!("prefix".parse::<Request6>().unwrap(), Request6::Prefix);
+        assert_eq!(
+            serde_json::to_string(&Request6::Both).unwrap(),
+            "\"address,prefix\""
+        );
         assert!(
             "info"
                 .parse::<Request6>()
