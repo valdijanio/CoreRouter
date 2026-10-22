@@ -81,9 +81,15 @@ fn cpes_get_an_address_a_prefix_and_a_route() {
     let servers = ok(&mut s, "ipv6.dhcp-server.print", json!({}));
     assert_eq!(servers[0]["status"], "running", "{servers}");
     assert_eq!(servers[0]["bindings"], 4);
-    let pools = ok(&mut s, "ipv6.pool.print", json!({}));
-    assert_eq!(pools[1]["size"], 256);
-    assert_eq!(pools[1]["used"], 2);
+    let pools = ok(&mut s, "ipv6.pool.list", json!({}));
+    let cpe = pools
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "cpe")
+        .unwrap();
+    assert_eq!(cpe["size"], 256);
+    assert_eq!(cpe["leases"], 2);
 
     // Release one prefix: its route goes.
     ok(&mut s, "ipv6.dhcp-server.binding.remove", json!({"id": p}));

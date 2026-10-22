@@ -123,7 +123,7 @@ const BINDINGS: TabDef = TabDef {
 const POOLS: TabDef = TabDef {
     title: "Pools",
     salt: "dhcp6-pools",
-    print: "ipv6.pool.print",
+    print: "ipv6.pool.list",
     add: "ipv6.pool.add",
     set: Some("ipv6.pool.set"),
     remove: "ipv6.pool.remove",
@@ -257,7 +257,7 @@ pub(crate) fn row(tab: Tab, r: &Value) -> Row {
                 text(r, "prefix"),
                 text(r, "prefix_length"),
                 text(r, "size_text"),
-                text(r, "used"),
+                text(r, "leases"),
                 checks(),
                 text(r, "comment"),
             ],
@@ -322,8 +322,13 @@ impl PanelState for Dhcp6Panel {
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
         if let Some(tab) = Tab::ALL.into_iter().find(|t| t.def().print == key)
-            && let Value::Array(a) = value
+            && let Value::Array(mut a) = value
         {
+            // `ipv6.pool.list` also has the pools DHCPv6 clients receive;
+            // this tab edits the configured ones (they have an id).
+            if tab == Tab::Pools {
+                a.retain(|r| r.get("id").is_some());
+            }
             self.rows.insert(tab, a);
         }
     }

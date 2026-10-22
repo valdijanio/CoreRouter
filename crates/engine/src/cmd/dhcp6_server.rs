@@ -47,9 +47,6 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         has_pools,
         pool_remove
     ),
-    cmd!(query "ipv6.pool.print", "IPv6 Pools", [], None,
-        "{} → [{id, name, prefix, prefix_length, size (addresses or prefixes, capped at 2^64), size_text (2^N when large), used, comment?, checks}]",
-        always, pool_print),
     cmd!(
         "ipv6.dhcp-server.add",
         "Add DHCPv6 Server",
@@ -271,7 +268,10 @@ fn pool_remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"id": pl.id, "name": pl.name}))
 }
 
-fn pool_print(s: &mut Session, _: &Value) -> Result<Value> {
+/// The configured pools as rows of `ipv6.pool.list` (no flags: static),
+/// after the ones DHCPv6 clients receive — one `/ipv6 pool print`, as in
+/// RouterOS.
+pub(super) fn static_pool_rows(s: &mut Session) -> Vec<Value> {
     let cand = s.store().candidate();
     let all = server6::checks(cand);
     let core = s.dhcp6_server();
@@ -290,9 +290,9 @@ fn pool_print(s: &mut Session, _: &Value) -> Result<Value> {
                     .count()
             });
             let mut v = json!({
-                "id": pl.id, "name": pl.name, "prefix": pl.prefix, "prefix_length": pl.prefix_length,
+                "id": pl.id, "name": pl.name, "flags": "", "prefix": pl.prefix, "prefix_length": pl.prefix_length,
                 "size": size, "size_text": if bits > 20 { format!("2^{bits}") } else { size.to_string() },
-                "used": used, "checks": check_rows(&all, "pools", pl.id),
+                "leases": used, "used": [], "status": "static", "checks": check_rows(&all, "pools", pl.id),
             });
             if !pl.comment.is_empty()
                 && let Some(o) = v.as_object_mut()
@@ -302,7 +302,7 @@ fn pool_print(s: &mut Session, _: &Value) -> Result<Value> {
             v
         })
         .collect();
-    Ok(Value::Array(rows))
+    rows
 }
 
 // ---- servers -------------------------------------------------------------

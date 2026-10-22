@@ -197,7 +197,7 @@ pub fn parse_duid(text: &str) -> Option<Vec<u8>> {
         Some(h) => h.to_owned(),
         None => t.split(':').collect(),
     };
-    if hex.is_empty() || hex.len() % 2 != 0 || hex.len() > 2 * crate::ipv6::MAX_DUID {
+    if hex.is_empty() || !hex.len().is_multiple_of(2) || hex.len() > 2 * crate::ipv6::MAX_DUID {
         return None;
     }
     (0..hex.len())

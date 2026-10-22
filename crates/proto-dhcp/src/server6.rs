@@ -856,7 +856,7 @@ impl Server6 {
         r
     }
 
-    fn pool_of<'a>(srv: &'a Server6Plan, kind: IaKind) -> Option<&'a Ipv6Pool> {
+    fn pool_of(srv: &Server6Plan, kind: IaKind) -> Option<&Ipv6Pool> {
         match kind {
             IaKind::Na => srv.na.as_ref(),
             IaKind::Pd => srv.pd.as_ref(),

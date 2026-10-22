@@ -255,7 +255,7 @@ cuja concessão não existe mais são fechadas no fim conhecido.
 
 | Comando | Faz |
 |---|---|
-| `ipv6.pool.add/set/remove/print` | pools configurados: `prefix` cortado em `prefix_length` (48..=64 para prefixos delegados, 128 para endereços); no máximo 2^20 prefixos por pool; o `ipv6.pool.list` da G4.7b continua mostrando os pools que o cliente DHCPv6 recebe |
+| `ipv6.pool.add/set/remove` | pools configurados: `prefix` cortado em `prefix_length` (48..=64 para prefixos delegados, 128 para endereços); no máximo 2^20 prefixos por pool; `ipv6.pool.list` (`/ipv6 pool print`) mostra, depois dos pools que os clientes DHCPv6 recebem (flag D), os configurados, com tamanho e concessões |
 | `ipv6.dhcp-server.add/set/remove/print` | `interface`, `address_pool` (IA_NA), `prefix_pool` (IA_PD), `lease_time` (vida válida, padrão 1 dia, **estimado**; a preferida é ⅔ dela), `preference` (255), `rapid_commit` (sim), `route_distance`, `relay` (link-address do relay), `dns_server`, `domain`, `dns_zone` (AAAA + PTR) |
 | `ipv6.dhcp-server.binding.add/remove/print` | fixos por DUID (e IAID) com endereço e/ou prefixo; o `print` junta os dinâmicos; `remove` de um dinâmico o libera |
 | `ipv6.dhcp-relay.add/remove/print` | relay v6: interface dos clientes, servidores (vazio: `ff05::1:3`), `link_address` |
