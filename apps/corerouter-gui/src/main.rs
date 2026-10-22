@@ -18,6 +18,7 @@ use corerouter_ui::{
     ConnectAction, ConnectScreen, CoreRouterUi, Credentials, NeighborRow, SavedRouter,
 };
 
+mod export;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
@@ -113,6 +114,7 @@ impl eframe::App for GuiApp {
         let next = match &mut self.screen {
             Screen::Router(r) => {
                 r.ui(ui);
+                export::save_all(r);
                 None
             }
             Screen::Connect(screen, platform) => {

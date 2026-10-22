@@ -83,3 +83,40 @@ proptest! {
         }
     }
 }
+
+#[test]
+fn run_task_pings_and_returns_the_statistics() {
+    let mut lab = Session::virtual_lab();
+    lab.set_runner(corerouter_control::thread_runner());
+    let mut backend = Headless::new(lab);
+    let mut call = |args: Value| {
+        let msg = json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"run_task","arguments": args}});
+        let input = format!("{msg}\n");
+        let mut out = Vec::new();
+        serve(&mut backend, Cursor::new(input.into_bytes()), &mut out).unwrap();
+        let reply: Value = serde_json::from_slice(&out).unwrap();
+        reply["result"].clone()
+    };
+    let r = call(json!({"command": "tool.ping.start",
+        "params": {"address": ["127.0.0.1", "203.0.113.1"], "count": 3, "interval_ms": 20,
+            "timeout_ms": 100}}));
+    assert_eq!(r["isError"], false, "{r}");
+    let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["state"], "done");
+    assert_eq!(v["summary"]["targets"][0]["received"], 3);
+    assert_eq!(v["summary"]["targets"][1]["loss_pct"], 100.0);
+    assert_eq!(v["events"].as_array().unwrap().len(), 6);
+
+    // Continuous: stopped after wait_secs, statistics kept.
+    let r = call(json!({"command": "tool.ping.start",
+        "params": {"address": "127.0.0.1", "interval_ms": 100}, "wait_secs": 1}));
+    let v: Value = serde_json::from_str(r["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(v["state"], "stopped");
+    assert_eq!(v["stopped_after_wait"], true);
+    assert!(v["summary"]["targets"][0]["received"].as_u64().unwrap() >= 5);
+
+    // Not a task: readable error.
+    let r = call(json!({"command": "interface.list"}));
+    assert_eq!(r["isError"], true);
+}

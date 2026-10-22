@@ -79,6 +79,7 @@ mod neighbor;
 mod route;
 mod routing;
 mod system;
+mod tool;
 mod user;
 mod vrf;
 
@@ -91,6 +92,7 @@ static AREAS: &[&[CommandSpec]] = &[
     routing::COMMANDS,
     system::COMMANDS,
     config::COMMANDS,
+    tool::COMMANDS,
     user::COMMANDS,
 ];
 

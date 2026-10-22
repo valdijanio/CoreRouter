@@ -1,6 +1,9 @@
 //! Tool catalog. Few generic tools reach every command; aliases raise the
 //! odds that a model gets the name right on the first try.
 
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
 use serde_json::{Value, json};
 
 use crate::Backend;
@@ -62,6 +65,24 @@ const TOOLS: &[Tool] = &[
         idempotent: true,
     },
     Tool {
+        names: &["run_task", "task_run"],
+        description: "Run a tool that works as a background task (tool.ping.start, tool.ping.mtu, \
+            tool.mtr.start…) and wait for it: starts it, collects its events until it finishes or \
+            `wait_secs` (default 10, max 60) pass, then stops it if still running. Returns the \
+            summary (per target: sent, received, loss_pct, min/avg/max/jitter/p95 ms…) and the \
+            last events. Example: {\"command\":\"tool.ping.start\",\"params\":{\"address\":\"8.8.8.8\",\"count\":5}}. \
+            For long runs use run_command with tool.task.poll / tool.task.stop instead.",
+        schema: || {
+            json!({"type": "object", "required": ["command"], "properties": {
+                "command": {"type": "string"},
+                "params": {"type": "object"},
+                "wait_secs": {"type": "integer", "minimum": 1, "maximum": 60}}})
+        },
+        read_only: true,
+        destructive: false,
+        idempotent: false,
+    },
+    Tool {
         names: &["ui_screenshot", "screenshot"],
         description: "PNG of the live GUI window (needs corerouter-gui --control and the \
             remote backend). Use it to check what an operator would see.",
@@ -71,6 +92,87 @@ const TOOLS: &[Tool] = &[
         idempotent: true,
     },
 ];
+
+/// Events `run_task` returns at most (the newest).
+const TASK_EVENTS: usize = 50;
+const TASK_WAIT_DEFAULT: u64 = 10;
+const TASK_WAIT_MAX: u64 = 60;
+const TASK_POLL: Duration = Duration::from_millis(200);
+const TASK_STOP_GRACE: Duration = Duration::from_secs(10);
+
+fn run_task(backend: &mut dyn Backend, args: &Value) -> Result<Value, String> {
+    let command = args
+        .get("command")
+        .and_then(Value::as_str)
+        .ok_or("run_task needs {command, params?, wait_secs?}")?;
+    let wait = args
+        .get("wait_secs")
+        .and_then(Value::as_u64)
+        .unwrap_or(TASK_WAIT_DEFAULT)
+        .clamp(1, TASK_WAIT_MAX);
+    let params = args.get("params").cloned().unwrap_or(Value::Null);
+    let started = backend.call(
+        "engine.execute",
+        json!({"command": command, "params": params}),
+    )?;
+    let id = started
+        .get("task_id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("{command} started no task (use run_command): {started}"))?;
+    let poll = |b: &mut dyn Backend, after: u64| {
+        b.call(
+            "engine.execute",
+            json!({"command": "tool.task.poll", "params": {"id": id, "after_seq": after}}),
+        )
+    };
+    let deadline = Instant::now() + Duration::from_secs(wait);
+    let mut events: VecDeque<Value> = VecDeque::new();
+    let mut after = 0u64;
+    let mut lost = 0u64;
+    let mut stopped = false;
+    loop {
+        let p = poll(backend, after)?;
+        lost += p.get("lost").and_then(Value::as_u64).unwrap_or(0);
+        for ev in p
+            .get("events")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            events.push_back(ev.clone());
+            if events.len() > TASK_EVENTS {
+                events.pop_front();
+                lost += 1;
+            }
+        }
+        after = p.get("next_seq").and_then(Value::as_u64).unwrap_or(after);
+        if p.get("done").and_then(Value::as_bool) == Some(true) {
+            return Ok(json!({
+                "task_id": id,
+                "state": p.get("state"),
+                "reason": p.get("reason"),
+                "stopped_after_wait": stopped,
+                "summary": p.get("summary"),
+                "events": events,
+                "events_not_shown": lost,
+            }));
+        }
+        // A task that ignores its stop must not hang the agent.
+        if Instant::now() >= deadline + TASK_STOP_GRACE {
+            return Err(format!("task {id} did not stop; see tool.task.list"));
+        }
+        if !stopped && Instant::now() >= deadline {
+            stopped = true;
+            backend.call(
+                "engine.execute",
+                json!({"command": "tool.task.stop", "params": {"id": id}}),
+            )?;
+        }
+        if p.get("more") != Some(&Value::Bool(true)) {
+            std::thread::sleep(TASK_POLL);
+        }
+    }
+}
 
 pub fn definitions() -> Value {
     let mut out = Vec::new();
@@ -135,6 +237,7 @@ pub fn call(backend: &mut dyn Backend, params: &Value) -> Value {
         "run_command" => text(backend.call("engine.execute", args)),
         "command_batch" => text(backend.call("engine.batch", args)),
         "inspect_state" => text(backend.call("state.inspect", args)),
+        "run_task" => text(run_task(backend, &args)),
         "ui_screenshot" => match backend.call("ui.screenshot", Value::Null) {
             Ok(img) => match (
                 img.get("data").and_then(Value::as_str),

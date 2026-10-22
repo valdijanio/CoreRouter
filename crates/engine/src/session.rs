@@ -12,6 +12,7 @@ use crate::cmd::{self, check_params, unknown_command};
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
+use crate::tasks::Tasks;
 use crate::validate::validate_all;
 use crate::{EngineError, Result, guard};
 
@@ -59,6 +60,8 @@ pub struct Session {
     safe_mode: SafeMode,
     /// Heard by discovery protocols (operational state, never saved).
     pub(crate) neighbors: NeighborTable,
+    /// Diagnostic tool jobs (operational state, never saved).
+    pub(crate) tasks: Tasks,
     /// Router accounts (G0.3): saved with the config, outside its revisions.
     users: Users,
     /// Logged-in sessions, for `user.active.list` (never saved).
@@ -133,6 +136,7 @@ impl Session {
             caller: Caller::local(),
             safe_mode: SafeMode::default(),
             neighbors: NeighborTable::default(),
+            tasks: Tasks::default(),
             users,
             logins: Logins::default(),
         }
