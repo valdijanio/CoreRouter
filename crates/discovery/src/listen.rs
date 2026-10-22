@@ -151,9 +151,12 @@ fn listen(sock: &UdpSocket, tx: &Sender<Heard>, stop: &AtomicBool) {
         if local.len() > MAX_HEARD {
             local.clear();
         }
-        let is_local = *local
-            .entry((from.ip(), scope))
-            .or_insert_with(|| sock::is_local(from.ip(), scope));
+        let is_local = *local.entry((from.ip(), scope)).or_insert_with(|| {
+            // A link-local address of this machine may arrive with the
+            // scope of another of its links (veth pairs, bridges).
+            sock::is_local(from.ip(), scope)
+                || matches!(from.ip(), IpAddr::V6(a) if kernel.has_address(&a))
+        });
         let heard = Heard {
             announcement,
             from,

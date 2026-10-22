@@ -86,9 +86,11 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio) + `VirtualHal` (lab, wasm, CI) | L0 |
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
+| L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
-| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal | L0–L2 (nunca plataforma) |
+| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal, tabela de vizinhos (estado operacional) | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha em loopback, WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client` | L0–L3 |
+| L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
 | L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
 | L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe); trait `Backend` assíncrono + `Local` | L0–L4 + egui |
@@ -110,10 +112,12 @@ CoreRouter/
 │   ├── hal-linux/        # L1 plataforma
 │   ├── proto-bgp/ proto-ospf/ proto-mpls/ proto-cgnat/ proto-dns/ proto-dhcp/   # L2
 │   ├── proto-lldp/ proto-mndp/   # L2: codecs de descoberta (G5.2)
+│   ├── proto-discovery/  # L2: codec do CRDP (G5.1)
 │   ├── engine/           # L3: src/cmd/{mod,args,interface,ip,routing,system,config}.rs
 │   ├── control/          # L4
 │   ├── mcp/              # L4
 │   ├── storage-fs/       # L4: persistência da config em arquivo
+│   ├── discovery/        # L4: runtime do CRDP (sockets, threads)
 │   └── ui/               # L5
 ├── apps/
 │   ├── corerouter-daemon/
@@ -194,6 +198,34 @@ arquivo `app.ron` em `~/.local/share/corerouter-gui` (o `app_id` separa da pasta
 daemon) ou `localStorage` na web; `apply_prefs` o lê na criação e ignora o que não entende. A
 memória do egui (posição das janelas) não é persistida.
 
+### Descoberta de vizinhos (G5.1)
+
+Protocolo próprio, o CRDP (`docs/discovery.md`); LLDP e MNDP passivo (G5.2) entram na mesma
+tabela. Os vizinhos são **estado operacional**, como os contadores de link: ficam na `Session`
+(`neighbors.rs`), nunca no `Config`, nunca no `running.json`. Só as configurações (`enabled`,
+`interfaces`, `interval_secs`) são config, em `ip.neighbor_discovery`.
+
+```
+daemon: corerouter_discovery::Agent (3 threads std)
+  tx (1 s): lock → expire_neighbors(now) + cópia da running → solta → anuncia nas interfaces ativas
+  rx4/rx6: datagrama → proto_discovery::decode → interface de chegada → lock → record_neighbor
+G5.2 (LLDP/MNDP): mesmo record_neighbor(NeighborEntry { protocol: Lldp | Mndp, .. })
+ip.neighbor.list ◄── Session::neighbors() filtrada pelas interfaces ativas da running
+```
+
+`record_neighbor` não é comando: é dado da rede, não ação do operador (não passa pelo journal
+nem gera revisão), e a sessão descarta o que chega por interface sem descoberta ativa. O relógio
+é o de quem grava (`last_seen` em segundos Unix), então a tabela não depende do `Hal::now_unix`
+e roda igual em wasm/testes. Índice de interface (para `ff02::1%if` e para saber por onde um
+link-local chegou) vem de `/proc/net/if_inet6`, que é do network namespace de quem lê; o
+`LinkInfo` do `Hal` ainda não tem índice (G1.7).
+
+A GUI nativa abre na tela de conexão (`ui::ConnectScreen`) quando não recebe `--connect`; a tela
+só coleta a escolha, e o app (`apps/corerouter-gui`, trait `Platform`) fornece os vizinhos
+(`Listener` no nativo, `ip.neighbor.list` do daemon na web), guarda a lista Saved e conecta. O
+canal `--control` da GUI segue o alvo escolhido (`Target::Choosing` responde `server.info` e
+`ui.screenshot`).
+
 ### `hal-linux`: aplicação no kernel (G1.2)
 
 `LinuxHal::apply(from, to)` tem duas metades:
@@ -249,3 +281,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-21 — G1.11: preferências da janela (tema, comentários inline) fora do engine.
 - 2026-10-21 — G5.2: crates `proto-lldp`/`proto-mndp` (L2) e módulo `l2` do `hal-linux`.
 - 2026-10-21 — G1.5: rotas estáticas e VRF (`model::route`, passos 0 e 9 do plano).
+- 2026-10-22 — G5.1: crates `proto-discovery` (L2) e `discovery` (L4), tabela de vizinhos no engine, tela de conexão.

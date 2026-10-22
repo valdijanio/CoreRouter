@@ -25,6 +25,7 @@ use serde_json::{Value, json};
 pub use backend::{Backend, Link, Local, Reply, RequestId};
 pub use connect::{ConnectAction, ConnectScreen, NeighborRow, SavedRouter};
 pub use neighbors::uptime_text;
+pub use prefs::stored_theme;
 pub use windows::Win;
 
 /// Seconds between automatic refreshes of the live tables.

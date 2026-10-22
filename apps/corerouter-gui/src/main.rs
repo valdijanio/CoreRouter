@@ -72,6 +72,10 @@ impl GuiApp {
     /// Load the saved preferences (eframe storage) into the app.
     fn with_storage(mut self, cc: &eframe::CreationContext<'_>) -> Self {
         self.prefs = cc.storage.and_then(|s| s.get_string(PREFS_KEY));
+        // The connect screen wears the stored theme too.
+        if let Some(theme) = self.prefs.as_deref().and_then(corerouter_ui::stored_theme) {
+            cc.egui_ctx.set_theme(theme);
+        }
         if let (Screen::Router(r), Some(prefs)) = (&mut self.screen, &self.prefs) {
             r.apply_prefs(prefs);
         }

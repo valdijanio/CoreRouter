@@ -150,6 +150,30 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   área, restaurar devolve o retângulo, duplo clique, menu, redimensionar a área, arrastar/recolher,
   janela de propriedades); conferido na GUI real (xdotool + `screenshot`).
 
+- 2026-10-22 — G5.1: descoberta de vizinhos com protocolo próprio, o CRDP (`docs/discovery.md`):
+  UDP 7979, `ff02::1` por interface + broadcast IPv4 dirigido, anúncio a cada 30 s, hold 4 ×
+  intervalo (120 s), despedida com hold 0; cabeçalho `CRDP`/versão, 13 TLVs (node id, hold,
+  identity, versão, plataforma, placa, uptime, interface, MAC, IPv4, IPv6, portas de controle e
+  WebSocket), datagrama ≤ 1232 bytes, TLV desconhecido ignorado. Codec puro em
+  `crates/proto-discovery` (L2, proptest: decode nunca dá panic, ida e volta, bytes trocados);
+  runtime em `crates/discovery` (L4, std + `socket2`): `Agent` do daemon (só anuncia e escuta,
+  nunca responde) e `Listener` passivo da GUI. Model: `NeighborEntry`/`NeighborProtocol` (estado
+  operacional, nunca salvo) e `ip.neighbor_discovery` (config: padrão ligado e **sem
+  interfaces**, porque ainda não há listas LAN/WAN). Engine: tabela de vizinhos (máx. 4096,
+  expiração por hold), `Session::record_neighbor`/`expire_neighbors` (ponto de entrada do G5.2),
+  `ip.neighbor.list`, `ip.neighbor.discovery.set`/`.get`; `interface.remove` tira a interface da
+  lista. Daemon: `--discovery-port`, `--no-discovery`, node id em `<config-dir>/node-id`. UI:
+  janela IP › Neighbors (tabela + configurações) e tela de conexão estilo WinBox 4
+  (`crates/ui/src/connect.rs`): Connect to/Login/Password/Group/Comment, Save to list, Connect,
+  Virtual lab; abas Neighbors/Saved com Find; clique preenche, duplo clique conecta; login e
+  senha desabilitados até o G0.3 e nenhuma senha gravada. GUI nativa sem `--connect` abre nela e
+  escuta CRDP (vizinho na própria máquina vira `127.0.0.1:<porta>`); web mostra o
+  `ip.neighbor.list` do daemon que serviu a página. 37 testes novos, entre eles dois daemons em
+  namespaces sem root que se veem em `ip.neighbor.list` por IPv6 puro e por IPv4+IPv6, e se
+  esquecem na hora com a despedida (`cargo xtask netns`, ~9 s **medido**). Teste manual num netns
+  descartável: dois daemons (7979 e 7981) e a GUI; a aba Neighbors mostrou os dois, o duplo
+  clique conectou e IP › Neighbors listou o outro roteador (screenshots conferidos).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -161,3 +185,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G5.2 (Parte 1).
 - 2026-10-21 — log do G1.12.
 - 2026-10-21 — log do G1.5.
+- 2026-10-22 — log do G5.1.
