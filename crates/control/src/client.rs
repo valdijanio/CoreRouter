@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::tls::{self, ClientStream, TlsError};
-use crate::wire::{Line, MAX_RESPONSE_LINE, read_line_bounded};
+use crate::wire::{Line, MAX_RESPONSE_LINE, read_line_bounded, write_line};
 
 enum Stream {
     Plain(TcpStream),
@@ -57,6 +57,8 @@ fn open(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
         .next()
         .ok_or_else(|| format!("{addr}: no address"))?;
     let stream = TcpStream::connect_timeout(&sock, timeout).map_err(|e| format!("{addr}: {e}"))?;
+    // Requests are small and answered one by one: send each at once.
+    stream.set_nodelay(true).map_err(|e| e.to_string())?;
     stream
         .set_read_timeout(Some(Duration::from_secs(120)))
         .map_err(|e| e.to_string())?;
@@ -150,9 +152,7 @@ impl Client {
         if let (Some(t), Some(o)) = (&self.token, req.as_object_mut()) {
             o.insert("token".into(), json!(t));
         }
-        let out = self.reader.get_mut();
-        writeln!(out, "{req}").map_err(|e| format!("send: {e}"))?;
-        out.flush().map_err(|e| format!("send: {e}"))?;
+        write_line(self.reader.get_mut(), &req).map_err(|e| format!("send: {e}"))?;
         let line = match read_line_bounded(&mut self.reader, MAX_RESPONSE_LINE) {
             Ok(Line::Text(t)) => t,
             Ok(Line::TooLong) => return Err("response exceeds 256 MiB".into()),

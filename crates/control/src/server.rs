@@ -16,7 +16,7 @@ use corerouter_engine::Caller;
 use crate::auth::Gate;
 use crate::dispatch::{Host, dispatch_as, hang_up, new_caller};
 use crate::tls::{self, ServerStream};
-use crate::wire::{Line, MAX_REQUEST_LINE, read_line_bounded};
+use crate::wire::{Line, MAX_REQUEST_LINE, read_line_bounded, write_line};
 
 pub const MAX_CONNECTIONS: usize = 16;
 
@@ -166,6 +166,10 @@ where
             }
         };
         let peer = stream.peer_addr().ok();
+        // One request, one reply: never hold a small write back (Nagle).
+        if let Err(e) = stream.set_nodelay(true) {
+            log::debug!("{what}: TCP_NODELAY not set: {e}");
+        }
         if endpoint.tls.is_none() && !peer.is_some_and(|a| a.ip().is_loopback()) {
             log::warn!("{what}: rejected non-loopback peer");
             continue;
@@ -173,10 +177,9 @@ where
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::SeqCst);
             if endpoint.tls.is_none() {
-                let _ = writeln!(
-                    stream,
-                    "{}",
-                    json!({"id": null, "ok": false, "error": "too many connections"})
+                let _ = write_line(
+                    &mut stream,
+                    &json!({"id": null, "ok": false, "error": "too many connections"}),
                 );
             }
             continue;
@@ -315,10 +318,9 @@ fn handle<H: Host>(
         let line = match read_line_bounded(&mut reader, MAX_REQUEST_LINE)? {
             Line::Eof => return Ok(()),
             Line::TooLong => {
-                writeln!(
+                write_line(
                     reader.get_mut(),
-                    "{}",
-                    json!({"id": null, "ok": false, "error": "request line exceeds 16 MiB"})
+                    &json!({"id": null, "ok": false, "error": "request line exceeds 16 MiB"}),
                 )?;
                 return Ok(());
             }
@@ -331,8 +333,6 @@ fn handle<H: Host>(
         let Some(reply) = answer(host, gate, caller, peer, &line) else {
             return Ok(());
         };
-        let out = reader.get_mut();
-        writeln!(out, "{reply}")?;
-        out.flush()?;
+        write_line(reader.get_mut(), &reply)?;
     }
 }

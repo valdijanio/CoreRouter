@@ -1,6 +1,6 @@
 //! Bounded line framing shared by the control channel and the MCP stdio server.
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 
 /// Largest accepted request line.
 pub const MAX_REQUEST_LINE: usize = 16 * 1024 * 1024;
@@ -59,6 +59,16 @@ pub fn read_line_bounded<R: BufRead>(r: &mut R, max: usize) -> io::Result<Line> 
         buf.pop();
     }
     Ok(Line::Text(String::from_utf8_lossy(&buf).into_owned()))
+}
+
+/// Send `msg` and its `\n` in **one** write, then flush. Two writes (the
+/// text, then the newline, as `writeln!` does) leave the second waiting for
+/// the peer's delayed ACK under Nagle: ~40 ms per request on each side.
+pub fn write_line<W: Write + ?Sized>(w: &mut W, msg: &impl std::fmt::Display) -> io::Result<()> {
+    let mut line = msg.to_string();
+    line.push('\n');
+    w.write_all(line.as_bytes())?;
+    w.flush()
 }
 
 #[cfg(test)]

@@ -287,12 +287,12 @@ fn messages(
 
 /// Minimal reply with a short plain-text body; the connection then closes.
 fn respond(stream: &mut dyn Conn, status: &str, body: &str) -> io::Result<()> {
-    write!(
-        stream,
+    let reply = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
          Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
-    )?;
+    );
+    stream.write_all(reply.as_bytes())?;
     stream.flush()
 }
 
@@ -315,17 +315,18 @@ fn static_file(stream: &mut dyn Conn, head: &Head, root: Option<&Path>) -> io::R
         Ok(b) => b,
         Err(_) => return respond(stream, "404 Not Found", "not found"),
     };
-    write!(
-        stream,
+    let mut reply = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
          X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\
          Connection: close\r\n\r\n",
         mime(&path),
         body.len()
-    )?;
+    )
+    .into_bytes();
     if head.method == "GET" {
-        stream.write_all(&body)?;
+        reply.extend_from_slice(&body);
     }
+    stream.write_all(&reply)?;
     stream.flush()
 }
 
@@ -508,6 +509,24 @@ mod tests {
             thread::sleep(Duration::from_millis(10));
         }
         assert!(!disabled());
+    }
+
+    /// No Nagle wait between requests on one socket (see `wire::write_line`).
+    #[test]
+    fn a_persistent_socket_answers_in_milliseconds() {
+        let port = start(WsPolicy::default());
+        let mut ws = connect(port, None).unwrap();
+        let mut times: Vec<Duration> = (0..40)
+            .map(|i| {
+                let t = std::time::Instant::now();
+                let r = call(&mut ws, json!({"id": i, "method": "ping"}));
+                assert_eq!(r["ok"], true);
+                t.elapsed()
+            })
+            .collect();
+        times.sort();
+        let median = times[20];
+        assert!(median < Duration::from_millis(5), "median {median:?}");
     }
 
     #[test]

@@ -336,3 +336,57 @@ fn shutdown_stops_accepting_and_closes_the_port() {
         &shutdown,
     );
 }
+
+/// Median time of `n` sequential calls on one open connection.
+fn median_call(c: &mut Client, method: &str, n: usize) -> Duration {
+    let mut times: Vec<Duration> = (0..n)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            c.call(method, json!({})).unwrap();
+            t.elapsed()
+        })
+        .collect();
+    times.sort();
+    times[n / 2]
+}
+
+/// One request per line must leave in one write: a reply split in two
+/// (JSON, then "\n") waited for the peer's delayed ACK (Nagle), ~40 ms per
+/// request. Plain TCP and TLS, server and client side.
+#[test]
+fn a_persistent_connection_answers_in_milliseconds() {
+    const LIMIT: Duration = Duration::from_millis(5);
+    let (session, gate, token) = lab();
+    let addr = start(&session, &gate);
+    let mut c = local(&addr, &token);
+    let plain = median_call(&mut c, "ping", 40);
+    let inspect = median_call(&mut c, "state.inspect", 40);
+
+    let (cert, key) = corerouter_control::tls::generate().unwrap();
+    let id = corerouter_control::tls::identity_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let tls_addr = listener.local_addr().unwrap().to_string();
+    spawn(
+        Endpoint::tls(listener, id.config.clone()),
+        SharedHost(session.clone()),
+        gate.clone(),
+    )
+    .unwrap();
+    let mut t =
+        Client::connect_tls(&tls_addr, Duration::from_secs(2), Some(&id.fingerprint)).unwrap();
+    t.login("admin", ADMIN_PW).unwrap();
+    let tls = median_call(&mut t, "ping", 40);
+    eprintln!(
+        "median per request: tcp ping {plain:?}, tcp state.inspect {inspect:?}, tls ping {tls:?}"
+    );
+    for (what, d) in [
+        ("tcp ping", plain),
+        ("tcp inspect", inspect),
+        ("tls ping", tls),
+    ] {
+        assert!(
+            d < LIMIT,
+            "{what}: median {d:?} per request (limit {LIMIT:?})"
+        );
+    }
+}
