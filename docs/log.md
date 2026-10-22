@@ -691,3 +691,70 @@ continuação indentadas).
   sessões ficam "prontas para a fila" ao abrir o PR, sem esperar o CI do GitHub. Motivo: quatro
   testes instáveis em 2026-10-22 (latência, ping IPv6, DAD, `netns_l2`), cada um travando a fila
   por 5–10 min.
+
+- 2026-10-22 — G1.3: Drift, parte 1: `config.drift.list` diz onde o kernel não tem mais o que a config em execução
+  (mais o que os clientes DHCP instalaram) pôs lá — link virtual apagado, porta derrubada, MTU
+  trocado, porta tirada da bridge/VRF, endereço apagado ou a mais, rota estática apagada ou a mais
+  num link gerenciado. Endereço que o kernel fez sozinho (SLAAC, link-local IPv6), rota de outro
+  protocolo e link de outro programa não são drift. `config.drift.reconcile` põe de volta (tudo ou
+  nada por rodada, até 3 rodadas enquanto houver progresso: entrar numa VRF derruba IPv6, que a
+  rodada seguinte recoloca), não muda a config nem a revisão e fica no journal; porta física que
+  sumiu fica como `fixable: false`. Se a conexão de quem chama chega por um endereço fora da config,
+  o reconcile recusa removê-lo (diz para `ip.address.add` ou `force: true`), como o lockout do
+  firewall. O motor fica em `corerouter_hal::drift` (o que a config põe no kernel, `diff`,
+  `repaired`); o hal-linux lê endereços (`IFA_F_PERMANENT`) e rotas `proto static` por rtnetlink e
+  gera os ops de reparo (`plan::repair`, na ordem do `plan`); o lab virtual guarda um "kernel" que
+  o teste altera (`VirtualHal::kernel()`).
+
+  Testar: `cargo test -p corerouter-engine --test drift` (lab: cada tipo de drift, porta sumida,
+  candidate não conta, proteção da conexão, params inválidos);
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_drift`
+  (kernel real: `ip addr del`, `ip link del` da VLAN, `ip link set nomaster`, MTU, rota a mais →
+  drift visto e reconciliado, conferido com `ip`). Na mão: daemon `--backend linux` num namespace,
+  `ip addr del …`, depois `corerouter-cli run config.drift.list` e `config.drift.reconcile`.
+
+- 2026-10-22 — G4.4: Prometheus, parte 1: `corerouter-daemon --metrics 9100` serve `/metrics` no formato de texto do
+  Prometheus 0.0.4 (`text/plain; version=0.0.4`) em 127.0.0.1:9100; `--metrics 0.0.0.0:9100` (ou
+  `[::]:9100`) abre para a rede com um aviso no log (sem login, como o node_exporter). Cada scrape
+  roda a consulta nova `system.metrics` (tudo é comando: CLI e MCP leem os mesmos números), que
+  traz por interface (config + links da plataforma, inclusive não gerenciados) bytes, pacotes,
+  erros, descartes, `running`, `disabled` e quedas de link vistas pelo motor, e os contadores do
+  motor desde o início: comandos de mudança e consultas por resultado, ids desconhecidos, commits
+  aplicados e recusados, revisão e Safe Mode. O daemon renderiza com nomes no estilo
+  netdev/netclass do node_exporter (`corerouter_interface_receive_bytes_total{interface="ether1"}`,
+  `corerouter_interface_up`, `corerouter_interface_info{type,managed}`,
+  `corerouter_commands_total{kind,result}`, `corerouter_commits_total{result}`,
+  `corerouter_config_revision`, `corerouter_safe_mode`, `corerouter_build_info`,
+  `corerouter_scrape_duration_seconds`); contador que a plataforma não tem não gera amostra (nunca
+  um zero inventado). Servidor HTTP mínimo em `std`: só `GET`/`HEAD` de `/metrics` e `/` (405 com
+  `Allow`, 404, 400), uma conexão por vez, cabeçalho limitado a 8 KiB e 2 s no total, escrita com
+  5 s de timeout; valores de label escapados (`\`, `"`, quebra de linha) e truncados em 128
+  caracteres. Contadores do motor em `crates/engine/src/metrics.rs` (dois incrementos em
+  `session.rs`: `execute` e o commit).
+  Testar: `cargo run -p corerouter-daemon -- --metrics 9100` e `curl -s 127.0.0.1:9100/metrics`;
+  `cargo run -p corerouter-cli -- run system.metrics`. Testes: `crates/engine/tests/metrics.rs`,
+  unitários do formato em `apps/corerouter-daemon/src/metrics.rs` (regras do formato: HELP/TYPE
+  uma vez antes das amostras, famílias sem intercalar, `_total` só em counter, série sem repetir) e
+  `apps/corerouter-daemon/tests/metrics.rs` (daemon real: scrape, contador sobe depois de um
+  `ip.address.add`, HEAD/POST/404, pedido de 64 KiB cortado). Custo de um scrape no laboratório
+  virtual com 8 portas: uma consulta à plataforma por interface (`counters`) sob o lock da sessão,
+  **estimado** abaixo de 1 ms; no linux cada interface abre o ethtool, então com centenas de
+  interfaces o scrape pesa (vira medição no G4.4c).
+
+- 2026-10-22 — G4.7c: Cliente DHCP, parte 3 (resiliência). Cada ACK é lembrado no estado `dhcp-leases` do
+  armazenamento (`state-dhcp-leases.json`, fora da config e das revisões; `ConfigStorage` ganhou
+  `load_state`/`save_state` com padrão vazio). Ao recomeçar (daemon reiniciado, cliente ou
+  interface reabilitados) o cliente faz INIT-REBOOT: REQUEST broadcast com a opção 50 e sem a 54;
+  ACK → bound sem DISCOVER; NAK → esquece e descobre; ~12 s sem resposta → usa a concessão
+  lembrada pelo resto do tempo (RFC 2131 §3.2) ou, vencida, DISCOVER pedindo o mesmo endereço.
+  `fallback_address` sobe após `fallback_timeout` s sem concessão (padrão 30) e sai no mesmo apply
+  em que uma chega. `check_gateway` (none/arp/ping) checa o gateway a cada 10 s; após 2 falhas as
+  rotas por ele saem do data plane (inativas em `ip.route.list`; a de distância maior assume) e
+  voltam na primeira resposta. O `list` mostra `gateway_status`, `fallback_active` e `remembered`;
+  na GUI, campos novos nas abas Advanced e Status. Desenho e pesquisa em `docs/dhcp-client.md` §15.
+
+  Testar: `cargo test -p corerouter-engine --test dhcp_resilience`, `cargo test -p
+  corerouter-proto-dhcp client`; netns: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user
+  --net -- cargo test -p corerouter-daemon --test netns_dhcp_resilience` (check-gateway tira a rota
+  padrão do kernel e a devolve; o daemon reiniciado manda REQUEST e nenhum DISCOVER; ~25 s,
+  **medido**). Lab: `ip.dhcp-client.add {"interface":"ether1","check_gateway":"arp","fallback_address":"192.168.100.2/24"}`.
