@@ -590,3 +590,9 @@ mesmo dia pode variar.
   estado, consultas, respostas e diálogos próprios, `Win::Panel(id)`, menu alfabético por grupo);
   `cargo xtask netns` descobre `tests/netns*.rs`. IP › DHCP Client e as janelas IPv6 viraram
   painéis. Regras em AGENTS.md ("Arquivo novo em vez de lista compartilhada").
+- 2026-10-22 — processo (pr-sync): o rótulo `conflito` sai na próxima execução em que o PR não
+  conflitar mais, inclusive quando a sessão dona resolveu à mão (antes só saía quando o próprio
+  pr-sync fazia o merge). Rótulos pela API REST (`gh pr edit --add-label/--remove-label` falha no
+  gh 2.45 por causa dos Projects clássicos, e o erro era engolido). Sem aviso de conflito quando a
+  branch andou durante o merge (no #42 o comentário listou um conflito que já tinha sido resolvido
+  17 s antes). Testado com `DRY_RUN=1` num clone descartável, com e sem o rótulo.
