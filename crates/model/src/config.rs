@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::dhcp_client::DhcpClient;
 use crate::firewall::Firewall;
 use crate::interface_list::InterfaceLists;
 use crate::neighbor::NeighborDiscovery;
@@ -124,9 +125,18 @@ pub struct Ip {
     /// `/ip firewall` (G2.1): filter, nat, mangle and address lists,
     /// IPv4 and IPv6 together.
     pub firewall: Firewall,
+    /// `/ip dhcp-client` (G4.7): at most one per interface.
+    pub dhcp_clients: Vec<DhcpClient>,
+    /// Next id handed out by `next_dhcp_client_id`.
+    pub next_dhcp_client_id: u32,
 }
 
 impl Ip {
+    pub fn next_dhcp_client_id(&mut self) -> ItemId {
+        self.next_dhcp_client_id = self.next_dhcp_client_id.saturating_add(1);
+        ItemId(self.next_dhcp_client_id)
+    }
+
     pub fn next_address_id(&mut self) -> ItemId {
         self.next_id = self.next_id.saturating_add(1);
         ItemId(self.next_id)

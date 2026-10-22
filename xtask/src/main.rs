@@ -200,6 +200,8 @@ const NETNS_TESTS: &[(&str, &str)] = &[
     ("corerouter-daemon", "netns_l2"),
     // G1.18: a linux-backend daemon sees its namespace, owns only its links.
     ("corerouter-daemon", "netns_linux"),
+    // G4.7a: the DHCP client of a linux-backend daemon against a test server.
+    ("corerouter-daemon", "netns_dhcp"),
     // G5.4: a router on this machine heard on a new link is local.
     ("corerouter-discovery", "netns_local"),
 ];

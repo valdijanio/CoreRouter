@@ -487,6 +487,19 @@ fn dependents(cfg: &Config, name: &IfName, iface: &Interface) -> Vec<String> {
             addrs.join(", ")
         ));
     }
+    let clients: Vec<String> = cfg
+        .ip
+        .dhcp_clients
+        .iter()
+        .filter(|c| c.interface == *name)
+        .map(|c| c.id.to_string())
+        .collect();
+    if !clients.is_empty() {
+        out.push(format!(
+            "remove DHCP client {} first (ip.dhcp-client.remove)",
+            clients.join(", ")
+        ));
+    }
     let children: Vec<&str> = cfg
         .interfaces
         .values()

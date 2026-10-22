@@ -6,6 +6,8 @@
 //! - discovery and counters: one `RTM_GETLINK` dump (`netlink::links`), the
 //!   same namespace `apply` writes to (G1.7/G1.18); `owner` decides which
 //!   links are CoreRouter's. The others are listed but never applied to.
+//! - `dhcp`: DHCP client transport (G4.7): frames over `AF_PACKET` with a
+//!   BPF filter, unicasts over UDP 68, ARP probe; bytes only (`proto-dhcp`).
 //! - `l2`: neighbor-discovery I/O — LLDP frames over `AF_PACKET`, passive
 //!   MNDP over UDP 5678 (G5.2). Bytes only; the codecs are `proto-lldp` /
 //!   `proto-mndp`, glued by the daemon.
@@ -43,6 +45,10 @@ pub mod nft;
 
 #[cfg(target_os = "linux")]
 pub mod l2;
+
+/// DHCP client transport (G4.7): `AF_PACKET` + BPF, UDP, ARP probe.
+#[cfg(target_os = "linux")]
+pub mod dhcp;
 
 /// Host ICMP for the diagnostic tools (G6.2).
 #[cfg(target_os = "linux")]
@@ -250,6 +256,15 @@ mod linux {
                 DynamicChange::Add(d) => crate::nft::add_dynamic(d),
                 DynamicChange::Remove(d) => crate::nft::remove_dynamic(d),
             }
+        }
+
+        fn dhcp_port(
+            &mut self,
+            name: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::DhcpPort>, HalError> {
+            crate::dhcp::LinuxDhcpPort::open(name)
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::DhcpPort>)
+                .map_err(|e| HalError::Io(e.to_string()))
         }
 
         fn prober(&self) -> Result<corerouter_hal::SharedProber, String> {
