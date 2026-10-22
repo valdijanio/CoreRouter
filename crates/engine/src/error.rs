@@ -26,6 +26,11 @@ pub enum EngineError {
     Store(#[from] StoreError),
     #[error("data plane: {0}")]
     Hal(String),
+    /// The change would cut the caller's management connection (G2.1b).
+    /// The text starts with "lockout: " so clients can offer Safe Mode or
+    /// `force`.
+    #[error("lockout: {0}")]
+    Lockout(String),
     #[error("batch step {step} failed: {error}")]
     Batch {
         step: usize,

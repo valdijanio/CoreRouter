@@ -117,8 +117,11 @@ fn elem_addr(v: &Value) -> Option<AddrMatch> {
     }
 }
 
-/// Entries with a timeout in our address-list sets, with the time left:
-/// they are kept across a table replace (`apply` re-adds them).
+/// The dynamic entries of our address-list sets, kept across a table
+/// replace (`apply` re-adds them): entries with a timeout in the `al*`
+/// sets (added by `address-list.add timeout=…`), with the time left, and
+/// every entry of the `ad*` sets (added by `add-*-to-address-list` rules,
+/// with or without a timeout).
 pub fn dynamic() -> Vec<DynamicAddress> {
     let Some(json) = list_json() else {
         return Vec::new();
@@ -134,11 +137,12 @@ pub fn dynamic() -> Vec<DynamicAddress> {
         let Some(name) = set.get("name").and_then(Value::as_str) else {
             continue;
         };
-        let Some(list) = name
-            .strip_prefix("al4_")
-            .or_else(|| name.strip_prefix("al6_"))
-            .and_then(|l| l.parse::<Name>().ok())
-        else {
+        let (rest, by_rule) = match name.get(..4) {
+            Some("al4_" | "al6_") => (name.get(4..), false),
+            Some("ad4_" | "ad6_") => (name.get(4..), true),
+            _ => continue,
+        };
+        let Some(list) = rest.and_then(|l| l.parse::<Name>().ok()) else {
             continue;
         };
         let elems = set
@@ -147,17 +151,24 @@ pub fn dynamic() -> Vec<DynamicAddress> {
             .cloned()
             .unwrap_or_default();
         for e in elems {
-            let Some(inner) = e.get("elem") else { continue };
-            let Some(left) = inner.get("expires").and_then(Value::as_u64) else {
-                continue;
+            let (val, left) = match e.get("elem") {
+                Some(inner) => (
+                    inner.get("val").cloned().unwrap_or(Value::Null),
+                    inner.get("expires").and_then(Value::as_u64),
+                ),
+                None => (e.clone(), None),
             };
-            let Some(address) = inner.get("val").and_then(elem_addr) else {
+            if left.is_none() && !by_rule {
+                continue;
+            }
+            let Some(address) = elem_addr(&val) else {
                 continue;
             };
             out.push(DynamicAddress {
                 list: list.clone(),
                 address,
-                timeout_secs: left.max(1),
+                timeout_secs: left.map_or(0, |l| l.max(1)),
+                added_by_rule: by_rule,
             });
         }
     }

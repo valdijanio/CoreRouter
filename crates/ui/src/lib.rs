@@ -10,9 +10,11 @@ pub mod backend;
 pub mod connect;
 mod dialog;
 mod firewall;
+mod firewall_assist;
 mod first_login;
 mod float;
 mod interfaces;
+mod lockout;
 mod mtr;
 mod neighbors;
 mod ping;
@@ -168,6 +170,9 @@ enum Pending {
     Query(Field),
     Action {
         command: String,
+        /// Sent again (with `force` or after Safe Mode) if the router
+        /// refuses it as a lockout (G2.1b).
+        params: Value,
         then: Then,
     },
     /// A tool task poll (not logged: the UI asks it, not the operator).
@@ -259,6 +264,9 @@ pub struct CoreRouterUi {
     terminal_user: String,
     /// First login without a password: the dialog (G0.3b).
     password_ask: first_login::PasswordAsk,
+    /// A change the router refused as a lockout, waiting for the
+    /// operator's answer (G2.1b).
+    lockout: Option<lockout::Held>,
 }
 
 impl CoreRouterUi {
@@ -303,6 +311,7 @@ impl CoreRouterUi {
             terminals: Vec::new(),
             terminal_user: "admin".into(),
             password_ask: first_login::PasswordAsk::default(),
+            lockout: None,
         }
     }
 
@@ -361,13 +370,15 @@ impl CoreRouterUi {
             self.then(then, &Err(why));
             return 0;
         }
-        let req = self
-            .backend
-            .submit("engine.execute", json!({"command": id, "params": params}));
+        let req = self.backend.submit(
+            "engine.execute",
+            json!({"command": id, "params": params.clone()}),
+        );
         self.pending.insert(
             req,
             Pending::Action {
                 command: id.to_owned(),
+                params,
                 then,
             },
         );
@@ -426,18 +437,24 @@ impl CoreRouterUi {
             Some(Pending::Query(field)) => self.on_query(field, id, result),
             Some(Pending::Tool(req)) => self.tool_reply(req, result),
             Some(Pending::Terminal { term }) => self.term_reply(term, id, result),
-            Some(Pending::Action { command, then }) => {
+            Some(Pending::Action {
+                command,
+                params,
+                then,
+            }) => {
                 let message = match &result {
                     Ok(v) => v.to_string(),
                     Err(e) => e.clone(),
                 };
                 self.push_log(LogLine {
                     ok: result.is_ok(),
-                    command,
+                    command: command.clone(),
                     message,
                 });
                 self.cache.refreshed_at = None;
-                self.then(then, &result);
+                if let Some(then) = self.hold_lockout(command, params, then, &result) {
+                    self.then(then, &result);
+                }
             }
         }
     }
@@ -507,8 +524,16 @@ impl CoreRouterUi {
             }
             Field::Neighbors => self.cache.neighbors = arr(value),
             Field::Discovery => self.cache.discovery = value,
+            Field::Fw(firewall::Feed::Zones) => {
+                self.fw_arrived(firewall::Feed::Zones, id, vec![value]);
+            }
             Field::Fw(feed) => self.fw_arrived(feed, id, arr(value)),
         }
+    }
+
+    /// [`Self::then`] for a held change the operator cancelled.
+    pub(crate) fn answer_then(&mut self, then: Then, result: &Result<Value, String>) {
+        self.then(then, result);
     }
 
     fn then(&mut self, then: Then, result: &Result<Value, String>) {
@@ -760,6 +785,7 @@ impl CoreRouterUi {
         self.fw_dialogs(&ctx, area);
         self.terminals(&ctx, area);
         self.password_window(&ctx);
+        self.lockout_window(&ctx);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -1019,6 +1045,7 @@ impl CoreRouterUi {
                 firewall::Tab::Nat => &mut self.tables.fw_nat,
                 firewall::Tab::Mangle => &mut self.tables.fw_mangle,
                 firewall::Tab::Addr => &mut self.tables.fw_addr,
+                firewall::Tab::Zones => return false,
             },
             Win::InterfaceList => match self.fw.if_tab {
                 firewall::IfTab::Members => &mut self.tables.if_members,
@@ -1593,6 +1620,7 @@ mod tests {
 
     mod dialog_keys;
     mod firewall;
+    mod firewall_assist;
     mod terminal;
     mod tools_ping;
 

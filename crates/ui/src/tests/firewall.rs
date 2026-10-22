@@ -31,7 +31,7 @@ impl Harness {
         h
     }
 
-    fn fw_row(&self, t: FwTable, id: &str) -> egui::Pos2 {
+    pub(super) fn fw_row(&self, t: FwTable, id: &str) -> egui::Pos2 {
         self.ctx
             .read_response(table::row_id(t.salt(), id))
             .unwrap_or_else(|| panic!("rule {id} not drawn"))
@@ -39,7 +39,7 @@ impl Harness {
             .center()
     }
 
-    fn fw_tool(&self, t: FwTable, icon: table::Icon) -> egui::Response {
+    pub(super) fn fw_tool(&self, t: FwTable, icon: table::Icon) -> egui::Response {
         self.ctx
             .read_response(table::tool_id(t.salt(), icon))
             .unwrap_or_else(|| panic!("no tool {icon:?}"))

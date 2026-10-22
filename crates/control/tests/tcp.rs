@@ -223,6 +223,33 @@ fn closing_the_safe_mode_connection_undoes_its_changes() {
     assert!(!corerouter_engine::lock(&session).in_safe_mode());
 }
 
+/// G2.1b: the control channel tells the engine which connection a command
+/// came from, so a rule that would drop it (loopback here: `lo`) is refused
+/// with the lockout reason, and `force` goes through.
+#[test]
+fn a_rule_that_drops_this_connection_is_refused_over_the_wire() {
+    let (session, gate, token) = lab();
+    let addr = start(&session, &gate);
+    let mut c = local(&addr, &token);
+    let drop_lo = json!({"chain": "input", "action": "drop", "in_interface": "lo"});
+    let refused = c
+        .call(
+            "engine.execute",
+            json!({"command": "ip.firewall.filter.add", "params": drop_lo}),
+        )
+        .unwrap_err();
+    assert!(refused.starts_with("lockout: "), "{refused}");
+    assert!(refused.contains("in-interface=lo"), "{refused}");
+    assert!(refused.contains(&format!("-> {addr} on lo")), "{refused}");
+    let mut forced = drop_lo.clone();
+    forced["force"] = json!(true);
+    c.call(
+        "engine.execute",
+        json!({"command": "ip.firewall.filter.add", "params": forced}),
+    )
+    .unwrap();
+}
+
 /// TLS end to end on loopback: TOFU (first time, same, changed), login.
 #[test]
 fn tls_endpoint_with_pinning_and_login() {

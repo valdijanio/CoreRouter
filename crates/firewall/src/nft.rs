@@ -8,11 +8,18 @@
 //! | mangle chains | `mangle_<chain>` (priority mangle; `output` is a `route` chain so a routing mark reroutes) |
 //! | custom chain `x` of table `t` | regular chain `t_x` (reached by `jump`) |
 //! | address list `x` | sets `al4_x` (ipv4) and `al6_x` (ipv6), `interval, timeout`, `auto-merge` |
+//! | list `x` filled by `add-*-to-address-list` | also `ad4_x`/`ad6_x` (`dynamic, timeout`, at most 65 536) |
 //! | interface list `x` | set `il_x` of `ifname` |
 //! | rule `*N` | rule(s) with `comment "cr:*N"`, always with a `counter` |
 //!
-//! A rule for both families that matches an address list becomes two
-//! kernel rules (one per family set); everything else is one rule. Marks
+//! The kernel cannot add to an interval set from the packet path, so a list
+//! that a rule fills gets a second, plain set (`ad*`); a rule matching that
+//! list matches either set: `@al4_x`, or `@ad4_x` and not `@al4_x` (two
+//! disjoint kernel rules, so a non-terminal action never runs twice), and
+//! `!@x` is `!= @al4_x != @ad4_x` in one rule.
+//!
+//! A rule for both families that matches an address list (or fills one)
+//! becomes one kernel rule per family; everything else is one rule. Marks
 //! are names in RouterOS and numbers in the kernel ([`mark_value`]):
 //! connection mark = `ct mark`; packet mark = low 16 bits of the packet
 //! mark, routing mark = high 16 bits (for `ip rule fwmark … /0xffff0000`).
@@ -22,6 +29,7 @@
 //! validator; [`quoted`] still drops anything that could break a string.
 
 use std::collections::BTreeSet;
+
 use std::fmt::Write as _;
 
 use corerouter_model::firewall::{
@@ -102,6 +110,30 @@ fn set_v4(list: &Name) -> String {
 
 fn set_v6(list: &Name) -> String {
     format!("al6_{list}")
+}
+
+fn dyn_v4(list: &Name) -> String {
+    format!("ad4_{list}")
+}
+
+fn dyn_v6(list: &Name) -> String {
+    format!("ad6_{list}")
+}
+
+/// Bound of a list's dynamic set: a flood of new sources cannot grow it
+/// without limit (**estimado**).
+pub const DYNAMIC_SET_SIZE: u32 = 65_536;
+
+/// Lists that a rule fills (`add-*-to-address-list`), disabled rules
+/// included so enabling one does not change the sets.
+pub fn filled_lists(cfg: &Config) -> BTreeSet<&Name> {
+    let fw = &cfg.ip.firewall;
+    Table::ALL
+        .iter()
+        .flat_map(|t| fw.rules(*t))
+        .filter(|r| !r.section)
+        .filter_map(|r| r.action.fills_list())
+        .collect()
 }
 
 fn set_if(list: &Name) -> String {
@@ -196,9 +228,25 @@ fn nat_to(t: &NatTarget, ports: Option<PortRange>) -> String {
     s
 }
 
+/// Which set a positive address-list matcher looks at, when its list also
+/// has a dynamic set (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pick {
+    /// `@al4_x` (also the only choice for lists without a dynamic set).
+    Static,
+    /// `@ad4_x` and not `@al4_x`.
+    Dynamic,
+}
+
 /// The nftables statements of rule `r` for one family (`Both` = no
 /// family match), matchers first, then counter, action and tag.
-fn statements(table: Table, r: &FirewallRule, fam: Family) -> String {
+fn statements(
+    table: Table,
+    r: &FirewallRule,
+    fam: Family,
+    filled: &BTreeSet<&Name>,
+    picks: (Pick, Pick),
+) -> String {
     let m = &r.matchers;
     let mut s: Vec<String> = Vec::new();
     match fam {
@@ -232,11 +280,29 @@ fn statements(table: Table, r: &FirewallRule, fam: Family) -> String {
             set_v4(l)
         }
     };
-    if let Some(l) = &m.src_address_list {
-        s.push(format!("{ip} saddr {}@{}", op(l), set(&l.value)));
-    }
-    if let Some(l) = &m.dst_address_list {
-        s.push(format!("{ip} daddr {}@{}", op(l), set(&l.value)));
+    let dyn_set = |l: &Name| {
+        if fam == Family::Ipv6 {
+            dyn_v6(l)
+        } else {
+            dyn_v4(l)
+        }
+    };
+    for (dir, list, pick) in [
+        ("saddr", &m.src_address_list, picks.0),
+        ("daddr", &m.dst_address_list, picks.1),
+    ] {
+        let Some(l) = list else { continue };
+        if !filled.contains(&l.value) {
+            s.push(format!("{ip} {dir} {}@{}", op(l), set(&l.value)));
+        } else if l.not {
+            s.push(format!("{ip} {dir} != @{}", set(&l.value)));
+            s.push(format!("{ip} {dir} != @{}", dyn_set(&l.value)));
+        } else if pick == Pick::Static {
+            s.push(format!("{ip} {dir} @{}", set(&l.value)));
+        } else {
+            s.push(format!("{ip} {dir} @{}", dyn_set(&l.value)));
+            s.push(format!("{ip} {dir} != @{}", set(&l.value)));
+        }
     }
     if let Some(p) = &m.protocol {
         s.push(format!("meta l4proto {}{}", op(p), proto_text(p.value)));
@@ -283,6 +349,14 @@ fn statements(table: Table, r: &FirewallRule, fam: Family) -> String {
             "meta mark & 0xffff0000 {} 0x{:08x}",
             if n.not { "!=" } else { "==" },
             mark_value(MarkKind::Routing, &n.value)
+        ));
+    }
+    if let Some(l) = &m.limit {
+        s.push(format!(
+            "limit rate {}/{} burst {} packets",
+            l.count,
+            l.period.name(),
+            l.burst
         ));
     }
     s.push("counter".into());
@@ -360,6 +434,24 @@ fn statements(table: Table, r: &FirewallRule, fam: Family) -> String {
             mark_value(MarkKind::Routing, new_routing_mark),
             stop(*passthrough)
         ),
+        Action::AddSrcToAddressList {
+            address_list,
+            address_list_timeout,
+        }
+        | Action::AddDstToAddressList {
+            address_list,
+            address_list_timeout,
+        } => {
+            let dir = if matches!(r.action, Action::AddSrcToAddressList { .. }) {
+                "saddr"
+            } else {
+                "daddr"
+            };
+            let timeout = address_list_timeout
+                .map(|t| format!(" timeout {}s", t.secs()))
+                .unwrap_or_default();
+            format!("add @{} {{ {ip} {dir}{timeout} }}", dyn_set(address_list))
+        }
     };
     if !act.is_empty() {
         s.push(act);
@@ -371,27 +463,41 @@ fn statements(table: Table, r: &FirewallRule, fam: Family) -> String {
 /// Kernel rules for `r`: one, or one per family when it uses address lists
 /// and applies to both. Empty when it can never match (invalid families,
 /// which the validator reports).
-pub fn kernel_rules(table: Table, r: &FirewallRule) -> Vec<String> {
+pub fn kernel_rules(table: Table, r: &FirewallRule, filled: &BTreeSet<&Name>) -> Vec<String> {
     let Ok(fam) = family(r) else {
         return Vec::new();
     };
     let m = &r.matchers;
-    let lists = m.src_address_list.is_some() || m.dst_address_list.is_some();
-    if fam == Family::Both && lists {
-        vec![
-            statements(table, r, Family::Ipv4),
-            statements(table, r, Family::Ipv6),
-        ]
+    let lists = m.src_address_list.is_some()
+        || m.dst_address_list.is_some()
+        || r.action.fills_list().is_some();
+    let families = if fam == Family::Both && lists {
+        vec![Family::Ipv4, Family::Ipv6]
     } else {
-        vec![statements(table, r, fam)]
+        vec![fam]
+    };
+    // A positive match on a list with a dynamic set: one rule per set.
+    let picks = |l: &Option<Neg<Name>>| match l {
+        Some(n) if !n.not && filled.contains(&n.value) => vec![Pick::Static, Pick::Dynamic],
+        _ => vec![Pick::Static],
+    };
+    let mut out = Vec::new();
+    for f in families {
+        for src in picks(&m.src_address_list) {
+            for dst in picks(&m.dst_address_list) {
+                out.push(statements(table, r, f, filled, (src, dst)));
+            }
+        }
     }
+    out
 }
 
 /// The address-list names the ruleset needs a set for.
 fn address_lists<'a>(cfg: &'a Config, dynamic: &'a [DynamicAddress]) -> BTreeSet<&'a Name> {
     let fw = &cfg.ip.firewall;
     let mut out: BTreeSet<&Name> = fw.address_lists.iter().map(|e| &e.list).collect();
-    out.extend(dynamic.iter().map(|d| &d.list));
+    out.extend(dynamic.iter().filter(|d| !d.added_by_rule).map(|d| &d.list));
+    out.extend(filled_lists(cfg));
     for table in Table::ALL {
         for r in fw.rules(table) {
             out.extend(r.matchers.src_address_list.as_ref().map(|n| &n.value));
@@ -410,15 +516,16 @@ fn elements(items: &[String]) -> String {
 }
 
 /// The body of `table inet corerouter`, or `None` when the config has no
-/// firewall at all (no rules, no address-list entries, nothing dynamic):
+/// firewall at all (no rules, no address-list entries, no dynamic entry from a command):
 /// then the table should not exist.
 pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
     let fw = &cfg.ip.firewall;
-    if fw.is_empty() && dynamic.is_empty() {
+    if fw.is_empty() && dynamic.iter().all(|d| d.added_by_rule) {
         return None;
     }
     let mut out = String::new();
     let _ = writeln!(out, "table inet {TABLE} {{");
+    let filled = filled_lists(cfg);
 
     for list in address_lists(cfg, dynamic) {
         for (fam, name, ty) in [
@@ -431,10 +538,13 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
                 .filter(|e| !e.disabled && e.list == *list && e.address.family() == fam)
                 .map(|e| addr_text(&e.address))
                 .collect();
+            // Entries a rule added go back to the dynamic set below (and
+            // are dropped once no rule fills the list).
             items.extend(
                 dynamic
                     .iter()
                     .filter(|d| d.list == *list && d.address.family() == fam)
+                    .filter(|d| !d.added_by_rule)
                     .map(|d| {
                         format!(
                             "{} timeout {}s",
@@ -446,6 +556,34 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
             let _ = write!(
                 out,
                 "\tset {name} {{\n\t\ttype {ty}\n\t\tflags interval, timeout\n\t\tauto-merge\n{}\t}}\n",
+                elements(&items)
+            );
+        }
+        if !filled.contains(list) {
+            continue;
+        }
+        for (fam, name, ty) in [
+            (Family::Ipv4, dyn_v4(list), "ipv4_addr"),
+            (Family::Ipv6, dyn_v6(list), "ipv6_addr"),
+        ] {
+            // Only single addresses fit a plain set.
+            let items: Vec<String> = dynamic
+                .iter()
+                .filter(|d| d.added_by_rule && d.list == *list && d.address.family() == fam)
+                .filter_map(|d| match d.address {
+                    AddrMatch::Net(n) if n.prefix_len() == n.max_prefix_len() => {
+                        Some(if d.timeout_secs > 0 {
+                            format!("{} timeout {}s", n.addr(), d.timeout_secs)
+                        } else {
+                            n.addr().to_string()
+                        })
+                    }
+                    _ => None,
+                })
+                .collect();
+            let _ = write!(
+                out,
+                "\tset {name} {{\n\t\ttype {ty}\n\t\tsize {DYNAMIC_SET_SIZE}\n\t\tflags dynamic, timeout\n{}\t}}\n",
                 elements(&items)
             );
         }
@@ -489,7 +627,7 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
                 );
             }
             for r in live.iter().filter(|r| r.chain.as_str() == chain) {
-                for line in kernel_rules(table, r) {
+                for line in kernel_rules(table, r, &filled) {
                     let _ = writeln!(out, "\t\t{line}");
                 }
             }
