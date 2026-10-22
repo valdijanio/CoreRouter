@@ -95,6 +95,8 @@ pub(crate) struct ZonesPanel {
     /// The zone the records window shows ("" until one is picked).
     pub(crate) zone: String,
     pub(crate) dialogs: Vec<DialogWin>,
+    /// `ip.dns.zone.dnssec.print`, while a zone dialog is open.
+    pub(crate) keys: Vec<Value>,
     /// The zone file window.
     pub(crate) file: FileView,
 }
@@ -141,6 +143,9 @@ pub(crate) struct ZoneForm {
     pub allow_transfer: String,
     pub notify: String,
     pub primaries: String,
+    pub dnssec: bool,
+    pub dnssec_algorithm: String,
+    pub signature_validity_secs: String,
     pub disabled: bool,
     pub comment: String,
 }
@@ -161,18 +166,22 @@ impl Default for ZoneForm {
             allow_transfer: String::new(),
             notify: String::new(),
             primaries: String::new(),
+            dnssec: false,
+            dnssec_algorithm: "ecdsa-p256".into(),
+            signature_validity_secs: "1209600".into(),
             disabled: false,
             comment: String::new(),
         }
     }
 }
 
-const ZONE_NUMBERS: [&str; 5] = [
+const ZONE_NUMBERS: [&str; 6] = [
     "refresh_secs",
     "retry_secs",
     "expire_secs",
     "minimum_secs",
     "ttl_secs",
+    "signature_validity_secs",
 ];
 const ZONE_LISTS: [&str; 3] = ["allow_transfer", "notify", "primaries"];
 
@@ -192,6 +201,13 @@ impl ZoneForm {
             allow_transfer: list_text(r, "allow_transfer"),
             notify: list_text(r, "notify"),
             primaries: list_text(r, "primaries"),
+            dnssec: flag(r, "dnssec"),
+            dnssec_algorithm: r
+                .get("dnssec_algorithm")
+                .map_or("ecdsa-p256".to_owned(), |_| text(r, "dnssec_algorithm")),
+            signature_validity_secs: r
+                .get("signature_validity_secs")
+                .map_or("1209600".to_owned(), |_| text(r, "signature_validity_secs")),
             disabled: flag(r, "disabled"),
             comment: text(r, "comment"),
         }
@@ -211,11 +227,20 @@ impl ZoneForm {
             "allow_transfer" => &self.allow_transfer,
             "notify" => &self.notify,
             "primaries" => &self.primaries,
+            "dnssec_algorithm" => &self.dnssec_algorithm,
+            "signature_validity_secs" => &self.signature_validity_secs,
             _ => &self.comment,
         }
     }
 
-    const TEXTS: [&'static str; 5] = ["name", "primary_ns", "admin", "serial_policy", "comment"];
+    const TEXTS: [&'static str; 6] = [
+        "name",
+        "primary_ns",
+        "admin",
+        "serial_policy",
+        "dnssec_algorithm",
+        "comment",
+    ];
 
     fn value(k: &str, s: &str) -> Value {
         if ZONE_NUMBERS.contains(&k) {
@@ -236,6 +261,9 @@ impl ZoneForm {
             if !v.trim().is_empty() {
                 p.insert((*k).into(), Self::value(k, v));
             }
+        }
+        if self.dnssec {
+            p.insert("dnssec".into(), json!(true));
         }
         if self.disabled {
             p.insert("disabled".into(), json!(true));
@@ -261,6 +289,9 @@ impl ZoneForm {
             if split(self.field(k)) != split(base.field(k)) {
                 p.insert(k.into(), json!(split(self.field(k))));
             }
+        }
+        if self.dnssec != base.dnssec {
+            p.insert("dnssec".into(), json!(self.dnssec));
         }
         if self.disabled != base.disabled {
             p.insert("disabled".into(), json!(self.disabled));
@@ -453,6 +484,9 @@ pub(crate) struct DialogWin {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Button {
     Remove,
+    RollZsk,
+    RollKsk,
+    DsPublished,
 }
 
 enum Applied {
@@ -512,7 +546,14 @@ pub(crate) fn status_text(r: &Value) -> String {
     let st = text(r, "status");
     let err = text(r, "error");
     let base = match st.as_str() {
+        "running" if r.get("signed_serial").is_some() => {
+            format!("serving, signed (serial {})", text(r, "signed_serial"))
+        }
+        "running" if flag(r, "dnssec") => "serving, not signed yet".to_owned(),
         "running" => "serving".to_owned(),
+        "loaded" if flag(r, "signed") => {
+            format!("loaded, signed, serial {}", text(r, "loaded_serial"))
+        }
         "loaded" => format!("loaded, serial {}", text(r, "loaded_serial")),
         "not-loaded" => "not loaded".to_owned(),
         "config-only" => "config only (no daemon)".to_owned(),
@@ -585,6 +626,15 @@ impl PanelState for ZonesPanel {
         let open = |w| app.open.contains(&Win::Panel(w));
         let any = open(WIN) || open(WIN_RECORDS) || open(WIN_FILE) || !self.dialogs.is_empty();
         let mut out = Vec::new();
+        if self.dialogs.iter().any(|d| matches!(d.dialog, Dialog::Zone { .. }))
+            && app.has_command("ip.dns.zone.dnssec.print")
+        {
+            out.push(Query {
+                key: "keys",
+                command: "ip.dns.zone.dnssec.print",
+                params: Value::Null,
+            });
+        }
         if any && app.has_command("ip.dns.zone.print") {
             out.push(Query {
                 key: "zones",
@@ -621,6 +671,7 @@ impl PanelState for ZonesPanel {
                 self.zones = a;
             }
             "records" => self.records = a,
+            "keys" => self.keys = a,
             _ => {}
         }
     }
@@ -1197,11 +1248,20 @@ impl ZonesPanel {
                 parent: Some(crate::win_id(Win::Panel(parent))),
             };
             let picker_zones = zones.clone();
+            let zone_keys: Vec<Value> = match &d.dialog {
+                Dialog::Zone { base, .. } => self
+                    .keys
+                    .iter()
+                    .filter(|k| text(k, "zone") == base.name)
+                    .cloned()
+                    .collect(),
+                _ => Vec::new(),
+            };
             let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
                 match &mut d.dialog {
-                    Dialog::NewZone(form) => zone_body(ui, f, form, true, None, &can),
+                    Dialog::NewZone(form) => zone_body(ui, f, form, true, None, &[], &can),
                     Dialog::Zone { form, .. } => {
-                        zone_body(ui, f, form, false, status_row.as_ref(), &can)
+                        zone_body(ui, f, form, false, status_row.as_ref(), &zone_keys, &can)
                     }
                     Dialog::NewRecord(form) => record_body(ui, f, form, Some(&picker_zones), &can),
                     Dialog::Record { form, .. } => record_body(ui, f, form, None, &can),
@@ -1227,6 +1287,21 @@ impl ZonesPanel {
             (Dialog::Zone { id, .. }, Press::Other(Button::Remove)) => {
                 ("ip.dns.zone.remove", json!({ "id": id }), None, true)
             }
+            (Dialog::Zone { base, .. }, Press::Other(roll @ (Button::RollZsk | Button::RollKsk))) => {
+                let key = if roll == Button::RollKsk { "ksk" } else { "zsk" };
+                (
+                    "ip.dns.zone.dnssec.rollover",
+                    json!({"zone": base.name, "key": key}),
+                    None,
+                    false,
+                )
+            }
+            (Dialog::Zone { base, .. }, Press::Other(Button::DsPublished)) => (
+                "ip.dns.zone.dnssec.ds-published",
+                json!({"zone": base.name}),
+                None,
+                false,
+            ),
             (Dialog::Record { id, .. }, Press::Other(Button::Remove)) => {
                 ("ip.dns.zone.record.remove", json!({ "id": id }), None, true)
             }
@@ -1296,6 +1371,7 @@ fn zone_body(
     form: &mut ZoneForm,
     new: bool,
     row: Option<&Value>,
+    keys: &[Value],
     can: &Avail,
 ) -> Footer<Button> {
     if let Some(r) = row {
@@ -1308,6 +1384,11 @@ fn zone_body(
             };
             chip(ui, &st, tone).on_hover_text(status_text(r));
             ui.label(format!("serial {}", text(r, "serial")));
+            if r.get("signed_serial").is_some() {
+                chip(ui, "signed", BLUE.tone(ui.visuals()))
+                    .on_hover_text("DNSSEC: the signed version is served");
+                ui.label(format!("serial {}", text(r, "signed_serial")));
+            }
             ui.weak(format!("{} records", text(r, "records")));
         });
         ui.separator();
@@ -1360,6 +1441,30 @@ fn zone_body(
                 f.text(ui, "Negative TTL (s)", "minimum_secs", &mut form.minimum_secs, "3600");
                 f.text(ui, "Default TTL (s)", "ttl_secs", &mut form.ttl_secs, "3600");
                 f.text(ui, "Notify", "notify", &mut form.notify, "secondaries to tell");
+                ui.label("DNSSEC").on_hover_text(
+                    "Sign the zone: a KSK and a ZSK made by the router, NSEC3 without extra \
+                     iterations or salt (RFC 9276). Put the DS shown below at the parent.",
+                );
+                ui.checkbox(&mut form.dnssec, "");
+                ui.end_row();
+                if form.dnssec {
+                    ui.label("Algorithm");
+                    egui::ComboBox::from_id_salt(f.window().with("dnssec_algorithm"))
+                        .selected_text(form.dnssec_algorithm.as_str())
+                        .show_ui(ui, |ui| {
+                            for t in ["ecdsa-p256", "ed25519"] {
+                                ui.selectable_value(&mut form.dnssec_algorithm, t.to_owned(), t);
+                            }
+                        });
+                    ui.end_row();
+                    f.text(
+                        ui,
+                        "Signature Validity (s)",
+                        "signature_validity_secs",
+                        &mut form.signature_validity_secs,
+                        "1209600",
+                    );
+                }
             }
             f.text(
                 ui,
@@ -1384,12 +1489,80 @@ fn zone_body(
         .weak()
         .small(),
     );
+    let pressed = if keys.is_empty() {
+        None
+    } else {
+        dnssec_keys(ui, keys, can)
+    };
     let ok = can.check(if new { "ip.dns.zone.add" } else { "ip.dns.zone.set" });
     let mut footer = Footer::edit(!new, ok);
     if !new {
         footer.extra = vec![("Remove", Button::Remove, can.check("ip.dns.zone.remove"))];
     }
+    footer.pressed = pressed;
     footer
+}
+
+/// The zone's keys: one line each (role, tag, state, what comes next), the
+/// DS for the parent with Copy, and the rollover buttons.
+fn dnssec_keys(ui: &mut Ui, keys: &[Value], can: &Avail) -> Option<Button> {
+    let mut pressed = None;
+    ui.separator();
+    ui.label(RichText::new("DNSSEC keys").strong());
+    let ksks = keys
+        .iter()
+        .filter(|k| text(k, "role") == "ksk" && text(k, "state") == "active")
+        .count();
+    for k in keys {
+        ui.horizontal(|ui| {
+            chip(ui, &text(k, "role").to_uppercase(), neutral_tone(ui.visuals()));
+            ui.label(format!("{} {}", text(k, "algorithm"), text(k, "key_tag")));
+            let st = text(k, "state");
+            let tone = match st.as_str() {
+                "active" => BLUE.tone(ui.visuals()),
+                "retired" => AMBER.tone(ui.visuals()),
+                _ => neutral_tone(ui.visuals()),
+            };
+            chip(ui, &st, tone);
+            let next = text(k, "next");
+            if !next.is_empty() {
+                ui.weak(next);
+            }
+        });
+        let ds = text(k, "ds");
+        if !ds.is_empty() && text(k, "state") != "retired" {
+            ui.horizontal(|ui| {
+                let mut shown = ds.clone();
+                if shown.len() > 48 {
+                    shown.truncate(48);
+                    shown.push('…');
+                }
+                ui.label(RichText::new(format!("DS {shown}")).monospace().small())
+                    .on_hover_text(&ds);
+                if ui.small_button("Copy DS").clicked() {
+                    ui.ctx().copy_text(ds.clone());
+                }
+            });
+        }
+    }
+    ui.horizontal(|ui| {
+        let roll = can.check("ip.dns.zone.dnssec.rollover");
+        if action(ui, "Roll ZSK", roll.clone()) {
+            pressed = Some(Button::RollZsk);
+        }
+        if action(ui, "Roll KSK", roll) {
+            pressed = Some(Button::RollKsk);
+        }
+        let published = if ksks > 1 {
+            can.check("ip.dns.zone.dnssec.ds-published")
+        } else {
+            Err("No KSK rollover is waiting for its DS".to_owned())
+        };
+        if action(ui, "DS Published", published) {
+            pressed = Some(Button::DsPublished);
+        }
+    });
+    pressed
 }
 
 fn record_body(

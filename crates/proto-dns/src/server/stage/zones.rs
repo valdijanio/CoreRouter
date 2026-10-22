@@ -11,7 +11,10 @@
 //! - a delegation below the apex: a referral (no AA) for a query without
 //!   RD; with RD the query goes to the delegation's glue addresses, like a
 //!   static FWD entry (we forward, we do not iterate);
-//! - a secondary not loaded (or expired): SERVFAIL.
+//! - a secondary not loaded (or expired): SERVFAIL;
+//! - DNSSEC (G4.1c-2): for a client that set DO, a signed zone adds the
+//!   RRSIGs of what it answers and the NSEC3 proofs of what does not
+//!   exist (RFC 4035 §3.1, RFC 5155 §7.2); without DO, none of it (§3.1).
 
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::RData;
@@ -19,7 +22,7 @@ use hickory_proto::rr::RData;
 use crate::message::QName;
 use crate::resolver::Transport;
 use crate::server::{Forwarder, Query, Reply, Stage, Step};
-use crate::zone::{self, Found};
+use crate::zone::{self, Found, dnssec};
 
 pub(crate) const STAGE: Stage = Stage {
     name: "zones",
@@ -44,16 +47,24 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
         };
         let mut r = Reply::code(ResponseCode::NoError);
         r.authoritative = true;
-        match z.lookup(&q.name.name, &q.name.key, q.qtype) {
+        let found = z.lookup(&q.name.name, &q.name.key, q.qtype);
+        let proof = if q.dnssec_ok() {
+            dnssec::authenticate(&z, &q.name.key, q.qtype, &found)
+        } else {
+            dnssec::Proof::default()
+        };
+        match found {
             Found::Answer {
                 records,
                 additional,
             } => {
                 r.answers = records;
+                r.answers.extend(proof.answer);
                 r.additional = additional;
             }
             Found::Cname { record, target } => {
                 q.prefix.push(*record);
+                q.prefix.extend(proof.answer);
                 q.name = QName::from_name(&target);
                 continue;
             }
@@ -80,6 +91,7 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
                 r.authority = vec![z.negative_soa()];
             }
         }
+        r.authority.extend(proof.authority);
         return Step::Reply(r);
     }
     // A loop of CNAMEs.
