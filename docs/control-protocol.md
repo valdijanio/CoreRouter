@@ -107,6 +107,21 @@ token: o mesmo usuário do sistema entra sem senha (grupo `full`), **outro usuá
 não consegue ler o arquivo e precisa logar** como qualquer um. O token local só vale no TCP de
 loopback e no `--ws` de loopback, nunca nos endpoints TLS.
 
+**Tela de conexão da GUI (G0.3c).** Login vem preenchido com `admin`. Em `127.0.0.1`/`::1` a
+GUI nativa primeiro pergunta `server.info` sem credencial: sem o campo `auth` é um roteador
+anterior ao G0.3 (sem usuários nem login), e a tela diz "This router runs an old version
+(without login). Update and restart corerouter-daemon." com o botão **Connect anyway** (só em
+loopback: lá esse daemon já aceita qualquer processo da máquina, então conectar não abre nada
+novo; a barra superior mostra `old router: no login` e o que ele não tem fica cinza, como no
+G1.16). Num roteador atual, tenta o token local; se o arquivo não for legível (daemon de outro
+usuário do sistema, p. ex. root com `sudo`) ou o roteador o recusar, faz `auth.login` com Login
+e Password (senha vazia vale em loopback enquanto o `admin` não tiver uma, G0.3b). Só se isso
+também falhar aparece um erro, curto ("Invalid user or password", "Set the admin password
+first…", "Too many failed logins…", "Nothing answers at that address…"), com o texto técnico (o
+caminho do token, a resposta do roteador) em **Details** e no tooltip. Fora do loopback é TLS +
+Login/Password como antes. Na GUI web o motivo da desconexão usa as mesmas frases (`unknown
+method 'auth.login'` vira a de roteador antigo; a web não oferece "Connect anyway").
+
 **TLS (`--listen`, `--ws-listen`).** `rustls` com o provedor `ring` (sem OpenSSL). Na primeira
 vez o daemon gera um certificado autoassinado em `--config-dir` (`tls-cert.pem`, e
 `tls-key.pem` com 0600) e loga a impressão digital SHA-256 (`TLS certificate fingerprint:
@@ -194,3 +209,5 @@ Na GUI web: `?connect=ws://127.0.0.1:7980` abre a tela de conexão com esse daem
   confiança no primeiro uso, portas TLS no CRDP.
 - 2026-10-22 — G0.3b: primeiro `admin` sem senha, login vazio só em loopback, rede recusada até
   definir a senha, `no_password` em `auth.login`/`auth.whoami`/`user.list`.
+- 2026-10-22 — G0.3c: tela de conexão (token local → Login/Password em loopback, `admin` por
+  padrão, roteador anterior ao G0.3 pelo `server.info` sem `auth`).

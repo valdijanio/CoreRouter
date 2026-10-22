@@ -5,6 +5,7 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod nic;
 pub mod probe;
 pub mod sim;
 pub mod virt;
@@ -13,6 +14,7 @@ use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 use serde::Serialize;
 
+pub use nic::{Counter, CounterGroup, EthernetMonitor, LinkCounters, NicHardware, Offload};
 pub use probe::{Prober, SharedProber};
 pub use sim::SimProber;
 pub use virt::VirtualHal;
@@ -128,5 +130,30 @@ pub trait Hal: Send {
     /// is none. Cheap: backends build it once and hand out clones.
     fn prober(&self) -> Result<SharedProber, String> {
         Err(format!("{} cannot send probes", self.describe()))
+    }
+
+    /// Live Ethernet state of `name` (G1.19). Fields the driver does not
+    /// report are `None`; `Unsupported` means nothing at all.
+    fn ethernet_monitor(&mut self, name: &IfName) -> Result<EthernetMonitor, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no Ethernet state for '{name}'",
+            self.describe()
+        )))
+    }
+
+    /// The NIC behind `name`: ids, driver, queues, rings, offloads (G1.19).
+    fn hardware(&mut self, name: &IfName) -> Result<NicHardware, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no hardware details for '{name}'",
+            self.describe()
+        )))
+    }
+
+    /// Every counter of `name` the platform has, by group (G1.19).
+    fn counters(&mut self, name: &IfName) -> Result<LinkCounters, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no counters for '{name}'",
+            self.describe()
+        )))
     }
 }

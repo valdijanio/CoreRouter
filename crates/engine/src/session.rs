@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::auth::{self, Group, Login, Logins, Principal};
 use crate::cmd::{self, check_params, unknown_command};
 use crate::firewall_dyn::DynamicLists;
+use crate::link_watch::LinkWatch;
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
@@ -74,6 +75,8 @@ pub struct Session {
     pub(crate) lockout_ack: bool,
     /// Inside [`Session::batch`]: the steps share one acknowledgement.
     in_batch: bool,
+    /// When links went up/down (operational, never saved; G1.19).
+    pub(crate) links: LinkWatch,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -150,6 +153,7 @@ impl Session {
             logins: Logins::default(),
             lockout_ack: false,
             in_batch: false,
+            links: LinkWatch::default(),
         }
     }
 

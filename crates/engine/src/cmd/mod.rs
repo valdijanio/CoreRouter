@@ -80,6 +80,7 @@ pub mod firewall;
 mod firewall_assist;
 mod firewall_zone;
 mod interface;
+mod interface_info;
 mod interface_list;
 mod ip;
 mod neighbor;
@@ -92,6 +93,7 @@ mod vrf;
 
 static AREAS: &[&[CommandSpec]] = &[
     interface::COMMANDS,
+    interface_info::COMMANDS,
     interface_list::COMMANDS,
     ip::COMMANDS,
     route::COMMANDS,

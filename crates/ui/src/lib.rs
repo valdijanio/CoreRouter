@@ -13,6 +13,7 @@ mod firewall;
 mod firewall_assist;
 mod first_login;
 mod float;
+mod iface_tabs;
 mod interfaces;
 mod lockout;
 mod mtr;
@@ -34,7 +35,7 @@ use egui::{Color32, RichText};
 use serde_json::{Value, json};
 
 pub use backend::{Backend, Link, Local, Reply, RequestId};
-pub use connect::{ConnectAction, ConnectScreen, Credentials, NeighborRow, SavedRouter};
+pub use connect::{ConnectAction, ConnectScreen, Credentials, Failure, NeighborRow, SavedRouter};
 pub use neighbors::uptime_text;
 pub use prefs::stored_theme;
 pub use windows::Win;
@@ -181,6 +182,8 @@ enum Pending {
     Terminal {
         term: u64,
     },
+    /// A query of an "Interface <name>" window's tabs (not logged).
+    Nic(iface_tabs::NicReq),
 }
 
 /// A file the UI wants saved (CSV export): the app writes it (native) or
@@ -232,6 +235,10 @@ pub struct CoreRouterUi {
     tables: Tables,
     /// Floating "New …" / "Interface <name>" / "Comment" windows.
     dialogs: Vec<interfaces::DialogWin>,
+    /// Live data of the open "Interface <name>" windows' tabs (G1.19).
+    nic: BTreeMap<String, iface_tabs::NicView>,
+    /// UI time of the last frame (when a tab query's reply is counted).
+    nic_clock: f64,
     /// Maximized windows and where they were (UI-local).
     floats: float::Floats,
     next_dialog: u64,
@@ -295,6 +302,8 @@ impl CoreRouterUi {
             },
             tables: Tables::default(),
             dialogs: Vec::new(),
+            nic: BTreeMap::new(),
+            nic_clock: 0.0,
             floats: float::Floats::default(),
             next_dialog: 0,
             open_after: Vec::new(),
@@ -437,6 +446,7 @@ impl CoreRouterUi {
             Some(Pending::Query(field)) => self.on_query(field, id, result),
             Some(Pending::Tool(req)) => self.tool_reply(req, result),
             Some(Pending::Terminal { term }) => self.term_reply(term, id, result),
+            Some(Pending::Nic(req)) => self.nic_reply(req, result),
             Some(Pending::Action {
                 command,
                 params,
@@ -656,7 +666,10 @@ impl CoreRouterUi {
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
         ask(self, Field::Commands, "engine.list", Value::Null);
-        ask(self, Field::Whoami, "auth.whoami", Value::Null);
+        // An old router has no auth.whoami: no question it cannot answer.
+        if !self.old_router() {
+            ask(self, Field::Whoami, "auth.whoami", Value::Null);
+        }
         if self.cache.info.is_null() {
             ask(self, Field::Info, "server.info", Value::Null);
         }
@@ -695,6 +708,7 @@ impl CoreRouterUi {
         self.pump();
         self.refresh(now);
         self.tools_tick(ui.ctx(), now);
+        self.nic_tick(now);
         self.pump();
         self.first_login_tick();
         let wake = if self.pending.is_empty() {
@@ -830,6 +844,26 @@ impl CoreRouterUi {
         ui.separator();
     }
 
+    /// A router older than the login (G0.3c), managed after "Connect
+    /// anyway": its `server.info` says nothing about `auth`.
+    pub fn old_router(&self) -> bool {
+        !matches!(self.link, Link::Local) && connect::old_router_info(&self.cache.info)
+    }
+
+    /// The top bar's warning while managing an old router.
+    fn old_router_warning(&self, ui: &mut egui::Ui) {
+        if !self.old_router() {
+            return;
+        }
+        ui.colored_label(ui.visuals().warn_fg_color, "old router: no login")
+            .on_hover_text(format!(
+                "{} Until then anyone on its machine can manage it, and what it does not \
+                 have yet is greyed out.",
+                connect::OLD_ROUTER
+            ));
+        ui.separator();
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let s = &self.cache.summary;
         let txt = |k: &str| s.get(k).map(value_text).unwrap_or_default();
@@ -849,6 +883,7 @@ impl CoreRouterUi {
         ui.horizontal(|ui| {
             self.link_label(ui);
             self.user_label(ui);
+            self.old_router_warning(ui);
             self.no_password_warning(ui);
             // Nothing heard from the router yet: no empty fields.
             if !known {
@@ -2487,6 +2522,13 @@ mod tests {
                     Ok(json!([]))
                 }
                 "engine.execute" if !known => Err(format!("unknown command '{command}'")),
+                // The interface window's tab queries (G1.19).
+                "engine.execute"
+                    if [iface_tabs::MONITOR, iface_tabs::HARDWARE, iface_tabs::STATS]
+                        .contains(&command.as_str()) =>
+                {
+                    Ok(json!({"available": false, "reason": "fake daemon"}))
+                }
                 "engine.execute" => {
                     d.executed.push(command);
                     Ok(json!({}))
@@ -2599,6 +2641,26 @@ mod tests {
         // Commit is there and works.
         h.click(h.text("Commit"));
         assert_eq!(d.borrow().executed, ["config.commit"]);
+    }
+
+    #[test]
+    fn an_old_router_without_login_is_flagged_in_the_top_bar() {
+        // The fake daemon is 0.0.9: its server.info says nothing about auth.
+        let (mut h, _) = Harness::daemon(before_safe_mode());
+        assert!(h.app.old_router());
+        let at = h.text("old router: no login");
+        h.tooltip_at(at);
+        assert!(h.has_text_containing("Update and restart corerouter-daemon"));
+        // A router of this version says "auth": no warning.
+        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0", "auth": "required"});
+        h.idle();
+        assert!(!h.app.old_router());
+        assert!(!h.has_text("old router: no login"));
+        // Nor in the lab, which has no login at all.
+        let mut lab = Harness::new();
+        lab.idle();
+        assert!(!lab.app.old_router());
+        assert!(!lab.has_text("old router: no login"));
     }
 
     #[test]
@@ -2731,5 +2793,135 @@ mod tests {
     fn bytes_are_human() {
         assert_eq!(human_bytes(10), "10 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
+    }
+
+    impl Harness {
+        /// Every place `needle` is painted, top first.
+        fn all_text(&self, needle: &str) -> Vec<egui::Pos2> {
+            fn find(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Pos2>) {
+                match shape {
+                    egui::Shape::Text(t) if t.galley.text() == needle => {
+                        out.push(t.visual_bounding_rect().center());
+                    }
+                    egui::Shape::Vec(v) => v.iter().for_each(|s| find(s, needle, out)),
+                    _ => {}
+                }
+            }
+            let mut out = Vec::new();
+            for s in &self.shapes {
+                find(&s.shape, needle, &mut out);
+            }
+            out.sort_by(|a, b| a.y.total_cmp(&b.y));
+            out
+        }
+
+        /// Click the tab `label` of the open "Interface <name>" window.
+        fn tab(&mut self, label: &str) {
+            let at = *self
+                .all_text(label)
+                .first()
+                .unwrap_or_else(|| panic!("no tab {label:?}"));
+            self.click(at);
+        }
+
+        /// Idle `secs` of UI time (the tabs refresh once a second).
+        fn wait(&mut self, secs: f64) {
+            let until = self.time + secs;
+            while self.time < until {
+                self.idle();
+            }
+        }
+    }
+
+    #[test]
+    fn interface_window_tabs() {
+        let mut h = Harness::new();
+        lock(&h.session).tick(1_000);
+        h.app.open_props("ether1");
+        h.wait(0.2);
+        // General: the editable fields plus MACs and L2 MTU from the NIC.
+        for t in ["General", "Status", "Hardware", "Traffic", "Statistics"] {
+            assert!(h.has_text(t), "tab {t}");
+        }
+        assert!(h.has_text("Factory MAC"));
+        assert!(h.has_text("02:00:00:00:00:01"));
+        assert!(h.has_text("L2 MTU"));
+        assert!(h.has_text("9216"));
+
+        h.tab("Status");
+        assert!(h.has_text("link-ok"));
+        assert!(h.has_text("1Gbps"));
+        assert!(h.has_text("done"));
+        assert!(h.has_text("up since before watching began (0s ago)"));
+        assert!(h.has_text("not since watching began (0s ago)"));
+        assert!(
+            h.has_text("10baseT/Half, 10baseT/Full, 100baseT/Half, 100baseT/Full, 1000baseT/Full")
+        );
+        assert!(
+            !h.has_text("Factory MAC"),
+            "General's fields are on their own tab"
+        );
+
+        h.tab("Hardware");
+        assert!(h.has_text("CoreRouter"));
+        assert!(h.has_text("Virtual NIC"));
+        assert!(h.has_text("corerouter-virt"));
+        assert!(h.has_text("not supported"), "the lab has no PCI ids");
+        // The offloads are further down the tab: scroll there.
+        let over = h.text("corerouter-virt");
+        h.frame(vec![egui::Event::PointerMoved(over)], egui::Modifiers::NONE);
+        h.frame(
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -800.0),
+                phase: egui::TouchPhase::Move,
+                source: egui::MouseWheelSource::Unknown,
+                modifiers: egui::Modifiers::NONE,
+            }],
+            egui::Modifiers::NONE,
+        );
+        h.wait(0.5);
+        assert!(h.has_text("TSO"));
+        assert!(h.has_text("fixed"), "LRO is fixed in the lab");
+
+        h.tab("Traffic");
+        h.wait(2.5);
+        assert!(!h.has_text("Collecting samples…"));
+
+        h.tab("Statistics");
+        assert!(h.has_text("interface"));
+        assert!(h.has_text("rx-bytes"));
+        assert!(h.has_text("rx-crc-errors"));
+        h.click(h.text("Zero view"));
+        assert!(h.has_text("Show totals"));
+        // Only the window's view moved: the router still counts from boot.
+        let st = lock(&h.session)
+            .execute("interface.stats", &json!({"name": "ether1"}))
+            .unwrap();
+        assert!(st["groups"][0]["counters"][0]["value"].as_u64().unwrap() > 0);
+        h.click(h.text("Show totals"));
+        assert!(!h.has_text("Show totals"));
+
+        // Esc still cancels from any tab; the tab queries stop with it.
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        assert!(h.app.dialogs.is_empty());
+        h.idle();
+        assert!(h.app.nic.is_empty());
+    }
+
+    #[test]
+    fn interface_tabs_explain_what_is_not_supported() {
+        let mut h = Harness::new();
+        lock(&h.session)
+            .execute("interface.bridge.add", &json!({"name": "br1"}))
+            .unwrap();
+        h.wait(1.1);
+        h.app.open_props("br1");
+        h.wait(0.2);
+        h.tab("Status");
+        assert!(h.has_text("Not supported here: 'br1' is a bridge, not an Ethernet port"));
+        assert!(h.has_text("link-ok"), "the link state is still known");
+        h.tab("Hardware");
+        assert!(h.has_text("bridge"));
     }
 }
