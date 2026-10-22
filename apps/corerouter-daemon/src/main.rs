@@ -1,6 +1,6 @@
 //! `corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
 //!  [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
-//!  [--discovery-port <port> | --no-discovery]`
+//!  [--discovery-port <port> | --no-discovery] [--discovery-transport interfaces|loopback]`
 //!
 //! The virtual backend is the default: touching a real kernel must be an
 //! explicit choice. TLS/auth for remote management is docs/gaps.md G0.3, so
@@ -21,6 +21,12 @@
 //! Neighbor discovery (G5.1, docs/discovery.md): CRDP announces on the
 //! interfaces listed with `ip.neighbor.discovery.set` (none by default) and
 //! fills `ip.neighbor.list`. The node id is kept in `<config-dir>/node-id`.
+//! The virtual lab (G5.4) has no real ports: CRDP goes over this host's
+//! loopback, and a new lab announces on ether1 out of the box, so labs on
+//! one computer see each other. The linux backend uses the real interfaces
+//! and announces on none until told to. `--discovery-transport` overrides the
+//! choice (a lab run in a network namespace over veths named like its ports
+//! uses `interfaces`; that is how the netns test exercises the real path).
 
 mod node_id;
 
@@ -30,8 +36,8 @@ use std::process::ExitCode;
 use corerouter_control::{
     DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_clock, spawn_ws,
 };
-use corerouter_discovery::{Agent, AgentConfig};
-use corerouter_engine::{ConfigStorage, MemoryStorage, Session, shared};
+use corerouter_discovery::{Agent, AgentConfig, Transport, enable_lab_default};
+use corerouter_engine::{ConfigStorage, MemoryStorage, Session, lock, shared};
 use corerouter_hal::{Hal, VirtualHal};
 use corerouter_storage_fs::FileStorage;
 
@@ -39,6 +45,7 @@ const USAGE: &str = "\
 usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
                          [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
                          [--discovery-port <port> | --no-discovery]
+                         [--discovery-transport interfaces|loopback]
 
   --ws <port>           WebSocket for the web GUI on 127.0.0.1:<port>
   --ws-origin <origin>  also allow pages from <origin> (e.g. http://127.0.0.1:8080 for
@@ -46,7 +53,10 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                         and http://localhost:<port>
   --web-root <dir>      serve the built web GUI (`trunk build` -> dist/) on the --ws port
   --discovery-port <p>  UDP port of CRDP neighbor discovery (default 7979)
-  --no-discovery        do not open the CRDP port at all";
+  --no-discovery        do not open the CRDP port at all
+  --discovery-transport where CRDP announces: `interfaces` (host interfaces named like the
+                        router's; default of --backend linux) or `loopback` (this host
+                        only, labs see each other; default of --backend virtual)";
 
 /// Writable config partition of the router image (docs/architecture.md 1.1).
 const PRODUCTION_CONFIG_DIR: &str = "/config";
@@ -60,6 +70,8 @@ struct Args {
     web_root: Option<PathBuf>,
     /// `None`: `--no-discovery`.
     discovery_port: Option<u16>,
+    /// `None`: chosen by the backend.
+    discovery_transport: Option<Transport>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -71,6 +83,7 @@ fn parse_args() -> Result<Args, String> {
         ws_origins: Vec::new(),
         web_root: None,
         discovery_port: Some(corerouter_discovery::PORT),
+        discovery_transport: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -106,6 +119,19 @@ fn parse_args() -> Result<Args, String> {
                 out.discovery_port = Some(v.parse().map_err(|_| format!("bad port '{v}'"))?);
             }
             "--no-discovery" => out.discovery_port = None,
+            "--discovery-transport" => {
+                let v = args.next().ok_or("--discovery-transport needs a value")?;
+                out.discovery_transport = Some(match v.as_str() {
+                    "interfaces" => Transport::Interfaces,
+                    "loopback" => Transport::Loopback,
+                    _ => {
+                        return Err(format!(
+                            "bad --discovery-transport '{}' (interfaces | loopback)",
+                            v.chars().take(32).collect::<String>()
+                        ));
+                    }
+                });
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
@@ -238,12 +264,27 @@ fn main() -> ExitCode {
     let _discovery = match args.discovery_port {
         None => None,
         Some(port) => {
+            let transport = args
+                .discovery_transport
+                .unwrap_or(match args.backend.as_str() {
+                    "virtual" => Transport::Loopback,
+                    _ => Transport::Interfaces,
+                });
+            if transport == Transport::Loopback {
+                let mut s = lock(&session);
+                if s.storage_status().loaded_from.is_none()
+                    && let Err(e) = enable_lab_default(&mut s)
+                {
+                    log::warn!("virtual lab: discovery default not set: {e}");
+                }
+            }
             let cfg = AgentConfig {
                 port,
                 node_id: node_id::load_or_create(config_dir.as_deref()),
                 control_port: Some(args.port),
                 ws_port: args.ws,
                 board: format!("{} {}", std::env::consts::ARCH, args.backend),
+                transport,
             };
             match Agent::spawn(session.clone(), cfg) {
                 Ok(a) => Some(a),

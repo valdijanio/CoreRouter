@@ -245,6 +245,26 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com o cursor no MTU, Ctrl+Enter aplica 9000 e fica aberto, Esc descarta, Esc em camadas na lista.
   Esforço do agente ~3 h (**estimado**).
 
+- 2026-10-22 — G5.4: no lab virtual a descoberta CRDP usa o loopback do host. Antes, um
+  `corerouter-daemon` virtual anunciava pelas interfaces **reais** com o nome das portas do lab
+  (`ether1` não existe no host) e, sem interfaces por padrão, não anunciava nada: a aba Neighbors
+  da GUI ficava vazia. Agora `corerouter_discovery::Transport::Loopback` (padrão de
+  `--backend virtual`; `--discovery-transport interfaces|loopback` troca) manda um broadcast para
+  `127.255.255.255:7979` por porta virtual ativa, de um socket ligado a `127.0.0.1` — nada sai da
+  máquina, nada lê `/proc/net/if_inet6` — e só ouve origem loopback. Portas de mesmo nome de todos
+  os labs do computador estão no mesmo fio: o vizinho entra na porta com o nome do TLV de
+  interface, se ela existe, está habilitada e tem descoberta. Lab novo (config não restaurada)
+  roda `ip.neighbor.discovery.set {"interfaces": ["ether1"]}` ao subir, pelo `Session::execute`.
+  `--backend linux` inalterado, e passa a descartar origem loopback (é o fio dos labs). O teste
+  em namespace do G5.1 roda labs sobre veths e agora pede `--discovery-transport interfaces`.
+  4 testes novos: dois labs e o `Listener` da GUI se veem pelo loopback sem namespace nem root
+  (`127.0.0.1:7979`/`:7981`), portas de nomes diferentes não se veem, o transporte de interfaces
+  ignora o fio do lab, e o mapeamento de porta (unitário). Teste manual (**medido**): dois
+  daemons virtuais (`--control 7981`/`7983`, a 7979 estava ocupada por outro daemon) se listaram
+  em `ip.neighbor.list` em `ether1`, e a `corerouter-gui --control 7990` sem `--connect` mostrou
+  os dois na aba Neighbors como `127.0.0.1 (this machine)` (screenshot conferido). Esforço do
+  agente ~1,5 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -261,3 +281,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.4.
 - 2026-10-22 — log do G5.1.
 - 2026-10-22 — log do G1.15.
+- 2026-10-22 — log do G5.4.

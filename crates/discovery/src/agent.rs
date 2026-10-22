@@ -1,6 +1,10 @@
 //! The router side of CRDP: announce on the interfaces where discovery is
 //! active, listen on them, and keep the session's neighbor table.
 //!
+//! Two transports ([`Transport`]): the host's real interfaces (linux
+//! backend) or, for the virtual lab, the host's loopback, where labs on
+//! one machine see each other and nothing reaches the network.
+//!
 //! Three threads: one sender (also expires the table every second) and one
 //! receiver per address family. Nothing is ever sent in reply to a
 //! datagram: a forged announcement costs the sender one table entry at most
@@ -14,7 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use corerouter_engine::{Shared, lock};
+use corerouter_engine::{Session, Shared, lock};
 use corerouter_model::{
     Config, IfName, MgmtPorts, NeighborDiscovery, NeighborEntry, NeighborProtocol,
 };
@@ -22,6 +26,7 @@ use corerouter_proto_discovery::{
     Announcement, MAX_ADDRESSES, MAX_PACKET, MAX_TEXT, NodeId, fit_text,
 };
 use ipnet::IpNet;
+use serde_json::json;
 
 use crate::ifaces::{self, IfTable};
 use crate::sock;
@@ -34,6 +39,40 @@ const RESCAN: Duration = Duration::from_secs(1);
 /// (duplicate address detection): complain only after this.
 const SETTLE: Duration = Duration::from_secs(10);
 
+/// Where announcements go and come from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// The kernel interfaces named like the config's (`--backend linux`):
+    /// `ff02::1` and directed IPv4 broadcast out of each active interface.
+    Interfaces,
+    /// The virtual lab (`--backend virtual`): its ports exist only in
+    /// memory, so every announcement goes to `127.255.255.255` and only
+    /// loopback sources are heard. Same-named ports of all labs on the host
+    /// share one wire: an announcement sent out of `ether1` arrives on the
+    /// receiver's `ether1`, if discovery is active there.
+    Loopback,
+}
+
+/// Port of the virtual lab where discovery is on out of the box
+/// ([`enable_lab_default`]).
+pub const LAB_INTERFACE: &str = "ether1";
+
+/// Factory default of a new virtual lab: announce on [`LAB_INTERFACE`], so
+/// two labs on one machine see each other without any command. Loopback
+/// never leaves the host. Goes through `Session::execute` (journaled, saved
+/// with `--config-dir`); call it only on a config that was not restored, so
+/// an operator's later choice wins. Never for the linux backend: there the
+/// default stays "no interface" (never announce on the WAN).
+pub fn enable_lab_default(session: &mut Session) -> Result<(), String> {
+    session
+        .execute(
+            "ip.neighbor.discovery.set",
+            &json!({ "interfaces": [LAB_INTERFACE] }),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     /// UDP port (`corerouter_proto_discovery::PORT` unless testing).
@@ -43,6 +82,7 @@ pub struct AgentConfig {
     pub ws_port: Option<u16>,
     /// Hardware/board text, e.g. "x86_64 (virtual lab)".
     pub board: String,
+    pub transport: Transport,
 }
 
 /// Running CRDP threads; dropping it stops them.
@@ -59,6 +99,10 @@ impl Agent {
         let rx6 = sock::listen_v6(cfg.port)?;
         let tx6 = UdpSocket::bind((Ipv6Addr::UNSPECIFIED, 0))?;
         let join6 = rx6.try_clone()?;
+        let lo = match cfg.transport {
+            Transport::Loopback => Some(sock::loopback_sender()?),
+            Transport::Interfaces => None,
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let cfg = Arc::new(cfg);
         let mut threads = Vec::new();
@@ -74,11 +118,21 @@ impl Agent {
         threads.push(
             thread::Builder::new()
                 .name("crdp-tx".into())
-                .spawn(move || send_loop(&tx6, &join6, &session2, &cfg2, &stop2))?,
+                .spawn(move || {
+                    let tx = Tx {
+                        v6: &tx6,
+                        lo: lo.as_ref(),
+                    };
+                    send_loop(&tx, &join6, &session2, &cfg2, &stop2);
+                })?,
         );
+        let via = match cfg.transport {
+            Transport::Interfaces => "the host interfaces of the same name",
+            Transport::Loopback => "this host's loopback only (virtual lab)",
+        };
         log::info!(
             "CRDP on UDP {} (node {}); announcing only on the interfaces in \
-             ip.neighbor.discovery.set",
+             ip.neighbor.discovery.set, through {via}",
             cfg.port,
             cfg.node_id
         );
@@ -166,13 +220,13 @@ impl Once {
     }
 }
 
-fn send_loop(
-    tx6: &UdpSocket,
-    rx6: &UdpSocket,
-    session: &Shared,
-    cfg: &AgentConfig,
-    stop: &AtomicBool,
-) {
+/// The sending sockets: `lo` is set for [`Transport::Loopback`].
+struct Tx<'a> {
+    v6: &'a UdpSocket,
+    lo: Option<&'a UdpSocket>,
+}
+
+fn send_loop(tx: &Tx<'_>, rx6: &UdpSocket, session: &Shared, cfg: &AgentConfig, stop: &AtomicBool) {
     let started = Instant::now();
     let mut last_sent: BTreeMap<IfName, Instant> = BTreeMap::new();
     let mut active_since: BTreeMap<IfName, Instant> = BTreeMap::new();
@@ -190,7 +244,12 @@ fn send_loop(
         let changed = last_settings.as_ref() != Some(&snap.settings);
         last_settings = Some(snap.settings.clone());
         let interval = Duration::from_secs(u64::from(snap.settings.interval_secs.max(1)));
-        let kernel = ifaces::read();
+        // The lab's ports are not kernel interfaces, even when a host
+        // interface happens to have the same name.
+        let kernel = match tx.lo {
+            Some(_) => IfTable::default(),
+            None => ifaces::read(),
+        };
         let uptime = started.elapsed().as_secs();
 
         let active: Vec<&IfName> = snap
@@ -217,7 +276,7 @@ fn send_loop(
                     uptime,
                     settled: true,
                 };
-                announce(tx6, cfg, &snap, &out, &kernel, &mut warned);
+                announce(tx, cfg, &snap, &out, &kernel, &mut warned);
             }
         }
         let hold = u16::try_from(snap.settings.hold_secs()).unwrap_or(u16::MAX);
@@ -241,7 +300,7 @@ fn send_loop(
                     uptime,
                     settled,
                 };
-                announce(tx6, cfg, &snap, &out, &kernel, &mut warned);
+                announce(tx, cfg, &snap, &out, &kernel, &mut warned);
                 last_sent.insert(name.clone(), Instant::now());
             }
         }
@@ -260,7 +319,7 @@ struct Out<'a> {
 }
 
 fn announce(
-    tx6: &UdpSocket,
+    tx: &Tx<'_>,
     cfg: &AgentConfig,
     snap: &Snapshot,
     out: &Out<'_>,
@@ -313,11 +372,23 @@ fn announce(
             return;
         }
     };
+    if let Some(lo) = tx.lo {
+        match sock::send_loopback(lo, &packet, cfg.port) {
+            Ok(()) => {
+                warned.clear("lo");
+                log::debug!("CRDP announced {name} on loopback (hold {hold_secs} s)");
+            }
+            Err(e) => warned.warn("lo".into(), || {
+                format!("CRDP: cannot broadcast on loopback (virtual lab): {e}")
+            }),
+        }
+        return;
+    }
     let mut sent = false;
     match k {
         // Still in duplicate address detection: nothing to send from yet.
         Some(k) if k.link_local.is_empty() && !settled => {}
-        Some(k) => match sock::send_v6(tx6, &packet, k.index, cfg.port) {
+        Some(k) => match sock::send_v6(tx.v6, &packet, k.index, cfg.port) {
             Ok(()) => {
                 sent = true;
                 warned.clear(&format!("{name}/v6"));
@@ -379,8 +450,14 @@ fn receive_loop(rx: &UdpSocket, session: &Shared, cfg: &AgentConfig, stop: &Atom
             scanned = Instant::now();
         }
         let mut s = lock(session);
-        let Some(interface) = arrival_interface(s.store().running(), &kernel, scope, from.ip())
-        else {
+        let running = s.store().running();
+        let interface = match cfg.transport {
+            Transport::Loopback => lab_interface(running, &a.interface, from.ip()),
+            // Loopback is the virtual labs' wire, never a link of ours.
+            Transport::Interfaces if from.ip().is_loopback() => None,
+            Transport::Interfaces => arrival_interface(running, &kernel, scope, from.ip()),
+        };
+        let Some(interface) = interface else {
             log::debug!("CRDP from {from}: not on any of our interfaces");
             continue;
         };
@@ -420,6 +497,21 @@ fn arrival_interface(
             .cloned()
             .unwrap_or(first),
     )
+}
+
+/// Virtual lab: the announcement arrives on our port with the name it was
+/// sent out of, when that port exists and is enabled. Only loopback sources:
+/// the lab has no other wire. Whether discovery is active there is
+/// `record_neighbor`'s check.
+fn lab_interface(cfg: &Config, sent_on: &str, src: IpAddr) -> Option<IfName> {
+    if !src.is_loopback() {
+        return None;
+    }
+    let name: IfName = sent_on.parse().ok()?;
+    cfg.interfaces
+        .get(&name)
+        .filter(|i| !i.disabled)
+        .map(|_| name)
 }
 
 /// Announcement → table row (pure).
@@ -491,6 +583,26 @@ mod tests {
             "ether2"
         );
         assert!(arrival_interface(&cfg, &t, None, "192.0.2.1".parse().unwrap()).is_none());
+    }
+
+    #[test]
+    fn lab_port_is_the_same_name_from_loopback_only() {
+        let mut s = Session::virtual_lab();
+        s.execute(
+            "interface.set",
+            &json!({ "name": "ether2", "disabled": true }),
+        )
+        .unwrap();
+        let cfg = s.store().running();
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        assert_eq!(lab_interface(cfg, "ether1", lo).unwrap().as_str(), "ether1");
+        assert!(lab_interface(cfg, "ether1", "::1".parse().unwrap()).is_some());
+        // Real network, disabled port, unknown port, garbage name.
+        assert!(lab_interface(cfg, "ether1", "10.0.0.2".parse().unwrap()).is_none());
+        assert!(lab_interface(cfg, "ether2", lo).is_none());
+        assert!(lab_interface(cfg, "ether99", lo).is_none());
+        assert!(lab_interface(cfg, "", lo).is_none());
+        assert!(lab_interface(cfg, "a b\n", lo).is_none());
     }
 
     #[test]
