@@ -19,4 +19,4 @@ Leia primeiro: [AGENTS.md](AGENTS.md), [docs/architecture.md](docs/architecture.
 [docs/gaps.md](docs/gaps.md), [docs/mcp.md](docs/mcp.md),
 [docs/control-protocol.md](docs/control-protocol.md).
 
-Licença: ainda não definida (G0.1).
+Licença: [GNU AGPL-3.0-or-later](LICENSE). Quem distribuir uma versão modificada, ou oferecê-la como serviço pela rede, precisa publicar o código-fonte dela.
