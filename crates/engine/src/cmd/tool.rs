@@ -34,7 +34,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     .positional("address")
     .task(),
     cmd!(query "tool.mtr.start", "MTR", ["Tools", "MTR"], None,
-        "{address: string, count?: int 0..1000000 (rounds, 0 = until stopped), interval_ms?: int 100..60000, timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, columns}",
+        "{address: string, count?: int 0..1000000 (rounds, 0 = until stopped), interval_ms?: int 100..60000, timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string, use_dns?: bool (default true: hop names by PTR), as_lookup?: bool (default false: origin AS via Team Cymru DNS)} → {id, task_id, columns}",
         can_start, mtr_start)
     .alias("traceroute,mtr")
     .positional("address")
@@ -303,6 +303,8 @@ fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
         max_hops: narrow("max_hops", max_hops)?,
         size: narrow("size", size)?,
         options,
+        use_dns: opt_bool(p, "use_dns")?.unwrap_or(true),
+        as_lookup: opt_bool(p, "as_lookup")?.unwrap_or(false),
     };
     let id = s.start_task("mtr", title("mtr", &targets), move |ctx| {
         mtr::run(job, prober.as_ref(), ctx)
@@ -310,7 +312,7 @@ fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({
         "id": id,
         "task_id": id,
-        "columns": ["round", "hop", "address", "rtt_ms", "status"],
+        "columns": ["round", "hop", "address", "rtt_ms", "status", "mpls"],
     }))
 }
 
@@ -462,6 +464,31 @@ mod tests {
         assert_eq!(p["kind"], "mtr");
         assert_eq!(p["summary"]["reached"], true);
         assert!(p["summary"]["hops"].as_array().unwrap().len() >= 2);
+        // G6.3b: names by default, AS numbers when asked, in the text too.
+        let last = p["summary"]["hops"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(last["name"], "host-8-8-8-8.sim-dest.example");
+        assert!(last["asn"].is_null(), "as_lookup is off by default");
+        let r = s
+            .execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "count": 1, "interval_ms": 100, "timeout_ms": 50,
+                        "use_dns": false, "as_lookup": true}),
+            )
+            .unwrap();
+        let id = r["task_id"].as_u64().unwrap();
+        let p = until_done(&mut s, id);
+        let last = p["summary"]["hops"].as_array().unwrap().last().unwrap().clone();
+        assert!(last["name"].is_null());
+        assert_eq!((last["asn"].as_u64(), last["as_name"].as_str()), (Some(64_999), Some("SIM-DEST")));
+        let t = s
+            .execute("tool.task.poll", &json!({"id": id, "text": true}))
+            .unwrap();
+        let table = t["summary_lines"].as_array().unwrap();
+        assert!(table.iter().any(|l| l.as_str().unwrap().ends_with("AS64999 SIM-DEST")), "{table:?}");
+        assert!(
+            s.execute("tool.mtr.start", &json!({"address": "8.8.8.8", "use_dns": "maybe"}))
+                .is_err()
+        );
         assert!(
             s.execute(
                 "tool.mtr.start",

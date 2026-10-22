@@ -330,6 +330,37 @@ impl Resolver {
     }
 }
 
+impl Resolver {
+    /// PTR names or TXT texts (`rtype`) of `name`, from the cache or
+    /// asked; a name that does not exist, or has none, gives no records
+    /// (G6.3b).
+    pub fn records(
+        &self,
+        t: &mut dyn Transport,
+        name: &str,
+        rtype: RecordType,
+    ) -> Result<Vec<String>, ResolveError> {
+        let qn = parse_name(name)?;
+        if special_use(&qn).is_some() {
+            return Ok(Vec::new());
+        }
+        Ok(self.resolve(t, &qn, rtype, None)?.answer.texts())
+    }
+
+    /// The name of `ip` (its first PTR, RFC 1035 §3.5 / RFC 3596 §2.5).
+    pub fn reverse(
+        &self,
+        t: &mut dyn Transport,
+        ip: IpAddr,
+    ) -> Result<Option<String>, ResolveError> {
+        let name = crate::reverse::reverse_name(ip);
+        Ok(self
+            .records(t, &name, RecordType::PTR)?
+            .first()
+            .map(|n| crate::reverse::printable(n, crate::message::MAX_NAME_LEN)))
+    }
+}
+
 /// RFC 6761 §6.3: `localhost` is the loopback, never asked upstream;
 /// §6.4: `invalid` never exists.
 fn special_use(qn: &QName) -> Option<Result<Vec<IpAddr>, ResolveError>> {
@@ -504,6 +535,8 @@ mod tests {
         Truncate([u8; 4]),
         /// A stray reply (other id) first, then the real one.
         Spoofed([u8; 4]),
+        /// PTR → `router-<first label>.example`; TXT → Team Cymru answers.
+        Reverse,
     }
 
     struct Fake {
@@ -551,6 +584,7 @@ mod tests {
                     Some((300, 300)),
                 )
             };
+            let qtype = Message::from_vec(query).unwrap().queries[0].query_type();
             let out = match self
                 .servers
                 .get(&server.ip())
@@ -562,6 +596,32 @@ mod tests {
                 Behave::ServFail => Some(reply(query, ResponseCode::ServFail, vec![], None)),
                 Behave::NxDomain => {
                     Some(reply(query, ResponseCode::NXDomain, vec![], Some((60, 60))))
+                }
+                Behave::Reverse => {
+                    use hickory_proto::rr::rdata::{PTR, TXT};
+                    use hickory_proto::rr::{RData, Record};
+                    let n = crate::message::tests::name(&owner);
+                    let data = match qtype {
+                        RecordType::PTR => {
+                            let first = owner.split('.').next().unwrap_or("x");
+                            RData::PTR(PTR(crate::message::tests::name(&format!(
+                                "router-{first}.example"
+                            ))))
+                        }
+                        RecordType::TXT if owner.starts_with("AS") => RData::TXT(TXT::new(vec![
+                            "64500 | ZZ | lab | 2026-01-01 | SIM-TRANSIT, ZZ".into(),
+                        ])),
+                        RecordType::TXT => RData::TXT(TXT::new(vec![
+                            "64500 | 198.51.100.0/24 | ZZ | lab | 2026-01-01".into(),
+                        ])),
+                        _ => RData::A(hickory_proto::rr::rdata::A([192, 0, 2, 1].into())),
+                    };
+                    Some(reply(
+                        query,
+                        ResponseCode::NoError,
+                        vec![Record::from_rdata(n, 300, data)],
+                        None,
+                    ))
                 }
                 Behave::Truncate(ip) if tcp => Some(answer(ip)),
                 Behave::Truncate(_) => {
@@ -730,6 +790,31 @@ mod tests {
             Err(ResolveError::BadName(_))
         ));
         assert!(t.log.is_empty());
+    }
+
+    #[test]
+    fn reverse_names_and_as_numbers_are_cached() {
+        let r = resolver(&["192.0.2.53"]);
+        let mut t = Fake::new(&[("192.0.2.53", Behave::Reverse)]);
+        let hop = ip("198.51.100.7");
+        assert_eq!(
+            r.reverse(&mut t, hop).unwrap().as_deref(),
+            Some("router-7.example")
+        );
+        assert_eq!(t.log.len(), 1);
+        r.reverse(&mut t, hop).unwrap();
+        assert_eq!(t.log.len(), 1, "PTR from the cache");
+        let o = crate::asn::lookup(&r, &mut t, hop).unwrap().unwrap();
+        assert_eq!((o.asn, o.name.as_deref()), (64500, Some("SIM-TRANSIT")));
+        assert_eq!(o.prefix.as_deref(), Some("198.51.100.0/24"));
+        assert_eq!(t.log.len(), 3, "origin and AS name");
+        crate::asn::lookup(&r, &mut t, hop).unwrap();
+        assert_eq!(t.log.len(), 3, "both TXT answers from the cache");
+        let rows = r.cache_rows(t.now);
+        assert!(
+            rows.iter()
+                .any(|row| row.qtype == "PTR" && row.name == "7.100.51.198.in-addr.arpa")
+        );
     }
 
     #[test]

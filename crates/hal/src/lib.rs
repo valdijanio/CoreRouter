@@ -7,6 +7,7 @@
 
 pub mod dhcp;
 pub mod drift;
+pub mod icmp_ext;
 pub mod nic;
 pub mod probe;
 pub mod sff;

@@ -9,6 +9,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+corerouter-buildinfo.workspace = true
 corerouter-engine.workspace = true
 corerouter-shell.workspace = true
 egui.workspace = true
@@ -18,6 +19,7 @@ serde_json.workspace = true
 [dev-dependencies]
 corerouter-hal.workspace = true
 corerouter-model.workspace = true
+corerouter-proto-dns.workspace = true
 
 [lints]
 workspace = true

@@ -3,13 +3,17 @@
 //! `server`, a chain of stages in front of the same resolver and cache).
 //! The full server on `hickory-server` (G4.1c) builds on the same config
 //! (`/ip dns`, docs/architecture.md "DNS", docs/dns.md).
+//! PTR and the Team Cymru TXT answers give MTR hops a name and an AS
+//! number (G6.3b).
 //!
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
+pub mod asn;
 pub mod cache;
 pub mod message;
 pub mod resolver;
+pub mod reverse;
 pub mod server;
 
 use corerouter_model::dns::AllowedFrom;

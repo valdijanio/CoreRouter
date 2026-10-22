@@ -1,6 +1,6 @@
 # Ferramentas de diagnóstico (Tools)
 
-Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) e G6.3 (MTR) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
+Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR) e G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
 jitter, percentis, histograma, alertas e exportação.
 
 ## 1. Tarefas (G6.1)
@@ -129,6 +129,44 @@ routing_table?}` — traceroute contínuo, IPv4 e IPv6:
 Perda que começa num salto e continua até o destino é um enlace com perda; perda num salto só
 (o resto 0 %) é um roteador que limita respostas ICMP — a leitura é a mesma do `mtr`.
 
+### 4.2 Nomes, ASN, privado/CGNAT e MPLS (G6.3b)
+
+`tool.mtr.start` ganha `use_dns?` (padrão `true`, como o `mtr`; no RouterOS o `use-dns` do
+`/tool traceroute` vem desligado) e `as_lookup?` (padrão `false`, como o `-z` do `mtr`: manda os
+endereços dos saltos, via o DNS configurado, ao serviço público da Team Cymru). No terminal:
+`/tool traceroute 8.8.8.8 use-dns=no as-lookup=yes`.
+
+- **Nome (PTR).** O resolvedor do roteador (`/ip dns`, G4.1a) consulta
+  `<endereço invertido>.in-addr.arpa` (RFC 1035 §3.5) ou `ip6.arpa` (RFC 3596 §2.5), com o mesmo
+  cache. A consulta **não espera**: o prober responde `Pending`, o daemon faz a consulta em 4
+  threads próprias (fila de até 256) e o MTR pergunta de novo na volta seguinte; o IP aparece
+  na hora e o nome entra quando chega. Uma execução com `count` espera até 3 s no fim pelos
+  nomes que faltam. Respostas (e falhas) ficam 5 min na fila do daemon; o cache do resolvedor
+  segue o TTL.
+- **ASN.** Duas consultas TXT: `<invertido>.origin.asn.cymru.com` (IPv6: `origin6`) →
+  `"3356 | 4.0.0.0/9 | US | arin | …"` (com vários prefixos, o mais específico; com várias
+  origens, a primeira) e `AS3356.asn.cymru.com` → nome curto (`LEVEL3`).
+- **Privado/CGNAT.** `10/8`, `172.16/12`, `192.168/16` (RFC 1918) e `fc00::/7` (RFC 4193) são
+  `private`; `100.64.0.0/10` (RFC 6598) é `cgnat`; `169.254/16`/`fe80::/10` `link-local`;
+  loopback. Esses não são consultados: a RFC 6598 §4 diz que a reversa do espaço compartilhado
+  "MUST NOT be forwarded to the global DNS", e a RFC 6303 §3 manda servir as zonas reversas
+  privadas localmente.
+- **MPLS.** O roteador que descarta o probe dentro de um LSP cita a pilha de rótulos que
+  recebeu no objeto MPLS Label Stack (RFC 4950, classe 1, C-Type 1), dentro das extensões ICMP
+  da RFC 4884. Codec puro em `crates/hal/src/icmp_ext.rs`: comprimento do datagrama original no
+  octeto 5 (ICMPv4, palavras de 32 bits) ou 4 (ICMPv6, 64 bits), mínimo de 128 octetos, versão
+  2, checksum certo ou zero (§7); sem comprimento, procura em 128 como manda o §5.5 para
+  remetentes antigos (o `mtr` só faz isso). Só o **raw socket** vê os rótulos: o ping socket
+  recebe pela fila de erros o nosso probe, não a mensagem do roteador.
+
+Resumo por salto (do primeiro endereço): `name`, `asn`, `as_name`, `scope`, `mpls_text`
+(`L=24017` ou `L=16005/24003`, topo primeiro) e `hosts_info: [{address, name, name_pending, asn,
+as_name, as_prefix, scope, mpls: [{label, tc, bottom, ttl}], mpls_text}]`; o evento por probe
+ganha `mpls`. O texto do terminal mostra `nome (IP) [private]`, a coluna `ASN` (`AS3356 LEVEL3`,
+`AS???` sem resposta) e uma linha `MPLS L=… TC=… S=… TTL=…` por rótulo, como o `-e` do `mtr`.
+A janela Tools › MTR tem as caixas **Use DNS** e **AS lookup**, o nome em cima e o IP embaixo
+(menor), e as colunas ASN e MPLS quando há o que mostrar.
+
 ## 5. Quem envia os pacotes
 
 O engine só fala com o trait `corerouter_hal::probe::Prober` (L1): `resolve`, `open` →
@@ -176,7 +214,12 @@ O resumo diz qual (`summary.prober`). Regras da rede simulada (primeira que casa
 Nomes resolvem para `198.18.0.0/15` (faixa de benchmark, RFC 2544), exceto `localhost`
 (`127.0.0.1`, `::1`) e nomes sob `.invalid` (não encontrados). O enlace local do roteador
 simulado tem MTU 1500 (DF maior falha localmente). Roteadores intermediários respondem TTL
-exceeded de `100.64.<salto>.x` (IPv6 `fd00::<salto>:x`); um em cada sete fica calado.
+exceeded (um em cada sete fica calado): o 1º salto de `10.0.0.x` (privado; IPv6 `fd00::1:x`), o
+2º de `100.64.2.x` (CGNAT), os outros de `198.19.<salto>.x` (IPv6 `2001:db8:ffff::<salto>:x`).
+Os públicos têm nome `ae…-<salto>.core….sim-transit.example` (um em cada cinco sem PTR), os
+saltos 3–5 são AS64500 `SIM-ACCESS`, os seguintes AS64510 `SIM-TRANSIT` e os destinos AS64999
+`SIM-DEST` (`host-a-b-c-d.sim-dest.example`); ASNs de uso privado (RFC 6996). Em caminhos de 5
+saltos ou mais, do 3º ao antepenúltimo há rótulo MPLS, o do meio com dois.
 
 A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
 
