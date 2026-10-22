@@ -361,8 +361,13 @@ maybe_fold() {
     --title "docs: consolida docs/changes ($pending arquivos)" \
     --body "Fold da fila de entrada (scripts/land.sh)." | grep -o '[0-9]*$')
   checks_or_stop "$fpr" "$(git rev-parse HEAD)"
-  gh pr merge -R "$repo" "$fpr" --squash --delete-branch --match-head-commit "$(git rev-parse HEAD)" ||
+  # Sem --delete-branch: o GitHub já apaga a branch no merge, e o 404 de apagar de novo fazia o
+  # gh sair com erro depois de um merge que deu certo (a fila parou assim em #120).
+  if ! gh pr merge -R "$repo" "$fpr" --squash --match-head-commit "$(git rev-parse HEAD)" &&
+    [ "$(gh pr view -R "$repo" "$fpr" --json state --jq .state)" != MERGED ]; then
     stop "$fpr" "o merge do fold foi recusado"
+  fi
+  git push --quiet origin --delete "$fb" 2>/dev/null || true
   say "  fold #$fpr entrou ($pending arquivos)"
   cd "$root"
   git worktree remove --force "$wt"
