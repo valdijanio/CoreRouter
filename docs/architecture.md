@@ -88,6 +88,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha em loopback, `dispatch`, `Host`, `Client` | L0–L3 |
+| L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
 | L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe) | L0–L4 + egui |
 | L6 | `apps/corerouter-{daemon,gui,cli}` | Binários; únicos que escolhem backend de plataforma e janela | tudo |
@@ -110,6 +111,7 @@ CoreRouter/
 │   ├── engine/           # L3: src/cmd/{mod,args,interface,ip,routing,system,config}.rs
 │   ├── control/          # L4
 │   ├── mcp/              # L4
+│   ├── storage-fs/       # L4: persistência da config em arquivo
 │   └── ui/               # L5
 ├── apps/
 │   ├── corerouter-daemon/
@@ -141,6 +143,21 @@ Modos: `immediate` (RouterOS: cada comando vira revisão) e `transactional` (VyO
 `config.diff` → `config.commit`; `config.rollback {revision}` carrega histórico). Safe Mode do
 RouterOS (commit confirmado com rollback automático) é G1.4.
 
+### Persistência (G0.6)
+
+Todo commit bem-sucedido grava running + histórico (`model::persist::encode`, JSON com
+`format_version`) num `ConfigStorage` (trait do engine, sem I/O). No boot,
+`Session::with_storage` tenta o slot `current` e depois o `previous`; o que não decodifica
+(truncado, lixo, versão desconhecida, invariantes quebradas) vai para quarentena (`*.corrupt`) e
+gera `storage.boot_errors` no `state.inspect`. Nada legível → config descoberta dos ports. O
+candidate nunca é gravado (edição não commitada não sobrevive a reinício, como no Junos/VyOS).
+
+| Backend | Onde | Uso |
+|---|---|---|
+| `MemoryStorage` | engine | GUI, wasm, testes, daemon em lab sem `--config-dir` |
+| `FileStorage` | `storage-fs` (L4) | daemon: temp + fsync → rename current→prev → rename temp→current → fsync do diretório |
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).
+- 2026-10-21 — G0.6: crate `storage-fs` (L4) e seção de persistência.

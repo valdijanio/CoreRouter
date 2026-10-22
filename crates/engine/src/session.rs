@@ -3,11 +3,12 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use corerouter_hal::{Hal, VirtualHal};
-use corerouter_model::{Config, ConfigStore, Interface, InterfaceKind};
+use corerouter_model::{Config, ConfigStore, Interface, InterfaceKind, persist};
 use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cmd::{self, check_params, unknown_command};
+use crate::storage::{ConfigStorage, MemoryStorage, Slot};
 use crate::validate::validate_all;
 use crate::{EngineError, Result, guard};
 
@@ -30,9 +31,23 @@ pub struct JournalEntry {
     pub error: Option<String>,
 }
 
+/// Persistence health, shown under `storage` in the `state.inspect` summary.
+#[derive(Debug, Clone, Serialize)]
+pub struct StorageStatus {
+    pub backend: String,
+    /// Slot the running config was restored from at boot (`None`: fresh start).
+    pub loaded_from: Option<&'static str>,
+    /// Unreadable slots found at boot (they were quarantined).
+    pub boot_errors: Vec<String>,
+    /// Last save failure; cleared by the next successful save.
+    pub last_error: Option<String>,
+}
+
 pub struct Session {
     store: ConfigStore,
     hal: Box<dyn Hal>,
+    storage: Box<dyn ConfigStorage>,
+    storage_status: StorageStatus,
     mode: CommitMode,
     journal: Vec<JournalEntry>,
     seq: u64,
@@ -56,25 +71,46 @@ pub const MAX_BATCH: usize = 256;
 
 impl Session {
     /// Build a session on `hal`, seeding one interface per discovered port.
-    pub fn new(mut hal: Box<dyn Hal>) -> Self {
-        let mut initial = Config::default();
-        match hal.discover_links() {
-            Ok(links) => {
-                for l in links {
-                    let mut iface = Interface::new(l.name.clone(), InterfaceKind::Ethernet);
-                    iface.mtu = l.mtu;
-                    iface.mac = l.mac.and_then(|m| m.parse().ok());
-                    initial.interfaces.insert(l.name, iface);
+    /// Nothing outlives the process (in-memory storage).
+    pub fn new(hal: Box<dyn Hal>) -> Self {
+        Self::with_storage(hal, Box::new(MemoryStorage::default()))
+    }
+
+    /// Build a session that restores the committed config from `storage`
+    /// (newest readable slot) and saves it there after every commit. With
+    /// nothing readable stored, it starts from the discovered ports.
+    pub fn with_storage(mut hal: Box<dyn Hal>, mut storage: Box<dyn ConfigStorage>) -> Self {
+        let (restored, boot_errors) = restore(storage.as_mut());
+        let mut status = StorageStatus {
+            backend: storage.describe(),
+            loaded_from: None,
+            boot_errors,
+            last_error: None,
+        };
+        let store = match restored {
+            Some((store, slot)) => {
+                log::info!(
+                    "restored revision {} from {} ({})",
+                    store.current_revision(),
+                    slot.name(),
+                    status.backend
+                );
+                for issue in validate_all(store.running()) {
+                    log::warn!("restored config: {issue}");
                 }
+                if let Err(e) = hal.apply(&Config::default(), store.running()) {
+                    log::error!("restored config not applied: {e}");
+                }
+                status.loaded_from = Some(slot.name());
+                store
             }
-            Err(e) => log::warn!("link discovery failed: {e}"),
-        }
-        if let Err(e) = hal.apply(&Config::default(), &initial) {
-            log::warn!("initial apply skipped: {e}");
-        }
+            None => ConfigStore::new(discovered(hal.as_mut())),
+        };
         Self {
-            store: ConfigStore::new(initial),
+            store,
             hal,
+            storage,
+            storage_status: status,
             mode: CommitMode::Immediate,
             journal: Vec::new(),
             seq: 0,
@@ -182,7 +218,27 @@ impl Session {
         self.hal
             .apply(self.store.running(), self.store.candidate())
             .map_err(|e| EngineError::Hal(e.to_string()))?;
-        Ok(self.store.commit(comment, self.hal.now_unix())?)
+        let revision = self.store.commit(comment, self.hal.now_unix())?;
+        self.save();
+        Ok(revision)
+    }
+
+    /// Persist running + history. A failure does not undo the commit (the
+    /// data plane already runs it): it is logged and shown by `state.inspect`.
+    fn save(&mut self) {
+        let saved = persist::encode(&self.store)
+            .map_err(|e| e.to_string())
+            .and_then(|text| self.storage.save(&text).map_err(|e| e.to_string()));
+        match saved {
+            Ok(()) => self.storage_status.last_error = None,
+            Err(e) => {
+                log::error!(
+                    "revision {} is running but was not saved: {e}",
+                    self.store.current_revision()
+                );
+                self.storage_status.last_error = Some(e);
+            }
+        }
     }
 
     fn record(&mut self, id: &str, params: &Value, result: &Result<Value>) {
@@ -216,6 +272,7 @@ impl Session {
                 "revision": self.store.current_revision(),
                 "dirty": self.store.is_dirty(),
                 "pending_changes": self.store.diff().len(),
+                "storage": self.storage_status,
                 "counts": {
                     "interfaces": cand.interfaces.len(),
                     "ip_addresses": cand.ip.addresses.len(),
@@ -270,6 +327,60 @@ impl Session {
     pub fn journal(&self) -> &[JournalEntry] {
         &self.journal
     }
+
+    pub fn storage_status(&self) -> &StorageStatus {
+        &self.storage_status
+    }
+}
+
+/// Default config: one Ethernet interface per discovered port, applied.
+fn discovered(hal: &mut dyn Hal) -> Config {
+    let mut initial = Config::default();
+    match hal.discover_links() {
+        Ok(links) => {
+            for l in links {
+                let mut iface = Interface::new(l.name.clone(), InterfaceKind::Ethernet);
+                iface.mtu = l.mtu;
+                iface.mac = l.mac.and_then(|m| m.parse().ok());
+                initial.interfaces.insert(l.name, iface);
+            }
+        }
+        Err(e) => log::warn!("link discovery failed: {e}"),
+    }
+    if let Err(e) = hal.apply(&Config::default(), &initial) {
+        log::warn!("initial apply skipped: {e}");
+    }
+    initial
+}
+
+/// Newest readable slot, quarantining the unreadable ones on the way.
+fn restore(storage: &mut dyn ConfigStorage) -> (Option<(ConfigStore, Slot)>, Vec<String>) {
+    let mut errors = Vec::new();
+    for slot in [Slot::Current, Slot::Previous] {
+        let text = match storage.load(slot) {
+            Ok(Some(text)) => text,
+            Ok(None) => continue,
+            Err(e) => {
+                log::error!("cannot read {} config: {e}", slot.name());
+                errors.push(format!("{}: {e}", slot.name()));
+                continue;
+            }
+        };
+        match persist::decode(&text) {
+            Ok(store) => return (Some((store, slot)), errors),
+            Err(e) => {
+                log::error!("{} config is unreadable, quarantined: {e}", slot.name());
+                errors.push(format!("{}: {e}", slot.name()));
+                if let Err(q) = storage.quarantine(slot) {
+                    log::error!("cannot quarantine {} config: {q}", slot.name());
+                }
+            }
+        }
+    }
+    if !errors.is_empty() {
+        log::error!("no readable saved config; starting from discovered ports");
+    }
+    (None, errors)
 }
 
 /// Replace `"$N.key.sub"` strings with values from earlier step results.

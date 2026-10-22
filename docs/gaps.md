@@ -18,7 +18,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G0.3 | Autenticação e TLS no canal de controle | control, daemon | `rustls`, tokens por usuário, grupos read/write/full (como RouterOS); bind não-loopback só com TLS; testes de recusa | 12 h | aberto |
 | G0.4 | GUI como cliente remoto + WebSocket para WASM | ui, control, gui, daemon | Trait de backend na UI (local/remoto); daemon serve WS; GUI web gerencia um roteador real | 14 h | aberto |
 | G0.5 | Fuzzing | engine, control, mcp | `cargo-fuzz` para JSON de config, `read_line_bounded`, `handle_message`; rodada de 10 min sem crash | 6 h | aberto |
-| G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa | 6 h | aberto |
+| G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa. Feito: `model::persist` (JSON `format_version` 1), trait `engine::ConfigStorage`, crate `storage-fs` (L4), `corerouter-daemon --config-dir` | 6 h | feito (`stream/G0.6-persistence`) |
 | G0.7 | MCP completo | mcp | resources (`corerouter://state`, `command/{id}`), prompts, completions, progresso/cancelamento, erro `-32003` (motor ocupado) | 10 h | aberto |
 | G0.8 | CLI interativa estilo RouterOS | cli, engine | `/ip address add address=… interface=…` traduzido para comandos; autocompletar a partir do registro | 10 h | aberto |
 
@@ -75,3 +75,4 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — lista inicial.
 - 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).
 - 2026-10-21 — G1.1 feito (VLAN, bridge, loopback, `interface.remove`); bonding separado em G1.8.
+- 2026-10-21 — G0.6 feito (persistência: `running.json` + `.prev`, escrita atômica, quarentena).
