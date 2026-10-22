@@ -487,6 +487,26 @@ mesmo dia pode variar.
   saneador. Testes: 32 no `proto-dhcp`, 15 de integração no engine, netns com daemon real e
   servidor DHCP em Rust (concessão + rotas no kernel em ~3 s **medido**), UI headless, terminal.
 
+- 2026-10-22 — G1.20: abas do diálogo de interface (parte 2), a pedido do usuário.
+  `interface.ethernet.set` (autonegociação, velocidade/duplex forçados, modos anunciados com nomes
+  do kernel ou do RouterOS 7.12+, controle de fluxo on/off/auto, offloads, `reset`) validado contra
+  o que a porta diz antes de aplicar; na config (`Interface::ethernet`), journal, histórico,
+  rollback e Safe Mode. Porta de gerência (a do IP do cliente remoto, via VLAN/bridge/VRF): mudança
+  de link e teste de cabo pedem Safe Mode ou `force`. SFP/SFP+/QSFP: `hal::sff` decodifica
+  SFF-8472/8636 (calibração externa, checksums, limites do módulo) com proptest e 4 dumps reais
+  publicados; `interface.ethernet.monitor` ganha `sfp` (identidade, DOM, níveis, alertas);
+  `engine::dom_watch` registra só as travessias de limite (e insere/remove), a cada monitor e a
+  cada 30 s. Teste de cabo como tarefa (G6.1), resultado por par e `cable-pairs` do RouterOS.
+  `hal-linux`: `LINKMODES_SET`/`PAUSE_SET`/`FEATURES_SET` com retrato da porta antes da primeira
+  mudança (tirar da config restaura), `MODULE_EEPROM_GET`, `CABLE_TEST_ACT` + notificação do grupo
+  `monitor`; tudo ou nada no `apply`. `VirtualHal`: ether8 vira gaiola SFP+ com módulo e DOM, teste
+  de cabo com um par em curto no ether7. GUI: abas Ethernet (form + offloads + "Cable Test" +
+  "Reset to Port Defaults", cinza com o motivo) e SFP (DOM colorido por nível, `SFP ⚠` na aba).
+  Testes: codec SFF (dumps reais + proptest), parser da notificação de cabo (proptest), engine
+  (sucesso, validação, rollback, Safe Mode e queda da conexão, plataforma sem ethtool, tarefa),
+  netns sem root com veth (offloads aplicados e restaurados no kernel; link/pause/EEPROM/cabo pelo
+  caminho "não suportado"), headless das abas; screenshots conferidos. Fora: LED (ioctl), `/export`
+  de `/interface ethernet`, FEC. Esforço do agente ~5 h (**estimado**).
 - 2026-10-22 — G0.9: `cargo xtask bench` (criterion 0.8 como dev-dependency, sem plots/rayon).
   Um build de todos os `benches/` e um resumo legível (mediana, IC 95%, tempo por item, variação
   contra a rodada anterior ou `--baseline <nome>`; `--save-baseline`, `--quick`, `--markdown`
@@ -522,6 +542,14 @@ mesmo dia pode variar.
   (bloquear 127.0.0.1 pela própria GUI → janela → Safe Mode e aplicar) conferidos em screenshot.
   Esforço do agente ~6 h (**estimado**).
 - 2026-10-22 — processo: proteção da main sem "branch atualizada" (strict=false) para dar vazão; workflow `main-red` abre/fecha a issue "main quebrada" quando o CI da main falha/volta; AGENTS.md: trazer a main antes do PR, main vermelha é prioridade zero, ids de gap só do brief/main, sessões não abrem sessões, PRs pequenos, pontos quentes com mudanças mínimas. Medido antes: CI de PR mediana 2,0 min, 1,6 execuções por PR.
+- 2026-10-22 — processo: workflow `pr-sync` (`scripts/pr-sync.sh`): a cada push na `main`, os PRs
+  com auto-merge que o GitHub marca CONFLICTING recebem o merge de verdade da `main` (o GitHub
+  ignora o `merge=union` e marcava conflito só por causa de `docs/log.md`/`docs/gaps-history.md`);
+  merge limpo → push do bot e `ci` disparado por `workflow_dispatch` (push com GITHUB_TOKEN não
+  dispara workflows); conflito real → comentário com os arquivos e rótulo `conflito`, sem push.
+  O `ci` ganhou `workflow_dispatch`. Testado localmente com repositório e `gh` falsos (union limpo
+  enviado, conflito real só comentado). Observado antes: com o merge do #37, #40/#41/#42 viraram
+  CONFLICTING no GitHub e o merge local do #40 saiu limpo.
 - 2026-10-22 — G1.21: hierarquia das janelas internas, a pedido do usuário (com um diálogo aberto,
   clicar na lista o mandava para trás, e pedir os detalhes de novo não o trazia de volta). Um lugar
   só, `Floats` em `crates/ui/src/float.rs`: relação filho→pai por janela (`Floats::adopt`, ligada

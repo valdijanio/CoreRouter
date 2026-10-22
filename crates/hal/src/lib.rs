@@ -8,6 +8,7 @@
 pub mod dhcp;
 pub mod nic;
 pub mod probe;
+pub mod sff;
 pub mod sim;
 pub mod virt;
 
@@ -16,8 +17,12 @@ use corerouter_model::{Config, IfName};
 use serde::Serialize;
 
 pub use dhcp::{DhcpPort, DhcpResponder, SharedResponder};
-pub use nic::{Counter, CounterGroup, EthernetMonitor, LinkCounters, NicHardware, Offload};
+pub use nic::{
+    CablePair, CableTest, CableTestResult, Counter, CounterGroup, EthernetMonitor, LinkCounters,
+    NicHardware, Offload,
+};
 pub use probe::{Prober, SharedProber};
+pub use sff::SfpModule;
 pub use sim::SimProber;
 pub use virt::VirtualHal;
 
@@ -155,6 +160,25 @@ pub trait Hal: Send {
     fn counters(&mut self, name: &IfName) -> Result<LinkCounters, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no counters for '{name}'",
+            self.describe()
+        )))
+    }
+
+    /// The pluggable module in `name`'s cage, decoded (G1.20). An empty
+    /// cage is `Ok` with `module_present: false`; a port without a cage
+    /// is `Unsupported`.
+    fn sfp_module(&mut self, name: &IfName) -> Result<SfpModule, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} reads no module EEPROM for '{name}'",
+            self.describe()
+        )))
+    }
+
+    /// A cable test of `name`, to run on a task thread (G1.20): building it
+    /// is cheap and checks what can be checked up front.
+    fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} cannot test the cable of '{name}'",
             self.describe()
         )))
     }

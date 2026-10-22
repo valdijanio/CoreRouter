@@ -15,6 +15,8 @@ use egui::{CollapsingHeader, Grid, RichText, ScrollArea, Ui};
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 use serde_json::{Value, json};
 
+use crate::avail::Avail;
+use crate::ethernet_tab::{self, CABLE_TEST, Cable, EthEdit, SET, TASK_POLL};
 use crate::{CoreRouterUi, Pending, REFRESH_SECS, value_text};
 
 pub(crate) const MONITOR: &str = "interface.ethernet.monitor";
@@ -35,16 +37,20 @@ const NOT_SUPPORTED: &str = "not supported";
 pub(crate) enum Tab {
     #[default]
     General,
+    Ethernet,
     Status,
+    Sfp,
     Hardware,
     Traffic,
     Stats,
 }
 
 impl Tab {
-    pub(crate) const ALL: [Tab; 5] = [
+    pub(crate) const ALL: [Tab; 7] = [
         Tab::General,
+        Tab::Ethernet,
         Tab::Status,
+        Tab::Sfp,
         Tab::Hardware,
         Tab::Traffic,
         Tab::Stats,
@@ -53,7 +59,9 @@ impl Tab {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Tab::General => "General",
+            Tab::Ethernet => "Ethernet",
             Tab::Status => "Status",
+            Tab::Sfp => "SFP",
             Tab::Hardware => "Hardware",
             Tab::Traffic => "Traffic",
             Tab::Stats => "Statistics",
@@ -67,9 +75,14 @@ pub(crate) enum What {
     Monitor,
     Hardware,
     Stats,
+    /// The operator's actions from the Ethernet tab (G1.20).
+    CableStart,
+    CablePoll,
+    Reset,
 }
 
 impl What {
+    /// The periodic queries.
     const ALL: [What; 3] = [What::Monitor, What::Hardware, What::Stats];
 
     fn command(self) -> &'static str {
@@ -77,13 +90,17 @@ impl What {
             What::Monitor => MONITOR,
             What::Hardware => HARDWARE,
             What::Stats => STATS,
+            What::CableStart => CABLE_TEST,
+            What::CablePoll => TASK_POLL,
+            What::Reset => SET,
         }
     }
 
     fn every(self) -> f64 {
         match self {
             What::Hardware => HARDWARE_SECS,
-            What::Monitor | What::Stats => REFRESH_SECS,
+            What::CablePoll => 0.5,
+            _ => REFRESH_SECS,
         }
     }
 }
@@ -119,9 +136,30 @@ pub(crate) struct NicView {
     rates: VecDeque<Rate>,
     /// "Zero view": the value of each (group, counter) when pressed.
     zero: BTreeMap<(String, String), u64>,
+    /// The Ethernet tab's edit buffer (G1.20).
+    pub(crate) eth: EthEdit,
+    pub(crate) cable: Cable,
+    /// "Reset to Port Defaults" was pressed.
+    pub(crate) reset: bool,
+    /// Why the last Ethernet-tab action failed.
+    pub(crate) action_error: Option<String>,
 }
 
 impl NicView {
+    pub(crate) fn monitor_value(&self) -> Option<&Value> {
+        match &self.monitor {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn hardware_value(&self) -> Option<&Value> {
+        match &self.hardware {
+            Some(Ok(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// MAC, factory MAC and L2 MTU for the General tab.
     pub(crate) fn general(&self) -> (Option<String>, Option<String>, Option<String>) {
         let hw = match &self.hardware {
@@ -249,7 +287,15 @@ impl CoreRouterUi {
                 .filter(|w| !view.pending.contains(w))
                 .filter(|w| view.asked.get(w).is_none_or(|t| now - t >= w.every()))
                 .collect();
+            let mut due = due;
+            if let Some(v) = self.nic.get(&name) {
+                due.extend(actions(v, now));
+            }
             for what in due {
+                let params = match self.nic.get_mut(&name) {
+                    Some(v) => action_params(v, what, &name),
+                    None => json!({ "name": name }),
+                };
                 if let Err(why) = self.can.check(what.command()) {
                     if let Some(v) = self.nic.get_mut(&name) {
                         let slot = v.slot(what);
@@ -260,7 +306,7 @@ impl CoreRouterUi {
                 }
                 let req = self.backend.submit(
                     "engine.execute",
-                    json!({"command": what.command(), "params": {"name": name}}),
+                    json!({"command": what.command(), "params": params}),
                 );
                 self.pending.insert(
                     req,
@@ -286,10 +332,89 @@ impl CoreRouterUi {
             return;
         };
         view.pending.remove(&req.what);
-        if let (What::Stats, Ok(v)) = (req.what, &result) {
-            view.sample(now, v);
+        match (req.what, &result) {
+            (What::Stats, Ok(v)) => view.sample(now, v),
+            (What::Monitor, Ok(v)) => view.eth.seed_link(v),
+            (What::Hardware, Ok(v)) => view.eth.seed_offloads(v),
+            _ => {}
         }
-        *view.slot(req.what) = Some(result);
+        match req.what {
+            What::Monitor | What::Hardware | What::Stats => *view.slot(req.what) = Some(result),
+            What::CableStart => {
+                view.cable = match result {
+                    Ok(v) => match v.get("id").and_then(Value::as_u64) {
+                        Some(id) => Cable::Running { id },
+                        None => Cable::Failed(format!("no task id in {v}")),
+                    },
+                    Err(e) => Cable::Failed(e),
+                };
+            }
+            What::CablePoll => match result {
+                Ok(v) if v.get("done") == Some(&Value::Bool(true)) => {
+                    view.cable = if v.get("state").and_then(Value::as_str) == Some("done") {
+                        Cable::Done(v.get("summary").cloned().unwrap_or(Value::Null))
+                    } else {
+                        let why = v.get("reason").map(value_text).unwrap_or_default();
+                        Cable::Failed(format!(
+                            "cable test {}: {why}",
+                            v.get("state").map(value_text).unwrap_or_default()
+                        ))
+                    };
+                }
+                Ok(_) => {}
+                Err(e) => view.cable = Cable::Failed(e),
+            },
+            What::Reset => match result {
+                Ok(_) => {
+                    // The form starts over from the router's next answers.
+                    view.eth = EthEdit::default();
+                    view.action_error = None;
+                    view.asked.remove(&What::Monitor);
+                    view.asked.remove(&What::Hardware);
+                }
+                Err(e) => view.action_error = Some(e),
+            },
+        }
+    }
+}
+
+/// The Ethernet tab's actions due now: a pressed button, a running test.
+fn actions(v: &NicView, now: f64) -> Vec<What> {
+    let mut out = Vec::new();
+    let free = |w: What| !v.pending.contains(&w);
+    if v.cable == Cable::Requested && free(What::CableStart) {
+        out.push(What::CableStart);
+    }
+    if matches!(v.cable, Cable::Running { .. })
+        && free(What::CablePoll)
+        && v.asked
+            .get(&What::CablePoll)
+            .is_none_or(|t| now - t >= What::CablePoll.every())
+    {
+        out.push(What::CablePoll);
+    }
+    if v.reset && free(What::Reset) {
+        out.push(What::Reset);
+    }
+    out
+}
+
+/// The params of `what` for window `name` (and the state change it means).
+fn action_params(v: &mut NicView, what: What, name: &str) -> Value {
+    match what {
+        What::CableStart => {
+            v.cable = Cable::Starting;
+            json!({ "name": name })
+        }
+        What::CablePoll => match v.cable {
+            Cable::Running { id } => json!({ "id": id }),
+            _ => json!({ "name": name }),
+        },
+        What::Reset => {
+            v.reset = false;
+            json!({ "name": name, "reset": true })
+        }
+        What::Monitor | What::Hardware | What::Stats => json!({ "name": name }),
     }
 }
 
@@ -298,16 +423,23 @@ impl NicView {
         match what {
             What::Monitor => &mut self.monitor,
             What::Hardware => &mut self.hardware,
-            What::Stats => &mut self.stats,
+            What::Stats | What::CableStart | What::CablePoll | What::Reset => &mut self.stats,
         }
     }
 }
 
-/// The tab buttons on top of the window.
-pub(crate) fn tab_bar(ui: &mut Ui, tab: &mut Tab) {
+/// The tab buttons on top of the window; SFP is coloured while a module
+/// reading is past its thresholds.
+pub(crate) fn tab_bar(ui: &mut Ui, tab: &mut Tab, view: Option<&NicView>) {
+    let alert = view.and_then(ethernet_tab::sfp_alert);
     ui.horizontal(|ui| {
         for t in Tab::ALL {
-            ui.selectable_value(tab, t, t.label());
+            let label = match (t, alert) {
+                (Tab::Sfp, Some(true)) => RichText::new("SFP ⚠").color(ui.visuals().error_fg_color),
+                (Tab::Sfp, Some(false)) => RichText::new("SFP ⚠").color(ui.visuals().warn_fg_color),
+                _ => RichText::new(t.label()),
+            };
+            ui.selectable_value(tab, t, label);
         }
     });
     ui.separator();
@@ -319,6 +451,7 @@ pub(crate) fn body(
     ui: &mut Ui,
     tab: Tab,
     view: Option<&mut NicView>,
+    can: &Avail,
     general: impl FnOnce(&mut Ui, Option<&NicView>),
 ) {
     ui.set_min_width(BODY_WIDTH);
@@ -343,7 +476,9 @@ pub(crate) fn body(
             };
             match tab {
                 Tab::General => {}
+                Tab::Ethernet => ethernet_tab::ethernet(ui, view, can),
                 Tab::Status => status(ui, view),
+                Tab::Sfp => ethernet_tab::sfp(ui, view),
                 Tab::Hardware => hardware(ui, view),
                 Tab::Traffic => traffic(ui, view),
                 Tab::Stats => statistics(ui, view),
