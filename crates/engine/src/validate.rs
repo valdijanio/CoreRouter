@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 
 use corerouter_model::route::{self, FIRST_VRF_TABLE, LAST_VRF_TABLE, Reach};
 use corerouter_model::{
-    Config, IfName, Interface, InterfaceKind, Issue, RouteEntry, RoutingTable, VlanId,
+    BondMode, Config, IfName, Interface, InterfaceKind, Issue, RouteEntry, RoutingTable, VlanId,
 };
 
 pub fn validate_all(cfg: &Config) -> Vec<Issue> {
@@ -55,6 +55,12 @@ fn core_checks(cfg: &Config) -> Vec<Issue> {
         }
         if let Some(vrf) = &iface.vrf {
             vrf_member_checks(cfg, name, iface, vrf, &mut out);
+        }
+        if let Some(bond) = &iface.bond {
+            bond_slave_checks(cfg, name, iface, bond, &mut out);
+        }
+        if let InterfaceKind::Bonding { mode, primary, .. } = &iface.kind {
+            bond_checks(cfg, name, *mode, primary.as_ref(), &mut out);
         }
         if let InterfaceKind::Vrf { table } = iface.kind {
             if !(FIRST_VRF_TABLE..=LAST_VRF_TABLE).contains(&table) {
@@ -258,6 +264,94 @@ fn bridge_port_checks(
             .into_iter()
             .map(|m| Issue::new(format!("interfaces.{name}.bridge"), m)),
     );
+}
+
+/// A slave carries no L3 and nothing else may own it: the bond does.
+fn bond_slave_checks(
+    cfg: &Config,
+    name: &IfName,
+    iface: &Interface,
+    bond: &IfName,
+    out: &mut Vec<Issue>,
+) {
+    let mut problems = Vec::new();
+    match cfg.interfaces.get(bond) {
+        None => problems.push(format!("bond '{bond}' does not exist")),
+        Some(b) if !matches!(b.kind, InterfaceKind::Bonding { .. }) => {
+            problems.push(format!("'{bond}' is not a bond (type {})", b.kind.label()))
+        }
+        Some(b) if b.mtu != iface.mtu => problems.push(format!(
+            "MTU {} differs from the MTU {} of bond '{bond}' (the kernel gives slaves the bond's)",
+            iface.mtu, b.mtu
+        )),
+        Some(_) => {}
+    }
+    if !matches!(iface.kind, InterfaceKind::Ethernet) {
+        problems.push(format!(
+            "'{name}' is a {}; only ethernet ports can be bond slaves",
+            iface.kind.label()
+        ));
+    }
+    if let Some(b) = &iface.bridge {
+        problems.push(format!(
+            "'{name}' is also a port of bridge '{b}'; add '{bond}' to the bridge instead"
+        ));
+    }
+    if let Some(v) = &iface.vrf {
+        problems.push(format!(
+            "'{name}' is also in VRF '{v}'; put '{bond}' in the VRF instead"
+        ));
+    }
+    if cfg.ip.addresses.iter().any(|a| a.interface == *name) {
+        problems.push(format!(
+            "'{name}' has an IP address; addresses go on '{bond}'"
+        ));
+    }
+    if cfg.ip.dhcp_clients.iter().any(|c| c.interface == *name) {
+        problems.push(format!("'{name}' has a DHCP client; run it on '{bond}'"));
+    }
+    if cfg.ipv6.dhcp_clients.iter().any(|c| c.interface == *name) {
+        problems.push(format!("'{name}' has a DHCPv6 client; run it on '{bond}'"));
+    }
+    if let Some(v) = cfg
+        .interfaces
+        .values()
+        .find(|i| matches!(&i.kind, InterfaceKind::Vlan { parent, .. } if parent == name))
+    {
+        problems.push(format!(
+            "VLAN '{}' runs on '{name}'; put it on '{bond}' instead",
+            v.name
+        ));
+    }
+    out.extend(
+        problems
+            .into_iter()
+            .map(|m| Issue::new(format!("interfaces.{name}.bond"), m)),
+    );
+}
+
+fn bond_checks(
+    cfg: &Config,
+    name: &IfName,
+    mode: BondMode,
+    primary: Option<&IfName>,
+    out: &mut Vec<Issue>,
+) {
+    let Some(p) = primary else {
+        return;
+    };
+    let path = format!("interfaces.{name}.kind.primary");
+    if !mode.has_primary() {
+        out.push(Issue::new(
+            path,
+            format!("mode {mode} has no primary slave (active-backup, balance-tlb, balance-alb)"),
+        ));
+    } else if cfg.interfaces.get(p).and_then(|i| i.bond.as_ref()) != Some(name) {
+        out.push(Issue::new(
+            path,
+            format!("'{p}' is not a slave of '{name}'"),
+        ));
+    }
 }
 
 /// Interfaces `name` is stacked on through VLAN parents, nearest first, and

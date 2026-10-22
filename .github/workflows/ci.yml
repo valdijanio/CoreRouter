@@ -121,6 +121,15 @@ jobs:
             echo "COREROUTER_REQUIRE_VRF=0" >> "$GITHUB_ENV"
           fi
 
+      # G1.8: o `bonding` vem no linux-modules base; um user namespace também não o carrega.
+      - name: Carregar o módulo bonding
+        if: github.event_name != 'pull_request'
+        run: |
+          sudo modprobe bonding
+          lsmod | grep -w '^bonding'
+          # Com o módulo carregado, o teste de bonding em netns falha em vez de pular.
+          echo "COREROUTER_REQUIRE_BOND=1" >> "$GITHUB_ENV"
+
       - name: cargo xtask ci
         run: cargo xtask ci ${{ github.event_name == 'pull_request' && '--fast' || '' }}
 

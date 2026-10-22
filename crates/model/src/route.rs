@@ -121,6 +121,12 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
                 format!("'{i}' is a port of bridge '{b}'; route through '{b}' instead"),
             );
         }
+        if let Some(b) = &iface.bond {
+            return invalid(
+                "gateway",
+                format!("'{i}' is a slave of bond '{b}'; route through '{b}' instead"),
+            );
+        }
         let t = table_of(cfg, i);
         if t != r.routing_table {
             return invalid(

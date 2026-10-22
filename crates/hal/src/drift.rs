@@ -86,10 +86,10 @@ pub fn active_addresses(cfg: &Config) -> BTreeSet<(IfName, IpNet)> {
         .collect()
 }
 
-/// Kernel master of `name` (`IFLA_MASTER`): its bridge or its VRF.
+/// Kernel master of `name` (`IFLA_MASTER`): its bridge, bond (G1.8) or VRF.
 pub fn master<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a IfName> {
     let i = cfg.interfaces.get(name)?;
-    i.bridge.as_ref().or(i.vrf.as_ref())
+    i.bridge.as_ref().or(i.bond.as_ref()).or(i.vrf.as_ref())
 }
 
 /// Static routes of `cfg` that belong in the kernel: the usable ones.

@@ -670,10 +670,11 @@ impl Hal for VirtualHal {
             let (mode, _) = corerouter_model::ipv6::ra_mode(cfg, name);
             // The lab forwards IPv6: `yes-if-forwarding-disabled` takes none.
             let accepts = mode == corerouter_model::ipv6::RaMode::On;
-            let enslaved = cfg
-                .interfaces
-                .get(name)
-                .is_some_and(|i| i.bridge.is_some() || matches!(i.kind, InterfaceKind::Vrf { .. }));
+            let enslaved = cfg.interfaces.get(name).is_some_and(|i| {
+                i.bridge.is_some()
+                    || i.bond.is_some()
+                    || matches!(i.kind, InterfaceKind::Vrf { .. })
+            });
             if !accepts || enslaved || !corerouter_model::route::is_up(cfg, name) {
                 continue;
             }

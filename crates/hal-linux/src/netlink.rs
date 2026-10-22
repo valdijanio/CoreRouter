@@ -13,7 +13,7 @@ use std::fmt::Write as _;
 use std::net::{IpAddr, Ipv6Addr};
 
 use corerouter_hal::{Features, HalError, Learned, NO_VRF};
-use corerouter_model::IfName;
+use corerouter_model::{BondMode, HashPolicy, IfName, LacpRate};
 use futures_util::{StreamExt, TryStreamExt};
 use ipnet::{IpNet, Ipv6Net};
 use rtnetlink::packet_route::AddressFamily;
@@ -21,13 +21,14 @@ use rtnetlink::packet_route::address::{
     AddressAttribute, AddressFlags, AddressHeaderFlags, AddressMessage, AddressScope,
 };
 use rtnetlink::packet_route::link::{
-    InfoData, InfoKind, InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State,
+    BondLacpRate, BondMode as KBondMode, BondXmitHashPolicy, InfoBond, InfoData, InfoKind,
+    InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State,
 };
 use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
 };
 use rtnetlink::{
-    Handle, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVlan, LinkVrf,
+    Handle, LinkBond, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVlan, LinkVrf,
     RouteMessageBuilder,
 };
 
@@ -465,6 +466,7 @@ struct Link {
     kind: Option<InfoKind>,
     vlan_id: Option<u16>,
     vrf_table: Option<u32>,
+    bond_mode: Option<KBondMode>,
 }
 
 impl Link {
@@ -487,6 +489,13 @@ impl Link {
                                 for x in v {
                                     if let InfoVlan::Id(id) = x {
                                         l.vlan_id = Some(*id);
+                                    }
+                                }
+                            }
+                            LinkInfo::Data(InfoData::Bond(v)) => {
+                                for x in v {
+                                    if let InfoBond::Mode(m) = x {
+                                        l.bond_mode = Some(*m);
                                     }
                                 }
                             }
@@ -513,6 +522,7 @@ impl Link {
             LinkSpec::Bridge => InfoKind::Bridge,
             LinkSpec::Dummy => InfoKind::Dummy,
             LinkSpec::Vrf { .. } => InfoKind::Vrf,
+            LinkSpec::Bond { .. } => InfoKind::Bond,
         };
         self.kind.as_ref() == Some(&want)
     }
@@ -523,6 +533,7 @@ impl Link {
             && match spec {
                 LinkSpec::Vlan { vlan_id, .. } => self.vlan_id == Some(*vlan_id),
                 LinkSpec::Vrf { table } => self.vrf_table == Some(*table),
+                LinkSpec::Bond { mode, .. } => self.bond_mode == Some(kernel_bond_mode(*mode)),
                 LinkSpec::Bridge | LinkSpec::Dummy => true,
             }
     }
@@ -532,6 +543,28 @@ impl Link {
             Some(k) => format!("{k:?}").to_lowercase(),
             None => "a physical/unknown link".into(),
         }
+    }
+}
+
+fn kernel_bond_mode(m: BondMode) -> KBondMode {
+    match m {
+        BondMode::BalanceRr => KBondMode::BalanceRr,
+        BondMode::ActiveBackup => KBondMode::ActiveBackup,
+        BondMode::BalanceXor => KBondMode::BalanceXor,
+        BondMode::Broadcast => KBondMode::Broadcast,
+        BondMode::Lacp => KBondMode::Ieee8023Ad,
+        BondMode::BalanceTlb => KBondMode::BalanceTlb,
+        BondMode::BalanceAlb => KBondMode::BalanceAlb,
+    }
+}
+
+fn kernel_hash(h: HashPolicy) -> BondXmitHashPolicy {
+    match h {
+        HashPolicy::Layer2 => BondXmitHashPolicy::Layer2,
+        HashPolicy::Layer23 => BondXmitHashPolicy::Layer23,
+        HashPolicy::Layer34 => BondXmitHashPolicy::Layer34,
+        HashPolicy::Encap23 => BondXmitHashPolicy::Encap23,
+        HashPolicy::Encap34 => BondXmitHashPolicy::Encap34,
     }
 }
 
@@ -612,26 +645,52 @@ impl Kernel {
             Op::SetMaster { link, master } => {
                 let l = self.require(link).await?;
                 let want = match master {
-                    Some(m) => Some(self.require(m).await?.index),
+                    Some(m) => Some(self.require(m).await?),
                     None => None,
                 };
-                if l.master == want {
+                if l.master == want.as_ref().map(|w| w.index) {
                     return Ok(vec![]);
                 }
                 let old = match l.master {
                     Some(i) => self.name_of(i).await?,
                     None => None,
                 };
+                // "Device can not be enslaved while up": a bond takes a
+                // slave only when it is down, and brings it up itself.
+                let downed = l.up
+                    && want
+                        .as_ref()
+                        .is_some_and(|w| w.kind == Some(InfoKind::Bond));
+                if downed {
+                    self.set(LinkUnspec::new_with_index(l.index).down().build())
+                        .await?;
+                }
                 let b = LinkUnspec::new_with_index(l.index);
-                let msg = match want {
-                    Some(i) => b.controller(i).build(),
+                let msg = match &want {
+                    Some(w) => b.controller(w.index).build(),
                     None => b.nocontroller().build(),
                 };
-                self.set(msg).await?;
-                Ok(vec![Op::SetMaster {
-                    link: link.clone(),
-                    master: old,
-                }])
+                if let Err(e) = self.set(msg).await {
+                    if downed {
+                        let up = LinkUnspec::new_with_index(l.index).up().build();
+                        if let Err(e2) = self.set(up).await {
+                            log::warn!("could not bring '{link}' back up: {e2}");
+                        }
+                    }
+                    return Err(e);
+                }
+                // Joining or leaving a bond changes the admin state too (a
+                // released slave is left down), so undo restores both.
+                Ok(vec![
+                    Op::SetMaster {
+                        link: link.clone(),
+                        master: old,
+                    },
+                    Op::SetUp {
+                        link: link.clone(),
+                        up: l.up,
+                    },
+                ])
             }
             Op::SetUp { link, up } => {
                 let l = self.require(link).await?;
@@ -656,7 +715,9 @@ impl Kernel {
     async fn create(&self, link: &IfName, spec: &LinkSpec) -> Result<Vec<Op>, String> {
         let parent = match spec {
             LinkSpec::Vlan { parent, .. } => Some(self.require(parent).await?.index),
-            LinkSpec::Bridge | LinkSpec::Dummy | LinkSpec::Vrf { .. } => None,
+            LinkSpec::Bridge | LinkSpec::Dummy | LinkSpec::Vrf { .. } | LinkSpec::Bond { .. } => {
+                None
+            }
         };
         if let Some(l) = self.find(link).await? {
             // Same link already there (daemon restart): adopt it, nothing to undo.
@@ -681,6 +742,36 @@ impl Kernel {
             (LinkSpec::Bridge, _) => LinkMessageBuilder::<LinkBridge>::new(name).build(),
             (LinkSpec::Dummy, _) => LinkMessageBuilder::<LinkDummy>::new(name).build(),
             (LinkSpec::Vrf { table }, _) => LinkVrf::new(name, *table).build(),
+            (
+                LinkSpec::Bond {
+                    mode,
+                    primary,
+                    hash,
+                    lacp_rate,
+                    mii_interval_ms,
+                    min_links,
+                },
+                _,
+            ) => {
+                let mut b = LinkBond::new(name)
+                    .mode(kernel_bond_mode(*mode))
+                    .miimon(*mii_interval_ms)
+                    .min_links(*min_links);
+                if mode.hashes() {
+                    b = b.xmit_hash_policy(kernel_hash(*hash));
+                }
+                if *mode == BondMode::Lacp {
+                    b = b.ad_lacp_rate(match lacp_rate {
+                        LacpRate::Slow => BondLacpRate::Slow,
+                        LacpRate::Fast => BondLacpRate::Fast,
+                    });
+                }
+                // The kernel keeps the name and picks the slave when it joins.
+                if let Some(p) = primary.as_ref().filter(|_| mode.has_primary()) {
+                    b = b.primary(self.require(p).await?.index);
+                }
+                b.build()
+            }
         };
         self.handle
             .link()
