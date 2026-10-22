@@ -7,11 +7,13 @@
 pub mod cmd;
 pub mod error;
 pub mod guard;
+pub mod safe_mode;
 pub mod session;
 pub mod storage;
 pub mod validate;
 
 pub use error::EngineError;
+pub use safe_mode::Caller;
 pub use session::{CommitMode, JournalEntry, Session, Shared, StorageStatus, lock, shared};
 pub use storage::{ConfigStorage, MemoryStorage, Slot, StorageError};
 

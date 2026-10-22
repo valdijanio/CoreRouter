@@ -1,6 +1,8 @@
 //! Method table of the control channel.
 
-use corerouter_engine::{Session, Shared, lock};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use corerouter_engine::{Caller, Session, Shared, lock};
 use serde_json::{Value, json};
 
 pub const NO_UI: &str = "ui.screenshot needs the GUI: start `corerouter-gui --control 7979` \
@@ -63,7 +65,38 @@ impl Host for SharedHost {
     }
 }
 
+/// A [`Caller`] for a new connection, unique in this process (TCP and
+/// WebSocket share the counter; 0 is [`Caller::LOCAL_ID`]).
+pub fn new_caller(kind: &str, peer: impl std::fmt::Display) -> Caller {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    Caller::new(
+        NEXT.fetch_add(1, Ordering::Relaxed),
+        format!("{kind} {peer}"),
+    )
+}
+
+/// The connection of `caller` closed: the session undoes its Safe Mode, if
+/// it held one. Hosts without a local session (a GUI proxying a daemon) have
+/// nothing to do: their own connection to the daemon closes with them.
+pub fn hang_up(host: &mut dyn Host, caller: &Caller) {
+    let _ = host.with_session(&mut |s| {
+        s.hang_up(caller.id);
+        Ok(Value::Null)
+    });
+}
+
+/// [`dispatch_as`] for a caller inside this process.
 pub fn dispatch(host: &mut dyn Host, method: &str, params: &Value) -> Result<Value, String> {
+    dispatch_as(host, &Caller::local(), method, params)
+}
+
+/// Answer `method` for the connection `caller`.
+pub fn dispatch_as(
+    host: &mut dyn Host,
+    caller: &Caller,
+    method: &str,
+    params: &Value,
+) -> Result<Value, String> {
     let err = |e: corerouter_engine::EngineError| e.to_string();
     if !matches!(method, "ping" | "ui.screenshot")
         && let Some(answer) = host.forward(method, params)
@@ -90,7 +123,7 @@ pub fn dispatch(host: &mut dyn Host, method: &str, params: &Value) -> Result<Val
                 .and_then(Value::as_str)
                 .ok_or("engine.execute needs {command, params?}")?;
             let p = params.get("params").cloned().unwrap_or(Value::Null);
-            host.with_session(&mut |s| s.execute(id, &p).map_err(err))
+            host.with_session(&mut |s| s.execute_as(caller, id, &p).map_err(err))
         }
         "engine.batch" => {
             let steps = params.get("steps").cloned().unwrap_or(Value::Null);
@@ -98,11 +131,11 @@ pub fn dispatch(host: &mut dyn Host, method: &str, params: &Value) -> Result<Val
                 .get("atomic")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            host.with_session(&mut |s| s.batch(&steps, atomic).map_err(err))
+            host.with_session(&mut |s| s.batch_as(caller, &steps, atomic).map_err(err))
         }
         "state.inspect" => {
             let path = params.get("path").and_then(Value::as_str);
-            host.with_session(&mut |s| s.inspect(path).map_err(err))
+            host.with_session(&mut |s| s.inspect_as(caller, path).map_err(err))
         }
         "ui.screenshot" => host.screenshot(),
         other => {

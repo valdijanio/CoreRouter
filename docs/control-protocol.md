@@ -33,6 +33,17 @@ G0.3: **até lá, TCP e WebSocket são só loopback e sem autenticação** — q
 pode comandar o roteador (o daemon diz isso no log de inicialização). Para gerenciar de outra
 máquina hoje, use um túnel (`ssh -L 7979:127.0.0.1:7979 roteador`).
 
+## Conexões e Safe Mode (G1.4)
+
+Cada conexão TCP ou WebSocket é um cliente (`Caller`, ex. `tcp 127.0.0.1:50412`). O
+`config.safe-mode.enter` pertence à conexão que o executou; quando ela fecha, o daemon desfaz
+tudo o que mudou desde a entrada. Por isso `corerouter-cli --connect … run
+config.safe-mode.enter` não serve para nada (a conexão fecha logo depois): use a GUI, o MCP
+(conexão persistente) ou um cliente que fique conectado. `state.inspect` mostra
+`safe_mode: {active, owner, yours, since, entry_revision, pending_revisions, timeout_secs,
+expires_in, last}` — `yours` é relativo à conexão que pergunta. A GUI com `--control` repassa
+cada cliente por uma conexão própria ao daemon, então o dono é esse cliente, não a janela.
+
 ## WebSocket (GUI no navegador)
 
 `corerouter-daemon --ws <porta>` serve os **mesmos métodos** por WebSocket em
@@ -70,3 +81,4 @@ a página).
 
 - 2026-10-21 — versão inicial.
 - 2026-10-21 — G0.4: WebSocket (`--ws`, Origin, `--web-root`), repasse da GUI remota.
+- 2026-10-22 — G1.4: conexão como dona do Safe Mode.

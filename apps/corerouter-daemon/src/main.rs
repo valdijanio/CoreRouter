@@ -12,11 +12,17 @@
 //! Persistence (G0.6): every commit is saved to `--config-dir` and restored at
 //! start-up. Without the flag the linux backend uses `/config` (the writable
 //! partition of the router image) and the virtual lab keeps nothing.
+//!
+//! Safe Mode (G1.4): a clock thread ticks the session every second (timeouts),
+//! and a control or WebSocket connection that closes undoes the Safe Mode it
+//! held. Changes made in Safe Mode are saved only when it is confirmed.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use corerouter_control::{DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_ws};
+use corerouter_control::{
+    DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_clock, spawn_ws,
+};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, shared};
 use corerouter_hal::{Hal, VirtualHal};
 use corerouter_storage_fs::FileStorage;
@@ -189,6 +195,10 @@ fn main() -> ExitCode {
     };
     let storage_name = storage.describe();
     let session = shared(Session::with_storage(hal, storage));
+    if let Err(e) = spawn_clock(session.clone()) {
+        eprintln!("cannot start the clock thread: {e}");
+        return ExitCode::FAILURE;
+    }
     let listener = match bind_loopback(args.port) {
         Ok(l) => l,
         Err(e) => {
