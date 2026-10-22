@@ -839,3 +839,6 @@ continuação indentadas).
   De quebra, duas falhas de pasta de build compartilhada entre worktrees: o `xtask` acha a raiz do
   workspace a partir do diretório atual (não do `CARGO_MANIFEST_DIR` do build), e os geradores
   vigiam `src/` por caminho absoluto (senão reaproveitavam a lista de outra worktree).
+
+- 2026-10-22 — processo: A fila faz o squash com o título do PR (`--subject "<título> (#n)"`): o #79 entrou na `main`
+  como "wip hotspots", a mensagem do primeiro commit da branch.
