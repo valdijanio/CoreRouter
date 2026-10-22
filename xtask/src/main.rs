@@ -164,16 +164,10 @@ fn netns_run(root: &Path) -> Outcome {
     }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let mut c = Command::new("unshare");
+    // Not `--quiet`: one line per test, so a CI log shows which ones ran.
     c.args(UNSHARE)
         .arg(cargo)
-        .args([
-            "test",
-            "--quiet",
-            "-p",
-            "corerouter-hal-linux",
-            "--test",
-            "netns",
-        ])
+        .args(["test", "-p", "corerouter-hal-linux", "--test", "netns"])
         .env("COREROUTER_NETNS_TESTS", "1");
     run(c, root)
 }
