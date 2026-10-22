@@ -71,6 +71,19 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G4.5 | Gráficos de tráfego na UI | ui | Séries por interface (como o Traffic do WinBox), sem travar o frame | 6 h | aberto |
 | G4.6 | NTP e syslog remoto | daemon | ntpd-rs; syslog RFC 5424 | 5 h | aberto |
 
+## G5 — Descoberta de vizinhos e gerência em malha
+
+Inspirado no que o MikroTik oferece com MNDP (vizinhos), WinBox (tela de conexão) e RoMON
+(gerência sem IP, a vários saltos). MNDP e RoMON são **proprietários e sem especificação**: não os
+clonamos. O CoreRouter usa um protocolo próprio documentado (CRDP), o padrão aberto LLDP e, só para
+leitura, o formato público do MNDP para enxergar MikroTiks numa rede mista.
+
+| Id | Tarefa | Crates | Critério de aceite | Est. | Status |
+|---|---|---|---|---|---|
+| G5.1 | Fase A — CRDP + vizinhos + tela de conexão | proto-discovery (novo), model, engine, daemon, ui, gui | Protocolo próprio documentado em `docs/discovery.md` (UDP, broadcast IPv4 + `ff02::1`, a cada 30 s, expira em ~120 s, TLVs: id do nó, identity, versão, placa, uptime, endereços, interface, portas de gerência), codec puro com proptest/fuzz; ligado só nas interfaces da lista de descoberta (nunca na WAN por padrão); `ip.neighbor.list` e `ip.neighbor.discovery.set`; janela IP › Neighbors; tela de conexão estilo WinBox (login à esquerda; abas Neighbors/Saved à direita; duplo clique preenche "Connect to"); GUI nativa escuta anúncios, web pega a lista do daemon | 20 h | aberto |
+| G5.2 | Fase B — LLDP (IEEE 802.1AB) + escuta passiva de MNDP | proto-lldp (novo), proto-mndp (novo, só decodificação), hal-linux, daemon | Envia e recebe LLDP (socket de camada 2 no `hal-linux`, testes em namespace sem root); decodifica MNDP recebido (UDP 5678) a partir de documentação pública, sem nunca anunciar MNDP; vizinhos LLDP/MNDP entram na mesma tabela do G5.1 com a coluna de protocolo; codecs com proptest/fuzz | 16 h | aberto |
+| G5.3 | Fase C — gerência em malha (estilo RoMON) | discovery, control, daemon, ui | **Depende de G0.3.** Transporte por IPv6 link-local entre vizinhos (sem IP configurado); anúncios inundados com sequência e saltos, assinados com o segredo da malha; GUI conecta num agente e escolhe o destino; sessão cifrada de ponta a ponta até o roteador destino (nós intermediários não leem nem alteram); login final é o do destino | 40 h | aberto |
+
 ## Histórico de revisão
 
 - 2026-10-21 — lista inicial.
@@ -80,4 +93,5 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.
 - 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.
 - 2026-10-21 — G0.4 feito (GUI cliente do daemon, nativo e web; WebSocket com Origin; `--web-root`).
+- 2026-10-21 — G5 adicionado: descoberta de vizinhos (CRDP), LLDP + MNDP passivo e gerência em malha.
 - 2026-10-22 — G1.4 feito (Safe Mode: comandos `config.safe-mode.*`, dono por conexão, timeout, sem salvar até confirmar).
