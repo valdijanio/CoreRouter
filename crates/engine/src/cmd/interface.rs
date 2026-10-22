@@ -91,6 +91,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = opt_str(p, "type")?;
     let live = s.hal_mut().poll();
+    s.watch_links(&live);
     let cfg = s.store().candidate();
     let mut rows: Vec<Value> = cfg
         .interfaces

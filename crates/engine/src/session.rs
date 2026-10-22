@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::auth::{self, Group, Login, Logins, Principal};
 use crate::cmd::{self, check_params, unknown_command};
 use crate::firewall_dyn::DynamicLists;
+use crate::link_watch::LinkWatch;
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
@@ -69,6 +70,8 @@ pub struct Session {
     users: Users,
     /// Logged-in sessions, for `user.active.list` (never saved).
     logins: Logins,
+    /// When links went up/down (operational, never saved; G1.19).
+    pub(crate) links: LinkWatch,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -143,6 +146,7 @@ impl Session {
             tasks: Tasks::default(),
             users,
             logins: Logins::default(),
+            links: LinkWatch::default(),
         }
     }
 
