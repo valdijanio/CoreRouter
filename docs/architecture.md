@@ -183,6 +183,15 @@ pode servir os arquivos da GUI web na mesma porta (`--web-root`, modelo WebFig);
 `Origin` impede que uma página qualquer comande o roteador local. Detalhes em
 `docs/control-protocol.md`. Autenticação/TLS continuam no G0.3: tudo só em loopback.
 
+### Preferências da janela (G1.11)
+
+Tema (Sistema/Claro/Escuro) e "Inline Comments" de cada tabela são estado da janela, não do
+roteador: não passam pelo engine nem pelo journal. `CoreRouterUi::prefs()` devolve um JSON
+pequeno que o app grava pela persistência do eframe (`App::save`, a cada 2 s e ao sair):
+arquivo `app.ron` em `~/.local/share/corerouter-gui` (o `app_id` separa da pasta de config do
+daemon) ou `localStorage` na web; `apply_prefs` o lê na criação e ignora o que não entende. A
+memória do egui (posição das janelas) não é persistida.
+
 ### `hal-linux`: aplicação no kernel (G1.2)
 
 `LinuxHal::apply(from, to)` tem duas metades:
@@ -211,3 +220,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-21 — G0.6: crate `storage-fs` (L4) e seção de persistência.
 - 2026-10-21 — `hal-linux` aplica via rtnetlink (G1.2): plano puro + executor com rollback.
 - 2026-10-21 — G0.4: trait `Backend` da UI, GUI remota (nativo e WebSocket), `control::ws`.
+- 2026-10-21 — G1.11: preferências da janela (tema, comentários inline) fora do engine.

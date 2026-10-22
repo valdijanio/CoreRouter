@@ -3,7 +3,7 @@
 use egui::{Grid, RichText, TextEdit};
 use serde_json::{Value, json};
 
-use crate::table::{self, Icon, Menu, Row, Shortcut, col};
+use crate::table::{self, Icon, Menu, Row, Shortcut, col, comment};
 use crate::{CoreRouterUi, err_color, value_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -135,7 +135,7 @@ impl CoreRouterUi {
             col("Address"),
             col("Network"),
             col("Interface"),
-            col("Comment"),
+            comment(),
         ];
         let rows: Vec<Row> = self
             .cache

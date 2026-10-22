@@ -79,6 +79,23 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   sozinha; pela GUI web servida com `--web-root`, ether3 reabilitada (revisão 3); página de
   outra origem recusada (403) até `--ws-origin`.
 
+- 2026-10-21 — G1.10 + G1.11: comentários inline e tema claro/escuro (só `crates/ui` e
+  `apps/corerouter-gui`; nenhum comando novo). A tabela reutilizável ganhou a coluna
+  `table::comment()` e o item marcável "Inline Comments" nos menus de contexto: ligado, a coluna
+  some e o comentário vira uma faixa acima do item (como o "Comment Type: header" do WinBox v4,
+  conferido em manual.mikrotik.com, e a linha `;;;` do terminal), com fundo sutil azul, barra e
+  ícone de balão desenhados e texto em itálico; a faixa e a linha formam um item só (clique,
+  Shift/Ctrl, menu), duplo clique na faixa abre o diálogo Comment, e o Find continua casando o
+  comentário. Barra superior: seletor Sistema/Claro/Escuro à direita (função própria, `top_bar`
+  intocado). Preferências da janela (`CoreRouterUi::prefs`/`apply_prefs`, JSON) salvas pelo
+  eframe com a feature `persistence` (arquivo em `~/.local/share/corerouter-gui` via
+  `app_id`, para não cair na pasta de config de um daemon; `localStorage` na web); entrada
+  hostil ignorada. Ícones da barra com tons próprios para o tema claro. 4 testes novos (2
+  headless dirigidos por eventos, 2 de preferências). Teste manual (**medido**): daemon com
+  `--config-dir` + GUI `--connect`, comentários em ether2/ether5, Inline Comments e tema
+  claro ligados pela GUI real (xdotool), screenshots nos dois temas conferidos; GUI fechada e
+  reaberta voltou em tema claro com os comentários inline.
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -86,3 +103,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.2.
 - 2026-10-21 — log do G1.9.
 - 2026-10-21 — log do G0.4.
+- 2026-10-21 — log do G1.10 + G1.11.
