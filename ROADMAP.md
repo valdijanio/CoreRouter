@@ -96,6 +96,22 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   claro ligados pela GUI real (xdotool), screenshots nos dois temas conferidos; GUI fechada e
   reaberta voltou em tema claro com os comentários inline.
 
+- 2026-10-21 — G5.2 (Parte 1): LLDP e escuta passiva de MNDP. `crates/proto-lldp` (L2): codec
+  puro de LLDPDU do IEEE 802.1AB (Chassis ID, Port ID, TTL, End, Port/System Description,
+  System Name, Capabilities, Management Address; TLVs desconhecidos e de organização guardados
+  crus), validação de recepção do 9.2.7.7. `crates/proto-mndp` (L2): **só decodificação** do
+  anúncio MikroTik (UDP 5678), escrito a partir do dissector do Wireshark e do manual da
+  MikroTik (fontes no topo do crate); o CoreRouter nunca anuncia MNDP. `hal-linux::l2`:
+  `LldpIo` (socket `AF_PACKET` por porta, EtherType 0x88CC para 01:80:C2:00:00:0E, envio a cada
+  30 s via `due`/`send`, recepção não bloqueante, `allmulticast` ligado e restaurado por
+  rtnetlink) e `MndpListener` (IPv4 + IPv6, `IP_PKTINFO` para a interface de chegada), sem
+  `unsafe` (`socket2` + `sockaddr_ll` vindo do `getifaddrs` do `nix`). Testes: proptest nos
+  dois codecs (1024 casos por propriedade) e `tests/netns_l2.rs` em namespace sem root (LLDP
+  entre as pontas de um veth nos dois sentidos, MNDP com a interface certa); `cargo xtask netns`
+  agora roda cada binário de teste no seu próprio namespace; os dois codecs entram no passo
+  wasm. Integração com a tabela de vizinhos do G5.1 (`ip.neighbor.list` com protocol=lldp/mndp)
+  fica para um segundo PR, depois do G5.1. Detalhes em `docs/lldp-mndp.md`.
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -104,3 +120,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.9.
 - 2026-10-21 — log do G0.4.
 - 2026-10-21 — log do G1.10 + G1.11.
+- 2026-10-21 — log do G5.2 (Parte 1).

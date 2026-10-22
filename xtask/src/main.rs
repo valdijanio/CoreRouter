@@ -12,6 +12,8 @@ const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|netns|layers|agents-
 const WASM_PACKAGES: &[&str] = &[
     "corerouter-model",
     "corerouter-hal",
+    "corerouter-proto-lldp",
+    "corerouter-proto-mndp",
     "corerouter-engine",
     "corerouter-ui",
     "corerouter-gui",
@@ -148,20 +150,33 @@ fn netns(root: &Path) -> Outcome {
         Err(e) => return Outcome::Skip(format!("cannot run unshare: {e}")),
     }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut c = Command::new("unshare");
-    c.args(UNSHARE)
-        .arg(cargo)
-        .args([
-            "test",
-            "--quiet",
-            "-p",
-            "corerouter-hal-linux",
-            "--test",
-            "netns",
-        ])
-        .env("COREROUTER_NETNS_TESTS", "1");
-    run(c, root)
+    // One fresh namespace per test binary: each one's guard requires a
+    // namespace holding only `lo`.
+    for test in NETNS_TESTS {
+        let mut c = Command::new("unshare");
+        c.args(UNSHARE)
+            .arg(&cargo)
+            .args([
+                "test",
+                "--quiet",
+                "-p",
+                "corerouter-hal-linux",
+                "--test",
+                test,
+            ])
+            .env("COREROUTER_NETNS_TESTS", "1");
+        if let Outcome::Fail(e) = run(c, root) {
+            return Outcome::Fail(format!("{test}: {e}"));
+        }
+    }
+    Outcome::Ok
 }
+
+/// hal-linux integration tests that need a kernel (`tests/<name>.rs`).
+const NETNS_TESTS: &[&str] = &[
+    "netns", // G5.2: LLDP over AF_PACKET and MNDP over UDP between veth peers.
+    "netns_l2",
+];
 
 fn layers_step(root: &Path) -> Outcome {
     let out = match cargo()
