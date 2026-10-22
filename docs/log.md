@@ -809,3 +809,23 @@ continuação indentadas).
   fila, que parou no meio: o #62 ficou fora de dois lotes por isso. Um PR que o GitHub marca em
   conflito só nesses documentos recebe a `main` na própria branch antes do lote (o squash é do
   GitHub, que não vê a resolução do lote). Testado na branch do #62.
+
+- 2026-10-22 — G0.5: Fuzzing das três entradas hostis do plano de controle. Cada uma tem um oráculo de bytes →
+  `Result` (`corerouter_engine::fuzz::config_file`, `corerouter_control::fuzz::{wire,
+  control_line}`, `corerouter_mcp::fuzz::messages`) que roda de dois jeitos: proptest com semente
+  fixa em `crates/{engine,control,mcp}/tests/fuzz.rs` (entra no `cargo xtask ci`, ~2 s, **medido**;
+  `COREROUTER_FUZZ_CASES=N` faz a rodada longa sem nightly) e libFuzzer no crate `fuzz/` (fora do
+  workspace; `cargo +nightly fuzz run -s none <alvo>`). O arquivo de config não só decodifica: o
+  roteador dá boot a partir dele e responde a todas as consultas, e salvar → ler → salvar é ponto
+  fixo. Pânico capturado pelo guarda do motor também conta como falha (hook de pânico por thread).
+  Sementes em `fuzz/seeds/`, dicionário `fuzz/json.dict`; crash achado vai para
+  `fuzz/regressions/<alvo>/` e a CI o reexecuta. Como testar: `cargo test -p corerouter-engine -p
+  corerouter-control -p corerouter-mcp --test fuzz`; rodada longa em `docs/fuzzing.md`.
+
+  Rodada de 10 min por alvo com libFuzzer (`-s none`, `json.dict`, 4 alvos em paralelo, Ryzen AI
+  Max+ 395, 2026-10-22), **medido**: nenhum crash, nenhum pânico capturado. `config_file` 1,9 M
+  execuções (cobertura 4545 arestas), `wire` 81 M (104), `control_line` 14,8 M (4720),
+  `mcp_messages` 4,6 M (3802). Rodada aleatória sem nightly, também limpa: 3 000 configs mutadas
+  (~90 % decodificam e dão boot), 5 000 casos por teste do canal de controle, 20 000 sessões MCP.
+  Nada a corrigir nos alvos; um bug achado no próprio oráculo do `wire` (entrada só `\r`) foi
+  corrigido antes da rodada.
