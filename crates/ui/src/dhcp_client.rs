@@ -193,6 +193,11 @@ pub(crate) struct DhcpForm {
     pub extra_options: String,
     /// `ip-or-mac, …`.
     pub allowed_servers: String,
+    /// none | arp | ping (G4.7c).
+    pub check_gateway: String,
+    /// Empty: none.
+    pub fallback_address: String,
+    pub fallback_timeout: String,
 }
 
 impl DhcpForm {
@@ -212,6 +217,9 @@ impl DhcpForm {
             vendor_class: String::new(),
             extra_options: String::new(),
             allowed_servers: String::new(),
+            check_gateway: "none".into(),
+            fallback_address: String::new(),
+            fallback_timeout: "30".into(),
         }
     }
 
@@ -230,6 +238,9 @@ impl DhcpForm {
             vendor_class: text(row, "vendor_class"),
             extra_options: text(row, "extra_options"),
             allowed_servers: text(row, "allowed_servers"),
+            check_gateway: text(row, "check_gateway"),
+            fallback_address: text(row, "fallback_address"),
+            fallback_timeout: text(row, "fallback_timeout"),
         }
     }
 
@@ -274,6 +285,12 @@ impl DhcpForm {
         if self.disabled != base.disabled {
             put("disabled", json!(self.disabled));
         }
+        if self.check_gateway != base.check_gateway {
+            put("check_gateway", json!(self.check_gateway));
+        }
+        if self.fallback_timeout.trim() != base.fallback_timeout {
+            put("fallback_timeout", form_number(&self.fallback_timeout));
+        }
         for (k, now, was) in [
             ("host_name", &self.host_name, &base.host_name),
             ("client_id", &self.client_id, &base.client_id),
@@ -283,6 +300,11 @@ impl DhcpForm {
                 "allowed_servers",
                 &self.allowed_servers,
                 &base.allowed_servers,
+            ),
+            (
+                "fallback_address",
+                &self.fallback_address,
+                &base.fallback_address,
             ),
         ] {
             if now.trim() != was.trim() {
@@ -912,6 +934,8 @@ impl DhcpPanel {
                             &mut sent.vendor_class,
                             &mut sent.extra_options,
                             &mut sent.allowed_servers,
+                            &mut sent.fallback_address,
+                            &mut sent.fallback_timeout,
                         ] {
                             *s = s.trim().to_owned();
                         }
@@ -1143,6 +1167,29 @@ fn advanced_tab(ui: &mut Ui, f: &Form, form: &mut DhcpForm) {
                 &mut form.allowed_servers,
                 "(any) 192.0.2.1, AA:BB:…",
             );
+            ui.label("Check Gateway");
+            egui::ComboBox::from_id_salt("dhcp-check-gw")
+                .selected_text(form.check_gateway.as_str())
+                .show_ui(ui, |ui| {
+                    for m in ["none", "arp", "ping"] {
+                        ui.selectable_value(&mut form.check_gateway, m.to_owned(), m);
+                    }
+                });
+            ui.end_row();
+            f.text(
+                ui,
+                "Fallback Address",
+                "fallback_address",
+                &mut form.fallback_address,
+                "(none) 192.168.100.2/24",
+            );
+            f.text(
+                ui,
+                "Fallback Timeout",
+                "fallback_timeout",
+                &mut form.fallback_timeout,
+                "30",
+            );
         });
     ui.weak(
         "Options: code:value, value as 0x0a0b, 'text', s'text', '10.0.0.1', '10', $(HOSTNAME).",
@@ -1171,6 +1218,8 @@ fn status_tab(ui: &mut Ui, row: Option<&Value>) {
                 ("Lease Time", "lease_time"),
                 ("Expires After", "expires_after"),
                 ("Routes Table", "routes_table"),
+                ("Gateway Check", "gateway_status"),
+                ("Remembered", "remembered"),
             ] {
                 ui.label(label);
                 ui.add_enabled(
@@ -1194,6 +1243,13 @@ fn status_tab(ui: &mut Ui, row: Option<&Value>) {
         .flatten()
     {
         ui.colored_label(ui.visuals().warn_fg_color, value_text(n));
+    }
+    if flag(r, "fallback_active") {
+        let note = format!(
+            "No lease: fallback address {} is up.",
+            text(r, "fallback_address")
+        );
+        ui.colored_label(ui.visuals().warn_fg_color, note);
     }
     let error = text(r, "error");
     if !error.is_empty() {
@@ -1244,6 +1300,24 @@ fn options_tab(ui: &mut Ui, row: Option<&Value>, options: Option<&Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resilience_fields_round_trip() {
+        let row = json!({"interface": "ether1", "check_gateway": "arp",
+            "fallback_address": "192.168.100.2/24", "fallback_timeout": 30});
+        let base = DhcpForm::of(&row);
+        assert_eq!(base.check_gateway, "arp");
+        let mut f = base.clone();
+        assert_eq!(f.set_params("*1", &base), None);
+        f.check_gateway = "ping".into();
+        f.fallback_address = String::new();
+        f.fallback_timeout = "60".into();
+        assert_eq!(
+            f.set_params("*1", &base),
+            Some(json!({"id": "*1", "check_gateway": "ping", "fallback_address": "",
+                "fallback_timeout": 60}))
+        );
+    }
 
     #[test]
     fn forms_send_only_what_changed() {

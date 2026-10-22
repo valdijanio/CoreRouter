@@ -40,7 +40,7 @@ const PORT_RETRY_MS: u64 = 10_000;
 /// Ids of dynamic addresses and routes: `0xDC000000 | client << 8 | n`.
 pub const DYN_BASE: u32 = 0xDC00_0000;
 
-fn dyn_id(client: ItemId, n: usize) -> ItemId {
+pub(crate) fn dyn_id(client: ItemId, n: usize) -> ItemId {
     let n = u32::try_from(n).unwrap_or(0xFF) & 0xFF;
     ItemId(DYN_BASE | ((client.0 & 0x3_FFFF) << 8) | n)
 }
@@ -69,7 +69,7 @@ pub struct HistoryEntry {
 pub(crate) struct Runner {
     /// The config it runs with (compared each service call).
     pub cfg: DhcpClient,
-    port: Option<Box<dyn DhcpPort>>,
+    pub(crate) port: Option<Box<dyn DhcpPort>>,
     pub client: Option<Client>,
     /// Why it cannot run (no socket, bad option): status `error`.
     pub error: Option<String>,
@@ -79,6 +79,11 @@ pub(crate) struct Runner {
     pub routes: Vec<RouteEntry>,
     /// Lease routes that could not be installed, and why.
     pub notes: Vec<String>,
+    /// The fallback address while it is up (G4.7c).
+    pub fallback: Option<AddressEntry>,
+    /// Since when the client has had no lease.
+    pub(crate) searching_since: Option<u64>,
+    pub(crate) gw: crate::dhcp_resilience::GatewayCheck,
 }
 
 impl Runner {
@@ -169,6 +174,10 @@ pub struct DhcpRuntime {
     seq: u64,
     /// Last time given to [`Session::dhcp_service`].
     pub(crate) now_ms: Option<u64>,
+    /// Leases kept across restarts (G4.7c), by client.
+    pub(crate) remembered: BTreeMap<ItemId, crate::dhcp_resilience::Remembered>,
+    /// Whether `remembered` was read from the storage.
+    pub(crate) loaded: bool,
 }
 
 impl DhcpRuntime {
@@ -182,9 +191,12 @@ impl DhcpRuntime {
 
     /// Dynamic addresses of every client.
     pub fn addresses(&self) -> impl Iterator<Item = (ItemId, &AddressEntry)> {
-        self.runners
-            .iter()
-            .flat_map(|(id, r)| r.addresses.iter().map(move |a| (*id, a)))
+        self.runners.iter().flat_map(|(id, r)| {
+            r.addresses
+                .iter()
+                .chain(r.fallback.iter())
+                .map(move |a| (*id, a))
+        })
     }
 }
 
@@ -284,6 +296,16 @@ fn mac_text(mac: [u8; 6]) -> String {
 /// History kind and text of an event.
 fn describe(e: &Event) -> (&'static str, String) {
     match e {
+        Event::Rebooting { address } => (
+            "rebooting",
+            format!("asking to keep the remembered lease {address} (INIT-REBOOT)"),
+        ),
+        Event::Reused { address, server } => (
+            "bound",
+            format!(
+                "no server answered: using the remembered lease {address} from {server} while it lasts"
+            ),
+        ),
         Event::Searching => ("searching", "searching for a DHCP server".into()),
         Event::Offered { server, address } => ("offered", format!("{address} offered by {server}")),
         Event::Bound {
@@ -358,7 +380,7 @@ impl Session {
             .dhcp
             .runners
             .values()
-            .all(|r| r.addresses.is_empty() && r.routes.is_empty());
+            .all(|r| r.addresses.is_empty() && r.routes.is_empty() && r.fallback.is_none());
         if v4_quiet && self.dhcp6_quiet(cfg) {
             return Cow::Borrowed(cfg);
         }
@@ -373,7 +395,8 @@ impl Session {
                 continue;
             }
             out.ip.addresses.extend(r.addresses.iter().cloned());
-            for route in &r.routes {
+            out.ip.addresses.extend(r.fallback.iter().cloned());
+            for route in r.routes.iter().filter(|rt| !r.withholds(rt)) {
                 let taken = out.ip.routes.iter().any(|o| {
                     !o.disabled
                         && o.routing_table == route.routing_table
@@ -396,6 +419,7 @@ impl Session {
     /// the native GUI call it a few times a second (`control::spawn_clock`).
     pub fn dhcp_service(&mut self, now_ms: u64) {
         self.dhcp.now_ms = Some(now_ms);
+        self.dhcp_load_leases();
         self.dhcp_reconcile(now_ms);
         let ids: Vec<ItemId> = self.dhcp.runners.keys().copied().collect();
         for id in ids {
@@ -404,6 +428,7 @@ impl Session {
                 None => continue,
             };
             self.dhcp_after(id, actions);
+            self.dhcp_resilience(id, now_ms);
         }
         // The DHCPv6 clients (G4.7b) run on the same clock.
         self.dhcp6_service(now_ms);
@@ -413,9 +438,18 @@ impl Session {
     pub(crate) fn dhcp_after(&mut self, id: ItemId, actions: Vec<Action>) {
         for a in actions {
             match a {
-                Action::Bind(lease) => self.dhcp_install(id, Some(&lease)),
+                Action::Bind(lease) => {
+                    self.dhcp_install(id, Some(&lease));
+                    self.dhcp_remember(id, &lease);
+                }
                 Action::Unbind => self.dhcp_install(id, None),
-                Action::Log(e) => self.dhcp_log(id, &e),
+                Action::Log(e) => {
+                    // A NAK says the remembered address is not ours.
+                    if matches!(e, Event::Nak { .. }) {
+                        self.dhcp_forget(id);
+                    }
+                    self.dhcp_log(id, &e);
+                }
                 // Socket actions were done by the runner.
                 Action::Send { .. } | Action::Probe(_) | Action::EndProbe => {}
             }
@@ -430,9 +464,15 @@ impl Session {
         self.dhcp_note(id, iface, event, message);
     }
 
-    fn dhcp_note(&mut self, id: ItemId, interface: IfName, event: &'static str, message: String) {
+    pub(crate) fn dhcp_note(
+        &mut self,
+        id: ItemId,
+        interface: IfName,
+        event: &'static str,
+        message: String,
+    ) {
         match event {
-            "error" | "refused" | "declined" | "nak" | "lost" => {
+            "error" | "refused" | "declined" | "nak" | "lost" | "gateway" | "fallback" => {
                 log::warn!("dhcp-client {id} on {interface}: {message}");
             }
             "searching" | "offered" => log::debug!("dhcp-client {id} on {interface}: {message}"),
@@ -466,6 +506,17 @@ impl Session {
             std::mem::take(&mut r.routes),
             std::mem::take(&mut r.notes),
         );
+        let old_fallback = r.fallback.clone();
+        let old_gw_down = r.gw.down;
+        // A lease replaces the fallback address in the same apply; a stop
+        // takes it away too.
+        r.fallback = None;
+        if lease.is_some() {
+            r.searching_since = None;
+            r.gw.new_lease();
+        } else {
+            r.gw = crate::dhcp_resilience::GatewayCheck::default();
+        }
         if let Some(l) = lease {
             let (a, routes, notes) = lease_entries(&running, &r.cfg, l);
             r.addresses = vec![a];
@@ -483,6 +534,8 @@ impl Session {
             let msg = format!("lease not applied: {e}");
             if let Some(r) = self.dhcp.runners.get_mut(&id) {
                 (r.addresses, r.routes, r.notes) = old;
+                r.fallback = old_fallback;
+                r.gw.down = old_gw_down;
                 r.error = Some(msg.clone());
             }
             self.dhcp_log(id, &Event::Error(msg));
@@ -527,6 +580,9 @@ impl Session {
             })
             .collect();
         for (id, why) in gone {
+            if why == "client removed" {
+                self.dhcp_forget(id);
+            }
             let actions = self
                 .dhcp
                 .runners
@@ -574,6 +630,9 @@ impl Session {
             addresses: Vec::new(),
             routes: Vec::new(),
             notes: Vec::new(),
+            fallback: None,
+            searching_since: Some(now),
+            gw: crate::dhcp_resilience::GatewayCheck::default(),
         };
         let started = match port {
             Err(e) => Err(format!(
@@ -597,7 +656,11 @@ impl Session {
         let had_error = self.dhcp.runners.get(&id).and_then(|o| o.error.clone());
         match started {
             Ok(mut client) => {
-                let actions = client.start(now);
+                let mac = r.port.as_ref().map(|p| p.mac()).unwrap_or_default();
+                let actions = match self.dhcp_recall(id, &c.interface, mac, now) {
+                    Some(lease) => client.reboot(now, lease),
+                    None => client.start(now),
+                };
                 r.client = Some(client);
                 let mut rest = Vec::new();
                 r.perform(actions, &mut rest);
@@ -665,6 +728,9 @@ impl Session {
         };
         let mut rest = Vec::new();
         r.perform(actions, &mut rest);
+        if release {
+            self.dhcp_forget(id);
+        }
         self.dhcp_after(id, rest);
         // The lab answers at once: let the exchange finish now.
         self.dhcp_service(now);

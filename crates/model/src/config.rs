@@ -7,11 +7,14 @@ use std::net::Ipv4Addr;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::bonding::{BondMode, HashPolicy, LacpRate, default_mii_interval};
 use crate::dhcp_client::DhcpClient;
 use crate::firewall::Firewall;
 use crate::interface_list::InterfaceLists;
 use crate::ipv6::Ipv6;
+use crate::logging::Logging;
 use crate::neighbor::NeighborDiscovery;
+use crate::ntp::NtpClient;
 use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -31,12 +34,20 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct System {
     pub identity: String,
+    /// `/system ntp client` (G4.6).
+    #[serde(skip_serializing_if = "NtpClient::is_default")]
+    pub ntp_client: NtpClient,
+    /// `/system logging` (G4.6): rules and remote syslog actions.
+    #[serde(skip_serializing_if = "Logging::is_default")]
+    pub logging: Logging,
 }
 
 impl Default for System {
     fn default() -> Self {
         Self {
             identity: "CoreRouter".into(),
+            ntp_client: NtpClient::default(),
+            logging: Logging::default(),
         }
     }
 }
@@ -62,6 +73,10 @@ pub struct Interface {
     /// interface is a bridge port or a VRF member, never both).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vrf: Option<IfName>,
+    /// Bond this port is a slave of (G1.8; `IFLA_MASTER` again, so a slave
+    /// is never also a bridge port or a VRF member).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bond: Option<IfName>,
     /// Link settings of a physical port (`interface.ethernet.set`, G1.20).
     #[serde(default, skip_serializing_if = "EthernetSettings::is_empty")]
     pub ethernet: EthernetSettings,
@@ -145,6 +160,7 @@ impl Interface {
             comment: String::new(),
             bridge: None,
             vrf: None,
+            bond: None,
             ethernet: EthernetSettings::default(),
         }
     }
@@ -165,6 +181,24 @@ pub enum InterfaceKind {
     Vrf {
         table: u32,
     },
+    /// Link aggregation (Linux `bond`, G1.8). The slaves are the interfaces
+    /// whose `bond` names it.
+    Bonding {
+        mode: BondMode,
+        /// Slave preferred while it is up (active-backup, balance-tlb/alb).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        primary: Option<IfName>,
+        #[serde(default)]
+        transmit_hash_policy: HashPolicy,
+        #[serde(default)]
+        lacp_rate: LacpRate,
+        /// MII link monitoring period; 0 turns monitoring off.
+        #[serde(default = "default_mii_interval")]
+        mii_interval_ms: u32,
+        /// Up slaves needed before the bond reports carrier.
+        #[serde(default)]
+        min_links: u32,
+    },
 }
 
 impl InterfaceKind {
@@ -175,6 +209,7 @@ impl InterfaceKind {
             Self::Bridge => "bridge",
             Self::Loopback => "loopback",
             Self::Vrf { .. } => "vrf",
+            Self::Bonding { .. } => "bonding",
         }
     }
 }

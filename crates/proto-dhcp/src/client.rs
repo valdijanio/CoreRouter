@@ -11,6 +11,11 @@
 //!   └──────────────────────────────────────────────┴───────────────────┘
 //!  BOUND ─T1→ RENEWING (unicast) ─T2→ REBINDING (broadcast) ─expiry→ INIT (lease lost)
 //!            └──ACK→ BOUND, NAK→ INIT ┘
+//!
+//!  INIT-REBOOT (a remembered lease, RFC 2131 §3.2 / §4.4.2):
+//!  REBOOTING ─ACK→ PROBING → BOUND      NAK → INIT
+//!            └ 3 REQUESTs unanswered → PROBING → BOUND on the old lease while
+//!              it lasts (§3.2 "MAY"), else INIT asking for the old address
 //! ```
 //!
 //! Choices (documented in `docs/dhcp-client.md`):
@@ -45,6 +50,10 @@ pub const MIN_RENEW_RETRY_MS: u64 = 60_000;
 pub const MIN_T1_MS: u64 = 5_000;
 /// Lease used when an ACK has none (RFC 2131 requires one; some servers forget).
 pub const DEFAULT_LEASE_SECS: u32 = 3_600;
+/// REQUESTs sent in REBOOTING (INIT-REBOOT) before giving up: at 0, ~4 and
+/// ~8 s, so a silent server costs ~12 s at boot (dhcpcd waits 5 s, then
+/// discovers; a router would rather keep its address; **estimado**).
+pub const REBOOT_TRIES: u32 = 3;
 
 /// Where the client is (RouterOS shows the coarse [`State::status`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +68,8 @@ pub enum State {
     Rebinding,
     /// After a DECLINE, waiting to start over.
     Declined,
+    /// INIT-REBOOT: asking to keep a remembered lease (RFC 2131 §4.4.2).
+    Rebooting,
 }
 
 impl State {
@@ -67,7 +78,7 @@ impl State {
         match self {
             Self::Stopped => "stopped",
             Self::Init | Self::Selecting | Self::Declined => "searching",
-            Self::Requesting | Self::Probing => "requesting",
+            Self::Requesting | Self::Probing | Self::Rebooting => "requesting",
             Self::Bound => "bound",
             Self::Renewing => "renewing",
             Self::Rebinding => "rebinding",
@@ -104,6 +115,9 @@ pub struct Lease {
     pub t2_ms: u64,
     /// `None`: never expires.
     pub expires_ms: Option<u64>,
+    /// The ACK as received, so the engine can remember the lease across
+    /// restarts and check it again with [`restore_lease`].
+    pub ack: Vec<u8>,
     /// Every option of the ACK as (code, bytes), for `ip.dhcp-client.options`.
     /// Routers and classless gateways are as the server sent them: the
     /// engine decides which routes can be installed.
@@ -120,6 +134,16 @@ impl Lease {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     Searching,
+    /// INIT-REBOOT: asking the network to confirm a remembered address.
+    Rebooting {
+        address: Ipv4Net,
+    },
+    /// No server answered INIT-REBOOT: the remembered lease is used while
+    /// it lasts (RFC 2131 §3.2).
+    Reused {
+        address: Ipv4Net,
+        server: Ipv4Addr,
+    },
     Offered {
         server: Ipv4Addr,
         address: Ipv4Addr,
@@ -229,6 +253,13 @@ pub struct Client {
     naks: u32,
     /// Servers already reported as refused in this exchange.
     refused: Vec<Ipv4Addr>,
+    /// Address asked for in DISCOVER (option 50, RFC 2131 §4.4.1): the last
+    /// lease's, so a server that still has it gives it back.
+    hint: Option<Ipv4Addr>,
+    /// The remembered lease while REBOOTING.
+    remembered: Option<Lease>,
+    /// The lease waiting for the probe is a remembered one nobody confirmed.
+    reusing: bool,
 }
 
 impl std::fmt::Debug for Client {
@@ -263,6 +294,9 @@ impl Client {
             pending: None,
             naks: 0,
             refused: Vec::new(),
+            hint: None,
+            remembered: None,
+            reusing: false,
         }
     }
 
@@ -329,6 +363,66 @@ impl Client {
         out
     }
 
+    /// Start from a remembered lease (INIT-REBOOT, RFC 2131 §3.2 / §4.4.2):
+    /// a broadcast REQUEST for its address, with no server identifier. An
+    /// ACK binds it again (after the ARP probe), a NAK starts over with
+    /// DISCOVER, and silence uses `lease` while it lasts — its timers are
+    /// already in this clock (see [`restore_lease`]) — else DISCOVERs
+    /// asking for the same address.
+    pub fn reboot(&mut self, now: u64, lease: Lease) -> Vec<Action> {
+        let mut out = Vec::new();
+        self.drop_lease(&mut out, "client restarted");
+        self.restart_at(now, now);
+        self.hint = Some(lease.address.addr());
+        self.state = State::Rebooting;
+        self.xid = self.random() as u32;
+        out.push(Action::Log(Event::Rebooting {
+            address: lease.address,
+        }));
+        self.remembered = Some(lease);
+        self.reboot_request(&mut out, now);
+        out
+    }
+
+    fn reboot_request(&mut self, out: &mut Vec<Action>, now: u64) {
+        let Some(addr) = self.remembered.as_ref().map(|l| l.address.addr()) else {
+            self.restart_at(now, now);
+            return;
+        };
+        // RFC 2131 §4.3.2 (INIT-REBOOT): ciaddr 0, 'requested IP address'
+        // MUST be filled in, 'server identifier' MUST NOT.
+        let a = Addrs {
+            ciaddr: Ipv4Addr::UNSPECIFIED,
+            requested: Some(addr),
+            server_id: None,
+        };
+        self.send(out, MessageType::Request, a, Dest::Broadcast, now);
+        // 4 s ± 1 between tries (RFC 2131 §4.1's first step), not doubled:
+        // a boot should not wait a minute for a server that is gone.
+        let wait = self.jitter(FIRST_BACKOFF_MS);
+        self.deadline = now.saturating_add(wait);
+    }
+
+    /// INIT-REBOOT got no answer.
+    fn reboot_timeout(&mut self, out: &mut Vec<Action>, now: u64) {
+        let Some(lease) = self.remembered.take() else {
+            self.restart_at(now, now);
+            return;
+        };
+        if lease.expires_ms.is_none_or(|e| e > now) {
+            // RFC 2131 §3.2: with neither ACK nor NAK, the client MAY use
+            // the previous address for the rest of the lease. The ARP probe
+            // still runs, and T1/T2 (likely past) make it renew at once.
+            self.reusing = true;
+            self.state = State::Probing;
+            self.deadline = now.saturating_add(PROBE_MS);
+            out.push(Action::Probe(lease.address.addr()));
+            self.pending = Some(lease);
+        } else {
+            self.restart_at(now, now);
+        }
+    }
+
     /// Stop: drop the lease (no RELEASE) and go quiet.
     pub fn stop(&mut self, reason: &str) -> Vec<Action> {
         let mut out = Vec::new();
@@ -339,6 +433,7 @@ impl Client {
         self.state = State::Stopped;
         self.offer = None;
         self.pending = None;
+        self.remembered = None;
         out
     }
 
@@ -359,6 +454,8 @@ impl Client {
         self.began = now;
         self.offer = None;
         self.pending = None;
+        self.remembered = None;
+        self.reusing = false;
         self.refused.clear();
     }
 
@@ -483,6 +580,17 @@ impl Client {
                     self.bind(&mut out, lease, false);
                 }
             }
+            State::Rebooting if now >= self.deadline => {
+                self.tries = self.tries.saturating_add(1);
+                if self.tries >= REBOOT_TRIES {
+                    self.reboot_timeout(&mut out, now);
+                    if self.state == State::Init {
+                        out.extend(self.poll(now));
+                    }
+                } else {
+                    self.reboot_request(&mut out, now);
+                }
+            }
             State::Declined if now >= self.deadline => {
                 self.restart_at(now, now);
                 return self.poll(now);
@@ -494,13 +602,12 @@ impl Client {
     }
 
     fn discover(&mut self, out: &mut Vec<Action>, now: u64) {
-        self.send(
-            out,
-            MessageType::Discover,
-            Addrs::from(Ipv4Addr::UNSPECIFIED),
-            Dest::Broadcast,
-            now,
-        );
+        // RFC 2131 §4.4.1: the client MAY suggest an address (option 50).
+        let a = Addrs {
+            requested: self.hint,
+            ..Addrs::from(Ipv4Addr::UNSPECIFIED)
+        };
+        self.send(out, MessageType::Discover, a, Dest::Broadcast, now);
         let wait = self.backoff();
         self.deadline = now.saturating_add(wait);
     }
@@ -528,6 +635,7 @@ impl Client {
         if l.expires_ms.is_some_and(|e| now >= e) {
             self.drop_lease(out, "lease expired: no server renewed it");
             self.restart_at(now, now);
+            self.hint = Some(l.address.addr());
             out.extend(self.poll(now));
             return;
         }
@@ -590,6 +698,12 @@ impl Client {
             (State::Renewing | State::Rebinding, MessageType::Ack) => {
                 self.on_ack(&mut out, now, &msg, d, server, false);
             }
+            // INIT-REBOOT: any (allowed) server may confirm or refuse.
+            (State::Rebooting, MessageType::Ack) => {
+                self.remembered = None;
+                self.on_ack(&mut out, now, &msg, d, server, true);
+            }
+            (State::Rebooting, MessageType::Nak) => self.on_nak(&mut out, now, &msg, server),
             (State::Requesting, MessageType::Nak) => {
                 if self.offer.as_ref().is_some_and(|o| o.server == server) {
                     self.on_nak(&mut out, now, &msg, server);
@@ -660,7 +774,12 @@ impl Client {
     }
 
     fn bind(&mut self, out: &mut Vec<Action>, lease: Lease, renewed: bool) {
-        let event = if renewed {
+        let event = if std::mem::take(&mut self.reusing) {
+            Event::Reused {
+                address: lease.address,
+                server: lease.server,
+            }
+        } else if renewed {
             Event::Renewed {
                 address: lease.address,
                 server: lease.server,
@@ -675,6 +794,7 @@ impl Client {
         };
         self.state = State::Bound;
         self.offer = None;
+        self.hint = None;
         self.deadline = lease.t1_ms;
         self.lease = Some(lease.clone());
         out.push(Action::Bind(Box::new(lease)));
@@ -687,6 +807,8 @@ impl Client {
             message: msg.message.clone(),
         }));
         self.drop_lease(out, "the server said NAK");
+        // The address is not ours any more: do not ask for it again.
+        self.hint = None;
         self.naks = self.naks.saturating_add(1);
         // Do not hammer a server that keeps saying no: 0, 2, 4 … 64 s.
         let wait = if self.naks <= 1 {
@@ -717,6 +839,8 @@ impl Client {
         }
         self.state = State::Declined;
         self.offer = None;
+        self.hint = None;
+        self.reusing = false;
         self.deadline = now.saturating_add(DECLINE_WAIT_MS);
         out
     }
@@ -804,8 +928,50 @@ fn lease_from(now: u64, msg: &Incoming, d: &Datagram, server: Ipv4Addr) -> Resul
         t1_ms: t1,
         t2_ms: t2,
         expires_ms: expires,
+        ack: d.payload.clone(),
         options: v4::raw_options(&d.payload),
     })
+}
+
+/// A lease remembered from an earlier run: its saved ACK checked again like
+/// a fresh one (the file is hostile input too), with every timer moved back
+/// by `age_ms` — the time since it was granted. `None` (no trustworthy wall
+/// clock) makes it count as expired: INIT-REBOOT may still confirm it, but
+/// it is never used without a server.
+pub fn restore_lease(
+    now: u64,
+    ack: &[u8],
+    server: Ipv4Addr,
+    server_mac: Option<[u8; 6]>,
+    age_ms: Option<u64>,
+) -> Result<Lease, String> {
+    let msg = v4::decode(ack).map_err(|e| e.to_string())?;
+    if msg.kind != MessageType::Ack {
+        return Err("the saved message is not an ACK".into());
+    }
+    let d = Datagram {
+        payload: ack.to_vec(),
+        src: server,
+        src_mac: server_mac,
+    };
+    let mut lease = lease_from(now, &msg, &d, msg.server_id.unwrap_or(server))?;
+    let Some(age) = age_ms else {
+        lease.t1_ms = now;
+        lease.t2_ms = now;
+        lease.expires_ms = Some(now);
+        return Ok(lease);
+    };
+    let back = |t: u64| {
+        if t == u64::MAX {
+            t
+        } else {
+            now.saturating_add(t.saturating_sub(now).saturating_sub(age))
+        }
+    };
+    lease.t1_ms = back(lease.t1_ms);
+    lease.t2_ms = back(lease.t2_ms);
+    lease.expires_ms = lease.expires_ms.map(back);
+    Ok(lease)
 }
 
 #[cfg(test)]

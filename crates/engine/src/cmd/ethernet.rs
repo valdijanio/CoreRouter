@@ -313,7 +313,7 @@ fn find_offload<'a>(name: &str, known: &'a [Offload]) -> Option<&'a Offload> {
 }
 
 /// The interfaces whose physical ports carry `cfg` interface `name`
-/// (VLAN parents, bridge and VRF members), bounded.
+/// (VLAN parents, bridge, bond and VRF members), bounded.
 fn physical(cfg: &Config, name: &IfName, depth: u8, out: &mut BTreeSet<IfName>) {
     let Some(iface) = cfg.interfaces.get(name) else {
         return;
@@ -331,6 +331,15 @@ fn physical(cfg: &Config, name: &IfName, depth: u8, out: &mut BTreeSet<IfName>) 
                 .interfaces
                 .values()
                 .filter(|i| i.bridge.as_ref() == Some(name))
+            {
+                physical(cfg, &m.name, depth + 1, out);
+            }
+        }
+        InterfaceKind::Bonding { .. } => {
+            for m in cfg
+                .interfaces
+                .values()
+                .filter(|i| i.bond.as_ref() == Some(name))
             {
                 physical(cfg, &m.name, depth + 1, out);
             }

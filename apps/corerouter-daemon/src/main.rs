@@ -2,7 +2,7 @@
 //!  [--listen <addr:port>] [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
 //!  [--ws-listen <addr:port>] [--token-file <path>] [--reset-admin-password]
 //!  [--discovery-port <port> | --no-discovery] [--discovery-transport interfaces|loopback]
-//!  [--manage <names>] [--unmanaged <names>]`
+//!  [--manage <names>] [--unmanaged <names>] [--metrics [<addr>:]<port>]`
 //!
 //! The virtual backend is the default: touching a real kernel must be an
 //! explicit choice.
@@ -66,10 +66,23 @@
 //! The signals come from `signal-hook`'s `flag::register` (its handler only
 //! sets an atomic flag, polled here every [`SIGNAL_POLL`]): no `unsafe`
 //! here, no async runtime, and the same path on unix and Windows.
+//!
+//! NTP and remote syslog (G4.6): the SNTP client of `system.ntp.client.set`
+//! measures the clock offset (it does not set the clock yet) and reports
+//! to `system.ntp.client.get`; `system.logging.*` rules send config changes,
+//! failed commands and NTP state changes to remote syslog collectors (RFC
+//! 5424 over UDP). Both run with either backend: they are this process
+//! talking to the network, like the control channel.
+//! Metrics (G4.4): `--metrics 9100` serves Prometheus' `/metrics` on
+//! 127.0.0.1:9100 (`--metrics 0.0.0.0:9100` on every address, with a
+//! warning: like node_exporter it has no login). See [`metrics`].
 
 #[cfg(target_os = "linux")]
 mod link_discovery;
+mod metrics;
 mod node_id;
+mod ntp_client;
+mod remote_log;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -99,6 +112,7 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                          [--discovery-transport interfaces|loopback]
                          [--lab-ping auto|host|sim]
                          [--manage <names>] [--unmanaged <names>]
+                         [--metrics [<addr>:]<port>]
 
   --control <port>      plain control channel on 127.0.0.1:<port> (default 7979)
   --listen <addr:port>  control channel over TLS on any address, e.g. 0.0.0.0:8729 or
@@ -125,7 +139,9 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                         allowed, else sim; the default)
   --manage <names>      linux backend: also manage these veth/dummy links (comma-separated
                         names or prefix*, e.g. `lab*`)
-  --unmanaged <names>   linux backend: never touch these links, physical ports included";
+  --unmanaged <names>   linux backend: never touch these links, physical ports included
+  --metrics <a:port>    Prometheus /metrics (interface and engine counters) over plain HTTP,
+                        no login: a bare port is 127.0.0.1:<port>; e.g. 9100 or [::]:9100";
 
 /// Longest wait for the discovery goodbyes when shutting down.
 const GOODBYE_WAIT: Duration = Duration::from_secs(1);
@@ -157,6 +173,8 @@ struct Args {
     lab_ping: String,
     /// `--manage` / `--unmanaged` (linux backend).
     policy: corerouter_hal_linux::Policy,
+    /// `--metrics`: where Prometheus scrapes.
+    metrics: Option<std::net::SocketAddr>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -175,6 +193,7 @@ fn parse_args() -> Result<Args, String> {
         discovery_transport: None,
         lab_ping: "auto".into(),
         policy: corerouter_hal_linux::Policy::default(),
+        metrics: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -257,6 +276,10 @@ fn parse_args() -> Result<Args, String> {
                 let v = args.next().ok_or("--unmanaged needs interface names")?;
                 out.policy.unmanaged = corerouter_hal_linux::Policy::patterns(&v)?;
             }
+            "--metrics" => {
+                let v = args.next().ok_or("--metrics needs [ADDR:]PORT")?;
+                out.metrics = Some(metrics_addr(&v)?);
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
@@ -268,6 +291,43 @@ fn parse_args() -> Result<Args, String> {
         return Err("--ws-origin and --web-root need --ws <port> or --ws-listen".into());
     }
     Ok(out)
+}
+
+/// `--metrics`: a bare port is loopback only; `ADDR:PORT` is explicit.
+fn metrics_addr(v: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(port) = v.parse::<u16>() {
+        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    v.parse().map_err(|_| {
+        format!(
+            "--metrics: '{}' is not PORT or ADDR:PORT ([::1]:9100 for IPv6)",
+            v.chars().take(64).collect::<String>()
+        )
+    })
+}
+
+/// Serve `/metrics`, if asked for.
+fn metrics_endpoint(
+    args: &Args,
+    session: &corerouter_engine::Shared,
+    shutdown: &Shutdown,
+) -> Result<(), String> {
+    let Some(addr) = args.metrics else {
+        return Ok(());
+    };
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| format!("cannot open --metrics {addr}: {e}"))?;
+    metrics::spawn(listener, session.clone(), shutdown.clone())
+        .map_err(|e| format!("cannot start the metrics thread: {e}"))?;
+    if addr.ip().is_loopback() {
+        log::info!("Prometheus metrics on http://{addr}/metrics (loopback only)");
+    } else {
+        log::warn!(
+            "Prometheus metrics on http://{addr}/metrics: plain HTTP without login, \
+             reachable from the network (filter the port in the firewall)"
+        );
+    }
+    Ok(())
 }
 
 /// Start the WebSocket endpoints on their own threads, if asked for.
@@ -767,6 +827,13 @@ fn main() -> ExitCode {
             }
         }
     };
+    // Neither stops the daemon: a router without them still forwards.
+    if let Err(e) = ntp_client::spawn(session.clone(), corerouter_proto_ntp::PORT) {
+        log::error!("NTP client is off: cannot start its thread: {e}");
+    }
+    if let Err(e) = remote_log::spawn(session.clone()) {
+        log::error!("remote logging is off: cannot start its thread: {e}");
+    }
     let discovery = Discovery {
         crdp,
         #[cfg(target_os = "linux")]
@@ -777,6 +844,10 @@ fn main() -> ExitCode {
     // The TLS endpoints never take the local token: it proves a local
     // OS user, which a remote peer is not.
     let remote_gate = Gate::default();
+    if let Err(e) = metrics_endpoint(&args, &session, &shutdown) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     if let Err(e) = websocket(&args, &host, (&gate, &remote_gate), tls.as_ref(), &shutdown) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
