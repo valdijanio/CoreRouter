@@ -902,7 +902,9 @@ dependencies = [
  "futures-util",
  "ipnet",
  "log",
+ "nix",
  "rtnetlink",
+ "socket2",
  "tokio",
 ]
 
@@ -954,6 +956,22 @@ name = "corerouter-proto-dns"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+]
+
+[[package]]
+name = "corerouter-proto-lldp"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "corerouter-proto-mndp"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
 ]
 
 [[package]]
@@ -2241,6 +2259,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
