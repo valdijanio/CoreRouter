@@ -260,6 +260,21 @@ fn ask_retry(sock: &mut dyn ProbeSocket, dst: &str, seq: u16, ttl: Option<u8>, s
     panic!("no answer from {dst}");
 }
 
+/// Like `ask_retry`, but also retries a non-echo answer: right after the lab
+/// comes up, the first IPv6 probe can come back "unreachable" while the
+/// router still resolves the far host (seen in CI). Returns the last answer.
+fn ask_echo(sock: &mut dyn ProbeSocket, dst: &str, seq: u16, ttl: Option<u8>, size: u16) -> Reply {
+    let mut last = ask_retry(sock, dst, seq, ttl, size);
+    for i in 1..10 {
+        if last.kind == ReplyKind::Echo {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        last = ask_retry(sock, dst, seq.wrapping_add(i * 100), ttl, size);
+    }
+    last
+}
+
 fn ip_of(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
@@ -274,7 +289,7 @@ fn loopback_with_both_socket_kinds() {
         let prober = HostProber::with_kind(kind);
         let mut sock = prober.open(&SocketOptions::default()).unwrap();
         for (i, dst) in ["127.0.0.1", "::1"].into_iter().enumerate() {
-            let r = ask_retry(sock.as_mut(), dst, 10 + i as u16, None, 84);
+            let r = ask_echo(sock.as_mut(), dst, 10 + i as u16, None, 84);
             assert_eq!(r.kind, ReplyKind::Echo, "{kind:?} {dst}");
             assert_eq!(r.from, ip_of(dst));
             assert!(r.rtt < Duration::from_millis(500));
@@ -300,7 +315,7 @@ fn across_a_veth_and_through_a_router() {
             (ReplyKind::Echo, Some(64)),
             "{kind:?}"
         );
-        let r = ask_retry(sock.as_mut(), &lab.near6, 2, None, 56);
+        let r = ask_echo(sock.as_mut(), &lab.near6, 2, None, 56);
         assert_eq!(r.kind, ReplyKind::Echo, "{kind:?}");
         // One router further: TTL 63, and TTL 1 dies at the router.
         let r = ask_retry(sock.as_mut(), &lab.far, 3, None, 56);
@@ -313,7 +328,7 @@ fn across_a_veth_and_through_a_router() {
         assert_eq!(r.kind, ReplyKind::TtlExceeded, "{kind:?}");
         assert_eq!(r.from, ip_of(&lab.near));
         // TTL 2 is enough to reach the host behind the router (what MTR walks).
-        let r = ask_retry(sock.as_mut(), &lab.far, 9, Some(2), 56);
+        let r = ask_echo(sock.as_mut(), &lab.far, 9, Some(2), 56);
         assert_eq!(r.kind, ReplyKind::Echo, "{kind:?}");
         assert_eq!(r.from, ip_of(&lab.far));
         let r = ask_retry(sock.as_mut(), &lab.far6, 5, Some(1), 56);
@@ -343,7 +358,7 @@ fn dont_fragment_finds_the_narrow_link() {
             ..SocketOptions::default()
         };
         let mut sock = prober.open(&df).unwrap();
-        let r = ask_retry(sock.as_mut(), &lab.far, 1, None, 1400);
+        let r = ask_echo(sock.as_mut(), &lab.far, 1, None, 1400);
         assert_eq!(r.kind, ReplyKind::Echo, "{kind:?}");
         // 1401 bytes with DF: the router says "fragmentation needed, 1400"
         // the first time; after that the kernel knows the path MTU and
@@ -377,7 +392,7 @@ fn dont_fragment_finds_the_narrow_link() {
             other => panic!("{kind:?}: expected too big, got {other:?}"),
         }
         // IPv6: "packet too big" from the router.
-        let r = ask_retry(sock.as_mut(), &lab.far6, 7, None, 1400);
+        let r = ask_echo(sock.as_mut(), &lab.far6, 7, None, 1400);
         assert_eq!(r.kind, ReplyKind::Echo, "{kind:?}");
         let probe = Probe {
             dst: ip_of(&lab.far6),
@@ -427,7 +442,7 @@ fn source_address_and_device_are_honored() {
             ..SocketOptions::default()
         })
         .unwrap();
-    let r = ask_retry(sock.as_mut(), &lab.far, 1, None, 56);
+    let r = ask_echo(sock.as_mut(), &lab.far, 1, None, 56);
     assert_eq!(r.kind, ReplyKind::Echo);
     // A source that is not ours cannot be bound.
     let mut bad = prober

@@ -145,3 +145,32 @@ São ~15% a mais sobre clippy + test (o passo `netns` e o `wasm` vêm depois e n
 porque compilar só (o que o clippy já faz) não pega um benchmark que dá panic ao rodar. O
 benchmark do kernel (`netns_apply`) só imprime "skipped" no `bench-check`; ele roda de verdade no
 `cargo xtask bench`.
+
+## CI e build (processo, 2026-10-22)
+
+**Medido** no GitHub Actions (`ubuntu-latest`), job `xtask ci (linux)`, antes desta mudança:
+
+| Passo | Run de PR | Run da `main` |
+|---|---|---|
+| Carregar o módulo `vrf` | 416 s (instalou `linux-modules-extra`) | 18 s (`modprobe` direto) |
+| Dependências de sistema (`apt`) | 114 s | 14 s |
+| Restaurar o cache (`rust-cache`, ~2,5 GB) | 70 s | 68 s |
+| `cargo xtask ci` | 160 s | 147 s (test 67 s, netns 57 s) |
+| **Total do job** | **775 s** | **264 s** |
+
+Mudanças: o `vrf.ko` sai do `.deb` baixado em vez de instalar o pacote; sem debuginfo no CI
+(`CARGO_PROFILE_{DEV,TEST}_DEBUG=0`), para encolher o cache e o link; `cargo nextest` no passo
+`test` (os binários rodam em paralelo), com `cargo test --doc` só quando existe doctest (hoje
+nenhum: os 20 `rustdoc` custavam 17 s para nada).
+
+**Medido** nesta máquina (32 núcleos, build dev já compilado, 2026-10-22):
+
+| | Antes | Depois |
+|---|---|---|
+| Testes do workspace | `cargo test` 29,7 s | `cargo xtask test` (nextest) 14,3 s |
+
+**`sccache` não foi adotado** (medido, workspace inteiro com testes, pasta de build nova como a
+de uma sessão em paralelo): sem `sccache` 27 s; `sccache` frio 34 s; `sccache` quente em outra
+pasta 36 s, com 0% de acerto em Rust. Ele não reaproveita entre caminhos de saída diferentes nem
+crates com compilação incremental, e o build já é curto. No CI, o `rust-cache` restaura o
+`target` inteiro de uma vez. Rever se as builds ficarem longas.

@@ -211,6 +211,13 @@ pub fn log_entry(date: &str, c: &Change) -> String {
     out
 }
 
+/// Is `c`'s log entry already in `log` (any date)?
+fn is_folded(log: &str, c: &Change) -> bool {
+    c.log
+        .first()
+        .is_some_and(|first| log.contains(&format!(" — {}: {first}\n", c.id)))
+}
+
 /// Append `entry` after a blank line.
 fn append(doc: &str, entry: &str, blank: bool) -> String {
     let mut out = doc.trim_end().to_owned();
@@ -238,6 +245,12 @@ pub fn fold(
 ) -> Result<Folded, String> {
     let (mut gaps, mut log, mut history) = (gaps.to_owned(), log.to_owned(), history.to_owned());
     for c in changes {
+        // Already folded: a branch made from another PR's branch still
+        // carries that PR's change file after its squash reached the main
+        // (the file never existed there, so the merge keeps it). Drop it.
+        if is_folded(&log, c) {
+            continue;
+        }
         for row in &c.rows {
             gaps = insert_row(&gaps, row)?;
         }
@@ -420,6 +433,16 @@ mod tests {
         assert!(out.contains("| G4.7b | DHCPv6 | aberto |\n| G4.7c | Novo | aberto |\n| G4.8 |"));
         assert!(insert_row(GAPS_MD, "| G4.7b | Dup | aberto |").is_err());
         assert!(insert_row(GAPS_MD, "| G7.1 | Fase nova | aberto |").is_err());
+    }
+
+    #[test]
+    fn fold_skips_a_change_already_in_the_log() {
+        let c = change("id: G4.7b\nstatus: feito\nhistory: G4.7b feito\n\nEntrou.\n");
+        let log = "# log\n\n- 2026-10-21 — G4.7b: Entrou.\n";
+        let (gaps, log2, history) = fold("2026-10-22", &[c], GAPS_MD, log, "# h\n").unwrap();
+        assert_eq!(log2, log);
+        assert_eq!(history, "# h\n");
+        assert_eq!(gaps, GAPS_MD);
     }
 
     #[test]
