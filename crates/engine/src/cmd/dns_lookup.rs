@@ -279,7 +279,7 @@ mod tests {
         assert_eq!(done["state"], "failed");
         assert_eq!(done["events"][0]["timeout"], true);
         assert!(done["reason"].as_str().unwrap().contains("timeout"));
-        assert_eq!(fake.0.lock().unwrap()[0].1, true, "tcp passed on");
+        assert!(fake.0.lock().unwrap()[0].1, "tcp passed on");
     }
 
     #[test]

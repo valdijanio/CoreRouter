@@ -400,7 +400,7 @@ fn status_line(ui: &mut Ui, a: &Value) {
         chip(ui, &format!("{} ms", text(a, "ms")), neutral_tone(&v)).on_hover_text("Query time");
         let server = text(a, "server");
         let shown = server.split('#').next().unwrap_or(&server).to_owned();
-        let shown = if shown.starts_with("127.0.0.1") && text(a, "stage") != "" {
+        let shown = if shown.starts_with("127.0.0.1") && !text(a, "stage").is_empty() {
             "router".to_owned()
         } else {
             shown

@@ -61,9 +61,10 @@ pub(crate) fn exchange(
         LookupServer::Plain(ip) => {
             // The resolver's port: 53 but in tests.
             let addr = SocketAddr::new(*ip, dns.resolver.settings().port);
-            let id = query
-                .get(..2)
-                .map_or(0, |b| u16::from_be_bytes([b[0], b[1]]));
+            let id = match query {
+                [a, b, ..] => u16::from_be_bytes([*a, *b]),
+                _ => 0,
+            };
             let mut accept = |m: &[u8]| dig::is_reply_to(id, m);
             let mut t = dns.transport();
             let mut over_tcp = tcp;
