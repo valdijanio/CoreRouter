@@ -20,12 +20,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "DNS",
         ["IP", "DNS"],
         None,
-        "{servers?: [ip], allow_remote_requests?: bool (answer the LAN on UDP/TCP 53), allowed_from?: [interface list | prefix] (who may ask; default LAN; others get REFUSED), max_queries_per_client?: int 0..100000 (per second, 0 = no limit), server_selection?: fastest | sequential, serve_stale_secs?: int 0..604800 (RFC 8767; 0 = off), max_concurrent_queries?: int 1..1000, max_concurrent_tcp_sessions?: int 1..1000, address_list_extra_time_secs?: int, cache_size?: int 0..1048576, cache_max_ttl_secs?: int, query_server_timeout_ms?: int 100..60000, query_total_timeout_ms?: int 100..600000, max_udp_packet_size?: int 512..65507} → {servers, allow_remote_requests, allowed_from, max_queries_per_client, server_selection, serve_stale_secs, max_concurrent_queries, max_concurrent_tcp_sessions, address_list_extra_time_secs, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size}",
+        "{servers?: [ip], allow_remote_requests?: bool (answer the LAN on UDP/TCP 53), allowed_from?: [interface list | prefix] (who may ask; default LAN; others get REFUSED), max_queries_per_client?: int 0..100000 (per second, 0 = no limit), server_selection?: fastest | sequential, serve_stale_secs?: int 0..604800 (RFC 8767; 0 = off), max_concurrent_queries?: int 1..1000, max_concurrent_tcp_sessions?: int 1..1000, address_list_extra_time_secs?: int, cache_size?: int 0..1048576, cache_max_ttl_secs?: int, query_server_timeout_ms?: int 100..60000, query_total_timeout_ms?: int 100..600000, max_udp_packet_size?: int 512..65507, use_doh_server?: string (https://host/path DoH or tls://host[#name] DoT; asked instead of servers, which then only resolve its name; \"\" = off), verify_doh_cert?: bool (default yes)} → {servers, allow_remote_requests, allowed_from, max_queries_per_client, server_selection, serve_stale_secs, max_concurrent_queries, max_concurrent_tcp_sessions, address_list_extra_time_secs, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size, use_doh_server, verify_doh_cert}",
         always,
         set
     ),
     cmd!(query "ip.dns.get", "DNS", [], None,
-        "{} → {servers, dynamic_servers, allow_remote_requests, allowed_from, allowed_networks (what allowed_from stands for now), max_queries_per_client, server_selection, serve_stale_secs, max_concurrent_queries, max_concurrent_tcp_sessions, address_list_extra_time_secs, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size, cache_used, resolver: router|simulated, upstream: [{server, srtt_ms, answers, failures, down}]}",
+        "{} → {servers, dynamic_servers, allow_remote_requests, allowed_from, allowed_networks (what allowed_from stands for now), max_queries_per_client, server_selection, serve_stale_secs, max_concurrent_queries, max_concurrent_tcp_sessions, address_list_extra_time_secs, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size, use_doh_server, verify_doh_cert, cache_used, resolver: router|simulated, upstream: [{server, srtt_ms, answers, failures, down}]}",
         always, get),
     cmd!(query "ip.dns.cache.print", "DNS Cache", [], None,
         "{name?: string, type?: string (A, MX, …)} → [{name, type, kind: records|nx-domain|no-data, data: [record text], addresses, ttl, hits, server, stale}]",
@@ -57,6 +57,8 @@ fn settings_json(d: &Dns) -> Value {
         "query_server_timeout_ms": d.query_server_timeout_ms,
         "query_total_timeout_ms": d.query_total_timeout_ms,
         "max_udp_packet_size": d.max_udp_packet_size,
+        "use_doh_server": d.use_doh_server,
+        "verify_doh_cert": d.verify_doh_cert,
     })
 }
 
@@ -209,7 +211,18 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         "max_udp_packet_size",
         u32::from(*UDP_PACKET_SIZE.start())..=u32::from(*UDP_PACKET_SIZE.end()),
     )?;
+    let doh = opt_str(p, "use_doh_server")?.map(str::trim);
+    if let Some(u) = doh {
+        corerouter_proto_dns::check_secure(u).map_err(|why| EngineError::bad("use_doh_server", why))?;
+    }
+    let verify = opt_bool(p, "verify_doh_cert")?;
     let mut d = s.store().candidate().ip.dns.clone();
+    if let Some(u) = doh {
+        u.clone_into(&mut d.use_doh_server);
+    }
+    if let Some(v) = verify {
+        d.verify_doh_cert = v;
+    }
     if let Some(list) = servers {
         d.servers = list;
     }

@@ -145,8 +145,9 @@ pub struct Query {
     pub qtype: RecordType,
     /// Records answered before `name` (a static CNAME), put in front.
     pub prefix: Vec<Record>,
-    /// A static FWD entry: ask these servers instead.
-    pub forward_to: Option<Vec<IpAddr>>,
+    /// A static FWD entry: ask these servers (or this forwarders group)
+    /// instead.
+    pub forward_to: Option<crate::resolver::Upstreams>,
     /// A static entry's address list, for its `after`.
     pub address_list: Option<String>,
     /// Which stage answered.

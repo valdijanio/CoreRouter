@@ -19,7 +19,7 @@ fn handle(f: &Forwarder, q: &mut Query, t: Option<&mut dyn Transport>) -> Step {
     let Some(t) = t else { return Step::Wait };
     match f
         .resolver
-        .resolve(t, &q.name, q.qtype, q.forward_to.as_deref())
+        .resolve(t, &q.name, q.qtype, q.forward_to.as_ref())
     {
         Ok(r) => {
             q.source = Some(r.source);

@@ -488,6 +488,76 @@ que mudou" do RouterOS), allowlist e regex próprias da adlist (o Pi-hole tem as
 resposta configurável (NXDOMAIN, REFUSED, IP próprio) e envio de arquivos ao roteador (`/file`),
 hoje um diretório do daemon (`--adlist-dir`).
 
+### Forwarders e DoT/DoH (G4.1d-2)
+
+**Problema.** Mandar um domínio (o da empresa, o da VPN) para outro grupo de servidores, e
+cifrar o DNS que sai do roteador (o provedor e quem está no caminho veem cada nome perguntado).
+
+**Agora.**
+
+```sh
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.set '{"servers":["9.9.9.9"],"use_doh_server":"https://cloudflare-dns.com/dns-query"}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.forwarders.add '{"name":"corp","dns_servers":["10.0.0.53"],"doh_servers":["tls://10.0.0.54#dns.corp.example"]}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.static.add '{"name":"corp.example","type":"FWD","forward_to":"corp","match_subdomain":true}'
+```
+
+No terminal: `/ip dns set use-doh-server=… verify-doh-cert=yes`, `/ip dns forwarders add
+name=corp dns-servers=10.0.0.53 doh-servers=tls://…`, `/ip dns static add … type=FWD
+forward-to=corp`. Na GUI: os campos Use DoH Server e Verify DoH Certificate na janela DNS, e IP ›
+DNS Forwarders (ou o botão **Forwarders**), com a coluna "Used By" (as estáticas que usam cada
+grupo).
+
+| Comando | Parâmetros |
+|---|---|
+| `ip.dns.set/get` | + `use_doh_server` (`https://host/path` DoH ou `tls://host[:porta][#nome]` DoT; vazio desliga), `verify_doh_cert` (padrão sim) |
+| `ip.dns.forwarders.add/set` | `name`, `dns_servers` (até 8 IPs), `doh_servers` (até 4 URLs DoH/DoT), `verify_doh_cert` (padrão sim), `disabled`, `comment` |
+| `ip.dns.forwarders.remove` | `id` (recusa se uma estática FWD ainda o usa) |
+| `ip.dns.forwarders.print` | + `used_by` |
+| `ip.dns.static.add/set` | `forward_to` aceita também o nome de um grupo (como o `forward-to` do RouterOS) |
+
+**Como funciona.**
+
+- `use_doh_server`: todas as consultas (do roteador e da LAN) vão ao servidor cifrado; os
+  `servers` comuns só resolvem o nome dele, como no RouterOS. O nome também pode vir de uma
+  estática A/AAAA (o RouterOS recomenda) ou ser um endereço (`https://1.1.1.1/dns-query`). Não
+  há volta para o DNS comum quando o cifrado falha (RFC 8310 §5: o perfil estrito não cai para
+  texto claro); o serve-stale continua valendo.
+- Um grupo pode misturar servidores comuns e cifrados: os comuns primeiro, pela mesma regra
+  `server_selection`, depois os cifrados. Grupo desabilitado ou apagado: a estática usa os
+  servidores de sempre. Renomear um grupo leva as estáticas junto.
+- **DoT** (RFC 7858): TLS na porta 853, cada mensagem com 2 bytes de tamanho (§3.3); o nome
+  depois de `#` é o que o certificado tem de trazer (RFC 8310 §6.6, o `ip@853#nome` do Unbound);
+  sem `#`, o próprio host.
+- **DoH** (RFC 8484): `POST` com `application/dns-message` (§4.1), resposta conferida pelo tipo
+  (§4.2), HTTP/1.1. Caminho padrão `/dns-query` (o exemplo da RFC).
+- A consulta cifrada vai com id 0 (RFC 8484 §4.1) e é preenchida até múltiplo de 128 bytes com a
+  opção Padding do EDNS(0) (RFC 7830, RFC 8467 §4.1): o tamanho não entrega o nome.
+- **Conexões reaproveitadas** (RFC 7858 §3.4): até 4 ociosas por servidor, por 20 s; uma que o
+  servidor fechou é refeita uma vez. Espera de no mínimo 5 s por servidor cifrado (o
+  `doh-timeout` do RouterOS), dentro do `query_total_timeout_ms`.
+- `verify_doh_cert` (padrão **sim**, o RouterOS usa não em `/ip dns`): cadeia até as raízes da
+  Mozilla embutidas e o nome no subjectAltName (RFC 8310 §8.1). Desligado: continua cifrado, com
+  qualquer certificado.
+
+**Testes.** `proto-dns`: endereços DoH/DoT (portas, IPv6, `#nome`, recusas) com proptest de ida e
+volta; consulta com id 0 e padding; resolvedor com `use_doh_server` por endereço, por nome
+resolvido pelos servidores comuns, por estática, e o erro que diz o que fazer; grupo misto com
+troca de servidor; transporte sem daemon recusa com a mensagem certa. Engine: `ip.dns.forwarders.*`
+(sucesso, validação, rollback, renomear leva as estáticas, remover recusa se em uso), FWD para
+grupo inexistente recusado, `use_doh_server` inválido recusado. Daemon: servidores DoT e DoH
+locais com certificado autoassinado (recusado com verificação, aceito sem; três consultas numa
+conexão só) e o resolvedor do roteador por eles. UI: campos DoH na janela DNS, botão Forwarders,
+novo grupo pelo diálogo. Ao vivo: DoH no `cloudflare-dns.com` (nome resolvido pelo 9.9.9.9) e DoT
+no Quad9 (`tls://9.9.9.9#dns.quad9.net`) por um grupo, com certificado verificado.
+
+**Desempenho** (**medido**, 2026-10-22, release, cache vazio, 15 nomes populares pelo 1.1.1.1, RTT
+~48 ms): UDP 48–51 ms, DoT 47–49 ms, DoH 49–53 ms por consulta. Com a conexão reaproveitada, o
+TLS não acrescenta tempo perceptível.
+
+**Fica para depois:** HTTP/2 no DoH (só se algum servidor recusar HTTP/1.1), várias consultas em
+voo numa mesma conexão (pipelining, RFC 7858 §3.3), `dns_servers` de grupo por nome, e a coluna de
+protocolo na tabela `upstream` do `ip.dns.get` (hoje o servidor cifrado aparece pelo endereço).
+
 ### Pesquisa da G4.1d
 
 Fontes:
@@ -530,6 +600,16 @@ do servidor DoH, sem volta ao DNS comum. HTTP/2 no DoH só na 7.23 (ARM64/x86). 
   (ou o IP da linha de hosts), TTL de bloqueio 10 s, listas a cada 24 h, até 256 MB por lista.
 - **Unbound/OPNsense:** DNSBL de domínios, com campo separado para curingas; DoT por forwarder
   com nome do certificado (`ip@853#nome`), padding de 128 bytes ligado.
+
+**O que adotamos (parte 2).** `/ip dns forwarders` com os nomes do RouterOS (`dns-servers`,
+`doh-servers`, `verify-doh-cert` sim no grupo), a estática `FWD forward-to=<grupo>`,
+`use-doh-server` substituindo os `servers` (que só resolvem o nome dele) e sem volta para texto
+claro. Do Unbound/OPNsense: DoT com o nome do certificado (`#nome`) e padding de 128 bytes.
+
+**Melhorias sobre o MikroTik (parte 2).** DoT além de DoH (o RouterOS não tem) na mesma sintaxe;
+`verify_doh_cert` ligado por padrão também em `/ip dns`, com raízes embutidas; padding (RFC 8467)
+e id 0; grupos que misturam servidores comuns e cifrados; "Used By" por grupo, remoção recusada
+se em uso e renomear leva as estáticas; erro que diz como resolver o nome do servidor cifrado.
 
 **O que adotamos (parte 1).** Nomes e comportamento do RouterOS (`url`, `file`, `ssl-verify`,
 contadores, `reload`, 4 h, 0.0.0.0, FWD como allowlist); semântica de casamento e `::` para AAAA

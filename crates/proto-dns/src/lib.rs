@@ -12,6 +12,7 @@
 pub mod adlist;
 pub mod asn;
 pub mod cache;
+pub mod encrypted;
 pub mod message;
 pub mod resolver;
 pub mod reverse;
@@ -40,6 +41,33 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
             ));
         }
     }
+    if let Err(why) = check_secure(&cfg.ip.dns.use_doh_server) {
+        out.push(Issue::new("ip.dns", format!("use_doh_server: {why}")));
+    }
+    if let Some(m) = cfg.ip.dns_forwarders.problem() {
+        out.push(Issue::new("ip.dns.forwarders", m));
+    }
+    for g in &cfg.ip.dns_forwarders.entries {
+        for u in &g.doh_servers {
+            if let Err(why) = check_secure(u) {
+                out.push(Issue::new(
+                    "ip.dns.forwarders",
+                    format!("forwarder {}: doh_servers: {why}", g.name),
+                ));
+            }
+        }
+    }
+    for e in &cfg.ip.dns_static.entries {
+        if !e.forwarder.is_empty() && cfg.ip.dns_forwarders.get(&e.forwarder).is_none() {
+            out.push(Issue::new(
+                "ip.dns.static",
+                format!(
+                    "static entry {}: no forwarders group '{}'",
+                    e.id, e.forwarder
+                ),
+            ));
+        }
+    }
     if let Some(m) = cfg.ip.dns_adlist.problem() {
         out.push(Issue::new("ip.dns.adlist", m));
     }
@@ -58,6 +86,14 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     }
     out.extend(zone::validate(cfg));
     out
+}
+
+/// Whether `url` is a usable encrypted server address (`""`: none).
+pub fn check_secure(url: &str) -> Result<(), String> {
+    if url.is_empty() {
+        return Ok(());
+    }
+    encrypted::SecureServer::parse(url, true).map(|_| ())
 }
 
 /// Whether `pattern` compiles as a static entry's `regexp`.
