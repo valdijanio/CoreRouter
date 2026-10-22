@@ -12,7 +12,7 @@
 use std::fmt::Write as _;
 use std::net::IpAddr;
 
-use corerouter_hal::HalError;
+use corerouter_hal::{Features, HalError, NO_VRF};
 use corerouter_model::IfName;
 use futures_util::TryStreamExt;
 use ipnet::IpNet;
@@ -34,13 +34,46 @@ const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
 const EEXIST: i32 = 17;
 const ENODEV: i32 = 19;
+const EOPNOTSUPP: i32 = 95;
 const EADDRNOTAVAIL: i32 = 99;
+
+/// Table of the throwaway VRF link `probe_vrf` makes: far above the ids the
+/// engine hands out (`model::route::LAST_VRF_TABLE`).
+const PROBE_TABLE: u32 = 0xFFFF_FFF0;
+/// Names `probe_vrf` tries before giving up (each taken one is skipped).
+const PROBE_TRIES: u32 = 8;
 
 /// Run `ops` against the kernel of the current network namespace.
 pub(crate) fn apply(ops: &[Op]) -> Result<(), HalError> {
     if ops.is_empty() {
         return Ok(());
     }
+    with_kernel(|k| async move { run(&k, ops).await })
+}
+
+/// What the kernel of the current network namespace supports. A probe that
+/// cannot decide (no `CAP_NET_ADMIN`, no netlink) assumes yes and logs why:
+/// `apply` still reports a real failure, with the same text.
+pub(crate) fn features() -> Features {
+    let vrf = match with_kernel(|k| async move { k.probe_vrf().await.map_err(HalError::Io) }) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("could not probe VRF support ({e}); assuming the kernel has it");
+            true
+        }
+    };
+    if !vrf {
+        log::warn!("{NO_VRF}: ip.vrf.add is disabled");
+    }
+    Features { vrf }
+}
+
+/// A private current-thread runtime and netlink connection for one call.
+fn with_kernel<T, F, Fut>(f: F) -> Result<T, HalError>
+where
+    F: FnOnce(Kernel) -> Fut,
+    Fut: Future<Output = Result<T, HalError>>,
+{
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()
@@ -49,7 +82,7 @@ pub(crate) fn apply(ops: &[Op]) -> Result<(), HalError> {
         let (conn, handle, _) = rtnetlink::new_connection()
             .map_err(|e| HalError::Io(format!("netlink socket: {e}")))?;
         let task = tokio::spawn(conn);
-        let out = run(&Kernel { handle }, ops).await;
+        let out = f(Kernel { handle }).await;
         task.abort();
         out
     })
@@ -327,11 +360,43 @@ impl Kernel {
             .add(msg)
             .execute()
             .await
-            .map_err(|e| readable(&e))?;
+            .map_err(|e| create_error(spec, errno(&e), readable(&e)))?;
         Ok(vec![Op::DeleteLink {
             link: link.clone(),
             spec: spec.clone(),
         }])
+    }
+
+    /// Whether the kernel can create `vrf` links: make a throwaway one under
+    /// a name nobody uses and delete it. Existing links are never touched: a
+    /// taken name is skipped, and only the link made here is deleted.
+    async fn probe_vrf(&self) -> Result<bool, String> {
+        for n in 0..PROBE_TRIES {
+            let raw = format!("crvrf{:x}{n}", std::process::id());
+            let name: IfName = raw.parse().map_err(|e| format!("probe link name: {e}"))?;
+            let msg = LinkVrf::new(name.as_str(), PROBE_TABLE).build();
+            match self.handle.link().add(msg).execute().await {
+                Ok(()) => {}
+                Err(e) if errno(&e) == Some(EEXIST) => continue,
+                Err(e) => {
+                    return vrf_verdict(errno(&e))
+                        .ok_or_else(|| format!("creating a probe vrf link: {}", readable(&e)));
+                }
+            }
+            // The kernel took it, so it has VRF. Delete it only if the link
+            // under that name is still exactly the probe's.
+            let ours = LinkSpec::Vrf { table: PROBE_TABLE };
+            match self.find(&name).await? {
+                Some(l) if l.matches(&ours) => {
+                    if let Err(e) = self.handle.link().del(l.index).execute().await {
+                        log::warn!("could not delete the probe link '{name}': {}", readable(&e));
+                    }
+                }
+                _ => log::warn!("probe link '{name}' changed under us; left alone"),
+            }
+            return Ok(true);
+        }
+        Err(format!("{PROBE_TRIES} probe link names are all taken"))
     }
 
     async fn delete(&self, link: &IfName, spec: &LinkSpec) -> Result<Vec<Op>, String> {
@@ -487,6 +552,21 @@ impl Kernel {
     }
 }
 
+/// Why creating `spec` failed, in words an operator can act on.
+fn create_error(spec: &LinkSpec, code: Option<i32>, text: String) -> String {
+    match (spec, code) {
+        // "Operation not supported": the `vrf` link kind is not in the kernel.
+        (LinkSpec::Vrf { .. }, Some(EOPNOTSUPP)) => NO_VRF.to_owned(),
+        _ => text,
+    }
+}
+
+/// The probe's answer for a failed `vrf` create: `Some(false)` when the
+/// kernel does not know the kind, `None` when the error says nothing about it.
+fn vrf_verdict(code: Option<i32>) -> Option<bool> {
+    (code == Some(EOPNOTSUPP)).then_some(false)
+}
+
 /// The netlink message that adds or deletes `r` (same fields both ways, so
 /// a delete only ever matches the route an add made).
 fn route_msg(r: &KernelRoute, oif: u32) -> Result<RouteMessage, String> {
@@ -539,5 +619,32 @@ fn ip_of(a: &RouteAddress) -> Option<IpAddr> {
         RouteAddress::Inet(v4) => Some(IpAddr::V4(*v4)),
         RouteAddress::Inet6(v6) => Some(IpAddr::V6(*v6)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn vrf_create_without_kernel_support_says_so() {
+        let vrf = LinkSpec::Vrf { table: 1000 };
+        let raw = "Operation not supported (os error 95)".to_owned();
+        assert_eq!(create_error(&vrf, Some(EOPNOTSUPP), raw.clone()), NO_VRF);
+        // Other errors, and EOPNOTSUPP on other kinds, keep the kernel's text.
+        assert_eq!(create_error(&vrf, Some(EEXIST), "exists".into()), "exists");
+        assert_eq!(
+            create_error(&LinkSpec::Bridge, Some(EOPNOTSUPP), raw.clone()),
+            raw
+        );
+        assert_eq!(create_error(&vrf, None, "socket".into()), "socket");
+    }
+
+    #[test]
+    fn probe_verdict_is_no_only_for_unsupported() {
+        assert_eq!(vrf_verdict(Some(EOPNOTSUPP)), Some(false));
+        for undecided in [None, Some(1), Some(EEXIST), Some(ENODEV)] {
+            assert_eq!(vrf_verdict(undecided), None, "{undecided:?}");
+        }
     }
 }
