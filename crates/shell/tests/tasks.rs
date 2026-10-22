@@ -37,7 +37,7 @@ impl Sim {
         json!([
             {"id": "tool.ping.start", "label": "Ping", "params": "{address: ip | name, count?: u32, interval_ms?: u32} → {id}",
              "kind": "action", "enabled": true, "alias": "ping", "positional": "address", "task": true},
-            {"id": "tool.mtr.start", "label": "MTR", "params": "{address: string, count?: int} → {id}",
+            {"id": "tool.mtr.start", "label": "MTR", "params": "{address: string, count?: int, use_dns?: bool, as_lookup?: bool} → {id}",
              "kind": "query", "enabled": true, "alias": "traceroute,mtr", "positional": "address", "task": true},
             {"id": "tool.task.poll", "label": "Poll Task", "params": "{id: u64, after_seq?: u64} → {events}", "kind": "query", "enabled": true},
             {"id": "tool.task.stop", "label": "Stop Task", "params": "{id: u64} → {id}", "kind": "action", "enabled": true},
@@ -265,6 +265,16 @@ fn a_menu_named_like_an_alias_runs_its_command() {
         assert!(!out.failed, "{line}: {}", out.text());
         assert_eq!(sim.mtr, Some(json!({"address": "9.9.9.9"})), "{line}");
     }
+    // G6.3b: names on by default, AS numbers on request, as RouterOS
+    // spells them.
+    sim.mtr = None;
+    let job = sh.submit("/tool traceroute 9.9.9.9 use-dns=no as-lookup=yes");
+    let out = sh.run_with(job, |r| sim.answer(r));
+    assert!(!out.failed, "{}", out.text());
+    assert_eq!(
+        sim.mtr,
+        Some(json!({"address": "9.9.9.9", "use_dns": false, "as_lookup": true}))
+    );
 }
 
 #[test]

@@ -4,6 +4,10 @@
 //! and polls it; the per-hop statistics come from the engine. The bar after
 //! the numbers is each hop's average RTT next to the slowest one, so the
 //! hop where latency jumps stands out.
+//!
+//! G6.3b: each hop shows its name (when the reverse lookup has answered)
+//! above its address in small type, its origin AS and the MPLS labels it
+//! reported; private and CGNAT addresses carry a tag instead.
 
 use egui::{Color32, Grid, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
@@ -21,6 +25,8 @@ pub(crate) struct MtrForm {
     pub(crate) src: String,
     pub(crate) interface: String,
     pub(crate) routing_table: String,
+    pub(crate) use_dns: bool,
+    pub(crate) as_lookup: bool,
 }
 
 impl Default for MtrForm {
@@ -33,6 +39,8 @@ impl Default for MtrForm {
             src: String::new(),
             interface: String::new(),
             routing_table: String::new(),
+            use_dns: true,
+            as_lookup: false,
         }
     }
 }
@@ -117,6 +125,8 @@ impl CoreRouterUi {
             "src_address": text(&f.src),
             "interface": text(&f.interface),
             "routing_table": text(&f.routing_table),
+            "use_dns": f.use_dns,
+            "as_lookup": f.as_lookup,
         });
         if let Value::Object(o) = &mut p {
             o.retain(|_, v| !v.is_null());
@@ -194,6 +204,11 @@ impl CoreRouterUi {
                     &mut f.routing_table,
                     &tables,
                 );
+                ui.checkbox(&mut f.use_dns, "Use DNS")
+                    .on_hover_text("Show hop names (reverse DNS through IP › DNS)");
+                ui.checkbox(&mut f.as_lookup, "AS lookup").on_hover_text(
+                    "Show each hop's origin AS (TXT queries to the Team Cymru service)",
+                );
                 ui.end_row();
             });
         ui.separator();
@@ -267,6 +282,8 @@ impl CoreRouterUi {
             .filter_map(|h| num(h, "avg_ms"))
             .fold(0.0f64, f64::max);
         let bar = ui.visuals().selection.bg_fill;
+        let as_col = t.summary.get("as_lookup").and_then(Value::as_bool) == Some(true);
+        let mpls_col = hops.iter().any(|h| h.get("mpls_text").is_some_and(Value::is_string));
         egui::ScrollArea::vertical()
             .id_salt("mtr-hops")
             .show(ui, |ui| {
@@ -274,32 +291,32 @@ impl CoreRouterUi {
                     .striped(true)
                     .spacing([12.0, 3.0])
                     .show(ui, |ui| {
-                        for h in [
-                            "Hop", "Host", "Loss %", "Sent", "Last", "Avg", "Best", "Worst",
-                            "StDev", "",
-                        ] {
+                        let mut heads = vec!["Hop", "Host"];
+                        if as_col {
+                            heads.push("ASN");
+                        }
+                        if mpls_col {
+                            heads.push("MPLS");
+                        }
+                        heads.extend([
+                            "Loss %", "Sent", "Last", "Avg", "Best", "Worst", "StDev", "",
+                        ]);
+                        for h in heads {
                             ui.strong(h);
                         }
                         ui.end_row();
                         for h in hops {
                             let g = |k: &str| h.get(k).map(value_text).unwrap_or_default();
                             ui.label(g("hop"));
-                            let hosts: Vec<String> = h
-                                .get("hosts")
-                                .and_then(Value::as_array)
-                                .into_iter()
-                                .flatten()
-                                .map(value_text)
-                                .collect();
-                            let mut host = if hosts.is_empty() {
-                                "???".to_owned()
-                            } else {
-                                hosts.join(", ")
-                            };
-                            if let Some(n) = h.get("note").and_then(Value::as_str) {
-                                host = format!("{host} ({n})");
+                            host_cell(ui, h);
+                            if as_col {
+                                ui.label(as_text(h));
                             }
-                            ui.label(host);
+                            if mpls_col {
+                                ui.label(
+                                    h.get("mpls_text").and_then(Value::as_str).unwrap_or(""),
+                                );
+                            }
                             let loss = num(h, "loss_pct").unwrap_or(0.0);
                             ui.label(
                                 RichText::new(format!("{loss:.1}")).color(loss_color(ui, loss)),
@@ -323,5 +340,58 @@ impl CoreRouterUi {
                         }
                     });
             });
+    }
+}
+
+/// "AS3356 LEVEL3", "AS3356", or "" (unknown or not looked up).
+fn as_text(h: &Value) -> String {
+    match (
+        h.get("asn").and_then(Value::as_u64),
+        h.get("as_name").and_then(Value::as_str),
+    ) {
+        (Some(n), Some(name)) => format!("AS{n} {name}"),
+        (Some(n), None) => format!("AS{n}"),
+        _ => String::new(),
+    }
+}
+
+/// The name above, the address (or addresses) below in small type; only
+/// the address while no name is known. A note (unreachable…) and the
+/// private/CGNAT tag follow the address.
+fn host_cell(ui: &mut Ui, h: &Value) {
+    let hosts: Vec<String> = h
+        .get("hosts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(value_text)
+        .collect();
+    let mut addr = if hosts.is_empty() {
+        "???".to_owned()
+    } else {
+        hosts.join(", ")
+    };
+    if let Some(scope) = h.get("scope").and_then(Value::as_str) {
+        addr = format!("{addr} [{scope}]");
+    }
+    if let Some(n) = h.get("note").and_then(Value::as_str) {
+        addr = format!("{addr} ({n})");
+    }
+    match h.get("name").and_then(Value::as_str) {
+        Some(name) => {
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.add(egui::Label::new(name).extend());
+                let size = ui
+                    .style()
+                    .text_styles
+                    .get(&egui::TextStyle::Body)
+                    .map_or(11.0, |f| f.size * 0.82);
+                ui.add(egui::Label::new(RichText::new(addr).size(size).weak()).extend());
+            });
+        }
+        None => {
+            ui.add(egui::Label::new(addr).extend());
+        }
     }
 }

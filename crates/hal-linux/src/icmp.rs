@@ -27,8 +27,10 @@ use std::os::fd::{AsFd, AsRawFd};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::time::{Duration, Instant};
 
+use corerouter_hal::icmp_ext;
 use corerouter_hal::probe::{
-    Family, Probe, ProbeError, ProbeSocket, Prober, Reply, ReplyKind, SocketOptions, overhead,
+    Family, MplsLabel, Probe, ProbeError, ProbeSocket, Prober, Reply, ReplyKind, SocketOptions,
+    overhead,
 };
 use nix::errno::Errno;
 use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -355,6 +357,8 @@ pub struct Parsed {
     pub kind: ReplyKind,
     pub size: Option<u16>,
     pub ttl: Option<u8>,
+    /// RFC 4950 labels of an ICMP error (raw sockets only).
+    pub mpls: Vec<MplsLabel>,
 }
 
 /// The echo header quoted inside an ICMP error: `(ident, seq)`.
@@ -406,6 +410,7 @@ pub fn parse_raw_v4(pkt: &[u8]) -> Option<Parsed> {
     Some(Parsed {
         seq,
         ident,
+        mpls: icmp_ext::mpls_labels(icmp, false),
         kind,
         size: Some(total),
         ttl: Some(ttl),
@@ -433,6 +438,7 @@ pub fn parse_raw_v6(icmp: &[u8], hop_limit: Option<u8>) -> Option<Parsed> {
     Some(Parsed {
         seq,
         ident,
+        mpls: icmp_ext::mpls_labels(icmp, true),
         kind,
         size: u16::try_from(icmp.len() + 40).ok(),
         ttl: hop_limit,
@@ -541,6 +547,7 @@ impl Side {
                             kind: ReplyKind::Echo,
                             size: u16::try_from(n + usize::from(overhead(from)) - 8).ok(),
                             ttl,
+                            mpls: Vec::new(),
                         })
                     })
                     .flatten()
@@ -598,6 +605,9 @@ impl Side {
                 kind,
                 size: None,
                 ttl: None,
+                // The error queue holds our probe, not the router's
+                // message: its ICMP extensions are not visible here.
+                mpls: Vec::new(),
             },
             from,
         ))
@@ -639,6 +649,7 @@ impl HostSocket {
             size: p.size,
             ttl: p.ttl,
             rtt: sent.at.elapsed(),
+            mpls: p.mpls,
         })
     }
 
@@ -788,6 +799,23 @@ mod tests {
         fragn.extend_from_slice(&quoted);
         let p = parse_raw_v4(&ipv4(1, 255, &fragn)).unwrap();
         assert_eq!(p.kind, ReplyKind::TooBig { mtu: Some(1400) });
+
+        // RFC 4950 inside RFC 4884: the quote padded to 128 octets (length
+        // 32 words at octet 5), then the label stack the LSR saw.
+        let label = MplsLabel {
+            label: 24_017,
+            tc: 0,
+            bottom: true,
+            ttl: 1,
+        };
+        let mut te = vec![ICMP_TIME_EXCEEDED, 0, 0, 0, 0, 32, 0, 0];
+        te.extend_from_slice(&quoted);
+        te.resize(8 + 128, 0);
+        te.extend(icmp_ext::encode_extension(&[icmp_ext::mpls_object(&[
+            label,
+        ])]));
+        let p = parse_raw_v4(&ipv4(1, 250, &te)).unwrap();
+        assert_eq!((p.seq, p.mpls), (4, vec![label]));
 
         // Our own echo request (loopback) and garbage are not replies.
         assert!(parse_raw_v4(&ipv4(1, 64, &echo_request(Family::V4, 1, 1, 0))).is_none());

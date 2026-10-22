@@ -8,7 +8,7 @@
 use std::net::IpAddr;
 use std::sync::Arc;
 
-use corerouter_hal::probe::{ProbeError, ProbeSocket, Prober, SocketOptions};
+use corerouter_hal::probe::{AsInfo, Lookup, ProbeError, ProbeSocket, Prober, SocketOptions};
 use corerouter_hal::SharedProber;
 use corerouter_model::dns::CacheRow;
 use corerouter_proto_dns::resolver::{ResolveError, Settings};
@@ -23,6 +23,19 @@ pub trait DnsBackend: Send + Sync {
     fn cache_rows(&self) -> Vec<CacheRow>;
     fn cache_used_bytes(&self) -> usize;
     fn flush(&self);
+
+    /// The PTR name of `ip`, without waiting (G6.3b): the lookup runs on
+    /// the backend's own threads and a later call gets the answer. `None`:
+    /// no server configured (the prober's own names apply).
+    fn reverse_nowait(&self, _ip: IpAddr) -> Option<Lookup<Option<String>>> {
+        None
+    }
+
+    /// The origin AS of `ip` (Team Cymru over DNS), like
+    /// [`Self::reverse_nowait`].
+    fn origin_as_nowait(&self, _ip: IpAddr) -> Option<Lookup<Option<AsInfo>>> {
+        None
+    }
 }
 
 #[derive(Default)]
@@ -90,6 +103,18 @@ impl Prober for RouterResolver {
 
     fn open(&self, options: &SocketOptions) -> Result<Box<dyn ProbeSocket>, ProbeError> {
         self.inner.open(options)
+    }
+
+    fn reverse_name(&self, ip: IpAddr) -> Lookup<Option<String>> {
+        self.dns
+            .reverse_nowait(ip)
+            .unwrap_or_else(|| self.inner.reverse_name(ip))
+    }
+
+    fn origin_as(&self, ip: IpAddr) -> Lookup<Option<AsInfo>> {
+        self.dns
+            .origin_as_nowait(ip)
+            .unwrap_or_else(|| self.inner.origin_as(ip))
     }
 }
 

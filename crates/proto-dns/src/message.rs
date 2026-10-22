@@ -1,6 +1,7 @@
 //! Queries and replies of the stub resolver, encoded and decoded by
 //! `hickory-proto`. Only what a router needs to reach a name: A and AAAA,
-//! CNAME chains, and the negative answers of RFC 2308.
+//! CNAME chains, and the negative answers of RFC 2308; PTR and TXT for the
+//! names and AS numbers of MTR hops (G6.3b).
 
 use std::net::IpAddr;
 
@@ -83,8 +84,16 @@ fn rtype(q: QType) -> RecordType {
     match q {
         QType::A => RecordType::A,
         QType::Aaaa => RecordType::AAAA,
+        QType::Ptr => RecordType::PTR,
+        QType::Txt => RecordType::TXT,
     }
 }
+
+/// Longest TXT text kept from one record (a Team Cymru answer is ~60
+/// bytes; anything longer is not for us).
+pub const MAX_TXT: usize = 512;
+/// Records kept from one answer (a name with hundreds of PTRs is a trap).
+pub const MAX_RECORDS: usize = 16;
 
 /// A recursive query for `name`/`q` with a fresh random id (RFC 5452 §9.2),
 /// advertising `udp_payload` bytes with EDNS(0) (RFC 6891 §6.2.5).
@@ -108,6 +117,12 @@ pub enum Outcome {
         /// The last name of the CNAME chain, when there was one.
         canonical: Option<String>,
         /// Smallest TTL along the chain (RFC 2181 §5.2).
+        ttl: u32,
+    },
+    /// PTR names or TXT strings.
+    Records {
+        records: Vec<String>,
+        canonical: Option<String>,
         ttl: u32,
     },
     /// `ttl`: how long it may be cached (RFC 2308 §5); `None` without SOA,
@@ -153,6 +168,30 @@ fn negative_ttl(m: &Message) -> Option<u32> {
     })
 }
 
+/// Adds `v` once, up to [`MAX_RECORDS`].
+fn push<T: PartialEq>(list: &mut Vec<T>, v: T) {
+    if list.len() < MAX_RECORDS && !list.contains(&v) {
+        list.push(v);
+    }
+}
+
+/// A TXT record's strings joined, as text (lossy), at most [`MAX_TXT`].
+fn txt_text(t: &hickory_proto::rr::rdata::TXT) -> String {
+    let mut out = String::new();
+    for part in t.txt_data.iter() {
+        out.push_str(&String::from_utf8_lossy(part));
+        if out.len() > MAX_TXT {
+            break;
+        }
+    }
+    let mut end = out.len().min(MAX_TXT);
+    while !out.is_char_boundary(end) {
+        end -= 1;
+    }
+    out.truncate(end);
+    out
+}
+
 /// Checks `bytes` against the query (`id`, `name`, `q`) and reads it.
 pub fn parse_reply(id: u16, name: &Name, q: QType, bytes: &[u8]) -> Result<Outcome, ReplyError> {
     let m = Message::from_vec(bytes).map_err(|e| {
@@ -191,23 +230,32 @@ pub fn parse_reply(id: u16, name: &Name, q: QType, bytes: &[u8]) -> Result<Outco
     let mut ttl = u32::MAX;
     for _ in 0..=MAX_CNAME_HOPS {
         let mut addresses = Vec::new();
+        let mut records = Vec::new();
         let mut min = u32::MAX;
         // Only records owned by the name we follow count: anything else in
         // the answer section is out of the chain (RFC 2181 §5.4.1).
         for r in m.answers.iter().filter(|r| r.name == target) {
-            let ip = match (&r.data, want) {
-                (RData::A(a), RecordType::A) => IpAddr::V4(a.0),
-                (RData::AAAA(a), RecordType::AAAA) => IpAddr::V6(a.0),
+            match (&r.data, want) {
+                (RData::A(a), RecordType::A) => push(&mut addresses, IpAddr::V4(a.0)),
+                (RData::AAAA(a), RecordType::AAAA) => push(&mut addresses, IpAddr::V6(a.0)),
+                // RFC 1035 §3.3.12: PTRDNAME, a domain name.
+                (RData::PTR(p), RecordType::PTR) => push(&mut records, key_of(&p.0)),
+                // RFC 1035 §3.3.14: one or more <character-string>s.
+                (RData::TXT(t), RecordType::TXT) => push(&mut records, txt_text(t)),
                 _ => continue,
-            };
-            if !addresses.contains(&ip) {
-                addresses.push(ip);
             }
             min = min.min(ttl_of(r));
         }
         if !addresses.is_empty() {
             return Ok(Outcome::Addresses {
                 addresses,
+                canonical,
+                ttl: ttl.min(min),
+            });
+        }
+        if !records.is_empty() {
+            return Ok(Outcome::Records {
+                records,
                 canonical,
                 ttl: ttl.min(min),
             });
@@ -445,6 +493,67 @@ pub(crate) mod tests {
             parse_reply(id, &n, QType::Aaaa, &bytes),
             Ok(Outcome::Addresses { addresses, .. }) if addresses == vec![IpAddr::V6(ip)]
         ));
+    }
+
+    #[test]
+    fn ptr_and_txt_answers() {
+        use hickory_proto::rr::rdata::{PTR, TXT};
+        let n = name("52.0.2.10.in-addr.arpa");
+        let (id, q) = query(&n, QType::Ptr, 1232).unwrap();
+        let bytes = reply(
+            &q,
+            ResponseCode::NoError,
+            vec![Record::from_rdata(
+                n.clone(),
+                3600,
+                RData::PTR(PTR(name("Core1.Example.NET"))),
+            )],
+            None,
+        );
+        assert_eq!(
+            parse_reply(id, &n, QType::Ptr, &bytes),
+            Ok(Outcome::Records {
+                records: vec!["core1.example.net".into()],
+                canonical: None,
+                ttl: 3600
+            })
+        );
+        // RFC 2317 §4: a classless reverse zone answers through a CNAME.
+        let n = name("5.2.0.192.in-addr.arpa");
+        let (id, q) = query(&n, QType::Ptr, 1232).unwrap();
+        let bytes = reply(
+            &q,
+            ResponseCode::NoError,
+            vec![
+                cname("5.2.0.192.in-addr.arpa", 600, "5.0-26.2.0.192.in-addr.arpa"),
+                Record::from_rdata(
+                    name("5.0-26.2.0.192.in-addr.arpa"),
+                    60,
+                    RData::PTR(PTR(name("cpe.example"))),
+                ),
+            ],
+            None,
+        );
+        let Ok(Outcome::Records { records, ttl, .. }) = parse_reply(id, &n, QType::Ptr, &bytes)
+        else {
+            panic!("no PTR")
+        };
+        assert_eq!((records, ttl), (vec!["cpe.example".to_owned()], 60));
+        // RFC 1035 §3.3.14: the character-strings of one TXT record join.
+        let n = name("as3356.asn.cymru.com");
+        let (id, q) = query(&n, QType::Txt, 1232).unwrap();
+        let bytes = reply(
+            &q,
+            ResponseCode::NoError,
+            vec![Record::from_rdata(
+                n.clone(),
+                300,
+                RData::TXT(TXT::new(vec!["3356 | US | ".into(), "arin".into()])),
+            )],
+            None,
+        );
+        assert!(matches!(parse_reply(id, &n, QType::Txt, &bytes),
+            Ok(Outcome::Records { records, .. }) if records == vec!["3356 | US | arin".to_owned()]));
     }
 
     #[test]

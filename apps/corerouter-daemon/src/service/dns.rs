@@ -10,15 +10,22 @@
 //! the running `/ip dns` and the servers learned by DHCP into the resolver
 //! every second, so a lookup never needs the session lock. The LAN
 //! forwarder of G4.1b will answer from the same [`Resolver`] and cache.
+//!
+//! G6.3b: the MTR asks for hop names (PTR) and AS numbers (Team Cymru TXT)
+//! without waiting. Those go to a bounded queue served by a few worker
+//! threads; the answer is kept a while so the next pass of the MTR finds
+//! it, and the resolver's cache keeps it for its TTL.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use corerouter_engine::dns::DnsBackend;
 use corerouter_engine::{Shared, lock};
+use corerouter_hal::probe::{AsInfo, Lookup};
 use corerouter_model::dns::CacheRow;
 use corerouter_proto_dns::resolver::{ResolveError, Resolver, Transport, TransportError};
 
@@ -27,17 +34,99 @@ const TICK: Duration = Duration::from_secs(1);
 /// Largest reply read over UDP (RFC 6891 payloads go up to 65535).
 const MAX_REPLY: usize = 65_535;
 
+/// Threads answering the lookups nobody waits for.
+const WORKERS: usize = 4;
+/// Lookups queued at most; more are refused (and asked again later).
+const MAX_QUEUE: usize = 256;
+/// Answers kept for the next ask; the oldest go when full.
+const MAX_DONE: usize = 4096;
+/// How long an answer (or a failure) is handed out before it is asked
+/// again (the resolver's cache still answers within the record's TTL).
+const KEEP: Duration = Duration::from_secs(300);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Ask {
+    Ptr(IpAddr),
+    Asn(IpAddr),
+}
+
+#[derive(Debug, Clone)]
+enum Answer {
+    Name(Option<String>),
+    Asn(Option<AsInfo>),
+}
+
+#[derive(Default)]
+struct Queue {
+    waiting: VecDeque<Ask>,
+    busy: BTreeSet<Ask>,
+    done: BTreeMap<Ask, (Answer, Instant)>,
+}
+
+#[derive(Default)]
+struct Background {
+    queue: Mutex<Queue>,
+    wake: Condvar,
+}
+
+impl Background {
+    fn queue(&self) -> MutexGuard<'_, Queue> {
+        self.queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 /// The resolver plus the clock its cache runs on.
 pub(crate) struct RouterDns {
-    resolver: Resolver,
+    resolver: Arc<Resolver>,
     start: Instant,
+    background: Arc<Background>,
+    workers: OnceLock<()>,
 }
 
 impl RouterDns {
     fn new() -> Self {
         Self {
-            resolver: Resolver::default(),
+            resolver: Arc::new(Resolver::default()),
             start: Instant::now(),
+            background: Arc::default(),
+            workers: OnceLock::new(),
+        }
+    }
+
+    /// The answer to `ask` if known, else queue it (`Pending`). `None`: no
+    /// DNS server, the prober's own names apply.
+    fn nowait(&self, ask: Ask) -> Option<Lookup<Answer>> {
+        if self.resolver.settings().servers.is_empty() {
+            return None;
+        }
+        self.workers.get_or_init(|| self.spawn_workers());
+        let mut q = self.background.queue();
+        if let Some((answer, at)) = q.done.get(&ask) {
+            if at.elapsed() < KEEP {
+                return Some(Lookup::Done(answer.clone()));
+            }
+            q.done.remove(&ask);
+        }
+        if !q.busy.contains(&ask) && !q.waiting.contains(&ask) && q.waiting.len() < MAX_QUEUE {
+            q.waiting.push_back(ask);
+            self.background.wake.notify_one();
+        }
+        Some(Lookup::Pending)
+    }
+
+    fn spawn_workers(&self) {
+        for i in 0..WORKERS {
+            let bg = self.background.clone();
+            let resolver = self.resolver.clone();
+            let start = self.start;
+            let spawned = thread::Builder::new()
+                .name(format!("dns-lookup-{i}"))
+                .spawn(move || work(&bg, &resolver, start));
+            if let Err(e) = spawned {
+                log::error!("DNS: cannot start lookup thread {i}: {e}");
+            }
         }
     }
 
@@ -62,6 +151,70 @@ impl DnsBackend for RouterDns {
 
     fn flush(&self) {
         self.resolver.flush();
+        self.background.queue().done.clear();
+    }
+
+    fn reverse_nowait(&self, ip: IpAddr) -> Option<Lookup<Option<String>>> {
+        Some(match self.nowait(Ask::Ptr(ip))? {
+            Lookup::Done(Answer::Name(n)) => Lookup::Done(n),
+            Lookup::Done(Answer::Asn(_)) => Lookup::Done(None),
+            Lookup::Pending => Lookup::Pending,
+        })
+    }
+
+    fn origin_as_nowait(&self, ip: IpAddr) -> Option<Lookup<Option<AsInfo>>> {
+        Some(match self.nowait(Ask::Asn(ip))? {
+            Lookup::Done(Answer::Asn(a)) => Lookup::Done(a),
+            Lookup::Done(Answer::Name(_)) => Lookup::Done(None),
+            Lookup::Pending => Lookup::Pending,
+        })
+    }
+}
+
+/// One worker: takes a lookup, asks the network, keeps the answer.
+fn work(bg: &Background, resolver: &Resolver, start: Instant) {
+    loop {
+        let ask = {
+            let mut q = bg.queue();
+            loop {
+                if let Some(a) = q.waiting.pop_front() {
+                    q.busy.insert(a);
+                    break a;
+                }
+                q = bg
+                    .wake
+                    .wait(q)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+        };
+        let mut t = Sockets { start };
+        // A failure (timeout, SERVFAIL) is "no answer" for a while too:
+        // the MTR shows the address and does not hammer the servers.
+        let answer = match ask {
+            Ask::Ptr(ip) => Answer::Name(resolver.reverse(&mut t, ip).ok().flatten()),
+            Ask::Asn(ip) => Answer::Asn(
+                corerouter_proto_dns::asn::lookup(resolver, &mut t, ip)
+                    .ok()
+                    .flatten()
+                    .map(|o| AsInfo {
+                        asn: o.asn,
+                        name: o.name,
+                        prefix: o.prefix,
+                    }),
+            ),
+        };
+        let mut q = bg.queue();
+        q.busy.remove(&ask);
+        if q.done.len() >= MAX_DONE {
+            q.done.retain(|_, (_, at)| at.elapsed() < KEEP);
+        }
+        while q.done.len() >= MAX_DONE {
+            let Some(oldest) = q.done.iter().min_by_key(|(_, (_, at))| *at).map(|(k, _)| *k) else {
+                break;
+            };
+            q.done.remove(&oldest);
+        }
+        q.done.insert(ask, (answer, Instant::now()));
     }
 }
 
@@ -230,7 +383,7 @@ pub(crate) mod tests {
     use corerouter_engine::{Session, shared};
     use corerouter_proto_dns::resolver::Settings;
     use hickory_proto::op::{Message, OpCode, ResponseCode};
-    use hickory_proto::rr::rdata::A;
+    use hickory_proto::rr::rdata::{A, PTR, TXT};
     use hickory_proto::rr::{RData, Record, RecordType};
     use serde_json::json;
     use std::net::Ipv4Addr;
@@ -251,8 +404,24 @@ pub(crate) mod tests {
             m.metadata.truncation = tc;
             m.add_queries(q.queries.clone());
             let qq = &q.queries[0];
-            if !tc && qq.query_type() == RecordType::A {
-                m.add_answer(Record::from_rdata(qq.name().clone(), 300, RData::A(A(ip))));
+            let owner = qq.name().to_ascii();
+            let data = match qq.query_type() {
+                RecordType::A => Some(RData::A(A(ip))),
+                RecordType::PTR => Some(RData::PTR(PTR(
+                    format!("hop-{}.isp.example.", owner.split('.').next().unwrap_or("x"))
+                        .parse()
+                        .unwrap(),
+                ))),
+                RecordType::TXT if owner.starts_with("AS") => Some(RData::TXT(TXT::new(vec![
+                    "3356 | US | arin | 2000-03-10 | LEVEL3, US".into(),
+                ]))),
+                RecordType::TXT => Some(RData::TXT(TXT::new(vec![
+                    "3356 | 4.0.0.0/9 | US | arin | 1992-12-01".into(),
+                ]))),
+                _ => None,
+            };
+            if let (false, Some(d)) = (tc, data) {
+                m.add_answer(Record::from_rdata(qq.name().clone(), 300, d));
             }
             m.to_vec().unwrap()
         };
@@ -301,6 +470,39 @@ pub(crate) mod tests {
         let rows = dns.cache_rows();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].name, "uol.com.br");
+    }
+
+    #[test]
+    fn hop_names_and_as_numbers_do_not_wait() {
+        let (port, count) = server(Ipv4Addr::new(192, 0, 2, 13), false);
+        let dns = RouterDns::new();
+        assert_eq!(dns.reverse_nowait("4.2.2.2".parse().unwrap()), None, "no servers: no lookup");
+        dns.resolver.configure(settings(port, &["127.0.0.1"]), 0);
+        let hop: IpAddr = "4.69.1.7".parse().unwrap();
+        assert_eq!(dns.reverse_nowait(hop), Some(Lookup::Pending), "answers at once");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let name = loop {
+            match dns.reverse_nowait(hop) {
+                Some(Lookup::Done(n)) => break n,
+                _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                other => panic!("no answer: {other:?}"),
+            }
+        };
+        assert_eq!(name.as_deref(), Some("hop-7.isp.example"));
+        let asn = loop {
+            match dns.origin_as_nowait(hop) {
+                Some(Lookup::Done(a)) => break a,
+                _ if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                other => panic!("no answer: {other:?}"),
+            }
+        };
+        let asn = asn.unwrap();
+        assert_eq!((asn.asn, asn.name.as_deref()), (3356, Some("LEVEL3")));
+        let asked = count.load(Ordering::Relaxed);
+        assert_eq!(asked, 3, "PTR, origin TXT, AS name TXT");
+        dns.reverse_nowait(hop);
+        dns.origin_as_nowait(hop);
+        assert_eq!(count.load(Ordering::Relaxed), asked, "kept for the next pass");
     }
 
     #[test]
