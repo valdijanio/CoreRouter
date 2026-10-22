@@ -214,7 +214,7 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 ## Agentes em paralelo
 
 - `CARGO_TARGET_DIR=target-<seu-id>` próprio (o diretório `target-*` está no `.gitignore`);
-  apague-o ao terminar (~10–30 GB).
+  apague-o ao terminar (~7 GB depois de uma `cargo xtask ci`, **medido**).
 - Edite só os crates da sua tarefa (a coluna "crates" de `docs/gaps.md`). Precisa mexer em
   `crates/model` ou `crates/engine/src/session.rs`? São compartilhados: mudanças pequenas,
   aditivas, e avise no PR.

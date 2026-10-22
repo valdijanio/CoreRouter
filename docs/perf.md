@@ -174,3 +174,9 @@ de uma sessão em paralelo): sem `sccache` 27 s; `sccache` frio 34 s; `sccache` 
 pasta 36 s, com 0% de acerto em Rust. Ele não reaproveita entre caminhos de saída diferentes nem
 crates com compilação incremental, e o build já é curto. No CI, o `rust-cache` restaura o
 `target` inteiro de uma vez. Rever se as builds ficarem longas.
+
+**Pasta de build por sessão** (**medido**, `cargo xtask ci` do zero numa pasta nova, 32 núcleos,
+2026-10-22): com debuginfo completo, 15 GB e 163 s; com `debug = "line-tables-only"` no nosso
+código e sem debuginfo nas dependências (`[profile.dev]` do `Cargo.toml`), 6,6 GB e 135 s. Dos
+6,6 GB, 2,1 GB são os 87 executáveis de teste (cada arquivo de `tests/` vira um binário com o
+workspace inteiro) e 1,7 GB o cache incremental.
