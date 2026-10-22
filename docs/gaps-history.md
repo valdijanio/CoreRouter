@@ -51,3 +51,13 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-22 — G1.8 feito (bonding 802.3ad/active-backup e demais modos); G1.8b, G1.8c e G1.8d abertos
 - 2026-10-22 — G4.6 parte 1 feita (cliente SNTP e syslog remoto); criados G4.6b (acertar o relógio), G4.6c (servidor NTP), G4.6d (log do sistema e mais alvos), G4.6e (janelas da GUI)
 - 2026-10-22 — G0.5 feito (fuzzing do arquivo de config, do canal de controle e do MCP); G0.5b criado (fuzz dos codecs e rodada periódica)
+- 2026-10-22 — G0.5c feito (MCP recusa lotes JSON-RPC, revisão 2025-06-18)
+- 2026-10-22 — G0.8b criado e feito (terminal: linha comprida quebra na largura; `/export` com ` \` e `terse`)
+- 2026-10-22 — G1.8d feito (parâmetros do bond sem recriar); G1.8e criado (`lacp_rate` sem recriar)
+- 2026-10-22 — G4.1 dividido em G4.1a (feito: resolvedor do roteador), G4.1b (encaminhador para a LAN), G4.1c (servidor estilo BIND) e G4.1d (GUI, `:resolve`, DoH/DoT, VRF); decisão: DNS inteiro em Hickory DNS
+- 2026-10-22 — G4.1b parte 1 feita (base do encaminhador da LAN); criados G4.1e (Statistics), G4.1f (DNSSEC no encaminhador) e G4.1g (benchmark contra Unbound/dnsmasq)
+- 2026-10-22 — G4.4c em partes (serviço `/metrics` configurável); criados G4.4d (vrf, token/TLS) e G4.4e (métricas de protocolos e escala do scrape)
+- 2026-10-22 — G4.6d parte 1 feita (log do sistema em memória, `log.print`, janela Log); criadas G4.6g (log em disco) e G4.6h (`/log print` no terminal)
+- 2026-10-22 — G4.6e feito (GUI de NTP Client e Logging)
+- 2026-10-22 — G6.3b criado e feito (MTR/traceroute: nomes, ASN, privado/CGNAT e rótulos MPLS); G6.3c criado (ASN pela tabela BGP e zonas locais da RFC 6303)
+- 2026-10-22 — G6.3d criado e feito (acabamento visual da janela MTR)

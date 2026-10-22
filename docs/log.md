@@ -856,3 +856,254 @@ continuação indentadas).
   quebra, em vez de N no um por um) e o fold dos `docs/changes/` é periódico (`--fold` ou 10
   pendentes), não um PR extra por lote; `cargo xtask docs pending` mostra os status de gap ainda
   não consolidados, e as sessões o leem junto com o `gaps.md`.
+
+- 2026-10-22 — G0.5c: MCP: lotes JSON-RPC recusados. A revisão 2025-06-18 do MCP (a única que o servidor negocia)
+  removeu o batching; até aqui o servidor aceitava arrays de até 64 mensagens. Agora um array na
+  linha, vazio ou não, recebe **um** objeto de erro `-32600` com `id: null` (JSON-RPC 2.0 §6: lote
+  não aceito → uma Response só, não um array) e uma mensagem que diz para mandar uma mensagem por
+  linha; nenhum item do array é executado, então um lote nunca aplica pela metade. O
+  `MAX_BATCH` saiu; o oráculo de fuzz (`corerouter_mcp::fuzz`) passa a exigir que toda resposta
+  seja um objeto, e o proptest `sessions_never_break` continua mandando arrays. `docs/mcp.md`
+  explica o comportamento e aponta a tool `command_batch` (atômica) para várias mudanças.
+  Testar: `cargo test -p corerouter-mcp` (`batch_items_never_run_and_the_server_keeps_serving`
+  confere que um `ip.address.add` dentro de um lote não roda e que o servidor segue atendendo;
+  `every_batch_is_refused_with_one_object` cobre arrays de 0 a 79 itens).
+
+- 2026-10-22 — G0.8: `/export` com a matriz de zonas vazia não escreve nada (saía "# set: from is not exported"):
+  uma configuração cuja lista de itens está vazia não tem linha a exportar. Visto pelo usuário
+  no roteador real; o #64 só cobria a matriz com células.
+
+- 2026-10-22 — G0.8b: Terminal como o do RouterOS: linha comprida quebra, nada de barra horizontal. **GUI**
+  (`crates/ui/src/terminal.rs`): a saída rola só na vertical; uma linha mais larga que a janela
+  quebra na largura visível (depois do último espaço da linha, se houver) e quebra de novo quando a
+  janela muda de tamanho, inclusive o que já está na tela; as linhas de continuação começam com um
+  `↳ ` discreto. A quebra é só de exibição: a saída guarda a linha original, Copy All copia as
+  originais e um plugin do egui (`UnwrapCopy`, no `output_hook`) tira as quebras de exibição do texto
+  de uma seleção copiada. A janela não estica (`wide_print_does_not_stretch_the_window` segue
+  passando). **Foco**: um clique em qualquer lugar da janela (na saída, não só na linha de
+  comando) devolve o foco ao campo de entrada, como no xterm, no PuTTY e no WinBox; arrastar para
+  selecionar mantém a seleção para copiar e não rouba o foco no meio do arrasto, e a próxima tecla
+  depois da seleção vai para a linha de comando; o menu de contexto (Copy All, Clear) continua.
+  **`/export`** (`crates/shell/src/export.rs`): comando mais largo que o terminal quebra
+  com ` \` no fim e as linhas seguintes recuadas 4 espaços, entre argumentos (nunca dentro de um
+  valor entre aspas; argumento maior que a linha fica sozinho); largura = a do terminal
+  (`Shell::set_width`: janela da GUI, `rustyline` da CLI), 80 sem terminal; `file=` sempre em 80,
+  para o arquivo não depender da janela. **`/export terse`**: uma linha por item com o menu na
+  frente, sem quebra (script, grep); `compact` aceito (padrão do RouterOS), `verbose` e
+  `show-sensitive` recusados com o motivo (antes viravam nome de arquivo); Tab completa `terse`.
+  As linhas de continuação são coloridas como argumentos. Tabelas do `print` continuam como
+  estavam. Como testar: `cargo run -p corerouter-gui -- --control 7979`, New Terminal, um comando
+  comprido e `/ip dhcp-client export` (estreite a janela e repita); na CLI,
+  `corerouter-cli shell` e `/export`, `/export terse`. Testes: unidade da quebra (aspas, valor
+  maior que a largura, recuo, linhas curtas intactas) e do `terse`; ida e volta export quebrado em
+  48 colunas → colar → export igual, e `terse` → colar → export igual (`crates/shell/tests/terminal.rs`);
+  headless da GUI (quebra, re-quebra ao estreitar arrastando o canto, nada desenhado além da borda,
+  janela não estica, clique na saída foca a entrada, arrasto preserva a seleção e a tecla seguinte vai para a entrada, quebra/desquebra exata, plugin de cópia, glifo `↳` na fonte mono); screenshots
+  em `docs/changes/G0.8b-screenshots/`.
+
+- 2026-10-22 — G1.8d: Bonding: mudar parâmetros sem recriar o bond. O planejador (`hal-linux/src/plan.rs`) ganhou `bond_in_place` e a op `SetBond`: `mii_interval`, `min_links`, `transmit_hash_policy` e `primary` vão para o bond existente num `RTM_NEWLINK` sem `NLM_F_CREATE` só com os `IFLA_BOND_*` que mudam (o `bond_changelink` do kernel; o `RTM_SETLINK` ignora o `IFLA_LINKINFO`). Nada de soltar slaves, apagar o link nem reinstalar endereços e rotas; o undo de um apply que falhou devolve os valores antigos. `primary` vazio vai como ifindex 0, que o kernel entende como "sem primary". Só o que o modo usa conta (hash fora de 802.3ad/balance-xor/balance-tlb, `primary` fora de active-backup/tlb/alb e `lacp_rate` fora do 802.3ad não geram op). Ainda recriam, porque o kernel recusa no bond vivo (`drivers/net/bonding/bond_options.c`): o modo (`BOND_OPTFLAG_NOSLAVES | BOND_OPTFLAG_IFDOWN`, "the bond device has slaves") e o `lacp_rate` (`BOND_OPTFLAG_IFDOWN`, "the bond is up"), conferido no Linux 7.0 (**medido**). Como testar: `cargo test -p corerouter-hal-linux --lib plan` e `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_bond` (`live_settings_change_without_recreating_the_bond` prova que o ifindex não muda, que os slaves ficam e que o rollback desfaz).
+
+- 2026-10-22 — G4.1a: Resolvedor DNS do próprio roteador (`/ip dns`). Ping, MTR e o cliente NTP resolviam nomes pelo
+  resolvedor do Linux do host (`/etc/resolv.conf` → `127.0.0.53`), que não existe no namespace do
+  roteador nem na imagem: "failed to lookup address information". Agora há um resolvedor próprio:
+  `crates/proto-dns` (L2, sem sockets) com mensagens `hickory-proto`, cache por TTL com orçamento
+  em KiB e troca de servidor, e um serviço do daemon (`service/dns.rs`) com UDP/TCP bloqueantes e
+  uma thread que segue a config. Comandos `ip.dns.set` (servers, allow_remote_requests aceito para
+  a G4.1b, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms,
+  max_udp_packet_size), `ip.dns.get` (+ `dynamic_servers` do DHCP `use_peer_dns`, `cache_used`,
+  `resolver`), `ip.dns.cache.print` e `ip.dns.cache.flush`. Config em `ip.dns` do modelo
+  (`corerouter_model::dns`); o resolvedor é registrado no `Session` por `ext_mut`. O prober do host
+  deixou de chamar `getaddrinfo`. No lab sem daemon, e no daemon sem servidor configurado, o
+  resolvedor simulado do `SimProber` continua valendo. Regras de RFC 1035/2181/2308/5452/6761/7766
+  citadas no código e nos testes. Os padrões seguem o RouterOS, exceto `max_udp_packet_size`, que
+  é 1232 (DNS Flag Day 2020), e o teto de 1 h para o cache negativo. Decisão "DNS inteiro em
+  Hickory DNS" registrada em `docs/architecture.md`.
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979`, depois
+  `corerouter-cli --connect 127.0.0.1:7979 run ip.dns.set '{"servers":["1.1.1.1"]}'`,
+  `run tool.ping.start '{"address":"uol.com.br","count":3}'` e `run ip.dns.cache.print`. Testes:
+  `proto-dns` (codec com o exemplo SRI-NIC.ARPA da RFC 1035 §6.2, CNAME, negativos, proptest;
+  cache; failover com transporte falso), engine (comandos, prober, `dynamic_servers` do DHCP),
+  daemon (servidor DNS local UDP/TCP, NTP por nome) e `tests/netns_dns.rs` (servidor DNS na porta
+  53 de um namespace sem resolv.conf: ping resolve `router.test`, NXDOMAIN em cache, flush).
+
+- 2026-10-22 — G4.1b: Encaminhador DNS da LAN, parte 1 (a base). Com `ip.dns.set allow_remote_requests=yes` o daemon
+  atende UDP e TCP 53 (serviço `dns server`, `service/dns_server.rs`, opção `--dns-port`) com o
+  mesmo resolvedor e o mesmo cache do G4.1a: as consultas do roteador e as da LAN dividem o
+  cache, que agora guarda qualquer tipo de registro, positivo e negativo, com hits por entrada.
+  Cada consulta passa por uma cadeia de etapas em `crates/proto-dns/src/server/stage/`, um
+  arquivo por etapa, achadas pelo `build.rs` e ordenadas pelo `order`:
+  `acl → limit → special → adlist (vazia) → static → zones (vazia) → cache → upstream`. As
+  próximas partes (Statistics, Adlist/Forwarders/DoT-DoH, Zones) entram como arquivos novos nessa
+  cadeia; o passo a passo está em `docs/dns.md`, "Uma etapa nova". Sem tokio: a thread do socket
+  responde o que não precisa de rede, e cada falta de cache ganha uma thread (no máximo
+  `max_concurrent_queries`, depois SERVFAIL). Resposta sai do endereço perguntado
+  (`IP_PKTINFO`/`IPV6_RECVPKTINFO`, pelo `nix`).
+
+  Config nova em `ip.dns.set`: `allowed_from` (listas de interfaces e prefixos; padrão `LAN`:
+  nunca resolvedor aberto, REFUSED para quem está fora; `ip.dns.get` mostra `allowed_networks`),
+  `max_queries_per_client` (balde de fichas por cliente, IPv6 por /64; UDP excedente
+  descartado), `server_selection` (`fastest`, que mede a latência e põe um servidor que falhou no
+  fim por 1 min, ou `sequential` do RouterOS; `ip.dns.get` mostra `upstream` com latência,
+  respostas e falhas), `serve_stale_secs` (RFC 8767, 1 dia por padrão, TTL 30 s),
+  `max_concurrent_queries`, `max_concurrent_tcp_sessions`, `address_list_extra_time_secs`.
+  `/ip dns static` (`ip.dns.static.add/set/remove/move/print`, área nova `cmd/dns_static.rs`,
+  seção `ip.dns_static` do modelo): A, AAAA, CNAME, FWD, MX, NS, NXDOMAIN, SRV, TXT, `regexp`
+  (crate `regex`, tempo linear), `match_subdomain`, `address_list`, `ttl_secs`, `disabled`,
+  `comment`, ordem de cima para baixo com regexp antes de nome, PTR automático para A/AAAA.
+  `ip.dns.cache.print` ganhou `type`, `data`, `hits` e `stale`. Também: ANY com um HINFO (RFC
+  8482), `localhost`/`.invalid` (RFC 6761), AXFR e classe não-IN recusados, FORMERR para lixo,
+  truncamento UDP pelo EDNS do cliente. GUI: IP › DNS (Settings com os botões Static e Cache;
+  Statistics, Adlist, Forwarders e Zones desabilitados com "Coming soon" e a gap), IP › DNS Static
+  (tabela + diálogo) e IP › DNS Cache (Flush Cache), painéis em `crates/ui/src/dns.rs`; o
+  espaço reservado `Win::Dns` saiu de `windows.rs`. Terminal e `/export` saem do registro:
+  `/ip dns static add …` vai e volta.
+
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979 --dns-port 5353`, depois
+  `corerouter-cli --connect 127.0.0.1:7979 run ip.dns.set '{"servers":["1.1.1.1"],"allow_remote_requests":true}'`,
+  `run ip.dns.static.add '{"name":"nas.lan","address":"192.168.88.10"}'`,
+  `dig @127.0.0.1 -p 5353 nas.lan`, `dig @127.0.0.1 -p 5353 uol.com.br MX` e
+  `run ip.dns.cache.print`. Testes: `proto-dns` (cadeia ponta a ponta com upstream falso,
+  proptest de pacotes hostis, cache com serve-stale e hits, resolvedor com servidor mais rápido e
+  FWD), engine (`ip.dns.static.*`, `ip.dns.set`, address list), shell (`/export` ida e volta),
+  daemon (sockets reais) e `tests/netns_dns_server.rs` (porta 53 num namespace: REFUSED fora do
+  `allowed_from`, resposta do endereço perguntado, PTR, TCP, serve-stale, limite por cliente).
+  Conferido também com `dig` contra um dnsmasq de upstream no namespace, e screenshot da GUI.
+
+- 2026-10-22 — G4.4c: `/metrics` como serviço da config, no estilo de `/ip service` do RouterOS. Comandos novos
+  `ip.service.metrics.set {enabled?, address?, port?, available_from?}` e
+  `ip.service.metrics.get` (config + `status: stopped|listening|error`, `listening`,
+  `last_error`, `requests`, `refused`). Padrão: desligado, `127.0.0.1:9100` (a porta do
+  node_exporter e do VyOS). O daemon segue a config em execução numa thread (`metrics-service`):
+  um commit abre, muda de porta ou fecha o listener em até 1 s, sem reiniciar; porta ocupada vira
+  `status: error` com o motivo e é tentada de novo a cada segundo. Cliente fora de
+  `available_from` é desconectado sem resposta e contado em `refused` (como o `address` do
+  `/ip service`; IPv4 mapeado em `::ffff:` casa como IPv4). `set` avisa (`warning`) quando o
+  endpoint, que não tem login, fica aberto para a rede sem `available_from`. A opção `--metrics`
+  continua igual, como um listener fora da config. Config em `system.metrics` do modelo
+  (`corerouter_model::metrics`); estado de execução no `Session` por `ext_mut::<MetricsStatus>()`.
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979`, depois
+  `corerouter-cli --connect 127.0.0.1:7979 run ip.service.metrics.set '{"enabled":true}'`,
+  `curl -s 127.0.0.1:9100/metrics` e `run ip.service.metrics.get`. Testes: engine
+  (`cmd::metrics_service`: sucesso, validação, aviso, rollback, status) e daemon
+  (`service::metrics`: abre, move, recusa por `available_from`, fecha; porta ocupada → erro →
+  recupera). O id do comando é `ip.service.metrics.*` (e não `system.metrics.set`, como dizia o
+  critério): `system.metrics` já é a consulta dos contadores, e um menu `/system metrics` no
+  terminal a esconderia; `/ip service metrics set port=9273` segue o `/ip service` do RouterOS e
+  abre espaço para os outros serviços do daemon (`ip.service.<nome>`).
+
+- 2026-10-22 — G4.6d: Log do sistema, parte 1. Todo evento passa por `Session::log_event` (engine, `logging.rs`): número,
+  hora do relógio da sessão (`Hal::now_unix`/`tick`), tópicos RouterOS, **origem** (`daemon` ou
+  conta + canal: `admin · GUI`, `local · terminal`, `… · MCP`, `… · CLI`, pelo `via` que cada
+  cliente manda em `engine.execute`/`engine.batch` e o `Caller` guarda), **mensagem em português**
+  ("Ping para uol.com.br iniciado (tarefa 1)", "NTP Client ligado: servidores pool.ntp.org, poll
+  6–10", "NTP: não foi possível resolver pool.ntp.org", "Falhou: /ip address add address=bad … —
+  motivo") e **detalhe técnico** (comando, parâmetros com segredos mascarados, resultado ou erro,
+  revisão criada). Fontes: journal de comandos, cliente DHCPv4/v6 (histórico traduzido; `searching`
+  e `offered` são `debug`), NTP só na mudança de estado ou de erro (sem repetir a cada poll) e o
+  aviso de relógio do daemon, ferramentas (início e fim de Ping/MTR/MTU/teste de cabo com quem
+  pediu; falha como `tool,warning`). A ação embutida `memory` guarda as últimas `memory_lines`
+  (padrão 1000, 1..65535, `system.logging.action.set {name: memory, memory_lines}`); as regras
+  padrão `info`, `error`, `warning`, `critical` → `memory` vêm em toda config nova (ids `*1`–`*4`,
+  marcadas `default` para o `/export` fazer `set`). O syslog remoto (G4.6) lê o mesmo log
+  (`Session::log_since`). Comandos `log.print {topics?, level?, since?, find?, limit?}` (o terminal
+  ganha `/log print`) e `log.clear`. Janela Log nova (painel `ui/src/system_log.rs`; a antiga, que
+  mostrava o journal da GUI em JSON, saiu): Hora (HH:MM:SS, data se não for o dia da linha mais
+  nova, data/hora completa UTC no tooltip), Tópicos, Origem, Mensagem com cor por nível;
+  Legível/Técnico, filtro de tópico, "Só avisos e erros", busca, Pausar, Limpar; pede só as
+  linhas depois da última (`since`) e recomeça se o roteador reiniciou. A janela System › Logging
+  mostra a ação `memory` (só o número de linhas muda; não se remove). Tópicos novos: `tool` e
+  `dns` (ponto de ligação do resolvedor da G4.1a, que estava em outra sessão).
+
+  Como testar: `cargo run -p corerouter-daemon -- --control 7980`, `corerouter-cli --connect
+  127.0.0.1:7980 run system.ntp.client.set '{"enabled":true,"servers":["pool.ntp.invalid"]}'`,
+  `… run tool.ping.start '{"address":"uol.com.br","count":3}'`, `… run log.print '{"level":"warning"}'`;
+  GUI `--connect 127.0.0.1:7980`, menu Log. Testes: `cmd/log.rs`, `logging.rs`, `tasks.rs`,
+  `tests/ntp_logging.rs`, `ui/src/tests/system_log.rs`, `ui/src/tests/logging.rs`.
+
+  Limites: hora em UTC (não há fuso horário); configs salvas antes desta mudança com regras de
+  `/system logging` não ganham as regras padrão (só as configs sem a seção); no terminal, a
+  mensagem longa sai das colunas do `/log print` (use `proplist=date,origin,message` ou `print
+  detail`; G4.6h).
+
+- 2026-10-22 — G4.6e: GUI de NTP e log remoto, dois painéis novos em `crates/ui` (nenhuma edição em `lib.rs`/`windows.rs`;
+  o `build.rs` os achou e o menu System os lista em ordem alfabética):
+
+  - **System › NTP Client** (`ntp_client.rs`): formulário Enabled / Servers (um por linha) / Min Poll /
+    Max Poll com Apply e Revert; o formulário intocado acompanha o roteador, a edição não aplicada fica
+    (marcada com "•") e a recusa do engine aparece embaixo. Status lido de `system.ntp.client.get` a cada
+    atualização: Status colorido (synchronized/waiting/stopped), Synced Server (nome e endereço), Stratum,
+    System Offset, Round Trip, Last Sync (UTC) e Next Poll, e o último erro.
+  - **System › Logging** (`logging.rs`): abas Rules (Topics, Prefix, Action) e Actions (Name, Type,
+    Remote Address/Port, Src. Address, Facility, Severity, Comment), cada uma uma tabela G1.9 (barra,
+    menus, atalhos, busca); diálogos New/Properties para regra e ação. Na regra, os tópicos válidos são
+    botões (clique inclui, botão direito exclui com `!`) e Action é uma lista das ações existentes; o
+    engine continua sendo quem valida (tópico inexistente e remover ação em uso voltam como erro no
+    diálogo).
+
+  Testar: `cargo test -p corerouter-ui -- ntp logging` (6 testes headless: status ao vivo vindo do daemon,
+  Apply/erro/Revert do NTP, editar/desabilitar/criar regra com tópico inválido, editar ação, remoção
+  recusada de ação em uso, nova ação; as listas de tópicos e facilities da UI conferidas contra o
+  `corerouter-model`). Na GUI: `cargo run -p corerouter-gui -- --control 7979`, menu System › NTP Client
+  e System › Logging.
+
+- 2026-10-22 — G6.3b: MTR/traceroute com nome, ASN e rótulos MPLS por salto, para operador de ISP. `tool.mtr.start`
+  ganha `use_dns` (padrão ligado, como o `mtr`) e `as_lookup` (padrão desligado, como o `-z`);
+  no terminal `/tool traceroute 8.8.8.8 use-dns=no as-lookup=yes`. O resolvedor do roteador
+  (G4.1a) passa a consultar PTR (`in-addr.arpa`/`ip6.arpa`, RFC 1035 §3.5 / RFC 3596 §2.5, CNAME
+  da RFC 2317) e TXT (Team Cymru: `origin.asn.cymru.com`, `origin6`, `AS<n>.asn.cymru.com`) no
+  mesmo cache (`QType::Ptr/Txt`, `CachedData::Records` no modelo). As consultas não atrasam a
+  medição: o `Prober` ganhou `reverse_name`/`origin_as` que respondem `Pending` ou `Done`; no
+  daemon elas rodam em 4 threads com fila limitada (256) e respostas guardadas 5 min; o MTR
+  pergunta de novo a cada volta e, com `count`, espera até 3 s no fim. Endereços RFC 1918, ULA,
+  CGNAT (RFC 6598), link-local e loopback são marcados (`scope`) e nunca consultados (RFC 6598 §4,
+  RFC 6303 §3). Rótulos MPLS: codec puro `crates/hal/src/icmp_ext.rs` (extensões ICMP da RFC 4884
+  com o modo §5.5 para remetentes antigos, objeto MPLS Label Stack da RFC 4950), lido pelo
+  `hal-linux` nas respostas Time Exceeded/Unreachable do raw socket (o ping socket não vê as
+  extensões). Lab: o `SimProber` dá roteadores privado (1º salto), CGNAT (2º) e públicos
+  `198.19.<salto>.x` com nomes `*.sim-transit.example`, AS64500/64510/64999 e rótulos MPLS
+  sintéticos. Janela Tools › MTR: caixas Use DNS e AS lookup, nome em cima e IP embaixo (menor),
+  colunas ASN e MPLS (screenshot em `docs/changes/G6.3b-screenshots/`). Terminal: `nome (IP)
+  [private]`, coluna ASN e linha `MPLS L=… TC=… S=… TTL=…` por rótulo.
+  Como testar: `cargo run -p corerouter-gui`, Virtual lab, Tools › MTR, marque AS lookup, endereço
+  `198.51.100.20`, Enter. Testes: `proto-dns` (PTR/TXT com o exemplo da RFC 1035 §3.5 e da RFC
+  3596 §2.5, CNAME da RFC 2317, respostas da Team Cymru, proptest de texto hostil, cache de PTR e
+  ASN no resolvedor), `hal` (codec com o exemplo da RFC 4950 §3, comprimentos por família, §5.5,
+  checksum zero, objetos desconhecidos, proptest de bytes hostis e ida e volta), `hal-linux`
+  (Time Exceeded com rótulo no raw socket), engine (classificação privado/CGNAT, nomes que chegam
+  depois sem travar e nome que nunca chega, comando e texto do terminal), daemon (consultas sem
+  espera contra um servidor DNS local), shell (`use-dns=no as-lookup=yes`) e headless da janela
+  (nome aparece depois; IP na hora).
+
+- 2026-10-22 — G6.3d: Janela Tools › MTR, acabamento visual (só `crates/ui/src/mtr.rs`). Uma linha por salto, todas da
+  mesma altura: o host é o nome (DNS reverso) ou o IP enquanto não há nome, cortado com "…" acima
+  de 40 caracteres; nome completo, endereços, rótulos e avisos vão no tooltip. Ao lado do host,
+  selos pequenos arredondados no lugar do texto entre colchetes: `privada` (neutro, com borda),
+  `CGNAT` (âmbar) e `MPLS 85260` (azul; a coluna MPLS saiu). A coluna ASN virou **Network**: o AS
+  é uma pílula `AS7162 UOL` (primeira palavra do nome; completo e prefixo no tooltip) com cor tirada
+  de uma paleta de 8 tons por hash de Fibonacci do número, então todos os saltos de um AS têm a
+  mesma cor e números consecutivos nunca coincidem; se dois ASs vizinhos no caminho caem no mesmo
+  tom, o segundo pega o tom seguinte (a troca de operadora sempre aparece). Cada tom tem tinta
+  escura no tema claro e clara no escuro, fundo lavado da mesma cor. Salto sem resposta: `sem
+  resposta` apagado, números `–`, perda em vermelho. Terminal sem mudança.
+  Como testar: `cargo run -p corerouter-gui`, Virtual lab, Tools › MTR, marque AS lookup, endereço
+  `198.51.100.20`, Enter; troque o tema no canto superior direito. Testes headless em
+  `crates/ui/src/tests/mtr_look.rs` (selos sem colchetes, "sem resposta", altura das linhas
+  uniforme nos dois temas, cor do AS estável e distinta para consecutivos e vizinhos de caminho).
+
+- 2026-10-22 — processo: Binários sempre atuais: a fila de entrada leva o checkout principal para a `main` nova e
+  recompila daemon, GUI e CLI depois de cada lote (só na `main` e sem alterações; `LAND_REBUILD=0`
+  desliga). Crate novo `corerouter-buildinfo` (L0) com o commit do build: o `server.info` o informa
+  e a barra da GUI avisa "daemon <commit> ≠ GUI <commit>" quando o daemon rodando é de outro build
+  (o usuário testou correções contra um daemon velho). O `plan/hw-lab.sh` local também recompila
+  antes de subir o daemon, a GUI e o terminal.
+
+- 2026-10-22 — processo: AGENTS.md e template de PR descrevem a fila como ela é: o usuário aprova ao pedir a rodada e a
+  fila contínua (`--watch`, rótulo `fila`) integra sozinha, com o resultado do CI lido dos runs do
+  Actions. Números das rodadas no `docs/perf.md`.
+
+- 2026-10-22 — processo: Fila contínua (`scripts/land.sh --watch`): pega sozinha os PRs com o rótulo `fila` (as
+  sessões o põem no `gh pr create`), sem esperar a sessão principal reagir; e lote especulativo:
+  enquanto um lote roda o CI, os PRs que ficam prontos são testados num lote montado em cima
+  dele; verde, entram logo depois, sem outro CI; vermelho, o especulativo é descartado e o lote
+  passa pela bisseção. PR que ficou de fora volta sozinho quando a branch muda. Simulado: lote
+  verde com um PR chegando no meio entra um passo depois; lote vermelho cai na bisseção.

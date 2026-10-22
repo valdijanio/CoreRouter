@@ -210,3 +210,47 @@ do daemon, passo do `ci.yml`), 1 era código de verdade (`hal-linux/src/plan.rs`
 Simulação dos merges de cada par de PRs nas listas de módulos: acrescentando no fim, 7 de 7 pares
 conflitam; em ordem alfabética, 2 de 7; geradas dos arquivos, 0. Com as listas geradas, só 1 dos
 7 PRs (o do conflito de código) teria ficado fora do primeiro lote, em vez de 3.
+
+### G4.1a — resolvedor DNS (`proto-dns`, `benches/resolver.rs`)
+
+**Medido** em 2026-10-22, AMD RYZEN AI MAX+ 395 w/ Radeon 8060S, build release (`cargo bench -p corerouter-proto-dns --bench resolver`):
+
+| Caso | Tempo |
+|---|---|
+| `dns_query_encode` (consulta A com EDNS) | 206 ns |
+| `dns_reply_parse` (CNAME + 2 A, conferência de id/pergunta) | 590 ns |
+| `dns_cache_hit_10k` (acerto no cache com 10 000 entradas) | 50 ns |
+
+O custo de uma consulta é dominado pela rede (ms); o codec e o cache não pesam no plano de controle.
+
+### G4.1b — encaminhador da LAN (`proto-dns`, `benches/forwarder.rs` e `benches/resolver.rs`)
+
+**Medido** em 2026-10-22, AMD RYZEN AI MAX+ 395 w/ Radeon 8060S, build release (`cargo bench -p corerouter-proto-dns`).
+Uma consulta da LAN pela cadeia inteira, bytes da consulta → bytes da resposta, sem o socket:
+
+| Caso | Tempo | Consultas/s por núcleo |
+|---|---|---|
+| `dns_forward_cache_hit` (cache quente) | 0,80 µs | ~1,25 M |
+| `dns_forward_static_1k` (estática entre 1000) | 1,04 µs (3,76 µs antes do índice por nome) | ~0,96 M |
+| `dns_forward_cache_miss` (cache frio, upstream falso instantâneo) | 2,35 µs | ~0,43 M (sem a rede) |
+
+O cache passou a guardar registros de qualquer tipo (antes só endereços); antes/depois do
+resolvedor do roteador, `main` (504accb) × branch, mesma máquina e build:
+
+| Caso | `main` | branch |
+|---|---|---|
+| `dns_query_encode` | 214 ns | 203 ns |
+| `dns_reply_parse` | 580 ns | 635 ns (+9%: guarda os registros da cadeia) |
+| `dns_cache_hit_10k` | 54 ns | 73 ns (+35%: copia os registros para o cliente) |
+
+Os dois aumentos são dezenas de nanossegundos numa consulta que custa milissegundos de rede.
+
+**Rodada 2 de agentes** (**medido**, 2026-10-22, horário de Brasília): 4 features pequenas
+(G0.5c, G1.8d, G4.4c, G4.6e) de 13:35 a 13:53 — sessões prontas em 4 a 12 min, dois lotes de
+3,4 min (3 PRs) e 5,3 min (1 PR), zero conflito, zero teste instável travando, nenhuma intervenção.
+
+**Fila contínua com lote especulativo** (**medido**, 14:47–14:52): lote de 4 PRs (#93 DNS, #94,
+#95, #96) entrou 4,5 min depois de o lote começar; o #97 (log), que ficou pronto com o lote já no
+CI, foi testado num lote especulativo em cima dele e entrou **44 s** depois, sem esperar outro CI.
+Antes disso, o lote do #94 ficou 20 min parado: o GitHub manteve o check-run do job Linux em
+"in_progress" depois de o job terminar verde; a fila passou a ler os runs do Actions.
