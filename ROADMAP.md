@@ -119,6 +119,37 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
   pref-src, criar VRF pela GUI.
 
+- 2026-10-21 — G5.2 (Parte 1): LLDP e escuta passiva de MNDP. `crates/proto-lldp` (L2): codec
+  puro de LLDPDU do IEEE 802.1AB (Chassis ID, Port ID, TTL, End, Port/System Description,
+  System Name, Capabilities, Management Address; TLVs desconhecidos e de organização guardados
+  crus), validação de recepção do 9.2.7.7. `crates/proto-mndp` (L2): **só decodificação** do
+  anúncio MikroTik (UDP 5678), escrito a partir do dissector do Wireshark e do manual da
+  MikroTik (fontes no topo do crate); o CoreRouter nunca anuncia MNDP. `hal-linux::l2`:
+  `LldpIo` (socket `AF_PACKET` por porta, EtherType 0x88CC para 01:80:C2:00:00:0E, envio a cada
+  30 s via `due`/`send`, recepção não bloqueante, `allmulticast` ligado e restaurado por
+  rtnetlink) e `MndpListener` (IPv4 + IPv6, `IP_PKTINFO` para a interface de chegada), sem
+  `unsafe` (`socket2` + `sockaddr_ll` vindo do `getifaddrs` do `nix`). Testes: proptest nos
+  dois codecs (1024 casos por propriedade) e `tests/netns_l2.rs` em namespace sem root (LLDP
+  entre as pontas de um veth nos dois sentidos, MNDP com a interface certa); `cargo xtask netns`
+  agora roda cada binário de teste no seu próprio namespace; os dois codecs entram no passo
+  wasm. Integração com a tabela de vizinhos do G5.1 (`ip.neighbor.list` com protocol=lldp/mndp)
+  fica para um segundo PR, depois do G5.1. Detalhes em `docs/lldp-mndp.md`.
+
+- 2026-10-21 — G1.12: maximizar e restaurar as janelas internas, estilo WinBox. Todas as janelas
+  flutuantes (as do menu e os diálogos de interface) passam por um wrapper único,
+  `crates/ui/src/float.rs` (`Floats::show`): a barra de título continua a do egui (▼, arrastar, ✕) e
+  ganha, na mesma camada da janela, o botão □/❐ ao lado do ✕ (desenhado; a fonte não tem os
+  glifos) e uma faixa só de clique sobre o título — o arraste ainda chega ao egui, o duplo clique
+  maximiza em vez de recolher, o botão direito abre Maximize/Restore. Maximizada = `fixed_rect` da
+  área central a cada frame (acompanha o redimensionamento) e o corpo ocupa a área toda (o egui
+  dimensiona a janela pelo conteúdo). Restaurar usa `fixed_rect` sem `constrain` por um frame (com
+  `current_pos` o arraste da barra do egui desfaz a posição; com `constrain` o tamanho maximizado do
+  frame anterior empurra a janela para o canto) e corrige o tamanho pedido por até 3 frames, porque
+  o conteúdo pode ficar uns px abaixo do pedido (Interfaces: 5 px, **medido**). Recolhida, guarda o
+  tamanho expandido. Estado só da UI, não passa pelo engine. 6 testes headless (maximizar ocupa a
+  área, restaurar devolve o retângulo, duplo clique, menu, redimensionar a área, arrastar/recolher,
+  janela de propriedades); conferido na GUI real (xdotool + `screenshot`).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -127,4 +158,6 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.9.
 - 2026-10-21 — log do G0.4.
 - 2026-10-21 — log do G1.10 + G1.11.
+- 2026-10-21 — log do G5.2 (Parte 1).
+- 2026-10-21 — log do G1.12.
 - 2026-10-21 — log do G1.5.

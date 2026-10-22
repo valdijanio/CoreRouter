@@ -8,7 +8,7 @@
 use egui::{Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
-use crate::interfaces::{cascade, field, opt_text};
+use crate::interfaces::{cascade, dialog_id, field, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, form_number, value_text};
 
@@ -417,6 +417,7 @@ impl CoreRouterUi {
         let mut dialogs = std::mem::take(&mut self.route_dialogs);
         dialogs.retain_mut(|d| {
             // A route window whose route is gone closes itself.
+            let id = dialog_id(d.id);
             let gone = match &d.dialog {
                 RouteDialog::Props { id, .. } => {
                     !routes.iter().any(|r| r.id.as_deref() == Some(id.as_str()))
@@ -425,22 +426,30 @@ impl CoreRouterUi {
                 _ => false,
             };
             if gone {
+                self.floats.forget(id);
                 return false;
             }
             let mut open = true;
             let mut pressed = None;
-            egui::Window::new(dialog_title(&d.dialog, &routes))
-                .id(egui::Id::unique(("corerouter-route-dialog", d.id)))
-                .open(&mut open)
-                .constrain_to(area)
-                .default_pos(cascade(area, d.id))
-                .resizable(false)
-                .collapsible(false)
-                .show(ctx, |ui| {
+            let title = dialog_title(&d.dialog, &routes);
+            let pos = cascade(area, d.id);
+            self.floats.show(
+                ctx,
+                area,
+                id,
+                &title,
+                &mut open,
+                |w| w.default_pos(pos).resizable(false).collapsible(false),
+                |ui| {
                     let busy = d.waiting > 0;
                     pressed = dialog_body(ui, d, &routes, &tables, busy);
-                });
-            open && pressed.is_none_or(|b| self.route_button(d, b, &routes))
+                },
+            );
+            let keep = open && pressed.is_none_or(|b| self.route_button(d, b, &routes));
+            if !keep {
+                self.floats.forget(id);
+            }
+            keep
         });
         dialogs.append(&mut self.route_dialogs);
         self.route_dialogs = dialogs;
@@ -556,6 +565,7 @@ impl CoreRouterUi {
         };
         if close {
             self.route_dialogs.remove(pos);
+            self.floats.forget(dialog_id(id));
         }
         if let Some(route) = created {
             // Opens when an `ip.route.list` that has it arrives.
