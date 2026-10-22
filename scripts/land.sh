@@ -325,6 +325,8 @@ land_set() {
   local set=("${members[@]}")
   if [ ${#set[@]} = 1 ]; then
     say "  #${set[0]} fora: quebra o CI (${failed:-tempo}) — a sessão dona corrige na branch"
+    # Fora até a branch mudar: sem isso a fila contínua o testava de novo a cada ciclo.
+    SKIP[${set[0]}]=${HEADS[${set[0]}]:-}
     return 0
   fi
   say "  vermelho (${failed:-tempo}): dividindo ${set[*]}"
@@ -391,6 +393,8 @@ watch() {
   gh label create fila --color 0E8A16 --description "Pronto para a fila de entrada" 2>/dev/null || true
   say "fila contínua: rótulo 'fila', a cada ${tick}s"
   while :; do
+    # Sempre da raiz: um passo anterior pode ter saído de dentro de uma worktree já removida.
+    cd "$root"
     mapfile -t ready < <(ready_prs)
     if [ -z "$run_sha" ] && [ ${#ready[@]} -gt 0 ]; then
       if build_combo "origin/$base" batch "${ready[@]}"; then
