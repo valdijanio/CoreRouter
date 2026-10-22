@@ -114,6 +114,7 @@ pub fn dispatch_as(
                 Ok(json!({
                     "name": "corerouter",
                     "version": env!("CARGO_PKG_VERSION"),
+                    "commit": corerouter_buildinfo::COMMIT,
                     "backend": s.backend(),
                     "has_ui": has_ui,
                 }))

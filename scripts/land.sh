@@ -260,9 +260,37 @@ test_combo() {
   return $r
 }
 
+# Depois de PRs entrarem: o checkout principal (o de onde a fila roda) vai para a main nova e os
+# binários são recompilados, para quem testa nunca rodar um build velho. Só se o checkout estiver
+# na main e sem alterações (senão avisa e não mexe); LAND_REBUILD=0 desliga. O daemon que estiver
+# rodando não é reiniciado (pode estar no meio de um teste): a GUI avisa quando o commit dele
+# difere do dela.
+refresh_checkout() {
+  local head
+  [ "${LAND_REBUILD:-1}" = 1 ] || return 0
+  head=$(git -C "$root" symbolic-ref --quiet --short HEAD || true)
+  if [ "$head" != "$base" ]; then
+    say "  checkout em '${head:-detached}': não recompila"
+    return 0
+  fi
+  if [ -n "$(git -C "$root" status --porcelain --untracked-files=no)" ]; then
+    say "  checkout com alterações: não recompila"
+    return 0
+  fi
+  if ! { git -C "$root" fetch --quiet origin "$base" && git -C "$root" merge --quiet --ff-only "origin/$base"; }; then
+    say "  checkout não avançou para a $base (ff): não recompila"
+    return 0
+  fi
+  if (cd "$root" && env -u CARGO_TARGET_DIR cargo build -q -p corerouter-daemon -p corerouter-gui -p corerouter-cli); then
+    say "  checkout em $(git -C "$root" rev-parse --short HEAD), binários recompilados (reinicie o daemon para usar)"
+  else
+    say "  aviso: o build do checkout falhou"
+  fi
+}
+
 # Squash de cada PR de $members (os checks rápidos do próprio PR têm de estar verdes).
 merge_members() {
-  local n r
+  local n r merged=0
   for n in "${members[@]}"; do
     r=0
     wait_checks "${HEADS[$n]}" || r=$?
@@ -272,10 +300,12 @@ merge_members() {
     fi
     if squash "$n" "${HEADS[$n]}"; then
       say "  #$n entrou"
+      merged=1
     else
       say "  #$n fora: o merge foi recusado (a branch mudou?)"
     fi
   done
+  [ "$merged" = 0 ] || refresh_checkout
 }
 
 # Integra os PRs: testa a combinação; verde, entram todos; vermelho, divide ao meio e repete em
@@ -465,6 +495,7 @@ for n in "${serial[@]}"; do
 
   squash "$n" "$sha" || stop "$n" "o merge foi recusado"
   say "  #$n entrou"
+  refresh_checkout
 
   cd "$root"
   git worktree remove --force "$wt"

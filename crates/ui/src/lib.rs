@@ -868,6 +868,35 @@ impl CoreRouterUi {
         !matches!(self.link, Link::Local) && connect::old_router_info(&self.cache.info)
     }
 
+    /// The commit of the daemon this GUI manages, when it differs from the
+    /// GUI's own: a daemon left running after a rebuild (the user tested
+    /// fixes against an old daemon). Local sessions are the GUI itself.
+    pub fn stale_daemon(&self) -> Option<String> {
+        if matches!(self.link, Link::Local) {
+            return None;
+        }
+        let theirs = self.cache.info.get("commit").and_then(Value::as_str)?;
+        let ours = corerouter_buildinfo::COMMIT;
+        (theirs != ours && theirs != "unknown" && ours != "unknown").then(|| theirs.to_owned())
+    }
+
+    /// The top bar's warning when the daemon was built from another commit.
+    fn stale_daemon_warning(&self, ui: &mut egui::Ui) {
+        let Some(theirs) = self.stale_daemon() else {
+            return;
+        };
+        ui.colored_label(
+            ui.visuals().warn_fg_color,
+            format!("daemon {theirs} ≠ GUI {}", corerouter_buildinfo::COMMIT),
+        )
+        .on_hover_text(
+            "The router's daemon was built from another commit than this GUI: fixes may be \
+             missing on one side. Restart it after building (bash plan/hw-lab.sh daemon in the \
+             lab).",
+        );
+        ui.separator();
+    }
+
     /// The top bar's warning while managing an old router.
     fn old_router_warning(&self, ui: &mut egui::Ui) {
         if !self.old_router() {
@@ -902,6 +931,7 @@ impl CoreRouterUi {
             self.link_label(ui);
             self.user_label(ui);
             self.old_router_warning(ui);
+            self.stale_daemon_warning(ui);
             self.no_password_warning(ui);
             // Nothing heard from the router yet: no empty fields.
             if !known {
@@ -2671,6 +2701,30 @@ mod tests {
         // Commit is there and works.
         h.click(h.text("Commit"));
         assert_eq!(d.borrow().executed, ["config.commit"]);
+    }
+
+    #[test]
+    fn a_daemon_built_from_another_commit_is_flagged_in_the_top_bar() {
+        let (mut h, _) = Harness::daemon(before_safe_mode());
+        let ours = corerouter_buildinfo::COMMIT;
+        h.app.cache.info = json!({"name": "corerouter", "version": "0.1.0", "auth": "required", "commit": "abc1234"});
+        h.idle();
+        if ours == "unknown" {
+            // Built outside git: nothing to compare.
+            assert_eq!(h.app.stale_daemon(), None);
+            return;
+        }
+        assert_eq!(h.app.stale_daemon().as_deref(), Some("abc1234"));
+        assert!(h.has_text(&format!("daemon abc1234 ≠ GUI {ours}")));
+        // Same commit: no warning.
+        h.app.cache.info =
+            json!({"name": "corerouter", "version": "0.1.0", "auth": "required", "commit": ours});
+        h.idle();
+        assert_eq!(h.app.stale_daemon(), None);
+        // The lab is the GUI itself.
+        let mut lab = Harness::new();
+        lab.idle();
+        assert_eq!(lab.app.stale_daemon(), None);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use std::fmt;
 
 pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-model", 0),
+    ("corerouter-buildinfo", 0),
     ("corerouter-hal", 1),
     ("corerouter-hal-linux", 1),
     // Pure (no I/O, wasm-safe): firewall validation + nftables render, needed by
