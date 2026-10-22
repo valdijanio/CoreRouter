@@ -407,7 +407,10 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com expiração), 1 em netns (aplica, troca, recusa sem mudar nada, preserva tabela de outro
   dono), 6 headless da GUI (seções, cores, diálogo com abas, erro no campo, ▲ e arrastar,
   atalhos, abas de listas). Teste manual: daemon de lab + `corerouter-gui --connect`, regras
-  pela CLI, janela e diálogo conferidos em screenshot. Esforço do agente ~6 h (**estimado**).
+  pela CLI, janela e diálogo conferidos em screenshot (repetido depois do merge com G0.3, logado
+  pelo token local, arrastando uma regra). Com o terminal do G0.8: `/export` → `/import` do firewall
+  testado (listas padrão LAN/WAN viram `set`, `passthrough=no` não se perde, chains próprias e `!`
+  digitados no terminal). Esforço do agente ~7 h (**estimado**).
 
 ## Histórico de revisão
 
