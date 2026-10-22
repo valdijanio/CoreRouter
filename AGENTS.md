@@ -167,6 +167,22 @@ a `main` vermelha tem prioridade (abaixo).
    avise no relato (a sessão principal liga). Nunca faça merge direto de PR com CI pendente.
 6. Depois do merge, apague a branch local e a remota.
 
+### PR em conflito depois de aberto (`pr-sync`)
+
+O GitHub ignora o `merge=union` do `.gitattributes`: todo PR aberto vira CONFLICTING quando outro
+acrescenta ao `docs/log.md` ou `docs/gaps-history.md`, e o auto-merge para. O workflow `pr-sync`
+(`.github/workflows/pr-sync.yml`, `scripts/pr-sync.sh`) roda a cada push na `main` e, nos PRs com
+auto-merge que o GitHub marca CONFLICTING, faz o merge de verdade da `main` (com o union):
+
+- **limpo** (o caso comum: só os arquivos de acréscimo): commit de merge do `github-actions[bot]`
+  na branch e o `ci` disparado nela; o auto-merge segue sozinho;
+- **conflito real**: nada é enviado; o PR ganha um comentário com os arquivos e o rótulo
+  `conflito`. Quem vê o rótulo (a sessão dona do PR, senão a principal) resolve:
+  `git fetch origin && git merge origin/main`, `cargo xtask ci`, push.
+
+A branch pode receber esse commit do bot: antes de enviar mais trabalho num PR aberto, faça
+`git pull` (merge) da própria branch. Nunca force-push.
+
 ### `main` vermelha é prioridade zero
 
 O CI roda na `main` após cada merge. Se falhar, o workflow `main-red` abre (ou atualiza) a issue

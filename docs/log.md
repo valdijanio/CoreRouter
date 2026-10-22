@@ -510,3 +510,11 @@ mesmo dia pode variar.
   (bloquear 127.0.0.1 pela própria GUI → janela → Safe Mode e aplicar) conferidos em screenshot.
   Esforço do agente ~6 h (**estimado**).
 - 2026-10-22 — processo: proteção da main sem "branch atualizada" (strict=false) para dar vazão; workflow `main-red` abre/fecha a issue "main quebrada" quando o CI da main falha/volta; AGENTS.md: trazer a main antes do PR, main vermelha é prioridade zero, ids de gap só do brief/main, sessões não abrem sessões, PRs pequenos, pontos quentes com mudanças mínimas. Medido antes: CI de PR mediana 2,0 min, 1,6 execuções por PR.
+- 2026-10-22 — processo: workflow `pr-sync` (`scripts/pr-sync.sh`): a cada push na `main`, os PRs
+  com auto-merge que o GitHub marca CONFLICTING recebem o merge de verdade da `main` (o GitHub
+  ignora o `merge=union` e marcava conflito só por causa de `docs/log.md`/`docs/gaps-history.md`);
+  merge limpo → push do bot e `ci` disparado por `workflow_dispatch` (push com GITHUB_TOKEN não
+  dispara workflows); conflito real → comentário com os arquivos e rótulo `conflito`, sem push.
+  O `ci` ganhou `workflow_dispatch`. Testado localmente com repositório e `gh` falsos (union limpo
+  enviado, conflito real só comentado). Observado antes: com o merge do #37, #40/#41/#42 viraram
+  CONFLICTING no GitHub e o merge local do #40 saiu limpo.
