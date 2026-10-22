@@ -14,7 +14,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     root_modules()?;
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let dir = manifest.join("src").join("cmd");
-    println!("cargo:rerun-if-changed=src/cmd");
+    // Absolute: the generated `#[path]`s are absolute, and worktrees that
+    // share a target directory must not reuse another worktree's list.
+    println!("cargo:rerun-if-changed={}", dir.display());
     let mut modules: Vec<(String, PathBuf, bool)> = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();

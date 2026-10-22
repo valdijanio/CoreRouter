@@ -1,0 +1,53 @@
+# G0.5: long fuzzing runs with libFuzzer (`cargo +nightly fuzz run <target>`,
+# docs/fuzzing.md). Outside the workspace: it needs nightly and libFuzzer,
+# and `cargo xtask ci` runs the same oracles as short proptests instead.
+[package]
+name = "corerouter-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+corerouter-engine = { path = "../crates/engine" }
+corerouter-control = { path = "../crates/control" }
+corerouter-mcp = { path = "../crates/mcp" }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "config_file"
+path = "fuzz_targets/config_file.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire"
+path = "fuzz_targets/wire.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "control_line"
+path = "fuzz_targets/control_line.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "mcp_messages"
+path = "fuzz_targets/mcp_messages.rs"
+test = false
+doc = false
+bench = false

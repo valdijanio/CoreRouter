@@ -42,7 +42,9 @@ fn path_text(p: &Path) -> Result<String, Box<dyn Error>> {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let src = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?).join("src");
-    println!("cargo:rerun-if-changed=src");
+    // Absolute: the generated `#[path]`s are absolute, and worktrees that
+    // share a target directory must not reuse another worktree's list.
+    println!("cargo:rerun-if-changed={}", src.display());
     let lib = std::fs::read_to_string(src.join("lib.rs"))?;
     // Only top-level declarations (`mod tests { mod x; }` lines are indented).
     let declared = |name: &str| {

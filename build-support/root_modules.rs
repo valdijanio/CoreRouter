@@ -12,7 +12,9 @@ fn root_modules() -> Result<(), Box<dyn std::error::Error>> {
     use std::fmt::Write as _;
     let manifest = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let src = manifest.join("src");
-    println!("cargo:rerun-if-changed=src");
+    // Absolute: the generated `#[path]`s are absolute, and worktrees that
+    // share a target directory must not reuse another worktree's list.
+    println!("cargo:rerun-if-changed={}", src.display());
     let mut mods: Vec<(String, std::path::PathBuf)> = Vec::new();
     for entry in std::fs::read_dir(&src)? {
         let path = entry?.path();

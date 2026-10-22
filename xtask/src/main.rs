@@ -124,9 +124,25 @@ fn main() -> ExitCode {
     }
 }
 
+/// The workspace this run is for: the nearest directory, from the current
+/// one up, whose `Cargo.toml` has `[workspace]`. Not `CARGO_MANIFEST_DIR`,
+/// which is fixed at build time: worktrees sharing a target directory reused
+/// an xtask built in another (deleted) worktree and ran there.
 fn workspace_root() -> PathBuf {
-    let here = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    here.parent().map(Path::to_path_buf).unwrap_or(here)
+    let built = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let fallback = built.parent().map(Path::to_path_buf).unwrap_or(built);
+    let Ok(mut dir) = std::env::current_dir() else {
+        return fallback;
+    };
+    loop {
+        let manifest = dir.join("Cargo.toml");
+        if std::fs::read_to_string(&manifest).is_ok_and(|t| t.contains("[workspace]")) {
+            return dir;
+        }
+        if !dir.pop() {
+            return fallback;
+        }
+    }
 }
 
 fn cargo_bin() -> std::ffi::OsString {

@@ -11,7 +11,9 @@ use std::path::PathBuf;
 fn main() -> Result<(), Box<dyn Error>> {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let dir = manifest.join("src").join("service");
-    println!("cargo:rerun-if-changed=src/service");
+    // Absolute: the generated `#[path]`s are absolute, and worktrees that
+    // share a target directory must not reuse another worktree's list.
+    println!("cargo:rerun-if-changed={}", dir.display());
     let mut modules: Vec<(String, PathBuf, bool)> = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();

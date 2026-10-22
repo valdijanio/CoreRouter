@@ -692,6 +692,17 @@ continuação indentadas).
   testes instáveis em 2026-10-22 (latência, ping IPv6, DAD, `netns_l2`), cada um travando a fila
   por 5–10 min.
 
+- 2026-10-22 — G0.7: MCP, parte 1: o servidor declara `resources`, `prompts` e `completions` no `initialize`.
+  Resources `corerouter://state`, `corerouter://commands`, `corerouter://diff` e os templates
+  `corerouter://command/{id}` e `corerouter://state/{path}` (JSON, mesmas permissões das tools;
+  inexistente → `-32002` com `data.uri` e sugestão de id). Prompts `configure_address` (endereço
+  + rota numa transação revisada, Safe Mode se for a gerência), `review_and_commit` (embute estado
+  e diff, explica riscos, commit só com o "sim") e `diagnose_connectivity` (rota, interface, ping,
+  MTR, sem mudar nada); argumento inválido → `-32602`. `completion/complete` sugere ids de
+  comando, caminhos de estado e interfaces. Como testar: `cargo test -p corerouter-mcp` (6 testes
+  de protocolo novos + proptest de params hostis) ou, no Claude Code com
+  `claude mcp add corerouter -- corerouter-cli mcp`, `@corerouter:corerouter://state` e
+  `/mcp__corerouter__review_and_commit`. Detalhes em `docs/mcp.md`.
 - 2026-10-22 — G1.3: Drift, parte 1: `config.drift.list` diz onde o kernel não tem mais o que a config em execução
   (mais o que os clientes DHCP instalaram) pôs lá — link virtual apagado, porta derrubada, MTU
   trocado, porta tirada da bridge/VRF, endereço apagado ou a mais, rota estática apagada ou a mais
@@ -791,3 +802,30 @@ continuação indentadas).
   `system.logging.action.add {"name":"lab","remote":"127.0.0.1","remote_port":15514}` e
   `system.logging.add {"topics":"info","action":"lab"}` um `nc -ul 15514` recebe
   `<30>1 2026-10-22T14:36:13.366151Z CoreRouter corerouter 11354 system - system.logging.add …`.
+
+- 2026-10-22 — processo: Fila de entrada resolve sozinha os conflitos só nos documentos do fold (`docs/log.md`,
+  `docs/gaps-history.md`, `docs/perf.md`: entradas dos dois lados; `docs/gaps.md`: a mesma gap
+  fica uma vez, a do PR). Eles vinham de uma branch que guardou o fold de uma rodada anterior da
+  fila, que parou no meio: o #62 ficou fora de dois lotes por isso. Um PR que o GitHub marca em
+  conflito só nesses documentos recebe a `main` na própria branch antes do lote (o squash é do
+  GitHub, que não vê a resolução do lote). Testado na branch do #62.
+
+- 2026-10-22 — G0.5: Fuzzing das três entradas hostis do plano de controle. Cada uma tem um oráculo de bytes →
+  `Result` (`corerouter_engine::fuzz::config_file`, `corerouter_control::fuzz::{wire,
+  control_line}`, `corerouter_mcp::fuzz::messages`) que roda de dois jeitos: proptest com semente
+  fixa em `crates/{engine,control,mcp}/tests/fuzz.rs` (entra no `cargo xtask ci`, ~2 s, **medido**;
+  `COREROUTER_FUZZ_CASES=N` faz a rodada longa sem nightly) e libFuzzer no crate `fuzz/` (fora do
+  workspace; `cargo +nightly fuzz run -s none <alvo>`). O arquivo de config não só decodifica: o
+  roteador dá boot a partir dele e responde a todas as consultas, e salvar → ler → salvar é ponto
+  fixo. Pânico capturado pelo guarda do motor também conta como falha (hook de pânico por thread).
+  Sementes em `fuzz/seeds/`, dicionário `fuzz/json.dict`; crash achado vai para
+  `fuzz/regressions/<alvo>/` e a CI o reexecuta. Como testar: `cargo test -p corerouter-engine -p
+  corerouter-control -p corerouter-mcp --test fuzz`; rodada longa em `docs/fuzzing.md`.
+
+  Rodada de 10 min por alvo com libFuzzer (`-s none`, `json.dict`, 4 alvos em paralelo, Ryzen AI
+  Max+ 395, 2026-10-22), **medido**: nenhum crash, nenhum pânico capturado. `config_file` 1,9 M
+  execuções (cobertura 4545 arestas), `wire` 81 M (104), `control_line` 14,8 M (4720),
+  `mcp_messages` 4,6 M (3802). Rodada aleatória sem nightly, também limpa: 3 000 configs mutadas
+  (~90 % decodificam e dão boot), 5 000 casos por teste do canal de controle, 20 000 sessões MCP.
+  Nada a corrigir nos alvos; um bug achado no próprio oráculo do `wire` (entrada só `\r`) foi
+  corrigido antes da rodada.
