@@ -83,13 +83,13 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas), `users` (contas e grupos, salvos fora das revisões), `firewall` e `interface_list` (G2.1) | serde, ipnet, thiserror |
-| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, `prober`, entradas dinâmicas de address-list) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria); `probe` (trait `Prober`/`ProbeSocket` das ferramentas) e `sim` (rede simulada determinística, G6.2) | L0, `firewall` (lateral permitido) |
+| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, `prober`, entradas dinâmicas de address-list, transporte do cliente DHCP `dhcp_port`/`DhcpPort`, G4.7) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria); `probe` (trait `Prober`/`ProbeSocket` das ferramentas) e `sim` (rede simulada determinística, G6.2) | L0, `firewall` (lateral permitido) |
 | L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
-| L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
+| L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
-| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU, MTR; G6.1–G6.3) | L0–L2 (nunca plataforma) |
+| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU, MTR; G6.1–G6.3), clientes DHCP em execução (`dhcp_client`: `Session::dhcp_service`, concessões como entradas dinâmicas vistas pelo HAL em `Session::effective`; G4.7) | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial`; `ThreadRunner` das tarefas (G6.1) | L0–L3 |
 | L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
 | L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
@@ -107,7 +107,7 @@ CoreRouter/
 ├── .cargo/config.toml    # alias: cargo xtask
 ├── AGENTS.md = CLAUDE.md
 ├── ROADMAP.md
-├── docs/{architecture,gaps,mcp,control-protocol,lldp-mndp,tools}.md
+├── docs/{architecture,gaps,mcp,control-protocol,lldp-mndp,tools,dhcp-client}.md
 ├── crates/
 │   ├── model/            # L0
 │   ├── hal/              # L1 (traits + virtual)
@@ -438,4 +438,5 @@ falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools
 - 2026-10-22 — G6.3: MTR nas tarefas das ferramentas.
 - 2026-10-22 — G0.3b: primeiro acesso sem senha (bootstrap no engine, regra de rede no `Gate`, `ui::first_login`).
 - 2026-10-22 — G1.19: `hal::nic` e os métodos `ethernet_monitor`/`hardware`/`counters` do `Hal`, genetlink do `hal-linux`, `engine::link_watch`.
+- 2026-10-22 — G4.7a: cliente DHCPv4 (`proto-dhcp` codec/cliente/lab, `Hal::dhcp_port`, `hal-linux::dhcp`, `engine::dhcp_client`, relógio de serviço no `control`).
 - 2026-10-22 — G2.1b: `Caller::link`, `engine::lockout`, `firewall::{eval,shadow,describe}`, `ui::{firewall_assist,lockout}`.
