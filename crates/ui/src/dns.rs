@@ -1152,8 +1152,16 @@ impl DnsPanel {
         let mut flush = false;
         ui.horizontal(|ui| {
             flush = action(ui, "Flush Cache", can.check("ip.dns.cache.flush"));
-            if ui.button("Resolve…").clicked() {
-                open_window(app, crate::dns_resolve::WIN);
+            if ui.button("Resolve…")
+                .on_hover_text("Tools › DNS Lookup, with the selected entry")
+                .clicked()
+            {
+                let picked = self.cache_table.selection(&rows).into_iter().next();
+                let (name, rtype) = picked
+                    .as_deref()
+                    .and_then(|k| k.split_once(' '))
+                    .unwrap_or(("", ""));
+                crate::dns_lookup::open_with(app, name, rtype);
             }
             ui.separator();
             let hits: u64 = self

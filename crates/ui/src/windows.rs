@@ -171,7 +171,8 @@ impl Win {
             Win::Firewall => [980.0, 420.0],
             Win::InterfaceList => [520.0, 280.0],
             Win::Ping => [900.0, 700.0],
-            Win::Mtr => [860.0, 520.0],
+            // Tools open as tall as their form and grow with the results.
+            Win::Mtr => [860.0, 160.0],
             _ => [380.0, 200.0],
         }
     }
@@ -496,4 +497,12 @@ pub(crate) fn combo(
                 ui.selectable_value(value, n.clone(), n);
             }
         });
+}
+
+/// How tall the results of a tool window get before they scroll
+/// (`ScrollArea::min_scrolled_height`). The window opens as tall as its form
+/// and egui grows it with what is inside: the results ask for their whole
+/// height up to this, so the window grows with them, then they scroll.
+pub(crate) fn grow_height(ui: &egui::Ui) -> f32 {
+    ui.ctx().content_rect().height() * 0.6
 }
