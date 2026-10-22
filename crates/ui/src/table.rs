@@ -75,6 +75,11 @@ pub(crate) struct Row {
     pub cells: Vec<String>,
     /// Drawn greyed out, like a disabled item in WinBox.
     pub dimmed: bool,
+    /// A section header (firewall): one full-width band with the title,
+    /// which is the text of the comment column (or the first cell).
+    pub section: bool,
+    /// Text colour of an enabled, unselected row (e.g. by firewall action).
+    pub tint: Option<Color32>,
 }
 
 impl Row {
@@ -109,6 +114,9 @@ pub(crate) struct TableOutput {
     /// comment (a window without a comment dialog treats it as `opened`).
     pub comment: Option<String>,
     pub shortcut: Option<Shortcut>,
+    /// A row was dragged and dropped (tables with [`TableState::reorder`]):
+    /// (dragged key, key of the row it lands above; `None` = after the last).
+    pub dropped: Option<(String, Option<String>)>,
 }
 
 /// UI-local state of one table: selection, Shift anchor, find text, and
@@ -120,6 +128,8 @@ pub(crate) struct TableState {
     pub filter: String,
     /// Comments as a band above each item instead of a column.
     pub inline_comments: bool,
+    /// Rows can be dragged to a new place (order matters: firewall rules).
+    pub reorder: bool,
 }
 
 impl TableState {
@@ -415,7 +425,7 @@ pub(crate) fn show(
         .iter()
         .map(|r| {
             note_col
-                .filter(|_| inline)
+                .filter(|_| inline && !r.section)
                 .and_then(|i| r.cells.get(i))
                 .and_then(|c| note_text(c))
         })
@@ -426,7 +436,7 @@ pub(crate) fn show(
         .iter()
         .filter_map(|&i| Some((i, text_width(ui, columns.get(i)?.title, &font))))
         .collect();
-    for r in &visible {
+    for r in visible.iter().filter(|r| !r.section) {
         for (i, w) in &mut layout {
             if let Some(cell) = r.cells.get(*i) {
                 let icon = if note_col == Some(*i) && !cell.trim().is_empty() {
@@ -486,12 +496,24 @@ pub(crate) fn show(
                 vec2(width, rows_h.max(ui.available_height())),
             );
             let bg = ui.interact(body, id, Sense::click());
+            let row_sense = if state.reorder {
+                Sense::click_and_drag()
+            } else {
+                Sense::click()
+            };
+            // Where each item is, for a drop; and the item being dragged.
+            let mut placed: Vec<(&str, Rect)> = Vec::with_capacity(visible.len());
+            let mut dragging: Option<(&str, bool)> = None;
 
             for (i, (row, note)) in visible.iter().zip(&notes).enumerate() {
                 // One item: the comment band (if any) and the row under it.
                 let item_h = if note.is_some() { 2.0 * row_h } else { row_h };
                 let (item, _) = ui.allocate_exact_size(vec2(width, item_h), Sense::hover());
-                let resp = ui.interact(item, row_id(salt, &row.key), Sense::click());
+                let resp = ui.interact(item, row_id(salt, &row.key), row_sense);
+                placed.push((row.key.as_str(), item));
+                if resp.dragged() || resp.drag_stopped() {
+                    dragging = Some((row.key.as_str(), resp.drag_stopped()));
+                }
                 let selected = state.is_selected(&row.key);
                 let fill = if selected {
                     Some(visuals.selection.bg_fill)
@@ -511,23 +533,33 @@ pub(crate) fn show(
                 if let Some(note) = note {
                     paint_note(ui, band, note, &style, &font);
                 }
-                let color = match (selected, row.dimmed) {
-                    (true, _) => visuals.selection.stroke.color,
-                    (false, true) => visuals.weak_text_color(),
-                    (false, false) => visuals.text_color(),
+                let color = match (selected, row.dimmed, row.tint) {
+                    (true, _, _) => visuals.selection.stroke.color,
+                    (false, true, _) => visuals.weak_text_color(),
+                    (false, false, Some(tint)) => tint,
+                    (false, false, None) => visuals.text_color(),
                 };
-                paint_cells(
-                    ui,
-                    rect,
-                    &layout,
-                    columns,
-                    |c| row.cells.get(c).map_or("", String::as_str),
-                    Ink {
-                        text: color,
-                        note: note_col.filter(|_| !inline).map(|c| (c, &style)),
-                    },
-                    &font,
-                );
+                if row.section {
+                    let title = note_col
+                        .and_then(|c| row.cells.get(c))
+                        .or_else(|| row.cells.iter().find(|c| !c.trim().is_empty()))
+                        .map(String::as_str)
+                        .unwrap_or("");
+                    paint_section(ui, rect, title, &style, selected, &font);
+                } else {
+                    paint_cells(
+                        ui,
+                        rect,
+                        &layout,
+                        columns,
+                        |c| row.cells.get(c).map_or("", String::as_str),
+                        Ink {
+                            text: color,
+                            note: note_col.filter(|_| !inline).map(|c| (c, &style)),
+                        },
+                        &font,
+                    );
+                }
 
                 if resp.clicked() {
                     let m = ui.input(|i| i.modifiers);
@@ -559,6 +591,27 @@ pub(crate) fn show(
                     menu(ui, Menu::Rows(&sel));
                     inline_toggle(ui, note_col.is_some(), inline_comments);
                 });
+            }
+            if let Some((key, done)) = dragging {
+                let target = drop_target(ui, &placed, key);
+                if done {
+                    if let Some(t) = target {
+                        out.dropped = Some((key.to_owned(), t.map(str::to_owned)));
+                    }
+                } else if let Some(t) = target {
+                    // The insertion line where the row would land.
+                    let y = match t {
+                        Some(k) => placed.iter().find(|(p, _)| *p == k).map(|(_, r)| r.top()),
+                        None => placed.last().map(|(_, r)| r.bottom()),
+                    };
+                    if let Some(y) = y {
+                        ui.painter().hline(
+                            head.x_range(),
+                            y,
+                            Stroke::new(2.0, visuals.selection.bg_fill),
+                        );
+                    }
+                }
             }
             let rest = (body.bottom() - ui.cursor().min.y).max(0.0);
             ui.allocate_space(vec2(width, rest));
@@ -594,6 +647,57 @@ pub(crate) fn show(
     }
     ui.weak(status);
     out
+}
+
+/// Where a dragged row lands: `Some(Some(k))` above row `k`, `Some(None)`
+/// after the last row, `None` when it would not move (its own place).
+fn drop_target<'a>(ui: &Ui, placed: &[(&'a str, Rect)], key: &str) -> Option<Option<&'a str>> {
+    let y = ui.input(|i| i.pointer.latest_pos())?.y;
+    let at = placed.iter().position(|(_, r)| y < r.center().y);
+    let from = placed.iter().position(|(k, _)| *k == key)?;
+    match at {
+        // Above itself or above the row right after it: same place.
+        Some(i) if i == from || i == from + 1 => None,
+        Some(i) => placed.get(i).map(|(k, _)| Some(*k)),
+        None if from + 1 == placed.len() => None,
+        None => Some(None),
+    }
+}
+
+/// A section header row: a band in the comment colours with the title in
+/// bold, across the whole table.
+fn paint_section(
+    ui: &Ui,
+    rect: Rect,
+    title: &str,
+    style: &CommentStyle,
+    selected: bool,
+    font: &egui::FontId,
+) {
+    let painter = ui.painter_at(rect);
+    if let (Some(wash), false) = (style.wash, selected) {
+        painter.rect_filled(rect, 0.0, wash);
+    }
+    painter.rect_filled(
+        Rect::from_min_size(rect.min, vec2(4.0, rect.height())),
+        0.0,
+        style.accent,
+    );
+    let text = egui::RichText::new(title).strong();
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        rect.width() - 2.0 * CELL_PAD - 10.0,
+        egui::FontSelection::FontId(font.clone()),
+    );
+    painter.galley(
+        pos2(
+            rect.left() + 10.0 + CELL_PAD,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        style.ink,
+    );
 }
 
 /// The "Inline Comments" entry closing every context menu of a table that
@@ -896,6 +1000,8 @@ mod tests {
                 key: (*n).to_owned(),
                 cells: vec![(*n).to_owned()],
                 dimmed: false,
+                section: false,
+                tint: None,
             })
             .collect();
         let mut s = TableState::default();

@@ -393,6 +393,24 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   valor posicional, tarefas acompanhadas ao vivo por `tool.task.poll` com Ctrl+C →
   `tool.task.stop` (testado com roteador simulado; o ping real liga-se sozinho), e menos
   requisições: ação = 3 (era ~12), `print` = 1. Esforço do agente ~8 h no total (**estimado**).
+- 2026-10-22 — G2.1a: firewall base no modelo do RouterOS (`docs/firewall.md`). Modelo em
+  `model::firewall` (tabelas, chains nativas e próprias, matchers em sintaxe RouterOS com `!`,
+  ações, seções, IPv4+IPv6 numa lista com `family`) e `model::interface_list` (LAN/WAN padrão).
+  Crate novo `corerouter-firewall` (L1 puro: validação + render nftables + grafo de jumps), usado
+  pelo engine, pelo `VirtualHal` e pelo `hal-linux` — L1 porque o `hal-linux` não pode depender de
+  L2. 27 comandos (`ip.firewall.{filter,nat,mangle}.*`, `address-list.*`, `interface.list.*`,
+  `.member.*`); erros apontam o parâmetro. Aplicação: tabela `inet corerouter` trocada inteira por
+  `nft -f -` (um lote netlink, atômico), antes do plano netlink e desfeita se ele falhar; entradas
+  dinâmicas (timeout) são estado operacional e sobrevivem à troca. Testes: 7 do render/validador
+  (golden `full.nft`, carregado também num kernel real), 9 de comandos (sucesso, validação,
+  rollback por recusa do data plane e por `config.rollback`, move/place_before, laços, dinâmicas
+  com expiração), 1 em netns (aplica, troca, recusa sem mudar nada, preserva tabela de outro
+  dono), 6 headless da GUI (seções, cores, diálogo com abas, erro no campo, ▲ e arrastar,
+  atalhos, abas de listas). Teste manual: daemon de lab + `corerouter-gui --connect`, regras
+  pela CLI, janela e diálogo conferidos em screenshot (repetido depois do merge com G0.3, logado
+  pelo token local, arrastando uma regra). Com o terminal do G0.8: `/export` → `/import` do firewall
+  testado (listas padrão LAN/WAN viram `set`, `passthrough=no` não se perde, chains próprias e `!`
+  digitados no terminal). Esforço do agente ~7 h (**estimado**).
 
 - 2026-10-22 — G6.1 + G6.2: Tools › Ping. Engine ganha tarefas em segundo plano (`tasks.rs`:
   `tool.task.list/poll/stop`, jobs nas threads de um `Runner` que o app instala —
@@ -448,5 +466,6 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G0.8.
 - 2026-10-22 — log do G0.3.
 - 2026-10-22 — log do G6.1 + G6.2.
+- 2026-10-22 — log do G2.1a.
 - 2026-10-22 — log do G6.3.
 - 2026-10-22 — log do G6.5.

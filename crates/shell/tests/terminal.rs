@@ -516,6 +516,107 @@ fn export_import_round_trip() {
     assert_eq!(c.export(), script);
 }
 
+/// G2.1: firewall rules (order, sections, negation, lists) and interface
+/// lists survive `/export` → `/import`; the default lists LAN/WAN are set,
+/// not added again.
+#[test]
+fn firewall_export_import_round_trip() {
+    let mut a = Term::new();
+    for (id, p) in [
+        (
+            "interface.list.set",
+            json!({"name": "LAN", "comment": "inside"}),
+        ),
+        ("interface.list.add", json!({"name": "DMZ"})),
+        (
+            "interface.list.member.add",
+            json!({"list": "LAN", "interface": "ether2"}),
+        ),
+        (
+            "interface.list.member.add",
+            json!({"list": "DMZ", "interface": "ether3"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"section": "Router protection"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"connection_state": "established,related"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"protocol": "tcp", "dst_port": "22,8291", "src_address_list": "!mgmt", "action": "drop", "comment": "ssh"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"in_interface_list": "!LAN", "action": "drop", "disabled": true}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"action": "jump", "jump_target": "guard"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"chain": "guard", "protocol": "tcp", "action": "reject", "reject_with": "tcp-reset"}),
+        ),
+        (
+            "ip.firewall.nat.add",
+            json!({"chain": "srcnat", "action": "masquerade", "out_interface_list": "DMZ"}),
+        ),
+        (
+            "ip.firewall.mangle.add",
+            json!({"chain": "prerouting", "action": "mark-connection", "new_connection_mark": "web", "passthrough": false}),
+        ),
+        (
+            "ip.firewall.address-list.add",
+            json!({"list": "mgmt", "address": "10.0.0.0/24"}),
+        ),
+        (
+            "ip.firewall.address-list.add",
+            json!({"list": "tmp", "address": "192.0.2.1", "timeout": "1h"}),
+        ),
+    ] {
+        a.router
+            .session
+            .execute(id, &p)
+            .unwrap_or_else(|e| panic!("{id}: {e}"));
+    }
+    let script = a.export();
+    assert!(
+        !script.contains("add name=LAN"),
+        "default list is set, not added:\n{script}"
+    );
+    assert!(
+        !script.contains("192.0.2.1"),
+        "dynamic entry is not exported:\n{script}"
+    );
+    let mut b = Term::new();
+    b.router.files.insert("fw.rsc".into(), script.clone());
+    b.ok("/import file=fw.rsc");
+    // Ids may differ (tables are imported in another order); content may not.
+    let fw = |t: &Term, path: &str| {
+        let mut v = t.router.session.inspect(Some(path)).unwrap();
+        for item in v.as_array_mut().into_iter().flatten() {
+            if let Some(o) = item.as_object_mut() {
+                o.remove("id");
+            }
+        }
+        v
+    };
+    for table in ["filter", "nat", "mangle", "address_lists"] {
+        let path = format!("running.ip.firewall.{table}");
+        assert_eq!(fw(&b, &path), fw(&a, &path), "{table}:\n{script}");
+    }
+    assert_eq!(
+        fw(&b, "running.interface_lists.lists"),
+        fw(&a, "running.interface_lists.lists")
+    );
+    assert_eq!(b.export(), script);
+    // Typed in the terminal, custom chains and negations work too.
+    b.ok("/ip firewall filter add chain=guard2 src-address=!10.0.0.0/8 action=drop");
+}
+
 #[test]
 fn import_is_atomic_and_says_where_it_failed() {
     let mut t = Term::new();

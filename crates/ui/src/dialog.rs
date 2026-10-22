@@ -110,6 +110,11 @@ pub(crate) fn field_id(window: Id, param: &str) -> Id {
 }
 
 impl Form {
+    /// The dialog window this form is in (for ids of custom fields).
+    pub(crate) fn window(&self) -> Id {
+        self.id
+    }
+
     fn field_id(&self, param: &str) -> Id {
         field_id(self.id, param)
     }

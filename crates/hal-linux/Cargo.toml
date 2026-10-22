@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 corerouter-model.workspace = true
 corerouter-hal.workspace = true
+corerouter-firewall.workspace = true
 ipnet.workspace = true
 log.workspace = true
 
@@ -24,6 +25,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"] }
 # G5.2 (l2.rs): AF_PACKET and UDP sockets through safe APIs only (no `unsafe`).
 socket2 = { version = "0.6.5", features = ["all"] }
+serde_json.workspace = true
 nix = { version = "0.30.1", default-features = false, features = ["socket", "net", "uio", "poll"] }
 # Tools (icmp.rs): IP_MTU_DISCOVER / IPV6_MTU_DISCOVER, which socket2 and nix lack.
 rustix = { version = "1.1.5", default-features = false, features = ["std", "net", "time"] }

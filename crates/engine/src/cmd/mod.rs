@@ -76,7 +76,9 @@ macro_rules! cmd {
 
 pub mod args;
 mod config;
+pub mod firewall;
 mod interface;
+mod interface_list;
 mod ip;
 mod neighbor;
 mod route;
@@ -88,9 +90,11 @@ mod vrf;
 
 static AREAS: &[&[CommandSpec]] = &[
     interface::COMMANDS,
+    interface_list::COMMANDS,
     ip::COMMANDS,
     route::COMMANDS,
     vrf::COMMANDS,
+    firewall::COMMANDS,
     neighbor::COMMANDS,
     routing::COMMANDS,
     system::COMMANDS,

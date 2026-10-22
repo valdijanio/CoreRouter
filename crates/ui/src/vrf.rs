@@ -509,6 +509,8 @@ fn vrf_row(v: &Vrf) -> Row {
             v.comment.clone(),
         ],
         dimmed: v.disabled,
+        section: false,
+        tint: None,
     }
 }
 
