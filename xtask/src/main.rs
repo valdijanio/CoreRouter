@@ -155,10 +155,101 @@ fn clippy(root: &Path) -> Outcome {
     run(c, root)
 }
 
+/// `cargo nextest` when installed (test binaries run in parallel, not one
+/// after the other; doctests still go through `cargo test --doc`), else
+/// `cargo test`. `COREROUTER_NEXTEST=0` forces `cargo test`.
 fn test(root: &Path) -> Outcome {
+    if !nextest_available(root) {
+        let mut c = cargo();
+        c.args(["test", "--workspace", "--quiet"]);
+        return run(c, root);
+    }
     let mut c = cargo();
-    c.args(["test", "--workspace", "--quiet"]);
-    run(c, root)
+    c.args([
+        "nextest",
+        "run",
+        "--workspace",
+        "--cargo-quiet",
+        "--status-level",
+        "fail",
+        "--final-status-level",
+        "slow",
+    ]);
+    match run(c, root) {
+        // `cargo test --doc` costs ~17 s even with no doctest (one rustdoc
+        // per crate), so it runs only when some doc comment has Rust code.
+        Outcome::Ok if has_doctests(root) => {
+            let mut d = cargo();
+            d.args(["test", "--workspace", "--doc", "--quiet"]);
+            run(d, root)
+        }
+        other => other,
+    }
+}
+
+/// Does any `crates/*/src` or `apps/*/src` doc comment open a fenced block
+/// that rustdoc runs (no tag, or `rust…` without `ignore`)?
+fn has_doctests(root: &Path) -> bool {
+    let mut files = Vec::new();
+    for top in ["crates", "apps"] {
+        let Ok(dirs) = std::fs::read_dir(root.join(top)) else {
+            continue;
+        };
+        for dir in dirs.flatten() {
+            collect_rs(&dir.path().join("src"), &mut files);
+        }
+    }
+    files
+        .iter()
+        .any(|f| std::fs::read_to_string(f).is_ok_and(|text| doc_has_rust_block(&text)))
+}
+
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_rs(&p, out);
+        } else if p.extension().is_some_and(|x| x == "rs") {
+            out.push(p);
+        }
+    }
+}
+
+fn doc_has_rust_block(text: &str) -> bool {
+    let mut open = false;
+    for line in text.lines() {
+        let l = line.trim_start();
+        let Some(doc) = l.strip_prefix("///").or_else(|| l.strip_prefix("//!")) else {
+            continue;
+        };
+        let Some(tag) = doc.trim().strip_prefix("```") else {
+            continue;
+        };
+        if open {
+            open = false;
+            continue;
+        }
+        open = true;
+        let tag = tag.trim();
+        if (tag.is_empty() || tag.starts_with("rust")) && !tag.contains("ignore") {
+            return true;
+        }
+    }
+    false
+}
+
+fn nextest_available(root: &Path) -> bool {
+    if std::env::var_os("COREROUTER_NEXTEST").is_some_and(|v| v == "0") {
+        return false;
+    }
+    cargo()
+        .args(["nextest", "--version"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 /// Tests against a real kernel, in a throwaway user + network namespace: no
@@ -354,5 +445,23 @@ mod tests {
         sorted.sort();
         assert_eq!(found, sorted);
         assert!(found.iter().all(|(_, t)| t.starts_with("netns")));
+    }
+}
+
+#[cfg(test)]
+mod doctest_tests {
+    use super::doc_has_rust_block;
+
+    #[test]
+    fn only_runnable_rust_blocks_count() {
+        assert!(!doc_has_rust_block(
+            "//! ```text\n//! a\n//! ```\n/// ```sh\n/// x\n/// ```\n"
+        ));
+        assert!(!doc_has_rust_block("/// ```rust,ignore\n/// x\n/// ```\n"));
+        assert!(doc_has_rust_block(
+            "//! ```text\n//! a\n//! ```\n/// ```\n/// let x = 1;\n/// ```\n"
+        ));
+        assert!(doc_has_rust_block("/// ```rust,no_run\n/// x\n/// ```\n"));
+        assert!(!doc_has_rust_block("// ```\nfn main() {}\n"));
     }
 }

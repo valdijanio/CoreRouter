@@ -145,7 +145,9 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 ## Verificação
 
 - Antes de cada commit: `cargo xtask ci` (fmt, clippy -D warnings, test, bench-check, netns,
-  layers, agents-sync, wasm). Ele para no primeiro FAIL; não faça commit com FAIL.
+  docs, layers, agents-sync, wasm). Ele para no primeiro FAIL; não faça commit com FAIL. O passo
+  `test` usa o `cargo nextest` quando instalado (`cargo install --locked cargo-nextest`; metade do
+  tempo, **medido**).
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.
