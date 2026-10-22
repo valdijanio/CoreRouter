@@ -42,6 +42,29 @@ execução. Comando novo no engine aparece no terminal sozinho (há um teste que
 | tipo `[string]` | lista `a,b,c` (vira array JSON; `[string] \| string` vai como texto) |
 | tipo `a\|b\|c` | valores oferecidos pelo Tab |
 
+### Metadados do registro para o terminal
+
+Três campos opcionais do `CommandSpec`, com construtores `const` (`cmd!(…).alias("ping")
+.positional("address").task()`), saem no `engine.list` como `alias`, `positional` e `task`:
+
+| Metadado | Efeito no terminal |
+|---|---|
+| `alias("ping")` | atalho válido em qualquer menu e na raiz: `ping …` e `/ping …` = `/tool ping start …`; aparece no Tab e no `?` da raiz. Nunca esconde um menu da raiz (teste no engine) |
+| `positional("address")` | a primeira palavra sem `=` vai para esse parâmetro: `ping 8.8.8.8 count=3` |
+| `task()` | o comando inicia uma tarefa: o terminal lê o `id` do resultado e acompanha com `tool.task.poll {id, after_seq}` (o `after_seq` é o `next_seq` da resposta anterior), imprimindo cada evento numa linha assim que chega (cabeçalho uma vez; colunas na ordem de um `columns` opcional no resultado ou na resposta, senão `seq` e as chaves do primeiro evento; `status` diferente de `ok`/vazio em amarelo), até `done`; então mostra `reason` e o `summary`. Entre polls sem novidade espera 250 ms (`Request::Sleep`). **Ctrl+C** chama `tool.task.stop {id}` uma vez e continua até o resumo |
+
+O `tool.ping.start` (sessão Tools › Ping, ainda fora da main) liga-se a isso sozinho quando entrar
+com esses metadados; os testes usam um roteador simulado com o mesmo contrato
+(`crates/shell/tests/tasks.rs`, e um teste headless da janela da GUI).
+
+### Custo em requisições
+
+O canal de controle paga latência por requisição, então o terminal pede pouco: conectar = 4
+(`server.info`, `engine.list`, `state.inspect` e um `engine.batch` não atômico com todas as
+leituras que o Tab usa); `print` e consultas = 1; ação = 3 (o comando, `state.inspect` para o
+prompt e o mesmo `engine.batch` de leituras). O `engine.list` só é pedido de novo quando o roteador
+responde "unknown command" (daemon trocado ou atualizado).
+
 Verbos do RouterOS **sem** comando equivalente no engine não são improvisados: `find`/`[find …]`
 (substituição de comando), `enable`/`disable` (use `set … disabled=yes|no`), `comment` (use
 `set … comment=…`), `edit`, `move`, `reset`, `unset`, `monitor`, `/system reboot`,
@@ -116,7 +139,7 @@ cond := termo (and|or termo)*      termo := [!]prop[(=|!=|~|<|>|<=|>=)valor]
 | Ctrl+X | Safe Mode: entra; de novo, sai **mantendo** as mudanças (RouterOS) | idem |
 | `/quit` | fecha a janela | sai; com Safe Mode desta conexão, **mantém** as mudanças (`exit`) antes |
 | Ctrl+D (linha vazia) | — | sai **desfazendo** o Safe Mode (`cancel`), como no RouterOS |
-| Ctrl+C | — | limpa a linha |
+| Ctrl+C | durante uma tarefa: para (`tool.task.stop`) | limpa a linha; durante uma tarefa: para |
 | Esc | esconde as sugestões | — |
 | botão direito na saída | Copy All, Clear | — |
 
@@ -194,3 +217,4 @@ interativo do Safe Mode (o engine diz quem segura; `force=yes` em `exit`/`cancel
 ## Histórico de revisão
 
 - 2026-10-22 — criado (G0.8: terminal na GUI e na CLI, export/import; SSH pendente do G0.3).
+- 2026-10-22 — atalhos (`alias`), parâmetro posicional e acompanhamento de tarefas ao vivo a partir de metadados do registro; custo em requisições reduzido.
