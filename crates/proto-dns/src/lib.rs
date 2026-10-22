@@ -9,6 +9,7 @@
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
+pub mod adlist;
 pub mod asn;
 pub mod cache;
 pub mod message;
@@ -37,6 +38,9 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
                 format!("allowed_from: no interface list '{name}'"),
             ));
         }
+    }
+    if let Some(m) = cfg.ip.dns_adlist.problem() {
+        out.push(Issue::new("ip.dns.adlist", m));
     }
     if let Some(m) = cfg.ip.dns_static.problem() {
         out.push(Issue::new("ip.dns.static", m));
