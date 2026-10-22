@@ -669,3 +669,7 @@ continuação indentadas).
   mediana de 40 pedidos passou dos 5 ms e reprovou um PR bom. Agora vale o pedido mais rápido dos
   40, com limite de 20 ms: o atraso de Nagle (~40 ms) atinge todo pedido e continua reprovando; a
   carga só atrasa alguns.
+
+- 2026-10-22 — processo: Teste `failure_rolls_back_every_done_step` (netns) sem falso negativo: a comparação dos
+  endereços ignora o estado `tentative` do DAD do IPv6, transitório logo depois de o link subir
+  (reprovou o CI do PR da bateria).
