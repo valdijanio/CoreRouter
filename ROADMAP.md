@@ -95,6 +95,29 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `--config-dir` + GUI `--connect`, comentários em ether2/ether5, Inline Comments e tema
   claro ligados pela GUI real (xdotool), screenshots nos dois temas conferidos; GUI fechada e
   reaberta voltou em tema claro com os comentários inline.
+- 2026-10-21 — G1.5: rotas estáticas e VRF básico. Modelo: `ip.routes` (`RouteEntry` com
+  `dst_address` IPv4/IPv6 incluindo `0.0.0.0/0` e `::/0`, `gateway` IP / interface /
+  `ip%interface`, `distance` 1..=255, `routing_table`, ids `*N`); VRF = interface tipo `vrf`
+  com tabela do kernel própria (1000+) e `Interface.vrf` nos membros. `model::route::reach`
+  decide se uma rota vale agora (ativa / inativa / inválida) e é usado pela validação, pelas
+  flags de `ip.route.list` (X A D C S; conectadas derivadas dos endereços como `ADC`) e pelo
+  `hal-linux`, então engine e kernel não divergem. Comandos: `ip.route.add/set/remove/list`,
+  `ip.vrf.add/set/remove/list`; recusa gateway fora de rede conectada da tabela, famílias
+  trocadas, bits de host no destino, rota duplicada ou de mesma distância (ECMP fica para
+  depois), endereço do próprio roteador, link-local sem interface; remover endereço/interface
+  de que uma rota depende é recusado com o comando a usar. `hal-linux`: ops `AddRoute`/
+  `DelRoute` (distance → métrica, proto static) e link `vrf`; o kernel apaga rotas de link que
+  desce, é recriado, muda de VRF ou perde o último IPv4, e apaga IPv6 de link que desce
+  (`keep_addr_on_down=0`, achado no teste de netns) — o plano remove e recoloca isso
+  explicitamente para o desfazer funcionar. UI: janela IP › Routes no padrão G1.9 (seleção,
+  +/−/✓/✗/Comment, menu de contexto, duplo clique "Route <dst>", "New Route" com Apply que
+  vira a janela da rota; gateway "10.0.0.1 reachable ether1"). 30 testes novos (13 de
+  comandos, 7 de modelo, 5 de plano, 3 em netns sem root — o de VRF pula com aviso se o kernel
+  não tem `vrf`, como o runner do GitHub —, 2 headless de UI).
+  Teste manual (**medido**): daemon `--config-dir` + GUI `--connect`; rota padrão criada pelo
+  "New Route" (revisão 3), backup distance 10 e `::/0` pela CLI; daemon e GUI reiniciados →
+  revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
+  pref-src, criar VRF pela GUI.
 
 - 2026-10-21 — G5.2 (Parte 1): LLDP e escuta passiva de MNDP. `crates/proto-lldp` (L2): codec
   puro de LLDPDU do IEEE 802.1AB (Chassis ID, Port ID, TTL, End, Port/System Description,
@@ -137,3 +160,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.10 + G1.11.
 - 2026-10-21 — log do G5.2 (Parte 1).
 - 2026-10-21 — log do G1.12.
+- 2026-10-21 — log do G1.5.

@@ -5,15 +5,28 @@
 //! fails, undoes the steps already done in reverse.
 //!
 //! Order (teardown first, then build):
-//! 1. remove addresses that go away (or whose link is recreated);
-//! 2. detach bridge ports that leave (or change) their bridge;
+//! 0. remove static routes that go away (or whose link is rebuilt, below);
+//! 1. remove addresses that go away, or whose link is disabled, recreated or
+//!    changes master (Linux drops IPv6 addresses of a link that goes down or
+//!    joins a VRF);
+//! 2. detach bridge ports / VRF members that leave (or change) their master;
 //! 3. delete virtual links, VLAN children before their parents;
 //! 4. create virtual links, parents before VLAN children;
 //! 5. MTU: decreases children-first, then increases parents-first, so a VLAN
 //!    never exceeds its parent on the way (nor on the way back, in rollback);
-//! 6. attach bridge ports;
+//! 6. attach bridge ports / VRF members;
 //! 7. add addresses;
-//! 8. admin state up/down, parents first.
+//! 8. admin state up/down, parents first;
+//! 9. add static routes that arrive (or whose link was rebuilt).
+//!
+//! The kernel deletes routes by itself when their link goes down, is
+//! recreated, is enslaved to (or released from) a VRF, or loses its last
+//! IPv4 address. Those links are "rebuilt": their routes are removed
+//! explicitly in step 0 and added again in step 9, so the undo of a failed
+//! apply can put every route back, and the kernel never holds a route the
+//! running config does not know about. Which routes belong in the kernel is
+//! decided by `corerouter_model::route::reach` — the same function behind
+//! the A flag of `ip.route.list`.
 //!
 //! Only interfaces present in `from` or `to` ever appear in the plan, so a
 //! host interface outside the config is never touched. Physical ports
@@ -21,8 +34,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::net::IpAddr;
 
 use corerouter_hal::HalError;
+use corerouter_model::route::{self, Reach};
 use corerouter_model::{Config, IfName, InterfaceKind};
 use ipnet::IpNet;
 
@@ -37,6 +52,10 @@ pub enum LinkSpec {
     Bridge,
     /// Linux `dummy`: what a RouterOS-style loopback is in the kernel.
     Dummy,
+    /// Linux `vrf` (l3mdev) bound to kernel routing table `table`.
+    Vrf {
+        table: u32,
+    },
 }
 
 impl LinkSpec {
@@ -50,6 +69,7 @@ impl LinkSpec {
             }),
             InterfaceKind::Bridge => Some(Self::Bridge),
             InterfaceKind::Loopback => Some(Self::Dummy),
+            InterfaceKind::Vrf { table } => Some(Self::Vrf { table: *table }),
         }
     }
 
@@ -59,6 +79,7 @@ impl LinkSpec {
             Self::Vlan { .. } => "vlan",
             Self::Bridge => "bridge",
             Self::Dummy => "dummy",
+            Self::Vrf { .. } => "vrf",
         }
     }
 }
@@ -69,13 +90,40 @@ impl fmt::Display for LinkSpec {
             Self::Vlan { parent, vlan_id } => write!(f, "vlan {vlan_id} on '{parent}'"),
             Self::Bridge => f.write_str("bridge"),
             Self::Dummy => f.write_str("loopback (dummy)"),
+            Self::Vrf { table } => write!(f, "vrf (table {table})"),
         }
+    }
+}
+
+/// A unicast route as the kernel holds it (protocol `static`). `metric` is
+/// the RouterOS distance, so the kernel prefers the lowest one, too.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct KernelRoute {
+    pub table: u32,
+    pub dst: IpNet,
+    pub metric: u32,
+    pub link: IfName,
+    pub gateway: Option<IpAddr>,
+}
+
+impl fmt::Display for KernelRoute {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "route {}", self.dst)?;
+        if let Some(g) = self.gateway {
+            write!(f, " via {g}")?;
+        }
+        write!(f, " dev '{}' metric {}", self.link, self.metric)?;
+        if self.table != route::MAIN_TABLE_ID {
+            write!(f, " table {}", self.table)?;
+        }
+        Ok(())
     }
 }
 
 /// One kernel operation. Each one is small enough to undo on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
+    DelRoute(KernelRoute),
     DelAddress {
         link: IfName,
         addr: IpNet,
@@ -105,6 +153,7 @@ pub enum Op {
         link: IfName,
         up: bool,
     },
+    AddRoute(KernelRoute),
 }
 
 impl Op {
@@ -117,6 +166,7 @@ impl Op {
             | Self::SetMtu { link, .. }
             | Self::AddAddress { link, .. }
             | Self::SetUp { link, .. } => link,
+            Self::DelRoute(r) | Self::AddRoute(r) => &r.link,
         }
     }
 }
@@ -126,18 +176,20 @@ impl fmt::Display for Op {
         match self {
             Self::DelAddress { link, addr } => write!(f, "remove address {addr} from '{link}'"),
             Self::SetMaster { link, master: None } => {
-                write!(f, "detach '{link}' from its bridge")
+                write!(f, "detach '{link}' from its bridge/VRF")
             }
             Self::SetMaster {
                 link,
                 master: Some(m),
-            } => write!(f, "attach '{link}' to bridge '{m}'"),
+            } => write!(f, "attach '{link}' to '{m}'"),
             Self::DeleteLink { link, spec } => write!(f, "delete {spec} '{link}'"),
             Self::CreateLink { link, spec } => write!(f, "create {spec} '{link}'"),
             Self::SetMtu { link, mtu } => write!(f, "set MTU of '{link}' to {mtu}"),
             Self::AddAddress { link, addr } => write!(f, "add address {addr} to '{link}'"),
             Self::SetUp { link, up: true } => write!(f, "bring '{link}' up"),
             Self::SetUp { link, up: false } => write!(f, "bring '{link}' down"),
+            Self::AddRoute(r) => write!(f, "add {r}"),
+            Self::DelRoute(r) => write!(f, "remove {r}"),
         }
     }
 }
@@ -157,13 +209,49 @@ fn depth(cfg: &Config, name: &IfName) -> usize {
     d
 }
 
-/// Enabled addresses on interfaces that exist in `cfg`, as (link, prefix).
+/// Enabled addresses on enabled interfaces of `cfg`, as (link, prefix).
+/// A disabled interface keeps none in the kernel: Linux drops the IPv6
+/// addresses of a link that goes down (`keep_addr_on_down` is 0 by default),
+/// so they are removed explicitly before it goes down — which an undo can
+/// reverse — and added again before it comes back up.
 fn active_addresses(cfg: &Config) -> BTreeSet<(IfName, IpNet)> {
     cfg.ip
         .addresses
         .iter()
-        .filter(|a| !a.disabled && cfg.interfaces.contains_key(&a.interface))
+        .filter(|a| {
+            !a.disabled
+                && cfg
+                    .interfaces
+                    .get(&a.interface)
+                    .is_some_and(|i| !i.disabled)
+        })
         .map(|a| (a.interface.clone(), a.address))
+        .collect()
+}
+
+/// Kernel master of `name` (`IFLA_MASTER`): its bridge or its VRF.
+fn master<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a IfName> {
+    let i = cfg.interfaces.get(name)?;
+    i.bridge.as_ref().or(i.vrf.as_ref())
+}
+
+/// Static routes of `cfg` that belong in the kernel: the usable ones.
+pub fn kernel_routes(cfg: &Config) -> BTreeSet<KernelRoute> {
+    cfg.ip
+        .routes
+        .iter()
+        .filter_map(|r| {
+            let Reach::Active { link, gateway } = route::reach(cfg, r) else {
+                return None;
+            };
+            Some(KernelRoute {
+                table: route::table_id(cfg, &r.routing_table)?,
+                dst: r.dst_address.trunc(),
+                metric: u32::from(r.distance),
+                link,
+                gateway,
+            })
+        })
         .collect()
 }
 
@@ -228,13 +316,41 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     // State of `from` that survives into the build phase.
     let kept = |name: &IfName| from.interfaces.contains_key(name) && !doomed.contains(name);
 
-    let mut ops = Vec::new();
+    // Kept links whose master (bridge or VRF) changes, or whose master is
+    // itself deleted or recreated. Enslaving to a VRF cycles the link, which
+    // drops its IPv6 addresses, so their addresses are re-added too.
+    let remastered: BTreeSet<IfName> = from
+        .interfaces
+        .keys()
+        .filter(|n| kept(n) && to.interfaces.contains_key(*n))
+        .filter(|n| {
+            let (a, b) = (master(from, n), master(to, n));
+            a != b || a.is_some_and(|m| !kept(m))
+        })
+        .cloned()
+        .collect();
 
-    // 1. Addresses that go away.
     let old_addrs = active_addresses(from);
     let new_addrs = active_addresses(to);
+    let rebuilt = rebuilt_links(from, &doomed, &fresh, &remastered, &old_addrs, &new_addrs);
+
+    let mut ops = Vec::new();
+
+    // 0. Routes that go away, or whose link is rebuilt.
+    let old_routes = kernel_routes(from);
+    let new_routes = kernel_routes(to);
+    for r in &old_routes {
+        if rebuilt.contains(&r.link) || !new_routes.contains(r) {
+            ops.push(Op::DelRoute(r.clone()));
+        }
+    }
+
+    // 1. Addresses that go away.
     for (link, addr) in &old_addrs {
-        if doomed.contains(link) || !new_addrs.contains(&(link.clone(), *addr)) {
+        if doomed.contains(link)
+            || remastered.contains(link)
+            || !new_addrs.contains(&(link.clone(), *addr))
+        {
             ops.push(Op::DelAddress {
                 link: link.clone(),
                 addr: *addr,
@@ -242,13 +358,12 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         }
     }
 
-    // 2. Ports that leave (or change) their bridge.
+    // 2. Ports and members that leave (or change) their bridge or VRF.
     for old in from.interfaces.values() {
-        let Some(bridge) = &old.bridge else { continue };
         let stays = kept(&old.name)
-            && kept(bridge)
-            && to.interfaces.get(&old.name).and_then(|i| i.bridge.as_ref()) == Some(bridge);
-        if !stays {
+            && to.interfaces.contains_key(&old.name)
+            && !remastered.contains(&old.name);
+        if master(from, &old.name).is_some() && !stays {
             ops.push(Op::SetMaster {
                 link: old.name.clone(),
                 master: None,
@@ -309,27 +424,25 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         });
     }
 
-    // 6. Ports that join (or change) their bridge.
+    // 6. Ports and members that join (or change) their bridge or VRF.
     for new in to.interfaces.values() {
-        let Some(bridge) = &new.bridge else { continue };
-        let already = kept(&new.name)
-            && kept(bridge)
-            && from
-                .interfaces
-                .get(&new.name)
-                .and_then(|i| i.bridge.as_ref())
-                == Some(bridge);
-        if !already {
+        let Some(m) = master(to, &new.name) else {
+            continue;
+        };
+        if !kept(&new.name) || remastered.contains(&new.name) {
             ops.push(Op::SetMaster {
                 link: new.name.clone(),
-                master: Some(bridge.clone()),
+                master: Some(m.clone()),
             });
         }
     }
 
-    // 7. Addresses that arrive (or whose link was recreated).
+    // 7. Addresses that arrive (or whose link was recreated or remastered).
     for (link, addr) in &new_addrs {
-        if fresh.contains(link) || !old_addrs.contains(&(link.clone(), *addr)) {
+        if fresh.contains(link)
+            || remastered.contains(link)
+            || !old_addrs.contains(&(link.clone(), *addr))
+        {
             ops.push(Op::AddAddress {
                 link: link.clone(),
                 addr: *addr,
@@ -358,13 +471,48 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
         });
     }
 
+    // 9. Routes that arrive, or whose link was rebuilt.
+    for r in &new_routes {
+        if rebuilt.contains(&r.link) || !old_routes.contains(r) {
+            ops.push(Op::AddRoute(r.clone()));
+        }
+    }
+
     Ok(ops)
+}
+
+/// Links whose static routes the kernel drops on its own during this plan.
+/// (A link going down is not listed: its routes stop being usable, so they
+/// leave `kernel_routes` anyway.)
+fn rebuilt_links(
+    from: &Config,
+    doomed: &BTreeSet<IfName>,
+    fresh: &BTreeSet<&IfName>,
+    remastered: &BTreeSet<IfName>,
+    old_addrs: &BTreeSet<(IfName, IpNet)>,
+    new_addrs: &BTreeSet<(IfName, IpNet)>,
+) -> BTreeSet<IfName> {
+    let has_v4 = |set: &BTreeSet<(IfName, IpNet)>, link: &IfName| {
+        set.iter()
+            .any(|(l, a)| l == link && matches!(a, IpNet::V4(_)))
+    };
+    let mut out: BTreeSet<IfName> = doomed.iter().chain(remastered).cloned().collect();
+    out.extend(fresh.iter().map(|n| (*n).clone()));
+    // Linux disables IPv4 on a link that loses its last IPv4 address,
+    // flushing every IPv4 route through it.
+    out.extend(
+        from.interfaces
+            .keys()
+            .filter(|l| has_v4(old_addrs, l) && !has_v4(new_addrs, l))
+            .cloned(),
+    );
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corerouter_model::{AddressEntry, Interface, ItemId, VlanId};
+    use corerouter_model::{AddressEntry, Interface, ItemId, RouteEntry, RoutingTable, VlanId};
 
     fn n(s: &str) -> IfName {
         s.parse().unwrap()
@@ -396,6 +544,29 @@ mod tests {
             disabled: false,
             comment: String::new(),
         });
+    }
+
+    fn route(cfg: &mut Config, dst: &str, gw: &str, distance: u8) {
+        let id = cfg.ip.next_route_id();
+        cfg.ip.routes.push(RouteEntry {
+            id,
+            dst_address: dst.parse().unwrap(),
+            gateway: gw.parse().unwrap(),
+            distance,
+            routing_table: RoutingTable::Main,
+            disabled: false,
+            comment: String::new(),
+        });
+    }
+
+    fn kr(dst: &str, gw: Option<&str>, link: &str, metric: u32, table: u32) -> KernelRoute {
+        KernelRoute {
+            table,
+            dst: dst.parse().unwrap(),
+            metric,
+            link: n(link),
+            gateway: gw.map(|g| g.parse().unwrap()),
+        }
     }
 
     fn base() -> Config {
@@ -742,5 +913,191 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    /// ether1 10.0.0.2/24 + 2001:db8::2/64, default routes via the upstream.
+    fn routed() -> Config {
+        let mut c = base();
+        addr(&mut c, "ether1", "10.0.0.2/24");
+        addr(&mut c, "ether1", "2001:db8::2/64");
+        route(&mut c, "0.0.0.0/0", "10.0.0.1", 1);
+        route(&mut c, "::/0", "2001:db8::1", 1);
+        c
+    }
+
+    #[test]
+    fn routes_come_after_their_address_and_go_before_it() {
+        let to = routed();
+        let ops = plan(&base(), &to).unwrap();
+        let v4 = Op::AddRoute(kr("0.0.0.0/0", Some("10.0.0.1"), "ether1", 1, 254));
+        let v6 = Op::AddRoute(kr("::/0", Some("2001:db8::1"), "ether1", 1, 254));
+        let address = Op::AddAddress {
+            link: n("ether1"),
+            addr: "10.0.0.2/24".parse().unwrap(),
+        };
+        assert!(pos(&ops, &address) < pos(&ops, &v4));
+        assert!(pos(&ops, &address) < pos(&ops, &v6));
+        assert_eq!(plan(&to, &to).unwrap(), vec![], "nothing to do twice");
+
+        let back = plan(&to, &base()).unwrap();
+        let del = Op::DelRoute(kr("0.0.0.0/0", Some("10.0.0.1"), "ether1", 1, 254));
+        let del_addr = Op::DelAddress {
+            link: n("ether1"),
+            addr: "10.0.0.2/24".parse().unwrap(),
+        };
+        assert!(pos(&back, &del) < pos(&back, &del_addr));
+    }
+
+    #[test]
+    fn changing_a_route_replaces_only_that_route() {
+        let from = routed();
+        let mut to = from.clone();
+        to.ip.routes.first_mut().unwrap().distance = 5;
+        assert_eq!(
+            plan(&from, &to).unwrap(),
+            vec![
+                Op::DelRoute(kr("0.0.0.0/0", Some("10.0.0.1"), "ether1", 1, 254)),
+                Op::AddRoute(kr("0.0.0.0/0", Some("10.0.0.1"), "ether1", 5, 254)),
+            ]
+        );
+        // A disabled route leaves the kernel; an interface route needs no address.
+        let mut to = from.clone();
+        to.ip.routes.first_mut().unwrap().disabled = true;
+        route(&mut to, "198.51.100.0/24", "ether2", 3);
+        assert_eq!(
+            plan(&from, &to).unwrap(),
+            vec![
+                Op::DelRoute(kr("0.0.0.0/0", Some("10.0.0.1"), "ether1", 1, 254)),
+                Op::AddRoute(kr("198.51.100.0/24", None, "ether2", 3, 254)),
+            ]
+        );
+    }
+
+    #[test]
+    fn link_down_and_up_removes_and_restores_its_routes() {
+        let from = routed();
+        let mut down = from.clone();
+        down.interfaces.get_mut(&n("ether1")).unwrap().disabled = true;
+        let ops = plan(&from, &down).unwrap();
+        let del = Op::DelRoute(kr("0.0.0.0/0", Some("10.0.0.1"), "ether1", 1, 254));
+        let off = Op::SetUp {
+            link: n("ether1"),
+            up: false,
+        };
+        // Removed explicitly before the kernel would flush them, so an undo
+        // can bring them back.
+        let del6 = Op::DelAddress {
+            link: n("ether1"),
+            addr: "2001:db8::2/64".parse().unwrap(),
+        };
+        assert!(pos(&ops, &del) < pos(&ops, &del6) && pos(&ops, &del6) < pos(&ops, &off));
+        let ops = plan(&down, &from).unwrap();
+        let on = Op::SetUp {
+            link: n("ether1"),
+            up: true,
+        };
+        let add = Op::AddRoute(kr("0.0.0.0/0", Some("10.0.0.1"), "ether1", 1, 254));
+        let add6 = Op::AddAddress {
+            link: n("ether1"),
+            addr: "2001:db8::2/64".parse().unwrap(),
+        };
+        assert!(pos(&ops, &add6) < pos(&ops, &on) && pos(&ops, &on) < pos(&ops, &add));
+    }
+
+    #[test]
+    fn losing_the_last_ipv4_address_reinstalls_the_links_routes() {
+        let mut from = base();
+        addr(&mut from, "ether2", "192.0.2.1/24");
+        route(&mut from, "198.51.100.0/24", "ether2", 1);
+        let mut to = from.clone();
+        to.ip.addresses.clear();
+        let r = kr("198.51.100.0/24", None, "ether2", 1, 254);
+        assert_eq!(
+            plan(&from, &to).unwrap(),
+            vec![
+                Op::DelRoute(r.clone()),
+                Op::DelAddress {
+                    link: n("ether2"),
+                    addr: "192.0.2.1/24".parse().unwrap()
+                },
+                Op::AddRoute(r),
+            ]
+        );
+    }
+
+    #[test]
+    fn joining_a_vrf_moves_addresses_and_routes_to_its_table() {
+        let mut from = base();
+        addr(&mut from, "ether2", "10.9.0.2/24");
+        addr(&mut from, "ether2", "2001:db8:9::2/64");
+        let mut to = from.clone();
+        add(&mut to, "blue", InterfaceKind::Vrf { table: 1000 });
+        to.interfaces.get_mut(&n("ether2")).unwrap().vrf = Some(n("blue"));
+        route(&mut to, "10.50.0.0/16", "10.9.0.1", 1);
+        to.ip.routes.first_mut().unwrap().routing_table = RoutingTable::Vrf(n("blue"));
+        let ops = plan(&from, &to).unwrap();
+
+        let create = pos(
+            &ops,
+            &Op::CreateLink {
+                link: n("blue"),
+                spec: LinkSpec::Vrf { table: 1000 },
+            },
+        );
+        let del6 = pos(
+            &ops,
+            &Op::DelAddress {
+                link: n("ether2"),
+                addr: "2001:db8:9::2/64".parse().unwrap(),
+            },
+        );
+        let enslave = pos(
+            &ops,
+            &Op::SetMaster {
+                link: n("ether2"),
+                master: Some(n("blue")),
+            },
+        );
+        let add6 = pos(
+            &ops,
+            &Op::AddAddress {
+                link: n("ether2"),
+                addr: "2001:db8:9::2/64".parse().unwrap(),
+            },
+        );
+        let up = pos(
+            &ops,
+            &Op::SetUp {
+                link: n("blue"),
+                up: true,
+            },
+        );
+        let rt = pos(
+            &ops,
+            &Op::AddRoute(kr("10.50.0.0/16", Some("10.9.0.1"), "ether2", 1, 1000)),
+        );
+        assert!(del6 < create && create < enslave && enslave < add6 && add6 < up && up < rt);
+
+        // Leaving it: routes out first, VRF gone last.
+        let back = plan(&to, &from).unwrap();
+        let del_rt = pos(
+            &back,
+            &Op::DelRoute(kr("10.50.0.0/16", Some("10.9.0.1"), "ether2", 1, 1000)),
+        );
+        let release = pos(
+            &back,
+            &Op::SetMaster {
+                link: n("ether2"),
+                master: None,
+            },
+        );
+        let delete = pos(
+            &back,
+            &Op::DeleteLink {
+                link: n("blue"),
+                spec: LinkSpec::Vrf { table: 1000 },
+            },
+        );
+        assert!(del_rt < release && release < delete);
     }
 }
