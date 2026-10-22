@@ -28,4 +28,4 @@
 - [ ] `cargo xtask ci` passa localmente
 - [ ] Mudou UI: screenshot conferido (`corerouter-cli --connect … screenshot`)
 - [ ] `docs/changes/<id>.md` com o log, o `status:` da gap e o `history:` (formato em `docs/changes/README.md`)
-- [ ] Sem auto-merge: com o CI verde, o PR espera a fila de entrada
+- [ ] PR com o rótulo `fila` e sem auto-merge (a fila contínua integra; não espere o CI do GitHub)
