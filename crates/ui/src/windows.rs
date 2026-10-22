@@ -11,6 +11,7 @@ pub enum Win {
     Interfaces,
     InterfaceList,
     Addresses,
+    DhcpClient,
     Neighbors,
     Routes,
     Vrf,
@@ -35,6 +36,7 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
         "IP",
         &[
             Win::Addresses,
+            Win::DhcpClient,
             Win::Neighbors,
             Win::Routes,
             Win::Vrf,
@@ -56,6 +58,7 @@ impl Win {
         Win::Interfaces,
         Win::InterfaceList,
         Win::Addresses,
+        Win::DhcpClient,
         Win::Neighbors,
         Win::Routes,
         Win::Vrf,
@@ -78,6 +81,7 @@ impl Win {
             Win::Interfaces => "Interfaces",
             Win::InterfaceList => "Interface List",
             Win::Addresses => "Addresses",
+            Win::DhcpClient => "DHCP Client",
             Win::Neighbors => "Neighbors",
             Win::Routes => "Routes",
             Win::Vrf => "VRF",
@@ -119,6 +123,7 @@ impl Win {
                 | Win::InterfaceList
                 | Win::Vrf
                 | Win::Neighbors
+                | Win::DhcpClient
                 | Win::History
                 | Win::Log
         )
@@ -130,6 +135,7 @@ impl Win {
             Win::Neighbors => [820.0, 320.0],
             Win::Addresses | Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
+            Win::DhcpClient => [760.0, 260.0],
             Win::Vrf => [600.0, 260.0],
             Win::Firewall => [980.0, 420.0],
             Win::InterfaceList => [520.0, 280.0],
@@ -152,6 +158,7 @@ impl CoreRouterUi {
             Win::Addresses => self.addresses(ui),
             Win::Neighbors => self.neighbors(ui),
             Win::Routes => self.routes(ui),
+            Win::DhcpClient => self.dhcp_clients(ui),
             Win::Vrf => self.vrfs(ui),
             Win::Firewall => self.firewall(ui),
             Win::InterfaceList => self.interface_lists(ui),
@@ -176,7 +183,8 @@ impl CoreRouterUi {
     }
 
     fn addresses(&mut self, ui: &mut egui::Ui) {
-        const COLUMNS: [table::Column; 5] = [
+        const COLUMNS: [table::Column; 6] = [
+            col(""),
             col("#"),
             col("Address"),
             col("Network"),
@@ -191,7 +199,7 @@ impl CoreRouterUi {
                 let get = |k: &str| r.get(k).map(value_text).unwrap_or_default();
                 Row {
                     key: get("id"),
-                    cells: ["id", "address", "network", "interface", "comment"]
+                    cells: ["flags", "id", "address", "network", "interface", "comment"]
                         .map(get)
                         .to_vec(),
                     dimmed: r.get("disabled").and_then(Value::as_bool).unwrap_or(false),
@@ -205,8 +213,18 @@ impl CoreRouterUi {
         let mut select_all = false;
         let can = self.can();
         ui.horizontal(|ui| {
+            let dynamic = self.cache.addresses.iter().any(|r| {
+                r.get("dynamic").and_then(Value::as_bool).unwrap_or(false)
+                    && selection.contains(&r.get("id").map(value_text).unwrap_or_default())
+            });
             let picked = if selection.is_empty() {
                 Err("Select one or more addresses first".to_owned())
+            } else if dynamic {
+                Err(
+                    "Dynamic addresses come from a DHCP client: release or disable it \
+                     (IP › DHCP Client)"
+                        .to_owned(),
+                )
             } else {
                 Ok(())
             };

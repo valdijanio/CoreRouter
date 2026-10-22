@@ -15,6 +15,12 @@
 //!   alarm and warning thresholds.
 //!
 //! CMIS modules (QSFP-DD, OSFP) are named but not decoded yet.
+//!
+//! Offsets and units follow SFF-8472 rev 12.4 (A0h Table 4-1, A2h Table
+//! 9-5, calibration §9.3), SFF-8636 rev 2.10a (lower page Table 6-1, upper
+//! page 00h Table 6-15, page 03h thresholds Table 6-28) and the SFF-8024
+//! tables of identifiers (4-1), connectors (4-3) and extended compliance
+//! (4-4).
 
 use serde::Serialize;
 

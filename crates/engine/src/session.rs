@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{self, Group, Login, Logins, Principal};
 use crate::cmd::{self, check_params, unknown_command};
+use crate::dhcp_client::DhcpRuntime;
 use crate::dom_watch::DomWatch;
 use crate::firewall_dyn::DynamicLists;
 use crate::link_watch::LinkWatch;
@@ -67,6 +68,9 @@ pub struct Session {
     pub(crate) dynamic_addresses: DynamicLists,
     /// Diagnostic tool jobs (operational state, never saved).
     pub(crate) tasks: Tasks,
+    /// DHCP clients at run time: leases, what they installed, history
+    /// (operational state, never saved; G4.7).
+    pub(crate) dhcp: DhcpRuntime,
     /// Router accounts (G0.3): saved with the config, outside its revisions.
     users: Users,
     /// Logged-in sessions, for `user.active.list` (never saved).
@@ -104,6 +108,8 @@ impl Session {
     /// (newest readable slot) and saves it there after every commit. With
     /// nothing readable stored, it starts from the discovered ports.
     pub fn with_storage(mut hal: Box<dyn Hal>, mut storage: Box<dyn ConfigStorage>) -> Self {
+        // The virtual lab's DHCP clients get leases from a simulated server.
+        hal.offer_dhcp_lab_server(Arc::new(corerouter_proto_dhcp::lab::LabServer::default()));
         let (restored, boot_errors) = restore(storage.as_mut());
         let (restored, users) = match restored {
             Some((store, users, slot)) => (Some((store, slot)), users),
@@ -147,6 +153,7 @@ impl Session {
             neighbors: NeighborTable::default(),
             dynamic_addresses: DynamicLists::default(),
             tasks: Tasks::default(),
+            dhcp: DhcpRuntime::default(),
             users,
             logins: Logins::default(),
             links: LinkWatch::default(),
@@ -289,8 +296,11 @@ impl Session {
         if !issues.is_empty() {
             return Err(EngineError::Validation(issues));
         }
+        // The data plane also holds what DHCP clients installed (G4.7).
+        let from = self.effective(self.store.running()).into_owned();
+        let to = self.effective(self.store.candidate()).into_owned();
         self.hal
-            .apply(self.store.running(), self.store.candidate())
+            .apply(&from, &to)
             .map_err(|e| EngineError::Hal(e.to_string()))?;
         let pending = self.safe_mode.is_active();
         let comment = match (pending, comment.is_empty()) {

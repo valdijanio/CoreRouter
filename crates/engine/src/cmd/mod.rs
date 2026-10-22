@@ -76,6 +76,7 @@ macro_rules! cmd {
 
 pub mod args;
 mod config;
+mod dhcp_client;
 mod ethernet;
 pub mod firewall;
 mod interface;
@@ -98,6 +99,7 @@ static AREAS: &[&[CommandSpec]] = &[
     ip::COMMANDS,
     route::COMMANDS,
     vrf::COMMANDS,
+    dhcp_client::COMMANDS,
     firewall::COMMANDS,
     neighbor::COMMANDS,
     routing::COMMANDS,
