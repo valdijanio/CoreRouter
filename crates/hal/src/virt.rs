@@ -2,9 +2,10 @@
 
 use std::sync::Arc;
 
+use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 
-use crate::{Features, Hal, HalError, LinkInfo, LinkState, SharedProber, SimProber};
+use crate::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState, SharedProber, SimProber};
 
 #[derive(Clone)]
 pub struct VirtualHal {
@@ -12,6 +13,10 @@ pub struct VirtualHal {
     applied: Config,
     ticks: u64,
     applies: u64,
+    /// The nftables script the last firewall change would have loaded
+    /// (the lab records it; nothing runs it).
+    ruleset: Option<String>,
+    dynamic: Vec<DynamicAddress>,
     /// Diagnostic tools: the simulated network unless the app swaps in the
     /// host's ICMP (`corerouter-daemon --lab-ping host`).
     prober: SharedProber,
@@ -38,6 +43,8 @@ impl VirtualHal {
             applied: Config::default(),
             ticks: 0,
             applies: 0,
+            ruleset: None,
+            dynamic: Vec::new(),
             prober: Arc::new(SimProber::default()),
         }
     }
@@ -54,6 +61,15 @@ impl VirtualHal {
 
     pub fn apply_count(&self) -> u64 {
         self.applies
+    }
+
+    /// The firewall script of the last apply that changed the firewall.
+    pub fn ruleset(&self) -> Option<&str> {
+        self.ruleset.as_deref()
+    }
+
+    pub fn dynamic(&self) -> &[DynamicAddress] {
+        &self.dynamic
     }
 }
 
@@ -82,7 +98,10 @@ impl Hal for VirtualHal {
             .collect())
     }
 
-    fn apply(&mut self, _from: &Config, to: &Config) -> Result<(), HalError> {
+    fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+        if corerouter_firewall::render(from, &[]) != corerouter_firewall::render(to, &[]) {
+            self.ruleset = Some(corerouter_firewall::script(to, &self.dynamic));
+        }
         self.applied = to.clone();
         self.applies = self.applies.saturating_add(1);
         Ok(())
@@ -120,6 +139,21 @@ impl Hal for VirtualHal {
 
     fn features(&self) -> Features {
         Features { vrf: true }
+    }
+
+    fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
+        match change {
+            DynamicChange::Add(d) => {
+                self.dynamic
+                    .retain(|x| x.list != d.list || x.address != d.address);
+                self.dynamic.push(d.clone());
+            }
+            DynamicChange::Remove(d) => {
+                self.dynamic
+                    .retain(|x| x.list != d.list || x.address != d.address);
+            }
+        }
+        Ok(())
     }
 
     fn prober(&self) -> Result<SharedProber, String> {

@@ -9,8 +9,10 @@
 //!   use `/interface vlan add`) — with the parameters that `add` declares;
 //!   fields `add` does not take but the menu's `set` does follow as a `set`
 //!   (`/interface set name=vlan10 disabled=yes`). Rows without an `add`
-//!   (physical ports, BGP instances) become a `set`. Dynamic rows (flag `D`,
-//!   `dynamic=yes`) are not configuration and are skipped.
+//!   (physical ports, BGP instances) become a `set`, and so do rows the
+//!   router marks `default=yes` (they exist in every new config, like the
+//!   interface lists LAN and WAN, so `add` would fail on import). Dynamic
+//!   rows (flag `D`, `dynamic=yes`) are not configuration and are skipped.
 //! - a one-object menu (`get`): one `set` with every field `set` declares.
 //!
 //! Order is safe for import: each line comes after the lines creating the
@@ -108,7 +110,10 @@ fn args_of(cmd: &Command, row: &Value, all: bool) -> Result<Vec<(String, String)
         if p.required && v.is_null() {
             return Err(format!("{} is not exported", kebab(&p.key)));
         }
-        let keep = p.required || if all { !v.is_null() } else { !empty(v) };
+        // `false` is the default of a bool, unless its doc says otherwise
+        // (`passthrough?: bool (default true)`).
+        let meaningful_false = v == &Value::Bool(false) && p.ty_text.contains("default true");
+        let keep = p.required || meaningful_false || if all { !v.is_null() } else { !empty(v) };
         if keep {
             out.push((p.key.clone(), arg_text(v)));
         }
@@ -148,6 +153,8 @@ fn rows_of(menu_path: &[String], menu: &Menu, value: &Value, out: &mut Vec<Out>)
             .and_then(Value::as_str)
             .and_then(|t| menu.children.get(t).map(|m| (t, m)))
             .and_then(|(t, m)| m.commands.get("add").map(|c| (t, c)));
+        // Present in every new config: set, never add.
+        let preset = row.get("default").and_then(Value::as_bool) == Some(true);
         let (add_path, add) = match typed {
             Some((t, c)) => {
                 let mut p = menu_path.to_vec();
@@ -156,6 +163,7 @@ fn rows_of(menu_path: &[String], menu: &Menu, value: &Value, out: &mut Vec<Out>)
             }
             None => (menu_path.to_vec(), menu.commands.get("add")),
         };
+        let add = add.filter(|_| !preset);
         match (add, set) {
             (Some(add), _) => {
                 if !push(out, &add_path, add, row, false, true) {

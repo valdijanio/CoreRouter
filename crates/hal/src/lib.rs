@@ -9,6 +9,7 @@ pub mod probe;
 pub mod sim;
 pub mod virt;
 
+use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 use serde::Serialize;
 
@@ -78,6 +79,14 @@ impl Default for Features {
     }
 }
 
+/// A change to the dynamic address-list entries (G2.1): entries with a
+/// timeout, which live in the data plane only (never in the config).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DynamicChange<'a> {
+    Add(&'a DynamicAddress),
+    Remove(&'a DynamicAddress),
+}
+
 pub trait Hal: Send {
     /// Human/agent readable description: "virtual lab (8 ports)", "linux netlink".
     fn describe(&self) -> String;
@@ -106,6 +115,13 @@ pub trait Hal: Send {
     /// that probe the kernel do it once and cache the answer.
     fn features(&self) -> Features {
         Features::default()
+    }
+
+    /// Add or remove one dynamic address-list entry in the data plane,
+    /// which expires it by itself. `apply` keeps the ones present.
+    fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
+        let _ = change;
+        Ok(())
     }
 
     /// ICMP prober for the diagnostic tools (ping, MTU, MTR), or why there

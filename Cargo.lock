@@ -1023,6 +1023,7 @@ name = "corerouter-engine"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "corerouter-firewall",
  "corerouter-hal",
  "corerouter-model",
  "corerouter-proto-bgp",
@@ -1039,6 +1040,15 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "corerouter-firewall"
+version = "0.1.0"
+dependencies = [
+ "corerouter-model",
+ "proptest",
+ "serde_json",
 ]
 
 [[package]]
@@ -1065,6 +1075,7 @@ dependencies = [
 name = "corerouter-hal"
 version = "0.1.0"
 dependencies = [
+ "corerouter-firewall",
  "corerouter-model",
  "ipnet",
  "serde",
@@ -1075,6 +1086,7 @@ dependencies = [
 name = "corerouter-hal-linux"
 version = "0.1.0"
 dependencies = [
+ "corerouter-firewall",
  "corerouter-hal",
  "corerouter-model",
  "futures-util",
@@ -1083,6 +1095,7 @@ dependencies = [
  "nix 0.30.1",
  "rtnetlink",
  "rustix 1.1.5",
+ "serde_json",
  "socket2",
  "tokio",
 ]

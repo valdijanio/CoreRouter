@@ -9,6 +9,7 @@ mod avail;
 pub mod backend;
 pub mod connect;
 mod dialog;
+mod firewall;
 mod float;
 mod interfaces;
 mod neighbors;
@@ -64,6 +65,8 @@ enum Field {
     Info,
     Neighbors,
     Discovery,
+    /// Firewall and interface-list tables (G2.1), only while their window is open.
+    Fw(firewall::Feed),
     /// `auth.whoami`: the logged-in user and group (G0.3), top bar.
     Whoami,
 }
@@ -111,17 +114,29 @@ struct Tables {
     routes: table::TableState,
     vrfs: table::TableState,
     neighbors: table::TableState,
+    fw_filter: table::TableState,
+    fw_nat: table::TableState,
+    fw_mangle: table::TableState,
+    fw_addr: table::TableState,
+    if_members: table::TableState,
+    if_lists: table::TableState,
 }
 
 impl Tables {
     /// Every table with the salt it is drawn with (stored preferences name
     /// tables by salt).
-    fn each(&mut self) -> [(&'static str, &mut table::TableState); 4] {
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 10] {
         [
             (interfaces::TABLE, &mut self.interfaces),
             ("addresses", &mut self.addresses),
             (routes::TABLE, &mut self.routes),
             (vrf::TABLE, &mut self.vrfs),
+            (firewall::Feed::Filter.salt(), &mut self.fw_filter),
+            (firewall::Feed::Nat.salt(), &mut self.fw_nat),
+            (firewall::Feed::Mangle.salt(), &mut self.fw_mangle),
+            (firewall::Feed::Addr.salt(), &mut self.fw_addr),
+            (firewall::Feed::Members.salt(), &mut self.if_members),
+            (firewall::Feed::Lists.salt(), &mut self.if_lists),
         ]
     }
 
@@ -132,6 +147,12 @@ impl Tables {
             ("addresses", &self.addresses),
             (routes::TABLE, &self.routes),
             (vrf::TABLE, &self.vrfs),
+            (firewall::Feed::Filter.salt(), &self.fw_filter),
+            (firewall::Feed::Nat.salt(), &self.fw_nat),
+            (firewall::Feed::Mangle.salt(), &self.fw_mangle),
+            (firewall::Feed::Addr.salt(), &self.fw_addr),
+            (firewall::Feed::Members.salt(), &self.if_members),
+            (firewall::Feed::Lists.salt(), &self.if_lists),
         ]
         .into_iter()
         .filter(|(_, t)| t.inline_comments)
@@ -183,6 +204,10 @@ pub(crate) enum Then {
     },
     /// A tool task started (Tools › Ping).
     Tool(ping::ToolReq),
+    Fw {
+        id: u64,
+        effect: firewall::Effect,
+    },
 }
 
 pub struct CoreRouterUi {
@@ -213,6 +238,8 @@ pub struct CoreRouterUi {
     vrf_dialogs: Vec<vrf::VrfDialogWin>,
     /// VRFs to open once an `ip.vrf.list` sent after this id arrives.
     open_vrf_after: Vec<(RequestId, String)>,
+    /// Firewall and interface-list windows (G2.1).
+    fw: firewall::State,
     /// What the router can run now (rebuilt when `engine.list`,
     /// `server.info` or the link change); every action asks it.
     can: Arc<avail::Avail>,
@@ -260,6 +287,7 @@ impl CoreRouterUi {
             open_route_after: Vec::new(),
             vrf_dialogs: Vec::new(),
             open_vrf_after: Vec::new(),
+            fw: firewall::State::default(),
             can,
             ping: ping::PingWin::default(),
             exports: Vec::new(),
@@ -469,6 +497,7 @@ impl CoreRouterUi {
             }
             Field::Neighbors => self.cache.neighbors = arr(value),
             Field::Discovery => self.cache.discovery = value,
+            Field::Fw(feed) => self.fw_arrived(feed, id, arr(value)),
         }
     }
 
@@ -489,6 +518,7 @@ impl CoreRouterUi {
             Then::Dialog { id, effect } => self.dialog_reply(id, effect, result),
             Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
             Then::Vrf { id, effect } => self.vrf_dialog_reply(id, effect, result),
+            Then::Fw { id, effect } => self.fw_dialog_reply(id, effect, result),
             Then::Tool(req) => self.tool_started(req, result),
         }
     }
@@ -594,6 +624,17 @@ impl CoreRouterUi {
         if self.cache.info.is_null() {
             ask(self, Field::Info, "server.info", Value::Null);
         }
+        let fw_open = self.open.contains(&Win::Firewall) || !self.fw.dialogs.is_empty();
+        let lists_open = fw_open || self.open.contains(&Win::InterfaceList);
+        for feed in firewall::Feed::ALL {
+            let wanted = match feed {
+                firewall::Feed::Lists | firewall::Feed::Members => lists_open,
+                _ => fw_open,
+            };
+            if wanted {
+                ask(self, Field::Fw(feed), "engine.execute", exec(feed.query()));
+            }
+        }
         if self.open.contains(&Win::Neighbors) {
             ask(
                 self,
@@ -694,6 +735,7 @@ impl CoreRouterUi {
         self.dialogs(&ctx, area);
         self.route_dialogs(&ctx, area);
         self.vrf_dialogs(&ctx, area);
+        self.fw_dialogs(&ctx, area);
         self.terminals(&ctx, area);
     }
 
@@ -932,6 +974,8 @@ impl CoreRouterUi {
             .clicked()
         {
             self.open.insert(win);
+            // Some lists are only asked for while their window is open.
+            self.cache.refreshed_at = None;
         }
     }
 }
@@ -946,6 +990,16 @@ impl CoreRouterUi {
             Win::Routes => &mut self.tables.routes,
             Win::Vrf => &mut self.tables.vrfs,
             Win::Neighbors => &mut self.tables.neighbors,
+            Win::Firewall => match self.fw.tab {
+                firewall::Tab::Filter => &mut self.tables.fw_filter,
+                firewall::Tab::Nat => &mut self.tables.fw_nat,
+                firewall::Tab::Mangle => &mut self.tables.fw_mangle,
+                firewall::Tab::Addr => &mut self.tables.fw_addr,
+            },
+            Win::InterfaceList => match self.fw.if_tab {
+                firewall::IfTab::Members => &mut self.tables.if_members,
+                firewall::IfTab::Lists => &mut self.tables.if_lists,
+            },
             _ => return false,
         };
         table.escape()
@@ -1462,6 +1516,8 @@ mod tests {
                     key: r.get("name").map(value_text).unwrap_or_default(),
                     cells: Vec::new(),
                     dimmed: false,
+                    section: false,
+                    tint: None,
                 })
                 .collect();
             self.app.tables.interfaces.selection(&rows)
@@ -1512,6 +1568,7 @@ mod tests {
     }
 
     mod dialog_keys;
+    mod firewall;
     mod terminal;
     mod tools_ping;
 

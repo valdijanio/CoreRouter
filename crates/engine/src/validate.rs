@@ -10,6 +10,7 @@ use corerouter_model::{
 
 pub fn validate_all(cfg: &Config) -> Vec<Issue> {
     let mut out = core_checks(cfg);
+    out.extend(corerouter_firewall::validate(cfg));
     out.extend(corerouter_proto_bgp::validate(cfg));
     out.extend(corerouter_proto_ospf::validate(cfg));
     out.extend(corerouter_proto_mpls::validate(cfg));

@@ -695,6 +695,8 @@ fn iface_row(row: &Value) -> Row {
             i.comment.clone(),
         ],
         dimmed: i.disabled || i.unmanaged.is_some(),
+        section: false,
+        tint: None,
     }
 }
 
