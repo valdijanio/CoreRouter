@@ -14,7 +14,7 @@ use crate::avail::Avail;
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::interfaces::{cascade, dialog_id};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment};
-use crate::{CoreRouterUi, LogLine, Then, form_number, value_text};
+use crate::{CoreRouterUi, LogLine, Then, Win, form_number, value_text};
 
 pub(crate) const TABLE: &str = "dhcp-client";
 /// Property windows opened at once from one selection.
@@ -381,6 +381,14 @@ impl CoreRouterUi {
         });
         ui.separator();
 
+        self.tables.dhcp.open = self
+            .dhcp_dialogs
+            .iter()
+            .filter_map(|d| match &d.dialog {
+                DhcpDialog::Props { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
         let out = table::show(
             ui,
             TABLE,
@@ -572,16 +580,17 @@ impl CoreRouterUi {
         self.cache.refreshed_at = None;
     }
 
-    /// "DHCP Client <iface>"; an already open one is not duplicated.
+    /// "DHCP Client <iface>"; an already open one comes to the front.
     pub(crate) fn open_dhcp(&mut self, id: &str) {
         let Some(row) = self.dhcp_row(id).cloned() else {
             return;
         };
         let open = self
             .dhcp_dialogs
-            .iter()
-            .any(|d| matches!(&d.dialog, DhcpDialog::Props { id: i, .. } if i == id));
-        if open {
+            .iter_mut()
+            .find(|d| matches!(&d.dialog, DhcpDialog::Props { id: i, .. } if i == id));
+        if let Some(d) = open {
+            d.status.bring_to_front();
             return;
         }
         let form = DhcpForm::of(&row);
@@ -641,6 +650,7 @@ impl CoreRouterUi {
                 title: &title,
                 dirty: d.dialog.dirty(),
                 pos: cascade(area, d.id),
+                parent: Some(crate::win_id(Win::DhcpClient)),
             };
             let options = row
                 .as_ref()

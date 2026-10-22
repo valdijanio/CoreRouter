@@ -14,7 +14,7 @@ use crate::avail::Avail;
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::iface_tabs::{self, NicView, Tab};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
-use crate::{CoreRouterUi, Then, form_number, human_bytes, value_text};
+use crate::{CoreRouterUi, Then, Win, form_number, human_bytes, value_text};
 
 pub(crate) const TABLE: &str = "interfaces";
 /// Property windows opened at once from one selection (WinBox opens one
@@ -309,6 +309,14 @@ impl CoreRouterUi {
         });
         ui.separator();
 
+        self.tables.interfaces.open = self
+            .dialogs
+            .iter()
+            .filter_map(|d| match &d.dialog {
+                Dialog::Props(p) => Some(p.name.clone()),
+                _ => None,
+            })
+            .collect();
         let out = table::show(
             ui,
             TABLE,
@@ -432,13 +440,15 @@ impl CoreRouterUi {
         });
     }
 
-    /// "Interface <name>"; an already open one is not duplicated.
+    /// "Interface <name>"; an already open one comes to the front.
     pub(crate) fn open_props(&mut self, name: &str) {
         let open = self
             .dialogs
-            .iter()
-            .any(|d| matches!(&d.dialog, Dialog::Props(p) if p.name == name));
-        if let (false, Some(i)) = (open, self.iface(name)) {
+            .iter_mut()
+            .find(|d| matches!(&d.dialog, Dialog::Props(p) if p.name == name));
+        if let Some(d) = open {
+            d.status.bring_to_front();
+        } else if let Some(i) = self.iface(name) {
             self.open_dialog(Dialog::Props(Props::new(&i)));
         }
     }
@@ -468,6 +478,7 @@ impl CoreRouterUi {
                 title: &title,
                 dirty: d.dialog.dirty() || eth.is_some(),
                 pos: cascade(area, d.id),
+                parent: Some(crate::win_id(Win::Interfaces)),
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
