@@ -79,6 +79,22 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   sozinha; pela GUI web servida com `--web-root`, ether3 reabilitada (revisão 3); página de
   outra origem recusada (403) até `--ws-origin`.
 
+- 2026-10-22 — G1.4: Safe Mode com a semântica do RouterOS (help.mikrotik.com, "Configuration
+  Management"). `config.safe-mode.enter {timeout_secs?}` (10..=86400; o dono de novo re-arma o
+  prazo), `exit {force?}` (confirma e salva), `cancel {force?}` (desfaz); `safe_mode` no resumo
+  do `state.inspect`. Módulo `engine::safe_mode`: guarda a `Config` da entrada; mudanças de
+  qualquer cliente ficam pendentes (revisão `[safe mode]`, não salva); undo = config da entrada
+  commitada como revisão nova. Dono por conexão: `Caller` + `Session::execute_as`/`hang_up`;
+  `control` dá um id por conexão TCP/WS e avisa quando ela fecha. Relógio: `Session::tick`,
+  chamado a cada 1 s por `control::spawn_clock` (daemon e GUI em lab). Segundo `enter` recusado
+  com dono e "since <UTC> (N s ago)". GUI: botão na barra superior, vermelho com contagem m:ss
+  quando é seu, "Safe Mode: <dono>" quando é de outro; clique direito com timeouts, desfazer e
+  release/undo forçado. 13 testes novos (9 de integração no engine + 1 do formato UTC, 2 no
+  canal TCP/WS, 1 na UI). Teste manual (**medido**): daemon `--config-dir` + GUI `--connect`, Safe Mode 5 min
+  pelo clique direito, ether2 desabilitada (diretório de config continuou vazio), GUI morta com
+  `kill` → daemon logou o undo e ether2 voltou habilitada (revisão 2 "safe mode undo: the
+  owner's connection closed"). Esforço do agente ~2 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -86,3 +102,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.2.
 - 2026-10-21 — log do G1.9.
 - 2026-10-21 — log do G0.4.
+- 2026-10-22 — log do G1.4.

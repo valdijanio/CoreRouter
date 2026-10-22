@@ -12,13 +12,15 @@
 //! the MCP headless backend, so MCP tools are written once.
 
 pub mod client;
+pub mod clock;
 pub mod dispatch;
 pub mod server;
 pub mod wire;
 pub mod ws;
 
 pub use client::{Client, reply_result};
-pub use dispatch::{Host, NO_UI, SharedHost, dispatch};
+pub use clock::spawn_clock;
+pub use dispatch::{Host, NO_UI, SharedHost, dispatch, dispatch_as, hang_up, new_caller};
 pub use server::{bind_loopback, serve, spawn};
 pub use ws::{WsPolicy, serve_ws, spawn_ws};
 
