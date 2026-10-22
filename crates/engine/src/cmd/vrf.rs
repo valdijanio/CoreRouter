@@ -127,6 +127,7 @@ fn set_members(cfg: &mut Config, vrf: &IfName, members: &[IfName]) -> Result<()>
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
+    super::interface::refuse_unmanaged(s, p, &["name", "interfaces"])?;
     let members = opt_names(p, "interfaces", MAX_INTERFACES)?.unwrap_or_default();
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
     let cfg = s.store_mut().candidate_mut();
@@ -146,6 +147,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    super::interface::refuse_unmanaged(s, p, &["interfaces"])?;
     let members = opt_names(p, "interfaces", MAX_INTERFACES)?;
     let disabled = opt_bool(p, "disabled")?;
     let comment = opt_text(p, "comment", 256)?;

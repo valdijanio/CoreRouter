@@ -336,6 +336,14 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com 0 e loga `shutting down: sent CRDP goodbye on 1 interface(s)`; `Agent::shutdown` com lab e
   `Listener`; `Shutdown` fecha as duas portas. Esforço do agente ~1,5 h (**estimado**).
 
+- 2026-10-22 — G1.18: o backend linux descobre links pelo mesmo rtnetlink que aplica (antes lia
+  sysfs, que num `unshare --net` mostra o host: o daemon listava `docker0`/`br-*` e falhava em
+  `eth0`). Tipos do kernel (`veth`, `bridge`, `loopback`, …) e política de posse: portas físicas,
+  veth com par no namespace e o que o CoreRouter criou são gerenciados; o resto aparece em
+  `interface.list` com `managed: false` e o motivo, nunca recebe apply e recusa comandos.
+  `--manage`/`--unmanaged` no daemon. Seed copia o admin state (boot no-op). G1.7 feito junto.
+  Esforço do agente ~2 h (**estimado**).
+
 - 2026-10-22 — G0.8: terminal com a sintaxe da CLI do RouterOS, **gerado do registro** (crate novo
   `corerouter-shell`, L4, puro e wasm). Menu = prefixo do id, `list`/`get`→`print`, chaves em
   kebab-case, tipos lidos do doc `params` (bool `yes/no`, número, lista `a,b`, enum para o Tab);
@@ -375,4 +383,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G5.4.
 - 2026-10-22 — log do G1.17.
 - 2026-10-22 — log do G5.5.
+- 2026-10-22 — log do G1.18.
 - 2026-10-22 — log do G0.8.

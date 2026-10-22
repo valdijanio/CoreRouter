@@ -84,7 +84,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 |---|---|---|---|
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas) | serde, ipnet, thiserror |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features) + `VirtualHal` (lab, wasm, CI) | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
@@ -248,7 +248,7 @@ nem gera revisão), e a sessão descarta o que chega por interface sem descobert
 é o de quem grava (`last_seen` em segundos Unix), então a tabela não depende do `Hal::now_unix`
 e roda igual em wasm/testes. Índice de interface (para `ff02::1%if` e para saber por onde um
 link-local chegou) vem de `/proc/net/if_inet6`, que é do network namespace de quem lê; o
-`LinkInfo` do `Hal` ainda não tem índice (G1.7).
+`LinkInfo` do `Hal` ainda não tem índice.
 
 A GUI nativa abre na tela de conexão (`ui::ConnectScreen`) quando não recebe `--connect`; a tela
 só coleta a escolha, e o app (`apps/corerouter-gui`, trait `Platform`) fornece os vizinhos
@@ -278,6 +278,52 @@ canal `--control` da GUI segue o alvo escolhido (`Target::Choosing` responde `se
 (nome livre, apagado em seguida; links existentes nunca são tocados) e guarda o resultado num
 `OnceLock`. Um kernel de terceiros sem `CONFIG_NET_VRF` deixa `ip.vrf.add` desabilitado; as
 imagens do G1.6 vêm com `CONFIG_NET_VRF=y`.
+
+### `hal-linux`: descoberta e posse dos links (G1.18)
+
+**Uma fonte só.** `discover_links`, `poll` e o `apply` falam com o kernel do mesmo network
+namespace: um dump `RTM_GETLINK` (`netlink::links`) dá nome, índice, `IFLA_INFO_KIND`, tipo
+`ARPHRD_*`, master, `IFLA_LINK_NETNSID` (par em outro namespace), MTU, MAC, `IFF_UP`, operstate e
+`stats64`. O sysfs saiu: `/sys/class/net` mostra o namespace de quem montou `/sys` (num
+`unshare --net` sem remontar, o do host), e a descoberta via sysfs semeava as interfaces do host
+num daemon que aplicava no namespace — `ip.address.add` falhava e o boot tentava mudar o MTU de
+`br-…` do Docker.
+
+**Posse** (`crates/hal-linux/src/owner.rs`, puro, testado em qualquer plataforma). Cada link é
+`Managed`, `External(motivo)` ou `Conflict(motivo)`; primeira regra que casa:
+
+1. nome que o modelo não aceita (`IfName`) → externo;
+2. o loopback do kernel (`ARPHRD_LOOPBACK`, `lo`) → externo (é do SO);
+3. nome em `--unmanaged` (nome ou `prefixo*`) → externo, até porta física;
+4. porta de um master externo (a veth de container dentro do `docker0`) → externo;
+5. nome que a config declara: gerenciado se o tipo do kernel serve (`vlan`/`bridge`/`dummy`/`vrf`
+   para o que o CoreRouter cria; física, `veth` ou `dummy` para uma porta `ether`). Porta `ether`
+   sobre outra coisa (config antiga que semeou o `docker0`) → externo; link virtual de outro tipo
+   → conflito (listado como não gerenciado; o executor recusa com a mensagem dele e faz rollback);
+6. porta física (sem `IFLA_INFO_KIND`, `ARPHRD_ETHER`) → gerenciada;
+7. `veth` com o par no mesmo namespace (um cabo dentro deste roteador) → gerenciada; com o par em
+   outro namespace (de container) → externa, salvo `--manage`;
+8. `veth`/`dummy` em `--manage` → gerenciada;
+9. o resto (`bridge`, `vlan`, `ppp`, `tun`, `wireguard`, … criados por outro programa) → externo.
+
+Porta com MTU fora de 68..=9216 também é externa (o modelo não a representa sem mudar o kernel).
+
+**Efeitos.** `discover_links` devolve só portas gerenciadas, com `up` (admin): o seed do engine
+copia MTU, MAC e `disabled = !up`, então o primeiro `apply` (padrão → seed) não muda nada no
+kernel (porta que estava down continua down; parte do G1.3). `poll` devolve todos os links com
+`kind`, `mtu`, `mac` e `unmanaged: Option<motivo>`; `interface.list` mostra as interfaces da
+config (com `kind` do kernel, `managed`, `unmanaged_reason`) e depois os links fora da config,
+sempre `managed: false`. `Hal::unmanaged()` (padrão vazio; o lab virtual não tem) alimenta
+`refuse_unmanaged` nos comandos que mudam interfaces (`interface.set`, `*.add` com o nome,
+`vlan.add` no pai, `bridge.port.*`, `ip.address.add`, `ip.vrf.add/set`): "'docker0' is not managed
+by CoreRouter: a bridge created outside CoreRouter". `interface.remove` aceita apagar uma porta
+`ether` da config cujo link é externo (limpeza de seed antigo). No `apply`, ops sobre links
+externos são descartadas com aviso no log, antes do executor: nem MTU, nem up/down, nem
+endereço chegam a eles. A GUI deixa as ações cinza com o mesmo motivo e a linha esmaecida.
+
+`corerouter-daemon --manage <nomes>` / `--unmanaged <nomes>` ajustam a regra (labs com veth entre
+namespaces usam `--manage ether*`, como `tests/netns_l2.rs`). Na imagem de produção (G1.6) as
+portas físicas são gerenciadas pela regra 6, sem flag.
 
 ### Rotas estáticas e VRF (G1.5)
 
@@ -322,4 +368,5 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).
 - 2026-10-22 — G5.1: crates `proto-discovery` (L2) e `discovery` (L4), tabela de vizinhos no engine, tela de conexão.
 - 2026-10-22 — G5.2 Parte 2: LLDP/MNDP no daemon (`link_discovery.rs`), cola L1+L2 na app.
+- 2026-10-22 — G1.18: descoberta/contadores do `hal-linux` via rtnetlink e política de posse dos links.
 - 2026-10-22 — G0.8: crate `shell` (L4) e o terminal no fluxo de um comando.

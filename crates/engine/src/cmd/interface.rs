@@ -1,6 +1,8 @@
 //! /interface — ports, VLANs, bridges and loopbacks (VRFs are interfaces
 //! too, managed by `ip.vrf.*`).
 
+use std::collections::BTreeMap;
+
 use corerouter_model::{Config, IfName, Interface, InterfaceKind, RoutingTable, VlanId};
 use serde_json::{Value, json};
 
@@ -14,7 +16,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: ether|vlan|bridge|loopback|vrf} → [{name, type, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, bridge, vrf, table}]",
+        "{type?: string (ether | vlan | bridge | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, bridge, vrf, table}]",
         always, list),
     cmd!(
         "interface.set",
@@ -84,12 +86,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     ),
 ];
 
+/// Config interfaces first (with the kernel's `kind` and counters), then
+/// the platform links outside the config, all `managed: false` (G1.18).
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = opt_str(p, "type")?;
     let live = s.hal_mut().poll();
-    let rows = s
-        .store()
-        .candidate()
+    let cfg = s.store().candidate();
+    let mut rows: Vec<Value> = cfg
         .interfaces
         .values()
         .filter(|i| filter.is_none_or(|t| i.kind.label() == t))
@@ -103,9 +106,13 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 InterfaceKind::Vrf { table } => Some(table),
                 _ => None,
             };
+            let unmanaged = st.and_then(|l| l.unmanaged.as_deref());
             json!({
                 "name": i.name,
                 "type": i.kind.label(),
+                "kind": st.map_or(i.kind.label(), |l| l.kind.as_str()),
+                "managed": unmanaged.is_none(),
+                "unmanaged_reason": unmanaged,
                 "mtu": i.mtu,
                 "disabled": i.disabled,
                 "running": st.is_some_and(|l| l.running),
@@ -122,6 +129,37 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             })
         })
         .collect();
+    rows.extend(
+        live.iter()
+            .filter(|l| !cfg.interfaces.contains_key(&l.name))
+            .filter(|l| filter.is_none_or(|t| l.kind == t))
+            .map(|l| {
+                let why = l
+                    .unmanaged
+                    .as_deref()
+                    .unwrap_or("not in the configuration (appeared after boot)");
+                json!({
+                    "name": l.name,
+                    "type": l.kind,
+                    "kind": l.kind,
+                    "managed": false,
+                    "unmanaged_reason": why,
+                    "mtu": l.mtu,
+                    "disabled": false,
+                    "running": l.running,
+                    "rx_bytes": l.rx_bytes,
+                    "tx_bytes": l.tx_bytes,
+                    "rx_packets": l.rx_packets,
+                    "tx_packets": l.tx_packets,
+                    "comment": "",
+                    "parent": null,
+                    "vlan_id": null,
+                    "bridge": null,
+                    "vrf": null,
+                    "table": null,
+                })
+            }),
+    );
     Ok(Value::Array(rows))
 }
 
@@ -134,6 +172,7 @@ fn parse_mtu(mtu: u32) -> Result<u16> {
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let name: IfName = req_parse(p, "name")?;
+    refuse_unmanaged(s, p, &["name"])?;
     let mtu = opt_u32(p, "mtu")?.map(parse_mtu).transpose()?;
     let disabled = opt_bool(p, "disabled")?;
     let comment = opt_text(p, "comment", 256)?;
@@ -153,6 +192,48 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         iface.comment = c;
     }
     Ok(json!({ "name": name }))
+}
+
+/// Kernel links the platform says CoreRouter must not change (G1.18).
+pub(super) fn unmanaged(s: &mut Session) -> BTreeMap<IfName, String> {
+    s.hal_mut().unmanaged().into_iter().collect()
+}
+
+/// Refuse when an interface named by `keys` in `p` (a name, a list, or a
+/// comma-separated string) is one the platform does not let CoreRouter
+/// manage. Runs before the other checks, so the reason beats "no interface".
+pub(super) fn refuse_unmanaged(s: &mut Session, p: &Value, keys: &[&str]) -> Result<()> {
+    let named: Vec<(&str, String)> = keys
+        .iter()
+        .flat_map(|k| {
+            let vals: Vec<String> = match p.get(*k) {
+                Some(Value::String(t)) => t.split(',').map(|x| x.trim().to_owned()).collect(),
+                Some(Value::Array(a)) => a
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect(),
+                _ => Vec::new(),
+            };
+            vals.into_iter().map(move |v| (*k, v))
+        })
+        .collect();
+    if named.is_empty() {
+        return Ok(());
+    }
+    let external = unmanaged(s);
+    for (key, name) in named {
+        let Ok(n) = name.parse::<IfName>() else {
+            continue;
+        };
+        if let Some(why) = external.get(&n) {
+            return Err(EngineError::bad(
+                key,
+                format!("'{n}' is not managed by CoreRouter: {why}"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Parse `key` as an interface that must exist in `cfg`.
@@ -193,6 +274,7 @@ fn insert(s: &mut Session, mut iface: Interface, p: &Value) -> Result<Value> {
 }
 
 fn vlan_add(s: &mut Session, p: &Value) -> Result<Value> {
+    refuse_unmanaged(s, p, &["name", "parent"])?;
     let cfg = s.store().candidate();
     let name = new_name(cfg, p)?;
     let (parent, parent_iface) = existing(cfg, p, "parent")?;
@@ -240,11 +322,13 @@ fn vlan_add(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn bridge_add(s: &mut Session, p: &Value) -> Result<Value> {
+    refuse_unmanaged(s, p, &["name"])?;
     let name = new_name(s.store().candidate(), p)?;
     insert(s, Interface::new(name, InterfaceKind::Bridge), p)
 }
 
 fn loopback_add(s: &mut Session, p: &Value) -> Result<Value> {
+    refuse_unmanaged(s, p, &["name"])?;
     let name = new_name(s.store().candidate(), p)?;
     insert(s, Interface::new(name, InterfaceKind::Loopback), p)
 }
@@ -263,6 +347,7 @@ fn port_params(cfg: &Config, p: &Value) -> Result<(IfName, IfName)> {
 }
 
 fn port_add(s: &mut Session, p: &Value) -> Result<Value> {
+    refuse_unmanaged(s, p, &["bridge", "interface"])?;
     let cfg = s.store().candidate();
     let (bridge, port) = port_params(cfg, p)?;
     let iface = cfg
@@ -325,6 +410,7 @@ fn port_add(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn port_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    refuse_unmanaged(s, p, &["bridge", "interface"])?;
     let (bridge, port) = port_params(s.store().candidate(), p)?;
     let iface = s
         .store_mut()
@@ -357,9 +443,12 @@ fn port_list(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    // A port entry for a link CoreRouter does not manage (a stale seed that
+    // took `docker0`) may go: apply never touches that link anyway.
+    let external = unmanaged(s);
     let cfg = s.store().candidate();
     let (name, iface) = existing(cfg, p, "name")?;
-    if matches!(iface.kind, InterfaceKind::Ethernet) {
+    if matches!(iface.kind, InterfaceKind::Ethernet) && !external.contains_key(&name) {
         return Err(EngineError::bad(
             "name",
             format!(
