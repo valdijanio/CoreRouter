@@ -168,9 +168,15 @@ nenhum: os 20 `rustdoc` custavam 17 s para nada).
 | | Antes | Depois |
 |---|---|---|
 | Testes do workspace | `cargo test` 29,7 s | `cargo xtask test` (nextest) 14,3 s |
+| Testes em namespace (11 binários, 38 testes) | um após o outro, 33–36 s | em paralelo, ~9 s |
 
 **`sccache` não foi adotado** (medido, workspace inteiro com testes, pasta de build nova como a
 de uma sessão em paralelo): sem `sccache` 27 s; `sccache` frio 34 s; `sccache` quente em outra
 pasta 36 s, com 0% de acerto em Rust. Ele não reaproveita entre caminhos de saída diferentes nem
 crates com compilação incremental, e o build já é curto. No CI, o `rust-cache` restaura o
 `target` inteiro de uma vez. Rever se as builds ficarem longas.
+
+Os testes em namespace (`cargo xtask netns`) compilam uma vez (`cargo test --no-run`) e rodam os
+11 binários ao mesmo tempo, cada um no seu namespace descartável, com a saída agrupada por
+binário. No CI, os pacotes do `apt` vêm de cache (`cache-apt-pkgs-action`): o `apt-get update`
+variava de 14 s a 114 s conforme o espelho.

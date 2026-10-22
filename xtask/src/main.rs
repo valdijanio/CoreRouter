@@ -298,31 +298,135 @@ fn netns_run(root: &Path) -> Outcome {
     if let Err(why) = netns_probe() {
         return Outcome::Skip(why);
     }
-    let cargo = cargo_bin();
     let tests = match netns_tests(root) {
         Ok(t) => t,
         Err(e) => return Outcome::Fail(e),
     };
-    // One fresh namespace per test binary: each one's guard requires a
-    // namespace holding only `lo`.
-    for (package, test) in &tests {
-        let mut c = Command::new("unshare");
-        // Not `--quiet`: one line per test, so a CI log shows which ones ran.
-        c.args(UNSHARE)
-            .arg(&cargo)
-            .args(["test", "-p", package, "--test", test])
-            .env("COREROUTER_NETNS_TESTS", "1");
-        if let Outcome::Fail(e) = run(c, root) {
-            return Outcome::Fail(format!("{package} {test}: {e}"));
+    let bins = match netns_build(root, &tests) {
+        Ok(b) => b,
+        Err(e) => return Outcome::Fail(e),
+    };
+    // All binaries at once, one fresh namespace each (each one's guard
+    // requires a namespace holding only `lo`): ~3× faster than one after the
+    // other (docs/perf.md). Output is printed per binary, not interleaved.
+    let mut running = Vec::new();
+    for b in &bins {
+        let child = Command::new("unshare")
+            .args(UNSHARE)
+            .arg(&b.exe)
+            .current_dir(&b.dir)
+            .env("COREROUTER_NETNS_TESTS", "1")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
+        running.push((b, child));
+    }
+    let mut failed = Vec::new();
+    for (b, child) in running {
+        let name = format!("{} {}", b.package, b.test);
+        match child.and_then(std::process::Child::wait_with_output) {
+            Ok(out) => {
+                // Not quiet: one line per test, so a CI log shows which ran.
+                eprintln!("--- {name}");
+                eprint!("{}", String::from_utf8_lossy(&out.stdout));
+                eprint!("{}", String::from_utf8_lossy(&out.stderr));
+                if !out.status.success() {
+                    failed.push(format!("{name}: {}", out.status));
+                }
+            }
+            Err(e) => failed.push(format!("{name}: could not start: {e}")),
         }
     }
-    Outcome::Ok
+    if failed.is_empty() {
+        Outcome::Ok
+    } else {
+        Outcome::Fail(failed.join("; "))
+    }
+}
+
+struct NetnsBin {
+    package: String,
+    test: String,
+    exe: PathBuf,
+    /// The package directory: where `cargo test` would run the binary.
+    dir: PathBuf,
+}
+
+/// Build every netns test binary in one `cargo test --no-run` (outside the
+/// namespace) and return the executables.
+fn netns_build(root: &Path, tests: &[NetnsTest]) -> Result<Vec<NetnsBin>, String> {
+    let mut c = cargo();
+    c.args([
+        "test",
+        "--no-run",
+        "--message-format=json-render-diagnostics",
+    ]);
+    for t in tests {
+        c.args(["-p", &t.package, "--test", &t.test]);
+    }
+    let out = c
+        .current_dir(root)
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .map_err(|e| format!("cargo test --no-run: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("cargo test --no-run: {}", out.status));
+    }
+    let mut bins = Vec::new();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let target = msg.get("target");
+        let is_test = target
+            .and_then(|t| t.get("kind"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|k| k.iter().any(|k| k == "test"));
+        let test = target
+            .and_then(|t| t.get("name"))
+            .and_then(serde_json::Value::as_str);
+        let exe = msg.get("executable").and_then(serde_json::Value::as_str);
+        let manifest = msg.get("manifest_path").and_then(serde_json::Value::as_str);
+        let (true, Some(test), Some(exe), Some(manifest)) = (is_test, test, exe, manifest) else {
+            continue;
+        };
+        let dir = Path::new(manifest)
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let Some(t) = tests.iter().find(|t| t.test == test && t.dir == dir) else {
+            continue;
+        };
+        bins.push(NetnsBin {
+            package: t.package.clone(),
+            test: t.test.clone(),
+            exe: PathBuf::from(exe),
+            dir,
+        });
+    }
+    if bins.len() != tests.len() {
+        return Err(format!(
+            "cargo test --no-run built {} of {} netns test binaries",
+            bins.len(),
+            tests.len()
+        ));
+    }
+    Ok(bins)
+}
+
+/// One `tests/netns*.rs` integration test.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct NetnsTest {
+    package: String,
+    test: String,
+    /// The package directory.
+    dir: PathBuf,
 }
 
 /// Integration tests that need a kernel: every `tests/netns*.rs` of every
-/// workspace package, as (package, test), sorted. Found, not listed: a new
+/// workspace package, sorted. Found, not listed: a new
 /// netns test needs no edit here (the list was a merge-conflict hot spot).
-fn netns_tests(root: &Path) -> Result<Vec<(String, String)>, String> {
+fn netns_tests(root: &Path) -> Result<Vec<NetnsTest>, String> {
     let out = cargo()
         .args(["metadata", "--no-deps", "--format-version", "1"])
         .current_dir(root)
@@ -353,7 +457,11 @@ fn netns_tests(root: &Path) -> Result<Vec<(String, String)>, String> {
                 continue;
             };
             if stem.starts_with("netns") && e.path().is_file() {
-                found.push((name.to_owned(), stem.to_owned()));
+                found.push(NetnsTest {
+                    package: name.to_owned(),
+                    test: stem.to_owned(),
+                    dir: dir.to_path_buf(),
+                });
             }
         }
     }
@@ -437,14 +545,16 @@ mod tests {
             ("corerouter-discovery", "netns_local"),
         ] {
             assert!(
-                found.iter().any(|(p, t)| p == want.0 && t == want.1),
+                found
+                    .iter()
+                    .any(|t| t.package == want.0 && t.test == want.1),
                 "{want:?} missing from {found:?}"
             );
         }
         let mut sorted = found.clone();
         sorted.sort();
         assert_eq!(found, sorted);
-        assert!(found.iter().all(|(_, t)| t.starts_with("netns")));
+        assert!(found.iter().all(|t| t.test.starts_with("netns")));
     }
 }
 
