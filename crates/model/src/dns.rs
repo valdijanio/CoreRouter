@@ -116,12 +116,15 @@ pub fn usable_server(ip: IpAddr) -> bool {
         && !matches!(ip, IpAddr::V4(v4) if v4.is_broadcast())
 }
 
-/// Record type of a cached answer (the resolver asks only for addresses).
+/// Record type of a cached answer: addresses for the tools and NTP; PTR
+/// and TXT for the names and AS numbers of MTR hops (G6.3b).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum QType {
     A,
     Aaaa,
+    Ptr,
+    Txt,
 }
 
 impl QType {
@@ -129,6 +132,8 @@ impl QType {
         match self {
             Self::A => "A",
             Self::Aaaa => "AAAA",
+            Self::Ptr => "PTR",
+            Self::Txt => "TXT",
         }
     }
 }
@@ -140,6 +145,13 @@ pub enum CachedData {
     /// Addresses, and the canonical name when the answer came via CNAME.
     Addresses {
         addresses: Vec<IpAddr>,
+        canonical: Option<String>,
+    },
+    /// PTR names or TXT strings (each TXT record's character-strings
+    /// joined), and the canonical name when the answer came via CNAME
+    /// (RFC 2317 delegates classless reverse zones that way).
+    Records {
+        records: Vec<String>,
         canonical: Option<String>,
     },
     /// RFC 2308 §2.1: the name does not exist.

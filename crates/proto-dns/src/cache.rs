@@ -100,6 +100,17 @@ impl Cache {
                 },
                 *ttl,
             ),
+            Outcome::Records {
+                records,
+                canonical,
+                ttl,
+            } => (
+                CachedData::Records {
+                    records: records.clone(),
+                    canonical: canonical.clone(),
+                },
+                *ttl,
+            ),
             // RFC 2308 §5: without SOA there is no negative TTL: not cached.
             Outcome::NxDomain { ttl: None } | Outcome::NoData { ttl: None } => return,
             Outcome::NxDomain { ttl: Some(t) } => {
@@ -118,6 +129,10 @@ impl Cache {
                     addresses,
                     canonical,
                 } => addresses.len() * 16 + canonical.as_ref().map_or(0, String::len),
+                CachedData::Records { records, canonical } => {
+                    records.iter().map(String::len).sum::<usize>()
+                        + canonical.as_ref().map_or(0, String::len)
+                }
                 _ => 0,
             };
         if size > self.budget {

@@ -104,6 +104,50 @@ pub struct Reply {
     pub ttl: Option<u8>,
     /// From sending the probe to receiving this.
     pub rtt: Duration,
+    /// MPLS label stack the router reported (RFC 4950), top first; empty
+    /// when none (or the socket cannot see ICMP extensions).
+    pub mpls: Vec<MplsLabel>,
+}
+
+/// One MPLS label stack entry (RFC 3032 §2.1; RFC 5462 renamed EXP to TC).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct MplsLabel {
+    pub label: u32,
+    pub tc: u8,
+    /// S: bottom of the stack.
+    pub bottom: bool,
+    pub ttl: u8,
+}
+
+impl std::fmt::Display for MplsLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "L={} TC={} S={} TTL={}",
+            self.label,
+            self.tc,
+            u8::from(self.bottom),
+            self.ttl
+        )
+    }
+}
+
+/// A name lookup that must not hold up the probes: asked again later
+/// until it is `Done`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Lookup<T> {
+    Pending,
+    Done(T),
+}
+
+/// The AS that originates the prefix of an address.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AsInfo {
+    pub asn: u32,
+    /// Short name ("LEVEL3").
+    pub name: Option<String>,
+    /// The announced prefix ("4.0.0.0/9").
+    pub prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -152,6 +196,17 @@ pub trait Prober: Send + Sync {
     /// A socket with `options`. Failing to open one family's side is
     /// reported by the first `send` to that family.
     fn open(&self, options: &SocketOptions) -> Result<Box<dyn ProbeSocket>, ProbeError>;
+
+    /// The name of `ip` (PTR), without waiting: `Pending` while a lookup
+    /// runs elsewhere, `Done(None)` when there is none. Default: no names.
+    fn reverse_name(&self, _ip: IpAddr) -> Lookup<Option<String>> {
+        Lookup::Done(None)
+    }
+
+    /// The origin AS of `ip`, without waiting, like [`Self::reverse_name`].
+    fn origin_as(&self, _ip: IpAddr) -> Lookup<Option<AsInfo>> {
+        Lookup::Done(None)
+    }
 }
 
 pub type SharedProber = Arc<dyn Prober>;

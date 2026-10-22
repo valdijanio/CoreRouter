@@ -88,7 +88,14 @@ servidor DNS de teste na porta 53 real de `127.0.0.2`, num namespace sem `resolv
 utilizável. Sem servidor, o ping falha com a mensagem certa; com `ip.dns.set`, o ping resolve
 `router.test`; o NXDOMAIN vai para o cache; o flush esvazia o cache.
 
-**Limites.** Só A e AAAA (o `cache all` com PTR/MX/TXT fica para a G4.1b). `ip.dns.resolve` (o
+**PTR e TXT (G6.3b).** O resolvedor também consulta PTR (nome de um endereço, RFC 1035 §3.5 /
+RFC 3596 §2.5, seguindo CNAME como na delegação sem classe da RFC 2317) e TXT (as respostas da
+Team Cymru para o ASN de um endereço), com o mesmo cache (`ip.dns.cache.print` mostra `type: PTR`
+/ `TXT`, `kind: records`). Quem usa é o MTR (`docs/tools.md` §4.2), sem esperar: o daemon faz
+essas consultas em threads próprias. Nomes e textos vindos da rede saem só com ASCII imprimível
+(sem sequências de escape de terminal).
+
+**Limites.** A, AAAA, PTR e TXT só para o próprio roteador (o `cache all` com MX etc. fica para a G4.1b). `ip.dns.resolve` (o
 `:resolve` do RouterOS) não existe ainda: um comando que espera a rede sob o lock do `Session`
 travaria o plano de controle, então ele vai virar tarefa (G4.1d). Sem DoH/DoT, VRF nem servidores
 dinâmicos do PPPoE e do DHCPv6 (G4.1d). Não há janela na GUI ainda (G4.1d).

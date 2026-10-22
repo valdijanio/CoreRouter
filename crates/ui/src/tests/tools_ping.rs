@@ -48,7 +48,7 @@ fn lab() -> Harness {
 
 impl Harness {
     /// Click into a form field of `window` and replace its text.
-    fn type_into(&mut self, window: egui::Id, param: &str, text: &str) {
+    pub(crate) fn type_into(&mut self, window: egui::Id, param: &str, text: &str) {
         let at = self
             .ctx
             .read_response(crate::dialog::field_id(window, param))
@@ -61,7 +61,7 @@ impl Harness {
     }
 
     /// Frames (and real time, for the task threads) until `done` holds.
-    fn until(&mut self, what: &str, mut done: impl FnMut(&Self) -> bool) {
+    pub(crate) fn until(&mut self, what: &str, mut done: impl FnMut(&Self) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while !done(self) {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
@@ -208,7 +208,11 @@ fn mtr_window_shows_one_row_per_hop() {
     assert_eq!(hops, 6, "{}", t.summary);
     assert!(h.has_text("Worst"));
     assert!(h.has_text("198.51.100.20"));
-    assert!(h.has_text("100.64.1.192"), "first router");
+    assert!(h.has_text_containing("[private]"), "first router: 10.0.0.x");
+    assert!(h.has_text_containing("[cgnat]"), "second router: 100.64.2.x");
+    // Use DNS is on by default: the lab's routers have names.
+    assert!(h.has_text_containing(".sim-transit.example"));
+    assert!(h.has_text("MPLS"), "the lossy path has labels");
     assert!(h.has_text_containing("reached"));
     // Esc with nothing running closes it.
     h.key(Key::Escape, egui::Modifiers::NONE);

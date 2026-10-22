@@ -98,12 +98,16 @@ pub fn line(kind: &str, ev: &Value) -> String {
         .trim_end()
         .to_owned(),
         "mtr" => format!(
-            "{:>5} {:>3} {:<40} {:<10} {}",
+            "{:>5} {:>3} {:<40} {:<10} {} {}",
             s(ev, "round"),
             s(ev, "hop"),
             s(ev, "address"),
             time(ev, "rtt_ms"),
-            s(ev, "status")
+            s(ev, "status"),
+            ev.get("mpls")
+                .and_then(Value::as_str)
+                .map(|m| format!("MPLS {m}"))
+                .unwrap_or_default()
         )
         .trim_end()
         .to_owned(),
@@ -188,10 +192,24 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
             None => format!("{}: no MTU found", s(summary, "address")),
         }],
         "mtr" => {
-            let mut out = vec![format!(
-                "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9}",
-                "HOP", "HOST", "LOSS%", "SENT", "LAST", "AVG", "BEST", "WORST", "STDEV"
-            )];
+            let asn = summary.get("as_lookup").and_then(Value::as_bool) == Some(true);
+            let mut out = vec![
+                format!(
+                    "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {}",
+                    "HOP",
+                    "HOST",
+                    "LOSS%",
+                    "SENT",
+                    "LAST",
+                    "AVG",
+                    "BEST",
+                    "WORST",
+                    "STDEV",
+                    if asn { "ASN" } else { "" }
+                )
+                .trim_end()
+                .to_owned(),
+            ];
             let num = |t: &Value, k: &str| {
                 t.get(k)
                     .and_then(Value::as_f64)
@@ -204,12 +222,24 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
                 .into_iter()
                 .flatten()
             {
-                let host = match s(h, "host").as_str() {
-                    "" => "???".to_owned(),
-                    x => x.to_owned(),
+                // mtr -b: the name and the address; marks for addresses
+                // that mean nothing outside their network.
+                let mut host = match (s(h, "host").as_str(), s(h, "name").as_str()) {
+                    ("", _) => "???".to_owned(),
+                    (ip, "") => ip.to_owned(),
+                    (ip, name) => format!("{name} ({ip})"),
+                };
+                if let Some(scope) = h.get("scope").and_then(Value::as_str) {
+                    host = format!("{host} [{scope}]");
+                }
+                let as_text = match (h.get("asn").and_then(Value::as_u64), s(h, "as_name")) {
+                    (Some(n), name) if !name.is_empty() => format!("AS{n} {name}"),
+                    (Some(n), _) => format!("AS{n}"),
+                    (None, _) if asn && !s(h, "host").is_empty() => "AS???".to_owned(),
+                    (None, _) => String::new(),
                 };
                 out.push(format!(
-                    "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9}",
+                    "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9} {}",
                     s(h, "hop"),
                     host,
                     format!(
@@ -222,7 +252,23 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
                     num(h, "best_ms"),
                     num(h, "worst_ms"),
                     num(h, "stddev_ms"),
-                ));
+                    as_text,
+                ).trim_end().to_owned());
+                // mtr -e: the label stack under the hop, top first.
+                for l in h
+                    .pointer("/hosts_info/0/mpls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    out.push(format!(
+                        "    MPLS L={} TC={} S={} TTL={}",
+                        s(l, "label"),
+                        s(l, "tc"),
+                        u8::from(l.get("bottom").and_then(Value::as_bool) == Some(true)),
+                        s(l, "ttl")
+                    ));
+                }
             }
             out
         }
@@ -278,6 +324,26 @@ mod tests {
         assert!(header("mtr").unwrap().contains("HOP"));
         assert!(t[1].contains("10.0.0.1"));
         assert!(t[2].contains("???") && t[2].contains("100.0"));
+    }
+
+    #[test]
+    fn mtr_table_with_names_as_numbers_and_labels() {
+        let t = summary(
+            "mtr",
+            &json!({"as_lookup": true, "hops": [
+                {"hop": 1, "host": "10.0.0.1", "scope": "private", "loss_pct": 0.0, "sent": 1},
+                {"hop": 2, "host": "4.69.1.1", "name": "ae1.core.example", "asn": 3356,
+                 "as_name": "LEVEL3", "loss_pct": 0.0, "sent": 1,
+                 "hosts_info": [{"mpls": [{"label": 24017, "tc": 0, "bottom": true, "ttl": 1}]}]},
+                {"hop": 3, "host": "4.69.1.2", "loss_pct": 0.0, "sent": 1}]}),
+        );
+        assert!(t[0].ends_with("ASN"), "{}", t[0]);
+        assert!(t[1].contains("10.0.0.1 [private]"), "{}", t[1]);
+        assert!(t[2].contains("ae1.core.example (4.69.1.1)") && t[2].ends_with("AS3356 LEVEL3"));
+        assert_eq!(t[3], "    MPLS L=24017 TC=0 S=1 TTL=1");
+        assert!(t[4].ends_with("AS???"));
+        let l = line("mtr", &json!({"round": 1, "hop": 2, "address": "4.69.1.1", "rtt_ms": 1.0, "status": "ttl-exceeded", "mpls": "L=24017"}));
+        assert!(l.ends_with("ttl-exceeded MPLS L=24017"), "{l}");
     }
 
     #[test]

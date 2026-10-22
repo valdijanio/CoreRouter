@@ -15,6 +15,15 @@
 //!
 //! Names resolve to `198.18.0.0/15` (RFC 2544 benchmarking space), except
 //! `localhost` (`127.0.0.1`, `::1`) and names under `.invalid` (not found).
+//!
+//! Routers on a path (G6.3b): hop 1 is private (`10.0.0.0/8`, `fd00::/8`),
+//! hop 2 CGNAT (`100.64.0.0/10`; IPv6: `2001:db8:ffff::/48` from hop 2 on),
+//! the rest `198.19.<hop>.0/24`. Their reverse names end in
+//! `.sim-transit.example` (one in five has none), hops 3–5 belong to
+//! AS64500 "SIM-ACCESS" and the later ones to AS64510 "SIM-TRANSIT"
+//! (RFC 6996 private-use ASNs); destinations are AS64999 "SIM-DEST". On
+//! paths of 5 hops or more, hops 3 to the third-to-last report an MPLS
+//! label (RFC 4950), the middle one a stack of two.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -22,7 +31,10 @@ use std::time::Duration;
 
 use ipnet::IpNet;
 
-use crate::probe::{Probe, ProbeError, ProbeSocket, Prober, Reply, ReplyKind, SocketOptions};
+use crate::probe::{
+    AsInfo, Lookup, MplsLabel, Probe, ProbeError, ProbeSocket, Prober, Reply, ReplyKind,
+    SocketOptions,
+};
 
 /// What happens to a probe that reaches the end of a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,12 +188,17 @@ impl SimProber {
     pub fn router(dst: IpAddr, hop: u8) -> IpAddr {
         let h = hash(&[&addr_bytes(dst), &[hop]]);
         let low = (h % 254) as u8 + 1;
-        match dst {
-            IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::new(100, 64, hop, low)),
-            IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::new(
-                0xfd00,
-                0,
-                0,
+        match (dst, hop) {
+            (IpAddr::V4(_), 1) => IpAddr::V4(Ipv4Addr::new(10, 0, 0, low)),
+            (IpAddr::V4(_), 2) => IpAddr::V4(Ipv4Addr::new(100, 64, 2, low)),
+            (IpAddr::V4(_), _) => IpAddr::V4(Ipv4Addr::new(198, 19, hop, low)),
+            (IpAddr::V6(_), 1) => {
+                IpAddr::V6(Ipv6Addr::new(0xfd00, 0, 0, 0, 0, 0, 1, u16::from(low)))
+            }
+            (IpAddr::V6(_), _) => IpAddr::V6(Ipv6Addr::new(
+                0x2001,
+                0x0db8,
+                0xffff,
                 0,
                 0,
                 0,
@@ -189,6 +206,48 @@ impl SimProber {
                 u16::from(low),
             )),
         }
+    }
+
+    /// The hop number of a simulated public router address, if it is one.
+    fn router_hop(ip: IpAddr) -> Option<u8> {
+        match ip {
+            IpAddr::V4(v) => match v.octets() {
+                [198, 19, hop, _] if hop >= 3 => Some(hop),
+                _ => None,
+            },
+            IpAddr::V6(v) => match v.segments() {
+                [0x2001, 0x0db8, 0xffff, 0, 0, 0, hop, _] => u8::try_from(hop).ok(),
+                _ => None,
+            },
+        }
+    }
+
+    /// The labels the router at `hop` reports on a path of `hops`.
+    pub fn labels(dst: IpAddr, hop: u8, hops: u8) -> Vec<MplsLabel> {
+        if hops < 5 || hop < 3 || hop > hops.saturating_sub(2) {
+            return Vec::new();
+        }
+        let h = hash(&[&addr_bytes(dst), &[hop], b"mpls"]);
+        let top = MplsLabel {
+            label: 16_000 + (h % 8000) as u32,
+            tc: 0,
+            bottom: true,
+            ttl: 1,
+        };
+        if hop == hops / 2 + 1 {
+            // A VPN/service label under the transport one.
+            let transport = MplsLabel {
+                bottom: false,
+                ..top
+            };
+            let service = MplsLabel {
+                label: 24_000 + (h >> 16) as u32 % 1000,
+                ttl: 1,
+                ..top
+            };
+            return vec![transport, service];
+        }
+        vec![top]
     }
 
     /// What answers `probe` (sent with DF = `df`), if anything.
@@ -224,6 +283,11 @@ impl SimProber {
         let reply = |from: IpAddr, kind: ReplyKind, k: u8| Reply {
             seq: probe.seq,
             from,
+            mpls: if kind == ReplyKind::TtlExceeded {
+                Self::labels(probe.dst, k, hops)
+            } else {
+                Vec::new()
+            },
             kind,
             size: Some(probe.size),
             ttl: Some(64u8.saturating_sub(k.saturating_sub(1))),
@@ -289,6 +353,40 @@ impl Prober for SimProber {
             b,
             c.max(1),
         ))])
+    }
+
+    fn reverse_name(&self, ip: IpAddr) -> Lookup<Option<String>> {
+        let h = hash(&[&addr_bytes(ip), b"ptr"]);
+        let name = match Self::router_hop(ip) {
+            Some(_) if h.is_multiple_of(5) => None,
+            Some(hop) => Some(format!(
+                "ae{}-{hop}.core{}.sim-transit.example",
+                h % 8,
+                h % 4 + 1
+            )),
+            None => match ip {
+                IpAddr::V4(v) => {
+                    let [a, b, c, d] = v.octets();
+                    Some(format!("host-{a}-{b}-{c}-{d}.sim-dest.example"))
+                }
+                IpAddr::V6(_) => Some(format!("host-{:x}.sim-dest.example", h & 0xffff)),
+            },
+        };
+        Lookup::Done(name)
+    }
+
+    fn origin_as(&self, ip: IpAddr) -> Lookup<Option<AsInfo>> {
+        let (asn, name, prefix) = match (Self::router_hop(ip), ip) {
+            (Some(hop), IpAddr::V4(_)) if hop <= 5 => (64_500, "SIM-ACCESS", "198.19.0.0/16"),
+            (Some(_), IpAddr::V4(_)) => (64_510, "SIM-TRANSIT", "198.19.0.0/16"),
+            (Some(_), IpAddr::V6(_)) => (64_510, "SIM-TRANSIT", "2001:db8:ffff::/48"),
+            (None, _) => (64_999, "SIM-DEST", ""),
+        };
+        Lookup::Done(Some(AsInfo {
+            asn,
+            name: Some(name.into()),
+            prefix: (!prefix.is_empty()).then(|| prefix.into()),
+        }))
     }
 
     fn open(&self, options: &SocketOptions) -> Result<Box<dyn ProbeSocket>, ProbeError> {
@@ -404,6 +502,44 @@ mod tests {
         assert_eq!(
             sock.send(&probe("8.8.8.8", 1, None, 1501)),
             Err(ProbeError::TooBig(Some(1500)))
+        );
+    }
+
+    #[test]
+    fn routers_have_names_as_numbers_and_labels() {
+        let sim = SimProber::default();
+        let dst: IpAddr = "8.8.4.4".parse().unwrap();
+        assert!(SimProber::router(dst, 1).to_string().starts_with("10.0.0."));
+        assert!(
+            SimProber::router(dst, 2)
+                .to_string()
+                .starts_with("100.64.2.")
+        );
+        let r5 = SimProber::router(dst, 5);
+        assert!(r5.to_string().starts_with("198.19.5."));
+        assert!(matches!(
+            sim.origin_as(r5),
+            Lookup::Done(Some(AsInfo { asn: 64_500, .. }))
+        ));
+        let named = (3..=20u8)
+            .filter(|h| {
+                matches!(
+                    sim.reverse_name(SimProber::router(dst, *h)),
+                    Lookup::Done(Some(_))
+                )
+            })
+            .count();
+        assert!((10..18).contains(&named), "{named} of 18 named");
+        assert!(SimProber::labels(dst, 2, 8).is_empty());
+        assert_eq!(SimProber::labels(dst, 3, 8).len(), 1);
+        assert_eq!(SimProber::labels(dst, 5, 8).len(), 2);
+        assert!(SimProber::labels(dst, 7, 8).is_empty());
+        let ttl3 = (1..50)
+            .find_map(|seq| sim.answer(&probe("198.51.100.9", seq, Some(3), 56), false))
+            .unwrap();
+        assert!(
+            !ttl3.mpls.is_empty(),
+            "the lossy 6-hop path has MPLS at hop 3"
         );
     }
 

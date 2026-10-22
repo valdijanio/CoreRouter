@@ -1334,6 +1334,7 @@ dependencies = [
  "corerouter-engine",
  "corerouter-hal",
  "corerouter-model",
+ "corerouter-proto-dns",
  "corerouter-shell",
  "egui",
  "egui_plot",
