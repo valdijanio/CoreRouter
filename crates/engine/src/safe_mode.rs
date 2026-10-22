@@ -21,6 +21,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::auth::Principal;
+use crate::lockout::Link;
 use crate::{EngineError, Result, Session};
 
 /// Who sent a command. The control channel gives each connection its own
@@ -36,6 +37,10 @@ pub struct Caller {
     pub name: String,
     #[serde(skip)]
     pub principal: Principal,
+    /// Its TCP connection, for the lockout check (`None`: inside the
+    /// process, nothing to lose).
+    #[serde(skip)]
+    pub link: Option<Link>,
 }
 
 impl Caller {
@@ -47,11 +52,18 @@ impl Caller {
             id,
             name: name.into(),
             principal: Principal::Anonymous,
+            link: None,
         }
     }
 
     pub fn local() -> Self {
         Self::new(Self::LOCAL_ID, "local").with_principal(Principal::Local)
+    }
+
+    #[must_use]
+    pub fn with_link(mut self, link: Link) -> Self {
+        self.link = Some(link);
+        self
     }
 
     #[must_use]
@@ -288,7 +300,7 @@ impl Session {
         let candidate = self.store().candidate().clone();
         self.store_mut().set_candidate(active.entry);
         let result = if self.store().is_dirty() {
-            self.commit_candidate(&format!("safe mode undo: {reason}"))
+            self.commit_restoring(&format!("safe mode undo: {reason}"))
                 .map(Some)
         } else {
             Ok(None)

@@ -39,3 +39,4 @@ redefine um item de `docs/gaps.md` acrescenta **uma linha no fim**, sem editar l
 - 2026-10-22 — G4.7a feito (cliente DHCPv4 estilo RouterOS com opções recebidas, rotas 121 com VRF, servidores permitidos e histórico).
 - 2026-10-22 — G0.9 (infraestrutura de benchmarks) adicionado; AGENTS.md ganha RFC original na pesquisa e a regra de desempenho (Rust puro × externo com dados).
 - 2026-10-22 — G1.20 feito.
+- 2026-10-22 — G2.1b (firewall: lockout, sombras, defaults, modelos, zonas, descrição) feito.

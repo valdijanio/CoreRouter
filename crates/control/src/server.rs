@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use corerouter_engine::Caller;
+use corerouter_engine::{Caller, Link};
 
 use crate::auth::Gate;
 use crate::dispatch::{Host, dispatch_as, hang_up, new_caller};
@@ -185,9 +185,11 @@ where
             continue;
         }
         let counter = Arc::clone(&active);
-        let caller = match peer {
-            Some(p) => new_caller(kind, p),
-            None => new_caller(kind, "?"),
+        let caller = match (peer, stream.local_addr().ok()) {
+            // The lockout check (G2.1b) needs both ends of the connection.
+            (Some(p), Some(local)) => new_caller(kind, p).with_link(Link { peer: p, local }),
+            (Some(p), None) => new_caller(kind, p),
+            (None, _) => new_caller(kind, "?"),
         };
         let tls = endpoint.tls.clone();
         let serve = serve.clone();
