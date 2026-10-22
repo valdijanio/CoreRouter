@@ -92,6 +92,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L4 | `crates/control` | Canal JSON-por-linha em loopback, WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client` | L0–L3 |
 | L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
 | L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
+| L4 | `crates/shell` | Terminal estilo RouterOS gerado do `engine.list`: parser, Tab, cores, `print`, `/export`/`/import`. Puro (sem I/O, wasm): pede chamadas do canal de controle ao front end (janela da GUI, `corerouter-cli shell`, SSH). Veja `docs/terminal.md` | `serde_json` (nada do workspace; testes usam o engine) |
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
 | L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe); trait `Backend` assíncrono + `Local` | L0–L4 + egui |
 | L6 | `apps/corerouter-{daemon,gui,cli}` | Binários; únicos que escolhem backend de plataforma e janela | tudo |
@@ -118,6 +119,7 @@ CoreRouter/
 │   ├── mcp/              # L4
 │   ├── storage-fs/       # L4: persistência da config em arquivo
 │   ├── discovery/        # L4: runtime do CRDP (sockets, threads)
+│   ├── shell/            # L4: terminal RouterOS gerado do registro (G0.8)
 │   └── ui/               # L5
 ├── apps/
 │   ├── corerouter-daemon/
@@ -133,7 +135,7 @@ Planejados (gaps): `crates/hal-frr` (L1 plataforma, G3.1), `crates/dataplane-ebp
 
 ```
 UI (CoreRouterUi::run) ─┐
-CLI ────────────────────┤
+CLI / terminal (shell) ─┤
 canal de controle ──────┼──► Session::execute(id, params)
 MCP (Headless/Remote) ──┘        1. acha o CommandSpec (ou "did you mean")
                                  2. check_params contra o doc `params`
@@ -320,3 +322,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).
 - 2026-10-22 — G5.1: crates `proto-discovery` (L2) e `discovery` (L4), tabela de vizinhos no engine, tela de conexão.
 - 2026-10-22 — G5.2 Parte 2: LLDP/MNDP no daemon (`link_discovery.rs`), cola L1+L2 na app.
+- 2026-10-22 — G0.8: crate `shell` (L4) e o terminal no fluxo de um comando.

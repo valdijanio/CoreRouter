@@ -10,6 +10,8 @@ use corerouter_engine::Session;
 use corerouter_mcp::{Backend, Headless, Remote};
 use serde_json::{Value, json};
 
+mod shell;
+
 const USAGE: &str = "\
 usage: corerouter-cli <command> [--connect HOST:PORT]
 
@@ -18,8 +20,9 @@ usage: corerouter-cli <command> [--connect HOST:PORT]
   inspect [path]              state summary, or one subtree (interfaces, routing.bgp, running.ip, journal)
   screenshot <out.png>        save the GUI window (needs --connect to corerouter-gui --control)
   mcp [--headless]            MCP server on stdio; default tries 127.0.0.1:7979, then headless
+  shell [--user NAME]         RouterOS-style terminal (/ip address print; Tab, ?, Ctrl+X); see docs/terminal.md
 
-Without --connect, list/run/inspect use a fresh in-process virtual lab (nothing persists).";
+Without --connect, list/run/inspect/shell use a fresh in-process virtual lab (nothing persists).";
 
 fn main() -> ExitCode {
     // stderr only: in `mcp` mode stdout carries the protocol.
@@ -38,12 +41,14 @@ fn main() -> ExitCode {
 fn real_main() -> Result<(), String> {
     let mut connect: Option<String> = None;
     let mut headless = false;
+    let mut user: Option<String> = None;
     let mut pos: Vec<String> = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--connect" => connect = Some(args.next().ok_or("--connect needs HOST:PORT")?),
             "--headless" => headless = true,
+            "--user" => user = Some(args.next().ok_or("--user needs a name")?),
             "-h" | "--help" => return Err(USAGE.into()),
             _ => pos.push(a),
         }
@@ -59,6 +64,12 @@ fn real_main() -> Result<(), String> {
         Some(addr) => Box::new(Remote::connect(addr)?),
         None => Box::new(Headless::new(Session::virtual_lab())),
     };
+    if cmd == "shell" {
+        let user = user
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "admin".into());
+        return shell::run(backend.as_mut(), &user);
+    }
     let result = match cmd.as_str() {
         "list" => {
             let prefix = pos.next().unwrap_or_default();

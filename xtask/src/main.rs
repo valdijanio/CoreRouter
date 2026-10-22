@@ -15,6 +15,7 @@ const WASM_PACKAGES: &[&str] = &[
     "corerouter-proto-lldp",
     "corerouter-proto-mndp",
     "corerouter-engine",
+    "corerouter-shell",
     "corerouter-ui",
     "corerouter-gui",
 ];

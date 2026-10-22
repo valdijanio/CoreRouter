@@ -336,6 +336,24 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com 0 e loga `shutting down: sent CRDP goodbye on 1 interface(s)`; `Agent::shutdown` com lab e
   `Listener`; `Shutdown` fecha as duas portas. Esforço do agente ~1,5 h (**estimado**).
 
+- 2026-10-22 — G0.8: terminal com a sintaxe da CLI do RouterOS, **gerado do registro** (crate novo
+  `corerouter-shell`, L4, puro e wasm). Menu = prefixo do id, `list`/`get`→`print`, chaves em
+  kebab-case, tipos lidos do doc `params` (bool `yes/no`, número, lista `a,b`, enum para o Tab);
+  nenhuma tabela por comando (teste percorre `cmd::all()`). Contexto (`/ip address`, `..`, `/`,
+  `/ip/address`), abreviação com "did you mean", `?`/F1, Tab (menus, comandos, parâmetros, valores
+  de enum, interfaces, ids), `print` com legenda de flags, `;;;`, `where` (and/or, `!`, `=`, `!=`,
+  `~`, `<`, `>`), `detail`, `as-json`, `count-only`, `proplist`, itens por número da última
+  `print` (vários → batch atômico) ou `*id`. `/export` determinístico em ordem de dependências,
+  segredos nunca em claro; `/import file=` e colar = um `engine.batch` atômico (ida e volta
+  testada). Ctrl+X Safe Mode, `<SAFE>` no prompt, `/quit` mantém e Ctrl+D desfaz (conferido na doc
+  da MikroTik). Front ends: janela "New Terminal" na GUI (várias, histórico, Tab clicável, cópia,
+  tema, maximizar) e `corerouter-cli shell` (`rustyline`, histórico persistente sem segredos,
+  modo não interativo por pipe). Engine ganhou `system.identity.get`. Tudo por `engine.*` e
+  `state.inspect`: permissões, Safe Mode e journal valem igual. SSH (`--ssh`, `russh`) fica para um
+  segundo PR, depois do G0.3. Testes: 16 unitários + 14 de integração no shell (2 proptest), 3
+  headless na UI; manual: daemon de lab + CLI `--connect` + GUI `--connect` com screenshot.
+  Esforço do agente ~6 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -357,3 +375,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G5.4.
 - 2026-10-22 — log do G1.17.
 - 2026-10-22 — log do G5.5.
+- 2026-10-22 — log do G0.8.
