@@ -856,3 +856,64 @@ continuação indentadas).
   quebra, em vez de N no um por um) e o fold dos `docs/changes/` é periódico (`--fold` ou 10
   pendentes), não um PR extra por lote; `cargo xtask docs pending` mostra os status de gap ainda
   não consolidados, e as sessões o leem junto com o `gaps.md`.
+
+- 2026-10-22 — G0.5c: MCP: lotes JSON-RPC recusados. A revisão 2025-06-18 do MCP (a única que o servidor negocia)
+  removeu o batching; até aqui o servidor aceitava arrays de até 64 mensagens. Agora um array na
+  linha, vazio ou não, recebe **um** objeto de erro `-32600` com `id: null` (JSON-RPC 2.0 §6: lote
+  não aceito → uma Response só, não um array) e uma mensagem que diz para mandar uma mensagem por
+  linha; nenhum item do array é executado, então um lote nunca aplica pela metade. O
+  `MAX_BATCH` saiu; o oráculo de fuzz (`corerouter_mcp::fuzz`) passa a exigir que toda resposta
+  seja um objeto, e o proptest `sessions_never_break` continua mandando arrays. `docs/mcp.md`
+  explica o comportamento e aponta a tool `command_batch` (atômica) para várias mudanças.
+  Testar: `cargo test -p corerouter-mcp` (`batch_items_never_run_and_the_server_keeps_serving`
+  confere que um `ip.address.add` dentro de um lote não roda e que o servidor segue atendendo;
+  `every_batch_is_refused_with_one_object` cobre arrays de 0 a 79 itens).
+
+- 2026-10-22 — G0.8: `/export` com a matriz de zonas vazia não escreve nada (saía "# set: from is not exported"):
+  uma configuração cuja lista de itens está vazia não tem linha a exportar. Visto pelo usuário
+  no roteador real; o #64 só cobria a matriz com células.
+
+- 2026-10-22 — G1.8d: Bonding: mudar parâmetros sem recriar o bond. O planejador (`hal-linux/src/plan.rs`) ganhou `bond_in_place` e a op `SetBond`: `mii_interval`, `min_links`, `transmit_hash_policy` e `primary` vão para o bond existente num `RTM_NEWLINK` sem `NLM_F_CREATE` só com os `IFLA_BOND_*` que mudam (o `bond_changelink` do kernel; o `RTM_SETLINK` ignora o `IFLA_LINKINFO`). Nada de soltar slaves, apagar o link nem reinstalar endereços e rotas; o undo de um apply que falhou devolve os valores antigos. `primary` vazio vai como ifindex 0, que o kernel entende como "sem primary". Só o que o modo usa conta (hash fora de 802.3ad/balance-xor/balance-tlb, `primary` fora de active-backup/tlb/alb e `lacp_rate` fora do 802.3ad não geram op). Ainda recriam, porque o kernel recusa no bond vivo (`drivers/net/bonding/bond_options.c`): o modo (`BOND_OPTFLAG_NOSLAVES | BOND_OPTFLAG_IFDOWN`, "the bond device has slaves") e o `lacp_rate` (`BOND_OPTFLAG_IFDOWN`, "the bond is up"), conferido no Linux 7.0 (**medido**). Como testar: `cargo test -p corerouter-hal-linux --lib plan` e `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_bond` (`live_settings_change_without_recreating_the_bond` prova que o ifindex não muda, que os slaves ficam e que o rollback desfaz).
+
+- 2026-10-22 — G4.4c: `/metrics` como serviço da config, no estilo de `/ip service` do RouterOS. Comandos novos
+  `ip.service.metrics.set {enabled?, address?, port?, available_from?}` e
+  `ip.service.metrics.get` (config + `status: stopped|listening|error`, `listening`,
+  `last_error`, `requests`, `refused`). Padrão: desligado, `127.0.0.1:9100` (a porta do
+  node_exporter e do VyOS). O daemon segue a config em execução numa thread (`metrics-service`):
+  um commit abre, muda de porta ou fecha o listener em até 1 s, sem reiniciar; porta ocupada vira
+  `status: error` com o motivo e é tentada de novo a cada segundo. Cliente fora de
+  `available_from` é desconectado sem resposta e contado em `refused` (como o `address` do
+  `/ip service`; IPv4 mapeado em `::ffff:` casa como IPv4). `set` avisa (`warning`) quando o
+  endpoint, que não tem login, fica aberto para a rede sem `available_from`. A opção `--metrics`
+  continua igual, como um listener fora da config. Config em `system.metrics` do modelo
+  (`corerouter_model::metrics`); estado de execução no `Session` por `ext_mut::<MetricsStatus>()`.
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979`, depois
+  `corerouter-cli --connect 127.0.0.1:7979 run ip.service.metrics.set '{"enabled":true}'`,
+  `curl -s 127.0.0.1:9100/metrics` e `run ip.service.metrics.get`. Testes: engine
+  (`cmd::metrics_service`: sucesso, validação, aviso, rollback, status) e daemon
+  (`service::metrics`: abre, move, recusa por `available_from`, fecha; porta ocupada → erro →
+  recupera). O id do comando é `ip.service.metrics.*` (e não `system.metrics.set`, como dizia o
+  critério): `system.metrics` já é a consulta dos contadores, e um menu `/system metrics` no
+  terminal a esconderia; `/ip service metrics set port=9273` segue o `/ip service` do RouterOS e
+  abre espaço para os outros serviços do daemon (`ip.service.<nome>`).
+
+- 2026-10-22 — G4.6e: GUI de NTP e log remoto, dois painéis novos em `crates/ui` (nenhuma edição em `lib.rs`/`windows.rs`;
+  o `build.rs` os achou e o menu System os lista em ordem alfabética):
+
+  - **System › NTP Client** (`ntp_client.rs`): formulário Enabled / Servers (um por linha) / Min Poll /
+    Max Poll com Apply e Revert; o formulário intocado acompanha o roteador, a edição não aplicada fica
+    (marcada com "•") e a recusa do engine aparece embaixo. Status lido de `system.ntp.client.get` a cada
+    atualização: Status colorido (synchronized/waiting/stopped), Synced Server (nome e endereço), Stratum,
+    System Offset, Round Trip, Last Sync (UTC) e Next Poll, e o último erro.
+  - **System › Logging** (`logging.rs`): abas Rules (Topics, Prefix, Action) e Actions (Name, Type,
+    Remote Address/Port, Src. Address, Facility, Severity, Comment), cada uma uma tabela G1.9 (barra,
+    menus, atalhos, busca); diálogos New/Properties para regra e ação. Na regra, os tópicos válidos são
+    botões (clique inclui, botão direito exclui com `!`) e Action é uma lista das ações existentes; o
+    engine continua sendo quem valida (tópico inexistente e remover ação em uso voltam como erro no
+    diálogo).
+
+  Testar: `cargo test -p corerouter-ui -- ntp logging` (6 testes headless: status ao vivo vindo do daemon,
+  Apply/erro/Revert do NTP, editar/desabilitar/criar regra com tópico inválido, editar ação, remoção
+  recusada de ação em uso, nova ação; as listas de tópicos e facilities da UI conferidas contra o
+  `corerouter-model`). Na GUI: `cargo run -p corerouter-gui -- --control 7979`, menu System › NTP Client
+  e System › Logging.

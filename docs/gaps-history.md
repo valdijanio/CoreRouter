@@ -51,3 +51,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-22 — G1.8 feito (bonding 802.3ad/active-backup e demais modos); G1.8b, G1.8c e G1.8d abertos
 - 2026-10-22 — G4.6 parte 1 feita (cliente SNTP e syslog remoto); criados G4.6b (acertar o relógio), G4.6c (servidor NTP), G4.6d (log do sistema e mais alvos), G4.6e (janelas da GUI)
 - 2026-10-22 — G0.5 feito (fuzzing do arquivo de config, do canal de controle e do MCP); G0.5b criado (fuzz dos codecs e rodada periódica)
+- 2026-10-22 — G0.5c feito (MCP recusa lotes JSON-RPC, revisão 2025-06-18)
+- 2026-10-22 — G1.8d feito (parâmetros do bond sem recriar); G1.8e criado (`lacp_rate` sem recriar)
+- 2026-10-22 — G4.4c em partes (serviço `/metrics` configurável); criados G4.4d (vrf, token/TLS) e G4.4e (métricas de protocolos e escala do scrape)
+- 2026-10-22 — G4.6e feito (GUI de NTP Client e Logging)
