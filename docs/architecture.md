@@ -504,6 +504,41 @@ servidor exigir HTTP/2 ou se o pipelining (várias consultas na mesma conexão) 
 
 Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
 
+### Supervisor de serviços do daemon (G0.10)
+
+Os serviços do daemon (`apps/corerouter-daemon/src/service/<nome>.rs`: `dns-resolver`,
+`dns-server`, `ntp-client`, `remote-logging`, `metrics`) rodam sob um supervisor
+(`service/supervisor.rs`), para que uma thread que morre ou um bind que falha não vire queda
+silenciosa.
+
+- **Interface.** `Service { name, flags, topic, enable, depends, start }`. O `start(&Ctx)` roda
+  uma vez no boot, lê as flags (erro = o daemon não sobe, como antes) e devolve o corpo
+  `Run = Fn(&Health) -> Result<(), String>`, que o supervisor roda numa thread própria e de novo
+  a cada falha. O laço do corpo usa `while health.sleep(TICK) { health.beat(); … }` e informa
+  `listen`, `event`/`error` e `disabled(motivo)`; `health.spawn` conta as threads auxiliares e
+  contém o panic delas. O guia completo está no topo de `service/mod.rs`.
+- **Política.** Reinicia sempre (systemd `Restart=always`, Erlang `permanent`): o corpo que
+  termina sem ser pedido, devolve `Err` ou dá panic (`catch_unwind`; o perfil de release é
+  `panic = "unwind"`) volta depois de 1 s, 2 s, 4 s… até 60 s (systemd 254 `RestartSteps` /
+  `RestartMaxDelaySec`); uma execução de 60 s zera a espera. Com 5 falhas em 60 s desiste e fica
+  `failed` (`StartLimitBurst`/`StartLimitIntervalSec`, intensidade/período do OTP), com linha
+  `critical` no log do roteador (o syslog remoto a encaminha). `start` e `reset-failures`
+  tentam de novo.
+- **Estados.** `disabled` (roda ocioso porque a config o desliga, com o motivo), `starting`
+  (sem heartbeat ainda, ou esperando uma dependência), `running`, `restarting` (com os segundos
+  que faltam), `stopped` (pelo admin, até o próximo boot; a config não muda) e `failed`.
+- **Engine.** O engine não tem threads e não depende do daemon: o supervisor publica as linhas
+  em `ServiceTable` (`s.ext_mut`, `corerouter_model::service`) a cada 200 ms e retira os pedidos
+  que `system.service.start|stop|restart|reset-failures` enfileiram (no máximo 64). Um lock
+  curto por volta e nenhum outro lock enquanto isso. Sem daemon (lab, WASM) a tabela fica vazia
+  e as ações explicam por quê.
+- **`control`.** A linha do canal de controle é `protected`: `stop` e `restart` são recusados
+  com o motivo (cortariam a própria sessão de gestão).
+- **Uma thread não se mata.** `stop` pede (`Health::stopping`) e o corpo devolve; um heartbeat
+  com mais de 30 s aparece como motivo ("no heartbeat for N s"), sem reinício forçado.
+- **Métricas.** `system.metrics` traz `services`, e o exportador gera `corerouter_service_up` e
+  `corerouter_service_restarts_total` por `name`.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

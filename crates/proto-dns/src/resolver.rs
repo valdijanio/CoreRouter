@@ -17,11 +17,16 @@
 //! a static FWD entry ([`Upstreams`]). Its host name is resolved by the
 //! static entries or the plain servers (RouterOS), never by itself.
 //!
+//! RFC 9520: a name and type that no server could answer is not asked
+//! again for a while (5 s, doubling up to 5 min while it keeps failing);
+//! the lookups in between fail at once (or get the stale answer), so a
+//! dead domain asked by every client does not keep every server busy.
+//!
 //! No sockets here: the caller brings a [`Transport`] (UDP/TCP in the
 //! daemon, a fake in tests). The lock is held only around the cache, never
 //! across the network, so one slow lookup does not stall the others.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, MutexGuard};
 
@@ -256,7 +261,27 @@ struct State {
     /// The last server that answered (RouterOS keeps using it).
     preferred: Option<IpAddr>,
     stats: BTreeMap<IpAddr, ServerStats>,
+    /// RFC 9520 §3.2: recent failures, by name and type.
+    failures: HashMap<(String, RecordType), Failure>,
 }
+
+/// A name and type no server could answer (RFC 9520 §2).
+#[derive(Debug, Clone)]
+struct Failure {
+    /// Not asked again before this.
+    until_ms: u64,
+    /// The hold this time; doubled on the next failure.
+    hold_ms: u64,
+    why: String,
+}
+
+/// RFC 9520 §3.2: the first hold (the RFC's example starts at 5 s; at
+/// least 1 s, MUST)…
+pub const FAILURE_HOLD_MS: u64 = 5_000;
+/// …doubling up to this (MUST NOT exceed 5 minutes).
+pub const FAILURE_MAX_HOLD_MS: u64 = 300_000;
+/// Failures remembered at most (§3.2: the cache SHOULD be bounded).
+pub const MAX_FAILURES: usize = 4096;
 
 /// Resolver shared by every thread of the router (tools, NTP, the LAN
 /// forwarder).
@@ -275,6 +300,7 @@ impl Resolver {
                 cache,
                 preferred: None,
                 stats: BTreeMap::new(),
+                failures: HashMap::new(),
             }),
         }
     }
@@ -315,7 +341,18 @@ impl Resolver {
     }
 
     pub fn flush(&self) {
-        self.state().cache.flush();
+        let mut st = self.state();
+        st.cache.flush();
+        st.failures.clear();
+    }
+
+    /// Names and types held after a failure now (RFC 9520).
+    pub fn failures(&self, now_ms: u64) -> usize {
+        self.state()
+            .failures
+            .values()
+            .filter(|f| f.until_ms > now_ms)
+            .count()
     }
 
     /// What the resolver measured of each server it asked.
@@ -380,6 +417,30 @@ impl Resolver {
                 });
             }
             let now = t.now_ms();
+            // RFC 9520 §3.2: no query while a failure is held; the stale
+            // answer (RFC 8767) still serves.
+            let failed_key = (qn.key.clone(), rtype);
+            if let Some(f) = st
+                .failures
+                .get(&failed_key)
+                .filter(|f| f.until_ms > now)
+                .cloned()
+            {
+                if let Some(hit) = st.cache.get_stale(&qn.key, rtype, now) {
+                    return Ok(Resolved {
+                        answer: hit.answer,
+                        source: Source::Stale,
+                    });
+                }
+                return Err(ResolveError::Failed {
+                    name: qn.key.clone(),
+                    why: format!(
+                        "{} (failed recently; asked again in {} s, RFC 9520)",
+                        f.why,
+                        f.until_ms.saturating_sub(now).div_ceil(1000)
+                    ),
+                });
+            }
             let (plain, secure) = match via {
                 Some(u) => (sorted(&st, &u.servers, now), u.secure.clone()),
                 None if !st.settings.secure.is_empty() => (Vec::new(), st.settings.secure.clone()),
@@ -427,6 +488,33 @@ impl Resolver {
             let keep = st.settings.servers.clone();
             st.stats
                 .retain(|ip, _| keep.contains(ip) || asked.contains(ip));
+        }
+        let key = (qn.key.clone(), rtype);
+        match &fetched.result {
+            Ok(_) => {
+                st.failures.remove(&key);
+            }
+            Err(ResolveError::Failed { why, .. }) => {
+                let hold = st
+                    .failures
+                    .get(&key)
+                    .map_or(FAILURE_HOLD_MS, |f| f.hold_ms.saturating_mul(2))
+                    .clamp(FAILURE_HOLD_MS, FAILURE_MAX_HOLD_MS);
+                if st.failures.len() >= MAX_FAILURES {
+                    st.failures.retain(|_, f| f.until_ms > now);
+                }
+                if st.failures.len() < MAX_FAILURES || st.failures.contains_key(&key) {
+                    st.failures.insert(
+                        key,
+                        Failure {
+                            until_ms: now.saturating_add(hold),
+                            hold_ms: hold,
+                            why: why.chars().take(200).collect(),
+                        },
+                    );
+                }
+            }
+            Err(_) => {}
         }
         match fetched.result {
             Ok((answer, server, wire)) => {
@@ -1290,5 +1378,49 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("router daemon"), "{err}");
+    }
+
+    #[test]
+    fn failures_are_held_rfc9520() {
+        let r = resolver(&["192.0.2.1"]);
+        let mut t = Fake::new(&[("192.0.2.1", Behave::ServFail)]);
+        let qn = parse_name("dead.example").unwrap();
+        assert!(r.resolve(&mut t, &qn, RecordType::A, None).is_err());
+        assert_eq!(t.log.len(), 1);
+        // Held: no query, the error says why and for how long.
+        let err = r
+            .resolve(&mut t, &qn, RecordType::A, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RFC 9520"), "{err}");
+        assert_eq!(t.log.len(), 1, "not asked while held");
+        assert_eq!(r.failures(t.now), 1);
+        // Another type is its own key.
+        assert!(r.resolve(&mut t, &qn, RecordType::AAAA, None).is_err());
+        assert_eq!(t.log.len(), 2);
+        // After 5 s it is asked again; failing again doubles the hold.
+        t.now += FAILURE_HOLD_MS;
+        assert!(r.resolve(&mut t, &qn, RecordType::A, None).is_err());
+        assert_eq!(t.log.len(), 3);
+        t.now += FAILURE_HOLD_MS;
+        assert!(r.resolve(&mut t, &qn, RecordType::A, None).is_err());
+        assert_eq!(t.log.len(), 3, "second hold is 10 s");
+        // The server comes back: after the hold it answers, and the
+        // failure is forgotten.
+        t.servers
+            .insert(ip("192.0.2.1"), Behave::Answer([198, 51, 100, 1]));
+        t.now += 2 * FAILURE_HOLD_MS;
+        assert!(r.resolve(&mut t, &qn, RecordType::A, None).is_ok());
+        // Flush forgets holds too.
+        t.servers.insert(ip("192.0.2.1"), Behave::ServFail);
+        let other = parse_name("other.example").unwrap();
+        assert!(r.resolve(&mut t, &other, RecordType::A, None).is_err());
+        r.flush();
+        assert_eq!(r.failures(t.now), 0);
+        // NXDOMAIN is an answer, not a failure (RFC 9520 §2).
+        t.servers.insert(ip("192.0.2.1"), Behave::NxDomain);
+        let gone = parse_name("gone.example").unwrap();
+        assert!(r.resolve(&mut t, &gone, RecordType::A, None).is_ok());
+        assert_eq!(r.failures(t.now), 0);
     }
 }

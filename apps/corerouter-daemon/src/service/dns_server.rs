@@ -39,6 +39,7 @@ use corerouter_model::Config;
 use corerouter_proto_dns::server::{Done, Effect, Forwarder, MAX_QUERY, Pending, Start, Statistics};
 use corerouter_proto_dns::zone;
 use super::dns::RouterDns;
+use corerouter_model::service::Listen;
 use sock::{Udp, bind_tcp};
 
 /// RFC 1035 §4.2.1.
@@ -293,8 +294,14 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
     }
 }
 
-/// The sockets of one epoch.
-fn open(srv: &Arc<Server>, port: u16, epoch: u64) -> Result<(), String> {
+/// The sockets of one epoch, their threads counted in `health`; where
+/// they listen.
+fn open(
+    srv: &Arc<Server>,
+    port: u16,
+    epoch: u64,
+    health: &super::Health,
+) -> Result<Vec<SocketAddr>, String> {
     let mut opened = Vec::new();
     for ip in [IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
         let addr = SocketAddr::new(ip, port);
@@ -308,21 +315,20 @@ fn open(srv: &Arc<Server>, port: u16, epoch: u64) -> Result<(), String> {
             Err(e) => return Err(format!("UDP {addr}: {e}")),
         };
         let tcp = bind_tcp(addr).map_err(|e| format!("TCP {addr}: {e}"))?;
-        opened.push((udp, tcp));
+        opened.push((udp, tcp, addr));
     }
-    for (udp, tcp) in opened {
+    let at = opened.iter().map(|(_, _, a)| *a).collect();
+    for (udp, tcp, _) in opened {
         let s = srv.clone();
-        thread::Builder::new()
-            .name("dns-udp".into())
-            .spawn(move || udp_loop(s, udp, epoch))
+        health
+            .spawn("dns-udp", move || udp_loop(s, udp, epoch))
             .map_err(|e| e.to_string())?;
         let s = srv.clone();
-        thread::Builder::new()
-            .name("dns-tcp-accept".into())
-            .spawn(move || tcp_loop(s, tcp, epoch))
+        health
+            .spawn("dns-tcp-accept", move || tcp_loop(s, tcp, epoch))
             .map_err(|e| e.to_string())?;
     }
-    Ok(())
+    Ok(at)
 }
 
 fn apply_effects(session: &Shared, rx: &Receiver<Effect>) {
@@ -341,11 +347,30 @@ fn apply_effects(session: &Shared, rx: &Receiver<Effect>) {
     }
 }
 
-/// Starts the forwarder on `port`: it follows the config from then on.
+/// Starts the forwarder on `port`, outside the supervisor (tests): it
+/// follows the config from then on.
+#[cfg(test)]
 pub(crate) fn spawn(
     session: Shared,
     dns: Arc<RouterDns>,
     port: u16,
+    shutdown: Shutdown,
+) -> std::io::Result<Arc<Server>> {
+    let srv = prepare(&session, dns, shutdown.clone())?;
+    let keep = srv.clone();
+    let health = super::Health::new(shutdown);
+    thread::Builder::new()
+        .name("dns-server".into())
+        .spawn(move || follow(&session, &keep, port, &health))?;
+    Ok(srv)
+}
+
+/// The forwarder and its effects thread, registered in the session. One
+/// for the daemon's life: a restart of the service keeps its lists and
+/// counters (only the sockets and the follow loop are per run).
+fn prepare(
+    session: &Shared,
+    dns: Arc<RouterDns>,
     shutdown: Shutdown,
 ) -> std::io::Result<Arc<Server>> {
     let (tx, rx) = channel();
@@ -365,27 +390,24 @@ pub(crate) fn spawn(
             .spawn(move || apply_effects(&session, &rx))?;
     }
     // `ip.dns.statistics.print` reads what the chain counts.
-    lock(&session).set_dns_statistics(srv.fwd.state::<Statistics>());
-    let keep = srv.clone();
-    thread::Builder::new()
-        .name("dns-server".into())
-        .spawn(move || follow(&session, &keep, port))?;
+    lock(session).set_dns_statistics(srv.fwd.state::<Statistics>());
     Ok(srv)
 }
 
 /// Copies the config in when it changes, or when what `allowed_from`
 /// stands for does (a DHCP lease, a delegated prefix); opens and closes the
 /// sockets.
-fn follow(session: &Shared, srv: &Arc<Server>, port: u16) {
+fn follow(session: &Shared, srv: &Arc<Server>, port: u16, health: &super::Health) {
     let mut last: Option<Config> = None;
     let mut last_allowed = Vec::new();
     let mut listening = false;
     let mut retry_at = 0u64;
     loop {
-        if srv.shutdown.is_closed() {
+        if health.stopping() {
             srv.epoch.fetch_add(1, Ordering::AcqRel);
             return;
         }
+        health.beat();
         let (changed, allowed) = {
             let s = lock(session);
             let running = s.store().running();
@@ -409,8 +431,11 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16) {
         let now = srv.dns.now_ms();
         if want && !listening && now >= retry_at {
             let epoch = srv.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-            match open(srv, port, epoch) {
-                Ok(()) => {
+            match open(srv, port, epoch, health) {
+                Ok(at) => {
+                    health.listen(at.iter().flat_map(|a| [Listen::new("udp", *a), Listen::new("tcp", *a)]).collect());
+                    health.clear_error();
+                    health.event(format!("answering the LAN on port {port}"));
                     listening = true;
                     log::info!("DNS: answering the LAN on port {port} (UDP, TCP)");
                 }
@@ -419,47 +444,57 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16) {
                     srv.epoch.fetch_add(1, Ordering::AcqRel);
                     retry_at = now + 10_000;
                     log::error!("DNS: cannot answer the LAN: {e}; retrying in 10 s");
+                    health.error(format!("cannot answer the LAN: {e}; retrying in 10 s"));
                 }
             }
         } else if !want && listening {
             srv.epoch.fetch_add(1, Ordering::AcqRel);
             listening = false;
+            health.listen(Vec::new());
             log::info!("DNS: no longer answering the LAN (allow_remote_requests off)");
         }
-        thread::sleep(TICK);
+        health.disabled((!want).then_some("ip.dns allow_remote_requests=no"));
+        health.sleep(TICK);
     }
 }
 
 pub(crate) const SERVICE: super::Service = super::Service {
-    name: "dns server",
+    name: "dns-server",
     flags: &[super::Flag {
         name: "--dns-port",
         value: Some("<port>"),
         help: "port of the LAN DNS forwarder (default 53; on with\nip.dns.set allow_remote_requests=yes)",
     }],
+    topic: "dns",
+    enable: "ip.dns.set allow_remote_requests=yes",
+    depends: &["dns-resolver"],
     start,
 };
 
-/// Without the resolver (its thread failed) there is nothing to forward to:
-/// logged, not fatal.
-fn start(ctx: &super::Ctx) -> Result<(), String> {
+/// A bad `--dns-port` stops the daemon; the rest runs supervised, on the
+/// resolver's cache (it depends on `dns-resolver`).
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let port = match ctx.flag("--dns-port") {
         None => DEFAULT_PORT,
         Some(p) => p
             .parse()
             .map_err(|_| format!("--dns-port: '{p}' is not a port"))?,
     };
-    let Some(dns) = super::dns::router() else {
-        log::error!("DNS server is off: the resolver did not start");
-        return Ok(());
-    };
-    match spawn(ctx.session.clone(), dns, port, ctx.shutdown.clone()) {
-        Ok(srv) => {
-            let _ = SERVER.set(srv);
-        }
-        Err(e) => log::error!("DNS server is off: cannot start its threads: {e}"),
-    }
-    Ok(())
+    let session = ctx.session.clone();
+    let shutdown = ctx.shutdown.clone();
+    Ok(Box::new(move |health: &super::Health| {
+        let srv = match SERVER.get() {
+            Some(srv) => srv.clone(),
+            None => {
+                let dns = super::dns::router().ok_or("the DNS resolver is not running")?;
+                let srv = prepare(&session, dns, shutdown.clone())
+                    .map_err(|e| format!("cannot start its threads: {e}"))?;
+                SERVER.get_or_init(|| srv).clone()
+            }
+        };
+        follow(&session, &srv, port, health);
+        Ok(())
+    }))
 }
 
 /// The forwarder, once started (the adlist loader fills its lists; the
@@ -475,7 +510,6 @@ pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
 pub(crate) fn server() -> Option<Arc<Server>> {
     SERVER.get().cloned()
 }
-
 
 /// Linux: the destination address of each query (IP_PKTINFO /
 /// IPV6_RECVPKTINFO), through `nix`.

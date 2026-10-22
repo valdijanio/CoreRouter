@@ -51,6 +51,18 @@ pub(crate) const BLUE: Hue = Hue {
     dark: (140, 190, 245),
 };
 
+/// Healthy: a state that is as it should be ("running"; G0.10).
+pub(crate) const GREEN: Hue = Hue {
+    light: (25, 125, 60),
+    dark: (125, 215, 145),
+};
+
+/// Broken: a state that needs the operator ("failed"; G0.10).
+pub(crate) const RED: Hue = Hue {
+    light: (180, 40, 40),
+    dark: (245, 140, 135),
+};
+
 /// The palette of keyed chips: eight hues far enough apart that two
 /// neighbours (operators side by side on a path, VLANs in a list) never look
 /// alike, each legible on both themes.

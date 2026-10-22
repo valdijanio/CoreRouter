@@ -100,9 +100,9 @@ essas consultas em threads próprias. Nomes e textos vindos da rede saem só com
 (sem sequências de escape de terminal).
 
 **Limites.** O roteador pergunta A, AAAA, PTR e TXT (o cache, desde a G4.1b, guarda qualquer tipo). `ip.dns.resolve` (o
-`:resolve` do RouterOS) não existe ainda: um comando que espera a rede sob o lock do `Session`
-travaria o plano de controle, então ele vai virar tarefa (G4.1d). Sem DoH/DoT, VRF nem servidores
-dinâmicos do PPPoE e do DHCPv6 (G4.1d). Não há janela na GUI ainda (G4.1d).
+`:resolve` do RouterOS) é uma tarefa, porque um comando que espera a rede sob o lock do `Session`
+travaria o plano de controle (G4.1d-3); DoH/DoT, adlist e forwarders também vieram na G4.1d. VRF
+e servidores dinâmicos do PPPoE e do DHCPv6: G4.1j.
 
 ## G4.1b — o encaminhador da LAN (parte 1, a base)
 
@@ -558,6 +558,63 @@ TLS não acrescenta tempo perceptível.
 voo numa mesma conexão (pipelining, RFC 7858 §3.3), `dns_servers` de grupo por nome, e a coluna de
 protocolo na tabela `upstream` do `ip.dns.get` (hoje o servidor cifrado aparece pelo endereço).
 
+### `:resolve` e cache de falhas (G4.1d-3)
+
+**Problema.** O operador quer perguntar um nome ao roteador ("o que o roteador responde para
+x?") sem sair para outra máquina; e um nome que nenhum servidor consegue resolver (domínio
+quebrado, servidor fora) não pode ser perguntado de novo a cada consulta de cada cliente.
+
+**Agora.**
+
+```sh
+corerouter-cli --connect 127.0.0.1:7979 watch ip.dns.resolve '{"name":"example.com"}'
+corerouter-cli --connect 127.0.0.1:7979 watch ip.dns.resolve '{"name":"1.1.1.1"}'                      # PTR
+corerouter-cli --connect 127.0.0.1:7979 watch ip.dns.resolve '{"name":"example.com","type":"MX","server":"9.9.9.9"}'
+```
+
+No terminal: `/ip dns resolve example.com` ou `/ip dns resolve name=… type=MX` (sem atalho
+global `resolve`: ele disputaria o Tab com `remove` em todo menu). Na GUI:
+IP › DNS Resolve, ou **Resolve…** na janela DNS Cache: nome, tipo, servidor opcional; uma linha por
+tipo com a resposta, de onde veio (`cache`, `stale`, o servidor), TTL e tempo.
+
+| Comando | Parâmetros |
+|---|---|
+| `ip.dns.resolve` | `name` (nome, ou endereço para o PTR), `type?` (A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT, CAA, HTTPS, SVCB; padrão A e AAAA, PTR para endereço), `server?` (só esse servidor, sem o cache) → `{id, task_id, types}`; eventos `{name, type, rcode, records, addresses, ttl, source, ms}` ou `{name, type, error}` |
+
+**Como funciona.**
+
+- É uma **tarefa** (`tool.task.poll`/`stop`), como ping e MTR: a espera pela rede acontece numa
+  thread do runner, nunca sob o lock do `Session`. Sem runner (o lab no navegador), o comando
+  fica desabilitado com o motivo. Sem daemon (o lab), A/AAAA vêm do resolvedor simulado
+  (`source: simulated`).
+- Sem `server`, a pergunta passa pelo resolvedor do roteador inteiro: cache, `use_doh_server` ou
+  os servidores, serve-stale. Com `server`, vai só a ele, por UDP (TCP no truncamento), sem ler
+  nem gravar o cache (o `:resolve server=` do RouterOS).
+- O texto vindo da rede sai só com ASCII imprimível (sem sequências de escape de terminal).
+- A ferramenta completa estilo `dig` (flags, seções, comparação, trace) é a G6.6; ela pode usar o
+  mesmo `DnsBackend::resolve_query`.
+
+**Cache de falhas (RFC 9520).** Quando nenhum servidor responde a um nome e tipo (SERVFAIL,
+REFUSED, silêncio, resposta malformada, `query_total_timeout`), o par fica retido: por **5 s** na
+primeira vez, dobrando a cada nova falha até **5 min** (§3.2: no mínimo 1 s, nunca mais de 5
+min, recuo exponencial). Enquanto retido, a consulta falha na hora (SERVFAIL para a LAN, erro com
+"asked again in N s, RFC 9520" para o roteador) ou recebe a resposta vencida do serve-stale
+(RFC 8767). A chave é nome + tipo (§3.2 deixa a escolha à implementação); NXDOMAIN e NODATA são
+respostas, não falhas (§2). Até 4096 pares; `ip.dns.cache.flush` esquece também as falhas. Os
+limites de reenvio por servidor do §3.1 já valem: cada servidor é perguntado uma vez por consulta
+(mais uma por TCP no truncamento).
+
+**Testes.** `proto-dns`: a retenção (não pergunta durante, outro tipo é outra chave, 5 s → 10 s,
+volta quando o servidor volta, flush esquece, NXDOMAIN não conta). Engine: `ip.dns.resolve` como
+tarefa (desabilitado sem runner, eventos por tipo, erro de um tipo não derruba o outro, PTR para
+endereço, `server` repassado, recusas de parâmetros, lab simulado). Daemon: registros, fonte
+(servidor, depois `cache`) e `server` direto passando pelo cache. UI: **Resolve…** no DNS Cache
+abre a janela, a tarefa roda e a resposta aparece.
+
+**Fica para depois** (G4.1j): `vrf` em `/ip dns` (os servidores numa tabela de rotas), servidores
+dinâmicos do PPPoE (`use-peer-dns`, quando houver cliente PPPoE) e do DHCPv6 / RA RDNSS em
+`dynamic_servers`.
+
 ### Pesquisa da G4.1d
 
 Fontes:
@@ -600,6 +657,10 @@ do servidor DoH, sem volta ao DNS comum. HTTP/2 no DoH só na 7.23 (ARM64/x86). 
   (ou o IP da linha de hosts), TTL de bloqueio 10 s, listas a cada 24 h, até 256 MB por lista.
 - **Unbound/OPNsense:** DNSBL de domínios, com campo separado para curingas; DoT por forwarder
   com nome do certificado (`ip@853#nome`), padding de 128 bytes ligado.
+
+**O que adotamos (parte 3).** O `:resolve` do RouterOS (nome, tipo, `server`) como tarefa, que
+não trava o plano de controle; da RFC 9520, o cache de falhas com 5 s iniciais, recuo
+exponencial e teto de 5 min (o exemplo da própria RFC), por nome e tipo.
 
 **O que adotamos (parte 2).** `/ip dns forwarders` com os nomes do RouterOS (`dns-servers`,
 `doh-servers`, `verify-doh-cert` sim no grupo), a estática `FWD forward-to=<grupo>`,
@@ -761,10 +822,10 @@ NSEC3 e RRSIG.
 
 - As zonas são servidas pelo mesmo servidor da LAN: só com `allow_remote_requests`, e as
   consultas só para quem está em `allowed_from`. Transferência e NOTIFY têm ACL própria. Modo só
-  autoritativo para a internet, `allow_query` por zona e RRL: G4.1j.
+  autoritativo para a internet, `allow_query` por zona e RRL: G4.1k.
 - A cópia da secundária e o diário do IXFR ficam em memória: depois de um reinício, a secundária
   transfere de novo, e o primário responde IXFR com a zona inteira. NOTIFY só para `notify`
-  (como o `notify explicit` do BIND), não para os NS da zona. Mais tipos de registro: G4.1k.
+  (como o `notify explicit` do BIND), não para os NS da zona. Mais tipos de registro: G4.1l.
 - Sem TSIG (G4.1c-3) e sem DNSSEC (G4.1c-2). Os benchmarks contra Unbound e Knot com sockets são
   a G4.1g.
 
@@ -859,7 +920,7 @@ SRV e TXT. Não tem SOA, PTR, CAA, zona, AXFR, IXFR nem NOTIFY.
 **Fica de fora, e por quê.**
 
 - XoT (RFC 9103): exige TLS no servidor DNS.
-- Views (split-horizon): G4.1j se for preciso.
+- Views (split-horizon): G4.1k se for preciso.
 - `$GENERATE` do BIND.
 - Catalog zones (RFC 9432).
-- Mais tipos de registro: G4.1k.
+- Mais tipos de registro: G4.1l.

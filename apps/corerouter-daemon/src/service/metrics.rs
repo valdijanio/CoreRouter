@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::metrics::{MetricsService, MetricsState, MetricsStatus};
+use corerouter_model::service::Listen;
 use serde_json::{Value, json};
 
 /// The exposition format's media type (prometheus.io, "Exposition formats").
@@ -172,6 +173,34 @@ pub fn render(m: &Value, scrape_seconds: f64) -> String {
     for (result, key) in [("ok", "commits_ok"), ("error", "commits_failed")] {
         if let Some(v) = n(key) {
             let _ = writeln!(out, "corerouter_commits_total{{result=\"{result}\"}} {v}");
+        }
+    }
+    // G0.10: the supervisor's view; a family with no sample is left out.
+    let services = m
+        .get("services")
+        .and_then(Value::as_array)
+        .map_or(&[][..], Vec::as_slice);
+    if !services.is_empty() {
+        family(
+            &mut out,
+            "corerouter_service_up",
+            "gauge",
+            "1 while the daemon service runs (or idles, turned off by the config); 0 while it starts, restarts, is stopped or failed.",
+        );
+        for v in services {
+            let up = v.get("up").and_then(Value::as_bool).unwrap_or(false);
+            let _ = writeln!(out, "corerouter_service_up{{name=\"{}\"}} {}", name_of(v), u8::from(up));
+        }
+        family(
+            &mut out,
+            "corerouter_service_restarts_total",
+            "counter",
+            "Restarts of the daemon service after a failure (exit, error or panic) since the daemon started.",
+        );
+        for v in services {
+            if let Some(n) = v.get("restarts").and_then(Value::as_u64) {
+                let _ = writeln!(out, "corerouter_service_restarts_total{{name=\"{}\"}} {n}", name_of(v));
+            }
         }
     }
     if let Some(v) = m.get("revision").and_then(Value::as_u64) {
@@ -391,6 +420,9 @@ pub(crate) const SERVICE: super::Service = super::Service {
         value: Some("<a:port>"),
         help: "Prometheus /metrics (interface and engine counters) over plain HTTP,\nno login: a bare port is 127.0.0.1:<port>; e.g. 9100 or [::]:9100\n(outside the config; ip.service.metrics.set is the configured one)",
     }],
+    topic: "system",
+    enable: "ip.service.metrics.set enabled=yes",
+    depends: &[],
     start,
 };
 
@@ -407,21 +439,28 @@ fn metrics_addr(v: &str) -> Result<SocketAddr, String> {
     })
 }
 
-/// Serve `/metrics` on `--metrics`, if asked for, and on what the config says.
-fn start(ctx: &super::Ctx) -> Result<(), String> {
-    if let Err(e) = spawn_service(ctx.session.clone(), ctx.shutdown.clone()) {
-        log::error!("metrics service is off: cannot start its thread: {e}");
-    }
-    let Some(v) = ctx.flag("--metrics") else {
-        return Ok(());
+/// Serve `/metrics` on `--metrics`, if asked for (a bad flag or a busy
+/// port stops the daemon, at boot), and on what the config says (the
+/// supervised body).
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let flag = match ctx.flag("--metrics") {
+        None => None,
+        Some(v) => {
+            let addr = metrics_addr(v)?;
+            let listener = TcpListener::bind(addr)
+                .map_err(|e| format!("cannot open --metrics {addr}: {e}"))?;
+            let at = listener.local_addr().unwrap_or(addr);
+            spawn(listener, ctx.session.clone(), ctx.shutdown.clone())
+                .map_err(|e| format!("cannot start the metrics thread: {e}"))?;
+            log_open(addr, false);
+            Some(at)
+        }
     };
-    let addr = metrics_addr(v)?;
-    let listener =
-        TcpListener::bind(addr).map_err(|e| format!("cannot open --metrics {addr}: {e}"))?;
-    spawn(listener, ctx.session.clone(), ctx.shutdown.clone())
-        .map_err(|e| format!("cannot start the metrics thread: {e}"))?;
-    log_open(addr, false);
-    Ok(())
+    let session = ctx.session.clone();
+    Ok(Box::new(move |health: &super::Health| {
+        run_service(&session, health, flag);
+        Ok(())
+    }))
 }
 
 fn log_open(addr: SocketAddr, restricted: bool) {
@@ -447,21 +486,37 @@ const ACCEPT_POLL: Duration = Duration::from_millis(20);
 /// new one (a failed bind is retried every tick and reported once in the
 /// log and in `last_error`); a client outside `available_from` is
 /// disconnected without an answer, as RouterOS `/ip service` does.
+#[cfg(test)]
 pub fn spawn_service(
     session: Shared,
     shutdown: Shutdown,
 ) -> std::io::Result<thread::JoinHandle<()>> {
+    let health = super::Health::new(shutdown);
     thread::Builder::new()
         .name("metrics-service".into())
-        .spawn(move || run_service(&session, &shutdown))
+        .spawn(move || run_service(&session, &health, None))
 }
 
-fn run_service(session: &Shared, shutdown: &Shutdown) {
+/// `flag`: where `--metrics` listens (its own thread), for the row.
+fn run_service(session: &Shared, health: &super::Health, flag: Option<SocketAddr>) {
     let mut cfg: Option<MetricsService> = None;
     let mut listener: Option<TcpListener> = None;
     let mut status = MetricsStatus::default();
-    while !shutdown.is_closed() {
+    while !health.stopping() {
+        health.beat();
+        let mut at: Vec<Listen> = flag.map(|a| Listen::new("http", a)).into_iter().collect();
+        if let Some(l) = &listener
+            && let Ok(a) = l.local_addr()
+        {
+            at.push(Listen::new("http", a));
+        }
+        health.listen(at);
+        match &status.last_error {
+            Some(e) => health.error(e),
+            None => health.clear_error(),
+        }
         let now = lock(session).store().running().system.metrics.clone();
+        health.disabled((!now.enabled && flag.is_none()).then_some("ip.service.metrics enabled=no"));
         let changed = cfg.as_ref() != Some(&now);
         if changed || (now.enabled && listener.is_none()) {
             if changed {
@@ -498,9 +553,13 @@ fn run_service(session: &Shared, shutdown: &Shutdown) {
                     publish(session, &status);
                 }
             }
-            None => thread::sleep(TICK),
+            None => {
+                health.sleep(TICK);
+            }
         }
     }
+    // Stopped: the listener closes with this run.
+    publish(session, &MetricsStatus::default());
 }
 
 fn open(addr: SocketAddr) -> std::io::Result<TcpListener> {
@@ -575,6 +634,10 @@ mod tests {
                  "tx_packets": null, "rx_errors": null, "tx_errors": null,
                  "rx_dropped": null, "tx_dropped": null, "link_downs": null},
             ],
+            "services": [
+                {"name": "dns-server", "state": "running", "up": true, "restarts": 0},
+                {"name": "ntp-client", "state": "failed", "up": false, "restarts": 5},
+            ],
         })
     }
 
@@ -594,6 +657,9 @@ mod tests {
             "corerouter_commits_total{result=\"ok\"} 4",
             "corerouter_config_revision 3",
             "corerouter_safe_mode 0",
+            "corerouter_service_up{name=\"dns-server\"} 1",
+            "corerouter_service_up{name=\"ntp-client\"} 0",
+            "corerouter_service_restarts_total{name=\"ntp-client\"} 5",
             "corerouter_scrape_duration_seconds 0.001200",
         ] {
             assert!(t.lines().any(|l| l == line), "no `{line}` in:\n{t}");

@@ -31,7 +31,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -640,10 +640,13 @@ impl Zones {
     }
 
     /// The service thread: a tick a second until the daemon closes.
-    pub(crate) fn run(self: &Arc<Self>) {
-        while !self.shutdown.is_closed() {
+    /// The service loop: a tick a second until stopped.
+    pub(crate) fn run(self: &Arc<Self>, health: &super::Health) {
+        while health.sleep(TICK) {
+            health.beat();
+            let none = self.fwd().config().config.ip.dns_zones.zones.is_empty();
+            health.disabled(none.then_some("no zone (ip.dns.zone.add)"));
             self.tick();
-            thread::sleep(TICK);
         }
     }
 }
@@ -665,33 +668,53 @@ impl ZoneBackend for Backend {
 }
 
 /// Starts the service on `srv` and registers it with the engine.
-pub(crate) fn spawn(session: &Shared, srv: Arc<Server>, port: u16, shutdown: Shutdown) -> std::io::Result<Arc<Zones>> {
+/// The service and its backend, registered with the engine.
+fn prepare(session: &Shared, srv: Arc<Server>, port: u16, shutdown: Shutdown) -> Arc<Zones> {
     let z = Zones::new(session.clone(), srv, port, shutdown);
     lock(session).set_zone_backend(Arc::new(Backend(z.clone())));
+    z
+}
+
+/// Starts the service outside the supervisor (tests).
+#[cfg(test)]
+pub(crate) fn spawn(session: &Shared, srv: Arc<Server>, port: u16, shutdown: Shutdown) -> std::io::Result<Arc<Zones>> {
+    let z = prepare(session, srv, port, shutdown.clone());
     let me = z.clone();
+    let health = super::Health::new(shutdown);
     thread::Builder::new()
         .name("dns-zones".into())
-        .spawn(move || me.run())?;
+        .spawn(move || me.run(&health))?;
     Ok(z)
 }
 
 pub(crate) const SERVICE: super::Service = super::Service {
-    name: "dns zones",
+    name: "dns-zones",
     flags: &[],
+    topic: "dns",
+    enable: "ip.dns.zone.add name=…",
+    depends: &["dns-server"],
     start,
 };
 
-/// Without the DNS server (its threads failed) there are no zones to serve:
-/// logged, not fatal.
-fn start(ctx: &super::Ctx) -> Result<(), String> {
-    let Some(srv) = super::dns_server::server() else {
-        log::error!("DNS zones are off: the DNS server did not start");
-        return Ok(());
-    };
-    if let Err(e) = spawn(&ctx.session, srv, DNS_PORT, ctx.shutdown.clone()) {
-        log::error!("DNS zones are off: cannot start their thread: {e}");
-    }
-    Ok(())
+/// One zone service for the daemon's life (a restart keeps the
+/// secondaries' copies and the journal, which live in the forwarder).
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    let shutdown = ctx.shutdown.clone();
+    let zones: Arc<OnceLock<Arc<Zones>>> = Arc::new(OnceLock::new());
+    Ok(Box::new(move |health: &super::Health| {
+        let z = match zones.get() {
+            Some(z) => z.clone(),
+            None => {
+                let srv = super::dns_server::server().ok_or("the DNS server is not running")?;
+                zones
+                    .get_or_init(|| prepare(&session, srv, DNS_PORT, shutdown.clone()))
+                    .clone()
+            }
+        };
+        z.run(health);
+        Ok(())
+    }))
 }
 
 #[cfg(test)]
