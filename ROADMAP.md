@@ -265,6 +265,7 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `6fbab48` (worktree temporária, `CARGO_TARGET_DIR` próprio) + GUI deste branch `--connect`
   `--control`, xdotool para o hover e `screenshot`: Safe Mode cinza com o tooltip de versão.
   Esforço do agente ~3 h (**estimado**).
+
 - 2026-10-22 — G5.4: no lab virtual a descoberta CRDP usa o loopback do host. Antes, um
   `corerouter-daemon` virtual anunciava pelas interfaces **reais** com o nome das portas do lab
   (`ether1` não existe no host) e, sem interfaces por padrão, não anunciava nada: a aba Neighbors
