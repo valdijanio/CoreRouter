@@ -850,3 +850,9 @@ continuação indentadas).
 
 - 2026-10-22 — processo: Push na `main` que só mexe em `docs/` (o fold de cada lote) também roda só `cargo xtask docs` no
   CI, comparando com o commit anterior; antes rodava o completo e enfileirava atrás do run do lote.
+
+- 2026-10-22 — processo: Fila de entrada como o padrão do mercado (pesquisa: merge queue do GitHub, Rust/bors rollups,
+  Trunk, towncrier, changesets): lote vermelho faz bisseção (~log2 N CIs para isolar quem
+  quebra, em vez de N no um por um) e o fold dos `docs/changes/` é periódico (`--fold` ou 10
+  pendentes), não um PR extra por lote; `cargo xtask docs pending` mostra os status de gap ainda
+  não consolidados, e as sessões o leem junto com o `gaps.md`.
