@@ -426,7 +426,9 @@ falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools
 daemon. São três partes sobre a mesma config (`/ip dns`) e o mesmo cache:
 
 - **G4.1a**, resolvedor do próprio roteador: mensagens com `hickory-proto`, sem runtime async.
-- **G4.1b**, encaminhador com cache para a LAN (`allow_remote_requests`, `/ip dns static`).
+- **G4.1b**, encaminhador com cache para a LAN (`allow_remote_requests`, `/ip dns static`),
+  em partes: base (cadeia de etapas, ACL, limite, estáticos, serve-stale), depois Statistics
+  (G4.1e), Adlist/Forwarders/DoT-DoH (G4.1d) e Zones (G4.1c), cada uma como etapas novas.
 - **G4.1c**, servidor completo estilo BIND (zonas autoritativas, DNSSEC) com `hickory-server`.
 
 Por que não orquestrar Unbound, Knot ou PowerDNS, como o FRR no roteamento: um processo só
@@ -448,6 +450,29 @@ thread "dns" (1 s): Session::dns_settings (running ip.dns + DHCP use_peer_dns) �
 
 O `proto-dns` não abre socket: compila em wasm e é testado com um transporte falso e um relógio
 falso. Sem daemon registrado, as ferramentas usam o resolvedor do prober (o simulado, no lab).
+
+**Encaminhador da LAN (G4.1b): Hickory para o protocolo, nossa camada de regras na frente.** O
+`hickory-server` 0.26 tem forwarder com cache, DNSSEC, DoT/DoH/DoQ e ACL, mas exige tokio, não
+tem limite por cliente, não lista nem limpa o cache e não fala as estatísticas no formato do
+RouterOS (e o README ainda diz "not recommended in production"). Por isso o encaminhador usa só o
+`hickory-proto` (mensagens) e passa cada consulta por uma **cadeia de etapas**
+(`proto-dns/src/server/stage/*.rs`, achadas pelo `build.rs`, ordenadas pelo `order` de cada uma):
+`acl → limit → special → adlist → static → zones → cache → upstream`. Sem runtime async: no
+daemon (`service/dns_server.rs`) uma thread por socket responde o que a cadeia resolve sem rede
+(cache, estáticos) na hora, e cada falta de cache ganha uma thread, no máximo
+`max_concurrent_queries`. Medido: 0,8 µs por consulta respondida do cache (bytes a bytes), ~1,2 M
+consultas/s por núcleo sem contar o socket. O `hickory-server` continua previsto para as zonas
+autoritativas (G4.1c), como uma etapa a mais.
+
+```
+UDP/TCP 53 ─► Forwarder::start (thread do socket) ─► acl, limit, special, adlist, static, zones, cache
+                                                          │ falta de cache: Step::Wait
+                                                          ▼
+                     thread por consulta (≤ max_concurrent_queries) ─► upstream: Resolver::resolve
+                                                          │ (o mesmo cache do roteador)
+efeitos (address-list) ─► thread "dns-effects" ─► Session::dns_address_list
+```
+
 Detalhes, regras de RFC e pesquisa: `docs/dns.md`.
 
 ## Histórico de revisão
