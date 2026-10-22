@@ -4,7 +4,7 @@
 
 use std::collections::BTreeMap;
 
-use corerouter_engine::{Caller, Session, cmd};
+use corerouter_engine::{Caller, Principal, Session, cmd};
 use corerouter_shell::parse::{self, Parsed};
 use corerouter_shell::{Reply, Request, Shell, doc};
 use serde_json::{Value, json};
@@ -20,7 +20,7 @@ impl Router {
     fn new() -> Self {
         Self {
             session: Session::virtual_lab(),
-            caller: Caller::new(7, "test 127.0.0.1:1"),
+            caller: Caller::new(7, "test 127.0.0.1:1").with_principal(Principal::Local),
             files: BTreeMap::new(),
             calls: Vec::new(),
         }
@@ -426,7 +426,7 @@ fn ctrl_x_toggles_safe_mode() {
     t.router
         .session
         .execute_as(
-            &Caller::new(99, "other 10.0.0.9:2"),
+            &Caller::new(99, "other 10.0.0.9:2").with_principal(Principal::Local),
             "config.safe-mode.enter",
             &json!({}),
         )

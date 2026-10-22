@@ -10,6 +10,7 @@ pub mod persist;
 pub mod route;
 pub mod store;
 pub mod types;
+pub mod users;
 pub mod validate;
 
 pub use config::{
@@ -23,4 +24,5 @@ pub use store::{ConfigStore, DiffLine, Revision, StoreError};
 pub use types::{
     Asn, Gateway, IfName, ItemId, MacAddr, ParseError, RoutingTable, VlanId, parse_destination,
 };
+pub use users::{Group, User, Users};
 pub use validate::Issue;

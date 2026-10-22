@@ -9,8 +9,18 @@ termina no mesmo `Session::execute` da UI. stdout é só protocolo; logs vão pa
 | Modo | Como iniciar | Quando usar |
 |---|---|---|
 | Remote | `corerouter-gui --control 7979` (ou `corerouter-daemon`), depois `corerouter-cli mcp --connect 127.0.0.1:7979` | Ver o agente trabalhar ao vivo; `ui_screenshot` funciona com a GUI |
+| Remote TLS | `COREROUTER_PASSWORD=… corerouter-cli mcp --connect 10.0.0.1:8729 --user admin [--fingerprint SHA256:…]` | Roteador em outra máquina (`corerouter-daemon --listen`) |
 | Headless | `corerouter-cli mcp --headless` | Automação e CI: virtual lab em processo, tudo menos tools de UI |
-| Sem flag | `corerouter-cli mcp` | Tenta 127.0.0.1:7979 e cai para headless |
+| Sem flag | `corerouter-cli mcp` | Usa 127.0.0.1:7979 se houver algo ouvindo (erro claro se faltar credencial), senão headless |
+
+**Autenticação (G0.3).** Em `127.0.0.1` o MCP manda o **token local** que o daemon (ou a GUI
+com `--control`) gravou num arquivo legível só pelo usuário do sistema que o rodou
+(`control-<porta>.token`, veja `docs/control-protocol.md`): rodando como o mesmo usuário, não há
+senha a configurar. Outro usuário, ou um roteador remoto (sempre TLS), usa `--user` com a senha
+em `$COREROUTER_PASSWORD` (o stdin é o protocolo, não há prompt). O certificado de um roteador
+novo precisa estar em `known_hosts` (conecte uma vez com `corerouter-cli --connect … --user …`
+num terminal, que pergunta) ou ser dado com `--fingerprint`. O que o agente pode fazer é o que o
+grupo do usuário permite: `list_commands` mostra `enabled: false` com o motivo.
 
 ```sh
 cargo install --path apps/corerouter-cli --locked
@@ -36,3 +46,4 @@ Faltando (G0.7): resources, prompts, completions, progresso/cancelamento, `-3200
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial.
+- 2026-10-22 — G0.3: token local, Remote TLS com usuário e senha.

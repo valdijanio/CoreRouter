@@ -30,6 +30,7 @@ const DAEMON: &str = env!("CARGO_BIN_EXE_corerouter-daemon");
 struct Daemon {
     child: Child,
     control: String,
+    token_file: std::path::PathBuf,
 }
 
 impl Drop for Daemon {
@@ -56,7 +57,9 @@ fn free_udp_port() -> u16 {
 }
 
 fn call(d: &Daemon, command: &str, params: Value) -> Result<Value, String> {
+    let token = std::fs::read_to_string(&d.token_file).map_err(|e| e.to_string())?;
     Client::connect(&d.control, Duration::from_millis(500)).and_then(|mut c| {
+        c.set_token(Some(token.trim().to_owned()));
         c.call(
             "engine.execute",
             json!({"command": command, "params": params}),
@@ -78,8 +81,12 @@ fn wait_for(what: &str, within: Duration, mut ok: impl FnMut() -> bool) {
 /// A virtual lab announcing every second on its factory-default ether1.
 fn lab(identity: &str, discovery_port: u16) -> Daemon {
     let port = free_tcp_port();
+    let token_file =
+        std::env::temp_dir().join(format!("cr-shutdown-{}-{port}.token", std::process::id()));
     let child = Command::new(DAEMON)
         .args(["--control", &port.to_string()])
+        .arg("--token-file")
+        .arg(&token_file)
         .args(["--discovery-port", &discovery_port.to_string()])
         .env("RUST_LOG", "info")
         .stdout(Stdio::null())
@@ -89,6 +96,7 @@ fn lab(identity: &str, discovery_port: u16) -> Daemon {
     let d = Daemon {
         child,
         control: format!("127.0.0.1:{port}"),
+        token_file,
     };
     wait_for("the control port", Duration::from_secs(20), || {
         call(&d, "system.identity.set", json!({ "name": identity })).is_ok()
@@ -155,6 +163,9 @@ fn goodbye_on(signal: &str) {
         log.contains("shutting down: sent CRDP goodbye on 1 interface(s)"),
         "{log}"
     );
+    // G0.3: the first start made `admin`; the local token left with us.
+    assert!(log.contains("created user 'admin'"), "{log}");
+    assert!(!b.token_file.exists(), "token file removed on shutdown");
     eprintln!("{log}");
     eprintln!(
         "SIG{signal}: forgotten after {forgotten:?}, exit after {:?}",

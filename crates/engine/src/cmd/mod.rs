@@ -79,6 +79,7 @@ mod neighbor;
 mod route;
 mod routing;
 mod system;
+mod user;
 mod vrf;
 
 static AREAS: &[&[CommandSpec]] = &[
@@ -90,6 +91,7 @@ static AREAS: &[&[CommandSpec]] = &[
     routing::COMMANDS,
     system::COMMANDS,
     config::COMMANDS,
+    user::COMMANDS,
 ];
 
 pub fn all() -> impl Iterator<Item = &'static CommandSpec> {
@@ -180,7 +182,9 @@ pub fn describe(session: &Session) -> Value {
     Value::Array(
         all()
             .map(|c| {
-                let enabled = (c.enabled)(session);
+                let enabled = session
+                    .permit(crate::auth::required_group(c.id, c.journal))
+                    .and_then(|()| (c.enabled)(session));
                 json!({
                     "id": c.id,
                     "label": c.label,

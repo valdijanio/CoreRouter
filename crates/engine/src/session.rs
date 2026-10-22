@@ -3,10 +3,11 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use corerouter_hal::{Hal, VirtualHal};
-use corerouter_model::{Config, ConfigStore, Interface, InterfaceKind, persist};
+use corerouter_model::{Config, ConfigStore, Interface, InterfaceKind, Users, persist};
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::auth::{self, Group, Login, Logins, Principal};
 use crate::cmd::{self, check_params, unknown_command};
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
@@ -58,6 +59,10 @@ pub struct Session {
     safe_mode: SafeMode,
     /// Heard by discovery protocols (operational state, never saved).
     pub(crate) neighbors: NeighborTable,
+    /// Router accounts (G0.3): saved with the config, outside its revisions.
+    users: Users,
+    /// Logged-in sessions, for `user.active.list` (never saved).
+    logins: Logins,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -88,6 +93,10 @@ impl Session {
     /// nothing readable stored, it starts from the discovered ports.
     pub fn with_storage(mut hal: Box<dyn Hal>, mut storage: Box<dyn ConfigStorage>) -> Self {
         let (restored, boot_errors) = restore(storage.as_mut());
+        let (restored, users) = match restored {
+            Some((store, users, slot)) => (Some((store, slot)), users),
+            None => (None, Users::default()),
+        };
         let mut status = StorageStatus {
             backend: storage.describe(),
             loaded_from: None,
@@ -124,6 +133,8 @@ impl Session {
             caller: Caller::local(),
             safe_mode: SafeMode::default(),
             neighbors: NeighborTable::default(),
+            users,
+            logins: Logins::default(),
         }
     }
 
@@ -136,6 +147,11 @@ impl Session {
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
         self.expire_safe_mode();
         let spec = cmd::find(id).ok_or_else(|| unknown_command(id))?;
+        self.permit(auth::required_group(spec.id, spec.journal))
+            .map_err(|reason| EngineError::Denied {
+                id: id.to_owned(),
+                reason,
+            })?;
         check_params(spec, params)?;
         (spec.enabled)(self).map_err(|reason| EngineError::Disabled {
             id: id.to_owned(),
@@ -167,6 +183,12 @@ impl Session {
     /// [`Session::batch`] on behalf of a connection.
     pub fn batch_as(&mut self, caller: &Caller, steps: &Value, atomic: bool) -> Result<Value> {
         self.as_caller(caller, |s| s.batch(steps, atomic))
+    }
+
+    /// [`Session::list`] as seen by a connection: commands its group may
+    /// not run show `enabled: false` with the reason.
+    pub fn list_as(&mut self, caller: &Caller) -> Value {
+        self.as_caller(caller, |s| s.list())
     }
 
     /// [`Session::inspect`] as seen by a connection (`safe_mode.yours`).
@@ -270,7 +292,7 @@ impl Session {
     /// Persist running + history. A failure does not undo the commit (the
     /// data plane already runs it): it is logged and shown by `state.inspect`.
     pub(crate) fn save(&mut self) {
-        let saved = persist::encode(&self.store)
+        let saved = persist::encode_with_users(&self.store, &self.users)
             .map_err(|e| e.to_string())
             .and_then(|text| self.storage.save(&text).map_err(|e| e.to_string()));
         match saved {
@@ -304,7 +326,8 @@ impl Session {
         self.journal.push(JournalEntry {
             seq: self.seq,
             command: id.to_owned(),
-            params: params.clone(),
+            // Passwords and tokens never reach the journal (G0.3).
+            params: auth::mask_secrets(params),
             ok: result.is_ok(),
             error: result.as_ref().err().map(ToString::to_string),
         });
@@ -321,6 +344,11 @@ impl Session {
     /// Compact state summary, or one subtree of the candidate by dotted path
     /// (`"interfaces"`, `"routing.bgp"`), so agents never pay for the whole tree.
     pub fn inspect(&self, path: Option<&str>) -> Result<Value> {
+        self.permit(Group::Read)
+            .map_err(|reason| EngineError::Denied {
+                id: "state.inspect".into(),
+                reason,
+            })?;
         let cand = self.store.candidate();
         match path.map(str::trim).filter(|p| !p.is_empty()) {
             None => Ok(json!({
@@ -400,6 +428,70 @@ impl Session {
         &self.caller
     }
 
+    /// The group of `principal` now, or `None` (not logged in, or the
+    /// account was removed or disabled).
+    pub fn group_of(&self, principal: &Principal) -> Option<Group> {
+        match principal {
+            Principal::Local => Some(Group::Full),
+            Principal::Anonymous => None,
+            Principal::User(name) => self
+                .users
+                .get(name)
+                .filter(|u| !u.disabled)
+                .map(|u| u.group),
+        }
+    }
+
+    /// Whether the current caller may run something that needs `need`.
+    pub(crate) fn permit(&self, need: Group) -> std::result::Result<(), String> {
+        let p = &self.caller.principal;
+        auth::permit(p, self.group_of(p), need)
+    }
+
+    pub fn users(&self) -> &Users {
+        &self.users
+    }
+
+    /// Replace the accounts and save them (user commands only).
+    pub(crate) fn set_users(&mut self, users: Users) {
+        self.users = users;
+        self.save();
+    }
+
+    /// The stored hash of an enabled account, for the login check (which
+    /// runs outside the session lock: Argon2 is slow on purpose).
+    pub fn password_hash(&self, user: &str) -> Option<String> {
+        self.users
+            .get(user)
+            .filter(|u| !u.disabled)
+            .map(|u| u.password_hash.clone())
+    }
+
+    /// A login succeeded (control channel): shown by `user.active.list`.
+    pub fn login_begin(&mut self, user: &str, via: &str) -> u64 {
+        let now = self.now();
+        self.logins.begin(user, via, now)
+    }
+
+    /// The login `id` was used; `false` when it no longer exists (ended,
+    /// or its user was removed or disabled).
+    pub fn login_touch(&mut self, id: u64) -> bool {
+        let now = self.now();
+        self.logins.touch(id, now)
+    }
+
+    pub fn login_end(&mut self, id: u64) {
+        self.logins.end(id);
+    }
+
+    pub(crate) fn logins_end_user(&mut self, user: &str) {
+        self.logins.end_user(user);
+    }
+
+    pub fn logins(&self) -> &[Login] {
+        &self.logins.list
+    }
+
     pub fn in_safe_mode(&self) -> bool {
         self.safe_mode.is_active()
     }
@@ -441,7 +533,8 @@ fn discovered(hal: &mut dyn Hal) -> Config {
 }
 
 /// Newest readable slot, quarantining the unreadable ones on the way.
-fn restore(storage: &mut dyn ConfigStorage) -> (Option<(ConfigStore, Slot)>, Vec<String>) {
+#[allow(clippy::type_complexity)]
+fn restore(storage: &mut dyn ConfigStorage) -> (Option<(ConfigStore, Users, Slot)>, Vec<String>) {
     let mut errors = Vec::new();
     for slot in [Slot::Current, Slot::Previous] {
         let text = match storage.load(slot) {
@@ -453,8 +546,8 @@ fn restore(storage: &mut dyn ConfigStorage) -> (Option<(ConfigStore, Slot)>, Vec
                 continue;
             }
         };
-        match persist::decode(&text) {
-            Ok(store) => return (Some((store, slot)), errors),
+        match persist::decode_with_users(&text) {
+            Ok((store, users)) => return (Some((store, users, slot)), errors),
             Err(e) => {
                 log::error!("{} config is unreadable, quarantined: {e}", slot.name());
                 errors.push(format!("{}: {e}", slot.name()));

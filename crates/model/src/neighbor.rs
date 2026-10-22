@@ -69,6 +69,12 @@ pub struct MgmtPorts {
     pub control: Option<u16>,
     /// WebSocket for the web GUI (`corerouter-daemon --ws`).
     pub ws: Option<u16>,
+    /// Control channel over TLS (`--listen`, G0.3): reachable from other machines.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tls: Option<u16>,
+    /// WebSocket over TLS (`--ws-listen`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wss: Option<u16>,
 }
 
 /// One neighbor heard on one of our interfaces with one protocol.

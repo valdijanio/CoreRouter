@@ -14,7 +14,9 @@
 
 use std::time::Duration;
 
-use corerouter_ui::{ConnectAction, ConnectScreen, CoreRouterUi, NeighborRow, SavedRouter};
+use corerouter_ui::{
+    ConnectAction, ConnectScreen, CoreRouterUi, Credentials, NeighborRow, SavedRouter,
+};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
@@ -36,10 +38,22 @@ trait Platform {
     fn neighbors(&mut self) -> Vec<NeighborRow>;
     /// Keep the Saved tab (address, group, comment; never a password).
     fn store_saved(&mut self, saved: &[SavedRouter]);
-    /// Start managing the router at `addr`, or say why not.
-    fn connect(&mut self, addr: &str) -> Result<CoreRouterUi, String>;
+    /// Log in to the router at `creds.address` and start managing it, or
+    /// say why not.
+    fn connect(&mut self, creds: &Credentials) -> Result<Connected, String>;
+    /// The operator accepted this certificate for `address` (G0.3 TOFU).
+    fn trust(&mut self, address: &str, fingerprint: &str) -> Result<(), String>;
     /// The in-process virtual lab.
     fn lab(&mut self) -> CoreRouterUi;
+}
+
+/// What [`Platform::connect`] got to.
+enum Connected {
+    Ready(Box<CoreRouterUi>),
+    /// First TLS connection: ask the operator about this fingerprint (the
+    /// browser checks certificates itself, so only natively).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Trust(Credentials, String),
 }
 
 enum Screen {
@@ -83,6 +97,17 @@ impl GuiApp {
     }
 }
 
+impl GuiApp {
+    /// Switch to managing a router.
+    fn show(&mut self, ui: &mut eframe::egui::Ui, mut r: CoreRouterUi) {
+        if let Some(prefs) = &self.prefs {
+            r.apply_prefs(prefs);
+        }
+        self.screen = Screen::Router(Box::new(r));
+        ui.ctx().request_repaint();
+    }
+}
+
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         let next = match &mut self.screen {
@@ -97,25 +122,44 @@ impl eframe::App for GuiApp {
                 if let Some(saved) = screen.take_saved_change() {
                     platform.store_saved(&saved);
                 }
-                match action {
+                let lab = matches!(action, Some(ConnectAction::VirtualLab));
+                let creds = match action {
                     None => None,
-                    Some(ConnectAction::VirtualLab) => Some(platform.lab()),
-                    Some(ConnectAction::Connect(addr)) => match platform.connect(&addr) {
-                        Ok(r) => Some(r),
-                        Err(e) => {
+                    Some(ConnectAction::VirtualLab) => None,
+                    Some(ConnectAction::Connect(c)) => Some(c),
+                    Some(ConnectAction::Trust { creds, fingerprint }) => {
+                        match platform.trust(&creds.address, &fingerprint) {
+                            Ok(()) => Some(creds),
+                            Err(e) => {
+                                screen.set_error(e);
+                                None
+                            }
+                        }
+                    }
+                };
+                if lab {
+                    Some(platform.lab())
+                } else {
+                    match creds.map(|c| platform.connect(&c)) {
+                        None => None,
+                        Some(Ok(Connected::Ready(r))) => {
+                            screen.connected();
+                            Some(*r)
+                        }
+                        Some(Ok(Connected::Trust(c, fp))) => {
+                            screen.ask_trust(c, fp);
+                            None
+                        }
+                        Some(Err(e)) => {
                             screen.set_error(e);
                             None
                         }
-                    },
+                    }
                 }
             }
         };
-        if let Some(mut r) = next {
-            if let Some(prefs) = &self.prefs {
-                r.apply_prefs(prefs);
-            }
-            self.screen = Screen::Router(Box::new(r));
-            ui.ctx().request_repaint();
+        if let Some(r) = next {
+            self.show(ui, r);
         }
     }
 
@@ -160,13 +204,6 @@ fn main() {
     };
     let app = match web::choice() {
         web::Choice::Lab => GuiApp::router(CoreRouterUi::new(shared(Session::virtual_lab()))),
-        web::Choice::Connect(url) => {
-            // Auth/TLS are G0.3: the daemon only listens on loopback.
-            log::info!("managing the router at {url}");
-            GuiApp::router(CoreRouterUi::with_backend(Box::new(web::WsBackend::new(
-                url,
-            ))))
-        }
         web::Choice::Screen(home) => {
             let (screen, platform) = web::connect_screen(home);
             GuiApp::connect(screen, Box::new(platform))

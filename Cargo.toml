@@ -51,6 +51,18 @@ tungstenite = { version = "0.30.0", default-features = false, features = ["hands
 signal-hook = { version = "0.3.18", default-features = false }
 # Line editor of `corerouter-cli shell` (history file, completion, colors, key handlers).
 rustyline = { version = "19.0.0", default-features = false, features = ["custom-bindings", "with-file-history"] }
+# G0.3: password hashes (Argon2id, pure Rust; salt from the OS, not from `rand`).
+argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
+getrandom = "0.3.4"
+# G0.3: TLS without OpenSSL; `ring` as the crypto provider (no cmake/NASM on Windows CI).
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rcgen = { version = "0.14.0", default-features = false, features = ["crypto", "ring", "pem"] }
+ring = "0.17.14"
+# G0.3: password prompt without echo (CLI).
+rpassword = "7.4.0"
+# G0.3: "Remember password" in the OS store (Keychain, Credential Manager, Secret
+# Service over zbus: pure Rust, no libdbus headers on CI).
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"
@@ -63,6 +75,13 @@ todo = "deny"
 unimplemented = "deny"
 unreachable = "deny"
 indexing_slicing = "deny"
+
+# Argon2 unoptimized takes ~1 s per hash: tests would crawl.
+[profile.dev.package.argon2]
+opt-level = 3
+
+[profile.dev.package.blake2]
+opt-level = 3
 
 [profile.release]
 # Must stay "unwind": engine::guard relies on catch_unwind to roll back a command.

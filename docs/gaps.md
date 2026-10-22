@@ -15,7 +15,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 |---|---|---|---|---|---|
 | G0.1 | Escolher licença do projeto | raiz | Decisão do dono registrada; `license` no `[workspace.package]`. **Agentes: não decidam, perguntem** | — | feito: AGPL-3.0-or-later |
 | G0.2 | CI no GitHub Actions | `.github/` | Workflow roda `cargo xtask ci` (Linux) + build macOS/Windows da GUI; cache de target | 3 h | feito (`stream/G0.2-github-actions`) |
-| G0.3 | Autenticação e TLS no canal de controle | control, daemon | `rustls`, tokens por usuário, grupos read/write/full (como RouterOS); bind não-loopback só com TLS; testes de recusa | 12 h | aberto |
+| G0.3 | Autenticação e TLS no canal de controle | control, daemon | `rustls`, tokens por usuário, grupos read/write/full (como RouterOS); bind não-loopback só com TLS; testes de recusa | 12 h | feito (`stream/G0.3-auth-tls`): usuários/grupos `read`/`write`/`full` (`user.*`, Argon2id, fora das revisões), permissão no engine (`engine.list` cinza por grupo), `auth.login`/token/limite de força bruta, token local 0600 para CLI/MCP, `--listen`/`--ws-listen` só TLS (`rustls`+`ring`), TOFU (`known_hosts`) na GUI/CLI/MCP, login na tela de conexão + "Remember password" no keyring, portas TLS no CRDP; `docs/control-protocol.md` |
 | G0.4 | GUI como cliente remoto + WebSocket para WASM | ui, control, gui, daemon | Trait de backend na UI (local/remoto); daemon serve WS; GUI web gerencia um roteador real. Feito: `ui::Backend` (`submit`/`poll`/`link`) + `Local`; `corerouter-gui --connect HOST:PORT` (thread + reconexão; `--control` repassa ao daemon); `corerouter-daemon --ws <porta> [--ws-origin …] [--web-root dist]` com lista de `Origin`; GUI web por `?connect=ws://…`, `?lab` ou mesma origem | 14 h | feito (`stream/G0.4-gui-remote`) |
 | G0.5 | Fuzzing | engine, control, mcp | `cargo-fuzz` para JSON de config, `read_line_bounded`, `handle_message`; rodada de 10 min sem crash | 6 h | aberto |
 | G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa. Feito: `model::persist` (JSON `format_version` 1), trait `engine::ConfigStorage`, crate `storage-fs` (L4), `corerouter-daemon --config-dir` | 6 h | feito (`stream/G0.6-persistence`) |
@@ -73,7 +73,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 
 | Id | Tarefa | Crates | Critério de aceite | Est. | Status |
 |---|---|---|---|---|---|
-| G4.1 | DNS | proto-dns, daemon, ui | hickory: cache, forwarders, estáticos, DoT/DoH upstream | 12 h | aberto |
+| G4.1 | DNS | proto-dns, daemon, ui | hickory: cache, forwarders, estáticos, DoT/DoH upstream | 12 h | em andamento (`stream/G0.3-auth-tls`) |
 | G4.2 | DHCPv4/v6 + relay | proto-dhcp, daemon, ui | dhcproto; pools, leases persistidos, opções, PD; janela DHCP Server | 16 h | aberto |
 | G4.3 | PPPoE / IPoE | proto-pppoe (novo), daemon | Orquestração do accel-ppp; sessões na UI | 16 h | aberto |
 | G4.4 | Prometheus, IPFIX/sFlow | daemon | `/metrics`; exportador de fluxos | 8 h | aberto |
@@ -121,3 +121,4 @@ leitura, o formato público do MNDP para enxergar MikroTiks numa rede mista.
 - 2026-10-22 — G5.5 (despedida da descoberta no encerramento do daemon por SIGINT/SIGTERM) adicionado e feito.
 - 2026-10-22 — G1.18 (descoberta via netlink e posse dos links no `hal-linux`) adicionado e feito; G1.7 feito junto; nota nova em G1.3.
 - 2026-10-22 — G0.8 feito (terminal RouterOS na GUI e na CLI, export/import); SSH pendente do G0.3.
+- 2026-10-22 — G0.3 feito (autenticação, usuários/grupos e TLS no canal de controle e no WebSocket).

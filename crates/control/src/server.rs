@@ -1,7 +1,8 @@
-//! Loopback TCP server: one thread per connection, synchronous, no runtime.
+//! Control-channel server: one thread per connection, synchronous, no
+//! runtime. Plain TCP on loopback, or TLS on any address (G0.3).
 
-use std::io::{self, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::io::{self, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
@@ -12,8 +13,10 @@ use serde_json::{Value, json};
 
 use corerouter_engine::Caller;
 
+use crate::auth::Gate;
 use crate::dispatch::{Host, dispatch_as, hang_up, new_caller};
-use crate::wire::{Line, MAX_REQUEST_LINE, read_line_bounded};
+use crate::tls::{self, ServerStream};
+use crate::wire::{Line, MAX_REQUEST_LINE, read_line_bounded, write_line};
 
 pub const MAX_CONNECTIONS: usize = 16;
 
@@ -24,6 +27,9 @@ struct Request {
     method: String,
     #[serde(default)]
     params: Value,
+    /// Session or local token (G0.3); never in a URL.
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// Bind `127.0.0.1:port` (0 = ephemeral). Never binds a routable address.
@@ -79,102 +85,242 @@ impl Shutdown {
     }
 }
 
-/// Serve forever on the current thread.
-pub fn serve<H: Host + Clone + Send + 'static>(listener: TcpListener, host: H) {
-    serve_until(listener, host, &Shutdown::default());
+/// A listening socket and how its connections are wrapped.
+///
+/// [`Endpoint::loopback`] is plain TCP and refuses any peer that is not on
+/// this machine. [`Endpoint::tls`] may listen on any address and runs TLS
+/// first (G0.3); every request on either still needs a token
+/// ([`crate::auth`]).
+pub struct Endpoint {
+    pub listener: TcpListener,
+    pub tls: Option<Arc<rustls::ServerConfig>>,
 }
 
-/// Serve on the current thread until `shutdown` is closed.
-pub fn serve_until<H: Host + Clone + Send + 'static>(
-    listener: TcpListener,
-    host: H,
-    shutdown: &Shutdown,
-) {
+impl Endpoint {
+    pub fn loopback(listener: TcpListener) -> Self {
+        Self {
+            listener,
+            tls: None,
+        }
+    }
+
+    pub fn tls(listener: TcpListener, config: Arc<rustls::ServerConfig>) -> Self {
+        Self {
+            listener,
+            tls: Some(config),
+        }
+    }
+
+    /// Shown in caller names: "tcp", "tls", "ws", "wss".
+    fn kind(&self, what: &str) -> &'static str {
+        match (what, self.tls.is_some()) {
+            ("ws", false) => "ws",
+            ("ws", true) => "wss",
+            (_, false) => "tcp",
+            (_, true) => "tls",
+        }
+    }
+}
+
+/// A connection after the optional TLS handshake.
+pub trait Conn: Read + Write + Send {
+    fn tcp(&self) -> &TcpStream;
+}
+
+impl Conn for TcpStream {
+    fn tcp(&self) -> &TcpStream {
+        self
+    }
+}
+
+impl Conn for ServerStream {
+    fn tcp(&self) -> &TcpStream {
+        &self.sock
+    }
+}
+
+/// Accept loop shared by the TCP and WebSocket servers: loopback check,
+/// connection limit, one thread per connection (TLS handshake included).
+/// `serve` gets the connection, its caller and the peer address.
+pub(crate) fn accept_loop<F>(endpoint: Endpoint, what: &str, shutdown: &Shutdown, serve: F)
+where
+    F: Fn(Box<dyn Conn>, Caller, Option<IpAddr>) -> io::Result<()> + Clone + Send + 'static,
+{
     let active = Arc::new(AtomicUsize::new(0));
-    shutdown.watch(&listener);
+    let kind = endpoint.kind(what);
+    shutdown.watch(&endpoint.listener);
     // A close that ran before `watch` did not wake this loop.
     if shutdown.is_closed() {
         return;
     }
-    for conn in listener.incoming() {
+    for conn in endpoint.listener.incoming() {
         if shutdown.is_closed() {
-            log::info!("control: no longer accepting connections");
+            log::info!("{what}: no longer accepting connections");
             return;
         }
         let mut stream = match conn {
             Ok(s) => s,
             Err(e) => {
-                log::warn!("control: accept failed: {e}");
+                log::warn!("{what}: accept failed: {e}");
                 continue;
             }
         };
-        if !stream.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
-            log::warn!("control: rejected non-loopback peer");
+        let peer = stream.peer_addr().ok();
+        // One request, one reply: never hold a small write back (Nagle).
+        if let Err(e) = stream.set_nodelay(true) {
+            log::debug!("{what}: TCP_NODELAY not set: {e}");
+        }
+        if endpoint.tls.is_none() && !peer.is_some_and(|a| a.ip().is_loopback()) {
+            log::warn!("{what}: rejected non-loopback peer");
             continue;
         }
         if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
             active.fetch_sub(1, Ordering::SeqCst);
-            let _ = writeln!(
-                stream,
-                "{}",
-                json!({"id": null, "ok": false, "error": "too many connections"})
-            );
+            if endpoint.tls.is_none() {
+                let _ = write_line(
+                    &mut stream,
+                    &json!({"id": null, "ok": false, "error": "too many connections"}),
+                );
+            }
             continue;
         }
-        let mut host = host.clone();
         let counter = Arc::clone(&active);
-        let caller = match stream.peer_addr() {
-            Ok(peer) => new_caller("tcp", peer),
-            Err(_) => new_caller("tcp", "?"),
+        let caller = match peer {
+            Some(p) => new_caller(kind, p),
+            None => new_caller(kind, "?"),
         };
+        let tls = endpoint.tls.clone();
+        let serve = serve.clone();
+        let label = what.to_owned();
         let spawned = thread::Builder::new()
-            .name("control-conn".into())
+            .name(format!("{what}-conn"))
             .spawn(move || {
-                if let Err(e) = handle(stream, &mut host, &caller) {
-                    log::debug!("control: connection closed: {e}");
+                let conn: io::Result<Box<dyn Conn>> = match tls {
+                    None => Ok(Box::new(stream)),
+                    Some(cfg) => tls::accept(stream, cfg).map(|s| Box::new(s) as Box<dyn Conn>),
+                };
+                let result = conn.and_then(|c| serve(c, caller, peer.map(|p| p.ip())));
+                if let Err(e) = result {
+                    log::debug!("{label}: connection closed: {e}");
                 }
-                hang_up(&mut host, &caller);
                 counter.fetch_sub(1, Ordering::SeqCst);
             });
         if let Err(e) = spawned {
             active.fetch_sub(1, Ordering::SeqCst);
-            log::error!("control: cannot spawn connection thread: {e}");
+            log::error!("{what}: cannot spawn connection thread: {e}");
         }
     }
 }
 
+/// Serve forever on the current thread.
+pub fn serve<H: Host + Clone + Send + 'static>(endpoint: Endpoint, host: H, gate: Gate) {
+    serve_until(endpoint, host, gate, &Shutdown::default());
+}
+
+/// Serve on the current thread until `shutdown` is closed.
+pub fn serve_until<H: Host + Clone + Send + 'static>(
+    endpoint: Endpoint,
+    host: H,
+    gate: Gate,
+    shutdown: &Shutdown,
+) {
+    accept_loop(endpoint, "control", shutdown, move |conn, caller, peer| {
+        let mut host = host.clone();
+        let out = handle(conn, &mut host, &gate, &caller, peer);
+        hang_up(&mut host, &caller);
+        out
+    });
+}
+
 /// Serve on a background thread.
 pub fn spawn<H: Host + Clone + Send + 'static>(
-    listener: TcpListener,
+    endpoint: Endpoint,
     host: H,
+    gate: Gate,
+) -> io::Result<thread::JoinHandle<()>> {
+    spawn_until(endpoint, host, gate, Shutdown::default())
+}
+
+/// [`spawn`] that stops accepting when `shutdown` is closed.
+pub fn spawn_until<H: Host + Clone + Send + 'static>(
+    endpoint: Endpoint,
+    host: H,
+    gate: Gate,
+    shutdown: Shutdown,
 ) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("control".into())
-        .spawn(move || serve(listener, host))
+        .spawn(move || serve_until(endpoint, host, gate, &shutdown))
 }
 
+/// Methods answered without a token.
+const OPEN_METHODS: &[&str] = &["ping", "server.info"];
+
 /// The reply to one request, or `None` when it is not a JSON request (the
-/// caller then drops the connection). Shared by TCP and WebSocket.
-pub(crate) fn answer(host: &mut dyn Host, caller: &Caller, text: &str) -> Option<Value> {
+/// caller then drops the connection). Shared by TCP, TLS and WebSocket.
+pub(crate) fn answer(
+    host: &mut dyn Host,
+    gate: &Gate,
+    caller: &Caller,
+    peer: Option<IpAddr>,
+    text: &str,
+) -> Option<Value> {
     let req = serde_json::from_str::<Request>(text).ok()?;
-    Some(match dispatch_as(host, caller, &req.method, &req.params) {
+    let token = req.token.as_deref();
+    let result = match req.method.as_str() {
+        m if OPEN_METHODS.contains(&m) => dispatch_as(host, caller, m, &req.params).map(|mut v| {
+            if m == "server.info"
+                && let Some(o) = v.as_object_mut()
+            {
+                o.entry("auth").or_insert(json!("required"));
+            }
+            v
+        }),
+        "auth.login" => gate.login(host, caller, peer, &req.params),
+        "auth.logout" => gate.logout(host, token),
+        method => gate.principal(host, token).and_then(|p| {
+            let caller = caller.clone().with_principal(p);
+            if method == "auth.whoami" {
+                whoami(host, &caller)
+            } else {
+                dispatch_as(host, &caller, method, &req.params)
+            }
+        }),
+    };
+    Some(match result {
         Ok(result) => json!({"id": req.id, "ok": true, "result": result}),
         Err(error) => json!({"id": req.id, "ok": false, "error": error}),
     })
 }
 
+/// `auth.whoami`: who this token is and what it may do.
+fn whoami(host: &mut dyn Host, caller: &Caller) -> Result<Value, String> {
+    let p = caller.principal.clone();
+    let group = host
+        .with_session(&mut |s| Ok(s.group_of(&p).map_or(Value::Null, |g| json!(g))))
+        .unwrap_or_else(|_| match p {
+            corerouter_engine::Principal::Local => json!("full"),
+            _ => Value::Null,
+        });
+    Ok(json!({"user": caller.principal.label(), "group": group, "via": caller.name}))
+}
+
 /// Runs until the client hangs up; the caller then calls [`hang_up`].
-fn handle<H: Host>(stream: TcpStream, host: &mut H, caller: &Caller) -> io::Result<()> {
-    let mut reader = BufReader::new(stream.try_clone()?);
-    let mut out = stream;
+fn handle<H: Host>(
+    stream: Box<dyn Conn>,
+    host: &mut H,
+    gate: &Gate,
+    caller: &Caller,
+    peer: Option<IpAddr>,
+) -> io::Result<()> {
+    let mut reader = BufReader::new(stream);
     loop {
         let line = match read_line_bounded(&mut reader, MAX_REQUEST_LINE)? {
             Line::Eof => return Ok(()),
             Line::TooLong => {
-                writeln!(
-                    out,
-                    "{}",
-                    json!({"id": null, "ok": false, "error": "request line exceeds 16 MiB"})
+                write_line(
+                    reader.get_mut(),
+                    &json!({"id": null, "ok": false, "error": "request line exceeds 16 MiB"}),
                 )?;
                 return Ok(());
             }
@@ -184,10 +330,9 @@ fn handle<H: Host>(stream: TcpStream, host: &mut H, caller: &Caller) -> io::Resu
             continue;
         }
         // Not JSON (e.g. an HTTP request from a web page): drop the connection.
-        let Some(reply) = answer(host, caller, &line) else {
+        let Some(reply) = answer(host, gate, caller, peer, &line) else {
             return Ok(());
         };
-        writeln!(out, "{reply}")?;
-        out.flush()?;
+        write_line(reader.get_mut(), &reply)?;
     }
 }

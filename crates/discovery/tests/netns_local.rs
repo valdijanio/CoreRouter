@@ -62,6 +62,8 @@ fn a_router_on_this_machine_is_reached_over_loopback_on_a_new_link() {
             node_id: NodeId([7; 16]),
             control_port: Some(7981),
             ws_port: None,
+            tls_port: None,
+            wss_port: None,
             board: "test".into(),
             transport: Transport::Interfaces,
         },
