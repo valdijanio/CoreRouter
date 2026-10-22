@@ -26,6 +26,7 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-mcp", 4),
     ("corerouter-storage-fs", 4),
     ("corerouter-discovery", 4),
+    ("corerouter-shell", 4),
     ("corerouter-ui", 5),
     ("corerouter-daemon", 6),
     ("corerouter-gui", 6),
