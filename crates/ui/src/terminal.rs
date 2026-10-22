@@ -12,12 +12,24 @@
 //! Mode (as in RouterOS; there is no cut in the terminal), Ctrl+C stops the
 //! task a command follows (`ping`: events print as they come), Esc hides the
 //! suggestions. Output is selectable; right click copies or clears it.
+//! A click anywhere in the window puts the focus back on the input (as in
+//! xterm, PuTTY and WinBox); after a drag that selects text, the selection
+//! stays and the next key goes to the input.
+//!
+//! Like every terminal (WinBox's, xterm), a line wider than the window
+//! wraps at its width and wraps again when the window is resized; the rows
+//! after the first start with a faint `↳ `. The wrap is display only: the
+//! output keeps the original lines, and copying (a selection or Copy All)
+//! gives them back without the breaks.
 
 use corerouter_shell::{Completion, Job, Line, Reply, Request, Shell, Span, Step, Style};
 use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 use egui::{Color32, FontId, Key, Modifiers, TextEdit, TextStyle};
 
 use crate::{CoreRouterUi, Pending, RequestId};
+
+/// What a display wrap inserts in a line (and copying takes out again).
+pub(crate) const WRAP: &str = "\n\u{21b3} ";
 
 /// Output lines kept per terminal.
 const MAX_OUTPUT: usize = 5000;
@@ -51,6 +63,8 @@ pub(crate) struct TermWin {
     /// A line to put back once the job ends (after `?` and Ctrl+X).
     restore: Option<String>,
     focus: bool,
+    /// A drag selected output text: the next key takes the focus back.
+    refocus_on_key: bool,
     closed: bool,
     /// Height of the input row and suggestions last frame (reserved under
     /// the output so the window keeps its size).
@@ -61,7 +75,7 @@ pub(crate) fn term_id(id: u64) -> egui::Id {
     egui::Id::unique(("corerouter-terminal", id))
 }
 
-fn input_id(id: u64) -> egui::Id {
+pub(crate) fn input_id(id: u64) -> egui::Id {
     egui::Id::unique(("corerouter-terminal-input", id))
 }
 
@@ -79,6 +93,7 @@ impl TermWin {
             suggestions: None,
             restore: None,
             focus: true,
+            refocus_on_key: false,
             closed: false,
             bottom: 24.0,
         }
@@ -178,6 +193,71 @@ fn job_of(ui: &egui::Ui, spans: &[Span], font: &FontId) -> LayoutJob {
         job.append(&s.text, 0.0, f);
     }
     job
+}
+
+/// `spans` as rows of at most `cols` characters: each row after the first
+/// starts with [`WRAP`] and holds two characters less. A row ends after its
+/// last space when it has one (the space stays, so taking [`WRAP`] out gives
+/// the line back), else at `cols`.
+pub(crate) fn wrapped(spans: &[Span], cols: usize) -> Vec<Span> {
+    let chars: Vec<(char, Style)> = spans
+        .iter()
+        .flat_map(|s| s.text.chars().map(move |c| (c, s.style)))
+        .collect();
+    if chars.len() <= cols {
+        return spans.to_vec();
+    }
+    let mut out: Vec<Span> = Vec::new();
+    let mut start = 0;
+    while start < chars.len() {
+        let room = if start == 0 { cols } else { cols.saturating_sub(2) }.max(1);
+        let mut end = (start + room).min(chars.len());
+        if end < chars.len()
+            && let Some(sp) = chars
+                .get(start..end)
+                .and_then(|row| row.iter().rposition(|(c, _)| *c == ' '))
+                .filter(|&sp| sp > 0)
+        {
+            end = start + sp + 1;
+        }
+        if start > 0 {
+            out.push(Span {
+                style: Style::Dim,
+                text: WRAP.to_owned(),
+            });
+        }
+        for &(c, style) in chars.get(start..end).unwrap_or_default() {
+            match out.last_mut() {
+                Some(last) if last.style == style && last.text != WRAP => last.text.push(c),
+                _ => out.push(Span {
+                    style,
+                    text: c.to_string(),
+                }),
+            }
+        }
+        start = end;
+    }
+    out
+}
+
+/// Takes the display wraps out of what the terminal's labels copy (egui
+/// copies a selection at the end of the frame, so this runs on the output).
+pub(crate) struct UnwrapCopy;
+
+impl egui::Plugin for UnwrapCopy {
+    fn debug_name(&self) -> &'static str {
+        "corerouter-terminal-unwrap-copy"
+    }
+
+    fn output_hook(&mut self, _ctx: &egui::Context, output: &mut egui::FullOutput) {
+        for c in &mut output.platform_output.commands {
+            if let egui::OutputCommand::CopyText(text) = c
+                && text.contains(WRAP)
+            {
+                *text = text.replace(WRAP, "");
+            }
+        }
+    }
 }
 
 impl CoreRouterUi {
@@ -456,8 +536,8 @@ impl CoreRouterUi {
 
     fn terminal_body(&mut self, ui: &mut egui::Ui, idx: usize) {
         let font = TextStyle::Monospace.resolve(ui.style());
-        // `print` fits this width (like RouterOS) instead of stretching the
-        // window; a longer line scrolls sideways.
+        // `print` and `/export` fit this width (like RouterOS) instead of
+        // stretching the window; a longer line wraps.
         let glyph = ui.fonts_mut(|f| f.glyph_width(&font, '0')).max(1.0);
         let cols = ((ui.available_width() - 16.0) / glyph).floor().max(20.0) as usize;
         if let Some(t) = self.terminals.get_mut(idx) {
@@ -467,6 +547,35 @@ impl CoreRouterUi {
             return;
         };
         let iid = input_id(t.id);
+        // A click in this window (not a drag) focuses the input; a key after
+        // a drag that selected text does too, without losing the selection.
+        let body = ui.max_rect();
+        let (clicked_at, dragged_from, keyed) = ui.input(|i| {
+            let p = &i.pointer;
+            let clicked = p.primary_clicked().then(|| p.interact_pos()).flatten();
+            let dragged = (p.primary_released() && !p.primary_clicked())
+                .then(|| p.press_origin())
+                .flatten();
+            let keyed = i.events.iter().any(|e| {
+                matches!(e, egui::Event::Text(_) | egui::Event::Key { pressed: true, .. })
+            });
+            (clicked, dragged, keyed)
+        });
+        let here = |pos: Option<egui::Pos2>| {
+            pos.is_some_and(|p| {
+                body.contains(p) && ui.ctx().layer_id_at(p) == Some(ui.layer_id())
+            })
+        };
+        let (clicked, dragged) = (here(clicked_at), here(dragged_from));
+        let nothing_focused = ui.memory(|m| m.focused().is_none());
+        // A key: focus now, so the input gets it this frame. A click: after
+        // the input is drawn (it gives the focus up on a click elsewhere).
+        let key_focus = t.refocus_on_key && keyed && nothing_focused;
+        let refocus_on_key =
+            !clicked && !key_focus && (dragged || (t.refocus_on_key && nothing_focused));
+        if key_focus {
+            ui.memory_mut(|m| m.request_focus(iid));
+        }
         let focused = ui.memory(|m| m.has_focus(iid));
 
         // Keys the terminal takes before the text field sees them.
@@ -528,7 +637,10 @@ impl CoreRouterUi {
         let output_height = (ui.available_height() - t.bottom - 6.0).max(40.0);
         let mut clear = false;
         let mut copy = false;
-        egui::ScrollArea::both()
+        if ui.ctx().plugin_opt::<UnwrapCopy>().is_none() {
+            ui.ctx().add_plugin(UnwrapCopy);
+        }
+        egui::ScrollArea::vertical()
             .id_salt(("terminal-output", t.id))
             .max_height(output_height)
             .auto_shrink([false, false])
@@ -536,7 +648,7 @@ impl CoreRouterUi {
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
                 for line in &t.output {
-                    let job = job_of(ui, &line.0, &font);
+                    let job = job_of(ui, &wrapped(&line.0, cols), &font);
                     let r = ui.add(egui::Label::new(job).selectable(true).extend());
                     r.context_menu(|ui| {
                         if ui.button("Copy All").clicked() {
@@ -617,6 +729,7 @@ impl CoreRouterUi {
             return;
         };
         t.bottom = bottom;
+        t.refocus_on_key = refocus_on_key;
         if input != t.input {
             t.input = input;
             t.suggestions = None;
@@ -636,7 +749,7 @@ impl CoreRouterUi {
             t.history_step(h);
             set_cursor(ui.ctx(), iid, t.input.chars().count());
         }
-        if t.focus {
+        if t.focus || clicked {
             t.focus = false;
             edit.request_focus();
             set_cursor(ui.ctx(), iid, t.input.chars().count());

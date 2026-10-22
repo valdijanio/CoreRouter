@@ -112,6 +112,8 @@ pub enum Parsed {
     Export {
         path: Vec<String>,
         file: Option<String>,
+        /// `terse`: one line per item, menu in front, never wrapped.
+        terse: bool,
     },
     Import {
         file: Option<String>,
@@ -415,8 +417,8 @@ pub fn parse(reg: &Registry, cwd: &[String], line: &str) -> Result<Parsed, Parse
             match verb {
                 Verb::Quit => no_args(line, args).map(|()| Parsed::Quit),
                 Verb::Export => {
-                    let file = file_arg(line, args)?;
-                    Ok(Parsed::Export { path, file })
+                    let (file, terse) = export_args(line, args)?;
+                    Ok(Parsed::Export { path, file, terse })
                 }
                 Verb::Import => {
                     let file = file_arg(line, args)?;
@@ -481,6 +483,33 @@ fn file_arg(line: &str, args: &[Word]) -> Result<Option<String>, ParseError> {
         }
     }
     Ok(file.filter(|f| !f.is_empty()))
+}
+
+/// `/export [file=…] [terse] [compact]` (`compact`, RouterOS's default
+/// since v6, changes nothing).
+fn export_args(line: &str, args: &[Word]) -> Result<(Option<String>, bool), ParseError> {
+    let mut terse = false;
+    let mut rest = Vec::new();
+    for w in args {
+        match (w.key.as_deref(), w.text.as_str()) {
+            (None, "terse") => terse = true,
+            (None, "compact") => {}
+            // Not file names: RouterOS options this export does not have.
+            (None, "verbose" | "show-sensitive") => {
+                return Err(ParseError::at(
+                    line,
+                    w.start,
+                    format!("{} is not supported (file=…, terse, compact)", w.text),
+                ));
+            }
+            _ => rest.push(w.clone()),
+        }
+    }
+    let file = file_arg(line, &rest).map_err(|mut e| {
+        e.message = e.message.replace("(only file=…)", "(file=…, terse)");
+        e
+    })?;
+    Ok((file, terse))
 }
 
 fn print_opts(line: &str, cmd: &Command, args: &[Word]) -> Result<PrintOpts, ParseError> {
@@ -754,9 +783,19 @@ mod tests {
             p(&["ip"], "export").unwrap(),
             Parsed::Export {
                 path: vec!["ip".into()],
-                file: None
+                file: None,
+                terse: false
             }
         );
+        assert_eq!(
+            p(&[], "/export terse file=a.rsc").unwrap(),
+            Parsed::Export {
+                path: vec![],
+                file: Some("a.rsc".into()),
+                terse: true
+            }
+        );
+        assert!(p(&[], "/export verbose").is_err());
         // `import` and `quit` are root verbs only.
         assert!(p(&["ip"], "import").is_err());
     }

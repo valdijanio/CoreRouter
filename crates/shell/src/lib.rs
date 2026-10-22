@@ -25,5 +25,7 @@ pub mod style;
 
 pub use complete::{Candidate, Completion};
 pub use registry::{Registry, path_text};
-pub use shell::{Job, MAX_SCRIPT, Reply, Request, SafeMode, Shell, Step, convert, script_line};
+pub use shell::{
+    Job, MAX_SCRIPT, Reply, Request, SafeMode, Shell, Step, convert, script_line, script_lines,
+};
 pub use style::{Line, Output, Span, Style, ansi, to_ansi};
