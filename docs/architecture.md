@@ -356,6 +356,17 @@ tabela `inet corerouter` inteira por `nft -f -` (atômico no kernel) **antes** d
 recarrega o ruleset anterior se o plano falhar; sem mudança no firewall o `nft` não roda. Detalhes,
 mapeamento RouterOS → nftables e o porquê do `nft` em `docs/firewall.md`.
 
+G2.1b: o `Caller` carrega o `Link` da conexão TCP (cliente e endereço local, preenchido pelo
+`control::server::accept_loop`). `Session::commit_candidate` chama `engine::lockout`, que passa os
+pacotes dessa conexão pelo firewall atual e pelo candidato com `corerouter_firewall::eval` e
+recusa (`EngineError::Lockout`, texto `lockout: …`) o que os cortaria, salvo `force: true` no
+comando (`Session::lockout_ack`, vale até o fim do comando ou do batch) ou Safe Mode; o desfazer do
+Safe Mode usa `commit_restoring`, sem a checagem. O crate `firewall` ganhou `eval` (destino de um
+pacote), `shadow` (regras sombreadas) e `describe` (frase em português), todos puros. Defaults,
+modelos e zonas são comandos do engine (`cmd/firewall_assist.rs`, `cmd/firewall_zone.rs`) que
+escrevem regras comuns pelo mesmo `add` dos comandos de regra; a GUI só junta parâmetros
+(`ui::firewall_assist`) e segura a recusa de lockout para o operador decidir (`ui::lockout`).
+
 ### Rotas estáticas e VRF (G1.5)
 
 - **Modelo:** `ip.routes` (`RouteEntry`: `dst_address`, `gateway`, `distance`, `routing_table`,
@@ -428,3 +439,4 @@ falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools
 - 2026-10-22 — G0.3b: primeiro acesso sem senha (bootstrap no engine, regra de rede no `Gate`, `ui::first_login`).
 - 2026-10-22 — G1.19: `hal::nic` e os métodos `ethernet_monitor`/`hardware`/`counters` do `Hal`, genetlink do `hal-linux`, `engine::link_watch`.
 - 2026-10-22 — G4.7a: cliente DHCPv4 (`proto-dhcp` codec/cliente/lab, `Hal::dhcp_port`, `hal-linux::dhcp`, `engine::dhcp_client`, relógio de serviço no `control`).
+- 2026-10-22 — G2.1b: `Caller::link`, `engine::lockout`, `firewall::{eval,shadow,describe}`, `ui::{firewall_assist,lockout}`.
