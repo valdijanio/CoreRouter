@@ -9,6 +9,8 @@
 //! `CoreRouterUi::run`; the engine validates (the error lands in the dialog,
 //! on the field it names).
 
+use std::collections::BTreeSet;
+
 use egui::{Color32, Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
@@ -17,7 +19,7 @@ use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
 use crate::firewall_assist::{Wizard, WizardForm};
 use crate::interfaces::{cascade, dialog_id};
 use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
-use crate::{CoreRouterUi, RequestId, Then, value_text};
+use crate::{CoreRouterUi, RequestId, Then, Win, value_text};
 
 /// Property windows opened at once from one selection.
 const MAX_OPEN: usize = 8;
@@ -193,6 +195,14 @@ impl Feed {
             Feed::Members => "if-members",
             Feed::Zones => "fw-zones",
             t => t.table().map(FwTable::salt).unwrap_or(""),
+        }
+    }
+
+    /// The list window its dialogs belong to (open over, close with).
+    fn window(self) -> Win {
+        match self {
+            Feed::Lists | Feed::Members => Win::InterfaceList,
+            _ => Win::Firewall,
         }
     }
 
@@ -1039,7 +1049,7 @@ fn can_toggle(rows: &[Value], f: Feed, sel: &[String], enable: bool) -> Result<(
 }
 
 impl CoreRouterUi {
-    fn fw_rows(&self, f: Feed) -> &[Value] {
+    pub(crate) fn fw_rows(&self, f: Feed) -> &[Value] {
         self.fw.rows(f)
     }
 
@@ -1245,11 +1255,13 @@ impl CoreRouterUi {
         });
         ui.separator();
 
+        let open = self.fw_open(f);
         let state = match f {
             Feed::Filter => &mut self.tables.fw_filter,
             Feed::Nat => &mut self.tables.fw_nat,
             _ => &mut self.tables.fw_mangle,
         };
+        state.open = open;
         let out = table::show(
             ui,
             t.salt(),
@@ -1444,11 +1456,13 @@ impl CoreRouterUi {
             table::find_field(ui, f.salt(), self.fw_table(f));
         });
         ui.separator();
+        let open = self.fw_open(f);
         let state = match f {
             Feed::Addr => &mut self.tables.fw_addr,
             Feed::Members => &mut self.tables.if_members,
             _ => &mut self.tables.if_lists,
         };
+        state.open = open;
         let out = table::show(
             ui,
             f.salt(),
@@ -1628,14 +1642,27 @@ impl CoreRouterUi {
         }
     }
 
-    /// The window of an assistant (one at a time per kind).
+    /// Items of `f` whose window is open (marked in the table).
+    fn fw_open(&self, f: Feed) -> BTreeSet<String> {
+        self.fw
+            .dialogs
+            .iter()
+            .filter(|d| d.edit.feed() == f && !matches!(d.edit, Edit::Comment { .. }))
+            .filter_map(|d| d.item.clone())
+            .collect()
+    }
+
+    /// The window of an assistant (one at a time per kind; asking again
+    /// brings the open one to the front).
     pub(crate) fn open_wizard(&mut self, w: Wizard) {
         let open = self
             .fw
             .dialogs
-            .iter()
-            .any(|d| matches!(&d.edit, Edit::Wizard { kind, .. } if *kind == w));
-        if !open {
+            .iter_mut()
+            .find(|d| matches!(&d.edit, Edit::Wizard { kind, .. } if *kind == w));
+        if let Some(d) = open {
+            d.status.bring_to_front();
+        } else {
             self.open_fw_dialog(
                 None,
                 Edit::Wizard {
@@ -1656,17 +1683,18 @@ impl CoreRouterUi {
         });
     }
 
-    /// The window of item `key`; an open one is not duplicated.
+    /// The window of item `key`; an open one comes to the front.
     pub(crate) fn open_fw(&mut self, f: Feed, key: &str) {
         let Some(row) = self.fw_row(f, key) else {
             return;
         };
-        let open = self.fw.dialogs.iter().any(|d| {
+        let open = self.fw.dialogs.iter_mut().find(|d| {
             d.item.as_deref() == Some(key)
                 && d.edit.feed() == f
                 && !matches!(d.edit, Edit::Comment { .. })
         });
-        if open {
+        if let Some(d) = open {
+            d.status.bring_to_front();
             return;
         }
         let edit = match f {
@@ -1760,6 +1788,7 @@ impl CoreRouterUi {
                 title: &title,
                 dirty: d.edit.dirty(),
                 pos: cascade(area, d.id),
+                parent: Some(crate::win_id(feed.window())),
             };
             let pick = Picks {
                 lists: &lists,
