@@ -45,6 +45,14 @@ struct Forms {
     addr_address: String,
     addr_interface: String,
     addr_comment: String,
+    vlan_name: String,
+    vlan_parent: String,
+    vlan_id: String,
+    vlan_mtu: String,
+    bridge_name: String,
+    loopback_name: String,
+    port_bridge: String,
+    port_interface: String,
     bgp_name: String,
     bgp_asn: String,
     bgp_router_id: String,
@@ -267,6 +275,17 @@ impl CoreRouterUi {
     }
 }
 
+/// Form text → JSON: integers as numbers, blank as absent, anything else as
+/// typed (the engine reports what is wrong with it).
+fn form_number(s: &str) -> Value {
+    let s = s.trim();
+    match s.parse::<u64>() {
+        Ok(n) => json!(n),
+        Err(_) if s.is_empty() => Value::Null,
+        Err(_) => json!(s),
+    }
+}
+
 fn value_text(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
@@ -324,6 +343,39 @@ mod tests {
             app.run("system.identity.set", json!({"name": "r1"}))
                 .is_some()
         );
+    }
+
+    #[test]
+    fn interface_forms_go_through_commands() {
+        let session = shared(Session::virtual_lab());
+        let mut app = CoreRouterUi::new(session.clone());
+        app.forms.vlan_name = "vlan100".into();
+        app.forms.vlan_parent = "ether1".into();
+        app.forms.vlan_id = " 100 ".into();
+        app.add_vlan();
+        app.forms.bridge_name = "bridge1".into();
+        app.add_bridge();
+        app.forms.port_bridge = "bridge1".into();
+        app.forms.port_interface = "ether2".into();
+        app.add_port();
+        assert!(app.log().iter().all(|l| l.ok), "{:?}", app.log());
+        assert!(app.forms.vlan_name.is_empty(), "form cleared on success");
+
+        app.forms.vlan_name = "v2".into();
+        app.forms.vlan_parent = "ether1".into();
+        app.forms.vlan_id = "abc".into();
+        app.add_vlan();
+        assert!(app.log().last().is_some_and(|l| !l.ok));
+        assert_eq!(app.forms.vlan_name, "v2", "form kept on error");
+
+        let running = lock(&session).store().running().clone();
+        assert_eq!(running.interfaces.len(), 10);
+        assert!(
+            app.run("interface.remove", json!({"name": "vlan100"}))
+                .is_some()
+        );
+        assert_eq!(form_number(""), Value::Null);
+        assert_eq!(form_number("7"), json!(7));
     }
 
     #[test]

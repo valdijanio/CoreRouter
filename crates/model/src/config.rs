@@ -45,6 +45,10 @@ pub struct Interface {
     pub mac: Option<MacAddr>,
     #[serde(default)]
     pub comment: String,
+    /// Bridge this interface is a port of (Linux `IFLA_MASTER`). A single
+    /// field, so a port can never belong to two bridges.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bridge: Option<IfName>,
 }
 
 fn default_mtu() -> u16 {
@@ -60,6 +64,7 @@ impl Interface {
             disabled: false,
             mac: None,
             comment: String::new(),
+            bridge: None,
         }
     }
 }
@@ -127,4 +132,22 @@ pub struct BgpInstance {
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_port_is_optional_in_json() {
+        let raw = r#"{"name": "ether1", "kind": {"type": "ethernet"}}"#;
+        let mut iface: Interface = serde_json::from_str(raw).unwrap();
+        assert_eq!(iface.bridge, None);
+        assert!(!serde_json::to_string(&iface).unwrap().contains("bridge"));
+
+        iface.bridge = Some("bridge1".parse().unwrap());
+        let back: Interface =
+            serde_json::from_str(&serde_json::to_string(&iface).unwrap()).unwrap();
+        assert_eq!(back, iface);
+    }
 }
