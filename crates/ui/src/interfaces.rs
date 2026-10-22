@@ -8,8 +8,8 @@
 use egui::{Grid, TextEdit, Ui};
 use serde_json::{Value, json};
 
-use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::avail::Avail;
+use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, form_number, human_bytes, value_text};
 
 pub(crate) const TABLE: &str = "interfaces";
@@ -256,7 +256,11 @@ impl CoreRouterUi {
                     "Disable",
                     can.and("interface.set", can_enable(&picked, false)),
                 ),
-                (Icon::Comment, "Comment", can.and("interface.set", some(&picked))),
+                (
+                    Icon::Comment,
+                    "Comment",
+                    can.and("interface.set", some(&picked)),
+                ),
             ];
             for (icon, tip, enabled) in tools {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
@@ -752,13 +756,25 @@ fn row_menu(
 ) {
     let picked: Vec<&Iface> = ifaces.iter().filter(|i| sel.contains(&i.name)).collect();
     let owned = || sel.to_vec();
-    if action(ui, "Enable", can.and("interface.set", can_enable(&picked, true))) {
+    if action(
+        ui,
+        "Enable",
+        can.and("interface.set", can_enable(&picked, true)),
+    ) {
         *act = Some(Act::Enable(owned()));
     }
-    if action(ui, "Disable", can.and("interface.set", can_enable(&picked, false))) {
+    if action(
+        ui,
+        "Disable",
+        can.and("interface.set", can_enable(&picked, false)),
+    ) {
         *act = Some(Act::Disable(owned()));
     }
-    if action(ui, "Remove", can.and("interface.remove", can_remove(&picked))) {
+    if action(
+        ui,
+        "Remove",
+        can.and("interface.remove", can_remove(&picked)),
+    ) {
         *act = Some(Act::Remove(owned()));
     }
     if action(ui, "Comment…", can.and("interface.set", some(&picked))) {

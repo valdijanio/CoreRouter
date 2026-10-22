@@ -8,9 +8,9 @@
 use egui::{Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
+use crate::avail::Avail;
 use crate::interfaces::{cascade, dialog_id, field, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
-use crate::avail::Avail;
 use crate::{CoreRouterUi, Then, form_number, value_text};
 
 pub(crate) const TABLE: &str = "routes";
@@ -639,16 +639,32 @@ fn can_enable(picked: &[&Route], enable: bool) -> Result<(), String> {
 fn row_menu(ui: &mut Ui, act: &mut Option<Act>, routes: &[Route], sel: &[String], can: &Avail) {
     let picked: Vec<&Route> = routes.iter().filter(|r| sel.contains(&r.key)).collect();
     let owned = || sel.to_vec();
-    if action(ui, "Enable", can.and("ip.route.set", can_enable(&picked, true))) {
+    if action(
+        ui,
+        "Enable",
+        can.and("ip.route.set", can_enable(&picked, true)),
+    ) {
         *act = Some(Act::Enable(owned()));
     }
-    if action(ui, "Disable", can.and("ip.route.set", can_enable(&picked, false))) {
+    if action(
+        ui,
+        "Disable",
+        can.and("ip.route.set", can_enable(&picked, false)),
+    ) {
         *act = Some(Act::Disable(owned()));
     }
-    if action(ui, "Remove", can.and("ip.route.remove", only_static(&picked))) {
+    if action(
+        ui,
+        "Remove",
+        can.and("ip.route.remove", only_static(&picked)),
+    ) {
         *act = Some(Act::Remove(owned()));
     }
-    if action(ui, "Comment…", can.and("ip.route.set", only_static(&picked))) {
+    if action(
+        ui,
+        "Comment…",
+        can.and("ip.route.set", only_static(&picked)),
+    ) {
         *act = Some(Act::Comment(owned()));
     }
     if action(ui, "Properties…", some(&picked)) {

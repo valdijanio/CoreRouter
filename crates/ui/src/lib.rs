@@ -278,8 +278,8 @@ impl CoreRouterUi {
     }
 
     fn update_can(&mut self) {
-        let loaded = self.cache.applied.contains_key(&Field::Commands)
-            && !self.cache.commands.is_empty();
+        let loaded =
+            self.cache.applied.contains_key(&Field::Commands) && !self.cache.commands.is_empty();
         let commands = loaded.then_some(self.cache.commands.as_slice());
         self.can = Arc::new(avail::Avail::new(&self.link, commands, &self.cache.info));
     }
@@ -2119,6 +2119,239 @@ mod tests {
         g.idle();
         assert_eq!(g.ctx.theme(), egui::Theme::Light);
         assert!(g.app.tables.interfaces.inline_comments);
+    }
+
+    /// A daemon that may be older than this GUI: answers at once, from its
+    /// own command list, and refuses what it does not have like a real one.
+    struct Daemon {
+        commands: Vec<Value>,
+        summary: Value,
+        link: Link,
+        /// Actions it was asked to run (queries left out).
+        executed: Vec<String>,
+        replies: Vec<Reply>,
+        next: RequestId,
+    }
+
+    struct Fake(Rc<RefCell<Daemon>>);
+
+    impl Backend for Fake {
+        fn submit(&mut self, method: &str, params: Value) -> RequestId {
+            let mut d = self.0.borrow_mut();
+            d.next += 1;
+            let command = params["command"].as_str().unwrap_or_default().to_owned();
+            let known = d.commands.iter().any(|c| c["id"] == command);
+            let reply = match method {
+                "state.inspect" => Ok(d.summary.clone()),
+                "engine.list" => Ok(Value::Array(d.commands.clone())),
+                "server.info" => Ok(json!({"name": "corerouter", "version": "0.0.9"})),
+                "engine.execute" if command == "interface.list" => {
+                    Ok(json!([{"name": "ether1", "type": "ether", "disabled": true}]))
+                }
+                "engine.execute"
+                    if command.ends_with(".list")
+                        || ["config.history", "config.diff"].contains(&command.as_str()) =>
+                {
+                    Ok(json!([]))
+                }
+                "engine.execute" if !known => Err(format!("unknown command '{command}'")),
+                "engine.execute" => {
+                    d.executed.push(command);
+                    Ok(json!({}))
+                }
+                _ => Err("unknown method".into()),
+            };
+            let id = d.next;
+            d.replies.push((id, reply));
+            id
+        }
+
+        fn poll(&mut self) -> Vec<Reply> {
+            std::mem::take(&mut self.0.borrow_mut().replies)
+        }
+
+        fn link(&self) -> Link {
+            self.0.borrow().link.clone()
+        }
+    }
+
+    fn command(id: &str) -> Value {
+        json!({"id": id, "enabled": true, "disabledReason": null})
+    }
+
+    impl Harness {
+        /// The UI over a fake daemon with these commands; dirty, so Commit
+        /// and Discard are shown.
+        fn daemon(commands: Vec<Value>) -> (Self, Rc<RefCell<Daemon>>) {
+            let d = Rc::new(RefCell::new(Daemon {
+                commands,
+                summary: json!({"identity": "old", "mode": "transactional", "revision": 3,
+                    "dirty": true, "pending_changes": 1, "safe_mode": {"active": false}}),
+                link: Link::Connected {
+                    target: "r1:7979".into(),
+                },
+                executed: Vec::new(),
+                replies: Vec::new(),
+                next: 0,
+            }));
+            let session = shared(Session::virtual_lab());
+            let mut h = Self {
+                ctx: egui::Context::default(),
+                app: CoreRouterUi::with_backend(Box::new(Fake(d.clone()))),
+                session,
+                time: 0.0,
+                screen: egui::vec2(1400.0, 900.0),
+                shapes: Vec::new(),
+            };
+            for _ in 0..3 {
+                h.idle();
+            }
+            (h, d)
+        }
+
+        /// The tooltip of what is drawn at `at`, as text on screen.
+        fn tooltip_at(&mut self, at: egui::Pos2) {
+            self.hover(at + egui::vec2(300.0, 300.0));
+            self.hover(at);
+            self.time += 1.0;
+            self.idle();
+            self.idle();
+        }
+
+        fn has_text_containing(&self, needle: &str) -> bool {
+            fn find(shape: &egui::Shape, needle: &str) -> bool {
+                match shape {
+                    egui::Shape::Text(t) => t.galley.text().contains(needle),
+                    egui::Shape::Vec(v) => v.iter().any(|s| find(s, needle)),
+                    _ => false,
+                }
+            }
+            self.shapes.iter().any(|s| find(&s.shape, needle))
+        }
+    }
+
+    /// Everything the GUI knows except Safe Mode (a daemon from before G1.4).
+    fn before_safe_mode() -> Vec<Value> {
+        corerouter_engine::cmd::all()
+            .filter(|c| !c.id.starts_with("config.safe-mode."))
+            .map(|c| command(c.id))
+            .collect()
+    }
+
+    #[test]
+    fn safe_mode_is_greyed_out_on_a_daemon_without_it() {
+        let (mut h, d) = Harness::daemon(before_safe_mode());
+        let at = h.text("Safe Mode");
+        h.click(at);
+        h.right_click(at);
+        assert!(d.borrow().executed.is_empty(), "{:?}", d.borrow().executed);
+        assert!(
+            !h.app
+                .log()
+                .iter()
+                .any(|l| l.command.starts_with("config.safe-mode")),
+            "{:?}",
+            h.app.log()
+        );
+        assert!(!h.has_text("Enter with a 1 min timeout"), "no menu");
+        h.tooltip_at(at);
+        assert!(
+            h.has_text_containing(
+                "Safe Mode: this router (corerouter 0.0.9) has no config.safe-mode.enter"
+            ),
+            "tooltip"
+        );
+        assert!(h.has_text_containing("older than this GUI"));
+        assert!(h.has_text_containing("update or restart it"));
+
+        // Commit is there and works.
+        h.click(h.text("Commit"));
+        assert_eq!(d.borrow().executed, ["config.commit"]);
+    }
+
+    #[test]
+    fn engine_reason_greys_out_commit_and_safe_mode() {
+        let mut list = before_safe_mode();
+        for c in &mut list {
+            if c["id"] == "config.commit" {
+                *c = json!({"id": "config.commit", "enabled": false,
+                    "disabledReason": "no pending changes"});
+            }
+        }
+        list.push(json!({"id": "config.safe-mode.enter", "enabled": false,
+            "disabledReason": "held by the maintenance window"}));
+        let (mut h, d) = Harness::daemon(list);
+        let commit = h.text("Commit");
+        h.click(commit);
+        h.click(h.text("Safe Mode"));
+        assert!(d.borrow().executed.is_empty(), "{:?}", d.borrow().executed);
+        h.tooltip_at(commit);
+        assert!(h.has_text("no pending changes"), "engine's reason");
+        h.tooltip_at(h.text("Safe Mode"));
+        assert!(h.has_text("Safe Mode: held by the maintenance window"));
+        // Discard is allowed and goes out.
+        h.click(h.text("Discard"));
+        assert_eq!(d.borrow().executed, ["config.discard"]);
+    }
+
+    #[test]
+    fn a_lost_link_greys_out_actions_and_keys_send_nothing() {
+        let (mut h, d) = Harness::daemon(before_safe_mode());
+        // The interface row, selected while the router is there.
+        h.click(h.row("ether1"));
+        d.borrow_mut().link = Link::Disconnected {
+            target: "r1:7979".into(),
+            reason: "connection reset".into(),
+        };
+        h.idle();
+        let enable = h.tool(table::Icon::Enable);
+        h.click(enable);
+        h.click(h.text("Commit"));
+        h.click(h.row("ether1"));
+        h.key(egui::Key::E, CTRL);
+        h.key(egui::Key::Delete, egui::Modifiers::NONE);
+        assert!(d.borrow().executed.is_empty(), "{:?}", d.borrow().executed);
+        // A key on an unavailable action says why in the status bar.
+        let last = h.app.log().last().unwrap();
+        assert_eq!(
+            (last.ok, last.message.as_str()),
+            (false, "disconnected: r1:7979")
+        );
+        h.tooltip_at(enable);
+        assert!(h.has_text("Enable: disconnected: r1:7979"), "tooltip");
+        h.tooltip_at(h.text("Safe Mode"));
+        assert!(h.has_text("Safe Mode: disconnected: r1:7979"));
+
+        // Back: everything works again.
+        d.borrow_mut().link = Link::Connected {
+            target: "r1:7979".into(),
+        };
+        h.idle();
+        h.click(h.row("ether1"));
+        h.key(egui::Key::E, CTRL);
+        assert_eq!(d.borrow().executed, ["interface.set"]);
+    }
+
+    #[test]
+    fn a_missing_command_greys_out_its_toolbar_button_and_menu_item() {
+        let list: Vec<Value> = before_safe_mode()
+            .into_iter()
+            .filter(|c| c["id"] != "interface.set")
+            .collect();
+        let (mut h, d) = Harness::daemon(list);
+        h.click(h.row("ether1"));
+        let enable = h.tool(table::Icon::Enable);
+        h.click(enable);
+        h.key(egui::Key::E, CTRL);
+        h.right_click(h.row("ether1"));
+        h.click(h.text("Enable"));
+        assert!(d.borrow().executed.is_empty(), "{:?}", d.borrow().executed);
+        h.key(egui::Key::Escape, egui::Modifiers::NONE);
+        h.tooltip_at(enable);
+        assert!(
+            h.has_text_containing("Enable: this router (corerouter 0.0.9) has no interface.set"),
+            "tooltip"
+        );
     }
 
     #[test]

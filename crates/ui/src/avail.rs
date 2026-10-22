@@ -27,6 +27,8 @@ pub(crate) struct Avail {
     commands: Option<BTreeMap<String, Option<String>>>,
     /// "corerouter 0.1.0", from `server.info`.
     server: Option<String>,
+    /// Its version alone.
+    version: Option<String>,
 }
 
 impl Avail {
@@ -35,16 +37,18 @@ impl Avail {
             list.iter()
                 .filter_map(|c| {
                     let id = c.get("id")?.as_str()?;
-                    let why = (c.get("enabled").and_then(Value::as_bool) == Some(false)).then(|| {
-                        let why = c.get("disabledReason").and_then(Value::as_str);
-                        clip(why.unwrap_or("not available on this router"))
-                    });
+                    let why =
+                        (c.get("enabled").and_then(Value::as_bool) == Some(false)).then(|| {
+                            let why = c.get("disabledReason").and_then(Value::as_str);
+                            clip(why.unwrap_or("not available on this router"))
+                        });
                     Some((id.to_owned(), why))
                 })
                 .collect()
         });
         let text = |k: &str| server.get(k).and_then(Value::as_str).map(clip);
-        let server = match (text("name"), text("version")) {
+        let version = text("version");
+        let server = match (text("name"), version.clone()) {
             (Some(n), Some(v)) => Some(format!("{n} {v}")),
             (None, Some(v)) => Some(format!("version {v}")),
             _ => None,
@@ -53,6 +57,7 @@ impl Avail {
             link: Some(link.clone()),
             commands,
             server,
+            version,
         }
     }
 
@@ -79,10 +84,14 @@ impl Avail {
                     .as_deref()
                     .map(|s| format!(" ({s})"))
                     .unwrap_or_default();
+                let gui = env!("CARGO_PKG_VERSION");
+                let older = if self.version.as_deref() == Some(gui) {
+                    format!("an older build than this GUI (same version {gui})")
+                } else {
+                    format!("older than this GUI ({gui})")
+                };
                 Err(format!(
-                    "this router{who} has no {id}: its daemon is older than this GUI \
-                     ({}); update or restart it",
-                    env!("CARGO_PKG_VERSION")
+                    "this router{who} has no {id}: its daemon is {older}; update or restart it"
                 ))
             }
         }
@@ -123,7 +132,8 @@ mod tests {
         let link = Link::Connected {
             target: "r1:7979".into(),
         };
-        let info = json!({"name": "corerouter", "version": "0.1.0"});
+        let gui = env!("CARGO_PKG_VERSION");
+        let info = json!({"name": "corerouter", "version": gui});
         let a = Avail::new(&link, Some(&list()), &info);
         assert_eq!(a.check("interface.set"), Ok(()));
         assert_eq!(
@@ -136,7 +146,8 @@ mod tests {
         );
         let why = a.check("config.safe-mode.enter").unwrap_err();
         assert!(why.contains("has no config.safe-mode.enter"), "{why}");
-        assert!(why.contains("corerouter 0.1.0"), "{why}");
+        assert!(why.contains(&format!("corerouter {gui}")), "{why}");
+        assert!(why.contains("an older build"), "{why}");
         assert!(why.contains("update or restart"), "{why}");
         // The router's reason comes before the UI's own rule.
         assert_eq!(
