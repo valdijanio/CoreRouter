@@ -10,13 +10,14 @@
 
 use corerouter_hal::LinkState;
 use corerouter_model::IfName;
+use corerouter_model::service::ServiceTable;
 use serde_json::{Value, json};
 
 use super::{CommandSpec, always};
 use crate::{Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "system.metrics", "Metrics", [], None,
-    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}]}",
+    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}]}",
     always, metrics)];
 
 /// Error and drop counters of the platform's `interface` group, by the
@@ -72,7 +73,28 @@ fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
         "safe_mode": s.in_safe_mode(),
         "engine": s.counters,
         "interfaces": rows,
+        "services": services(s),
     }))
+}
+
+/// The supervised services (G0.10); none without a daemon.
+fn services(s: &Session) -> Vec<Value> {
+    s.ext::<ServiceTable>()
+        .filter(|t| t.supervised)
+        .map(|t| {
+            t.rows
+                .iter()
+                .map(|r| {
+                    json!({
+                        "name": r.name,
+                        "state": r.state.as_str(),
+                        "up": r.state.is_up(),
+                        "restarts": r.restarts,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `[rx_errors, tx_errors, rx_dropped, tx_dropped]`, `None` where the

@@ -11,6 +11,7 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+#[cfg(test)]
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,10 +26,13 @@ const APP_NAME: &str = "corerouter";
 /// Topics that say how bad, not what: never the MSGID.
 const LEVELS: &[&str] = &["critical", "debug", "error", "info", "warning"];
 
+/// The loop on a thread of its own, outside the supervisor (tests).
+#[cfg(test)]
 pub fn spawn(session: Shared) -> std::io::Result<()> {
+    let health = super::Health::new(corerouter_control::Shutdown::default());
     thread::Builder::new()
         .name("remote-log".into())
-        .spawn(move || run(&session))
+        .spawn(move || run(&session, &health))
         .map(|_| ())
 }
 
@@ -39,12 +43,12 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-fn run(session: &Shared) {
+fn run(session: &Shared, health: &super::Health) {
     let mut last_seq = lock(session).log_seq();
     let pid = std::process::id().to_string();
     let mut sender = Sender::default();
-    loop {
-        thread::sleep(TICK);
+    while health.sleep(TICK) {
+        health.beat();
         let (logging, hostname, mut events) = {
             let s = lock(session);
             let events: Vec<LogEvent> = s.log_since(last_seq);
@@ -63,6 +67,15 @@ fn run(session: &Shared) {
                     sender.send(action, &bytes);
                 }
             }
+        }
+        let remote = logging
+            .rules
+            .iter()
+            .any(|r| logging.action(&r.action).is_some());
+        health.disabled((!remote).then_some("no rule sends to a remote action (system.logging.add)"));
+        match sender.errors.iter().next() {
+            Some((action, e)) => health.error(format!("action '{action}': {e}")),
+            None => health.clear_error(),
         }
     }
 }
@@ -147,17 +160,20 @@ impl Sender {
 
 /// No flags: configured with `system.logging.*`.
 pub(crate) const SERVICE: super::Service = super::Service {
-    name: "remote logging",
+    name: "remote-logging",
     flags: &[],
+    topic: "system",
+    enable: "system.logging.action.add + system.logging.add",
+    depends: &[],
     start,
 };
 
-/// A router without it still forwards: a failure is logged, not fatal.
-fn start(ctx: &super::Ctx) -> Result<(), String> {
-    if let Err(e) = spawn(ctx.session.clone()) {
-        log::error!("remote logging is off: cannot start its thread: {e}");
-    }
-    Ok(())
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    Ok(Box::new(move |health: &super::Health| {
+        run(&session, health);
+        Ok(())
+    }))
 }
 
 #[cfg(test)]
