@@ -9,7 +9,7 @@
 //! lab answers with a [`DhcpResponder`] — a simulated server, installed by
 //! the engine — so the lab and the CI get leases without any network.
 
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 
 use corerouter_model::IfName;
@@ -85,3 +85,80 @@ pub trait DhcpResponder: Send + Sync {
 }
 
 pub type SharedResponder = Arc<dyn DhcpResponder>;
+
+/// Network number N (1..=254) of lab port `port`: its trailing number, else
+/// a hash of its name. Behind it the lab has `100.64.N.0/24` and
+/// `2001:db8:0:N::/64` (see `proto_dhcp::lab` and `lab6`).
+pub fn lab_net(port: &IfName) -> u8 {
+    let name = port.as_str();
+    let digits = name.len() - name.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+    let n = name
+        .get(name.len().saturating_sub(digits)..)
+        .and_then(|d| d.parse::<u32>().ok())
+        .filter(|n| (1..=254).contains(n))
+        .unwrap_or_else(|| 1 + lab_hash(name.as_bytes()) % 254);
+    u8::try_from(n).unwrap_or(1)
+}
+
+/// FNV-1a, the lab's stable hash.
+pub fn lab_hash(bytes: &[u8]) -> u32 {
+    bytes.iter().fold(2_166_136_261u32, |h, b| {
+        (h ^ u32::from(*b)).wrapping_mul(16_777_619)
+    })
+}
+
+/// The lab router's MAC behind port N (also its DHCP servers').
+pub fn lab_router_mac(n: u8) -> [u8; 6] {
+    [0x02, 0xdc, 0, 0, 0, n]
+}
+
+/// Modified EUI-64 interface identifier of `mac` (RFC 4291 App. A).
+pub fn eui64(mac: [u8; 6]) -> u64 {
+    let [a, b, c, d, e, f] = mac;
+    u64::from_be_bytes([a ^ 0x02, b, c, 0xff, 0xfe, d, e, f])
+}
+
+/// Link-local address of `mac` (fe80::/64 + EUI-64).
+pub fn link_local(mac: [u8; 6]) -> Ipv6Addr {
+    Ipv6Addr::from((0xfe80u128 << 112) | u128::from(eui64(mac)))
+}
+
+// ---- DHCPv6 (G4.7b) --------------------------------------------------------
+
+/// DHCPv6 client and server ports (RFC 8415 §7.2).
+pub const CLIENT_PORT6: u16 = 546;
+pub const SERVER_PORT6: u16 = 547;
+/// All_DHCP_Relay_Agents_and_Servers (RFC 8415 §7.1): where a client sends.
+pub const ALL_DHCP_SERVERS: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 1, 2);
+
+/// One DHCPv6 message received on port 546.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Datagram6 {
+    pub payload: Vec<u8>,
+    /// IPv6 source: the server's (or relay's) link-local address.
+    pub src: Ipv6Addr,
+    /// Ethernet source, when the platform sees it.
+    pub src_mac: Option<[u8; 6]>,
+}
+
+/// A DHCPv6 client socket on one interface. Every message goes to
+/// [`ALL_DHCP_SERVERS`] from the interface's link-local address (the client
+/// never unicasts: the Server Unicast option is deprecated, RFC 9915).
+pub trait Dhcp6Port: Send {
+    /// Hardware address of the interface (the DUID-LL is made of it).
+    fn mac(&self) -> [u8; 6];
+
+    fn send(&mut self, payload: &[u8]) -> Result<(), HalError>;
+
+    /// Next message for port 546, or `None` when nothing is waiting.
+    fn recv(&mut self) -> Result<Option<Datagram6>, HalError>;
+}
+
+/// A simulated DHCPv6 server for the virtual lab and the tests.
+pub trait Dhcp6Responder: Send + Sync {
+    /// Answers to `payload`, sent by the client with hardware address `mac`
+    /// on lab port `port`.
+    fn answer(&self, port: &IfName, mac: [u8; 6], payload: &[u8]) -> Vec<Datagram6>;
+}
+
+pub type SharedResponder6 = Arc<dyn Dhcp6Responder>;

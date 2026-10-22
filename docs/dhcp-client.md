@@ -1,8 +1,8 @@
 # Cliente DHCP (`/ip dhcp-client`)
 
-Status: G4.7a (DHCPv4 estilo RouterOS + extras) feito. G4.7b (DHCPv6 com endereço, prefixo
-delegado e aceitar RA) e G4.7c (endereço de reserva, checar gateway, concessão lembrada) abertos
-em `docs/gaps.md`.
+Status: G4.7a (DHCPv4 estilo RouterOS + extras) e G4.7b (DHCPv6 com endereço, prefixo delegado,
+pools e controle de RA; §9–§13) feitos. G4.7c (endereço de reserva, checar gateway, concessão
+lembrada) aberto em `docs/gaps.md`.
 
 O roteador pega endereço, rota padrão, DNS e NTP sozinho na WAN, como o `/ip dhcp-client` do
 RouterOS: um cliente por interface, com os mesmos nomes de propriedade e a mesma regra para
@@ -193,6 +193,188 @@ num socket comum); `script`/hooks (aqui tudo é comando e o MCP já reage a even
 `history`); `allow-reconfigure` (FORCERENEW, RFC 3203); `user-class` (dá para mandar como
 `extra_options` 77). `check-gateway`, endereço de reserva e concessão lembrada são o G4.7c;
 DHCPv6/PD/RA o G4.7b.
+
+## 9. DHCPv6 (`/ipv6 dhcp-client`, G4.7b)
+
+Na WAN IPv6 o roteador pede um endereço (IA_NA) e um **prefixo delegado** (IA_PD) ao provedor e
+numera as LANs com ele, como `/ipv6 dhcp-client` + `/ipv6 address from-pool` do RouterOS. A
+rota padrão vem, como manda a RFC 7084 (W-3), do Router Advertisement do provedor (§12).
+
+| Comando | Faz |
+|---|---|
+| `ipv6.dhcp-client.add {interface, request, …}` | cria o cliente (habilitado) → `{id}` |
+| `ipv6.dhcp-client.set` / `remove` | muda / remove (`remove` recusa enquanto um endereço usa o pool) |
+| `ipv6.dhcp-client.renew` / `release` | Renew agora / Release ao servidor e recomeça |
+| `ipv6.dhcp-client.list` | configuração + estado: `status`, `address` (/128), `prefix`, validades, T1/T2, servidor (link-local + DUID), nosso DUID, DNS, domínios, o que faltou (`missing`) |
+| `ipv6.dhcp-client.options {id}` | todas as opções do último Reply (IA_NA/IA_PD decodificados) |
+| `ipv6.dhcp-client.history` | eventos: `searching`, `advertised`, `bound`, `renewed`, `lost`, `status`, `refused`, `ignored`, `error`, `stopped` |
+| `ipv6.pool.list` | os pools: prefixo, validade, endereços numerados a partir dele |
+| `ipv6.settings.get` / `set` | política de RA (§12) e, por interface, se aceita e por quê |
+
+| Propriedade | Padrão | Significado |
+|---|---|---|
+| `request` | — (obrigatório) | `address`, `prefix` ou `address,prefix` (`info` ainda não: vira gap) |
+| `pool_name` | vazio | nome do pool do prefixo; obrigatório com `prefix`; um cliente por pool |
+| `prefix_hint` | nenhum | `::/56` pede um /56; um prefixo inteiro pede aquele; `::/0` = sem dica |
+| `accept_prefix_without_address` | `true` | com os dois pedidos, aceita só o prefixo (RFC 7084 WPD-6); `false` espera um servidor que dê os dois |
+| `add_default_route` | `false` | `::/0` via o link-local do servidor (ou do relay) com `default_route_distance` |
+| `use_peer_dns` | `true` | DNS recebidos em `Session::dhcp6_peer_dns()` para o G4.1 |
+| `rapid_commit` | `true` | Solicit com Rapid Commit (2 mensagens quando o servidor aceita) |
+| `custom_duid` | vazio | `0x…`; vazio = DUID-LL do MAC da interface |
+| `allowed_servers` | `[]` | DUID (`0x…`), endereço IPv6 de origem ou MAC (dentro do DUID-LL/LLT) |
+
+Identidade: DUID-LL do MAC da interface (estável sem armazenamento: RFC 7084 W-5 enquanto a placa
+for a mesma) e IAID = hash do nome da interface (estável entre reinícios: RFC 9096 WPD-10). O
+RouterOS usa um DUID por roteador; o nosso dispensa guardar estado e `custom_duid` cobre o resto.
+
+## 10. Máquina de estados DHCPv6 (RFC 9915, ex-8415)
+
+Pura, em `crates/proto-dhcp/src/client6.rs`, como a v4 (tempo, datagramas → ações), com a seção
+da RFC citada no código e nos testes.
+
+```text
+ INIT ─0–1 s→ SOLICITING ─Advertise (melhor do 1º RT; preferência 255 na hora)→ REQUESTING ─Reply→ BOUND
+ BOUND ─T1→ RENEWING (ao servidor) ─T2→ REBINDING (a qualquer um) ─validades acabam→ INIT
+ Rapid Commit: Solicit → Reply → BOUND.   release: RELEASING (até REL_MAX_RC) → INIT
+```
+
+- Tempos da §7.6 e retransmissão da §15: RT = 2·RTprev ± 10 %, teto MRT ± 10 %; o 1º RT do
+  Solicit é **estritamente** maior que IRT; Request desiste após REQ_MAX_RC = 10; Renew até T2;
+  Rebind até a última validade; Release até REL_MAX_RC = 4. SOL_MAX_RT do servidor só de 60 a
+  86400 s (§21.24). Limite de taxa da §14.1: no máximo 20 mensagens em 20 s por interface.
+- Advertise sem endereço nem prefixo é ignorado (§18.2.9); um IA com T1 > T2 é descartado
+  (§21.4/§21.21); endereço/prefixo com preferida > válida é descartado (§21.6/§21.22).
+- T1 = T2 = 0: o cliente usa 0,5 e 0,8 da menor validade preferida (§21.4); T1 nunca antes de
+  5 s; T2 ≤ 7/8 da validade. Validade infinita não renova.
+- Reply com NoBinding a um Renew/Rebind → Request (§18.2.10.1); NotOnLink → Solicit; validade 0
+  revoga; o que o Reply omite fica até a própria validade acabar. Nada concedido → Solicit de novo
+  após 1, 2, 4 … 64 s.
+- Release: para de usar antes de mandar (§18.2.7). Desabilitar, remover ou reiniciar **não** manda
+  Release (RFC 9096 WPD-9: o provedor guarda o prefixo).
+- Um endereço e um prefixo por cliente (o primeiro utilizável de cada IA); os IAs dividem o menor
+  T1/T2 (como o `odhcp6c`). Prefixo maior que /64 não numera LAN e é recusado com o motivo.
+- Reconfigure nunca é aceito (não mandamos Reconfigure Accept).
+
+## 11. Pools e endereços da LAN (`from_pool`)
+
+O prefixo delegado vira o pool `pool_name`. Um endereço com `from_pool` guarda só os bits **depois**
+do prefixo, como o "general prefix" do Cisco e o `from-pool` do RouterOS:
+
+```text
+ipv6.dhcp-client.add interface=ether1 request=address,prefix pool_name=pd prefix_hint=::/56
+ip.address.add address=::1/64        interface=ether2 from_pool=pd   → 2001:db8:1:100::1/64
+ip.address.add address=0:0:0:1::1/64 interface=ether3 from_pool=pd   → 2001:db8:1:101::1/64
+```
+
+- O id da sub-rede é escolha do operador e **estável**: mudar o prefixo (renumeração do provedor)
+  renumera as LANs com o mesmo id; tirar um endereço não desloca os outros (o RouterOS aloca do pool).
+- Sem prefixo (cliente procurando, desabilitado, prefixo expirado) o endereço não vai ao data plane
+  e aparece com flag `I` e o motivo em `ip.address.list`; volta sozinho quando o prefixo chega.
+- Validação: só IPv6; o pool tem de ser de um cliente que pede prefixo; a mesma sub-rede do mesmo
+  pool em duas interfaces é recusada; bits dentro do prefixo delegado ("o /60 não comporta o
+  id 0x100") só se sabe com o prefixo na mão e viram o motivo do `I`.
+- Os endereços entram no kernel sem validade (permanentes) e saem quando o prefixo sai: nunca
+  sobrevivem ao prefixo (RFC 9915 §18.2.10.1, RFC 9096 L-15) e não ficam "deprecated" para
+  sempre como no bug do RouterOS 7.23.3. Anunciar o prefixo na LAN (RA/DHCPv6 servidor) é outro item.
+- `Session::effective` resolve os endereços: o HAL nunca vê `::1/64` cru.
+
+## 12. Router Advertisements (`ipv6.settings`)
+
+O kernel aceita RA sozinho (`accept_ra=1` com forwarding desligado): foi assim que o endereço do
+provedor apareceu na `eno1` sem o CoreRouter saber. Agora quem decide é a config:
+
+| `accept_router_advertisements` | Kernel (`net.ipv6.conf.<if>.accept_ra`) |
+|---|---|
+| **`auto`** (padrão) | `2` só nas interfaces com cliente DHCPv6 habilitado (a WAN); `0` no resto |
+| `yes` | `2` (aceita mesmo roteando) |
+| `no` | `0` |
+| `yes-if-forwarding-disabled` | `1` (o padrão do RouterOS: o kernel decide pelo forwarding) |
+
+`accept_router_advertisements_on` (lista de interfaces: `all`, `none` ou uma de `interface.list`)
+restringe onde vale. **Padrão seguro** (`auto`): a LAN nunca aceita RA (um RA falso na LAN não
+rouba a rota padrão nem renumera o roteador; e o receptor de RA fica desligado onde não precisa —
+veja o CVE-2023-32154 do RouterOS), a WAN aceita quando o operador a declara WAN com um cliente
+DHCPv6, que é quando a rota padrão IPv6 precisa vir do RA.
+
+- O hal-linux escreve o sysctl de cada interface gerenciada a cada apply (e no primeiro apply ao
+  subir, também com a config inalterada). Quando uma interface deixa de aceitar — e no primeiro
+  apply depois de subir — o que o kernel aprendeu por RA nela (endereços sem `IFA_F_PERMANENT`,
+  rotas `proto ra`) é **removido na hora** (o RouterOS pede reboot). Sem permissão para escrever
+  em `/proc/sys` (contêiner): aviso no log, o commit não falha.
+- O aprendido por RA aparece nas listas com flag `D` e `origin: ra` (`ip.address.list` com as
+  validades, `ip.route.list` com distância 255 — a métrica 1024 do kernel perde para qualquer
+  estática ou DHCP). Não se remove à mão: o erro diz para desligar o RA.
+- No lab, o roteador atrás de cada porta N anuncia `2001:db8:0:N::/64` e ele mesmo como rota
+  padrão (`fe80::dc:ff:fe00:N`); o lab roteia, então `yes-if-forwarding-disabled` não aceita nada.
+
+## 13. Testes e onde roda (DHCPv6)
+
+| Onde | O quê |
+|---|---|
+| `proto-dhcp` `v6` | codec: Reply de exemplo, ida e volta do Solicit, regras de opção da RFC, bytes hostis (Status Code de 0/1 byte, Preference longa — o que derruba o `dhcproto` v6), proptest (bytes aleatórios, Replies mutilados, `describe`) |
+| `proto-dhcp` `client6` | relógio simulado: Rapid Commit, coleta no 1º RT, preferência 255, §15 (RT > IRT, ×2, teto), Renew em T1, servidor morto → Rebind em T2 → perda, NoBinding → Request, só prefixo × `accept_prefix_without_address`, backoff, Release (REL_MAX_RC), stop sem Release, servidores permitidos, T1/T2 = 0, T1 > T2, infinito, validade 0, respostas estranhas, limite de taxa |
+| `engine/tests/dhcp6_client.rs` | comandos (sucesso, validação sem efeito, rollback), lab: endereço e pool, LAN do pool e renumeração, erros de pool, política de RA (auto/no/yes/lista), rota padrão pelo servidor, renew/release/NoBinding, só prefixo, servidores recusados, transação, config salva |
+| `corerouter-daemon/tests/netns_dhcp6.rs` | daemon `--backend linux` em namespace sem root, veth até outro namespace com servidor DHCPv6 em Rust e RAs a cada 500 ms: o kernel autoconfigura sozinho antes; o daemon zera `accept_ra` e limpa; com o cliente: `accept_ra=2` na WAN, /128 e prefixo, `::1/64` da LAN no kernel, SLAAC e rota `proto ra` listados com origem; Renew; Release tira /128 e LAN; RA desligado limpa na hora |
+| `ui`, `shell` | janelas IPv6 no teste headless; `/ipv6 dhcp-client`, `/ipv6 pool`, `/ipv6 settings` |
+
+GUI: **IPv6 › DHCPv6 Client** (tabela G1.9, Renew/Release, diálogo com as abas DHCP, Status,
+Advanced e Options), **IPv6 › IPv6 Pool** (prefixos e quem os usa) e **IPv6 › IPv6 Settings**
+(política de RA e, por interface, se aceita e por quê); Addresses ganhou a coluna Origin (pool e
+o motivo da espera, dhcp, dhcpv6, ra) e o campo "from pool". O histórico vai para o Log.
+
+Transporte (hal-linux `dhcp6`): socket UDP na porta 546 preso à interface (`SO_BINDTODEVICE`,
+`SO_REUSEADDR` para várias interfaces), tudo para `ff02::1:2` porta 547 saindo dela; o kernel
+escolhe o link-local de origem e o servidor responde a ele. A Server Unicast foi aposentada pela
+RFC 9915: nunca mandamos unicast. Antes do DAD do link-local o envio falha e a retransmissão cobre.
+Porta 546 ocupada (outro cliente DHCPv6 no host) vira `error` com o motivo.
+
+## 14. Pesquisa (G4.7b)
+
+Fontes (texto próprio): MikroTik RouterOS 7.25
+[`/ipv6 dhcp-client`](https://manual.mikrotik.com/docs/7.25/cli-reference/ipv6/dhcp-client/),
+[DHCPv6 client](https://manual.mikrotik.com/docs/7.25/network-management/dhcp/dhcpv6-client/),
+[`/ipv6 settings`](https://manual.mikrotik.com/docs/7.25/cli-reference/ipv6/settings/),
+[`/ipv6 address`](https://manual.mikrotik.com/docs/7.25/cli-reference/ipv6/address/),
+[`/ipv6 pool`](https://manual.mikrotik.com/docs/7.25/cli-reference/ipv6/pool/),
+[CVE-2023-32154](https://mikrotik.com/supportsec/cve-2023-32154);
+[VyOS `dhcpv6-options`](https://docs.vyos.io/en/latest/configuration/interfaces/ethernet.html),
+[OpenWrt `dhcpv6`/odhcp6c](https://openwrt.org/docs/guide-user/network/ipv6/configuration),
+[OPNsense](https://docs.opnsense.org/manual/interfaces.html), Cisco IOS-XE `ipv6 dhcp client pd`
+\+ general prefix; RFCs: [RFC 9915](https://www.rfc-editor.org/rfc/rfc9915.html) (DHCPv6, STD 102,
+jan/2026, obsoleta a [RFC 8415](https://datatracker.ietf.org/doc/rfc8415/) com a mesma numeração
+de seções; errata [8415](https://errata.rfc-editor.org/rfc8415) e
+[9915](https://errata.rfc-editor.org/rfc9915) — nenhuma muda o lado do cliente além do texto),
+§§7.1–7.6, 11, 14.1, 15, 16, 18.2.1–18.2.13, 21.4–21.24; RFC 4861 (ND/RA), RFC 4862 (SLAAC),
+RFC 4191, RFC 8106; [RFC 7084](https://www.rfc-editor.org/rfc/rfc7084.html) (CE router: W-3,
+W-5, WPD-1..8) e [RFC 9096](https://www.rfc-editor.org/rfc/rfc9096.html) (WPD-9, WPD-10, L-15,
+L-16); kernel [`ip-sysctl`](https://docs.kernel.org/networking/ip-sysctl.html) (`accept_ra` 0/1/2).
+
+- **MikroTik:** `request` address/prefix/info, `pool-name` + `pool-prefix-length`,
+  `prefix-hint` (`::/0` = nada), `add-default-route` (não; via o servidor),
+  `default-route-distance`, `use-peer-dns`, `rapid-commit`, `accept-prefix-without-address`,
+  `custom-duid`, `validate-server-duid`, `allow-reconfigure`; `/ipv6 address from-pool=`
+  com o endereço como sufixo; `/ipv6 settings accept-router-advertisements`
+  (no/yes/yes-if-forwarding-disabled, padrão o último) + `accept-router-advertisements-on`
+  (lista); mudar o RA exige **reboot** para limpar o SLAAC; endereços do pool ficaram
+  "deprecated" para sempre num bug do 7.23.3.
+- **Outros:** VyOS põe o id da sub-rede (`sla-id`) e o host de cada LAN no próprio cliente;
+  OpenWrt tem `norelease` por padrão, `reqaddress try/force`, `ip6hint` por LAN; OPNsense tem
+  "Track Interface" + "Prefix ID"; Cisco tem o "general prefix" nomeado com o sufixo na LAN.
+- **Adotado:** os nomes e padrões do RouterOS; o sufixo com id de sub-rede explícito e estável (o
+  melhor do Cisco/VyOS/OPNsense, sem estado de alocação); sem Release ao parar (OpenWrt, RFC 9096);
+  `auto` como padrão de RA (só na WAN declarada) — mais seguro que o `yes-if-forwarding-disabled`
+  do RouterOS e sem reboot; o aprendido por RA visível com origem e validade; histórico e opções
+  recebidas como na parte 1; servidores permitidos também por DUID e por MAC dentro do DUID;
+  codec próprio (o `dhcproto` 0.15 v6 tem `panic` com Status Code curto e dessincroniza com
+  Preference/Rapid Commit de tamanho errado — a pesquisa leu o código-fonte; ficaria atrás de
+  outro saneador maior que o próprio codec).
+- **Fora agora (viram gap):** `request=info` (stateless) e Information Refresh Time; Confirm/Rebind
+  ao voltar o link (§18.2.12) e lembrar o lease (com o G4.7c); Decline após DAD falho; Reconfigure
+  com RKAP; PD Exclude (RFC 6603); vários endereços/prefixos por IA; `pool-prefix-length` e pools
+  estáticos (`ipv6.pool.add`); RA e servidor DHCPv6 na LAN a partir do pool (validades limitadas à
+  do prefixo, L-13/L-16); rota de descarte do prefixo delegado (WPD-5); `prefix-address-lists`;
+  `check-gateway` v6; gerenciar `forward` (hoje o kernel decide; mexer nele mudaria a máquina de
+  desenvolvimento); RDNSS/DNSSL do RA para o DNS (G4.1).
 
 ## Histórico de revisão
 

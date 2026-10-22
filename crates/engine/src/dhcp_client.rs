@@ -45,9 +45,12 @@ fn dyn_id(client: ItemId, n: usize) -> ItemId {
     ItemId(DYN_BASE | ((client.0 & 0x3_FFFF) << 8) | n)
 }
 
-/// Whether `id` names an address or route a DHCP client installed.
+/// Whether `id` names an address or route a DHCP client installed (v4 or
+/// v6) or the kernel learned from Router Advertisements.
 pub fn is_dynamic(id: ItemId) -> bool {
     id.0 & 0xFC00_0000 == DYN_BASE
+        || crate::dhcp6_client::is_dynamic6(id)
+        || crate::dhcp6_client::is_learned(id)
 }
 
 /// One line of the history.
@@ -209,6 +212,7 @@ pub fn lease_entries(
         interface: c.interface.clone(),
         disabled: false,
         comment: String::new(),
+        from_pool: None,
     };
     let mut wanted: Vec<(Ipv4Net, Ipv4Addr)> = Vec::new();
     let classless = !lease.classless.is_empty();
@@ -350,12 +354,12 @@ impl Session {
     /// has disabled) are left out, and so is a route a static route already
     /// holds (same table, destination and distance: the kernel takes one).
     pub(crate) fn effective<'a>(&self, cfg: &'a Config) -> Cow<'a, Config> {
-        if self
+        let v4_quiet = self
             .dhcp
             .runners
             .values()
-            .all(|r| r.addresses.is_empty() && r.routes.is_empty())
-        {
+            .all(|r| r.addresses.is_empty() && r.routes.is_empty());
+        if v4_quiet && self.dhcp6_quiet(cfg) {
             return Cow::Borrowed(cfg);
         }
         let mut out = cfg.clone();
@@ -381,6 +385,8 @@ impl Session {
                 }
             }
         }
+        // DHCPv6 (G4.7b): leases, and the addresses taken from pools.
+        self.dhcp6_extend(cfg, &mut out);
         Cow::Owned(out)
     }
 
@@ -399,6 +405,8 @@ impl Session {
             };
             self.dhcp_after(id, actions);
         }
+        // The DHCPv6 clients (G4.7b) run on the same clock.
+        self.dhcp6_service(now_ms);
     }
 
     /// Apply what a state machine asked for (bind, unbind, log).

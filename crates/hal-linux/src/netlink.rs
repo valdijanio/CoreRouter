@@ -10,13 +10,16 @@
 //! are no-ops with no undo, so applying twice is harmless.
 
 use std::fmt::Write as _;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv6Addr};
 
-use corerouter_hal::{Features, HalError, NO_VRF};
+use corerouter_hal::{Features, HalError, Learned, NO_VRF};
 use corerouter_model::IfName;
-use futures_util::TryStreamExt;
-use ipnet::IpNet;
-use rtnetlink::packet_route::address::AddressMessage;
+use futures_util::{StreamExt, TryStreamExt};
+use ipnet::{IpNet, Ipv6Net};
+use rtnetlink::packet_route::AddressFamily;
+use rtnetlink::packet_route::address::{
+    AddressAttribute, AddressFlags, AddressHeaderFlags, AddressMessage, AddressScope,
+};
 use rtnetlink::packet_route::link::{
     InfoData, InfoKind, InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State,
 };
@@ -234,6 +237,85 @@ pub(crate) fn features() -> Features {
         log::warn!("{NO_VRF}: ip.vrf.add is disabled");
     }
     Features { vrf }
+}
+
+/// Bound on one address or route dump (hostile input; **estimado**).
+const MAX_DUMP: usize = 1 << 20;
+
+/// What the kernel learned from Router Advertisements on the links of
+/// `names` (index → name): global IPv6 addresses it made itself (no
+/// `IFA_F_PERMANENT`: SLAAC, temporary) and routes of protocol `ra`.
+pub(crate) fn learned(
+    names: &std::collections::BTreeMap<u32, IfName>,
+) -> Result<Vec<Learned>, HalError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    with_kernel(|k| async move { k.learned(names).await.map_err(HalError::Io) })
+}
+
+/// Remove what [`learned`] would show on `links`, except addresses in
+/// `keep` (the config's own). Returns how many entries went.
+pub(crate) fn flush_learned(links: &[IfName], keep: &[(IfName, IpNet)]) -> Result<usize, HalError> {
+    with_kernel(|k| async move { k.flush_learned(links, keep).await.map_err(HalError::Io) })
+}
+
+fn infinite_or(secs: u32) -> Option<u32> {
+    (secs != u32::MAX).then_some(secs)
+}
+
+/// A global address the kernel configured itself, as (address, valid, preferred).
+fn self_made(m: &AddressMessage) -> Option<(Ipv6Net, Option<u32>, Option<u32>)> {
+    if m.header.family != AddressFamily::Inet6 || m.header.scope != AddressScope::Universe {
+        return None;
+    }
+    let mut addr = None;
+    let mut permanent = m.header.flags.contains(AddressHeaderFlags::Permanent);
+    let mut life = (None, None);
+    for a in &m.attributes {
+        match a {
+            AddressAttribute::Address(IpAddr::V6(v6)) => addr = Some(*v6),
+            AddressAttribute::Flags(f) => permanent |= f.contains(AddressFlags::Permanent),
+            AddressAttribute::CacheInfo(c) => {
+                life = (infinite_or(c.ifa_valid), infinite_or(c.ifa_preferred));
+            }
+            _ => {}
+        }
+    }
+    if permanent {
+        return None;
+    }
+    let net = Ipv6Net::new(addr?, m.header.prefix_len).ok()?;
+    Some((net, life.0, life.1))
+}
+
+/// An RA route, as (destination, gateway, oif, metric, table, expires).
+#[allow(clippy::type_complexity)]
+fn ra_route(m: &RouteMessage) -> Option<(Ipv6Net, Option<Ipv6Addr>, u32, u32, u32, Option<u32>)> {
+    let h = &m.header;
+    if h.protocol != RouteProtocol::Ra {
+        return None;
+    }
+    let mut table = u32::from(h.table);
+    let (mut dst, mut gw, mut oif, mut prio, mut expires) = (None, None, None, 0, None);
+    for a in &m.attributes {
+        match a {
+            RouteAttribute::Table(t) => table = *t,
+            RouteAttribute::Destination(RouteAddress::Inet6(d)) => dst = Some(*d),
+            RouteAttribute::Gateway(RouteAddress::Inet6(g)) => gw = Some(*g),
+            RouteAttribute::Oif(i) => oif = Some(*i),
+            RouteAttribute::Priority(p) => prio = *p,
+            // Hundredths of a second.
+            RouteAttribute::CacheInfo(c) if c.expires > 0 => expires = Some(c.expires / 100),
+            _ => {}
+        }
+    }
+    let dst = Ipv6Net::new(
+        dst.unwrap_or(Ipv6Addr::UNSPECIFIED),
+        h.destination_prefix_length,
+    )
+    .ok()?;
+    Some((dst, gw, oif?, prio, table, expires))
 }
 
 /// A private current-thread runtime and netlink connection for one call.
@@ -700,6 +782,119 @@ impl Kernel {
             Err(e) if matches!(errno(&e), Some(ESRCH | ENOENT)) => Ok(vec![]),
             Err(e) => Err(readable(&e)),
         }
+    }
+
+    async fn addresses_v6(&self) -> Result<Vec<AddressMessage>, String> {
+        self.handle
+            .address()
+            .get()
+            .execute()
+            .try_filter(|m| futures_util::future::ready(m.header.family == AddressFamily::Inet6))
+            .take(MAX_DUMP)
+            .try_collect()
+            .await
+            .map_err(|e| format!("listing addresses: {}", readable(&e)))
+    }
+
+    async fn routes_v6(&self) -> Result<Vec<RouteMessage>, String> {
+        self.handle
+            .route()
+            .get(RouteMessageBuilder::<Ipv6Addr>::new().table_id(0).build())
+            .execute()
+            .take(MAX_DUMP)
+            .try_collect()
+            .await
+            .map_err(|e| format!("listing routes: {}", readable(&e)))
+    }
+
+    async fn learned(
+        &self,
+        names: &std::collections::BTreeMap<u32, IfName>,
+    ) -> Result<Vec<Learned>, String> {
+        let mut out = Vec::new();
+        for m in self.addresses_v6().await? {
+            let Some(interface) = names.get(&m.header.index) else {
+                continue;
+            };
+            if let Some((address, valid_secs, preferred_secs)) = self_made(&m) {
+                out.push(Learned::Address {
+                    interface: interface.clone(),
+                    address,
+                    valid_secs,
+                    preferred_secs,
+                });
+            }
+        }
+        for m in self.routes_v6().await? {
+            let Some((dst, gateway, oif, metric, table, expires_secs)) = ra_route(&m) else {
+                continue;
+            };
+            let Some(interface) = names.get(&oif) else {
+                continue;
+            };
+            out.push(Learned::Route {
+                interface: interface.clone(),
+                dst,
+                gateway,
+                metric,
+                table,
+                expires_secs,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn flush_learned(
+        &self,
+        links: &[IfName],
+        keep: &[(IfName, IpNet)],
+    ) -> Result<usize, String> {
+        let mut index = std::collections::BTreeMap::new();
+        for l in links {
+            if let Some(link) = self.find(l).await? {
+                index.insert(link.index, l.clone());
+            }
+        }
+        let mut gone = 0usize;
+        for m in self.addresses_v6().await? {
+            let Some(name) = index.get(&m.header.index) else {
+                continue;
+            };
+            let Some((net, _, _)) = self_made(&m) else {
+                continue;
+            };
+            if keep.iter().any(|(i, a)| i == name && *a == IpNet::V6(net)) {
+                continue;
+            }
+            match self.handle.address().del(m).execute().await {
+                Ok(()) => gone = gone.saturating_add(1),
+                Err(e) if matches!(errno(&e), Some(EADDRNOTAVAIL | ENOENT)) => {}
+                Err(e) => return Err(format!("removing {net} from '{name}': {}", readable(&e))),
+            }
+        }
+        for m in self.routes_v6().await? {
+            let Some((dst, ..)) = ra_route(&m) else {
+                continue;
+            };
+            let oif = m.attributes.iter().find_map(|a| match a {
+                RouteAttribute::Oif(i) => Some(*i),
+                _ => None,
+            });
+            let Some(name) = oif.and_then(|i| index.get(&i)) else {
+                continue;
+            };
+            match self.handle.route().del(m).execute().await {
+                Ok(()) => gone = gone.saturating_add(1),
+                Err(e) if matches!(errno(&e), Some(ESRCH | ENOENT)) => {}
+                Err(e) => {
+                    return Err(format!(
+                        "removing RA route {dst} on '{name}': {}",
+                        readable(&e)
+                    ));
+                }
+            }
+        }
+        Ok(gone)
     }
 
     /// Whether the kernel holds `r` exactly (static, same next hop).

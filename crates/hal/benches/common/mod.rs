@@ -40,6 +40,7 @@ fn push_address(cfg: &mut Config, port: &str, a: &str) {
         interface: name(port),
         disabled: false,
         comment: String::new(),
+        from_pool: None,
     });
 }
 

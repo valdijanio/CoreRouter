@@ -8,6 +8,7 @@ pub mod config;
 pub mod dhcp_client;
 pub mod firewall;
 pub mod interface_list;
+pub mod ipv6;
 pub mod neighbor;
 pub mod persist;
 pub mod route;
@@ -23,6 +24,7 @@ pub use config::{
 pub use dhcp_client::{AddDefaultRoute, AllowedServer, DhcpClient, ExtraOption};
 pub use firewall::{Firewall, FirewallRule, Table};
 pub use interface_list::InterfaceLists;
+pub use ipv6::{AcceptRa, AllowedServer6, Dhcp6Client, Ipv6, Ipv6Settings, Request6};
 pub use neighbor::{MgmtPorts, NeighborDiscovery, NeighborEntry, NeighborProtocol};
 pub use persist::{FORMAT_VERSION, PersistError};
 pub use route::Reach;

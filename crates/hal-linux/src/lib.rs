@@ -8,6 +8,9 @@
 //!   links are CoreRouter's. The others are listed but never applied to.
 //! - `dhcp`: DHCP client transport (G4.7): frames over `AF_PACKET` with a
 //!   BPF filter, unicasts over UDP 68, ARP probe; bytes only (`proto-dhcp`).
+//!   `dhcp6`: the DHCPv6 one (UDP 546). `ra`: which interfaces accept
+//!   Router Advertisements (sysctl `accept_ra`), synced on every apply, and
+//!   what the kernel learned from them (`Hal::ipv6_learned`) (G4.7b).
 //! - `l2`: neighbor-discovery I/O — LLDP frames over `AF_PACKET`, passive
 //!   MNDP over UDP 5678 (G5.2). Bytes only; the codecs are `proto-lldp` /
 //!   `proto-mndp`, glued by the daemon.
@@ -59,6 +62,14 @@ pub mod l2;
 #[cfg(target_os = "linux")]
 pub mod dhcp;
 
+/// DHCPv6 client transport (G4.7b): UDP 546 → ff02::1:2.
+#[cfg(target_os = "linux")]
+pub mod dhcp6;
+
+/// Router Advertisements: `accept_ra` per interface, flush (G4.7b).
+#[cfg(target_os = "linux")]
+pub mod ra;
+
 /// Host ICMP for the diagnostic tools (G6.2).
 #[cfg(target_os = "linux")]
 pub mod icmp;
@@ -89,6 +100,8 @@ mod linux {
         policy: Policy,
         /// What the last applied config says each name is (`owner` rule 5).
         claims: BTreeMap<IfName, InterfaceKind>,
+        /// Whether `ra::sync` ran once (the first one flushes stale RA state).
+        ra_synced: bool,
         /// Each port's Ethernet settings before CoreRouter first changed
         /// them (G1.20): what a setting taken out of the config returns to.
         ether_orig: BTreeMap<IfName, EtherState>,
@@ -125,6 +138,40 @@ mod linux {
                 .collect();
             out.sort_by(|a, b| a.0.name.cmp(&b.0.name));
             Ok(out)
+        }
+    }
+
+    impl LinuxHal {
+        /// `accept_ra` per managed interface of `to` (G4.7b). Best effort:
+        /// a failure is logged, never refuses the commit.
+        fn sync_ra(&mut self, to: &Config) {
+            let mut claims = self.claims.clone();
+            claims.extend(claims_of(to));
+            let managed: std::collections::BTreeSet<IfName> = match self.view(&claims) {
+                Ok(v) => v
+                    .into_iter()
+                    .filter(|(_, o)| *o == Owner::Managed)
+                    .filter_map(|(l, _)| l.name.parse().ok())
+                    .collect(),
+                Err(e) => {
+                    log::warn!("ipv6 RA settings not applied: {e}");
+                    return;
+                }
+            };
+            for p in crate::ra::sync(to, &managed, !self.ra_synced) {
+                log::warn!("ipv6 RA settings: {p}");
+            }
+            self.ra_synced = true;
+        }
+
+        /// Kernel index → name of the managed links.
+        fn managed_indexes(&self) -> Result<BTreeMap<u32, IfName>, HalError> {
+            Ok(self
+                .view(&self.claims)?
+                .into_iter()
+                .filter(|(_, o)| *o == Owner::Managed)
+                .filter_map(|(l, _)| Some((l.index, l.name.parse().ok()?)))
+                .collect())
         }
     }
 
@@ -300,6 +347,8 @@ mod linux {
             }
             if ops.is_empty() {
                 self.claims = claims_of(to);
+                // After the links exist (a new VLAN has no sysctl before).
+                self.sync_ra(to);
                 return Ok(());
             }
             let mut claims = claims_of(from);
@@ -322,6 +371,7 @@ mod linux {
             match crate::netlink::apply(&run) {
                 Ok(()) => {
                     self.claims = claims_of(to);
+                    self.sync_ra(to);
                     Ok(())
                 }
                 Err(e) => {
@@ -409,6 +459,20 @@ mod linux {
             crate::dhcp::LinuxDhcpPort::open(name)
                 .map(|p| Box::new(p) as Box<dyn corerouter_hal::DhcpPort>)
                 .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn dhcp6_port(
+            &mut self,
+            name: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::Dhcp6Port>, HalError> {
+            crate::dhcp6::LinuxDhcp6Port::open(name)
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::Dhcp6Port>)
+                .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn ipv6_learned(&mut self) -> Result<Vec<corerouter_hal::Learned>, HalError> {
+            let names = self.managed_indexes()?;
+            crate::netlink::learned(&names)
         }
 
         fn prober(&self) -> Result<corerouter_hal::SharedProber, String> {
