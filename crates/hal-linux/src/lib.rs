@@ -524,6 +524,14 @@ mod linux {
                 .map_err(|e| HalError::Io(e.to_string()))
         }
 
+        fn dhcp_relay_uplink(
+            &mut self,
+        ) -> Result<Box<dyn corerouter_hal::dhcp_server::DhcpUplink>, HalError> {
+            crate::dhcp_server::LinuxDhcpUplink::open()
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::dhcp_server::DhcpUplink>)
+                .map_err(|e| HalError::Io(e.to_string()))
+        }
+
         fn dhcp6_port(
             &mut self,
             name: &IfName,

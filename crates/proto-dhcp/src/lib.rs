@@ -9,7 +9,8 @@
 //! - [`v6`], [`client6`], [`lab6`]: the same for DHCPv6 (G4.7b), with a
 //!   codec of our own (RFC 9915);
 //! - [`server`]: the DHCPv4 server (G4.2a), pure like the client, and
-//!   [`lab_hosts`], the lab's simulated clients for it.
+//!   [`lab_hosts`], the lab's simulated clients for it; [`relay`], the
+//!   relay agent (G4.2b).
 //!
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
@@ -20,6 +21,7 @@ pub mod lab;
 pub mod lab6;
 pub mod lab_hosts;
 pub mod optval;
+pub mod relay;
 pub mod server;
 pub mod v4;
 pub mod v6;

@@ -57,11 +57,13 @@ fn run(session: &Shared, health: &super::Health) {
             let mut s = lock(session);
             let heard = s.dhcp_server_poll(ms, &clock);
             let d = &s.store().running().ip.dhcp_server;
-            let configured = d.servers.iter().any(|x| !x.disabled) || d.alerts.iter().any(|a| !a.disabled);
+            let configured = d.servers.iter().any(|x| !x.disabled)
+                || d.alerts.iter().any(|a| !a.disabled)
+                || s.store().running().ip.dhcp_relays.relays.iter().any(|r| !r.disabled);
             (heard, s.dhcp_server_ports(), configured, s.dhcp_server_journal_error())
         };
         if !configured {
-            health.disabled(Some("no enabled DHCP server (ip.dhcp-server.add)"));
+            health.disabled(Some("no enabled DHCP server nor relay (ip.dhcp-server.add, ip.dhcp-relay.add)"));
             health.listen(Vec::new());
             rest = IDLE;
             continue;

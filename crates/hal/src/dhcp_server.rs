@@ -80,6 +80,23 @@ pub trait DhcpServerPort: Send {
     fn describe(&self) -> String {
         String::new()
     }
+
+    /// Send a client's DISCOVER (port 68 to 67, broadcast, from 0.0.0.0):
+    /// the alert looks for servers that only answer by unicast (G4.2b).
+    fn send_discover(&mut self, payload: &[u8]) -> Result<(), HalError> {
+        let _ = payload;
+        Ok(())
+    }
+}
+
+/// The relay agent's side towards the servers (G4.2b): UDP port 67 on
+/// every interface, routed. Replies of the servers come back here.
+pub trait DhcpUplink: Send {
+    /// Next message to port 67 (`src` is the server's address).
+    fn recv(&mut self) -> Result<Option<Heard>, HalError>;
+
+    /// Send `payload` to `server` port 67.
+    fn send(&mut self, payload: &[u8], server: Ipv4Addr) -> Result<(), HalError>;
 }
 
 /// The virtual lab's hosts: simulated DHCP clients (and a squatter, and a

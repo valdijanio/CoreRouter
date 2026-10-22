@@ -645,13 +645,30 @@ fn lease_checks(cfg: &Config, out: &mut Out) {
         {
             out.err(at("server"), l.id, "server", format!("no server '{s}'"));
         }
-        if l.mac_address.is_none() && l.client_id.is_empty() {
+        if l.mac_address.is_none()
+            && l.client_id.is_empty()
+            && l.agent_circuit_id.is_empty()
+            && l.agent_remote_id.is_empty()
+        {
             out.err(
                 at("mac_address"),
                 l.id,
                 "client",
-                "a static lease needs a MAC or a client id",
+                "a static lease needs a MAC or a client id (or an option 82 id)",
             );
+        }
+        for (field, v) in [
+            ("agent_circuit_id", &l.agent_circuit_id),
+            ("agent_remote_id", &l.agent_remote_id),
+        ] {
+            if !v.is_empty() && super::agent::parse(v).is_none() {
+                out.err(
+                    at(field),
+                    l.id,
+                    "option 82",
+                    "text, or 0x… bytes; at most 255",
+                );
+            }
         }
         let cid = if l.client_id.is_empty() {
             None
@@ -876,9 +893,123 @@ fn other_checks(cfg: &Config, out: &mut Out) {
     }
 }
 
+fn relay_checks(cfg: &Config, out: &mut Out) {
+    use corerouter_model::dhcp_relay::{MAX_RELAYS, MAX_SERVERS as MAX_RELAY_SERVERS};
+    let relays = &cfg.ip.dhcp_relays.relays;
+    if relays.len() > MAX_RELAYS {
+        out.err(
+            "ip.dhcp_relays".into(),
+            ItemId(0),
+            "too many",
+            format!("at most {MAX_RELAYS} relays"),
+        );
+    }
+    let mine = router_addresses(cfg);
+    let mut names = BTreeSet::new();
+    let mut ifaces = BTreeSet::new();
+    for r in relays {
+        let at = |f: &str| format!("ip.dhcp_relays.relays[{}].{f}", r.id);
+        if !ip_pool::name_ok(&r.name) || !names.insert(r.name.as_str()) {
+            out.err(
+                at("name"),
+                r.id,
+                "name",
+                format!("'{}': a unique name", r.name),
+            );
+        }
+        if !cfg.interfaces.contains_key(&r.interface) {
+            out.err(
+                at("interface"),
+                r.id,
+                "interface",
+                format!("interface '{}' does not exist", r.interface),
+            );
+        }
+        if r.dhcp_server.is_empty() || r.dhcp_server.len() > MAX_RELAY_SERVERS {
+            out.err(
+                at("dhcp_server"),
+                r.id,
+                "servers",
+                format!("1..={MAX_RELAY_SERVERS} DHCP servers"),
+            );
+        }
+        if r.relay_info_remote_id.len() > 64 {
+            out.err(
+                at("relay_info_remote_id"),
+                r.id,
+                "remote id",
+                "at most 64 characters",
+            );
+        }
+        if r.disabled {
+            continue;
+        }
+        if !ifaces.insert(&r.interface) {
+            out.err(
+                at("interface"),
+                r.id,
+                "interface",
+                format!("another relay already serves '{}'", r.interface),
+            );
+        }
+        if let Some(s) = cfg
+            .ip
+            .dhcp_server
+            .servers
+            .iter()
+            .find(|s| !s.disabled && s.interface == r.interface && s.relay.is_none())
+        {
+            out.err(
+                at("interface"),
+                r.id,
+                "server here",
+                format!(
+                    "DHCP server '{}' already answers on '{}': a client would get two answers",
+                    s.name, r.interface
+                ),
+            );
+        }
+        let on_link: Vec<_> = mine
+            .iter()
+            .filter(|(_, i)| **i == r.interface)
+            .map(|(n, _)| *n)
+            .collect();
+        match r.local_address {
+            Some(a) if !mine.iter().any(|(n, _)| n.addr() == a) => out.err(
+                at("local_address"),
+                r.id,
+                "local address",
+                format!("{a} is not one of the router's addresses"),
+            ),
+            None if on_link.is_empty() => out.warn(
+                at("interface"),
+                r.id,
+                "no address",
+                format!(
+                    "'{}' has no IPv4 address to relay from (giaddr): set local_address or add one",
+                    r.interface
+                ),
+            ),
+            _ => {}
+        }
+        if r.dhcp_server
+            .iter()
+            .any(|s| on_link.iter().any(|n| n.contains(s)))
+        {
+            out.warn(
+                at("dhcp_server"),
+                r.id,
+                "same link",
+                "a server on the clients' own link hears them directly",
+            );
+        }
+    }
+}
+
 /// Every check of the DHCP server's config (and of `/ip pool`).
 pub fn checks(cfg: &Config) -> Vec<Check> {
     let mut out = Out(Vec::new());
+    relay_checks(cfg, &mut out);
     pool_checks(cfg, &mut out);
     server_checks(cfg, &mut out);
     network_checks(cfg, &mut out);
@@ -889,7 +1020,7 @@ pub fn checks(cfg: &Config) -> Vec<Check> {
 
 /// The errors, as validation issues: the commit is refused while any exist.
 pub fn validate(cfg: &Config) -> Vec<Issue> {
-    if cfg.ip.pools.is_empty() && cfg.ip.dhcp_server.is_empty() {
+    if cfg.ip.pools.is_empty() && cfg.ip.dhcp_server.is_empty() && cfg.ip.dhcp_relays.is_empty() {
         return Vec::new();
     }
     checks(cfg)

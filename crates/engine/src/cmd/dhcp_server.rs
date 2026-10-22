@@ -156,14 +156,18 @@ pub(super) fn opt_ref(p: &Value, key: &str, none: &[&str]) -> Result<Option<Opti
     }
 }
 
-/// A duration: seconds or `1h30m`, as u32.
+/// A duration: seconds or `1h30m`, `365d`, `52w` (RouterOS), as u32.
 pub(super) fn opt_secs(p: &Value, key: &str) -> Result<Option<u32>> {
-    match super::firewall::parse_timeout(p, key)? {
-        None => Ok(None),
-        Some(s) => u32::try_from(s)
-            .map(Some)
-            .map_err(|_| EngineError::bad(key, "too long")),
-    }
+    let text = match p.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::Number(n)) => n.to_string(),
+        Some(Value::String(s)) => s.clone(),
+        Some(_) => return Err(EngineError::bad(key, "seconds or like 1h30m")),
+    };
+    corerouter_model::dhcp_server::parse_duration(&text)
+        .and_then(|s| u32::try_from(s).ok())
+        .map(Some)
+        .ok_or_else(|| EngineError::bad(key, "seconds or like 30m, 1d12h, 52w (at most 10 years)"))
 }
 
 /// The checks about item `id` in the candidate: the first error refuses

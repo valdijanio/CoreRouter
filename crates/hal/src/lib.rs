@@ -240,6 +240,14 @@ pub trait Hal: Send {
         )))
     }
 
+    /// Open the DHCP relay's socket towards the servers (G4.2b).
+    fn dhcp_relay_uplink(&mut self) -> Result<Box<dyn dhcp_server::DhcpUplink>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no DHCP relay transport (only servers on the router itself)",
+            self.describe()
+        )))
+    }
+
     /// The lab's simulated DHCP clients (G4.2a), offered by the engine like
     /// [`Hal::offer_dhcp_lab_server`].
     fn offer_dhcp_lab_clients(&mut self, hosts: dhcp_server::SharedLabClients) {
