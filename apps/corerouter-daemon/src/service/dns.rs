@@ -349,31 +349,44 @@ impl Transport for Sockets {
 }
 
 /// Starts the resolver: registered in the session (the tools use it from
-/// there) and kept in step with the config by a thread.
+/// there) and kept in step with the config by a thread, outside the
+/// supervisor (tests).
+#[cfg(test)]
 pub(crate) fn spawn(session: Shared) -> std::io::Result<Arc<RouterDns>> {
     let dns = Arc::new(RouterDns::new());
-    {
-        let mut s = lock(&session);
-        dns.resolver.configure(s.dns_settings(), dns.now_ms());
-        s.set_dns_backend(dns.clone());
-    }
+    register(&session, &dns);
     let keep = dns.clone();
-    thread::Builder::new().name("dns".into()).spawn(move || {
-        let mut warned = false;
-        loop {
-            thread::sleep(TICK);
-            let settings = lock(&session).dns_settings();
-            if settings.servers.is_empty() && !warned {
-                log::info!(
-                    "DNS: no server configured; names will not resolve until ip.dns.set \
-                     servers=… or a DHCP client with use_peer_dns gets one"
-                );
-            }
-            warned = settings.servers.is_empty();
-            keep.resolver.configure(settings, keep.now_ms());
-        }
-    })?;
+    let health = super::Health::new(corerouter_control::Shutdown::default());
+    thread::Builder::new()
+        .name("dns".into())
+        .spawn(move || follow(&session, &keep, &health))?;
     Ok(dns)
+}
+
+fn register(session: &Shared, dns: &Arc<RouterDns>) {
+    let mut s = lock(session);
+    dns.resolver.configure(s.dns_settings(), dns.now_ms());
+    s.set_dns_backend(dns.clone());
+}
+
+/// Copies the running `/ip dns` into the resolver every tick, until stopped.
+fn follow(session: &Shared, dns: &RouterDns, health: &super::Health) {
+    let mut warned = false;
+    while health.sleep(TICK) {
+        health.beat();
+        let settings = lock(session).dns_settings();
+        if settings.servers.is_empty() && !warned {
+            log::info!(
+                "DNS: no server configured; names will not resolve until ip.dns.set \
+                 servers=… or a DHCP client with use_peer_dns gets one"
+            );
+            health.event("no DNS server configured (ip.dns.set servers=… or DHCP)");
+        } else if !settings.servers.is_empty() && warned {
+            health.event("DNS servers configured");
+        }
+        warned = settings.servers.is_empty();
+        dns.resolver.configure(settings, dns.now_ms());
+    }
 }
 
 /// Addresses of `host` for the daemon's own services (NTP client): an IP
@@ -392,20 +405,23 @@ pub(crate) fn resolve(session: &Shared, host: &str) -> Result<Vec<IpAddr>, Strin
 
 /// No flags: configured with `ip.dns.*`.
 pub(crate) const SERVICE: super::Service = super::Service {
-    name: "dns resolver",
+    name: "dns-resolver",
     flags: &[],
+    topic: "dns",
+    enable: "always on (ip.dns.set servers=…)",
+    depends: &[],
     start,
 };
 
-/// A router without it still forwards: a failure is logged, not fatal.
-fn start(ctx: &super::Ctx) -> Result<(), String> {
-    match spawn(ctx.session.clone()) {
-        Ok(dns) => {
-            let _ = ROUTER.set(dns);
-        }
-        Err(e) => log::error!("DNS resolver is off: cannot start its thread: {e}"),
-    }
-    Ok(())
+/// One resolver for the daemon's life: a restart keeps it and its cache.
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    Ok(Box::new(move |health: &super::Health| {
+        let dns = ROUTER.get_or_init(|| Arc::new(RouterDns::new())).clone();
+        register(&session, &dns);
+        follow(&session, &dns, health);
+        Ok(())
+    }))
 }
 
 #[cfg(test)]
