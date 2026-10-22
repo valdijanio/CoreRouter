@@ -83,7 +83,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas) | serde, ipnet, thiserror |
-| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio) + `VirtualHal` (lab, wasm, CI) | L0 |
+| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features) + `VirtualHal` (lab, wasm, CI) | L0 |
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal | L0–L2 (nunca plataforma) |
@@ -208,6 +208,13 @@ memória do egui (posição das janelas) não é persistida.
    inversa e devolve `HalError::Rejected` dizendo o passo, o motivo e se o rollback foi completo.
    Mudança já em vigor (MTU igual, endereço presente) é no-op sem desfazer.
 
+**Recursos do kernel (G1.14).** `Hal::features()` diz o que a plataforma suporta (hoje só
+`vrf`), para um comando recusar de antemão com o motivo (`enabled`) em vez de falhar no
+`apply`. O `LinuxHal` sonda uma vez, na primeira consulta, com um link descartável por recurso
+(nome livre, apagado em seguida; links existentes nunca são tocados) e guarda o resultado num
+`OnceLock`. Um kernel de terceiros sem `CONFIG_NET_VRF` deixa `ip.vrf.add` desabilitado; as
+imagens do G1.6 vêm com `CONFIG_NET_VRF=y`.
+
 ### Rotas estáticas e VRF (G1.5)
 
 - **Modelo:** `ip.routes` (`RouteEntry`: `dst_address`, `gateway`, `distance`, `routing_table`,
@@ -246,3 +253,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-21 — G0.4: trait `Backend` da UI, GUI remota (nativo e WebSocket), `control::ws`.
 - 2026-10-21 — G1.11: preferências da janela (tema, comentários inline) fora do engine.
 - 2026-10-21 — G1.5: rotas estáticas e VRF (`model::route`, passos 0 e 9 do plano).
+- 2026-10-22 — G1.14: `Hal::features` e a sonda de recursos do `hal-linux`.

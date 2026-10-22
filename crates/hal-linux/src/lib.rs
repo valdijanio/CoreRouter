@@ -4,6 +4,8 @@
 //!   operations (pure, tested everywhere); `netlink` runs them over rtnetlink
 //!   and undoes the done ones if one fails (G1.2).
 //! - discovery and counters: `/sys/class/net` (netlink stats in G1.7).
+//! - `features`: probed once, on first use, with a throwaway link per
+//!   capability (`netlink::features`), then cached (G1.14).
 //!
 //! Integration tests run against a real kernel inside a throwaway network
 //! namespace, without root: see `tests/netns.rs`.
@@ -17,9 +19,10 @@ mod netlink;
 mod linux {
     use std::fs;
     use std::path::Path;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use corerouter_hal::{Hal, HalError, LinkInfo, LinkState};
+    use corerouter_hal::{Features, Hal, HalError, LinkInfo, LinkState};
     use corerouter_model::{Config, IfName};
 
     const SYS_NET: &str = "/sys/class/net";
@@ -29,7 +32,8 @@ mod linux {
 
     #[derive(Debug, Default)]
     pub struct LinuxHal {
-        _private: (),
+        /// Probed on the first `features()` call, not at startup.
+        features: OnceLock<Features>,
     }
 
     impl LinuxHal {
@@ -105,6 +109,10 @@ mod linux {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs())
+        }
+
+        fn features(&self) -> Features {
+            *self.features.get_or_init(crate::netlink::features)
         }
     }
 }

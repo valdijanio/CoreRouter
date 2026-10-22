@@ -118,6 +118,19 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   "New Route" (revisão 3), backup distance 10 e `::/0` pela CLI; daemon e GUI reiniciados →
   revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
   pref-src, criar VRF pela GUI.
+- 2026-10-22 — G1.14: kernel sem VRF. `Hal::features() -> Features { vrf }` (aditivo, padrão
+  "tudo"; `VirtualHal` diz sim). `LinuxHal` sonda uma vez, na primeira consulta, criando um link
+  `vrf` descartável (`crvrf<pid>`, tabela fora da faixa do engine; nome ocupado é pulado, só o
+  link criado pela sonda é apagado) e guarda o resultado; sonda indecisa (sem `CAP_NET_ADMIN`)
+  assume sim e registra o motivo. `ip.vrf.add` ganha `enabled`: sem VRF, fica desabilitado com
+  "this kernel has no VRF support (CONFIG_NET_VRF / module vrf)" (menus e `list_commands`
+  mostram o motivo); criar link `vrf` com EOPNOTSUPP no `apply` dá o mesmo texto (o rollback já
+  era limpo). `Session::hal()` (leitura, `pub(crate)`) é a única mudança em `session.rs`. CI: o
+  job Linux roda `sudo modprobe vrf` (com `linux-modules-extra-$(uname -r)` como plano B) e
+  `COREROUTER_REQUIRE_VRF=1`, que faz `vrf_routes_live_in_their_own_table` falhar em vez de
+  pular e transforma o `skip` do passo netns do xtask em FAIL. Testes: 2 de engine (HAL falso
+  sem VRF; lab virtual), 2 unitários do mapeamento de erro/veredito da sonda, 1 em netns (sonda
+  = `ip link add … type vrf`, sem sobras).
 
 ## Histórico de revisão
 
@@ -128,3 +141,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G0.4.
 - 2026-10-21 — log do G1.10 + G1.11.
 - 2026-10-21 — log do G1.5.
+- 2026-10-22 — log do G1.14.
