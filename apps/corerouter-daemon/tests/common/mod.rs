@@ -121,7 +121,7 @@ pub fn token_file(netns: Option<u32>, dir: &std::path::Path) -> PathBuf {
     path
 }
 
-fn token_of(netns: Option<u32>) -> Option<String> {
+pub fn token_of(netns: Option<u32>) -> Option<String> {
     let t = TOKENS.lock().unwrap();
     let path = t
         .iter()

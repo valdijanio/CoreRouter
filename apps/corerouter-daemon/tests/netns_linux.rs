@@ -21,10 +21,8 @@
 mod common;
 
 use std::process::{Command, Stdio};
-use std::time::Duration;
 
 use common::*;
-use corerouter_control::Client;
 use serde_json::{Value, json};
 
 const PORT: &str = "7996";
@@ -36,7 +34,7 @@ fn ip_out(args: &[&str]) -> String {
 }
 
 fn run(command: &str, params: Value) -> Result<Value, String> {
-    Client::connect(&format!("127.0.0.1:{PORT}"), Duration::from_secs(1)).and_then(|mut c| {
+    common::client(&format!("127.0.0.1:{PORT}"), common::token_of(None)).and_then(|mut c| {
         c.call(
             "engine.execute",
             json!({"command": command, "params": params}),
@@ -95,6 +93,8 @@ fn linux_backend_sees_its_namespace_and_owns_only_its_links() {
         "--config-dir",
     ])
     .arg(&dir)
+    .arg("--token-file")
+    .arg(common::token_file(None, &dir))
     .env("RUST_LOG", "info")
     .stdout(Stdio::null())
     .stderr(log);
