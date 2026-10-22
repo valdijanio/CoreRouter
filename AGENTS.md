@@ -147,7 +147,10 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 - Antes de cada commit: `cargo xtask ci` (fmt, clippy -D warnings, test, bench-check, netns,
   docs, layers, agents-sync, wasm). Ele para no primeiro FAIL; não faça commit com FAIL. O passo
   `test` usa o `cargo nextest` quando instalado (`cargo install --locked cargo-nextest`; metade do
-  tempo, **medido**).
+  tempo, **medido**). Teste que falha e passa ao repetir sai como FLAKY/"flaky netns test" e não
+  reprova: corrija-o depois (teste instável trava a fila; foram quatro em 2026-10-22).
+- **Portão em duas camadas:** `cargo xtask ci --fast` (sem `netns` e `bench-check`) é o do PR;
+  o completo roda localmente, no lote da fila de entrada e na `main`.
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.
@@ -166,10 +169,10 @@ usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
    `gh pr create --base main --title "<id>: <resumo>"`. O corpo do PR diz o que mudou, como
    testar (comandos ou cliques), o id da gap e, em feature nova, a seção `## Pesquisa` (veja
    "Pesquisa antes de implementar").
-4. O workflow `ci` (`.github/workflows/ci.yml`) roda no PR. Vermelho? Leia o log
-   (`gh run view --log-failed`), corrija na mesma branch e faça push de novo.
-5. Com o CI verde, **pare** e diga no relato "pronto para a fila: #<n>". Não ligue
-   `gh pr merge --auto` nem faça merge.
+4. Com o PR aberto, **pare** e diga no relato "pronto para a fila: #<n>" (o `cargo xtask ci`
+   local completo já passou; não espere o CI do GitHub). Não ligue `gh pr merge --auto` nem
+   faça merge. O CI do PR roda o portão rápido (`cargo xtask ci --fast`); se ele ou a fila
+   acusarem erro, a sessão principal avisa e você corrige na mesma branch.
 
 ### Fila de entrada (sessão principal)
 

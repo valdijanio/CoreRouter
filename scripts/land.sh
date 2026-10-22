@@ -59,15 +59,16 @@ wait_checks() {
     runs=$(gh api "repos/$repo/commits/$sha/check-runs?per_page=100" \
       --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion)"')
     pending=0 failed=""
+    # Every run of each required check on this commit counts (the PR's fast gate and the full
+    # one the queue dispatches have the same names).
     while IFS= read -r name; do
       [ -z "$name" ] && continue
-      line=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n' | head -n1)
-      case "$line" in
-        "") pending=1 ;;
-        *$'\tcompleted\tsuccess') ;;
-        *$'\tcompleted\t'*) failed="$failed $name" ;;
-        *) pending=1 ;;
-      esac
+      lines=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n')
+      if [ -z "$lines" ] || printf '%s\n' "$lines" | grep -qv $'\tcompleted\t'; then
+        pending=1
+      elif printf '%s\n' "$lines" | grep -qv $'\tcompleted\tsuccess$'; then
+        failed="$failed $name"
+      fi
     done <<< "$required"
     [ -n "$failed" ] && return 1
     [ "$pending" = 0 ] && return 0
@@ -209,8 +210,17 @@ for n in "${serial[@]}"; do
     git push --quiet origin "HEAD:refs/heads/$branch" || stop "$n" "push recusado (a branch andou?)"
   fi
 
+  # O CI do PR é o portão rápido; o completo (testes contra o kernel) roda aqui, no commit que
+  # vai entrar.
+  gh workflow run ci.yml --ref "$branch" >/dev/null
+  # Espera o run disparado aparecer, senão o portão rápido (já verde) passaria por ele.
+  for _ in $(seq 1 30); do
+    gh run list --workflow ci.yml --branch "$branch" --event workflow_dispatch --commit "$sha" \
+      --json databaseId --jq 'length' | grep -qv '^0$' && break
+    sleep 4
+  done
   if [ "$n_required" -gt 0 ]; then
-    say "  esperando os $n_required checks exigidos"
+    say "  esperando os $n_required checks exigidos (rápido do PR + completo)"
     checks_or_stop "$n" "$sha"
   fi
 
