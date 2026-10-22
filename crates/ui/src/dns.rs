@@ -1152,6 +1152,9 @@ impl DnsPanel {
         let mut flush = false;
         ui.horizontal(|ui| {
             flush = action(ui, "Flush Cache", can.check("ip.dns.cache.flush"));
+            if ui.button("Resolve…").clicked() {
+                open_window(app, crate::dns_resolve::WIN);
+            }
             ui.separator();
             let hits: u64 = self
                 .cache
