@@ -51,7 +51,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Interface List Member",
         ["Interfaces", "Interface List"],
         None,
-        "{list: string, interface: string, disabled?: bool, comment?: string} → {id}",
+        "{list: string, interface: string, disabled?: bool, comment?: string, force?: bool (even if the firewall would then cut your management connection)} → {id}",
         always,
         member_add
     ),
@@ -60,7 +60,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Interface List Member",
         [],
         None,
-        "{id: *hex, list?: string, interface?: string, disabled?: bool, comment?: string} → {id}",
+        "{id: *hex, list?: string, interface?: string, disabled?: bool, comment?: string, force?: bool} → {id}",
         has_members,
         member_set
     ),
@@ -69,7 +69,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove Interface List Member",
         [],
         None,
-        "{id: *hex} → {id}",
+        "{id: *hex, force?: bool} → {id}",
         has_members,
         member_remove
     ),
@@ -294,7 +294,8 @@ fn check_member(cfg: &Config, m: &InterfaceListMember, interface_changed: bool) 
     Ok(())
 }
 
-fn member_add(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn member_add(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let list: Name = req_parse(p, "list")?;
     let interface: IfName = req_parse(p, "interface")?;
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
@@ -321,6 +322,7 @@ fn member_add(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn member_set(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
     let list: Option<Name> = opt_parse(p, "list")?;
     let interface: Option<IfName> = opt_parse(p, "interface")?;
@@ -355,6 +357,7 @@ fn member_set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn member_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
     let cfg = s.store_mut().candidate_mut();
     let pos = member_pos(cfg, id)?;

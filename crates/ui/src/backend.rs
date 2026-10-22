@@ -9,7 +9,7 @@
 
 use std::collections::VecDeque;
 
-use corerouter_engine::{Shared, lock};
+use corerouter_engine::{Caller, Shared, lock};
 use serde_json::{Value, json};
 
 /// Increases with every `submit` of one backend.
@@ -53,14 +53,24 @@ pub struct Local {
     session: Shared,
     next: RequestId,
     ready: VecDeque<Reply>,
+    /// Who the commands run as: in-process by default; tests pose as a
+    /// control-channel connection to exercise what depends on it (the
+    /// lockout check of G2.1b).
+    caller: Caller,
 }
 
 impl Local {
     pub fn new(session: Shared) -> Self {
+        Self::as_caller(session, Caller::local())
+    }
+
+    /// The commands run as `caller` (`Session::execute_as`).
+    pub fn as_caller(session: Shared, caller: Caller) -> Self {
         Self {
             session,
             next: 0,
             ready: VecDeque::new(),
+            caller,
         }
     }
 
@@ -77,7 +87,7 @@ impl Local {
                 "backend": s.backend(),
                 "has_ui": true,
             })),
-            "engine.list" => Ok(s.list()),
+            "engine.list" => Ok(s.list_as(&self.caller)),
             "auth.whoami" => Ok(corerouter_engine::auth::whoami(
                 &s,
                 &corerouter_engine::Principal::Local,
@@ -89,7 +99,7 @@ impl Local {
                     .and_then(Value::as_str)
                     .ok_or("engine.execute needs {command, params?}")?;
                 let p = params.get("params").cloned().unwrap_or(Value::Null);
-                s.execute(id, &p).map_err(err)
+                s.execute_as(&self.caller, id, &p).map_err(err)
             }
             "engine.batch" => {
                 let steps = params.get("steps").cloned().unwrap_or(Value::Null);
@@ -97,11 +107,11 @@ impl Local {
                     .get("atomic")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                s.batch(&steps, atomic).map_err(err)
+                s.batch_as(&self.caller, &steps, atomic).map_err(err)
             }
             "state.inspect" => {
                 let path = params.get("path").and_then(Value::as_str);
-                s.inspect(path).map_err(err)
+                s.inspect_as(&self.caller, path).map_err(err)
             }
             other => Err(format!(
                 "unknown method '{}'",
