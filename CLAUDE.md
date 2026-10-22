@@ -59,7 +59,7 @@ Decisões de desempenho se tomam com números, não com preferência.
 - **Meça caminhos quentes antes e depois:** encaminhamento/filtragem de pacotes, aplicar
   milhares de regras/rotas/endereços no kernel, o canal de controle, codecs e parsers de
   protocolo, ferramentas (ping/MTR). Use os benchmarks do workspace (`cargo xtask bench`,
-  criterion) e registre o resultado em `docs/perf.md` marcado como **medido** (máquina, build
+  criterion) e registre o resultado na seção `## perf` do seu `docs/changes/<id>.md` (a fila o acrescenta ao `docs/perf.md`; não edite o `perf.md` à mão) marcado como **medido** (máquina, build
   release, data). PR que toca caminho quente traz a seção "Desempenho" com antes/depois:
   `cargo xtask bench --save-baseline antes` na `main`, `cargo xtask bench --baseline antes` na
   branch (a coluna "change" do resumo é o antes/depois). Benchmark novo = `benches/<nome>.rs`

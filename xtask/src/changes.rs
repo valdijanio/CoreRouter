@@ -18,6 +18,7 @@ const DIR: &str = "docs/changes";
 const GAPS: &str = "docs/gaps.md";
 const LOG: &str = "docs/log.md";
 const HISTORY: &str = "docs/gaps-history.md";
+const PERF: &str = "docs/perf.md";
 /// Upper bound for one change file: a log entry, not a document.
 const MAX_BYTES: usize = 64 * 1024;
 
@@ -32,6 +33,8 @@ pub struct Change {
     pub log: Vec<String>,
     /// New `docs/gaps.md` rows (`| G4.7d | … |`).
     pub rows: Vec<String>,
+    /// Text after a `## perf` line, for the end of `docs/perf.md`.
+    pub perf: Vec<String>,
 }
 
 /// `G4.7c` → (4, 7, "c"); `G2` → (2, 0, ""). `None` for anything else.
@@ -110,9 +113,14 @@ pub fn parse(file: &str, text: &str) -> Result<Change, String> {
     if status.is_some() && gap_key(&id).is_none() {
         return Err(format!("{file}: 'status:' needs a gap id, not '{id}'"));
     }
-    let (mut log, mut rows) = (Vec::new(), Vec::new());
+    let (mut log, mut rows, mut perf) = (Vec::new(), Vec::new(), Vec::new());
+    let mut in_perf = false;
     for line in lines {
-        if line.starts_with("| G") {
+        if line.trim() == "## perf" {
+            in_perf = true;
+        } else if in_perf {
+            perf.push(line.trim_end().to_owned());
+        } else if line.starts_with("| G") {
             row_id(line).ok_or_else(|| format!("{file}: bad gap row: {line:.60}"))?;
             rows.push(line.to_owned());
         } else {
@@ -128,12 +136,17 @@ pub fn parse(file: &str, text: &str) -> Result<Change, String> {
     if log.is_empty() {
         return Err(format!("{file}: no log text after the header"));
     }
+    trim_blank(&mut perf);
+    if in_perf && perf.is_empty() {
+        return Err(format!("{file}: '## perf' without text"));
+    }
     Ok(Change {
         id,
         status,
         history,
         log,
         rows,
+        perf,
     })
 }
 
@@ -232,18 +245,32 @@ fn append(doc: &str, entry: &str, blank: bool) -> String {
     out
 }
 
-/// `docs/gaps.md`, `docs/log.md`, `docs/gaps-history.md` after a fold.
-pub type Folded = (String, String, String);
+fn trim_blank(lines: &mut Vec<String>) {
+    while lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    while lines.first().is_some_and(String::is_empty) {
+        lines.remove(0);
+    }
+}
 
-/// Fold the changes, in file name order, into (gaps, log, history).
-pub fn fold(
-    date: &str,
-    changes: &[Change],
-    gaps: &str,
-    log: &str,
-    history: &str,
-) -> Result<Folded, String> {
-    let (mut gaps, mut log, mut history) = (gaps.to_owned(), log.to_owned(), history.to_owned());
+/// The documents a fold writes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Docs {
+    pub gaps: String,
+    pub log: String,
+    pub history: String,
+    pub perf: String,
+}
+
+/// Fold the changes, in file name order, into the documents.
+pub fn fold(date: &str, changes: &[Change], docs: &Docs) -> Result<Docs, String> {
+    let Docs {
+        mut gaps,
+        mut log,
+        mut history,
+        mut perf,
+    } = docs.clone();
     for c in changes {
         // Already folded: a branch made from another PR's branch still
         // carries that PR's change file after its squash reached the main
@@ -261,8 +288,16 @@ pub fn fold(
         if let Some(h) = &c.history {
             history = append(&history, &format!("- {date} — {h}\n"), false);
         }
+        if !c.perf.is_empty() {
+            perf = append(&perf, &(c.perf.join("\n") + "\n"), true);
+        }
     }
-    Ok((gaps, log, history))
+    Ok(Docs {
+        gaps,
+        log,
+        history,
+        perf,
+    })
 }
 
 fn read(root: &Path, rel: &str) -> Result<String, String> {
@@ -314,17 +349,16 @@ pub fn check(root: &Path) -> Outcome {
     }
 }
 
-fn dry_fold(root: &Path, date: &str) -> Result<(Vec<String>, Folded), String> {
+fn dry_fold(root: &Path, date: &str) -> Result<(Vec<String>, Docs), String> {
     let loaded = load(root)?;
     let (names, changes): (Vec<String>, Vec<Change>) = loaded.into_iter().unzip();
-    let folded = fold(
-        date,
-        &changes,
-        &read(root, GAPS)?,
-        &read(root, LOG)?,
-        &read(root, HISTORY)?,
-    )?;
-    Ok((names, folded))
+    let docs = Docs {
+        gaps: read(root, GAPS)?,
+        log: read(root, LOG)?,
+        history: read(root, HISTORY)?,
+        perf: read(root, PERF)?,
+    };
+    Ok((names, fold(date, &changes, &docs)?))
 }
 
 /// `cargo xtask docs [fold [--date AAAA-MM-DD]]`.
@@ -335,7 +369,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         [f, d, date] if f == "fold" && d == "--date" && date.len() == 10 => date.clone(),
         _ => return Outcome::Fail("usage: cargo xtask docs [fold [--date AAAA-MM-DD]]".into()),
     };
-    let (names, (gaps, log, history)) = match dry_fold(root, &date) {
+    let (names, docs) = match dry_fold(root, &date) {
         Ok(v) => v,
         Err(e) => return Outcome::Fail(e),
     };
@@ -346,9 +380,10 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
     let write = |rel: &str, text: &str| {
         std::fs::write(root.join(rel), text).map_err(|e| format!("{rel}: {e}"))
     };
-    let result = write(GAPS, &gaps)
-        .and_then(|()| write(LOG, &log))
-        .and_then(|()| write(HISTORY, &history))
+    let result = write(GAPS, &docs.gaps)
+        .and_then(|()| write(LOG, &docs.log))
+        .and_then(|()| write(HISTORY, &docs.history))
+        .and_then(|()| write(PERF, &docs.perf))
         .and_then(|()| {
             names.iter().try_for_each(|n| {
                 std::fs::remove_file(root.join(DIR).join(n)).map_err(|e| format!("{DIR}/{n}: {e}"))
@@ -435,32 +470,45 @@ mod tests {
         assert!(insert_row(GAPS_MD, "| G7.1 | Fase nova | aberto |").is_err());
     }
 
-    #[test]
-    fn fold_skips_a_change_already_in_the_log() {
-        let c = change("id: G4.7b\nstatus: feito\nhistory: G4.7b feito\n\nEntrou.\n");
-        let log = "# log\n\n- 2026-10-21 — G4.7b: Entrou.\n";
-        let (gaps, log2, history) = fold("2026-10-22", &[c], GAPS_MD, log, "# h\n").unwrap();
-        assert_eq!(log2, log);
-        assert_eq!(history, "# h\n");
-        assert_eq!(gaps, GAPS_MD);
+    fn docs(log: &str, history: &str) -> Docs {
+        Docs {
+            gaps: GAPS_MD.into(),
+            log: log.into(),
+            history: history.into(),
+            perf: "# perf\n".into(),
+        }
     }
 
     #[test]
-    fn fold_appends_log_and_history() {
-        let c = change("id: G4.7b\nstatus: feito\nhistory: G4.7b feito\n\nEntrou.\nComo testar.\n");
-        let (gaps, log, history) = fold(
+    fn fold_skips_a_change_already_in_the_log() {
+        let c = change("id: G4.7b\nstatus: feito\nhistory: G4.7b feito\n\nEntrou.\n");
+        let before = docs("# log\n\n- 2026-10-21 — G4.7b: Entrou.\n", "# h\n");
+        assert_eq!(fold("2026-10-22", &[c], &before).unwrap(), before);
+    }
+
+    #[test]
+    fn fold_appends_log_history_and_perf() {
+        let c = change(
+            "id: G4.7b\nstatus: feito\nhistory: G4.7b feito\n\nEntrou.\nComo testar.\n\n## perf\n\n| codec | 1 µs |\n",
+        );
+        assert_eq!(c.log, ["Entrou.", "Como testar."]);
+        let out = fold(
             "2026-10-22",
             &[c],
-            GAPS_MD,
-            "# log\n\n- antiga\n",
-            "# h\n- velha\n",
+            &docs("# log\n\n- antiga\n", "# h\n- velha\n"),
         )
         .unwrap();
-        assert!(gaps.contains("| G4.7b | DHCPv6 | feito |"));
+        assert!(out.gaps.contains("| G4.7b | DHCPv6 | feito |"));
         assert_eq!(
-            log,
+            out.log,
             "# log\n\n- antiga\n\n- 2026-10-22 — G4.7b: Entrou.\n  Como testar.\n"
         );
-        assert_eq!(history, "# h\n- velha\n- 2026-10-22 — G4.7b feito\n");
+        assert_eq!(out.history, "# h\n- velha\n- 2026-10-22 — G4.7b feito\n");
+        assert_eq!(out.perf, "# perf\n\n| codec | 1 µs |\n");
+    }
+
+    #[test]
+    fn empty_perf_section_is_an_error() {
+        assert!(parse("G4.7b.md", "id: G4.7b\n\nx\n## perf\n\n").is_err());
     }
 }
