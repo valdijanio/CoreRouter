@@ -71,7 +71,8 @@ backend.**
 | DNS cache/forwarder, registros estáticos | `hickory-server` + `hickory-resolver` | Embutido no daemon; DoT/DoH upstream via `rustls` |
 | DHCPv4/DHCPv6 (+PD) e relay | DHCPv4: codec `dhcproto` atrás de um saneador; DHCPv6: codec próprio (G4.7b: o `dhcproto` 0.15 v6 dá panic/dessincroniza com bytes hostis); servidor e banco de leases próprios | Leases em `/config`, escrita atômica |
 | PPPoE / IPoE (BNG) | orquestrar `accel-ppp` | Não há BNG Rust maduro; mesmo padrão do FRR |
-| NTP | `ntpd-rs` | Rust, memória segura |
+| NTP | Cliente SNTP próprio (G4.6: `proto-ntp` L2 puro + thread no daemon); `ntpd-rs` fica como opção para o servidor NTP e a disciplina do relógio (G4.6b/G4.6c) | Medir o offset é um pacote de 48 bytes e quatro timestamps (RFC 5905 §8/§14): um processo externo a mais não paga isso, e o status vai direto para `system.ntp.client.get` sem parsear saída. Ajustar o relógio (slew/step, `CAP_SYS_TIME`) e servir hora são outra conversa: lá a maturidade do `ntpd-rs`/chrony pesa mais |
+| Syslog remoto | Codec RFC 5424 próprio (`proto-syslog`, só encode) + UDP (RFC 5426) no daemon | Regras e ações estilo `/system logging` do RouterOS no engine; TCP/TLS (RFC 5425) depois |
 | Gerência remota | `rustls` + provedor `ring` (TLS do canal de controle e do WebSocket), `rcgen` (certificado autoassinado), `argon2` (hash de senha), `keyring` ("Remember password" da GUI nativa); `russh` (CLI SSH) depois | G0.3 feito |
 | Telemetria | `prometheus-client`, export IPFIX/sFlow | G4.4 |
 
@@ -115,6 +116,7 @@ CoreRouter/
 │   ├── firewall/         # L1 puro: validação + render nftables (G2.1)
 │   ├── proto-bgp/ proto-ospf/ proto-mpls/ proto-cgnat/ proto-dns/ proto-dhcp/   # L2
 │   ├── proto-lldp/ proto-mndp/   # L2: codecs de descoberta (G5.2)
+│   ├── proto-ntp/ proto-syslog/  # L2: cliente SNTP e mensagens syslog (G4.6)
 │   ├── proto-discovery/  # L2: codec do CRDP (G5.1)
 │   ├── engine/           # L3: src/cmd/{mod,args,interface,ip,routing,system,config}.rs
 │   ├── control/          # L4

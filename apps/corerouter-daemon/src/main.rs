@@ -66,10 +66,19 @@
 //! The signals come from `signal-hook`'s `flag::register` (its handler only
 //! sets an atomic flag, polled here every [`SIGNAL_POLL`]): no `unsafe`
 //! here, no async runtime, and the same path on unix and Windows.
+//!
+//! NTP and remote syslog (G4.6): the SNTP client of `system.ntp.client.set`
+//! measures the clock offset (it does not set the clock yet) and reports
+//! to `system.ntp.client.get`; `system.logging.*` rules send config changes,
+//! failed commands and NTP state changes to remote syslog collectors (RFC
+//! 5424 over UDP). Both run with either backend: they are this process
+//! talking to the network, like the control channel.
 
 #[cfg(target_os = "linux")]
 mod link_discovery;
 mod node_id;
+mod ntp_client;
+mod remote_log;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -767,6 +776,13 @@ fn main() -> ExitCode {
             }
         }
     };
+    // Neither stops the daemon: a router without them still forwards.
+    if let Err(e) = ntp_client::spawn(session.clone(), corerouter_proto_ntp::PORT) {
+        log::error!("NTP client is off: cannot start its thread: {e}");
+    }
+    if let Err(e) = remote_log::spawn(session.clone()) {
+        log::error!("remote logging is off: cannot start its thread: {e}");
+    }
     let discovery = Discovery {
         crdp,
         #[cfg(target_os = "linux")]
