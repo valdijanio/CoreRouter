@@ -160,8 +160,9 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 
 Nada entra na `main` sem PR com o CI verde. A proteção da `main` no GitHub impõe isso: PR
 obrigatório, os três checks do `ci` no próprio PR, vale para admin, sem force-push. A
-combinação dos PRs com a `main` é testada pela fila (abaixo). Quem faz o merge é a **fila de entrada** da sessão principal, com a aprovação do
-usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
+combinação dos PRs com a `main` é testada pela fila (abaixo). Quem faz o merge é a **fila de entrada** da sessão principal. O usuário aprova ao pedir a rodada
+de features; daí a fila integra sozinha (ele pode pedir para ser consultado antes de um lote).
+Sessões de feature não fazem merge nem ligam auto-merge.
 
 1. Trabalhe numa branch `stream/<id>-<slug>`, nunca na `main`. Nunca faça commit nem push na `main`.
 2. Antes de cada commit: `cargo xtask ci`.
@@ -178,11 +179,12 @@ usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
 
 ### Fila de entrada (sessão principal)
 
-Quando há PRs prontos, a sessão principal pergunta ao usuário **uma vez por lote** ("N features
-prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh --batch <pr>...` — ou deixa
-rodando a **fila contínua** `scripts/land.sh --watch`, que pega sozinha os PRs com o rótulo `fila`
-e, enquanto um lote roda o CI, já testa os PRs novos num lote especulativo montado em cima dele
-(lote verde: o especulativo entra logo depois, sem esperar outro CI; vermelho: é descartado):
+Enquanto houver sessões trabalhando, a sessão principal deixa rodando a **fila contínua**
+`scripts/land.sh --watch`: ela pega sozinha os PRs com o rótulo `fila` e, enquanto um lote roda o
+CI, já testa os PRs novos num lote especulativo montado em cima dele (lote verde: o especulativo
+entra logo depois, sem esperar outro CI; vermelho: é descartado). O resultado de cada CI vem dos
+runs do Actions, não dos check-runs (o GitHub já deixou um check-run preso em "in_progress").
+`scripts/land.sh --batch <pr>...` integra uma lista na hora:
 
 - **Lote:** junta a `main` e todos os PRs numa branch temporária, confere os `docs/changes/` e
   roda **um** CI completo nessa combinação, que é o que a `main` vai ser: o "sozinho passa,
