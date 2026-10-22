@@ -215,7 +215,7 @@ cliente.
 
 **Limites e o que fica para depois.** Sem validação DNSSEC: uma consulta com DO recebe a resposta
 sem RRSIG, como no RouterOS (G4.1f). `allowed_from` com lista de interfaces usa os endereços
-estáticos; os aprendidos por DHCP e os `from_pool` do IPv6 ficam para a G4.1e, junto com
+estáticos; os aprendidos por DHCP e os `from_pool` do IPv6 entraram na G4.1e, junto com
 Statistics. Grupos de forwarders, adlist e DoT/DoH: G4.1d. Zonas: G4.1c. Comparação de
 desempenho com Unbound e dnsmasq com sockets de verdade: G4.1g. Consultas iguais em voo não são
 juntadas (cada falta de cache pergunta ao upstream).
@@ -324,6 +324,81 @@ aviso na GUI quando a lista não tem rede; limite por cliente que descarta em UD
 ligado (1 dia); servidor mais rápido medido, com os números no `ip.dns.get`; hits por entrada do
 cache; resposta do endereço perguntado; ANY mínimo (RFC 8482); regexp em tempo linear (o crate
 `regex` não faz backtracking: um padrão hostil não trava o DNS).
+
+## G4.1e — Statistics
+
+**O que conta.** Uma etapa a mais na cadeia, `stage/statistics.rs` (ordem 100, só `after`): vê toda
+resposta e todo descarte e conta, desde o último reset:
+
+- consultas, UDP e TCP;
+- **quem respondeu** (`answered`): `cache`, `static`, `upstream`, `stale` (RFC 8767), `refused`
+  (fora do `allowed_from`), `limit` (acima de `max_queries_per_client`), `busy` (acima de
+  `max_concurrent_queries`), `special` (RFC 6761/8880) e qualquer etapa nova pelo nome (adlist,
+  zones), sem editar esta;
+- códigos de resposta (`noerror`, `nxdomain`, `servfail`, `refused`, `dropped`…) e tipos
+  perguntados (até 64 tipos; o resto em `other`);
+- **por cliente**, os que mais perguntam, com quantas foram recusadas. A tabela guarda no máximo
+  1024 clientes: cheia, o de menor contagem dá lugar ao novo (Space-Saving, Metwally et al.
+  2005). O topo fica certo mesmo sob inundação de origens falsas, e cada contagem traz o erro
+  máximo (`error`; a GUI mostra `≤N`);
+- **por upstream**, as respostas que cada servidor deu aos clientes, junto com o SRTT e as falhas
+  que o resolvedor já mede.
+
+Para as `after` verem também os descartes, `Forwarder::done` passou a chamá-las antes de
+descartar (`Query::dropped()` diz que foi descarte). É a única mudança em `server/mod.rs`, além
+do `pub use` dos tipos.
+
+**Comandos.** `ip.dns.statistics.print {top?}` (padrão 10 clientes, até 100) e
+`ip.dns.statistics.reset`. Os contadores são estado de execução, não config: o reset não entra
+na transação nem tem rollback, e um restart do daemon zera tudo. Sem daemon (lab virtual, WASM),
+`print` mostra zeros com `resolver: simulated`.
+
+```sh
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.statistics.print '{"top": 5}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.statistics.reset
+```
+
+**GUI.** O botão Statistics da janela IP › DNS abre **DNS Statistics** (`ui/src/dns_statistics.rs`):
+total, UDP/TCP e acerto do cache no topo; "Answered by", "Response codes" e "Types" lado a lado;
+tabelas "Top clients" e "Upstream servers". Um selo diz por que nada conta (`lab`, ou
+`forwarder off` com Allow Remote Requests desligado).
+
+**`allowed_from` com endereços dinâmicos.** `Session::dns_allowed_networks` calcula as redes
+sobre a config efetiva: endereços estáticos das interfaces da lista, os aprendidos por cliente
+DHCP (flag D) e os `from_pool` do IPv6 já resolvidos com o prefixo delegado. O serviço do
+daemon recalcula a cada segundo e reconfigura o encaminhador quando muda (um lease novo ou um
+prefixo novo liberam a LAN sem mexer na config). `ip.dns.get` mostra o mesmo em
+`allowed_networks`.
+
+**Custo, medido.** Um mutex e alguns mapas pequenos por consulta: +45 a +80 ns por consulta no
+`benches/forwarder.rs` (cache quente 762 → 809 ns, estática 869 → 952 ns, falta de cache
+2,16 → 2,39 µs). Números no `docs/perf.md`.
+
+### Pesquisa
+
+- **MikroTik RouterOS v7** (<https://help.mikrotik.com/docs/spaces/ROS/pages/37748767/DNS>): não
+  há `/ip dns statistics`. Os únicos contadores são `match-count` e `name-count` do `/ip dns
+  adlist` e o `cache-used`. Adotamos o estilo `print`/`reset` dos menus do RouterOS
+  (`/interface print stats`, `reset-counters`).
+- **Unbound** (`unbound-control stats`): `total.num.queries`, `num.cachehits`/`cachemiss`,
+  `num.query.type.*`, `num.answer.rcode.*`, `num.query.tcp`, `num.query.ratelimited`,
+  `unwanted.queries` (ACL), `num.expired` (serve-expired), histograma de tempo de resposta.
+  Viraram `answered`, `rcodes`, `types`, `udp/tcp`, `limit`, `refused` e `stale`.
+- **PowerDNS Recursor** (`rec_control get-all`, `top-remotes`, `top-queries`,
+  `top-servfail-queries`): contadores por resultado e os "top" por amostragem num anel. Do
+  `top-remotes` veio o "Top clients"; usamos Space-Saving no lugar do anel (memória fixa, topo
+  exato para quem pergunta muito).
+- **dnsmasq** (SIGUSR1 e `dig CHAOS TXT hits.bind misses.bind servers.bind`): por upstream,
+  consultas mandadas e falhas. Daí a tabela "Upstream servers" com respostas, SRTT e falhas.
+
+**Melhorias sobre o MikroTik.** A janela e o comando existem (no RouterOS só há o
+`cache-used`); o topo de clientes com memória limitada mostra quem inunda o resolvedor; a
+contagem por etapa mostra o efeito do `allowed_from`, do limite por cliente e do serve-stale; o
+`allowed_from` acompanha DHCP e prefixo delegado sem o operador digitar a rede.
+
+**Fica para depois (G4.1h).** Histograma de latência (Unbound), nomes mais perguntados e com
+SERVFAIL/NXDOMAIN (PowerDNS `top-queries`), contagem de mensagens malformadas (hoje saem antes
+da cadeia), contadores no `/metrics` do Prometheus e "visto há" por cliente.
 
 ## G4.1d — Adlist, Forwarders, DoT/DoH
 

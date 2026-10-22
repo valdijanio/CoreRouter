@@ -36,9 +36,7 @@ use std::time::Duration;
 use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::Config;
-use corerouter_proto_dns::server::{
-    Done, Effect, Forwarder, MAX_QUERY, Pending, Start, allowed_networks,
-};
+use corerouter_proto_dns::server::{Done, Effect, Forwarder, MAX_QUERY, Pending, Start, Statistics};
 use super::dns::RouterDns;
 use sock::{Udp, bind_tcp};
 
@@ -339,6 +337,8 @@ pub(crate) fn spawn(
             .name("dns-effects".into())
             .spawn(move || apply_effects(&session, &rx))?;
     }
+    // `ip.dns.statistics.print` reads what the chain counts.
+    lock(&session).set_dns_statistics(srv.fwd.state::<Statistics>());
     let keep = srv.clone();
     thread::Builder::new()
         .name("dns-server".into())
@@ -346,9 +346,12 @@ pub(crate) fn spawn(
     Ok(srv)
 }
 
-/// Copies the config in when it changes; opens and closes the sockets.
+/// Copies the config in when it changes, or when what `allowed_from`
+/// stands for does (a DHCP lease, a delegated prefix); opens and closes the
+/// sockets.
 fn follow(session: &Shared, srv: &Arc<Server>, port: u16) {
     let mut last: Option<Config> = None;
+    let mut last_allowed = Vec::new();
     let mut listening = false;
     let mut retry_at = 0u64;
     loop {
@@ -356,19 +359,24 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16) {
             srv.epoch.fetch_add(1, Ordering::AcqRel);
             return;
         }
-        let changed = {
+        let (changed, allowed) = {
             let s = lock(session);
             let running = s.store().running();
+            let allowed = s.dns_allowed_networks(running);
             if last.as_ref() == Some(running) {
-                None
+                (None, allowed)
             } else {
-                Some(running.clone())
+                (Some(running.clone()), allowed)
             }
         };
-        if let Some(cfg) = changed {
-            let allowed = allowed_networks(&cfg);
-            srv.fwd.configure(Arc::new(cfg.clone()), allowed);
-            last = Some(cfg);
+        if changed.is_some() || allowed != last_allowed {
+            if let Some(cfg) = changed {
+                last = Some(cfg);
+            }
+            if let Some(cfg) = &last {
+                srv.fwd.configure(Arc::new(cfg.clone()), allowed.clone());
+            }
+            last_allowed = allowed;
         }
         let want = last.as_ref().is_some_and(|c| c.ip.dns.allow_remote_requests);
         let now = srv.dns.now_ms();
@@ -749,6 +757,16 @@ mod tests {
                 .unwrap();
             rows.as_array().is_some_and(|r| r.len() == 1)
         });
+        // G4.1e: the chain counted all of it.
+        let st = lock(&session)
+            .execute("ip.dns.statistics.print", &json!({}))
+            .unwrap();
+        assert_eq!(st["resolver"], "router");
+        assert_eq!(st["tcp"], 1);
+        assert!(st["answered"]["static"].as_u64().unwrap() >= 1, "{st}");
+        assert!(st["answered"]["upstream"].as_u64().unwrap() >= 1, "{st}");
+        assert_eq!(st["answered"]["cache"], 1, "{st}");
+        assert_eq!(st["clients"][0]["address"], "127.0.0.1");
 
         lock(&session)
             .execute("ip.dns.set", &json!({"allow_remote_requests": false}))
