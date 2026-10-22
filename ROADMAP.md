@@ -18,3 +18,7 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   (interface, ip address, BGP instance, identity, config commit/rollback/diff/mode), guard de
   panic, modos immediate/transactional, canal de controle, MCP stdio (5 tools + aliases), GUI egui
   estilo WinBox (nativo + wasm, `ui.screenshot`), `cargo xtask ci`.
+- 2026-10-21 — G0.2: `.github/workflows/ci.yml` — em push/PR para `main`, `cargo xtask ci` em
+  ubuntu-latest (toolchain do `rust-toolchain.toml`, deps de sistema do eframe, rust-cache) e
+  build de gui/cli/daemon em macOS e Windows. Actions fixadas por SHA. Validado só localmente
+  (`cargo xtask ci`); primeira execução no GitHub fica para o push.

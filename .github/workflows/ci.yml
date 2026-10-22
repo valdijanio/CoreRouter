@@ -1,0 +1,79 @@
+# G0.2 — o mesmo portão que os agentes rodam antes de cada commit (`cargo xtask ci`),
+# mais um build da GUI/CLI/daemon em macOS e Windows.
+# A toolchain vem de rust-toolchain.toml (stable + rustfmt, clippy, wasm32-unknown-unknown).
+# Actions fixadas por SHA; o comentário diz a versão.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  xtask-ci:
+    name: xtask ci (linux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # Cabeçalhos que eframe/winit/wgpu (x11, wayland, GL) pedem para compilar.
+      - name: Dependências de sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libgl1-mesa-dev
+
+      - name: Toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show
+          # Sem o alvo, o passo wasm do xtask vira "skip" em vez de falhar.
+          rustup target list --installed | grep -qx wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: cargo xtask ci
+        run: cargo xtask ci
+
+  build:
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # hal-linux compila vazio fora do Linux; o daemon cai no backend virtual.
+      - name: cargo build
+        run: cargo build -p corerouter-gui -p corerouter-cli -p corerouter-daemon
