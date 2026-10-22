@@ -190,6 +190,19 @@ impl TableState {
         self.anchor = None;
     }
 
+    /// Esc: clear the find text if any, else the selection if any. Returns
+    /// whether there was something to clear (else the window closes).
+    pub fn escape(&mut self) -> bool {
+        if !self.filter.is_empty() {
+            self.filter.clear();
+        } else if !self.selected.is_empty() {
+            self.clear();
+        } else {
+            return false;
+        }
+        true
+    }
+
     /// ↑/↓: move the selection one row (Shift extends it from the anchor).
     fn step(&mut self, down: bool, shift: bool, order: &[&str]) {
         let cursor = order
@@ -534,7 +547,9 @@ pub(crate) fn show(
             let rest = (body.bottom() - ui.cursor().min.y).max(0.0);
             ui.allocate_space(vec2(width, rest));
 
-            if bg.clicked() || bg.secondary_clicked() {
+            // Only a real click: the table holds the focus under this id,
+            // and egui turns Enter/Space on a focused widget into a click.
+            if bg.clicked_by(egui::PointerButton::Primary) || bg.secondary_clicked() {
                 state.clear();
                 ui.memory_mut(|mem| mem.request_focus(id));
             }
