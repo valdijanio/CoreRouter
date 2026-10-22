@@ -483,7 +483,7 @@ corerouter-proto-dns --bench adlist`): 1 000 000 nomes lidos e montados em 230 m
 conjunto; consulta 79 ns (nome listado), 82 ns (abaixo de um `||domínio^`), 105–120 ns (não
 listado).
 
-**Fica para depois** (G4.1h): recarga condicional (ETag/`If-Modified-Since`, como o "aplica só o
+**Fica para depois** (G4.1i): recarga condicional (ETag/`If-Modified-Since`, como o "aplica só o
 que mudou" do RouterOS), allowlist e regex próprias da adlist (o Pi-hole tem as duas), modo de
 resposta configurável (NXDOMAIN, REFUSED, IP próprio) e envio de arquivos ao roteador (`/file`),
 hoje um diretório do daemon (`--adlist-dir`).
