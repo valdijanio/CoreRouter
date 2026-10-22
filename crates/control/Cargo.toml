@@ -19,7 +19,12 @@ rcgen.workspace = true
 ring.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "control"
+harness = false
 
 [lints]
 workspace = true

@@ -47,6 +47,8 @@ egui_plot = { version = "0.38.0", default-features = false }
 png = "0.18.1"
 base64 = "0.23.1"
 proptest = "1.12.0"
+# G0.9: benchmarks (dev-dependency only; no plots, no rayon: a summary comes from xtask).
+criterion = { version = "0.8.2", default-features = false, features = ["cargo_bench_support"] }
 # Synchronous WebSocket (daemon server for the web GUI); no async runtime.
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
 # SIGINT/SIGTERM for the daemon's graceful shutdown: `flag::register` (safe API, unix and

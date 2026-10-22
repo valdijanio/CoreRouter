@@ -30,7 +30,12 @@ argon2.workspace = true
 getrandom.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 proptest.workspace = true
+
+[[bench]]
+name = "execute"
+harness = false
 
 [lints]
 workspace = true

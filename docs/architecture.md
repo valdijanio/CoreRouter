@@ -97,7 +97,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
 | L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe); trait `Backend` assíncrono + `Local` | L0–L4 + egui |
 | L6 | `apps/corerouter-{daemon,gui,cli}` | Binários; únicos que escolhem backend de plataforma e janela | tudo |
-| L7 | `xtask` | `cargo xtask ci`, `layers`, `wasm`, `agents-sync` | nenhum crate do workspace |
+| L7 | `xtask` | `cargo xtask ci`, `layers`, `wasm`, `agents-sync`, `bench` (criterion, G0.9; `docs/perf.md`) | nenhum crate do workspace |
 
 ```
 CoreRouter/
