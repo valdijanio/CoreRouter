@@ -122,6 +122,8 @@ pub fn line(kind: &str, ev: &Value) -> String {
         )
         .trim_end()
         .to_owned(),
+        // G6.6: the `dig` text, or a compare/trace row (may be several lines).
+        "dns-lookup" => crate::dns_lookup::text_line(ev),
         _ => ev.to_string(),
     }
 }
@@ -276,6 +278,7 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
             }
             out
         }
+        "dns-lookup" => crate::dns_lookup::summary_lines(summary),
         _ => vec![summary.to_string()],
     }
 }

@@ -12,6 +12,7 @@
 pub mod adlist;
 pub mod asn;
 pub mod cache;
+pub mod dig;
 pub mod encrypted;
 pub mod message;
 pub mod resolver;

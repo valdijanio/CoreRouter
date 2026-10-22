@@ -31,6 +31,8 @@ getrandom.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+# G6.6 tests build DNS replies.
+hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 proptest.workspace = true
 
 [[bench]]
