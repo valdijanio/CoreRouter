@@ -8,3 +8,6 @@ completa se o `insmod` falhar); sem debuginfo no CI (cache de ~2,5 GB, 70 s para
 força o `cargo test`), com `cargo test --doc` só se algum comentário de documentação tiver
 código Rust. Localmente os testes caíram de 29,7 s para 14,3 s (**medido**). `sccache` medido e
 descartado (0% de acerto entre pastas de build; build nova já leva 27 s).
+Também corrige um teste instável que derrubou o CI deste PR: no `netns_icmp`, o primeiro ping
+IPv6 logo depois de o laboratório subir pode voltar "unreachable" enquanto o roteador resolve o
+host; os testes que esperam eco agora tentam de novo (`ask_echo`) antes de reprovar.
