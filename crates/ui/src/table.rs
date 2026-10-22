@@ -923,10 +923,13 @@ fn keyboard(
 }
 
 fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
+    // A cell may carry chips after its text (`chip::cell`).
+    let (text, chips) = crate::chip::split(text);
     ui.painter()
         .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
         .size()
         .x
+        + crate::chip::cell_chips_width(ui.painter(), &chips, crate::chip::cell_size(font))
 }
 
 /// Colours of one line of cells: `text` for plain cells, `note` the Comment
@@ -970,7 +973,19 @@ fn paint_cells<'a>(
         } else {
             (Align2::LEFT_CENTER, pos2(x + CELL_PAD, rect.center().y))
         };
-        ui.painter().text(at, anchor, text(i), font.clone(), color);
+        let (cell, chips) = crate::chip::split(text(i));
+        let drawn = ui.painter().text(at, anchor, cell, font.clone(), color);
+        if !chips.is_empty() {
+            crate::chip::paint_cell_chips(
+                ui.painter(),
+                ui.visuals(),
+                drawn.right(),
+                rect.center().y,
+                rect.height(),
+                &chips,
+                crate::chip::cell_size(font),
+            );
+        }
         x += w;
     }
 }

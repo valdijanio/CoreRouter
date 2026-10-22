@@ -226,3 +226,33 @@ fn state_lives_beside_the_config_and_survives_reopening() {
     // Never part of the config slots.
     assert!(st.load(Slot::Current).unwrap().is_none());
 }
+
+/// G4.2a: the DHCP server's journal: appended, read back whole, compacted
+/// by an atomic rewrite; a torn last line (a crash mid-append) stays for the
+/// reader to skip.
+#[test]
+fn journals_append_and_compact() {
+    let dir = TempDir::new();
+    let mut s = FileStorage::open(&dir.0).unwrap();
+    assert_eq!(s.load_journal("dhcp-leases").unwrap(), None);
+    s.append_journal("dhcp-leases", "{\"a\":1}\n").unwrap();
+    s.append_journal("dhcp-leases", "{\"a\":2}\n{\"to").unwrap();
+    let text = s.load_journal("dhcp-leases").unwrap().unwrap();
+    assert_eq!(text.lines().count(), 3);
+    s.rewrite_journal("dhcp-leases", "{\"a\":2}\n").unwrap();
+    assert_eq!(
+        s.load_journal("dhcp-leases").unwrap().unwrap(),
+        "{\"a\":2}\n"
+    );
+    assert!(!dir.0.join("journal-dhcp-leases.log.tmp").exists());
+    assert!(s.append_journal("../x", "y").is_err(), "names become files");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir.0.join("journal-dhcp-leases.log"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+}

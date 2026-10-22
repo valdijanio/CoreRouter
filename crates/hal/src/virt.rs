@@ -40,6 +40,8 @@ pub struct VirtualHal {
     dhcp: Option<SharedResponder>,
     /// Simulated DHCPv6 server (G4.7b).
     dhcp6: Option<SharedResponder6>,
+    /// Simulated hosts asking the router's DHCP server (G4.2a).
+    dhcp_hosts: Option<crate::dhcp_server::SharedLabClients>,
     /// Times each port was enabled again (each one is a simulated link
     /// down and up, G1.19).
     reenabled: BTreeMap<IfName, u32>,
@@ -91,6 +93,7 @@ impl VirtualHal {
             prober: Arc::new(SimProber::default()),
             dhcp: None,
             dhcp6: None,
+            dhcp_hosts: None,
             reenabled: BTreeMap::new(),
             kernel: Arc::new(Mutex::new(kernel)),
         }
@@ -131,6 +134,12 @@ impl VirtualHal {
     /// the lab server the engine offers.
     pub fn with_dhcp_server(mut self, server: SharedResponder) -> Self {
         self.dhcp = Some(server);
+        self
+    }
+
+    /// Put `hosts` behind the lab ports instead of the lab's own (G4.2a).
+    pub fn with_dhcp_hosts(mut self, hosts: crate::dhcp_server::SharedLabClients) -> Self {
+        self.dhcp_hosts = Some(hosts);
         self
     }
 
@@ -639,6 +648,31 @@ impl Hal for VirtualHal {
         }
     }
 
+    fn dhcp_server_port(
+        &mut self,
+        name: &IfName,
+    ) -> Result<Box<dyn crate::dhcp_server::DhcpServerPort>, HalError> {
+        if !self.applied.interfaces.contains_key(name) && !self.ports.contains(name) {
+            return Err(HalError::Rejected(format!(
+                "no interface '{name}' in the lab"
+            )));
+        }
+        Ok(Box::new(SimDhcpServerPort {
+            port: name.clone(),
+            mac: self.mac_of(name),
+            hosts: self.dhcp_hosts.clone(),
+            now: 0,
+            inbox: VecDeque::new(),
+            answered: Vec::new(),
+        }))
+    }
+
+    fn offer_dhcp_lab_clients(&mut self, hosts: crate::dhcp_server::SharedLabClients) {
+        if self.dhcp_hosts.is_none() {
+            self.dhcp_hosts = Some(hosts);
+        }
+    }
+
     fn dhcp6_port(&mut self, name: &IfName) -> Result<Box<dyn Dhcp6Port>, HalError> {
         if !self.applied.interfaces.contains_key(name) && !self.ports.contains(name) {
             return Err(HalError::Rejected(format!(
@@ -744,6 +778,65 @@ impl Dhcp6Port for SimDhcp6Port {
 
     fn recv(&mut self) -> Result<Option<Datagram6>, HalError> {
         Ok(self.inbox.pop_front())
+    }
+}
+
+/// A lab DHCP server socket (G4.2a): the lab's hosts behind the port talk
+/// to it, on the clock the engine hands it.
+struct SimDhcpServerPort {
+    port: IfName,
+    mac: [u8; 6],
+    hosts: Option<crate::dhcp_server::SharedLabClients>,
+    now: u64,
+    inbox: VecDeque<crate::dhcp_server::Heard>,
+    answered: Vec<(Ipv4Addr, [u8; 6])>,
+}
+
+impl crate::dhcp_server::DhcpServerPort for SimDhcpServerPort {
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    fn tick(&mut self, now_unix: u64) {
+        self.now = now_unix;
+        if let Some(h) = &self.hosts {
+            for m in h.poll(&self.port, now_unix) {
+                if self.inbox.len() < SIM_INBOX {
+                    self.inbox.push_back(m);
+                }
+            }
+        }
+    }
+
+    fn recv(&mut self) -> Result<Option<crate::dhcp_server::Heard>, HalError> {
+        Ok(self.inbox.pop_front())
+    }
+
+    fn send(
+        &mut self,
+        payload: &[u8],
+        _src: Ipv4Addr,
+        to: crate::dhcp_server::ReplyTo,
+    ) -> Result<(), HalError> {
+        if let Some(h) = &self.hosts {
+            h.deliver(&self.port, payload, to, self.now);
+        }
+        Ok(())
+    }
+
+    fn probe(&mut self, ip: Ipv4Addr, _src: Ipv4Addr) -> Result<bool, HalError> {
+        if let Some(mac) = self.hosts.as_ref().and_then(|h| h.arp(&self.port, ip)) {
+            self.answered.push((ip, mac));
+        }
+        Ok(true)
+    }
+
+    fn probe_replies(&mut self) -> Result<Vec<(Ipv4Addr, [u8; 6])>, HalError> {
+        Ok(std::mem::take(&mut self.answered))
+    }
+
+    fn describe(&self) -> String {
+        format!("lab hosts on {}", self.port)
     }
 }
 

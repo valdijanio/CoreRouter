@@ -62,6 +62,10 @@ pub mod l2;
 #[cfg(target_os = "linux")]
 pub mod dhcp;
 
+/// DHCP server transport (G4.2a): `AF_PACKET` + BPF, UDP 67, ARP probes.
+#[cfg(target_os = "linux")]
+pub mod dhcp_server;
+
 /// DHCPv6 client transport (G4.7b): UDP 546 → ff02::1:2.
 #[cfg(target_os = "linux")]
 pub mod dhcp6;
@@ -508,6 +512,15 @@ mod linux {
         ) -> Result<Box<dyn corerouter_hal::DhcpPort>, HalError> {
             crate::dhcp::LinuxDhcpPort::open(name)
                 .map(|p| Box::new(p) as Box<dyn corerouter_hal::DhcpPort>)
+                .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn dhcp_server_port(
+            &mut self,
+            name: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::dhcp_server::DhcpServerPort>, HalError> {
+            crate::dhcp_server::LinuxDhcpServerPort::open(name)
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::dhcp_server::DhcpServerPort>)
                 .map_err(|e| HalError::Io(e.to_string()))
         }
 

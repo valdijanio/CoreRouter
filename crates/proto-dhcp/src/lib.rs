@@ -7,7 +7,9 @@
 //! - [`optval`]: RouterOS' option value syntax;
 //! - [`lab`]: the virtual lab's simulated DHCP server;
 //! - [`v6`], [`client6`], [`lab6`]: the same for DHCPv6 (G4.7b), with a
-//!   codec of our own (RFC 9915).
+//!   codec of our own (RFC 9915);
+//! - [`server`]: the DHCPv4 server (G4.2a), pure like the client, and
+//!   [`lab_hosts`], the lab's simulated clients for it.
 //!
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
@@ -16,7 +18,9 @@ pub mod client;
 pub mod client6;
 pub mod lab;
 pub mod lab6;
+pub mod lab_hosts;
 pub mod optval;
+pub mod server;
 pub mod v4;
 pub mod v6;
 
@@ -37,6 +41,7 @@ pub const RESERVED_CODES: [u8; 11] = [0, 12, 50, 52, 53, 54, 55, 57, 60, 61, 255
 /// Validate this subsystem's part of the candidate: the DHCP clients.
 pub fn validate(cfg: &Config) -> Vec<Issue> {
     let mut out = validate6(cfg);
+    out.extend(server::checks::validate(cfg));
     if cfg.ip.dhcp_clients.len() > MAX_CLIENTS {
         out.push(Issue::new(
             "ip.dhcp_clients",
