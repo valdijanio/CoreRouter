@@ -761,10 +761,10 @@ NSEC3 e RRSIG.
 
 - As zonas são servidas pelo mesmo servidor da LAN: só com `allow_remote_requests`, e as
   consultas só para quem está em `allowed_from`. Transferência e NOTIFY têm ACL própria. Modo só
-  autoritativo para a internet, `allow_query` por zona e RRL: G4.1j.
+  autoritativo para a internet, `allow_query` por zona e RRL: G4.1k.
 - A cópia da secundária e o diário do IXFR ficam em memória: depois de um reinício, a secundária
   transfere de novo, e o primário responde IXFR com a zona inteira. NOTIFY só para `notify`
-  (como o `notify explicit` do BIND), não para os NS da zona. Mais tipos de registro: G4.1k.
+  (como o `notify explicit` do BIND), não para os NS da zona. Mais tipos de registro: G4.1l.
 - Sem TSIG (G4.1c-3) e sem DNSSEC (G4.1c-2). Os benchmarks contra Unbound e Knot com sockets são
   a G4.1g.
 
@@ -859,7 +859,7 @@ SRV e TXT. Não tem SOA, PTR, CAA, zona, AXFR, IXFR nem NOTIFY.
 **Fica de fora, e por quê.**
 
 - XoT (RFC 9103): exige TLS no servidor DNS.
-- Views (split-horizon): G4.1j se for preciso.
+- Views (split-horizon): G4.1k se for preciso.
 - `$GENERATE` do BIND.
 - Catalog zones (RFC 9432).
-- Mais tipos de registro: G4.1k.
+- Mais tipos de registro: G4.1l.
