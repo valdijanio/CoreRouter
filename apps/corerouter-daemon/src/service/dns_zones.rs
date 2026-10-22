@@ -14,6 +14,14 @@
 //!   transfer keeps the old copy (RFC 5936 §6). Timers come from the
 //!   loaded SOA, clamped like BIND (refresh 300 s..4 weeks, retry 60 s..2
 //!   weeks).
+//! - **DNSSEC** (G4.1c-2): every second the engine's key life cycle runs
+//!   (`Session::dnssec_tick`, with ring generating the keys here); a
+//!   signed zone is re-signed in a thread of its own when its data or keys
+//!   change and when half of the signature validity is gone, with a
+//!   serial larger than the last signed one (the secondaries must fetch
+//!   the new signatures), and the signed version is what the zone serves,
+//!   transfers and NOTIFYs. A transferred signed zone gets its signatures
+//!   indexed, so a secondary answers DO queries with them too.
 //! - The engine sees all this through [`ZoneBackend`] (status, a
 //!   secondary's zone file, refresh now).
 //!
@@ -29,6 +37,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corerouter_control::Shutdown;
 use corerouter_engine::dns_zone::ZoneBackend;
+use corerouter_engine::dnssec::NewKey;
+use corerouter_model::dnssec::{DnssecAlgorithm, DnssecKey, KeyRole, KeyState};
 use corerouter_engine::{Shared, lock};
 use corerouter_model::dns_zone::{ZoneStatus, ZoneType, serial_gt};
 use corerouter_proto_dns::zone::xfr::{self, Ack, Transfer};
@@ -82,8 +92,28 @@ impl Sec {
     }
 }
 
+/// What a signed version was made from: a new one is due when this
+/// changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SignInput {
+    serial: u32,
+    keys: Vec<(u32, KeyState)>,
+    validity: u32,
+}
+
+/// One zone's signing.
+#[derive(Debug, Default)]
+struct SignJob {
+    busy: bool,
+    done: Option<SignInput>,
+    /// After a failure, wait before trying again.
+    retry_at: Option<Instant>,
+    error: String,
+}
+
 /// The zone service: shared by its thread, its workers and the engine.
 pub(crate) struct Zones {
+    session: Shared,
     srv: Arc<Server>,
     /// Port of the primaries and NOTIFY targets (53; tests use their own).
     port: u16,
@@ -92,6 +122,7 @@ pub(crate) struct Zones {
     notify_errors: Mutex<HashMap<String, String>>,
     /// Zones with a NOTIFY sender running, and the change to send next.
     notifying: Mutex<HashMap<String, Option<Changed>>>,
+    signing: Mutex<HashMap<String, SignJob>>,
     shutdown: Shutdown,
 }
 
@@ -136,13 +167,15 @@ fn write_framed(s: &mut TcpStream, msg: &[u8]) -> std::io::Result<()> {
 }
 
 impl Zones {
-    pub(crate) fn new(srv: Arc<Server>, port: u16, shutdown: Shutdown) -> Arc<Self> {
+    pub(crate) fn new(session: Shared, srv: Arc<Server>, port: u16, shutdown: Shutdown) -> Arc<Self> {
         Arc::new(Self {
+            session,
             srv,
             port,
             secs: Mutex::new(HashMap::new()),
             notify_errors: Mutex::new(HashMap::new()),
             notifying: Mutex::new(HashMap::new()),
+            signing: Mutex::new(HashMap::new()),
             shutdown,
         })
     }
@@ -182,6 +215,7 @@ impl Zones {
         }
         let cfg = self.fwd().config();
         let zones = zone::zones(self.fwd(), &cfg);
+        self.dnssec(&zones);
         let secondaries: HashMap<&String, &ZoneConf> = zones
             .conf
             .iter()
@@ -241,6 +275,109 @@ impl Zones {
                 {
                     s.busy = false;
                 }
+            }
+        }
+    }
+
+    /// The key life cycle, then a signing thread for each signed zone due.
+    fn dnssec(self: &Arc<Self>, zones: &zone::Zones) {
+        let now = unix_now();
+        let state = {
+            let mut s = lock(&self.session);
+            let mut generate = |zone: &str, alg: DnssecAlgorithm, role: KeyRole| {
+                zone::dnssec::generate(zone, alg, role).map(|g| NewKey {
+                    private_key: g.private_key,
+                    dnskey: g.dnskey,
+                    ds: g.ds,
+                    key_tag: g.key_tag,
+                })
+            };
+            if let Err(e) = s.dnssec_tick(now, &mut generate) {
+                log::error!("DNSSEC keys: {e}");
+            }
+            s.dnssec_state()
+        };
+        let mut jobs = self.signing.lock().unwrap_or_else(|e| e.into_inner());
+        for (name, conf) in &zones.conf {
+            if conf.ztype != ZoneType::Primary {
+                continue;
+            }
+            if !conf.dnssec {
+                zone::drop_signed(self.fwd(), name);
+                jobs.remove(name);
+                continue;
+            }
+            let Some(unsigned) = zones.primaries.get(name).cloned() else {
+                continue;
+            };
+            let keys: Vec<DnssecKey> = state.keys_of(name).cloned().collect();
+            if !keys.iter().any(|k| k.state == KeyState::Active) {
+                continue;
+            }
+            let input = SignInput {
+                serial: unsigned.serial,
+                keys: keys.iter().map(|k| (k.id, k.state)).collect(),
+                validity: conf.signature_validity_secs,
+            };
+            // Half of the validity gone: new signatures (Knot and BIND
+            // refresh well before expiry, RFC 6781 §4.4.2).
+            let expiring = zone::signed(self.fwd(), name)
+                .and_then(|z| z.dnssec.as_ref().map(|d| u64::from(d.expires)))
+                .is_none_or(|exp| exp < now + u64::from(conf.signature_validity_secs) / 2);
+            let job = jobs.entry(name.clone()).or_default();
+            if job.busy
+                || job.retry_at.is_some_and(|t| Instant::now() < t)
+                || (job.done.as_ref() == Some(&input) && !expiring)
+            {
+                continue;
+            }
+            job.busy = true;
+            let last = state.signed_serial.get(name).copied();
+            // Larger than the last signed serial, and than the config's.
+            let serial = match last {
+                Some(l) if !serial_gt(unsigned.serial, l) => l.wrapping_add(1),
+                _ => unsigned.serial,
+            };
+            let me = self.clone();
+            let name = name.clone();
+            let thread_name = name.clone();
+            let spawned = thread::Builder::new().name("dns-sign".into()).spawn(move || {
+                me.sign(&name, &unsigned, &keys, serial, input);
+            });
+            if let Err(e) = spawned {
+                log::warn!("DNSSEC: no thread to sign {thread_name}: {e}");
+                job.busy = false;
+            }
+        }
+    }
+
+    fn sign(&self, name: &str, unsigned: &ZoneData, keys: &[DnssecKey], serial: u32, input: SignInput) {
+        let now = u32::try_from(unix_now()).unwrap_or(u32::MAX);
+        let started = Instant::now();
+        let result = zone::dnssec::sign(unsigned, keys, serial, now, input.validity);
+        let mut jobs = self.signing.lock().unwrap_or_else(|e| e.into_inner());
+        let job = jobs.entry(name.to_owned()).or_default();
+        job.busy = false;
+        match result {
+            Ok(signed) => {
+                log::info!(
+                    "DNSSEC: zone {name} signed, serial {serial}, {} records, {} ms",
+                    signed.len(),
+                    started.elapsed().as_millis()
+                );
+                zone::set_signed(self.fwd(), name, signed);
+                job.done = Some(input);
+                job.retry_at = None;
+                job.error.clear();
+                drop(jobs);
+                if let Err(e) = lock(&self.session).dnssec_signed(name, serial) {
+                    log::error!("DNSSEC: zone {name}: {e}");
+                }
+            }
+            Err(e) => {
+                log::error!("DNSSEC: zone {name} not signed: {e}");
+                job.error = format!("not signed: {e}");
+                job.retry_at = Some(Instant::now() + Duration::from_secs(60));
             }
         }
     }
@@ -360,6 +497,8 @@ impl Zones {
             other => other?,
         };
         if let Some(data) = got {
+            // A signed zone: its RRSIG/NSEC3 go to the lookup tables.
+            let data = zone::dnssec::index(data)?;
             log::info!(
                 "DNS: zone {} transferred from {ip}: serial {}, {} records",
                 conf.name,
@@ -437,6 +576,13 @@ impl Zones {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        let signing: HashMap<String, String> = self
+            .signing
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, j)| (k.clone(), j.error.clone()))
+            .collect();
         let now = Instant::now();
         let unix = unix_now();
         let mut out: Vec<ZoneStatus> = zones
@@ -444,14 +590,22 @@ impl Zones {
             .values()
             .map(|c| {
                 let data = match c.ztype {
+                    ZoneType::Primary if c.dnssec => zone::signed(self.fwd(), &c.name)
+                        .or_else(|| zones.primaries.get(&c.name).cloned()),
                     ZoneType::Primary => zones.primaries.get(&c.name).cloned(),
                     ZoneType::Secondary => zone::secondary(self.fwd(), &c.name),
                 };
                 let sec = secs.get(&c.name);
+                let sign_error = signing.get(&c.name).cloned().unwrap_or_default();
                 let error = match c.ztype {
-                    ZoneType::Primary => notify.get(&c.name).cloned().unwrap_or_default(),
+                    ZoneType::Primary => [notify.get(&c.name).cloned().unwrap_or_default(), sign_error]
+                        .into_iter()
+                        .filter(|e| !e.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("; "),
                     ZoneType::Secondary => sec.map(|s| s.error.clone()).unwrap_or_default(),
                 };
+                let signed = data.as_ref().and_then(|d| d.dnssec.as_ref().map(|s| s.expires));
                 ZoneStatus {
                     zone: c.name.clone(),
                     loaded_serial: data.as_ref().map(|d| d.serial),
@@ -461,6 +615,9 @@ impl Zones {
                         unix + s.next.saturating_duration_since(now).as_secs()
                     }),
                     error,
+                    signed_serial: signed.and(data.as_ref().map(|d| d.serial)).filter(|_| c.dnssec),
+                    signatures_expire_unix: signed.map(u64::from),
+                    signed: signed.is_some() && c.ztype == ZoneType::Secondary,
                 }
             })
             .collect();
@@ -509,7 +666,7 @@ impl ZoneBackend for Backend {
 
 /// Starts the service on `srv` and registers it with the engine.
 pub(crate) fn spawn(session: &Shared, srv: Arc<Server>, port: u16, shutdown: Shutdown) -> std::io::Result<Arc<Zones>> {
-    let z = Zones::new(srv, port, shutdown);
+    let z = Zones::new(session.clone(), srv, port, shutdown);
     lock(session).set_zone_backend(Arc::new(Backend(z.clone())));
     let me = z.clone();
     thread::Builder::new()
@@ -660,6 +817,119 @@ mod tests {
         // Leaving the config: the copy stops answering.
         run(&secondary, "ip.dns.zone.remove", json!({"id": "example.com"}));
         wait("the copy to go", || answer(sp, "www.example.com.").is_none());
+        shutdown.close();
+    }
+
+    fn ask_do(port: u16, name: &str, t: RecordType) -> Option<Message> {
+        let mut m = Message::query();
+        m.add_query(Query::query(Name::from_ascii(name).unwrap(), t));
+        let mut e = hickory_proto::op::Edns::new();
+        e.set_dnssec_ok(true);
+        e.set_max_payload(4096);
+        m.set_edns(e);
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        s.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port)).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, _) = s.recv_from(&mut buf).ok()?;
+        Message::from_vec(&buf[..n]).ok()
+    }
+
+    fn rrsigs(m: &Message) -> usize {
+        m.answers
+            .iter()
+            .filter(|r| r.record_type() == RecordType::RRSIG)
+            .count()
+    }
+
+    /// G4.1c-2: `dnssec=yes` makes keys (in the engine's state, not the
+    /// config), signs, serves RRSIGs to DO queries only, re-signs on a
+    /// change with a new serial, and a secondary serves the signatures it
+    /// transferred.
+    #[test]
+    fn a_signed_zone_and_its_secondary() {
+        let (pp, sp) = (free_port(), free_port());
+        let shutdown = Shutdown::default();
+        let primary = shared(Session::virtual_lab());
+        run(&primary, "ip.dns.set", json!({"allow_remote_requests": true}));
+        run(
+            &primary,
+            "ip.dns.zone.add",
+            json!({"name": "example.com", "allow_transfer": "127.0.0.0/8", "notify": "127.0.0.1", "dnssec": true}),
+        );
+        let www = run(
+            &primary,
+            "ip.dns.zone.record.add",
+            json!({"zone": "example.com", "name": "www", "address": "192.0.2.80"}),
+        );
+        let p_srv = super::super::dns_server::spawn(
+            primary.clone(),
+            Arc::new(RouterDns::new()),
+            pp,
+            shutdown.clone(),
+        )
+        .unwrap();
+        spawn(&primary, p_srv, sp, shutdown.clone()).unwrap();
+        wait("the signed zone", || {
+            ask_do(pp, "www.example.com.", RecordType::A).is_some_and(|m| rrsigs(&m) == 1)
+        });
+        let keys = run(&primary, "ip.dns.zone.dnssec.print", json!({"zone": "example.com"}));
+        assert_eq!(keys.as_array().unwrap().len(), 2, "{keys}");
+        assert!(!keys.to_string().contains("private"), "{keys}");
+        let zone = run(&primary, "ip.dns.zone.print", json!({}));
+        assert!(zone[0]["ds"][0].as_str().unwrap().contains(" 13 2 "), "{zone}");
+        let signed = zone[0]["signed_serial"].as_u64().unwrap();
+        // Without DO: no RRSIG (RFC 4035 §3.1).
+        let m = ask(pp, "www.example.com.").unwrap();
+        assert!(m.answers.iter().all(|r| r.record_type() == RecordType::A));
+        // A change: re-signed with a larger serial.
+        run(
+            &primary,
+            "ip.dns.zone.record.set",
+            json!({"id": www["id"], "address": "192.0.2.81"}),
+        );
+        wait("the re-signing", || {
+            ask_do(pp, "www.example.com.", RecordType::A).is_some_and(|m| {
+                rrsigs(&m) == 1 && m.answers.iter().any(|r| r.data.to_string() == "192.0.2.81")
+            })
+        });
+        let again = run(&primary, "ip.dns.zone.print", json!({}))[0]["signed_serial"]
+            .as_u64()
+            .unwrap();
+        assert!(again > signed);
+
+        let secondary = shared(Session::virtual_lab());
+        run(&secondary, "ip.dns.set", json!({"allow_remote_requests": true}));
+        run(
+            &secondary,
+            "ip.dns.zone.add",
+            json!({"name": "example.com", "type": "secondary", "primaries": "127.0.0.1"}),
+        );
+        let s_srv = super::super::dns_server::spawn(
+            secondary.clone(),
+            Arc::new(RouterDns::new()),
+            sp,
+            shutdown.clone(),
+        )
+        .unwrap();
+        spawn(&secondary, s_srv, pp, shutdown.clone()).unwrap();
+        wait("the secondary with signatures", || {
+            ask_do(sp, "www.example.com.", RecordType::A).is_some_and(|m| rrsigs(&m) == 1)
+        });
+        // The same NXDOMAIN proof as the primary's (with two names, one
+        // NSEC3 may prove it all).
+        let nsec3 = |m: &Message| {
+            m.authorities
+                .iter()
+                .filter(|r| r.record_type() == RecordType::NSEC3)
+                .count()
+        };
+        let pm = ask_do(pp, "nope.example.com.", RecordType::A).unwrap();
+        let m = ask_do(sp, "nope.example.com.", RecordType::A).unwrap();
+        assert!(nsec3(&m) >= 1);
+        assert_eq!(nsec3(&m), nsec3(&pm), "the secondary proves NXDOMAIN too");
+        let rows = run(&secondary, "ip.dns.zone.print", json!({}));
+        assert_eq!(rows[0]["signed"], true, "{rows}");
         shutdown.close();
     }
 }
