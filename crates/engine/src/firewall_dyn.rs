@@ -41,6 +41,7 @@ impl DynamicEntry {
             list: self.list.clone(),
             address: self.address,
             timeout_secs: self.left(now).max(1),
+            added_by_rule: false,
         }
     }
 }

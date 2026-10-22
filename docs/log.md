@@ -486,4 +486,27 @@ mesmo dia pode variar.
   achou dois `panic` no `dhcproto` 0.15 com pacotes malformados; o decode agora passa por um
   saneador. Testes: 32 no `proto-dhcp`, 15 de integração no engine, netns com daemon real e
   servidor DHCP em Rust (concessão + rotas no kernel em ~3 s **medido**), UI headless, terminal.
+- 2026-10-22 — G2.1b: firewall seguro e fácil (`docs/firewall.md` §6–§11). **Lockout:** o canal
+  de controle dá ao `Caller` o `Link` da conexão; todo commit que mexe no firewall passa os pacotes
+  dela (estabelecido em input, resposta em output, login novo em input e em dstnat) pelo firewall
+  atual e pelo candidato (`firewall::eval`) e recusa o que os cortaria, salvo `force` ou Safe
+  Mode; na GUI a recusa vira a janela "This change would lock you out" (Safe Mode e aplicar /
+  aplicar mesmo assim / cancelar). **Sombras:** `firewall::shadow` por inclusão de matchers
+  (`shadowed_by` e flag `S`; linha na cor de aviso). **Defaults** (`ip.firewall.defaults.apply`,
+  estilo `defconf` do RouterOS com IPv6 e `lo`), **5 modelos** (`ip.firewall.template.*`:
+  redirecionar porta, bloquear endereço, força bruta em estágios, limitar ping, gerência só da
+  LAN), **zonas** (`ip.firewall.zone.*`: matriz de→para gerando um bloco marcado `Z`, edição
+  manual dele recusada, `detach` devolve as regras). Para a força bruta: ação
+  `add-src/dst-to-address-list` (o kernel não insere em set de intervalos pelo caminho dos
+  pacotes, então a lista ganha um set `ad*` e a regra que a casa vira duas disjuntas) e matcher
+  `limit`. **Descrição** em português por regra (`firewall::describe`) e cores por ação com
+  contraste ≥ 4,5:1 nos dois temas. Testes: 7 unitários do crate firewall (avaliador, sombras,
+  descrição), golden atualizado, 1 netns novo (um SYN enche o set dinâmico, a troca preserva, a
+  regra conta), 13 do engine (lockout com conexão simulada em 8 situações, sombras, defaults,
+  modelos, zonas), 1 do canal de controle real (lockout por `lo` e `force`), 7 headless da GUI
+  (descrição/sombra, botões cinza nas regras Z, assistentes, matriz nos dois temas, contraste,
+  janela de lockout e cancelamento que volta ao assistente). Teste manual: daemon de lab +
+  `corerouter-gui --connect` num Xvfb isolado; defaults, modelos, zonas e o aviso de lockout
+  (bloquear 127.0.0.1 pela própria GUI → janela → Safe Mode e aplicar) conferidos em screenshot.
+  Esforço do agente ~6 h (**estimado**).
 - 2026-10-22 — processo: proteção da main sem "branch atualizada" (strict=false) para dar vazão; workflow `main-red` abre/fecha a issue "main quebrada" quando o CI da main falha/volta; AGENTS.md: trazer a main antes do PR, main vermelha é prioridade zero, ids de gap só do brief/main, sessões não abrem sessões, PRs pequenos, pontos quentes com mudanças mínimas. Medido antes: CI de PR mediana 2,0 min, 1,6 execuções por PR.

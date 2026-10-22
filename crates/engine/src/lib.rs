@@ -11,6 +11,7 @@ pub mod error;
 pub mod firewall_dyn;
 pub mod guard;
 pub mod link_watch;
+pub mod lockout;
 pub mod neighbors;
 pub mod safe_mode;
 pub mod session;
@@ -21,6 +22,7 @@ pub mod validate;
 
 pub use auth::{Group, Login, Principal};
 pub use error::EngineError;
+pub use lockout::Link;
 pub use neighbors::{MAX_NEIGHBORS, NeighborTable};
 pub use safe_mode::Caller;
 pub use session::{CommitMode, JournalEntry, Session, Shared, StorageStatus, lock, shared};

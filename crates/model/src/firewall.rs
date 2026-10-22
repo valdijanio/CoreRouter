@@ -669,6 +669,185 @@ impl fmt::Display for IcmpOptions {
 }
 text_serde!(IcmpOptions);
 
+/// The unit of a [`Limit`] (the ones nftables has).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum LimitPeriod {
+    Second,
+    Minute,
+    Hour,
+    Day,
+}
+
+impl LimitPeriod {
+    pub fn secs(self) -> u32 {
+        match self {
+            LimitPeriod::Second => 1,
+            LimitPeriod::Minute => 60,
+            LimitPeriod::Hour => 3600,
+            LimitPeriod::Day => 86_400,
+        }
+    }
+
+    /// The nftables keyword.
+    pub fn name(self) -> &'static str {
+        match self {
+            LimitPeriod::Second => "second",
+            LimitPeriod::Minute => "minute",
+            LimitPeriod::Hour => "hour",
+            LimitPeriod::Day => "day",
+        }
+    }
+
+    fn short(self) -> &'static str {
+        match self {
+            LimitPeriod::Second => "1s",
+            LimitPeriod::Minute => "1m",
+            LimitPeriod::Hour => "1h",
+            LimitPeriod::Day => "1d",
+        }
+    }
+}
+
+/// `limit`: the rule matches at most `count` packets per `period`, plus a
+/// `burst` of extra packets (RouterOS `limit=count/time,burst`; the times
+/// are the ones nftables has: 1s, 1m, 1h, 1d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Limit {
+    pub count: u32,
+    pub period: LimitPeriod,
+    pub burst: u32,
+}
+
+impl Limit {
+    /// Hostile-input bound (**estimado**: far above any real rate).
+    pub const MAX: u32 = 1_000_000;
+    /// nftables' default burst.
+    pub const DEFAULT_BURST: u32 = 5;
+}
+
+impl FromStr for Limit {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let bad = |why: &'static str| ParseError::new("limit", s, why);
+        let (rate, burst) = match s.split_once(',') {
+            Some((r, b)) => (r.trim(), Some(b.trim())),
+            None => (s, None),
+        };
+        let (count, period) = rate
+            .split_once('/')
+            .ok_or_else(|| bad("expected count/time[,burst], like 5/1s,10"))?;
+        let count: u32 = count
+            .trim()
+            .parse()
+            .map_err(|_| bad("the count must be a whole number"))?;
+        let period = match period.trim() {
+            "s" | "1s" | "sec" | "second" => LimitPeriod::Second,
+            "m" | "1m" | "min" | "minute" => LimitPeriod::Minute,
+            "h" | "1h" | "hour" => LimitPeriod::Hour,
+            "d" | "1d" | "day" => LimitPeriod::Day,
+            _ => return Err(bad("the time must be 1s, 1m, 1h or 1d")),
+        };
+        let burst = match burst {
+            Some(b) => b
+                .trim()
+                .parse()
+                .map_err(|_| bad("the burst must be a whole number"))?,
+            None => Limit::DEFAULT_BURST,
+        };
+        if count == 0 || count > Limit::MAX || burst > Limit::MAX {
+            return Err(bad("count 1..=1000000, burst 0..=1000000"));
+        }
+        Ok(Limit {
+            count,
+            period,
+            burst,
+        })
+    }
+}
+
+impl fmt::Display for Limit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{},{}", self.count, self.period.short(), self.burst)
+    }
+}
+text_serde!(Limit);
+
+/// A RouterOS duration: `90` (seconds), `30s`, `5m`, `1h30m`, `1d`, `1w`;
+/// 1 second ..= 35 days (nftables keeps timeouts in 32-bit milliseconds).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Timeout(pub u32);
+
+impl Timeout {
+    pub const MAX: u32 = 35 * 86_400;
+
+    pub fn secs(self) -> u32 {
+        self.0
+    }
+}
+
+impl FromStr for Timeout {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let text = s.trim();
+        let bad = || {
+            ParseError::new(
+                "timeout",
+                s,
+                "expected seconds or a duration like 30s, 5m, 1h30m, 1d",
+            )
+        };
+        if text.is_empty() || text.len() > 32 {
+            return Err(bad());
+        }
+        let mut total: u64 = 0;
+        let mut num = String::new();
+        for c in text.chars() {
+            if c.is_ascii_digit() {
+                num.push(c);
+                continue;
+            }
+            let unit: u64 = match c {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86_400,
+                'w' => 604_800,
+                _ => return Err(bad()),
+            };
+            let n: u64 = num.parse().map_err(|_| bad())?;
+            total = total.saturating_add(n.saturating_mul(unit));
+            num.clear();
+        }
+        if !num.is_empty() {
+            let n: u64 = num.parse().map_err(|_| bad())?;
+            total = total.saturating_add(n);
+        }
+        if total == 0 || total > u64::from(Timeout::MAX) {
+            return Err(ParseError::new(
+                "timeout",
+                s,
+                "must be 1 second ..= 35 days",
+            ));
+        }
+        u32::try_from(total).map(Timeout).map_err(|_| bad())
+    }
+}
+
+impl fmt::Display for Timeout {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let secs = self.0;
+        let (d, h, m, s) = (secs / 86_400, secs / 3600 % 24, secs / 60 % 60, secs % 60);
+        for (n, u) in [(d, "d"), (h, "h"), (m, "m"), (s, "s")] {
+            if n > 0 {
+                write!(f, "{n}{u}")?;
+            }
+        }
+        Ok(())
+    }
+}
+text_serde!(Timeout);
+
 /// What a rule matches. Absent = any.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -707,6 +886,8 @@ pub struct Matchers {
     pub packet_mark: Option<Neg<Name>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing_mark: Option<Neg<Name>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<Limit>,
 }
 
 impl Matchers {
@@ -868,11 +1049,25 @@ pub enum Action {
         #[serde(default = "yes", skip_serializing_if = "is_true")]
         passthrough: bool,
     },
+    /// Put the packet's source address in `address_list` (dynamic, kept in
+    /// the kernel; without a timeout it stays until the next restart).
+    /// The packet goes on to the next rule.
+    AddSrcToAddressList {
+        address_list: Name,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address_list_timeout: Option<Timeout>,
+    },
+    /// Same with the destination address.
+    AddDstToAddressList {
+        address_list: Name,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        address_list_timeout: Option<Timeout>,
+    },
 }
 
 impl Action {
     /// RouterOS action names, in menu order.
-    pub const NAMES: [&'static str; 13] = [
+    pub const NAMES: [&'static str; 15] = [
         "accept",
         "drop",
         "reject",
@@ -886,6 +1081,8 @@ impl Action {
         "mark-connection",
         "mark-packet",
         "mark-routing",
+        "add-src-to-address-list",
+        "add-dst-to-address-list",
     ];
 
     pub fn name(&self) -> &'static str {
@@ -903,13 +1100,27 @@ impl Action {
             Action::MarkConnection { .. } => "mark-connection",
             Action::MarkPacket { .. } => "mark-packet",
             Action::MarkRouting { .. } => "mark-routing",
+            Action::AddSrcToAddressList { .. } => "add-src-to-address-list",
+            Action::AddDstToAddressList { .. } => "add-dst-to-address-list",
+        }
+    }
+
+    /// The address list an `add-*-to-address-list` action fills.
+    pub fn fills_list(&self) -> Option<&Name> {
+        match self {
+            Action::AddSrcToAddressList { address_list, .. }
+            | Action::AddDstToAddressList { address_list, .. } => Some(address_list),
+            _ => None,
         }
     }
 
     /// Whether a matching packet goes on to the next rule.
     pub fn continues(&self) -> bool {
         match self {
-            Action::Log { .. } | Action::Passthrough => true,
+            Action::Log { .. }
+            | Action::Passthrough
+            | Action::AddSrcToAddressList { .. }
+            | Action::AddDstToAddressList { .. } => true,
             Action::MarkConnection { passthrough, .. }
             | Action::MarkPacket { passthrough, .. }
             | Action::MarkRouting { passthrough, .. } => *passthrough,
@@ -938,6 +1149,69 @@ pub struct FirewallRule {
     /// it never reaches the data plane.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub section: bool,
+    /// Generated by the zone matrix (`ip.firewall.zone.*`): rewritten
+    /// whenever the matrix changes, so the rule commands refuse to edit it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub zone: bool,
+}
+
+/// One side of a zone-matrix cell: the router itself or the interfaces of
+/// an interface list.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Zone {
+    Router,
+    List(Name),
+}
+
+impl Zone {
+    pub const ROUTER: &'static str = "router";
+}
+
+impl FromStr for Zone {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if s == Zone::ROUTER {
+            return Ok(Zone::Router);
+        }
+        s.parse().map(Zone::List)
+    }
+}
+
+impl fmt::Display for Zone {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Zone::Router => f.write_str(Zone::ROUTER),
+            Zone::List(n) => n.fmt(f),
+        }
+    }
+}
+text_serde!(Zone);
+
+/// What a zone-matrix cell does with new connections from → to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ZoneAction {
+    Allow,
+    Block,
+}
+
+impl ZoneAction {
+    pub fn name(self) -> &'static str {
+        match self {
+            ZoneAction::Allow => "allow",
+            ZoneAction::Block => "block",
+        }
+    }
+}
+
+/// One cell of the zone matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ZonePolicy {
+    pub from: Zone,
+    pub to: Zone,
+    pub action: ZoneAction,
 }
 
 /// A static `/ip firewall address-list` entry (IPv4 and IPv6 together).
@@ -961,8 +1235,13 @@ pub struct AddressListEntry {
 pub struct DynamicAddress {
     pub list: Name,
     pub address: AddrMatch,
-    /// Seconds left; the data plane expires it on its own.
+    /// Seconds left; the data plane expires it on its own. 0 = no timeout
+    /// (only for `added_by_rule` entries).
     pub timeout_secs: u64,
+    /// Put there by an `add-*-to-address-list` rule (kept in the list's
+    /// dynamic set, see `corerouter-firewall::nft`), not by a command.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub added_by_rule: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
@@ -975,6 +1254,10 @@ pub struct Firewall {
     /// Next rule id (shared by the three tables; never reused).
     pub next_rule_id: u32,
     pub next_address_list_id: u32,
+    /// The simple mode's zone matrix (G2.1b); its rules are the `zone`
+    /// ones of the filter table.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub zones: Vec<ZonePolicy>,
 }
 
 impl Firewall {
@@ -1078,6 +1361,7 @@ mod tests {
             disabled: false,
             comment: String::new(),
             section: false,
+            zone: false,
         };
         let json = serde_json::to_string(&rule).unwrap();
         assert!(
@@ -1091,6 +1375,34 @@ mod tests {
             serde_json::from_str(r#"{"type": "mark-connection", "new_connection_mark": "web"}"#)
                 .unwrap();
         assert!(mark.continues(), "passthrough defaults to yes");
+    }
+
+    #[test]
+    fn limits_timeouts_and_zones_parse() {
+        let l: Limit = "5/s".parse().unwrap();
+        assert_eq!(l.to_string(), "5/1s,5");
+        assert_eq!("10/1m,20".parse::<Limit>().unwrap().burst, 20);
+        assert!("0/1s".parse::<Limit>().is_err());
+        assert!("5/5s".parse::<Limit>().is_err(), "nftables has no 5s unit");
+        assert!("5".parse::<Limit>().is_err());
+        let t: Timeout = "1h30m".parse().unwrap();
+        assert_eq!(t.secs(), 5400);
+        assert_eq!(t.to_string(), "1h30m");
+        assert_eq!("90".parse::<Timeout>().unwrap().to_string(), "1m30s");
+        assert!("36d".parse::<Timeout>().is_err());
+        assert!("0".parse::<Timeout>().is_err());
+        assert!("1x".parse::<Timeout>().is_err());
+        assert_eq!("router".parse::<Zone>().unwrap(), Zone::Router);
+        assert_eq!(
+            "LAN".parse::<Zone>().unwrap(),
+            Zone::List("LAN".parse().unwrap())
+        );
+        let add: Action = serde_json::from_str(
+            r#"{"type": "add-src-to-address-list", "address_list": "bad", "address_list_timeout": "1d"}"#,
+        )
+        .unwrap();
+        assert!(add.continues());
+        assert_eq!(add.fills_list().map(Name::as_str), Some("bad"));
     }
 
     #[test]

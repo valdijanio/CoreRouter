@@ -17,6 +17,7 @@ pub fn rule(id: u32, chain: &str, m: Matchers, action: Action) -> Option<Firewal
         disabled: false,
         comment: String::new(),
         section: false,
+        zone: false,
     })
 }
 
@@ -123,6 +124,28 @@ fn build() -> Option<Config> {
             m(&[("protocol", "tcp")])?,
             act(r#"{"type": "reject", "reject_with": "tcp-reset"}"#)?,
         )?,
+        rule(
+            21,
+            "input",
+            m(&[
+                ("protocol", "tcp"),
+                ("dst_port", "22"),
+                ("connection_state", "new"),
+            ])?,
+            act(
+                r#"{"type": "add-src-to-address-list", "address_list": "blocked", "address_list_timeout": "1m"}"#,
+            )?,
+        )?,
+        rule(
+            22,
+            "input",
+            m(&[
+                ("protocol", "icmp"),
+                ("icmp_options", "8:0"),
+                ("limit", "5/1s,10"),
+            ])?,
+            Action::Accept,
+        )?,
         disabled,
         rule(
             10,
@@ -209,7 +232,7 @@ fn build() -> Option<Config> {
             act(r#"{"type": "mark-packet", "new_packet_mark": "bulk"}"#)?,
         )?,
     ];
-    fw.next_rule_id = 20;
+    fw.next_rule_id = 22;
     fw.next_address_list_id = 4;
     Some(cfg)
 }

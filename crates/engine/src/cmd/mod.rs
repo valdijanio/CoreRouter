@@ -78,6 +78,8 @@ pub mod args;
 mod config;
 mod dhcp_client;
 pub mod firewall;
+mod firewall_assist;
+mod firewall_zone;
 mod interface;
 mod interface_info;
 mod interface_list;
@@ -99,6 +101,8 @@ static AREAS: &[&[CommandSpec]] = &[
     vrf::COMMANDS,
     dhcp_client::COMMANDS,
     firewall::COMMANDS,
+    firewall_assist::COMMANDS,
+    firewall_zone::COMMANDS,
     neighbor::COMMANDS,
     routing::COMMANDS,
     system::COMMANDS,
