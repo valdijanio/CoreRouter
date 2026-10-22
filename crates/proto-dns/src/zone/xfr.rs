@@ -1,7 +1,8 @@
 //! Zone transfers and NOTIFY, as messages (the daemon has the sockets).
 //!
 //! Server side, [`intercept`]: before the chain sees a message, AXFR and
-//! IXFR queries (RFC 5936, RFC 1995) and NOTIFY (RFC 1996) are answered
+//! IXFR queries (RFC 5936, RFC 1995), NOTIFY (RFC 1996) and UPDATE (RFC
+//! 2136, handed to the daemon's updater: `zone::update`) are answered
 //! here, with their own ACLs (`allow_transfer`, a secondary's
 //! `primaries`), not `allowed_from`: a secondary somewhere else may
 //! transfer, a LAN client may not.
@@ -65,6 +66,14 @@ fn peek(packet: &[u8]) -> Option<(u8, Option<u16>)> {
 /// (or junk), for the chain.
 pub fn intercept(f: &Forwarder, packet: &[u8], client: IpAddr, tcp: bool) -> Option<Vec<Vec<u8>>> {
     let (opcode, qtype) = peek(packet)?;
+    // RFC 2136 UPDATE (G4.1c-3): the daemon's zone service answers it.
+    if opcode == 5 {
+        if let Some(u) = super::updater(f) {
+            return Some(u(packet, client).into_iter().collect());
+        }
+        let m = Message::from_vec(packet).ok()?;
+        return Some(error(&m, ResponseCode::NotImp).into_iter().collect());
+    }
     let notify = opcode == 4;
     let transfer = opcode == 0
         && qtype

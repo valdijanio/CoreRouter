@@ -1093,3 +1093,127 @@ confirmação; o `delv` valida a zona inteira no teste de namespace; assinar a z
 **Fica de fora, e por quê.** CDS/CDNSKEY e a checagem do DS no pai (precisam consultar o pai pela
 internet, com o resolvedor da G4.1f); NSEC (a gap pede NSEC3); rotação por idade e de algoritmo;
 chave offline (`offline-ksk` do Knot): G4.1m.
+
+### G4.1c-3 — Atualização dinâmica (RFC 2136 + TSIG) e DHCP → DNS
+
+**Problema.** Os nomes dos equipamentos de uma LAN (o notebook, o telefone IP) vêm do DHCP e mudam
+de endereço; ninguém os cadastra à mão. Os servidores de DHCP sérios (Kea com o dhcp-ddns, ISC
+dhcpd) os publicam por RFC 2136 UPDATE assinado com TSIG; o RouterOS não aceita UPDATE (tem o
+`add-dns-entries` do seu próprio DHCP e scripts de concessão). O servidor DHCP do CoreRouter (G4.2)
+ainda não existe.
+
+**Agora.**
+
+```sh
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.tsig-key.add '{"name":"dhcp-ddns"}'      # devolve o secret (32 bytes aleatórios)
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.set '{"id":"lan.example","update_keys":"dhcp-ddns"}'
+nsupdate -y hmac-sha256:dhcp-ddns:<secret> <<< $'server 192.168.88.1\nzone lan.example\nupdate add laptop.lan.example 600 A 192.168.88.77\nsend'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.record.print '{"zone":"lan.example"}'   # D laptop A 192.168.88.77
+```
+
+Na GUI: IP › DNS TSIG Keys (New faz uma chave aleatória e mostra o secret uma vez, com Copy; Show
+Secret mostra de novo), o diálogo da zona ganha Update Keys e Allow Update, e IP › DNS Zone Records
+mostra os registros dinâmicos com `D` (Remove os tira).
+
+| Comando | Parâmetros |
+|---|---|
+| `ip.dns.tsig-key.add/set/remove/print` | `name`, `algorithm` (`hmac-sha256` padrão, `hmac-sha384`, `hmac-sha512`), `secret` (base64, 16 a 256 bytes; ausente: 32 aleatórios), `comment`; `print show_secret=yes` mostra o secret, que o `print` normal e o `/export` escondem |
+| `ip.dns.zone.add/set` | + `update_keys` (chaves que podem atualizar), `allow_update` (de onde; sem `update_keys`, sem assinatura de lá) |
+| `ip.dns.zone.record.print` | + as linhas `D` (dinâmicas): `dynamic`, `source` (quem pôs), `expires_unix` |
+| `ip.dns.zone.dynamic.remove` / `.flush` | `{id}` / `{zone}` |
+| `ip.dns.zone.file.get` | inclui os registros dinâmicos |
+
+**Os registros dinâmicos ficam fora da config.** Como as chaves DNSSEC e as concessões do cliente
+DHCP, ficam no estado operacional (`dns-dynamic`, salvo antes de responder ao UPDATE, RFC 2136 §3.5):
+uma concessão não é revisão, um rollback não traz de volta o nome de uma concessão vencida e o
+`config.diff` não se afoga neles. Um UPDATE nunca muda um registro configurado: apagar um nome
+configurado só apaga os dinâmicos dele. Cada mudança sobe o serial servido (§3.6), também à frente
+do serial da config, e o próximo serial da config passa dele; uma zona assinada é assinada de novo.
+
+**Quem pode** (RFC 3007, §3.3): uma chave de `update_keys` (e, se houver, de `allow_update`); sem
+chaves, sem assinatura só de `allow_update` (o `allow-update` do BIND, para uma LAN de confiança);
+sem nenhum dos dois, REFUSED. Nada atualiza por padrão, como no BIND, no Knot e no PowerDNS.
+
+**O que é checado** (`proto-dns/src/zone/update.rs`), antes de qualquer mudança:
+
+- §3.1: a seção de zona é uma pergunta SOA de uma zona primária nossa (FORMERR, NOTAUTH).
+- TSIG (RFC 8945 §5.2): a chave, depois o MAC (sem MAC truncado), depois o tempo (fudge de 300 s,
+  §10) e nunca mais velho que a última mensagem da mesma chave (§5.2.3, contra repetição). BADKEY e
+  BADSIG voltam sem assinatura, BADTIME assinado, todos com NOTAUTH; a resposta a um UPDATE
+  assinado é assinada (§5.3). HMAC-SHA256/384/512 (§6: MD5 MUST NOT, SHA-1 NOT RECOMMENDED).
+- §3.2: os pré-requisitos (nome em uso ou não, RRset existe ou não, RRset igual) contra o que a
+  zona serve agora; YXDOMAIN, NXDOMAIN, YXRRSET, NXRRSET, NOTZONE.
+- §3.4.1/§2.5: adicionar, apagar RRset, apagar nome, apagar registro; o SOA é nosso (ignorado);
+  tipos que as zonas não guardam (SSHFP, DHCID…) são recusados; no máximo 100 mudanças por mensagem.
+- Engine (`engine/src/dns_dynamic.rs`), tudo ou nada (§3.7): registro igual só troca o TTL; CNAME
+  nunca se junta a outros dados nem outros dados a um CNAME (ignorado, §3.4.2.2 e errata 4469); o NS
+  do ápice é nosso.
+
+**DHCP → DNS (para a G4.2).** `Session::dns_dynamic_lease` põe o A/AAAA `host.<zona>` (trocando o
+que uma concessão anterior do mesmo host pôs) e o PTR na zona reversa nossa que cobre o endereço,
+com expiração no fim da concessão; `Session::dns_dynamic_release` os tira. Um host que é nome
+configurado não é tomado (como o Kea, que não sobrescreve nome que não é dele). O servidor DHCP da
+G4.2 chama essas duas funções (critério atualizado em `docs/gaps.md`); até lá, o Kea, o ISC dhcpd
+ou qualquer servidor com DDNS já atualiza as zonas por UPDATE.
+
+**Regras de RFC no código:**
+
+| Regra | Onde |
+|---|---|
+| RFC 2136 §3.1/§3.1.1: uma pergunta SOA; NOTAUTH fora das nossas zonas | `update::read` |
+| RFC 2136 §2.4/§3.2: pré-requisitos e seus códigos | `update::prerequisites` |
+| RFC 2136 §2.5/§3.4.1: seção de atualização, varredura antes | `update::changes` |
+| RFC 2136 §3.3 e RFC 3007 §2: permissão antes de tudo, nada por padrão | `update::read` |
+| RFC 2136 §3.4.2.2 (errata 4469): conflito de CNAME ignorado; registro igual troca o TTL | `dns_dynamic::apply` |
+| RFC 2136 §3.5: salvo antes da resposta; §3.6 serial sobe; §3.7 tudo ou nada | `Session::dns_dynamic_apply` |
+| RFC 8945 §5.2/§5.3/§6/§10: ordem dos testes, erros, resposta assinada, algoritmos, fudge | `update::sign` |
+| RFC 8945 §6: chave com pelo menos 16 bytes (`tsig-keygen` faz 32) | `dns_tsig::TsigKey::problem` |
+| RFC 1035 §3.5 e RFC 3596 §2.5: nome reverso do PTR | `dns_dynamic::reverse_name` |
+
+**Testes.** Modelo: chaves (base64, tamanho, algoritmos). `proto-dns`: permissão (sem chave, rede,
+zona alheia, seção de zona), pré-requisitos da §2.4 um a um, seção de atualização (apagar RRset,
+nome, registro; SOA ignorado; tipo desconhecido; NOTZONE), TSIG com o `TSigner` do Hickory (chave
+certa com resposta assinada, BADSIG, BADKEY, BADTIME, repetição, rede fora de `allow_update`) e
+proptests com bytes hostis e UPDATEs danificados. Engine: regras da §3.4.2, tudo ou nada, serial,
+concessão com A + PTR, troca de endereço, nome configurado preservado, expiração, liberação,
+reinício. Daemon: UPDATE assinado por UDP respondido na hora, chave errada sem efeito, concessão
+com A e PTR e o fim dela. Namespace (`tests/netns_dns_ddns.rs`): o `nsupdate` do BIND com TSIG
+(pré-requisito, YXDOMAIN, chave errada, PTR na reversa, delete). GUI: janela de chaves (New e Show
+Secret), linha `D` removida, e o log/status da GUI nunca mostra um secret (`redact.rs`).
+
+**Limites e o que fica para depois.** Sem DHCID/resolução de conflito da RFC 4703 (o Kea manda os
+DHCID como TXT/DHCID; DHCID é recusado: use `ddns-conflict-resolution-mode no-check-without-dhcid`
+no Kea); sem regras por nome/tipo como o `update-policy` do BIND; uma secundária não repassa UPDATE
+ao primário; TSIG também para AXFR/NOTIFY: G4.1n.
+
+#### Pesquisa da G4.1c-3
+
+Fontes (conferidas em 2026-10-22): MikroTik `/ip dns` e DHCP server (`lease-script`,
+`add-dns-entries` com sufixo `lan` e TTL da concessão,
+<https://manual.mikrotik.com/docs/network-management/dhcp/server/>); Kea D2
+(<https://kea.readthedocs.io/en/latest/arm/ddns.html>, `ddns-conflict-resolution-mode`, TTL 1/3 da
+concessão com mínimo de 600 s); ISC dhcpd `ddns-update-style`; BIND `allow-update` ×
+`update-policy`, journal; Knot ACL `action: update` com `update-type`/`update-owner`; PowerDNS
+`dnsupdate`, `allow-dnsupdate-from`, `TSIG-ALLOW-DNSUPDATE` (IP e chave, os dois); dnsmasq
+(`--domain`, `--dhcp-fqdn`) e OPNsense ("Register DHCP leases"); RFCs 2136 (§2.4, §2.5, §3.1–§3.8),
+3007, 8945 (obsoleta 2845 e 4635), 4701, 4703, 2181, 1035 §3.5, 3596. Errata: RFC 2136 4469
+(verificada, §3.4.2.2) e 2805 (retida); RFC 8945 7983 (editorial) e 9014 (rejeitada). "Updated by"
+da RFC 2136: 3007, 4033, 4034, 4035.
+
+**Como o MikroTik faz.** Sem UPDATE; o servidor DHCP põe um A dinâmico por concessão
+(`add-dns-entries`, sem PTR) ou roda um script.
+
+**Como os outros fazem.** Kea e ISC mandam UPDATE com TSIG (forward e reverse, DHCID para
+conflitos), BIND/Knot/PowerDNS aceitam por chave ou endereço, com política por nome/tipo; dnsmasq
+e OPNsense põem as concessões direto no DNS local.
+
+**O que adotamos.** UPDATE com TSIG como o BIND/Knot/PowerDNS, chave por zona, nada por padrão, IP e
+chave juntos como o PowerDNS; registros dinâmicos separados da config; e a função interna que o
+nosso DHCP vai chamar, com A **e** PTR (o RouterOS só faz A).
+
+**Melhorias.** O operador vê na lista de registros o que é dinâmico (`D`), quem pôs e quando vence,
+e tira com Remove; um rollback nunca mexe neles; a chave TSIG nasce aleatória e o secret nunca
+aparece no log, no `print` comum nem no export; o UPDATE de uma zona assinada sai assinado na hora.
+
+**Fica de fora, e por quê.** DHCID/RFC 4703 e `update-policy` por nome (G4.1n); repassar UPDATE
+de secundária ao primário (RFC 2136 §6, pouco usado); SIG(0) (quase ninguém usa).

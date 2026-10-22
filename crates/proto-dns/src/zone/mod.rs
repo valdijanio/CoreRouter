@@ -17,6 +17,7 @@
 
 pub mod dnssec;
 pub mod file;
+pub mod update;
 pub mod xfr;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -466,7 +467,12 @@ pub fn primary(z: &Zone, records: &[&ZoneRecord]) -> Option<ZoneData> {
 /// Primary zone `z` as served: its configured records and its dynamic
 /// ones (G4.1c-3), with the serial a dynamic change moved past the
 /// config's.
-pub fn served(z: &Zone, records: &[&ZoneRecord], dynamic: &[&ZoneRecord], serial: Option<u32>) -> Option<ZoneData> {
+pub fn served(
+    z: &Zone,
+    records: &[&ZoneRecord],
+    dynamic: &[&ZoneRecord],
+    serial: Option<u32>,
+) -> Option<ZoneData> {
     let mut z = z.clone();
     if let Some(s) = serial.filter(|s| corerouter_model::dns_zone::serial_gt(*s, z.serial)) {
         z.serial = s;
@@ -681,7 +687,11 @@ pub fn zones(f: &Forwarder, cfg: &ServerConfig) -> Arc<Zones> {
     let rt = runtime(f);
     let (dyn_version, dynamic) = rt.dynamic.read().unwrap_or_else(|e| e.into_inner()).clone();
     let key = (cfg.generation, dyn_version);
-    if let Some((k, z)) = rt.current.read().unwrap_or_else(|e| e.into_inner()).as_ref()
+    if let Some((k, z)) = rt
+        .current
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
         && *k == key
     {
         return z.clone();
@@ -741,12 +751,19 @@ pub fn set_dynamic(f: &Forwarder, version: u64, state: Arc<DynamicState>) {
 
 /// The version of the dynamic records the forwarder has.
 pub fn dynamic_version(f: &Forwarder) -> u64 {
-    runtime(f).dynamic.read().unwrap_or_else(|e| e.into_inner()).0
+    runtime(f)
+        .dynamic
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
 }
 
 /// Registers who answers UPDATE (without one: NOTIMP).
 pub fn set_updater(f: &Forwarder, u: Arc<Updater>) {
-    *runtime(f).updater.write().unwrap_or_else(|e| e.into_inner()) = Some(u);
+    *runtime(f)
+        .updater
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(u);
 }
 
 pub(crate) fn updater(f: &Forwarder) -> Option<Arc<Updater>> {
@@ -906,10 +923,17 @@ pub fn validate(cfg: &Config) -> Vec<corerouter_model::Issue> {
     }
     let dz = &cfg.ip.dns_zones;
     for z in &dz.zones {
-        if let Some(k) = z.update_keys.iter().find(|k| cfg.ip.dns_tsig.get(k).is_none()) {
+        if let Some(k) = z
+            .update_keys
+            .iter()
+            .find(|k| cfg.ip.dns_tsig.get(k).is_none())
+        {
             out.push(corerouter_model::Issue::new(
                 "ip.dns.zone",
-                format!("zone {}: update_keys: no TSIG key {k} (ip.dns.tsig-key.add)", z.name),
+                format!(
+                    "zone {}: update_keys: no TSIG key {k} (ip.dns.tsig-key.add)",
+                    z.name
+                ),
             ));
         }
     }

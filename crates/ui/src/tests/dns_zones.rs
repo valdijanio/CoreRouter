@@ -160,3 +160,41 @@ fn the_zone_dialog_shows_dnssec_keys() {
     let st = lock(&h.session).dnssec_state();
     assert_eq!(st.rollovers.len(), 1, "{:?}", h.app.log());
 }
+
+/// G4.1c-3: a dynamic record shows as `D` and Remove takes it out of the
+/// dynamic state (not the config).
+#[test]
+fn dynamic_records_show_and_go() {
+    let mut s = lab();
+    s.dns_dynamic_apply(
+        "example.com",
+        &[corerouter_model::dns_dynamic::DynamicOp::Add({
+            let mut r = corerouter_model::dns_zone::ZoneRecord::new(
+                corerouter_model::types::ItemId(0),
+                "example.com",
+                "pc",
+            );
+            r.address = Some("192.0.2.50".parse().unwrap());
+            r
+        })],
+        "update test",
+        None,
+        0,
+    )
+    .unwrap();
+    let mut h = open(s, WIN_RECORDS);
+    assert!(h.has_text("192.0.2.50"));
+    assert!(h.has_text("D"));
+    h.click(h.text("192.0.2.50"));
+    h.idle();
+    let remove = h
+        .ctx
+        .read_response(table::tool_id(RECORD_TABLE, table::Icon::Remove))
+        .unwrap()
+        .rect
+        .center();
+    h.click(remove);
+    refresh(&mut h);
+    assert!(lock(&h.session).dns_dynamic().1.records.is_empty(), "{:?}", h.app.log());
+    assert_eq!(lock(&h.session).store().running().ip.dns_zones.records.len(), 1);
+}

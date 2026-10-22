@@ -143,6 +143,8 @@ pub(crate) struct ZoneForm {
     pub allow_transfer: String,
     pub notify: String,
     pub primaries: String,
+    pub update_keys: String,
+    pub allow_update: String,
     pub dnssec: bool,
     pub dnssec_algorithm: String,
     pub signature_validity_secs: String,
@@ -166,6 +168,8 @@ impl Default for ZoneForm {
             allow_transfer: String::new(),
             notify: String::new(),
             primaries: String::new(),
+            update_keys: String::new(),
+            allow_update: String::new(),
             dnssec: false,
             dnssec_algorithm: "ecdsa-p256".into(),
             signature_validity_secs: "1209600".into(),
@@ -183,7 +187,13 @@ const ZONE_NUMBERS: [&str; 6] = [
     "ttl_secs",
     "signature_validity_secs",
 ];
-const ZONE_LISTS: [&str; 3] = ["allow_transfer", "notify", "primaries"];
+const ZONE_LISTS: [&str; 5] = [
+    "allow_transfer",
+    "notify",
+    "primaries",
+    "update_keys",
+    "allow_update",
+];
 
 impl ZoneForm {
     fn of(r: &Value) -> Self {
@@ -201,6 +211,8 @@ impl ZoneForm {
             allow_transfer: list_text(r, "allow_transfer"),
             notify: list_text(r, "notify"),
             primaries: list_text(r, "primaries"),
+            update_keys: list_text(r, "update_keys"),
+            allow_update: list_text(r, "allow_update"),
             dnssec: flag(r, "dnssec"),
             dnssec_algorithm: r
                 .get("dnssec_algorithm")
@@ -227,6 +239,8 @@ impl ZoneForm {
             "allow_transfer" => &self.allow_transfer,
             "notify" => &self.notify,
             "primaries" => &self.primaries,
+            "update_keys" => &self.update_keys,
+            "allow_update" => &self.allow_update,
             "dnssec_algorithm" => &self.dnssec_algorithm,
             "signature_validity_secs" => &self.signature_validity_secs,
             _ => &self.comment,
@@ -591,6 +605,16 @@ pub(crate) fn zone_row(r: &Value) -> Row {
     }
 }
 
+/// A record's row key: dynamic records (G4.1c-3) have ids of their own,
+/// so `d*N`.
+pub(crate) fn record_key(r: &Value) -> String {
+    if flag(r, "dynamic") {
+        format!("d{}", text(r, "id"))
+    } else {
+        text(r, "id")
+    }
+}
+
 pub(crate) fn record_row(r: &Value) -> Row {
     let ttl = if r.get("ttl_secs").is_some() {
         text(r, "ttl_secs")
@@ -598,7 +622,7 @@ pub(crate) fn record_row(r: &Value) -> Row {
         format!("({})", text(r, "ttl"))
     };
     Row {
-        key: text(r, "id"),
+        key: record_key(r),
         cells: vec![
             text(r, "flags"),
             text(r, "name"),
@@ -945,7 +969,7 @@ impl ZonesPanel {
         let selection = self.record_table.selection(&rows);
         let picked: Vec<&Value> = records
             .iter()
-            .filter(|r| selection.contains(&text(r, "id")))
+            .filter(|r| selection.contains(&record_key(r)))
             .collect();
         let can = app.can();
         let mut act = None;
@@ -1008,7 +1032,7 @@ impl ZonesPanel {
                 Menu::Rows(sel) => {
                     let picked: Vec<&Value> = records
                         .iter()
-                        .filter(|r| sel.contains(&text(r, "id")))
+                        .filter(|r| sel.contains(&record_key(r)))
                         .collect();
                     let owned = || sel.to_vec();
                     for (label, cmd, ok, a) in [
@@ -1055,23 +1079,28 @@ impl ZonesPanel {
         };
         match a {
             Act::Enable(keys) | Act::Disable(keys) if keys.is_empty() => {}
+            // A dynamic record (`d*N`) is not config: no enable/disable, no
+            // dialog; Remove takes it out of the dynamic state.
             Act::Enable(keys) => {
-                for id in keys {
+                for id in keys.iter().filter(|k| !k.starts_with('d')) {
                     app.run("ip.dns.zone.record.set", json!({"id": id, "disabled": false}));
                 }
             }
             Act::Disable(keys) => {
-                for id in keys {
+                for id in keys.iter().filter(|k| !k.starts_with('d')) {
                     app.run("ip.dns.zone.record.set", json!({"id": id, "disabled": true}));
                 }
             }
             Act::Remove(keys) => {
                 for id in keys {
-                    app.run("ip.dns.zone.record.remove", json!({ "id": id }));
+                    match id.strip_prefix('d') {
+                        Some(d) => app.run("ip.dns.zone.dynamic.remove", json!({ "id": d })),
+                        None => app.run("ip.dns.zone.record.remove", json!({ "id": id })),
+                    };
                 }
             }
             Act::Open(keys) => {
-                for k in keys.iter().take(MAX_OPEN) {
+                for k in keys.iter().filter(|k| !k.starts_with('d')).take(MAX_OPEN) {
                     self.open_record(app, k);
                 }
             }
@@ -1441,6 +1470,9 @@ fn zone_body(
                 f.text(ui, "Negative TTL (s)", "minimum_secs", &mut form.minimum_secs, "3600");
                 f.text(ui, "Default TTL (s)", "ttl_secs", &mut form.ttl_secs, "3600");
                 f.text(ui, "Notify", "notify", &mut form.notify, "secondaries to tell");
+                f.text(ui, "Update Keys", "update_keys", &mut form.update_keys, "TSIG keys (RFC 2136)")
+                    ;
+                f.text(ui, "Allow Update", "allow_update", &mut form.allow_update, "anywhere (prefixes)");
                 ui.label("DNSSEC").on_hover_text(
                     "Sign the zone: a KSK and a ZSK made by the router, NSEC3 without extra \
                      iterations or salt (RFC 9276). Put the DS shown below at the parent.",

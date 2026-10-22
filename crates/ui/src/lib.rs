@@ -449,7 +449,7 @@ impl CoreRouterUi {
                 then,
             }) => {
                 let message = match &result {
-                    Ok(v) => v.to_string(),
+                    Ok(v) => redact::redacted(v).to_string(),
                     Err(e) => e.clone(),
                 };
                 self.push_log(LogLine {
