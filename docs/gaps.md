@@ -23,6 +23,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa. Feito: `model::persist` (JSON `format_version` 1), trait `engine::ConfigStorage`, crate `storage-fs` (L4), `corerouter-daemon --config-dir` | 6 h | feito (`stream/G0.6-persistence`) |
 | G0.7 | MCP completo | mcp | resources (`corerouter://state`, `command/{id}`), prompts, completions, progresso/cancelamento, erro `-32003` (motor ocupado) | 10 h | aberto |
 | G0.8 | Terminal estilo RouterOS (GUI, CLI, SSH) | shell (novo), ui, cli, engine | Sintaxe RouterOS gerada do registro (menu = prefixo do id, `list`→`print`, `snake_case`→`kebab-case`), contexto, abreviação, Tab, `?`/F1, `print` com flags/`where`/`detail`/`as-json`, itens por número da última `print` ou `*id`, `/export` determinístico em ordem de dependências e `/import`/colar como `engine.batch` atômico, Ctrl+X Safe Mode; tudo por `engine.*`. Feito: crate `corerouter-shell` (L4, puro, wasm), janela New Terminal, `corerouter-cli shell` (rustyline), `system.identity.get`; metadados `alias`/`positional`/`task` no `CommandSpec` (`ping 8.8.8.8` com eventos ao vivo e Ctrl+C quando o `tool.ping.start` entrar); `docs/terminal.md`. **SSH pendente do G0.3**: `corerouter-daemon --ssh <porta>` com `russh` e os usuários do G0.3, segundo PR | 10 h | feito (`stream/G0.8-terminal`); SSH pendente do G0.3 |
+| G0.9 | Infraestrutura de desempenho: `cargo xtask bench` | xtask, benches dev-only nos crates | `cargo xtask bench` roda benchmarks `criterion` (dev-dependency, fora do build normal) e imprime um resumo; primeiros benchmarks: canal de controle (requisição em conexão persistente, TCP e TLS), `Session::execute` de comandos comuns, aplicar N regras/rotas/endereços (VirtualHal e netlink em namespace), codecs DHCP/LLDP/CRDP/SFF; `docs/perf.md` com tabela por benchmark (máquina, release, data, **medido**); o CI não reprova por benchmark (só travas folgadas já existentes); seção "Desempenho e escolha de implementação" do AGENTS.md aponta para isso | 6 h | aberto |
 
 ## Fase 1 — Core / Interfaces
 
@@ -119,40 +120,6 @@ genérico de tarefas no engine. Detalhes em `docs/tools.md`.
 | G6.5 | Ferramentas no terminal como no RouterOS | engine (`cmd/mod.rs`, `cmd/tool.rs`, `tools/text.rs`), shell | `ping 8.8.8.8`, `/ping …`, `/tool ping 8.8.8.8 count=5 size=1400`, `/tool ping address=…`, `traceroute`/`/tool traceroute`/`mtr` para o MTR; saída ao vivo `SEQ HOST SIZE TTL TIME STATUS` e resumo `sent= received= packet-loss=% min-rtt= avg-rtt= max-rtt=`; `count` infinito por padrão; Ctrl+C → `tool.task.stop`. Genérico: alias com vários nomes, menu com nome de alias roda o comando, `tool.task.poll {text: true}` devolve linhas prontas (o shell não conhece o ping). Testes no engine e no shell (daemon simulado) | 2 h | feito (`stream/G6.5-terminal-tools`) |
 | G6.4 | Traceroute, torch e bandwidth-test | engine, hal, hal-linux, ui | Sobre as tarefas do G6.1: traceroute de uma passada (ICMP/UDP), torch (tráfego por fluxo numa interface, `AF_PACKET`), bandwidth-test entre dois CoreRouters (TCP/UDP, protocolo próprio documentado) | 20 h | aberto |
 
-## Histórico de revisão
+## Histórico
 
-- 2026-10-21 — lista inicial.
-- 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).
-- 2026-10-21 — G1.1 feito (VLAN, bridge, loopback, `interface.remove`); bonding separado em G1.8.
-- 2026-10-21 — G0.6 feito (persistência: `running.json` + `.prev`, escrita atômica, quarentena).
-- 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.
-- 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.
-- 2026-10-21 — G0.4 feito (GUI cliente do daemon, nativo e web; WebSocket com Origin; `--web-root`).
-- 2026-10-21 — G5 adicionado: descoberta de vizinhos (CRDP), LLDP + MNDP passivo e gerência em malha.
-- 2026-10-21 — G1.10 (comentários inline) e G1.11 (tema claro/escuro) adicionados e feitos.
-- 2026-10-21 — G5.2 Parte 1 feita (proto-lldp, proto-mndp só decodificação, LLDP/MNDP no `hal-linux`); integração com a tabela do G5.1 pendente.
-- 2026-10-21 — G1.12 (maximizar/restaurar janelas internas) adicionado e feito.
-- 2026-10-21 — G1.5 feito (rotas estáticas IPv4/IPv6, VRF básico, janela Routes).
-- 2026-10-21 — G1.13 (VRF pela GUI) adicionado e feito.
-- 2026-10-22 — G1.14 (kernel sem VRF: `Hal::features`, `ip.vrf.add` desabilitado com o motivo, CI carrega o módulo `vrf`) adicionado e feito; nota de `CONFIG_NET_VRF=y` em G1.6.
-- 2026-10-22 — G1.4 feito (Safe Mode: comandos `config.safe-mode.*`, dono por conexão, timeout, sem salvar até confirmar).
-- 2026-10-22 — G5.1 feito (CRDP, tabela de vizinhos, tela de conexão); G5.2 Parte 2 pode usar `Session::record_neighbor`.
-- 2026-10-22 — G1.15 (teclado nos diálogos e janelas internas) adicionado e feito.
-- 2026-10-22 — G1.16 (ações indisponíveis cinza com o motivo: comando ausente num daemon antigo, desabilitado pelo engine ou link fora) adicionado e feito.
-- 2026-10-22 — G5.2 feito (Parte 2: LLDP/MNDP ligados à tabela de vizinhos no daemon).
-- 2026-10-22 — G5.4 (CRDP do lab virtual pelo loopback, `ether1` ligada por padrão no lab) adicionado e feito.
-- 2026-10-22 — G1.17 (cores dos comentários: azul no ativo, cinza no desativado, inline e coluna) adicionado e feito.
-- 2026-10-22 — G5.5 (despedida da descoberta no encerramento do daemon por SIGINT/SIGTERM) adicionado e feito.
-- 2026-10-22 — G1.18 (descoberta via netlink e posse dos links no `hal-linux`) adicionado e feito; G1.7 feito junto; nota nova em G1.3.
-- 2026-10-22 — G0.8 feito (terminal RouterOS na GUI e na CLI, export/import); SSH pendente do G0.3.
-- 2026-10-22 — G0.3 feito (autenticação, usuários/grupos e TLS no canal de controle e no WebSocket).
-- 2026-10-22 — G6 adicionado (ferramentas de diagnóstico); G6.1 (tarefas) e G6.2 (ping, vários destinos, MTU) feitos; G6.3 (MTR) e G6.4 abertos.
-- 2026-10-22 — G2.1 dividido em G2.1a/b/c; G2.1a (firewall base) feito.
-- 2026-10-22 — G6.3 (MTR) feito.
-- 2026-10-22 — G6.5 (ferramentas no terminal como no RouterOS) adicionado e feito.
-- 2026-10-22 — G0.3b (primeiro acesso sem senha, estilo RouterOS 7) adicionado e feito.
-- 2026-10-22 — G0.3c (tela de conexão: `admin` por padrão, token→senha em loopback, roteador antigo) adicionado e feito.
-- 2026-10-22 — G1.19 (abas do diálogo de interface, só leitura) adicionado e feito; G1.20 (Ethernet configurável, SFP/DOM, teste de cabo) adicionado.
-- 2026-10-22 — G4.7 (cliente DHCP: a DHCPv4, b DHCPv6+PD+RA, c resiliência) adicionado; G4.7a em andamento.
-- 2026-10-22 — G4.7a feito (cliente DHCPv4 estilo RouterOS com opções recebidas, rotas 121 com VRF, servidores permitidos e histórico).
-- 2026-10-22 — G2.1b (firewall: lockout, sombras, defaults, modelos, zonas, descrição) feito.
+Em `docs/gaps-history.md` (só de acrescentar, `merge=union`).
