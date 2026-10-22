@@ -16,7 +16,7 @@
 //! offset is logged so the operator knows.
 
 use std::collections::BTreeSet;
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -71,7 +71,8 @@ fn run(session: &Shared, port: u16) {
             cfg = Some(now_cfg.clone());
         }
         if now_cfg.enabled && Instant::now() >= next {
-            let round = poll_round(&now_cfg.servers, port, &mut denied);
+            let resolve = |host: &str| super::dns::resolve(session, host);
+            let round = poll_round(&now_cfg.servers, port, &mut denied, &resolve);
             poll_exp = next_poll(poll_exp, &now_cfg, &round);
             let wait = 1u64 << poll_exp.min(17);
             status = round.status(&status, wait);
@@ -140,15 +141,24 @@ fn next_poll(exp: u8, cfg: &NtpClient, round: &Round) -> u8 {
     }
 }
 
+/// How a server name becomes addresses: the router's resolver (G4.1a),
+/// never the host's.
+pub type Resolve<'a> = &'a dyn Fn(&str) -> Result<Vec<IpAddr>, String>;
+
 /// Asks every server not denied; keeps the smallest round trip.
-pub fn poll_round(servers: &[String], port: u16, denied: &mut BTreeSet<String>) -> Round {
+pub fn poll_round(
+    servers: &[String],
+    port: u16,
+    denied: &mut BTreeSet<String>,
+    resolve: Resolve<'_>,
+) -> Round {
     let mut round = Round::default();
     for server in servers {
         if denied.contains(server) {
             continue;
         }
-        let addr = match (server.as_str(), port).to_socket_addrs() {
-            Ok(mut a) => a.next(),
+        let addr = match resolve(server) {
+            Ok(a) => a.first().map(|ip| SocketAddr::new(*ip, port)),
             Err(e) => {
                 round.errors.push(format!("{server}: {e}"));
                 continue;
@@ -320,21 +330,38 @@ mod tests {
         assert!(matches!(err, QueryError::Timeout), "{err}");
     }
 
+    fn literal(host: &str) -> Result<Vec<IpAddr>, String> {
+        host.parse().map(|ip| vec![ip]).map_err(|_| "not an IP".into())
+    }
+
+    #[test]
+    fn names_go_through_the_router_resolver() {
+        let port = server(0, None);
+        let via = |h: &str| match h {
+            "time.example" => Ok(vec![IpAddr::from([127, 0, 0, 1])]),
+            _ => Err("name 'nope.example' does not exist".to_owned()),
+        };
+        let servers = ["time.example".into(), "nope.example".into()];
+        let r = poll_round(&servers, port, &mut BTreeSet::new(), &via);
+        assert_eq!(r.best.unwrap().0, "time.example");
+        assert!(r.errors[0].starts_with("nope.example: name"), "{:?}", r.errors);
+    }
+
     #[test]
     fn deny_drops_the_server_and_rate_slows_down() {
         let deny = server(0, Some(b"DENY"));
         let mut denied = BTreeSet::new();
-        let r = poll_round(&["127.0.0.1".into()], deny, &mut denied);
+        let r = poll_round(&["127.0.0.1".into()], deny, &mut denied, &literal);
         assert!(r.best.is_none());
         assert!(denied.contains("127.0.0.1"));
         assert!(
-            poll_round(&["127.0.0.1".into()], deny, &mut denied)
+            poll_round(&["127.0.0.1".into()], deny, &mut denied, &literal)
                 .errors
                 .is_empty()
         );
 
         let rate = server(0, Some(b"RATE"));
-        let r = poll_round(&["127.0.0.1".into()], rate, &mut BTreeSet::new());
+        let r = poll_round(&["127.0.0.1".into()], rate, &mut BTreeSet::new(), &literal);
         let cfg = NtpClient::default();
         assert_eq!(next_poll(cfg.min_poll, &cfg, &r), cfg.max_poll);
     }

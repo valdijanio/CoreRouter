@@ -229,7 +229,7 @@ fn ping_start(s: &mut Session, p: &Value) -> Result<Value> {
         Some(_) => return Err(EngineError::bad("ttl", "must be 1..=255")),
     };
     let options = options(s, p, &targets)?;
-    let prober = s.hal().prober().map_err(EngineError::Hal)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
     let job = ping::PingJob {
         targets: targets.clone(),
         count,
@@ -266,7 +266,7 @@ fn ping_mtu(s: &mut Session, p: &Value) -> Result<Value> {
     let retries = ranged(p, "retries", 1, 5, 2)?;
     let targets = [target.clone()];
     let options = options(s, p, &targets)?;
-    let prober = s.hal().prober().map_err(EngineError::Hal)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
     let job = mtu::MtuJob {
         target,
         max: narrow("max_size", max)?,
@@ -294,7 +294,7 @@ fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
     let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 56)?;
     let targets = [target.clone()];
     let options = options(s, p, &targets)?;
-    let prober = s.hal().prober().map_err(EngineError::Hal)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
     let job = mtr::MtrJob {
         target,
         count,

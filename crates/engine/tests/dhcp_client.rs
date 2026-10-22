@@ -242,6 +242,11 @@ fn a_lab_client_gets_a_lease_and_the_data_plane_runs_it() {
         l.s.dhcp_peer_dns(),
         vec!["100.64.1.1".parse::<std::net::Ipv4Addr>().unwrap()]
     );
+    // G4.1a: the router's resolver sees them as RouterOS `dynamic-servers`.
+    assert_eq!(
+        l.ok("ip.dns.get", json!({}))["dynamic_servers"],
+        json!(["100.64.1.1"])
+    );
     let opts = l.ok("ip.dhcp-client.options", json!({"id": id}));
     let opts = opts["options"].as_array().unwrap();
     assert!(opts.iter().any(|o| o["code"] == 121
