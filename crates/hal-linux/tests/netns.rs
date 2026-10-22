@@ -360,16 +360,15 @@ fn existing_links_are_adopted_only_if_they_match() {
 }
 
 #[test]
-fn static_routes_vrf_and_link_state() {
+fn static_routes_and_link_state() {
     if !in_netns() {
         return;
     }
     port("e1eth1");
     port("e1eth2");
-    port("e1eth3");
     let mut hal = LinuxHal::new();
     let mut base = Config::default();
-    for p in ["e1eth1", "e1eth2", "e1eth3"] {
+    for p in ["e1eth1", "e1eth2"] {
         eth(&mut base, p);
     }
     addr(&mut base, "e1eth1", "10.61.0.2/24");
@@ -382,52 +381,34 @@ fn static_routes_vrf_and_link_state() {
     route(&mut to, "0.0.0.0/0", "10.61.0.254").distance = 10; // backup
     route(&mut to, "198.51.100.0/24", "e1eth2");
     route(&mut to, "2001:db8:99::/48", "fe80::1%e1eth2");
-    // A VRF with its own copy of 10.61.0.0/24 and its own default route.
-    add(&mut to, "e1blue", InterfaceKind::Vrf { table: 1061 });
-    to.interfaces.get_mut(&n("e1eth3")).unwrap().vrf = Some(n("e1blue"));
-    addr(&mut to, "e1eth3", "10.61.0.2/24");
-    let r = route(&mut to, "0.0.0.0/0", "10.61.0.9");
-    r.routing_table = RoutingTable::Vrf(n("e1blue"));
     hal.apply(&base, &to).unwrap();
 
-    let want = [
-        "default via 10.61.0.254 dev e1eth1 metric 10",
-        "default via 10.61.0.9 dev e1eth3 table 1061 metric 1",
-    ];
     let got = routes("e1");
-    for w in want.map(str::to_owned) {
-        assert!(got.contains(&w), "missing '{w}' in {got:#?}");
+    for want in [
+        "default via 10.61.0.1 dev e1eth1",
+        "default via 10.61.0.254 dev e1eth1 metric 10",
+        "198.51.100.0/24 dev e1eth2",
+        "default via 2001:db8:61::1 dev e1eth1",
+        "2001:db8:99::/48 via fe80::1 dev e1eth2",
+    ] {
+        assert!(
+            got.iter().any(|l| l.starts_with(want)),
+            "missing '{want}' in {got:#?}"
+        );
     }
     assert!(
         got.iter()
-            .any(|l| l.starts_with("default via 10.61.0.1 dev e1eth1"))
+            .any(|l| l.starts_with("198.51.100.0/24") && l.contains("scope link"))
     );
-    assert!(
-        got.iter()
-            .any(|l| l.starts_with("198.51.100.0/24 dev e1eth2") && l.contains("scope link"))
-    );
-    assert!(
-        got.iter()
-            .any(|l| l.starts_with("default via 2001:db8:61::1 dev e1eth1"))
-    );
-    assert!(
-        got.iter()
-            .any(|l| l.starts_with("2001:db8:99::/48 via fe80::1 dev e1eth2"))
-    );
-    assert_eq!(got.len(), 6, "{got:#?}");
-    let vrf = ip(&["-d", "-o", "link", "show", "e1blue"]);
-    assert!(vrf.contains("vrf table 1061"), "{vrf}");
-    assert!(ip(&["-o", "link", "show", "e1eth3"]).contains("master e1blue"));
-    // The VRF's connected route lives in its table, not in main.
-    assert!(ip(&["route", "show", "table", "1061"]).contains("10.61.0.0/24 dev e1eth3"));
+    assert_eq!(got.len(), 5, "{got:#?}");
 
     // Applying again (or a daemon restart over the live kernel) changes nothing.
     hal.apply(&to, &to).unwrap();
     hal.apply(&Config::default(), &to).unwrap();
     assert_eq!(routes("e1"), got);
 
-    // The kernel flushes routes of a link that goes down; disabling and
-    // enabling e1eth1 must end with every route back.
+    // The kernel flushes routes (and IPv6 addresses) of a link that goes
+    // down; disabling and enabling e1eth1 must end with every route back.
     let mut down = to.clone();
     down.interfaces.get_mut(&n("e1eth1")).unwrap().disabled = true;
     hal.apply(&to, &down).unwrap();
@@ -435,11 +416,79 @@ fn static_routes_vrf_and_link_state() {
     hal.apply(&down, &to).unwrap();
     assert_eq!(routes("e1"), got);
 
-    // And back to no routes at all, VRF gone, e1eth3 released.
     hal.apply(&to, &base).unwrap();
     assert!(routes("e1").is_empty(), "{:#?}", routes("e1"));
-    assert!(!exists("e1blue"));
-    assert!(!ip(&["-o", "link", "show", "e1eth3"]).contains("master"));
+}
+
+/// Whether this kernel can create a `vrf` link (the module may be missing,
+/// and a user namespace cannot load it): VRF tests skip, loudly, if not.
+fn has_vrf() -> bool {
+    let ok = Command::new("ip")
+        .args(["link", "add", "vrfprobe", "type", "vrf", "table", "4242"])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    if ok {
+        ip(&["link", "del", "vrfprobe"]);
+    } else {
+        eprintln!("skipped: this kernel has no vrf support (CONFIG_NET_VRF / module vrf)");
+    }
+    ok
+}
+
+#[test]
+fn vrf_routes_live_in_their_own_table() {
+    if !in_netns() || !has_vrf() {
+        return;
+    }
+    port("g1eth1");
+    port("g1eth2");
+    let mut hal = LinuxHal::new();
+    let mut base = Config::default();
+    eth(&mut base, "g1eth1");
+    eth(&mut base, "g1eth2");
+    addr(&mut base, "g1eth1", "10.64.0.2/24");
+    hal.apply(&Config::default(), &base).unwrap();
+
+    // A VRF with its own copy of 10.64.0.0/24 and its own default route,
+    // next to main's.
+    let mut to = base.clone();
+    route(&mut to, "0.0.0.0/0", "10.64.0.1");
+    add(&mut to, "g1blue", InterfaceKind::Vrf { table: 1064 });
+    to.interfaces.get_mut(&n("g1eth2")).unwrap().vrf = Some(n("g1blue"));
+    addr(&mut to, "g1eth2", "10.64.0.2/24");
+    addr(&mut to, "g1eth2", "2001:db8:64::2/64");
+    let r = route(&mut to, "0.0.0.0/0", "10.64.0.9");
+    r.routing_table = RoutingTable::Vrf(n("g1blue"));
+    hal.apply(&base, &to).unwrap();
+
+    let got = routes("g1");
+    assert!(
+        got.iter()
+            .any(|l| l.starts_with("default via 10.64.0.1 dev g1eth1")),
+        "{got:#?}"
+    );
+    assert!(
+        got.contains(&"default via 10.64.0.9 dev g1eth2 table 1064 metric 1".to_owned()),
+        "{got:#?}"
+    );
+    let vrf = ip(&["-d", "-o", "link", "show", "g1blue"]);
+    assert!(vrf.contains("vrf table 1064"), "{vrf}");
+    assert!(ip(&["-o", "link", "show", "g1eth2"]).contains("master g1blue"));
+    // Connected routes and the IPv6 address follow the member into the VRF.
+    assert!(ip(&["route", "show", "table", "1064"]).contains("10.64.0.0/24 dev g1eth2"));
+    assert!(ip(&["-o", "addr", "show", "dev", "g1eth2"]).contains("2001:db8:64::2/64"));
+
+    hal.apply(&to, &to).unwrap();
+    hal.apply(&Config::default(), &to).unwrap();
+    assert_eq!(routes("g1"), got);
+
+    // Back: routes gone, VRF deleted, g1eth2 released.
+    hal.apply(&to, &base).unwrap();
+    assert!(routes("g1").is_empty(), "{:#?}", routes("g1"));
+    assert!(!exists("g1blue"));
+    assert!(!ip(&["-o", "link", "show", "g1eth2"]).contains("master"));
 }
 
 #[test]

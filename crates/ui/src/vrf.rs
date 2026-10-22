@@ -11,7 +11,7 @@ use std::collections::BTreeSet;
 use egui::{Grid, ScrollArea, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
-use crate::interfaces::{Iface, cascade, field, opt_text};
+use crate::interfaces::{Iface, cascade, dialog_id, field, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, value_text};
 
@@ -326,25 +326,34 @@ impl CoreRouterUi {
         let mut dialogs = std::mem::take(&mut self.vrf_dialogs);
         dialogs.retain_mut(|d| {
             // A VRF window whose VRF is gone closes itself.
+            let id = dialog_id(d.id);
             if let VrfDialog::Props { base, .. } = &d.dialog
                 && !vrfs.iter().any(|v| v.name == base.name)
             {
+                self.floats.forget(id);
                 return false;
             }
             let mut open = true;
             let mut pressed = None;
-            egui::Window::new(dialog_title(&d.dialog))
-                .id(egui::Id::unique(("corerouter-vrf-dialog", d.id)))
-                .open(&mut open)
-                .constrain_to(area)
-                .default_pos(cascade(area, d.id))
-                .resizable(false)
-                .collapsible(false)
-                .show(ctx, |ui| {
+            let title = dialog_title(&d.dialog);
+            let pos = cascade(area, d.id);
+            self.floats.show(
+                ctx,
+                area,
+                id,
+                &title,
+                &mut open,
+                |w| w.default_pos(pos).resizable(false).collapsible(false),
+                |ui| {
                     let busy = d.waiting > 0;
                     pressed = dialog_body(ui, d, &vrfs, &ifaces, busy);
-                });
-            open && pressed.is_none_or(|b| self.vrf_button(d, b, &vrfs))
+                },
+            );
+            let keep = open && pressed.is_none_or(|b| self.vrf_button(d, b, &vrfs));
+            if !keep {
+                self.floats.forget(id);
+            }
+            keep
         });
         dialogs.append(&mut self.vrf_dialogs);
         self.vrf_dialogs = dialogs;
@@ -452,6 +461,7 @@ impl CoreRouterUi {
         };
         if close {
             self.vrf_dialogs.remove(pos);
+            self.floats.forget(dialog_id(id));
         }
         if let Some(name) = created {
             // Opens when an `ip.vrf.list` that has it arrives.

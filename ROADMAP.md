@@ -111,8 +111,9 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   (`keep_addr_on_down=0`, achado no teste de netns) — o plano remove e recoloca isso
   explicitamente para o desfazer funcionar. UI: janela IP › Routes no padrão G1.9 (seleção,
   +/−/✓/✗/Comment, menu de contexto, duplo clique "Route <dst>", "New Route" com Apply que
-  vira a janela da rota; gateway "10.0.0.1 reachable ether1"). 29 testes novos (13 de
-  comandos, 7 de modelo, 5 de plano, 2 em netns sem root, 2 headless de UI).
+  vira a janela da rota; gateway "10.0.0.1 reachable ether1"). 30 testes novos (13 de
+  comandos, 7 de modelo, 5 de plano, 3 em netns sem root — o de VRF pula com aviso se o kernel
+  não tem `vrf`, como o runner do GitHub —, 2 headless de UI).
   Teste manual (**medido**): daemon `--config-dir` + GUI `--connect`; rota padrão criada pelo
   "New Route" (revisão 3), backup distance 10 e `::/0` pela CLI; daemon e GUI reiniciados →
   revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
@@ -143,6 +144,21 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   wasm. Integração com a tabela de vizinhos do G5.1 (`ip.neighbor.list` com protocol=lldp/mndp)
   fica para um segundo PR, depois do G5.1. Detalhes em `docs/lldp-mndp.md`.
 
+- 2026-10-21 — G1.12: maximizar e restaurar as janelas internas, estilo WinBox. Todas as janelas
+  flutuantes (as do menu e os diálogos de interface) passam por um wrapper único,
+  `crates/ui/src/float.rs` (`Floats::show`): a barra de título continua a do egui (▼, arrastar, ✕) e
+  ganha, na mesma camada da janela, o botão □/❐ ao lado do ✕ (desenhado; a fonte não tem os
+  glifos) e uma faixa só de clique sobre o título — o arraste ainda chega ao egui, o duplo clique
+  maximiza em vez de recolher, o botão direito abre Maximize/Restore. Maximizada = `fixed_rect` da
+  área central a cada frame (acompanha o redimensionamento) e o corpo ocupa a área toda (o egui
+  dimensiona a janela pelo conteúdo). Restaurar usa `fixed_rect` sem `constrain` por um frame (com
+  `current_pos` o arraste da barra do egui desfaz a posição; com `constrain` o tamanho maximizado do
+  frame anterior empurra a janela para o canto) e corrige o tamanho pedido por até 3 frames, porque
+  o conteúdo pode ficar uns px abaixo do pedido (Interfaces: 5 px, **medido**). Recolhida, guarda o
+  tamanho expandido. Estado só da UI, não passa pelo engine. 6 testes headless (maximizar ocupa a
+  área, restaurar devolve o retângulo, duplo clique, menu, redimensionar a área, arrastar/recolher,
+  janela de propriedades); conferido na GUI real (xdotool + `screenshot`).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -152,5 +168,6 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G0.4.
 - 2026-10-21 — log do G1.10 + G1.11.
 - 2026-10-21 — log do G5.2 (Parte 1).
+- 2026-10-21 — log do G1.12.
 - 2026-10-21 — log do G1.5.
 - 2026-10-21 — log do G1.13.
