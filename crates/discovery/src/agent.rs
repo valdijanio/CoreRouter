@@ -83,6 +83,10 @@ pub struct AgentConfig {
     pub node_id: NodeId,
     pub control_port: Option<u16>,
     pub ws_port: Option<u16>,
+    /// TLS control and WebSocket ports (G0.3), announced so GUIs on other
+    /// machines can connect.
+    pub tls_port: Option<u16>,
+    pub wss_port: Option<u16>,
     /// Hardware/board text, e.g. "x86_64 (virtual lab)".
     pub board: String,
     pub transport: Transport,
@@ -445,6 +449,8 @@ fn announce(
         ipv6: v6,
         control_port: cfg.control_port,
         ws_port: cfg.ws_port,
+        tls_port: cfg.tls_port,
+        wss_port: cfg.wss_port,
     };
     let packet = match a.encode() {
         Ok(p) => p,
@@ -612,9 +618,14 @@ pub fn to_entry(a: Announcement, interface: IfName, src: IpAddr, now: u64) -> Ne
     if !addresses.contains(&src) {
         addresses.push(src);
     }
-    let mgmt = (a.control_port.is_some() || a.ws_port.is_some()).then_some(MgmtPorts {
+    let any = [a.control_port, a.ws_port, a.tls_port, a.wss_port]
+        .iter()
+        .any(Option::is_some);
+    let mgmt = any.then_some(MgmtPorts {
         control: a.control_port,
         ws: a.ws_port,
+        tls: a.tls_port,
+        wss: a.wss_port,
     });
     NeighborEntry {
         interface,
@@ -708,6 +719,8 @@ mod tests {
             ipv6: Vec::new(),
             control_port: Some(7979),
             ws_port: None,
+            tls_port: None,
+            wss_port: None,
         };
         let e = to_entry(a, "ether1".parse().unwrap(), "fe80::2".parse().unwrap(), 9);
         assert_eq!(

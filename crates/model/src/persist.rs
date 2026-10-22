@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::store::{ConfigStore, Revision};
+use crate::users::Users;
 
 /// Version written by this build. Bump it when the layout changes and teach
 /// [`decode`] to migrate the older ones.
@@ -38,6 +39,10 @@ struct FileOut<'a> {
     revision: u32,
     running: &'a Config,
     history: Vec<RevisionOut<'a>>,
+    /// Router accounts (G0.3): hashes only, outside the revisions so a
+    /// rollback never restores an old password.
+    #[serde(skip_serializing_if = "Users::is_empty")]
+    users: &'a Users,
 }
 
 #[derive(Serialize)]
@@ -61,6 +66,8 @@ struct FileIn {
     revision: u32,
     running: Config,
     history: Vec<RevisionIn>,
+    #[serde(default)]
+    users: Users,
 }
 
 #[derive(Deserialize)]
@@ -75,6 +82,11 @@ struct RevisionIn {
 /// Serialize running + history (the candidate is never persisted: an
 /// uncommitted edit does not survive a reboot, as on Junos/VyOS).
 pub fn encode(store: &ConfigStore) -> Result<String, PersistError> {
+    encode_with_users(store, &Users::default())
+}
+
+/// [`encode`] plus the router accounts.
+pub fn encode_with_users(store: &ConfigStore, users: &Users) -> Result<String, PersistError> {
     let file = FileOut {
         format_version: FORMAT_VERSION,
         revision: store.current_revision(),
@@ -89,6 +101,7 @@ pub fn encode(store: &ConfigStore) -> Result<String, PersistError> {
                 config: &r.config,
             })
             .collect(),
+        users,
     };
     let mut out =
         serde_json::to_string_pretty(&file).map_err(|e| PersistError::Malformed(e.to_string()))?;
@@ -96,8 +109,14 @@ pub fn encode(store: &ConfigStore) -> Result<String, PersistError> {
     Ok(out)
 }
 
-/// Parse and verify a file written by [`encode`].
+/// Parse and verify a file written by [`encode`] (accounts are dropped).
 pub fn decode(text: &str) -> Result<ConfigStore, PersistError> {
+    decode_with_users(text).map(|(store, _)| store)
+}
+
+/// Parse and verify a file written by [`encode_with_users`]. A file
+/// without `users` (older builds) gives an empty list.
+pub fn decode_with_users(text: &str) -> Result<(ConfigStore, Users), PersistError> {
     if text.len() > MAX_FILE_BYTES {
         return Err(PersistError::TooLarge(text.len()));
     }
@@ -148,7 +167,8 @@ pub fn decode(text: &str) -> Result<ConfigStore, PersistError> {
             "running differs from the newest revision".into(),
         ));
     }
-    Ok(ConfigStore::restore(file.running, history))
+    file.users.check().map_err(PersistError::Inconsistent)?;
+    Ok((ConfigStore::restore(file.running, history), file.users))
 }
 
 fn malformed(e: serde_json::Error) -> PersistError {
@@ -195,6 +215,30 @@ mod tests {
         assert_eq!(back.history()[1].config.system.identity, "edge-1");
         // Byte-stable: re-encoding the decoded store gives the same file.
         assert_eq!(encode(&back).unwrap(), text);
+    }
+
+    #[test]
+    fn users_round_trip_and_are_checked() {
+        use crate::users::{Group, User};
+        let st = sample();
+        assert!(!encode(&st).unwrap().contains("users"), "no users: no key");
+        let mut users = Users::default();
+        users.put(User {
+            name: "admin".into(),
+            group: Group::Full,
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            disabled: false,
+            comment: String::new(),
+        });
+        let text = encode_with_users(&st, &users).unwrap();
+        let (back, u) = decode_with_users(&text).unwrap();
+        assert_eq!((back.current_revision(), u), (2, users));
+        let mut v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        v["users"]["admin"]["password_hash"] = "plain".into();
+        assert!(matches!(
+            decode_with_users(&v.to_string()),
+            Err(PersistError::Inconsistent(_))
+        ));
     }
 
     #[test]

@@ -280,6 +280,11 @@ fn flag(row: &Value, k: &str) -> bool {
     row.get(k).and_then(Value::as_bool).unwrap_or(false)
 }
 
+/// A section header row (`section` holds its title).
+fn is_section(row: &Value) -> bool {
+    row.get("section").is_some_and(|v| v.is_string())
+}
+
 /// Key of a row: the rule/entry id, or the list name.
 fn key_of(f: Feed, row: &Value) -> String {
     text(row, f.key())
@@ -823,7 +828,7 @@ fn arrow(ui: &mut Ui, salt: &str, up: bool, enabled: Result<(), String>) -> bool
 }
 
 fn rule_row(r: &Value, visuals: &egui::Visuals) -> Row {
-    let section = flag(r, "section");
+    let section = is_section(r);
     let flags = text(r, "flags");
     let action = text(r, "action");
     let tint = if flags.contains('I') {
@@ -1596,7 +1601,7 @@ impl CoreRouterUi {
             }
             t => {
                 let Some(t) = t.table() else { return };
-                if flag(&row, "section") {
+                if is_section(&row) {
                     let title = text(&row, "comment");
                     Edit::Section {
                         table: t,

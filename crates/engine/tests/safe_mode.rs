@@ -3,18 +3,18 @@
 //! `exit` confirms them; a restart in the middle boots the entry config.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
-use corerouter_engine::{Caller, EngineError, MemoryStorage, Session};
+use corerouter_engine::{Caller, EngineError, MemoryStorage, Principal, Session};
 use corerouter_hal::VirtualHal;
 use serde_json::{Value, json};
 
 const T0: u64 = 1_792_591_389;
 
 fn gui() -> Caller {
-    Caller::new(7, "tcp 127.0.0.1:50412")
+    Caller::new(7, "tcp 127.0.0.1:50412").with_principal(Principal::Local)
 }
 
 fn cli() -> Caller {
-    Caller::new(8, "tcp 127.0.0.1:50999")
+    Caller::new(8, "tcp 127.0.0.1:50999").with_principal(Principal::Local)
 }
 
 fn boot(storage: &MemoryStorage) -> Session {

@@ -155,7 +155,7 @@ fn move_and_place_before_follow_routeros() {
     );
     assert_eq!(ids(&mut s, "filter"), ["*4", "*1", "*2", "*3"]);
     let row = &ok(&mut s, "ip.firewall.filter.list", Value::Null)[0];
-    assert_eq!(row["section"], true);
+    assert_eq!(row["section"], "Router protection");
     assert_eq!(row["comment"], "Router protection");
     assert_eq!(row["chain"], Value::Null);
     let (param, _) = bad(

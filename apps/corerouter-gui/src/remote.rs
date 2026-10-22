@@ -6,12 +6,20 @@
 //! no connection fails at once (it is never queued for "later", which could
 //! apply a change the operator already saw fail). Lost connections are
 //! retried every `RETRY`.
+//!
+//! G0.3: the worker connects through a [`Dialer`] — plain with the local
+//! token on loopback, TLS pinned to the certificate the operator accepted
+//! elsewhere — and logs in again by itself when the session token expires.
+//! A refused login stops the retries (they would only feed the router's
+//! brute-force limit) and is shown as the link's reason.
 
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corerouter_control::Client;
+use corerouter_control::dial::RefuseNew;
+use corerouter_control::{Client, KnownHosts, Login, Target, UNAUTHORIZED, dial};
 use corerouter_ui::{Backend, Link, Reply, RequestId};
 use serde_json::Value;
 
@@ -19,6 +27,93 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const RETRY: Duration = Duration::from_secs(2);
 /// Longest the worker sleeps while connected and idle.
 const IDLE: Duration = Duration::from_secs(60);
+
+/// How to reach one router again and again: its address, the login, and
+/// (TLS) the one certificate fingerprint accepted for it.
+#[derive(Clone)]
+pub struct Dialer {
+    pub target: Target,
+    login: Login,
+    fingerprint: Option<String>,
+    /// The worker's current session token, shared with the `--control`
+    /// proxy so it acts as the same logged-in user.
+    token: Arc<Mutex<Option<String>>>,
+}
+
+impl Dialer {
+    pub fn new(target: Target, login: Login, fingerprint: Option<String>) -> Self {
+        Self {
+            target,
+            login,
+            fingerprint,
+            token: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    fn known(&self) -> KnownHosts {
+        let mut k = KnownHosts::in_memory();
+        if let Some(fp) = &self.fingerprint {
+            let _ = k.remember(&self.target.addr(), fp);
+        }
+        k
+    }
+
+    /// Connect and log in (the worker).
+    pub fn dial(&self) -> Result<Client, String> {
+        let c = dial(
+            &self.target,
+            CONNECT_TIMEOUT,
+            &self.login,
+            &mut self.known(),
+            &mut RefuseNew,
+        )?;
+        self.keep_token(&c);
+        Ok(c)
+    }
+
+    /// Connect with the worker's session (the `--control` proxy), or the
+    /// local token when there is no login.
+    pub fn dial_shared(&self) -> Result<Client, String> {
+        let token = self
+            .token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let login = match token {
+            Some(t) => Login::Token(t),
+            // No session yet: log in on our own.
+            None => return self.dial(),
+        };
+        dial(
+            &self.target,
+            CONNECT_TIMEOUT,
+            &login,
+            &mut self.known(),
+            &mut RefuseNew,
+        )
+    }
+
+    fn keep_token(&self, c: &Client) {
+        if matches!(self.login, Login::Password { .. }) {
+            *self.token.lock().unwrap_or_else(PoisonError::into_inner) =
+                c.token().map(str::to_owned);
+        }
+    }
+
+    /// Log in again on `c` (the session token expired).
+    fn relogin(&self, c: &mut Client) -> Result<(), String> {
+        let Login::Password { user, password } = &self.login else {
+            return Err("no password to log in again with".into());
+        };
+        c.login(user, password)?;
+        self.keep_token(c);
+        Ok(())
+    }
+
+    fn can_relogin(&self) -> bool {
+        matches!(self.login, Login::Password { .. })
+    }
+}
 
 struct Request {
     id: RequestId,
@@ -42,22 +137,26 @@ pub struct Remote {
 }
 
 impl Remote {
-    /// Start the worker; connecting happens in the background.
-    pub fn spawn(target: &str) -> std::io::Result<Self> {
+    /// Start the worker on a connection already made (and logged in) by
+    /// the connect screen, or connecting in the background when `None`.
+    pub fn spawn(dialer: Dialer, first: Option<Client>) -> std::io::Result<Self> {
         let (req_tx, req_rx) = mpsc::channel();
         let (ev_tx, ev_rx) = mpsc::channel();
-        let addr = target.to_owned();
+        let target = dialer.target.to_string();
+        if let Some(c) = &first {
+            dialer.keep_token(c);
+        }
         thread::Builder::new()
             .name("gui-remote".into())
-            .spawn(move || worker(&addr, &req_rx, &ev_tx))?;
+            .spawn(move || worker(&dialer, first, &req_rx, &ev_tx))?;
         Ok(Self {
             requests: req_tx,
             events: ev_rx,
             next: 0,
             link: Link::Connecting {
-                target: target.to_owned(),
+                target: target.clone(),
             },
-            target: target.to_owned(),
+            target,
             orphans: Vec::new(),
         })
     }
@@ -102,29 +201,55 @@ impl Backend for Remote {
     }
 }
 
+/// A login the router refused: retrying cannot help.
+fn refused(e: &str) -> bool {
+    e.contains(corerouter_control::auth::INVALID_LOGIN)
+        || e.contains("too many failed logins")
+        || e.contains("CHANGED")
+        || e.contains("not trusted")
+}
+
 /// Runs until the UI drops its `Remote`.
-fn worker(addr: &str, requests: &Receiver<Request>, events: &Sender<Event>) {
-    let target = addr.to_owned();
-    let mut client: Option<Client> = None;
+fn worker(
+    dialer: &Dialer,
+    first: Option<Client>,
+    requests: &Receiver<Request>,
+    events: &Sender<Event>,
+) {
+    let target = dialer.target.to_string();
+    let connected = first.is_some();
+    let mut client: Option<Client> = first;
     let mut reason = String::new();
+    // Set when the router refused the login: no more retries.
+    let mut fatal: Option<String> = None;
     let mut retry_at = Instant::now();
     let link = |l: Link| events.send(Event::Link(l)).is_ok();
+    if connected
+        && !link(Link::Connected {
+            target: target.clone(),
+        })
+    {
+        return;
+    }
     loop {
-        if client.is_none() && Instant::now() >= retry_at {
+        if client.is_none() && fatal.is_none() && Instant::now() >= retry_at {
             if !link(Link::Connecting {
                 target: target.clone(),
             }) {
                 return;
             }
-            let next = match Client::connect(addr, CONNECT_TIMEOUT) {
+            let next = match dialer.dial() {
                 Ok(c) => {
                     client = Some(c);
-                    log::info!("connected to {addr}");
+                    log::info!("connected to {target}");
                     Link::Connected {
                         target: target.clone(),
                     }
                 }
                 Err(e) => {
+                    if refused(&e) {
+                        fatal = Some(e.clone());
+                    }
                     reason = e;
                     retry_at = Instant::now() + RETRY;
                     Link::Disconnected {
@@ -137,9 +262,9 @@ fn worker(addr: &str, requests: &Receiver<Request>, events: &Sender<Event>) {
                 return;
             }
         }
-        let wait = match client {
-            Some(_) => IDLE,
-            None => retry_at.saturating_duration_since(Instant::now()),
+        let wait = match (&client, &fatal) {
+            (Some(_), _) | (None, Some(_)) => IDLE,
+            (None, None) => retry_at.saturating_duration_since(Instant::now()),
         };
         let req = match requests.recv_timeout(wait) {
             Ok(r) => r,
@@ -147,11 +272,33 @@ fn worker(addr: &str, requests: &Receiver<Request>, events: &Sender<Event>) {
             Err(RecvTimeoutError::Disconnected) => return,
         };
         let result = match client.as_mut() {
-            None => Err(format!("not connected to {addr}: {reason}")),
-            Some(c) => match c.request(&req.method, req.params) {
+            None => Err(format!("not connected to {target}: {reason}")),
+            Some(c) => match c.request(&req.method, req.params.clone()) {
+                // The session token expired: log in again, once, and retry.
+                Ok(Err(e)) if e.starts_with(UNAUTHORIZED) && dialer.can_relogin() => {
+                    match dialer.relogin(c) {
+                        Ok(()) => c
+                            .request(&req.method, req.params)
+                            .unwrap_or_else(|e| Err(format!("connection to {target} lost: {e}"))),
+                        Err(again) => {
+                            if refused(&again) {
+                                fatal = Some(again.clone());
+                                client = None;
+                                reason = again.clone();
+                                if !link(Link::Disconnected {
+                                    target: target.clone(),
+                                    reason: again.clone(),
+                                }) {
+                                    return;
+                                }
+                            }
+                            Err(again)
+                        }
+                    }
+                }
                 Ok(answer) => answer,
                 Err(e) => {
-                    log::warn!("connection to {addr} lost: {e}");
+                    log::warn!("connection to {target} lost: {e}");
                     client = None;
                     reason = e.clone();
                     // Reconnect on the next turn, without waiting.
@@ -162,7 +309,7 @@ fn worker(addr: &str, requests: &Receiver<Request>, events: &Sender<Event>) {
                     }) {
                         return;
                     }
-                    Err(format!("connection to {addr} lost: {e}"))
+                    Err(format!("connection to {target} lost: {e}"))
                 }
             },
         };
@@ -175,7 +322,7 @@ fn worker(addr: &str, requests: &Receiver<Request>, events: &Sender<Event>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corerouter_control::{SharedHost, bind_loopback, spawn};
+    use corerouter_control::{Endpoint, Gate, Limits, SharedHost, bind_loopback, spawn};
     use corerouter_engine::{Session, shared};
     use serde_json::json;
     use std::io::{BufRead, BufReader, Write};
@@ -192,13 +339,39 @@ mod tests {
         out
     }
 
-    #[test]
-    fn talks_to_a_real_control_server() {
+    /// A router with user `op` (write); session tokens idle out after `idle`.
+    fn router(idle: Duration) -> String {
+        let mut s = Session::virtual_lab();
+        s.execute(
+            "user.add",
+            &json!({"name": "op", "group": "write", "password": "op-password"}),
+        )
+        .unwrap();
         let listener = bind_loopback(0).unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        spawn(listener, SharedHost(shared(Session::virtual_lab()))).unwrap();
+        let gate = Gate::new(Limits {
+            idle,
+            ..Limits::default()
+        });
+        spawn(Endpoint::loopback(listener), SharedHost(shared(s)), gate).unwrap();
+        addr
+    }
 
-        let mut b = Remote::spawn(&addr).unwrap();
+    fn dialer(addr: &str, password: &str) -> Dialer {
+        Dialer::new(
+            Target::parse(addr).unwrap(),
+            Login::Password {
+                user: "op".into(),
+                password: password.into(),
+            },
+            None,
+        )
+    }
+
+    #[test]
+    fn talks_to_a_real_control_server() {
+        let addr = router(Duration::from_secs(600));
+        let mut b = Remote::spawn(dialer(&addr, "op-password"), None).unwrap();
         let set = b.submit(
             "engine.execute",
             json!({"command": "system.identity.set", "params": {"name": "remote"}}),
@@ -214,6 +387,39 @@ mod tests {
     }
 
     #[test]
+    fn logs_in_again_when_the_token_expires_and_stops_on_a_bad_password() {
+        let addr = router(Duration::from_millis(100));
+        let d = dialer(&addr, "op-password");
+        let mut b = Remote::spawn(d.clone(), None).unwrap();
+        let first = b.submit("auth.whoami", Value::Null);
+        assert_eq!(wait(&mut b, 1)[0].0, first);
+        thread::sleep(Duration::from_millis(250));
+        let later = b.submit("auth.whoami", Value::Null);
+        let r = wait(&mut b, 1);
+        assert_eq!(r[0].0, later);
+        assert_eq!(r[0].1.as_ref().unwrap()["user"], "op");
+        // The proxy reuses the same session.
+        let mut proxy = d.dial_shared().unwrap();
+        assert_eq!(
+            proxy.call("auth.whoami", Value::Null).unwrap()["user"],
+            "op"
+        );
+
+        let mut bad = Remote::spawn(dialer(&addr, "wrong-password"), None).unwrap();
+        let id = bad.submit("ping", Value::Null);
+        let r = wait(&mut bad, 1);
+        assert_eq!(r[0].0, id);
+        thread::sleep(Duration::from_millis(100));
+        bad.poll();
+        match bad.link() {
+            Link::Disconnected { reason, .. } => {
+                assert!(reason.contains("invalid user or password"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn no_router_fails_fast_and_says_why() {
         // Bind and drop: a loopback port with nobody listening.
         let addr = TcpListener::bind("127.0.0.1:0")
@@ -221,7 +427,7 @@ mod tests {
             .local_addr()
             .unwrap()
             .to_string();
-        let mut b = Remote::spawn(&addr).unwrap();
+        let mut b = Remote::spawn(dialer(&addr, "x"), None).unwrap();
         let id = b.submit("ping", Value::Null);
         let replies = wait(&mut b, 1);
         assert_eq!(replies.len(), 1);
@@ -250,7 +456,8 @@ mod tests {
                 writeln!(s, "{}", json!({"id": req["id"], "ok": true, "result": 1})).unwrap();
             }
         });
-        let mut b = Remote::spawn(&addr).unwrap();
+        let d = Dialer::new(Target::parse(&addr).unwrap(), Login::Nothing, None);
+        let mut b = Remote::spawn(d, None).unwrap();
         let first = b.submit("ping", Value::Null);
         let lost = b.submit("ping", Value::Null);
         let again = b.submit("ping", Value::Null);

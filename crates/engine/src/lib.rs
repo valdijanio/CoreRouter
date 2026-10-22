@@ -4,6 +4,7 @@
 //! `src/cmd/*.rs`. The UI, the CLI, the control channel and the MCP server all
 //! go through one door: [`Session::execute`].
 
+pub mod auth;
 pub mod cmd;
 pub mod error;
 pub mod firewall_dyn;
@@ -14,6 +15,7 @@ pub mod session;
 pub mod storage;
 pub mod validate;
 
+pub use auth::{Group, Login, Principal};
 pub use error::EngineError;
 pub use neighbors::{MAX_NEIGHBORS, NeighborTable};
 pub use safe_mode::Caller;

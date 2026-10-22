@@ -23,12 +23,17 @@ pub enum HalError {
     Io(String),
 }
 
-/// A physical (or virtual) port discovered on the platform.
+/// A port the platform lets CoreRouter manage (used to seed the default
+/// config). Links CoreRouter must not touch are never `LinkInfo`s; they
+/// show up only in [`Hal::poll`], with [`LinkState::unmanaged`] set.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LinkInfo {
     pub name: IfName,
     pub mac: Option<String>,
     pub mtu: u16,
+    /// Administratively up: the seed sets `disabled = !up`, so the first
+    /// apply changes nothing in the kernel.
+    pub up: bool,
 }
 
 /// Live operational state of a link.
@@ -40,6 +45,16 @@ pub struct LinkState {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    /// What the platform says the link is: `ether` (a physical port),
+    /// `veth`, `bridge`, `vlan`, `loopback`, `dummy`, `ppp`, `tun`, …
+    pub kind: String,
+    /// `u32` like the kernel (`lo` has 65536).
+    pub mtu: u32,
+    pub mac: Option<String>,
+    /// `Some(why)`: a link CoreRouter did not create and must not manage
+    /// (another program's bridge, a container's veth, the host `lo`…).
+    /// It is listed, never applied to, and commands refuse to change it.
+    pub unmanaged: Option<String>,
 }
 
 /// Why `ip.vrf.add` is disabled, and what a failed `vrf` link create means.
@@ -81,6 +96,13 @@ pub trait Hal: Send {
 
     /// Sample live link state/counters.
     fn poll(&mut self) -> Vec<LinkState>;
+
+    /// Links present on the platform that CoreRouter must not change, with
+    /// the reason (see [`LinkState::unmanaged`]). Commands check it before
+    /// touching a name; the default (virtual lab) has none.
+    fn unmanaged(&mut self) -> Vec<(IfName, String)> {
+        Vec::new()
+    }
 
     /// Wall clock in seconds since the Unix epoch, if the platform has one.
     fn now_unix(&self) -> Option<u64>;

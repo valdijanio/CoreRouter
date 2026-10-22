@@ -146,7 +146,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         filter_move
     ),
     cmd!(query "ip.firewall.filter.list", "Filter Rules", ["IP", "Firewall"], None,
-        "{chain?: string} → [{id, position, chain, family, action, flags (X disabled, I invalid), disabled, invalid, reason, section, comment, summary, <matchers and action parameters set on the rule>}]",
+        "{chain?: string} → [{id, position, chain, family, action, flags (X disabled, I invalid), disabled, invalid, reason, section (title of a section header, else null), comment, summary, <matchers and action parameters set on the rule>}]",
         always, filter_list),
     cmd!(
         "ip.firewall.nat.add",
@@ -315,6 +315,19 @@ fn text_param(p: &Value, key: &str) -> Result<Option<Option<String>>> {
             Ok(Some(Some(s.trim().to_owned())))
         }
         Some(Value::Number(n)) => Ok(Some(Some(n.to_string()))),
+        // Lists (ports, states) may come as a JSON array: ["22", "80"].
+        Some(Value::Array(items)) if items.len() <= 64 => {
+            let parts: Option<Vec<String>> = items
+                .iter()
+                .map(|v| match v {
+                    Value::String(s) => Some(s.trim().to_owned()),
+                    Value::Number(n) => Some(n.to_string()),
+                    _ => None,
+                })
+                .collect();
+            let parts = parts.ok_or_else(|| EngineError::bad(key, "must be a string"))?;
+            Ok(Some((!parts.is_empty()).then(|| parts.join(","))))
+        }
         Some(_) => Err(EngineError::bad(key, "must be a string")),
     }
 }
@@ -688,7 +701,14 @@ pub fn row(cfg: &Config, table: Table, position: usize, r: &FirewallRule) -> Val
             json!(r.chain)
         },
     );
-    obj.insert("family".into(), json!(r.family.name()));
+    obj.insert(
+        "family".into(),
+        if r.section {
+            Value::Null
+        } else {
+            json!(r.family.name())
+        },
+    );
     obj.insert(
         "action".into(),
         if r.section {
@@ -704,7 +724,15 @@ pub fn row(cfg: &Config, table: Table, position: usize, r: &FirewallRule) -> Val
         "reason".into(),
         json!(issue.map(|(f, m)| format!("{f}: {m}"))),
     );
-    obj.insert("section".into(), json!(r.section));
+    // The title for a section header (what `add` takes back), else null.
+    obj.insert(
+        "section".into(),
+        if r.section {
+            json!(r.comment)
+        } else {
+            Value::Null
+        },
+    );
     obj.insert("comment".into(), json!(r.comment));
     obj.insert("summary".into(), json!(summary(r)));
     Value::Object(obj)

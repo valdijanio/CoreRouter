@@ -578,3 +578,116 @@ fn a_conflicting_kernel_route_rolls_the_apply_back() {
     ip(&["route", "del", "192.0.2.0/24", "dev", "f1eth1"]);
     hal.apply(&with, &base).unwrap();
 }
+
+/// G1.18: discovery and counters come from netlink in *this* namespace
+/// (sysfs here shows the host's links), and links CoreRouter did not make
+/// are listed as unmanaged and never applied to.
+#[test]
+fn discovery_ownership_and_counters_via_netlink() {
+    if !in_netns() {
+        return;
+    }
+    ip(&[
+        "link", "add", "g1p0", "type", "veth", "peer", "name", "g1p1",
+    ]);
+    ip(&["link", "set", "g1p0", "up"]);
+    ip(&["link", "add", "g1dock", "type", "bridge"]);
+    ip(&["link", "set", "g1dock", "mtu", "1400"]);
+    ip(&["link", "add", "g1dum", "type", "dummy"]);
+    let mut hal = LinuxHal::new();
+    let ours = |hal: &mut LinuxHal| -> Vec<(String, bool)> {
+        hal.discover_links()
+            .unwrap()
+            .into_iter()
+            .filter(|l| l.name.as_str().starts_with("g1"))
+            .map(|l| (l.name.to_string(), l.up))
+            .collect()
+    };
+    assert_eq!(
+        ours(&mut hal),
+        [("g1p0".to_owned(), true), ("g1p1".to_owned(), false)]
+    );
+    let polled = hal.poll();
+    let state = |name: &str| polled.iter().find(|l| l.name.as_str() == name).unwrap();
+    assert_eq!(state("g1p0").kind, "veth");
+    assert_eq!(state("g1p0").unmanaged, None);
+    assert_eq!(state("lo").kind, "loopback");
+    assert!(state("lo").unmanaged.is_some());
+    assert_eq!(state("g1dock").kind, "bridge");
+    assert_eq!(state("g1dock").mtu, 1400);
+    assert!(
+        state("g1dock")
+            .unmanaged
+            .as_deref()
+            .is_some_and(|w| w.contains("bridge created outside")),
+        "{:?}",
+        state("g1dock")
+    );
+    assert_eq!(state("g1dum").kind, "dummy");
+    assert!(state("g1dum").unmanaged.is_some());
+    // Nothing of the host leaks in: sysfs, unless remounted, still lists
+    // the host's links, and none of those that are not here may show up.
+    let here = ip(&["-o", "link", "show"]);
+    let host_only: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .map(|d| {
+            d.filter_map(Result::ok)
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| !here.contains(&format!(": {n}")))
+                .collect()
+        })
+        .unwrap_or_default();
+    for l in &polled {
+        assert!(
+            !host_only.iter().any(|h| h == l.name.as_str()),
+            "{} is a host link",
+            l.name
+        );
+    }
+
+    // Counters are stats64 of this namespace: traffic over the veth shows.
+    ip(&["link", "set", "g1p1", "up"]);
+    ip(&["addr", "add", "10.181.0.1/24", "dev", "g1p0"]);
+    let start = std::time::Instant::now();
+    loop {
+        let st = hal.poll();
+        let p0 = st.iter().find(|l| l.name.as_str() == "g1p0").unwrap();
+        if p0.tx_packets > 0 && p0.tx_bytes > 0 && p0.running {
+            break;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "no traffic counted on g1p0: {p0:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Seed as the engine does (admin state from the kernel): boot apply is
+    // a no-op; a stale config that took the foreign bridge as a port, and
+    // asks for MTU 1500 on it, never reaches it.
+    let mut cfg = Config::default();
+    for p in ["g1p0", "g1p1", "g1dock"] {
+        eth(&mut cfg, p);
+    }
+    hal.apply(&Config::default(), &cfg).unwrap();
+    let dock = ip(&["-o", "link", "show", "g1dock"]);
+    assert!(dock.contains("mtu 1400"), "{dock}");
+    assert!(!dock.contains(",UP"), "{dock}");
+    let mut to = cfg.clone();
+    addr(&mut to, "g1dock", "10.182.0.1/24");
+    addr(&mut to, "g1p1", "10.181.0.2/24");
+    hal.apply(&cfg, &to).unwrap();
+    assert!(!ip(&["-br", "addr", "show", "dev", "g1dock"]).contains("10.182"));
+    assert!(ip(&["-br", "addr", "show", "dev", "g1p1"]).contains("10.181.0.2/24"));
+    let polled = hal.poll();
+    let dock = polled.iter().find(|l| l.name.as_str() == "g1dock").unwrap();
+    assert!(
+        dock.unmanaged
+            .as_deref()
+            .is_some_and(|w| w.contains("as ether but the kernel as bridge")),
+        "{dock:?}"
+    );
+
+    for l in ["g1p0", "g1dock", "g1dum"] {
+        ip(&["link", "del", l]);
+    }
+}

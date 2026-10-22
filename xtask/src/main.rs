@@ -15,6 +15,7 @@ const WASM_PACKAGES: &[&str] = &[
     "corerouter-proto-lldp",
     "corerouter-proto-mndp",
     "corerouter-engine",
+    "corerouter-shell",
     "corerouter-ui",
     "corerouter-gui",
 ];
@@ -193,6 +194,8 @@ const NETNS_TESTS: &[(&str, &str)] = &[
     ("corerouter-daemon", "netns"),
     // G5.2: two linux-backend daemons list each other as LLDP; MNDP is read.
     ("corerouter-daemon", "netns_l2"),
+    // G1.18: a linux-backend daemon sees its namespace, owns only its links.
+    ("corerouter-daemon", "netns_linux"),
     // G5.4: a router on this machine heard on a new link is local.
     ("corerouter-discovery", "netns_local"),
 ];

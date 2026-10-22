@@ -336,6 +336,63 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com 0 e loga `shutting down: sent CRDP goodbye on 1 interface(s)`; `Agent::shutdown` com lab e
   `Listener`; `Shutdown` fecha as duas portas. Esforço do agente ~1,5 h (**estimado**).
 
+- 2026-10-22 — G1.18: o backend linux descobre links pelo mesmo rtnetlink que aplica (antes lia
+  sysfs, que num `unshare --net` mostra o host: o daemon listava `docker0`/`br-*` e falhava em
+  `eth0`). Tipos do kernel (`veth`, `bridge`, `loopback`, …) e política de posse: portas físicas,
+  veth com par no namespace e o que o CoreRouter criou são gerenciados; o resto aparece em
+  `interface.list` com `managed: false` e o motivo, nunca recebe apply e recusa comandos.
+  `--manage`/`--unmanaged` no daemon. Seed copia o admin state (boot no-op). G1.7 feito junto.
+  Esforço do agente ~2 h (**estimado**).
+- 2026-10-22 — G0.3: autenticação, usuários/grupos e TLS. **Engine**: `model::users` (contas
+  salvas no `running.json`, fora das revisões: `config.rollback` não restaura senha), comandos
+  `user.add/set/remove/list/active.list`, `auth::required_group` (consulta `read`, ação `write`,
+  `user.*` `full`) checado em `execute`/`inspect` com o grupo atual do `Principal` do `Caller`,
+  `engine.list` por chamador (botões cinza do G1.16), Argon2id com sal do SO, journal com
+  `***`, sem lock-out do último `full`, recusa em Safe Mode. **Controle**: `auth::Gate` (token de
+  256 bits guardado como SHA-256, comparação em tempo constante, 30 min ocioso/12 h, falhas por
+  IP e por usuário: 3 livres, 250 ms dobrando até 8 s, bloqueio com 20 em 15 min, resposta única
+  `invalid user or password` com verificação falsa para usuário inexistente), token local em
+  arquivo 0600 (CLI/MCP do mesmo usuário do sistema sem senha; outro usuário da máquina precisa
+  logar), `Endpoint` loopback ou TLS (`rustls`+`ring`, certificado `rcgen` em `--config-dir`,
+  chave 0600, impressão digital no log), `known_hosts` + `dial` (TOFU: primeira vez pergunta,
+  igual passa, mudou recusa antes de enviar nada). **Daemon**: `admin` com senha aleatória
+  impressa uma vez, `--reset-admin-password`, `--listen`, `--ws-listen` (wss, origem
+  `https://`+`Host`), `--token-file`. **CLI/MCP**: `--user` (prompt sem eco ou
+  `$COREROUTER_PASSWORD`), `--fingerprint`. **GUI**: Login/Password de verdade, diálogo de
+  certificado novo, "Remember password" só com keyring do SO (`keyring`, zbus puro; na web
+  nunca), `user: X (grupo)` na barra, re-login automático quando o token expira, proxy
+  `--control` com a sessão da janela; vizinhos CRDP com porta TLS (TLV 14/15) conectáveis.
+  Testes novos: engine (grupos, máscara, rollback × contas, lock-out, logins), controle (login
+  certo/errado, força bruta, expiração, token local, proptest dos params de login, TLS ponta a
+  ponta com TOFU nas três situações, texto puro na porta TLS), daemon (processo real: admin
+  impresso uma vez, TLS + login, certificado igual após reinício, token local recusado no TLS,
+  reset), CLI/MCP pelo token local, GUI (re-login, senha errada para de tentar, tela de
+  conexão). Teste manual (**medido**): namespace sem root com `dummy` 10.77.0.1, daemon
+  `--listen 10.77.0.1:8729`, GUI por esse IP: diálogo com a mesma impressão do log, admin
+  `(full)` com `+` ativo, usuário `noc` `(read)` com `+` e Safe Mode cinza; nenhuma senha nos
+  logs. Esforço do agente ~6 h (**estimado**).
+
+- 2026-10-22 — G0.8: terminal com a sintaxe da CLI do RouterOS, **gerado do registro** (crate novo
+  `corerouter-shell`, L4, puro e wasm). Menu = prefixo do id, `list`/`get`→`print`, chaves em
+  kebab-case, tipos lidos do doc `params` (bool `yes/no`, número, lista `a,b`, enum para o Tab);
+  nenhuma tabela por comando (teste percorre `cmd::all()`). Contexto (`/ip address`, `..`, `/`,
+  `/ip/address`), abreviação com "did you mean", `?`/F1, Tab (menus, comandos, parâmetros, valores
+  de enum, interfaces, ids), `print` com legenda de flags, `;;;`, `where` (and/or, `!`, `=`, `!=`,
+  `~`, `<`, `>`), `detail`, `as-json`, `count-only`, `proplist`, itens por número da última
+  `print` (vários → batch atômico) ou `*id`. `/export` determinístico em ordem de dependências,
+  segredos nunca em claro; `/import file=` e colar = um `engine.batch` atômico (ida e volta
+  testada). Ctrl+X Safe Mode, `<SAFE>` no prompt, `/quit` mantém e Ctrl+D desfaz (conferido na doc
+  da MikroTik). Front ends: janela "New Terminal" na GUI (várias, histórico, Tab clicável, cópia,
+  tema, maximizar) e `corerouter-cli shell` (`rustyline`, histórico persistente sem segredos,
+  modo não interativo por pipe). Engine ganhou `system.identity.get`. Tudo por `engine.*` e
+  `state.inspect`: permissões, Safe Mode e journal valem igual. SSH (`--ssh`, `russh`) fica para um
+  segundo PR, depois do G0.3. Testes: 16 unitários + 14 de integração no shell (2 proptest), 3
+  headless na UI; manual: daemon de lab + CLI `--connect` + GUI `--connect` com screenshot.
+  Depois do primeiro retorno do usuário (`ping 8.8.8.8` → "bad command name"): metadados
+  `alias`/`positional`/`task` no `CommandSpec` (construtores `const`), atalhos em qualquer menu,
+  valor posicional, tarefas acompanhadas ao vivo por `tool.task.poll` com Ctrl+C →
+  `tool.task.stop` (testado com roteador simulado; o ping real liga-se sozinho), e menos
+  requisições: ação = 3 (era ~12), `print` = 1. Esforço do agente ~8 h no total (**estimado**).
 - 2026-10-22 — G2.1a: firewall base no modelo do RouterOS (`docs/firewall.md`). Modelo em
   `model::firewall` (tabelas, chains nativas e próprias, matchers em sintaxe RouterOS com `!`,
   ações, seções, IPv4+IPv6 numa lista com `family`) e `model::interface_list` (LAN/WAN padrão).
@@ -373,4 +430,7 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G5.4.
 - 2026-10-22 — log do G1.17.
 - 2026-10-22 — log do G5.5.
+- 2026-10-22 — log do G1.18.
+- 2026-10-22 — log do G0.8.
+- 2026-10-22 — log do G0.3.
 - 2026-10-22 — log do G2.1a.

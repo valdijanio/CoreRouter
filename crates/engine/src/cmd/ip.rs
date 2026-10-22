@@ -43,6 +43,7 @@ fn has_addresses(s: &Session) -> std::result::Result<(), String> {
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let address: IpNet = req_parse(p, "address")?;
     let interface: IfName = req_parse(p, "interface")?;
+    super::interface::refuse_unmanaged(s, p, &["interface"])?;
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
 
