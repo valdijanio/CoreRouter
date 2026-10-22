@@ -3,7 +3,8 @@
 use egui::{Grid, RichText, TextEdit};
 use serde_json::{Value, json};
 
-use crate::{CoreRouterUi, err_color, form_number, human_bytes, value_text};
+use crate::table::{self, Icon, Menu, Row, Shortcut, col};
+use crate::{CoreRouterUi, err_color, value_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Win {
@@ -118,190 +119,6 @@ impl CoreRouterUi {
         }
     }
 
-    fn interfaces(&mut self, ui: &mut egui::Ui) {
-        let mut toggle: Option<(String, bool)> = None;
-        let mut remove: Option<String> = None;
-        egui::ScrollArea::vertical()
-            .id_salt("interfaces-table")
-            .auto_shrink([false, false])
-            .max_height((ui.available_height() - 110.0).max(80.0))
-            .show(ui, |ui| {
-                Grid::new("interfaces").striped(true).show(ui, |ui| {
-                    for h in [
-                        "", "Name", "Type", "MTU", "Rx", "Tx", "Rx pkt", "Tx pkt", "Info",
-                        "Comment", "", "",
-                    ] {
-                        ui.strong(h);
-                    }
-                    ui.end_row();
-                    for row in &self.cache.interfaces {
-                        let get = |k: &str| row.get(k).map(value_text).unwrap_or_default();
-                        let num = |k: &str| row.get(k).and_then(Value::as_u64).unwrap_or(0);
-                        let disabled = row
-                            .get("disabled")
-                            .and_then(Value::as_bool)
-                            .unwrap_or(false);
-                        let running = row.get("running").and_then(Value::as_bool).unwrap_or(false);
-                        // RouterOS flags: X = disabled, R = running.
-                        ui.monospace(if disabled {
-                            "X"
-                        } else if running {
-                            "R"
-                        } else {
-                            " "
-                        });
-                        ui.label(get("name"));
-                        ui.label(get("type"));
-                        ui.label(get("mtu"));
-                        ui.label(human_bytes(num("rx_bytes")));
-                        ui.label(human_bytes(num("tx_bytes")));
-                        ui.label(num("rx_packets").to_string());
-                        ui.label(num("tx_packets").to_string());
-                        ui.label(interface_info(row));
-                        ui.label(get("comment"));
-                        let btn = if disabled { "Enable" } else { "Disable" };
-                        if ui.small_button(btn).clicked() {
-                            toggle = Some((get("name"), !disabled));
-                        }
-                        // Like WinBox: offered on every row; the engine
-                        // explains why a physical or in-use port cannot go.
-                        if ui.small_button("−").on_hover_text("Remove").clicked() {
-                            remove = Some(get("name"));
-                        }
-                        ui.end_row();
-                    }
-                });
-            });
-        if let Some((name, disabled)) = toggle {
-            self.run("interface.set", json!({"name": name, "disabled": disabled}));
-        }
-        if let Some(name) = remove {
-            self.run("interface.remove", json!({ "name": name }));
-        }
-        ui.separator();
-        self.interface_forms(ui);
-    }
-
-    fn interface_forms(&mut self, ui: &mut egui::Ui) {
-        let names = self.interface_names(None);
-        let bridges = self.interface_names(Some("bridge"));
-        let (mut vlan, mut bridge, mut lo, mut port_add, mut port_remove) =
-            (false, false, false, false, false);
-        Grid::new("interface-forms").num_columns(2).show(ui, |ui| {
-            ui.strong("VLAN");
-            ui.horizontal(|ui| {
-                ui.add(
-                    TextEdit::singleline(&mut self.forms.vlan_name)
-                        .hint_text("vlan100")
-                        .desired_width(90.0),
-                );
-                combo(
-                    ui,
-                    "vlan-parent",
-                    "parent",
-                    &mut self.forms.vlan_parent,
-                    &names,
-                );
-                ui.add(
-                    TextEdit::singleline(&mut self.forms.vlan_id)
-                        .hint_text("VLAN id")
-                        .desired_width(70.0),
-                );
-                ui.add(
-                    TextEdit::singleline(&mut self.forms.vlan_mtu)
-                        .hint_text("MTU")
-                        .desired_width(50.0),
-                );
-                vlan = ui.button("Add VLAN").clicked();
-            });
-            ui.end_row();
-            ui.strong("Bridge");
-            ui.horizontal(|ui| {
-                ui.add(
-                    TextEdit::singleline(&mut self.forms.bridge_name)
-                        .hint_text("bridge1")
-                        .desired_width(90.0),
-                );
-                bridge = ui.button("Add Bridge").clicked();
-                ui.separator();
-                ui.add(
-                    TextEdit::singleline(&mut self.forms.loopback_name)
-                        .hint_text("lo0")
-                        .desired_width(90.0),
-                );
-                lo = ui.button("Add Loopback").clicked();
-            });
-            ui.end_row();
-            ui.strong("Port");
-            ui.horizontal(|ui| {
-                combo(
-                    ui,
-                    "port-bridge",
-                    "bridge",
-                    &mut self.forms.port_bridge,
-                    &bridges,
-                );
-                combo(
-                    ui,
-                    "port-iface",
-                    "interface",
-                    &mut self.forms.port_interface,
-                    &names,
-                );
-                port_add = ui.button("Add Port").clicked();
-                port_remove = ui.button("Remove Port").clicked();
-            });
-            ui.end_row();
-        });
-        if vlan {
-            self.add_vlan();
-        }
-        if bridge {
-            self.add_bridge();
-        }
-        if lo {
-            let p = json!({"name": self.forms.loopback_name.trim()});
-            if self.run("interface.loopback.add", p).is_some() {
-                self.forms.loopback_name.clear();
-            }
-        }
-        if port_add {
-            self.add_port();
-        }
-        if port_remove {
-            let p =
-                json!({"bridge": self.forms.port_bridge, "interface": self.forms.port_interface});
-            self.run("interface.bridge.port.remove", p);
-        }
-    }
-
-    pub(crate) fn add_vlan(&mut self) {
-        let f = &self.forms;
-        let p = json!({
-            "name": f.vlan_name.trim(),
-            "parent": f.vlan_parent,
-            "vlan_id": form_number(&f.vlan_id),
-            "mtu": form_number(&f.vlan_mtu),
-        });
-        if self.run("interface.vlan.add", p).is_some() {
-            self.forms.vlan_name.clear();
-            self.forms.vlan_id.clear();
-            self.forms.vlan_mtu.clear();
-        }
-    }
-
-    pub(crate) fn add_bridge(&mut self) {
-        let p = json!({"name": self.forms.bridge_name.trim()});
-        if self.run("interface.bridge.add", p).is_some() {
-            self.forms.bridge_name.clear();
-        }
-    }
-
-    pub(crate) fn add_port(&mut self) {
-        let p = json!({"bridge": self.forms.port_bridge, "interface": self.forms.port_interface});
-        self.run("interface.bridge.port.add", p);
-    }
-
     /// Names from the cached `interface.list`, optionally of one type.
     fn interface_names(&self, kind: Option<&str>) -> Vec<String> {
         self.cache
@@ -313,27 +130,69 @@ impl CoreRouterUi {
     }
 
     fn addresses(&mut self, ui: &mut egui::Ui) {
-        let mut remove: Option<String> = None;
-        Grid::new("addresses").striped(true).show(ui, |ui| {
-            for h in ["#", "Address", "Network", "Interface", "Comment", ""] {
-                ui.strong(h);
-            }
-            ui.end_row();
-            for row in &self.cache.addresses {
-                let get = |k: &str| row.get(k).map(value_text).unwrap_or_default();
-                ui.monospace(get("id"));
-                ui.label(get("address"));
-                ui.label(get("network"));
-                ui.label(get("interface"));
-                ui.label(get("comment"));
-                if ui.small_button("−").on_hover_text("Remove").clicked() {
-                    remove = Some(get("id"));
+        const COLUMNS: [table::Column; 5] = [
+            col("#"),
+            col("Address"),
+            col("Network"),
+            col("Interface"),
+            col("Comment"),
+        ];
+        let rows: Vec<Row> = self
+            .cache
+            .addresses
+            .iter()
+            .map(|r| {
+                let get = |k: &str| r.get(k).map(value_text).unwrap_or_default();
+                Row {
+                    key: get("id"),
+                    cells: ["id", "address", "network", "interface", "comment"]
+                        .map(get)
+                        .to_vec(),
+                    dimmed: r.get("disabled").and_then(Value::as_bool).unwrap_or(false),
                 }
-                ui.end_row();
+            })
+            .collect();
+        let selection = self.tables.addresses.selection(&rows);
+        let mut remove: Option<Vec<String>> = None;
+        let mut select_all = false;
+        ui.horizontal(|ui| {
+            let can = if selection.is_empty() {
+                Err("Select one or more addresses first".to_owned())
+            } else {
+                Ok(())
+            };
+            if table::tool(ui, "addresses", Icon::Remove, "Remove", can).clicked() {
+                remove = Some(selection.clone());
             }
+            table::find_field(ui, "addresses", &mut self.tables.addresses);
         });
-        if let Some(id) = remove {
-            self.run("ip.address.remove", json!({"id": id}));
+        ui.separator();
+        let out = table::show(
+            ui,
+            "addresses",
+            ui.spacing().interact_size.y * 2.0,
+            &mut self.tables.addresses,
+            &COLUMNS,
+            &rows,
+            |ui, menu| match menu {
+                Menu::Rows(sel) => {
+                    if ui.button("Remove").clicked() {
+                        remove = Some(sel.to_vec());
+                    }
+                }
+                Menu::Empty => {
+                    select_all = ui.button("Select All").clicked();
+                }
+            },
+        );
+        if out.shortcut == Some(Shortcut::Remove) {
+            remove = Some(self.tables.addresses.selection(&rows));
+        }
+        if select_all {
+            self.tables.addresses.select_all(&rows);
+        }
+        for id in remove.unwrap_or_default() {
+            self.run("ip.address.remove", json!({ "id": id }));
         }
 
         ui.separator();
@@ -510,21 +369,14 @@ impl CoreRouterUi {
     }
 }
 
-/// "vlan 100 on ether1", "port of bridge1" — from `interface.list` fields.
-fn interface_info(row: &Value) -> String {
-    let field = |k: &str| row.get(k).filter(|v| !v.is_null()).map(value_text);
-    let mut parts = Vec::new();
-    if let (Some(id), Some(parent)) = (field("vlan_id"), field("parent")) {
-        parts.push(format!("vlan {id} on {parent}"));
-    }
-    if let Some(b) = field("bridge") {
-        parts.push(format!("port of {b}"));
-    }
-    parts.join(", ")
-}
-
 /// Combo box over `options`; `hint` shows while nothing is picked.
-fn combo(ui: &mut egui::Ui, id: &str, hint: &str, value: &mut String, options: &[String]) {
+pub(crate) fn combo(
+    ui: &mut egui::Ui,
+    id: &str,
+    hint: &str,
+    value: &mut String,
+    options: &[String],
+) {
     egui::ComboBox::from_id_salt(id)
         .selected_text(if value.is_empty() {
             hint

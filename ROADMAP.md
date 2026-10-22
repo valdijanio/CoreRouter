@@ -48,8 +48,21 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `cargo xtask ci`; `skip` onde `unshare` sem root é proibido). Na CI do GitHub o workflow
   libera user namespaces (`sysctl kernel.apparmor_restrict_unprivileged_userns=0`).
 
+- 2026-10-21 — G1.9: tabelas estilo WinBox em `crates/ui/src/table.rs`, reutilizáveis: seleção
+  da linha inteira (clique, Ctrl, Shift, espaço vazio limpa, Ctrl+A, ↑/↓), filtro Find (Ctrl+F),
+  atalhos do WinBox v3/v4 conferidos em help.mikrotik.com (Delete, Ctrl+E/D/M; Enter abre),
+  menus de contexto na linha e no espaço vazio. Janela Interfaces (`interfaces.rs`): barra
+  +/−/✓/✗/comentário com ícones desenhados (a fonte do egui não tem ✓/✗) e motivo no tooltip
+  quando desabilitado; "Add VLAN on <if>", "Add to Bridge ▸"; duplo clique abre a janela
+  flutuante "Interface <nome>" (MTU, comment, disabled; pai/VLAN id; portas da bridge; OK/Cancel/
+  Apply/Disable/Remove); diálogos New VLAN/Bridge/Loopback (Apply vira a janela da interface
+  criada) substituem os formulários fixos do rodapé. Addresses usa a mesma tabela. Só `crates/ui`;
+  nenhum comando novo. 4 testes headless dirigidos por eventos sintéticos + 3 de seleção;
+  conferido na GUI real (xdotool + `screenshot`).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
 - 2026-10-21 — log do G0.6.
 - 2026-10-21 — log do G1.2.
+- 2026-10-21 — log do G1.9.
