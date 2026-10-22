@@ -277,3 +277,124 @@ fn a_failed_apply_puts_the_slaves_back() {
     let l = link("b2p1");
     assert!(!l.contains("master") && l.contains(",UP"), "{l}");
 }
+
+fn ifindex(name: &str) -> String {
+    link(name).split(':').next().unwrap().trim().to_string()
+}
+
+/// G1.8d: miimon, min-links, hash and primary change on the live bond — same
+/// ifindex, slaves stay — and a failed apply puts the old values back.
+#[test]
+fn live_settings_change_without_recreating_the_bond() {
+    if !in_netns() {
+        return;
+    }
+    let mut hal = LinuxHal::new();
+    let base = ports(&mut hal, &["b3p1", "b3p2"]);
+    let tune = |mode, primary: Option<&str>, hash, mii, min| InterfaceKind::Bonding {
+        mode,
+        primary: primary.map(n),
+        transmit_hash_policy: hash,
+        lacp_rate: LacpRate::Slow,
+        mii_interval_ms: mii,
+        min_links: min,
+    };
+    let mut from = base.clone();
+    from.interfaces.insert(
+        n("b3bond"),
+        Interface::new(
+            n("b3bond"),
+            tune(BondMode::BalanceXor, None, HashPolicy::Layer2, 100, 0),
+        ),
+    );
+    enslave(&mut from, "b3bond", &["b3p1", "b3p2"]);
+    let id = from.ip.next_address_id();
+    from.ip.addresses.push(AddressEntry {
+        id,
+        address: "10.63.0.1/24".parse().unwrap(),
+        interface: n("b3bond"),
+        disabled: false,
+        comment: String::new(),
+        from_pool: None,
+    });
+    hal.apply(&base, &from).unwrap();
+    let index = ifindex("b3bond");
+
+    let mut to = from.clone();
+    to.interfaces.get_mut(&n("b3bond")).unwrap().kind =
+        tune(BondMode::BalanceXor, None, HashPolicy::Layer34, 250, 2);
+    hal.apply(&from, &to).unwrap();
+    let b = link("b3bond");
+    assert!(b.contains("miimon 250"), "{b}");
+    assert!(b.contains("min_links 2"), "{b}");
+    assert!(b.contains("xmit_hash_policy layer3+4"), "{b}");
+    assert_eq!(ifindex("b3bond"), index, "the bond was recreated");
+    for p in ["b3p1", "b3p2"] {
+        assert!(link(p).contains("master b3bond"), "{p} left the bond");
+    }
+    assert!(ip(&["-br", "addr", "show", "dev", "b3bond"]).contains("10.63.0.1/24"));
+
+    // A failed apply (someone else's identical route makes the last step
+    // fail) undoes the in-place change.
+    ip(&[
+        "route",
+        "add",
+        "198.51.100.0/24",
+        "via",
+        "10.63.0.99",
+        "dev",
+        "b3bond",
+        "metric",
+        "1",
+        "proto",
+        "static",
+    ]);
+    let mut bad = to.clone();
+    bad.interfaces.get_mut(&n("b3bond")).unwrap().kind =
+        tune(BondMode::BalanceXor, None, HashPolicy::Layer23, 50, 1);
+    let rid = bad.ip.next_route_id();
+    bad.ip.routes.push(corerouter_model::RouteEntry {
+        id: rid,
+        dst_address: "198.51.100.0/24".parse().unwrap(),
+        gateway: "10.63.0.2".parse().unwrap(),
+        distance: 1,
+        routing_table: corerouter_model::RoutingTable::Main,
+        disabled: false,
+        comment: String::new(),
+    });
+    let err = hal.apply(&to, &bad).unwrap_err().to_string();
+    assert!(
+        err.contains("rolled back") && !err.contains("INCOMPLETE"),
+        "{err}"
+    );
+    let b = link("b3bond");
+    assert!(b.contains("miimon 250") && b.contains("min_links 2"), "{b}");
+    assert!(b.contains("xmit_hash_policy layer3+4"), "{b}");
+    ip(&["route", "del", "198.51.100.0/24"]);
+
+    // Active-backup: the primary is set and cleared in place.
+    let mut ab = to.clone();
+    ab.interfaces.get_mut(&n("b3bond")).unwrap().kind =
+        tune(BondMode::ActiveBackup, None, HashPolicy::Layer2, 100, 0);
+    hal.apply(&to, &ab).unwrap();
+    let index = ifindex("b3bond");
+    let mut primary = ab.clone();
+    primary.interfaces.get_mut(&n("b3bond")).unwrap().kind = tune(
+        BondMode::ActiveBackup,
+        Some("b3p2"),
+        HashPolicy::Layer2,
+        100,
+        0,
+    );
+    hal.apply(&ab, &primary).unwrap();
+    let b = link("b3bond");
+    assert!(b.contains("primary b3p2"), "{b}");
+    assert!(b.contains("active_slave b3p2"), "{b}");
+    hal.apply(&primary, &ab).unwrap();
+    let b = link("b3bond");
+    assert!(!b.contains("primary b3p2"), "{b}");
+    assert_eq!(ifindex("b3bond"), index, "the bond was recreated");
+
+    hal.apply(&ab, &base).unwrap();
+    assert!(!exists("b3bond"));
+}

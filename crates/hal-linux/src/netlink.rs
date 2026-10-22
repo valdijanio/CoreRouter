@@ -33,7 +33,7 @@ use rtnetlink::{
 };
 
 use crate::owner::KernelLink;
-use crate::plan::{KernelRoute, LinkSpec, Op};
+use crate::plan::{BondSetting, KernelRoute, LinkSpec, Op, bond_in_place};
 
 /// Bound on one link dump (hostile input: a kernel with more links than
 /// this is not one CoreRouter can manage sensibly anyway).
@@ -630,6 +630,7 @@ impl Kernel {
         match op {
             Op::CreateLink { link, spec } => self.create(link, spec).await,
             Op::DeleteLink { link, spec } => self.delete(link, spec).await,
+            Op::SetBond { link, from, to } => self.set_bond(link, from, to).await,
             Op::SetMtu { link, mtu } => {
                 let l = self.require(link).await?;
                 if l.mtu == *mtu {
@@ -782,6 +783,52 @@ impl Kernel {
         Ok(vec![Op::DeleteLink {
             link: link.clone(),
             spec: spec.clone(),
+        }])
+    }
+
+    /// Bond settings on the live bond, same ifindex, slaves untouched
+    /// (G1.8d): only the `IFLA_BOND_*` that change, which the kernel hands
+    /// to `bond_changelink`.
+    async fn set_bond(
+        &self,
+        link: &IfName,
+        from: &LinkSpec,
+        to: &LinkSpec,
+    ) -> Result<Vec<Op>, String> {
+        let settings = bond_in_place(from, to)
+            .ok_or_else(|| format!("'{link}' cannot change from {from} to {to} in place"))?;
+        let l = self.require(link).await?;
+        if !l.matches(to) {
+            return Err(format!(
+                "'{link}' is {} in the kernel, not {to}; refusing to touch it",
+                l.describe_kind()
+            ));
+        }
+        let mut b =
+            LinkMessageBuilder::<LinkBond>::new_with_info_kind(InfoKind::Bond).index(l.index);
+        for s in &settings {
+            b = match s {
+                BondSetting::MiiInterval(ms) => b.miimon(*ms),
+                BondSetting::MinLinks(n) => b.min_links(*n),
+                BondSetting::Hash(h) => b.xmit_hash_policy(kernel_hash(*h)),
+                // The kernel clears the primary for an ifindex it does not know.
+                BondSetting::Primary(p) => b.primary(match p {
+                    Some(p) => self.require(p).await?.index,
+                    None => 0,
+                }),
+            };
+        }
+        // RTM_NEWLINK without NLM_F_CREATE: `RTM_SETLINK` ignores IFLA_LINKINFO.
+        self.handle
+            .link()
+            .change(b.build())
+            .execute()
+            .await
+            .map_err(|e| readable(&e))?;
+        Ok(vec![Op::SetBond {
+            link: link.clone(),
+            from: to.clone(),
+            to: from.clone(),
         }])
     }
 

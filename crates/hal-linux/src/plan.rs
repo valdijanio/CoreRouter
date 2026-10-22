@@ -12,7 +12,8 @@
 //! 2. detach bridge ports / bond slaves / VRF members that leave (or change)
 //!    their master;
 //! 3. delete virtual links, VLAN children before their parents;
-//! 4. create virtual links, parents before VLAN children;
+//! 4. create virtual links, parents before VLAN children, then change in
+//!    place the bond settings the kernel takes on a live bond;
 //! 5. MTU: decreases children-first, then increases parents-first, so a VLAN
 //!    never exceeds its parent on the way (nor on the way back, in rollback);
 //! 6. attach bridge ports / bond slaves / VRF members;
@@ -58,9 +59,9 @@ pub enum LinkSpec {
     Vrf {
         table: u32,
     },
-    /// Linux `bond`. Every setting is part of the spec: changing one
-    /// recreates the bond (the kernel refuses a mode change while it has
-    /// slaves or is up), with its slaves released first and taken back after.
+    /// Linux `bond`. What [`bond_in_place`] accepts changes on the live bond
+    /// (same ifindex, slaves stay); a new mode or LACP rate recreates it,
+    /// with its slaves released first and taken back after.
     Bond {
         mode: BondMode,
         primary: Option<IfName>,
@@ -125,6 +126,80 @@ impl fmt::Display for LinkSpec {
     }
 }
 
+/// One bond setting changed on a live bond (`IFLA_BOND_*` in an
+/// `RTM_NEWLINK` on its ifindex, the kernel's `bond_changelink`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BondSetting {
+    MiiInterval(u32),
+    MinLinks(u32),
+    Hash(HashPolicy),
+    /// `None` clears it (ifindex 0).
+    Primary(Option<IfName>),
+}
+
+impl fmt::Display for BondSetting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MiiInterval(ms) => write!(f, "mii-interval {ms}ms"),
+            Self::MinLinks(n) => write!(f, "min-links {n}"),
+            Self::Hash(h) => write!(f, "transmit-hash-policy {}", h.label()),
+            Self::Primary(Some(p)) => write!(f, "primary {p}"),
+            Self::Primary(None) => f.write_str("primary none"),
+        }
+    }
+}
+
+/// The settings that take bond `from` to `to` without recreating it, or
+/// `None` when the kernel only takes the change on a new bond. Only what
+/// the kernel uses in the mode is compared, as when the bond is created.
+///
+/// Linux `drivers/net/bonding/bond_options.c` flags each option: `mode` is
+/// `BOND_OPTFLAG_NOSLAVES | BOND_OPTFLAG_IFDOWN` ("unable to set option
+/// because the bond device has slaves") and `lacp_rate` is
+/// `BOND_OPTFLAG_IFDOWN` ("…because the bond is up"); `miimon`,
+/// `min_links`, `xmit_hash_policy` and `primary` have no flag, so they
+/// change on a bond that is up and has slaves (checked on Linux 7.0).
+pub fn bond_in_place(from: &LinkSpec, to: &LinkSpec) -> Option<Vec<BondSetting>> {
+    let (
+        LinkSpec::Bond {
+            mode,
+            primary,
+            hash,
+            lacp_rate,
+            mii_interval_ms,
+            min_links,
+        },
+        LinkSpec::Bond {
+            mode: mode2,
+            primary: primary2,
+            hash: hash2,
+            lacp_rate: lacp_rate2,
+            mii_interval_ms: mii2,
+            min_links: min_links2,
+        },
+    ) = (from, to)
+    else {
+        return None;
+    };
+    if mode != mode2 || (*mode == BondMode::Lacp && lacp_rate != lacp_rate2) {
+        return None;
+    }
+    let mut out = Vec::new();
+    if mii_interval_ms != mii2 {
+        out.push(BondSetting::MiiInterval(*mii2));
+    }
+    if min_links != min_links2 {
+        out.push(BondSetting::MinLinks(*min_links2));
+    }
+    if mode.hashes() && hash != hash2 {
+        out.push(BondSetting::Hash(*hash2));
+    }
+    if mode.has_primary() && primary != primary2 {
+        out.push(BondSetting::Primary(primary2.clone()));
+    }
+    Some(out)
+}
+
 /// One kernel operation. Each one is small enough to undo on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
@@ -144,6 +219,13 @@ pub enum Op {
     CreateLink {
         link: IfName,
         spec: LinkSpec,
+    },
+    /// Bond settings changed in place: what [`bond_in_place`] gives for
+    /// `from` → `to`. Undone by the same op with the two swapped.
+    SetBond {
+        link: IfName,
+        from: LinkSpec,
+        to: LinkSpec,
     },
     /// `u32` like the kernel: `lo` has MTU 65536, and undo must restore it.
     SetMtu {
@@ -168,6 +250,7 @@ impl Op {
             | Self::SetMaster { link, .. }
             | Self::DeleteLink { link, .. }
             | Self::CreateLink { link, .. }
+            | Self::SetBond { link, .. }
             | Self::SetMtu { link, .. }
             | Self::AddAddress { link, .. }
             | Self::SetUp { link, .. } => link,
@@ -189,6 +272,17 @@ impl fmt::Display for Op {
             } => write!(f, "attach '{link}' to '{m}'"),
             Self::DeleteLink { link, spec } => write!(f, "delete {spec} '{link}'"),
             Self::CreateLink { link, spec } => write!(f, "create {spec} '{link}'"),
+            Self::SetBond { link, from, to } => {
+                write!(f, "set")?;
+                for (i, s) in bond_in_place(from, to)
+                    .unwrap_or_default()
+                    .iter()
+                    .enumerate()
+                {
+                    write!(f, "{}{s}", if i == 0 { " " } else { ", " })?;
+                }
+                write!(f, " on bonding '{link}'")
+            }
             Self::SetMtu { link, mtu } => write!(f, "set MTU of '{link}' to {mtu}"),
             Self::AddAddress { link, addr } => write!(f, "add address {addr} to '{link}'"),
             Self::SetUp { link, up: true } => write!(f, "bring '{link}' up"),
@@ -236,7 +330,7 @@ fn doomed(from: &Config, to: &Config) -> Result<BTreeSet<IfName>, HalError> {
             (Some(_), None) => {
                 out.insert(name.clone());
             }
-            (Some(a), Some(Some(b))) if a != b => {
+            (Some(a), Some(Some(b))) if a != b && bond_in_place(a, b).is_none() => {
                 out.insert(name.clone());
             }
             _ => {}
@@ -358,6 +452,27 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
             ops.push(Op::CreateLink {
                 link: name.clone(),
                 spec,
+            });
+        }
+    }
+
+    // 4b. Bond settings the kernel changes on the live bond (G1.8d).
+    for new in to.interfaces.values() {
+        if !kept(&new.name) {
+            continue;
+        }
+        let old = from
+            .interfaces
+            .get(&new.name)
+            .and_then(|i| LinkSpec::of(&i.kind));
+        let (Some(old), Some(spec)) = (old, LinkSpec::of(&new.kind)) else {
+            continue;
+        };
+        if bond_in_place(&old, &spec).is_some_and(|s| !s.is_empty()) {
+            ops.push(Op::SetBond {
+                link: new.name.clone(),
+                from: old,
+                to: spec,
             });
         }
     }
@@ -1023,7 +1138,7 @@ mod tests {
     }
 
     #[test]
-    fn changing_a_bond_setting_recreates_it_and_rejoins_its_slaves() {
+    fn changing_the_bond_mode_recreates_it_and_rejoins_its_slaves() {
         let mut from = base();
         add(&mut from, "bond1", bond(BondMode::Lacp));
         from.interfaces.get_mut(&n("ether1")).unwrap().bond = Some(n("bond1"));
@@ -1055,6 +1170,120 @@ mod tests {
             leave < del && del < create && create < join && join < up,
             "{ops:?}"
         );
+    }
+
+    fn tuned(kind: InterfaceKind, f: impl FnOnce(&mut InterfaceKind)) -> InterfaceKind {
+        let mut k = kind;
+        f(&mut k);
+        k
+    }
+
+    #[test]
+    fn live_bond_settings_change_in_place_without_touching_the_slaves() {
+        let mut from = base();
+        add(&mut from, "bond1", bond(BondMode::Lacp));
+        from.interfaces.get_mut(&n("ether1")).unwrap().bond = Some(n("bond1"));
+        addr(&mut from, "bond1", "10.0.0.1/30");
+        route(&mut from, "192.0.2.0/24", "10.0.0.2", 1);
+        let mut to = from.clone();
+        to.interfaces.get_mut(&n("bond1")).unwrap().kind = tuned(bond(BondMode::Lacp), |k| {
+            if let InterfaceKind::Bonding {
+                mii_interval_ms,
+                min_links,
+                transmit_hash_policy,
+                ..
+            } = k
+            {
+                *mii_interval_ms = 200;
+                *min_links = 1;
+                *transmit_hash_policy = HashPolicy::Layer34;
+            }
+        });
+        let ops = plan(&from, &to).unwrap();
+        let old = LinkSpec::of(&bond(BondMode::Lacp)).unwrap();
+        let new = LinkSpec::of(&to.interfaces[&n("bond1")].kind).unwrap();
+        assert_eq!(
+            ops,
+            vec![Op::SetBond {
+                link: n("bond1"),
+                from: old.clone(),
+                to: new.clone(),
+            }],
+            "no delete, no slave leaving, no route or address reinstalled"
+        );
+        assert_eq!(
+            bond_in_place(&old, &new).unwrap(),
+            vec![
+                BondSetting::MiiInterval(200),
+                BondSetting::MinLinks(1),
+                BondSetting::Hash(HashPolicy::Layer34),
+            ]
+        );
+        assert_eq!(
+            ops[0].to_string(),
+            "set mii-interval 200ms, min-links 1, transmit-hash-policy layer-3-and-4 \
+             on bonding 'bond1'"
+        );
+    }
+
+    #[test]
+    fn bond_in_place_needs_the_same_mode_and_lacp_rate() {
+        let spec = |k: InterfaceKind| LinkSpec::of(&k).unwrap();
+        let lacp = bond(BondMode::Lacp);
+        let fast = tuned(lacp.clone(), |k| {
+            if let InterfaceKind::Bonding { lacp_rate, .. } = k {
+                *lacp_rate = LacpRate::Fast;
+            }
+        });
+        // lacp_rate is BOND_OPTFLAG_IFDOWN, mode NOSLAVES | IFDOWN.
+        assert_eq!(bond_in_place(&spec(lacp.clone()), &spec(fast)), None);
+        assert_eq!(
+            bond_in_place(&spec(lacp.clone()), &spec(bond(BondMode::BalanceXor))),
+            None
+        );
+        assert_eq!(bond_in_place(&spec(lacp), &LinkSpec::Bridge), None);
+
+        // What the mode ignores is no change: no lacp_rate outside 802.3ad,
+        // no hash in active-backup, no primary in balance-xor.
+        let ab = bond(BondMode::ActiveBackup);
+        let ab2 = tuned(ab.clone(), |k| {
+            if let InterfaceKind::Bonding {
+                lacp_rate,
+                transmit_hash_policy,
+                primary,
+                ..
+            } = k
+            {
+                *lacp_rate = LacpRate::Fast;
+                *transmit_hash_policy = HashPolicy::Layer34;
+                *primary = Some(n("ether2"));
+            }
+        });
+        assert_eq!(
+            bond_in_place(&spec(ab.clone()), &spec(ab2.clone())).unwrap(),
+            vec![BondSetting::Primary(Some(n("ether2")))]
+        );
+        assert_eq!(
+            bond_in_place(&spec(ab2), &spec(ab)).unwrap(),
+            vec![BondSetting::Primary(None)]
+        );
+        let xor = bond(BondMode::BalanceXor);
+        let xor2 = tuned(xor.clone(), |k| {
+            if let InterfaceKind::Bonding { primary, .. } = k {
+                *primary = Some(n("ether2"));
+            }
+        });
+        assert_eq!(
+            bond_in_place(&spec(xor.clone()), &spec(xor2.clone())).unwrap(),
+            vec![]
+        );
+
+        // An ignored change plans nothing at all.
+        let mut from = base();
+        add(&mut from, "bond1", xor);
+        let mut to = from.clone();
+        to.interfaces.get_mut(&n("bond1")).unwrap().kind = xor2;
+        assert_eq!(plan(&from, &to).unwrap(), vec![]);
     }
 
     #[test]
