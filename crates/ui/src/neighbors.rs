@@ -126,6 +126,7 @@ impl CoreRouterUi {
             });
         }
         let names = self.interface_names(None);
+        let can = self.can();
         let Some(form) = self.forms.discovery.loaded.as_mut() else {
             ui.weak("Discovery settings: waiting for the router…");
             return;
@@ -159,7 +160,7 @@ impl CoreRouterUi {
             ui.label("Interval");
             ui.add(TextEdit::singleline(&mut form.interval).desired_width(48.0));
             ui.label("s");
-            apply = ui.button("Apply").clicked();
+            apply = table::action(ui, "Apply", can.check("ip.neighbor.discovery.set"));
             reset = ui.button("Reset").clicked();
         });
         if apply {
