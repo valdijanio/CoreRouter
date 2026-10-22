@@ -269,7 +269,17 @@ fn exchange(v4: bool) {
     let a = daemon(None, &dir_a, &format!("crdp-netns-a-{tag}.log"));
     let b_daemon = daemon(Some(b), &dir_b, &format!("crdp-netns-b-{tag}.log"));
 
-    wait_for("A to list B", || sees(&neighbors(None), &b_name).is_some());
+    // Over IPv4 B may show up before its link-local address has passed
+    // duplicate address detection; wait until it announces that too.
+    let link_local = |row: &Value| {
+        row["addresses"].as_array().is_some_and(|a| {
+            a.iter()
+                .any(|x| x.as_str().is_some_and(|x| x.starts_with("fe80::")))
+        })
+    };
+    wait_for("A to list B with its link-local address", || {
+        sees(&neighbors(None), &b_name).is_some_and(link_local)
+    });
     wait_for("B to list A", || {
         sees(&neighbors(Some(b)), &a_name).is_some()
     });
