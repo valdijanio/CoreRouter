@@ -4,6 +4,8 @@
 //! guard turns a panic into `Internal` and the reply looks normal, so
 //! [`panics`] watches for panics with a hook instead.
 
+#![doc(hidden)]
+
 use std::cell::Cell;
 use std::sync::Once;
 

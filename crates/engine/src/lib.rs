@@ -4,29 +4,9 @@
 //! `src/cmd/*.rs`. The UI, the CLI, the control channel and the MCP server all
 //! go through one door: [`Session::execute`].
 
-pub mod auth;
-pub mod cmd;
-pub mod dhcp6_client;
-pub mod dhcp_client;
-pub mod dhcp_resilience;
-pub mod dom_watch;
-pub mod error;
-pub mod firewall_dyn;
-#[doc(hidden)]
-pub mod fuzz;
-pub mod guard;
-pub mod link_watch;
-pub mod lockout;
-pub mod logging;
-pub mod metrics;
-pub mod neighbors;
-pub mod ntp;
-pub mod safe_mode;
-pub mod session;
-pub mod storage;
-pub mod tasks;
-pub mod tools;
-pub mod validate;
+// Every `src/<name>.rs` and `src/<name>/mod.rs` is a public module, generated
+// by build.rs (build-support/root_modules.rs): a new module is a new file.
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 
 pub use auth::{Group, Login, Principal};
 pub use error::EngineError;

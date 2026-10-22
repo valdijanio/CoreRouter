@@ -7,10 +7,16 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
+include!("../../build-support/root_modules.rs");
+
 fn main() -> Result<(), Box<dyn Error>> {
+    // The root module list too (`build-support/root_modules.rs`).
+    root_modules()?;
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
     let dir = manifest.join("src").join("cmd");
-    println!("cargo:rerun-if-changed=src/cmd");
+    // Absolute: the generated `#[path]`s are absolute, and worktrees that
+    // share a target directory must not reuse another worktree's list.
+    println!("cargo:rerun-if-changed={}", dir.display());
     let mut modules: Vec<(String, PathBuf, bool)> = Vec::new();
     for entry in std::fs::read_dir(&dir)? {
         let path = entry?.path();

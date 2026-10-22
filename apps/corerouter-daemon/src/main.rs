@@ -79,10 +79,8 @@
 
 #[cfg(target_os = "linux")]
 mod link_discovery;
-mod metrics;
 mod node_id;
-mod ntp_client;
-mod remote_log;
+mod service;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -111,8 +109,7 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                          [--discovery-port <port> | --no-discovery]
                          [--discovery-transport interfaces|loopback]
                          [--lab-ping auto|host|sim]
-                         [--manage <names>] [--unmanaged <names>]
-                         [--metrics [<addr>:]<port>]
+                         [--manage <names>] [--unmanaged <names>] [service flags]
 
   --control <port>      plain control channel on 127.0.0.1:<port> (default 7979)
   --listen <addr:port>  control channel over TLS on any address, e.g. 0.0.0.0:8729 or
@@ -140,8 +137,13 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
   --manage <names>      linux backend: also manage these veth/dummy links (comma-separated
                         names or prefix*, e.g. `lab*`)
   --unmanaged <names>   linux backend: never touch these links, physical ports included
-  --metrics <a:port>    Prometheus /metrics (interface and engine counters) over plain HTTP,
-                        no login: a bare port is 127.0.0.1:<port>; e.g. 9100 or [::]:9100";
+
+service flags (src/service/):";
+
+/// The help: the daemon's flags, then each service's.
+fn usage() -> String {
+    format!("{USAGE}{}", service::usage())
+}
 
 /// Longest wait for the discovery goodbyes when shutting down.
 const GOODBYE_WAIT: Duration = Duration::from_secs(1);
@@ -173,8 +175,8 @@ struct Args {
     lab_ping: String,
     /// `--manage` / `--unmanaged` (linux backend).
     policy: corerouter_hal_linux::Policy,
-    /// `--metrics`: where Prometheus scrapes.
-    metrics: Option<std::net::SocketAddr>,
+    /// Flags of the services (`src/service/`): `--metrics 9100`, …
+    service_flags: std::collections::BTreeMap<&'static str, String>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -193,7 +195,7 @@ fn parse_args() -> Result<Args, String> {
         discovery_transport: None,
         lab_ping: "auto".into(),
         policy: corerouter_hal_linux::Policy::default(),
-        metrics: None,
+        service_flags: Default::default(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -276,12 +278,19 @@ fn parse_args() -> Result<Args, String> {
                 let v = args.next().ok_or("--unmanaged needs interface names")?;
                 out.policy.unmanaged = corerouter_hal_linux::Policy::patterns(&v)?;
             }
-            "--metrics" => {
-                let v = args.next().ok_or("--metrics needs [ADDR:]PORT")?;
-                out.metrics = Some(metrics_addr(&v)?);
+            "-h" | "--help" => return Err(usage()),
+            other => {
+                let Some(f) = service::flag(other) else {
+                    return Err(format!("unknown argument '{other}'\n{}", usage()));
+                };
+                let v = match f.value {
+                    Some(placeholder) => args
+                        .next()
+                        .ok_or_else(|| format!("{other} needs {placeholder}"))?,
+                    None => String::new(),
+                };
+                out.service_flags.insert(f.name, v);
             }
-            "-h" | "--help" => return Err(USAGE.into()),
-            other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
     if out.ws.is_none()
@@ -291,43 +300,6 @@ fn parse_args() -> Result<Args, String> {
         return Err("--ws-origin and --web-root need --ws <port> or --ws-listen".into());
     }
     Ok(out)
-}
-
-/// `--metrics`: a bare port is loopback only; `ADDR:PORT` is explicit.
-fn metrics_addr(v: &str) -> Result<std::net::SocketAddr, String> {
-    if let Ok(port) = v.parse::<u16>() {
-        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
-    }
-    v.parse().map_err(|_| {
-        format!(
-            "--metrics: '{}' is not PORT or ADDR:PORT ([::1]:9100 for IPv6)",
-            v.chars().take(64).collect::<String>()
-        )
-    })
-}
-
-/// Serve `/metrics`, if asked for.
-fn metrics_endpoint(
-    args: &Args,
-    session: &corerouter_engine::Shared,
-    shutdown: &Shutdown,
-) -> Result<(), String> {
-    let Some(addr) = args.metrics else {
-        return Ok(());
-    };
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| format!("cannot open --metrics {addr}: {e}"))?;
-    metrics::spawn(listener, session.clone(), shutdown.clone())
-        .map_err(|e| format!("cannot start the metrics thread: {e}"))?;
-    if addr.ip().is_loopback() {
-        log::info!("Prometheus metrics on http://{addr}/metrics (loopback only)");
-    } else {
-        log::warn!(
-            "Prometheus metrics on http://{addr}/metrics: plain HTTP without login, \
-             reachable from the network (filter the port in the firewall)"
-        );
-    }
-    Ok(())
 }
 
 /// Start the WebSocket endpoints on their own threads, if asked for.
@@ -827,13 +799,6 @@ fn main() -> ExitCode {
             }
         }
     };
-    // Neither stops the daemon: a router without them still forwards.
-    if let Err(e) = ntp_client::spawn(session.clone(), corerouter_proto_ntp::PORT) {
-        log::error!("NTP client is off: cannot start its thread: {e}");
-    }
-    if let Err(e) = remote_log::spawn(session.clone()) {
-        log::error!("remote logging is off: cannot start its thread: {e}");
-    }
     let discovery = Discovery {
         crdp,
         #[cfg(target_os = "linux")]
@@ -844,7 +809,12 @@ fn main() -> ExitCode {
     // The TLS endpoints never take the local token: it proves a local
     // OS user, which a remote peer is not.
     let remote_gate = Gate::default();
-    if let Err(e) = metrics_endpoint(&args, &session, &shutdown) {
+    let ctx = service::Ctx {
+        session: session.clone(),
+        shutdown: shutdown.clone(),
+        flags: args.service_flags.clone(),
+    };
+    if let Err(e) = service::start_all(&ctx) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }

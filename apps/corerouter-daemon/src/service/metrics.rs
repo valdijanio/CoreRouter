@@ -381,6 +381,52 @@ fn scrape(session: &Shared) -> String {
     render(&m, start.elapsed().as_secs_f64())
 }
 
+
+/// `--metrics [<addr>:]<port>` (G4.4).
+pub(crate) const SERVICE: super::Service = super::Service {
+    name: "metrics",
+    flags: &[super::Flag {
+        name: "--metrics",
+        value: Some("<a:port>"),
+        help: "Prometheus /metrics (interface and engine counters) over plain HTTP,\nno login: a bare port is 127.0.0.1:<port>; e.g. 9100 or [::]:9100",
+    }],
+    start,
+};
+
+/// `--metrics`: a bare port is loopback only; `ADDR:PORT` is explicit.
+fn metrics_addr(v: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(port) = v.parse::<u16>() {
+        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+    }
+    v.parse().map_err(|_| {
+        format!(
+            "--metrics: '{}' is not PORT or ADDR:PORT ([::1]:9100 for IPv6)",
+            v.chars().take(64).collect::<String>()
+        )
+    })
+}
+
+/// Serve `/metrics`, if asked for.
+fn start(ctx: &super::Ctx) -> Result<(), String> {
+    let Some(v) = ctx.flag("--metrics") else {
+        return Ok(());
+    };
+    let addr = metrics_addr(v)?;
+    let listener = std::net::TcpListener::bind(addr)
+        .map_err(|e| format!("cannot open --metrics {addr}: {e}"))?;
+    spawn(listener, ctx.session.clone(), ctx.shutdown.clone())
+        .map_err(|e| format!("cannot start the metrics thread: {e}"))?;
+    if addr.ip().is_loopback() {
+        log::info!("Prometheus metrics on http://{addr}/metrics (loopback only)");
+    } else {
+        log::warn!(
+            "Prometheus metrics on http://{addr}/metrics: plain HTTP without login, \
+             reachable from the network (filter the port in the firewall)"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

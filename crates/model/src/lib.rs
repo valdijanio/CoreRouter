@@ -4,21 +4,9 @@
 //! candidate/running store with commit history. No I/O, no clock, no UI, so it
 //! compiles everywhere (including `wasm32-unknown-unknown`).
 
-pub mod bonding;
-pub mod config;
-pub mod dhcp_client;
-pub mod firewall;
-pub mod interface_list;
-pub mod ipv6;
-pub mod logging;
-pub mod neighbor;
-pub mod ntp;
-pub mod persist;
-pub mod route;
-pub mod store;
-pub mod types;
-pub mod users;
-pub mod validate;
+// Every `src/<name>.rs` and `src/<name>/mod.rs` is a public module, generated
+// by build.rs (build-support/root_modules.rs): a new module is a new file.
+include!(concat!(env!("OUT_DIR"), "/modules.rs"));
 
 pub use bonding::{BondMode, HashPolicy, LacpRate};
 pub use config::{

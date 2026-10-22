@@ -122,13 +122,17 @@ jobs:
           fi
 
       # G1.8: o `bonding` vem no linux-modules base; um user namespace também não o carrega.
-      - name: Carregar o módulo bonding
+      # Módulos simples (só `modprobe`): um arquivo por módulo em ci/kernel-modules/.
+      - name: Carregar os módulos do kernel
         if: github.event_name != 'pull_request'
         run: |
-          sudo modprobe bonding
-          lsmod | grep -w '^bonding'
-          # Com o módulo carregado, o teste de bonding em netns falha em vez de pular.
-          echo "COREROUTER_REQUIRE_BOND=1" >> "$GITHUB_ENV"
+          for f in ci/kernel-modules/*; do
+            mod=$(basename "$f")
+            [ "$mod" = README.md ] && continue
+            sudo modprobe "$mod"
+            lsmod | grep -w "^$mod"
+            echo "$(head -n1 "$f")=1" >> "$GITHUB_ENV"
+          done
 
       - name: cargo xtask ci
         run: cargo xtask ci ${{ github.event_name == 'pull_request' && '--fast' || '' }}

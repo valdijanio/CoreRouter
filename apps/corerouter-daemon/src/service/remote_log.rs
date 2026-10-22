@@ -157,6 +157,22 @@ impl Sender {
     }
 }
 
+
+/// No flags: configured with `system.logging.*`.
+pub(crate) const SERVICE: super::Service = super::Service {
+    name: "remote logging",
+    flags: &[],
+    start,
+};
+
+/// A router without it still forwards: a failure is logged, not fatal.
+fn start(ctx: &super::Ctx) -> Result<(), String> {
+    if let Err(e) = spawn(ctx.session.clone()) {
+        log::error!("remote logging is off: cannot start its thread: {e}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

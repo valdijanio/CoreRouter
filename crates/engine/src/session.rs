@@ -92,6 +92,9 @@ pub struct Session {
     pub(crate) ntp: corerouter_model::ntp::NtpStatus,
     /// Commands and commits since start (operational; G4.4).
     pub(crate) counters: EngineCounters,
+    /// Runtime state of features, by type (`ext`/`ext_mut`): a new feature
+    /// keeps its state here instead of adding a field (crate::ext).
+    ext: crate::ext::Extensions,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -111,6 +114,17 @@ const MAX_JOURNAL: usize = 1024;
 pub const MAX_BATCH: usize = 256;
 
 impl Session {
+    /// A feature's runtime state of type `T` (crate::ext), if set.
+    pub fn ext<T: std::any::Any + Send>(&self) -> Option<&T> {
+        self.ext.get()
+    }
+
+    /// A feature's runtime state of type `T`, created with `Default` the
+    /// first time (crate::ext).
+    pub fn ext_mut<T: std::any::Any + Send + Default>(&mut self) -> Option<&mut T> {
+        self.ext.get_mut()
+    }
+
     /// Build a session on `hal`, seeding one interface per discovered port.
     /// Nothing outlives the process (in-memory storage).
     pub fn new(hal: Box<dyn Hal>) -> Self {
@@ -180,6 +194,7 @@ impl Session {
             dom: DomWatch::default(),
             ntp: Default::default(),
             counters: EngineCounters::default(),
+            ext: crate::ext::Extensions::default(),
         }
     }
 

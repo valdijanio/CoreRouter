@@ -1,6 +1,8 @@
 //! Fuzz oracle for the MCP stdio server (G0.5); see
 //! `corerouter_control::fuzz` for how panics are caught.
 
+#![doc(hidden)]
+
 use std::io::Cursor;
 
 use corerouter_control::fuzz::panics;
