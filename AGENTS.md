@@ -170,7 +170,8 @@ usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
    `gh pr create --base main --title "<id>: <resumo>"`. O corpo do PR diz o que mudou, como
    testar (comandos ou cliques), o id da gap e, em feature nova, a seção `## Pesquisa` (veja
    "Pesquisa antes de implementar").
-4. Com o PR aberto, **pare** e diga no relato "pronto para a fila: #<n>" (o `cargo xtask ci`
+4. Abra o PR com o rótulo **`fila`** (`gh pr create … --label fila`): é ele que a fila contínua
+   (`scripts/land.sh --watch`) procura. Com o PR aberto, **pare** e diga no relato "pronto para a fila: #<n>" (o `cargo xtask ci`
    local completo já passou; não espere o CI do GitHub). Não ligue `gh pr merge --auto` nem
    faça merge. O CI do PR roda o portão rápido (`cargo xtask ci --fast`); se ele ou a fila
    acusarem erro, a sessão principal avisa e você corrige na mesma branch.
@@ -178,7 +179,10 @@ usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
 ### Fila de entrada (sessão principal)
 
 Quando há PRs prontos, a sessão principal pergunta ao usuário **uma vez por lote** ("N features
-prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh --batch <pr>...`:
+prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh --batch <pr>...` — ou deixa
+rodando a **fila contínua** `scripts/land.sh --watch`, que pega sozinha os PRs com o rótulo `fila`
+e, enquanto um lote roda o CI, já testa os PRs novos num lote especulativo montado em cima dele
+(lote verde: o especulativo entra logo depois, sem esperar outro CI; vermelho: é descartado):
 
 - **Lote:** junta a `main` e todos os PRs numa branch temporária, confere os `docs/changes/` e
   roda **um** CI completo nessa combinação, que é o que a `main` vai ser: o "sozinho passa,
