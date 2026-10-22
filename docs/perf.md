@@ -4,6 +4,9 @@ Regra em `AGENTS.md`, "Desempenho e escolha de implementação". Cada número di
 (com máquina, build e data) ou **estimado**. Os benchmarks são do G0.9: `cargo xtask bench`
 (criterion 0.8, dev-dependency só dos crates medidos; fora do build normal e do wasm).
 
+Medições novas entram pela seção `## perf` do arquivo de mudança do PR (`docs/changes/`), que a
+fila de entrada acrescenta no fim deste arquivo; não o edite à mão (conflito entre PRs).
+
 ## Como rodar
 
 ```sh

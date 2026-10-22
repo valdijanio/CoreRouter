@@ -31,6 +31,9 @@ como **medido** ou **estimado**. Pode ter várias linhas e parágrafos.
   data do merge.
 - **Linhas de tabela** no corpo (`| G… |`) são gaps novas: entram em `docs/gaps.md` logo depois
   da linha anterior da mesma fase. O id tem de ser novo; confira na `origin/main`.
+- **`## perf`** (opcional, no fim): tudo depois dessa linha vai para o fim de `docs/perf.md`
+  (medições **medidas**, com máquina, build e data). Não edite o `perf.md` à mão: todo PR de
+  desempenho acrescentava no fim dele, e PRs paralelos conflitavam.
 
 `cargo xtask docs` confere todos os arquivos (sem gravar). `cargo xtask docs fold [--date
 AAAA-MM-DD]` aplica e apaga.
