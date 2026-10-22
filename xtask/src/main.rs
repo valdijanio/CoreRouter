@@ -230,8 +230,11 @@ fn netns_tests(root: &Path) -> Result<Vec<(String, String)>, String> {
     let json: serde_json::Value =
         serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
     let mut found = Vec::new();
-    for p in json["packages"].as_array().into_iter().flatten() {
-        let (Some(name), Some(manifest)) = (p["name"].as_str(), p["manifest_path"].as_str()) else {
+    let packages = json.get("packages").and_then(serde_json::Value::as_array);
+    for p in packages.into_iter().flatten() {
+        let name = p.get("name").and_then(serde_json::Value::as_str);
+        let manifest = p.get("manifest_path").and_then(serde_json::Value::as_str);
+        let (Some(name), Some(manifest)) = (name, manifest) else {
             continue;
         };
         let Some(dir) = Path::new(manifest).parent() else {

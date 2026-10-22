@@ -20,7 +20,7 @@ use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::interfaces::{cascade, dialog_id};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
-use crate::{CoreRouterUi, LogLine, form_number, value_text};
+use crate::{CoreRouterUi, LogLine, Win, form_number, value_text};
 
 const NAME: &str = "dhcp-client";
 /// The window's id (`Win::Panel`).
@@ -50,7 +50,7 @@ pub(crate) struct DhcpPanel {
     pub(crate) dialogs: Vec<DhcpDialogWin>,
     /// Clients to open once a list sent after this request arrives.
     open_after: Vec<(RequestId, String)>,
-    table: TableState,
+    pub(crate) table: TableState,
 }
 
 /// What a dialog's command changes when it is answered.
@@ -504,6 +504,14 @@ impl DhcpPanel {
         });
         ui.separator();
 
+        self.table.open = self
+            .dialogs
+            .iter()
+            .filter_map(|d| match &d.dialog {
+                DhcpDialog::Props { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
         let out = table::show(
             ui,
             TABLE,
@@ -692,15 +700,17 @@ impl DhcpPanel {
         app.cache.refreshed_at = None;
     }
 
-    /// "DHCP Client <iface>"; an already open one is not duplicated.
-    fn open_dhcp(&mut self, app: &mut CoreRouterUi, id: &str) {
+    /// "DHCP Client <iface>"; an already open one comes to the front.
+    pub(crate) fn open_dhcp(&mut self, app: &mut CoreRouterUi, id: &str) {
         let Some(row) = self.dhcp_row(id).cloned() else {
             return;
         };
-        let open = self.dialogs
-            .iter()
-            .any(|d| matches!(&d.dialog, DhcpDialog::Props { id: i, .. } if i == id));
-        if open {
+        let open = self
+            .dialogs
+            .iter_mut()
+            .find(|d| matches!(&d.dialog, DhcpDialog::Props { id: i, .. } if i == id));
+        if let Some(d) = open {
+            d.status.bring_to_front();
             return;
         }
         let form = DhcpForm::of(&row);
@@ -760,6 +770,7 @@ impl DhcpPanel {
                 title: &title,
                 dirty: d.dialog.dirty(),
                 pos: cascade(area, d.id),
+                parent: Some(crate::win_id(Win::Panel(WIN))),
             };
             let options = row
                 .as_ref()

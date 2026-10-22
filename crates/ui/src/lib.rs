@@ -790,6 +790,12 @@ impl CoreRouterUi {
                     _ => {}
                 }
             }
+            if floats.take_close(win_id(*win)) {
+                open = false;
+            } else if !open && !floats.close_family(&ctx, win_id(*win)) {
+                // A child has edits not applied: the question asks first.
+                open = true;
+            }
             if !open {
                 self.open.remove(win);
                 floats.closed(win_id(*win));
@@ -810,6 +816,7 @@ impl CoreRouterUi {
         self.terminals(&ctx, area);
         self.password_window(&ctx);
         self.lockout_window(&ctx);
+        self.floats.end_frame(&ctx);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -1068,7 +1075,10 @@ impl CoreRouterUi {
             .selectable_label(self.open.contains(&win), label)
             .clicked()
         {
-            self.open.insert(win);
+            if !self.open.insert(win) {
+                // Already open: to the front, with its dialogs over it.
+                self.floats.raise(win_id(win));
+            }
             // Some lists are only asked for while their window is open.
             self.cache.refreshed_at = None;
         }
@@ -1110,7 +1120,7 @@ impl CoreRouterUi {
     }
 }
 
-fn win_id(win: Win) -> egui::Id {
+pub(crate) fn win_id(win: Win) -> egui::Id {
     egui::Id::unique(("corerouter-win", win))
 }
 
@@ -1549,13 +1559,15 @@ mod tests {
             self.idle();
         }
 
-        /// Centre of a row of the Interfaces table.
+        /// A point of a row of the Interfaces table, on its name (the left
+        /// end, which a dialog open over the list leaves uncovered).
         fn row(&self, name: &str) -> egui::Pos2 {
-            self.ctx
+            let r = self
+                .ctx
                 .read_response(table::row_id(interfaces::TABLE, name))
                 .unwrap_or_else(|| panic!("row {name} not drawn"))
-                .rect
-                .center()
+                .rect;
+            egui::pos2(r.left() + 40.0, r.center().y)
         }
 
         fn tool(&self, icon: table::Icon) -> egui::Pos2 {

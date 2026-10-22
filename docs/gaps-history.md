@@ -40,3 +40,4 @@ redefine um item de `docs/gaps.md` acrescenta **uma linha no fim**, sem editar l
 - 2026-10-22 — G0.9 (infraestrutura de benchmarks) adicionado; AGENTS.md ganha RFC original na pesquisa e a regra de desempenho (Rust puro × externo com dados).
 - 2026-10-22 — G0.9 feito (`cargo xtask bench`, 31 benchmarks, `bench-check` no CI, `docs/perf.md` com números medidos).
 - 2026-10-22 — G2.1b (firewall: lockout, sombras, defaults, modelos, zonas, descrição) feito.
+- 2026-10-22 — G1.21 (hierarquia das janelas internas: trazer à frente, filho sobre o pai, fechar junto, Ctrl+Tab) adicionado e feito.

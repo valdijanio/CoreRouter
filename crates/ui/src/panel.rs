@@ -152,6 +152,21 @@ impl CoreRouterUi {
             .find_map(|p| (p.as_mut() as &mut dyn Any).downcast_mut::<T>())
     }
 
+    /// Run `f` on the panel of type `T` (tests drive a panel directly).
+    #[cfg(test)]
+    pub(crate) fn with_panel_as<T: PanelState, R>(
+        &mut self,
+        f: impl FnOnce(&mut T, &mut Self) -> R,
+    ) -> Option<R> {
+        let name = all().iter().zip(&self.panels).find_map(|(p, s)| {
+            let s: &dyn Any = s.as_deref()?;
+            s.is::<T>().then_some(p.name)
+        })?;
+        self.with_panel(name, |s, app| {
+            (s as &mut dyn Any).downcast_mut::<T>().map(|t| f(t, app))
+        })?
+    }
+
     /// Draw every panel's dialogs.
     pub(crate) fn panel_dialogs(&mut self, ctx: &egui::Context, area: egui::Rect) {
         for p in all() {
