@@ -8,10 +8,16 @@
      Em correção pequena, escreva "não se aplica". -->
 
 - **MikroTik RouterOS v7** (help.mikrotik.com, links): como funciona, nomes e padrões.
+- **RFCs consultadas** (quando fala protocolo; base + "Updated by" + errata, com seções):
 - **Outros** (pelo menos dois: VyOS, Junos, IOS-XE, SR Linux, EOS, OPNsense/pfSense, OpenWrt, FRR, RFCs…): o que fazem melhor.
 - **Adotado:**
 - **Melhorias propostas** (entram agora / viram gap):
 - **Fora do escopo, e por quê:**
+
+## Desempenho
+
+<!-- Se tocar caminho quente (pacotes, aplicar N regras/rotas, canal de controle, codecs):
+     antes/depois medido com `cargo xtask bench`, e a linha em docs/perf.md. Senão: "não se aplica". -->
 
 ## Como testar
 
