@@ -255,6 +255,9 @@ pub struct Ip {
     /// `/ip dns zone` (G4.1c): authoritative zones and their records.
     #[serde(skip_serializing_if = "crate::dns_zone::DnsZones::is_empty")]
     pub dns_zones: crate::dns_zone::DnsZones,
+    /// `/ip dns tsig-key` (G4.1c-3): TSIG keys for RFC 2136 UPDATE.
+    #[serde(skip_serializing_if = "crate::dns_tsig::DnsTsig::is_empty")]
+    pub dns_tsig: crate::dns_tsig::DnsTsig,
 }
 
 impl Ip {

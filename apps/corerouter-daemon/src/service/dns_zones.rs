@@ -186,6 +186,7 @@ impl Zones {
 
     /// One second's work: NOTIFY for changed primaries, secondaries due.
     pub(crate) fn tick(self: &Arc<Self>) {
+        self.dynamic();
         for c in zone::reload(self.fwd()) {
             if c.notify.is_empty() {
                 continue;
@@ -277,6 +278,54 @@ impl Zones {
                 }
             }
         }
+    }
+
+    /// Dynamic records (G4.1c-3): expired ones go, and the forwarder gets
+    /// the engine's copy when it moved.
+    fn dynamic(&self) {
+        let now = unix_now();
+        let copy = {
+            let mut s = lock(&self.session);
+            match s.dns_dynamic_tick(now) {
+                Ok(0) => {}
+                Ok(n) => log::info!("DNS: {n} dynamic records expired"),
+                Err(e) => log::error!("DNS: dynamic records: {e}"),
+            }
+            (s.dns_dynamic_version() != zone::dynamic_version(self.fwd())).then(|| s.dns_dynamic())
+        };
+        if let Some((version, state)) = copy {
+            zone::set_dynamic(self.fwd(), version, Arc::new(state));
+        }
+    }
+
+    /// RFC 2136 UPDATE (G4.1c-3): checked by `zone::update`, applied in
+    /// the engine (saved before the answer, §3.5), then answered.
+    fn update(&self, packet: &[u8], client: IpAddr) -> Option<Vec<u8>> {
+        let now = unix_now();
+        let u = match zone::update::read(self.fwd(), packet, client, now) {
+            Ok(u) => u,
+            Err(reply) => return Some(reply),
+        };
+        let source = match &u.key {
+            Some(k) => format!("update {} key {k}", u.client),
+            None => format!("update {}", u.client),
+        };
+        let applied = lock(&self.session).dns_dynamic_apply(&u.zone, &u.ops, &source, None, now);
+        let ok = match applied {
+            Ok(n) => {
+                if n > 0 {
+                    log::info!("DNS: zone {}: {n} records changed by {source}", u.zone);
+                }
+                self.dynamic();
+                true
+            }
+            Err(e) => {
+                // §3.4.2.7: nothing applied, SERVFAIL.
+                log::warn!("DNS: zone {}: update by {source} failed: {e}", u.zone);
+                false
+            }
+        };
+        Some(zone::update::finish(&u, ok, now))
     }
 
     /// The key life cycle, then a signing thread for each signed zone due.
@@ -671,6 +720,12 @@ impl ZoneBackend for Backend {
 /// The service and its backend, registered with the engine.
 fn prepare(session: &Shared, srv: Arc<Server>, port: u16, shutdown: Shutdown) -> Arc<Zones> {
     let z = Zones::new(session.clone(), srv, port, shutdown);
+    let weak = Arc::downgrade(&z);
+    zone::set_updater(
+        z.fwd(),
+        Arc::new(move |packet: &[u8], client: IpAddr| weak.upgrade()?.update(packet, client)),
+    );
+    z.dynamic();
     lock(session).set_zone_backend(Arc::new(Backend(z.clone())));
     z
 }
@@ -953,6 +1008,98 @@ mod tests {
         assert_eq!(nsec3(&m), nsec3(&pm), "the secondary proves NXDOMAIN too");
         let rows = run(&secondary, "ip.dns.zone.print", json!({}));
         assert_eq!(rows[0]["signed"], true, "{rows}");
+        shutdown.close();
+    }
+
+    /// G4.1c-3: a TSIG-signed RFC 2136 UPDATE adds a record the zone
+    /// answers at once; a bad key changes nothing; a lease (the API the
+    /// DHCP server of G4.2 calls) gets its A and PTR, gone at its end.
+    #[test]
+    fn dynamic_updates_and_leases() {
+        use hickory_proto::op::OpCode;
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
+        use hickory_proto::rr::{RData, Record, TSigner};
+        let port = free_port();
+        let shutdown = Shutdown::default();
+        let session = shared(Session::virtual_lab());
+        run(&session, "ip.dns.set", json!({"allow_remote_requests": true}));
+        let key = run(&session, "ip.dns.tsig-key.add", json!({"name": "ddns"}));
+        let secret = corerouter_model::dns_tsig::base64_decode(key["secret"].as_str().unwrap()).unwrap();
+        run(&session, "ip.dns.zone.add", json!({"name": "lan.example", "update_keys": "ddns"}));
+        run(&session, "ip.dns.zone.add", json!({"name": "88.168.192.in-addr.arpa"}));
+        let srv = super::super::dns_server::spawn(
+            session.clone(),
+            Arc::new(RouterDns::new()),
+            port,
+            shutdown.clone(),
+        )
+        .unwrap();
+        spawn(&session, srv, port, shutdown.clone()).unwrap();
+        wait("the zone", || ask(port, "lan.example.").is_some_and(|m| m.metadata.authoritative));
+
+        let send = |secret: &[u8]| -> Message {
+            let mut m = Message::query();
+            m.metadata.op_code = OpCode::Update;
+            m.add_query(Query::query(Name::from_ascii("lan.example.").unwrap(), RecordType::SOA));
+            m.add_authority(Record::from_rdata(
+                Name::from_ascii("pc.lan.example.").unwrap(),
+                300,
+                RData::A(A::new(192, 168, 88, 50)),
+            ));
+            let signer = TSigner::new(
+                secret.to_vec(),
+                TsigAlgorithm::HmacSha256,
+                Name::from_ascii("ddns.").unwrap(),
+                300,
+            )
+            .unwrap();
+            let (tsig, _) = signer.sign_message(&m, unix_now()).unwrap();
+            m.set_signature(tsig);
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            s.send_to(&m.to_vec().unwrap(), ("127.0.0.1", port)).unwrap();
+            let mut buf = [0u8; 4096];
+            let (n, _) = s.recv_from(&mut buf).unwrap();
+            Message::from_vec(&buf[..n]).unwrap()
+        };
+        let r = send(&[1; 32]);
+        assert_eq!(r.metadata.response_code, hickory_proto::op::ResponseCode::NotAuth);
+        assert!(answer(port, "pc.lan.example.").is_none(), "a bad key changes nothing");
+        let r = send(&secret);
+        assert_eq!(r.metadata.response_code, hickory_proto::op::ResponseCode::NoError);
+        assert!(r.signature().is_some(), "RFC 8945 §5.3: signed answer");
+        assert_eq!(answer(port, "pc.lan.example.").as_deref(), Some("192.168.88.50"));
+        let rows = run(&session, "ip.dns.zone.record.print", json!({"zone": "lan.example"}));
+        assert_eq!(rows[0]["flags"], "D", "{rows}");
+        assert!(rows[0]["source"].as_str().unwrap().contains("key ddns"));
+
+        // A lease, as the DHCP server will hand it over.
+        let now = unix_now();
+        lock(&session)
+            .dns_dynamic_lease(
+                &corerouter_engine::dns_dynamic::LeaseName {
+                    zone: "lan.example".into(),
+                    host: "laptop".into(),
+                    address: "192.168.88.77".parse().unwrap(),
+                    ttl_secs: 600,
+                    expires_unix: Some(now + 2),
+                    source: "dhcp lan".into(),
+                },
+                now,
+            )
+            .unwrap();
+        wait("the lease's A", || answer(port, "laptop.lan.example.").as_deref() == Some("192.168.88.77"));
+        let mut q = Message::query();
+        q.add_query(Query::query(Name::from_ascii("77.88.168.192.in-addr.arpa.").unwrap(), RecordType::PTR));
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        s.send_to(&q.to_vec().unwrap(), ("127.0.0.1", port)).unwrap();
+        let mut buf = [0u8; 4096];
+        let (n, _) = s.recv_from(&mut buf).unwrap();
+        let ptr = Message::from_vec(&buf[..n]).unwrap();
+        assert_eq!(ptr.answers[0].data.to_string(), "laptop.lan.example.");
+        wait("the lease's end", || answer(port, "laptop.lan.example.").is_none());
         shutdown.close();
     }
 }

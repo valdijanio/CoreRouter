@@ -251,6 +251,15 @@ pub struct Zone {
     /// Who may transfer the zone (AXFR/IXFR); empty: nobody.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow_transfer: Vec<IpNet>,
+    /// RFC 2136 UPDATE (G4.1c-3): TSIG keys (`/ip dns tsig-key`) allowed
+    /// to change the zone's dynamic records.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub update_keys: Vec<String>,
+    /// Where an UPDATE may come from (empty: anywhere, with a key). Without
+    /// `update_keys`, these networks may update unsigned (BIND
+    /// `allow-update`; only for a LAN you trust).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_update: Vec<IpNet>,
     /// Told on every change (NOTIFY, RFC 1996), port 53.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notify: Vec<IpAddr>,
@@ -289,6 +298,8 @@ impl Zone {
             minimum_secs: DEFAULT_MINIMUM_SECS,
             ttl_secs: DEFAULT_TTL_SECS,
             allow_transfer: Vec::new(),
+            update_keys: Vec::new(),
+            allow_update: Vec::new(),
             notify: Vec::new(),
             primaries: Vec::new(),
             dnssec: false,
@@ -371,6 +382,16 @@ impl Zone {
         }
         if self.allow_transfer.len() > MAX_ALLOW_TRANSFER {
             return Some(format!("allow_transfer takes at most {MAX_ALLOW_TRANSFER} prefixes"));
+        }
+        if self.allow_update.len() > MAX_ALLOW_TRANSFER || self.update_keys.len() > 8 {
+            return Some(format!(
+                "allow_update takes at most {MAX_ALLOW_TRANSFER} prefixes, update_keys 8 keys"
+            ));
+        }
+        if self.ztype == ZoneType::Secondary
+            && (!self.allow_update.is_empty() || !self.update_keys.is_empty())
+        {
+            return Some("updates are for primary zones (a secondary forwards nothing)".into());
         }
         if self.notify.len() > MAX_NOTIFY {
             return Some(format!("notify takes at most {MAX_NOTIFY} addresses"));

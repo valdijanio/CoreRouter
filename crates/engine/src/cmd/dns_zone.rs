@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Zone",
         ["IP", "DNS"],
         None,
-        "{name: name (the zone: example.com, 88.168.192.in-addr.arpa), type?: primary | secondary (default primary), primary_ns?: name (SOA MNAME; default ns1.<zone>), admin?: email or name (SOA RNAME; default hostmaster.<zone>), serial?: int (default: by serial_policy), serial_policy?: date | increment | unixtime (default date: YYYYMMDDnn), refresh_secs?: int (86400), retry_secs?: int (7200), expire_secs?: int (3600000), minimum_secs?: int (negative TTL, 3600), ttl_secs?: int (default record TTL, 3600), allow_transfer?: [prefix] (who may AXFR/IXFR; default nobody), notify?: [ip] (told on every change, RFC 1996), primaries?: [ip] (secondary: transfer from), dnssec?: bool (sign the zone: KSK + ZSK, NSEC3), dnssec_algorithm?: ecdsa-p256 | ed25519 (default ecdsa-p256), signature_validity_secs?: int 86400..7776000 (default 1209600), disabled?: bool, comment?: string} → {id, name, serial}",
+        "{name: name (the zone: example.com, 88.168.192.in-addr.arpa), type?: primary | secondary (default primary), primary_ns?: name (SOA MNAME; default ns1.<zone>), admin?: email or name (SOA RNAME; default hostmaster.<zone>), serial?: int (default: by serial_policy), serial_policy?: date | increment | unixtime (default date: YYYYMMDDnn), refresh_secs?: int (86400), retry_secs?: int (7200), expire_secs?: int (3600000), minimum_secs?: int (negative TTL, 3600), ttl_secs?: int (default record TTL, 3600), allow_transfer?: [prefix] (who may AXFR/IXFR; default nobody), notify?: [ip] (told on every change, RFC 1996), primaries?: [ip] (secondary: transfer from), dnssec?: bool (sign the zone: KSK + ZSK, NSEC3), dnssec_algorithm?: ecdsa-p256 | ed25519 (default ecdsa-p256), signature_validity_secs?: int 86400..7776000 (default 1209600), update_keys?: [TSIG key name] (may change the zone by RFC 2136 UPDATE), allow_update?: [prefix] (where an UPDATE may come from; without update_keys: unsigned from there), disabled?: bool, comment?: string} → {id, name, serial}",
         always,
         add
     ),
@@ -40,7 +40,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Zone",
         [],
         None,
-        "{id: *hex | name, name?: name, primary_ns?: name, admin?: email or name, serial?: int, serial_policy?: date | increment | unixtime, refresh_secs?: int, retry_secs?: int, expire_secs?: int, minimum_secs?: int, ttl_secs?: int, allow_transfer?: [prefix], notify?: [ip], primaries?: [ip], dnssec?: bool, dnssec_algorithm?: ecdsa-p256 | ed25519, signature_validity_secs?: int, disabled?: bool, comment?: string} → {id, name, serial} (\"\" clears a field)",
+        "{id: *hex | name, name?: name, primary_ns?: name, admin?: email or name, serial?: int, serial_policy?: date | increment | unixtime, refresh_secs?: int, retry_secs?: int, expire_secs?: int, minimum_secs?: int, ttl_secs?: int, allow_transfer?: [prefix], notify?: [ip], primaries?: [ip], dnssec?: bool, dnssec_algorithm?: ecdsa-p256 | ed25519, signature_validity_secs?: int, update_keys?: [name], allow_update?: [prefix], disabled?: bool, comment?: string} → {id, name, serial} (\"\" clears a field)",
         has_zones,
         set
     ),
@@ -105,8 +105,26 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         record_remove
     ),
     cmd!(query "ip.dns.zone.record.print", "DNS Zone Records", ["IP", "DNS"], None,
-        "{zone?: name, name?: string} → [{id, zone, name, fqdn, type, address?, target?, priority?, weight?, port?, text?, caa_flags?, caa_tag?, ttl_secs?, ttl (effective), data, disabled?, comment?, flags (X disabled)}]",
+        "{zone?: name, name?: string} → [{id, zone, name, fqdn, type, address?, target?, priority?, weight?, port?, text?, caa_flags?, caa_tag?, ttl_secs?, ttl (effective), data, disabled?, comment?, dynamic? (from an UPDATE or a lease), source?, expires_unix?, flags (X disabled, D dynamic)}]",
         always, record_print),
+    cmd!(
+        "ip.dns.zone.dynamic.remove",
+        "Remove Dynamic Record",
+        [],
+        None,
+        "{id: *hex (a D row of ip.dns.zone.record.print)} → {id}",
+        always,
+        dynamic_remove
+    ),
+    cmd!(
+        "ip.dns.zone.dynamic.flush",
+        "Flush Dynamic Records",
+        [],
+        None,
+        "{zone: name} → {zone, removed}",
+        has_zones,
+        dynamic_flush
+    ),
 ];
 
 fn has_zones(s: &Session) -> std::result::Result<(), String> {
@@ -270,6 +288,12 @@ fn apply_zone(z: &mut Zone, p: &Value) -> Result<()> {
     if let Some(v) = servers(p, "primaries", MAX_PRIMARIES)? {
         z.primaries = v;
     }
+    if let Some(v) = list::<IpNet>(p, "allow_update", MAX_ALLOW_TRANSFER, "a prefix")? {
+        z.allow_update = v.into_iter().map(|n| n.trunc()).collect();
+    }
+    if let Some(v) = list::<String>(p, "update_keys", 8, "a key name")? {
+        z.update_keys = v.iter().map(|k| normalize_host(k)).collect();
+    }
     if let Some(v) = opt_bool(p, "dnssec")? {
         z.dnssec = v;
     }
@@ -286,7 +310,7 @@ fn apply_zone(z: &mut Zone, p: &Value) -> Result<()> {
         z.comment = v;
     }
     if let Some(why) = z.problem() {
-        let key = ["name", "primary_ns", "admin", "retry_secs", "expire_secs", "minimum_secs", "notify", "primaries", "allow_transfer", "signature_validity_secs", "dnssec"]
+        let key = ["name", "primary_ns", "admin", "retry_secs", "expire_secs", "minimum_secs", "notify", "primaries", "allow_transfer", "signature_validity_secs", "dnssec", "allow_update", "update_keys"]
             .into_iter()
             .find(|k| why.starts_with(k))
             .unwrap_or("type");
@@ -307,16 +331,22 @@ fn commit_zones(s: &mut Session, dz: DnsZones, key: &str) -> Result<()> {
 
 /// The next serial of primary zone `name` (in `dz`): after the running
 /// one, so one transaction's changes share it (RFC 1982: always larger).
-fn bump(s: &Session, dz: &mut DnsZones, name: &str) -> Option<u32> {
+fn bump(s: &mut Session, dz: &mut DnsZones, name: &str) -> Option<u32> {
     // The daemon's clock (`Session::tick`) when the HAL has none (lab).
     let now = s.now().unwrap_or(0);
+    // The serial served after a dynamic update may be ahead of the
+    // config's (G4.1c-3): the next one passes it too.
+    let dynamic = s.dns_dynamic_serial(name);
     let running = s
         .store()
         .running()
         .ip
         .dns_zones
         .zone(name)
-        .map(|z| z.serial);
+        .map(|z| match dynamic {
+            Some(d) if serial_gt(d, z.serial) => d,
+            _ => z.serial,
+        });
     let z = dz.zones.iter_mut().find(|z| z.name == name)?;
     if z.ztype != ZoneType::Primary {
         return None;
@@ -492,6 +522,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn file_get(s: &mut Session, p: &Value) -> Result<Value> {
     let i = zone_index(s, p, "zone")?;
+    let (_, dyn_state) = s.dns_dynamic();
     let dz = zones(s);
     let Some(z) = dz.zones.get(i) else {
         return Err(EngineError::bad("zone", "no such zone"));
@@ -499,7 +530,10 @@ fn file_get(s: &mut Session, p: &Value) -> Result<Value> {
     let text = match z.ztype {
         ZoneType::Primary => {
             let recs: Vec<&ZoneRecord> = dz.records_of(&z.name).collect();
-            corerouter_proto_dns::zone::primary(z, &recs)
+            let dynamic: Vec<&ZoneRecord> =
+                dyn_state.records_of(&z.name).map(|d| &d.record).collect();
+            let serial = dyn_state.serials.get(&z.name).copied();
+            corerouter_proto_dns::zone::served(z, &recs, &dynamic, serial)
                 .map(|d| d.to_file())
                 .ok_or_else(|| EngineError::bad("zone", "the zone cannot be built"))?
         }
@@ -788,24 +822,65 @@ fn record_remove(s: &mut Session, p: &Value) -> Result<Value> {
 fn record_print(s: &mut Session, p: &Value) -> Result<Value> {
     let zone = opt_str(p, "zone")?.map(normalize_host);
     let name = opt_str(p, "name")?.map(|n| n.trim().to_ascii_lowercase());
+    let (_, dynamic) = s.dns_dynamic();
     let dz = zones(s);
-    let rows: Vec<Value> = dz
+    let wanted = |r: &ZoneRecord| {
+        zone.as_ref().is_none_or(|z| r.zone == *z)
+            && name.as_ref().is_none_or(|n| r.name.contains(n.as_str()))
+    };
+    let row = |r: &ZoneRecord, flags: &str| -> Option<Value> {
+        let z = dz.zone(&r.zone)?;
+        let mut v = serde_json::to_value(r).ok()?;
+        let o = v.as_object_mut()?;
+        o.insert("fqdn".into(), json!(z.owner(&r.name)));
+        o.insert("ttl".into(), json!(r.ttl_secs.unwrap_or(z.ttl_secs)));
+        o.insert("data".into(), json!(r.data()));
+        o.insert("flags".into(), json!(flags));
+        Some(v)
+    };
+    let mut rows: Vec<Value> = dz
         .records
         .iter()
-        .filter(|r| zone.as_ref().is_none_or(|z| r.zone == *z))
-        .filter(|r| name.as_ref().is_none_or(|n| r.name.contains(n.as_str())))
-        .filter_map(|r| {
-            let z = dz.zone(&r.zone)?;
-            let mut v = serde_json::to_value(r).ok()?;
-            let o = v.as_object_mut()?;
-            o.insert("fqdn".into(), json!(z.owner(&r.name)));
-            o.insert("ttl".into(), json!(r.ttl_secs.unwrap_or(z.ttl_secs)));
-            o.insert("data".into(), json!(r.data()));
-            o.insert("flags".into(), json!(if r.disabled { "X" } else { "" }));
-            Some(v)
-        })
+        .filter(|r| wanted(r))
+        .filter_map(|r| row(r, if r.disabled { "X" } else { "" }))
         .collect();
+    // Dynamic records (G4.1c-3): `D`, like RouterOS's dynamic entries;
+    // their ids are of their own space (`ip.dns.zone.dynamic.remove`).
+    rows.extend(dynamic.records.iter().filter(|d| wanted(&d.record)).filter_map(|d| {
+        let mut v = row(&d.record, "D")?;
+        let o = v.as_object_mut()?;
+        o.insert("dynamic".into(), json!(true));
+        o.insert("source".into(), json!(d.source));
+        if let Some(e) = d.expires_unix {
+            o.insert("expires_unix".into(), json!(e));
+        }
+        Some(v)
+    }));
     Ok(Value::Array(rows))
+}
+
+fn dynamic_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    let id: ItemId = req_parse(p, "id")?;
+    let now = s.now().unwrap_or(0);
+    let n = s
+        .dns_dynamic_remove(|d| d.record.id == id, now)
+        .map_err(EngineError::Internal)?;
+    if n == 0 {
+        return Err(EngineError::bad("id", format!("no dynamic record {id}")));
+    }
+    Ok(json!({"id": id}))
+}
+
+fn dynamic_flush(s: &mut Session, p: &Value) -> Result<Value> {
+    let i = zone_index(s, p, "zone")?;
+    let Some(name) = zones(s).zones.get(i).map(|z| z.name.clone()) else {
+        return Err(EngineError::bad("zone", "no such zone"));
+    };
+    let now = s.now().unwrap_or(0);
+    let n = s
+        .dns_dynamic_remove(|d| d.record.zone == name, now)
+        .map_err(EngineError::Internal)?;
+    Ok(json!({"zone": name, "removed": n}))
 }
 
 #[cfg(test)]

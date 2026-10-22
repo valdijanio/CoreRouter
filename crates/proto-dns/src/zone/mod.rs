@@ -17,6 +17,7 @@
 
 pub mod dnssec;
 pub mod file;
+pub mod update;
 pub mod xfr;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -24,6 +25,7 @@ use std::net::IpAddr;
 use std::sync::{Arc, Mutex, RwLock};
 
 use corerouter_model::Config;
+use corerouter_model::dns_dynamic::DynamicState;
 use corerouter_model::dns_zone::{RecordType as ZType, Zone, ZoneRecord, ZoneType};
 use hickory_proto::rr::rdata::{A, AAAA, CNAME, MX, NS, PTR, SOA, SRV, TXT};
 use hickory_proto::rr::{DNSClass, Name, RData, Record, RecordType};
@@ -462,6 +464,23 @@ pub fn primary(z: &Zone, records: &[&ZoneRecord]) -> Option<ZoneData> {
     ZoneData::new(soa, recs).ok()
 }
 
+/// Primary zone `z` as served: its configured records and its dynamic
+/// ones (G4.1c-3), with the serial a dynamic change moved past the
+/// config's.
+pub fn served(
+    z: &Zone,
+    records: &[&ZoneRecord],
+    dynamic: &[&ZoneRecord],
+    serial: Option<u32>,
+) -> Option<ZoneData> {
+    let mut z = z.clone();
+    if let Some(s) = serial.filter(|s| corerouter_model::dns_zone::serial_gt(*s, z.serial)) {
+        z.serial = s;
+    }
+    let all: Vec<&ZoneRecord> = records.iter().chain(dynamic).copied().collect();
+    primary(&z, &all)
+}
+
 /// What the zone config says beyond the data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ZoneConf {
@@ -473,6 +492,9 @@ pub struct ZoneConf {
     pub refresh_secs: u32,
     pub retry_secs: u32,
     pub expire_secs: u32,
+    /// RFC 2136 UPDATE (G4.1c-3): the TSIG keys that may, and from where.
+    pub update_keys: Vec<String>,
+    pub allow_update: Vec<IpNet>,
     /// Signed (G4.1c-2): the signed version is served once the daemon made
     /// it; until then the unsigned one.
     pub dnssec: bool,
@@ -490,6 +512,8 @@ impl ZoneConf {
             refresh_secs: z.refresh_secs,
             retry_secs: z.retry_secs,
             expire_secs: z.expire_secs,
+            update_keys: z.update_keys.clone(),
+            allow_update: z.allow_update.clone(),
             dnssec: z.dnssec,
             signature_validity_secs: z.signature_validity_secs,
         }
@@ -510,14 +534,19 @@ pub struct Zones {
 }
 
 impl Zones {
-    pub fn build(cfg: &Config) -> Self {
+    /// The zones of `cfg`, the primaries with their dynamic records
+    /// (G4.1c-3).
+    pub fn build(cfg: &Config, dynamic: &DynamicState) -> Self {
         let mut out = Self::default();
         let dz = &cfg.ip.dns_zones;
         for z in dz.zones.iter().filter(|z| !z.disabled) {
             out.conf.insert(z.name.clone(), ZoneConf::of(z));
             if z.ztype == ZoneType::Primary {
                 let recs: Vec<&ZoneRecord> = dz.records_of(&z.name).collect();
-                if let Some(data) = primary(z, &recs) {
+                let dynamic_recs: Vec<&ZoneRecord> =
+                    dynamic.records_of(&z.name).map(|d| &d.record).collect();
+                let serial = dynamic.serials.get(&z.name).copied();
+                if let Some(data) = served(z, &recs, &dynamic_recs, serial) {
                     out.primaries.insert(z.name.clone(), Arc::new(data));
                 }
             }
@@ -591,11 +620,20 @@ pub struct Changed {
     pub soa: Record,
 }
 
+/// What a [`Zones`] was built from: the config generation and the dynamic
+/// records' version.
+type BuiltFrom = (u64, u64);
+
 /// The zone state of a [`Forwarder`] (`f.state::<Runtime>()`).
 #[derive(Default)]
 pub struct Runtime {
-    /// The zones of the config generation they were built from.
-    current: RwLock<Option<(u64, Arc<Zones>)>>,
+    /// The zones of the config generation and dynamic version they were
+    /// built from.
+    current: RwLock<Option<(BuiltFrom, Arc<Zones>)>>,
+    /// The dynamic records (G4.1c-3), with the engine's version.
+    dynamic: RwLock<(u64, Arc<DynamicState>)>,
+    /// Who answers RFC 2136 UPDATE (the daemon's zone service).
+    updater: RwLock<Option<Arc<Updater>>>,
     secondaries: RwLock<HashMap<String, Arc<ZoneData>>>,
     /// Signed versions of the primaries with `dnssec` (G4.1c-2).
     signed: RwLock<HashMap<String, Arc<ZoneData>>>,
@@ -646,26 +684,29 @@ fn runtime(f: &Forwarder) -> Arc<Runtime> {
     f.state::<Runtime>()
 }
 
-/// The zones of `cfg`, rebuilt when the config changed; a rebuild records
-/// what changed in each primary (journal, NOTIFY).
+/// The zones of `cfg`, rebuilt when the config or the dynamic records
+/// changed; a rebuild records what changed in each primary (journal,
+/// NOTIFY).
 pub fn zones(f: &Forwarder, cfg: &ServerConfig) -> Arc<Zones> {
     let rt = runtime(f);
-    if let Some((generation, z)) = rt
+    let (dyn_version, dynamic) = rt.dynamic.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let key = (cfg.generation, dyn_version);
+    if let Some((k, z)) = rt
         .current
         .read()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        && *generation == cfg.generation
+        && *k == key
     {
         return z.clone();
     }
     let mut cur = rt.current.write().unwrap_or_else(|e| e.into_inner());
-    if let Some((generation, z)) = cur.as_ref()
-        && *generation == cfg.generation
+    if let Some((k, z)) = cur.as_ref()
+        && *k == key
     {
         return z.clone();
     }
-    let new = Arc::new(Zones::build(&cfg.config));
+    let new = Arc::new(Zones::build(&cfg.config, &dynamic));
     let old = cur.as_ref().map(|(_, z)| z.clone());
     for (name, data) in &new.primaries {
         // A signed zone's history and NOTIFY follow its signed versions
@@ -694,8 +735,47 @@ pub fn zones(f: &Forwarder, cfg: &ServerConfig) -> Arc<Zones> {
                 });
         }
     }
-    *cur = Some((cfg.generation, new.clone()));
+    *cur = Some((key, new.clone()));
     new
+}
+
+/// What handles an RFC 2136 UPDATE: the bytes and the client in, the reply
+/// out (the daemon applies the change in the engine, then answers).
+pub type Updater = dyn Fn(&[u8], IpAddr) -> Option<Vec<u8>> + Send + Sync;
+
+/// The engine's dynamic records (G4.1c-3), copied in by the daemon when
+/// their version moves.
+pub fn set_dynamic(f: &Forwarder, version: u64, state: Arc<DynamicState>) {
+    let rt = runtime(f);
+    let mut d = rt.dynamic.write().unwrap_or_else(|e| e.into_inner());
+    if d.0 != version {
+        *d = (version, state);
+    }
+}
+
+/// The version of the dynamic records the forwarder has.
+pub fn dynamic_version(f: &Forwarder) -> u64 {
+    runtime(f)
+        .dynamic
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .0
+}
+
+/// Registers who answers UPDATE (without one: NOTIMP).
+pub fn set_updater(f: &Forwarder, u: Arc<Updater>) {
+    *runtime(f)
+        .updater
+        .write()
+        .unwrap_or_else(|e| e.into_inner()) = Some(u);
+}
+
+pub(crate) fn updater(f: &Forwarder) -> Option<Arc<Updater>> {
+    runtime(f)
+        .updater
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Brings the zones up to the forwarder's config and returns the primaries
@@ -842,7 +922,25 @@ pub fn validate(cfg: &Config) -> Vec<corerouter_model::Issue> {
         out.push(corerouter_model::Issue::new("ip.dns.zone", p));
         return out;
     }
+    if let Some(p) = cfg.ip.dns_tsig.problem() {
+        out.push(corerouter_model::Issue::new("ip.dns.tsig-key", p));
+    }
     let dz = &cfg.ip.dns_zones;
+    for z in &dz.zones {
+        if let Some(k) = z
+            .update_keys
+            .iter()
+            .find(|k| cfg.ip.dns_tsig.get(k).is_none())
+        {
+            out.push(corerouter_model::Issue::new(
+                "ip.dns.zone",
+                format!(
+                    "zone {}: update_keys: no TSIG key {k} (ip.dns.tsig-key.add)",
+                    z.name
+                ),
+            ));
+        }
+    }
     for z in dz.zones.iter().filter(|z| z.ztype == ZoneType::Primary) {
         if soa_of(z).is_none() {
             out.push(corerouter_model::Issue::new(
