@@ -4,9 +4,11 @@ Cada PR grava **um arquivo só seu** aqui, `docs/changes/<id>.md` (ou `<id>-<slu
 mesma gap tem mais de um PR), em vez de editar `docs/log.md`, `docs/gaps-history.md` ou a coluna
 Status de `docs/gaps.md`. Um arquivo que só um PR toca nunca conflita.
 
-Quem consolida é a fila de entrada (`scripts/land.sh`, rodada pela sessão principal): logo antes
-do merge, `cargo xtask docs fold` aplica o arquivo nos documentos e o apaga, um PR por vez, então
-o fold também não conflita. O `cargo xtask ci` só confere o formato (passo `docs`).
+Quem consolida é a fila de entrada (`scripts/land.sh`, rodada pela sessão principal), de tempos
+em tempos (com `--fold` ou 10 arquivos pendentes, como o towncrier/changesets no release):
+`cargo xtask docs fold` aplica os arquivos nos documentos e os apaga, num PR só de docs. Até lá,
+`cargo xtask docs pending` mostra os status de gap ainda não consolidados. O `cargo xtask ci`
+confere o formato (passo `docs`).
 
 ## Formato
 

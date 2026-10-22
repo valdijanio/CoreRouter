@@ -361,13 +361,44 @@ fn dry_fold(root: &Path, date: &str) -> Result<(Vec<String>, Docs), String> {
     Ok((names, fold(date, &changes, &docs)?))
 }
 
-/// `cargo xtask docs [fold [--date AAAA-MM-DD]]`.
+/// `cargo xtask docs pending`: what the change files not folded yet say. The
+/// merge queue folds periodically (like towncrier at release time), so
+/// `docs/gaps.md` can lag: read this too before picking a gap.
+fn pending(root: &Path) -> Outcome {
+    let loaded = match load(root) {
+        Ok(l) => l,
+        Err(e) => return Outcome::Fail(e),
+    };
+    if loaded.is_empty() {
+        println!("nothing pending in {DIR}: docs/gaps.md is current");
+        return Outcome::Ok;
+    }
+    println!("{} change file(s) not folded yet ({DIR}):", loaded.len());
+    for (name, c) in &loaded {
+        let first = c.log.first().map_or("", String::as_str);
+        println!("- {name}: {}", first.chars().take(100).collect::<String>());
+        if let Some(st) = &c.status {
+            println!("    status {}: {st}", c.id);
+        }
+        for row in &c.rows {
+            println!("    new gap {}", row.chars().take(100).collect::<String>());
+        }
+    }
+    Outcome::Ok
+}
+
+/// `cargo xtask docs [pending | fold [--date AAAA-MM-DD]]`.
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let date = match args {
         [] => return check(root),
+        [p] if p == "pending" => return pending(root),
         [f] if f == "fold" => today(),
         [f, d, date] if f == "fold" && d == "--date" && date.len() == 10 => date.clone(),
-        _ => return Outcome::Fail("usage: cargo xtask docs [fold [--date AAAA-MM-DD]]".into()),
+        _ => {
+            return Outcome::Fail(
+                "usage: cargo xtask docs [pending | fold [--date AAAA-MM-DD]]".into(),
+            );
+        }
     };
     let (names, docs) = match dry_fold(root, &date) {
         Ok(v) => v,
