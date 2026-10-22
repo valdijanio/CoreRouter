@@ -16,12 +16,13 @@
 
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
+use corerouter_model::metrics::{MetricsService, MetricsState, MetricsStatus};
 use serde_json::{Value, json};
 
 /// The exposition format's media type (prometheus.io, "Exposition formats").
@@ -382,21 +383,21 @@ fn scrape(session: &Shared) -> String {
 }
 
 
-/// `--metrics [<addr>:]<port>` (G4.4).
+/// `--metrics [<addr>:]<port>` (G4.4) and `ip.service.metrics.*` (G4.4c).
 pub(crate) const SERVICE: super::Service = super::Service {
     name: "metrics",
     flags: &[super::Flag {
         name: "--metrics",
         value: Some("<a:port>"),
-        help: "Prometheus /metrics (interface and engine counters) over plain HTTP,\nno login: a bare port is 127.0.0.1:<port>; e.g. 9100 or [::]:9100",
+        help: "Prometheus /metrics (interface and engine counters) over plain HTTP,\nno login: a bare port is 127.0.0.1:<port>; e.g. 9100 or [::]:9100\n(outside the config; ip.service.metrics.set is the configured one)",
     }],
     start,
 };
 
 /// `--metrics`: a bare port is loopback only; `ADDR:PORT` is explicit.
-fn metrics_addr(v: &str) -> Result<std::net::SocketAddr, String> {
+fn metrics_addr(v: &str) -> Result<SocketAddr, String> {
     if let Ok(port) = v.parse::<u16>() {
-        return Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)));
+        return Ok(SocketAddr::from(([127, 0, 0, 1], port)));
     }
     v.parse().map_err(|_| {
         format!(
@@ -406,25 +407,151 @@ fn metrics_addr(v: &str) -> Result<std::net::SocketAddr, String> {
     })
 }
 
-/// Serve `/metrics`, if asked for.
+/// Serve `/metrics` on `--metrics`, if asked for, and on what the config says.
 fn start(ctx: &super::Ctx) -> Result<(), String> {
+    if let Err(e) = spawn_service(ctx.session.clone(), ctx.shutdown.clone()) {
+        log::error!("metrics service is off: cannot start its thread: {e}");
+    }
     let Some(v) = ctx.flag("--metrics") else {
         return Ok(());
     };
     let addr = metrics_addr(v)?;
-    let listener = std::net::TcpListener::bind(addr)
-        .map_err(|e| format!("cannot open --metrics {addr}: {e}"))?;
+    let listener =
+        TcpListener::bind(addr).map_err(|e| format!("cannot open --metrics {addr}: {e}"))?;
     spawn(listener, ctx.session.clone(), ctx.shutdown.clone())
         .map_err(|e| format!("cannot start the metrics thread: {e}"))?;
+    log_open(addr, false);
+    Ok(())
+}
+
+fn log_open(addr: SocketAddr, restricted: bool) {
     if addr.ip().is_loopback() {
         log::info!("Prometheus metrics on http://{addr}/metrics (loopback only)");
+    } else if restricted {
+        log::info!("Prometheus metrics on http://{addr}/metrics (available-from applies)");
     } else {
         log::warn!(
             "Prometheus metrics on http://{addr}/metrics: plain HTTP without login, \
-             reachable from the network (filter the port in the firewall)"
+             reachable from the network (set available_from or filter the port)"
         );
     }
-    Ok(())
+}
+
+/// How often the configured service looks at the running config, and the
+/// longest a scrape waits to be accepted.
+const TICK: Duration = Duration::from_secs(1);
+const ACCEPT_POLL: Duration = Duration::from_millis(20);
+
+/// The service of `ip.service.metrics.*` (G4.4c): one thread that
+/// follows the running config. A change closes the listener and opens the
+/// new one (a failed bind is retried every tick and reported once in the
+/// log and in `last_error`); a client outside `available_from` is
+/// disconnected without an answer, as RouterOS `/ip service` does.
+pub fn spawn_service(
+    session: Shared,
+    shutdown: Shutdown,
+) -> std::io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("metrics-service".into())
+        .spawn(move || run_service(&session, &shutdown))
+}
+
+fn run_service(session: &Shared, shutdown: &Shutdown) {
+    let mut cfg: Option<MetricsService> = None;
+    let mut listener: Option<TcpListener> = None;
+    let mut status = MetricsStatus::default();
+    while !shutdown.is_closed() {
+        let now = lock(session).store().running().system.metrics.clone();
+        let changed = cfg.as_ref() != Some(&now);
+        if changed || (now.enabled && listener.is_none()) {
+            if changed {
+                listener = None;
+                status = MetricsStatus::default();
+            }
+            if now.enabled {
+                let addr = SocketAddr::new(now.address, now.port);
+                match open(addr) {
+                    Ok(l) => {
+                        let at = l.local_addr().unwrap_or(addr);
+                        log_open(at, !now.available_from.is_empty());
+                        status.status = MetricsState::Listening;
+                        status.listening = Some(at.to_string());
+                        status.last_error = None;
+                        listener = Some(l);
+                    }
+                    Err(e) => {
+                        let e = format!("cannot listen on {addr}: {e}");
+                        if status.last_error.as_ref() != Some(&e) {
+                            log::error!("metrics service: {e}");
+                        }
+                        status.status = MetricsState::Error;
+                        status.last_error = Some(e);
+                    }
+                }
+            }
+            cfg = Some(now.clone());
+            publish(session, &status);
+        }
+        match &listener {
+            Some(l) => {
+                if accept_for(l, &now, session, &mut status, TICK) {
+                    publish(session, &status);
+                }
+            }
+            None => thread::sleep(TICK),
+        }
+    }
+}
+
+fn open(addr: SocketAddr) -> std::io::Result<TcpListener> {
+    let l = TcpListener::bind(addr)?;
+    // Non-blocking accept, so the thread sees a config change within a tick.
+    l.set_nonblocking(true)?;
+    Ok(l)
+}
+
+fn publish(session: &Shared, status: &MetricsStatus) {
+    if let Some(st) = lock(session).ext_mut::<MetricsStatus>() {
+        *st = status.clone();
+    }
+}
+
+/// Accept and answer connections for `period`; true if any came.
+fn accept_for(
+    l: &TcpListener,
+    cfg: &MetricsService,
+    session: &Shared,
+    status: &mut MetricsStatus,
+    period: Duration,
+) -> bool {
+    let until = Instant::now() + period;
+    let mut any = false;
+    while Instant::now() < until {
+        match l.accept() {
+            Ok((stream, peer)) => {
+                any = true;
+                if !cfg.allows(peer.ip()) {
+                    status.refused = status.refused.saturating_add(1);
+                    log::debug!("metrics: {peer} is not in available_from; disconnected");
+                    continue;
+                }
+                status.requests = status.requests.saturating_add(1);
+                // The accepted socket may inherit non-blocking mode.
+                let served = stream
+                    .set_nonblocking(false)
+                    .and_then(|()| serve(stream, session));
+                if let Err(e) = served {
+                    log::debug!("metrics: connection from {peer} dropped: {e}");
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(ACCEPT_POLL),
+            Err(e) => {
+                log::debug!("metrics: accept failed: {e}");
+                thread::sleep(ACCEPT_POLL);
+            }
+        }
+    }
+    any
 }
 
 #[cfg(test)]
@@ -551,5 +678,109 @@ mod tests {
         assert_eq!(get("GET /metrics SPDY/3\r\n\r\n"), Route::Bad);
         assert_eq!(route(&[0xff, 0xfe, b' ', b'/']), Route::Bad);
         assert_eq!(route(b""), Route::Bad);
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn wait_status(session: &Shared, want: MetricsState, listening: Option<&str>) -> MetricsStatus {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let st = lock(session)
+                .ext::<MetricsStatus>()
+                .cloned()
+                .unwrap_or_default();
+            let ok = st.status == want
+                && listening.is_none_or(|l| st.listening.as_deref() == Some(l));
+            if ok || Instant::now() > deadline {
+                return st;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The whole answer to `GET /metrics`, or what came before the server
+    /// closed the connection.
+    fn get_metrics(port: u16) -> std::io::Result<String> {
+        let mut c = TcpStream::connect(("127.0.0.1", port))?;
+        c.set_read_timeout(Some(Duration::from_secs(5)))?;
+        c.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")?;
+        let mut out = String::new();
+        c.read_to_string(&mut out)?;
+        Ok(out)
+    }
+
+    /// G4.4c: a commit opens, moves and closes the listener; nothing restarts.
+    #[test]
+    fn the_service_follows_the_running_config() {
+        let session = corerouter_engine::shared(corerouter_engine::Session::virtual_lab());
+        let shutdown = Shutdown::default();
+        spawn_service(session.clone(), shutdown.clone()).unwrap();
+        let run = |p: Value| {
+            lock(&session)
+                .execute("ip.service.metrics.set", &p)
+                .unwrap();
+        };
+
+        let a = free_port();
+        run(json!({"enabled": true, "port": a}));
+        let st = wait_status(&session, MetricsState::Listening, Some(&format!("127.0.0.1:{a}")));
+        assert_eq!(st.status, MetricsState::Listening, "{st:?}");
+        let body = get_metrics(a).unwrap();
+        assert!(body.starts_with("HTTP/1.1 200 OK"), "{body}");
+        assert!(body.contains("corerouter_interface_up{interface=\"ether1\"}"));
+        let g = lock(&session)
+            .execute("ip.service.metrics.get", &json!({}))
+            .unwrap();
+        assert_eq!(g["status"], "listening");
+
+        // Move it: the old port closes, the new one answers.
+        let b = free_port();
+        run(json!({"port": b}));
+        wait_status(&session, MetricsState::Listening, Some(&format!("127.0.0.1:{b}")));
+        assert!(get_metrics(b).unwrap().starts_with("HTTP/1.1 200 OK"));
+        assert!(get_metrics(a).is_err(), "port {a} still open");
+
+        // Not allowed: disconnected without an answer, and counted.
+        run(json!({"available_from": ["192.0.2.0/24"]}));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while lock(&session).ext::<MetricsStatus>().is_some_and(|s| s.refused == 0)
+            && Instant::now() < deadline
+        {
+            // The first tries may still reach the listener of the old config.
+            let _ = get_metrics(b);
+        }
+        assert_eq!(get_metrics(b).unwrap_or_default(), "");
+        assert!(lock(&session).ext::<MetricsStatus>().unwrap().refused >= 1);
+
+        run(json!({"enabled": false}));
+        wait_status(&session, MetricsState::Stopped, None);
+        thread::sleep(Duration::from_millis(100));
+        assert!(get_metrics(b).is_err(), "disabled but port {b} open");
+        shutdown.close();
+    }
+
+    #[test]
+    fn a_port_in_use_is_an_error_until_it_frees() {
+        let session = corerouter_engine::shared(corerouter_engine::Session::virtual_lab());
+        let shutdown = Shutdown::default();
+        let taken = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = taken.local_addr().unwrap().port();
+        spawn_service(session.clone(), shutdown.clone()).unwrap();
+        lock(&session)
+            .execute("ip.service.metrics.set", &json!({"enabled": true, "port": port}))
+            .unwrap();
+        let st = wait_status(&session, MetricsState::Error, None);
+        assert_eq!(st.status, MetricsState::Error, "{st:?}");
+        assert!(st.last_error.unwrap().contains(&port.to_string()));
+        drop(taken);
+        let st = wait_status(&session, MetricsState::Listening, None);
+        assert_eq!(st.status, MetricsState::Listening, "{st:?}");
+        shutdown.close();
     }
 }

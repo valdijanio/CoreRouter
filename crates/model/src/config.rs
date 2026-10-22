@@ -13,6 +13,7 @@ use crate::firewall::Firewall;
 use crate::interface_list::InterfaceLists;
 use crate::ipv6::Ipv6;
 use crate::logging::Logging;
+use crate::metrics::MetricsService;
 use crate::neighbor::NeighborDiscovery;
 use crate::ntp::NtpClient;
 use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
@@ -40,6 +41,9 @@ pub struct System {
     /// `/system logging` (G4.6): rules and remote syslog actions.
     #[serde(skip_serializing_if = "Logging::is_default")]
     pub logging: Logging,
+    /// Prometheus `/metrics` as a service (G4.4c).
+    #[serde(skip_serializing_if = "MetricsService::is_default")]
+    pub metrics: MetricsService,
 }
 
 impl Default for System {
@@ -48,6 +52,7 @@ impl Default for System {
             identity: "CoreRouter".into(),
             ntp_client: NtpClient::default(),
             logging: Logging::default(),
+            metrics: MetricsService::default(),
         }
     }
 }
