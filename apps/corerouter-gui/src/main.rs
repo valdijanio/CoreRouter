@@ -18,13 +18,41 @@ mod remote;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
+/// Storage key of the window preferences (theme, inline comments). eframe
+/// keeps them in a file under the user's data dir, or in `localStorage`.
+const PREFS_KEY: &str = "corerouter.prefs";
+
 struct GuiApp {
     ui: CoreRouterUi,
+}
+
+impl GuiApp {
+    fn new(mut ui: CoreRouterUi, cc: &eframe::CreationContext<'_>) -> Self {
+        if let Some(prefs) = cc.storage.and_then(|s| s.get_string(PREFS_KEY)) {
+            ui.apply_prefs(&prefs);
+        }
+        Self { ui }
+    }
 }
 
 impl eframe::App for GuiApp {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
         self.ui.ui(ui);
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        storage.set_string(PREFS_KEY, self.ui.prefs());
+    }
+
+    /// Only our own preferences are kept, not egui's window layout.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    /// Saved on exit too; a short interval also covers a killed process or
+    /// a closed browser tab.
+    fn auto_save_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(2)
     }
 }
 
@@ -59,7 +87,7 @@ fn main() {
             .start(
                 canvas,
                 eframe::WebOptions::default(),
-                Box::new(move |_cc| Ok(Box::new(GuiApp { ui }))),
+                Box::new(move |cc| Ok(Box::new(GuiApp::new(ui, cc)))),
             )
             .await;
         if let Err(e) = started {

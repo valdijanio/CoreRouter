@@ -79,6 +79,39 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   sozinha; pela GUI web servida com `--web-root`, ether3 reabilitada (revisão 3); página de
   outra origem recusada (403) até `--ws-origin`.
 
+- 2026-10-21 — G1.10 + G1.11: comentários inline e tema claro/escuro (só `crates/ui` e
+  `apps/corerouter-gui`; nenhum comando novo). A tabela reutilizável ganhou a coluna
+  `table::comment()` e o item marcável "Inline Comments" nos menus de contexto: ligado, a coluna
+  some e o comentário vira uma faixa acima do item (como o "Comment Type: header" do WinBox v4,
+  conferido em manual.mikrotik.com, e a linha `;;;` do terminal), com fundo sutil azul, barra e
+  ícone de balão desenhados e texto em itálico; a faixa e a linha formam um item só (clique,
+  Shift/Ctrl, menu), duplo clique na faixa abre o diálogo Comment, e o Find continua casando o
+  comentário. Barra superior: seletor Sistema/Claro/Escuro à direita (função própria, `top_bar`
+  intocado). Preferências da janela (`CoreRouterUi::prefs`/`apply_prefs`, JSON) salvas pelo
+  eframe com a feature `persistence` (arquivo em `~/.local/share/corerouter-gui` via
+  `app_id`, para não cair na pasta de config de um daemon; `localStorage` na web); entrada
+  hostil ignorada. Ícones da barra com tons próprios para o tema claro. 4 testes novos (2
+  headless dirigidos por eventos, 2 de preferências). Teste manual (**medido**): daemon com
+  `--config-dir` + GUI `--connect`, comentários em ether2/ether5, Inline Comments e tema
+  claro ligados pela GUI real (xdotool), screenshots nos dois temas conferidos; GUI fechada e
+  reaberta voltou em tema claro com os comentários inline.
+
+- 2026-10-21 — G5.2 (Parte 1): LLDP e escuta passiva de MNDP. `crates/proto-lldp` (L2): codec
+  puro de LLDPDU do IEEE 802.1AB (Chassis ID, Port ID, TTL, End, Port/System Description,
+  System Name, Capabilities, Management Address; TLVs desconhecidos e de organização guardados
+  crus), validação de recepção do 9.2.7.7. `crates/proto-mndp` (L2): **só decodificação** do
+  anúncio MikroTik (UDP 5678), escrito a partir do dissector do Wireshark e do manual da
+  MikroTik (fontes no topo do crate); o CoreRouter nunca anuncia MNDP. `hal-linux::l2`:
+  `LldpIo` (socket `AF_PACKET` por porta, EtherType 0x88CC para 01:80:C2:00:00:0E, envio a cada
+  30 s via `due`/`send`, recepção não bloqueante, `allmulticast` ligado e restaurado por
+  rtnetlink) e `MndpListener` (IPv4 + IPv6, `IP_PKTINFO` para a interface de chegada), sem
+  `unsafe` (`socket2` + `sockaddr_ll` vindo do `getifaddrs` do `nix`). Testes: proptest nos
+  dois codecs (1024 casos por propriedade) e `tests/netns_l2.rs` em namespace sem root (LLDP
+  entre as pontas de um veth nos dois sentidos, MNDP com a interface certa); `cargo xtask netns`
+  agora roda cada binário de teste no seu próprio namespace; os dois codecs entram no passo
+  wasm. Integração com a tabela de vizinhos do G5.1 (`ip.neighbor.list` com protocol=lldp/mndp)
+  fica para um segundo PR, depois do G5.1. Detalhes em `docs/lldp-mndp.md`.
+
 - 2026-10-22 — G1.4: Safe Mode com a semântica do RouterOS (help.mikrotik.com, "Configuration
   Management"). `config.safe-mode.enter {timeout_secs?}` (10..=86400; o dono de novo re-arma o
   prazo), `exit {force?}` (confirma e salva), `cancel {force?}` (desfaz); `safe_mode` no resumo
@@ -102,4 +135,6 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.2.
 - 2026-10-21 — log do G1.9.
 - 2026-10-21 — log do G0.4.
+- 2026-10-21 — log do G1.10 + G1.11.
+- 2026-10-21 — log do G5.2 (Parte 1).
 - 2026-10-22 — log do G1.4.

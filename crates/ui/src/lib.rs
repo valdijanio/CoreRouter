@@ -7,6 +7,7 @@
 
 pub mod backend;
 mod interfaces;
+mod prefs;
 mod table;
 mod windows;
 
@@ -78,6 +79,29 @@ struct Tables {
     addresses: table::TableState,
 }
 
+impl Tables {
+    /// Every table with the salt it is drawn with (stored preferences name
+    /// tables by salt).
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 2] {
+        [
+            (interfaces::TABLE, &mut self.interfaces),
+            ("addresses", &mut self.addresses),
+        ]
+    }
+
+    /// Salts of the tables showing comments inline.
+    fn inline_comments(&self) -> Vec<&'static str> {
+        [
+            (interfaces::TABLE, &self.interfaces),
+            ("addresses", &self.addresses),
+        ]
+        .into_iter()
+        .filter(|(_, t)| t.inline_comments)
+        .map(|(salt, _)| salt)
+        .collect()
+    }
+}
+
 /// What a reply is for.
 enum Pending {
     Query(Field),
@@ -108,6 +132,8 @@ pub struct CoreRouterUi {
     next_dialog: u64,
     /// Interfaces to open once an `interface.list` at least this new arrives.
     open_after: Vec<(RequestId, String)>,
+    /// Light, dark or the system's (a window preference, see `prefs`).
+    theme: egui::ThemePreference,
 }
 
 impl CoreRouterUi {
@@ -137,6 +163,7 @@ impl CoreRouterUi {
             dialogs: Vec::new(),
             next_dialog: 0,
             open_after: Vec::new(),
+            theme: egui::ThemePreference::System,
         }
     }
 
@@ -389,8 +416,18 @@ impl CoreRouterUi {
             PENDING_REPAINT
         };
         ui.ctx().request_repaint_after(wake);
+        self.sync_theme(ui.ctx());
 
-        egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top-bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.theme_switch(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        self.top_bar(ui);
+                    });
+                });
+            });
+        });
         egui::Panel::bottom("status-bar").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("menu")
             .resizable(false)
@@ -1274,6 +1311,103 @@ mod tests {
         h.click(h.text("Cancel"));
         assert!(!h.has_text("New Loopback Interface"));
         assert!(h.app.log().iter().all(|l| l.ok), "{:?}", h.app.log());
+    }
+
+    #[test]
+    fn inline_comments_draw_a_band_that_belongs_to_the_item() {
+        let mut h = Harness::new();
+        lock(&h.session)
+            .execute(
+                "interface.set",
+                &json!({"name": "ether2", "comment": "uplink to the core"}),
+            )
+            .unwrap();
+        h.app.cache.refreshed_at = None;
+        h.idle();
+        h.idle();
+        // Column mode: header "Comment", text on the row's own line.
+        assert!(h.has_text("Comment"));
+        let (note, name) = (h.text("uplink to the core"), h.text("ether2"));
+        assert!((note.y - name.y).abs() < 4.0, "{note:?} {name:?}");
+
+        // Row menu ▸ Inline Comments: the column goes, the band comes.
+        h.right_click(h.row("ether1"));
+        h.click(h.text("Inline Comments"));
+        assert!(h.app.tables.interfaces.inline_comments);
+        assert!(!h.has_text("Comment"), "column hidden");
+        let (note, name) = (h.text("uplink to the core"), h.text("ether2"));
+        assert!(note.y < name.y - 5.0, "band above: {note:?} {name:?}");
+        assert!(h.app.prefs().contains("interfaces"));
+
+        // A click on the band selects its item …
+        h.click(note);
+        assert_eq!(h.selected(), ["ether2"]);
+        // … Shift extends from it, and arrows step over bands.
+        h.click_with(
+            h.row("ether4"),
+            egui::PointerButton::Primary,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(h.selected(), ["ether2", "ether3", "ether4"]);
+        h.key(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        assert_eq!(h.selected(), ["ether5"]);
+
+        // … double click on the band edits the comment, on the row opens it.
+        let note = h.text("uplink to the core");
+        h.time += 1.0;
+        h.click(note);
+        h.click(note);
+        assert!(h.has_text("Comment for Interface <ether2>"));
+        assert!(!h.has_text("Interface <ether2>"));
+        h.click(h.text("Cancel"));
+
+        // The band's menu acts on the item.
+        h.right_click(h.text("uplink to the core"));
+        assert_eq!(h.selected(), ["ether2"]);
+        h.click(h.text("Disable"));
+        assert_eq!(h.iface("ether2").unwrap()["disabled"], true);
+
+        // Find matches the comment text with the column hidden.
+        h.click(h.text("Find"));
+        h.type_text("CORE");
+        assert!(h.has_text("ether2"));
+        assert!(!h.has_text("ether1"));
+
+        // Empty-space menu turns it off again.
+        h.right_click(h.row("ether2") + egui::vec2(0.0, 80.0));
+        h.click(h.text("Inline Comments"));
+        assert!(!h.app.tables.interfaces.inline_comments);
+        assert!(h.has_text("Comment"));
+    }
+
+    #[test]
+    fn theme_switch_changes_and_remembers_the_theme() {
+        let mut h = Harness::new();
+        let at = |h: &Harness, p| {
+            h.ctx
+                .read_response(prefs::theme_id(p))
+                .map(|r| r.rect.center())
+                .unwrap()
+        };
+        h.click(at(&h, egui::ThemePreference::Light));
+        assert_eq!(h.ctx.theme(), egui::Theme::Light);
+        assert!(!h.ctx.global_style().visuals.dark_mode);
+        assert!(h.app.prefs().contains(r#""theme":"light""#));
+        h.click(at(&h, egui::ThemePreference::Dark));
+        assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+        h.click(at(&h, egui::ThemePreference::System));
+        assert_eq!(
+            h.ctx.options(|o| o.theme_preference),
+            egui::ThemePreference::System
+        );
+
+        // Stored preferences apply on the first frame.
+        let mut g = Harness::new();
+        g.app
+            .apply_prefs(r#"{"theme":"light","inline_comments":["interfaces"]}"#);
+        g.idle();
+        assert_eq!(g.ctx.theme(), egui::Theme::Light);
+        assert!(g.app.tables.interfaces.inline_comments);
     }
 
     #[test]
