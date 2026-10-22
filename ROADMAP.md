@@ -235,6 +235,26 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `tests/netns_l2.rs` (dois daemons linux em namespaces, veth ×2; crdp + lldp com o mesmo
   node id, filtro por protocolo, MNDP sintético, interface sem descoberta não grava, TTL 0
   apaga; ~14 s **medido**); helpers dos testes netns do daemon em `tests/common`.
+- 2026-10-22 — G1.15: teclado nos diálogos e janelas internas, no padrão Windows/macOS/GNOME/WinBox.
+  Um lugar só: `crates/ui/src/dialog.rs` (tipo comum de diálogo: `Status` com erro/pendências,
+  `Footer` com OK/Cancel/Apply + botões extras, `Form` que dá a cada campo de texto um id com o nome
+  do parâmetro do comando) e `Floats::keys` em `float.rs`. Enter = OK (fecha só quando o engine
+  aceita; recusa mantém aberto, mostra o erro e põe o cursor no campo de `parameter '<x>'`),
+  Ctrl+Enter = Apply, Esc = Cancel sem perguntar; com resposta pendente (backend remoto, G0.4) o OK
+  vira "Saving…" e nada reaplica. "•" no título com alterações não salvas — "●" (U+25CF) não existe
+  nas fontes do egui e virava um quadrado (**medido** no screenshot). Listas: Esc limpa o Find, depois
+  a seleção, depois fecha. Roteamento: as teclas vão à janela que tem o foco ou, sem foco, à de cima
+  ainda aberta (o egui mantém janelas fechadas na ordem de camadas; usar `top_layer_id` engolia o Esc
+  logo depois de fechar um diálogo — achado no teste manual); popup/combo aberto no início do frame
+  fica com Esc/Enter; Enter com foco num botão/checkbox é do widget. De quebra, Enter na tabela (G1.9)
+  limpava a seleção antes de abrir as propriedades (o egui transforma Enter num clique do widget com
+  foco, e o fundo da tabela tem o id do foco): o fundo agora só aceita clique de ponteiro. 14 testes
+  novos (11 headless com eventos sintéticos, inclusive backend que segura a resposta e os diálogos
+  de VRF do G1.13; 3 unitários); Esc em camadas também em VRF e Neighbors (G5.1).
+  Teste manual (**medido**): `corerouter-daemon --control --config-dir <tmp>` + `corerouter-gui
+  --connect`, xdotool + `screenshot`: Enter na tabela abre, "•" ao editar, MTU 10 + Enter mostra o erro
+  com o cursor no MTU, Ctrl+Enter aplica 9000 e fica aberto, Esc descarta, Esc em camadas na lista.
+  Esforço do agente ~3 h (**estimado**).
 
 ## Histórico de revisão
 
@@ -251,4 +271,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.14.
 - 2026-10-22 — log do G1.4.
 - 2026-10-22 — log do G5.1.
+- 2026-10-22 — log do G1.15.
 - 2026-10-22 — log do G5.2 (Parte 2).
