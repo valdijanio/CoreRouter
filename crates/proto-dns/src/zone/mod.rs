@@ -15,6 +15,7 @@
 //! are in [`xfr`], zone files in [`file`]. Pure data and messages: the
 //! daemon brings the sockets (`service/dns_zones.rs`).
 
+pub mod dnssec;
 pub mod file;
 pub mod xfr;
 
@@ -167,6 +168,8 @@ pub struct ZoneData {
     /// Delegations: owners of NS records below the apex.
     cuts: HashSet<String>,
     count: usize,
+    /// A signed zone's RRSIGs and NSEC3 chain (G4.1c-2).
+    pub dnssec: Option<Arc<dnssec::Signatures>>,
 }
 
 impl ZoneData {
@@ -190,6 +193,7 @@ impl ZoneData {
             names: HashSet::new(),
             cuts: HashSet::new(),
             count: 0,
+            dnssec: None,
         };
         z.names.insert(z.key.clone());
         if records.len() > MAX_ZONE_RECORDS {
@@ -262,8 +266,23 @@ impl ZoneData {
         self.count == 0
     }
 
-    /// Every record besides the SOA, the apex first, then by owner.
+    /// `key` owns records (an exact match, not a wildcard).
+    pub fn has_owner(&self, key: &str) -> bool {
+        self.sets.contains_key(key)
+    }
+
+    /// Every record besides the SOA, the apex first, then by owner; a
+    /// signed zone's RRSIGs and NSEC3 records at the end.
     pub fn records(&self) -> Vec<&Record> {
+        let mut out = self.data_records();
+        if let Some(s) = &self.dnssec {
+            out.extend(s.records());
+        }
+        out
+    }
+
+    /// The records without the signatures.
+    fn data_records(&self) -> Vec<&Record> {
         let mut owners: Vec<&String> = self.sets.keys().collect();
         owners.sort_by_cached_key(|k| {
             (
@@ -470,6 +489,10 @@ pub struct ZoneConf {
     /// RFC 2136 UPDATE (G4.1c-3): the TSIG keys that may, and from where.
     pub update_keys: Vec<String>,
     pub allow_update: Vec<IpNet>,
+    /// Signed (G4.1c-2): the signed version is served once the daemon made
+    /// it; until then the unsigned one.
+    pub dnssec: bool,
+    pub signature_validity_secs: u32,
 }
 
 impl ZoneConf {
@@ -485,6 +508,8 @@ impl ZoneConf {
             expire_secs: z.expire_secs,
             update_keys: z.update_keys.clone(),
             allow_update: z.allow_update.clone(),
+            dnssec: z.dnssec,
+            signature_validity_secs: z.signature_validity_secs,
         }
     }
 
@@ -600,6 +625,8 @@ pub struct Runtime {
     /// Who answers RFC 2136 UPDATE (the daemon's zone service).
     updater: RwLock<Option<Arc<Updater>>>,
     secondaries: RwLock<HashMap<String, Arc<ZoneData>>>,
+    /// Signed versions of the primaries with `dnssec` (G4.1c-2).
+    signed: RwLock<HashMap<String, Arc<ZoneData>>>,
     journal: Mutex<HashMap<String, VecDeque<Diff>>>,
     changed: Mutex<Vec<Changed>>,
     /// Secondaries a NOTIFY asked to refresh now.
@@ -668,6 +695,11 @@ pub fn zones(f: &Forwarder, cfg: &ServerConfig) -> Arc<Zones> {
     let new = Arc::new(Zones::build(&cfg.config, &dynamic));
     let old = cur.as_ref().map(|(_, z)| z.clone());
     for (name, data) in &new.primaries {
+        // A signed zone's history and NOTIFY follow its signed versions
+        // (`set_signed`).
+        if new.conf.get(name).is_some_and(|c| c.dnssec) {
+            continue;
+        }
         let prev = old.as_ref().and_then(|o| o.primaries.get(name));
         if prev.is_some_and(|p| p.serial == data.serial && **p == **data) {
             continue;
@@ -739,6 +771,9 @@ pub fn find(f: &Forwarder, cfg: &ServerConfig, key: &str) -> Option<Result<Arc<Z
     let zs = zones(f, cfg);
     let conf = zs.zone_for(key)?;
     match conf.ztype {
+        ZoneType::Primary if conf.dnssec => signed(f, &conf.name)
+            .or_else(|| zs.primaries.get(&conf.name).cloned())
+            .map(Ok),
         ZoneType::Primary => zs.primaries.get(&conf.name).cloned().map(Ok),
         ZoneType::Secondary => Some(
             secondary(f, &conf.name).ok_or_else(|| format!("zone {} is not loaded", conf.name)),
@@ -754,6 +789,60 @@ pub fn secondary(f: &Forwarder, zone: &str) -> Option<Arc<ZoneData>> {
         .unwrap_or_else(|e| e.into_inner())
         .get(zone)
         .cloned()
+}
+
+/// The signed version of primary `zone`, if made.
+pub fn signed(f: &Forwarder, zone: &str) -> Option<Arc<ZoneData>> {
+    runtime(f)
+        .signed
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(zone)
+        .cloned()
+}
+
+/// A new signed version of primary `zone` (the daemon signs): it goes to
+/// the journal (IXFR) and its secondaries are told (NOTIFY).
+pub fn set_signed(f: &Forwarder, zone: &str, data: ZoneData) {
+    let rt = runtime(f);
+    let cfg = f.config();
+    let notify = zones(f, &cfg)
+        .conf
+        .get(zone)
+        .map(|c| c.notify.clone())
+        .unwrap_or_default();
+    let mut map = rt.signed.write().unwrap_or_else(|e| e.into_inner());
+    if let Some(old) = map.get(zone) {
+        rt.record(zone, diff(old, &data), data.len());
+    }
+    if map.get(zone).is_none_or(|o| o.serial != data.serial) {
+        rt.changed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Changed {
+                zone: zone.to_owned(),
+                serial: data.serial,
+                notify,
+                soa: data.soa.clone(),
+            });
+    }
+    map.insert(zone.to_owned(), Arc::new(data));
+}
+
+/// A zone no longer signed (or gone): its signed version leaves.
+pub fn drop_signed(f: &Forwarder, zone: &str) {
+    let rt = runtime(f);
+    let removed = rt
+        .signed
+        .write()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(zone);
+    if removed.is_some() {
+        rt.journal
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(zone);
+    }
 }
 
 /// A secondary got a new copy (the old one goes to the journal as a diff,

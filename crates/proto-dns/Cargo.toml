@@ -18,6 +18,13 @@ ipnet.workspace = true
 # `/ip dns static` regexp: linear time, no backtracking (hostile patterns
 # cannot stall the forwarder).
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
+# DNSSEC signing (G4.1c-2): ring, so only the daemon turns it on (the
+# engine, the GUI and wasm builds never link it).
+rustls-pki-types = { version = "1.15.1", optional = true }
+base64 = { workspace = true, optional = true }
+
+[features]
+dnssec = ["hickory-proto/dnssec-ring", "dep:rustls-pki-types", "dep:base64"]
 
 [dev-dependencies]
 proptest.workspace = true
@@ -34,6 +41,11 @@ harness = false
 [[bench]]
 name = "zones"
 harness = false
+
+[[bench]]
+name = "dnssec"
+harness = false
+required-features = ["dnssec"]
 
 [[bench]]
 name = "adlist"

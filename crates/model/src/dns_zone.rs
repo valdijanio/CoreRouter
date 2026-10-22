@@ -44,6 +44,23 @@ pub const MAX_TEXT_LEN: usize = 2048;
 /// RFC 8659 §4.1: the tag is 1..=15 letters and digits.
 pub const MAX_CAA_TAG_LEN: usize = 15;
 pub const MAX_CAA_VALUE_LEN: usize = 1024;
+/// RRSIG validity (Knot `rrsig-lifetime` 14 days); re-signed when half of
+/// it is left. Shorter than a day leaves no room for a failed re-signing;
+/// longer than 90 days keeps replayable answers around (RFC 6781 §4.4.2).
+pub const DEFAULT_SIGNATURE_VALIDITY_SECS: u32 = 1_209_600;
+pub const SIGNATURE_VALIDITY_SECS: std::ops::RangeInclusive<u32> = 86_400..=7_776_000;
+
+fn is_default_validity(v: &u32) -> bool {
+    *v == DEFAULT_SIGNATURE_VALIDITY_SECS
+}
+
+fn default_validity() -> u32 {
+    DEFAULT_SIGNATURE_VALIDITY_SECS
+}
+
+fn is_default_algorithm(a: &crate::dnssec::DnssecAlgorithm) -> bool {
+    *a == crate::dnssec::DnssecAlgorithm::default()
+}
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -250,6 +267,15 @@ pub struct Zone {
     /// the only ones whose NOTIFY is heard.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub primaries: Vec<IpAddr>,
+    /// Sign the zone (G4.1c-2): KSK + ZSK made by the daemon, NSEC3 (RFC
+    /// 9276: no extra iterations, no salt), re-signed on every change and
+    /// before the signatures expire.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub dnssec: bool,
+    #[serde(default, skip_serializing_if = "is_default_algorithm")]
+    pub dnssec_algorithm: crate::dnssec::DnssecAlgorithm,
+    #[serde(default = "default_validity", skip_serializing_if = "is_default_validity")]
+    pub signature_validity_secs: u32,
     #[serde(default, skip_serializing_if = "is_false")]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -276,6 +302,9 @@ impl Zone {
             allow_update: Vec::new(),
             notify: Vec::new(),
             primaries: Vec::new(),
+            dnssec: false,
+            dnssec_algorithm: crate::dnssec::DnssecAlgorithm::default(),
+            signature_validity_secs: DEFAULT_SIGNATURE_VALIDITY_SECS,
             disabled: false,
             comment: String::new(),
         }
@@ -380,7 +409,15 @@ impl Zone {
                 "{bad} cannot be a DNS server (unspecified, multicast or broadcast)"
             ));
         }
+        if !SIGNATURE_VALIDITY_SECS.contains(&self.signature_validity_secs) {
+            return Some(format!(
+                "signature_validity_secs must be {SIGNATURE_VALIDITY_SECS:?} (1 to 90 days)"
+            ));
+        }
         match self.ztype {
+            ZoneType::Secondary if self.dnssec => Some(
+                "dnssec is for primary zones: a secondary serves the signatures of its primary".into(),
+            ),
             ZoneType::Secondary if self.primaries.is_empty() => {
                 Some("a secondary zone needs primaries (where to transfer it from)".into())
             }
@@ -735,6 +772,15 @@ pub struct ZoneStatus {
     /// The last failure (a transfer, a NOTIFY), if the last attempt failed.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
+    /// DNSSEC (G4.1c-2): the serial of the signed version being served.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_serial: Option<u32>,
+    /// When the earliest signature of the served version expires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signatures_expire_unix: Option<u64>,
+    /// A transferred zone carries signatures (RRSIG, NSEC3).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub signed: bool,
 }
 
 #[cfg(test)]
