@@ -392,7 +392,9 @@ mod tests {
                     m.add_authority(Record::from_rdata(n("com."), 172800, RData::NS(NS(n("a.gtld-servers.net.")))));
                     m.add_authority(Record::from_rdata(n("com."), 86400, RData::Unknown {
                         code: RecordType::DS,
-                        rdata: NULL::with(vec![1, 2, 3]),
+                        // Key tag, algorithm 13, SHA-256 digest (RFC 4034 §5.1): a real DS
+                        // also when hickory decodes DNSSEC types.
+                        rdata: NULL::with([vec![0x4d, 0x06, 13, 2], vec![0xab; 32]].concat()),
                     }));
                     m.add_additional(Record::from_rdata(n("a.gtld-servers.net."), 172800, RData::A(A::new(192, 0, 2, 30))));
                 }
