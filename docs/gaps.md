@@ -34,6 +34,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G1.6 | Imagem Buildroot | `os/` (novo) | Imagem x86_64 A/B + squashfs + dm-verity bootando o daemon em QEMU; script de build reprodutível | 20 h | aberto |
 | G1.7 | Estatísticas via netlink | hal-linux | `poll` com stats64 do netlink (substitui sysfs) | 3 h | aberto |
 | G1.8 | Bonding (802.3ad, active-backup) | model, engine (`cmd/interface.rs`), ui | `interface.bonding.add {name, slaves, mode}`; slave não pode ser porta de bridge nem ter endereço; mesmo padrão de dependências do G1.1 | 4 h | aberto |
+| G1.9 | Tabelas estilo WinBox: seleção, menu de contexto, duplo clique | ui | Mecanismo reutilizável em `crates/ui` (`table.rs`): clique/Ctrl/Shift/espaço vazio/Ctrl+A/↑↓ selecionam; Delete, Ctrl+E/D/M, Enter (atalhos do WinBox v3/v4); barra +, −, ✓, ✗, comentário e Find, desabilitados com o motivo; menu do botão direito na linha (Enable/Disable, Remove, Comment…, Properties…, Add VLAN on <if>, Add to Bridge ▸) e no espaço vazio (Add ▸, Select All, Refresh); duplo clique abre "Interface <nome>" (OK/Cancel/Apply/Disable/Remove); diálogos New VLAN/Bridge/Loopback no lugar dos formulários fixos. Interfaces e Addresses usam; tudo via `CoreRouterUi::run`. Testes headless com eventos sintéticos | 6 h | feito (`stream/G1.9-winbox-tables`) |
 
 ## Fase 2 — Firewall / CGNAT
 
@@ -75,3 +76,4 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — lista inicial.
 - 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).
 - 2026-10-21 — G1.1 feito (VLAN, bridge, loopback, `interface.remove`); bonding separado em G1.8.
+- 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.
