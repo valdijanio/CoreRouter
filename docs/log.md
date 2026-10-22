@@ -522,3 +522,21 @@ mesmo dia pode variar.
   (bloquear 127.0.0.1 pela própria GUI → janela → Safe Mode e aplicar) conferidos em screenshot.
   Esforço do agente ~6 h (**estimado**).
 - 2026-10-22 — processo: proteção da main sem "branch atualizada" (strict=false) para dar vazão; workflow `main-red` abre/fecha a issue "main quebrada" quando o CI da main falha/volta; AGENTS.md: trazer a main antes do PR, main vermelha é prioridade zero, ids de gap só do brief/main, sessões não abrem sessões, PRs pequenos, pontos quentes com mudanças mínimas. Medido antes: CI de PR mediana 2,0 min, 1,6 execuções por PR.
+- 2026-10-22 — G1.21: hierarquia das janelas internas, a pedido do usuário (com um diálogo aberto,
+  clicar na lista o mandava para trás, e pedir os detalhes de novo não o trazia de volta). Um lugar
+  só, `Floats` em `crates/ui/src/float.rs`: relação filho→pai por janela (`Floats::adopt`, ligada
+  por `dialog::Head::parent`, que cada família de diálogos preenche com a sua lista: Interfaces,
+  Routes, VRF, Firewall com os assistentes do G2.1b, Interface List). Modelo das janelas *owned* do Windows / *transient-for*
+  do GTK: o filho fica sempre acima do pai (o egui só sabe "subir" um conjunto mantendo a ordem
+  relativa, então ao subir o pai os descendentes sobem no mesmo frame, e uma janela pedida no frame
+  em que a família sobe sobe no seguinte), e o teclado vai à janela *ativa* (a clicada, pedida ou
+  aberta por último), que pode estar sob os próprios filhos. Pedir de novo (`Status::bring_to_front`,
+  `Floats::raise`): sobe, toma o foco e pisca a borda por ~0,6 s. Filho abre abaixo do cabeçalho
+  da tabela do pai e a 30 % da largura dele (48–240 px), em cascata de 24 px: a primeira tentativa (36, 44) cobria o "+" da lista e
+  quebrou um teste do VRF, e (48, 92) cobria o meio das linhas com o diálogo maior do G1.19 (dois
+  testes que clicavam no centro da linha); agora os nomes das outras linhas ficam clicáveis
+  (**medido**). Fechar o pai: filhos limpos fecham junto (`Floats::close_family`/`take_close`);
+  com alterações, `egui::Modal` "Close <pai>?" (Close All / Cancel / Esc). Extras: marca na linha
+  cuja janela está aberta (`TableState::open`, clique traz a janela) e Ctrl+Tab / Ctrl+F6 (atalho do
+  WinBox) com Shift ao contrário; no navegador o Ctrl+Tab é da aba, o Ctrl+F6 fica. 8 testes headless
+  novos; conferido na GUI real num Xvfb próprio (screenshots). Esforço do agente ~3 h (**estimado**).

@@ -7,6 +7,10 @@
 //! (close, dropping the edits). While a request is out (a remote router
 //! answers later) OK says "Saving…" and nothing applies a second time. An
 //! error stays in the dialog and puts the cursor in the field it names.
+//!
+//! A dialog belongs to the list window it was opened from ([`Head::parent`],
+//! see [`crate::float`]): it opens over it, stays above it and closes with
+//! it. Asking for an open dialog again ([`Status::bring_to_front`]) raises it.
 
 use egui::{Button, Context, Id, Rect, RichText, TextEdit, Ui};
 use serde_json::Value;
@@ -39,9 +43,17 @@ pub(crate) struct Status {
     pub close_on_success: bool,
     /// Put the cursor in the field the new error names, once.
     focus_error: bool,
+    /// Asked for again: come to the front when next drawn.
+    bring: bool,
 }
 
 impl Status {
+    /// The dialog was asked for again (double click, Enter, menu): bring
+    /// it to the front with a flash instead of opening a second one.
+    pub(crate) fn bring_to_front(&mut self) {
+        self.bring = true;
+    }
+
     pub(crate) fn busy(&self) -> bool {
         self.waiting > 0
     }
@@ -155,12 +167,17 @@ pub(crate) struct Head<'a> {
     pub title: &'a str,
     /// Edits not saved yet: [`UNSAVED`] after the title.
     pub dirty: bool,
+    /// Where it opens when it has no parent open.
     pub pos: egui::Pos2,
+    /// The window it was opened from: it opens over it, stays above it
+    /// and closes with it.
+    pub parent: Option<Id>,
 }
 
 /// Draw one dialog: its fields (`body`), the error line, the buttons, and
 /// read the keyboard. Returns what the operator asked for; the window's ✕
-/// is Cancel. While a request is out only Cancel gets through.
+/// is Cancel. While a request is out only Cancel gets through. A dialog
+/// whose parent closed returns Cancel without drawing.
 pub(crate) fn show<B>(
     floats: &mut Floats,
     ctx: &Context,
@@ -169,6 +186,14 @@ pub(crate) fn show<B>(
     status: &mut Status,
     body: impl FnOnce(&mut Ui, &Form) -> Footer<B>,
 ) -> Option<Press<B>> {
+    if floats.take_close(head.id) {
+        return Some(Press::Cancel);
+    }
+    if std::mem::take(&mut status.bring) {
+        floats.raise(head.id);
+    }
+    floats.set_dirty(head.id, head.dirty);
+    let pos = floats.adopt(ctx, head.id, head.parent).unwrap_or(head.pos);
     let title = if head.dirty {
         format!("{} {UNSAVED}", head.title)
     } else {
@@ -195,7 +220,7 @@ pub(crate) fn show<B>(
             head.id,
             &title,
             &mut open,
-            |w| w.default_pos(head.pos).resizable(false).collapsible(false),
+            |w| w.default_pos(pos).resizable(false).collapsible(false),
             |ui| {
                 let footer = body(ui, &form);
                 view = matches!(footer.buttons, Buttons::View);
@@ -221,7 +246,8 @@ pub(crate) fn show<B>(
         // A read-only window has nothing to apply: OK closes it.
         Some(Press::Ok) if view => Some(Press::Cancel),
         Some(Press::Apply) if view => None,
-        Some(Press::Cancel) => Some(Press::Cancel),
+        // Its own children (if any) close with it, or ask first.
+        Some(Press::Cancel) => floats.close_family(ctx, head.id).then_some(Press::Cancel),
         Some(_) if busy => None,
         // OK / Apply greyed out: the router cannot run what they send.
         Some(Press::Ok | Press::Apply) if !can_ok => None,

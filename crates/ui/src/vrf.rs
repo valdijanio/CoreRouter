@@ -15,7 +15,7 @@ use crate::avail::Avail;
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::interfaces::{Iface, cascade, dialog_id, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
-use crate::{CoreRouterUi, Then, value_text};
+use crate::{CoreRouterUi, Then, Win, value_text};
 
 pub(crate) const TABLE: &str = "vrf";
 /// Property windows opened at once from one selection.
@@ -235,6 +235,14 @@ impl CoreRouterUi {
         });
         ui.separator();
 
+        self.tables.vrfs.open = self
+            .vrf_dialogs
+            .iter()
+            .filter_map(|d| match &d.dialog {
+                VrfDialog::Props { base, .. } => Some(base.name.clone()),
+                _ => None,
+            })
+            .collect();
         let out = table::show(
             ui,
             TABLE,
@@ -335,14 +343,16 @@ impl CoreRouterUi {
         });
     }
 
-    /// "VRF <name>"; an already open one is not duplicated.
+    /// "VRF <name>"; an already open one comes to the front.
     pub(crate) fn open_vrf(&mut self, name: &str) {
         let Some(v) = self.vrf(name) else { return };
         let open = self
             .vrf_dialogs
-            .iter()
-            .any(|d| matches!(&d.dialog, VrfDialog::Props { base, .. } if base.name == v.name));
-        if !open {
+            .iter_mut()
+            .find(|d| matches!(&d.dialog, VrfDialog::Props { base, .. } if base.name == v.name));
+        if let Some(d) = open {
+            d.status.bring_to_front();
+        } else {
             self.open_vrf_dialog(VrfDialog::Props {
                 form: VrfForm::of(&v),
                 base: VrfForm::of(&v),
@@ -370,6 +380,7 @@ impl CoreRouterUi {
                 title: &title,
                 dirty: d.dialog.dirty(),
                 pos: cascade(area, d.id),
+                parent: Some(crate::win_id(Win::Vrf)),
             };
             let salt = d.id;
             let can = self.can();
