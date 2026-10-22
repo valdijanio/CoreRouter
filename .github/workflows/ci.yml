@@ -42,7 +42,7 @@ jobs:
             libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libgl1-mesa-dev
+            libgl1-mesa-dev nftables
 
       - name: Toolchain (rust-toolchain.toml)
         run: |

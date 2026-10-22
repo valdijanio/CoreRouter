@@ -6,6 +6,7 @@
 
 pub mod cmd;
 pub mod error;
+pub mod firewall_dyn;
 pub mod guard;
 pub mod neighbors;
 pub mod safe_mode;

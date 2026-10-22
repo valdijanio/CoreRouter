@@ -15,6 +15,7 @@ repository = "https://github.com/valdijanio/CoreRouter"
 corerouter-model = { path = "crates/model" }
 corerouter-hal = { path = "crates/hal" }
 corerouter-hal-linux = { path = "crates/hal-linux" }
+corerouter-firewall = { path = "crates/firewall" }
 corerouter-proto-bgp = { path = "crates/proto-bgp" }
 corerouter-proto-ospf = { path = "crates/proto-ospf" }
 corerouter-proto-mpls = { path = "crates/proto-mpls" }

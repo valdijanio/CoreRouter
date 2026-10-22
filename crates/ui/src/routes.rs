@@ -618,6 +618,8 @@ fn route_row(r: &Route) -> Row {
             r.comment.clone(),
         ],
         dimmed: r.disabled,
+        section: false,
+        tint: None,
     }
 }
 

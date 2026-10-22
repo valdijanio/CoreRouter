@@ -74,6 +74,8 @@ pub(crate) fn neighbor_row(r: &Value) -> Row {
             uptime,
         ],
         dimmed: false,
+        section: false,
+        tint: None,
     }
 }
 

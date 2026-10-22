@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cmd::{self, check_params, unknown_command};
+use crate::firewall_dyn::DynamicLists;
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
@@ -58,6 +59,8 @@ pub struct Session {
     safe_mode: SafeMode,
     /// Heard by discovery protocols (operational state, never saved).
     pub(crate) neighbors: NeighborTable,
+    /// Address-list entries with a timeout (operational, never saved; G2.1).
+    pub(crate) dynamic_addresses: DynamicLists,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -124,6 +127,7 @@ impl Session {
             caller: Caller::local(),
             safe_mode: SafeMode::default(),
             neighbors: NeighborTable::default(),
+            dynamic_addresses: DynamicLists::default(),
         }
     }
 
@@ -336,8 +340,11 @@ impl Session {
                     "interfaces": cand.interfaces.len(),
                     "ip_addresses": cand.ip.addresses.len(),
                     "bgp_instances": cand.routing.bgp.len(),
+                    "firewall_rules": cand.ip.firewall.filter.len()
+                        + cand.ip.firewall.nat.len()
+                        + cand.ip.firewall.mangle.len(),
                 },
-                "paths": ["system", "interfaces", "ip", "routing", "running", "journal"],
+                "paths": ["system", "interfaces", "interface_lists", "ip", "ip.firewall", "routing", "running", "journal"],
             })),
             Some("journal") => serde_json::to_value(&self.journal)
                 .map_err(|e| EngineError::Internal(e.to_string())),

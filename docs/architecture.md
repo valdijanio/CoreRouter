@@ -83,8 +83,9 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas) | serde, ipnet, thiserror |
-| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features) + `VirtualHal` (lab, wasm, CI) | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
+| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, entradas dinâmicas de address-list) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria) | L0, `firewall` (lateral permitido) |
+| L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); firewall por `nft -f -` (módulo `nft`, G2.1). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
@@ -110,6 +111,7 @@ CoreRouter/
 │   ├── model/            # L0
 │   ├── hal/              # L1 (traits + virtual)
 │   ├── hal-linux/        # L1 plataforma
+│   ├── firewall/         # L1 puro: validação + render nftables (G2.1)
 │   ├── proto-bgp/ proto-ospf/ proto-mpls/ proto-cgnat/ proto-dns/ proto-dhcp/   # L2
 │   ├── proto-lldp/ proto-mndp/   # L2: codecs de descoberta (G5.2)
 │   ├── proto-discovery/  # L2: codec do CRDP (G5.1)
@@ -277,6 +279,15 @@ canal `--control` da GUI segue o alvo escolhido (`Target::Choosing` responde `se
 `OnceLock`. Um kernel de terceiros sem `CONFIG_NET_VRF` deixa `ip.vrf.add` desabilitado; as
 imagens do G1.6 vêm com `CONFIG_NET_VRF=y`.
 
+### Firewall (G2.1)
+
+`ip.firewall` (filter, nat, mangle, address-lists) e `interface_lists` são config; entradas de
+address-list com timeout são estado operacional na `Session` (`firewall_dyn.rs`), como os
+vizinhos. O commit valida com `corerouter_firewall::validate`; o `LinuxHal::apply` troca a
+tabela `inet corerouter` inteira por `nft -f -` (atômico no kernel) **antes** do plano netlink, e
+recarrega o ruleset anterior se o plano falhar; sem mudança no firewall o `nft` não roda. Detalhes,
+mapeamento RouterOS → nftables e o porquê do `nft` em `docs/firewall.md`.
+
 ### Rotas estáticas e VRF (G1.5)
 
 - **Modelo:** `ip.routes` (`RouteEntry`: `dst_address`, `gateway`, `distance`, `routing_table`,
@@ -320,3 +331,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).
 - 2026-10-22 — G5.1: crates `proto-discovery` (L2) e `discovery` (L4), tabela de vizinhos no engine, tela de conexão.
 - 2026-10-22 — G5.2 Parte 2: LLDP/MNDP no daemon (`link_discovery.rs`), cola L1+L2 na app.
+- 2026-10-22 — G2.1a: crate `firewall` (L1 puro), seção Firewall, `Hal::address_list_dynamic`.

@@ -9,6 +9,7 @@ use crate::{CoreRouterUi, err_color, value_text};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Win {
     Interfaces,
+    InterfaceList,
     Addresses,
     Neighbors,
     Routes,
@@ -27,7 +28,7 @@ pub enum Win {
 
 /// Side menu: (group, items). A group with one item of the same name is a leaf.
 pub(crate) const MENU: &[(&str, &[Win])] = &[
-    ("Interfaces", &[Win::Interfaces]),
+    ("Interfaces", &[Win::Interfaces, Win::InterfaceList]),
     (
         "IP",
         &[
@@ -50,6 +51,7 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
 impl Win {
     pub const ALL: &'static [Win] = &[
         Win::Interfaces,
+        Win::InterfaceList,
         Win::Addresses,
         Win::Neighbors,
         Win::Routes,
@@ -69,6 +71,7 @@ impl Win {
     pub fn title(self) -> &'static str {
         match self {
             Win::Interfaces => "Interfaces",
+            Win::InterfaceList => "Interface List",
             Win::Addresses => "Addresses",
             Win::Neighbors => "Neighbors",
             Win::Routes => "Routes",
@@ -89,7 +92,6 @@ impl Win {
     /// `Some(gap id)` while the area has no engine commands yet.
     pub fn gap(self) -> Option<&'static str> {
         match self {
-            Win::Firewall => Some("G2.1"),
             Win::Cgnat => Some("G2.3"),
             Win::Ospf => Some("G3.4"),
             Win::Mpls => Some("G3.5"),
@@ -106,6 +108,8 @@ impl Win {
             Win::Interfaces
                 | Win::Addresses
                 | Win::Routes
+                | Win::Firewall
+                | Win::InterfaceList
                 | Win::Vrf
                 | Win::Neighbors
                 | Win::History
@@ -120,6 +124,8 @@ impl Win {
             Win::Addresses | Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
             Win::Vrf => [600.0, 260.0],
+            Win::Firewall => [980.0, 420.0],
+            Win::InterfaceList => [520.0, 280.0],
             _ => [380.0, 200.0],
         }
     }
@@ -138,6 +144,8 @@ impl CoreRouterUi {
             Win::Neighbors => self.neighbors(ui),
             Win::Routes => self.routes(ui),
             Win::Vrf => self.vrfs(ui),
+            Win::Firewall => self.firewall(ui),
+            Win::InterfaceList => self.interface_lists(ui),
             Win::Bgp => self.bgp(ui),
             Win::Identity => self.identity(ui),
             Win::History => self.history(ui),
@@ -176,6 +184,8 @@ impl CoreRouterUi {
                         .map(get)
                         .to_vec(),
                     dimmed: r.get("disabled").and_then(Value::as_bool).unwrap_or(false),
+                    section: false,
+                    tint: None,
                 }
             })
             .collect();

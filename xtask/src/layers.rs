@@ -12,6 +12,9 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-model", 0),
     ("corerouter-hal", 1),
     ("corerouter-hal-linux", 1),
+    // Pure (no I/O, wasm-safe): firewall validation + nftables render, needed by
+    // hal-linux (L1) and the engine, so it cannot be an L2 proto-* crate.
+    ("corerouter-firewall", 1),
     ("corerouter-proto-bgp", 2),
     ("corerouter-proto-ospf", 2),
     ("corerouter-proto-mpls", 2),
@@ -39,6 +42,10 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     ("corerouter-mcp", "corerouter-control"),
     // Platform backends implement the L1 traits.
     ("corerouter-hal-linux", "corerouter-hal"),
+    // The lab backend records the ruleset it would load (G2.1).
+    ("corerouter-hal", "corerouter-firewall"),
+    // hal-linux applies the ruleset corerouter-firewall renders (G2.1).
+    ("corerouter-hal-linux", "corerouter-firewall"),
 ];
 
 pub const UI_CRATES: &[&str] = &[

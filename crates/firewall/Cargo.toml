@@ -1,0 +1,19 @@
+[package]
+name = "corerouter-firewall"
+description = "L1 (pure): firewall validation and nftables rendering, shared by the engine and hal-linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

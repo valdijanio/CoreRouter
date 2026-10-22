@@ -91,6 +91,7 @@ impl Session {
     pub fn tick(&mut self, now_unix: u64) {
         self.safe_mode_mut().clock = Some(now_unix);
         self.expire_safe_mode();
+        self.expire_dynamic_addresses();
     }
 
     /// The connection `caller_id` closed. If it owned Safe Mode, its changes

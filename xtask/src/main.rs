@@ -187,6 +187,8 @@ const NETNS_TESTS: &[(&str, &str)] = &[
     ("corerouter-hal-linux", "netns"),
     // G5.2: LLDP over AF_PACKET and MNDP over UDP between veth peers.
     ("corerouter-hal-linux", "netns_l2"),
+    // G2.1: the firewall ruleset through `nft`, atomic replace, dynamic entries.
+    ("corerouter-hal-linux", "netns_nft"),
     // G5.1: two daemons find each other with CRDP.
     ("corerouter-daemon", "netns"),
     // G5.2: two linux-backend daemons list each other as LLDP; MNDP is read.

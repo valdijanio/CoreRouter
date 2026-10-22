@@ -7,6 +7,9 @@
 //! - `l2`: neighbor-discovery I/O — LLDP frames over `AF_PACKET`, passive
 //!   MNDP over UDP 5678 (G5.2). Bytes only; the codecs are `proto-lldp` /
 //!   `proto-mndp`, glued by the daemon.
+//! - firewall (G2.1): `nft` replaces table `inet corerouter` in one
+//!   transaction when the rendered ruleset changes (see [`nft`]), before the
+//!   netlink plan; if the plan then fails, the old ruleset goes back.
 //! - `features`: probed once, on first use, with a throwaway link per
 //!   capability (`netlink::features`), then cached (G1.14).
 //!
@@ -19,6 +22,9 @@ pub mod plan;
 mod netlink;
 
 #[cfg(target_os = "linux")]
+pub mod nft;
+
+#[cfg(target_os = "linux")]
 pub mod l2;
 
 #[cfg(target_os = "linux")]
@@ -28,7 +34,7 @@ mod linux {
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use corerouter_hal::{Features, Hal, HalError, LinkInfo, LinkState};
+    use corerouter_hal::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState};
     use corerouter_model::{Config, IfName};
 
     const SYS_NET: &str = "/sys/class/net";
@@ -89,7 +95,27 @@ mod linux {
         }
 
         fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
-            crate::netlink::apply(&crate::plan::plan(from, to)?)
+            let plan = crate::plan::plan(from, to)?;
+            // Only when the firewall changed: a host without nftables can
+            // still run everything else.
+            let firewall =
+                corerouter_firewall::render(from, &[]) != corerouter_firewall::render(to, &[]);
+            if firewall {
+                let dynamic = crate::nft::dynamic();
+                crate::nft::run(&corerouter_firewall::script(to, &dynamic))?;
+            }
+            let applied = crate::netlink::apply(&plan);
+            if let Err(e) = &applied
+                && firewall
+            {
+                let dynamic = crate::nft::dynamic();
+                if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic)) {
+                    return Err(HalError::Rejected(format!(
+                        "{e}; restoring the previous firewall also failed: {back}"
+                    )));
+                }
+            }
+            applied
         }
 
         fn poll(&mut self) -> Vec<LinkState> {
@@ -119,6 +145,13 @@ mod linux {
 
         fn features(&self) -> Features {
             *self.features.get_or_init(crate::netlink::features)
+        }
+
+        fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
+            match change {
+                DynamicChange::Add(d) => crate::nft::add_dynamic(d),
+                DynamicChange::Remove(d) => crate::nft::remove_dynamic(d),
+            }
         }
     }
 }
