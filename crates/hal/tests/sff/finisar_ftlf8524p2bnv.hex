@@ -1,0 +1,35 @@
+# Source: https://gist.github.com/Chester-Gillon/d2c3bc6d76394af4fc9551e1be441dd8 (raw: https://gist.githubusercontent.com/Chester-Gillon/d2c3bc6d76394af4fc9551e1be441dd8/raw , file Reading_QSFP_module_information.md, fetched 2026-10-22, gist updated 2026-04-29)
+# Module: SFP (id 0x03), FINISAR CORP. FTLF8524P2BNV rev A, SN PFA48HS, date 090306, 850 nm, 4.25G FC / 1000BASE-SX, DOM internally calibrated (byte 92 = 0x68)
+# Hex bytes as published (512 bytes); module identity data, used as a decoder test fixture.
+0x0000: 03 04 07 00 00 00 01 20 40 0c 15 01 2a 00 00 00
+0x0010: 0f 07 00 00 46 49 4e 49 53 41 52 20 43 4f 52 50
+0x0020: 2e 20 20 20 00 00 90 65 46 54 4c 46 38 35 32 34
+0x0030: 50 32 42 4e 56 20 20 20 41 20 20 20 03 52 00 71
+0x0040: 00 32 00 00 50 46 41 34 38 48 53 20 20 20 20 20
+0x0050: 20 20 20 20 30 39 30 33 30 36 20 20 68 d8 01 e3
+0x0060: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x0070: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x0080: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x0090: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x00a0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x00b0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x00c0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x00d0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x00e0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x00f0: ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+0x0100: 5f 00 e7 00 5a 00 ec 00 98 58 69 78 90 88 71 48
+0x0110: 21 34 01 f4 1b 58 03 e8 18 a6 02 9e 18 a6 03 16
+0x0120: 31 2e 00 64 1f 04 00 9e 00 00 00 00 00 00 00 00
+0x0130: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x0140: 00 00 00 00 3f 80 00 00 00 00 00 00 01 00 00 00
+0x0150: 01 00 00 00 01 00 00 00 01 00 00 00 00 00 00 52
+0x0160: 1d 3b 80 f8 0d 7b 0f 9c 11 34 00 00 00 00 10 00
+0x0170: 00 00 00 00 00 00 00 00 ff ff ff ff ff ff ff 01
+0x0180: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x0190: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x01a0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x01b0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x01c0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x01d0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x01e0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+0x01f0: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00

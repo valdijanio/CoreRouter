@@ -220,6 +220,8 @@ pub(crate) enum Effect {
     },
     /// Enable/Disable button.
     Toggled(bool),
+    /// The Ethernet tab's settings went through (G1.20).
+    EthApplied(String),
 }
 
 /// The buttons of an "Interface <name>" window besides OK/Cancel/Apply.
@@ -457,17 +459,21 @@ impl CoreRouterUi {
                 return false;
             }
             let title = dialog_title(&d.dialog);
+            let eth = match &d.dialog {
+                Dialog::Props(p) => nic.get(&p.name).and_then(|v| v.eth.params(&p.name)),
+                _ => None,
+            };
             let head = Head {
                 id,
                 title: &title,
-                dirty: d.dialog.dirty(),
+                dirty: d.dialog.dirty() || eth.is_some(),
                 pos: cascade(area, d.id),
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
                     dialog_body(ui, f, &mut d.dialog, &ifaces, &can, &mut nic)
                 });
-            let keep = pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces));
+            let keep = pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces, eth));
             if !keep {
                 self.floats.forget(id);
             }
@@ -482,7 +488,13 @@ impl CoreRouterUi {
     /// Send what a dialog button means. Returns whether the dialog stays
     /// open now; whether it closes on success is decided when the replies
     /// arrive ([`CoreRouterUi::dialog_reply`]).
-    fn dialog_button(&mut self, d: &mut DialogWin, b: Press<Button>, ifaces: &[Iface]) -> bool {
+    fn dialog_button(
+        &mut self,
+        d: &mut DialogWin,
+        b: Press<Button>,
+        ifaces: &[Iface],
+        eth: Option<Value>,
+    ) -> bool {
         if b == Press::Cancel {
             return false;
         }
@@ -531,7 +543,14 @@ impl CoreRouterUi {
                 })
                 .collect(),
             Dialog::Props(p) => {
-                let (sends, close) = props_sends(p, &b, ifaces);
+                let (mut sends, close) = props_sends(p, &b, ifaces);
+                if let (Press::Ok | Press::Apply, Some(params)) = (&b, eth) {
+                    sends.push((
+                        crate::ethernet_tab::SET,
+                        params,
+                        Effect::EthApplied(p.name.clone()),
+                    ));
+                }
                 if sends.is_empty() {
                     // OK with nothing changed just closes.
                     return !close;
@@ -584,6 +603,11 @@ impl CoreRouterUi {
                     (Ok(_), Effect::Toggled(now), Dialog::Props(p)) => {
                         p.disabled = now;
                         p.base_disabled = now;
+                    }
+                    (Ok(_), Effect::EthApplied(name), _) => {
+                        if let Some(v) = self.nic.get_mut(&name) {
+                            v.eth.applied();
+                        }
                     }
                     (Ok(_), _, _) => {}
                 }
@@ -905,9 +929,9 @@ fn dialog_body(
             return Footer::edit(true, can.check("interface.set"));
         };
         toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
-        iface_tabs::tab_bar(ui, &mut p.tab);
+        iface_tabs::tab_bar(ui, &mut p.tab, nic.get(&p.name));
         let view = nic.get_mut(&p.name);
-        iface_tabs::body(ui, p.tab, view, |ui, view| {
+        iface_tabs::body(ui, p.tab, view, can, |ui, view| {
             // A fixed label column: the fields do not move while the
             // window settles (or when the MAC rows arrive).
             Grid::new("fields")

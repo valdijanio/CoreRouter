@@ -6,7 +6,9 @@
 //!     cargo test -p corerouter-hal-linux --test netns_nic
 //! ```
 //!
-//! A veth pair stands in for a NIC: the kernel reports 10 Gb/s full
+//! A veth pair stands in for a NIC (G1.20: its offloads change over
+//! ethtool netlink; link modes, pause, module EEPROM and cable test are
+//! the "not supported" path): the kernel reports 10 Gb/s full
 //! duplex for it over ethtool netlink, counts its frames and its carrier
 //! transitions. Like the other netns tests, these refuse to run unless the
 //! namespace holds nothing but `lo`.
@@ -20,9 +22,9 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use corerouter_hal::{Hal, HalError, LinkCounters};
-use corerouter_hal_linux::LinuxHal;
 use corerouter_hal_linux::l2::LldpIo;
-use corerouter_model::IfName;
+use corerouter_hal_linux::{LinuxHal, Policy};
+use corerouter_model::{Config, IfName, Interface, InterfaceKind};
 
 const ENV: &str = "COREROUTER_NETNS_TESTS";
 
@@ -218,4 +220,105 @@ fn unsupported_queries_are_notes_and_missing_links_errors() {
     ] {
         assert!(matches!(r, Err(HalError::Rejected(_))), "{r:?}");
     }
+}
+
+fn gro(name: &str) -> bool {
+    let out = Command::new("ethtool").args(["-k", name]).output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .find(|l| l.starts_with("generic-receive-offload:"))
+            .is_some_and(|l| l.contains(": on")),
+        // No ethtool binary: ask the HAL instead.
+        _ => LinuxHal::new()
+            .hardware(&n(name))
+            .unwrap()
+            .offloads
+            .iter()
+            .any(|o| o.feature == "rx-gro" && o.active),
+    }
+}
+
+/// A HAL that manages `names` (the test's veths are not its own links).
+fn managing(names: &[&str]) -> (LinuxHal, Config) {
+    let hal = LinuxHal::with_policy(Policy {
+        manage: names.iter().map(|s| (*s).to_owned()).collect(),
+        unmanaged: Vec::new(),
+    });
+    let mut cfg = Config::default();
+    for name in names {
+        let mut i = Interface::new(n(name), InterfaceKind::Ethernet);
+        i.mtu = 1500;
+        cfg.interfaces.insert(n(name), i);
+    }
+    (hal, cfg)
+}
+
+#[test]
+fn offloads_apply_and_come_back_on_rollback() {
+    if !in_netns() {
+        return;
+    }
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _pair = Pair::new("offa", "offb");
+    let (mut hal, base) = managing(&["offa"]);
+    hal.apply(&Config::default(), &base).unwrap();
+    let was = gro("offa");
+    let mut off = base.clone();
+    off.interfaces
+        .get_mut(&n("offa"))
+        .unwrap()
+        .ethernet
+        .offloads
+        .insert("rx-gro".into(), !was);
+    hal.apply(&base, &off).unwrap();
+    assert_eq!(gro("offa"), !was, "FEATURES_SET changed GRO");
+    // Taking the setting out puts the port's own value back.
+    hal.apply(&off, &base).unwrap();
+    assert_eq!(gro("offa"), was, "restored from the snapshot");
+}
+
+#[test]
+fn veth_link_modes_are_refused_and_nothing_changes() {
+    if !in_netns() {
+        return;
+    }
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _pair = Pair::new("lnka", "lnkb");
+    let (mut hal, base) = managing(&["lnka"]);
+    hal.apply(&Config::default(), &base).unwrap();
+    let was = gro("lnka");
+    let mut forced = base.clone();
+    let e = &mut forced.interfaces.get_mut(&n("lnka")).unwrap().ethernet;
+    e.auto_negotiation = Some(false);
+    e.speed_mbps = Some(1000);
+    e.full_duplex = Some(true);
+    e.offloads.insert("rx-gro".into(), !was);
+    let err = hal.apply(&base, &forced).unwrap_err();
+    assert!(
+        matches!(&err, HalError::Rejected(m) if m.contains("lnka")),
+        "{err:?}"
+    );
+    assert_eq!(gro("lnka"), was, "all or nothing: the offload did not stay");
+    let m = hal.ethernet_monitor(&n("lnka")).unwrap();
+    assert_eq!(m.speed_mbps, Some(10_000), "the veth kept its rate");
+}
+
+#[test]
+fn veth_has_no_module_and_no_cable_test() {
+    if !in_netns() {
+        return;
+    }
+    let _one = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let _pair = Pair::new("sfpa", "sfpb");
+    let mut hal = LinuxHal::new();
+    let r = hal.sfp_module(&n("sfpa"));
+    assert!(matches!(r, Err(HalError::Unsupported(_))), "{r:?}");
+    let mut t = hal.cable_tester(&n("sfpa")).unwrap();
+    let r = t.run(&|_| true);
+    assert!(matches!(r, Err(HalError::Unsupported(_))), "{r:?}");
+    assert!(matches!(
+        hal.cable_tester(&n("nosuch0")),
+        Err(HalError::Rejected(_))
+    ));
 }

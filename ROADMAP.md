@@ -483,6 +483,27 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   (Ethernet configurável, SFP/DOM, teste de cabo) registrado. Esforço do agente ~5 h
   (**estimado**).
 
+- 2026-10-22 — G1.20: abas do diálogo de interface (parte 2), a pedido do usuário.
+  `interface.ethernet.set` (autonegociação, velocidade/duplex forçados, modos anunciados com nomes
+  do kernel ou do RouterOS 7.12+, controle de fluxo on/off/auto, offloads, `reset`) validado contra
+  o que a porta diz antes de aplicar; na config (`Interface::ethernet`), journal, histórico,
+  rollback e Safe Mode. Porta de gerência (a do IP do cliente remoto, via VLAN/bridge/VRF): mudança
+  de link e teste de cabo pedem Safe Mode ou `force`. SFP/SFP+/QSFP: `hal::sff` decodifica
+  SFF-8472/8636 (calibração externa, checksums, limites do módulo) com proptest e 4 dumps reais
+  publicados; `interface.ethernet.monitor` ganha `sfp` (identidade, DOM, níveis, alertas);
+  `engine::dom_watch` registra só as travessias de limite (e insere/remove), a cada monitor e a
+  cada 30 s. Teste de cabo como tarefa (G6.1), resultado por par e `cable-pairs` do RouterOS.
+  `hal-linux`: `LINKMODES_SET`/`PAUSE_SET`/`FEATURES_SET` com retrato da porta antes da primeira
+  mudança (tirar da config restaura), `MODULE_EEPROM_GET`, `CABLE_TEST_ACT` + notificação do grupo
+  `monitor`; tudo ou nada no `apply`. `VirtualHal`: ether8 vira gaiola SFP+ com módulo e DOM, teste
+  de cabo com um par em curto no ether7. GUI: abas Ethernet (form + offloads + "Cable Test" +
+  "Reset to Port Defaults", cinza com o motivo) e SFP (DOM colorido por nível, `SFP ⚠` na aba).
+  Testes: codec SFF (dumps reais + proptest), parser da notificação de cabo (proptest), engine
+  (sucesso, validação, rollback, Safe Mode e queda da conexão, plataforma sem ethtool, tarefa),
+  netns sem root com veth (offloads aplicados e restaurados no kernel; link/pause/EEPROM/cabo pelo
+  caminho "não suportado"), headless das abas; screenshots conferidos. Fora: LED (ioctl), `/export`
+  de `/interface ethernet`, FEC. Esforço do agente ~5 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -514,3 +535,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G0.3b.
 - 2026-10-22 — log do G0.3c.
 - 2026-10-22 — log do G1.19.
+- 2026-10-22 — log do G1.20.

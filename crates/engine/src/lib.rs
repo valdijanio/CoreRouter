@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod cmd;
+pub mod dom_watch;
 pub mod error;
 pub mod firewall_dyn;
 pub mod guard;

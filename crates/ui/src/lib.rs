@@ -9,6 +9,7 @@ mod avail;
 pub mod backend;
 pub mod connect;
 mod dialog;
+mod ethernet_tab;
 mod firewall;
 mod first_login;
 mod float;
@@ -1627,6 +1628,7 @@ mod tests {
     }
 
     mod dialog_keys;
+    mod ethernet_tab;
     mod firewall;
     mod terminal;
     mod tools_ping;

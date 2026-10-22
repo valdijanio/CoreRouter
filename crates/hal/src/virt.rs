@@ -2,11 +2,16 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use corerouter_model::firewall::DynamicAddress;
-use corerouter_model::{Config, IfName, InterfaceKind};
+use corerouter_model::{Config, FlowControl, IfName, InterfaceKind};
 
-use crate::nic::{CounterGroup, EthernetMonitor, LinkCounters, NicHardware, Offload, base_t_modes};
+use crate::nic::{
+    CablePair, CableTest, CableTestResult, CounterGroup, EthernetMonitor, LinkCounters,
+    NicHardware, Offload, base_t_modes, mode_speed,
+};
+use crate::sff::{self, SfpModule};
 use crate::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState, SharedProber, SimProber};
 
 #[derive(Clone)]
@@ -85,10 +90,37 @@ impl VirtualHal {
 
     /// Fastest rate of a lab port: the last one is a 10G port, the rest 1G.
     fn port_speed(&self, index: usize) -> u32 {
-        if index + 1 == self.ports.len() && index > 0 {
-            10_000
+        if self.is_sfp(index) { 10_000 } else { 1000 }
+    }
+
+    /// The last port (of two or more) is an SFP+ cage with a 10GBASE-SR
+    /// module in it (G1.20); the others are copper.
+    fn is_sfp(&self, index: usize) -> bool {
+        index + 1 == self.ports.len() && index > 0
+    }
+
+    /// Link modes lab port `index` can do.
+    fn port_modes(&self, index: usize) -> Vec<String> {
+        if self.is_sfp(index) {
+            vec!["1000baseX/Full".into(), "10000baseSR/Full".into()]
         } else {
-            1000
+            base_t_modes(self.port_speed(index))
+        }
+    }
+
+    /// An Ethernet port of the lab, by name, and its position.
+    fn lab_port(&self, name: &IfName) -> Result<(usize, &corerouter_model::Interface), HalError> {
+        let iface = self
+            .applied
+            .interfaces
+            .get(name)
+            .ok_or_else(|| self.missing(name))?;
+        match (&iface.kind, self.port_index(name)) {
+            (InterfaceKind::Ethernet, Some(i)) => Ok((i, iface)),
+            _ => Err(HalError::Unsupported(format!(
+                "'{name}' is a {}, not an Ethernet port",
+                iface.kind.label()
+            ))),
         }
     }
 
@@ -208,47 +240,106 @@ impl Hal for VirtualHal {
 
     /// Lab ports negotiate their top speed, full duplex, with an equal
     /// partner; each has a few link downs from "before" plus one per
-    /// re-enable.
+    /// re-enable. What `interface.ethernet.set` applied shows here: forced
+    /// rate and duplex, fewer advertised modes, flow control (G1.20).
     fn ethernet_monitor(&mut self, name: &IfName) -> Result<EthernetMonitor, HalError> {
-        let iface = self
-            .applied
-            .interfaces
-            .get(name)
-            .ok_or_else(|| self.missing(name))?;
-        let index = match (&iface.kind, self.port_index(name)) {
-            (InterfaceKind::Ethernet, Some(i)) => i,
-            _ => {
-                return Err(HalError::Unsupported(format!(
-                    "'{name}' is a {}, not an Ethernet port",
-                    iface.kind.label()
-                )));
-            }
-        };
+        let (index, iface) = self.lab_port(name)?;
         let up = !iface.disabled;
-        let speed = self.port_speed(index);
-        let modes = base_t_modes(speed);
+        let set = &iface.ethernet;
+        let modes = self.port_modes(index);
+        let autoneg = set.auto_negotiation.unwrap_or(true);
+        let advertising = set.advertise.clone().unwrap_or_else(|| modes.clone());
+        // The partner can do everything: the best advertised mode wins.
+        let best = advertising
+            .iter()
+            .filter_map(|m| mode_speed(m))
+            .max_by_key(|(speed, full)| (*speed, *full));
+        let (speed, full) = if autoneg {
+            best.unwrap_or((self.port_speed(index), true))
+        } else {
+            (
+                set.speed_mbps.unwrap_or(self.port_speed(index)),
+                set.full_duplex.unwrap_or(true),
+            )
+        };
+        let flow = |f: Option<FlowControl>| match f {
+            None | Some(FlowControl::Off) => false,
+            // The lab partner always agrees to pause frames.
+            Some(FlowControl::On | FlowControl::Auto) => true,
+        };
         let downs = u32::try_from(index % 3)
             .unwrap_or(0)
             .saturating_add(self.reenabled.get(name).copied().unwrap_or(0));
+        let sfp = self.is_sfp(index);
         Ok(EthernetMonitor {
             link_ok: up,
             speed_mbps: up.then_some(speed),
-            full_duplex: up.then_some(true),
-            autoneg: Some(true),
-            port: Some("twisted-pair".into()),
-            mdix: up.then(|| if index % 2 == 0 { "mdi" } else { "mdi-x" }.into()),
-            mdix_ctrl: Some("auto".into()),
+            full_duplex: up.then_some(full),
+            autoneg: Some(autoneg),
+            port: Some(if sfp { "fibre" } else { "twisted-pair" }.into()),
+            mdix: (up && !sfp).then(|| if index % 2 == 0 { "mdi" } else { "mdi-x" }.into()),
+            mdix_ctrl: (!sfp).then(|| "auto".into()),
             supported: modes.clone(),
-            advertising: modes.clone(),
-            partner_advertising: if up { modes } else { Vec::new() },
-            rx_flow_control: Some(false),
-            tx_flow_control: Some(false),
-            flow_control_autoneg: Some(true),
+            advertising: if autoneg { advertising } else { Vec::new() },
+            partner_advertising: if up && autoneg { modes } else { Vec::new() },
+            rx_flow_control: Some(flow(set.rx_flow_control)),
+            tx_flow_control: Some(flow(set.tx_flow_control)),
+            flow_control_autoneg: Some(
+                [set.rx_flow_control, set.tx_flow_control].contains(&Some(FlowControl::Auto)),
+            ),
             carrier_changes: Some(downs.saturating_mul(2).saturating_add(u32::from(up))),
             link_downs: Some(downs),
             down_reason: (!up).then(|| "administratively disabled".into()),
             notes: Vec::new(),
         })
+    }
+
+    /// The last port's SFP+ module: steady readings, the laser off while
+    /// the port is disabled.
+    fn sfp_module(&mut self, name: &IfName) -> Result<SfpModule, HalError> {
+        let (index, iface) = self.lab_port(name)?;
+        if !self.is_sfp(index) {
+            return Err(HalError::Unsupported(format!(
+                "'{name}' is a copper port: no module cage"
+            )));
+        }
+        let n = index.saturating_add(1);
+        let tx = if iface.disabled { sff::MIN_DBM } else { -2.4 };
+        let (a0, a2) = sff::lab_sfp_plus(&format!("CRV{n:05}"), 41.2, tx, -3.1);
+        let mut m = sff::decode(&a0, Some(&a2));
+        m.notes.push("simulated by the virtual lab".into());
+        Ok(m)
+    }
+
+    /// Copper ports pass, except ether7's damaged cable (pair C shorted
+    /// at 23.5 m); a disabled port's cable is open at its far end.
+    fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {
+        let (index, iface) = self.lab_port(name)?;
+        if self.is_sfp(index) {
+            return Err(HalError::Unsupported(format!(
+                "'{name}' is a fibre port: there are no copper pairs to test"
+            )));
+        }
+        let length = 2.5 + 3.1 * index as f64;
+        let pairs = ["A", "B", "C", "D"]
+            .into_iter()
+            .map(|pair| {
+                let (status, distance_m) = match (index, pair, iface.disabled) {
+                    (6, "C", _) => ("short", Some(23.5)),
+                    (_, _, true) => ("open", Some(length)),
+                    _ => ("ok", None),
+                };
+                CablePair {
+                    pair: pair.into(),
+                    status: status.into(),
+                    distance_m,
+                }
+            })
+            .collect();
+        Ok(Box::new(LabCableTest(CableTestResult {
+            pairs,
+            notes: vec!["simulated by the virtual lab".into()],
+        })))
     }
 
     fn hardware(&mut self, name: &IfName) -> Result<NicHardware, HalError> {
@@ -276,10 +367,14 @@ impl Hal for VirtualHal {
             });
         };
         let n = u32::try_from(index).unwrap_or(0).saturating_add(1);
+        let wanted = &iface.ethernet.offloads;
         let offload = |name: &str, feature: &str, active: bool, fixed: bool| Offload {
             name: name.into(),
             feature: feature.into(),
-            active,
+            active: match wanted.get(feature) {
+                Some(on) if !fixed => *on,
+                _ => active,
+            },
             fixed,
         };
         Ok(NicHardware {
@@ -290,8 +385,8 @@ impl Hal for VirtualHal {
             bus: Some("virtual".into()),
             bus_address: Some(format!("lab:{n:02}")),
             vendor: Some("CoreRouter".into()),
-            model: Some(if self.port_speed(index) > 1000 {
-                "Virtual NIC 10G".into()
+            model: Some(if self.is_sfp(index) {
+                "Virtual NIC 10G SFP+".into()
             } else {
                 "Virtual NIC".into()
             }),
@@ -407,6 +502,18 @@ impl Hal for VirtualHal {
             groups,
             notes: Vec::new(),
         })
+    }
+}
+
+/// The lab's cable test: a short pause, then the precomputed pairs.
+struct LabCableTest(CableTestResult);
+
+impl CableTest for LabCableTest {
+    fn run(&mut self, wait: &dyn Fn(Duration) -> bool) -> Result<CableTestResult, HalError> {
+        if !wait(Duration::from_millis(1500)) {
+            return Err(HalError::Io("stopped".into()));
+        }
+        Ok(self.0.clone())
     }
 }
 

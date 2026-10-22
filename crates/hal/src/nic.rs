@@ -9,7 +9,11 @@
 //! [`crate::HalError::Unsupported`] only when the backend has nothing at
 //! all for that port.
 
+use std::time::Duration;
+
 use serde::Serialize;
+
+use crate::HalError;
 
 /// Bound on the lists below (link modes, IRQs, offloads, counters): a
 /// driver reporting more is hostile or broken, and nobody reads 4096 rows.
@@ -149,4 +153,68 @@ pub(crate) fn base_t_modes(max_mbps: u32) -> Vec<String> {
             half.into_iter().chain([format!("{s}baseT/Full")])
         })
         .collect()
+}
+
+/// One twisted pair after a cable test (G1.20).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CablePair {
+    /// `A`..`D`.
+    pub pair: String,
+    /// `ok`, `open`, `short` (within the pair), `cross-short` (to another
+    /// pair), `impedance-mismatch`, `noise`, `unknown`.
+    pub status: String,
+    /// Distance to the fault in meters, when the PHY measures it (an open
+    /// pair at the far end gives the cable length).
+    pub distance_m: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+pub struct CableTestResult {
+    pub pairs: Vec<CablePair>,
+    pub notes: Vec<String>,
+}
+
+/// A cable test (TDR) that runs away from the session lock: the link
+/// goes down while the PHY measures, a few seconds.
+pub trait CableTest: Send {
+    /// Run to the end. `wait(d)` sleeps up to `d` and returns `false` when
+    /// the task was stopped, so a test gives up between steps.
+    fn run(&mut self, wait: &dyn Fn(Duration) -> bool) -> Result<CableTestResult, HalError>;
+}
+
+/// Rate and duplex of a kernel link mode: `1000baseT/Full` → (1000, true).
+/// Bits that are not a rate (`Autoneg`, `TP`, `Pause`, `FEC_RS`) are `None`.
+pub fn mode_speed(mode: &str) -> Option<(u32, bool)> {
+    let (rate, rest) = mode.split_once("base")?;
+    let speed = rate.parse::<u32>().ok().filter(|s| *s > 0)?;
+    let full = match rest.rsplit_once('/')?.1 {
+        "Full" => true,
+        "Half" => false,
+        _ => return None,
+    };
+    Some((speed, full))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mode_speed;
+
+    #[test]
+    fn link_mode_names() {
+        assert_eq!(mode_speed("1000baseT/Full"), Some((1000, true)));
+        assert_eq!(mode_speed("10baseT/Half"), Some((10, false)));
+        assert_eq!(mode_speed("10000baseSR/Full"), Some((10_000, true)));
+        assert_eq!(mode_speed("100000baseCR4/Full"), Some((100_000, true)));
+        for not in [
+            "Autoneg",
+            "TP",
+            "Pause",
+            "Asym_Pause",
+            "FEC_RS",
+            "basebase/Full",
+            "",
+        ] {
+            assert_eq!(mode_speed(not), None, "{not}");
+        }
+    }
 }
