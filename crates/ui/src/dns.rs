@@ -2,9 +2,9 @@
 //!
 //! - **DNS** (Settings): servers, the LAN forwarder (Allow Remote Requests,
 //!   who may ask, per-client limit), upstream selection, serve-stale, cache
-//!   and limits, with Apply; buttons open Static and Cache. Statistics,
-//!   Adlist, Forwarders and Zones are there greyed out with the part that
-//!   brings them.
+//!   and limits, with Apply; buttons open Static, Cache and Zones
+//!   (`dns_zones.rs`). Statistics, Adlist and Forwarders are there greyed
+//!   out with the part that brings them.
 //! - **DNS Static**: the static entries, with New/properties dialogs.
 //! - **DNS Cache**: what the cache holds, with hits, and Flush Cache.
 //!
@@ -35,11 +35,10 @@ const TYPES: [&str; 9] = [
     "A", "AAAA", "CNAME", "FWD", "MX", "NS", "NXDOMAIN", "SRV", "TXT",
 ];
 /// The buttons of parts still to come, with why they are greyed out.
-const LATER: [(&str, &str); 4] = [
+const LATER: [(&str, &str); 3] = [
     ("Statistics", "Coming soon (G4.1e)"),
     ("Adlist", "Coming soon (G4.1d)"),
     ("Forwarders", "Coming soon (G4.1d)"),
-    ("Zones", "Coming soon (G4.1c)"),
 ];
 
 pub(crate) const PANEL: Panel = Panel {
@@ -658,6 +657,9 @@ impl DnsPanel {
                 if ui.button(label).clicked() {
                     open_window(app, win);
                 }
+            }
+            if ui.button("Zones").clicked() {
+                crate::dns_zones::open(app);
             }
             for (label, why) in LATER {
                 ui.add_enabled(false, egui::Button::new(label))

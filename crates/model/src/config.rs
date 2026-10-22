@@ -246,6 +246,9 @@ pub struct Ip {
     /// `/ip dns static` (G4.1b).
     #[serde(skip_serializing_if = "crate::dns_static::DnsStatic::is_empty")]
     pub dns_static: crate::dns_static::DnsStatic,
+    /// `/ip dns zone` (G4.1c): authoritative zones and their records.
+    #[serde(skip_serializing_if = "crate::dns_zone::DnsZones::is_empty")]
+    pub dns_zones: crate::dns_zone::DnsZones,
 }
 
 impl Ip {

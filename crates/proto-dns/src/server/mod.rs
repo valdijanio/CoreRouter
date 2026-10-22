@@ -71,6 +71,8 @@ pub struct Reply {
     pub rcode: ResponseCode,
     pub answers: Vec<Record>,
     pub authority: Vec<Record>,
+    /// Additional section (glue, addresses of NS/MX/SRV targets: zones).
+    pub additional: Vec<Record>,
     /// AA: the router is the authority (static entries, zones).
     pub authoritative: bool,
 }
@@ -81,6 +83,7 @@ impl Reply {
             rcode,
             answers: Vec::new(),
             authority: Vec::new(),
+            additional: Vec::new(),
             authoritative: false,
         }
     }
@@ -90,6 +93,7 @@ impl Reply {
             rcode: a.rcode.code(),
             answers: a.records.clone(),
             authority: a.authority.clone(),
+            additional: Vec::new(),
             authoritative: false,
         }
     }
@@ -428,7 +432,7 @@ impl Query {
         if q.query_class() != DNSClass::IN {
             return Err(error(&request, ResponseCode::Refused));
         }
-        // Zone transfers are for authoritative servers (G4.1c).
+        // Zone transfers are answered before the chain (`zone::xfr::intercept`).
         if matches!(q.query_type(), RecordType::AXFR | RecordType::IXFR) {
             return Err(error(&request, ResponseCode::Refused));
         }
@@ -468,6 +472,11 @@ impl Query {
     /// The client's question was sent with EDNS(0).
     pub fn has_edns(&self) -> bool {
         self.request.edns.is_some()
+    }
+
+    /// The client asked for recursion (RD).
+    pub fn recursion_desired(&self) -> bool {
+        self.request.metadata.recursion_desired
     }
 }
 
@@ -530,6 +539,7 @@ fn encode(q: &Query, r: &Reply) -> Option<Vec<u8>> {
     m.add_queries(req.queries.clone());
     m.add_answers(r.answers.iter().cloned());
     m.add_authorities(r.authority.iter().cloned());
+    m.add_additionals(r.additional.iter().cloned());
     if req.edns.is_some() {
         let mut e = Edns::new();
         e.set_max_payload(q.config.config.ip.dns.max_udp_packet_size.max(512));
@@ -541,6 +551,7 @@ fn encode(q: &Query, r: &Reply) -> Option<Vec<u8>> {
     }
     m.answers.clear();
     m.authorities.clear();
+    m.additionals.clear();
     m.metadata.truncation = true;
     m.to_vec().ok()
 }

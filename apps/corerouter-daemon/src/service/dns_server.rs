@@ -29,7 +29,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -39,6 +39,7 @@ use corerouter_model::Config;
 use corerouter_proto_dns::server::{
     Done, Effect, Forwarder, MAX_QUERY, Pending, Start, allowed_networks,
 };
+use corerouter_proto_dns::zone;
 use super::dns::RouterDns;
 use sock::{Udp, bind_tcp};
 
@@ -141,6 +142,11 @@ impl Server {
         }
     }
 
+    /// The forwarder (its zones are served by `dns_zones`).
+    pub(crate) fn forwarder(&self) -> &Forwarder {
+        &self.fwd
+    }
+
     /// The rest of the chain, on this (worker) thread.
     fn finish(&self, p: Pending) -> Done {
         let mut t = self.dns.transport();
@@ -167,6 +173,13 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
             }
         };
         let packet = buf.get(..n).unwrap_or_default();
+        // Zone transfers and NOTIFY (G4.1c), before the chain.
+        if let Some(replies) = zone::xfr::intercept(&srv.fwd, packet, from.ip(), false) {
+            for r in &replies {
+                sock.send(r, from, local);
+            }
+            continue;
+        }
         match srv.fwd.start(packet, from.ip(), false, srv.dns.now_ms()) {
             Start::Done(mut d) => {
                 if let Some(r) = &d.reply {
@@ -244,6 +257,20 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         let mut msg = vec![0u8; usize::from(u16::from_be_bytes(head))];
         if s.read_exact(&mut msg).is_err() {
             return;
+        }
+        // AXFR/IXFR (several messages) and NOTIFY (G4.1c), before the chain.
+        if let Some(replies) = zone::xfr::intercept(&srv.fwd, &msg, peer.ip(), true) {
+            for r in replies {
+                let Ok(len) = u16::try_from(r.len()) else {
+                    return;
+                };
+                let mut framed = len.to_be_bytes().to_vec();
+                framed.extend(r);
+                if s.write_all(&framed).is_err() {
+                    return;
+                }
+            }
+            continue;
         }
         let mut done = match srv.fwd.start(&msg, peer.ip(), true, srv.dns.now_ms()) {
             Start::Done(d) => d,
@@ -418,10 +445,21 @@ fn start(ctx: &super::Ctx) -> Result<(), String> {
         log::error!("DNS server is off: the resolver did not start");
         return Ok(());
     };
-    if let Err(e) = spawn(ctx.session.clone(), dns, port, ctx.shutdown.clone()) {
-        log::error!("DNS server is off: cannot start its threads: {e}");
+    match spawn(ctx.session.clone(), dns, port, ctx.shutdown.clone()) {
+        Ok(srv) => {
+            let _ = SERVER.set(srv);
+        }
+        Err(e) => log::error!("DNS server is off: cannot start its threads: {e}"),
     }
     Ok(())
+}
+
+/// The daemon's forwarder, once the service started (the zone service
+/// works on its zones).
+static SERVER: OnceLock<Arc<Server>> = OnceLock::new();
+
+pub(crate) fn server() -> Option<Arc<Server>> {
+    SERVER.get().cloned()
 }
 
 
