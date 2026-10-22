@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
-use corerouter_control::{Client, Host, SharedHost, bind_loopback, spawn};
+use corerouter_control::{Client, Host, SharedHost, bind_loopback, spawn, spawn_clock};
 use corerouter_engine::{Session, shared};
 use corerouter_ui::CoreRouterUi;
 use eframe::egui;
@@ -217,6 +217,10 @@ pub fn main() -> ExitCode {
         },
         None => {
             let session = shared(Session::virtual_lab());
+            // Safe Mode timeouts need a clock; the lab has no other.
+            if let Err(e) = spawn_clock(Arc::clone(&session)) {
+                log::warn!("no clock thread ({e}): Safe Mode timeouts are unavailable");
+            }
             (
                 CoreRouterUi::new(Arc::clone(&session)),
                 Target::Local(SharedHost(session)),

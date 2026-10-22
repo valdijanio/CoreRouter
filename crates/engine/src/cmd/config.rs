@@ -1,8 +1,8 @@
-//! Transaction control: commit, discard, rollback, history, diff, mode.
+//! Transaction control: commit, discard, rollback, history, diff, mode, Safe Mode.
 
 use serde_json::{Value, json};
 
-use super::args::{opt_text, req_str, req_u32};
+use super::args::{opt_bool, opt_text, opt_u32, req_str, req_u32};
 use super::{CommandSpec, always};
 use crate::{CommitMode, EngineError, Result, Session};
 
@@ -43,6 +43,33 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "config.mode.set", "Commit Mode", ["System", "Configuration"], None,
         "{mode: immediate|transactional} → {mode}",
         always, mode_set),
+    cmd!(
+        "config.safe-mode.enter",
+        "Safe Mode",
+        ["System", "Configuration"],
+        None,
+        "{timeout_secs?: u32} → {active, owner, since, entry_revision, timeout_secs, expires_in}",
+        always,
+        safe_mode_enter
+    ),
+    cmd!(
+        "config.safe-mode.exit",
+        "Leave Safe Mode (keep changes)",
+        ["System", "Configuration"],
+        None,
+        "{force?: bool} → {active: false, last}",
+        in_safe_mode,
+        safe_mode_exit
+    ),
+    cmd!(
+        "config.safe-mode.cancel",
+        "Leave Safe Mode (undo changes)",
+        ["System", "Configuration"],
+        None,
+        "{force?: bool} → {active: false, last}",
+        in_safe_mode,
+        safe_mode_cancel
+    ),
 ];
 
 fn dirty(s: &Session) -> std::result::Result<(), String> {
@@ -50,6 +77,14 @@ fn dirty(s: &Session) -> std::result::Result<(), String> {
         Ok(())
     } else {
         Err("no pending changes".into())
+    }
+}
+
+fn in_safe_mode(s: &Session) -> std::result::Result<(), String> {
+    if s.in_safe_mode() {
+        Ok(())
+    } else {
+        Err("not in Safe Mode".into())
     }
 }
 
@@ -102,4 +137,19 @@ fn mode_set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.set_mode(mode);
     Ok(json!({ "mode": mode }))
+}
+
+// Safe Mode (G1.4): see `crate::safe_mode`. Journaled, so the history of who
+// entered and left is in `state.inspect {path: journal}`; none of them edits
+// the candidate, so `execute` never auto-commits after them.
+fn safe_mode_enter(s: &mut Session, p: &Value) -> Result<Value> {
+    s.safe_mode_enter(opt_u32(p, "timeout_secs")?)
+}
+
+fn safe_mode_exit(s: &mut Session, p: &Value) -> Result<Value> {
+    s.safe_mode_exit(opt_bool(p, "force")?.unwrap_or(false))
+}
+
+fn safe_mode_cancel(s: &mut Session, p: &Value) -> Result<Value> {
+    s.safe_mode_cancel(opt_bool(p, "force")?.unwrap_or(false))
 }

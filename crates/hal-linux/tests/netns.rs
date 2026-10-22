@@ -27,6 +27,9 @@ use corerouter_model::{
 };
 
 const ENV: &str = "COREROUTER_NETNS_TESTS";
+/// With this set to 1 (the CI does it after `modprobe vrf`), a kernel
+/// without VRF fails the VRF tests instead of skipping them.
+const REQUIRE_VRF: &str = "COREROUTER_REQUIRE_VRF";
 
 /// True when the tests may touch the kernel; panics if asked to run outside
 /// a fresh namespace.
@@ -421,20 +424,50 @@ fn static_routes_and_link_state() {
 }
 
 /// Whether this kernel can create a `vrf` link (the module may be missing,
-/// and a user namespace cannot load it): VRF tests skip, loudly, if not.
+/// and a user namespace cannot load it). Checked once, with `ip`, so it is
+/// independent of our netlink code.
+fn kernel_has_vrf() -> bool {
+    static HAS: OnceLock<bool> = OnceLock::new();
+    *HAS.get_or_init(|| {
+        let ok = Command::new("ip")
+            .args(["link", "add", "vrfprobe", "type", "vrf", "table", "4242"])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        if ok {
+            ip(&["link", "del", "vrfprobe"]);
+        }
+        ok
+    })
+}
+
+/// Gate for VRF tests: without kernel VRF they skip, loudly — or fail, if
+/// `COREROUTER_REQUIRE_VRF=1`, so a broken module load cannot pass silently.
 fn has_vrf() -> bool {
-    let ok = Command::new("ip")
-        .args(["link", "add", "vrfprobe", "type", "vrf", "table", "4242"])
-        .output()
-        .unwrap()
-        .status
-        .success();
-    if ok {
-        ip(&["link", "del", "vrfprobe"]);
-    } else {
-        eprintln!("skipped: this kernel has no vrf support (CONFIG_NET_VRF / module vrf)");
+    if kernel_has_vrf() {
+        return true;
     }
-    ok
+    assert!(
+        std::env::var_os(REQUIRE_VRF).is_none_or(|v| v != "1"),
+        "{REQUIRE_VRF}=1 but this kernel cannot create a vrf link \
+         (CONFIG_NET_VRF / module vrf; on the host: modprobe vrf)"
+    );
+    eprintln!("skipped: this kernel has no vrf support (CONFIG_NET_VRF / module vrf)");
+    false
+}
+
+#[test]
+fn features_probe_matches_the_kernel_and_leaves_nothing() {
+    if !in_netns() {
+        return;
+    }
+    let hal = LinuxHal::new();
+    // Both answers are valid here; they just have to agree.
+    assert_eq!(hal.features().vrf, kernel_has_vrf());
+    assert_eq!(hal.features(), hal.features());
+    let links = ip(&["-o", "link", "show"]);
+    assert!(!links.contains("crvrf"), "probe link left behind:\n{links}");
 }
 
 #[test]
@@ -452,9 +485,11 @@ fn vrf_routes_live_in_their_own_table() {
     hal.apply(&Config::default(), &base).unwrap();
 
     // A VRF with its own copy of 10.64.0.0/24 and its own default route,
-    // next to main's.
+    // next to main's. Distance 5: tests share one namespace and run in
+    // parallel, and `static_routes_and_link_state` puts main's default at
+    // metrics 1 and 10 (same destination + metric = EEXIST).
     let mut to = base.clone();
-    route(&mut to, "0.0.0.0/0", "10.64.0.1");
+    route(&mut to, "0.0.0.0/0", "10.64.0.1").distance = 5;
     add(&mut to, "g1blue", InterfaceKind::Vrf { table: 1064 });
     to.interfaces.get_mut(&n("g1eth2")).unwrap().vrf = Some(n("g1blue"));
     addr(&mut to, "g1eth2", "10.64.0.2/24");

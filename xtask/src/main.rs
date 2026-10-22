@@ -127,8 +127,23 @@ fn test(root: &Path) -> Outcome {
 
 /// hal-linux against a real kernel, in a throwaway user + network namespace:
 /// no root, nothing reaches the host (crates/hal-linux/tests/netns.rs).
-/// Skips where unprivileged user namespaces are not allowed.
+/// Skips where unprivileged user namespaces are not allowed — unless
+/// `COREROUTER_REQUIRE_VRF=1` (the Linux CI job), where a skip would hide
+/// the VRF tests, so it fails instead.
 fn netns(root: &Path) -> Outcome {
+    match netns_run(root) {
+        Outcome::Skip(why)
+            if std::env::var_os("COREROUTER_REQUIRE_VRF").is_some_and(|v| v == "1") =>
+        {
+            Outcome::Fail(format!(
+                "COREROUTER_REQUIRE_VRF=1 but the netns tests cannot run: {why}"
+            ))
+        }
+        other => other,
+    }
+}
+
+fn netns_run(root: &Path) -> Outcome {
     if !cfg!(target_os = "linux") {
         return Outcome::Skip("network namespaces are Linux-only".into());
     }
@@ -154,16 +169,10 @@ fn netns(root: &Path) -> Outcome {
     // namespace holding only `lo`.
     for test in NETNS_TESTS {
         let mut c = Command::new("unshare");
+        // Not `--quiet`: one line per test, so a CI log shows which ones ran.
         c.args(UNSHARE)
             .arg(&cargo)
-            .args([
-                "test",
-                "--quiet",
-                "-p",
-                "corerouter-hal-linux",
-                "--test",
-                test,
-            ])
+            .args(["test", "-p", "corerouter-hal-linux", "--test", test])
             .env("COREROUTER_NETNS_TESTS", "1");
         if let Outcome::Fail(e) = run(c, root) {
             return Outcome::Fail(format!("{test}: {e}"));

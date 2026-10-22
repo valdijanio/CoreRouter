@@ -7,6 +7,8 @@
 //! - `l2`: neighbor-discovery I/O — LLDP frames over `AF_PACKET`, passive
 //!   MNDP over UDP 5678 (G5.2). Bytes only; the codecs are `proto-lldp` /
 //!   `proto-mndp`, glued by the daemon.
+//! - `features`: probed once, on first use, with a throwaway link per
+//!   capability (`netlink::features`), then cached (G1.14).
 //!
 //! Integration tests run against a real kernel inside a throwaway network
 //! namespace, without root: see `tests/netns.rs`.
@@ -23,9 +25,10 @@ pub mod l2;
 mod linux {
     use std::fs;
     use std::path::Path;
+    use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use corerouter_hal::{Hal, HalError, LinkInfo, LinkState};
+    use corerouter_hal::{Features, Hal, HalError, LinkInfo, LinkState};
     use corerouter_model::{Config, IfName};
 
     const SYS_NET: &str = "/sys/class/net";
@@ -35,7 +38,8 @@ mod linux {
 
     #[derive(Debug, Default)]
     pub struct LinuxHal {
-        _private: (),
+        /// Probed on the first `features()` call, not at startup.
+        features: OnceLock<Features>,
     }
 
     impl LinuxHal {
@@ -111,6 +115,10 @@ mod linux {
                 .duration_since(UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_secs())
+        }
+
+        fn features(&self) -> Features {
+            *self.features.get_or_init(crate::netlink::features)
         }
     }
 }

@@ -557,12 +557,15 @@ impl CoreRouterUi {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         let known = !s.is_null();
+        let safe_mode = SafeModeView::from_summary(s);
         ui.horizontal(|ui| {
             self.link_label(ui);
             // Nothing heard from the router yet: no empty fields.
             if !known {
                 return;
             }
+            self.safe_mode_button(ui, &safe_mode);
+            ui.separator();
             ui.strong(identity);
             ui.separator();
             ui.label(format!("backend: {backend}"));
@@ -581,6 +584,87 @@ impl CoreRouterUi {
                 }
                 if ui.button("Discard").clicked() {
                     self.run("config.discard", Value::Null);
+                }
+            }
+        });
+    }
+
+    /// WinBox's "Safe Mode" button. Click: enter, or leave keeping the
+    /// changes. Right click: timeouts, undo, and ending another client's.
+    fn safe_mode_button(&mut self, ui: &mut egui::Ui, v: &SafeModeView) {
+        let text = RichText::new(v.label()).strong();
+        let button = match v {
+            SafeModeView::Off { .. } => egui::Button::new(text),
+            SafeModeView::Mine { .. } => {
+                egui::Button::new(text.color(Color32::WHITE)).fill(SAFE_MODE_FILL)
+            }
+            SafeModeView::Theirs { .. } => {
+                egui::Button::new(text.color(ui.visuals().warn_fg_color))
+            }
+        };
+        let resp = ui.add(button).on_hover_text(v.hover());
+        if resp.clicked() {
+            match v {
+                // Theirs: the router answers with who holds it and since when.
+                SafeModeView::Off { .. } | SafeModeView::Theirs { .. } => {
+                    self.run("config.safe-mode.enter", json!({}));
+                }
+                SafeModeView::Mine { .. } => {
+                    self.run("config.safe-mode.exit", json!({}));
+                }
+            }
+        }
+        resp.context_menu(|ui| {
+            let mut pick = |ui: &mut egui::Ui, label: &str, id: &str, params: Value| {
+                if ui.button(label).clicked() {
+                    self.run(id, params);
+                    ui.close();
+                }
+            };
+            match v {
+                SafeModeView::Off { .. } | SafeModeView::Mine { .. } => {
+                    let verb = if matches!(v, SafeModeView::Off { .. }) {
+                        "Enter"
+                    } else {
+                        "Re-arm"
+                    };
+                    for (mins, secs) in [(1, 60), (5, 300), (10, 600)] {
+                        pick(
+                            ui,
+                            &format!("{verb} with a {mins} min timeout"),
+                            "config.safe-mode.enter",
+                            json!({ "timeout_secs": secs }),
+                        );
+                    }
+                    if matches!(v, SafeModeView::Mine { .. }) {
+                        ui.separator();
+                        pick(
+                            ui,
+                            "Leave, keep changes",
+                            "config.safe-mode.exit",
+                            json!({}),
+                        );
+                        pick(
+                            ui,
+                            "Leave, undo changes",
+                            "config.safe-mode.cancel",
+                            json!({}),
+                        );
+                    }
+                }
+                SafeModeView::Theirs { .. } => {
+                    pick(
+                        ui,
+                        "Release it (keep their changes)",
+                        "config.safe-mode.exit",
+                        json!({"force": true}),
+                    );
+                    pick(
+                        ui,
+                        "Undo their changes",
+                        "config.safe-mode.cancel",
+                        json!({"force": true}),
+                    );
                 }
             }
         });
@@ -681,6 +765,89 @@ pub fn human_bytes(n: u64) -> String {
     }
 }
 
+/// Background of the Safe Mode button while this client holds it.
+const SAFE_MODE_FILL: Color32 = Color32::from_rgb(190, 40, 40);
+
+/// The `safe_mode` part of the `state.inspect` summary, as the top bar
+/// shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SafeModeView {
+    Off {
+        last: Option<String>,
+    },
+    Mine {
+        entry_revision: u64,
+        expires_in: Option<u64>,
+    },
+    Theirs {
+        owner: String,
+    },
+}
+
+impl SafeModeView {
+    fn from_summary(summary: &Value) -> Self {
+        let sm = summary.get("safe_mode").unwrap_or(&Value::Null);
+        let text = |k: &str| sm.get(k).and_then(Value::as_str).map(str::to_owned);
+        if sm.get("active").and_then(Value::as_bool) != Some(true) {
+            return Self::Off { last: text("last") };
+        }
+        if sm.get("yours").and_then(Value::as_bool) == Some(true) {
+            Self::Mine {
+                entry_revision: sm
+                    .get("entry_revision")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0),
+                expires_in: sm.get("expires_in").and_then(Value::as_u64),
+            }
+        } else {
+            Self::Theirs {
+                owner: text("owner").unwrap_or_default(),
+            }
+        }
+    }
+
+    fn label(&self) -> String {
+        match self {
+            Self::Off { .. } => "Safe Mode".into(),
+            Self::Mine {
+                expires_in: Some(t),
+                ..
+            } => format!("Safe Mode {}:{:02}", t / 60, t % 60),
+            Self::Mine { .. } => "Safe Mode".into(),
+            Self::Theirs { owner } => format!("Safe Mode: {owner}"),
+        }
+    }
+
+    fn hover(&self) -> String {
+        match self {
+            Self::Off { last } => {
+                let mut s = "Enter Safe Mode: changes are undone if this connection drops.                              Right click for a timeout."
+                    .to_owned();
+                if let Some(last) = last {
+                    s.push_str("\nLast Safe Mode: ");
+                    s.push_str(last);
+                }
+                s
+            }
+            Self::Mine {
+                entry_revision,
+                expires_in,
+            } => {
+                let deadline = expires_in
+                    .map(|t| format!(", or in {t} s without confirmation"))
+                    .unwrap_or_default();
+                format!(
+                    "Safe Mode is on: changes since revision {entry_revision} are undone if                      this connection drops{deadline}.\nClick to keep them; right click to undo."
+                )
+            }
+            Self::Theirs { owner } => format!(
+                "Safe Mode is held by {owner}: their changes are undone if they disconnect. \
+                 Right click to release or undo it."
+            ),
+        }
+    }
+}
+
 fn err_color(ui: &egui::Ui) -> Color32 {
     ui.visuals().error_fg_color
 }
@@ -702,6 +869,50 @@ mod tests {
                 .drop_without_applying_deltas();
         }
         assert_eq!(app.open.len(), Win::ALL.len());
+    }
+
+    #[test]
+    fn safe_mode_button_follows_the_summary() {
+        let session = shared(Session::virtual_lab());
+        lock(&session).tick(1_000);
+        let mut app = CoreRouterUi::new(session.clone());
+        let ctx = egui::Context::default();
+        let frame = |app: &mut CoreRouterUi| {
+            ctx.run_ui(egui::RawInput::default(), |ui| app.ui(ui))
+                .drop_without_applying_deltas();
+        };
+        frame(&mut app);
+        let view = || SafeModeView::from_summary(&app.cache.summary);
+        assert_eq!(view(), SafeModeView::Off { last: None });
+
+        app.run("config.safe-mode.enter", json!({"timeout_secs": 300}));
+        app.pump();
+        frame(&mut app);
+        let view = SafeModeView::from_summary(&app.cache.summary);
+        assert_eq!(
+            view,
+            SafeModeView::Mine {
+                entry_revision: 0,
+                expires_in: Some(300)
+            }
+        );
+        assert_eq!(view.label(), "Safe Mode 5:00");
+
+        app.run("config.safe-mode.cancel", json!({}));
+        app.pump();
+        frame(&mut app);
+        let SafeModeView::Off { last: Some(last) } = SafeModeView::from_summary(&app.cache.summary)
+        else {
+            panic!("{}", app.cache.summary);
+        };
+        assert!(last.contains("cancelled"), "{last}");
+
+        // Held by another connection.
+        let theirs =
+            json!({"safe_mode": {"active": true, "yours": false, "owner": "tcp 10.0.0.9:4000"}});
+        let v = SafeModeView::from_summary(&theirs);
+        assert_eq!(v.label(), "Safe Mode: tcp 10.0.0.9:4000");
+        assert!(SafeModeView::from_summary(&Value::Null) == SafeModeView::Off { last: None });
     }
 
     #[test]

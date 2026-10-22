@@ -83,7 +83,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas) | serde, ipnet, thiserror |
-| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio) + `VirtualHal` (lab, wasm, CI) | L0 |
+| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features) + `VirtualHal` (lab, wasm, CI) | L0 |
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
@@ -142,8 +142,33 @@ MCP (Headless/Remote) ──┘        1. acha o CommandSpec (ou "did you mean")
 ```
 
 Modos: `immediate` (RouterOS: cada comando vira revisão) e `transactional` (VyOS/Junos:
-`config.diff` → `config.commit`; `config.rollback {revision}` carrega histórico). Safe Mode do
-RouterOS (commit confirmado com rollback automático) é G1.4.
+`config.diff` → `config.commit`; `config.rollback {revision}` carrega histórico).
+
+### Safe Mode (G1.4)
+
+Como no RouterOS: `config.safe-mode.enter` guarda a config running da entrada (a própria
+`Config`, não um número de revisão: o histórico é limitado a 64). Toda mudança feita depois —
+de qualquer cliente, como no RouterOS — roda no data plane, vira revisão marcada `[safe mode]`
+e **não é salva** no `ConfigStorage`. Fim:
+
+| Evento | Efeito |
+|---|---|
+| `config.safe-mode.exit` | confirma: salva e mantém |
+| `config.safe-mode.cancel`, conexão dona fecha, `timeout_secs` expira | a config da entrada é commitada como revisão nova ("safe mode undo: …"); journal registra o automático |
+| daemon reinicia no meio | o disco ainda tem a config da entrada: sobe nela |
+
+Quem é o dono: `Session::execute_as(&Caller, …)` (também `batch_as`, `inspect_as`); o canal de
+controle dá um `Caller` por conexão TCP/WebSocket (`control::new_caller`) e, quando ela fecha,
+chama `control::hang_up` → `Session::hang_up(id)`. `Session::execute` sem `_as` é o
+`Caller::local()` (GUI em lab, testes). Só um dono por vez: outro `enter` recebe "held by
+`<conexão>` since `<UTC>` (N s ago)"; `exit`/`cancel` de outro cliente pedem `force: true`
+(o "release"/"unroll" do RouterOS).
+
+Relógio: o engine não tem (wasm32). O tempo vem de `Hal::now_unix` ou de `Session::tick(unix)`,
+que o daemon e a GUI em lab chamam a cada segundo (`control::spawn_clock`); expiração é
+conferida em cada tick e antes de cada comando. Sem relógio (wasm `?lab`), Safe Mode funciona
+sem timeout. Uma conexão TCP ociosa morta (rede caiu sem FIN) só é percebida pelo timeout: por
+isso o botão oferece 1/5/10 min no clique direito.
 
 ### Persistência (G0.6)
 
@@ -210,6 +235,13 @@ memória do egui (posição das janelas) não é persistida.
    inversa e devolve `HalError::Rejected` dizendo o passo, o motivo e se o rollback foi completo.
    Mudança já em vigor (MTU igual, endereço presente) é no-op sem desfazer.
 
+**Recursos do kernel (G1.14).** `Hal::features()` diz o que a plataforma suporta (hoje só
+`vrf`), para um comando recusar de antemão com o motivo (`enabled`) em vez de falhar no
+`apply`. O `LinuxHal` sonda uma vez, na primeira consulta, com um link descartável por recurso
+(nome livre, apagado em seguida; links existentes nunca são tocados) e guarda o resultado num
+`OnceLock`. Um kernel de terceiros sem `CONFIG_NET_VRF` deixa `ip.vrf.add` desabilitado; as
+imagens do G1.6 vêm com `CONFIG_NET_VRF=y`.
+
 ### Rotas estáticas e VRF (G1.5)
 
 - **Modelo:** `ip.routes` (`RouteEntry`: `dst_address`, `gateway`, `distance`, `routing_table`,
@@ -249,3 +281,5 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-21 — G1.11: preferências da janela (tema, comentários inline) fora do engine.
 - 2026-10-21 — G5.2: crates `proto-lldp`/`proto-mndp` (L2) e módulo `l2` do `hal-linux`.
 - 2026-10-21 — G1.5: rotas estáticas e VRF (`model::route`, passos 0 e 9 do plano).
+- 2026-10-22 — G1.14: `Hal::features` e a sonda de recursos do `hal-linux`.
+- 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).

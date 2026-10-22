@@ -41,6 +41,24 @@ pub struct LinkState {
     pub tx_packets: u64,
 }
 
+/// Why `ip.vrf.add` is disabled, and what a failed `vrf` link create means.
+pub const NO_VRF: &str = "this kernel has no VRF support (CONFIG_NET_VRF / module vrf)";
+
+/// What the platform can do, so a command can refuse up front (with the
+/// reason) instead of failing at apply time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct Features {
+    /// VRF devices (Linux: `CONFIG_NET_VRF`, module `vrf`).
+    pub vrf: bool,
+}
+
+impl Default for Features {
+    /// Everything: a backend that does not probe lets `apply` say no.
+    fn default() -> Self {
+        Self { vrf: true }
+    }
+}
+
 pub trait Hal: Send {
     /// Human/agent readable description: "virtual lab (8 ports)", "linux netlink".
     fn describe(&self) -> String;
@@ -57,4 +75,10 @@ pub trait Hal: Send {
 
     /// Wall clock in seconds since the Unix epoch, if the platform has one.
     fn now_unix(&self) -> Option<u64>;
+
+    /// What this platform supports. Cheap after the first call: backends
+    /// that probe the kernel do it once and cache the answer.
+    fn features(&self) -> Features {
+        Features::default()
+    }
 }
