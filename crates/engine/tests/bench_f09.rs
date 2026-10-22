@@ -15,6 +15,7 @@ fn bench_f09_answers() {
 fn bench_f09_builds_a_system_literal() {
     let s = corerouter_model::System {
         identity: "edge-1".into(),
+        ..Default::default()
     };
     assert_eq!(s.identity, "edge-1");
 }
