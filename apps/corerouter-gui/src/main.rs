@@ -1,26 +1,25 @@
 //! CoreRouter GUI.
 //!
-//! Native: `corerouter-gui [--control <port>]` runs the virtual lab and, with
-//! `--control`, serves the control channel (including `ui.screenshot`) so an
-//! agent can drive and *see* the app. Web: same UI on a `<canvas id="corerouter">`.
-//! Remote mode (UI as a client of a real router) is docs/gaps.md G0.4.
+//! Native: `corerouter-gui [--connect HOST:PORT] [--control <port>]` manages a
+//! `corerouter-daemon` over its control channel (like WinBox), or runs an
+//! in-process virtual lab without `--connect`. `--control` serves the control
+//! channel (including `ui.screenshot`) so an agent can drive and *see* the app.
+//!
+//! Web: same UI on a `<canvas id="corerouter">`, talking to the daemon's
+//! WebSocket (`?connect=ws://…`, or the page's own origin when the daemon
+//! serves the GUI); `?lab` runs the virtual lab in the browser instead.
 
-use corerouter_engine::Shared;
 use corerouter_ui::CoreRouterUi;
 
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
+#[cfg(not(target_arch = "wasm32"))]
+mod remote;
+#[cfg(target_arch = "wasm32")]
+mod web;
 
 struct GuiApp {
     ui: CoreRouterUi,
-}
-
-impl GuiApp {
-    fn new(session: Shared) -> Self {
-        Self {
-            ui: CoreRouterUi::new(session),
-        }
-    }
 }
 
 impl eframe::App for GuiApp {
@@ -47,13 +46,20 @@ fn main() {
         log::error!("no <canvas id=\"corerouter\"> in the page");
         return;
     };
+    let ui = match web::choice() {
+        web::Choice::Lab => CoreRouterUi::new(shared(Session::virtual_lab())),
+        web::Choice::Connect(url) => {
+            // Auth/TLS are G0.3: the daemon only listens on loopback.
+            log::info!("managing the router at {url}");
+            CoreRouterUi::with_backend(Box::new(web::WsBackend::new(url)))
+        }
+    };
     wasm_bindgen_futures::spawn_local(async move {
-        let session = shared(Session::virtual_lab());
         let started = eframe::WebRunner::new()
             .start(
                 canvas,
                 eframe::WebOptions::default(),
-                Box::new(move |_cc| Ok(Box::new(GuiApp::new(session)))),
+                Box::new(move |_cc| Ok(Box::new(GuiApp { ui }))),
             )
             .await;
         if let Err(e) = started {

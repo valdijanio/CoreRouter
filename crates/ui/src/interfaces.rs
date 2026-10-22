@@ -9,7 +9,7 @@ use egui::{Grid, TextEdit, Ui};
 use serde_json::{Value, json};
 
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, num};
-use crate::{CoreRouterUi, form_number, human_bytes, value_text};
+use crate::{CoreRouterUi, Then, form_number, human_bytes, value_text};
 
 pub(crate) const TABLE: &str = "interfaces";
 /// Property windows opened at once from one selection (WinBox opens one
@@ -153,12 +153,6 @@ impl Props {
         p.insert("name".into(), json!(self.name));
         Some(Value::Object(p))
     }
-
-    fn applied(&mut self) {
-        self.base_mtu = self.mtu.trim().to_owned();
-        self.base_comment = self.comment.clone();
-        self.base_disabled = self.disabled;
-    }
 }
 
 pub(crate) struct DialogWin {
@@ -167,6 +161,27 @@ pub(crate) struct DialogWin {
     pub dialog: Dialog,
     /// Last engine error, shown at the bottom like WinBox does.
     pub error: Option<String>,
+    /// Commands sent by the last button and not answered yet; the buttons
+    /// are disabled meanwhile.
+    pub waiting: usize,
+    /// Close once every reply is in and none failed (OK, Remove, "New …").
+    pub close_on_success: bool,
+}
+
+/// What a dialog's command changes in the dialog when it succeeds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Effect {
+    None,
+    /// "New …" + Apply: open the created interface's window.
+    OpenCreated,
+    /// The values sent by OK/Apply are the engine's now.
+    Applied {
+        mtu: String,
+        comment: String,
+        disabled: bool,
+    },
+    /// Enable/Disable button.
+    Toggled(bool),
 }
 
 /// What the buttons of a dialog asked for this frame.
@@ -347,11 +362,13 @@ impl CoreRouterUi {
             id: self.next_dialog,
             dialog,
             error: None,
+            waiting: 0,
+            close_on_success: false,
         });
     }
 
     /// "Interface <name>"; an already open one is not duplicated.
-    fn open_props(&mut self, name: &str) {
+    pub(crate) fn open_props(&mut self, name: &str) {
         let open = self
             .dialogs
             .iter()
@@ -382,7 +399,8 @@ impl CoreRouterUi {
                 .resizable(false)
                 .collapsible(false)
                 .show(ctx, |ui| {
-                    pressed = dialog_body(ui, &mut d.dialog, &ifaces, &mut d.error);
+                    let busy = d.waiting > 0;
+                    pressed = dialog_body(ui, &mut d.dialog, &ifaces, &d.error, busy);
                 });
             open && pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces))
         });
@@ -391,20 +409,27 @@ impl CoreRouterUi {
         self.dialogs = dialogs;
     }
 
-    /// Run what a dialog button means. Returns whether the dialog stays open.
+    /// Send what a dialog button means. Returns whether the dialog stays
+    /// open now; whether it closes on success is decided when the replies
+    /// arrive ([`CoreRouterUi::dialog_reply`]).
     fn dialog_button(&mut self, d: &mut DialogWin, b: Button, ifaces: &[Iface]) -> bool {
         if b == Button::Cancel {
             return false;
         }
-        let keep = b == Button::Apply;
-        let ok = match &mut d.dialog {
+        let open_after = if b == Button::Apply {
+            Effect::OpenCreated
+        } else {
+            Effect::None
+        };
+        // "New …" closes on any success; Apply also opens what it made.
+        let sends: Vec<(&str, Value, Effect)> = match &d.dialog {
             Dialog::NewVlan {
                 name,
                 parent,
                 vlan_id,
                 mtu,
                 comment,
-            } => self.create(
+            } => vec![(
                 "interface.vlan.add",
                 json!({
                     "name": name.trim(),
@@ -413,110 +438,157 @@ impl CoreRouterUi {
                     "mtu": form_number(mtu),
                     "comment": opt_text(comment),
                 }),
-                keep,
-            ),
-            Dialog::NewBridge { name, comment } => self.create(
+                open_after,
+            )],
+            Dialog::NewBridge { name, comment } => vec![(
                 "interface.bridge.add",
                 json!({"name": name.trim(), "comment": opt_text(comment)}),
-                keep,
-            ),
-            Dialog::NewLoopback { name, comment } => self.create(
+                open_after,
+            )],
+            Dialog::NewLoopback { name, comment } => vec![(
                 "interface.loopback.add",
                 json!({"name": name.trim(), "comment": opt_text(comment)}),
-                keep,
-            ),
-            Dialog::Comment { targets, text } => {
-                let mut ok = true;
-                for t in targets.iter() {
-                    ok &= self
-                        .run("interface.set", json!({"name": t, "comment": text}))
-                        .is_some();
+                open_after,
+            )],
+            Dialog::Comment { targets, text } => targets
+                .iter()
+                .map(|t| {
+                    (
+                        "interface.set",
+                        json!({"name": t, "comment": text}),
+                        Effect::None,
+                    )
+                })
+                .collect(),
+            Dialog::Props(p) => {
+                let (sends, close) = props_sends(p, &b, ifaces);
+                if sends.is_empty() {
+                    // OK with nothing changed just closes.
+                    return !close;
                 }
-                ok
+                d.close_on_success = close;
+                return self.send_dialog(d, sends);
             }
-            Dialog::Props(p) => return self.props_button(p, b, ifaces, &mut d.error),
         };
-        d.error = (!ok).then(|| self.last_error());
-        // "New …" + Apply turns into the new interface's window (opened by
-        // `create`), so the "New …" window itself closes on any success.
-        !ok
+        d.close_on_success = true;
+        self.send_dialog(d, sends)
     }
 
-    /// `*.add` from a "New …" dialog; on Apply, open the created interface.
-    fn create(&mut self, id: &str, params: Value, open_after: bool) -> bool {
-        let Some(r) = self.run(id, params) else {
-            return false;
-        };
-        if open_after && let Some(name) = r.get("name").and_then(Value::as_str) {
-            self.reload();
-            self.open_props(name);
+    fn send_dialog(&mut self, d: &mut DialogWin, sends: Vec<(&str, Value, Effect)>) -> bool {
+        d.error = None;
+        for (id, params, effect) in sends {
+            d.waiting += 1;
+            self.run_then(id, params, Then::Dialog { id: d.id, effect });
         }
         true
     }
 
-    fn props_button(
-        &mut self,
-        p: &mut Props,
-        b: Button,
-        ifaces: &[Iface],
-        error: &mut Option<String>,
-    ) -> bool {
-        let ok = match &b {
-            Button::Ok | Button::Apply => match p.changes() {
-                Some(params) => {
-                    let ok = self.run("interface.set", params).is_some();
-                    if ok {
-                        p.applied();
-                    }
-                    ok
-                }
-                None => true,
-            },
-            // WinBox applies Enable/Disable at once, outside OK/Apply.
-            Button::Toggle => {
-                let now = ifaces
-                    .iter()
-                    .find(|i| i.name == p.name)
-                    .is_some_and(|i| i.disabled);
-                let ok = self
-                    .run("interface.set", json!({"name": p.name, "disabled": !now}))
-                    .is_some();
-                if ok {
-                    p.disabled = !now;
-                    p.base_disabled = !now;
-                }
-                ok
-            }
-            Button::Remove => {
-                if self
-                    .run("interface.remove", json!({ "name": p.name }))
-                    .is_some()
-                {
-                    return false;
-                }
-                false
-            }
-            Button::Port { add, bridge, port } => {
-                let id = if *add {
-                    "interface.bridge.port.add"
-                } else {
-                    "interface.bridge.port.remove"
-                };
-                self.run(id, json!({"bridge": bridge, "interface": port}))
-                    .is_some()
-            }
-            Button::Cancel => return false,
+    /// A reply to a dialog's command. A failure shows the engine's error in
+    /// the dialog and keeps it open; the dialog may be gone already.
+    pub(crate) fn dialog_reply(&mut self, id: u64, effect: Effect, result: &Result<Value, String>) {
+        let Some(pos) = self.dialogs.iter().position(|d| d.id == id) else {
+            return;
         };
-        *error = (!ok).then(|| self.last_error());
-        !(ok && b == Button::Ok)
+        let mut open_created = None;
+        let close = match self.dialogs.get_mut(pos) {
+            None => return,
+            Some(d) => {
+                d.waiting = d.waiting.saturating_sub(1);
+                match (result, effect, &mut d.dialog) {
+                    (Err(e), _, _) => d.error = Some(e.clone()),
+                    (Ok(r), Effect::OpenCreated, _) => {
+                        open_created = r.get("name").and_then(Value::as_str).map(str::to_owned);
+                    }
+                    (
+                        Ok(_),
+                        Effect::Applied {
+                            mtu,
+                            comment,
+                            disabled,
+                        },
+                        Dialog::Props(p),
+                    ) => {
+                        p.base_mtu = mtu;
+                        p.base_comment = comment;
+                        p.base_disabled = disabled;
+                    }
+                    (Ok(_), Effect::Toggled(now), Dialog::Props(p)) => {
+                        p.disabled = now;
+                        p.base_disabled = now;
+                    }
+                    (Ok(_), _, _) => {}
+                }
+                d.waiting == 0 && d.close_on_success && d.error.is_none()
+            }
+        };
+        if close {
+            self.dialogs.remove(pos);
+        }
+        if let Some(name) = open_created {
+            // Opens when an `interface.list` that has it arrives.
+            let list = self.reload();
+            self.open_after.push((list, name));
+        }
     }
+}
 
-    fn last_error(&self) -> String {
-        self.log
-            .last()
-            .filter(|l| !l.ok)
-            .map(|l| l.message.clone())
-            .unwrap_or_default()
+/// The commands of a button in an "Interface <name>" window, and whether
+/// the window closes when they succeed.
+fn props_sends(
+    p: &Props,
+    b: &Button,
+    ifaces: &[Iface],
+) -> (Vec<(&'static str, Value, Effect)>, bool) {
+    match b {
+        Button::Ok | Button::Apply => {
+            let close = *b == Button::Ok;
+            match p.changes() {
+                Some(params) => {
+                    let effect = Effect::Applied {
+                        mtu: p.mtu.trim().to_owned(),
+                        comment: p.comment.clone(),
+                        disabled: p.disabled,
+                    };
+                    (vec![("interface.set", params, effect)], close)
+                }
+                None => (Vec::new(), close),
+            }
+        }
+        // WinBox applies Enable/Disable at once, outside OK/Apply.
+        Button::Toggle => {
+            let now = ifaces
+                .iter()
+                .find(|i| i.name == p.name)
+                .is_some_and(|i| i.disabled);
+            (
+                vec![(
+                    "interface.set",
+                    json!({"name": p.name, "disabled": !now}),
+                    Effect::Toggled(!now),
+                )],
+                false,
+            )
+        }
+        Button::Remove => (
+            vec![("interface.remove", json!({ "name": p.name }), Effect::None)],
+            true,
+        ),
+        Button::Port { add, bridge, port } => {
+            let id = if *add {
+                "interface.bridge.port.add"
+            } else {
+                "interface.bridge.port.remove"
+            };
+            (
+                vec![(
+                    id,
+                    json!({"bridge": bridge, "interface": port}),
+                    Effect::None,
+                )],
+                false,
+            )
+        }
+        Button::Cancel => (Vec::new(), true),
     }
 }
 
@@ -705,7 +777,8 @@ fn dialog_body(
     ui: &mut Ui,
     d: &mut Dialog,
     ifaces: &[Iface],
-    error: &mut Option<String>,
+    error: &Option<String>,
+    busy: bool,
 ) -> Option<Button> {
     let names: Vec<String> = ifaces.iter().map(|i| i.name.clone()).collect();
     let mut port_op: Option<(bool, String, String)> = None;
@@ -795,8 +868,10 @@ fn dialog_body(
     ui.separator();
     let mut pressed = None;
     ui.horizontal(|ui| {
+        // While the router has not answered, only Cancel works.
         let mut btn = |ui: &mut Ui, text: &str, b: Button| {
-            if ui.button(text).clicked() {
+            let enabled = !busy || b == Button::Cancel;
+            if ui.add_enabled(enabled, egui::Button::new(text)).clicked() {
                 pressed = Some(b);
             }
         };
@@ -809,8 +884,12 @@ fn dialog_body(
             btn(ui, t, Button::Toggle);
             btn(ui, "Remove", Button::Remove);
         }
+        if busy {
+            ui.weak("…");
+        }
     });
     port_op
+        .filter(|_| !busy)
         .map(|(add, bridge, port)| Button::Port { add, bridge, port })
         .or(pressed)
 }

@@ -56,6 +56,7 @@ cargo run -p corerouter-cli -- list ip.                 # comandos e assinaturas
 cargo run -p corerouter-cli -- run interface.list
 cargo run -p corerouter-daemon -- --control 7979        # daemon (virtual lab)
 cargo run -p corerouter-gui -- --control 7979           # GUI + canal de controle
+cargo run -p corerouter-gui -- --connect 127.0.0.1:7979 --control 7990   # GUI gerenciando o daemon
 cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.address.add '{"address":"10.0.0.1/24","interface":"ether1"}'
 cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 screenshot /tmp/ui.png   # depois abra o PNG
 ```

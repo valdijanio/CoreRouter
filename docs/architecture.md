@@ -87,10 +87,10 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, endereços; G1.2), descoberta/contadores via sysfs; nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal | L0–L2 (nunca plataforma) |
-| L4 | `crates/control` | Canal JSON-por-linha em loopback, `dispatch`, `Host`, `Client` | L0–L3 |
+| L4 | `crates/control` | Canal JSON-por-linha em loopback, WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client` | L0–L3 |
 | L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
-| L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe) | L0–L4 + egui |
+| L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe); trait `Backend` assíncrono + `Local` | L0–L4 + egui |
 | L6 | `apps/corerouter-{daemon,gui,cli}` | Binários; únicos que escolhem backend de plataforma e janela | tudo |
 | L7 | `xtask` | `cargo xtask ci`, `layers`, `wasm`, `agents-sync` | nenhum crate do workspace |
 
@@ -157,6 +157,32 @@ candidate nunca é gravado (edição não commitada não sobrevive a reinício, 
 | `MemoryStorage` | engine | GUI, wasm, testes, daemon em lab sem `--config-dir` |
 | `FileStorage` | `storage-fs` (L4) | daemon: temp + fsync → rename current→prev → rename temp→current → fsync do diretório |
 
+### GUI como cliente do daemon (G0.4)
+
+A GUI não segura a `Session`: fala com um `Backend` (trait de `crates/ui`) por requisição e
+resposta, com os métodos do canal de controle (`engine.execute`, `state.inspect`, …).
+`submit(method, params) -> RequestId` enfileira e volta na hora; `poll()` entrega as respostas
+que chegaram, em qualquer ordem; `link()` diz conectando/conectado/desconectado (barra
+superior). Contrato: todo id recebe exatamente uma resposta (erro se a conexão cair).
+
+```
+CoreRouterUi::run(id, params) ─► Backend::submit("engine.execute") ─► pending[id] = Action{then}
+frame N+k: Backend::poll() ─► log + refresh + efeito (fecha diálogo, abre a interface criada…)
+refresh (1 s, um por vez): state.inspect + 5 listas ─► cache; resposta mais velha que a já
+aplicada no mesmo campo é descartada
+```
+
+| Backend | Onde | Transporte |
+|---|---|---|
+| `Local` | `crates/ui` | `Session` no processo; responde na hora (testes headless, `corerouter-gui` sem `--connect`, `?lab` na web) |
+| `Remote` | `apps/corerouter-gui` (nativo) | `control::Client` numa thread de trabalho com canais std; reconecta a cada 2 s; requisição sem conexão falha na hora (nunca fica para "depois") |
+| `WsBackend` | `apps/corerouter-gui` (wasm) | `web_sys::WebSocket`; eventos do navegador só enchem uma fila lida em `poll` |
+
+O daemon serve o WebSocket com `control::ws` (thread por conexão, `tungstenite` síncrono) e
+pode servir os arquivos da GUI web na mesma porta (`--web-root`, modelo WebFig); a lista de
+`Origin` impede que uma página qualquer comande o roteador local. Detalhes em
+`docs/control-protocol.md`. Autenticação/TLS continuam no G0.3: tudo só em loopback.
+
 ### `hal-linux`: aplicação no kernel (G1.2)
 
 `LinuxHal::apply(from, to)` tem duas metades:
@@ -184,3 +210,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).
 - 2026-10-21 — G0.6: crate `storage-fs` (L4) e seção de persistência.
 - 2026-10-21 — `hal-linux` aplica via rtnetlink (G1.2): plano puro + executor com rollback.
+- 2026-10-21 — G0.4: trait `Backend` da UI, GUI remota (nativo e WebSocket), `control::ws`.

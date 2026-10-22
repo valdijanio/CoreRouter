@@ -60,9 +60,29 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   nenhum comando novo. 4 testes headless dirigidos por eventos sintéticos + 3 de seleção;
   conferido na GUI real (xdotool + `screenshot`).
 
+- 2026-10-21 — G0.4: a GUI gerencia um `corerouter-daemon` (antes só rodava um lab em memória,
+  e o que se fazia nela sumia ao fechar). `crates/ui` ganhou o trait `Backend` (`submit` →
+  `RequestId`, `poll`, `link`) sobre os métodos do canal de controle; `CoreRouterUi::run`
+  continua a única porta de ação, mas o resultado chega num frame seguinte (diálogos esperam a
+  resposta com os botões desabilitados; refresh um por vez; resposta atrasada não sobrescreve
+  uma mais nova). `Local` mantém o comportamento antigo e os testes headless. Nativo:
+  `corerouter-gui --connect HOST:PORT` (thread + reconexão a cada 2 s; "connecting…/
+  disconnected" na barra superior, erro na de status; `--control` repassa ao daemon e mantém
+  `ui.screenshot`). Web: `corerouter-daemon --ws <porta>` (`control::ws`, `tungstenite` 0.30
+  síncrono) com lista de `Origin` (padrão: só a origem da própria porta), `--ws-origin`,
+  `--web-root dist` (GUI servida pelo daemon, modelo WebFig); GUI wasm com `web_sys::WebSocket`
+  (`?connect=`, `?lab`, ou mesma origem). Sem autenticação/TLS (G0.3): só loopback, dito no log.
+  16 testes novos (WS com Origin aceito/recusado, limites, arquivos estáticos; backend remoto
+  contra servidor real em `127.0.0.1:0` e queda de conexão; UI com respostas fora de ordem e
+  link caindo). Teste manual (**medido**): ether3 desabilitada e ether5 comentada pela GUI
+  nativa sobreviveram a reinício de GUI e daemon (revisão 2 restaurada); a GUI reconectou
+  sozinha; pela GUI web servida com `--web-root`, ether3 reabilitada (revisão 3); página de
+  outra origem recusada (403) até `--ws-origin`.
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
 - 2026-10-21 — log do G0.6.
 - 2026-10-21 — log do G1.2.
 - 2026-10-21 — log do G1.9.
+- 2026-10-21 — log do G0.4.

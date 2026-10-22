@@ -5,21 +5,25 @@
 //! business logic lives here. This crate depends on `egui` only — the window
 //! (eframe/winit/wgpu) belongs to `apps/corerouter-gui`.
 
+pub mod backend;
 mod interfaces;
 mod table;
 mod windows;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use corerouter_engine::{Shared, lock};
+use corerouter_engine::Shared;
 use egui::{Color32, RichText};
 use serde_json::{Value, json};
 
+pub use backend::{Backend, Link, Local, Reply, RequestId};
 pub use windows::Win;
 
 /// Seconds between automatic refreshes of the live tables.
 const REFRESH_SECS: f64 = 1.0;
+/// Repaint this often while replies are outstanding (a remote router).
+const PENDING_REPAINT: Duration = Duration::from_millis(50);
 const MAX_LOG: usize = 500;
 
 #[derive(Debug, Clone)]
@@ -27,6 +31,17 @@ pub struct LogLine {
     pub ok: bool,
     pub command: String,
     pub message: String,
+}
+
+/// One cached query result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Field {
+    Summary,
+    Interfaces,
+    Addresses,
+    Bgp,
+    History,
+    Diff,
 }
 
 /// Cached query results, refreshed every `REFRESH_SECS` or after an action.
@@ -39,6 +54,8 @@ struct Cache {
     history: Vec<Value>,
     diff: Vec<Value>,
     refreshed_at: Option<f64>,
+    /// Newest reply applied per field: an older one arriving late is dropped.
+    applied: BTreeMap<Field, RequestId>,
 }
 
 /// Text fields of the forms (UI-local state only).
@@ -61,8 +78,26 @@ struct Tables {
     addresses: table::TableState,
 }
 
+/// What a reply is for.
+enum Pending {
+    Query(Field),
+    Action { command: String, then: Then },
+}
+
+/// What to do when an action's reply arrives.
+pub(crate) enum Then {
+    Nothing,
+    ClearAddressForm,
+    ShowFrr,
+    Dialog { id: u64, effect: interfaces::Effect },
+}
+
 pub struct CoreRouterUi {
-    session: Shared,
+    backend: Box<dyn Backend>,
+    pending: BTreeMap<RequestId, Pending>,
+    /// Last link state seen, and whether its loss was already logged.
+    link: Link,
+    link_down_logged: bool,
     open: BTreeSet<Win>,
     log: Vec<LogLine>,
     cache: Cache,
@@ -71,14 +106,26 @@ pub struct CoreRouterUi {
     /// Floating "New …" / "Interface <name>" / "Comment" windows.
     dialogs: Vec<interfaces::DialogWin>,
     next_dialog: u64,
+    /// Interfaces to open once an `interface.list` at least this new arrives.
+    open_after: Vec<(RequestId, String)>,
 }
 
 impl CoreRouterUi {
+    /// UI over a session in this process (the virtual lab).
     pub fn new(session: Shared) -> Self {
+        Self::with_backend(Box::new(Local::new(session)))
+    }
+
+    /// UI over any backend, e.g. a remote router.
+    pub fn with_backend(backend: Box<dyn Backend>) -> Self {
         let mut open = BTreeSet::new();
         open.insert(Win::Interfaces);
+        let link = backend.link();
         Self {
-            session,
+            backend,
+            pending: BTreeMap::new(),
+            link,
+            link_down_logged: false,
             open,
             log: Vec::new(),
             cache: Cache::default(),
@@ -89,6 +136,7 @@ impl CoreRouterUi {
             tables: Tables::default(),
             dialogs: Vec::new(),
             next_dialog: 0,
+            open_after: Vec::new(),
         }
     }
 
@@ -104,38 +152,183 @@ impl CoreRouterUi {
         &self.log
     }
 
-    /// The only way the UI changes anything: run a command, log the outcome,
-    /// refresh the tables. Returns the result on success.
-    pub fn run(&mut self, id: &str, params: Value) -> Option<Value> {
-        let result = lock(&self.session).execute(id, &params);
-        let line = match &result {
-            Ok(v) => LogLine {
-                ok: true,
+    pub fn link(&self) -> &Link {
+        &self.link
+    }
+
+    /// The only way the UI changes anything: send a command to the router.
+    /// The outcome is logged (and the tables refreshed) when the reply
+    /// arrives, a later frame for a remote router.
+    pub fn run(&mut self, id: &str, params: Value) -> RequestId {
+        self.run_then(id, params, Then::Nothing)
+    }
+
+    pub(crate) fn run_then(&mut self, id: &str, params: Value, then: Then) -> RequestId {
+        let req = self
+            .backend
+            .submit("engine.execute", json!({"command": id, "params": params}));
+        self.pending.insert(
+            req,
+            Pending::Action {
                 command: id.to_owned(),
-                message: v.to_string(),
+                then,
             },
-            Err(e) => LogLine {
-                ok: false,
-                command: id.to_owned(),
-                message: e.to_string(),
-            },
-        };
+        );
+        req
+    }
+
+    /// Actions sent and not answered yet.
+    pub fn busy(&self) -> usize {
+        self.pending
+            .values()
+            .filter(|p| matches!(p, Pending::Action { .. }))
+            .count()
+    }
+
+    fn push_log(&mut self, line: LogLine) {
         self.log.push(line);
         if self.log.len() > MAX_LOG {
             self.log.remove(0);
         }
-        self.cache.refreshed_at = None;
-        result.ok()
     }
 
-    /// Read-only command; errors are shown in place by the caller.
-    fn query(&self, id: &str, params: Value) -> Value {
-        lock(&self.session)
-            .execute(id, &params)
-            .unwrap_or(Value::Null)
+    /// Apply every reply that has arrived. Never blocks.
+    pub fn pump(&mut self) {
+        // A local backend answers the queries a reply triggers (a reload)
+        // at once; a few rounds settle it within the frame.
+        for _ in 0..4 {
+            let replies = self.backend.poll();
+            if replies.is_empty() {
+                break;
+            }
+            for (id, result) in replies {
+                self.on_reply(id, result);
+            }
+        }
+        self.watch_link();
+    }
+
+    fn on_reply(&mut self, id: RequestId, result: Result<Value, String>) {
+        // Unknown or already answered ids are ignored.
+        match self.pending.remove(&id) {
+            None => {}
+            Some(Pending::Query(field)) => self.on_query(field, id, result),
+            Some(Pending::Action { command, then }) => {
+                let message = match &result {
+                    Ok(v) => v.to_string(),
+                    Err(e) => e.clone(),
+                };
+                self.push_log(LogLine {
+                    ok: result.is_ok(),
+                    command,
+                    message,
+                });
+                self.cache.refreshed_at = None;
+                self.then(then, &result);
+            }
+        }
+    }
+
+    fn on_query(&mut self, field: Field, id: RequestId, result: Result<Value, String>) {
+        // A failed query keeps the last good data; the link state says why.
+        let Ok(value) = result else {
+            return;
+        };
+        if self
+            .cache
+            .applied
+            .get(&field)
+            .is_some_and(|&seen| seen > id)
+        {
+            return;
+        }
+        self.cache.applied.insert(field, id);
+        let arr = |v: Value| match v {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        match field {
+            Field::Summary => self.cache.summary = value,
+            Field::Interfaces => {
+                self.cache.interfaces = arr(value);
+                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_after)
+                    .into_iter()
+                    .partition(|(req, _)| *req <= id);
+                self.open_after = later;
+                for (_, name) in ready {
+                    self.open_props(&name);
+                }
+            }
+            Field::Addresses => self.cache.addresses = arr(value),
+            Field::Bgp => self.cache.bgp = arr(value),
+            Field::History => self.cache.history = arr(value),
+            Field::Diff => self.cache.diff = arr(value),
+        }
+    }
+
+    fn then(&mut self, then: Then, result: &Result<Value, String>) {
+        match then {
+            Then::Nothing => {}
+            Then::ClearAddressForm => {
+                if result.is_ok() {
+                    self.forms.addr_address.clear();
+                    self.forms.addr_comment.clear();
+                }
+            }
+            Then::ShowFrr => {
+                if let Ok(r) = result {
+                    self.forms.bgp_frr = r.get("frr").map(value_text).unwrap_or_default();
+                }
+            }
+            Then::Dialog { id, effect } => self.dialog_reply(id, effect, result),
+        }
+    }
+
+    /// Log when the router goes away or comes back (once, not per retry).
+    fn watch_link(&mut self) {
+        let link = self.backend.link();
+        if link == self.link {
+            return;
+        }
+        match &link {
+            Link::Disconnected { target, reason } if !self.link_down_logged => {
+                self.link_down_logged = true;
+                let message = if reason.contains(target.as_str()) {
+                    reason.clone()
+                } else {
+                    format!("{target}: {reason}")
+                };
+                self.push_log(LogLine {
+                    ok: false,
+                    command: "connection".into(),
+                    message,
+                });
+            }
+            Link::Connected { target } => {
+                if self.link_down_logged {
+                    self.push_log(LogLine {
+                        ok: true,
+                        command: "connection".into(),
+                        message: format!("connected to {target}"),
+                    });
+                }
+                self.link_down_logged = false;
+                self.cache.refreshed_at = None;
+            }
+            _ => {}
+        }
+        self.link = link;
     }
 
     fn refresh(&mut self, now: f64) {
+        // One refresh at a time: a slow router must not pile requests up.
+        if self
+            .pending
+            .values()
+            .any(|p| matches!(p, Pending::Query(_)))
+        {
+            return;
+        }
         if self
             .cache
             .refreshed_at
@@ -147,26 +340,55 @@ impl CoreRouterUi {
         self.cache.refreshed_at = Some(now);
     }
 
-    /// Re-read every table now (e.g. to open a window on what was just made).
-    fn reload(&mut self) {
-        let arr = |v: Value| match v {
-            Value::Array(a) => a,
-            _ => Vec::new(),
+    /// Ask for every table again. Returns the id of the `interface.list`.
+    fn reload(&mut self) -> RequestId {
+        let ask = |me: &mut Self, field: Field, method: &str, params: Value| {
+            let id = me.backend.submit(method, params);
+            me.pending.insert(id, Pending::Query(field));
+            id
         };
-        self.cache.summary = lock(&self.session).inspect(None).unwrap_or(Value::Null);
-        self.cache.interfaces = arr(self.query("interface.list", Value::Null));
-        self.cache.addresses = arr(self.query("ip.address.list", Value::Null));
-        self.cache.bgp = arr(self.query("routing.bgp.instance.list", Value::Null));
-        self.cache.history = arr(self.query("config.history", Value::Null));
-        self.cache.diff = arr(self.query("config.diff", Value::Null));
+        let exec = |command: &str| json!({ "command": command });
+        ask(self, Field::Summary, "state.inspect", json!({}));
+        let list = ask(
+            self,
+            Field::Interfaces,
+            "engine.execute",
+            exec("interface.list"),
+        );
+        ask(
+            self,
+            Field::Addresses,
+            "engine.execute",
+            exec("ip.address.list"),
+        );
+        ask(
+            self,
+            Field::Bgp,
+            "engine.execute",
+            exec("routing.bgp.instance.list"),
+        );
+        ask(
+            self,
+            Field::History,
+            "engine.execute",
+            exec("config.history"),
+        );
+        ask(self, Field::Diff, "engine.execute", exec("config.diff"));
+        list
     }
 
     /// Draw one frame into the root `Ui`.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let now = ui.input(|i| i.time);
+        self.pump();
         self.refresh(now);
-        ui.ctx()
-            .request_repaint_after(Duration::from_secs_f64(REFRESH_SECS));
+        self.pump();
+        let wake = if self.pending.is_empty() {
+            Duration::from_secs_f64(REFRESH_SECS)
+        } else {
+            PENDING_REPAINT
+        };
+        ui.ctx().request_repaint_after(wake);
 
         egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
         egui::Panel::bottom("status-bar").show(ui, |ui| self.status_bar(ui));
@@ -202,6 +424,25 @@ impl CoreRouterUi {
         self.dialogs(&ctx, area);
     }
 
+    fn link_label(&self, ui: &mut egui::Ui) {
+        match &self.link {
+            Link::Local => {}
+            Link::Connecting { target } => {
+                ui.colored_label(ui.visuals().warn_fg_color, format!("connecting… {target}"));
+                ui.separator();
+            }
+            Link::Connected { target } => {
+                ui.label(target.as_str());
+                ui.separator();
+            }
+            Link::Disconnected { target, reason } => {
+                ui.colored_label(err_color(ui), format!("disconnected: {target}"))
+                    .on_hover_text(reason.as_str());
+                ui.separator();
+            }
+        }
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let s = &self.cache.summary;
         let txt = |k: &str| s.get(k).map(value_text).unwrap_or_default();
@@ -216,7 +457,13 @@ impl CoreRouterUi {
             .get("pending_changes")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        let known = !s.is_null();
         ui.horizontal(|ui| {
+            self.link_label(ui);
+            // Nothing heard from the router yet: no empty fields.
+            if !known {
+                return;
+            }
             ui.strong(identity);
             ui.separator();
             ui.label(format!("backend: {backend}"));
@@ -241,7 +488,11 @@ impl CoreRouterUi {
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
+        let busy = self.busy();
         ui.horizontal(|ui| match self.log.last() {
+            _ if busy > 0 => {
+                ui.weak(format!("waiting for the router ({busy})…"));
+            }
             Some(l) => {
                 let color = if l.ok {
                     ui.visuals().text_color()
@@ -334,7 +585,9 @@ fn err_color(ui: &egui::Ui) -> Color32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use corerouter_engine::{Session, shared};
+    use corerouter_engine::{Session, lock, shared};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     #[test]
     fn every_window_renders_headless() {
@@ -351,12 +604,144 @@ mod tests {
     #[test]
     fn run_logs_errors() {
         let mut app = CoreRouterUi::new(shared(Session::virtual_lab()));
-        assert!(app.run("ip.address.add", json!({"address": "x"})).is_none());
+        app.run("ip.address.add", json!({"address": "x"}));
+        assert_eq!(app.busy(), 1);
+        app.pump();
+        assert_eq!(app.busy(), 0);
         assert!(!app.log()[0].ok);
+        app.run("system.identity.set", json!({"name": "r1"}));
+        app.pump();
+        assert!(app.log()[1].ok);
+    }
+
+    /// A router that answers only when the test says so, in any order.
+    #[derive(Default)]
+    struct Wire {
+        next: RequestId,
+        sent: Vec<(RequestId, String, Value)>,
+        replies: Vec<Reply>,
+        link: Option<Link>,
+    }
+
+    struct Scripted(Rc<RefCell<Wire>>);
+
+    impl Backend for Scripted {
+        fn submit(&mut self, method: &str, params: Value) -> RequestId {
+            let mut w = self.0.borrow_mut();
+            w.next += 1;
+            let id = w.next;
+            w.sent.push((id, method.to_owned(), params));
+            id
+        }
+
+        fn poll(&mut self) -> Vec<Reply> {
+            std::mem::take(&mut self.0.borrow_mut().replies)
+        }
+
+        fn link(&self) -> Link {
+            self.0.borrow().link.clone().unwrap_or(Link::Connecting {
+                target: "r1:7979".into(),
+            })
+        }
+    }
+
+    impl Wire {
+        /// Id of the last request for `command` (or method).
+        fn last(&self, what: &str) -> RequestId {
+            self.sent
+                .iter()
+                .rev()
+                .find(|(_, m, p)| m == what || p["command"] == what)
+                .map(|(id, ..)| *id)
+                .unwrap()
+        }
+    }
+
+    fn frame(ctx: &egui::Context, app: &mut CoreRouterUi, t: f64) -> Vec<String> {
+        let raw = egui::RawInput {
+            time: Some(t),
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw, |ui| app.ui(ui));
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        fn walk(s: &egui::Shape, out: &mut Vec<String>) {
+            match s {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut texts);
+        }
+        texts
+    }
+
+    #[test]
+    fn late_replies_and_a_lost_link_do_not_break_the_ui() {
+        let wire = Rc::new(RefCell::new(Wire::default()));
+        let mut app = CoreRouterUi::with_backend(Box::new(Scripted(wire.clone())));
+        app.open_all();
+        let ctx = egui::Context::default();
+        let texts = frame(&ctx, &mut app, 0.0);
         assert!(
-            app.run("system.identity.set", json!({"name": "r1"}))
-                .is_some()
+            texts.iter().any(|t| t == "connecting… r1:7979"),
+            "{texts:?}"
         );
+        let old = wire.borrow().last("interface.list");
+
+        // Nothing answered yet: no second refresh piles up.
+        frame(&ctx, &mut app, 5.0);
+        assert_eq!(wire.borrow().last("interface.list"), old);
+
+        // A forced reload, answered before the first one.
+        let new = app.reload();
+        let row = |n: &str| json!({"name": n, "type": "ether"});
+        {
+            let mut w = wire.borrow_mut();
+            w.link = Some(Link::Connected {
+                target: "r1:7979".into(),
+            });
+            w.replies
+                .push((new, Ok(json!([row("ether1"), row("ether2")]))));
+            w.replies.push((old, Ok(json!([row("ether1")]))));
+            // Garbage and unknown ids are ignored.
+            w.replies.push((9999, Ok(json!("??"))));
+            let all: Vec<RequestId> = w.sent.iter().map(|(id, ..)| *id).collect();
+            for id in all.into_iter().filter(|id| *id != new && *id != old) {
+                w.replies.push((id, Ok(json!({"not": "a list"}))));
+            }
+        }
+        let texts = frame(&ctx, &mut app, 6.0);
+        assert_eq!(app.cache.interfaces.len(), 2, "late reply did not win");
+        assert!(texts.iter().any(|t| t == "r1:7979"));
+
+        // An action in flight when the link drops gets an error, once.
+        let req = app.run("interface.set", json!({"name": "ether1", "disabled": true}));
+        assert_eq!(app.busy(), 1);
+        {
+            let mut w = wire.borrow_mut();
+            w.link = Some(Link::Disconnected {
+                target: "r1:7979".into(),
+                reason: "connection reset".into(),
+            });
+            w.replies.push((req, Err("connection lost".into())));
+            w.replies.push((req, Ok(json!({}))));
+        }
+        let texts = frame(&ctx, &mut app, 7.0);
+        assert_eq!(app.busy(), 0);
+        let failed: Vec<_> = app.log().iter().filter(|l| !l.ok).collect();
+        assert_eq!(failed.len(), 2, "{:?}", app.log());
+        assert!(failed.iter().any(|l| l.command == "connection"));
+        assert!(
+            texts.iter().any(|t| t == "disconnected: r1:7979"),
+            "{texts:?}"
+        );
+        assert_eq!(app.cache.interfaces.len(), 2, "keeps the last data");
+        for t in 8..20 {
+            frame(&ctx, &mut app, f64::from(t));
+        }
     }
 
     /// Drives the real UI with synthetic pointer/keyboard events, the way

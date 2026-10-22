@@ -4,21 +4,91 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use base64::Engine as _;
-use corerouter_control::{Host, SharedHost, bind_loopback, spawn};
-use corerouter_engine::{Session, Shared, shared};
+use corerouter_control::{Client, Host, SharedHost, bind_loopback, spawn};
+use corerouter_engine::{Session, shared};
+use corerouter_ui::CoreRouterUi;
 use eframe::egui;
 use serde_json::{Value, json};
 
 use crate::GuiApp;
+use crate::remote::Remote;
 
-const USAGE: &str = "usage: corerouter-gui [--control <port>]";
+const USAGE: &str = "\
+usage: corerouter-gui [--connect HOST:PORT] [--control <port>]
 
-/// Control host with a live window: everything `SharedHost` does, plus
-/// `ui.screenshot` captured from the next rendered frame.
+  --connect HOST:PORT   manage a corerouter-daemon (its control port, e.g. 127.0.0.1:7979)
+                        instead of an in-process virtual lab
+  --control <port>      serve the control channel on 127.0.0.1:<port> (ui.screenshot;
+                        with --connect, every other method is passed on to the daemon)";
+
+const PROXY_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Where the session lives.
 #[derive(Clone)]
+enum Target {
+    Local(SharedHost),
+    /// The daemon at `addr`; each control connection opens its own client.
+    Remote {
+        addr: String,
+    },
+}
+
+/// Control host with a live window: the session's methods (local, or passed
+/// on to the daemon), plus `ui.screenshot` captured from the next frame.
 struct GuiHost {
-    inner: SharedHost,
+    target: Target,
+    proxy: Option<Client>,
     ctx: Arc<OnceLock<egui::Context>>,
+}
+
+impl Clone for GuiHost {
+    fn clone(&self) -> Self {
+        Self {
+            target: self.target.clone(),
+            proxy: None,
+            ctx: Arc::clone(&self.ctx),
+        }
+    }
+}
+
+impl GuiHost {
+    fn pass_on(&mut self, addr: &str, method: &str, params: &Value) -> Result<Value, String> {
+        let answer = self.ask_daemon(addr, method, params);
+        if method != "server.info" {
+            return answer;
+        }
+        // The window is here even when the daemon is not: clients that
+        // start with `server.info` (MCP, `corerouter-cli screenshot`) still
+        // get to take a screenshot.
+        let mut info = answer.unwrap_or_else(|e| {
+            json!({
+                "name": "corerouter",
+                "version": env!("CARGO_PKG_VERSION"),
+                "backend": null,
+                "router_error": e,
+            })
+        });
+        if let Some(o) = info.as_object_mut() {
+            o.insert("has_ui".into(), json!(true));
+            o.insert("via".into(), json!("corerouter-gui"));
+            o.insert("router".into(), json!(addr));
+        }
+        Ok(info)
+    }
+
+    fn ask_daemon(&mut self, addr: &str, method: &str, params: &Value) -> Result<Value, String> {
+        let client = match &mut self.proxy {
+            Some(c) => c,
+            None => self.proxy.insert(Client::connect(addr, PROXY_TIMEOUT)?),
+        };
+        match client.request(method, params.clone()) {
+            Ok(answer) => answer,
+            Err(e) => {
+                self.proxy = None;
+                Err(format!("{addr}: {e}"))
+            }
+        }
+    }
 }
 
 impl Host for GuiHost {
@@ -26,7 +96,18 @@ impl Host for GuiHost {
         &mut self,
         f: &mut dyn FnMut(&mut Session) -> Result<Value, String>,
     ) -> Result<Value, String> {
-        self.inner.with_session(f)
+        match &mut self.target {
+            Target::Local(h) => h.with_session(f),
+            Target::Remote { addr } => Err(format!("this GUI manages {addr}")),
+        }
+    }
+
+    fn forward(&mut self, method: &str, params: &Value) -> Option<Result<Value, String>> {
+        let Target::Remote { addr } = &self.target else {
+            return None;
+        };
+        let addr = addr.clone();
+        Some(self.pass_on(&addr, method, params))
     }
 
     fn has_ui(&self) -> bool {
@@ -73,20 +154,36 @@ fn encode_png(img: &egui::ColorImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-fn parse_args() -> Result<Option<u16>, String> {
-    let mut control = None;
-    let mut args = std::env::args().skip(1);
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Args {
+    control: Option<u16>,
+    connect: Option<String>,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
+    let mut out = Args::default();
+    let mut args = args.into_iter();
     while let Some(a) = args.next() {
         match a.as_str() {
             "--control" => {
                 let port = args.next().ok_or("--control needs a port")?;
-                control = Some(port.parse().map_err(|_| format!("bad port '{port}'"))?);
+                out.control = Some(port.parse().map_err(|_| format!("bad port '{port}'"))?);
+            }
+            "--connect" => {
+                let addr = args.next().ok_or("--connect needs HOST:PORT")?;
+                if addr
+                    .rsplit_once(':')
+                    .is_none_or(|(h, p)| h.is_empty() || p.parse::<u16>().is_err())
+                {
+                    return Err(format!("--connect needs HOST:PORT, got '{addr}'"));
+                }
+                out.connect = Some(addr);
             }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
-    Ok(control)
+    Ok(out)
 }
 
 pub fn main() -> ExitCode {
@@ -95,19 +192,42 @@ pub fn main() -> ExitCode {
             .default_filter_or("warn,corerouter_gui=info,corerouter_control=info"),
     )
     .init();
-    let control = match parse_args() {
-        Ok(c) => c,
+    let args = match parse_args(std::env::args().skip(1)) {
+        Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
         }
     };
-    let session: Shared = shared(Session::virtual_lab());
     let ctx_slot = Arc::new(OnceLock::new());
+    let (ui, target) = match &args.connect {
+        Some(addr) => match Remote::spawn(addr) {
+            Ok(remote) => {
+                // Auth/TLS are G0.3: only reach daemons over loopback or a tunnel.
+                log::info!("managing the router at {addr} (no authentication: G0.3)");
+                (
+                    CoreRouterUi::with_backend(Box::new(remote)),
+                    Target::Remote { addr: addr.clone() },
+                )
+            }
+            Err(e) => {
+                eprintln!("cannot start the connection thread: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            let session = shared(Session::virtual_lab());
+            (
+                CoreRouterUi::new(Arc::clone(&session)),
+                Target::Local(SharedHost(session)),
+            )
+        }
+    };
 
-    if let Some(port) = control {
+    if let Some(port) = args.control {
         let host = GuiHost {
-            inner: SharedHost(Arc::clone(&session)),
+            target,
+            proxy: None,
             ctx: Arc::clone(&ctx_slot),
         };
         match bind_loopback(port).and_then(|l| spawn(l, host)) {
@@ -130,7 +250,7 @@ pub fn main() -> ExitCode {
         options,
         Box::new(move |cc| {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
-            Ok(Box::new(GuiApp::new(session)))
+            Ok(Box::new(GuiApp { ui }))
         }),
     );
     match result {
@@ -139,5 +259,66 @@ pub fn main() -> ExitCode {
             eprintln!("GUI failed: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Args, String> {
+        parse_args(args.iter().map(|s| (*s).to_owned()))
+    }
+
+    #[test]
+    fn parses_connect_and_control() {
+        assert_eq!(parse(&[]).unwrap(), Args::default());
+        let a = parse(&["--connect", "127.0.0.1:7979", "--control", "7990"]).unwrap();
+        assert_eq!(a.connect.as_deref(), Some("127.0.0.1:7979"));
+        assert_eq!(a.control, Some(7990));
+        for bad in ["127.0.0.1", ":7979", "h:99999", "h:x"] {
+            assert!(parse(&["--connect", bad]).is_err(), "{bad}");
+        }
+        assert!(parse(&["--connect"]).is_err());
+    }
+
+    #[test]
+    fn control_port_passes_methods_on_to_the_daemon() {
+        let daemon = bind_loopback(0).unwrap();
+        let addr = daemon.local_addr().unwrap().to_string();
+        spawn(daemon, SharedHost(shared(Session::virtual_lab()))).unwrap();
+        let mut host = GuiHost {
+            target: Target::Remote { addr },
+            proxy: None,
+            ctx: Arc::new(OnceLock::new()),
+        };
+        let r = corerouter_control::dispatch(
+            &mut host,
+            "engine.execute",
+            &json!({"command": "system.identity.set", "params": {"name": "via-gui"}}),
+        )
+        .unwrap();
+        assert_eq!(r["name"], "via-gui");
+        let info = corerouter_control::dispatch(&mut host, "server.info", &Value::Null).unwrap();
+        assert_eq!(info["has_ui"], true);
+        // The window is not up in a test: the screenshot is answered here.
+        let shot = corerouter_control::dispatch(&mut host, "ui.screenshot", &Value::Null);
+        assert!(shot.unwrap_err().contains("not up yet"));
+    }
+
+    #[test]
+    fn server_info_answers_without_the_daemon() {
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = gone.local_addr().unwrap().to_string();
+        drop(gone);
+        let mut host = GuiHost {
+            target: Target::Remote { addr },
+            proxy: None,
+            ctx: Arc::new(OnceLock::new()),
+        };
+        let info = corerouter_control::dispatch(&mut host, "server.info", &Value::Null).unwrap();
+        assert_eq!(info["has_ui"], true);
+        assert!(info["router_error"].is_string());
+        assert!(corerouter_control::dispatch(&mut host, "engine.list", &Value::Null).is_err());
     }
 }

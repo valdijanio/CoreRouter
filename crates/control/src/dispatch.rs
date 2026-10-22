@@ -32,6 +32,13 @@ pub trait Host {
     fn screenshot(&mut self) -> Result<Value, String> {
         Err(NO_UI.into())
     }
+
+    /// A host whose session lives elsewhere (the GUI as a client of a
+    /// daemon) answers here every method except `ping` and `ui.screenshot`.
+    /// `None`: use [`Host::with_session`].
+    fn forward(&mut self, _method: &str, _params: &Value) -> Option<Result<Value, String>> {
+        None
+    }
 }
 
 impl Host for Session {
@@ -58,6 +65,11 @@ impl Host for SharedHost {
 
 pub fn dispatch(host: &mut dyn Host, method: &str, params: &Value) -> Result<Value, String> {
     let err = |e: corerouter_engine::EngineError| e.to_string();
+    if !matches!(method, "ping" | "ui.screenshot")
+        && let Some(answer) = host.forward(method, params)
+    {
+        return answer;
+    }
     match method {
         "ping" => Ok(json!({ "pong": true })),
         "server.info" => {
@@ -131,6 +143,39 @@ mod tests {
             dispatch(&mut s, "engine.exec", &Value::Null)
                 .unwrap_err()
                 .contains("did you mean")
+        );
+    }
+
+    /// Forwards everything but `ping` and `ui.screenshot`.
+    struct Proxy;
+
+    impl Host for Proxy {
+        fn with_session(
+            &mut self,
+            _f: &mut dyn FnMut(&mut Session) -> Result<Value, String>,
+        ) -> Result<Value, String> {
+            Err("no local session".into())
+        }
+
+        fn forward(&mut self, method: &str, _params: &Value) -> Option<Result<Value, String>> {
+            Some(Ok(json!({ "forwarded": method })))
+        }
+    }
+
+    #[test]
+    fn forwarding_host_keeps_ping_and_screenshot_local() {
+        let mut p = Proxy;
+        assert_eq!(
+            dispatch(&mut p, "engine.list", &Value::Null).unwrap()["forwarded"],
+            "engine.list"
+        );
+        assert_eq!(
+            dispatch(&mut p, "ping", &Value::Null).unwrap()["pong"],
+            true
+        );
+        assert_eq!(
+            dispatch(&mut p, "ui.screenshot", &Value::Null).unwrap_err(),
+            NO_UI
         );
     }
 }
