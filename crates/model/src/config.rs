@@ -31,12 +31,16 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct System {
     pub identity: String,
+    pub contact: String,
+    pub location: String,
 }
 
 impl Default for System {
     fn default() -> Self {
         Self {
             identity: "CoreRouter".into(),
+            contact: String::new(),
+            location: String::new(),
         }
     }
 }
