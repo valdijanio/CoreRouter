@@ -88,7 +88,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
-| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU; G6.1/G6.2) | L0–L2 (nunca plataforma) |
+| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU, MTR; G6.1–G6.3) | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial`; `ThreadRunner` das tarefas (G6.1) | L0–L3 |
 | L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
 | L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
@@ -371,7 +371,7 @@ um link cujo tipo no kernel difere do config. Testes de integração (`tests/net
 num network namespace descartável sem root: `cargo xtask netns` (passo do `cargo xtask ci`,
 que vira `skip` onde `unshare` sem root não é permitido).
 
-### Tarefas das ferramentas (G6.1/G6.2)
+### Tarefas das ferramentas (G6.1–G6.3)
 
 Ping, MTU e (G6.3) MTR levam segundos ou não terminam: o comando valida, inicia um **job** e
 devolve o id; o resultado chega por `tool.task.poll`. Estado operacional, como os vizinhos:
@@ -408,3 +408,4 @@ falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools
 - 2026-10-22 — G0.8: crate `shell` (L4) e o terminal no fluxo de um comando.
 - 2026-10-22 — G0.3: `model::users`, `engine::auth`, `control::{auth,tls,local_token,known_hosts,dial}`, seção de autenticação.
 - 2026-10-22 — G6.1/G6.2: tarefas das ferramentas (`tasks`, `tools/`, `Hal::prober`, `hal::sim`, `hal-linux::icmp`, `ThreadRunner`).
+- 2026-10-22 — G6.3: MTR nas tarefas das ferramentas.

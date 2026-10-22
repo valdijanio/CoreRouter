@@ -1,7 +1,6 @@
 # Ferramentas de diagnóstico (Tools)
 
-Status: G6.1 (tarefas) e G6.2 (Ping, vários destinos, descoberta de MTU) feitos; G6.3 (MTR)
-no PR seguinte. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
+Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) e G6.3 (MTR) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
 jitter, percentis, histograma, alertas e exportação.
 
 ## 1. Tarefas (G6.1)
@@ -14,6 +13,7 @@ bandwidth-test entram nele depois).
 |---|---|
 | `tool.ping.start {…}` | inicia um ping → `{id, task_id, targets, columns}` |
 | `tool.ping.mtu {…}` | inicia uma descoberta de MTU → `{id, task_id, columns}` |
+| `tool.mtr.start {…}` | inicia um MTR → `{id, task_id, columns}` |
 | `tool.task.poll {id, after_seq?, max?}` | eventos com `seq > after_seq` (até 256), o resumo e o estado |
 | `tool.task.stop {id}` | pede a parada (a tarefa termina em ≤ ~100 ms) |
 | `tool.task.list {}` | tarefas guardadas: id, tipo, título, estado, motivo, dono, idade |
@@ -109,6 +109,26 @@ Eventos por probe `{size, payload, status, rtt_ms?, mtu?}`; resumo `{address, mt
 smallest_failing, probes, state}` com `mtu` = maior pacote IP que passa (MTU do caminho) e
 `payload` = `mtu − 28` (IPv4) / `− 48` (IPv6), o número do `ping -s` do Linux.
 
+## 4.1 MTR (G6.3)
+
+`tool.mtr.start {address, count? (rodadas, 0 = até parar), interval_ms? (1000, mín. 100),
+timeout_ms? (1000), max_hops? (30, 1–64), size?, dscp?, src_address?, interface?,
+routing_table?}` — traceroute contínuo, IPv4 e IPv6:
+
+- cada rodada manda, de uma vez, um probe por TTL de 1 até o fim conhecido do caminho; o
+  roteador do salto N responde "TTL exceeded", o destino responde o eco;
+- quando o destino (ou um roteador com "unreachable") responde no salto N, as rodadas seguintes
+  param em N e os saltos depois dele somem do resumo;
+- cada salto tem as estatísticas do §2 (`loss_pct`, `last_ms`, `avg_ms`, `best_ms` = mínimo,
+  `worst_ms` = máximo, `stddev_ms`, jitter, percentis) e até 4 endereços (`hosts`: caminhos com
+  balanceamento respondem de vários); qualquer resposta do salto conta como recebida (como o
+  `mtr`); `note` guarda "host unreachable" etc.;
+- eventos por probe `{round, hop, address, rtt_ms, status}` (`ok`, `ttl-exceeded`,
+  `unreachable`, `too-big`, `timeout`); resumo `{host, address, rounds, reached, max_hops, hops}`.
+
+Perda que começa num salto e continua até o destino é um enlace com perda; perda num salto só
+(o resto 0 %) é um roteador que limita respostas ICMP — a leitura é a mesma do `mtr`.
+
 ## 5. Quem envia os pacotes
 
 O engine só fala com o trait `corerouter_hal::probe::Prober` (L1): `resolve`, `open` →
@@ -149,7 +169,7 @@ O resumo diz qual (`summary.prober`). Regras da rede simulada (primeira que casa
 |---|---|
 | `127.0.0.0/8`, `::1` | loopback: 1 salto, ~0,03 ms |
 | `192.0.2.0/24`, `2001:db8:2::/48` | "host unreachable" a partir do 3º salto |
-| `198.51.100.0/24`, `2001:db8:51::/48` | túnel com perda de 25 %, MTU 1400, 6 saltos, ~40 ms |
+| `198.51.100.0/24`, `2001:db8:51::/48` | túnel com MTU 1400 e perda de 25 % a partir do meio do caminho, 6 saltos, ~40 ms |
 | `203.0.113.0/24`, `2001:db8:113::/48` | buraco negro: roteadores respondem, o host nunca |
 | qualquer outro | 2–11 saltos, 2–81 ms, jitter de 10 %, MTU 1500 (por hash do endereço) |
 
@@ -172,12 +192,17 @@ A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
   20 000 respostas: arquivo em `$COREROUTER_EXPORT_DIR`, `~/Downloads` ou o diretório atual na
   nativa, download no navegador); **Discover MTU** (primeiro endereço). Botões cinza com o motivo
   (G1.16). Fechar a janela para as tarefas dela.
+- **GUI** — Tools › MTR: endereço, rodadas, intervalo, saltos máximos, origem, interface,
+  tabela; Start (Enter) / Stop (Esc); tabela por salto ao vivo (Hop, Host, Loss %, Sent,
+  Last, Avg, Best, Worst, StDev) com a perda colorida e uma barra da média relativa ao salto
+  mais lento.
 - **Terminal** (G0.8) — `ping 8.8.8.8 count=4` de qualquer menu, ou `/tool ping start
   address=… count=…`, `/tool ping mtu 198.51.100.3`; Ctrl+C para (pelo `tool.task.stop`) e
-  mostra o resumo.
+  mostra o resumo. `mtr 8.8.8.8 count=10` idem.
 - **CLI** — `corerouter-cli [--connect HOST:PORT] watch tool.ping.start
   '{"address":"8.8.8.8,1.1.1.1","count":4}'` imprime as linhas no formato do RouterOS
-  (`engine::tools::text`) e o resumo por destino; Ctrl+C para.
+  (`engine::tools::text`) e o resumo por destino; `watch tool.mtr.start '{"address":"…"}'`
+  termina com a tabela por salto; Ctrl+C para.
 - **MCP** — tool `run_task {command, params, wait_secs?}`: inicia, junta os eventos até
   terminar ou `wait_secs` (padrão 10, máx. 60), para se ainda roda e devolve `summary` + últimos
   50 eventos. Para sessões longas: `run_command` com `tool.task.poll`/`tool.task.stop`.
@@ -187,3 +212,4 @@ A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
 ## Histórico de revisão
 
 - 2026-10-22 — versão inicial (G6.1 tarefas, G6.2 ping, vários destinos, MTU).
+- 2026-10-22 — G6.3 (MTR).
