@@ -29,7 +29,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -37,6 +37,7 @@ use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::Config;
 use corerouter_proto_dns::server::{Done, Effect, Forwarder, MAX_QUERY, Pending, Start, Statistics};
+use corerouter_proto_dns::zone;
 use super::dns::RouterDns;
 use corerouter_model::service::Listen;
 use sock::{Udp, bind_tcp};
@@ -140,6 +141,11 @@ impl Server {
         }
     }
 
+    /// The forwarder (its zones are served by `dns_zones`).
+    pub(crate) fn forwarder(&self) -> &Forwarder {
+        &self.fwd
+    }
+
     /// The rest of the chain, on this (worker) thread.
     fn finish(&self, p: Pending) -> Done {
         let mut t = self.dns.transport();
@@ -166,6 +172,13 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
             }
         };
         let packet = buf.get(..n).unwrap_or_default();
+        // Zone transfers and NOTIFY (G4.1c), before the chain.
+        if let Some(replies) = zone::xfr::intercept(&srv.fwd, packet, from.ip(), false) {
+            for r in &replies {
+                sock.send(r, from, local);
+            }
+            continue;
+        }
         match srv.fwd.start(packet, from.ip(), false, srv.dns.now_ms()) {
             Start::Done(mut d) => {
                 if let Some(r) = &d.reply {
@@ -243,6 +256,20 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
         let mut msg = vec![0u8; usize::from(u16::from_be_bytes(head))];
         if s.read_exact(&mut msg).is_err() {
             return;
+        }
+        // AXFR/IXFR (several messages) and NOTIFY (G4.1c), before the chain.
+        if let Some(replies) = zone::xfr::intercept(&srv.fwd, &msg, peer.ip(), true) {
+            for r in replies {
+                let Ok(len) = u16::try_from(r.len()) else {
+                    return;
+                };
+                let mut framed = len.to_be_bytes().to_vec();
+                framed.extend(r);
+                if s.write_all(&framed).is_err() {
+                    return;
+                }
+            }
+            continue;
         }
         let mut done = match srv.fwd.start(&msg, peer.ip(), true, srv.dns.now_ms()) {
             Start::Done(d) => d,
@@ -470,8 +497,9 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     }))
 }
 
-/// The forwarder, once started (the adlist loader fills its lists).
-static SERVER: std::sync::OnceLock<Arc<Server>> = std::sync::OnceLock::new();
+/// The forwarder, once started (the adlist loader fills its lists; the
+/// zone service works on its zones).
+static SERVER: OnceLock<Arc<Server>> = OnceLock::new();
 
 /// G6.6 DNS Lookup with the router as the server: `query` down the chain
 /// as a client on the router itself is answered, without a socket. The
@@ -491,6 +519,11 @@ pub(crate) fn ask(query: &[u8], tcp: bool) -> Option<(Option<Vec<u8>>, &'static 
 /// The block lists the forwarder matches (G4.1d), once it started.
 pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
     SERVER.get().map(|s| s.fwd.state())
+}
+
+/// The DNS server, once it started (G4.1c: `dns_zones`).
+pub(crate) fn server() -> Option<Arc<Server>> {
+    SERVER.get().cloned()
 }
 
 /// Linux: the destination address of each query (IP_PKTINFO /

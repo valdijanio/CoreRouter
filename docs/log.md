@@ -1115,3 +1115,77 @@ continuação indentadas).
   dele; verde, entram logo depois, sem outro CI; vermelho, o especulativo é descartado e o lote
   passa pela bisseção. PR que ficou de fora volta sozinho quando a branch muda. Simulado: lote
   verde com um PR chegando no meio entra um passo depois; lote vermelho cai na bisseção.
+
+- 2026-10-22 — G0.10: Supervisor de serviços do daemon: cada serviço de `apps/corerouter-daemon/src/service/` (dns-resolver, dns-server, ntp-client, remote-logging, metrics) roda numa thread do supervisor, que o reinicia quando termina, devolve erro ou dá panic (`catch_unwind`), esperando 1 s, 2 s, 4 s… até 60 s; com 5 falhas em 60 s ele fica `failed`, com linha `critical` no log. Cada serviço informa heartbeat, portas em escuta, último evento ou erro, threads e o motivo de estar ocioso pela config (`disabled`); o `dns-server` depende do `dns-resolver`. Comandos novos em `crates/engine/src/cmd/system_service.rs`: `system.service.print` e `system.service.start|stop|restart|reset-failures {name}` (o `stop` dura até o boot e não muda a config; o `control` é protegido e explica por quê). Janela System › Services (`crates/ui/src/services.rs`): botões, selos de resumo, tabela com selo de estado e de alcance (`all`, `LAN`, `local`, `public`), detalhe com o comando que liga o serviço, dependência, política, heartbeat, threads e as últimas linhas do tópico no log. Selos `GREEN` e `RED` novos em `chip.rs` (docs/ui-style.md). Interface `Service` nova documentada no topo de `service/mod.rs` e em `docs/architecture.md`.
+
+  Como testar: `cargo run -p corerouter-daemon -- --control 7979`, depois `corerouter-cli --connect 127.0.0.1:7979 run system.service.print`, `run system.service.stop '{"name":"ntp-client"}'` e `run system.service.start '{"name":"ntp-client"}'`; na GUI (`--connect 127.0.0.1:7979`), System › Services. Com `--metrics 9100`, `curl 127.0.0.1:9100/metrics | grep service`. Testes: `cargo test -p corerouter-daemon supervisor` (falha → espera → failed → reset; panic contido; stop/start/restart; dependência), `cargo test -p corerouter-engine system_service`, `cargo test -p corerouter-ui services`.
+
+- 2026-10-22 — G4.1c: Zonas DNS autoritativas, estilo BIND, na cadeia do encaminhador. Config `ip.dns_zones` (modelo
+  `crates/model/src/dns_zone.rs`): zona primária (SOA a partir dos campos da zona, serial
+  `date`/`increment`/`unixtime` que anda sozinho, um serial novo por transação) ou secundária
+  (`primaries`). Comandos `ip.dns.zone.add/set/remove/print`, `ip.dns.zone.record.add/set/remove/print`,
+  `ip.dns.zone.file.get/load` (arquivo de zona RFC 1035, parser próprio com proptest; `$INCLUDE`
+  recusado) e `ip.dns.zone.refresh`. A etapa `zones` (`proto-dns/src/zone/`) responde com AA pela
+  RFC 1034 §4.3.2: curingas (RFC 4592), não terminais vazios (NODATA), delegação com glue
+  (referência sem RD; com RD, encaminha às glue), CNAME seguido, NXDOMAIN/NODATA com o SOA (RFC
+  2308 §3), seção adicional para NS/MX/SRV. AXFR (RFC 5936, só TCP, `allow_transfer`, NOTAUTH
+  para zona alheia), IXFR com diário em memória (RFC 1995; sem histórico, a zona inteira; por UDP
+  só se couber) e NOTIFY recebido de `primaries` são atendidos antes da cadeia; o serviço do daemon
+  `dns zones` manda NOTIFY (RFC 1996 §3.6, 5 retransmissões com intervalo crescente) e mantém as
+  secundárias (SOA a cada refresh, IXFR com volta para AXFR, expira em `expire`). Janela IP › DNS ›
+  Zones (DNS Zones, DNS Zone Records, DNS Zone File). Testar: `corerouter-daemon --control 7979
+  --dns-port 5353`, `ip.dns.set allow_remote_requests=yes`, `ip.dns.zone.add
+  '{"name":"example.com","allow_transfer":"127.0.0.0/8"}'`, `ip.dns.zone.record.add
+  '{"zone":"example.com","name":"www","address":"192.0.2.80"}'`, `dig -p 5353 @127.0.0.1
+  www.example.com` (flag `aa`) e `dig +tcp -p 5353 @127.0.0.1 example.com AXFR`. Custo **medido**:
+  nenhum para quem não tem zonas; 1,04 µs por resposta de uma zona de 1000 registros.
+
+- 2026-10-22 — G4.1d: DNS adlist (`/ip dns adlist`, RouterOS v7): listas de bloqueio por URL (`http`/`https`) ou arquivo
+  (`--adlist-dir`), em formato hosts, um domínio por linha ou `||nome^`; o nome listado recebe
+  0.0.0.0 / `::` (TTL 10 s), `||nome^` vale para os subdomínios, uma estática FWD libera um nome.
+  O daemon baixa e monta as listas fora do lock do `Session` (cliente HTTP/1.1 próprio sobre rustls
+  com as raízes Mozilla embutidas, nomes pelo resolvedor do roteador), recarrega a cada 4 h e no
+  `ip.dns.adlist.reload`, e mostra estado, nomes, bloqueios e erro em `ip.dns.adlist.print` e na
+  janela IP › DNS Adlist (aberta pelo botão Adlist da janela DNS). Como testar: `corerouter-cli run
+  ip.dns.adlist.add '{"url":"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"}'`,
+  `ip.dns.adlist.print` e `dig @<roteador> <nome da lista>`. Ao vivo (**medido**): a lista do
+  StevenBlack, 71 492 nomes, baixada e aplicada em menos de 10 s. Detalhes em `docs/dns.md`.
+
+- 2026-10-22 — G4.1d: DNS forwarders e upstream cifrado: `/ip dns forwarders` (RouterOS 7.17: grupos com `dns_servers`,
+  `doh_servers` e `verify_doh_cert`), a estática FWD com `forward_to=<grupo>`, e `ip.dns.set
+  use_doh_server` com DoH (`https://…`, RFC 8484) ou DoT (`tls://host#nome`, RFC 7858; o RouterOS
+  não tem), certificado verificado contra as raízes Mozilla por padrão, consulta com id 0 e padding
+  de 128 bytes (RFC 8467), conexões reaproveitadas, sem volta para texto claro. O nome do servidor
+  cifrado vem de uma estática ou dos `servers` comuns. Janela IP › DNS Forwarders e campos DoH na
+  janela DNS. Como testar: `ip.dns.set '{"use_doh_server":"https://cloudflare-dns.com/dns-query"}'`
+  e `dig @<roteador> example.org`; grupo: `ip.dns.forwarders.add '{"name":"q9","doh_servers":["tls://9.9.9.9#dns.quad9.net"]}'`
+  e `ip.dns.static.add '{"name":"wikipedia.org","type":"FWD","forward_to":"q9","match_subdomain":true}'`.
+  Ao vivo (**medido**): Cloudflare DoH e Quad9 DoT respondendo com certificado verificado. Detalhes em
+  `docs/dns.md`.
+
+- 2026-10-22 — G4.1d: DNS `:resolve` e cache de falhas: `ip.dns.resolve {name, type?, server?}` (RouterOS `:resolve`;
+  `/ip dns resolve` no terminal) roda como tarefa, sem esperar a rede sob o lock do `Session`, e mostra por
+  tipo a resposta, a fonte (cache, stale, servidor), o TTL e o tempo; endereço vira PTR; `server`
+  pergunta só a ele, sem o cache. Janela IP › DNS Resolve (também pelo **Resolve…** do DNS Cache).
+  O resolvedor guarda as falhas (RFC 9520): um nome e tipo que nenhum servidor respondeu não é
+  perguntado de novo por 5 s, dobrando até 5 min; nesse tempo responde SERVFAIL ou a resposta
+  vencida (RFC 8767). Como testar: `corerouter-cli --connect 127.0.0.1:7979 watch ip.dns.resolve
+  '{"name":"example.com"}'`; na GUI, IP › DNS Resolve. Detalhes em `docs/dns.md`.
+
+- 2026-10-22 — G4.1e: Estatísticas do encaminhador DNS da LAN. Etapa nova `crates/proto-dns/src/server/stage/statistics.rs`
+  (só `after`, ordem 100) conta consultas UDP/TCP, quem respondeu (cache, static, upstream,
+  stale, refused, limit, busy, special), códigos de resposta, tipos, os clientes que mais
+  perguntam (no máximo 1024 guardados, Space-Saving: topo certo sob inundação) e as respostas
+  por upstream. As `after` agora também veem descartes (`Query::dropped()`). Comandos
+  `ip.dns.statistics.print {top?}` e `ip.dns.statistics.reset` (estado de execução, sem
+  rollback); botão Statistics na janela IP › DNS abre a janela DNS Statistics.
+  `Session::dns_allowed_networks`: `allowed_from` com lista de interfaces passa a contar os
+  endereços aprendidos por DHCP e os `from_pool` do IPv6 já resolvidos; o daemon recalcula a cada
+  segundo. Testar: `corerouter-daemon --control 7979 --dns-port 5353`, `ip.dns.set
+  allow_remote_requests=yes servers=1.1.1.1`, `dig -p 5353 @127.0.0.1 example.com`, depois
+  `corerouter-cli --connect 127.0.0.1:7979 run ip.dns.statistics.print` ou IP › DNS ›
+  Statistics. Custo **medido**: +45 a +80 ns por consulta.
+
+- 2026-10-22 — G6.6: Registro da G6.6: a ferramenta DNS Lookup (estilo `dig`) em Tools, com a tela aprovada pelo
+  usuário. Começa depois que a G4.1d entrar, porque reaproveita o `ip.dns.resolve` como tarefa e
+  o upstream DoH dela.

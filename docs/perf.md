@@ -254,3 +254,55 @@ Os dois aumentos são dezenas de nanossegundos numa consulta que custa milissegu
 CI, foi testado num lote especulativo em cima dele e entrou **44 s** depois, sem esperar outro CI.
 Antes disso, o lote do #94 ficou 20 min parado: o GitHub manteve o check-run do job Linux em
 "in_progress" depois de o job terminar verde; a fila passou a ler os runs do Actions.
+
+### G4.1c-1 — zonas na cadeia do encaminhador (**medido**)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build release de `cargo bench -p corerouter-proto-dns`, em
+2026-10-22. Antes é a `main` em 692ef7a; depois é a branch.
+
+| caso | antes | depois | diferença |
+|---|---|---|---|
+| `dns_forward_cache_hit` (sem zonas) | 875 ns | 857 ns | −2,5 % (ruído) |
+| `dns_forward_static_1k` | 1,013 µs | 1,022 µs | +1,2 % (ruído) |
+| `dns_forward_cache_miss` | 2,448 µs | 2,393 µs | −2,3 % (ruído) |
+
+Bench novo `benches/zones.rs`:
+
+| caso | tempo |
+|---|---|
+| `dns_zone_answer` (A de uma zona de 1000 registros, AA) | 1,04 µs |
+| `dns_zone_nxdomain` (com o SOA na autoridade) | 1,44 µs |
+| `dns_forward_cache_hit_100_zones` (nome de fora, 100 zonas configuradas) | 1,17 µs |
+
+Uma resposta de zona custa o mesmo que um acerto de cache. Com 100 zonas configuradas, um nome
+de fora paga +0,3 µs para descobrir que não é de nenhuma.
+
+### G4.1d — adlist (**medido**, 2026-10-22)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build release (`cargo bench -p corerouter-proto-dns --bench
+adlist`): lista de hosts de 1 000 000 nomes lida e montada em 230 ms; o conjunto ocupa 31,8 MB
+(~32 B por nome, arena ordenada + deslocamentos `u32`); consulta 79 ns (listado), 82 ns (abaixo
+de um `||domínio^`), 105–120 ns (não listado).
+
+### G4.1d — DoT/DoH upstream (**medido**, 2026-10-22)
+
+Build release, AMD Ryzen AI MAX+ 395, cache vazio, 15 nomes populares pelo 1.1.1.1 (RTT ~48 ms),
+tempo do `dig` contra o encaminhador: UDP 48–51 ms, DoT 47–49 ms, DoH (HTTP/1.1) 49–53 ms por
+consulta. Com a conexão TLS reaproveitada (até 4 ociosas por servidor, 20 s), cifrar não acrescenta
+tempo perceptível.
+
+### G4.1e — custo da etapa de estatísticas (**medido**)
+
+AMD Ryzen AI MAX+ 395, build release (`cargo bench -p corerouter-proto-dns --bench forwarder`),
+2026-10-22, antes = `main` 49503e0, depois = a branch:
+
+| caso | antes | depois | diferença |
+|---|---|---|---|
+| `dns_forward_cache_hit` | 762 ns | 809 ns | +5,6 % |
+| `dns_forward_static_1k` | 869 ns | 952 ns | +8,4 % |
+| `dns_forward_cache_miss` | 2,16 µs | 2,39 µs | +9,0 % |
+
+Um mutex, a busca do estado do `Forwarder` e alguns mapas pequenos por consulta. A primeira
+versão alocava o nome do tipo por consulta (+10 a +15 %); contar pelo código do tipo e dar nome
+só no `print` tirou metade disso. Ainda dá ~1,2 milhão de consultas por segundo por núcleo com
+o cache quente.

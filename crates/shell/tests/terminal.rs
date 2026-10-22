@@ -1031,3 +1031,41 @@ fn dns_export_import_round_trip() {
     assert!(!script.contains("/ip dns cache"), "{script}");
     a.ok("/ip dns cache flush");
 }
+
+/// G4.1c: `/ip dns zone` and its records survive `/export` → `/import`
+/// (zones before their records; the serial kept as exported).
+#[test]
+fn dns_zone_export_import_round_trip() {
+    let mut a = Term::new();
+    for line in [
+        "/ip dns zone add name=example.com allow-transfer=192.0.2.0/24 notify=192.0.2.2 admin=noc@example.com",
+        "/ip dns zone add name=partner.example type=secondary primaries=192.0.2.53",
+        "/ip dns zone record add zone=example.com name=www address=192.0.2.80",
+        "/ip dns zone record add zone=example.com type=MX target=mail.example.com priority=10",
+        "/ip dns zone record add zone=example.com name=t type=TXT text=\"v=spf1 -all\" ttl-secs=300",
+    ] {
+        a.ok(line);
+    }
+    let printed = a.ok("/ip dns zone record print");
+    assert!(
+        printed.contains("www") && printed.contains("MX"),
+        "{printed}"
+    );
+    let script = a.export();
+    assert!(script.contains("/ip dns zone"), "{script}");
+    let zones = script.find("/ip dns zone\n").unwrap_or(usize::MAX);
+    let records = script.find("/ip dns zone record").unwrap_or(0);
+    assert!(zones < records, "zones first: {script}");
+    let mut b = Term::new();
+    b.router.files.insert("cfg.rsc".into(), script.clone());
+    b.ok("/import file=cfg.rsc");
+    assert_eq!(b.export(), script);
+    let get = |t: &Term| {
+        t.router
+            .session
+            .inspect(Some("running.ip.dns_zones"))
+            .unwrap()
+    };
+    assert_eq!(get(&b)["records"], get(&a)["records"]);
+    assert_eq!(get(&b)["zones"][0]["serial"], get(&a)["zones"][0]["serial"]);
+}
