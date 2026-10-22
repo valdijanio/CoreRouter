@@ -486,3 +486,4 @@ mesmo dia pode variar.
   achou dois `panic` no `dhcproto` 0.15 com pacotes malformados; o decode agora passa por um
   saneador. Testes: 32 no `proto-dhcp`, 15 de integração no engine, netns com daemon real e
   servidor DHCP em Rust (concessão + rotas no kernel em ~3 s **medido**), UI headless, terminal.
+- 2026-10-22 — processo: proteção da main sem "branch atualizada" (strict=false) para dar vazão; workflow `main-red` abre/fecha a issue "main quebrada" quando o CI da main falha/volta; AGENTS.md: trazer a main antes do PR, main vermelha é prioridade zero, ids de gap só do brief/main, sessões não abrem sessões, PRs pequenos, pontos quentes com mudanças mínimas. Medido antes: CI de PR mediana 2,0 min, 1,6 execuções por PR.
