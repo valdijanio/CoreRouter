@@ -13,6 +13,7 @@ mod neighbors;
 mod prefs;
 mod routes;
 mod table;
+mod vrf;
 mod windows;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +49,7 @@ enum Field {
     Interfaces,
     Addresses,
     Routes,
+    Vrfs,
     Bgp,
     History,
     Diff,
@@ -62,6 +64,7 @@ struct Cache {
     interfaces: Vec<Value>,
     addresses: Vec<Value>,
     routes: Vec<Value>,
+    vrfs: Vec<Value>,
     bgp: Vec<Value>,
     history: Vec<Value>,
     diff: Vec<Value>,
@@ -92,17 +95,19 @@ struct Tables {
     interfaces: table::TableState,
     addresses: table::TableState,
     routes: table::TableState,
+    vrfs: table::TableState,
     neighbors: table::TableState,
 }
 
 impl Tables {
     /// Every table with the salt it is drawn with (stored preferences name
     /// tables by salt).
-    fn each(&mut self) -> [(&'static str, &mut table::TableState); 3] {
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 4] {
         [
             (interfaces::TABLE, &mut self.interfaces),
             ("addresses", &mut self.addresses),
             (routes::TABLE, &mut self.routes),
+            (vrf::TABLE, &mut self.vrfs),
         ]
     }
 
@@ -112,6 +117,7 @@ impl Tables {
             (interfaces::TABLE, &self.interfaces),
             ("addresses", &self.addresses),
             (routes::TABLE, &self.routes),
+            (vrf::TABLE, &self.vrfs),
         ]
         .into_iter()
         .filter(|(_, t)| t.inline_comments)
@@ -133,6 +139,7 @@ pub(crate) enum Then {
     ShowFrr,
     Dialog { id: u64, effect: interfaces::Effect },
     Route { id: u64, effect: routes::Effect },
+    Vrf { id: u64, effect: vrf::Effect },
 }
 
 pub struct CoreRouterUi {
@@ -159,6 +166,10 @@ pub struct CoreRouterUi {
     route_dialogs: Vec<routes::RouteDialogWin>,
     /// Routes to open once an `ip.route.list` sent after this id arrives.
     open_route_after: Vec<(RequestId, String)>,
+    /// "New VRF" / "VRF <name>" / VRF "Comment" windows.
+    vrf_dialogs: Vec<vrf::VrfDialogWin>,
+    /// VRFs to open once an `ip.vrf.list` sent after this id arrives.
+    open_vrf_after: Vec<(RequestId, String)>,
 }
 
 impl CoreRouterUi {
@@ -192,6 +203,8 @@ impl CoreRouterUi {
             theme: egui::ThemePreference::System,
             route_dialogs: Vec::new(),
             open_route_after: Vec::new(),
+            vrf_dialogs: Vec::new(),
+            open_vrf_after: Vec::new(),
         }
     }
 
@@ -325,6 +338,16 @@ impl CoreRouterUi {
                     self.open_route(&route);
                 }
             }
+            Field::Vrfs => {
+                self.cache.vrfs = arr(value);
+                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_vrf_after)
+                    .into_iter()
+                    .partition(|(req, _)| *req <= id);
+                self.open_vrf_after = later;
+                for (_, name) in ready {
+                    self.open_vrf(&name);
+                }
+            }
             Field::Bgp => self.cache.bgp = arr(value),
             Field::History => self.cache.history = arr(value),
             Field::Diff => self.cache.diff = arr(value),
@@ -349,6 +372,7 @@ impl CoreRouterUi {
             }
             Then::Dialog { id, effect } => self.dialog_reply(id, effect, result),
             Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
+            Then::Vrf { id, effect } => self.vrf_dialog_reply(id, effect, result),
         }
     }
 
@@ -431,6 +455,7 @@ impl CoreRouterUi {
             exec("ip.address.list"),
         );
         ask(self, Field::Routes, "engine.execute", exec("ip.route.list"));
+        ask(self, Field::Vrfs, "engine.execute", exec("ip.vrf.list"));
         ask(
             self,
             Field::Bgp,
@@ -522,6 +547,7 @@ impl CoreRouterUi {
         self.floats = floats;
         self.dialogs(&ctx, area);
         self.route_dialogs(&ctx, area);
+        self.vrf_dialogs(&ctx, area);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -1542,6 +1568,173 @@ mod tests {
         h.click(h.text("Remove"));
         assert!(h.route("*1").is_none());
         assert!(h.app.log().iter().all(|l| l.ok), "{:?}", h.app.log());
+    }
+
+    impl Harness {
+        /// Only the VRF window, over a lab where ether5 is a port of br0
+        /// and VRF blue holds ether4 and ether6.
+        fn vrfs() -> Self {
+            let mut h = Self::new();
+            for (cmd, p) in [
+                ("interface.bridge.add", json!({"name": "br0"})),
+                (
+                    "interface.bridge.port.add",
+                    json!({"bridge": "br0", "interface": "ether5"}),
+                ),
+                (
+                    "ip.vrf.add",
+                    json!({"name": "blue", "interfaces": ["ether4", "ether6"]}),
+                ),
+            ] {
+                lock(&h.session).execute(cmd, &p).unwrap();
+            }
+            h.app.open.clear();
+            h.app.open(Win::Vrf);
+            h.app.cache.refreshed_at = None;
+            h.idle();
+            h.idle();
+            h
+        }
+
+        fn vrf_row(&self, name: &str) -> egui::Pos2 {
+            self.ctx
+                .read_response(table::row_id(vrf::TABLE, name))
+                .unwrap_or_else(|| panic!("vrf row {name} not drawn"))
+                .rect
+                .center()
+        }
+
+        fn vrf_tool(&self, icon: table::Icon) -> egui::Pos2 {
+            self.ctx
+                .read_response(table::tool_id(vrf::TABLE, icon))
+                .map(|r| r.rect.center())
+                .unwrap_or_else(|| panic!("no vrf tool {icon:?}"))
+        }
+
+        /// The VRF as the engine lists it.
+        fn vrf(&self, name: &str) -> Option<Value> {
+            let list = lock(&self.session).execute("ip.vrf.list", &Value::Null);
+            list.ok()?
+                .as_array()?
+                .iter()
+                .find(|v| v["name"] == name)
+                .cloned()
+        }
+    }
+
+    #[test]
+    fn new_vrf_dialog_offers_only_free_interfaces() {
+        let mut h = Harness::vrfs();
+        assert!(h.has_text("ether4, ether6"), "members column");
+        h.click(h.vrf_tool(table::Icon::Add));
+        assert!(h.has_text("New VRF"));
+        // Bridge ports and members of another VRF are not offered; a
+        // bridge is (it joins with its ports).
+        for taken in ["ether4", "ether5", "ether6"] {
+            assert!(!h.has_text(taken), "{taken} offered");
+        }
+        // The whole list fits, so what is missing is left out, not scrolled away.
+        for free in ["br0", "ether1", "ether2", "ether3", "ether7", "ether8"] {
+            assert!(h.has_text(free), "{free} not offered");
+        }
+
+        h.click(h.text("vrf1"));
+        h.type_text("red");
+        h.click(h.text("ether2"));
+        h.click(h.text("br0"));
+        // Apply turns "New VRF" into "VRF <red>".
+        h.click(h.text("Apply"));
+        let red = h.vrf("red").expect("vrf created");
+        assert_eq!(red["interfaces"], json!(["br0", "ether2"]));
+        assert_eq!(red["table"], json!(1001), "next free table after blue");
+        assert!(h.has_text("VRF <red>"), "properties opened");
+        assert!(!h.has_text("New VRF"));
+        assert!(h.has_text("br0, ether2"));
+
+        // A name the engine refuses keeps the dialog open with its reason.
+        h.click(h.vrf_tool(table::Icon::Add));
+        h.click(h.text("vrf1"));
+        h.type_text("main");
+        h.click(h.text("OK"));
+        let d = h
+            .app
+            .vrf_dialogs
+            .iter()
+            .find(|d| matches!(d.dialog, vrf::VrfDialog::New(_)))
+            .expect("still open");
+        assert!(
+            d.error.as_deref().is_some_and(|e| e.contains("main")),
+            "{:?}",
+            d.error
+        );
+        h.click(h.text("Cancel"));
+        assert_eq!(h.app.vrf_dialogs.len(), 1, "only VRF <red> left");
+    }
+
+    #[test]
+    fn vrf_properties_toolbar_and_menu() {
+        let mut h = Harness::vrfs();
+
+        // Double click: "VRF <blue>"; Apply sends the new member list.
+        let at = h.vrf_row("blue");
+        h.click(at);
+        h.click(at);
+        assert!(h.has_text("VRF <blue>"));
+        assert!(h.has_text("1000"), "routing table shown");
+        h.click(h.text("ether4")); // out
+        h.click(h.text("ether3")); // in
+        h.click(h.text("Apply"));
+        assert_eq!(
+            h.vrf("blue").unwrap()["interfaces"],
+            json!(["ether3", "ether6"])
+        );
+        assert_eq!(h.iface("ether4").unwrap()["vrf"], Value::Null);
+        h.click(h.text("Disable"));
+        assert_eq!(h.vrf("blue").unwrap()["disabled"], true);
+        h.click(h.text("OK"));
+        assert!(h.app.vrf_dialogs.is_empty());
+
+        // Ctrl+E on the selected row enables it again.
+        h.time += 1.0;
+        h.idle();
+        h.click(h.vrf_row("blue"));
+        h.key(egui::Key::E, CTRL);
+        assert_eq!(h.vrf("blue").unwrap()["disabled"], false);
+
+        // Toolbar comment.
+        h.click(h.vrf_tool(table::Icon::Comment));
+        assert!(h.has_text("Comment for VRF <blue>"));
+        match h.app.vrf_dialogs.first_mut().map(|d| &mut d.dialog) {
+            Some(vrf::VrfDialog::Comment { text, .. }) => *text = "customer A".into(),
+            _ => panic!("comment window not open"),
+        }
+        h.click(h.text("OK"));
+        assert_eq!(h.vrf("blue").unwrap()["comment"], "customer A");
+
+        // Remove is refused while the VRF has an address: logged, kept.
+        let addr = lock(&h.session)
+            .execute(
+                "ip.address.add",
+                &json!({"address": "10.9.0.1/24", "interface": "blue"}),
+            )
+            .unwrap();
+        h.right_click(h.vrf_row("blue"));
+        h.click(h.text("Remove"));
+        assert!(h.vrf("blue").is_some());
+        let last = h.app.log().last().unwrap();
+        assert!(
+            !last.ok && last.message.contains("ip.address.remove"),
+            "{last:?}"
+        );
+
+        // Without it, Delete removes the VRF and frees its members.
+        lock(&h.session)
+            .execute("ip.address.remove", &json!({"id": addr["id"]}))
+            .unwrap();
+        h.click(h.vrf_row("blue"));
+        h.key(egui::Key::Delete, egui::Modifiers::NONE);
+        assert!(h.vrf("blue").is_none());
+        assert_eq!(h.iface("ether6").unwrap()["vrf"], Value::Null);
     }
 
     /// Same rectangle, give or take egui's pixel rounding.
