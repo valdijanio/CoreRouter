@@ -96,6 +96,7 @@ fn lookup_window_runs_the_task_and_shows_the_answer() {
     s.tick(1_000);
     let mut h = open(s);
     assert!(h.has_text("recursion") && h.has_text("compare"), "option chips");
+    let before = h.win_rect(win_id(Win::Panel(WIN))).height();
     h.app.panel_mut::<LookupPanel>().unwrap().name = "www.example.com".into();
     h.idle();
     h.click(h.text("Start"));
@@ -114,6 +115,9 @@ fn lookup_window_runs_the_task_and_shows_the_answer() {
     assert!(h.has_text("Answer"));
     assert!(h.has_text("192.0.2.7"));
     assert!(h.has_text("AS64999 SIM-DEST"), "the AS pill of the lab");
+    // Opened as tall as the form, the window grew with the answer.
+    let after = h.win_rect(win_id(Win::Panel(WIN))).height();
+    assert!(after > before + 40.0, "{before} → {after}");
     let p = h.app.panel_mut::<LookupPanel>().unwrap();
     assert_eq!(p.command, "dig www.example.com A");
     let dig = p.dig_text();

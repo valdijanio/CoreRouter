@@ -334,6 +334,7 @@ impl CoreRouterUi {
         let hover_fill = ui.visuals().widgets.hovered.weak_bg_fill;
         egui::ScrollArea::vertical()
             .id_salt("mtr-hops")
+            .min_scrolled_height(crate::windows::grow_height(ui))
             .show(ui, |ui| {
                 Grid::new("mtr-table")
                     .striped(true)

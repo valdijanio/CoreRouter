@@ -574,8 +574,9 @@ corerouter-cli --connect 127.0.0.1:7979 watch ip.dns.resolve '{"name":"example.c
 
 No terminal: `/ip dns resolve example.com` ou `/ip dns resolve name=… type=MX` (sem atalho
 global `resolve`: ele disputaria o Tab com `remove` em todo menu). Na GUI:
-IP › DNS Resolve, ou **Resolve…** na janela DNS Cache: nome, tipo, servidor opcional; uma linha por
-tipo com a resposta, de onde veio (`cache`, `stale`, o servidor), TTL e tempo.
+Tools › DNS Lookup (G6.6), que também abre pelo **Resolve…** da janela DNS Cache, já com o nome e o
+tipo da entrada selecionada. A janela própria IP › DNS Resolve saiu: era um subconjunto do DNS
+Lookup, e perguntar um nome é diagnóstico (Tools), não configuração (IP).
 
 | Comando | Parâmetros |
 |---|---|
@@ -609,7 +610,7 @@ volta quando o servidor volta, flush esquece, NXDOMAIN não conta). Engine: `ip.
 tarefa (desabilitado sem runner, eventos por tipo, erro de um tipo não derruba o outro, PTR para
 endereço, `server` repassado, recusas de parâmetros, lab simulado). Daemon: registros, fonte
 (servidor, depois `cache`) e `server` direto passando pelo cache. UI: **Resolve…** no DNS Cache
-abre a janela, a tarefa roda e a resposta aparece.
+abre o Tools › DNS Lookup com a entrada selecionada.
 
 **Fica para depois** (G4.1j): `vrf` em `/ip dns` (os servidores numa tabela de rotas), servidores
 dinâmicos do PPPoE (`use-peer-dns`, quando houver cliente PPPoE) e do DHCPv6 / RA RDNSS em
