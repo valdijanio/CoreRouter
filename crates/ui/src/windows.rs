@@ -225,10 +225,7 @@ impl CoreRouterUi {
                 "interface": self.forms.addr_interface,
                 "comment": (!comment.is_empty()).then_some(comment),
             });
-            if self.run("ip.address.add", p).is_some() {
-                self.forms.addr_address.clear();
-                self.forms.addr_comment.clear();
-            }
+            self.run_then("ip.address.add", p, crate::Then::ClearAddressForm);
         }
     }
 
@@ -269,9 +266,7 @@ impl CoreRouterUi {
                 "asn": self.forms.bgp_asn.trim(),
                 "router_id": self.forms.bgp_router_id.trim(),
             });
-            if let Some(r) = self.run("routing.bgp.instance.set", p) {
-                self.forms.bgp_frr = r.get("frr").map(value_text).unwrap_or_default();
-            }
+            self.run_then("routing.bgp.instance.set", p, crate::Then::ShowFrr);
         }
         if !self.forms.bgp_frr.is_empty() {
             ui.separator();

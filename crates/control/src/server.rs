@@ -79,6 +79,16 @@ pub fn spawn<H: Host + Clone + Send + 'static>(
         .spawn(move || serve(listener, host))
 }
 
+/// The reply to one request, or `None` when it is not a JSON request (the
+/// caller then drops the connection). Shared by TCP and WebSocket.
+pub(crate) fn answer(host: &mut dyn Host, text: &str) -> Option<Value> {
+    let req = serde_json::from_str::<Request>(text).ok()?;
+    Some(match dispatch(host, &req.method, &req.params) {
+        Ok(result) => json!({"id": req.id, "ok": true, "result": result}),
+        Err(error) => json!({"id": req.id, "ok": false, "error": error}),
+    })
+}
+
 fn handle<H: Host>(stream: TcpStream, mut host: H) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut out = stream;
@@ -99,12 +109,8 @@ fn handle<H: Host>(stream: TcpStream, mut host: H) -> io::Result<()> {
             continue;
         }
         // Not JSON (e.g. an HTTP request from a web page): drop the connection.
-        let Ok(req) = serde_json::from_str::<Request>(&line) else {
+        let Some(reply) = answer(&mut host, &line) else {
             return Ok(());
-        };
-        let reply = match dispatch(&mut host, &req.method, &req.params) {
-            Ok(result) => json!({"id": req.id, "ok": true, "result": result}),
-            Err(error) => json!({"id": req.id, "ok": false, "error": error}),
         };
         writeln!(out, "{reply}")?;
         out.flush()?;

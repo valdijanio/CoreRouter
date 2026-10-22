@@ -1,7 +1,13 @@
-//! `corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]`
+//! `corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
+//!  [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]`
 //!
 //! The virtual backend is the default: touching a real kernel must be an
-//! explicit choice. TLS/auth for remote management is docs/gaps.md G0.3.
+//! explicit choice. TLS/auth for remote management is docs/gaps.md G0.3, so
+//! both the control port and the WebSocket listen on 127.0.0.1 only.
+//!
+//! `--ws` serves the control methods over WebSocket for the GUI in a browser
+//! (G0.4). Only pages from an allowed origin may connect: by default the
+//! origin of this port itself, which serves the GUI with `--web-root`.
 //!
 //! Persistence (G0.6): every commit is saved to `--config-dir` and restored at
 //! start-up. Without the flag the linux backend uses `/config` (the writable
@@ -10,13 +16,20 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use corerouter_control::{DEFAULT_PORT, SharedHost, bind_loopback, serve};
+use corerouter_control::{DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_ws};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, shared};
 use corerouter_hal::{Hal, VirtualHal};
 use corerouter_storage_fs::FileStorage;
 
-const USAGE: &str =
-    "usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]";
+const USAGE: &str = "\
+usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
+                         [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
+
+  --ws <port>           WebSocket for the web GUI on 127.0.0.1:<port>
+  --ws-origin <origin>  also allow pages from <origin> (e.g. http://127.0.0.1:8080 for
+                        `trunk serve`); the default is only http://127.0.0.1:<port>
+                        and http://localhost:<port>
+  --web-root <dir>      serve the built web GUI (`trunk build` -> dist/) on the --ws port";
 
 /// Writable config partition of the router image (docs/architecture.md 1.1).
 const PRODUCTION_CONFIG_DIR: &str = "/config";
@@ -25,6 +38,9 @@ struct Args {
     port: u16,
     backend: String,
     config_dir: Option<PathBuf>,
+    ws: Option<u16>,
+    ws_origins: Vec<String>,
+    web_root: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -32,6 +48,9 @@ fn parse_args() -> Result<Args, String> {
         port: DEFAULT_PORT,
         backend: "virtual".into(),
         config_dir: None,
+        ws: None,
+        ws_origins: Vec::new(),
+        web_root: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -45,11 +64,67 @@ fn parse_args() -> Result<Args, String> {
                 let v = args.next().ok_or("--config-dir needs a directory")?;
                 out.config_dir = Some(PathBuf::from(v));
             }
+            "--ws" => {
+                let v = args.next().ok_or("--ws needs a port")?;
+                out.ws = Some(v.parse().map_err(|_| format!("bad port '{v}'"))?);
+            }
+            "--ws-origin" => {
+                let v = args.next().ok_or("--ws-origin needs an origin")?;
+                if !(v.starts_with("http://") || v.starts_with("https://")) || v.ends_with('/') {
+                    return Err(format!(
+                        "--ws-origin is scheme://host[:port] as the browser sends it, got '{v}'"
+                    ));
+                }
+                out.ws_origins.push(v);
+            }
+            "--web-root" => {
+                let v = args.next().ok_or("--web-root needs a directory")?;
+                out.web_root = Some(PathBuf::from(v));
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
+    if out.ws.is_none() && (!out.ws_origins.is_empty() || out.web_root.is_some()) {
+        return Err("--ws-origin and --web-root need --ws <port>".into());
+    }
     Ok(out)
+}
+
+/// Start the WebSocket endpoint on its own thread, if asked for.
+fn websocket(args: &Args, host: SharedHost) -> Result<(), String> {
+    let Some(port) = args.ws else {
+        return Ok(());
+    };
+    if let Some(root) = &args.web_root
+        && !root.join("index.html").is_file()
+    {
+        return Err(format!(
+            "--web-root {}: no index.html (build it with `trunk build` in apps/corerouter-gui)",
+            root.display()
+        ));
+    }
+    let listener = bind_loopback(port).map_err(|e| format!("cannot open --ws port {port}: {e}"))?;
+    let mut origins = WsPolicy::same_origin(port);
+    origins.extend(args.ws_origins.iter().cloned());
+    log::info!(
+        "WebSocket on ws://127.0.0.1:{port}/ws (loopback only; NO authentication or TLS \
+         until G0.3); allowed page origins: {}",
+        origins.join(", ")
+    );
+    if let Some(root) = &args.web_root {
+        log::info!(
+            "web GUI from {} at http://127.0.0.1:{port}/",
+            root.display()
+        );
+    }
+    let policy = WsPolicy {
+        origins,
+        web_root: args.web_root.clone(),
+    };
+    spawn_ws(listener, host, policy)
+        .map(|_| ())
+        .map_err(|e| format!("cannot start the WebSocket thread: {e}"))
 }
 
 fn backend(name: &str) -> Result<Box<dyn Hal>, String> {
@@ -122,11 +197,17 @@ fn main() -> ExitCode {
         }
     };
     log::info!(
-        "corerouter-daemon {} on 127.0.0.1:{} (backend: {}, storage: {storage_name})",
+        "corerouter-daemon {} on 127.0.0.1:{} (backend: {}, storage: {storage_name}; \
+         loopback only, no authentication until G0.3)",
         env!("CARGO_PKG_VERSION"),
         args.port,
         args.backend
     );
-    serve(listener, SharedHost(session));
+    let host = SharedHost(session);
+    if let Err(e) = websocket(&args, host.clone()) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    serve(listener, host);
     ExitCode::SUCCESS
 }

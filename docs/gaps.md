@@ -16,7 +16,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G0.1 | Escolher licença do projeto | raiz | Decisão do dono registrada; `license` no `[workspace.package]`. **Agentes: não decidam, perguntem** | — | feito: AGPL-3.0-or-later |
 | G0.2 | CI no GitHub Actions | `.github/` | Workflow roda `cargo xtask ci` (Linux) + build macOS/Windows da GUI; cache de target | 3 h | feito (`stream/G0.2-github-actions`) |
 | G0.3 | Autenticação e TLS no canal de controle | control, daemon | `rustls`, tokens por usuário, grupos read/write/full (como RouterOS); bind não-loopback só com TLS; testes de recusa | 12 h | aberto |
-| G0.4 | GUI como cliente remoto + WebSocket para WASM | ui, control, gui, daemon | Trait de backend na UI (local/remoto); daemon serve WS; GUI web gerencia um roteador real | 14 h | aberto |
+| G0.4 | GUI como cliente remoto + WebSocket para WASM | ui, control, gui, daemon | Trait de backend na UI (local/remoto); daemon serve WS; GUI web gerencia um roteador real. Feito: `ui::Backend` (`submit`/`poll`/`link`) + `Local`; `corerouter-gui --connect HOST:PORT` (thread + reconexão; `--control` repassa ao daemon); `corerouter-daemon --ws <porta> [--ws-origin …] [--web-root dist]` com lista de `Origin`; GUI web por `?connect=ws://…`, `?lab` ou mesma origem | 14 h | feito (`stream/G0.4-gui-remote`) |
 | G0.5 | Fuzzing | engine, control, mcp | `cargo-fuzz` para JSON de config, `read_line_bounded`, `handle_message`; rodada de 10 min sem crash | 6 h | aberto |
 | G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa. Feito: `model::persist` (JSON `format_version` 1), trait `engine::ConfigStorage`, crate `storage-fs` (L4), `corerouter-daemon --config-dir` | 6 h | feito (`stream/G0.6-persistence`) |
 | G0.7 | MCP completo | mcp | resources (`corerouter://state`, `command/{id}`), prompts, completions, progresso/cancelamento, erro `-32003` (motor ocupado) | 10 h | aberto |
@@ -79,3 +79,4 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — G0.6 feito (persistência: `running.json` + `.prev`, escrita atômica, quarentena).
 - 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.
 - 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.
+- 2026-10-21 — G0.4 feito (GUI cliente do daemon, nativo e web; WebSocket com Origin; `--web-root`).

@@ -41,6 +41,17 @@ impl Client {
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.request(method, params)?
+    }
+
+    /// Like [`Client::call`], but tells the two failures apart: the outer
+    /// `Err` means the connection is gone (reconnect before the next call),
+    /// the inner one is the router refusing the request.
+    pub fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Result<Result<Value, String>, String> {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
         let req = json!({"id": id, "method": method, "params": params});
@@ -53,14 +64,19 @@ impl Client {
             Err(e) => return Err(format!("receive: {e}")),
         };
         let reply: Value = serde_json::from_str(&line).map_err(|e| format!("bad reply: {e}"))?;
-        if reply.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(reply.get("result").cloned().unwrap_or(Value::Null))
-        } else {
-            Err(reply
-                .get("error")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error")
-                .to_owned())
-        }
+        Ok(reply_result(&reply))
+    }
+}
+
+/// `{"ok": true, "result"}` | `{"ok": false, "error"}` → `Result`.
+pub fn reply_result(reply: &Value) -> Result<Value, String> {
+    if reply.get("ok").and_then(Value::as_bool) == Some(true) {
+        Ok(reply.get("result").cloned().unwrap_or(Value::Null))
+    } else {
+        Err(reply
+            .get("error")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown error")
+            .to_owned())
     }
 }
