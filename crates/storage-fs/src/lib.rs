@@ -8,7 +8,8 @@
 //! | `running.json.prev` | [`Slot::Previous`] |
 //! | `running.json.tmp` | write in progress (removed on open) |
 //! | `*.corrupt` | quarantined unreadable slot |
-//! | `state-<name>.json` | operational state outside the revisions (DHCP leases) |
+//! | `state-<name>.json` | operational state outside the revisions (DHCP client leases) |
+//! | `journal-<name>.log` | append-only journal (the DHCP server's leases, G4.2a) |
 //!
 //! A save is: write `running.json.tmp`, fsync it, rename `running.json` →
 //! `running.json.prev`, rename the temp file → `running.json`, fsync the
@@ -20,7 +21,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
-use corerouter_engine::storage::{MAX_STATE_BYTES, state_name_ok};
+use corerouter_engine::storage::{MAX_JOURNAL_BYTES, MAX_STATE_BYTES, state_name_ok};
 use corerouter_engine::{ConfigStorage, Slot, StorageError};
 use corerouter_model::persist::MAX_FILE_BYTES;
 
@@ -79,6 +80,14 @@ impl FileStorage {
             Ok(format!("state-{name}.json"))
         } else {
             Err(StorageError(format!("bad state name '{name}'")))
+        }
+    }
+
+    fn journal_file(name: &str) -> Result<String, StorageError> {
+        if state_name_ok(name) {
+            Ok(format!("journal-{name}.log"))
+        } else {
+            Err(StorageError(format!("bad journal name '{name}'")))
         }
     }
 
@@ -184,6 +193,56 @@ impl ConfigStorage for FileStorage {
         }
         let temp = format!("{file}.tmp");
         self.write_file(&temp, data)
+            .map_err(|e| self.err(&format!("write {temp}"), &e))?;
+        fs::rename(self.path(&temp), self.path(&file))
+            .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))?;
+        self.sync_dir().map_err(|e| self.err("sync", &e))
+    }
+
+    fn load_journal(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        let file = Self::journal_file(name)?;
+        let f = match File::open(self.path(&file)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(self.err(&format!("open {file}"), &e)),
+        };
+        let limit = u64::try_from(MAX_JOURNAL_BYTES).unwrap_or(u64::MAX);
+        let mut bytes = Vec::new();
+        f.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|e| self.err(&format!("read {file}"), &e))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    fn append_journal(&mut self, name: &str, lines: &str) -> Result<(), StorageError> {
+        let file = Self::journal_file(name)?;
+        let mut opts = OpenOptions::new();
+        opts.append(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(self.path(&file))
+            .map_err(|e| self.err(&format!("open {file}"), &e))?;
+        let fresh = f.metadata().map(|m| m.len() == 0).unwrap_or(false);
+        f.write_all(lines.as_bytes())
+            .map_err(|e| self.err(&format!("append {file}"), &e))?;
+        // fdatasync: the lines (and the size) are on disk, not the times.
+        f.sync_data()
+            .map_err(|e| self.err(&format!("sync {file}"), &e))?;
+        if fresh {
+            // A new file's directory entry must reach the disk too.
+            self.sync_dir().map_err(|e| self.err("sync", &e))?;
+        }
+        Ok(())
+    }
+
+    fn rewrite_journal(&mut self, name: &str, text: &str) -> Result<(), StorageError> {
+        let file = Self::journal_file(name)?;
+        let temp = format!("{file}.tmp");
+        self.write_file(&temp, text)
             .map_err(|e| self.err(&format!("write {temp}"), &e))?;
         fs::rename(self.path(&temp), self.path(&file))
             .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))?;

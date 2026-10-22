@@ -430,8 +430,10 @@ impl Session {
             self.dhcp_after(id, actions);
             self.dhcp_resilience(id, now_ms);
         }
-        // The DHCPv6 clients (G4.7b) run on the same clock.
+        // The DHCPv6 clients (G4.7b) run on the same clock, and the DHCP
+        // server (G4.2a) when no daemon service drives it.
         self.dhcp6_service(now_ms);
+        self.dhcp_server_from_clock(now_ms);
     }
 
     /// Apply what a state machine asked for (bind, unbind, log).

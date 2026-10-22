@@ -6,6 +6,7 @@
 //! Windows, macOS and iOS, without root.
 
 pub mod dhcp;
+pub mod dhcp_server;
 pub mod drift;
 pub mod icmp_ext;
 pub mod nic;
@@ -226,6 +227,23 @@ pub trait Hal: Send {
     /// uses it unless it already has one (a test's own).
     fn offer_dhcp_lab_server(&mut self, server: SharedResponder) {
         let _ = server;
+    }
+
+    /// Open the DHCP server socket of interface `name` (G4.2a).
+    fn dhcp_server_port(
+        &mut self,
+        name: &IfName,
+    ) -> Result<Box<dyn dhcp_server::DhcpServerPort>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no DHCP server transport (asked for '{name}')",
+            self.describe()
+        )))
+    }
+
+    /// The lab's simulated DHCP clients (G4.2a), offered by the engine like
+    /// [`Hal::offer_dhcp_lab_server`].
+    fn offer_dhcp_lab_clients(&mut self, hosts: dhcp_server::SharedLabClients) {
+        let _ = hosts;
     }
 
     /// Open the DHCPv6 client socket of interface `name` (G4.7b).

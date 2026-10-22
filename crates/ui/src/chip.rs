@@ -177,3 +177,131 @@ pub(crate) fn chip(ui: &mut Ui, text: &str, tone: Tone) -> egui::Response {
     resp
 }
 
+
+// ---- chips inside a table cell (G4.2a) ------------------------------------
+
+/// Separates a table cell's text from its chips (`table::show` paints
+/// them): `cell("lab-laptop", &[("DNS", Kind::Blue)])`.
+pub(crate) const SEP: char = '\u{1f}';
+
+/// The tone of a chip in a cell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Neutral,
+    Amber,
+    Blue,
+    Green,
+    Red,
+    /// A palette entry (`hashed`).
+    Hashed(usize),
+}
+
+impl Kind {
+    fn code(self) -> char {
+        match self {
+            Self::Neutral => 'n',
+            Self::Amber => 'a',
+            Self::Blue => 'b',
+            Self::Green => 'g',
+            Self::Red => 'r',
+            Self::Hashed(i) => char::from_digit(u32::try_from(i % PALETTE.len()).unwrap_or(0), 10).unwrap_or('0'),
+        }
+    }
+
+    fn of(code: char) -> Self {
+        match code {
+            'a' => Self::Amber,
+            'b' => Self::Blue,
+            'g' => Self::Green,
+            'r' => Self::Red,
+            d if d.is_ascii_digit() => Self::Hashed(d.to_digit(10).map_or(0, |n| n as usize)),
+            _ => Self::Neutral,
+        }
+    }
+
+    pub(crate) fn tone(self, v: &egui::Visuals) -> Tone {
+        match self {
+            Self::Neutral => neutral_tone(v),
+            Self::Amber => AMBER.tone(v),
+            Self::Blue => BLUE.tone(v),
+            Self::Green => GREEN.tone(v),
+            Self::Red => RED.tone(v),
+            Self::Hashed(i) => palette_tone(v, i),
+        }
+    }
+}
+
+/// A cell: `text`, then `chips` on the same line.
+pub(crate) fn cell(text: &str, chips: &[(&str, Kind)]) -> String {
+    let mut out = text.replace(SEP, " ");
+    for (label, kind) in chips {
+        out.push(SEP);
+        out.push(kind.code());
+        out.push_str(&label.replace(SEP, " "));
+    }
+    out
+}
+
+/// A cell's text and its chips.
+pub(crate) fn split(cell: &str) -> (&str, Vec<(Kind, &str)>) {
+    let mut parts = cell.split(SEP);
+    let text = parts.next().unwrap_or("");
+    let chips = parts
+        .filter_map(|p| {
+            let mut c = p.chars();
+            let code = c.next()?;
+            Some((Kind::of(code), c.as_str()))
+        })
+        .collect();
+    (text, chips)
+}
+
+const CELL_GAP: f32 = 6.0;
+const CELL_PAD: egui::Vec2 = egui::vec2(6.0, 1.0);
+
+/// Width of a cell's chips (after its text).
+pub(crate) fn cell_chips_width(painter: &egui::Painter, chips: &[(Kind, &str)], size: f32) -> f32 {
+    chips
+        .iter()
+        .map(|(_, label)| {
+            let g = painter.layout_no_wrap((*label).to_owned(), egui::FontId::proportional(size), Color32::PLACEHOLDER);
+            CELL_GAP + g.size().x + 2.0 * CELL_PAD.x
+        })
+        .sum()
+}
+
+/// Paint a cell's chips from `x` on the line centred at `y`, at most
+/// `height` tall.
+pub(crate) fn paint_cell_chips(painter: &egui::Painter, v: &egui::Visuals, x: f32, y: f32, height: f32, chips: &[(Kind, &str)], size: f32) {
+    let mut x = x;
+    for (kind, label) in chips {
+        let tone = kind.tone(v);
+        let g = painter.layout_no_wrap((*label).to_owned(), egui::FontId::proportional(size), tone.ink);
+        let h = (g.size().y + 2.0 * CELL_PAD.y).min(height - 2.0);
+        x += CELL_GAP;
+        let rect = egui::Rect::from_min_size(egui::pos2(x, y - h / 2.0), egui::vec2(g.size().x + 2.0 * CELL_PAD.x, h));
+        let stroke = tone.border.map_or(egui::Stroke::NONE, |c| egui::Stroke::new(1.0, c));
+        painter.rect(rect, 8.0, tone.fill, stroke, egui::StrokeKind::Inside);
+        painter.galley(rect.center() - g.size() / 2.0, g, tone.ink);
+        x = rect.right();
+    }
+}
+
+/// Font size of chips in a table: a step below the body.
+pub(crate) fn cell_size(font: &egui::FontId) -> f32 {
+    font.size * 0.85
+}
+
+#[cfg(test)]
+mod cell_tests {
+    use super::*;
+
+    #[test]
+    fn cells_carry_their_chips() {
+        let c = cell("lab-laptop", &[("DNS", Kind::Blue), ("ONU 1/1/3", Kind::Hashed(3))]);
+        let (text, chips) = split(&c);
+        assert_eq!(text, "lab-laptop");
+        assert_eq!(chips, vec![(Kind::Blue, "DNS"), (Kind::Hashed(3), "ONU 1/1/3")]);
+        assert_eq!(split("plain"), ("plain", vec![]));
+    }
+}

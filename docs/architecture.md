@@ -69,7 +69,7 @@ backend.**
 | Serviço | Escolha | Observação |
 |---|---|---|
 | DNS: resolvedor do roteador, encaminhador com cache, estáticos, servidor autoritativo | Hickory DNS, Rust puro (decisão do usuário, 2026-10-22): `hickory-proto` no resolvedor (G4.1a), `hickory-server` no servidor (G4.1c) | Num processo só, integrado aos comandos e às transações; veja "DNS (G4.1)" na seção 3 e `docs/dns.md` |
-| DHCPv4/DHCPv6 (+PD) e relay | DHCPv4: codec `dhcproto` atrás de um saneador; DHCPv6: codec próprio (G4.7b: o `dhcproto` 0.15 v6 dá panic/dessincroniza com bytes hostis); servidor e banco de leases próprios | Leases em `/config`, escrita atômica |
+| DHCPv4/DHCPv6 (+PD) e relay | Rust puro (decisão do usuário, 2026-10-22). DHCPv4: codec `dhcproto` atrás de um saneador no cliente; o servidor (G4.2a) lê pedidos com leitor próprio e responde pelo `dhcproto`; DHCPv6: codec próprio (G4.7b: o `dhcproto` 0.15 v6 dá panic/dessincroniza com bytes hostis); servidor e diário de concessões próprios | Diário só de acréscimo em `/config` com `fdatasync` antes do ACK e compactação atômica; veja "Servidor DHCP (G4.2)" e `docs/dhcp.md` |
 | PPPoE / IPoE (BNG) | orquestrar `accel-ppp` | Não há BNG Rust maduro; mesmo padrão do FRR |
 | NTP | Cliente SNTP próprio (G4.6: `proto-ntp` L2 puro + thread no daemon); `ntpd-rs` fica como opção para o servidor NTP e a disciplina do relógio (G4.6b/G4.6c) | Medir o offset é um pacote de 48 bytes e quatro timestamps (RFC 5905 §8/§14): um processo externo a mais não paga isso, e o status vai direto para `system.ntp.client.get` sem parsear saída. Ajustar o relógio (slew/step, `CAP_SYS_TIME`) e servir hora são outra conversa: lá a maturidade do `ntpd-rs`/chrony pesa mais |
 | Syslog remoto | Codec RFC 5424 próprio (`proto-syslog`, só encode) + UDP (RFC 5426) no daemon | Regras e ações estilo `/system logging` do RouterOS no engine; TCP/TLS (RFC 5425) depois |
@@ -544,6 +544,32 @@ silenciosa.
   com mais de 30 s aparece como motivo ("no heartbeat for N s"), sem reinício forçado.
 - **Métricas.** `system.metrics` traz `services`, e o exportador gera `corerouter_service_up` e
   `corerouter_service_restarts_total` por `name`.
+
+### Servidor DHCP (G4.2)
+
+**Decisão do usuário (2026-10-22):** servidor DHCP em **Rust puro** sobre o `dhcproto`, dentro do
+daemon, em vez de orquestrar o Kea ou o dnsmasq.
+
+| | Rust puro (G4.2a) | Kea (OPNsense/VyOS) | dnsmasq (OpenWrt) |
+|---|---|---|---|
+| Processo | nenhum a mais | `kea-dhcp4` + `kea-lfc` + `kea-dhcp-ddns` | um |
+| Config | comandos, transações, Safe Mode, MCP | JSON próprio, recarga por API de controle | arquivo, recarga por sinal |
+| Concessões no motor | direto (`ip.dhcp-server.lease.print`, make-static, release) | API de controle ou leitura do CSV | arquivo de leases |
+| DHCP → DNS e firewall | chamada direta (`dns_dynamic_lease`, address-list dinâmica) | D2 + RFC 2136 com TSIG | hosts locais, sem PTR remoto |
+| Vazão do núcleo | **medido**: 171–214 k leases/s (§9 de `docs/dhcp.md`) | milhares de leases/s com memfile (**estimado**; o ISC publica números com `perfdhcp`) | **estimado**: alguns k/s |
+| Maturidade, interoperabilidade | nova; testada contra o nosso cliente, o lab e a RFC | muito alta | alta |
+
+Por que Rust puro ganhou: um processo e um ponto de falha a menos; concessões dentro das
+transações, do Safe Mode e do MCP; integração direta com o DNS e o firewall sem protocolo no meio;
+números de vazão acima do que um roteador de borda precisa. O gargalo do servidor no daemon é o
+disco: uma `fdatasync` por rodada, com todas as concessões da rodada (group commit).
+**Risco aceito:** clientes estranhos (CPEs, ONUs, IoT) que o Kea já viu e nós não. Mitigação:
+leitor de pedidos tolerante e testado com proptest, comportamento do RouterOS como referência, e
+a decisão pode ser revista com números de campo.
+
+Camadas: o servidor é L2 puro (`proto-dhcp/src/server/`, compila em wasm: o lab do navegador
+também o roda), o engine guarda o estado e aplica os efeitos, o daemon só o dirige
+(`service/dhcp_server.rs`) e o `hal-linux` só carrega bytes (`dhcp_server.rs`).
 
 ## Histórico de revisão
 

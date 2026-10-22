@@ -258,6 +258,12 @@ pub struct Ip {
     /// `/ip dns tsig-key` (G4.1c-3): TSIG keys for RFC 2136 UPDATE.
     #[serde(skip_serializing_if = "crate::dns_tsig::DnsTsig::is_empty")]
     pub dns_tsig: crate::dns_tsig::DnsTsig,
+    /// `/ip pool` (G4.2a): address pools of the DHCP server.
+    #[serde(skip_serializing_if = "crate::ip_pool::IpPools::is_empty")]
+    pub pools: crate::ip_pool::IpPools,
+    /// `/ip dhcp-server` (G4.2a): servers, networks, static leases, options.
+    #[serde(skip_serializing_if = "crate::dhcp_server::DhcpServers::is_empty")]
+    pub dhcp_server: crate::dhcp_server::DhcpServers,
 }
 
 impl Ip {

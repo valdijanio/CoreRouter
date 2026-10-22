@@ -65,7 +65,7 @@ fn dhcp_filter() -> [SockFilter; 11] {
     ]
 }
 
-fn packet_socket(link: &LinkAddr, ethertype: u16) -> io::Result<Socket> {
+pub(crate) fn packet_socket(link: &LinkAddr, ethertype: u16) -> io::Result<Socket> {
     let proto = Protocol::from(i32::from(ethertype.to_be()));
     let sock = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
     sock.set_nonblocking(true)?;
@@ -94,7 +94,7 @@ fn udp_socket(name: &IfName) -> io::Result<Socket> {
 }
 
 /// One's-complement sum of 16-bit words (IP and UDP checksums).
-fn sum16(data: &[u8], mut acc: u32) -> u32 {
+pub(crate) fn sum16(data: &[u8], mut acc: u32) -> u32 {
     let (words, rest) = data.as_chunks::<2>();
     for w in words {
         acc = acc.wrapping_add(u32::from(u16::from_be_bytes(*w)));
@@ -105,7 +105,7 @@ fn sum16(data: &[u8], mut acc: u32) -> u32 {
     acc
 }
 
-fn fold(mut acc: u32) -> u16 {
+pub(crate) fn fold(mut acc: u32) -> u16 {
     while acc > 0xffff {
         acc = (acc & 0xffff).wrapping_add(acc >> 16);
     }

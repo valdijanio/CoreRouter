@@ -17,7 +17,7 @@ use super::{CommandSpec, always};
 use crate::{Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "system.metrics", "Metrics", [], None,
-    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}]}",
+    "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}], dhcp_server (null until a DHCP server ran; else as ip.dhcp-server.statistics.print)}",
     always, metrics)];
 
 /// Error and drop counters of the platform's `interface` group, by the
@@ -74,6 +74,7 @@ fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
         "engine": s.counters,
         "interfaces": rows,
         "services": services(s),
+        "dhcp_server": super::dhcp_server_stats::snapshot(s),
     }))
 }
 

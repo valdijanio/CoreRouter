@@ -203,6 +203,9 @@ pub fn render(m: &Value, scrape_seconds: f64) -> String {
             }
         }
     }
+    if let Some(d) = m.get("dhcp_server").filter(|d| d.is_object()) {
+        dhcp_server(&mut out, d);
+    }
     if let Some(v) = m.get("revision").and_then(Value::as_u64) {
         family(
             &mut out,
@@ -243,6 +246,85 @@ pub fn render(m: &Value, scrape_seconds: f64) -> String {
         "corerouter_scrape_duration_seconds {scrape_seconds:.6}"
     );
     out
+}
+
+/// G4.2a: the DHCP server's numbers (`ip.dhcp-server.statistics.print`).
+fn dhcp_server(out: &mut String, d: &Value) {
+    let obj = |k: &str| d.get(k).and_then(Value::as_object);
+    if let Some(l) = obj("leases") {
+        family(out, "corerouter_dhcp_leases", "gauge", "DHCP server leases by state.");
+        for (state, n) in l {
+            if let Some(n) = n.as_u64() {
+                let _ = writeln!(out, "corerouter_dhcp_leases{{state=\"{}\"}} {n}", label(state));
+            }
+        }
+    }
+    let pools = d.get("pools").and_then(Value::as_array).map_or(&[][..], Vec::as_slice);
+    if !pools.is_empty() {
+        for (metric, key, help) in [
+            ("corerouter_dhcp_pool_size", "size", "Addresses in the pool."),
+            ("corerouter_dhcp_pool_used", "bound", "Addresses of the pool bound to a client."),
+            ("corerouter_dhcp_pool_offered", "offered", "Addresses of the pool on offer."),
+        ] {
+            family(out, metric, "gauge", help);
+            for p in pools {
+                let pool = label(p.get("pool").and_then(Value::as_str).unwrap_or(""));
+                if let Some(n) = p.get(key).and_then(Value::as_u64) {
+                    let _ = writeln!(out, "{metric}{{pool=\"{pool}\"}} {n}");
+                }
+            }
+        }
+    }
+    for (key, metric, help) in [
+        ("received", "corerouter_dhcp_received_total", "DHCP messages received, by type."),
+        ("sent", "corerouter_dhcp_sent_total", "DHCP replies sent, by type."),
+    ] {
+        if let Some(by) = obj(key) {
+            family(out, metric, "counter", help);
+            for (kind, n) in by {
+                if let Some(n) = n.as_u64() {
+                    let _ = writeln!(out, "{metric}{{type=\"{}\"}} {n}", label(kind));
+                }
+            }
+        }
+    }
+    if let Some(drops) = d.get("dropped").and_then(Value::as_array) {
+        family(out, "corerouter_dhcp_dropped_total", "counter", "DHCP messages that got no answer, by reason.");
+        for x in drops {
+            let reason = label(x.get("reason").and_then(Value::as_str).unwrap_or(""));
+            if let Some(n) = x.get("count").and_then(Value::as_u64) {
+                let _ = writeln!(out, "corerouter_dhcp_dropped_total{{reason=\"{reason}\"}} {n}");
+            }
+        }
+    }
+    for (key, metric, kind, help) in [
+        ("probes", "corerouter_dhcp_probes_total", "counter", "ARP probes before an offer."),
+        ("conflicts", "corerouter_dhcp_conflicts_total", "counter", "Addresses found in use (probe answered, or DECLINE)."),
+        ("rogue_replies", "corerouter_dhcp_rogue_replies_total", "counter", "Replies of unknown DHCP servers heard where an alert watches."),
+        ("peak_acks", "corerouter_dhcp_peak_acks_per_second", "gauge", "Most ACKs sent in one second since the start or the last reset."),
+    ] {
+        if let Some(n) = d.get(key).and_then(Value::as_u64) {
+            family(out, metric, kind, help);
+            let _ = writeln!(out, "{metric} {n}");
+        }
+    }
+    let lat = d.get("latency_us");
+    if let Some(buckets) = lat.and_then(|l| l.get("buckets")).and_then(Value::as_array) {
+        let name = "corerouter_dhcp_reply_seconds";
+        family(out, name, "histogram", "Time from a request's arrival to its reply leaving (an offer's probe wait not counted).");
+        for b in buckets {
+            let le = match b.get(0).and_then(Value::as_u64) {
+                Some(us) => format!("{}", us as f64 / 1e6),
+                None => "+Inf".into(),
+            };
+            let n = b.get(1).and_then(Value::as_u64).unwrap_or(0);
+            let _ = writeln!(out, "{name}_bucket{{le=\"{le}\"}} {n}");
+        }
+        let sum = lat.and_then(|l| l.get("sum")).and_then(Value::as_u64).unwrap_or(0);
+        let count = lat.and_then(|l| l.get("count")).and_then(Value::as_u64).unwrap_or(0);
+        let _ = writeln!(out, "{name}_sum {}", sum as f64 / 1e6);
+        let _ = writeln!(out, "{name}_count {count}");
+    }
 }
 
 fn family(out: &mut String, name: &str, kind: &str, help: &str) {
@@ -714,6 +796,31 @@ mod tests {
         assert_eq!(label(&"x".repeat(500)).len(), MAX_LABEL);
         let m = json!({"interfaces": [{"name": "we\"ird\n", "running": true}]});
         assert!(render(&m, 0.0).contains("corerouter_interface_up{interface=\"we\\\"ird\\n\"} 1"));
+    }
+
+    #[test]
+    fn renders_the_dhcp_server() {
+        let m = json!({"dhcp_server": {
+            "leases": {"bound": 4, "offered": 1},
+            "pools": [{"pool": "lan", "size": 41, "bound": 4, "offered": 1}],
+            "received": {"discover": 9}, "sent": {"ack": 4},
+            "dropped": [{"reason": "rate-limited", "count": 2}],
+            "probes": 5, "conflicts": 1, "rogue_replies": 0, "peak_acks": 3,
+            "latency_us": {"sum": 900, "count": 4, "buckets": [[25, 1], [50, 4], [null, 4]]},
+        }});
+        let text = render(&m, 0.0);
+        for want in [
+            "corerouter_dhcp_leases{state=\"bound\"} 4",
+            "corerouter_dhcp_pool_size{pool=\"lan\"} 41",
+            "corerouter_dhcp_received_total{type=\"discover\"} 9",
+            "corerouter_dhcp_dropped_total{reason=\"rate-limited\"} 2",
+            "corerouter_dhcp_conflicts_total 1",
+            "corerouter_dhcp_reply_seconds_bucket{le=\"0.00005\"} 4",
+            "corerouter_dhcp_reply_seconds_bucket{le=\"+Inf\"} 4",
+            "corerouter_dhcp_reply_seconds_count 4",
+        ] {
+            assert!(text.contains(want), "{want} not in\n{text}");
+        }
     }
 
     #[test]

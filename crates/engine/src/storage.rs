@@ -61,7 +61,33 @@ pub trait ConfigStorage: Send {
         let _ = (name, data);
         Ok(())
     }
+
+    /// The whole text of append-only journal `name` (the DHCP server's
+    /// leases, G4.2a), or `None` if it was never written.
+    fn load_journal(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Append `lines` to journal `name`, on disk (synced) before it
+    /// returns: a reply that depends on them goes out after. A crash may
+    /// leave a torn last line, which the reader skips.
+    fn append_journal(&mut self, name: &str, lines: &str) -> Result<(), StorageError> {
+        let _ = (name, lines);
+        Ok(())
+    }
+
+    /// Replace journal `name` with `text` (its compaction), atomically:
+    /// after a crash it is either the old journal or the new one.
+    fn rewrite_journal(&mut self, name: &str, text: &str) -> Result<(), StorageError> {
+        let _ = (name, text);
+        Ok(())
+    }
 }
+
+/// Largest journal read back (**estimado**: a /12 of leases at ~200 bytes
+/// a line, with room for the lines since the last compaction).
+pub const MAX_JOURNAL_BYTES: usize = 512 << 20;
 
 /// Largest state blob kept by [`ConfigStorage::save_state`] (hostile file
 /// on the way back in; **estimado**: 256 leases of ~1 KiB).
@@ -83,6 +109,7 @@ struct Slots {
     previous: Option<String>,
     quarantined: Vec<String>,
     state: std::collections::BTreeMap<String, String>,
+    journals: std::collections::BTreeMap<String, String>,
 }
 
 /// In-memory storage. Clones share the same slots, so a test can keep a
@@ -155,6 +182,32 @@ impl ConfigStorage for MemoryStorage {
             return Err(StorageError(format!("state '{name}' refused")));
         }
         self.with(|s| s.state.insert(name.to_owned(), data.to_owned()));
+        Ok(())
+    }
+
+    fn load_journal(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        Ok(self.with(|s| s.journals.get(name).cloned()))
+    }
+
+    fn append_journal(&mut self, name: &str, lines: &str) -> Result<(), StorageError> {
+        if !state_name_ok(name) {
+            return Err(StorageError(format!("journal '{name}' refused")));
+        }
+        self.with(|s| {
+            let j = s.journals.entry(name.to_owned()).or_default();
+            if j.len() + lines.len() > MAX_JOURNAL_BYTES {
+                return Err(StorageError(format!("journal '{name}' is full")));
+            }
+            j.push_str(lines);
+            Ok(())
+        })
+    }
+
+    fn rewrite_journal(&mut self, name: &str, text: &str) -> Result<(), StorageError> {
+        if !state_name_ok(name) {
+            return Err(StorageError(format!("journal '{name}' refused")));
+        }
+        self.with(|s| s.journals.insert(name.to_owned(), text.to_owned()));
         Ok(())
     }
 }
