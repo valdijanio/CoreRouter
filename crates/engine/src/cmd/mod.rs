@@ -46,6 +46,7 @@ pub mod args;
 mod config;
 mod interface;
 mod ip;
+mod neighbor;
 mod route;
 mod routing;
 mod system;
@@ -56,6 +57,7 @@ static AREAS: &[&[CommandSpec]] = &[
     ip::COMMANDS,
     route::COMMANDS,
     vrf::COMMANDS,
+    neighbor::COMMANDS,
     routing::COMMANDS,
     system::COMMANDS,
     config::COMMANDS,

@@ -6,8 +6,10 @@
 //! (eframe/winit/wgpu) belongs to `apps/corerouter-gui`.
 
 pub mod backend;
+pub mod connect;
 mod float;
 mod interfaces;
+mod neighbors;
 mod prefs;
 mod routes;
 mod table;
@@ -22,6 +24,9 @@ use egui::{Color32, RichText};
 use serde_json::{Value, json};
 
 pub use backend::{Backend, Link, Local, Reply, RequestId};
+pub use connect::{ConnectAction, ConnectScreen, NeighborRow, SavedRouter};
+pub use neighbors::uptime_text;
+pub use prefs::stored_theme;
 pub use windows::Win;
 
 /// Seconds between automatic refreshes of the live tables.
@@ -50,6 +55,8 @@ enum Field {
     Diff,
     /// `engine.list`: which commands the router allows now, and why not.
     Commands,
+    Neighbors,
+    Discovery,
 }
 
 /// Cached query results, refreshed every `REFRESH_SECS` or after an action.
@@ -64,6 +71,8 @@ struct Cache {
     history: Vec<Value>,
     diff: Vec<Value>,
     commands: Vec<Value>,
+    neighbors: Vec<Value>,
+    discovery: Value,
     refreshed_at: Option<f64>,
     /// Newest reply applied per field: an older one arriving late is dropped.
     applied: BTreeMap<Field, RequestId>,
@@ -80,6 +89,7 @@ struct Forms {
     bgp_router_id: String,
     bgp_frr: String,
     identity: String,
+    discovery: neighbors::DiscoveryForm,
 }
 
 /// Selection and find text of each list window (UI-local state only).
@@ -89,6 +99,7 @@ struct Tables {
     addresses: table::TableState,
     routes: table::TableState,
     vrfs: table::TableState,
+    neighbors: table::TableState,
 }
 
 impl Tables {
@@ -364,6 +375,8 @@ impl CoreRouterUi {
             Field::History => self.cache.history = arr(value),
             Field::Diff => self.cache.diff = arr(value),
             Field::Commands => self.cache.commands = arr(value),
+            Field::Neighbors => self.cache.neighbors = arr(value),
+            Field::Discovery => self.cache.discovery = value,
         }
     }
 
@@ -481,6 +494,20 @@ impl CoreRouterUi {
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
         ask(self, Field::Commands, "engine.list", Value::Null);
+        if self.open.contains(&Win::Neighbors) {
+            ask(
+                self,
+                Field::Neighbors,
+                "engine.execute",
+                exec("ip.neighbor.list"),
+            );
+            ask(
+                self,
+                Field::Discovery,
+                "engine.execute",
+                exec("ip.neighbor.discovery.get"),
+            );
+        }
         list
     }
 

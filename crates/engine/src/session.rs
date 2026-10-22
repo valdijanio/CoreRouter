@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cmd::{self, check_params, unknown_command};
+use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
 use crate::validate::validate_all;
@@ -55,6 +56,8 @@ pub struct Session {
     /// Sender of the command being run (see [`Session::execute_as`]).
     caller: Caller,
     safe_mode: SafeMode,
+    /// Heard by discovery protocols (operational state, never saved).
+    pub(crate) neighbors: NeighborTable,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -120,6 +123,7 @@ impl Session {
             seq: 0,
             caller: Caller::local(),
             safe_mode: SafeMode::default(),
+            neighbors: NeighborTable::default(),
         }
     }
 

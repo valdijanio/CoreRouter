@@ -1,5 +1,6 @@
 //! `corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
-//!  [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]`
+//!  [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
+//!  [--discovery-port <port> | --no-discovery]`
 //!
 //! The virtual backend is the default: touching a real kernel must be an
 //! explicit choice. TLS/auth for remote management is docs/gaps.md G0.3, so
@@ -16,6 +17,12 @@
 //! Safe Mode (G1.4): a clock thread ticks the session every second (timeouts),
 //! and a control or WebSocket connection that closes undoes the Safe Mode it
 //! held. Changes made in Safe Mode are saved only when it is confirmed.
+//!
+//! Neighbor discovery (G5.1, docs/discovery.md): CRDP announces on the
+//! interfaces listed with `ip.neighbor.discovery.set` (none by default) and
+//! fills `ip.neighbor.list`. The node id is kept in `<config-dir>/node-id`.
+
+mod node_id;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -23,6 +30,7 @@ use std::process::ExitCode;
 use corerouter_control::{
     DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_clock, spawn_ws,
 };
+use corerouter_discovery::{Agent, AgentConfig};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, shared};
 use corerouter_hal::{Hal, VirtualHal};
 use corerouter_storage_fs::FileStorage;
@@ -30,12 +38,15 @@ use corerouter_storage_fs::FileStorage;
 const USAGE: &str = "\
 usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
                          [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
+                         [--discovery-port <port> | --no-discovery]
 
   --ws <port>           WebSocket for the web GUI on 127.0.0.1:<port>
   --ws-origin <origin>  also allow pages from <origin> (e.g. http://127.0.0.1:8080 for
                         `trunk serve`); the default is only http://127.0.0.1:<port>
                         and http://localhost:<port>
-  --web-root <dir>      serve the built web GUI (`trunk build` -> dist/) on the --ws port";
+  --web-root <dir>      serve the built web GUI (`trunk build` -> dist/) on the --ws port
+  --discovery-port <p>  UDP port of CRDP neighbor discovery (default 7979)
+  --no-discovery        do not open the CRDP port at all";
 
 /// Writable config partition of the router image (docs/architecture.md 1.1).
 const PRODUCTION_CONFIG_DIR: &str = "/config";
@@ -47,6 +58,8 @@ struct Args {
     ws: Option<u16>,
     ws_origins: Vec<String>,
     web_root: Option<PathBuf>,
+    /// `None`: `--no-discovery`.
+    discovery_port: Option<u16>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -57,6 +70,7 @@ fn parse_args() -> Result<Args, String> {
         ws: None,
         ws_origins: Vec::new(),
         web_root: None,
+        discovery_port: Some(corerouter_discovery::PORT),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -87,6 +101,11 @@ fn parse_args() -> Result<Args, String> {
                 let v = args.next().ok_or("--web-root needs a directory")?;
                 out.web_root = Some(PathBuf::from(v));
             }
+            "--discovery-port" => {
+                let v = args.next().ok_or("--discovery-port needs a port")?;
+                out.discovery_port = Some(v.parse().map_err(|_| format!("bad port '{v}'"))?);
+            }
+            "--no-discovery" => out.discovery_port = None,
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
@@ -148,28 +167,30 @@ fn backend(name: &str) -> Result<Box<dyn Hal>, String> {
 /// implicit `/config` of the linux backend degrades to memory instead: a
 /// router that boots without persistence still forwards traffic, and
 /// `state.inspect` shows `storage.backend`.
-fn storage(args: &Args) -> Result<Box<dyn ConfigStorage>, String> {
+/// The storage, and its directory when it is on disk.
+fn storage(args: &Args) -> Result<(Box<dyn ConfigStorage>, Option<PathBuf>), String> {
     let (dir, explicit) = match (&args.config_dir, args.backend.as_str()) {
         (Some(d), _) => (d.clone(), true),
         (None, "linux") => (PathBuf::from(PRODUCTION_CONFIG_DIR), false),
-        (None, _) => return Ok(Box::new(MemoryStorage::default())),
+        (None, _) => return Ok((Box::new(MemoryStorage::default()), None)),
     };
     match FileStorage::open(&dir) {
-        Ok(fs) => Ok(Box::new(fs)),
+        Ok(fs) => Ok((Box::new(fs), Some(dir))),
         Err(e) if explicit => Err(format!("cannot use --config-dir {}: {e}", dir.display())),
         Err(e) => {
             log::error!(
                 "cannot use {}: {e}; config will NOT survive a restart",
                 dir.display()
             );
-            Ok(Box::new(MemoryStorage::default()))
+            Ok((Box::new(MemoryStorage::default()), None))
         }
     }
 }
 
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
-        "warn,corerouter_daemon=info,corerouter_control=info,corerouter_engine=info",
+        "warn,corerouter_daemon=info,corerouter_control=info,corerouter_engine=info,\
+         corerouter_discovery=info",
     ))
     .init();
     let args = match parse_args() {
@@ -186,7 +207,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let storage = match storage(&args) {
+    let (storage, config_dir) = match storage(&args) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
@@ -213,6 +234,27 @@ fn main() -> ExitCode {
         args.port,
         args.backend
     );
+    // Kept alive until `serve` returns (never, in practice).
+    let _discovery = match args.discovery_port {
+        None => None,
+        Some(port) => {
+            let cfg = AgentConfig {
+                port,
+                node_id: node_id::load_or_create(config_dir.as_deref()),
+                control_port: Some(args.port),
+                ws_port: args.ws,
+                board: format!("{} {}", std::env::consts::ARCH, args.backend),
+            };
+            match Agent::spawn(session.clone(), cfg) {
+                Ok(a) => Some(a),
+                Err(e) => {
+                    // A router without discovery still forwards traffic.
+                    log::error!("neighbor discovery is off: cannot open UDP {port}: {e}");
+                    None
+                }
+            }
+        }
+    };
     let host = SharedHost(session);
     if let Err(e) = websocket(&args, host.clone()) {
         eprintln!("{e}");

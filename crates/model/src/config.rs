@@ -7,6 +7,7 @@ use std::net::Ipv4Addr;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::neighbor::NeighborDiscovery;
 use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -114,6 +115,8 @@ pub struct Ip {
     pub routes: Vec<RouteEntry>,
     /// Next id handed out by `next_route_id`.
     pub next_route_id: u32,
+    /// Where neighbor discovery listens and announces (`ip.neighbor.discovery.set`).
+    pub neighbor_discovery: NeighborDiscovery,
 }
 
 impl Ip {

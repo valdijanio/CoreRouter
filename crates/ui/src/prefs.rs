@@ -34,6 +34,22 @@ fn theme_name(pref: ThemePreference) -> &'static str {
         .map_or("system", |(_, name, _)| name)
 }
 
+fn theme_in(v: &Value) -> Option<ThemePreference> {
+    THEMES
+        .iter()
+        .find(|(_, name, _)| v.get("theme").and_then(Value::as_str) == Some(*name))
+        .map(|(pref, ..)| *pref)
+}
+
+/// The theme of stored preferences, for screens drawn before a router is
+/// picked (the connect screen).
+pub fn stored_theme(text: &str) -> Option<ThemePreference> {
+    if text.len() > MAX_PREFS {
+        return None;
+    }
+    theme_in(&serde_json::from_str::<Value>(text).ok()?)
+}
+
 impl CoreRouterUi {
     /// The preferences as JSON, for the app to store.
     pub fn prefs(&self) -> String {
@@ -50,11 +66,8 @@ impl CoreRouterUi {
         let Ok(v) = serde_json::from_str::<Value>(text) else {
             return;
         };
-        if let Some((pref, ..)) = THEMES
-            .iter()
-            .find(|(_, name, _)| v.get("theme").and_then(Value::as_str) == Some(*name))
-        {
-            self.theme = *pref;
+        if let Some(pref) = theme_in(&v) {
+            self.theme = pref;
         }
         if let Some(list) = v.get("inline_comments").and_then(Value::as_array) {
             for (salt, table) in self.tables.each() {

@@ -3,8 +3,11 @@
 //!
 //! - `?connect=ws://127.0.0.1:7980` — that daemon (`corerouter-daemon --ws`);
 //! - `?lab` — the virtual lab, inside the page (nothing persists);
-//! - neither — the daemon that served the page (`ws(s)://<host>/ws`, the
-//!   WebFig model with `corerouter-daemon --ws <port> --web-root <dist>`).
+//! - neither — the connect screen, with "Connect to" set to the daemon that
+//!   served the page (`ws(s)://<host>/ws`, the WebFig model with
+//!   `corerouter-daemon --ws <port> --web-root <dist>`) and the Neighbors tab
+//!   filled from that daemon's `ip.neighbor.list` (a browser cannot listen
+//!   for CRDP itself). The Saved tab lives in `localStorage`.
 //!
 //! Browser events (open, message, close) only fill a queue; `poll` hands it
 //! to the UI on its next frame.
@@ -13,7 +16,10 @@ use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::{Rc, Weak};
 
-use corerouter_ui::{Backend, Link, Reply, RequestId};
+use corerouter_engine::{Session, shared};
+use corerouter_ui::{
+    Backend, ConnectScreen, CoreRouterUi, Link, NeighborRow, Reply, RequestId, SavedRouter,
+};
 use eframe::wasm_bindgen::JsCast as _;
 use eframe::wasm_bindgen::closure::Closure;
 use serde_json::{Value, json};
@@ -25,7 +31,14 @@ const RETRY_MS: f64 = 2000.0;
 pub enum Choice {
     Lab,
     Connect(String),
+    /// The connect screen; the WebSocket URL of the daemon that served the page.
+    Screen(String),
 }
+
+/// `localStorage` key of the Saved tab.
+const SAVED_KEY: &str = "corerouter.saved-routers";
+/// Milliseconds between two `ip.neighbor.list` on the connect screen.
+const NEIGHBORS_MS: f64 = 2000.0;
 
 /// Read the page URL.
 pub fn choice() -> Choice {
@@ -50,7 +63,138 @@ pub fn choice() -> Choice {
     }
     let secure = location.protocol().is_ok_and(|p| p == "https:");
     let host = location.host().unwrap_or_default();
-    Choice::Connect(format!("{}://{host}/ws", if secure { "wss" } else { "ws" }))
+    Choice::Screen(format!("{}://{host}/ws", if secure { "wss" } else { "ws" }))
+}
+
+/// `ws://…` for what the operator typed: a URL as is, `host:port` gets the
+/// scheme and the `/ws` path of `corerouter-daemon --ws`.
+fn ws_url(addr: &str) -> String {
+    if addr.contains("://") {
+        addr.to_owned()
+    } else {
+        format!("ws://{addr}/ws")
+    }
+}
+
+/// The connect screen in the browser.
+pub struct WebPlatform {
+    /// Connection to the daemon that served the page, for its neighbor list.
+    home: WsBackend,
+    asked: Option<RequestId>,
+    asked_at: f64,
+    rows: Vec<NeighborRow>,
+}
+
+pub fn connect_screen(home: String) -> (ConnectScreen, WebPlatform) {
+    let mut screen = ConnectScreen::new(load_saved());
+    screen.connect_to = home.clone();
+    screen.set_source(format!(
+        "Neighbors of the router at {home} (ip.neighbor.list; a browser cannot listen \
+         for announcements itself)"
+    ));
+    let platform = WebPlatform {
+        home: WsBackend::new(home),
+        asked: None,
+        asked_at: f64::NEG_INFINITY,
+        rows: Vec::new(),
+    };
+    (screen, platform)
+}
+
+fn storage() -> Option<web_sys::Storage> {
+    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+}
+
+fn load_saved() -> Vec<SavedRouter> {
+    storage()
+        .and_then(|s| s.get_item(SAVED_KEY).ok().flatten())
+        .filter(|text| text.len() <= 1 << 20)
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .map(|v| SavedRouter::list_from_json(&v))
+        .unwrap_or_default()
+}
+
+/// One `ip.neighbor.list` row of the home daemon as a Neighbors row; it is
+/// reachable from the browser through its WebSocket port, if it has one.
+fn neighbor_row(r: &Value) -> NeighborRow {
+    let get = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let address = get("address");
+    let ws = r
+        .get("mgmt")
+        .and_then(|m| m.get("ws"))
+        .and_then(Value::as_u64);
+    let host = if address.contains(':') {
+        format!("[{address}]")
+    } else {
+        address.clone()
+    };
+    NeighborRow {
+        key: format!(
+            "{}/{}/{}",
+            get("interface"),
+            get("protocol"),
+            r.get("node_id").and_then(Value::as_str).unwrap_or(&address)
+        ),
+        interface: get("interface"),
+        protocol: get("protocol").to_uppercase(),
+        address: address.clone(),
+        mac: get("mac"),
+        identity: get("identity"),
+        version: get("version"),
+        board: get("board"),
+        uptime_secs: r.get("uptime_secs").and_then(Value::as_u64),
+        connect_to: ws
+            .filter(|_| !address.is_empty())
+            .map(|p| format!("ws://{host}:{p}/ws")),
+    }
+}
+
+impl crate::Platform for WebPlatform {
+    fn neighbors(&mut self) -> Vec<NeighborRow> {
+        for (id, result) in self.home.poll() {
+            if Some(id) != self.asked {
+                continue;
+            }
+            self.asked = None;
+            if let Ok(Value::Array(rows)) = result {
+                self.rows = rows.iter().map(neighbor_row).collect();
+            }
+        }
+        let now = js_sys::Date::now();
+        if self.asked.is_none() && now - self.asked_at >= NEIGHBORS_MS {
+            self.asked_at = now;
+            self.asked = Some(
+                self.home
+                    .submit("engine.execute", json!({"command": "ip.neighbor.list"})),
+            );
+        }
+        self.rows.clone()
+    }
+
+    fn store_saved(&mut self, saved: &[SavedRouter]) {
+        let text = SavedRouter::list_to_json(saved).to_string();
+        if let Some(s) = storage()
+            && s.set_item(SAVED_KEY, &text).is_err()
+        {
+            log::error!("cannot keep the router list in localStorage");
+        }
+    }
+
+    fn connect(&mut self, addr: &str) -> Result<CoreRouterUi, String> {
+        let url = ws_url(addr);
+        if !(url.starts_with("ws://") || url.starts_with("wss://")) {
+            return Err(format!(
+                "Connect to needs ws://HOST:PORT/ws or HOST:PORT, got '{addr}'"
+            ));
+        }
+        // Auth/TLS are G0.3: the daemon only listens on loopback.
+        log::info!("managing the router at {url}");
+        Ok(CoreRouterUi::with_backend(Box::new(WsBackend::new(url))))
+    }
+
+    fn lab(&mut self) -> CoreRouterUi {
+        CoreRouterUi::new(shared(Session::virtual_lab()))
+    }
 }
 
 /// The socket and the callbacks it holds (dropped together).

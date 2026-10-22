@@ -1,0 +1,669 @@
+//! The connect screen (WinBox 4 login style): pick the router to manage
+//! before any session exists. Left: Connect to, Login, Password, Group,
+//! Comment, Save to list, Connect. Right: Neighbors (heard on the network)
+//! and Saved (the operator's list), each with Find.
+//!
+//! The screen only collects choices: the app supplies the neighbor rows
+//! (CRDP listener natively, `ip.neighbor.list` on the web), stores the saved
+//! list and does the connecting. Login and password have no effect until
+//! authentication exists (docs/gaps.md G0.3), and no password is ever kept.
+
+use egui::{Key, RichText, TextEdit, Ui};
+use serde_json::{Value, json};
+
+use crate::neighbors::uptime_text;
+use crate::table::{self, Menu, Row, Shortcut, TableState, col, num};
+
+const NEIGHBORS: &str = "connect-neighbors";
+const SAVED: &str = "connect-saved";
+/// Saved entries kept at most, and the longest text of each field.
+pub const MAX_SAVED: usize = 1000;
+const MAX_FIELD: usize = 256;
+
+const NEIGHBOR_COLUMNS: [table::Column; 7] = [
+    col("Address"),
+    col("MAC Address"),
+    col("Identity"),
+    col("Version"),
+    col("Board"),
+    num("Uptime"),
+    col("Interface"),
+];
+const SAVED_COLUMNS: [table::Column; 3] = [col("Address"), col("Group"), col("Comment")];
+
+/// One router heard on the network, as the Neighbors tab shows it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NeighborRow {
+    /// Stable id of the row (node id, MAC …).
+    pub key: String,
+    /// Where it was heard (this machine's or the router's interface).
+    pub interface: String,
+    pub protocol: String,
+    pub address: String,
+    pub mac: String,
+    pub identity: String,
+    pub version: String,
+    pub board: String,
+    pub uptime_secs: Option<u64>,
+    /// What "Connect to" gets; `None` when it advertises no CoreRouter
+    /// management port (an LLDP or MNDP neighbor).
+    pub connect_to: Option<String>,
+}
+
+/// An entry of the Saved tab. Deliberately no password: secrets wait for
+/// G0.3 and a secure store.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedRouter {
+    pub address: String,
+    pub group: String,
+    pub comment: String,
+}
+
+impl SavedRouter {
+    pub fn list_to_json(list: &[SavedRouter]) -> Value {
+        Value::Array(
+            list.iter()
+                .map(|s| json!({"address": s.address, "group": s.group, "comment": s.comment}))
+                .collect(),
+        )
+    }
+
+    /// Read a stored list; anything malformed is skipped, sizes are bounded.
+    pub fn list_from_json(v: &Value) -> Vec<SavedRouter> {
+        let field = |e: &Value, k: &str| -> String {
+            e.get(k)
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(MAX_FIELD)
+                .collect()
+        };
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .take(MAX_SAVED)
+                    .map(|e| SavedRouter {
+                        address: field(e, "address"),
+                        group: field(e, "group"),
+                        comment: field(e, "comment"),
+                    })
+                    .filter(|s| !s.address.trim().is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectAction {
+    /// Manage the router at this address (as typed in "Connect to").
+    Connect(String),
+    /// Run the in-process virtual lab instead.
+    VirtualLab,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tab {
+    Neighbors,
+    Saved,
+}
+
+pub struct ConnectScreen {
+    pub connect_to: String,
+    /// Kept for the form only: never sent, never saved (no auth until G0.3).
+    login: String,
+    password: String,
+    group: String,
+    comment: String,
+    tab: Tab,
+    neighbors: TableState,
+    saved_table: TableState,
+    saved: Vec<SavedRouter>,
+    saved_changed: bool,
+    /// Last message (error, or a hint) under the buttons.
+    message: Option<(bool, String)>,
+    /// Where the Neighbors tab gets its rows, shown above the table.
+    source: String,
+    offer_lab: bool,
+}
+
+impl ConnectScreen {
+    pub fn new(saved: Vec<SavedRouter>) -> Self {
+        Self {
+            connect_to: String::new(),
+            login: String::new(),
+            password: String::new(),
+            group: String::new(),
+            comment: String::new(),
+            tab: Tab::Neighbors,
+            neighbors: TableState::default(),
+            saved_table: TableState::default(),
+            saved,
+            saved_changed: false,
+            message: None,
+            source: String::new(),
+            offer_lab: true,
+        }
+    }
+
+    /// Text above the Neighbors table, e.g. "listening for CRDP on UDP 7979".
+    pub fn set_source(&mut self, text: impl Into<String>) {
+        self.source = text.into();
+    }
+
+    pub fn set_error(&mut self, text: impl Into<String>) {
+        self.message = Some((false, text.into()));
+    }
+
+    /// Show the "Virtual lab" button (default: shown).
+    pub fn offer_lab(&mut self, offer: bool) {
+        self.offer_lab = offer;
+    }
+
+    pub fn saved(&self) -> &[SavedRouter] {
+        &self.saved
+    }
+
+    /// The saved list, once after each change, for the app to store.
+    pub fn take_saved_change(&mut self) -> Option<Vec<SavedRouter>> {
+        std::mem::take(&mut self.saved_changed).then(|| self.saved.clone())
+    }
+
+    /// Draw the whole screen into the root `Ui`; returns what to do.
+    pub fn ui(&mut self, ui: &mut Ui, neighbors: &[NeighborRow]) -> Option<ConnectAction> {
+        let mut action = None;
+        egui::Panel::left("connect-form")
+            .resizable(false)
+            .exact_size(330.0)
+            .show(ui, |ui| self.form(ui, &mut action));
+        egui::CentralPanel::default().show(ui, |ui| self.lists(ui, neighbors, &mut action));
+        if let Some(ConnectAction::Connect(addr)) = &action {
+            self.message = Some((true, format!("connecting to {addr}…")));
+        }
+        action
+    }
+
+    fn connect(&mut self, action: &mut Option<ConnectAction>) {
+        let addr = self.connect_to.trim();
+        if addr.is_empty() {
+            self.set_error("Type an address in Connect to, or pick a neighbor or a saved router");
+        } else {
+            *action = Some(ConnectAction::Connect(addr.to_owned()));
+        }
+    }
+
+    fn form(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
+        ui.add_space(12.0);
+        ui.heading("CoreRouter");
+        ui.weak("Connect to a router");
+        ui.add_space(12.0);
+        let no_auth = "Authentication arrives with G0.3 (docs/gaps.md). Until then a \
+                       router takes management only from its own machine (loopback) and \
+                       asks for no login.";
+        let mut enter = false;
+        egui::Grid::new("connect-grid")
+            .num_columns(2)
+            .spacing([8.0, 8.0])
+            .show(ui, |ui| {
+                let w = 200.0;
+                ui.label("Connect to:");
+                let r = ui.add(
+                    TextEdit::singleline(&mut self.connect_to)
+                        .hint_text("127.0.0.1:7979")
+                        .desired_width(w),
+                );
+                enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
+                ui.end_row();
+                ui.label("Login:");
+                ui.add_enabled(
+                    false,
+                    TextEdit::singleline(&mut self.login)
+                        .hint_text("admin")
+                        .desired_width(w),
+                )
+                .on_disabled_hover_text(no_auth);
+                ui.end_row();
+                ui.label("Password:");
+                ui.add_enabled(
+                    false,
+                    TextEdit::singleline(&mut self.password)
+                        .password(true)
+                        .desired_width(w),
+                )
+                .on_disabled_hover_text(no_auth);
+                ui.end_row();
+                ui.label("");
+                let mut remember = false;
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut remember, "Remember password"),
+                )
+                .on_disabled_hover_text(
+                    "Passwords are never stored in plain text; a secure store \
+                         comes with authentication (G0.3).",
+                );
+                ui.end_row();
+                ui.label("Group:");
+                ui.add(TextEdit::singleline(&mut self.group).desired_width(w));
+                ui.end_row();
+                ui.label("Comment:");
+                ui.add(TextEdit::singleline(&mut self.comment).desired_width(w));
+                ui.end_row();
+            });
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            if ui
+                .button("Save to list")
+                .on_hover_text("Keep address, group and comment in the Saved tab")
+                .clicked()
+            {
+                self.save_current();
+            }
+            if ui.button(RichText::new("Connect").strong()).clicked() || enter {
+                self.connect(action);
+            }
+        });
+        ui.add_space(8.0);
+        ui.colored_label(ui.visuals().warn_fg_color, "No login yet")
+            .on_hover_text(no_auth);
+        ui.weak(no_auth);
+        if self.offer_lab {
+            ui.add_space(8.0);
+            ui.separator();
+            if ui
+                .button("Virtual lab")
+                .on_hover_text("An in-memory router inside this window; nothing is saved")
+                .clicked()
+            {
+                *action = Some(ConnectAction::VirtualLab);
+            }
+        }
+        if let Some((ok, text)) = &self.message {
+            ui.add_space(8.0);
+            let color = if *ok {
+                ui.visuals().text_color()
+            } else {
+                ui.visuals().error_fg_color
+            };
+            ui.colored_label(color, text.as_str());
+        }
+    }
+
+    fn save_current(&mut self) {
+        let address = self.connect_to.trim().to_owned();
+        if address.is_empty() {
+            self.set_error("Nothing to save: Connect to is empty");
+            return;
+        }
+        let entry = SavedRouter {
+            address: address.chars().take(MAX_FIELD).collect(),
+            group: self.group.trim().chars().take(MAX_FIELD).collect(),
+            comment: self.comment.trim().chars().take(MAX_FIELD).collect(),
+        };
+        let full = self.saved.len() >= MAX_SAVED;
+        match self.saved.iter_mut().find(|s| s.address == entry.address) {
+            Some(s) => *s = entry,
+            None if full => {
+                self.set_error(format!("The saved list is full ({MAX_SAVED})"));
+                return;
+            }
+            None => self.saved.push(entry),
+        }
+        self.saved_changed = true;
+        self.tab = Tab::Saved;
+        self.message = Some((true, format!("saved {address}")));
+    }
+
+    fn lists(
+        &mut self,
+        ui: &mut Ui,
+        neighbors: &[NeighborRow],
+        action: &mut Option<ConnectAction>,
+    ) {
+        ui.horizontal(|ui| {
+            let n = format!("Neighbors ({})", neighbors.len());
+            if ui.selectable_label(self.tab == Tab::Neighbors, n).clicked() {
+                self.tab = Tab::Neighbors;
+            }
+            let s = format!("Saved ({})", self.saved.len());
+            if ui.selectable_label(self.tab == Tab::Saved, s).clicked() {
+                self.tab = Tab::Saved;
+            }
+            match self.tab {
+                Tab::Neighbors => table::find_field(ui, NEIGHBORS, &mut self.neighbors),
+                Tab::Saved => table::find_field(ui, SAVED, &mut self.saved_table),
+            }
+        });
+        ui.separator();
+        match self.tab {
+            Tab::Neighbors => self.neighbor_tab(ui, neighbors, action),
+            Tab::Saved => self.saved_tab(ui, action),
+        }
+    }
+
+    fn neighbor_tab(
+        &mut self,
+        ui: &mut Ui,
+        neighbors: &[NeighborRow],
+        action: &mut Option<ConnectAction>,
+    ) {
+        if !self.source.is_empty() {
+            ui.weak(self.source.as_str());
+        }
+        let rows: Vec<Row> = neighbors
+            .iter()
+            .map(|n| Row {
+                key: n.key.clone(),
+                cells: vec![
+                    n.address.clone(),
+                    n.mac.clone(),
+                    n.identity.clone(),
+                    n.version.clone(),
+                    n.board.clone(),
+                    n.uptime_secs.map(uptime_text).unwrap_or_default(),
+                    n.interface.clone(),
+                ],
+                dimmed: n.connect_to.is_none(),
+            })
+            .collect();
+        let before = self.neighbors.selection(&rows);
+        let out = table::show(
+            ui,
+            NEIGHBORS,
+            0.0,
+            &mut self.neighbors,
+            &NEIGHBOR_COLUMNS,
+            &rows,
+            |_, _| {},
+        );
+        let after = self.neighbors.selection(&rows);
+        let find = |key: &str| neighbors.iter().find(|n| n.key == key);
+        let opened = out.opened.or_else(|| {
+            (out.shortcut == Some(Shortcut::Open))
+                .then(|| after.first().cloned())
+                .flatten()
+        });
+        if let Some(key) = opened {
+            if let Some(n) = find(&key)
+                && self.pick_neighbor(n)
+            {
+                self.connect(action);
+            }
+        } else if after != before
+            && let [one] = after.as_slice()
+            && let Some(n) = find(one)
+        {
+            self.pick_neighbor(n);
+        }
+    }
+
+    /// Fill "Connect to" from a neighbor; false when it cannot be managed.
+    fn pick_neighbor(&mut self, n: &NeighborRow) -> bool {
+        match &n.connect_to {
+            Some(addr) => {
+                self.connect_to = addr.clone();
+                self.message = None;
+                true
+            }
+            None => {
+                let who = if n.identity.is_empty() {
+                    &n.address
+                } else {
+                    &n.identity
+                };
+                self.set_error(format!(
+                    "{who} ({}) advertises no CoreRouter management port",
+                    n.protocol
+                ));
+                false
+            }
+        }
+    }
+
+    fn saved_tab(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
+        let rows: Vec<Row> = self
+            .saved
+            .iter()
+            .map(|s| Row {
+                key: s.address.clone(),
+                cells: vec![s.address.clone(), s.group.clone(), s.comment.clone()],
+                dimmed: false,
+            })
+            .collect();
+        let before = self.saved_table.selection(&rows);
+        let mut remove: Option<Vec<String>> = None;
+        let out = table::show(
+            ui,
+            SAVED,
+            0.0,
+            &mut self.saved_table,
+            &SAVED_COLUMNS,
+            &rows,
+            |ui, menu| {
+                if let Menu::Rows(sel) = menu
+                    && ui.button("Remove").clicked()
+                {
+                    remove = Some(sel.to_vec());
+                }
+            },
+        );
+        let after = self.saved_table.selection(&rows);
+        if out.shortcut == Some(Shortcut::Remove) {
+            remove = Some(after.clone());
+        }
+        if let Some(gone) = remove.filter(|g| !g.is_empty()) {
+            self.saved.retain(|s| !gone.contains(&s.address));
+            self.saved_changed = true;
+            return;
+        }
+        let opened = out.opened.or_else(|| {
+            (out.shortcut == Some(Shortcut::Open))
+                .then(|| after.first().cloned())
+                .flatten()
+        });
+        let pick = opened.clone().or_else(|| match after.as_slice() {
+            [one] if after != before => Some(one.clone()),
+            _ => None,
+        });
+        if let Some(addr) = pick
+            && let Some(s) = self.saved.iter().find(|s| s.address == addr).cloned()
+        {
+            self.connect_to = s.address;
+            self.group = s.group;
+            self.comment = s.comment;
+            self.message = None;
+            if opened.is_some() {
+                self.connect(action);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn neighbor(id: &str, connect: Option<&str>) -> NeighborRow {
+        NeighborRow {
+            key: id.into(),
+            interface: "eth0".into(),
+            protocol: "crdp".into(),
+            address: format!("10.0.0.{}", id.len()),
+            identity: format!("r-{id}"),
+            connect_to: connect.map(str::to_owned),
+            ..NeighborRow::default()
+        }
+    }
+
+    /// Draw one frame with `events`; returns the action and painted texts.
+    fn frame(
+        ctx: &egui::Context,
+        screen: &mut ConnectScreen,
+        rows: &[NeighborRow],
+        events: Vec<egui::Event>,
+        t: &mut f64,
+    ) -> (Option<ConnectAction>, Vec<(String, egui::Rect)>) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1200.0, 700.0),
+            )),
+            time: Some(*t),
+            events,
+            ..Default::default()
+        };
+        *t += 0.02;
+        let mut action = None;
+        let mut out = ctx.run_ui(raw, |ui| {
+            if let Some(a) = screen.ui(ui, rows) {
+                action = Some(a);
+            }
+        });
+        out.textures_delta.clear();
+        let mut texts = Vec::new();
+        fn walk(s: &egui::Shape, out: &mut Vec<(String, egui::Rect)>) {
+            match s {
+                egui::Shape::Text(t) => {
+                    out.push((t.galley.text().to_owned(), t.visual_bounding_rect()))
+                }
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        for c in &out.shapes {
+            walk(&c.shape, &mut texts);
+        }
+        (action, texts)
+    }
+
+    fn click_events(pos: egui::Pos2) -> Vec<egui::Event> {
+        let ev = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        vec![egui::Event::PointerMoved(pos), ev(true), ev(false)]
+    }
+
+    fn at(texts: &[(String, egui::Rect)], needle: &str) -> egui::Pos2 {
+        texts
+            .iter()
+            .rev()
+            .find(|(t, _)| t == needle)
+            .map(|(_, r)| r.center())
+            .unwrap_or_else(|| panic!("no {needle:?} on screen"))
+    }
+
+    #[test]
+    fn double_click_on_a_neighbor_fills_connect_to_and_connects() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let rows = [neighbor("a", Some("127.0.0.1:7979")), neighbor("bb", None)];
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
+        assert!(texts.iter().any(|(x, _)| x == "Neighbors (2)"));
+        let row = at(&texts, "r-a");
+        // Single click fills only.
+        let (a, _) = frame(&ctx, &mut s, &rows, click_events(row), &mut t);
+        assert_eq!(a, None);
+        assert_eq!(s.connect_to, "127.0.0.1:7979");
+        s.connect_to.clear();
+        // Double click fills and connects.
+        let mut both = click_events(row);
+        both.extend(click_events(row));
+        let mut action = frame(&ctx, &mut s, &rows, both, &mut t).0;
+        for _ in 0..2 {
+            action = action.or(frame(&ctx, &mut s, &rows, Vec::new(), &mut t).0);
+        }
+        assert_eq!(
+            action,
+            Some(ConnectAction::Connect("127.0.0.1:7979".into()))
+        );
+        // A neighbor without a management port explains itself.
+        let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
+        let (a, _) = frame(
+            &ctx,
+            &mut s,
+            &rows,
+            click_events(at(&texts, "r-bb")),
+            &mut t,
+        );
+        assert_eq!(a, None);
+        assert!(
+            matches!(&s.message, Some((false, m)) if m.contains("no CoreRouter management port"))
+        );
+    }
+
+    #[test]
+    fn save_to_list_keeps_no_password_and_round_trips() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        s.connect_to = "10.0.0.1:7979".into();
+        s.group = "pop-1".into();
+        s.comment = "edge".into();
+        s.password = "secret".into();
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Save to list")),
+            &mut t,
+        );
+        let saved = s.take_saved_change().expect("changed");
+        assert_eq!(
+            saved,
+            [SavedRouter {
+                address: "10.0.0.1:7979".into(),
+                group: "pop-1".into(),
+                comment: "edge".into()
+            }]
+        );
+        assert!(s.take_saved_change().is_none(), "reported once");
+        let json = SavedRouter::list_to_json(&saved);
+        assert!(!json.to_string().contains("secret"));
+        assert_eq!(SavedRouter::list_from_json(&json), saved);
+        // Hostile files: wrong shapes are skipped, sizes bounded.
+        let junk = json!([{"address": "x".repeat(10_000)}, 5, {"group": "no address"}]);
+        let back = SavedRouter::list_from_json(&junk);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].address.len(), MAX_FIELD);
+        // The Saved tab is now shown; a click there fills the form.
+        s.connect_to.clear();
+        s.group.clear();
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        frame(&ctx, &mut s, &[], click_events(at(&texts, "pop-1")), &mut t);
+        assert_eq!(
+            (s.connect_to.as_str(), s.group.as_str()),
+            ("10.0.0.1:7979", "pop-1")
+        );
+    }
+
+    #[test]
+    fn empty_connect_to_is_refused_and_lab_is_offered() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        let (a, _) = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Connect")),
+            &mut t,
+        );
+        assert_eq!(a, None);
+        assert!(matches!(&s.message, Some((false, _))));
+        let (a, _) = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Virtual lab")),
+            &mut t,
+        );
+        assert_eq!(a, Some(ConnectAction::VirtualLab));
+    }
+}
