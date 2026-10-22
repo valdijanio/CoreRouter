@@ -350,7 +350,13 @@ fn add_text(reply: &mut Value) {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|ev| text::line(&kind, ev))
+        // A `dig` answer is many lines: each its own.
+        .flat_map(|ev| {
+            text::line(&kind, ev)
+                .split('\n')
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
         .collect();
     let done = reply.get("done").and_then(Value::as_bool) == Some(true);
     let summary = done.then(|| text::summary(&kind, reply.get("summary").unwrap_or(&Value::Null)));

@@ -167,6 +167,53 @@ ganha `mpls`. O texto do terminal mostra `nome (IP) [private]`, a coluna `ASN` (
 A janela Tools › MTR tem as caixas **Use DNS** e **AS lookup**, o nome em cima e o IP embaixo
 (menor), e as colunas ASN e MPLS quando há o que mostrar.
 
+### 4.3 DNS Lookup (G6.6)
+
+`tool.dns.query {name, type?, server?, recursion?, dnssec?, tcp?, trace?, compare?}` — um `dig`
+como tarefa (`tool.task.poll`/`stop`): a espera pela rede é numa thread do runner, nunca sob o
+lock do `Session`. Terminal: `/tool dns-lookup example.com type=MX dnssec=yes` (ou
+`dns-lookup …` de qualquer menu). Janela: Tools › DNS Lookup.
+
+- `name`: um nome, ou um endereço (pergunta o PTR, como o `dig -x`). `type`: A (padrão), AAAA,
+  ANY, CAA, CNAME, DNSKEY, DS, HTTPS, MX, NS, PTR, SOA, SRV, SSHFP, SVCB, TLSA, TXT (AXFR/IXFR
+  não: transferência de zona não é consulta).
+- `server`: vazio ou `router` (padrão) é o **próprio roteador**: a pergunta desce a cadeia do
+  encaminhador da LAN (G4.1b: acl → adlist → static → zones → cache → upstream) dentro do
+  processo, como um cliente da LAN seria atendido, e a resposta diz a **etapa** que respondeu
+  (`;; STAGE: cache`; na janela, o selo `from cache · etapa cache` ou `etapa upstream`). Um IP
+  pergunta direto a ele (UDP; TCP com `tcp`, ou quando a resposta vem truncada, RFC 7766 §5).
+  `https://…` (DoH, RFC 8484, id 0) e `tls://…` (DoT, RFC 7858) usam o cliente da G4.1d (o
+  `verify_doh_cert` do servidor configurado vale). `all` é o mesmo que `compare`.
+- `recursion` (padrão `true`) é o bit RD (`+norecurse` do `dig`); `dnssec` liga o DO (RFC 3225)
+  com EDNS(0) de 1232 bytes. As assinaturas aparecem (RRSIG, DS e DNSKEY no formato da RFC
+  4034), mas **não são validadas** (G4.1f): o flag `ad` é o que o servidor afirma.
+- **Resposta** (evento `answer`): status (`NOERROR`, `NXDOMAIN`, `SERVFAIL`…), flags
+  (`qr aa tc rd ra ad cd`), tempo, servidor e transporte, tamanho, EDNS e as seções Answer,
+  Authority e Additional, um registro por linha (`name`, `ttl`, `class`, `type`, `data` no
+  formato de apresentação, RFC 1035 §5.1). Os endereços ganham o AS de origem (eventos `asn`,
+  a mesma consulta Team Cymru do MTR). O campo `dig` traz o texto no formato do `dig` (cabeçalho
+  `;; ->>HEADER<<-`, `OPT PSEUDOSECTION`, seções, `Query time`, `SERVER`, `MSG SIZE`): é o que o
+  terminal imprime e o que **Copy as dig** copia.
+- **`compare`**: a mesma pergunta a todos os upstreams (`servers` e `use_doh_server`), em
+  paralelo (o mais lento dita o tempo, não a soma). Cada servidor dá status, tempo e dados; o
+  resumo marca `diverge` em quem respondeu diferente da maioria estrita (sem maioria, todos
+  divergem) e `timeout` em quem não respondeu (3 s). Endereços comparam pelo **AS** de origem
+  quando ele é conhecido: uma CDN entrega a cada resolvedor seus próprios servidores (mesmo AS)
+  e isso não é divergência; um sinkhole (`0.0.0.0`) ou um sequestro para outra rede é.
+- **`trace`**: da raiz até a resposta (RD desligado, DO ligado), uma linha por delegação: zona,
+  servidor perguntado, tempo e resposta (`referral: com. (13 NS)` ou os registros). O selo
+  `assinada` diz que veio um DS da zona filha (ou RRSIG na resposta final); sem eles, `sem
+  assinatura`. Começa num servidor raiz escolhido pelo relógio (os 13 do `named.root`);
+  servidores sem glue são resolvidos pelo resolvedor do roteador (IPv4 primeiro); até 3
+  servidores por zona e 12 delegações; uma indicação que não chega mais perto do nome é
+  recusada (laço).
+- Texto vindo da rede sai só com ASCII imprimível (o resto como `\DDD`), limitado por campo e
+  por seção (64 registros).
+
+Codec em `crates/proto-dns/src/dig.rs` (sem sockets, compila em WASM); a tarefa em
+`crates/engine/src/dns_lookup.rs`; o transporte no daemon em
+`apps/corerouter-daemon/src/service/dns_lookup.rs` (`DnsBackend::exchange`).
+
 ## 5. Quem envia os pacotes
 
 O engine só fala com o trait `corerouter_hal::probe::Prober` (L1): `resolve`, `open` →
