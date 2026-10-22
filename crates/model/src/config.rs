@@ -11,7 +11,9 @@ use crate::dhcp_client::DhcpClient;
 use crate::firewall::Firewall;
 use crate::interface_list::InterfaceLists;
 use crate::ipv6::Ipv6;
+use crate::logging::Logging;
 use crate::neighbor::NeighborDiscovery;
+use crate::ntp::NtpClient;
 use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -31,12 +33,20 @@ pub struct Config {
 #[serde(default, deny_unknown_fields)]
 pub struct System {
     pub identity: String,
+    /// `/system ntp client` (G4.6).
+    #[serde(skip_serializing_if = "NtpClient::is_default")]
+    pub ntp_client: NtpClient,
+    /// `/system logging` (G4.6): rules and remote syslog actions.
+    #[serde(skip_serializing_if = "Logging::is_default")]
+    pub logging: Logging,
 }
 
 impl Default for System {
     fn default() -> Self {
         Self {
             identity: "CoreRouter".into(),
+            ntp_client: NtpClient::default(),
+            logging: Logging::default(),
         }
     }
 }

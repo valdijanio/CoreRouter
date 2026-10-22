@@ -1,0 +1,18 @@
+[package]
+name = "corerouter-proto-syslog"
+description = "L2: syslog messages (RFC 5424) for UDP transport (RFC 5426): encode only"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

@@ -1073,6 +1073,8 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",
+ "corerouter-proto-ntp",
+ "corerouter-proto-syslog",
  "corerouter-storage-fs",
  "env_logger",
  "log",
@@ -1277,10 +1279,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "corerouter-proto-ntp"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "corerouter-proto-ospf"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+]
+
+[[package]]
+name = "corerouter-proto-syslog"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

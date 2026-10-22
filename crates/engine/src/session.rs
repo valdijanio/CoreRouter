@@ -88,6 +88,8 @@ pub struct Session {
     pub(crate) links: LinkWatch,
     /// SFP diagnostics past their thresholds (operational; G1.20).
     pub(crate) dom: DomWatch,
+    /// What the daemon's NTP client last learned (operational; G4.6).
+    pub(crate) ntp: corerouter_model::ntp::NtpStatus,
     /// Commands and commits since start (operational; G4.4).
     pub(crate) counters: EngineCounters,
 }
@@ -176,6 +178,7 @@ impl Session {
             in_batch: false,
             links: LinkWatch::default(),
             dom: DomWatch::default(),
+            ntp: Default::default(),
             counters: EngineCounters::default(),
         }
     }
