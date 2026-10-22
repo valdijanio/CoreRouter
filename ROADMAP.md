@@ -122,6 +122,18 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   "New Route" (revisão 3), backup distance 10 e `::/0` pela CLI; daemon e GUI reiniciados →
   revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
   pref-src, criar VRF pela GUI.
+- 2026-10-21 — G1.13: VRF pela GUI (só `crates/ui`; nenhum comando novo). Janela IP › VRF
+  (`crates/ui/src/vrf.rs`) na tabela reutilizável do G1.9 sobre `ip.vrf.list`, consultado no
+  refresh (`Field::Vrfs`): flag X, nome, tabela do kernel, membros e comentário; toolbar,
+  menus, atalhos e comentários inline como em Routes. "New VRF" pede nome e marca os membros
+  numa lista de caixas que deixa de fora VRFs, portas de bridge e membros de outra VRF (uma
+  bridge entra inteira); Apply cria e abre "VRF <nome>", que edita membros (`ip.vrf.set`
+  troca a lista inteira), comentário e Disabled e tem Disable/Remove. Recusas do engine
+  (nome `main`, VRF com endereço ou rota) aparecem no diálogo ou no log. Num kernel sem VRF
+  (G1.14), + e "Add VRF…" ficam cinza com o motivo no tooltip: a UI consulta `engine.list`
+  pelo backend no refresh (`Field::Commands`, `CoreRouterUi::command_allowed`), sem detectar
+  nada por conta própria, e funciona igual na GUI remota. 3 testes headless dirigidos por
+  eventos sintéticos (um com HAL sem VRF).
 
 - 2026-10-21 — G5.2 (Parte 1): LLDP e escuta passiva de MNDP. `crates/proto-lldp` (L2): codec
   puro de LLDPDU do IEEE 802.1AB (Chassis ID, Port ID, TTL, End, Port/System Description,
@@ -188,6 +200,30 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `kill` → daemon logou o undo e ether2 voltou habilitada (revisão 2 "safe mode undo: the
   owner's connection closed"). Esforço do agente ~2 h (**estimado**).
 
+- 2026-10-22 — G5.1: descoberta de vizinhos com protocolo próprio, o CRDP (`docs/discovery.md`):
+  UDP 7979, `ff02::1` por interface + broadcast IPv4 dirigido, anúncio a cada 30 s, hold 4 ×
+  intervalo (120 s), despedida com hold 0; cabeçalho `CRDP`/versão, 13 TLVs (node id, hold,
+  identity, versão, plataforma, placa, uptime, interface, MAC, IPv4, IPv6, portas de controle e
+  WebSocket), datagrama ≤ 1232 bytes, TLV desconhecido ignorado. Codec puro em
+  `crates/proto-discovery` (L2, proptest: decode nunca dá panic, ida e volta, bytes trocados);
+  runtime em `crates/discovery` (L4, std + `socket2`): `Agent` do daemon (só anuncia e escuta,
+  nunca responde) e `Listener` passivo da GUI. Model: `NeighborEntry`/`NeighborProtocol` (estado
+  operacional, nunca salvo) e `ip.neighbor_discovery` (config: padrão ligado e **sem
+  interfaces**, porque ainda não há listas LAN/WAN). Engine: tabela de vizinhos (máx. 4096,
+  expiração por hold), `Session::record_neighbor`/`expire_neighbors` (ponto de entrada do G5.2),
+  `ip.neighbor.list`, `ip.neighbor.discovery.set`/`.get`; `interface.remove` tira a interface da
+  lista. Daemon: `--discovery-port`, `--no-discovery`, node id em `<config-dir>/node-id`. UI:
+  janela IP › Neighbors (tabela + configurações) e tela de conexão estilo WinBox 4
+  (`crates/ui/src/connect.rs`): Connect to/Login/Password/Group/Comment, Save to list, Connect,
+  Virtual lab; abas Neighbors/Saved com Find; clique preenche, duplo clique conecta; login e
+  senha desabilitados até o G0.3 e nenhuma senha gravada. GUI nativa sem `--connect` abre nela e
+  escuta CRDP (vizinho na própria máquina vira `127.0.0.1:<porta>`); web mostra o
+  `ip.neighbor.list` do daemon que serviu a página. 37 testes novos, entre eles dois daemons em
+  namespaces sem root que se veem em `ip.neighbor.list` por IPv6 puro e por IPv4+IPv6, e se
+  esquecem na hora com a despedida (`cargo xtask netns`, ~9 s **medido**). Teste manual num netns
+  descartável: dois daemons (7979 e 7981) e a GUI; a aba Neighbors mostrou os dois, o duplo
+  clique conectou e IP › Neighbors listou o outro roteador (screenshots conferidos).
+
 - 2026-10-22 — G1.15: teclado nos diálogos e janelas internas, no padrão Windows/macOS/GNOME/WinBox.
   Um lugar só: `crates/ui/src/dialog.rs` (tipo comum de diálogo: `Status` com erro/pendências,
   `Footer` com OK/Cancel/Apply + botões extras, `Form` que dá a cada campo de texto um id com o nome
@@ -201,8 +237,9 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   logo depois de fechar um diálogo — achado no teste manual); popup/combo aberto no início do frame
   fica com Esc/Enter; Enter com foco num botão/checkbox é do widget. De quebra, Enter na tabela (G1.9)
   limpava a seleção antes de abrir as propriedades (o egui transforma Enter num clique do widget com
-  foco, e o fundo da tabela tem o id do foco): o fundo agora só aceita clique de ponteiro. 13 testes
-  novos (10 headless com eventos sintéticos, inclusive backend que segura a resposta; 3 unitários).
+  foco, e o fundo da tabela tem o id do foco): o fundo agora só aceita clique de ponteiro. 14 testes
+  novos (11 headless com eventos sintéticos, inclusive backend que segura a resposta e os diálogos
+  de VRF do G1.13; 3 unitários); Esc em camadas também em VRF e Neighbors (G5.1).
   Teste manual (**medido**): `corerouter-daemon --control --config-dir <tmp>` + `corerouter-gui
   --connect`, xdotool + `screenshot`: Enter na tabela abre, "•" ao editar, MTU 10 + Enter mostra o erro
   com o cursor no MTU, Ctrl+Enter aplica 9000 e fica aberto, Esc descarta, Esc em camadas na lista.
@@ -219,6 +256,8 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G5.2 (Parte 1).
 - 2026-10-21 — log do G1.12.
 - 2026-10-21 — log do G1.5.
+- 2026-10-21 — log do G1.13.
 - 2026-10-22 — log do G1.14.
 - 2026-10-22 — log do G1.4.
+- 2026-10-22 — log do G5.1.
 - 2026-10-22 — log do G1.15.

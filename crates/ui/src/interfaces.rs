@@ -220,7 +220,7 @@ enum Button {
 }
 
 impl CoreRouterUi {
-    fn ifaces(&self) -> Vec<Iface> {
+    pub(crate) fn ifaces(&self) -> Vec<Iface> {
         self.cache.interfaces.iter().map(Iface::from_row).collect()
     }
 

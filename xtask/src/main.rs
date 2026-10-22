@@ -125,8 +125,9 @@ fn test(root: &Path) -> Outcome {
     run(c, root)
 }
 
-/// hal-linux against a real kernel, in a throwaway user + network namespace:
-/// no root, nothing reaches the host (crates/hal-linux/tests/netns.rs).
+/// Tests against a real kernel, in a throwaway user + network namespace: no
+/// root, nothing reaches the host (crates/hal-linux/tests/netns*.rs,
+/// apps/corerouter-daemon/tests/netns.rs).
 /// Skips where unprivileged user namespaces are not allowed — unless
 /// `COREROUTER_REQUIRE_VRF=1` (the Linux CI job), where a skip would hide
 /// the VRF tests, so it fails instead.
@@ -167,24 +168,27 @@ fn netns_run(root: &Path) -> Outcome {
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     // One fresh namespace per test binary: each one's guard requires a
     // namespace holding only `lo`.
-    for test in NETNS_TESTS {
+    for (package, test) in NETNS_TESTS {
         let mut c = Command::new("unshare");
         // Not `--quiet`: one line per test, so a CI log shows which ones ran.
         c.args(UNSHARE)
             .arg(&cargo)
-            .args(["test", "-p", "corerouter-hal-linux", "--test", test])
+            .args(["test", "-p", package, "--test", test])
             .env("COREROUTER_NETNS_TESTS", "1");
         if let Outcome::Fail(e) = run(c, root) {
-            return Outcome::Fail(format!("{test}: {e}"));
+            return Outcome::Fail(format!("{package} {test}: {e}"));
         }
     }
     Outcome::Ok
 }
 
-/// hal-linux integration tests that need a kernel (`tests/<name>.rs`).
-const NETNS_TESTS: &[&str] = &[
-    "netns", // G5.2: LLDP over AF_PACKET and MNDP over UDP between veth peers.
-    "netns_l2",
+/// Integration tests that need a kernel: (package, `tests/<name>.rs`).
+const NETNS_TESTS: &[(&str, &str)] = &[
+    ("corerouter-hal-linux", "netns"),
+    // G5.2: LLDP over AF_PACKET and MNDP over UDP between veth peers.
+    ("corerouter-hal-linux", "netns_l2"),
+    // G5.1: two daemons find each other with CRDP.
+    ("corerouter-daemon", "netns"),
 ];
 
 fn layers_step(root: &Path) -> Outcome {

@@ -346,3 +346,48 @@ fn escape_right_after_a_dialog_closes_reaches_the_list() {
     h.frame(vec![esc()], NONE);
     assert!(!h.app.open.contains(&Win::Interfaces));
 }
+
+#[test]
+fn vrf_dialogs_and_list_take_the_same_keys() {
+    let mut h = Harness::vrfs();
+    // Enter on the table opens "VRF blue"; Ctrl+Enter applies a comment.
+    h.click(h.vrf_row("blue"));
+    h.key(Key::Enter, NONE);
+    h.idle();
+    let d = h.app.vrf_dialogs.first().expect("VRF blue open");
+    let win = interfaces::dialog_id(d.id);
+    h.retype(win, "comment", "customer A");
+    assert!(h.has_text("VRF <blue> •"));
+    h.key(Key::Enter, CTRL);
+    h.idle();
+    assert_eq!(h.vrf("blue").unwrap()["comment"], "customer A");
+    assert_eq!(h.app.vrf_dialogs.len(), 1, "Apply keeps it open");
+    h.key(Key::Escape, NONE);
+    assert!(h.app.vrf_dialogs.is_empty());
+
+    // "New VRF" with a bad name: the error puts the cursor in Name.
+    h.click(h.vrf_tool(table::Icon::Add));
+    h.idle();
+    let d = h.app.vrf_dialogs.first().expect("New VRF open");
+    let win = interfaces::dialog_id(d.id);
+    h.retype(win, "name", "blue");
+    h.key(Key::Enter, NONE);
+    h.idle();
+    assert!(
+        h.app
+            .vrf_dialogs
+            .first()
+            .is_some_and(|d| d.status.error.is_some())
+    );
+    assert!(h.has_focus(dialog::field_id(win, "name")));
+    h.key(Key::Escape, NONE);
+    assert!(h.app.vrf_dialogs.is_empty());
+
+    // The list: selection, then the window.
+    assert!(h.app.tables.vrfs.is_selected("blue"));
+    h.key(Key::Escape, NONE);
+    assert!(!h.app.tables.vrfs.is_selected("blue"));
+    assert!(h.app.open.contains(&Win::Vrf));
+    h.key(Key::Escape, NONE);
+    assert!(!h.app.open.contains(&Win::Vrf));
+}
