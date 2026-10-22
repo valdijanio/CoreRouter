@@ -568,3 +568,9 @@ mesmo dia pode variar.
   cuja janela está aberta (`TableState::open`, clique traz a janela) e Ctrl+Tab / Ctrl+F6 (atalho do
   WinBox) com Shift ao contrário; no navegador o Ctrl+Tab é da aba, o Ctrl+F6 fica. 8 testes headless
   novos; conferido na GUI real num Xvfb próprio (screenshots). Esforço do agente ~3 h (**estimado**).
+- 2026-10-22 — processo (pr-sync): o rótulo `conflito` sai na próxima execução em que o PR não
+  conflitar mais, inclusive quando a sessão dona resolveu à mão (antes só saía quando o próprio
+  pr-sync fazia o merge). Rótulos pela API REST (`gh pr edit --add-label/--remove-label` falha no
+  gh 2.45 por causa dos Projects clássicos, e o erro era engolido). Sem aviso de conflito quando a
+  branch andou durante o merge (no #42 o comentário listou um conflito que já tinha sido resolvido
+  17 s antes). Testado com `DRY_RUN=1` num clone descartável, com e sem o rótulo.

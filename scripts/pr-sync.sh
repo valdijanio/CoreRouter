@@ -12,7 +12,9 @@
 #   - merge limpo: push na branch e dispara o `ci` nela (push com GITHUB_TOKEN não dispara
 #     workflows; `workflow_dispatch` sim) — os checks exigidos rodam no novo commit;
 #   - conflito de verdade: nada é enviado; comentário no PR (um por commit da main) com os
-#     arquivos e o rótulo `conflito`, para a sessão dona resolver.
+#     arquivos e o rótulo `conflito`, para a sessão dona resolver; o rótulo sai na próxima
+#     execução em que o PR não conflitar mais (inclusive quando a sessão resolveu à mão);
+#   - se a branch andou enquanto o merge rodava, não comenta: o aviso seria sobre um commit velho.
 #
 # Ambiente: GH_TOKEN, GH_REPO; BASE (padrão main); DRY_RUN=1 só diz o que faria.
 set -euo pipefail
@@ -21,8 +23,19 @@ base=${BASE:-main}
 dry=${DRY_RUN:-0}
 label="conflito"
 
+repo=${GH_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}
+
 say() { printf '%s\n' "$*"; }
 run() { if [ "$dry" = 1 ]; then say "  (dry-run) $*"; else "$@"; fi; }
+
+# Rótulos pela API REST: o `gh pr edit --add-label/--remove-label` falha em versões do gh que
+# ainda consultam os Projects clássicos (descontinuados).
+label_add() { run gh api --silent -X POST "repos/$repo/issues/$1/labels" -f "labels[]=$label"; }
+label_remove() {
+  [ "$2" = 1 ] || return 0
+  say "  tira o rótulo $label"
+  run gh api --silent -X DELETE "repos/$repo/issues/$1/labels/$label" || true
+}
 
 git fetch --quiet origin "$base"
 main_sha=$(git rev-parse "origin/$base")
@@ -44,10 +57,11 @@ mergeable_of() {
   printf '%s' "$m"
 }
 
+# shellcheck disable=SC2016 # `\(…)` é interpolação do jq, não do shell
 prs=$(gh pr list --base "$base" --state open --limit 100 \
-  --json number,headRefName,isCrossRepository,isDraft,autoMergeRequest \
+  --json number,headRefName,isCrossRepository,isDraft,autoMergeRequest,labels \
   --jq '.[] | select((.isCrossRepository | not) and (.isDraft | not) and .autoMergeRequest != null)
-             | "\(.number) \(.headRefName)"')
+             | "\(.number) \(.headRefName) \(if any(.labels[]; .name == "'"$label"'") then 1 else 0 end)"')
 
 if [ -z "$prs" ]; then
   say "nenhum PR com auto-merge aberto"
@@ -57,16 +71,20 @@ fi
 gh label create "$label" --color D93F0B \
   --description "Conflito real com a main: a sessão dona resolve" 2>/dev/null || true
 
-while read -r n branch; do
+while read -r n branch labeled; do
   [ -z "$n" ] && continue
   state=$(mergeable_of "$n")
   say "#$n ($branch): $state"
-  [ "$state" = CONFLICTING ] || continue
+  if [ "$state" != CONFLICTING ]; then
+    [ "$state" = MERGEABLE ] && label_remove "$n" "$labeled"
+    continue
+  fi
 
   git fetch --quiet origin "$branch"
   git checkout --quiet -B "pr-sync/$n" "origin/$branch"
   if git merge-base --is-ancestor "origin/$base" HEAD; then
     say "  já contém a main $short; nada a fazer"
+    label_remove "$n" "$labeled"
     continue
   fi
 
@@ -75,7 +93,7 @@ while read -r n branch; do
     # Sem --force: se a sessão dona enviou algo neste meio tempo, o push falha e fica com ela.
     if run git push --quiet origin "HEAD:refs/heads/$branch"; then
       run gh workflow run ci.yml --ref "$branch"
-      run gh pr edit "$n" --remove-label "$label" >/dev/null 2>&1 || true
+      label_remove "$n" "$labeled"
     else
       say "  push recusado (a branch andou); fica para o próximo push na main"
     fi
@@ -83,6 +101,11 @@ while read -r n branch; do
     # shellcheck disable=SC2016 # crases literais: Markdown do comentário
     files=$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/')
     git merge --abort
+    head=$(gh pr view "$n" --json headRefOid --jq .headRefOid)
+    if [ "$head" != "$(git rev-parse HEAD)" ]; then
+      say "  a branch andou durante o merge; fica para o próximo push na main"
+      continue
+    fi
     marker="<!-- pr-sync:$main_sha -->"
     if gh pr view "$n" --json comments --jq '.comments[].body' | grep -qF "$marker"; then
       say "  conflito real (já avisado)"
@@ -96,7 +119,7 @@ $files
 
 Resolva na branch: \`git fetch origin && git merge origin/$base\`, \`cargo xtask ci\`, push (AGENTS.md, \"Integração\")."
     run gh pr comment "$n" --body "$body"
-    run gh pr edit "$n" --add-label "$label" >/dev/null
+    label_add "$n"
   fi
 done <<< "$prs"
 
