@@ -308,6 +308,17 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   tentando o endereço do campo. Teste manual em netns descartável: daemon local + daemon num
   namespace filho + GUI — local "(this machine)", remoto cinza com a dica (screenshot conferido).
   Esforço do agente ~3 h (**estimado**).
+- 2026-10-22 — G1.17: cores dos comentários nas tabelas. Pedido do usuário a partir de um print: a
+  `ether5` desativada (flag X, linha cinza) tinha o comentário no mesmo azul do item ativo, e a coluna
+  Comment (Inline Comments desligado) usava texto comum. Agora `table::comment_style(visuals,
+  disabled, selected)` é o único lugar dessas cores: ativo no azul de destaque do G1.10, desativado
+  (o mesmo `Row::dimmed` da linha) em cinza escuro na faixa, barra, ícone e texto, selecionado na
+  cor de texto da seleção. A coluna Comment ganha o balão e o itálico da faixa, com as mesmas cores.
+  Vale para Interfaces, Addresses, Routes e VRF sem mudar as janelas. 1 teste headless novo (inline e
+  coluna × claro e escuro, ativo/desativado/selecionado, contraste do cinza com o fundo). Teste manual
+  (**medido**): daemon de lab `--config-dir <tmp>` + `corerouter-gui --connect --control` com as
+  preferências num `XDG_DATA_HOME` descartável, `ether4` "queimou" ativa e `ether5` desativada
+  comentada, `screenshot` nos quatro casos conferido. Esforço do agente ~1 h (**estimado**).
 - 2026-10-22 — G5.5: o `corerouter-daemon` se despede ao encerrar. SIGINT/SIGTERM chegam pelo
   `signal_hook::flag::register` (o handler só marca um `AtomicBool`, lido a cada 50 ms; mesmo
   caminho no unix e no Windows — o iterador do `signal-hook` só existe no unix e quebrou o build
@@ -344,4 +355,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.16.
 - 2026-10-22 — log do G5.2 (Parte 2).
 - 2026-10-22 — log do G5.4.
+- 2026-10-22 — log do G1.17.
 - 2026-10-22 — log do G5.5.
