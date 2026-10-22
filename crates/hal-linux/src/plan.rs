@@ -34,10 +34,10 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
-use std::net::IpAddr;
 
 use corerouter_hal::HalError;
-use corerouter_model::route::{self, Reach};
+use corerouter_hal::drift::{self, Snapshot, active_addresses, master};
+pub use corerouter_hal::drift::{KernelRoute, kernel_routes};
 use corerouter_model::{Config, IfName, InterfaceKind};
 use ipnet::IpNet;
 
@@ -92,31 +92,6 @@ impl fmt::Display for LinkSpec {
             Self::Dummy => f.write_str("loopback (dummy)"),
             Self::Vrf { table } => write!(f, "vrf (table {table})"),
         }
-    }
-}
-
-/// A unicast route as the kernel holds it (protocol `static`). `metric` is
-/// the RouterOS distance, so the kernel prefers the lowest one, too.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct KernelRoute {
-    pub table: u32,
-    pub dst: IpNet,
-    pub metric: u32,
-    pub link: IfName,
-    pub gateway: Option<IpAddr>,
-}
-
-impl fmt::Display for KernelRoute {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "route {}", self.dst)?;
-        if let Some(g) = self.gateway {
-            write!(f, " via {g}")?;
-        }
-        write!(f, " dev '{}' metric {}", self.link, self.metric)?;
-        if self.table != route::MAIN_TABLE_ID {
-            write!(f, " table {}", self.table)?;
-        }
-        Ok(())
     }
 }
 
@@ -207,52 +182,6 @@ fn depth(cfg: &Config, name: &IfName) -> usize {
         cur = parent;
     }
     d
-}
-
-/// Enabled addresses on enabled interfaces of `cfg`, as (link, prefix).
-/// A disabled interface keeps none in the kernel: Linux drops the IPv6
-/// addresses of a link that goes down (`keep_addr_on_down` is 0 by default),
-/// so they are removed explicitly before it goes down — which an undo can
-/// reverse — and added again before it comes back up.
-fn active_addresses(cfg: &Config) -> BTreeSet<(IfName, IpNet)> {
-    cfg.ip
-        .addresses
-        .iter()
-        .filter(|a| {
-            !a.disabled
-                && cfg
-                    .interfaces
-                    .get(&a.interface)
-                    .is_some_and(|i| !i.disabled)
-        })
-        .map(|a| (a.interface.clone(), a.address))
-        .collect()
-}
-
-/// Kernel master of `name` (`IFLA_MASTER`): its bridge or its VRF.
-fn master<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a IfName> {
-    let i = cfg.interfaces.get(name)?;
-    i.bridge.as_ref().or(i.vrf.as_ref())
-}
-
-/// Static routes of `cfg` that belong in the kernel: the usable ones.
-pub fn kernel_routes(cfg: &Config) -> BTreeSet<KernelRoute> {
-    cfg.ip
-        .routes
-        .iter()
-        .filter_map(|r| {
-            let Reach::Active { link, gateway } = route::reach(cfg, r) else {
-                return None;
-            };
-            Some(KernelRoute {
-                table: route::table_id(cfg, &r.routing_table)?,
-                dst: r.dst_address.trunc(),
-                metric: u32::from(r.distance),
-                link,
-                gateway,
-            })
-        })
-        .collect()
 }
 
 /// Virtual links of `from` that must be deleted: gone from `to`, changed
@@ -479,6 +408,120 @@ pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
     }
 
     Ok(ops)
+}
+
+/// The operations that put back what `cfg` (the applied config) holds in
+/// the kernel, where `have` (read from it) drifted (G1.3). Same phase order
+/// as [`plan`]; a missing virtual link is created again with its MTU,
+/// master, addresses, state and routes, a missing port is left alone. The
+/// executor skips what is already in place, and the engine checks again
+/// afterwards: enslaving to a VRF, for one, drops addresses that the next
+/// round puts back.
+pub fn repair(cfg: &Config, have: &Snapshot) -> Vec<Op> {
+    let want = drift::expected(cfg);
+    let fresh: BTreeSet<&IfName> = want
+        .links
+        .keys()
+        .filter(|n| !have.links.contains_key(*n) && drift::recreatable(cfg, n))
+        .collect();
+    let there = |l: &IfName| have.links.contains_key(l) || fresh.contains(l);
+    let mut ops = Vec::new();
+
+    // Teardown: what the kernel has on our links and the config does not.
+    for r in have.routes.difference(&want.routes) {
+        if want.links.contains_key(&r.link) {
+            ops.push(Op::DelRoute(r.clone()));
+        }
+    }
+    for (link, addr) in have.addresses.difference(&want.addresses) {
+        let link_local = matches!(addr, IpNet::V6(v6) if v6.addr().is_unicast_link_local());
+        if want.links.contains_key(link) && !link_local {
+            ops.push(Op::DelAddress {
+                link: link.clone(),
+                addr: *addr,
+            });
+        }
+    }
+
+    // Create, parents first.
+    let mut adds: Vec<&IfName> = fresh.iter().copied().collect();
+    adds.sort_by_key(|n| depth(cfg, n));
+    for name in adds {
+        if let Some(spec) = cfg.interfaces.get(name).and_then(|i| LinkSpec::of(&i.kind)) {
+            ops.push(Op::CreateLink {
+                link: name.clone(),
+                spec,
+            });
+        }
+    }
+
+    // MTU: decreases children first, then increases parents first.
+    let (mut down, mut up) = (Vec::new(), Vec::new());
+    for (name, w) in &want.links {
+        match have.links.get(name).map(|h| h.mtu) {
+            Some(m) if m == w.mtu => {}
+            Some(m) if w.mtu < m => down.push((depth(cfg, name), name, w.mtu)),
+            Some(_) => up.push((depth(cfg, name), name, w.mtu)),
+            None if fresh.contains(name) => up.push((depth(cfg, name), name, w.mtu)),
+            None => {}
+        }
+    }
+    down.sort_by_key(|(d, _, _)| std::cmp::Reverse(*d));
+    up.sort_by_key(|(d, _, _)| *d);
+    for (_, name, mtu) in down.into_iter().chain(up) {
+        ops.push(Op::SetMtu {
+            link: name.clone(),
+            mtu,
+        });
+    }
+
+    // Bridge / VRF membership.
+    for (name, w) in &want.links {
+        let wrong = match have.links.get(name) {
+            Some(h) => h.master != w.master,
+            None => fresh.contains(name) && w.master.is_some(),
+        };
+        if wrong {
+            ops.push(Op::SetMaster {
+                link: name.clone(),
+                master: w.master.clone(),
+            });
+        }
+    }
+
+    for (link, addr) in want.addresses.difference(&have.addresses) {
+        if there(link) {
+            ops.push(Op::AddAddress {
+                link: link.clone(),
+                addr: *addr,
+            });
+        }
+    }
+
+    // Admin state, parents first.
+    let mut states: Vec<(usize, &IfName, bool)> = want
+        .links
+        .iter()
+        .filter(|(n, w)| match have.links.get(*n) {
+            Some(h) => h.up != w.up,
+            None => fresh.contains(n),
+        })
+        .map(|(n, w)| (depth(cfg, n), n, w.up))
+        .collect();
+    states.sort_by_key(|(d, _, _)| *d);
+    for (_, name, up) in states {
+        ops.push(Op::SetUp {
+            link: name.clone(),
+            up,
+        });
+    }
+
+    for r in want.routes.difference(&have.routes) {
+        if there(&r.link) {
+            ops.push(Op::AddRoute(r.clone()));
+        }
+    }
+    ops
 }
 
 /// Links whose static routes the kernel drops on its own during this plan.
@@ -1101,5 +1144,77 @@ mod tests {
             },
         );
         assert!(del_rt < release && release < delete);
+    }
+
+    #[test]
+    fn repair_rebuilds_a_missing_vlan_and_fixes_the_rest() {
+        let mut c = routed();
+        add(&mut c, "v10", vlan("ether2", 10));
+        addr(&mut c, "v10", "10.10.0.1/24");
+        let mut have = drift::expected(&c);
+        assert!(repair(&c, &have).is_empty(), "in sync: nothing to do");
+
+        have.links.remove(&n("v10"));
+        have.addresses.retain(|(l, _)| *l != n("v10"));
+        let route = kernel_routes(&c).into_iter().next().unwrap();
+        have.routes.remove(&route);
+        have.addresses
+            .insert((n("ether1"), "192.0.2.9/24".parse().unwrap()));
+        have.addresses
+            .insert((n("ether1"), "fe80::1/64".parse().unwrap()));
+        if let Some(l) = have.links.get_mut(&n("ether2")) {
+            l.up = false;
+        }
+        let ops = repair(&c, &have);
+        let del = Op::DelAddress {
+            link: n("ether1"),
+            addr: "192.0.2.9/24".parse().unwrap(),
+        };
+        let create = Op::CreateLink {
+            link: n("v10"),
+            spec: LinkSpec::Vlan {
+                parent: n("ether2"),
+                vlan_id: 10,
+            },
+        };
+        let v10_addr = Op::AddAddress {
+            link: n("v10"),
+            addr: "10.10.0.1/24".parse().unwrap(),
+        };
+        let wanted = [
+            del.clone(),
+            create.clone(),
+            Op::SetMtu {
+                link: n("v10"),
+                mtu: 1500,
+            },
+            v10_addr.clone(),
+            Op::SetUp {
+                link: n("ether2"),
+                up: true,
+            },
+            Op::SetUp {
+                link: n("v10"),
+                up: true,
+            },
+            Op::AddRoute(route.clone()),
+        ];
+        for w in &wanted {
+            assert!(ops.contains(w), "{w} missing from {ops:?}");
+        }
+        assert_eq!(ops.len(), wanted.len(), "{ops:?}");
+        assert!(pos(&ops, &del) < pos(&ops, &create));
+        assert!(pos(&ops, &create) < pos(&ops, &v10_addr));
+        assert!(pos(&ops, &v10_addr) < pos(&ops, &Op::AddRoute(route)));
+    }
+
+    #[test]
+    fn repair_leaves_a_missing_port_alone() {
+        let c = routed();
+        let mut have = drift::expected(&c);
+        have.links.remove(&n("ether1"));
+        have.addresses.retain(|(l, _)| *l != n("ether1"));
+        have.routes.clear();
+        assert_eq!(repair(&c, &have), Vec::new());
     }
 }

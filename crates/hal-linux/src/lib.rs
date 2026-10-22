@@ -80,6 +80,7 @@ mod linux {
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use corerouter_hal::drift::{LinkSnap, Snapshot};
     use corerouter_hal::{
         CableTest, DynamicChange, EthernetMonitor, Features, Hal, HalError, LinkCounters, LinkInfo,
         LinkState, NicHardware, SfpModule,
@@ -419,6 +420,55 @@ mod linux {
                     })
                 })
                 .collect()
+        }
+
+        /// Managed links of `cfg` as the kernel has them, and the
+        /// addresses and static routes on them (G1.3).
+        fn snapshot(&mut self, cfg: &Config) -> Result<Snapshot, HalError> {
+            let mut claims = self.claims.clone();
+            claims.extend(claims_of(cfg));
+            let view = self.view(&claims)?;
+            let by_index: BTreeMap<u32, &str> = view
+                .iter()
+                .map(|(l, _)| (l.index, l.name.as_str()))
+                .collect();
+            let mut links = BTreeMap::new();
+            let mut managed = BTreeMap::new();
+            for (l, o) in &view {
+                let Ok(name) = l.name.parse::<IfName>() else {
+                    continue;
+                };
+                if *o != Owner::Managed || !cfg.interfaces.contains_key(&name) {
+                    continue;
+                }
+                let master = l
+                    .master
+                    .and_then(|i| by_index.get(&i))
+                    .and_then(|m| m.parse().ok());
+                let snap = LinkSnap {
+                    up: l.up,
+                    mtu: l.mtu,
+                    master,
+                };
+                links.insert(name.clone(), snap);
+                managed.insert(l.index, name);
+            }
+            let (addresses, routes) = crate::netlink::held(&managed)?;
+            Ok(Snapshot {
+                links,
+                addresses,
+                routes,
+            })
+        }
+
+        /// One round of [`crate::plan::repair`], all or nothing.
+        fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
+            let have = self.snapshot(cfg)?;
+            let ops = crate::plan::repair(cfg, &have);
+            for op in &ops {
+                log::info!("reconcile: {op}");
+            }
+            crate::netlink::apply(&ops)
         }
 
         fn unmanaged(&mut self) -> Vec<(IfName, String)> {
