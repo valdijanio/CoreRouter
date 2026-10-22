@@ -1,6 +1,7 @@
 //! Command registry. One file per area; each defines `COMMANDS` with `cmd!`.
 //!
-//! Adding behavior = adding a `CommandSpec` here + a test. The `params` string
+//! Adding behavior = adding a `CommandSpec` to an area (`cmd/<area>.rs`,
+//! picked up by `build.rs`: a new area is a new file) + a test. The `params` string
 //! is the contract read by humans, agents (`list_commands`) and the engine:
 //! `check_params` rejects keys it does not declare and required keys missing.
 
@@ -74,42 +75,10 @@ macro_rules! cmd {
     };
 }
 
-pub mod args;
-mod config;
-mod dhcp_client;
-pub mod firewall;
-mod firewall_assist;
-mod firewall_zone;
-mod interface;
-mod interface_info;
-mod interface_list;
-mod ip;
-mod neighbor;
-mod route;
-mod routing;
-mod system;
-mod tool;
-mod user;
-mod vrf;
-
-static AREAS: &[&[CommandSpec]] = &[
-    interface::COMMANDS,
-    interface_info::COMMANDS,
-    interface_list::COMMANDS,
-    ip::COMMANDS,
-    route::COMMANDS,
-    vrf::COMMANDS,
-    dhcp_client::COMMANDS,
-    firewall::COMMANDS,
-    firewall_assist::COMMANDS,
-    firewall_zone::COMMANDS,
-    neighbor::COMMANDS,
-    routing::COMMANDS,
-    system::COMMANDS,
-    config::COMMANDS,
-    tool::COMMANDS,
-    user::COMMANDS,
-];
+// Every `cmd/<area>.rs` is a module and, when it defines `COMMANDS`, an
+// area: `build.rs` lists them (file-name order), so a new area is just a new
+// file. `args` (parameter helpers) is a module like the rest.
+include!(concat!(env!("OUT_DIR"), "/cmd_areas.rs"));
 
 pub fn all() -> impl Iterator<Item = &'static CommandSpec> {
     AREAS.iter().flat_map(|area| area.iter())
