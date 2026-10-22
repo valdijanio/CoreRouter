@@ -55,6 +55,7 @@ impl Hal for VirtualHal {
                 name: name.clone(),
                 mac: Some(format!("02:00:00:00:00:{:02X}", (i + 1) & 0xFF)),
                 mtu: 1500,
+                up: true,
             })
             .collect())
     }
@@ -82,6 +83,10 @@ impl Hal for VirtualHal {
                     tx_bytes: rate.wrapping_mul(t).wrapping_mul(900),
                     rx_packets: rate.wrapping_mul(t),
                     tx_packets: rate.wrapping_mul(t) / 2,
+                    kind: iface.kind.label().to_owned(),
+                    mtu: u32::from(iface.mtu),
+                    mac: iface.mac.map(|m| m.to_string()),
+                    unmanaged: None,
                 }
             })
             .collect()

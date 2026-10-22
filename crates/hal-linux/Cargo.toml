@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-hal-linux"
-description = "L1 platform crate: Linux backend (rtnetlink apply, sysfs counters). Only apps may depend on it."
+description = "L1 platform crate: Linux backend (rtnetlink apply, discovery and counters). Only apps may depend on it."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
