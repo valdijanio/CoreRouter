@@ -507,6 +507,17 @@ mesmo dia pode variar.
   netns sem root com veth (offloads aplicados e restaurados no kernel; link/pause/EEPROM/cabo pelo
   caminho "não suportado"), headless das abas; screenshots conferidos. Fora: LED (ioctl), `/export`
   de `/interface ethernet`, FEC. Esforço do agente ~5 h (**estimado**).
+- 2026-10-22 — G0.9: `cargo xtask bench` (criterion 0.8 como dev-dependency, sem plots/rayon).
+  Um build de todos os `benches/` e um resumo legível (mediana, IC 95%, tempo por item, variação
+  contra a rodada anterior ou `--baseline <nome>`; `--save-baseline`, `--quick`, `--markdown`
+  para o `docs/perf.md`). 31 benchmarks: canal de controle (TCP e TLS, `ping` e
+  `interface.list`), `Session::execute` (list/add/filter add/erro), `VirtualHal::apply` e
+  `LinuxHal::apply` de 100/1000 endereços, rotas e regras (o do kernel num namespace sem root,
+  `netns_*`, pulado com aviso onde não dá), codecs DHCPv4/LLDP/CRDP/MNDP. Números **medidos**
+  (Ryzen AI MAX+ 395, release): `ping` 7,4 µs (TLS 8,3 µs), `ip.address.add` 16 µs, netlink
+  ~20 µs por endereço/rota, `nft -f` ~20 ms fixos + ~13 µs/regra, decode DHCP 0,57 µs. Passo
+  `bench-check` no `cargo xtask ci` (+10,5 s **medido**): roda cada benchmark uma vez em debug.
+  Como testar: `cargo xtask bench --quick`; `cargo xtask bench-check`.
 - 2026-10-22 — G2.1b: firewall seguro e fácil (`docs/firewall.md` §6–§11). **Lockout:** o canal
   de controle dá ao `Caller` o `Link` da conexão; todo commit que mexe no firewall passa os pacotes
   dela (estabelecido em input, resposta em output, login novo em input e em dstnat) pelo firewall
