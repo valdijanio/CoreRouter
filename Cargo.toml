@@ -82,6 +82,16 @@ unreachable = "deny"
 indexing_slicing = "deny"
 
 # Argon2 unoptimized takes ~1 s per hash: tests would crawl.
+# Pastas de build menores e builds mais rápidas: cada sessão em paralelo tem a sua
+# (`CARGO_TARGET_DIR`), e com debuginfo completo uma `cargo xtask ci` do zero ocupava 15 GB
+# (163 s); assim, 6,6 GB (135 s), **medido** (docs/perf.md). Backtraces e panics continuam com
+# arquivo e linha do nosso código; as dependências ficam sem debuginfo.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.dev.package.argon2]
 opt-level = 3
 
