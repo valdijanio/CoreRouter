@@ -312,6 +312,11 @@ impl Session {
         &mut self.store
     }
 
+    /// Read-only view of the backend, e.g. for `enabled` checks on its features.
+    pub(crate) fn hal(&self) -> &dyn Hal {
+        self.hal.as_ref()
+    }
+
     pub(crate) fn hal_mut(&mut self) -> &mut dyn Hal {
         self.hal.as_mut()
     }

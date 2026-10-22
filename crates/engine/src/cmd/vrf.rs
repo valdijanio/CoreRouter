@@ -1,6 +1,7 @@
 //! /ip vrf — a VRF is a named routing table plus the interfaces that route
 //! with it. It is also an interface (type `vrf`, the Linux `vrf` device),
 //! so its name follows interface-name rules and shows in `interface.list`.
+//! `ip.vrf.add` is disabled, with the reason, on a kernel without VRF.
 
 use corerouter_model::route::{FIRST_VRF_TABLE, LAST_VRF_TABLE};
 use corerouter_model::{Config, IfName, Interface, InterfaceKind, RoutingTable};
@@ -18,7 +19,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         ["IP", "VRF"],
         None,
         "{name: string, interfaces?: [string] | string (comma-separated), comment?: string} → {name, table}",
-        always,
+        vrf_supported,
         add
     ),
     cmd!(
@@ -43,6 +44,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{name, table, interfaces, disabled, comment}]",
         always, list),
 ];
+
+/// The backend can create VRF devices (Linux: `CONFIG_NET_VRF`).
+fn vrf_supported(s: &Session) -> std::result::Result<(), String> {
+    if s.hal().features().vrf {
+        Ok(())
+    } else {
+        Err(corerouter_hal::NO_VRF.to_owned())
+    }
+}
 
 fn is_vrf(cfg: &Config, name: &IfName) -> bool {
     matches!(
