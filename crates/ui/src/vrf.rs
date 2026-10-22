@@ -13,6 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::interfaces::{Iface, cascade, dialog_id, field, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
+use crate::avail::Avail;
 use crate::{CoreRouterUi, Then, value_text};
 
 pub(crate) const TABLE: &str = "vrf";
@@ -180,18 +181,26 @@ impl CoreRouterUi {
             .filter(|v| selection.contains(&v.name))
             .collect();
         let mut act: Option<Act> = None;
-        // A kernel without VRF support: the engine says so, and why.
-        let can_add = self.command_allowed("ip.vrf.add");
+        // E.g. a kernel without VRF support: the engine says so, and why.
+        let can = self.can();
 
         ui.horizontal(|ui| {
-            if table::tool(ui, TABLE, Icon::Add, "Add", can_add.clone()).clicked() {
+            if table::tool(ui, TABLE, Icon::Add, "Add", can.check("ip.vrf.add")).clicked() {
                 act = Some(Act::New);
             }
             let tools = [
-                (Icon::Remove, "Remove", some(&picked)),
-                (Icon::Enable, "Enable", can_enable(&picked, true)),
-                (Icon::Disable, "Disable", can_enable(&picked, false)),
-                (Icon::Comment, "Comment", some(&picked)),
+                (Icon::Remove, "Remove", can.and("ip.vrf.remove", some(&picked))),
+                (
+                    Icon::Enable,
+                    "Enable",
+                    can.and("ip.vrf.set", can_enable(&picked, true)),
+                ),
+                (
+                    Icon::Disable,
+                    "Disable",
+                    can.and("ip.vrf.set", can_enable(&picked, false)),
+                ),
+                (Icon::Comment, "Comment", can.and("ip.vrf.set", some(&picked))),
             ];
             for (icon, tip, enabled) in tools {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
@@ -216,9 +225,9 @@ impl CoreRouterUi {
             &COLUMNS,
             &rows,
             |ui, menu| match menu {
-                Menu::Rows(sel) => row_menu(ui, &mut act, &vrfs, sel, &can_add),
+                Menu::Rows(sel) => row_menu(ui, &mut act, &vrfs, sel, &can),
                 Menu::Empty => {
-                    if action(ui, "Add VRF…", can_add.clone()) {
+                    if action(ui, "Add VRF…", can.check("ip.vrf.add")) {
                         act = Some(Act::New);
                     }
                     if ui.button("Select All").clicked() {
@@ -522,27 +531,27 @@ fn row_menu(
     act: &mut Option<Act>,
     vrfs: &[Vrf],
     sel: &[String],
-    can_add: &Result<(), String>,
+    can: &Avail,
 ) {
     let picked: Vec<&Vrf> = vrfs.iter().filter(|v| sel.contains(&v.name)).collect();
     let owned = || sel.to_vec();
-    if action(ui, "Enable", can_enable(&picked, true)) {
+    if action(ui, "Enable", can.and("ip.vrf.set", can_enable(&picked, true))) {
         *act = Some(Act::Enable(owned()));
     }
-    if action(ui, "Disable", can_enable(&picked, false)) {
+    if action(ui, "Disable", can.and("ip.vrf.set", can_enable(&picked, false))) {
         *act = Some(Act::Disable(owned()));
     }
-    if action(ui, "Remove", some(&picked)) {
+    if action(ui, "Remove", can.and("ip.vrf.remove", some(&picked))) {
         *act = Some(Act::Remove(owned()));
     }
-    if action(ui, "Comment…", some(&picked)) {
+    if action(ui, "Comment…", can.and("ip.vrf.set", some(&picked))) {
         *act = Some(Act::Comment(owned()));
     }
     if action(ui, "Properties…", some(&picked)) {
         *act = Some(Act::Open(owned()));
     }
     ui.separator();
-    if action(ui, "Add VRF…", can_add.clone()) {
+    if action(ui, "Add VRF…", can.check("ip.vrf.add")) {
         *act = Some(Act::New);
     }
 }

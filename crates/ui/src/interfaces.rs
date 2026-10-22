@@ -9,6 +9,7 @@ use egui::{Grid, TextEdit, Ui};
 use serde_json::{Value, json};
 
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
+use crate::avail::Avail;
 use crate::{CoreRouterUi, Then, form_number, human_bytes, value_text};
 
 pub(crate) const TABLE: &str = "interfaces";
@@ -228,15 +229,34 @@ impl CoreRouterUi {
             .map(|i| i.name.clone())
             .collect();
         let mut act: Option<Act> = None;
+        let can = self.can();
 
         ui.horizontal(|ui| {
-            let add = table::tool(ui, TABLE, Icon::Add, "Add", Ok(()));
-            egui::Popup::menu(&add).show(|ui| add_menu(ui, &mut act, None));
+            // Greyed out only when none of its kinds can be added.
+            let can_add = ADD_KINDS
+                .iter()
+                .map(|(_, id)| can.check(id))
+                .reduce(|a, b| a.or(b))
+                .unwrap_or(Ok(()));
+            let add = table::tool(ui, TABLE, Icon::Add, "Add", can_add);
+            egui::Popup::menu(&add).show(|ui| add_menu(ui, &mut act, None, &can));
             let tools = [
-                (Icon::Remove, "Remove", can_remove(&picked)),
-                (Icon::Enable, "Enable", can_enable(&picked, true)),
-                (Icon::Disable, "Disable", can_enable(&picked, false)),
-                (Icon::Comment, "Comment", some(&picked)),
+                (
+                    Icon::Remove,
+                    "Remove",
+                    can.and("interface.remove", can_remove(&picked)),
+                ),
+                (
+                    Icon::Enable,
+                    "Enable",
+                    can.and("interface.set", can_enable(&picked, true)),
+                ),
+                (
+                    Icon::Disable,
+                    "Disable",
+                    can.and("interface.set", can_enable(&picked, false)),
+                ),
+                (Icon::Comment, "Comment", can.and("interface.set", some(&picked))),
             ];
             for (icon, tip, enabled) in tools {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
@@ -261,9 +281,9 @@ impl CoreRouterUi {
             &COLUMNS,
             &rows,
             |ui, menu| match menu {
-                Menu::Rows(sel) => row_menu(ui, &mut act, &ifaces, &bridges, sel),
+                Menu::Rows(sel) => row_menu(ui, &mut act, &ifaces, &bridges, sel, &can),
                 Menu::Empty => {
-                    ui.menu_button("Add", |ui| add_menu(ui, &mut act, None));
+                    ui.menu_button("Add", |ui| add_menu(ui, &mut act, None, &can));
                     if ui.button("Select All").clicked() {
                         act = Some(Act::SelectAll);
                     }
@@ -701,17 +721,24 @@ fn can_enable(picked: &[&Iface], enable: bool) -> Result<(), String> {
     }
 }
 
-fn add_menu(ui: &mut Ui, act: &mut Option<Act>, parent: Option<&str>) {
-    if ui.button("VLAN").clicked() {
-        *act = Some(Act::NewVlan {
-            parent: parent.map(str::to_owned),
-        });
-    }
-    if ui.button("Bridge").clicked() {
-        *act = Some(Act::NewBridge);
-    }
-    if ui.button("Loopback").clicked() {
-        *act = Some(Act::NewLoopback);
+/// The "+" menu: label and the command its dialog sends.
+const ADD_KINDS: [(&str, &str); 3] = [
+    ("VLAN", "interface.vlan.add"),
+    ("Bridge", "interface.bridge.add"),
+    ("Loopback", "interface.loopback.add"),
+];
+
+fn add_menu(ui: &mut Ui, act: &mut Option<Act>, parent: Option<&str>, can: &Avail) {
+    for (label, id) in ADD_KINDS {
+        if action(ui, label, can.check(id)) {
+            *act = Some(match label {
+                "VLAN" => Act::NewVlan {
+                    parent: parent.map(str::to_owned),
+                },
+                "Bridge" => Act::NewBridge,
+                _ => Act::NewLoopback,
+            });
+        }
     }
 }
 
@@ -721,19 +748,20 @@ fn row_menu(
     ifaces: &[Iface],
     bridges: &[String],
     sel: &[String],
+    can: &Avail,
 ) {
     let picked: Vec<&Iface> = ifaces.iter().filter(|i| sel.contains(&i.name)).collect();
     let owned = || sel.to_vec();
-    if action(ui, "Enable", can_enable(&picked, true)) {
+    if action(ui, "Enable", can.and("interface.set", can_enable(&picked, true))) {
         *act = Some(Act::Enable(owned()));
     }
-    if action(ui, "Disable", can_enable(&picked, false)) {
+    if action(ui, "Disable", can.and("interface.set", can_enable(&picked, false))) {
         *act = Some(Act::Disable(owned()));
     }
-    if action(ui, "Remove", can_remove(&picked)) {
+    if action(ui, "Remove", can.and("interface.remove", can_remove(&picked))) {
         *act = Some(Act::Remove(owned()));
     }
-    if action(ui, "Comment…", some(&picked)) {
+    if action(ui, "Comment…", can.and("interface.set", some(&picked))) {
         *act = Some(Act::Comment(owned()));
     }
     if action(ui, "Properties…", some(&picked)) {
@@ -742,29 +770,31 @@ fn row_menu(
     ui.separator();
     match picked.as_slice() {
         [one] => {
-            if ui.button(format!("Add VLAN on {}", one.name)).clicked() {
+            let label = format!("Add VLAN on {}", one.name);
+            if action(ui, &label, can.check("interface.vlan.add")) {
                 *act = Some(Act::NewVlan {
                     parent: Some(one.name.clone()),
                 });
             }
         }
         _ => {
-            action(ui, "Add VLAN on …", Err("Select a single parent".into()));
+            let why = can.and("interface.vlan.add", Err("Select a single parent".into()));
+            action(ui, "Add VLAN on …", why);
         }
     }
     let targets: Vec<&String> = bridges.iter().filter(|b| !sel.contains(b)).collect();
     let why = if picked.iter().any(|i| i.kind == "bridge") {
-        Some("A bridge cannot be a bridge port")
+        Err("A bridge cannot be a bridge port".to_owned())
     } else if targets.is_empty() {
-        Some("No bridge yet: create one with Add > Bridge")
+        Err("No bridge yet: create one with Add > Bridge".to_owned())
     } else {
-        None
+        Ok(())
     };
-    match why {
-        Some(why) => {
-            action(ui, "Add to Bridge", Err(why.into()));
+    match can.and("interface.bridge.port.add", why) {
+        Err(why) => {
+            action(ui, "Add to Bridge", Err(why));
         }
-        None => {
+        Ok(()) => {
             ui.menu_button("Add to Bridge", |ui| {
                 for b in targets {
                     if ui.button(b.as_str()).clicked() {
@@ -782,11 +812,15 @@ fn row_menu(
     } else {
         Err("Not a bridge port".into())
     };
-    if action(ui, "Remove from Bridge", ported) {
+    if action(
+        ui,
+        "Remove from Bridge",
+        can.and("interface.bridge.port.remove", ported),
+    ) {
         *act = Some(Act::RemoveFromBridge(owned()));
     }
     ui.separator();
-    ui.menu_button("Add", |ui| add_menu(ui, act, None));
+    ui.menu_button("Add", |ui| add_menu(ui, act, None, can));
 }
 
 fn dialog_title(d: &Dialog) -> String {

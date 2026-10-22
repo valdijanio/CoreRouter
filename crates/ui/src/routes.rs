@@ -10,6 +10,7 @@ use serde_json::{Map, Value, json};
 
 use crate::interfaces::{cascade, dialog_id, field, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
+use crate::avail::Avail;
 use crate::{CoreRouterUi, Then, form_number, value_text};
 
 pub(crate) const TABLE: &str = "routes";
@@ -250,16 +251,33 @@ impl CoreRouterUi {
             .filter(|r| selection.contains(&r.key))
             .collect();
         let mut act: Option<Act> = None;
+        let can = self.can();
 
         ui.horizontal(|ui| {
-            if table::tool(ui, TABLE, Icon::Add, "Add", Ok(())).clicked() {
+            if table::tool(ui, TABLE, Icon::Add, "Add", can.check("ip.route.add")).clicked() {
                 act = Some(Act::New);
             }
             let tools = [
-                (Icon::Remove, "Remove", only_static(&picked)),
-                (Icon::Enable, "Enable", can_enable(&picked, true)),
-                (Icon::Disable, "Disable", can_enable(&picked, false)),
-                (Icon::Comment, "Comment", only_static(&picked)),
+                (
+                    Icon::Remove,
+                    "Remove",
+                    can.and("ip.route.remove", only_static(&picked)),
+                ),
+                (
+                    Icon::Enable,
+                    "Enable",
+                    can.and("ip.route.set", can_enable(&picked, true)),
+                ),
+                (
+                    Icon::Disable,
+                    "Disable",
+                    can.and("ip.route.set", can_enable(&picked, false)),
+                ),
+                (
+                    Icon::Comment,
+                    "Comment",
+                    can.and("ip.route.set", only_static(&picked)),
+                ),
             ];
             for (icon, tip, enabled) in tools {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
@@ -284,9 +302,9 @@ impl CoreRouterUi {
             &COLUMNS,
             &rows,
             |ui, menu| match menu {
-                Menu::Rows(sel) => row_menu(ui, &mut act, &routes, sel),
+                Menu::Rows(sel) => row_menu(ui, &mut act, &routes, sel, &can),
                 Menu::Empty => {
-                    if ui.button("Add Route…").clicked() {
+                    if action(ui, "Add Route…", can.check("ip.route.add")) {
                         act = Some(Act::New);
                     }
                     if ui.button("Select All").clicked() {
@@ -618,26 +636,26 @@ fn can_enable(picked: &[&Route], enable: bool) -> Result<(), String> {
     }
 }
 
-fn row_menu(ui: &mut Ui, act: &mut Option<Act>, routes: &[Route], sel: &[String]) {
+fn row_menu(ui: &mut Ui, act: &mut Option<Act>, routes: &[Route], sel: &[String], can: &Avail) {
     let picked: Vec<&Route> = routes.iter().filter(|r| sel.contains(&r.key)).collect();
     let owned = || sel.to_vec();
-    if action(ui, "Enable", can_enable(&picked, true)) {
+    if action(ui, "Enable", can.and("ip.route.set", can_enable(&picked, true))) {
         *act = Some(Act::Enable(owned()));
     }
-    if action(ui, "Disable", can_enable(&picked, false)) {
+    if action(ui, "Disable", can.and("ip.route.set", can_enable(&picked, false))) {
         *act = Some(Act::Disable(owned()));
     }
-    if action(ui, "Remove", only_static(&picked)) {
+    if action(ui, "Remove", can.and("ip.route.remove", only_static(&picked))) {
         *act = Some(Act::Remove(owned()));
     }
-    if action(ui, "Comment…", only_static(&picked)) {
+    if action(ui, "Comment…", can.and("ip.route.set", only_static(&picked))) {
         *act = Some(Act::Comment(owned()));
     }
     if action(ui, "Properties…", some(&picked)) {
         *act = Some(Act::Open(owned()));
     }
     ui.separator();
-    if ui.button("Add Route…").clicked() {
+    if action(ui, "Add Route…", can.check("ip.route.add")) {
         *act = Some(Act::New);
     }
 }

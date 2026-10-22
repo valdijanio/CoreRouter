@@ -5,6 +5,7 @@
 //! business logic lives here. This crate depends on `egui` only — the window
 //! (eframe/winit/wgpu) belongs to `apps/corerouter-gui`.
 
+mod avail;
 pub mod backend;
 mod float;
 mod interfaces;
@@ -15,6 +16,7 @@ mod vrf;
 mod windows;
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use corerouter_engine::Shared;
@@ -50,6 +52,8 @@ enum Field {
     Diff,
     /// `engine.list`: which commands the router allows now, and why not.
     Commands,
+    /// `server.info`: name and version of the router's daemon.
+    Info,
 }
 
 /// Cached query results, refreshed every `REFRESH_SECS` or after an action.
@@ -64,6 +68,7 @@ struct Cache {
     history: Vec<Value>,
     diff: Vec<Value>,
     commands: Vec<Value>,
+    info: Value,
     refreshed_at: Option<f64>,
     /// Newest reply applied per field: an older one arriving late is dropped.
     applied: BTreeMap<Field, RequestId>,
@@ -162,6 +167,9 @@ pub struct CoreRouterUi {
     vrf_dialogs: Vec<vrf::VrfDialogWin>,
     /// VRFs to open once an `ip.vrf.list` sent after this id arrives.
     open_vrf_after: Vec<(RequestId, String)>,
+    /// What the router can run now (rebuilt when `engine.list`,
+    /// `server.info` or the link change); every action asks it.
+    can: Arc<avail::Avail>,
 }
 
 impl CoreRouterUi {
@@ -175,6 +183,7 @@ impl CoreRouterUi {
         let mut open = BTreeSet::new();
         open.insert(Win::Interfaces);
         let link = backend.link();
+        let can = Arc::new(avail::Avail::new(&link, None, &Value::Null));
         Self {
             backend,
             pending: BTreeMap::new(),
@@ -197,6 +206,7 @@ impl CoreRouterUi {
             open_route_after: Vec::new(),
             vrf_dialogs: Vec::new(),
             open_vrf_after: Vec::new(),
+            can,
         }
     }
 
@@ -223,7 +233,19 @@ impl CoreRouterUi {
         self.run_then(id, params, Then::Nothing)
     }
 
+    /// A command the router cannot run now (see [`Self::can`]) is not sent:
+    /// its reason is logged and handed to `then` as the failure, and the id
+    /// returned is 0, which no backend ever answers.
     pub(crate) fn run_then(&mut self, id: &str, params: Value, then: Then) -> RequestId {
+        if let Err(why) = self.can.check(id) {
+            self.push_log(LogLine {
+                ok: false,
+                command: id.to_owned(),
+                message: why.clone(),
+            });
+            self.then(then, &Err(why));
+            return 0;
+        }
         let req = self
             .backend
             .submit("engine.execute", json!({"command": id, "params": params}));
@@ -237,24 +259,18 @@ impl CoreRouterUi {
         req
     }
 
-    /// Whether the router allows command `id` now, with its reason when
-    /// not (from `engine.list`; the engine decides). Unknown yet: allowed,
-    /// and the engine still answers for itself.
-    pub(crate) fn command_allowed(&self, id: &str) -> Result<(), String> {
-        let Some(c) = self
-            .cache
-            .commands
-            .iter()
-            .find(|c| c.get("id").and_then(Value::as_str) == Some(id))
-        else {
-            return Ok(());
-        };
-        if c.get("enabled").and_then(Value::as_bool) == Some(false) {
-            let why = c.get("disabledReason").and_then(Value::as_str);
-            Err(why.unwrap_or("not available on this router").to_owned())
-        } else {
-            Ok(())
-        }
+    /// What the router can run now: `Ok`, or the reason to grey an action
+    /// out with (missing on an older daemon, disabled by the engine, link
+    /// not up). The engine decides; the UI keeps no list of its own.
+    pub(crate) fn can(&self) -> Arc<avail::Avail> {
+        Arc::clone(&self.can)
+    }
+
+    fn update_can(&mut self) {
+        let loaded = self.cache.applied.contains_key(&Field::Commands)
+            && !self.cache.commands.is_empty();
+        let commands = loaded.then_some(self.cache.commands.as_slice());
+        self.can = Arc::new(avail::Avail::new(&self.link, commands, &self.cache.info));
     }
 
     /// Actions sent and not answered yet.
@@ -363,7 +379,14 @@ impl CoreRouterUi {
             Field::Bgp => self.cache.bgp = arr(value),
             Field::History => self.cache.history = arr(value),
             Field::Diff => self.cache.diff = arr(value),
-            Field::Commands => self.cache.commands = arr(value),
+            Field::Commands => {
+                self.cache.commands = arr(value);
+                self.update_can();
+            }
+            Field::Info => {
+                self.cache.info = value;
+                self.update_can();
+            }
         }
     }
 
@@ -417,10 +440,13 @@ impl CoreRouterUi {
                 }
                 self.link_down_logged = false;
                 self.cache.refreshed_at = None;
+                // Maybe another daemon now (restarted, upgraded): ask again.
+                self.cache.info = Value::Null;
             }
             _ => {}
         }
         self.link = link;
+        self.update_can();
     }
 
     fn refresh(&mut self, now: f64) {
@@ -481,6 +507,9 @@ impl CoreRouterUi {
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
         ask(self, Field::Commands, "engine.list", Value::Null);
+        if self.cache.info.is_null() {
+            ask(self, Field::Info, "server.info", Value::Null);
+        }
         list
     }
 
@@ -604,10 +633,11 @@ impl CoreRouterUi {
                     ui.visuals().warn_fg_color,
                     format!("{pending} pending change(s)"),
                 );
-                if ui.button("Commit").clicked() {
+                let can = self.can();
+                if table::action(ui, "Commit", can.check("config.commit")) {
                     self.run("config.commit", json!({"comment": "from GUI"}));
                 }
-                if ui.button("Discard").clicked() {
+                if table::action(ui, "Discard", can.check("config.discard")) {
                     self.run("config.discard", Value::Null);
                 }
             }
@@ -627,21 +657,28 @@ impl CoreRouterUi {
                 egui::Button::new(text.color(ui.visuals().warn_fg_color))
             }
         };
-        let resp = ui.add(button).on_hover_text(v.hover());
-        if resp.clicked() {
-            match v {
-                // Theirs: the router answers with who holds it and since when.
-                SafeModeView::Off { .. } | SafeModeView::Theirs { .. } => {
-                    self.run("config.safe-mode.enter", json!({}));
-                }
-                SafeModeView::Mine { .. } => {
-                    self.run("config.safe-mode.exit", json!({}));
-                }
+        // Theirs: the router answers with who holds it and since when.
+        let click = match v {
+            SafeModeView::Off { .. } | SafeModeView::Theirs { .. } => "config.safe-mode.enter",
+            SafeModeView::Mine { .. } => "config.safe-mode.exit",
+        };
+        let can = self.can();
+        let resp = match can.check(click) {
+            Ok(()) => ui.add(button).on_hover_text(v.hover()),
+            Err(why) => {
+                // Greyed out, without its menu: on a router without Safe
+                // Mode (or with the link down) none of its items would work.
+                ui.add_enabled(false, egui::Button::new(v.label()))
+                    .on_disabled_hover_text(format!("Safe Mode: {why}"));
+                return;
             }
+        };
+        if resp.clicked() {
+            self.run(click, json!({}));
         }
         resp.context_menu(|ui| {
             let mut pick = |ui: &mut egui::Ui, label: &str, id: &str, params: Value| {
-                if ui.button(label).clicked() {
+                if table::action(ui, label, can.check(id)) {
                     self.run(id, params);
                     ui.close();
                 }
