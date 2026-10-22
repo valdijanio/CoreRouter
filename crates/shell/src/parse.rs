@@ -170,11 +170,16 @@ fn distance(a: &str, b: &str) -> usize {
     prev.last().copied().unwrap_or(0)
 }
 
-/// Names a menu offers at the path stage: sub-menus, its commands and the
-/// built-in verbs.
-pub fn names(menu: &Menu, root: bool) -> Vec<&str> {
+/// Names a menu offers at the path stage: sub-menus, its commands, the
+/// built-in verbs and the registry's shortcuts (`ping`, from any menu).
+pub fn names<'a>(reg: &'a Registry, menu: &'a Menu, root: bool) -> Vec<&'a str> {
     let mut out: Vec<&str> = menu.children.keys().map(String::as_str).collect();
     out.extend(menu.commands.keys().map(String::as_str));
+    for a in reg.aliases.keys() {
+        if !out.contains(&a.as_str()) {
+            out.push(a);
+        }
+    }
     if !menu.commands.contains_key(EXPORT) {
         out.push(EXPORT);
     }
@@ -250,7 +255,7 @@ pub fn walk<'r>(
         let menu = reg
             .menu(&path)
             .ok_or_else(|| (off, "no such menu".to_owned()))?;
-        let all = names(menu, path.is_empty());
+        let all = names(reg, menu, path.is_empty());
         let name = match pick(&word, &all) {
             Pick::One(n) => n,
             Pick::None => {
@@ -277,6 +282,9 @@ pub fn walk<'r>(
             continue;
         }
         let verb = if let Some(cmd) = menu.commands.get(name) {
+            Verb::Command(cmd)
+        } else if let Some((cpath, cmd)) = reg.aliases.get(name).and_then(|id| reg.by_id(id)) {
+            path = cpath.to_vec();
             Verb::Command(cmd)
         } else if name == EXPORT {
             Verb::Export

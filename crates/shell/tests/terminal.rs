@@ -38,6 +38,7 @@ impl Router {
                 self.files.insert(path.clone(), content.clone());
                 Ok(Value::Null)
             }
+            Request::Sleep { .. } => Ok(Value::Null),
             Request::Call { method, params } => {
                 self.calls.push(method.clone());
                 let s = &mut self.session;
@@ -572,6 +573,28 @@ fn help_shows_menus_commands_and_params() {
     assert!(p.contains("where") && p.contains("properties"), "{p}");
     let off = t.ok("/config commit ?");
     assert!(off.contains("unavailable now: no pending changes"), "{off}");
+}
+
+/// A command costs few round trips: no `engine.list` and no read per menu
+/// after each line (the control channel pays latency per request).
+#[test]
+fn a_command_costs_three_requests_and_a_print_one() {
+    let mut t = Term::new();
+    t.router.calls.clear();
+    t.ok("/system identity set name=x");
+    assert_eq!(
+        t.router.calls,
+        ["engine.execute", "state.inspect", "engine.batch"]
+    );
+    t.router.calls.clear();
+    t.ok("/ip address print");
+    assert_eq!(t.router.calls, ["engine.execute"]);
+    t.router.calls.clear();
+    t.ok("/config diff");
+    assert_eq!(t.router.calls, ["engine.execute"], "queries do not refresh");
+    // The completion values were refreshed by that one batch.
+    t.ok("/interface bridge add name=brz");
+    assert!(t.complete("/interface set br").contains(&"brz".to_owned()));
 }
 
 #[test]

@@ -26,6 +26,33 @@ pub struct CommandSpec {
     pub run: Run,
     /// false for queries: no journal entry, no auto-commit.
     pub journal: bool,
+    /// Terminal: a shortcut at the root menu (`ping` for `tool.ping.start`).
+    pub alias: Option<&'static str>,
+    /// Terminal: the parameter a bare value goes to (`ping 8.8.8.8`).
+    pub positional: Option<&'static str>,
+    /// Starts a background task: the result carries its `id`, read with
+    /// `tool.task.poll` and ended with `tool.task.stop`.
+    pub task: bool,
+}
+
+impl CommandSpec {
+    /// Root shortcut in the terminal: `cmd!(…).alias("ping")`.
+    pub const fn alias(mut self, alias: &'static str) -> Self {
+        self.alias = Some(alias);
+        self
+    }
+
+    /// Parameter that takes a bare value in the terminal.
+    pub const fn positional(mut self, key: &'static str) -> Self {
+        self.positional = Some(key);
+        self
+    }
+
+    /// The command starts a background task.
+    pub const fn task(mut self) -> Self {
+        self.task = true;
+        self
+    }
 }
 
 /// One line per command:
@@ -34,11 +61,13 @@ pub struct CommandSpec {
 macro_rules! cmd {
     (query $id:literal, $label:literal, [$($menu:literal),* $(,)?], $shortcut:expr, $params:literal, $enabled:path, $run:path) => {
         $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($menu),*], shortcut: $shortcut,
-            params: $params, enabled: $enabled, run: $run, journal: false }
+            params: $params, enabled: $enabled, run: $run, journal: false,
+            alias: None, positional: None, task: false }
     };
     ($id:literal, $label:literal, [$($menu:literal),* $(,)?], $shortcut:expr, $params:literal, $enabled:path, $run:path) => {
         $crate::cmd::CommandSpec { id: $id, label: $label, menu: &[$($menu),*], shortcut: $shortcut,
-            params: $params, enabled: $enabled, run: $run, journal: true }
+            params: $params, enabled: $enabled, run: $run, journal: true,
+            alias: None, positional: None, task: false }
     };
 }
 
@@ -165,6 +194,9 @@ pub fn describe(session: &Session) -> Value {
                     "kind": if c.journal { "action" } else { "query" },
                     "enabled": enabled.is_ok(),
                     "disabledReason": enabled.err(),
+                    "alias": c.alias,
+                    "positional": c.positional,
+                    "task": c.task,
                 })
             })
             .collect(),
@@ -214,6 +246,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn terminal_metadata_is_consistent() {
+        let mut aliases = HashSet::new();
+        let roots: HashSet<&str> = all().filter_map(|c| c.id.split('.').next()).collect();
+        for c in all() {
+            if let Some(a) = c.alias {
+                assert!(aliases.insert(a), "alias {a} used twice");
+                assert!(!roots.contains(a), "alias {a} hides the menu /{a}");
+                assert!(
+                    !a.is_empty() && a.bytes().all(|b| b.is_ascii_lowercase() || b == b'-'),
+                    "bad alias {a}"
+                );
+            }
+            if let Some(p) = c.positional {
+                assert!(
+                    doc_keys(c.params).iter().any(|(k, _)| *k == p),
+                    "{}: positional '{p}' is not a parameter",
+                    c.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn builders_set_the_metadata() {
+        let c =
+            cmd!(query "x.y.start", "X", [], None, "{address: ip} → {id}", always, describe_stub)
+                .alias("xy")
+                .positional("address")
+                .task();
+        assert_eq!(
+            (c.alias, c.positional, c.task),
+            (Some("xy"), Some("address"), true)
+        );
+    }
+
+    fn describe_stub(_: &mut Session, _: &Value) -> Result<Value> {
+        Ok(Value::Null)
     }
 
     #[test]

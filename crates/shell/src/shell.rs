@@ -34,6 +34,11 @@ pub enum Request {
     ReadFile { path: String },
     /// Write a file on the client's side (`/export file=`).
     WriteFile { path: String, content: String },
+    /// Wait this long, then reply `Ok(null)` (between polls of a task).
+    /// A front end without access to the shell meanwhile (a blocking loop)
+    /// reports Ctrl+C by replying `{"interrupted": true}`, possibly early;
+    /// one with access calls [`Shell::interrupt`].
+    Sleep { ms: u64 },
 }
 
 impl Request {
@@ -103,6 +108,11 @@ pub struct Shell {
     pub(crate) last_print: BTreeMap<Vec<String>, Vec<Value>>,
     /// Latest result of each read command (completion values).
     pub(crate) cache: BTreeMap<String, Value>,
+    /// Lines a running job printed already (a task's events), for the
+    /// front end to show before the job ends ([`Shell::take_live`]).
+    live: Vec<Line>,
+    /// Ctrl+C while a job runs: a task being followed is stopped.
+    interrupted: bool,
 }
 
 fn reply(replies: &[Reply], i: usize) -> Reply {
@@ -177,6 +187,8 @@ impl Shell {
             safe: SafeMode::default(),
             last_print: BTreeMap::new(),
             cache: BTreeMap::new(),
+            live: Vec::new(),
+            interrupted: false,
         }
     }
 
@@ -235,22 +247,58 @@ impl Shell {
         }
     }
 
-    /// Drive `job` to the end, answering each request with `answer`.
-    pub fn run_with(&mut self, mut job: Job, mut answer: impl FnMut(&Request) -> Reply) -> Output {
+    /// Drive `job` to the end, answering each request with `answer`. Lines
+    /// the job printed while running come first in the output.
+    pub fn run_with(&mut self, job: Job, answer: impl FnMut(&Request) -> Reply) -> Output {
+        let mut live = Vec::new();
+        let mut out = self.run_live(job, answer, |lines| live.extend_from_slice(lines));
+        live.append(&mut out.lines);
+        out.lines = live;
+        out
+    }
+
+    /// Like [`Shell::run_with`], handing lines to `show` as soon as the job
+    /// prints them (a ping, line by line).
+    pub fn run_live(
+        &mut self,
+        mut job: Job,
+        mut answer: impl FnMut(&Request) -> Reply,
+        mut show: impl FnMut(&[Line]),
+    ) -> Output {
         let mut replies = Vec::new();
         loop {
-            match self.step(&mut job, replies) {
+            let step = self.step(&mut job, replies);
+            let live = self.take_live();
+            if !live.is_empty() {
+                show(&live);
+            }
+            match step {
                 Step::Send(reqs) => replies = reqs.iter().map(&mut answer).collect(),
                 Step::Done(o) => return o,
             }
         }
     }
 
+    /// Lines printed by the running job since the last call.
+    pub fn take_live(&mut self) -> Vec<Line> {
+        std::mem::take(&mut self.live)
+    }
+
+    /// Ctrl+C: stop the task the running job follows (it keeps polling
+    /// until the task reports its summary).
+    pub fn interrupt(&mut self) {
+        self.interrupted = true;
+    }
+
     /// First job of a connection: the command list, the state and the
-    /// values completion offers; prints a banner.
+    /// values completion offers; prints a banner. Four requests in two
+    /// rounds; `engine.list` is not asked again unless the router stops
+    /// knowing a command (see [`Shell::reload_registry`]).
     pub fn connect(&mut self) -> Job {
-        let mut reqs = vec![Request::call("server.info", Value::Null)];
-        reqs.extend(self.refresh_requests());
+        let reqs = vec![
+            Request::call("server.info", Value::Null),
+            Request::call("engine.list", Value::Null),
+        ];
         Job::new(Next::Send(
             reqs,
             Box::new(|sh, replies| {
@@ -262,67 +310,66 @@ impl Shell {
                         .unwrap_or("")
                         .to_owned();
                 }
-                sh.apply_refresh(replies.get(1..).unwrap_or_default());
+                let list = reply(&replies, 1);
+                sh.apply_list(list.as_ref().ok());
                 let mut out = Output::default();
-                if let Err(e) = info {
+                for e in [info.err(), list.err()].into_iter().flatten() {
                     out.lines.push(Line::styled(Style::Error, e));
                 }
-                out.lines.push(
-                    Line::new()
-                        .with(Style::Header, format!("CoreRouter {}", sh.version))
-                        .with(Style::Dim, format!(" — {}", sh.identity)),
-                );
-                out.lines.push(Line::styled(
-                    Style::Dim,
-                    "Tab completes, ? shows help, Ctrl+X toggles Safe Mode, /quit leaves.",
-                ));
-                Next::Done(out)
+                let next = sh.with_refresh(out);
+                chain(
+                    sh,
+                    next,
+                    Box::new(|sh, mut out| {
+                        out.lines.push(
+                            Line::new()
+                                .with(Style::Header, format!("CoreRouter {}", sh.version))
+                                .with(Style::Dim, format!(" — {}", sh.identity)),
+                        );
+                        out.lines.push(Line::styled(
+                            Style::Dim,
+                            "Tab completes, ? or F1 shows help, Ctrl+X toggles Safe Mode, /quit leaves.",
+                        ));
+                        Next::Done(out)
+                    }),
+                )
             }),
         ))
     }
 
-    fn refresh_requests(&self) -> Vec<Request> {
-        let mut reqs = vec![
-            Request::call("engine.list", Value::Null),
-            Request::call("state.inspect", json!({})),
-        ];
-        reqs.extend(
-            self.cache_reads()
-                .iter()
-                .map(|id| Request::execute(id, json!({}))),
-        );
-        reqs
-    }
-
-    /// Read commands whose results completion uses: every `print` with no
-    /// required parameter.
-    fn cache_reads(&self) -> Vec<String> {
-        self.reg
-            .commands()
-            .filter(|(_, c)| c.verb == "print" && c.required().next().is_none())
-            .map(|(_, c)| c.id.clone())
-            .collect()
-    }
-
-    fn apply_refresh(&mut self, replies: &[Reply]) {
-        let reads = self.cache_reads();
-        if let Some(Ok(list)) = replies.first()
-            && list.is_array()
-        {
+    fn apply_list(&mut self, list: Option<&Value>) {
+        if let Some(list) = list.filter(|l| l.is_array()) {
             self.reg = Registry::from_list(list);
-        }
-        if let Some(Ok(sum)) = replies.get(1) {
-            self.apply_summary(sum);
-        }
-        for (id, r) in reads.iter().zip(replies.iter().skip(2)) {
-            if let Ok(v) = r {
-                self.cache.insert(id.clone(), v.clone());
-            }
         }
         // A menu that disappeared (older router): back to where it exists.
         while !self.cwd.is_empty() && self.reg.menu(&self.cwd).is_none() && !self.reg.is_empty() {
             self.cwd.pop();
         }
+    }
+
+    /// Read the command list again (the router was replaced or upgraded),
+    /// then finish with `out`.
+    fn reload_registry(&mut self, out: Output) -> Next {
+        Next::Send(
+            vec![Request::call("engine.list", Value::Null)],
+            Box::new(move |sh, replies| {
+                sh.apply_list(reply(&replies, 0).ok().as_ref());
+                Next::Done(out)
+            }),
+        )
+    }
+
+    /// Read commands whose results completion uses: every `print` with no
+    /// required parameter that the router allows now (one disabled step
+    /// would fail the batch).
+    fn cache_reads(&self) -> Vec<String> {
+        self.reg
+            .commands()
+            .filter(|(_, c)| {
+                c.verb == "print" && !c.task && c.enabled.is_ok() && c.required().next().is_none()
+            })
+            .map(|(_, c)| c.id.clone())
+            .collect()
     }
 
     fn apply_summary(&mut self, sum: &Value) {
@@ -341,12 +388,31 @@ impl Shell {
         };
     }
 
-    /// `out`, after the state and caches are read again.
+    /// `out`, after the state and the completion values are read again:
+    /// two requests, `state.inspect` and one `engine.batch` (not atomic,
+    /// queries only) with every read.
     fn with_refresh(&mut self, out: Output) -> Next {
+        let reads = self.cache_reads();
+        let mut reqs = vec![Request::call("state.inspect", json!({}))];
+        if !reads.is_empty() {
+            let steps: Vec<Value> = reads.iter().map(|id| json!({ "command": id })).collect();
+            reqs.push(Request::call(
+                "engine.batch",
+                json!({"steps": steps, "atomic": false}),
+            ));
+        }
         Next::Send(
-            self.refresh_requests(),
+            reqs,
             Box::new(move |sh, replies| {
-                sh.apply_refresh(&replies);
+                if let Ok(sum) = reply(&replies, 0) {
+                    sh.apply_summary(&sum);
+                }
+                if let Ok(batch) = reply(&replies, 1) {
+                    let results = batch.get("results").and_then(Value::as_array);
+                    for (id, v) in reads.iter().zip(results.into_iter().flatten()) {
+                        sh.cache.insert(id.clone(), v.clone());
+                    }
+                }
                 Next::Done(out)
             }),
         )
@@ -408,6 +474,8 @@ impl Shell {
     /// A line typed (or pasted). Several lines at once are a script: they
     /// run as one atomic batch, like `/import`.
     pub fn submit(&mut self, input: &str) -> Job {
+        self.interrupted = false;
+        self.live.clear();
         if input.len() > MAX_SCRIPT {
             return Job::new(Next::Done(Output::error(format!(
                 "input too long (at most {MAX_SCRIPT} bytes)"
@@ -575,6 +643,14 @@ impl Shell {
                     base.insert(key.clone(), convert(cmd.param(key).map(|p| &p.ty), value));
                 }
                 Arg::Positional(text) => {
+                    // The registry names where a bare value goes (`ping 8.8.8.8`).
+                    if let Some(pk) = cmd.positional.as_deref()
+                        && !base.contains_key(pk)
+                    {
+                        first = false;
+                        base.insert(pk.to_owned(), convert(cmd.param(pk).map(|p| &p.ty), text));
+                        continue;
+                    }
                     let item_ok = first && cmd.verb != "add" && listed;
                     first = false;
                     if item_ok && let Some(ns) = numbers(text) {
@@ -692,13 +768,27 @@ impl Shell {
             vec![req],
             Box::new(move |sh, replies| match reply(&replies, 0) {
                 Ok(v) => {
+                    let task = v
+                        .get("id")
+                        .or_else(|| v.get("task"))
+                        .filter(|t| !t.is_null());
+                    if let (true, false, Some(task)) = (cmd.task, multi, task) {
+                        let columns = columns_of(&v);
+                        return sh.follow(Follow::new(task.clone(), columns));
+                    }
                     let lines = if multi {
                         Vec::new()
                     } else {
                         result_lines(&cmd, &v)
                     };
-                    sh.with_refresh(Output::lines(lines))
+                    if cmd.query {
+                        Next::Done(Output::lines(lines))
+                    } else {
+                        sh.with_refresh(Output::lines(lines))
+                    }
                 }
+                // The router no longer knows it: read its command list again.
+                Err(e) if e.starts_with("unknown command") => sh.reload_registry(Output::error(e)),
                 Err(e) => Next::Done(Output::error(e)),
             }),
         )
@@ -945,6 +1035,20 @@ impl Shell {
                 ),
         );
         if path.is_empty() {
+            for (alias, id) in &self.reg.aliases {
+                let Some((cpath, cmd)) = self.reg.by_id(id) else {
+                    continue;
+                };
+                out.push(
+                    Line::new()
+                        .with(Style::Plain, "  ")
+                        .with(Style::Verb, format!("{alias:<16}"))
+                        .with(
+                            Style::Dim,
+                            format!(" {} (= {} {})", cmd.label, path_text(cpath), cmd.verb),
+                        ),
+                );
+            }
             out.push(
                 Line::new()
                     .with(Style::Plain, "  ")
@@ -963,6 +1067,168 @@ impl Shell {
             "  .. goes up, / to the root; names abbreviate; Tab completes; Ctrl+X: Safe Mode",
         ));
         out
+    }
+}
+
+/// Milliseconds between two polls of a task with nothing new.
+const POLL_MS: u64 = 250;
+
+/// A task being followed: its id, the last event seen and the columns.
+struct Follow {
+    id: Value,
+    after: u64,
+    columns: Option<Vec<String>>,
+    widths: Vec<usize>,
+    stop_sent: bool,
+}
+
+impl Follow {
+    fn new(id: Value, columns: Option<Vec<String>>) -> Self {
+        Self {
+            id,
+            after: 0,
+            columns,
+            widths: Vec::new(),
+            stop_sent: false,
+        }
+    }
+
+    /// The header (first time) and one line per event.
+    fn rows(&mut self, events: &[Value]) -> Vec<Line> {
+        let mut out = Vec::new();
+        let Some(first) = events.first() else {
+            return out;
+        };
+        if self.widths.is_empty() {
+            let cols = self.columns.clone().unwrap_or_else(|| {
+                let mut keys: Vec<String> = first
+                    .as_object()
+                    .map(|o| o.keys().filter(|k| *k != "seq").cloned().collect())
+                    .unwrap_or_default();
+                keys.insert(0, "seq".into());
+                keys
+            });
+            self.widths = cols
+                .iter()
+                .map(|c| {
+                    let v = first.get(c).map(format::value_text).unwrap_or_default();
+                    c.chars().count().max(v.chars().count()) + 2
+                })
+                .collect();
+            let head: String = cols
+                .iter()
+                .zip(&self.widths)
+                .map(|(c, w)| format!("{:<w$}", kebab(c).to_uppercase()))
+                .collect();
+            out.push(Line::styled(Style::Header, head.trim_end().to_owned()));
+            self.columns = Some(cols);
+        }
+        let cols = self.columns.clone().unwrap_or_default();
+        for ev in events {
+            let text: String = cols
+                .iter()
+                .zip(&self.widths)
+                .map(|(c, w)| {
+                    let v = ev.get(c).map(format::value_text).unwrap_or_default();
+                    format!("{v:<w$} ")
+                })
+                .collect();
+            let failed = ev
+                .get("status")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty() && s != "ok");
+            let style = if failed { Style::Warn } else { Style::Plain };
+            out.push(Line::styled(style, text.trim_end().to_owned()));
+        }
+        out
+    }
+}
+
+/// An ordered `columns` list in a reply, if the router gives one.
+fn columns_of(v: &Value) -> Option<Vec<String>> {
+    let cols: Vec<String> = v
+        .get("columns")?
+        .as_array()?
+        .iter()
+        .filter_map(Value::as_str)
+        .take(32)
+        .map(str::to_owned)
+        .collect();
+    (!cols.is_empty()).then_some(cols)
+}
+
+impl Shell {
+    /// Poll a task (`tool.task.poll`), printing its events as they come,
+    /// until it is done; Ctrl+C ([`Shell::interrupt`]) sends
+    /// `tool.task.stop` once and keeps polling for the summary.
+    fn follow(&mut self, mut f: Follow) -> Next {
+        Next::Send(
+            vec![Request::execute(
+                "tool.task.poll",
+                json!({"id": f.id, "after_seq": f.after}),
+            )],
+            Box::new(move |sh, replies| {
+                let p = match reply(&replies, 0) {
+                    Ok(p) => p,
+                    Err(e) => return Next::Done(Output::error(e)),
+                };
+                if f.columns.is_none() {
+                    f.columns = columns_of(&p);
+                }
+                if let Some(lost) = p.get("lost").and_then(Value::as_u64).filter(|n| *n > 0) {
+                    sh.live
+                        .push(Line::styled(Style::Warn, format!("({lost} events lost)")));
+                }
+                let events = p
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let rows = f.rows(&events);
+                sh.live.extend(rows);
+                f.after = p.get("next_seq").and_then(Value::as_u64).unwrap_or(f.after);
+                if p.get("done").and_then(Value::as_bool) == Some(true) {
+                    let mut lines = Vec::new();
+                    let state = p.get("state").and_then(Value::as_str).unwrap_or("");
+                    if let Some(r) = p.get("reason").and_then(Value::as_str) {
+                        lines.push(Line::styled(Style::Warn, format!("{state}: {r}")));
+                    }
+                    if let Some(sum) = p
+                        .get("summary")
+                        .filter(|s| s.as_object().is_some_and(|o| !o.is_empty()))
+                    {
+                        lines.extend(format::object(sum, &[]));
+                    }
+                    return Next::Done(Output::lines(lines));
+                }
+                if sh.interrupted && !f.stop_sent {
+                    f.stop_sent = true;
+                    let id = f.id.clone();
+                    return Next::Send(
+                        vec![Request::execute("tool.task.stop", json!({ "id": id }))],
+                        Box::new(move |sh, replies| match reply(&replies, 0) {
+                            Ok(_) => sh.follow(f),
+                            Err(e) => Next::Done(Output::error(e)),
+                        }),
+                    );
+                }
+                if p.get("more").and_then(Value::as_bool) == Some(true) {
+                    return sh.follow(f);
+                }
+                Next::Send(
+                    vec![Request::Sleep { ms: POLL_MS }],
+                    Box::new(move |sh, replies| {
+                        let cut = reply(&replies, 0)
+                            .ok()
+                            .and_then(|v| v.get("interrupted").and_then(Value::as_bool));
+                        if cut == Some(true) {
+                            sh.interrupted = true;
+                        }
+                        sh.follow(f)
+                    }),
+                )
+            }),
+        )
     }
 }
 

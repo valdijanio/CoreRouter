@@ -968,6 +968,7 @@ dependencies = [
  "rpassword",
  "rustyline",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

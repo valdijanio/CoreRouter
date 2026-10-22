@@ -9,7 +9,8 @@
 //! Keys (input focused): Enter runs, ↑/↓ walk the history, Tab completes
 //! (one candidate: inserted; several: their common start and a list to
 //! click), `?` or F1 shows help at once and keeps the line, Ctrl+X toggles Safe
-//! Mode (as in RouterOS; there is no cut in the terminal), Esc hides the
+//! Mode (as in RouterOS; there is no cut in the terminal), Ctrl+C stops the
+//! task a command follows (`ping`: events print as they come), Esc hides the
 //! suggestions. Output is selectable; right click copies or clears it.
 
 use corerouter_shell::{Completion, Job, Line, Reply, Request, Shell, Span, Step, Style};
@@ -29,6 +30,9 @@ struct Running {
     /// Backend request ids, by slot (None: answered on the spot).
     ids: Vec<Option<RequestId>>,
     replies: Vec<Option<Reply>>,
+    /// A `Sleep` slot (between polls of a task): its slot, length and,
+    /// once a frame saw it, when it ends (UI time, seconds).
+    sleep: Option<(usize, f64, Option<f64>)>,
 }
 
 pub(crate) struct TermWin {
@@ -225,6 +229,7 @@ impl CoreRouterUi {
                 job,
                 ids: Vec::new(),
                 replies: Vec::new(),
+                sleep: None,
             });
         }
         self.term_advance(idx, Vec::new());
@@ -239,7 +244,11 @@ impl CoreRouterUi {
             let Some(mut run) = t.running.take() else {
                 return;
             };
-            match t.shell.step(&mut run.job, replies) {
+            let step = t.shell.step(&mut run.job, replies);
+            // A task's events, as they come.
+            let live = t.shell.take_live();
+            t.print(live);
+            match step {
                 Step::Done(out) => {
                     if out.quit {
                         t.closed = true;
@@ -257,12 +266,18 @@ impl CoreRouterUi {
                     let term = t.id;
                     run.ids.clear();
                     run.replies.clear();
+                    run.sleep = None;
                     for r in reqs {
                         match r {
                             Request::Call { method, params } => {
                                 let id = self.backend.submit(&method, params);
                                 self.pending.insert(id, Pending::Terminal { term });
                                 run.ids.push(Some(id));
+                                run.replies.push(None);
+                            }
+                            Request::Sleep { ms } => {
+                                run.sleep = Some((run.replies.len(), ms as f64 / 1000.0, None));
+                                run.ids.push(None);
                                 run.replies.push(None);
                             }
                             Request::ReadFile { .. } | Request::WriteFile { .. } => {
@@ -307,6 +322,33 @@ impl CoreRouterUi {
         };
         if let Some(r) = run.replies.get_mut(slot) {
             *r = Some(result);
+        }
+        if run.replies.iter().all(Option::is_some) {
+            let replies = run.replies.drain(..).flatten().collect();
+            self.term_advance(idx, replies);
+        }
+    }
+
+    /// End the sleep of terminal `idx` when its time came (or Ctrl+C cut it
+    /// short), and keep frames coming meanwhile.
+    fn term_wake(&mut self, idx: usize, now: f64, cut: bool) {
+        let Some(t) = self.terminals.get_mut(idx) else {
+            return;
+        };
+        let Some(run) = t.running.as_mut() else {
+            return;
+        };
+        let Some((slot, secs, due)) = run.sleep else {
+            return;
+        };
+        let due = due.unwrap_or(now + secs);
+        if !cut && now < due {
+            run.sleep = Some((slot, secs, Some(due)));
+            return;
+        }
+        run.sleep = None;
+        if let Some(r) = run.replies.get_mut(slot) {
+            *r = Some(Ok(serde_json::Value::Null));
         }
         if run.replies.iter().all(Option::is_some) {
             let replies = run.replies.drain(..).flatten().collect();
@@ -422,6 +464,7 @@ impl CoreRouterUi {
         let mut safe = false;
         let mut help = false;
         let mut escape = false;
+        let mut interrupt = false;
         if focused {
             ui.input_mut(|i| {
                 submit = i.consume_key(Modifiers::NONE, Key::Enter);
@@ -434,6 +477,14 @@ impl CoreRouterUi {
                 escape = i.consume_key(Modifiers::NONE, Key::Escape);
                 // F1: RouterOS v7's help key.
                 let f1 = i.consume_key(Modifiers::NONE, Key::F1);
+                // Ctrl+C while a job runs: stop the task it follows (a real
+                // keyboard sends Copy).
+                if t.busy() {
+                    let before = i.events.len();
+                    i.events.retain(|e| !matches!(e, egui::Event::Copy));
+                    interrupt =
+                        before != i.events.len() || i.consume_key(Modifiers::COMMAND, Key::C);
+                }
                 // Ctrl+X arrives as Cut from a real keyboard.
                 let before = i.events.len();
                 i.events.retain(|e| !matches!(e, egui::Event::Cut));
@@ -450,6 +501,12 @@ impl CoreRouterUi {
         }
 
         let busy = t.busy();
+        let now = ui.input(|i| i.time);
+        if busy {
+            // A task between polls has no reply pending: keep frames coming.
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
         let prompt = t.shell.prompt();
         let output_height = (ui.available_height() - t.bottom - 6.0).max(40.0);
         let mut clear = false;
@@ -585,6 +642,12 @@ impl CoreRouterUi {
                 .map_or(0, |t| t.input.get(..at).unwrap_or("").chars().count());
             set_cursor(ui.ctx(), iid, chars);
         }
+        if interrupt && let Some(t) = self.terminals.get_mut(idx) {
+            t.shell.interrupt();
+            let echo = Line::styled(Style::Dim, "^C");
+            t.print([echo]);
+        }
+        self.term_wake(idx, now, interrupt);
         if safe {
             self.term_safe_mode(idx);
         }

@@ -145,3 +145,113 @@ fn several_terminals_paste_and_quit() {
     }
     assert_eq!(h.app.terminal_count(), 1);
 }
+
+/// A router whose `ping` starts a task that answers one reply per poll.
+#[derive(Default)]
+struct PingRouter {
+    next: RequestId,
+    replies: Vec<Reply>,
+    emitted: u64,
+    stopped: bool,
+    stops: usize,
+}
+
+struct Ping(std::rc::Rc<std::cell::RefCell<PingRouter>>);
+
+impl Backend for Ping {
+    fn submit(&mut self, method: &str, params: Value) -> RequestId {
+        let mut r = self.0.borrow_mut();
+        r.next += 1;
+        let cmd = params["command"].as_str().unwrap_or_default().to_owned();
+        let reply = match (method, cmd.as_str()) {
+            ("engine.list", _) => Ok(json!([
+                {"id": "tool.ping.start", "label": "Ping", "params": "{address: string, count?: u32} → {id}",
+                 "kind": "action", "enabled": true, "alias": "ping", "positional": "address", "task": true},
+                {"id": "tool.task.poll", "label": "Poll", "params": "{id: u64, after_seq?: u64} → {}", "kind": "query", "enabled": true},
+                {"id": "tool.task.stop", "label": "Stop", "params": "{id: u64} → {}", "kind": "action", "enabled": true},
+            ])),
+            ("state.inspect", _) => Ok(json!({"identity": "sim"})),
+            ("server.info", _) => Ok(json!({"version": "sim"})),
+            ("engine.execute", "tool.ping.start") => Ok(json!({"id": 1})),
+            ("engine.execute", "tool.task.stop") => {
+                r.stopped = true;
+                r.stops += 1;
+                Ok(json!({"id": 1}))
+            }
+            ("engine.execute", "tool.task.poll") => {
+                let mut events = Vec::new();
+                if !r.stopped {
+                    r.emitted += 1;
+                    events.push(json!({"seq": r.emitted, "host": "8.8.8.8", "time": "1ms"}));
+                }
+                Ok(
+                    json!({"done": r.stopped, "state": if r.stopped {"stopped"} else {"running"},
+                          "events": events, "next_seq": r.emitted,
+                          "summary": {"sent": r.emitted}}),
+                )
+            }
+            ("engine.execute", _) => Ok(json!([])),
+            _ => Ok(json!({})),
+        };
+        let id = r.next;
+        r.replies.push((id, reply));
+        id
+    }
+
+    fn poll(&mut self) -> Vec<Reply> {
+        std::mem::take(&mut self.0.borrow_mut().replies)
+    }
+
+    fn link(&self) -> Link {
+        Link::Connected {
+            target: "sim:1".into(),
+        }
+    }
+}
+
+#[test]
+fn ping_streams_live_and_ctrl_c_stops_it() {
+    let router = std::rc::Rc::new(std::cell::RefCell::new(PingRouter::default()));
+    let mut app = CoreRouterUi::with_backend(Box::new(Ping(router.clone())));
+    let ctx = egui::Context::default();
+    let mut time = 0.0;
+    let mut frame = |app: &mut CoreRouterUi, events: Vec<egui::Event>| {
+        let raw = egui::RawInput {
+            time: Some(time),
+            events,
+            ..Default::default()
+        };
+        time += 0.05;
+        ctx.run_ui(raw, |ui| app.ui(ui))
+            .drop_without_applying_deltas();
+    };
+    app.new_terminal();
+    for _ in 0..3 {
+        frame(&mut app, Vec::new());
+    }
+    app.terminal_submit(0, "ping 8.8.8.8");
+    // Events arrive while the job runs (one poll every 250 ms).
+    for _ in 0..30 {
+        frame(&mut app, Vec::new());
+    }
+    let text = app.terminal_text(0);
+    assert!(text.contains("SEQ") && text.contains("8.8.8.8"), "{text}");
+    assert!(app.terminals[0].busy(), "still pinging");
+    let lines_before = text.lines().count();
+    for _ in 0..12 {
+        frame(&mut app, Vec::new());
+    }
+    assert!(
+        app.terminal_text(0).lines().count() > lines_before,
+        "live lines keep coming"
+    );
+    // Ctrl+C (Copy from a real keyboard) in the focused input stops it.
+    frame(&mut app, vec![egui::Event::Copy]);
+    for _ in 0..10 {
+        frame(&mut app, Vec::new());
+    }
+    assert_eq!(router.borrow().stops, 1);
+    assert!(!app.terminals[0].busy());
+    let text = app.terminal_text(0);
+    assert!(text.contains("^C") && text.contains("sent:"), "{text}");
+}
