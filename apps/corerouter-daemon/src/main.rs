@@ -15,9 +15,13 @@
 //! TLS, always with a login. The certificate is made once in the config
 //! dir (`tls-cert.pem`, `tls-key.pem` 0600) and its fingerprint is logged
 //! at start-up so operators can compare it with what their client shows.
-//! With no account yet, `admin` (group full) is created with a random
-//! password printed once on stderr; `--reset-admin-password` prints a new
-//! one (and re-enables `admin` in group full).
+//! With no account yet, `admin` (group full) is created **without a
+//! password**, as RouterOS does (G0.3b): it logs in with an empty password
+//! from this machine only, the GUI and the terminal ask it to set one, and
+//! while any account of group full has no password every login from the
+//! network is refused (the TLS listeners still start, with a warning).
+//! `--reset-admin-password` takes `admin`'s password away again (and
+//! re-enables it in group full): the way back in for a lost password.
 //!
 //! `--ws` serves the control methods over WebSocket for the GUI in a browser
 //! (G0.4). Only pages from an allowed origin may connect: by default the
@@ -100,8 +104,9 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
   --listen <addr:port>  control channel over TLS on any address, e.g. 0.0.0.0:8729 or
                         [::]:8729; login required (the local token is not accepted there)
   --token-file <path>   where to write the local token (default: see docs/control-protocol.md)
-  --reset-admin-password  give `admin` (group full, enabled) a new random password,
-                        printed once on stderr, and go on running
+  --reset-admin-password  leave `admin` (group full, enabled) without a password, as on
+                        the first start, and go on running; set a new one from this
+                        machine (network logins are refused until then)
   --ws <port>           WebSocket for the web GUI on 127.0.0.1:<port>
   --ws-listen <a:port>  the same over TLS (wss://, https:// for --web-root) on any address
   --ws-origin <origin>  also allow pages from <origin> (e.g. http://127.0.0.1:8080 for
@@ -398,40 +403,36 @@ fn tls_identity(
     Ok(Some(id))
 }
 
-/// First start (no account at all): `admin` in group full with a random
-/// password, printed once. `--reset-admin-password`: a new one for admin.
-fn bootstrap_admin(session: &corerouter_engine::Shared, reset: bool) -> Result<(), String> {
-    let mut s = lock(session);
-    let first = s.users().is_empty();
-    if !first && !reset {
-        return Ok(());
+/// First start (no account at all): `admin` in group full without a
+/// password. `--reset-admin-password`: no password for admin again.
+fn bootstrap_admin(session: &corerouter_engine::Shared, reset: bool) {
+    if let Some(what) = lock(session).bootstrap_admin(reset) {
+        log::warn!(
+            "{what}: log in as admin with an empty password from this machine \
+             (GUI or `corerouter-cli shell`) and set one"
+        );
     }
-    let password = corerouter_control::auth::random_password()?;
-    let params = serde_json::json!({"name": "admin", "group": "full", "password": password});
-    let result = if s.users().get("admin").is_some() {
-        let mut set = params.clone();
-        if let Some(o) = set.as_object_mut() {
-            o.insert("disabled".into(), false.into());
-        }
-        s.execute("user.set", &set)
-    } else {
-        s.execute("user.add", &params)
-    };
-    result.map_err(|e| format!("cannot set the admin password: {e}"))?;
-    let why = if first {
-        "first start: created user 'admin' (group full)"
-    } else {
-        "new password for user 'admin' (reset at start-up)"
-    };
-    // stderr, not the log: shown once, to whoever started the daemon.
-    eprintln!(
-        "\n================================================================\n\
-         {why}\n  password: {password}\n\
-         It is shown only now and stored only as a hash. Lost it? Restart\n\
-         with --reset-admin-password.\n\
-         ================================================================\n"
-    );
-    Ok(())
+}
+
+/// Listening on the network while an account of group full has no
+/// password: the listener runs, but refuses every login until one is set.
+fn warn_open_admin(session: &corerouter_engine::Shared, args: &Args) {
+    let missing = lock(session).admins_without_password();
+    let remote: Vec<String> = [args.listen, args.ws_listen]
+        .into_iter()
+        .flatten()
+        .filter(|a| !a.ip().is_loopback())
+        .map(|a| a.to_string())
+        .collect();
+    if !missing.is_empty() && !remote.is_empty() {
+        log::warn!(
+            "{} listen(s) on the network, but user(s) {} of group full have no password: \
+             every network login is refused until a password is set (user.set from this \
+             machine)",
+            remote.join(", "),
+            missing.join(", ")
+        );
+    }
 }
 
 /// Write the local token where local clients look for it.
@@ -709,10 +710,8 @@ fn main() -> ExitCode {
         args.port,
         args.backend
     );
-    if let Err(e) = bootstrap_admin(&session, args.reset_admin) {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
+    bootstrap_admin(&session, args.reset_admin);
+    warn_open_admin(&session, &args);
     let tls = match tls_identity(&args, config_dir.as_deref()) {
         Ok(t) => t,
         Err(e) => {

@@ -232,7 +232,11 @@ sessão (Argon2 é lento de propósito); a sessão só entrega o hash e registra
 restaura senha. O token local (arquivo 0600 do usuário do sistema que roda o roteador) dá a CLI
 e o MCP locais sem senha; TCP puro só aceita loopback, qualquer outro endereço é TLS
 (`--listen`, `--ws-listen`) com login, e os clientes nativos fixam o certificado no primeiro uso
-(`known_hosts`). Detalhes em `docs/control-protocol.md`.
+(`known_hosts`). Primeiro acesso (G0.3b, RouterOS 7): `Session::bootstrap_admin` (só na partida
+do daemon, não é comando) cria `admin` sem senha (`password_hash: None`); o `Gate` aceita senha
+vazia só de loopback e recusa todo login da rede enquanto houver conta `full` sem senha; a UI e o
+`corerouter-shell` sabem disso por `auth.whoami` (`no_password`) e pedem a senha pelo
+`user.set` normal. Detalhes em `docs/control-protocol.md`.
 
 ### Preferências da janela (G1.11)
 
@@ -421,3 +425,4 @@ falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools
 - 2026-10-22 — G6.1/G6.2: tarefas das ferramentas (`tasks`, `tools/`, `Hal::prober`, `hal::sim`, `hal-linux::icmp`, `ThreadRunner`).
 - 2026-10-22 — G2.1a: crate `firewall` (L1 puro), seção Firewall, `Hal::address_list_dynamic`.
 - 2026-10-22 — G6.3: MTR nas tarefas das ferramentas.
+- 2026-10-22 — G0.3b: primeiro acesso sem senha (bootstrap no engine, regra de rede no `Gate`, `ui::first_login`).

@@ -293,16 +293,19 @@ pub(crate) fn answer(
     })
 }
 
-/// `auth.whoami`: who this token is and what it may do.
+/// `auth.whoami`: who this token is and what it may do. For group `full`
+/// also `no_password`: the accounts of group full still without a password
+/// (G0.3b), so the GUI and the terminal can ask for one.
 fn whoami(host: &mut dyn Host, caller: &Caller) -> Result<Value, String> {
     let p = caller.principal.clone();
-    let group = host
-        .with_session(&mut |s| Ok(s.group_of(&p).map_or(Value::Null, |g| json!(g))))
-        .unwrap_or_else(|_| match p {
-            corerouter_engine::Principal::Local => json!("full"),
-            _ => Value::Null,
-        });
-    Ok(json!({"user": caller.principal.label(), "group": group, "via": caller.name}))
+    host.with_session(&mut |s| Ok(corerouter_engine::auth::whoami(s, &p, &caller.name)))
+        .or_else(|_| {
+            Ok(json!({
+                "user": p.label(),
+                "group": if p == corerouter_engine::Principal::Local { json!("full") } else { Value::Null },
+                "via": caller.name,
+            }))
+        })
 }
 
 /// Runs until the client hangs up; the caller then calls [`hang_up`].

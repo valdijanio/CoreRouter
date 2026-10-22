@@ -5,7 +5,10 @@
 //! config, outside its revisions: `config.rollback` never restores an old
 //! password. Changes are refused in Safe Mode, which could not undo them.
 //! Passwords are hashed here (Argon2id) and never echoed, journaled or
-//! returned; `user.list` shows no hash either.
+//! returned; `user.list` shows no hash either, only `no_password` for an
+//! account that has none (the first `admin`, G0.3b). A password cannot be
+//! taken away by a command: only `corerouter-daemon --reset-admin-password`
+//! does that, at start-up.
 
 use corerouter_model::users::check_name;
 use corerouter_model::{Group, User};
@@ -18,7 +21,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "user.list", "Users", ["System", "Users"], None,
-        "{} → [{name, group, disabled, comment}]",
+        "{} → [{name, group, disabled, no_password, comment}]",
         super::always, list),
     cmd!(query "user.active.list", "Active Users", ["System", "Users"], None,
         "{} → [{id, user, via, since, last_seen}]",
@@ -64,6 +67,7 @@ fn row(u: &User) -> Value {
         "name": u.name,
         "group": u.group,
         "disabled": u.disabled,
+        "no_password": u.password_hash.is_none(),
         "comment": u.comment,
     })
 }
@@ -109,7 +113,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     users.put(User {
         name: name.to_owned(),
         group,
-        password_hash: hash,
+        password_hash: Some(hash),
         disabled,
         comment,
     });
@@ -134,10 +138,10 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let new_password = password(p)?;
     let password_changed = new_password.is_some();
     if let Some(h) = new_password {
-        user.password_hash = h;
+        user.password_hash = Some(h);
     }
     let out = json!({ "name": user.name, "group": user.group, "disabled": user.disabled });
-    let ends_logins = user.disabled || password_changed;
+    let user_disabled = user.disabled;
     users.put(user);
     if lockout(s, &users) {
         return Err(EngineError::bad(
@@ -146,9 +150,12 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     s.set_users(users);
-    if ends_logins {
-        // A disabled account or a new password ends the sessions it had.
+    if user_disabled {
         s.logins_end_user(name);
+    } else if password_changed {
+        // A new password ends the account's other sessions; whoever set it
+        // stays logged in (the first-login "set a password" dialog).
+        s.logins_end_others(name);
     }
     log::info!("user '{name}' changed");
     Ok(out)

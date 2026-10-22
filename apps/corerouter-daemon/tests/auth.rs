@@ -1,6 +1,6 @@
-//! G0.3 end to end on the real daemon: first admin printed once, TLS
-//! endpoint with login, certificate kept across restarts, local token on
-//! loopback, `--reset-admin-password`.
+//! G0.3 end to end on the real daemon: first admin without a password
+//! (G0.3b), TLS endpoint with login, certificate kept across restarts,
+//! local token on loopback, `--reset-admin-password`.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -67,15 +67,6 @@ impl Daemon {
             .to_owned()
     }
 
-    fn password(&mut self) -> String {
-        self.line("  password: ")
-            .split("password: ")
-            .nth(1)
-            .unwrap()
-            .trim()
-            .to_owned()
-    }
-
     fn fingerprint(&mut self) -> String {
         self.line("TLS certificate fingerprint: ")
             .split("fingerprint: ")
@@ -95,11 +86,15 @@ fn free_port() -> u16 {
 }
 
 fn start(dir: &Path, extra: &[&str]) -> Daemon {
+    start_on(dir, "127.0.0.1", extra)
+}
+
+fn start_on(dir: &Path, listen: &str, extra: &[&str]) -> Daemon {
     let (control, tls) = (free_port(), free_port());
     let token_file = dir.join("local.token");
     let mut child = Command::new(DAEMON)
         .args(["--control", &control.to_string(), "--no-discovery"])
-        .args(["--listen", &format!("127.0.0.1:{tls}")])
+        .args(["--listen", &format!("{listen}:{tls}")])
         .arg("--config-dir")
         .arg(dir)
         .arg("--token-file")
@@ -151,15 +146,20 @@ fn exec(c: &mut Client, command: &str, params: Value) -> Result<Value, String> {
     )
 }
 
+const ADMIN_PW: &str = "first-real-password";
+
 #[test]
 fn admin_tls_login_local_token_and_reset() {
     let dir = std::env::temp_dir().join(format!("cr-auth-daemon-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
 
     let mut d = start(&dir, &[]);
-    let password = d.password();
-    assert!(password.len() >= 16, "{password}");
+    d.line("created user 'admin' (group full) without a password");
     let fp = d.fingerprint();
+    assert!(
+        !d.seen.iter().any(|l| l.contains("  password: ")),
+        "no random password is printed any more"
+    );
     let key = std::fs::metadata(dir.join("tls-key.pem")).unwrap();
     #[cfg(unix)]
     {
@@ -170,12 +170,29 @@ fn admin_tls_login_local_token_and_reset() {
     }
     let _ = key;
 
-    // TLS + login as admin; create a read-only user.
-    let mut admin = login(&d, "admin", &password, &fp).unwrap();
-    assert_eq!(
-        admin.call("auth.whoami", Value::Null).unwrap()["group"],
-        "full"
+    // First login, from this machine, with an empty password; the router
+    // says admin has none. Setting one keeps this session.
+    assert!(login(&d, "admin", "not-the-password", &fp).is_err());
+    let mut admin = login(&d, "admin", "", &fp).unwrap();
+    let me = admin.call("auth.whoami", Value::Null).unwrap();
+    assert_eq!(me["group"], "full");
+    assert_eq!(me["no_password"], json!(["admin"]));
+    exec(
+        &mut admin,
+        "user.set",
+        json!({"name": "admin", "password": ADMIN_PW}),
+    )
+    .unwrap();
+    let me = admin.call("auth.whoami", Value::Null).unwrap();
+    assert_eq!(me["no_password"], json!([]), "{me}");
+    assert!(
+        login(&d, "admin", "", &fp).is_err(),
+        "empty no longer works"
     );
+    let list = exec(&mut admin, "user.list", json!({})).unwrap();
+    assert_eq!(list[0]["no_password"], false);
+
+    // Create a read-only user.
     exec(
         &mut admin,
         "user.add",
@@ -189,6 +206,13 @@ fn admin_tls_login_local_token_and_reset() {
     let mut noc = login(&d, "noc", "noc-password", &fp).unwrap();
     let e = exec(&mut noc, "system.identity.set", json!({"name": "x"})).unwrap_err();
     assert!(e.contains("needs group write"), "{e}");
+    assert!(
+        noc.call("auth.whoami", Value::Null)
+            .unwrap()
+            .get("no_password")
+            .is_none(),
+        "only group full is told"
+    );
 
     // The TLS endpoint does not take the local token.
     let mut c =
@@ -215,23 +239,24 @@ fn admin_tls_login_local_token_and_reset() {
         json!({"name": "edge-auth"}),
     )
     .unwrap();
-    // The password is nowhere in the journal or the log.
+    // The passwords are nowhere in the journal or the log.
     let journal = plain
         .call("state.inspect", json!({"path": "journal"}))
         .unwrap();
     assert!(!journal.to_string().contains("noc-password"));
+    assert!(!journal.to_string().contains(ADMIN_PW));
     drop((admin, noc, plain, c));
     let _ = d.child.kill();
     let _ = d.child.wait();
     let log = d.seen.join("\n");
-    assert_eq!(log.matches(&password).count(), 1, "printed exactly once");
-    assert!(!log.contains("noc-password"));
+    assert!(!log.contains("noc-password") && !log.contains(ADMIN_PW));
 
-    // Restart: same certificate, users kept, no new admin password.
+    // Restart: same certificate, users and passwords kept, admin not reset.
     let mut d = start(&dir, &[]);
     assert_eq!(d.fingerprint(), fp);
-    assert!(!d.seen.iter().any(|l| l.contains("  password: ")));
+    assert!(!d.seen.iter().any(|l| l.contains("without a password")));
     assert!(login(&d, "noc", "noc-password", &fp).is_ok());
+    assert!(login(&d, "admin", ADMIN_PW, &fp).is_ok());
     // A client that never saw this router refuses to send anything.
     let e = dial(
         &Target::parse(&d.tls).unwrap(),
@@ -245,14 +270,40 @@ fn admin_tls_login_local_token_and_reset() {
     assert!(e.contains("not trusted"), "{e}");
     drop(d);
 
-    // --reset-admin-password: the old one stops working.
+    // --reset-admin-password: admin has no password again.
     let mut d = start(&dir, &["--reset-admin-password"]);
-    let new = d.password();
-    assert_ne!(new, password);
-    assert!(login(&d, "admin", &password, &fp).is_err());
-    if let Err(e) = login(&d, "admin", &new, &fp) {
+    d.line("user 'admin' has no password again");
+    assert!(login(&d, "admin", ADMIN_PW, &fp).is_err());
+    if let Err(e) = login(&d, "admin", "", &fp) {
         panic!("{e}\n{}", d.seen.join("\n"));
     }
+    assert!(login(&d, "noc", "noc-password", &fp).is_ok(), "others kept");
+    drop(d);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn network_listener_warns_while_admin_has_no_password() {
+    let dir = std::env::temp_dir().join(format!("cr-auth-open-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut d = start_on(&dir, "0.0.0.0", &[]);
+    d.line("every network login is refused until a password is set");
+    // Reached through loopback it is still this machine: the empty login
+    // works (the refusal from other addresses is tested in control::auth).
+    let fp = d.fingerprint();
+    let port = d.tls.rsplit(':').next().unwrap().to_owned();
+    let local = Target::parse(&format!("tls://127.0.0.1:{port}")).unwrap();
+    let c = dial(
+        &local,
+        Duration::from_secs(2),
+        &Login::Password {
+            user: "admin".into(),
+            password: String::new(),
+        },
+        &mut KnownHosts::in_memory(),
+        &mut Expect(fp),
+    );
+    assert!(c.is_ok(), "{:?}", c.err());
     drop(d);
     let _ = std::fs::remove_dir_all(&dir);
 }

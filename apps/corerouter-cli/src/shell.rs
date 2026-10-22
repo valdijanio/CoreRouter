@@ -213,6 +213,8 @@ pub fn run(backend: &mut dyn Backend, user: &str) -> Result<(), String> {
     let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     print(&out, tty);
     if !tty {
+        // A script cannot answer "set a password" (G0.3b).
+        shell.borrow_mut().skip_password();
         return batch(&shell, backend);
     }
 
@@ -250,6 +252,17 @@ pub fn run(backend: &mut dyn Backend, user: &str) -> Result<(), String> {
 
     let mut keep = String::new();
     loop {
+        if shell.borrow().asking_password() {
+            // First login without a password (G0.3b): read it without echo
+            // and outside the history.
+            let prompt = plain(&shell.borrow().prompt());
+            // Ctrl+D / Ctrl+C: an empty line, "not now".
+            let line = rpassword::prompt_password(prompt).unwrap_or_default();
+            let job = shell.borrow_mut().submit(&line);
+            let out = drive(&shell, backend, job, true);
+            print(&out, true);
+            continue;
+        }
         let prompt = plain(&shell.borrow().prompt());
         let read = rl.readline_with_initial(&prompt, (&keep, ""));
         keep.clear();

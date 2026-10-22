@@ -441,6 +441,19 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   e `tool.task.poll {text: true}` devolve `header`/`lines`/`summary_lines` renderizados pelo
   engine (`tools::text`). Esforço do agente ~1 h (**estimado**).
 
+- 2026-10-22 — G0.3b: primeiro acesso estilo RouterOS 7, a pedido do usuário (no lugar da senha
+  aleatória impressa do G0.3). `admin` nasce **sem senha** (`password_hash: None`, estado
+  explícito; `user.list` mostra `no_password`), criado por `Session::bootstrap_admin` na partida
+  do daemon; `--reset-admin-password` volta a esse estado. `control::auth::Gate`: senha vazia só
+  de loopback, e todo login de endereço não-loopback é recusado enquanto houver conta `full` sem
+  senha (`--listen` fora do loopback sobe com aviso). `auth.login`/`auth.whoami` dizem
+  `no_password`. GUI (nativa e web): diálogo "Set a password for admin" com "Not now" logo após
+  entrar e aviso clicável na barra superior (`ui::first_login`); terminal (`corerouter-shell`,
+  CLI e New Terminal) pergunta a senha sem eco e fora do histórico. Definir é o `user.set` normal;
+  quem define continua logado. Testes: modelo, engine, `Gate` (loopback × rede), daemon de ponta
+  a ponta, terminal, GUI headless (clique em "Not now", aviso aparece e some). Esforço do agente
+  ~3 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -469,3 +482,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G2.1a.
 - 2026-10-22 — log do G6.3.
 - 2026-10-22 — log do G6.5.
+- 2026-10-22 — log do G0.3b.

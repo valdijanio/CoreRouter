@@ -292,7 +292,9 @@ fn tls_endpoint_with_pinning_and_login() {
     // Plain text to a TLS port goes nowhere.
     let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
     raw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-    writeln!(raw, "{}", json!({"id": 1, "method": "ping"})).unwrap();
+    // The server may reset the connection before this write finishes; that
+    // is the expected outcome, not a test failure.
+    let _ = writeln!(raw, "{}", json!({"id": 1, "method": "ping"}));
     let mut line = String::new();
     let _ = BufReader::new(raw).read_line(&mut line);
     assert!(!line.contains("pong"));

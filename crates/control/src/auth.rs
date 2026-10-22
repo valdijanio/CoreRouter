@@ -13,6 +13,13 @@
 //!   acts as [`Principal::Local`] (group full). It is how the CLI and the
 //!   MCP server on the same machine work without a password.
 //!
+//! **No password yet (G0.3b, RouterOS 7 style).** The first `admin` has no
+//! password. It logs in with an empty one, but only from loopback; and
+//! while any enabled account of group `full` has no password, every login
+//! from a non-loopback address is refused with [`NO_PASSWORD_REMOTE`], so a
+//! fresh router cannot be taken over from the network. The local token is
+//! not affected.
+//!
 //! Tokens are compared in constant time. Failed logins are counted per
 //! source address and per user name: after [`Limits::free_failures`] each
 //! new attempt waits longer ([`Limits::base_delay`] doubling up to
@@ -40,6 +47,11 @@ use crate::dispatch::Host;
 pub const UNAUTHORIZED: &str = "unauthorized";
 /// The one answer to a failed login, whatever the cause.
 pub const INVALID_LOGIN: &str = "invalid user or password";
+/// The answer to a network login while an account of group `full` has no
+/// password (G0.3b). Clients stop retrying on it.
+pub const NO_PASSWORD_REMOTE: &str = "login from the network is refused while an account of \
+     group full has no password: set the admin password first (on the router itself, \
+     e.g. `corerouter-cli shell` or the GUI at 127.0.0.1, or user.set)";
 /// Most tokens held at once (the oldest session token goes first).
 pub const MAX_TOKENS: usize = 256;
 /// Most tracked sources of failed logins.
@@ -135,20 +147,6 @@ pub fn new_token() -> Result<String, String> {
     random_hex(32)
 }
 
-/// A strong random password: 20 characters of an unambiguous 32-letter
-/// alphabet (100 bits), for the first `admin` and `--reset-admin-password`.
-pub fn random_password() -> Result<String, String> {
-    const ALPHABET: &[u8; 32] = b"abcdefghjkmnpqrstuvwxyz23456789-";
-    let mut buf = [0u8; 20];
-    SystemRandom::new()
-        .fill(&mut buf)
-        .map_err(|_| "no random source".to_owned())?;
-    Ok(buf
-        .iter()
-        .filter_map(|b| ALPHABET.get(usize::from(b % 32)).map(|c| char::from(*c)))
-        .collect())
-}
-
 fn unauthorized(why: &str) -> String {
     format!("{UNAUTHORIZED}: {why}")
 }
@@ -196,6 +194,23 @@ impl Gate {
         params: &Value,
     ) -> Result<Value, String> {
         let (user, password) = login_params(params)?;
+        let loopback = peer.is_some_and(|p| p.is_loopback());
+        if !loopback {
+            let missing = host
+                .with_session(&mut |s| Ok(Value::from(s.admins_without_password())))
+                .ok()
+                .and_then(|v| v.as_array().map(Vec::len))
+                .unwrap_or(0);
+            if missing > 0 {
+                log::warn!(
+                    "control: network login for {:?} from {} refused: an account of group \
+                     full has no password",
+                    user.chars().take(64).collect::<String>(),
+                    peer.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+                );
+                return Err(NO_PASSWORD_REMOTE.into());
+            }
+        }
         let keys = [
             format!("ip {}", peer.map(|p| p.to_string()).unwrap_or_default()),
             format!("user {}", user.chars().take(64).collect::<String>()),
@@ -204,17 +219,23 @@ impl Gate {
         if !delay.is_zero() {
             thread::sleep(delay);
         }
-        let hash = if user.len() > 64 || password.len() > MAX_PASSWORD {
-            None
+        let stored = if user.len() > 64 || password.len() > MAX_PASSWORD {
+            Value::Null
         } else {
             let user = user.to_owned();
-            host.with_session(&mut |s| Ok(s.password_hash(&user).map_or(Value::Null, Value::from)))
-                .ok()
-                .and_then(|v| v.as_str().map(str::to_owned))
+            host.with_session(&mut |s| {
+                Ok(match s.password_hash(&user) {
+                    Some(h) => Value::from(h),
+                    None => Value::Bool(s.has_no_password(&user)),
+                })
+            })
+            .unwrap_or(Value::Null)
         };
-        let ok = match &hash {
-            Some(h) => verify_password(h, password),
-            None => {
+        let ok = match &stored {
+            Value::String(h) => verify_password(h, password),
+            // An account without a password: the empty one, from loopback.
+            Value::Bool(true) if loopback => password.is_empty(),
+            _ => {
                 burn_verification(password);
                 false
             }
@@ -267,6 +288,7 @@ impl Gate {
             "user": name,
             "group": group,
             "idle_timeout_secs": self.0.limits.idle.as_secs(),
+            "no_password": stored == Value::Bool(true),
         }))
     }
 
@@ -557,11 +579,72 @@ mod tests {
     }
 
     #[test]
-    fn random_passwords_are_long_and_differ() {
-        let (a, b) = (random_password().unwrap(), random_password().unwrap());
-        assert_eq!(a.len(), 20);
-        assert_ne!(a, b);
-        assert!(corerouter_engine::auth::check_password(&a).is_ok());
+    fn no_password_admin_logs_in_from_loopback_only() {
+        let gate = Gate::new(quick());
+        let mut s = Session::virtual_lab();
+        assert!(s.bootstrap_admin(false).is_some());
+        s.execute(
+            "user.add",
+            &json!({"name": "noc", "group": "read", "password": "right-password"}),
+        )
+        .unwrap();
+        let at = |gate: &Gate, s: &mut Session, ip: &str, user: &str, pw: &str| {
+            gate.login(
+                s,
+                &Caller::new(1, format!("tcp {ip}:1")),
+                Some(ip.parse().unwrap()),
+                &json!({"user": user, "password": pw}),
+            )
+        };
+        let ok = at(&gate, &mut s, "127.0.0.1", "admin", "").unwrap();
+        assert_eq!(ok["no_password"], true);
+        assert_eq!(ok["group"], "full");
+        let ok = at(&gate, &mut s, "::1", "admin", "").unwrap();
+        assert_eq!(ok["no_password"], true);
+        assert_eq!(
+            at(&gate, &mut s, "127.0.0.1", "admin", "anything").unwrap_err(),
+            INVALID_LOGIN
+        );
+        // From the network: refused for everyone while admin has none,
+        // before any password check (no failure counted).
+        for (u, p) in [("admin", ""), ("noc", "right-password"), ("ghost", "x")] {
+            assert_eq!(
+                at(&gate, &mut s, "10.0.0.9", u, p).unwrap_err(),
+                NO_PASSWORD_REMOTE
+            );
+        }
+        // A read account with a password still logs in locally.
+        let noc = at(&gate, &mut s, "127.0.0.1", "noc", "right-password").unwrap();
+        assert_eq!(noc["no_password"], false);
+        // Once admin has a password, the network is open, and the empty
+        // password no longer works anywhere.
+        s.execute(
+            "user.set",
+            &json!({"name": "admin", "password": "a-real-password"}),
+        )
+        .unwrap();
+        assert!(at(&gate, &mut s, "10.0.0.9", "admin", "a-real-password").is_ok());
+        assert!(at(&gate, &mut s, "10.0.0.9", "noc", "right-password").is_ok());
+        assert_eq!(
+            at(&gate, &mut s, "127.0.0.1", "admin", "").unwrap_err(),
+            INVALID_LOGIN
+        );
+        // --reset-admin-password closes the network again.
+        s.bootstrap_admin(true);
+        assert_eq!(
+            at(&gate, &mut s, "10.0.0.9", "admin", "a-real-password").unwrap_err(),
+            NO_PASSWORD_REMOTE
+        );
+        // Unknown peer (no address): treated as the network.
+        let e = gate
+            .login(
+                &mut s,
+                &Caller::new(1, "x"),
+                None,
+                &json!({"user": "admin", "password": ""}),
+            )
+            .unwrap_err();
+        assert_eq!(e, NO_PASSWORD_REMOTE);
     }
 
     #[test]

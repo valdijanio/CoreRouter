@@ -63,8 +63,10 @@ cargo run -p corerouter-daemon -- --config-dir /tmp/cr --listen 127.0.0.1:8729  
 cargo run -p corerouter-cli -- --connect tls://127.0.0.1:8729 --user admin inspect
 ```
 
-Autenticação (G0.3): na primeira vez o daemon cria `admin` e imprime a senha **uma vez** no
-stderr (`--reset-admin-password` gera outra). CLI, MCP e GUI em `127.0.0.1` entram sem senha com
+Autenticação (G0.3/G0.3b): na primeira vez o daemon cria `admin` **sem senha** (RouterOS 7):
+entra com senha vazia só de `127.0.0.1`, a GUI e o terminal pedem para definir uma ("Not now"
+pula), e todo login pela rede é recusado até lá (`--reset-admin-password` volta a deixar o
+`admin` sem senha). CLI, MCP e GUI em `127.0.0.1` entram sem senha com
 o **token local** que o daemon grava em `control-<porta>.token` (só o mesmo usuário do sistema
 lê; `$COREROUTER_RUNTIME_DIR` muda a pasta, `--token-file` o arquivo). Fora do loopback é sempre
 TLS + `--user` (senha por prompt ou `$COREROUTER_PASSWORD`); o certificado é confirmado no

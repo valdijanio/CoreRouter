@@ -17,9 +17,9 @@ Uma requisição JSON por linha, sobre TCP puro **só em loopback** (`--control`
 |---|---|---|
 | `ping` | — | `{pong: true}` (sem token) |
 | `server.info` | — | `{name, version, backend, has_ui, auth: "required"}` (sem token) |
-| `auth.login` | `{user, password}` | `{token, user, group, idle_timeout_secs}` (sem token) |
+| `auth.login` | `{user, password}` | `{token, user, group, idle_timeout_secs, no_password}` (sem token) |
 | `auth.logout` | — | `{}`: o token de sessão deixa de valer |
-| `auth.whoami` | — | `{user, group, via}` |
+| `auth.whoami` | — | `{user, group, via, no_password?}` (`no_password`: contas `full` sem senha, só para quem é `full`) |
 | `engine.list` | — | registro de comandos |
 | `engine.execute` | `{command, params?}` | resultado do comando |
 | `engine.batch` | `{steps: [{command, params?}], atomic?: bool = true}` | `{results}` |
@@ -50,7 +50,7 @@ read`), o mesmo mecanismo do G1.16 que deixa os botões da GUI cinza.
 
 | Comando | Params | Resultado |
 |---|---|---|
-| `user.list` | `{}` | `[{name, group, disabled, comment}]` (nunca o hash) |
+| `user.list` | `{}` | `[{name, group, disabled, no_password, comment}]` (nunca o hash) |
 | `user.active.list` | `{}` | `[{id, user, via, since, last_seen}]` |
 | `user.add` | `{name, group, password, disabled?, comment?}` | `{name, group}` |
 | `user.set` | `{name, password?, group?, disabled?, comment?}` | `{name, group, disabled}` |
@@ -64,10 +64,28 @@ Mudanças de usuário valem na hora (sem candidate/commit), são recusadas em Sa
 desfaria) e nunca deixam o roteador sem um usuário `full` ativo. Senha nova ou conta desativada
 encerra as sessões daquela conta.
 
-**Primeiro `admin`.** Sem nenhuma conta, o daemon cria `admin` (grupo `full`) com senha
-aleatória de 20 caracteres (100 bits) e a imprime **uma vez** no stderr. Perdeu? Reinicie com
-`corerouter-daemon --reset-admin-password …`: nova senha impressa, `admin` volta ativo e `full`,
-e o daemon segue rodando.
+**Primeiro `admin`, sem senha (G0.3b, como o RouterOS 7).** Sem nenhuma conta, o daemon cria
+`admin` (grupo `full`) **sem senha** e loga isso; nenhuma senha é impressa. "Sem senha" é um
+estado explícito (`password_hash: null` no arquivo, `no_password: true` no `user.list`), nunca o
+hash de uma string vazia. Regras enquanto uma conta `full` ativa estiver sem senha:
+
+- O login dela com senha **vazia** só vale de **loopback** (`127.0.0.1`/`::1`, inclusive o TLS
+  e o `--ws` em loopback); de qualquer outro endereço é recusado.
+- **Todo** login vindo da rede (endereço não-loopback, de qualquer conta) é recusado com
+  `login from the network is refused while an account of group full has no password: set the
+  admin password first …`, antes de conferir senha (não conta como falha). `--listen` /
+  `--ws-listen` fora do loopback sobem assim mesmo, com um aviso no log.
+- O token local (CLI/MCP na mesma máquina) segue igual.
+- Logo após entrar, a GUI (nativa e web) abre **"Set a password for admin"** com **"Not now"**,
+  e a barra superior mostra `admin has no password — set one` (clicável) até haver senha; o
+  terminal (`corerouter-cli shell`, janela New Terminal) pergunta `New password for admin:` sem
+  eco e fora do histórico (linha vazia = agora não). Definir é o `user.set {name, password}`
+  normal, pelo engine; quem define continua logado (as outras sessões da conta acabam).
+
+Nenhum comando tira a senha de uma conta. Perdeu a senha? Reinicie com
+`corerouter-daemon --reset-admin-password …`: `admin` volta ativo, `full` e **sem senha** (as
+sessões dele acabam, as outras contas não mudam), a rede fica fechada de novo até definir uma, e
+o daemon segue rodando.
 
 **Login e tokens.** `auth.login` devolve um token de sessão (256 bits aleatórios; o servidor
 guarda só o SHA-256, compara em tempo constante). Ele acaba com `auth.logout`, após 30 min sem
@@ -174,3 +192,5 @@ Na GUI web: `?connect=ws://127.0.0.1:7980` abre a tela de conexão com esse daem
 - 2026-10-22 — G1.4: conexão como dona do Safe Mode.
 - 2026-10-22 — G0.3: usuários/grupos, `auth.*`, token local, TLS (`--listen`, `--ws-listen`),
   confiança no primeiro uso, portas TLS no CRDP.
+- 2026-10-22 — G0.3b: primeiro `admin` sem senha, login vazio só em loopback, rede recusada até
+  definir a senha, `no_password` em `auth.login`/`auth.whoami`/`user.list`.

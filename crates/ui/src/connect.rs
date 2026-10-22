@@ -347,7 +347,9 @@ impl ConnectScreen {
         ui.add_space(12.0);
         let login_hint = "A router on this machine (127.0.0.1) needs no login when this \
                           OS user runs it (local token). Any other address is TLS with a \
-                          user and password.";
+                          user and password. A new router's admin has no password: log in \
+                          from this machine with an empty one and set it; until then \
+                          logins from the network are refused.";
         let mut enter = false;
         egui::Grid::new("connect-grid")
             .num_columns(2)

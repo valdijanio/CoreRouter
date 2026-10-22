@@ -7,7 +7,11 @@
 //! at once, outside the candidate/commit cycle.
 //!
 //! Only the Argon2id hash of a password is kept (PHC string, made by the
-//! engine); the model never sees a plain password.
+//! engine); the model never sees a plain password. An account with **no
+//! password** (the first `admin`, RouterOS style) has `password_hash: None`,
+//! never the hash of an empty string: the control channel then lets it in
+//! only from loopback, and refuses every network login while an account of
+//! group `full` is in that state (G0.3b).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -65,13 +69,14 @@ impl FromStr for Group {
     }
 }
 
-/// One account. `password_hash` is an Argon2id PHC string.
+/// One account. `password_hash` is an Argon2id PHC string, or `None` for
+/// an account without a password.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct User {
     pub name: String,
     pub group: Group,
-    pub password_hash: String,
+    pub password_hash: Option<String>,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
@@ -117,6 +122,15 @@ impl Users {
             .count()
     }
 
+    /// Enabled users of group `full` without a password, by name. While
+    /// there is one, the router refuses logins from the network.
+    pub fn admins_without_password(&self) -> Vec<String> {
+        self.iter()
+            .filter(|u| u.group == Group::Full && !u.disabled && u.password_hash.is_none())
+            .map(|u| u.name.clone())
+            .collect()
+    }
+
     /// Checks a loaded list (the config file is hostile input).
     pub fn check(&self) -> Result<(), String> {
         if self.0.len() > MAX_USERS {
@@ -127,7 +141,9 @@ impl Users {
             if key != &u.name {
                 return Err(format!("user listed as '{key}' is named '{}'", u.name));
             }
-            if u.password_hash.len() > MAX_HASH || !u.password_hash.starts_with("$argon2id$") {
+            if let Some(h) = &u.password_hash
+                && (h.len() > MAX_HASH || !h.starts_with("$argon2id$"))
+            {
                 return Err(format!(
                     "user '{key}': password_hash is not an Argon2id hash"
                 ));
@@ -165,7 +181,7 @@ mod tests {
         User {
             name: name.into(),
             group,
-            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into()),
             disabled: false,
             comment: String::new(),
         }
@@ -197,11 +213,35 @@ mod tests {
         assert!(u.check().is_ok());
         assert_eq!(u.admins(), 1);
         let mut plain = user("bob", Group::Read);
-        plain.password_hash = "hunter2".into();
+        plain.password_hash = Some("hunter2".into());
         u.put(plain);
         assert!(u.check().is_err());
         let json = r#"{"x": {"name": "y", "group": "read", "password_hash": "$argon2id$"}}"#;
         let bad: Users = serde_json::from_str(json).unwrap();
         assert!(bad.check().is_err());
+    }
+
+    #[test]
+    fn no_password_is_explicit_and_round_trips() {
+        let mut u = Users::default();
+        let mut admin = user("admin", Group::Full);
+        admin.password_hash = None;
+        u.put(admin);
+        u.put(user("noc", Group::Full));
+        assert!(u.check().is_ok());
+        assert_eq!(u.admins_without_password(), ["admin"]);
+        let text = serde_json::to_string(&u).unwrap();
+        assert!(text.contains(r#""password_hash":null"#), "{text}");
+        let back: Users = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, u);
+        // A disabled or non-full account does not count.
+        let mut ro = user("ro", Group::Read);
+        ro.password_hash = None;
+        u.put(ro);
+        if let Some(mut a) = u.get("admin").cloned() {
+            a.disabled = true;
+            u.put(a);
+        }
+        assert!(u.admins_without_password().is_empty());
     }
 }

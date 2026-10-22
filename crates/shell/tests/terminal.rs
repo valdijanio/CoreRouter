@@ -44,6 +44,11 @@ impl Router {
                 let s = &mut self.session;
                 match method.as_str() {
                     "server.info" => Ok(json!({"name": "corerouter", "version": "test"})),
+                    "auth.whoami" => Ok(corerouter_engine::auth::whoami(
+                        s,
+                        &self.caller.principal,
+                        &self.caller.name,
+                    )),
                     "engine.list" => Ok(s.list()),
                     "engine.execute" => {
                         let id = params["command"].as_str().unwrap_or("");
@@ -750,4 +755,57 @@ mod hostile {
             t.shell.highlight(&line);
         }
     }
+}
+
+/// G0.3b: right after the login, an admin without a password is asked for
+/// one; an empty line is "not now"; the answer goes through `user.set`.
+#[test]
+fn first_login_asks_for_the_admin_password() {
+    let first = || {
+        let mut router = Router::new();
+        router.session.bootstrap_admin(false);
+        router.caller =
+            Caller::new(7, "test 127.0.0.1:1").with_principal(Principal::User("admin".into()));
+        let mut shell = Shell::new("admin");
+        let job = shell.connect();
+        let r = &mut router;
+        let out = shell.run_with(job, |q| r.answer(q)).text();
+        assert!(out.contains("User admin has no password"), "{out}");
+        assert!(shell.asking_password());
+        assert_eq!(shell.prompt_text(), "New password for admin: ");
+        Term { shell, router }
+    };
+    // Not now: back to the normal prompt, nothing changed.
+    let mut t = first();
+    let out = t.run("");
+    assert!(out.contains("Not now"), "{out}");
+    assert!(!t.shell.asking_password());
+    assert!(t.shell.prompt_text().starts_with("[admin@"));
+    assert!(t.router.session.has_no_password("admin"));
+
+    // Too short, then two different entries, then a good one.
+    let mut t = first();
+    t.run("short");
+    assert_eq!(t.shell.prompt_text(), "Repeat new password: ");
+    let out = t.run("short");
+    assert!(out.contains("at least"), "{out}");
+    assert!(t.shell.asking_password());
+    t.run("first-password");
+    let out = t.run("other-password");
+    assert!(out.contains("differ"), "{out}");
+    t.run("first-password");
+    let out = t.run("first-password");
+    assert!(out.contains("Password set for admin"), "{out}");
+    assert!(!t.shell.asking_password());
+    let h = t.router.session.password_hash("admin").unwrap();
+    assert!(corerouter_engine::auth::verify_password(
+        &h,
+        "first-password"
+    ));
+    // The password reached the engine only as the masked journal entry.
+    assert!(!t.ok("/config history").contains("first-password"));
+
+    // A router where every admin has a password: no question.
+    let t = Term::new();
+    assert!(!t.shell.asking_password());
 }
