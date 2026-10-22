@@ -319,6 +319,22 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   (**medido**): daemon de lab `--config-dir <tmp>` + `corerouter-gui --connect --control` com as
   preferências num `XDG_DATA_HOME` descartável, `ether4` "queimou" ativa e `ether5` desativada
   comentada, `screenshot` nos quatro casos conferido. Esforço do agente ~1 h (**estimado**).
+- 2026-10-22 — G5.5: o `corerouter-daemon` se despede ao encerrar. SIGINT/SIGTERM chegam pelo
+  `signal_hook::flag::register` (o handler só marca um `AtomicBool`, lido a cada 50 ms; mesmo
+  caminho no unix e no Windows — o iterador do `signal-hook` só existe no unix e quebrou o build
+  do Windows na primeira versão do PR; sem `unsafe` no workspace, sem runtime async; `ctrlc` com
+  `termination` também serviria, mas não distingue os sinais no log). Ao receber: `corerouter_control::Shutdown` fecha
+  as portas de controle e WebSocket (`serve_until`/`spawn_ws_until`; conexões abertas seguem até o
+  fim do processo); `Agent::shutdown` acorda o emissor (agora dorme num canal, não num `sleep`) e
+  manda `hold 0` em toda interface onde anunciava, também o loopback do lab; `LinkDiscovery`
+  manda o LLDPDU TTL 0; prazo total 1 s; depois a sessão fica travada até o `exit(0)` (commit em
+  curso termina, nenhum novo começa a salvar). Safe Mode ativo: só um aviso no log; não salvo,
+  então reinicia na config de antes (G1.4). Segundo sinal: sai na hora com 130. `drop` do `Agent`
+  também se despede. A GUI nativa já tirava o vizinho ao ouvir `hold 0` (`Listener::poll`); teste
+  novo confirma com o `Listener`. Testes: dois daemons de lab reais (processos), SIGTERM e SIGINT
+  num deles — o outro o esquece em ~50 ms (**medido**, exigido ≤ 2 s, hold de 4 s) e o processo sai
+  com 0 e loga `shutting down: sent CRDP goodbye on 1 interface(s)`; `Agent::shutdown` com lab e
+  `Listener`; `Shutdown` fecha as duas portas. Esforço do agente ~1,5 h (**estimado**).
 
 ## Histórico de revisão
 
@@ -340,3 +356,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G5.2 (Parte 2).
 - 2026-10-22 — log do G5.4.
 - 2026-10-22 — log do G1.17.
+- 2026-10-22 — log do G5.5.

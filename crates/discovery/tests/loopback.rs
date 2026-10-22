@@ -113,6 +113,37 @@ fn two_labs_and_the_gui_listener_see_each_other_over_loopback() {
     assert_eq!(targets, ["127.0.0.1:7979", "127.0.0.1:7981"]);
 }
 
+/// G5.5: stopping an agent says goodbye: the other lab and the GUI
+/// listener forget it at once instead of after the hold time (4 s here).
+#[test]
+fn shutdown_says_goodbye_to_labs_and_the_gui_listener() {
+    let port = free_udp_port();
+    let mut listener = Listener::spawn(port).unwrap();
+    let (a, b) = (lab("bye-a"), lab("bye-b"));
+    let _aa = agent(&a, port, 3, 7979, Transport::Loopback);
+    let ab = agent(&b, port, 4, 7981, Transport::Loopback);
+    assert!(wait_for(|| sees(&a, "bye-b").is_some()));
+    assert!(wait_for(|| listener.poll().len() == 2));
+
+    let start = Instant::now();
+    assert_eq!(ab.shutdown(Duration::from_secs(1)), Some(1));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    let gone = |l: &mut Listener| {
+        let ids: Vec<NodeId> = l.poll().iter().map(|h| h.announcement.node_id).collect();
+        ids == [NodeId([3; 16])]
+    };
+    let deadline = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < deadline && !(sees(&a, "bye-b").is_none() && gone(&mut listener)) {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(sees(&a, "bye-b").is_none(), "lab a still lists bye-b");
+    assert!(gone(&mut listener), "the GUI listener still lists bye-b");
+}
+
 #[test]
 fn a_lab_hears_only_on_its_port_of_the_same_name() {
     let port = free_udp_port();

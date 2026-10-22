@@ -2,9 +2,10 @@
 
 use std::io::{self, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -30,10 +31,76 @@ pub fn bind_loopback(port: u16) -> io::Result<TcpListener> {
     TcpListener::bind(SocketAddr::from((Ipv4Addr::LOCALHOST, port)))
 }
 
+/// How long [`Shutdown::close`] waits for each accept loop to wake up.
+const WAKE_TIMEOUT: Duration = Duration::from_millis(200);
+
+/// Stops the accept loops of [`serve_until`] and `serve_ws_until`: after
+/// [`Shutdown::close`] each loop returns at its next accept and drops its
+/// listener, so the port closes. Connections already open keep running.
+#[derive(Debug, Clone, Default)]
+pub struct Shutdown(Arc<ShutdownInner>);
+
+#[derive(Debug, Default)]
+struct ShutdownInner {
+    closed: AtomicBool,
+    /// Where the loops listen, to wake their blocking accept.
+    listening: Mutex<Vec<SocketAddr>>,
+}
+
+impl Shutdown {
+    pub fn is_closed(&self) -> bool {
+        self.0.closed.load(Ordering::SeqCst)
+    }
+
+    /// Stop accepting on every loop that uses this handle; wakes each one
+    /// with a throwaway connection, so they return now, not at the next
+    /// client.
+    pub fn close(&self) {
+        self.0.closed.store(true, Ordering::SeqCst);
+        let addrs = self
+            .0
+            .listening
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        for addr in addrs {
+            let _ = TcpStream::connect_timeout(&addr, WAKE_TIMEOUT);
+        }
+    }
+
+    pub(crate) fn watch(&self, listener: &TcpListener) {
+        if let Ok(addr) = listener.local_addr() {
+            self.0
+                .listening
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(addr);
+        }
+    }
+}
+
 /// Serve forever on the current thread.
 pub fn serve<H: Host + Clone + Send + 'static>(listener: TcpListener, host: H) {
+    serve_until(listener, host, &Shutdown::default());
+}
+
+/// Serve on the current thread until `shutdown` is closed.
+pub fn serve_until<H: Host + Clone + Send + 'static>(
+    listener: TcpListener,
+    host: H,
+    shutdown: &Shutdown,
+) {
     let active = Arc::new(AtomicUsize::new(0));
+    shutdown.watch(&listener);
+    // A close that ran before `watch` did not wake this loop.
+    if shutdown.is_closed() {
+        return;
+    }
     for conn in listener.incoming() {
+        if shutdown.is_closed() {
+            log::info!("control: no longer accepting connections");
+            return;
+        }
         let mut stream = match conn {
             Ok(s) => s,
             Err(e) => {

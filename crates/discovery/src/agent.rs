@@ -6,7 +6,9 @@
 //! one machine see each other and nothing reaches the network.
 //!
 //! Three threads: one sender (also expires the table every second) and one
-//! receiver per address family. Nothing is ever sent in reply to a
+//! receiver per address family. When the agent stops ([`Agent::shutdown`],
+//! or drop) the sender says goodbye (hold 0) on every interface it was
+//! announcing on, so neighbors forget us now, not after the hold time. Nothing is ever sent in reply to a
 //! datagram: a forged announcement costs the sender one table entry at most
 //! (bounded by `MAX_NEIGHBORS`), never traffic from us.
 
@@ -15,6 +17,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -85,10 +88,15 @@ pub struct AgentConfig {
     pub transport: Transport,
 }
 
-/// Running CRDP threads; dropping it stops them.
+/// Running CRDP threads; dropping it stops them (after the goodbye, like
+/// [`Agent::shutdown`] without a deadline).
 pub struct Agent {
     stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    /// Dropping it wakes the sender at once (it sleeps on the channel).
+    wake: Option<mpsc::Sender<()>>,
+    /// The sender returns how many goodbyes it sent.
+    sender: Option<JoinHandle<usize>>,
+    receivers: Vec<JoinHandle<()>>,
 }
 
 impl Agent {
@@ -104,28 +112,27 @@ impl Agent {
             Transport::Interfaces => None,
         };
         let stop = Arc::new(AtomicBool::new(false));
+        let (wake, asleep) = mpsc::channel();
         let cfg = Arc::new(cfg);
-        let mut threads = Vec::new();
+        let mut receivers = Vec::new();
         for (name, rx) in [("crdp-rx4", rx4), ("crdp-rx6", rx6)] {
             let (session, cfg, stop) = (session.clone(), cfg.clone(), stop.clone());
-            threads.push(
+            receivers.push(
                 thread::Builder::new()
                     .name(name.into())
                     .spawn(move || receive_loop(&rx, &session, &cfg, &stop))?,
             );
         }
-        let (session2, cfg2, stop2) = (session, cfg.clone(), stop.clone());
-        threads.push(
-            thread::Builder::new()
-                .name("crdp-tx".into())
-                .spawn(move || {
-                    let tx = Tx {
-                        v6: &tx6,
-                        lo: lo.as_ref(),
-                    };
-                    send_loop(&tx, &join6, &session2, &cfg2, &stop2);
-                })?,
-        );
+        let cfg2 = cfg.clone();
+        let sender = thread::Builder::new()
+            .name("crdp-tx".into())
+            .spawn(move || {
+                let tx = Tx {
+                    v6: &tx6,
+                    lo: lo.as_ref(),
+                };
+                send_loop(&tx, &join6, &session, &cfg2, &asleep)
+            })?;
         let via = match cfg.transport {
             Transport::Interfaces => "the host interfaces of the same name",
             Transport::Loopback => "this host's loopback only (virtual lab)",
@@ -136,14 +143,42 @@ impl Agent {
             cfg.port,
             cfg.node_id
         );
-        Ok(Agent { stop, threads })
+        Ok(Agent {
+            stop,
+            wake: Some(wake),
+            sender: Some(sender),
+            receivers,
+        })
+    }
+
+    /// Stop announcing: send the goodbye (hold 0) on every interface we
+    /// were announcing on and return how many, or `None` when the sender
+    /// did not finish `within` (it is left to finish on its own). The
+    /// receivers are not waited for: they stop within `sock::RECV_TIMEOUT`.
+    pub fn shutdown(mut self, within: Duration) -> Option<usize> {
+        self.stop.store(true, Ordering::Relaxed);
+        self.wake = None;
+        let deadline = Instant::now() + within;
+        let sender = self.sender.take()?;
+        while !sender.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.receivers.clear();
+        if !sender.is_finished() {
+            return None;
+        }
+        sender.join().ok()
     }
 }
 
 impl Drop for Agent {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        for t in self.threads.drain(..) {
+        self.wake = None;
+        if let Some(t) = self.sender.take() {
+            let _ = t.join();
+        }
+        for t in self.receivers.drain(..) {
             let _ = t.join();
         }
     }
@@ -226,13 +261,21 @@ struct Tx<'a> {
     lo: Option<&'a UdpSocket>,
 }
 
-fn send_loop(tx: &Tx<'_>, rx6: &UdpSocket, session: &Shared, cfg: &AgentConfig, stop: &AtomicBool) {
+/// Runs until `wake` is disconnected (the agent stops); returns the number
+/// of goodbyes sent then.
+fn send_loop(
+    tx: &Tx<'_>,
+    rx6: &UdpSocket,
+    session: &Shared,
+    cfg: &AgentConfig,
+    wake: &mpsc::Receiver<()>,
+) -> usize {
     let started = Instant::now();
     let mut last_sent: BTreeMap<IfName, Instant> = BTreeMap::new();
     let mut active_since: BTreeMap<IfName, Instant> = BTreeMap::new();
     let mut last_settings: Option<NeighborDiscovery> = None;
     let mut warned = Once::default();
-    while !stop.load(Ordering::Relaxed) {
+    loop {
         let snap = {
             let mut s = lock(session);
             let gone = s.expire_neighbors(unix_now());
@@ -304,8 +347,47 @@ fn send_loop(tx: &Tx<'_>, rx6: &UdpSocket, session: &Shared, cfg: &AgentConfig, 
                 last_sent.insert(name.clone(), Instant::now());
             }
         }
-        thread::sleep(TICK);
+        match wake.recv_timeout(TICK) {
+            Ok(()) | Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
     }
+    goodbye(tx, session, cfg, last_sent.keys(), started, &mut warned)
+}
+
+/// Hold 0 on each interface in `on`, from the running config as it is now
+/// (an interface removed since is skipped). Returns how many were sent.
+fn goodbye<'a>(
+    tx: &Tx<'_>,
+    session: &Shared,
+    cfg: &AgentConfig,
+    on: impl Iterator<Item = &'a IfName>,
+    started: Instant,
+    warned: &mut Once,
+) -> usize {
+    let snap = Snapshot::of(lock(session).store().running());
+    let kernel = match tx.lo {
+        Some(_) => IfTable::default(),
+        None => ifaces::read(),
+    };
+    let uptime = started.elapsed().as_secs();
+    let mut sent = 0;
+    for name in on {
+        let Some(info) = snap.ifaces.get(name) else {
+            continue;
+        };
+        let out = Out {
+            name,
+            info,
+            hold_secs: 0,
+            uptime,
+            settled: true,
+        };
+        if announce(tx, cfg, &snap, &out, &kernel, warned) {
+            sent += 1;
+        }
+    }
+    sent
 }
 
 /// One announcement to send.
@@ -318,6 +400,7 @@ struct Out<'a> {
     settled: bool,
 }
 
+/// True when at least one datagram went out.
 fn announce(
     tx: &Tx<'_>,
     cfg: &AgentConfig,
@@ -325,7 +408,7 @@ fn announce(
     out: &Out<'_>,
     kernel: &IfTable,
     warned: &mut Once,
-) {
+) -> bool {
     let Out {
         name,
         info,
@@ -369,20 +452,23 @@ fn announce(
             warned.warn(format!("{name}/encode"), || {
                 format!("CRDP: cannot build the announcement for {name}: {e}")
             });
-            return;
+            return false;
         }
     };
     if let Some(lo) = tx.lo {
-        match sock::send_loopback(lo, &packet, cfg.port) {
+        return match sock::send_loopback(lo, &packet, cfg.port) {
             Ok(()) => {
                 warned.clear("lo");
                 log::debug!("CRDP announced {name} on loopback (hold {hold_secs} s)");
+                true
             }
-            Err(e) => warned.warn("lo".into(), || {
-                format!("CRDP: cannot broadcast on loopback (virtual lab): {e}")
-            }),
-        }
-        return;
+            Err(e) => {
+                warned.warn("lo".into(), || {
+                    format!("CRDP: cannot broadcast on loopback (virtual lab): {e}")
+                });
+                false
+            }
+        };
     }
     let mut sent = false;
     match k {
@@ -425,6 +511,7 @@ fn announce(
     if sent {
         log::debug!("CRDP announced on {name} (hold {hold_secs} s)");
     }
+    sent
 }
 
 fn receive_loop(rx: &UdpSocket, session: &Shared, cfg: &AgentConfig, stop: &AtomicBool) {

@@ -54,7 +54,8 @@ pub struct LocalSystem {
 /// The running thread; dropping it sends the shutdown LLDPDUs and stops it.
 pub struct LinkDiscovery {
     stop: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
+    /// Returns how many ports got the shutdown LLDPDU.
+    thread: Option<JoinHandle<usize>>,
 }
 
 impl LinkDiscovery {
@@ -81,6 +82,21 @@ impl LinkDiscovery {
             stop,
             thread: Some(thread),
         })
+    }
+
+    /// Stop: the shutdown LLDPDU (TTL 0) on every open port; how many, or
+    /// `None` when the thread did not finish `within`.
+    pub fn shutdown(mut self, within: Duration) -> Option<usize> {
+        self.stop.store(true, Ordering::Relaxed);
+        let deadline = Instant::now() + within;
+        let t = self.thread.take()?;
+        while !t.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !t.is_finished() {
+            return None;
+        }
+        t.join().ok()
     }
 }
 
@@ -427,16 +443,25 @@ impl Lldp<'_> {
         }
     }
 
-    /// Shutdown LLDPDU on every open port, then close them.
-    fn close(&mut self, snap: &Snapshot, now: Instant) {
+    /// Shutdown LLDPDU on every open port, then close them; how many ports.
+    fn close(&mut self, snap: &Snapshot, now: Instant) -> usize {
+        let mut n = 0;
         for (name, _) in self.io.interfaces() {
             self.send(snap, &name, 0, now);
+            n += 1;
         }
         self.io.set_interfaces(&[]);
+        n
     }
 }
 
-fn run(session: &Shared, local: &LocalSystem, mut mndp: Option<MndpListener>, stop: &AtomicBool) {
+/// Returns how many ports got the shutdown LLDPDU when `stop` is set.
+fn run(
+    session: &Shared,
+    local: &LocalSystem,
+    mut mndp: Option<MndpListener>,
+    stop: &AtomicBool,
+) -> usize {
     let mut lldp = Lldp {
         io: LldpIo::new(Duration::from_secs(u64::from(
             corerouter_proto_lldp::TX_INTERVAL_SECS,
@@ -484,8 +509,9 @@ fn run(session: &Shared, local: &LocalSystem, mut mndp: Option<MndpListener>, st
         }
         thread::sleep(TICK);
     }
-    if let Some(s) = &snap {
-        lldp.close(s, Instant::now());
+    match &snap {
+        Some(s) => lldp.close(s, Instant::now()),
+        None => 0,
     }
 }
 
