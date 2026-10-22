@@ -9,7 +9,7 @@ use egui::{Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
 use crate::interfaces::{cascade, field, opt_text};
-use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, num};
+use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, form_number, value_text};
 
 pub(crate) const TABLE: &str = "routes";
@@ -23,7 +23,7 @@ const COLUMNS: [table::Column; 6] = [
     col("Gateway"),
     num("Distance"),
     col("Routing Table"),
-    col("Comment"),
+    comment(),
 ];
 
 /// One row of `ip.route.list`, as the window needs it.
@@ -300,6 +300,10 @@ impl CoreRouterUi {
         );
         if let Some(key) = out.opened {
             act = Some(Act::Open(vec![key]));
+        }
+        // Double click on an inline comment: only static routes have one.
+        if let Some(key) = out.comment {
+            act = Some(Act::Comment(vec![key]));
         }
         if let Some(s) = out.shortcut {
             let sel = self.tables.routes.selection(&rows);

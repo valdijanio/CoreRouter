@@ -8,7 +8,7 @@
 use egui::{Grid, TextEdit, Ui};
 use serde_json::{Value, json};
 
-use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, num};
+use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, form_number, human_bytes, value_text};
 
 pub(crate) const TABLE: &str = "interfaces";
@@ -26,7 +26,7 @@ const COLUMNS: [table::Column; 10] = [
     num("Rx pkt"),
     num("Tx pkt"),
     col("Info"),
-    col("Comment"),
+    comment(),
 ];
 
 /// One row of `interface.list`, as the UI needs it for menus and dialogs.
@@ -275,6 +275,9 @@ impl CoreRouterUi {
         );
         if let Some(name) = out.opened {
             act = Some(Act::Open(vec![name]));
+        }
+        if let Some(name) = out.comment {
+            act = Some(Act::Comment(vec![name]));
         }
         if let Some(s) = out.shortcut {
             let sel = self.tables.interfaces.selection(&rows);
