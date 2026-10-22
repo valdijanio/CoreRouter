@@ -277,7 +277,7 @@ fn get(s: &mut Session, _: &Value) -> Result<Value> {
             "resolver".into(),
             json!(if backend.is_some() { "router" } else { "simulated" }),
         );
-        let nets = corerouter_proto_dns::server::allowed_networks(s.store().candidate());
+        let nets = s.dns_allowed_networks(s.store().candidate());
         o.insert("allowed_networks".into(), json!(nets));
         let upstream: Vec<Value> = backend
             .map(|b| b.server_stats())
