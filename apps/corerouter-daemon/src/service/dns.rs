@@ -109,7 +109,7 @@ impl RouterDns {
     /// The answer to `ask` if known, else queue it (`Pending`). `None`: no
     /// DNS server, the prober's own names apply.
     fn nowait(&self, ask: Ask) -> Option<Lookup<Answer>> {
-        if self.resolver.settings().servers.is_empty() {
+        if !self.resolver.settings().has_servers() {
             return None;
         }
         self.workers.get_or_init(|| self.spawn_workers());
@@ -346,6 +346,16 @@ impl Transport for Sockets {
             Self::udp(server, query, deadline, accept)
         }
     }
+
+    fn exchange_secure(
+        &mut self,
+        server: SocketAddr,
+        via: &corerouter_proto_dns::encrypted::SecureServer,
+        query: &[u8],
+        wait_ms: u64,
+    ) -> Result<Vec<u8>, TransportError> {
+        super::dns_secure::exchange(server, via, query, wait_ms)
+    }
 }
 
 /// Starts the resolver: registered in the session (the tools use it from
@@ -375,16 +385,16 @@ fn follow(session: &Shared, dns: &RouterDns, health: &super::Health) {
     while health.sleep(TICK) {
         health.beat();
         let settings = lock(session).dns_settings();
-        if settings.servers.is_empty() && !warned {
+        if !settings.has_servers() && !warned {
             log::info!(
                 "DNS: no server configured; names will not resolve until ip.dns.set \
                  servers=… or a DHCP client with use_peer_dns gets one"
             );
             health.event("no DNS server configured (ip.dns.set servers=… or DHCP)");
-        } else if !settings.servers.is_empty() && warned {
+        } else if settings.has_servers() && warned {
             health.event("DNS servers configured");
         }
-        warned = settings.servers.is_empty();
+        warned = !settings.has_servers();
         dns.resolver.configure(settings, dns.now_ms());
     }
 }

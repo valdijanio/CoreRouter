@@ -22,7 +22,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Static DNS Entry",
         ["IP", "DNS"],
         None,
-        "{name?: string (the name answered), regexp?: string (instead of name; regexp entries are tried first), type?: A | AAAA | CNAME | FWD | MX | NS | NXDOMAIN | SRV | TXT (default A), address?: ip (A, AAAA), cname?: name, forward_to?: [ip] (FWD: ask these servers), mx_exchange?: name, mx_preference?: int 0..65535, ns?: name, srv_target?: name, srv_port?: int 0..65535, srv_priority?: int 0..65535, srv_weight?: int 0..65535, text?: string (TXT), ttl_secs?: int (default 86400), match_subdomain?: bool (also every name under it), address_list?: name (answered addresses go into this firewall list for their TTL), disabled?: bool, comment?: string, place_before?: *hex} → {id}",
+        "{name?: string (the name answered), regexp?: string (instead of name; regexp entries are tried first), type?: A | AAAA | CNAME | FWD | MX | NS | NXDOMAIN | SRV | TXT (default A), address?: ip (A, AAAA), cname?: name, forward_to?: [ip] | forwarders group name (FWD: ask these servers, or that /ip dns forwarders group), mx_exchange?: name, mx_preference?: int 0..65535, ns?: name, srv_target?: name, srv_port?: int 0..65535, srv_priority?: int 0..65535, srv_weight?: int 0..65535, text?: string (TXT), ttl_secs?: int (default 86400), match_subdomain?: bool (also every name under it), address_list?: name (answered addresses go into this firewall list for their TTL), disabled?: bool, comment?: string, place_before?: *hex} → {id}",
         always,
         add
     ),
@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Static DNS Entry",
         [],
         None,
-        "{id: *hex, name?: string, regexp?: string, type?: A | AAAA | CNAME | FWD | MX | NS | NXDOMAIN | SRV | TXT, address?: ip, cname?: name, forward_to?: [ip], mx_exchange?: name, mx_preference?: int, ns?: name, srv_target?: name, srv_port?: int, srv_priority?: int, srv_weight?: int, text?: string, ttl_secs?: int, match_subdomain?: bool, address_list?: name, disabled?: bool, comment?: string} → {id} (\"\" clears a field)",
+        "{id: *hex, name?: string, regexp?: string, type?: A | AAAA | CNAME | FWD | MX | NS | NXDOMAIN | SRV | TXT, address?: ip, cname?: name, forward_to?: [ip] | forwarders group name, mx_exchange?: name, mx_preference?: int, ns?: name, srv_target?: name, srv_port?: int, srv_priority?: int, srv_weight?: int, text?: string, ttl_secs?: int, match_subdomain?: bool, address_list?: name, disabled?: bool, comment?: string} → {id} (\"\" clears a field)",
         has_entries,
         set
     ),
@@ -99,7 +99,13 @@ fn port(p: &Value, key: &str) -> Result<Option<u16>> {
         .transpose()
 }
 
-fn forward_to(p: &Value) -> Result<Option<Vec<IpAddr>>> {
+/// A FWD entry's target: servers, or a `/ip dns forwarders` group (G4.1d).
+enum Fwd {
+    Servers(Vec<IpAddr>),
+    Group(String),
+}
+
+fn forward_to(p: &Value) -> Result<Option<Fwd>> {
     let raw: Vec<String> = match p.get("forward_to") {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(s)) => s
@@ -118,10 +124,22 @@ fn forward_to(p: &Value) -> Result<Option<Vec<IpAddr>>> {
             .collect::<Result<_>>()?,
         Some(_) => return Err(EngineError::bad("forward_to", "must be a list of addresses")),
     };
+    if let [one] = raw.as_slice()
+        && one.parse::<IpAddr>().is_err()
+    {
+        if !corerouter_model::dns_forwarders::name_ok(one) {
+            let shown: String = one.chars().take(64).collect();
+            return Err(EngineError::bad(
+                "forward_to",
+                format!("'{shown}' is neither an IP address nor a forwarders group name"),
+            ));
+        }
+        return Ok(Some(Fwd::Group(one.clone())));
+    }
     if raw.len() > MAX_FORWARD_TO {
         return Err(EngineError::bad(
             "forward_to",
-            format!("at most {MAX_FORWARD_TO} servers (groups of forwarders: G4.1d)"),
+            format!("at most {MAX_FORWARD_TO} servers (more: a /ip dns forwarders group)"),
         ));
     }
     let mut out = Vec::new();
@@ -140,7 +158,7 @@ fn forward_to(p: &Value) -> Result<Option<Vec<IpAddr>>> {
             out.push(ip);
         }
     }
-    Ok(Some(out))
+    Ok(Some(Fwd::Servers(out)))
 }
 
 /// Applies the fields given in `p` to `e`.
@@ -171,8 +189,16 @@ fn apply(e: &mut StaticEntry, p: &Value) -> Result<()> {
     if let Some(v) = host(p, "cname")? {
         e.cname = v;
     }
-    if let Some(v) = forward_to(p)? {
-        e.forward_to = v;
+    match forward_to(p)? {
+        Some(Fwd::Servers(v)) => {
+            e.forward_to = v;
+            e.forwarder.clear();
+        }
+        Some(Fwd::Group(g)) => {
+            e.forward_to.clear();
+            e.forwarder = g;
+        }
+        None => {}
     }
     if let Some(v) = host(p, "mx_exchange")? {
         e.mx_exchange = v;
@@ -312,6 +338,10 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
             let o = v.as_object_mut()?;
             o.insert("position".into(), json!(i));
             o.insert("data".into(), json!(e.data()));
+            // RouterOS writes a group as `forward-to` too.
+            if let Some(g) = o.remove("forwarder") {
+                o.insert("forward_to".into(), json!([g]));
+            }
             o.insert("flags".into(), json!(if e.disabled { "X" } else { "" }));
             Some(v)
         })

@@ -12,6 +12,11 @@
 //! The router's own lookups (ping, NTP: [`Resolver::lookup`]) and the LAN
 //! forwarder ([`Resolver::resolve`], any record type) share the cache.
 //!
+//! G4.1d: an upstream may be encrypted (DoH, DoT: `encrypted.rs`) —
+//! `use_doh_server` for everything, or a `/ip dns forwarders` group for
+//! a static FWD entry ([`Upstreams`]). Its host name is resolved by the
+//! static entries or the plain servers (RouterOS), never by itself.
+//!
 //! No sockets here: the caller brings a [`Transport`] (UDP/TCP in the
 //! daemon, a fake in tests). The lock is held only around the cache, never
 //! across the network, so one slow lookup does not stall the others.
@@ -20,10 +25,12 @@ use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, MutexGuard};
 
+use corerouter_model::Config;
 use corerouter_model::dns::{CacheRow, Dns, ServerSelection};
 use hickory_proto::rr::RecordType;
 
 use crate::cache::{Cache, Hit};
+use crate::encrypted::SecureServer;
 use crate::message::{Answer, NameError, QName, Rcode, ReplyError, check_reply, parse_name, query};
 
 /// Moves bytes to a server and back.
@@ -43,7 +50,72 @@ pub trait Transport {
         wait_ms: u64,
         accept: &mut dyn FnMut(&[u8]) -> bool,
     ) -> Result<Vec<u8>, TransportError>;
+
+    /// Sends `query` to an encrypted server (`via`) at `server` and returns
+    /// its answer, waiting at most `wait_ms`. Only the daemon speaks TLS.
+    fn exchange_secure(
+        &mut self,
+        server: SocketAddr,
+        via: &SecureServer,
+        query: &[u8],
+        wait_ms: u64,
+    ) -> Result<Vec<u8>, TransportError> {
+        let _ = (server, via, query, wait_ms);
+        Err(TransportError::Io(
+            "DNS over TLS/HTTPS needs the router daemon".into(),
+        ))
+    }
 }
+
+/// Where a lookup goes instead of the configured servers: a static FWD
+/// entry's servers, or a `/ip dns forwarders` group.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Upstreams {
+    pub servers: Vec<IpAddr>,
+    pub secure: Vec<SecureServer>,
+}
+
+impl Upstreams {
+    pub fn plain(servers: Vec<IpAddr>) -> Self {
+        Self {
+            servers,
+            secure: Vec::new(),
+        }
+    }
+
+    /// The group `name` of `cfg` (`None`: no such group, or disabled).
+    pub fn group(cfg: &Config, name: &str) -> Option<Self> {
+        let g = cfg.ip.dns_forwarders.get(name).filter(|g| !g.disabled)?;
+        Some(Self {
+            servers: g.dns_servers.clone(),
+            secure: g
+                .doh_servers
+                .iter()
+                .filter_map(|u| SecureServer::parse(u, g.verify_doh_cert).ok())
+                .collect(),
+        })
+    }
+}
+
+/// One server to ask, as `fetch` sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Target {
+    Plain(IpAddr),
+    /// An encrypted server, at one of its addresses.
+    Secure(IpAddr, SecureServer),
+}
+
+impl Target {
+    pub fn ip(&self) -> IpAddr {
+        match self {
+            Self::Plain(ip) | Self::Secure(ip, _) => *ip,
+        }
+    }
+}
+
+/// An encrypted exchange waits at least this long: a TLS handshake is two
+/// round trips more (RouterOS `doh-timeout` 5 s).
+pub const SECURE_TIMEOUT_MS: u64 = 5000;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TransportError {
@@ -65,6 +137,10 @@ pub struct Settings {
     pub cache_bytes: usize,
     pub selection: ServerSelection,
     pub stale_secs: u32,
+    /// `use_doh_server`: asked instead of `servers` (G4.1d).
+    pub secure: Vec<SecureServer>,
+    /// Static A/AAAA names, for an encrypted server's host name.
+    pub hosts: Vec<(String, IpAddr)>,
 }
 
 impl Settings {
@@ -88,7 +164,36 @@ impl Settings {
                 .saturating_mul(1024),
             selection: dns.server_selection,
             stale_secs: dns.serve_stale_secs,
+            secure: SecureServer::parse(&dns.use_doh_server, dns.verify_doh_cert)
+                .ok()
+                .into_iter()
+                .collect(),
+            hosts: Vec::new(),
         }
+    }
+
+    /// [`Self::new`], plus the static A/AAAA names (an encrypted server's
+    /// name is looked up there first, as RouterOS advises).
+    pub fn from_config(cfg: &Config, dynamic: &[IpAddr]) -> Self {
+        use corerouter_model::dns_static::StaticType;
+        let mut s = Self::new(&cfg.ip.dns, dynamic);
+        if !s.secure.is_empty() || !cfg.ip.dns_forwarders.entries.is_empty() {
+            s.hosts = cfg
+                .ip
+                .dns_static
+                .entries
+                .iter()
+                .filter(|e| !e.disabled && e.regexp.is_empty())
+                .filter(|e| matches!(e.rtype, StaticType::A | StaticType::Aaaa))
+                .filter_map(|e| Some((e.name.to_ascii_lowercase(), e.address?)))
+                .collect();
+        }
+        s
+    }
+
+    /// Whether any server is configured (plain or encrypted).
+    pub fn has_servers(&self) -> bool {
+        !self.servers.is_empty() || !self.secure.is_empty()
     }
 }
 
@@ -255,17 +360,18 @@ impl Resolver {
         }
     }
 
-    /// One name and type: from the cache, or asked (of `forward_to` when a
-    /// static FWD entry says so, else of the configured servers) and then
-    /// cached; stale when every server failed (RFC 8767).
+    /// One name and type: from the cache, or asked (of `via` when a
+    /// static FWD entry says so, else of `use_doh_server` or the
+    /// configured servers) and then cached; stale when every server failed
+    /// (RFC 8767).
     pub fn resolve(
         &self,
         t: &mut dyn Transport,
         qn: &QName,
         rtype: RecordType,
-        forward_to: Option<&[IpAddr]>,
+        via: Option<&Upstreams>,
     ) -> Result<Resolved, ResolveError> {
-        let (settings, servers) = {
+        let (settings, plain, secure) = {
             let mut st = self.state();
             if let Some(hit) = st.cache.get(&qn.key, rtype, t.now_ms()) {
                 return Ok(Resolved {
@@ -273,13 +379,32 @@ impl Resolver {
                     source: Source::Cache,
                 });
             }
-            let servers = match forward_to {
-                Some(list) => list.to_vec(),
-                None => order(&st, t.now_ms()),
+            let now = t.now_ms();
+            let (plain, secure) = match via {
+                Some(u) => (sorted(&st, &u.servers, now), u.secure.clone()),
+                None if !st.settings.secure.is_empty() => (Vec::new(), st.settings.secure.clone()),
+                None => (order(&st, now), Vec::new()),
             };
-            (st.settings.clone(), servers)
+            (st.settings.clone(), plain, secure)
         };
+        let mut servers: Vec<Target> = plain.into_iter().map(Target::Plain).collect();
+        let mut unresolved: Vec<String> = Vec::new();
+        for s in secure {
+            match self.secure_addrs(t, &settings, &s) {
+                // Two addresses at most: a dead one, then a live one.
+                Ok(ips) => servers.extend(
+                    ips.into_iter()
+                        .take(2)
+                        .map(|ip| Target::Secure(ip, s.clone())),
+                ),
+                Err(why) => unresolved.push(why),
+            }
+        }
+        if servers.is_empty() && !unresolved.is_empty() {
+            return Err(failed(qn, &unresolved));
+        }
         let fetched = fetch(t, &settings, &servers, qn, rtype);
+        let asked: Vec<IpAddr> = servers.iter().map(Target::ip).collect();
         let mut st = self.state();
         let now = t.now_ms();
         for (ip, rtt) in &fetched.tried {
@@ -296,13 +421,16 @@ impl Resolver {
                 }
             }
         }
-        // Forget servers no longer configured (the map stays small).
-        let keep = st.settings.servers.clone();
-        st.stats
-            .retain(|ip, _| keep.contains(ip) || servers.contains(ip));
+        // Forget servers no longer configured (the map stays small); a
+        // group's servers stay while there is room.
+        if st.stats.len() > MAX_STATS {
+            let keep = st.settings.servers.clone();
+            st.stats
+                .retain(|ip, _| keep.contains(ip) || asked.contains(ip));
+        }
         match fetched.result {
             Ok((answer, server, wire)) => {
-                if forward_to.is_none() {
+                if via.is_none() && settings.secure.is_empty() {
                     st.preferred = Some(server);
                 }
                 st.cache.put(
@@ -331,6 +459,52 @@ impl Resolver {
 }
 
 impl Resolver {
+    /// The addresses of an encrypted server: its literal, a static entry,
+    /// or asked of the plain servers (never of itself: RouterOS).
+    fn secure_addrs(
+        &self,
+        t: &mut dyn Transport,
+        settings: &Settings,
+        s: &SecureServer,
+    ) -> Result<Vec<IpAddr>, String> {
+        if let Some(ip) = s.ip() {
+            return Ok(vec![ip]);
+        }
+        let pinned: Vec<IpAddr> = settings
+            .hosts
+            .iter()
+            .filter(|(n, _)| *n == s.host)
+            .map(|(_, ip)| *ip)
+            .collect();
+        if !pinned.is_empty() {
+            return Ok(pinned);
+        }
+        let why = |e: String| format!("{}: cannot resolve {}: {e}", s.url(), s.host);
+        if settings.servers.is_empty() {
+            return Err(why(
+                "add a static entry for it, or a plain server in ip.dns servers".into(),
+            ));
+        }
+        let qn = parse_name(&s.host).map_err(|e| why(e.to_string()))?;
+        let plain = Upstreams::plain(settings.servers.clone());
+        let mut out = Vec::new();
+        for rtype in [RecordType::A, RecordType::AAAA] {
+            match self.resolve(t, &qn, rtype, Some(&plain)) {
+                Ok(r) if r.answer.rcode == Rcode::NxDomain => break,
+                Ok(r) => out.extend(r.answer.addresses()),
+                Err(e) => return Err(why(e.to_string())),
+            }
+            if !out.is_empty() {
+                break;
+            }
+        }
+        if out.is_empty() {
+            Err(why("no address".into()))
+        } else {
+            Ok(out)
+        }
+    }
+
     /// PTR names or TXT texts (`rtype`) of `name`, from the cache or
     /// asked; a name that does not exist, or has none, gives no records
     /// (G6.3b).
@@ -377,6 +551,25 @@ fn special_use(qn: &QName) -> Option<Result<Vec<IpAddr>, ResolveError>> {
     None
 }
 
+/// Server stats kept at most beyond the configured servers.
+const MAX_STATS: usize = 64;
+
+/// `list` (a group's servers) by the same rule as `order`, without the
+/// preferred server.
+fn sorted(st: &State, list: &[IpAddr], now_ms: u64) -> Vec<IpAddr> {
+    let mut out = list.to_vec();
+    if st.settings.selection == ServerSelection::Fastest {
+        out.sort_by_key(|ip| {
+            let s = st.stats.get(ip).copied().unwrap_or_default();
+            (
+                s.down_until_ms > now_ms,
+                s.srtt_ms.unwrap_or(UNKNOWN_RTT_MS),
+            )
+        });
+    }
+    out
+}
+
 /// Servers in asking order.
 fn order(st: &State, now_ms: u64) -> Vec<IpAddr> {
     let servers = &st.settings.servers;
@@ -417,7 +610,7 @@ pub struct Fetched {
 pub fn fetch(
     t: &mut dyn Transport,
     settings: &Settings,
-    servers: &[IpAddr],
+    servers: &[Target],
     qn: &QName,
     rtype: RecordType,
 ) -> Fetched {
@@ -432,7 +625,32 @@ pub fn fetch(
         .now_ms()
         .saturating_add(u64::from(settings.total_timeout_ms));
     let mut errors: Vec<String> = Vec::new();
-    for ip in servers {
+    for target in servers {
+        let ip = &target.ip();
+        if let Target::Secure(_, via) = target {
+            let left = deadline.saturating_sub(t.now_ms());
+            if left == 0 {
+                errors.push("query_total_timeout reached".into());
+                break;
+            }
+            let wait = left.min(u64::from(settings.server_timeout_ms).max(SECURE_TIMEOUT_MS));
+            let started = t.now_ms();
+            let server = SocketAddr::new(*ip, via.port);
+            match ask_secure(t, server, via, settings.udp_payload, qn, rtype, wait) {
+                Ok((answer, wire)) => {
+                    tried.push((*ip, Some(t.now_ms().saturating_sub(started))));
+                    return Fetched {
+                        result: Ok((answer, *ip, wire)),
+                        tried,
+                    };
+                }
+                Err(e) => {
+                    tried.push((*ip, None));
+                    errors.push(format!("{} ({ip}): {e}", via.url()));
+                    continue;
+                }
+            }
+        }
         let server = SocketAddr::new(*ip, settings.port);
         let mut tcp = false;
         let started = t.now_ms();
@@ -492,6 +710,26 @@ enum Ask {
     Transport(TransportError),
     #[error("{0}")]
     Reply(ReplyError),
+}
+
+/// One query to an encrypted server: id 0 and padded (RFC 8484 §4.1,
+/// RFC 8467 §4.1); no truncation to retry, it is a stream.
+fn ask_secure(
+    t: &mut dyn Transport,
+    server: SocketAddr,
+    via: &SecureServer,
+    payload: u16,
+    qn: &QName,
+    rtype: RecordType,
+    wait: u64,
+) -> Result<(Answer, usize), Ask> {
+    let bytes = crate::encrypted::query(&qn.name, rtype, payload)
+        .map_err(|e| Ask::Transport(TransportError::Io(e)))?;
+    let reply = t
+        .exchange_secure(server, via, &bytes, wait)
+        .map_err(Ask::Transport)?;
+    let m = check_reply(0, &qn.name, rtype, &reply).map_err(Ask::Reply)?;
+    Ok((Answer::from_reply(&qn.name, rtype, &m), reply.len()))
 }
 
 fn ask(
@@ -559,6 +797,26 @@ mod tests {
     }
 
     impl Transport for Fake {
+        /// An encrypted server answers like a plain one at the same
+        /// address; the log says which way it was asked (`true`).
+        fn exchange_secure(
+            &mut self,
+            server: SocketAddr,
+            via: &SecureServer,
+            query: &[u8],
+            wait_ms: u64,
+        ) -> Result<Vec<u8>, TransportError> {
+            let m = Message::from_vec(query).unwrap();
+            assert_eq!(m.metadata.id, 0, "RFC 8484 §4.1");
+            assert_eq!(query.len() % crate::encrypted::PAD_BLOCK, 0, "RFC 8467");
+            assert_eq!(server.port(), via.port);
+            let out = self.exchange(server, query, true, wait_ms, &mut |_| true);
+            if let Some(last) = self.log.last_mut() {
+                last.1 = true;
+            }
+            out
+        }
+
         fn now_ms(&self) -> u64 {
             self.now
         }
@@ -887,7 +1145,12 @@ mod tests {
         ]);
         let qn = parse_name("corp.example").unwrap();
         let got = r
-            .resolve(&mut t, &qn, RecordType::A, Some(&[ip("192.0.2.9")]))
+            .resolve(
+                &mut t,
+                &qn,
+                RecordType::A,
+                Some(&Upstreams::plain(vec![ip("192.0.2.9")])),
+            )
             .unwrap();
         assert_eq!(got.source, Source::Server(ip("192.0.2.9")));
         assert_eq!(got.answer.addresses(), vec![ip("198.51.100.9")]);
@@ -897,5 +1160,135 @@ mod tests {
             r.lookup(&mut t, "corp.example").unwrap()[0],
             ip("198.51.100.9")
         );
+    }
+
+    fn doh(dns: Dns, hosts: &[(&str, &str)]) -> Resolver {
+        let mut st = Settings::new(&dns, &[]);
+        st.hosts = hosts
+            .iter()
+            .map(|(n, a)| ((*n).to_owned(), ip(a)))
+            .collect();
+        Resolver::new(st)
+    }
+
+    #[test]
+    fn use_doh_server_replaces_the_servers() {
+        // An address literal: asked directly, plain servers never.
+        let r = doh(
+            Dns {
+                servers: vec![ip("192.0.2.1")],
+                use_doh_server: "https://192.0.2.53/dns-query".into(),
+                ..Dns::default()
+            },
+            &[],
+        );
+        let mut t = Fake::new(&[
+            ("192.0.2.1", Behave::Answer([198, 51, 100, 1])),
+            ("192.0.2.53", Behave::Answer([198, 51, 100, 53])),
+        ]);
+        assert_eq!(
+            r.lookup(&mut t, "www.example").unwrap()[0],
+            ip("198.51.100.53")
+        );
+        assert!(
+            t.log
+                .iter()
+                .all(|(a, secure)| *a == ip("192.0.2.53") && *secure),
+            "{:?}",
+            t.log
+        );
+
+        // A name: the plain servers resolve it (and only it).
+        let r = doh(
+            Dns {
+                servers: vec![ip("192.0.2.1")],
+                use_doh_server: "tls://dns.example#dns.example".into(),
+                ..Dns::default()
+            },
+            &[],
+        );
+        let mut t = Fake::new(&[
+            ("192.0.2.1", Behave::Answer([192, 0, 2, 77])),
+            ("192.0.2.77", Behave::Answer([198, 51, 100, 7])),
+        ]);
+        let qn = parse_name("www.example").unwrap();
+        let got = r.resolve(&mut t, &qn, RecordType::A, None).unwrap();
+        assert_eq!(got.source, Source::Server(ip("192.0.2.77")));
+        assert_eq!(
+            t.log,
+            vec![(ip("192.0.2.1"), false), (ip("192.0.2.77"), true)]
+        );
+
+        // A static entry pins the name; with no plain server and no
+        // entry, the error says what to do.
+        let r = doh(
+            Dns {
+                use_doh_server: "https://dns.example/q".into(),
+                ..Dns::default()
+            },
+            &[("dns.example", "192.0.2.78")],
+        );
+        let mut t = Fake::new(&[("192.0.2.78", Behave::Answer([198, 51, 100, 8]))]);
+        assert_eq!(
+            r.lookup(&mut t, "a.example").unwrap()[0],
+            ip("198.51.100.8")
+        );
+        let r = doh(
+            Dns {
+                use_doh_server: "https://dns.example/q".into(),
+                ..Dns::default()
+            },
+            &[],
+        );
+        let err = r.lookup(&mut t, "b.example").unwrap_err().to_string();
+        assert!(err.contains("add a static entry"), "{err}");
+    }
+
+    #[test]
+    fn a_group_mixes_plain_and_encrypted_and_fails_over() {
+        let r = resolver(&["192.0.2.1"]);
+        let mut t = Fake::new(&[
+            ("192.0.2.1", Behave::Answer([198, 51, 100, 1])),
+            ("192.0.2.60", Behave::ServFail),
+            ("192.0.2.61", Behave::Answer([198, 51, 100, 61])),
+        ]);
+        let group = Upstreams {
+            servers: vec![ip("192.0.2.60")],
+            secure: vec![SecureServer::parse("tls://192.0.2.61", true).unwrap()],
+        };
+        let qn = parse_name("corp.example").unwrap();
+        let got = r.resolve(&mut t, &qn, RecordType::A, Some(&group)).unwrap();
+        assert_eq!(got.source, Source::Server(ip("192.0.2.61")));
+        assert_eq!(
+            t.log,
+            vec![(ip("192.0.2.60"), false), (ip("192.0.2.61"), true)]
+        );
+        // Without the daemon (the default transport method): a clear error.
+        struct Plain;
+        impl Transport for Plain {
+            fn now_ms(&self) -> u64 {
+                0
+            }
+            fn exchange(
+                &mut self,
+                _: SocketAddr,
+                _: &[u8],
+                _: bool,
+                _: u64,
+                _: &mut dyn FnMut(&[u8]) -> bool,
+            ) -> Result<Vec<u8>, TransportError> {
+                Err(TransportError::Timeout)
+            }
+        }
+        let only = Upstreams {
+            servers: Vec::new(),
+            secure: group.secure.clone(),
+        };
+        let qn = parse_name("other.example").unwrap();
+        let err = r
+            .resolve(&mut Plain, &qn, RecordType::A, Some(&only))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("router daemon"), "{err}");
     }
 }
