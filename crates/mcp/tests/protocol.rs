@@ -70,8 +70,54 @@ fn tool_errors_are_readable_text() {
 #[test]
 fn parse_error_and_batch() {
     let out = run_raw("{not json\n[{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"ping\"}]\n");
+    assert_eq!(out.len(), 2);
     assert_eq!(out[0]["error"]["code"], -32700);
-    assert_eq!(out[1][0]["id"], 7);
+    // MCP 2025-06-18 removed batching: one error object, id null (JSON-RPC 2.0 §6).
+    assert_eq!(out[1]["error"]["code"], -32600);
+    assert_eq!(out[1]["id"], Value::Null);
+    assert!(
+        out[1]["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("batches are not supported")
+    );
+}
+
+fn add_address(id: u64) -> Value {
+    call(
+        id,
+        "tools/call",
+        json!({"name": "run_command", "arguments": {"command": "ip.address.add",
+            "params": {"address": "10.9.9.1/24", "interface": "ether1"}}}),
+    )
+}
+
+fn address_count(out: &Value) -> usize {
+    let text = out["result"]["content"][0]["text"].as_str().unwrap();
+    text.matches("10.9.9.1/24").count()
+}
+
+#[test]
+fn batch_items_never_run_and_the_server_keeps_serving() {
+    let list = || {
+        call(
+            9,
+            "tools/call",
+            json!({"name": "run_command", "arguments": {"command": "ip.address.list"}}),
+        )
+    };
+    let empty = Value::Array(vec![]);
+    let batch = Value::Array(vec![add_address(1), call(2, "ping", json!({}))]);
+    let out = run(&[empty, batch, list(), add_address(3), list()]);
+    assert_eq!(out.len(), 5, "{out:?}");
+    for reply in &out[..2] {
+        assert!(reply.is_object(), "{reply}");
+        assert_eq!(reply["error"]["code"], -32600, "{reply}");
+        assert_eq!(reply["id"], Value::Null);
+    }
+    assert_eq!(address_count(&out[2]), 0, "a batch item ran: {}", out[2]);
+    assert_eq!(out[3]["result"]["isError"], false, "{}", out[3]);
+    assert_eq!(address_count(&out[4]), 1, "{}", out[4]);
 }
 
 proptest! {
@@ -79,8 +125,18 @@ proptest! {
     fn hostile_lines_never_break_the_server(lines in proptest::collection::vec(".{0,200}", 0..8)) {
         let input: String = lines.iter().map(|l| format!("{l}\n")).collect();
         for reply in run_raw(&input) {
-            prop_assert!(reply.is_object() || reply.is_array());
+            prop_assert!(reply.is_object());
         }
+    }
+
+    /// Any array, however its items look, gets exactly one -32600 object.
+    #[test]
+    fn every_batch_is_refused_with_one_object(ids in proptest::collection::vec(0u64..1000, 0..80)) {
+        let batch = Value::Array(ids.iter().map(|&id| add_address(id)).collect());
+        let out = run(&[batch]);
+        prop_assert_eq!(out.len(), 1);
+        prop_assert_eq!(&out[0]["error"]["code"], &json!(-32600));
+        prop_assert_eq!(&out[0]["id"], &Value::Null);
     }
 }
 

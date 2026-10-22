@@ -41,7 +41,12 @@ claude mcp add corerouter -- corerouter-cli mcp
 Erros de tool voltam como texto com `isError: true` ("unknown parameter 'adress'; did you mean
 'address'?"), nunca como erro de protocolo — o agente lê e corrige.
 
-Limites: linha de até 16 MiB, lote JSON-RPC de até 64 mensagens, `command_batch` até 256 passos.
+Limites: linha de até 16 MiB, `command_batch` até 256 passos.
+
+Lote JSON-RPC (um array na linha) é recusado (G0.5c): a revisão MCP 2025-06-18, a única que o
+servidor negocia, removeu o batching. A resposta é **um** objeto `-32600` com `id: null` e nenhum
+item do array roda (nada aplica pela metade). Para várias mudanças de uma vez, use a tool
+`command_batch`, que é atômica.
 
 ## Resources (G0.7)
 
