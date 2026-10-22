@@ -10,6 +10,7 @@ use crate::{CoreRouterUi, err_color, value_text};
 pub enum Win {
     Interfaces,
     Addresses,
+    Neighbors,
     Routes,
     Vrf,
     Firewall,
@@ -31,6 +32,7 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
         "IP",
         &[
             Win::Addresses,
+            Win::Neighbors,
             Win::Routes,
             Win::Vrf,
             Win::Firewall,
@@ -49,6 +51,7 @@ impl Win {
     pub const ALL: &'static [Win] = &[
         Win::Interfaces,
         Win::Addresses,
+        Win::Neighbors,
         Win::Routes,
         Win::Vrf,
         Win::Firewall,
@@ -67,6 +70,7 @@ impl Win {
         match self {
             Win::Interfaces => "Interfaces",
             Win::Addresses => "Addresses",
+            Win::Neighbors => "Neighbors",
             Win::Routes => "Routes",
             Win::Vrf => "VRF",
             Win::Firewall => "Firewall",
@@ -98,6 +102,7 @@ impl Win {
     pub(crate) fn default_size(self) -> [f32; 2] {
         match self {
             Win::Interfaces => [780.0, 520.0],
+            Win::Neighbors => [820.0, 320.0],
             Win::Addresses | Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
             Win::Vrf => [600.0, 260.0],
@@ -116,6 +121,7 @@ impl CoreRouterUi {
         match win {
             Win::Interfaces => self.interfaces(ui),
             Win::Addresses => self.addresses(ui),
+            Win::Neighbors => self.neighbors(ui),
             Win::Routes => self.routes(ui),
             Win::Vrf => self.vrfs(ui),
             Win::Bgp => self.bgp(ui),

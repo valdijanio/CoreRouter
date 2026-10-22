@@ -1,0 +1,26 @@
+[package]
+name = "corerouter-discovery"
+description = "L4: CRDP runtime — UDP sockets and threads (std) that announce, listen and feed the neighbor table"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+corerouter-engine.workspace = true
+corerouter-proto-discovery.workspace = true
+ipnet.workspace = true
+log.workspace = true
+# Safe wrapper for what std's UdpSocket lacks: SO_REUSEADDR/SO_REUSEPORT
+# (daemon, GUI and other daemons on one host share the CRDP port),
+# IPV6_V6ONLY and the IPv6 multicast interface.
+socket2 = { version = "0.6.5", features = ["all"] }
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

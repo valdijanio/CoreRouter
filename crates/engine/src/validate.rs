@@ -16,6 +16,7 @@ pub fn validate_all(cfg: &Config) -> Vec<Issue> {
     out.extend(corerouter_proto_cgnat::validate(cfg));
     out.extend(corerouter_proto_dns::validate(cfg));
     out.extend(corerouter_proto_dhcp::validate(cfg));
+    out.extend(corerouter_proto_discovery::validate(cfg));
     out
 }
 
