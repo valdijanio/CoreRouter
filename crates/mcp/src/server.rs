@@ -3,7 +3,7 @@ use std::io::{self, BufRead, Write};
 use corerouter_control::wire::{Line, MAX_REQUEST_LINE, read_line_bounded};
 use serde_json::{Value, json};
 
-use crate::{Backend, tools};
+use crate::{Backend, prompts, resources, tools};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 pub const MAX_BATCH: usize = 64;
@@ -15,7 +15,9 @@ run_command, or several at once with command_batch (atomic by default). Check th
 with inspect_state (pass `path` to read one subtree). Commit mode: `immediate` applies each \
 change at once; switch to `transactional` (config.mode.set) for multi-step changes, review \
 config.diff, then config.commit; config.rollback {revision} restores history. Errors are \
-plain text that says what to fix. With the GUI attached, ui_screenshot shows the screen.";
+plain text that says what to fix. Resources: corerouter://state, corerouter://diff, \
+corerouter://command/{id}, corerouter://state/{path}; prompts: configure_address, \
+review_and_commit, diagnose_connectivity. With the GUI attached, ui_screenshot shows the screen.";
 
 /// Serve until EOF on `input`.
 pub fn serve<R: BufRead, W: Write>(
@@ -80,13 +82,36 @@ pub fn handle_message(backend: &mut dyn Backend, msg: &Value) -> Option<Value> {
     let result = match method {
         "initialize" => json!({
             "protocolVersion": PROTOCOL_VERSION,
-            "capabilities": {"tools": {"listChanged": false}},
+            "capabilities": {
+                "tools": {"listChanged": false},
+                "resources": {"subscribe": false, "listChanged": false},
+                "prompts": {"listChanged": false},
+                "completions": {},
+            },
             "serverInfo": {"name": "corerouter", "version": env!("CARGO_PKG_VERSION")},
             "instructions": format!("{INSTRUCTIONS} Active backend: {}.", backend.describe()),
         }),
         "ping" => json!({}),
         "tools/list" => json!({"tools": tools::definitions()}),
         "tools/call" => tools::call(backend, &params),
+        "resources/list" => resources::list(),
+        "resources/templates/list" => resources::templates(),
+        "resources/read" => match resources::read(backend, &params) {
+            Ok(r) => r,
+            Err(e) => {
+                return Some(json!({"jsonrpc": "2.0", "id": id, "error": {
+                    "code": e.code, "message": e.message, "data": {"uri": e.uri}}}));
+            }
+        },
+        "prompts/list" => prompts::list(),
+        "prompts/get" => match prompts::get(backend, &params) {
+            Ok(r) => r,
+            Err(e) => return Some(error(id, -32602, &e)),
+        },
+        "completion/complete" => match prompts::complete(backend, &params) {
+            Ok(r) => r,
+            Err(e) => return Some(error(id, -32602, &e)),
+        },
         other => {
             let name: String = other.chars().take(64).collect();
             return Some(error(id, -32601, &format!("method not found: {name}")));
