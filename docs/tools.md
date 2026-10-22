@@ -14,7 +14,7 @@ bandwidth-test entram nele depois).
 | `tool.ping.start {…}` | inicia um ping → `{id, task_id, targets, columns}` |
 | `tool.ping.mtu {…}` | inicia uma descoberta de MTU → `{id, task_id, columns}` |
 | `tool.mtr.start {…}` | inicia um MTR → `{id, task_id, columns}` |
-| `tool.task.poll {id, after_seq?, max?}` | eventos com `seq > after_seq` (até 256), o resumo e o estado |
+| `tool.task.poll {id, after_seq?, max?, text?}` | eventos com `seq > after_seq` (até 256), o resumo e o estado; com `text: true`, também `header`, `lines` e (ao terminar) `summary_lines` no formato do RouterOS |
 | `tool.task.stop {id}` | pede a parada (a tarefa termina em ≤ ~100 ms) |
 | `tool.task.list {}` | tarefas guardadas: id, tipo, título, estado, motivo, dono, idade |
 
@@ -196,9 +196,13 @@ A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
   tabela; Start (Enter) / Stop (Esc); tabela por salto ao vivo (Hop, Host, Loss %, Sent,
   Last, Avg, Best, Worst, StDev) com a perda colorida e uma barra da média relativa ao salto
   mais lento.
-- **Terminal** (G0.8) — `ping 8.8.8.8 count=4` de qualquer menu, ou `/tool ping start
-  address=… count=…`, `/tool ping mtu 198.51.100.3`; Ctrl+C para (pelo `tool.task.stop`) e
-  mostra o resumo. `mtr 8.8.8.8 count=10` idem.
+- **Terminal** (G0.8 + G6.5) — como no RouterOS: `ping 8.8.8.8`, `/ping 8.8.8.8`,
+  `/tool ping 8.8.8.8 count=5 size=1400`, `/tool ping address=…`; `traceroute 8.8.8.8`,
+  `/tool traceroute …` ou `mtr …` para o MTR; `/tool ping mtu 198.51.100.3`. Sem `count` roda
+  até Ctrl+C (que chama `tool.task.stop` e mostra o resumo). Linha a linha `SEQ HOST SIZE TTL
+  TIME STATUS` e no fim `sent=… received=… packet-loss=…% min-rtt=… avg-rtt=… max-rtt=…` — o
+  engine renderiza (`tool.task.poll {text: true}` → `header`, `lines`, `summary_lines`) e o
+  terminal só imprime.
 - **CLI** — `corerouter-cli [--connect HOST:PORT] watch tool.ping.start
   '{"address":"8.8.8.8,1.1.1.1","count":4}'` imprime as linhas no formato do RouterOS
   (`engine::tools::text`) e o resumo por destino; `watch tool.mtr.start '{"address":"…"}'`
@@ -213,3 +217,4 @@ A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
 
 - 2026-10-22 — versão inicial (G6.1 tarefas, G6.2 ping, vários destinos, MTU).
 - 2026-10-22 — G6.3 (MTR).
+- 2026-10-22 — G6.5: formas do RouterOS no terminal, `text` no `tool.task.poll`.

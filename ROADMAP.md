@@ -416,6 +416,13 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   jitter cresce com o salto (o MTR do lab mostra onde a perda começa). Esforço do agente ~1,5 h
   (**estimado**).
 
+- 2026-10-22 — G6.5: ferramentas no terminal como no RouterOS. `ping 8.8.8.8`, `/ping`,
+  `/tool ping 8.8.8.8 count=5 size=1400`, `/tool ping address=…`, `traceroute`/`mtr`.
+  Genérico, sem o shell conhecer o ping: `alias` aceita vários nomes (`"traceroute,mtr"`), um
+  menu com o nome de um alias roda o comando dele quando o que vem depois não é nome do menu,
+  e `tool.task.poll {text: true}` devolve `header`/`lines`/`summary_lines` renderizados pelo
+  engine (`tools::text`). Esforço do agente ~1 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -442,3 +449,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G0.3.
 - 2026-10-22 — log do G6.1 + G6.2.
 - 2026-10-22 — log do G6.3.
+- 2026-10-22 — log do G6.5.
