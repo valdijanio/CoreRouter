@@ -644,3 +644,5 @@ continuação indentadas).
 - 2026-10-22 — G9.1: Bateria da fila de entrada: feature sintética 01 (`bench.f01.get`).
 
 - 2026-10-22 — G9.2: Bateria da fila de entrada: feature sintética 02 (`bench.f02.get`).
+
+- 2026-10-22 — G9.3: Bateria da fila de entrada: feature sintética 03 (`bench.f03.get`).
