@@ -55,11 +55,11 @@ use std::time::{Duration, Instant};
 
 use corerouter_control::{
     DEFAULT_PORT, SharedHost, Shutdown, WsPolicy, bind_loopback, serve_until, spawn_clock,
-    spawn_ws_until,
+    spawn_ws_until, thread_runner,
 };
 use corerouter_discovery::{Agent, AgentConfig, Transport, enable_lab_default};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, lock, shared};
-use corerouter_hal::{Hal, VirtualHal};
+use corerouter_hal::{Hal, Prober, VirtualHal};
 use corerouter_storage_fs::FileStorage;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,6 +71,7 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                          [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
                          [--discovery-port <port> | --no-discovery]
                          [--discovery-transport interfaces|loopback]
+                         [--lab-ping auto|host|sim]
 
   --ws <port>           WebSocket for the web GUI on 127.0.0.1:<port>
   --ws-origin <origin>  also allow pages from <origin> (e.g. http://127.0.0.1:8080 for
@@ -82,7 +83,11 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                         backend LLDP and MNDP)
   --discovery-transport where CRDP announces: `interfaces` (host interfaces named like the
                         router's; default of --backend linux) or `loopback` (this host
-                        only, labs see each other; default of --backend virtual)";
+                        only, labs see each other; default of --backend virtual)
+  --lab-ping <how>      what Tools > Ping/MTR reach in the virtual lab: `host` (this
+                        host's ICMP: needs ping_group_range or CAP_NET_RAW), `sim`
+                        (the simulated network of docs/tools.md) or `auto` (host when
+                        allowed, else sim; the default)";
 
 /// Longest wait for the discovery goodbyes when shutting down.
 const GOODBYE_WAIT: Duration = Duration::from_secs(1);
@@ -106,6 +111,8 @@ struct Args {
     discovery_port: Option<u16>,
     /// `None`: chosen by the backend.
     discovery_transport: Option<Transport>,
+    /// Virtual lab tools: `auto`, `host` or `sim`.
+    lab_ping: String,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -118,6 +125,7 @@ fn parse_args() -> Result<Args, String> {
         web_root: None,
         discovery_port: Some(corerouter_discovery::PORT),
         discovery_transport: None,
+        lab_ping: "auto".into(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -166,6 +174,16 @@ fn parse_args() -> Result<Args, String> {
                     }
                 });
             }
+            "--lab-ping" => {
+                let v = args.next().ok_or("--lab-ping needs auto, host or sim")?;
+                if !matches!(v.as_str(), "auto" | "host" | "sim") {
+                    return Err(format!(
+                        "bad --lab-ping '{}' (auto | host | sim)",
+                        v.chars().take(32).collect::<String>()
+                    ));
+                }
+                out.lab_ping = v;
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
@@ -212,9 +230,33 @@ fn websocket(args: &Args, host: SharedHost, shutdown: &Shutdown) -> Result<(), S
         .map_err(|e| format!("cannot start the WebSocket thread: {e}"))
 }
 
-fn backend(name: &str) -> Result<Box<dyn Hal>, String> {
+/// The lab's diagnostic tools: this host's ICMP or the simulated network.
+fn lab_tools(lab: VirtualHal, how: &str) -> Result<VirtualHal, String> {
+    #[cfg(target_os = "linux")]
+    let host = corerouter_hal_linux::icmp::HostProber::detect();
+    #[cfg(not(target_os = "linux"))]
+    let host: Result<corerouter_hal::SimProber, String> =
+        Err("host ICMP is only implemented on Linux".into());
+    match (how, host) {
+        ("sim", _) => Ok(lab),
+        (_, Ok(p)) => {
+            log::info!(
+                "virtual lab tools use this host's network: {}",
+                p.describe()
+            );
+            Ok(lab.with_prober(Arc::new(p)))
+        }
+        ("host", Err(e)) => Err(format!("--lab-ping host: {e}")),
+        (_, Err(e)) => {
+            log::info!("virtual lab tools use the simulated network ({e})");
+            Ok(lab)
+        }
+    }
+}
+
+fn backend(name: &str, lab_ping: &str) -> Result<Box<dyn Hal>, String> {
     match name {
-        "virtual" => Ok(Box::new(VirtualHal::default())),
+        "virtual" => Ok(Box::new(lab_tools(VirtualHal::default(), lab_ping)?)),
         #[cfg(target_os = "linux")]
         "linux" => Ok(Box::new(corerouter_hal_linux::LinuxHal::new())),
         #[cfg(not(target_os = "linux"))]
@@ -399,7 +441,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let hal = match backend(&args.backend) {
+    let hal = match backend(&args.backend, &args.lab_ping) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("{e}");
@@ -414,7 +456,9 @@ fn main() -> ExitCode {
         }
     };
     let storage_name = storage.describe();
-    let session = shared(Session::with_storage(hal, storage));
+    let mut session = Session::with_storage(hal, storage);
+    session.set_runner(thread_runner());
+    let session = shared(session);
     if let Err(e) = spawn_clock(session.clone()) {
         eprintln!("cannot start the clock thread: {e}");
         return ExitCode::FAILURE;

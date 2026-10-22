@@ -27,11 +27,18 @@ base64.workspace = true
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3.106"
 web-sys = { version = "0.3.106", features = [
+    "Blob",
+    "BlobPropertyBag",
     "CloseEvent",
+    "Document",
+    "Element",
+    "HtmlAnchorElement",
+    "HtmlElement",
     "Event",
     "Location",
     "MessageEvent",
     "Storage",
+    "Url",
     "UrlSearchParams",
     "WebSocket",
     "Window",

@@ -10,6 +10,7 @@ repository.workspace = true
 
 [dependencies]
 corerouter-model.workspace = true
+ipnet.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

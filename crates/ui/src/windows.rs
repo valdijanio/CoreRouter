@@ -22,6 +22,7 @@ pub enum Win {
     Cgnat,
     Identity,
     History,
+    Ping,
     Log,
 }
 
@@ -44,6 +45,7 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("MPLS", &[Win::Mpls]),
     ("CGNAT", &[Win::Cgnat]),
     ("System", &[Win::Identity, Win::History]),
+    ("Tools", &[Win::Ping]),
     ("Log", &[Win::Log]),
 ];
 
@@ -63,6 +65,7 @@ impl Win {
         Win::Cgnat,
         Win::Identity,
         Win::History,
+        Win::Ping,
         Win::Log,
     ];
 
@@ -82,6 +85,7 @@ impl Win {
             Win::Cgnat => "CGNAT",
             Win::Identity => "Identity",
             Win::History => "History",
+            Win::Ping => "Ping",
             Win::Log => "Log",
         }
     }
@@ -120,6 +124,7 @@ impl Win {
             Win::Addresses | Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
             Win::Vrf => [600.0, 260.0],
+            Win::Ping => [900.0, 700.0],
             _ => [380.0, 200.0],
         }
     }
@@ -142,6 +147,7 @@ impl CoreRouterUi {
             Win::Identity => self.identity(ui),
             Win::History => self.history(ui),
             Win::Log => self.log_window(ui),
+            Win::Ping => self.ping_window(ui),
             _ => {}
         }
     }

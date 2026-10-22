@@ -12,6 +12,7 @@ mod dialog;
 mod float;
 mod interfaces;
 mod neighbors;
+mod ping;
 mod prefs;
 mod routes;
 mod table;
@@ -138,7 +139,21 @@ impl Tables {
 /// What a reply is for.
 enum Pending {
     Query(Field),
-    Action { command: String, then: Then },
+    Action {
+        command: String,
+        then: Then,
+    },
+    /// A tool task poll (not logged: the UI asks it, not the operator).
+    Tool(ping::ToolReq),
+}
+
+/// A file the UI wants saved (CSV export): the app writes it (native) or
+/// offers it as a download (web). See [`CoreRouterUi::take_exports`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Export {
+    pub file_name: String,
+    pub mime: &'static str,
+    pub bytes: Vec<u8>,
 }
 
 /// What to do when an action's reply arrives.
@@ -146,9 +161,20 @@ pub(crate) enum Then {
     Nothing,
     ClearAddressForm,
     ShowFrr,
-    Dialog { id: u64, effect: interfaces::Effect },
-    Route { id: u64, effect: routes::Effect },
-    Vrf { id: u64, effect: vrf::Effect },
+    Dialog {
+        id: u64,
+        effect: interfaces::Effect,
+    },
+    Route {
+        id: u64,
+        effect: routes::Effect,
+    },
+    Vrf {
+        id: u64,
+        effect: vrf::Effect,
+    },
+    /// A tool task started (Tools › Ping).
+    Tool(ping::ToolReq),
 }
 
 pub struct CoreRouterUi {
@@ -182,6 +208,10 @@ pub struct CoreRouterUi {
     /// What the router can run now (rebuilt when `engine.list`,
     /// `server.info` or the link change); every action asks it.
     can: Arc<avail::Avail>,
+    /// Tools › Ping: form, followed tasks and their data (UI-local).
+    ping: ping::PingWin,
+    /// Files waiting for the app to save.
+    exports: Vec<Export>,
 }
 
 impl CoreRouterUi {
@@ -219,6 +249,8 @@ impl CoreRouterUi {
             vrf_dialogs: Vec::new(),
             open_vrf_after: Vec::new(),
             can,
+            ping: ping::PingWin::default(),
+            exports: Vec::new(),
         }
     }
 
@@ -232,6 +264,20 @@ impl CoreRouterUi {
 
     pub fn log(&self) -> &[LogLine] {
         &self.log
+    }
+
+    /// Files the UI asked to save since the last call (CSV exports).
+    pub fn take_exports(&mut self) -> Vec<Export> {
+        std::mem::take(&mut self.exports)
+    }
+
+    /// Log a line from the app (where an export was saved, or why not).
+    pub fn note(&mut self, ok: bool, command: &str, message: String) {
+        self.push_log(LogLine {
+            ok,
+            command: command.to_owned(),
+            message,
+        });
     }
 
     pub fn link(&self) -> &Link {
@@ -321,6 +367,7 @@ impl CoreRouterUi {
         match self.pending.remove(&id) {
             None => {}
             Some(Pending::Query(field)) => self.on_query(field, id, result),
+            Some(Pending::Tool(req)) => self.tool_reply(req, result),
             Some(Pending::Action { command, then }) => {
                 let message = match &result {
                     Ok(v) => v.to_string(),
@@ -421,6 +468,7 @@ impl CoreRouterUi {
             Then::Dialog { id, effect } => self.dialog_reply(id, effect, result),
             Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
             Then::Vrf { id, effect } => self.vrf_dialog_reply(id, effect, result),
+            Then::Tool(req) => self.tool_started(req, result),
         }
     }
 
@@ -547,6 +595,7 @@ impl CoreRouterUi {
         self.floats.begin_frame(ui.ctx());
         self.pump();
         self.refresh(now);
+        self.tools_tick(ui.ctx(), now);
         self.pump();
         let wake = if self.pending.is_empty() {
             Duration::from_secs_f64(REFRESH_SECS)
@@ -603,9 +652,20 @@ impl CoreRouterUi {
             {
                 open = self.escape(*win);
             }
+            if *win == Win::Ping {
+                // Enter starts, Esc stops a running ping, else closes.
+                match floats.keys(&ctx, win_id(*win), float::Takes::Dialog) {
+                    Some(float::Keyed::Enter) => self.ping_start(),
+                    Some(float::Keyed::Escape) if !self.ping_stop() => open = false,
+                    _ => {}
+                }
+            }
             if !open {
                 self.open.remove(win);
                 floats.closed(win_id(*win));
+                if *win == Win::Ping {
+                    self.ping_closed();
+                }
             }
         }
         self.floats = floats;
@@ -1397,6 +1457,7 @@ mod tests {
     }
 
     mod dialog_keys;
+    mod tools_ping;
 
     #[test]
     fn rows_select_with_click_ctrl_shift_and_keys() {

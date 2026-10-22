@@ -11,6 +11,7 @@ use crate::cmd::{self, check_params, unknown_command};
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
+use crate::tasks::Tasks;
 use crate::validate::validate_all;
 use crate::{EngineError, Result, guard};
 
@@ -58,6 +59,8 @@ pub struct Session {
     safe_mode: SafeMode,
     /// Heard by discovery protocols (operational state, never saved).
     pub(crate) neighbors: NeighborTable,
+    /// Diagnostic tool jobs (operational state, never saved).
+    pub(crate) tasks: Tasks,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -124,6 +127,7 @@ impl Session {
             caller: Caller::local(),
             safe_mode: SafeMode::default(),
             neighbors: NeighborTable::default(),
+            tasks: Tasks::default(),
         }
     }
 

@@ -15,6 +15,7 @@ pub mod client;
 pub mod clock;
 pub mod dispatch;
 pub mod server;
+pub mod tasks;
 pub mod wire;
 pub mod ws;
 
@@ -22,6 +23,7 @@ pub use client::{Client, reply_result};
 pub use clock::spawn_clock;
 pub use dispatch::{Host, NO_UI, SharedHost, dispatch, dispatch_as, hang_up, new_caller};
 pub use server::{Shutdown, bind_loopback, serve, serve_until, spawn};
+pub use tasks::{ThreadRunner, thread_runner};
 pub use ws::{WsPolicy, serve_ws, serve_ws_until, spawn_ws, spawn_ws_until};
 
 pub const DEFAULT_PORT: u16 = 7979;

@@ -50,6 +50,7 @@ mod neighbor;
 mod route;
 mod routing;
 mod system;
+mod tool;
 mod vrf;
 
 static AREAS: &[&[CommandSpec]] = &[
@@ -61,6 +62,7 @@ static AREAS: &[&[CommandSpec]] = &[
     routing::COMMANDS,
     system::COMMANDS,
     config::COMMANDS,
+    tool::COMMANDS,
 ];
 
 pub fn all() -> impl Iterator<Item = &'static CommandSpec> {
