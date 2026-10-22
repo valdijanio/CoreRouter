@@ -6,14 +6,19 @@
 
 pub mod config;
 pub mod persist;
+pub mod route;
 pub mod store;
 pub mod types;
 pub mod validate;
 
 pub use config::{
-    AddressEntry, BgpInstance, Config, Interface, InterfaceKind, Ip, Routing, System,
+    AddressEntry, BgpInstance, Config, DEFAULT_DISTANCE, Interface, InterfaceKind, Ip, RouteEntry,
+    Routing, System,
 };
 pub use persist::{FORMAT_VERSION, PersistError};
+pub use route::Reach;
 pub use store::{ConfigStore, DiffLine, Revision, StoreError};
-pub use types::{Asn, IfName, ItemId, MacAddr, ParseError, VlanId};
+pub use types::{
+    Asn, Gateway, IfName, ItemId, MacAddr, ParseError, RoutingTable, VlanId, parse_destination,
+};
 pub use validate::Issue;

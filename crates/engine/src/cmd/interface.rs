@@ -1,6 +1,7 @@
-//! /interface — ports, VLANs, bridges and loopbacks.
+//! /interface — ports, VLANs, bridges and loopbacks (VRFs are interfaces
+//! too, managed by `ip.vrf.*`).
 
-use corerouter_model::{Config, IfName, Interface, InterfaceKind, VlanId};
+use corerouter_model::{Config, IfName, Interface, InterfaceKind, RoutingTable, VlanId};
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, req_u32};
@@ -13,7 +14,7 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: ether|vlan|bridge|loopback} → [{name, type, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, bridge}]",
+        "{type?: ether|vlan|bridge|loopback|vrf} → [{name, type, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, bridge, vrf, table}]",
         always, list),
     cmd!(
         "interface.set",
@@ -98,6 +99,10 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 InterfaceKind::Vlan { parent, vlan_id } => (Some(parent), Some(vlan_id.get())),
                 _ => (None, None),
             };
+            let table = match i.kind {
+                InterfaceKind::Vrf { table } => Some(table),
+                _ => None,
+            };
             json!({
                 "name": i.name,
                 "type": i.kind.label(),
@@ -112,6 +117,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "parent": parent,
                 "vlan_id": vlan_id,
                 "bridge": i.bridge,
+                "vrf": i.vrf,
+                "table": table,
             })
         })
         .collect();
@@ -158,7 +165,7 @@ fn existing<'a>(cfg: &'a Config, p: &Value, key: &str) -> Result<(IfName, &'a In
 }
 
 /// Parse the `name` of an interface about to be created.
-fn new_name(cfg: &Config, p: &Value) -> Result<IfName> {
+pub(super) fn new_name(cfg: &Config, p: &Value) -> Result<IfName> {
     let name: IfName = req_parse(p, "name")?;
     if cfg.interfaces.contains_key(&name) {
         return Err(EngineError::bad(
@@ -189,10 +196,16 @@ fn vlan_add(s: &mut Session, p: &Value) -> Result<Value> {
     let cfg = s.store().candidate();
     let name = new_name(cfg, p)?;
     let (parent, parent_iface) = existing(cfg, p, "parent")?;
-    if matches!(parent_iface.kind, InterfaceKind::Loopback) {
+    if matches!(
+        parent_iface.kind,
+        InterfaceKind::Loopback | InterfaceKind::Vrf { .. }
+    ) {
         return Err(EngineError::bad(
             "parent",
-            format!("'{parent}' is a loopback; use an ethernet, bridge or VLAN interface"),
+            format!(
+                "'{parent}' is a {}; use an ethernet, bridge or VLAN interface",
+                parent_iface.kind.label()
+            ),
         ));
     }
     let vlan_id = u16::try_from(req_u32(p, "vlan_id")?)
@@ -263,7 +276,7 @@ fn port_add(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     match iface.kind {
-        InterfaceKind::Bridge | InterfaceKind::Loopback => {
+        InterfaceKind::Bridge | InterfaceKind::Loopback | InterfaceKind::Vrf { .. } => {
             return Err(EngineError::bad(
                 "interface",
                 format!(
@@ -290,6 +303,14 @@ fn port_add(s: &mut Session, p: &Value) -> Result<Value> {
             ));
         }
         None => {}
+    }
+    if let Some(v) = &iface.vrf {
+        return Err(EngineError::bad(
+            "interface",
+            format!(
+                "'{port}' is in VRF '{v}'; take it out first (ip.vrf.set), or put '{bridge}' in the VRF"
+            ),
+        ));
     }
     if vlan_lowers(cfg, &port).0.contains(&&bridge) {
         return Err(EngineError::bad(
@@ -400,6 +421,25 @@ fn dependents(cfg: &Config, name: &IfName, iface: &Interface) -> Vec<String> {
     if let Some(b) = &iface.bridge {
         out.push(format!(
             "remove it from bridge {b} first (interface.bridge.port.remove)"
+        ));
+    }
+    if matches!(iface.kind, InterfaceKind::Vrf { .. }) {
+        out.push(format!(
+            "'{name}' is a VRF: remove it with ip.vrf.remove, which releases its members"
+        ));
+    }
+    let table = RoutingTable::Vrf(name.clone());
+    let routes: Vec<String> = cfg
+        .ip
+        .routes
+        .iter()
+        .filter(|r| r.gateway.iface() == Some(name) || r.routing_table == table)
+        .map(|r| format!("{} ({})", r.id, r.dst_address))
+        .collect();
+    if !routes.is_empty() {
+        out.push(format!(
+            "remove route {} first (ip.route.remove)",
+            routes.join(", ")
         ));
     }
     out

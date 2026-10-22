@@ -22,7 +22,9 @@ use std::sync::OnceLock;
 
 use corerouter_hal::Hal;
 use corerouter_hal_linux::LinuxHal;
-use corerouter_model::{AddressEntry, Config, IfName, Interface, InterfaceKind, VlanId};
+use corerouter_model::{
+    AddressEntry, Config, IfName, Interface, InterfaceKind, RouteEntry, RoutingTable, VlanId,
+};
 
 const ENV: &str = "COREROUTER_NETNS_TESTS";
 
@@ -119,6 +121,43 @@ fn addr(cfg: &mut Config, iface: &str, a: &str) {
         disabled: false,
         comment: String::new(),
     });
+}
+
+fn route<'a>(cfg: &'a mut Config, dst: &str, gw: &str) -> &'a mut RouteEntry {
+    let id = cfg.ip.next_route_id();
+    cfg.ip.routes.push(RouteEntry {
+        id,
+        dst_address: dst.parse().unwrap(),
+        gateway: gw.parse().unwrap(),
+        distance: 1,
+        routing_table: RoutingTable::Main,
+        disabled: false,
+        comment: String::new(),
+    });
+    cfg.ip.routes.last_mut().unwrap()
+}
+
+/// Static routes the kernel has through links whose name starts with
+/// `prefix` (other tests share the namespace), one `ip route` line each.
+fn routes(prefix: &str) -> Vec<String> {
+    let mut out: Vec<String> = ["-4", "-6"]
+        .iter()
+        .flat_map(|fam| {
+            ip(&[fam, "route", "show", "table", "all", "proto", "static"])
+                .lines()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|l| {
+            l.split_whitespace()
+                .skip_while(|w| *w != "dev")
+                .nth(1)
+                .is_some_and(|d| d.starts_with(prefix))
+        })
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    out.sort();
+    out
 }
 
 fn mtu(cfg: &mut Config, name: &str, m: u16) {
@@ -318,4 +357,189 @@ fn existing_links_are_adopted_only_if_they_match() {
         .to_string();
     assert!(err.contains("does not match"), "{err}");
     assert!(ip(&["-d", "-o", "link", "show", "d1v30"]).contains("id 30"));
+}
+
+#[test]
+fn static_routes_and_link_state() {
+    if !in_netns() {
+        return;
+    }
+    port("e1eth1");
+    port("e1eth2");
+    let mut hal = LinuxHal::new();
+    let mut base = Config::default();
+    for p in ["e1eth1", "e1eth2"] {
+        eth(&mut base, p);
+    }
+    addr(&mut base, "e1eth1", "10.61.0.2/24");
+    addr(&mut base, "e1eth1", "2001:db8:61::2/64");
+    hal.apply(&Config::default(), &base).unwrap();
+
+    let mut to = base.clone();
+    route(&mut to, "0.0.0.0/0", "10.61.0.1");
+    route(&mut to, "::/0", "2001:db8:61::1");
+    route(&mut to, "0.0.0.0/0", "10.61.0.254").distance = 10; // backup
+    route(&mut to, "198.51.100.0/24", "e1eth2");
+    route(&mut to, "2001:db8:99::/48", "fe80::1%e1eth2");
+    hal.apply(&base, &to).unwrap();
+
+    let got = routes("e1");
+    for want in [
+        "default via 10.61.0.1 dev e1eth1",
+        "default via 10.61.0.254 dev e1eth1 metric 10",
+        "198.51.100.0/24 dev e1eth2",
+        "default via 2001:db8:61::1 dev e1eth1",
+        "2001:db8:99::/48 via fe80::1 dev e1eth2",
+    ] {
+        assert!(
+            got.iter().any(|l| l.starts_with(want)),
+            "missing '{want}' in {got:#?}"
+        );
+    }
+    assert!(
+        got.iter()
+            .any(|l| l.starts_with("198.51.100.0/24") && l.contains("scope link"))
+    );
+    assert_eq!(got.len(), 5, "{got:#?}");
+
+    // Applying again (or a daemon restart over the live kernel) changes nothing.
+    hal.apply(&to, &to).unwrap();
+    hal.apply(&Config::default(), &to).unwrap();
+    assert_eq!(routes("e1"), got);
+
+    // The kernel flushes routes (and IPv6 addresses) of a link that goes
+    // down; disabling and enabling e1eth1 must end with every route back.
+    let mut down = to.clone();
+    down.interfaces.get_mut(&n("e1eth1")).unwrap().disabled = true;
+    hal.apply(&to, &down).unwrap();
+    assert!(!routes("e1").iter().any(|l| l.contains("dev e1eth1")));
+    hal.apply(&down, &to).unwrap();
+    assert_eq!(routes("e1"), got);
+
+    hal.apply(&to, &base).unwrap();
+    assert!(routes("e1").is_empty(), "{:#?}", routes("e1"));
+}
+
+/// Whether this kernel can create a `vrf` link (the module may be missing,
+/// and a user namespace cannot load it): VRF tests skip, loudly, if not.
+fn has_vrf() -> bool {
+    let ok = Command::new("ip")
+        .args(["link", "add", "vrfprobe", "type", "vrf", "table", "4242"])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    if ok {
+        ip(&["link", "del", "vrfprobe"]);
+    } else {
+        eprintln!("skipped: this kernel has no vrf support (CONFIG_NET_VRF / module vrf)");
+    }
+    ok
+}
+
+#[test]
+fn vrf_routes_live_in_their_own_table() {
+    if !in_netns() || !has_vrf() {
+        return;
+    }
+    port("g1eth1");
+    port("g1eth2");
+    let mut hal = LinuxHal::new();
+    let mut base = Config::default();
+    eth(&mut base, "g1eth1");
+    eth(&mut base, "g1eth2");
+    addr(&mut base, "g1eth1", "10.64.0.2/24");
+    hal.apply(&Config::default(), &base).unwrap();
+
+    // A VRF with its own copy of 10.64.0.0/24 and its own default route,
+    // next to main's.
+    let mut to = base.clone();
+    route(&mut to, "0.0.0.0/0", "10.64.0.1");
+    add(&mut to, "g1blue", InterfaceKind::Vrf { table: 1064 });
+    to.interfaces.get_mut(&n("g1eth2")).unwrap().vrf = Some(n("g1blue"));
+    addr(&mut to, "g1eth2", "10.64.0.2/24");
+    addr(&mut to, "g1eth2", "2001:db8:64::2/64");
+    let r = route(&mut to, "0.0.0.0/0", "10.64.0.9");
+    r.routing_table = RoutingTable::Vrf(n("g1blue"));
+    hal.apply(&base, &to).unwrap();
+
+    let got = routes("g1");
+    assert!(
+        got.iter()
+            .any(|l| l.starts_with("default via 10.64.0.1 dev g1eth1")),
+        "{got:#?}"
+    );
+    assert!(
+        got.contains(&"default via 10.64.0.9 dev g1eth2 table 1064 metric 1".to_owned()),
+        "{got:#?}"
+    );
+    let vrf = ip(&["-d", "-o", "link", "show", "g1blue"]);
+    assert!(vrf.contains("vrf table 1064"), "{vrf}");
+    assert!(ip(&["-o", "link", "show", "g1eth2"]).contains("master g1blue"));
+    // Connected routes and the IPv6 address follow the member into the VRF.
+    assert!(ip(&["route", "show", "table", "1064"]).contains("10.64.0.0/24 dev g1eth2"));
+    assert!(ip(&["-o", "addr", "show", "dev", "g1eth2"]).contains("2001:db8:64::2/64"));
+
+    hal.apply(&to, &to).unwrap();
+    hal.apply(&Config::default(), &to).unwrap();
+    assert_eq!(routes("g1"), got);
+
+    // Back: routes gone, VRF deleted, g1eth2 released.
+    hal.apply(&to, &base).unwrap();
+    assert!(routes("g1").is_empty(), "{:#?}", routes("g1"));
+    assert!(!exists("g1blue"));
+    assert!(!ip(&["-o", "link", "show", "g1eth2"]).contains("master"));
+}
+
+#[test]
+fn a_conflicting_kernel_route_rolls_the_apply_back() {
+    if !in_netns() {
+        return;
+    }
+    port("f1eth1");
+    let mut hal = LinuxHal::new();
+    let mut base = Config::default();
+    eth(&mut base, "f1eth1");
+    addr(&mut base, "f1eth1", "10.62.0.2/24");
+    hal.apply(&Config::default(), &base).unwrap();
+    // Someone else's route to the same prefix with the same metric.
+    ip(&[
+        "route",
+        "add",
+        "203.0.113.0/24",
+        "via",
+        "10.62.0.99",
+        "dev",
+        "f1eth1",
+        "metric",
+        "1",
+        "proto",
+        "static",
+    ]);
+    let foreign = routes("f1");
+    let addrs = ip(&["-o", "addr", "show", "dev", "f1eth1"]);
+
+    let mut to = base.clone();
+    addr(&mut to, "f1eth1", "10.63.0.2/24");
+    route(&mut to, "192.0.2.0/24", "10.62.0.1");
+    route(&mut to, "203.0.113.0/24", "10.62.0.1");
+    let err = hal.apply(&base, &to).unwrap_err().to_string();
+    assert!(
+        err.contains("already has another route to 203.0.113.0/24"),
+        "{err}"
+    );
+    assert!(
+        err.contains("rolled back") && !err.contains("INCOMPLETE"),
+        "{err}"
+    );
+    // Our route and address are gone again; the foreign route is untouched.
+    assert_eq!(routes("f1"), foreign);
+    assert_eq!(ip(&["-o", "addr", "show", "dev", "f1eth1"]), addrs);
+
+    // Removing a route that is already gone is not an error either.
+    let mut with = base.clone();
+    route(&mut with, "192.0.2.0/24", "10.62.0.1");
+    hal.apply(&base, &with).unwrap();
+    ip(&["route", "del", "192.0.2.0/24", "dev", "f1eth1"]);
+    hal.apply(&with, &base).unwrap();
 }

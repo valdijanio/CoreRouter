@@ -82,9 +82,9 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
-| L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico) | serde, ipnet, thiserror |
+| L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas) | serde, ipnet, thiserror |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio) + `VirtualHal` (lab, wasm, CI) | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, endereços; G1.2), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal | L0–L2 (nunca plataforma) |
@@ -235,6 +235,30 @@ memória do egui (posição das janelas) não é persistida.
    inversa e devolve `HalError::Rejected` dizendo o passo, o motivo e se o rollback foi completo.
    Mudança já em vigor (MTU igual, endereço presente) é no-op sem desfazer.
 
+### Rotas estáticas e VRF (G1.5)
+
+- **Modelo:** `ip.routes` (`RouteEntry`: `dst_address`, `gateway`, `distance`, `routing_table`,
+  `disabled`, `comment`; ids `*N` próprios, `ip.next_route_id`). Rotas conectadas não são
+  guardadas: derivam de `ip.addresses`. Um VRF é uma interface `InterfaceKind::Vrf { table }`
+  (o device `vrf` do Linux; nome = nome da tabela) e cada membro guarda `Interface.vrf`, que é
+  o `IFLA_MASTER` dele — por isso porta de bridge e membro de VRF se excluem.
+- **Uma regra só para "a rota vale agora":** `model::route::reach(cfg, rota)` resolve o gateway
+  dentro da tabela da rota e devolve `Active { link, gateway }`, `Inactive(motivo)` (rota,
+  interface, VRF ou endereço desabilitado) ou `Invalid { campo, motivo }` (gateway fora de toda
+  rede conectada, famílias trocadas, tabela/interface inexistente, endereço do próprio
+  roteador, link-local sem interface). O engine usa para validar (`validate::route_issues`,
+  também chamado pelos comandos) e para as flags de `ip.route.list` (X A D C S, ordem do
+  RouterOS v6; ativa = usável e de menor distância no par tabela+destino); o `hal-linux` usa
+  para decidir o que fica no kernel. Assim nunca divergem.
+- **Kernel:** distance vira a métrica (o kernel também prefere a menor), protocolo `static`;
+  rota sem gateway em IPv4 tem escopo `link`. O plano ganhou o passo 0 (remover rotas) e o 9
+  (adicionar rotas). O kernel apaga sozinho rotas de link que desce, é recriado, entra/sai de
+  VRF ou perde o último IPv4, e apaga os IPv6 de link que desce ou entra em VRF
+  (`keep_addr_on_down=0`): o plano remove essas rotas/endereços explicitamente antes e os
+  recoloca depois, para que o desfazer de uma falha devolva tudo. Rota existente no kernel só é
+  adotada se for idêntica (static, mesma tabela/métrica/next hop); outra rota no mesmo destino e
+  métrica faz o apply falhar e desfazer.
+
 Proteções do host: só interfaces do config entram no plano; o `lo` do kernel não é descoberto;
 link existente só é adotado se tiver o mesmo tipo (e VLAN id/pai) do config, e nunca se apaga
 um link cujo tipo no kernel difere do config. Testes de integração (`tests/netns.rs`) rodam
@@ -249,4 +273,5 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-21 — G0.4: trait `Backend` da UI, GUI remota (nativo e WebSocket), `control::ws`.
 - 2026-10-21 — G1.11: preferências da janela (tema, comentários inline) fora do engine.
 - 2026-10-21 — G5.2: crates `proto-lldp`/`proto-mndp` (L2) e módulo `l2` do `hal-linux`.
+- 2026-10-21 — G1.5: rotas estáticas e VRF (`model::route`, passos 0 e 9 do plano).
 - 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).

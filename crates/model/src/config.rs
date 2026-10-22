@@ -7,7 +7,7 @@ use std::net::Ipv4Addr;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
-use crate::types::{Asn, IfName, ItemId, MacAddr, VlanId};
+use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -49,6 +49,10 @@ pub struct Interface {
     /// field, so a port can never belong to two bridges.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bridge: Option<IfName>,
+    /// VRF this interface belongs to (also `IFLA_MASTER` in Linux, so an
+    /// interface is a bridge port or a VRF member, never both).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vrf: Option<IfName>,
 }
 
 fn default_mtu() -> u16 {
@@ -65,6 +69,7 @@ impl Interface {
             mac: None,
             comment: String::new(),
             bridge: None,
+            vrf: None,
         }
     }
 }
@@ -73,9 +78,17 @@ impl Interface {
 #[serde(tag = "type", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum InterfaceKind {
     Ethernet,
-    Vlan { parent: IfName, vlan_id: VlanId },
+    Vlan {
+        parent: IfName,
+        vlan_id: VlanId,
+    },
     Bridge,
     Loopback,
+    /// VRF device (Linux `vrf`): the interfaces whose `vrf` names it route
+    /// with kernel table `table`, a routing table named like the VRF.
+    Vrf {
+        table: u32,
+    },
 }
 
 impl InterfaceKind {
@@ -85,6 +98,7 @@ impl InterfaceKind {
             Self::Vlan { .. } => "vlan",
             Self::Bridge => "bridge",
             Self::Loopback => "loopback",
+            Self::Vrf { .. } => "vrf",
         }
     }
 }
@@ -95,12 +109,22 @@ pub struct Ip {
     pub addresses: Vec<AddressEntry>,
     /// Next id handed out by `next_address_id` (never reused, like RouterOS).
     pub next_id: u32,
+    /// Static routes (`/ip route`), IPv4 and IPv6 together. Connected routes
+    /// are not stored: they are derived from `addresses` (see `route`).
+    pub routes: Vec<RouteEntry>,
+    /// Next id handed out by `next_route_id`.
+    pub next_route_id: u32,
 }
 
 impl Ip {
     pub fn next_address_id(&mut self) -> ItemId {
         self.next_id = self.next_id.saturating_add(1);
         ItemId(self.next_id)
+    }
+
+    pub fn next_route_id(&mut self) -> ItemId {
+        self.next_route_id = self.next_route_id.saturating_add(1);
+        ItemId(self.next_route_id)
     }
 }
 
@@ -114,6 +138,31 @@ pub struct AddressEntry {
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+}
+
+/// One static route. `distance` is RouterOS' administrative distance
+/// (1..=255; connected routes are 0); in the kernel it becomes the metric,
+/// so the lowest distance wins there too.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RouteEntry {
+    pub id: ItemId,
+    pub dst_address: IpNet,
+    pub gateway: Gateway,
+    #[serde(default = "default_distance")]
+    pub distance: u8,
+    #[serde(default)]
+    pub routing_table: RoutingTable,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default)]
+    pub comment: String,
+}
+
+pub const DEFAULT_DISTANCE: u8 = 1;
+
+fn default_distance() -> u8 {
+    DEFAULT_DISTANCE
 }
 
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -149,5 +198,23 @@ mod tests {
         let back: Interface =
             serde_json::from_str(&serde_json::to_string(&iface).unwrap()).unwrap();
         assert_eq!(back, iface);
+    }
+
+    #[test]
+    fn older_configs_without_routes_still_load() {
+        let ip: Ip = serde_json::from_str(r#"{"addresses": [], "next_id": 3}"#).unwrap();
+        assert!(ip.routes.is_empty());
+        assert_eq!(ip.next_route_id, 0);
+
+        let raw = r#"{"id": "*1", "dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}"#;
+        let r: RouteEntry = serde_json::from_str(raw).unwrap();
+        assert_eq!(r.distance, 1);
+        assert_eq!(r.routing_table, RoutingTable::Main);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains(r#""routing_table":"main""#), "{json}");
+        assert_eq!(serde_json::from_str::<RouteEntry>(&json).unwrap(), r);
+
+        let vrf: InterfaceKind = serde_json::from_str(r#"{"type": "vrf", "table": 1000}"#).unwrap();
+        assert_eq!(vrf, InterfaceKind::Vrf { table: 1000 });
     }
 }

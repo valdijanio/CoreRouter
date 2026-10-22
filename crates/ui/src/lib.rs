@@ -9,6 +9,7 @@ pub mod backend;
 mod float;
 mod interfaces;
 mod prefs;
+mod routes;
 mod table;
 mod windows;
 
@@ -41,6 +42,7 @@ enum Field {
     Summary,
     Interfaces,
     Addresses,
+    Routes,
     Bgp,
     History,
     Diff,
@@ -52,6 +54,7 @@ struct Cache {
     summary: Value,
     interfaces: Vec<Value>,
     addresses: Vec<Value>,
+    routes: Vec<Value>,
     bgp: Vec<Value>,
     history: Vec<Value>,
     diff: Vec<Value>,
@@ -78,15 +81,17 @@ struct Forms {
 struct Tables {
     interfaces: table::TableState,
     addresses: table::TableState,
+    routes: table::TableState,
 }
 
 impl Tables {
     /// Every table with the salt it is drawn with (stored preferences name
     /// tables by salt).
-    fn each(&mut self) -> [(&'static str, &mut table::TableState); 2] {
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 3] {
         [
             (interfaces::TABLE, &mut self.interfaces),
             ("addresses", &mut self.addresses),
+            (routes::TABLE, &mut self.routes),
         ]
     }
 
@@ -95,6 +100,7 @@ impl Tables {
         [
             (interfaces::TABLE, &self.interfaces),
             ("addresses", &self.addresses),
+            (routes::TABLE, &self.routes),
         ]
         .into_iter()
         .filter(|(_, t)| t.inline_comments)
@@ -115,6 +121,7 @@ pub(crate) enum Then {
     ClearAddressForm,
     ShowFrr,
     Dialog { id: u64, effect: interfaces::Effect },
+    Route { id: u64, effect: routes::Effect },
 }
 
 pub struct CoreRouterUi {
@@ -137,6 +144,10 @@ pub struct CoreRouterUi {
     open_after: Vec<(RequestId, String)>,
     /// Light, dark or the system's (a window preference, see `prefs`).
     theme: egui::ThemePreference,
+    /// "New Route" / "Route <dst>" / route "Comment" windows.
+    route_dialogs: Vec<routes::RouteDialogWin>,
+    /// Routes to open once an `ip.route.list` sent after this id arrives.
+    open_route_after: Vec<(RequestId, String)>,
 }
 
 impl CoreRouterUi {
@@ -168,6 +179,8 @@ impl CoreRouterUi {
             next_dialog: 0,
             open_after: Vec::new(),
             theme: egui::ThemePreference::System,
+            route_dialogs: Vec::new(),
+            open_route_after: Vec::new(),
         }
     }
 
@@ -291,6 +304,16 @@ impl CoreRouterUi {
                 }
             }
             Field::Addresses => self.cache.addresses = arr(value),
+            Field::Routes => {
+                self.cache.routes = arr(value);
+                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_route_after)
+                    .into_iter()
+                    .partition(|(req, _)| *req <= id);
+                self.open_route_after = later;
+                for (_, route) in ready {
+                    self.open_route(&route);
+                }
+            }
             Field::Bgp => self.cache.bgp = arr(value),
             Field::History => self.cache.history = arr(value),
             Field::Diff => self.cache.diff = arr(value),
@@ -312,6 +335,7 @@ impl CoreRouterUi {
                 }
             }
             Then::Dialog { id, effect } => self.dialog_reply(id, effect, result),
+            Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
         }
     }
 
@@ -371,7 +395,8 @@ impl CoreRouterUi {
         self.cache.refreshed_at = Some(now);
     }
 
-    /// Ask for every table again. Returns the id of the `interface.list`.
+    /// Ask for every table again. Returns the id of the `interface.list`
+    /// (the other queries of the batch get larger ids).
     fn reload(&mut self) -> RequestId {
         let ask = |me: &mut Self, field: Field, method: &str, params: Value| {
             let id = me.backend.submit(method, params);
@@ -392,6 +417,7 @@ impl CoreRouterUi {
             "engine.execute",
             exec("ip.address.list"),
         );
+        ask(self, Field::Routes, "engine.execute", exec("ip.route.list"));
         ask(
             self,
             Field::Bgp,
@@ -468,6 +494,7 @@ impl CoreRouterUi {
         }
         self.floats = floats;
         self.dialogs(&ctx, area);
+        self.route_dialogs(&ctx, area);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -1351,6 +1378,142 @@ mod tests {
         assert!(h.has_text("New Loopback Interface"));
         h.click(h.text("Cancel"));
         assert!(!h.has_text("New Loopback Interface"));
+        assert!(h.app.log().iter().all(|l| l.ok), "{:?}", h.app.log());
+    }
+
+    impl Harness {
+        /// Only the Routes window, over a lab whose ether1 is 10.0.0.2/24.
+        fn routes() -> Self {
+            let mut h = Self::new();
+            lock(&h.session)
+                .execute(
+                    "ip.address.add",
+                    &json!({"address": "10.0.0.2/24", "interface": "ether1"}),
+                )
+                .unwrap();
+            h.app.open.clear();
+            h.app.open(Win::Routes);
+            h.app.cache.refreshed_at = None;
+            h.idle();
+            h.idle();
+            h
+        }
+
+        fn route_row(&self, key: &str) -> egui::Pos2 {
+            self.ctx
+                .read_response(table::row_id(routes::TABLE, key))
+                .unwrap_or_else(|| panic!("route row {key} not drawn"))
+                .rect
+                .center()
+        }
+
+        fn route_tool(&self, icon: table::Icon) -> egui::Response {
+            self.ctx
+                .read_response(table::tool_id(routes::TABLE, icon))
+                .unwrap_or_else(|| panic!("no route tool {icon:?}"))
+        }
+
+        /// The static route `id` as the engine lists it.
+        fn route(&self, id: &str) -> Option<Value> {
+            let list = lock(&self.session).execute("ip.route.list", &Value::Null);
+            list.ok()?
+                .as_array()?
+                .iter()
+                .find(|r| r["id"] == id)
+                .cloned()
+        }
+    }
+
+    #[test]
+    fn new_route_dialog_adds_a_default_route() {
+        let mut h = Harness::routes();
+        assert!(h.has_text("ADC"), "connected route listed");
+        h.click(h.route_tool(table::Icon::Add).rect.center());
+        assert!(h.has_text("New Route"));
+        h.click(h.text("0.0.0.0/0"));
+        h.type_text("0.0.0.0/0");
+        h.click(h.text("10.0.0.1 or ether1"));
+        h.type_text("10.0.0.1");
+        h.click(h.text("OK"));
+        assert!(h.app.route_dialogs.is_empty(), "OK closes on success");
+        let r = h.route("*1").expect("route created");
+        assert_eq!((&r["flags"], &r["distance"]), (&json!("AS"), &json!(1)));
+        assert!(
+            h.has_text("10.0.0.1 reachable ether1"),
+            "WinBox gateway column"
+        );
+
+        // A bad gateway keeps the dialog open with the engine's reason.
+        h.click(h.route_tool(table::Icon::Add).rect.center());
+        h.click(h.text("0.0.0.0/0"));
+        h.type_text("10.9.0.0/16");
+        h.click(h.text("10.0.0.1 or ether1"));
+        h.type_text("172.16.0.1");
+        h.click(h.text("OK"));
+        let d = h.app.route_dialogs.first().expect("still open");
+        assert!(
+            d.error
+                .as_deref()
+                .is_some_and(|e| e.contains("not in any connected network")),
+            "{:?}",
+            d.error
+        );
+        h.click(h.text("Cancel"));
+        assert!(h.app.route_dialogs.is_empty());
+    }
+
+    #[test]
+    fn route_properties_toolbar_and_menu() {
+        let mut h = Harness::routes();
+        lock(&h.session)
+            .execute(
+                "ip.route.add",
+                &json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}),
+            )
+            .unwrap();
+        h.app.cache.refreshed_at = None;
+        h.idle();
+        h.idle(); // rows are laid out where the new list puts them
+
+        // Connected routes cannot be removed, disabled or commented.
+        let connected = "connected main 10.0.0.0/24 ether1";
+        h.click(h.route_row(connected));
+        assert!(!h.route_tool(table::Icon::Remove).sense.senses_click());
+        h.key(egui::Key::Delete, egui::Modifiers::NONE);
+        assert!(!h.log_ids().contains(&"ip.route.remove"));
+
+        // Double click: "Route <0.0.0.0/0>"; Apply sends only what changed.
+        // (Wait first, or the click above would make it a triple click.)
+        h.time += 1.0;
+        h.idle();
+        let at = h.route_row("*1");
+        h.click(at);
+        h.click(at);
+        assert!(h.has_text("Route <0.0.0.0/0>"));
+        match h.app.route_dialogs.first_mut().map(|d| &mut d.dialog) {
+            Some(routes::RouteDialog::Props { form, .. }) => {
+                form.distance = "5".into();
+                form.comment = "isp".into();
+            }
+            _ => panic!("route window not open"),
+        }
+        h.click(h.text("Apply"));
+        let r = h.route("*1").unwrap();
+        assert_eq!((&r["distance"], &r["comment"]), (&json!(5), &json!("isp")));
+        h.click(h.text("Disable"));
+        assert_eq!(h.route("*1").unwrap()["flags"], "XS");
+        h.click(h.text("OK"));
+        assert!(h.app.route_dialogs.is_empty());
+
+        // Ctrl+E on the selected row enables it again.
+        h.click(h.route_row("*1"));
+        h.key(egui::Key::E, CTRL);
+        assert_eq!(h.route("*1").unwrap()["flags"], "AS");
+
+        // Right click ▸ Remove.
+        h.right_click(h.route_row("*1"));
+        h.click(h.text("Remove"));
+        assert!(h.route("*1").is_none());
         assert!(h.app.log().iter().all(|l| l.ok), "{:?}", h.app.log());
     }
 

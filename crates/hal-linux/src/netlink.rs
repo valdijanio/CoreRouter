@@ -10,6 +10,7 @@
 //! are no-ops with no undo, so applying twice is harmless.
 
 use std::fmt::Write as _;
+use std::net::IpAddr;
 
 use corerouter_hal::HalError;
 use corerouter_model::IfName;
@@ -17,13 +18,20 @@ use futures_util::TryStreamExt;
 use ipnet::IpNet;
 use rtnetlink::packet_route::address::AddressMessage;
 use rtnetlink::packet_route::link::{
-    InfoData, InfoKind, InfoVlan, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
+    InfoData, InfoKind, InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
 };
-use rtnetlink::{Handle, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVlan};
+use rtnetlink::packet_route::route::{
+    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
+};
+use rtnetlink::{
+    Handle, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVlan, LinkVrf,
+    RouteMessageBuilder,
+};
 
-use crate::plan::{LinkSpec, Op};
+use crate::plan::{KernelRoute, LinkSpec, Op};
 
 const ENOENT: i32 = 2;
+const ESRCH: i32 = 3;
 const EEXIST: i32 = 17;
 const ENODEV: i32 = 19;
 const EADDRNOTAVAIL: i32 = 99;
@@ -96,6 +104,7 @@ struct Link {
     lower: Option<u32>,
     kind: Option<InfoKind>,
     vlan_id: Option<u16>,
+    vrf_table: Option<u32>,
 }
 
 impl Link {
@@ -121,6 +130,13 @@ impl Link {
                                     }
                                 }
                             }
+                            LinkInfo::Data(InfoData::Vrf(v)) => {
+                                for x in v {
+                                    if let InfoVrf::TableId(t) = x {
+                                        l.vrf_table = Some(*t);
+                                    }
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -136,8 +152,19 @@ impl Link {
             LinkSpec::Vlan { .. } => InfoKind::Vlan,
             LinkSpec::Bridge => InfoKind::Bridge,
             LinkSpec::Dummy => InfoKind::Dummy,
+            LinkSpec::Vrf { .. } => InfoKind::Vrf,
         };
         self.kind.as_ref() == Some(&want)
+    }
+
+    /// Same kind, and the same VLAN id / VRF table: safe to adopt or delete.
+    fn matches(&self, spec: &LinkSpec) -> bool {
+        self.is_kind(spec)
+            && match spec {
+                LinkSpec::Vlan { vlan_id, .. } => self.vlan_id == Some(*vlan_id),
+                LinkSpec::Vrf { table } => self.vrf_table == Some(*table),
+                LinkSpec::Bridge | LinkSpec::Dummy => true,
+            }
     }
 
     fn describe_kind(&self) -> String {
@@ -261,23 +288,20 @@ impl Kernel {
             }
             Op::AddAddress { link, addr } => self.add_address(link, addr).await,
             Op::DelAddress { link, addr } => self.del_address(link, addr).await,
+            Op::AddRoute(r) => self.add_route(r).await,
+            Op::DelRoute(r) => self.del_route(r).await,
         }
     }
 
     async fn create(&self, link: &IfName, spec: &LinkSpec) -> Result<Vec<Op>, String> {
         let parent = match spec {
             LinkSpec::Vlan { parent, .. } => Some(self.require(parent).await?.index),
-            LinkSpec::Bridge | LinkSpec::Dummy => None,
+            LinkSpec::Bridge | LinkSpec::Dummy | LinkSpec::Vrf { .. } => None,
         };
         if let Some(l) = self.find(link).await? {
             // Same link already there (daemon restart): adopt it, nothing to undo.
-            let same = l.is_kind(spec)
-                && match spec {
-                    LinkSpec::Vlan { vlan_id, .. } => {
-                        l.vlan_id == Some(*vlan_id) && l.lower == parent
-                    }
-                    LinkSpec::Bridge | LinkSpec::Dummy => true,
-                };
+            let same =
+                l.matches(spec) && (!matches!(spec, LinkSpec::Vlan { .. }) || l.lower == parent);
             if same {
                 log::info!("netlink: '{link}' already exists as {spec}; adopting it");
                 return Ok(vec![]);
@@ -296,6 +320,7 @@ impl Kernel {
             }
             (LinkSpec::Bridge, _) => LinkMessageBuilder::<LinkBridge>::new(name).build(),
             (LinkSpec::Dummy, _) => LinkMessageBuilder::<LinkDummy>::new(name).build(),
+            (LinkSpec::Vrf { table }, _) => LinkVrf::new(name, *table).build(),
         };
         self.handle
             .link()
@@ -314,11 +339,7 @@ impl Kernel {
             return Ok(vec![]);
         };
         // Never delete something that is not what the config says we created.
-        let id_ok = match spec {
-            LinkSpec::Vlan { vlan_id, .. } => l.vlan_id == Some(*vlan_id),
-            LinkSpec::Bridge | LinkSpec::Dummy => true,
-        };
-        if !l.is_kind(spec) || !id_ok {
+        if !l.matches(spec) {
             return Err(format!(
                 "kernel has '{link}' as {}, not {spec}; refusing to delete it",
                 l.describe_kind()
@@ -402,5 +423,121 @@ impl Kernel {
             Err(e) if matches!(errno(&e), Some(EADDRNOTAVAIL | ENOENT)) => Ok(vec![]),
             Err(e) => Err(readable(&e)),
         }
+    }
+
+    async fn add_route(&self, r: &KernelRoute) -> Result<Vec<Op>, String> {
+        let l = self.require(&r.link).await?;
+        match self
+            .handle
+            .route()
+            .add(route_msg(r, l.index)?)
+            .execute()
+            .await
+        {
+            Ok(()) => Ok(vec![Op::DelRoute(r.clone())]),
+            // Exactly ours already (daemon restart): adopt it, nothing to undo.
+            Err(e) if errno(&e) == Some(EEXIST) => {
+                if self.has_route(r, l.index).await? {
+                    Ok(vec![])
+                } else {
+                    Err(format!(
+                        "the kernel already has another route to {} with metric {} in table {}; \
+                         refusing to replace it",
+                        r.dst, r.metric, r.table
+                    ))
+                }
+            }
+            Err(e) => Err(readable(&e)),
+        }
+    }
+
+    async fn del_route(&self, r: &KernelRoute) -> Result<Vec<Op>, String> {
+        // No link, no route: the kernel removed it with the link.
+        let Some(l) = self.find(&r.link).await? else {
+            return Ok(vec![]);
+        };
+        match self
+            .handle
+            .route()
+            .del(route_msg(r, l.index)?)
+            .execute()
+            .await
+        {
+            Ok(()) => Ok(vec![Op::AddRoute(r.clone())]),
+            Err(e) if matches!(errno(&e), Some(ESRCH | ENOENT)) => Ok(vec![]),
+            Err(e) => Err(readable(&e)),
+        }
+    }
+
+    /// Whether the kernel holds `r` exactly (static, same next hop).
+    async fn has_route(&self, r: &KernelRoute, oif: u32) -> Result<bool, String> {
+        let probe = match r.dst {
+            IpNet::V4(_) => RouteMessageBuilder::<std::net::Ipv4Addr>::new().build(),
+            IpNet::V6(_) => RouteMessageBuilder::<std::net::Ipv6Addr>::new().build(),
+        };
+        let all: Vec<RouteMessage> = self
+            .handle
+            .route()
+            .get(probe)
+            .execute()
+            .try_collect()
+            .await
+            .map_err(|e| format!("listing routes: {}", readable(&e)))?;
+        Ok(all.iter().any(|m| same_route(m, r, oif)))
+    }
+}
+
+/// The netlink message that adds or deletes `r` (same fields both ways, so
+/// a delete only ever matches the route an add made).
+fn route_msg(r: &KernelRoute, oif: u32) -> Result<RouteMessage, String> {
+    let b = RouteMessageBuilder::<IpAddr>::new()
+        .destination_prefix(r.dst.addr(), r.dst.prefix_len())
+        .map_err(|e| e.to_string())?
+        .output_interface(oif)
+        .priority(r.metric)
+        .table_id(r.table)
+        .protocol(RouteProtocol::Static);
+    let b = match r.gateway {
+        Some(g) => b.gateway(g).map_err(|e| e.to_string())?,
+        // Like `ip route add … dev X`: an on-link route has link scope.
+        None if r.dst.addr().is_ipv4() => b.scope(RouteScope::Link),
+        None => b,
+    };
+    Ok(b.build())
+}
+
+fn same_route(m: &RouteMessage, r: &KernelRoute, oif: u32) -> bool {
+    let h = &m.header;
+    let mut table = u32::from(h.table);
+    let (mut dst, mut gw, mut out, mut prio) = (None, None, None, 0);
+    for a in &m.attributes {
+        match a {
+            RouteAttribute::Table(t) => table = *t,
+            RouteAttribute::Destination(d) => dst = ip_of(d),
+            RouteAttribute::Gateway(g) => gw = ip_of(g),
+            RouteAttribute::Oif(i) => out = Some(*i),
+            RouteAttribute::Priority(p) => prio = *p,
+            _ => {}
+        }
+    }
+    let dst_ok = match dst {
+        Some(d) => d == r.dst.addr(),
+        // The default route carries no RTA_DST.
+        None => r.dst.prefix_len() == 0,
+    };
+    h.protocol == RouteProtocol::Static
+        && table == r.table
+        && h.destination_prefix_length == r.dst.prefix_len()
+        && dst_ok
+        && prio == r.metric
+        && out == Some(oif)
+        && gw == r.gateway
+}
+
+fn ip_of(a: &RouteAddress) -> Option<IpAddr> {
+    match a {
+        RouteAddress::Inet(v4) => Some(IpAddr::V4(*v4)),
+        RouteAddress::Inet6(v6) => Some(IpAddr::V6(*v6)),
+        _ => None,
     }
 }
