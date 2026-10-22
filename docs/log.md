@@ -486,3 +486,15 @@ mesmo dia pode variar.
   achou dois `panic` no `dhcproto` 0.15 com pacotes malformados; o decode agora passa por um
   saneador. Testes: 32 no `proto-dhcp`, 15 de integração no engine, netns com daemon real e
   servidor DHCP em Rust (concessão + rotas no kernel em ~3 s **medido**), UI headless, terminal.
+
+- 2026-10-22 — G0.9: `cargo xtask bench` (criterion 0.8 como dev-dependency, sem plots/rayon).
+  Um build de todos os `benches/` e um resumo legível (mediana, IC 95%, tempo por item, variação
+  contra a rodada anterior ou `--baseline <nome>`; `--save-baseline`, `--quick`, `--markdown`
+  para o `docs/perf.md`). 31 benchmarks: canal de controle (TCP e TLS, `ping` e
+  `interface.list`), `Session::execute` (list/add/filter add/erro), `VirtualHal::apply` e
+  `LinuxHal::apply` de 100/1000 endereços, rotas e regras (o do kernel num namespace sem root,
+  `netns_*`, pulado com aviso onde não dá), codecs DHCPv4/LLDP/CRDP/MNDP. Números **medidos**
+  (Ryzen AI MAX+ 395, release): `ping` 7,4 µs (TLS 8,3 µs), `ip.address.add` 16 µs, netlink
+  ~20 µs por endereço/rota, `nft -f` ~20 ms fixos + ~13 µs/regra, decode DHCP 0,57 µs. Passo
+  `bench-check` no `cargo xtask ci` (+10,5 s **medido**): roda cada benchmark uma vez em debug.
+  Como testar: `cargo xtask bench --quick`; `cargo xtask bench-check`.

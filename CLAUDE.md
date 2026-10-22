@@ -60,7 +60,11 @@ Decisões de desempenho se tomam com números, não com preferência.
   milhares de regras/rotas/endereços no kernel, o canal de controle, codecs e parsers de
   protocolo, ferramentas (ping/MTR). Use os benchmarks do workspace (`cargo xtask bench`,
   criterion) e registre o resultado em `docs/perf.md` marcado como **medido** (máquina, build
-  release, data). PR que toca caminho quente traz a seção "Desempenho" com antes/depois.
+  release, data). PR que toca caminho quente traz a seção "Desempenho" com antes/depois:
+  `cargo xtask bench --save-baseline antes` na `main`, `cargo xtask bench --baseline antes` na
+  branch (a coluna "change" do resumo é o antes/depois). Benchmark novo = `benches/<nome>.rs`
+  (criterion, `harness = false`) no crate dono do código; alvo `netns_*` roda num namespace sem
+  root. Detalhes em `docs/perf.md`.
 - **O CI não reprova por benchmark** (máquinas compartilhadas variam). Só entram travas folgadas
   contra regressões grandes, como o teste de latência do canal de controle.
 - **Orquestrar algo externo (FRR, `nft`, accel-ppp…) ou escrever em Rust puro:** compare com
@@ -140,8 +144,8 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 
 ## Verificação
 
-- Antes de cada commit: `cargo xtask ci` (fmt, clippy -D warnings, test, layers, agents-sync,
-  wasm). Ele para no primeiro FAIL; não faça commit com FAIL.
+- Antes de cada commit: `cargo xtask ci` (fmt, clippy -D warnings, test, bench-check, netns,
+  layers, agents-sync, wasm). Ele para no primeiro FAIL; não faça commit com FAIL.
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.

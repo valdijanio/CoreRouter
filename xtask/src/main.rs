@@ -1,12 +1,13 @@
 //! `cargo xtask <task>` — checks as code. Agents run `cargo xtask ci` before
 //! every commit; it stops at the first FAIL and prints an ok/FAIL/skip summary.
 
+mod bench;
 mod layers;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|netns|layers|agents-sync|wasm>";
+const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|layers|agents-sync|wasm|bench [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -33,6 +34,9 @@ const CI: &[Step] = &[
     ("fmt", fmt),
     ("clippy", clippy),
     ("test", test),
+    // G0.9: every benchmark compiled and run once in debug (no measurement),
+    // so a renamed command parameter fails here instead of rotting.
+    ("bench-check", bench::check),
     ("netns", netns),
     ("layers", layers_step),
     ("agents-sync", agents_sync),
@@ -44,6 +48,20 @@ fn main() -> ExitCode {
     let task = std::env::args().nth(1).unwrap_or_default();
     let steps: Vec<&Step> = match task.as_str() {
         "ci" => CI.iter().collect(),
+        "bench" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match bench::main(&root, &rest) {
+                Outcome::Ok => ExitCode::SUCCESS,
+                Outcome::Skip(why) => {
+                    eprintln!("skip: {why}");
+                    ExitCode::SUCCESS
+                }
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL bench: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         "" | "-h" | "--help" => {
             eprintln!("{USAGE}");
             return ExitCode::from(2);
@@ -89,8 +107,12 @@ fn workspace_root() -> PathBuf {
     here.parent().map(Path::to_path_buf).unwrap_or(here)
 }
 
+fn cargo_bin() -> std::ffi::OsString {
+    std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into())
+}
+
 fn cargo() -> Command {
-    Command::new(std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into()))
+    Command::new(cargo_bin())
 }
 
 fn run(mut cmd: Command, root: &Path) -> Outcome {
@@ -145,28 +167,34 @@ fn netns(root: &Path) -> Outcome {
     }
 }
 
-fn netns_run(root: &Path) -> Outcome {
+/// `unshare` arguments for a throwaway user + network namespace (no root).
+const UNSHARE: [&str; 4] = ["--user", "--map-root-user", "--net", "--"];
+
+/// Can this user create a link inside a fresh namespace? `Err` says why not.
+fn netns_probe() -> Result<(), String> {
     if !cfg!(target_os = "linux") {
-        return Outcome::Skip("network namespaces are Linux-only".into());
+        return Err("network namespaces are Linux-only".into());
     }
-    const UNSHARE: [&str; 4] = ["--user", "--map-root-user", "--net", "--"];
-    // Probe: can this user create a link inside a fresh namespace?
     match Command::new("unshare")
         .args(UNSHARE)
         .args(["ip", "link", "add", "xtask0", "type", "dummy"])
         .output()
     {
-        Ok(o) if o.status.success() => {}
-        Ok(o) => {
-            return Outcome::Skip(format!(
-                "unshare without root is not allowed here ({}); on Ubuntu: \
-                 sysctl kernel.apparmor_restrict_unprivileged_userns=0",
-                String::from_utf8_lossy(&o.stderr).trim()
-            ));
-        }
-        Err(e) => return Outcome::Skip(format!("cannot run unshare: {e}")),
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(format!(
+            "unshare without root is not allowed here ({}); on Ubuntu: \
+             sysctl kernel.apparmor_restrict_unprivileged_userns=0",
+            String::from_utf8_lossy(&o.stderr).trim()
+        )),
+        Err(e) => Err(format!("cannot run unshare: {e}")),
     }
-    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+}
+
+fn netns_run(root: &Path) -> Outcome {
+    if let Err(why) = netns_probe() {
+        return Outcome::Skip(why);
+    }
+    let cargo = cargo_bin();
     // One fresh namespace per test binary: each one's guard requires a
     // namespace holding only `lo`.
     for (package, test) in NETNS_TESTS {
