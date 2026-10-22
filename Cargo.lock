@@ -823,6 +823,7 @@ dependencies = [
  "log",
  "rustyline",
  "serde_json",
+ "signal-hook",
 ]
 
 [[package]]

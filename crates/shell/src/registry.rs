@@ -32,6 +32,12 @@ pub struct Command {
     pub query: bool,
     /// `Err(reason)` while the engine refuses it.
     pub enabled: Result<(), String>,
+    /// Shortcut usable from any menu (`ping`).
+    pub alias: Option<String>,
+    /// The parameter a bare value goes to.
+    pub positional: Option<String>,
+    /// Starts a background task (`tool.task.poll` follows it).
+    pub task: bool,
 }
 
 impl Command {
@@ -81,6 +87,8 @@ pub struct Registry {
     pub root: Menu,
     /// Command id → menu path, in `engine.list` order.
     pub order: Vec<(String, Vec<String>)>,
+    /// Shortcut → command id (`ping` → `tool.ping.start`).
+    pub aliases: BTreeMap<String, String>,
 }
 
 impl Registry {
@@ -107,6 +115,12 @@ impl Registry {
             };
             let text = |k: &str| e.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
             let doc_text = text("params");
+            let word = |k: &str| {
+                e.get(k)
+                    .and_then(Value::as_str)
+                    .filter(|a| a.len() <= 32 && !a.is_empty())
+                    .map(str::to_owned)
+            };
             let enabled = match e.get("enabled").and_then(Value::as_bool) {
                 Some(false) => Err(e
                     .get("disabledReason")
@@ -127,6 +141,10 @@ impl Registry {
                     doc: doc_text,
                     query: e.get("kind").and_then(Value::as_str) == Some("query"),
                     enabled,
+                    alias: word("alias")
+                        .filter(|a| a.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')),
+                    positional: word("positional"),
+                    task: e.get("task").and_then(Value::as_bool) == Some(true),
                 },
             ));
         }
@@ -145,6 +163,15 @@ impl Registry {
             }
             reg.order.push((cmd.id.clone(), path.clone()));
             node.commands.insert(cmd.verb.clone(), cmd);
+        }
+        // Shortcuts never hide a menu of the root.
+        let aliases: Vec<(String, String)> = reg
+            .commands()
+            .filter_map(|(_, c)| c.alias.clone().map(|a| (a, c.id.clone())))
+            .filter(|(a, _)| !reg.root.children.contains_key(a))
+            .collect();
+        for (a, id) in aliases {
+            reg.aliases.entry(a).or_insert(id);
         }
         reg
     }

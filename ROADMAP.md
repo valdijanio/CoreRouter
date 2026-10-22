@@ -360,7 +360,11 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `state.inspect`: permissões, Safe Mode e journal valem igual. SSH (`--ssh`, `russh`) fica para um
   segundo PR, depois do G0.3. Testes: 16 unitários + 14 de integração no shell (2 proptest), 3
   headless na UI; manual: daemon de lab + CLI `--connect` + GUI `--connect` com screenshot.
-  Esforço do agente ~6 h (**estimado**).
+  Depois do primeiro retorno do usuário (`ping 8.8.8.8` → "bad command name"): metadados
+  `alias`/`positional`/`task` no `CommandSpec` (construtores `const`), atalhos em qualquer menu,
+  valor posicional, tarefas acompanhadas ao vivo por `tool.task.poll` com Ctrl+C →
+  `tool.task.stop` (testado com roteador simulado; o ping real liga-se sozinho), e menos
+  requisições: ação = 3 (era ~12), `print` = 1. Esforço do agente ~8 h no total (**estimado**).
 
 ## Histórico de revisão
 

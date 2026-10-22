@@ -163,13 +163,20 @@ impl Shell {
                 out.push(cand(format!("{name} "), about, Style::Menu));
             }
         }
-        for name in parse::names(menu, path.is_empty()) {
+        for name in parse::names(&self.reg, menu, path.is_empty()) {
             if menu.children.contains_key(name) || !name.starts_with(typed) {
                 continue;
             }
             let about = menu
                 .commands
                 .get(name)
+                .or_else(|| {
+                    self.reg
+                        .aliases
+                        .get(name)
+                        .and_then(|id| self.reg.by_id(id))
+                        .map(|(_, c)| c)
+                })
                 .map(|c| c.label.clone())
                 .unwrap_or_else(|| {
                     match name {
@@ -524,18 +531,20 @@ impl Shell {
                     out.push((o, end, Style::Error));
                     continue;
                 };
-                let names = parse::names(menu, path.is_empty());
+                let names = parse::names(&self.reg, menu, path.is_empty());
                 match parse::pick(seg.trim_end_matches('?'), &names) {
                     Pick::One(n) if menu.children.contains_key(n) => {
                         path.push(n.to_owned());
                         out.push((o, end, Style::Menu));
                     }
                     Pick::One(n) => {
-                        verb = menu.commands.get(n);
-                        if verb.is_none() {
-                            // export / import / quit: plain arguments after.
-                            failed = false;
-                        }
+                        verb = menu.commands.get(n).or_else(|| {
+                            self.reg
+                                .aliases
+                                .get(n)
+                                .and_then(|id| self.reg.by_id(id))
+                                .map(|(_, c)| c)
+                        });
                         out.push((o, end, Style::Verb));
                         if verb.is_none() {
                             // Arguments of a built-in: color them as keys.
