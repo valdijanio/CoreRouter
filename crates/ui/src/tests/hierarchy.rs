@@ -5,7 +5,8 @@
 //! children, and Ctrl+Tab goes through the windows.
 
 use super::*;
-use crate::firewall::Feed;
+use crate::firewall::{Edit, Feed};
+use crate::firewall_assist::Wizard;
 use crate::float::{CHILD_STEP, child_offset};
 use egui::Key;
 
@@ -298,6 +299,49 @@ fn every_dialog_belongs_to_its_list() {
     );
     let rule_win = interfaces::dialog_id(h.app.fw.dialogs[0].id);
     assert!(h.app.floats.is_flashing(rule_win));
+
+    // A firewall assistant (G2.1b) too: one per kind, asked again = front.
+    h.app.open_wizard(Wizard::Block);
+    h.idle();
+    h.app.open_wizard(Wizard::Block);
+    h.idle();
+    let wizards: Vec<_> = h
+        .app
+        .fw
+        .dialogs
+        .iter()
+        .filter(|d| matches!(d.edit, Edit::Wizard { .. }))
+        .map(|d| interfaces::dialog_id(d.id))
+        .collect();
+    assert_eq!(wizards.len(), 1);
+    assert_eq!(h.app.floats.parent(wizards[0]), Some(win_id(Win::Firewall)));
+    assert!(h.app.floats.is_flashing(wizards[0]));
+
+    // DHCP Client (G4.7a).
+    let mut h = Harness::new();
+    lock(&h.session)
+        .execute("ip.dhcp-client.add", &json!({"interface": "ether1"}))
+        .unwrap();
+    h.app.open.clear();
+    h.app.open(Win::DhcpClient);
+    h.app.cache.refreshed_at = None;
+    h.idle();
+    h.idle();
+    let id = lock(&h.session)
+        .execute("ip.dhcp-client.list", &Value::Null)
+        .unwrap()[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    h.app.open_dhcp(&id);
+    h.idle();
+    h.app.open_dhcp(&id);
+    h.idle();
+    assert_eq!(h.app.dhcp_dialogs.len(), 1);
+    let win = interfaces::dialog_id(h.app.dhcp_dialogs[0].id);
+    assert_eq!(h.app.floats.parent(win), Some(win_id(Win::DhcpClient)));
+    assert!(h.app.floats.is_flashing(win));
+    assert!(h.app.tables.dhcp.open.contains(&id), "its row is marked");
 }
 
 #[test]

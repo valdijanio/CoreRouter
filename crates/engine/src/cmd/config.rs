@@ -12,7 +12,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Commit",
         ["System", "Configuration"],
         Some("Ctrl+Enter"),
-        "{comment?: string} → {revision}",
+        "{comment?: string, force?: bool (commit even if the firewall would cut your management connection)} → {revision}",
         dirty,
         commit
     ),
@@ -30,7 +30,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Rollback",
         ["System", "History"],
         None,
-        "{revision: u32} → {loaded, pending}",
+        "{revision: u32, force?: bool} → {loaded, pending}",
         always,
         rollback
     ),
@@ -89,6 +89,7 @@ fn in_safe_mode(s: &Session) -> std::result::Result<(), String> {
 }
 
 fn commit(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
     let revision = s.commit_candidate(&comment)?;
     Ok(json!({ "revision": revision }))
@@ -100,6 +101,7 @@ fn discard(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn rollback(s: &mut Session, p: &Value) -> Result<Value> {
+    crate::lockout::take_force(s, p)?;
     let rev = req_u32(p, "revision")?;
     s.store_mut().rollback(rev)?;
     // In immediate mode `execute` commits right after this returns.

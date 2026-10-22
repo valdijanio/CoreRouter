@@ -66,18 +66,18 @@ pub struct LldpFrame {
     pub lldpdu: Vec<u8>,
 }
 
-fn io_err(e: nix::Error) -> io::Error {
+pub(crate) fn io_err(e: nix::Error) -> io::Error {
     io::Error::from_raw_os_error(e as i32)
 }
 
 /// What the kernel reports for one interface, read via `getifaddrs`.
-struct IfInfo {
-    link: LinkAddr,
-    mac: [u8; 6],
+pub(crate) struct IfInfo {
+    pub(crate) link: LinkAddr,
+    pub(crate) mac: [u8; 6],
     allmulti: bool,
 }
 
-fn if_info(name: &IfName) -> io::Result<IfInfo> {
+pub(crate) fn if_info(name: &IfName) -> io::Result<IfInfo> {
     let found = getifaddrs()
         .map_err(io_err)?
         .filter(|a| a.interface_name == name.as_str())

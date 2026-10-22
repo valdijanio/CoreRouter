@@ -46,7 +46,7 @@ fn golden(name: &str, actual: &str) {
 fn sample_is_valid() {
     assert_eq!(
         sample().ip.firewall.filter.len(),
-        13,
+        15,
         "every fixture value parsed"
     );
     let issues = validate(&sample());
@@ -59,6 +59,7 @@ fn golden_full_ruleset() {
         list: "blocked".parse().unwrap(),
         address: "192.0.2.99".parse().unwrap(),
         timeout_secs: 600,
+        added_by_rule: false,
     }];
     golden("full.nft", &script(&sample(), &dynamic));
 }
@@ -292,10 +293,16 @@ fn families_split_only_for_address_lists() {
             .count()
     };
     assert_eq!(
-        tagged("*6"),
+        tagged("*7"),
         2,
         "both families + address list = 2 kernel rules"
     );
+    assert_eq!(
+        tagged("*6"),
+        4,
+        "a list that rule 21 (*15) fills: static or dynamic set, per family"
+    );
+    assert_eq!(tagged("*15"), 2, "filling a list (rule 21) needs ip or ip6");
     assert_eq!(tagged("*2"), 1);
     assert_eq!(tagged("*9"), 0, "disabled rules are not rendered");
     assert_eq!(tagged("*1"), 0, "sections are not rendered");

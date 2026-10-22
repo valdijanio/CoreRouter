@@ -41,6 +41,8 @@ pub(crate) struct Route {
     pub table: String,
     pub flags: String,
     pub active: bool,
+    /// From a DHCP client's lease (G4.7) or connected: not the operator's.
+    pub dynamic: bool,
     pub disabled: bool,
     pub immediate: Option<String>,
     pub reason: Option<String>,
@@ -70,6 +72,7 @@ impl Route {
             table: text("routing_table"),
             flags: text("flags"),
             active: flag("active"),
+            dynamic: flag("dynamic"),
             disabled: flag("disabled"),
             immediate: opt("immediate_gw"),
             reason: opt("reason"),
@@ -77,8 +80,9 @@ impl Route {
         }
     }
 
+    /// The operator's own route (not connected, not from a DHCP lease).
     fn is_static(&self) -> bool {
-        self.id.is_some()
+        self.id.is_some() && !self.dynamic
     }
 
     /// WinBox's gateway column: "10.0.0.1 reachable ether1".
@@ -415,7 +419,14 @@ impl CoreRouterUi {
     fn static_ids(&self, keys: &[String]) -> Vec<String> {
         let routes = self.route_rows();
         keys.iter()
-            .filter_map(|k| routes.iter().find(|r| r.key == *k)?.id.clone())
+            .filter_map(|k| {
+                routes
+                    .iter()
+                    .find(|r| r.key == *k)
+                    .filter(|r| r.is_static())?
+                    .id
+                    .clone()
+            })
             .collect()
     }
 
@@ -447,12 +458,12 @@ impl CoreRouterUi {
             return;
         }
         let dialog = match &r.id {
-            Some(id) => RouteDialog::Props {
+            Some(id) if r.is_static() => RouteDialog::Props {
                 id: id.clone(),
                 form: RouteForm::of(&r),
                 base: RouteForm::of(&r),
             },
-            None => RouteDialog::Connected(r.key.clone()),
+            _ => RouteDialog::Connected(r.key.clone()),
         };
         self.open_route_dialog(dialog);
     }
@@ -646,7 +657,11 @@ fn some(picked: &[&Route]) -> Result<(), String> {
 fn only_static(picked: &[&Route]) -> Result<(), String> {
     some(picked)?;
     if picked.iter().any(|r| !r.is_static()) {
-        Err("Connected routes come from IP addresses: change the address instead".into())
+        Err(
+            "Connected routes come from IP addresses, dynamic ones from a DHCP client: \
+             change those instead"
+                .into(),
+        )
     } else {
         Ok(())
     }
@@ -771,6 +786,7 @@ fn dialog_body(
 ) -> Footer<Button> {
     let mut toggle_label = None;
     let mut view_only = false;
+    let mut from_dhcp = false;
     Grid::new("fields")
         .num_columns(2)
         .spacing([12.0, 6.0])
@@ -797,15 +813,21 @@ fn dialog_body(
                     read_only(ui, "Gateway", &r.gateway);
                     read_only(ui, "Distance", &r.distance);
                     read_only(ui, "Routing Table", &r.table);
+                    from_dhcp = r.id.is_some();
                     ui.label("Status");
-                    ui.weak(format!("connected, {}", r.status()));
+                    let kind = if from_dhcp { "dynamic" } else { "connected" };
+                    ui.weak(format!("{kind}, {}", r.status()));
                     ui.end_row();
                 }
             }
             RouteDialog::Comment { text, .. } => f.text(ui, "Comment", "comment", text, ""),
         });
     if view_only {
-        ui.weak("Connected routes follow their IP address (IP › Addresses).");
+        ui.weak(if from_dhcp {
+            "Dynamic routes come with a DHCP client's lease (IP › DHCP Client)."
+        } else {
+            "Connected routes follow their IP address (IP › Addresses)."
+        });
         return Footer {
             buttons: Buttons::View,
             ok: Ok(()),

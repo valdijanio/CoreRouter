@@ -16,6 +16,7 @@ use serde_json::{Map, Value, json};
 
 use crate::avail::Avail;
 use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
+use crate::firewall_assist::{Wizard, WizardForm};
 use crate::interfaces::{cascade, dialog_id};
 use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
 use crate::{CoreRouterUi, RequestId, Then, Win, value_text};
@@ -78,6 +79,8 @@ impl FwTable {
                 "return",
                 "log",
                 "passthrough",
+                "add-src-to-address-list",
+                "add-dst-to-address-list",
             ],
             FwTable::Nat => &[
                 "accept",
@@ -88,6 +91,8 @@ impl FwTable {
                 "return",
                 "log",
                 "passthrough",
+                "add-src-to-address-list",
+                "add-dst-to-address-list",
             ],
             FwTable::Mangle => &[
                 "accept",
@@ -98,6 +103,8 @@ impl FwTable {
                 "return",
                 "log",
                 "passthrough",
+                "add-src-to-address-list",
+                "add-dst-to-address-list",
             ],
         }
     }
@@ -120,16 +127,19 @@ pub(crate) enum Feed {
     Addr,
     Lists,
     Members,
+    /// `ip.firewall.zone.list`: one object (zones, cells, rules).
+    Zones,
 }
 
 impl Feed {
-    pub(crate) const ALL: [Feed; 6] = [
+    pub(crate) const ALL: [Feed; 7] = [
         Feed::Filter,
         Feed::Nat,
         Feed::Mangle,
         Feed::Addr,
         Feed::Lists,
         Feed::Members,
+        Feed::Zones,
     ];
 
     /// The query that fills it.
@@ -141,6 +151,7 @@ impl Feed {
             Feed::Addr => "ip.firewall.address-list.list",
             Feed::Lists => "interface.list.list",
             Feed::Members => "interface.list.member.list",
+            Feed::Zones => "ip.firewall.zone.list",
         }
     }
 
@@ -182,6 +193,7 @@ impl Feed {
             Feed::Addr => "fw-addr",
             Feed::Lists => "if-lists",
             Feed::Members => "if-members",
+            Feed::Zones => "fw-zones",
             t => t.table().map(FwTable::salt).unwrap_or(""),
         }
     }
@@ -199,6 +211,7 @@ impl Feed {
             Feed::Addr => "Address List Entry",
             Feed::Lists => "Interface List",
             Feed::Members => "Interface List Member",
+            Feed::Zones => "Zone",
             t => t.table().map(FwTable::label).unwrap_or(""),
         }
     }
@@ -211,6 +224,7 @@ pub(crate) enum Tab {
     Nat,
     Mangle,
     Addr,
+    Zones,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -235,7 +249,7 @@ pub(crate) struct State {
     pub if_tab: IfTab,
     /// Chain filter of each rule table ("" = all).
     chain: [String; 3],
-    rows: [Vec<Value>; 6],
+    rows: [Vec<Value>; 7],
     pub dialogs: Vec<FwDialogWin>,
     /// Items to open once a list sent after this request arrives.
     open_after: Vec<(RequestId, Feed, String)>,
@@ -249,6 +263,7 @@ fn feed_index(f: Feed) -> usize {
         Feed::Addr => 3,
         Feed::Lists => 4,
         Feed::Members => 5,
+        Feed::Zones => 6,
     }
 }
 
@@ -340,8 +355,13 @@ const RULE_FIELDS: [&str; 27] = [
     "new_connection_mark",
     "new_packet_mark",
 ];
-/// The last action field (does not fit the array above).
-const RULE_FIELDS_TAIL: [&str; 1] = ["new_routing_mark"];
+/// The fields that do not fit the array above.
+const RULE_FIELDS_TAIL: [&str; 4] = [
+    "new_routing_mark",
+    "limit",
+    "address_list",
+    "address_list_timeout",
+];
 
 /// Fields only sent with these actions (so switching action does not send
 /// stale parameters the engine would refuse).
@@ -355,6 +375,9 @@ fn action_field_owner(field: &str) -> Option<&'static [&'static str]> {
         "new_connection_mark" => &["mark-connection"],
         "new_packet_mark" => &["mark-packet"],
         "new_routing_mark" => &["mark-routing"],
+        "address_list" | "address_list_timeout" => {
+            &["add-src-to-address-list", "add-dst-to-address-list"]
+        }
         _ => return None,
     })
 }
@@ -536,6 +559,11 @@ pub(crate) enum Edit {
         text: String,
         base: String,
     },
+    /// An assistant (G2.1b): one command with what the form holds.
+    Wizard {
+        kind: Wizard,
+        form: WizardForm,
+    },
 }
 
 impl Edit {
@@ -547,6 +575,7 @@ impl Edit {
             Edit::Member { form, base } => form != base,
             Edit::List { form, base } => form != base,
             Edit::Comment { text, base, .. } => text != base,
+            Edit::Wizard { .. } => false,
         }
     }
 
@@ -557,6 +586,7 @@ impl Edit {
             Edit::Member { .. } => Feed::Members,
             Edit::List { .. } => Feed::Lists,
             Edit::Comment { feed, .. } => *feed,
+            Edit::Wizard { kind, .. } => kind.feed(),
         }
     }
 
@@ -655,6 +685,7 @@ impl Edit {
                 })
             }
             (Edit::Comment { .. }, _) => None,
+            (Edit::Wizard { kind, form }, _) => Some((kind.cmd().to_owned(), form.params())),
         }
     }
 
@@ -680,6 +711,7 @@ impl Edit {
                 *base = form.clone();
             }
             Edit::Comment { text, base, .. } => *base = text.clone(),
+            Edit::Wizard { .. } => {}
         }
     }
 }
@@ -724,6 +756,8 @@ enum Act {
     Drop(String, Option<String>),
     SelectAll,
     Refresh,
+    /// Open an assistant (G2.1b).
+    Wizard(Wizard),
 }
 
 /// Colour of a rule by what it does (readable on both themes).
@@ -739,7 +773,7 @@ pub(crate) fn action_color(action: &str, dark: bool) -> Option<Color32> {
     Some(Color32::from_rgb(r, g, b))
 }
 
-const RULE_COLUMNS: [table::Column; 12] = [
+const RULE_COLUMNS: [table::Column; 13] = [
     col("#"),
     col(""),
     col("Chain"),
@@ -751,6 +785,7 @@ const RULE_COLUMNS: [table::Column; 12] = [
     col("Dst. Port"),
     col("In. Interface"),
     col("Out. Interface"),
+    col("Descrição"),
     comment(),
 ];
 
@@ -837,12 +872,30 @@ fn arrow(ui: &mut Ui, salt: &str, up: bool, enabled: Result<(), String>) -> bool
     resp.clicked()
 }
 
-fn rule_row(r: &Value, visuals: &egui::Visuals) -> Row {
+/// The Portuguese description, with a warning in front when an earlier
+/// rule takes every packet this one would see (named by its `#`, the
+/// number the table shows).
+pub(crate) fn description(r: &Value, all: &[Value]) -> String {
+    let d = text(r, "description");
+    let Some(by) = r.get("shadowed_by").and_then(Value::as_str) else {
+        return d;
+    };
+    let by = all
+        .iter()
+        .find(|o| o.get("id").and_then(Value::as_str) == Some(by))
+        .map_or_else(|| by.to_owned(), |o| format!("#{}", text(o, "position")));
+    format!("NUNCA CASA: a regra {by} acima já decide estes pacotes. {d}")
+}
+
+fn rule_row(r: &Value, all: &[Value], visuals: &egui::Visuals) -> Row {
     let section = is_section(r);
     let flags = text(r, "flags");
     let action = text(r, "action");
     let tint = if flags.contains('I') {
         Some(visuals.error_fg_color)
+    } else if flags.contains('S') {
+        // Shadowed: the warning colour, whatever the action.
+        Some(visuals.warn_fg_color)
     } else {
         action_color(&action, visuals.dark_mode)
     };
@@ -860,6 +913,11 @@ fn rule_row(r: &Value, visuals: &egui::Visuals) -> Row {
             text(r, "dst_port"),
             join(text(r, "in_interface"), bracketed(r, "in_interface_list")),
             join(text(r, "out_interface"), bracketed(r, "out_interface_list")),
+            if section {
+                String::new()
+            } else {
+                description(r, all)
+            },
             text(r, "comment"),
         ],
         dimmed: flag(r, "disabled"),
@@ -950,6 +1008,18 @@ fn list_row(r: &Value) -> Row {
     }
 }
 
+/// Rules the zone matrix generated change only through the matrix.
+fn not_zone(rows: &[Value], sel: &[String]) -> Result<(), String> {
+    let zone = rows
+        .iter()
+        .any(|r| flag(r, "zone") && sel.contains(&text(r, "id")));
+    if zone {
+        Err("Generated by the zone matrix: change it in the Zones tab".into())
+    } else {
+        Ok(())
+    }
+}
+
 fn some(sel: &[String], what: &str) -> Result<(), String> {
     if sel.is_empty() {
         Err(format!("Select one or more {what} first"))
@@ -961,6 +1031,7 @@ fn some(sel: &[String], what: &str) -> Result<(), String> {
 /// Enable/Disable greyed when nothing selected would change.
 fn can_toggle(rows: &[Value], f: Feed, sel: &[String], enable: bool) -> Result<(), String> {
     some(sel, "items")?;
+    not_zone(rows, sel)?;
     let picked: Vec<&Value> = rows
         .iter()
         .filter(|r| sel.contains(&key_of(f, r)))
@@ -997,6 +1068,8 @@ impl CoreRouterUi {
             Feed::Addr => &mut self.tables.fw_addr,
             Feed::Lists => &mut self.tables.if_lists,
             Feed::Members => &mut self.tables.if_members,
+            // The matrix is not a table; its rules are the filter table's.
+            Feed::Zones => &mut self.tables.fw_filter,
         }
     }
 
@@ -1027,6 +1100,7 @@ impl CoreRouterUi {
                 (Tab::Nat, "NAT"),
                 (Tab::Mangle, "Mangle"),
                 (Tab::Addr, "Address Lists"),
+                (Tab::Zones, "Zones"),
             ] {
                 ui.selectable_value(&mut self.fw.tab, tab, label);
             }
@@ -1037,6 +1111,7 @@ impl CoreRouterUi {
             Tab::Nat => self.rules_tab(ui, FwTable::Nat),
             Tab::Mangle => self.rules_tab(ui, FwTable::Mangle),
             Tab::Addr => self.simple_tab(ui, Feed::Addr),
+            Tab::Zones => self.zones_tab(ui),
         }
     }
 
@@ -1063,7 +1138,7 @@ impl CoreRouterUi {
             .iter()
             .filter(|r| chain.is_empty() || text(r, "chain") == chain)
             .collect();
-        let rows: Vec<Row> = shown.iter().map(|r| rule_row(r, &visuals)).collect();
+        let rows: Vec<Row> = shown.iter().map(|r| rule_row(r, &all, &visuals)).collect();
         let order: Vec<String> = all.iter().map(|r| text(r, "id")).collect();
         self.fw_table(f).reorder = chain.is_empty();
         let selection = self.fw_table(f).selection(&rows);
@@ -1071,10 +1146,12 @@ impl CoreRouterUi {
         let mut act: Option<Act> = None;
         let set = t.cmd("set");
         let one = match selection.as_slice() {
-            [k] => Ok(k.clone()),
+            [k] => not_zone(&all, &selection).map(|()| k.clone()),
             [] => Err("Select a rule first".to_owned()),
             _ => Err("Select one rule to move it".to_owned()),
         };
+        let editable =
+            |sel: &[String], what: &str| some(sel, what).and_then(|()| not_zone(&all, sel));
         let up = one.clone().and_then(|k| {
             if order.first() == Some(&k) {
                 Err("Already the first rule".into())
@@ -1099,7 +1176,7 @@ impl CoreRouterUi {
                 (
                     Icon::Remove,
                     "Remove",
-                    can.and(&t.cmd("remove"), some(&selection, "rules")),
+                    can.and(&t.cmd("remove"), editable(&selection, "rules")),
                 ),
                 (
                     Icon::Enable,
@@ -1114,7 +1191,7 @@ impl CoreRouterUi {
                 (
                     Icon::Comment,
                     "Comment",
-                    can.and(&set, some(&selection, "rules")),
+                    can.and(&set, editable(&selection, "rules")),
                 ),
             ];
             for (icon, tip, enabled) in tools {
@@ -1137,6 +1214,13 @@ impl CoreRouterUi {
             if action(ui, "Section", can.check(&t.cmd("add"))) {
                 act = Some(Act::NewSection);
             }
+            ui.menu_button("Templates", |ui| {
+                for w in Wizard::ALL {
+                    if action(ui, &format!("{}…", w.label()), can.check(w.cmd())) {
+                        act = Some(Act::Wizard(w));
+                    }
+                }
+            });
             let mut picked = chain.clone();
             let mut chains: Vec<String> = vec![String::new()];
             chains.extend(t.chains().iter().map(|c| (*c).to_owned()));
@@ -1198,10 +1282,14 @@ impl CoreRouterUi {
                     ) {
                         act = Some(Act::Disable(owned()));
                     }
-                    if action(ui, "Remove", can.and(&t.cmd("remove"), some(sel, "rules"))) {
+                    if action(
+                        ui,
+                        "Remove",
+                        can.and(&t.cmd("remove"), editable(sel, "rules")),
+                    ) {
                         act = Some(Act::Remove(owned()));
                     }
-                    if action(ui, "Comment…", can.and(&set, some(sel, "rules"))) {
+                    if action(ui, "Comment…", can.and(&set, editable(sel, "rules"))) {
                         act = Some(Act::Comment(owned()));
                     }
                     if action(ui, "Properties…", some(sel, "rules")) {
@@ -1548,6 +1636,7 @@ impl CoreRouterUi {
                 }
                 self.run(&t.cmd("move"), p);
             }
+            Act::Wizard(w) => self.open_wizard(w),
             Act::SelectAll => self.fw_table(f).select_all(rows),
             Act::Refresh => self.cache.refreshed_at = None,
         }
@@ -1561,6 +1650,27 @@ impl CoreRouterUi {
             .filter(|d| d.edit.feed() == f && !matches!(d.edit, Edit::Comment { .. }))
             .filter_map(|d| d.item.clone())
             .collect()
+    }
+
+    /// The window of an assistant (one at a time per kind; asking again
+    /// brings the open one to the front).
+    pub(crate) fn open_wizard(&mut self, w: Wizard) {
+        let open = self
+            .fw
+            .dialogs
+            .iter_mut()
+            .find(|d| matches!(&d.edit, Edit::Wizard { kind, .. } if *kind == w));
+        if let Some(d) = open {
+            d.status.bring_to_front();
+        } else {
+            self.open_fw_dialog(
+                None,
+                Edit::Wizard {
+                    kind: w,
+                    form: w.form(),
+                },
+            );
+        }
     }
 
     fn open_fw_dialog(&mut self, item: Option<String>, edit: Edit) {
@@ -1874,6 +1984,7 @@ fn title(e: &Edit, item: Option<&str>, row: Option<&Value>) -> String {
             [one] => format!("Comment for {} <{one}>", feed.what()),
             many => format!("Comment for {} items", many.len()),
         },
+        Edit::Wizard { kind, .. } => kind.label().to_owned(),
     }
 }
 
@@ -1945,6 +2056,9 @@ fn body(
     pick: &Picks<'_>,
     can: &Avail,
 ) -> Footer<Button> {
+    if let Edit::Wizard { kind, form } = e {
+        return crate::firewall_assist::body(ui, f, *kind, form, can);
+    }
     let feed = e.feed();
     let mut toggle = None;
     match e {
@@ -2092,6 +2206,7 @@ fn body(
                         rule_field(ui, f, form, "Connection Mark", "connection_mark", "name");
                         rule_field(ui, f, form, "Packet Mark", "packet_mark", "name");
                         rule_field(ui, f, form, "Routing Mark", "routing_mark", "name");
+                        rule_field(ui, f, form, "Limit", "limit", "5/1s,10 (count/time,burst)");
                     }
                     RuleTab::Action => {
                         let actions = strings(t.actions());
@@ -2113,6 +2228,12 @@ fn body(
                             ("new_connection_mark", "New Connection Mark", "name"),
                             ("new_packet_mark", "New Packet Mark", "name"),
                             ("new_routing_mark", "New Routing Mark", "name"),
+                            ("address_list", "Address List", "name"),
+                            (
+                                "address_list_timeout",
+                                "Timeout",
+                                "none (until restart), 1m, 1d",
+                            ),
                         ];
                         for (param, label, hint) in fields {
                             if !form.applies(param) {
@@ -2134,6 +2255,8 @@ fn body(
                                     ]),
                                     hint,
                                 );
+                            } else if *param == "address_list" {
+                                rule_combo(ui, f, form, label, param, pick.addr_lists, hint);
                             } else {
                                 rule_field(ui, f, form, label, param, hint);
                             }
@@ -2263,6 +2386,7 @@ fn body(
                 f.text(ui, "Comment", "comment", text, "");
             });
         }
+        Edit::Wizard { .. } => {}
     }
     let new = item.is_none();
     let ok_cmd = match e {

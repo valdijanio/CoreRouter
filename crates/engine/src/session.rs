@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::auth::{self, Group, Login, Logins, Principal};
 use crate::cmd::{self, check_params, unknown_command};
+use crate::dhcp_client::DhcpRuntime;
 use crate::firewall_dyn::DynamicLists;
 use crate::link_watch::LinkWatch;
 use crate::neighbors::NeighborTable;
@@ -66,10 +67,18 @@ pub struct Session {
     pub(crate) dynamic_addresses: DynamicLists,
     /// Diagnostic tool jobs (operational state, never saved).
     pub(crate) tasks: Tasks,
+    /// DHCP clients at run time: leases, what they installed, history
+    /// (operational state, never saved; G4.7).
+    pub(crate) dhcp: DhcpRuntime,
     /// Router accounts (G0.3): saved with the config, outside its revisions.
     users: Users,
     /// Logged-in sessions, for `user.active.list` (never saved).
     logins: Logins,
+    /// The command being run said `force: true`: a lockout is accepted
+    /// (G2.1b, see `crate::lockout`). Reset after each command or batch.
+    pub(crate) lockout_ack: bool,
+    /// Inside [`Session::batch`]: the steps share one acknowledgement.
+    in_batch: bool,
     /// When links went up/down (operational, never saved; G1.19).
     pub(crate) links: LinkWatch,
 }
@@ -101,6 +110,8 @@ impl Session {
     /// (newest readable slot) and saves it there after every commit. With
     /// nothing readable stored, it starts from the discovered ports.
     pub fn with_storage(mut hal: Box<dyn Hal>, mut storage: Box<dyn ConfigStorage>) -> Self {
+        // The virtual lab's DHCP clients get leases from a simulated server.
+        hal.offer_dhcp_lab_server(Arc::new(corerouter_proto_dhcp::lab::LabServer::default()));
         let (restored, boot_errors) = restore(storage.as_mut());
         let (restored, users) = match restored {
             Some((store, users, slot)) => (Some((store, slot)), users),
@@ -144,8 +155,11 @@ impl Session {
             neighbors: NeighborTable::default(),
             dynamic_addresses: DynamicLists::default(),
             tasks: Tasks::default(),
+            dhcp: DhcpRuntime::default(),
             users,
             logins: Logins::default(),
+            lockout_ack: false,
+            in_batch: false,
             links: LinkWatch::default(),
         }
     }
@@ -179,6 +193,9 @@ impl Session {
         });
         if result.is_err() {
             self.store.set_candidate(snapshot);
+        }
+        if !self.in_batch {
+            self.lockout_ack = false;
         }
         if spec.journal {
             self.record(id, params, &result);
@@ -233,6 +250,22 @@ impl Session {
         if atomic {
             self.mode = CommitMode::Transactional;
         }
+        let outer_batch = std::mem::replace(&mut self.in_batch, true);
+        let out = self.batch_steps(steps, atomic, saved_mode, snapshot);
+        self.in_batch = outer_batch;
+        if !outer_batch {
+            self.lockout_ack = false;
+        }
+        out
+    }
+
+    fn batch_steps(
+        &mut self,
+        steps: &[Value],
+        atomic: bool,
+        saved_mode: CommitMode,
+        snapshot: corerouter_model::Config,
+    ) -> Result<Value> {
         let mut results: Vec<Value> = Vec::with_capacity(steps.len());
         let mut outcome = Ok(());
         for (i, step) in steps.iter().enumerate() {
@@ -281,12 +314,31 @@ impl Session {
     /// In Safe Mode the revision is marked and not saved: the boot config
     /// stays the one from the entry until `config.safe-mode.exit`.
     pub(crate) fn commit_candidate(&mut self, comment: &str) -> Result<u32> {
+        self.commit_checked(comment, true)
+    }
+
+    /// [`Self::commit_candidate`] without the lockout check: for restoring a
+    /// config that was running before (the Safe Mode undo).
+    pub(crate) fn commit_restoring(&mut self, comment: &str) -> Result<u32> {
+        self.commit_checked(comment, false)
+    }
+
+    fn commit_checked(&mut self, comment: &str, lockout: bool) -> Result<u32> {
         let issues = validate_all(self.store.candidate());
         if !issues.is_empty() {
             return Err(EngineError::Validation(issues));
         }
+        // The data plane also holds what DHCP clients installed (G4.7).
+        let from = self.effective(self.store.running()).into_owned();
+        let to = self.effective(self.store.candidate()).into_owned();
+        // The lockout check sees the same: a DHCP address can be the one
+        // the operator is connected to.
+        if lockout {
+            let dynamic = self.dynamic_now();
+            self.check_lockout(&from, &to, &dynamic, &dynamic)?;
+        }
         self.hal
-            .apply(self.store.running(), self.store.candidate())
+            .apply(&from, &to)
             .map_err(|e| EngineError::Hal(e.to_string()))?;
         let pending = self.safe_mode.is_active();
         let comment = match (pending, comment.is_empty()) {

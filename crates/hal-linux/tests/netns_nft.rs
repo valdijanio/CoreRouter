@@ -22,6 +22,9 @@ use corerouter_model::firewall::DynamicAddress;
 
 const ENV: &str = "COREROUTER_NETNS_TESTS";
 
+/// The tests share one kernel table: one at a time.
+static KERNEL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn ready() -> bool {
     if std::env::var_os(ENV).is_none_or(|v| v != "1") {
         eprintln!("skipped: set {ENV}=1 and run inside `unshare --user --map-root-user --net`");
@@ -73,6 +76,7 @@ fn firewall_is_applied_replaced_and_removed_atomically() {
     if !ready() {
         return;
     }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
     // A table of another owner must survive everything below.
     let mut other = Command::new("nft")
         .args(["add", "table", "inet", "someone-else"])
@@ -88,7 +92,7 @@ fn firewall_is_applied_replaced_and_removed_atomically() {
     hal.apply(&empty, &fw_only).unwrap();
     let text = ruleset();
     assert!(text.contains("table inet corerouter"), "{text}");
-    assert_eq!(text.matches("comment \"cr:").count(), 20, "{text}");
+    assert_eq!(text.matches("comment \"cr:").count(), 25, "{text}");
     assert!(text.contains("table inet someone-else"));
 
     // A dynamic entry survives a replace of the table.
@@ -96,6 +100,7 @@ fn firewall_is_applied_replaced_and_removed_atomically() {
         list: "blocked".parse().unwrap(),
         address: "192.0.2.77".parse().unwrap(),
         timeout_secs: 300,
+        added_by_rule: false,
     };
     hal.address_list_dynamic(DynamicChange::Add(&d)).unwrap();
     assert_eq!(nft::dynamic().len(), 1);
@@ -135,4 +140,97 @@ fn firewall_is_applied_replaced_and_removed_atomically() {
         .status()
         .unwrap();
     assert!(other.success());
+}
+
+/// G2.1b: an `add-src-to-address-list` rule fills the list's dynamic set
+/// from the packet path, the entries survive a table replace, a rule on
+/// that list matches them, and `limit` loads.
+#[test]
+fn rules_fill_address_lists_from_the_packet_path() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    assert!(
+        Command::new("ip")
+            .args(["link", "set", "lo", "up"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let sample = |pairs: &[(&str, &str)]| corerouter_firewall::sample::m(pairs).unwrap();
+    let act = |json: &str| corerouter_firewall::sample::act(json).unwrap();
+    let rule = |id, chain, m, a| corerouter_firewall::sample::rule(id, chain, m, a).unwrap();
+    let mut cfg = Config::default();
+    cfg.ip.firewall.filter = vec![
+        rule(
+            1,
+            "input",
+            sample(&[
+                ("protocol", "tcp"),
+                ("dst_port", "2222"),
+                ("connection_state", "new"),
+            ]),
+            act(
+                r#"{"type":"add-src-to-address-list","address_list":"knock","address_list_timeout":"10m"}"#,
+            ),
+        ),
+        rule(
+            2,
+            "input",
+            sample(&[
+                ("src_address_list", "knock"),
+                ("protocol", "tcp"),
+                ("dst_port", "2223"),
+            ]),
+            act(r#"{"type":"reject","reject_with":"tcp-reset"}"#),
+        ),
+        rule(
+            3,
+            "input",
+            sample(&[("protocol", "icmp"), ("limit", "2/1s,2")]),
+            act(r#"{"type":"accept"}"#),
+        ),
+    ];
+    let mut hal = LinuxHal::new();
+    hal.apply(&Config::default(), &cfg).unwrap();
+
+    // A SYN to 2222: nothing listens (refused), but the input chain saw it.
+    let addr: std::net::SocketAddr = "127.0.0.1:2222".parse().unwrap();
+    let _ = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2));
+    let kept = nft::dynamic();
+    assert!(
+        kept.iter().any(|d| d.added_by_rule
+            && d.list.as_str() == "knock"
+            && d.address.to_string() == "127.0.0.1"
+            && d.timeout_secs > 0),
+        "{kept:?}\n{}",
+        ruleset()
+    );
+
+    // A replace keeps it in the dynamic set, and rule 2 matches it.
+    let mut changed = cfg.clone();
+    changed.ip.firewall.filter.retain(|r| r.id.0 != 3);
+    hal.apply(&cfg, &changed).unwrap();
+    let text = ruleset();
+    assert!(text.contains("set ad4_knock"), "{text}");
+    assert!(text.contains("127.0.0.1"), "entry kept: {text}");
+    let counters = |id: &str| -> String {
+        ruleset()
+            .lines()
+            .filter(|l| l.contains(&format!("\"cr:{id}\"")))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let addr: std::net::SocketAddr = "127.0.0.1:2223".parse().unwrap();
+    let _ = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2));
+    let hits = counters("*2");
+    assert!(
+        hits.lines()
+            .any(|l| l.contains("@ad4_knock") && l.contains("packets 1 ")),
+        "the dynamic-set rule counted the SYN: {hits}"
+    );
+
+    hal.apply(&changed, &Config::default()).unwrap();
+    assert!(!ruleset().contains("corerouter"));
 }

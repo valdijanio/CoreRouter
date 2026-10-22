@@ -6,11 +6,13 @@
 //! Every rule change is checked by `corerouter_firewall::rule_issues` before
 //! it touches the candidate; the whole config is validated again at commit.
 
+use corerouter_firewall::describe::describe;
 use corerouter_firewall::rule_issues;
+use corerouter_firewall::shadow::shadowed;
 use corerouter_firewall::validate::MAX_RULES;
 use corerouter_hal::DynamicChange;
 use corerouter_model::firewall::{
-    Action, AddrMatch, AddressListEntry, Family, FirewallRule, Matchers, Name, Table,
+    Action, AddrMatch, AddressListEntry, Family, FirewallRule, Matchers, Name, Table, Timeout,
 };
 use corerouter_model::{Config, ItemId};
 use serde_json::{Map, Value, json};
@@ -18,10 +20,11 @@ use serde_json::{Map, Value, json};
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, req_parse};
 use super::{CommandSpec, always};
 use crate::firewall_dyn::{DynamicEntry, MAX_DYNAMIC};
+use crate::lockout::take_force;
 use crate::{EngineError, Result, Session};
 
 /// Matcher parameters, in the order the GUI and `summary` show them.
-pub const MATCHERS: [&str; 17] = [
+pub const MATCHERS: [&str; 18] = [
     "src_address",
     "dst_address",
     "src_address_list",
@@ -39,10 +42,11 @@ pub const MATCHERS: [&str; 17] = [
     "connection_mark",
     "packet_mark",
     "routing_mark",
+    "limit",
 ];
 
 /// Action parameters and the actions each one belongs to.
-const ACTION_FIELDS: [(&str, &[&str]); 9] = [
+const ACTION_FIELDS: [(&str, &[&str]); 11] = [
     ("reject_with", &["reject"]),
     ("jump_target", &["jump"]),
     ("log_prefix", &["log"]),
@@ -54,6 +58,14 @@ const ACTION_FIELDS: [(&str, &[&str]); 9] = [
     (
         "passthrough",
         &["mark-connection", "mark-packet", "mark-routing"],
+    ),
+    (
+        "address_list",
+        &["add-src-to-address-list", "add-dst-to-address-list"],
+    ),
+    (
+        "address_list_timeout",
+        &["add-src-to-address-list", "add-dst-to-address-list"],
     ),
 ];
 
@@ -114,7 +126,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Filter Rule",
         ["IP", "Firewall"],
         None,
-        "{chain?: input | forward | output | <custom>, action?: accept | drop | reject | jump | return | log | passthrough (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports (22 or 80-90 or a comma-separated list), dst_port?: [!]ports, in_interface?: [!]interface, out_interface?: [!]interface, in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]list of established | related | new | invalid | untracked (comma-separated), connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, reject_with?: icmp-no-route | icmp-admin-prohibited | icmp-address-unreachable | icmp-port-unreachable | tcp-reset, jump_target?: chain, log_prefix?: string, disabled?: bool, comment?: string, section?: string (a section header with this title instead of a rule), place_before?: *hex} → {id}",
+        "{chain?: input | forward | output | <custom>, action?: accept | drop | reject | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports (22 or 80-90 or a comma-separated list), dst_port?: [!]ports, in_interface?: [!]interface, out_interface?: [!]interface, in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]list of established | related | new | invalid | untracked (comma-separated), connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst] (5/1s,10; time 1s 1m 1h 1d), reject_with?: icmp-no-route | icmp-admin-prohibited | icmp-address-unreachable | icmp-port-unreachable | tcp-reset, jump_target?: chain, log_prefix?: string, address_list?: name (add-*-to-address-list), address_list_timeout?: duration (30s, 1h, 1d; absent = until restart), disabled?: bool, comment?: string, section?: string (a section header with this title instead of a rule), place_before?: *hex, force?: bool (apply even if it would cut your management connection)} → {id}",
         always,
         filter_add
     ),
@@ -123,7 +135,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Filter Rule",
         [],
         None,
-        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, reject_with?, jump_target?, log_prefix?, disabled?: bool, comment?: string, section?: string (title of a section header)} → {id} (same syntax as add; \"\" clears a matcher)",
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, limit?, reject_with?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string (title of a section header), force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
         has_filter,
         filter_set
     ),
@@ -132,7 +144,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove Filter Rule",
         [],
         None,
-        "{id: *hex} → {id}",
+        "{id: *hex, force?: bool} → {id}",
         has_filter,
         filter_remove
     ),
@@ -141,19 +153,19 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Move Filter Rule",
         [],
         None,
-        "{id: *hex, destination?: *hex (moved above it; absent = to the end)} → {id, position}",
+        "{id: *hex, destination?: *hex (moved above it; absent = to the end), force?: bool} → {id, position}",
         has_filter,
         filter_move
     ),
     cmd!(query "ip.firewall.filter.list", "Filter Rules", ["IP", "Firewall"], None,
-        "{chain?: string} → [{id, position, chain, family, action, flags (X disabled, I invalid), disabled, invalid, reason, section (title of a section header, else null), comment, summary, <matchers and action parameters set on the rule>}]",
+        "{chain?: string} → [{id, position, chain, family, action, flags (X disabled, I invalid, S shadowed, Z zone matrix), disabled, invalid, reason, shadowed_by (*hex of the earlier rule that takes all its packets, else null), zone (generated by ip.firewall.zone), section (title of a section header, else null), comment, summary, description (in Portuguese), <matchers and action parameters set on the rule>}]",
         always, filter_list),
     cmd!(
         "ip.firewall.nat.add",
         "Add NAT Rule",
         ["IP", "Firewall"],
         None,
-        "{chain?: srcnat | dstnat | <custom>, action?: accept | masquerade | src-nat | dst-nat | jump | return | log | passthrough (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface, out_interface?: [!]interface, in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, to_addresses?: ip | ip-ip (src-nat, dst-nat), to_ports?: port | port-port, jump_target?: chain, log_prefix?: string, disabled?: bool, comment?: string, section?: string, place_before?: *hex} → {id}",
+        "{chain?: srcnat | dstnat | <custom>, action?: accept | masquerade | src-nat | dst-nat | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface, out_interface?: [!]interface, in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst], to_addresses?: ip | ip-ip (src-nat, dst-nat), to_ports?: port | port-port, jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id}",
         always,
         nat_add
     ),
@@ -162,7 +174,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set NAT Rule",
         [],
         None,
-        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, to_addresses?, to_ports?, jump_target?, log_prefix?, disabled?: bool, comment?: string, section?: string} → {id} (same syntax as add; \"\" clears a matcher)",
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, limit?, to_addresses?, to_ports?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
         has_nat,
         nat_set
     ),
@@ -171,7 +183,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove NAT Rule",
         [],
         None,
-        "{id: *hex} → {id}",
+        "{id: *hex, force?: bool} → {id}",
         has_nat,
         nat_remove
     ),
@@ -180,19 +192,19 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Move NAT Rule",
         [],
         None,
-        "{id: *hex, destination?: *hex (moved above it; absent = to the end)} → {id, position}",
+        "{id: *hex, destination?: *hex (moved above it; absent = to the end), force?: bool} → {id, position}",
         has_nat,
         nat_move
     ),
     cmd!(query "ip.firewall.nat.list", "NAT Rules", ["IP", "Firewall"], None,
-        "{chain?: string} → [{id, position, chain, family, action, flags, disabled, invalid, reason, section, comment, summary, …}]",
+        "{chain?: string} → [{id, position, chain, family, action, flags, disabled, invalid, reason, shadowed_by, zone, section, comment, summary, description, …}]",
         always, nat_list),
     cmd!(
         "ip.firewall.mangle.add",
         "Add Mangle Rule",
         ["IP", "Firewall"],
         None,
-        "{chain?: prerouting | input | forward | output | postrouting | <custom>, action?: accept | mark-connection | mark-packet | mark-routing | jump | return | log | passthrough (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface, out_interface?: [!]interface, in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, new_connection_mark?: name, new_packet_mark?: name, new_routing_mark?: name, passthrough?: bool (default true), jump_target?: chain, log_prefix?: string, disabled?: bool, comment?: string, section?: string, place_before?: *hex} → {id}",
+        "{chain?: prerouting | input | forward | output | postrouting | <custom>, action?: accept | mark-connection | mark-packet | mark-routing | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface, out_interface?: [!]interface, in_interface_list?: [!]list, out_interface_list?: [!]list, connection_state?: [!]states, connection_nat_state?: [!]srcnat | dstnat (comma-separated), icmp_options?: type[:code], connection_mark?: [!]name, packet_mark?: [!]name, routing_mark?: [!]name, limit?: count/time[,burst], new_connection_mark?: name, new_packet_mark?: name, new_routing_mark?: name, passthrough?: bool (default true), jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id}",
         always,
         mangle_add
     ),
@@ -201,7 +213,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Mangle Rule",
         [],
         None,
-        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, new_connection_mark?, new_packet_mark?, new_routing_mark?, passthrough?: bool, jump_target?, log_prefix?, disabled?: bool, comment?: string, section?: string} → {id} (same syntax as add; \"\" clears a matcher)",
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, connection_state?, connection_nat_state?, icmp_options?, connection_mark?, packet_mark?, routing_mark?, limit?, new_connection_mark?, new_packet_mark?, new_routing_mark?, passthrough?: bool, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
         has_mangle,
         mangle_set
     ),
@@ -210,7 +222,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove Mangle Rule",
         [],
         None,
-        "{id: *hex} → {id}",
+        "{id: *hex, force?: bool} → {id}",
         has_mangle,
         mangle_remove
     ),
@@ -219,19 +231,19 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Move Mangle Rule",
         [],
         None,
-        "{id: *hex, destination?: *hex (moved above it; absent = to the end)} → {id, position}",
+        "{id: *hex, destination?: *hex (moved above it; absent = to the end), force?: bool} → {id, position}",
         has_mangle,
         mangle_move
     ),
     cmd!(query "ip.firewall.mangle.list", "Mangle Rules", ["IP", "Firewall"], None,
-        "{chain?: string} → [{id, position, chain, family, action, flags, disabled, invalid, reason, section, comment, summary, …}]",
+        "{chain?: string} → [{id, position, chain, family, action, flags, disabled, invalid, reason, shadowed_by, zone, section, comment, summary, description, …}]",
         always, mangle_list),
     cmd!(
         "ip.firewall.address-list.add",
         "Add Address List Entry",
         ["IP", "Firewall"],
         None,
-        "{list: name, address: ip | cidr | ip-ip (IPv4 or IPv6), timeout?: seconds | 30s | 5m | 1h | 1d | 1h30m (dynamic entry: not saved, expires), disabled?: bool, comment?: string} → {id, dynamic}",
+        "{list: name, address: ip | cidr | ip-ip (IPv4 or IPv6), timeout?: seconds | 30s | 5m | 1h | 1d | 1h30m (dynamic entry: not saved, expires), disabled?: bool, comment?: string, force?: bool} → {id, dynamic}",
         always,
         al_add
     ),
@@ -240,7 +252,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Address List Entry",
         [],
         None,
-        "{id: *hex (a static entry), list?: name, address?: ip | cidr | ip-ip, disabled?: bool, comment?: string} → {id}",
+        "{id: *hex (a static entry), list?: name, address?: ip | cidr | ip-ip, disabled?: bool, comment?: string, force?: bool} → {id}",
         has_static_entries,
         al_set
     ),
@@ -249,7 +261,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove Address List Entry",
         [],
         None,
-        "{id: *hex (static or dynamic)} → {id}",
+        "{id: *hex (static or dynamic), force?: bool} → {id}",
         has_entries,
         al_remove
     ),
@@ -301,6 +313,42 @@ fn position(cfg: &Config, table: Table, id: ItemId, key: &str) -> Result<usize> 
                 ),
             )
         })
+}
+
+/// What the zone matrix generated is rewritten by `ip.firewall.zone.set`:
+/// a hand edit would be lost at the next change, so it is refused.
+fn not_zone(r: &FirewallRule) -> Result<()> {
+    if r.zone {
+        return Err(EngineError::bad(
+            "id",
+            format!(
+                "{} is generated by the zone matrix: change the matrix (ip.firewall.zone.set), \
+                 or ip.firewall.zone.detach to turn its rules into normal rules",
+                r.id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A rule placed above `anchor` must not land inside the zone block (only
+/// above its header).
+fn outside_zone_block(cfg: &Config, table: Table, anchor: ItemId, key: &str) -> Result<()> {
+    let rules = cfg.ip.firewall.rules(table);
+    let first_zone = rules.iter().find(|r| r.zone).map(|r| r.id);
+    let inside = rules
+        .iter()
+        .any(|r| r.id == anchor && r.zone && Some(r.id) != first_zone);
+    if inside {
+        return Err(EngineError::bad(
+            key,
+            format!(
+                "{anchor} is inside the zone matrix's rules; place it above the zone \
+                 section's header or after its last rule"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// The JSON of `p[key]` as a matcher/action value: a string; `""` clears.
@@ -463,7 +511,9 @@ fn check_interfaces(cfg: &Config, before: &Matchers, after: &Matchers) -> Result
         ("in_interface", &before.in_interface, &after.in_interface),
         ("out_interface", &before.out_interface, &after.out_interface),
     ] {
+        // `lo` (loopback) is never in the config but always exists.
         if let Some(n) = a.as_ref().filter(|n| Some(*n) != b.as_ref())
+            && n.value.as_str() != "lo"
             && !cfg.interfaces.contains_key(&n.value)
         {
             return Err(EngineError::bad(
@@ -494,7 +544,8 @@ fn rule_keys_in(p: &Value) -> Option<&'static str> {
         .find(|k| p.get(*k).is_some_and(|v| !v.is_null()))
 }
 
-fn add(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
+pub(super) fn add(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let section = opt_text(p, "section", 256)?;
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
@@ -512,7 +563,11 @@ fn add(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
         disabled,
         comment,
         section: false,
+        zone: false,
     };
+    if let Some(anchor) = before {
+        outside_zone_block(s.store().candidate(), table, anchor, "place_before")?;
+    }
     if let Some(title) = section {
         if let Some(k) = rule_keys_in(p) {
             return Err(EngineError::bad(
@@ -555,6 +610,7 @@ fn add(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
 }
 
 fn set(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
     let section = opt_text(p, "section", 256)?;
     let disabled = opt_bool(p, "disabled")?;
@@ -571,6 +627,7 @@ fn set(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
         .get(pos)
         .cloned()
         .ok_or_else(|| EngineError::bad("id", format!("no rule {id}")))?;
+    not_zone(&rule)?;
     let old = rule.clone();
     if rule.section {
         if let Some(k) = rule_keys_in(p) {
@@ -615,19 +672,30 @@ fn set(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
     let cfg = s.store_mut().candidate_mut();
     let pos = position(cfg, table, id, "id")?;
+    if let Some(r) = cfg.ip.firewall.rules(table).get(pos) {
+        not_zone(r)?;
+    }
     cfg.ip.firewall.rules_mut(table).remove(pos);
     Ok(json!({ "id": id }))
 }
 
 /// RouterOS `move`: above `destination`, or to the end.
 fn move_rule(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
     let dest: Option<ItemId> = opt_parse(p, "destination")?;
     let cfg = s.store_mut().candidate_mut();
     let from = position(cfg, table, id, "id")?;
+    if let Some(r) = cfg.ip.firewall.rules(table).get(from) {
+        not_zone(r)?;
+    }
+    if let Some(d) = dest {
+        outside_zone_block(cfg, table, d, "destination")?;
+    }
     if dest == Some(id) {
         return Ok(json!({ "id": id, "position": from }));
     }
@@ -674,8 +742,15 @@ pub fn summary(r: &FirewallRule) -> String {
     parts.join(" ")
 }
 
-/// One rule as `ip.firewall.<table>.list` shows it.
-pub fn row(cfg: &Config, table: Table, position: usize, r: &FirewallRule) -> Value {
+/// One rule as `ip.firewall.<table>.list` shows it; `shadowed_by` comes
+/// from [`corerouter_firewall::shadow::shadowed`] over the whole table.
+pub fn row(
+    cfg: &Config,
+    table: Table,
+    position: usize,
+    r: &FirewallRule,
+    shadowed_by: Option<ItemId>,
+) -> Value {
     let issue = rule_issues(cfg, table, r).into_iter().next();
     let mut flags = String::new();
     if r.disabled {
@@ -683,6 +758,12 @@ pub fn row(cfg: &Config, table: Table, position: usize, r: &FirewallRule) -> Val
     }
     if issue.is_some() {
         flags.push('I');
+    }
+    if shadowed_by.is_some() {
+        flags.push('S');
+    }
+    if r.zone {
+        flags.push('Z');
     }
     let mut obj = Map::new();
     if let Ok(Value::Object(m)) = serde_json::to_value(&r.matchers) {
@@ -735,12 +816,16 @@ pub fn row(cfg: &Config, table: Table, position: usize, r: &FirewallRule) -> Val
     );
     obj.insert("comment".into(), json!(r.comment));
     obj.insert("summary".into(), json!(summary(r)));
+    obj.insert("description".into(), json!(describe(table, r)));
+    obj.insert("shadowed_by".into(), json!(shadowed_by));
+    obj.insert("zone".into(), json!(r.zone));
     Value::Object(obj)
 }
 
 fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
     let chain: Option<Name> = opt_parse(p, "chain")?;
     let cfg = s.store().candidate();
+    let shadows = shadowed(cfg, table);
     Ok(Value::Array(
         cfg.ip
             .firewall
@@ -748,7 +833,7 @@ fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
             .iter()
             .enumerate()
             .filter(|(_, r)| chain.as_ref().is_none_or(|c| *c == r.chain && !r.section))
-            .map(|(i, r)| row(cfg, table, i, r))
+            .map(|(i, r)| row(cfg, table, i, r, shadows.get(&r.id).copied()))
             .collect(),
     ))
 }
@@ -756,7 +841,6 @@ fn list(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
 /// RouterOS durations: `90`, `30s`, `5m`, `1h30m`, `1d`, `1w` (at most 35
 /// days: nftables keeps timeouts in 32-bit milliseconds).
 pub fn parse_timeout(p: &Value, key: &str) -> Result<Option<u64>> {
-    const MAX: u64 = 35 * 86_400;
     let text = match p.get(key) {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Number(n)) => n
@@ -766,45 +850,14 @@ pub fn parse_timeout(p: &Value, key: &str) -> Result<Option<u64>> {
         Some(Value::String(s)) => s.trim().to_owned(),
         Some(_) => return Err(EngineError::bad(key, "must be seconds or like 1h30m")),
     };
-    let bad = || {
-        EngineError::bad(
-            key,
-            "expected seconds or a duration like 30s, 5m, 1h30m, 1d",
-        )
-    };
-    if text.is_empty() || text.len() > 32 {
-        return Err(bad());
-    }
-    let mut total: u64 = 0;
-    let mut num = String::new();
-    for c in text.chars() {
-        if c.is_ascii_digit() {
-            num.push(c);
-            continue;
-        }
-        let unit = match c {
-            's' => 1,
-            'm' => 60,
-            'h' => 3600,
-            'd' => 86_400,
-            'w' => 604_800,
-            _ => return Err(bad()),
-        };
-        let n: u64 = num.parse().map_err(|_| bad())?;
-        total = total.saturating_add(n.saturating_mul(unit));
-        num.clear();
-    }
-    if !num.is_empty() {
-        let n: u64 = num.parse().map_err(|_| bad())?;
-        total = total.saturating_add(n);
-    }
-    if total == 0 || total > MAX {
-        return Err(EngineError::bad(key, "must be 1 second ..= 35 days"));
-    }
-    Ok(Some(total))
+    let t: Timeout = text
+        .parse()
+        .map_err(|e: corerouter_model::ParseError| EngineError::bad(key, e.to_string()))?;
+    Ok(Some(u64::from(t.secs())))
 }
 
-fn al_add(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn al_add(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let list: Name = req_parse(p, "list")?;
     let address: AddrMatch = req_parse(p, "address")?;
     let timeout = parse_timeout(p, "timeout")?;
@@ -848,10 +901,16 @@ fn al_add(s: &mut Session, p: &Value) -> Result<Value> {
             added: now,
             comment,
         };
+        let id = entry.id;
+        // Not a commit (operational state), so the lockout check is here.
+        let before = s.dynamic_now();
+        let mut after = before.clone();
+        after.push(entry.data_plane(now));
+        let running = s.store().running();
+        s.check_lockout(running, running, &before, &after)?;
         s.hal_mut()
             .address_list_dynamic(DynamicChange::Add(&entry.data_plane(now)))
             .map_err(|e| EngineError::Hal(e.to_string()))?;
-        let id = entry.id;
         s.dynamic_addresses.push(entry);
         return Ok(json!({ "id": id, "dynamic": true }));
     }
@@ -887,6 +946,7 @@ fn static_entry(cfg: &Config, id: ItemId) -> Result<usize> {
 }
 
 fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
     let list: Option<Name> = opt_parse(p, "list")?;
     let address: Option<AddrMatch> = opt_parse(p, "address")?;
@@ -932,6 +992,7 @@ fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn al_remove(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
     let id: ItemId = req_parse(p, "id")?;
     let now = s.now();
     if let Some(e) = s.dynamic_addresses.remove(id) {

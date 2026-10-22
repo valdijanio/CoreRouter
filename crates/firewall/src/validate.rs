@@ -4,7 +4,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use corerouter_model::firewall::{Action, Family, FirewallRule, Name, Protocol, RejectWith, Table};
+use corerouter_model::firewall::{
+    Action, Family, FirewallRule, Name, Protocol, RejectWith, Table, Zone,
+};
 use corerouter_model::interface_list::RESERVED;
 use corerouter_model::{Config, Issue};
 
@@ -20,6 +22,9 @@ pub const MAX_LOG_PREFIX: usize = 64;
 /// The kernel keeps 128 bytes of comment; titles longer than that are
 /// still fine because comments never reach the kernel.
 pub const MAX_COMMENT: usize = 256;
+/// Zone-matrix cells: (256 lists + router)² would be far more than a
+/// screen can show (**estimado**).
+pub const MAX_ZONE_CELLS: usize = 1024;
 
 /// Actions allowed in `table` (before looking at the chain).
 fn table_allows(table: Table, action: &Action) -> bool {
@@ -30,6 +35,8 @@ fn table_allows(table: Table, action: &Action) -> bool {
             | Action::Return
             | Action::Log { .. }
             | Action::Passthrough
+            | Action::AddSrcToAddressList { .. }
+            | Action::AddDstToAddressList { .. }
     );
     common
         || match table {
@@ -342,6 +349,7 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
         }
     }
     out.extend(mark_collisions(cfg));
+    out.extend(zone_issues(cfg));
     if fw.address_lists.len() > MAX_ADDRESS_LIST_ENTRIES {
         out.push(Issue::new(
             "ip.firewall.address_lists",
@@ -389,6 +397,40 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
                 format!("interface_lists.members[{}]", m.id),
                 format!("{} is already a member of {}", m.interface, m.list),
             ));
+        }
+    }
+    out
+}
+
+/// The zone matrix: cells name existing lists, never the same zone twice,
+/// each pair once.
+fn zone_issues(cfg: &Config) -> Vec<Issue> {
+    let zones = &cfg.ip.firewall.zones;
+    let mut out = Vec::new();
+    if zones.len() > MAX_ZONE_CELLS {
+        out.push(Issue::new(
+            "ip.firewall.zones",
+            format!("at most {MAX_ZONE_CELLS} cells"),
+        ));
+    }
+    let mut pairs = BTreeSet::new();
+    for z in zones {
+        let at = format!("ip.firewall.zones[{} → {}]", z.from, z.to);
+        if z.from == z.to {
+            out.push(Issue::new(&at, "a zone to itself is not a cell"));
+        }
+        if !pairs.insert((&z.from, &z.to)) {
+            out.push(Issue::new(&at, "duplicate cell"));
+        }
+        for side in [&z.from, &z.to] {
+            if let Zone::List(l) = side
+                && cfg.interface_lists.get(l.as_str()).is_none()
+            {
+                out.push(Issue::new(
+                    &at,
+                    format!("interface list '{l}' does not exist"),
+                ));
+            }
         }
     }
     out

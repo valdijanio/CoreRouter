@@ -367,6 +367,7 @@ impl Hal for Recording {
                 list,
                 address,
                 timeout_secs,
+                ..
             }) => format!("add {list} {address} {timeout_secs}"),
             DynamicChange::Remove(d) => format!("remove {} {}", d.list, d.address),
         };
