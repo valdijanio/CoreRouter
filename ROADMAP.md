@@ -336,6 +336,35 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com 0 e loga `shutting down: sent CRDP goodbye on 1 interface(s)`; `Agent::shutdown` com lab e
   `Listener`; `Shutdown` fecha as duas portas. Esforço do agente ~1,5 h (**estimado**).
 
+- 2026-10-22 — G0.3: autenticação, usuários/grupos e TLS. **Engine**: `model::users` (contas
+  salvas no `running.json`, fora das revisões: `config.rollback` não restaura senha), comandos
+  `user.add/set/remove/list/active.list`, `auth::required_group` (consulta `read`, ação `write`,
+  `user.*` `full`) checado em `execute`/`inspect` com o grupo atual do `Principal` do `Caller`,
+  `engine.list` por chamador (botões cinza do G1.16), Argon2id com sal do SO, journal com
+  `***`, sem lock-out do último `full`, recusa em Safe Mode. **Controle**: `auth::Gate` (token de
+  256 bits guardado como SHA-256, comparação em tempo constante, 30 min ocioso/12 h, falhas por
+  IP e por usuário: 3 livres, 250 ms dobrando até 8 s, bloqueio com 20 em 15 min, resposta única
+  `invalid user or password` com verificação falsa para usuário inexistente), token local em
+  arquivo 0600 (CLI/MCP do mesmo usuário do sistema sem senha; outro usuário da máquina precisa
+  logar), `Endpoint` loopback ou TLS (`rustls`+`ring`, certificado `rcgen` em `--config-dir`,
+  chave 0600, impressão digital no log), `known_hosts` + `dial` (TOFU: primeira vez pergunta,
+  igual passa, mudou recusa antes de enviar nada). **Daemon**: `admin` com senha aleatória
+  impressa uma vez, `--reset-admin-password`, `--listen`, `--ws-listen` (wss, origem
+  `https://`+`Host`), `--token-file`. **CLI/MCP**: `--user` (prompt sem eco ou
+  `$COREROUTER_PASSWORD`), `--fingerprint`. **GUI**: Login/Password de verdade, diálogo de
+  certificado novo, "Remember password" só com keyring do SO (`keyring`, zbus puro; na web
+  nunca), `user: X (grupo)` na barra, re-login automático quando o token expira, proxy
+  `--control` com a sessão da janela; vizinhos CRDP com porta TLS (TLV 14/15) conectáveis.
+  Testes novos: engine (grupos, máscara, rollback × contas, lock-out, logins), controle (login
+  certo/errado, força bruta, expiração, token local, proptest dos params de login, TLS ponta a
+  ponta com TOFU nas três situações, texto puro na porta TLS), daemon (processo real: admin
+  impresso uma vez, TLS + login, certificado igual após reinício, token local recusado no TLS,
+  reset), CLI/MCP pelo token local, GUI (re-login, senha errada para de tentar, tela de
+  conexão). Teste manual (**medido**): namespace sem root com `dummy` 10.77.0.1, daemon
+  `--listen 10.77.0.1:8729`, GUI por esse IP: diálogo com a mesma impressão do log, admin
+  `(full)` com `+` ativo, usuário `noc` `(read)` com `+` e Safe Mode cinza; nenhuma senha nos
+  logs. Esforço do agente ~6 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -357,3 +386,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G5.4.
 - 2026-10-22 — log do G1.17.
 - 2026-10-22 — log do G5.5.
+- 2026-10-22 — log do G0.3.
