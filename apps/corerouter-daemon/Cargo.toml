@@ -25,6 +25,8 @@ log.workspace = true
 env_logger.workspace = true
 signal-hook.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 # service/dns_server.rs: IP_PKTINFO / IPV6_RECVPKTINFO (answer from the
 # address the query went to), which std and socket2 lack.
 nix = { version = "0.30.1", default-features = false, features = ["socket", "uio", "net"] }

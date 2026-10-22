@@ -20,14 +20,13 @@
 //!   (a static entry's address list) under the session lock, off the
 //!   answering threads.
 //!
-//! UDP sockets read the destination address of each query (IP_PKTINFO /
+//! On Linux, UDP sockets read the destination address of each query (IP_PKTINFO /
 //! IPV6_RECVPKTINFO) and answer from it: a router with several addresses
 //! on the LAN would otherwise answer from another one, and the client drops
 //! the reply (dnsmasq and Unbound do the same).
 
-use std::io::{IoSlice, IoSliceMut, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
@@ -40,14 +39,8 @@ use corerouter_model::Config;
 use corerouter_proto_dns::server::{
     Done, Effect, Forwarder, MAX_QUERY, Pending, Start, allowed_networks,
 };
-use nix::libc;
-use nix::sys::socket::{
-    AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
-    SockaddrIn, SockaddrIn6, SockaddrStorage, bind, recvmsg, sendmsg, setsockopt, socket,
-    sockopt,
-};
-
 use super::dns::RouterDns;
+use sock::{Udp, bind_tcp};
 
 /// RFC 1035 §4.2.1.
 const DEFAULT_PORT: u16 = 53;
@@ -152,125 +145,6 @@ impl Server {
     fn finish(&self, p: Pending) -> Done {
         let mut t = self.dns.transport();
         self.fwd.finish(p, &mut t)
-    }
-}
-
-/// A UDP socket that knows each query's destination address.
-struct Udp {
-    sock: UdpSocket,
-    v6: bool,
-}
-
-fn nix_io(e: nix::Error) -> std::io::Error {
-    std::io::Error::from_raw_os_error(e as i32)
-}
-
-impl Udp {
-    fn bind(addr: SocketAddr) -> std::io::Result<Self> {
-        let v6 = addr.is_ipv6();
-        let family = if v6 {
-            AddressFamily::Inet6
-        } else {
-            AddressFamily::Inet
-        };
-        let fd: OwnedFd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
-            .map_err(nix_io)?;
-        setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(nix_io)?;
-        match addr {
-            SocketAddr::V4(a) => {
-                setsockopt(&fd, sockopt::Ipv4PacketInfo, &true).map_err(nix_io)?;
-                bind(fd.as_raw_fd(), &SockaddrIn::from(a)).map_err(nix_io)?;
-            }
-            SocketAddr::V6(a) => {
-                // IPv4 has its own socket.
-                setsockopt(&fd, sockopt::Ipv6V6Only, &true).map_err(nix_io)?;
-                setsockopt(&fd, sockopt::Ipv6RecvPacketInfo, &true).map_err(nix_io)?;
-                bind(fd.as_raw_fd(), &SockaddrIn6::from(a)).map_err(nix_io)?;
-            }
-        }
-        let sock = UdpSocket::from(fd);
-        sock.set_read_timeout(Some(POLL))?;
-        Ok(Self { sock, v6 })
-    }
-
-    /// One datagram: (length, client, the address it was sent to).
-    fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr, Option<IpAddr>)> {
-        let mut cmsg = nix::cmsg_space!(libc::in6_pktinfo);
-        let mut iov = [IoSliceMut::new(buf)];
-        let msg = recvmsg::<SockaddrStorage>(
-            self.sock.as_raw_fd(),
-            &mut iov,
-            Some(&mut cmsg),
-            MsgFlags::empty(),
-        )
-        .map_err(nix_io)?;
-        let mut local = None;
-        for c in msg.cmsgs().map_err(nix_io)? {
-            match c {
-                ControlMessageOwned::Ipv4PacketInfo(i) => {
-                    local = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(i.ipi_addr.s_addr))));
-                }
-                ControlMessageOwned::Ipv6PacketInfo(i) => {
-                    local = Some(IpAddr::V6(Ipv6Addr::from(i.ipi6_addr.s6_addr)));
-                }
-                _ => {}
-            }
-        }
-        let from = msg.address.as_ref().and_then(|a| {
-            a.as_sockaddr_in()
-                .map(|v4| SocketAddr::from((v4.ip(), v4.port())))
-                .or_else(|| {
-                    a.as_sockaddr_in6()
-                        .map(|v6| SocketAddr::from((v6.ip(), v6.port())))
-                })
-        });
-        let from = from.ok_or_else(|| std::io::Error::other("datagram without a source"))?;
-        Ok((msg.bytes, from, local))
-    }
-
-    /// Sends `bytes` to `to`, from `local` when known.
-    fn send(&self, bytes: &[u8], to: SocketAddr, local: Option<IpAddr>) {
-        let iov = [IoSlice::new(bytes)];
-        let sent = match (to, local) {
-            (SocketAddr::V4(dst), Some(IpAddr::V4(src))) if !self.v6 => {
-                let info = libc::in_pktinfo {
-                    ipi_ifindex: 0,
-                    ipi_spec_dst: libc::in_addr {
-                        s_addr: u32::from(src).to_be(),
-                    },
-                    ipi_addr: libc::in_addr { s_addr: 0 },
-                };
-                sendmsg(
-                    self.sock.as_raw_fd(),
-                    &iov,
-                    &[ControlMessage::Ipv4PacketInfo(&info)],
-                    MsgFlags::empty(),
-                    Some(&SockaddrIn::from(dst)),
-                )
-            }
-            (SocketAddr::V6(dst), Some(IpAddr::V6(src))) if self.v6 => {
-                let info = libc::in6_pktinfo {
-                    ipi6_addr: libc::in6_addr {
-                        s6_addr: src.octets(),
-                    },
-                    ipi6_ifindex: 0,
-                };
-                sendmsg(
-                    self.sock.as_raw_fd(),
-                    &iov,
-                    &[ControlMessage::Ipv6PacketInfo(&info)],
-                    MsgFlags::empty(),
-                    Some(&SockaddrIn6::from(dst)),
-                )
-            }
-            _ => self
-                .sock
-                .send_to(bytes, to)
-                .map_err(|e| nix::Error::from_raw(e.raw_os_error().unwrap_or(0))),
-        };
-        if let Err(e) = sent {
-            log::debug!("DNS: reply to {to} not sent: {e}");
-        }
     }
 }
 
@@ -426,29 +300,6 @@ fn open(srv: &Arc<Server>, port: u16, epoch: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn bind_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    let family = if addr.is_ipv6() {
-        AddressFamily::Inet6
-    } else {
-        AddressFamily::Inet
-    };
-    let fd: OwnedFd =
-        socket(family, SockType::Stream, SockFlag::SOCK_CLOEXEC, None).map_err(nix_io)?;
-    setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(nix_io)?;
-    match addr {
-        SocketAddr::V4(a) => bind(fd.as_raw_fd(), &SockaddrIn::from(a)).map_err(nix_io)?,
-        SocketAddr::V6(a) => {
-            setsockopt(&fd, sockopt::Ipv6V6Only, &true).map_err(nix_io)?;
-            bind(fd.as_raw_fd(), &SockaddrIn6::from(a)).map_err(nix_io)?;
-        }
-    }
-    let backlog = nix::sys::socket::Backlog::new(128).map_err(nix_io)?;
-    nix::sys::socket::listen(&fd, backlog).map_err(nix_io)?;
-    let l = TcpListener::from(fd);
-    l.set_nonblocking(true)?;
-    Ok(l)
-}
-
 fn apply_effects(session: &Shared, rx: &Receiver<Effect>) {
     while let Ok(e) = rx.recv() {
         match e {
@@ -574,6 +425,207 @@ fn start(ctx: &super::Ctx) -> Result<(), String> {
 }
 
 
+/// Linux: the destination address of each query (IP_PKTINFO /
+/// IPV6_RECVPKTINFO), through `nix`.
+#[cfg(target_os = "linux")]
+mod sock {
+    use std::io::{IoSlice, IoSliceMut};
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, UdpSocket};
+    use std::os::fd::{AsRawFd, OwnedFd};
+
+    use nix::libc;
+    use nix::sys::socket::{
+        AddressFamily, ControlMessage, ControlMessageOwned, MsgFlags, SockFlag, SockType,
+        SockaddrIn, SockaddrIn6, SockaddrStorage, bind, recvmsg, sendmsg, setsockopt, socket,
+        sockopt,
+    };
+
+    use super::POLL;
+
+    /// A UDP socket that knows each query's destination address.
+    pub(super) struct Udp {
+        sock: UdpSocket,
+        v6: bool,
+    }
+
+    fn nix_io(e: nix::Error) -> std::io::Error {
+        std::io::Error::from_raw_os_error(e as i32)
+    }
+
+    impl Udp {
+        pub(super) fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+            let v6 = addr.is_ipv6();
+            let family = if v6 {
+                AddressFamily::Inet6
+            } else {
+                AddressFamily::Inet
+            };
+            let fd: OwnedFd = socket(family, SockType::Datagram, SockFlag::SOCK_CLOEXEC, None)
+                .map_err(nix_io)?;
+            setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(nix_io)?;
+            match addr {
+                SocketAddr::V4(a) => {
+                    setsockopt(&fd, sockopt::Ipv4PacketInfo, &true).map_err(nix_io)?;
+                    bind(fd.as_raw_fd(), &SockaddrIn::from(a)).map_err(nix_io)?;
+                }
+                SocketAddr::V6(a) => {
+                    // IPv4 has its own socket.
+                    setsockopt(&fd, sockopt::Ipv6V6Only, &true).map_err(nix_io)?;
+                    setsockopt(&fd, sockopt::Ipv6RecvPacketInfo, &true).map_err(nix_io)?;
+                    bind(fd.as_raw_fd(), &SockaddrIn6::from(a)).map_err(nix_io)?;
+                }
+            }
+            let sock = UdpSocket::from(fd);
+            sock.set_read_timeout(Some(POLL))?;
+            Ok(Self { sock, v6 })
+        }
+
+        /// One datagram: (length, client, the address it was sent to).
+        pub(super) fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+            let mut cmsg = nix::cmsg_space!(libc::in6_pktinfo);
+            let mut iov = [IoSliceMut::new(buf)];
+            let msg = recvmsg::<SockaddrStorage>(
+                self.sock.as_raw_fd(),
+                &mut iov,
+                Some(&mut cmsg),
+                MsgFlags::empty(),
+            )
+            .map_err(nix_io)?;
+            let mut local = None;
+            for c in msg.cmsgs().map_err(nix_io)? {
+                match c {
+                    ControlMessageOwned::Ipv4PacketInfo(i) => {
+                        local = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(i.ipi_addr.s_addr))));
+                    }
+                    ControlMessageOwned::Ipv6PacketInfo(i) => {
+                        local = Some(IpAddr::V6(Ipv6Addr::from(i.ipi6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            let from = msg.address.as_ref().and_then(|a| {
+                a.as_sockaddr_in()
+                    .map(|v4| SocketAddr::from((v4.ip(), v4.port())))
+                    .or_else(|| {
+                        a.as_sockaddr_in6()
+                            .map(|v6| SocketAddr::from((v6.ip(), v6.port())))
+                    })
+            });
+            let from = from.ok_or_else(|| std::io::Error::other("datagram without a source"))?;
+            Ok((msg.bytes, from, local))
+        }
+
+        /// Sends `bytes` to `to`, from `local` when known.
+        pub(super) fn send(&self, bytes: &[u8], to: SocketAddr, local: Option<IpAddr>) {
+            let iov = [IoSlice::new(bytes)];
+            let sent = match (to, local) {
+                (SocketAddr::V4(dst), Some(IpAddr::V4(src))) if !self.v6 => {
+                    let info = libc::in_pktinfo {
+                        ipi_ifindex: 0,
+                        ipi_spec_dst: libc::in_addr {
+                            s_addr: u32::from(src).to_be(),
+                        },
+                        ipi_addr: libc::in_addr { s_addr: 0 },
+                    };
+                    sendmsg(
+                        self.sock.as_raw_fd(),
+                        &iov,
+                        &[ControlMessage::Ipv4PacketInfo(&info)],
+                        MsgFlags::empty(),
+                        Some(&SockaddrIn::from(dst)),
+                    )
+                }
+                (SocketAddr::V6(dst), Some(IpAddr::V6(src))) if self.v6 => {
+                    let info = libc::in6_pktinfo {
+                        ipi6_addr: libc::in6_addr {
+                            s6_addr: src.octets(),
+                        },
+                        ipi6_ifindex: 0,
+                    };
+                    sendmsg(
+                        self.sock.as_raw_fd(),
+                        &iov,
+                        &[ControlMessage::Ipv6PacketInfo(&info)],
+                        MsgFlags::empty(),
+                        Some(&SockaddrIn6::from(dst)),
+                    )
+                }
+                _ => self
+                    .sock
+                    .send_to(bytes, to)
+                    .map_err(|e| nix::Error::from_raw(e.raw_os_error().unwrap_or(0))),
+            };
+            if let Err(e) = sent {
+                log::debug!("DNS: reply to {to} not sent: {e}");
+            }
+        }
+    }
+
+    pub(super) fn bind_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
+        let family = if addr.is_ipv6() {
+            AddressFamily::Inet6
+        } else {
+            AddressFamily::Inet
+        };
+        let fd: OwnedFd =
+            socket(family, SockType::Stream, SockFlag::SOCK_CLOEXEC, None).map_err(nix_io)?;
+        setsockopt(&fd, sockopt::ReuseAddr, &true).map_err(nix_io)?;
+        match addr {
+            SocketAddr::V4(a) => bind(fd.as_raw_fd(), &SockaddrIn::from(a)).map_err(nix_io)?,
+            SocketAddr::V6(a) => {
+                setsockopt(&fd, sockopt::Ipv6V6Only, &true).map_err(nix_io)?;
+                bind(fd.as_raw_fd(), &SockaddrIn6::from(a)).map_err(nix_io)?;
+            }
+        }
+        let backlog = nix::sys::socket::Backlog::new(128).map_err(nix_io)?;
+        nix::sys::socket::listen(&fd, backlog).map_err(nix_io)?;
+        let l = TcpListener::from(fd);
+        l.set_nonblocking(true)?;
+        Ok(l)
+    }
+}
+
+/// Elsewhere (the daemon on macOS/Windows runs the virtual lab): plain
+/// `std::net`, answering from whatever address the system picks.
+#[cfg(not(target_os = "linux"))]
+mod sock {
+    use std::net::{IpAddr, SocketAddr, TcpListener, UdpSocket};
+
+    use super::POLL;
+
+    pub(super) struct Udp {
+        sock: UdpSocket,
+    }
+
+    impl Udp {
+        pub(super) fn bind(addr: SocketAddr) -> std::io::Result<Self> {
+            let sock = UdpSocket::bind(addr)?;
+            sock.set_read_timeout(Some(POLL))?;
+            Ok(Self { sock })
+        }
+
+        pub(super) fn recv(
+            &self,
+            buf: &mut [u8],
+        ) -> std::io::Result<(usize, SocketAddr, Option<IpAddr>)> {
+            let (n, from) = self.sock.recv_from(buf)?;
+            Ok((n, from, None))
+        }
+
+        pub(super) fn send(&self, bytes: &[u8], to: SocketAddr, _local: Option<IpAddr>) {
+            if let Err(e) = self.sock.send_to(bytes, to) {
+                log::debug!("DNS: reply to {to} not sent: {e}");
+            }
+        }
+    }
+
+    pub(super) fn bind_tcp(addr: SocketAddr) -> std::io::Result<TcpListener> {
+        let l = TcpListener::bind(addr)?;
+        l.set_nonblocking(true)?;
+        Ok(l)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,6 +634,7 @@ mod tests {
     use hickory_proto::op::{Message, Query, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
     use serde_json::json;
+    use std::net::UdpSocket;
     use std::time::Instant;
 
     fn free_port() -> u16 {
