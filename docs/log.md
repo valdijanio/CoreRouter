@@ -842,3 +842,8 @@ continuação indentadas).
 
 - 2026-10-22 — processo: A fila faz o squash com o título do PR (`--subject "<título> (#n)"`): o #79 entrou na `main`
   como "wip hotspots", a mensagem do primeiro commit da branch.
+
+- 2026-10-22 — processo: PR que só mexe em `docs/` roda só `cargo xtask docs` no CI (job `changes` decide; os 3 checks
+  exigidos passam do mesmo jeito): o PR de fold de cada lote da fila custava um CI inteiro (~3 min)
+  para mudar só `.md`, e num lote de 1 PR dobrava o tempo. Lote, `main` e `workflow_dispatch`
+  continuam com o CI completo.
