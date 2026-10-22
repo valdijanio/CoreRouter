@@ -4,6 +4,9 @@
 //!   operations (pure, tested everywhere); `netlink` runs them over rtnetlink
 //!   and undoes the done ones if one fails (G1.2).
 //! - discovery and counters: `/sys/class/net` (netlink stats in G1.7).
+//! - `l2`: neighbor-discovery I/O — LLDP frames over `AF_PACKET`, passive
+//!   MNDP over UDP 5678 (G5.2). Bytes only; the codecs are `proto-lldp` /
+//!   `proto-mndp`, glued by the daemon.
 //! - `features`: probed once, on first use, with a throwaway link per
 //!   capability (`netlink::features`), then cached (G1.14).
 //!
@@ -14,6 +17,9 @@ pub mod plan;
 
 #[cfg(target_os = "linux")]
 mod netlink;
+
+#[cfg(target_os = "linux")]
+pub mod l2;
 
 #[cfg(target_os = "linux")]
 mod linux {

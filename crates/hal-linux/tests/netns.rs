@@ -485,9 +485,11 @@ fn vrf_routes_live_in_their_own_table() {
     hal.apply(&Config::default(), &base).unwrap();
 
     // A VRF with its own copy of 10.64.0.0/24 and its own default route,
-    // next to main's.
+    // next to main's. Distance 5: tests share one namespace and run in
+    // parallel, and `static_routes_and_link_state` puts main's default at
+    // metrics 1 and 10 (same destination + metric = EEXIST).
     let mut to = base.clone();
-    route(&mut to, "0.0.0.0/0", "10.64.0.1");
+    route(&mut to, "0.0.0.0/0", "10.64.0.1").distance = 5;
     add(&mut to, "g1blue", InterfaceKind::Vrf { table: 1064 });
     to.interfaces.get_mut(&n("g1eth2")).unwrap().vrf = Some(n("g1blue"));
     addr(&mut to, "g1eth2", "10.64.0.2/24");
