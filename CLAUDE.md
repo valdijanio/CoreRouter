@@ -18,7 +18,9 @@ Este arquivo é idêntico a `CLAUDE.md` (`cargo xtask agents-sync` falha se dive
 
 ## Pesquisa antes de implementar (obrigatória em toda feature nova)
 
-Nenhuma feature nova começa pelo código. Antes de planejar:
+Nenhuma feature nova começa pelo código. Comece por `scripts/research.sh "<menu ou termo>"`, que
+imprime os links de busca já montados de todas as fontes de `docs/research-sources.md` (MikroTik,
+outros roteadores, RFCs, kernel, crates). Antes de planejar:
 
 1. **MikroTik RouterOS v7 primeiro.** Leia a documentação oficial da versão estável mais recente
    (help.mikrotik.com) sobre a feature, se existir: nomes de menus, parâmetros, padrões, flags,
