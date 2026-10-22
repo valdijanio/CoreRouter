@@ -72,7 +72,7 @@ backend.**
 | DHCPv4/DHCPv6 (+PD) e relay | codec `dhcproto` + servidor e banco de leases próprios | Leases em `/config`, escrita atômica |
 | PPPoE / IPoE (BNG) | orquestrar `accel-ppp` | Não há BNG Rust maduro; mesmo padrão do FRR |
 | NTP | `ntpd-rs` | Rust, memória segura |
-| Gerência remota | `rustls` (TLS do canal de controle), `russh` (CLI SSH) | G0.3 |
+| Gerência remota | `rustls` + provedor `ring` (TLS do canal de controle e do WebSocket), `rcgen` (certificado autoassinado), `argon2` (hash de senha), `keyring` ("Remember password" da GUI nativa); `russh` (CLI SSH) depois | G0.3 feito |
 | Telemetria | `prometheus-client`, export IPFIX/sFlow | G4.4 |
 
 ## 2. Camadas do workspace
@@ -82,14 +82,14 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
-| L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas) | serde, ipnet, thiserror |
+| L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas), `users` (contas e grupos, salvos fora das revisões) | serde, ipnet, thiserror |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features) + `VirtualHal` (lab, wasm, CI) | L0 |
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via sysfs; I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
-| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal, tabela de vizinhos (estado operacional) | L0–L2 (nunca plataforma) |
-| L4 | `crates/control` | Canal JSON-por-linha em loopback, WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client` | L0–L3 |
+| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional) | L0–L2 (nunca plataforma) |
+| L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial` | L0–L3 |
 | L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
 | L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
@@ -212,7 +212,23 @@ aplicada no mesmo campo é descartada
 O daemon serve o WebSocket com `control::ws` (thread por conexão, `tungstenite` síncrono) e
 pode servir os arquivos da GUI web na mesma porta (`--web-root`, modelo WebFig); a lista de
 `Origin` impede que uma página qualquer comande o roteador local. Detalhes em
-`docs/control-protocol.md`. Autenticação/TLS continuam no G0.3: tudo só em loopback.
+`docs/control-protocol.md`.
+
+### Autenticação e TLS (G0.3)
+
+Quem decide **o que** cada um pode é o engine; quem decide **quem é** cada um é o canal de
+controle. Cada conexão tem um `Caller`; a cada requisição o `control::auth::Gate` troca o
+`token` pelo `Principal` (`Local` = processo ou token local, `User(nome)`, `Anonymous`) e o põe
+no `Caller` antes de `Session::execute_as`. O engine olha o grupo **atual** da conta no `Users`
+da sessão e compara com `auth::required_group` (consulta `read`, ação `write`, `user.*` `full`),
+recusando com `EngineError::Denied` e marcando `enabled: false` no `engine.list` daquele
+chamador (botões cinza da GUI, G1.16). A senha é verificada pelo `Gate` **fora** do lock da
+sessão (Argon2 é lento de propósito); a sessão só entrega o hash e registra o login
+(`user.active.list`). Contas ficam no mesmo arquivo da config, fora das revisões: rollback nunca
+restaura senha. O token local (arquivo 0600 do usuário do sistema que roda o roteador) dá a CLI
+e o MCP locais sem senha; TCP puro só aceita loopback, qualquer outro endereço é TLS
+(`--listen`, `--ws-listen`) com login, e os clientes nativos fixam o certificado no primeiro uso
+(`known_hosts`). Detalhes em `docs/control-protocol.md`.
 
 ### Preferências da janela (G1.11)
 
@@ -320,3 +336,4 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).
 - 2026-10-22 — G5.1: crates `proto-discovery` (L2) e `discovery` (L4), tabela de vizinhos no engine, tela de conexão.
 - 2026-10-22 — G5.2 Parte 2: LLDP/MNDP no daemon (`link_discovery.rs`), cola L1+L2 na app.
+- 2026-10-22 — G0.3: `model::users`, `engine::auth`, `control::{auth,tls,local_token,known_hosts,dial}`, seção de autenticação.

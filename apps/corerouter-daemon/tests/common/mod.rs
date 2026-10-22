@@ -19,6 +19,7 @@ pub const ENV: &str = "COREROUTER_NETNS_TESTS";
 /// Set by [`call`] when it re-runs the test binary inside B's namespace.
 const QUERY_ENV: &str = "CRDP_NETNS_QUERY";
 const QUERY_CMD_ENV: &str = "CRDP_NETNS_QUERY_CMD";
+const QUERY_TOKEN_ENV: &str = "CRDP_NETNS_QUERY_TOKEN";
 pub const DAEMON: &str = env!("CARGO_BIN_EXE_corerouter-daemon");
 pub const CONTROL: &str = "127.0.0.1:7979";
 
@@ -106,13 +107,44 @@ pub fn namespace_b() -> Kill {
     holder
 }
 
+/// Token files of the daemons, by namespace (G0.3: each daemon writes its
+/// local token to `--token-file`, see [`token_file`]).
+static TOKENS: std::sync::Mutex<Vec<(Option<u32>, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+
+/// The `--token-file` of a daemon whose config dir is `dir`, remembered
+/// for [`call`] on namespace `netns`.
+pub fn token_file(netns: Option<u32>, dir: &std::path::Path) -> PathBuf {
+    let path = dir.join("local.token");
+    let mut t = TOKENS.lock().unwrap();
+    t.retain(|(n, _)| *n != netns);
+    t.push((netns, path.clone()));
+    path
+}
+
+fn token_of(netns: Option<u32>) -> Option<String> {
+    let t = TOKENS.lock().unwrap();
+    let path = t
+        .iter()
+        .find(|(n, _)| *n == netns)
+        .map(|(_, p)| p.clone())?;
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_owned())
+}
+
+/// A client of the control port at `addr` with `token`.
+pub fn client(addr: &str, token: Option<String>) -> Result<Client, String> {
+    let mut c = Client::connect(addr, Duration::from_secs(1))?;
+    c.set_token(token);
+    Ok(c)
+}
+
 /// `engine.execute {command, params}` on router A (here) or B (inside
 /// `pid`, by re-running this test binary there: see [`query_helper`]).
 pub fn call(netns: Option<u32>, command: &str, params: Value) -> Result<Value, String> {
     let req = json!({"command": command, "params": params});
     match netns {
-        None => Client::connect(CONTROL, Duration::from_secs(1))
-            .and_then(|mut c| c.call("engine.execute", req)),
+        None => client(CONTROL, token_of(None)).and_then(|mut c| c.call("engine.execute", req)),
         Some(pid) => {
             let out = in_ns(
                 Some(pid),
@@ -127,6 +159,7 @@ pub fn call(netns: Option<u32>, command: &str, params: Value) -> Result<Value, S
             ])
             .env(QUERY_ENV, CONTROL)
             .env(QUERY_CMD_ENV, req.to_string())
+            .env(QUERY_TOKEN_ENV, token_of(Some(pid)).unwrap_or_default())
             .env_remove(ENV)
             .output()
             .unwrap();
@@ -155,8 +188,10 @@ pub fn query_helper() {
         .ok()
         .and_then(|j| serde_json::from_str(&j).ok())
         .unwrap_or_else(|| json!({"command": "ip.neighbor.list"}));
-    let answer = Client::connect(&addr, Duration::from_secs(1))
-        .and_then(|mut c| c.call("engine.execute", req));
+    let token = std::env::var(QUERY_TOKEN_ENV)
+        .ok()
+        .filter(|t| !t.is_empty());
+    let answer = client(&addr, token).and_then(|mut c| c.call("engine.execute", req));
     let line = match answer {
         Ok(v) => v,
         Err(e) => json!({ "error": e }),

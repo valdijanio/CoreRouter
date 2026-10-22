@@ -5,8 +5,11 @@
 //!
 //! The screen only collects choices: the app supplies the neighbor rows
 //! (CRDP listener natively, `ip.neighbor.list` on the web), stores the saved
-//! list and does the connecting. Login and password have no effect until
-//! authentication exists (docs/gaps.md G0.3), and no password is ever kept.
+//! list and does the connecting (G0.3: login over TLS, the certificate
+//! confirmed on first use with [`ConnectScreen::ask_trust`]). The saved
+//! list keeps the login name but never a password; "Remember password"
+//! is offered only where the operating system has a secure store
+//! ([`ConnectScreen::set_keyring`]), and the app keeps it there.
 
 use egui::{Key, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
@@ -48,30 +51,57 @@ pub struct NeighborRow {
     /// What "Connect to" gets; `None` when it advertises no CoreRouter
     /// management port (an LLDP or MNDP neighbor).
     pub connect_to: Option<String>,
-    /// Runs on another machine. Until authentication (G0.3) a router takes
-    /// management only from its own machine, so connecting would be
-    /// refused: the row is greyed out and a double click explains instead.
+    /// Runs on another machine and announces no TLS management port: its
+    /// plain control port takes only clients on its own machine, so the
+    /// row is greyed out and a double click explains instead.
     pub remote: bool,
 }
 
-/// Why a router on another machine cannot be managed from here yet.
-pub const REMOTE_HINT: &str = "Greyed out: on another machine. Until authentication (G0.3) a \
-     router accepts management only from its own machine (loopback).";
+/// Why a router on another machine cannot be managed from here.
+pub const REMOTE_HINT: &str = "Greyed out: on another machine without a TLS management port. \
+     Start its daemon with --listen 0.0.0.0:8729 to manage it from here.";
 
-/// An entry of the Saved tab. Deliberately no password: secrets wait for
-/// G0.3 and a secure store.
+/// An entry of the Saved tab. Deliberately no password: that goes only to
+/// the operating system's secure store ("Remember password").
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SavedRouter {
     pub address: String,
     pub group: String,
     pub comment: String,
+    /// Login name (empty: the local token on this machine).
+    pub user: String,
+}
+
+/// What the operator typed to log in.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct Credentials {
+    pub address: String,
+    /// Empty: no login (a router on this machine, with its local token).
+    pub user: String,
+    pub password: String,
+    /// Keep the password in the operating system's secure store.
+    pub remember: bool,
+}
+
+impl std::fmt::Debug for Credentials {
+    /// Never prints the password.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("address", &self.address)
+            .field("user", &self.user)
+            .field("remember", &self.remember)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SavedRouter {
     pub fn list_to_json(list: &[SavedRouter]) -> Value {
         Value::Array(
             list.iter()
-                .map(|s| json!({"address": s.address, "group": s.group, "comment": s.comment}))
+                .map(|s| {
+                    json!({"address": s.address, "group": s.group, "comment": s.comment,
+                           "user": s.user})
+                })
                 .collect(),
         )
     }
@@ -95,6 +125,7 @@ impl SavedRouter {
                         address: field(e, "address"),
                         group: field(e, "group"),
                         comment: field(e, "comment"),
+                        user: field(e, "user"),
                     })
                     .filter(|s| !s.address.trim().is_empty())
                     .collect()
@@ -106,7 +137,13 @@ impl SavedRouter {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConnectAction {
     /// Manage the router at this address (as typed in "Connect to").
-    Connect(String),
+    Connect(Credentials),
+    /// The operator checked and accepted this certificate (first TLS
+    /// connection): remember it and connect.
+    Trust {
+        creds: Credentials,
+        fingerprint: String,
+    },
     /// Run the in-process virtual lab instead.
     VirtualLab,
 }
@@ -119,9 +156,14 @@ enum Tab {
 
 pub struct ConnectScreen {
     pub connect_to: String,
-    /// Kept for the form only: never sent, never saved (no auth until G0.3).
     login: String,
+    /// Sent with the login, then cleared; never saved by this screen.
     password: String,
+    remember: bool,
+    /// `None`: no secure store here (the checkbox is off, with the reason).
+    keyring: Option<String>,
+    /// First TLS connection: the fingerprint waiting for a yes.
+    trust: Option<(Credentials, String)>,
     group: String,
     comment: String,
     tab: Tab,
@@ -134,6 +176,7 @@ pub struct ConnectScreen {
     /// Where the Neighbors tab gets its rows, shown above the table.
     source: String,
     offer_lab: bool,
+    keyring_why: String,
 }
 
 impl ConnectScreen {
@@ -142,6 +185,9 @@ impl ConnectScreen {
             connect_to: String::new(),
             login: String::new(),
             password: String::new(),
+            remember: false,
+            keyring: None,
+            trust: None,
             group: String::new(),
             comment: String::new(),
             tab: Tab::Neighbors,
@@ -152,6 +198,7 @@ impl ConnectScreen {
             message: None,
             source: String::new(),
             offer_lab: true,
+            keyring_why: "no secure password store on this platform".into(),
         }
     }
 
@@ -162,6 +209,37 @@ impl ConnectScreen {
 
     pub fn set_error(&mut self, text: impl Into<String>) {
         self.message = Some((false, text.into()));
+    }
+
+    /// Where "Remember password" keeps it (e.g. "the system keyring"), or
+    /// `Err(why)` to grey the checkbox out.
+    pub fn set_keyring(&mut self, store: Result<String, String>) {
+        match store {
+            Ok(name) => self.keyring = Some(name),
+            Err(why) => {
+                self.keyring = None;
+                self.remember = false;
+                self.keyring_why = why;
+            }
+        }
+    }
+
+    /// First TLS connection to `creds.address`: show `fingerprint` and
+    /// wait for the operator (the answer comes as [`ConnectAction::Trust`]).
+    pub fn ask_trust(&mut self, creds: Credentials, fingerprint: String) {
+        self.message = None;
+        self.trust = Some((creds, fingerprint));
+    }
+
+    /// Fill the Login field (e.g. from `--user`).
+    pub fn set_login(&mut self, user: &str) {
+        self.login = user.to_owned();
+    }
+
+    /// The login worked: forget the typed password.
+    pub fn connected(&mut self) {
+        self.password.clear();
+        self.trust = None;
     }
 
     /// Show the "Virtual lab" button (default: shown).
@@ -186,18 +264,79 @@ impl ConnectScreen {
             .exact_size(330.0)
             .show(ui, |ui| self.form(ui, &mut action));
         egui::CentralPanel::default().show(ui, |ui| self.lists(ui, neighbors, &mut action));
-        if let Some(ConnectAction::Connect(addr)) = &action {
-            self.message = Some((true, format!("connecting to {addr}…")));
+        self.trust_window(ui, &mut action);
+        if let Some(ConnectAction::Connect(c) | ConnectAction::Trust { creds: c, .. }) = &action {
+            self.message = Some((true, format!("connecting to {}…", c.address)));
         }
         action
     }
 
+    /// The SSH-style question of the first TLS connection.
+    fn trust_window(&mut self, ui: &mut Ui, action: &mut Option<ConnectAction>) {
+        let Some((creds, fp)) = self.trust.clone() else {
+            return;
+        };
+        let mut answer = None;
+        egui::Window::new("Unknown router certificate")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ui.ctx(), |ui| {
+                ui.label(format!(
+                    "First connection to {}. Its TLS certificate fingerprint is:",
+                    creds.address
+                ));
+                ui.add_space(4.0);
+                ui.monospace(fp.as_str());
+                ui.add_space(4.0);
+                ui.weak(
+                    "Compare it with the fingerprint the router printed at start-up \
+                     (corerouter-daemon log). If they match, trust it: it is remembered \
+                     and a different certificate later is refused.",
+                );
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .button(RichText::new("Trust and connect").strong())
+                        .clicked()
+                    {
+                        answer = Some(true);
+                    }
+                    if ui.button("Cancel").clicked() || ui.input(|i| i.key_pressed(Key::Escape)) {
+                        answer = Some(false);
+                    }
+                });
+            });
+        match answer {
+            Some(true) => {
+                self.trust = None;
+                *action = Some(ConnectAction::Trust {
+                    creds,
+                    fingerprint: fp,
+                });
+            }
+            Some(false) => {
+                self.trust = None;
+                self.set_error("Not connected: the certificate was not trusted");
+            }
+            None => {}
+        }
+    }
+
+    fn credentials(&self) -> Credentials {
+        Credentials {
+            address: self.connect_to.trim().to_owned(),
+            user: self.login.trim().to_owned(),
+            password: self.password.clone(),
+            remember: self.remember && self.keyring.is_some(),
+        }
+    }
+
     fn connect(&mut self, action: &mut Option<ConnectAction>) {
-        let addr = self.connect_to.trim();
-        if addr.is_empty() {
+        if self.connect_to.trim().is_empty() {
             self.set_error("Type an address in Connect to, or pick a neighbor or a saved router");
         } else {
-            *action = Some(ConnectAction::Connect(addr.to_owned()));
+            *action = Some(ConnectAction::Connect(self.credentials()));
         }
     }
 
@@ -206,9 +345,9 @@ impl ConnectScreen {
         ui.heading("CoreRouter");
         ui.weak("Connect to a router");
         ui.add_space(12.0);
-        let no_auth = "Authentication arrives with G0.3 (docs/gaps.md). Until then a \
-                       router takes management only from its own machine (loopback) and \
-                       asks for no login.";
+        let login_hint = "A router on this machine (127.0.0.1) needs no login when this \
+                          OS user runs it (local token). Any other address is TLS with a \
+                          user and password.";
         let mut enter = false;
         egui::Grid::new("connect-grid")
             .num_columns(2)
@@ -224,33 +363,35 @@ impl ConnectScreen {
                 enter = r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 ui.end_row();
                 ui.label("Login:");
-                ui.add_enabled(
-                    false,
-                    TextEdit::singleline(&mut self.login)
-                        .hint_text("admin")
-                        .desired_width(w),
-                )
-                .on_disabled_hover_text(no_auth);
+                let r = ui
+                    .add(
+                        TextEdit::singleline(&mut self.login)
+                            .hint_text("admin")
+                            .desired_width(w),
+                    )
+                    .on_hover_text(login_hint);
+                enter |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 ui.end_row();
                 ui.label("Password:");
-                ui.add_enabled(
-                    false,
+                let r = ui.add(
                     TextEdit::singleline(&mut self.password)
                         .password(true)
                         .desired_width(w),
-                )
-                .on_disabled_hover_text(no_auth);
+                );
+                enter |= r.lost_focus() && ui.input(|i| i.key_pressed(Key::Enter));
                 ui.end_row();
                 ui.label("");
-                let mut remember = false;
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(&mut remember, "Remember password"),
-                )
-                .on_disabled_hover_text(
-                    "Passwords are never stored in plain text; a secure store \
-                         comes with authentication (G0.3).",
-                );
+                match &self.keyring {
+                    Some(store) => {
+                        ui.checkbox(&mut self.remember, "Remember password")
+                            .on_hover_text(format!("Kept in {store}, never in a file of this app"));
+                    }
+                    None => {
+                        let mut off = false;
+                        ui.add_enabled(false, egui::Checkbox::new(&mut off, "Remember password"))
+                            .on_disabled_hover_text(self.keyring_why.as_str());
+                    }
+                }
                 ui.end_row();
                 ui.label("Group:");
                 ui.add(TextEdit::singleline(&mut self.group).desired_width(w));
@@ -273,9 +414,7 @@ impl ConnectScreen {
             }
         });
         ui.add_space(8.0);
-        ui.colored_label(ui.visuals().warn_fg_color, "No login yet")
-            .on_hover_text(no_auth);
-        ui.weak(no_auth);
+        ui.weak(login_hint);
         if self.offer_lab {
             ui.add_space(8.0);
             ui.separator();
@@ -308,6 +447,7 @@ impl ConnectScreen {
             address: address.chars().take(MAX_FIELD).collect(),
             group: self.group.trim().chars().take(MAX_FIELD).collect(),
             comment: self.comment.trim().chars().take(MAX_FIELD).collect(),
+            user: self.login.trim().chars().take(MAX_FIELD).collect(),
         };
         let full = self.saved.len() >= MAX_SAVED;
         match self.saved.iter_mut().find(|s| s.address == entry.address) {
@@ -421,10 +561,9 @@ impl ConnectScreen {
             Some(addr) if n.remote => {
                 self.connect_to = addr.clone();
                 self.set_error(format!(
-                    "{who} is on another machine: until authentication (G0.3) a router \
-                     accepts management only from its own machine, so the connection would \
-                     be refused. Run the GUI on that router (or tunnel its port to this \
-                     machine); Connect still tries the address."
+                    "{who} is on another machine and announces no TLS management port: \
+                     its plain port only takes clients on its own machine. Start its daemon \
+                     with --listen 0.0.0.0:8729; Connect still tries the address."
                 ));
                 false
             }
@@ -494,6 +633,7 @@ impl ConnectScreen {
             self.connect_to = s.address;
             self.group = s.group;
             self.comment = s.comment;
+            self.login = s.user;
             self.message = None;
             if opened.is_some() {
                 self.connect(action);
@@ -505,6 +645,72 @@ impl ConnectScreen {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conn(addr: &str) -> ConnectAction {
+        ConnectAction::Connect(Credentials {
+            address: addr.into(),
+            ..Credentials::default()
+        })
+    }
+
+    #[test]
+    fn login_goes_with_connect_and_a_new_certificate_is_asked() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        s.connect_to = "10.0.0.1:8729".into();
+        s.login = "admin".into();
+        s.password = "pw-123456".into();
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Connect")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        let Some(ConnectAction::Connect(c)) = a else {
+            panic!("{a:?}")
+        };
+        assert_eq!(
+            (c.user.as_str(), c.password.as_str()),
+            ("admin", "pw-123456")
+        );
+        assert!(!c.remember, "no keyring: never remembered");
+        assert!(!format!("{c:?}").contains("pw-123456"));
+        // First TLS connection: the fingerprint is shown and needs a yes.
+        s.ask_trust(c.clone(), "SHA256:AA:BB".into());
+        // A new window is laid out on its first frame, shown on the next.
+        frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        let (_, texts) = frame(&ctx, &mut s, &[], Vec::new(), &mut t);
+        assert!(texts.iter().any(|(x, _)| x == "SHA256:AA:BB"));
+        let mut a = frame(
+            &ctx,
+            &mut s,
+            &[],
+            click_events(at(&texts, "Trust and connect")),
+            &mut t,
+        )
+        .0;
+        a = a.or(frame(&ctx, &mut s, &[], Vec::new(), &mut t).0);
+        assert_eq!(
+            a,
+            Some(ConnectAction::Trust {
+                creds: c,
+                fingerprint: "SHA256:AA:BB".into()
+            })
+        );
+        s.connected();
+        assert!(s.password.is_empty());
+        // With a keyring the box can be ticked.
+        s.set_keyring(Ok("the system keyring".into()));
+        s.remember = true;
+        assert!(s.credentials().remember);
+        s.set_keyring(Err("none".into()));
+        assert!(!s.credentials().remember);
+    }
 
     fn neighbor(id: &str, connect: Option<&str>) -> NeighborRow {
         NeighborRow {
@@ -599,10 +805,7 @@ mod tests {
         for _ in 0..2 {
             action = action.or(frame(&ctx, &mut s, &rows, Vec::new(), &mut t).0);
         }
-        assert_eq!(
-            action,
-            Some(ConnectAction::Connect("127.0.0.1:7979".into()))
-        );
+        assert_eq!(action, Some(conn("127.0.0.1:7979")));
         // A neighbor without a management port explains itself.
         let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
         let (a, _) = frame(
@@ -642,7 +845,7 @@ mod tests {
         }
         assert_eq!(action, None);
         assert_eq!(s.connect_to, "10.0.0.3:7979");
-        assert!(matches!(&s.message, Some((false, m)) if m.contains("G0.3")));
+        assert!(matches!(&s.message, Some((false, m)) if m.contains("no TLS management port")));
         // The operator may still try it by hand.
         let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
         let mut action = frame(
@@ -654,7 +857,7 @@ mod tests {
         )
         .0;
         action = action.or(frame(&ctx, &mut s, &rows, Vec::new(), &mut t).0);
-        assert_eq!(action, Some(ConnectAction::Connect("10.0.0.3:7979".into())));
+        assert_eq!(action, Some(conn("10.0.0.3:7979")));
         // Without remote neighbors there is no hint.
         let (_, texts) = frame(&ctx, &mut s, &rows[..1], Vec::new(), &mut t);
         assert!(!texts.iter().any(|(x, _)| x.starts_with("Greyed out")));
@@ -683,7 +886,8 @@ mod tests {
             [SavedRouter {
                 address: "10.0.0.1:7979".into(),
                 group: "pop-1".into(),
-                comment: "edge".into()
+                comment: "edge".into(),
+                user: String::new(),
             }]
         );
         assert!(s.take_saved_change().is_none(), "reported once");

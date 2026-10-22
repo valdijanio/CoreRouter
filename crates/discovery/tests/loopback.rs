@@ -50,6 +50,8 @@ fn agent(session: &Shared, port: u16, id: u8, control: u16, transport: Transport
             node_id: NodeId([id; 16]),
             control_port: Some(control),
             ws_port: None,
+            tls_port: None,
+            wss_port: None,
             board: "test".into(),
             transport,
         },

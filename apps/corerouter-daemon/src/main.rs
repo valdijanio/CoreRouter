@@ -1,10 +1,22 @@
 //! `corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
-//!  [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
+//!  [--listen <addr:port>] [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
+//!  [--ws-listen <addr:port>] [--token-file <path>] [--reset-admin-password]
 //!  [--discovery-port <port> | --no-discovery] [--discovery-transport interfaces|loopback]`
 //!
 //! The virtual backend is the default: touching a real kernel must be an
-//! explicit choice. TLS/auth for remote management is docs/gaps.md G0.3, so
-//! both the control port and the WebSocket listen on 127.0.0.1 only.
+//! explicit choice.
+//!
+//! Authentication and TLS (G0.3, docs/control-protocol.md): every request
+//! needs a token. The control port and `--ws` stay on 127.0.0.1, plain;
+//! local clients send the local token from `--token-file` (default
+//! `corerouter_control::local_token::path`, readable only by this OS user).
+//! `--listen` / `--ws-listen` open the same channel on any address, always
+//! TLS, always with a login. The certificate is made once in the config
+//! dir (`tls-cert.pem`, `tls-key.pem` 0600) and its fingerprint is logged
+//! at start-up so operators can compare it with what their client shows.
+//! With no account yet, `admin` (group full) is created with a random
+//! password printed once on stderr; `--reset-admin-password` prints a new
+//! one (and re-enables `admin` in group full).
 //!
 //! `--ws` serves the control methods over WebSocket for the GUI in a browser
 //! (G0.4). Only pages from an allowed origin may connect: by default the
@@ -53,9 +65,10 @@ use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use corerouter_control::tls::ServerIdentity;
 use corerouter_control::{
-    DEFAULT_PORT, SharedHost, Shutdown, WsPolicy, bind_loopback, serve_until, spawn_clock,
-    spawn_ws_until,
+    DEFAULT_PORT, Endpoint, Gate, SharedHost, Shutdown, WsPolicy, bind_loopback, local_token,
+    serve_until, spawn_clock, spawn_until, spawn_ws_until,
 };
 use corerouter_discovery::{Agent, AgentConfig, Transport, enable_lab_default};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, lock, shared};
@@ -68,11 +81,20 @@ use signal_hook::consts::{SIGINT, SIGTERM};
 
 const USAGE: &str = "\
 usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
-                         [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
+                         [--listen <addr:port>] [--ws <port> [--ws-origin <origin>]...
+                         [--web-root <dir>]] [--ws-listen <addr:port>]
+                         [--token-file <path>] [--reset-admin-password]
                          [--discovery-port <port> | --no-discovery]
                          [--discovery-transport interfaces|loopback]
 
+  --control <port>      plain control channel on 127.0.0.1:<port> (default 7979)
+  --listen <addr:port>  control channel over TLS on any address, e.g. 0.0.0.0:8729 or
+                        [::]:8729; login required (the local token is not accepted there)
+  --token-file <path>   where to write the local token (default: see docs/control-protocol.md)
+  --reset-admin-password  give `admin` (group full, enabled) a new random password,
+                        printed once on stderr, and go on running
   --ws <port>           WebSocket for the web GUI on 127.0.0.1:<port>
+  --ws-listen <a:port>  the same over TLS (wss://, https:// for --web-root) on any address
   --ws-origin <origin>  also allow pages from <origin> (e.g. http://127.0.0.1:8080 for
                         `trunk serve`); the default is only http://127.0.0.1:<port>
                         and http://localhost:<port>
@@ -97,6 +119,10 @@ const PRODUCTION_CONFIG_DIR: &str = "/config";
 
 struct Args {
     port: u16,
+    listen: Option<std::net::SocketAddr>,
+    ws_listen: Option<std::net::SocketAddr>,
+    token_file: Option<PathBuf>,
+    reset_admin: bool,
     backend: String,
     config_dir: Option<PathBuf>,
     ws: Option<u16>,
@@ -111,6 +137,10 @@ struct Args {
 fn parse_args() -> Result<Args, String> {
     let mut out = Args {
         port: DEFAULT_PORT,
+        listen: None,
+        ws_listen: None,
+        token_file: None,
+        reset_admin: false,
         backend: "virtual".into(),
         config_dir: None,
         ws: None,
@@ -127,6 +157,22 @@ fn parse_args() -> Result<Args, String> {
                 out.port = v.parse().map_err(|_| format!("bad port '{v}'"))?;
             }
             "--backend" => out.backend = args.next().ok_or("--backend needs a value")?,
+            "--listen" | "--ws-listen" => {
+                let v = args.next().ok_or_else(|| format!("{a} needs ADDR:PORT"))?;
+                let addr = v
+                    .parse()
+                    .map_err(|_| format!("{a}: '{v}' is not ADDR:PORT ([::]:8729 for IPv6)"))?;
+                if a == "--listen" {
+                    out.listen = Some(addr);
+                } else {
+                    out.ws_listen = Some(addr);
+                }
+            }
+            "--token-file" => {
+                let v = args.next().ok_or("--token-file needs a path")?;
+                out.token_file = Some(PathBuf::from(v));
+            }
+            "--reset-admin-password" => out.reset_admin = true,
             "--config-dir" => {
                 let v = args.next().ok_or("--config-dir needs a directory")?;
                 out.config_dir = Some(PathBuf::from(v));
@@ -170,17 +216,24 @@ fn parse_args() -> Result<Args, String> {
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
-    if out.ws.is_none() && (!out.ws_origins.is_empty() || out.web_root.is_some()) {
-        return Err("--ws-origin and --web-root need --ws <port>".into());
+    if out.ws.is_none()
+        && out.ws_listen.is_none()
+        && (!out.ws_origins.is_empty() || out.web_root.is_some())
+    {
+        return Err("--ws-origin and --web-root need --ws <port> or --ws-listen".into());
     }
     Ok(out)
 }
 
-/// Start the WebSocket endpoint on its own thread, if asked for.
-fn websocket(args: &Args, host: SharedHost, shutdown: &Shutdown) -> Result<(), String> {
-    let Some(port) = args.ws else {
-        return Ok(());
-    };
+/// Start the WebSocket endpoints on their own threads, if asked for.
+/// `local_gate` takes the local token (loopback); `remote_gate` only logins.
+fn websocket(
+    args: &Args,
+    host: &SharedHost,
+    (local_gate, remote_gate): (&Gate, &Gate),
+    tls: Option<&ServerIdentity>,
+    shutdown: &Shutdown,
+) -> Result<(), String> {
     if let Some(root) = &args.web_root
         && !root.join("index.html").is_file()
     {
@@ -189,27 +242,173 @@ fn websocket(args: &Args, host: SharedHost, shutdown: &Shutdown) -> Result<(), S
             root.display()
         ));
     }
-    let listener = bind_loopback(port).map_err(|e| format!("cannot open --ws port {port}: {e}"))?;
-    let mut origins = WsPolicy::same_origin(port);
-    origins.extend(args.ws_origins.iter().cloned());
-    log::info!(
-        "WebSocket on ws://127.0.0.1:{port}/ws (loopback only; NO authentication or TLS \
-         until G0.3); allowed page origins: {}",
-        origins.join(", ")
-    );
-    if let Some(root) = &args.web_root {
+    if let Some(port) = args.ws {
+        let listener =
+            bind_loopback(port).map_err(|e| format!("cannot open --ws port {port}: {e}"))?;
+        let mut origins = WsPolicy::same_origin(port);
+        origins.extend(args.ws_origins.iter().cloned());
         log::info!(
-            "web GUI from {} at http://127.0.0.1:{port}/",
-            root.display()
+            "WebSocket on ws://127.0.0.1:{port}/ws (loopback only, login required); \
+             allowed page origins: {}",
+            origins.join(", ")
         );
+        if let Some(root) = &args.web_root {
+            log::info!(
+                "web GUI from {} at http://127.0.0.1:{port}/",
+                root.display()
+            );
+        }
+        let policy = WsPolicy {
+            origins,
+            web_root: args.web_root.clone(),
+            same_host: false,
+        };
+        spawn_ws_until(
+            Endpoint::loopback(listener),
+            host.clone(),
+            policy,
+            local_gate.clone(),
+            shutdown.clone(),
+        )
+        .map_err(|e| format!("cannot start the WebSocket thread: {e}"))?;
     }
-    let policy = WsPolicy {
-        origins,
-        web_root: args.web_root.clone(),
+    if let (Some(addr), Some(id)) = (args.ws_listen, tls) {
+        let listener = std::net::TcpListener::bind(addr)
+            .map_err(|e| format!("cannot open --ws-listen {addr}: {e}"))?;
+        log::info!(
+            "WebSocket over TLS on wss://{addr}/ws (login required){}",
+            if args.web_root.is_some() {
+                format!("; web GUI at https://{addr}/")
+            } else {
+                String::new()
+            }
+        );
+        let policy = WsPolicy {
+            origins: args.ws_origins.clone(),
+            web_root: args.web_root.clone(),
+            same_host: true,
+        };
+        spawn_ws_until(
+            Endpoint::tls(listener, id.config.clone()),
+            host.clone(),
+            policy,
+            remote_gate.clone(),
+            shutdown.clone(),
+        )
+        .map_err(|e| format!("cannot start the WebSocket TLS thread: {e}"))?;
+    }
+    Ok(())
+}
+
+/// The TLS identity, when something listens with TLS: kept in the config
+/// dir, or made for this run only (the virtual lab without one).
+fn tls_identity(
+    args: &Args,
+    config_dir: Option<&std::path::Path>,
+) -> Result<Option<ServerIdentity>, String> {
+    if args.listen.is_none() && args.ws_listen.is_none() {
+        return Ok(None);
+    }
+    let id = match config_dir {
+        Some(dir) => {
+            let (id, created) = corerouter_control::tls::load_or_create(dir)
+                .map_err(|e| format!("TLS certificate in {}: {e}", dir.display()))?;
+            if created {
+                log::info!(
+                    "made a new self-signed TLS certificate in {}",
+                    dir.display()
+                );
+            }
+            id
+        }
+        None => {
+            log::warn!(
+                "no --config-dir: the TLS certificate is new on every start, so clients \
+                 that remembered it will refuse the next one"
+            );
+            let (cert, key) = corerouter_control::tls::generate()?;
+            corerouter_control::tls::identity_from_pem(cert.as_bytes(), key.as_bytes())?
+        }
     };
-    spawn_ws_until(listener, host, policy, shutdown.clone())
-        .map(|_| ())
-        .map_err(|e| format!("cannot start the WebSocket thread: {e}"))
+    log::info!("TLS certificate fingerprint: {}", id.fingerprint);
+    Ok(Some(id))
+}
+
+/// First start (no account at all): `admin` in group full with a random
+/// password, printed once. `--reset-admin-password`: a new one for admin.
+fn bootstrap_admin(session: &corerouter_engine::Shared, reset: bool) -> Result<(), String> {
+    let mut s = lock(session);
+    let first = s.users().is_empty();
+    if !first && !reset {
+        return Ok(());
+    }
+    let password = corerouter_control::auth::random_password()?;
+    let params = serde_json::json!({"name": "admin", "group": "full", "password": password});
+    let result = if s.users().get("admin").is_some() {
+        let mut set = params.clone();
+        if let Some(o) = set.as_object_mut() {
+            o.insert("disabled".into(), false.into());
+        }
+        s.execute("user.set", &set)
+    } else {
+        s.execute("user.add", &params)
+    };
+    result.map_err(|e| format!("cannot set the admin password: {e}"))?;
+    let why = if first {
+        "first start: created user 'admin' (group full)"
+    } else {
+        "new password for user 'admin' (reset at start-up)"
+    };
+    // stderr, not the log: shown once, to whoever started the daemon.
+    eprintln!(
+        "\n================================================================\n\
+         {why}\n  password: {password}\n\
+         It is shown only now and stored only as a hash. Lost it? Restart\n\
+         with --reset-admin-password.\n\
+         ================================================================\n"
+    );
+    Ok(())
+}
+
+/// Write the local token where local clients look for it.
+fn write_local_token(args: &Args, token: &str) -> Option<PathBuf> {
+    let written = match &args.token_file {
+        Some(path) => write_token_at(path, token).map(|()| path.clone()),
+        None => local_token::create(args.port, token),
+    };
+    match written {
+        Ok(path) => {
+            log::info!(
+                "local token for CLI/MCP on this machine: {}",
+                path.display()
+            );
+            Some(path)
+        }
+        Err(e) => {
+            log::warn!(
+                "local token not written ({e}): local clients must log in with a user \
+                 and password"
+            );
+            None
+        }
+    }
+}
+
+fn write_token_at(path: &std::path::Path, token: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let _ = std::fs::remove_file(path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    writeln!(f, "{token}")
 }
 
 fn backend(name: &str) -> Result<Box<dyn Hal>, String> {
@@ -321,6 +520,7 @@ fn run_until_signal(
     session: &corerouter_engine::Shared,
     shutdown: &Shutdown,
     discovery: Discovery,
+    token_file: Option<PathBuf>,
 ) -> ! {
     let sig = signals.wait();
     log::info!(
@@ -338,6 +538,9 @@ fn run_until_signal(
         log::warn!("a second signal will not cut the shutdown short: {e}");
     }
     shutdown.close();
+    if let Some(f) = token_file {
+        let _ = std::fs::remove_file(f);
+    }
     let deadline = Instant::now() + GOODBYE_WAIT;
     let left = || deadline.saturating_duration_since(Instant::now());
     #[cfg(target_os = "linux")]
@@ -428,11 +631,32 @@ fn main() -> ExitCode {
     };
     log::info!(
         "corerouter-daemon {} on 127.0.0.1:{} (backend: {}, storage: {storage_name}; \
-         loopback only, no authentication until G0.3)",
+         login or local token required)",
         env!("CARGO_PKG_VERSION"),
         args.port,
         args.backend
     );
+    if let Err(e) = bootstrap_admin(&session, args.reset_admin) {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
+    let tls = match tls_identity(&args, config_dir.as_deref()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let gate = Gate::default();
+    let token = match corerouter_control::auth::new_token() {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("cannot make the local token: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    gate.add_local_token(&token);
+    let token_file = write_local_token(&args, &token);
     let node_id = node_id::load_or_create(config_dir.as_deref());
     let crdp = match args.discovery_port {
         None => None,
@@ -456,6 +680,8 @@ fn main() -> ExitCode {
                 node_id,
                 control_port: Some(args.port),
                 ws_port: args.ws,
+                tls_port: args.listen.map(|a| a.port()),
+                wss_port: args.ws_listen.map(|a| a.port()),
                 board: format!("{} {}", std::env::consts::ARCH, args.backend),
                 transport,
             };
@@ -476,17 +702,40 @@ fn main() -> ExitCode {
     };
     let shutdown = Shutdown::default();
     let host = SharedHost(session.clone());
-    if let Err(e) = websocket(&args, host.clone(), &shutdown) {
+    // The TLS endpoints never take the local token: it proves a local
+    // OS user, which a remote peer is not.
+    let remote_gate = Gate::default();
+    if let Err(e) = websocket(&args, &host, (&gate, &remote_gate), tls.as_ref(), &shutdown) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
+    }
+    if let (Some(addr), Some(id)) = (args.listen, &tls) {
+        let started = std::net::TcpListener::bind(addr)
+            .map_err(|e| format!("cannot open --listen {addr}: {e}"))
+            .and_then(|l| {
+                spawn_until(
+                    Endpoint::tls(l, id.config.clone()),
+                    host.clone(),
+                    remote_gate.clone(),
+                    shutdown.clone(),
+                )
+                .map_err(|e| format!("cannot start the TLS control thread: {e}"))
+            });
+        match started {
+            Ok(_) => log::info!("control channel over TLS on {addr} (login required)"),
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
     }
     let stop = shutdown.clone();
     let control = thread::Builder::new()
         .name("control".into())
-        .spawn(move || serve_until(listener, host, &stop));
+        .spawn(move || serve_until(Endpoint::loopback(listener), host, gate, &stop));
     if let Err(e) = control {
         eprintln!("cannot start the control thread: {e}");
         return ExitCode::FAILURE;
     }
-    run_until_signal(signals, &session, &shutdown, discovery)
+    run_until_signal(signals, &session, &shutdown, discovery, token_file)
 }

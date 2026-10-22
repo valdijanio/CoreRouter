@@ -23,6 +23,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 log.workspace = true
 ipnet.workspace = true
+argon2.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+getrandom.workspace = true
 
 [lints]
 workspace = true

@@ -11,6 +11,9 @@ pub const NO_UI: &str = "ui.screenshot needs the GUI: start `corerouter-gui --co
 const METHODS: &[&str] = &[
     "ping",
     "server.info",
+    "auth.login",
+    "auth.logout",
+    "auth.whoami",
     "engine.list",
     "engine.execute",
     "engine.batch",
@@ -116,7 +119,7 @@ pub fn dispatch_as(
                 }))
             })
         }
-        "engine.list" => host.with_session(&mut |s| Ok(s.list())),
+        "engine.list" => host.with_session(&mut |s| Ok(s.list_as(caller))),
         "engine.execute" => {
             let id = params
                 .get("command")

@@ -47,6 +47,10 @@ pub mod tlv {
     pub const IPV6: u16 = 11;
     pub const CONTROL_PORT: u16 = 12;
     pub const WS_PORT: u16 = 13;
+    /// Control channel over TLS (`corerouter-daemon --listen`, G0.3).
+    pub const TLS_PORT: u16 = 14;
+    /// WebSocket over TLS (`--ws-listen`).
+    pub const WSS_PORT: u16 = 15;
 }
 
 /// Stable 128-bit id of a router, generated once and kept with its config.
@@ -103,6 +107,9 @@ pub struct Announcement {
     pub ipv6: Vec<(Ipv6Addr, u8)>,
     pub control_port: Option<u16>,
     pub ws_port: Option<u16>,
+    /// Ports reachable from other machines: TLS control and WebSocket.
+    pub tls_port: Option<u16>,
+    pub wss_port: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -235,6 +242,8 @@ impl Announcement {
         for (t, port) in [
             (tlv::CONTROL_PORT, self.control_port),
             (tlv::WS_PORT, self.ws_port),
+            (tlv::TLS_PORT, self.tls_port),
+            (tlv::WSS_PORT, self.wss_port),
         ] {
             match port {
                 Some(0) => return Err(EncodeError::ZeroPort),
@@ -272,6 +281,8 @@ struct Partial {
     ipv6: Vec<(Ipv6Addr, u8)>,
     control: Option<u16>,
     ws: Option<u16>,
+    tls: Option<u16>,
+    wss: Option<u16>,
 }
 
 fn once<T>(slot: &mut Option<T>, t: u16, value: T) -> Result<(), DecodeError> {
@@ -355,6 +366,8 @@ impl Partial {
             }
             tlv::CONTROL_PORT => once(&mut self.control, t, port(t, v)?)?,
             tlv::WS_PORT => once(&mut self.ws, t, port(t, v)?)?,
+            tlv::TLS_PORT => once(&mut self.tls, t, port(t, v)?)?,
+            tlv::WSS_PORT => once(&mut self.wss, t, port(t, v)?)?,
             // Unknown TLV: a newer sender; skip it.
             _ => {}
         }
@@ -376,6 +389,8 @@ impl Partial {
             ipv6: self.ipv6,
             control_port: self.control,
             ws_port: self.ws,
+            tls_port: self.tls,
+            wss_port: self.wss,
         })
     }
 }
@@ -466,6 +481,8 @@ mod tests {
             ipv6: vec![("fe80::1".parse().unwrap(), 64)],
             control_port: Some(7979),
             ws_port: Some(7980),
+            tls_port: Some(8729),
+            wss_port: None,
         }
     }
 
@@ -606,11 +623,14 @@ mod tests {
                 proptest::collection::vec((any::<[u8; 16]>(), 0u8..=128), 0..=MAX_ADDRESSES),
                 proptest::option::of(1u16..),
                 proptest::option::of(1u16..),
+                proptest::option::of(1u16..),
+                proptest::option::of(1u16..),
             ),
         )
             .prop_map(
                 |((id, hold, identity, version, platform, board, interface), rest)| {
-                    let (uptime_secs, mac, v4, v6, control_port, ws_port) = rest;
+                    let (uptime_secs, mac, v4, v6, control_port, ws_port, tls_port, wss_port) =
+                        rest;
                     Announcement {
                         node_id: NodeId(id),
                         hold_secs: hold,
@@ -625,6 +645,8 @@ mod tests {
                         ipv6: v6.into_iter().map(|(a, l)| (a.into(), l)).collect(),
                         control_port,
                         ws_port,
+                        tls_port,
+                        wss_port,
                     }
                 },
             )

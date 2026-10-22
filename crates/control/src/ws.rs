@@ -1,12 +1,16 @@
 //! WebSocket endpoint of the control channel, for the GUI in a browser.
 //!
 //! Same requests and replies as the TCP channel, one JSON text message each
-//! way. Synchronous (`tungstenite`), one thread per connection, loopback only.
+//! way, each request with its `token` (G0.3: log in with `auth.login`).
+//! Synchronous (`tungstenite`), one thread per connection. A plain endpoint
+//! is loopback only; one bound to another address is always TLS (`wss://`).
 //!
 //! A browser lets any page open a WebSocket to `127.0.0.1`, so the handshake
 //! is refused (403) when the `Origin` header is not in [`WsPolicy::origins`].
 //! A request without `Origin` does not come from a page (browsers always send
-//! it) and is treated like a TCP client. Authentication and TLS are G0.3.
+//! it) and is treated like a TCP client. On a TLS endpoint
+//! [`WsPolicy::same_host`] also allows the page this port served itself
+//! (`Origin` = `https://` + the `Host` header).
 //!
 //! With [`WsPolicy::web_root`] the same port also serves the GUI files over
 //! plain HTTP `GET` (the WebFig model), so the default allowed origin is the
@@ -14,10 +18,9 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -26,8 +29,9 @@ use tungstenite::{Message, WebSocket};
 
 use corerouter_engine::Caller;
 
-use crate::dispatch::{Host, hang_up, new_caller};
-use crate::server::{MAX_CONNECTIONS, Shutdown, answer};
+use crate::auth::Gate;
+use crate::dispatch::{Host, hang_up};
+use crate::server::{Conn, Endpoint, Shutdown, accept_loop, answer};
 use crate::wire::MAX_REQUEST_LINE;
 
 /// Largest HTTP request head (request line + headers).
@@ -45,6 +49,9 @@ pub struct WsPolicy {
     pub origins: Vec<String>,
     /// Directory with the built web GUI (`trunk build` → `dist/`).
     pub web_root: Option<PathBuf>,
+    /// Also allow `Origin: https://<Host header>`: the page served by this
+    /// very port over TLS, whatever address the browser used to reach it.
+    pub same_host: bool,
 }
 
 impl WsPolicy {
@@ -56,102 +63,64 @@ impl WsPolicy {
         ]
     }
 
-    /// `None` (no `Origin`) or an exact match.
-    pub fn origin_allowed(&self, origin: Option<&str>) -> bool {
-        origin.is_none_or(|o| self.origins.iter().any(|a| a == o))
+    /// `None` (no `Origin`), an exact match, or (with `same_host`) the
+    /// HTTPS origin of the `Host` the browser asked for.
+    pub fn origin_allowed(&self, origin: Option<&str>, host: Option<&str>) -> bool {
+        origin.is_none_or(|o| {
+            self.origins.iter().any(|a| a == o)
+                || (self.same_host && host.is_some_and(|h| o == format!("https://{h}")))
+        })
     }
 }
 
 /// Serve forever on the current thread.
 pub fn serve_ws<H: Host + Clone + Send + 'static>(
-    listener: TcpListener,
+    endpoint: Endpoint,
     host: H,
     policy: WsPolicy,
+    gate: Gate,
 ) {
-    serve_ws_until(listener, host, policy, &Shutdown::default());
+    serve_ws_until(endpoint, host, policy, gate, &Shutdown::default());
 }
 
 /// Serve on the current thread until `shutdown` is closed.
 pub fn serve_ws_until<H: Host + Clone + Send + 'static>(
-    listener: TcpListener,
+    endpoint: Endpoint,
     host: H,
     policy: WsPolicy,
+    gate: Gate,
     shutdown: &Shutdown,
 ) {
     let policy = Arc::new(policy);
-    let active = Arc::new(AtomicUsize::new(0));
-    shutdown.watch(&listener);
-    // A close that ran before `watch` did not wake this loop.
-    if shutdown.is_closed() {
-        return;
-    }
-    for conn in listener.incoming() {
-        if shutdown.is_closed() {
-            log::info!("ws: no longer accepting connections");
-            return;
-        }
-        let mut stream = match conn {
-            Ok(s) => s,
-            Err(e) => {
-                log::warn!("ws: accept failed: {e}");
-                continue;
-            }
-        };
-        if !stream.peer_addr().is_ok_and(|a| a.ip().is_loopback()) {
-            log::warn!("ws: rejected non-loopback peer");
-            continue;
-        }
-        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            active.fetch_sub(1, Ordering::SeqCst);
-            let _ = respond(
-                &mut stream,
-                "503 Service Unavailable",
-                "too many connections",
-            );
-            continue;
-        }
-        let (mut host, policy, counter) = (host.clone(), Arc::clone(&policy), Arc::clone(&active));
-        let caller = match stream.peer_addr() {
-            Ok(peer) => new_caller("ws", peer),
-            Err(_) => new_caller("ws", "?"),
-        };
-        let spawned = thread::Builder::new()
-            .name("ws-conn".into())
-            .spawn(move || {
-                if let Err(e) = handle(stream, &mut host, &caller, &policy) {
-                    log::debug!("ws: connection closed: {e}");
-                }
-                hang_up(&mut host, &caller);
-                counter.fetch_sub(1, Ordering::SeqCst);
-            });
-        if let Err(e) = spawned {
-            active.fetch_sub(1, Ordering::SeqCst);
-            log::error!("ws: cannot spawn connection thread: {e}");
-        }
-    }
+    accept_loop(endpoint, "ws", shutdown, move |conn, caller, peer| {
+        let mut host = host.clone();
+        let out = handle(conn, &mut host, &gate, &caller, peer, &policy);
+        hang_up(&mut host, &caller);
+        out
+    });
 }
 
 /// Serve on a background thread.
 pub fn spawn_ws<H: Host + Clone + Send + 'static>(
-    listener: TcpListener,
+    endpoint: Endpoint,
     host: H,
     policy: WsPolicy,
+    gate: Gate,
 ) -> io::Result<thread::JoinHandle<()>> {
-    thread::Builder::new()
-        .name("ws".into())
-        .spawn(move || serve_ws(listener, host, policy))
+    spawn_ws_until(endpoint, host, policy, gate, Shutdown::default())
 }
 
 /// [`spawn_ws`] that stops accepting when `shutdown` is closed.
 pub fn spawn_ws_until<H: Host + Clone + Send + 'static>(
-    listener: TcpListener,
+    endpoint: Endpoint,
     host: H,
     policy: WsPolicy,
+    gate: Gate,
     shutdown: Shutdown,
 ) -> io::Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("ws".into())
-        .spawn(move || serve_ws_until(listener, host, policy, &shutdown))
+        .spawn(move || serve_ws_until(endpoint, host, policy, gate, &shutdown))
 }
 
 /// The parts of an HTTP request head this server looks at.
@@ -161,6 +130,7 @@ struct Head {
     target: String,
     upgrade: bool,
     origin: Option<String>,
+    host: Option<String>,
 }
 
 fn parse_head(raw: &[u8]) -> Option<Head> {
@@ -181,6 +151,8 @@ fn parse_head(raw: &[u8]) -> Option<Head> {
             head.upgrade = value.eq_ignore_ascii_case("websocket");
         } else if name.eq_ignore_ascii_case("origin") {
             head.origin = Some(value.to_owned());
+        } else if name.eq_ignore_ascii_case("host") {
+            head.host = Some(value.to_owned());
         }
     }
     Some(head)
@@ -188,7 +160,7 @@ fn parse_head(raw: &[u8]) -> Option<Head> {
 
 /// Read up to the blank line that ends the head. Returns the head and
 /// whatever came after it (handed back to the WebSocket handshake).
-fn read_head(stream: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
+fn read_head(stream: &mut dyn Conn) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 2048];
     loop {
@@ -210,7 +182,7 @@ fn read_head(stream: &mut TcpStream) -> io::Result<Option<(Vec<u8>, Vec<u8>)>> {
 /// A stream with bytes already read in front of it.
 struct Prefixed {
     front: io::Cursor<Vec<u8>>,
-    stream: TcpStream,
+    stream: Box<dyn Conn>,
 }
 
 impl Read for Prefixed {
@@ -234,22 +206,24 @@ impl Write for Prefixed {
 }
 
 fn handle<H: Host>(
-    mut stream: TcpStream,
+    mut stream: Box<dyn Conn>,
     host: &mut H,
+    gate: &Gate,
     caller: &Caller,
+    peer: Option<IpAddr>,
     policy: &WsPolicy,
 ) -> io::Result<()> {
-    stream.set_read_timeout(Some(HEAD_TIMEOUT))?;
-    let Some((raw, rest)) = read_head(&mut stream)? else {
-        return respond(&mut stream, "400 Bad Request", "bad request");
+    stream.tcp().set_read_timeout(Some(HEAD_TIMEOUT))?;
+    let Some((raw, rest)) = read_head(stream.as_mut())? else {
+        return respond(stream.as_mut(), "400 Bad Request", "bad request");
     };
     let Some(head) = parse_head(&raw) else {
-        return respond(&mut stream, "400 Bad Request", "bad request");
+        return respond(stream.as_mut(), "400 Bad Request", "bad request");
     };
     if !head.upgrade {
-        return static_file(&mut stream, &head, policy.web_root.as_deref());
+        return static_file(stream.as_mut(), &head, policy.web_root.as_deref());
     }
-    if !policy.origin_allowed(head.origin.as_deref()) {
+    if !policy.origin_allowed(head.origin.as_deref(), head.host.as_deref()) {
         log::warn!(
             "ws: refused origin {:?} (allowed: {})",
             head.origin
@@ -260,7 +234,7 @@ fn handle<H: Host>(
                 .collect::<String>(),
             policy.origins.join(", ")
         );
-        return respond(&mut stream, "403 Forbidden", "origin not allowed");
+        return respond(stream.as_mut(), "403 Forbidden", "origin not allowed");
     }
     let mut front = raw;
     front.extend_from_slice(&rest);
@@ -274,11 +248,17 @@ fn handle<H: Host>(
     let mut ws = tungstenite::accept_with_config(io, Some(config))
         .map_err(|e| io::Error::other(format!("handshake: {e}")))?;
     // Idle browser tabs are normal: no read timeout after the handshake.
-    ws.get_mut().stream.set_read_timeout(None)?;
-    messages(&mut ws, host, caller)
+    ws.get_mut().stream.tcp().set_read_timeout(None)?;
+    messages(&mut ws, host, gate, caller, peer)
 }
 
-fn messages(ws: &mut WebSocket<Prefixed>, host: &mut dyn Host, caller: &Caller) -> io::Result<()> {
+fn messages(
+    ws: &mut WebSocket<Prefixed>,
+    host: &mut dyn Host,
+    gate: &Gate,
+    caller: &Caller,
+    peer: Option<IpAddr>,
+) -> io::Result<()> {
     let closed = |e: tungstenite::Error| match e {
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => Ok(()),
         tungstenite::Error::Io(e) => Err(e),
@@ -296,7 +276,7 @@ fn messages(ws: &mut WebSocket<Prefixed>, host: &mut dyn Host, caller: &Caller) 
         if text.trim().is_empty() {
             continue;
         }
-        let Some(reply) = answer(host, caller, &text) else {
+        let Some(reply) = answer(host, gate, caller, peer, &text) else {
             return ws.close(None).or_else(closed);
         };
         if let Err(e) = ws.send(Message::text(reply.to_string())) {
@@ -306,7 +286,7 @@ fn messages(ws: &mut WebSocket<Prefixed>, host: &mut dyn Host, caller: &Caller) 
 }
 
 /// Minimal reply with a short plain-text body; the connection then closes.
-fn respond(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
+fn respond(stream: &mut dyn Conn, status: &str, body: &str) -> io::Result<()> {
     write!(
         stream,
         "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\n\
@@ -317,7 +297,7 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) -> io::Result<()> {
 }
 
 /// `GET`/`HEAD` of a file under `root`; anything else is refused.
-fn static_file(stream: &mut TcpStream, head: &Head, root: Option<&Path>) -> io::Result<()> {
+fn static_file(stream: &mut dyn Conn, head: &Head, root: Option<&Path>) -> io::Result<()> {
     let Some(root) = root else {
         return respond(stream, "404 Not Found", "this port only speaks WebSocket");
     };
@@ -394,14 +374,24 @@ mod tests {
     use crate::server::bind_loopback;
     use corerouter_engine::{Session, shared};
     use serde_json::{Value, json};
+    use std::net::TcpStream;
     use tungstenite::client::IntoClientRequest;
     use tungstenite::http::HeaderValue;
+
+    /// Every test talks with the local token.
+    const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn gate() -> Gate {
+        let g = Gate::default();
+        g.add_local_token(TOKEN);
+        g
+    }
 
     fn start(policy: WsPolicy) -> u16 {
         let listener = bind_loopback(0).unwrap();
         let port = listener.local_addr().unwrap().port();
         let host = SharedHost(shared(Session::virtual_lab()));
-        spawn_ws(listener, host, policy).unwrap();
+        spawn_ws(Endpoint::loopback(listener), host, policy, gate()).unwrap();
         port
     }
 
@@ -425,7 +415,8 @@ mod tests {
             })
     }
 
-    fn call(ws: &mut WebSocket<TcpStream>, req: Value) -> Value {
+    fn call(ws: &mut WebSocket<TcpStream>, mut req: Value) -> Value {
+        req["token"] = json!(TOKEN);
         ws.send(Message::text(req.to_string())).unwrap();
         loop {
             if let Message::Text(t) = ws.read().unwrap() {
@@ -438,9 +429,20 @@ mod tests {
     fn allowed_origin_runs_commands() {
         let port = start(WsPolicy {
             origins: WsPolicy::same_origin(1234),
-            web_root: None,
+            ..WsPolicy::default()
         });
         let mut ws = connect(port, Some("http://127.0.0.1:1234")).unwrap();
+        // Without the token: refused.
+        ws.send(Message::text(
+            json!({"id": 1, "method": "state.inspect"}).to_string(),
+        ))
+        .unwrap();
+        let r: Value = loop {
+            if let Message::Text(t) = ws.read().unwrap() {
+                break serde_json::from_str(&t).unwrap();
+            }
+        };
+        assert!(r["error"].as_str().unwrap().starts_with("unauthorized"));
         let r = call(
             &mut ws,
             json!({"id": 7, "method": "engine.execute",
@@ -459,7 +461,13 @@ mod tests {
         let listener = bind_loopback(0).unwrap();
         let port = listener.local_addr().unwrap().port();
         let session = shared(Session::virtual_lab());
-        spawn_ws(listener, SharedHost(session.clone()), WsPolicy::default()).unwrap();
+        spawn_ws(
+            Endpoint::loopback(listener),
+            SharedHost(session.clone()),
+            WsPolicy::default(),
+            gate(),
+        )
+        .unwrap();
         let disabled = || {
             corerouter_engine::lock(&session)
                 .store()
@@ -506,7 +514,7 @@ mod tests {
     fn foreign_origin_is_refused() {
         let port = start(WsPolicy {
             origins: WsPolicy::same_origin(1234),
-            web_root: None,
+            ..WsPolicy::default()
         });
         for bad in ["http://evil.example", "null", "http://127.0.0.1:1235"] {
             match connect(port, Some(bad)) {
@@ -573,8 +581,8 @@ mod tests {
         fs::write(root.join("app_bg.wasm"), b"\0asm").unwrap();
         fs::write(dir.join("secret.txt"), "no").unwrap();
         let port = start(WsPolicy {
-            origins: Vec::new(),
             web_root: Some(root),
+            ..WsPolicy::default()
         });
         let index = http_get(port, "/?connect=x");
         assert!(index.starts_with("HTTP/1.1 200"), "{index}");
@@ -617,9 +625,18 @@ mod tests {
                 target: "/ws".into(),
                 upgrade: true,
                 origin: Some("http://a:1".into()),
+                host: Some("a".into()),
             }
         );
         assert!(parse_head(b"\xff\xfe").is_none());
+        let tls = WsPolicy {
+            same_host: true,
+            ..WsPolicy::default()
+        };
+        assert!(tls.origin_allowed(Some("https://10.0.0.1:8730"), Some("10.0.0.1:8730")));
+        assert!(!tls.origin_allowed(Some("https://evil.example"), Some("10.0.0.1:8730")));
+        assert!(!tls.origin_allowed(Some("http://10.0.0.1:8730"), Some("10.0.0.1:8730")));
+        assert!(!WsPolicy::default().origin_allowed(Some("https://a:1"), Some("a:1")));
         assert!(parse_head(b"GET").is_none());
     }
 }

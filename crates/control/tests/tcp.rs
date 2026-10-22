@@ -1,18 +1,62 @@
-use std::io::{Read, Write};
-use std::net::TcpStream;
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::time::Duration;
 
-use corerouter_control::{Client, SharedHost, bind_loopback, spawn};
-use corerouter_engine::{Session, shared};
+use corerouter_control::dial::{Expect, RefuseNew};
+use corerouter_control::{
+    Client, Endpoint, Gate, KnownHosts, Limits, Login, SharedHost, Target, Trust, UNAUTHORIZED,
+    bind_loopback, dial, spawn,
+};
+use corerouter_engine::{Session, Shared, shared};
 use serde_json::{Value, json};
+
+const ADMIN_PW: &str = "admin-password";
+
+/// A lab with admin (full) and noc (read), a gate with a known local token.
+fn lab() -> (Shared, Gate, String) {
+    let mut s = Session::virtual_lab();
+    for (name, group) in [("admin", "full"), ("noc", "read")] {
+        s.execute(
+            "user.add",
+            &json!({"name": name, "group": group, "password": ADMIN_PW}),
+        )
+        .unwrap();
+    }
+    let gate = Gate::new(Limits {
+        base_delay: Duration::from_millis(1),
+        max_delay: Duration::from_millis(2),
+        ..Limits::default()
+    });
+    let token = corerouter_control::auth::new_token().unwrap();
+    gate.add_local_token(&token);
+    (shared(s), gate, token)
+}
+
+fn start(session: &Shared, gate: &Gate) -> String {
+    let listener = bind_loopback(0).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    spawn(
+        Endpoint::loopback(listener),
+        SharedHost(session.clone()),
+        gate.clone(),
+    )
+    .unwrap();
+    addr
+}
+
+fn local(addr: &str, token: &str) -> Client {
+    let mut c = Client::connect(addr, Duration::from_secs(2)).unwrap();
+    c.set_token(Some(token.to_owned()));
+    c
+}
 
 #[test]
 fn roundtrip_and_hostile_lines() {
-    let listener = bind_loopback(0).unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    spawn(listener, SharedHost(shared(Session::virtual_lab()))).unwrap();
-
-    let mut c = Client::connect(&addr, Duration::from_secs(2)).unwrap();
+    let (session, gate, token) = lab();
+    let addr = start(&session, &gate);
+    let mut c = local(&addr, &token);
     assert_eq!(c.call("ping", Value::Null).unwrap()["pong"], true);
     let r = c
         .call(
@@ -25,6 +69,7 @@ fn roundtrip_and_hostile_lines() {
         c.call("engine.execute", json!({"command": "nope"}))
             .is_err()
     );
+    assert_eq!(c.call("auth.whoami", Value::Null).unwrap()["user"], "local");
 
     // An HTTP request is not JSON: the server must close the connection.
     let mut raw = TcpStream::connect(&addr).unwrap();
@@ -33,6 +78,98 @@ fn roundtrip_and_hostile_lines() {
         .unwrap();
     let mut buf = [0u8; 16];
     assert_eq!(raw.read(&mut buf).unwrap(), 0);
+}
+
+/// G0.3: loopback without a credential gets nothing but ping/server.info.
+#[test]
+fn loopback_without_credentials_is_refused() {
+    let (session, gate, _) = lab();
+    let addr = start(&session, &gate);
+    let mut c = Client::connect(&addr, Duration::from_secs(2)).unwrap();
+    assert_eq!(c.call("ping", Value::Null).unwrap()["pong"], true);
+    assert_eq!(
+        c.call("server.info", Value::Null).unwrap()["auth"],
+        "required"
+    );
+    for (method, params) in [
+        ("engine.list", Value::Null),
+        ("state.inspect", json!({})),
+        (
+            "engine.execute",
+            json!({"command": "system.identity.set", "params": {"name": "pwned"}}),
+        ),
+        ("engine.batch", json!({"steps": []})),
+    ] {
+        let e = c.call(method, params).unwrap_err();
+        assert!(e.starts_with(UNAUTHORIZED), "{method}: {e}");
+    }
+    c.set_token(Some("f".repeat(64)));
+    assert!(
+        c.call("engine.list", Value::Null)
+            .unwrap_err()
+            .starts_with(UNAUTHORIZED)
+    );
+    assert_eq!(
+        corerouter_engine::lock(&session)
+            .store()
+            .running()
+            .system
+            .identity,
+        "CoreRouter"
+    );
+}
+
+#[test]
+fn login_and_group_permissions_over_the_wire() {
+    let (session, gate, _) = lab();
+    let addr = start(&session, &gate);
+    let mut c = Client::connect(&addr, Duration::from_secs(2)).unwrap();
+    let e = c.login("admin", "wrong-password").unwrap_err();
+    assert_eq!(e, "invalid user or password");
+    let e = c.login("nobody", ADMIN_PW).unwrap_err();
+    assert_eq!(e, "invalid user or password");
+    let me = c.login("noc", ADMIN_PW).unwrap();
+    assert_eq!(me["group"], "read");
+    assert!(c.call("state.inspect", json!({})).is_ok());
+    let e = c
+        .call(
+            "engine.execute",
+            json!({"command": "system.identity.set", "params": {"name": "x"}}),
+        )
+        .unwrap_err();
+    assert!(e.contains("needs group write"), "{e}");
+    let list = c.call("engine.list", Value::Null).unwrap();
+    let add = list
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["id"] == "ip.address.add")
+        .unwrap();
+    assert_eq!(add["enabled"], false);
+    // The admin sees noc's session; logout ends it.
+    let mut admin = Client::connect(&addr, Duration::from_secs(2)).unwrap();
+    admin.login("admin", ADMIN_PW).unwrap();
+    let active = admin
+        .call("engine.execute", json!({"command": "user.active.list"}))
+        .unwrap();
+    assert!(active.to_string().contains("noc"), "{active}");
+    c.call("auth.logout", Value::Null).unwrap();
+    assert!(
+        c.call("state.inspect", json!({}))
+            .unwrap_err()
+            .starts_with(UNAUTHORIZED)
+    );
+    // A password never shows in the journal the admin can read.
+    admin
+        .call(
+            "engine.execute",
+            json!({"command": "user.add", "params": {"name": "bob", "group": "write", "password": "bobs-password"}}),
+        )
+        .unwrap();
+    let journal = admin
+        .call("state.inspect", json!({"path": "journal"}))
+        .unwrap();
+    assert!(!journal.to_string().contains("bobs-password"));
 }
 
 fn ether2_disabled(session: &corerouter_engine::Shared) -> bool {
@@ -47,10 +184,8 @@ fn ether2_disabled(session: &corerouter_engine::Shared) -> bool {
 /// G1.4: Safe Mode belongs to one connection; when it closes, the changes go.
 #[test]
 fn closing_the_safe_mode_connection_undoes_its_changes() {
-    let listener = bind_loopback(0).unwrap();
-    let addr = listener.local_addr().unwrap().to_string();
-    let session = shared(Session::virtual_lab());
-    spawn(listener, SharedHost(session.clone())).unwrap();
+    let (session, gate, token) = lab();
+    let addr = start(&session, &gate);
     let execute = |c: &mut Client, command: &str, params: Value| {
         c.call(
             "engine.execute",
@@ -58,8 +193,8 @@ fn closing_the_safe_mode_connection_undoes_its_changes() {
         )
     };
 
-    let mut owner = Client::connect(&addr, Duration::from_secs(2)).unwrap();
-    let mut other = Client::connect(&addr, Duration::from_secs(2)).unwrap();
+    let mut owner = local(&addr, &token);
+    let mut other = local(&addr, &token);
     execute(&mut owner, "config.safe-mode.enter", json!({})).unwrap();
     execute(
         &mut owner,
@@ -88,25 +223,102 @@ fn closing_the_safe_mode_connection_undoes_its_changes() {
     assert!(!corerouter_engine::lock(&session).in_safe_mode());
 }
 
+/// TLS end to end on loopback: TOFU (first time, same, changed), login.
+#[test]
+fn tls_endpoint_with_pinning_and_login() {
+    let (session, gate, _) = lab();
+    let (cert, key) = corerouter_control::tls::generate().unwrap();
+    let id = corerouter_control::tls::identity_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    spawn(
+        Endpoint::tls(listener, id.config.clone()),
+        SharedHost(session.clone()),
+        gate.clone(),
+    )
+    .unwrap();
+    let target = Target::parse(&format!("tls://127.0.0.1:{port}")).unwrap();
+    let login = Login::Password {
+        user: "admin".into(),
+        password: ADMIN_PW.into(),
+    };
+    let dir = std::env::temp_dir().join(format!("cr-tofu-{}-{port}", std::process::id()));
+    let path = dir.join("known_hosts");
+    let mut known = KnownHosts::load(&path);
+    let t = Duration::from_secs(2);
+
+    // First use, refused: nothing is remembered.
+    let e = dial(&target, t, &login, &mut known, &mut RefuseNew)
+        .err()
+        .unwrap();
+    assert!(e.contains("not trusted"), "{e}");
+    assert!(known.get(&target.addr()).is_none());
+
+    // First use, accepted after showing the fingerprint.
+    struct Shown(Option<String>);
+    impl Trust for Shown {
+        fn first_use(&mut self, _: &Target, fp: &str) -> bool {
+            self.0 = Some(fp.to_owned());
+            true
+        }
+    }
+    let mut shown = Shown(None);
+    let mut c = dial(&target, t, &login, &mut known, &mut shown).unwrap();
+    assert_eq!(shown.0.as_deref(), Some(id.fingerprint.as_str()));
+    assert_eq!(c.call("auth.whoami", Value::Null).unwrap()["user"], "admin");
+    assert!(c.is_tls());
+
+    // Same certificate: no question asked.
+    let mut known = KnownHosts::load(&path);
+    assert!(dial(&target, t, &login, &mut known, &mut RefuseNew).is_ok());
+    assert!(
+        dial(
+            &target,
+            t,
+            &login,
+            &mut KnownHosts::in_memory(),
+            &mut Expect(id.fingerprint.clone())
+        )
+        .is_ok()
+    );
+
+    // The router's certificate changes: refused before logging in.
+    known.remember(&target.addr(), "SHA256:00:11").unwrap();
+    let e = dial(&target, t, &login, &mut known, &mut shown)
+        .err()
+        .unwrap();
+    assert!(e.contains("CHANGED"), "{e}");
+
+    // Plain text to a TLS port goes nowhere.
+    let mut raw = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    raw.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    writeln!(raw, "{}", json!({"id": 1, "method": "ping"})).unwrap();
+    let mut line = String::new();
+    let _ = BufReader::new(raw).read_line(&mut line);
+    assert!(!line.contains("pong"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn shutdown_stops_accepting_and_closes_the_port() {
-    use corerouter_control::{Shutdown, WsPolicy, bind_loopback, serve_until, spawn_ws_until};
-    let session = shared(Session::virtual_lab());
+    use corerouter_control::{Shutdown, WsPolicy, serve_until, spawn_ws_until};
+    let (session, gate, token) = lab();
     let shutdown = Shutdown::default();
     let tcp = bind_loopback(0).unwrap();
     let ws = bind_loopback(0).unwrap();
     let (tcp_addr, ws_addr) = (tcp.local_addr().unwrap(), ws.local_addr().unwrap());
-    let (host, stop) = (SharedHost(session.clone()), shutdown.clone());
-    let control = std::thread::spawn(move || serve_until(tcp, host, &stop));
+    let (host, stop, g) = (SharedHost(session.clone()), shutdown.clone(), gate.clone());
+    let control = std::thread::spawn(move || serve_until(Endpoint::loopback(tcp), host, g, &stop));
     let ws_thread = spawn_ws_until(
-        ws,
+        Endpoint::loopback(ws),
         SharedHost(session),
         WsPolicy::default(),
+        gate.clone(),
         shutdown.clone(),
     )
     .unwrap();
     // Open before the shutdown: keeps working.
-    let mut open = Client::connect(&tcp_addr.to_string(), Duration::from_secs(2)).unwrap();
+    let mut open = local(&tcp_addr.to_string(), &token);
     assert_eq!(open.call("ping", Value::Null).unwrap()["pong"], true);
 
     shutdown.close();
@@ -118,8 +330,9 @@ fn shutdown_stops_accepting_and_closes_the_port() {
     // Closing twice, or a loop started after the close, returns at once.
     shutdown.close();
     serve_until(
-        bind_loopback(0).unwrap(),
+        Endpoint::loopback(bind_loopback(0).unwrap()),
         SharedHost(shared(Session::virtual_lab())),
+        gate,
         &shutdown,
     );
 }

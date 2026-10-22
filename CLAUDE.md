@@ -59,7 +59,16 @@ cargo run -p corerouter-gui -- --control 7979           # GUI + canal de control
 cargo run -p corerouter-gui -- --connect 127.0.0.1:7979 --control 7990   # GUI gerenciando o daemon
 cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.address.add '{"address":"10.0.0.1/24","interface":"ether1"}'
 cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 screenshot /tmp/ui.png   # depois abra o PNG
+cargo run -p corerouter-daemon -- --config-dir /tmp/cr --listen 127.0.0.1:8729   # TLS + login
+cargo run -p corerouter-cli -- --connect tls://127.0.0.1:8729 --user admin inspect
 ```
+
+Autenticação (G0.3): na primeira vez o daemon cria `admin` e imprime a senha **uma vez** no
+stderr (`--reset-admin-password` gera outra). CLI, MCP e GUI em `127.0.0.1` entram sem senha com
+o **token local** que o daemon grava em `control-<porta>.token` (só o mesmo usuário do sistema
+lê; `$COREROUTER_RUNTIME_DIR` muda a pasta, `--token-file` o arquivo). Fora do loopback é sempre
+TLS + `--user` (senha por prompt ou `$COREROUTER_PASSWORD`); o certificado é confirmado no
+primeiro uso e fica em `~/.config/corerouter/known_hosts`. Detalhes em `docs/control-protocol.md`.
 
 Mudou UI? Rode a GUI com `--control`, tire `screenshot` e **olhe o PNG** antes de dizer que está
 pronto. Sem display, use o teste headless de `crates/ui` (`every_window_renders_headless`).

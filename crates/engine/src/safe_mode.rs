@@ -20,29 +20,44 @@ use corerouter_model::Config;
 use serde::Serialize;
 use serde_json::{Value, json};
 
+use crate::auth::Principal;
 use crate::{EngineError, Result, Session};
 
 /// Who sent a command. The control channel gives each connection its own
 /// id; commands from inside the process (the GUI lab, tests) are [`Caller::local`].
+///
+/// A new connection starts [`Principal::Anonymous`] (no rights); the
+/// control channel sets the principal of each request after checking its
+/// token (G0.3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Caller {
     pub id: u64,
     /// Shown to other operators: "tcp 127.0.0.1:50412".
     pub name: String,
+    #[serde(skip)]
+    pub principal: Principal,
 }
 
 impl Caller {
     pub const LOCAL_ID: u64 = 0;
 
+    /// A connection that has not logged in yet.
     pub fn new(id: u64, name: impl Into<String>) -> Self {
         Self {
             id,
             name: name.into(),
+            principal: Principal::Anonymous,
         }
     }
 
     pub fn local() -> Self {
-        Self::new(Self::LOCAL_ID, "local")
+        Self::new(Self::LOCAL_ID, "local").with_principal(Principal::Local)
+    }
+
+    #[must_use]
+    pub fn with_principal(mut self, principal: Principal) -> Self {
+        self.principal = principal;
+        self
     }
 }
 

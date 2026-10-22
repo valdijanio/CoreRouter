@@ -27,7 +27,7 @@ use egui::{Color32, RichText};
 use serde_json::{Value, json};
 
 pub use backend::{Backend, Link, Local, Reply, RequestId};
-pub use connect::{ConnectAction, ConnectScreen, NeighborRow, SavedRouter};
+pub use connect::{ConnectAction, ConnectScreen, Credentials, NeighborRow, SavedRouter};
 pub use neighbors::uptime_text;
 pub use prefs::stored_theme;
 pub use windows::Win;
@@ -62,6 +62,8 @@ enum Field {
     Info,
     Neighbors,
     Discovery,
+    /// `auth.whoami`: the logged-in user and group (G0.3), top bar.
+    Whoami,
 }
 
 /// Cached query results, refreshed every `REFRESH_SECS` or after an action.
@@ -77,6 +79,7 @@ struct Cache {
     diff: Vec<Value>,
     commands: Vec<Value>,
     info: Value,
+    whoami: Value,
     neighbors: Vec<Value>,
     discovery: Value,
     refreshed_at: Option<f64>,
@@ -357,6 +360,7 @@ impl CoreRouterUi {
         };
         match field {
             Field::Summary => self.cache.summary = value,
+            Field::Whoami => self.cache.whoami = value,
             Field::Interfaces => {
                 self.cache.interfaces = arr(value);
                 let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_after)
@@ -521,6 +525,7 @@ impl CoreRouterUi {
         );
         ask(self, Field::Diff, "engine.execute", exec("config.diff"));
         ask(self, Field::Commands, "engine.list", Value::Null);
+        ask(self, Field::Whoami, "auth.whoami", Value::Null);
         if self.cache.info.is_null() {
             ask(self, Field::Info, "server.info", Value::Null);
         }
@@ -633,6 +638,29 @@ impl CoreRouterUi {
         }
     }
 
+    /// Who this window is logged in as (G0.3); nothing for the lab.
+    fn user_label(&self, ui: &mut egui::Ui) {
+        if matches!(self.link, Link::Local) {
+            return;
+        }
+        let Some(user) = self.cache.whoami.get("user").and_then(Value::as_str) else {
+            return;
+        };
+        let group = self
+            .cache
+            .whoami
+            .get("group")
+            .and_then(Value::as_str)
+            .unwrap_or("?");
+        ui.label(RichText::new(format!("user: {user}")).strong())
+            .on_hover_text(format!(
+                "Logged in as {user}, group {group}: actions this group may not run are \
+                 greyed out"
+            ));
+        ui.weak(format!("({group})"));
+        ui.separator();
+    }
+
     fn top_bar(&mut self, ui: &mut egui::Ui) {
         let s = &self.cache.summary;
         let txt = |k: &str| s.get(k).map(value_text).unwrap_or_default();
@@ -651,6 +679,7 @@ impl CoreRouterUi {
         let safe_mode = SafeModeView::from_summary(s);
         ui.horizontal(|ui| {
             self.link_label(ui);
+            self.user_label(ui);
             // Nothing heard from the router yet: no empty fields.
             if !known {
                 return;

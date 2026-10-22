@@ -57,6 +57,8 @@ fn daemon(netns: Option<u32>, dir: &Path, log: &str) -> Kill {
         "--config-dir",
     ])
     .arg(dir)
+    .arg("--token-file")
+    .arg(common::token_file(netns, dir))
     .env("RUST_LOG", "info,corerouter_daemon=debug")
     .stdout(Stdio::null())
     .stderr(log);

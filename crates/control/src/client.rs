@@ -1,43 +1,135 @@
-//! Synchronous control-channel client (CLI, MCP `Remote` backend, tests).
+//! Synchronous control-channel client (CLI, MCP `Remote` backend, GUI,
+//! tests), over plain TCP or TLS, sending its token with every request.
+//! Most callers use [`crate::dial`], which also logs in and pins the TLS
+//! certificate.
 
-use std::io::{BufReader, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::io::{self, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::Duration;
 
 use serde_json::{Value, json};
 
+use crate::tls::{self, ClientStream, TlsError};
 use crate::wire::{Line, MAX_RESPONSE_LINE, read_line_bounded};
 
+enum Stream {
+    Plain(TcpStream),
+    Tls(Box<ClientStream>),
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
 pub struct Client {
-    reader: BufReader<TcpStream>,
-    writer: TcpStream,
+    reader: BufReader<Stream>,
     next_id: u64,
     addr: String,
+    token: Option<String>,
+    fingerprint: Option<String>,
+}
+
+fn open(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
+    let sock: SocketAddr = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("{addr}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("{addr}: no address"))?;
+    let stream = TcpStream::connect_timeout(&sock, timeout).map_err(|e| format!("{addr}: {e}"))?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(120)))
+        .map_err(|e| e.to_string())?;
+    Ok(stream)
 }
 
 impl Client {
+    /// Plain TCP (the router only accepts it on loopback).
     pub fn connect(addr: &str, timeout: Duration) -> Result<Self, String> {
-        let sock = addr
-            .to_socket_addrs()
-            .map_err(|e| format!("{addr}: {e}"))?
-            .next()
-            .ok_or_else(|| format!("{addr}: no address"))?;
-        let stream =
-            TcpStream::connect_timeout(&sock, timeout).map_err(|e| format!("{addr}: {e}"))?;
+        let stream = open(addr, timeout)?;
+        Ok(Self::over(Stream::Plain(stream), addr, None))
+    }
+
+    /// TLS, pinned to `expected` (or to whatever the router shows when
+    /// `None`: check [`Client::fingerprint`] before sending anything secret).
+    pub fn connect_tls(
+        addr: &str,
+        timeout: Duration,
+        expected: Option<&str>,
+    ) -> Result<Self, TlsError> {
+        let stream = open(addr, timeout).map_err(TlsError::Other)?;
         stream
+            .set_read_timeout(Some(tls::HANDSHAKE_TIMEOUT))
+            .map_err(|e| TlsError::Other(e.to_string()))?;
+        let (s, fp) = tls::connect(stream, expected)?;
+        s.sock
             .set_read_timeout(Some(Duration::from_secs(120)))
-            .map_err(|e| e.to_string())?;
-        let reader = BufReader::new(stream.try_clone().map_err(|e| e.to_string())?);
-        Ok(Self {
-            reader,
-            writer: stream,
+            .map_err(|e| TlsError::Other(e.to_string()))?;
+        Ok(Self::over(Stream::Tls(Box::new(s)), addr, Some(fp)))
+    }
+
+    fn over(stream: Stream, addr: &str, fingerprint: Option<String>) -> Self {
+        Self {
+            reader: BufReader::new(stream),
             next_id: 0,
             addr: addr.to_owned(),
-        })
+            token: None,
+            fingerprint,
+        }
     }
 
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    /// The router's certificate fingerprint (TLS only).
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
+    }
+
+    pub fn is_tls(&self) -> bool {
+        matches!(self.reader.get_ref(), Stream::Tls(_))
+    }
+
+    /// The token sent with every request from now on.
+    pub fn set_token(&mut self, token: Option<String>) {
+        self.token = token;
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        self.token.as_deref()
+    }
+
+    /// `auth.login`; on success the token is kept for the next requests.
+    /// Returns `{token, user, group, idle_timeout_secs}`.
+    pub fn login(&mut self, user: &str, password: &str) -> Result<Value, String> {
+        let reply = self.call("auth.login", json!({"user": user, "password": password}))?;
+        let token = reply
+            .get("token")
+            .and_then(Value::as_str)
+            .ok_or("the router sent no token")?;
+        self.token = Some(token.to_owned());
+        Ok(reply)
     }
 
     pub fn call(&mut self, method: &str, params: Value) -> Result<Value, String> {
@@ -54,9 +146,13 @@ impl Client {
     ) -> Result<Result<Value, String>, String> {
         self.next_id = self.next_id.wrapping_add(1);
         let id = self.next_id;
-        let req = json!({"id": id, "method": method, "params": params});
-        writeln!(self.writer, "{req}").map_err(|e| format!("send: {e}"))?;
-        self.writer.flush().map_err(|e| format!("send: {e}"))?;
+        let mut req = json!({"id": id, "method": method, "params": params});
+        if let (Some(t), Some(o)) = (&self.token, req.as_object_mut()) {
+            o.insert("token".into(), json!(t));
+        }
+        let out = self.reader.get_mut();
+        writeln!(out, "{req}").map_err(|e| format!("send: {e}"))?;
+        out.flush().map_err(|e| format!("send: {e}"))?;
         let line = match read_line_bounded(&mut self.reader, MAX_RESPONSE_LINE) {
             Ok(Line::Text(t)) => t,
             Ok(Line::TooLong) => return Err("response exceeds 256 MiB".into()),
