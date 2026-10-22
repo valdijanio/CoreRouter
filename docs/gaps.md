@@ -27,12 +27,12 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | Id | Tarefa | Crates | Critério de aceite | Est. | Status |
 |---|---|---|---|---|---|
 | G1.1 | VLAN, bridge, loopback | model, engine (`cmd/interface.rs`), ui | `interface.vlan.add`, `interface.bridge.add`, `interface.bridge.port.add`, `interface.remove`; validação de dependências; janela na UI. Bonding saiu para G1.8 | 8 h | feito (`stream/G1.1-vlan-bridge`) |
-| G1.2 | `hal-linux` aplica via rtnetlink | hal-linux | links (up/down, MTU), VLAN, bridge, endereços; transação com rollback; testes em network namespace (sem root na CI via `unshare`) | 16 h | aberto |
-| G1.3 | Reconciliação e drift | hal-linux, engine | Lê estado do kernel, `config.drift` lista divergências | 6 h | aberto |
+| G1.2 | `hal-linux` aplica via rtnetlink | hal-linux | links (up/down, MTU), VLAN, bridge, endereços; transação com rollback; testes em network namespace (sem root na CI via `unshare`) | 16 h | feito (`stream/G1.2-netlink`) |
+| G1.3 | Reconciliação e drift | hal-linux, engine | Lê estado do kernel, `config.drift` lista divergências; boot semeia `disabled` do estado do kernel (hoje `Session::new` aplica `disabled=false` e sobe portas descobertas que estavam down) | 6 h | aberto |
 | G1.4 | Safe Mode | engine, ui | `config.commit {confirm_timeout}`; sem `config.confirm` no prazo → rollback automático; botão Safe Mode na barra | 6 h | aberto |
 | G1.5 | Rotas estáticas e VRF | model, engine, hal-linux, ui | `ip.route.add/remove/list`, distance, VRF; tabela de rotas ao vivo na janela Routes | 10 h | aberto |
 | G1.6 | Imagem Buildroot | `os/` (novo) | Imagem x86_64 A/B + squashfs + dm-verity bootando o daemon em QEMU; script de build reprodutível | 20 h | aberto |
-| G1.7 | Estatísticas via netlink | hal-linux | `poll` com stats64 do netlink (substitui sysfs) | 3 h | aberto |
+| G1.7 | Estatísticas via netlink | hal-linux | `poll` e `discover_links` via netlink (substituem sysfs, que mostra o netns de quem montou `/sys`, não o do processo) | 3 h | aberto |
 | G1.8 | Bonding (802.3ad, active-backup) | model, engine (`cmd/interface.rs`), ui | `interface.bonding.add {name, slaves, mode}`; slave não pode ser porta de bridge nem ter endereço; mesmo padrão de dependências do G1.1 | 4 h | aberto |
 
 ## Fase 2 — Firewall / CGNAT
@@ -75,3 +75,4 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — lista inicial.
 - 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).
 - 2026-10-21 — G1.1 feito (VLAN, bridge, loopback, `interface.remove`); bonding separado em G1.8.
+- 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.

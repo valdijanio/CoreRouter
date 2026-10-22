@@ -30,6 +30,16 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   Interfaces com coluna Info, remover por linha e formulários VLAN/bridge/loopback/porta. 15
   testes novos no engine + 1 na UI; screenshot conferido. Bonding virou G1.8.
 
+- 2026-10-21 — G1.2: `LinuxHal::apply` aplica no kernel via `rtnetlink` 0.23 (tokio
+  current-thread encapsulado no `hal-linux`): links up/down e MTU, VLAN 802.1Q, bridge + portas,
+  loopback (`dummy`) e endereços IPv4/IPv6. Plano puro `from` → `to` em ordem segura (11 testes
+  unitários); executor lê o kernel antes de cada passo e, se um falha, desfaz os anteriores.
+  Só toca interfaces do config; não descobre o `lo`; não apaga link de tipo diferente do config.
+  4 testes de integração em network namespace sem root (`cargo xtask netns`, novo passo do
+  `cargo xtask ci`; `skip` onde `unshare` sem root é proibido). Na CI do GitHub o workflow
+  libera user namespaces (`sysctl kernel.apparmor_restrict_unprivileged_userns=0`).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
+- 2026-10-21 — log do G1.2.

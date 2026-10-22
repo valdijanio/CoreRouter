@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-hal-linux"
-description = "L1 platform crate: Linux backend (sysfs today, netlink/nftables next). Only apps may depend on it."
+description = "L1 platform crate: Linux backend (rtnetlink apply, sysfs counters). Only apps may depend on it."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,6 +11,17 @@ repository.workspace = true
 [dependencies]
 corerouter-model.workspace = true
 corerouter-hal.workspace = true
+ipnet.workspace = true
+log.workspace = true
+
+# Netlink only exists on Linux; elsewhere only the pure planner compiles.
+# netlink-packet-route comes re-exported as `rtnetlink::packet_route`, so the
+# two can never drift apart.
+[target.'cfg(target_os = "linux")'.dependencies]
+rtnetlink = { version = "0.23.0", default-features = false, features = ["tokio_socket"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+# Only a current-thread runtime, private to hal-linux: the Hal trait stays sync.
+tokio = { version = "1.54.1", default-features = false, features = ["rt", "net"] }
 
 [lints]
 workspace = true
