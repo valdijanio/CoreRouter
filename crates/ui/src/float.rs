@@ -117,11 +117,13 @@ const RESTORE_TRIES: u8 = 3;
 const FLASH_SECS: f64 = 0.6;
 const FLASH_STEP: f64 = 0.1;
 
-/// Where a child opens over its parent: down and to the right of the
-/// parent's corner, below its title bar, toolbar and table header (so
-/// "+", Find and the columns stay in reach), each next one a step further
-/// (wrapping after 8).
-pub(crate) const CHILD_OFFSET: Vec2 = Vec2::new(48.0, 92.0);
+/// Where a child opens over its parent: below the parent's title bar,
+/// toolbar and table header, and a third of the way across (so "+", Find,
+/// the columns and the names of the other rows stay in reach), each next
+/// one a step further (wrapping after 8).
+pub(crate) fn child_offset(parent: Rect) -> Vec2 {
+    Vec2::new((parent.width() * 0.3).clamp(48.0, 240.0), 92.0)
+}
 pub(crate) const CHILD_STEP: f32 = 24.0;
 const CHILD_SLOTS: u8 = 8;
 
@@ -266,8 +268,8 @@ impl Floats {
             self.parents.insert(child, (p, slot));
         }
         let (p, slot) = self.parents.get(&child)?;
-        let corner = ctx.memory(|m| m.area_rect(*p))?.min;
-        Some(corner + CHILD_OFFSET + Vec2::splat(f32::from(*slot) * CHILD_STEP))
+        let parent = ctx.memory(|m| m.area_rect(*p))?;
+        Some(parent.min + child_offset(parent) + Vec2::splat(f32::from(*slot) * CHILD_STEP))
     }
 
     /// The children of `id`, and theirs, back to front.

@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::firewall::Feed;
-use crate::float::{CHILD_OFFSET, CHILD_STEP};
+use crate::float::{CHILD_STEP, child_offset};
 use egui::Key;
 
 const NONE: egui::Modifiers = egui::Modifiers::NONE;
@@ -161,13 +161,13 @@ fn a_child_opens_over_its_parent() {
     h.app.open_props("ether2");
     h.idle();
     h.idle();
-    let parent = h.win_rect(ifaces()).min;
+    let parent = h.win_rect(ifaces());
     let (e1, e2) = (h.props_win("ether1"), h.props_win("ether2"));
     assert_eq!(h.app.floats.parent(e1), Some(ifaces()));
     let first = h.win_rect(e1).min;
     let second = h.win_rect(e2).min;
     assert!(
-        (first - (parent + CHILD_OFFSET)).length() < 1.0,
+        (first - (parent.min + child_offset(parent))).length() < 1.0,
         "{first:?}"
     );
     assert!(
@@ -175,10 +175,12 @@ fn a_child_opens_over_its_parent() {
         "the next one a step further: {second:?}"
     );
 
-    // The list's toolbar stays in reach above its dialogs.
-    let add = h.tool(table::Icon::Add);
+    // The list's toolbar and the names of its rows stay in reach.
     let layer = egui::LayerId::new(egui::Order::Middle, ifaces());
-    assert_eq!(h.ctx.layer_id_at(add), Some(layer));
+    assert_eq!(h.ctx.layer_id_at(h.tool(table::Icon::Add)), Some(layer));
+    for name in ["ether1", "ether2", "ether3", "ether8"] {
+        assert_eq!(h.ctx.layer_id_at(h.row(name)), Some(layer), "{name}");
+    }
 
     // Without its list open a dialog has no parent and opens on its own.
     h.app.open.remove(&Win::Interfaces);

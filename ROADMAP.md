@@ -492,9 +492,11 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   relativa, então ao subir o pai os descendentes sobem no mesmo frame, e uma janela pedida no frame
   em que a família sobe sobe no seguinte), e o teclado vai à janela *ativa* (a clicada, pedida ou
   aberta por último), que pode estar sob os próprios filhos. Pedir de novo (`Status::bring_to_front`,
-  `Floats::raise`): sobe, toma o foco e pisca a borda por ~0,6 s. Filho abre a (48, 92) px do canto
-  do pai, em cascata de 24 px: a primeira tentativa (36, 44) cobria o "+" da lista e quebrou um teste
-  do VRF (**medido**). Fechar o pai: filhos limpos fecham junto (`Floats::close_family`/`take_close`);
+  `Floats::raise`): sobe, toma o foco e pisca a borda por ~0,6 s. Filho abre abaixo do cabeçalho
+  da tabela do pai e a 30 % da largura dele (48–240 px), em cascata de 24 px: a primeira tentativa (36, 44) cobria o "+" da lista e
+  quebrou um teste do VRF, e (48, 92) cobria o meio das linhas com o diálogo maior do G1.19 (dois
+  testes que clicavam no centro da linha); agora os nomes das outras linhas ficam clicáveis
+  (**medido**). Fechar o pai: filhos limpos fecham junto (`Floats::close_family`/`take_close`);
   com alterações, `egui::Modal` "Close <pai>?" (Close All / Cancel / Esc). Extras: marca na linha
   cuja janela está aberta (`TableState::open`, clique traz a janela) e Ctrl+Tab / Ctrl+F6 (atalho do
   WinBox) com Shift ao contrário; no navegador o Ctrl+Tab é da aba, o Ctrl+F6 fica. 8 testes headless

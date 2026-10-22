@@ -1514,13 +1514,15 @@ mod tests {
             self.idle();
         }
 
-        /// Centre of a row of the Interfaces table.
+        /// A point of a row of the Interfaces table, on its name (the left
+        /// end, which a dialog open over the list leaves uncovered).
         fn row(&self, name: &str) -> egui::Pos2 {
-            self.ctx
+            let r = self
+                .ctx
                 .read_response(table::row_id(interfaces::TABLE, name))
                 .unwrap_or_else(|| panic!("row {name} not drawn"))
-                .rect
-                .center()
+                .rect;
+            egui::pos2(r.left() + 40.0, r.center().y)
         }
 
         fn tool(&self, icon: table::Icon) -> egui::Pos2 {
