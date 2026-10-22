@@ -226,6 +226,7 @@ impl Session {
         })?;
 
         let snapshot = self.store.candidate().clone();
+        let rev_before = self.store.current_revision();
         let result = guard::run(id, || (spec.run)(self, params)).and_then(|value| {
             if spec.journal && self.mode == CommitMode::Immediate && self.store.is_dirty() {
                 self.commit_candidate(id)?;
@@ -239,7 +240,8 @@ impl Session {
             self.lockout_ack = false;
         }
         if spec.journal {
-            self.record(id, params, &result);
+            let rev = self.store.current_revision();
+            self.record(id, params, &result, (rev != rev_before).then_some(rev));
         }
         result
     }
@@ -425,26 +427,30 @@ impl Session {
         reason: &str,
         result: &Result<Option<u32>>,
     ) {
+        let revision = result.as_ref().ok().copied().flatten();
         let result = result
             .as_ref()
             .map(|rev| json!({ "revision": rev }))
             .map_err(Clone::clone);
-        self.record(id, &json!({ "automatic": reason }), &result);
+        self.record(id, &json!({ "automatic": reason }), &result, revision);
     }
 
-    fn record(&mut self, id: &str, params: &Value, result: &Result<Value>) {
+    /// Journal a command and log it (G4.6d); `revision`: the one it created.
+    fn record(&mut self, id: &str, params: &Value, result: &Result<Value>, revision: Option<u32>) {
         self.seq = self.seq.saturating_add(1);
+        // Passwords and tokens never reach the journal nor the log (G0.3).
+        let params = auth::mask_secrets(params);
         self.journal.push(JournalEntry {
             seq: self.seq,
             command: id.to_owned(),
-            // Passwords and tokens never reach the journal (G0.3).
-            params: auth::mask_secrets(params),
+            params: params.clone(),
             ok: result.is_ok(),
             error: result.as_ref().err().map(ToString::to_string),
         });
         if self.journal.len() > MAX_JOURNAL {
             self.journal.remove(0);
         }
+        self.log_journal(self.seq, id, &params, result, revision);
     }
 
     /// Command registry with enabled state, for `list_commands` and menus.

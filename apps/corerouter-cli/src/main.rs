@@ -127,7 +127,10 @@ fn real_main() -> Result<(), String> {
                 Some(raw) => serde_json::from_str(&raw).map_err(|e| format!("params: {e}"))?,
                 None => Value::Null,
             };
-            backend.call("engine.execute", json!({"command": id, "params": params}))?
+            backend.call(
+                "engine.execute",
+                json!({"command": id, "params": params, "via": "cli"}),
+            )?
         }
         "watch" => {
             let id = pos.next().ok_or("watch needs a command id")?;

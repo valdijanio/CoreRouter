@@ -1,12 +1,13 @@
 //! /system logging (G4.6): remote syslog actions and the rules that send
-//! events with some topics to them.
+//! events with some topics to them; the built-in `memory` action keeps the
+//! router's own log (`log.print`, G4.6d) and only takes `memory_lines`.
 
 use std::net::IpAddr;
 
 use corerouter_model::ItemId;
 use corerouter_model::logging::{
-    Facility, LogAction, LogRule, Logging, MAX_ACTIONS, MAX_NAME, MAX_PREFIX, MAX_RULES,
-    MAX_TOPICS, SeverityChoice, valid_topic,
+    Facility, LogAction, LogRule, Logging, MAX_ACTIONS, MAX_MEMORY_LINES, MAX_NAME, MAX_PREFIX,
+    MAX_RULES, MAX_TOPICS, MEMORY_ACTION, SeverityChoice, valid_topic,
 };
 use serde_json::{Value, json};
 
@@ -29,7 +30,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Edit Logging Action",
         [],
         None,
-        "{name: string, remote?: ip, remote_port?: int 1..65535, src_address?: ip|\"\", syslog_facility?: kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|authpriv|ftp|ntp|local0..local7, syslog_severity?: auto|emergency|alert|critical|error|warning|notice|info|debug, comment?: string} → {name}",
+        "{name: string, remote?: ip, remote_port?: int 1..65535, src_address?: ip|\"\", syslog_facility?: kern|user|mail|daemon|auth|syslog|lpr|news|uucp|cron|authpriv|ftp|ntp|local0..local7, syslog_severity?: auto|emergency|alert|critical|error|warning|notice|info|debug, comment?: string, memory_lines?: int 1..65535} → {name}",
         always,
         action_set
     ),
@@ -43,7 +44,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         action_remove
     ),
     cmd!(query "system.logging.action.list", "Logging Actions", [], None,
-        "{} → [{name, target, remote, remote_port, src_address, syslog_facility, syslog_severity, comment}]",
+        "{} → [{name, target, default, memory_lines, remote, remote_port, src_address, syslog_facility, syslog_severity, comment}]",
         always, action_list),
     cmd!(
         "system.logging.add",
@@ -73,7 +74,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         rule_remove
     ),
     cmd!(query "system.logging.list", "Logging Rules", [], None,
-        "{} → [{id, topics, action, prefix, disabled}]",
+        "{} → [{id, topics, action, prefix, disabled, default}]",
         always, rule_list),
 ];
 
@@ -100,6 +101,8 @@ fn action_json(a: &LogAction) -> Value {
     json!({
         "name": a.name,
         "target": "remote",
+        "default": false,
+        "memory_lines": null,
         "remote": a.remote,
         "remote_port": a.remote_port,
         "src_address": a.src_address,
@@ -158,7 +161,7 @@ fn action_add(s: &mut Session, p: &Value) -> Result<Value> {
     let name = action_name(p, "name")?;
     let remote: IpAddr = req_parse(p, "remote")?;
     let l = &s.store().candidate().system.logging;
-    if l.action(&name).is_some() {
+    if l.has_action(&name) {
         return Err(EngineError::bad(
             "name",
             format!("action '{name}' already exists (use system.logging.action.set)"),
@@ -184,8 +187,45 @@ fn action_add(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "name": name }))
 }
 
+/// `memory_lines` of the built-in `memory` action, the only thing it has.
+fn memory_set(s: &mut Session, p: &Value) -> Result<Value> {
+    let remote_keys = [
+        "remote",
+        "remote_port",
+        "src_address",
+        "syslog_facility",
+        "syslog_severity",
+        "comment",
+    ];
+    if let Some(k) = remote_keys.iter().find(|k| p.get(**k).is_some_and(|v| !v.is_null())) {
+        return Err(EngineError::bad(
+            k,
+            "the memory action keeps the log in RAM: it only takes memory_lines",
+        ));
+    }
+    if let Some(n) = opt_u32(p, "memory_lines")? {
+        if !(1..=MAX_MEMORY_LINES).contains(&n) {
+            return Err(EngineError::bad(
+                "memory_lines",
+                format!("must be 1..={MAX_MEMORY_LINES}"),
+            ));
+        }
+        logging(s).memory_lines = n;
+    }
+    Ok(json!({ "name": MEMORY_ACTION }))
+}
+
 fn action_set(s: &mut Session, p: &Value) -> Result<Value> {
     let name = action_name(p, "name")?;
+    if name == MEMORY_ACTION {
+        return memory_set(s, p);
+    }
+    if p.get("memory_lines").is_some_and(|v| !v.is_null()) {
+        return Err(EngineError::bad(
+            "memory_lines",
+            format!("only the memory action has memory_lines; '{name}' is remote"),
+        ));
+    }
     let mut a = s
         .store()
         .candidate()
@@ -210,6 +250,12 @@ fn no_action(name: &str) -> EngineError {
 
 fn action_remove(s: &mut Session, p: &Value) -> Result<Value> {
     let name = action_name(p, "name")?;
+    if name == MEMORY_ACTION {
+        return Err(EngineError::bad(
+            "name",
+            "memory is the router's own log: it cannot be removed (disable its rules instead)",
+        ));
+    }
     let l = &s.store().candidate().system.logging;
     if l.action(&name).is_none() {
         return Err(no_action(&name));
@@ -230,7 +276,23 @@ fn action_remove(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn action_list(s: &mut Session, _: &Value) -> Result<Value> {
     let l = &s.store().candidate().system.logging;
-    Ok(Value::Array(l.actions.iter().map(action_json).collect()))
+    let memory = json!({
+        "name": MEMORY_ACTION,
+        "target": "memory",
+        "default": true,
+        "memory_lines": l.memory_lines,
+        "remote": null,
+        "remote_port": null,
+        "src_address": null,
+        "syslog_facility": null,
+        "syslog_severity": null,
+        "comment": "",
+    });
+    Ok(Value::Array(
+        std::iter::once(memory)
+            .chain(l.actions.iter().map(action_json))
+            .collect(),
+    ))
 }
 
 /// Topics as a JSON array or, for the CLI, `"ntp,!debug"`.
@@ -275,6 +337,9 @@ fn topics(p: &Value) -> Result<Option<Vec<String>>> {
     Ok(Some(out))
 }
 
+/// Ids of the default rules (`Logging::default`).
+const DEFAULT_RULES: u32 = 4;
+
 fn rule_json(r: &LogRule) -> Value {
     json!({
         "id": r.id,
@@ -282,6 +347,9 @@ fn rule_json(r: &LogRule) -> Value {
         "action": r.action,
         "prefix": r.prefix,
         "disabled": r.disabled,
+        // The four rules every new config has (*1..*4; ids are never
+        // reused): `/export` sets them instead of adding copies.
+        "default": r.id.0 <= DEFAULT_RULES,
     })
 }
 
@@ -292,7 +360,7 @@ fn apply_rule(s: &Session, r: &mut LogRule, p: &Value) -> Result<()> {
     }
     if p.get("action").is_some_and(|v| !v.is_null()) {
         let name = action_name(p, "action")?;
-        if s.store().candidate().system.logging.action(&name).is_none() {
+        if !s.store().candidate().system.logging.has_action(&name) {
             return Err(EngineError::bad(
                 "action",
                 format!(

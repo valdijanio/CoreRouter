@@ -2,8 +2,8 @@
 //! to their remote actions as RFC 5424 messages over UDP (RFC 5426).
 //!
 //! One thread. Every [`TICK`] it copies out of the session lock what is new
-//! (journal entries past the last one sent, the NTP status) and the rules
-//! and actions, then sends without the lock: a slow or absent collector
+//! in the router's log (`Session::log_since`: journal, NTP, DHCP, tools;
+//! G4.6d) and the rules and actions, then sends without the lock: a slow or absent collector
 //! never stalls a command. UDP is fire-and-forget (RFC 5426 §3.1, one
 //! message per datagram); a send error is logged once per action until it
 //! changes.
@@ -14,7 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use corerouter_engine::logging::{journal_event, ntp_event, routes};
+use corerouter_engine::logging::routes;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::logging::{LogAction, LogEvent};
 use corerouter_proto_syslog::{DEFAULT_MAX_LEN, Message, encode};
@@ -40,28 +40,15 @@ fn now_micros() -> i64 {
 }
 
 fn run(session: &Shared) {
-    let (mut last_seq, mut last_ntp) = {
-        let s = lock(session);
-        (s.journal().last().map_or(0, |e| e.seq), s.ntp_status())
-    };
+    let mut last_seq = lock(session).log_seq();
     let pid = std::process::id().to_string();
     let mut sender = Sender::default();
     loop {
         thread::sleep(TICK);
-        let time = u64::try_from(now_micros() / 1_000_000).unwrap_or(0);
         let (logging, hostname, mut events) = {
             let s = lock(session);
-            let events: Vec<LogEvent> = s
-                .journal()
-                .iter()
-                .filter(|e| e.seq > last_seq)
-                .map(|e| journal_event(e, time))
-                .collect();
-            last_seq = s.journal().last().map_or(last_seq, |e| e.seq);
-            let ntp = s.ntp_status();
-            let mut events = events;
-            events.extend(ntp_event(&last_ntp, &ntp, time));
-            last_ntp = ntp;
+            let events: Vec<LogEvent> = s.log_since(last_seq);
+            last_seq = events.last().map_or(last_seq, |e| e.seq);
             let cfg = s.store().running();
             (
                 cfg.system.logging.clone(),
@@ -195,9 +182,12 @@ mod tests {
     #[test]
     fn datagram_is_rfc_5424() {
         let ev = LogEvent {
+            seq: 1,
             time: 0,
             topics: vec!["system".into(), "account".into(), "error".into()],
+            origin: "admin · GUI".into(),
             message: "user.add failed: bad".into(),
+            detail: serde_json::Value::Null,
         };
         let out = datagram(&action(514), "r1", &ev, "edge 1", "42", 0);
         // local3 (19) × 8 + error (3) = 155.
@@ -240,8 +230,9 @@ mod tests {
         // daemon (3) × 8 + info (6) = 30.
         assert!(msg.starts_with("<30>1 "), "{msg}");
         assert!(msg.contains(" edge1 corerouter "), "{msg}");
+        // Not ASCII: RFC 5424 §6.4 puts a BOM before the UTF-8 text.
         assert!(
-            msg.ends_with(r#" system - system.identity.set {"name":"edge1"}"#),
+            msg.ends_with(" system - \u{feff}Nome do roteador alterado para «edge1»"),
             "{msg}"
         );
     }

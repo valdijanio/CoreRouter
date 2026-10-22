@@ -41,7 +41,20 @@ pub struct Caller {
     /// process, nothing to lose).
     #[serde(skip)]
     pub link: Option<Link>,
+    /// The client program, as it said (`via` in `engine.execute`): "GUI",
+    /// "terminal", "MCP", "CLI". Shown as the origin in the log (G4.6d).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<&'static str>,
 }
+
+/// Client programs a request may name in `via`, and how the log shows them.
+const VIAS: &[(&str, &str)] = &[
+    ("gui", "GUI"),
+    ("terminal", "terminal"),
+    ("mcp", "MCP"),
+    ("cli", "CLI"),
+    ("api", "API"),
+];
 
 impl Caller {
     pub const LOCAL_ID: u64 = 0;
@@ -53,6 +66,7 @@ impl Caller {
             name: name.into(),
             principal: Principal::Anonymous,
             link: None,
+            via: None,
         }
     }
 
@@ -63,6 +77,17 @@ impl Caller {
     #[must_use]
     pub fn with_link(mut self, link: Link) -> Self {
         self.link = Some(link);
+        self
+    }
+
+    /// The caller with the client program `params.via` names (a known one;
+    /// anything else is ignored, it only labels the log).
+    #[must_use]
+    pub fn with_via(mut self, params: &Value) -> Self {
+        let named = params.get("via").and_then(Value::as_str);
+        if let Some((_, label)) = named.and_then(|v| VIAS.iter().find(|(k, _)| *k == v)) {
+            self.via = Some(label);
+        }
         self
     }
 

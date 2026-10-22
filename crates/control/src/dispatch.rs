@@ -126,7 +126,9 @@ pub fn dispatch_as(
                 .and_then(Value::as_str)
                 .ok_or("engine.execute needs {command, params?}")?;
             let p = params.get("params").cloned().unwrap_or(Value::Null);
-            host.with_session(&mut |s| s.execute_as(caller, id, &p).map_err(err))
+            // `via` names the client program, for the log's origin (G4.6d).
+            let caller = caller.clone().with_via(params);
+            host.with_session(&mut |s| s.execute_as(&caller, id, &p).map_err(err))
         }
         "engine.batch" => {
             let steps = params.get("steps").cloned().unwrap_or(Value::Null);
@@ -134,7 +136,8 @@ pub fn dispatch_as(
                 .get("atomic")
                 .and_then(Value::as_bool)
                 .unwrap_or(true);
-            host.with_session(&mut |s| s.batch_as(caller, &steps, atomic).map_err(err))
+            let caller = caller.clone().with_via(params);
+            host.with_session(&mut |s| s.batch_as(&caller, &steps, atomic).map_err(err))
         }
         "state.inspect" => {
             let path = params.get("path").and_then(Value::as_str);

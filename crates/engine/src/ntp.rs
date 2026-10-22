@@ -3,6 +3,7 @@
 //! shows it. Operational state, never saved.
 
 use corerouter_model::ntp::NtpStatus;
+use serde_json::Value;
 
 use crate::Session;
 
@@ -12,6 +13,9 @@ impl Session {
     pub fn set_ntp_status(&mut self, mut status: NtpStatus) {
         if !self.store().running().system.ntp_client.enabled {
             status = NtpStatus::default();
+        }
+        if let Some((level, message)) = crate::logging::ntp_event(&self.ntp, &status) {
+            self.log_event(&["ntp", level], crate::logging::DAEMON, message, Value::Null);
         }
         self.ntp = status;
     }

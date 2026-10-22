@@ -53,13 +53,13 @@ fn logging_rules_tab_lists_edits_and_adds() {
 
     let row = h
         .ctx
-        .read_response(table::row_id(RULES, "*1"))
+        .read_response(table::row_id(RULES, "*5"))
         .expect("row drawn")
         .rect
         .center();
     h.right_click(row);
     h.click(h.text("Properties…"));
-    assert!(h.has_text("Logging Rule <*1>"));
+    assert!(h.has_text("Logging Rule <*5>"));
     // The topic buttons: click "info" adds it.
     h.click(h.text("info"));
     if let LogDialog::Rule { form, .. } = dialog(&mut h) {
@@ -72,7 +72,7 @@ fn logging_rules_tab_lists_edits_and_adds() {
     let rules = lock(&h.session)
         .execute("system.logging.list", &Value::Null)
         .unwrap();
-    assert_eq!(rules[0]["topics"], json!(["system", "!debug"]), "{:?}", h.app.log());
+    assert_eq!(rules[4]["topics"], json!(["system", "!debug"]), "{:?}", h.app.log());
     assert!(h.app.panel_mut::<LogPanel>().unwrap().dialogs.is_empty());
 
     // Disable from the toolbar, with the row selected.
@@ -88,7 +88,7 @@ fn logging_rules_tab_lists_edits_and_adds() {
     let rules = lock(&h.session)
         .execute("system.logging.list", &Value::Null)
         .unwrap();
-    assert_eq!(rules[0]["disabled"], true);
+    assert_eq!(rules[4]["disabled"], true);
 
     // New: the first action is picked; a bad topic stays in the dialog.
     let add = h
@@ -101,7 +101,8 @@ fn logging_rules_tab_lists_edits_and_adds() {
     refresh(&mut h);
     assert!(h.has_text("New Logging Rule"));
     if let LogDialog::NewRule { form, .. } = dialog(&mut h) {
-        assert_eq!(form.action, "siem");
+        // The built-in memory action comes first (G4.6d).
+        assert_eq!(form.action, "memory");
         form.topics = "nosuchtopic".into();
     }
     h.idle();
@@ -117,7 +118,7 @@ fn logging_rules_tab_lists_edits_and_adds() {
     let rules = lock(&h.session)
         .execute("system.logging.list", &Value::Null)
         .unwrap();
-    assert_eq!(rules[1]["topics"], json!(["firewall"]), "{:?}", h.app.log());
+    assert_eq!(rules[5]["topics"], json!(["firewall"]), "{:?}", h.app.log());
 }
 
 #[test]
@@ -146,8 +147,8 @@ fn logging_actions_tab_lists_edits_and_refuses_removing_one_in_use() {
     let actions = lock(&h.session)
         .execute("system.logging.action.list", &Value::Null)
         .unwrap();
-    assert_eq!(actions[0]["remote_port"], 6514, "{:?}", h.app.log());
-    assert_eq!(actions[0]["syslog_severity"], "warning");
+    assert_eq!(actions[1]["remote_port"], 6514, "{:?}", h.app.log());
+    assert_eq!(actions[1]["syslog_severity"], "warning");
     // Remove while a rule uses it: the engine says why, the window stays.
     h.click(h.text("Remove"));
     refresh(&mut h);
@@ -179,8 +180,39 @@ fn logging_actions_tab_lists_edits_and_refuses_removing_one_in_use() {
     let actions = lock(&h.session)
         .execute("system.logging.action.list", &Value::Null)
         .unwrap();
-    assert_eq!(actions[1]["name"], "remote1", "{:?}", h.app.log());
-    assert_eq!(actions[1]["remote_port"], 514);
+    assert_eq!(actions[2]["name"], "remote1", "{:?}", h.app.log());
+    assert_eq!(actions[2]["remote_port"], 514);
+}
+
+#[test]
+fn the_memory_action_only_takes_its_lines() {
+    let mut h = lab();
+    tab(&mut h, Tab::Actions);
+    let row = h
+        .ctx
+        .read_response(table::row_id(ACTIONS, "memory"))
+        .expect("memory row drawn")
+        .rect
+        .center();
+    h.right_click(row);
+    h.click(h.text("Properties…"));
+    assert!(h.has_text("Logging Action <memory>"));
+    assert!(!h.has_text("Syslog Facility"), "no remote fields");
+    assert!(!h.has_text("Remove"), "the built-in action stays");
+    if let LogDialog::Action { form, .. } = dialog(&mut h) {
+        assert!(form.memory);
+        assert_eq!(form.memory_lines, "1000");
+        form.memory_lines = "300".into();
+    }
+    h.idle();
+    h.click(h.text("OK"));
+    refresh(&mut h);
+    assert_eq!(
+        lock(&h.session).store().running().system.logging.memory_lines,
+        300,
+        "{:?}",
+        h.app.log()
+    );
 }
 
 #[test]

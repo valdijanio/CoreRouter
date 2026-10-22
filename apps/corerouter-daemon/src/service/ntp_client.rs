@@ -86,6 +86,17 @@ fn run(session: &Shared, port: u16) {
                     off / 1000.0,
                     status.synced_server.as_deref().unwrap_or("?")
                 );
+                lock(session).log_event(
+                    &["ntp", "warning"],
+                    corerouter_engine::logging::DAEMON,
+                    format!(
+                        "NTP: o relógio do sistema está {:.1} s fora de {}; o CoreRouter ainda \
+                         não acerta o relógio, use o serviço NTP do sistema",
+                        off / 1000.0,
+                        status.synced_server.as_deref().unwrap_or("?")
+                    ),
+                    serde_json::Value::Null,
+                );
                 warned = true;
             }
             next = Instant::now() + Duration::from_secs(wait);

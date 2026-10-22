@@ -345,6 +345,14 @@ impl Session {
             }
             _ => log::info!("dhcpv6-client {id} on {interface}: {message}"),
         }
+        let (topics, text, detail) = crate::logging::dhcp_event(
+            true,
+            &id.to_string(),
+            interface.as_str(),
+            event,
+            &message,
+        );
+        self.log_event(&topics, crate::logging::DAEMON, text, detail);
         self.dhcp6.seq = self.dhcp6.seq.saturating_add(1);
         let time = self.now();
         self.dhcp6.history.push_back(HistoryEntry {

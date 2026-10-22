@@ -99,7 +99,8 @@ impl Local {
                     .and_then(Value::as_str)
                     .ok_or("engine.execute needs {command, params?}")?;
                 let p = params.get("params").cloned().unwrap_or(Value::Null);
-                s.execute_as(&self.caller, id, &p).map_err(err)
+                s.execute_as(&self.caller.clone().with_via(params), id, &p)
+                    .map_err(err)
             }
             "engine.batch" => {
                 let steps = params.get("steps").cloned().unwrap_or(Value::Null);
@@ -107,7 +108,8 @@ impl Local {
                     .get("atomic")
                     .and_then(Value::as_bool)
                     .unwrap_or(true);
-                s.batch_as(&self.caller, &steps, atomic).map_err(err)
+                s.batch_as(&self.caller.clone().with_via(params), &steps, atomic)
+                    .map_err(err)
             }
             "state.inspect" => {
                 let path = params.get("path").and_then(Value::as_str);
@@ -121,9 +123,22 @@ impl Local {
     }
 }
 
+/// `params` of `engine.execute`/`engine.batch` with `via: "gui"` when the
+/// sender did not name itself (the terminal says `terminal`): the log shows
+/// where a change came from (G4.6d). Every backend sends through this.
+pub fn tag_via(method: &str, mut params: Value) -> Value {
+    if matches!(method, "engine.execute" | "engine.batch")
+        && let Some(o) = params.as_object_mut()
+    {
+        o.entry("via").or_insert_with(|| json!("gui"));
+    }
+    params
+}
+
 impl Backend for Local {
     fn submit(&mut self, method: &str, params: Value) -> RequestId {
         self.next = self.next.wrapping_add(1);
+        let params = tag_via(method, params);
         let reply = self.answer(method, &params);
         self.ready.push_back((self.next, reply));
         self.next
