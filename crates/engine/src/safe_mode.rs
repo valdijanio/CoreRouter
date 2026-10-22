@@ -108,6 +108,7 @@ impl Session {
         self.expire_safe_mode();
         self.expire_dynamic_addresses();
         self.expire_tasks();
+        self.poll_links();
     }
 
     /// The connection `caller_id` closed. If it owned Safe Mode, its changes

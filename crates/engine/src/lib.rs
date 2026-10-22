@@ -10,6 +10,7 @@ pub mod dhcp_client;
 pub mod error;
 pub mod firewall_dyn;
 pub mod guard;
+pub mod link_watch;
 pub mod neighbors;
 pub mod safe_mode;
 pub mod session;

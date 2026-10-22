@@ -5,11 +5,14 @@
 //! (e.g. a physical port has nothing to remove); the engine is the authority
 //! and every action still goes through `CoreRouterUi::run`.
 
+use std::collections::BTreeMap;
+
 use egui::{Grid, TextEdit, Ui};
 use serde_json::{Value, json};
 
 use crate::avail::Avail;
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
+use crate::iface_tabs::{self, NicView, Tab};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, form_number, human_bytes, value_text};
 
@@ -157,6 +160,8 @@ pub(crate) struct Props {
     base_comment: String,
     base_disabled: bool,
     pub port_pick: String,
+    /// The tab shown (G1.19).
+    pub tab: Tab,
 }
 
 impl Props {
@@ -170,6 +175,7 @@ impl Props {
             base_comment: i.comment.clone(),
             base_disabled: i.disabled,
             port_pick: String::new(),
+            tab: Tab::General,
         }
     }
 
@@ -439,6 +445,7 @@ impl CoreRouterUi {
     pub(crate) fn dialogs(&mut self, ctx: &egui::Context, area: egui::Rect) {
         let ifaces = self.ifaces();
         let can = self.can();
+        let mut nic = std::mem::take(&mut self.nic);
         let mut dialogs = std::mem::take(&mut self.dialogs);
         dialogs.retain_mut(|d| {
             // A properties window whose interface is gone closes itself.
@@ -458,7 +465,7 @@ impl CoreRouterUi {
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, &mut d.dialog, &ifaces, &can)
+                    dialog_body(ui, f, &mut d.dialog, &ifaces, &can, &mut nic)
                 });
             let keep = pressed.is_none_or(|b| self.dialog_button(d, b, &ifaces));
             if !keep {
@@ -469,6 +476,7 @@ impl CoreRouterUi {
         // Dialogs opened while these were drawn (Apply on "New …") go last.
         dialogs.append(&mut self.dialogs);
         self.dialogs = dialogs;
+        self.nic = nic;
     }
 
     /// Send what a dialog button means. Returns whether the dialog stays
@@ -887,90 +895,63 @@ fn dialog_body(
     d: &mut Dialog,
     ifaces: &[Iface],
     can: &Avail,
+    nic: &mut BTreeMap<String, NicView>,
 ) -> Footer<Button> {
     let names: Vec<String> = ifaces.iter().map(|i| i.name.clone()).collect();
     let mut port_op: Option<(bool, String, String)> = None;
     let mut toggle_label = None;
-    Grid::new("fields")
-        .num_columns(2)
-        .spacing([12.0, 6.0])
-        .show(ui, |ui| match d {
-            Dialog::NewVlan {
-                name,
-                parent,
-                vlan_id,
-                mtu,
-                comment,
-            } => {
-                f.text(ui, "Name", "name", name, "vlan100");
-                ui.label("Interface");
-                crate::windows::combo(ui, "vlan-parent", "parent", parent, &names);
-                ui.end_row();
-                f.text(ui, "VLAN ID", "vlan_id", vlan_id, "1..4094");
-                f.text(ui, "MTU", "mtu", mtu, "parent MTU");
-                f.text(ui, "Comment", "comment", comment, "");
-            }
-            Dialog::NewBridge { name, comment } => {
-                f.text(ui, "Name", "name", name, "bridge1");
-                f.text(ui, "Comment", "comment", comment, "");
-            }
-            Dialog::NewLoopback { name, comment } => {
-                f.text(ui, "Name", "name", name, "lo0");
-                f.text(ui, "Comment", "comment", comment, "");
-            }
-            Dialog::Comment { text, .. } => {
-                f.text(ui, "Comment", "comment", text, "");
-            }
-            Dialog::Props(p) => {
-                let Some(i) = ifaces.iter().find(|i| i.name == p.name) else {
-                    return;
-                };
-                ui.label("Name");
-                ui.add_enabled(
-                    false,
-                    TextEdit::singleline(&mut p.name.clone()).desired_width(180.0),
-                );
-                ui.end_row();
-                ui.label("Type");
-                ui.label(&i.kind);
-                ui.end_row();
-                f.text(ui, "MTU", "mtu", &mut p.mtu, "");
-                f.text(ui, "Comment", "comment", &mut p.comment, "");
-                ui.label("Disabled");
-                ui.checkbox(&mut p.disabled, "");
-                ui.end_row();
-                if let (Some(parent), Some(id)) = (&i.parent, &i.vlan_id) {
-                    ui.label("Interface");
-                    ui.label(parent);
-                    ui.end_row();
-                    ui.label("VLAN ID");
-                    ui.label(id);
-                    ui.end_row();
-                }
-                if let Some(b) = &i.bridge {
-                    ui.label("Bridge");
-                    ui.horizontal(|ui| {
-                        ui.label(b);
-                        let ok = can.check("interface.bridge.port.remove");
-                        if small_action(ui, "Remove from Bridge", None, ok) {
-                            port_op = Some((false, b.clone(), i.name.clone()));
-                        }
-                    });
-                    ui.end_row();
-                }
-                if i.kind == "bridge" {
-                    bridge_ports(ui, p, ifaces, &mut port_op, can);
-                }
-                toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
-                ui.label("Status");
-                ui.weak(match (i.disabled, i.running) {
-                    (true, _) => "disabled",
-                    (false, true) => "enabled, running",
-                    (false, false) => "enabled",
+    if let Dialog::Props(p) = d {
+        let Some(i) = ifaces.iter().find(|i| i.name == p.name) else {
+            return Footer::edit(true, can.check("interface.set"));
+        };
+        toggle_label = Some(if i.disabled { "Enable" } else { "Disable" });
+        iface_tabs::tab_bar(ui, &mut p.tab);
+        let view = nic.get_mut(&p.name);
+        iface_tabs::body(ui, p.tab, view, |ui, view| {
+            // A fixed label column: the fields do not move while the
+            // window settles (or when the MAC rows arrive).
+            Grid::new("fields")
+                .num_columns(2)
+                .min_col_width(96.0)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    props_general(ui, f, p, i, ifaces, can, &mut port_op, view)
                 });
-                ui.end_row();
-            }
         });
+    } else {
+        Grid::new("fields")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| match d {
+                Dialog::NewVlan {
+                    name,
+                    parent,
+                    vlan_id,
+                    mtu,
+                    comment,
+                } => {
+                    f.text(ui, "Name", "name", name, "vlan100");
+                    ui.label("Interface");
+                    crate::windows::combo(ui, "vlan-parent", "parent", parent, &names);
+                    ui.end_row();
+                    f.text(ui, "VLAN ID", "vlan_id", vlan_id, "1..4094");
+                    f.text(ui, "MTU", "mtu", mtu, "parent MTU");
+                    f.text(ui, "Comment", "comment", comment, "");
+                }
+                Dialog::NewBridge { name, comment } => {
+                    f.text(ui, "Name", "name", name, "bridge1");
+                    f.text(ui, "Comment", "comment", comment, "");
+                }
+                Dialog::NewLoopback { name, comment } => {
+                    f.text(ui, "Name", "name", name, "lo0");
+                    f.text(ui, "Comment", "comment", comment, "");
+                }
+                Dialog::Comment { text, .. } => {
+                    f.text(ui, "Comment", "comment", text, "");
+                }
+                Dialog::Props(_) => {}
+            });
+    }
     // What OK / Apply send.
     let ok = can.check(match d {
         Dialog::NewVlan { .. } => "interface.vlan.add",
@@ -987,6 +968,79 @@ fn dialog_body(
     }
     footer.pressed = port_op.map(|(add, bridge, port)| Button::Port { add, bridge, port });
     footer
+}
+
+/// The General tab of "Interface <name>": the editable fields, the MAC
+/// addresses and L2 MTU (from `interface.hardware`), bridge membership.
+#[allow(clippy::too_many_arguments)]
+fn props_general(
+    ui: &mut Ui,
+    f: &Form,
+    p: &mut Props,
+    i: &Iface,
+    ifaces: &[Iface],
+    can: &Avail,
+    port_op: &mut Option<(bool, String, String)>,
+    view: Option<&NicView>,
+) {
+    let (mac, perm_mac, l2mtu) = view.map(NicView::general).unwrap_or_default();
+    ui.label("Name");
+    ui.add_enabled(
+        false,
+        TextEdit::singleline(&mut p.name.clone()).desired_width(180.0),
+    );
+    ui.end_row();
+    ui.label("Type");
+    ui.label(&i.kind);
+    ui.end_row();
+    f.text(ui, "MTU", "mtu", &mut p.mtu, "");
+    if let Some(l2) = l2mtu {
+        ui.label("L2 MTU");
+        ui.label(l2)
+            .on_hover_text("the largest MTU the driver accepts");
+        ui.end_row();
+    }
+    ui.label("MAC Address");
+    ui.label(mac.as_deref().unwrap_or("-"));
+    ui.end_row();
+    if let Some(perm) = perm_mac {
+        ui.label("Factory MAC");
+        ui.label(perm);
+        ui.end_row();
+    }
+    f.text(ui, "Comment", "comment", &mut p.comment, "");
+    ui.label("Disabled");
+    ui.checkbox(&mut p.disabled, "");
+    ui.end_row();
+    if let (Some(parent), Some(id)) = (&i.parent, &i.vlan_id) {
+        ui.label("Interface");
+        ui.label(parent);
+        ui.end_row();
+        ui.label("VLAN ID");
+        ui.label(id);
+        ui.end_row();
+    }
+    if let Some(b) = &i.bridge {
+        ui.label("Bridge");
+        ui.horizontal(|ui| {
+            ui.label(b);
+            let ok = can.check("interface.bridge.port.remove");
+            if small_action(ui, "Remove from Bridge", None, ok) {
+                *port_op = Some((false, b.clone(), i.name.clone()));
+            }
+        });
+        ui.end_row();
+    }
+    if i.kind == "bridge" {
+        bridge_ports(ui, p, ifaces, port_op, can);
+    }
+    ui.label("Status");
+    ui.weak(match (i.disabled, i.running) {
+        (true, _) => "disabled",
+        (false, true) => "enabled, running",
+        (false, false) => "enabled",
+    });
+    ui.end_row();
 }
 
 fn bridge_ports(

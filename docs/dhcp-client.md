@@ -152,6 +152,49 @@ do `rand` dele usa `wasm_js`). Pacote de rede é hostil:
 | `ui` | janela listada, diálogo com Status e Options, Renew, New com a primeira interface livre, histórico no Log |
 | `shell` | `add`/`print`/`print detail`/`set`/`renew` e `D - dynamic` em `/ip address` |
 
+## 8. Pesquisa
+
+Fontes lidas (texto próprio, nada copiado):
+[MikroTik RouterOS — DHCP](https://help.mikrotik.com/docs/spaces/ROS/pages/24805500/DHCP),
+[VyOS — Ethernet, `dhcp-options`](https://docs.vyos.io/en/latest/configuration/interfaces/ethernet.html),
+[OPNsense — Interfaces](https://docs.opnsense.org/manual/interfaces.html) e
+[Settings](https://docs.opnsense.org/manual/interfaces_settings.html),
+[OpenWrt — protocolo `dhcp`](https://openwrt.org/docs/guide-user/network/ipv4/configuration),
+RFC 2131/2132 (protocolo e opções), RFC 3442 (rotas sem classe), RFC 3396 (opções longas),
+RFC 5227 (detecção de conflito por ARP), RFC 4361 (client-id).
+
+- **MikroTik (referência de nomes e comportamento):** `add-default-route` yes/no/special-classless
+  (121 vence a 3; `special-classless` põe as duas), `default-route-distance`, tabelas de rota (na
+  VRF da interface), `use-peer-dns`/`use-peer-ntp`, `host-name` (identidade se vazio), `client-id`
+  (`0x01`+MAC se vazio), opções do cliente com a sintaxe das opções do servidor (`0x…`, `'…'`,
+  `s'…'`, `$(HOSTNAME)`), `renew`/`release`, status `searching…/requesting…/bound/renewing…/
+  rebinding…/stopped/error`, flags `X`/`I`. Também tem `check-gateway`, `script`,
+  `allow-reconfigure`, `use-broadcast`.
+- **VyOS:** `client-id`, `host-name`, `vendor-class-id`, `user-class`, `no-default-route`,
+  `default-route-distance` e **`reject`** (ignorar concessões de um endereço ou sub-rede, ex.: o
+  modem do provedor), além de scripts antes/depois.
+- **OPNsense:** **"Reject Leases From"**, endereço alias fixo junto do DHCP, sobrescrever o MTU
+  recebido, "Prevent release" (não manda RELEASE ao sair).
+- **OpenWrt:** `broadcast`, `hostname`, `clientid`/`sendclientid`, `vendorid`, `defaultroute`,
+  `peerdns`, `classlessroute`, `reqopts`/`sendopts` (`opção:valor`), `metric`, `norelease`.
+
+O que adotamos: os nomes e as regras de rota do RouterOS; `vendor_class` (VyOS/OpenWrt);
+`extra_options` como o `sendopts` do OpenWrt mas na sintaxe do RouterOS; filtro de servidores
+como lista de **permitidos** por IP **ou MAC** (mais forte que o `reject` do VyOS/OPNsense: um
+servidor desconhecido na WAN não entra, e o filtro vale também para o NAK); não mandar RELEASE ao
+desabilitar (o "Prevent release"/`norelease` como padrão; `release` manda); todas as opções
+recebidas visíveis (nenhum dos quatro mostra isso tão fácil); histórico consultável; DECLINE por
+ARP; a concessão nunca vira config e passa pelo mesmo `apply` transacional.
+
+Ficou de fora agora (candidatos a gap): lista de **rejeitados** além da de permitidos (VyOS/
+OPNsense); aplicar o MTU da opção 26 (pedimos e mostramos, não aplicamos) com o "override MTU" do
+OPNsense; `use-broadcast` (sempre pedimos broadcast, que é o que funciona antes de ter endereço
+num socket comum); `script`/hooks (aqui tudo é comando e o MCP já reage a eventos pelo
+`history`); `allow-reconfigure` (FORCERENEW, RFC 3203); `user-class` (dá para mandar como
+`extra_options` 77). `check-gateway`, endereço de reserva e concessão lembrada são o G4.7c;
+DHCPv6/PD/RA o G4.7b.
+
 ## Histórico de revisão
 
 - 2026-10-22 — versão inicial (G4.7a).
+- 2026-10-22 — seção Pesquisa (regra nova do AGENTS.md).

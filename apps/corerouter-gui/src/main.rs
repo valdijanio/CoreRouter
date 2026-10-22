@@ -15,7 +15,7 @@
 use std::time::Duration;
 
 use corerouter_ui::{
-    ConnectAction, ConnectScreen, CoreRouterUi, Credentials, NeighborRow, SavedRouter,
+    ConnectAction, ConnectScreen, CoreRouterUi, Credentials, Failure, NeighborRow, SavedRouter,
 };
 
 mod export;
@@ -40,8 +40,8 @@ trait Platform {
     /// Keep the Saved tab (address, group, comment; never a password).
     fn store_saved(&mut self, saved: &[SavedRouter]);
     /// Log in to the router at `creds.address` and start managing it, or
-    /// say why not.
-    fn connect(&mut self, creds: &Credentials) -> Result<Connected, String>;
+    /// say why not (one sentence, the technical part as its detail).
+    fn connect(&mut self, creds: &Credentials) -> Result<Connected, Failure>;
     /// The operator accepted this certificate for `address` (G0.3 TOFU).
     fn trust(&mut self, address: &str, fingerprint: &str) -> Result<(), String>;
     /// The in-process virtual lab.
@@ -153,7 +153,7 @@ impl eframe::App for GuiApp {
                             None
                         }
                         Some(Err(e)) => {
-                            screen.set_error(e);
+                            screen.fail(e);
                             None
                         }
                     }

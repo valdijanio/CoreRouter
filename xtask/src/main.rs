@@ -192,6 +192,8 @@ const NETNS_TESTS: &[(&str, &str)] = &[
     ("corerouter-hal-linux", "netns_nft"),
     // G6.2: host ICMP (ping and raw sockets) through a veth and a router.
     ("corerouter-hal-linux", "netns_icmp"),
+    // G1.19: ethtool netlink and link counters of a veth pair.
+    ("corerouter-hal-linux", "netns_nic"),
     // G5.1: two daemons find each other with CRDP.
     ("corerouter-daemon", "netns"),
     // G5.2: two linux-backend daemons list each other as LLDP; MNDP is read.
