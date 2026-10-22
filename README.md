@@ -13,7 +13,7 @@ cargo run -p corerouter-cli -- run ip.address.add '{"address":"10.0.0.1/24","int
 claude mcp add corerouter -- corerouter-cli mcp  # MCP
 ```
 
-Web: `trunk serve apps/corerouter-gui/index.html`.
+Web (requer `cargo install trunk --locked`): `cd apps/corerouter-gui && trunk serve` e abra http://127.0.0.1:8080.
 
 Leia primeiro: [AGENTS.md](AGENTS.md), [docs/architecture.md](docs/architecture.md),
 [docs/gaps.md](docs/gaps.md), [docs/mcp.md](docs/mcp.md),
