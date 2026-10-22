@@ -309,9 +309,10 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   namespace filho + GUI — local "(this machine)", remoto cinza com a dica (screenshot conferido).
   Esforço do agente ~3 h (**estimado**).
 - 2026-10-22 — G5.5: o `corerouter-daemon` se despede ao encerrar. SIGINT/SIGTERM chegam pelo
-  iterador do `signal-hook` (o handler só escreve num pipe; sem `unsafe` no workspace, sem runtime
-  async; `ctrlc` com `termination` também serviria, mas não distingue os sinais no log nem deixa
-  o segundo sinal num fio separado tão simples). Ao receber: `corerouter_control::Shutdown` fecha
+  `signal_hook::flag::register` (o handler só marca um `AtomicBool`, lido a cada 50 ms; mesmo
+  caminho no unix e no Windows — o iterador do `signal-hook` só existe no unix e quebrou o build
+  do Windows na primeira versão do PR; sem `unsafe` no workspace, sem runtime async; `ctrlc` com
+  `termination` também serviria, mas não distingue os sinais no log). Ao receber: `corerouter_control::Shutdown` fecha
   as portas de controle e WebSocket (`serve_until`/`spawn_ws_until`; conexões abertas seguem até o
   fim do processo); `Agent::shutdown` acorda o emissor (agora dorme num canal, não num `sleep`) e
   manda `hold 0` em toda interface onde anunciava, também o loopback do lab; `LinkDiscovery`

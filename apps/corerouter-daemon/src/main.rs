@@ -40,8 +40,9 @@
 //! signal during the shutdown exits at once (code 130). Safe Mode active at
 //! that moment is not undone here: its changes were never saved, so the
 //! next start comes up on the config from before it, as G1.4 defines.
-//! The signals come from `signal-hook`'s iterator (a pipe written by its
-//! handler, read on a thread): no `unsafe` here and no async runtime.
+//! The signals come from `signal-hook`'s `flag::register` (its handler only
+//! sets an atomic flag, polled here every [`SIGNAL_POLL`]): no `unsafe`
+//! here, no async runtime, and the same path on unix and Windows.
 
 #[cfg(target_os = "linux")]
 mod link_discovery;
@@ -60,8 +61,10 @@ use corerouter_discovery::{Agent, AgentConfig, Transport, enable_lab_default};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, lock, shared};
 use corerouter_hal::{Hal, VirtualHal};
 use corerouter_storage_fs::FileStorage;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use signal_hook::consts::{SIGINT, SIGTERM};
-use signal_hook::iterator::Signals;
 
 const USAGE: &str = "\
 usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
@@ -83,6 +86,8 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
 
 /// Longest wait for the discovery goodbyes when shutting down.
 const GOODBYE_WAIT: Duration = Duration::from_secs(1);
+/// How often the signal flags are looked at.
+const SIGNAL_POLL: Duration = Duration::from_millis(50);
 /// Exit code of a second signal during the shutdown (128 + SIGINT, as a
 /// shell reports an interrupted command).
 const EXIT_INTERRUPTED: i32 = 130;
@@ -275,6 +280,33 @@ fn signal_name(sig: i32) -> &'static str {
     }
 }
 
+/// SIGINT and SIGTERM, one flag each, set by signal-hook's handler.
+struct Signals(Vec<(i32, Arc<AtomicBool>)>);
+
+impl Signals {
+    fn register() -> std::io::Result<Self> {
+        let mut flags = Vec::new();
+        for sig in [SIGINT, SIGTERM] {
+            let flag = Arc::new(AtomicBool::new(false));
+            signal_hook::flag::register(sig, flag.clone())?;
+            flags.push((sig, flag));
+        }
+        Ok(Self(flags))
+    }
+
+    /// Block until a signal arrives (one that came earlier counts); clears it.
+    fn wait(&self) -> i32 {
+        loop {
+            for (sig, flag) in &self.0 {
+                if flag.swap(false, Ordering::SeqCst) {
+                    return *sig;
+                }
+            }
+            thread::sleep(SIGNAL_POLL);
+        }
+    }
+}
+
 /// Discovery threads that say goodbye on the way out.
 struct Discovery {
     crdp: Option<Agent>,
@@ -285,12 +317,12 @@ struct Discovery {
 /// Block until SIGINT/SIGTERM, then shut down as the module doc says.
 /// Never returns: exits the process.
 fn run_until_signal(
-    mut signals: Signals,
+    signals: Signals,
     session: &corerouter_engine::Shared,
     shutdown: &Shutdown,
     discovery: Discovery,
 ) -> ! {
-    let sig = signals.forever().next().unwrap_or(SIGTERM);
+    let sig = signals.wait();
     log::info!(
         "{}: shutting down (again to exit at once)",
         signal_name(sig)
@@ -298,10 +330,9 @@ fn run_until_signal(
     let spawned = thread::Builder::new()
         .name("signals".into())
         .spawn(move || {
-            if let Some(sig) = signals.forever().next() {
-                log::warn!("{}: exiting now, without goodbye", signal_name(sig));
-                std::process::exit(EXIT_INTERRUPTED);
-            }
+            let sig = signals.wait();
+            log::warn!("{}: exiting now, without goodbye", signal_name(sig));
+            std::process::exit(EXIT_INTERRUPTED);
         });
     if let Err(e) = spawned {
         log::warn!("a second signal will not cut the shutdown short: {e}");
@@ -359,9 +390,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    // First, so a signal during start-up waits in the queue instead of
+    // First, so a signal during start-up is kept in its flag instead of
     // killing the process before the goodbye exists.
-    let signals = match Signals::new([SIGINT, SIGTERM]) {
+    let signals = match Signals::register() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("cannot handle SIGINT/SIGTERM: {e}");
