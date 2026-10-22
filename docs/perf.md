@@ -306,3 +306,35 @@ Um mutex, a busca do estado do `Forwarder` e alguns mapas pequenos por consulta.
 versão alocava o nome do tipo por consulta (+10 a +15 %); contar pelo código do tipo e dar nome
 só no `print` tirou metade disso. Ainda dá ~1,2 milhão de consultas por segundo por núcleo com
 o cache quente.
+
+### G4.1c-2 — assinatura DNSSEC (**medido**)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build release,
+`cargo bench -p corerouter-proto-dns --features dnssec --bench dnssec`, 2026-10-22:
+
+| caso | tempo |
+|---|---|
+| `dnssec_sign_1k/ecdsa-p256` (zona de 1000 registros inteira, KSK + ZSK, NSEC3) | 24,2 ms |
+| `dnssec_sign_1k/ed25519` | 31,8 ms |
+| `dns_zone_signed_answer_do` (A + RRSIG pela cadeia) | 1,56 µs |
+| `dns_zone_signed_nxdomain_do` (SOA, RRSIG, prova NSEC3 com hashes por consulta) | 6,59 µs |
+
+Sem DO, a resposta de uma zona assinada custa o mesmo que a de uma não assinada (1,04 µs, G4.1c-1).
+
+### Servidor DHCP: tempestade (G4.2a)
+
+**Medido** em 2026-10-22, AMD Ryzen AI MAX+ 395 (32 threads), build release, `cargo bench -p
+corerouter-proto-dhcp --bench server_storm` (o servidor puro: N clientes DISCOVER → OFFER →
+REQUEST → ACK, linhas de diário serializadas como no engine; sem disco) e `cargo run --release -p
+corerouter-proto-dhcp --example storm` (p50/p99 de cada mensagem com `Instant`):
+
+| Caso | Tempo por tempestade | leases/s | p50 / p99 por mensagem |
+|---|---|---|---|
+| `dhcp_server_storm/dora/1000` | 4,66 ms | 214 k | — |
+| `dhcp_server_storm/probed/1000` (sonda ARP, ofertas estacionadas) | 5,35 ms | 187 k | — |
+| `dhcp_server_storm/dora/10000` | 53,2 ms | 188 k | 2,2 µs / 3,5 µs |
+| `dhcp_server_storm/probed/10000` | 58,5 ms | 171 k | 2,2 µs / 4,6 µs |
+
+Antes de trocar a busca linear de ofertas estacionadas por um conjunto, `probed/10000` dava 20 k
+leases/s e p99 de 64 µs (O(n²) numa tempestade). No daemon soma-se uma `fdatasync` do diário por
+rodada (todas as concessões da rodada juntas, antes dos ACKs).

@@ -1189,3 +1189,135 @@ continuação indentadas).
 - 2026-10-22 — G6.6: Registro da G6.6: a ferramenta DNS Lookup (estilo `dig`) em Tools, com a tela aprovada pelo
   usuário. Começa depois que a G4.1d entrar, porque reaproveita o `ip.dns.resolve` como tarefa e
   o upstream DoH dela.
+
+- 2026-10-22 — G4.1c: Assinatura DNSSEC das zonas autoritativas. `ip.dns.zone.set dnssec=yes` (e `dnssec_algorithm`,
+  `signature_validity_secs`): o daemon gera KSK e ZSK (ring, pelo `hickory-proto`, feature `dnssec`
+  do proto-dns ligada só nele), guardadas no estado operacional `dnssec-keys` (fora das revisões:
+  um rollback nunca tira uma chave cujo DS está no pai), e assina a zona inteira: RRSIG de todo
+  RRset autoritativo (delegação e glue não, RFC 4035 §2.2), cadeia NSEC3 com 0 iteração e sem salt
+  (RFC 9276), NSEC3PARAM, serial próprio sempre maior. A etapa `zones` responde DO com os RRSIG e as
+  provas NSEC3 da RFC 5155 §7.2; AXFR/IXFR/NOTIFY levam a versão assinada; uma secundária de zona
+  assinada serve as assinaturas. Comandos `ip.dns.zone.dnssec.print/rollover/ds-published/forget`;
+  DS (SHA-256) em `ip.dns.zone.print`; diálogo da zona com as chaves, Copy DS e os botões de rotação.
+  Rotação: ZSK por pré-publicação, KSK por assinatura dupla esperando `ds-published` (RFC 6781
+  §4.1, tempos da RFC 7583). Testar: `ip.dns.zone.set '{"id":"example.com","dnssec":true}'`,
+  `ip.dns.zone.print` (DS), `dig +dnssec @… www.example.com`; namespace com o `delv` do BIND
+  validando resposta, NXDOMAIN, NODATA, curinga e CNAME. Desempenho **medido**: 24 ms para assinar
+  1000 registros (ECDSA), 1,56 µs por resposta assinada, 6,6 µs por NXDOMAIN com prova.
+
+- 2026-10-22 — G4.1c: Atualização dinâmica das zonas: `ip.dns.tsig-key.*` (HMAC-SHA256/384/512; secret aleatório de 32
+  bytes se não for dado; escondido no `print`, no export e no log da GUI) e, por zona, `update_keys`
+  e `allow_update`. Um RFC 2136 UPDATE (Kea dhcp-ddns, ISC dhcpd, `nsupdate`) é checado em
+  `proto-dns/src/zone/update.rs` (zona, TSIG: chave, MAC, tempo e repetição; permissão; pré-requisitos
+  da §3.2; seção de atualização) e aplicado pelo engine tudo ou nada (`engine/src/dns_dynamic.rs`,
+  estado `dns-dynamic`, salvo antes da resposta), com as regras da §3.4.2 e o serial servido subindo
+  (e a zona assinada assinada de novo). Registros configurados nunca mudam por UPDATE. Os dinâmicos
+  aparecem em `ip.dns.zone.record.print` com `D`, saem com `ip.dns.zone.dynamic.remove/flush` e no
+  arquivo de zona. `Session::dns_dynamic_lease`/`_release` criam e tiram o A/AAAA e o PTR de uma
+  concessão (para a G4.2, cujo critério foi atualizado). GUI: janela IP › DNS TSIG Keys, Update Keys
+  e Allow Update no diálogo da zona, linhas `D` nos registros. Testar: `ip.dns.tsig-key.add
+  '{"name":"dhcp-ddns"}'`, `ip.dns.zone.set '{"id":"lan.example","update_keys":"dhcp-ddns"}'`,
+  `nsupdate -y hmac-sha256:dhcp-ddns:<secret>`; namespace com o `nsupdate` do BIND.
+
+- 2026-10-22 — G4.2: Servidor DHCPv4 (G4.2a), Rust puro sobre o `dhcproto`, com os menus e nomes do RouterOS v7:
+  `ip.pool.*` (faixas, `next_pool`, `/ip pool used`), `ip.dhcp-server.*` (interface, pool ou
+  `static-only`, `lease_time` 30m, `authoritative` com os atrasos, `conflict_detection`,
+  `always_broadcast`, `server_address`, `relay`, `dhcp_option_set`, `address_lists`,
+  `client_mac_limit`, `client_rate_limit`), `network.*` (gateway, DNS, domínio, NTP, WINS, PXE,
+  opções e `dns_zone`), `lease.*` (fixas e dinâmicas, `make-static`, `release`, `block`,
+  `check-status`), `option.*`, `option-set.*`, `matcher.*` (vendor class e outros, `exact`/`substring`)
+  e `alert.*` (servidor estranho, log `dhcp,critical`). O núcleo é puro
+  (`proto-dhcp/src/server/`: RFC 2131 §4.3.1–§4.3.5, §4.1, §4.4.5, RFC 6842, 3046, 4702, 4361),
+  o engine (`engine/src/dhcp_server.rs`) grava o diário (`journal-dhcp-leases.log`, uma linha JSON
+  por mudança, `fdatasync` por rodada antes de qualquer ACK, compactação atômica por hora ou a 2×
+  os registros), responde, nomeia a concessão no DNS (A + PTR, TTL ⅓ da concessão, mínimo 600 s,
+  via `dns_dynamic_lease`) e a põe nas address-lists do firewall; o serviço `dhcp-server` do daemon
+  o dirige sob o supervisor; o `hal-linux` fala `AF_PACKET`+BPF, UDP 67 e ARP. Sonda ARP antes de
+  oferecer (endereço que responde vira `conflict` com o motivo e outro é oferecido), checagens contra
+  erro do operador (pool com gateway ou endereço do roteador, pools sobrepostos: erro; interface com
+  cara de WAN: aviso), limite de mensagens por cliente com descartes contados por motivo,
+  estatísticas (`ip.dhcp-server.statistics.print/reset`: uso de pool com alerta a 80 %, mensagens,
+  ACK/s com pico, p50/p99, descartes) e no `/metrics` (`corerouter_dhcp_*`). GUI: IP › DHCP Server
+  (abas DHCP, Networks, Leases com selos, Options, Option Sets, Matchers, Alerts), IP › DHCP
+  Statistics e IP › Pool; selos dentro de células de tabela (`chip::cell`). O lab tem hosts
+  simulados atrás de cada porta (quatro clientes, um invasor no `.11`, um servidor estranho).
+  Testar: `ip.address.add '{"address":"192.168.88.1/24","interface":"ether2"}'`, `ip.pool.add
+  '{"name":"lan","ranges":"192.168.88.10-192.168.88.50"}'`, `ip.dhcp-server.add
+  '{"interface":"ether2","address_pool":"lan"}'`, `ip.dhcp-server.network.add
+  '{"address":"192.168.88.0/24","gateway":"192.168.88.1"}'`, `ip.dhcp-server.lease.print`; netns
+  com o nosso cliente (`apps/corerouter-daemon/tests/netns_dhcp_server.rs`: concessão, conflito,
+  DNS, renovação, reinício pelo diário, release). Achado: o `dhcproto` 0.15 escreve uma opção 82
+  crua duas vezes (a 82 é escrita por nós).
+
+- 2026-10-22 — G4.2: A G4.2 fecha com a parte 3 (G4.2c, servidor DHCPv6): servidor DHCP completo, v4 e v6, com relay,
+  em Rust puro.
+
+- 2026-10-22 — G4.2b: DHCP, parte 2 (G4.2b): `ip.dhcp-relay.*` (interface, servidores, `local_address`/giaddr,
+  `add_relay_info` com circuit id = nome da interface e remote id = MAC do cliente,
+  `relay_info_remote_id`; contadores de pedidos, respostas e descartes) — núcleo puro em
+  `proto-dhcp/src/relay.rs` (RFC 1542 §4.1, RFC 3046 §2.1/§2.2), em tempo de execução em
+  `engine/src/dhcp_relay.rs` (com servidor do próprio roteador em memória; para fora, socket UDP 67
+  do `hal-linux`). No servidor: opção 82 lida (`server/agent.rs`) e mostrada (`agent_circuit_id`,
+  `agent_remote_id`), concessão fixa por porta (`agent_circuit_id`/`agent_remote_id`, RouterOS 7.21),
+  renovação unicast direta reconhecida pela concessão (antes caía no servidor da interface de
+  chegada e levava NAK). Histórico (`server/history.rs`, `engine/src/dhcp_history.rs`): uma entrada
+  por vinculação, diário próprio, `ip.dhcp-server.history.print` (inclusive "quem tinha às HH:MM"),
+  `.export` (CSV), `ip.dhcp-server.config.set history_retention` (padrão 1 ano, Marco Civil; 0
+  desliga). Durações também em semanas e dias longos (`365d`, `52w`). O alerta manda um DISCOVER por
+  minuto. GUI: IP › DHCP Relay; aba History no DHCP Server (busca, Export CSV para a área de
+  transferência); selo da porta, colorido por hash, nas concessões. Testar: `ip.dhcp-relay.add
+  '{"interface":"ether3","dhcp_server":"192.168.88.1","add_relay_info":true}'` com um servidor
+  `relay` = o endereço de ether3; `ip.dhcp-server.history.print '{"address":"10.20.0.10"}'`; netns
+  `apps/corerouter-daemon/tests/netns_dhcp_relay.rs` (três daemons).
+
+- 2026-10-22 — G4.2c: DHCP, parte 3 (G4.2c): servidor DHCPv6 puro (`proto-dhcp/src/server6.rs`, RFC 9915 §16, §18.3,
+  §19, §21.4) com Solicit/Advertise/Request/Renew/Rebind/Release/Decline/Confirm/Information-request,
+  Rapid Commit, Preference, Relay-Forw/Relay-Repl aninhados (até 8 saltos); IA_NA por hash do cliente
+  (o mesmo endereço em qualquer roteador), IA_PD do pool (dica, fixo, próximo livre); diário
+  `journal-dhcp6-leases.log`. Engine (`engine/src/dhcp6_server.rs`): rota dinâmica (flag D) a cada
+  prefixo delegado via o cliente ou o relay, aplicada pelo `Session::effective`; AAAA + PTR pela opção
+  39; relay v6 em memória para o servidor do roteador, ou por UDP 547. Comandos `ipv6.pool.*`,
+  `ipv6.dhcp-server.*`, `ipv6.dhcp-server.binding.*`, `ipv6.dhcp-relay.*`; hal-linux UDP 547 por
+  interface no `ff02::1:2`; hosts DHCPv6 simulados no lab (`lab_hosts6.rs`). GUI: IPv6 › DHCPv6
+  Server (Servers, Bindings, Pools, Relays). Testar: `ipv6.pool.add
+  '{"name":"cpe","prefix":"2001:db8:100::/48","prefix_length":56}'`, `ipv6.dhcp-server.add
+  '{"interface":"ether2","prefix_pool":"cpe"}'`, `ipv6.dhcp-server.binding.print`; netns
+  `apps/corerouter-daemon/tests/netns_dhcp6_server.rs` (o nosso cliente DHCPv6 recebe endereço e /56,
+  a rota ao /56 aparece no kernel, e volta depois de reiniciar o servidor).
+
+- 2026-10-22 — G6.6: DNS Lookup estilo `dig`: `tool.dns.query {name, type?, server?, recursion?, dnssec?, tcp?,
+  trace?, compare?}` roda como tarefa (nunca espera a rede sob o lock do `Session`). Com o
+  servidor padrão (o roteador), a pergunta desce a cadeia do encaminhador da LAN dentro do
+  processo e a resposta diz a etapa que respondeu (`cache`, `static`, `adlist`, `zones`,
+  `upstream`); também um IP (UDP, TCP no truncamento ou com `tcp`), DoH/DoT (cliente da G4.1d) ou
+  todos os upstreams. `compare` pergunta a todos em paralelo e marca `diverge` em quem foge da
+  maioria (endereços comparados pelo AS de origem: CDN não diverge, sinkhole e sequestro sim) e
+  `timeout` em quem não respondeu; `trace` vai da raiz até a resposta, uma linha por delegação,
+  com o selo `assinada` quando veio DS/RRSIG (sem validar: G4.1f). Codec em
+  `proto-dns/src/dig.rs`: consulta com RD/DO, resposta inteira (flags, EDNS, as três seções, RRSIG,
+  DS e DNSKEY no formato da RFC 4034), texto no formato do `dig` e as delegações do trace. Janela
+  Tools › DNS Lookup com selos (status, flags, tempo, servidor, etapa), Answer/Authority/Additional
+  uma linha por registro com a pílula do AS, tabelas de compare e trace, "Copy as dig". Terminal:
+  `/tool dns-lookup example.com type=MX dnssec=yes`.
+
+  Como testar: `corerouter-cli --connect 127.0.0.1:7979 watch tool.dns.query
+  '{"name":"example.com","compare":true}'`; na GUI, Tools › DNS Lookup. Testes: codec e texto do
+  `dig` (proto-dns, com proptest), tarefa com sucesso, validação, timeout, PTR, compare e trace
+  com backend falso (engine), compare na rede com quatro upstreams UDP em 127.0.0.1–4 (um diverge,
+  um calado; daemon), `/tool dns-lookup` no terminal (shell) e a janela headless (ui).
+  Ao vivo (**medido**, 2026-10-22, daemon debug no lab virtual): compare de 4 upstreams com um
+  calado em ~3 s (o timeout de um, não a soma); trace de `www.example.com` em 3 delegações.
+
+- 2026-10-22 — ui: Janelas de ferramentas do tamanho do conteúdo, e o `:resolve` só no Tools (pedido do usuário).
+
+  - **IP › DNS Resolve saiu.** Era um subconjunto do Tools › DNS Lookup (G6.6), e perguntar um nome é
+    diagnóstico, não configuração. O **Resolve…** da janela DNS Cache abre o DNS Lookup já com o nome
+    e o tipo da entrada selecionada, perguntando ao roteador. O comando `ip.dns.resolve` (o
+    `:resolve` do RouterOS) continua para o terminal, scripts e MCP.
+  - **Tools › DNS Lookup e MTR abrem da altura do formulário** e crescem com as respostas (o egui
+    aumenta a janela quando o conteúdo cresce), em vez de abrir num tamanho fixo com a tabela
+    ocupando o espaço vazio. Redimensionada pelo usuário, a janela fica do tamanho que ele deu. As
+    listas (Interfaces, Leases, Firewall…) continuam com tamanho fixo, como no WinBox.
+
+  Como testar: abra Tools › DNS Lookup (só o formulário), pergunte `uol.com.br` (a janela cresce
+  com as respostas); DNS Cache › selecione uma entrada › **Resolve…**; Tools › MTR.

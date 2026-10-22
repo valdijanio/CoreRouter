@@ -68,3 +68,9 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-22 — G4.1d feito (adlist, forwarders, DoT/DoH, :resolve, cache de falhas)
 - 2026-10-22 — G4.1e feito (estatísticas do encaminhador DNS); criado G4.1h (mais estatísticas: latência, top nomes, /metrics)
 - 2026-10-22 — G6.6 criado (DNS Lookup, a ferramenta estilo dig; tela aprovada pelo usuário)
+- 2026-10-22 — G4.1c: assinatura DNSSEC das zonas feita (G4.1c-2); criado G4.1m (DNSSEC: CDS/CDNSKEY, checkds, rotação por idade e de algoritmo)
+- 2026-10-22 — G4.1c feito (atualização dinâmica RFC 2136 + TSIG, G4.1c-3); criado G4.1n (DNS dinâmico: DHCID, update-policy, TSIG em transferências); G4.2 ganhou o DHCP → DNS no critério
+- 2026-10-22 — G4.2 dividido em G4.2a (servidor DHCPv4), G4.2b (relay + opção 82 + histórico), G4.2c (DHCPv6 + PD); G4.2a feito; criado G4.2d (DHCP em alta disponibilidade)
+- 2026-10-22 — G4.2b feito (relay, opção 82, histórico); criado G4.2e (sonda ICMP para relays e limite por remote id)
+- 2026-10-22 — G4.2c feito (servidor DHCPv6 com IA_NA, IA_PD e relay v6); criado G4.2f (DHCPv6: reconfigure, opções, estatísticas)
+- 2026-10-22 — G6.6 feito (DNS Lookup estilo dig em Tools)
