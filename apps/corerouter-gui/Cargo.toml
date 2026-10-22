@@ -11,7 +11,7 @@ repository.workspace = true
 [dependencies]
 corerouter-engine.workspace = true
 corerouter-ui.workspace = true
-eframe = { workspace = true, features = ["wgpu", "default_fonts", "accesskit"] }
+eframe = { workspace = true, features = ["wgpu", "default_fonts", "accesskit", "persistence"] }
 log.workspace = true
 serde_json.workspace = true
 

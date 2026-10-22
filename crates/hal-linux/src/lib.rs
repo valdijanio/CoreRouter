@@ -4,6 +4,9 @@
 //!   operations (pure, tested everywhere); `netlink` runs them over rtnetlink
 //!   and undoes the done ones if one fails (G1.2).
 //! - discovery and counters: `/sys/class/net` (netlink stats in G1.7).
+//! - `l2`: neighbor-discovery I/O — LLDP frames over `AF_PACKET`, passive
+//!   MNDP over UDP 5678 (G5.2). Bytes only; the codecs are `proto-lldp` /
+//!   `proto-mndp`, glued by the daemon.
 //!
 //! Integration tests run against a real kernel inside a throwaway network
 //! namespace, without root: see `tests/netns.rs`.
@@ -12,6 +15,9 @@ pub mod plan;
 
 #[cfg(target_os = "linux")]
 mod netlink;
+
+#[cfg(target_os = "linux")]
+pub mod l2;
 
 #[cfg(target_os = "linux")]
 mod linux {
