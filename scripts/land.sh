@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Fila de entrada: integra PRs prontos na `main` (AGENTS.md, "Integração").
 #
-# Uso: scripts/land.sh [--batch] [--fold] [<pr>...]
+# Uso: scripts/land.sh [--watch | --batch] [--fold] [<pr>...]
+#
+# --watch: fila contínua — pega sozinha os PRs com o rótulo `fila` e roda os lotes abaixo, com um
+#   lote especulativo montado em cima do que está no CI (veja `watch`).
 #
 # --batch (o normal): um CI para a combinação, não um por PR.
 #   1. junta numa branch temporária (`queue/batch-<hora>`) a `main` e os PRs, em ordem; um PR que
@@ -27,17 +30,18 @@
 # xtask, fora do git); FOLD_MIN (padrão 10).
 set -euo pipefail
 
-batch=0 fold=0
+batch=0 fold=0 watch=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --batch) batch=1 ;;
+    --watch) watch=1 ;;
     --fold) fold=1 ;;
     *) break ;;
   esac
   shift
 done
-[ $# -ge 1 ] || [ "$fold" = 1 ] ||
-  { echo "uso: scripts/land.sh [--batch] [--fold] [<pr>...]" >&2; exit 2; }
+[ $# -ge 1 ] || [ "$fold" = 1 ] || [ "$watch" = 1 ] ||
+  { echo "uso: scripts/land.sh [--watch | --batch] [--fold] [<pr>...]" >&2; exit 2; }
 
 root=$(git rev-parse --show-toplevel)
 base=${BASE:-main}
@@ -57,25 +61,34 @@ n_required=$(printf '%s\n' "$required" | grep -c . || true)
 # Espera os checks exigidos aparecerem e terminarem no commit `sha`. 0: verdes; 1: algum falhou
 # (nomes em $failed); 2: não terminou em 30 min.
 failed=""
+# Os checks exigidos no commit `sha`, uma consulta: 0 verdes; 1 algum falhou (nomes em $failed);
+# 3 ainda rodando. Toda execução de cada check conta (o portão rápido do PR e o completo que a
+# fila dispara têm os mesmos nomes).
+check_once() {
+  local sha=$1 runs pending=0 lines name
+  failed=""
+  runs=$(gh api "repos/$repo/commits/$sha/check-runs?per_page=100" \
+    --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion)"') || return 3
+  while IFS= read -r name; do
+    [ -z "$name" ] && continue
+    lines=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n')
+    if [ -z "$lines" ] || printf '%s\n' "$lines" | grep -qv $'\tcompleted\t'; then
+      pending=1
+    elif printf '%s\n' "$lines" | grep -qv $'\tcompleted\tsuccess$'; then
+      failed="$failed $name"
+    fi
+  done <<< "$required"
+  [ -n "$failed" ] && return 1
+  [ "$pending" = 0 ] && return 0
+  return 3
+}
+
 wait_checks() {
-  local sha=$1 runs pending
+  local sha=$1 r
   for _ in $(seq 1 180); do
-    runs=$(gh api "repos/$repo/commits/$sha/check-runs?per_page=100" \
-      --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion)"')
-    pending=0 failed=""
-    # Every run of each required check on this commit counts (the PR's fast gate and the full
-    # one the queue dispatches have the same names).
-    while IFS= read -r name; do
-      [ -z "$name" ] && continue
-      lines=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n')
-      if [ -z "$lines" ] || printf '%s\n' "$lines" | grep -qv $'\tcompleted\t'; then
-        pending=1
-      elif printf '%s\n' "$lines" | grep -qv $'\tcompleted\tsuccess$'; then
-        failed="$failed $name"
-      fi
-    done <<< "$required"
-    [ -n "$failed" ] && return 1
-    [ "$pending" = 0 ] && return 0
+    r=0
+    check_once "$sha" || r=$?
+    [ "$r" = 3 ] || return "$r"
     sleep 10
   done
   return 2
@@ -173,13 +186,21 @@ members=()
 
 # Monta a combinação `main` + PRs (os que entram limpos ficam em $members), faz o fold nela e roda o
 # CI completo uma vez. 0: verde; 1: vermelho; 2: ninguém entrou na combinação.
-test_combo() {
-  local n state cross branch head wt sha qb r=0
+# Monta numa worktree ($2) a combinação de `$1` (a main, ou a branch de um lote em andamento) com
+# os PRs, faz o fold, envia a branch `queue/batch-<hora>` e dispara o CI completo nela. Deixa em
+# $members os que entraram limpos, em $combo_sha/$combo_branch o resultado. 0: disparado; 2:
+# ninguém entrou; 1: docs/changes inválido. Quem fica de fora vai para SKIP (até a branch mudar).
+declare -A SKIP=()
+combo_sha="" combo_branch=""
+build_combo() {
+  local from=$1 name=$2 n state cross branch head wt
+  shift 2
   members=()
   git -C "$root" fetch --quiet origin "$base"
-  wt="$dir/batch"
+  case "$from" in origin/queue/*) git -C "$root" fetch --quiet origin "${from#origin/}" ;; esac
+  wt="$dir/$name"
   git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
-  git -C "$root" worktree add --quiet --detach "$wt" "origin/$base"
+  git -C "$root" worktree add --quiet --detach "$wt" "$from"
   cd "$wt"
   for n in "$@"; do
     read -r state cross branch head < <(pr_info "$n")
@@ -189,6 +210,7 @@ test_combo() {
     fi
     if ! refresh_if_conflicting "$n" "$branch"; then
       say "  #$n fora: conflito com a $base — a sessão dona resolve"
+      SKIP[$n]=$head
       continue
     fi
     git fetch --quiet origin "$branch"
@@ -201,27 +223,39 @@ test_combo() {
       HEADS[$n]=$head
     else
       say "  #$n fora: conflito com o lote em $conflicts— a sessão dona resolve"
+      SKIP[$n]=$head
     fi
   done
   if [ ${#members[@]} = 0 ]; then
     cd "$root"
     return 2
   fi
-  cargo xtask docs fold >/dev/null || {
+  if ! cargo xtask docs fold >/dev/null; then
     cd "$root"
     say "  docs/changes inválido na combinação (cargo xtask docs)"
     return 1
-  }
+  fi
   git add -A docs
   git commit --quiet -m "lote: consolida docs/changes" || true
-  sha=$(git rev-parse HEAD)
-  qb="queue/batch-$(date +%s)"
-  git push --quiet origin "HEAD:refs/heads/$qb"
-  gh workflow run ci.yml --ref "$qb" >/dev/null
-  say "== lote ${members[*]}: CI da combinação ($(git rev-parse --short HEAD))"
-  wait_checks "$sha" || r=$?
+  combo_sha=$(git rev-parse HEAD)
+  combo_branch="queue/batch-$(date +%s%N | cut -c1-13)"
+  git push --quiet origin "HEAD:refs/heads/$combo_branch"
+  gh workflow run ci.yml --ref "$combo_branch" >/dev/null
+  say "== lote ${members[*]}: CI da combinação ($(git rev-parse --short HEAD), sobre ${from#origin/})"
   cd "$root"
-  git push --quiet origin --delete "$qb" 2>/dev/null || true
+  return 0
+}
+
+drop_branch() {
+  [ -n "$1" ] && git push --quiet origin --delete "$1" 2>/dev/null || true
+}
+
+# Monta a combinação `main` + PRs e espera o CI. 0: verde; 1: vermelho; 2: ninguém entrou.
+test_combo() {
+  local r=0
+  build_combo "origin/$base" batch "$@" || return $?
+  wait_checks "$combo_sha" || r=$?
+  drop_branch "$combo_branch"
   return $r
 }
 
@@ -235,8 +269,11 @@ merge_members() {
       say "  #$n fora: o CI do próprio PR está vermelho (${failed:-tempo})"
       continue
     fi
-    squash "$n" "${HEADS[$n]}" || stop "$n" "o merge foi recusado"
-    say "  #$n entrou"
+    if squash "$n" "${HEADS[$n]}"; then
+      say "  #$n entrou"
+    else
+      say "  #$n fora: o merge foi recusado (a branch mudou?)"
+    fi
   done
 }
 
@@ -295,8 +332,89 @@ maybe_fold() {
   git worktree remove --force "$wt"
 }
 
+# PRs prontos: abertos, para a main, não rascunho, com o rótulo `fila`, fora dos que ficaram de
+# fora (SKIP) enquanto a branch deles não mudar.
+ready_prs() {
+  local n head
+  gh pr list --base "$base" --state open --label fila --limit 100 \
+    --json number,isDraft,headRefOid --jq '.[] | select(.isDraft | not) | "\(.number) \(.headRefOid)"' |
+    while read -r n head; do
+      [ "${SKIP[$n]:-}" = "$head" ] || printf '%s\n' "$n"
+    done
+}
+
+# --watch: fila contínua. A cada WATCH_TICK segundos pega os PRs prontos (rótulo `fila`):
+# - sem lote em andamento: monta um com todos e dispara o CI da combinação;
+# - com lote em andamento: os PRs novos entram num lote especulativo montado **em cima dele**, com
+#   o próprio CI, rodando ao mesmo tempo;
+# - lote verde: squash dos PRs; o especulativo (se houver) vira o lote em andamento, já com o CI
+#   adiantado — testou exatamente main + lote + PRs novos;
+# - lote vermelho: o especulativo é descartado e o lote passa pela bisseção (land_set).
+# Para depois de WATCH_IDLE segundos sem nada para fazer.
+watch() {
+  local tick=${WATCH_TICK:-20} max_idle=${WATCH_IDLE:-1800} idle=0 r n
+  local run=() run_sha="" run_branch="" spec=() spec_sha="" spec_branch="" ready=() new=()
+  gh label create fila --color 0E8A16 --description "Pronto para a fila de entrada" 2>/dev/null || true
+  say "fila contínua: rótulo 'fila', a cada ${tick}s"
+  while :; do
+    mapfile -t ready < <(ready_prs)
+    if [ -z "$run_sha" ] && [ ${#ready[@]} -gt 0 ]; then
+      if build_combo "origin/$base" batch "${ready[@]}"; then
+        run=("${members[@]}") run_sha=$combo_sha run_branch=$combo_branch
+      fi
+    elif [ -n "$run_sha" ] && [ -z "$spec_sha" ]; then
+      new=()
+      for n in "${ready[@]}"; do
+        case " ${run[*]} " in *" $n "*) ;; *) new+=("$n") ;; esac
+      done
+      if [ ${#new[@]} -gt 0 ] && build_combo "origin/$run_branch" spec "${new[@]}"; then
+        spec=("${members[@]}") spec_sha=$combo_sha spec_branch=$combo_branch
+        say "   (especulativo, sobre o lote ${run[*]})"
+      fi
+    fi
+    if [ -n "$run_sha" ]; then
+      r=0
+      check_once "$run_sha" || r=$?
+      case $r in
+        0)
+          members=("${run[@]}")
+          merge_members
+          drop_branch "$run_branch"
+          run=() run_sha="" run_branch=""
+          if [ -n "$spec_sha" ]; then
+            run=("${spec[@]}") run_sha=$spec_sha run_branch=$spec_branch
+            spec=() spec_sha="" spec_branch=""
+            say "   o especulativo ${run[*]} vira o lote em andamento"
+          fi
+          ;;
+        1)
+          say "  lote ${run[*]} vermelho (${failed}): especulativo descartado, bisseção"
+          drop_branch "$run_branch"
+          drop_branch "$spec_branch"
+          local again=("${run[@]}")
+          run=() run_sha="" run_branch="" spec=() spec_sha="" spec_branch=""
+          land_set "${again[@]}"
+          ;;
+      esac
+    fi
+    if [ -z "$run_sha" ] && [ ${#ready[@]} = 0 ]; then
+      idle=$((idle + tick))
+      if [ "$idle" -ge "$max_idle" ]; then
+        say "fila contínua: ${max_idle}s sem PR pronto, encerrando"
+        break
+      fi
+    else
+      idle=0
+    fi
+    sleep "$tick"
+  done
+}
+
 serial=("$@")
-if [ "$batch" = 1 ]; then
+if [ "$watch" = 1 ]; then
+  watch
+  serial=()
+elif [ "$batch" = 1 ]; then
   land_set "$@"
   serial=()
 fi
