@@ -1,0 +1,58 @@
+# Alerta de "main quebrada" (AGENTS.md, "`main` vermelha é prioridade zero").
+#
+# A proteção da main não exige branch atualizada (mais vazão), então dois PRs que passam sozinhos
+# podem quebrar juntos. O `ci` roda na main após cada merge; se ele falhar, este workflow abre (ou
+# comenta) a issue "main quebrada" com o link do log, e a fecha quando a main volta a ficar verde.
+
+name: main-red
+
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: main-red
+  cancel-in-progress: false
+
+jobs:
+  alert:
+    if: github.event.workflow_run.event == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      RUN_URL: ${{ github.event.workflow_run.html_url }}
+      SHA: ${{ github.event.workflow_run.head_sha }}
+      COMMIT_MSG: ${{ github.event.workflow_run.head_commit.message }}
+    steps:
+      - name: Abrir, comentar ou fechar a issue "main quebrada"
+        run: |
+          set -euo pipefail
+          label="main-quebrada"
+          gh label create "$label" --color B60205 \
+            --description "O CI da main falhou; prioridade zero" 2>/dev/null || true
+          open=$(gh issue list --label "$label" --state open --json number --jq '.[0].number // empty')
+          title_line=$(printf '%s' "$COMMIT_MSG" | head -n1)
+          short=${SHA:0:7}
+
+          if [ "$CONCLUSION" = "failure" ]; then
+            body="O \`ci\` falhou na \`main\` no commit \`${short}\` (${title_line}).
+
+          Log: ${RUN_URL}
+
+          Prioridade zero (AGENTS.md): corrigir numa branch \`stream/fix-main-<slug>\` ou reverter o PR culpado, antes de qualquer outra tarefa."
+            if [ -n "$open" ]; then
+              gh issue comment "$open" --body "$body"
+            else
+              gh issue create --title "main quebrada" --label "$label" --body "$body"
+            fi
+          elif [ "$CONCLUSION" = "success" ] && [ -n "$open" ]; then
+            gh issue close "$open" --comment "A \`main\` voltou a ficar verde no commit \`${short}\` (${RUN_URL})."
+          fi

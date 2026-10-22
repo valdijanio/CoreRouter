@@ -148,20 +148,32 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 
 ## Integração: sempre por Pull Request
 
-Nada entra na `main` sem PR com o CI verde. O repositório é privado no plano gratuito, então o
-GitHub não impõe isso: esta regra impõe.
+Nada entra na `main` sem PR com o CI verde. A proteção da `main` no GitHub impõe isso (PR
+obrigatório, os três checks do `ci`, vale para admin, sem force-push). Ela **não** exige que a
+branch esteja atualizada com a `main` (mais vazão); por isso o passo 3 traz a `main` antes do PR e
+a `main` vermelha tem prioridade (abaixo).
 
 1. Trabalhe numa branch `stream/<id>-<slug>`, nunca na `main`. Nunca faça commit nem push na `main`.
 2. Antes de cada commit: `cargo xtask ci`.
-3. Ao terminar: `git push -u origin <branch>` e
+3. Ao terminar: `git fetch origin && git merge origin/main` (merge, nunca rebase/force-push numa
+   branch com PR), `cargo xtask ci` de novo, `git push -u origin <branch>` e
    `gh pr create --base main --title "<id>: <resumo>"`. O corpo do PR diz o que mudou, como
    testar (comandos ou cliques), o id da gap e, em feature nova, a seção `## Pesquisa` (veja
    "Pesquisa antes de implementar").
 4. O workflow `ci` (`.github/workflows/ci.yml`) roda no PR. Vermelho? Leia o log
    (`gh run view --log-failed`), corrija na mesma branch e faça push de novo.
-5. O merge é do usuário (**Squash and merge**: um commit por gap na `main`). Agente só faz merge
-   com pedido explícito do usuário naquela conversa.
+5. Merge por **Squash and merge** (um commit por gap na `main`). O usuário aprovou mesclar quando
+   o CI passar: ligue `gh pr merge <n> --auto --squash`; se a checagem de permissão bloquear,
+   avise no relato (a sessão principal liga). Nunca faça merge direto de PR com CI pendente.
 6. Depois do merge, apague a branch local e a remota.
+
+### `main` vermelha é prioridade zero
+
+O CI roda na `main` após cada merge. Se falhar, o workflow `main-red` abre (ou atualiza) a issue
+**"main quebrada"** com o link do log e a fecha sozinho quando a `main` voltar a ficar verde.
+Enquanto ela estiver aberta: a próxima sessão que vir a issue (ou a sessão principal) corrige numa
+branch `stream/fix-main-<slug>` ou reverte o PR culpado (`git revert` num PR), antes de qualquer
+outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 
 ## Acesso root e testes de rede
 
@@ -184,6 +196,15 @@ GitHub não impõe isso: esta regra impõe.
   aditivas, e avise no PR.
 - Marque o item como `em andamento (<branch>)` em `docs/gaps.md` no primeiro commit.
 - Branch: `stream/<id-da-gap>-<slug>`, ex. `stream/G1.2-netlink-addresses`.
+- **Ids de gap vêm do brief ou da `main`.** Nunca invente um id: confira `docs/gaps.md` na
+  `origin/main` atualizada antes de registrar um item novo (já houve colisão de G1.20).
+- **Não abra outras sessões por conta própria.** Trabalho extra que você descobrir vira um item em
+  `docs/gaps.md` e uma sugestão no seu relato; quem decide abrir sessão é o usuário ou a sessão
+  principal (sessões não planejadas mexem nos mesmos arquivos e geram conflito).
+- **PRs pequenos e focados**: entram mais rápido e reduzem a janela de conflito. Feature grande
+  vira vários PRs sequenciais, um por sessão.
+- **Pontos quentes** (`crates/engine/src/session.rs`, `crates/engine/src/cmd/mod.rs`,
+  `crates/ui/src/lib.rs`): mudanças mínimas e aditivas; prefira arquivos novos no seu módulo.
 
 ## Progresso
 
