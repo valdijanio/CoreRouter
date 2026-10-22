@@ -18,7 +18,7 @@ use futures_util::TryStreamExt;
 use ipnet::IpNet;
 use rtnetlink::packet_route::address::AddressMessage;
 use rtnetlink::packet_route::link::{
-    InfoData, InfoKind, InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage,
+    InfoData, InfoKind, InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State,
 };
 use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
@@ -28,7 +28,12 @@ use rtnetlink::{
     RouteMessageBuilder,
 };
 
+use crate::owner::KernelLink;
 use crate::plan::{KernelRoute, LinkSpec, Op};
+
+/// Bound on one link dump (hostile input: a kernel with more links than
+/// this is not one CoreRouter can manage sensibly anyway).
+const MAX_LINKS: usize = 65_536;
 
 const ENOENT: i32 = 2;
 const ESRCH: i32 = 3;
@@ -49,6 +54,78 @@ pub(crate) fn apply(ops: &[Op]) -> Result<(), HalError> {
         return Ok(());
     }
     with_kernel(|k| async move { run(&k, ops).await })
+}
+
+/// Every link of the current network namespace (`RTM_GETLINK` dump): the
+/// same kernel `apply` writes to, so discovery and apply never disagree
+/// (sysfs shows the namespace that mounted `/sys`, not this one).
+pub(crate) fn links() -> Result<Vec<KernelLink>, HalError> {
+    with_kernel(|k| async move {
+        let mut s = k.handle.link().get().execute();
+        let mut out = Vec::new();
+        while let Some(m) = s
+            .try_next()
+            .await
+            .map_err(|e| HalError::Io(format!("listing links: {}", readable(&e))))?
+        {
+            if out.len() >= MAX_LINKS {
+                return Err(HalError::Io(format!("more than {MAX_LINKS} links")));
+            }
+            out.push(kernel_link(&m));
+        }
+        Ok(out)
+    })
+}
+
+/// A `RTM_NEWLINK` message as [`KernelLink`].
+fn kernel_link(m: &LinkMessage) -> KernelLink {
+    let flags = m.header.flags;
+    let mut l = KernelLink {
+        index: m.header.index,
+        arphrd: u16::from(m.header.link_layer_type),
+        up: flags.contains(LinkFlags::Up),
+        ..KernelLink::default()
+    };
+    let mut oper = None;
+    for a in &m.attributes {
+        match a {
+            LinkAttribute::IfName(n) => l.name.clone_from(n),
+            LinkAttribute::Mtu(v) => l.mtu = *v,
+            LinkAttribute::Controller(v) if *v != 0 => l.master = Some(*v),
+            LinkAttribute::LinkNetNsId(_) => l.peer_elsewhere = true,
+            LinkAttribute::OperState(st) => oper = Some(*st),
+            LinkAttribute::Address(mac) if mac.len() == 6 && mac.iter().any(|b| *b != 0) => {
+                l.mac = Some(
+                    mac.iter()
+                        .map(|b| format!("{b:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(":"),
+                );
+            }
+            LinkAttribute::Stats64(st) => {
+                l.rx_bytes = st.rx_bytes;
+                l.tx_bytes = st.tx_bytes;
+                l.rx_packets = st.rx_packets;
+                l.tx_packets = st.tx_packets;
+            }
+            LinkAttribute::LinkInfo(infos) => {
+                for i in infos {
+                    if let LinkInfo::Kind(k) = i {
+                        l.kind = Some(k.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Like `ip link`: dummy/loopback report UNKNOWN but carry traffic while
+    // up and with carrier (`IFF_LOWER_UP`).
+    l.running = match oper {
+        Some(State::Up) => true,
+        Some(State::Unknown) | None => l.up && flags.contains(LinkFlags::LowerUp),
+        Some(_) => false,
+    };
+    l
 }
 
 /// What the kernel of the current network namespace supports. A probe that

@@ -1,7 +1,8 @@
 //! The GUI in a browser: which router to manage (from the page URL) and the
 //! WebSocket backend that talks to it.
 //!
-//! - `?connect=ws://127.0.0.1:7980` — that daemon (`corerouter-daemon --ws`);
+//! - `?connect=ws://127.0.0.1:7980` — the connect screen with that daemon
+//!   (`corerouter-daemon --ws`) in "Connect to": a login is needed (G0.3);
 //! - `?lab` — the virtual lab, inside the page (nothing persists);
 //! - neither — the connect screen, with "Connect to" set to the daemon that
 //!   served the page (`ws(s)://<host>/ws`, the WebFig model with
@@ -11,6 +12,13 @@
 //!
 //! Browser events (open, message, close) only fill a queue; `poll` hands it
 //! to the UI on its next frame.
+//!
+//! G0.3: [`WsBackend`] sends `auth.login` first on every (re)connection and
+//! the session token with each request, never in the URL. The password
+//! stays in this tab's memory (to log in again after a reconnection or an
+//! expired token) and is never written to `localStorage`. A refused login
+//! stops the retries. TLS is the browser's: a page served over `https://`
+//! by `--ws-listen` talks `wss://` to the same port.
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -18,8 +26,14 @@ use std::rc::{Rc, Weak};
 
 use corerouter_engine::{Session, shared};
 use corerouter_ui::{
-    Backend, ConnectScreen, CoreRouterUi, Link, NeighborRow, Reply, RequestId, SavedRouter,
+    Backend, ConnectScreen, CoreRouterUi, Credentials, Link, NeighborRow, Reply, RequestId,
+    SavedRouter,
 };
+
+use crate::Connected;
+
+/// Id of the internal `auth.login` request (never handed out by `submit`).
+const LOGIN_ID: RequestId = RequestId::MAX;
 use eframe::wasm_bindgen::JsCast as _;
 use eframe::wasm_bindgen::closure::Closure;
 use serde_json::{Value, json};
@@ -30,8 +44,8 @@ const RETRY_MS: f64 = 2000.0;
 
 pub enum Choice {
     Lab,
-    Connect(String),
-    /// The connect screen; the WebSocket URL of the daemon that served the page.
+    /// The connect screen; the WebSocket URL of the daemon that served the
+    /// page, or the one given with `?connect=`.
     Screen(String),
 }
 
@@ -54,7 +68,7 @@ pub fn choice() -> Choice {
             return Choice::Lab;
         }
         if let Some(url) = q.get("connect").filter(|u| !u.is_empty()) {
-            return Choice::Connect(if url.contains("://") {
+            return Choice::Screen(if url.contains("://") {
                 url
             } else {
                 format!("ws://{url}")
@@ -89,11 +103,14 @@ pub fn connect_screen(home: String) -> (ConnectScreen, WebPlatform) {
     let mut screen = ConnectScreen::new(load_saved());
     screen.connect_to = home.clone();
     screen.set_source(format!(
-        "Neighbors of the router at {home} (ip.neighbor.list; a browser cannot listen \
-         for announcements itself)"
+        "Neighbors of the router at {home} (ip.neighbor.list, shown once logged in to it; \
+         a browser cannot listen for announcements itself)"
+    ));
+    screen.set_keyring(Err(
+        "a browser page never stores passwords; the browser's own password manager can".into(),
     ));
     let platform = WebPlatform {
-        home: WsBackend::new(home),
+        home: WsBackend::new(home, None),
         asked: None,
         asked_at: f64::NEG_INFINITY,
         rows: Vec::new(),
@@ -119,10 +136,11 @@ fn load_saved() -> Vec<SavedRouter> {
 fn neighbor_row(r: &Value) -> NeighborRow {
     let get = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
     let address = get("address");
-    let ws = r
-        .get("mgmt")
-        .and_then(|m| m.get("ws"))
-        .and_then(Value::as_u64);
+    let port = |k: &str| r.get("mgmt").and_then(|m| m.get(k)).and_then(Value::as_u64);
+    let (ws, wss) = (port("ws"), port("wss"));
+    let loopback = address
+        .parse::<std::net::IpAddr>()
+        .is_ok_and(|a| a.is_loopback());
     let host = if address.contains(':') {
         format!("[{address}]")
     } else {
@@ -143,13 +161,14 @@ fn neighbor_row(r: &Value) -> NeighborRow {
         version: get("version"),
         board: get("board"),
         uptime_secs: r.get("uptime_secs").and_then(Value::as_u64),
-        connect_to: ws
-            .filter(|_| !address.is_empty())
-            .map(|p| format!("ws://{host}:{p}/ws")),
-        // The WebSocket listens on loopback only until G0.3.
-        remote: !address
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|a| a.is_loopback()),
+        connect_to: match (wss, ws) {
+            _ if address.is_empty() => None,
+            (Some(p), _) => Some(format!("wss://{host}:{p}/ws")),
+            (None, Some(p)) => Some(format!("ws://{host}:{p}/ws")),
+            (None, None) => None,
+        },
+        // A plain WebSocket takes only its own machine; wss (G0.3) anyone.
+        remote: !loopback && wss.is_none(),
     }
 }
 
@@ -184,16 +203,27 @@ impl crate::Platform for WebPlatform {
         }
     }
 
-    fn connect(&mut self, addr: &str) -> Result<CoreRouterUi, String> {
+    fn connect(&mut self, creds: &Credentials) -> Result<Connected, String> {
+        let addr = creds.address.as_str();
         let url = ws_url(addr);
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
             return Err(format!(
                 "Connect to needs ws://HOST:PORT/ws or HOST:PORT, got '{addr}'"
             ));
         }
-        // Auth/TLS are G0.3: the daemon only listens on loopback.
-        log::info!("managing the router at {url}");
-        Ok(CoreRouterUi::with_backend(Box::new(WsBackend::new(url))))
+        if creds.user.is_empty() || creds.password.is_empty() {
+            return Err("Type a Login and Password (the router asks for them)".into());
+        }
+        log::info!("managing the router at {url} as {}", creds.user);
+        let login = (creds.user.clone(), creds.password.clone());
+        Ok(Connected::Ready(Box::new(CoreRouterUi::with_backend(
+            Box::new(WsBackend::new(url, Some(login))),
+        ))))
+    }
+
+    /// The browser checks certificates itself.
+    fn trust(&mut self, _: &str, _: &str) -> Result<(), String> {
+        Ok(())
     }
 
     fn lab(&mut self) -> CoreRouterUi {
@@ -218,15 +248,27 @@ struct State {
     dead: Option<Conn>,
     /// Sent on the socket, not answered yet.
     in_flight: BTreeSet<RequestId>,
-    /// Submitted while the socket was still opening.
-    outbox: Vec<(RequestId, String)>,
+    /// Submitted while the socket was opening or logging in.
+    outbox: Vec<(RequestId, String, Value)>,
     replies: Vec<Reply>,
     retry_at: f64,
+    /// User and password, kept in memory to log in on each connection.
+    login: Option<(String, String)>,
+    token: Option<String>,
+    /// `auth.login` sent, its answer not in yet.
+    logging_in: bool,
+    /// The router refused the login: no more retries.
+    refused: bool,
 }
 
 impl State {
-    fn send(&mut self, id: RequestId, text: &str) {
-        let sent = self.conn.as_ref().map(|c| c.ws.send_with_str(text));
+    fn send(&mut self, id: RequestId, method: &str, params: Value) {
+        let mut req = json!({"id": id, "method": method, "params": params});
+        if let (Some(t), Some(o)) = (&self.token, req.as_object_mut()) {
+            o.insert("token".into(), json!(t));
+        }
+        let text = req.to_string();
+        let sent = self.conn.as_ref().map(|c| c.ws.send_with_str(&text));
         match sent {
             Some(Ok(())) => {
                 self.in_flight.insert(id);
@@ -248,16 +290,18 @@ impl State {
             .chain(
                 std::mem::take(&mut self.outbox)
                     .into_iter()
-                    .map(|(id, _)| id),
+                    .map(|(id, _, _)| id),
             )
             .collect();
-        for id in waiting {
+        for id in waiting.into_iter().filter(|id| *id != LOGIN_ID) {
             self.replies.push((id, Err(msg.clone())));
         }
         self.link = Link::Disconnected {
             target: self.url.clone(),
             reason,
         };
+        self.logging_in = false;
+        self.token = None;
         self.retry_at = js_sys::Date::now() + RETRY_MS;
     }
 
@@ -265,8 +309,44 @@ impl State {
         self.link = Link::Connected {
             target: self.url.clone(),
         };
-        for (id, text) in std::mem::take(&mut self.outbox) {
-            self.send(id, &text);
+        if !self.log_in() {
+            self.flush();
+        }
+    }
+
+    /// Send `auth.login` when there are credentials; requests wait for it.
+    fn log_in(&mut self) -> bool {
+        let Some((user, password)) = self.login.clone() else {
+            return false;
+        };
+        self.token = None;
+        self.logging_in = true;
+        self.send(
+            LOGIN_ID,
+            "auth.login",
+            json!({"user": user, "password": password}),
+        );
+        true
+    }
+
+    fn flush(&mut self) {
+        for (id, method, params) in std::mem::take(&mut self.outbox) {
+            self.send(id, &method, params);
+        }
+    }
+
+    fn login_answer(&mut self, result: Result<Value, String>) {
+        self.logging_in = false;
+        match result {
+            Ok(v) => {
+                self.token = v.get("token").and_then(Value::as_str).map(str::to_owned);
+                self.flush();
+            }
+            Err(e) => {
+                // Retrying would only feed the router's brute-force limit.
+                self.refused = true;
+                self.lost(e);
+            }
         }
     }
 
@@ -289,6 +369,17 @@ impl State {
                 .unwrap_or("unknown error")
                 .to_owned())
         };
+        if id == LOGIN_ID {
+            return self.login_answer(result);
+        }
+        // The session expired: log in again for the next requests.
+        if result
+            .as_ref()
+            .is_err_and(|e| e.starts_with("unauthorized"))
+            && !self.logging_in
+        {
+            self.log_in();
+        }
         self.replies.push((id, result));
     }
 }
@@ -299,7 +390,8 @@ pub struct WsBackend {
 }
 
 impl WsBackend {
-    pub fn new(url: String) -> Self {
+    /// `login`: user and password sent with `auth.login` on each connection.
+    pub fn new(url: String, login: Option<(String, String)>) -> Self {
         let me = Self {
             state: Rc::new(RefCell::new(State {
                 link: Link::Connecting {
@@ -312,6 +404,10 @@ impl WsBackend {
                 outbox: Vec::new(),
                 replies: Vec::new(),
                 retry_at: 0.0,
+                login,
+                token: None,
+                logging_in: false,
+                refused: false,
             })),
             next: 0,
         };
@@ -377,12 +473,13 @@ impl Backend for WsBackend {
     fn submit(&mut self, method: &str, params: Value) -> RequestId {
         self.next = self.next.wrapping_add(1);
         let id = self.next;
-        let text = json!({"id": id, "method": method, "params": params}).to_string();
         let mut s = self.state.borrow_mut();
         let ready = s.conn.as_ref().map(|c| c.ws.ready_state());
         match ready {
-            Some(WebSocket::OPEN) => s.send(id, &text),
-            Some(WebSocket::CONNECTING) => s.outbox.push((id, text)),
+            Some(WebSocket::OPEN) if !s.logging_in => s.send(id, method, params),
+            Some(WebSocket::OPEN | WebSocket::CONNECTING) => {
+                s.outbox.push((id, method.to_owned(), params));
+            }
             _ => {
                 let why = match &s.link {
                     Link::Disconnected { reason, .. } => reason.clone(),
@@ -399,7 +496,7 @@ impl Backend for WsBackend {
         let retry = {
             let mut s = self.state.borrow_mut();
             s.dead = None;
-            s.conn.is_none() && js_sys::Date::now() >= s.retry_at
+            s.conn.is_none() && !s.refused && js_sys::Date::now() >= s.retry_at
         };
         if retry {
             self.connect();

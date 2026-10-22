@@ -30,7 +30,6 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use common::*;
-use corerouter_control::Client;
 use corerouter_engine::Session;
 use corerouter_hal::VirtualHal;
 use corerouter_storage_fs::FileStorage;
@@ -73,6 +72,8 @@ fn daemon(netns: Option<u32>, dir: &Path, log: &str) -> Kill {
     c.args(["--discovery-transport", "interfaces"]);
     c.args(["--control", "7979", "--config-dir"])
         .arg(dir)
+        .arg("--token-file")
+        .arg(common::token_file(netns, dir))
         .env("RUST_LOG", "info,corerouter_discovery=debug")
         .stdout(Stdio::null())
         .stderr(log);
@@ -169,7 +170,13 @@ fn exchange(v4: bool) {
     // A turns discovery off: its goodbye makes B forget it at once, well
     // before the hold time (4 × INTERVAL) would run out.
     let off = Instant::now();
-    let mut c = Client::connect(CONTROL, Duration::from_secs(1)).unwrap();
+    let mut c = common::client(
+        CONTROL,
+        std::fs::read_to_string(dir_a.join("local.token"))
+            .ok()
+            .map(|t| t.trim().to_owned()),
+    )
+    .unwrap();
     c.call(
         "engine.execute",
         json!({"command": "ip.neighbor.discovery.set", "params": {"enabled": false}}),

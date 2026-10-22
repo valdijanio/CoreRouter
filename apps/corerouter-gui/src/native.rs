@@ -5,22 +5,29 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use base64::Engine as _;
-use corerouter_control::{Client, Host, SharedHost, bind_loopback, spawn, spawn_clock};
+use corerouter_control::dial::local_token_hint;
+use corerouter_control::{
+    Client, Endpoint, Gate, Host, KnownHosts, Login, SharedHost, Target as RouterAddr,
+    UNAUTHORIZED, bind_loopback, local_token, spawn, spawn_clock,
+};
 use corerouter_discovery::{Heard, Listener};
 use corerouter_engine::{Session, shared};
-use corerouter_ui::{ConnectScreen, CoreRouterUi, NeighborRow, SavedRouter};
+use corerouter_ui::{ConnectScreen, CoreRouterUi, Credentials, NeighborRow, SavedRouter};
 use eframe::egui;
 use serde_json::{Value, json};
 
-use crate::remote::Remote;
-use crate::{GuiApp, Platform};
+use crate::remote::{Dialer, Remote};
+use crate::{Connected, GuiApp, Platform};
 
 const USAGE: &str = "\
-usage: corerouter-gui [--connect HOST:PORT] [--control <port>]
-                      [--discovery-port <port>] [--saved-list <file>]
+usage: corerouter-gui [--connect HOST:PORT | tls://HOST:PORT] [--user USER]
+                      [--control <port>] [--discovery-port <port>] [--saved-list <file>]
 
-  --connect HOST:PORT     manage a corerouter-daemon (its control port, e.g. 127.0.0.1:7979)
-                          right away; without it the GUI opens on the connect screen
+  --connect HOST:PORT     manage a corerouter-daemon right away: 127.0.0.1:PORT with the
+                          router's local token (same OS user), any other address over TLS
+                          with --user (password from $COREROUTER_PASSWORD, or typed on the
+                          connect screen); without it the GUI opens on the connect screen
+  --user USER             login name for --connect
   --control <port>        serve the control channel on 127.0.0.1:<port> (ui.screenshot;
                           once connected, every other method is passed on to the daemon)
   --discovery-port <port> UDP port the connect screen listens on for CRDP (default 7979)
@@ -38,9 +45,10 @@ enum Target {
     /// The connect screen: no router picked yet.
     Choosing,
     Local(SharedHost),
-    /// The daemon at `addr`; each control connection opens its own client.
+    /// The daemon behind `dialer`; each control connection opens its own
+    /// client, logged in as the window's user.
     Remote {
-        addr: String,
+        dialer: Box<Dialer>,
     },
 }
 
@@ -71,8 +79,9 @@ impl GuiHost {
             .clone()
     }
 
-    fn pass_on(&mut self, addr: &str, method: &str, params: &Value) -> Result<Value, String> {
-        let answer = self.ask_daemon(addr, method, params);
+    fn pass_on(&mut self, dialer: &Dialer, method: &str, params: &Value) -> Result<Value, String> {
+        let addr = dialer.target.to_string();
+        let answer = self.ask_daemon(dialer, method, params);
         if method != "server.info" {
             return answer;
         }
@@ -95,16 +104,26 @@ impl GuiHost {
         Ok(info)
     }
 
-    fn ask_daemon(&mut self, addr: &str, method: &str, params: &Value) -> Result<Value, String> {
+    fn ask_daemon(
+        &mut self,
+        dialer: &Dialer,
+        method: &str,
+        params: &Value,
+    ) -> Result<Value, String> {
         let client = match &mut self.proxy {
             Some(c) => c,
-            None => self.proxy.insert(Client::connect(addr, PROXY_TIMEOUT)?),
+            None => self.proxy.insert(dialer.dial_shared()?),
         };
         match client.request(method, params.clone()) {
+            // The window's session was renewed: use the new token next time.
+            Ok(Err(e)) if e.starts_with(UNAUTHORIZED) => {
+                self.proxy = None;
+                Err(e)
+            }
             Ok(answer) => answer,
             Err(e) => {
                 self.proxy = None;
-                Err(format!("{addr}: {e}"))
+                Err(format!("{}: {e}", dialer.target))
             }
         }
     }
@@ -117,7 +136,7 @@ impl Host for GuiHost {
     ) -> Result<Value, String> {
         match self.target() {
             Target::Local(mut h) => h.with_session(f),
-            Target::Remote { addr } => Err(format!("this GUI manages {addr}")),
+            Target::Remote { dialer } => Err(format!("this GUI manages {}", dialer.target)),
             Target::Choosing => Err(CHOOSING.into()),
         }
     }
@@ -125,7 +144,7 @@ impl Host for GuiHost {
     fn forward(&mut self, method: &str, params: &Value) -> Option<Result<Value, String>> {
         match self.target() {
             Target::Local(_) => None,
-            Target::Remote { addr } => Some(self.pass_on(&addr, method, params)),
+            Target::Remote { dialer } => Some(self.pass_on(&dialer, method, params)),
             // Still answer server.info, so clients that start with it can
             // take a screenshot of the connect screen.
             Target::Choosing if method == "server.info" => Some(Ok(json!({
@@ -191,22 +210,20 @@ const CHOOSING: &str = "the GUI is on its connect screen: no router picked yet";
 struct Args {
     control: Option<u16>,
     connect: Option<String>,
+    user: Option<String>,
     discovery_port: Option<u16>,
     saved_list: Option<PathBuf>,
 }
 
-/// `HOST:PORT` as `--connect` and the connect screen take it.
-fn check_addr(addr: &str) -> Result<(), String> {
-    if addr
-        .rsplit_once(':')
-        .is_none_or(|(h, p)| h.is_empty() || p.parse::<u16>().is_err())
-    {
-        return Err(format!(
-            "Connect to needs HOST:PORT (the router's control port, e.g. 127.0.0.1:7979), got '{}'",
+/// `HOST:PORT` or `tls://HOST:PORT` as `--connect` and the connect screen take it.
+fn check_addr(addr: &str) -> Result<RouterAddr, String> {
+    RouterAddr::parse(addr).map_err(|_| {
+        format!(
+            "Connect to needs HOST:PORT (e.g. 127.0.0.1:7979, or a router's TLS port \
+             10.0.0.1:8729), got '{}'",
             addr.chars().take(64).collect::<String>()
-        ));
-    }
-    Ok(())
+        )
+    })
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -224,6 +241,7 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
                     .map_err(|_| format!("--connect needs HOST:PORT, got '{addr}'"))?;
                 out.connect = Some(addr);
             }
+            "--user" => out.user = Some(args.next().ok_or("--user needs a name")?),
             "--discovery-port" => {
                 let port = args.next().ok_or("--discovery-port needs a port")?;
                 out.discovery_port = Some(port.parse().map_err(|_| format!("bad port '{port}'"))?);
@@ -254,23 +272,28 @@ pub fn main() -> ExitCode {
     };
     let ctx_slot = Arc::new(OnceLock::new());
     let target = Arc::new(Mutex::new(Target::Choosing));
-    let app = match &args.connect {
-        Some(addr) => match Remote::spawn(addr) {
-            Ok(remote) => {
-                // Auth/TLS are G0.3: only reach daemons over loopback or a tunnel.
-                log::info!("managing the router at {addr} (no authentication: G0.3)");
-                set_target(&target, Target::Remote { addr: addr.clone() });
-                GuiApp::router(CoreRouterUi::with_backend(Box::new(remote)))
-            }
-            Err(e) => {
-                eprintln!("cannot start the connection thread: {e}");
-                return ExitCode::FAILURE;
-            }
-        },
-        None => {
-            let (screen, platform) = NativePlatform::start(&args, Arc::clone(&target));
-            GuiApp::connect(screen, Box::new(platform))
+    let (mut screen, mut platform) = NativePlatform::start(&args, Arc::clone(&target));
+    // `--connect`: the same path as the Connect button, so a first TLS
+    // connection still asks about the certificate on the connect screen.
+    let mut ready = None;
+    if let Some(addr) = &args.connect {
+        screen.connect_to = addr.clone();
+        let creds = Credentials {
+            address: addr.clone(),
+            user: args.user.clone().unwrap_or_default(),
+            password: std::env::var("COREROUTER_PASSWORD").unwrap_or_default(),
+            remember: false,
+        };
+        screen.set_login(&creds.user);
+        match platform.connect(&creds) {
+            Ok(Connected::Ready(r)) => ready = Some(*r),
+            Ok(Connected::Trust(c, fp)) => screen.ask_trust(c, fp),
+            Err(e) => screen.set_error(e),
         }
+    }
+    let app = match ready {
+        Some(r) => GuiApp::router(r),
+        None => GuiApp::connect(screen, Box::new(platform)),
     };
 
     if let Some(port) = args.control {
@@ -279,7 +302,19 @@ pub fn main() -> ExitCode {
             proxy: None,
             ctx: Arc::clone(&ctx_slot),
         };
-        match bind_loopback(port).and_then(|l| spawn(l, host)) {
+        // Like the daemon: the local token, for the CLI/MCP of this OS user.
+        let gate = Gate::default();
+        match corerouter_control::auth::new_token() {
+            Ok(token) => {
+                gate.add_local_token(&token);
+                match local_token::create(port, &token) {
+                    Ok(path) => log::info!("local token for CLI/MCP: {}", path.display()),
+                    Err(e) => log::warn!("local token not written: {e}"),
+                }
+            }
+            Err(e) => log::warn!("no local token: {e}"),
+        }
+        match bind_loopback(port).and_then(|l| spawn(Endpoint::loopback(l), host, gate)) {
             Ok(_) => log::info!("control channel on 127.0.0.1:{port}"),
             Err(e) => {
                 eprintln!("cannot open control port {port}: {e}");
@@ -319,11 +354,30 @@ fn set_target(slot: &Mutex<Target>, target: Target) {
 }
 
 /// The connect screen on the desktop: neighbors heard directly on this
-/// machine's interfaces, saved list in a file.
+/// machine's interfaces, saved list in a file, passwords (when asked to
+/// remember) in the operating system's keyring.
 struct NativePlatform {
     listener: Option<Listener>,
     saved_path: Option<PathBuf>,
     target: Arc<Mutex<Target>>,
+    keyring: bool,
+}
+
+/// Keyring service name; the account is `user@address`.
+const KEYRING_SERVICE: &str = "corerouter";
+
+/// Whether the OS keyring answers at all (a probe entry that does not exist).
+fn keyring_probe() -> Result<String, String> {
+    let entry = keyring::Entry::new(KEYRING_SERVICE, "probe@corerouter")
+        .map_err(|e| format!("no secure password store: {e}"))?;
+    match entry.get_password() {
+        Ok(_) | Err(keyring::Error::NoEntry) => Ok("the system keyring".into()),
+        Err(e) => Err(format!("no secure password store: {e}")),
+    }
+}
+
+fn keyring_entry(address: &str, user: &str) -> Option<keyring::Entry> {
+    keyring::Entry::new(KEYRING_SERVICE, &format!("{user}@{address}")).ok()
 }
 
 impl NativePlatform {
@@ -331,6 +385,9 @@ impl NativePlatform {
         let saved_path = args.saved_list.clone().or_else(default_saved_path);
         let saved = saved_path.as_deref().map(load_saved).unwrap_or_default();
         let mut screen = ConnectScreen::new(saved);
+        let keyring = keyring_probe();
+        let has_keyring = keyring.is_ok();
+        screen.set_keyring(keyring);
         let port = args.discovery_port.unwrap_or(corerouter_discovery::PORT);
         let listener = match Listener::spawn(port) {
             Ok(l) => {
@@ -350,6 +407,7 @@ impl NativePlatform {
                 listener,
                 saved_path,
                 target,
+                keyring: has_keyring,
             },
         )
     }
@@ -372,19 +430,79 @@ impl Platform for NativePlatform {
         }
     }
 
-    fn connect(&mut self, addr: &str) -> Result<CoreRouterUi, String> {
-        check_addr(addr)?;
-        let remote =
-            Remote::spawn(addr).map_err(|e| format!("cannot start the connection thread: {e}"))?;
-        log::info!("managing the router at {addr} (no authentication: G0.3)");
+    fn connect(&mut self, creds: &Credentials) -> Result<Connected, String> {
+        let target = check_addr(&creds.address)?;
+        let addr = target.addr();
+        let login = if creds.user.is_empty() {
+            if target.tls {
+                return Err(format!(
+                    "{target} is reached over TLS: type a Login and Password"
+                ));
+            }
+            Login::Auto
+        } else {
+            let mut password = creds.password.clone();
+            if password.is_empty() && self.keyring {
+                password = keyring_entry(&addr, &creds.user)
+                    .and_then(|e| e.get_password().ok())
+                    .unwrap_or_default();
+            }
+            Login::Password {
+                user: creds.user.clone(),
+                password,
+            }
+        };
+        let fingerprint = if target.tls {
+            match KnownHosts::load_default().get(&addr) {
+                Some(fp) => Some(fp.to_owned()),
+                None => {
+                    // First time: look at the certificate, send nothing, ask.
+                    let c = Client::connect_tls(&addr, PROXY_TIMEOUT, None)
+                        .map_err(|e| format!("{target}: {e}"))?;
+                    let fp = c.fingerprint().unwrap_or_default().to_owned();
+                    return Ok(Connected::Trust(creds.clone(), fp));
+                }
+            }
+        } else {
+            None
+        };
+        let dialer = Dialer::new(target.clone(), login, fingerprint);
+        let mut client = dialer.dial()?;
+        if let Err(e) = client.call("auth.whoami", Value::Null) {
+            return Err(if e.starts_with(UNAUTHORIZED) && creds.user.is_empty() {
+                format!("{target}: {}", local_token_hint(target.port))
+            } else {
+                format!("{target}: {e}")
+            });
+        }
+        if creds.remember
+            && !creds.user.is_empty()
+            && !creds.password.is_empty()
+            && let Some(entry) = keyring_entry(&addr, &creds.user)
+            && let Err(e) = entry.set_password(&creds.password)
+        {
+            log::warn!("password not remembered: {e}");
+        }
+        let remote = Remote::spawn(dialer.clone(), Some(client))
+            .map_err(|e| format!("cannot start the connection thread: {e}"))?;
+        log::info!("managing the router at {target}");
         set_target(
             &self.target,
             Target::Remote {
-                addr: addr.to_owned(),
+                dialer: Box::new(dialer),
             },
         );
         self.listener = None;
-        Ok(CoreRouterUi::with_backend(Box::new(remote)))
+        Ok(Connected::Ready(Box::new(CoreRouterUi::with_backend(
+            Box::new(remote),
+        ))))
+    }
+
+    fn trust(&mut self, address: &str, fingerprint: &str) -> Result<(), String> {
+        let target = check_addr(address)?;
+        KnownHosts::load_default()
+            .remember(&target.addr(), fingerprint)
+            .map_err(|e| format!("cannot save the known hosts file: {e}"))
     }
 
     fn lab(&mut self) -> CoreRouterUi {
@@ -430,7 +548,7 @@ fn heard_row(h: &Heard) -> NeighborRow {
         board: a.board.clone(),
         uptime_secs: uptime,
         connect_to: h.connect_to(),
-        remote: !h.local,
+        remote: !h.reachable(),
     }
 }
 
@@ -510,9 +628,23 @@ mod tests {
     fn control_port_passes_methods_on_to_the_daemon() {
         let daemon = bind_loopback(0).unwrap();
         let addr = daemon.local_addr().unwrap().to_string();
-        spawn(daemon, SharedHost(shared(Session::virtual_lab()))).unwrap();
+        let gate = Gate::default();
+        gate.add_local_token(&"ab".repeat(32));
+        spawn(
+            Endpoint::loopback(daemon),
+            SharedHost(shared(Session::virtual_lab())),
+            gate,
+        )
+        .unwrap();
+        let dialer = Dialer::new(
+            RouterAddr::parse(&addr).unwrap(),
+            Login::Token("ab".repeat(32)),
+            None,
+        );
         let mut host = GuiHost {
-            target: Arc::new(Mutex::new(Target::Remote { addr })),
+            target: Arc::new(Mutex::new(Target::Remote {
+                dialer: Box::new(dialer),
+            })),
             proxy: None,
             ctx: Arc::new(OnceLock::new()),
         };
@@ -561,6 +693,7 @@ mod tests {
             address: "127.0.0.1:7979".into(),
             group: "lab".into(),
             comment: String::new(),
+            user: "admin".into(),
         }];
         write_saved(&path, &list).unwrap();
         assert_eq!(load_saved(&path), list);
@@ -577,7 +710,13 @@ mod tests {
         let addr = gone.local_addr().unwrap().to_string();
         drop(gone);
         let mut host = GuiHost {
-            target: Arc::new(Mutex::new(Target::Remote { addr })),
+            target: Arc::new(Mutex::new(Target::Remote {
+                dialer: Box::new(Dialer::new(
+                    RouterAddr::parse(&addr).unwrap(),
+                    Login::Auto,
+                    None,
+                )),
+            })),
             proxy: None,
             ctx: Arc::new(OnceLock::new()),
         };

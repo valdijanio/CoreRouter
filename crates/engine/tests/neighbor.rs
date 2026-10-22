@@ -21,7 +21,7 @@ fn heard(iface: &str, node: &str, protocol: NeighborProtocol, at: u64) -> Neighb
         remote_interface: Some("ether9".into()),
         mgmt: Some(MgmtPorts {
             control: Some(7979),
-            ws: None,
+            ..MgmtPorts::default()
         }),
         last_seen: at,
         hold_secs: 120,

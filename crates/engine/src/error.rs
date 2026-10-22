@@ -11,6 +11,8 @@ pub enum EngineError {
     },
     #[error("command '{id}' is disabled: {reason}")]
     Disabled { id: String, reason: String },
+    #[error("permission denied for '{id}': {reason}")]
+    Denied { id: String, reason: String },
     #[error("unknown parameter '{param}'{}", hint(.suggestion))]
     UnknownParam {
         param: String,

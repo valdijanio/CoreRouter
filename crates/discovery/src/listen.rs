@@ -42,13 +42,27 @@ pub struct Heard {
 
 impl Heard {
     /// `HOST:PORT` of its control channel, as `--connect` takes it: loopback
-    /// for a router on this machine, else its first announced IPv4, else
-    /// the packet source (with the scope of a link-local address).
+    /// for a router on this machine, else (G0.3) `tls://` + its first
+    /// announced IPv4 (or the packet source, with the scope of a link-local
+    /// address) and its TLS port; without one, the plain port, which only
+    /// its own machine may use.
     pub fn connect_to(&self) -> Option<String> {
-        let port = self.announcement.control_port?;
         if self.local {
+            let port = self.announcement.control_port?;
             return Some(format!("127.0.0.1:{port}"));
         }
+        if let Some(tls) = self.announcement.tls_port {
+            return self.remote_addr(tls).map(|a| format!("tls://{a}"));
+        }
+        self.remote_addr(self.announcement.control_port?)
+    }
+
+    /// The router can be managed from this machine (TLS port, or local).
+    pub fn reachable(&self) -> bool {
+        self.local || self.announcement.tls_port.is_some()
+    }
+
+    fn remote_addr(&self, port: u16) -> Option<String> {
         if let Some((v4, _)) = self.announcement.ipv4.first() {
             return Some(format!("{v4}:{port}"));
         }

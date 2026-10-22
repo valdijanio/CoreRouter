@@ -78,6 +78,7 @@ impl Local {
                 "has_ui": true,
             })),
             "engine.list" => Ok(s.list()),
+            "auth.whoami" => Ok(json!({"user": "local", "group": "full", "via": "local"})),
             "engine.execute" => {
                 let id = params
                     .get("command")

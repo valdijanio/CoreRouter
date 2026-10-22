@@ -74,6 +74,8 @@ fn run(transport: Transport, id: u8) {
             node_id: NodeId([id; 16]),
             control_port: Some(7981),
             ws_port: None,
+            tls_port: None,
+            wss_port: None,
             board: "test".into(),
             transport,
         },

@@ -23,11 +23,16 @@ const MAX_NAME: usize = 253;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "tool.ping.start", "Ping", ["Tools", "Ping"], None,
-        "{address: string|[string] (1..16 IPs or DNS names), count?: int 0..1000000 (0 = until stopped), interval_ms?: int 10..60000, timeout_ms?: int 10..10000, size?: int 28..65535 (whole IP packet), ttl?: int 1..255, dscp?: int 0..63, do_not_fragment?: bool, src_address?: ip, interface?: string, routing_table?: string} → {task_id, targets}",
-        can_start, ping_start),
+        "{address: string|[string] (1..16 IPs or DNS names), count?: int 0..1000000 (0 = until stopped), interval_ms?: int 10..60000, timeout_ms?: int 10..10000, size?: int 28..65535 (whole IP packet), ttl?: int 1..255, dscp?: int 0..63, do_not_fragment?: bool, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, targets, columns}",
+        can_start, ping_start)
+    .alias("ping")
+    .positional("address")
+    .task(),
     cmd!(query "tool.ping.mtu", "Discover MTU", ["Tools", "Ping"], None,
-        "{address: string, max_size?: int 28..65535 (default 1500), timeout_ms?: int 10..10000, retries?: int 1..5, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string} → {task_id}",
-        can_start, ping_mtu),
+        "{address: string, max_size?: int 28..65535 (default 1500), timeout_ms?: int 10..10000, retries?: int 1..5, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, columns}",
+        can_start, ping_mtu)
+    .positional("address")
+    .task(),
     cmd!(query "tool.task.list", "Tasks", [], None,
         "{} → [{id, kind, title, state: running|done|stopped|failed, reason, owner, events, age_secs}]",
         always, task_list),
@@ -226,7 +231,13 @@ fn ping_start(s: &mut Session, p: &Value) -> Result<Value> {
         ping::run(job, prober.as_ref(), ctx)
     })?;
     let names: Vec<&str> = targets.iter().map(|t| t.input.as_str()).collect();
-    Ok(json!({ "task_id": id, "targets": names }))
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "targets": names,
+        // Event fields in RouterOS column order, for terminals.
+        "columns": ["icmp_seq", "host", "size", "ttl", "rtt_ms", "status", "detail"],
+    }))
 }
 
 fn ping_mtu(s: &mut Session, p: &Value) -> Result<Value> {
@@ -254,7 +265,11 @@ fn ping_mtu(s: &mut Session, p: &Value) -> Result<Value> {
     let id = s.start_task("mtu", title("mtu", &targets), move |ctx| {
         mtu::run(job, prober.as_ref(), ctx)
     })?;
-    Ok(json!({ "task_id": id }))
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "columns": ["size", "payload", "rtt_ms", "status", "mtu"],
+    }))
 }
 
 fn task_list(s: &mut Session, _: &Value) -> Result<Value> {
