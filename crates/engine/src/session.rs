@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use corerouter_hal::{Hal, VirtualHal};
-use corerouter_model::{Config, ConfigStore, Interface, InterfaceKind, Users, persist};
+use corerouter_model::{Config, ConfigStore, Interface, InterfaceKind, User, Users, persist};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -463,12 +463,62 @@ impl Session {
     }
 
     /// The stored hash of an enabled account, for the login check (which
-    /// runs outside the session lock: Argon2 is slow on purpose).
+    /// runs outside the session lock: Argon2 is slow on purpose). `None`
+    /// for an unknown or disabled account, or one without a password.
     pub fn password_hash(&self, user: &str) -> Option<String> {
         self.users
             .get(user)
             .filter(|u| !u.disabled)
-            .map(|u| u.password_hash.clone())
+            .and_then(|u| u.password_hash.clone())
+    }
+
+    /// An enabled account that has no password (G0.3b): it logs in with an
+    /// empty one, from loopback only.
+    pub fn has_no_password(&self, user: &str) -> bool {
+        self.users
+            .get(user)
+            .is_some_and(|u| !u.disabled && u.password_hash.is_none())
+    }
+
+    /// Enabled accounts of group `full` without a password. While there is
+    /// one, the control channel refuses logins from the network.
+    pub fn admins_without_password(&self) -> Vec<String> {
+        self.users.admins_without_password()
+    }
+
+    /// Start-up only, never a command: with no account at all, create
+    /// `admin` (group full) **without a password**, as RouterOS does; with
+    /// `reset`, also take `admin`'s password away again (re-enabled, group
+    /// full; its sessions end). The operator sets one on the first login
+    /// (`user.set`). Returns what was done, `None` when nothing was.
+    pub fn bootstrap_admin(&mut self, reset: bool) -> Option<&'static str> {
+        let first = self.users.is_empty();
+        if !first && !reset {
+            return None;
+        }
+        let mut users = self.users.clone();
+        let mut admin = users.get("admin").cloned().unwrap_or_else(|| User {
+            name: "admin".into(),
+            group: Group::Full,
+            password_hash: None,
+            disabled: false,
+            comment: String::new(),
+        });
+        admin.group = Group::Full;
+        admin.disabled = false;
+        admin.password_hash = None;
+        if users.get("admin").is_none() && users.len() >= corerouter_model::users::MAX_USERS {
+            log::error!("cannot create user 'admin': the user list is full");
+            return None;
+        }
+        users.put(admin);
+        self.set_users(users);
+        self.logins.end_user("admin");
+        Some(if first {
+            "first start: created user 'admin' (group full) without a password"
+        } else {
+            "--reset-admin-password: user 'admin' has no password again"
+        })
     }
 
     /// A login succeeded (control channel): shown by `user.active.list`.
@@ -490,6 +540,13 @@ impl Session {
 
     pub(crate) fn logins_end_user(&mut self, user: &str) {
         self.logins.end_user(user);
+    }
+
+    /// End `user`'s sessions except the caller's own (a user who changes
+    /// their own password stays logged in, as in RouterOS).
+    pub(crate) fn logins_end_others(&mut self, user: &str) {
+        let me = self.caller.name.clone();
+        self.logins.end_user_except(user, &me);
     }
 
     pub fn logins(&self) -> &[Login] {

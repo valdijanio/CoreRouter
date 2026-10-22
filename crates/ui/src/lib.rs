@@ -9,6 +9,7 @@ mod avail;
 pub mod backend;
 pub mod connect;
 mod dialog;
+mod first_login;
 mod float;
 mod interfaces;
 mod neighbors;
@@ -183,6 +184,8 @@ pub(crate) enum Then {
     },
     /// A tool task started (Tools › Ping).
     Tool(ping::ToolReq),
+    /// The first-login "Set a password" dialog's `user.set` (G0.3b).
+    Password,
 }
 
 pub struct CoreRouterUi {
@@ -224,6 +227,8 @@ pub struct CoreRouterUi {
     terminals: Vec<terminal::TermWin>,
     /// The user the terminals' prompt shows.
     terminal_user: String,
+    /// First login without a password: the dialog (G0.3b).
+    password_ask: first_login::PasswordAsk,
 }
 
 impl CoreRouterUi {
@@ -265,6 +270,7 @@ impl CoreRouterUi {
             exports: Vec::new(),
             terminals: Vec::new(),
             terminal_user: "admin".into(),
+            password_ask: first_login::PasswordAsk::default(),
         }
     }
 
@@ -490,6 +496,7 @@ impl CoreRouterUi {
             Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
             Then::Vrf { id, effect } => self.vrf_dialog_reply(id, effect, result),
             Then::Tool(req) => self.tool_started(req, result),
+            Then::Password => self.password_reply(result),
         }
     }
 
@@ -619,6 +626,7 @@ impl CoreRouterUi {
         self.refresh(now);
         self.tools_tick(ui.ctx(), now);
         self.pump();
+        self.first_login_tick();
         let wake = if self.pending.is_empty() {
             Duration::from_secs_f64(REFRESH_SECS)
         } else {
@@ -695,6 +703,7 @@ impl CoreRouterUi {
         self.route_dialogs(&ctx, area);
         self.vrf_dialogs(&ctx, area);
         self.terminals(&ctx, area);
+        self.password_window(&ctx);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -758,6 +767,7 @@ impl CoreRouterUi {
         ui.horizontal(|ui| {
             self.link_label(ui);
             self.user_label(ui);
+            self.no_password_warning(ui);
             // Nothing heard from the router yet: no empty fields.
             if !known {
                 return;

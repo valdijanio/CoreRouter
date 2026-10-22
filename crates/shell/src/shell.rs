@@ -113,6 +113,17 @@ pub struct Shell {
     live: Vec<Line>,
     /// Ctrl+C while a job runs: a task being followed is stopped.
     interrupted: bool,
+    /// The first-login question (G0.3b): set a password for this account.
+    ask: Option<Ask>,
+}
+
+/// "Set a password for admin" after a login while an account of group full
+/// has none (RouterOS 7 asks the same). The lines typed meanwhile are
+/// passwords: front ends hide them and keep them out of the history.
+struct Ask {
+    user: String,
+    /// The first entry, waiting for the repeat.
+    first: Option<String>,
 }
 
 fn reply(replies: &[Reply], i: usize) -> Reply {
@@ -189,7 +200,20 @@ impl Shell {
             cache: BTreeMap::new(),
             live: Vec::new(),
             interrupted: false,
+            ask: None,
         }
+    }
+
+    /// The terminal is asking for a new password (G0.3b): the front end
+    /// hides what is typed and keeps it out of the history.
+    pub fn asking_password(&self) -> bool {
+        self.ask.is_some()
+    }
+
+    /// Drop the first-login question without a word (a script on stdin
+    /// cannot answer it).
+    pub fn skip_password(&mut self) {
+        self.ask = None;
     }
 
     pub fn registry(&self) -> &Registry {
@@ -207,6 +231,14 @@ impl Shell {
     /// `[admin@CoreRouter] /ip/address>` (RouterOS v7's prompt); `<SAFE>`
     /// takes the place of `>` while this connection holds Safe Mode.
     pub fn prompt(&self) -> Vec<Span> {
+        if let Some(a) = &self.ask {
+            let text = if a.first.is_some() {
+                "Repeat new password: ".to_owned()
+            } else {
+                format!("New password for {}: ", a.user)
+            };
+            return Line::styled(Style::Plain, text).0;
+        }
         let identity = if self.identity.is_empty() {
             "router"
         } else {
@@ -298,6 +330,7 @@ impl Shell {
         let reqs = vec![
             Request::call("server.info", Value::Null),
             Request::call("engine.list", Value::Null),
+            Request::call("auth.whoami", Value::Null),
         ];
         Job::new(Next::Send(
             reqs,
@@ -312,6 +345,8 @@ impl Shell {
                 }
                 let list = reply(&replies, 1);
                 sh.apply_list(list.as_ref().ok());
+                // An older router without auth.whoami: no question.
+                let me = reply(&replies, 2).unwrap_or(Value::Null);
                 let mut out = Output::default();
                 for e in [info.err(), list.err()].into_iter().flatten() {
                     out.lines.push(Line::styled(Style::Error, e));
@@ -320,7 +355,7 @@ impl Shell {
                 chain(
                     sh,
                     next,
-                    Box::new(|sh, mut out| {
+                    Box::new(move |sh, mut out| {
                         out.lines.push(
                             Line::new()
                                 .with(Style::Header, format!("CoreRouter {}", sh.version))
@@ -330,11 +365,92 @@ impl Shell {
                             Style::Dim,
                             "Tab completes, ? or F1 shows help, Ctrl+X toggles Safe Mode, /quit leaves.",
                         ));
+                        sh.first_login(&me, &mut out);
                         Next::Done(out)
                     }),
                 )
             }),
         ))
+    }
+
+    /// After the banner: when `auth.whoami` lists accounts of group full
+    /// without a password, warn and ask for one (the logged-in user's own,
+    /// else the first listed).
+    fn first_login(&mut self, me: &Value, out: &mut Output) {
+        let missing: Vec<&str> = me
+            .get("no_password")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        let mine = me.get("user").and_then(Value::as_str);
+        let Some(user) = missing
+            .iter()
+            .find(|u| Some(**u) == mine)
+            .or(missing.first())
+        else {
+            return;
+        };
+        let user: String = user.chars().take(64).collect();
+        out.lines.push(Line::styled(
+            Style::Error,
+            format!(
+                "User {user} has no password: anyone on this machine can manage the router, \
+                 and logins from the network are refused until it has one."
+            ),
+        ));
+        out.lines.push(Line::styled(
+            Style::Dim,
+            "Set it now (empty line: not now).",
+        ));
+        self.ask = Some(Ask { user, first: None });
+    }
+
+    /// A line typed while [`Self::asking_password`].
+    fn answer_password(&mut self, line: &str) -> Next {
+        let Some(mut ask) = self.ask.take() else {
+            return Next::Done(Output::default());
+        };
+        if line.is_empty() {
+            return Next::Done(Output::lines(vec![Line::styled(
+                Style::Dim,
+                format!(
+                    "Not now. Set it later with /user set {} password=…",
+                    ask.user
+                ),
+            )]));
+        }
+        let Some(first) = ask.first.take() else {
+            ask.first = Some(line.to_owned());
+            self.ask = Some(ask);
+            return Next::Done(Output::default());
+        };
+        if first != line {
+            self.ask = Some(ask);
+            return Next::Done(Output::error(
+                "The passwords differ; type it again (empty line: not now).",
+            ));
+        }
+        let user = ask.user.clone();
+        Next::Send(
+            vec![Request::execute(
+                "user.set",
+                json!({"name": user, "password": line}),
+            )],
+            Box::new(move |sh, replies| match reply(&replies, 0) {
+                Ok(_) => Next::Done(Output::lines(vec![Line::styled(
+                    Style::Dim,
+                    format!("Password set for {}.", ask.user),
+                )])),
+                Err(e) => {
+                    sh.ask = Some(ask);
+                    Next::Done(Output::error(format!(
+                        "{e} — type another (empty line: not now)."
+                    )))
+                }
+            }),
+        )
     }
 
     fn apply_list(&mut self, list: Option<&Value>) {
@@ -482,6 +598,9 @@ impl Shell {
             ))));
         }
         let input = input.trim_end_matches(['\n', '\r']);
+        if self.ask.is_some() {
+            return Job::new(self.answer_password(input));
+        }
         if input.contains('\n') {
             return Job::new(self.import_text(input));
         }

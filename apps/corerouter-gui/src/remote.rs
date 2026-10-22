@@ -204,6 +204,7 @@ impl Backend for Remote {
 /// A login the router refused: retrying cannot help.
 fn refused(e: &str) -> bool {
     e.contains(corerouter_control::auth::INVALID_LOGIN)
+        || e.contains(corerouter_control::auth::NO_PASSWORD_REMOTE)
         || e.contains("too many failed logins")
         || e.contains("CHANGED")
         || e.contains("not trusted")

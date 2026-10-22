@@ -177,6 +177,27 @@ pub fn mask_secrets(v: &Value) -> Value {
     }
 }
 
+/// The answer to `auth.whoami` (control channel, and the UI's in-process
+/// lab): user, group, how it is connected and, for group `full`, the
+/// accounts of group full without a password (G0.3b).
+pub fn whoami(s: &crate::Session, principal: &Principal, via: &str) -> Value {
+    let group = s.group_of(principal);
+    let mut out = serde_json::json!({
+        "user": principal.label(),
+        "group": group,
+        "via": via,
+    });
+    if group == Some(Group::Full)
+        && let Some(o) = out.as_object_mut()
+    {
+        o.insert(
+            "no_password".into(),
+            Value::from(s.admins_without_password()),
+        );
+    }
+    out
+}
+
 /// One logged-in session, for `user.active.list` (no token here: the
 /// control channel keeps those).
 #[derive(Debug, Clone, Serialize)]
@@ -230,6 +251,11 @@ impl Logins {
 
     pub(crate) fn end_user(&mut self, user: &str) {
         self.list.retain(|l| l.user != user);
+    }
+
+    /// [`Self::end_user`], keeping the logins made over `via`.
+    pub(crate) fn end_user_except(&mut self, user: &str, via: &str) {
+        self.list.retain(|l| l.user != user || l.via == via);
     }
 }
 

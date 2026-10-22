@@ -214,7 +214,17 @@ legenda `Flags:` e coluna de flags. Diferenças conscientes: `where` com `~` = c
 sem `from`, `follow`, `interval`, `file` no `print`; sem busca Ctrl+R de menus; sem o "hijack"
 interativo do Safe Mode (o engine diz quem segura; `force=yes` em `exit`/`cancel` libera ou desfaz).
 
+## Primeiro login sem senha (G0.3b)
+
+Ao conectar, o terminal pede `auth.whoami`. Se o roteador listar uma conta `full` sem senha
+(`no_password`, o `admin` de um roteador novo), ele avisa e pergunta `New password for admin:` e
+`Repeat new password:`, como o RouterOS 7. Essas linhas não aparecem (a CLI lê sem eco, a janela
+New Terminal mascara) e não entram no histórico; linha vazia é "agora não". A senha vai pelo
+`user.set` normal; erro do engine (curta demais) pergunta de novo. Com a entrada vinda de um
+script (`echo … | corerouter-cli shell`) a pergunta é pulada.
+
 ## Histórico de revisão
 
 - 2026-10-22 — criado (G0.8: terminal na GUI e na CLI, export/import; SSH pendente do G0.3).
 - 2026-10-22 — atalhos (`alias`), parâmetro posicional e acompanhamento de tarefas ao vivo a partir de metadados do registro; custo em requisições reduzido.
+- 2026-10-22 — G0.3b: pergunta da senha no primeiro login.

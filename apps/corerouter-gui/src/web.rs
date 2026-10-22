@@ -211,8 +211,10 @@ impl crate::Platform for WebPlatform {
                 "Connect to needs ws://HOST:PORT/ws or HOST:PORT, got '{addr}'"
             ));
         }
-        if creds.user.is_empty() || creds.password.is_empty() {
-            return Err("Type a Login and Password (the router asks for them)".into());
+        // An empty password is fine: a new router's admin has none, and the
+        // router accepts that only from this machine (G0.3b).
+        if creds.user.is_empty() {
+            return Err("Type a Login (and the Password, if the account has one)".into());
         }
         log::info!("managing the router at {url} as {}", creds.user);
         let login = (creds.user.clone(), creds.password.clone());

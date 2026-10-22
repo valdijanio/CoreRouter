@@ -207,9 +207,14 @@ impl CoreRouterUi {
             return;
         }
         let mut echo = Line(t.shell.prompt());
-        echo.0.extend(t.shell.highlight(line));
-        t.print([echo]);
-        t.remember(line);
+        if t.shell.asking_password() {
+            // A password (first login, G0.3b): never shown, never kept.
+            t.print([echo]);
+        } else {
+            echo.0.extend(t.shell.highlight(line));
+            t.print([echo]);
+            t.remember(line);
+        }
         t.browse = None;
         let job = t.shell.submit(line);
         self.term_start(n, job);
@@ -465,6 +470,8 @@ impl CoreRouterUi {
         let mut help = false;
         let mut escape = false;
         let mut interrupt = false;
+        // Typing a password (first login): only Enter means something.
+        let asking = t.shell.asking_password();
         if focused {
             ui.input_mut(|i| {
                 submit = i.consume_key(Modifiers::NONE, Key::Enter);
@@ -490,13 +497,16 @@ impl CoreRouterUi {
                 i.events.retain(|e| !matches!(e, egui::Event::Cut));
                 safe = before != i.events.len() || i.consume_key(Modifiers::COMMAND, Key::X);
                 let quotes_open = t.input.matches('"').count() % 2 == 1;
-                if !quotes_open {
+                if !quotes_open && !asking {
                     let before = i.events.len();
                     i.events
                         .retain(|e| !matches!(e, egui::Event::Text(s) if s == "?"));
                     help = before != i.events.len();
                 }
                 help |= f1;
+                if asking {
+                    (tab, hist, safe, help) = (false, None, false, false);
+                }
             });
         }
 
@@ -557,6 +567,7 @@ impl CoreRouterUi {
         }
 
         let mut input = t.input.clone();
+        let secret = t.shell.asking_password();
         let shell_ref = &t.shell;
         let mut layouter = |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
             let mut job = job_of(ui, &shell_ref.highlight(text.as_str()), &font);
@@ -569,16 +580,18 @@ impl CoreRouterUi {
             if busy {
                 ui.weak("…");
             }
-            ui.add(
-                TextEdit::singleline(&mut input)
-                    .id(iid)
-                    .font(TextStyle::Monospace)
-                    .frame(egui::Frame::NONE)
-                    .desired_width(f32::INFINITY)
-                    .lock_focus(true)
-                    .return_key(None)
-                    .layouter(&mut layouter),
-            )
+            let edit = TextEdit::singleline(&mut input)
+                .id(iid)
+                .font(TextStyle::Monospace)
+                .frame(egui::Frame::NONE)
+                .desired_width(f32::INFINITY)
+                .lock_focus(true)
+                .return_key(None);
+            if secret {
+                ui.add(edit.password(true))
+            } else {
+                ui.add(edit.layouter(&mut layouter))
+            }
         });
         let edit = row.inner;
         let bottom = (ui.min_rect().bottom() - bottom_top).max(16.0);

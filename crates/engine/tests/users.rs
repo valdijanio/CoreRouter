@@ -223,6 +223,80 @@ fn active_logins_are_listed_and_end_with_the_account() {
 }
 
 #[test]
+fn first_start_admin_has_no_password_until_set() {
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    assert!(s.bootstrap_admin(false).unwrap().contains("first start"));
+    assert!(s.bootstrap_admin(false).is_none(), "only once");
+    assert_eq!(s.admins_without_password(), ["admin"]);
+    assert!(s.has_no_password("admin") && s.password_hash("admin").is_none());
+    let list = s.execute("user.list", &json!({})).unwrap();
+    assert_eq!(list[0]["no_password"], true);
+    assert_eq!(list[0]["group"], "full");
+    // Survives a restart as "no password", not as a hash of "".
+    let mut again = boot(&storage);
+    assert!(again.bootstrap_admin(false).is_none());
+    assert!(again.has_no_password("admin"));
+    // The admin sets one on the first login, from its own session: that
+    // session stays, the others of admin end.
+    let me = Caller::new(7, "tcp 127.0.0.1:4000").with_principal(Principal::User("admin".into()));
+    let mine = s.login_begin("admin", "tcp 127.0.0.1:4000");
+    let other = s.login_begin("admin", "ws 127.0.0.1:9");
+    s.execute_as(
+        &me,
+        "user.set",
+        &json!({"name": "admin", "password": SECRET}),
+    )
+    .unwrap();
+    assert!(s.login_touch(mine), "the caller stays logged in");
+    assert!(!s.login_touch(other));
+    assert!(s.admins_without_password().is_empty());
+    assert!(!s.has_no_password("admin"));
+    let list = s.execute("user.list", &json!({})).unwrap();
+    assert_eq!(list[0]["no_password"], false);
+    // No command takes a password away.
+    let e = s
+        .execute("user.set", &json!({"name": "admin", "password": ""}))
+        .unwrap_err();
+    assert!(e.to_string().contains("at least"), "{e}");
+}
+
+#[test]
+fn reset_admin_password_clears_it_again() {
+    let (mut s, _) = with_team();
+    s.execute(
+        "user.set",
+        &json!({"name": "admin", "group": "read", "disabled": true}),
+    )
+    .ok();
+    let l = s.login_begin("admin", "tcp 127.0.0.1:1");
+    assert!(s.bootstrap_admin(false).is_none(), "users exist: nothing");
+    assert!(
+        s.bootstrap_admin(true)
+            .unwrap()
+            .contains("no password again")
+    );
+    assert!(s.has_no_password("admin"));
+    assert_eq!(
+        s.group_of(&Principal::User("admin".into())),
+        Some(corerouter_engine::auth::Group::Full)
+    );
+    assert!(!s.login_touch(l), "old sessions end");
+    // The others keep their passwords.
+    assert!(s.password_hash("op").is_some());
+    // No admin at all yet (renamed away): reset creates it.
+    let storage = MemoryStorage::default();
+    let mut t = boot(&storage);
+    t.execute(
+        "user.add",
+        &json!({"name": "root", "group": "full", "password": SECRET}),
+    )
+    .unwrap();
+    assert!(t.bootstrap_admin(true).is_some());
+    assert!(t.has_no_password("admin") && t.password_hash("root").is_some());
+}
+
+#[test]
 fn reset_like_the_daemon() {
     let (mut s, _) = with_team();
     s.execute(

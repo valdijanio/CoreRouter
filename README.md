@@ -18,7 +18,14 @@ claude mcp add corerouter -- corerouter-cli mcp  # MCP
 Web (requer `cargo install trunk --locked`): `cd apps/corerouter-gui && trunk build`, depois
 `cargo run -p corerouter-daemon -- --ws 7980 --web-root apps/corerouter-gui/dist` e abra
 http://127.0.0.1:7980 (a GUI servida pelo roteador, como o WebFig). Só a demo no navegador:
-`trunk serve` e abra http://127.0.0.1:8080/?lab. Sem autenticação até o G0.3: tudo só em loopback.
+`trunk serve` e abra http://127.0.0.1:8080/?lab.
+
+Primeiro acesso (como o RouterOS 7): o daemon cria o usuário `admin` **sem senha**. Entre como
+`admin` com a senha vazia a partir da própria máquina (GUI em `127.0.0.1`, ou
+`corerouter-cli shell`); a GUI e o terminal pedem para definir uma senha logo ao entrar ("Not
+now" pula). Enquanto o `admin` estiver sem senha, todo login pela rede (`--listen`,
+`--ws-listen`) é recusado. Esqueceu a senha? `corerouter-daemon --reset-admin-password` volta
+ao estado sem senha. Detalhes em [docs/control-protocol.md](docs/control-protocol.md).
 
 Leia primeiro: [AGENTS.md](AGENTS.md), [docs/architecture.md](docs/architecture.md),
 [docs/gaps.md](docs/gaps.md), [docs/mcp.md](docs/mcp.md),

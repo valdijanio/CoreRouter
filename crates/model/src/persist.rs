@@ -226,7 +226,7 @@ mod tests {
         users.put(User {
             name: "admin".into(),
             group: Group::Full,
-            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into(),
+            password_hash: Some("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".into()),
             disabled: false,
             comment: String::new(),
         });
