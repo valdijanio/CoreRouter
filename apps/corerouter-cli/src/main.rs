@@ -19,6 +19,8 @@ use corerouter_engine::Session;
 use corerouter_mcp::{Backend, Headless, Remote};
 use serde_json::{Value, json};
 
+mod shell;
+
 const USAGE: &str = "\
 usage: corerouter-cli <command> [--connect HOST:PORT | tls://HOST:PORT]
                       [--user USER] [--fingerprint SHA256:...]
@@ -28,8 +30,10 @@ usage: corerouter-cli <command> [--connect HOST:PORT | tls://HOST:PORT]
   inspect [path]              state summary, or one subtree (interfaces, routing.bgp, running.ip, journal)
   screenshot <out.png>        save the GUI window (needs --connect to corerouter-gui --control)
   mcp [--headless]            MCP server on stdio; default tries 127.0.0.1:7979, then headless
+  shell                       RouterOS-style terminal (/ip address print; Tab, ?, Ctrl+X); see docs/terminal.md;
+                              the prompt shows the logged-in user
 
-Without --connect, list/run/inspect use a fresh in-process virtual lab (nothing persists).
+Without --connect, list/run/inspect/shell use a fresh in-process virtual lab (nothing persists).
 
   --connect HOST:PORT     127.0.0.1:PORT uses the router's local token file (same OS user);
                           any other address is TLS (tls:// is implied), with --user
@@ -82,6 +86,17 @@ fn real_main() -> Result<(), String> {
         Some(addr) => Box::new(remote(addr, &auth, true)?),
         None => Box::new(Headless::new(Session::virtual_lab())),
     };
+    if cmd == "shell" {
+        // The prompt shows who the router says we are (G0.3), else the OS user.
+        let user = backend
+            .call("auth.whoami", Value::Null)
+            .ok()
+            .and_then(|w| w.get("user").and_then(Value::as_str).map(str::to_owned))
+            .or_else(|| auth.user.clone())
+            .or_else(|| std::env::var("USER").ok())
+            .unwrap_or_else(|| "admin".into());
+        return shell::run(backend.as_mut(), &user);
+    }
     let result = match cmd.as_str() {
         "list" => {
             let prefix = pos.next().unwrap_or_default();

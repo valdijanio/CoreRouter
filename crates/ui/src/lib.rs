@@ -15,6 +15,7 @@ mod neighbors;
 mod prefs;
 mod routes;
 mod table;
+mod terminal;
 mod vrf;
 mod windows;
 
@@ -141,7 +142,14 @@ impl Tables {
 /// What a reply is for.
 enum Pending {
     Query(Field),
-    Action { command: String, then: Then },
+    Action {
+        command: String,
+        then: Then,
+    },
+    /// A call of a terminal window's job.
+    Terminal {
+        term: u64,
+    },
 }
 
 /// What to do when an action's reply arrives.
@@ -185,6 +193,10 @@ pub struct CoreRouterUi {
     /// What the router can run now (rebuilt when `engine.list`,
     /// `server.info` or the link change); every action asks it.
     can: Arc<avail::Avail>,
+    /// "New Terminal" windows.
+    terminals: Vec<terminal::TermWin>,
+    /// The user the terminals' prompt shows.
+    terminal_user: String,
 }
 
 impl CoreRouterUi {
@@ -222,7 +234,14 @@ impl CoreRouterUi {
             vrf_dialogs: Vec::new(),
             open_vrf_after: Vec::new(),
             can,
+            terminals: Vec::new(),
+            terminal_user: "admin".into(),
         }
+    }
+
+    /// The user shown in the terminals' prompt (`[user@identity]`).
+    pub fn set_terminal_user(&mut self, user: impl Into<String>) {
+        self.terminal_user = user.into();
     }
 
     pub fn open(&mut self, win: Win) {
@@ -324,6 +343,7 @@ impl CoreRouterUi {
         match self.pending.remove(&id) {
             None => {}
             Some(Pending::Query(field)) => self.on_query(field, id, result),
+            Some(Pending::Terminal { term }) => self.term_reply(term, id, result),
             Some(Pending::Action { command, then }) => {
                 let message = match &result {
                     Ok(v) => v.to_string(),
@@ -617,6 +637,7 @@ impl CoreRouterUi {
         self.dialogs(&ctx, area);
         self.route_dialogs(&ctx, area);
         self.vrf_dialogs(&ctx, area);
+        self.terminals(&ctx, area);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -821,6 +842,13 @@ impl CoreRouterUi {
     fn menu(&mut self, ui: &mut egui::Ui) {
         ui.add_space(4.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if ui
+                .selectable_label(false, "New Terminal")
+                .on_hover_text("RouterOS-style terminal: /ip address print, Tab, ?, Ctrl+X")
+                .clicked()
+            {
+                self.new_terminal();
+            }
             for (group, items) in windows::MENU {
                 match items {
                     [only] if only.title() == *group => self.menu_item(ui, *only),
@@ -1007,6 +1035,7 @@ mod tests {
     fn every_window_renders_headless() {
         let mut app = CoreRouterUi::new(shared(Session::virtual_lab()));
         app.open_all();
+        app.new_terminal();
         let ctx = egui::Context::default();
         for _ in 0..3 {
             ctx.run_ui(egui::RawInput::default(), |ui| app.ui(ui))
@@ -1426,6 +1455,7 @@ mod tests {
     }
 
     mod dialog_keys;
+    mod terminal;
 
     #[test]
     fn rows_select_with_click_ctrl_shift_and_keys() {

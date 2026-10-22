@@ -30,6 +30,7 @@ corerouter-mcp = { path = "crates/mcp" }
 corerouter-storage-fs = { path = "crates/storage-fs" }
 corerouter-discovery = { path = "crates/discovery" }
 corerouter-ui = { path = "crates/ui" }
+corerouter-shell = { path = "crates/shell" }
 
 # External: heavy crates enter with default-features = false.
 serde = { version = "1.0.229", features = ["derive"] }
@@ -48,6 +49,8 @@ tungstenite = { version = "0.30.0", default-features = false, features = ["hands
 # SIGINT/SIGTERM for the daemon's graceful shutdown: `flag::register` (safe API, unix and
 # Windows; the iterator is unix-only).
 signal-hook = { version = "0.3.18", default-features = false }
+# Line editor of `corerouter-cli shell` (history file, completion, colors, key handlers).
+rustyline = { version = "19.0.0", default-features = false, features = ["custom-bindings", "with-file-history"] }
 # G0.3: password hashes (Argon2id, pure Rust; salt from the OS, not from `rand`).
 argon2 = { version = "0.5.3", default-features = false, features = ["alloc", "password-hash"] }
 getrandom = "0.3.4"

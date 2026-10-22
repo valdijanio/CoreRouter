@@ -6,15 +6,24 @@ use super::args::opt_text;
 use super::{CommandSpec, always};
 use crate::{EngineError, Result, Session};
 
-pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(
-    "system.identity.set",
-    "Identity",
-    ["System", "Identity"],
-    None,
-    "{name: string} → {name}",
-    always,
-    identity_set
-)];
+pub(super) const COMMANDS: &[CommandSpec] = &[
+    cmd!(
+        "system.identity.set",
+        "Identity",
+        ["System", "Identity"],
+        None,
+        "{name: string} → {name}",
+        always,
+        identity_set
+    ),
+    cmd!(query "system.identity.get", "Identity", [], None,
+        "{} → {name}",
+        always, identity_get),
+];
+
+fn identity_get(s: &mut Session, _: &Value) -> Result<Value> {
+    Ok(json!({ "name": s.store().candidate().system.identity }))
+}
 
 fn identity_set(s: &mut Session, p: &Value) -> Result<Value> {
     let name = opt_text(p, "name", 64)?.unwrap_or_default();

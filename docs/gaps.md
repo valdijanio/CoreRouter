@@ -20,7 +20,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G0.5 | Fuzzing | engine, control, mcp | `cargo-fuzz` para JSON de config, `read_line_bounded`, `handle_message`; rodada de 10 min sem crash | 6 h | aberto |
 | G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa. Feito: `model::persist` (JSON `format_version` 1), trait `engine::ConfigStorage`, crate `storage-fs` (L4), `corerouter-daemon --config-dir` | 6 h | feito (`stream/G0.6-persistence`) |
 | G0.7 | MCP completo | mcp | resources (`corerouter://state`, `command/{id}`), prompts, completions, progresso/cancelamento, erro `-32003` (motor ocupado) | 10 h | aberto |
-| G0.8 | CLI interativa estilo RouterOS | cli, engine | `/ip address add address=… interface=…` traduzido para comandos; autocompletar a partir do registro | 10 h | aberto |
+| G0.8 | Terminal estilo RouterOS (GUI, CLI, SSH) | shell (novo), ui, cli, engine | Sintaxe RouterOS gerada do registro (menu = prefixo do id, `list`→`print`, `snake_case`→`kebab-case`), contexto, abreviação, Tab, `?`/F1, `print` com flags/`where`/`detail`/`as-json`, itens por número da última `print` ou `*id`, `/export` determinístico em ordem de dependências e `/import`/colar como `engine.batch` atômico, Ctrl+X Safe Mode; tudo por `engine.*`. Feito: crate `corerouter-shell` (L4, puro, wasm), janela New Terminal, `corerouter-cli shell` (rustyline), `system.identity.get`; `docs/terminal.md`. **SSH pendente do G0.3**: `corerouter-daemon --ssh <porta>` com `russh` e os usuários do G0.3, segundo PR | 10 h | feito (`stream/G0.8-terminal`); SSH pendente do G0.3 |
 
 ## Fase 1 — Core / Interfaces
 
@@ -120,4 +120,5 @@ leitura, o formato público do MNDP para enxergar MikroTiks numa rede mista.
 - 2026-10-22 — G1.17 (cores dos comentários: azul no ativo, cinza no desativado, inline e coluna) adicionado e feito.
 - 2026-10-22 — G5.5 (despedida da descoberta no encerramento do daemon por SIGINT/SIGTERM) adicionado e feito.
 - 2026-10-22 — G1.18 (descoberta via netlink e posse dos links no `hal-linux`) adicionado e feito; G1.7 feito junto; nota nova em G1.3.
+- 2026-10-22 — G0.8 feito (terminal RouterOS na GUI e na CLI, export/import); SSH pendente do G0.3.
 - 2026-10-22 — G0.3 feito (autenticação, usuários/grupos e TLS no canal de controle e no WebSocket).
