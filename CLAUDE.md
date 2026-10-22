@@ -245,9 +245,22 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   - testes de UI de uma feature: `crates/ui/src/tests/<feature>.rs` (descoberto), não no fim do
     `mod tests` do `lib.rs`;
   - teste em namespace: `tests/netns<nome>.rs` em qualquer pacote — o `cargo xtask netns`
-    descobre; não há lista para editar.
-- **Pontos quentes que restam** (`crates/engine/src/session.rs`, `crates/hal/src/lib.rs`,
-  `crates/model/src/lib.rs`): mudanças mínimas e aditivas; prefira arquivos novos no seu módulo.
+    descobre; não há lista para editar;
+  - módulo novo no engine, no model ou no mcp: só o arquivo `src/<nome>.rs` (ou
+    `src/<nome>/mod.rs`) — o `build.rs` gera os `pub mod` (`build-support/root_modules.rs`);
+    **não edite** a lista do `lib.rs`. Atributo do módulo vai dentro dele (`#![doc(hidden)]`).
+    Não acrescente `pub use` na raiz: use o caminho (`corerouter_model::bonding::BondMode`);
+  - estado de execução de uma feature no `Session`: `s.ext_mut::<SeuTipo>()` /
+    `s.ext::<SeuTipo>()` (`crates/engine/src/ext.rs`); **não acrescente campo** ao `Session`;
+  - serviço novo no daemon (thread de rede, opção de linha de comando): um arquivo
+    `apps/corerouter-daemon/src/service/<nome>.rs` com `pub(crate) const SERVICE: Service`
+    (opções e `start`); **não edite** o `main.rs` do daemon;
+  - módulo do kernel que o CI completo precisa carregar: um arquivo
+    `ci/kernel-modules/<módulo>` com a variável que ele liga; **não edite** o `ci.yml`.
+  Medido na rodada de 7 agentes (2026-10-22): 5 de 6 conflitos eram linha acrescentada no fim
+  dessas listas; listas geradas zeraram os conflitos na simulação (`docs/perf.md`).
+- **Pontos quentes que restam** (`crates/hal/src/lib.rs`, `crates/model/src/config.rs`):
+  mudanças mínimas e aditivas; prefira arquivos novos no seu módulo.
 
 ## Progresso
 

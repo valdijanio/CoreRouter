@@ -247,6 +247,22 @@ pub fn query(addr: SocketAddr, wait: Duration) -> Result<(Packet, Sample), Query
     }
 }
 
+
+/// No flags: configured with `system.ntp.client.*`.
+pub(crate) const SERVICE: super::Service = super::Service {
+    name: "ntp client",
+    flags: &[],
+    start,
+};
+
+/// A router without it still forwards: a failure is logged, not fatal.
+fn start(ctx: &super::Ctx) -> Result<(), String> {
+    if let Err(e) = spawn(ctx.session.clone(), corerouter_proto_ntp::PORT) {
+        log::error!("NTP client is off: cannot start its thread: {e}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
