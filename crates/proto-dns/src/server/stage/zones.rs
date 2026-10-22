@@ -67,7 +67,7 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
                     })
                     .collect();
                 if q.recursion_desired() && !addrs.is_empty() {
-                    q.forward_to = Some(addrs);
+                    q.forward_to = Some(crate::resolver::Upstreams::plain(addrs));
                     return Step::Next;
                 }
                 r.authoritative = false;
