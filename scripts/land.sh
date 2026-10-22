@@ -61,26 +61,27 @@ n_required=$(printf '%s\n' "$required" | grep -c . || true)
 # Espera os checks exigidos aparecerem e terminarem no commit `sha`. 0: verdes; 1: algum falhou
 # (nomes em $failed); 2: não terminou em 30 min.
 failed=""
-# Os checks exigidos no commit `sha`, uma consulta: 0 verdes; 1 algum falhou (nomes em $failed);
-# 3 ainda rodando. Toda execução de cada check conta (o portão rápido do PR e o completo que a
-# fila dispara têm os mesmos nomes).
+# O CI do commit `sha`, uma consulta: 0 verde; 1 vermelho; 3 ainda rodando (ou nenhum run ainda).
+# Todo run do `ci` nesse commit conta (o portão rápido do PR e o completo que a fila dispara).
 check_once() {
-  local sha=$1 runs pending=0 lines name
+  local sha=$1 runs
   failed=""
-  runs=$(gh api "repos/$repo/commits/$sha/check-runs?per_page=100" \
-    --jq '.check_runs[] | "\(.name)\t\(.status)\t\(.conclusion)"') || return 3
-  while IFS= read -r name; do
-    [ -z "$name" ] && continue
-    lines=$(printf '%s\n' "$runs" | awk -F'\t' -v n="$name" '$1 == n')
-    if [ -z "$lines" ] || printf '%s\n' "$lines" | grep -qv $'\tcompleted\t'; then
-      pending=1
-    elif printf '%s\n' "$lines" | grep -qv $'\tcompleted\tsuccess$'; then
-      failed="$failed $name"
-    fi
-  done <<< "$required"
-  [ -n "$failed" ] && return 1
-  [ "$pending" = 0 ] && return 0
-  return 3
+  # Fonte: os runs do workflow `ci` desse commit (Actions), não os check-runs: o GitHub já deixou
+  # um check-run "in_progress" para sempre num job que tinha terminado verde (2026-10-22, lote
+  # do #94), e a fila ficou esperando. Todos os runs do commit têm de terminar; um vermelho
+  # reprova.
+  runs=$(gh api "repos/$repo/actions/runs?head_sha=$sha&per_page=30" \
+    --jq '.workflow_runs[] | select(.name == "ci") | "\(.status) \(.conclusion)"') || return 3
+  [ -n "$runs" ] || return 3
+  if printf '%s\n' "$runs" | grep -qv '^completed '; then
+    return 3
+  fi
+  if printf '%s\n' "$runs" | grep -qE ' (failure|timed_out|startup_failure|action_required)$'; then
+    failed=" ci"
+    return 1
+  fi
+  printf '%s\n' "$runs" | grep -q ' success$' || return 3
+  return 0
 }
 
 wait_checks() {
