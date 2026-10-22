@@ -41,6 +41,7 @@ pub fn header(kind: &str) -> Option<String> {
             "{:>5} {:>3} {:<40} {:<10} STATUS",
             "ROUND", "HOP", "ADDRESS", "TIME"
         )),
+        "cable-test" => Some(format!("{:<4} {:<20} DISTANCE", "PAIR", "STATUS")),
         _ => None,
     }
 }
@@ -106,6 +107,17 @@ pub fn line(kind: &str, ev: &Value) -> String {
         )
         .trim_end()
         .to_owned(),
+        "cable-test" => format!(
+            "{:<4} {:<20} {}",
+            s(ev, "pair"),
+            s(ev, "status"),
+            ev.get("distance_m")
+                .and_then(Value::as_f64)
+                .map(|d| format!("{d:.1}m"))
+                .unwrap_or_default()
+        )
+        .trim_end()
+        .to_owned(),
         _ => ev.to_string(),
     }
 }
@@ -159,6 +171,13 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
                 })
                 .collect()
         }
+        // RouterOS: `cable-pairs: open:4,open:4,open:4,open:4`.
+        "cable-test" => vec![format!(
+            "{}: {} cable-pairs: {}",
+            s(summary, "name"),
+            s(summary, "status"),
+            s(summary, "cable_pairs")
+        )],
         "mtu" => vec![match summary.get("mtu").and_then(Value::as_u64) {
             Some(m) => format!(
                 "{}: path MTU {m} bytes (ICMP payload {}), {} probes",

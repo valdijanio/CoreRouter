@@ -62,6 +62,72 @@ pub struct Interface {
     /// interface is a bridge port or a VRF member, never both).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vrf: Option<IfName>,
+    /// Link settings of a physical port (`interface.ethernet.set`, G1.20).
+    #[serde(default, skip_serializing_if = "EthernetSettings::is_empty")]
+    pub ethernet: EthernetSettings,
+}
+
+/// What `interface.ethernet.set` changed on a port (RouterOS
+/// `/interface ethernet set`). Every field is optional: `None` (or a key
+/// missing from `offloads`) leaves the driver's own setting alone, so a
+/// config without this section changes nothing on the NIC. Taking a value
+/// out again puts back what the port had before CoreRouter changed it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EthernetSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub auto_negotiation: Option<bool>,
+    /// Forced rate in Mb/s; only with `auto_negotiation: false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speed_mbps: Option<u32>,
+    /// Forced duplex; only with `auto_negotiation: false`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub full_duplex: Option<bool>,
+    /// Link modes advertised while auto-negotiating, kernel names
+    /// (`1000baseT/Full`), sorted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub advertise: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rx_flow_control: Option<FlowControl>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tx_flow_control: Option<FlowControl>,
+    /// Offloads by kernel feature name (`rx-gro`): on or off.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub offloads: BTreeMap<String, bool>,
+}
+
+impl EthernetSettings {
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// Something that renegotiates the link (and drops it for a moment).
+    pub fn touches_link(&self, other: &Self) -> bool {
+        self.auto_negotiation != other.auto_negotiation
+            || self.speed_mbps != other.speed_mbps
+            || self.full_duplex != other.full_duplex
+            || self.advertise != other.advertise
+    }
+}
+
+/// RouterOS `rx-flow-control` / `tx-flow-control`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FlowControl {
+    Off,
+    On,
+    /// Resolved with the link partner during auto-negotiation.
+    Auto,
+}
+
+impl FlowControl {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::On => "on",
+            Self::Auto => "auto",
+        }
+    }
 }
 
 fn default_mtu() -> u16 {
@@ -79,6 +145,7 @@ impl Interface {
             comment: String::new(),
             bridge: None,
             vrf: None,
+            ethernet: EthernetSettings::default(),
         }
     }
 }

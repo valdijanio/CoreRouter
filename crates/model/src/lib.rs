@@ -18,8 +18,8 @@ pub mod users;
 pub mod validate;
 
 pub use config::{
-    AddressEntry, BgpInstance, Config, DEFAULT_DISTANCE, Interface, InterfaceKind, Ip, RouteEntry,
-    Routing, System,
+    AddressEntry, BgpInstance, Config, DEFAULT_DISTANCE, EthernetSettings, FlowControl, Interface,
+    InterfaceKind, Ip, RouteEntry, Routing, System,
 };
 pub use dhcp_client::{AddDefaultRoute, AllowedServer, DhcpClient, ExtraOption};
 pub use firewall::{Firewall, FirewallRule, Table};

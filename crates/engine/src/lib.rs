@@ -8,6 +8,7 @@ pub mod auth;
 pub mod cmd;
 pub mod dhcp6_client;
 pub mod dhcp_client;
+pub mod dom_watch;
 pub mod error;
 pub mod firewall_dyn;
 pub mod guard;

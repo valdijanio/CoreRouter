@@ -1157,6 +1157,7 @@ dependencies = [
  "corerouter-model",
  "criterion",
  "ipnet",
+ "proptest",
  "serde",
  "thiserror 2.0.21",
 ]

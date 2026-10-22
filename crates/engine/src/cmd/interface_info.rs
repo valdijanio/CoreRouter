@@ -16,7 +16,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.ethernet.monitor", "Ethernet Monitor", [], None,
-        "{name: string} → {name, available, reason, status (link-ok | no-link), auto_negotiation (done | incomplete | disabled), rate, speed_mbps, full_duplex, autoneg, port, mdix, mdix_ctrl, supported_modes, advertising, link_partner_advertising, rx_flow_control, tx_flow_control, flow_control_autoneg, carrier_changes, link_downs, down_reason, last_link_up_time, last_link_down_time, watching_since, now, notes}",
+        "{name: string} → {name, available, reason, status (link-ok | no-link), auto_negotiation (done | incomplete | disabled), rate, speed_mbps, full_duplex, autoneg, port, mdix, mdix_ctrl, supported_modes, advertising, link_partner_advertising, rx_flow_control, tx_flow_control, flow_control_autoneg, carrier_changes, link_downs, down_reason, last_link_up_time, last_link_down_time, watching_since, now, configured: {auto_negotiation, speed_mbps, full_duplex, advertise, rx_flow_control, tx_flow_control, offloads}, sfp: null | {module_present, kind, spec, connector, compliance, cable, nominal_rate_mbd, vendor_name, vendor_oui, vendor_part_number, vendor_revision, vendor_serial, manufacturing_date, wavelength_nm, link_length: [{medium, meters}], rx_loss, tx_fault, checksum_ok, dom: [{name, lane, value, unit, limits: {high_alarm, high_warning, low_warning, low_alarm}, level (ok | low-warning | high-warning | low-alarm | high-alarm)}], alerts: [string], notes}, sfp_reason, notes}",
         always, monitor)
     .positional("name"),
     cmd!(query "interface.hardware", "Interface Hardware", [], None,
@@ -76,6 +76,11 @@ fn monitor(s: &mut Session, p: &Value) -> Result<Value> {
         st.as_ref().is_some_and(|l| l.running)
     };
     let times = s.links.get(&name).copied();
+    let (sfp, sfp_reason) = if available {
+        sfp(s, &name)
+    } else {
+        (Value::Null, reason.clone())
+    };
     let auto = match (m.autoneg, link_ok) {
         (Some(false), _) => Some("disabled"),
         (Some(true), true) => Some("done"),
@@ -109,8 +114,44 @@ fn monitor(s: &mut Session, p: &Value) -> Result<Value> {
         "last_link_down_time": times.and_then(|t| t.last_down),
         "watching_since": s.links.since,
         "now": s.now(),
+        "configured": super::ethernet::configured(s, &name),
+        "sfp": sfp,
+        "sfp_reason": sfp_reason,
         "notes": m.notes,
     }))
+}
+
+/// The module in `name`'s cage as JSON, with its alerts spelled out; or
+/// why there is none (`null` + reason: a copper port, a driver without
+/// module access).
+fn sfp(s: &mut Session, name: &IfName) -> (Value, Option<String>) {
+    let disabled = s
+        .store()
+        .running()
+        .interfaces
+        .get(name)
+        .is_some_and(|i| i.disabled);
+    match s.read_module(name) {
+        Ok(m) => {
+            // A disabled port's laser is off on purpose (as in the log).
+            let alerts: Vec<String> = m
+                .alerts()
+                .filter(|r| !(disabled && r.name.starts_with("tx-")))
+                .map(|r| {
+                    let level = r.level.map_or("", |l| l.label());
+                    format!("{} {:.2} {} ({level})", r.key(), r.value, r.unit)
+                })
+                .collect();
+            let mut v = serde_json::to_value(&m).unwrap_or(Value::Null);
+            if let Value::Object(o) = &mut v {
+                o.insert("alerts".into(), json!(alerts));
+            }
+            (v, None)
+        }
+        Err(HalError::Unsupported(why) | HalError::Rejected(why) | HalError::Io(why)) => {
+            (Value::Null, Some(why))
+        }
+    }
 }
 
 /// `0x8086` → `"8086"`.

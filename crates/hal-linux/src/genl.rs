@@ -195,6 +195,10 @@ impl Msg {
         self
     }
 
+    pub fn u8(&mut self, kind: u16, v: u8) -> &mut Self {
+        self.put(kind, &[v])
+    }
+
     pub fn u32(&mut self, kind: u16, v: u32) -> &mut Self {
         self.put(kind, &v.to_ne_bytes())
     }
@@ -252,6 +256,9 @@ mod io {
     const CTRL_CMD_GETFAMILY: u8 = 3;
     const CTRL_ATTR_FAMILY_ID: u16 = 1;
     const CTRL_ATTR_FAMILY_NAME: u16 = 2;
+    const CTRL_ATTR_MCAST_GROUPS: u16 = 7;
+    const CTRL_ATTR_MCAST_GRP_NAME: u16 = 1;
+    const CTRL_ATTR_MCAST_GRP_ID: u16 = 2;
     /// A reply slower than this is a stuck driver: give up on it.
     const TIMEOUT_MS: u16 = 1000;
     /// Bound on the messages of one reply (dumps are not used).
@@ -300,13 +307,65 @@ mod io {
 
         /// Id of family `name` (`ethtool`, `devlink`).
         pub fn family(&mut self, name: &str) -> Result<u16, GenlError> {
+            Ok(self.family_and_group(name, "")?.0)
+        }
+
+        /// Id of family `name` and of its multicast group `group` (`None`
+        /// when it has no such group, or `group` is empty).
+        pub fn family_and_group(
+            &mut self,
+            name: &str,
+            group: &str,
+        ) -> Result<(u16, Option<u32>), GenlError> {
             let seq = self.next_seq();
             let mut m = Msg::new(GENL_ID_CTRL, CTRL_CMD_GETFAMILY, 1, seq);
             m.str(CTRL_ATTR_FAMILY_NAME, name);
             let data = self.call(m.finish(), seq)?;
-            data.iter()
+            let id = data
+                .iter()
                 .find_map(|(_, a)| find(attrs(a), CTRL_ATTR_FAMILY_ID)?.u16())
-                .ok_or_else(|| GenlError::Io(format!("no id for family {name}")))
+                .ok_or_else(|| GenlError::Io(format!("no id for family {name}")))?;
+            let gid = data.iter().find_map(|(_, a)| {
+                find(attrs(a), CTRL_ATTR_MCAST_GROUPS)?
+                    .nested()
+                    .find_map(|g| {
+                        let n = find(g.nested(), CTRL_ATTR_MCAST_GRP_NAME)?.str()?;
+                        (!group.is_empty() && n == group)
+                            .then(|| find(g.nested(), CTRL_ATTR_MCAST_GRP_ID)?.u32())
+                            .flatten()
+                    })
+            });
+            Ok((id, gid))
+        }
+
+        /// Receive the multicast messages of `group` from now on.
+        pub fn join(&mut self, group: u32) -> Result<(), GenlError> {
+            self.sock
+                .add_membership(group)
+                .map_err(|e| GenlError::Io(format!("netlink join group {group}: {e}")))
+        }
+
+        /// Notifications (sequence 0) that arrive within `timeout_ms`; an
+        /// empty list when none did.
+        pub fn notifications(&mut self, timeout_ms: u16) -> Result<Vec<(u8, Vec<u8>)>, GenlError> {
+            let mut fds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
+            let ready = poll(&mut fds, PollTimeout::from(timeout_ms))
+                .map_err(|e| GenlError::Io(format!("netlink poll: {e}")))?;
+            if ready == 0 {
+                return Ok(Vec::new());
+            }
+            let (buf, _) = self
+                .sock
+                .recv_from_full()
+                .map_err(|e| GenlError::Io(format!("netlink recv: {e}")))?;
+            Ok(replies(&buf, 0)
+                .into_iter()
+                .filter_map(|r| match r {
+                    Reply::Data { cmd, attrs } => Some((cmd, attrs.to_vec())),
+                    _ => None,
+                })
+                .take(MAX_REPLIES)
+                .collect())
         }
 
         pub fn next_seq(&mut self) -> u32 {

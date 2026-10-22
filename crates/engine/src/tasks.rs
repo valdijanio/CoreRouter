@@ -273,6 +273,16 @@ pub(crate) fn can_start(s: &Session) -> std::result::Result<(), String> {
     s.hal().prober().map(|_| ())
 }
 
+/// Why task commands that need no prober (the cable test) are disabled.
+pub(crate) fn can_run(s: &Session) -> std::result::Result<(), String> {
+    if s.tasks.runner.is_none() {
+        return Err("this build runs no background tasks (the in-browser lab): \
+             connect the GUI to a daemon"
+            .into());
+    }
+    Ok(())
+}
+
 /// One task as `tool.task.list` shows it.
 fn row(id: u64, e: &Entry, now: Option<u64>) -> Value {
     let d = e.cell.data();

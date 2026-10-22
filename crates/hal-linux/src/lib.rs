@@ -23,6 +23,11 @@
 //!   and `counters` from rtnetlink, the `ethtool`/`devlink` generic netlink
 //!   families (`genl`, `ethtool`; never the ioctls) and sysfs device files;
 //!   `pci_ids` names the PCI ids.
+//! - Ethernet settings (G1.20): `apply` writes what `interface.ethernet.set`
+//!   put in the config over ethtool netlink (`ether` computes the target
+//!   over a snapshot of the port taken before the first change, so taking
+//!   a setting out restores the driver's own); `sfp_module` reads the
+//!   module EEPROM and `cable_tester` runs the PHY's cable test.
 //!
 //! Integration tests run against a real kernel inside a throwaway network
 //! namespace, without root: see `tests/netns.rs`.
@@ -33,6 +38,10 @@ pub mod plan;
 
 /// Generic netlink codec (pure) and socket (Linux) for G1.19.
 mod genl;
+
+/// `interface.ethernet.set` targets over the port's own settings (G1.20).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod ether;
 
 /// Interface dialog data: ethtool netlink, devlink, sysfs (G1.19).
 #[cfg(target_os = "linux")]
@@ -72,10 +81,12 @@ mod linux {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use corerouter_hal::{
-        DynamicChange, EthernetMonitor, Features, Hal, HalError, LinkCounters, LinkInfo, LinkState,
-        NicHardware,
+        CableTest, DynamicChange, EthernetMonitor, Features, Hal, HalError, LinkCounters, LinkInfo,
+        LinkState, NicHardware, SfpModule,
     };
-    use corerouter_model::{Config, IfName, InterfaceKind};
+    use corerouter_model::{Config, EthernetSettings, IfName, InterfaceKind};
+
+    use crate::ether::{self, EtherState};
 
     use crate::owner::{self, KernelLink, Owner, Policy};
     use crate::plan::Op;
@@ -91,6 +102,9 @@ mod linux {
         claims: BTreeMap<IfName, InterfaceKind>,
         /// Whether `ra::sync` ran once (the first one flushes stale RA state).
         ra_synced: bool,
+        /// Each port's Ethernet settings before CoreRouter first changed
+        /// them (G1.20): what a setting taken out of the config returns to.
+        ether_orig: BTreeMap<IfName, EtherState>,
     }
 
     impl LinuxHal {
@@ -161,6 +175,120 @@ mod linux {
         }
     }
 
+    /// Ports whose Ethernet settings differ between `from` and `to`.
+    fn ether_changes<'a>(
+        from: &'a Config,
+        to: &'a Config,
+    ) -> Vec<(&'a IfName, EthernetSettings, &'a EthernetSettings)> {
+        to.interfaces
+            .iter()
+            .filter(|(_, i)| i.kind == InterfaceKind::Ethernet)
+            .filter_map(|(n, i)| {
+                let old = from
+                    .interfaces
+                    .get(n)
+                    .map(|o| o.ethernet.clone())
+                    .unwrap_or_default();
+                (old != i.ethernet).then_some((n, old, &i.ethernet))
+            })
+            .collect()
+    }
+
+    impl LinuxHal {
+        /// Bring `name` to `want` over its snapshot (taken now if this is
+        /// the first change).
+        fn ether_apply(&mut self, name: &IfName, want: &EthernetSettings) -> Result<(), HalError> {
+            let mut e = crate::ethtool::Ethtool::open(name.as_str())
+                .map_err(|e| HalError::Rejected(format!("{name}: ethtool netlink: {e}")))?;
+            let now = e
+                .state()
+                .map_err(|why| HalError::Rejected(format!("{name}: {why}")))?;
+            let orig = self.ether_orig.entry(name.clone()).or_insert(now.clone());
+            let t = ether::target(orig, want);
+            let fail = |what: &str, err: crate::genl::GenlError| {
+                HalError::Rejected(format!("{name}: {what}: {err}"))
+            };
+            if let Some(link) = &t.link {
+                let unchanged = match link {
+                    ether::Link::Auto(m) => now.autoneg == Some(true) && now.advertising == *m,
+                    ether::Link::Forced {
+                        speed_mbps,
+                        full_duplex,
+                    } => {
+                        now.autoneg == Some(false)
+                            && now.speed_mbps == Some(*speed_mbps)
+                            && now.full_duplex == Some(*full_duplex)
+                    }
+                };
+                if !unchanged {
+                    e.set_link(link, &now.supported)
+                        .map_err(|err| fail("link modes", err))?;
+                }
+            }
+            if let Some(p) = t.pause
+                && now.pause != Some(p)
+            {
+                e.set_pause(p).map_err(|err| fail("flow control", err))?;
+            }
+            let changes = ether::feature_changes(&t, &now.features);
+            e.set_features(&changes)
+                .map_err(|err| fail("offloads", err))?;
+            if !changes.is_empty() {
+                // The kernel may keep a feature as it was (dependencies,
+                // driver limits) without failing the request.
+                let after = e
+                    .state()
+                    .map_err(|why| HalError::Rejected(format!("{name}: {why}")))?;
+                let kept: Vec<&str> = changes
+                    .iter()
+                    .filter(|(f, on)| after.features.get(*f) != Some(*on))
+                    .map(|(f, _)| f.as_str())
+                    .collect();
+                if !kept.is_empty() {
+                    return Err(HalError::Rejected(format!(
+                        "{name}: the driver did not change {}",
+                        kept.join(", ")
+                    )));
+                }
+            }
+            Ok(())
+        }
+
+        /// Ethernet settings `from` → `to`, all or nothing: on a failure
+        /// the ports done so far go back to `from`.
+        fn ether_transition(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+            let changes = ether_changes(from, to);
+            if changes.is_empty() {
+                return Ok(());
+            }
+            let external: BTreeMap<String, String> = self
+                .view(&claims_of(to))?
+                .into_iter()
+                .filter_map(|(l, o)| match o {
+                    Owner::External(r) => Some((l.name, r)),
+                    Owner::Managed | Owner::Conflict(_) => None,
+                })
+                .collect();
+            let mut done: Vec<(&IfName, EthernetSettings)> = Vec::new();
+            for (name, old, new) in changes {
+                if let Some(why) = external.get(name.as_str()) {
+                    log::warn!("Ethernet settings of '{name}' not applied ({why})");
+                    continue;
+                }
+                if let Err(e) = self.ether_apply(name, new) {
+                    for (n, back) in done.iter().rev() {
+                        if let Err(b) = self.ether_apply(n, back) {
+                            log::error!("restoring Ethernet settings of '{n}': {b}");
+                        }
+                    }
+                    return Err(e);
+                }
+                done.push((name, old));
+            }
+            Ok(())
+        }
+    }
+
     fn claims_of(cfg: &Config) -> BTreeMap<IfName, InterfaceKind> {
         cfg.interfaces
             .iter()
@@ -204,6 +332,19 @@ mod linux {
                 let dynamic = crate::nft::dynamic();
                 crate::nft::run(&corerouter_firewall::script(to, &dynamic))?;
             }
+            // Ethernet settings next: validated by the engine against what
+            // the port supports, they rarely fail; if the plan below does,
+            // they go back too.
+            if let Err(e) = self.ether_transition(from, to) {
+                if firewall {
+                    let dynamic = crate::nft::dynamic();
+                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
+                    {
+                        log::error!("restoring the previous firewall: {back}");
+                    }
+                }
+                return Err(e);
+            }
             if ops.is_empty() {
                 self.claims = claims_of(to);
                 // After the links exist (a new VLAN has no sysctl before).
@@ -235,6 +376,9 @@ mod linux {
                 }
                 Err(e) => {
                     self.claims = claims_of(from);
+                    if let Err(back) = self.ether_transition(to, from) {
+                        log::error!("restoring Ethernet settings: {back}");
+                    }
                     if firewall {
                         // The links went back to `from`: so does the firewall.
                         let dynamic = crate::nft::dynamic();
@@ -349,6 +493,18 @@ mod linux {
 
         fn counters(&mut self, name: &IfName) -> Result<LinkCounters, HalError> {
             crate::nic::counters(name.as_str())
+        }
+
+        fn sfp_module(&mut self, name: &IfName) -> Result<SfpModule, HalError> {
+            crate::nic::sfp_module(name.as_str())
+        }
+
+        fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {
+            crate::netlink::link_detail(name.as_str())?
+                .ok_or_else(|| HalError::Rejected(format!("no link '{name}' in the kernel")))?;
+            Ok(Box::new(crate::ethtool::LinuxCableTest {
+                dev: name.as_str().to_owned(),
+            }))
         }
     }
 }
