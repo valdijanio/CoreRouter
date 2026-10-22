@@ -17,6 +17,7 @@ pub mod message;
 pub mod resolver;
 pub mod reverse;
 pub mod server;
+pub mod zone;
 
 use corerouter_model::dns::AllowedFrom;
 use corerouter_model::{Config, Issue};
@@ -83,6 +84,7 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
             ));
         }
     }
+    out.extend(zone::validate(cfg));
     out
 }
 

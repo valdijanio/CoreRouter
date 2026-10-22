@@ -461,8 +461,17 @@ RouterOS (e o README ainda diz "not recommended in production"). Por isso o enca
 daemon (`service/dns_server.rs`) uma thread por socket responde o que a cadeia resolve sem rede
 (cache, estáticos) na hora, e cada falta de cache ganha uma thread, no máximo
 `max_concurrent_queries`. Medido: 0,8 µs por consulta respondida do cache (bytes a bytes), ~1,2 M
-consultas/s por núcleo sem contar o socket. O `hickory-server` continua previsto para as zonas
-autoritativas (G4.1c), como uma etapa a mais.
+consultas/s por núcleo sem contar o socket.
+
+**Zonas autoritativas (G4.1c-1): a busca é nossa, numa etapa da cadeia.** O plano era servir as
+zonas pelo `hickory-server`. A versão 0.26.3 não tem IXFR, NOTIFY (enviado ou recebido), zona
+secundária nem ACL de IP para AXFR, e a busca dela é async (tokio), fora da cadeia síncrona que
+compila em wasm. Então a etapa `zones` (`proto-dns/src/zone/`) faz a busca da RFC 1034 §4.3.2 sobre
+registros do `hickory-proto`. Transferências e NOTIFY são atendidos antes da cadeia, e o serviço
+`dns zones` do daemon faz o NOTIFY enviado e as secundárias. Medido: 1,04 µs por resposta de zona
+(como um acerto de cache), nada para quem não tem zonas. O `hickory-server` fica para a assinatura
+DNSSEC (G4.1c-2): `InMemoryZoneHandler::secure_zone_mut` é síncrono e monta NSEC3/RRSIG, que
+serviríamos da mesma etapa. Detalhes em `docs/dns.md`, "G4.1c — Zonas".
 
 ```
 UDP/TCP 53 ─► Forwarder::start (thread do socket) ─► acl, limit, special, adlist, static, zones, cache
