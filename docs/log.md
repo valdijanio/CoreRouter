@@ -486,6 +486,18 @@ mesmo dia pode variar.
   achou dois `panic` no `dhcproto` 0.15 com pacotes malformados; o decode agora passa por um
   saneador. Testes: 32 no `proto-dhcp`, 15 de integração no engine, netns com daemon real e
   servidor DHCP em Rust (concessão + rotas no kernel em ~3 s **medido**), UI headless, terminal.
+
+- 2026-10-22 — G0.9: `cargo xtask bench` (criterion 0.8 como dev-dependency, sem plots/rayon).
+  Um build de todos os `benches/` e um resumo legível (mediana, IC 95%, tempo por item, variação
+  contra a rodada anterior ou `--baseline <nome>`; `--save-baseline`, `--quick`, `--markdown`
+  para o `docs/perf.md`). 31 benchmarks: canal de controle (TCP e TLS, `ping` e
+  `interface.list`), `Session::execute` (list/add/filter add/erro), `VirtualHal::apply` e
+  `LinuxHal::apply` de 100/1000 endereços, rotas e regras (o do kernel num namespace sem root,
+  `netns_*`, pulado com aviso onde não dá), codecs DHCPv4/LLDP/CRDP/MNDP. Números **medidos**
+  (Ryzen AI MAX+ 395, release): `ping` 7,4 µs (TLS 8,3 µs), `ip.address.add` 16 µs, netlink
+  ~20 µs por endereço/rota, `nft -f` ~20 ms fixos + ~13 µs/regra, decode DHCP 0,57 µs. Passo
+  `bench-check` no `cargo xtask ci` (+10,5 s **medido**): roda cada benchmark uma vez em debug.
+  Como testar: `cargo xtask bench --quick`; `cargo xtask bench-check`.
 - 2026-10-22 — G2.1b: firewall seguro e fácil (`docs/firewall.md` §6–§11). **Lockout:** o canal
   de controle dá ao `Caller` o `Link` da conexão; todo commit que mexe no firewall passa os pacotes
   dela (estabelecido em input, resposta em output, login novo em input e em dstnat) pelo firewall
@@ -518,3 +530,21 @@ mesmo dia pode variar.
   O `ci` ganhou `workflow_dispatch`. Testado localmente com repositório e `gh` falsos (union limpo
   enviado, conflito real só comentado). Observado antes: com o merge do #37, #40/#41/#42 viraram
   CONFLICTING no GitHub e o merge local do #40 saiu limpo.
+- 2026-10-22 — G1.21: hierarquia das janelas internas, a pedido do usuário (com um diálogo aberto,
+  clicar na lista o mandava para trás, e pedir os detalhes de novo não o trazia de volta). Um lugar
+  só, `Floats` em `crates/ui/src/float.rs`: relação filho→pai por janela (`Floats::adopt`, ligada
+  por `dialog::Head::parent`, que cada família de diálogos preenche com a sua lista: Interfaces,
+  Routes, VRF, Firewall com os assistentes do G2.1b, Interface List). Modelo das janelas *owned* do Windows / *transient-for*
+  do GTK: o filho fica sempre acima do pai (o egui só sabe "subir" um conjunto mantendo a ordem
+  relativa, então ao subir o pai os descendentes sobem no mesmo frame, e uma janela pedida no frame
+  em que a família sobe sobe no seguinte), e o teclado vai à janela *ativa* (a clicada, pedida ou
+  aberta por último), que pode estar sob os próprios filhos. Pedir de novo (`Status::bring_to_front`,
+  `Floats::raise`): sobe, toma o foco e pisca a borda por ~0,6 s. Filho abre abaixo do cabeçalho
+  da tabela do pai e a 30 % da largura dele (48–240 px), em cascata de 24 px: a primeira tentativa (36, 44) cobria o "+" da lista e
+  quebrou um teste do VRF, e (48, 92) cobria o meio das linhas com o diálogo maior do G1.19 (dois
+  testes que clicavam no centro da linha); agora os nomes das outras linhas ficam clicáveis
+  (**medido**). Fechar o pai: filhos limpos fecham junto (`Floats::close_family`/`take_close`);
+  com alterações, `egui::Modal` "Close <pai>?" (Close All / Cancel / Esc). Extras: marca na linha
+  cuja janela está aberta (`TableState::open`, clique traz a janela) e Ctrl+Tab / Ctrl+F6 (atalho do
+  WinBox) com Shift ao contrário; no navegador o Ctrl+Tab é da aba, o Ctrl+F6 fica. 8 testes headless
+  novos; conferido na GUI real num Xvfb próprio (screenshots). Esforço do agente ~3 h (**estimado**).

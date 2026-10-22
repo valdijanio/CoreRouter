@@ -130,6 +130,10 @@ pub(crate) struct TableState {
     pub inline_comments: bool,
     /// Rows can be dragged to a new place (order matters: firewall rules).
     pub reorder: bool,
+    /// Items whose own window is open, set by the list before each frame:
+    /// a mark at the left end of the row, and a click on the mark brings
+    /// that window to the front (as a double click on the row does).
+    pub open: BTreeSet<String>,
 }
 
 impl TableState {
@@ -561,6 +565,9 @@ pub(crate) fn show(
                     );
                 }
 
+                if state.open.contains(&row.key) && open_mark(ui, salt, &row.key, rect, selected) {
+                    out.opened = Some(row.key.clone());
+                }
                 if resp.clicked() {
                     let m = ui.input(|i| i.modifiers);
                     state.click(&row.key, m.command, m.shift, &order);
@@ -647,6 +654,31 @@ pub(crate) fn show(
     }
     ui.weak(status);
     out
+}
+
+/// Width of the open-window mark, and of the strip a click on it takes.
+const MARK_W: f32 = 3.0;
+const MARK_HIT: f32 = 8.0;
+
+/// The mark of a row whose window is open. Returns whether it was clicked.
+fn open_mark(ui: &mut Ui, salt: &str, key: &str, row: Rect, selected: bool) -> bool {
+    let v = ui.visuals();
+    let color = if selected {
+        v.selection.stroke.color
+    } else {
+        v.selection.bg_fill
+    };
+    let bar = Rect::from_min_size(row.min, vec2(MARK_W, row.height())).shrink2(vec2(0.0, 2.0));
+    ui.painter().rect_filled(bar, 1.0, color);
+    let hit = Rect::from_min_size(row.min, vec2(MARK_HIT, row.height()));
+    ui.interact(hit, mark_id(salt, key), Sense::click())
+        .on_hover_text("Its window is open: click to bring it to the front")
+        .clicked()
+}
+
+/// Id of the open-window mark of row `key` (the tests click it).
+pub(crate) fn mark_id(salt: &str, key: &str) -> Id {
+    row_id(salt, key).with("open-mark")
 }
 
 /// Where a dragged row lands: `Some(Some(k))` above row `k`, `Some(None)`
