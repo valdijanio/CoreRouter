@@ -1,21 +1,30 @@
-//! The router's stub resolver: cache first, then the servers one by one
-//! (RouterOS `/ip dns`: static servers, then the dynamic ones; the last
-//! server that answered goes first next time), each for at most
-//! `query_server_timeout`, all of them for at most `query_total_timeout`.
-//! A truncated UDP answer is asked again over TCP on the same server
-//! (RFC 7766 §5). NXDOMAIN is final: another server would say the same.
+//! The router's resolver: cache first, then the upstream servers, each for
+//! at most `query_server_timeout`, all of them for at most
+//! `query_total_timeout`. Two ways to pick the order (`server_selection`):
+//! `sequential` is RouterOS (static servers, then the dynamic ones; the
+//! last one that answered goes first next time), `fastest` measures each
+//! server's latency and asks the fastest first, a failing one going last
+//! for a minute. A truncated UDP answer is asked again over TCP on the same
+//! server (RFC 7766 §5). NXDOMAIN is final: another server would say the
+//! same. When every server fails, an expired answer still inside the
+//! serve-stale window is used (RFC 8767).
+//!
+//! The router's own lookups (ping, NTP: [`Resolver::lookup`]) and the LAN
+//! forwarder ([`Resolver::resolve`], any record type) share the cache.
 //!
 //! No sockets here: the caller brings a [`Transport`] (UDP/TCP in the
 //! daemon, a fake in tests). The lock is held only around the cache, never
 //! across the network, so one slow lookup does not stall the others.
 
+use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Mutex, MutexGuard};
 
-use corerouter_model::dns::{CacheRow, CachedData, Dns, QType};
+use corerouter_model::dns::{CacheRow, Dns, ServerSelection};
+use hickory_proto::rr::RecordType;
 
-use crate::cache::Cache;
-use crate::message::{NameError, Outcome, QName, ReplyError, parse_name, parse_reply, query};
+use crate::cache::{Cache, Hit};
+use crate::message::{Answer, NameError, QName, Rcode, ReplyError, check_reply, parse_name, query};
 
 /// Moves bytes to a server and back.
 pub trait Transport {
@@ -54,6 +63,8 @@ pub struct Settings {
     pub udp_payload: u16,
     pub max_ttl: u32,
     pub cache_bytes: usize,
+    pub selection: ServerSelection,
+    pub stale_secs: u32,
 }
 
 impl Settings {
@@ -75,6 +86,8 @@ impl Settings {
             cache_bytes: usize::try_from(dns.cache_size)
                 .unwrap_or(usize::MAX)
                 .saturating_mul(1024),
+            selection: dns.server_selection,
+            stale_secs: dns.serve_stale_secs,
         }
     }
 }
@@ -99,16 +112,49 @@ pub enum ResolveError {
     Failed { name: String, why: String },
 }
 
+/// Where an answer came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    Cache,
+    Server(IpAddr),
+    /// Expired, served because no server answered (RFC 8767).
+    Stale,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    pub answer: Answer,
+    pub source: Source,
+}
+
+/// Latency a server is assumed to have before it answered once (Unbound's
+/// `UNKNOWN_SERVER_NICENESS`): a known fast server goes first, an unknown
+/// one before a slow one.
+const UNKNOWN_RTT_MS: u64 = 376;
+/// A server that failed goes last for this long (`fastest`).
+const DOWN_MS: u64 = 60_000;
+
+/// What the resolver knows of one server.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ServerStats {
+    /// Smoothed round-trip time (RFC 6298 style, 7/8 old + 1/8 new).
+    pub srtt_ms: Option<u64>,
+    pub down_until_ms: u64,
+    pub answers: u64,
+    pub failures: u64,
+}
+
 #[derive(Debug, Default)]
 struct State {
     settings: Settings,
     cache: Cache,
     /// The last server that answered (RouterOS keeps using it).
     preferred: Option<IpAddr>,
+    stats: BTreeMap<IpAddr, ServerStats>,
 }
 
-/// Resolver shared by every thread of the router (tools, NTP, later the
-/// LAN forwarder of G4.1b).
+/// Resolver shared by every thread of the router (tools, NTP, the LAN
+/// forwarder).
 #[derive(Debug, Default)]
 pub struct Resolver {
     state: Mutex<State>,
@@ -116,12 +162,14 @@ pub struct Resolver {
 
 impl Resolver {
     pub fn new(settings: Settings) -> Self {
-        let cache = Cache::new(settings.cache_bytes);
+        let mut cache = Cache::new(settings.cache_bytes);
+        cache.set_stale(settings.stale_secs);
         Self {
             state: Mutex::new(State {
                 settings,
                 cache,
                 preferred: None,
+                stats: BTreeMap::new(),
             }),
         }
     }
@@ -142,6 +190,7 @@ impl Resolver {
             return;
         }
         st.cache.set_budget(settings.cache_bytes, now_ms);
+        st.cache.set_stale(settings.stale_secs);
         if st.preferred.is_some_and(|p| !settings.servers.contains(&p)) {
             st.preferred = None;
         }
@@ -164,6 +213,16 @@ impl Resolver {
         self.state().cache.flush();
     }
 
+    /// What the resolver measured of each server it asked.
+    pub fn server_stats(&self) -> Vec<(IpAddr, ServerStats)> {
+        self.state().stats.iter().map(|(k, v)| (*k, *v)).collect()
+    }
+
+    /// The fresh cached answer, if any (never touches the network).
+    pub fn cached(&self, key: &str, rtype: RecordType, now_ms: u64) -> Option<Hit> {
+        self.state().cache.get(key, rtype, now_ms)
+    }
+
     /// Addresses of `name`: IPv4 first, then IPv6. IP literals come back
     /// as they are.
     pub fn lookup(&self, t: &mut dyn Transport, name: &str) -> Result<Vec<IpAddr>, ResolveError> {
@@ -176,12 +235,11 @@ impl Resolver {
         }
         let mut out = Vec::new();
         let mut failure = None;
-        for q in [QType::A, QType::Aaaa] {
-            match self.lookup_type(t, &qn, q) {
-                Ok(CachedData::Addresses { addresses, .. }) => out.extend(addresses),
+        for rtype in [RecordType::A, RecordType::AAAA] {
+            match self.resolve(t, &qn, rtype, None) {
                 // RFC 2308 §2.1: no such name, for any type.
-                Ok(CachedData::NxDomain) => break,
-                Ok(CachedData::NoData | CachedData::Records { .. }) => {}
+                Ok(r) if r.answer.rcode == Rcode::NxDomain => break,
+                Ok(r) => out.extend(r.answer.addresses()),
                 Err(e @ ResolveError::NoServers) => return Err(e),
                 // Every server failed for A: AAAA would wait as long again.
                 Err(e) => {
@@ -197,65 +255,96 @@ impl Resolver {
         }
     }
 
-    /// One type: from the cache, or asked and then cached.
-    fn lookup_type(
+    /// One name and type: from the cache, or asked (of `forward_to` when a
+    /// static FWD entry says so, else of the configured servers) and then
+    /// cached; stale when every server failed (RFC 8767).
+    pub fn resolve(
         &self,
         t: &mut dyn Transport,
         qn: &QName,
-        q: QType,
-    ) -> Result<CachedData, ResolveError> {
-        let (settings, preferred) = {
+        rtype: RecordType,
+        forward_to: Option<&[IpAddr]>,
+    ) -> Result<Resolved, ResolveError> {
+        let (settings, servers) = {
             let mut st = self.state();
-            let now = t.now_ms();
-            if let Some((data, _)) = st.cache.get(&qn.key, q, now) {
-                return Ok(data);
+            if let Some(hit) = st.cache.get(&qn.key, rtype, t.now_ms()) {
+                return Ok(Resolved {
+                    answer: hit.answer,
+                    source: Source::Cache,
+                });
             }
-            (st.settings.clone(), st.preferred)
+            let servers = match forward_to {
+                Some(list) => list.to_vec(),
+                None => order(&st, t.now_ms()),
+            };
+            (st.settings.clone(), servers)
         };
-        let (outcome, server) = fetch(t, &settings, preferred, qn, q)?;
+        let fetched = fetch(t, &settings, &servers, qn, rtype);
         let mut st = self.state();
-        st.preferred = Some(server);
-        st.cache.put(
-            &qn.key,
-            q,
-            &outcome,
-            Some(server),
-            t.now_ms(),
-            settings.max_ttl,
-        );
-        Ok(match outcome {
-            Outcome::Addresses {
-                addresses,
-                canonical,
-                ..
-            } => CachedData::Addresses {
-                addresses,
-                canonical,
+        let now = t.now_ms();
+        for (ip, rtt) in &fetched.tried {
+            let s = st.stats.entry(*ip).or_default();
+            match rtt {
+                Some(ms) => {
+                    s.srtt_ms = Some(s.srtt_ms.map_or(*ms, |old| (old * 7 + ms) / 8));
+                    s.down_until_ms = 0;
+                    s.answers = s.answers.saturating_add(1);
+                }
+                None => {
+                    s.down_until_ms = now.saturating_add(DOWN_MS);
+                    s.failures = s.failures.saturating_add(1);
+                }
+            }
+        }
+        // Forget servers no longer configured (the map stays small).
+        let keep = st.settings.servers.clone();
+        st.stats
+            .retain(|ip, _| keep.contains(ip) || servers.contains(ip));
+        match fetched.result {
+            Ok((answer, server, wire)) => {
+                if forward_to.is_none() {
+                    st.preferred = Some(server);
+                }
+                st.cache.put(
+                    &qn.key,
+                    rtype,
+                    &answer,
+                    Some(server),
+                    now,
+                    settings.max_ttl,
+                    wire,
+                );
+                Ok(Resolved {
+                    answer,
+                    source: Source::Server(server),
+                })
+            }
+            Err(e) => match st.cache.get_stale(&qn.key, rtype, now) {
+                Some(hit) => Ok(Resolved {
+                    answer: hit.answer,
+                    source: Source::Stale,
+                }),
+                None => Err(e),
             },
-            Outcome::Records {
-                records, canonical, ..
-            } => CachedData::Records { records, canonical },
-            Outcome::NxDomain { .. } => CachedData::NxDomain,
-            Outcome::NoData { .. } => CachedData::NoData,
-        })
+        }
     }
+}
 
-    /// Records of type `q` (PTR or TXT) for `name`, from the cache or
-    /// asked; a name that does not exist, or has none, gives no records.
+impl Resolver {
+    /// PTR names or TXT texts (`rtype`) of `name`, from the cache or
+    /// asked; a name that does not exist, or has none, gives no records
+    /// (G6.3b).
     pub fn records(
         &self,
         t: &mut dyn Transport,
         name: &str,
-        q: QType,
+        rtype: RecordType,
     ) -> Result<Vec<String>, ResolveError> {
         let qn = parse_name(name)?;
         if special_use(&qn).is_some() {
             return Ok(Vec::new());
         }
-        match self.lookup_type(t, &qn, q)? {
-            CachedData::Records { records, .. } => Ok(records),
-            _ => Ok(Vec::new()),
-        }
+        Ok(self.resolve(t, &qn, rtype, None)?.answer.texts())
     }
 
     /// The name of `ip` (its first PTR, RFC 1035 §3.5 / RFC 3596 §2.5).
@@ -266,7 +355,7 @@ impl Resolver {
     ) -> Result<Option<String>, ResolveError> {
         let name = crate::reverse::reverse_name(ip);
         Ok(self
-            .records(t, &name, QType::Ptr)?
+            .records(t, &name, RecordType::PTR)?
             .first()
             .map(|n| crate::reverse::printable(n, crate::message::MAX_NAME_LEN)))
     }
@@ -288,59 +377,107 @@ fn special_use(qn: &QName) -> Option<Result<Vec<IpAddr>, ResolveError>> {
     None
 }
 
-/// Servers in asking order: the preferred one first, then the list.
-fn order(servers: &[IpAddr], preferred: Option<IpAddr>) -> Vec<IpAddr> {
-    let mut out: Vec<IpAddr> = preferred
-        .filter(|p| servers.contains(p))
-        .into_iter()
-        .collect();
-    out.extend(servers.iter().filter(|s| Some(**s) != preferred));
-    out
+/// Servers in asking order.
+fn order(st: &State, now_ms: u64) -> Vec<IpAddr> {
+    let servers = &st.settings.servers;
+    match st.settings.selection {
+        // The preferred one first, then the list.
+        ServerSelection::Sequential => {
+            let mut out: Vec<IpAddr> = st
+                .preferred
+                .filter(|p| servers.contains(p))
+                .into_iter()
+                .collect();
+            out.extend(servers.iter().filter(|s| Some(**s) != st.preferred));
+            out
+        }
+        // Up before down, then by latency; ties keep the list order.
+        ServerSelection::Fastest => {
+            let mut out = servers.clone();
+            out.sort_by_key(|ip| {
+                let s = st.stats.get(ip).copied().unwrap_or_default();
+                (
+                    s.down_until_ms > now_ms,
+                    s.srtt_ms.unwrap_or(UNKNOWN_RTT_MS),
+                )
+            });
+            out
+        }
+    }
 }
 
-/// Asks the servers until one gives a definite answer.
+/// The result of asking the servers, and how each one did (round-trip
+/// time, or `None` for a failure).
+pub struct Fetched {
+    pub result: Result<(Answer, IpAddr, usize), ResolveError>,
+    pub tried: Vec<(IpAddr, Option<u64>)>,
+}
+
+/// Asks `servers` in order until one gives a definite answer.
 pub fn fetch(
     t: &mut dyn Transport,
     settings: &Settings,
-    preferred: Option<IpAddr>,
+    servers: &[IpAddr],
     qn: &QName,
-    q: QType,
-) -> Result<(Outcome, IpAddr), ResolveError> {
-    if settings.servers.is_empty() {
-        return Err(ResolveError::NoServers);
+    rtype: RecordType,
+) -> Fetched {
+    let mut tried = Vec::new();
+    if servers.is_empty() {
+        return Fetched {
+            result: Err(ResolveError::NoServers),
+            tried,
+        };
     }
     let deadline = t
         .now_ms()
         .saturating_add(u64::from(settings.total_timeout_ms));
     let mut errors: Vec<String> = Vec::new();
-    for ip in order(&settings.servers, preferred) {
-        let server = SocketAddr::new(ip, settings.port);
+    for ip in servers {
+        let server = SocketAddr::new(*ip, settings.port);
         let mut tcp = false;
+        let started = t.now_ms();
         loop {
             let left = deadline.saturating_sub(t.now_ms());
             if left == 0 {
                 errors.push("query_total_timeout reached".into());
-                return Err(failed(qn, &errors));
+                return Fetched {
+                    result: Err(failed(qn, &errors)),
+                    tried,
+                };
             }
             let wait = left.min(u64::from(settings.server_timeout_ms));
-            match ask(t, server, settings.udp_payload, qn, q, tcp, wait) {
-                Ok(outcome) => return Ok((outcome, ip)),
+            match ask(t, server, settings.udp_payload, qn, rtype, tcp, wait) {
+                Ok((answer, wire)) => {
+                    tried.push((*ip, Some(t.now_ms().saturating_sub(started))));
+                    return Fetched {
+                        result: Ok((answer, *ip, wire)),
+                        tried,
+                    };
+                }
                 // RFC 7766 §5: a truncated UDP answer is retried over TCP.
                 Err(Ask::Reply(ReplyError::Truncated)) if !tcp => tcp = true,
                 Err(e) => {
+                    tried.push((*ip, None));
                     errors.push(format!("{ip}: {e}"));
                     break;
                 }
             }
         }
     }
-    Err(failed(qn, &errors))
+    Fetched {
+        result: Err(failed(qn, &errors)),
+        tried,
+    }
 }
 
 fn failed(qn: &QName, errors: &[String]) -> ResolveError {
     let mut why = errors.join("; ");
     if why.len() > 300 {
-        why.truncate(297);
+        let mut cut = 297;
+        while !why.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        why.truncate(cut);
         why.push_str("...");
     }
     ResolveError::Failed {
@@ -362,18 +499,23 @@ fn ask(
     server: SocketAddr,
     payload: u16,
     qn: &QName,
-    q: QType,
+    rtype: RecordType,
     tcp: bool,
     wait: u64,
-) -> Result<Outcome, Ask> {
+) -> Result<(Answer, usize), Ask> {
     let (id, bytes) =
-        query(&qn.name, q, payload).map_err(|e| Ask::Transport(TransportError::Io(e)))?;
-    let mut accept =
-        |b: &[u8]| !matches!(parse_reply(id, &qn.name, q, b), Err(ReplyError::Mismatch));
+        query(&qn.name, rtype, payload).map_err(|e| Ask::Transport(TransportError::Io(e)))?;
+    let mut accept = |b: &[u8]| {
+        !matches!(
+            check_reply(id, &qn.name, rtype, b),
+            Err(ReplyError::Mismatch)
+        )
+    };
     let reply = t
         .exchange(server, &bytes, tcp, wait, &mut accept)
         .map_err(Ask::Transport)?;
-    parse_reply(id, &qn.name, q, &reply).map_err(Ask::Reply)
+    let m = check_reply(id, &qn.name, rtype, &reply).map_err(Ask::Reply)?;
+    Ok((Answer::from_reply(&qn.name, rtype, &m), reply.len()))
 }
 
 #[cfg(test)]
@@ -457,7 +599,7 @@ mod tests {
                 }
                 Behave::Reverse => {
                     use hickory_proto::rr::rdata::{PTR, TXT};
-                    use hickory_proto::rr::{RData, Record, RecordType};
+                    use hickory_proto::rr::{RData, Record};
                     let n = crate::message::tests::name(&owner);
                     let data = match qtype {
                         RecordType::PTR => {
@@ -671,7 +813,7 @@ mod tests {
         let rows = r.cache_rows(t.now);
         assert!(
             rows.iter()
-                .any(|row| row.qtype == QType::Ptr && row.name == "7.100.51.198.in-addr.arpa")
+                .any(|row| row.qtype == "PTR" && row.name == "7.100.51.198.in-addr.arpa")
         );
     }
 
@@ -687,5 +829,73 @@ mod tests {
         let r = Resolver::new(s);
         r.configure(Settings::new(&Dns::default(), &[]), 0);
         assert!(r.settings().servers.is_empty());
+    }
+
+    #[test]
+    fn fastest_server_first_and_a_failing_one_goes_last() {
+        let r = resolver(&["192.0.2.1", "192.0.2.2"]);
+        let mut t = Fake::new(&[
+            ("192.0.2.1", Behave::Silent),
+            ("192.0.2.2", Behave::Answer([198, 51, 100, 2])),
+        ]);
+        r.lookup(&mut t, "a.example").unwrap();
+        let stats = r.server_stats();
+        assert_eq!(stats[0].1.failures, 1);
+        assert!(stats[1].1.srtt_ms.is_some());
+        t.log.clear();
+        r.lookup(&mut t, "b.example").unwrap();
+        assert_eq!(
+            t.log[0].0,
+            ip("192.0.2.2"),
+            "the one that answered goes first"
+        );
+        // A minute later the failed one is tried again (it is still unknown,
+        // and unknown (376 ms) loses to a measured 5 ms).
+        t.now += DOWN_MS + 1;
+        t.log.clear();
+        r.lookup(&mut t, "c.example").unwrap();
+        assert_eq!(t.log[0].0, ip("192.0.2.2"));
+    }
+
+    #[test]
+    fn stale_answer_when_every_server_fails() {
+        let r = resolver(&["192.0.2.1"]);
+        let mut t = Fake::new(&[("192.0.2.1", Behave::Answer([198, 51, 100, 5]))]);
+        let qn = parse_name("s.example").unwrap();
+        r.resolve(&mut t, &qn, RecordType::A, None).unwrap();
+        t.now += 301_000;
+        t.servers.insert(ip("192.0.2.1"), Behave::Silent);
+        let got = r.resolve(&mut t, &qn, RecordType::A, None).unwrap();
+        assert_eq!(got.source, Source::Stale, "RFC 8767");
+        assert_eq!(got.answer.records[0].ttl, crate::cache::STALE_TTL);
+        // serve_stale off: the failure goes through.
+        let dns = Dns {
+            servers: vec![ip("192.0.2.1")],
+            serve_stale_secs: 0,
+            ..Dns::default()
+        };
+        r.configure(Settings::new(&dns, &[]), t.now);
+        assert!(r.resolve(&mut t, &qn, RecordType::A, None).is_err());
+    }
+
+    #[test]
+    fn forward_to_overrides_the_servers() {
+        let r = resolver(&["192.0.2.1"]);
+        let mut t = Fake::new(&[
+            ("192.0.2.1", Behave::Answer([198, 51, 100, 1])),
+            ("192.0.2.9", Behave::Answer([198, 51, 100, 9])),
+        ]);
+        let qn = parse_name("corp.example").unwrap();
+        let got = r
+            .resolve(&mut t, &qn, RecordType::A, Some(&[ip("192.0.2.9")]))
+            .unwrap();
+        assert_eq!(got.source, Source::Server(ip("192.0.2.9")));
+        assert_eq!(got.answer.addresses(), vec![ip("198.51.100.9")]);
+        assert_eq!(t.log.len(), 1);
+        // Shared cache: the router's own lookup is answered from it.
+        assert_eq!(
+            r.lookup(&mut t, "corp.example").unwrap()[0],
+            ip("198.51.100.9")
+        );
     }
 }

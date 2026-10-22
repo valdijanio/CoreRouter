@@ -992,3 +992,42 @@ fn wrapped_and_terse_export_round_trip() {
     c.ok(&terse);
     assert_eq!(c.export(), a.export());
 }
+
+/// G4.1b: `/ip dns` and `/ip dns static` survive `/export` → `/import`,
+/// typed in the terminal the RouterOS way.
+#[test]
+fn dns_export_import_round_trip() {
+    let mut a = Term::new();
+    for line in [
+        "/ip dns set servers=1.1.1.1,9.9.9.9 allow-remote-requests=yes allowed-from=LAN,10.0.0.0/8 server-selection=sequential serve-stale-secs=3600",
+        "/ip dns static add name=nas.lan address=192.168.88.10 comment=\"file server\"",
+        "/ip dns static add name=www.lan type=CNAME cname=nas.lan",
+        "/ip dns static add regexp=\"^ads[0-9]*\\\\.example$\" type=NXDOMAIN",
+        "/ip dns static add name=corp.example type=FWD forward-to=10.0.0.53 match-subdomain=yes address-list=vpn",
+        "/ip dns static add name=_sip._udp.lan type=SRV srv-target=pbx.lan srv-port=5060 disabled=yes",
+        "/ip dns static add name=t.lan type=TXT text=\"v=spf1 -all\" ttl-secs=300",
+    ] {
+        a.ok(line);
+    }
+    let printed = a.ok("/ip dns static print");
+    assert!(
+        printed.contains("nas.lan") && printed.contains("CNAME"),
+        "{printed}"
+    );
+    let script = a.export();
+    assert!(script.contains("/ip dns static"), "{script}");
+    assert!(script.contains("allowed-from=LAN,10.0.0.0/8"), "{script}");
+    let mut b = Term::new();
+    b.router.files.insert("cfg.rsc".into(), script.clone());
+    b.ok("/import file=cfg.rsc");
+    assert_eq!(b.export(), script);
+    let dns = |t: &Term, p: &str| t.router.session.inspect(Some(p)).unwrap();
+    assert_eq!(
+        dns(&b, "running.ip.dns_static"),
+        dns(&a, "running.ip.dns_static")
+    );
+    assert_eq!(dns(&b, "running.ip.dns"), dns(&a, "running.ip.dns"));
+    // The cache is not configuration.
+    assert!(!script.contains("/ip dns cache"), "{script}");
+    a.ok("/ip dns cache flush");
+}
