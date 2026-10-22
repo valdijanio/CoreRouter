@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add Zone",
         ["IP", "DNS"],
         None,
-        "{name: name (the zone: example.com, 88.168.192.in-addr.arpa), type?: primary | secondary (default primary), primary_ns?: name (SOA MNAME; default ns1.<zone>), admin?: email or name (SOA RNAME; default hostmaster.<zone>), serial?: int (default: by serial_policy), serial_policy?: date | increment | unixtime (default date: YYYYMMDDnn), refresh_secs?: int (86400), retry_secs?: int (7200), expire_secs?: int (3600000), minimum_secs?: int (negative TTL, 3600), ttl_secs?: int (default record TTL, 3600), allow_transfer?: [prefix] (who may AXFR/IXFR; default nobody), notify?: [ip] (told on every change, RFC 1996), primaries?: [ip] (secondary: transfer from), disabled?: bool, comment?: string} → {id, name, serial}",
+        "{name: name (the zone: example.com, 88.168.192.in-addr.arpa), type?: primary | secondary (default primary), primary_ns?: name (SOA MNAME; default ns1.<zone>), admin?: email or name (SOA RNAME; default hostmaster.<zone>), serial?: int (default: by serial_policy), serial_policy?: date | increment | unixtime (default date: YYYYMMDDnn), refresh_secs?: int (86400), retry_secs?: int (7200), expire_secs?: int (3600000), minimum_secs?: int (negative TTL, 3600), ttl_secs?: int (default record TTL, 3600), allow_transfer?: [prefix] (who may AXFR/IXFR; default nobody), notify?: [ip] (told on every change, RFC 1996), primaries?: [ip] (secondary: transfer from), dnssec?: bool (sign the zone: KSK + ZSK, NSEC3), dnssec_algorithm?: ecdsa-p256 | ed25519 (default ecdsa-p256), signature_validity_secs?: int 86400..7776000 (default 1209600), disabled?: bool, comment?: string} → {id, name, serial}",
         always,
         add
     ),
@@ -40,7 +40,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Zone",
         [],
         None,
-        "{id: *hex | name, name?: name, primary_ns?: name, admin?: email or name, serial?: int, serial_policy?: date | increment | unixtime, refresh_secs?: int, retry_secs?: int, expire_secs?: int, minimum_secs?: int, ttl_secs?: int, allow_transfer?: [prefix], notify?: [ip], primaries?: [ip], disabled?: bool, comment?: string} → {id, name, serial} (\"\" clears a field)",
+        "{id: *hex | name, name?: name, primary_ns?: name, admin?: email or name, serial?: int, serial_policy?: date | increment | unixtime, refresh_secs?: int, retry_secs?: int, expire_secs?: int, minimum_secs?: int, ttl_secs?: int, allow_transfer?: [prefix], notify?: [ip], primaries?: [ip], dnssec?: bool, dnssec_algorithm?: ecdsa-p256 | ed25519, signature_validity_secs?: int, disabled?: bool, comment?: string} → {id, name, serial} (\"\" clears a field)",
         has_zones,
         set
     ),
@@ -54,7 +54,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.dns.zone.print", "DNS Zones", ["IP", "DNS"], None,
-        "{name?: string} → [{id, name, type, primary_ns?, admin?, serial, serial_policy, refresh_secs, retry_secs, expire_secs, minimum_secs, ttl_secs, allow_transfer?, notify?, primaries?, disabled?, comment?, records (count), status: running | disabled | loaded | not-loaded | config-only, loaded_serial?, refreshed_unix?, next_refresh_unix?, error?, flags (X disabled)}]",
+        "{name?: string} → [{id, name, type, primary_ns?, admin?, serial, serial_policy, refresh_secs, retry_secs, expire_secs, minimum_secs, ttl_secs, allow_transfer?, notify?, primaries?, disabled?, comment?, records (count), status: running | disabled | loaded | not-loaded | config-only, loaded_serial?, refreshed_unix?, next_refresh_unix?, error?, signed_serial?, signatures_expire_unix?, ds? ([DS for the parent]), flags (X disabled)}]",
         always, print),
     cmd!(query "ip.dns.zone.file.get", "Zone File", [], None,
         "{zone: name} → {zone, text (RFC 1035 zone file of what the zone serves)}",
@@ -270,6 +270,15 @@ fn apply_zone(z: &mut Zone, p: &Value) -> Result<()> {
     if let Some(v) = servers(p, "primaries", MAX_PRIMARIES)? {
         z.primaries = v;
     }
+    if let Some(v) = opt_bool(p, "dnssec")? {
+        z.dnssec = v;
+    }
+    if let Some(v) = opt_parse(p, "dnssec_algorithm")? {
+        z.dnssec_algorithm = v;
+    }
+    if let Some(v) = opt_u32(p, "signature_validity_secs")? {
+        z.signature_validity_secs = v;
+    }
     if let Some(v) = opt_bool(p, "disabled")? {
         z.disabled = v;
     }
@@ -277,7 +286,7 @@ fn apply_zone(z: &mut Zone, p: &Value) -> Result<()> {
         z.comment = v;
     }
     if let Some(why) = z.problem() {
-        let key = ["name", "primary_ns", "admin", "retry_secs", "expire_secs", "minimum_secs", "notify", "primaries", "allow_transfer"]
+        let key = ["name", "primary_ns", "admin", "retry_secs", "expire_secs", "minimum_secs", "notify", "primaries", "allow_transfer", "signature_validity_secs", "dnssec"]
             .into_iter()
             .find(|k| why.starts_with(k))
             .unwrap_or("type");
@@ -366,7 +375,21 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::bad("id", "no such zone"));
     };
     let old = z.name.clone();
+    let old_alg = z.dnssec_algorithm;
     apply_zone(&mut z, p)?;
+    if z.dnssec_algorithm != old_alg && s.dnssec_state().keys_of(&old).next().is_some() {
+        return Err(EngineError::bad(
+            "dnssec_algorithm",
+            "the zone has keys of the other algorithm: an algorithm rollover is not supported yet \
+             (turn dnssec off, wait for the DS to leave the parent, forget the keys)",
+        ));
+    }
+    if z.name != old && s.dnssec_state().keys_of(&old).next().is_some() {
+        return Err(EngineError::bad(
+            "name",
+            "a zone with DNSSEC keys cannot be renamed (its DS belongs to the old name)",
+        ));
+    }
     if z.name != old {
         if dz.zone(&z.name).is_some() {
             return Err(EngineError::bad("name", format!("zone {} already exists", z.name)));
@@ -401,6 +424,7 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
 fn print(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = opt_str(p, "name")?.map(normalize_host);
     let status = s.zone_backend().map(|b| b.status());
+    let keys = s.dnssec_state();
     let dz = zones(s);
     let rows: Vec<Value> = dz
         .zones
@@ -439,6 +463,25 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
                 if !st.error.is_empty() {
                     o.insert("error".into(), json!(st.error));
                 }
+                for (k, val) in [
+                    ("signed_serial", st.signed_serial.map(u64::from)),
+                    ("signatures_expire_unix", st.signatures_expire_unix),
+                ] {
+                    if let Some(val) = val {
+                        o.insert(k.into(), json!(val));
+                    }
+                }
+                if st.signed {
+                    o.insert("signed".into(), json!(true));
+                }
+            }
+            let ds: Vec<&str> = keys
+                .keys_of(&z.name)
+                .filter(|k| !k.ds.is_empty() && k.state != corerouter_model::dnssec::KeyState::Retired)
+                .map(|k| k.ds.as_str())
+                .collect();
+            if !ds.is_empty() {
+                o.insert("ds".into(), json!(ds));
             }
             o.insert("flags".into(), json!(if z.disabled { "X" } else { "" }));
             Some(v)

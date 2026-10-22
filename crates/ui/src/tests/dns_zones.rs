@@ -124,3 +124,39 @@ fn rows_say_what_they_are() {
         "data": "192.0.2.80", "ttl": 3600, "flags": ""});
     assert_eq!(record_row(&rec).cells[4], "(3600)", "the zone's TTL in parentheses");
 }
+
+/// G4.1c-2: the zone dialog shows the keys and the DS for the parent, and
+/// its rollover button reaches the engine.
+#[test]
+fn the_zone_dialog_shows_dnssec_keys() {
+    let mut s = Session::virtual_lab();
+    s.execute("ip.dns.zone.add", &json!({"name": "example.com", "dnssec": true}))
+        .unwrap();
+    let mut n = 0u16;
+    let mut fake = |_: &str,
+                    _: corerouter_model::dnssec::DnssecAlgorithm,
+                    role: corerouter_model::dnssec::KeyRole| {
+        n += 1;
+        let ksk = role == corerouter_model::dnssec::KeyRole::Ksk;
+        Ok(corerouter_engine::dnssec::NewKey {
+            private_key: "secret".into(),
+            dnskey: format!("{} 3 13 AAAA", if ksk { 257 } else { 256 }),
+            ds: if ksk { format!("{n} 13 2 ABCDEF") } else { String::new() },
+            key_tag: n,
+        })
+    };
+    s.dnssec_tick(0, &mut fake).unwrap();
+    let mut h = open(s, WIN);
+    // Select the zone and open its properties (Enter).
+    h.click(h.text("example.com"));
+    h.idle();
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    refresh(&mut h);
+    assert!(h.has_text("DNSSEC keys"), "{:?}", h.app.log());
+    assert!(h.has_text("DS 1 13 2 ABCDEF"));
+    assert!(!h.has_text("secret"));
+    h.click(h.text("Roll ZSK"));
+    refresh(&mut h);
+    let st = lock(&h.session).dnssec_state();
+    assert_eq!(st.rollovers.len(), 1, "{:?}", h.app.log());
+}

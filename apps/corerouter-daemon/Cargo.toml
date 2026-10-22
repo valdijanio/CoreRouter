@@ -18,7 +18,8 @@ corerouter-discovery.workspace = true
 corerouter-model.workspace = true
 corerouter-proto-lldp.workspace = true
 corerouter-proto-mndp.workspace = true
-corerouter-proto-dns.workspace = true
+# Signs zones (G4.1c-2): ring stays out of the engine and the GUI.
+corerouter-proto-dns = { workspace = true, features = ["dnssec"] }
 corerouter-proto-ntp.workspace = true
 corerouter-proto-syslog.workspace = true
 log.workspace = true

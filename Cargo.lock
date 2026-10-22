@@ -1262,12 +1262,14 @@ dependencies = [
 name = "corerouter-proto-dns"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "corerouter-model",
  "criterion",
  "hickory-proto",
  "ipnet",
  "proptest",
  "regex",
+ "rustls-pki-types",
  "thiserror 2.0.21",
 ]
 
@@ -2366,6 +2368,7 @@ version = "0.26.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "12b92608f679a6fa515dd1d15c1ff89443026e391200a2c840c7afcba482893d"
 dependencies = [
+ "bitflags 2.13.2",
  "data-encoding",
  "idna",
  "ipnet",
@@ -2373,7 +2376,9 @@ dependencies = [
  "once_cell",
  "rand 0.10.3",
  "ring",
+ "rustls-pki-types",
  "thiserror 2.0.21",
+ "time",
  "tinyvec",
  "tracing",
  "url",

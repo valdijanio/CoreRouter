@@ -489,6 +489,14 @@ impl Query {
     pub fn recursion_desired(&self) -> bool {
         self.request.metadata.recursion_desired
     }
+
+    /// The client wants DNSSEC records (EDNS DO bit, RFC 3225).
+    pub fn dnssec_ok(&self) -> bool {
+        self.request
+            .edns
+            .as_ref()
+            .is_some_and(|e| e.flags().dnssec_ok)
+    }
 }
 
 /// Reads a client's message. `Err(Some(bytes))`: answer with an error;
@@ -554,6 +562,8 @@ fn encode(q: &Query, r: &Reply) -> Option<Vec<u8>> {
     if req.edns.is_some() {
         let mut e = Edns::new();
         e.set_max_payload(q.config.config.ip.dns.max_udp_packet_size.max(512));
+        // RFC 3225 §3: DO is copied into the response.
+        e.set_dnssec_ok(q.dnssec_ok());
         m.set_edns(e);
     }
     let bytes = m.to_vec().ok()?;
