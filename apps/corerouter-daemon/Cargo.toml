@@ -20,6 +20,7 @@ corerouter-proto-lldp.workspace = true
 corerouter-proto-mndp.workspace = true
 log.workspace = true
 env_logger.workspace = true
+signal-hook.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

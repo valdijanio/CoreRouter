@@ -33,6 +33,12 @@ Vários processos CRDP no mesmo host (daemons, GUI) compartilham a porta (`SO_RE
   vizinho `hold` segundos depois do último anúncio.
 - **Despedida:** quando a descoberta para numa interface (saiu da lista, `enabled = false`), o
   roteador manda um último anúncio com `hold = 0`; quem recebe apaga o vizinho na hora.
+- **Despedida ao encerrar (G5.5):** SIGINT (Ctrl+C) ou SIGTERM (`kill`) no `corerouter-daemon`
+  manda `hold = 0` em toda interface onde ele anunciava (no lab virtual, pelo loopback do §5.1;
+  no `--backend linux`, também o LLDPDU com TTL 0 do §6), espera no máximo 1 s e sai com código
+  0; o log diz `shutting down: sent CRDP goodbye on N interface(s)`. Um segundo sinal durante o
+  encerramento sai na hora (código 130, sem despedida). `kill -9`, queda de energia ou pânico não
+  avisam: aí vale o `hold`. A GUI nativa (`Listener`) também apaga o vizinho ao ouvir `hold = 0`.
 - O daemon expira a tabela uma vez por segundo.
 
 ## 4. Formato
@@ -225,3 +231,4 @@ No laboratório virtual (`--backend virtual`) só roda o CRDP: não há enlace d
   `ether1` ligada por padrão no lab (G5.4).
 - 2026-10-22 — seção 7: detecção de "vizinho local" sem cache negativo permanente; vizinho remoto
   cinza com explicação (G5.4).
+- 2026-10-22 — §3: despedida no encerramento do daemon por SIGINT/SIGTERM (G5.5).

@@ -21,7 +21,7 @@ pub mod ws;
 pub use client::{Client, reply_result};
 pub use clock::spawn_clock;
 pub use dispatch::{Host, NO_UI, SharedHost, dispatch, dispatch_as, hang_up, new_caller};
-pub use server::{bind_loopback, serve, spawn};
-pub use ws::{WsPolicy, serve_ws, spawn_ws};
+pub use server::{Shutdown, bind_loopback, serve, serve_until, spawn};
+pub use ws::{WsPolicy, serve_ws, serve_ws_until, spawn_ws, spawn_ws_until};
 
 pub const DEFAULT_PORT: u16 = 7979;

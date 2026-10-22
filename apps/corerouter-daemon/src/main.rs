@@ -30,6 +30,18 @@
 //! and announces on none until told to. `--discovery-transport` overrides the
 //! choice (a lab run in a network namespace over veths named like its ports
 //! uses `interfaces`; that is how the netns test exercises the real path).
+//!
+//! Graceful shutdown (G5.5): on SIGINT (Ctrl+C) or SIGTERM (`kill`) the
+//! daemon stops accepting control and WebSocket connections, sends the
+//! discovery goodbye (CRDP hold 0, and with the linux backend LLDP TTL 0)
+//! on every interface it announced on, waiting at most [`GOODBYE_WAIT`],
+//! then takes the session lock for good (a commit in progress finishes, no
+//! new one starts, so no save is cut short) and exits with code 0. A second
+//! signal during the shutdown exits at once (code 130). Safe Mode active at
+//! that moment is not undone here: its changes were never saved, so the
+//! next start comes up on the config from before it, as G1.4 defines.
+//! The signals come from `signal-hook`'s iterator (a pipe written by its
+//! handler, read on a thread): no `unsafe` here and no async runtime.
 
 #[cfg(target_os = "linux")]
 mod link_discovery;
@@ -37,14 +49,19 @@ mod node_id;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use corerouter_control::{
-    DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_clock, spawn_ws,
+    DEFAULT_PORT, SharedHost, Shutdown, WsPolicy, bind_loopback, serve_until, spawn_clock,
+    spawn_ws_until,
 };
 use corerouter_discovery::{Agent, AgentConfig, Transport, enable_lab_default};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, lock, shared};
 use corerouter_hal::{Hal, VirtualHal};
 use corerouter_storage_fs::FileStorage;
+use signal_hook::consts::{SIGINT, SIGTERM};
+use signal_hook::iterator::Signals;
 
 const USAGE: &str = "\
 usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
@@ -63,6 +80,12 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
   --discovery-transport where CRDP announces: `interfaces` (host interfaces named like the
                         router's; default of --backend linux) or `loopback` (this host
                         only, labs see each other; default of --backend virtual)";
+
+/// Longest wait for the discovery goodbyes when shutting down.
+const GOODBYE_WAIT: Duration = Duration::from_secs(1);
+/// Exit code of a second signal during the shutdown (128 + SIGINT, as a
+/// shell reports an interrupted command).
+const EXIT_INTERRUPTED: i32 = 130;
 
 /// Writable config partition of the router image (docs/architecture.md 1.1).
 const PRODUCTION_CONFIG_DIR: &str = "/config";
@@ -149,7 +172,7 @@ fn parse_args() -> Result<Args, String> {
 }
 
 /// Start the WebSocket endpoint on its own thread, if asked for.
-fn websocket(args: &Args, host: SharedHost) -> Result<(), String> {
+fn websocket(args: &Args, host: SharedHost, shutdown: &Shutdown) -> Result<(), String> {
     let Some(port) = args.ws else {
         return Ok(());
     };
@@ -179,7 +202,7 @@ fn websocket(args: &Args, host: SharedHost) -> Result<(), String> {
         origins,
         web_root: args.web_root.clone(),
     };
-    spawn_ws(listener, host, policy)
+    spawn_ws_until(listener, host, policy, shutdown.clone())
         .map(|_| ())
         .map_err(|e| format!("cannot start the WebSocket thread: {e}"))
 }
@@ -244,6 +267,85 @@ fn link_discovery(
     }
 }
 
+fn signal_name(sig: i32) -> &'static str {
+    match sig {
+        SIGINT => "SIGINT",
+        SIGTERM => "SIGTERM",
+        _ => "signal",
+    }
+}
+
+/// Discovery threads that say goodbye on the way out.
+struct Discovery {
+    crdp: Option<Agent>,
+    #[cfg(target_os = "linux")]
+    lldp: Option<link_discovery::LinkDiscovery>,
+}
+
+/// Block until SIGINT/SIGTERM, then shut down as the module doc says.
+/// Never returns: exits the process.
+fn run_until_signal(
+    mut signals: Signals,
+    session: &corerouter_engine::Shared,
+    shutdown: &Shutdown,
+    discovery: Discovery,
+) -> ! {
+    let sig = signals.forever().next().unwrap_or(SIGTERM);
+    log::info!(
+        "{}: shutting down (again to exit at once)",
+        signal_name(sig)
+    );
+    let spawned = thread::Builder::new()
+        .name("signals".into())
+        .spawn(move || {
+            if let Some(sig) = signals.forever().next() {
+                log::warn!("{}: exiting now, without goodbye", signal_name(sig));
+                std::process::exit(EXIT_INTERRUPTED);
+            }
+        });
+    if let Err(e) = spawned {
+        log::warn!("a second signal will not cut the shutdown short: {e}");
+    }
+    shutdown.close();
+    let deadline = Instant::now() + GOODBYE_WAIT;
+    let left = || deadline.saturating_duration_since(Instant::now());
+    #[cfg(target_os = "linux")]
+    let lldp = discovery
+        .lldp
+        .map(|l| thread::spawn(move || l.shutdown(GOODBYE_WAIT)));
+    let crdp = discovery.crdp.map(|a| a.shutdown(left()));
+    match crdp {
+        Some(Some(n)) => log::info!("shutting down: sent CRDP goodbye on {n} interface(s)"),
+        Some(None) => log::warn!(
+            "shutting down: CRDP goodbye not sent within {} ms; neighbors forget us \
+             after their hold time",
+            GOODBYE_WAIT.as_millis()
+        ),
+        None => log::info!("shutting down: neighbor discovery was off, no goodbye"),
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(t) = lldp {
+        while !t.is_finished() && !left().is_zero() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        match t.is_finished().then(|| t.join().ok().flatten()).flatten() {
+            Some(n) => log::info!("shutting down: sent LLDP shutdown on {n} port(s)"),
+            None => log::warn!("shutting down: LLDP shutdown not sent in time"),
+        }
+    }
+    // Held until the process ends: a commit in progress finishes first and
+    // no new one (no new save) starts.
+    let s = corerouter_engine::lock(session);
+    if s.in_safe_mode() {
+        log::warn!(
+            "shutting down in Safe Mode: its changes were not saved; the next start \
+             uses the config from before Safe Mode"
+        );
+    }
+    log::info!("stopped");
+    std::process::exit(0)
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
         "warn,corerouter_daemon=info,corerouter_control=info,corerouter_engine=info,\
@@ -255,6 +357,15 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("{e}");
             return ExitCode::from(2);
+        }
+    };
+    // First, so a signal during start-up waits in the queue instead of
+    // killing the process before the goodbye exists.
+    let signals = match Signals::new([SIGINT, SIGTERM]) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot handle SIGINT/SIGTERM: {e}");
+            return ExitCode::FAILURE;
         }
     };
     let hal = match backend(&args.backend) {
@@ -292,8 +403,7 @@ fn main() -> ExitCode {
         args.backend
     );
     let node_id = node_id::load_or_create(config_dir.as_deref());
-    // Kept alive until `serve` returns (never, in practice).
-    let _discovery = match args.discovery_port {
+    let crdp = match args.discovery_port {
         None => None,
         Some(port) => {
             let transport = args
@@ -328,13 +438,24 @@ fn main() -> ExitCode {
             }
         }
     };
-    #[cfg(target_os = "linux")]
-    let _link_discovery = link_discovery(&args, &session, node_id);
-    let host = SharedHost(session);
-    if let Err(e) = websocket(&args, host.clone()) {
+    let discovery = Discovery {
+        crdp,
+        #[cfg(target_os = "linux")]
+        lldp: link_discovery(&args, &session, node_id),
+    };
+    let shutdown = Shutdown::default();
+    let host = SharedHost(session.clone());
+    if let Err(e) = websocket(&args, host.clone(), &shutdown) {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
-    serve(listener, host);
-    ExitCode::SUCCESS
+    let stop = shutdown.clone();
+    let control = thread::Builder::new()
+        .name("control".into())
+        .spawn(move || serve_until(listener, host, &stop));
+    if let Err(e) = control {
+        eprintln!("cannot start the control thread: {e}");
+        return ExitCode::FAILURE;
+    }
+    run_until_signal(signals, &session, &shutdown, discovery)
 }

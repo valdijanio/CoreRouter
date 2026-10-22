@@ -87,3 +87,39 @@ fn closing_the_safe_mode_connection_undoes_its_changes() {
     assert!(!ether2_disabled(&session), "the owner's hang-up must undo");
     assert!(!corerouter_engine::lock(&session).in_safe_mode());
 }
+
+#[test]
+fn shutdown_stops_accepting_and_closes_the_port() {
+    use corerouter_control::{Shutdown, WsPolicy, bind_loopback, serve_until, spawn_ws_until};
+    let session = shared(Session::virtual_lab());
+    let shutdown = Shutdown::default();
+    let tcp = bind_loopback(0).unwrap();
+    let ws = bind_loopback(0).unwrap();
+    let (tcp_addr, ws_addr) = (tcp.local_addr().unwrap(), ws.local_addr().unwrap());
+    let (host, stop) = (SharedHost(session.clone()), shutdown.clone());
+    let control = std::thread::spawn(move || serve_until(tcp, host, &stop));
+    let ws_thread = spawn_ws_until(
+        ws,
+        SharedHost(session),
+        WsPolicy::default(),
+        shutdown.clone(),
+    )
+    .unwrap();
+    // Open before the shutdown: keeps working.
+    let mut open = Client::connect(&tcp_addr.to_string(), Duration::from_secs(2)).unwrap();
+    assert_eq!(open.call("ping", Value::Null).unwrap()["pong"], true);
+
+    shutdown.close();
+    control.join().unwrap();
+    ws_thread.join().unwrap();
+    assert!(TcpStream::connect_timeout(&tcp_addr, Duration::from_secs(1)).is_err());
+    assert!(TcpStream::connect_timeout(&ws_addr, Duration::from_secs(1)).is_err());
+    assert_eq!(open.call("ping", Value::Null).unwrap()["pong"], true);
+    // Closing twice, or a loop started after the close, returns at once.
+    shutdown.close();
+    serve_until(
+        bind_loopback(0).unwrap(),
+        SharedHost(shared(Session::virtual_lab())),
+        &shutdown,
+    );
+}

@@ -45,6 +45,8 @@ base64 = "0.23.1"
 proptest = "1.12.0"
 # Synchronous WebSocket (daemon server for the web GUI); no async runtime.
 tungstenite = { version = "0.30.0", default-features = false, features = ["handshake"] }
+# SIGINT/SIGTERM for the daemon's graceful shutdown, safe API (self-pipe thread).
+signal-hook = { version = "0.3.18", default-features = false, features = ["iterator"] }
 
 [workspace.lints.rust]
 unsafe_code = "deny"

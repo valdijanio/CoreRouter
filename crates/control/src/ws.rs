@@ -27,7 +27,7 @@ use tungstenite::{Message, WebSocket};
 use corerouter_engine::Caller;
 
 use crate::dispatch::{Host, hang_up, new_caller};
-use crate::server::{MAX_CONNECTIONS, answer};
+use crate::server::{MAX_CONNECTIONS, Shutdown, answer};
 use crate::wire::MAX_REQUEST_LINE;
 
 /// Largest HTTP request head (request line + headers).
@@ -68,9 +68,28 @@ pub fn serve_ws<H: Host + Clone + Send + 'static>(
     host: H,
     policy: WsPolicy,
 ) {
+    serve_ws_until(listener, host, policy, &Shutdown::default());
+}
+
+/// Serve on the current thread until `shutdown` is closed.
+pub fn serve_ws_until<H: Host + Clone + Send + 'static>(
+    listener: TcpListener,
+    host: H,
+    policy: WsPolicy,
+    shutdown: &Shutdown,
+) {
     let policy = Arc::new(policy);
     let active = Arc::new(AtomicUsize::new(0));
+    shutdown.watch(&listener);
+    // A close that ran before `watch` did not wake this loop.
+    if shutdown.is_closed() {
+        return;
+    }
     for conn in listener.incoming() {
+        if shutdown.is_closed() {
+            log::info!("ws: no longer accepting connections");
+            return;
+        }
         let mut stream = match conn {
             Ok(s) => s,
             Err(e) => {
@@ -121,6 +140,18 @@ pub fn spawn_ws<H: Host + Clone + Send + 'static>(
     thread::Builder::new()
         .name("ws".into())
         .spawn(move || serve_ws(listener, host, policy))
+}
+
+/// [`spawn_ws`] that stops accepting when `shutdown` is closed.
+pub fn spawn_ws_until<H: Host + Clone + Send + 'static>(
+    listener: TcpListener,
+    host: H,
+    policy: WsPolicy,
+    shutdown: Shutdown,
+) -> io::Result<thread::JoinHandle<()>> {
+    thread::Builder::new()
+        .name("ws".into())
+        .spawn(move || serve_ws_until(listener, host, policy, &shutdown))
 }
 
 /// The parts of an HTTP request head this server looks at.
