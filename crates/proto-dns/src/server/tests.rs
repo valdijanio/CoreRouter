@@ -147,7 +147,15 @@ fn stages_are_in_order() {
     assert_eq!(
         names,
         [
-            "acl", "limit", "special", "adlist", "static", "zones", "cache", "upstream"
+            "acl",
+            "limit",
+            "special",
+            "adlist",
+            "static",
+            "zones",
+            "cache",
+            "upstream",
+            "statistics"
         ]
     );
 }

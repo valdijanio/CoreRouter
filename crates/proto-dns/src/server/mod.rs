@@ -3,8 +3,8 @@
 //! `stage/`, until one answers:
 //!
 //! ```text
-//! acl → limit → special → adlist → static → zones → cache → upstream
-//!  10     20       25        30       40      50      60       90
+//! acl → limit → special → adlist → static → zones → cache → upstream → statistics
+//!  10     20       25        30       40      50      60       90         100
 //! ```
 //!
 //! A stage is a `pub(crate) const STAGE: Stage` (found by `build.rs`, placed
@@ -35,6 +35,8 @@ use crate::resolver::{Resolver, Source, Transport};
 
 include!(concat!(env!("OUT_DIR"), "/stages.rs"));
 
+pub use statistics::{ClientStats, Counters, Snapshot, Statistics};
+
 /// The smallest message a client must accept (RFC 1035 §4.2.1).
 pub const MIN_UDP: usize = 512;
 /// Longest message read from a client (RFC 1035 §4.2.2: TCP length is 16
@@ -50,7 +52,8 @@ pub struct Stage {
     /// that needs the network returns [`Step::Wait`] then, and is called
     /// again on a worker with a transport.
     pub handle: fn(&Forwarder, &mut Query, Option<&mut dyn Transport>) -> Step,
-    /// Sees every reply the chain gave (whoever answered).
+    /// Sees every reply the chain gave (whoever answered), and drops too
+    /// ([`Query::dropped`]; the reply is then a placeholder SERVFAIL).
     pub after: Option<fn(&Forwarder, &mut Query, &Reply)>,
 }
 
@@ -192,8 +195,10 @@ pub(crate) fn stage_statics_compile(pattern: &str) -> Result<regex::Regex, Strin
 
 /// The networks `allowed_from` stands for in `cfg`: its prefixes, and the
 /// networks of the addresses of each listed interface list's members
-/// (static addresses; a LAN gets its address from the config; `from_pool`
-/// IPv6 addresses and DHCP-learned ones are left out: G4.1e).
+/// (an address still marked `from_pool` holds only the bits after the
+/// pool's prefix and is left out). The engine passes the effective config,
+/// with the DHCP-learned addresses in and the pools' addresses resolved
+/// (`Session::dns_allowed_networks`, G4.1e).
 pub fn allowed_networks(cfg: &Config) -> Vec<IpNet> {
     use corerouter_model::dns::AllowedFrom;
     let mut out: Vec<IpNet> = Vec::new();
@@ -388,13 +393,6 @@ impl Forwarder {
     }
 
     fn done(&self, mut q: Query) -> Done {
-        if q.dropped {
-            return Done {
-                reply: None,
-                effects: q.effects,
-                answered_by: q.answered_by,
-            };
-        }
         let reply = q
             .reply
             .take()
@@ -403,6 +401,13 @@ impl Forwarder {
             if let Some(after) = stage.after {
                 after(self, &mut q, &reply);
             }
+        }
+        if q.dropped {
+            return Done {
+                reply: None,
+                effects: q.effects,
+                answered_by: q.answered_by,
+            };
         }
         Done {
             reply: encode(&q, &reply),
@@ -463,6 +468,11 @@ impl Query {
             reply: None,
             dropped: false,
         })
+    }
+
+    /// A stage dropped it: no reply goes out.
+    pub fn dropped(&self) -> bool {
+        self.dropped
     }
 
     /// The client's question was sent with EDNS(0).

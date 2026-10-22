@@ -702,3 +702,19 @@ fn renew_without_a_service_clock_says_why() {
         .unwrap_err();
     assert!(err.to_string().contains("no service clock"), "{err}");
 }
+
+#[test]
+fn dns_allowed_from_counts_the_lease() {
+    // G4.1e: an interface of the list numbered by DHCP may ask the forwarder.
+    let mut l = Lab::new(Knobs::default());
+    l.add(json!({"interface": "ether1"}));
+    l.ok(
+        "interface.list.member.add",
+        json!({"list": "LAN", "interface": "ether1"}),
+    );
+    let nets = |l: &mut Lab| l.ok("ip.dns.get", Value::Null)["allowed_networks"].clone();
+    assert_eq!(nets(&mut l), json!([]), "no lease yet");
+    l.run(1_000);
+    let lease: ipnet::Ipv4Net = format!("{}/24", mine()).parse().unwrap();
+    assert_eq!(nets(&mut l), json!([lease.trunc().to_string()]));
+}
