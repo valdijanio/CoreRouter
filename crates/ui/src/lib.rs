@@ -6,6 +6,7 @@
 //! (eframe/winit/wgpu) belongs to `apps/corerouter-gui`.
 
 pub mod backend;
+mod dialog;
 mod float;
 mod interfaces;
 mod prefs;
@@ -437,6 +438,7 @@ impl CoreRouterUi {
     /// Draw one frame into the root `Ui`.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let now = ui.input(|i| i.time);
+        self.floats.begin_frame(ui.ctx());
         self.pump();
         self.refresh(now);
         self.pump();
@@ -488,8 +490,16 @@ impl CoreRouterUi {
                 |w| w.default_size(win.default_size()),
                 |ui| self.window(*win, ui),
             );
+            if win.closes_on_escape()
+                && floats
+                    .keys(&ctx, win_id(*win), float::Takes::Escape)
+                    .is_some()
+            {
+                open = self.escape(*win);
+            }
             if !open {
                 self.open.remove(win);
+                floats.closed(win_id(*win));
             }
         }
         self.floats = floats;
@@ -694,6 +704,20 @@ impl CoreRouterUi {
         {
             self.open.insert(win);
         }
+    }
+}
+
+impl CoreRouterUi {
+    /// Esc on a list window, one layer at a time: clear the find text,
+    /// else the selection, else close. Returns whether it stays open.
+    fn escape(&mut self, win: Win) -> bool {
+        let table = match win {
+            Win::Interfaces => &mut self.tables.interfaces,
+            Win::Addresses => &mut self.tables.addresses,
+            Win::Routes => &mut self.tables.routes,
+            _ => return false,
+        };
+        table.escape()
     }
 }
 
@@ -1233,6 +1257,8 @@ mod tests {
         }
     }
 
+    mod dialog_keys;
+
     #[test]
     fn rows_select_with_click_ctrl_shift_and_keys() {
         let mut h = Harness::new();
@@ -1310,9 +1336,12 @@ mod tests {
         h.click(h.text("OK"));
         let d = h.app.dialogs.first().expect("still open");
         assert!(
-            d.error.as_deref().is_some_and(|e| e.contains("required")),
+            d.status
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("required")),
             "{:?}",
-            d.error
+            d.status.error
         );
     }
 
@@ -1342,7 +1371,12 @@ mod tests {
         assert_eq!(h.iface("ether2").unwrap()["disabled"], true);
         // Remove on a physical port is refused and explained in place.
         h.click(h.text("Remove"));
-        assert!(h.app.dialogs.first().is_some_and(|d| d.error.is_some()));
+        assert!(
+            h.app
+                .dialogs
+                .first()
+                .is_some_and(|d| d.status.error.is_some())
+        );
         h.click(h.text("OK"));
         assert!(h.app.dialogs.is_empty());
     }
@@ -1452,11 +1486,12 @@ mod tests {
         h.click(h.text("OK"));
         let d = h.app.route_dialogs.first().expect("still open");
         assert!(
-            d.error
+            d.status
+                .error
                 .as_deref()
                 .is_some_and(|e| e.contains("not in any connected network")),
             "{:?}",
-            d.error
+            d.status.error
         );
         h.click(h.text("Cancel"));
         assert!(h.app.route_dialogs.is_empty());

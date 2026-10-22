@@ -4,12 +4,16 @@
 //! next to the ✕, a double click on the title and the title's context menu
 //! toggle between the work area and the rectangle the window had before.
 //!
+//! The keyboard of a window lives here too ([`Floats::keys`]): Enter,
+//! Ctrl+Enter and Esc reach only the window in front, and none of them
+//! while a popup (combo box, menu) is open, so they close the popup instead.
+//!
 //! The state is UI-local: nothing here goes through the engine.
 
 use egui::collapsing_header::CollapsingState;
 use egui::{
-    Atom, Context, Id, IdMap, IdSalt, Pos2, Rect, Response, Sense, Stroke, StrokeKind, TextStyle,
-    Ui, UiBuilder, Vec2, Window, pos2,
+    Atom, Context, Id, IdMap, IdSalt, IdSet, Key, LayerId, Modifiers, Order, Pos2, Rect, Response,
+    Sense, Stroke, StrokeKind, TextEdit, TextStyle, Ui, UiBuilder, Vec2, Window, pos2,
 };
 
 /// Placement of the floating windows (UI-local state only).
@@ -24,6 +28,44 @@ pub(crate) struct Floats {
     /// Last rectangle of each window while fully expanded (a collapsed
     /// window is only its title bar, which is not what to restore).
     expanded: IdMap<Rect>,
+    /// How the keyboard stood when this frame began, before any widget
+    /// reacted to this frame's keys.
+    start: Start,
+    /// Windows drawn this frame and the last one. egui keeps closed
+    /// windows in its layer order: only these can be in front.
+    shown: IdSet,
+    shown_last: IdSet,
+}
+
+#[derive(Default)]
+struct Start {
+    /// A popup or menu was open: Esc and Enter are its.
+    popup: bool,
+    /// Layer of the widget with keyboard focus (egui drops the focus on
+    /// Esc before the frame, so Esc goes to the window in front).
+    focus_layer: Option<LayerId>,
+    /// Enter belongs to the focused widget unless it is a text field (a
+    /// focused button or checkbox takes Enter as a click).
+    enter_is_ours: bool,
+}
+
+/// A key a window reacts to, read by [`Floats::keys`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Keyed {
+    /// Enter: OK.
+    Enter,
+    /// Ctrl+Enter (Cmd+Enter on a Mac): Apply.
+    CtrlEnter,
+    Escape,
+}
+
+/// Which keys a window takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Takes {
+    /// A dialog: Enter, Ctrl+Enter and Esc.
+    Dialog,
+    /// A list window: Esc only (Enter belongs to its table).
+    Escape,
 }
 
 /// egui draws a window at the size of its contents, which may be a little
@@ -41,8 +83,73 @@ impl Floats {
         self.maximized.contains_key(&id)
     }
 
+    /// Call once at the start of every frame, before any window is drawn.
+    pub(crate) fn begin_frame(&mut self, ctx: &Context) {
+        self.shown_last = std::mem::take(&mut self.shown);
+        let focused = ctx.memory(|m| m.focused());
+        self.start = Start {
+            popup: egui::Popup::is_any_open(ctx),
+            focus_layer: focused
+                .and_then(|f| ctx.read_response(f))
+                .map(|r| r.layer_id),
+            enter_is_ours: focused.is_none_or(|f| TextEdit::load_state(ctx, f).is_some()),
+        };
+    }
+
+    /// Whether the window `id` is the one the keyboard talks to: the one
+    /// holding the focus, or the one in front when nothing has it.
+    pub(crate) fn is_front(&self, ctx: &Context, id: Id) -> bool {
+        let layer = LayerId::new(Order::Middle, id);
+        match self.start.focus_layer {
+            Some(focus) if focus.order == Order::Middle => focus == layer,
+            _ => self.front(ctx) == Some(layer),
+        }
+    }
+
+    /// The topmost window still open (egui's own `top_layer_id` may be one
+    /// that was just closed).
+    fn front(&self, ctx: &Context) -> Option<LayerId> {
+        ctx.memory(|m| {
+            m.layer_ids()
+                .filter(|l| l.order == Order::Middle)
+                .filter(|l| self.shown.contains(&l.id) || self.shown_last.contains(&l.id))
+                .last()
+        })
+    }
+
+    /// The window `id` was closed: it is not in front any more.
+    pub(crate) fn closed(&mut self, id: Id) {
+        self.shown.remove(&id);
+        self.shown_last.remove(&id);
+    }
+
+    /// The key the window `id` was given this frame, consumed so nothing
+    /// else acts on it. Call after drawing the window (its widgets see the
+    /// keys first: a table takes its own Enter, a text field ends editing).
+    pub(crate) fn keys(&self, ctx: &Context, id: Id, takes: Takes) -> Option<Keyed> {
+        if self.start.popup || !self.is_front(ctx, id) {
+            return None;
+        }
+        ctx.input_mut(|i| {
+            if i.consume_key(Modifiers::NONE, Key::Escape) {
+                return Some(Keyed::Escape);
+            }
+            if takes != Takes::Dialog || !self.start.enter_is_ours {
+                return None;
+            }
+            if i.consume_key(Modifiers::COMMAND, Key::Enter) {
+                Some(Keyed::CtrlEnter)
+            } else if i.consume_key(Modifiers::NONE, Key::Enter) {
+                Some(Keyed::Enter)
+            } else {
+                None
+            }
+        })
+    }
+
     /// Drop what is kept for a window that will never be shown again.
     pub(crate) fn forget(&mut self, id: Id) {
+        self.closed(id);
         self.maximized.remove(&id);
         self.restore.remove(&id);
         self.expanded.remove(&id);
@@ -75,6 +182,7 @@ impl Floats {
         add_contents: impl FnOnce(&mut Ui) -> R,
     ) -> Option<R> {
         self.area = Some(area);
+        self.shown.insert(id);
         let bar = Bar::new(ctx);
         // Room on both sides of the centred title, so a long one is cut
         // before it reaches the maximize button.

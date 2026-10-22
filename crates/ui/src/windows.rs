@@ -91,6 +91,14 @@ impl Win {
         }
     }
 
+    /// List windows close on Esc (after clearing find text and selection).
+    pub(crate) fn closes_on_escape(self) -> bool {
+        matches!(
+            self,
+            Win::Interfaces | Win::Addresses | Win::Routes | Win::History | Win::Log
+        )
+    }
+
     pub(crate) fn default_size(self) -> [f32; 2] {
         match self {
             Win::Interfaces => [780.0, 520.0],
