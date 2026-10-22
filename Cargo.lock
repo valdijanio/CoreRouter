@@ -844,6 +844,8 @@ dependencies = [
  "corerouter-hal",
  "corerouter-hal-linux",
  "corerouter-model",
+ "corerouter-proto-lldp",
+ "corerouter-proto-mndp",
  "corerouter-storage-fs",
  "env_logger",
  "log",

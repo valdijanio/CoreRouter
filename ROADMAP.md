@@ -223,6 +223,18 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   esquecem na hora com a despedida (`cargo xtask netns`, ~9 s **medido**). Teste manual num netns
   descartável: dois daemons (7979 e 7981) e a GUI; a aba Neighbors mostrou os dois, o duplo
   clique conectou e IP › Neighbors listou o outro roteador (screenshots conferidos).
+- 2026-10-22 — G5.2 (Parte 2): LLDP e MNDP na tabela de vizinhos. Com `--backend linux` o daemon
+  (`apps/corerouter-daemon/src/link_discovery.rs`, uma thread) envia LLDP nas interfaces da
+  descoberta a cada `interval_secs` com TTL 4 × (System Name = identity, System Description =
+  `CoreRouter <versão>`, Chassis ID = node id do CRDP, Port ID = nome, Port Description =
+  comentário, Management Address = endereços da interface), reenvia logo quando o conteúdo muda
+  e manda TTL 0 quando a interface sai; recebe LLDP e escuta MNDP (UDP 5678, **nunca**
+  anunciado) e grava `lldp`/`mndp` com `record_neighbor`. Sem `CAP_NET_RAW` o LLDP fica
+  desligado com um aviso claro e o daemon segue (conferido com `setpriv`). `hal-linux`:
+  `LldpIo::set_interval`/`ifindex`. Testes: 7 unitários de mapeamento e
+  `tests/netns_l2.rs` (dois daemons linux em namespaces, veth ×2; crdp + lldp com o mesmo
+  node id, filtro por protocolo, MNDP sintético, interface sem descoberta não grava, TTL 0
+  apaga; ~14 s **medido**); helpers dos testes netns do daemon em `tests/common`.
 
 ## Histórico de revisão
 
@@ -239,3 +251,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.14.
 - 2026-10-22 — log do G1.4.
 - 2026-10-22 — log do G5.1.
+- 2026-10-22 — log do G5.2 (Parte 2).
