@@ -222,11 +222,11 @@ impl PanelState for TsigPanel {
         };
         match *r {
             Reply::Added { id } => {
-                if let Some(d) = self.dialog.as_mut().filter(|d| d.id == id) {
-                    if d.status.replied(result) {
-                        app.floats.forget(dialog_id(id));
-                        self.dialog = None;
-                    }
+                if let Some(d) = self.dialog.as_mut().filter(|d| d.id == id)
+                    && d.status.replied(result)
+                {
+                    app.floats.forget(dialog_id(id));
+                    self.dialog = None;
                 }
                 if let Ok(v) = result {
                     // RFC 8945 keys are shared: shown once now, to copy.

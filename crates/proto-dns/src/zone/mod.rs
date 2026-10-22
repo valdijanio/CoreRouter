@@ -620,12 +620,16 @@ pub struct Changed {
     pub soa: Record,
 }
 
+/// What a [`Zones`] was built from: the config generation and the dynamic
+/// records' version.
+type BuiltFrom = (u64, u64);
+
 /// The zone state of a [`Forwarder`] (`f.state::<Runtime>()`).
 #[derive(Default)]
 pub struct Runtime {
     /// The zones of the config generation and dynamic version they were
     /// built from.
-    current: RwLock<Option<((u64, u64), Arc<Zones>)>>,
+    current: RwLock<Option<(BuiltFrom, Arc<Zones>)>>,
     /// The dynamic records (G4.1c-3), with the engine's version.
     dynamic: RwLock<(u64, Arc<DynamicState>)>,
     /// Who answers RFC 2136 UPDATE (the daemon's zone service).
