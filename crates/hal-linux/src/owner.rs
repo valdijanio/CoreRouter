@@ -167,6 +167,7 @@ fn claim_fits(claim: &InterfaceKind, link: &KernelLink) -> bool {
         InterfaceKind::Bridge => link.is("bridge"),
         InterfaceKind::Loopback => link.is("dummy"),
         InterfaceKind::Vrf { .. } => link.is("vrf"),
+        InterfaceKind::Bonding { .. } => link.is("bond"),
     }
 }
 

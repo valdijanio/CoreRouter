@@ -1,5 +1,5 @@
-//! /interface — ports, VLANs, bridges and loopbacks (VRFs are interfaces
-//! too, managed by `ip.vrf.*`).
+//! /interface — ports, VLANs, bridges and loopbacks (VRFs and bonds are
+//! interfaces too, managed by `ip.vrf.*` and `interface.bonding.*`).
 
 use std::collections::BTreeMap;
 
@@ -16,14 +16,14 @@ pub const MAX_INTERFACES: usize = 4096;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.list", "Interfaces", ["Interfaces"], None,
-        "{type?: string (ether | vlan | bridge | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, bridge, vrf, table}]",
+        "{type?: string (ether | vlan | bridge | bonding | loopback | vrf | veth | …)} → [{name, type, kind, managed, unmanaged_reason, mtu, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, comment, parent, vlan_id, bridge, bond, vrf, table}]",
         always, list),
     cmd!(
         "interface.set",
         "Set Interface",
         [],
         None,
-        "{name: string, mtu?: u32 (68..=9216), disabled?: bool, comment?: string} → {name}",
+        "{name: string, mtu?: u32 (68..=9216; a bond passes it to its slaves), disabled?: bool, comment?: string} → {name}",
         always,
         set
     ),
@@ -80,7 +80,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove Interface",
         [],
         None,
-        "{name: string (not a physical port; nothing may depend on it)} → {name}",
+        "{name: string (not a physical port; nothing may depend on it; a bond releases its slaves)} → {name}",
         always,
         remove
     ),
@@ -125,6 +125,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 "parent": parent,
                 "vlan_id": vlan_id,
                 "bridge": i.bridge,
+                "bond": i.bond,
                 "vrf": i.vrf,
                 "table": table,
             })
@@ -156,6 +157,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     "parent": null,
                     "vlan_id": null,
                     "bridge": null,
+                    "bond": null,
                     "vrf": null,
                     "table": null,
                 })
@@ -177,9 +179,22 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let mtu = opt_u32(p, "mtu")?.map(parse_mtu).transpose()?;
     let disabled = opt_bool(p, "disabled")?;
     let comment = opt_text(p, "comment", 256)?;
-    let iface = s
-        .store_mut()
-        .candidate_mut()
+    let cfg = s.store_mut().candidate_mut();
+    if let Some(mtu) = mtu {
+        if let Some(b) = cfg.interfaces.get(&name).and_then(|i| i.bond.as_ref()) {
+            return Err(EngineError::bad(
+                "mtu",
+                format!("'{name}' is a slave of '{b}' and takes its MTU; set it on '{b}'"),
+            ));
+        }
+        // A bond's slaves follow its MTU (the kernel does the same).
+        for slave in cfg.interfaces.values_mut() {
+            if slave.bond.as_ref() == Some(&name) {
+                slave.mtu = mtu;
+            }
+        }
+    }
+    let iface = cfg
         .interfaces
         .get_mut(&name)
         .ok_or_else(|| EngineError::bad("name", format!("no interface '{name}'")))?;
@@ -466,6 +481,13 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let cfg = s.store_mut().candidate_mut();
     cfg.interfaces.remove(&name);
+    // A bond takes its slaves with it (RouterOS does the same): they go
+    // back to being plain ports.
+    for slave in cfg.interfaces.values_mut() {
+        if slave.bond.as_ref() == Some(&name) {
+            slave.bond = None;
+        }
+    }
     // Discovery stops on it with it, instead of blocking the removal.
     cfg.ip.neighbor_discovery.interfaces.remove(&name);
     Ok(json!({ "name": name }))

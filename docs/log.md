@@ -703,3 +703,102 @@ continuação indentadas).
   de protocolo novos + proptest de params hostis) ou, no Claude Code com
   `claude mcp add corerouter -- corerouter-cli mcp`, `@corerouter:corerouter://state` e
   `/mcp__corerouter__review_and_commit`. Detalhes em `docs/mcp.md`.
+- 2026-10-22 — G1.3: Drift, parte 1: `config.drift.list` diz onde o kernel não tem mais o que a config em execução
+  (mais o que os clientes DHCP instalaram) pôs lá — link virtual apagado, porta derrubada, MTU
+  trocado, porta tirada da bridge/VRF, endereço apagado ou a mais, rota estática apagada ou a mais
+  num link gerenciado. Endereço que o kernel fez sozinho (SLAAC, link-local IPv6), rota de outro
+  protocolo e link de outro programa não são drift. `config.drift.reconcile` põe de volta (tudo ou
+  nada por rodada, até 3 rodadas enquanto houver progresso: entrar numa VRF derruba IPv6, que a
+  rodada seguinte recoloca), não muda a config nem a revisão e fica no journal; porta física que
+  sumiu fica como `fixable: false`. Se a conexão de quem chama chega por um endereço fora da config,
+  o reconcile recusa removê-lo (diz para `ip.address.add` ou `force: true`), como o lockout do
+  firewall. O motor fica em `corerouter_hal::drift` (o que a config põe no kernel, `diff`,
+  `repaired`); o hal-linux lê endereços (`IFA_F_PERMANENT`) e rotas `proto static` por rtnetlink e
+  gera os ops de reparo (`plan::repair`, na ordem do `plan`); o lab virtual guarda um "kernel" que
+  o teste altera (`VirtualHal::kernel()`).
+
+  Testar: `cargo test -p corerouter-engine --test drift` (lab: cada tipo de drift, porta sumida,
+  candidate não conta, proteção da conexão, params inválidos);
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_drift`
+  (kernel real: `ip addr del`, `ip link del` da VLAN, `ip link set nomaster`, MTU, rota a mais →
+  drift visto e reconciliado, conferido com `ip`). Na mão: daemon `--backend linux` num namespace,
+  `ip addr del …`, depois `corerouter-cli run config.drift.list` e `config.drift.reconcile`.
+
+- 2026-10-22 — G4.4: Prometheus, parte 1: `corerouter-daemon --metrics 9100` serve `/metrics` no formato de texto do
+  Prometheus 0.0.4 (`text/plain; version=0.0.4`) em 127.0.0.1:9100; `--metrics 0.0.0.0:9100` (ou
+  `[::]:9100`) abre para a rede com um aviso no log (sem login, como o node_exporter). Cada scrape
+  roda a consulta nova `system.metrics` (tudo é comando: CLI e MCP leem os mesmos números), que
+  traz por interface (config + links da plataforma, inclusive não gerenciados) bytes, pacotes,
+  erros, descartes, `running`, `disabled` e quedas de link vistas pelo motor, e os contadores do
+  motor desde o início: comandos de mudança e consultas por resultado, ids desconhecidos, commits
+  aplicados e recusados, revisão e Safe Mode. O daemon renderiza com nomes no estilo
+  netdev/netclass do node_exporter (`corerouter_interface_receive_bytes_total{interface="ether1"}`,
+  `corerouter_interface_up`, `corerouter_interface_info{type,managed}`,
+  `corerouter_commands_total{kind,result}`, `corerouter_commits_total{result}`,
+  `corerouter_config_revision`, `corerouter_safe_mode`, `corerouter_build_info`,
+  `corerouter_scrape_duration_seconds`); contador que a plataforma não tem não gera amostra (nunca
+  um zero inventado). Servidor HTTP mínimo em `std`: só `GET`/`HEAD` de `/metrics` e `/` (405 com
+  `Allow`, 404, 400), uma conexão por vez, cabeçalho limitado a 8 KiB e 2 s no total, escrita com
+  5 s de timeout; valores de label escapados (`\`, `"`, quebra de linha) e truncados em 128
+  caracteres. Contadores do motor em `crates/engine/src/metrics.rs` (dois incrementos em
+  `session.rs`: `execute` e o commit).
+  Testar: `cargo run -p corerouter-daemon -- --metrics 9100` e `curl -s 127.0.0.1:9100/metrics`;
+  `cargo run -p corerouter-cli -- run system.metrics`. Testes: `crates/engine/tests/metrics.rs`,
+  unitários do formato em `apps/corerouter-daemon/src/metrics.rs` (regras do formato: HELP/TYPE
+  uma vez antes das amostras, famílias sem intercalar, `_total` só em counter, série sem repetir) e
+  `apps/corerouter-daemon/tests/metrics.rs` (daemon real: scrape, contador sobe depois de um
+  `ip.address.add`, HEAD/POST/404, pedido de 64 KiB cortado). Custo de um scrape no laboratório
+  virtual com 8 portas: uma consulta à plataforma por interface (`counters`) sob o lock da sessão,
+  **estimado** abaixo de 1 ms; no linux cada interface abre o ethtool, então com centenas de
+  interfaces o scrape pesa (vira medição no G4.4c).
+
+- 2026-10-22 — G4.7c: Cliente DHCP, parte 3 (resiliência). Cada ACK é lembrado no estado `dhcp-leases` do
+  armazenamento (`state-dhcp-leases.json`, fora da config e das revisões; `ConfigStorage` ganhou
+  `load_state`/`save_state` com padrão vazio). Ao recomeçar (daemon reiniciado, cliente ou
+  interface reabilitados) o cliente faz INIT-REBOOT: REQUEST broadcast com a opção 50 e sem a 54;
+  ACK → bound sem DISCOVER; NAK → esquece e descobre; ~12 s sem resposta → usa a concessão
+  lembrada pelo resto do tempo (RFC 2131 §3.2) ou, vencida, DISCOVER pedindo o mesmo endereço.
+  `fallback_address` sobe após `fallback_timeout` s sem concessão (padrão 30) e sai no mesmo apply
+  em que uma chega. `check_gateway` (none/arp/ping) checa o gateway a cada 10 s; após 2 falhas as
+  rotas por ele saem do data plane (inativas em `ip.route.list`; a de distância maior assume) e
+  voltam na primeira resposta. O `list` mostra `gateway_status`, `fallback_active` e `remembered`;
+  na GUI, campos novos nas abas Advanced e Status. Desenho e pesquisa em `docs/dhcp-client.md` §15.
+
+  Testar: `cargo test -p corerouter-engine --test dhcp_resilience`, `cargo test -p
+  corerouter-proto-dhcp client`; netns: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user
+  --net -- cargo test -p corerouter-daemon --test netns_dhcp_resilience` (check-gateway tira a rota
+  padrão do kernel e a devolve; o daemon reiniciado manda REQUEST e nenhum DISCOVER; ~25 s,
+  **medido**). Lab: `ip.dhcp-client.add {"interface":"ether1","check_gateway":"arp","fallback_address":"192.168.100.2/24"}`.
+
+- 2026-10-22 — G1.8: Bonding (`/interface bonding` do RouterOS v7). Comandos `interface.bonding.add {name, slaves, mode, primary?, transmit_hash_policy?, lacp_rate?, mii_interval?, min_links?, mtu?, comment?}`, `interface.bonding.set` (troca slaves e parâmetros) e `interface.bonding.list`; `interface.remove` apaga o bond e solta os slaves. Os 7 modos do Linux com os nomes do RouterOS (`802.3ad`, `active-backup`, `balance-rr`, `balance-xor`, `broadcast`, `balance-tlb`, `balance-alb`; `lacp` também vale). O modo é obrigatório (o padrão `balance-rr` do RouterOS embaralha a ordem dos pacotes e precisa de LAG estático no switch). Slave só pode ser porta ethernet sem endereço, cliente DHCP/DHCPv6, VLAN, bridge, VRF nem outro bond; o erro diz o que tirar e onde pôr (no bond). Recusa o que não teria efeito: `primary` fora de active-backup/tlb/alb ou fora dos slaves, `transmit_hash_policy` em modo que não faz hash, `lacp_rate` fora do 802.3ad, `min_links` maior que o número de slaves (o bond nunca subiria). O MTU do bond vale para os slaves (como no kernel); `interface.set mtu` num slave é recusado. A validação do commit (`validate.rs`) é a rede para config carregada e modo transacional. No modelo, `InterfaceKind::Bonding` e `Interface.bond` (o slave aponta para o bond, como a porta de bridge, então ninguém é slave de dois). `hal-linux` cria o `bond` via rtnetlink (mudar um parâmetro recria o bond, com os slaves soltos antes e de volta depois), baixa o link antes de escravizar ("Device can not be enslaved while up") e reaplica o estado admin depois de entrar/sair de um bond; o undo de um apply que falhou devolve slaves e estado. Janela Interfaces › Bonding (painel `crates/ui/src/bonding.rs`, tabela G1.9, diálogo com os slaves em caixas de seleção e os campos do modo escolhido).
+
+  Como testar: `cargo test -p corerouter-engine --test bonding`; `cargo test -p corerouter-hal-linux --lib plan`; `cargo xtask netns` (inclui `tests/netns_bond.rs`; sem o módulo `bonding` o teste pula, e o CI o carrega e exige com `COREROUTER_REQUIRE_BOND=1`); `cargo test -p corerouter-ui bonding`. Na mão: `corerouter-cli run interface.bonding.add '{"name":"bond1","slaves":["ether1","ether2"],"mode":"802.3ad"}'` e Interfaces › Bonding na GUI.
+
+- 2026-10-22 — G4.6: NTP e syslog remoto, parte 1. Comandos estilo RouterOS: `system.ntp.client.set/get`
+  (`enabled`, `servers` com IP ou nome DNS, `min_poll`/`max_poll` 6..17 — o RouterOS aceita 3, mas a
+  RFC 4330 §5 proíbe perguntar mais de uma vez por minuto; habilitar sem servidor é recusado) e
+  `system.logging.action.add/set/remove/list` (alvo remoto: `remote`, `remote_port` 514,
+  `src_address`, `syslog_facility` padrão `daemon`, `syslog_severity` padrão `auto`) +
+  `system.logging.add/set/remove/list` (`topics` com `!` para excluir, como no RouterOS; tópicos
+  conferidos contra uma lista fixa, então um erro de digitação não cria regra inútil; ação em uso
+  não pode ser removida). Crates novos L2 puros: `proto-ntp` (pacote SNTPv4, checagens da RFC 4330 §5,
+  Kiss-o'-Death da RFC 5905 §7.4, offset/atraso da §8, eras de 2036) e `proto-syslog` (RFC 5424 §6,
+  só encode, campos do cabeçalho saneados e corte em 1180 bytes na fronteira UTF-8, RFC 5426 §3.2),
+  os dois com proptest. No daemon: thread do cliente SNTP (pergunta a todos os servidores, fica com o
+  menor atraso, intervalo dobra até `max_poll`, DENY/RSTR descartam o servidor, RATE vai ao
+  `max_poll`; status `stopped`/`waiting`/`synchronized` com servidor, estrato, offset e atraso em
+  `system.ntp.client.get`) e thread de syslog remoto (mudanças de config `system,info` + tópico da
+  área, comandos que falharam `…,error`, sincronizou/perdeu NTP `ntp,info`/`ntp,warning`; nunca
+  envia segurando o lock da sessão). O cliente **não acerta o relógio** ainda: registra um aviso se o
+  offset passar de 1 s (G4.6b).
+
+  Como testar: `cargo test -p corerouter-proto-ntp -p corerouter-proto-syslog`, `cargo test -p
+  corerouter-engine --test ntp_logging`, `cargo test -p corerouter-daemon --bins ntp remote_log`
+  (servidor SNTP e coletor syslog de teste em 127.0.0.1). À mão:
+  `corerouter-daemon --control 7466 --no-discovery`, depois `corerouter-cli --connect
+  127.0.0.1:7466 run system.ntp.client.set '{"enabled":true,"servers":["pool.ntp.org","time.cloudflare.com"]}'`
+  e `run system.ntp.client.get`: **medido** em 2026-10-22, `synchronized` com time.cloudflare.com
+  (estrato 3, atraso 44,6 ms, offset −5,5 ms) em menos de 6 s; com
+  `system.logging.action.add {"name":"lab","remote":"127.0.0.1","remote_port":15514}` e
+  `system.logging.add {"topics":"info","action":"lab"}` um `nc -ul 15514` recebe
+  `<30>1 2026-10-22T14:36:13.366151Z CoreRouter corerouter 11354 system - system.logging.add …`.
