@@ -25,7 +25,7 @@ use crate::chip::{AMBER, BLUE, GREEN, RED, chip, hashed, neutral_tone, palette_t
 use crate::dhcp_client::text;
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::action;
-use crate::{CoreRouterUi, err_color};
+use crate::{CoreRouterUi, Win, err_color};
 
 const NAME: &str = "dns-lookup";
 pub(crate) const WIN: &str = "dns-lookup";
@@ -43,7 +43,8 @@ pub(crate) const PANEL: Panel = Panel {
         id: WIN,
         group: "Tools",
         title: "DNS Lookup",
-        size: [780.0, 520.0],
+        // Opens as tall as the form; the window grows with the answers.
+        size: [780.0, 120.0],
         escape: true,
     }],
     new: || Box::new(LookupPanel::default()),
@@ -83,6 +84,24 @@ pub(crate) struct LookupPanel {
     pub(crate) selected: Option<(&'static str, usize)>,
     /// Each row's rectangle from the last frame (the click area).
     rows: BTreeMap<(&'static str, usize), egui::Rect>,
+}
+
+/// Open Tools › DNS Lookup asking the router for `name` (DNS Cache's
+/// Resolve…); an empty name keeps what the form had.
+pub(crate) fn open_with(app: &mut CoreRouterUi, name: &str, rtype: &str) {
+    if let Some(p) = app.panel_mut::<LookupPanel>()
+        && !name.is_empty()
+    {
+        p.name = name.to_owned();
+        p.ask = Ask::Router;
+        if TYPES.contains(&rtype) {
+            p.rtype = rtype.to_owned();
+        }
+    }
+    if !app.open.insert(Win::Panel(WIN)) {
+        app.floats.raise(crate::win_id(Win::Panel(WIN)));
+    }
+    app.cache.refreshed_at = None;
 }
 
 impl Default for LookupPanel {
@@ -302,7 +321,8 @@ impl LookupPanel {
         };
         egui::ScrollArea::vertical()
             .id_salt("dns-lookup-results")
-            .auto_shrink([false, false])
+            .auto_shrink([false, true])
+            .min_scrolled_height(crate::windows::grow_height(ui))
             .show(ui, |ui| {
                 // A click selects the row (copies are in its right-click
                 // menu), never starts a text selection inside a cell.

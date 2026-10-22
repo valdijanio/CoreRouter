@@ -143,8 +143,9 @@ impl CoreRouterUi {
             && self.can.check(id).is_ok()
     }
 
-    /// The state of panel type `T` (tests look inside).
-    #[cfg(test)]
+    /// The state of panel type `T` (tests look inside; a panel fills in
+    /// another's form, as DNS Cache does for DNS Lookup). `None` while that
+    /// panel is drawing itself.
     pub(crate) fn panel_mut<T: PanelState>(&mut self) -> Option<&mut T> {
         self.panels
             .iter_mut()
