@@ -1,4 +1,4 @@
-//! G1.20: the internal windows as a hierarchy (a dialog belongs to the
+//! G1.21: the internal windows as a hierarchy (a dialog belongs to the
 //! list it was opened from), driven with synthetic events through the real
 //! UI: asking again brings a dialog to the front, a child opens over its
 //! parent and stays above it, closing the parent closes (or asks about) its

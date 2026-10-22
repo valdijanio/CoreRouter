@@ -77,6 +77,104 @@ pub(crate) fn links() -> Result<Vec<KernelLink>, HalError> {
     })
 }
 
+/// What one link's `RTM_NEWLINK` says beyond [`KernelLink`] (G1.19).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LinkDetail {
+    pub link: KernelLink,
+    pub perm_mac: Option<String>,
+    pub min_mtu: Option<u32>,
+    pub max_mtu: Option<u32>,
+    pub rx_queues: Option<u32>,
+    pub tx_queues: Option<u32>,
+    /// `pci` and `0000:03:00.0` for a PCI NIC (kernel ≥ 5.16).
+    pub parent_bus: Option<String>,
+    pub parent_dev: Option<String>,
+    pub carrier_changes: Option<u32>,
+    pub carrier_down_count: Option<u32>,
+    /// Every `IFLA_STATS64` counter, kernel names.
+    pub stats: Vec<(String, u64)>,
+}
+
+/// Link `name` of the current network namespace; `Ok(None)` if absent.
+pub(crate) fn link_detail(name: &str) -> Result<Option<LinkDetail>, HalError> {
+    let name = name.to_owned();
+    with_kernel(|k| async move {
+        let mut s = k.handle.link().get().match_name(name.clone()).execute();
+        match s.try_next().await {
+            Ok(Some(m)) => Ok(Some(detail(&m))),
+            Ok(None) => Ok(None),
+            Err(e) if errno(&e) == Some(ENODEV) => Ok(None),
+            Err(e) => Err(HalError::Io(format!(
+                "reading link {name}: {}",
+                readable(&e)
+            ))),
+        }
+    })
+}
+
+fn mac_text(mac: &[u8]) -> Option<String> {
+    (mac.len() == 6 && mac.iter().any(|b| *b != 0)).then(|| {
+        mac.iter()
+            .map(|b| format!("{b:02X}"))
+            .collect::<Vec<_>>()
+            .join(":")
+    })
+}
+
+fn detail(m: &LinkMessage) -> LinkDetail {
+    let mut d = LinkDetail {
+        link: kernel_link(m),
+        ..LinkDetail::default()
+    };
+    for a in &m.attributes {
+        match a {
+            LinkAttribute::PermAddress(mac) => d.perm_mac = mac_text(mac),
+            LinkAttribute::MinMtu(v) => d.min_mtu = Some(*v),
+            LinkAttribute::MaxMtu(v) => d.max_mtu = Some(*v),
+            LinkAttribute::NumRxQueues(v) => d.rx_queues = Some(*v),
+            LinkAttribute::NumTxQueues(v) => d.tx_queues = Some(*v),
+            LinkAttribute::ParentDevBusName(v) => d.parent_bus = Some(v.clone()),
+            LinkAttribute::ParentDevName(v) => d.parent_dev = Some(v.clone()),
+            LinkAttribute::CarrierChanges(v) => d.carrier_changes = Some(*v),
+            LinkAttribute::CarrierDownCount(v) => d.carrier_down_count = Some(*v),
+            LinkAttribute::Stats64(st) => {
+                d.stats = [
+                    ("rx_bytes", st.rx_bytes),
+                    ("tx_bytes", st.tx_bytes),
+                    ("rx_packets", st.rx_packets),
+                    ("tx_packets", st.tx_packets),
+                    ("rx_errors", st.rx_errors),
+                    ("tx_errors", st.tx_errors),
+                    ("rx_dropped", st.rx_dropped),
+                    ("tx_dropped", st.tx_dropped),
+                    ("multicast", st.multicast),
+                    ("collisions", st.collisions),
+                    ("rx_length_errors", st.rx_length_errors),
+                    ("rx_over_errors", st.rx_over_errors),
+                    ("rx_crc_errors", st.rx_crc_errors),
+                    ("rx_frame_errors", st.rx_frame_errors),
+                    ("rx_fifo_errors", st.rx_fifo_errors),
+                    ("rx_missed_errors", st.rx_missed_errors),
+                    ("tx_aborted_errors", st.tx_aborted_errors),
+                    ("tx_carrier_errors", st.tx_carrier_errors),
+                    ("tx_fifo_errors", st.tx_fifo_errors),
+                    ("tx_heartbeat_errors", st.tx_heartbeat_errors),
+                    ("tx_window_errors", st.tx_window_errors),
+                    ("rx_compressed", st.rx_compressed),
+                    ("tx_compressed", st.tx_compressed),
+                    ("rx_nohandler", st.rx_nohandler),
+                    ("rx_otherhost_dropped", st.rx_otherhost_dropped),
+                ]
+                .into_iter()
+                .map(|(n, v)| (n.to_owned(), v))
+                .collect();
+            }
+            _ => {}
+        }
+    }
+    d
+}
+
 /// A `RTM_NEWLINK` message as [`KernelLink`].
 fn kernel_link(m: &LinkMessage) -> KernelLink {
     let flags = m.header.flags;
@@ -94,14 +192,7 @@ fn kernel_link(m: &LinkMessage) -> KernelLink {
             LinkAttribute::Controller(v) if *v != 0 => l.master = Some(*v),
             LinkAttribute::LinkNetNsId(_) => l.peer_elsewhere = true,
             LinkAttribute::OperState(st) => oper = Some(*st),
-            LinkAttribute::Address(mac) if mac.len() == 6 && mac.iter().any(|b| *b != 0) => {
-                l.mac = Some(
-                    mac.iter()
-                        .map(|b| format!("{b:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(":"),
-                );
-            }
+            LinkAttribute::Address(mac) if mac_text(mac).is_some() => l.mac = mac_text(mac),
             LinkAttribute::Stats64(st) => {
                 l.rx_bytes = st.rx_bytes;
                 l.tx_bytes = st.tx_bytes;

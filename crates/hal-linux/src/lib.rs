@@ -14,12 +14,26 @@
 //!   netlink plan; if the plan then fails, the old ruleset goes back.
 //! - `features`: probed once, on first use, with a throwaway link per
 //!   capability (`netlink::features`), then cached (G1.14).
+//! - interface dialog (G1.19): `nic` answers `ethernet_monitor`, `hardware`
+//!   and `counters` from rtnetlink, the `ethtool`/`devlink` generic netlink
+//!   families (`genl`, `ethtool`; never the ioctls) and sysfs device files;
+//!   `pci_ids` names the PCI ids.
 //!
 //! Integration tests run against a real kernel inside a throwaway network
 //! namespace, without root: see `tests/netns.rs`.
 
 pub mod owner;
+pub mod pci_ids;
 pub mod plan;
+
+/// Generic netlink codec (pure) and socket (Linux) for G1.19.
+mod genl;
+
+/// Interface dialog data: ethtool netlink, devlink, sysfs (G1.19).
+#[cfg(target_os = "linux")]
+mod ethtool;
+#[cfg(target_os = "linux")]
+mod nic;
 
 #[cfg(target_os = "linux")]
 mod netlink;
@@ -40,7 +54,10 @@ mod linux {
     use std::sync::OnceLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use corerouter_hal::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState};
+    use corerouter_hal::{
+        DynamicChange, EthernetMonitor, Features, Hal, HalError, LinkCounters, LinkInfo, LinkState,
+        NicHardware,
+    };
     use corerouter_model::{Config, IfName, InterfaceKind};
 
     use crate::owner::{self, KernelLink, Owner, Policy};
@@ -241,6 +258,18 @@ mod linux {
                 .get_or_init(crate::icmp::HostProber::detect)
                 .clone()?;
             Ok(std::sync::Arc::new(p))
+        }
+
+        fn ethernet_monitor(&mut self, name: &IfName) -> Result<EthernetMonitor, HalError> {
+            crate::nic::monitor(name.as_str())
+        }
+
+        fn hardware(&mut self, name: &IfName) -> Result<NicHardware, HalError> {
+            crate::nic::hardware(name.as_str())
+        }
+
+        fn counters(&mut self, name: &IfName) -> Result<LinkCounters, HalError> {
+            crate::nic::counters(name.as_str())
         }
     }
 }

@@ -467,7 +467,23 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   **medido**: daemon com o token em 000, daemon de 6fbab48 e token legível, com screenshots. Esforço
   do agente ~2 h (**estimado**).
 
-- 2026-10-22 — G1.20: hierarquia das janelas internas, a pedido do usuário (com um diálogo aberto,
+- 2026-10-22 — G1.19: abas do diálogo de interface (parte 1, só leitura), a pedido do usuário.
+  Engine: `interface.ethernet.monitor`, `interface.hardware`, `interface.stats` (consultas, no
+  terminal pelo registro), "não suportado" como `available: false` + motivo, e `link_watch`
+  anotando a hora das subidas/quedas a cada `tick`/`interface.list`. HAL: tipos em `hal::nic` e
+  três métodos aditivos com padrão "não suportado"; `VirtualHal` simulado e determinístico.
+  `hal-linux`: cliente genetlink síncrono próprio (`genl.rs`, socket do `netlink-sys`, codec puro
+  com proptest) para as famílias `ethtool` (link modes/info/state, pause, features, rings,
+  channels, grupos de estatística padrão) e `devlink` (firmware), rtnetlink para MAC de fábrica,
+  MTU, filas, dispositivo pai, portadora e stats64, sysfs do dispositivo e `pci.ids` (parser
+  puro com proptest); nada de ioctl. GUI: abas General/Status/Hardware/Traffic/Statistics no
+  "Interface <nome>" (`ui::iface_tabs`), gráfico bps/pps com `egui_plot`, "Zero view" só na
+  janela. Testes: engine, netns com veth (4), headless (2), unitários; conferido na placa Wi-Fi
+  da máquina (só leitura: offloads batem com `ethtool -k`) e por screenshots no Xvfb. G1.20
+  (Ethernet configurável, SFP/DOM, teste de cabo) registrado. Esforço do agente ~5 h
+  (**estimado**).
+
+- 2026-10-22 — G1.21: hierarquia das janelas internas, a pedido do usuário (com um diálogo aberto,
   clicar na lista o mandava para trás, e pedir os detalhes de novo não o trazia de volta). Um lugar
   só, `Floats` em `crates/ui/src/float.rs`: relação filho→pai por janela (`Floats::adopt`, ligada
   por `dialog::Head::parent`, que cada família de diálogos preenche com a sua lista: Interfaces,
@@ -514,4 +530,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G6.5.
 - 2026-10-22 — log do G0.3b.
 - 2026-10-22 — log do G0.3c.
-- 2026-10-22 — log do G1.20.
+- 2026-10-22 — log do G1.19.
+- 2026-10-22 — log do G1.21.
