@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_parse, opt_u32, req_u32};
 use super::{CommandSpec, always};
 use crate::tasks::{MAX_POLL, can_start};
-use crate::tools::{Target, mtu, ping};
+use crate::tools::{Target, mtr, mtu, ping};
 use crate::{EngineError, Result, Session};
 
 /// Targets one ping task may have.
@@ -31,6 +31,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "tool.ping.mtu", "Discover MTU", ["Tools", "Ping"], None,
         "{address: string, max_size?: int 28..65535 (default 1500), timeout_ms?: int 10..10000, retries?: int 1..5, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, columns}",
         can_start, ping_mtu)
+    .positional("address")
+    .task(),
+    cmd!(query "tool.mtr.start", "MTR", ["Tools", "MTR"], None,
+        "{address: string, count?: int 0..1000000 (rounds, 0 = until stopped), interval_ms?: int 100..60000, timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, columns}",
+        can_start, mtr_start)
+    .alias("mtr")
     .positional("address")
     .task(),
     cmd!(query "tool.task.list", "Tasks", [], None,
@@ -278,6 +284,36 @@ fn ping_mtu(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
+    let raw = super::args::req_str(p, "address")?;
+    let target = target("address", raw)?;
+    let count = ranged(p, "count", 0, 1_000_000, 0)?;
+    let interval = ranged(p, "interval_ms", 100, 60_000, 1000)?;
+    let timeout = ranged(p, "timeout_ms", 10, 10_000, 1000)?;
+    let max_hops = ranged(p, "max_hops", 1, 64, 30)?;
+    let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 56)?;
+    let targets = [target.clone()];
+    let options = options(s, p, &targets)?;
+    let prober = s.hal().prober().map_err(EngineError::Hal)?;
+    let job = mtr::MtrJob {
+        target,
+        count,
+        interval: Duration::from_millis(u64::from(interval)),
+        timeout: Duration::from_millis(u64::from(timeout)),
+        max_hops: narrow("max_hops", max_hops)?,
+        size: narrow("size", size)?,
+        options,
+    };
+    let id = s.start_task("mtr", title("mtr", &targets), move |ctx| {
+        mtr::run(job, prober.as_ref(), ctx)
+    })?;
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "columns": ["round", "hop", "address", "rtt_ms", "status"],
+    }))
+}
+
 fn task_list(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(s.task_list())
 }
@@ -356,6 +392,35 @@ mod tests {
         let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
         assert_eq!(p["summary"]["mtu"], 1500);
         assert_eq!(p["summary"]["payload"], 1472);
+    }
+
+    #[test]
+    fn mtr_task_lists_the_hops() {
+        let mut s = lab();
+        let r = s
+            .execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "count": 2, "interval_ms": 100, "timeout_ms": 50}),
+            )
+            .unwrap();
+        let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
+        assert_eq!(p["kind"], "mtr");
+        assert_eq!(p["summary"]["reached"], true);
+        assert!(p["summary"]["hops"].as_array().unwrap().len() >= 2);
+        assert!(
+            s.execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "max_hops": 0})
+            )
+            .is_err()
+        );
+        assert!(
+            s.execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "interval_ms": 10})
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -92,6 +92,16 @@ pub fn line(kind: &str, ev: &Value) -> String {
         )
         .trim_end()
         .to_owned(),
+        "mtr" => format!(
+            "{:>5} {:>3} {:<40} {:<10} {}",
+            s(ev, "round"),
+            s(ev, "hop"),
+            s(ev, "address"),
+            time(ev, "rtt_ms"),
+            s(ev, "status")
+        )
+        .trim_end()
+        .to_owned(),
         _ => ev.to_string(),
     }
 }
@@ -137,6 +147,45 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
             ),
             None => format!("{}: no MTU found", s(summary, "address")),
         }],
+        "mtr" => {
+            let mut out = vec![format!(
+                "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9}",
+                "HOP", "HOST", "LOSS%", "SENT", "LAST", "AVG", "BEST", "WORST", "STDEV"
+            )];
+            let num = |t: &Value, k: &str| {
+                t.get(k)
+                    .and_then(Value::as_f64)
+                    .map(|x| format!("{x:.2}"))
+                    .unwrap_or_else(|| "-".into())
+            };
+            for h in summary
+                .get("hops")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let host = match s(h, "host").as_str() {
+                    "" => "???".to_owned(),
+                    x => x.to_owned(),
+                };
+                out.push(format!(
+                    "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9}",
+                    s(h, "hop"),
+                    host,
+                    format!(
+                        "{:.1}",
+                        h.get("loss_pct").and_then(Value::as_f64).unwrap_or(0.0)
+                    ),
+                    s(h, "sent"),
+                    num(h, "last_ms"),
+                    num(h, "avg_ms"),
+                    num(h, "best_ms"),
+                    num(h, "worst_ms"),
+                    num(h, "stddev_ms"),
+                ));
+            }
+            out
+        }
         _ => vec![summary.to_string()],
     }
 }
@@ -169,6 +218,19 @@ mod tests {
              max-rtt=1.000ms jitter="
         );
         assert!(header("ping").unwrap().contains("STATUS"));
+    }
+
+    #[test]
+    fn mtr_table() {
+        let t = summary(
+            "mtr",
+            &json!({"hops": [{"hop": 1, "host": "10.0.0.1", "loss_pct": 0.0, "sent": 3,
+                "last_ms": 1.0, "avg_ms": 1.0, "best_ms": 1.0, "worst_ms": 1.0, "stddev_ms": 0.0},
+                {"hop": 2, "host": null, "loss_pct": 100.0, "sent": 3}]}),
+        );
+        assert!(t[0].contains("WORST"));
+        assert!(t[1].contains("10.0.0.1"));
+        assert!(t[2].contains("???") && t[2].contains("100.0"));
     }
 
     #[test]
