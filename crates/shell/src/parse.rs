@@ -242,6 +242,21 @@ pub fn walk<'r>(
     let mut path: Vec<String> = if absolute { Vec::new() } else { cwd.to_vec() };
     for (word, off, idx) in parts {
         let Some(w) = words.get(idx) else { break };
+        // `/tool ping 8.8.8.8`, `/tool ping address=…`: a menu named like an
+        // alias of one of its commands runs it when what follows is not a
+        // name of the menu.
+        if let Some(cmd) = menu_command(reg, &path)
+            && (w.is_pair()
+                || reg.menu(&path).is_some_and(|m| {
+                    matches!(pick(&word, &names(reg, m, path.is_empty())), Pick::None)
+                }))
+        {
+            return Ok(Stage::Verb {
+                path,
+                verb: Verb::Command(cmd),
+                next: idx,
+            });
+        }
         if w.is_pair() {
             return Err((
                 off,
@@ -300,6 +315,16 @@ pub fn walk<'r>(
         });
     }
     Ok(Stage::Path(path))
+}
+
+/// The command a menu runs by its own name: one of its commands whose
+/// alias is the menu's name (`/tool ping` → `tool.ping.start`).
+pub fn menu_command<'r>(reg: &'r Registry, path: &[String]) -> Option<&'r Command> {
+    let name = path.last()?;
+    reg.menu(path)?
+        .commands
+        .values()
+        .find(|c| c.alias.iter().any(|a| a == name))
 }
 
 pub fn clip(s: &str) -> String {

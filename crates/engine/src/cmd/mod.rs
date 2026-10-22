@@ -26,7 +26,10 @@ pub struct CommandSpec {
     pub run: Run,
     /// false for queries: no journal entry, no auto-commit.
     pub journal: bool,
-    /// Terminal: a shortcut at the root menu (`ping` for `tool.ping.start`).
+    /// Terminal: shortcuts usable from any menu (`ping` for
+    /// `tool.ping.start`); several are comma-separated (`"traceroute,mtr"`).
+    /// A menu named like one of its commands' aliases also runs it
+    /// (`/tool ping 8.8.8.8`).
     pub alias: Option<&'static str>,
     /// Terminal: the parameter a bare value goes to (`ping 8.8.8.8`).
     pub positional: Option<&'static str>,
@@ -259,7 +262,7 @@ mod tests {
         let mut aliases = HashSet::new();
         let roots: HashSet<&str> = all().filter_map(|c| c.id.split('.').next()).collect();
         for c in all() {
-            if let Some(a) = c.alias {
+            for a in c.alias.into_iter().flat_map(|a| a.split(',')) {
                 assert!(aliases.insert(a), "alias {a} used twice");
                 assert!(!roots.contains(a), "alias {a} hides the menu /{a}");
                 assert!(

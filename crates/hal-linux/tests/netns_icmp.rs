@@ -312,6 +312,10 @@ fn across_a_veth_and_through_a_router() {
         let r = ask_retry(sock.as_mut(), &lab.far, 4, Some(1), 56);
         assert_eq!(r.kind, ReplyKind::TtlExceeded, "{kind:?}");
         assert_eq!(r.from, ip_of(&lab.near));
+        // TTL 2 is enough to reach the host behind the router (what MTR walks).
+        let r = ask_retry(sock.as_mut(), &lab.far, 9, Some(2), 56);
+        assert_eq!(r.kind, ReplyKind::Echo, "{kind:?}");
+        assert_eq!(r.from, ip_of(&lab.far));
         let r = ask_retry(sock.as_mut(), &lab.far6, 5, Some(1), 56);
         assert_eq!(r.kind, ReplyKind::TtlExceeded, "{kind:?}");
         assert_eq!(r.from, ip_of(&lab.near6));

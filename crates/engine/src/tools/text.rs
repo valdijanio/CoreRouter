@@ -37,6 +37,10 @@ pub fn header(kind: &str) -> Option<String> {
             "{:>5} {:>7}  {:<10} STATUS",
             "SIZE", "PAYLOAD", "TIME"
         )),
+        "mtr" => Some(format!(
+            "{:>5} {:>3} {:<40} {:<10} STATUS",
+            "ROUND", "HOP", "ADDRESS", "TIME"
+        )),
         _ => None,
     }
 }
@@ -92,6 +96,16 @@ pub fn line(kind: &str, ev: &Value) -> String {
         )
         .trim_end()
         .to_owned(),
+        "mtr" => format!(
+            "{:>5} {:>3} {:<40} {:<10} {}",
+            s(ev, "round"),
+            s(ev, "hop"),
+            s(ev, "address"),
+            time(ev, "rtt_ms"),
+            s(ev, "status")
+        )
+        .trim_end()
+        .to_owned(),
         _ => ev.to_string(),
     }
 }
@@ -99,35 +113,52 @@ pub fn line(kind: &str, ev: &Value) -> String {
 /// The closing statistics, one line per target.
 pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
     match kind {
-        "ping" => summary
-            .get("targets")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .map(|t| {
-                let mut l = format!(
-                    "{}: sent={} received={} packet-loss={}%",
-                    s(t, "host"),
-                    s(t, "sent"),
-                    s(t, "received"),
-                    s(t, "loss_pct")
-                );
-                if t.get("min_ms").is_some_and(Value::is_number) {
-                    l.push_str(&format!(
-                        " min-rtt={} avg-rtt={} max-rtt={} jitter={}",
-                        time(t, "min_ms"),
-                        time(t, "avg_ms"),
-                        time(t, "max_ms"),
-                        time(t, "jitter_ms"),
-                    ));
-                }
-                let err = s(t, "error");
-                if !err.is_empty() {
-                    l.push_str(&format!(" error: {err}"));
-                }
-                l
-            })
-            .collect(),
+        "ping" => {
+            let targets: Vec<&Value> = summary
+                .get("targets")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .collect();
+            let many = targets.len() > 1;
+            targets
+                .into_iter()
+                .map(|t| {
+                    let loss = t.get("loss_pct").and_then(Value::as_f64).unwrap_or(0.0);
+                    let loss = if loss.fract() == 0.0 {
+                        format!("{loss:.0}")
+                    } else {
+                        format!("{loss:.1}")
+                    };
+                    let mut l = format!(
+                        "{}sent={} received={} packet-loss={loss}%",
+                        if many {
+                            format!("{}: ", s(t, "host"))
+                        } else {
+                            String::new()
+                        },
+                        s(t, "sent"),
+                        s(t, "received"),
+                    );
+                    if t.get("min_ms").is_some_and(Value::is_number) {
+                        l.push_str(&format!(
+                            " min-rtt={} avg-rtt={} max-rtt={}",
+                            time(t, "min_ms"),
+                            time(t, "avg_ms"),
+                            time(t, "max_ms"),
+                        ));
+                        if t.get("jitter_ms").is_some_and(Value::is_number) {
+                            l.push_str(&format!(" jitter={}", time(t, "jitter_ms")));
+                        }
+                    }
+                    let err = s(t, "error");
+                    if !err.is_empty() {
+                        l.push_str(&format!(" error: {err}"));
+                    }
+                    l
+                })
+                .collect()
+        }
         "mtu" => vec![match summary.get("mtu").and_then(Value::as_u64) {
             Some(m) => format!(
                 "{}: path MTU {m} bytes (ICMP payload {}), {} probes",
@@ -137,6 +168,45 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
             ),
             None => format!("{}: no MTU found", s(summary, "address")),
         }],
+        "mtr" => {
+            let mut out = vec![format!(
+                "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9}",
+                "HOP", "HOST", "LOSS%", "SENT", "LAST", "AVG", "BEST", "WORST", "STDEV"
+            )];
+            let num = |t: &Value, k: &str| {
+                t.get(k)
+                    .and_then(Value::as_f64)
+                    .map(|x| format!("{x:.2}"))
+                    .unwrap_or_else(|| "-".into())
+            };
+            for h in summary
+                .get("hops")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let host = match s(h, "host").as_str() {
+                    "" => "???".to_owned(),
+                    x => x.to_owned(),
+                };
+                out.push(format!(
+                    "{:>3} {:<40} {:>6} {:>5} {:>9} {:>9} {:>9} {:>9} {:>9}",
+                    s(h, "hop"),
+                    host,
+                    format!(
+                        "{:.1}",
+                        h.get("loss_pct").and_then(Value::as_f64).unwrap_or(0.0)
+                    ),
+                    s(h, "sent"),
+                    num(h, "last_ms"),
+                    num(h, "avg_ms"),
+                    num(h, "best_ms"),
+                    num(h, "worst_ms"),
+                    num(h, "stddev_ms"),
+                ));
+            }
+            out
+        }
         _ => vec![summary.to_string()],
     }
 }
@@ -165,10 +235,30 @@ mod tests {
         );
         assert_eq!(
             sum[0],
-            "8.8.8.8: sent=2 received=1 packet-loss=50.0% min-rtt=1.000ms avg-rtt=1.000ms \
-             max-rtt=1.000ms jitter="
+            "sent=2 received=1 packet-loss=50% min-rtt=1.000ms avg-rtt=1.000ms max-rtt=1.000ms"
         );
+        let two = summary(
+            "ping",
+            &json!({"targets": [{"host": "a", "sent": 3, "received": 2, "loss_pct": 33.333},
+                {"host": "b", "sent": 3, "received": 3, "loss_pct": 0.0}]}),
+        );
+        assert_eq!(two[0], "a: sent=3 received=2 packet-loss=33.3%");
+        assert_eq!(two[1], "b: sent=3 received=3 packet-loss=0%");
         assert!(header("ping").unwrap().contains("STATUS"));
+    }
+
+    #[test]
+    fn mtr_table() {
+        let t = summary(
+            "mtr",
+            &json!({"hops": [{"hop": 1, "host": "10.0.0.1", "loss_pct": 0.0, "sent": 3,
+                "last_ms": 1.0, "avg_ms": 1.0, "best_ms": 1.0, "worst_ms": 1.0, "stddev_ms": 0.0},
+                {"hop": 2, "host": null, "loss_pct": 100.0, "sent": 3}]}),
+        );
+        assert!(t[0].contains("WORST"));
+        assert!(header("mtr").unwrap().contains("HOP"));
+        assert!(t[1].contains("10.0.0.1"));
+        assert!(t[2].contains("???") && t[2].contains("100.0"));
     }
 
     #[test]

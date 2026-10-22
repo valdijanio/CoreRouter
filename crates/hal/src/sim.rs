@@ -198,14 +198,20 @@ impl SimProber {
         let seq = probe.seq.to_be_bytes();
         let ttl = probe.ttl.unwrap_or(64);
         let h = hash(&[&dst, &seq, &[ttl]]);
-        if path.loss_pct > 0 && hash(&[&dst, &seq]) % 100 < u64::from(path.loss_pct) {
+        let hops = path.hops.max(1);
+        // The link that shrinks the MTU and loses packets sits halfway.
+        let narrow = hops.div_ceil(2);
+        if path.loss_pct > 0
+            && ttl >= narrow
+            && hash(&[&dst, &seq]) % 100 < u64::from(path.loss_pct)
+        {
             return None;
         }
-        let hops = path.hops.max(1);
-        // RTT to hop k grows with k; jitter in [-jitter, +jitter].
+        // RTT and jitter to hop k grow with k; jitter in [-j, +j].
         let rtt_to = |k: u8| {
-            let base = path.rtt.as_nanos() * u128::from(k) / u128::from(hops);
-            let span = path.jitter.as_nanos();
+            let k = u128::from(k.min(hops));
+            let base = path.rtt.as_nanos() * k / u128::from(hops);
+            let span = path.jitter.as_nanos() * k / u128::from(hops);
             let offset = if span == 0 {
                 0
             } else {
@@ -223,8 +229,6 @@ impl SimProber {
             ttl: Some(64u8.saturating_sub(k.saturating_sub(1))),
             rtt: rtt_to(k),
         };
-        // The link that shrinks the MTU sits halfway along the path.
-        let narrow = hops.div_ceil(2);
         if df && probe.size > path.mtu && ttl >= narrow {
             let at = narrow.saturating_sub(1).max(1);
             let from = if at >= hops {

@@ -32,8 +32,8 @@ pub struct Command {
     pub query: bool,
     /// `Err(reason)` while the engine refuses it.
     pub enabled: Result<(), String>,
-    /// Shortcut usable from any menu (`ping`).
-    pub alias: Option<String>,
+    /// Shortcuts usable from any menu (`ping`; `traceroute`, `mtr`).
+    pub alias: Vec<String>,
     /// The parameter a bare value goes to.
     pub positional: Option<String>,
     /// Starts a background task (`tool.task.poll` follows it).
@@ -142,7 +142,18 @@ impl Registry {
                     query: e.get("kind").and_then(Value::as_str) == Some("query"),
                     enabled,
                     alias: word("alias")
-                        .filter(|a| a.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')),
+                        .map(|a| {
+                            a.split(',')
+                                .map(str::trim)
+                                .filter(|a| {
+                                    !a.is_empty()
+                                        && a.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+                                })
+                                .take(4)
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     positional: word("positional"),
                     task: e.get("task").and_then(Value::as_bool) == Some(true),
                 },
@@ -167,7 +178,7 @@ impl Registry {
         // Shortcuts never hide a menu of the root.
         let aliases: Vec<(String, String)> = reg
             .commands()
-            .filter_map(|(_, c)| c.alias.clone().map(|a| (a, c.id.clone())))
+            .flat_map(|(_, c)| c.alias.iter().map(|a| (a.clone(), c.id.clone())))
             .filter(|(a, _)| !reg.root.children.contains_key(a))
             .collect();
         for (a, id) in aliases {

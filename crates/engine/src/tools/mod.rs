@@ -2,6 +2,7 @@
 //! [`TaskCtx`]: no sockets, threads or clocks of their own, so they run the
 //! same on the host's ICMP and on the simulated network, and in tests.
 
+pub mod mtr;
 pub mod mtu;
 pub mod ping;
 pub mod stats;

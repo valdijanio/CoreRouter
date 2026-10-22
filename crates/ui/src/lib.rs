@@ -12,6 +12,7 @@ mod dialog;
 mod firewall;
 mod float;
 mod interfaces;
+mod mtr;
 mod neighbors;
 mod ping;
 mod prefs;
@@ -245,6 +246,8 @@ pub struct CoreRouterUi {
     can: Arc<avail::Avail>,
     /// Tools › Ping: form, followed tasks and their data (UI-local).
     ping: ping::PingWin,
+    /// Tools › MTR (UI-local).
+    mtr: mtr::MtrWin,
     /// Files waiting for the app to save.
     exports: Vec<Export>,
     /// "New Terminal" windows.
@@ -290,6 +293,7 @@ impl CoreRouterUi {
             fw: firewall::State::default(),
             can,
             ping: ping::PingWin::default(),
+            mtr: mtr::MtrWin::default(),
             exports: Vec::new(),
             terminals: Vec::new(),
             terminal_user: "admin".into(),
@@ -723,11 +727,21 @@ impl CoreRouterUi {
                     _ => {}
                 }
             }
+            if *win == Win::Mtr {
+                match floats.keys(&ctx, win_id(*win), float::Takes::Dialog) {
+                    Some(float::Keyed::Enter) => self.mtr_start(),
+                    Some(float::Keyed::Escape) if !self.mtr_stop() => open = false,
+                    _ => {}
+                }
+            }
             if !open {
                 self.open.remove(win);
                 floats.closed(win_id(*win));
                 if *win == Win::Ping {
                     self.ping_closed();
+                }
+                if *win == Win::Mtr {
+                    self.mtr_closed();
                 }
             }
         }
