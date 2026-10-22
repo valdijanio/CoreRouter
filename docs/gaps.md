@@ -13,7 +13,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 
 | Id | Tarefa | Crates | Critério de aceite | Est. | Status |
 |---|---|---|---|---|---|
-| G0.1 | Escolher licença do projeto | raiz | Decisão do dono registrada; `license` no `[workspace.package]`. **Agentes: não decidam, perguntem** | — | aberto |
+| G0.1 | Escolher licença do projeto | raiz | Decisão do dono registrada; `license` no `[workspace.package]`. **Agentes: não decidam, perguntem** | — | feito: AGPL-3.0-or-later |
 | G0.2 | CI no GitHub Actions | `.github/` | Workflow roda `cargo xtask ci` (Linux) + build macOS/Windows da GUI; cache de target | 3 h | feito (`stream/G0.2-github-actions`) |
 | G0.3 | Autenticação e TLS no canal de controle | control, daemon | `rustls`, tokens por usuário, grupos read/write/full (como RouterOS); bind não-loopback só com TLS; testes de recusa | 12 h | aberto |
 | G0.4 | GUI como cliente remoto + WebSocket para WASM | ui, control, gui, daemon | Trait de backend na UI (local/remoto); daemon serve WS; GUI web gerencia um roteador real | 14 h | aberto |

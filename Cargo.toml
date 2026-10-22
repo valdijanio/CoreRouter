@@ -7,7 +7,8 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.95"
 publish = false
-# License intentionally unset: owner decision, see docs/gaps.md G0.1.
+license = "AGPL-3.0-or-later"
+repository = "https://github.com/valdijanio/CoreRouter"
 
 [workspace.dependencies]
 # Workspace crates (path deps; the layer table lives in xtask/src/layers.rs).
