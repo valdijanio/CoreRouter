@@ -8,6 +8,7 @@
 use egui::{Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
+use crate::avail::Avail;
 use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
 use crate::interfaces::{cascade, dialog_id, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
@@ -269,16 +270,33 @@ impl CoreRouterUi {
             .filter(|r| selection.contains(&r.key))
             .collect();
         let mut act: Option<Act> = None;
+        let can = self.can();
 
         ui.horizontal(|ui| {
-            if table::tool(ui, TABLE, Icon::Add, "Add", Ok(())).clicked() {
+            if table::tool(ui, TABLE, Icon::Add, "Add", can.check("ip.route.add")).clicked() {
                 act = Some(Act::New);
             }
             let tools = [
-                (Icon::Remove, "Remove", only_static(&picked)),
-                (Icon::Enable, "Enable", can_enable(&picked, true)),
-                (Icon::Disable, "Disable", can_enable(&picked, false)),
-                (Icon::Comment, "Comment", only_static(&picked)),
+                (
+                    Icon::Remove,
+                    "Remove",
+                    can.and("ip.route.remove", only_static(&picked)),
+                ),
+                (
+                    Icon::Enable,
+                    "Enable",
+                    can.and("ip.route.set", can_enable(&picked, true)),
+                ),
+                (
+                    Icon::Disable,
+                    "Disable",
+                    can.and("ip.route.set", can_enable(&picked, false)),
+                ),
+                (
+                    Icon::Comment,
+                    "Comment",
+                    can.and("ip.route.set", only_static(&picked)),
+                ),
             ];
             for (icon, tip, enabled) in tools {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
@@ -303,9 +321,9 @@ impl CoreRouterUi {
             &COLUMNS,
             &rows,
             |ui, menu| match menu {
-                Menu::Rows(sel) => row_menu(ui, &mut act, &routes, sel),
+                Menu::Rows(sel) => row_menu(ui, &mut act, &routes, sel, &can),
                 Menu::Empty => {
-                    if ui.button("Add Route…").clicked() {
+                    if action(ui, "Add Route…", can.check("ip.route.add")) {
                         act = Some(Act::New);
                     }
                     if ui.button("Select All").clicked() {
@@ -448,6 +466,7 @@ impl CoreRouterUi {
                 return false;
             }
             let title = dialog_title(&d.dialog, &routes);
+            let can = self.can();
             let head = Head {
                 id,
                 title: &title,
@@ -456,7 +475,7 @@ impl CoreRouterUi {
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
-                    dialog_body(ui, f, &mut d.dialog, &routes, &tables)
+                    dialog_body(ui, f, &mut d.dialog, &routes, &tables, &can)
                 });
             let keep = pressed.is_none_or(|b| self.route_button(d, b, &routes));
             if !keep {
@@ -630,26 +649,42 @@ fn can_enable(picked: &[&Route], enable: bool) -> Result<(), String> {
     }
 }
 
-fn row_menu(ui: &mut Ui, act: &mut Option<Act>, routes: &[Route], sel: &[String]) {
+fn row_menu(ui: &mut Ui, act: &mut Option<Act>, routes: &[Route], sel: &[String], can: &Avail) {
     let picked: Vec<&Route> = routes.iter().filter(|r| sel.contains(&r.key)).collect();
     let owned = || sel.to_vec();
-    if action(ui, "Enable", can_enable(&picked, true)) {
+    if action(
+        ui,
+        "Enable",
+        can.and("ip.route.set", can_enable(&picked, true)),
+    ) {
         *act = Some(Act::Enable(owned()));
     }
-    if action(ui, "Disable", can_enable(&picked, false)) {
+    if action(
+        ui,
+        "Disable",
+        can.and("ip.route.set", can_enable(&picked, false)),
+    ) {
         *act = Some(Act::Disable(owned()));
     }
-    if action(ui, "Remove", only_static(&picked)) {
+    if action(
+        ui,
+        "Remove",
+        can.and("ip.route.remove", only_static(&picked)),
+    ) {
         *act = Some(Act::Remove(owned()));
     }
-    if action(ui, "Comment…", only_static(&picked)) {
+    if action(
+        ui,
+        "Comment…",
+        can.and("ip.route.set", only_static(&picked)),
+    ) {
         *act = Some(Act::Comment(owned()));
     }
     if action(ui, "Properties…", some(&picked)) {
         *act = Some(Act::Open(owned()));
     }
     ui.separator();
-    if ui.button("Add Route…").clicked() {
+    if action(ui, "Add Route…", can.check("ip.route.add")) {
         *act = Some(Act::New);
     }
 }
@@ -718,6 +753,7 @@ fn dialog_body(
     d: &mut RouteDialog,
     routes: &[Route],
     tables: &[String],
+    can: &Avail,
 ) -> Footer<Button> {
     let mut toggle_label = None;
     let mut view_only = false;
@@ -758,13 +794,22 @@ fn dialog_body(
         ui.weak("Connected routes follow their IP address (IP › Addresses).");
         return Footer {
             buttons: Buttons::View,
+            ok: Ok(()),
             extra: Vec::new(),
             pressed: None,
         };
     }
-    let mut footer = Footer::edit(!matches!(d, RouteDialog::Comment { .. }));
+    // What OK / Apply send.
+    let ok = can.check(match d {
+        RouteDialog::New(_) => "ip.route.add",
+        _ => "ip.route.set",
+    });
+    let mut footer = Footer::edit(!matches!(d, RouteDialog::Comment { .. }), ok);
     if let Some(t) = toggle_label {
-        footer.extra = vec![(t, Button::Toggle), ("Remove", Button::Remove)];
+        footer.extra = vec![
+            (t, Button::Toggle, can.check("ip.route.set")),
+            ("Remove", Button::Remove, can.check("ip.route.remove")),
+        ];
     }
     footer
 }

@@ -223,18 +223,7 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   esquecem na hora com a despedida (`cargo xtask netns`, ~9 s **medido**). Teste manual num netns
   descartável: dois daemons (7979 e 7981) e a GUI; a aba Neighbors mostrou os dois, o duplo
   clique conectou e IP › Neighbors listou o outro roteador (screenshots conferidos).
-- 2026-10-22 — G5.2 (Parte 2): LLDP e MNDP na tabela de vizinhos. Com `--backend linux` o daemon
-  (`apps/corerouter-daemon/src/link_discovery.rs`, uma thread) envia LLDP nas interfaces da
-  descoberta a cada `interval_secs` com TTL 4 × (System Name = identity, System Description =
-  `CoreRouter <versão>`, Chassis ID = node id do CRDP, Port ID = nome, Port Description =
-  comentário, Management Address = endereços da interface), reenvia logo quando o conteúdo muda
-  e manda TTL 0 quando a interface sai; recebe LLDP e escuta MNDP (UDP 5678, **nunca**
-  anunciado) e grava `lldp`/`mndp` com `record_neighbor`. Sem `CAP_NET_RAW` o LLDP fica
-  desligado com um aviso claro e o daemon segue (conferido com `setpriv`). `hal-linux`:
-  `LldpIo::set_interval`/`ifindex`. Testes: 7 unitários de mapeamento e
-  `tests/netns_l2.rs` (dois daemons linux em namespaces, veth ×2; crdp + lldp com o mesmo
-  node id, filtro por protocolo, MNDP sintético, interface sem descoberta não grava, TTL 0
-  apaga; ~14 s **medido**); helpers dos testes netns do daemon em `tests/common`.
+
 - 2026-10-22 — G1.15: teclado nos diálogos e janelas internas, no padrão Windows/macOS/GNOME/WinBox.
   Um lugar só: `crates/ui/src/dialog.rs` (tipo comum de diálogo: `Status` com erro/pendências,
   `Footer` com OK/Cancel/Apply + botões extras, `Form` que dá a cada campo de texto um id com o nome
@@ -256,6 +245,39 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   com o cursor no MTU, Ctrl+Enter aplica 9000 e fica aberto, Esc descarta, Esc em camadas na lista.
   Esforço do agente ~3 h (**estimado**).
 
+- 2026-10-22 — G1.16: ações indisponíveis ficam cinza com o motivo. Motivo real: GUI nova `--connect`
+  num daemon iniciado antes do Safe Mode; o clique dava "unknown command 'config.safe-mode.enter'" na
+  barra de status. Agora um ponto só (`crates/ui/src/avail.rs`, `CoreRouterUi::can`) responde, por
+  comando, a partir de `engine.list` + `server.info` + estado do link (G0.4): ausente no daemon
+  ("this router (corerouter X) has no <id>: its daemon is older than this GUI …; update or restart
+  it"), `enabled=false` (o `disabledReason` do engine, ex. "no pending changes") ou `connecting…`/
+  `disconnected` (mesmo texto do indicador). Lista ainda não carregada com o link de pé não bloqueia.
+  Usado em todas as ações: barras +/−/✓/✗/Comment, menus de contexto, botões dos diálogos (via
+  `Footer::ok` e `extra` do `dialog.rs` do G1.15: OK/Apply/Enable/Disable/Remove, Add Port, −),
+  barra superior (Safe Mode sem menu quando cinza, Commit, Discard), modo de commit, Rollback, Add/Apply
+  das janelas simples, Apply do Neighbors. Motivo da UI (seleção, porta física) combina com o do
+  roteador, o do roteador primeiro. `CoreRouterUi::run` confere de novo: atalho de tabela, Enter/
+  Ctrl+Enter de diálogo ou clique numa ação indisponível não envia nada (o motivo vai para o log e,
+  num diálogo, para o erro dele). Nenhuma lista fixa de comandos na UI. 8 testes novos (3 unitários
+  do `Avail`; 5 headless com um daemon falso: sem `config.safe-mode.*`, comando desabilitado pelo
+  engine, link caído com teclas, comando ausente em barra/menu, OK de diálogo cinza com Enter);
+  conferido que falham com o `check` neutralizado. Teste manual (**medido**): daemon compilado de
+  `6fbab48` (worktree temporária, `CARGO_TARGET_DIR` próprio) + GUI deste branch `--connect`
+  `--control`, xdotool para o hover e `screenshot`: Safe Mode cinza com o tooltip de versão.
+  Esforço do agente ~3 h (**estimado**).
+- 2026-10-22 — G5.2 (Parte 2): LLDP e MNDP na tabela de vizinhos. Com `--backend linux` o daemon
+  (`apps/corerouter-daemon/src/link_discovery.rs`, uma thread) envia LLDP nas interfaces da
+  descoberta a cada `interval_secs` com TTL 4 × (System Name = identity, System Description =
+  `CoreRouter <versão>`, Chassis ID = node id do CRDP, Port ID = nome, Port Description =
+  comentário, Management Address = endereços da interface), reenvia logo quando o conteúdo muda
+  e manda TTL 0 quando a interface sai; recebe LLDP e escuta MNDP (UDP 5678, **nunca**
+  anunciado) e grava `lldp`/`mndp` com `record_neighbor`. Sem `CAP_NET_RAW` o LLDP fica
+  desligado com um aviso claro e o daemon segue (conferido com `setpriv`). `hal-linux`:
+  `LldpIo::set_interval`/`ifindex`. Testes: 7 unitários de mapeamento e
+  `tests/netns_l2.rs` (dois daemons linux em namespaces, veth ×2; crdp + lldp com o mesmo
+  node id, filtro por protocolo, MNDP sintético, interface sem descoberta não grava, TTL 0
+  apaga; ~14 s **medido**); helpers dos testes netns do daemon em `tests/common`.
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -272,4 +294,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.4.
 - 2026-10-22 — log do G5.1.
 - 2026-10-22 — log do G1.15.
+- 2026-10-22 — log do G1.16.
 - 2026-10-22 — log do G5.2 (Parte 2).
