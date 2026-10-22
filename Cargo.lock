@@ -820,6 +820,7 @@ dependencies = [
  "corerouter-engine",
  "corerouter-hal",
  "corerouter-hal-linux",
+ "corerouter-storage-fs",
  "env_logger",
  "log",
 ]
@@ -938,6 +939,17 @@ name = "corerouter-proto-ospf"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+]
+
+[[package]]
+name = "corerouter-storage-fs"
+version = "0.1.0"
+dependencies = [
+ "corerouter-engine",
+ "corerouter-hal",
+ "corerouter-model",
+ "log",
+ "serde_json",
 ]
 
 [[package]]

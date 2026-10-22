@@ -13,6 +13,7 @@ corerouter-engine.workspace = true
 corerouter-hal.workspace = true
 corerouter-hal-linux.workspace = true
 corerouter-control.workspace = true
+corerouter-storage-fs.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
