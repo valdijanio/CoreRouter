@@ -1,14 +1,16 @@
-//! /ip dns (G4.1a): the router's resolver settings and its cache.
+//! /ip dns (G4.1a, G4.1b): the resolver and LAN forwarder settings and the
+//! shared cache. Static entries: `dns_static.rs`.
 
 use std::net::IpAddr;
 
 use corerouter_model::dns::{
-    CACHE_SIZE_KIB, Dns, MAX_SERVERS, MAX_TTL_SECS, SERVER_TIMEOUT_MS, TOTAL_TIMEOUT_MS,
+    AllowedFrom, CACHE_SIZE_KIB, CONCURRENCY, Dns, MAX_ALLOWED_FROM, MAX_SERVERS, MAX_TTL_SECS,
+    QUERIES_PER_CLIENT, SERVE_STALE_SECS, SERVER_TIMEOUT_MS, ServerSelection, TOTAL_TIMEOUT_MS,
     UDP_PACKET_SIZE, usable_server,
 };
 use serde_json::{Value, json};
 
-use super::args::{opt_bool, opt_str, opt_u32};
+use super::args::{opt_bool, opt_parse, opt_str, opt_u32};
 use super::{CommandSpec, always};
 use crate::{EngineError, Result, Session};
 
@@ -18,15 +20,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "DNS",
         ["IP", "DNS"],
         None,
-        "{servers?: [ip], allow_remote_requests?: bool, cache_size?: int 0..1048576, cache_max_ttl_secs?: int, query_server_timeout_ms?: int 100..60000, query_total_timeout_ms?: int 100..600000, max_udp_packet_size?: int 512..65507} → {servers, allow_remote_requests, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size}",
+        "{servers?: [ip], allow_remote_requests?: bool (answer the LAN on UDP/TCP 53), allowed_from?: [interface list | prefix] (who may ask; default LAN; others get REFUSED), max_queries_per_client?: int 0..100000 (per second, 0 = no limit), server_selection?: fastest | sequential, serve_stale_secs?: int 0..604800 (RFC 8767; 0 = off), max_concurrent_queries?: int 1..1000, max_concurrent_tcp_sessions?: int 1..1000, address_list_extra_time_secs?: int, cache_size?: int 0..1048576, cache_max_ttl_secs?: int, query_server_timeout_ms?: int 100..60000, query_total_timeout_ms?: int 100..600000, max_udp_packet_size?: int 512..65507} → {servers, allow_remote_requests, allowed_from, max_queries_per_client, server_selection, serve_stale_secs, max_concurrent_queries, max_concurrent_tcp_sessions, address_list_extra_time_secs, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size}",
         always,
         set
     ),
     cmd!(query "ip.dns.get", "DNS", [], None,
-        "{} → {servers, dynamic_servers, allow_remote_requests, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size, cache_used, resolver: router|simulated}",
+        "{} → {servers, dynamic_servers, allow_remote_requests, allowed_from, allowed_networks (what allowed_from stands for now), max_queries_per_client, server_selection, serve_stale_secs, max_concurrent_queries, max_concurrent_tcp_sessions, address_list_extra_time_secs, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size, cache_used, resolver: router|simulated, upstream: [{server, srtt_ms, answers, failures, down}]}",
         always, get),
     cmd!(query "ip.dns.cache.print", "DNS Cache", [], None,
-        "{name?: string} → [{name, type: A|AAAA, kind: addresses|nx-domain|no-data, addresses?, canonical?, ttl, server}]",
+        "{name?: string, type?: string (A, MX, …)} → [{name, type, kind: records|nx-domain|no-data, data: [record text], addresses, ttl, hits, server, stale}]",
         always, cache_print),
     cmd!(
         "ip.dns.cache.flush",
@@ -43,12 +45,82 @@ fn settings_json(d: &Dns) -> Value {
     json!({
         "servers": d.servers,
         "allow_remote_requests": d.allow_remote_requests,
+        "allowed_from": d.allowed_from,
+        "max_queries_per_client": d.max_queries_per_client,
+        "server_selection": d.server_selection.as_str(),
+        "serve_stale_secs": d.serve_stale_secs,
+        "max_concurrent_queries": d.max_concurrent_queries,
+        "max_concurrent_tcp_sessions": d.max_concurrent_tcp_sessions,
+        "address_list_extra_time_secs": d.address_list_extra_time_secs,
         "cache_size": d.cache_size,
         "cache_max_ttl_secs": d.cache_max_ttl_secs,
         "query_server_timeout_ms": d.query_server_timeout_ms,
         "query_total_timeout_ms": d.query_total_timeout_ms,
         "max_udp_packet_size": d.max_udp_packet_size,
     })
+}
+
+/// A JSON array of strings or, for the CLI, one comma-separated string.
+fn string_list(p: &Value, key: &str, example: &str) -> Result<Option<Vec<String>>> {
+    Ok(Some(match p.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(|s| s.trim().to_owned())
+                    .ok_or_else(|| EngineError::bad(key, "each item must be a string"))
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => {
+            return Err(EngineError::bad(key, format!("must be a list, e.g. {example}")));
+        }
+    }))
+}
+
+/// `allowed_from`: interface lists that exist, and prefixes.
+fn allowed_from(s: &Session, p: &Value) -> Result<Option<Vec<String>>> {
+    let Some(raw) = string_list(p, "allowed_from", "[\"LAN\", \"10.0.0.0/8\"]")? else {
+        return Ok(None);
+    };
+    if raw.len() > MAX_ALLOWED_FROM {
+        return Err(EngineError::bad(
+            "allowed_from",
+            format!("at most {MAX_ALLOWED_FROM} items"),
+        ));
+    }
+    let mut out: Vec<String> = Vec::new();
+    for item in raw {
+        let shown: String = item.chars().take(64).collect();
+        let canonical = match AllowedFrom::parse(&item) {
+            Ok(AllowedFrom::Net(n)) => n.to_string(),
+            Ok(AllowedFrom::List(l)) => {
+                if s.store().candidate().interface_lists.get(&l).is_none() {
+                    return Err(EngineError::bad(
+                        "allowed_from",
+                        format!("no interface list '{shown}' (see interface.list.list)"),
+                    ));
+                }
+                l
+            }
+            Err(_) => {
+                return Err(EngineError::bad(
+                    "allowed_from",
+                    format!("'{shown}' is neither a prefix (192.168.88.0/24) nor an interface list"),
+                ));
+            }
+        };
+        if !out.contains(&canonical) {
+            out.push(canonical);
+        }
+    }
+    Ok(Some(out))
 }
 
 /// A JSON array of addresses or, for the CLI, one comma-separated string.
@@ -121,6 +193,13 @@ fn ranged(p: &Value, key: &str, range: std::ops::RangeInclusive<u32>) -> Result<
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let servers = servers(p)?;
     let remote = opt_bool(p, "allow_remote_requests")?;
+    let allowed = allowed_from(s, p)?;
+    let per_client = ranged(p, "max_queries_per_client", QUERIES_PER_CLIENT)?;
+    let selection: Option<ServerSelection> = opt_parse(p, "server_selection")?;
+    let stale = ranged(p, "serve_stale_secs", SERVE_STALE_SECS)?;
+    let concurrent = ranged(p, "max_concurrent_queries", CONCURRENCY)?;
+    let tcp_sessions = ranged(p, "max_concurrent_tcp_sessions", CONCURRENCY)?;
+    let extra = ranged(p, "address_list_extra_time_secs", 0..=MAX_TTL_SECS)?;
     let cache_size = ranged(p, "cache_size", CACHE_SIZE_KIB)?;
     let max_ttl = ranged(p, "cache_max_ttl_secs", 0..=MAX_TTL_SECS)?;
     let server_to = ranged(p, "query_server_timeout_ms", SERVER_TIMEOUT_MS)?;
@@ -136,6 +215,27 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(v) = remote {
         d.allow_remote_requests = v;
+    }
+    if let Some(v) = allowed {
+        d.allowed_from = v;
+    }
+    if let Some(v) = per_client {
+        d.max_queries_per_client = v;
+    }
+    if let Some(v) = selection {
+        d.server_selection = v;
+    }
+    if let Some(v) = stale {
+        d.serve_stale_secs = v;
+    }
+    if let Some(v) = concurrent {
+        d.max_concurrent_queries = v;
+    }
+    if let Some(v) = tcp_sessions {
+        d.max_concurrent_tcp_sessions = v;
+    }
+    if let Some(v) = extra {
+        d.address_list_extra_time_secs = v;
     }
     if let Some(v) = cache_size {
         d.cache_size = v;
@@ -177,16 +277,30 @@ fn get(s: &mut Session, _: &Value) -> Result<Value> {
             "resolver".into(),
             json!(if backend.is_some() { "router" } else { "simulated" }),
         );
+        let nets = corerouter_proto_dns::server::allowed_networks(s.store().candidate());
+        o.insert("allowed_networks".into(), json!(nets));
+        let upstream: Vec<Value> = backend
+            .map(|b| b.server_stats())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(ip, st)| {
+                json!({"server": ip, "srtt_ms": st.srtt_ms, "answers": st.answers,
+                    "failures": st.failures, "down": st.down_until_ms > 0})
+            })
+            .collect();
+        o.insert("upstream".into(), json!(upstream));
     }
     Ok(out)
 }
 
 fn cache_print(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = opt_str(p, "name")?.map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase());
+    let qtype = opt_str(p, "type")?.map(|t| t.trim().to_ascii_uppercase());
     let rows = s.dns_backend().map(|b| b.cache_rows()).unwrap_or_default();
     let rows: Vec<Value> = rows
         .into_iter()
         .filter(|r| filter.as_ref().is_none_or(|f| r.name.contains(f.as_str())))
+        .filter(|r| qtype.as_ref().is_none_or(|t| r.qtype == *t))
         .filter_map(|r| serde_json::to_value(r).ok())
         .collect();
     Ok(Value::Array(rows))
@@ -221,6 +335,20 @@ mod tests {
         assert_eq!(got["dynamic_servers"], json!([]));
         assert_eq!(got["resolver"], "simulated");
         assert_eq!(s.dns_settings().servers.len(), 2);
+        assert_eq!(got["allowed_from"], json!(["LAN"]), "never an open resolver");
+        assert_eq!(got["allowed_networks"], json!([]), "LAN has no members yet");
+        let out = s
+            .execute(
+                "ip.dns.set",
+                &json!({"allow_remote_requests": true, "allowed_from": "LAN, 10.9.8.7/16",
+                    "max_queries_per_client": 50, "server_selection": "sequential",
+                    "serve_stale_secs": 0, "max_concurrent_queries": 10}),
+            )
+            .unwrap();
+        assert_eq!(out["allowed_from"], json!(["LAN", "10.9.0.0/16"]));
+        assert_eq!(out["server_selection"], "sequential");
+        let got = s.execute("ip.dns.get", &json!({})).unwrap();
+        assert_eq!(got["allowed_networks"], json!(["10.9.0.0/16"]));
     }
 
     #[test]
@@ -235,6 +363,11 @@ mod tests {
             json!({"query_total_timeout_ms": 1000}),
             json!({"max_udp_packet_size": 100}),
             json!({"cache_size": 2_000_000}),
+            json!({"allowed_from": ["NOPE"]}),
+            json!({"allowed_from": "10.0.0.0/33"}),
+            json!({"server_selection": "random"}),
+            json!({"max_concurrent_queries": 0}),
+            json!({"serve_stale_secs": 9_999_999}),
         ] {
             let err = s.execute("ip.dns.set", &p).unwrap_err();
             assert!(matches!(err, EngineError::BadParam { .. }), "{p}: {err}");

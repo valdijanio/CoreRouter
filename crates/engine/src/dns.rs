@@ -11,7 +11,7 @@ use std::sync::Arc;
 use corerouter_hal::probe::{ProbeError, ProbeSocket, Prober, SocketOptions};
 use corerouter_hal::SharedProber;
 use corerouter_model::dns::CacheRow;
-use corerouter_proto_dns::resolver::{ResolveError, Settings};
+use corerouter_proto_dns::resolver::{ResolveError, ServerStats, Settings};
 
 use crate::Session;
 
@@ -23,6 +23,10 @@ pub trait DnsBackend: Send + Sync {
     fn cache_rows(&self) -> Vec<CacheRow>;
     fn cache_used_bytes(&self) -> usize;
     fn flush(&self);
+    /// What the resolver measured of each upstream server.
+    fn server_stats(&self) -> Vec<(IpAddr, ServerStats)> {
+        Vec::new()
+    }
 }
 
 #[derive(Default)]
@@ -51,6 +55,41 @@ impl Session {
     /// learned servers.
     pub fn dns_settings(&self) -> Settings {
         Settings::new(&self.store().running().ip.dns, &self.dns_dynamic_servers())
+    }
+
+    /// A static DNS entry's `address_list` (G4.1b): `address` goes into
+    /// firewall list `list` as a dynamic entry for `timeout_secs`. One
+    /// already there is refreshed only when it has less than half of that
+    /// left (every answer would otherwise rewrite the list).
+    pub fn dns_address_list(
+        &mut self,
+        list: &str,
+        address: IpAddr,
+        timeout_secs: u64,
+    ) -> Result<(), String> {
+        let timeout = timeout_secs.max(1);
+        let name: corerouter_model::firewall::Name = list.parse().map_err(|e| format!("{e}"))?;
+        let addr = corerouter_model::firewall::AddrMatch::Net(ipnet::IpNet::from(address));
+        let now = self.now();
+        if let Some(e) = self.dynamic_addresses.find(&name, &addr) {
+            if e.left(now) >= timeout / 2 {
+                return Ok(());
+            }
+            let id = e.id;
+            self.execute("ip.firewall.address-list.remove", &serde_json::json!({"id": id}))
+                .map_err(|e| e.to_string())?;
+        }
+        self.execute(
+            "ip.firewall.address-list.add",
+            &serde_json::json!({
+                "list": list,
+                "address": address.to_string(),
+                "timeout": timeout,
+                "comment": "dns static",
+            }),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string())
     }
 
     /// The tools' prober, resolving names through the router's resolver
@@ -117,6 +156,20 @@ mod tests {
             0
         }
         fn flush(&self) {}
+    }
+
+    #[test]
+    fn address_list_from_dns_is_added_once_and_refreshed() {
+        let mut s = Session::virtual_lab();
+        let ip: IpAddr = [192, 0, 2, 7].into();
+        s.dns_address_list("vpn", ip, 300).unwrap();
+        s.dns_address_list("vpn", ip, 300).unwrap();
+        let rows = s
+            .execute("ip.firewall.address-list.list", &serde_json::json!({"list": "vpn"}))
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+        assert_eq!(rows[0]["dynamic"], true);
+        assert!(s.dns_address_list("bad list!", ip, 300).is_err());
     }
 
     #[test]

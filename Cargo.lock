@@ -1255,7 +1255,9 @@ dependencies = [
  "corerouter-model",
  "criterion",
  "hickory-proto",
+ "ipnet",
  "proptest",
+ "regex",
  "thiserror 2.0.21",
 ]
 

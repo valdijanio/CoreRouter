@@ -9,18 +9,21 @@
 //! port (RFC 5452 §9.2: id and port both unpredictable). A thread copies
 //! the running `/ip dns` and the servers learned by DHCP into the resolver
 //! every second, so a lookup never needs the session lock. The LAN
-//! forwarder of G4.1b will answer from the same [`Resolver`] and cache.
+//! forwarder (G4.1b, `dns_server.rs`) answers from the same [`Resolver`]
+//! and cache, through [`router`].
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpStream, UdpSocket};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use corerouter_engine::dns::DnsBackend;
 use corerouter_engine::{Shared, lock};
 use corerouter_model::dns::CacheRow;
-use corerouter_proto_dns::resolver::{ResolveError, Resolver, Transport, TransportError};
+use corerouter_proto_dns::resolver::{
+    ResolveError, Resolver, ServerStats, Transport, TransportError,
+};
 
 /// How often the thread looks at the config.
 const TICK: Duration = Duration::from_secs(1);
@@ -29,20 +32,33 @@ const MAX_REPLY: usize = 65_535;
 
 /// The resolver plus the clock its cache runs on.
 pub(crate) struct RouterDns {
-    resolver: Resolver,
+    pub(crate) resolver: Arc<Resolver>,
     start: Instant,
 }
 
+/// The daemon's resolver, once the service started (the LAN forwarder
+/// shares it).
+static ROUTER: OnceLock<Arc<RouterDns>> = OnceLock::new();
+
+pub(crate) fn router() -> Option<Arc<RouterDns>> {
+    ROUTER.get().cloned()
+}
+
 impl RouterDns {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            resolver: Resolver::default(),
+            resolver: Arc::new(Resolver::default()),
             start: Instant::now(),
         }
     }
 
-    fn now_ms(&self) -> u64 {
+    pub(crate) fn now_ms(&self) -> u64 {
         u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    /// The network, on the cache's clock.
+    pub(crate) fn transport(&self) -> Sockets {
+        Sockets { start: self.start }
     }
 }
 
@@ -63,10 +79,22 @@ impl DnsBackend for RouterDns {
     fn flush(&self) {
         self.resolver.flush();
     }
+
+    /// `down_until_ms` only while it lasts (the engine has not this clock).
+    fn server_stats(&self) -> Vec<(IpAddr, ServerStats)> {
+        let now = self.now_ms();
+        let mut out = self.resolver.server_stats();
+        for (_, s) in &mut out {
+            if s.down_until_ms <= now {
+                s.down_until_ms = 0;
+            }
+        }
+        out
+    }
 }
 
 /// The real network.
-struct Sockets {
+pub(crate) struct Sockets {
     start: Instant,
 }
 
@@ -218,8 +246,11 @@ pub(crate) const SERVICE: super::Service = super::Service {
 
 /// A router without it still forwards: a failure is logged, not fatal.
 fn start(ctx: &super::Ctx) -> Result<(), String> {
-    if let Err(e) = spawn(ctx.session.clone()) {
-        log::error!("DNS resolver is off: cannot start its thread: {e}");
+    match spawn(ctx.session.clone()) {
+        Ok(dns) => {
+            let _ = ROUTER.set(dns);
+        }
+        Err(e) => log::error!("DNS resolver is off: cannot start its thread: {e}"),
     }
     Ok(())
 }
