@@ -7,6 +7,8 @@ use std::net::Ipv4Addr;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+use crate::firewall::Firewall;
+use crate::interface_list::InterfaceLists;
 use crate::neighbor::NeighborDiscovery;
 use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 
@@ -15,6 +17,8 @@ use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 pub struct Config {
     pub system: System,
     pub interfaces: BTreeMap<IfName, Interface>,
+    /// `/interface list` (G2.1): named groups of interfaces.
+    pub interface_lists: InterfaceLists,
     pub ip: Ip,
     pub routing: Routing,
 }
@@ -117,6 +121,9 @@ pub struct Ip {
     pub next_route_id: u32,
     /// Where neighbor discovery listens and announces (`ip.neighbor.discovery.set`).
     pub neighbor_discovery: NeighborDiscovery,
+    /// `/ip firewall` (G2.1): filter, nat, mangle and address lists,
+    /// IPv4 and IPv6 together.
+    pub firewall: Firewall,
 }
 
 impl Ip {

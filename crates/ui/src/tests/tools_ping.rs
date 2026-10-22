@@ -186,3 +186,31 @@ fn bad_input_shows_the_engine_error_and_web_lab_greys_start() {
     h.tooltip_at(h.text("Start"));
     assert!(h.has_text_containing("connect the GUI to a daemon"));
 }
+
+#[test]
+fn mtr_window_shows_one_row_per_hop() {
+    let mut s = Session::virtual_lab();
+    s.set_runner(Arc::new(Threads));
+    let mut h = Harness::with_session(s);
+    h.app.open.remove(&Win::Interfaces);
+    h.app.open(Win::Mtr);
+    for _ in 0..6 {
+        h.idle();
+    }
+    h.type_into(win_id(Win::Mtr), "address", "198.51.100.20");
+    h.app.mtr.form.count = "3".into();
+    h.app.mtr.form.interval = "100".into();
+    h.key(Key::Enter, egui::Modifiers::NONE);
+    h.until("mtr", |h| h.app.mtr.task.as_ref().is_some_and(|t| t.done));
+    let t = h.app.mtr.task.as_ref().unwrap();
+    assert_eq!(t.state, "done");
+    let hops = t.summary["hops"].as_array().unwrap().len();
+    assert_eq!(hops, 6, "{}", t.summary);
+    assert!(h.has_text("Worst"));
+    assert!(h.has_text("198.51.100.20"));
+    assert!(h.has_text("100.64.1.192"), "first router");
+    assert!(h.has_text_containing("reached"));
+    // Esc with nothing running closes it.
+    h.key(Key::Escape, egui::Modifiers::NONE);
+    assert!(!h.app.open.contains(&Win::Mtr));
+}

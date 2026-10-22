@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_parse, opt_u32, req_u32};
 use super::{CommandSpec, always};
 use crate::tasks::{MAX_POLL, can_start};
-use crate::tools::{Target, mtu, ping};
+use crate::tools::{Target, mtr, mtu, ping, text};
 use crate::{EngineError, Result, Session};
 
 /// Targets one ping task may have.
@@ -33,11 +33,17 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         can_start, ping_mtu)
     .positional("address")
     .task(),
+    cmd!(query "tool.mtr.start", "MTR", ["Tools", "MTR"], None,
+        "{address: string, count?: int 0..1000000 (rounds, 0 = until stopped), interval_ms?: int 100..60000, timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string} → {id, task_id, columns}",
+        can_start, mtr_start)
+    .alias("traceroute,mtr")
+    .positional("address")
+    .task(),
     cmd!(query "tool.task.list", "Tasks", [], None,
         "{} → [{id, kind, title, state: running|done|stopped|failed, reason, owner, events, age_secs}]",
         always, task_list),
     cmd!(query "tool.task.poll", "Poll Task", [], None,
-        "{id: int, after_seq?: int, max?: int 1..256} → {id, kind, title, state, done, reason, summary, events: [{seq, …}], next_seq, more, lost}",
+        "{id: int, after_seq?: int, max?: int 1..256, text?: bool (add RouterOS-style header, lines, summary_lines)} → {id, kind, title, state, done, reason, summary, events: [{seq, …}], next_seq, more, lost, header?, lines?, summary_lines?}",
         always, task_poll),
     cmd!(query "tool.task.stop", "Stop Task", [], None,
         "{id: int} → {id, state, stopping}",
@@ -278,6 +284,36 @@ fn ping_mtu(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
+    let raw = super::args::req_str(p, "address")?;
+    let target = target("address", raw)?;
+    let count = ranged(p, "count", 0, 1_000_000, 0)?;
+    let interval = ranged(p, "interval_ms", 100, 60_000, 1000)?;
+    let timeout = ranged(p, "timeout_ms", 10, 10_000, 1000)?;
+    let max_hops = ranged(p, "max_hops", 1, 64, 30)?;
+    let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 56)?;
+    let targets = [target.clone()];
+    let options = options(s, p, &targets)?;
+    let prober = s.hal().prober().map_err(EngineError::Hal)?;
+    let job = mtr::MtrJob {
+        target,
+        count,
+        interval: Duration::from_millis(u64::from(interval)),
+        timeout: Duration::from_millis(u64::from(timeout)),
+        max_hops: narrow("max_hops", max_hops)?,
+        size: narrow("size", size)?,
+        options,
+    };
+    let id = s.start_task("mtr", title("mtr", &targets), move |ctx| {
+        mtr::run(job, prober.as_ref(), ctx)
+    })?;
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "columns": ["round", "hop", "address", "rtt_ms", "status"],
+    }))
+}
+
 fn task_list(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(s.task_list())
 }
@@ -291,7 +327,36 @@ fn task_poll(s: &mut Session, p: &Value) -> Result<Value> {
             .ok_or_else(|| EngineError::bad("after_seq", "must be a non-negative integer"))?,
     };
     let max = ranged(p, "max", 1, MAX_POLL as u32, MAX_POLL as u32)?;
-    s.task_poll(u64::from(id), after, max as usize)
+    let mut reply = s.task_poll(u64::from(id), after, max as usize)?;
+    if opt_bool(p, "text")? == Some(true) {
+        add_text(&mut reply);
+    }
+    Ok(reply)
+}
+
+/// Terminal rendering of a poll reply (`tools::text`): the column header,
+/// one line per event and, once done, the closing statistics. Front ends
+/// print these and need not know the tool.
+fn add_text(reply: &mut Value) {
+    let kind = reply
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let lines: Vec<String> = reply
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|ev| text::line(&kind, ev))
+        .collect();
+    let done = reply.get("done").and_then(Value::as_bool) == Some(true);
+    let summary = done.then(|| text::summary(&kind, reply.get("summary").unwrap_or(&Value::Null)));
+    if let Value::Object(o) = reply {
+        o.insert("header".into(), json!(text::header(&kind)));
+        o.insert("lines".into(), json!(lines));
+        o.insert("summary_lines".into(), json!(summary));
+    }
 }
 
 fn task_stop(s: &mut Session, p: &Value) -> Result<Value> {
@@ -356,6 +421,61 @@ mod tests {
         let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
         assert_eq!(p["summary"]["mtu"], 1500);
         assert_eq!(p["summary"]["payload"], 1472);
+    }
+
+    #[test]
+    fn poll_can_render_routeros_text() {
+        let mut s = lab();
+        let r = s
+            .execute(
+                "tool.ping.start",
+                &json!({"address": "127.0.0.1", "count": 2, "interval_ms": 10}),
+            )
+            .unwrap();
+        let id = r["task_id"].as_u64().unwrap();
+        let p = until_done(&mut s, id);
+        assert!(p.get("lines").is_none(), "only on request");
+        let t = s
+            .execute("tool.task.poll", &json!({"id": id, "text": true}))
+            .unwrap();
+        assert!(t["header"].as_str().unwrap().contains("SEQ"));
+        assert_eq!(t["lines"].as_array().unwrap().len(), 2);
+        assert!(t["lines"][0].as_str().unwrap().contains("127.0.0.1"));
+        assert!(
+            t["summary_lines"][0]
+                .as_str()
+                .unwrap()
+                .contains("sent=2 received=2 packet-loss=0")
+        );
+    }
+
+    #[test]
+    fn mtr_task_lists_the_hops() {
+        let mut s = lab();
+        let r = s
+            .execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "count": 2, "interval_ms": 100, "timeout_ms": 50}),
+            )
+            .unwrap();
+        let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
+        assert_eq!(p["kind"], "mtr");
+        assert_eq!(p["summary"]["reached"], true);
+        assert!(p["summary"]["hops"].as_array().unwrap().len() >= 2);
+        assert!(
+            s.execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "max_hops": 0})
+            )
+            .is_err()
+        );
+        assert!(
+            s.execute(
+                "tool.mtr.start",
+                &json!({"address": "8.8.8.8", "interval_ms": 10})
+            )
+            .is_err()
+        );
     }
 
     #[test]

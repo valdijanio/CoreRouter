@@ -515,6 +515,8 @@ impl ConnectScreen {
                     n.interface.clone(),
                 ],
                 dimmed: n.connect_to.is_none() || n.remote,
+                section: false,
+                tint: None,
             })
             .collect();
         if neighbors.iter().any(|n| n.remote && n.connect_to.is_some()) {
@@ -592,6 +594,8 @@ impl ConnectScreen {
                 key: s.address.clone(),
                 cells: vec![s.address.clone(), s.group.clone(), s.comment.clone()],
                 dimmed: false,
+                section: false,
+                tint: None,
             })
             .collect();
         let before = self.saved_table.selection(&rows);

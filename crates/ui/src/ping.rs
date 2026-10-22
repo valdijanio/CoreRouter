@@ -111,7 +111,7 @@ pub(crate) struct TaskView {
 }
 
 impl TaskView {
-    fn new(id: u64) -> Self {
+    pub(crate) fn new(id: u64) -> Self {
         Self {
             id,
             state: "running".into(),
@@ -156,8 +156,9 @@ struct Series {
 /// Which request a tool reply answers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolReq {
-    PingPoll,
-    MtuPoll,
+    Ping,
+    Mtu,
+    Mtr,
 }
 
 #[derive(Default)]
@@ -293,8 +294,9 @@ impl CoreRouterUi {
     pub(crate) fn tools_tick(&mut self, ctx: &egui::Context, now: f64) {
         let mut due = Vec::new();
         for (req, task) in [
-            (ToolReq::PingPoll, self.ping.ping.as_mut()),
-            (ToolReq::MtuPoll, self.ping.mtu.as_mut()),
+            (ToolReq::Ping, self.ping.ping.as_mut()),
+            (ToolReq::Mtu, self.ping.mtu.as_mut()),
+            (ToolReq::Mtr, self.mtr.task.as_mut()),
         ] {
             let Some(t) = task else { continue };
             if t.running() {
@@ -312,10 +314,13 @@ impl CoreRouterUi {
     }
 
     pub(crate) fn tool_reply(&mut self, req: ToolReq, result: Result<Value, String>) {
+        if req == ToolReq::Mtr {
+            return self.mtr_reply(result);
+        }
         let w = &mut self.ping;
         let task = match req {
-            ToolReq::PingPoll => w.ping.as_mut(),
-            ToolReq::MtuPoll => w.mtu.as_mut(),
+            ToolReq::Ping => w.ping.as_mut(),
+            ToolReq::Mtu | ToolReq::Mtr => w.mtu.as_mut(),
         };
         let Some(task) = task else { return };
         match result {
@@ -327,8 +332,8 @@ impl CoreRouterUi {
                 }
                 let events = task.absorb(&p);
                 match req {
-                    ToolReq::PingPoll => w.take_events(events),
-                    ToolReq::MtuPoll => w.mtu_events.extend(events),
+                    ToolReq::Ping => w.take_events(events),
+                    ToolReq::Mtu | ToolReq::Mtr => w.mtu_events.extend(events),
                 }
             }
             Err(e) => {
@@ -342,6 +347,9 @@ impl CoreRouterUi {
     }
 
     pub(crate) fn tool_started(&mut self, req: ToolReq, result: &Result<Value, String>) {
+        if req == ToolReq::Mtr {
+            return self.mtr_started(result);
+        }
         let w = &mut self.ping;
         w.starting = false;
         match result {
@@ -352,7 +360,7 @@ impl CoreRouterUi {
                 };
                 w.error = None;
                 match req {
-                    ToolReq::PingPoll => {
+                    ToolReq::Ping => {
                         let hosts = r
                             .get("targets")
                             .and_then(Value::as_array)
@@ -362,7 +370,7 @@ impl CoreRouterUi {
                             .collect();
                         w.reset(id, hosts);
                     }
-                    ToolReq::MtuPoll => {
+                    ToolReq::Mtu | ToolReq::Mtr => {
                         w.mtu = Some(TaskView::new(id));
                         w.mtu_events.clear();
                     }
@@ -416,7 +424,7 @@ impl CoreRouterUi {
             o.retain(|_, v| !v.is_null());
         }
         self.ping.starting = true;
-        self.run_then("tool.ping.start", p, Then::Tool(ToolReq::PingPoll));
+        self.run_then("tool.ping.start", p, Then::Tool(ToolReq::Ping));
     }
 
     /// Stop (Esc) the running ping; `false` if none ran.
@@ -452,7 +460,7 @@ impl CoreRouterUi {
             });
             o.insert("address".into(), json!(first));
         }
-        self.run_then("tool.ping.mtu", p, Then::Tool(ToolReq::MtuPoll));
+        self.run_then("tool.ping.mtu", p, Then::Tool(ToolReq::Mtu));
     }
 
     /// Queue the replies as a CSV for the app to save (native: a file;

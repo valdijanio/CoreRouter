@@ -1199,6 +1199,8 @@ struct Follow {
     columns: Option<Vec<String>>,
     widths: Vec<usize>,
     stop_sent: bool,
+    /// The router's own header was printed (`text` polls).
+    header_done: bool,
 }
 
 impl Follow {
@@ -1209,6 +1211,7 @@ impl Follow {
             columns,
             widths: Vec::new(),
             stop_sent: false,
+            header_done: false,
         }
     }
 
@@ -1284,7 +1287,8 @@ impl Shell {
         Next::Send(
             vec![Request::execute(
                 "tool.task.poll",
-                json!({"id": f.id, "after_seq": f.after}),
+                // `text`: the router renders the lines (RouterOS style) itself.
+                json!({"id": f.id, "after_seq": f.after, "text": true}),
             )],
             Box::new(move |sh, replies| {
                 let p = match reply(&replies, 0) {
@@ -1303,8 +1307,33 @@ impl Shell {
                     .and_then(Value::as_array)
                     .cloned()
                     .unwrap_or_default();
-                let rows = f.rows(&events);
-                sh.live.extend(rows);
+                let rendered: Option<Vec<String>> = p
+                    .get("lines")
+                    .and_then(Value::as_array)
+                    .map(|l| l.iter().map(format::value_text).collect());
+                match rendered {
+                    Some(lines) => {
+                        if !f.header_done {
+                            f.header_done = true;
+                            if let Some(h) = p.get("header").and_then(Value::as_str) {
+                                sh.live.push(Line::styled(Style::Header, h.to_owned()));
+                            }
+                        }
+                        for (i, text) in lines.into_iter().enumerate() {
+                            let failed = events
+                                .get(i)
+                                .and_then(|e| e.get("status"))
+                                .and_then(Value::as_str)
+                                .is_some_and(|s| !s.is_empty() && s != "ok");
+                            let style = if failed { Style::Warn } else { Style::Plain };
+                            sh.live.push(Line::styled(style, text));
+                        }
+                    }
+                    None => {
+                        let rows = f.rows(&events);
+                        sh.live.extend(rows);
+                    }
+                }
                 f.after = p.get("next_seq").and_then(Value::as_u64).unwrap_or(f.after);
                 if p.get("done").and_then(Value::as_bool) == Some(true) {
                     let mut lines = Vec::new();
@@ -1312,7 +1341,9 @@ impl Shell {
                     if let Some(r) = p.get("reason").and_then(Value::as_str) {
                         lines.push(Line::styled(Style::Warn, format!("{state}: {r}")));
                     }
-                    if let Some(sum) = p
+                    if let Some(text) = p.get("summary_lines").and_then(Value::as_array) {
+                        lines.extend(text.iter().map(|l| Line::plain(format::value_text(l))));
+                    } else if let Some(sum) = p
                         .get("summary")
                         .filter(|s| s.as_object().is_some_and(|o| !o.is_empty()))
                     {

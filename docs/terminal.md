@@ -49,12 +49,11 @@ Três campos opcionais do `CommandSpec`, com construtores `const` (`cmd!(…).al
 
 | Metadado | Efeito no terminal |
 |---|---|
-| `alias("ping")` | atalho válido em qualquer menu e na raiz: `ping …` e `/ping …` = `/tool ping start …`; aparece no Tab e no `?` da raiz. Nunca esconde um menu da raiz (teste no engine) |
+| `alias("ping")` | atalho válido em qualquer menu e na raiz: `ping …` e `/ping …` = `/tool ping start …`; aparece no Tab e no `?` da raiz. Nunca esconde um menu da raiz (teste no engine). Vários nomes separados por vírgula (`alias("traceroute,mtr")`). **Menu com o nome de um alias:** se a palavra seguinte não é nome do menu (ou é `chave=valor`), o menu roda o comando dele que tem esse alias — `/tool ping 8.8.8.8 count=5 size=1400` e `/tool ping address=…` = `/tool ping start …`, como no RouterOS; `/tool ping mtu …` continua sendo o comando `mtu` |
 | `positional("address")` | a primeira palavra sem `=` vai para esse parâmetro: `ping 8.8.8.8 count=3` |
-| `task()` | o comando inicia uma tarefa: o terminal lê o `id` do resultado e acompanha com `tool.task.poll {id, after_seq}` (o `after_seq` é o `next_seq` da resposta anterior), imprimindo cada evento numa linha assim que chega (cabeçalho uma vez; colunas na ordem de um `columns` opcional no resultado ou na resposta, senão `seq` e as chaves do primeiro evento; `status` diferente de `ok`/vazio em amarelo), até `done`; então mostra `reason` e o `summary`. Entre polls sem novidade espera 250 ms (`Request::Sleep`). **Ctrl+C** chama `tool.task.stop {id}` uma vez e continua até o resumo |
+| `task()` | o comando inicia uma tarefa: o terminal lê o `id` do resultado e acompanha com `tool.task.poll {id, after_seq}` (o `after_seq` é o `next_seq` da resposta anterior), imprimindo cada evento numa linha assim que chega (cabeçalho uma vez; colunas na ordem de um `columns` opcional no resultado ou na resposta, senão `seq` e as chaves do primeiro evento; `status` diferente de `ok`/vazio em amarelo), até `done`; então mostra `reason` e o `summary`. O poll vai com `text: true`: se a resposta trouxer `header`/`lines`/`summary_lines` (o engine as gera em `tools::text`, no formato do RouterOS: `SEQ HOST SIZE TTL TIME STATUS` e `sent=… received=… packet-loss=…% min-rtt=…`), o terminal imprime essas linhas como vieram, sem conhecer a ferramenta; senão usa as colunas acima. Entre polls sem novidade espera 250 ms (`Request::Sleep`). **Ctrl+C** chama `tool.task.stop {id}` uma vez e continua até o resumo |
 
-O `tool.ping.start` (sessão Tools › Ping, ainda fora da main) liga-se a isso sozinho quando entrar
-com esses metadados; os testes usam um roteador simulado com o mesmo contrato
+O `tool.ping.start` e o `tool.mtr.start` (G6.2/G6.3, `docs/tools.md`) usam esses metadados; os testes usam um roteador simulado com o mesmo contrato
 (`crates/shell/tests/tasks.rs`, e um teste headless da janela da GUI).
 
 ### Custo em requisições
@@ -227,4 +226,5 @@ script (`echo … | corerouter-cli shell`) a pergunta é pulada.
 
 - 2026-10-22 — criado (G0.8: terminal na GUI e na CLI, export/import; SSH pendente do G0.3).
 - 2026-10-22 — atalhos (`alias`), parâmetro posicional e acompanhamento de tarefas ao vivo a partir de metadados do registro; custo em requisições reduzido.
+- 2026-10-22 — G6.5: vários aliases, menu com nome de alias roda o comando (`/tool ping 8.8.8.8`), linhas renderizadas pelo engine (`tool.task.poll {text: true}`).
 - 2026-10-22 — G0.3b: pergunta da senha no primeiro login.

@@ -15,6 +15,9 @@ struct Sim {
     emitted: u64,
     total: u64,
     stopped: bool,
+    /// Answer `text: true` polls with rendered lines (the engine does).
+    render: bool,
+    mtr: Option<Value>,
 }
 
 impl Sim {
@@ -25,6 +28,8 @@ impl Sim {
             emitted: 0,
             total,
             stopped: false,
+            render: false,
+            mtr: None,
         }
     }
 
@@ -32,6 +37,8 @@ impl Sim {
         json!([
             {"id": "tool.ping.start", "label": "Ping", "params": "{address: ip | name, count?: u32, interval_ms?: u32} → {id}",
              "kind": "action", "enabled": true, "alias": "ping", "positional": "address", "task": true},
+            {"id": "tool.mtr.start", "label": "MTR", "params": "{address: string, count?: int} → {id}",
+             "kind": "query", "enabled": true, "alias": "traceroute,mtr", "positional": "address", "task": true},
             {"id": "tool.task.poll", "label": "Poll Task", "params": "{id: u64, after_seq?: u64} → {events}", "kind": "query", "enabled": true},
             {"id": "tool.task.stop", "label": "Stop Task", "params": "{id: u64} → {id}", "kind": "action", "enabled": true},
             {"id": "tool.task.list", "label": "Tasks", "params": "{} → [{id, kind, state}]", "kind": "query", "enabled": true},
@@ -52,6 +59,11 @@ impl Sim {
             "engine.execute" => {
                 let p = &params["params"];
                 match params["command"].as_str().unwrap_or("") {
+                    "tool.mtr.start" => {
+                        self.mtr = Some(p.clone());
+                        self.emitted = 0;
+                        Ok(json!({"id": 7}))
+                    }
                     "tool.ping.start" => {
                         self.started = Some(p.clone());
                         Ok(json!({"id": 7, "columns": ["seq", "host", "time", "status"]}))
@@ -67,6 +79,19 @@ impl Sim {
                             events.push(json!({"seq": self.emitted, "host": "8.8.8.8", "time": "1ms", "status": status}));
                         }
                         let done = self.stopped || self.emitted >= self.total;
+                        if self.render && p["text"] == true {
+                            let lines: Vec<String> = events
+                                .iter()
+                                .map(|e| format!("LINE {}", e["seq"]))
+                                .collect();
+                            return Ok(json!({
+                                "id": 7, "state": if done { "done" } else { "running" }, "done": done,
+                                "events": events, "next_seq": self.emitted, "more": false, "lost": 0,
+                                "summary": {"sent": self.emitted}, "header": "SEQ HOST TIME",
+                                "lines": lines,
+                                "summary_lines": if done { json!(["sent=3 received=2 packet-loss=33%"]) } else { Value::Null },
+                            }));
+                        }
                         Ok(json!({
                             "id": 7, "state": if self.stopped { "stopped" } else if done { "done" } else { "running" },
                             "done": done, "reason": if self.stopped { json!("stopped by test") } else { Value::Null },
@@ -201,4 +226,66 @@ fn ctrl_c_stops_the_task_and_shows_the_summary() {
         out.text()
     );
     assert!(sim.emitted < 100);
+}
+
+#[test]
+fn a_menu_named_like_an_alias_runs_its_command() {
+    let mut sim = Sim::new(1);
+    let mut sh = connect(&mut sim);
+    for line in [
+        "/tool ping 8.8.8.8 count=3",
+        "/tool ping address=8.8.8.8 count=3",
+    ] {
+        sim.started = None;
+        sim.emitted = 0;
+        let job = sh.submit(line);
+        let out = sh.run_with(job, |r| sim.answer(r));
+        assert!(!out.failed, "{line}: {}", out.text());
+        assert_eq!(
+            sim.started,
+            Some(json!({"address": "8.8.8.8", "count": 3})),
+            "{line}"
+        );
+    }
+    // The menu's own commands still win.
+    sim.emitted = 0;
+    let job = sh.submit("/tool ping start 1.1.1.1");
+    sh.run_with(job, |r| sim.answer(r));
+    assert_eq!(sim.started.as_ref().unwrap()["address"], "1.1.1.1");
+    // Several aliases: traceroute and mtr, from the root and from /tool.
+    for line in [
+        "traceroute 9.9.9.9",
+        "mtr 9.9.9.9",
+        "/tool traceroute 9.9.9.9",
+        "/tool mtr 9.9.9.9",
+    ] {
+        sim.mtr = None;
+        let job = sh.submit(line);
+        let out = sh.run_with(job, |r| sim.answer(r));
+        assert!(!out.failed, "{line}: {}", out.text());
+        assert_eq!(sim.mtr, Some(json!({"address": "9.9.9.9"})), "{line}");
+    }
+}
+
+#[test]
+fn lines_rendered_by_the_router_are_printed_as_they_are() {
+    let mut sim = Sim::new(3);
+    sim.render = true;
+    let mut sh = connect(&mut sim);
+    let job = sh.submit("ping 8.8.8.8 count=3");
+    let out = sh.run_with(job, |r| sim.answer(r));
+    let all: Vec<String> = sh
+        .take_live()
+        .iter()
+        .chain(out.lines.iter())
+        .map(Line::text)
+        .collect();
+    let text = all.join("\n");
+    assert!(text.contains("SEQ HOST TIME"), "{text}");
+    assert!(text.contains("LINE 1") && text.contains("LINE 3"), "{text}");
+    assert!(text.contains("packet-loss=33%"), "{text}");
+    assert!(
+        !text.contains("sent: 3"),
+        "the key: value summary is replaced: {text}"
+    );
 }
