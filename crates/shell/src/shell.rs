@@ -322,6 +322,11 @@ impl Shell {
         self.width = width.filter(|w| *w > 0);
     }
 
+    /// The width set by [`Self::set_width`].
+    pub fn width(&self) -> Option<usize> {
+        self.width
+    }
+
     /// Lines printed by the running job since the last call.
     pub fn take_live(&mut self) -> Vec<Line> {
         std::mem::take(&mut self.live)
@@ -698,7 +703,7 @@ impl Shell {
             Parsed::Help { path, id } => Next::Done(Output::lines(self.help(&path, id.as_deref()))),
             Parsed::Print { path, id, opts } => self.print(path, &id, opts),
             Parsed::Command { path, id, args } => self.run_command(&path, &id, &args),
-            Parsed::Export { path, file } => self.export(path, file),
+            Parsed::Export { path, file, terse } => self.export(path, file, terse),
             Parsed::Import { file: None } => Next::Done(Output::error(
                 "import needs file=<name> (a file on this computer), or paste the script",
             )),
@@ -924,7 +929,7 @@ impl Shell {
         )
     }
 
-    fn export(&mut self, path: Vec<String>, file: Option<String>) -> Next {
+    fn export(&mut self, path: Vec<String>, file: Option<String>, terse: bool) -> Next {
         let ids = export::reads(&self.reg);
         let reqs = ids
             .iter()
@@ -943,8 +948,17 @@ impl Shell {
                     }
                 }
                 let script = export::script(&sh.reg, &path, &results, &sh.version);
+                // RouterOS's layout: wrapped at the terminal's width (a file
+                // at 80, so it does not depend on the window), or `terse`.
+                let script = match (terse, &file) {
+                    (true, _) => export::terse(&script),
+                    (false, Some(_)) => export::wrap(&script, export::DEFAULT_WIDTH),
+                    (false, None) => {
+                        export::wrap(&script, sh.width.unwrap_or(export::DEFAULT_WIDTH))
+                    }
+                };
                 match file {
-                    None => Next::Done(Output::lines(script.lines().map(script_line).collect())),
+                    None => Next::Done(Output::lines(script_lines(&script))),
                     Some(f) => Next::Send(
                         vec![Request::WriteFile {
                             path: f.clone(),
@@ -1423,21 +1437,55 @@ fn result_lines(cmd: &Command, v: &Value) -> Vec<Line> {
     }
 }
 
+/// The lines of an exported script, colored (a line after a ` \\` goes on
+/// with arguments).
+pub fn script_lines(script: &str) -> Vec<Line> {
+    let mut cont = false;
+    script
+        .lines()
+        .map(|l| {
+            let line = script_line_in(l, cont);
+            cont = !l.starts_with('#') && l.ends_with('\\');
+            line
+        })
+        .collect()
+}
+
 /// A line of an exported script, colored.
 pub fn script_line(line: &str) -> Line {
+    script_line_in(line, false)
+}
+
+/// `cont`: the line continues the one before (no verb).
+fn script_line_in(line: &str, cont: bool) -> Line {
     if line.starts_with('#') {
         return Line::styled(Style::Comment, line);
     }
-    if line.starts_with('/') {
-        return Line::styled(Style::Menu, line);
-    }
+    let words = crate::lex::words(line);
+    // `terse`: the menu, then the verb (the last word before the first
+    // `key=value`).
+    let menu_words = if line.starts_with('/') {
+        let bare = words.iter().take_while(|w| w.key.is_none()).count();
+        if bare == words.len() {
+            return Line::styled(Style::Menu, line);
+        }
+        bare.saturating_sub(1)
+    } else {
+        0
+    };
     let mut l = Line::new();
     let mut last = 0usize;
-    for (i, w) in crate::lex::words(line).into_iter().enumerate() {
+    for (i, w) in words.into_iter().enumerate() {
         l.push(Style::Plain, line.get(last..w.start).unwrap_or(""));
         let raw = line.get(w.start..w.end).unwrap_or("");
         match (i, w.key.as_ref()) {
-            (0, _) => {
+            _ if raw == "\\" => {
+                l.push(Style::Dim, raw);
+            }
+            (i, _) if i < menu_words => {
+                l.push(Style::Menu, raw);
+            }
+            (i, None) if i == menu_words && !cont => {
                 l.push(Style::Verb, raw);
             }
             (_, Some(_)) => {

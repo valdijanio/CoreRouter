@@ -171,7 +171,16 @@ registro:
 - **segredos nunca em texto puro**: campo com nome de segredo (`password`, `secret`, `psk`,
   `token`, `private`) não sai; uma linha que precisaria dele vira comentário
   `# add name=x: password is not exported` (o engine não devolve senhas). Quando o G0.3 entrar,
-  usuários seguem essa regra até existir um hash exportável.
+  usuários seguem essa regra até existir um hash exportável;
+- **largura do terminal, como o RouterOS** (G0.8b): comando mais largo que o terminal quebra com
+  ` \` no fim e as linhas seguintes recuadas 4 espaços, sempre entre argumentos (nunca dentro de
+  um valor entre aspas; um argumento maior que a linha fica sozinho na sua). A largura é a do
+  terminal (`Shell::set_width`: a janela da GUI, o `rustyline` da CLI), 80 sem terminal; o
+  `file=` sai sempre em 80 colunas, para o arquivo não depender da janela;
+- **`/export terse`**: uma linha por item com o menu na frente
+  (`/ip address add address=… interface=…`), sem quebra — para script e grep. `compact` (o
+  padrão do RouterOS desde a v6) é aceito e não muda nada; `verbose` e `show-sensitive` são
+  recusados com o motivo (não viram nome de arquivo).
 
 `/import file=nome` lê o arquivo do lado do cliente e **colar várias linhas** no terminal faz o
 mesmo: o script inteiro é traduzido antes (erro de sintaxe → "line N: …", nada aplicado) e vai
@@ -186,6 +195,20 @@ descoberta e identity → export → import num lab novo → export igual, runni
 
 A GUI não lê nem grava arquivos (roda também no navegador): lá, cole o script; o `export` aparece
 na janela e pode ser copiado (botão direito › Copy All).
+
+### Linha comprida na janela (G0.8b)
+
+Como em todo terminal (WinBox, xterm, SSH), a janela New Terminal não tem barra horizontal: uma
+linha mais larga que a janela quebra na largura visível e quebra de novo quando a janela muda de
+tamanho, inclusive o que já está na tela. As linhas de continuação começam com um `↳ ` discreto.
+A quebra é só de exibição: a saída guarda a linha original, e copiar (seleção ou Copy All) devolve
+a linha original, sem as quebras nem o `↳`. Tabelas do `print` e o `/export` já saem na largura
+da janela (colunas que cabem + "N more columns…"; ` \` no export), então quase só mensagens,
+erros e a linha digitada quebram assim.
+
+Um clique em qualquer lugar da janela (na saída, não só na linha) devolve o foco à linha de
+comando, como no xterm, no PuTTY e no WinBox. Arrastar para selecionar mantém a seleção para
+copiar; a próxima tecla depois disso vai para a linha de comando.
 
 ## Safe Mode (Ctrl+X)
 

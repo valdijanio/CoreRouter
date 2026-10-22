@@ -23,6 +23,12 @@
 //! Secrets never leave in plain text: a field whose name says it is one is
 //! replaced by a commented line, and so is a row missing a required `add`
 //! parameter (the router does not return passwords).
+//!
+//! Layout, as RouterOS prints it: a command wider than the terminal goes on
+//! with ` \` and the next line indented four spaces ([`wrap`]), breaking
+//! between arguments only (a quoted value is never cut); `/import` joins
+//! them back. `/export terse` ([`terse`]) writes one line per item with its
+//! menu in front, never wrapped, for scripts and grep.
 
 use std::collections::BTreeMap;
 
@@ -399,6 +405,77 @@ pub fn script(
     s
 }
 
+/// Width of an export with no terminal (a file, a pipe): RouterOS's 80.
+pub const DEFAULT_WIDTH: usize = 80;
+
+/// Indent of a continued line.
+const INDENT: &str = "    ";
+
+/// `script` with every command line wider than `width` characters broken
+/// between arguments: ` \` ends a broken line, the next starts with four
+/// spaces. Comments and menu lines stay as they are, and so does an
+/// argument wider than the whole line (it gets a line of its own).
+pub fn wrap(script: &str, width: usize) -> String {
+    let mut out = String::with_capacity(script.len() + script.len() / 16);
+    for line in script.lines() {
+        if line.starts_with('#') || line.starts_with('/') || line.chars().count() <= width {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        let words = crate::lex::words(line);
+        let n = words.len();
+        let mut cur = String::new();
+        for (i, w) in words.iter().enumerate() {
+            let word = line.get(w.start..w.end).unwrap_or("");
+            if cur.is_empty() {
+                cur.push_str(word);
+                continue;
+            }
+            // A broken line keeps room for its ` \`; the last one does not
+            // need it.
+            let room = if i + 1 == n {
+                width
+            } else {
+                width.saturating_sub(2)
+            };
+            let fits = cur.chars().count() + 1 + word.chars().count() <= room;
+            if fits {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                out.push_str(&cur);
+                out.push_str(" \\\n");
+                cur = format!("{INDENT}{word}");
+            }
+        }
+        out.push_str(&cur);
+        out.push('\n');
+    }
+    out
+}
+
+/// `script` with one line per item and the menu in front of each
+/// (`/ip address add address=… interface=…`), as `/export terse`: what a
+/// script or grep wants. Notes keep their menu too.
+pub fn terse(script: &str) -> String {
+    let mut out = String::with_capacity(script.len() * 2);
+    let mut menu: Option<&str> = None;
+    for line in script.lines() {
+        match (menu, line.strip_prefix("# ")) {
+            _ if line.starts_with('/') => {
+                menu = Some(line);
+                continue;
+            }
+            (Some(m), Some(note)) => out.push_str(&format!("# {m} {note}")),
+            (Some(m), None) if !line.starts_with('#') => out.push_str(&format!("{m} {line}")),
+            _ => out.push_str(line),
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +502,70 @@ mod tests {
         assert!(s.contains("set name=ether1 mtu=1500"), "{s}");
         assert!(s.contains("add name=br1"), "{s}");
         assert!(!s.contains("docker0") && !s.contains("dyn\n"), "{s}");
+    }
+
+    #[test]
+    fn wrap_breaks_between_arguments_and_indents() {
+        let line = "add interface=ether1 add-default-route=yes use-peer-dns=yes use-peer-ntp=yes comment=\"uplink to the ISP\"";
+        let s = wrap(&format!("/ip dhcp-client\n{line}\n"), 40);
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "/ip dhcp-client",
+                "add interface=ether1 \\",
+                "    add-default-route=yes \\",
+                "    use-peer-dns=yes use-peer-ntp=yes \\",
+                "    comment=\"uplink to the ISP\"",
+            ]
+        );
+        for l in &lines {
+            assert!(l.chars().count() <= 40, "{l:?}");
+        }
+        // Joined back as /import does, it is the same command.
+        let joined: String = lines
+            .iter()
+            .skip(1)
+            .map(|l| l.strip_suffix('\\').unwrap_or(l))
+            .collect();
+        let words = |t: &str| {
+            crate::lex::words(t)
+                .into_iter()
+                .map(|w| w.text)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(words(&joined), words(line));
+    }
+
+    #[test]
+    fn wrap_never_cuts_a_value_and_leaves_short_lines_alone() {
+        let long = "x".repeat(60);
+        let s = wrap(
+            &format!("set a=1 comment=\"{long} y\" b=2\nset c=3\n# {long}\n"),
+            30,
+        );
+        let lines: Vec<&str> = s.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "set a=1 \\",
+                &format!("    comment=\"{long} y\" \\"),
+                "    b=2",
+                "set c=3",
+                &format!("# {long}"),
+            ]
+        );
+        // Wide enough: unchanged.
+        let one = "add name=br1 comment=\"a b\"\n";
+        assert_eq!(wrap(one, 80), one);
+    }
+
+    #[test]
+    fn terse_puts_the_menu_on_every_line() {
+        let s = "# header\n/interface bridge\nadd name=br1\n# add name=x: password is not exported\n/ip address\nadd address=10.0.0.1/24 interface=br1\n";
+        assert_eq!(
+            terse(s),
+            "# header\n/interface bridge add name=br1\n# /interface bridge add name=x: password is not exported\n/ip address add address=10.0.0.1/24 interface=br1\n"
+        );
     }
 }

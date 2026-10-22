@@ -940,3 +940,42 @@ fn dhcpv6_client_pool_and_settings() {
     let e = t.fails("/ipv6 dhcp-client add interface=ether2 request=prefix");
     assert!(e.contains("pool"), "{e}");
 }
+
+/// G0.8b: on a narrow terminal `/export` wraps as RouterOS does (` \` and a
+/// four-space indent, between arguments) and pasting it back rebuilds the
+/// same config; `/export terse` is one line per item with its menu.
+#[test]
+fn wrapped_and_terse_export_round_trip() {
+    let mut a = Term::new();
+    build(&mut a);
+    a.ok("/ip dhcp-client add interface=ether1 add-default-route=no use-peer-dns=no use-peer-ntp=no comment=\"uplink to the ISP\" fallback-address=192.168.88.2/24");
+    a.shell.set_width(Some(48));
+    let screen = a.ok("/export");
+    assert!(screen.contains(" \\\n    "), "{screen}");
+    for l in screen.lines().filter(|l| !l.starts_with('#')) {
+        assert!(l.chars().count() <= 48, "{l:?} in:\n{screen}");
+    }
+    // A quoted value is never cut.
+    assert!(screen.contains("comment=\"uplink to the ISP\""), "{screen}");
+
+    let mut b = Term::new();
+    let out = b.ok(&screen);
+    assert!(out.contains("one atomic batch"), "{out}");
+    b.shell.set_width(Some(48));
+    assert_eq!(b.ok("/export"), screen);
+    // A file does not depend on the window: always 80 columns.
+    assert_eq!(b.export(), a.export());
+
+    let terse = a.ok("/export terse");
+    for l in terse.lines() {
+        assert!(l.starts_with('/') || l.starts_with('#'), "{l:?}");
+        assert!(!l.ends_with('\\'), "{l:?}");
+    }
+    assert!(
+        terse.contains("/ip dhcp-client add interface=ether1 "),
+        "{terse}"
+    );
+    let mut c = Term::new();
+    c.ok(&terse);
+    assert_eq!(c.export(), a.export());
+}

@@ -139,14 +139,20 @@ impl Shell {
                     let given = done.get(next..).unwrap_or_default();
                     self.arg_candidates(&path, cmd, given, partial, start)
                 }
-                Verb::Export | Verb::Import => Completion {
-                    start,
-                    candidates: ["file="]
-                        .into_iter()
-                        .filter(|f| f.starts_with(typed))
-                        .map(|f| cand(f.to_owned(), "a file on this computer", Style::Key))
-                        .collect(),
-                },
+                Verb::Export | Verb::Import => {
+                    let mut opts = vec![("file=", "a file on this computer", Style::Key)];
+                    if matches!(verb, Verb::Export) {
+                        opts.push(("terse", "one line per item, menu in front", Style::Item));
+                    }
+                    Completion {
+                        start,
+                        candidates: opts
+                            .into_iter()
+                            .filter(|(f, _, _)| f.starts_with(typed))
+                            .map(|(f, help, style)| cand(f.to_owned(), help, style))
+                            .collect(),
+                    }
+                }
                 Verb::Quit => Completion::default(),
             },
         }

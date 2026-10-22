@@ -277,3 +277,177 @@ fn wide_print_does_not_stretch_the_window() {
     let out = h.app.terminal_text(t);
     assert!(out.contains("more column"), "{out}");
 }
+
+/// G0.8b: a line wider than the window wraps at its width (no sideways
+/// scrolling), wraps again when the window is resized, and copies back as
+/// the original line.
+#[test]
+fn long_lines_wrap_at_the_window_width() {
+    let mut h = Harness::new();
+    let t = h.open_terminal();
+    let id = crate::terminal::term_id(h.app.terminals[t].id);
+    let before = h.win_rect(id);
+    let long = format!("/ip address print where comment=\"{}\"", "x".repeat(300));
+    h.enter(&long);
+    for _ in 0..3 {
+        h.idle();
+    }
+    // Stored as typed; shown in rows that start with the mark.
+    assert!(h.app.terminal_text(t).contains(&long));
+    assert!(h.has_text_containing("\u{21b3} "), "the echo wraps");
+    let after = h.win_rect(id);
+    assert!(
+        (after.width() - before.width()).abs() < 1.0,
+        "window grew from {before:?} to {after:?}"
+    );
+    // Nothing drawn past the window's right edge: no sideways scrolling.
+    let right = |h: &Harness| {
+        let rects = text_rects(h, "xxxxxxxx");
+        assert!(!rects.is_empty(), "the line is drawn");
+        rects.iter().map(|r| r.right()).fold(f32::MIN, f32::max)
+    };
+    assert!(right(&h) < after.right(), "text past the edge");
+    let rows = |h: &Harness| {
+        h.app.terminals[t]
+            .shell
+            .width()
+            .and_then(|cols| {
+                let echo = h.app.terminals[t]
+                    .output
+                    .iter()
+                    .find(|l| l.text().contains("xxxx"))?;
+                Some(crate::terminal::wrapped(&echo.0, cols))
+            })
+            .unwrap()
+            .iter()
+            .filter(|s| s.text == crate::terminal::WRAP)
+            .count()
+    };
+    let wide_rows = rows(&h);
+    assert!(wide_rows >= 2, "{wide_rows}");
+
+    // Narrower window: the same line takes more rows.
+    let corner = after.right_bottom() - egui::vec2(2.0, 2.0);
+    h.drag(corner, egui::vec2(-300.0, 0.0));
+    for _ in 0..3 {
+        h.idle();
+    }
+    let narrow = h.win_rect(id);
+    assert!(narrow.width() < after.width() - 100.0, "{narrow:?}");
+    assert!(rows(&h) > wide_rows, "{} vs {wide_rows}", rows(&h));
+    assert!(right(&h) < narrow.right(), "text past the edge");
+}
+
+#[test]
+fn wrap_breaks_after_spaces_and_unwraps_exactly() {
+    use corerouter_shell::{Line, Style};
+    use crate::terminal::{WRAP, wrapped};
+    let line = Line::new()
+        .with(Style::Error, "failure: no interface 'ether99' ")
+        .with(Style::Dim, "(did you mean ether9?)");
+    let text = line.text();
+    for cols in [10, 17, 24, 40] {
+        let spans = wrapped(&line.0, cols);
+        let shown: String = spans.iter().map(|s| s.text.as_str()).collect();
+        for (i, row) in shown.split('\n').enumerate() {
+            assert!(row.chars().count() <= cols, "{cols}: {row:?}");
+            assert_eq!(i > 0, row.starts_with("\u{21b3} "), "{row:?}");
+        }
+        assert_eq!(shown.replace(WRAP, ""), text, "{cols}");
+    }
+    // Colors stay with their characters.
+    let spans = wrapped(&line.0, 20);
+    assert!(spans.iter().any(|s| s.style == Style::Error && s.text.contains("failure")));
+    assert!(spans.iter().any(|s| s.style == Style::Dim && s.text.contains("ether9?")));
+    // Short enough: unchanged.
+    assert_eq!(wrapped(&line.0, 200), line.0);
+}
+
+/// Copying a selection of wrapped rows gives the original line back.
+#[test]
+fn copy_takes_the_display_wraps_out() {
+    let ctx = egui::Context::default();
+    ctx.add_plugin(crate::terminal::UnwrapCopy);
+    let wrapped = format!("abc {}def", crate::terminal::WRAP);
+    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        ui.ctx().copy_text(wrapped.clone())
+    });
+    out.textures_delta.clear();
+    let copied: Vec<&str> = out
+        .platform_output
+        .commands
+        .iter()
+        .filter_map(|c| match c {
+            egui::OutputCommand::CopyText(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(copied, ["abc def"]);
+}
+
+#[test]
+fn the_wrap_mark_has_a_glyph() {
+    let ctx = egui::Context::default();
+    ctx.run_ui(egui::RawInput::default(), |_| {})
+        .textures_delta
+        .clear();
+    let font = egui::FontId::monospace(12.0);
+    assert!(ctx.fonts_mut(|f| f.has_glyph(&font, '\u{21b3}')));
+}
+
+/// A click anywhere in the output puts the focus back on the input; a drag
+/// selects text without taking it, and the next key goes to the input.
+#[test]
+fn click_in_the_output_focuses_the_input() {
+    let mut h = Harness::new();
+    let t = h.open_terminal();
+    h.enter("/system identity print");
+    let iid = crate::terminal::input_id(h.app.terminals[t].id);
+    let focused = |h: &Harness| h.ctx.memory(|m| m.has_focus(iid));
+    assert!(focused(&h));
+
+    // Focus lost (a click on the desktop), then a click on empty output.
+    h.click(egui::pos2(1300.0, 850.0));
+    assert!(!focused(&h));
+    let win = h.win_rect(crate::terminal::term_id(h.app.terminals[t].id));
+    h.click(win.center());
+    assert!(focused(&h), "a click in the output focuses the input");
+    h.type_text("/ip");
+    assert_eq!(h.input(t), "/ip");
+
+    // A drag over the banner selects it and keeps the selection.
+    let banner = text_rects(&h, "Tab completes")[0];
+    let at = egui::pos2(banner.left() + 4.0, banner.center().y);
+    h.drag(at, egui::vec2(120.0, 0.0));
+    let selected = |h: &Harness| {
+        h.ctx
+            .plugin::<egui::text_selection::LabelSelectionState>()
+            .lock()
+            .has_selection()
+    };
+    assert!(selected(&h), "the drag selected text");
+    h.idle();
+    assert!(selected(&h), "the selection stays");
+    // The next key goes to the input.
+    h.type_text(" a");
+    assert!(focused(&h));
+    assert_eq!(h.input(t), "/ip a");
+}
+
+/// Where the text shapes containing `needle` are drawn.
+fn text_rects(h: &Harness, needle: &str) -> Vec<egui::Rect> {
+    fn find(shape: &egui::Shape, needle: &str, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Text(t) if t.galley.text().contains(needle) => {
+                out.push(t.visual_bounding_rect());
+            }
+            egui::Shape::Vec(v) => v.iter().for_each(|s| find(s, needle, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for s in &h.shapes {
+        find(&s.shape, needle, &mut out);
+    }
+    out
+}
