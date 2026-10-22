@@ -21,7 +21,12 @@
 //! Neighbor discovery (G5.1, docs/discovery.md): CRDP announces on the
 //! interfaces listed with `ip.neighbor.discovery.set` (none by default) and
 //! fills `ip.neighbor.list`. The node id is kept in `<config-dir>/node-id`.
+//! With the linux backend (G5.2) the same interfaces also send and receive
+//! LLDP, and MNDP from MikroTiks is listened to (never sent); the virtual
+//! lab has no real links, so it runs CRDP only.
 
+#[cfg(target_os = "linux")]
+mod link_discovery;
 mod node_id;
 
 use std::path::PathBuf;
@@ -46,7 +51,8 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                         and http://localhost:<port>
   --web-root <dir>      serve the built web GUI (`trunk build` -> dist/) on the --ws port
   --discovery-port <p>  UDP port of CRDP neighbor discovery (default 7979)
-  --no-discovery        do not open the CRDP port at all";
+  --no-discovery        no neighbor discovery at all (CRDP, and with the linux
+                        backend LLDP and MNDP)";
 
 /// Writable config partition of the router image (docs/architecture.md 1.1).
 const PRODUCTION_CONFIG_DIR: &str = "/config";
@@ -187,6 +193,31 @@ fn storage(args: &Args) -> Result<(Box<dyn ConfigStorage>, Option<PathBuf>), Str
     }
 }
 
+/// LLDP + passive MNDP (G5.2): only on a real kernel, and not with
+/// `--no-discovery`. Never stops the daemon.
+#[cfg(target_os = "linux")]
+fn link_discovery(
+    args: &Args,
+    session: &corerouter_engine::Shared,
+    node_id: corerouter_discovery::NodeId,
+) -> Option<link_discovery::LinkDiscovery> {
+    if args.discovery_port.is_none() || args.backend != "linux" {
+        return None;
+    }
+    let local = link_discovery::LocalSystem {
+        chassis: node_id.to_string(),
+        description: format!("CoreRouter {}", env!("CARGO_PKG_VERSION")),
+    };
+    match link_discovery::LinkDiscovery::spawn(session.clone(), local, corerouter_proto_mndp::PORT)
+    {
+        Ok(l) => Some(l),
+        Err(e) => {
+            log::error!("LLDP/MNDP are off: cannot start their thread: {e}");
+            None
+        }
+    }
+}
+
 fn main() -> ExitCode {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(
         "warn,corerouter_daemon=info,corerouter_control=info,corerouter_engine=info,\
@@ -234,13 +265,14 @@ fn main() -> ExitCode {
         args.port,
         args.backend
     );
+    let node_id = node_id::load_or_create(config_dir.as_deref());
     // Kept alive until `serve` returns (never, in practice).
     let _discovery = match args.discovery_port {
         None => None,
         Some(port) => {
             let cfg = AgentConfig {
                 port,
-                node_id: node_id::load_or_create(config_dir.as_deref()),
+                node_id,
                 control_port: Some(args.port),
                 ws_port: args.ws,
                 board: format!("{} {}", std::env::consts::ARCH, args.backend),
@@ -255,6 +287,8 @@ fn main() -> ExitCode {
             }
         }
     };
+    #[cfg(target_os = "linux")]
+    let _link_discovery = link_discovery(&args, &session, node_id);
     let host = SharedHost(session);
     if let Err(e) = websocket(&args, host.clone()) {
         eprintln!("{e}");

@@ -15,11 +15,13 @@ corerouter-hal-linux.workspace = true
 corerouter-control.workspace = true
 corerouter-storage-fs.workspace = true
 corerouter-discovery.workspace = true
+corerouter-model.workspace = true
+corerouter-proto-lldp.workspace = true
+corerouter-proto-mndp.workspace = true
 log.workspace = true
 env_logger.workspace = true
 
 [dev-dependencies]
-corerouter-model.workspace = true
 serde_json.workspace = true
 
 [lints]

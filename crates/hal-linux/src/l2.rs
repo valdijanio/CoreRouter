@@ -195,6 +195,18 @@ impl LldpIo {
         failed
     }
 
+    /// Change the time between two LLDPDUs on a port (the operator's
+    /// `interval_secs`); takes effect at the next [`LldpIo::due`].
+    pub fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
+    }
+
+    /// Kernel interface index of an open port (for the Management Address
+    /// TLV's ifIndex).
+    pub fn ifindex(&self, name: &IfName) -> Option<u32> {
+        self.ports.get(name).map(|p| p.ifindex)
+    }
+
     /// Open ports and their MAC addresses (for the Chassis/Port ID).
     pub fn interfaces(&self) -> Vec<(IfName, [u8; 6])> {
         self.ports.iter().map(|(n, p)| (n.clone(), p.mac)).collect()
