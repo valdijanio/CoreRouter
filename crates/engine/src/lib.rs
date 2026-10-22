@@ -14,6 +14,7 @@ pub mod firewall_dyn;
 pub mod guard;
 pub mod link_watch;
 pub mod lockout;
+pub mod metrics;
 pub mod neighbors;
 pub mod safe_mode;
 pub mod session;
