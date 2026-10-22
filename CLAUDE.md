@@ -85,7 +85,7 @@ Decisões de desempenho se tomam com números, não com preferência.
 ## Inegociáveis (cada um com o motivo e o que o impõe)
 
 - **Tudo é comando.** Comportamento novo = `CommandSpec` em `crates/engine/src/cmd/<área>.rs`
-  com `cmd!` + teste. UI, CLI, canal de controle e MCP só chamam `Session::execute(id, params)`.
+  com `cmd!` + teste (área nova = arquivo novo; o `build.rs` do engine a registra). UI, CLI, canal de controle e MCP só chamam `Session::execute(id, params)`.
   Motivo: um caminho só para validar, registrar no journal e fazer rollback. Imposto por revisão
   e pelos testes do registro (`ids_are_unique_and_well_formed`, `every_params_doc_parses`).
 - **O `params` é contrato.** Formato `{chave: tipo, opcional?: tipo} → resultado`. O engine
@@ -207,8 +207,20 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   principal (sessões não planejadas mexem nos mesmos arquivos e geram conflito).
 - **PRs pequenos e focados**: entram mais rápido e reduzem a janela de conflito. Feature grande
   vira vários PRs sequenciais, um por sessão.
-- **Pontos quentes** (`crates/engine/src/session.rs`, `crates/engine/src/cmd/mod.rs`,
-  `crates/ui/src/lib.rs`): mudanças mínimas e aditivas; prefira arquivos novos no seu módulo.
+- **Arquivo novo em vez de lista compartilhada.** Os registros que todo PR editava (e onde PRs
+  paralelos conflitavam) agora são gerados a partir dos arquivos:
+  - área de comandos nova: `crates/engine/src/cmd/<área>.rs` com `COMMANDS` — o `build.rs` do
+    engine a registra; **não edite** `cmd/mod.rs`;
+  - janela nova na GUI: um **painel** `crates/ui/src/<feature>.rs` com
+    `pub(crate) const PANEL: Panel` (veja `crates/ui/src/panel.rs`: estado próprio, consultas,
+    respostas, diálogos); **não edite** `ui/src/lib.rs` nem `ui/src/windows.rs`. Os itens de cada
+    grupo do menu ficam em ordem alfabética (como no WinBox); grupo novo é uma linha em `MENU`;
+  - testes de UI de uma feature: `crates/ui/src/tests/<feature>.rs` (descoberto), não no fim do
+    `mod tests` do `lib.rs`;
+  - teste em namespace: `tests/netns<nome>.rs` em qualquer pacote — o `cargo xtask netns`
+    descobre; não há lista para editar.
+- **Pontos quentes que restam** (`crates/engine/src/session.rs`, `crates/hal/src/lib.rs`,
+  `crates/model/src/lib.rs`): mudanças mínimas e aditivas; prefira arquivos novos no seu módulo.
 
 ## Progresso
 

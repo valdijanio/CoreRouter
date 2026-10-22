@@ -540,3 +540,11 @@ mesmo dia pode variar.
   cuja janela está aberta (`TableState::open`, clique traz a janela) e Ctrl+Tab / Ctrl+F6 (atalho do
   WinBox) com Shift ao contrário; no navegador o Ctrl+Tab é da aba, o Ctrl+F6 fica. 8 testes headless
   novos; conferido na GUI real num Xvfb próprio (screenshots). Esforço do agente ~3 h (**estimado**).
+- 2026-10-22 — processo: os pontos quentes que todo PR editava viram registros gerados a partir dos
+  arquivos (medido nos 40 commits anteriores: `ui/src/lib.rs` em 23, `xtask/src/main.rs` em 13,
+  `ui/src/windows.rs` em 13, `engine/src/cmd/mod.rs` em 10). `crates/engine/build.rs` registra
+  cada `src/cmd/<área>.rs` (áreas em ordem de nome de arquivo); `crates/ui/build.rs` declara os
+  módulos de `src/`, os testes de `src/tests/` e os **painéis** (`ui/src/panel.rs`: janela com
+  estado, consultas, respostas e diálogos próprios, `Win::Panel(id)`, menu alfabético por grupo);
+  `cargo xtask netns` descobre `tests/netns*.rs`. IP › DHCP Client e as janelas IPv6 viraram
+  painéis. Regras em AGENTS.md ("Arquivo novo em vez de lista compartilhada").
