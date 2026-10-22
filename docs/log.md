@@ -640,3 +640,7 @@ continuação indentadas).
   `perf.md`. Achado da bateria da fila de entrada: o #49 e o #50 acrescentaram no fim do `perf.md`
   e o segundo parou na fila com conflito real. `xtask/src/changes.rs` ganhou a struct `Docs` (os
   quatro documentos do fold) e testes da seção nova.
+
+- 2026-10-22 — G9.1: Bateria da fila de entrada: feature sintética 01 (`bench.f01.get`).
+
+- 2026-10-22 — G9.2: Bateria da fila de entrada: feature sintética 02 (`bench.f02.get`).
