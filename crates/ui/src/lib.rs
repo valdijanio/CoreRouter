@@ -10,6 +10,7 @@ pub mod backend;
 pub mod connect;
 mod dhcp_client;
 mod dialog;
+mod ethernet_tab;
 mod firewall;
 mod firewall_assist;
 mod first_login;
@@ -1746,6 +1747,7 @@ mod tests {
     }
 
     mod dialog_keys;
+    mod ethernet_tab;
     mod firewall;
     mod firewall_assist;
     mod hierarchy;

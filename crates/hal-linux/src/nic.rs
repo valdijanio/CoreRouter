@@ -11,9 +11,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use corerouter_hal::nic::MAX_ITEMS;
+use corerouter_hal::sff::{self, DiagPage, HALF_PAGE, SfpModule};
 use corerouter_hal::{CounterGroup, EthernetMonitor, HalError, LinkCounters, NicHardware};
 
 use crate::ethtool::{Ethtool, devlink_info};
+use crate::genl::GenlError;
 use crate::netlink::{LinkDetail, link_detail};
 use crate::pci_ids::{self, PciIds};
 
@@ -115,6 +117,52 @@ pub(crate) fn counters(name: &str) -> Result<LinkCounters, HalError> {
     });
     out.notes = notes;
     Ok(out)
+}
+
+/// The module in `name`'s cage (G1.20): page 0 of address 0x50, then the
+/// diagnostics page the identifier calls for.
+pub(crate) fn sfp_module(name: &str) -> Result<SfpModule, HalError> {
+    detail(name)?;
+    let mut e = Ethtool::open(name)
+        .map_err(|e| HalError::Unsupported(format!("ethtool netlink unavailable: {e}")))?;
+    let half = u32::try_from(HALF_PAGE).unwrap_or(128);
+    let lower = match e.module_eeprom(0x50, 0, 0, half) {
+        Ok(b) => b,
+        Err(err) if err.unsupported() => {
+            return Err(HalError::Unsupported(format!(
+                "'{name}' has no module EEPROM ({err})"
+            )));
+        }
+        // ENODEV, ENXIO, EIO, EREMOTEIO: an empty cage or a dead module.
+        Err(err @ GenlError::Errno(19 | 6 | 5 | 121)) => {
+            return Ok(SfpModule::empty(format!(
+                "no module in the cage, or it does not answer ({err})"
+            )));
+        }
+        Err(err) => return Err(HalError::Io(format!("module EEPROM: {err}"))),
+    };
+    let mut page0 = lower;
+    let mut notes = Vec::new();
+    match e.module_eeprom(0x50, 0, half, half) {
+        Ok(upper) => page0.extend(upper),
+        Err(err) => notes.push(format!("upper page 00h: {err}")),
+    }
+    let diag = match sff::diag_page(&page0) {
+        DiagPage::A2 => e.module_eeprom(0x51, 0, 0, half),
+        DiagPage::Page3 => e.module_eeprom(0x50, 3, half, half),
+        DiagPage::None => Ok(Vec::new()),
+    };
+    let diag = match diag {
+        Ok(d) if !d.is_empty() => Some(d),
+        Ok(_) => None,
+        Err(err) => {
+            notes.push(format!("diagnostics page: {err}"));
+            None
+        }
+    };
+    let mut m = sff::decode(&page0, diag.as_deref());
+    m.notes.extend(notes);
+    Ok(m)
 }
 
 /// A bus/device/driver name usable as one path component.

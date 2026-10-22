@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use crate::auth::{self, Group, Login, Logins, Principal};
 use crate::cmd::{self, check_params, unknown_command};
 use crate::dhcp_client::DhcpRuntime;
+use crate::dom_watch::DomWatch;
 use crate::firewall_dyn::DynamicLists;
 use crate::link_watch::LinkWatch;
 use crate::neighbors::NeighborTable;
@@ -81,6 +82,8 @@ pub struct Session {
     in_batch: bool,
     /// When links went up/down (operational, never saved; G1.19).
     pub(crate) links: LinkWatch,
+    /// SFP diagnostics past their thresholds (operational; G1.20).
+    pub(crate) dom: DomWatch,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -161,6 +164,7 @@ impl Session {
             lockout_ack: false,
             in_batch: false,
             links: LinkWatch::default(),
+            dom: DomWatch::default(),
         }
     }
 
