@@ -6,6 +6,8 @@
 //! stdout carries protocol only; logs go to stderr.
 
 pub mod backend;
+#[doc(hidden)]
+pub mod fuzz;
 pub mod server;
 pub mod tools;
 

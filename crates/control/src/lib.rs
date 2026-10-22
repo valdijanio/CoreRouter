@@ -21,6 +21,8 @@ pub mod client;
 pub mod clock;
 pub mod dial;
 pub mod dispatch;
+#[doc(hidden)]
+pub mod fuzz;
 pub mod known_hosts;
 pub mod local_token;
 pub mod server;

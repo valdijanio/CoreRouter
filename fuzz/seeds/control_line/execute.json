@@ -1,0 +1,1 @@
+{"id":2,"method":"engine.execute","params":{"command":"ip.address.add","params":{"address":"10.0.0.1/24","interface":"ether1"}}}

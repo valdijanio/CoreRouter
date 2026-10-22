@@ -11,6 +11,8 @@ pub mod dhcp_client;
 pub mod dom_watch;
 pub mod error;
 pub mod firewall_dyn;
+#[doc(hidden)]
+pub mod fuzz;
 pub mod guard;
 pub mod link_watch;
 pub mod lockout;
