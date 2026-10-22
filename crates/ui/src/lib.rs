@@ -6,6 +6,7 @@
 //! (eframe/winit/wgpu) belongs to `apps/corerouter-gui`.
 
 pub mod backend;
+mod float;
 mod interfaces;
 mod prefs;
 mod table;
@@ -129,6 +130,8 @@ pub struct CoreRouterUi {
     tables: Tables,
     /// Floating "New …" / "Interface <name>" / "Comment" windows.
     dialogs: Vec<interfaces::DialogWin>,
+    /// Maximized windows and where they were (UI-local).
+    floats: float::Floats,
     next_dialog: u64,
     /// Interfaces to open once an `interface.list` at least this new arrives.
     open_after: Vec<(RequestId, String)>,
@@ -161,6 +164,7 @@ impl CoreRouterUi {
             },
             tables: Tables::default(),
             dialogs: Vec::new(),
+            floats: float::Floats::default(),
             next_dialog: 0,
             open_after: Vec::new(),
             theme: egui::ThemePreference::System,
@@ -443,21 +447,26 @@ impl CoreRouterUi {
             .rect;
 
         let ctx = ui.ctx().clone();
+        let mut floats = std::mem::take(&mut self.floats);
         for win in Win::ALL {
             if !self.open.contains(win) {
                 continue;
             }
             let mut open = true;
-            egui::Window::new(win.title())
-                .id(egui::Id::unique(("corerouter-win", *win)))
-                .open(&mut open)
-                .constrain_to(area)
-                .default_size(win.default_size())
-                .show(&ctx, |ui| self.window(*win, ui));
+            floats.show(
+                &ctx,
+                area,
+                win_id(*win),
+                win.title(),
+                &mut open,
+                |w| w.default_size(win.default_size()),
+                |ui| self.window(*win, ui),
+            );
             if !open {
                 self.open.remove(win);
             }
         }
+        self.floats = floats;
         self.dialogs(&ctx, area);
     }
 
@@ -575,6 +584,10 @@ impl CoreRouterUi {
             self.open.insert(win);
         }
     }
+}
+
+fn win_id(win: Win) -> egui::Id {
+    egui::Id::unique(("corerouter-win", win))
 }
 
 /// Form text → JSON: integers as numbers, blank as absent, anything else as
@@ -788,6 +801,7 @@ mod tests {
         app: CoreRouterUi,
         session: Shared,
         time: f64,
+        screen: egui::Vec2,
         shapes: Vec<egui::epaint::ClippedShape>,
     }
 
@@ -807,6 +821,7 @@ mod tests {
                 app: CoreRouterUi::new(session.clone()),
                 session,
                 time: 0.0,
+                screen: egui::vec2(1400.0, 900.0),
                 shapes: Vec::new(),
             };
             for _ in 0..3 {
@@ -818,10 +833,7 @@ mod tests {
         fn frame(&mut self, mut events: Vec<egui::Event>, modifiers: egui::Modifiers) {
             events.insert(0, egui::Event::ModifiersChanged(modifiers));
             let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1400.0, 900.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)),
                 time: Some(self.time),
                 events,
                 ..Default::default()
@@ -947,6 +959,35 @@ mod tests {
                 .iter()
                 .find(|i| i["name"] == name)
                 .cloned()
+        }
+
+        /// Where a floating window is now.
+        fn win_rect(&self, id: egui::Id) -> egui::Rect {
+            self.ctx
+                .memory(|m| m.area_rect(id))
+                .unwrap_or_else(|| panic!("window {id:?} not shown"))
+        }
+
+        fn title_bar(&self, id: egui::Id) -> float::Places {
+            float::Bar::new(&self.ctx).places(self.win_rect(id))
+        }
+
+        fn drag(&mut self, from: egui::Pos2, by: egui::Vec2) {
+            let none = egui::Modifiers::NONE;
+            let ev = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: none,
+            };
+            self.frame(vec![egui::Event::PointerMoved(from)], none);
+            self.frame(vec![ev(from, true)], none);
+            for step in 1..=5 {
+                let at = from + by * (step as f32 / 5.0);
+                self.frame(vec![egui::Event::PointerMoved(at)], none);
+            }
+            self.frame(vec![ev(from + by, false)], none);
+            self.idle();
         }
 
         fn log_ids(&self) -> Vec<&str> {
@@ -1100,6 +1141,164 @@ mod tests {
         h.click(h.text("Cancel"));
         assert!(!h.has_text("New Loopback Interface"));
         assert!(h.app.log().iter().all(|l| l.ok), "{:?}", h.app.log());
+    }
+
+    /// Same rectangle, give or take egui's pixel rounding.
+    fn same_rect(a: egui::Rect, b: egui::Rect) -> bool {
+        (a.min - b.min).length() < 1.5 && (a.max - b.max).length() < 1.5
+    }
+
+    #[test]
+    fn maximize_fills_the_work_area_and_restore_puts_it_back() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        // Somewhere of its own first, so "back" is not the default place.
+        h.drag(h.title_bar(id).strip.center(), egui::vec2(40.0, 30.0));
+        let before = h.win_rect(id);
+        let area = h.app.floats.area.unwrap();
+        assert!(!same_rect(before, area));
+
+        h.click(h.title_bar(id).button.center());
+        assert!(h.app.floats.is_maximized(id));
+        assert!(
+            same_rect(h.win_rect(id), area),
+            "{:?} vs {area:?}",
+            h.win_rect(id)
+        );
+        // Not over the top bar, the side menu or the status bar.
+        assert!(area.min.x >= 170.0 && area.min.y > 0.0 && area.max.y < 900.0);
+
+        h.click(h.title_bar(id).button.center());
+        assert!(!h.app.floats.is_maximized(id));
+        h.idle();
+        assert!(
+            same_rect(h.win_rect(id), before),
+            "{:?} vs {before:?}",
+            h.win_rect(id)
+        );
+    }
+
+    #[test]
+    fn double_click_on_the_title_toggles_without_collapsing() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        let before = h.win_rect(id);
+        let at = h.title_bar(id).strip.center();
+        h.click(at);
+        h.click(at);
+        assert!(h.app.floats.is_maximized(id));
+        assert!(same_rect(h.win_rect(id), h.app.floats.area.unwrap()));
+        assert!(h.has_text("ether1"), "body still shown: not collapsed");
+
+        // A pause, or the next click would make a triple click.
+        h.time += 1.0;
+        let at = h.title_bar(id).strip.center();
+        h.click(at);
+        h.click(at);
+        h.idle();
+        assert!(!h.app.floats.is_maximized(id));
+        assert!(same_rect(h.win_rect(id), before));
+        assert!(h.has_text("ether1"));
+    }
+
+    #[test]
+    fn title_menu_maximizes_and_restores() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        h.right_click(h.title_bar(id).strip.center());
+        h.click(h.text("Maximize"));
+        assert!(h.app.floats.is_maximized(id));
+        h.right_click(h.title_bar(id).strip.center());
+        h.click(h.text("Restore"));
+        assert!(!h.app.floats.is_maximized(id));
+    }
+
+    #[test]
+    fn a_maximized_window_follows_the_app_window() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        h.click(h.title_bar(id).button.center());
+        let big = h.app.floats.area.unwrap();
+        h.screen = egui::vec2(1100.0, 700.0);
+        h.idle();
+        h.idle();
+        let small = h.app.floats.area.unwrap();
+        assert!(small.width() < big.width() && small.height() < big.height());
+        assert!(
+            same_rect(h.win_rect(id), small),
+            "{:?} vs {small:?}",
+            h.win_rect(id)
+        );
+        h.screen = egui::vec2(1600.0, 1000.0);
+        h.idle();
+        h.idle();
+        assert!(same_rect(h.win_rect(id), h.app.floats.area.unwrap()));
+    }
+
+    #[test]
+    fn the_title_still_drags_and_collapses() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        let before = h.win_rect(id);
+        h.drag(h.title_bar(id).strip.center(), egui::vec2(60.0, 40.0));
+        let moved = h.win_rect(id);
+        assert!(
+            (moved.min - before.min - egui::vec2(60.0, 40.0)).length() < 1.5,
+            "{before:?} → {moved:?}"
+        );
+
+        // Collapsed, maximized and restored: expanding gives the old size.
+        h.click(h.title_bar(id).collapse.center());
+        for _ in 0..10 {
+            h.idle();
+        }
+        assert!(
+            h.win_rect(id).height() < 60.0,
+            "collapsed: {:?}",
+            h.win_rect(id)
+        );
+        h.click(h.title_bar(id).button.center());
+        assert!(h.app.floats.is_maximized(id));
+        h.click(h.title_bar(id).button.center());
+        h.click(h.title_bar(id).collapse.center());
+        for _ in 0..10 {
+            h.idle();
+        }
+        assert!(
+            same_rect(h.win_rect(id), moved),
+            "{:?} vs {moved:?}",
+            h.win_rect(id)
+        );
+    }
+
+    #[test]
+    fn properties_window_maximizes_too() {
+        let mut h = Harness::new();
+        let at = h.row("ether2");
+        h.click(at);
+        h.click(at);
+        let id = match h.app.dialogs.first() {
+            Some(d) => interfaces::dialog_id(d.id),
+            None => panic!("properties window not open"),
+        };
+        let before = h.win_rect(id);
+        h.click(h.title_bar(id).button.center());
+        assert!(
+            same_rect(h.win_rect(id), h.app.floats.area.unwrap()),
+            "{:?}",
+            h.win_rect(id)
+        );
+        h.click(h.title_bar(id).button.center());
+        h.idle();
+        assert!(
+            same_rect(h.win_rect(id), before),
+            "{:?} vs {before:?}",
+            h.win_rect(id)
+        );
+        // Closing forgets it.
+        h.click(h.text("OK"));
+        assert!(h.app.dialogs.is_empty());
+        assert!(!h.app.floats.is_maximized(id));
     }
 
     #[test]
