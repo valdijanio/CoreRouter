@@ -1,6 +1,6 @@
 //! G6.3b: Tools › MTR shows each hop's address at once and its name when
 //! the (slow) reverse lookup answers, without holding up the table; the
-//! AS column appears with "AS lookup".
+//! Network (AS) column appears with "AS lookup".
 
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -108,13 +108,12 @@ fn names_join_the_addresses_when_they_arrive() {
     });
     assert!(h.has_text("8.8.8.8"), "the address shows at once");
     assert!(!h.has_text_containing("slow-"), "no name yet");
-    assert!(h.has_text("ASN") && h.has_text_containing("AS3356 LEVEL3"));
+    assert!(h.has_text("Network") && h.has_text("AS3356 LEVEL3"));
     assert!(hops(&h).iter().all(|x| x["name"].is_null()));
-    // The names arrive: they show above the addresses, the task never
-    // stopped measuring.
+    // The names arrive: they take the addresses' place (G6.3d; the address
+    // is in the tooltip), the task never stopped measuring.
     slow.ready.store(true, Ordering::Relaxed);
     h.until("names", |h| h.has_text("slow-8-8-8-8.example"));
-    assert!(h.has_text("8.8.8.8"), "the address stays under the name");
     let last = hops(&h).last().cloned().unwrap();
     assert_eq!(last["name"], "slow-8-8-8-8.example");
     // Private and CGNAT hops are never looked up.

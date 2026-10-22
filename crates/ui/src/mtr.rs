@@ -5,9 +5,17 @@
 //! the numbers is each hop's average RTT next to the slowest one, so the
 //! hop where latency jumps stands out.
 //!
-//! G6.3b: each hop shows its name (when the reverse lookup has answered)
-//! above its address in small type, its origin AS and the MPLS labels it
-//! reported; private and CGNAT addresses carry a tag instead.
+//! G6.3b: each hop shows its name (when the reverse lookup has answered),
+//! its origin AS and the MPLS labels it reported.
+//!
+//! G6.3d: one line per hop, all the same height. The host is the name, or
+//! the address while none is known, followed by small pills: `privada`
+//! (quiet), `CGNAT` (amber) and `MPLS <label>` (blue). The Network column
+//! is the AS as a pill whose colour comes from the AS number, so every hop
+//! of one operator shares a colour and the hand-over to the next one
+//! stands out. Full names, addresses and labels are in the tooltips.
+
+use std::collections::BTreeMap;
 
 use egui::{Color32, Grid, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
@@ -58,7 +66,7 @@ fn num(v: &Value, k: &str) -> Option<f64> {
 }
 
 fn ms(v: Option<f64>) -> String {
-    v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "-".into())
+    v.map(|x| format!("{x:.2}")).unwrap_or_else(|| "–".into())
 }
 
 /// Loss colour: none, some, all.
@@ -283,7 +291,7 @@ impl CoreRouterUi {
             .fold(0.0f64, f64::max);
         let bar = ui.visuals().selection.bg_fill;
         let as_col = t.summary.get("as_lookup").and_then(Value::as_bool) == Some(true);
-        let mpls_col = hops.iter().any(|h| h.get("mpls_text").is_some_and(Value::is_string));
+        let hues = path_hues(hops.iter().filter_map(|h| h.get("asn").and_then(Value::as_u64)));
         egui::ScrollArea::vertical()
             .id_salt("mtr-hops")
             .show(ui, |ui| {
@@ -293,10 +301,7 @@ impl CoreRouterUi {
                     .show(ui, |ui| {
                         let mut heads = vec!["Hop", "Host"];
                         if as_col {
-                            heads.push("ASN");
-                        }
-                        if mpls_col {
-                            heads.push("MPLS");
+                            heads.push("Network");
                         }
                         heads.extend([
                             "Loss %", "Sent", "Last", "Avg", "Best", "Worst", "StDev", "",
@@ -310,12 +315,7 @@ impl CoreRouterUi {
                             ui.label(g("hop"));
                             host_cell(ui, h);
                             if as_col {
-                                ui.label(as_text(h));
-                            }
-                            if mpls_col {
-                                ui.label(
-                                    h.get("mpls_text").and_then(Value::as_str).unwrap_or(""),
-                                );
+                                network_cell(ui, h, &hues);
                             }
                             let loss = num(h, "loss_pct").unwrap_or(0.0);
                             ui.label(
@@ -343,21 +343,248 @@ impl CoreRouterUi {
     }
 }
 
-/// "AS3356 LEVEL3", "AS3356", or "" (unknown or not looked up).
-fn as_text(h: &Value) -> String {
-    match (
-        h.get("asn").and_then(Value::as_u64),
-        h.get("as_name").and_then(Value::as_str),
-    ) {
-        (Some(n), Some(name)) => format!("AS{n} {name}"),
-        (Some(n), None) => format!("AS{n}"),
-        _ => String::new(),
+/// A pill's colours: soft fill, ink of the same hue, optional border.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Tone {
+    pub(crate) fill: Color32,
+    pub(crate) ink: Color32,
+    pub(crate) border: Option<Color32>,
+}
+
+/// One hue for both themes: darker ink on the light one, lighter on the
+/// dark one; the fill is the ink washed out, so it reads on striped rows.
+struct Hue {
+    light: (u8, u8, u8),
+    dark: (u8, u8, u8),
+}
+
+impl Hue {
+    fn tone(&self, v: &egui::Visuals) -> Tone {
+        let ((r, g, b), wash) = if v.dark_mode {
+            (self.dark, 0.20)
+        } else {
+            (self.light, 0.12)
+        };
+        let ink = Color32::from_rgb(r, g, b);
+        Tone {
+            fill: ink.gamma_multiply(wash),
+            ink,
+            border: None,
+        }
     }
 }
 
-/// The name above, the address (or addresses) below in small type; only
-/// the address while no name is known. A note (unreachable…) and the
-/// private/CGNAT tag follow the address.
+const AMBER: Hue = Hue {
+    light: (140, 85, 0),
+    dark: (245, 195, 105),
+};
+
+const BLUE: Hue = Hue {
+    light: (30, 95, 175),
+    dark: (140, 190, 245),
+};
+
+/// The AS palette: eight hues far enough apart that two operators side by
+/// side on a path never look alike, each legible on both themes.
+const AS_HUES: [Hue; 8] = [
+    BLUE,
+    Hue {
+        light: (0, 120, 120),
+        dark: (110, 215, 205),
+    },
+    Hue {
+        light: (35, 125, 50),
+        dark: (140, 215, 140),
+    },
+    Hue {
+        light: (110, 110, 0),
+        dark: (210, 205, 110),
+    },
+    Hue {
+        light: (175, 80, 10),
+        dark: (250, 170, 110),
+    },
+    Hue {
+        light: (180, 35, 55),
+        dark: (245, 145, 155),
+    },
+    Hue {
+        light: (110, 60, 180),
+        dark: (195, 165, 245),
+    },
+    Hue {
+        light: (160, 40, 140),
+        dark: (240, 150, 220),
+    },
+];
+
+/// Which palette entry an AS gets: Fibonacci hashing, so the colour is
+/// fixed by the number alone (every hop of an AS looks the same, in every
+/// run) and consecutive numbers always land on different entries
+/// (consecutive products differ by 0.618 of the range, more than 1/8).
+pub(crate) fn as_hue(asn: u64) -> usize {
+    let h = (asn as u32).wrapping_mul(0x9E37_79B9);
+    (h >> 29) as usize
+}
+
+/// The colour of each AS on a path: its own (`as_hue`), except when the
+/// AS right before it on the path (a different one) already has it; then
+/// the next free one, so a hand-over between operators always shows. An
+/// AS keeps the colour it got first for the whole table.
+pub(crate) fn path_hues(asns: impl IntoIterator<Item = u64>) -> BTreeMap<u64, usize> {
+    let mut out: BTreeMap<u64, usize> = BTreeMap::new();
+    let mut prev: Option<usize> = None;
+    for asn in asns {
+        let hue = *out.entry(asn).or_insert_with(|| {
+            let own = as_hue(asn);
+            if prev == Some(own) {
+                (own + 1) % AS_HUES.len()
+            } else {
+                own
+            }
+        });
+        prev = Some(hue);
+    }
+    out
+}
+
+pub(crate) fn as_tone(v: &egui::Visuals, hue: usize) -> Tone {
+    AS_HUES
+        .get(hue)
+        .map_or_else(|| neutral_tone(v), |h| h.tone(v))
+}
+
+fn neutral_tone(v: &egui::Visuals) -> Tone {
+    Tone {
+        fill: v.widgets.noninteractive.weak_bg_fill,
+        ink: v.weak_text_color(),
+        border: Some(v.widgets.noninteractive.bg_stroke.color),
+    }
+}
+
+/// Font size of the pills: a step below the table's.
+fn small(ui: &Ui) -> f32 {
+    ui.style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .map_or(11.0, |f| f.size * 0.85)
+}
+
+/// A small rounded pill, never taller than a table row.
+fn chip(ui: &mut Ui, text: &str, tone: Tone) -> egui::Response {
+    let font = egui::FontId::proportional(small(ui));
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, tone.ink);
+    let pad = egui::vec2(7.0, 2.0);
+    let h = (galley.size().y + 2.0 * pad.y).min(ui.spacing().interact_size.y - 2.0);
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(galley.size().x + 2.0 * pad.x, h),
+        egui::Sense::hover(),
+    );
+    if ui.is_rect_visible(rect) {
+        let stroke = tone
+            .border
+            .map_or(egui::Stroke::NONE, |c| egui::Stroke::new(1.0, c));
+        ui.painter()
+            .rect(rect, 8.0, tone.fill, stroke, egui::StrokeKind::Inside);
+        let at = rect.center() - galley.size() / 2.0;
+        ui.painter().galley(at, galley, tone.ink);
+    }
+    resp
+}
+
+/// What the chip of a private, CGNAT, link-local… address says.
+fn scope_chip(scope: &str) -> &str {
+    match scope {
+        "private" => "privada",
+        "cgnat" => "CGNAT",
+        other => other,
+    }
+}
+
+/// "MPLS 85260", "MPLS 16005/24003" (top first) from the hop's labels.
+fn mpls_chip(h: &Value) -> Option<String> {
+    let labels: Vec<String> = h
+        .get("hosts_info")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|f| f.get("mpls"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|l| l.get("label").and_then(Value::as_u64))
+        .map(|l| l.to_string())
+        .collect();
+    if !labels.is_empty() {
+        return Some(format!("MPLS {}", labels.join("/")));
+    }
+    // An older router sends only the text ("L=24017").
+    h.get("mpls_text")
+        .and_then(Value::as_str)
+        .map(|t| format!("MPLS {}", t.trim_start_matches("L=")))
+}
+
+/// What the AS pill says: "AS7162 UOL" (the first word of the registry
+/// name), "AS7162" without a name.
+pub(crate) fn as_text(h: &Value) -> Option<String> {
+    let n = h.get("asn").and_then(Value::as_u64)?;
+    let short = h
+        .get("as_name")
+        .and_then(Value::as_str)
+        .and_then(|name| name.split(',').next())
+        .and_then(|name| name.split_whitespace().next())
+        .map(|w| truncate(w, 16));
+    Some(match short {
+        Some(w) => format!("AS{n} {w}"),
+        None => format!("AS{n}"),
+    })
+}
+
+/// The Network cell: the AS pill, coloured by its number; empty without one.
+fn network_cell(ui: &mut Ui, h: &Value, hues: &BTreeMap<u64, usize>) {
+    let (Some(text), Some(n)) = (as_text(h), h.get("asn").and_then(Value::as_u64)) else {
+        ui.label("");
+        return;
+    };
+    let hue = hues.get(&n).copied().unwrap_or_else(|| as_hue(n));
+    let tone = as_tone(ui.visuals(), hue);
+    let mut tip = format!("AS{n}");
+    if let Some(name) = h.get("as_name").and_then(Value::as_str) {
+        tip = format!("{tip} {name}");
+    }
+    let prefix = h
+        .get("hosts_info")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(|f| f.get("as_prefix"))
+        .and_then(Value::as_str);
+    if let Some(p) = prefix {
+        tip = format!("{tip}\nprefix {p}");
+    }
+    chip(ui, &text, tone).on_hover_text(tip);
+}
+
+/// At most `max` characters, with "…" when cut.
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_owned();
+    }
+    let mut t: String = s.chars().take(max.saturating_sub(1)).collect();
+    t.push('…');
+    t
+}
+
+/// Longest host name before it ends in "…" (the whole one is in the tooltip).
+const HOST_CHARS: usize = 40;
+
+pub(crate) fn host_id(hop: u64) -> egui::Id {
+    egui::Id::unique(("mtr-host", hop))
+}
+
+/// One line per hop: the name (or the address while none is known), then
+/// the chips. Everything else (every address, the full name, the labels,
+/// an unreachable note) is in the tooltip.
 fn host_cell(ui: &mut Ui, h: &Value) {
     let hosts: Vec<String> = h
         .get("hosts")
@@ -366,32 +593,54 @@ fn host_cell(ui: &mut Ui, h: &Value) {
         .flatten()
         .map(value_text)
         .collect();
-    let mut addr = if hosts.is_empty() {
-        "???".to_owned()
-    } else {
-        hosts.join(", ")
-    };
-    if let Some(scope) = h.get("scope").and_then(Value::as_str) {
-        addr = format!("{addr} [{scope}]");
-    }
-    if let Some(n) = h.get("note").and_then(Value::as_str) {
-        addr = format!("{addr} ({n})");
-    }
-    match h.get("name").and_then(Value::as_str) {
-        Some(name) => {
-            ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
-                ui.add(egui::Label::new(name).extend());
-                let size = ui
-                    .style()
-                    .text_styles
-                    .get(&egui::TextStyle::Body)
-                    .map_or(11.0, |f| f.size * 0.82);
-                ui.add(egui::Label::new(RichText::new(addr).size(size).weak()).extend());
-            });
+    let name = h.get("name").and_then(Value::as_str);
+    let scope = h.get("scope").and_then(Value::as_str);
+    let mpls = mpls_chip(h);
+    let note = h.get("note").and_then(Value::as_str);
+    let hop = h.get("hop").and_then(Value::as_u64).unwrap_or(0);
+    let r = ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 8.0;
+        let Some(first) = hosts.first() else {
+            ui.weak("sem resposta");
+            return;
+        };
+        let shown = name.unwrap_or(first);
+        ui.add(egui::Label::new(truncate(shown, HOST_CHARS)).selectable(false));
+        ui.spacing_mut().item_spacing.x = 4.0;
+        if hosts.len() > 1 {
+            ui.weak(format!("+{}", hosts.len() - 1));
         }
-        None => {
-            ui.add(egui::Label::new(addr).extend());
+        if let Some(s) = scope {
+            let tone = if s == "cgnat" {
+                AMBER.tone(ui.visuals())
+            } else {
+                neutral_tone(ui.visuals())
+            };
+            chip(ui, scope_chip(s), tone);
         }
+        if let Some(m) = &mpls {
+            chip(ui, m, BLUE.tone(ui.visuals()));
+        }
+        if let Some(n) = note {
+            ui.weak(n);
+        }
+    });
+    let mut tip: Vec<String> = Vec::new();
+    if let Some(n) = name {
+        tip.push(n.to_owned());
+    }
+    tip.extend(hosts.iter().cloned());
+    if let Some(s) = scope {
+        tip.push(format!("{s} address: not looked up"));
+    }
+    if let Some(m) = h.get("mpls_text").and_then(Value::as_str) {
+        tip.push(format!("MPLS {m}"));
+    }
+    if let Some(n) = note {
+        tip.push(n.to_owned());
+    }
+    let resp = ui.interact(r.response.rect, host_id(hop), egui::Sense::hover());
+    if !tip.is_empty() {
+        resp.on_hover_text(tip.join("\n"));
     }
 }
