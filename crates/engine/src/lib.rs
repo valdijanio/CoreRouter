@@ -7,11 +7,13 @@
 pub mod cmd;
 pub mod error;
 pub mod guard;
+pub mod neighbors;
 pub mod session;
 pub mod storage;
 pub mod validate;
 
 pub use error::EngineError;
+pub use neighbors::{MAX_NEIGHBORS, NeighborTable};
 pub use session::{CommitMode, JournalEntry, Session, Shared, StorageStatus, lock, shared};
 pub use storage::{ConfigStorage, MemoryStorage, Slot, StorageError};
 

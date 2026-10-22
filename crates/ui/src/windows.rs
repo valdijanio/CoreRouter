@@ -10,6 +10,7 @@ use crate::{CoreRouterUi, err_color, value_text};
 pub enum Win {
     Interfaces,
     Addresses,
+    Neighbors,
     Routes,
     Firewall,
     Dns,
@@ -30,6 +31,7 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
         "IP",
         &[
             Win::Addresses,
+            Win::Neighbors,
             Win::Routes,
             Win::Firewall,
             Win::Dns,
@@ -47,6 +49,7 @@ impl Win {
     pub const ALL: &'static [Win] = &[
         Win::Interfaces,
         Win::Addresses,
+        Win::Neighbors,
         Win::Routes,
         Win::Firewall,
         Win::Dns,
@@ -64,6 +67,7 @@ impl Win {
         match self {
             Win::Interfaces => "Interfaces",
             Win::Addresses => "Addresses",
+            Win::Neighbors => "Neighbors",
             Win::Routes => "Routes",
             Win::Firewall => "Firewall",
             Win::Dns => "DNS",
@@ -95,6 +99,7 @@ impl Win {
     pub(crate) fn default_size(self) -> [f32; 2] {
         match self {
             Win::Interfaces => [780.0, 520.0],
+            Win::Neighbors => [820.0, 320.0],
             Win::Addresses | Win::Log => [640.0, 260.0],
             _ => [380.0, 200.0],
         }
@@ -111,6 +116,7 @@ impl CoreRouterUi {
         match win {
             Win::Interfaces => self.interfaces(ui),
             Win::Addresses => self.addresses(ui),
+            Win::Neighbors => self.neighbors(ui),
             Win::Bgp => self.bgp(ui),
             Win::Identity => self.identity(ui),
             Win::History => self.history(ui),
@@ -120,7 +126,7 @@ impl CoreRouterUi {
     }
 
     /// Names from the cached `interface.list`, optionally of one type.
-    fn interface_names(&self, kind: Option<&str>) -> Vec<String> {
+    pub(crate) fn interface_names(&self, kind: Option<&str>) -> Vec<String> {
         self.cache
             .interfaces
             .iter()

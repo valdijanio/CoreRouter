@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use crate::cmd::{self, check_params, unknown_command};
+use crate::neighbors::NeighborTable;
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
 use crate::validate::validate_all;
 use crate::{EngineError, Result, guard};
@@ -51,6 +52,8 @@ pub struct Session {
     mode: CommitMode,
     journal: Vec<JournalEntry>,
     seq: u64,
+    /// Heard by discovery protocols (operational state, never saved).
+    pub(crate) neighbors: NeighborTable,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -114,6 +117,7 @@ impl Session {
             mode: CommitMode::Immediate,
             journal: Vec::new(),
             seq: 0,
+            neighbors: NeighborTable::default(),
         }
     }
 

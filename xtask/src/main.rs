@@ -17,6 +17,8 @@ const WASM_PACKAGES: &[&str] = &[
     "corerouter-gui",
 ];
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
+/// Packages with a `tests/netns.rs` (rtnetlink apply; two daemons over CRDP).
+const NETNS_PACKAGES: &[&str] = &["corerouter-hal-linux", "corerouter-daemon"];
 
 enum Outcome {
     Ok,
@@ -123,8 +125,9 @@ fn test(root: &Path) -> Outcome {
     run(c, root)
 }
 
-/// hal-linux against a real kernel, in a throwaway user + network namespace:
-/// no root, nothing reaches the host (crates/hal-linux/tests/netns.rs).
+/// Tests against a real kernel, in a throwaway user + network namespace: no
+/// root, nothing reaches the host (crates/hal-linux/tests/netns.rs,
+/// apps/corerouter-daemon/tests/netns.rs).
 /// Skips where unprivileged user namespaces are not allowed.
 fn netns(root: &Path) -> Outcome {
     if !cfg!(target_os = "linux") {
@@ -148,19 +151,20 @@ fn netns(root: &Path) -> Outcome {
         Err(e) => return Outcome::Skip(format!("cannot run unshare: {e}")),
     }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    let mut c = Command::new("unshare");
-    c.args(UNSHARE)
-        .arg(cargo)
-        .args([
-            "test",
-            "--quiet",
-            "-p",
-            "corerouter-hal-linux",
-            "--test",
-            "netns",
-        ])
-        .env("COREROUTER_NETNS_TESTS", "1");
-    run(c, root)
+    // Each package in its own fresh namespace: the tests refuse to run in
+    // one that already has links.
+    for package in NETNS_PACKAGES {
+        let mut c = Command::new("unshare");
+        c.args(UNSHARE)
+            .arg(&cargo)
+            .args(["test", "--quiet", "-p", package, "--test", "netns"])
+            .env("COREROUTER_NETNS_TESTS", "1");
+        match run(c, root) {
+            Outcome::Ok => {}
+            other => return other,
+        }
+    }
+    Outcome::Ok
 }
 
 fn layers_step(root: &Path) -> Outcome {

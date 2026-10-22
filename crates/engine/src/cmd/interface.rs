@@ -353,7 +353,10 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
             format!("'{name}' is in use: {}", blockers.join("; ")),
         ));
     }
-    s.store_mut().candidate_mut().interfaces.remove(&name);
+    let cfg = s.store_mut().candidate_mut();
+    cfg.interfaces.remove(&name);
+    // Discovery stops on it with it, instead of blocking the removal.
+    cfg.ip.neighbor_discovery.interfaces.remove(&name);
     Ok(json!({ "name": name }))
 }
 

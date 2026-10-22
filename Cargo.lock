@@ -833,12 +833,28 @@ name = "corerouter-daemon"
 version = "0.1.0"
 dependencies = [
  "corerouter-control",
+ "corerouter-discovery",
  "corerouter-engine",
  "corerouter-hal",
  "corerouter-hal-linux",
+ "corerouter-model",
  "corerouter-storage-fs",
  "env_logger",
  "log",
+ "serde_json",
+]
+
+[[package]]
+name = "corerouter-discovery"
+version = "0.1.0"
+dependencies = [
+ "corerouter-engine",
+ "corerouter-model",
+ "corerouter-proto-discovery",
+ "ipnet",
+ "log",
+ "serde_json",
+ "socket2",
 ]
 
 [[package]]
@@ -850,6 +866,7 @@ dependencies = [
  "corerouter-proto-bgp",
  "corerouter-proto-cgnat",
  "corerouter-proto-dhcp",
+ "corerouter-proto-discovery",
  "corerouter-proto-dns",
  "corerouter-proto-mpls",
  "corerouter-proto-ospf",
@@ -866,6 +883,7 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "corerouter-control",
+ "corerouter-discovery",
  "corerouter-engine",
  "corerouter-ui",
  "eframe",
@@ -944,6 +962,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corerouter-proto-discovery"
+version = "0.1.0"
+dependencies = [
+ "corerouter-model",
+ "proptest",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "corerouter-proto-dns"
 version = "0.1.0"
 dependencies = [
@@ -980,6 +1007,7 @@ name = "corerouter-ui"
 version = "0.1.0"
 dependencies = [
  "corerouter-engine",
+ "corerouter-model",
  "egui",
  "serde_json",
 ]

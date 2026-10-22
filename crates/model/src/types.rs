@@ -14,7 +14,7 @@ pub struct ParseError {
 }
 
 impl ParseError {
-    fn new(kind: &'static str, input: &str, reason: &'static str) -> Self {
+    pub(crate) fn new(kind: &'static str, input: &str, reason: &'static str) -> Self {
         // Hostile input may be huge: keep only a bounded prefix in the message.
         let input: String = input.chars().take(64).collect();
         Self {

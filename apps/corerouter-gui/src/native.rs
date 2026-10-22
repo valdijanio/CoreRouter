@@ -1,31 +1,42 @@
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::mpsc;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use base64::Engine as _;
 use corerouter_control::{Client, Host, SharedHost, bind_loopback, spawn};
+use corerouter_discovery::{Heard, Listener};
 use corerouter_engine::{Session, shared};
-use corerouter_ui::CoreRouterUi;
+use corerouter_ui::{ConnectScreen, CoreRouterUi, NeighborRow, SavedRouter};
 use eframe::egui;
 use serde_json::{Value, json};
 
-use crate::GuiApp;
 use crate::remote::Remote;
+use crate::{GuiApp, Platform};
 
 const USAGE: &str = "\
 usage: corerouter-gui [--connect HOST:PORT] [--control <port>]
+                      [--discovery-port <port>] [--saved-list <file>]
 
-  --connect HOST:PORT   manage a corerouter-daemon (its control port, e.g. 127.0.0.1:7979)
-                        instead of an in-process virtual lab
-  --control <port>      serve the control channel on 127.0.0.1:<port> (ui.screenshot;
-                        with --connect, every other method is passed on to the daemon)";
+  --connect HOST:PORT     manage a corerouter-daemon (its control port, e.g. 127.0.0.1:7979)
+                          right away; without it the GUI opens on the connect screen
+  --control <port>        serve the control channel on 127.0.0.1:<port> (ui.screenshot;
+                          once connected, every other method is passed on to the daemon)
+  --discovery-port <port> UDP port the connect screen listens on for CRDP (default 7979)
+  --saved-list <file>     the connect screen's Saved tab (default
+                          $XDG_CONFIG_HOME/corerouter/saved-routers.json)";
+
+/// Largest saved-list file read (a hostile or broken file stays bounded).
+const MAX_SAVED_FILE: u64 = 1 << 20;
 
 const PROXY_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Where the session lives.
 #[derive(Clone)]
 enum Target {
+    /// The connect screen: no router picked yet.
+    Choosing,
     Local(SharedHost),
     /// The daemon at `addr`; each control connection opens its own client.
     Remote {
@@ -36,7 +47,8 @@ enum Target {
 /// Control host with a live window: the session's methods (local, or passed
 /// on to the daemon), plus `ui.screenshot` captured from the next frame.
 struct GuiHost {
-    target: Target,
+    /// Set when the operator picks a router on the connect screen.
+    target: Arc<Mutex<Target>>,
     proxy: Option<Client>,
     ctx: Arc<OnceLock<egui::Context>>,
 }
@@ -44,7 +56,7 @@ struct GuiHost {
 impl Clone for GuiHost {
     fn clone(&self) -> Self {
         Self {
-            target: self.target.clone(),
+            target: Arc::clone(&self.target),
             proxy: None,
             ctx: Arc::clone(&self.ctx),
         }
@@ -52,6 +64,13 @@ impl Clone for GuiHost {
 }
 
 impl GuiHost {
+    fn target(&self) -> Target {
+        self.target
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn pass_on(&mut self, addr: &str, method: &str, params: &Value) -> Result<Value, String> {
         let answer = self.ask_daemon(addr, method, params);
         if method != "server.info" {
@@ -96,18 +115,30 @@ impl Host for GuiHost {
         &mut self,
         f: &mut dyn FnMut(&mut Session) -> Result<Value, String>,
     ) -> Result<Value, String> {
-        match &mut self.target {
-            Target::Local(h) => h.with_session(f),
+        match self.target() {
+            Target::Local(mut h) => h.with_session(f),
             Target::Remote { addr } => Err(format!("this GUI manages {addr}")),
+            Target::Choosing => Err(CHOOSING.into()),
         }
     }
 
     fn forward(&mut self, method: &str, params: &Value) -> Option<Result<Value, String>> {
-        let Target::Remote { addr } = &self.target else {
-            return None;
-        };
-        let addr = addr.clone();
-        Some(self.pass_on(&addr, method, params))
+        match self.target() {
+            Target::Local(_) => None,
+            Target::Remote { addr } => Some(self.pass_on(&addr, method, params)),
+            // Still answer server.info, so clients that start with it can
+            // take a screenshot of the connect screen.
+            Target::Choosing if method == "server.info" => Some(Ok(json!({
+                "name": "corerouter",
+                "version": env!("CARGO_PKG_VERSION"),
+                "backend": null,
+                "has_ui": true,
+                "via": "corerouter-gui",
+                "router": null,
+                "router_error": CHOOSING,
+            }))),
+            Target::Choosing => Some(Err(CHOOSING.into())),
+        }
     }
 
     fn has_ui(&self) -> bool {
@@ -154,10 +185,28 @@ fn encode_png(img: &egui::ColorImage) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+const CHOOSING: &str = "the GUI is on its connect screen: no router picked yet";
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
     control: Option<u16>,
     connect: Option<String>,
+    discovery_port: Option<u16>,
+    saved_list: Option<PathBuf>,
+}
+
+/// `HOST:PORT` as `--connect` and the connect screen take it.
+fn check_addr(addr: &str) -> Result<(), String> {
+    if addr
+        .rsplit_once(':')
+        .is_none_or(|(h, p)| h.is_empty() || p.parse::<u16>().is_err())
+    {
+        return Err(format!(
+            "Connect to needs HOST:PORT (the router's control port, e.g. 127.0.0.1:7979), got '{}'",
+            addr.chars().take(64).collect::<String>()
+        ));
+    }
+    Ok(())
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
@@ -171,13 +220,17 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<Args, String> {
             }
             "--connect" => {
                 let addr = args.next().ok_or("--connect needs HOST:PORT")?;
-                if addr
-                    .rsplit_once(':')
-                    .is_none_or(|(h, p)| h.is_empty() || p.parse::<u16>().is_err())
-                {
-                    return Err(format!("--connect needs HOST:PORT, got '{addr}'"));
-                }
+                check_addr(&addr)
+                    .map_err(|_| format!("--connect needs HOST:PORT, got '{addr}'"))?;
                 out.connect = Some(addr);
+            }
+            "--discovery-port" => {
+                let port = args.next().ok_or("--discovery-port needs a port")?;
+                out.discovery_port = Some(port.parse().map_err(|_| format!("bad port '{port}'"))?);
+            }
+            "--saved-list" => {
+                let file = args.next().ok_or("--saved-list needs a file")?;
+                out.saved_list = Some(PathBuf::from(file));
             }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
@@ -200,15 +253,14 @@ pub fn main() -> ExitCode {
         }
     };
     let ctx_slot = Arc::new(OnceLock::new());
-    let (ui, target) = match &args.connect {
+    let target = Arc::new(Mutex::new(Target::Choosing));
+    let app = match &args.connect {
         Some(addr) => match Remote::spawn(addr) {
             Ok(remote) => {
                 // Auth/TLS are G0.3: only reach daemons over loopback or a tunnel.
                 log::info!("managing the router at {addr} (no authentication: G0.3)");
-                (
-                    CoreRouterUi::with_backend(Box::new(remote)),
-                    Target::Remote { addr: addr.clone() },
-                )
+                set_target(&target, Target::Remote { addr: addr.clone() });
+                GuiApp::router(CoreRouterUi::with_backend(Box::new(remote)))
             }
             Err(e) => {
                 eprintln!("cannot start the connection thread: {e}");
@@ -216,11 +268,8 @@ pub fn main() -> ExitCode {
             }
         },
         None => {
-            let session = shared(Session::virtual_lab());
-            (
-                CoreRouterUi::new(Arc::clone(&session)),
-                Target::Local(SharedHost(session)),
-            )
+            let (screen, platform) = NativePlatform::start(&args, Arc::clone(&target));
+            GuiApp::connect(screen, Box::new(platform))
         }
     };
 
@@ -250,7 +299,7 @@ pub fn main() -> ExitCode {
         options,
         Box::new(move |cc| {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
-            Ok(Box::new(GuiApp { ui }))
+            Ok(Box::new(app))
         }),
     );
     match result {
@@ -260,6 +309,170 @@ pub fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn set_target(slot: &Mutex<Target>, target: Target) {
+    *slot.lock().unwrap_or_else(PoisonError::into_inner) = target;
+}
+
+/// The connect screen on the desktop: neighbors heard directly on this
+/// machine's interfaces, saved list in a file.
+struct NativePlatform {
+    listener: Option<Listener>,
+    saved_path: Option<PathBuf>,
+    target: Arc<Mutex<Target>>,
+}
+
+impl NativePlatform {
+    fn start(args: &Args, target: Arc<Mutex<Target>>) -> (ConnectScreen, Self) {
+        let saved_path = args.saved_list.clone().or_else(default_saved_path);
+        let saved = saved_path.as_deref().map(load_saved).unwrap_or_default();
+        let mut screen = ConnectScreen::new(saved);
+        let port = args.discovery_port.unwrap_or(corerouter_discovery::PORT);
+        let listener = match Listener::spawn(port) {
+            Ok(l) => {
+                screen.set_source(format!(
+                    "Listening for CRDP announcements on UDP {port} (this machine never sends any)"
+                ));
+                Some(l)
+            }
+            Err(e) => {
+                screen.set_source(format!("Cannot listen for neighbors: {e}"));
+                None
+            }
+        };
+        (
+            screen,
+            Self {
+                listener,
+                saved_path,
+                target,
+            },
+        )
+    }
+}
+
+impl Platform for NativePlatform {
+    fn neighbors(&mut self) -> Vec<NeighborRow> {
+        let Some(l) = self.listener.as_mut() else {
+            return Vec::new();
+        };
+        l.poll().into_iter().map(heard_row).collect()
+    }
+
+    fn store_saved(&mut self, saved: &[SavedRouter]) {
+        let Some(path) = &self.saved_path else {
+            return;
+        };
+        if let Err(e) = write_saved(path, saved) {
+            log::error!("cannot save the router list to {}: {e}", path.display());
+        }
+    }
+
+    fn connect(&mut self, addr: &str) -> Result<CoreRouterUi, String> {
+        check_addr(addr)?;
+        let remote =
+            Remote::spawn(addr).map_err(|e| format!("cannot start the connection thread: {e}"))?;
+        log::info!("managing the router at {addr} (no authentication: G0.3)");
+        set_target(
+            &self.target,
+            Target::Remote {
+                addr: addr.to_owned(),
+            },
+        );
+        self.listener = None;
+        Ok(CoreRouterUi::with_backend(Box::new(remote)))
+    }
+
+    fn lab(&mut self) -> CoreRouterUi {
+        let session = shared(Session::virtual_lab());
+        set_target(
+            &self.target,
+            Target::Local(SharedHost(Arc::clone(&session))),
+        );
+        self.listener = None;
+        CoreRouterUi::new(session)
+    }
+}
+
+fn heard_row(h: &Heard) -> NeighborRow {
+    let a = &h.announcement;
+    let address = a
+        .ipv4
+        .first()
+        .map(|(ip, _)| ip.to_string())
+        .unwrap_or_else(|| h.from.ip().to_string());
+    let uptime = a
+        .uptime_secs
+        .map(|u| u.saturating_add(h.at.elapsed().as_secs()));
+    NeighborRow {
+        key: a.node_id.to_string(),
+        interface: h.interface.clone().unwrap_or_default(),
+        protocol: "CRDP".into(),
+        address: if h.local {
+            format!("{address} (this machine)")
+        } else {
+            address
+        },
+        mac: a.mac.map(|m| mac_text(&m)).unwrap_or_default(),
+        identity: a.identity.clone(),
+        version: a.version.clone(),
+        board: a.board.clone(),
+        uptime_secs: uptime,
+        connect_to: h.connect_to(),
+    }
+}
+
+fn mac_text(m: &[u8; 6]) -> String {
+    m.iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// `$XDG_CONFIG_HOME` (or `~/.config`, or `%APPDATA%`)`/corerouter/saved-routers.json`.
+fn default_saved_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))?;
+    Some(base.join("corerouter").join("saved-routers.json"))
+}
+
+fn load_saved(path: &std::path::Path) -> Vec<SavedRouter> {
+    use std::io::Read as _;
+    let mut text = String::new();
+    let read =
+        std::fs::File::open(path).and_then(|f| f.take(MAX_SAVED_FILE).read_to_string(&mut text));
+    match read {
+        Ok(_) => match serde_json::from_str::<Value>(&text) {
+            Ok(v) => SavedRouter::list_from_json(&v),
+            Err(e) => {
+                log::warn!(
+                    "{} is not a router list ({e}); starting empty",
+                    path.display()
+                );
+                Vec::new()
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            log::warn!("cannot read {}: {e}", path.display());
+            Vec::new()
+        }
+    }
+}
+
+/// Temp file + rename: a crash never leaves half a list.
+fn write_saved(path: &std::path::Path, saved: &[SavedRouter]) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let text = serde_json::to_string_pretty(&SavedRouter::list_to_json(saved))
+        .map_err(std::io::Error::other)?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)
 }
 
 #[cfg(test)]
@@ -288,7 +501,7 @@ mod tests {
         let addr = daemon.local_addr().unwrap().to_string();
         spawn(daemon, SharedHost(shared(Session::virtual_lab()))).unwrap();
         let mut host = GuiHost {
-            target: Target::Remote { addr },
+            target: Arc::new(Mutex::new(Target::Remote { addr })),
             proxy: None,
             ctx: Arc::new(OnceLock::new()),
         };
@@ -307,12 +520,53 @@ mod tests {
     }
 
     #[test]
+    fn connect_screen_still_answers_server_info_and_screenshot() {
+        let mut host = GuiHost {
+            target: Arc::new(Mutex::new(Target::Choosing)),
+            proxy: None,
+            ctx: Arc::new(OnceLock::new()),
+        };
+        let info = corerouter_control::dispatch(&mut host, "server.info", &Value::Null).unwrap();
+        assert_eq!(info["has_ui"], true);
+        let err = corerouter_control::dispatch(&mut host, "engine.list", &Value::Null);
+        assert!(err.unwrap_err().contains("connect screen"));
+        let shot = corerouter_control::dispatch(&mut host, "ui.screenshot", &Value::Null);
+        assert!(shot.unwrap_err().contains("not up yet"));
+        // Picking the lab switches the same host over.
+        set_target(
+            &host.target,
+            Target::Local(SharedHost(shared(Session::virtual_lab()))),
+        );
+        assert!(corerouter_control::dispatch(&mut host, "engine.list", &Value::Null).is_ok());
+    }
+
+    #[test]
+    fn saved_list_file_round_trip() {
+        let path = std::env::temp_dir()
+            .join(format!("crdp-gui-{}", std::process::id()))
+            .join("saved.json");
+        assert!(load_saved(&path).is_empty(), "missing file: empty list");
+        let list = vec![SavedRouter {
+            address: "127.0.0.1:7979".into(),
+            group: "lab".into(),
+            comment: String::new(),
+        }];
+        write_saved(&path, &list).unwrap();
+        assert_eq!(load_saved(&path), list);
+        std::fs::write(&path, "{not json").unwrap();
+        assert!(load_saved(&path).is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+        assert!(check_addr("[fe80::1%2]:7979").is_ok());
+        assert!(check_addr("10.0.0.1").is_err());
+    }
+
+    #[test]
     fn server_info_answers_without_the_daemon() {
         let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = gone.local_addr().unwrap().to_string();
         drop(gone);
         let mut host = GuiHost {
-            target: Target::Remote { addr },
+            target: Arc::new(Mutex::new(Target::Remote { addr })),
             proxy: None,
             ctx: Arc::new(OnceLock::new()),
         };
