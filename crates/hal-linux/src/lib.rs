@@ -66,6 +66,10 @@ pub mod dhcp;
 #[cfg(target_os = "linux")]
 pub mod dhcp_server;
 
+/// DHCPv6 server and relay transport (G4.2c): UDP 547, ff02::1:2.
+#[cfg(target_os = "linux")]
+pub mod dhcp6_server;
+
 /// DHCPv6 client transport (G4.7b): UDP 546 → ff02::1:2.
 #[cfg(target_os = "linux")]
 pub mod dhcp6;
@@ -529,6 +533,23 @@ mod linux {
         ) -> Result<Box<dyn corerouter_hal::dhcp_server::DhcpUplink>, HalError> {
             crate::dhcp_server::LinuxDhcpUplink::open()
                 .map(|p| Box::new(p) as Box<dyn corerouter_hal::dhcp_server::DhcpUplink>)
+                .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn dhcp6_server_port(
+            &mut self,
+            name: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::dhcp_server::Dhcp6ServerPort>, HalError> {
+            crate::dhcp6_server::LinuxDhcp6ServerPort::open(name)
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::dhcp_server::Dhcp6ServerPort>)
+                .map_err(|e| HalError::Io(e.to_string()))
+        }
+
+        fn dhcp6_relay_uplink(
+            &mut self,
+        ) -> Result<Box<dyn corerouter_hal::dhcp_server::Dhcp6Uplink>, HalError> {
+            crate::dhcp6_server::LinuxDhcp6Uplink::open()
+                .map(|p| Box::new(p) as Box<dyn corerouter_hal::dhcp_server::Dhcp6Uplink>)
                 .map_err(|e| HalError::Io(e.to_string()))
         }
 

@@ -248,6 +248,30 @@ pub trait Hal: Send {
         )))
     }
 
+    /// Open the DHCPv6 server socket of interface `name` (G4.2c).
+    fn dhcp6_server_port(
+        &mut self,
+        name: &IfName,
+    ) -> Result<Box<dyn dhcp_server::Dhcp6ServerPort>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no DHCPv6 server transport (asked for '{name}')",
+            self.describe()
+        )))
+    }
+
+    /// The DHCPv6 relay's socket towards the servers (G4.2c).
+    fn dhcp6_relay_uplink(&mut self) -> Result<Box<dyn dhcp_server::Dhcp6Uplink>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no DHCPv6 relay transport",
+            self.describe()
+        )))
+    }
+
+    /// The lab's simulated DHCPv6 clients (G4.2c).
+    fn offer_dhcp6_lab_clients(&mut self, hosts: dhcp_server::SharedLabClients6) {
+        let _ = hosts;
+    }
+
     /// The lab's simulated DHCP clients (G4.2a), offered by the engine like
     /// [`Hal::offer_dhcp_lab_server`].
     fn offer_dhcp_lab_clients(&mut self, hosts: dhcp_server::SharedLabClients) {

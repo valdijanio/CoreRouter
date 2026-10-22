@@ -42,6 +42,8 @@ pub struct VirtualHal {
     dhcp6: Option<SharedResponder6>,
     /// Simulated hosts asking the router's DHCP server (G4.2a).
     dhcp_hosts: Option<crate::dhcp_server::SharedLabClients>,
+    /// Simulated DHCPv6 clients (G4.2c).
+    dhcp6_hosts: Option<crate::dhcp_server::SharedLabClients6>,
     /// Times each port was enabled again (each one is a simulated link
     /// down and up, G1.19).
     reenabled: BTreeMap<IfName, u32>,
@@ -94,6 +96,7 @@ impl VirtualHal {
             dhcp: None,
             dhcp6: None,
             dhcp_hosts: None,
+            dhcp6_hosts: None,
             reenabled: BTreeMap::new(),
             kernel: Arc::new(Mutex::new(kernel)),
         }
@@ -667,6 +670,30 @@ impl Hal for VirtualHal {
         }))
     }
 
+    fn dhcp6_server_port(
+        &mut self,
+        name: &IfName,
+    ) -> Result<Box<dyn crate::dhcp_server::Dhcp6ServerPort>, HalError> {
+        if !self.applied.interfaces.contains_key(name) && !self.ports.contains(name) {
+            return Err(HalError::Rejected(format!(
+                "no interface '{name}' in the lab"
+            )));
+        }
+        Ok(Box::new(SimDhcp6ServerPort {
+            port: name.clone(),
+            mac: self.mac_of(name),
+            hosts: self.dhcp6_hosts.clone(),
+            now: 0,
+            inbox: VecDeque::new(),
+        }))
+    }
+
+    fn offer_dhcp6_lab_clients(&mut self, hosts: crate::dhcp_server::SharedLabClients6) {
+        if self.dhcp6_hosts.is_none() {
+            self.dhcp6_hosts = Some(hosts);
+        }
+    }
+
     fn offer_dhcp_lab_clients(&mut self, hosts: crate::dhcp_server::SharedLabClients) {
         if self.dhcp_hosts.is_none() {
             self.dhcp_hosts = Some(hosts);
@@ -778,6 +805,47 @@ impl Dhcp6Port for SimDhcp6Port {
 
     fn recv(&mut self) -> Result<Option<Datagram6>, HalError> {
         Ok(self.inbox.pop_front())
+    }
+}
+
+/// A lab DHCPv6 server socket (G4.2c).
+struct SimDhcp6ServerPort {
+    port: IfName,
+    mac: [u8; 6],
+    hosts: Option<crate::dhcp_server::SharedLabClients6>,
+    now: u64,
+    inbox: VecDeque<crate::dhcp_server::Heard6>,
+}
+
+impl crate::dhcp_server::Dhcp6ServerPort for SimDhcp6ServerPort {
+    fn mac(&self) -> [u8; 6] {
+        self.mac
+    }
+
+    fn tick(&mut self, now_unix: u64) {
+        self.now = now_unix;
+        if let Some(h) = &self.hosts {
+            for m in h.poll(&self.port, now_unix) {
+                if self.inbox.len() < SIM_INBOX {
+                    self.inbox.push_back(m);
+                }
+            }
+        }
+    }
+
+    fn recv(&mut self) -> Result<Option<crate::dhcp_server::Heard6>, HalError> {
+        Ok(self.inbox.pop_front())
+    }
+
+    fn send(&mut self, payload: &[u8], _to: Ipv6Addr, _port: u16) -> Result<(), HalError> {
+        if let Some(h) = &self.hosts {
+            h.deliver(&self.port, payload, self.now);
+        }
+        Ok(())
+    }
+
+    fn describe(&self) -> String {
+        format!("lab hosts on {} (v6)", self.port)
     }
 }
 

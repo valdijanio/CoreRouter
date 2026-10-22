@@ -1018,7 +1018,7 @@ impl Ipv6Panel {
             })
             .collect();
         ui.horizontal(|ui| {
-            ui.weak("Pools come from DHCPv6 clients (pool name). Number a LAN with");
+            ui.weak("Pools come from DHCPv6 clients (flag D) or DHCPv6 Server › Pools. Number a LAN with");
             ui.monospace("ip.address.add address=::1/64 from_pool=<pool>");
         });
         ui.separator();

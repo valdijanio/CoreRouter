@@ -71,7 +71,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{id?: *hex, after_seq?: u32} → {events: [{seq, time, client, interface, event (searching | advertised | bound | renewed | lost | status | refused | ignored | error | stopped), message}], last_seq}",
         always, history),
     cmd!(query "ipv6.pool.list", "Pools", ["IPv6", "Pool"], None,
-        "{} → [{name, flags (D dynamic, I inactive), prefix, interface, client, expires_after, preferred_lifetime, valid_lifetime, used: [{interface, address, id}], status}]",
+        "{} → [{name, flags (D dynamic, I inactive; none: configured), prefix, interface?, client?, expires_after?, preferred_lifetime?, valid_lifetime?, used: [{interface, address, id}], status (bound | waiting for a prefix | static), id? (configured), prefix_length?, size?, size_text?, leases? (bound DHCPv6 server leases), comment?, checks?}]",
         always, pools),
     cmd!(query "ipv6.settings.get", "IPv6 Settings", ["IPv6", "Settings"], None,
         "{} → {accept_router_advertisements, accept_router_advertisements_on, interfaces: [{interface, accept (off | if-not-forwarding | on), accepts, why}]}",
@@ -484,6 +484,8 @@ fn pools(s: &mut Session, _p: &Value) -> Result<Value> {
             })
         })
         .collect();
+    let mut rows = rows;
+    rows.extend(super::dhcp6_server::static_pool_rows(s));
     Ok(Value::Array(rows))
 }
 

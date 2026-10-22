@@ -173,6 +173,8 @@ impl Session {
         // G4.2b: the relays first; requests for our own servers come back.
         let mut relayed: Vec<(IfName, Heard)> = Vec::new();
         let mut heard = self.dhcp_relay_poll(now, &mut relayed);
+        // G4.2c: the DHCPv6 server and relays, on the same round.
+        heard |= self.dhcp6_server_poll(now);
         let Some(rt) = self.ext_mut::<DhcpServerRuntime>() else {
             return heard;
         };

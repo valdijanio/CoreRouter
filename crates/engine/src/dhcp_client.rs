@@ -381,7 +381,7 @@ impl Session {
             .runners
             .values()
             .all(|r| r.addresses.is_empty() && r.routes.is_empty() && r.fallback.is_none());
-        if v4_quiet && self.dhcp6_quiet(cfg) {
+        if v4_quiet && self.dhcp6_quiet(cfg) && self.dhcp6_server_quiet() {
             return Cow::Borrowed(cfg);
         }
         let mut out = cfg.clone();
@@ -410,6 +410,8 @@ impl Session {
         }
         // DHCPv6 (G4.7b): leases, and the addresses taken from pools.
         self.dhcp6_extend(cfg, &mut out);
+        // Routes to the prefixes the DHCPv6 server delegated (G4.2c).
+        self.dhcp6_server_extend(cfg, &mut out);
         Cow::Owned(out)
     }
 

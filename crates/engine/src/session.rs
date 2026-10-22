@@ -139,6 +139,7 @@ impl Session {
         hal.offer_dhcp_lab_server(Arc::new(corerouter_proto_dhcp::lab::LabServer::default()));
         hal.offer_dhcp6_lab_server(Arc::new(corerouter_proto_dhcp::lab6::LabServer6::default()));
         hal.offer_dhcp_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts::LabHosts::default()));
+        hal.offer_dhcp6_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts6::LabHosts6::default()));
         let (restored, boot_errors) = restore(storage.as_mut());
         let (restored, users) = match restored {
             Some((store, users, slot)) => (Some((store, slot)), users),

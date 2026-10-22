@@ -1,7 +1,8 @@
 # Servidor DHCP (`/ip dhcp-server`, `/ip pool`)
 
-Status: **G4.2a** (servidor DHCPv4 completo) e **G4.2b** (`/ip dhcp-relay`, opção 82 no servidor e
-histórico de concessões, §11–§13) feitos. G4.2c (servidor DHCPv6 com IA_NA e IA_PD) vem no PR seguinte. O cliente DHCP
+Status: **G4.2a** (servidor DHCPv4 completo), **G4.2b** (`/ip dhcp-relay`, opção 82 no servidor e
+histórico de concessões, §11–§13) e **G4.2c** (servidor DHCPv6 com IA_NA e IA_PD, relay v6, §14)
+feitos. O cliente DHCP
 (WAN) está em `docs/dhcp-client.md`.
 
 O roteador entrega endereços na LAN com os menus e nomes do RouterOS v7: pools, servidores,
@@ -250,6 +251,43 @@ cuja concessão não existe mais são fechadas no fim conhecido.
 - Em memória até 500 000 entradas (**estimado** ~150 bytes cada); acima disso as mais antigas saem
   da memória (o disco guarda até a retenção).
 
+## 14. DHCPv6 (`/ipv6 dhcp-server`, G4.2c)
+
+| Comando | Faz |
+|---|---|
+| `ipv6.pool.add/set/remove` | pools configurados: `prefix` cortado em `prefix_length` (48..=64 para prefixos delegados, 128 para endereços); no máximo 2^20 prefixos por pool; `ipv6.pool.list` (`/ipv6 pool print`) mostra, depois dos pools que os clientes DHCPv6 recebem (flag D), os configurados, com tamanho e concessões |
+| `ipv6.dhcp-server.add/set/remove/print` | `interface`, `address_pool` (IA_NA), `prefix_pool` (IA_PD), `lease_time` (vida válida, padrão 1 dia, **estimado**; a preferida é ⅔ dela), `preference` (255), `rapid_commit` (sim), `route_distance`, `relay` (link-address do relay), `dns_server`, `domain`, `dns_zone` (AAAA + PTR) |
+| `ipv6.dhcp-server.binding.add/remove/print` | fixos por DUID (e IAID) com endereço e/ou prefixo; o `print` junta os dinâmicos; `remove` de um dinâmico o libera |
+| `ipv6.dhcp-relay.add/remove/print` | relay v6: interface dos clientes, servidores (vazio: `ff05::1:3`), `link_address` |
+
+RFC 9915 (ex-8415, que substituiu a 3315 e a 3633), por seção: §16 o que cada mensagem tem de ter
+(Solicit sem Client Identifier ou com Server Identifier: descartado); §18.3.1 Solicit → Advertise
+com Preference, ou Reply direto com Rapid Commit; §18.3.2 Request; §18.3.4 Renew (IA desconhecido:
+NoBinding); §18.3.5 Rebind (endereço que não é do link: devolvido com vidas 0); §18.3.7 Release;
+§18.3.8 Decline (endereço retido); §18.3.3 Confirm (Success ou NotOnLink); §18.3.6
+Information-request; §21.4 T1 = 0,5 e T2 = 0,8 da vida preferida; §9/§19 Relay-Forw/Relay-Repl,
+aninhados até o limite de 8 saltos, com Interface-Id. O servidor é puro como o v4
+(`proto-dhcp/src/server6.rs`), com codec próprio (o do G4.7b) e diário próprio
+(`journal-dhcp6-leases.log`).
+
+- **Endereço (IA_NA):** um hash do cliente (DUID + IAID) escolhe o endereço no pool: o mesmo cliente
+  recebe o mesmo endereço em qualquer roteador e depois de perder a tabela; 64 candidatos a partir
+  do hash.
+- **Prefixo (IA_PD):** o fixo, o que o cliente já tinha, a dica dele (§18.2.1), senão o próximo
+  livre. Cada prefixo delegado ganha uma **rota** dinâmica (flag D) via o endereço de onde o cliente
+  falou (o link-local dele ou o relay), pelo mesmo `Session::effective` dos clientes DHCP; volta
+  depois de reiniciar (o diário).
+- **DNS:** o nome da opção 39 (RFC 4704) dá AAAA e PTR (G4.1c-3), TTL ⅓ da vida, mínimo 600 s.
+- **DUID do servidor:** DUID-LL do MAC da interface onde o pedido chegou.
+- **Relay v6:** pedidos de clientes ouvidos na interface do relay viram Relay-Forw (link-address,
+  peer-address, Interface-Id = nome da interface) para os servidores; a resposta Relay-Repl volta ao
+  cliente. Servidor do próprio roteador: em memória, como no v4.
+- **Transporte Linux:** UDP 547 por interface (`SO_BINDTODEVICE`), no grupo `ff02::1:2`; respostas ao
+  link-local do cliente pela interface; o relay usa um socket 547 sem interface.
+- **GUI:** IPv6 › DHCPv6 Server, abas Servers, Bindings (selos NA/PD, status, estático), Pools e Relays.
+- **Fora (gap G4.2f):** reconfigure (RFC 9915 §18.3.11), opções arbitrárias por servidor, `prefix
+  exclude` (RFC 6603), limite por cliente e estatísticas no `/metrics` como o v4, histórico v6.
+
 ## Pesquisa
 
 **G4.2b.** RouterOS `/ip dhcp-relay` (`dhcp-server`, `local-address`, `add-relay-info` com circuit
@@ -261,6 +299,14 @@ remote id), RFC 1542 §4.1 (hops, giaddr), RFC 2131 §4.1/§4.4.5. Marco Civil d
 12.965/2014), art. 13: registros de conexão por 1 ano. Melhorias: circuit id com o nome da
 interface (legível) em vez do MAC; histórico com consulta "quem tinha às HH:MM" e CSV, que nem o
 RouterOS nem o Kea trazem prontos; servidor e relay no mesmo roteador conversando em memória.
+
+**G4.2c.** RouterOS `/ipv6 dhcp-server` (interface, `address-pool`, `prefix-pool`, `lease-time`,
+`preference`, `rapid-commit`, `route-distance`, `binding` estáticos por DUID/IAID, rota automática
+ao prefixo delegado) e `/ipv6 pool` (`prefix`, `prefix-length`); Kea DHCPv6 (pools e `pd-pools`
+com `delegated-len`, reservas por DUID, `rapid-commit`); RFC 9915 (jan/2026, obsoleta a 8415, que
+obsoletou a 3315 e a 3633), RFC 3646 (DNS), RFC 4704 (FQDN), RFC 6603 (exclude, fora). Melhorias:
+endereço por hash do cliente (estável entre roteadores); prefixo dica honrado; relay e servidor no
+mesmo roteador em memória; rota ao prefixo como entrada dinâmica do mesmo caminho de aplicação.
 
 **Fontes.** RouterOS v7: <https://manual.mikrotik.com/docs/cli-reference/ip/dhcp-server/> (e
 `/lease`, `/network`, `/option`, `/matcher`, `/alert`, `/config`),
