@@ -1004,6 +1004,8 @@ name = "corerouter-ui"
 version = "0.1.0"
 dependencies = [
  "corerouter-engine",
+ "corerouter-hal",
+ "corerouter-model",
  "egui",
  "serde_json",
 ]

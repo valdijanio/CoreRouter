@@ -13,5 +13,9 @@ corerouter-engine.workspace = true
 egui.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+corerouter-hal.workspace = true
+corerouter-model.workspace = true
+
 [lints]
 workspace = true
