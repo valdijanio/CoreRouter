@@ -2,11 +2,14 @@
 //! remove, journaled, saved); its lease is operational state read by `list`,
 //! `options` and `history`, and acted on by `renew` / `release`.
 
-use corerouter_model::dhcp_client::{MAX_ALLOWED, MAX_EXTRA};
+use corerouter_model::dhcp_client::{
+    CheckGateway, MAX_ALLOWED, MAX_EXTRA, MAX_FALLBACK_TIMEOUT, MIN_FALLBACK_TIMEOUT,
+};
 use corerouter_model::{
     AddDefaultRoute, AllowedServer, Config, DhcpClient, ExtraOption, IfName, ItemId, RoutingTable,
 };
 use corerouter_proto_dhcp::v4;
+use ipnet::Ipv4Net;
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse};
@@ -20,7 +23,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add DHCP Client",
         ["IP", "DHCP Client"],
         None,
-        "{interface: string, disabled?: bool, comment?: string, add_default_route?: yes | no | special-classless (default yes: option 121 if sent, else a default route via option 3; special-classless: both), default_route_distance?: u32 (1..=255, default 1), default_route_table?: string (main | VRF; empty = the interface's table), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true), host_name?: string (option 12; empty = system identity), client_id?: string (option 61: text or 0x…; empty = 0x01+MAC), vendor_class?: string (option 60: text or 0x…), extra_options?: [string (code:value, value as 0x0a0b | 'text' | s'text' | '10.0.0.1' | '10' | $(HOSTNAME) | $(CLIENT_MAC))] | string, allowed_servers?: [string (IPv4 or MAC; empty = any server)] | string} → {id}",
+        "{interface: string, disabled?: bool, comment?: string, add_default_route?: yes | no | special-classless (default yes: option 121 if sent, else a default route via option 3; special-classless: both), default_route_distance?: u32 (1..=255, default 1), default_route_table?: string (main | VRF; empty = the interface's table), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true), host_name?: string (option 12; empty = system identity), client_id?: string (option 61: text or 0x…; empty = 0x01+MAC), vendor_class?: string (option 60: text or 0x…), extra_options?: [string (code:value, value as 0x0a0b | 'text' | s'text' | '10.0.0.1' | '10' | $(HOSTNAME) | $(CLIENT_MAC))] | string, allowed_servers?: [string (IPv4 or MAC; empty = any server)] | string, check_gateway?: none | arp | ping (default none; every 10 s, the lease's routes are withheld after 2 unanswered checks), fallback_address?: string (IPv4/prefix put on the interface while no server answers; empty = none), fallback_timeout?: u32 (5..=3600 s without a lease before the fallback address goes up, default 30)} → {id}",
         always,
         add
     ),
@@ -29,7 +32,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set DHCP Client",
         [],
         None,
-        "{id: *hex, interface?: string, disabled?: bool, comment?: string, add_default_route?: yes | no | special-classless (default yes: option 121 if sent, else a default route via option 3; special-classless: both), default_route_distance?: u32 (1..=255, default 1), default_route_table?: string (main | VRF; empty = the interface's table), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true), host_name?: string (option 12; empty = system identity), client_id?: string (option 61: text or 0x…; empty = 0x01+MAC), vendor_class?: string (option 60: text or 0x…), extra_options?: [string (code:value, value as 0x0a0b | 'text' | s'text' | '10.0.0.1' | '10' | $(HOSTNAME) | $(CLIENT_MAC))] | string, allowed_servers?: [string (IPv4 or MAC; empty = any server)] | string} → {id}",
+        "{id: *hex, interface?: string, disabled?: bool, comment?: string, add_default_route?: yes | no | special-classless (default yes: option 121 if sent, else a default route via option 3; special-classless: both), default_route_distance?: u32 (1..=255, default 1), default_route_table?: string (main | VRF; empty = the interface's table), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true), host_name?: string (option 12; empty = system identity), client_id?: string (option 61: text or 0x…; empty = 0x01+MAC), vendor_class?: string (option 60: text or 0x…), extra_options?: [string (code:value, value as 0x0a0b | 'text' | s'text' | '10.0.0.1' | '10' | $(HOSTNAME) | $(CLIENT_MAC))] | string, allowed_servers?: [string (IPv4 or MAC; empty = any server)] | string, check_gateway?: none | arp | ping (default none; every 10 s, the lease's routes are withheld after 2 unanswered checks), fallback_address?: string (IPv4/prefix put on the interface while no server answers; empty = none), fallback_timeout?: u32 (5..=3600 s without a lease before the fallback address goes up, default 30)} → {id}",
         has_clients,
         set
     ),
@@ -61,13 +64,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         release
     ),
     cmd!(query "ip.dhcp-client.list", "DHCP Client", ["IP", "DHCP Client"], None,
-        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, use_peer_dns, add_default_route, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, gateway, dhcp_server, expires_after, primary_dns, secondary_dns, primary_ntp, secondary_ntp, domain, lease_time, expires_after_secs, routes, notes, error, invalid, disabled, comment, default_route_distance, default_route_table, routes_table, use_peer_ntp, host_name, client_id, vendor_class, extra_options, allowed_servers}]",
+        "{interface?: string} → [{id, flags (X disabled, I invalid), interface, use_peer_dns, add_default_route, status (stopped | searching | requesting | bound | renewing | rebinding | error), address, gateway, dhcp_server, expires_after, primary_dns, secondary_dns, primary_ntp, secondary_ntp, domain, lease_time, expires_after_secs, routes, notes, error, invalid, disabled, comment, default_route_distance, default_route_table, routes_table, use_peer_ntp, host_name, client_id, vendor_class, extra_options, allowed_servers, check_gateway, gateway_status (unchecked | up | down), fallback_address, fallback_timeout, fallback_active, remembered (the lease kept for INIT-REBOOT, if any)}]",
         always, list),
     cmd!(query "ip.dhcp-client.options", "Received Options", [], None,
         "{id: *hex} → {id, interface, dhcp_server, options: [{code, name, value, hex}]}",
         has_clients, options),
     cmd!(query "ip.dhcp-client.history", "DHCP Client History", [], None,
-        "{id?: *hex, after_seq?: u32} → {events: [{seq, time, client, interface, event (searching | offered | bound | renewed | lost | nak | refused | declined | ignored | error | stopped), message}], last_seq}",
+        "{id?: *hex, after_seq?: u32} → {events: [{seq, time, client, interface, event (searching | rebooting | offered | bound | renewed | lost | nak | refused | declined | ignored | error | stopped | fallback | gateway), message}], last_seq}",
         always, history),
 ];
 
@@ -251,7 +254,50 @@ fn edit(c: &mut DhcpClient, p: &Value) -> Result<()> {
     if let Some(v) = opt_allowed(p)? {
         c.allowed_servers = v;
     }
+    if let Some(v) = opt_parse::<CheckGateway>(p, "check_gateway")? {
+        c.check_gateway = v;
+    }
+    if let Some(t) = opt_str(p, "fallback_address")? {
+        c.fallback_address = if t.trim().is_empty() {
+            None
+        } else {
+            Some(fallback(t)?)
+        };
+    }
+    if let Some(v) = opt_u32(p, "fallback_timeout")? {
+        if !(MIN_FALLBACK_TIMEOUT..=MAX_FALLBACK_TIMEOUT).contains(&v) {
+            return Err(EngineError::bad(
+                "fallback_timeout",
+                format!("must be {MIN_FALLBACK_TIMEOUT}..={MAX_FALLBACK_TIMEOUT} seconds"),
+            ));
+        }
+        c.fallback_timeout = v;
+    }
     Ok(())
+}
+
+/// A fallback address: a host address with its prefix (`192.168.100.2/24`).
+fn fallback(t: &str) -> Result<Ipv4Net> {
+    let key = "fallback_address";
+    let net: Ipv4Net = t
+        .trim()
+        .parse()
+        .map_err(|_| EngineError::bad(key, format!("'{}': write address/prefix", clip(t))))?;
+    let ip = net.addr();
+    let edge = net.prefix_len() < 31 && (ip == net.network() || ip == net.broadcast());
+    if ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || ip.is_loopback()
+        || net.prefix_len() == 0
+        || edge
+    {
+        return Err(EngineError::bad(
+            key,
+            format!("{net} is not a usable host address"),
+        ));
+    }
+    Ok(net)
 }
 
 /// Refuse `c` with the first problem the validator sees in it.
@@ -441,6 +487,12 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             "vendor_class": c.vendor_class,
             "extra_options": c.extra_options.iter().map(|o| format!("{}:{}", o.code, o.value)).collect::<Vec<_>>(),
             "allowed_servers": c.allowed_servers.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "check_gateway": c.check_gateway,
+            "gateway_status": runner.map_or("unchecked", |r| r.gateway_status()),
+            "fallback_address": c.fallback_address.map(|a| a.to_string()).unwrap_or_default(),
+            "fallback_timeout": c.fallback_timeout,
+            "fallback_active": runner.is_some_and(|r| r.fallback.is_some()),
+            "remembered": s.dhcp.remembered(c.id).map(|m| m.address.to_string()),
         }));
     }
     Ok(Value::Array(rows))
@@ -486,7 +538,7 @@ mod tests {
     use super::*;
 
     /// `add` and `set` must document the same optional keys.
-    const SET_KEYS: &str = "disabled?: bool, comment?: string, add_default_route?: yes | no | special-classless (default yes: option 121 if sent, else a default route via option 3; special-classless: both), default_route_distance?: u32 (1..=255, default 1), default_route_table?: string (main | VRF; empty = the interface's table), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true), host_name?: string (option 12; empty = system identity), client_id?: string (option 61: text or 0x…; empty = 0x01+MAC), vendor_class?: string (option 60: text or 0x…), extra_options?: [string (code:value, value as 0x0a0b | 'text' | s'text' | '10.0.0.1' | '10' | $(HOSTNAME) | $(CLIENT_MAC))] | string, allowed_servers?: [string (IPv4 or MAC; empty = any server)] | string";
+    const SET_KEYS: &str = "disabled?: bool, comment?: string, add_default_route?: yes | no | special-classless (default yes: option 121 if sent, else a default route via option 3; special-classless: both), default_route_distance?: u32 (1..=255, default 1), default_route_table?: string (main | VRF; empty = the interface's table), use_peer_dns?: bool (default true), use_peer_ntp?: bool (default true), host_name?: string (option 12; empty = system identity), client_id?: string (option 61: text or 0x…; empty = 0x01+MAC), vendor_class?: string (option 60: text or 0x…), extra_options?: [string (code:value, value as 0x0a0b | 'text' | s'text' | '10.0.0.1' | '10' | $(HOSTNAME) | $(CLIENT_MAC))] | string, allowed_servers?: [string (IPv4 or MAC; empty = any server)] | string, check_gateway?: none | arp | ping (default none; every 10 s, the lease's routes are withheld after 2 unanswered checks), fallback_address?: string (IPv4/prefix put on the interface while no server answers; empty = none), fallback_timeout?: u32 (5..=3600 s without a lease before the fallback address goes up, default 30)";
 
     #[test]
     fn add_and_set_document_the_same_keys() {

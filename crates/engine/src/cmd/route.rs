@@ -268,6 +268,21 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             }
         })
         .collect();
+    // Lease routes whose gateway fails check-gateway (G4.7c): inactive.
+    lines.extend(s.dhcp_withheld(cfg).into_iter().map(|(r, why)| Line {
+        id: Some(r.id),
+        dst: r.dst_address,
+        gateway: r.gateway.to_string(),
+        distance: r.distance,
+        table: r.routing_table.clone(),
+        usable: false,
+        connected: false,
+        disabled: false,
+        immediate: None,
+        reason: Some(why),
+        comment: r.comment.clone(),
+        ra: false,
+    }));
     lines.extend(route::connected(cfg).into_iter().map(|c| Line {
         id: None,
         dst: c.dst,

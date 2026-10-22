@@ -367,16 +367,18 @@ fn shutdown_stops_accepting_and_closes_the_port() {
 }
 
 /// Median time of `n` sequential calls on one open connection.
-fn median_call(c: &mut Client, method: &str, n: usize) -> Duration {
-    let mut times: Vec<Duration> = (0..n)
+/// The fastest of `n` calls. Nagle's ~40 ms delay hits every request, while
+/// a loaded machine (parallel builds: `docs/perf.md`) only slows some, so the
+/// fastest one still tells the two apart; a median failed under load.
+fn fastest_call(c: &mut Client, method: &str, n: usize) -> Duration {
+    let times: Vec<Duration> = (0..n)
         .map(|_| {
             let t = std::time::Instant::now();
             c.call(method, json!({})).unwrap();
             t.elapsed()
         })
         .collect();
-    times.sort();
-    times[n / 2]
+    times.into_iter().min().unwrap_or(Duration::MAX)
 }
 
 /// One request per line must leave in one write: a reply split in two
@@ -384,12 +386,13 @@ fn median_call(c: &mut Client, method: &str, n: usize) -> Duration {
 /// request. Plain TCP and TLS, server and client side.
 #[test]
 fn a_persistent_connection_answers_in_milliseconds() {
-    const LIMIT: Duration = Duration::from_millis(5);
+    // Half of Nagle's ~40 ms: a regression fails, a busy machine does not.
+    const LIMIT: Duration = Duration::from_millis(20);
     let (session, gate, token) = lab();
     let addr = start(&session, &gate);
     let mut c = local(&addr, &token);
-    let plain = median_call(&mut c, "ping", 40);
-    let inspect = median_call(&mut c, "state.inspect", 40);
+    let plain = fastest_call(&mut c, "ping", 40);
+    let inspect = fastest_call(&mut c, "state.inspect", 40);
 
     let (cert, key) = corerouter_control::tls::generate().unwrap();
     let id = corerouter_control::tls::identity_from_pem(cert.as_bytes(), key.as_bytes()).unwrap();
@@ -404,9 +407,9 @@ fn a_persistent_connection_answers_in_milliseconds() {
     let mut t =
         Client::connect_tls(&tls_addr, Duration::from_secs(2), Some(&id.fingerprint)).unwrap();
     t.login("admin", ADMIN_PW).unwrap();
-    let tls = median_call(&mut t, "ping", 40);
+    let tls = fastest_call(&mut t, "ping", 40);
     eprintln!(
-        "median per request: tcp ping {plain:?}, tcp state.inspect {inspect:?}, tls ping {tls:?}"
+        "fastest request: tcp ping {plain:?}, tcp state.inspect {inspect:?}, tls ping {tls:?}"
     );
     for (what, d) in [
         ("tcp ping", plain),
@@ -415,7 +418,7 @@ fn a_persistent_connection_answers_in_milliseconds() {
     ] {
         assert!(
             d < LIMIT,
-            "{what}: median {d:?} per request (limit {LIMIT:?})"
+            "{what}: fastest request took {d:?} (limit {LIMIT:?})"
         );
     }
 }

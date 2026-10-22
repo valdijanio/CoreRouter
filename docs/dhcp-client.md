@@ -1,8 +1,8 @@
 # Cliente DHCP (`/ip dhcp-client`)
 
-Status: G4.7a (DHCPv4 estilo RouterOS + extras) e G4.7b (DHCPv6 com endereço, prefixo delegado,
-pools e controle de RA; §9–§13) feitos. G4.7c (endereço de reserva, checar gateway, concessão
-lembrada) aberto em `docs/gaps.md`.
+Status: G4.7a (DHCPv4 estilo RouterOS + extras), G4.7b (DHCPv6 com endereço, prefixo delegado,
+pools e controle de RA; §9–§13) e G4.7c (concessão lembrada com INIT-REBOOT, endereço de reserva,
+`check_gateway`; §15) feitos.
 
 O roteador pega endereço, rota padrão, DNS e NTP sozinho na WAN, como o `/ip dhcp-client` do
 RouterOS: um cliente por interface, com os mesmos nomes de propriedade e a mesma regra para
@@ -62,7 +62,7 @@ Por isso todo temporizador é testado com relógio simulado.
 - NAK: perde a concessão e recomeça; NAKs seguidos esperam 0, 4, 8 … 64 s (um servidor que só
   diz não não é martelado).
 - Desabilitar ou remover o cliente retira a concessão **sem** RELEASE (o provedor guarda o IP
-  para nós; G4.7c vai lembrá-lo). Só `release` manda DHCPRELEASE.
+  para nós, e o cliente o lembra, §15). Só `release` manda DHCPRELEASE.
 - Cada resposta é conferida: `xid` e `chaddr` nossos; endereço utilizável (não 0, broadcast,
   multicast, loopback, classe E, rede ou broadcast da sub-rede); máscara contígua (sem ela, a
   classful).
@@ -83,6 +83,7 @@ apaga a concessão e a concessão não atrapalha o commit.
   (o kernel aceita uma). Para DHCP como reserva, distância maior (ela aparece `DS` sem `A`).
 - Interface desabilitada ou removida, cliente desabilitado ou removido: a concessão sai do data
   plane no mesmo commit; o serviço para o cliente no próximo ciclo (`stopped` no histórico).
+  A concessão continua lembrada (§15): ao voltar, o cliente pede o mesmo endereço (INIT-REBOOT).
 - Servidor fora de `allowed_servers` é ignorado em OFFER, ACK **e** NAK (um servidor estranho
   não dá endereço nem tira o nosso); vira um `refused` por troca no histórico.
 
@@ -375,6 +376,95 @@ L-16); kernel [`ip-sysctl`](https://docs.kernel.org/networking/ip-sysctl.html) (
   do prefixo, L-13/L-16); rota de descarte do prefixo delegado (WPD-5); `prefix-address-lists`;
   `check-gateway` v6; gerenciar `forward` (hoje o kernel decide; mexer nele mudaria a máquina de
   desenvolvimento); RDNSS/DNSSL do RA para o DNS (G4.1).
+
+## 15. Resiliência (G4.7c)
+
+Três coisas que mantêm a WAN de pé quando o provedor falha ou o roteador reinicia.
+
+### Concessão lembrada (INIT-REBOOT)
+
+Toda concessão (cada ACK) é guardada **fora da config e das revisões**, no estado `dhcp-leases`
+do armazenamento (`state-dhcp-leases.json` ao lado do `running.json`, gravado com temp + rename;
+na memória nos testes e na GUI). Guarda-se o ACK inteiro, a interface, o MAC e a hora (relógio de
+parede) em que veio. Quando o cliente começa de novo — reinício do daemon, cliente ou interface
+reabilitados — e a interface e o MAC batem, o ACK é **decodificado e conferido outra vez** como se
+tivesse acabado de chegar (o arquivo é entrada hostil: mesmo saneador do §5, hex com limite de
+tamanho, entrada ruim ignorada) e os temporizadores andam para trás pela idade:
+
+```text
+ REBOOTING: REQUEST broadcast, ciaddr 0, opção 50 = endereço lembrado, sem opção 54 (§4.3.2)
+   ACK  → sonda ARP → BOUND (sem DISCOVER/OFFER)
+   NAK  → esquece a concessão → INIT (DISCOVER sem pedir endereço)            (§3.2 passo 3)
+   3 REQUESTs a ~4 s sem resposta (~12 s):
+     concessão ainda válida → sonda ARP → BOUND nela pelo resto do tempo     (§3.2, "MAY")
+                              (T1/T2 já passados renovam na hora)
+     vencida ou idade desconhecida → INIT, DISCOVER pedindo o mesmo endereço (§4.4.1)
+```
+
+- Sem relógio de parede confiável (idade negativa ou desconhecida) a concessão conta como
+  vencida: o INIT-REBOOT ainda pode confirmá-la, mas ela nunca é usada sem servidor.
+- `release` e `remove` esquecem a concessão; NAK também. Desabilitar não (é o caso de uso).
+- `ip.dhcp-client.list` mostra `remembered` (o endereço guardado); o histórico ganha
+  `rebooting` e um `bound` "no server answered: using the remembered lease…".
+- Ao perder a concessão por expiração, o DISCOVER seguinte também pede o endereço antigo.
+
+### Endereço de reserva
+
+`fallback_address` (endereço/prefixo, ex. `192.168.100.2/24` para alcançar o modem) entra na
+interface depois de `fallback_timeout` s (5–3600, padrão 30, como o `timeout` do dhcpcd) sem
+concessão e sai no **mesmo apply** em que uma concessão chega. É dinâmico como a concessão
+(flag `D`, comentário `fallback`, nunca na config), aparece em `ip.address.list`, e o `list` do
+cliente mostra `fallback_active`. Limpar o campo com a reserva no ar a retira.
+
+### `check_gateway`
+
+`none` (padrão) | `arp` | `ping`, como o `check-gateway` do RouterOS (o do `/ip route`): uma
+checagem a cada 10 s; sem resposta em 2 s conta uma falha; **2 falhas seguidas** = gateway fora;
+a primeira resposta o traz de volta. O gateway checado é o da rota padrão da concessão (senão o da
+primeira rota). Fora, as rotas da concessão por ele saem do data plane (as de outros gateways da
+121 ficam) e aparecem em `ip.route.list` sem `A`, com o motivo — uma rota estática com distância
+maior assume. `gateway_status` no `list`: `unchecked` / `up` / `down`; eventos `gateway` no
+histórico.
+
+- `arp`: a mesma sonda ARP do §2 (`DhcpPort::probe`/`conflict`), feita só fora do PROBING; o
+  gateway responde a um pedido com remetente 0.0.0.0 como a qualquer outro.
+- `ping`: eco ICMP pelo `Prober` das ferramentas (G6), pela interface (`SO_BINDTODEVICE`) com o
+  endereço da concessão como origem.
+- No lab, o roteador `100.64.N.1` responde ARP com o MAC do servidor; o knob `gateway_down` o cala.
+
+### Testes (G4.7c)
+
+| Onde | O quê |
+|---|---|
+| `proto-dhcp` (máquina) | INIT-REBOOT com os campos da RFC 2131 §4.3.2, ACK direto, NAK → DISCOVER sem opção 50, rede muda → reusa a concessão válida e depois renova/perde, vencida → DISCOVER com opção 50 após ~12 s, `restore_lease` com idade, sem relógio, lixo, truncado, não-ACK |
+| `engine/tests/dhcp_resilience.rs` | reinício pelo mesmo armazenamento (INIT-REBOOT sem DISCOVER), rede muda após reinício, concessão vencida, NAK/release/remove esquecem, arquivo estragado ou hostil ignorado, reserva sobe e desce, check-gateway arp com rota reserva assumindo e voltando, ping, validação |
+| `storage-fs` | estado ao lado da config, temp + rename, nomes que escapariam do diretório recusados |
+| `ui` | Check Gateway / Fallback Address / Fallback Timeout na aba Advanced; Gateway Check e Remembered no Status |
+| `corerouter-daemon/tests/netns_dhcp_resilience.rs` | daemon `--backend linux` num namespace: check-gateway ARP tira e devolve a rota padrão **do kernel** quando o gateway some do veth; daemon reiniciado manda REQUEST (INIT-REBOOT), nenhum DISCOVER, e volta com o mesmo endereço |
+
+### Pesquisa (G4.7c)
+
+- **RFC 2131** §3.2 (reusar endereço: REQUEST broadcast; NAK → INIT; sem resposta, "MAY" usar o
+  anterior pelo resto da concessão), §4.3.2 (INIT-REBOOT: ciaddr 0, opção 50 MUST, opção 54 MUST
+  NOT), §4.4.1 (opção 50 no DISCOVER), §4.4.2, §4.1 (retransmissão). Atualizada por 3396, 4361,
+  5494, 6842; errata só editorial nessas seções (489, 7369, 8719). RFC 6842 (eco do client-id) e
+  RFC 4436 (DNAv4: confirmar a rede por ARP unicast ao gateway lembrado) lidas; ficam para o G4.7d.
+- **MikroTik v7**: `check-gateway` no `/ip dhcp-client` (arp/ping/bfd/none) sem efeito
+  documentado na página; o `/ip route check-gateway` checa a cada 10 s e marca o gateway
+  inacessível após 2 timeouts — adotado. Nenhuma concessão lembrada nem endereço de reserva
+  documentados no cliente.
+- **dhcpcd**: guarda o ACK cru (`/var/lib/dhcpcd/<if>.lease`, mtime = hora), `reboot` 5 s antes
+  do DISCOVER, `lastlease` (usa a última se ninguém responde, só se válida), `fallback` e IPv4LL
+  após `timeout` 30 s. **systemd-networkd**: `RequestAddress=` (opção 50 no DISCOVER), concessão
+  em `/run` (não sobrevive ao boot), `KeepConfiguration=`. **VyOS/OPNsense**: `reject`, hooks;
+  monitoramento de gateway do pfSense/OPNsense (dpinger: IP de monitoria separado, perda/latência)
+  como ideia.
+- **Adotado**: ACK cru re-conferido (dhcpcd), INIT-REBOOT + o "MAY" da §3.2 (o `lastlease` do
+  dhcpcd, só pelo resto da concessão: nada de `lastleaseextend`, que viola a §3.7), opção 50 no
+  DISCOVER após perder ou não confirmar (networkd), regra 10 s × 2 do RouterOS, reserva como o
+  `fallback` do dhcpcd mas um endereço só e dinâmico. Melhor que eles: a concessão nunca vira
+  revisão da config (rollback não a ressuscita), tudo visível no `list` e no histórico, a reserva
+  e a troca de rota passam pelo mesmo apply transacional.
 
 ## Histórico de revisão
 

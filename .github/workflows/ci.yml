@@ -35,10 +35,6 @@ jobs:
     name: xtask ci (linux)
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    env:
-      # G1.14: o teste de VRF em netns falha em vez de pular (e o passo netns
-      # do xtask também) se o módulo `vrf` não estiver carregado.
-      COREROUTER_REQUIRE_VRF: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -73,31 +69,60 @@ jobs:
       # G1.2: `cargo xtask netns` testa o hal-linux num network namespace sem root.
       # O Ubuntu 24.04 bloqueia user namespaces sem privilégio (AppArmor); isto só
       # muda a VM descartável do runner. Se não pegar, o passo netns vira "skip".
+      # Portão em duas camadas: no PR, `cargo xtask ci --fast` (determinístico, sem os testes
+      # contra o kernel); no lote da fila de entrada (workflow_dispatch) e na main, o completo.
+      # Teste que falha e passa ao repetir é marcado como instável e não reprova (docs/perf.md).
       - name: Liberar user namespaces sem root
+        if: github.event_name != 'pull_request'
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
 
       # G1.14: um user namespace não carrega módulos; carregamos o `vrf` aqui, na
       # VM descartável do runner (o sudo dos agentes, localmente, continua proibido).
-      # Imagens do Azure às vezes trazem o vrf.ko só em linux-modules-extra. Instalar o pacote
-      # levava ~7 min (gatilhos do initramfs); baixar e tirar só o vrf.ko leva segundos.
+      # Imagens do Azure às vezes trazem o vrf.ko só em linux-modules-extra (51 MB), e o espelho
+      # chegou a 82 kB/s: 10 min só para baixar (bateria da fila, docs/perf.md). O vrf.ko fica no
+      # cache do Actions por versão do kernel; sem cache, o download tem teto de 2 min, e se
+      # estourar o CI segue sem o teste de VRF, com aviso, em vez de travar a fila.
+      - name: Versão do kernel
+        if: github.event_name != 'pull_request'
+        id: kernel
+        run: echo "release=$(uname -r)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name != 'pull_request'
+        with:
+          path: ~/vrf-ko
+          key: vrf-ko-${{ steps.kernel.outputs.release }}
+
       - name: Carregar o módulo vrf
+        if: github.event_name != 'pull_request'
         run: |
-          if ! sudo modprobe vrf; then
+          # G1.14: com o módulo carregado, o teste de VRF em netns falha em vez de pular (e o
+          # passo netns do xtask também).
+          if sudo modprobe vrf; then
+            echo "COREROUTER_REQUIRE_VRF=1" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          ko=$(find ~/vrf-ko -name 'vrf.ko*' -print -quit 2>/dev/null || true)
+          if [ -z "$ko" ]; then
             pkg="linux-modules-extra-$(uname -r)"
-            cd "$RUNNER_TEMP"
+            mkdir -p ~/vrf-ko && cd "$RUNNER_TEMP"
             sudo apt-get update -qq   # o cache de pacotes acima pula o update
-            apt-get download "$pkg"
-            dpkg-deb --fsys-tarfile "$pkg"_*.deb | tar -x --wildcards '*/vrf.ko*'
-            ko=$(find . -name 'vrf.ko*' -print -quit)
-            if ! sudo insmod "$ko"; then
-              sudo apt-get install -y --no-install-recommends "$pkg"
-              sudo modprobe vrf
+            if timeout 120 apt-get download "$pkg"; then
+              dpkg-deb --fsys-tarfile "$pkg"_*.deb | tar -x --wildcards '*/vrf.ko*'
+              find . -name 'vrf.ko*' -exec cp {} ~/vrf-ko/ \;
+              ko=$(find ~/vrf-ko -name 'vrf.ko*' -print -quit)
             fi
           fi
-          lsmod | grep -w '^vrf'
+          if [ -n "$ko" ] && sudo insmod "$ko"; then
+            lsmod | grep -w '^vrf'
+            echo "COREROUTER_REQUIRE_VRF=1" >> "$GITHUB_ENV"
+          else
+            echo "::warning::módulo vrf indisponível (sem cache e download lento); o teste de VRF em netns fica de fora deste run"
+            echo "COREROUTER_REQUIRE_VRF=0" >> "$GITHUB_ENV"
+          fi
 
       - name: cargo xtask ci
-        run: cargo xtask ci
+        run: cargo xtask ci ${{ github.event_name == 'pull_request' && '--fast' || '' }}
 
   build:
     name: build (${{ matrix.os }})

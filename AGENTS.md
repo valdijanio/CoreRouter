@@ -147,7 +147,10 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 - Antes de cada commit: `cargo xtask ci` (fmt, clippy -D warnings, test, bench-check, netns,
   docs, layers, agents-sync, wasm). Ele para no primeiro FAIL; não faça commit com FAIL. O passo
   `test` usa o `cargo nextest` quando instalado (`cargo install --locked cargo-nextest`; metade do
-  tempo, **medido**).
+  tempo, **medido**). Teste que falha e passa ao repetir sai como FLAKY/"flaky netns test" e não
+  reprova: corrija-o depois (teste instável trava a fila; foram quatro em 2026-10-22).
+- **Portão em duas camadas:** `cargo xtask ci --fast` (sem `netns` e `bench-check`) é o do PR;
+  o completo roda localmente, no lote da fila de entrada e na `main`.
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.
@@ -155,8 +158,8 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 ## Integração: sempre por Pull Request, pela fila de entrada
 
 Nada entra na `main` sem PR com o CI verde. A proteção da `main` no GitHub impõe isso: PR
-obrigatório, os três checks do `ci`, branch **atualizada** com a `main`, vale para admin, sem
-force-push. Quem faz o merge é a **fila de entrada** da sessão principal, com a aprovação do
+obrigatório, os três checks do `ci` no próprio PR, vale para admin, sem force-push. A
+combinação dos PRs com a `main` é testada pela fila (abaixo). Quem faz o merge é a **fila de entrada** da sessão principal, com a aprovação do
 usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
 
 1. Trabalhe numa branch `stream/<id>-<slug>`, nunca na `main`. Nunca faça commit nem push na `main`.
@@ -166,19 +169,24 @@ usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
    `gh pr create --base main --title "<id>: <resumo>"`. O corpo do PR diz o que mudou, como
    testar (comandos ou cliques), o id da gap e, em feature nova, a seção `## Pesquisa` (veja
    "Pesquisa antes de implementar").
-4. O workflow `ci` (`.github/workflows/ci.yml`) roda no PR. Vermelho? Leia o log
-   (`gh run view --log-failed`), corrija na mesma branch e faça push de novo.
-5. Com o CI verde, **pare** e diga no relato "pronto para a fila: #<n>". Não ligue
-   `gh pr merge --auto` nem faça merge.
+4. Com o PR aberto, **pare** e diga no relato "pronto para a fila: #<n>" (o `cargo xtask ci`
+   local completo já passou; não espere o CI do GitHub). Não ligue `gh pr merge --auto` nem
+   faça merge. O CI do PR roda o portão rápido (`cargo xtask ci --fast`); se ele ou a fila
+   acusarem erro, a sessão principal avisa e você corrige na mesma branch.
 
 ### Fila de entrada (sessão principal)
 
 Quando há PRs prontos, a sessão principal pergunta ao usuário **uma vez por lote** ("N features
-prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh <pr>...`. Para cada PR, em
-ordem: traz a `main` para a branch, roda `cargo xtask docs fold` (consolida os arquivos de
-`docs/changes/`), envia, espera os checks exigidos do commit novo e faz o squash merge
-(`--match-head-commit`). Como a branch tem de estar atualizada, o CI de cada PR roda sobre a
-`main` em que ele vai entrar: o "sozinho passa, junto quebra" para no PR, não na `main`.
+prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh --batch <pr>...`:
+
+- **Lote:** junta a `main` e todos os PRs numa branch temporária, consolida `docs/changes/`
+  (`cargo xtask docs fold`) e roda **um** CI nessa combinação, que é o que a `main` vai ser:
+  o "sozinho passa, junto quebra" aparece aqui. Verde: squash de cada PR em ordem, sem esperar
+  mais CI, e um PR do fold. Um PR que conflita com o lote fica de fora (a sessão dona resolve).
+  Um CI (~2,5 min) por lote em vez de um por PR (**medido** na bateria, `docs/perf.md`).
+- **Lote vermelho:** a fila cai no modo um por um (`scripts/land.sh <pr>...`), que traz a
+  `main` para cada branch, faz o fold, envia, espera o CI do commit novo e faz o squash
+  (`--match-head-commit`): o primeiro que quebrar para a fila.
 
 A fila para no primeiro problema e diz qual PR e por quê:
 

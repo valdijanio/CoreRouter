@@ -265,7 +265,7 @@ fn failure_rolls_back_every_done_step() {
             .join("\n")
     };
     let before = mine(&["-d", "-o", "link", "show"]);
-    let before_addrs = mine(&["-o", "addr", "show"]);
+    let before_addrs = settled(&mine(&["-o", "addr", "show"]));
 
     // The config believes in a port the kernel does not have (unplugged NIC).
     let mut from = base.clone();
@@ -289,7 +289,14 @@ fn failure_rolls_back_every_done_step() {
 
     assert!(!exists("b1v20") && !exists("b1br"));
     assert_eq!(mine(&["-d", "-o", "link", "show"]), before);
-    assert_eq!(mine(&["-o", "addr", "show"]), before_addrs);
+    assert_eq!(settled(&mine(&["-o", "addr", "show"])), before_addrs);
+}
+
+/// `ip addr` output without the kernel's transient DAD state: an IPv6
+/// link-local address is `tentative` for a moment after the link comes up,
+/// so the same address read twice could differ (flaked in CI).
+fn settled(addrs: &str) -> String {
+    addrs.replace(" tentative", "")
 }
 
 #[test]
