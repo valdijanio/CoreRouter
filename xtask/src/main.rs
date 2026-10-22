@@ -191,6 +191,8 @@ const NETNS_TESTS: &[(&str, &str)] = &[
     ("corerouter-daemon", "netns"),
     // G5.2: two linux-backend daemons list each other as LLDP; MNDP is read.
     ("corerouter-daemon", "netns_l2"),
+    // G5.4: a router on this machine heard on a new link is local.
+    ("corerouter-discovery", "netns_local"),
 ];
 
 fn layers_step(root: &Path) -> Outcome {

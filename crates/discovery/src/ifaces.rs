@@ -24,6 +24,9 @@ pub struct Iface {
     pub link_local: Vec<Ipv6Addr>,
     /// Other usable IPv6 addresses.
     pub global: Vec<(Ipv6Addr, u8)>,
+    /// Addresses still in duplicate address detection: not usable yet,
+    /// but already this host's.
+    pub tentative: Vec<Ipv6Addr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -47,11 +50,14 @@ impl IfTable {
         self.by_name.iter().map(|(n, i)| (n.as_str(), i))
     }
 
-    /// True when `addr` is one of this host's IPv6 addresses.
+    /// True when `addr` is one of this host's IPv6 addresses, tentative
+    /// ones included.
     pub fn has_address(&self, addr: &Ipv6Addr) -> bool {
-        self.by_name
-            .values()
-            .any(|i| i.link_local.contains(addr) || i.global.iter().any(|(a, _)| a == addr))
+        self.by_name.values().any(|i| {
+            i.link_local.contains(addr)
+                || i.tentative.contains(addr)
+                || i.global.iter().any(|(a, _)| a == addr)
+        })
     }
 }
 
@@ -84,7 +90,11 @@ pub fn parse(text: &str) -> IfTable {
                 index,
                 ..Iface::default()
             });
-        if flags & (TENTATIVE | DAD_FAILED) != 0 {
+        if flags & DAD_FAILED != 0 {
+            continue;
+        }
+        if flags & TENTATIVE != 0 {
+            entry.tentative.push(addr);
             continue;
         }
         if addr.is_unicast_link_local() {
@@ -141,6 +151,7 @@ zz800000000000000000000000000002 05 40 20 80     bad0
         let veth = t.get("veth1").unwrap();
         assert_eq!(veth.index, 4);
         assert!(veth.link_local.is_empty());
+        assert!(t.has_address(&"fe80::2".parse().unwrap()));
         assert!(t.get("lo").unwrap().global.is_empty());
         assert!(t.get("bad0").is_none());
         assert_eq!(t.name_of(4), Some("veth1"));

@@ -48,7 +48,15 @@ pub struct NeighborRow {
     /// What "Connect to" gets; `None` when it advertises no CoreRouter
     /// management port (an LLDP or MNDP neighbor).
     pub connect_to: Option<String>,
+    /// Runs on another machine. Until authentication (G0.3) a router takes
+    /// management only from its own machine, so connecting would be
+    /// refused: the row is greyed out and a double click explains instead.
+    pub remote: bool,
 }
+
+/// Why a router on another machine cannot be managed from here yet.
+pub const REMOTE_HINT: &str = "Greyed out: on another machine. Until authentication (G0.3) a \
+     router accepts management only from its own machine (loopback).";
 
 /// An entry of the Saved tab. Deliberately no password: secrets wait for
 /// G0.3 and a secure store.
@@ -364,9 +372,12 @@ impl ConnectScreen {
                     n.uptime_secs.map(uptime_text).unwrap_or_default(),
                     n.interface.clone(),
                 ],
-                dimmed: n.connect_to.is_none(),
+                dimmed: n.connect_to.is_none() || n.remote,
             })
             .collect();
+        if neighbors.iter().any(|n| n.remote && n.connect_to.is_some()) {
+            ui.weak(REMOTE_HINT);
+        }
         let before = self.neighbors.selection(&rows);
         let out = table::show(
             ui,
@@ -398,20 +409,31 @@ impl ConnectScreen {
         }
     }
 
-    /// Fill "Connect to" from a neighbor; false when it cannot be managed.
+    /// Fill "Connect to" from a neighbor; false when it cannot be managed
+    /// from here (the Connect button still tries what was filled in).
     fn pick_neighbor(&mut self, n: &NeighborRow) -> bool {
+        let who = if n.identity.is_empty() {
+            &n.address
+        } else {
+            &n.identity
+        };
         match &n.connect_to {
+            Some(addr) if n.remote => {
+                self.connect_to = addr.clone();
+                self.set_error(format!(
+                    "{who} is on another machine: until authentication (G0.3) a router \
+                     accepts management only from its own machine, so the connection would \
+                     be refused. Run the GUI on that router (or tunnel its port to this \
+                     machine); Connect still tries the address."
+                ));
+                false
+            }
             Some(addr) => {
                 self.connect_to = addr.clone();
                 self.message = None;
                 true
             }
             None => {
-                let who = if n.identity.is_empty() {
-                    &n.address
-                } else {
-                    &n.identity
-                };
                 self.set_error(format!(
                     "{who} ({}) advertises no CoreRouter management port",
                     n.protocol
@@ -594,6 +616,48 @@ mod tests {
         assert!(
             matches!(&s.message, Some((false, m)) if m.contains("no CoreRouter management port"))
         );
+    }
+
+    #[test]
+    fn a_remote_neighbor_explains_instead_of_connecting() {
+        let ctx = egui::Context::default();
+        let mut s = ConnectScreen::new(Vec::new());
+        let mut far = neighbor("far", Some("10.0.0.3:7979"));
+        far.remote = true;
+        let rows = [neighbor("a", Some("127.0.0.1:7979")), far];
+        let mut t = 0.0;
+        let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
+        assert!(
+            texts
+                .iter()
+                .any(|(x, _)| x.starts_with("Greyed out: on another"))
+        );
+        // Double click: filled, explained, no connection attempt.
+        let row = at(&texts, "r-far");
+        let mut both = click_events(row);
+        both.extend(click_events(row));
+        let mut action = frame(&ctx, &mut s, &rows, both, &mut t).0;
+        for _ in 0..2 {
+            action = action.or(frame(&ctx, &mut s, &rows, Vec::new(), &mut t).0);
+        }
+        assert_eq!(action, None);
+        assert_eq!(s.connect_to, "10.0.0.3:7979");
+        assert!(matches!(&s.message, Some((false, m)) if m.contains("G0.3")));
+        // The operator may still try it by hand.
+        let (_, texts) = frame(&ctx, &mut s, &rows, Vec::new(), &mut t);
+        let mut action = frame(
+            &ctx,
+            &mut s,
+            &rows,
+            click_events(at(&texts, "Connect")),
+            &mut t,
+        )
+        .0;
+        action = action.or(frame(&ctx, &mut s, &rows, Vec::new(), &mut t).0);
+        assert_eq!(action, Some(ConnectAction::Connect("10.0.0.3:7979".into())));
+        // Without remote neighbors there is no hint.
+        let (_, texts) = frame(&ctx, &mut s, &rows[..1], Vec::new(), &mut t);
+        assert!(!texts.iter().any(|(x, _)| x.starts_with("Greyed out")));
     }
 
     #[test]

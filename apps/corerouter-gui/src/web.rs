@@ -146,6 +146,10 @@ fn neighbor_row(r: &Value) -> NeighborRow {
         connect_to: ws
             .filter(|_| !address.is_empty())
             .map(|p| format!("ws://{host}:{p}/ws")),
+        // The WebSocket listens on loopback only until G0.3.
+        remote: !address
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|a| a.is_loopback()),
     }
 }
 

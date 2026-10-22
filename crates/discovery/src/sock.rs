@@ -9,6 +9,10 @@ use socket2::{Domain, Protocol, Socket, Type};
 
 /// IPv6 all-nodes, link scope.
 pub const ALL_NODES: Ipv6Addr = Ipv6Addr::new(0xff02, 0, 0, 0, 0, 0, 0, 1);
+/// Broadcast address of the loopback network: every CRDP socket of this
+/// host bound to `0.0.0.0:port` gets a copy, and it never leaves the machine.
+/// The transport of the virtual lab (docs/discovery.md, "Lab virtual").
+pub const LOOPBACK_BROADCAST: Ipv4Addr = Ipv4Addr::new(127, 255, 255, 255);
 /// How long a receive blocks, so threads notice when they should stop.
 pub const RECV_TIMEOUT: Duration = Duration::from_millis(500);
 
@@ -68,6 +72,20 @@ pub fn send_v4(from: Ipv4Addr, broadcast: Ipv4Addr, packet: &[u8], port: u16) ->
     let s = UdpSocket::bind(SocketAddrV4::new(from, 0))?;
     s.set_broadcast(true)?;
     s.send_to(packet, SocketAddrV4::new(broadcast, port))
+        .map(|_| ())
+}
+
+/// The sender of the loopback transport: bound to `127.0.0.1`, so the
+/// broadcast goes out of `lo` only.
+pub fn loopback_sender() -> io::Result<UdpSocket> {
+    let s = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0))?;
+    s.set_broadcast(true)?;
+    Ok(s)
+}
+
+/// Send one datagram to `127.255.255.255:port` (see [`LOOPBACK_BROADCAST`]).
+pub fn send_loopback(sock: &UdpSocket, packet: &[u8], port: u16) -> io::Result<()> {
+    sock.send_to(packet, SocketAddrV4::new(LOOPBACK_BROADCAST, port))
         .map(|_| ())
 }
 

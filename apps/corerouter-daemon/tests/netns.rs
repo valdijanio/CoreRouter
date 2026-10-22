@@ -68,6 +68,9 @@ fn config_dir(name: &str, address: Option<&str>) -> PathBuf {
 fn daemon(netns: Option<u32>, dir: &Path, log: &str) -> Kill {
     let log = std::fs::File::create(std::env::temp_dir().join(log)).unwrap();
     let mut c = in_ns(netns, DAEMON);
+    // Virtual ports over real veths: the interfaces transport, not the
+    // lab's loopback default (G5.4).
+    c.args(["--discovery-transport", "interfaces"]);
     c.args(["--control", "7979", "--config-dir"])
         .arg(dir)
         .env("RUST_LOG", "info,corerouter_discovery=debug")

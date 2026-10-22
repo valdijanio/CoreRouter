@@ -14,13 +14,11 @@ corerouter-engine.workspace = true
 corerouter-proto-discovery.workspace = true
 ipnet.workspace = true
 log.workspace = true
+serde_json.workspace = true
 # Safe wrapper for what std's UdpSocket lacks: SO_REUSEADDR/SO_REUSEPORT
 # (daemon, GUI and other daemons on one host share the CRDP port),
 # IPV6_V6ONLY and the IPv6 multicast interface.
 socket2 = { version = "0.6.5", features = ["all"] }
-
-[dev-dependencies]
-serde_json.workspace = true
 
 [lints]
 workspace = true

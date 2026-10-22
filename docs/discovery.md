@@ -107,7 +107,40 @@ Depois de decodificar, o receptor:
 interfaces LAN/WAN, então não sabe qual porta é WAN; anunciar numa WAN contaria à internet a
 identity, a versão e as portas de gerência. O operador liga a descoberta nomeando as
 interfaces do lado LAN: `ip.neighbor.discovery.set {"interfaces": ["ether2", "bridge1"]}`.
-Remover uma interface (`interface.remove`) também a tira da lista.
+Remover uma interface (`interface.remove`) também a tira da lista. Isso vale para o
+`--backend linux`; o lab virtual tem outro padrão (seção 5.1).
+
+### 5.1 Lab virtual: o "fio" é o loopback (G5.4)
+
+As portas `ether1..8` do `--backend virtual` só existem na memória do daemon; anunciar pelas
+interfaces de mesmo nome do host não faria sentido (e poderia vazar para uma rede real). Por
+isso, com `--backend virtual` o `Agent` usa `Transport::Loopback`:
+
+| Item | Lab virtual | `--backend linux` |
+|---|---|---|
+| Envio | broadcast para `127.255.255.255:7979`, de um socket ligado a `127.0.0.1` (sai só por `lo`); um datagrama por porta virtual ativa | `ff02::1` + broadcast dirigido por interface real (seção 2) |
+| IPv6 / interfaces do kernel | não usa: nunca lê `/proc/net/if_inet6`, nunca entra em grupo multicast | como na seção 2 |
+| Recepção | só origem loopback (`127.0.0.0/8`, `::1`); o resto é descartado | origem loopback é descartada (é o fio dos labs, não um enlace do roteador) |
+| Interface do vizinho | a porta **de mesmo nome** da que o anúncio diz ter saído (TLV 8), se ela existe, não está desabilitada e tem descoberta ativa | a interface de chegada (escopo do link-local ou sub-rede) |
+| Padrão | lab novo (config não restaurada) roda `ip.neighbor.discovery.set {"interfaces": ["ether1"]}` ao subir | nenhuma interface |
+
+`--discovery-transport interfaces|loopback` troca a escolha feita pelo backend: o teste em
+namespace do daemon (`apps/corerouter-daemon/tests/netns.rs`) roda labs virtuais sobre veths
+chamadas `ether1` com `interfaces`, para exercitar o caminho real sem root.
+
+Mapeamento escolhido: **portas de mesmo nome de todos os labs do computador estão no mesmo
+fio** — `ether1` de um lab "vê" a `ether1` dos outros, `ether2` a `ether2`, e assim por diante.
+É determinístico, não cria uma linha por par de portas e permite montar topologias simples só
+escolhendo em quais portas a descoberta fica ativa. O vizinho aparece com `interface` e
+`remote_interface` iguais.
+
+O padrão `ether1` passa pelo `Session::execute` (fica no journal; com `--config-dir` é salvo, e
+uma escolha posterior do operador vence porque config restaurada não recebe o padrão). Ele só
+existe no lab porque loopback nunca sai da máquina: nada é contado à rede. A GUI nativa (que
+escuta em `0.0.0.0:7979`) recebe os mesmos broadcasts e mostra cada lab como
+`127.0.0.1:<porta de controle>`. Para testar: `corerouter-daemon --control 7979` e
+`corerouter-daemon --control 7981` em dois terminais, `ip.neighbor.list` em qualquer um, ou
+`corerouter-gui` sem `--connect` (aba Neighbors).
 
 ## 6. Ponto de integração para outros protocolos (G5.2)
 
@@ -157,7 +190,16 @@ No laboratório virtual (`--backend virtual`) só roda o CRDP: não há enlace d
   Comment, Save to list, Connect e "Virtual lab". Direita: abas Neighbors e Saved com Find.
   Clique num vizinho preenche Connect to; duplo clique preenche e conecta.
   - Nativo: escuta CRDP direto nas interfaces da máquina (`corerouter_discovery::Listener`,
-    nunca envia). Um vizinho que roda na própria máquina vira `127.0.0.1:<porta>`.
+    nunca envia). Um vizinho que roda na própria máquina vira `127.0.0.1:<porta>`. "Na própria
+    máquina" = o bind no endereço de origem funciona ou o endereço IPv6 é de uma interface local
+    (inclusive tentativo, em DAD). O veredito "não é local" vale só 2 s e a tabela de interfaces é
+    relida (no máximo 1×/s): um enlace que acabou de subir, depois da GUI, não fica marcado como
+    remoto para sempre (G5.4; antes o duplo clique ia para `[fe80::…%2]:<porta>` e era recusado).
+  - Vizinho em **outra máquina** fica cinza, com a linha "Greyed out: on another machine…" acima
+    da tabela: até a autenticação (G0.3) o canal de controle só aceita loopback. Clique/duplo
+    clique preenche Connect to e explica, sem tentar conectar; o botão Connect tenta o que estiver
+    no campo (nada bloqueia o endereço digitado). Na web, "outra máquina" = endereço que não é
+    loopback.
   - Web: o navegador não escuta UDP; a aba Neighbors mostra o `ip.neighbor.list` do daemon que
     serviu a página, e Connect to usa a porta WebSocket anunciada.
   - Login e senha ficam **desabilitados** até a autenticação (G0.3). Saved guarda só endereço,
@@ -171,9 +213,15 @@ No laboratório virtual (`--backend virtual`) só roda o CRDP: não há enlace d
   "Connect to" enganoso — e conectar ainda exige alcançar o canal de controle, que hoje só
   aceita loopback (G0.3).
 - O CRDP nunca responde, então não serve para amplificação.
+- Lab virtual: só fala e escuta pelo loopback; qualquer processo local pode forjar um vizinho de
+  lab, o que não dá a ele nada que já não tenha (o canal de controle também é loopback).
 - Assinatura dos anúncios com o segredo da malha e transporte entre vizinhos sem IP vêm no G5.3.
 
 ## Histórico de revisão
 
 - 2026-10-22 — v1 (G5.1).
 - 2026-10-22 — LLDP e MNDP no §6 (G5.2 Parte 2).
+- 2026-10-22 — seção 5.1: lab virtual pelo loopback, portas de mesmo nome no mesmo fio,
+  `ether1` ligada por padrão no lab (G5.4).
+- 2026-10-22 — seção 7: detecção de "vizinho local" sem cache negativo permanente; vizinho remoto
+  cinza com explicação (G5.4).

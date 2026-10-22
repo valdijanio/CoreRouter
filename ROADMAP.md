@@ -278,6 +278,37 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   node id, filtro por protocolo, MNDP sintético, interface sem descoberta não grava, TTL 0
   apaga; ~14 s **medido**); helpers dos testes netns do daemon em `tests/common`.
 
+- 2026-10-22 — G5.4: no lab virtual a descoberta CRDP usa o loopback do host. Antes, um
+  `corerouter-daemon` virtual anunciava pelas interfaces **reais** com o nome das portas do lab
+  (`ether1` não existe no host) e, sem interfaces por padrão, não anunciava nada: a aba Neighbors
+  da GUI ficava vazia. Agora `corerouter_discovery::Transport::Loopback` (padrão de
+  `--backend virtual`; `--discovery-transport interfaces|loopback` troca) manda um broadcast para
+  `127.255.255.255:7979` por porta virtual ativa, de um socket ligado a `127.0.0.1` — nada sai da
+  máquina, nada lê `/proc/net/if_inet6` — e só ouve origem loopback. Portas de mesmo nome de todos
+  os labs do computador estão no mesmo fio: o vizinho entra na porta com o nome do TLV de
+  interface, se ela existe, está habilitada e tem descoberta. Lab novo (config não restaurada)
+  roda `ip.neighbor.discovery.set {"interfaces": ["ether1"]}` ao subir, pelo `Session::execute`.
+  `--backend linux` inalterado, e passa a descartar origem loopback (é o fio dos labs). O teste
+  em namespace do G5.1 roda labs sobre veths e agora pede `--discovery-transport interfaces`.
+  4 testes novos: dois labs e o `Listener` da GUI se veem pelo loopback sem namespace nem root
+  (`127.0.0.1:7979`/`:7981`), portas de nomes diferentes não se veem, o transporte de interfaces
+  ignora o fio do lab, e o mapeamento de porta (unitário). Teste manual (**medido**): dois
+  daemons virtuais (`--control 7981`/`7983`, a 7979 estava ocupada por outro daemon) se listaram
+  em `ip.neighbor.list` em `ether1`, e a `corerouter-gui --control 7990` sem `--connect` mostrou
+  os dois na aba Neighbors como `127.0.0.1 (this machine)` (screenshot conferido).
+  No mesmo PR, a pedido do usuário: (a) o lab não tenta mais broadcast de endereços que só existem
+  na config (sumiu o `WARN cannot broadcast from 10.0.0.1 on ether1`); no linux o aviso sai uma vez
+  por problema (teste com logger que captura); (b) o `Listener` da GUI cacheava para sempre "não é
+  local" — a tabela de interfaces era lida antes de a veth existir (releitura a cada 10 s) e o
+  bind no link-local falha porque o datagrama chega com o escopo da outra ponta; o duplo clique ia
+  para `[fe80::…%2]:7981` e era recusado. Agora "não" vale 2 s, a tabela é relida (≤ 1×/s) e
+  endereço tentativo conta como local. Teste em netns (`netns_local`: GUI antes do enlace) falhou
+  antes da correção e passa 5/5 depois (**medido**); (c) vizinho de outra máquina fica cinza com o
+  motivo (G0.3) e o duplo clique explica em vez de tentar (teste headless); Connect continua
+  tentando o endereço do campo. Teste manual em netns descartável: daemon local + daemon num
+  namespace filho + GUI — local "(this machine)", remoto cinza com a dica (screenshot conferido).
+  Esforço do agente ~3 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -296,3 +327,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.15.
 - 2026-10-22 — log do G1.16.
 - 2026-10-22 — log do G5.2 (Parte 2).
+- 2026-10-22 — log do G5.4.
