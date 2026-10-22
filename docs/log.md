@@ -829,3 +829,13 @@ continuação indentadas).
   (~90 % decodificam e dão boot), 5 000 casos por teste do canal de controle, 20 000 sessões MCP.
   Nada a corrigir nos alvos; um bug achado no próprio oráculo do `wire` (entrada só `\r`) foi
   corrigido antes da rodada.
+
+- 2026-10-22 — processo: Pontos quentes que sobravam viram arquivos (pedido do usuário, depois da rodada de 7 agentes):
+  os `pub mod` do engine, do model e do mcp são gerados de `src/` (`build-support/root_modules.rs`);
+  estado de execução de feature no `Session` por tipo (`s.ext_mut::<T>()`, `crates/engine/src/ext.rs`)
+  em vez de campo novo; serviços do daemon em `apps/corerouter-daemon/src/service/<nome>.rs` com
+  `SERVICE` (opções de linha de comando e `start`) — NTP, syslog remoto e métricas migrados, o
+  `main.rs` não muda mais por serviço; módulos do kernel do CI em `ci/kernel-modules/<módulo>`.
+  De quebra, duas falhas de pasta de build compartilhada entre worktrees: o `xtask` acha a raiz do
+  workspace a partir do diretório atual (não do `CARGO_MANIFEST_DIR` do build), e os geradores
+  vigiam `src/` por caminho absoluto (senão reaproveitavam a lista de outra worktree).

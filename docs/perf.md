@@ -203,3 +203,10 @@ GitHub Actions conta grátis):
 | 10 PRs integrados, de ponta a ponta | 40 min (com as duas paradas e o espelho lento) |
 | Conflito de texto / quebra de integração | parados pela fila em 3 s / 57 s; corrigidos pela dona em 5 s / 10 s |
 | Falso negativo local sob carga | 1 em 10 (teste de latência; corrigido) |
+
+**Conflitos da rodada de 7 agentes** (**medido**, 2026-10-22): 6 arquivos em conflito em 3 PRs;
+5 eram linha acrescentada no fim de lista compartilhada (`pub mod`, campo do `Session`, `spawn`
+do daemon, passo do `ci.yml`), 1 era código de verdade (`hal-linux/src/plan.rs`, drift × bonding).
+Simulação dos merges de cada par de PRs nas listas de módulos: acrescentando no fim, 7 de 7 pares
+conflitam; em ordem alfabética, 2 de 7; geradas dos arquivos, 0. Com as listas geradas, só 1 dos
+7 PRs (o do conflito de código) teria ficado fora do primeiro lote, em vez de 3.
