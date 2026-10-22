@@ -2,6 +2,7 @@
 
 use std::str::FromStr;
 
+use corerouter_model::IfName;
 use serde_json::Value;
 
 use crate::{EngineError, Result};
@@ -75,4 +76,42 @@ pub fn opt_text(p: &Value, key: &str, max: usize) -> Result<Option<String>> {
         return Err(EngineError::bad(key, "control characters are not allowed"));
     }
     Ok(Some(s.to_owned()))
+}
+
+/// Optional list of interface names: a JSON array of strings or, for the
+/// CLI, one comma-separated string (`"ether2,ether3"`). Duplicates are
+/// dropped; at most `max` names.
+pub fn opt_names(p: &Value, key: &str, max: usize) -> Result<Option<Vec<IfName>>> {
+    let raw: Vec<&str> = match p.get(key) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) if s.trim().is_empty() => Vec::new(),
+        Some(Value::String(s)) => s.split(',').collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .ok_or_else(|| EngineError::bad(key, "must be a list of interface names"))
+            })
+            .collect::<Result<_>>()?,
+        Some(_) => {
+            return Err(EngineError::bad(
+                key,
+                "must be a list of interface names or \"a,b\"",
+            ));
+        }
+    };
+    if raw.len() > max {
+        return Err(EngineError::bad(key, format!("at most {max} interfaces")));
+    }
+    let mut out: Vec<IfName> = Vec::with_capacity(raw.len());
+    for name in raw {
+        let name: IfName = name
+            .trim()
+            .parse()
+            .map_err(|e: corerouter_model::ParseError| EngineError::bad(key, e.to_string()))?;
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(Some(out))
 }

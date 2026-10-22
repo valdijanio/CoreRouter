@@ -30,7 +30,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G1.2 | `hal-linux` aplica via rtnetlink | hal-linux | links (up/down, MTU), VLAN, bridge, endereços; transação com rollback; testes em network namespace (sem root na CI via `unshare`) | 16 h | feito (`stream/G1.2-netlink`) |
 | G1.3 | Reconciliação e drift | hal-linux, engine | Lê estado do kernel, `config.drift` lista divergências; boot semeia `disabled` do estado do kernel (hoje `Session::new` aplica `disabled=false` e sobe portas descobertas que estavam down) | 6 h | aberto |
 | G1.4 | Safe Mode | engine, ui | `config.commit {confirm_timeout}`; sem `config.confirm` no prazo → rollback automático; botão Safe Mode na barra | 6 h | aberto |
-| G1.5 | Rotas estáticas e VRF | model, engine, hal-linux, ui | `ip.route.add/remove/list`, distance, VRF; tabela de rotas ao vivo na janela Routes | 10 h | aberto |
+| G1.5 | Rotas estáticas e VRF | model, engine, hal-linux, ui | `ip.route.add/remove/list`, distance, VRF; tabela de rotas ao vivo na janela Routes. Feito: `ip.route.add/set/remove/list` (IPv4/IPv6, gateway IP / interface / `ip%interface`, distance → métrica do kernel, conectadas derivadas com flags `ADC`), `ip.vrf.add/set/remove/list` (VRF = interface tipo `vrf` com tabela própria), `model::route::reach` compartilhado por engine e `hal-linux`, plano com rotas + VRF (links "reconstruídos" têm rotas removidas/recolocadas explicitamente), janela IP › Routes no padrão G1.9. Fora: ECMP, blackhole, pref-src, VRF pela GUI | 10 h | feito (`stream/G1.5-static-routes`) |
 | G1.6 | Imagem Buildroot | `os/` (novo) | Imagem x86_64 A/B + squashfs + dm-verity bootando o daemon em QEMU; script de build reprodutível | 20 h | aberto |
 | G1.7 | Estatísticas via netlink | hal-linux | `poll` e `discover_links` via netlink (substituem sysfs, que mostra o netns de quem montou `/sys`, não o do processo) | 3 h | aberto |
 | G1.8 | Bonding (802.3ad, active-backup) | model, engine (`cmd/interface.rs`), ui | `interface.bonding.add {name, slaves, mode}`; slave não pode ser porta de bridge nem ter endereço; mesmo padrão de dependências do G1.1 | 4 h | aberto |
@@ -80,3 +80,4 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.
 - 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.
 - 2026-10-21 — G0.4 feito (GUI cliente do daemon, nativo e web; WebSocket com Origin; `--web-root`).
+- 2026-10-21 — G1.5 feito (rotas estáticas IPv4/IPv6, VRF básico, janela Routes).

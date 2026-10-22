@@ -41,6 +41,8 @@ pub(crate) struct Iface {
     pub parent: Option<String>,
     pub vlan_id: Option<String>,
     pub bridge: Option<String>,
+    pub vrf: Option<String>,
+    pub table: Option<String>,
 }
 
 impl Iface {
@@ -58,6 +60,8 @@ impl Iface {
             parent: opt("parent"),
             vlan_id: opt("vlan_id"),
             bridge: opt("bridge"),
+            vrf: opt("vrf"),
+            table: opt("table"),
         }
     }
 
@@ -594,12 +598,12 @@ fn props_sends(
 
 /// New windows open down and to the right of the previous one, like WinBox,
 /// instead of all on the same spot.
-fn cascade(area: egui::Rect, id: u64) -> egui::Pos2 {
+pub(crate) fn cascade(area: egui::Rect, id: u64) -> egui::Pos2 {
     let step = (id % 8) as f32 * 28.0;
     area.center() + egui::vec2(-160.0 + step, -200.0 + step)
 }
 
-fn opt_text(s: &str) -> Value {
+pub(crate) fn opt_text(s: &str) -> Value {
     if s.is_empty() { Value::Null } else { json!(s) }
 }
 
@@ -640,6 +644,12 @@ fn info(i: &Iface) -> String {
     }
     if let Some(b) = &i.bridge {
         parts.push(format!("port of {b}"));
+    }
+    if let Some(v) = &i.vrf {
+        parts.push(format!("in VRF {v}"));
+    }
+    if let Some(t) = &i.table {
+        parts.push(format!("routing table {t}"));
     }
     parts.join(", ")
 }
@@ -894,7 +904,7 @@ fn dialog_body(
         .or(pressed)
 }
 
-fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
+pub(crate) fn field(ui: &mut Ui, label: &str, value: &mut String, hint: &str) {
     ui.label(label);
     ui.add(
         TextEdit::singleline(value)
@@ -929,7 +939,8 @@ fn bridge_ports(
         }
         let candidates: Vec<String> = ifaces
             .iter()
-            .filter(|i| i.kind != "bridge" && i.bridge.is_none())
+            .filter(|i| i.kind != "bridge" && i.kind != "vrf")
+            .filter(|i| i.bridge.is_none() && i.vrf.is_none())
             .map(|i| i.name.clone())
             .collect();
         ui.horizontal(|ui| {

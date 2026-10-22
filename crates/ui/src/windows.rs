@@ -81,7 +81,6 @@ impl Win {
     /// `Some(gap id)` while the area has no engine commands yet.
     pub fn gap(self) -> Option<&'static str> {
         match self {
-            Win::Routes => Some("G1.5"),
             Win::Firewall => Some("G2.1"),
             Win::Cgnat => Some("G2.3"),
             Win::Ospf => Some("G3.4"),
@@ -96,6 +95,7 @@ impl Win {
         match self {
             Win::Interfaces => [780.0, 520.0],
             Win::Addresses | Win::Log => [640.0, 260.0],
+            Win::Routes => [700.0, 320.0],
             _ => [380.0, 200.0],
         }
     }
@@ -111,6 +111,7 @@ impl CoreRouterUi {
         match win {
             Win::Interfaces => self.interfaces(ui),
             Win::Addresses => self.addresses(ui),
+            Win::Routes => self.routes(ui),
             Win::Bgp => self.bgp(ui),
             Win::Identity => self.identity(ui),
             Win::History => self.history(ui),
@@ -120,7 +121,7 @@ impl CoreRouterUi {
     }
 
     /// Names from the cached `interface.list`, optionally of one type.
-    fn interface_names(&self, kind: Option<&str>) -> Vec<String> {
+    pub(crate) fn interface_names(&self, kind: Option<&str>) -> Vec<String> {
         self.cache
             .interfaces
             .iter()
