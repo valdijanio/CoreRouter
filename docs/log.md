@@ -847,3 +847,6 @@ continuação indentadas).
   exigidos passam do mesmo jeito): o PR de fold de cada lote da fila custava um CI inteiro (~3 min)
   para mudar só `.md`, e num lote de 1 PR dobrava o tempo. Lote, `main` e `workflow_dispatch`
   continuam com o CI completo.
+
+- 2026-10-22 — processo: Push na `main` que só mexe em `docs/` (o fold de cada lote) também roda só `cargo xtask docs` no
+  CI, comparando com o commit anterior; antes rodava o completo e enfileirava atrás do run do lote.
