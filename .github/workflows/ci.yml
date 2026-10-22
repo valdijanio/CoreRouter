@@ -9,7 +9,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # bench/**: base descartável da bateria de testes da fila de entrada (PRs sintéticos que
+    # nunca vão para a main).
+    branches: [main, "bench/**"]
   # Rodar à mão numa branch (Actions → ci → Run workflow).
   workflow_dispatch:
 
