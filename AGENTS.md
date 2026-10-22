@@ -155,8 +155,8 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 ## Integração: sempre por Pull Request, pela fila de entrada
 
 Nada entra na `main` sem PR com o CI verde. A proteção da `main` no GitHub impõe isso: PR
-obrigatório, os três checks do `ci`, branch **atualizada** com a `main`, vale para admin, sem
-force-push. Quem faz o merge é a **fila de entrada** da sessão principal, com a aprovação do
+obrigatório, os três checks do `ci` no próprio PR, vale para admin, sem force-push. A
+combinação dos PRs com a `main` é testada pela fila (abaixo). Quem faz o merge é a **fila de entrada** da sessão principal, com a aprovação do
 usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
 
 1. Trabalhe numa branch `stream/<id>-<slug>`, nunca na `main`. Nunca faça commit nem push na `main`.
@@ -174,11 +174,16 @@ usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
 ### Fila de entrada (sessão principal)
 
 Quando há PRs prontos, a sessão principal pergunta ao usuário **uma vez por lote** ("N features
-prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh <pr>...`. Para cada PR, em
-ordem: traz a `main` para a branch, roda `cargo xtask docs fold` (consolida os arquivos de
-`docs/changes/`), envia, espera os checks exigidos do commit novo e faz o squash merge
-(`--match-head-commit`). Como a branch tem de estar atualizada, o CI de cada PR roda sobre a
-`main` em que ele vai entrar: o "sozinho passa, junto quebra" para no PR, não na `main`.
+prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh --batch <pr>...`:
+
+- **Lote:** junta a `main` e todos os PRs numa branch temporária, consolida `docs/changes/`
+  (`cargo xtask docs fold`) e roda **um** CI nessa combinação, que é o que a `main` vai ser:
+  o "sozinho passa, junto quebra" aparece aqui. Verde: squash de cada PR em ordem, sem esperar
+  mais CI, e um PR do fold. Um PR que conflita com o lote fica de fora (a sessão dona resolve).
+  Um CI (~2,5 min) por lote em vez de um por PR (**medido** na bateria, `docs/perf.md`).
+- **Lote vermelho:** a fila cai no modo um por um (`scripts/land.sh <pr>...`), que traz a
+  `main` para cada branch, faz o fold, envia, espera o CI do commit novo e faz o squash
+  (`--match-head-commit`): o primeiro que quebrar para a fila.
 
 A fila para no primeiro problema e diz qual PR e por quê:
 
