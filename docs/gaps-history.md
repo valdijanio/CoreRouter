@@ -44,3 +44,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-22 — G2.1b (firewall: lockout, sombras, defaults, modelos, zonas, descrição) feito.
 - 2026-10-22 — G1.21 (hierarquia das janelas internas: trazer à frente, filho sobre o pai, fechar junto, Ctrl+Tab) adicionado e feito.
 - 2026-10-22 — processo: arquivos de mudança por PR (`docs/changes/`) e fila de entrada; o status das gaps passa a vir do fold
+- 2026-10-22 — G0.7 parcial (resources, prompts, completions); resto vira G0.7b
