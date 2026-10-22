@@ -29,6 +29,15 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   porta física e diz o que remover antes (endereço, VLAN filha, porta de bridge). Janela
   Interfaces com coluna Info, remover por linha e formulários VLAN/bridge/loopback/porta. 15
   testes novos no engine + 1 na UI; screenshot conferido. Bonding virou G1.8.
+- 2026-10-21 — G0.6: persistência da config. `model::persist` (de)serializa running + histórico
+  em JSON versionado (`format_version` 1, limite de 64 MiB, invariantes conferidas: revisões
+  crescentes, running = última revisão). Trait `ConfigStorage` no engine (slots current/previous +
+  quarentena) com `MemoryStorage` (GUI, wasm, testes); crate novo `corerouter-storage-fs` (L4):
+  `running.json` / `running.json.prev`, escrita temp + fsync + rename + fsync do diretório, modo
+  0600. `Session::with_storage` restaura o slot legível mais novo, salva após cada commit e expõe
+  `storage` no `state.inspect`; falha ao salvar não desfaz o commit (log + `last_error`).
+  `corerouter-daemon --config-dir <dir>` (padrão `/config` só com `--backend linux`). 24 testes
+  novos (3 proptest). Teste manual: endereço sobreviveu a reinício do daemon.
 
 - 2026-10-21 — G1.2: `LinuxHal::apply` aplica no kernel via `rtnetlink` 0.23 (tokio
   current-thread encapsulado no `hal-linux`): links up/down e MTU, VLAN 802.1Q, bridge + portas,
@@ -42,4 +51,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
+- 2026-10-21 — log do G0.6.
 - 2026-10-21 — log do G1.2.

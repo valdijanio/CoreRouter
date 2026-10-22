@@ -79,6 +79,27 @@ impl ConfigStore {
         }
     }
 
+    /// Rebuild a store from persisted parts (see `persist::decode`, which
+    /// checks that `history` is non-empty, ordered and ends at `running`).
+    /// The candidate starts clean; history keeps the newest
+    /// [`Self::DEFAULT_MAX_HISTORY`] revisions.
+    pub fn restore(running: Config, mut history: Vec<Revision>) -> Self {
+        if history.is_empty() {
+            return Self::new(running);
+        }
+        let max_history = Self::DEFAULT_MAX_HISTORY;
+        if history.len() > max_history {
+            let excess = history.len() - max_history;
+            history.drain(..excess);
+        }
+        Self {
+            candidate: running.clone(),
+            running,
+            history,
+            max_history,
+        }
+    }
+
     pub fn running(&self) -> &Config {
         &self.running
     }
