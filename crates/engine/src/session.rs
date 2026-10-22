@@ -14,6 +14,7 @@ use crate::dhcp6_client::Dhcp6Runtime;
 use crate::dom_watch::DomWatch;
 use crate::firewall_dyn::DynamicLists;
 use crate::link_watch::LinkWatch;
+use crate::metrics::EngineCounters;
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
@@ -87,6 +88,8 @@ pub struct Session {
     pub(crate) links: LinkWatch,
     /// SFP diagnostics past their thresholds (operational; G1.20).
     pub(crate) dom: DomWatch,
+    /// Commands and commits since start (operational; G4.4).
+    pub(crate) counters: EngineCounters,
 }
 
 /// Session shared between the UI thread and the control server.
@@ -173,6 +176,7 @@ impl Session {
             in_batch: false,
             links: LinkWatch::default(),
             dom: DomWatch::default(),
+            counters: EngineCounters::default(),
         }
     }
 
@@ -183,6 +187,13 @@ impl Session {
 
     /// The one door: UI, CLI, control channel and MCP all call this.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
+        let result = self.execute_counted(id, params);
+        let journal = cmd::find(id).map(|spec| spec.journal);
+        self.counters.note_command(journal, result.is_ok());
+        result
+    }
+
+    fn execute_counted(&mut self, id: &str, params: &Value) -> Result<Value> {
         self.expire_safe_mode();
         let spec = cmd::find(id).ok_or_else(|| unknown_command(id))?;
         self.permit(auth::required_group(spec.id, spec.journal))
@@ -336,6 +347,12 @@ impl Session {
     }
 
     fn commit_checked(&mut self, comment: &str, lockout: bool) -> Result<u32> {
+        let result = self.commit_counted(comment, lockout);
+        self.counters.note_commit(result.is_ok());
+        result
+    }
+
+    fn commit_counted(&mut self, comment: &str, lockout: bool) -> Result<u32> {
         let issues = validate_all(self.store.candidate());
         if !issues.is_empty() {
             return Err(EngineError::Validation(issues));
@@ -481,6 +498,11 @@ impl Session {
 
     pub(crate) fn hal_mut(&mut self) -> &mut dyn Hal {
         self.hal.as_mut()
+    }
+
+    /// Where state outside the revisions is kept (DHCP leases, G4.7c).
+    pub(crate) fn storage_mut(&mut self) -> &mut dyn ConfigStorage {
+        self.storage.as_mut()
     }
 
     pub fn backend(&self) -> String {

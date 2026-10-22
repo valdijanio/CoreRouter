@@ -125,8 +125,16 @@ fn rpad(s: &str, width: usize) -> String {
 }
 
 /// The numbered table of `print` (or, `numbers = false`, a plain table for
-/// query results such as `/config history`).
-pub fn table(rows: &[Value], shape: &Shape, opts: &PrintOpts, numbers: bool) -> Vec<Line> {
+/// query results such as `/config history`). With `max` (the terminal's
+/// width), the columns that do not fit are left out and named on a last
+/// line, like RouterOS: a wide table never stretches the terminal.
+pub fn table(
+    rows: &[Value],
+    shape: &Shape,
+    opts: &PrintOpts,
+    numbers: bool,
+    max: Option<usize>,
+) -> Vec<Line> {
     let (flag_cols, legend) = flag_fields(shape, rows);
     let mut cols: Vec<String> = match &opts.proplist {
         Some(p) => p.clone(),
@@ -185,6 +193,27 @@ pub fn table(rows: &[Value], shape: &Shape, opts: &PrintOpts, numbers: bool) -> 
                 .unwrap_or(0)
         })
         .collect();
+    // Columns that fit `max`, in order; at least the first one. An explicit
+    // `proplist` is shown whole: the operator asked for those columns.
+    let lead_w = if numbers { num_w + 2 } else { 0 } + if flag_w > 0 { flag_w + 1 } else { 0 };
+    let fit = match max.filter(|_| opts.proplist.is_none()) {
+        None => cols.len(),
+        Some(max) => {
+            let mut used = lead_w;
+            let mut n = 0;
+            for w in &widths {
+                let need = if n == 0 { *w } else { w + 2 };
+                if n > 0 && used + need > max {
+                    break;
+                }
+                used += need;
+                n += 1;
+            }
+            n
+        }
+    };
+    let hidden: Vec<String> = cols.iter().skip(fit).map(|c| kebab(c)).collect();
+    let cols: Vec<String> = cols.into_iter().take(fit).collect();
 
     let mut out = Vec::new();
     if numbers && let Some(l) = legend_line(&legend) {
@@ -239,9 +268,28 @@ pub fn table(rows: &[Value], shape: &Shape, opts: &PrintOpts, numbers: bool) -> 
         };
         let text: Vec<String> = cells
             .get(i)
-            .map(|r| r.iter().zip(&widths).map(|(c, w)| pad(c, *w)).collect())
+            .map(|r| {
+                r.iter()
+                    .zip(&widths)
+                    .take(cols.len())
+                    .map(|(c, w)| pad(c, *w))
+                    .collect()
+            })
             .unwrap_or_default();
         l.push(style, text.join("  ").trim_end().to_owned());
+        out.push(l);
+    }
+    if !hidden.is_empty() {
+        let mut l = Line::new();
+        l.push(
+            Style::Dim,
+            format!(
+                "{} more column{} ({}): print detail, or print proplist=…",
+                hidden.len(),
+                if hidden.len() == 1 { "" } else { "s" },
+                hidden.join(", ")
+            ),
+        );
         out.push(l);
     }
     out
@@ -462,9 +510,47 @@ mod tests {
     }
 
     #[test]
+    fn table_fits_the_terminal_and_names_what_it_left_out() {
+        let (rows, s) = routes();
+        let all: Vec<String> = table(&rows, &s, &PrintOpts::default(), true, None)
+            .iter()
+            .map(Line::text)
+            .collect();
+        // The header (the legend line is wider and not a table row).
+        let wide = all[1].chars().count();
+        let narrow: Vec<String> = table(&rows, &s, &PrintOpts::default(), true, Some(wide - 1))
+            .iter()
+            .map(Line::text)
+            .collect();
+        let last = narrow.last().unwrap();
+        assert!(
+            last.contains("more column") && last.contains("print detail"),
+            "{narrow:?}"
+        );
+        assert!(
+            narrow
+                .iter()
+                .skip(1)
+                .take(4)
+                .all(|l| l.chars().count() < wide),
+            "{narrow:?}"
+        );
+        // An explicit proplist is shown whole.
+        let opts = PrintOpts {
+            proplist: Some(vec!["dst_address".into(), "gateway".into()]),
+            ..PrintOpts::default()
+        };
+        let pl: Vec<String> = table(&rows, &s, &opts, true, Some(5))
+            .iter()
+            .map(Line::text)
+            .collect();
+        assert!(pl.iter().any(|l| l.contains("GATEWAY")), "{pl:?}");
+    }
+
+    #[test]
     fn table_has_legend_numbers_flags_and_comments() {
         let (rows, s) = routes();
-        let text: Vec<String> = table(&rows, &s, &PrintOpts::default(), true)
+        let text: Vec<String> = table(&rows, &s, &PrintOpts::default(), true, None)
             .iter()
             .map(Line::text)
             .collect();
@@ -486,7 +572,7 @@ mod tests {
             json!({"name": "ether1", "type": "ether", "disabled": false, "running": true}),
             json!({"name": "v10", "type": "vlan", "disabled": true, "running": false}),
         ];
-        let text: Vec<String> = table(&rows, &s, &PrintOpts::default(), true)
+        let text: Vec<String> = table(&rows, &s, &PrintOpts::default(), true, None)
             .iter()
             .map(Line::text)
             .collect();

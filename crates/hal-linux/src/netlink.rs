@@ -261,6 +261,83 @@ pub(crate) fn flush_learned(links: &[IfName], keep: &[(IfName, IpNet)]) -> Resul
     with_kernel(|k| async move { k.flush_learned(links, keep).await.map_err(HalError::Io) })
 }
 
+/// Addresses and static routes the kernel holds on the links of `names`
+/// (index → name), for the drift check (G1.3). Addresses the kernel made
+/// itself (no `IFA_F_PERMANENT`: SLAAC, temporary) are left out; so are
+/// routes of any protocol but `static`, the one `apply` installs with.
+#[allow(clippy::type_complexity)]
+pub(crate) fn held(
+    names: &std::collections::BTreeMap<u32, IfName>,
+) -> Result<
+    (
+        std::collections::BTreeSet<(IfName, IpNet)>,
+        std::collections::BTreeSet<KernelRoute>,
+    ),
+    HalError,
+> {
+    if names.is_empty() {
+        return Ok(Default::default());
+    }
+    with_kernel(|k| async move { k.held(names).await.map_err(HalError::Io) })
+}
+
+/// A configured (permanent) address of `m`, as a prefix.
+fn configured_address(m: &AddressMessage) -> Option<IpNet> {
+    let mut permanent = m.header.flags.contains(AddressHeaderFlags::Permanent);
+    let (mut local, mut address) = (None, None);
+    for a in &m.attributes {
+        match a {
+            // IPv4: IFA_LOCAL is ours, IFA_ADDRESS the peer on a
+            // point-to-point link (and the same as IFA_LOCAL otherwise).
+            AddressAttribute::Local(ip) => local = Some(*ip),
+            AddressAttribute::Address(ip) => address = Some(*ip),
+            AddressAttribute::Flags(f) => permanent |= f.contains(AddressFlags::Permanent),
+            _ => {}
+        }
+    }
+    if !permanent {
+        return None;
+    }
+    IpNet::new(local.or(address)?, m.header.prefix_len).ok()
+}
+
+/// A static unicast route of `m`, given the link names by index.
+fn static_route(
+    m: &RouteMessage,
+    names: &std::collections::BTreeMap<u32, IfName>,
+) -> Option<KernelRoute> {
+    let h = &m.header;
+    if h.protocol != RouteProtocol::Static {
+        return None;
+    }
+    let mut table = u32::from(h.table);
+    let (mut dst, mut gateway, mut oif, mut metric) = (None, None, None, 0);
+    for a in &m.attributes {
+        match a {
+            RouteAttribute::Table(t) => table = *t,
+            RouteAttribute::Destination(d) => dst = ip_of(d),
+            RouteAttribute::Gateway(g) => gateway = ip_of(g),
+            RouteAttribute::Oif(i) => oif = Some(*i),
+            RouteAttribute::Priority(p) => metric = *p,
+            _ => {}
+        }
+    }
+    // The default route carries no RTA_DST.
+    let dst = match (dst, h.address_family) {
+        (Some(d), _) => d,
+        (None, AddressFamily::Inet) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        (None, AddressFamily::Inet6) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+        (None, _) => return None,
+    };
+    Some(KernelRoute {
+        table,
+        dst: IpNet::new(dst, h.destination_prefix_length).ok()?,
+        metric,
+        link: names.get(&oif?)?.clone(),
+        gateway,
+    })
+}
+
 fn infinite_or(secs: u32) -> Option<u32> {
     (secs != u32::MAX).then_some(secs)
 }
@@ -896,6 +973,50 @@ impl Kernel {
             .try_collect()
             .await
             .map_err(|e| format!("listing routes: {}", readable(&e)))
+    }
+
+    #[allow(clippy::type_complexity)]
+    async fn held(
+        &self,
+        names: &std::collections::BTreeMap<u32, IfName>,
+    ) -> Result<
+        (
+            std::collections::BTreeSet<(IfName, IpNet)>,
+            std::collections::BTreeSet<KernelRoute>,
+        ),
+        String,
+    > {
+        let addresses: Vec<AddressMessage> = self
+            .handle
+            .address()
+            .get()
+            .execute()
+            .take(MAX_DUMP)
+            .try_collect()
+            .await
+            .map_err(|e| format!("listing addresses: {}", readable(&e)))?;
+        let addresses = addresses
+            .iter()
+            .filter_map(|m| Some((names.get(&m.header.index)?.clone(), configured_address(m)?)))
+            .collect();
+        let mut routes = std::collections::BTreeSet::new();
+        let v4: Vec<RouteMessage> = self
+            .handle
+            .route()
+            .get(
+                RouteMessageBuilder::<std::net::Ipv4Addr>::new()
+                    .table_id(0)
+                    .build(),
+            )
+            .execute()
+            .take(MAX_DUMP)
+            .try_collect()
+            .await
+            .map_err(|e| format!("listing routes: {}", readable(&e)))?;
+        for m in v4.iter().chain(self.routes_v6().await?.iter()) {
+            routes.extend(static_route(m, names));
+        }
+        Ok((addresses, routes))
     }
 
     async fn learned(

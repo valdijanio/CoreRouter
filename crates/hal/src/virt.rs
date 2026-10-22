@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::collections::VecDeque;
 use std::net::{Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use corerouter_model::firewall::DynamicAddress;
@@ -13,6 +13,7 @@ use crate::dhcp::{
     Datagram, Datagram6, Dest, Dhcp6Port, DhcpPort, SharedResponder, SharedResponder6, eui64,
     lab_net, lab_router_mac, link_local,
 };
+use crate::drift::{self, LinkSnap, Snapshot};
 use crate::nic::{
     CablePair, CableTest, CableTestResult, CounterGroup, EthernetMonitor, LinkCounters,
     NicHardware, Offload, base_t_modes, mode_speed,
@@ -42,7 +43,13 @@ pub struct VirtualHal {
     /// Times each port was enabled again (each one is a simulated link
     /// down and up, G1.19).
     reenabled: BTreeMap<IfName, u32>,
+    /// The lab's "kernel" (G1.3): what each apply left, which a test (or
+    /// a lab script) can change behind CoreRouter's back to make drift.
+    kernel: LabKernel,
 }
+
+/// Handle on the virtual lab's data plane, shared with the [`VirtualHal`].
+pub type LabKernel = Arc<Mutex<Snapshot>>;
 
 impl std::fmt::Debug for VirtualHal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -57,9 +64,23 @@ impl std::fmt::Debug for VirtualHal {
 impl VirtualHal {
     /// `ports` virtual Ethernet ports named `ether1..=etherN` (RouterOS style).
     pub fn new(ports: u8) -> Self {
-        let ports = (1..=ports)
+        let ports: Vec<IfName> = (1..=ports)
             .filter_map(|i| format!("ether{i}").parse().ok())
             .collect();
+        let kernel = Snapshot {
+            links: ports
+                .iter()
+                .map(|p| {
+                    let link = LinkSnap {
+                        up: true,
+                        mtu: 1500,
+                        master: None,
+                    };
+                    (p.clone(), link)
+                })
+                .collect(),
+            ..Snapshot::default()
+        };
         Self {
             ports,
             applied: Config::default(),
@@ -71,7 +92,39 @@ impl VirtualHal {
             dhcp: None,
             dhcp6: None,
             reenabled: BTreeMap::new(),
+            kernel: Arc::new(Mutex::new(kernel)),
         }
+    }
+
+    /// The lab's data plane, to change it behind CoreRouter's back.
+    pub fn kernel(&self) -> LabKernel {
+        Arc::clone(&self.kernel)
+    }
+
+    /// The lab kernel after `from` → `to`: like a real one, only what
+    /// changed is touched, so drift elsewhere stays.
+    fn carry(&self, from: &Config, to: &Config) {
+        let (a, b) = (drift::expected(from), drift::expected(to));
+        let mut k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
+        for name in a.links.keys().filter(|n| !b.links.contains_key(*n)) {
+            if drift::recreatable(from, name) {
+                k.links.remove(name);
+            }
+        }
+        for (name, link) in &b.links {
+            if a.links.get(name) != Some(link) {
+                k.links.insert(name.clone(), link.clone());
+            }
+        }
+        for x in a.addresses.difference(&b.addresses) {
+            k.addresses.remove(x);
+        }
+        k.addresses
+            .extend(b.addresses.difference(&a.addresses).cloned());
+        for r in a.routes.difference(&b.routes) {
+            k.routes.remove(r);
+        }
+        k.routes.extend(b.routes.difference(&a.routes).cloned());
     }
 
     /// Answer DHCP clients with `server` (a test's own scenario) instead of
@@ -242,8 +295,24 @@ impl Hal for VirtualHal {
                 *n = n.saturating_add(1);
             }
         }
+        self.carry(from, to);
         self.applied = to.clone();
         self.applies = self.applies.saturating_add(1);
+        Ok(())
+    }
+
+    fn snapshot(&mut self, cfg: &Config) -> Result<Snapshot, HalError> {
+        let _ = cfg;
+        Ok(self
+            .kernel
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone())
+    }
+
+    fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
+        let mut k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
+        *k = drift::repaired(cfg, &k);
         Ok(())
     }
 
