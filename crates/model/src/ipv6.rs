@@ -29,6 +29,9 @@ pub struct Ipv6 {
     /// `/ipv6 dhcp-client`: at most one per interface.
     pub dhcp_clients: Vec<Dhcp6Client>,
     pub next_dhcp_client_id: u32,
+    /// `/ipv6 pool`, `/ipv6 dhcp-server` and `/ipv6 dhcp-relay` (G4.2c).
+    #[serde(skip_serializing_if = "crate::dhcp6_server::Dhcp6Servers::is_empty")]
+    pub dhcp_server: crate::dhcp6_server::Dhcp6Servers,
 }
 
 impl Ipv6 {

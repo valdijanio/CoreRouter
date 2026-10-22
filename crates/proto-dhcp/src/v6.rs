@@ -50,12 +50,16 @@ pub mod opt {
     pub const ORO: u16 = 6;
     pub const PREFERENCE: u16 = 7;
     pub const ELAPSED_TIME: u16 = 8;
+    /// Relay Message (RFC 9915 §21.10).
+    pub const RELAY_MSG: u16 = 9;
     pub const UNICAST: u16 = 12;
     pub const STATUS_CODE: u16 = 13;
     pub const RAPID_COMMIT: u16 = 14;
     pub const USER_CLASS: u16 = 15;
     pub const VENDOR_CLASS: u16 = 16;
     pub const VENDOR_OPTS: u16 = 17;
+    /// Interface-Id (RFC 9915 §21.18).
+    pub const INTERFACE_ID: u16 = 18;
     pub const RECONF_ACCEPT: u16 = 20;
     /// RFC 3646.
     pub const DNS_SERVERS: u16 = 23;
@@ -134,7 +138,10 @@ fn bad(why: impl Into<String>) -> CodecError {
 
 /// `(code, data)` of each option in `data`, in order. Refuses an option
 /// whose length runs past the end, and more than `budget` options.
-fn split<'a>(data: &'a [u8], budget: &mut usize) -> Result<Vec<(u16, &'a [u8])>, CodecError> {
+pub(crate) fn split<'a>(
+    data: &'a [u8],
+    budget: &mut usize,
+) -> Result<Vec<(u16, &'a [u8])>, CodecError> {
     let mut out = Vec::new();
     let mut rest = data;
     while !rest.is_empty() {
@@ -489,7 +496,7 @@ pub struct Outgoing<'a> {
     pub oro: &'a [u16],
 }
 
-fn put(out: &mut Vec<u8>, code: u16, data: &[u8]) {
+pub(crate) fn put(out: &mut Vec<u8>, code: u16, data: &[u8]) {
     out.extend_from_slice(&code.to_be_bytes());
     out.extend_from_slice(&u16::try_from(data.len()).unwrap_or(u16::MAX).to_be_bytes());
     out.extend_from_slice(data);

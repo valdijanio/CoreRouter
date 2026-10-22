@@ -20,9 +20,11 @@ pub mod client6;
 pub mod lab;
 pub mod lab6;
 pub mod lab_hosts;
+pub mod lab_hosts6;
 pub mod optval;
 pub mod relay;
 pub mod server;
+pub mod server6;
 pub mod v4;
 pub mod v6;
 
@@ -44,6 +46,12 @@ pub const RESERVED_CODES: [u8; 11] = [0, 12, 50, 52, 53, 54, 55, 57, 60, 61, 255
 pub fn validate(cfg: &Config) -> Vec<Issue> {
     let mut out = validate6(cfg);
     out.extend(server::checks::validate(cfg));
+    out.extend(
+        server6::checks(cfg)
+            .into_iter()
+            .filter(|c| c.level == server::checks::Level::Error)
+            .map(|c| Issue::new(c.path, c.text)),
+    );
     if cfg.ip.dhcp_clients.len() > MAX_CLIENTS {
         out.push(Issue::new(
             "ip.dhcp_clients",

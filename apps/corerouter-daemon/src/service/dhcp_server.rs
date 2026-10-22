@@ -59,7 +59,9 @@ fn run(session: &Shared, health: &super::Health) {
             let d = &s.store().running().ip.dhcp_server;
             let configured = d.servers.iter().any(|x| !x.disabled)
                 || d.alerts.iter().any(|a| !a.disabled)
-                || s.store().running().ip.dhcp_relays.relays.iter().any(|r| !r.disabled);
+                || s.store().running().ip.dhcp_relays.relays.iter().any(|r| !r.disabled)
+                || s.store().running().ipv6.dhcp_server.servers.iter().any(|x| !x.disabled)
+                || s.store().running().ipv6.dhcp_server.relays.iter().any(|r| !r.disabled);
             (heard, s.dhcp_server_ports(), configured, s.dhcp_server_journal_error())
         };
         if !configured {

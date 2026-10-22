@@ -115,3 +115,47 @@ pub trait LabClients: Send + Sync {
 }
 
 pub type SharedLabClients = Arc<dyn LabClients>;
+
+// ---- DHCPv6 server (G4.2c) -------------------------------------------------
+
+/// A DHCPv6 message heard on port 547.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Heard6 {
+    pub payload: Vec<u8>,
+    /// The client's link-local address, or the relay agent's.
+    pub src: std::net::Ipv6Addr,
+}
+
+/// The DHCPv6 server's socket on one interface: UDP 547, joined to
+/// All_DHCP_Relay_Agents_and_Servers (ff02::1:2).
+pub trait Dhcp6ServerPort: Send {
+    fn mac(&self) -> [u8; 6];
+
+    fn tick(&mut self, now_unix: u64) {
+        let _ = now_unix;
+    }
+
+    fn recv(&mut self) -> Result<Option<Heard6>, HalError>;
+
+    /// Send to `to` port `port` (546 to a client, 547 to a relay agent),
+    /// out of this interface.
+    fn send(&mut self, payload: &[u8], to: std::net::Ipv6Addr, port: u16) -> Result<(), HalError>;
+
+    fn describe(&self) -> String {
+        String::new()
+    }
+}
+
+/// The DHCPv6 relay's side towards the servers: UDP 547, routed.
+pub trait Dhcp6Uplink: Send {
+    fn recv(&mut self) -> Result<Option<Heard6>, HalError>;
+    fn send(&mut self, payload: &[u8], to: std::net::Ipv6Addr) -> Result<(), HalError>;
+}
+
+/// The lab's simulated DHCPv6 clients (`proto_dhcp::lab_hosts6`).
+pub trait LabClients6: Send + Sync {
+    fn poll(&self, port: &IfName, now_unix: u64) -> Vec<Heard6>;
+    fn deliver(&self, port: &IfName, payload: &[u8], now_unix: u64);
+}
+
+pub type SharedLabClients6 = Arc<dyn LabClients6>;
