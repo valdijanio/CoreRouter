@@ -6,7 +6,7 @@ mod layers;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|layers|agents-sync|wasm>";
+const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|netns|layers|agents-sync|wasm>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -30,6 +30,7 @@ const CI: &[Step] = &[
     ("fmt", fmt),
     ("clippy", clippy),
     ("test", test),
+    ("netns", netns),
     ("layers", layers_step),
     ("agents-sync", agents_sync),
     ("wasm", wasm),
@@ -119,6 +120,46 @@ fn clippy(root: &Path) -> Outcome {
 fn test(root: &Path) -> Outcome {
     let mut c = cargo();
     c.args(["test", "--workspace", "--quiet"]);
+    run(c, root)
+}
+
+/// hal-linux against a real kernel, in a throwaway user + network namespace:
+/// no root, nothing reaches the host (crates/hal-linux/tests/netns.rs).
+/// Skips where unprivileged user namespaces are not allowed.
+fn netns(root: &Path) -> Outcome {
+    if !cfg!(target_os = "linux") {
+        return Outcome::Skip("network namespaces are Linux-only".into());
+    }
+    const UNSHARE: [&str; 4] = ["--user", "--map-root-user", "--net", "--"];
+    // Probe: can this user create a link inside a fresh namespace?
+    match Command::new("unshare")
+        .args(UNSHARE)
+        .args(["ip", "link", "add", "xtask0", "type", "dummy"])
+        .output()
+    {
+        Ok(o) if o.status.success() => {}
+        Ok(o) => {
+            return Outcome::Skip(format!(
+                "unshare without root is not allowed here ({}); on Ubuntu: \
+                 sysctl kernel.apparmor_restrict_unprivileged_userns=0",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ));
+        }
+        Err(e) => return Outcome::Skip(format!("cannot run unshare: {e}")),
+    }
+    let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    let mut c = Command::new("unshare");
+    c.args(UNSHARE)
+        .arg(cargo)
+        .args([
+            "test",
+            "--quiet",
+            "-p",
+            "corerouter-hal-linux",
+            "--test",
+            "netns",
+        ])
+        .env("COREROUTER_NETNS_TESTS", "1");
     run(c, root)
 }
 

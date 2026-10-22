@@ -51,6 +51,12 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      # G1.2: `cargo xtask netns` testa o hal-linux num network namespace sem root.
+      # O Ubuntu 24.04 bloqueia user namespaces sem privilégio (AppArmor); isto só
+      # muda a VM descartável do runner. Se não pegar, o passo netns vira "skip".
+      - name: Liberar user namespaces sem root
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
       - name: cargo xtask ci
         run: cargo xtask ci
 

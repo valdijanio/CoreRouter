@@ -84,7 +84,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 |---|---|---|---|
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico) | serde, ipnet, thiserror |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio) + `VirtualHal` (lab, wasm, CI) | L0 |
-| L1 | `crates/hal-linux` | Backend Linux (hoje sysfs só-leitura; netlink/nftables em G1.2/G2.1). **Plataforma** | L0, `hal` (lateral permitido) |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, endereços; G1.2), descoberta/contadores via sysfs; nftables em G2.1. **Plataforma** | L0, `hal` (lateral permitido) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, guard de panic, commit/rollback, batch, journal | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha em loopback, `dispatch`, `Host`, `Client` | L0–L3 |
@@ -157,7 +157,30 @@ candidate nunca é gravado (edição não commitada não sobrevive a reinício, 
 | `MemoryStorage` | engine | GUI, wasm, testes, daemon em lab sem `--config-dir` |
 | `FileStorage` | `storage-fs` (L4) | daemon: temp + fsync → rename current→prev → rename temp→current → fsync do diretório |
 
+### `hal-linux`: aplicação no kernel (G1.2)
+
+`LinuxHal::apply(from, to)` tem duas metades:
+
+1. **Plano puro** (`crates/hal-linux/src/plan.rs`, compila em qualquer plataforma): o diff
+   `from` → `to` vira uma lista ordenada de `Op` — remover endereços → soltar portas de bridge →
+   apagar links (filhos VLAN antes do pai) → criar links (pai antes) → MTU (reduções dos filhos
+   para o pai, aumentos do pai para os filhos) → prender portas → adicionar endereços → up/down.
+   Mudou o tipo ou o VLAN id de um link virtual: apaga e recria, junto com as VLANs empilhadas
+   nele (o kernel as apagaria de qualquer jeito). Porta física nunca é criada nem apagada.
+2. **Executor** (`netlink.rs`, só Linux): roda cada `Op` com `rtnetlink` num runtime tokio
+   *current-thread* criado dentro do `apply` (o trait `Hal` continua síncrono). Antes de cada
+   mudança lê o link no kernel e guarda o desfazer; se o passo N falha, desfaz N-1..0 na ordem
+   inversa e devolve `HalError::Rejected` dizendo o passo, o motivo e se o rollback foi completo.
+   Mudança já em vigor (MTU igual, endereço presente) é no-op sem desfazer.
+
+Proteções do host: só interfaces do config entram no plano; o `lo` do kernel não é descoberto;
+link existente só é adotado se tiver o mesmo tipo (e VLAN id/pai) do config, e nunca se apaga
+um link cujo tipo no kernel difere do config. Testes de integração (`tests/netns.rs`) rodam
+num network namespace descartável sem root: `cargo xtask netns` (passo do `cargo xtask ci`,
+que vira `skip` onde `unshare` sem root não é permitido).
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).
 - 2026-10-21 — G0.6: crate `storage-fs` (L4) e seção de persistência.
+- 2026-10-21 — `hal-linux` aplica via rtnetlink (G1.2): plano puro + executor com rollback.

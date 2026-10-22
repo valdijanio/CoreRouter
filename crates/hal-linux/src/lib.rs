@@ -1,8 +1,17 @@
 //! Linux backend.
 //!
-//! Today: read-only discovery from `/sys/class/net` (no root needed).
-//! Next (docs/gaps.md G1.2/G1.3): `rtnetlink` for links/addresses/routes and
-//! nftables for firewall/NAT, applied as one transaction per commit.
+//! - `apply`: [`plan::plan`] turns the diff `from` → `to` into ordered kernel
+//!   operations (pure, tested everywhere); `netlink` runs them over rtnetlink
+//!   and undoes the done ones if one fails (G1.2).
+//! - discovery and counters: `/sys/class/net` (netlink stats in G1.7).
+//!
+//! Integration tests run against a real kernel inside a throwaway network
+//! namespace, without root: see `tests/netns.rs`.
+
+pub mod plan;
+
+#[cfg(target_os = "linux")]
+mod netlink;
 
 #[cfg(target_os = "linux")]
 mod linux {
@@ -14,6 +23,9 @@ mod linux {
     use corerouter_model::{Config, IfName};
 
     const SYS_NET: &str = "/sys/class/net";
+    /// `ARPHRD_LOOPBACK`: the kernel `lo` is never managed (its MTU, 65536,
+    /// does not even fit the model).
+    const ARPHRD_LOOPBACK: &str = "772";
 
     #[derive(Debug, Default)]
     pub struct LinuxHal {
@@ -38,6 +50,7 @@ mod linux {
         let dir = fs::read_dir(SYS_NET).map_err(|e| HalError::Io(format!("{SYS_NET}: {e}")))?;
         let mut out: Vec<_> = dir
             .filter_map(Result::ok)
+            .filter(|e| read_trim(&e.path().join("type")).as_deref() != Some(ARPHRD_LOOPBACK))
             .filter_map(|e| {
                 let name = e.file_name().to_str()?.parse::<IfName>().ok()?;
                 Some((name, e.path()))
@@ -49,7 +62,7 @@ mod linux {
 
     impl Hal for LinuxHal {
         fn describe(&self) -> String {
-            "linux (sysfs read-only; netlink apply pending G1.2)".into()
+            "linux (rtnetlink apply, sysfs counters)".into()
         }
 
         fn discover_links(&mut self) -> Result<Vec<LinkInfo>, HalError> {
@@ -65,11 +78,8 @@ mod linux {
                 .collect())
         }
 
-        fn apply(&mut self, _from: &Config, _to: &Config) -> Result<(), HalError> {
-            Err(HalError::Unsupported(
-                "netlink apply is not implemented yet (docs/gaps.md G1.2); use --backend virtual"
-                    .into(),
-            ))
+        fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+            crate::netlink::apply(&crate::plan::plan(from, to)?)
         }
 
         fn poll(&mut self) -> Vec<LinkState> {
