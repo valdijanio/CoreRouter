@@ -80,6 +80,7 @@ while read -r n branch; do
       say "  push recusado (a branch andou); fica para o próximo push na main"
     fi
   else
+    # shellcheck disable=SC2016 # crases literais: Markdown do comentário
     files=$(git diff --name-only --diff-filter=U | sed 's/^/- `/; s/$/`/')
     git merge --abort
     marker="<!-- pr-sync:$main_sha -->"
