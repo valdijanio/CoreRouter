@@ -324,3 +324,145 @@ aviso na GUI quando a lista não tem rede; limite por cliente que descarta em UD
 ligado (1 dia); servidor mais rápido medido, com os números no `ip.dns.get`; hits por entrada do
 cache; resposta do endereço perguntado; ANY mínimo (RFC 8482); regexp em tempo linear (o crate
 `regex` não faz backtracking: um padrão hostil não trava o DNS).
+
+## G4.1d — Adlist, Forwarders, DoT/DoH
+
+Em PRs sequenciais: **G4.1d-1** adlist (este), **G4.1d-2** forwarders e upstream DoT/DoH,
+**G4.1d-3** `ip.dns.resolve` como tarefa e cache de falhas (RFC 9520).
+
+### Adlist (G4.1d-1)
+
+**Problema.** Bloquear anúncios, rastreadores e malware para a LAN inteira (o que o Pi-hole e o
+AdGuard Home fazem) com as listas públicas de sempre (StevenBlack, OISD, Hagezi…), que têm de
+dezenas de milhares a mais de um milhão de nomes: muito para a config e para o `/ip dns static`
+(limitado a 10 000 entradas).
+
+**Agora.**
+
+```sh
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.adlist.add '{"url":"https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.adlist.add '{"file":"local.txt"}'   # de --adlist-dir
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.adlist.print    # state, name_count, match_count
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.adlist.reload
+dig @192.168.88.1 ads.example        # 0.0.0.0
+```
+
+No terminal: `/ip dns adlist add url=…`, `/ip dns adlist print`, `/ip dns adlist reload`. Na GUI:
+IP › DNS Adlist, ou o botão **Adlist** da janela DNS (o botão de uma parte nova acende sozinho
+quando o painel `DNS <parte>` existe). A lista mostra fonte, estado, nomes, bloqueios, há quanto
+tempo carregou e o comentário; o diálogo tem URL ou File, SSL Verify, Disabled, Comment, o estado e
+as linhas puladas, com Reload e Remove.
+
+| Comando | Parâmetros |
+|---|---|
+| `ip.dns.adlist.add/set` | `url` (`http://` ou `https://`) ou `file` (nome de arquivo em `--adlist-dir`), `ssl_verify` (padrão sim), `disabled`, `comment` |
+| `ip.dns.adlist.remove` | `id` |
+| `ip.dns.adlist.reload` | `id?` (sem: todas); baixa de novo em segundo plano |
+| `ip.dns.adlist.print` | + `state` (`waiting`, `loading`, `loaded`, `failed`, `off`), `name_count`, `match_count`, `skipped`, `loaded_secs_ago`, `error` |
+
+**Como funciona.**
+
+- A config guarda só de onde vem cada lista (`ip.dns_adlist`, até 32). Os nomes ficam no daemon:
+  o serviço `dns adlist` (`service/dns_adlist.rs`) baixa ou lê cada lista numa thread própria,
+  nunca sob o lock do `Session`, e entrega o conjunto à etapa `adlist` (ordem 30, antes das
+  estáticas) numa troca só. Uma consulta nunca espera um download.
+- Carrega quando a lista entra ou muda, a cada **4 h** (como o RouterOS) e no `reload`. Falhou:
+  mantém os nomes que tinha, mostra o erro e tenta de novo em 10 min. O contador de bloqueios
+  continua entre recargas da mesma lista.
+- **Formatos**, misturados no mesmo arquivo: hosts (`0.0.0.0 nome nome2`, qualquer endereço na
+  frente, com ou sem zona `%lo0`), um domínio por linha, e o subconjunto Adblock de domínio inteiro
+  `||nome^`. Comentários `#` e `!`. Os nomes da própria máquina (`localhost`, `ip6-*`,
+  `broadcasthost`) e domínios de um rótulo só são ignorados; regras Adblock com caminho, `$opções`,
+  `@@` ou curinga no meio contam como puladas (`skipped`), nunca meio entendidas.
+- **O que casa:** linha de hosts ou de domínio bloqueia **aquele nome**; `||nome^` bloqueia o nome
+  e **tudo abaixo dele** (como Pi-hole e AdGuard Home: as listas de hosts listam cada subdomínio
+  que querem, e algumas listam um pai cujos outros subdomínios têm de continuar funcionando).
+- **Resposta:** A → `0.0.0.0`, AAAA → `::`, outros tipos → NOERROR sem registros, TTL 10 s (o
+  RouterOS responde 0.0.0.0; é o modo "NULL", padrão do Pi-hole). O cliente desiste na hora, em
+  vez de tentar o próximo servidor como faria com um NXDOMAIN.
+- **Liberar um nome** (allowlist, como no RouterOS 7.17): uma entrada estática `FWD` para ele;
+  com `match_subdomain`, libera os subdomínios também.
+- **Entrada hostil:** corpo até 64 MiB, linha até 4 KiB, cabeçalho HTTP até 16 KiB, 5
+  redirecionamentos (nunca de https para http), 120 s por download, 2 000 000 nomes somando todas
+  as listas (passou: guarda os primeiros e avisa no `error`); cada nome conferido pela RFC 1035
+  §2.3.4 antes de entrar. `file` é só nome de arquivo (sem `/`, sem `..`, sem começar com `.`).
+- **HTTPS:** cliente HTTP/1.1 próprio do daemon (`service/https.rs`) sobre rustls, com as raízes
+  da Mozilla embutidas (`webpki-roots`), porque o roteador não tem loja de CAs nem resolvedor do
+  sistema: o nome do servidor da lista é resolvido pelo próprio roteador (`/ip dns servers`).
+  `ssl_verify=no` continua cifrando e conferindo a assinatura do handshake, só não confere o
+  certificado.
+
+**Testes.** `proto-dns`: parser (hosts, domínios, Adblock, comentários, linhas da máquina, zona
+IPv6, teto de nomes, linha longa), proptest com texto qualquer e conjunto contra uma busca simples;
+a etapa de ponta a ponta (A/AAAA/MX bloqueados, `||` com subdomínios, hosts exato, FWD libera,
+contador, lista retirada). Engine: `ip.dns.adlist.*` (sucesso, validação, rollback, contagens e
+reload vindos do carregador). Daemon: cliente HTTP (comprimento, chunked, até fechar, 404, laço de
+redirecionamentos, cabeçalho enorme, corpo grande demais, TLS com e sem verificação contra um
+servidor local com certificado autoassinado) e o carregador (URL e arquivo, desabilitar tira na
+hora, reload mantém o contador, remover tira, teto de nomes somando listas). UI: o botão Adlist da
+janela DNS abre a janela, contagens do carregador, novo pelo diálogo. Ao vivo: a lista do
+StevenBlack (71 492 nomes) baixada por HTTPS, `dig` recebe 0.0.0.0 e `::`.
+
+**Desempenho** (**medido**, AMD Ryzen AI MAX+ 395, build release, 2026-10-22, `cargo bench -p
+corerouter-proto-dns --bench adlist`): 1 000 000 nomes lidos e montados em 230 ms, 31,8 MB no
+conjunto; consulta 79 ns (nome listado), 82 ns (abaixo de um `||domínio^`), 105–120 ns (não
+listado).
+
+**Fica para depois** (G4.1h): recarga condicional (ETag/`If-Modified-Since`, como o "aplica só o
+que mudou" do RouterOS), allowlist e regex próprias da adlist (o Pi-hole tem as duas), modo de
+resposta configurável (NXDOMAIN, REFUSED, IP próprio) e envio de arquivos ao roteador (`/file`),
+hoje um diretório do daemon (`--adlist-dir`).
+
+### Pesquisa da G4.1d
+
+Fontes:
+
+- MikroTik RouterOS v7, DNS (adlist, forwarders, DoH):
+  <https://help.mikrotik.com/docs/spaces/ROS/pages/37748767/DNS>; changelogs 7.15–7.23
+  (<https://upgrade.mikrotik.com/routeros/7.17/CHANGELOG> e os das outras versões).
+- Pi-hole v6: <https://docs.pi-hole.net/ftldns/blockingmode/>,
+  <https://docs.pi-hole.net/database/domain-database/>, o cron do gravity
+  (<https://github.com/pi-hole/pi-hole/blob/master/advanced/Templates/pihole.cron>).
+- AdGuard Home: <https://github.com/AdguardTeam/AdGuardHome/wiki/Hosts-Blocklists>,
+  <https://github.com/AdguardTeam/AdGuardHome/wiki/Configuration> e o código
+  (`internal/home/config.go`, `internal/filtering/rulelist/rulelist.go`).
+- Unbound: <https://github.com/NLnetLabs/unbound/blob/master/doc/unbound.conf.rst>
+  (`forward-tls-upstream`, `ip@853#nome`, `tls-cert-bundle`, padding); OPNsense:
+  <https://docs.opnsense.org/manual/unbound.html> (DNSBL, DoT com "Verify CN").
+- RFCs: 8484 (DoH: §4.1 id 0, §5.1 cache, §5.2 HTTP/2 recomendado, §6), 7858 (DoT: §3.1 porta
+  853, §3.3 prefixo de 2 bytes, §3.4 reuso de conexão), 8310 (perfis estrito e oportunista, §5,
+  §6.6, §8.1), 8467 (padding de 128 bytes, §4.1), 9520 (cache de falhas: §2, §3.1, §3.2: de 1 s a
+  5 min, recuo exponencial). Errata: RFC 8484, três só "Reported" (§4.1 base64url, §3 server
+  push, §10); RFC 7858, uma editorial "Held"; RFC 9520, uma editorial verificada (§7.2); RFC
+  8310, nenhuma. "Updated by": a RFC 7858 pela 8310; a RFC 9520 atualiza 2308, 4035 e 4697.
+
+**Como o MikroTik faz.** Adlist desde a 7.15: `url` ou `file`, `ssl-verify`, e só leitura
+`name-count` e `match-count`; `reload` confere as listas e aplica só o que mudou; recarga a cada 4
+h; listas de hosts; o nome bloqueado recebe 0.0.0.0; uma estática FWD libera um nome (7.17). Os
+nomes moram no cache do DNS (aumentar `cache-size`; "max cache size reached" no log). Forwarders
+desde a 7.17: `name`, `dns-servers` (IP ou nome), `doh-servers` (várias URLs), `verify-doh-cert`
+(padrão **sim** aqui, **não** em `/ip dns`), round-robin; a estática `FWD` usa `forward-to=<nome>`.
+`/ip dns` tem `use-doh-server` (uma URL), `verify-doh-cert`, `doh-max-server-connections` (5),
+`doh-max-concurrent-queries` (50), `doh-timeout` (5 s); com DoH os `servers` só resolvem o nome
+do servidor DoH, sem volta ao DNS comum. HTTP/2 no DoH só na 7.23 (ARM64/x86). Não tem DoT.
+
+**Como os outros fazem.**
+
+- **Pi-hole:** resposta "NULL" (0.0.0.0/::) por padrão; hosts e domínios casam o nome exato,
+  `||nome^` casa os subdomínios; prioridade allow exato > allow regex > deny exato > listas >
+  regex; gravity semanal.
+- **AdGuard Home:** `||x^` casa subdomínios, linha de hosts não; `@@` libera; resposta 0.0.0.0/::
+  (ou o IP da linha de hosts), TTL de bloqueio 10 s, listas a cada 24 h, até 256 MB por lista.
+- **Unbound/OPNsense:** DNSBL de domínios, com campo separado para curingas; DoT por forwarder
+  com nome do certificado (`ip@853#nome`), padding de 128 bytes ligado.
+
+**O que adotamos (parte 1).** Nomes e comportamento do RouterOS (`url`, `file`, `ssl-verify`,
+contadores, `reload`, 4 h, 0.0.0.0, FWD como allowlist); semântica de casamento e `::` para AAAA
+do Pi-hole/AdGuard; TTL 10 s do AdGuard.
+
+**Melhorias sobre o MikroTik.** `ssl_verify` ligado por padrão, com raízes embutidas (o RouterOS
+confere contra `/certificate`, que vem vazio); listas fora do cache do DNS (uma lista grande não
+expulsa as respostas do cache) num conjunto compacto medido; formatos de domínio e `||nome^`
+além de hosts; `state`, `error`, `skipped` e "carregou há" por lista, para o operador saber por que
+uma lista não bloqueia; um download falho mantém os nomes anteriores; teto de nomes somando as
+listas, com aviso.

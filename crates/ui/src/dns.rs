@@ -2,9 +2,9 @@
 //!
 //! - **DNS** (Settings): servers, the LAN forwarder (Allow Remote Requests,
 //!   who may ask, per-client limit), upstream selection, serve-stale, cache
-//!   and limits, with Apply; buttons open Static and Cache. Statistics,
-//!   Adlist, Forwarders and Zones are there greyed out with the part that
-//!   brings them.
+//!   and limits, with Apply; buttons open Static and Cache, and the
+//!   windows of the later parts (Adlist…) once their panel exists; the
+//!   others are greyed out with the part that brings them.
 //! - **DNS Static**: the static entries, with New/properties dialogs.
 //! - **DNS Cache**: what the cache holds, with hits, and Flush Cache.
 //!
@@ -660,8 +660,24 @@ impl DnsPanel {
                 }
             }
             for (label, why) in LATER {
-                ui.add_enabled(false, egui::Button::new(label))
-                    .on_disabled_hover_text(why);
+                // A part that landed has a window "DNS <label>" (its own
+                // panel): the button opens it.
+                let title = format!("DNS {label}");
+                let landed = crate::panel::all()
+                    .iter()
+                    .flat_map(|p| p.windows)
+                    .find(|w| w.title == title);
+                match landed {
+                    Some(w) => {
+                        if ui.button(label).clicked() {
+                            open_window(app, w.id);
+                        }
+                    }
+                    None => {
+                        ui.add_enabled(false, egui::Button::new(label))
+                            .on_disabled_hover_text(why);
+                    }
+                }
             }
         });
         ui.separator();

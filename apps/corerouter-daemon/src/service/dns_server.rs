@@ -418,10 +418,21 @@ fn start(ctx: &super::Ctx) -> Result<(), String> {
         log::error!("DNS server is off: the resolver did not start");
         return Ok(());
     };
-    if let Err(e) = spawn(ctx.session.clone(), dns, port, ctx.shutdown.clone()) {
-        log::error!("DNS server is off: cannot start its threads: {e}");
+    match spawn(ctx.session.clone(), dns, port, ctx.shutdown.clone()) {
+        Ok(srv) => {
+            let _ = SERVER.set(srv);
+        }
+        Err(e) => log::error!("DNS server is off: cannot start its threads: {e}"),
     }
     Ok(())
+}
+
+/// The forwarder, once started (the adlist loader fills its lists).
+static SERVER: std::sync::OnceLock<Arc<Server>> = std::sync::OnceLock::new();
+
+/// The block lists the forwarder matches (G4.1d), once it started.
+pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
+    SERVER.get().map(|s| s.fwd.state())
 }
 
 
