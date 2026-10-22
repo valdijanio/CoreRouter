@@ -115,6 +115,9 @@ pub struct Shell {
     interrupted: bool,
     /// The first-login question (G0.3b): set a password for this account.
     ask: Option<Ask>,
+    /// Characters per line of the front end; `print` drops the columns that
+    /// do not fit (like RouterOS), instead of stretching the terminal.
+    width: Option<usize>,
 }
 
 /// "Set a password for admin" after a login while an account of group full
@@ -201,6 +204,7 @@ impl Shell {
             live: Vec::new(),
             interrupted: false,
             ask: None,
+            width: None,
         }
     }
 
@@ -309,6 +313,13 @@ impl Shell {
                 Step::Done(o) => return o,
             }
         }
+    }
+
+    /// The terminal's width in characters (`None`: unlimited). `print` shows
+    /// the columns that fit and says which it left out (`print detail` has
+    /// them all).
+    pub fn set_width(&mut self, width: Option<usize>) {
+        self.width = width.filter(|w| *w > 0);
     }
 
     /// Lines printed by the running job since the last call.
@@ -732,7 +743,7 @@ impl Shell {
                         } else if opts.detail {
                             format::detail(&rows, &cmd.shape, &opts)
                         } else {
-                            format::table(&rows, &cmd.shape, &opts, true)
+                            format::table(&rows, &cmd.shape, &opts, true, sh.width)
                         }
                     }
                     other if opts.as_json => json_lines(&other),
@@ -1396,7 +1407,7 @@ fn json_lines(v: &Value) -> Vec<Line> {
 fn result_lines(cmd: &Command, v: &Value) -> Vec<Line> {
     match v {
         Value::Array(rows) if rows.iter().all(Value::is_object) && !rows.is_empty() => {
-            format::table(rows, &cmd.shape, &PrintOpts::default(), false)
+            format::table(rows, &cmd.shape, &PrintOpts::default(), false, None)
         }
         Value::Array(rows) if rows.is_empty() => Vec::new(),
         Value::Object(o)

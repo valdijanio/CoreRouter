@@ -456,6 +456,13 @@ impl CoreRouterUi {
 
     fn terminal_body(&mut self, ui: &mut egui::Ui, idx: usize) {
         let font = TextStyle::Monospace.resolve(ui.style());
+        // `print` fits this width (like RouterOS) instead of stretching the
+        // window; a longer line scrolls sideways.
+        let glyph = ui.fonts_mut(|f| f.glyph_width(&font, '0')).max(1.0);
+        let cols = ((ui.available_width() - 16.0) / glyph).floor().max(20.0) as usize;
+        if let Some(t) = self.terminals.get_mut(idx) {
+            t.shell.set_width(Some(cols));
+        }
         let Some(t) = self.terminals.get(idx) else {
             return;
         };
@@ -521,7 +528,7 @@ impl CoreRouterUi {
         let output_height = (ui.available_height() - t.bottom - 6.0).max(40.0);
         let mut clear = false;
         let mut copy = false;
-        egui::ScrollArea::vertical()
+        egui::ScrollArea::both()
             .id_salt(("terminal-output", t.id))
             .max_height(output_height)
             .auto_shrink([false, false])
