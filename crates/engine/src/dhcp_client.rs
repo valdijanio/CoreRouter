@@ -478,6 +478,14 @@ impl Session {
             "searching" | "offered" => log::debug!("dhcp-client {id} on {interface}: {message}"),
             _ => log::info!("dhcp-client {id} on {interface}: {message}"),
         }
+        let (topics, text, detail) = crate::logging::dhcp_event(
+            false,
+            &id.to_string(),
+            interface.as_str(),
+            event,
+            &message,
+        );
+        self.log_event(&topics, crate::logging::DAEMON, text, detail);
         self.dhcp.seq = self.dhcp.seq.saturating_add(1);
         let time = self.now();
         self.dhcp.history.push_back(HistoryEntry {

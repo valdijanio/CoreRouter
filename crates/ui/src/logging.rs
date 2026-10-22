@@ -1,6 +1,7 @@
 //! The System › Logging window (G4.6e), WinBox `/system logging` style:
 //! the tabs Rules (topics → action, with prefix) and Actions (remote
-//! syslog targets), each a G1.9 table with its toolbar, menus and keys,
+//! syslog targets and the built-in `memory`, the router's own Log window,
+//! of which only the number of lines changes; G4.6d), each a G1.9 table with its toolbar, menus and keys,
 //! and "New Logging Rule" / "Logging Rule <id>" / "New Logging Action" /
 //! "Logging Action <name>" windows.
 //!
@@ -44,11 +45,12 @@ pub(crate) const PANEL: Panel = Panel {
 
 /// The topics an event can carry (`corerouter_model::logging::TOPICS`,
 /// which a test keeps in step; the engine refuses any other).
-pub(crate) const TOPICS: [&str; 12] = [
+pub(crate) const TOPICS: [&str; 14] = [
     "account",
     "critical",
     "debug",
     "dhcp",
+    "dns",
     "error",
     "firewall",
     "info",
@@ -56,6 +58,7 @@ pub(crate) const TOPICS: [&str; 12] = [
     "ntp",
     "route",
     "system",
+    "tool",
     "warning",
 ];
 /// RFC 5424 §6.2.1 order (`Facility::ALL`, kept in step by a test).
@@ -76,9 +79,10 @@ const SEVERITIES: [&str; 9] = [
 ];
 
 const RULE_COLUMNS: [table::Column; 4] = [col(""), col("Topics"), col("Prefix"), col("Action")];
-const ACTION_COLUMNS: [table::Column; 8] = [
+const ACTION_COLUMNS: [table::Column; 9] = [
     col("Name"),
     col("Type"),
+    num("Lines"),
     col("Remote Address"),
     num("Remote Port"),
     col("Src. Address"),
@@ -181,6 +185,9 @@ impl RuleForm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ActionForm {
     pub name: String,
+    /// The built-in `memory` action: only `memory_lines` applies.
+    pub memory: bool,
+    pub memory_lines: String,
     pub remote: String,
     pub remote_port: String,
     /// Empty: the router picks.
@@ -195,6 +202,8 @@ impl ActionForm {
     fn new() -> Self {
         Self {
             name: String::new(),
+            memory: false,
+            memory_lines: String::new(),
             remote: String::new(),
             remote_port: "514".into(),
             src_address: String::new(),
@@ -207,6 +216,8 @@ impl ActionForm {
     fn of(row: &Value) -> Self {
         Self {
             name: text(row, "name"),
+            memory: text(row, "target") == "memory",
+            memory_lines: text(row, "memory_lines"),
             remote: text(row, "remote"),
             remote_port: text(row, "remote_port"),
             src_address: text(row, "src_address"),
@@ -219,6 +230,12 @@ impl ActionForm {
     /// The keys that differ from `base`, as add/set take them.
     fn diff(&self, base: &ActionForm) -> Map<String, Value> {
         let mut p = Map::new();
+        if self.memory {
+            if self.memory_lines.trim() != base.memory_lines {
+                p.insert("memory_lines".into(), form_number(&self.memory_lines));
+            }
+            return p;
+        }
         if self.remote.trim() != base.remote {
             p.insert("remote".into(), json!(self.remote.trim()));
         }
@@ -388,6 +405,7 @@ fn action_row(a: &Value) -> Row {
         cells: vec![
             text(a, "name"),
             text(a, "target"),
+            text(a, "memory_lines"),
             text(a, "remote"),
             text(a, "remote_port"),
             text(a, "src_address"),
@@ -978,8 +996,15 @@ fn dialog_body(
                     f.text(ui, "Name", "name", &mut form.name, "remote1");
                 }
                 ui.label("Type");
-                ui.label("remote");
+                ui.label(if form.memory { "memory" } else { "remote" });
                 ui.end_row();
+                if form.memory {
+                    f.text(ui, "Lines", "memory_lines", &mut form.memory_lines, "1000");
+                    ui.label("");
+                    ui.weak("The router's own log (Log window): the newest lines kept");
+                    ui.end_row();
+                    return;
+                }
                 f.text(ui, "Remote Address", "remote", &mut form.remote, "192.0.2.10");
                 f.text(ui, "Remote Port", "remote_port", &mut form.remote_port, "514");
                 f.text(
@@ -1018,7 +1043,7 @@ fn dialog_body(
                 ),
                 ("Remove", Button::Remove, can.check("system.logging.remove")),
             ];
-        } else {
+        } else if text(r, "target") != "memory" {
             footer.extra = vec![(
                 "Remove",
                 Button::Remove,

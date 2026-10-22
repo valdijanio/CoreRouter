@@ -3,7 +3,7 @@
 #![allow(clippy::unwrap_used, clippy::panic)]
 
 use corerouter_engine::Session;
-use corerouter_engine::logging::{journal_event, routes};
+use corerouter_engine::logging::routes;
 use corerouter_model::ntp::{NtpState, NtpStatus};
 use serde_json::{Value, json};
 
@@ -116,18 +116,25 @@ fn logging_actions_and_rules() {
         json!({"name": "siem", "remote": "192.0.2.10", "syslog_facility": "local3"}),
     );
     let list = ok(&mut s, "system.logging.action.list", Value::Null);
+    assert_eq!(list[0]["name"], "memory");
+    assert_eq!(list[0]["memory_lines"], 1000);
     assert_eq!(
-        list[0],
-        json!({"name": "siem", "target": "remote", "remote": "192.0.2.10", "remote_port": 514,
-               "src_address": null, "syslog_facility": "local3", "syslog_severity": "auto", "comment": ""})
+        list[1],
+        json!({"name": "siem", "target": "remote", "default": false, "memory_lines": null,
+               "remote": "192.0.2.10", "remote_port": 514, "src_address": null,
+               "syslog_facility": "local3", "syslog_severity": "auto", "comment": ""})
     );
+    // The four default rules (RouterOS): info, error, warning, critical → memory.
+    let rules = ok(&mut s, "system.logging.list", Value::Null);
+    assert_eq!(rules.as_array().unwrap().len(), 4);
+    assert_eq!(rules[0]["action"], "memory");
     let id = ok(
         &mut s,
         "system.logging.add",
         json!({"topics": "info,!debug", "action": "siem", "prefix": "r1"}),
     )["id"]
         .clone();
-    assert_eq!(id, "*1");
+    assert_eq!(id, "*5");
     ok(
         &mut s,
         "system.logging.add",
@@ -142,8 +149,8 @@ fn logging_actions_and_rules() {
     assert_eq!(a.remote_port, 5514);
 
     // Every config change after that is an event the rules send once.
-    let entry = s.journal().last().unwrap().clone();
-    let ev = journal_event(&entry, 0);
+    let ev = s.log_since(0).pop().unwrap();
+    assert_eq!(ev.detail["command"], "system.logging.action.set");
     let to = routes(&s.store().running().system.logging, &ev);
     assert_eq!(to.len(), 1, "two rules, one action: one datagram");
     assert_eq!(to[0].prefix, "r1");
@@ -227,7 +234,7 @@ fn logging_validation() {
         &mut s,
         "system.logging.action.remove",
         json!({"name": "a"}),
-        "used by logging rule *1",
+        "used by logging rule *5",
     );
     fails(
         &mut s,
@@ -251,21 +258,83 @@ fn logging_remove_and_rollback() {
         json!({"topics": ["info"], "action": "a"}),
     );
     let rev = s.store().current_revision();
-    ok(&mut s, "system.logging.remove", json!({"id": "*1"}));
+    ok(&mut s, "system.logging.remove", json!({"id": "*5"}));
     ok(&mut s, "system.logging.action.remove", json!({"name": "a"}));
     assert!(s.store().running().system.logging.actions.is_empty());
     ok(&mut s, "config.rollback", json!({"revision": rev}));
     let l = &s.store().running().system.logging;
     assert_eq!(l.actions.len(), 1);
-    assert_eq!(l.rules[0].action, "a");
+    assert_eq!(l.rules[4].action, "a");
     // Ids are never reused.
-    ok(&mut s, "system.logging.remove", json!({"id": "*1"}));
+    ok(&mut s, "system.logging.remove", json!({"id": "*5"}));
     let id = ok(
         &mut s,
         "system.logging.add",
         json!({"topics": ["info"], "action": "a"}),
     );
-    assert_eq!(id["id"], "*2");
+    assert_eq!(id["id"], "*6");
+}
+
+#[test]
+fn the_memory_action_is_built_in() {
+    let mut s = Session::virtual_lab();
+    ok(
+        &mut s,
+        "system.logging.action.set",
+        json!({"name": "memory", "memory_lines": 50}),
+    );
+    assert_eq!(s.store().running().system.logging.memory_lines, 50);
+    fails(
+        &mut s,
+        "system.logging.action.set",
+        json!({"name": "memory", "memory_lines": 0}),
+        "1..=65535",
+    );
+    fails(
+        &mut s,
+        "system.logging.action.set",
+        json!({"name": "memory", "remote": "192.0.2.1"}),
+        "only takes memory_lines",
+    );
+    fails(
+        &mut s,
+        "system.logging.action.remove",
+        json!({"name": "memory"}),
+        "cannot be removed",
+    );
+    fails(
+        &mut s,
+        "system.logging.action.add",
+        json!({"name": "memory", "remote": "192.0.2.1"}),
+        "already exists",
+    );
+    ok(
+        &mut s,
+        "system.logging.action.add",
+        json!({"name": "siem", "remote": "192.0.2.1"}),
+    );
+    fails(
+        &mut s,
+        "system.logging.action.set",
+        json!({"name": "siem", "memory_lines": 10}),
+        "only the memory action",
+    );
+    // A rule may send to memory; disabling the defaults empties the log.
+    ok(
+        &mut s,
+        "system.logging.add",
+        json!({"topics": ["dhcp", "debug"], "action": "memory"}),
+    );
+    for id in ["*1", "*2", "*3", "*4"] {
+        ok(
+            &mut s,
+            "system.logging.set",
+            json!({"id": id, "disabled": true}),
+        );
+    }
+    ok(&mut s, "log.clear", json!({}));
+    let rows = ok(&mut s, "log.print", json!({}));
+    assert_eq!(rows, json!([]), "log.clear is info: no rule sends it now");
 }
 
 #[test]

@@ -3,8 +3,9 @@
 //!
 //! As in RouterOS, an event carries topics (`system,info`, `ntp,warning`)
 //! and a rule matches when the event has every topic of the rule and none
-//! of its `!`-negated ones. Today the only action target is `remote`:
-//! syslog over UDP (RFC 5424 + RFC 5426).
+//! of its `!`-negated ones. Action targets: `remote` (syslog over UDP,
+//! RFC 5424 + RFC 5426) and the built-in `memory` (the router's own log,
+//! `log.print`; G4.6d), which keeps the last [`Logging::memory_lines`].
 
 use std::fmt;
 use std::net::IpAddr;
@@ -21,6 +22,12 @@ pub const MAX_NAME: usize = 32;
 pub const MAX_PREFIX: usize = 64;
 /// RFC 5426 §3.3: syslog over UDP goes to port 514 unless configured.
 pub const DEFAULT_PORT: u16 = 514;
+/// The built-in action of the router's own log (RouterOS `memory`): always
+/// there, never in [`Logging::actions`], cannot be removed.
+pub const MEMORY_ACTION: &str = "memory";
+/// RouterOS `memory-lines` default and range.
+pub const DEFAULT_MEMORY_LINES: u32 = 1000;
+pub const MAX_MEMORY_LINES: u32 = 65_535;
 
 /// Topics an event can carry. Rules may only name these, so a typo cannot
 /// make a rule that never matches.
@@ -29,6 +36,7 @@ pub const TOPICS: &[&str] = &[
     "critical",
     "debug",
     "dhcp",
+    "dns",
     "error",
     "firewall",
     "info",
@@ -36,8 +44,12 @@ pub const TOPICS: &[&str] = &[
     "ntp",
     "route",
     "system",
+    "tool",
     "warning",
 ];
+
+/// Topics that say how bad, not what (RouterOS levels), mildest first.
+pub const LEVELS: &[&str] = &["debug", "info", "warning", "error", "critical"];
 
 /// RFC 5424 §6.2.1, Table 1, with RouterOS' names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -335,13 +347,41 @@ pub fn valid_topic(t: &str) -> Result<(), String> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Logging {
+    /// Remote actions; the built-in [`MEMORY_ACTION`] is not listed here.
     pub actions: Vec<LogAction>,
     pub rules: Vec<LogRule>,
     /// Next id handed out by `next_rule_id`.
     pub next_rule_id: u32,
+    /// Lines the `memory` action keeps (RouterOS `memory-lines`).
+    pub memory_lines: u32,
+}
+
+/// RouterOS' default rules: `info`, `error`, `warning` and `critical` go to
+/// `memory`, so the router's log shows them out of the box (`debug` does
+/// not: it would push the useful lines out).
+impl Default for Logging {
+    fn default() -> Self {
+        let rules: Vec<LogRule> = ["info", "error", "warning", "critical"]
+            .iter()
+            .zip(1u32..)
+            .map(|(topic, id)| LogRule {
+                id: ItemId(id),
+                topics: vec![(*topic).to_owned()],
+                action: MEMORY_ACTION.to_owned(),
+                prefix: String::new(),
+                disabled: false,
+            })
+            .collect();
+        Self {
+            actions: Vec::new(),
+            next_rule_id: u32::try_from(rules.len()).unwrap_or(0),
+            rules,
+            memory_lines: DEFAULT_MEMORY_LINES,
+        }
+    }
 }
 
 impl Logging {
@@ -357,15 +397,57 @@ impl Logging {
     pub fn action(&self, name: &str) -> Option<&LogAction> {
         self.actions.iter().find(|a| a.name == name)
     }
+
+    /// `name` is an action a rule may name: a remote one or `memory`.
+    pub fn has_action(&self, name: &str) -> bool {
+        name == MEMORY_ACTION || self.action(name).is_some()
+    }
+
+    /// Some enabled rule sends events with `topics` to `memory`.
+    pub fn to_memory(&self, topics: &[String]) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.action == MEMORY_ACTION && r.matches(topics))
+    }
 }
 
 /// One thing that happened, ready to be matched against the rules.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEvent {
-    /// Unix time, seconds.
+    /// Number in the router's log, rising from 1 since start (0: not
+    /// logged yet).
+    #[serde(default)]
+    pub seq: u64,
+    /// Unix time, seconds (0: the router had no clock yet).
     pub time: u64,
     pub topics: Vec<String>,
+    /// Who caused it: `daemon`, or the account and channel of a command
+    /// (`admin · GUI`).
+    #[serde(default)]
+    pub origin: String,
+    /// For people, in Portuguese: "Ping para uol.com.br iniciado (tarefa 1)".
     pub message: String,
+    /// For the technical view: the command, its parameters, its result or
+    /// error, the revision it created. `null` when there is nothing more.
+    #[serde(default)]
+    pub detail: serde_json::Value,
+}
+
+impl LogEvent {
+    /// The level topic it carries (`info` when none).
+    pub fn level(&self) -> &str {
+        LEVELS
+            .iter()
+            .rev()
+            .find(|l| self.topics.iter().any(|t| t == *l))
+            .copied()
+            .unwrap_or("info")
+    }
+}
+
+/// Rank of a level in [`LEVELS`] (unknown: `info`'s).
+pub fn level_rank(level: &str) -> usize {
+    LEVELS.iter().position(|l| *l == level).unwrap_or(1)
 }
 
 #[cfg(test)]
@@ -429,6 +511,32 @@ mod tests {
         assert_eq!(a.remote_port, 514);
         assert_eq!(a.syslog_facility, Facility::Daemon);
         assert_eq!(a.syslog_severity, SeverityChoice::Auto);
+    }
+
+    #[test]
+    fn defaults_send_the_four_levels_to_memory() {
+        let l = Logging::default();
+        assert_eq!(l.rules.len(), 4);
+        assert_eq!(l.memory_lines, 1000);
+        assert!(l.to_memory(&topics(&["ntp", "warning"])));
+        assert!(!l.to_memory(&topics(&["dhcp", "debug"])));
+        assert!(l.has_action("memory") && !l.has_action("siem"));
+        // An old config without the field keeps the default size.
+        let back: Logging = serde_json::from_str(r#"{"rules": []}"#).unwrap();
+        assert_eq!(back.memory_lines, 1000);
+        assert!(back.rules.is_empty());
+        let mut ev = LogEvent {
+            seq: 1,
+            time: 0,
+            topics: topics(&["tool", "warning"]),
+            origin: String::new(),
+            message: String::new(),
+            detail: serde_json::Value::Null,
+        };
+        assert_eq!(ev.level(), "warning");
+        ev.topics = topics(&["system"]);
+        assert_eq!(ev.level(), "info");
+        assert!(level_rank("error") > level_rank("warning"));
     }
 
     #[test]

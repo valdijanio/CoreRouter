@@ -168,7 +168,7 @@ impl Backend for Remote {
         let req = Request {
             id: self.next,
             method: method.to_owned(),
-            params,
+            params: corerouter_ui::backend::tag_via(method, params),
         };
         if self.requests.send(req).is_err() {
             self.orphans

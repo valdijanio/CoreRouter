@@ -100,6 +100,15 @@ const TASK_WAIT_MAX: u64 = 60;
 const TASK_POLL: Duration = Duration::from_millis(200);
 const TASK_STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// The log shows what an agent changed as `… · MCP` (G4.6d), whatever
+/// `via` the arguments carried.
+fn via_mcp(mut args: Value) -> Value {
+    if let Some(o) = args.as_object_mut() {
+        o.insert("via".into(), json!("mcp"));
+    }
+    args
+}
+
 fn run_task(backend: &mut dyn Backend, args: &Value) -> Result<Value, String> {
     let command = args
         .get("command")
@@ -113,7 +122,7 @@ fn run_task(backend: &mut dyn Backend, args: &Value) -> Result<Value, String> {
     let params = args.get("params").cloned().unwrap_or(Value::Null);
     let started = backend.call(
         "engine.execute",
-        json!({"command": command, "params": params}),
+        json!({"command": command, "params": params, "via": "mcp"}),
     )?;
     let id = started
         .get("task_id")
@@ -234,8 +243,8 @@ pub fn call(backend: &mut dyn Backend, params: &Value) -> Value {
                 }
             }))
         }
-        "run_command" => text(backend.call("engine.execute", args)),
-        "command_batch" => text(backend.call("engine.batch", args)),
+        "run_command" => text(backend.call("engine.execute", via_mcp(args))),
+        "command_batch" => text(backend.call("engine.batch", via_mcp(args))),
         "inspect_state" => text(backend.call("state.inspect", args)),
         "run_task" => text(run_task(backend, &args)),
         "ui_screenshot" => match backend.call("ui.screenshot", Value::Null) {

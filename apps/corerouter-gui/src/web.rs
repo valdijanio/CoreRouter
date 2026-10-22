@@ -484,6 +484,7 @@ impl Backend for WsBackend {
     fn submit(&mut self, method: &str, params: Value) -> RequestId {
         self.next = self.next.wrapping_add(1);
         let id = self.next;
+        let params = corerouter_ui::backend::tag_via(method, params);
         let mut s = self.state.borrow_mut();
         let ready = s.conn.as_ref().map(|c| c.ws.ready_state());
         match ready {

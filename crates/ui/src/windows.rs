@@ -1,10 +1,10 @@
 //! The floating windows (WinBox MDI style) and the side menu layout.
 
-use egui::{Grid, RichText, TextEdit};
+use egui::{Grid, TextEdit};
 use serde_json::{Value, json};
 
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment};
-use crate::{CoreRouterUi, err_color, value_text};
+use crate::{CoreRouterUi, value_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Win {
@@ -25,7 +25,6 @@ pub enum Win {
     History,
     Ping,
     Mtr,
-    Log,
     /// A panel's window, by its `WinDef::id` (`panel.rs`): new windows are
     /// panels, so this enum and the menu below need no edit.
     Panel(&'static str),
@@ -55,7 +54,8 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("CGNAT", &[Win::Cgnat]),
     ("System", &[Win::Identity, Win::History]),
     ("Tools", &[Win::Ping, Win::Mtr]),
-    ("Log", &[Win::Log]),
+    // The Log window is a panel (`system_log.rs`, G4.6d).
+    ("Log", &[]),
 ];
 
 /// The side menu as drawn: every group with its built-in and panel windows,
@@ -98,7 +98,6 @@ impl Win {
         Win::History,
         Win::Ping,
         Win::Mtr,
-        Win::Log,
     ];
 
     /// Every window: the built-in ones, then the panels'.
@@ -133,7 +132,6 @@ impl Win {
             Win::History => "History",
             Win::Ping => "Ping",
             Win::Mtr => "MTR",
-            Win::Log => "Log",
         }
     }
 
@@ -164,7 +162,6 @@ impl Win {
                 | Win::Vrf
                 | Win::Neighbors
                 | Win::History
-                | Win::Log
         )
     }
 
@@ -173,7 +170,6 @@ impl Win {
             Win::Interfaces => [780.0, 520.0],
             Win::Neighbors => [820.0, 320.0],
             Win::Addresses => [760.0, 300.0],
-            Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
             Win::Panel(id) => crate::panel::find(id).map_or([380.0, 200.0], |(_, w)| w.size),
             Win::Vrf => [600.0, 260.0],
@@ -209,7 +205,6 @@ impl CoreRouterUi {
             Win::Bgp => self.bgp(ui),
             Win::Identity => self.identity(ui),
             Win::History => self.history(ui),
-            Win::Log => self.log_window(ui),
             Win::Ping => self.ping_window(ui),
             Win::Mtr => self.mtr_window(ui),
             _ => {}
@@ -484,21 +479,6 @@ impl CoreRouterUi {
         if let Some(n) = rollback {
             self.run("config.rollback", json!({ "revision": n }));
         }
-    }
-
-    fn log_window(&mut self, ui: &mut egui::Ui) {
-        egui::ScrollArea::vertical()
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for l in &self.log {
-                    let text = RichText::new(format!("{}  {}", l.command, l.message)).monospace();
-                    if l.ok {
-                        ui.label(text);
-                    } else {
-                        ui.label(text.color(err_color(ui)));
-                    }
-                }
-            });
     }
 }
 

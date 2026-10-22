@@ -42,7 +42,13 @@ pub enum Request {
 }
 
 impl Request {
-    pub fn call(method: &str, params: Value) -> Self {
+    pub fn call(method: &str, mut params: Value) -> Self {
+        // The log shows a change made here as `… · terminal` (G4.6d).
+        if matches!(method, "engine.execute" | "engine.batch")
+            && let Some(o) = params.as_object_mut()
+        {
+            o.entry("via").or_insert_with(|| json!("terminal"));
+        }
         Self::Call {
             method: method.to_owned(),
             params,

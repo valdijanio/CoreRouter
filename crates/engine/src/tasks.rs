@@ -205,6 +205,10 @@ struct Entry {
     kind: &'static str,
     title: String,
     owner: String,
+    /// Who started it, as the log shows it (G4.6d).
+    origin: String,
+    /// Its end is in the log already.
+    logged_end: bool,
     /// Session clock (Unix seconds) at start and at the last poll; `None`
     /// without a clock (then nothing expires by time).
     started: Option<u64>,
@@ -263,6 +267,65 @@ impl Tasks {
     }
 }
 
+/// "Ping" and " para uol.com.br" of a task, for the log.
+fn tool_words(kind: &str, title: &str) -> (String, String) {
+    let (name, verb, prep) = match kind {
+        "ping" => ("Ping", "ping ", " para "),
+        "mtu" => ("Descoberta de MTU", "mtu ", " para "),
+        "mtr" => ("MTR", "mtr ", " para "),
+        "cable-test" => ("Teste de cabo", "cable test ", " em "),
+        other => (other, "", " "),
+    };
+    let target = title.strip_prefix(verb).unwrap_or(title);
+    let target = if target.is_empty() {
+        String::new()
+    } else {
+        format!("{prep}{target}")
+    };
+    (name.to_owned(), target)
+}
+
+/// ": 4 enviados, 4 recebidos, 0% perdidos" from a ping summary (one
+/// target), or nothing.
+fn outcome(summary: &Value) -> String {
+    let targets = summary.get("targets").and_then(Value::as_array);
+    let Some([t]) = targets.map(Vec::as_slice) else {
+        return String::new();
+    };
+    match (
+        t.get("sent").and_then(Value::as_u64),
+        t.get("received").and_then(Value::as_u64),
+        t.get("loss_pct").and_then(Value::as_f64),
+    ) {
+        (Some(sent), Some(received), Some(loss)) => {
+            format!(": {sent} enviados, {received} recebidos, {loss:.0}% perdidos")
+        }
+        _ => String::new(),
+    }
+}
+
+/// `{sent, received, loss_pct}` of each target of a ping summary.
+fn totals(summary: &Value) -> Value {
+    let targets = summary.get("targets").and_then(Value::as_array);
+    Value::Array(
+        targets
+            .map(|t| {
+                t.iter()
+                    .take(8)
+                    .map(|t| {
+                        json!({
+                            "host": t.get("host"),
+                            "sent": t.get("sent"),
+                            "received": t.get("received"),
+                            "loss_pct": t.get("loss_pct"),
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    )
+}
+
 /// Why tool commands are disabled here, if they are.
 pub(crate) fn can_start(s: &Session) -> std::result::Result<(), String> {
     if s.tasks.runner.is_none() {
@@ -306,6 +369,7 @@ impl Session {
     }
 
     pub(crate) fn expire_tasks(&mut self) {
+        self.log_finished_tasks();
         if let Some(now) = self.now() {
             self.tasks.expire(now);
         }
@@ -349,14 +413,78 @@ impl Session {
             id,
             Entry {
                 kind,
-                title,
+                title: title.clone(),
                 owner: self.caller().name.clone(),
+                origin: crate::logging::origin(self.caller()),
+                logged_end: false,
                 started: now,
                 seen: now,
                 cell,
             },
         );
+        let origin = crate::logging::origin(self.caller());
+        let (name, target) = tool_words(kind, &title);
+        self.log_event(
+            &["tool", "info"],
+            &origin,
+            format!("{name}{target} iniciado (tarefa {id})"),
+            json!({ "task": id, "kind": kind, "title": title }),
+        );
         Ok(id)
+    }
+
+    /// Log the end of tasks that finished since the last look: `tool,info`
+    /// when done or stopped, `tool,warning` with the reason when failed.
+    fn log_finished_tasks(&mut self) {
+        let mut ended = Vec::new();
+        for (id, e) in &mut self.tasks.entries {
+            if e.logged_end {
+                continue;
+            }
+            let d = e.cell.data();
+            if d.state == TaskState::Running {
+                continue;
+            }
+            e.logged_end = true;
+            ended.push((
+                *id,
+                e.kind,
+                e.title.clone(),
+                e.origin.clone(),
+                d.state.clone(),
+                d.reason.clone(),
+                d.summary.clone(),
+            ));
+        }
+        for (id, kind, title, origin, state, reason, summary) in ended {
+            let (name, target) = tool_words(kind, &title);
+            let head = format!("{name}{target}");
+            let (level, message) = match state {
+                TaskState::Failed => (
+                    "warning",
+                    format!(
+                        "{head} falhou (tarefa {id}): {}",
+                        reason.as_deref().unwrap_or("motivo desconhecido")
+                    ),
+                ),
+                TaskState::Stopped => (
+                    "info",
+                    format!("{head} parado (tarefa {id}){}", outcome(&summary)),
+                ),
+                _ => (
+                    "info",
+                    format!("{head} terminou (tarefa {id}){}", outcome(&summary)),
+                ),
+            };
+            self.log_event(
+                &["tool", level],
+                &origin,
+                message,
+                // The summary itself stays in the tool's window (it can be
+                // large): the log keeps what it says in numbers.
+                json!({ "task": id, "kind": kind, "state": state, "reason": reason, "totals": totals(&summary) }),
+            );
+        }
     }
 
     pub(crate) fn task_list(&mut self) -> Value {
@@ -382,6 +510,7 @@ impl Session {
 
     /// Events after `after_seq` (at most `max`), the summary and the state.
     pub(crate) fn task_poll(&mut self, id: u64, after_seq: u64, max: usize) -> Result<Value> {
+        self.log_finished_tasks();
         let now = self.now();
         let e = self.task(id)?;
         if now.is_some() {
@@ -559,6 +688,21 @@ mod tests {
         let p = wait_done(&mut s, id);
         assert_eq!(p["state"], "failed");
         assert_eq!(p["reason"], "no route");
+        // The log has its start and, once looked at, its failure (G4.6d).
+        s.task_list();
+        let log = s.log_since(0);
+        let msgs: Vec<(&str, &str)> = log
+            .iter()
+            .map(|e| (e.topics[1].as_str(), e.message.as_str()))
+            .collect();
+        assert_eq!(
+            msgs,
+            [
+                ("info", "test bad iniciado (tarefa 1)"),
+                ("warning", "test bad falhou (tarefa 1): no route"),
+            ]
+        );
+        assert_eq!(log[0].origin, "local");
         #[allow(clippy::panic)]
         let id = s
             .start_task("test", "crash".into(), |_| panic!("boom"))
