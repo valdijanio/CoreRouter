@@ -27,6 +27,10 @@ jobs:
     name: xtask ci (linux)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # G1.14: o teste de VRF em netns falha em vez de pular (e o passo netns
+      # do xtask também) se o módulo `vrf` não estiver carregado.
+      COREROUTER_REQUIRE_VRF: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -56,6 +60,17 @@ jobs:
       # muda a VM descartável do runner. Se não pegar, o passo netns vira "skip".
       - name: Liberar user namespaces sem root
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      # G1.14: um user namespace não carrega módulos; carregamos o `vrf` aqui, na
+      # VM descartável do runner (o sudo dos agentes, localmente, continua proibido).
+      # Imagens do Azure às vezes trazem o vrf.ko só em linux-modules-extra.
+      - name: Carregar o módulo vrf
+        run: |
+          if ! sudo modprobe vrf; then
+            sudo apt-get install -y --no-install-recommends "linux-modules-extra-$(uname -r)"
+            sudo modprobe vrf
+          fi
+          lsmod | grep -w '^vrf'
 
       - name: cargo xtask ci
         run: cargo xtask ci

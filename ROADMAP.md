@@ -18,10 +18,12 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   (interface, ip address, BGP instance, identity, config commit/rollback/diff/mode), guard de
   panic, modos immediate/transactional, canal de controle, MCP stdio (5 tools + aliases), GUI egui
   estilo WinBox (nativo + wasm, `ui.screenshot`), `cargo xtask ci`.
+
 - 2026-10-21 — G0.2: `.github/workflows/ci.yml` — em push/PR para `main`, `cargo xtask ci` em
   ubuntu-latest (toolchain do `rust-toolchain.toml`, deps de sistema do eframe, rust-cache) e
   build de gui/cli/daemon em macOS e Windows. Actions fixadas por SHA. Validado só localmente
   (`cargo xtask ci`); primeira execução no GitHub fica para o push.
+
 - 2026-10-21 — G1.1: `interface.vlan.add`, `interface.bridge.add`, `interface.bridge.port.add`/
   `remove`/`list`, `interface.loopback.add`, `interface.remove` (21 comandos no total). Porta de
   bridge é o campo `Interface.bridge` (uma bridge por porta por construção). Validação: VLAN com
@@ -29,6 +31,7 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   porta física e diz o que remover antes (endereço, VLAN filha, porta de bridge). Janela
   Interfaces com coluna Info, remover por linha e formulários VLAN/bridge/loopback/porta. 15
   testes novos no engine + 1 na UI; screenshot conferido. Bonding virou G1.8.
+
 - 2026-10-21 — G0.6: persistência da config. `model::persist` (de)serializa running + histórico
   em JSON versionado (`format_version` 1, limite de 64 MiB, invariantes conferidas: revisões
   crescentes, running = última revisão). Trait `ConfigStorage` no engine (slots current/previous +
@@ -95,6 +98,7 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   `--config-dir` + GUI `--connect`, comentários em ether2/ether5, Inline Comments e tema
   claro ligados pela GUI real (xdotool), screenshots nos dois temas conferidos; GUI fechada e
   reaberta voltou em tema claro com os comentários inline.
+
 - 2026-10-21 — G1.5: rotas estáticas e VRF básico. Modelo: `ip.routes` (`RouteEntry` com
   `dst_address` IPv4/IPv6 incluindo `0.0.0.0/0` e `::/0`, `gateway` IP / interface /
   `ip%interface`, `distance` 1..=255, `routing_table`, ids `*N`); VRF = interface tipo `vrf`
@@ -150,6 +154,24 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   área, restaurar devolve o retângulo, duplo clique, menu, redimensionar a área, arrastar/recolher,
   janela de propriedades); conferido na GUI real (xdotool + `screenshot`).
 
+- 2026-10-22 — G1.14: kernel sem VRF. `Hal::features() -> Features { vrf }` (aditivo, padrão
+  "tudo"; `VirtualHal` diz sim). `LinuxHal` sonda uma vez, na primeira consulta, criando um link
+  `vrf` descartável (`crvrf<pid>`, tabela fora da faixa do engine; nome ocupado é pulado, só o
+  link criado pela sonda é apagado) e guarda o resultado; sonda indecisa (sem `CAP_NET_ADMIN`)
+  assume sim e registra o motivo. `ip.vrf.add` ganha `enabled`: sem VRF, fica desabilitado com
+  "this kernel has no VRF support (CONFIG_NET_VRF / module vrf)" (menus e `list_commands`
+  mostram o motivo); criar link `vrf` com EOPNOTSUPP no `apply` dá o mesmo texto (o rollback já
+  era limpo). `Session::hal()` (leitura, `pub(crate)`) é a única mudança em `session.rs`. CI: o
+  job Linux roda `sudo modprobe vrf` (com `linux-modules-extra-$(uname -r)` como plano B) e
+  `COREROUTER_REQUIRE_VRF=1`, que faz `vrf_routes_live_in_their_own_table` falhar em vez de
+  pular e transforma o `skip` do passo netns do xtask em FAIL. Testes: 2 de engine (HAL falso
+  sem VRF; lab virtual), 2 unitários do mapeamento de erro/veredito da sonda, 1 em netns (sonda
+  = `ip link add … type vrf`, sem sobras). Rodando de verdade, o teste de VRF mostrou uma corrida
+  do G1.5: ele e `static_routes_and_link_state` punham `0.0.0.0/0` métrica 1 na `main` do mesmo
+  namespace em paralelo (EEXIST em ~1 de 5 rodadas, **medido**); a rota da `main` no teste de VRF
+  passou a distance 5 (40 rodadas seguidas limpas, **medido**). `xtask netns` sem `--quiet`, para o
+  log da CI listar cada teste.
+
 - 2026-10-22 — G1.4: Safe Mode com a semântica do RouterOS (help.mikrotik.com, "Configuration
   Management"). `config.safe-mode.enter {timeout_secs?}` (10..=86400; o dono de novo re-arma o
   prazo), `exit {force?}` (confirma e salva), `cancel {force?}` (desfaz); `safe_mode` no resumo
@@ -177,4 +199,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G5.2 (Parte 1).
 - 2026-10-21 — log do G1.12.
 - 2026-10-21 — log do G1.5.
+- 2026-10-22 — log do G1.14.
 - 2026-10-22 — log do G1.4.

@@ -2,7 +2,7 @@
 
 use corerouter_model::{Config, IfName};
 
-use crate::{Hal, HalError, LinkInfo, LinkState};
+use crate::{Features, Hal, HalError, LinkInfo, LinkState};
 
 #[derive(Debug, Clone)]
 pub struct VirtualHal {
@@ -89,6 +89,10 @@ impl Hal for VirtualHal {
 
     fn now_unix(&self) -> Option<u64> {
         None
+    }
+
+    fn features(&self) -> Features {
+        Features { vrf: true }
     }
 }
 
