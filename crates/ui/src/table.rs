@@ -8,34 +8,60 @@
 //! those into `CoreRouterUi::run` calls. Shortcuts follow the WinBox v3/v4
 //! tables (help.mikrotik.com, WinBox page): Delete removes, Ctrl+E enables,
 //! Ctrl+D disables, Ctrl+M comments, Ctrl+F jumps to the find field.
+//!
+//! Comments: a table whose columns include [`comment`] shows the item's
+//! comment either in that column or, with "Inline Comments" ticked in its
+//! context menu, as a band above the item (WinBox v4 "Comment Type: header",
+//! the `;;;` line of the RouterOS terminal). The band belongs to the item:
+//! clicking, double clicking and right clicking it act on the item.
 
 use std::collections::BTreeSet;
 
 use egui::{
     Align2, Button, Color32, EventFilter, Id, Key, Modifiers, Rect, ScrollArea, Sense, Stroke,
-    TextEdit, TextStyle, Ui, pos2, vec2,
+    TextEdit, TextStyle, Ui, Visuals, pos2, vec2,
 };
 
 /// Horizontal padding inside each cell, in points.
 const CELL_PAD: f32 = 6.0;
 /// Rows the table lays out at most; a longer list is cut (and says so).
 pub(crate) const MAX_ROWS: usize = 10_000;
+/// Left edge of an inline comment's text: room for the accent bar and icon.
+const NOTE_INDENT: f32 = 30.0;
+/// Characters of a comment drawn inline; the rest is cut with "…".
+const NOTE_CHARS: usize = 512;
 
 pub(crate) struct Column {
     pub title: &'static str,
     /// Numbers read better right-aligned.
     pub right: bool,
+    /// The item's comment: drawn above the row with Inline Comments on.
+    pub comment: bool,
 }
 
 pub(crate) const fn col(title: &'static str) -> Column {
     Column {
         title,
         right: false,
+        comment: false,
     }
 }
 
 pub(crate) const fn num(title: &'static str) -> Column {
-    Column { title, right: true }
+    Column {
+        title,
+        right: true,
+        comment: false,
+    }
+}
+
+/// The "Comment" column, which Inline Comments turns into a band.
+pub(crate) const fn comment() -> Column {
+    Column {
+        title: "Comment",
+        right: false,
+        comment: true,
+    }
 }
 
 pub(crate) struct Row {
@@ -75,15 +101,21 @@ pub(crate) enum Shortcut {
 pub(crate) struct TableOutput {
     /// Key of the row that was double-clicked.
     pub opened: Option<String>,
+    /// Key of the item whose inline comment was double-clicked: edit the
+    /// comment (a window without a comment dialog treats it as `opened`).
+    pub comment: Option<String>,
     pub shortcut: Option<Shortcut>,
 }
 
-/// UI-local state of one table: selection, Shift anchor, find text.
+/// UI-local state of one table: selection, Shift anchor, find text, and
+/// how comments are shown.
 #[derive(Default)]
 pub(crate) struct TableState {
     selected: BTreeSet<String>,
     anchor: Option<String>,
     pub filter: String,
+    /// Comments as a band above each item instead of a column.
+    pub inline_comments: bool,
 }
 
 impl TableState {
@@ -222,7 +254,8 @@ pub(crate) fn action(ui: &mut Ui, text: &str, enabled: Result<(), String>) -> bo
 }
 
 /// Toolbar icons, painted (egui's bundled font has no ✓/✗ glyphs) in the
-/// WinBox colours: blue add, red remove/disable, green enable, yellow note.
+/// WinBox colours: blue add, red remove/disable, green enable, yellow note;
+/// a deeper shade of each on the light theme, so they keep their contrast.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum Icon {
     Add,
@@ -233,12 +266,16 @@ pub(crate) enum Icon {
 }
 
 impl Icon {
-    fn color(self) -> Color32 {
-        match self {
-            Icon::Add => Color32::from_rgb(80, 150, 240),
-            Icon::Remove | Icon::Disable => Color32::from_rgb(225, 80, 70),
-            Icon::Enable => Color32::from_rgb(70, 185, 90),
-            Icon::Comment => Color32::from_rgb(235, 195, 70),
+    fn color(self, dark: bool) -> Color32 {
+        match (self, dark) {
+            (Icon::Add, true) => Color32::from_rgb(80, 150, 240),
+            (Icon::Add, false) => Color32::from_rgb(30, 105, 210),
+            (Icon::Remove | Icon::Disable, true) => Color32::from_rgb(225, 80, 70),
+            (Icon::Remove | Icon::Disable, false) => Color32::from_rgb(200, 45, 35),
+            (Icon::Enable, true) => Color32::from_rgb(70, 185, 90),
+            (Icon::Enable, false) => Color32::from_rgb(30, 140, 55),
+            (Icon::Comment, true) => Color32::from_rgb(235, 195, 70),
+            (Icon::Comment, false) => Color32::from_rgb(215, 160, 20),
         }
     }
 
@@ -304,7 +341,10 @@ pub(crate) fn tool(
     };
     let resp = ui.interact(rect, tool_id(salt, icon), sense);
     let (visuals, color) = match &enabled {
-        Ok(()) => (*ui.style().interact(&resp), icon.color()),
+        Ok(()) => (
+            *ui.style().interact(&resp),
+            icon.color(ui.visuals().dark_mode),
+        ),
         Err(_) => (
             ui.visuals().widgets.noninteractive,
             ui.visuals().weak_text_color(),
@@ -347,20 +387,44 @@ pub(crate) fn show(
     let visuals = ui.visuals().clone();
     let row_h = ui.spacing().interact_size.y;
 
-    // Column widths fit the widest cell, so no text is ever cut.
-    let mut widths: Vec<f32> = columns
+    // With Inline Comments the comment column turns into a band above the
+    // item; the cell text stays in the row, so Find still matches it.
+    let note_col = columns.iter().position(|c| c.comment);
+    let inline = state.inline_comments && note_col.is_some();
+    let shown: Vec<usize> = (0..columns.len())
+        .filter(|&i| !(inline && note_col == Some(i)))
+        .collect();
+    let notes: Vec<Option<String>> = visible
         .iter()
-        .map(|c| text_width(ui, c.title, &font))
+        .map(|r| {
+            note_col
+                .filter(|_| inline)
+                .and_then(|i| r.cells.get(i))
+                .and_then(|c| note_text(c))
+        })
+        .collect();
+
+    // Column widths fit the widest cell, so no text is ever cut.
+    let mut layout: Vec<(usize, f32)> = shown
+        .iter()
+        .filter_map(|&i| Some((i, text_width(ui, columns.get(i)?.title, &font))))
         .collect();
     for r in &visible {
-        for (w, cell) in widths.iter_mut().zip(&r.cells) {
-            *w = w.max(text_width(ui, cell, &font));
+        for (i, w) in &mut layout {
+            if let Some(cell) = r.cells.get(*i) {
+                *w = w.max(text_width(ui, cell, &font));
+            }
         }
     }
-    for w in &mut widths {
+    for (_, w) in &mut layout {
         *w += 2.0 * CELL_PAD;
     }
-    let content_w: f32 = widths.iter().sum();
+    let notes_w = notes
+        .iter()
+        .flatten()
+        .map(|n| NOTE_INDENT + text_width(ui, n, &font) + 2.0 * CELL_PAD)
+        .fold(0.0, f32::max);
+    let content_w = layout.iter().map(|(_, w)| w).sum::<f32>().max(notes_w);
 
     let status_h = row_h + ui.spacing().item_spacing.y + reserve;
     ScrollArea::both()
@@ -374,9 +438,9 @@ pub(crate) fn show(
             paint_cells(
                 ui,
                 head,
-                &widths,
+                &layout,
                 columns,
-                columns.iter().map(|c| c.title),
+                |i| columns.get(i).map_or("", |c| c.title),
                 visuals.strong_text_color(),
                 &font,
             );
@@ -390,16 +454,19 @@ pub(crate) fn show(
             // owns the "Add / Select All / Refresh" menu. Registered before
             // the rows so a row on top of it wins the hit test.
             let top = ui.cursor().min.y;
-            let rows_h = row_h * visible.len() as f32;
+            let bands = notes.iter().flatten().count();
+            let rows_h = row_h * (visible.len() + bands) as f32;
             let body = Rect::from_min_size(
                 pos2(head.left(), top),
                 vec2(width, rows_h.max(ui.available_height())),
             );
             let bg = ui.interact(body, id, Sense::click());
 
-            for (i, row) in visible.iter().enumerate() {
-                let (rect, _) = ui.allocate_exact_size(vec2(width, row_h), Sense::hover());
-                let resp = ui.interact(rect, row_id(salt, &row.key), Sense::click());
+            for (i, (row, note)) in visible.iter().zip(&notes).enumerate() {
+                // One item: the comment band (if any) and the row under it.
+                let item_h = if note.is_some() { 2.0 * row_h } else { row_h };
+                let (item, _) = ui.allocate_exact_size(vec2(width, item_h), Sense::hover());
+                let resp = ui.interact(item, row_id(salt, &row.key), Sense::click());
                 let selected = state.is_selected(&row.key);
                 let fill = if selected {
                     Some(visuals.selection.bg_fill)
@@ -411,7 +478,12 @@ pub(crate) fn show(
                     None
                 };
                 if let Some(fill) = fill {
-                    ui.painter().rect_filled(rect, 0.0, fill);
+                    ui.painter().rect_filled(item, 0.0, fill);
+                }
+                let rect = Rect::from_min_max(pos2(item.left(), item.bottom() - row_h), item.max);
+                let band = Rect::from_min_max(item.min, pos2(item.right(), rect.top()));
+                if let Some(note) = note {
+                    paint_note(ui, band, note, selected, row.dimmed, &font);
                 }
                 let color = match (selected, row.dimmed) {
                     (true, _) => visuals.selection.stroke.color,
@@ -421,9 +493,9 @@ pub(crate) fn show(
                 paint_cells(
                     ui,
                     rect,
-                    &widths,
+                    &layout,
                     columns,
-                    row.cells.iter().map(String::as_str),
+                    |c| row.cells.get(c).map_or("", String::as_str),
                     color,
                     &font,
                 );
@@ -442,10 +514,22 @@ pub(crate) fn show(
                     ui.memory_mut(|mem| mem.request_focus(id));
                 }
                 if resp.double_clicked() {
-                    out.opened = Some(row.key.clone());
+                    let on_note = note.is_some()
+                        && ui
+                            .input(|i| i.pointer.latest_pos())
+                            .is_some_and(|p| band.contains(p));
+                    if on_note {
+                        out.comment = Some(row.key.clone());
+                    } else {
+                        out.opened = Some(row.key.clone());
+                    }
                 }
                 let sel = state.selection(rows);
-                resp.context_menu(|ui| menu(ui, Menu::Rows(&sel)));
+                let inline_comments = &mut state.inline_comments;
+                resp.context_menu(|ui| {
+                    menu(ui, Menu::Rows(&sel));
+                    inline_toggle(ui, note_col.is_some(), inline_comments);
+                });
             }
             let rest = (body.bottom() - ui.cursor().min.y).max(0.0);
             ui.allocate_space(vec2(width, rest));
@@ -454,7 +538,11 @@ pub(crate) fn show(
                 state.clear();
                 ui.memory_mut(|mem| mem.request_focus(id));
             }
-            bg.context_menu(|ui| menu(ui, Menu::Empty));
+            let inline_comments = &mut state.inline_comments;
+            bg.context_menu(|ui| {
+                menu(ui, Menu::Empty);
+                inline_toggle(ui, note_col.is_some(), inline_comments);
+            });
         });
 
     keyboard(ui, salt, state, &order, rows, &mut out);
@@ -475,6 +563,96 @@ pub(crate) fn show(
     }
     ui.weak(status);
     out
+}
+
+/// The "Inline Comments" entry closing every context menu of a table that
+/// has a comment column.
+fn inline_toggle(ui: &mut Ui, has_comments: bool, on: &mut bool) {
+    if !has_comments {
+        return;
+    }
+    ui.separator();
+    if ui.checkbox(on, "Inline Comments").clicked() {
+        ui.close();
+    }
+}
+
+/// A comment as one line for the band; `None` when there is nothing to show.
+fn note_text(cell: &str) -> Option<String> {
+    let flat = cell.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.is_empty() {
+        return None;
+    }
+    if flat.chars().count() <= NOTE_CHARS {
+        return Some(flat);
+    }
+    let mut cut: String = flat.chars().take(NOTE_CHARS).collect();
+    cut.push('…');
+    Some(cut)
+}
+
+/// Accent of the comment band: a calm blue that reads on both themes.
+fn note_accent(v: &Visuals) -> Color32 {
+    if v.dark_mode {
+        Color32::from_rgb(105, 160, 235)
+    } else {
+        Color32::from_rgb(35, 105, 200)
+    }
+}
+
+/// The band above a commented item: a faint accent wash, an accent bar and
+/// a speech-bubble icon at the left, and the comment in italics.
+fn paint_note(ui: &Ui, band: Rect, text: &str, selected: bool, dimmed: bool, font: &egui::FontId) {
+    let v = ui.visuals();
+    let painter = ui.painter();
+    let accent = note_accent(v);
+    let ink = match (selected, v.dark_mode) {
+        (true, _) => v.selection.stroke.color,
+        (false, true) => Color32::from_rgb(170, 205, 250),
+        (false, false) => Color32::from_rgb(25, 80, 160),
+    };
+    let ink = if dimmed && !selected {
+        ink.gamma_multiply(0.6)
+    } else {
+        ink
+    };
+    if !selected {
+        let wash = accent.gamma_multiply(if v.dark_mode { 0.16 } else { 0.10 });
+        painter.rect_filled(band, 0.0, wash);
+    }
+    let bar = Rect::from_min_size(band.min, vec2(3.0, band.height()));
+    painter.rect_filled(bar, 0.0, if selected { ink } else { accent });
+
+    // Speech bubble: a rounded body with a tail at its lower left.
+    let c = pos2(band.left() + 16.0, band.center().y - 1.0);
+    let body = Rect::from_center_size(c, vec2(12.0, 8.0));
+    let icon = if selected { ink } else { accent };
+    painter.rect_filled(body, 2.5, icon);
+    painter.add(egui::Shape::convex_polygon(
+        vec![
+            pos2(body.left() + 2.0, body.bottom() - 0.5),
+            pos2(body.left() + 6.0, body.bottom() - 0.5),
+            pos2(body.left() + 1.5, body.bottom() + 3.5),
+        ],
+        icon,
+        Stroke::NONE,
+    ));
+
+    let job = egui::text::LayoutJob::single_section(
+        text.to_owned(),
+        egui::TextFormat {
+            font_id: font.clone(),
+            color: ink,
+            italics: true,
+            ..Default::default()
+        },
+    );
+    let galley = painter.layout_job(job);
+    let at = pos2(
+        band.left() + NOTE_INDENT,
+        band.center().y - galley.size().y / 2.0,
+    );
+    painter.galley(at, galley, ink);
 }
 
 /// Shortcuts act only while the table has keyboard focus (it gets it from a
@@ -541,18 +719,21 @@ fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
         .x
 }
 
+/// Paint one line of cells; `layout` is (column index, width) of the
+/// columns shown, `text` the cell of a column index.
 fn paint_cells<'a>(
     ui: &Ui,
     rect: Rect,
-    widths: &[f32],
+    layout: &[(usize, f32)],
     columns: &[Column],
-    cells: impl Iterator<Item = &'a str>,
+    text: impl Fn(usize) -> &'a str,
     color: egui::Color32,
     font: &egui::FontId,
 ) {
     let mut x = rect.left();
-    for ((w, c), text) in widths.iter().zip(columns).zip(cells) {
-        let (anchor, at) = if c.right {
+    for &(i, w) in layout {
+        let right = columns.get(i).is_some_and(|c| c.right);
+        let (anchor, at) = if right {
             (
                 Align2::RIGHT_CENTER,
                 pos2(x + w - CELL_PAD, rect.center().y),
@@ -560,7 +741,7 @@ fn paint_cells<'a>(
         } else {
             (Align2::LEFT_CENTER, pos2(x + CELL_PAD, rect.center().y))
         };
-        ui.painter().text(at, anchor, text, font.clone(), color);
+        ui.painter().text(at, anchor, text(i), font.clone(), color);
         x += w;
     }
 }
