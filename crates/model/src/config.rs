@@ -243,6 +243,9 @@ pub struct Ip {
     /// `/ip dns` (G4.1a): the router's resolver and its cache.
     #[serde(skip_serializing_if = "Dns::is_default")]
     pub dns: Dns,
+    /// `/ip dns static` (G4.1b).
+    #[serde(skip_serializing_if = "crate::dns_static::DnsStatic::is_empty")]
+    pub dns_static: crate::dns_static::DnsStatic,
 }
 
 impl Ip {

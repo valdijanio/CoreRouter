@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-proto-dns"
-description = "L2: DNS stub resolver over hickory-proto: queries, reply checks, TTL cache, server failover (no sockets: the caller brings the transport)"
+description = "L2: DNS over hickory-proto: the router's resolver (TTL cache, server failover, serve-stale) and the LAN forwarder's chain of stages (no sockets: the caller brings the transport)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,6 +14,10 @@ corerouter-model.workspace = true
 # threads, docs/architecture.md "DNS").
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 thiserror.workspace = true
+ipnet.workspace = true
+# `/ip dns static` regexp: linear time, no backtracking (hostile patterns
+# cannot stall the forwarder).
+regex = { version = "1.13.1", default-features = false, features = ["std", "perf", "unicode-case", "unicode-perl"] }
 
 [dev-dependencies]
 proptest.workspace = true
@@ -21,6 +25,10 @@ criterion.workspace = true
 
 [[bench]]
 name = "resolver"
+harness = false
+
+[[bench]]
+name = "forwarder"
 harness = false
 
 [lints]

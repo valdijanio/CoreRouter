@@ -12,7 +12,7 @@
 
 use std::net::IpAddr;
 
-use corerouter_model::dns::QType;
+use hickory_proto::rr::RecordType;
 
 use crate::resolver::{ResolveError, Resolver, Transport};
 use crate::reverse::{printable, reversed};
@@ -91,12 +91,12 @@ pub fn lookup(
     t: &mut dyn Transport,
     ip: IpAddr,
 ) -> Result<Option<Origin>, ResolveError> {
-    let Some(mut o) = best_origin(&r.records(t, &origin_name(ip), QType::Txt)?) else {
+    let Some(mut o) = best_origin(&r.records(t, &origin_name(ip), RecordType::TXT)?) else {
         return Ok(None);
     };
     // Without a name the number still helps: a failure here is not one.
     o.name = r
-        .records(t, &as_name(o.asn), QType::Txt)
+        .records(t, &as_name(o.asn), RecordType::TXT)
         .ok()
         .and_then(|txts| txts.iter().find_map(|t| parse_as_name(t)));
     Ok(Some(o))
