@@ -263,6 +263,10 @@ pub fn run(backend: &mut dyn Backend, user: &str) -> Result<(), String> {
             print(&out, true);
             continue;
         }
+        // `print` fits the terminal (like RouterOS); a pipe has no width.
+        shell
+            .borrow_mut()
+            .set_width(rl.dimensions().map(|(cols, _)| usize::from(cols)));
         let prompt = plain(&shell.borrow().prompt());
         let read = rl.readline_with_initial(&prompt, (&keep, ""));
         keep.clear();
