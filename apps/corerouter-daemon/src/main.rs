@@ -1,6 +1,7 @@
 //! `corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-dir <dir>]
 //!  [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
-//!  [--discovery-port <port> | --no-discovery] [--discovery-transport interfaces|loopback]`
+//!  [--discovery-port <port> | --no-discovery] [--discovery-transport interfaces|loopback]
+//!  [--manage <names>] [--unmanaged <names>]`
 //!
 //! The virtual backend is the default: touching a real kernel must be an
 //! explicit choice. TLS/auth for remote management is docs/gaps.md G0.3, so
@@ -30,6 +31,12 @@
 //! and announces on none until told to. `--discovery-transport` overrides the
 //! choice (a lab run in a network namespace over veths named like its ports
 //! uses `interfaces`; that is how the netns test exercises the real path).
+//!
+//! Ownership (G1.18, docs/architecture.md): the linux backend manages the
+//! physical ports, veths whose peer is in the same namespace, and what
+//! CoreRouter created; other links (docker0, a container's veth, ppp, `lo`)
+//! are listed as unmanaged and never touched. `--manage` adds veth/dummy
+//! links, `--unmanaged` sets ports aside (names or `prefix*`, comma-separated).
 //!
 //! Graceful shutdown (G5.5): on SIGINT (Ctrl+C) or SIGTERM (`kill`) the
 //! daemon stops accepting control and WebSocket connections, sends the
@@ -71,6 +78,7 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                          [--ws <port> [--ws-origin <origin>]... [--web-root <dir>]]
                          [--discovery-port <port> | --no-discovery]
                          [--discovery-transport interfaces|loopback]
+                         [--manage <names>] [--unmanaged <names>]
 
   --ws <port>           WebSocket for the web GUI on 127.0.0.1:<port>
   --ws-origin <origin>  also allow pages from <origin> (e.g. http://127.0.0.1:8080 for
@@ -82,7 +90,10 @@ usage: corerouter-daemon [--control <port>] [--backend virtual|linux] [--config-
                         backend LLDP and MNDP)
   --discovery-transport where CRDP announces: `interfaces` (host interfaces named like the
                         router's; default of --backend linux) or `loopback` (this host
-                        only, labs see each other; default of --backend virtual)";
+                        only, labs see each other; default of --backend virtual)
+  --manage <names>      linux backend: also manage these veth/dummy links (comma-separated
+                        names or prefix*, e.g. `lab*`)
+  --unmanaged <names>   linux backend: never touch these links, physical ports included";
 
 /// Longest wait for the discovery goodbyes when shutting down.
 const GOODBYE_WAIT: Duration = Duration::from_secs(1);
@@ -106,6 +117,8 @@ struct Args {
     discovery_port: Option<u16>,
     /// `None`: chosen by the backend.
     discovery_transport: Option<Transport>,
+    /// `--manage` / `--unmanaged` (linux backend).
+    policy: corerouter_hal_linux::Policy,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -118,6 +131,7 @@ fn parse_args() -> Result<Args, String> {
         web_root: None,
         discovery_port: Some(corerouter_discovery::PORT),
         discovery_transport: None,
+        policy: corerouter_hal_linux::Policy::default(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -166,6 +180,14 @@ fn parse_args() -> Result<Args, String> {
                     }
                 });
             }
+            "--manage" => {
+                let v = args.next().ok_or("--manage needs interface names")?;
+                out.policy.manage = corerouter_hal_linux::Policy::patterns(&v)?;
+            }
+            "--unmanaged" => {
+                let v = args.next().ok_or("--unmanaged needs interface names")?;
+                out.policy.unmanaged = corerouter_hal_linux::Policy::patterns(&v)?;
+            }
             "-h" | "--help" => return Err(USAGE.into()),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
@@ -212,11 +234,14 @@ fn websocket(args: &Args, host: SharedHost, shutdown: &Shutdown) -> Result<(), S
         .map_err(|e| format!("cannot start the WebSocket thread: {e}"))
 }
 
-fn backend(name: &str) -> Result<Box<dyn Hal>, String> {
+fn backend(name: &str, policy: &corerouter_hal_linux::Policy) -> Result<Box<dyn Hal>, String> {
+    let _ = policy; // only the linux backend has one
     match name {
         "virtual" => Ok(Box::new(VirtualHal::default())),
         #[cfg(target_os = "linux")]
-        "linux" => Ok(Box::new(corerouter_hal_linux::LinuxHal::new())),
+        "linux" => Ok(Box::new(corerouter_hal_linux::LinuxHal::with_policy(
+            policy.clone(),
+        ))),
         #[cfg(not(target_os = "linux"))]
         "linux" => Err("the linux backend only exists on Linux".into()),
         other => Err(format!("unknown backend '{other}' (virtual | linux)")),
@@ -399,7 +424,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let hal = match backend(&args.backend) {
+    let hal = match backend(&args.backend, &args.policy) {
         Ok(h) => h,
         Err(e) => {
             eprintln!("{e}");
