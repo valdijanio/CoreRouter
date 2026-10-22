@@ -1,7 +1,7 @@
 # CoreRouter — histórico da lista de gaps
 
-Só de acrescentar (`merge=union` no `.gitattributes`): cada PR que adiciona, muda o status ou
-redefine um item de `docs/gaps.md` acrescenta **uma linha no fim**, sem editar linhas antigas.
+Gerado pela fila de entrada: a linha `history:` do `docs/changes/<id>.md` de cada PR entra aqui,
+no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.**
 
 - 2026-10-21 — lista inicial.
 - 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).
@@ -43,3 +43,4 @@ redefine um item de `docs/gaps.md` acrescenta **uma linha no fim**, sem editar l
 - 2026-10-22 — G0.9 feito (`cargo xtask bench`, 31 benchmarks, `bench-check` no CI, `docs/perf.md` com números medidos).
 - 2026-10-22 — G2.1b (firewall: lockout, sombras, defaults, modelos, zonas, descrição) feito.
 - 2026-10-22 — G1.21 (hierarquia das janelas internas: trazer à frente, filho sobre o pai, fechar junto, Ctrl+Tab) adicionado e feito.
+- 2026-10-22 — processo: arquivos de mudança por PR (`docs/changes/`) e fila de entrada; o status das gaps passa a vir do fold

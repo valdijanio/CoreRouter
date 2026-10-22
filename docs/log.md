@@ -1,9 +1,9 @@
 # CoreRouter — log
 
-Só de acrescentar (`merge=union` no `.gitattributes`): cada PR adiciona sua entrada **no fim**, sem
-editar ou reordenar entradas antigas. Uma entrada = um item `- AAAA-MM-DD — <id>: …` (pode ter
-linhas de continuação indentadas). PRs paralelos se juntam sem conflito; a ordem entre entradas do
-mesmo dia pode variar.
+Gerado pela fila de entrada: cada PR grava `docs/changes/<id>.md` e `cargo xtask docs fold`
+acrescenta a entrada aqui, no fim, logo antes do merge (formato em `docs/changes/README.md`).
+**Não edite à mão.** Uma entrada = um item `- AAAA-MM-DD — <id>: …` (pode ter linhas de
+continuação indentadas).
 
 - 2026-10-21 — v0.1.0: workspace em 8 camadas, `Session::execute` com 14 comandos
   (interface, ip address, BGP instance, identity, config commit/rollback/diff/mode), guard de
@@ -596,3 +596,15 @@ mesmo dia pode variar.
   gh 2.45 por causa dos Projects clássicos, e o erro era engolido). Sem aviso de conflito quando a
   branch andou durante o merge (no #42 o comentário listou um conflito que já tinha sido resolvido
   17 s antes). Testado com `DRY_RUN=1` num clone descartável, com e sem o rótulo.
+
+- 2026-10-22 — processo: Fila de entrada e arquivos de mudança por PR, no lugar do merge automático + `pr-sync`. Cada PR
+  grava `docs/changes/<id>.md` (log, status da gap, histórico, gaps novas) em vez de editar
+  `docs/log.md`, `docs/gaps-history.md` e a coluna Status de `docs/gaps.md`; `cargo xtask docs`
+  confere o formato no CI e `cargo xtask docs fold` consolida. As sessões não ligam mais o
+  auto-merge: a sessão principal pergunta ao usuário por lote ("N features prontas — subir?") e
+  roda `scripts/land.sh`, que integra um PR por vez (traz a `main`, faz o fold, envia, espera o CI
+  do PR e faz o squash). A proteção da `main` volta a exigir branch atualizada, então o CI de cada
+  PR roda sobre a `main` em que ele vai entrar: "sozinho passa, junto quebra" (como o `from_pool` e
+  o `Head.parent` em 2026-10-22) para no PR, não na `main`. Saem o workflow `pr-sync` e o
+  `scripts/pr-sync.sh`; o #46 foi fechado sem merge. Números do dia (**medido**): 46 PRs, 86 runs
+  de CI nos PRs e 46 na `main`.

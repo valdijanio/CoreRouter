@@ -2,12 +2,13 @@
 //! every commit; it stops at the first FAIL and prints an ok/FAIL/skip summary.
 
 mod bench;
+mod changes;
 mod layers;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|layers|agents-sync|wasm|bench [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|docs|layers|agents-sync|wasm|bench|docs fold [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -38,6 +39,8 @@ const CI: &[Step] = &[
     // so a renamed command parameter fails here instead of rotting.
     ("bench-check", bench::check),
     ("netns", netns),
+    // docs/changes/*.md (one file per PR) parse and fold into the docs.
+    ("docs", changes::check),
     ("layers", layers_step),
     ("agents-sync", agents_sync),
     ("wasm", wasm),
@@ -58,6 +61,16 @@ fn main() -> ExitCode {
                 }
                 Outcome::Fail(why) => {
                     eprintln!("FAIL bench: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        "docs" if std::env::args().nth(2).is_some() => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match changes::main(&root, &rest) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL docs: {why}");
                     ExitCode::FAILURE
                 }
             };
