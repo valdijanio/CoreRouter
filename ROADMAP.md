@@ -454,6 +454,19 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   a ponta, terminal, GUI headless (clique em "Not now", aviso aparece e some). Esforço do agente
   ~3 h (**estimado**).
 
+- 2026-10-22 — G0.3c: tela de conexão sem beco sem saída, a pedido do usuário (daemon rodando como
+  root num network namespace e a GUI como o usuário: o token local era ilegível e a tela parava
+  numa mensagem sobre token; e uma GUI nova num daemon antigo mostrava `unknown method
+  'auth.whoami'`). Login vem com `admin`; em loopback a GUI sonda `server.info`, tenta o token
+  local e cai para Login/Password; erro = uma frase (`ui::connect::explain`) com o técnico em
+  "Details". Roteador anterior ao G0.3 (sem `auth` no `server.info`) é nomeado e, só em loopback,
+  "Connect anyway" com aviso `old router: no login` na barra (decisão: esse daemon já aceita
+  qualquer processo local, então conectar não reduz a segurança; pela rede ele nem tem TLS). Testes:
+  headless (Login preenchido, "Details", "Connect anyway", aviso na barra) e com servidores de
+  controle de teste (token legível, ilegível, recusado; senha errada; daemon antigo falso). Manual
+  **medido**: daemon com o token em 000, daemon de 6fbab48 e token legível, com screenshots. Esforço
+  do agente ~2 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -483,3 +496,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G6.3.
 - 2026-10-22 — log do G6.5.
 - 2026-10-22 — log do G0.3b.
+- 2026-10-22 — log do G0.3c.

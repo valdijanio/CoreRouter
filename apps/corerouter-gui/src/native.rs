@@ -12,7 +12,8 @@ use corerouter_control::{
 };
 use corerouter_discovery::{Heard, Listener};
 use corerouter_engine::{Session, shared};
-use corerouter_ui::{ConnectScreen, CoreRouterUi, Credentials, NeighborRow, SavedRouter};
+use corerouter_ui::connect::{self, DEFAULT_LOGIN, explain};
+use corerouter_ui::{ConnectScreen, CoreRouterUi, Credentials, Failure, NeighborRow, SavedRouter};
 use eframe::egui;
 use serde_json::{Value, json};
 
@@ -24,10 +25,11 @@ usage: corerouter-gui [--connect HOST:PORT | tls://HOST:PORT] [--user USER]
                       [--control <port>] [--discovery-port <port>] [--saved-list <file>]
 
   --connect HOST:PORT     manage a corerouter-daemon right away: 127.0.0.1:PORT with the
-                          router's local token (same OS user), any other address over TLS
-                          with --user (password from $COREROUTER_PASSWORD, or typed on the
-                          connect screen); without it the GUI opens on the connect screen
-  --user USER             login name for --connect
+                          router's local token (same OS user), else (and at any other
+                          address, over TLS) as --user (password from $COREROUTER_PASSWORD,
+                          or typed on the connect screen); without it the GUI opens on the
+                          connect screen
+  --user USER             login name for --connect (default admin)
   --control <port>        serve the control channel on 127.0.0.1:<port> (ui.screenshot;
                           once connected, every other method is passed on to the daemon)
   --discovery-port <port> UDP port the connect screen listens on for CRDP (default 7979)
@@ -280,15 +282,16 @@ pub fn main() -> ExitCode {
         screen.connect_to = addr.clone();
         let creds = Credentials {
             address: addr.clone(),
-            user: args.user.clone().unwrap_or_default(),
+            user: args.user.clone().unwrap_or_else(|| DEFAULT_LOGIN.into()),
             password: std::env::var("COREROUTER_PASSWORD").unwrap_or_default(),
             remember: false,
+            legacy: false,
         };
         screen.set_login(&creds.user);
         match platform.connect(&creds) {
             Ok(Connected::Ready(r)) => ready = Some(*r),
             Ok(Connected::Trust(c, fp)) => screen.ask_trust(c, fp),
-            Err(e) => screen.set_error(e),
+            Err(e) => screen.fail(e),
         }
     }
     let app = match ready {
@@ -430,35 +433,27 @@ impl Platform for NativePlatform {
         }
     }
 
-    fn connect(&mut self, creds: &Credentials) -> Result<Connected, String> {
+    fn connect(&mut self, creds: &Credentials) -> Result<Connected, Failure> {
         let target = check_addr(&creds.address)?;
         let addr = target.addr();
-        let login = if creds.user.is_empty() {
-            if target.tls {
-                return Err(format!(
-                    "{target} is reached over TLS: type a Login and Password"
-                ));
-            }
-            Login::Auto
-        } else {
-            let mut password = creds.password.clone();
-            if password.is_empty() && self.keyring {
-                password = keyring_entry(&addr, &creds.user)
-                    .and_then(|e| e.get_password().ok())
-                    .unwrap_or_default();
-            }
-            Login::Password {
-                user: creds.user.clone(),
-                password,
-            }
-        };
+        if target.tls && creds.user.is_empty() {
+            return Err(Failure::from(format!(
+                "{target} is reached over TLS: type a Login and Password"
+            )));
+        }
+        let mut password = creds.password.clone();
+        if password.is_empty() && self.keyring && !creds.user.is_empty() {
+            password = keyring_entry(&addr, &creds.user)
+                .and_then(|e| e.get_password().ok())
+                .unwrap_or_default();
+        }
         let fingerprint = if target.tls {
             match KnownHosts::load_default().get(&addr) {
                 Some(fp) => Some(fp.to_owned()),
                 None => {
                     // First time: look at the certificate, send nothing, ask.
                     let c = Client::connect_tls(&addr, PROXY_TIMEOUT, None)
-                        .map_err(|e| format!("{target}: {e}"))?;
+                        .map_err(|e| explain(&format!("{target}: {e}")))?;
                     let fp = c.fingerprint().unwrap_or_default().to_owned();
                     return Ok(Connected::Trust(creds.clone(), fp));
                 }
@@ -466,30 +461,40 @@ impl Platform for NativePlatform {
         } else {
             None
         };
-        let dialer = Dialer::new(target.clone(), login, fingerprint);
-        let mut client = dialer.dial()?;
-        if let Err(e) = client.call("auth.whoami", Value::Null) {
-            return Err(if e.starts_with(UNAUTHORIZED) && creds.user.is_empty() {
-                format!("{target}: {}", local_token_hint(target.port))
-            } else {
-                format!("{target}: {e}")
-            });
-        }
-        if creds.remember
-            && !creds.user.is_empty()
+        let local = if target.tls {
+            None
+        } else {
+            local_token::read(target.port)
+        };
+        let way = log_in(
+            &target,
+            &creds.user,
+            &password,
+            fingerprint,
+            creds.legacy,
+            local,
+        )?;
+        if way.how == How::Password
+            && creds.remember
             && !creds.password.is_empty()
             && let Some(entry) = keyring_entry(&addr, &creds.user)
             && let Err(e) = entry.set_password(&creds.password)
         {
             log::warn!("password not remembered: {e}");
         }
-        let remote = Remote::spawn(dialer.clone(), Some(client))
+        let remote = Remote::spawn(way.dialer.clone(), Some(way.client))
             .map_err(|e| format!("cannot start the connection thread: {e}"))?;
-        log::info!("managing the router at {target}");
+        match way.how {
+            How::Token => log::info!("managing the router at {target} (local token)"),
+            How::Password => log::info!("managing the router at {target} as {}", creds.user),
+            How::Legacy => log::warn!(
+                "managing the router at {target}: an old version without login (update it)"
+            ),
+        }
         set_target(
             &self.target,
             Target::Remote {
-                dialer: Box::new(dialer),
+                dialer: Box::new(way.dialer),
             },
         );
         self.listener = None;
@@ -520,6 +525,146 @@ impl Platform for NativePlatform {
         );
         self.listener = None;
         CoreRouterUi::new(session)
+    }
+}
+
+/// How the GUI got into a router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum How {
+    /// The local token of a router run by this operating-system user.
+    Token,
+    /// Login and Password (a session token, renewed by the worker).
+    Password,
+    /// "Connect anyway": a router older than the login (G0.3c).
+    Legacy,
+}
+
+struct Way {
+    dialer: Dialer,
+    client: Client,
+    how: How,
+}
+
+/// Get into the router at `target` (G0.3c). On this machine: an old router
+/// without login is told apart first (and managed only when `legacy`, the
+/// operator's "Connect anyway"); then the local token `local`, when this
+/// user could read it and the router takes it; else `user` + `password`
+/// (an empty password is fine here, G0.3b). Elsewhere: TLS pinned to
+/// `fingerprint`, then `user` + `password`. A failure is one sentence for
+/// the operator, the router's own words in its detail.
+fn log_in(
+    target: &RouterAddr,
+    user: &str,
+    password: &str,
+    fingerprint: Option<String>,
+    legacy: bool,
+    local: Option<String>,
+) -> Result<Way, Failure> {
+    let with_password = Login::Password {
+        user: user.to_owned(),
+        password: password.to_owned(),
+    };
+    if target.tls {
+        let dialer = Dialer::new(target.clone(), with_password, fingerprint);
+        let mut client = dialer.dial().map_err(|e| explain(&e))?;
+        check_whoami(target, &mut client, String::new())?;
+        return Ok(Way {
+            dialer,
+            client,
+            how: How::Password,
+        });
+    }
+    let probe = Dialer::new(target.clone(), Login::Nothing, None);
+    let mut client = probe.dial().map_err(|e| explain(&e))?;
+    let info = client
+        .call("server.info", Value::Null)
+        .map_err(|e| explain(&format!("{target}: {e}")))?;
+    if connect::old_router_info(&info) {
+        if legacy {
+            return Ok(Way {
+                dialer: probe,
+                client,
+                how: How::Legacy,
+            });
+        }
+        return Err(old_router(target, &info));
+    }
+    let token_note = match local {
+        Some(token) => {
+            client.set_token(Some(token));
+            match client.call("auth.whoami", Value::Null) {
+                Ok(_) => {
+                    return Ok(Way {
+                        dialer: Dialer::new(target.clone(), Login::Auto, None),
+                        client,
+                        how: How::Token,
+                    });
+                }
+                Err(e) => {
+                    client.set_token(None);
+                    format!("the local token was refused ({e})")
+                }
+            }
+        }
+        None => local_token_hint(target.port),
+    };
+    if user.is_empty() {
+        return Err(Failure::new(
+            "Type a Login (and its Password, if the account has one)",
+            format!("{target}: {token_note}"),
+        ));
+    }
+    let detail = |e: &str| format!("{target}: {e}\nnot by the local token: {token_note}");
+    if let Err(e) = client.login(user, password) {
+        let mut f = explain(&e);
+        if connect::old_router_error(&e) {
+            f.offer_anyway = true;
+        }
+        f.detail = detail(&e);
+        return Err(f);
+    }
+    check_whoami(target, &mut client, token_note)?;
+    Ok(Way {
+        dialer: Dialer::new(target.clone(), with_password, None),
+        client,
+        how: How::Password,
+    })
+}
+
+/// The login worked: one call that needs it, so a missing right is one
+/// clear error up front.
+fn check_whoami(target: &RouterAddr, client: &mut Client, note: String) -> Result<(), Failure> {
+    client.call("auth.whoami", Value::Null).map_err(|e| {
+        let mut f = explain(&e);
+        f.offer_anyway = connect::old_router_error(&e) && !target.tls;
+        f.detail = if note.is_empty() {
+            format!("{target}: {e}")
+        } else {
+            format!("{target}: {e}\n{note}")
+        };
+        f
+    })?;
+    Ok(())
+}
+
+/// A router older than the login on this machine: say so, offer "Connect
+/// anyway".
+fn old_router(target: &RouterAddr, info: &Value) -> Failure {
+    let version: String = info
+        .get("version")
+        .and_then(Value::as_str)
+        .unwrap_or("?")
+        .chars()
+        .take(64)
+        .collect();
+    Failure {
+        text: connect::OLD_ROUTER.into(),
+        detail: format!(
+            "{target}: corerouter-daemon {version} answers server.info without \"auth\" \
+             (older than G0.3): it has no users and no login. This GUI is {}.",
+            env!("CARGO_PKG_VERSION")
+        ),
+        offer_anyway: true,
     }
 }
 
@@ -702,6 +847,153 @@ mod tests {
         std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
         assert!(check_addr("[fe80::1%2]:7979").is_ok());
         assert!(check_addr("10.0.0.1").is_err());
+    }
+
+    /// A router of this version on loopback: `admin` without a password
+    /// (G0.3b), `op` with one, and the local token `ab…`.
+    fn router() -> RouterAddr {
+        let mut s = Session::virtual_lab();
+        s.bootstrap_admin(false);
+        s.execute(
+            "user.add",
+            &json!({"name": "op", "group": "write", "password": "op-password"}),
+        )
+        .unwrap();
+        let listener = bind_loopback(0).unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let gate = Gate::default();
+        gate.add_local_token(&"ab".repeat(32));
+        spawn(Endpoint::loopback(listener), SharedHost(shared(s)), gate).unwrap();
+        RouterAddr::parse(&addr).unwrap()
+    }
+
+    fn whoami(way: &mut Way) -> String {
+        let me = way.client.call("auth.whoami", Value::Null).unwrap();
+        me["user"].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn local_token_first_then_login_and_password() {
+        let r = router();
+        let token = Some("ab".repeat(32));
+        // The token readable and taken: no password needed.
+        let mut way = log_in(&r, "admin", "", None, false, token).unwrap();
+        assert_eq!(way.how, How::Token);
+        assert_eq!(whoami(&mut way), "local");
+        // Not readable (the daemon runs as another OS user): Login and
+        // Password; admin has none yet and this is loopback.
+        let mut way = log_in(&r, DEFAULT_LOGIN, "", None, false, None).unwrap();
+        assert_eq!(way.how, How::Password);
+        assert_eq!(whoami(&mut way), "admin");
+        // A stale token is no dead end either.
+        let mut way = log_in(&r, "op", "op-password", None, false, Some("cd".repeat(32))).unwrap();
+        assert_eq!((way.how, whoami(&mut way)), (How::Password, "op".into()));
+        // The worker logs in again on its own after a reconnection.
+        assert_eq!(
+            way.dialer
+                .dial()
+                .unwrap()
+                .call("auth.whoami", Value::Null)
+                .unwrap()["user"],
+            "op"
+        );
+    }
+
+    #[test]
+    fn a_failed_login_says_it_shortly_with_the_details_aside() {
+        let r = router();
+        let f = log_in(&r, "op", "wrong", None, false, None).err().unwrap();
+        assert_eq!(f.text, connect::BAD_LOGIN);
+        assert!(!f.offer_anyway);
+        // The technical part is still there, under "Details".
+        assert!(
+            f.detail.contains(corerouter_control::auth::INVALID_LOGIN),
+            "{}",
+            f.detail
+        );
+        assert!(f.detail.contains("local token"), "{}", f.detail);
+        // No Login and no token: ask for one.
+        let f = log_in(&r, "", "", None, false, None).err().unwrap();
+        assert!(f.text.starts_with("Type a Login"), "{}", f.text);
+        // Nobody at that port.
+        let gone = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = RouterAddr::parse(&gone.local_addr().unwrap().to_string()).unwrap();
+        drop(gone);
+        let f = log_in(&addr, "admin", "", None, false, None).err().unwrap();
+        assert!(f.text.starts_with("Nothing answers"), "{f:?}");
+    }
+
+    #[test]
+    fn explain_knows_the_control_channel_errors() {
+        use corerouter_control::auth::{INVALID_LOGIN, NO_PASSWORD_REMOTE};
+        let f = explain(&format!("tls://10.0.0.1:8729: {NO_PASSWORD_REMOTE}"));
+        assert_eq!(f.text, connect::SET_PASSWORD_FIRST);
+        assert!(f.detail.contains(NO_PASSWORD_REMOTE));
+        assert_eq!(explain(INVALID_LOGIN).text, connect::BAD_LOGIN);
+        // Unknown errors stay as they are.
+        let f = explain("certificate CHANGED");
+        assert_eq!(
+            (f.text.as_str(), f.detail.as_str()),
+            ("certificate CHANGED", "")
+        );
+    }
+
+    /// A daemon from before G0.3 (6fbab48): no `auth` in `server.info`,
+    /// no `auth.*` methods, and the `token` field of a request ignored.
+    fn old_router() -> RouterAddr {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut out) = conn else { return };
+                std::thread::spawn(move || {
+                    let reader = BufReader::new(out.try_clone().unwrap());
+                    for line in reader.lines() {
+                        let Ok(line) = line else { return };
+                        let req: Value = serde_json::from_str(&line).unwrap();
+                        let reply = match req["method"].as_str().unwrap_or("") {
+                            "server.info" => json!({"id": req["id"], "ok": true, "result":
+                                {"name": "corerouter", "version": "0.1.0", "backend": "virtual",
+                                 "has_ui": false}}),
+                            "ping" => {
+                                json!({"id": req["id"], "ok": true, "result": {"pong": true}})
+                            }
+                            m if m.starts_with("auth.") => json!({"id": req["id"], "ok": false,
+                                "error": format!("unknown method '{m}'; methods: ping, server.info, \
+                                 engine.list, engine.execute")}),
+                            _ => json!({"id": req["id"], "ok": true, "result": []}),
+                        };
+                        if writeln!(out, "{reply}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        RouterAddr::parse(&addr).unwrap()
+    }
+
+    #[test]
+    fn an_old_router_is_named_and_can_be_managed_anyway() {
+        let r = old_router();
+        let f = log_in(&r, "admin", "", None, false, Some("ab".repeat(32)))
+            .err()
+            .unwrap();
+        assert_eq!(f.text, connect::OLD_ROUTER);
+        assert!(f.offer_anyway);
+        assert!(f.detail.contains("0.1.0"), "{}", f.detail);
+        assert!(!f.text.contains("unknown method"));
+        // "Connect anyway": no login at all, and requests work.
+        let mut way = log_in(&r, "admin", "", None, true, None).unwrap();
+        assert_eq!(way.how, How::Legacy);
+        assert!(way.client.call("engine.list", Value::Null).is_ok());
+        // Older still or behind a proxy: told apart by the error too.
+        let f = check_whoami(&r, &mut way.client, String::new())
+            .err()
+            .unwrap();
+        assert_eq!(f.text, connect::OLD_ROUTER);
+        assert!(f.offer_anyway);
     }
 
     #[test]

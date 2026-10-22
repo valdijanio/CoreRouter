@@ -26,8 +26,8 @@ use std::rc::{Rc, Weak};
 
 use corerouter_engine::{Session, shared};
 use corerouter_ui::{
-    Backend, ConnectScreen, CoreRouterUi, Credentials, Link, NeighborRow, Reply, RequestId,
-    SavedRouter,
+    Backend, ConnectScreen, CoreRouterUi, Credentials, Failure, Link, NeighborRow, Reply,
+    RequestId, SavedRouter, connect::explain,
 };
 
 use crate::Connected;
@@ -203,18 +203,20 @@ impl crate::Platform for WebPlatform {
         }
     }
 
-    fn connect(&mut self, creds: &Credentials) -> Result<Connected, String> {
+    fn connect(&mut self, creds: &Credentials) -> Result<Connected, Failure> {
         let addr = creds.address.as_str();
         let url = ws_url(addr);
         if !(url.starts_with("ws://") || url.starts_with("wss://")) {
-            return Err(format!(
+            return Err(Failure::from(format!(
                 "Connect to needs ws://HOST:PORT/ws or HOST:PORT, got '{addr}'"
-            ));
+            )));
         }
         // An empty password is fine: a new router's admin has none, and the
         // router accepts that only from this machine (G0.3b).
         if creds.user.is_empty() {
-            return Err("Type a Login (and the Password, if the account has one)".into());
+            return Err(Failure::from(
+                "Type a Login (and the Password, if the account has one)".to_owned(),
+            ));
         }
         log::info!("managing the router at {url} as {}", creds.user);
         let login = (creds.user.clone(), creds.password.clone());
@@ -346,8 +348,15 @@ impl State {
             }
             Err(e) => {
                 // Retrying would only feed the router's brute-force limit.
+                // The top bar shows the short reason (an old router without
+                // login, a wrong password…) with the router's words after it.
                 self.refused = true;
-                self.lost(e);
+                let why = explain(&e);
+                self.lost(if why.detail.is_empty() {
+                    why.text
+                } else {
+                    format!("{} ({})", why.text, why.detail)
+                });
             }
         }
     }
