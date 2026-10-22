@@ -608,3 +608,27 @@ continuação indentadas).
   o `Head.parent` em 2026-10-22) para no PR, não na `main`. Saem o workflow `pr-sync` e o
   `scripts/pr-sync.sh`; o #46 foi fechado sem merge. Números do dia (**medido**): 46 PRs, 86 runs
   de CI nos PRs e 46 na `main`.
+
+- 2026-10-22 — processo: CI mais rápido, com números em `docs/perf.md` ("CI e build"). O job `xtask ci (linux)` chegou a
+  775 s num PR (**medido**): 416 s só para carregar o módulo `vrf` instalando o
+  `linux-modules-extra` inteiro. Agora o `vrf.ko` sai do `.deb` baixado (cai na instalação
+  completa se o `insmod` falhar); sem debuginfo no CI (cache de ~2,5 GB, 70 s para restaurar);
+  `cargo nextest` no passo `test` do `cargo xtask ci` quando instalado (`COREROUTER_NEXTEST=0`
+  força o `cargo test`), com `cargo test --doc` só se algum comentário de documentação tiver
+  código Rust. Localmente os testes caíram de 29,7 s para 14,3 s (**medido**). `sccache` medido e
+  descartado (0% de acerto entre pastas de build; build nova já leva 27 s).
+  Também corrige um teste instável que derrubou o CI deste PR: no `netns_icmp`, o primeiro ping
+  IPv6 logo depois de o laboratório subir pode voltar "unreachable" enquanto o roteador resolve o
+  host; os testes que esperam eco agora tentam de novo (`ask_echo`) antes de reprovar.
+
+- 2026-10-22 — processo: Fila de entrada e arquivos de mudança por PR, no lugar do merge automático + `pr-sync`. Cada PR
+  grava `docs/changes/<id>.md` (log, status da gap, histórico, gaps novas) em vez de editar
+  `docs/log.md`, `docs/gaps-history.md` e a coluna Status de `docs/gaps.md`; `cargo xtask docs`
+  confere o formato no CI e `cargo xtask docs fold` consolida. As sessões não ligam mais o
+  auto-merge: a sessão principal pergunta ao usuário por lote ("N features prontas — subir?") e
+  roda `scripts/land.sh`, que integra um PR por vez (traz a `main`, faz o fold, envia, espera o CI
+  do PR e faz o squash). A proteção da `main` volta a exigir branch atualizada, então o CI de cada
+  PR roda sobre a `main` em que ele vai entrar: "sozinho passa, junto quebra" (como o `from_pool` e
+  o `Head.parent` em 2026-10-22) para no PR, não na `main`. Saem o workflow `pr-sync` e o
+  `scripts/pr-sync.sh`; o #46 foi fechado sem merge. Números do dia (**medido**): 46 PRs, 86 runs
+  de CI nos PRs e 46 na `main`.
