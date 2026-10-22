@@ -3,7 +3,7 @@
 //! then the login (local token or user + password).
 
 use std::fmt;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::time::Duration;
 
 use crate::client::Client;
@@ -161,15 +161,30 @@ pub fn dial(
             }
         }
         c
+    } else if target.host.eq_ignore_ascii_case("localhost") {
+        // `localhost` usually resolves to `::1` first, where the router does
+        // not listen ([`crate::bind_loopback`]) and any local user could.
+        Client::connect(&format!("{}:{}", Ipv4Addr::LOCALHOST, target.port), timeout)?
     } else {
         Client::connect(&addr, timeout)?
     };
     match login {
         Login::Auto if !target.tls => {
-            if let Some(t) = local_token::read(target.port) {
-                client.set_token(Some(t));
-            } else {
-                log::debug!("{}", local_token_hint(target.port));
+            // The token file belongs to the port on 127.0.0.1, the only
+            // address the router binds in the clear: never hand it to
+            // whatever answers elsewhere (`[::1]`, `127.0.0.2`).
+            let ours = client
+                .peer()
+                .is_some_and(|p| p.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST));
+            match local_token::read(target.port) {
+                Some(t) if ours => client.set_token(Some(t)),
+                Some(_) => log::warn!(
+                    "{target}: not {}:{}, where the router listens; the local token \
+                     is not sent",
+                    Ipv4Addr::LOCALHOST,
+                    target.port
+                ),
+                None => log::debug!("{}", local_token_hint(target.port)),
             }
         }
         Login::Auto | Login::Nothing => {}
@@ -208,5 +223,55 @@ mod tests {
             password: "hunter22".into(),
         };
         assert!(!format!("{l:?}").contains("hunter22"));
+    }
+
+    /// Audit (control finding 5): whatever listens on `[::1]:P` (any local
+    /// user can bind it; the router binds only 127.0.0.1) never gets the
+    /// local token of port P, neither as `[::1]:P` nor as `localhost:P`.
+    #[test]
+    fn the_local_token_goes_only_to_127_0_0_1() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpListener;
+        use std::sync::mpsc;
+        let Ok(fake) = TcpListener::bind("[::1]:0") else {
+            return; // no IPv6 loopback here
+        };
+        let port = fake.local_addr().unwrap().port();
+        let token = "cd".repeat(32);
+        let Ok(file) = local_token::create(port, &token) else {
+            return; // no runtime directory
+        };
+        let (tx, rx) = mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            for conn in fake.incoming() {
+                let Ok(mut conn) = conn else { break };
+                let mut line = String::new();
+                let _ = BufReader::new(&conn).read_line(&mut line);
+                let _ = conn.write_all(b"{\"id\":1,\"ok\":true,\"result\":{\"pong\":true}}\n");
+                let _ = tx.send(line);
+            }
+        });
+        let t = Duration::from_secs(2);
+        for target in [format!("[::1]:{port}"), format!("localhost:{port}")] {
+            let target = Target::parse(&target).unwrap();
+            if let Ok(mut c) = dial(
+                &target,
+                t,
+                &Login::Auto,
+                &mut KnownHosts::load(std::path::Path::new("/nonexistent/kh")),
+                &mut RefuseNew,
+            ) {
+                let _ = c.call("ping", serde_json::Value::Null);
+            }
+        }
+        let _ = std::fs::remove_file(file);
+        let seen: Vec<String> = rx.try_iter().collect();
+        assert!(
+            !seen.is_empty(),
+            "the [::1] test listener was never reached"
+        );
+        for line in seen {
+            assert!(!line.contains(&token), "token sent to [::1]: {line}");
+        }
     }
 }

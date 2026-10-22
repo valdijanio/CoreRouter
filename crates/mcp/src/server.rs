@@ -66,10 +66,22 @@ fn error(id: Value, code: i64, message: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-/// Handle one JSON-RPC message; `None` for notifications.
+/// Handle one JSON-RPC message; `None` for notifications and responses.
 pub fn handle_message(backend: &mut dyn Backend, msg: &Value) -> Option<Value> {
     let id = msg.get("id").cloned();
+    // JSON-RPC 2.0 §4: an id is a string, a number or null.
+    if matches!(id, Some(Value::Object(_) | Value::Array(_) | Value::Bool(_))) {
+        return Some(error(
+            Value::Null,
+            -32600,
+            "invalid request: id must be a string, a number or null",
+        ));
+    }
     let Some(method) = msg.get("method").and_then(Value::as_str) else {
+        // A response (to a request of ours) is never answered (§5).
+        if msg.get("result").is_some() || msg.get("error").is_some() {
+            return None;
+        }
         return id.map(|id| error(id, -32600, "invalid request: missing method"));
     };
     let id = id?; // notification (e.g. notifications/initialized): no reply
