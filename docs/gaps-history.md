@@ -47,3 +47,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-22 — G1.3 parte 1 feita (drift de links, endereços e rotas: listar e reconciliar); criados G1.3b e G1.3c
 - 2026-10-22 — G4.4 dividido: `/metrics` feito; G4.4b (exportador de fluxos) e G4.4c (`/metrics` como serviço configurável) criados
 - 2026-10-22 — G4.7c feito (resiliência do cliente DHCP); G4.7d criado (sobras: DNAv4, eco do client-id, bfd, carrier)
+- 2026-10-22 — G1.8 feito (bonding 802.3ad/active-backup e demais modos); G1.8b, G1.8c e G1.8d abertos
+- 2026-10-22 — G4.6 parte 1 feita (cliente SNTP e syslog remoto); criados G4.6b (acertar o relógio), G4.6c (servidor NTP), G4.6d (log do sistema e mais alvos), G4.6e (janelas da GUI)
