@@ -84,6 +84,18 @@ no monitor.
   (nenhum contador do kernel é zerado); "Show totals" volta.
 - Enter/Ctrl+Enter/Esc, maximizar e os botões cinza continuam valendo em qualquer aba.
 
+## Pesquisa
+
+- RouterOS v7 (help.mikrotik.com, Ethernet): `monitor` e `print stats` dão os nomes e valores
+  (`link-ok`, `rate`, `auto-negotiation`, `link-partner-advertising`, `orig-mac-address`,
+  `l2mtu`).
+- VyOS: `show interfaces ethernet <if> physical` (saída do ethtool, driver, bus-info) separado dos
+  contadores e do `transceiver`; daí as abas Status / Hardware / Statistics.
+- Junos: `clear interfaces statistics` guarda a linha de base; aqui a linha de base fica só na
+  janela ("Zero view"), sem apagar nada do roteador.
+- A mais que o MikroTik: "não suportado" com motivo, hora da última subida/queda, offloads
+  "fixed", contadores padrão IEEE 802.3/RMON do kernel. Fora: LED e firmware sem devlink (ioctl).
+
 ## Próximo (G1.20)
 
 Configurar Ethernet (autonegociação, velocidade, duplex, controle de fluxo, modos anunciados,
