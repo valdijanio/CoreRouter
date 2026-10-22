@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::cmd::{self, check_params, unknown_command};
 use crate::neighbors::NeighborTable;
+use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
 use crate::validate::validate_all;
 use crate::{EngineError, Result, guard};
@@ -52,6 +53,9 @@ pub struct Session {
     mode: CommitMode,
     journal: Vec<JournalEntry>,
     seq: u64,
+    /// Sender of the command being run (see [`Session::execute_as`]).
+    caller: Caller,
+    safe_mode: SafeMode,
     /// Heard by discovery protocols (operational state, never saved).
     pub(crate) neighbors: NeighborTable,
 }
@@ -117,6 +121,8 @@ impl Session {
             mode: CommitMode::Immediate,
             journal: Vec::new(),
             seq: 0,
+            caller: Caller::local(),
+            safe_mode: SafeMode::default(),
             neighbors: NeighborTable::default(),
         }
     }
@@ -128,6 +134,7 @@ impl Session {
 
     /// The one door: UI, CLI, control channel and MCP all call this.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
+        self.expire_safe_mode();
         let spec = cmd::find(id).ok_or_else(|| unknown_command(id))?;
         check_params(spec, params)?;
         (spec.enabled)(self).map_err(|reason| EngineError::Disabled {
@@ -149,6 +156,29 @@ impl Session {
             self.record(id, params, &result);
         }
         result
+    }
+
+    /// [`Session::execute`] on behalf of a control-channel connection (it
+    /// may own Safe Mode, which ends when that connection closes).
+    pub fn execute_as(&mut self, caller: &Caller, id: &str, params: &Value) -> Result<Value> {
+        self.as_caller(caller, |s| s.execute(id, params))
+    }
+
+    /// [`Session::batch`] on behalf of a connection.
+    pub fn batch_as(&mut self, caller: &Caller, steps: &Value, atomic: bool) -> Result<Value> {
+        self.as_caller(caller, |s| s.batch(steps, atomic))
+    }
+
+    /// [`Session::inspect`] as seen by a connection (`safe_mode.yours`).
+    pub fn inspect_as(&mut self, caller: &Caller, path: Option<&str>) -> Result<Value> {
+        self.as_caller(caller, |s| s.inspect(path))
+    }
+
+    fn as_caller<T>(&mut self, caller: &Caller, f: impl FnOnce(&mut Self) -> T) -> T {
+        let outer = std::mem::replace(&mut self.caller, caller.clone());
+        let out = f(self);
+        self.caller = outer;
+        out
     }
 
     /// Run several commands as one step. `"$N.key"` in a parameter is replaced
@@ -214,6 +244,8 @@ impl Session {
     }
 
     /// Validate → apply to the data plane → promote candidate to running.
+    /// In Safe Mode the revision is marked and not saved: the boot config
+    /// stays the one from the entry until `config.safe-mode.exit`.
     pub(crate) fn commit_candidate(&mut self, comment: &str) -> Result<u32> {
         let issues = validate_all(self.store.candidate());
         if !issues.is_empty() {
@@ -222,14 +254,22 @@ impl Session {
         self.hal
             .apply(self.store.running(), self.store.candidate())
             .map_err(|e| EngineError::Hal(e.to_string()))?;
-        let revision = self.store.commit(comment, self.hal.now_unix())?;
-        self.save();
+        let pending = self.safe_mode.is_active();
+        let comment = match (pending, comment.is_empty()) {
+            (false, _) => comment.to_owned(),
+            (true, true) => "[safe mode]".to_owned(),
+            (true, false) => format!("{comment} [safe mode]"),
+        };
+        let revision = self.store.commit(&comment, self.now())?;
+        if !pending {
+            self.save();
+        }
         Ok(revision)
     }
 
     /// Persist running + history. A failure does not undo the commit (the
     /// data plane already runs it): it is logged and shown by `state.inspect`.
-    fn save(&mut self) {
+    pub(crate) fn save(&mut self) {
         let saved = persist::encode(&self.store)
             .map_err(|e| e.to_string())
             .and_then(|text| self.storage.save(&text).map_err(|e| e.to_string()));
@@ -243,6 +283,20 @@ impl Session {
                 self.storage_status.last_error = Some(e);
             }
         }
+    }
+
+    /// Journal an action the engine took by itself (Safe Mode undo).
+    pub(crate) fn record_automatic(
+        &mut self,
+        id: &str,
+        reason: &str,
+        result: &Result<Option<u32>>,
+    ) {
+        let result = result
+            .as_ref()
+            .map(|rev| json!({ "revision": rev }))
+            .map_err(Clone::clone);
+        self.record(id, &json!({ "automatic": reason }), &result);
     }
 
     fn record(&mut self, id: &str, params: &Value, result: &Result<Value>) {
@@ -277,6 +331,7 @@ impl Session {
                 "dirty": self.store.is_dirty(),
                 "pending_changes": self.store.diff().len(),
                 "storage": self.storage_status,
+                "safe_mode": self.safe_mode_summary(),
                 "counts": {
                     "interfaces": cand.interfaces.len(),
                     "ip_addresses": cand.ip.addresses.len(),
@@ -339,6 +394,26 @@ impl Session {
 
     pub fn storage_status(&self) -> &StorageStatus {
         &self.storage_status
+    }
+
+    pub fn caller(&self) -> &Caller {
+        &self.caller
+    }
+
+    pub fn in_safe_mode(&self) -> bool {
+        self.safe_mode.is_active()
+    }
+
+    pub(crate) fn safe_mode(&self) -> &SafeMode {
+        &self.safe_mode
+    }
+
+    pub(crate) fn safe_mode_mut(&mut self) -> &mut SafeMode {
+        &mut self.safe_mode
+    }
+
+    pub(crate) fn hal_now(&self) -> Option<u64> {
+        self.hal.now_unix()
     }
 }
 

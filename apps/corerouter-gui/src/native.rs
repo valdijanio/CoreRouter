@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use base64::Engine as _;
-use corerouter_control::{Client, Host, SharedHost, bind_loopback, spawn};
+use corerouter_control::{Client, Host, SharedHost, bind_loopback, spawn, spawn_clock};
 use corerouter_discovery::{Heard, Listener};
 use corerouter_engine::{Session, shared};
 use corerouter_ui::{ConnectScreen, CoreRouterUi, NeighborRow, SavedRouter};
@@ -389,6 +389,10 @@ impl Platform for NativePlatform {
 
     fn lab(&mut self) -> CoreRouterUi {
         let session = shared(Session::virtual_lab());
+        // Safe Mode timeouts need a clock; the lab has no other.
+        if let Err(e) = spawn_clock(Arc::clone(&session)) {
+            log::warn!("no clock thread ({e}): Safe Mode timeouts are unavailable");
+        }
         set_target(
             &self.target,
             Target::Local(SharedHost(Arc::clone(&session))),

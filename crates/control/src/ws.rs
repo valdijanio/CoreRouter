@@ -24,7 +24,9 @@ use std::time::Duration;
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
 
-use crate::dispatch::Host;
+use corerouter_engine::Caller;
+
+use crate::dispatch::{Host, hang_up, new_caller};
 use crate::server::{MAX_CONNECTIONS, answer};
 use crate::wire::MAX_REQUEST_LINE;
 
@@ -89,13 +91,18 @@ pub fn serve_ws<H: Host + Clone + Send + 'static>(
             );
             continue;
         }
-        let (host, policy, counter) = (host.clone(), Arc::clone(&policy), Arc::clone(&active));
+        let (mut host, policy, counter) = (host.clone(), Arc::clone(&policy), Arc::clone(&active));
+        let caller = match stream.peer_addr() {
+            Ok(peer) => new_caller("ws", peer),
+            Err(_) => new_caller("ws", "?"),
+        };
         let spawned = thread::Builder::new()
             .name("ws-conn".into())
             .spawn(move || {
-                if let Err(e) = handle(stream, host, &policy) {
+                if let Err(e) = handle(stream, &mut host, &caller, &policy) {
                     log::debug!("ws: connection closed: {e}");
                 }
+                hang_up(&mut host, &caller);
                 counter.fetch_sub(1, Ordering::SeqCst);
             });
         if let Err(e) = spawned {
@@ -195,7 +202,12 @@ impl Write for Prefixed {
     }
 }
 
-fn handle<H: Host>(mut stream: TcpStream, mut host: H, policy: &WsPolicy) -> io::Result<()> {
+fn handle<H: Host>(
+    mut stream: TcpStream,
+    host: &mut H,
+    caller: &Caller,
+    policy: &WsPolicy,
+) -> io::Result<()> {
     stream.set_read_timeout(Some(HEAD_TIMEOUT))?;
     let Some((raw, rest)) = read_head(&mut stream)? else {
         return respond(&mut stream, "400 Bad Request", "bad request");
@@ -232,10 +244,10 @@ fn handle<H: Host>(mut stream: TcpStream, mut host: H, policy: &WsPolicy) -> io:
         .map_err(|e| io::Error::other(format!("handshake: {e}")))?;
     // Idle browser tabs are normal: no read timeout after the handshake.
     ws.get_mut().stream.set_read_timeout(None)?;
-    messages(&mut ws, &mut host)
+    messages(&mut ws, host, caller)
 }
 
-fn messages(ws: &mut WebSocket<Prefixed>, host: &mut dyn Host) -> io::Result<()> {
+fn messages(ws: &mut WebSocket<Prefixed>, host: &mut dyn Host, caller: &Caller) -> io::Result<()> {
     let closed = |e: tungstenite::Error| match e {
         tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed => Ok(()),
         tungstenite::Error::Io(e) => Err(e),
@@ -253,7 +265,7 @@ fn messages(ws: &mut WebSocket<Prefixed>, host: &mut dyn Host) -> io::Result<()>
         if text.trim().is_empty() {
             continue;
         }
-        let Some(reply) = answer(host, &text) else {
+        let Some(reply) = answer(host, caller, &text) else {
             return ws.close(None).or_else(closed);
         };
         if let Err(e) = ws.send(Message::text(reply.to_string())) {
@@ -408,6 +420,55 @@ mod tests {
         assert_eq!(r["result"]["identity"], "ws");
         let r = call(&mut ws, json!({"id": 9, "method": "nope"}));
         assert_eq!(r["ok"], false);
+    }
+
+    /// G1.4: the browser tab that holds Safe Mode closes → changes undone.
+    #[test]
+    fn closing_the_safe_mode_socket_undoes_its_changes() {
+        let listener = bind_loopback(0).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let session = shared(Session::virtual_lab());
+        spawn_ws(listener, SharedHost(session.clone()), WsPolicy::default()).unwrap();
+        let disabled = || {
+            corerouter_engine::lock(&session)
+                .store()
+                .running()
+                .interfaces
+                .values()
+                .any(|i| i.disabled)
+        };
+        let mut ws = connect(port, None).unwrap();
+        for (id, command, params) in [
+            (1, "config.safe-mode.enter", json!({})),
+            (
+                2,
+                "interface.set",
+                json!({"name": "ether2", "disabled": true}),
+            ),
+        ] {
+            let r = call(
+                &mut ws,
+                json!({"id": id, "method": "engine.execute",
+                       "params": {"command": command, "params": params}}),
+            );
+            assert_eq!(r["ok"], true, "{r}");
+        }
+        let r = call(&mut ws, json!({"id": 3, "method": "state.inspect"}));
+        assert!(
+            r["result"]["safe_mode"]["owner"]
+                .as_str()
+                .unwrap()
+                .starts_with("ws 127.0.0.1:")
+        );
+        assert!(disabled());
+        ws.close(None).unwrap();
+        let _ = ws.flush();
+        drop(ws);
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while disabled() && std::time::Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!disabled());
     }
 
     #[test]

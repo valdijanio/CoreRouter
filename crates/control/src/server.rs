@@ -9,7 +9,9 @@ use std::thread;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::dispatch::{Host, dispatch};
+use corerouter_engine::Caller;
+
+use crate::dispatch::{Host, dispatch_as, hang_up, new_caller};
 use crate::wire::{Line, MAX_REQUEST_LINE, read_line_bounded};
 
 pub const MAX_CONNECTIONS: usize = 16;
@@ -52,14 +54,19 @@ pub fn serve<H: Host + Clone + Send + 'static>(listener: TcpListener, host: H) {
             );
             continue;
         }
-        let host = host.clone();
+        let mut host = host.clone();
         let counter = Arc::clone(&active);
+        let caller = match stream.peer_addr() {
+            Ok(peer) => new_caller("tcp", peer),
+            Err(_) => new_caller("tcp", "?"),
+        };
         let spawned = thread::Builder::new()
             .name("control-conn".into())
             .spawn(move || {
-                if let Err(e) = handle(stream, host) {
+                if let Err(e) = handle(stream, &mut host, &caller) {
                     log::debug!("control: connection closed: {e}");
                 }
+                hang_up(&mut host, &caller);
                 counter.fetch_sub(1, Ordering::SeqCst);
             });
         if let Err(e) = spawned {
@@ -81,15 +88,16 @@ pub fn spawn<H: Host + Clone + Send + 'static>(
 
 /// The reply to one request, or `None` when it is not a JSON request (the
 /// caller then drops the connection). Shared by TCP and WebSocket.
-pub(crate) fn answer(host: &mut dyn Host, text: &str) -> Option<Value> {
+pub(crate) fn answer(host: &mut dyn Host, caller: &Caller, text: &str) -> Option<Value> {
     let req = serde_json::from_str::<Request>(text).ok()?;
-    Some(match dispatch(host, &req.method, &req.params) {
+    Some(match dispatch_as(host, caller, &req.method, &req.params) {
         Ok(result) => json!({"id": req.id, "ok": true, "result": result}),
         Err(error) => json!({"id": req.id, "ok": false, "error": error}),
     })
 }
 
-fn handle<H: Host>(stream: TcpStream, mut host: H) -> io::Result<()> {
+/// Runs until the client hangs up; the caller then calls [`hang_up`].
+fn handle<H: Host>(stream: TcpStream, host: &mut H, caller: &Caller) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
     let mut out = stream;
     loop {
@@ -109,7 +117,7 @@ fn handle<H: Host>(stream: TcpStream, mut host: H) -> io::Result<()> {
             continue;
         }
         // Not JSON (e.g. an HTTP request from a web page): drop the connection.
-        let Some(reply) = answer(&mut host, &line) else {
+        let Some(reply) = answer(host, caller, &line) else {
             return Ok(());
         };
         writeln!(out, "{reply}")?;

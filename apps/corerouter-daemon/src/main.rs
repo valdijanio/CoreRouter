@@ -14,6 +14,10 @@
 //! start-up. Without the flag the linux backend uses `/config` (the writable
 //! partition of the router image) and the virtual lab keeps nothing.
 //!
+//! Safe Mode (G1.4): a clock thread ticks the session every second (timeouts),
+//! and a control or WebSocket connection that closes undoes the Safe Mode it
+//! held. Changes made in Safe Mode are saved only when it is confirmed.
+//!
 //! Neighbor discovery (G5.1, docs/discovery.md): CRDP announces on the
 //! interfaces listed with `ip.neighbor.discovery.set` (none by default) and
 //! fills `ip.neighbor.list`. The node id is kept in `<config-dir>/node-id`.
@@ -23,7 +27,9 @@ mod node_id;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use corerouter_control::{DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_ws};
+use corerouter_control::{
+    DEFAULT_PORT, SharedHost, WsPolicy, bind_loopback, serve, spawn_clock, spawn_ws,
+};
 use corerouter_discovery::{Agent, AgentConfig};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, shared};
 use corerouter_hal::{Hal, VirtualHal};
@@ -210,6 +216,10 @@ fn main() -> ExitCode {
     };
     let storage_name = storage.describe();
     let session = shared(Session::with_storage(hal, storage));
+    if let Err(e) = spawn_clock(session.clone()) {
+        eprintln!("cannot start the clock thread: {e}");
+        return ExitCode::FAILURE;
+    }
     let listener = match bind_loopback(args.port) {
         Ok(l) => l,
         Err(e) => {

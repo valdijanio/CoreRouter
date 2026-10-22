@@ -146,8 +146,33 @@ MCP (Headless/Remote) ──┘        1. acha o CommandSpec (ou "did you mean")
 ```
 
 Modos: `immediate` (RouterOS: cada comando vira revisão) e `transactional` (VyOS/Junos:
-`config.diff` → `config.commit`; `config.rollback {revision}` carrega histórico). Safe Mode do
-RouterOS (commit confirmado com rollback automático) é G1.4.
+`config.diff` → `config.commit`; `config.rollback {revision}` carrega histórico).
+
+### Safe Mode (G1.4)
+
+Como no RouterOS: `config.safe-mode.enter` guarda a config running da entrada (a própria
+`Config`, não um número de revisão: o histórico é limitado a 64). Toda mudança feita depois —
+de qualquer cliente, como no RouterOS — roda no data plane, vira revisão marcada `[safe mode]`
+e **não é salva** no `ConfigStorage`. Fim:
+
+| Evento | Efeito |
+|---|---|
+| `config.safe-mode.exit` | confirma: salva e mantém |
+| `config.safe-mode.cancel`, conexão dona fecha, `timeout_secs` expira | a config da entrada é commitada como revisão nova ("safe mode undo: …"); journal registra o automático |
+| daemon reinicia no meio | o disco ainda tem a config da entrada: sobe nela |
+
+Quem é o dono: `Session::execute_as(&Caller, …)` (também `batch_as`, `inspect_as`); o canal de
+controle dá um `Caller` por conexão TCP/WebSocket (`control::new_caller`) e, quando ela fecha,
+chama `control::hang_up` → `Session::hang_up(id)`. `Session::execute` sem `_as` é o
+`Caller::local()` (GUI em lab, testes). Só um dono por vez: outro `enter` recebe "held by
+`<conexão>` since `<UTC>` (N s ago)"; `exit`/`cancel` de outro cliente pedem `force: true`
+(o "release"/"unroll" do RouterOS).
+
+Relógio: o engine não tem (wasm32). O tempo vem de `Hal::now_unix` ou de `Session::tick(unix)`,
+que o daemon e a GUI em lab chamam a cada segundo (`control::spawn_clock`); expiração é
+conferida em cada tick e antes de cada comando. Sem relógio (wasm `?lab`), Safe Mode funciona
+sem timeout. Uma conexão TCP ociosa morta (rede caiu sem FIN) só é percebida pelo timeout: por
+isso o botão oferece 1/5/10 min no clique direito.
 
 ### Persistência (G0.6)
 
@@ -289,4 +314,5 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-21 — G5.2: crates `proto-lldp`/`proto-mndp` (L2) e módulo `l2` do `hal-linux`.
 - 2026-10-21 — G1.5: rotas estáticas e VRF (`model::route`, passos 0 e 9 do plano).
 - 2026-10-22 — G1.14: `Hal::features` e a sonda de recursos do `hal-linux`.
+- 2026-10-22 — G1.4: seção Safe Mode (`Caller` por conexão, `hang_up`, relógio por `tick`).
 - 2026-10-22 — G5.1: crates `proto-discovery` (L2) e `discovery` (L4), tabela de vizinhos no engine, tela de conexão.
