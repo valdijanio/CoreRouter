@@ -469,9 +469,15 @@ secundária nem ACL de IP para AXFR, e a busca dela é async (tokio), fora da ca
 compila em wasm. Então a etapa `zones` (`proto-dns/src/zone/`) faz a busca da RFC 1034 §4.3.2 sobre
 registros do `hickory-proto`. Transferências e NOTIFY são atendidos antes da cadeia, e o serviço
 `dns zones` do daemon faz o NOTIFY enviado e as secundárias. Medido: 1,04 µs por resposta de zona
-(como um acerto de cache), nada para quem não tem zonas. O `hickory-server` fica para a assinatura
-DNSSEC (G4.1c-2): `InMemoryZoneHandler::secure_zone_mut` é síncrono e monta NSEC3/RRSIG, que
-serviríamos da mesma etapa. Detalhes em `docs/dns.md`, "G4.1c — Zonas".
+(como um acerto de cache), nada para quem não tem zonas. Na assinatura DNSSEC (G4.1c-2) o
+`hickory-server` também ficou de fora: o `InMemoryZoneHandler::secure_zone_mut` dele assina o NS
+de delegação e a glue (a RFC 4035 §2.2 proíbe), marca RRSIG no bitmap de delegações sem DS e não
+tem rotação de chaves. A criptografia é a do `hickory-proto` (ring, feature `dnssec` do proto-dns,
+ligada só pelo daemon: engine, GUI e wasm não ligam o ring); a cadeia NSEC3, as provas e as
+rotações são nossas. As chaves ficam fora da config versionada (estado operacional
+`dnssec-keys`), para um rollback nunca tirar uma chave cujo DS está no pai. Medido: 24 ms para
+assinar 1000 registros, 1,56 µs por resposta assinada. Detalhes em `docs/dns.md`, "G4.1c —
+Zonas".
 
 ```
 UDP/TCP 53 ─► Forwarder::start (thread do socket) ─► acl, limit, special, adlist, static, zones, cache

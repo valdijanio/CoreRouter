@@ -924,3 +924,172 @@ SRV e TXT. Não tem SOA, PTR, CAA, zona, AXFR, IXFR nem NOTIFY.
 - `$GENERATE` do BIND.
 - Catalog zones (RFC 9432).
 - Mais tipos de registro: G4.1l.
+
+### G4.1c-2 — Assinatura DNSSEC
+
+**Problema.** Uma zona sem assinatura pode ser falsificada no caminho (envenenamento de cache,
+BGP sequestrado): o resolvedor do cliente não tem como saber. BIND, Knot e PowerDNS assinam
+zonas; nenhum roteador da comparação assina (RouterOS nem valida). Quem quer DNSSEC hoje roda um
+servidor à parte e cuida das chaves e das rotações à mão.
+
+**Agora.**
+
+```sh
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.set '{"id":"example.com","dnssec":true}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.print          # ds: o DS para o registro
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.dnssec.print   # chaves (nunca a privada)
+dig +dnssec @192.168.88.1 www.example.com                              # RRSIG junto
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.dnssec.rollover '{"zone":"example.com","key":"zsk"}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.dnssec.rollover '{"zone":"example.com","key":"ksk"}'
+corerouter-cli --connect 127.0.0.1:7979 run ip.dns.zone.dnssec.ds-published '{"zone":"example.com"}'
+```
+
+Na GUI, o diálogo da zona ganha DNSSEC, Algorithm e Signature Validity, e a seção "DNSSEC keys"
+(papel, tag, estado com selo, o próximo passo, o DS com Copy DS e os botões Roll ZSK, Roll KSK e DS
+Published).
+
+| Comando | Parâmetros |
+|---|---|
+| `ip.dns.zone.add/set` | + `dnssec` (assina), `dnssec_algorithm` (`ecdsa-p256` padrão, `ed25519`), `signature_validity_secs` (padrão 14 dias, de 1 a 90) |
+| `ip.dns.zone.print` | + `signed_serial`, `signatures_expire_unix`, `ds` (os DS das KSK, SHA-256), `signed` (secundária de zona assinada) |
+| `ip.dns.zone.dnssec.print` | `{zone?}` → chaves: `role` (ksk/zsk), `algorithm`, `key_tag`, `state` (published/active/retired), `dnskey`, `ds`, `next` (o que acontece depois e quando) |
+| `ip.dns.zone.dnssec.rollover` | `{zone, key: ksk\|zsk}` |
+| `ip.dns.zone.dnssec.ds-published` | `{zone}`: o DS da KSK nova já está no pai |
+| `ip.dns.zone.dnssec.forget` | `{zone}`: apaga as chaves de uma zona que não assina mais |
+
+**As chaves ficam fora da config.** Como os usuários, elas não entram em revisão, `config.diff`
+nem export: um `config.rollback` nunca pode levar embora uma chave cujo DS está no pai (a zona
+ficaria "bogus" para todo resolvedor que valida), e a chave privada nunca aparece num diff. O
+engine as guarda no estado operacional do armazenamento (`dnssec-keys`, arquivo 0600 ao lado da
+config, o mesmo mecanismo das concessões do DHCP) e as muda na hora; o daemon as gera (ring) e
+assina. Elas sobrevivem a reinícios (teste).
+
+**O que é assinado** (`proto-dns/src/zone/dnssec/`, feature `dnssec`, ligada só pelo daemon:
+engine, GUI e wasm não ligam o ring):
+
+- KSK (flags 257) assina o conjunto DNSKEY; ZSK (256) assina o resto. ECDSA P-256 (13) por
+  padrão, MUST para assinar pela RFC 8624/9904; Ed25519 (15), RECOMMENDED. Sem RSA (respostas
+  maiores, assinatura lenta).
+- Todo RRset autoritativo, inclusive o NS do ápice; o NS de uma delegação e a glue abaixo dela
+  não (RFC 4035 §2.2). TTL único por RRset, o menor (RFC 2181 §5.2).
+- NSEC3 (RFC 5155 §7.1): um por dono autoritativo e por não terminal vazio, SHA-1, 0 iteração
+  extra, sem salt, sem opt-out (RFC 9276 §3.1: iterations 0 MUST, salt SHOULD NOT); TTL =
+  min(TTL do SOA, MINIMUM) (RFC 9077); NSEC3PARAM no ápice. Delegação sem DS: bitmap só com NS,
+  sem RRSIG.
+- RRSIG com início uma hora antes (relógios desajustados) e validade de `signature_validity_secs`
+  (RFC 6781 §4.4.2); assinado de novo quando falta metade, quando os dados mudam e quando as
+  chaves mudam.
+- Serial: a versão assinada tem serial próprio, sempre maior que o último assinado (guardado no
+  estado, sobrevive a reinício) e que o da config: uma nova assinatura sem mudança de dados também
+  sobe o serial, para as secundárias buscarem as assinaturas novas (como o `inline-signing` do
+  BIND). Enquanto a nova versão é assinada, a anterior continua sendo servida.
+
+**Respostas** (etapa `zones`): sem DO, nada de DNSSEC (RFC 4035 §3.1); o DNSKEY é dado comum e
+vai para quem perguntar. Com DO (copiado na resposta, RFC 3225): os RRSIG do que responde (do
+CNAME também), e no NXDOMAIN o SOA com RRSIG e a prova do encontro mais próximo (NSEC3 do encontro,
+NSEC3 cobrindo o próximo mais próximo, NSEC3 cobrindo o curinga: RFC 5155 §7.2.2); NODATA com o
+NSEC3 do nome (§7.2.3), curinga com o NSEC3 cobrindo o próximo mais próximo (§7.2.6), referência
+para filho sem DS com o NSEC3 da delegação (§7.2.7). AXFR e IXFR levam a versão assinada; o diário
+do IXFR e o NOTIFY seguem as versões assinadas. Uma secundária de zona assinada (nossa ou de
+outro servidor) separa RRSIG e NSEC3 do que transferiu e responde DO do mesmo jeito.
+
+**Rotação** (`engine/src/dnssec.rs`, tempos da RFC 7583, conferidos com relógio falso):
+
+- Zona assinada sem chaves: o daemon gera uma KSK e uma ZSK, ativas. O DS (SHA-256, RFC 4509; o
+  SHA-1 é MUST NOT desde a RFC 9905) aparece em `ip.dns.zone.print` e na GUI: o operador o leva ao
+  registro.
+- ZSK, pré-publicação (RFC 6781 §4.1.1.1): a nova é publicada no DNSKEY sem assinar; depois de
+  Ipub = TTL do DNSKEY + 1 h de propagação ela passa a assinar e a antiga se aposenta; depois de
+  Iret = maior TTL da zona + 1 h a antiga sai.
+- KSK, assinatura dupla (§4.1.2): a nova assina o DNSKEY já junto com a antiga; o operador põe o
+  DS novo no pai e diz `ds-published` (como o `rndc dnssec -checkds published` do BIND); a antiga
+  se aposenta e sai depois do TTL do DS no pai (1 dia, `parent-ds-ttl` do BIND) + 1 h. Enquanto o
+  operador não confirmar, as duas assinam (sem risco de quebrar).
+- Trocar o algoritmo de uma zona com chaves é recusado (rotação de algoritmo: G4.1m); renomear
+  também (o DS é do nome antigo).
+
+**Regras de RFC no código:**
+
+| Regra | Onde |
+|---|---|
+| RFC 4034 §2.1.1: flags 256/257 (SEP na KSK) | `dnssec/sign.rs::dnskey_of` |
+| RFC 4034 §3.1.3 e RFC 6840 §6.3: rótulos do RRSIG sem o `*` | `sign.rs::rrsig` |
+| RFC 4035 §2.2: delegação e glue sem assinatura; NS do ápice assinado | `sign.rs::sign` |
+| RFC 4035 §3.1: DNSSEC só com DO; §3.1.1 RRSIG junto; §3.1.3 provas | `stage/zones.rs`, `dnssec::authenticate` |
+| RFC 3225 §3: DO copiado na resposta | `server::encode` |
+| RFC 5155 §7.1: NSEC3 por dono e não terminal vazio, NSEC3PARAM | `sign.rs::sign` |
+| RFC 5155 §7.2.2/§7.2.3/§7.2.5/§7.2.6/§7.2.7: provas | `dnssec::authenticate` |
+| RFC 5155 errata 3544: base32hex | `dnssec::base32hex` |
+| RFC 9276 §3.1: 0 iterações, sem salt, sem opt-out | `sign.rs` (`ITERATIONS`) |
+| RFC 9077: TTL do NSEC3 = min(SOA TTL, MINIMUM) | `sign.rs::sign` |
+| RFC 2181 §5.2: um TTL por RRset | `sign.rs::sign` |
+| RFC 8624/9904 §3.1: algoritmos 13 e 15; RFC 4509 e 9905: DS com SHA-256 | `sign.rs::generate` |
+| RFC 6781 §4.1.1.1/§4.1.2, RFC 7583 §3: pré-publicação da ZSK, assinatura dupla da KSK, Ipub/Iret | `engine/src/dnssec.rs` |
+| RFC 6781 §4.4.2: início no passado, renovação na metade da validade | `sign.rs`, `service/dns_zones.rs` |
+
+**Testes.** `proto-dns` (feature `dnssec`): toda RRSIG verificada com o verificador do Hickory
+(ECDSA e Ed25519), o que é e o que não é assinado, a cadeia NSEC3 (anel fechado, ordem, bitmaps,
+parâmetros da RFC 9276, TTL), as provas da §7.2 (NXDOMAIN, NODATA, não terminal vazio, curinga,
+referência, CNAME), zona assinada transferida e reindexada, estados das chaves, chave danificada,
+a cadeia com e sem DO. Engine: ciclo de vida das chaves com relógio falso (chaves iniciais,
+rotação de ZSK e de KSK, espera do DS, remoção), chaves sobrevivem a reinício, comandos. Daemon:
+zona assinada com DO e sem DO, nova assinatura com serial maior, secundária servindo as
+assinaturas e a mesma prova de NXDOMAIN. Namespace (`tests/netns_dns_dnssec.rs`): o `delv` do BIND,
+um validador independente, com a KSK como âncora: resposta, SOA, DNSKEY, NXDOMAIN, NODATA, não
+terminal vazio, curinga e CNAME "fully validated", e de novo depois de uma mudança. GUI: diálogo
+com as chaves e o DS, o botão Roll ZSK chegando ao engine, screenshot.
+
+**Desempenho (medido, `benches/dnssec.rs`).** Assinar uma zona de 1000 registros inteira (≈ 2000
+assinaturas com o NSEC3): 24 ms com ECDSA P-256, 32 ms com Ed25519. Resposta assinada com DO:
+1,56 µs; NXDOMAIN com a prova NSEC3 (hashes por consulta): 6,6 µs.
+
+**Por que não o `hickory-server` aqui também.** O `InMemoryZoneHandler::secure_zone_mut` do
+`hickory-server` 0.26.3 assina todo RRset, inclusive o NS de delegação e a glue (a RFC 4035 §2.2
+proíbe), põe RRSIG no bitmap de delegações sem DS e não tem rotação de chaves. A criptografia é do
+`hickory-proto` (DNSKEY, RRSIG, DS, hash NSEC3, ring); a cadeia, as provas e as rotações são nossas.
+
+**Limites e o que fica para depois** (G4.1m): CDS/CDNSKEY (RFC 7344/8078/9615) e checagem
+automática do DS no pai (o `checkds` do BIND, o `ksk-submission` do Knot); rotação automática por
+idade (`zsk-lifetime`); rotação de algoritmo; NSEC como alternativa ao NSEC3; DS de zonas filhas
+nos registros (delegação assinada).
+
+#### Pesquisa da G4.1c-2
+
+Fontes (conferidas em 2026-10-22): MikroTik `/ip dns` (sem DNSSEC nenhum, só DoH); BIND 9
+`dnssec-policy` e o guia de DNSSEC (<https://bind9.readthedocs.io/en/latest/reference.html>,
+<https://bind9.readthedocs.io/en/latest/dnssec-guide.html>); Knot `policy`
+(<https://www.knot-dns.cz/docs/latest/html/reference.html>); PowerDNS
+(<https://doc.powerdns.com/authoritative/dnssec/pdnsutil.html>,
+<https://doc.powerdns.com/authoritative/dnssec/modes-of-operation.html>); VyOS, OPNsense
+(plugin BIND), OpenWrt (pacote knot), pfSense; RFCs 3225, 4033, 4034, 4035, 4509, 5155, 6605,
+6781 (§3.3, §4.1, §4.4.2), 6840 (§5.1, §5.11, §6.3), 7344, 7583, 8078, 8624 → 9904, 9077, 9276,
+9615, 9905. Errata: RFC 4034 4552 (verificada) e 2681 (soma da key tag em 32 bits; o Hickory a
+calcula assim), 1062; RFC 4035 5226 (§3.1.4.1), 8037 (retida); RFC 5155 3441, 3544 (base32hex),
+4622, 4993; RFC 9276 7104 (editorial); RFC 6781 4844 (publicar o DNSKEY antes de mandar o DS);
+RFC 7344 7997, RFC 8078 5049; RFC 8624 6227 e 8144 (rejeitadas); RFC 6840 8038 (retida).
+
+**Como o MikroTik faz.** Não faz: nem valida nem assina.
+
+**Como os outros fazem.** BIND `default`: uma CSK ECDSA P-256 sem prazo, NSEC (NSEC3 com
+`nsec3param`, exemplo 0 iteração e sem salt), validade de 2 semanas renovada aos 5 dias,
+`publish-safety`/`retire-safety` 1 h, `parent-ds-ttl` 1 dia, `inline-signing`, CDS/CDNSKEY,
+`checkds` no pai, `rndc dnssec -checkds/-rollover/-status`. Knot: ECDSA P-256, KSK + ZSK
+(`single-type-signing` desligado), `zsk-lifetime` 30 dias, KSK sem prazo, `rrsig-lifetime` 14
+dias, NSEC3 desligado (0 iteração, sem salt quando ligado), `ksk-submission`. PowerDNS: uma CSK
+ECDSA, NSEC por padrão, assinatura na hora com cache, janela semanal, `set-nsec3` padrão '1 0 0 -'
+pela RFC 9276. VyOS, OPNsense e pfSense só validam; o OpenWrt assina só com Knot cru, sem tela.
+
+**O que adotamos.** ECDSA P-256 como todos; KSK + ZSK como o Knot (o pedido da gap: a ZSK gira
+sozinha sem tocar no registro, a KSK só quando o operador quer); NSEC3 com os parâmetros da RFC
+9276 (pedido da gap; esconde os nomes da zona de quem caminha pelo NSEC); validade de 14 dias
+como o Knot; DS só com SHA-256; a rotação da KSK espera a confirmação do DS como o `checkds`.
+
+**Melhorias sobre os outros.** As chaves fora da config e do rollback (um rollback do BIND com
+`dnssec-policy` não mexe nas chaves, mas um operador que restaura um backup de zona sim); o DS na
+tela, com Copy, e o próximo passo de cada chave em palavras; a rotação da KSK nunca avança sem a
+confirmação; o `delv` valida a zona inteira no teste de namespace; assinar a zona inteira custa
+24 ms por 1000 registros.
+
+**Fica de fora, e por quê.** CDS/CDNSKEY e a checagem do DS no pai (precisam consultar o pai pela
+internet, com o resolvedor da G4.1f); NSEC (a gap pede NSEC3); rotação por idade e de algoritmo;
+chave offline (`offline-ksk` do Knot): G4.1m.

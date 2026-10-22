@@ -198,7 +198,7 @@ mod tests {
         assert!("rsasha1".parse::<DnssecAlgorithm>().is_err());
         assert_eq!("ksk".parse::<KeyRole>(), Ok(KeyRole::Ksk));
         let s = DnssecState::default();
-        assert_eq!(serde_json::to_string(&s).unwrap().len() < 120, true);
+        assert!(serde_json::to_string(&s).unwrap().len() < 120);
         assert_eq!(s.problem(), None);
     }
 }
