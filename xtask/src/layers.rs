@@ -18,6 +18,8 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-cgnat", 2),
     ("corerouter-proto-dns", 2),
     ("corerouter-proto-dhcp", 2),
+    ("corerouter-proto-lldp", 2),
+    ("corerouter-proto-mndp", 2),
     ("corerouter-engine", 3),
     ("corerouter-control", 4),
     ("corerouter-mcp", 4),
