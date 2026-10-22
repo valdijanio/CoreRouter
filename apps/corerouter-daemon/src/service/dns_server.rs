@@ -501,6 +501,21 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
 /// zone service works on its zones).
 static SERVER: OnceLock<Arc<Server>> = OnceLock::new();
 
+/// G6.6 DNS Lookup with the router as the server: `query` down the chain
+/// as a client on the router itself is answered, without a socket. The
+/// reply's bytes (`None`: dropped) and the stage that answered; `None`
+/// when the forwarder has not started.
+pub(crate) fn ask(query: &[u8], tcp: bool) -> Option<(Option<Vec<u8>>, &'static str)> {
+    let srv = SERVER.get()?;
+    let client = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    let mut done = match srv.fwd.start(query, client, tcp, srv.dns.now_ms()) {
+        Start::Done(d) => d,
+        Start::Pending(p) => srv.finish(*p),
+    };
+    srv.effects(&mut done);
+    Some((done.reply, done.answered_by))
+}
+
 /// The block lists the forwarder matches (G4.1d), once it started.
 pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
     SERVER.get().map(|s| s.fwd.state())

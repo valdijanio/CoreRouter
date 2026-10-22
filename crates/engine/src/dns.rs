@@ -53,6 +53,30 @@ pub trait DnsBackend: Send + Sync {
         let _ = (name, rtype, server);
         Err("ip.dns.resolve needs the router daemon's resolver".into())
     }
+
+    /// `tool.dns.query` (G6.6): `query` sent as it is to `to` (the router's
+    /// own chain, a server, or an encrypted one), over TCP if `tcp` (UDP
+    /// retried over TCP when truncated), and the reply's bytes. Waits on
+    /// the network: called from a task.
+    fn exchange(
+        &self,
+        to: &crate::dns_lookup::LookupServer,
+        query: &[u8],
+        tcp: bool,
+    ) -> Result<crate::dns_lookup::Exchanged, String> {
+        let _ = (to, query, tcp);
+        Err(crate::dns_lookup::NEEDS_DAEMON.into())
+    }
+
+    /// [`Self::exchange`] with every `(server, query)` at once (`compare`):
+    /// the daemon asks them in parallel, so the slowest sets the time.
+    fn exchange_all(
+        &self,
+        asks: &[(crate::dns_lookup::LookupServer, Vec<u8>)],
+        tcp: bool,
+    ) -> Vec<Result<crate::dns_lookup::Exchanged, String>> {
+        asks.iter().map(|(to, q)| self.exchange(to, q, tcp)).collect()
+    }
 }
 
 /// One answer of `ip.dns.resolve`.

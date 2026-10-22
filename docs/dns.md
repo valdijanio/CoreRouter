@@ -591,8 +591,8 @@ tipo com a resposta, de onde veio (`cache`, `stale`, o servidor), TTL e tempo.
   os servidores, serve-stale. Com `server`, vai só a ele, por UDP (TCP no truncamento), sem ler
   nem gravar o cache (o `:resolve server=` do RouterOS).
 - O texto vindo da rede sai só com ASCII imprimível (sem sequências de escape de terminal).
-- A ferramenta completa estilo `dig` (flags, seções, comparação, trace) é a G6.6; ela pode usar o
-  mesmo `DnsBackend::resolve_query`.
+- A ferramenta completa estilo `dig` (flags, seções, comparação, trace) é a G6.6
+  (`tool.dns.query`, `docs/tools.md` §4.3), sobre `DnsBackend::exchange`.
 
 **Cache de falhas (RFC 9520).** Quando nenhum servidor responde a um nome e tipo (SERVFAIL,
 REFUSED, silêncio, resposta malformada, `query_total_timeout`), o par fica retido: por **5 s** na

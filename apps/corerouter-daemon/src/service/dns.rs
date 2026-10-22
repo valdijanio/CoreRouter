@@ -241,6 +241,23 @@ impl DnsBackend for RouterDns {
         })
     }
 
+    fn exchange(
+        &self,
+        to: &corerouter_engine::dns_lookup::LookupServer,
+        query: &[u8],
+        tcp: bool,
+    ) -> Result<corerouter_engine::dns_lookup::Exchanged, String> {
+        super::dns_lookup::exchange(self, to, query, tcp)
+    }
+
+    fn exchange_all(
+        &self,
+        asks: &[(corerouter_engine::dns_lookup::LookupServer, Vec<u8>)],
+        tcp: bool,
+    ) -> Vec<Result<corerouter_engine::dns_lookup::Exchanged, String>> {
+        super::dns_lookup::exchange_all(self, asks, tcp)
+    }
+
     fn reverse_nowait(&self, ip: IpAddr) -> Option<Lookup<Option<String>>> {
         Some(match self.nowait(Ask::Ptr(ip))? {
             Lookup::Done(Answer::Name(n)) => Lookup::Done(n),
