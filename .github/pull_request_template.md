@@ -27,4 +27,4 @@
 
 - [ ] `cargo xtask ci` passa localmente
 - [ ] Mudou UI: screenshot conferido (`corerouter-cli --connect … screenshot`)
-- [ ] `docs/gaps.md` e `ROADMAP.md` atualizados
+- [ ] Linha do item em `docs/gaps.md` atualizada; entrada no fim de `docs/log.md` (e de `docs/gaps-history.md` se mudou o status)

@@ -187,7 +187,17 @@ GitHub não impõe isso: esta regra impõe.
 
 ## Progresso
 
-- Ao terminar: atualize o status em `docs/gaps.md`, o log de `ROADMAP.md` e, se a arquitetura
-  mudou, `docs/architecture.md` — no mesmo PR.
+- Ao terminar, no mesmo PR:
+  - atualize **só a linha do seu item** em `docs/gaps.md` (status, critério) — nunca reescreva
+    linhas de outros itens;
+  - acrescente **no fim** de `docs/log.md` uma entrada `- AAAA-MM-DD — <id>: …` (o que entrou,
+    como testar, números medidos);
+  - acrescente **no fim** de `docs/gaps-history.md` uma linha se você criou, redefiniu ou mudou o
+    status de um item;
+  - se a arquitetura mudou, atualize `docs/architecture.md`.
+- `docs/log.md` e `docs/gaps-history.md` são **só de acrescentar** e usam `merge=union`
+  (`.gitattributes`): o git junta as entradas de PRs paralelos sem conflito. Por isso, só
+  acrescente no fim; nunca edite, reordene ou apague entradas antigas.
+- Não crie seções de "histórico de revisão" no fim de outros documentos (geram conflito entre PRs
+  paralelos); o histórico do projeto é o `docs/log.md`.
 - Notas e estimativas erram para baixo; marque cada número como **medido** ou **estimado**.
-- Documento tocado ganha linha no histórico de revisão no fim do arquivo.
