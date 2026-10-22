@@ -12,7 +12,7 @@
 //! | lease | 600 s (T1 300 s, T2 525 s) |
 //! | domain | `lab.test` |
 //! | classless routes (121) | `0.0.0.0/0` via `100.64.N.1`, `10.200.0.0/16` via `100.64.N.254` |
-//! | server MAC | `02:DC:00:00:00:N` |
+//! | server MAC | `02:DC:00:00:00:N` (answers ARP for `100.64.N.1`) |
 //!
 //! Tests turn [`Knobs`] to play a silent server, a NAKing one, a rogue one
 //! or a host that already uses the address.
@@ -40,6 +40,8 @@ pub struct Knobs {
     pub classless: bool,
     /// A lab host already uses the offered address (ARP finds this MAC).
     pub squatter: Option<[u8; 6]>,
+    /// The router `100.64.N.1` stops answering ARP (check-gateway, G4.7c).
+    pub gateway_down: bool,
 }
 
 impl Default for Knobs {
@@ -51,6 +53,7 @@ impl Default for Knobs {
             server: None,
             classless: true,
             squatter: None,
+            gateway_down: false,
         }
     }
 }
@@ -194,7 +197,11 @@ impl DhcpResponder for LabServer {
 
     fn conflict(&self, port: &IfName, ip: Ipv4Addr) -> Option<[u8; 6]> {
         let k = self.knobs();
-        let _ = (port, ip);
+        if ip == Self::server_ip(port) {
+            // The lab router answers ARP for itself.
+            let n = Self::net_of(port);
+            return (!k.gateway_down).then(|| corerouter_hal::dhcp::lab_router_mac(n));
+        }
         k.squatter
     }
 }

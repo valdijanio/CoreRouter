@@ -524,3 +524,152 @@ fn odd_timers_and_masks_from_the_server() {
     assert!(lease_from(0, &i, &d, server).is_err());
     let _ = OptionCode::End;
 }
+
+/// The lease of a bound client, as the engine would remember it.
+fn remembered() -> Lease {
+    bound_at_1s().bound.unwrap()
+}
+
+fn decoded(a: &Action) -> Option<(Message, Dest)> {
+    match a {
+        Action::Send { payload, dest, .. } => {
+            Some((Message::decode(&mut Decoder::new(payload)).unwrap(), *dest))
+        }
+        _ => None,
+    }
+}
+
+#[test]
+fn init_reboot_requests_the_remembered_address_without_a_server_id() {
+    let old = remembered();
+    let lease = restore_lease(0, &old.ack, old.server, old.server_mac, Some(60_000)).unwrap();
+    let mut n = Net::new(Knobs::default());
+    let actions = n.client.reboot(0, lease);
+    assert_eq!(n.client.state(), State::Rebooting);
+    assert_eq!(n.client.state().status(), "requesting");
+    let (m, dest) = actions.iter().find_map(decoded).unwrap();
+    // RFC 2131 §4.3.2 (INIT-REBOOT): ciaddr zero, option 50 MUST hold the
+    // previous address, option 54 MUST NOT be there; §4.4.2: broadcast.
+    assert_eq!(m.opts().msg_type(), Some(MessageType::Request));
+    assert_eq!(dest, Dest::Broadcast);
+    assert_eq!(m.ciaddr(), Ipv4Addr::UNSPECIFIED);
+    assert_eq!(
+        m.opts().get(OptionCode::RequestedIpAddress),
+        Some(&DhcpOption::RequestedIpAddress(old.address.addr()))
+    );
+    assert!(m.opts().get(OptionCode::ServerIdentifier).is_none());
+    assert!(
+        matches!(actions.first(), Some(Action::Log(Event::Rebooting { address })) if *address == old.address)
+    );
+    // The server confirms: ARP probe, then bound, no DISCOVER at all.
+    n.run(0, actions);
+    assert_eq!(n.client.state(), State::Probing);
+    n.advance(0, 1_000);
+    assert_eq!(n.client.state(), State::Bound);
+    assert_eq!(n.bound.as_ref().unwrap().address, old.address);
+    assert_eq!(n.kinds(), vec![MessageType::Request]);
+}
+
+#[test]
+fn init_reboot_nak_starts_over_without_asking_for_the_address_again() {
+    let old = remembered();
+    let mut lease = restore_lease(0, &old.ack, old.server, old.server_mac, Some(0)).unwrap();
+    // Another network: the lab server NAKs an address that is not ours.
+    lease.address = "100.64.9.9/24".parse().unwrap();
+    let mut n = Net::new(Knobs::default());
+    let a = n.client.reboot(0, lease);
+    n.run(0, a);
+    assert!(n.events.iter().any(|e| matches!(e, Event::Nak { .. })));
+    // RFC 2131 §3.2 step 3: NAK → INIT; then the usual exchange.
+    assert_eq!(
+        n.kinds(),
+        vec![
+            MessageType::Request,
+            MessageType::Discover,
+            MessageType::Request
+        ]
+    );
+    n.advance(0, 1_000);
+    assert_eq!(n.client.state(), State::Bound);
+    assert_eq!(n.bound.as_ref().unwrap().address, old.address);
+}
+
+#[test]
+fn silent_network_reuses_an_unexpired_remembered_lease() {
+    let old = remembered();
+    // Granted 100 s ago: T1 (300 s) still ahead, so it binds and waits.
+    let lease = restore_lease(0, &old.ack, old.server, old.server_mac, Some(100_000)).unwrap();
+    assert_eq!(lease.t1_ms, 200_000);
+    assert_eq!(lease.expires_ms, Some(500_000));
+    let mut n = Net::new(Knobs {
+        silent: true,
+        ..Knobs::default()
+    });
+    let a = n.client.reboot(0, lease);
+    n.run(0, a);
+    n.advance(0, 20_000);
+    // RFC 2131 §3.2: no ACK nor NAK after retransmitting → MAY use it for
+    // the rest of the lease.
+    assert_eq!(n.client.state(), State::Bound);
+    assert_eq!(n.kinds(), vec![MessageType::Request; REBOOT_TRIES as usize]);
+    assert!(n.events.iter().any(|e| matches!(e, Event::Reused { .. })));
+    assert_eq!(n.bound.as_ref().unwrap().address, old.address);
+    // Still nobody at T1/T2: renewing, rebinding, then the lease is gone.
+    n.advance(20_000, 500_000);
+    assert_eq!(n.client.state(), State::Selecting);
+    assert!(n.bound.is_none());
+}
+
+#[test]
+fn silent_network_and_an_expired_lease_discover_asking_for_the_old_address() {
+    let old = remembered();
+    let lease = restore_lease(0, &old.ack, old.server, old.server_mac, Some(700_000)).unwrap();
+    assert_eq!(lease.expires_ms, Some(0));
+    let mut n = Net::new(Knobs {
+        silent: true,
+        ..Knobs::default()
+    });
+    let a = n.client.reboot(0, lease);
+    n.run(0, a);
+    let mut discover = None;
+    let mut t = 0;
+    while t <= 20_000 && discover.is_none() {
+        let a = n.client.poll(t);
+        discover = a
+            .iter()
+            .filter_map(decoded)
+            .find(|(m, _)| m.opts().msg_type() == Some(MessageType::Discover));
+        n.run(t, a);
+        t += 250;
+    }
+    let (m, _) = discover.expect("a DISCOVER after the reboot tries");
+    assert!((12_000..=16_000).contains(&t), "gave up at {t} ms");
+    // RFC 2131 §4.4.1: the client MAY suggest the address it had.
+    assert_eq!(
+        m.opts().get(OptionCode::RequestedIpAddress),
+        Some(&DhcpOption::RequestedIpAddress(old.address.addr()))
+    );
+    assert!(n.bound.is_none());
+}
+
+#[test]
+fn restored_leases_are_checked_and_aged() {
+    let old = remembered();
+    let ack = &old.ack;
+    // Unknown age (no wall clock): expired, so never used without a server.
+    let l = restore_lease(5_000, ack, old.server, None, None).unwrap();
+    assert_eq!(l.expires_ms, Some(5_000));
+    // Same options as the original.
+    assert_eq!(l.options, old.options);
+    // Garbage, truncated and non-ACK messages are refused.
+    assert!(restore_lease(0, b"junk", old.server, None, Some(0)).is_err());
+    assert!(restore_lease(0, &ack[..ack.len() / 2], old.server, None, Some(0)).is_err());
+    let mut offer = ack.clone();
+    // Option 53 is the first option after the magic cookie (lab order).
+    let at = offer
+        .windows(3)
+        .position(|w| w == [53, 1, 5])
+        .expect("message type option");
+    offer[at + 2] = 2;
+    assert!(restore_lease(0, &offer, old.server, None, Some(0)).is_err());
+}

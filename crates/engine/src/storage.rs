@@ -47,6 +47,34 @@ pub trait ConfigStorage: Send {
     /// Move an unreadable `slot` out of the way (kept for forensics), so the
     /// next save does not rotate garbage over a good [`Slot::Previous`].
     fn quarantine(&mut self, slot: Slot) -> Result<(), StorageError>;
+
+    /// Operational state kept across restarts but outside the config and
+    /// its revisions (DHCP leases, G4.7c), by `name` (see [`state_name_ok`]).
+    /// Default: nothing is kept.
+    fn load_state(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        let _ = name;
+        Ok(None)
+    }
+
+    /// Replace state `name` with `data`, atomically like [`Self::save`].
+    fn save_state(&mut self, name: &str, data: &str) -> Result<(), StorageError> {
+        let _ = (name, data);
+        Ok(())
+    }
+}
+
+/// Largest state blob kept by [`ConfigStorage::save_state`] (hostile file
+/// on the way back in; **estimado**: 256 leases of ~1 KiB).
+pub const MAX_STATE_BYTES: usize = 1 << 20;
+
+/// State names are short lowercase words (`dhcp-leases`): they become
+/// file names.
+pub fn state_name_ok(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
 }
 
 #[derive(Debug, Default)]
@@ -54,6 +82,7 @@ struct Slots {
     current: Option<String>,
     previous: Option<String>,
     quarantined: Vec<String>,
+    state: std::collections::BTreeMap<String, String>,
 }
 
 /// In-memory storage. Clones share the same slots, so a test can keep a
@@ -114,6 +143,18 @@ impl ConfigStorage for MemoryStorage {
                 s.quarantined.push(bad);
             }
         });
+        Ok(())
+    }
+
+    fn load_state(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        Ok(self.with(|s| s.state.get(name).cloned()))
+    }
+
+    fn save_state(&mut self, name: &str, data: &str) -> Result<(), StorageError> {
+        if !state_name_ok(name) || data.len() > MAX_STATE_BYTES {
+            return Err(StorageError(format!("state '{name}' refused")));
+        }
+        self.with(|s| s.state.insert(name.to_owned(), data.to_owned()));
         Ok(())
     }
 }

@@ -483,6 +483,11 @@ impl Session {
         self.hal.as_mut()
     }
 
+    /// Where state outside the revisions is kept (DHCP leases, G4.7c).
+    pub(crate) fn storage_mut(&mut self) -> &mut dyn ConfigStorage {
+        self.storage.as_mut()
+    }
+
     pub fn backend(&self) -> String {
         self.hal.describe()
     }

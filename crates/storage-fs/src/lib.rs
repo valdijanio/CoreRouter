@@ -8,6 +8,7 @@
 //! | `running.json.prev` | [`Slot::Previous`] |
 //! | `running.json.tmp` | write in progress (removed on open) |
 //! | `*.corrupt` | quarantined unreadable slot |
+//! | `state-<name>.json` | operational state outside the revisions (DHCP leases) |
 //!
 //! A save is: write `running.json.tmp`, fsync it, rename `running.json` →
 //! `running.json.prev`, rename the temp file → `running.json`, fsync the
@@ -19,6 +20,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
+use corerouter_engine::storage::{MAX_STATE_BYTES, state_name_ok};
 use corerouter_engine::{ConfigStorage, Slot, StorageError};
 use corerouter_model::persist::MAX_FILE_BYTES;
 
@@ -72,7 +74,19 @@ impl FileStorage {
         StorageError(format!("{what} in {}: {e}", self.dir.display()))
     }
 
+    fn state_file(name: &str) -> Result<String, StorageError> {
+        if state_name_ok(name) {
+            Ok(format!("state-{name}.json"))
+        } else {
+            Err(StorageError(format!("bad state name '{name}'")))
+        }
+    }
+
     fn write_temp(&self, data: &str) -> io::Result<()> {
+        self.write_file(TEMP, data)
+    }
+
+    fn write_file(&self, file: &str, data: &str) -> io::Result<()> {
         let mut opts = OpenOptions::new();
         opts.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -81,7 +95,7 @@ impl FileStorage {
             // The config will hold secrets (BGP/RADIUS keys): owner only.
             opts.mode(0o600);
         }
-        let mut f = opts.open(self.path(TEMP))?;
+        let mut f = opts.open(self.path(file))?;
         f.write_all(data.as_bytes())?;
         f.sync_all()
     }
@@ -146,5 +160,33 @@ impl ConfigStorage for FileStorage {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(self.err(&format!("rename {file} → {bad}"), &e)),
         }
+    }
+
+    fn load_state(&mut self, name: &str) -> Result<Option<String>, StorageError> {
+        let file = Self::state_file(name)?;
+        let f = match File::open(self.path(&file)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(self.err(&format!("open {file}"), &e)),
+        };
+        let limit = u64::try_from(MAX_STATE_BYTES).unwrap_or(u64::MAX);
+        let mut bytes = Vec::new();
+        f.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|e| self.err(&format!("read {file}"), &e))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    fn save_state(&mut self, name: &str, data: &str) -> Result<(), StorageError> {
+        let file = Self::state_file(name)?;
+        if data.len() > MAX_STATE_BYTES {
+            return Err(StorageError(format!("{file}: too large")));
+        }
+        let temp = format!("{file}.tmp");
+        self.write_file(&temp, data)
+            .map_err(|e| self.err(&format!("write {temp}"), &e))?;
+        fs::rename(self.path(&temp), self.path(&file))
+            .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))?;
+        self.sync_dir().map_err(|e| self.err("sync", &e))
     }
 }
