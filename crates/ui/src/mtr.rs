@@ -184,7 +184,7 @@ impl CoreRouterUi {
                 names.extend(interfaces);
                 combo(ui, "mtr-iface", "any", &mut f.interface, &names);
                 ui.label("Routing table");
-                combo(ui, "mtr-table", "main", &mut f.routing_table, &tables);
+                combo(ui, "mtr-routing-table", "main", &mut f.routing_table, &tables);
                 ui.end_row();
             });
         ui.separator();
