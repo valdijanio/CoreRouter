@@ -8,7 +8,8 @@ Este arquivo é idêntico a `CLAUDE.md` (`cargo xtask agents-sync` falha se dive
 
 ## Comece toda sessão aqui
 
-1. Leia `ROADMAP.md` e `docs/gaps.md` (lista ranqueada). Sem tarefa do usuário, pegue o primeiro
+1. Leia `ROADMAP.md`, `docs/gaps.md` (lista ranqueada) e a saída de `cargo xtask docs pending`
+   (status de gap que a fila ainda não consolidou no `gaps.md`). Sem tarefa do usuário, pegue o primeiro
    item `aberto` de `docs/gaps.md` (sessões em paralelo recebem o id no brief da sessão principal).
 2. Se existir, leia `plan/STATUS.md` (pasta local, fora do git) e a tarefa em `plan/`.
 3. Leia `docs/architecture.md` antes de criar crate ou mexer em camadas.
@@ -179,14 +180,17 @@ usuário por lote. Sessões de feature não fazem merge nem ligam auto-merge.
 Quando há PRs prontos, a sessão principal pergunta ao usuário **uma vez por lote** ("N features
 prontas: X, Y, Z — subir?") e, com o sim, roda `scripts/land.sh --batch <pr>...`:
 
-- **Lote:** junta a `main` e todos os PRs numa branch temporária, consolida `docs/changes/`
-  (`cargo xtask docs fold`) e roda **um** CI nessa combinação, que é o que a `main` vai ser:
-  o "sozinho passa, junto quebra" aparece aqui. Verde: squash de cada PR em ordem, sem esperar
-  mais CI, e um PR do fold. Um PR que conflita com o lote fica de fora (a sessão dona resolve).
-  Um CI (~2,5 min) por lote em vez de um por PR (**medido** na bateria, `docs/perf.md`).
-- **Lote vermelho:** a fila cai no modo um por um (`scripts/land.sh <pr>...`), que traz a
-  `main` para cada branch, faz o fold, envia, espera o CI do commit novo e faz o squash
-  (`--match-head-commit`): o primeiro que quebrar para a fila.
+- **Lote:** junta a `main` e todos os PRs numa branch temporária, confere os `docs/changes/` e
+  roda **um** CI completo nessa combinação, que é o que a `main` vai ser: o "sozinho passa,
+  junto quebra" aparece aqui. Verde: squash de cada PR em ordem, sem esperar mais CI. Um PR que
+  conflita de verdade fica de fora (a sessão dona resolve); conflito só nos documentos do fold
+  a fila resolve sozinha. Um CI por lote (~4–6 min de ponta a ponta, **medido**).
+- **Lote vermelho:** bisseção — a fila divide ao meio e testa cada metade, até isolar quem quebra
+  (~log₂ N CIs); os outros entram, quem quebra fica de fora para a sessão dona corrigir.
+- **Fold periódico:** os `docs/changes/` são consolidados em log, gaps, histórico e perf só com
+  `scripts/land.sh --fold` ou quando há 10 pendentes (como o towncrier/changesets, que
+  consolidam no release) — não um PR extra por lote. Até lá, `cargo xtask docs pending` mostra
+  o que falta consolidar.
 
 A fila para no primeiro problema e diz qual PR e por quê:
 

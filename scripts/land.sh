@@ -1,39 +1,43 @@
 #!/usr/bin/env bash
-# Fila de entrada: integra PRs prontos na `main`, um por vez (AGENTS.md, "Integração").
+# Fila de entrada: integra PRs prontos na `main` (AGENTS.md, "Integração").
 #
-# Uso: scripts/land.sh [--batch] <pr> [<pr>...]
-#   A sessão principal roda depois que o usuário aprova o lote ("N features prontas — subir?").
+# Uso: scripts/land.sh [--batch] [--fold] [<pr>...]
 #
-# --batch (o normal com vários PRs): um CI só para a combinação, não um por PR.
-#   1. junta numa branch temporária (`queue/batch-<hora>`) a `main` e todos os PRs, em ordem; um PR que
-#      conflita sai do lote (a sessão dona resolve) e o resto segue;
-#   2. `cargo xtask docs fold` e um CI (`workflow_dispatch`) nessa combinação: é o que a `main`
-#      vai ser, então "sozinho passa, junto quebra" aparece aqui;
-#   3. verde: squash de cada PR em ordem, sem esperar mais CI (os checks do próprio PR já estão
-#      verdes, e a `main` termina igual à combinação testada); depois um PR do fold, com CI;
-#   4. vermelho: cai no modo um por um para esses PRs, que acha qual quebrou.
-#   Medido na bateria: um CI ~2,5 min; um por um eram ~2,5 min por PR.
+# --batch (o normal): um CI para a combinação, não um por PR.
+#   1. junta numa branch temporária (`queue/batch-<hora>`) a `main` e os PRs, em ordem; um PR que
+#      conflita de verdade fica de fora (a sessão dona resolve); conflito só nos documentos do
+#      fold é resolvido sozinho;
+#   2. faz o fold nessa combinação (confere os docs/changes) e roda o CI completo
+#      (`workflow_dispatch`): é o que a `main` vai ser, então "sozinho passa, junto quebra"
+#      aparece aqui;
+#   3. verde: squash de cada PR em ordem (os checks rápidos do próprio PR precisam estar verdes);
+#   4. vermelho: bisseção — divide ao meio e repete em cada metade, a da direita sobre a `main`
+#      que já recebeu a da esquerda, até isolar quem quebra (~log2 N CIs); quem quebra fica de fora.
+#   Medido: lote de 1 a 4 PRs em 220–348 s, contra ~2,5–4 min por PR no um por um.
 #
-# Sem --batch, por PR, em ordem:
-#   1. worktree temporária na branch do PR e merge da `origin/main` (conflito real: para e diz
-#      quais arquivos; a sessão dona resolve);
-#   2. `cargo xtask docs fold`: consolida `docs/changes/*.md` em log, gaps e histórico (commit);
-#   3. push (como você, então o `ci` do PR roda normalmente) e espera os checks exigidos do
-#      commit novo: o CI do PR roda sobre a `main` em que ele vai entrar, e "sozinho passa,
-#      junto quebra" para aqui, não na `main`;
-#   4. squash merge (`--match-head-commit`: nada entra que não tenha sido testado).
-# Para no primeiro problema e diz qual PR e por quê; os PRs seguintes ficam para a próxima rodada.
+# Fold (consolidar docs/changes em log, gaps, histórico e perf): periódico, como no
+# towncrier/changesets, que só consolidam no release. Só com --fold (sozinho ou junto) ou quando
+# houver FOLD_MIN (10) arquivos pendentes; até lá, `cargo xtask docs pending` mostra os status de
+# gap ainda não consolidados.
+#
+# Sem --batch, um por um: merge da `main` na branch do PR, fold, push, CI completo disparado no
+# commit que vai entrar, squash; para no primeiro problema.
 #
 # Ambiente: BASE (padrão main); LAND_DIR (padrão <repo>/target-land: worktrees e o target do
-# xtask, fora do git).
+# xtask, fora do git); FOLD_MIN (padrão 10).
 set -euo pipefail
 
-batch=0
-if [ "${1:-}" = --batch ]; then
-  batch=1
+batch=0 fold=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --batch) batch=1 ;;
+    --fold) fold=1 ;;
+    *) break ;;
+  esac
   shift
-fi
-[ $# -ge 1 ] || { echo "uso: scripts/land.sh [--batch] <pr> [<pr>...]" >&2; exit 2; }
+done
+[ $# -ge 1 ] || [ "$fold" = 1 ] ||
+  { echo "uso: scripts/land.sh [--batch] [--fold] [<pr>...]" >&2; exit 2; }
 
 root=$(git rev-parse --show-toplevel)
 base=${BASE:-main}
@@ -163,10 +167,15 @@ pr_info() {
     --jq '"\(.state) \(.isCrossRepository) \(.headRefName) \(.headRefOid)"'
 }
 
-# Um lote: devolve (em $rest) os PRs que ficaram para o modo um por um.
-rest=()
-land_batch() {
-  local n state cross branch head wt sha r=0 included=() heads=()
+# Head de cada PR do lote (pode mudar: refresh_if_conflicting).
+declare -A HEADS=()
+members=()
+
+# Monta a combinação `main` + PRs (os que entram limpos ficam em $members), faz o fold nela e roda o
+# CI completo uma vez. 0: verde; 1: vermelho; 2: ninguém entrou na combinação.
+test_combo() {
+  local n state cross branch head wt sha qb r=0
+  members=()
   git -C "$root" fetch --quiet origin "$base"
   wt="$dir/batch"
   git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
@@ -174,82 +183,122 @@ land_batch() {
   cd "$wt"
   for n in "$@"; do
     read -r state cross branch head < <(pr_info "$n")
-    if [ "$state" != OPEN ] || [ "$cross" != false ]; then
-      say "  #$n fora do lote: $state, fork=$cross"
+    if [ "$state" != OPEN ]; then
+      say "  #$n fora: o PR está $state"
       continue
     fi
     if ! refresh_if_conflicting "$n" "$branch"; then
-      say "  #$n fora do lote: conflito com a $base em $conflicts— a sessão dona resolve"
+      say "  #$n fora: conflito com a $base — a sessão dona resolve"
       continue
     fi
     git fetch --quiet origin "$branch"
     if [ "$(git rev-parse "origin/$branch")" != "$head" ]; then
-      say "  #$n fora do lote: a branch andou durante a fila"
+      say "  #$n fora: a branch andou durante a fila"
       continue
     fi
     if merge_fold_aware "origin/$branch" "lote: #$n"; then
-      included+=("$n")
-      heads+=("$head")
+      members+=("$n")
+      HEADS[$n]=$head
     else
-      say "  #$n fora do lote: conflito com o lote em $conflicts— a sessão dona resolve"
+      say "  #$n fora: conflito com o lote em $conflicts— a sessão dona resolve"
     fi
   done
-  [ ${#included[@]} -gt 0 ] || { cd "$root"; return 0; }
-  say "== lote: ${included[*]}"
-  cargo xtask docs fold >/dev/null || stop "${included[0]}" "docs/changes inválido no lote (cargo xtask docs)"
+  if [ ${#members[@]} = 0 ]; then
+    cd "$root"
+    return 2
+  fi
+  cargo xtask docs fold >/dev/null || {
+    cd "$root"
+    say "  docs/changes inválido na combinação (cargo xtask docs)"
+    return 1
+  }
   git add -A docs
   git commit --quiet -m "lote: consolida docs/changes" || true
   sha=$(git rev-parse HEAD)
-  local qb
   qb="queue/batch-$(date +%s)"
   git push --quiet origin "HEAD:refs/heads/$qb"
   gh workflow run ci.yml --ref "$qb" >/dev/null
-  say "  CI do lote ($(git rev-parse --short HEAD)), esperando os $n_required checks"
+  say "== lote ${members[*]}: CI da combinação ($(git rev-parse --short HEAD))"
   wait_checks "$sha" || r=$?
   cd "$root"
   git push --quiet origin --delete "$qb" 2>/dev/null || true
-  if [ $r != 0 ]; then
-    say "  lote vermelho (${failed:-tempo}): um por um, para achar quem quebrou"
-    rest=("${included[@]}")
-    return 0
-  fi
-  local i
-  for i in "${!included[@]}"; do
-    n=${included[$i]}
-    checks_or_stop "$n" "${heads[$i]}"
-    squash "$n" "${heads[$i]}" ||
-      stop "$n" "o merge foi recusado"
+  return $r
+}
+
+# Squash de cada PR de $members (os checks rápidos do próprio PR têm de estar verdes).
+merge_members() {
+  local n r
+  for n in "${members[@]}"; do
+    r=0
+    wait_checks "${HEADS[$n]}" || r=$?
+    if [ $r != 0 ]; then
+      say "  #$n fora: o CI do próprio PR está vermelho (${failed:-tempo})"
+      continue
+    fi
+    squash "$n" "${HEADS[$n]}" || stop "$n" "o merge foi recusado"
     say "  #$n entrou"
   done
-  # O fold do lote entra como um PR próprio (a main é protegida).
+}
+
+# Integra os PRs: testa a combinação; verde, entram todos; vermelho, divide ao meio e repete em
+# cada metade (bisseção: ~log2 N CIs para achar o culpado, em vez de N no um por um). A metade da
+# direita é testada sobre a main que já recebeu a da esquerda.
+land_set() {
+  local r=0 half
+  [ $# -gt 0 ] || return 0
+  test_combo "$@" || r=$?
+  case $r in
+    0) merge_members; return 0 ;;
+    2) return 0 ;;
+  esac
+  local set=("${members[@]}")
+  if [ ${#set[@]} = 1 ]; then
+    say "  #${set[0]} fora: quebra o CI (${failed:-tempo}) — a sessão dona corrige na branch"
+    return 0
+  fi
+  say "  vermelho (${failed:-tempo}): dividindo ${set[*]}"
+  half=$(( ${#set[@]} / 2 ))
+  land_set "${set[@]:0:$half}"
+  land_set "${set[@]:$half}"
+}
+
+# Fold dos docs/changes pendentes num PR próprio (a main é protegida). Periódico, como no
+# towncrier/changesets (que só consolidam no release): só com --fold ou com FOLD_MIN arquivos
+# pendentes; até lá `cargo xtask docs pending` mostra os status ainda não consolidados.
+FOLD_MIN=${FOLD_MIN:-10}
+maybe_fold() {
+  local wt pending fb fpr
   git -C "$root" fetch --quiet origin "$base"
+  pending=$(git -C "$root" ls-tree --name-only "origin/$base" docs/changes/ | grep -vc 'README.md$' || true)
+  if [ "$fold" != 1 ] && [ "$pending" -lt "$FOLD_MIN" ]; then
+    [ "$pending" -gt 0 ] && say "fold adiado: $pending arquivo(s) em docs/changes (consolida com $FOLD_MIN ou --fold)"
+    return 0
+  fi
+  [ "$pending" -gt 0 ] || return 0
+  wt="$dir/fold"
   git -C "$root" worktree remove --force "$wt" 2>/dev/null || true
   git -C "$root" worktree add --quiet --detach "$wt" "origin/$base"
   cd "$wt"
-  cargo xtask docs fold >/dev/null || stop "${included[0]}" "fold falhou na main"
-  if [ -n "$(git status --porcelain)" ]; then
-    local fb
-    fb="queue/fold-$(date +%s)"
-    git add -A docs
-    git commit --quiet -m "docs: consolida docs/changes (lote ${included[*]})"
-    git push --quiet origin "HEAD:refs/heads/$fb"
-    local fpr
-    fpr=$(gh pr create --base "$base" --head "$fb" \
-      --title "docs: consolida docs/changes (lote ${included[*]})" \
-      --body "Fold da fila de entrada (scripts/land.sh --batch)." | grep -o '[0-9]*$')
-    checks_or_stop "$fpr" "$(git rev-parse HEAD)"
-    gh pr merge -R "$repo" "$fpr" --squash --delete-branch --match-head-commit "$(git rev-parse HEAD)" ||
-      stop "$fpr" "o merge do fold foi recusado"
-    say "  fold #$fpr entrou"
-  fi
+  cargo xtask docs fold >/dev/null || stop fold "fold falhou na main"
+  fb="queue/fold-$(date +%s)"
+  git add -A docs
+  git commit --quiet -m "docs: consolida docs/changes ($pending arquivos)"
+  git push --quiet origin "HEAD:refs/heads/$fb"
+  fpr=$(gh pr create --base "$base" --head "$fb" \
+    --title "docs: consolida docs/changes ($pending arquivos)" \
+    --body "Fold da fila de entrada (scripts/land.sh)." | grep -o '[0-9]*$')
+  checks_or_stop "$fpr" "$(git rev-parse HEAD)"
+  gh pr merge -R "$repo" "$fpr" --squash --delete-branch --match-head-commit "$(git rev-parse HEAD)" ||
+    stop "$fpr" "o merge do fold foi recusado"
+  say "  fold #$fpr entrou ($pending arquivos)"
   cd "$root"
   git worktree remove --force "$wt"
 }
 
 serial=("$@")
 if [ "$batch" = 1 ]; then
-  land_batch "$@"
-  serial=("${rest[@]}")
+  land_set "$@"
+  serial=()
 fi
 
 for n in "${serial[@]}"; do
@@ -302,5 +351,6 @@ for n in "${serial[@]}"; do
   git worktree remove --force "$wt"
 done
 
+maybe_fold
 git -C "$root" fetch --quiet origin "$base"
 say "fila concluída: $*"
