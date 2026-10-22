@@ -12,7 +12,7 @@ use crate::avail::Avail;
 use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
 use crate::interfaces::{cascade, dialog_id, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
-use crate::{CoreRouterUi, Then, form_number, value_text};
+use crate::{CoreRouterUi, Then, Win, form_number, value_text};
 
 pub(crate) const TABLE: &str = "routes";
 /// Property windows opened at once from one selection.
@@ -313,6 +313,16 @@ impl CoreRouterUi {
         });
         ui.separator();
 
+        // A static route's key is its id.
+        self.tables.routes.open = self
+            .route_dialogs
+            .iter()
+            .filter_map(|d| match &d.dialog {
+                RouteDialog::Props { id, .. } => Some(id.clone()),
+                RouteDialog::Connected(k) => Some(k.clone()),
+                _ => None,
+            })
+            .collect();
         let out = table::show(
             ui,
             TABLE,
@@ -424,15 +434,16 @@ impl CoreRouterUi {
         });
     }
 
-    /// "Route <dst>"; an already open one is not duplicated.
+    /// "Route <dst>"; an already open one comes to the front.
     pub(crate) fn open_route(&mut self, key: &str) {
         let Some(r) = self.route(key) else { return };
-        let open = self.route_dialogs.iter().any(|d| match &d.dialog {
+        let open = self.route_dialogs.iter_mut().find(|d| match &d.dialog {
             RouteDialog::Props { id, .. } => r.id.as_deref() == Some(id.as_str()),
             RouteDialog::Connected(k) => *k == r.key,
             _ => false,
         });
-        if open {
+        if let Some(d) = open {
+            d.status.bring_to_front();
             return;
         }
         let dialog = match &r.id {
@@ -472,6 +483,7 @@ impl CoreRouterUi {
                 title: &title,
                 dirty: d.dialog.dirty(),
                 pos: cascade(area, d.id),
+                parent: Some(crate::win_id(Win::Routes)),
             };
             let pressed =
                 dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {

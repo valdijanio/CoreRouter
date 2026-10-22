@@ -745,6 +745,12 @@ impl CoreRouterUi {
                     _ => {}
                 }
             }
+            if floats.take_close(win_id(*win)) {
+                open = false;
+            } else if !open && !floats.close_family(&ctx, win_id(*win)) {
+                // A child has edits not applied: the question asks first.
+                open = true;
+            }
             if !open {
                 self.open.remove(win);
                 floats.closed(win_id(*win));
@@ -763,6 +769,7 @@ impl CoreRouterUi {
         self.fw_dialogs(&ctx, area);
         self.terminals(&ctx, area);
         self.password_window(&ctx);
+        self.floats.end_frame(&ctx);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -1021,7 +1028,10 @@ impl CoreRouterUi {
             .selectable_label(self.open.contains(&win), label)
             .clicked()
         {
-            self.open.insert(win);
+            if !self.open.insert(win) {
+                // Already open: to the front, with its dialogs over it.
+                self.floats.raise(win_id(win));
+            }
             // Some lists are only asked for while their window is open.
             self.cache.refreshed_at = None;
         }
@@ -1054,7 +1064,7 @@ impl CoreRouterUi {
     }
 }
 
-fn win_id(win: Win) -> egui::Id {
+pub(crate) fn win_id(win: Win) -> egui::Id {
     egui::Id::unique(("corerouter-win", win))
 }
 
@@ -1617,6 +1627,7 @@ mod tests {
 
     mod dialog_keys;
     mod firewall;
+    mod hierarchy;
     mod terminal;
     mod tools_ping;
 

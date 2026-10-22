@@ -467,6 +467,23 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   **medido**: daemon com o token em 000, daemon de 6fbab48 e token legível, com screenshots. Esforço
   do agente ~2 h (**estimado**).
 
+- 2026-10-22 — G1.20: hierarquia das janelas internas, a pedido do usuário (com um diálogo aberto,
+  clicar na lista o mandava para trás, e pedir os detalhes de novo não o trazia de volta). Um lugar
+  só, `Floats` em `crates/ui/src/float.rs`: relação filho→pai por janela (`Floats::adopt`, ligada
+  por `dialog::Head::parent`, que cada família de diálogos preenche com a sua lista: Interfaces,
+  Routes, VRF, Firewall, Interface List). Modelo das janelas *owned* do Windows / *transient-for*
+  do GTK: o filho fica sempre acima do pai (o egui só sabe "subir" um conjunto mantendo a ordem
+  relativa, então ao subir o pai os descendentes sobem no mesmo frame, e uma janela pedida no frame
+  em que a família sobe sobe no seguinte), e o teclado vai à janela *ativa* (a clicada, pedida ou
+  aberta por último), que pode estar sob os próprios filhos. Pedir de novo (`Status::bring_to_front`,
+  `Floats::raise`): sobe, toma o foco e pisca a borda por ~0,6 s. Filho abre a (48, 92) px do canto
+  do pai, em cascata de 24 px: a primeira tentativa (36, 44) cobria o "+" da lista e quebrou um teste
+  do VRF (**medido**). Fechar o pai: filhos limpos fecham junto (`Floats::close_family`/`take_close`);
+  com alterações, `egui::Modal` "Close <pai>?" (Close All / Cancel / Esc). Extras: marca na linha
+  cuja janela está aberta (`TableState::open`, clique traz a janela) e Ctrl+Tab / Ctrl+F6 (atalho do
+  WinBox) com Shift ao contrário; no navegador o Ctrl+Tab é da aba, o Ctrl+F6 fica. 8 testes headless
+  novos; conferido na GUI real num Xvfb próprio (screenshots). Esforço do agente ~3 h (**estimado**).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -497,3 +514,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G6.5.
 - 2026-10-22 — log do G0.3b.
 - 2026-10-22 — log do G0.3c.
+- 2026-10-22 — log do G1.20.
