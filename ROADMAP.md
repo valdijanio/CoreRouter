@@ -117,6 +117,15 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   "New Route" (revisão 3), backup distance 10 e `::/0` pela CLI; daemon e GUI reiniciados →
   revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
   pref-src, criar VRF pela GUI.
+- 2026-10-21 — G1.13: VRF pela GUI (só `crates/ui`; nenhum comando novo). Janela IP › VRF
+  (`crates/ui/src/vrf.rs`) na tabela reutilizável do G1.9 sobre `ip.vrf.list`, consultado no
+  refresh (`Field::Vrfs`): flag X, nome, tabela do kernel, membros e comentário; toolbar,
+  menus, atalhos e comentários inline como em Routes. "New VRF" pede nome e marca os membros
+  numa lista de caixas que deixa de fora VRFs, portas de bridge e membros de outra VRF (uma
+  bridge entra inteira); Apply cria e abre "VRF <nome>", que edita membros (`ip.vrf.set`
+  troca a lista inteira), comentário e Disabled e tem Disable/Remove. Recusas do engine
+  (nome `main`, VRF com endereço ou rota) aparecem no diálogo ou no log. 2 testes headless
+  dirigidos por eventos sintéticos.
 
 ## Histórico de revisão
 
@@ -127,3 +136,4 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G0.4.
 - 2026-10-21 — log do G1.10 + G1.11.
 - 2026-10-21 — log do G1.5.
+- 2026-10-21 — log do G1.13.
