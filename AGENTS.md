@@ -45,7 +45,8 @@ Este arquivo é idêntico a `CLAUDE.md` (`cargo xtask agents-sync` falha se dive
 - **`unsafe` proibido**, exceto no futuro crate isolado `dataplane-ebpf` (programas XDP), com
   revisão humana e comentário `SAFETY:` por bloco.
 - **Kernel real só com pedido explícito.** O padrão é `--backend virtual`. Nunca rode
-  `--backend linux` como root nem altere interfaces da máquina de desenvolvimento.
+  `--backend linux` como root nem altere interfaces da máquina de desenvolvimento (veja "Acesso
+  root e testes de rede").
 
 ## Rodar e olhar
 
@@ -70,6 +71,34 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.
+
+## Integração: sempre por Pull Request
+
+Nada entra na `main` sem PR com o CI verde. O repositório é privado no plano gratuito, então o
+GitHub não impõe isso: esta regra impõe.
+
+1. Trabalhe numa branch `stream/<id>-<slug>`, nunca na `main`. Nunca faça commit nem push na `main`.
+2. Antes de cada commit: `cargo xtask ci`.
+3. Ao terminar: `git push -u origin <branch>` e
+   `gh pr create --base main --title "<id>: <resumo>"`. O corpo do PR diz o que mudou, como
+   testar (comandos ou cliques) e o id da gap.
+4. O workflow `ci` (`.github/workflows/ci.yml`) roda no PR. Vermelho? Leia o log
+   (`gh run view --log-failed`), corrija na mesma branch e faça push de novo.
+5. O merge é do usuário (**Squash and merge**: um commit por gap na `main`). Agente só faz merge
+   com pedido explícito do usuário naquela conversa.
+6. Depois do merge, apague a branch local e a remota.
+
+## Acesso root e testes de rede
+
+- Agentes **nunca** rodam `sudo`. Não há senha no ambiente, e isso é intencional: um erro com
+  root derruba a rede da máquina de desenvolvimento.
+- Testes que precisam de `CAP_NET_ADMIN` (netlink, VLAN, bridge, nftables) rodam num network
+  namespace descartável, sem root:
+  `unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux`. Dentro dele só
+  existe uma interface `lo`; crie interfaces `dummy`/`veth` no próprio teste. Nada vaza para o host.
+- Precisa de root de verdade (FRR instalado no host, XDP numa NIC física, imagem Buildroot,
+  `setcap`)? Pare e entregue ao usuário o comando exato e o motivo; ele roda no terminal dele.
+  Nunca proponha `sudo` sem senha (NOPASSWD) amplo.
 
 ## Agentes em paralelo
 
