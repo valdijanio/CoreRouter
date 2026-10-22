@@ -16,7 +16,9 @@ use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 use serde::Serialize;
 
-pub use dhcp::{DhcpPort, DhcpResponder, SharedResponder};
+pub use dhcp::{
+    Dhcp6Port, Dhcp6Responder, DhcpPort, DhcpResponder, SharedResponder, SharedResponder6,
+};
 pub use nic::{
     CablePair, CableTest, CableTestResult, Counter, CounterGroup, EthernetMonitor, LinkCounters,
     NicHardware, Offload,
@@ -86,6 +88,32 @@ impl Default for Features {
     fn default() -> Self {
         Self { vrf: true }
     }
+}
+
+/// Something the platform learned from IPv6 Router Advertisements (or
+/// set up on its own) on a managed interface, outside the config: a SLAAC
+/// address or a route of `proto ra`. Shown with flag D by the lists
+/// (G4.7b); never applied by CoreRouter, removed by the platform when RA is
+/// no longer accepted there.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum Learned {
+    Address {
+        interface: IfName,
+        address: ipnet::Ipv6Net,
+        /// Seconds left; `None`: forever.
+        valid_secs: Option<u32>,
+        preferred_secs: Option<u32>,
+    },
+    Route {
+        interface: IfName,
+        dst: ipnet::Ipv6Net,
+        gateway: Option<std::net::Ipv6Addr>,
+        /// Kernel metric (RA default routes: 1024).
+        metric: u32,
+        /// Kernel table id.
+        table: u32,
+        expires_secs: Option<u32>,
+    },
 }
 
 /// A change to the dynamic address-list entries (G2.1): entries with a
@@ -196,5 +224,25 @@ pub trait Hal: Send {
     /// uses it unless it already has one (a test's own).
     fn offer_dhcp_lab_server(&mut self, server: SharedResponder) {
         let _ = server;
+    }
+
+    /// Open the DHCPv6 client socket of interface `name` (G4.7b).
+    fn dhcp6_port(&mut self, name: &IfName) -> Result<Box<dyn Dhcp6Port>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no DHCPv6 client transport (asked for '{name}')",
+            self.describe()
+        )))
+    }
+
+    /// The lab's simulated DHCPv6 server (see [`Hal::offer_dhcp_lab_server`]).
+    fn offer_dhcp6_lab_server(&mut self, server: SharedResponder6) {
+        let _ = server;
+    }
+
+    /// IPv6 state learned from Router Advertisements on managed interfaces
+    /// (G4.7b). Which interfaces accept RA follows the applied config
+    /// (`corerouter_model::ipv6::ra_mode`).
+    fn ipv6_learned(&mut self) -> Result<Vec<Learned>, HalError> {
+        Ok(Vec::new())
     }
 }

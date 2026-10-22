@@ -664,6 +664,7 @@ mod tests {
                 interface: iface.parse().unwrap(),
                 disabled: false,
                 comment: String::new(),
+                from_pool: None,
             });
         }
         let t = IfTable::default();

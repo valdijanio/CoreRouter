@@ -187,7 +187,7 @@ fn add_print_where_and_remove_by_number() {
     let table = t.ok("pr");
     let lines: Vec<&str> = table.lines().collect();
     // G4.7a: DHCP leases list here too, flagged D.
-    assert_eq!(lines[0], "Flags: X - disabled, D - dynamic");
+    assert_eq!(lines[0], "Flags: X - disabled, I - invalid, D - dynamic");
     assert!(lines[1].contains("ADDRESS") && lines[1].contains("INTERFACE"));
     assert!(lines[2].contains(";;; uplink A"), "{table}");
     assert!(lines[3].starts_with(" 0   10.0.0.1/24"), "{table}");
@@ -313,7 +313,7 @@ fn print_of_a_one_object_menu_and_query_results() {
 fn completion_offers_menus_commands_params_and_values() {
     let mut t = Term::new();
     t.ok("/interface vlan add name=vlan10 parent=ether1 vlan-id=10");
-    assert_eq!(t.complete("/i"), ["interface", "ip", "import"]);
+    assert_eq!(t.complete("/i"), ["interface", "ip", "ipv6", "import"]);
     assert_eq!(t.complete("/ip/ad"), ["address"]);
     assert!(t.complete("/ip address ").contains(&"add".to_owned()));
     assert_eq!(t.complete("/ip address a"), ["add"]);
@@ -846,4 +846,32 @@ fn dhcp_client_add_print_and_dynamic_address() {
     let e = t.fails("/ip dhcp-client add interface=ether1");
     assert!(e.contains("already has DHCP client"), "{e}");
     t.ok("/ip dhcp-client renew 0");
+}
+
+/// G4.7b: `/ipv6 dhcp-client`, `/ipv6 pool`, `/ipv6 settings` from the
+/// registry, and a LAN address numbered from the delegated prefix.
+#[test]
+fn dhcpv6_client_pool_and_settings() {
+    let mut t = Term::new();
+    t.ok("/ipv6 dhcp-client add interface=ether1 request=address,prefix pool-name=pd prefix-hint=::/56");
+    t.ok("/ip address add address=::1/64 interface=ether2 from-pool=pd");
+    t.router.session.dhcp_service(0);
+    t.router.session.dhcp_service(1_500);
+    let table = t.ok("/ipv6 dhcp-client print");
+    assert!(
+        table.contains("ether1") && table.contains("bound"),
+        "{table}"
+    );
+    let d = t.ok("/ipv6 dhcp-client print detail");
+    assert!(d.contains("prefix=2001:db8:1:100::/56"), "{d}");
+    assert!(d.contains("request=address,prefix"), "{d}");
+    let p = t.ok("/ipv6 pool print");
+    assert!(p.contains("pd") && p.contains("2001:db8:1:100::/56"), "{p}");
+    let a = t.ok("/ip address print");
+    assert!(a.contains("2001:db8:1:100::1/64"), "{a}");
+    let s = t.ok("/ipv6 settings print");
+    assert!(s.contains("auto"), "{s}");
+    t.ok("/ipv6 settings set accept-router-advertisements=no");
+    let e = t.fails("/ipv6 dhcp-client add interface=ether2 request=prefix");
+    assert!(e.contains("pool"), "{e}");
 }

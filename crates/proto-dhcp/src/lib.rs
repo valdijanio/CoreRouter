@@ -5,15 +5,20 @@
 //! - [`client`]: the DHCPv4 client state machine, pure (the engine runs
 //!   it on its service clock, the HAL carries the bytes);
 //! - [`optval`]: RouterOS' option value syntax;
-//! - [`lab`]: the virtual lab's simulated DHCP server.
+//! - [`lab`]: the virtual lab's simulated DHCP server;
+//! - [`v6`], [`client6`], [`lab6`]: the same for DHCPv6 (G4.7b), with a
+//!   codec of our own (RFC 9915).
 //!
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
 pub mod client;
+pub mod client6;
 pub mod lab;
+pub mod lab6;
 pub mod optval;
 pub mod v4;
+pub mod v6;
 
 use std::collections::BTreeSet;
 
@@ -21,7 +26,7 @@ use corerouter_model::dhcp_client::{
     MAX_ALLOWED, MAX_CLIENTS, MAX_EXTRA, MAX_HOST_NAME, MAX_VALUE_TEXT,
 };
 use corerouter_model::route::{table_id, table_of};
-use corerouter_model::{Config, DhcpClient, InterfaceKind, Issue};
+use corerouter_model::{Config, Dhcp6Client, DhcpClient, InterfaceKind, Issue, ipv6};
 
 use crate::optval::Vars;
 
@@ -31,7 +36,7 @@ pub const RESERVED_CODES: [u8; 11] = [0, 12, 50, 52, 53, 54, 55, 57, 60, 61, 255
 
 /// Validate this subsystem's part of the candidate: the DHCP clients.
 pub fn validate(cfg: &Config) -> Vec<Issue> {
-    let mut out = Vec::new();
+    let mut out = validate6(cfg);
     if cfg.ip.dhcp_clients.len() > MAX_CLIENTS {
         out.push(Issue::new(
             "ip.dhcp_clients",
@@ -212,6 +217,199 @@ pub fn settings(
         vendor_class,
         extra,
     })
+}
+
+/// The DHCPv6 clients, the RA policy and the addresses taken from pools.
+pub fn validate6(cfg: &Config) -> Vec<Issue> {
+    let mut out = Vec::new();
+    let v6 = &cfg.ipv6;
+    if v6.dhcp_clients.len() > ipv6::MAX_CLIENTS {
+        out.push(Issue::new(
+            "ipv6.dhcp_clients",
+            format!("at most {} DHCPv6 clients", ipv6::MAX_CLIENTS),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut pools = BTreeSet::new();
+    for c in &v6.dhcp_clients {
+        let at = |field: &str| format!("ipv6.dhcp_clients[{}].{field}", c.id);
+        if !seen.insert(&c.interface) {
+            out.push(Issue::new(
+                at("interface"),
+                format!("'{}' already has a DHCPv6 client", c.interface),
+            ));
+        }
+        if c.request.prefix() && !c.pool_name.is_empty() && !pools.insert(c.pool_name.as_str()) {
+            out.push(Issue::new(
+                at("pool_name"),
+                format!("pool '{}' is already filled by another client", c.pool_name),
+            ));
+        }
+        for (field, why) in client6_issues(cfg, c) {
+            out.push(Issue::new(at(field), why));
+        }
+    }
+    let list = v6.settings.accept_router_advertisements_on.as_str();
+    if !matches!(list, "all" | "none") && cfg.interface_lists.get(list).is_none() {
+        out.push(Issue::new(
+            "ipv6.settings.accept_router_advertisements_on",
+            format!("interface list '{list}' does not exist (all, none or interface.list.list)"),
+        ));
+    }
+    out.extend(pool_address_issues(cfg));
+    out
+}
+
+/// What is wrong with DHCPv6 client `c` in `cfg`, as (field, message).
+pub fn client6_issues(cfg: &Config, c: &Dhcp6Client) -> Vec<(&'static str, String)> {
+    let mut out = Vec::new();
+    match cfg.interfaces.get(&c.interface) {
+        None => out.push((
+            "interface",
+            format!("interface '{}' does not exist", c.interface),
+        )),
+        Some(i) if matches!(i.kind, InterfaceKind::Vrf { .. }) => out.push((
+            "interface",
+            format!(
+                "'{}' is a VRF; run the client on one of its members",
+                c.interface
+            ),
+        )),
+        Some(i) => {
+            if let Some(b) = &i.bridge {
+                out.push((
+                    "interface",
+                    format!(
+                        "'{}' is a port of bridge '{b}'; run the client on '{b}' instead",
+                        c.interface
+                    ),
+                ));
+            }
+        }
+    }
+    if c.request.prefix() {
+        if c.pool_name.is_empty() {
+            out.push((
+                "pool_name",
+                "a prefix needs a pool to go to: set pool_name (LAN addresses then use \
+                 ip.address.add from_pool=<pool>)"
+                    .into(),
+            ));
+        } else if let Err(e) = c.pool_name.parse::<corerouter_model::firewall::Name>() {
+            out.push(("pool_name", e.to_string()));
+        }
+    }
+    if let Some(h) = c.prefix_hint
+        && !(1..=64).contains(&h.prefix_len())
+    {
+        out.push((
+            "prefix_hint",
+            format!(
+                "/{} cannot number a LAN; hint /1../64 (::/56 asks for a /56)",
+                h.prefix_len()
+            ),
+        ));
+    }
+    if c.default_route_distance == 0 {
+        out.push(("default_route_distance", "must be 1..=255".into()));
+    }
+    if !c.custom_duid.is_empty() {
+        match ipv6::parse_hex(&c.custom_duid) {
+            Some(d) if (3..=ipv6::MAX_DUID).contains(&d.len()) => {}
+            _ => out.push((
+                "custom_duid",
+                format!(
+                    "write 3..={} bytes as 0x… (e.g. 0x00030001aabbccddeeff)",
+                    ipv6::MAX_DUID
+                ),
+            )),
+        }
+    }
+    if c.allowed_servers.len() > ipv6::MAX_ALLOWED {
+        out.push((
+            "allowed_servers",
+            format!("at most {} servers", ipv6::MAX_ALLOWED),
+        ));
+    }
+    out
+}
+
+/// Addresses taken from a pool: IPv6, a pool some client fills, and no two
+/// interfaces numbered with the same subnet of one pool.
+pub fn pool_address_issues(cfg: &Config) -> Vec<Issue> {
+    let mut out = Vec::new();
+    let mut used: Vec<(&str, ipnet::Ipv6Net, &corerouter_model::IfName)> = Vec::new();
+    for a in &cfg.ip.addresses {
+        let Some(pool) = &a.from_pool else {
+            continue;
+        };
+        let at = format!("ip.addresses[{}].from_pool", a.id);
+        let ipnet::IpNet::V6(net) = a.address else {
+            out.push(Issue::new(at, "only IPv6 addresses come from a pool"));
+            continue;
+        };
+        let filled = cfg
+            .ipv6
+            .dhcp_clients
+            .iter()
+            .any(|c| c.request.prefix() && c.pool_name == *pool);
+        if !filled {
+            out.push(Issue::new(
+                at,
+                format!("no DHCPv6 client delegates a prefix into pool '{pool}'"),
+            ));
+            continue;
+        }
+        if a.disabled {
+            continue;
+        }
+        let subnet = net.trunc();
+        if let Some((_, _, other)) = used
+            .iter()
+            .find(|(p, s, i)| *p == pool.as_str() && *s == subnet && **i != a.interface)
+        {
+            out.push(Issue::new(
+                at,
+                format!(
+                    "subnet {subnet} of pool '{pool}' is already on '{other}'; write another \
+                     subnet id (e.g. 0:0:0:1::1/64)"
+                ),
+            ));
+        }
+        used.push((pool.as_str(), subnet, &a.interface));
+    }
+    out
+}
+
+/// What DHCPv6 client `c` sends, on an interface with MAC `mac`. The error
+/// names the field to fix.
+pub fn settings6(
+    c: &Dhcp6Client,
+    mac: [u8; 6],
+) -> Result<client6::Settings, (&'static str, String)> {
+    let duid = if c.custom_duid.is_empty() {
+        // DUID-LL of the interface: stable across restarts without storage
+        // (RFC 7084 W-5) as long as the port keeps its MAC.
+        v6::duid_ll(mac)
+    } else {
+        ipv6::parse_hex(&c.custom_duid)
+            .filter(|d| (3..=ipv6::MAX_DUID).contains(&d.len()))
+            .ok_or_else(|| ("custom_duid", "write 0x… (3..=130 bytes)".to_owned()))?
+    };
+    Ok(client6::Settings {
+        duid,
+        iaid: iaid_of(&c.interface),
+        address: c.request.address(),
+        prefix: c.request.prefix(),
+        prefix_hint: c.prefix_hint,
+        rapid_commit: c.rapid_commit,
+        require_both: c.request == ipv6::Request6::Both && !c.accept_prefix_without_address,
+    })
+}
+
+/// A stable IAID per interface (RFC 9096 WPD-10): a hash of its name.
+pub fn iaid_of(iface: &corerouter_model::IfName) -> u32 {
+    corerouter_hal::dhcp::lab_hash(iface.as_str().as_bytes())
 }
 
 #[cfg(test)]

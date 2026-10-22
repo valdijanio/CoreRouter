@@ -158,7 +158,7 @@ const COLUMNS: [table::Column; 8] = [
     comment(),
 ];
 
-fn text(row: &Value, k: &str) -> String {
+pub(crate) fn text(row: &Value, k: &str) -> String {
     match row.get(k) {
         None | Some(Value::Null) => String::new(),
         Some(Value::Array(a)) => a.iter().map(value_text).collect::<Vec<_>>().join(", "),
@@ -166,11 +166,11 @@ fn text(row: &Value, k: &str) -> String {
     }
 }
 
-fn flag(row: &Value, k: &str) -> bool {
+pub(crate) fn flag(row: &Value, k: &str) -> bool {
     row.get(k).and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn yes_no(b: bool) -> String {
+pub(crate) fn yes_no(b: bool) -> String {
     if b { "yes" } else { "no" }.into()
 }
 

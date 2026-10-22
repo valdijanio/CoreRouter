@@ -678,6 +678,7 @@ mod tests {
             interface: name("ether1"),
             disabled: false,
             comment: String::new(),
+            from_pool: None,
         });
         let d = &mut cfg.ip.neighbor_discovery;
         d.interfaces = [name("ether1"), name("ether3")].into_iter().collect();

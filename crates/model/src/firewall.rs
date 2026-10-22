@@ -98,6 +98,11 @@ impl Name {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The built-in list of every interface (RouterOS `all`).
+    pub fn all() -> Self {
+        Self("all".into())
+    }
 }
 
 impl FromStr for Name {
