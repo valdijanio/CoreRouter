@@ -6,7 +6,8 @@ use serde_json::{Value, json};
 use crate::{Backend, prompts, resources, tools};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
-pub const MAX_BATCH: usize = 64;
+const BATCH_REJECTED: &str = "invalid request: JSON-RPC batches are not supported \
+(removed in MCP 2025-06-18); send one message per line";
 
 const INSTRUCTIONS: &str = "CoreRouter is a router OS. Every action is a command with a \
 RouterOS-style dotted id (interface.list, ip.address.add, routing.bgp.instance.set). \
@@ -41,21 +42,15 @@ pub fn serve<R: BufRead, W: Write>(
         if line.trim().is_empty() {
             continue;
         }
-        let reply =
-            match serde_json::from_str::<Value>(&line) {
-                Err(_) => Some(error(Value::Null, -32700, "parse error")),
-                Ok(Value::Array(batch)) if batch.is_empty() || batch.len() > MAX_BATCH => Some(
-                    error(Value::Null, -32600, "batch must hold 1..=64 messages"),
-                ),
-                Ok(Value::Array(batch)) => {
-                    let replies: Vec<Value> = batch
-                        .iter()
-                        .filter_map(|m| handle_message(backend, m))
-                        .collect();
-                    (!replies.is_empty()).then_some(Value::Array(replies))
-                }
-                Ok(msg) => handle_message(backend, &msg),
-            };
+        let reply = match serde_json::from_str::<Value>(&line) {
+            Err(_) => Some(error(Value::Null, -32700, "parse error")),
+            // MCP 2025-06-18 removed JSON-RPC batching (changelog, PR #416), and
+            // that is the only revision we negotiate. JSON-RPC 2.0 §6: a batch
+            // the server does not accept gets one Response object, not an array.
+            // No item is run, so a batch never half-applies.
+            Ok(Value::Array(_)) => Some(error(Value::Null, -32600, BATCH_REJECTED)),
+            Ok(msg) => handle_message(backend, &msg),
+        };
         if let Some(reply) = reply {
             emit(&mut output, &reply)?;
         }

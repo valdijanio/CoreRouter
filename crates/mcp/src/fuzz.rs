@@ -12,7 +12,8 @@ use serde_json::Value;
 use crate::{Headless, serve};
 
 /// Serve `data` (any number of lines) on a fresh virtual lab. Every reply
-/// must be one JSON-RPC 2.0 object (or a batch of them) on its own line,
+/// must be one JSON-RPC 2.0 object on its own line (batches are refused
+/// with one error object, G0.5c),
 /// and nothing may panic, not even a panic the engine guard catches.
 pub fn messages(data: &[u8]) -> Result<(), String> {
     let mut backend = Headless::new(Session::virtual_lab());
@@ -26,18 +27,14 @@ pub fn messages(data: &[u8]) -> Result<(), String> {
     for line in out.lines() {
         let reply: Value =
             serde_json::from_str(line).map_err(|e| format!("reply is not JSON ({e}): {line}"))?;
-        let replies = match &reply {
-            Value::Array(batch) if !batch.is_empty() => batch.iter().collect(),
-            Value::Object(_) => vec![&reply],
-            _ => return Err(format!("reply is neither object nor batch: {line}")),
-        };
-        for r in replies {
-            if r.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-                return Err(format!("reply without jsonrpc 2.0: {r}"));
-            }
-            if r.get("result").is_some() == r.get("error").is_some() {
-                return Err(format!("reply needs exactly one of result/error: {r}"));
-            }
+        if !reply.is_object() {
+            return Err(format!("reply is not an object: {line}"));
+        }
+        if reply.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(format!("reply without jsonrpc 2.0: {reply}"));
+        }
+        if reply.get("result").is_some() == reply.get("error").is_some() {
+            return Err(format!("reply needs exactly one of result/error: {reply}"));
         }
     }
     Ok(())
