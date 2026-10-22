@@ -140,7 +140,13 @@ TLS + `--user` (senha por prompt ou `$COREROUTER_PASSWORD`); o certificado é co
 primeiro uso e fica em `~/.config/corerouter/known_hosts`. Detalhes em `docs/control-protocol.md`.
 
 Mudou UI? Rode a GUI com `--control`, tire `screenshot` e **olhe o PNG** antes de dizer que está
-pronto. Sem display, use o teste headless de `crates/ui` (`every_window_renders_headless`).
+pronto.
+
+**Binários sempre atuais:** depois de cada lote, a fila de entrada (`scripts/land.sh`) leva o
+checkout principal para a `main` nova e recompila daemon, GUI e CLI (só se ele estiver na `main`
+e sem alterações; `LAND_REBUILD=0` desliga). Quem já está rodando não é reiniciado: a barra da GUI
+mostra "daemon <commit> ≠ GUI <commit>" quando o daemon foi compilado de outro commit
+(`server.info` traz o `commit`, crate `corerouter-buildinfo`). Sem display, use o teste headless de `crates/ui` (`every_window_renders_headless`).
 MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md`).
 
 ## Verificação
