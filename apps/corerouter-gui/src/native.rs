@@ -506,7 +506,10 @@ impl Platform for NativePlatform {
     }
 
     fn lab(&mut self) -> CoreRouterUi {
-        let session = shared(Session::virtual_lab());
+        let mut lab = Session::virtual_lab();
+        // Tools > Ping / MTR run as background tasks on threads.
+        lab.set_runner(corerouter_control::thread_runner());
+        let session = shared(lab);
         // Safe Mode timeouts need a clock; the lab has no other.
         if let Err(e) = spawn_clock(Arc::clone(&session)) {
             log::warn!("no clock thread ({e}): Safe Mode timeouts are unavailable");

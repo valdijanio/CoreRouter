@@ -13,6 +13,7 @@ use crate::firewall_dyn::DynamicLists;
 use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
+use crate::tasks::Tasks;
 use crate::validate::validate_all;
 use crate::{EngineError, Result, guard};
 
@@ -62,6 +63,8 @@ pub struct Session {
     pub(crate) neighbors: NeighborTable,
     /// Address-list entries with a timeout (operational, never saved; G2.1).
     pub(crate) dynamic_addresses: DynamicLists,
+    /// Diagnostic tool jobs (operational state, never saved).
+    pub(crate) tasks: Tasks,
     /// Router accounts (G0.3): saved with the config, outside its revisions.
     users: Users,
     /// Logged-in sessions, for `user.active.list` (never saved).
@@ -137,6 +140,7 @@ impl Session {
             safe_mode: SafeMode::default(),
             neighbors: NeighborTable::default(),
             dynamic_addresses: DynamicLists::default(),
+            tasks: Tasks::default(),
             users,
             logins: Logins::default(),
         }

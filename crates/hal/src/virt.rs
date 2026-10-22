@@ -1,11 +1,13 @@
 //! Virtual lab backend: deterministic fake ports and counters.
 
+use std::sync::Arc;
+
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 
-use crate::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState};
+use crate::{DynamicChange, Features, Hal, HalError, LinkInfo, LinkState, SharedProber, SimProber};
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct VirtualHal {
     ports: Vec<IfName>,
     applied: Config,
@@ -15,6 +17,19 @@ pub struct VirtualHal {
     /// (the lab records it; nothing runs it).
     ruleset: Option<String>,
     dynamic: Vec<DynamicAddress>,
+    /// Diagnostic tools: the simulated network unless the app swaps in the
+    /// host's ICMP (`corerouter-daemon --lab-ping host`).
+    prober: SharedProber,
+}
+
+impl std::fmt::Debug for VirtualHal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VirtualHal")
+            .field("ports", &self.ports)
+            .field("applies", &self.applies)
+            .field("prober", &self.prober.describe())
+            .finish_non_exhaustive()
+    }
 }
 
 impl VirtualHal {
@@ -30,7 +45,14 @@ impl VirtualHal {
             applies: 0,
             ruleset: None,
             dynamic: Vec::new(),
+            prober: Arc::new(SimProber::default()),
         }
+    }
+
+    /// Probe with `prober` instead of the simulated network.
+    pub fn with_prober(mut self, prober: SharedProber) -> Self {
+        self.prober = prober;
+        self
     }
 
     pub fn applied(&self) -> &Config {
@@ -132,6 +154,10 @@ impl Hal for VirtualHal {
             }
         }
         Ok(())
+    }
+
+    fn prober(&self) -> Result<SharedProber, String> {
+        Ok(Arc::clone(&self.prober))
     }
 }
 

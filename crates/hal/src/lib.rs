@@ -5,12 +5,16 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod probe;
+pub mod sim;
 pub mod virt;
 
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 use serde::Serialize;
 
+pub use probe::{Prober, SharedProber};
+pub use sim::SimProber;
 pub use virt::VirtualHal;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -118,5 +122,11 @@ pub trait Hal: Send {
     fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
         let _ = change;
         Ok(())
+    }
+
+    /// ICMP prober for the diagnostic tools (ping, MTU, MTR), or why there
+    /// is none. Cheap: backends build it once and hand out clones.
+    fn prober(&self) -> Result<SharedProber, String> {
+        Err(format!("{} cannot send probes", self.describe()))
     }
 }

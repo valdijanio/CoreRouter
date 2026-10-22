@@ -30,6 +30,10 @@ pub mod nft;
 #[cfg(target_os = "linux")]
 pub mod l2;
 
+/// Host ICMP for the diagnostic tools (G6.2).
+#[cfg(target_os = "linux")]
+pub mod icmp;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
@@ -46,6 +50,8 @@ mod linux {
     pub struct LinuxHal {
         /// Probed on the first `features()` call, not at startup.
         features: OnceLock<Features>,
+        /// Host ICMP, detected on the first `prober()` call.
+        prober: OnceLock<Result<crate::icmp::HostProber, String>>,
         policy: Policy,
         /// What the last applied config says each name is (`owner` rule 5).
         claims: BTreeMap<IfName, InterfaceKind>,
@@ -227,6 +233,14 @@ mod linux {
                 DynamicChange::Add(d) => crate::nft::add_dynamic(d),
                 DynamicChange::Remove(d) => crate::nft::remove_dynamic(d),
             }
+        }
+
+        fn prober(&self) -> Result<corerouter_hal::SharedProber, String> {
+            let p = self
+                .prober
+                .get_or_init(crate::icmp::HostProber::detect)
+                .clone()?;
+            Ok(std::sync::Arc::new(p))
         }
     }
 }

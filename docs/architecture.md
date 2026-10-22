@@ -83,14 +83,14 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas), `users` (contas e grupos, salvos fora das revisões), `firewall` e `interface_list` (G2.1) | serde, ipnet, thiserror |
-| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, entradas dinâmicas de address-list) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria) | L0, `firewall` (lateral permitido) |
+| L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, `prober`, entradas dinâmicas de address-list) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria); `probe` (trait `Prober`/`ProbeSocket` das ferramentas) e `sim` (rede simulada determinística, G6.2) | L0, `firewall` (lateral permitido) |
 | L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); firewall por `nft -f -` (módulo `nft`, G2.1). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
-| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional) | L0–L2 (nunca plataforma) |
-| L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial` | L0–L3 |
+| L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU; G6.1/G6.2) | L0–L2 (nunca plataforma) |
+| L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial`; `ThreadRunner` das tarefas (G6.1) | L0–L3 |
 | L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
 | L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
 | L4 | `crates/shell` | Terminal estilo RouterOS gerado do `engine.list`: parser, Tab, cores, `print`, `/export`/`/import`. Puro (sem I/O, wasm): pede chamadas do canal de controle ao front end (janela da GUI, `corerouter-cli shell`, SSH). Veja `docs/terminal.md` | `serde_json` (nada do workspace; testes usam o engine) |
@@ -107,7 +107,7 @@ CoreRouter/
 ├── .cargo/config.toml    # alias: cargo xtask
 ├── AGENTS.md = CLAUDE.md
 ├── ROADMAP.md
-├── docs/{architecture,gaps,mcp,control-protocol,lldp-mndp}.md
+├── docs/{architecture,gaps,mcp,control-protocol,lldp-mndp,tools}.md
 ├── crates/
 │   ├── model/            # L0
 │   ├── hal/              # L1 (traits + virtual)
@@ -382,6 +382,26 @@ um link cujo tipo no kernel difere do config. Testes de integração (`tests/net
 num network namespace descartável sem root: `cargo xtask netns` (passo do `cargo xtask ci`,
 que vira `skip` onde `unshare` sem root não é permitido).
 
+### Tarefas das ferramentas (G6.1/G6.2)
+
+Ping, MTU e (G6.3) MTR levam segundos ou não terminam: o comando valida, inicia um **job** e
+devolve o id; o resultado chega por `tool.task.poll`. Estado operacional, como os vizinhos:
+fora do `Config`, do journal e do disco.
+
+```
+tool.ping.start ─► Session::start_task(kind, título, job)        (sob o lock, rápido)
+                     Hal::prober() ─► Arc<dyn Prober>            (L1: hal-linux::icmp | hal::sim)
+                     Runner::spawn(job)                          (thread std do app; engine não tem)
+job (fora do lock): Prober::open ─► ProbeSocket::send/recv ─► TaskCtx::emit / summary ─► TaskCell
+tool.task.poll ─► TaskCell (mutex próprio): eventos > after_seq, resumo, estado
+Session::tick (1 s): tarefa sem poll há 60 s ─► stop; terminada há 300 s ─► some
+```
+
+O engine não tem relógio nem threads (wasm32): o `Runner` dá a thread e o `Clock` (tempo
+monotônico e `sleep`) do job; o RTT é medido pelo socket. Os jobs (`engine/src/tools/`) são
+lógica pura sobre `ProbeSocket` + `TaskCtx` e são testados com a rede simulada e um relógio
+falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools.md`.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).
@@ -398,4 +418,5 @@ que vira `skip` onde `unshare` sem root não é permitido).
 - 2026-10-22 — G1.18: descoberta/contadores do `hal-linux` via rtnetlink e política de posse dos links.
 - 2026-10-22 — G0.8: crate `shell` (L4) e o terminal no fluxo de um comando.
 - 2026-10-22 — G0.3: `model::users`, `engine::auth`, `control::{auth,tls,local_token,known_hosts,dial}`, seção de autenticação.
+- 2026-10-22 — G6.1/G6.2: tarefas das ferramentas (`tasks`, `tools/`, `Hal::prober`, `hal::sim`, `hal-linux::icmp`, `ThreadRunner`).
 - 2026-10-22 — G2.1a: crate `firewall` (L1 puro), seção Firewall, `Hal::address_list_dynamic`.

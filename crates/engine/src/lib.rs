@@ -13,6 +13,8 @@ pub mod neighbors;
 pub mod safe_mode;
 pub mod session;
 pub mod storage;
+pub mod tasks;
+pub mod tools;
 pub mod validate;
 
 pub use auth::{Group, Login, Principal};
@@ -21,5 +23,6 @@ pub use neighbors::{MAX_NEIGHBORS, NeighborTable};
 pub use safe_mode::Caller;
 pub use session::{CommitMode, JournalEntry, Session, Shared, StorageStatus, lock, shared};
 pub use storage::{ConfigStorage, MemoryStorage, Slot, StorageError};
+pub use tasks::{Clock, Job, Runner, TaskCtx, TaskState};
 
 pub type Result<T> = std::result::Result<T, EngineError>;

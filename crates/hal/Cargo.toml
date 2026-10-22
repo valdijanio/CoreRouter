@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 corerouter-model.workspace = true
 corerouter-firewall.workspace = true
+ipnet.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 

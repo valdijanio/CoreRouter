@@ -107,6 +107,7 @@ impl Session {
         self.safe_mode_mut().clock = Some(now_unix);
         self.expire_safe_mode();
         self.expire_dynamic_addresses();
+        self.expire_tasks();
     }
 
     /// The connection `caller_id` closed. If it owned Safe Mode, its changes

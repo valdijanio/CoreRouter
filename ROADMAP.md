@@ -412,6 +412,21 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   testado (listas padrão LAN/WAN viram `set`, `passthrough=no` não se perde, chains próprias e `!`
   digitados no terminal). Esforço do agente ~7 h (**estimado**).
 
+- 2026-10-22 — G6.1 + G6.2: Tools › Ping. Engine ganha tarefas em segundo plano (`tasks.rs`:
+  `tool.task.list/poll/stop`, jobs nas threads de um `Runner` que o app instala —
+  `control::ThreadRunner` —, anel de 1024 eventos, ≤ 8 rodando, abandono em 60 s, nada no
+  journal) e as ferramentas puras em `tools/` (ping com N destinos, MTU por busca binária com DF,
+  estatísticas com jitter RFC 3550 e percentis, texto estilo RouterOS). `Hal::prober()` (L1,
+  `probe.rs`): `hal-linux::icmp` com ping socket ou raw (`CAP_NET_RAW`), sem `unsafe`
+  (socket2 + nix para fila de erros/cmsg/poll + rustix para `IP_MTU_DISCOVER`); `VirtualHal`
+  com rede simulada determinística (`sim.rs`) ou a do host (`--lab-ping`). GUI: janela Tools ›
+  Ping com `egui_plot` 0.38 (linha da egui 0.37), alertas, histograma, CSV (`ui::Export`,
+  salvo pelo app: arquivo nativo, download na web). CLI `watch`, MCP `run_task`; terminal do
+  G0.8 usa `alias("ping")`/`positional`/`task`. Testes: 4 em netns com ICMP real (veth e um
+  roteador com MTU 1400 em namespaces aninhados), jobs na rede simulada com relógio falso,
+  headless da janela. Sem tempos medidos de produção; esforço do agente ~6 h (**estimado**).
+  MTR (G6.3) vai no PR seguinte.
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -436,4 +451,5 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-22 — log do G1.18.
 - 2026-10-22 — log do G0.8.
 - 2026-10-22 — log do G0.3.
+- 2026-10-22 — log do G6.1 + G6.2.
 - 2026-10-22 — log do G2.1a.

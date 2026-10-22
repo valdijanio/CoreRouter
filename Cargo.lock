@@ -1036,6 +1036,7 @@ dependencies = [
  "getrandom 0.3.4",
  "ipnet",
  "log",
+ "proptest",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -1076,6 +1077,7 @@ version = "0.1.0"
 dependencies = [
  "corerouter-firewall",
  "corerouter-model",
+ "ipnet",
  "serde",
  "thiserror 2.0.21",
 ]
@@ -1092,6 +1094,7 @@ dependencies = [
  "log",
  "nix 0.30.1",
  "rtnetlink",
+ "rustix 1.1.5",
  "serde_json",
  "socket2",
  "tokio",
@@ -1215,6 +1218,7 @@ dependencies = [
  "corerouter-model",
  "corerouter-shell",
  "egui",
+ "egui_plot",
  "serde_json",
 ]
 
@@ -1544,6 +1548,18 @@ dependencies = [
  "log",
  "profiling",
  "winit",
+]
+
+[[package]]
+name = "egui_plot"
+version = "0.38.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3c34f8fe086d7e69ce558dcc85f7c7be593092525d01cb30caa560044bc2bbaa"
+dependencies = [
+ "ahash",
+ "egui",
+ "emath",
+ "nohash-hasher",
 ]
 
 [[package]]

@@ -12,6 +12,7 @@ repository.workspace = true
 corerouter-engine.workspace = true
 corerouter-shell.workspace = true
 egui.workspace = true
+egui_plot.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
