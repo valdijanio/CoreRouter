@@ -189,3 +189,17 @@ variava de 14 s a 114 s conforme o espelho.
 código e sem debuginfo nas dependências (`[profile.dev]` do `Cargo.toml`), 6,6 GB e 135 s. Dos
 6,6 GB, 2,1 GB são os 87 executáveis de teste (cada arquivo de `tests/` vira um binário com o
 workspace inteiro) e 1,7 GB o cache incremental.
+
+**Bateria da fila de entrada** (**medido**, 2026-10-22; 10 features sintéticas, 32 núcleos aqui,
+GitHub Actions conta grátis):
+
+| Fase | Resultado |
+|---|---|
+| 10 `cargo xtask ci` ao mesmo tempo (como 10 sessões; `CARGO_INCREMENTAL=0`) | 346 s no total (uma sozinha: 135 s); 4,6 GB de build por sessão |
+| 10 PRs abertos juntos (30 jobs) | job começou 7–101 s depois de aberto (limite de jobs simultâneos) |
+| `xtask ci (linux)` por PR | mediana 138 s (antes das melhorias: 264 s; pior caso 775 s), máx. 433 s |
+| `build (windows-latest)` / `(macos-latest)` | mediana 87 s / 58 s |
+| Fila de entrada, por PR (merge da main + fold + CI + squash) | mediana 148 s (137–180 s); 856 s no PR que pegou o espelho lento do `vrf` |
+| 10 PRs integrados, de ponta a ponta | 40 min (com as duas paradas e o espelho lento) |
+| Conflito de texto / quebra de integração | parados pela fila em 3 s / 57 s; corrigidos pela dona em 5 s / 10 s |
+| Falso negativo local sob carga | 1 em 10 (teste de latência; corrigido) |
