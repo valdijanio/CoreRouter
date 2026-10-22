@@ -721,6 +721,7 @@ impl CoreRouterUi {
                 title: &title,
                 dirty: d.dialog.dirty(),
                 pos: cascade(area, d.id),
+                parent: Some(crate::win_id(crate::windows::Win::Dhcp6Client)),
             };
             let options = row
                 .as_ref()
