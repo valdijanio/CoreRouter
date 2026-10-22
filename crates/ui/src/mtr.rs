@@ -20,6 +20,10 @@ use std::collections::BTreeMap;
 use egui::{Color32, Grid, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
 
+pub(crate) use crate::chip::{
+    hashed as as_hue, hues_along as path_hues, palette_tone as as_tone,
+};
+use crate::chip::{AMBER, BLUE, chip, neutral_tone};
 use crate::ping::{TaskView, ToolReq};
 use crate::table::action;
 use crate::windows::combo;
@@ -59,6 +63,13 @@ pub(crate) struct MtrWin {
     pub(crate) task: Option<TaskView>,
     error: Option<String>,
     starting: bool,
+    /// The selected hop (click a row; click it again to clear).
+    pub(crate) selected: Option<u64>,
+    /// Enter with a new address while running: stop, then start again.
+    restart: bool,
+    /// Each row's rectangle from the last frame: the click area sits under
+    /// the cells, so their tooltips (full name, AS prefix) keep working.
+    rows: BTreeMap<u64, egui::Rect>,
 }
 
 fn num(v: &Value, k: &str) -> Option<f64> {
@@ -167,9 +178,10 @@ impl CoreRouterUi {
         let mut tables = vec!["main".to_owned()];
         tables.extend(self.interface_names(Some("vrf")));
         let f = &mut self.mtr.form;
+        let mut enter = false;
         ui.horizontal(|ui| {
             ui.label("Address");
-            ui.add(
+            let r = ui.add(
                 TextEdit::singleline(&mut f.address)
                     .id(crate::dialog::field_id(
                         crate::win_id(crate::Win::Mtr),
@@ -178,6 +190,7 @@ impl CoreRouterUi {
                     .hint_text("8.8.8.8 or example.com")
                     .desired_width(260.0),
             );
+            enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
             ui.label("Count");
             ui.add(
                 TextEdit::singleline(&mut f.count)
@@ -261,7 +274,29 @@ impl CoreRouterUi {
                 }
             }
         });
+        // Enter in Address: start; while running, a changed address restarts
+        // with it (the same address keeps running).
+        if enter && !self.mtr.form.address.trim().is_empty() {
+            let now = self
+                .mtr
+                .task
+                .as_ref()
+                .and_then(|t| t.summary.get("address"))
+                .map(value_text)
+                .unwrap_or_default();
+            if !running {
+                start = true;
+            } else if now.trim() != self.mtr.form.address.trim() {
+                self.mtr.restart = true;
+                stop = true;
+            }
+        }
+        if self.mtr.restart && !running && !self.mtr.starting && !stop {
+            self.mtr.restart = false;
+            start = true;
+        }
         if start {
+            self.mtr.selected = None;
             self.mtr_start();
         }
         if stop {
@@ -274,7 +309,7 @@ impl CoreRouterUi {
         self.mtr_table(ui);
     }
 
-    fn mtr_table(&self, ui: &mut Ui) {
+    fn mtr_table(&mut self, ui: &mut Ui) {
         let Some(t) = &self.mtr.task else {
             ui.weak("Type an address and press Start (Enter): one row per hop, updated live.");
             return;
@@ -292,6 +327,11 @@ impl CoreRouterUi {
         let bar = ui.visuals().selection.bg_fill;
         let as_col = t.summary.get("as_lookup").and_then(Value::as_bool) == Some(true);
         let hues = path_hues(hops.iter().filter_map(|h| h.get("asn").and_then(Value::as_u64)));
+        let mut selected = self.mtr.selected;
+        let last_rows = std::mem::take(&mut self.mtr.rows);
+        let mut rows = BTreeMap::new();
+        let sel_fill = ui.visuals().selection.bg_fill;
+        let hover_fill = ui.visuals().widgets.hovered.weak_bg_fill;
         egui::ScrollArea::vertical()
             .id_salt("mtr-hops")
             .show(ui, |ui| {
@@ -312,6 +352,27 @@ impl CoreRouterUi {
                         ui.end_row();
                         for h in hops {
                             let g = |k: &str| h.get(k).map(value_text).unwrap_or_default();
+                            let hop = h.get("hop").and_then(Value::as_u64).unwrap_or(0);
+                            if let Some(rect) = last_rows.get(&hop) {
+                                let resp = ui.interact(
+                                    *rect,
+                                    egui::Id::unique(("mtr-row", hop)),
+                                    egui::Sense::click(),
+                                );
+                                if resp.clicked() {
+                                    selected = (selected != Some(hop)).then_some(hop);
+                                }
+                                if resp.secondary_clicked() {
+                                    selected = Some(hop);
+                                }
+                                row_menu(&resp, h);
+                                if selected == Some(hop) {
+                                    ui.painter().rect_filled(*rect, 2.0, sel_fill);
+                                } else if resp.hovered() {
+                                    ui.painter().rect_filled(*rect, 2.0, hover_fill);
+                                }
+                            }
+                            let top_left = ui.cursor().min;
                             ui.label(g("hop"));
                             host_cell(ui, h);
                             if as_col {
@@ -336,162 +397,49 @@ impl CoreRouterUi {
                             let mut fill = rect;
                             fill.set_width(rect.width() * frac.clamp(0.0, 1.0));
                             ui.painter().rect_filled(fill, 2.0, bar);
+                            let right = rect.right();
                             ui.end_row();
+                            let bottom = ui.cursor().min.y - ui.spacing().item_spacing.y;
+                            rows.insert(
+                                hop,
+                                egui::Rect::from_min_max(
+                                    top_left - egui::vec2(4.0, 1.0),
+                                    egui::pos2(right + 4.0, bottom.max(top_left.y) + 1.0),
+                                ),
+                            );
                         }
                     });
             });
+        self.mtr.rows = rows;
+        self.mtr.selected = selected;
     }
 }
 
-/// A pill's colours: soft fill, ink of the same hue, optional border.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) struct Tone {
-    pub(crate) fill: Color32,
-    pub(crate) ink: Color32,
-    pub(crate) border: Option<Color32>,
-}
-
-/// One hue for both themes: darker ink on the light one, lighter on the
-/// dark one; the fill is the ink washed out, so it reads on striped rows.
-struct Hue {
-    light: (u8, u8, u8),
-    dark: (u8, u8, u8),
-}
-
-impl Hue {
-    fn tone(&self, v: &egui::Visuals) -> Tone {
-        let ((r, g, b), wash) = if v.dark_mode {
-            (self.dark, 0.20)
-        } else {
-            (self.light, 0.12)
-        };
-        let ink = Color32::from_rgb(r, g, b);
-        Tone {
-            fill: ink.gamma_multiply(wash),
-            ink,
-            border: None,
+/// Right click on a hop: copy what an operator pastes into a ticket.
+fn row_menu(resp: &egui::Response, h: &Value) {
+    let address = h
+        .get("hosts")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .map(value_text);
+    let name = h.get("name").and_then(Value::as_str).map(str::to_owned);
+    if address.is_none() {
+        return;
+    }
+    resp.context_menu(|ui| {
+        if let Some(a) = &address
+            && ui.button("Copy address").clicked()
+        {
+            ui.ctx().copy_text(a.clone());
+            ui.close();
         }
-    }
-}
-
-const AMBER: Hue = Hue {
-    light: (140, 85, 0),
-    dark: (245, 195, 105),
-};
-
-const BLUE: Hue = Hue {
-    light: (30, 95, 175),
-    dark: (140, 190, 245),
-};
-
-/// The AS palette: eight hues far enough apart that two operators side by
-/// side on a path never look alike, each legible on both themes.
-const AS_HUES: [Hue; 8] = [
-    BLUE,
-    Hue {
-        light: (0, 120, 120),
-        dark: (110, 215, 205),
-    },
-    Hue {
-        light: (35, 125, 50),
-        dark: (140, 215, 140),
-    },
-    Hue {
-        light: (110, 110, 0),
-        dark: (210, 205, 110),
-    },
-    Hue {
-        light: (175, 80, 10),
-        dark: (250, 170, 110),
-    },
-    Hue {
-        light: (180, 35, 55),
-        dark: (245, 145, 155),
-    },
-    Hue {
-        light: (110, 60, 180),
-        dark: (195, 165, 245),
-    },
-    Hue {
-        light: (160, 40, 140),
-        dark: (240, 150, 220),
-    },
-];
-
-/// Which palette entry an AS gets: Fibonacci hashing, so the colour is
-/// fixed by the number alone (every hop of an AS looks the same, in every
-/// run) and consecutive numbers always land on different entries
-/// (consecutive products differ by 0.618 of the range, more than 1/8).
-pub(crate) fn as_hue(asn: u64) -> usize {
-    let h = (asn as u32).wrapping_mul(0x9E37_79B9);
-    (h >> 29) as usize
-}
-
-/// The colour of each AS on a path: its own (`as_hue`), except when the
-/// AS right before it on the path (a different one) already has it; then
-/// the next free one, so a hand-over between operators always shows. An
-/// AS keeps the colour it got first for the whole table.
-pub(crate) fn path_hues(asns: impl IntoIterator<Item = u64>) -> BTreeMap<u64, usize> {
-    let mut out: BTreeMap<u64, usize> = BTreeMap::new();
-    let mut prev: Option<usize> = None;
-    for asn in asns {
-        let hue = *out.entry(asn).or_insert_with(|| {
-            let own = as_hue(asn);
-            if prev == Some(own) {
-                (own + 1) % AS_HUES.len()
-            } else {
-                own
-            }
-        });
-        prev = Some(hue);
-    }
-    out
-}
-
-pub(crate) fn as_tone(v: &egui::Visuals, hue: usize) -> Tone {
-    AS_HUES
-        .get(hue)
-        .map_or_else(|| neutral_tone(v), |h| h.tone(v))
-}
-
-fn neutral_tone(v: &egui::Visuals) -> Tone {
-    Tone {
-        fill: v.widgets.noninteractive.weak_bg_fill,
-        ink: v.weak_text_color(),
-        border: Some(v.widgets.noninteractive.bg_stroke.color),
-    }
-}
-
-/// Font size of the pills: a step below the table's.
-fn small(ui: &Ui) -> f32 {
-    ui.style()
-        .text_styles
-        .get(&egui::TextStyle::Body)
-        .map_or(11.0, |f| f.size * 0.85)
-}
-
-/// A small rounded pill, never taller than a table row.
-fn chip(ui: &mut Ui, text: &str, tone: Tone) -> egui::Response {
-    let font = egui::FontId::proportional(small(ui));
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font, tone.ink);
-    let pad = egui::vec2(7.0, 2.0);
-    let h = (galley.size().y + 2.0 * pad.y).min(ui.spacing().interact_size.y - 2.0);
-    let (rect, resp) = ui.allocate_exact_size(
-        egui::vec2(galley.size().x + 2.0 * pad.x, h),
-        egui::Sense::hover(),
-    );
-    if ui.is_rect_visible(rect) {
-        let stroke = tone
-            .border
-            .map_or(egui::Stroke::NONE, |c| egui::Stroke::new(1.0, c));
-        ui.painter()
-            .rect(rect, 8.0, tone.fill, stroke, egui::StrokeKind::Inside);
-        let at = rect.center() - galley.size() / 2.0;
-        ui.painter().galley(at, galley, tone.ink);
-    }
-    resp
+        if let Some(n) = &name
+            && ui.button("Copy host").clicked()
+        {
+            ui.ctx().copy_text(n.clone());
+            ui.close();
+        }
+    });
 }
 
 /// What the chip of a private, CGNAT, link-local… address says.
@@ -534,6 +482,8 @@ pub(crate) fn as_text(h: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .and_then(|name| name.split(',').next())
         .and_then(|name| name.split_whitespace().next())
+        // A registry "name" that is the number itself adds nothing.
+        .filter(|w| !w.eq_ignore_ascii_case(&format!("AS{n}")))
         .map(|w| truncate(w, 16));
     Some(match short {
         Some(w) => format!("AS{n} {w}"),

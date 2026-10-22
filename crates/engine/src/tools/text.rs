@@ -233,7 +233,11 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
                     host = format!("{host} [{scope}]");
                 }
                 let as_text = match (h.get("asn").and_then(Value::as_u64), s(h, "as_name")) {
-                    (Some(n), name) if !name.is_empty() => format!("AS{n} {name}"),
+                    (Some(n), name)
+                        if !name.is_empty() && !name.eq_ignore_ascii_case(&format!("AS{n}")) =>
+                    {
+                        format!("AS{n} {name}")
+                    }
                     (Some(n), _) => format!("AS{n}"),
                     (None, _) if asn && !s(h, "host").is_empty() => "AS???".to_owned(),
                     (None, _) => String::new(),

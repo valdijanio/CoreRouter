@@ -288,6 +288,9 @@ refresh_checkout() {
   fi
 }
 
+# Algum PR entrou desde o último fold (a fila contínua consolida quando fica ociosa).
+MERGED_ANY=0
+
 # Squash de cada PR de $members (os checks rápidos do próprio PR têm de estar verdes).
 merge_members() {
   local n r merged=0
@@ -305,7 +308,7 @@ merge_members() {
       say "  #$n fora: o merge foi recusado (a branch mudou?)"
     fi
   done
-  [ "$merged" = 0 ] || refresh_checkout
+  [ "$merged" = 0 ] || { MERGED_ANY=1; refresh_checkout; }
 }
 
 # Integra os PRs: testa a combinação; verde, entram todos; vermelho, divide ao meio e repete em
@@ -322,6 +325,8 @@ land_set() {
   local set=("${members[@]}")
   if [ ${#set[@]} = 1 ]; then
     say "  #${set[0]} fora: quebra o CI (${failed:-tempo}) — a sessão dona corrige na branch"
+    # Fora até a branch mudar: sem isso a fila contínua o testava de novo a cada ciclo.
+    SKIP[${set[0]}]=${HEADS[${set[0]}]:-}
     return 0
   fi
   say "  vermelho (${failed:-tempo}): dividindo ${set[*]}"
@@ -388,6 +393,8 @@ watch() {
   gh label create fila --color 0E8A16 --description "Pronto para a fila de entrada" 2>/dev/null || true
   say "fila contínua: rótulo 'fila', a cada ${tick}s"
   while :; do
+    # Sempre da raiz: um passo anterior pode ter saído de dentro de uma worktree já removida.
+    cd "$root"
     mapfile -t ready < <(ready_prs)
     if [ -z "$run_sha" ] && [ ${#ready[@]} -gt 0 ]; then
       if build_combo "origin/$base" batch "${ready[@]}"; then
@@ -429,6 +436,12 @@ watch() {
       esac
     fi
     if [ -z "$run_sha" ] && [ ${#ready[@]} = 0 ]; then
+      # Ociosa depois de integrar: consolida os docs/changes se passaram de FOLD_MIN (o fold
+      # periódico; antes só rodava quando a fila contínua terminava).
+      if [ "$MERGED_ANY" = 1 ]; then
+        MERGED_ANY=0
+        maybe_fold
+      fi
       idle=$((idle + tick))
       if [ "$idle" -ge "$max_idle" ]; then
         say "fila contínua: ${max_idle}s sem PR pronto, encerrando"
