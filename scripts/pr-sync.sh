@@ -9,8 +9,11 @@
 #   - só PRs do próprio repositório, abertos, não rascunho, com auto-merge ligado;
 #   - só os que o GitHub diz CONFLICTING (com a proteção sem "branch atualizada", PR mergeável
 #     não precisa da main: não gastamos CI à toa);
-#   - merge limpo: push na branch e dispara o `ci` nela (push com GITHUB_TOKEN não dispara
-#     workflows; `workflow_dispatch` sim) — os checks exigidos rodam no novo commit;
+#   - merge limpo: push na branch e aprova o `ci` do PR. O push do bot gera o evento
+#     `pull_request`, mas o GitHub o deixa em "Action required" (o bot conta como colaborador
+#     novo), e é esse run que o PR enxerga: um `ci` disparado por `workflow_dispatch` passa no
+#     commit, mas não conta para o PR (#45 ficou BLOCKED com os três checks verdes). Se o run
+#     não aparecer, cai no `workflow_dispatch` antigo e avisa;
 #   - conflito de verdade: nada é enviado; comentário no PR (um por commit da main) com os
 #     arquivos e o rótulo `conflito`, para a sessão dona resolver; o rótulo sai na próxima
 #     execução em que o PR não conflitar mais (inclusive quando a sessão resolveu à mão);
@@ -27,6 +30,25 @@ repo=${GH_REPO:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}
 
 say() { printf '%s\n' "$*"; }
 run() { if [ "$dry" = 1 ]; then say "  (dry-run) $*"; else "$@"; fi; }
+
+# Aprova o run `pull_request` que o push do bot deixou em "Action required" (até ~2 min).
+approve_ci() {
+  local sha=$1 ids
+  [ "$dry" = 1 ] && { say "  (dry-run) aprovaria o ci de $sha"; return 0; }
+  for _ in $(seq 1 24); do
+    ids=$(gh api "repos/$repo/actions/runs?head_sha=$sha&event=pull_request" \
+      --jq '.workflow_runs[] | select(.status == "action_required") | .id')
+    if [ -n "$ids" ]; then
+      for id in $ids; do
+        say "  aprova o ci (run $id)"
+        gh api --silent -X POST "repos/$repo/actions/runs/$id/approve" || return 1
+      done
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
 
 # Rótulos pela API REST: o `gh pr edit --add-label/--remove-label` falha em versões do gh que
 # ainda consultam os Projects clássicos (descontinuados).
@@ -92,7 +114,10 @@ while read -r n branch labeled; do
     say "  merge limpo: push e ci"
     # Sem --force: se a sessão dona enviou algo neste meio tempo, o push falha e fica com ela.
     if run git push --quiet origin "HEAD:refs/heads/$branch"; then
-      run gh workflow run ci.yml --ref "$branch"
+      if ! approve_ci "$(git rev-parse HEAD)"; then
+        say "  aviso: nenhum ci do PR para aprovar; dispara por workflow_dispatch (pode não contar para o PR)"
+        run gh workflow run ci.yml --ref "$branch"
+      fi
       label_remove "$n" "$labeled"
     else
       say "  push recusado (a branch andou); fica para o próximo push na main"

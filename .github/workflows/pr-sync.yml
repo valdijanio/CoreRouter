@@ -3,7 +3,7 @@
 # O GitHub ignora o `merge=union` do .gitattributes, então um PR vira CONFLICTING sempre que outro
 # acrescenta ao docs/log.md ou ao docs/gaps-history.md, e o auto-merge para até alguém trazer a
 # main à mão. A cada push na main, `scripts/pr-sync.sh` faz o merge de verdade (com o union) nesses
-# PRs: limpo → push e dispara o `ci` na branch; conflito real → comentário + rótulo `conflito`.
+# PRs: limpo → push e aprova o `ci` do PR; conflito real → comentário + rótulo `conflito`.
 
 name: pr-sync
 
@@ -15,7 +15,8 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # `gh workflow run ci.yml`: um push com GITHUB_TOKEN não dispara o ci; workflow_dispatch sim.
+  # Aprovar o run do `ci` que o push do bot deixa em "Action required" (e o `workflow_dispatch`
+  # de reserva).
   actions: write
 
 concurrency:

@@ -588,3 +588,9 @@ mesmo dia pode variar.
   gh 2.45 por causa dos Projects clássicos, e o erro era engolido). Sem aviso de conflito quando a
   branch andou durante o merge (no #42 o comentário listou um conflito que já tinha sido resolvido
   17 s antes). Testado com `DRY_RUN=1` num clone descartável, com e sem o rótulo.
+- 2026-10-22 — processo (pr-sync): depois do merge limpo, o pr-sync **aprova** o run `pull_request`
+  do `ci` que o push do bot deixa em "Action required" (o GitHub trata o `github-actions[bot]` como
+  colaborador novo) em vez de só disparar o `ci` por `workflow_dispatch`. O run disparado passava
+  no commit, mas não contava para o PR: o #45 ficou BLOCKED com os três checks verdes até o run
+  ser aprovado à mão (`POST /actions/runs/{id}/approve`, testado no #45). O `workflow_dispatch` fica
+  como reserva, com aviso, se o run do PR não aparecer em ~2 min.
