@@ -9,7 +9,8 @@ use egui::{Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
 use crate::avail::Avail;
-use crate::interfaces::{cascade, dialog_id, field, opt_text};
+use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
+use crate::interfaces::{cascade, dialog_id, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, form_number, value_text};
 
@@ -130,6 +131,14 @@ pub(crate) struct RouteForm {
 }
 
 impl RouteForm {
+    /// A blank "New Route" form.
+    fn new() -> Self {
+        Self {
+            table: MAIN.into(),
+            ..Self::default()
+        }
+    }
+
     fn of(r: &Route) -> Self {
         Self {
             dst: r.dst.clone(),
@@ -194,15 +203,27 @@ pub(crate) enum RouteDialog {
     Comment {
         targets: Vec<String>,
         text: String,
+        /// The text when the dialog opened.
+        base: String,
     },
+}
+
+impl RouteDialog {
+    /// Edits not saved yet (the dot in the title).
+    fn dirty(&self) -> bool {
+        match self {
+            RouteDialog::New(form) => *form != RouteForm::new(),
+            RouteDialog::Props { id, form, base } => form.set_params(id, base).is_some(),
+            RouteDialog::Connected(_) => false,
+            RouteDialog::Comment { text, base, .. } => text != base,
+        }
+    }
 }
 
 pub(crate) struct RouteDialogWin {
     pub id: u64,
     pub dialog: RouteDialog,
-    pub error: Option<String>,
-    pub waiting: usize,
-    pub close_on_success: bool,
+    pub status: Status,
 }
 
 /// What a dialog's command changes in the dialog when it succeeds.
@@ -217,11 +238,9 @@ pub(crate) enum Effect {
     Toggled(bool),
 }
 
+/// The buttons of a "Route <dst>" window besides OK/Cancel/Apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Button {
-    Ok,
-    Apply,
-    Cancel,
     Toggle,
     Remove,
 }
@@ -364,7 +383,11 @@ impl CoreRouterUi {
                     _ => String::new(),
                 };
                 if !targets.is_empty() {
-                    self.open_route_dialog(RouteDialog::Comment { targets, text });
+                    self.open_route_dialog(RouteDialog::Comment {
+                        targets,
+                        base: text.clone(),
+                        text,
+                    });
                 }
             }
             Act::Open(keys) => {
@@ -372,10 +395,7 @@ impl CoreRouterUi {
                     self.open_route(k);
                 }
             }
-            Act::New => self.open_route_dialog(RouteDialog::New(RouteForm {
-                table: MAIN.into(),
-                ..RouteForm::default()
-            })),
+            Act::New => self.open_route_dialog(RouteDialog::New(RouteForm::new())),
             Act::SelectAll => self.tables.routes.select_all(rows),
             Act::Refresh => self.cache.refreshed_at = None,
         }
@@ -400,9 +420,7 @@ impl CoreRouterUi {
         self.route_dialogs.push(RouteDialogWin {
             id: self.next_dialog,
             dialog,
-            error: None,
-            waiting: 0,
-            close_on_success: false,
+            status: Status::default(),
         });
     }
 
@@ -447,23 +465,18 @@ impl CoreRouterUi {
                 self.floats.forget(id);
                 return false;
             }
-            let mut open = true;
-            let mut pressed = None;
             let title = dialog_title(&d.dialog, &routes);
-            let pos = cascade(area, d.id);
-            self.floats.show(
-                ctx,
-                area,
+            let head = Head {
                 id,
-                &title,
-                &mut open,
-                |w| w.default_pos(pos).resizable(false).collapsible(false),
-                |ui| {
-                    let busy = d.waiting > 0;
-                    pressed = dialog_body(ui, d, &routes, &tables, busy);
-                },
-            );
-            let keep = open && pressed.is_none_or(|b| self.route_button(d, b, &routes));
+                title: &title,
+                dirty: d.dialog.dirty(),
+                pos: cascade(area, d.id),
+            };
+            let pressed =
+                dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
+                    dialog_body(ui, f, &mut d.dialog, &routes, &tables)
+                });
+            let keep = pressed.is_none_or(|b| self.route_button(d, b, &routes));
             if !keep {
                 self.floats.forget(id);
             }
@@ -475,13 +488,13 @@ impl CoreRouterUi {
 
     /// Send what a button means. Returns whether the dialog stays open now;
     /// closing on success is decided when the replies arrive.
-    fn route_button(&mut self, d: &mut RouteDialogWin, b: Button, routes: &[Route]) -> bool {
-        if b == Button::Cancel {
+    fn route_button(&mut self, d: &mut RouteDialogWin, b: Press<Button>, routes: &[Route]) -> bool {
+        if b == Press::Cancel {
             return false;
         }
         let (sends, close): (Vec<(&str, Value, Effect)>, bool) = match &d.dialog {
             RouteDialog::New(form) => {
-                let effect = if b == Button::Apply {
+                let effect = if b == Press::Apply {
                     Effect::OpenCreated
                 } else {
                     Effect::None
@@ -489,15 +502,15 @@ impl CoreRouterUi {
                 (vec![("ip.route.add", form.add_params(), effect)], true)
             }
             RouteDialog::Props { id, form, base } => match b {
-                Button::Ok | Button::Apply => match form.set_params(id, base) {
+                Press::Ok | Press::Apply => match form.set_params(id, base) {
                     Some(p) => (
                         vec![("ip.route.set", p, Effect::Applied(form.clone()))],
-                        b == Button::Ok,
+                        b == Press::Ok,
                     ),
                     // OK with nothing changed just closes.
-                    None => return b != Button::Ok,
+                    None => return b != Press::Ok,
                 },
-                Button::Toggle => {
+                Press::Other(Button::Toggle) => {
                     let now = routes
                         .iter()
                         .find(|r| r.id.as_deref() == Some(id.as_str()))
@@ -511,14 +524,14 @@ impl CoreRouterUi {
                         false,
                     )
                 }
-                Button::Remove => (
+                Press::Other(Button::Remove) => (
                     vec![("ip.route.remove", json!({ "id": id }), Effect::None)],
                     true,
                 ),
-                Button::Cancel => return false,
+                Press::Cancel => return false,
             },
             RouteDialog::Connected(_) => return false,
-            RouteDialog::Comment { targets, text } => (
+            RouteDialog::Comment { targets, text, .. } => (
                 targets
                     .iter()
                     .map(|t| {
@@ -532,10 +545,9 @@ impl CoreRouterUi {
                 true,
             ),
         };
-        d.close_on_success = close;
-        d.error = None;
+        d.status.close_on_success = close;
         for (cmd, params, effect) in sends {
-            d.waiting += 1;
+            d.status.sent();
             self.run_then(cmd, params, Then::Route { id: d.id, effect });
         }
         true
@@ -555,9 +567,9 @@ impl CoreRouterUi {
         let close = match self.route_dialogs.get_mut(pos) {
             None => return,
             Some(d) => {
-                d.waiting = d.waiting.saturating_sub(1);
+                let close = d.status.replied(result);
                 match (result, effect, &mut d.dialog) {
-                    (Err(e), _, _) => d.error = Some(e.clone()),
+                    (Err(_), _, _) => {}
                     (Ok(r), Effect::OpenCreated, _) => {
                         created = r.get("id").and_then(Value::as_str).map(str::to_owned);
                     }
@@ -578,7 +590,7 @@ impl CoreRouterUi {
                     }
                     (Ok(_), _, _) => {}
                 }
-                d.waiting == 0 && d.close_on_success && d.error.is_none()
+                close
             }
         };
         if close {
@@ -703,17 +715,23 @@ fn dialog_title(d: &RouteDialog, routes: &[Route]) -> String {
     }
 }
 
-fn form_fields(ui: &mut Ui, f: &mut RouteForm, tables: &[String], with_disabled: bool) {
-    field(ui, "Dst. Address", &mut f.dst, "0.0.0.0/0");
-    field(ui, "Gateway", &mut f.gateway, "10.0.0.1 or ether1");
-    field(ui, "Distance", &mut f.distance, "1");
+fn form_fields(ui: &mut Ui, f: &Form, r: &mut RouteForm, tables: &[String], with_disabled: bool) {
+    f.text(ui, "Dst. Address", "dst_address", &mut r.dst, "0.0.0.0/0");
+    f.text(
+        ui,
+        "Gateway",
+        "gateway",
+        &mut r.gateway,
+        "10.0.0.1 or ether1",
+    );
+    f.text(ui, "Distance", "distance", &mut r.distance, "1");
     ui.label("Routing Table");
-    crate::windows::combo(ui, "route-table", MAIN, &mut f.table, tables);
+    crate::windows::combo(ui, "route-table", MAIN, &mut r.table, tables);
     ui.end_row();
-    field(ui, "Comment", &mut f.comment, "");
+    f.text(ui, "Comment", "comment", &mut r.comment, "");
     if with_disabled {
         ui.label("Disabled");
-        ui.checkbox(&mut f.disabled, "");
+        ui.checkbox(&mut r.disabled, "");
         ui.end_row();
     }
 }
@@ -727,23 +745,23 @@ fn read_only(ui: &mut Ui, label: &str, value: &str) {
     ui.end_row();
 }
 
-/// Fields + buttons of one dialog. Returns the button pressed, if any.
+/// The fields of one dialog, and the buttons it has under them.
 fn dialog_body(
     ui: &mut Ui,
-    d: &mut RouteDialogWin,
+    f: &Form,
+    d: &mut RouteDialog,
     routes: &[Route],
     tables: &[String],
-    busy: bool,
-) -> Option<Button> {
+) -> Footer<Button> {
     let mut toggle_label = None;
     let mut view_only = false;
     Grid::new("fields")
         .num_columns(2)
         .spacing([12.0, 6.0])
-        .show(ui, |ui| match &mut d.dialog {
-            RouteDialog::New(form) => form_fields(ui, form, tables, false),
+        .show(ui, |ui| match &mut *d {
+            RouteDialog::New(form) => form_fields(ui, f, form, tables, false),
             RouteDialog::Props { id, form, .. } => {
-                form_fields(ui, form, tables, true);
+                form_fields(ui, f, form, tables, true);
                 if let Some(r) = routes.iter().find(|r| r.id.as_deref() == Some(id.as_str())) {
                     read_only(
                         ui,
@@ -768,40 +786,19 @@ fn dialog_body(
                     ui.end_row();
                 }
             }
-            RouteDialog::Comment { text, .. } => field(ui, "Comment", text, ""),
+            RouteDialog::Comment { text, .. } => f.text(ui, "Comment", "comment", text, ""),
         });
     if view_only {
         ui.weak("Connected routes follow their IP address (IP › Addresses).");
-    }
-    if let Some(e) = d.error.as_deref() {
-        ui.colored_label(ui.visuals().error_fg_color, e);
-    }
-    ui.separator();
-    let mut pressed = None;
-    ui.horizontal(|ui| {
-        // While the router has not answered, only Cancel works.
-        let mut btn = |ui: &mut Ui, text: &str, b: Button| {
-            let enabled = !busy || b == Button::Cancel;
-            if ui.add_enabled(enabled, egui::Button::new(text)).clicked() {
-                pressed = Some(b);
-            }
+        return Footer {
+            buttons: Buttons::View,
+            extra: Vec::new(),
+            pressed: None,
         };
-        if view_only {
-            btn(ui, "OK", Button::Cancel);
-            return;
-        }
-        btn(ui, "OK", Button::Ok);
-        btn(ui, "Cancel", Button::Cancel);
-        if !matches!(d.dialog, RouteDialog::Comment { .. }) {
-            btn(ui, "Apply", Button::Apply);
-        }
-        if let Some(t) = toggle_label {
-            btn(ui, t, Button::Toggle);
-            btn(ui, "Remove", Button::Remove);
-        }
-        if busy {
-            ui.weak("…");
-        }
-    });
-    pressed
+    }
+    let mut footer = Footer::edit(!matches!(d, RouteDialog::Comment { .. }));
+    if let Some(t) = toggle_label {
+        footer.extra = vec![(t, Button::Toggle), ("Remove", Button::Remove)];
+    }
+    footer
 }

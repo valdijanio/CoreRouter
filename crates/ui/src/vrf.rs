@@ -12,7 +12,8 @@ use egui::{Grid, ScrollArea, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
 use crate::avail::Avail;
-use crate::interfaces::{Iface, cascade, dialog_id, field, opt_text};
+use crate::dialog::{self, Footer, Form, Head, Press, Status};
+use crate::interfaces::{Iface, cascade, dialog_id, opt_text};
 use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment, num};
 use crate::{CoreRouterUi, Then, value_text};
 
@@ -131,15 +132,26 @@ pub(crate) enum VrfDialog {
     Comment {
         targets: Vec<String>,
         text: String,
+        /// The text when the dialog opened.
+        base: String,
     },
+}
+
+impl VrfDialog {
+    /// Edits not saved yet (the dot in the title).
+    fn dirty(&self) -> bool {
+        match self {
+            VrfDialog::New(form) => *form != VrfForm::default(),
+            VrfDialog::Props { form, base } => form.set_params(base).is_some(),
+            VrfDialog::Comment { text, base, .. } => text != base,
+        }
+    }
 }
 
 pub(crate) struct VrfDialogWin {
     pub id: u64,
     pub dialog: VrfDialog,
-    pub error: Option<String>,
-    pub waiting: usize,
-    pub close_on_success: bool,
+    pub status: Status,
 }
 
 /// What a dialog's command changes in the dialog when it succeeds.
@@ -154,11 +166,9 @@ pub(crate) enum Effect {
     Toggled(bool),
 }
 
+/// The buttons of a "VRF <name>" window besides OK/Cancel/Apply.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Button {
-    Ok,
-    Apply,
-    Cancel,
     Toggle,
     Remove,
 }
@@ -292,7 +302,11 @@ impl CoreRouterUi {
                     _ => String::new(),
                 };
                 if !targets.is_empty() {
-                    self.open_vrf_dialog(VrfDialog::Comment { targets, text });
+                    self.open_vrf_dialog(VrfDialog::Comment {
+                        targets,
+                        base: text.clone(),
+                        text,
+                    });
                 }
             }
             Act::Open(names) => {
@@ -317,9 +331,7 @@ impl CoreRouterUi {
         self.vrf_dialogs.push(VrfDialogWin {
             id: self.next_dialog,
             dialog,
-            error: None,
-            waiting: 0,
-            close_on_success: false,
+            status: Status::default(),
         });
     }
 
@@ -352,23 +364,19 @@ impl CoreRouterUi {
                 self.floats.forget(id);
                 return false;
             }
-            let mut open = true;
-            let mut pressed = None;
             let title = dialog_title(&d.dialog);
-            let pos = cascade(area, d.id);
-            self.floats.show(
-                ctx,
-                area,
+            let head = Head {
                 id,
-                &title,
-                &mut open,
-                |w| w.default_pos(pos).resizable(false).collapsible(false),
-                |ui| {
-                    let busy = d.waiting > 0;
-                    pressed = dialog_body(ui, d, &vrfs, &ifaces, busy);
-                },
-            );
-            let keep = open && pressed.is_none_or(|b| self.vrf_button(d, b, &vrfs));
+                title: &title,
+                dirty: d.dialog.dirty(),
+                pos: cascade(area, d.id),
+            };
+            let salt = d.id;
+            let pressed =
+                dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
+                    dialog_body(ui, f, salt, &mut d.dialog, &vrfs, &ifaces)
+                });
+            let keep = pressed.is_none_or(|b| self.vrf_button(d, b, &vrfs));
             if !keep {
                 self.floats.forget(id);
             }
@@ -380,13 +388,13 @@ impl CoreRouterUi {
 
     /// Send what a button means. Returns whether the dialog stays open now;
     /// closing on success is decided when the replies arrive.
-    fn vrf_button(&mut self, d: &mut VrfDialogWin, b: Button, vrfs: &[Vrf]) -> bool {
-        if b == Button::Cancel {
+    fn vrf_button(&mut self, d: &mut VrfDialogWin, b: Press<Button>, vrfs: &[Vrf]) -> bool {
+        if b == Press::Cancel {
             return false;
         }
         let (sends, close): (Vec<(&str, Value, Effect)>, bool) = match &d.dialog {
             VrfDialog::New(form) => {
-                let effect = if b == Button::Apply {
+                let effect = if b == Press::Apply {
                     Effect::OpenCreated
                 } else {
                     Effect::None
@@ -394,15 +402,15 @@ impl CoreRouterUi {
                 (vec![("ip.vrf.add", form.add_params(), effect)], true)
             }
             VrfDialog::Props { form, base } => match b {
-                Button::Ok | Button::Apply => match form.set_params(base) {
+                Press::Ok | Press::Apply => match form.set_params(base) {
                     Some(p) => (
                         vec![("ip.vrf.set", p, Effect::Applied(form.clone()))],
-                        b == Button::Ok,
+                        b == Press::Ok,
                     ),
                     // OK with nothing changed just closes.
-                    None => return b != Button::Ok,
+                    None => return b != Press::Ok,
                 },
-                Button::Toggle => {
+                Press::Other(Button::Toggle) => {
                     let now = vrfs
                         .iter()
                         .find(|v| v.name == base.name)
@@ -416,13 +424,13 @@ impl CoreRouterUi {
                         false,
                     )
                 }
-                Button::Remove => (
+                Press::Other(Button::Remove) => (
                     vec![("ip.vrf.remove", json!({ "name": base.name }), Effect::None)],
                     true,
                 ),
-                Button::Cancel => return false,
+                Press::Cancel => return false,
             },
-            VrfDialog::Comment { targets, text } => (
+            VrfDialog::Comment { targets, text, .. } => (
                 targets
                     .iter()
                     .map(|t| {
@@ -436,10 +444,9 @@ impl CoreRouterUi {
                 true,
             ),
         };
-        d.close_on_success = close;
-        d.error = None;
+        d.status.close_on_success = close;
         for (cmd, params, effect) in sends {
-            d.waiting += 1;
+            d.status.sent();
             self.run_then(cmd, params, Then::Vrf { id: d.id, effect });
         }
         true
@@ -459,9 +466,9 @@ impl CoreRouterUi {
         let close = match self.vrf_dialogs.get_mut(pos) {
             None => return,
             Some(d) => {
-                d.waiting = d.waiting.saturating_sub(1);
+                let close = d.status.replied(result);
                 match (result, effect, &mut d.dialog) {
-                    (Err(e), _, _) => d.error = Some(e.clone()),
+                    (Err(_), _, _) => {}
                     (Ok(r), Effect::OpenCreated, _) => {
                         created = r.get("name").and_then(Value::as_str).map(str::to_owned);
                     }
@@ -475,7 +482,7 @@ impl CoreRouterUi {
                     }
                     (Ok(_), _, _) => {}
                 }
-                d.waiting == 0 && d.close_on_success && d.error.is_none()
+                close
             }
         };
         if close {
@@ -621,23 +628,24 @@ fn read_only(ui: &mut Ui, label: &str, value: &str) {
     ui.end_row();
 }
 
-/// Fields + buttons of one dialog. Returns the button pressed, if any.
+/// The fields of one dialog, and the buttons it has under them.
 fn dialog_body(
     ui: &mut Ui,
-    d: &mut VrfDialogWin,
+    f: &Form,
+    salt: u64,
+    d: &mut VrfDialog,
     vrfs: &[Vrf],
     ifaces: &[Iface],
-    busy: bool,
-) -> Option<Button> {
+) -> Footer<Button> {
     let mut toggle_label = None;
     Grid::new("fields")
         .num_columns(2)
         .spacing([12.0, 6.0])
-        .show(ui, |ui| match &mut d.dialog {
+        .show(ui, |ui| match &mut *d {
             VrfDialog::New(form) => {
-                field(ui, "Name", &mut form.name, "vrf1");
-                members(ui, d.id, &mut form.members, &candidates(ifaces, None));
-                field(ui, "Comment", &mut form.comment, "");
+                f.text(ui, "Name", "name", &mut form.name, "vrf1");
+                members(ui, salt, &mut form.members, &candidates(ifaces, None));
+                f.text(ui, "Comment", "comment", &mut form.comment, "");
             }
             VrfDialog::Props { form, base } => {
                 read_only(ui, "Name", &base.name);
@@ -646,39 +654,17 @@ fn dialog_body(
                     toggle_label = Some(if v.disabled { "Enable" } else { "Disable" });
                 }
                 let offer = candidates(ifaces, Some(&base.name));
-                members(ui, d.id, &mut form.members, &offer);
-                field(ui, "Comment", &mut form.comment, "");
+                members(ui, salt, &mut form.members, &offer);
+                f.text(ui, "Comment", "comment", &mut form.comment, "");
                 ui.label("Disabled");
                 ui.checkbox(&mut form.disabled, "");
                 ui.end_row();
             }
-            VrfDialog::Comment { text, .. } => field(ui, "Comment", text, ""),
+            VrfDialog::Comment { text, .. } => f.text(ui, "Comment", "comment", text, ""),
         });
-    if let Some(e) = d.error.as_deref() {
-        ui.colored_label(ui.visuals().error_fg_color, e);
+    let mut footer = Footer::edit(!matches!(d, VrfDialog::Comment { .. }));
+    if let Some(t) = toggle_label {
+        footer.extra = vec![(t, Button::Toggle), ("Remove", Button::Remove)];
     }
-    ui.separator();
-    let mut pressed = None;
-    ui.horizontal(|ui| {
-        // While the router has not answered, only Cancel works.
-        let mut btn = |ui: &mut Ui, text: &str, b: Button| {
-            let enabled = !busy || b == Button::Cancel;
-            if ui.add_enabled(enabled, egui::Button::new(text)).clicked() {
-                pressed = Some(b);
-            }
-        };
-        btn(ui, "OK", Button::Ok);
-        btn(ui, "Cancel", Button::Cancel);
-        if !matches!(d.dialog, VrfDialog::Comment { .. }) {
-            btn(ui, "Apply", Button::Apply);
-        }
-        if let Some(t) = toggle_label {
-            btn(ui, t, Button::Toggle);
-            btn(ui, "Remove", Button::Remove);
-        }
-        if busy {
-            ui.weak("…");
-        }
-    });
-    pressed
+    footer
 }
