@@ -53,7 +53,15 @@ pub fn stored_theme(text: &str) -> Option<ThemePreference> {
 impl CoreRouterUi {
     /// The preferences as JSON, for the app to store.
     pub fn prefs(&self) -> String {
-        let inline = self.tables.inline_comments();
+        let mut inline = self.tables.inline_comments();
+        inline.extend(
+            self.panels
+                .iter()
+                .flatten()
+                .flat_map(|p| p.tables())
+                .filter(|(_, t)| t.inline_comments)
+                .map(|(salt, _)| salt),
+        );
         json!({"theme": theme_name(self.theme), "inline_comments": inline}).to_string()
     }
 
@@ -70,7 +78,8 @@ impl CoreRouterUi {
             self.theme = pref;
         }
         if let Some(list) = v.get("inline_comments").and_then(Value::as_array) {
-            for (salt, table) in self.tables.each() {
+            let panels = self.panels.iter_mut().flatten().flat_map(|p| p.tables_mut());
+            for (salt, table) in self.tables.each().into_iter().chain(panels) {
                 table.inline_comments = list.iter().any(|s| s.as_str() == Some(salt));
             }
         }

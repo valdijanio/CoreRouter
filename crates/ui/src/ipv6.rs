@@ -12,6 +12,8 @@
 //! Everything comes from `ipv6.*` queries and goes through
 //! `CoreRouterUi::run`; the engine decides. The clients' history
 //! (`ipv6.dhcp-client.history`) feeds the Log window.
+//!
+//! A panel (`panel.rs`): its state lives here, not in `CoreRouterUi`.
 
 use std::collections::BTreeMap;
 
@@ -23,8 +25,9 @@ use crate::backend::RequestId;
 use crate::dhcp_client::{flag, text};
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::interfaces::{cascade, dialog_id};
-use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment};
-use crate::{CoreRouterUi, LogLine, Then, form_number, value_text};
+use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
+use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
+use crate::{CoreRouterUi, LogLine, Win, form_number, value_text};
 
 pub(crate) const TABLE: &str = "dhcpv6-client";
 pub(crate) const POOL_TABLE: &str = "ipv6-pool";
@@ -45,27 +48,165 @@ const COLUMNS: [table::Column; 8] = [
     comment(),
 ];
 
-/// What the IPv6 windows read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) enum Feed {
-    Clients,
-    Options,
-    History,
-    Pools,
-    Settings,
+const NAME: &str = "ipv6";
+/// The windows' ids (`Win::Panel`).
+pub(crate) const WIN_CLIENT: &str = "dhcpv6-client";
+pub(crate) const WIN_POOL: &str = "ipv6-pool";
+pub(crate) const WIN_SETTINGS: &str = "ipv6-settings";
+
+pub(crate) const PANEL: Panel = Panel {
+    name: NAME,
+    windows: &[
+        WinDef {
+            id: WIN_CLIENT,
+            group: "IPv6",
+            title: "DHCPv6 Client",
+            size: [860.0, 260.0],
+            escape: true,
+        },
+        WinDef {
+            id: WIN_POOL,
+            group: "IPv6",
+            title: "IPv6 Pool",
+            size: [760.0, 220.0],
+            escape: true,
+        },
+        WinDef {
+            id: WIN_SETTINGS,
+            group: "IPv6",
+            title: "IPv6 Settings",
+            size: [620.0, 340.0],
+            escape: false,
+        },
+    ],
+    new: || Box::new(Ipv6Panel::default()),
+};
+
+/// The IPv6 windows' data, dialogs and tables.
+#[derive(Default)]
+pub(crate) struct Ipv6Panel {
+    clients: Vec<Value>,
+    options: BTreeMap<String, Value>,
+    pools: Vec<Value>,
+    settings: Value,
+    /// Last history event logged (`None` before the first look).
+    seq: Option<u64>,
+    pub(crate) dialogs: Vec<Dhcp6DialogWin>,
+    /// Clients to open once a list sent after this request arrives.
+    open_after: Vec<(RequestId, String)>,
+    pub(crate) table: TableState,
+    pool_table: TableState,
+    ra_table: TableState,
 }
 
-#[derive(Default)]
-pub(crate) struct State {
-    pub clients: Vec<Value>,
-    pub options: BTreeMap<String, Value>,
-    pub pools: Vec<Value>,
-    pub settings: Value,
-    /// Last history event logged (`None` before the first look).
-    pub seq: Option<u64>,
-    pub dialogs: Vec<Dhcp6DialogWin>,
-    /// Clients to open once a list sent after this request arrives.
-    pub open_after: Vec<(RequestId, String)>,
+/// What a dialog's command changes when it is answered.
+struct Reply {
+    id: u64,
+    effect: Effect,
+}
+
+impl PanelState for Ipv6Panel {
+    fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
+        let open = |w| app.open.contains(&Win::Panel(w));
+        let q = |key, command, params| Query {
+            key,
+            command,
+            params,
+        };
+        let mut out = Vec::new();
+        if open(WIN_CLIENT) || !self.dialogs.is_empty() {
+            out.push(q("list", "ipv6.dhcp-client.list", Value::Null));
+        }
+        for c in self.dialogs.iter().filter_map(|d| d.dialog.options_of()) {
+            out.push(q("options", "ipv6.dhcp-client.options", json!({ "id": c })));
+        }
+        if open(WIN_POOL) {
+            out.push(q("pools", "ipv6.pool.list", Value::Null));
+        }
+        if open(WIN_SETTINGS) {
+            out.push(q("settings", "ipv6.settings.get", Value::Null));
+        }
+        // Only a router known to have it (an older daemon has not).
+        if app.has_command("ipv6.dhcp-client.history") {
+            out.push(q(
+                "history",
+                "ipv6.dhcp-client.history",
+                json!({ "after_seq": self.seq.unwrap_or(0) }),
+            ));
+        }
+        out
+    }
+
+    fn arrived(&mut self, app: &mut CoreRouterUi, key: &'static str, id: RequestId, value: Value) {
+        let arr = |v: Value| match v {
+            Value::Array(a) => a,
+            _ => Vec::new(),
+        };
+        match key {
+            "list" => {
+                self.clients = arr(value);
+                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_after)
+                    .into_iter()
+                    .partition(|(req, _)| *req <= id);
+                self.open_after = later;
+                for (_, c) in ready {
+                    self.open_dhcp6(app, &c);
+                }
+            }
+            "options" => {
+                if let Some(c) = value.get("id").and_then(Value::as_str) {
+                    self.options.insert(c.to_owned(), value.clone());
+                }
+            }
+            "history" => self.dhcp6_history_arrived(app, &value),
+            "pools" => self.pools = arr(value),
+            "settings" => self.settings = value,
+            _ => {}
+        }
+    }
+
+    fn window(&mut self, app: &mut CoreRouterUi, win: &'static str, ui: &mut egui::Ui) {
+        match win {
+            WIN_CLIENT => self.dhcp6_clients(app, ui),
+            WIN_POOL => self.ipv6_pools(ui),
+            WIN_SETTINGS => self.ipv6_settings(app, ui),
+            _ => {}
+        }
+    }
+
+    fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        self.dhcp6_dialogs(app, ctx, area);
+    }
+
+    fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        if let Ok(r) = then.downcast::<Reply>() {
+            self.dhcp6_dialog_reply(app, r.id, r.effect, result);
+        }
+    }
+
+    fn escape(&mut self, win: &'static str) -> bool {
+        match win {
+            WIN_CLIENT => self.table.escape(),
+            WIN_POOL => self.pool_table.escape(),
+            _ => false,
+        }
+    }
+
+    fn tables(&self) -> Vec<(&'static str, &TableState)> {
+        vec![
+            (TABLE, &self.table),
+            (POOL_TABLE, &self.pool_table),
+            (RA_TABLE, &self.ra_table),
+        ]
+    }
+
+    fn tables_mut(&mut self) -> Vec<(&'static str, &mut TableState)> {
+        vec![
+            (TABLE, &mut self.table),
+            (POOL_TABLE, &mut self.pool_table),
+            (RA_TABLE, &mut self.ra_table),
+        ]
+    }
 }
 
 /// The editable fields of a client, as typed.
@@ -324,82 +465,21 @@ fn client_row(r: &Value) -> Row {
     }
 }
 
-impl CoreRouterUi {
-    /// A query of the IPv6 windows arrived (request `id`).
-    pub(crate) fn v6_arrived(&mut self, feed: Feed, id: RequestId, value: Value) {
-        let arr = |v: Value| match v {
-            Value::Array(a) => a,
-            _ => Vec::new(),
-        };
-        match feed {
-            Feed::Clients => {
-                self.v6.clients = arr(value);
-                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.v6.open_after)
-                    .into_iter()
-                    .partition(|(req, _)| *req <= id);
-                self.v6.open_after = later;
-                for (_, c) in ready {
-                    self.open_dhcp6(&c);
-                }
-            }
-            Feed::Options => {
-                if let Some(c) = value.get("id").and_then(Value::as_str) {
-                    self.v6.options.insert(c.to_owned(), value.clone());
-                }
-            }
-            Feed::History => self.dhcp6_history_arrived(&value),
-            Feed::Pools => self.v6.pools = arr(value),
-            Feed::Settings => self.v6.settings = value,
-        }
-    }
-
-    /// The queries the open IPv6 windows need, as (feed, command, params).
-    pub(crate) fn v6_queries(&self, history: bool) -> Vec<(Feed, &'static str, Value)> {
-        let mut out = Vec::new();
-        let open = |w| self.open.contains(&w);
-        if open(crate::windows::Win::Dhcp6Client) || !self.v6.dialogs.is_empty() {
-            out.push((Feed::Clients, "ipv6.dhcp-client.list", Value::Null));
-        }
-        for d in &self.v6.dialogs {
-            if let Some(c) = d.dialog.options_of() {
-                out.push((
-                    Feed::Options,
-                    "ipv6.dhcp-client.options",
-                    json!({ "id": c }),
-                ));
-            }
-        }
-        if open(crate::windows::Win::Ipv6Pool) {
-            out.push((Feed::Pools, "ipv6.pool.list", Value::Null));
-        }
-        if open(crate::windows::Win::Ipv6Settings) {
-            out.push((Feed::Settings, "ipv6.settings.get", Value::Null));
-        }
-        if history {
-            let after = self.v6.seq.unwrap_or(0);
-            out.push((
-                Feed::History,
-                "ipv6.dhcp-client.history",
-                json!({ "after_seq": after }),
-            ));
-        }
-        out
-    }
-
+impl Ipv6Panel {
     fn dhcp6_row(&self, id: &str) -> Option<&Value> {
-        self.v6.clients.iter().find(|r| text(r, "id") == id)
+        self.clients.iter().find(|r| text(r, "id") == id)
     }
 
-    pub(crate) fn dhcp6_clients(&mut self, ui: &mut Ui) {
-        let clients = self.v6.clients.clone();
+    fn dhcp6_clients(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let clients = self.clients.clone();
         let rows: Vec<Row> = clients.iter().map(client_row).collect();
-        let selection = self.tables.dhcp6.selection(&rows);
+        let selection = self.table.selection(&rows);
         let picked: Vec<&Value> = clients
             .iter()
             .filter(|r| selection.contains(&text(r, "id")))
             .collect();
         let mut act: Option<Act> = None;
-        let can = self.can();
+        let can = app.can();
         ui.horizontal(|ui| {
             if table::tool(
                 ui,
@@ -460,14 +540,14 @@ impl CoreRouterUi {
             ) {
                 act = Some(Act::Release(selection.clone()));
             }
-            table::find_field(ui, TABLE, &mut self.tables.dhcp6);
+            table::find_field(ui, TABLE, &mut self.table);
         });
         ui.separator();
         let out = table::show(
             ui,
             TABLE,
             0.0,
-            &mut self.tables.dhcp6,
+            &mut self.table,
             &COLUMNS,
             &rows,
             |ui, menu| match menu {
@@ -548,7 +628,7 @@ impl CoreRouterUi {
             act = Some(Act::Comment(vec![key]));
         }
         if let Some(s) = out.shortcut {
-            let sel = self.tables.dhcp6.selection(&rows);
+            let sel = self.table.selection(&rows);
             let picked: Vec<&Value> = clients
                 .iter()
                 .filter(|r| sel.contains(&text(r, "id")))
@@ -569,26 +649,26 @@ impl CoreRouterUi {
             }
         }
         if let Some(a) = act {
-            self.dhcp6_act(a, &rows);
+            self.dhcp6_act(app, a, &rows);
         }
     }
 
-    fn dhcp6_act(&mut self, act: Act, rows: &[Row]) {
-        let each = |me: &mut Self, keys: &[String], cmd: &str, extra: Value| {
+    fn dhcp6_act(&mut self, app: &mut CoreRouterUi, act: Act, rows: &[Row]) {
+        let each = |app: &mut CoreRouterUi, keys: &[String], cmd: &str, extra: Value| {
             for id in keys {
                 let mut p = json!({ "id": id });
                 if let (Value::Object(o), Value::Object(e)) = (&mut p, &extra) {
                     o.extend(e.clone());
                 }
-                me.run(cmd, p);
+                app.run(cmd, p);
             }
         };
         match act {
-            Act::Enable(k) => each(self, &k, "ipv6.dhcp-client.set", json!({"disabled": false})),
-            Act::Disable(k) => each(self, &k, "ipv6.dhcp-client.set", json!({"disabled": true})),
-            Act::Remove(k) => each(self, &k, "ipv6.dhcp-client.remove", json!({})),
-            Act::Renew(k) => each(self, &k, "ipv6.dhcp-client.renew", json!({})),
-            Act::Release(k) => each(self, &k, "ipv6.dhcp-client.release", json!({})),
+            Act::Enable(k) => each(app, &k, "ipv6.dhcp-client.set", json!({"disabled": false})),
+            Act::Disable(k) => each(app, &k, "ipv6.dhcp-client.set", json!({"disabled": true})),
+            Act::Remove(k) => each(app, &k, "ipv6.dhcp-client.remove", json!({})),
+            Act::Renew(k) => each(app, &k, "ipv6.dhcp-client.renew", json!({})),
+            Act::Release(k) => each(app, &k, "ipv6.dhcp-client.release", json!({})),
             Act::Comment(keys) => {
                 let text = match keys.as_slice() {
                     [one] => self
@@ -598,7 +678,7 @@ impl CoreRouterUi {
                     _ => String::new(),
                 };
                 if !keys.is_empty() {
-                    self.open_dhcp6_dialog(Dhcp6Dialog::Comment {
+                    self.open_dhcp6_dialog(app, Dhcp6Dialog::Comment {
                         targets: keys,
                         base: text.clone(),
                         text,
@@ -607,19 +687,16 @@ impl CoreRouterUi {
             }
             Act::Open(keys) => {
                 for k in keys.iter().take(MAX_OPEN) {
-                    self.open_dhcp6(k);
+                    self.open_dhcp6(app, k);
                 }
             }
             Act::New => {
                 let mut form = Dhcp6Form::new();
-                let taken: Vec<String> = self
-                    .v6
-                    .clients
+                let taken: Vec<String> = self.clients
                     .iter()
                     .map(|r| text(r, "interface"))
                     .collect();
-                if let Some(free) = self
-                    .interface_names(None)
+                if let Some(free) = app.interface_names(None)
                     .into_iter()
                     .find(|n| !taken.contains(n) && n != "lo")
                 {
@@ -627,9 +704,7 @@ impl CoreRouterUi {
                 }
                 // A pool name to start with (the LAN addresses use it).
                 let mut n = 1;
-                let pools: Vec<String> = self
-                    .v6
-                    .clients
+                let pools: Vec<String> = self.clients
                     .iter()
                     .map(|r| text(r, "pool_name"))
                     .collect();
@@ -637,41 +712,39 @@ impl CoreRouterUi {
                     n += 1;
                 }
                 form.pool_name = format!("pd{n}");
-                self.open_dhcp6_dialog(Dhcp6Dialog::New {
+                self.open_dhcp6_dialog(app, Dhcp6Dialog::New {
                     base: form.clone(),
                     form,
                     tab: Tab::Dhcp,
                 });
             }
-            Act::SelectAll => self.tables.dhcp6.select_all(rows),
-            Act::Refresh => self.cache.refreshed_at = None,
+            Act::SelectAll => self.table.select_all(rows),
+            Act::Refresh => app.cache.refreshed_at = None,
         }
     }
 
-    fn open_dhcp6_dialog(&mut self, dialog: Dhcp6Dialog) {
-        self.next_dialog = self.next_dialog.wrapping_add(1);
-        self.v6.dialogs.push(Dhcp6DialogWin {
-            id: self.next_dialog,
+    fn open_dhcp6_dialog(&mut self, app: &mut CoreRouterUi, dialog: Dhcp6Dialog) {
+        app.next_dialog = app.next_dialog.wrapping_add(1);
+        self.dialogs.push(Dhcp6DialogWin {
+            id: app.next_dialog,
             dialog,
             status: Status::default(),
         });
-        self.cache.refreshed_at = None;
+        app.cache.refreshed_at = None;
     }
 
-    pub(crate) fn open_dhcp6(&mut self, id: &str) {
+    pub(crate) fn open_dhcp6(&mut self, app: &mut CoreRouterUi, id: &str) {
         let Some(row) = self.dhcp6_row(id).cloned() else {
             return;
         };
-        let open = self
-            .v6
-            .dialogs
+        let open = self.dialogs
             .iter()
             .any(|d| matches!(&d.dialog, Dhcp6Dialog::Props { id: i, .. } if i == id));
         if open {
             return;
         }
         let form = Dhcp6Form::of(&row);
-        self.open_dhcp6_dialog(Dhcp6Dialog::Props {
+        self.open_dhcp6_dialog(app, Dhcp6Dialog::Props {
             id: id.to_owned(),
             base: form.clone(),
             form,
@@ -679,17 +752,17 @@ impl CoreRouterUi {
         });
     }
 
-    pub(crate) fn dhcp6_dialogs(&mut self, ctx: &egui::Context, area: egui::Rect) {
-        let clients = self.v6.clients.clone();
-        let names = self.interface_names(None);
-        let mut dialogs = std::mem::take(&mut self.v6.dialogs);
+    fn dhcp6_dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        let clients = self.clients.clone();
+        let names = app.interface_names(None);
+        let mut dialogs = std::mem::take(&mut self.dialogs);
         dialogs.retain_mut(|d| {
             let wid = dialog_id(d.id);
             let row = match &d.dialog {
                 Dhcp6Dialog::Props { id, .. } => {
                     let row = clients.iter().find(|r| text(r, "id") == *id);
-                    if row.is_none() && !self.v6.clients.is_empty() {
-                        self.floats.forget(wid);
+                    if row.is_none() && !self.clients.is_empty() {
+                        app.floats.forget(wid);
                         return false;
                     }
                     row.cloned()
@@ -715,20 +788,20 @@ impl CoreRouterUi {
                     many => format!("Comment for {} DHCPv6 Clients", many.len()),
                 },
             };
-            let can = self.can();
+            let can = app.can();
             let head = Head {
                 id: wid,
                 title: &title,
                 dirty: d.dialog.dirty(),
                 pos: cascade(area, d.id),
-                parent: Some(crate::win_id(crate::windows::Win::Dhcp6Client)),
+                parent: Some(crate::win_id(Win::Panel(WIN_CLIENT))),
             };
             let options = row
                 .as_ref()
-                .and_then(|r| self.v6.options.get(&text(r, "id")))
+                .and_then(|r| self.options.get(&text(r, "id")))
                 .cloned();
             let pressed =
-                dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
+                dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
                     dialog_body(
                         ui,
                         f,
@@ -739,18 +812,19 @@ impl CoreRouterUi {
                         &can,
                     )
                 });
-            let keep = pressed.is_none_or(|b| self.dhcp6_button(d, b, row.as_ref()));
+            let keep = pressed.is_none_or(|b| self.dhcp6_button(app, d, b, row.as_ref()));
             if !keep {
-                self.floats.forget(wid);
+                app.floats.forget(wid);
             }
             keep
         });
-        dialogs.append(&mut self.v6.dialogs);
-        self.v6.dialogs = dialogs;
+        dialogs.append(&mut self.dialogs);
+        self.dialogs = dialogs;
     }
 
     fn dhcp6_button(
         &mut self,
+        app: &mut CoreRouterUi,
         d: &mut Dhcp6DialogWin,
         b: Press<Button>,
         row: Option<&Value>,
@@ -819,22 +893,23 @@ impl CoreRouterUi {
         d.status.close_on_success = close;
         for (cmd, params, effect) in sends {
             d.status.sent();
-            self.run_then(cmd, params, Then::Dhcp6 { id: d.id, effect });
+            app.run_then(cmd, params, crate::panel::then(NAME, Reply { id: d.id, effect }));
         }
         true
     }
 
-    pub(crate) fn dhcp6_dialog_reply(
+    fn dhcp6_dialog_reply(
         &mut self,
+        app: &mut CoreRouterUi,
         id: u64,
         effect: Effect,
         result: &Result<Value, String>,
     ) {
-        let Some(pos) = self.v6.dialogs.iter().position(|d| d.id == id) else {
+        let Some(pos) = self.dialogs.iter().position(|d| d.id == id) else {
             return;
         };
         let mut created = None;
-        let close = match self.v6.dialogs.get_mut(pos) {
+        let close = match self.dialogs.get_mut(pos) {
             None => return,
             Some(d) => {
                 let close = d.status.replied(result);
@@ -868,24 +943,24 @@ impl CoreRouterUi {
             }
         };
         if close {
-            self.v6.dialogs.remove(pos);
-            self.floats.forget(dialog_id(id));
+            self.dialogs.remove(pos);
+            app.floats.forget(dialog_id(id));
         }
-        self.cache.refreshed_at = None;
+        app.cache.refreshed_at = None;
         if let Some(c) = created {
-            let list = self.reload();
-            self.v6.open_after.push((list, c));
+            let list = app.reload();
+            self.open_after.push((list, c));
         }
     }
 
-    fn dhcp6_history_arrived(&mut self, value: &Value) {
+    fn dhcp6_history_arrived(&mut self, app: &mut CoreRouterUi, value: &Value) {
         let last = value.get("last_seq").and_then(Value::as_u64).unwrap_or(0);
         let events = value
             .get("events")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let skip = if self.v6.seq.is_none() {
+        let skip = if self.seq.is_none() {
             events.len().saturating_sub(FIRST_LOOK)
         } else {
             0
@@ -895,16 +970,16 @@ impl CoreRouterUi {
                 text(e, "event").as_str(),
                 "lost" | "status" | "refused" | "error"
             );
-            self.push_log(LogLine {
+            app.push_log(LogLine {
                 ok: !bad,
                 command: "dhcpv6-client".into(),
                 message: format!("{}: {}", text(e, "interface"), text(e, "message")),
             });
         }
-        self.v6.seq = Some(last);
+        self.seq = Some(last);
     }
 
-    pub(crate) fn ipv6_pools(&mut self, ui: &mut Ui) {
+    fn ipv6_pools(&mut self, ui: &mut Ui) {
         const POOL_COLUMNS: [table::Column; 6] = [
             col(""),
             col("Name"),
@@ -913,9 +988,7 @@ impl CoreRouterUi {
             col("Expires After"),
             col("Used By"),
         ];
-        let rows: Vec<Row> = self
-            .v6
-            .pools
+        let rows: Vec<Row> = self.pools
             .iter()
             .map(|p| {
                 let used: Vec<String> = p
@@ -953,22 +1026,22 @@ impl CoreRouterUi {
             ui,
             POOL_TABLE,
             0.0,
-            &mut self.tables.pool6,
+            &mut self.pool_table,
             &POOL_COLUMNS,
             &rows,
             |_, _| {},
         );
     }
 
-    pub(crate) fn ipv6_settings(&mut self, ui: &mut Ui) {
-        let s = self.v6.settings.clone();
-        let can = self.can();
+    fn ipv6_settings(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let s = self.settings.clone();
+        let can = app.can();
         let mut mode = text(&s, "accept_router_advertisements");
         let mut on = text(&s, "accept_router_advertisements_on");
         let (mode0, on0) = (mode.clone(), on.clone());
         let mut lists = vec!["all".to_owned(), "none".to_owned()];
         lists.extend(
-            self.fw
+            app.fw
                 .rows(crate::firewall::Feed::Lists)
                 .iter()
                 .map(|l| text(l, "name")),
@@ -1003,13 +1076,13 @@ impl CoreRouterUi {
         .on_disabled_hover_text(enabled.err().unwrap_or_default());
         ui.weak("auto: only where a DHCPv6 client runs (the WAN); never on the LAN.");
         if mode != mode0 && !mode0.is_empty() {
-            self.run(
+            app.run(
                 "ipv6.settings.set",
                 json!({"accept_router_advertisements": mode}),
             );
         }
         if on != on0 && !on0.is_empty() {
-            self.run(
+            app.run(
                 "ipv6.settings.set",
                 json!({"accept_router_advertisements_on": on}),
             );
@@ -1033,7 +1106,7 @@ impl CoreRouterUi {
             ui,
             RA_TABLE,
             0.0,
-            &mut self.tables.ra6,
+            &mut self.ra_table,
             &RA_COLUMNS,
             &rows,
             |_, _| {},

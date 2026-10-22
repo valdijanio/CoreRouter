@@ -195,9 +195,13 @@ fn netns_run(root: &Path) -> Outcome {
         return Outcome::Skip(why);
     }
     let cargo = cargo_bin();
+    let tests = match netns_tests(root) {
+        Ok(t) => t,
+        Err(e) => return Outcome::Fail(e),
+    };
     // One fresh namespace per test binary: each one's guard requires a
     // namespace holding only `lo`.
-    for (package, test) in NETNS_TESTS {
+    for (package, test) in &tests {
         let mut c = Command::new("unshare");
         // Not `--quiet`: one line per test, so a CI log shows which ones ran.
         c.args(UNSHARE)
@@ -211,30 +215,47 @@ fn netns_run(root: &Path) -> Outcome {
     Outcome::Ok
 }
 
-/// Integration tests that need a kernel: (package, `tests/<name>.rs`).
-const NETNS_TESTS: &[(&str, &str)] = &[
-    ("corerouter-hal-linux", "netns"),
-    // G5.2: LLDP over AF_PACKET and MNDP over UDP between veth peers.
-    ("corerouter-hal-linux", "netns_l2"),
-    // G2.1: the firewall ruleset through `nft`, atomic replace, dynamic entries.
-    ("corerouter-hal-linux", "netns_nft"),
-    // G6.2: host ICMP (ping and raw sockets) through a veth and a router.
-    ("corerouter-hal-linux", "netns_icmp"),
-    // G1.19: ethtool netlink and link counters of a veth pair.
-    ("corerouter-hal-linux", "netns_nic"),
-    // G5.1: two daemons find each other with CRDP.
-    ("corerouter-daemon", "netns"),
-    // G5.2: two linux-backend daemons list each other as LLDP; MNDP is read.
-    ("corerouter-daemon", "netns_l2"),
-    // G1.18: a linux-backend daemon sees its namespace, owns only its links.
-    ("corerouter-daemon", "netns_linux"),
-    // G4.7a: the DHCP client of a linux-backend daemon against a test server.
-    ("corerouter-daemon", "netns_dhcp"),
-    // G4.7b: DHCPv6 address + prefix delegation, accept_ra and RA flush.
-    ("corerouter-daemon", "netns_dhcp6"),
-    // G5.4: a router on this machine heard on a new link is local.
-    ("corerouter-discovery", "netns_local"),
-];
+/// Integration tests that need a kernel: every `tests/netns*.rs` of every
+/// workspace package, as (package, test), sorted. Found, not listed: a new
+/// netns test needs no edit here (the list was a merge-conflict hot spot).
+fn netns_tests(root: &Path) -> Result<Vec<(String, String)>, String> {
+    let out = cargo()
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .current_dir(root)
+        .output()
+        .map_err(|e| format!("cargo metadata: {e}"))?;
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).into_owned());
+    }
+    let json: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("cargo metadata: {e}"))?;
+    let mut found = Vec::new();
+    let packages = json.get("packages").and_then(serde_json::Value::as_array);
+    for p in packages.into_iter().flatten() {
+        let name = p.get("name").and_then(serde_json::Value::as_str);
+        let manifest = p.get("manifest_path").and_then(serde_json::Value::as_str);
+        let (Some(name), Some(manifest)) = (name, manifest) else {
+            continue;
+        };
+        let Some(dir) = Path::new(manifest).parent() else {
+            continue;
+        };
+        let Ok(entries) = std::fs::read_dir(dir.join("tests")) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let file = e.file_name();
+            let Some(stem) = file.to_str().and_then(|f| f.strip_suffix(".rs")) else {
+                continue;
+            };
+            if stem.starts_with("netns") && e.path().is_file() {
+                found.push((name.to_owned(), stem.to_owned()));
+            }
+        }
+    }
+    found.sort();
+    Ok(found)
+}
 
 fn layers_step(root: &Path) -> Outcome {
     let out = match cargo()
@@ -296,4 +317,29 @@ fn wasm(root: &Path) -> Outcome {
         c.args(["-p", p]);
     }
     run(c, root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn netns_tests_are_found_not_listed() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let found = netns_tests(&root).unwrap();
+        for want in [
+            ("corerouter-hal-linux", "netns"),
+            ("corerouter-daemon", "netns_dhcp"),
+            ("corerouter-discovery", "netns_local"),
+        ] {
+            assert!(
+                found.iter().any(|(p, t)| p == want.0 && t == want.1),
+                "{want:?} missing from {found:?}"
+            );
+        }
+        let mut sorted = found.clone();
+        sorted.sort();
+        assert_eq!(found, sorted);
+        assert!(found.iter().all(|(_, t)| t.starts_with("netns")));
+    }
 }

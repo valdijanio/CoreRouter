@@ -5,29 +5,11 @@
 //! business logic lives here. This crate depends on `egui` only — the window
 //! (eframe/winit/wgpu) belongs to `apps/corerouter-gui`.
 
-mod avail;
 pub mod backend;
 pub mod connect;
-mod dhcp_client;
-mod dialog;
-mod ethernet_tab;
-mod firewall;
-mod firewall_assist;
-mod first_login;
-mod float;
-mod iface_tabs;
-mod interfaces;
-mod ipv6;
-mod lockout;
-mod mtr;
-mod neighbors;
-mod ping;
-mod prefs;
-mod routes;
-mod table;
-mod terminal;
-mod vrf;
-mod windows;
+// Every other `src/*.rs` is a module, and the ones defining `PANEL` are
+// panels: `build.rs` lists them, so a new window is just a new file.
+include!(concat!(env!("OUT_DIR"), "/ui_modules.rs"));
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -77,14 +59,8 @@ enum Field {
     Fw(firewall::Feed),
     /// `auth.whoami`: the logged-in user and group (G0.3), top bar.
     Whoami,
-    /// `ip.dhcp-client.list` (G4.7), while its window or a dialog is open.
-    DhcpClients,
-    /// `ip.dhcp-client.options` of a dialog showing its Options tab.
-    DhcpOptions,
-    /// `ip.dhcp-client.history`: new events go to the Log.
-    DhcpHistory,
-    /// The IPv6 menu's queries (G4.7b).
-    V6(ipv6::Feed),
+    /// A panel's query: (panel, key), see `panel.rs`.
+    Panel(&'static str, &'static str),
 }
 
 /// Cached query results, refreshed every `REFRESH_SECS` or after an action.
@@ -103,11 +79,6 @@ struct Cache {
     whoami: Value,
     neighbors: Vec<Value>,
     discovery: Value,
-    dhcp_clients: Vec<Value>,
-    /// `ip.dhcp-client.options` replies by client id.
-    dhcp_options: BTreeMap<String, Value>,
-    /// Last DHCP history event logged (`None` before the first look).
-    dhcp_seq: Option<u64>,
     refreshed_at: Option<f64>,
     /// Newest reply applied per field: an older one arriving late is dropped.
     applied: BTreeMap<Field, RequestId>,
@@ -142,16 +113,12 @@ struct Tables {
     fw_addr: table::TableState,
     if_members: table::TableState,
     if_lists: table::TableState,
-    dhcp: table::TableState,
-    dhcp6: table::TableState,
-    pool6: table::TableState,
-    ra6: table::TableState,
 }
 
 impl Tables {
     /// Every table with the salt it is drawn with (stored preferences name
     /// tables by salt).
-    fn each(&mut self) -> [(&'static str, &mut table::TableState); 14] {
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 10] {
         [
             (interfaces::TABLE, &mut self.interfaces),
             ("addresses", &mut self.addresses),
@@ -163,10 +130,6 @@ impl Tables {
             (firewall::Feed::Addr.salt(), &mut self.fw_addr),
             (firewall::Feed::Members.salt(), &mut self.if_members),
             (firewall::Feed::Lists.salt(), &mut self.if_lists),
-            (dhcp_client::TABLE, &mut self.dhcp),
-            (ipv6::TABLE, &mut self.dhcp6),
-            (ipv6::POOL_TABLE, &mut self.pool6),
-            (ipv6::RA_TABLE, &mut self.ra6),
         ]
     }
 
@@ -183,10 +146,6 @@ impl Tables {
             (firewall::Feed::Addr.salt(), &self.fw_addr),
             (firewall::Feed::Members.salt(), &self.if_members),
             (firewall::Feed::Lists.salt(), &self.if_lists),
-            (dhcp_client::TABLE, &self.dhcp),
-            (ipv6::TABLE, &self.dhcp6),
-            (ipv6::POOL_TABLE, &self.pool6),
-            (ipv6::RA_TABLE, &self.ra6),
         ]
         .into_iter()
         .filter(|(_, t)| t.inline_comments)
@@ -247,13 +206,10 @@ pub(crate) enum Then {
         id: u64,
         effect: firewall::Effect,
     },
-    Dhcp {
-        id: u64,
-        effect: dhcp_client::Effect,
-    },
-    Dhcp6 {
-        id: u64,
-        effect: ipv6::Effect,
+    /// A panel's command: its own value comes back to it (`panel.rs`).
+    Panel {
+        panel: &'static str,
+        then: panel::PanelThen,
     },
     /// The first-login "Set a password" dialog's `user.set` (G0.3b).
     Password,
@@ -293,12 +249,8 @@ pub struct CoreRouterUi {
     open_vrf_after: Vec<(RequestId, String)>,
     /// Firewall and interface-list windows (G2.1).
     fw: firewall::State,
-    /// "New DHCP Client" / "DHCP Client <iface>" / Comment windows (G4.7).
-    dhcp_dialogs: Vec<dhcp_client::DhcpDialogWin>,
-    /// DHCP clients to open once an `ip.dhcp-client.list` after this id arrives.
-    open_dhcp_after: Vec<(RequestId, String)>,
-    /// The IPv6 windows' data and dialogs (G4.7b).
-    v6: ipv6::State,
+    /// The panels' state, in `PANELS` order (`None` while one is at work).
+    panels: Vec<Option<Box<dyn panel::PanelState>>>,
     /// What the router can run now (rebuilt when `engine.list`,
     /// `server.info` or the link change); every action asks it.
     can: Arc<avail::Avail>,
@@ -356,9 +308,7 @@ impl CoreRouterUi {
             vrf_dialogs: Vec::new(),
             open_vrf_after: Vec::new(),
             fw: firewall::State::default(),
-            dhcp_dialogs: Vec::new(),
-            open_dhcp_after: Vec::new(),
-            v6: ipv6::State::default(),
+            panels: PANELS.iter().map(|p| Some((p.new)())).collect(),
             can,
             ping: ping::PingWin::default(),
             mtr: mtr::MtrWin::default(),
@@ -380,7 +330,7 @@ impl CoreRouterUi {
     }
 
     pub fn open_all(&mut self) {
-        self.open.extend(Win::ALL.iter().copied());
+        self.open.extend(Win::all());
     }
 
     pub fn log(&self) -> &[LogLine] {
@@ -584,23 +534,9 @@ impl CoreRouterUi {
                 self.fw_arrived(firewall::Feed::Zones, id, vec![value]);
             }
             Field::Fw(feed) => self.fw_arrived(feed, id, arr(value)),
-            Field::DhcpClients => {
-                self.cache.dhcp_clients = arr(value);
-                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_dhcp_after)
-                    .into_iter()
-                    .partition(|(req, _)| *req <= id);
-                self.open_dhcp_after = later;
-                for (_, c) in ready {
-                    self.open_dhcp(&c);
-                }
+            Field::Panel(name, key) => {
+                self.with_panel(name, |p, app| p.arrived(app, key, id, value));
             }
-            Field::DhcpOptions => {
-                if let Some(c) = value.get("id").and_then(Value::as_str) {
-                    self.cache.dhcp_options.insert(c.to_owned(), value.clone());
-                }
-            }
-            Field::DhcpHistory => self.dhcp_history_arrived(&value),
-            Field::V6(feed) => self.v6_arrived(feed, id, value),
         }
     }
 
@@ -627,8 +563,9 @@ impl CoreRouterUi {
             Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
             Then::Vrf { id, effect } => self.vrf_dialog_reply(id, effect, result),
             Then::Fw { id, effect } => self.fw_dialog_reply(id, effect, result),
-            Then::Dhcp { id, effect } => self.dhcp_dialog_reply(id, effect, result),
-            Then::Dhcp6 { id, effect } => self.dhcp6_dialog_reply(id, effect, result),
+            Then::Panel { panel, then } => {
+                self.with_panel(panel, |p, app| p.reply(app, then, result));
+            }
             Then::Tool(req) => self.tool_started(req, result),
             Then::Password => self.password_reply(result),
         }
@@ -749,54 +686,12 @@ impl CoreRouterUi {
                 ask(self, Field::Fw(feed), "engine.execute", exec(feed.query()));
             }
         }
-        if self.open.contains(&Win::DhcpClient) || !self.dhcp_dialogs.is_empty() {
+        for (panel, q) in self.panel_queries() {
             ask(
                 self,
-                Field::DhcpClients,
+                Field::Panel(panel, q.key),
                 "engine.execute",
-                exec("ip.dhcp-client.list"),
-            );
-        }
-        let options: Vec<String> = self
-            .dhcp_dialogs
-            .iter()
-            .filter_map(|d| d.dialog.options_of().map(str::to_owned))
-            .collect();
-        for c in options {
-            ask(
-                self,
-                Field::DhcpOptions,
-                "engine.execute",
-                json!({"command": "ip.dhcp-client.options", "params": {"id": c}}),
-            );
-        }
-        // Only a router known to have it (an older daemon has not).
-        let history = self
-            .cache
-            .commands
-            .iter()
-            .any(|c| c.get("id").and_then(Value::as_str) == Some("ip.dhcp-client.history"));
-        if history && self.can.check("ip.dhcp-client.history").is_ok() {
-            let after = self.cache.dhcp_seq.unwrap_or(0);
-            ask(
-                self,
-                Field::DhcpHistory,
-                "engine.execute",
-                json!({"command": "ip.dhcp-client.history", "params": {"after_seq": after}}),
-            );
-        }
-        let history6 = self
-            .cache
-            .commands
-            .iter()
-            .any(|c| c.get("id").and_then(Value::as_str) == Some("ipv6.dhcp-client.history"))
-            && self.can.check("ipv6.dhcp-client.history").is_ok();
-        for (feed, command, params) in self.v6_queries(history6) {
-            ask(
-                self,
-                Field::V6(feed),
-                "engine.execute",
-                json!({"command": command, "params": params}),
+                json!({"command": q.command, "params": q.params}),
             );
         }
         if self.open.contains(&Win::Neighbors) {
@@ -860,7 +755,7 @@ impl CoreRouterUi {
 
         let ctx = ui.ctx().clone();
         let mut floats = std::mem::take(&mut self.floats);
-        for win in Win::ALL {
+        for win in &Win::all() {
             if !self.open.contains(win) {
                 continue;
             }
@@ -918,8 +813,7 @@ impl CoreRouterUi {
         self.route_dialogs(&ctx, area);
         self.vrf_dialogs(&ctx, area);
         self.fw_dialogs(&ctx, area);
-        self.dhcp_dialogs(&ctx, area);
-        self.dhcp6_dialogs(&ctx, area);
+        self.panel_dialogs(&ctx, area);
         self.terminals(&ctx, area);
         self.password_window(&ctx);
         self.lockout_window(&ctx);
@@ -1157,12 +1051,12 @@ impl CoreRouterUi {
             {
                 self.new_terminal();
             }
-            for (group, items) in windows::MENU {
-                match items {
-                    [only] if only.title() == *group => self.menu_item(ui, *only),
+            for (group, items) in windows::menu() {
+                match items.as_slice() {
+                    [only] if only.title() == group => self.menu_item(ui, *only),
                     _ => {
-                        ui.collapsing(*group, |ui| {
-                            for w in *items {
+                        ui.collapsing(group, |ui| {
+                            for w in &items {
                                 self.menu_item(ui, *w);
                             }
                         });
@@ -1202,10 +1096,14 @@ impl CoreRouterUi {
             Win::Routes => &mut self.tables.routes,
             Win::Vrf => &mut self.tables.vrfs,
             Win::Neighbors => &mut self.tables.neighbors,
-            Win::DhcpClient => &mut self.tables.dhcp,
-            Win::Dhcp6Client => &mut self.tables.dhcp6,
-            Win::Ipv6Pool => &mut self.tables.pool6,
-            Win::Ipv6Settings => &mut self.tables.ra6,
+            Win::Panel(id) => {
+                let Some((p, _)) = panel::find(id) else {
+                    return false;
+                };
+                return self
+                    .with_panel(p.name, |s, _| s.escape(id))
+                    .unwrap_or(false);
+            }
             Win::Firewall => match self.fw.tab {
                 firewall::Tab::Filter => &mut self.tables.fw_filter,
                 firewall::Tab::Nat => &mut self.tables.fw_nat,
@@ -1369,7 +1267,7 @@ mod tests {
             ctx.run_ui(egui::RawInput::default(), |ui| app.ui(ui))
                 .drop_without_applying_deltas();
         }
-        assert_eq!(app.open.len(), Win::ALL.len());
+        assert_eq!(app.open.len(), Win::all().len());
     }
 
     #[test]
@@ -1786,13 +1684,9 @@ mod tests {
         }
     }
 
-    mod dialog_keys;
-    mod ethernet_tab;
-    mod firewall;
-    mod firewall_assist;
-    mod hierarchy;
-    mod terminal;
-    mod tools_ping;
+    // Every `src/tests/*.rs` (build.rs): a feature's UI tests go in a file of
+    // their own there, not at the end of this module.
+    include!(concat!(env!("OUT_DIR"), "/ui_tests.rs"));
 
     #[test]
     fn rows_select_with_click_ctrl_shift_and_keys() {
@@ -2652,13 +2546,8 @@ mod tests {
                 }
                 "engine.execute"
                     if command.ends_with(".list")
-                        || [
-                            "config.history",
-                            "config.diff",
-                            "ip.dhcp-client.history",
-                            "ipv6.dhcp-client.history",
-                        ]
-                        .contains(&command.as_str()) =>
+                        || command.ends_with(".history")
+                        || command == "config.diff" =>
                 {
                     Ok(json!([]))
                 }
@@ -2934,98 +2823,6 @@ mod tests {
     fn bytes_are_human() {
         assert_eq!(human_bytes(10), "10 B");
         assert_eq!(human_bytes(1536), "1.5 KiB");
-    }
-
-    #[test]
-    fn dhcp_client_window_lists_opens_and_adds() {
-        let mut s = Session::virtual_lab();
-        s.tick(1_000);
-        s.execute("ip.dhcp-client.add", &json!({"interface": "ether1"}))
-            .unwrap();
-        s.dhcp_service(0);
-        s.dhcp_service(1_000);
-        let mut h = Harness::with_session(s);
-        h.app.open.clear();
-        h.app.open(Win::DhcpClient);
-        h.app.cache.refreshed_at = None;
-        h.idle();
-        h.idle();
-        assert!(h.has_text("bound"), "status column");
-        let lease = lock(&h.session)
-            .execute("ip.dhcp-client.list", &Value::Null)
-            .unwrap()[0]["address"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        assert!(h.has_text(&lease), "IP Address column");
-
-        let row = h
-            .ctx
-            .read_response(table::row_id(dhcp_client::TABLE, "*1"))
-            .expect("row drawn")
-            .rect
-            .center();
-        h.right_click(row);
-        h.click(h.text("Properties…"));
-        assert!(h.has_text("DHCP Client <ether1>"));
-        let set_tab = |h: &mut Harness, tab: dhcp_client::Tab| {
-            if let Some(dhcp_client::DhcpDialog::Props { tab: t, .. }) =
-                h.app.dhcp_dialogs.first_mut().map(|d| &mut d.dialog)
-            {
-                *t = tab;
-            }
-            h.app.cache.refreshed_at = None;
-            for _ in 0..3 {
-                h.idle();
-            }
-        };
-        set_tab(&mut h, dhcp_client::Tab::Status);
-        assert!(h.has_text("100.64.1.1"), "gateway on the Status tab");
-        set_tab(&mut h, dhcp_client::Tab::Options);
-        assert!(h.has_text("classless-static-route"), "Options tab");
-        h.click(h.text("Renew"));
-        assert!(
-            h.app
-                .log()
-                .iter()
-                .any(|l| l.ok && l.command == "ip.dhcp-client.renew"),
-            "{:?}",
-            h.app.log()
-        );
-        h.click(h.text("Cancel"));
-        assert!(h.app.dhcp_dialogs.is_empty());
-
-        // New: the first interface without a client is picked; OK adds it.
-        let add = h
-            .ctx
-            .read_response(table::tool_id(dhcp_client::TABLE, table::Icon::Add))
-            .expect("add tool")
-            .rect
-            .center();
-        h.click(add);
-        for _ in 0..6 {
-            h.idle();
-        }
-        assert!(
-            h.has_text("New DHCP Client"),
-            "{} dialogs, log {:?}",
-            h.app.dhcp_dialogs.len(),
-            h.app.log()
-        );
-        h.click(h.text("OK"));
-        let list = lock(&h.session)
-            .execute("ip.dhcp-client.list", &Value::Null)
-            .unwrap();
-        assert_eq!(list[1]["interface"], "ether2", "{list}");
-        // The history reached the Log.
-        assert!(
-            h.app
-                .log()
-                .iter()
-                .any(|l| l.command == "dhcp-client" && l.message.starts_with("ether1: got")),
-            "{:?}",
-            h.app.log()
-        );
     }
 
     impl Harness {

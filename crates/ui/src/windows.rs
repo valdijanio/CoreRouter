@@ -11,10 +11,6 @@ pub enum Win {
     Interfaces,
     InterfaceList,
     Addresses,
-    DhcpClient,
-    Dhcp6Client,
-    Ipv6Pool,
-    Ipv6Settings,
     Neighbors,
     Routes,
     Vrf,
@@ -30,16 +26,21 @@ pub enum Win {
     Ping,
     Mtr,
     Log,
+    /// A panel's window, by its `WinDef::id` (`panel.rs`): new windows are
+    /// panels, so this enum and the menu below need no edit.
+    Panel(&'static str),
 }
 
-/// Side menu: (group, items). A group with one item of the same name is a leaf.
+/// Side menu groups, in order, with their built-in windows. A group with one
+/// item of the same name is a leaf. Panels add their windows to their group;
+/// inside a group the items are alphabetical (as in WinBox), so a new one
+/// has no place to fight over.
 pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("Interfaces", &[Win::Interfaces, Win::InterfaceList]),
     (
         "IP",
         &[
             Win::Addresses,
-            Win::DhcpClient,
             Win::Neighbors,
             Win::Routes,
             Win::Vrf,
@@ -48,10 +49,7 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
             Win::Dhcp,
         ],
     ),
-    (
-        "IPv6",
-        &[Win::Dhcp6Client, Win::Ipv6Pool, Win::Ipv6Settings],
-    ),
+    ("IPv6", &[]),
     ("Routing", &[Win::Bgp, Win::Ospf]),
     ("MPLS", &[Win::Mpls]),
     ("CGNAT", &[Win::Cgnat]),
@@ -60,15 +58,32 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("Log", &[Win::Log]),
 ];
 
+/// The side menu as drawn: every group with its built-in and panel windows,
+/// alphabetical; empty groups are left out.
+pub(crate) fn menu() -> Vec<(&'static str, Vec<Win>)> {
+    MENU.iter()
+        .map(|(group, built_in)| {
+            let mut items: Vec<Win> = built_in.to_vec();
+            items.extend(
+                crate::panel::all()
+                    .iter()
+                    .flat_map(|p| p.windows)
+                    .filter(|w| w.group == *group)
+                    .map(|w| Win::Panel(w.id)),
+            );
+            items.sort_by_key(|w| w.title().to_lowercase());
+            (*group, items)
+        })
+        .filter(|(_, items)| !items.is_empty())
+        .collect()
+}
+
 impl Win {
-    pub const ALL: &'static [Win] = &[
+    /// The built-in windows (panels' come from `panel::all`).
+    const BUILT_IN: &'static [Win] = &[
         Win::Interfaces,
         Win::InterfaceList,
         Win::Addresses,
-        Win::DhcpClient,
-        Win::Dhcp6Client,
-        Win::Ipv6Pool,
-        Win::Ipv6Settings,
         Win::Neighbors,
         Win::Routes,
         Win::Vrf,
@@ -86,15 +101,24 @@ impl Win {
         Win::Log,
     ];
 
+    /// Every window: the built-in ones, then the panels'.
+    pub fn all() -> Vec<Win> {
+        let mut out = Self::BUILT_IN.to_vec();
+        out.extend(
+            crate::panel::all()
+                .iter()
+                .flat_map(|p| p.windows)
+                .map(|w| Win::Panel(w.id)),
+        );
+        out
+    }
+
     pub fn title(self) -> &'static str {
         match self {
             Win::Interfaces => "Interfaces",
             Win::InterfaceList => "Interface List",
             Win::Addresses => "Addresses",
-            Win::DhcpClient => "DHCP Client",
-            Win::Dhcp6Client => "DHCPv6 Client",
-            Win::Ipv6Pool => "IPv6 Pool",
-            Win::Ipv6Settings => "IPv6 Settings",
+            Win::Panel(id) => crate::panel::find(id).map_or(id, |(_, w)| w.title),
             Win::Neighbors => "Neighbors",
             Win::Routes => "Routes",
             Win::Vrf => "VRF",
@@ -127,6 +151,9 @@ impl Win {
 
     /// List windows close on Esc (after clearing find text and selection).
     pub(crate) fn closes_on_escape(self) -> bool {
+        if let Win::Panel(id) = self {
+            return crate::panel::find(id).is_some_and(|(_, w)| w.escape);
+        }
         matches!(
             self,
             Win::Interfaces
@@ -136,9 +163,6 @@ impl Win {
                 | Win::InterfaceList
                 | Win::Vrf
                 | Win::Neighbors
-                | Win::DhcpClient
-                | Win::Dhcp6Client
-                | Win::Ipv6Pool
                 | Win::History
                 | Win::Log
         )
@@ -151,10 +175,7 @@ impl Win {
             Win::Addresses => [760.0, 300.0],
             Win::Log => [640.0, 260.0],
             Win::Routes => [700.0, 320.0],
-            Win::DhcpClient => [760.0, 260.0],
-            Win::Dhcp6Client => [860.0, 260.0],
-            Win::Ipv6Pool => [760.0, 220.0],
-            Win::Ipv6Settings => [620.0, 340.0],
+            Win::Panel(id) => crate::panel::find(id).map_or([380.0, 200.0], |(_, w)| w.size),
             Win::Vrf => [600.0, 260.0],
             Win::Firewall => [980.0, 420.0],
             Win::InterfaceList => [520.0, 280.0],
@@ -177,10 +198,11 @@ impl CoreRouterUi {
             Win::Addresses => self.addresses(ui),
             Win::Neighbors => self.neighbors(ui),
             Win::Routes => self.routes(ui),
-            Win::DhcpClient => self.dhcp_clients(ui),
-            Win::Dhcp6Client => self.dhcp6_clients(ui),
-            Win::Ipv6Pool => self.ipv6_pools(ui),
-            Win::Ipv6Settings => self.ipv6_settings(ui),
+            Win::Panel(id) => {
+                if let Some((p, _)) = crate::panel::find(id) {
+                    self.with_panel(p.name, |s, app| s.window(app, id, ui));
+                }
+            }
             Win::Vrf => self.vrfs(ui),
             Win::Firewall => self.firewall(ui),
             Win::InterfaceList => self.interface_lists(ui),

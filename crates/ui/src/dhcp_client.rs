@@ -6,15 +6,138 @@
 //! Status, lease and routes come from `ip.dhcp-client.list` / `.options`;
 //! the engine decides them. Every change goes through `CoreRouterUi::run`.
 //! The clients' history (`ip.dhcp-client.history`) feeds the Log window.
+//!
+//! A panel (`panel.rs`): its state lives here, not in `CoreRouterUi`.
+
+use std::collections::BTreeMap;
 
 use egui::{Grid, RichText, ScrollArea, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
 use crate::avail::Avail;
+use crate::backend::RequestId;
 use crate::dialog::{self, Footer, Form, Head, Press, Status};
 use crate::interfaces::{cascade, dialog_id};
-use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment};
-use crate::{CoreRouterUi, LogLine, Then, Win, form_number, value_text};
+use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
+use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
+use crate::{CoreRouterUi, LogLine, Win, form_number, value_text};
+
+const NAME: &str = "dhcp-client";
+/// The window's id (`Win::Panel`).
+pub(crate) const WIN: &str = "dhcp-client";
+
+pub(crate) const PANEL: Panel = Panel {
+    name: NAME,
+    windows: &[WinDef {
+        id: WIN,
+        group: "IP",
+        title: "DHCP Client",
+        size: [760.0, 260.0],
+        escape: true,
+    }],
+    new: || Box::new(DhcpPanel::default()),
+};
+
+/// IP › DHCP Client: rows, dialogs and table, kept here.
+#[derive(Default)]
+pub(crate) struct DhcpPanel {
+    /// `ip.dhcp-client.list`, while the window or a dialog is open.
+    clients: Vec<Value>,
+    /// `ip.dhcp-client.options` replies by client id.
+    options: BTreeMap<String, Value>,
+    /// Last history event logged (`None` before the first look).
+    seq: Option<u64>,
+    pub(crate) dialogs: Vec<DhcpDialogWin>,
+    /// Clients to open once a list sent after this request arrives.
+    open_after: Vec<(RequestId, String)>,
+    pub(crate) table: TableState,
+}
+
+/// What a dialog's command changes when it is answered.
+struct Reply {
+    id: u64,
+    effect: Effect,
+}
+
+impl PanelState for DhcpPanel {
+    fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
+        let mut out = Vec::new();
+        if app.open.contains(&crate::Win::Panel(WIN)) || !self.dialogs.is_empty() {
+            out.push(Query {
+                key: "list",
+                command: "ip.dhcp-client.list",
+                params: Value::Null,
+            });
+        }
+        for c in self.dialogs.iter().filter_map(|d| d.dialog.options_of()) {
+            out.push(Query {
+                key: "options",
+                command: "ip.dhcp-client.options",
+                params: json!({ "id": c }),
+            });
+        }
+        // Only a router known to have it (an older daemon has not).
+        if app.has_command("ip.dhcp-client.history") {
+            out.push(Query {
+                key: "history",
+                command: "ip.dhcp-client.history",
+                params: json!({ "after_seq": self.seq.unwrap_or(0) }),
+            });
+        }
+        out
+    }
+
+    fn arrived(&mut self, app: &mut CoreRouterUi, key: &'static str, id: RequestId, value: Value) {
+        match key {
+            "list" => {
+                self.clients = match value {
+                    Value::Array(a) => a,
+                    _ => Vec::new(),
+                };
+                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_after)
+                    .into_iter()
+                    .partition(|(req, _)| *req <= id);
+                self.open_after = later;
+                for (_, c) in ready {
+                    self.open_dhcp(app, &c);
+                }
+            }
+            "options" => {
+                if let Some(c) = value.get("id").and_then(Value::as_str) {
+                    self.options.insert(c.to_owned(), value.clone());
+                }
+            }
+            "history" => self.dhcp_history_arrived(app, &value),
+            _ => {}
+        }
+    }
+
+    fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut egui::Ui) {
+        self.clients_window(app, ui);
+    }
+
+    fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        self.draw_dialogs(app, ctx, area);
+    }
+
+    fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        if let Ok(r) = then.downcast::<Reply>() {
+            self.dhcp_dialog_reply(app, r.id, r.effect, result);
+        }
+    }
+
+    fn escape(&mut self, _win: &'static str) -> bool {
+        self.table.escape()
+    }
+
+    fn tables(&self) -> Vec<(&'static str, &TableState)> {
+        vec![(TABLE, &self.table)]
+    }
+
+    fn tables_mut(&mut self) -> Vec<(&'static str, &mut TableState)> {
+        vec![(TABLE, &mut self.table)]
+    }
+}
 
 pub(crate) const TABLE: &str = "dhcp-client";
 /// Property windows opened at once from one selection.
@@ -314,21 +437,21 @@ fn client_row(r: &Value) -> Row {
     }
 }
 
-impl CoreRouterUi {
+impl DhcpPanel {
     fn dhcp_row(&self, id: &str) -> Option<&Value> {
-        self.cache.dhcp_clients.iter().find(|r| text(r, "id") == id)
+        self.clients.iter().find(|r| text(r, "id") == id)
     }
 
-    pub(crate) fn dhcp_clients(&mut self, ui: &mut Ui) {
-        let clients = self.cache.dhcp_clients.clone();
+    fn clients_window(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let clients = self.clients.clone();
         let rows: Vec<Row> = clients.iter().map(client_row).collect();
-        let selection = self.tables.dhcp.selection(&rows);
+        let selection = self.table.selection(&rows);
         let picked: Vec<&Value> = clients
             .iter()
             .filter(|r| selection.contains(&text(r, "id")))
             .collect();
         let mut act: Option<Act> = None;
-        let can = self.can();
+        let can = app.can();
 
         ui.horizontal(|ui| {
             let add = can.check("ip.dhcp-client.add");
@@ -377,12 +500,12 @@ impl CoreRouterUi {
             if action(ui, "Release", release) {
                 act = Some(Act::Release(selection.clone()));
             }
-            table::find_field(ui, TABLE, &mut self.tables.dhcp);
+            table::find_field(ui, TABLE, &mut self.table);
         });
         ui.separator();
 
-        self.tables.dhcp.open = self
-            .dhcp_dialogs
+        self.table.open = self
+            .dialogs
             .iter()
             .filter_map(|d| match &d.dialog {
                 DhcpDialog::Props { id, .. } => Some(id.clone()),
@@ -393,7 +516,7 @@ impl CoreRouterUi {
             ui,
             TABLE,
             0.0,
-            &mut self.tables.dhcp,
+            &mut self.table,
             &COLUMNS,
             &rows,
             |ui, menu| match menu {
@@ -474,7 +597,7 @@ impl CoreRouterUi {
             act = Some(Act::Comment(vec![key]));
         }
         if let Some(s) = out.shortcut {
-            let sel = self.tables.dhcp.selection(&rows);
+            let sel = self.table.selection(&rows);
             let picked: Vec<&Value> = clients
                 .iter()
                 .filter(|r| sel.contains(&text(r, "id")))
@@ -495,33 +618,33 @@ impl CoreRouterUi {
             }
         }
         if let Some(a) = act {
-            self.dhcp_act(a, &rows);
+            self.dhcp_act(app, a, &rows);
         }
     }
 
-    fn dhcp_act(&mut self, act: Act, rows: &[Row]) {
-        let each = |me: &mut Self, keys: &[String], cmd: &str, extra: Value| {
+    fn dhcp_act(&mut self, app: &mut CoreRouterUi, act: Act, rows: &[Row]) {
+        let each = |app: &mut CoreRouterUi, keys: &[String], cmd: &str, extra: Value| {
             for id in keys {
                 let mut p = json!({ "id": id });
                 if let (Value::Object(o), Value::Object(e)) = (&mut p, &extra) {
                     o.extend(e.clone());
                 }
-                me.run(cmd, p);
+                app.run(cmd, p);
             }
         };
         match act {
             Act::Enable(keys) => each(
-                self,
+                app,
                 &keys,
                 "ip.dhcp-client.set",
                 json!({"disabled": false}),
             ),
             Act::Disable(keys) => {
-                each(self, &keys, "ip.dhcp-client.set", json!({"disabled": true}))
+                each(app, &keys, "ip.dhcp-client.set", json!({"disabled": true}))
             }
-            Act::Remove(keys) => each(self, &keys, "ip.dhcp-client.remove", json!({})),
-            Act::Renew(keys) => each(self, &keys, "ip.dhcp-client.renew", json!({})),
-            Act::Release(keys) => each(self, &keys, "ip.dhcp-client.release", json!({})),
+            Act::Remove(keys) => each(app, &keys, "ip.dhcp-client.remove", json!({})),
+            Act::Renew(keys) => each(app, &keys, "ip.dhcp-client.renew", json!({})),
+            Act::Release(keys) => each(app, &keys, "ip.dhcp-client.release", json!({})),
             Act::Comment(keys) => {
                 let text = match keys.as_slice() {
                     [one] => self
@@ -531,7 +654,7 @@ impl CoreRouterUi {
                     _ => String::new(),
                 };
                 if !keys.is_empty() {
-                    self.open_dhcp_dialog(DhcpDialog::Comment {
+                    self.open_dhcp_dialog(app, DhcpDialog::Comment {
                         targets: keys,
                         base: text.clone(),
                         text,
@@ -540,53 +663,50 @@ impl CoreRouterUi {
             }
             Act::Open(keys) => {
                 for k in keys.iter().take(MAX_OPEN) {
-                    self.open_dhcp(k);
+                    self.open_dhcp(app, k);
                 }
             }
             Act::New => {
                 let mut form = DhcpForm::new();
                 // The first interface without a client, as a start.
-                let taken: Vec<String> = self
-                    .cache
-                    .dhcp_clients
+                let taken: Vec<String> = self.clients
                     .iter()
                     .map(|r| text(r, "interface"))
                     .collect();
-                if let Some(free) = self
-                    .interface_names(None)
+                if let Some(free) = app.interface_names(None)
                     .into_iter()
                     .find(|n| !taken.contains(n) && n != "lo")
                 {
                     form.interface = free;
                 }
-                self.open_dhcp_dialog(DhcpDialog::New {
+                self.open_dhcp_dialog(app, DhcpDialog::New {
                     base: form.clone(),
                     form,
                     tab: Tab::Dhcp,
                 });
             }
-            Act::SelectAll => self.tables.dhcp.select_all(rows),
-            Act::Refresh => self.cache.refreshed_at = None,
+            Act::SelectAll => self.table.select_all(rows),
+            Act::Refresh => app.cache.refreshed_at = None,
         }
     }
 
-    fn open_dhcp_dialog(&mut self, dialog: DhcpDialog) {
-        self.next_dialog = self.next_dialog.wrapping_add(1);
-        self.dhcp_dialogs.push(DhcpDialogWin {
-            id: self.next_dialog,
+    fn open_dhcp_dialog(&mut self, app: &mut CoreRouterUi, dialog: DhcpDialog) {
+        app.next_dialog = app.next_dialog.wrapping_add(1);
+        self.dialogs.push(DhcpDialogWin {
+            id: app.next_dialog,
             dialog,
             status: Status::default(),
         });
-        self.cache.refreshed_at = None;
+        app.cache.refreshed_at = None;
     }
 
     /// "DHCP Client <iface>"; an already open one comes to the front.
-    pub(crate) fn open_dhcp(&mut self, id: &str) {
+    pub(crate) fn open_dhcp(&mut self, app: &mut CoreRouterUi, id: &str) {
         let Some(row) = self.dhcp_row(id).cloned() else {
             return;
         };
         let open = self
-            .dhcp_dialogs
+            .dialogs
             .iter_mut()
             .find(|d| matches!(&d.dialog, DhcpDialog::Props { id: i, .. } if i == id));
         if let Some(d) = open {
@@ -594,7 +714,7 @@ impl CoreRouterUi {
             return;
         }
         let form = DhcpForm::of(&row);
-        self.open_dhcp_dialog(DhcpDialog::Props {
+        self.open_dhcp_dialog(app, DhcpDialog::Props {
             id: id.to_owned(),
             base: form.clone(),
             form,
@@ -603,20 +723,20 @@ impl CoreRouterUi {
     }
 
     /// Draw every open DHCP client dialog.
-    pub(crate) fn dhcp_dialogs(&mut self, ctx: &egui::Context, area: egui::Rect) {
-        let clients = self.cache.dhcp_clients.clone();
-        let names = self.interface_names(None);
+    fn draw_dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        let clients = self.clients.clone();
+        let names = app.interface_names(None);
         let mut tables = vec![String::new(), "main".to_owned()];
-        tables.extend(self.interface_names(Some("vrf")));
-        let mut dialogs = std::mem::take(&mut self.dhcp_dialogs);
+        tables.extend(app.interface_names(Some("vrf")));
+        let mut dialogs = std::mem::take(&mut self.dialogs);
         dialogs.retain_mut(|d| {
             let wid = dialog_id(d.id);
             let row = match &d.dialog {
                 DhcpDialog::Props { id, .. } => {
                     let row = clients.iter().find(|r| text(r, "id") == *id);
                     // A window whose client is gone closes itself.
-                    if row.is_none() && !self.cache.dhcp_clients.is_empty() {
-                        self.floats.forget(wid);
+                    if row.is_none() && !self.clients.is_empty() {
+                        app.floats.forget(wid);
                         return false;
                     }
                     row.cloned()
@@ -644,20 +764,20 @@ impl CoreRouterUi {
                     many => format!("Comment for {} DHCP Clients", many.len()),
                 },
             };
-            let can = self.can();
+            let can = app.can();
             let head = Head {
                 id: wid,
                 title: &title,
                 dirty: d.dialog.dirty(),
                 pos: cascade(area, d.id),
-                parent: Some(crate::win_id(Win::DhcpClient)),
+                parent: Some(crate::win_id(Win::Panel(WIN))),
             };
             let options = row
                 .as_ref()
-                .and_then(|r| self.cache.dhcp_options.get(&text(r, "id")))
+                .and_then(|r| self.options.get(&text(r, "id")))
                 .cloned();
             let pressed =
-                dialog::show(&mut self.floats, ctx, area, head, &mut d.status, |ui, f| {
+                dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
                     dialog_body(
                         ui,
                         f,
@@ -669,18 +789,19 @@ impl CoreRouterUi {
                         &can,
                     )
                 });
-            let keep = pressed.is_none_or(|b| self.dhcp_button(d, b, row.as_ref()));
+            let keep = pressed.is_none_or(|b| self.dhcp_button(app, d, b, row.as_ref()));
             if !keep {
-                self.floats.forget(wid);
+                app.floats.forget(wid);
             }
             keep
         });
-        dialogs.append(&mut self.dhcp_dialogs);
-        self.dhcp_dialogs = dialogs;
+        dialogs.append(&mut self.dialogs);
+        self.dialogs = dialogs;
     }
 
     fn dhcp_button(
         &mut self,
+        app: &mut CoreRouterUi,
         d: &mut DhcpDialogWin,
         b: Press<Button>,
         row: Option<&Value>,
@@ -754,23 +875,24 @@ impl CoreRouterUi {
         d.status.close_on_success = close;
         for (cmd, params, effect) in sends {
             d.status.sent();
-            self.run_then(cmd, params, Then::Dhcp { id: d.id, effect });
+            app.run_then(cmd, params, crate::panel::then(NAME, Reply { id: d.id, effect }));
         }
         true
     }
 
     /// A reply to a DHCP dialog's command: an error stays in the dialog.
-    pub(crate) fn dhcp_dialog_reply(
+    fn dhcp_dialog_reply(
         &mut self,
+        app: &mut CoreRouterUi,
         id: u64,
         effect: Effect,
         result: &Result<Value, String>,
     ) {
-        let Some(pos) = self.dhcp_dialogs.iter().position(|d| d.id == id) else {
+        let Some(pos) = self.dialogs.iter().position(|d| d.id == id) else {
             return;
         };
         let mut created = None;
-        let close = match self.dhcp_dialogs.get_mut(pos) {
+        let close = match self.dialogs.get_mut(pos) {
             None => return,
             Some(d) => {
                 let close = d.status.replied(result);
@@ -806,25 +928,25 @@ impl CoreRouterUi {
             }
         };
         if close {
-            self.dhcp_dialogs.remove(pos);
-            self.floats.forget(dialog_id(id));
+            self.dialogs.remove(pos);
+            app.floats.forget(dialog_id(id));
         }
-        self.cache.refreshed_at = None;
+        app.cache.refreshed_at = None;
         if let Some(c) = created {
-            let list = self.reload();
-            self.open_dhcp_after.push((list, c));
+            let list = app.reload();
+            self.open_after.push((list, c));
         }
     }
 
     /// `ip.dhcp-client.history` arrived: new events go to the Log.
-    pub(crate) fn dhcp_history_arrived(&mut self, value: &Value) {
+    fn dhcp_history_arrived(&mut self, app: &mut CoreRouterUi, value: &Value) {
         let last = value.get("last_seq").and_then(Value::as_u64).unwrap_or(0);
         let events = value
             .get("events")
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        let first_look = self.cache.dhcp_seq.is_none();
+        let first_look = self.seq.is_none();
         let skip = if first_look {
             events.len().saturating_sub(FIRST_LOOK)
         } else {
@@ -836,14 +958,14 @@ impl CoreRouterUi {
                 kind.as_str(),
                 "lost" | "nak" | "refused" | "declined" | "error"
             );
-            self.push_log(LogLine {
+            app.push_log(LogLine {
                 ok: !bad,
                 command: "dhcp-client".into(),
                 message: format!("{}: {}", text(e, "interface"), text(e, "message")),
             });
         }
         // A restarted daemon counts from 0 again.
-        self.cache.dhcp_seq = Some(last);
+        self.seq = Some(last);
     }
 }
 

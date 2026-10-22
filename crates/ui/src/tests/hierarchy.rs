@@ -5,6 +5,7 @@
 //! children, and Ctrl+Tab goes through the windows.
 
 use super::*;
+use crate::dhcp_client::{DhcpPanel, WIN as DHCP};
 use crate::firewall::{Edit, Feed};
 use crate::firewall_assist::Wizard;
 use crate::float::{CHILD_STEP, child_offset};
@@ -323,7 +324,7 @@ fn every_dialog_belongs_to_its_list() {
         .execute("ip.dhcp-client.add", &json!({"interface": "ether1"}))
         .unwrap();
     h.app.open.clear();
-    h.app.open(Win::DhcpClient);
+    h.app.open(Win::Panel(DHCP));
     h.app.cache.refreshed_at = None;
     h.idle();
     h.idle();
@@ -333,15 +334,20 @@ fn every_dialog_belongs_to_its_list() {
         .as_str()
         .unwrap()
         .to_owned();
-    h.app.open_dhcp(&id);
-    h.idle();
-    h.app.open_dhcp(&id);
-    h.idle();
-    assert_eq!(h.app.dhcp_dialogs.len(), 1);
-    let win = interfaces::dialog_id(h.app.dhcp_dialogs[0].id);
-    assert_eq!(h.app.floats.parent(win), Some(win_id(Win::DhcpClient)));
+    let open = |h: &mut Harness| {
+        h.app
+            .with_panel_as::<DhcpPanel, _>(|p, app| p.open_dhcp(app, &id))
+            .unwrap();
+        h.idle();
+    };
+    open(&mut h);
+    open(&mut h);
+    let p = h.app.panel_mut::<DhcpPanel>().unwrap();
+    assert_eq!(p.dialogs.len(), 1);
+    let win = interfaces::dialog_id(p.dialogs[0].id);
+    assert!(p.table.open.contains(&id), "its row is marked");
+    assert_eq!(h.app.floats.parent(win), Some(win_id(Win::Panel(DHCP))));
     assert!(h.app.floats.is_flashing(win));
-    assert!(h.app.tables.dhcp.open.contains(&id), "its row is marked");
 }
 
 #[test]
