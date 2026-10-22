@@ -18,7 +18,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G0.3 | Autenticação e TLS no canal de controle | control, daemon | `rustls`, tokens por usuário, grupos read/write/full (como RouterOS); bind não-loopback só com TLS; testes de recusa | 12 h | aberto |
 | G0.4 | GUI como cliente remoto + WebSocket para WASM | ui, control, gui, daemon | Trait de backend na UI (local/remoto); daemon serve WS; GUI web gerencia um roteador real | 14 h | aberto |
 | G0.5 | Fuzzing | engine, control, mcp | `cargo-fuzz` para JSON de config, `read_line_bounded`, `handle_message`; rodada de 10 min sem crash | 6 h | aberto |
-| G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa | 6 h | aberto |
+| G0.6 | Persistência da config | model, engine, daemon | running + histórico em `/config` (escrita atômica, fsync); carregados no boot; corrupção → última revisão boa. Feito: `model::persist` (JSON `format_version` 1), trait `engine::ConfigStorage`, crate `storage-fs` (L4), `corerouter-daemon --config-dir` | 6 h | feito (`stream/G0.6-persistence`) |
 | G0.7 | MCP completo | mcp | resources (`corerouter://state`, `command/{id}`), prompts, completions, progresso/cancelamento, erro `-32003` (motor ocupado) | 10 h | aberto |
 | G0.8 | CLI interativa estilo RouterOS | cli, engine | `/ip address add address=… interface=…` traduzido para comandos; autocompletar a partir do registro | 10 h | aberto |
 
@@ -27,12 +27,12 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | Id | Tarefa | Crates | Critério de aceite | Est. | Status |
 |---|---|---|---|---|---|
 | G1.1 | VLAN, bridge, loopback | model, engine (`cmd/interface.rs`), ui | `interface.vlan.add`, `interface.bridge.add`, `interface.bridge.port.add`, `interface.remove`; validação de dependências; janela na UI. Bonding saiu para G1.8 | 8 h | feito (`stream/G1.1-vlan-bridge`) |
-| G1.2 | `hal-linux` aplica via rtnetlink | hal-linux | links (up/down, MTU), VLAN, bridge, endereços; transação com rollback; testes em network namespace (sem root na CI via `unshare`) | 16 h | aberto |
-| G1.3 | Reconciliação e drift | hal-linux, engine | Lê estado do kernel, `config.drift` lista divergências | 6 h | aberto |
+| G1.2 | `hal-linux` aplica via rtnetlink | hal-linux | links (up/down, MTU), VLAN, bridge, endereços; transação com rollback; testes em network namespace (sem root na CI via `unshare`) | 16 h | feito (`stream/G1.2-netlink`) |
+| G1.3 | Reconciliação e drift | hal-linux, engine | Lê estado do kernel, `config.drift` lista divergências; boot semeia `disabled` do estado do kernel (hoje `Session::new` aplica `disabled=false` e sobe portas descobertas que estavam down) | 6 h | aberto |
 | G1.4 | Safe Mode | engine, ui | `config.commit {confirm_timeout}`; sem `config.confirm` no prazo → rollback automático; botão Safe Mode na barra | 6 h | aberto |
 | G1.5 | Rotas estáticas e VRF | model, engine, hal-linux, ui | `ip.route.add/remove/list`, distance, VRF; tabela de rotas ao vivo na janela Routes | 10 h | aberto |
 | G1.6 | Imagem Buildroot | `os/` (novo) | Imagem x86_64 A/B + squashfs + dm-verity bootando o daemon em QEMU; script de build reprodutível | 20 h | aberto |
-| G1.7 | Estatísticas via netlink | hal-linux | `poll` com stats64 do netlink (substitui sysfs) | 3 h | aberto |
+| G1.7 | Estatísticas via netlink | hal-linux | `poll` e `discover_links` via netlink (substituem sysfs, que mostra o netns de quem montou `/sys`, não o do processo) | 3 h | aberto |
 | G1.8 | Bonding (802.3ad, active-backup) | model, engine (`cmd/interface.rs`), ui | `interface.bonding.add {name, slaves, mode}`; slave não pode ser porta de bridge nem ter endereço; mesmo padrão de dependências do G1.1 | 4 h | aberto |
 | G1.9 | Tabelas estilo WinBox: seleção, menu de contexto, duplo clique | ui | Mecanismo reutilizável em `crates/ui` (`table.rs`): clique/Ctrl/Shift/espaço vazio/Ctrl+A/↑↓ selecionam; Delete, Ctrl+E/D/M, Enter (atalhos do WinBox v3/v4); barra +, −, ✓, ✗, comentário e Find, desabilitados com o motivo; menu do botão direito na linha (Enable/Disable, Remove, Comment…, Properties…, Add VLAN on <if>, Add to Bridge ▸) e no espaço vazio (Add ▸, Select All, Refresh); duplo clique abre "Interface <nome>" (OK/Cancel/Apply/Disable/Remove); diálogos New VLAN/Bridge/Loopback no lugar dos formulários fixos. Interfaces e Addresses usam; tudo via `CoreRouterUi::run`. Testes headless com eventos sintéticos | 6 h | feito (`stream/G1.9-winbox-tables`) |
 
@@ -76,4 +76,6 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 - 2026-10-21 — lista inicial.
 - 2026-10-21 — G0.2 feito: `.github/workflows/ci.yml` (ainda não rodou no GitHub; sem push).
 - 2026-10-21 — G1.1 feito (VLAN, bridge, loopback, `interface.remove`); bonding separado em G1.8.
+- 2026-10-21 — G0.6 feito (persistência: `running.json` + `.prev`, escrita atômica, quarentena).
+- 2026-10-21 — G1.2 feito (rtnetlink: plano puro + executor com rollback, testes em netns); notas novas em G1.3 e G1.7.
 - 2026-10-21 — G1.9 (tabelas estilo WinBox) adicionado e feito.

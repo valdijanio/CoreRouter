@@ -8,9 +8,11 @@ pub mod cmd;
 pub mod error;
 pub mod guard;
 pub mod session;
+pub mod storage;
 pub mod validate;
 
 pub use error::EngineError;
-pub use session::{CommitMode, JournalEntry, Session, Shared, lock, shared};
+pub use session::{CommitMode, JournalEntry, Session, Shared, StorageStatus, lock, shared};
+pub use storage::{ConfigStorage, MemoryStorage, Slot, StorageError};
 
 pub type Result<T> = std::result::Result<T, EngineError>;

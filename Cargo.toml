@@ -24,6 +24,7 @@ corerouter-proto-dhcp = { path = "crates/proto-dhcp" }
 corerouter-engine = { path = "crates/engine" }
 corerouter-control = { path = "crates/control" }
 corerouter-mcp = { path = "crates/mcp" }
+corerouter-storage-fs = { path = "crates/storage-fs" }
 corerouter-ui = { path = "crates/ui" }
 
 # External: heavy crates enter with default-features = false.

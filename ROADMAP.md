@@ -29,6 +29,25 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   porta física e diz o que remover antes (endereço, VLAN filha, porta de bridge). Janela
   Interfaces com coluna Info, remover por linha e formulários VLAN/bridge/loopback/porta. 15
   testes novos no engine + 1 na UI; screenshot conferido. Bonding virou G1.8.
+- 2026-10-21 — G0.6: persistência da config. `model::persist` (de)serializa running + histórico
+  em JSON versionado (`format_version` 1, limite de 64 MiB, invariantes conferidas: revisões
+  crescentes, running = última revisão). Trait `ConfigStorage` no engine (slots current/previous +
+  quarentena) com `MemoryStorage` (GUI, wasm, testes); crate novo `corerouter-storage-fs` (L4):
+  `running.json` / `running.json.prev`, escrita temp + fsync + rename + fsync do diretório, modo
+  0600. `Session::with_storage` restaura o slot legível mais novo, salva após cada commit e expõe
+  `storage` no `state.inspect`; falha ao salvar não desfaz o commit (log + `last_error`).
+  `corerouter-daemon --config-dir <dir>` (padrão `/config` só com `--backend linux`). 24 testes
+  novos (3 proptest). Teste manual: endereço sobreviveu a reinício do daemon.
+
+- 2026-10-21 — G1.2: `LinuxHal::apply` aplica no kernel via `rtnetlink` 0.23 (tokio
+  current-thread encapsulado no `hal-linux`): links up/down e MTU, VLAN 802.1Q, bridge + portas,
+  loopback (`dummy`) e endereços IPv4/IPv6. Plano puro `from` → `to` em ordem segura (11 testes
+  unitários); executor lê o kernel antes de cada passo e, se um falha, desfaz os anteriores.
+  Só toca interfaces do config; não descobre o `lo`; não apaga link de tipo diferente do config.
+  4 testes de integração em network namespace sem root (`cargo xtask netns`, novo passo do
+  `cargo xtask ci`; `skip` onde `unshare` sem root é proibido). Na CI do GitHub o workflow
+  libera user namespaces (`sysctl kernel.apparmor_restrict_unprivileged_userns=0`).
+
 - 2026-10-21 — G1.9: tabelas estilo WinBox em `crates/ui/src/table.rs`, reutilizáveis: seleção
   da linha inteira (clique, Ctrl, Shift, espaço vazio limpa, Ctrl+A, ↑/↓), filtro Find (Ctrl+F),
   atalhos do WinBox v3/v4 conferidos em help.mikrotik.com (Delete, Ctrl+E/D/M; Enter abre),
@@ -44,4 +63,6 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
+- 2026-10-21 — log do G0.6.
+- 2026-10-21 — log do G1.2.
 - 2026-10-21 — log do G1.9.
