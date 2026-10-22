@@ -57,10 +57,16 @@ fn narrow<T: TryFrom<u32>>(key: &str, v: u32) -> Result<T> {
 }
 
 /// A DNS name: 1..=253 characters, labels of 1..=63 letters, digits, `-`
-/// and `_`, not starting or ending with `-`.
+/// and `_`, not starting or ending with `-`, and a last label that is not
+/// all digits (RFC 3696 §2: so a mistyped `192.168.0.` is not a name).
 fn valid_name(s: &str) -> bool {
     let s = s.strip_suffix('.').unwrap_or(s);
+    let numeric_tld = s
+        .rsplit('.')
+        .next()
+        .is_some_and(|tld| tld.bytes().all(|b| b.is_ascii_digit()));
     !s.is_empty()
+        && !numeric_tld
         && s.len() <= MAX_NAME
         && s.split('.').all(|label| {
             !label.is_empty()
@@ -440,6 +446,9 @@ mod tests {
         assert!(!valid_name(&"a".repeat(64)));
         assert!(!valid_name("x-.com"));
         assert!(!valid_name("ex ample.com"));
+        assert!(!valid_name("192.168.0."));
+        assert!(!valid_name("10.1"));
+        assert!(valid_name("host1"));
     }
 
     #[test]

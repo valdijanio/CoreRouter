@@ -488,21 +488,25 @@ impl CoreRouterUi {
             ui.selectable_value(&mut f.tab, Tab::Advanced, "Advanced");
         });
         ui.separator();
+        if f.tab == Tab::General {
+            ui.horizontal(|ui| {
+                ui.label("Address");
+                ui.add(
+                    TextEdit::singleline(&mut f.address)
+                        .id(crate::dialog::field_id(
+                            crate::win_id(crate::Win::Ping),
+                            "address",
+                        ))
+                        .hint_text("8.8.8.8, 1.1.1.1, example.com (comma separated)")
+                        .desired_width(420.0),
+                );
+            });
+        }
         Grid::new("ping-form")
             .num_columns(4)
             .spacing([12.0, 4.0])
             .show(ui, |ui| match f.tab {
                 Tab::General => {
-                    ui.label("Address");
-                    ui.add(
-                        TextEdit::singleline(&mut f.address)
-                            .id(crate::dialog::field_id(
-                                crate::win_id(crate::Win::Ping),
-                                "address",
-                            ))
-                            .hint_text("8.8.8.8, 1.1.1.1, example.com")
-                            .desired_width(280.0),
-                    );
                     ui.label("Count");
                     ui.add(
                         TextEdit::singleline(&mut f.count)
@@ -676,6 +680,8 @@ impl CoreRouterUi {
             .height(180.0)
             .legend(Legend::default())
             .include_y(0.0)
+            .include_x(0.0)
+            .include_x(10.0)
             .y_axis_label("ms")
             .x_axis_label("seq")
             .allow_scroll(false)
@@ -842,12 +848,22 @@ impl CoreRouterUi {
             })
             .collect();
         let labels: Vec<String> = (0..counts.len()).map(label).collect();
+        let n = counts.len();
         Plot::new("ping-histogram")
             .height(140.0)
             .allow_scroll(false)
             .allow_drag(false)
             .allow_zoom(false)
             .include_y(0.0)
+            // One mark per bar, so every bucket is named.
+            .x_grid_spacer(move |_| {
+                (0..n)
+                    .map(|i| egui_plot::GridMark {
+                        value: i as f64,
+                        step_size: 1.0,
+                    })
+                    .collect()
+            })
             .x_axis_formatter(move |mark, _| {
                 labels
                     .get(mark.value.round() as usize)
