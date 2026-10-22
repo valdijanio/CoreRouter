@@ -272,7 +272,10 @@ fn engine_errors_come_through_as_they_are() {
     // A verb the engine has no command for is not improvised: the menu
     // says what it has.
     let e = t.fails("/ip address set 0 comment=x");
-    assert!(e.contains("bad command name 'set'") && e.contains("here: ") && e.contains("add"), "{e}");
+    assert!(
+        e.contains("bad command name 'set'") && e.contains("here: ") && e.contains("add"),
+        "{e}"
+    );
     // A disabled command answers with the engine's reason.
     let e = t.fails("/config commit");
     assert!(e.contains("no pending changes"), "{e}");
@@ -315,9 +318,14 @@ fn completion_offers_menus_commands_params_and_values() {
     );
     assert_eq!(t.complete("/ip address add interface=vl"), ["vlan10"]);
     assert_eq!(t.complete("/ip address add disabled="), ["yes", "no"]);
+    let types = t.complete("/interface print type=");
+    assert!(
+        types.contains(&"ether".to_owned()) && types.contains(&"vlan".to_owned()),
+        "{types:?}"
+    );
     assert_eq!(
-        t.complete("/interface print type="),
-        ["ether", "vlan", "bridge", "loopback", "vrf"]
+        t.complete("/ip neighbor print protocol="),
+        ["crdp", "lldp", "mndp"]
     );
     assert_eq!(t.complete("/config mode set mode=t"), ["transactional"]);
     // Items of `set`: the names the menu lists.

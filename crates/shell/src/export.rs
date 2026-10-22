@@ -82,8 +82,11 @@ fn arg_text(v: &Value) -> String {
     value_text(v)
 }
 
+/// Not configuration: dynamic rows, and rows the router says it does not
+/// manage (`managed=no`: links of the host it leaves alone).
 fn dynamic(row: &Value) -> bool {
-    row.get("dynamic").and_then(Value::as_bool) == Some(true)
+    row.get("managed").and_then(Value::as_bool) == Some(false)
+        || row.get("dynamic").and_then(Value::as_bool) == Some(true)
         || row
             .get("flags")
             .and_then(Value::as_str)
@@ -335,4 +338,33 @@ pub fn script(
         s.push('\n');
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn unmanaged_and_dynamic_rows_are_not_exported() {
+        let reg = Registry::from_list(&json!([
+            {"id": "interface.list", "params": "{} → [{name, type, managed, mtu}]", "kind": "query", "enabled": true},
+            {"id": "interface.set", "params": "{name: string, mtu?: u32} → {name}", "kind": "action", "enabled": true},
+            {"id": "interface.bridge.add", "params": "{name: string} → {name}", "kind": "action", "enabled": true},
+        ]));
+        let mut results = BTreeMap::new();
+        results.insert(
+            "interface.list".to_owned(),
+            json!([
+                {"name": "ether1", "type": "ether", "managed": true, "mtu": 1500},
+                {"name": "docker0", "type": "bridge", "managed": false, "mtu": 1500},
+                {"name": "br1", "type": "bridge", "managed": true, "mtu": 1500, "dynamic": false},
+                {"name": "dyn", "type": "bridge", "dynamic": true},
+            ]),
+        );
+        let s = script(&reg, &[], &results, "t");
+        assert!(s.contains("set name=ether1 mtu=1500"), "{s}");
+        assert!(s.contains("add name=br1"), "{s}");
+        assert!(!s.contains("docker0") && !s.contains("dyn\n"), "{s}");
+    }
 }

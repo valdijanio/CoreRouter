@@ -141,7 +141,8 @@ registro:
   `add` do submenu do seu `type` (`/interface` tipo `vlan` → `/interface vlan add`) — com as chaves
   que esse `add` declara; o que o `add` não aceita mas o `set` do menu aceita vem num `set` em
   seguida (`/interface set name=vlan30 disabled=yes`). Sem `add` (portas físicas, instâncias BGP):
-  `set`. Linhas dinâmicas (flag D) ficam de fora. Menus de um objeto (`get`): um `set`;
+  `set`. Linhas dinâmicas (flag D) e links que o roteador não gerencia (`managed=no`, G1.18) ficam
+  de fora. Menus de um objeto (`get`): um `set`;
 - **ordem segura**: cada linha vem depois das que criam os nomes que ela cita (bridge antes da VLAN
   sobre ela, VLAN antes da VLAN empilhada, VRF antes dos endereços e rotas da sua tabela);
 - **determinístico**: sem data/hora, ordem estável (o mesmo running dá o mesmo texto);
