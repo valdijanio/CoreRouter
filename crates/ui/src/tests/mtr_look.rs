@@ -136,6 +136,7 @@ fn as_colours_follow_the_number() {
     let lum = |c: egui::Color32| u32::from(c.r()) + u32::from(c.g()) + u32::from(c.b());
     assert!(lum(d) > lum(l));
     let text = |n: u64, name: &str| as_text(&json!({"asn": n, "as_name": name}));
+    assert_eq!(text(262_901, "AS262901, BR").as_deref(), Some("AS262901"));
     assert_eq!(text(7162, "UOL Diveo S.A., BR").as_deref(), Some("AS7162 UOL"));
     assert_eq!(as_text(&json!({"asn": 3356})).as_deref(), Some("AS3356"));
     assert_eq!(as_text(&json!({"scope": "cgnat"})), None);
