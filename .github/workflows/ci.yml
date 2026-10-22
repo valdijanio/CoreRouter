@@ -32,8 +32,8 @@ env:
 
 jobs:
   # PR que só mexe em `docs/` (o fold da fila de entrada, por exemplo) não pode quebrar o código:
-  # os 3 checks exigidos passam com `cargo xtask docs` só (~20 s em vez de ~3 min). Lote,
-  # main e workflow_dispatch rodam sempre o completo.
+  # os 3 checks exigidos passam com `cargo xtask docs` só (~20 s em vez de ~3 min). O mesmo
+  # para um push na main só de docs. Lote (workflow_dispatch) roda sempre o completo.
   changes:
     name: changes
     runs-on: ubuntu-latest
@@ -46,13 +46,18 @@ jobs:
           fetch-depth: 0
       - id: diff
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
+          # PR: contra a base; push na main: contra o commit anterior (o fold de cada lote só
+          # mexe em docs/). workflow_dispatch (lote da fila): sempre o completo.
           docs_only=false
-          if [ "${{ github.event_name }}" = pull_request ] &&
-            ! git diff --name-only "$BASE"...HEAD | grep -qv '^docs/'; then
-            docs_only=true
-          fi
+          case "${{ github.event_name }}" in
+            pull_request | push)
+              if git cat-file -e "$BASE" 2>/dev/null &&
+                ! git diff --name-only "$BASE"...HEAD | grep -qv '^docs/'; then
+                docs_only=true
+              fi ;;
+          esac
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "só documentação: $docs_only"
 
