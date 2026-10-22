@@ -203,3 +203,26 @@ fn open_rejects_a_file_path() {
     fs::write(&file, "x").unwrap();
     assert!(FileStorage::open(&file).is_err());
 }
+
+#[test]
+fn state_lives_beside_the_config_and_survives_reopening() {
+    let dir = TempDir::new();
+    let mut st = FileStorage::open(&dir.0).unwrap();
+    assert_eq!(st.load_state("dhcp-leases").unwrap(), None);
+    st.save_state("dhcp-leases", "{\"leases\":[]}").unwrap();
+    st.save_state("dhcp-leases", "{\"leases\":[1]}").unwrap();
+    let mut again = FileStorage::open(&dir.0).unwrap();
+    assert_eq!(
+        again.load_state("dhcp-leases").unwrap().as_deref(),
+        Some("{\"leases\":[1]}")
+    );
+    assert!(dir.0.join("state-dhcp-leases.json").exists());
+    assert!(!dir.0.join("state-dhcp-leases.json.tmp").exists());
+    // Names become file names: nothing that could escape the directory.
+    for bad in ["../x", "a/b", "", "UPPER", "x.json"] {
+        assert!(st.save_state(bad, "1").is_err(), "{bad}");
+        assert!(st.load_state(bad).is_err(), "{bad}");
+    }
+    // Never part of the config slots.
+    assert!(st.load(Slot::Current).unwrap().is_none());
+}
