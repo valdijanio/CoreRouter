@@ -22,3 +22,14 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   ubuntu-latest (toolchain do `rust-toolchain.toml`, deps de sistema do eframe, rust-cache) e
   build de gui/cli/daemon em macOS e Windows. Actions fixadas por SHA. Validado só localmente
   (`cargo xtask ci`); primeira execução no GitHub fica para o push.
+- 2026-10-21 — G1.1: `interface.vlan.add`, `interface.bridge.add`, `interface.bridge.port.add`/
+  `remove`/`list`, `interface.loopback.add`, `interface.remove` (21 comandos no total). Porta de
+  bridge é o campo `Interface.bridge` (uma bridge por porta por construção). Validação: VLAN com
+  pai existente, par (pai, vlan_id) único, MTU ≤ MTU do pai, sem ciclo; `interface.remove` recusa
+  porta física e diz o que remover antes (endereço, VLAN filha, porta de bridge). Janela
+  Interfaces com coluna Info, remover por linha e formulários VLAN/bridge/loopback/porta. 15
+  testes novos no engine + 1 na UI; screenshot conferido. Bonding virou G1.8.
+
+## Histórico de revisão
+
+- 2026-10-21 — log do G1.1.
