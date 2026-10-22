@@ -104,7 +104,9 @@ Decisões de desempenho se tomam com números, não com preferência.
   (`hal-linux`, `hal-frr`, `dataplane-ebpf`) só nas apps. Imposto por `cargo xtask layers`.
   Crate novo precisa entrar na tabela `LAYERS` de `xtask/src/layers.rs`.
 - **UI fina.** Painéis leem estado por comandos de consulta e agem com `CoreRouterUi::run(id,
-  params)`. Nenhuma regra de negócio em `crates/ui`.
+  params)`. Nenhuma regra de negócio em `crates/ui`. Visual: siga `docs/ui-style.md` — selos (chips) e
+  selos coloridos por hash de chave (AS, VLAN, VRF) com `crates/ui/src/chip.rs`, nunca texto entre
+  colchetes nem cores ad hoc; tabelas com uma linha por item e seleção por clique.
 - **Só Rust.** Nada de JS/TS escrito à mão (o `index.html` do trunk é a exceção).
 - **Nunca quebrar o WASM.** model, hal, engine, ui e gui compilam para `wasm32-unknown-unknown`.
   Não use `std::time::SystemTime::now`, threads ou `std::net` nessas camadas (o relógio vem do

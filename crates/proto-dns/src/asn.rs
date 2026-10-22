@@ -79,10 +79,16 @@ pub fn best_origin<'a>(txts: impl IntoIterator<Item = &'a String>) -> Option<Ori
 /// The short name of an AS answer: the fifth field up to its first " - "
 /// or "," ("LEVEL3, US" → "LEVEL3"; "TEAM-CYMRU - Team Cymru Inc., US" →
 /// "TEAM-CYMRU").
+/// A registry whose "name" is the number itself ("AS262901, BR") gives
+/// `None`: shown as "AS262901 AS262901" it repeated the number.
 pub fn parse_as_name(txt: &str) -> Option<String> {
-    let full = txt.split('|').nth(4)?;
+    let mut fields = txt.split('|');
+    let asn = fields.next()?.trim();
+    let full = fields.nth(3)?;
     let short = full.split(" - ").next()?.split(',').next()?;
-    field(short, 32)
+    let name = field(short, 32)?;
+    let bare = name.strip_prefix("AS").or_else(|| name.strip_prefix("as"));
+    (bare != Some(asn)).then_some(name)
 }
 
 /// Origin AS and its name for `ip`. `Ok(None)`: no AS announces it.
@@ -155,6 +161,15 @@ mod tests {
         assert_eq!(parse_origin("NA | 10.0.0.0/8"), None);
         assert_eq!(parse_origin("99999999999 | x"), None);
         assert_eq!(parse_as_name("3356 | US"), None);
+        // The registry's name is just the number: no name.
+        assert_eq!(
+            parse_as_name("262901 | BR | lacnic | 2014-05-21 | AS262901, BR"),
+            None
+        );
+        assert_eq!(
+            parse_as_name("262902 | BR | lacnic | 2014-05-21 | AS262901, BR").as_deref(),
+            Some("AS262901")
+        );
         let o = parse_origin("1 | \u{1b}[31m1.0.0.0/24 | US").unwrap();
         assert_eq!(o.prefix.as_deref(), Some("[31m1.0.0.0/24"));
     }

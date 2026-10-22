@@ -288,6 +288,9 @@ refresh_checkout() {
   fi
 }
 
+# Algum PR entrou desde o último fold (a fila contínua consolida quando fica ociosa).
+MERGED_ANY=0
+
 # Squash de cada PR de $members (os checks rápidos do próprio PR têm de estar verdes).
 merge_members() {
   local n r merged=0
@@ -305,7 +308,7 @@ merge_members() {
       say "  #$n fora: o merge foi recusado (a branch mudou?)"
     fi
   done
-  [ "$merged" = 0 ] || refresh_checkout
+  [ "$merged" = 0 ] || { MERGED_ANY=1; refresh_checkout; }
 }
 
 # Integra os PRs: testa a combinação; verde, entram todos; vermelho, divide ao meio e repete em
@@ -429,6 +432,12 @@ watch() {
       esac
     fi
     if [ -z "$run_sha" ] && [ ${#ready[@]} = 0 ]; then
+      # Ociosa depois de integrar: consolida os docs/changes se passaram de FOLD_MIN (o fold
+      # periódico; antes só rodava quando a fila contínua terminava).
+      if [ "$MERGED_ANY" = 1 ]; then
+        MERGED_ANY=0
+        maybe_fold
+      fi
       idle=$((idle + tick))
       if [ "$idle" -ge "$max_idle" ]; then
         say "fila contínua: ${max_idle}s sem PR pronto, encerrando"
