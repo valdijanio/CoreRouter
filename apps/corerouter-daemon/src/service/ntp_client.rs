@@ -17,6 +17,7 @@
 
 use std::collections::BTreeSet;
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+#[cfg(test)]
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -32,10 +33,13 @@ const TICK: Duration = Duration::from_secs(1);
 /// Junos logs above 1000 s and still syncs).
 const WARN_OFFSET_MS: f64 = 1000.0;
 
+/// The loop on a thread of its own, outside the supervisor (tests).
+#[cfg(test)]
 pub fn spawn(session: Shared, port: u16) -> std::io::Result<()> {
+    let health = super::Health::new(corerouter_control::Shutdown::default());
     thread::Builder::new()
         .name("ntp-client".into())
-        .spawn(move || run(&session, port))
+        .spawn(move || run(&session, port, &health))
         .map(|_| ())
 }
 
@@ -46,7 +50,7 @@ fn unix_nanos() -> i128 {
         .unwrap_or(0)
 }
 
-fn run(session: &Shared, port: u16) {
+fn run(session: &Shared, port: u16, health: &super::Health) {
     let mut cfg: Option<NtpClient> = None;
     let mut status = NtpStatus::default();
     let mut poll_exp = 0u8;
@@ -54,6 +58,7 @@ fn run(session: &Shared, port: u16) {
     let mut denied: BTreeSet<String> = BTreeSet::new();
     let mut warned = false;
     loop {
+        health.beat();
         let now_cfg = lock(session).store().running().system.ntp_client.clone();
         if cfg.as_ref() != Some(&now_cfg) {
             poll_exp = now_cfg.min_poll;
@@ -101,8 +106,18 @@ fn run(session: &Shared, port: u16) {
             }
             next = Instant::now() + Duration::from_secs(wait);
             lock(session).set_ntp_status(status.clone());
+            match &status.last_error {
+                Some(e) => health.error(e),
+                None => health.clear_error(),
+            }
+            if let Some(server) = &status.synced_server {
+                health.event(format!("synchronized with {server}"));
+            }
         }
-        thread::sleep(TICK);
+        health.disabled((!now_cfg.enabled).then_some("system.ntp.client enabled=no"));
+        if !health.sleep(TICK) {
+            return;
+        }
     }
 }
 
@@ -271,17 +286,20 @@ pub fn query(addr: SocketAddr, wait: Duration) -> Result<(Packet, Sample), Query
 
 /// No flags: configured with `system.ntp.client.*`.
 pub(crate) const SERVICE: super::Service = super::Service {
-    name: "ntp client",
+    name: "ntp-client",
     flags: &[],
+    topic: "ntp",
+    enable: "system.ntp.client.set enabled=yes servers=…",
+    depends: &[],
     start,
 };
 
-/// A router without it still forwards: a failure is logged, not fatal.
-fn start(ctx: &super::Ctx) -> Result<(), String> {
-    if let Err(e) = spawn(ctx.session.clone(), corerouter_proto_ntp::PORT) {
-        log::error!("NTP client is off: cannot start its thread: {e}");
-    }
-    Ok(())
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    Ok(Box::new(move |health: &super::Health| {
+        run(&session, corerouter_proto_ntp::PORT, health);
+        Ok(())
+    }))
 }
 
 #[cfg(test)]

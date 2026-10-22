@@ -40,6 +40,32 @@ pub trait DnsBackend: Send + Sync {
     fn origin_as_nowait(&self, _ip: IpAddr) -> Option<Lookup<Option<AsInfo>>> {
         None
     }
+
+    /// `ip.dns.resolve` (G4.1d): `name` and `rtype` through the cache and
+    /// the servers, or asked of `server` alone (no cache). Waits on the
+    /// network: called from a task, never under the session lock.
+    fn resolve_query(
+        &self,
+        name: &str,
+        rtype: &str,
+        server: Option<IpAddr>,
+    ) -> Result<Resolution, String> {
+        let _ = (name, rtype, server);
+        Err("ip.dns.resolve needs the router daemon's resolver".into())
+    }
+}
+
+/// One answer of `ip.dns.resolve`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct Resolution {
+    /// `NOERROR` or `NXDOMAIN` (the others are failures).
+    pub rcode: String,
+    /// The records as text (`CNAME edge.example.`, `A 192.0.2.7`).
+    pub records: Vec<String>,
+    pub addresses: Vec<IpAddr>,
+    pub ttl: Option<u32>,
+    /// `cache`, `stale`, `simulated`, or the server that answered.
+    pub source: String,
 }
 
 #[derive(Default)]

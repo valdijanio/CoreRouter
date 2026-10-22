@@ -24,7 +24,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use corerouter_engine::dns::DnsBackend;
+use corerouter_engine::dns::{DnsBackend, Resolution};
+use hickory_proto::rr::RecordType;
 use corerouter_engine::{Shared, lock};
 use corerouter_hal::probe::{AsInfo, Lookup};
 use corerouter_model::dns::CacheRow;
@@ -180,6 +181,64 @@ impl DnsBackend for RouterDns {
             }
         }
         out
+    }
+
+    fn resolve_query(
+        &self,
+        name: &str,
+        rtype: &str,
+        server: Option<IpAddr>,
+    ) -> Result<Resolution, String> {
+        use corerouter_proto_dns::message::{Rcode, parse_name};
+        use corerouter_proto_dns::resolver::{Source, Target, fetch};
+        let qn = parse_name(name).map_err(|e| e.to_string())?;
+        let rt: RecordType = rtype
+            .parse()
+            .map_err(|_| format!("unknown record type {rtype}"))?;
+        let mut t = self.transport();
+        let (answer, source) = match server {
+            None => {
+                let r = self
+                    .resolver
+                    .resolve(&mut t, &qn, rt, None)
+                    .map_err(|e| e.to_string())?;
+                let source = match r.source {
+                    Source::Cache => "cache".to_owned(),
+                    Source::Stale => "stale".to_owned(),
+                    Source::Server(ip) => ip.to_string(),
+                };
+                (r.answer, source)
+            }
+            // One server, past the cache (RouterOS `:resolve server=`).
+            Some(ip) => {
+                let settings = self.resolver.settings();
+                let f = fetch(&mut t, &settings, &[Target::Plain(ip)], &qn, rt);
+                let (answer, from, _) = f.result.map_err(|e| e.to_string())?;
+                (answer, from.to_string())
+            }
+        };
+        Ok(Resolution {
+            rcode: match answer.rcode {
+                Rcode::NoError => "NOERROR".into(),
+                Rcode::NxDomain => "NXDOMAIN".into(),
+            },
+            records: answer
+                .records
+                .iter()
+                // Text from the network: printable ASCII only (no terminal
+                // escapes), bounded; names keep their final dot (`MX 0 .`).
+                .map(|r| {
+                    format!("{} {}", r.record_type(), r.data)
+                        .chars()
+                        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+                        .take(512)
+                        .collect()
+                })
+                .collect(),
+            addresses: answer.addresses(),
+            ttl: answer.ttl,
+            source,
+        })
     }
 
     fn reverse_nowait(&self, ip: IpAddr) -> Option<Lookup<Option<String>>> {
@@ -359,31 +418,44 @@ impl Transport for Sockets {
 }
 
 /// Starts the resolver: registered in the session (the tools use it from
-/// there) and kept in step with the config by a thread.
+/// there) and kept in step with the config by a thread, outside the
+/// supervisor (tests).
+#[cfg(test)]
 pub(crate) fn spawn(session: Shared) -> std::io::Result<Arc<RouterDns>> {
     let dns = Arc::new(RouterDns::new());
-    {
-        let mut s = lock(&session);
-        dns.resolver.configure(s.dns_settings(), dns.now_ms());
-        s.set_dns_backend(dns.clone());
-    }
+    register(&session, &dns);
     let keep = dns.clone();
-    thread::Builder::new().name("dns".into()).spawn(move || {
-        let mut warned = false;
-        loop {
-            thread::sleep(TICK);
-            let settings = lock(&session).dns_settings();
-            if !settings.has_servers() && !warned {
-                log::info!(
-                    "DNS: no server configured; names will not resolve until ip.dns.set \
-                     servers=… or a DHCP client with use_peer_dns gets one"
-                );
-            }
-            warned = !settings.has_servers();
-            keep.resolver.configure(settings, keep.now_ms());
-        }
-    })?;
+    let health = super::Health::new(corerouter_control::Shutdown::default());
+    thread::Builder::new()
+        .name("dns".into())
+        .spawn(move || follow(&session, &keep, &health))?;
     Ok(dns)
+}
+
+fn register(session: &Shared, dns: &Arc<RouterDns>) {
+    let mut s = lock(session);
+    dns.resolver.configure(s.dns_settings(), dns.now_ms());
+    s.set_dns_backend(dns.clone());
+}
+
+/// Copies the running `/ip dns` into the resolver every tick, until stopped.
+fn follow(session: &Shared, dns: &RouterDns, health: &super::Health) {
+    let mut warned = false;
+    while health.sleep(TICK) {
+        health.beat();
+        let settings = lock(session).dns_settings();
+        if !settings.has_servers() && !warned {
+            log::info!(
+                "DNS: no server configured; names will not resolve until ip.dns.set \
+                 servers=… or a DHCP client with use_peer_dns gets one"
+            );
+            health.event("no DNS server configured (ip.dns.set servers=… or DHCP)");
+        } else if settings.has_servers() && warned {
+            health.event("DNS servers configured");
+        }
+        warned = !settings.has_servers();
+        dns.resolver.configure(settings, dns.now_ms());
+    }
 }
 
 /// Addresses of `host` for the daemon's own services (NTP client): an IP
@@ -402,20 +474,23 @@ pub(crate) fn resolve(session: &Shared, host: &str) -> Result<Vec<IpAddr>, Strin
 
 /// No flags: configured with `ip.dns.*`.
 pub(crate) const SERVICE: super::Service = super::Service {
-    name: "dns resolver",
+    name: "dns-resolver",
     flags: &[],
+    topic: "dns",
+    enable: "always on (ip.dns.set servers=…)",
+    depends: &[],
     start,
 };
 
-/// A router without it still forwards: a failure is logged, not fatal.
-fn start(ctx: &super::Ctx) -> Result<(), String> {
-    match spawn(ctx.session.clone()) {
-        Ok(dns) => {
-            let _ = ROUTER.set(dns);
-        }
-        Err(e) => log::error!("DNS resolver is off: cannot start its thread: {e}"),
-    }
-    Ok(())
+/// One resolver for the daemon's life: a restart keeps it and its cache.
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    Ok(Box::new(move |health: &super::Health| {
+        let dns = ROUTER.get_or_init(|| Arc::new(RouterDns::new())).clone();
+        register(&session, &dns);
+        follow(&session, &dns, health);
+        Ok(())
+    }))
 }
 
 #[cfg(test)]
@@ -544,6 +619,26 @@ pub(crate) mod tests {
         dns.reverse_nowait(hop);
         dns.origin_as_nowait(hop);
         assert_eq!(count.load(Ordering::Relaxed), asked, "kept for the next pass");
+    }
+
+    #[test]
+    fn resolve_query_reports_records_and_source() {
+        let (port, count) = server(Ipv4Addr::new(192, 0, 2, 14), false);
+        let dns = RouterDns::new();
+        dns.resolver.configure(settings(port, &["127.0.0.1"]), 0);
+        let r = dns.resolve_query("www.example", "A", None).unwrap();
+        assert_eq!((r.rcode.as_str(), r.source.as_str()), ("NOERROR", "127.0.0.1"));
+        assert_eq!(r.records, vec!["A 192.0.2.14".to_owned()]);
+        assert_eq!(r.ttl, Some(300));
+        assert_eq!(dns.resolve_query("www.example", "A", None).unwrap().source, "cache");
+        // `server`: asked directly, past the cache.
+        let before = count.load(Ordering::Relaxed);
+        let r = dns
+            .resolve_query("www.example", "A", Some("127.0.0.1".parse().unwrap()))
+            .unwrap();
+        assert_eq!(r.source, "127.0.0.1");
+        assert_eq!(count.load(Ordering::Relaxed), before + 1);
+        assert!(dns.resolve_query("www.example", "BOGUS", None).is_err());
     }
 
     #[test]

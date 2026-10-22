@@ -21,6 +21,8 @@ Tons (`chip(ui, texto, tom)`):
 | `neutral_tone(visuals)` | um fato que vale um olhar, sem alarme | `privada` |
 | `AMBER.tone(visuals)` | algo que o operador deve notar | `CGNAT` |
 | `BLUE.tone(visuals)` | um detalhe extra, informativo | `MPLS 85260` |
+| `GREEN.tone(visuals)` | um estado que está como deve | `running` |
+| `RED.tone(visuals)` | um estado quebrado, que pede o operador | `failed` |
 
 ## Selos coloridos por chave (hash de cor)
 

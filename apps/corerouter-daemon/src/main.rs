@@ -619,6 +619,17 @@ struct Discovery {
 
 /// Block until SIGINT/SIGTERM, then shut down as the module doc says.
 /// Never returns: exits the process.
+/// Where the control channel listens: the protected `control` service row.
+fn control_listens(args: &Args) -> Vec<corerouter_model::service::Listen> {
+    use corerouter_model::service::Listen;
+    let local = |p: u16| std::net::SocketAddr::from(([127, 0, 0, 1], p));
+    let mut out = vec![Listen::new("tcp", local(args.port))];
+    out.extend(args.ws.map(|p| Listen::new("ws", local(p))));
+    out.extend(args.listen.map(|a| Listen::new("tls", a)));
+    out.extend(args.ws_listen.map(|a| Listen::new("wss", a)));
+    out
+}
+
 fn run_until_signal(
     signals: Signals,
     session: &corerouter_engine::Shared,
@@ -813,6 +824,7 @@ fn main() -> ExitCode {
         session: session.clone(),
         shutdown: shutdown.clone(),
         flags: args.service_flags.clone(),
+        control: control_listens(&args),
     };
     if let Err(e) = service::start_all(&ctx) {
         eprintln!("{e}");

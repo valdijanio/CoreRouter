@@ -18,7 +18,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use corerouter_engine::dns_adlist::{AdlistBackend, AdlistStatus};
@@ -265,33 +264,37 @@ impl AdlistBackend for Loader {
     }
 }
 
-/// Starts the loader: registered in the session, following its config.
-pub(crate) fn spawn(session: Shared, loader: Arc<Loader>) -> std::io::Result<()> {
-    lock(&session).set_adlist_backend(loader.clone());
-    thread::Builder::new().name("dns-adlist".into()).spawn(move || {
-        loop {
-            let entries = lock(&session).store().running().ip.dns_adlist.entries.clone();
-            loader.step(&entries);
-            let st = loader.state();
-            if st.reload.is_empty() {
-                let _ = loader.wake.wait_timeout(st, TICK);
-            }
+/// Runs the loader until stopped: registered in the session, following its
+/// config.
+fn run(session: &Shared, loader: &Arc<Loader>, health: &super::Health) {
+    lock(session).set_adlist_backend(loader.clone());
+    while !health.stopping() {
+        health.beat();
+        let entries = lock(session).store().running().ip.dns_adlist.entries.clone();
+        health.disabled(entries.is_empty().then_some("no list (ip.dns.adlist.add)"));
+        loader.step(&entries);
+        let st = loader.state();
+        if st.reload.is_empty() {
+            let _ = loader.wake.wait_timeout(st, TICK);
         }
-    })?;
-    Ok(())
+    }
 }
 
 pub(crate) const SERVICE: super::Service = super::Service {
-    name: "dns adlist",
+    name: "dns-adlist",
     flags: &[super::Flag {
         name: "--adlist-dir",
         value: Some("<dir>"),
         help: "where /ip dns adlist file=… lists are read from",
     }],
+    topic: "dns",
+    enable: "ip.dns.adlist.add url=…",
+    depends: &["dns-server"],
     start,
 };
 
-fn start(ctx: &super::Ctx) -> Result<(), String> {
+/// One loader for the daemon's life (a restart keeps the lists loaded).
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let session = ctx.session.clone();
     let loader = Arc::new(Loader {
         state: Mutex::default(),
@@ -300,10 +303,11 @@ fn start(ctx: &super::Ctx) -> Result<(), String> {
         resolve: Box::new(move |host| super::dns::resolve(&session, host)),
         target: Box::new(super::dns_server::adlists),
     });
-    if let Err(e) = spawn(ctx.session.clone(), loader) {
-        log::error!("DNS adlist is off: cannot start its thread: {e}");
-    }
-    Ok(())
+    let session = ctx.session.clone();
+    Ok(Box::new(move |health: &super::Health| {
+        run(&session, &loader, health);
+        Ok(())
+    }))
 }
 
 #[cfg(test)]
