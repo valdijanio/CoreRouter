@@ -12,13 +12,13 @@ const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|netns|layers|agents-
 const WASM_PACKAGES: &[&str] = &[
     "corerouter-model",
     "corerouter-hal",
+    "corerouter-proto-lldp",
+    "corerouter-proto-mndp",
     "corerouter-engine",
     "corerouter-ui",
     "corerouter-gui",
 ];
 const WASM_TARGET: &str = "wasm32-unknown-unknown";
-/// Packages with a `tests/netns.rs` (rtnetlink apply; two daemons over CRDP).
-const NETNS_PACKAGES: &[&str] = &["corerouter-hal-linux", "corerouter-daemon"];
 
 enum Outcome {
     Ok,
@@ -151,21 +151,29 @@ fn netns(root: &Path) -> Outcome {
         Err(e) => return Outcome::Skip(format!("cannot run unshare: {e}")),
     }
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-    // Each package in its own fresh namespace: the tests refuse to run in
-    // one that already has links.
-    for package in NETNS_PACKAGES {
+    // One fresh namespace per test binary: each one's guard requires a
+    // namespace holding only `lo`.
+    for (package, test) in NETNS_TESTS {
         let mut c = Command::new("unshare");
         c.args(UNSHARE)
             .arg(&cargo)
-            .args(["test", "--quiet", "-p", package, "--test", "netns"])
+            .args(["test", "--quiet", "-p", package, "--test", test])
             .env("COREROUTER_NETNS_TESTS", "1");
-        match run(c, root) {
-            Outcome::Ok => {}
-            other => return other,
+        if let Outcome::Fail(e) = run(c, root) {
+            return Outcome::Fail(format!("{package} {test}: {e}"));
         }
     }
     Outcome::Ok
 }
+
+/// Integration tests that need a kernel: (package, `tests/<name>.rs`).
+const NETNS_TESTS: &[(&str, &str)] = &[
+    ("corerouter-hal-linux", "netns"),
+    // G5.2: LLDP over AF_PACKET and MNDP over UDP between veth peers.
+    ("corerouter-hal-linux", "netns_l2"),
+    // G5.1: two daemons find each other with CRDP.
+    ("corerouter-daemon", "netns"),
+];
 
 fn layers_step(root: &Path) -> Outcome {
     let out = match cargo()

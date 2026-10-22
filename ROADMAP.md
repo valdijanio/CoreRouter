@@ -79,6 +79,77 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   sozinha; pela GUI web servida com `--web-root`, ether3 reabilitada (revisão 3); página de
   outra origem recusada (403) até `--ws-origin`.
 
+- 2026-10-21 — G1.10 + G1.11: comentários inline e tema claro/escuro (só `crates/ui` e
+  `apps/corerouter-gui`; nenhum comando novo). A tabela reutilizável ganhou a coluna
+  `table::comment()` e o item marcável "Inline Comments" nos menus de contexto: ligado, a coluna
+  some e o comentário vira uma faixa acima do item (como o "Comment Type: header" do WinBox v4,
+  conferido em manual.mikrotik.com, e a linha `;;;` do terminal), com fundo sutil azul, barra e
+  ícone de balão desenhados e texto em itálico; a faixa e a linha formam um item só (clique,
+  Shift/Ctrl, menu), duplo clique na faixa abre o diálogo Comment, e o Find continua casando o
+  comentário. Barra superior: seletor Sistema/Claro/Escuro à direita (função própria, `top_bar`
+  intocado). Preferências da janela (`CoreRouterUi::prefs`/`apply_prefs`, JSON) salvas pelo
+  eframe com a feature `persistence` (arquivo em `~/.local/share/corerouter-gui` via
+  `app_id`, para não cair na pasta de config de um daemon; `localStorage` na web); entrada
+  hostil ignorada. Ícones da barra com tons próprios para o tema claro. 4 testes novos (2
+  headless dirigidos por eventos, 2 de preferências). Teste manual (**medido**): daemon com
+  `--config-dir` + GUI `--connect`, comentários em ether2/ether5, Inline Comments e tema
+  claro ligados pela GUI real (xdotool), screenshots nos dois temas conferidos; GUI fechada e
+  reaberta voltou em tema claro com os comentários inline.
+- 2026-10-21 — G1.5: rotas estáticas e VRF básico. Modelo: `ip.routes` (`RouteEntry` com
+  `dst_address` IPv4/IPv6 incluindo `0.0.0.0/0` e `::/0`, `gateway` IP / interface /
+  `ip%interface`, `distance` 1..=255, `routing_table`, ids `*N`); VRF = interface tipo `vrf`
+  com tabela do kernel própria (1000+) e `Interface.vrf` nos membros. `model::route::reach`
+  decide se uma rota vale agora (ativa / inativa / inválida) e é usado pela validação, pelas
+  flags de `ip.route.list` (X A D C S; conectadas derivadas dos endereços como `ADC`) e pelo
+  `hal-linux`, então engine e kernel não divergem. Comandos: `ip.route.add/set/remove/list`,
+  `ip.vrf.add/set/remove/list`; recusa gateway fora de rede conectada da tabela, famílias
+  trocadas, bits de host no destino, rota duplicada ou de mesma distância (ECMP fica para
+  depois), endereço do próprio roteador, link-local sem interface; remover endereço/interface
+  de que uma rota depende é recusado com o comando a usar. `hal-linux`: ops `AddRoute`/
+  `DelRoute` (distance → métrica, proto static) e link `vrf`; o kernel apaga rotas de link que
+  desce, é recriado, muda de VRF ou perde o último IPv4, e apaga IPv6 de link que desce
+  (`keep_addr_on_down=0`, achado no teste de netns) — o plano remove e recoloca isso
+  explicitamente para o desfazer funcionar. UI: janela IP › Routes no padrão G1.9 (seleção,
+  +/−/✓/✗/Comment, menu de contexto, duplo clique "Route <dst>", "New Route" com Apply que
+  vira a janela da rota; gateway "10.0.0.1 reachable ether1"). 30 testes novos (13 de
+  comandos, 7 de modelo, 5 de plano, 3 em netns sem root — o de VRF pula com aviso se o kernel
+  não tem `vrf`, como o runner do GitHub —, 2 headless de UI).
+  Teste manual (**medido**): daemon `--config-dir` + GUI `--connect`; rota padrão criada pelo
+  "New Route" (revisão 3), backup distance 10 e `::/0` pela CLI; daemon e GUI reiniciados →
+  revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
+  pref-src, criar VRF pela GUI.
+
+- 2026-10-21 — G5.2 (Parte 1): LLDP e escuta passiva de MNDP. `crates/proto-lldp` (L2): codec
+  puro de LLDPDU do IEEE 802.1AB (Chassis ID, Port ID, TTL, End, Port/System Description,
+  System Name, Capabilities, Management Address; TLVs desconhecidos e de organização guardados
+  crus), validação de recepção do 9.2.7.7. `crates/proto-mndp` (L2): **só decodificação** do
+  anúncio MikroTik (UDP 5678), escrito a partir do dissector do Wireshark e do manual da
+  MikroTik (fontes no topo do crate); o CoreRouter nunca anuncia MNDP. `hal-linux::l2`:
+  `LldpIo` (socket `AF_PACKET` por porta, EtherType 0x88CC para 01:80:C2:00:00:0E, envio a cada
+  30 s via `due`/`send`, recepção não bloqueante, `allmulticast` ligado e restaurado por
+  rtnetlink) e `MndpListener` (IPv4 + IPv6, `IP_PKTINFO` para a interface de chegada), sem
+  `unsafe` (`socket2` + `sockaddr_ll` vindo do `getifaddrs` do `nix`). Testes: proptest nos
+  dois codecs (1024 casos por propriedade) e `tests/netns_l2.rs` em namespace sem root (LLDP
+  entre as pontas de um veth nos dois sentidos, MNDP com a interface certa); `cargo xtask netns`
+  agora roda cada binário de teste no seu próprio namespace; os dois codecs entram no passo
+  wasm. Integração com a tabela de vizinhos do G5.1 (`ip.neighbor.list` com protocol=lldp/mndp)
+  fica para um segundo PR, depois do G5.1. Detalhes em `docs/lldp-mndp.md`.
+
+- 2026-10-21 — G1.12: maximizar e restaurar as janelas internas, estilo WinBox. Todas as janelas
+  flutuantes (as do menu e os diálogos de interface) passam por um wrapper único,
+  `crates/ui/src/float.rs` (`Floats::show`): a barra de título continua a do egui (▼, arrastar, ✕) e
+  ganha, na mesma camada da janela, o botão □/❐ ao lado do ✕ (desenhado; a fonte não tem os
+  glifos) e uma faixa só de clique sobre o título — o arraste ainda chega ao egui, o duplo clique
+  maximiza em vez de recolher, o botão direito abre Maximize/Restore. Maximizada = `fixed_rect` da
+  área central a cada frame (acompanha o redimensionamento) e o corpo ocupa a área toda (o egui
+  dimensiona a janela pelo conteúdo). Restaurar usa `fixed_rect` sem `constrain` por um frame (com
+  `current_pos` o arraste da barra do egui desfaz a posição; com `constrain` o tamanho maximizado do
+  frame anterior empurra a janela para o canto) e corrige o tamanho pedido por até 3 frames, porque
+  o conteúdo pode ficar uns px abaixo do pedido (Interfaces: 5 px, **medido**). Recolhida, guarda o
+  tamanho expandido. Estado só da UI, não passa pelo engine. 6 testes headless (maximizar ocupa a
+  área, restaurar devolve o retângulo, duplo clique, menu, redimensionar a área, arrastar/recolher,
+  janela de propriedades); conferido na GUI real (xdotool + `screenshot`).
+
 ## Histórico de revisão
 
 - 2026-10-21 — log do G1.1.
@@ -86,3 +157,7 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
 - 2026-10-21 — log do G1.2.
 - 2026-10-21 — log do G1.9.
 - 2026-10-21 — log do G0.4.
+- 2026-10-21 — log do G1.10 + G1.11.
+- 2026-10-21 — log do G5.2 (Parte 1).
+- 2026-10-21 — log do G1.12.
+- 2026-10-21 — log do G1.5.

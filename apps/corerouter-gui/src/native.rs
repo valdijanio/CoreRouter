@@ -291,6 +291,9 @@ pub fn main() -> ExitCode {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("CoreRouter")
+            // Also names eframe's storage dir (window preferences): its
+            // own, never a router's config dir such as ~/.local/share/corerouter.
+            .with_app_id("corerouter-gui")
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
@@ -299,7 +302,7 @@ pub fn main() -> ExitCode {
         options,
         Box::new(move |cc| {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
-            Ok(Box::new(app))
+            Ok(Box::new(app.with_storage(cc)))
         }),
     );
     match result {

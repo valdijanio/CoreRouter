@@ -23,6 +23,10 @@ mod remote;
 #[cfg(target_arch = "wasm32")]
 mod web;
 
+/// Storage key of the window preferences (theme, inline comments). eframe
+/// keeps them in a file under the user's data dir, or in `localStorage`.
+const PREFS_KEY: &str = "corerouter.prefs";
+
 /// How often the connect screen redraws while it waits for announcements.
 const CONNECT_REPAINT: Duration = Duration::from_millis(500);
 
@@ -45,19 +49,33 @@ enum Screen {
 
 struct GuiApp {
     screen: Screen,
+    /// Window preferences as last loaded or saved; applied to the router
+    /// UI once one is picked on the connect screen.
+    prefs: Option<String>,
 }
 
 impl GuiApp {
     fn router(ui: CoreRouterUi) -> Self {
         Self {
             screen: Screen::Router(Box::new(ui)),
+            prefs: None,
         }
     }
 
     fn connect(screen: ConnectScreen, platform: Box<dyn Platform>) -> Self {
         Self {
             screen: Screen::Connect(Box::new(screen), platform),
+            prefs: None,
         }
+    }
+
+    /// Load the saved preferences (eframe storage) into the app.
+    fn with_storage(mut self, cc: &eframe::CreationContext<'_>) -> Self {
+        self.prefs = cc.storage.and_then(|s| s.get_string(PREFS_KEY));
+        if let (Screen::Router(r), Some(prefs)) = (&mut self.screen, &self.prefs) {
+            r.apply_prefs(prefs);
+        }
+        self
     }
 }
 
@@ -88,10 +106,33 @@ impl eframe::App for GuiApp {
                 }
             }
         };
-        if let Some(r) = next {
+        if let Some(mut r) = next {
+            if let Some(prefs) = &self.prefs {
+                r.apply_prefs(prefs);
+            }
             self.screen = Screen::Router(Box::new(r));
             ui.ctx().request_repaint();
         }
+    }
+
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        if let Screen::Router(r) = &self.screen {
+            self.prefs = Some(r.prefs());
+        }
+        if let Some(prefs) = &self.prefs {
+            storage.set_string(PREFS_KEY, prefs.clone());
+        }
+    }
+
+    /// Only our own preferences are kept, not egui's window layout.
+    fn persist_egui_memory(&self) -> bool {
+        false
+    }
+
+    /// Saved on exit too; a short interval also covers a killed process or
+    /// a closed browser tab.
+    fn auto_save_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(2)
     }
 }
 
@@ -132,7 +173,7 @@ fn main() {
             .start(
                 canvas,
                 eframe::WebOptions::default(),
-                Box::new(move |_cc| Ok(Box::new(app))),
+                Box::new(move |cc| Ok(Box::new(app.with_storage(cc)))),
             )
             .await;
         if let Err(e) = started {

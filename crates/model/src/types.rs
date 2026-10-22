@@ -1,8 +1,10 @@
 //! Network value types. Every constructor validates; parsing never panics.
 
 use std::fmt;
+use std::net::IpAddr;
 use std::str::FromStr;
 
+use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -233,6 +235,142 @@ impl fmt::Display for ItemId {
 }
 string_serde!(ItemId);
 
+/// Next hop of a static route, RouterOS syntax: `10.0.0.1` (resolved through
+/// a connected network), `ether1` (out of that interface) or
+/// `fe80::1%ether1` (that address, out of that interface). At least one of
+/// the two parts is always present.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Gateway {
+    address: Option<IpAddr>,
+    interface: Option<IfName>,
+}
+
+impl Gateway {
+    pub fn ip(address: IpAddr) -> Self {
+        Self {
+            address: Some(address),
+            interface: None,
+        }
+    }
+
+    pub fn interface(interface: IfName) -> Self {
+        Self {
+            address: None,
+            interface: Some(interface),
+        }
+    }
+
+    pub fn via(address: IpAddr, interface: IfName) -> Self {
+        Self {
+            address: Some(address),
+            interface: Some(interface),
+        }
+    }
+
+    pub fn address(&self) -> Option<IpAddr> {
+        self.address
+    }
+
+    pub fn iface(&self) -> Option<&IfName> {
+        self.interface.as_ref()
+    }
+}
+
+impl FromStr for Gateway {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        if let Some((ip, iface)) = t.split_once('%') {
+            let ip = ip
+                .parse()
+                .map_err(|_| ParseError::new("gateway", s, "expected <ip>%<interface>"))?;
+            let iface = iface
+                .parse()
+                .map_err(|_| ParseError::new("gateway", s, "invalid interface after '%'"))?;
+            return Ok(Self::via(ip, iface));
+        }
+        // An address wins: "10.0.0.1" would also be a legal interface name.
+        if let Ok(ip) = t.parse::<IpAddr>() {
+            return Ok(Self::ip(ip));
+        }
+        t.parse::<IfName>().map(Self::interface).map_err(|_| {
+            ParseError::new(
+                "gateway",
+                s,
+                "expected an IP, an interface or <ip>%<interface>",
+            )
+        })
+    }
+}
+
+impl fmt::Display for Gateway {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (&self.address, &self.interface) {
+            (Some(a), Some(i)) => write!(f, "{a}%{i}"),
+            (Some(a), None) => write!(f, "{a}"),
+            (None, Some(i)) => write!(f, "{i}"),
+            (None, None) => Ok(()),
+        }
+    }
+}
+string_serde!(Gateway);
+
+/// Routing table of a route: `main`, or the name of a VRF (whose kernel
+/// device has the same name, so VRF names follow interface-name rules).
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RoutingTable {
+    #[default]
+    Main,
+    Vrf(IfName),
+}
+
+impl RoutingTable {
+    pub const MAIN: &'static str = "main";
+
+    pub fn is_main(&self) -> bool {
+        matches!(self, Self::Main)
+    }
+}
+
+impl FromStr for RoutingTable {
+    type Err = ParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let t = s.trim();
+        if t == Self::MAIN {
+            return Ok(Self::Main);
+        }
+        t.parse::<IfName>().map(Self::Vrf).map_err(|_| {
+            ParseError::new(
+                "routing table",
+                s,
+                "expected \"main\" or a VRF name (1..=15 of A-Z a-z 0-9 - _ .)",
+            )
+        })
+    }
+}
+
+impl fmt::Display for RoutingTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Main => f.write_str(Self::MAIN),
+            Self::Vrf(name) => write!(f, "{name}"),
+        }
+    }
+}
+string_serde!(RoutingTable);
+
+/// Destination of a route: a prefix, or a bare address meaning a host route
+/// (`/32`, `/128`), as RouterOS accepts it.
+pub fn parse_destination(s: &str) -> Result<IpNet, ParseError> {
+    let t = s.trim();
+    if let Ok(net) = t.parse::<IpNet>() {
+        return Ok(net);
+    }
+    t.parse::<IpAddr>()
+        .map(IpNet::from)
+        .map_err(|_| ParseError::new("destination", s, "expected a prefix like 10.0.0.0/8"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +413,46 @@ mod tests {
         assert_eq!(id.to_string(), "*1F");
     }
 
+    #[test]
+    fn gateway_forms_roundtrip() {
+        for (text, ip, iface) in [
+            ("10.0.0.1", Some("10.0.0.1"), None),
+            ("ether1", None, Some("ether1")),
+            ("fe80::1%ether1", Some("fe80::1"), Some("ether1")),
+            ("2001:db8::1", Some("2001:db8::1"), None),
+        ] {
+            let g: Gateway = text.parse().unwrap();
+            assert_eq!(g.address(), ip.map(|i| i.parse().unwrap()), "{text}");
+            assert_eq!(g.iface().map(IfName::as_str), iface, "{text}");
+            assert_eq!(g.to_string(), text);
+        }
+        assert!("10.0.0.1%".parse::<Gateway>().is_err());
+        assert!("x%ether1".parse::<Gateway>().is_err());
+        assert!("eth 1".parse::<Gateway>().is_err());
+        assert!("".parse::<Gateway>().is_err());
+    }
+
+    #[test]
+    fn tables_and_destinations() {
+        assert_eq!("main".parse::<RoutingTable>().unwrap(), RoutingTable::Main);
+        assert_eq!(
+            "vrf-cust".parse::<RoutingTable>().unwrap().to_string(),
+            "vrf-cust"
+        );
+        assert!("a b".parse::<RoutingTable>().is_err());
+        assert_eq!(
+            parse_destination("0.0.0.0/0").unwrap().to_string(),
+            "0.0.0.0/0"
+        );
+        assert_eq!(parse_destination("::/0").unwrap().to_string(), "::/0");
+        assert_eq!(
+            parse_destination("10.1.1.1").unwrap().to_string(),
+            "10.1.1.1/32"
+        );
+        assert_eq!(parse_destination("2001:db8::1").unwrap().prefix_len(), 128);
+        assert!(parse_destination("10.0.0.0/33").is_err());
+    }
+
     proptest! {
         #[test]
         fn parsers_never_panic(s in ".{0,64}") {
@@ -282,6 +460,9 @@ mod tests {
             let _ = s.parse::<IfName>();
             let _ = s.parse::<MacAddr>();
             let _ = s.parse::<ItemId>();
+            let _ = s.parse::<Gateway>();
+            let _ = s.parse::<RoutingTable>();
+            let _ = parse_destination(&s);
         }
     }
 }

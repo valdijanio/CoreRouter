@@ -47,12 +47,16 @@ mod config;
 mod interface;
 mod ip;
 mod neighbor;
+mod route;
 mod routing;
 mod system;
+mod vrf;
 
 static AREAS: &[&[CommandSpec]] = &[
     interface::COMMANDS,
     ip::COMMANDS,
+    route::COMMANDS,
+    vrf::COMMANDS,
     neighbor::COMMANDS,
     routing::COMMANDS,
     system::COMMANDS,

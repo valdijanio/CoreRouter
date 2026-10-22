@@ -22,6 +22,8 @@ corerouter-proto-cgnat = { path = "crates/proto-cgnat" }
 corerouter-proto-dns = { path = "crates/proto-dns" }
 corerouter-proto-dhcp = { path = "crates/proto-dhcp" }
 corerouter-proto-discovery = { path = "crates/proto-discovery" }
+corerouter-proto-lldp = { path = "crates/proto-lldp" }
+corerouter-proto-mndp = { path = "crates/proto-mndp" }
 corerouter-engine = { path = "crates/engine" }
 corerouter-control = { path = "crates/control" }
 corerouter-mcp = { path = "crates/mcp" }

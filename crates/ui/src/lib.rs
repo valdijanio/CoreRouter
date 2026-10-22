@@ -7,8 +7,11 @@
 
 pub mod backend;
 pub mod connect;
+mod float;
 mod interfaces;
 mod neighbors;
+mod prefs;
+mod routes;
 mod table;
 mod windows;
 
@@ -43,6 +46,7 @@ enum Field {
     Summary,
     Interfaces,
     Addresses,
+    Routes,
     Bgp,
     History,
     Diff,
@@ -56,6 +60,7 @@ struct Cache {
     summary: Value,
     interfaces: Vec<Value>,
     addresses: Vec<Value>,
+    routes: Vec<Value>,
     bgp: Vec<Value>,
     history: Vec<Value>,
     diff: Vec<Value>,
@@ -85,7 +90,33 @@ struct Forms {
 struct Tables {
     interfaces: table::TableState,
     addresses: table::TableState,
+    routes: table::TableState,
     neighbors: table::TableState,
+}
+
+impl Tables {
+    /// Every table with the salt it is drawn with (stored preferences name
+    /// tables by salt).
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 3] {
+        [
+            (interfaces::TABLE, &mut self.interfaces),
+            ("addresses", &mut self.addresses),
+            (routes::TABLE, &mut self.routes),
+        ]
+    }
+
+    /// Salts of the tables showing comments inline.
+    fn inline_comments(&self) -> Vec<&'static str> {
+        [
+            (interfaces::TABLE, &self.interfaces),
+            ("addresses", &self.addresses),
+            (routes::TABLE, &self.routes),
+        ]
+        .into_iter()
+        .filter(|(_, t)| t.inline_comments)
+        .map(|(salt, _)| salt)
+        .collect()
+    }
 }
 
 /// What a reply is for.
@@ -100,6 +131,7 @@ pub(crate) enum Then {
     ClearAddressForm,
     ShowFrr,
     Dialog { id: u64, effect: interfaces::Effect },
+    Route { id: u64, effect: routes::Effect },
 }
 
 pub struct CoreRouterUi {
@@ -115,9 +147,17 @@ pub struct CoreRouterUi {
     tables: Tables,
     /// Floating "New …" / "Interface <name>" / "Comment" windows.
     dialogs: Vec<interfaces::DialogWin>,
+    /// Maximized windows and where they were (UI-local).
+    floats: float::Floats,
     next_dialog: u64,
     /// Interfaces to open once an `interface.list` at least this new arrives.
     open_after: Vec<(RequestId, String)>,
+    /// Light, dark or the system's (a window preference, see `prefs`).
+    theme: egui::ThemePreference,
+    /// "New Route" / "Route <dst>" / route "Comment" windows.
+    route_dialogs: Vec<routes::RouteDialogWin>,
+    /// Routes to open once an `ip.route.list` sent after this id arrives.
+    open_route_after: Vec<(RequestId, String)>,
 }
 
 impl CoreRouterUi {
@@ -145,8 +185,12 @@ impl CoreRouterUi {
             },
             tables: Tables::default(),
             dialogs: Vec::new(),
+            floats: float::Floats::default(),
             next_dialog: 0,
             open_after: Vec::new(),
+            theme: egui::ThemePreference::System,
+            route_dialogs: Vec::new(),
+            open_route_after: Vec::new(),
         }
     }
 
@@ -270,6 +314,16 @@ impl CoreRouterUi {
                 }
             }
             Field::Addresses => self.cache.addresses = arr(value),
+            Field::Routes => {
+                self.cache.routes = arr(value);
+                let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_route_after)
+                    .into_iter()
+                    .partition(|(req, _)| *req <= id);
+                self.open_route_after = later;
+                for (_, route) in ready {
+                    self.open_route(&route);
+                }
+            }
             Field::Bgp => self.cache.bgp = arr(value),
             Field::History => self.cache.history = arr(value),
             Field::Diff => self.cache.diff = arr(value),
@@ -293,6 +347,7 @@ impl CoreRouterUi {
                 }
             }
             Then::Dialog { id, effect } => self.dialog_reply(id, effect, result),
+            Then::Route { id, effect } => self.route_dialog_reply(id, effect, result),
         }
     }
 
@@ -352,7 +407,8 @@ impl CoreRouterUi {
         self.cache.refreshed_at = Some(now);
     }
 
-    /// Ask for every table again. Returns the id of the `interface.list`.
+    /// Ask for every table again. Returns the id of the `interface.list`
+    /// (the other queries of the batch get larger ids).
     fn reload(&mut self) -> RequestId {
         let ask = |me: &mut Self, field: Field, method: &str, params: Value| {
             let id = me.backend.submit(method, params);
@@ -373,6 +429,7 @@ impl CoreRouterUi {
             "engine.execute",
             exec("ip.address.list"),
         );
+        ask(self, Field::Routes, "engine.execute", exec("ip.route.list"));
         ask(
             self,
             Field::Bgp,
@@ -415,8 +472,18 @@ impl CoreRouterUi {
             PENDING_REPAINT
         };
         ui.ctx().request_repaint_after(wake);
+        self.sync_theme(ui.ctx());
 
-        egui::Panel::top("top-bar").show(ui, |ui| self.top_bar(ui));
+        egui::Panel::top("top-bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.theme_switch(ui);
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        self.top_bar(ui);
+                    });
+                });
+            });
+        });
         egui::Panel::bottom("status-bar").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("menu")
             .resizable(false)
@@ -432,22 +499,28 @@ impl CoreRouterUi {
             .rect;
 
         let ctx = ui.ctx().clone();
+        let mut floats = std::mem::take(&mut self.floats);
         for win in Win::ALL {
             if !self.open.contains(win) {
                 continue;
             }
             let mut open = true;
-            egui::Window::new(win.title())
-                .id(egui::Id::unique(("corerouter-win", *win)))
-                .open(&mut open)
-                .constrain_to(area)
-                .default_size(win.default_size())
-                .show(&ctx, |ui| self.window(*win, ui));
+            floats.show(
+                &ctx,
+                area,
+                win_id(*win),
+                win.title(),
+                &mut open,
+                |w| w.default_size(win.default_size()),
+                |ui| self.window(*win, ui),
+            );
             if !open {
                 self.open.remove(win);
             }
         }
+        self.floats = floats;
         self.dialogs(&ctx, area);
+        self.route_dialogs(&ctx, area);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -564,6 +637,10 @@ impl CoreRouterUi {
             self.open.insert(win);
         }
     }
+}
+
+fn win_id(win: Win) -> egui::Id {
+    egui::Id::unique(("corerouter-win", win))
 }
 
 /// Form text → JSON: integers as numbers, blank as absent, anything else as
@@ -777,6 +854,7 @@ mod tests {
         app: CoreRouterUi,
         session: Shared,
         time: f64,
+        screen: egui::Vec2,
         shapes: Vec<egui::epaint::ClippedShape>,
     }
 
@@ -796,6 +874,7 @@ mod tests {
                 app: CoreRouterUi::new(session.clone()),
                 session,
                 time: 0.0,
+                screen: egui::vec2(1400.0, 900.0),
                 shapes: Vec::new(),
             };
             for _ in 0..3 {
@@ -807,10 +886,7 @@ mod tests {
         fn frame(&mut self, mut events: Vec<egui::Event>, modifiers: egui::Modifiers) {
             events.insert(0, egui::Event::ModifiersChanged(modifiers));
             let raw = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1400.0, 900.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.screen)),
                 time: Some(self.time),
                 events,
                 ..Default::default()
@@ -936,6 +1012,35 @@ mod tests {
                 .iter()
                 .find(|i| i["name"] == name)
                 .cloned()
+        }
+
+        /// Where a floating window is now.
+        fn win_rect(&self, id: egui::Id) -> egui::Rect {
+            self.ctx
+                .memory(|m| m.area_rect(id))
+                .unwrap_or_else(|| panic!("window {id:?} not shown"))
+        }
+
+        fn title_bar(&self, id: egui::Id) -> float::Places {
+            float::Bar::new(&self.ctx).places(self.win_rect(id))
+        }
+
+        fn drag(&mut self, from: egui::Pos2, by: egui::Vec2) {
+            let none = egui::Modifiers::NONE;
+            let ev = |pos, pressed| egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: none,
+            };
+            self.frame(vec![egui::Event::PointerMoved(from)], none);
+            self.frame(vec![ev(from, true)], none);
+            for step in 1..=5 {
+                let at = from + by * (step as f32 / 5.0);
+                self.frame(vec![egui::Event::PointerMoved(at)], none);
+            }
+            self.frame(vec![ev(from + by, false)], none);
+            self.idle();
         }
 
         fn log_ids(&self) -> Vec<&str> {
@@ -1089,6 +1194,397 @@ mod tests {
         h.click(h.text("Cancel"));
         assert!(!h.has_text("New Loopback Interface"));
         assert!(h.app.log().iter().all(|l| l.ok), "{:?}", h.app.log());
+    }
+
+    impl Harness {
+        /// Only the Routes window, over a lab whose ether1 is 10.0.0.2/24.
+        fn routes() -> Self {
+            let mut h = Self::new();
+            lock(&h.session)
+                .execute(
+                    "ip.address.add",
+                    &json!({"address": "10.0.0.2/24", "interface": "ether1"}),
+                )
+                .unwrap();
+            h.app.open.clear();
+            h.app.open(Win::Routes);
+            h.app.cache.refreshed_at = None;
+            h.idle();
+            h.idle();
+            h
+        }
+
+        fn route_row(&self, key: &str) -> egui::Pos2 {
+            self.ctx
+                .read_response(table::row_id(routes::TABLE, key))
+                .unwrap_or_else(|| panic!("route row {key} not drawn"))
+                .rect
+                .center()
+        }
+
+        fn route_tool(&self, icon: table::Icon) -> egui::Response {
+            self.ctx
+                .read_response(table::tool_id(routes::TABLE, icon))
+                .unwrap_or_else(|| panic!("no route tool {icon:?}"))
+        }
+
+        /// The static route `id` as the engine lists it.
+        fn route(&self, id: &str) -> Option<Value> {
+            let list = lock(&self.session).execute("ip.route.list", &Value::Null);
+            list.ok()?
+                .as_array()?
+                .iter()
+                .find(|r| r["id"] == id)
+                .cloned()
+        }
+    }
+
+    #[test]
+    fn new_route_dialog_adds_a_default_route() {
+        let mut h = Harness::routes();
+        assert!(h.has_text("ADC"), "connected route listed");
+        h.click(h.route_tool(table::Icon::Add).rect.center());
+        assert!(h.has_text("New Route"));
+        h.click(h.text("0.0.0.0/0"));
+        h.type_text("0.0.0.0/0");
+        h.click(h.text("10.0.0.1 or ether1"));
+        h.type_text("10.0.0.1");
+        h.click(h.text("OK"));
+        assert!(h.app.route_dialogs.is_empty(), "OK closes on success");
+        let r = h.route("*1").expect("route created");
+        assert_eq!((&r["flags"], &r["distance"]), (&json!("AS"), &json!(1)));
+        assert!(
+            h.has_text("10.0.0.1 reachable ether1"),
+            "WinBox gateway column"
+        );
+
+        // A bad gateway keeps the dialog open with the engine's reason.
+        h.click(h.route_tool(table::Icon::Add).rect.center());
+        h.click(h.text("0.0.0.0/0"));
+        h.type_text("10.9.0.0/16");
+        h.click(h.text("10.0.0.1 or ether1"));
+        h.type_text("172.16.0.1");
+        h.click(h.text("OK"));
+        let d = h.app.route_dialogs.first().expect("still open");
+        assert!(
+            d.error
+                .as_deref()
+                .is_some_and(|e| e.contains("not in any connected network")),
+            "{:?}",
+            d.error
+        );
+        h.click(h.text("Cancel"));
+        assert!(h.app.route_dialogs.is_empty());
+    }
+
+    #[test]
+    fn route_properties_toolbar_and_menu() {
+        let mut h = Harness::routes();
+        lock(&h.session)
+            .execute(
+                "ip.route.add",
+                &json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}),
+            )
+            .unwrap();
+        h.app.cache.refreshed_at = None;
+        h.idle();
+        h.idle(); // rows are laid out where the new list puts them
+
+        // Connected routes cannot be removed, disabled or commented.
+        let connected = "connected main 10.0.0.0/24 ether1";
+        h.click(h.route_row(connected));
+        assert!(!h.route_tool(table::Icon::Remove).sense.senses_click());
+        h.key(egui::Key::Delete, egui::Modifiers::NONE);
+        assert!(!h.log_ids().contains(&"ip.route.remove"));
+
+        // Double click: "Route <0.0.0.0/0>"; Apply sends only what changed.
+        // (Wait first, or the click above would make it a triple click.)
+        h.time += 1.0;
+        h.idle();
+        let at = h.route_row("*1");
+        h.click(at);
+        h.click(at);
+        assert!(h.has_text("Route <0.0.0.0/0>"));
+        match h.app.route_dialogs.first_mut().map(|d| &mut d.dialog) {
+            Some(routes::RouteDialog::Props { form, .. }) => {
+                form.distance = "5".into();
+                form.comment = "isp".into();
+            }
+            _ => panic!("route window not open"),
+        }
+        h.click(h.text("Apply"));
+        let r = h.route("*1").unwrap();
+        assert_eq!((&r["distance"], &r["comment"]), (&json!(5), &json!("isp")));
+        h.click(h.text("Disable"));
+        assert_eq!(h.route("*1").unwrap()["flags"], "XS");
+        h.click(h.text("OK"));
+        assert!(h.app.route_dialogs.is_empty());
+
+        // Ctrl+E on the selected row enables it again.
+        h.click(h.route_row("*1"));
+        h.key(egui::Key::E, CTRL);
+        assert_eq!(h.route("*1").unwrap()["flags"], "AS");
+
+        // Right click ▸ Remove.
+        h.right_click(h.route_row("*1"));
+        h.click(h.text("Remove"));
+        assert!(h.route("*1").is_none());
+        assert!(h.app.log().iter().all(|l| l.ok), "{:?}", h.app.log());
+    }
+
+    /// Same rectangle, give or take egui's pixel rounding.
+    fn same_rect(a: egui::Rect, b: egui::Rect) -> bool {
+        (a.min - b.min).length() < 1.5 && (a.max - b.max).length() < 1.5
+    }
+
+    #[test]
+    fn maximize_fills_the_work_area_and_restore_puts_it_back() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        // Somewhere of its own first, so "back" is not the default place.
+        h.drag(h.title_bar(id).strip.center(), egui::vec2(40.0, 30.0));
+        let before = h.win_rect(id);
+        let area = h.app.floats.area.unwrap();
+        assert!(!same_rect(before, area));
+
+        h.click(h.title_bar(id).button.center());
+        assert!(h.app.floats.is_maximized(id));
+        assert!(
+            same_rect(h.win_rect(id), area),
+            "{:?} vs {area:?}",
+            h.win_rect(id)
+        );
+        // Not over the top bar, the side menu or the status bar.
+        assert!(area.min.x >= 170.0 && area.min.y > 0.0 && area.max.y < 900.0);
+
+        h.click(h.title_bar(id).button.center());
+        assert!(!h.app.floats.is_maximized(id));
+        h.idle();
+        assert!(
+            same_rect(h.win_rect(id), before),
+            "{:?} vs {before:?}",
+            h.win_rect(id)
+        );
+    }
+
+    #[test]
+    fn double_click_on_the_title_toggles_without_collapsing() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        let before = h.win_rect(id);
+        let at = h.title_bar(id).strip.center();
+        h.click(at);
+        h.click(at);
+        assert!(h.app.floats.is_maximized(id));
+        assert!(same_rect(h.win_rect(id), h.app.floats.area.unwrap()));
+        assert!(h.has_text("ether1"), "body still shown: not collapsed");
+
+        // A pause, or the next click would make a triple click.
+        h.time += 1.0;
+        let at = h.title_bar(id).strip.center();
+        h.click(at);
+        h.click(at);
+        h.idle();
+        assert!(!h.app.floats.is_maximized(id));
+        assert!(same_rect(h.win_rect(id), before));
+        assert!(h.has_text("ether1"));
+    }
+
+    #[test]
+    fn title_menu_maximizes_and_restores() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        h.right_click(h.title_bar(id).strip.center());
+        h.click(h.text("Maximize"));
+        assert!(h.app.floats.is_maximized(id));
+        h.right_click(h.title_bar(id).strip.center());
+        h.click(h.text("Restore"));
+        assert!(!h.app.floats.is_maximized(id));
+    }
+
+    #[test]
+    fn a_maximized_window_follows_the_app_window() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        h.click(h.title_bar(id).button.center());
+        let big = h.app.floats.area.unwrap();
+        h.screen = egui::vec2(1100.0, 700.0);
+        h.idle();
+        h.idle();
+        let small = h.app.floats.area.unwrap();
+        assert!(small.width() < big.width() && small.height() < big.height());
+        assert!(
+            same_rect(h.win_rect(id), small),
+            "{:?} vs {small:?}",
+            h.win_rect(id)
+        );
+        h.screen = egui::vec2(1600.0, 1000.0);
+        h.idle();
+        h.idle();
+        assert!(same_rect(h.win_rect(id), h.app.floats.area.unwrap()));
+    }
+
+    #[test]
+    fn the_title_still_drags_and_collapses() {
+        let mut h = Harness::new();
+        let id = win_id(Win::Interfaces);
+        let before = h.win_rect(id);
+        h.drag(h.title_bar(id).strip.center(), egui::vec2(60.0, 40.0));
+        let moved = h.win_rect(id);
+        assert!(
+            (moved.min - before.min - egui::vec2(60.0, 40.0)).length() < 1.5,
+            "{before:?} → {moved:?}"
+        );
+
+        // Collapsed, maximized and restored: expanding gives the old size.
+        h.click(h.title_bar(id).collapse.center());
+        for _ in 0..10 {
+            h.idle();
+        }
+        assert!(
+            h.win_rect(id).height() < 60.0,
+            "collapsed: {:?}",
+            h.win_rect(id)
+        );
+        h.click(h.title_bar(id).button.center());
+        assert!(h.app.floats.is_maximized(id));
+        h.click(h.title_bar(id).button.center());
+        h.click(h.title_bar(id).collapse.center());
+        for _ in 0..10 {
+            h.idle();
+        }
+        assert!(
+            same_rect(h.win_rect(id), moved),
+            "{:?} vs {moved:?}",
+            h.win_rect(id)
+        );
+    }
+
+    #[test]
+    fn properties_window_maximizes_too() {
+        let mut h = Harness::new();
+        let at = h.row("ether2");
+        h.click(at);
+        h.click(at);
+        let id = match h.app.dialogs.first() {
+            Some(d) => interfaces::dialog_id(d.id),
+            None => panic!("properties window not open"),
+        };
+        let before = h.win_rect(id);
+        h.click(h.title_bar(id).button.center());
+        assert!(
+            same_rect(h.win_rect(id), h.app.floats.area.unwrap()),
+            "{:?}",
+            h.win_rect(id)
+        );
+        h.click(h.title_bar(id).button.center());
+        h.idle();
+        assert!(
+            same_rect(h.win_rect(id), before),
+            "{:?} vs {before:?}",
+            h.win_rect(id)
+        );
+        // Closing forgets it.
+        h.click(h.text("OK"));
+        assert!(h.app.dialogs.is_empty());
+        assert!(!h.app.floats.is_maximized(id));
+    }
+
+    #[test]
+    fn inline_comments_draw_a_band_that_belongs_to_the_item() {
+        let mut h = Harness::new();
+        lock(&h.session)
+            .execute(
+                "interface.set",
+                &json!({"name": "ether2", "comment": "uplink to the core"}),
+            )
+            .unwrap();
+        h.app.cache.refreshed_at = None;
+        h.idle();
+        h.idle();
+        // Column mode: header "Comment", text on the row's own line.
+        assert!(h.has_text("Comment"));
+        let (note, name) = (h.text("uplink to the core"), h.text("ether2"));
+        assert!((note.y - name.y).abs() < 4.0, "{note:?} {name:?}");
+
+        // Row menu ▸ Inline Comments: the column goes, the band comes.
+        h.right_click(h.row("ether1"));
+        h.click(h.text("Inline Comments"));
+        assert!(h.app.tables.interfaces.inline_comments);
+        assert!(!h.has_text("Comment"), "column hidden");
+        let (note, name) = (h.text("uplink to the core"), h.text("ether2"));
+        assert!(note.y < name.y - 5.0, "band above: {note:?} {name:?}");
+        assert!(h.app.prefs().contains("interfaces"));
+
+        // A click on the band selects its item …
+        h.click(note);
+        assert_eq!(h.selected(), ["ether2"]);
+        // … Shift extends from it, and arrows step over bands.
+        h.click_with(
+            h.row("ether4"),
+            egui::PointerButton::Primary,
+            egui::Modifiers::SHIFT,
+        );
+        assert_eq!(h.selected(), ["ether2", "ether3", "ether4"]);
+        h.key(egui::Key::ArrowDown, egui::Modifiers::NONE);
+        assert_eq!(h.selected(), ["ether5"]);
+
+        // … double click on the band edits the comment, on the row opens it.
+        let note = h.text("uplink to the core");
+        h.time += 1.0;
+        h.click(note);
+        h.click(note);
+        assert!(h.has_text("Comment for Interface <ether2>"));
+        assert!(!h.has_text("Interface <ether2>"));
+        h.click(h.text("Cancel"));
+
+        // The band's menu acts on the item.
+        h.right_click(h.text("uplink to the core"));
+        assert_eq!(h.selected(), ["ether2"]);
+        h.click(h.text("Disable"));
+        assert_eq!(h.iface("ether2").unwrap()["disabled"], true);
+
+        // Find matches the comment text with the column hidden.
+        h.click(h.text("Find"));
+        h.type_text("CORE");
+        assert!(h.has_text("ether2"));
+        assert!(!h.has_text("ether1"));
+
+        // Empty-space menu turns it off again.
+        h.right_click(h.row("ether2") + egui::vec2(0.0, 80.0));
+        h.click(h.text("Inline Comments"));
+        assert!(!h.app.tables.interfaces.inline_comments);
+        assert!(h.has_text("Comment"));
+    }
+
+    #[test]
+    fn theme_switch_changes_and_remembers_the_theme() {
+        let mut h = Harness::new();
+        let at = |h: &Harness, p| {
+            h.ctx
+                .read_response(prefs::theme_id(p))
+                .map(|r| r.rect.center())
+                .unwrap()
+        };
+        h.click(at(&h, egui::ThemePreference::Light));
+        assert_eq!(h.ctx.theme(), egui::Theme::Light);
+        assert!(!h.ctx.global_style().visuals.dark_mode);
+        assert!(h.app.prefs().contains(r#""theme":"light""#));
+        h.click(at(&h, egui::ThemePreference::Dark));
+        assert_eq!(h.ctx.theme(), egui::Theme::Dark);
+        h.click(at(&h, egui::ThemePreference::System));
+        assert_eq!(
+            h.ctx.options(|o| o.theme_preference),
+            egui::ThemePreference::System
+        );
+
+        // Stored preferences apply on the first frame.
+        let mut g = Harness::new();
+        g.app
+            .apply_prefs(r#"{"theme":"light","inline_comments":["interfaces"]}"#);
+        g.idle();
+        assert_eq!(g.ctx.theme(), egui::Theme::Light);
+        assert!(g.app.tables.interfaces.inline_comments);
     }
 
     #[test]
