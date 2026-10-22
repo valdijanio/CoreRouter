@@ -9,7 +9,9 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    # bench/**: base descartável da bateria de testes da fila de entrada (PRs sintéticos que
+    # nunca vão para a main).
+    branches: [main, "bench/**"]
   # Rodar à mão numa branch (Actions → ci → Run workflow).
   workflow_dispatch:
 
@@ -40,15 +42,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      # Cabeçalhos que eframe/winit/wgpu (x11, wayland, GL) pedem para compilar.
+      # Cabeçalhos que eframe/winit/wgpu (x11, wayland, GL) pedem para compilar, e o nftables dos
+      # testes em namespace. Em cache: o `apt-get update` variava de 14 s a 114 s conforme o espelho.
       - name: Dependências de sistema
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+        with:
+          packages: >-
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
             libgl1-mesa-dev nftables
+          version: "1"
 
       - name: Toolchain (rust-toolchain.toml)
         run: |
@@ -81,6 +85,7 @@ jobs:
           if ! sudo modprobe vrf; then
             pkg="linux-modules-extra-$(uname -r)"
             cd "$RUNNER_TEMP"
+            sudo apt-get update -qq   # o cache de pacotes acima pula o update
             apt-get download "$pkg"
             dpkg-deb --fsys-tarfile "$pkg"_*.deb | tar -x --wildcards '*/vrf.ko*'
             ko=$(find . -name 'vrf.ko*' -print -quit)
