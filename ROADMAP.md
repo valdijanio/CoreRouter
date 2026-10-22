@@ -111,8 +111,9 @@ Restante até uma beta de Fase 1: ~70 h de agente (**estimado**, soma de G0.2, G
   (`keep_addr_on_down=0`, achado no teste de netns) — o plano remove e recoloca isso
   explicitamente para o desfazer funcionar. UI: janela IP › Routes no padrão G1.9 (seleção,
   +/−/✓/✗/Comment, menu de contexto, duplo clique "Route <dst>", "New Route" com Apply que
-  vira a janela da rota; gateway "10.0.0.1 reachable ether1"). 29 testes novos (13 de
-  comandos, 7 de modelo, 5 de plano, 2 em netns sem root, 2 headless de UI).
+  vira a janela da rota; gateway "10.0.0.1 reachable ether1"). 30 testes novos (13 de
+  comandos, 7 de modelo, 5 de plano, 3 em netns sem root — o de VRF pula com aviso se o kernel
+  não tem `vrf`, como o runner do GitHub —, 2 headless de UI).
   Teste manual (**medido**): daemon `--config-dir` + GUI `--connect`; rota padrão criada pelo
   "New Route" (revisão 3), backup distance 10 e `::/0` pela CLI; daemon e GUI reiniciados →
   revisão 5 restaurada com as 3 rotas e flags iguais. Fora do escopo: ECMP, blackhole,
