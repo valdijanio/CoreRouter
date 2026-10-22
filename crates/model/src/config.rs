@@ -32,6 +32,7 @@ pub struct Config {
 pub struct System {
     pub identity: String,
     pub contact: String,
+    pub location: String,
 }
 
 impl Default for System {
@@ -39,6 +40,7 @@ impl Default for System {
         Self {
             identity: "CoreRouter".into(),
             contact: String::new(),
+            location: String::new(),
         }
     }
 }
