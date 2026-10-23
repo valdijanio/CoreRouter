@@ -164,12 +164,23 @@ pub trait EventSource: Send {
     /// Append the events that arrive within `wait_ms` (at most `max`) to
     /// `out`. Events the kernel could not deliver (a full socket buffer:
     /// `ENOBUFS`) are counted in [`EventSource::lost`], not an error.
-    fn recv(&mut self, wait_ms: u32, max: usize, out: &mut Vec<Event>) -> Result<(), crate::HalError>;
+    fn recv(
+        &mut self,
+        wait_ms: u32,
+        max: usize,
+        out: &mut Vec<Event>,
+    ) -> Result<(), crate::HalError>;
 
-    /// The whole table now (at most [`MAX_READ`]), for the active and
-    /// inactive timeouts: `true` when it was read to the end.
-    fn table(&mut self) -> Result<(Vec<Conn>, bool), crate::HalError>;
+    /// A reader of the whole table, for the active and inactive timeouts
+    /// (used from another thread than `recv`).
+    fn table_reader(&self) -> Box<dyn TableReader>;
 
     /// Events the kernel dropped since the source opened.
     fn lost(&self) -> u64;
+}
+
+/// Reads the whole conntrack table (at most [`MAX_READ`]): the
+/// connections and whether the read reached the end.
+pub trait TableReader: Send {
+    fn read(&mut self) -> Result<(Vec<Conn>, bool), crate::HalError>;
 }
