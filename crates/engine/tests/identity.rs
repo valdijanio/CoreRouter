@@ -147,7 +147,9 @@ fn hostile_names_are_cleaned_and_cut() {
 fn the_index_is_built_once_per_change() {
     let mut s = Session::virtual_lab();
     maria(&mut s);
-    let many: Vec<String> = (0..2000).map(|i| format!("10.9.{}.{}", i / 250, i % 250)).collect();
+    let many: Vec<String> = (0..2000)
+        .map(|i| format!("10.9.{}.{}", i / 250, i % 250))
+        .collect();
     let r = who(&mut s, json!({"addresses": many}));
     assert_eq!(r.len(), 2000);
     let builds = s.ext::<IdentityCache>().unwrap().builds();
@@ -232,7 +234,11 @@ fn host_names_now_and_at_a_past_time() {
     let mut s = Session::virtual_lab();
     lan(&mut s);
     let ms = run(&mut s, 0, 5);
-    let leases = ok(&mut s, "ip.dhcp-server.lease.print", json!({"status": "bound"}));
+    let leases = ok(
+        &mut s,
+        "ip.dhcp-server.lease.print",
+        json!({"status": "bound"}),
+    );
     let laptop = leases
         .as_array()
         .unwrap()
@@ -248,7 +254,11 @@ fn host_names_now_and_at_a_past_time() {
     let bound_at = 1_700_000_002;
 
     // Released: nobody holds it now, but the history says who did.
-    ok(&mut s, "ip.dhcp-server.lease.release", json!({"address": ip}));
+    ok(
+        &mut s,
+        "ip.dhcp-server.lease.release",
+        json!({"address": ip}),
+    );
     run(&mut s, ms, 2);
     let now = &who(&mut s, json!({"addresses": [ip]}))[0];
     assert!(now.get("primary").is_none(), "{now}");
@@ -285,10 +295,18 @@ fn mistakes_are_refused() {
     assert_eq!(p, "addresses");
     let (p, _) = bad(&mut s, json!({"addresses": []}));
     assert_eq!(p, "addresses");
-    let too_many: Vec<String> = (0..5000).map(|i| format!("10.0.{}.{}", i / 250, i % 250)).collect();
+    let too_many: Vec<String> = (0..5000)
+        .map(|i| format!("10.0.{}.{}", i / 250, i % 250))
+        .collect();
     let (p, why) = bad(&mut s, json!({"addresses": too_many}));
-    assert_eq!((p.as_str(), why.as_str()), ("addresses", "at most 4096 items"));
-    let (p, why) = bad(&mut s, json!({"addresses": "10.0.0.1", "sources": ["radius"]}));
+    assert_eq!(
+        (p.as_str(), why.as_str()),
+        ("addresses", "at most 4096 items")
+    );
+    let (p, why) = bad(
+        &mut s,
+        json!({"addresses": "10.0.0.1", "sources": ["radius"]}),
+    );
     assert_eq!(p, "sources");
     assert!(why.contains("dhcp-static"), "{why}");
     let (p, _) = bad(&mut s, json!({"addresses": "10.0.0.1", "at": "ontem"}));
