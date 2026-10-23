@@ -10,7 +10,6 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Bandwidth Server", "Servidor de banda"),
     ("Bandwidth Test", "Teste de banda"),
     ("Direction", "Direção"),
-    ("Enabled", "Ativado"),
     ("It fills the path for", "Ele enche o caminho por"),
     ("Jitter", "Jitter"),
     ("Last test", "Último teste"),
