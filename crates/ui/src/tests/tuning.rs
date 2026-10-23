@@ -26,11 +26,12 @@ fn panel(h: &mut Harness) -> &mut TuningPanel {
 
 #[test]
 fn every_parameter_is_explained_in_both_languages() {
-    use corerouter_model::tuning::{PARAMS, PORT_PARAMS};
+    use corerouter_model::tuning::{CPU_PARAMS, PARAMS, PORT_PARAMS};
     let keys = PARAMS
         .iter()
         .map(|p| format!("tuning.{}", p.name))
-        .chain(PORT_PARAMS.iter().map(|p| format!("tuning.port.{}", p.name)));
+        .chain(PORT_PARAMS.iter().map(|p| format!("tuning.port.{}", p.name)))
+        .chain(CPU_PARAMS.iter().map(|p| format!("tuning.cpu.{}", p.name)));
     for key in keys {
         for l in [Lang::En, Lang::Pt] {
             let got = i18n::explain(Langs { labels: l, help: l }, &key);
@@ -230,4 +231,33 @@ fn interfaces_tab_lists_a_port_edits_it_and_applies_the_profile() {
     let s = lock(&h.session);
     assert!(s.in_safe_mode());
     assert_eq!(s.store().running().system.tuning.ports.len(), 8, "{:?}", h.app.log());
+}
+
+#[test]
+fn cpu_tab_sets_the_governor_and_spreads_a_ports_irqs() {
+    let mut h = open(Tab::Cpu);
+    refresh(&mut h);
+    assert!(h.has_text("O irqbalance está rodando: ele desfaz a afinidade das IRQs.") || h.has_text("irqbalance is running: it undoes the IRQ affinity."));
+    assert!(h.has_text("Frequency (1)"));
+    assert!(h.has_text("1 (schedutil)"));
+    assert!(h.has_text("CPU and IRQ (3)"));
+    assert!(h.has_text_containing("100: 0-15"));
+
+    h.click(h.text("governor"));
+    h.idle();
+    panel(&mut h).edit = "0".into();
+    h.idle();
+    h.click(h.text("Set"));
+    refresh(&mut h);
+    let cpu = lock(&h.session).store().running().system.tuning.cpu.clone();
+    assert_eq!(cpu.get("governor"), Some(&0), "{:?}", h.app.log());
+    assert!(h.has_text("0 (performance)"));
+
+    h.click(h.text("irq_affinity"));
+    h.idle();
+    panel(&mut h).edit = "1".into();
+    h.idle();
+    h.click(h.text("Set"));
+    refresh(&mut h);
+    assert!(h.has_text_containing("101: 1,"), "one CPU per IRQ");
 }

@@ -82,6 +82,8 @@ pub struct Machine {
     #[serde(flatten)]
     pub sys: SystemInfo,
     pub nics: Vec<Nic>,
+    /// `irqbalance` runs (G1.26c).
+    pub irqbalance: bool,
 }
 
 impl Machine {
@@ -119,6 +121,7 @@ pub const WHY: &[(&str, &str)] = &[
     ("budget_low", "The kernel's value: shorter receive rounds, less waiting ({profile})."),
     ("coalesce_adaptive", "Adaptive interrupt coalescing: few interrupts under load, quick ones when idle."),
     ("coalesce_off", "An interrupt per packet: the lowest latency, at the cost of CPU."),
+    ("c_states", "1 µs: the CPUs stay in C1 at most, waking at once for a packet (deep C-states take tens of µs)."),
     ("ct_buckets", "A quarter of nf_conntrack_max: short hash chains on every lookup."),
     ("ct_max", "{share} of the RAM ({mem}) for connection tracking, ~320 B per entry."),
     ("ct_timeout", "{value} s ({profile}): dead connections leave the table sooner."),
@@ -126,7 +129,9 @@ pub const WHY: &[(&str, &str)] = &[
     ("default", "The kernel's default."),
     ("forward", "A router forwards packets."),
     ("gro", "GRO merges a flow's packets on receive and the kernel splits them again on send: fewer per-packet costs, safe for forwarding."),
+    ("governor", "performance: the CPUs stay at full clock; ramping up on a burst costs latency and drops."),
     ("hash_l4", "Spreads flows over equal-cost routes by port too, not only by address."),
+    ("irq_local", "One queue IRQ per CPU of the port's NUMA node ({cpus} CPUs), fixed: no cross-node memory traffic."),
     ("keep", "{profile} keeps the kernel's value."),
     ("lro", "LRO rewrites headers and cannot be undone: a router must not forward what it built (the kernel turns it off with forwarding)."),
     ("min_free", "A reserve for allocations in interrupts (NIC rings): {share} of the RAM."),
@@ -139,10 +144,15 @@ pub const WHY: &[(&str, &str)] = &[
     ("qdisc_mq", "Several transmit queues: mq keeps one qdisc per queue (the default one, fq_codel), without a lock shared by all CPUs."),
     ("queues", "One queue per CPU of the port's NUMA node ({cpus}), up to the NIC's {max}."),
     ("ring", "{value} descriptors ({profile}), of the NIC's {max}: room for a burst without missed frames."),
+    ("rps_off", "Several queues: RSS already spreads the flows; RPS would only add work."),
+    ("rps_on", "One receive queue: RPS spreads the flows over the node's CPUs in software."),
     ("rp_loose", "Loose: drops sources with no route at all and keeps asymmetric routing (several uplinks) working."),
     ("rp_off", "Off: no extra route lookup per packet; filter spoofed sources in the firewall."),
     ("sockbuf", "Lets BGP and the API ask for 16 MiB socket buffers (full tables)."),
     ("v6_routes", "Linux {kernel} still caps IPv6 routes at max_size: room for a full table."),
+    ("watchdog", "The hardware reboots the router if the daemon stops answering."),
+    ("xps_off", "One transmit queue: nothing to choose."),
+    ("xps_on", "Each CPU sends on its own queue: no lock shared between CPUs."),
 ];
 
 fn rec(id: &'static str, value: i64, args: &[(&'static str, String)]) -> Rec {
@@ -382,6 +392,7 @@ pub const FINDINGS: &[(&str, &str)] = &[
     ("conntrack_full", "The conntrack table is {pct}% full ({count} of {max}): new connections are dropped when it fills."),
     ("flow_control_on", "Flow control (pause frames) is on on {nics}: one full queue stops the whole port (Interfaces tab)."),
     ("forwarding_off", "IPv4 forwarding is off: this router does not route."),
+    ("irqbalance", "irqbalance is running: it moves IRQs every 10 s and undoes the IRQ affinity (stop it: systemctl disable --now irqbalance)."),
     ("lro_on", "LRO is on on {nics}: it merges packets in a way a router must not forward (Interfaces tab)."),
     ("neigh_full", "The {family} neighbor table overflowed {count} times since boot: hosts lose connectivity."),
     ("nic_missed", "{nics} dropped {count} frames for lack of RX descriptors, with the RX ring below its maximum (Interfaces tab)."),
@@ -511,6 +522,9 @@ pub fn diagnose(m: &Machine, stats: &KernelStats, cur: &Sysctls) -> Vec<Finding>
             ));
         }
     }
+    if m.irqbalance {
+        out.push(finding(Severity::Warning, "irqbalance", &[], None, None));
+    }
     // One finding for all such ports: the lab (and a big router) has many.
     let short: Vec<(&str, u64)> = m
         .nics
@@ -535,7 +549,7 @@ pub fn diagnose(m: &Machine, stats: &KernelStats, cur: &Sysctls) -> Vec<Finding>
         ));
     }
     for (id, severity, on) in [
-        ("lro_on", Severity::Warning, (|n: &Nic| n.lro) as fn(&Nic) -> Option<bool>),
+    ("lro_on", Severity::Warning, (|n: &Nic| n.lro) as fn(&Nic) -> Option<bool>),
         ("flow_control_on", Severity::Info, |n: &Nic| n.pause),
     ] {
         let names: Vec<&str> = m
@@ -578,6 +592,7 @@ mod tests {
                     ..Nic::default()
                 })
                 .collect(),
+            irqbalance: false,
         }
     }
 
@@ -703,6 +718,12 @@ mod tests {
         let f = diagnose(&m, &stats, &cur);
         let sq = f.iter().find(|f| f.id == "softnet_squeeze").unwrap();
         assert_eq!((sq.severity, sq.suggest), (Severity::Info, None));
+        let busy = Machine {
+            irqbalance: true,
+            ..machine(8, &[])
+        };
+        let calm_stats = KernelStats::default();
+        assert_eq!(diagnose(&busy, &calm_stats, &Sysctls::new())[0].id, "irqbalance");
         // Quiet counters: nothing to say.
         let calm = KernelStats {
             softnet: vec![SoftnetCpu { cpu: 0, processed: 1_000_000, dropped: 0, time_squeeze: 5 }],

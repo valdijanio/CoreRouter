@@ -26,7 +26,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{name, key, value}]",
         always, print_set),
     cmd!(query "system.tuning.interface.parameter.print", "Port Tuning", [], None,
-        "{name?: string, profile?: conservative|balanced|throughput|latency} → {profile, ports: [{name, driver, model, speed_mbps, notes, params: [{name, tab, section, current, configured, recommended, why, why_id, why_args, min, max, unit, choices, default, link_flap, ethernet, fixed}]}]}",
+        "{name?: string, profile?: conservative|balanced|throughput|latency} → {profile, ports: [{name, driver, model, speed_mbps, notes, irqs: [{irq, cpus}], params: [{name, tab, section, current, configured, recommended, why, why_id, why_args, min, max, unit, choices, default, link_flap, ethernet, fixed}]}]}",
         always, print),
     cmd!(
         "system.tuning.interface.set",
@@ -238,6 +238,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
                 "model": d.hw.model,
                 "speed_mbps": m.nics.iter().find(|n| n.name == d.name.as_str()).and_then(|n| n.speed_mbps),
                 "notes": d.tuning.notes,
+                "irqs": d.tuning.irqs.iter().map(|(irq, cpus)| json!({"irq": irq, "cpus": cpus})).collect::<Vec<_>>(),
                 "params": params,
             })
         })

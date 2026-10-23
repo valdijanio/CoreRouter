@@ -3,6 +3,33 @@
 /// Explanations by key (`tuning.<parameter>`, `tuning.<topic>`).
 pub(super) const HELP: &[(&str, &str)] = &[
     (
+        "tuning.cpu.cpu_dma_latency",
+        r##"## What it does
+The deepest C-state the CPUs may sleep in, as the wake-up latency allowed in µs: a PM QoS request on `/dev/cpu_dma_latency`. 1 µs keeps them in C1; 0 makes them poll (never sleep). No value: the kernel's own choice.
+## When to change
+Low latency: deep C-states take tens to hundreds of µs to wake, and the first packets of a burst wait for it. **No reboot needed**, unlike `intel_idle.max_cstate` (Boot tab).
+## Careful
+The request lasts while the file stays open: the daemon holds it, so if the daemon stops the limit goes away (safe). Shallow C-states cost power; 0 (polling) burns whole cores."##,
+    ),
+    (
+        "tuning.cpu.governor",
+        r##"## What it does
+The cpufreq governor of every CPU policy: how the kernel picks the clock. **performance** keeps it at the top; schedutil and ondemand follow the load; powersave keeps it low.
+## When to change
+performance on a router: the softirq load comes in bursts, and ramping the clock up takes milliseconds, enough to drop packets on a full ring (tuned and VyOS do the same).
+## Careful
+More power and heat. Without cpufreq (many VMs, some firmware settings) the row is empty: the clock is not the kernel's to choose."##,
+    ),
+    (
+        "tuning.cpu.hw_watchdog",
+        r##"## What it does
+The hardware watchdog (`/dev/watchdog`): the daemon feeds it every second; if it stops (hung, killed, kernel stuck) the board reboots by itself.
+## When to change
+On for a router nobody can reach in person. Combined with `kernel.panic` it brings the box back from any freeze.
+## Careful
+Turning it off sends the magic close, which stops the timer. A driver without magic close keeps counting after CoreRouter lets go: it reboots unless something else feeds it."##,
+    ),
+    (
         "tuning.kernel.panic",
         r##"## What it does
 Seconds after a kernel panic before the machine reboots by itself; 0 waits forever on the panic screen.
@@ -36,7 +63,8 @@ How many packets one round of the receive softirq handles, across all the queues
 ## When to raise
 When `time_squeeze` grows (Summary tab): the round ends with work left and the rest waits for the next one. 600 is a common value for a router; 1000+ for 10/40 Gb/s ports.
 ## Careful
-A longer round delays everything else on that CPU (user space, the routing daemon). Raise it together with `netdev_budget_usecs`."##,
+A longer round delays everything else on that CPU (user space, the routing daemon). Raise it together with `netdev_budget_usecs`.
+Host-wide: a container or a network namespace does not have it (it shows as –)."##,
     ),
     (
         "tuning.net.core.netdev_budget_usecs",
@@ -90,7 +118,9 @@ Reverse path filter: checks the source address of each packet against the routin
 ## When to change
 Loose is the safe choice for an ISP router: it drops bogus sources and keeps asymmetric routing (two uplinks, BGP multihoming) working. Off saves a route lookup per packet when anti-spoofing is done in the firewall.
 ## Careful
-Strict breaks asymmetric routing silently: replies come in by another uplink and are dropped. MikroTik's default is off."##,
+Strict breaks asymmetric routing silently: replies come in by another uplink and are dropped. MikroTik's default is off.
+## Measured
+Forwarding 64-byte UDP on one CPU (veth in a namespace): strict 1.61 Mpps, off 1.82 Mpps (+13 %). Turning `all` off is not enough: the interface's own value (and `default`, for new ones) must go down too."##,
     ),
     (
         "tuning.net.ipv4.conf.default.rp_filter",
@@ -117,7 +147,8 @@ Whether the kernel forwards IPv4 packets between interfaces. A router needs it o
 ## When to change
 Never on a router. Off is for a host.
 ## Careful
-Turning it off stops all IPv4 routing at once. Turning it on also turns off LRO on every port (the kernel does it)."##,
+Turning it off stops all IPv4 routing at once. Turning it on also turns off LRO on every port (the kernel does it).
+Changing it resets other configuration parameters to the host or router defaults (`ip-sysctl.rst`): CoreRouter always writes it before the others."##,
     ),
     (
         "tuning.net.ipv4.neigh.default.gc_thresh1",
@@ -381,6 +412,15 @@ It does not matter for forwarded traffic, which arrives already cut to the wire'
 It helps the router's own TCP (BGP with full tables, the API); turning it off only costs CPU."##,
     ),
     (
+        "tuning.port.irq_affinity",
+        r##"## What it does
+Where the port's queue interrupts run. **local node**: each queue IRQ on its own CPU of the port's NUMA node (queue 0 on the first CPU, queue 1 on the second…), written to `/proc/irq/<n>/smp_affinity_list`. **kernel**: every online CPU (the kernel's default).
+## When to change
+Local node on a router (Intel's `set_irq_affinity -X local`, `scaling.rst`): a queue served by one CPU keeps its cache warm, and a CPU on the other node would reach the NIC across the interconnect.
+## Careful
+**Stop irqbalance** first: it moves IRQs every 10 s, ignores where the NIC sits (many firmwares do not report the NUMA node) and overrides a manual affinity, so the work moves between CPUs and flows get reordered. The Summary tab warns when it runs. Some drivers fix their IRQs' CPUs (managed IRQs, MikroTik's flag `o`): CoreRouter says so."##,
+    ),
+    (
         "tuning.port.lro",
         r##"## What it does
 Large Receive Offload: the NIC merges packets in hardware and rewrites their headers in a way that cannot be undone.
@@ -401,7 +441,9 @@ The root queueing discipline of the port: how packets wait to be sent.
 ## When to change
 A multi-queue port keeps mq; a single-queue port gets fq_codel. Shaping (HTB, CAKE) is a different feature.
 ## Careful
-fq_codel at the root of a multi-queue NIC funnels every CPU through one lock: lower throughput."##,
+fq_codel at the root of a multi-queue NIC funnels every CPU through one lock: lower throughput.
+## Measured
+On a virtual port (veth, dummy: `noqueue`), fq_codel cost 7 % of the forwarding rate (from 1.82 to 1.70 Mpps, one CPU): the profile keeps `noqueue` there."##,
     ),
     (
         "tuning.port.rp_filter",
@@ -410,7 +452,18 @@ The reverse path filter of this port. The kernel uses the larger of `net.ipv4.co
 ## When to change
 To the same value as `all` (the profile does so): loose (2) for an ISP with several uplinks, off (0) with anti-spoofing in the firewall.
 ## Careful
-Strict (1) on an uplink drops replies that come back by another uplink (asymmetric routing)."##,
+Strict (1) on an uplink drops replies that come back by another uplink (asymmetric routing).
+## Measured
+Strict cost 12 % of the forwarding rate against off (1.61 vs 1.82 Mpps, one CPU, veth)."##,
+    ),
+    (
+        "tuning.port.rps",
+        r##"## What it does
+Receive Packet Steering: the kernel spreads received flows over the CPUs of the port's NUMA node in software (`rps_cpus` of each receive queue), as RSS does in hardware.
+## When to change
+On for a port with a single receive queue (an old NIC, a VM, a tunnel), whose one IRQ would load one CPU only.
+## Careful
+Off when the NIC has several queues: RSS already spreads the flows and RPS only adds an extra hop (MikroTik and the kernel docs say the same)."##,
     ),
     (
         "tuning.port.rx_channels",
@@ -501,6 +554,15 @@ Packets the kernel queues for the port when the NIC is busy (in the qdisc, befor
 Rarely: with fq_codel the queue is kept short by the qdisc anyway. A virtual interface (VLAN, tunnel) with 0 has no queue at all.
 ## Careful
 A big queue without an AQM qdisc is bufferbloat: seconds of delay under load."##,
+    ),
+    (
+        "tuning.port.xps",
+        r##"## What it does
+Transmit Packet Steering: each CPU sends on its own transmit queue (`xps_cpus`), the same CPU as that queue's IRQ.
+## When to change
+On for multi-queue ports: no lock shared between CPUs on transmit, and completions stay on the CPU that sent.
+## Careful
+Some drivers set XPS themselves; turning it off puts their map back."##,
     ),
     (
         "tuning.profiles",

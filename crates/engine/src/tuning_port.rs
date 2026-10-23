@@ -94,6 +94,19 @@ pub fn recommend_port(profile: Profile, m: &Machine, port: &Port) -> BTreeMap<&'
             "txqueuelen" => Some(why("default", 1000, &[])),
             // A virtual port (veth, dummy) sends at once, with no queue
             // of its own: fq_codel there only costs (netns_forward: −7 %).
+            "irq_affinity" => Some(why("irq_local", 1, &[("cpus", local_cpus(m, port).to_string())])),
+            // RPS spreads a single-queue port's work over the node's CPUs;
+            // with RSS (several queues) it only adds work (MikroTik, kernel).
+            "rps" => Some(if port.tx_queues.unwrap_or(1) > 1 {
+                why("rps_off", 0, &[])
+            } else {
+                why("rps_on", 1, &[])
+            }),
+            "xps" => Some(if port.tx_queues.unwrap_or(1) > 1 {
+                why("xps_on", 1, &[])
+            } else {
+                why("xps_off", 0, &[])
+            }),
             "qdisc" => Some(if port.now.get("qdisc").copied().flatten() == Some(NOQUEUE) {
                 why("qdisc_noqueue", NOQUEUE, &[])
             } else if port.tx_queues.unwrap_or(1) > 1 {
@@ -106,6 +119,29 @@ pub fn recommend_port(profile: Profile, m: &Machine, port: &Port) -> BTreeMap<&'
         if let Some(r) = r {
             out.insert(k, r);
         }
+    }
+    out
+}
+
+/// What `profile` wants of the CPU settings `now` (keys with `None` are
+/// knobs this machine lacks, except `cpu_dma_latency`, which is `None`
+/// while no limit is held).
+pub fn recommend_cpu(
+    profile: Profile,
+    now: &BTreeMap<String, Option<i64>>,
+) -> BTreeMap<&'static str, Rec> {
+    let mut out = BTreeMap::new();
+    if profile == Profile::Conservative {
+        return out;
+    }
+    if now.get("governor").is_some_and(Option::is_some) {
+        out.insert("governor", why("governor", 0, &[]));
+    }
+    if profile == Profile::Latency {
+        out.insert("cpu_dma_latency", why("c_states", 1, &[]));
+    }
+    if now.get("hw_watchdog").is_some_and(Option::is_some) {
+        out.insert("hw_watchdog", why("watchdog", 1, &[]));
     }
     out
 }
@@ -129,6 +165,7 @@ mod tests {
                 ..SystemInfo::default()
             },
             nics: Vec::new(),
+            irqbalance: false,
         }
     }
 
@@ -187,6 +224,24 @@ mod tests {
                 assert!(!r.why.contains('{'), "{}", r.why);
             }
         }
+        // CPU and IRQ (G1.26c): multi-queue → IRQs on the node, XPS, no RPS.
+        let mut cpu_port = port();
+        for k in ["irq_affinity", "rps", "xps"] {
+            cpu_port.now.insert(k.into(), Some(0));
+        }
+        let r = recommend_port(Profile::Balanced, &m, &cpu_port);
+        assert_eq!((r["irq_affinity"].value, r["rps"].value, r["xps"].value), (1, 0, 1));
+        cpu_port.tx_queues = Some(1);
+        let r = recommend_port(Profile::Balanced, &m, &cpu_port);
+        assert_eq!((r["rps"].value, r["xps"].value), (1, 0));
+        let mut cpu: BTreeMap<String, Option<i64>> = BTreeMap::new();
+        cpu.insert("governor".into(), Some(1));
+        cpu.insert("hw_watchdog".into(), None);
+        let c = recommend_cpu(Profile::Latency, &cpu);
+        assert_eq!(c["governor"].value, 0);
+        assert_eq!(c["cpu_dma_latency"].value, 1);
+        assert!(!c.contains_key("hw_watchdog"), "no watchdog device");
+        assert!(recommend_cpu(Profile::Conservative, &cpu).is_empty());
         // A single-queue port gets fq_codel; a virtual one keeps noqueue.
         let mut one = port();
         one.tx_queues = Some(1);

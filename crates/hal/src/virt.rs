@@ -19,7 +19,9 @@ use crate::nic::{
     NicHardware, Offload, base_t_modes, mode_speed,
 };
 use crate::sff::{self, SfpModule};
-use crate::tuning::{KernelStats, NumaNode, PortTuning, SoftnetCpu, Sysctls, SystemInfo};
+use crate::tuning::{
+    CpuTuning, KernelStats, NumaNode, PortTuning, SoftnetCpu, Sysctls, SystemInfo,
+};
 use crate::{
     DynamicChange, Features, Hal, HalError, Learned, LinkErrors, LinkInfo, LinkState, SharedProber,
     SimProber,
@@ -68,7 +70,14 @@ const LAB_PORT: &[(&str, Option<i64>)] = &[
     ("txqueuelen", Some(1000)),
     ("qdisc", Some(3)),
     ("rp_filter", Some(0)),
+    ("irq_affinity", Some(0)),
+    ("rps", Some(0)),
+    ("xps", Some(0)),
 ];
+
+/// The lab server's CPU settings (G1.26c): schedutil, no C-state limit, a
+/// watchdog nobody holds.
+const LAB_CPU: &[(&str, i64)] = &[("governor", 1), ("hw_watchdog", 0)];
 
 /// Memory of the lab's made-up server (32 GiB).
 const LAB_MEM_KIB: u64 = 32 << 20;
@@ -450,10 +459,43 @@ impl Hal for VirtualHal {
         .into_iter()
         .map(|(k, v)| (k.to_owned(), v))
         .collect();
+        // Four queue IRQs per port; the kernel's spread, or one per CPU
+        // of the port's NUMA node once `irq_affinity` asks for it.
+        let index = self.port_index(name).unwrap_or(0);
+        let node = u32::from(index >= self.ports.len() / 2);
+        let spread = values.get("irq_affinity").copied().flatten() == Some(1);
+        let irqs = (0..4u32)
+            .map(|q| {
+                let irq = 100 + u32::try_from(index).unwrap_or(0) * 8 + q;
+                let cpus = if spread {
+                    (node * 8 + q).to_string()
+                } else {
+                    "0-15".to_owned()
+                };
+                (irq, cpus)
+            })
+            .collect();
         Ok(PortTuning {
             values,
             max,
             notes: vec!["separate rx/tx queues: the lab NIC has combined ones only".into()],
+            irqs,
+        })
+    }
+
+    fn cpu_tuning(&mut self) -> Result<CpuTuning, HalError> {
+        let mut values: BTreeMap<String, Option<i64>> = LAB_CPU
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), Some(*v)))
+            .collect();
+        values.insert("cpu_dma_latency".into(), None);
+        for (k, v) in &self.applied.system.tuning.cpu {
+            values.insert(k.clone(), Some(*v));
+        }
+        Ok(CpuTuning {
+            values,
+            irqbalance: true,
+            notes: Vec::new(),
         })
     }
 
