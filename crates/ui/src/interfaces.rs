@@ -21,7 +21,7 @@ pub(crate) const TABLE: &str = "interfaces";
 /// per item; a hundred at a time helps nobody).
 const MAX_OPEN: usize = 8;
 
-const COLUMNS: [table::Column; 10] = [
+const COLUMNS: [table::Column; 11] = [
     col(""),
     col("Name"),
     col("Type"),
@@ -30,6 +30,8 @@ const COLUMNS: [table::Column; 10] = [
     num("Tx"),
     num("Rx pkt"),
     num("Tx pkt"),
+    // G4.5: the last five minutes, from the traffic history (`spark.rs`).
+    col("Traffic"),
     col("Info"),
     comment(),
 ];
@@ -249,7 +251,16 @@ impl CoreRouterUi {
 
     pub(crate) fn interfaces(&mut self, ui: &mut Ui) {
         let ifaces = self.ifaces();
-        let rows: Vec<Row> = self.cache.interfaces.iter().map(iface_row).collect();
+        let spark = self
+            .panel_mut::<crate::spark::Spark>()
+            .map(|s| s.cells.clone())
+            .unwrap_or_default();
+        let rows: Vec<Row> = self
+            .cache
+            .interfaces
+            .iter()
+            .map(|r| iface_row(r, &spark))
+            .collect();
         let selection = self.tables.interfaces.selection(&rows);
         let picked: Vec<&Iface> = ifaces
             .iter()
@@ -712,7 +723,7 @@ pub(crate) fn opt_text(s: &str) -> Value {
     if s.is_empty() { Value::Null } else { json!(s) }
 }
 
-fn iface_row(row: &Value) -> Row {
+fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, String>) -> Row {
     let i = Iface::from_row(row);
     let n = |k: &str| row.get(k).and_then(Value::as_u64).unwrap_or(0);
     // RouterOS flags: X = disabled, R = running.
@@ -734,6 +745,7 @@ fn iface_row(row: &Value) -> Row {
             human_bytes(n("tx_bytes")),
             n("rx_packets").to_string(),
             n("tx_packets").to_string(),
+            spark.get(&i.name).cloned().unwrap_or_default(),
             info(&i),
             i.comment.clone(),
         ],
