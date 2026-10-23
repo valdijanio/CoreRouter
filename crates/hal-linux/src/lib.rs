@@ -59,6 +59,16 @@ mod netlink;
 #[cfg(target_os = "linux")]
 pub mod nft;
 
+/// nf_tables over nfnetlink (G2.3b): the encoder is pure, the socket Linux.
+pub mod nfnl;
+
+/// Conntrack over ctnetlink (G2.2): codec pure, socket Linux.
+pub mod ctnl;
+
+/// The CGNAT table in the kernel (G2.3).
+#[cfg(target_os = "linux")]
+mod cgnat;
+
 #[cfg(target_os = "linux")]
 pub mod l2;
 
@@ -407,9 +417,7 @@ mod linux {
             }
             // CGNAT (G2.3): its own table, replaced whole in one batch.
             let cgnat = corerouter_firewall::cgnat::changed(&from.ip.cgnat, &to.ip.cgnat);
-            if cgnat
-                && let Err(e) = crate::nft::run(&corerouter_firewall::cgnat::script(&to.ip.cgnat))
-            {
+            if cgnat && let Err(e) = crate::cgnat::apply(&from.ip.cgnat, &to.ip.cgnat) {
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -420,10 +428,7 @@ mod linux {
                 return Err(e);
             }
             let undo_cgnat = || {
-                if cgnat
-                    && let Err(back) =
-                        crate::nft::run(&corerouter_firewall::cgnat::script(&from.ip.cgnat))
-                {
+                if cgnat && let Err(back) = crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat) {
                     log::error!("restoring the previous CGNAT table: {back}");
                 }
             };

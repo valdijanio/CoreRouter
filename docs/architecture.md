@@ -48,6 +48,51 @@ Layout da imagem:
 3. **DPDK/VPP:** não entra no caminho crítico. Se um cliente precisar de >100 Gbit/s de CGNAT
    por caixa, vira um terceiro backend do mesmo trait (VPP pela API binária).
 
+#### 1.2.1 nftables: netlink direto × o binário `nft` (G2.3b, **medido**)
+
+O CGNAT fala com o nf_tables por **nfnetlink**, num lote atômico (`NFNL_MSG_BATCH_BEGIN/END`), sem
+o programa `nft`. O encoder é próprio, em `crates/hal-linux/src/nfnl.rs`, sem `unsafe`.
+
+Descrição única: `corerouter_firewall::program::Table`. Dela saem tanto o texto de "Ver regras"
+quanto as mensagens.
+
+Números do CGNAT: AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0, nft 1.0.9, build release,
+netns sem root, 2026-10-23, `cargo bench -p corerouter-hal-linux --bench netns_cgnat`.
+
+| Operação | netlink (Rust) | `nft -f` |
+|---|---|---|
+| tabela com 1 Ki assinantes | 17,5 ms | 23,7 ms |
+| tabela com 16 Ki assinantes | 26,5 ms | 90,0 ms |
+| tabela com 64 Ki assinantes | 66,0 ms | 303 ms |
+| um assinante a mais numa tabela de 64 Ki (com o diff) | 0,155 ms | 2,40 ms |
+
+**Por que netlink:**
+
+- É 4,6× mais rápido para carregar e 15× para mudar um elemento.
+- O `nft` precisa de uma correspondência de protocolo para mapear portas; o kernel, não. Por
+  isso uma regra só cobre TCP, UDP, ICMP e o resto, e o mapa `a_` por pool deixou de existir.
+- Sem um processo externo nem texto gerado para outro parser, a mudança vai como diferença de
+  elementos. Os mapeamentos UDP vivos (EIM) sobrevivem a uma mudança que não remapeia ninguém.
+- O kernel continua dono da atomicidade: o lote entra inteiro ou nada.
+
+**O que se paga:**
+
+- Mantemos os números de atributo da UAPI (`nf_tables.h`, que só cresce por acréscimo) e um
+  subconjunto pequeno de expressões: `payload`, `meta`, `cmp`, `bitwise`, `ct`, `lookup`, `nat`,
+  `dynset`, `counter`, `immediate`.
+- Os testes em netns conferem que o kernel aceita e que o `nft list` lê o que foi carregado.
+- Os crates Rust disponíveis não cobriam faixas na NAT, `dynset` nem dados de mapa com faixa:
+  `rustables` 0.9 (GPL, bindgen e `unsafe`) e `netlink-packet-netfilter` 0.4 (sem `nat`, `ct` e
+  `dynset`).
+
+**Limite em user namespace:**
+
+- Lá o `SO_SNDBUFFORCE` é recusado e o lote cabe em 2 × `wmem_max`, cerca de 8 MiB, ou seja, uns
+  150 mil assinantes (**estimado**).
+- No roteador o daemon é root e o limite some.
+
+O firewall do G2.1 continua no `nft -f` por enquanto: a migração para o mesmo encoder é a G2.8.
+
 ### 1.3 Control plane (BGP, OSPF, MPLS/LDP, BFD)
 
 **Decisão: orquestrar FRRouting sob a camada transacional do engine; avaliar holo como segundo
@@ -87,7 +132,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L0 | `crates/buildinfo` | Versão e commit do build (`COREROUTER_COMMIT` pelo `build.rs`): `server.info` e o aviso de daemon de outro commit na GUI. Crate à parte para um commit novo não recompilar o workspace | nada do workspace |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, `prober`, entradas dinâmicas de address-list, transporte do cliente DHCP `dhcp_port`/`DhcpPort`, G4.7; DHCPv6 `dhcp6_port`/`Dhcp6Port` e o que o kernel aprendeu por RA `ipv6_learned`/`Learned`, G4.7b; `sfp_module`/`cable_tester`, G1.20) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria; simula um SFP+ e o teste de cabo); `probe` (trait `Prober`/`ProbeSocket` das ferramentas), `sim` (rede simulada determinística, G6.2) e `sff` (EEPROM SFF-8472/8636 decodificado em código puro, G1.20) | L0, `firewall` (lateral permitido) |
 | L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; a tabela `ip corerouter_cgnat` do CGNAT (`cgnat`, G2.3); sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT por nfnetlink (`nfnl`, `cgnat`, G2.3b) e conntrack por ctnetlink (`ctnl`, G2.2); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`); o mesmo para DHCPv6 com codec próprio (`v6`, `client6`, `lab6`; G4.7b) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |

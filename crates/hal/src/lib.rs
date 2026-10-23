@@ -5,6 +5,7 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
 pub mod drift;
