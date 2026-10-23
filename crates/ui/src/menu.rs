@@ -67,6 +67,7 @@ const DNS: Option<&str> = Some("DNS");
 /// Every window of the menu, by key (sorted, a test checks).
 pub(crate) const CATALOG: &[Entry] = &[
     e("addresses", None, None, icons::MAP_PIN, "/ip address", &["ip.address"], &["ip address", "ipv4", "endereço", "endereco", "gateway", "subnet"]),
+    e("analytics", None, None, icons::DATABASE, "", &["system.analytics"], &["clickhouse", "grafana", "export", "exportar", "métricas", "metrics", "logs", "histórico", "long term", "longo prazo", "timeseries", "netflow"]),
     e("bgp", None, None, icons::GLOBE_HEMISPHERE_WEST, "/routing bgp", &["routing.bgp"], &["peer", "asn", "ebgp", "ibgp", "transit", "trânsito", "upstream"]),
     e("bonding", None, None, icons::LINK, "/interface bonding", &["interface.bonding"], &["lacp", "802.3ad", "bond", "link aggregation", "agregação"]),
     e("cgnat", None, None, icons::ARROWS_SPLIT, "", &[], &["nat444", "cgn", "port block", "ipv4 compartilhado", "rfc 6598"]),

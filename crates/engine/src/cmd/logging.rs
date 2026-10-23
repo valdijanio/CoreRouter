@@ -314,10 +314,12 @@ fn action_list(s: &mut Session, _: &Value) -> Result<Value> {
         "syslog_severity": null,
         "comment": "",
     });
+    // Built-ins around the remote ones: memory first (as RouterOS lists
+    // it), analytics last.
     Ok(Value::Array(
-        [memory, analytics]
-            .into_iter()
+        std::iter::once(memory)
             .chain(l.actions.iter().map(action_json))
+            .chain(std::iter::once(analytics))
             .collect(),
     ))
 }

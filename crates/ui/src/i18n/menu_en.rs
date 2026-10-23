@@ -5,6 +5,7 @@
 
 pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.addresses", "## What it does\nThe IPv4 addresses of the router's interfaces. Each address also makes the connected route of its network.\n\nAn address can come from a pool (prefix delegation) or from a DHCP lease; the Origin column says which."),
+    ("menu.analytics", "## What it does\nSends the router's metrics, log, flows and NAT events to a ClickHouse server you run, in batches, for months of history and for every router in one place (Grafana reads it).\n\nThe router keeps nothing long-term here: a queue in memory (and optionally on disk) holds the rows while the server is away."),
     ("menu.bgp", "## What it does\nThe BGP instance: the router's AS, router id and the sessions with peers (upstreams, IXs, customers). The protocol itself runs in FRR; this window configures it."),
     ("menu.bonding", "## What it does\nBonds join several ports into one link (LACP 802.3ad, active-backup, balance-xor…) for more capacity and for redundancy when a cable or port fails."),
     ("menu.cgnat", "## What it does\nCarrier-grade NAT for subscribers (shared IPv4, RFC 6598 100.64.0.0/10), with port blocks and the logs the law asks for. Not implemented yet."),
