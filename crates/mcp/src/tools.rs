@@ -42,7 +42,7 @@ const TOOLS: &[Tool] = &[
     },
     Tool {
         names: &["command_batch"],
-        description: "Run up to 256 commands as one step. \"$N.key\" in params takes `key` from \
+        description: "Run up to 32768 commands as one step. \"$N.key\" in params takes `key` from \
             step N's result (1-based). atomic (default true): all-or-nothing, one commit.",
         schema: || {
             json!({"type": "object", "required": ["steps"], "properties": {
