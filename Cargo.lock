@@ -1279,6 +1279,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "corerouter-proto-flow"
+version = "0.1.0"
+dependencies = [
+ "corerouter-hal",
+ "criterion",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "corerouter-proto-lldp"
 version = "0.1.0"
 dependencies = [

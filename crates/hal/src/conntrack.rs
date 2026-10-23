@@ -134,3 +134,42 @@ pub struct Stats {
 /// What `connections` reads at most (a CGNAT box holds millions; the
 /// engine filters and pages what comes back).
 pub const MAX_READ: usize = 2_000_000;
+
+/// What a conntrack event says happened (ctnetlink multicast groups
+/// `NFNLGRP_CONNTRACK_NEW` and `NFNLGRP_CONNTRACK_DESTROY`; G4.4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventKind {
+    /// The connection was confirmed (its first packet left the stack):
+    /// the NAT mapping is decided by now.
+    New,
+    /// The connection ended (closed or timed out); the counters are final.
+    Destroy,
+}
+
+/// One conntrack event, as the flow exporter reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Event {
+    pub kind: EventKind,
+    pub conn: Conn,
+    /// `CTA_TIMESTAMP_START`/`_STOP`, Unix nanoseconds, when the kernel
+    /// stamps connections (`net.netfilter.nf_conntrack_timestamp=1`).
+    pub start_ns: Option<u64>,
+    pub stop_ns: Option<u64>,
+}
+
+/// A live feed of conntrack events (G4.4b): the kernel's, or the lab's.
+/// Its own sockets, used outside the session lock by the flow exporter.
+pub trait EventSource: Send {
+    /// Append the events that arrive within `wait_ms` (at most `max`) to
+    /// `out`. Events the kernel could not deliver (a full socket buffer:
+    /// `ENOBUFS`) are counted in [`EventSource::lost`], not an error.
+    fn recv(&mut self, wait_ms: u32, max: usize, out: &mut Vec<Event>) -> Result<(), crate::HalError>;
+
+    /// The whole table now (at most [`MAX_READ`]), for the active and
+    /// inactive timeouts: `true` when it was read to the end.
+    fn table(&mut self) -> Result<(Vec<Conn>, bool), crate::HalError>;
+
+    /// Events the kernel dropped since the source opened.
+    fn lost(&self) -> u64;
+}
