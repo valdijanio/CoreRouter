@@ -96,3 +96,7 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
 - A explicação de uma janela (ⓘ do item selecionado) é `menu.<chave>` nos catálogos
   `i18n/menu_en.rs` e `i18n/menu_pt.rs`; caminho do RouterOS e comandos o modal acrescenta sozinho.
 
+- **Busca** (campo do menu e Ctrl+K, `crates/ui/src/menu_search.rs`): acha pelo título, rótulo,
+  lugar no menu, caminho do RouterOS e sinônimos da entrada. Janela nova: ponha nos sinônimos as
+  palavras que o operador usaria (inclusive em português e o nome em outros roteadores). Atalhos:
+  `/` foca a busca, Ctrl+K abre a paleta; nenhuma janela deve usar esses dois.

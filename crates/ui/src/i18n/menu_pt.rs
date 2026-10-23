@@ -2,14 +2,23 @@
 
 
 pub(super) const LABELS: &[(&str, &str)] = &[
+    ("Add to favorites", "Adicionar aos favoritos"),
     ("Client", "Cliente"),
     ("Commands", "Comandos"),
+    ("Favorites", "Favoritos"),
     ("New Terminal", "Novo terminal"),
     ("Not implemented yet", "Ainda não implementado"),
+    ("Nothing found", "Nada encontrado"),
+    ("Open in a terminal", "Abrir num terminal"),
+    ("Recent", "Recentes"),
+    ("Remove from favorites", "Tirar dos favoritos"),
     ("RouterOS path", "Caminho no RouterOS"),
+    ("Search menu…", "Buscar no menu…"),
+    ("Search the menu (/ or Ctrl+K)", "Buscar no menu (/ ou Ctrl+K)"),
     ("Server", "Servidor"),
     ("Statistics", "Estatísticas"),
     ("TSIG Keys", "Chaves TSIG"),
+    ("Type a window, a RouterOS path or a command", "Digite uma janela, um caminho do RouterOS ou um comando"),
     ("What this window does", "O que esta janela faz"),
     ("Zone File", "Arquivo de zona"),
     ("Zone Records", "Registros de zona"),
