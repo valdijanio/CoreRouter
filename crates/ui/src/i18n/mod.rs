@@ -221,6 +221,13 @@ mod tests {
                 ids.push(key);
             }
         }
+        for (id, en) in corerouter_engine::dns_upstreams::TEXTS {
+            let key = format!("dnsbench.{id}");
+            let pt = lookup(Lang::Pt.templates(), &key)
+                .unwrap_or_else(|| panic!("dns_lookup_pt.rs lacks {key}"));
+            assert_eq!(places(en), places(pt), "{key}");
+            ids.push(key);
+        }
         for (id, en) in corerouter_engine::dns_lookup::WHY_TEXTS {
             let key = format!("dnswhy.{id}");
             let pt = lookup(Lang::Pt.templates(), &key)
