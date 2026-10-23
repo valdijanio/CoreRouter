@@ -268,31 +268,53 @@ pub fn root_test(root: &Path) -> Outcome {
         Err(e) => return Outcome::Fail(e),
     }
     let exe_s = exe.to_string_lossy().into_owned();
-    let run = sudo(&[
-        "ip",
-        "netns",
-        "exec",
-        ns,
-        "env",
-        "COREROUTER_XDP_ROOT=1",
-        &exe_s,
-        "--test-threads=1",
-        "--nocapture",
-    ]);
-    let _ = sudo(&["ip", "netns", "del", ns]);
-    match run {
-        Ok(o) => {
-            eprint!("{}", String::from_utf8_lossy(&o.stdout));
-            eprint!("{}", String::from_utf8_lossy(&o.stderr));
-            if o.status.success() {
-                Outcome::Ok
-            } else {
-                Outcome::Fail(format!("xdp_root: {}", o.status))
-            }
+    // One test at a time, each with a deadline, output straight to the log:
+    // a hang shows which test, and never holds the CI job.
+    let mut failed = Vec::new();
+    for (test, secs) in XDP_TESTS {
+        eprintln!("--- xdp_root {test}");
+        let status = Command::new("timeout")
+            .args([
+                "--kill-after=10",
+                &secs.to_string(),
+                "sudo",
+                "-n",
+                "ip",
+                "netns",
+                "exec",
+                ns,
+                "env",
+                "COREROUTER_XDP_ROOT=1",
+                &exe_s,
+                test,
+                "--exact",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .current_dir(root)
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) if s.code() == Some(124) => failed.push(format!("{test}: timed out after {secs} s")),
+            Ok(s) => failed.push(format!("{test}: {s}")),
+            Err(e) => failed.push(format!("{test}: {e}")),
         }
-        Err(e) => Outcome::Fail(e),
+    }
+    let _ = sudo(&["ip", "netns", "del", ns]);
+    if failed.is_empty() {
+        Outcome::Ok
+    } else {
+        Outcome::Fail(failed.join("; "))
     }
 }
+
+/// The root tests and how long each may take (seconds).
+const XDP_TESTS: [(&str, u32); 4] = [
+    ("loads_attaches_and_counts", 180),
+    ("kernel_and_host_agree", 300),
+    ("perf_lpm_cost", 600),
+    ("perf_pktgen_veth", 300),
+];
 
 fn test_binary(root: &Path) -> Result<PathBuf, String> {
     let out = crate::cargo()

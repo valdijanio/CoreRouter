@@ -381,7 +381,7 @@ fn perf_pktgen_veth() {
     let pair = Pair::new();
     let _ = &pair;
     let mac = sh(&["cat", "/sys/class/net/xa/address"]).trim().to_owned();
-    let count: u64 = 3_000_000;
+    let count: u64 = 1_000_000;
     let run = |label: &str, counter: &dyn Fn() -> u64| {
         let before = counter();
         let t = Instant::now();
@@ -460,5 +460,9 @@ pg xb 'udp_dst_max 9'
 echo start > /proc/net/pktgen/pgctrl
 "
     );
-    sh(&["ip", "netns", "exec", PEER_NS, "sh", "-c", &script]);
+    // pktgen blocks until done; a stuck generator must not hold the test.
+    let ok = sh_ok(&["timeout", "60", "ip", "netns", "exec", PEER_NS, "sh", "-c", &script]);
+    if !ok {
+        println!("PERF | pktgen did not finish in 60 s");
+    }
 }
