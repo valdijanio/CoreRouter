@@ -33,7 +33,7 @@ claude mcp add corerouter -- corerouter-cli mcp
 |---|---|---|
 | `list_commands` / `command_list` | Registro inteiro (id, `params`, enabled + motivo); `prefix` filtra | read-only |
 | `run_command` / `command_run` | `{command, params}` → `Session::execute` | destrutiva |
-| `command_batch` | Até 256 passos, `"$N.chave"` referencia resultados; `atomic` (padrão true) = um commit | destrutiva |
+| `command_batch` | Até 32 768 passos, `"$N.chave"` referencia resultados; `atomic` (padrão true) = um commit | destrutiva |
 | `inspect_state` / `state_inspect` | Resumo, ou uma subárvore por `path` (`interfaces`, `routing.bgp`, `running.ip`, `journal`) | read-only |
 | `run_task` / `task_run` | Inicia uma ferramenta em segundo plano (`tool.ping.start`, `tool.ping.mtu`…), junta eventos até terminar ou `wait_secs` (≤ 60), para se preciso; devolve `summary` + últimos 50 eventos (`docs/tools.md`). Só comandos `tool.*` (outro id é recusado antes de rodar) | read-only |
 | `ui_screenshot` / `screenshot` | PNG da janela (só Remote com GUI) | read-only |
@@ -41,7 +41,7 @@ claude mcp add corerouter -- corerouter-cli mcp
 Erros de tool voltam como texto com `isError: true` ("unknown parameter 'adress'; did you mean
 'address'?"), nunca como erro de protocolo — o agente lê e corrige.
 
-Limites: linha de até 16 MiB, `command_batch` até 256 passos.
+Limites: linha de até 16 MiB, `command_batch` até 32 768 passos (`engine::session::MAX_BATCH`).
 
 Lote JSON-RPC (um array na linha) é recusado (G0.5c): a revisão MCP 2025-06-18, a única que o
 servidor negocia, removeu o batching. A resposta é **um** objeto `-32600` com `id: null` e nenhum
