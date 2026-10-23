@@ -359,7 +359,7 @@ fn a_static_route_holds_its_place() {
         defaults[1]["reason"]
             .as_str()
             .unwrap()
-            .contains("lower distance")
+            .contains("loses to distance")
     );
 }
 

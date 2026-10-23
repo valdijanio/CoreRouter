@@ -72,6 +72,15 @@ impl LinkWatch {
     pub fn get(&self, name: &IfName) -> Option<&LinkTimes> {
         self.links.get(name)
     }
+
+    /// Links last seen without carrier (G1.27: their routes are inactive).
+    pub fn down_links(&self) -> Vec<IfName> {
+        self.links
+            .iter()
+            .filter(|(_, t)| !t.running)
+            .map(|(n, _)| n.clone())
+            .collect()
+    }
 }
 
 impl Session {

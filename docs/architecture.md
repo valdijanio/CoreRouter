@@ -465,6 +465,18 @@ escrevem regras comuns pelo mesmo `add` dos comandos de regra; a GUI só junta p
   recoloca depois, para que o desfazer de uma falha devolva tudo. Rota existente no kernel só é
   adotada se for idêntica (static, mesma tabela/métrica/next hop); outra rota no mesmo destino e
   métrica faz o apply falhar e desfazer.
+- **ECMP (G1.27a):** rotas de mesma distância ao mesmo destino formam um grupo (como no RouterOS
+  v7). O plano e o drift continuam vendo um `KernelRoute` por caminho; quem junta é o executor
+  netlink: o primeiro op de rota de um apply lê as rotas `static` do kernel uma vez (cache do
+  apply), e acrescentar/tirar um caminho de um grupo reescreve a rota inteira com
+  `RTA_MULTIPATH` (`NLM_F_REPLACE`). Só caminhos que o config de origem ou de destino põe no
+  kernel entram num grupo: uma rota `static` de outro programa no mesmo destino e métrica
+  continua fazendo o apply falhar. Escolhido em vez de mudar o `Op` do plano para "grupo" porque
+  o IPv4 apaga a rota multipath inteira se o delete casa só o primeiro caminho, então o executor
+  precisa da visão do kernel de qualquer jeito, e o plano (e os testes dele) ficam como estão.
+  Custo: uma leitura de links e rotas por apply que mexe em rota (`hal_linux_apply/routes` em
+  `docs/routes.md` e no `docs/perf.md`). Detalhes da janela, do motivo e do lookup:
+  `docs/routes.md`.
 
 Proteções do host: só interfaces do config entram no plano; o `lo` do kernel não é descoberto;
 link existente só é adotado se tiver o mesmo tipo (e VLAN id/pai) do config, e nunca se apaga
@@ -668,6 +680,31 @@ também o roda), o engine guarda o estado e aplica os efeitos, o daemon só o di
   (tirar da config o restaura).
 - O engine (`tuning.rs`) calcula perfis, faixas e diagnóstico, puro e testado sem kernel.
 - Medida de pps em netns: `docs/tuning.md`.
+
+### Menu lateral e ícones (G0.23)
+
+O menu é uma árvore (grupo › subgrupo › janela) montada de uma **tabela central**,
+`crates/ui/src/menu.rs` (`CATALOG`, indexada pela chave da janela): subgrupo, rótulo curto,
+ícone, caminho no RouterOS, comandos e sinônimos de busca. Os painéis continuam declarando só o
+grupo (`WinDef::group`); a tabela evita editar cada painel (arquivos de outras sessões) e um teste
+garante que toda janela tem entrada, ícone, explicação em EN e PT e sinônimos. Os comandos do ⓘ
+vêm do `engine.list` do roteador, filtrados pelos prefixos da tabela: a UI não mantém lista
+própria. Grupos abertos são preferência da janela (`prefs.rs`, chave `menu`).
+
+**Ícones: Phosphor Icons (MIT), fonte embutida em subconjunto, sem dependência nova.**
+
+- **Comparado:** o crate `egui-phosphor` (MIT/Apache-2.0) era o caminho óbvio, mas a 0.14 (a mais
+  nova, 2026-09) depende de egui 0.36 e o workspace está no 0.37: seriam duas versões do egui no
+  build (tempo de compilação, wasm maior) só para ler bytes e constantes. Ícones desenhados à mão
+  (como o ⓘ do G0.15) não escalam para ~50 desenhos.
+- **Como fica:** `crates/ui/assets/phosphor/Phosphor-subset.ttf` (16,0 KB, 50 ícones, **medido**;
+  a fonte completa tem 489 KB) é cortado da `Phosphor.ttf` do próprio crate `egui-phosphor`
+  0.14.0 por `scripts/icons-subset.sh` (pyftsubset), a partir dos códigos listados em
+  `crates/ui/src/icons.rs`. A fonte entra numa família própria (`FontFamily::Name("phosphor")`),
+  porque a fonte de emoji do egui usa os mesmos códigos da área privada para outros desenhos.
+  Compila em `wasm32-unknown-unknown` (é só `include_bytes!`). O teste `the_font_has_every_icon`
+  reprova ícone sem glifo. Quando o `egui-phosphor` acompanhar o egui do workspace, dá para trocar
+  o subconjunto pelo crate (macro `subset!`) sem mudar `icons.rs`.
 
 ## Histórico de revisão
 
