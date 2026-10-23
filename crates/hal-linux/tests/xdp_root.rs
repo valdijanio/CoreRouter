@@ -458,6 +458,9 @@ pg xb 'flag IPSRC_RND'
 pg xb 'udp_dst_min 9'
 pg xb 'udp_dst_max 9'
 echo start > /proc/net/pktgen/pgctrl
+# Let go of xb before anyone deletes it: a device pktgen still holds never
+# finishes unregistering, with the rtnl lock held (the CI VM hung on it).
+echo reset > /proc/net/pktgen/pgctrl
 "
     );
     // pktgen blocks until done; a stuck generator must not hold the test.
