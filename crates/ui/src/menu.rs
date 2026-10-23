@@ -104,6 +104,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("routes", None, None, icons::SIGNPOST, "/ip route", &["ip.route"], &["rota", "rotas", "rota padrão", "default route", "gateway", "0.0.0.0/0", "static route", "ipv4"]),
     e("services", None, None, icons::HEARTBEAT, "/system service", &["system.service"], &["supervisor", "daemon", "processo", "failed", "restart", "reiniciar"]),
     e("settings", None, None, icons::SLIDERS_HORIZONTAL, "", &[], &["language", "idioma", "theme", "tema", "preferences", "preferências"]),
+    e("traffic-flow", None, None, icons::SHARE_NETWORK, "/ip traffic-flow", &["ip.traffic-flow"], &["netflow", "ipfix", "sflow", "flow export", "fluxos", "nat log", "log de nat", "marco civil", "top talkers", "coletor", "collector", "pmacct", "goflow"]),
     e("tuning", None, None, icons::GAUGE, "/system tuning", &["system.tuning"], &["sysctl", "performance", "desempenho", "irq", "rps", "governor", "boot", "kernel"]),
     e("vrf", None, None, icons::STACK, "/ip vrf", &["ip.vrf"], &["routing table", "tabela de rotas", "l3vpn"]),
 ];
