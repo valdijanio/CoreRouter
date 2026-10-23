@@ -332,19 +332,31 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
   - hairpin: quem recebe vê o IP público de quem mandou;
   - tirar os pools apaga a tabela;
   - modo blocos: sem ouvinte da fila, o primeiro pacote cai; com ouvinte, sai no bloco alocado; o
-    bloco sobrevive à troca da tabela.
+    bloco sobrevive à troca da tabela;
+  - esgotamento (G2.3e, RFC 6888 REQ-3/11): com 64 portas, 80 fluxos dão exatamente 64, todos no slot
+    do assinante (nunca uma porta do vizinho), e o kernel conta as recusas;
+  - remapear mata as conexões antigas mesmo com um ping no meio (o bug do #178).
+- **Bateria de propriedades (`crates/engine/tests/cgnat_battery.rs`, G2.3e):**
+  - para formas aleatórias de pool, o que o planner diz que cabe é o que o pool criado com os
+    parâmetros dele faz;
+  - a prévia é a tabela do pool;
+  - todo assinante volta pelo "Quem era?" a partir do próprio slot (primeira, última e porta do
+    meio);
+  - entrada hostil no planner, na exportação e no "Quem era?" vira erro de parâmetro, nunca panic.
+- **Fast path (G2.4):** veja `docs/fastpath.md` §3.
+- **Desempenho:** seção 6 (benches `netns_cgnat`, `netns_cgnat_pps`, `cgnat_who_was`).
 
 ## 4. Plano das próximas partes
 
 | Parte | O que entra |
 |---|---|
 | G2.3b (feito) | nftables por nfnetlink, sem o binário `nft`; diferença de elementos; uma regra para todos os protocolos; remapeados derrubados e mapeamentos UDP esquecidos; números em `docs/architecture.md` §1.2.1 |
-| G2.2a | IP › Firewall › Connections (ctnetlink: lista, filtros, assinantes com mais conexões, kill, timeouts, uso da tabela, coluna Via) |
+| G2.2a (feito) | IP › Firewall › Connections (ctnetlink: lista, filtros, assinantes com mais conexões, kill, timeouts, uso da tabela, coluna Via) |
 | G2.3c (feito) | Modo blocos (fila 7422 + alocador pareado, cresce, solta com quarentena de 120 s), log por bloco (log do roteador e syslog), "Quem era?" pelo histórico de blocos, alerta de portas |
 | G2.3d (feito) | Janela IP › Firewall › CGNAT: pools, exceções, Quem era?, mapeamento, histórico, alertas; ⓘ em cada campo |
 | G6.9a (feito) | Tools › IP Calculator: Subnet, IPv6/PD, CGNAT planner (criar pool, exportar, ver regras, script RouterOS); comandos `tool.ip-calc.*` |
-| G2.4a | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |
-| G2.3e | Bateria final de bugs e desempenho e o relatório (seção 6) |
+| G2.4a (feito) | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |
+| G2.3e (feito) | Bateria final de bugs e desempenho e o relatório (seção 6) |
 
 ## 5. Pesquisa
 
@@ -458,24 +470,85 @@ Kernel:
 
 ## 6. Desempenho
 
-Carga da tabela (G2.3b, **medido**, release, netns, Ryzen AI MAX+ 395, kernel 7.0, 2026-10-23):
+Tudo **medido** em 2026-10-23, build release, num namespace sem root, Ryzen AI MAX+ 395 (32 threads),
+kernel 7.0. A máquina estava com carga 8–16 (CIs de outras sessões): os números comparam
+configurações entre si, num núcleo. Não são o teto de um servidor.
+
+### 6.1 Carga da tabela (G2.3b)
 
 | Operação | netlink | `nft -f` |
 |---|---|---|
 | 64 Ki assinantes | 66 ms | 303 ms |
 | um assinante a mais | 0,155 ms | 2,40 ms |
 
-Tabela completa em `docs/architecture.md` §1.2.1. O resto é medido em G2.3e.
+Tabela completa em `docs/architecture.md` §1.2.1 (bench `netns_cgnat`).
 
-Antecipação **medida** na pesquisa (AMD Ryzen AI MAX+ 395, kernel 7.0, nft
-1.0.9, 2026-10-23):
+### 6.2 Pacotes por segundo pelo NAT (bench `netns_cgnat_pps`)
 
-- 65 536 elementos de mapa carregam em 0,60–0,63 s pelo `nft -f`;
-- substituir o mapa leva o mesmo tempo;
-- apagar e recriar a tabela leva 0,83 s;
-- um `nft add element` avulso custa quase o mesmo que recarregar tudo, porque o `nft` lê o
-  conjunto inteiro antes.
+Um gerador `AF_PACKET` em Rust escreve quadros UDP de 64 bytes de 255 assinantes (um fluxo
+cada) numa veth. Eles atravessam o CGNAT e saem por outra veth, e os `tx_packets` dela contam.
+Antes de medir, cada fluxo recebe uma resposta (escrita do outro lado a partir da tupla do
+conntrack): UDP só fica `established` depois de uma resposta, e só aí entra no flowtable.
 
-Esse último número é o argumento do G2.3b para o netlink direto.
+| Caminho | pps (mediana) |
+|---|---|
+| só roteamento (sem conntrack) | ~830 mil |
+| CGNAT (conntrack + mapa da fórmula) | ~650 mil |
+| CGNAT + fast path em software (G2.4) | ~1,04 milhão (254 de 255 fluxos no flowtable) |
 
-O que um teste em veth mede, e o que só hardware mostra, fica no relatório final.
+O fast path devolve o custo do NAT e do conntrack: com ele o CGNAT fica no nível do
+roteamento puro (o limite passa a ser a veth num núcleo).
+
+### 6.3 Conexões novas por segundo
+
+Cada quadro é uma conexão nunca vista (outra porta de origem de um dos 255 assinantes). Entre as
+rodadas, fora do tempo, as conexões novas são apagadas: cada rodada começa com ~20 conexões por
+assinante, como num roteador.
+
+| Caminho | conexões novas/s |
+|---|---|
+| só conntrack, sem NAT | ~551 mil |
+| CGNAT, EIM desligado | ~274 mil |
+| CGNAT (EIM ligado, o padrão) | ~255 mil |
+
+- O NAT custa cerca de metade da criação da conexão: a escolha de uma porta livre no slot do
+  assinante (`nf_nat`).
+- O EIM (o `update` no mapa dinâmico) custa pouco, ~7 %.
+- **Slot quase cheio:** sem apagar entre as rodadas, as conexões se acumulam até perto das 1000
+  portas de cada assinante, e a taxa cai para **~13 mil/s**, ~20× mais lenta. Com quase todas as
+  portas ocupadas, o kernel tenta várias antes de achar uma livre (ou desistir).
+- **Consequência operacional:** o alerta de portas (padrão 90 %) avisa antes desse ponto.
+  Assinantes que vivem perto do limite pedem mais portas por assinante (o planner mostra quantas
+  cabem).
+
+### 6.4 "Quem era?" (bench `cgnat_who_was`, engine)
+
+| Pool | Histórico | Latência |
+|---|---|---|
+| 64 Ki assinantes | 1 época | 1,4 µs |
+| 64 Ki assinantes | 365 épocas (uma mudança por dia, um ano) | 3,0 µs |
+
+É a busca da época em vigor mais o `Layout::reverse`: não depende do tráfego nem de log, porque não
+há log por conexão (RFC 7422 §2).
+
+### 6.5 Memória por conexão (**estimado**)
+
+O `struct nf_conn` com as extensões de NAT, contabilidade e timestamp ocupa ~320–400 bytes no slab
+`nf_conntrack` (fonte do kernel 6.x/7.x). O tamanho medido exige ler `/proc/slabinfo` como root, e
+fica no G2.3f: `sudo grep nf_conntrack /proc/slabinfo` (coluna `objsize`).
+
+Para 1 milhão de conexões, ~400 MB. Os mapas do CGNAT são ~200 B por assinante (**estimado**): 13 MB
+para 64 Ki assinantes.
+
+### 6.6 O que veth mede e o que só hardware mostra
+
+- **A veth mede** o custo relativo no kernel: NAT × roteamento × fast path, criação de conexão,
+  efeito do slot cheio e o tempo de aplicar a tabela.
+- **A veth não mede:**
+  - vazão por porta com RSS em vários núcleos;
+  - custo de interrupção e DMA;
+  - limite da tabela de CT de uma placa;
+  - offload em hardware (veth recusa `flags offload`);
+  - comportamento com milhões de conexões vivas e a memória real.
+
+Isso é o G2.3f (CGNAT em servidor real) e o G2.4b (ConnectX em switchdev).

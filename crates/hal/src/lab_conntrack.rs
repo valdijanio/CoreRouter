@@ -57,6 +57,13 @@ pub fn waiting(
     out
 }
 
+/// The ports of the lab's flowtable (every one exists in the lab).
+pub fn fastpath_ports(cfg: &Config) -> Vec<String> {
+    corerouter_firewall::fastpath::devices(&cfg.ip.fastpath, cfg, |n| {
+        cfg.interfaces.keys().any(|k| k.as_str() == n)
+    })
+}
+
 pub fn table(
     cfg: &Config,
     killed: &BTreeSet<u32>,
@@ -70,6 +77,12 @@ pub fn table(
         Ipv4Addr::new(1, 1, 1, 1),
         Ipv4Addr::new(200, 160, 2, 3),
     ];
+    let fast = cfg.ip.fastpath.enabled;
+    let hw = fast
+        && cfg.ip.fastpath.hw_offload != corerouter_model::fastpath::HwOffload::No
+        && crate::virt::LAB_SWITCHDEV
+            .iter()
+            .any(|p| fastpath_ports(cfg).iter().any(|d| d == p));
     let mut push = |c: Conn| {
         if !killed.contains(&c.id) {
             out.push(c);
@@ -127,9 +140,17 @@ pub fn table(
                 if protocol == 6 && !h.is_multiple_of(4) {
                     st |= status::ASSURED;
                 }
+                // With the fast path on (G2.4) some established TCP and UDP
+                // connections are in the flowtable, and with hardware offload
+                // a few of those in the card (the lab's switchdev port).
                 match h % 23 {
-                    0..=5 => st |= status::OFFLOAD,
-                    6 => st |= status::OFFLOAD | status::HW_OFFLOAD,
+                    0..=5 if fast && protocol != 1 => st |= status::OFFLOAD,
+                    6 if fast && protocol != 1 => {
+                        st |= status::OFFLOAD;
+                        if hw {
+                            st |= status::HW_OFFLOAD;
+                        }
+                    }
                     _ => {}
                 }
                 let id = u32::try_from((u64::from(u32::from(sub)) ^ (k << 20) ^ h) & 0xffff_ffff)

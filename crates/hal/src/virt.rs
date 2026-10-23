@@ -27,6 +27,14 @@ use crate::{
     SimProber,
 };
 
+/// Lab ports that pretend to be NVIDIA ConnectX-6 Dx ports (G2.4): the
+/// first in the default `legacy` eSwitch mode (software flowtable only,
+/// with the command to switch), the second a switchdev uplink
+/// representor with `hw-tc-offload` on.
+pub const LAB_MLX5: [&str; 2] = ["ether7", "ether8"];
+/// The one of [`LAB_MLX5`] in switchdev mode.
+pub const LAB_SWITCHDEV: [&str; 1] = ["ether8"];
+
 #[derive(Clone)]
 pub struct VirtualHal {
     ports: Vec<IfName>,
@@ -430,6 +438,60 @@ impl Hal for VirtualHal {
             }
         }
         Ok(())
+    }
+
+    fn eswitch(&mut self, name: &IfName) -> Result<crate::fastpath::Eswitch, HalError> {
+        use crate::fastpath::{Eswitch, EswitchMode};
+        let iface = self
+            .applied
+            .interfaces
+            .get(name)
+            .ok_or_else(|| self.missing(name))?;
+        if iface.kind != InterfaceKind::Ethernet || self.port_index(name).is_none() {
+            return Ok(Eswitch {
+                notes: vec!["a software interface: its ports' cards decide".into()],
+                ..Eswitch::default()
+            });
+        }
+        let Some(i) = LAB_MLX5.iter().position(|p| *p == name.as_str()) else {
+            return Ok(Eswitch {
+                driver: Some("corerouter-virt".into()),
+                notes: vec!["the lab's virtual NIC has no flow offload".into()],
+                ..Eswitch::default()
+            });
+        };
+        let switchdev = LAB_SWITCHDEV.contains(&name.as_str());
+        Ok(Eswitch {
+            driver: Some("mlx5_core".into()),
+            firmware: Some("22.39.1002".into()),
+            devlink: Some(format!("pci/0000:3b:00.{i}")),
+            mode: Some(if switchdev {
+                EswitchMode::Switchdev
+            } else {
+                EswitchMode::Legacy
+            }),
+            representor: switchdev,
+            hw_tc_offload: Some(switchdev),
+            notes: vec!["simulated ConnectX-6 Dx (virtual lab)".into()],
+        })
+    }
+
+    fn fastpath_state(&mut self) -> crate::fastpath::FastPathState {
+        let fp = &self.applied.ip.fastpath;
+        let devices = crate::lab_conntrack::fastpath_ports(&self.applied);
+        if !fp.enabled || devices.is_empty() {
+            return crate::fastpath::FastPathState::default();
+        }
+        let capable = devices.iter().any(|d| LAB_SWITCHDEV.contains(&d.as_str()));
+        let asked = fp.hw_offload != corerouter_model::fastpath::HwOffload::No;
+        crate::fastpath::FastPathState {
+            active: true,
+            hardware: asked && capable,
+            note: (asked && !capable).then(|| {
+                "hardware offload refused (Operation not supported): no port in switchdev mode; running in software".into()
+            }),
+            devices,
+        }
     }
 
     fn cgnat_waiting(&mut self) -> Vec<crate::cgnat::Waiting> {

@@ -62,6 +62,10 @@ name = "netns_cgnat"
 harness = false
 
 [[bench]]
+name = "netns_cgnat_pps"
+harness = false
+
+[[bench]]
 name = "netns_capture"
 harness = false
 
