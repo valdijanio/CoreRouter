@@ -15,14 +15,24 @@ use std::time::Duration;
 
 use corerouter_engine::{ConfigStorage, Session};
 use corerouter_hal::VirtualHal;
-use corerouter_model::{Config, ConfigStore, Gateway, RouteEntry, RoutingTable, persist};
+use corerouter_model::{AddressEntry, Config, ConfigStore, Gateway, RouteEntry, RoutingTable, persist};
 use corerouter_storage_fs::FileStorage;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::json;
 
-/// The lab's own config with `n` distinct static /24 routes.
+/// The lab's own config with 192.0.2.1/24 on ether1 and `n` distinct
+/// static /24 routes through 192.0.2.254.
 fn routes(n: usize) -> Config {
     let mut cfg = Session::virtual_lab().store().running().clone();
+    let id = cfg.ip.next_address_id();
+    cfg.ip.addresses.push(AddressEntry {
+        id,
+        address: "192.0.2.1/24".parse().unwrap(),
+        interface: "ether1".parse().unwrap(),
+        disabled: false,
+        comment: String::new(),
+        from_pool: None,
+    });
     for i in 0..n {
         let [hi, lo] = u16::try_from(i).unwrap().to_be_bytes();
         let id = cfg.ip.next_route_id();
