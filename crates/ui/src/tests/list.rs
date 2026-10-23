@@ -175,7 +175,7 @@ const SPEC: Spec = Spec {
     edit_title: "Address",
     help: "ip.address",
     fields: FIELDS,
-    preview: "ip.address.preview",
+    preview: "ip.address.check",
 };
 
 #[test]

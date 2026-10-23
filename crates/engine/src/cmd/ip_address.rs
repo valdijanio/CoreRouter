@@ -35,7 +35,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         has_static,
         set
     ),
-    cmd!(query "ip.address.preview", "Preview Address", [], None,
+    cmd!(query "ip.address.check", "Check Address", [], None,
         "{address?: string, interface?: string, to?: string (last address of a series: one entry per address from address to to, at most 256), id?: string (the address being edited), disabled?: bool, comment?: string, from_pool?: string, arp?: bool (default true: ARP probe for an IPv4 address, RFC 5227)} → {computed: [{label, value}], checks: [{level (ok | warning | error | pending | info), check, message, param}], commands: [{command, params}], risk, count}",
         always, preview),
 ];

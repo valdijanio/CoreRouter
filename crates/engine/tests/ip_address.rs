@@ -27,7 +27,7 @@ fn row(s: &mut Session, address: &str) -> Value {
 }
 
 fn preview(s: &mut Session, p: Value) -> Value {
-    ok(s, "ip.address.preview", p)
+    ok(s, "ip.address.check", p)
 }
 
 fn levels(p: &Value, check: &str) -> Vec<String> {
@@ -455,7 +455,7 @@ fn the_access_address_asks_before_it_goes() {
     let p = s
         .execute_as(
             &who,
-            "ip.address.preview",
+            "ip.address.check",
             &json!({"id": lan, "disabled": true}),
         )
         .unwrap();
@@ -463,7 +463,7 @@ fn the_access_address_asks_before_it_goes() {
     let p = s
         .execute_as(
             &who,
-            "ip.address.preview",
+            "ip.address.check",
             &json!({"id": lan, "comment": "mgmt"}),
         )
         .unwrap();

@@ -1,7 +1,7 @@
 //! "Is this address already in use on the wire?" before it is added
 //! (G1.28): an ARP probe (RFC 5227 §2.1.1: who-has the address, sender IP
 //! 0.0.0.0, so nobody's ARP cache learns it) on the interface, then a short
-//! wait for an answer. `ip.address.preview` starts it and reads it on
+//! wait for an answer. `ip.address.check` starts it and reads it on
 //! later calls, so the GUI never waits: it shows "checking…" and asks
 //! again.
 //!

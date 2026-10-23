@@ -2,7 +2,7 @@
 //! (G0.24, `docs/ui-style.md`): the bar + − ✓ ✗ 💬, filter chips, state and
 //! origin chips, interface and VRF chips by key, the footer, the right-click
 //! menu with copy as command, and the add/edit modal fed by
-//! `ip.address.preview` (network, series, overlap, ARP, access risk).
+//! `ip.address.check` (network, series, overlap, ARP, access risk).
 //!
 //! The window stays `Win::Addresses` (its place in the menu and the stored
 //! preferences); this panel has no window of its own and holds the state:
@@ -104,7 +104,7 @@ pub(crate) const SPEC: Spec = Spec {
     edit_title: "Address",
     help: "ip.address",
     fields: FIELDS,
-    preview: "ip.address.preview",
+    preview: "ip.address.check",
 };
 
 const COLUMNS: [table::Column; 7] = [

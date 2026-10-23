@@ -215,7 +215,7 @@ const FIELDS: &[Field] = &[
             input: Input::Choice, edit: true },
 ];
 const SPEC: Spec = Spec { panel: NAME, parent: Win::Panel(WIN), new_title: "New Address",
-    edit_title: "Address", help: "ip.address", fields: FIELDS, preview: "ip.address.preview" };
+    edit_title: "Address", help: "ip.address", fields: FIELDS, preview: "ip.address.check" };
 
 // window(): a barra e a tabela
 let picked: Vec<Item> = linhas_selecionadas.map(|r| Item::of(r, "id", "dynamic")).collect();
