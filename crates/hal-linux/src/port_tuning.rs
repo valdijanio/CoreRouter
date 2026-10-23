@@ -234,7 +234,9 @@ pub struct Ports {
     orig: BTreeMap<(IfName, String), i64>,
 }
 
-type PortMap = BTreeMap<IfName, BTreeMap<String, i64>>;
+/// One port's settings, by key.
+type Settings = BTreeMap<String, i64>;
+type PortMap = BTreeMap<IfName, Settings>;
 
 impl Ports {
     /// Bring every port from `from` to `to`, all or nothing.
@@ -246,7 +248,8 @@ impl Ports {
     ) -> Result<(), HalError> {
         let empty = BTreeMap::new();
         let names: Vec<&IfName> = from.keys().chain(to.keys()).collect();
-        let mut done: Vec<(IfName, BTreeMap<String, i64>, BTreeMap<String, i64>)> = Vec::new();
+        // (port, its settings now, what to put back).
+        let mut done: Vec<(IfName, Settings, Settings)> = Vec::new();
         let mut seen = Vec::new();
         for name in names {
             if seen.contains(&name) {

@@ -9,6 +9,9 @@ use corerouter_model::tuning::{PORT_PARAMS, Param};
 
 use crate::tuning::{Machine, Profile, Rec, recommend, why};
 
+/// Code of `noqueue` in `corerouter_model::tuning::QDISCS`.
+const NOQUEUE: i64 = 4;
+
 /// One port as the profile sees it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Port {
@@ -89,7 +92,11 @@ pub fn recommend_port(profile: Profile, m: &Machine, port: &Port) -> BTreeMap<&'
             "rx_usecs" | "tx_usecs" if profile == Latency => Some(why("coalesce_off", 0, &[])),
             "rx_pause" | "tx_pause" => Some(why("pause", 0, &[])),
             "txqueuelen" => Some(why("default", 1000, &[])),
-            "qdisc" => Some(if port.tx_queues.unwrap_or(1) > 1 {
+            // A virtual port (veth, dummy) sends at once, with no queue
+            // of its own: fq_codel there only costs (netns_forward: −7 %).
+            "qdisc" => Some(if port.now.get("qdisc").copied().flatten() == Some(NOQUEUE) {
+                why("qdisc_noqueue", NOQUEUE, &[])
+            } else if port.tx_queues.unwrap_or(1) > 1 {
                 why("qdisc_mq", 3, &[])
             } else {
                 why("qdisc_fq_codel", 0, &[])
@@ -180,9 +187,11 @@ mod tests {
                 assert!(!r.why.contains('{'), "{}", r.why);
             }
         }
-        // A single-queue port gets fq_codel.
+        // A single-queue port gets fq_codel; a virtual one keeps noqueue.
         let mut one = port();
         one.tx_queues = Some(1);
         assert_eq!(recommend_port(Profile::Balanced, &m, &one)["qdisc"].value, 0);
+        one.now.insert("qdisc".into(), Some(NOQUEUE));
+        assert_eq!(recommend_port(Profile::Balanced, &m, &one)["qdisc"].value, NOQUEUE);
     }
 }

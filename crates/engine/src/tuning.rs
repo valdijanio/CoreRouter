@@ -135,6 +135,7 @@ pub const WHY: &[(&str, &str)] = &[
     ("panic", "Reboot 10 s after a kernel panic instead of hanging."),
     ("pause", "Pause frames stop the whole port when one queue fills: head-of-line blocking for every flow."),
     ("qdisc_fq_codel", "One transmit queue: fq_codel keeps queuing delay low (no bufferbloat)."),
+    ("qdisc_noqueue", "A virtual port sends at once, with no queue of its own: a qdisc there only adds work."),
     ("qdisc_mq", "Several transmit queues: mq keeps one qdisc per queue (the default one, fq_codel), without a lock shared by all CPUs."),
     ("queues", "One queue per CPU of the port's NUMA node ({cpus}), up to the NIC's {max}."),
     ("ring", "{value} descriptors ({profile}), of the NIC's {max}: room for a burst without missed frames."),

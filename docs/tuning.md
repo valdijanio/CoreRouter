@@ -17,7 +17,7 @@ Partes:
 | Parte | O quê | Estado |
 |---|---|---|
 | G1.26a | Resumo (hardware, diagnóstico, perfil), Kernel (sysctl), Perfis, medida de pps | este documento |
-| G1.26b | Interfaces: anel, filas, RSS, coalescência, offloads, flow control, txqueuelen, qdisc | aberto |
+| G1.26b | Interfaces: anel, filas, coalescência, offloads, flow control, txqueuelen, qdisc, `rp_filter` por porta | este documento (RSS: G1.26g) |
 | G1.26c | CPU e IRQ: afinidade por nó NUMA, RPS/XPS, governor, C-states por PM QoS, watchdog | aberto |
 | G1.26d | Boot: parâmetros da imagem A/B | aberto |
 
@@ -140,6 +140,78 @@ contadores não zeram, e o diagnóstico por taxa é o G1.26e.
   - "Show differences" (modal com o motivo de cada um) e "Apply with Safe Mode".
 - **Perfis**: os quatro lado a lado, com o atual; em negrito o que muda.
 
+## Interfaces (G1.26b)
+
+Os ajustes de cada porta ficam em `system.tuning.ports` (porta → chave → valor), com o catálogo
+`PORT_PARAMS`:
+
+| Seção | Chaves | Como o CoreRouter grava |
+|---|---|---|
+| Anéis e filas | `rx_ring`, `tx_ring`, `combined_channels`, `rx_channels`, `tx_channels` | ethtool netlink `RINGS_SET`, `CHANNELS_SET` (**pisca o link**) |
+| Coalescência | `adaptive_rx`, `rx_usecs`, `adaptive_tx`, `tx_usecs` | `COALESCE_SET` |
+| Offloads | `gro`, `lro`, `tso`, `gso` | as opções Ethernet da porta (`interface.ethernet.set`, G1.20) |
+| Controle de fluxo | `rx_pause`, `tx_pause` | idem |
+| Fila de transmissão | `txqueuelen`, `qdisc` (fq_codel, fq, pfifo_fast, mq, noqueue) | rtnetlink (`IFLA_TXQLEN`, `RTM_NEWQDISC` raiz) |
+| Filtragem | `rp_filter` | `/proc/sys/net/ipv4/conf/<porta>/rp_filter` |
+
+Comportamento:
+
+- **Faixa**: o máximo de anéis e filas vem da própria placa (`*_MAX` do ethtool).
+- **Chave que a placa não tem** (veth sem anel, coalescência não suportada): recusada com o motivo.
+  Na aplicação, um valor que o driver não guardou desfaz a mudança toda da porta.
+- **Offloads e controle de fluxo** ficam num lugar só: as opções Ethernet da porta, que o
+  `interface.ethernet.set` também edita. Ligar o LRO aqui é recusado; o caminho com `force` do
+  G1.20 continua valendo para porta que só termina tráfego.
+- **Só portas gerenciadas**: os ajustes alcançam apenas as portas que o CoreRouter gerencia (a regra
+  de posse do G1.18); um link de outro programa nunca é tocado.
+- **Tirar uma chave da config** devolve o valor que a porta tinha.
+
+Comandos:
+
+| Comando | O que faz |
+|---|---|
+| `system.tuning.interface.parameter.print {name?, profile?}` | Por porta: atual, configurado, recomendado (e motivo), faixa da placa, `link_flap`, `fixed` |
+| `system.tuning.interface.print {}` | Só o que a config define, `[{name, key, value}]` (o `/export` o devolve como `set`) |
+| `system.tuning.interface.set {name, key, value}` | Define; avisa quando a mudança pisca o link |
+| `system.tuning.interface.unset {name, key}` | Tira da config: a porta volta ao próprio valor |
+| `system.tuning.interface.apply {profile, names?}` | Aplica o perfil em todas as portas (ou em `names`) num commit |
+
+Recomendação por porta:
+
+- **Anéis**: 2048 no balanceado, o máximo da placa no alto desempenho, 1024 na baixa latência.
+- **Filas**: uma por CPU do nó NUMA da porta, até o máximo da placa.
+- **Coalescência**: adaptativa; na baixa latência, desligada com 0 µs.
+- **Offloads**: GRO ligado; LRO desligado; TSO/GSO sem recomendação (irrelevantes para o
+  encaminhamento).
+- **Controle de fluxo**: desligado.
+- **`txqueuelen`**: 1000.
+- **Qdisc**:
+  - `mq` em placa de várias filas;
+  - `fq_codel` em placa de fila única;
+  - `noqueue` mantido em porta virtual (medido: `fq_codel` ali custa 7 %).
+- **`rp_filter`**: o mesmo valor do `all` do perfil (o kernel usa o maior dos dois).
+
+Diagnóstico novo:
+
+- **LRO ligado** numa porta: aviso.
+- **Controle de fluxo ligado**: nota.
+
+Na janela, a aba Interfaces tem:
+
+- o seletor de porta;
+- a mesma lista de propriedades, com os selos `flaps link` e `fixed`;
+- ⓘ por chave, com o comando `/system tuning interface set name=… key=… value=…`;
+- "Apply to all ports with Safe Mode".
+
+Teste em netns (`tests/netns_tuning.rs`), num veth de 4 filas:
+
+- canais, `txqueuelen`, qdisc e `rp_filter` mudam e voltam;
+- um anel (o veth não tem) desfaz a mudança toda;
+- uma porta `--unmanaged` fica intacta.
+
+O `netdevsim`, que teria anel e coalescência, precisa de root no namespace do host para criar o
+dispositivo, então fica fora dos testes sem root.
+
 ## Medida antes e depois
 
 `crates/hal-linux/benches/netns_forward.rs` (rode com `cargo xtask bench netns_forward`) mede, num
@@ -149,7 +221,8 @@ namespace sem root:
 - eles entram pelo par `fb`, são roteados e saem pelo dummy `fo`;
 - o `tx_packets` de `fo`, lido por rtnetlink, conta o que foi encaminhado.
 
-Uma CPU faz tudo. Os números estão em `docs/perf.md`.
+Uma CPU faz tudo. Os números estão em `docs/perf.md`. Um terceiro caso (G1.26b) põe `fq_codel` na
+porta de saída virtual.
 
 Limite da medida: num namespace só há os parâmetros por namespace. `netdev_budget`,
 `netdev_max_backlog` e os `gc_thresh` são do host e só podem ser medidos na máquina real, como
@@ -243,6 +316,7 @@ Pesquisa completa nas notas da sessão (`G1.26-research.md`). Resumo:
   - `ip_forward` gravado primeiro;
   - medida de pps antes e depois.
 - Vira gap:
+  - RSS: hash e tabela de indireção (G1.26g);
   - diagnóstico por taxa (G1.26e);
   - medida no host com root (G1.26f);
   - flowtable (o fasttrack do Linux), XDP (G2.5), RSS_SET, cpusets.

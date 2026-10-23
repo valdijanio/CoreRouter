@@ -152,7 +152,7 @@ impl Scope {
 }
 
 /// Width of the property list's columns.
-const COLS: [f32; 6] = [340.0, 170.0, 150.0, 170.0, 150.0, 28.0];
+const COLS: [f32; 6] = [320.0, 165.0, 150.0, 165.0, 200.0, 28.0];
 
 /// One parameter as `system.tuning.print` describes it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -256,7 +256,7 @@ impl Param {
         } else {
             self.choices
                 .iter()
-                .map(|(v, _)| v.to_string())
+                .map(|(_, n)| n.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         }

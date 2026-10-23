@@ -951,6 +951,10 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"Várias filas de transmissão: o mq mantém uma qdisc por fila (a padrão, fq_codel), sem uma trava dividida por todas as CPUs."##,
     ),
     (
+        "why.qdisc_noqueue",
+        r##"Uma porta virtual envia na hora, sem fila própria: uma qdisc ali só acrescenta trabalho."##,
+    ),
+    (
         "why.queues",
         r##"Uma fila por CPU do nó NUMA da porta ({cpus}), até as {max} da placa."##,
     ),
