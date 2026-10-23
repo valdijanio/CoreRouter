@@ -454,3 +454,77 @@ interfaces; inclui montar a entrada):
 e depois `record` (outra varredura para expulsar). Com o lock da sessão ocupado ~120 µs por
 datagrama, ~8 000 anúncios/s bastavam para segurá-lo o tempo todo; agora seriam ~1,2 M/s, e o
 limite de 200/s corta antes disso.
+
+### audit-e2e — import grande ponta a ponta (**medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release, 2026-10-22. `cargo bench -p corerouter-engine
+--bench batch_import` (N entradas de address-list num `Session::batch` atômico, lab novo), antes
+= `main` anterior ao #130, depois = `main` com o `AtomicBatch` do #130:
+
+| N | antes | depois | mudança |
+|---|---|---|---|
+| 1000 | 16,4 ms | 3,49 ms | −78,7% |
+| 4000 | 237 ms | 29,4 ms | −87,6% |
+
+No daemon real (release, um `engine.batch` por bloco), antes → depois do #130: 4000 regras
+1,02 s → 0,06 s; 20 000 entradas de address-list 22,8 s → 0,54 s; 10 000 rotas 18,3 s → 0,17 s;
+10 000 concessões fixas 64,0 s → 17,0 s (resto: G0.18). Commit com essa config: p50 110 ms →
+36 ms, máx. 297 ms → 55 ms.
+
+Memória do daemon (VmRSS/VmHWM de `/proc/<pid>/status`, release, backend virtual, medido antes
+do #130): ocioso
+10,8 MiB; + 4000 regras 47 MiB; + 20 000 entradas de address-list 137 MiB; + 10 000 rotas
+150 MiB (pico 257 MiB durante os commits seguintes, que serializavam o arquivo de 32 MiB; com o
+#130: 118 MiB depois das rotas, 220 MiB após 20 commits);
++ 10 000 concessões fixas 244 MiB (pico 310 MiB); cache DNS com 50 000 nomes distintos
+(encaminhador em loopback, upstream DoH local) 289 MiB, pico 354 MiB. Concessões dinâmicas não
+foram medidas (o lab virtual não tem caminho de DHCP sem namespace). 16 clientes × 60 s de
+escritas mistas (antes do #130): 4665 commits, 77/s, p50 208 ms, p99 450 ms, 0 erros; RSS 217 MiB.
+
+### audit-gui: um quadro da GUI com listas grandes (2026-10-22, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release (`cargo bench`), criterion. Bench novo
+`crates/ui/benches/frames.rs`: um quadro 1400×900 da UI real, com a janela aberta e a lista posta
+no cache (sem refresh entre quadros). "antes" = código da `main` (237ea9b) com os mesmos ganchos.
+
+| Bench | antes | depois |
+|---|---|---|
+| `ui_frame/addresses_10k` | 208 ms | 16,1 ms |
+| `ui_frame/addresses_10k_all_selected` (Ctrl+A) | 15,15 s | 28,0 ms |
+| `ui_frame/addresses_1k_4kB_comments` | 94,4 ms | 1,78 ms |
+| `ui_frame/firewall_5k_shadowed` | 155 ms | 21,0 ms |
+| `ui_frame/terminal_5000_lines` (200 caracteres) | 8,47 ms | 0,090 ms |
+
+### audit-perf — commit, execute e canal de controle sob carga
+
+Máquina A: AMD Ryzen AI MAX+ 395 (32 CPUs lógicas), Linux 7.0.0-38-generic; build release
+(bench); 2026-10-22. Todos **medidos**; antes = `main` c5db148 (mesmo bench, código da `main`).
+
+| Benchmark | Antes | Depois |
+|---|---|---|
+| `storage_fs/commit/routes_history64/1000` (arquivo, fsync, 64 revisões) | 23,7 ms | 4,47 ms |
+| `storage_fs/commit/routes_history64/10000` | 396 ms | 11,0 ms |
+| `engine_scale/commit/filter_rules/3000` | 51,2 ms | 2,07 ms |
+| `engine_scale/commit/routes/1000` | 17,6 ms | 0,65 ms |
+| `engine_scale/commit/routes/10000` | 380 ms | 6,29 ms |
+| `engine_scale/commit/addresses/10000` | 288 ms | 3,46 ms |
+| `engine_scale/commit/address_lists/20000` | 347 ms | 6,60 ms |
+| `engine_scale/import/address_lists/1000` (batch atômico) | 19,1 ms | 3,65 ms |
+| `engine_scale/import/address_lists/5000` | 423 ms | 60,8 ms |
+| `engine_execute/interface.list` | 10,3 µs | 8,15 µs |
+| `engine_execute/ip.address.list` | 1,39 µs | 0,223 µs |
+| `engine_execute/ip.address.add` | 29,6 µs | 19,9 µs |
+| `engine_execute/ip.firewall.filter.add` | 38,0 µs | 26,8 µs |
+| `engine_execute/rejected_param` | 1,21 µs | 0,815 µs |
+| `engine_execute/virtual_lab_new` | 8,04 µs | 7,36 µs |
+
+Canal de controle sob carga (`control_load/tcp/interface.list/N`, bench novo, TCP com token
+local, N conexões pedindo sem parar; latência de cada pedido):
+
+| Conexões | Vazão | p50 | p99 |
+|---|---|---|---|
+| 1 | 17,6 mil/s | 51,6 µs | 113 µs |
+| 4 | 61,5 mil/s | 62,6 µs | 106 µs |
+| 16 (`MAX_CONNECTIONS`) | 77,1 mil/s | 201 µs | 578 µs |
+
+A vazão satura em ~77 mil pedidos/s (~13 µs cada, o tempo com o lock da sessão).
