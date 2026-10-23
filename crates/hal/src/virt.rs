@@ -430,7 +430,7 @@ impl Hal for VirtualHal {
     }
 
     fn conntrack_events(&mut self) -> Result<Box<dyn crate::conntrack::EventSource>, HalError> {
-        let table = crate::lab_conntrack::table(&self.applied, &self.killed);
+        let table = crate::lab_conntrack::table(&self.applied, &self.killed, &self.blocks);
         Ok(Box::new(crate::lab_flow::LabEvents::new(table)))
     }
 

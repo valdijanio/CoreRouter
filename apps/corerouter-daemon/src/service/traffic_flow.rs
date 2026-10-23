@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use corerouter_engine::traffic_flow::IfRouter;
+use corerouter_engine::traffic_flow::{IfRouter, port_blocks};
 use corerouter_engine::{Shared, lock};
 use corerouter_hal::conntrack::{Event, EventSource, TableReader};
 use corerouter_model::traffic_flow::{
@@ -449,6 +449,8 @@ struct Running {
     source: String,
     accounting: (Option<bool>, Option<bool>),
     boot_ms: u64,
+    /// The router's log read up to here (CGNAT block events).
+    log_seq: u64,
 }
 
 impl Drop for Running {
@@ -503,6 +505,7 @@ impl Running {
             source,
             accounting,
             boot_ms: now_ms(),
+            log_seq: lock(session).log_seq(),
         })
     }
 
@@ -525,6 +528,11 @@ impl Running {
                 Ok((table, complete)) => self.meter.scan(&table, complete, now, router, &mut recs),
                 Err(e) => log::warn!("traffic-flow: reading the table: {e}"),
             }
+        }
+        if tf.nat_events {
+            let log = lock(session).log_since(self.log_seq);
+            self.log_seq = log.last().map_or(self.log_seq, |e| e.seq);
+            recs.extend(port_blocks(&log));
         }
         self.export(now, &recs, meta);
         if !recs.is_empty() && tf.retention_hours > 0 && tf.retention_records > 0 {
