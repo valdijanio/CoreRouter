@@ -680,3 +680,54 @@ A consulta (cadeia e lookup na adlist) não mudou além do ruído: sem `explain`
 teste de `Option`. Carregar uma lista de 1 milhão de nomes ficou ~30% mais lento (linha e forma
 de cada nome, ordenadas junto): ~0,3 s na thread do carregador, a cada 4 h, nunca na consulta.
 Memória: 36,8 MB contra 31,8 MB para 1 milhão de nomes (+5 bytes por nome).
+
+### G1.27c — IP › Routes com 1 milhão de rotas
+
+**Medido** em 2026-10-23, AMD Ryzen AI MAX+ 395 (32 CPUs), Linux 7.0, build release. Antes = a branch
+da G1.27b (`--save-baseline antes_c`), depois = G1.27c. Tabela de `corerouter_engine::perf::full_table`:
+1 000 000 de rotas (IPv4 /24 e um /16 a cada 256, IPv6 /48 a cada 20).
+
+| benchmark | antes | depois |
+|---|---|---|
+| `routes_1m/ip.route.list` (a lista inteira em JSON) | 4,83 s | 3,83 s (−21%) |
+| `routes_1m/ip.route.page/cold` (linhas refeitas) | — | 786 ms |
+| `routes_1m/ip.route.page/first` (linhas guardadas) | — | 4,56 ms |
+| `routes_1m/ip.route.page/last` | — | 4,41 ms |
+| `routes_1m/ip.route.page/prefix` (`12.0.0.0/8` contido) | — | 12,3 ms |
+| `routes_1m/ip.route.page/inactive` | — | 6,00 ms |
+| `routes_1m/ip.route.page/aggregate` (por /16) | — | 10,6 ms |
+| `ui_frame/routes_1m` (um quadro com a janela aberta) | 4,47 s | 796 µs |
+
+Antes, a janela recebia a lista inteira e remontava 1 M de linhas a cada quadro (4,47 s); depois
+recebe uma página de 500 e monta as linhas uma vez por resposta. O `ip.route.list` ficou 21% mais
+rápido porque as linhas vêm do cache; o resto é o JSON de 1 M de linhas (~30 campos cada).
+
+### G4.4b: codec de fluxos (medido)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build release (bench do criterion), 2026-10-23,
+`cargo bench -p corerouter-proto-flow --bench flow_codec`:
+
+| Operação | Tempo | Vazão |
+|---|---|---|
+| medidor: 10 mil conexões NAT, `NEW` + `DESTROY` (20 mil eventos, 30 mil registros) | 2,60 ms | 7,7 M eventos/s |
+| IPFIX: 30 mil registros (10 mil conexões) em mensagens de 1400 bytes | 1,88 ms | 16 M registros/s |
+| NetFlow v9: o mesmo | 2,09 ms | 14 M registros/s |
+
+Um CGNAT com 50 mil conexões novas por segundo gasta menos de 2 % de um núcleo no medidor e no
+codec juntos (**estimado** a partir destes números).
+
+### G4.4b: Traffic Flow ponta a ponta (medido)
+
+AMD Ryzen AI MAX+ 395, kernel 7.0, netns sem root, daemon em build de teste (sem otimização),
+2026-10-23. Comando: `COREROUTER_FLOW_BURST=<n> … cargo test -p corerouter-daemon --test
+netns_traffic_flow -- --nocapture`. As conexões são UDP com SNAT; depois de abertas, são apagadas de
+uma vez pelo ctnetlink. O coletor é IPFIX por TCP.
+
+| Rajada | Creates exportados | Deletes e fluxos exportados | Registros/s | CPU do daemon | RSS | Perdas |
+|---|---|---|---|---|---|---|
+| 20 mil conexões (abertas em 0,09 s) | 20 000 em 0,19 s | 40 000 em 0,24 s | ~160 mil | 4,7 µs/registro | 59 MB | 0 na fila, 0 no kernel |
+| 100 mil conexões (abertas em 0,35 s) | 81 545 (2 estouros do kernel) | 200 000 em 1,0 s | ~200 mil | (inclui 60 s de leituras da tabela) | 137 MB | 0 na fila; 18 % dos `NEW` perdidos no kernel |
+
+Em user namespace o buffer do socket fica no `rmem_max` (8 MiB efetivos). No roteador o daemon é
+root e pede 32 MiB com `SO_RCVBUFFORCE`. Mesmo com estouro, todo delete leva o início da sessão:
+nenhuma sessão some do registro.

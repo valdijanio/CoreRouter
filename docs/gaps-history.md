@@ -92,3 +92,10 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G2.3 redefinido e dividido em G2.3a–e; G2.2 e G2.4 com critério detalhado; G6.9 e G2.7 criados; G2.3a feito (núcleo do CGNAT)
 - 2026-10-23 — G2.3b feito (CGNAT por nfnetlink); G2.8 criado
 - 2026-10-23 — G6.8 criado (análise no Tools › DNS Lookup: Why this answer, Ask as, Watch, Upstreams, Check hijack); parte 1 em `stream/G6.8a-dns-why-ask-as`
+- 2026-10-23 — G0.24 feito (componentes do padrão de janela de lista)
+- 2026-10-23 — G1.27c feito (escala da janela IP › Routes para a tabela cheia)
+- 2026-10-23 — G2.2 feito (Connections por ctnetlink)
+- 2026-10-23 — G2.3c feito (PBA e alertas de portas)
+- 2026-10-23 — G2.3d feito (janela CGNAT)
+- 2026-10-23 — G4.4b em partes (comandos e serviço do Traffic Flow)
+- 2026-10-23 — G6.8 feito (análise no Tools › DNS Lookup)
