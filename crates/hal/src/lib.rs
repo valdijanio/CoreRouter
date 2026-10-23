@@ -383,6 +383,14 @@ pub trait Hal: Send {
         )))
     }
 
+    /// The kernel command line the system booted with (G1.26d).
+    fn boot_cmdline(&mut self) -> Result<String, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} does not say how it booted",
+            self.describe()
+        )))
+    }
+
     /// Counters behind the tuning diagnosis.
     fn kernel_stats(&mut self) -> Result<tuning::KernelStats, HalError> {
         Err(HalError::Unsupported(format!(

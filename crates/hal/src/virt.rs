@@ -483,6 +483,13 @@ impl Hal for VirtualHal {
         })
     }
 
+    /// The lab "booted" its image A with the stock command line; what the
+    /// config sets for the next boot shows up only after a reboot, which
+    /// the lab never does.
+    fn boot_cmdline(&mut self) -> Result<String, HalError> {
+        Ok("BOOT_IMAGE=/boot/corerouter-a root=/dev/vda2 ro quiet".into())
+    }
+
     fn cpu_tuning(&mut self) -> Result<CpuTuning, HalError> {
         let mut values: BTreeMap<String, Option<i64>> = LAB_CPU
             .iter()

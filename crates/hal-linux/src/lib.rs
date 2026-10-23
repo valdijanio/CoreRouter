@@ -523,6 +523,13 @@ mod linux {
             Ok(self.sysctl.root.kernel_stats())
         }
 
+        fn boot_cmdline(&mut self) -> Result<String, HalError> {
+            self.sysctl
+                .root
+                .cmdline()
+                .ok_or_else(|| HalError::Io("/proc/cmdline unreadable".into()))
+        }
+
         fn cpu_tuning(&mut self) -> Result<CpuTuning, HalError> {
             Ok(self.cpu.read(&self.sysctl.root))
         }

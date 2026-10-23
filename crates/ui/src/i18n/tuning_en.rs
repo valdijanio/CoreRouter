@@ -3,6 +3,76 @@
 /// Explanations by key (`tuning.<parameter>`, `tuning.<topic>`).
 pub(super) const HELP: &[(&str, &str)] = &[
     (
+        "tuning.boot",
+        r##"## Boot parameters
+They go on the kernel command line of the router's image and are valid from the **next boot**. The image is immutable and A/B: a boot that fails goes back to the previous image by itself, with its own command line.
+## Now
+The A/B image (G1.6) does not exist yet: the parameters are saved in the config and shown as pending; the image will read them when it does (G1.26h). "Running" is what this boot used (`/proc/cmdline`)."##,
+    ),
+    (
+        "tuning.boot.intel_idle.max_cstate",
+        r##"## What it does
+The deepest C-state the intel_idle idle driver may use, from boot: 0 turns that driver off, 1 keeps the CPUs in C1. Valid from the next boot.
+## When to change
+Lowest latency on hardware where the C-state limit of the CPU tab (PM QoS, no reboot) is not enough.
+## Careful
+More power and heat. The CPU tab's `cpu_dma_latency` does the same at runtime and goes away if the daemon stops: prefer it."##,
+    ),
+    (
+        "tuning.boot.iommu",
+        r##"## What it does
+**pt** (passthrough): devices of the host do DMA without IOMMU translation, while devices given to VMs (VFIO, SR-IOV) keep it. **off** turns the IOMMU off; **nopt** translates everything.
+## When to change
+pt on a router with the IOMMU on: each packet's DMA mapping costs CPU otherwise.
+## Careful
+off loses the protection against a device writing where it should not (DMA attacks) and breaks VFIO."##,
+    ),
+    (
+        "tuning.boot.isolcpus",
+        r##"## What it does
+Takes these CPUs away from the scheduler from boot: no ordinary task runs there unless pinned. Valid from the **next boot**.
+## When to change
+Rarely on a kernel router: forwarding runs in softirq on the CPU of each queue's IRQ, which isolcpus does not move. It helps a busy-polling data plane (DPDK, AF_XDP) that owns whole CPUs.
+## Careful
+The scheduler never balances onto them again until a reboot (the kernel docs prefer cpusets for anything dynamic). CPU 0 stays with the system."##,
+    ),
+    (
+        "tuning.boot.mitigations",
+        r##"## What it does
+The kernel's defenses against CPU side channels (Spectre, Meltdown, MDS, Retbleed…). **auto** (default) keeps them; **auto,nosmt** also turns hyper-threading off where needed; **off** removes them all.
+## When to change
+off gains a few percent only on a box that runs nothing but its own code.
+## Careful
+**Security risk.** A router still handles hostile input: the API, the web, BGP and DNS from outside. With off, a flaw in any of them can read the memory of every other process, keys included. CoreRouter asks for an explicit confirmation and never recommends it."##,
+    ),
+    (
+        "tuning.boot.nohz_full",
+        r##"## What it does
+Stops the periodic timer tick on these CPUs while they run a single task (it also moves their RCU callbacks away). Valid from the next boot.
+## When to change
+With isolcpus, for CPUs that busy-poll packets: no tick interrupting them.
+## Careful
+Needs a kernel built with NO_HZ_FULL. The boot CPU cannot be in it. Without a single busy task per CPU it only adds overhead."##,
+    ),
+    (
+        "tuning.boot.pcie_aspm",
+        r##"## What it does
+PCIe Active State Power Management. **off**: the kernel leaves ASPM as the firmware set it and does not enable it; **force**: enables it even where the firmware forbids it.
+## When to change
+off on a router: a NIC whose PCIe link sleeps adds microseconds to the first packets after a pause.
+## Careful
+force can hang machines whose devices do not support ASPM well."##,
+    ),
+    (
+        "tuning.boot.processor.max_cstate",
+        r##"## What it does
+The deepest C-state the ACPI (processor) idle driver may use, from boot: 0 turns that driver off, 1 keeps the CPUs in C1. Valid from the next boot.
+## When to change
+Lowest latency on hardware where the C-state limit of the CPU tab (PM QoS, no reboot) is not enough.
+## Careful
+More power and heat. The CPU tab's `cpu_dma_latency` does the same at runtime and goes away if the daemon stops: prefer it."##,
+    ),
+    (
         "tuning.cpu.cpu_dma_latency",
         r##"## What it does
 The deepest C-state the CPUs may sleep in, as the wake-up latency allowed in µs: a PM QoS request on `/dev/cpu_dma_latency`. 1 µs keeps them in C1; 0 makes them poll (never sleep). No value: the kernel's own choice.

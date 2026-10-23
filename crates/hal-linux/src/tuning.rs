@@ -160,6 +160,11 @@ impl Root {
         }
     }
 
+    /// The kernel command line the system booted with (G1.26d).
+    pub fn cmdline(&self) -> Option<String> {
+        read(&self.proc.join("cmdline")).map(|t| t.trim().chars().take(4096).collect())
+    }
+
     /// The diagnosis counters.
     pub fn kernel_stats(&self) -> KernelStats {
         let net = self.proc.join("net");

@@ -42,6 +42,18 @@ const PORT_APPLY: &str = "system.tuning.interface.apply";
 const CPU_PRINT: &str = "system.tuning.cpu.parameter.print";
 const CPU_SET: &str = "system.tuning.cpu.set";
 const CPU_UNSET: &str = "system.tuning.cpu.unset";
+const BOOT_PRINT: &str = "system.tuning.boot.parameter.print";
+const BOOT_SET: &str = "system.tuning.boot.set";
+const BOOT_UNSET: &str = "system.tuning.boot.unset";
+
+/// The Boot sections (G1.26d).
+const BOOT_SECTIONS: [&str; 5] = [
+    "CPU isolation",
+    "Idle states",
+    "Power saving",
+    "IOMMU",
+    "Security",
+];
 
 /// The CPU sections (G1.26c), and the port section shown with them.
 const CPU_SECTIONS: [&str; 3] = ["Frequency", "Idle states", "Watchdog"];
@@ -350,6 +362,10 @@ pub(crate) struct TuningPanel {
     pub(crate) port_print: Option<Value>,
     /// The CPU and IRQ tab: `system.tuning.cpu.parameter.print`.
     pub(crate) cpu_print: Option<Value>,
+    /// The Boot tab: `system.tuning.boot.parameter.print`, and the
+    /// confirmation `mitigations=off` asks for.
+    pub(crate) boot_print: Option<Value>,
+    pub(crate) boot_confirm: bool,
 }
 
 impl TuningPanel {
@@ -376,6 +392,13 @@ impl PanelState for TuningPanel {
             command: PRINT,
             params: json!({"profile": self.profile()}),
         }];
+        if self.tab == Tab::Boot && app.has_command(BOOT_PRINT) {
+            q.push(Query {
+                key: "boot",
+                command: BOOT_PRINT,
+                params: json!({"profile": self.profile()}),
+            });
+        }
         if self.tab == Tab::Cpu && app.has_command(CPU_PRINT) {
             q.push(Query {
                 key: "cpu",
@@ -433,6 +456,7 @@ impl PanelState for TuningPanel {
             }
             "port" => self.port_print = Some(value),
             "cpu" => self.cpu_print = Some(value),
+            "boot" => self.boot_print = Some(value),
             "diagnose" => self.diagnosis = Some(value),
             k => {
                 if let Some(slot) = self.compare.iter_mut().find(|(c, _)| *c == k) {
@@ -527,11 +551,7 @@ impl TuningPanel {
             Tab::Profiles => self.profiles(app, ui),
             Tab::Interfaces => self.interfaces(app, ui),
             Tab::Cpu => self.cpu(app, ui),
-            Tab::Boot => later(
-                ui,
-                l,
-                "Boot parameters of the image (isolcpus, nohz_full, C-states, IOMMU, mitigations) arrive with G1.26d.",
-            ),
+            Tab::Boot => self.boot(app, ui),
         }
     }
 
@@ -1221,6 +1241,259 @@ impl TuningPanel {
         });
     }
 
+    // ---- Boot -----------------------------------------------------------------
+
+    fn boot(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        if !app.has_command(BOOT_PRINT) {
+            later(
+                ui,
+                l,
+                "This router has no boot parameters yet: update corerouter-daemon.",
+            );
+            return;
+        }
+        let Some(data) = self.boot_print.clone() else {
+            ui.weak(tr(l, "waiting for the router…"));
+            return;
+        };
+        let v = ui.visuals().clone();
+        let text = |k: &str| data.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+        ui.horizontal_wrapped(|ui| {
+            chip(ui, tr(l, "next boot"), AMBER.tone(&v));
+            ui.label(if data.get("image_ab").and_then(Value::as_bool) == Some(true) {
+                tr(l, "Valid from the next boot; a boot that fails goes back to the previous image.")
+            } else {
+                tr(
+                    l,
+                    "Valid from the next boot. The A/B image does not exist yet (G1.6): the parameters are saved in the config and wait for it (G1.26h).",
+                )
+            });
+            if help::info_button(ui, Id::unique("tuning-boot-help"), tr(l, "Boot")).clicked() {
+                self.help = Some(HelpView::new("tuning.boot", tr(l, "Boot")));
+            }
+        });
+        Grid::new("tuning-boot-cmdlines")
+            .num_columns(2)
+            .spacing([12.0, 4.0])
+            .show(ui, |ui| {
+                ui.label(tr(l, "Running"));
+                ui.label(RichText::new(text("running_cmdline")).monospace());
+                ui.end_row();
+                ui.label(tr(l, "Next boot"));
+                ui.label(RichText::new(text("next_cmdline")).monospace().strong());
+                ui.end_row();
+            });
+        ui.add_space(6.0);
+        let rows: Vec<Value> = data
+            .get("params")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let field = |r: &Value, k: &str| r.get(k).and_then(Value::as_str).map(str::to_owned);
+        let mut clicked: Option<String> = None;
+        let mut info: Option<Value> = None;
+        Grid::new("tuning-boot")
+            .striped(true)
+            .num_columns(6)
+            .spacing([16.0, 5.0])
+            .show(ui, |ui| {
+                for t in ["Parameter", "Running", "Next boot", "Recommended", "Range"] {
+                    ui.strong(tr(l, t));
+                }
+                ui.label("");
+                ui.end_row();
+                for section in BOOT_SECTIONS {
+                    let in_section: Vec<&Value> = rows
+                        .iter()
+                        .filter(|r| r.get("section").and_then(Value::as_str) == Some(section))
+                        .collect();
+                    if in_section.is_empty() {
+                        continue;
+                    }
+                    ui.label(RichText::new(tr(l, section)).strong().italics());
+                    ui.end_row();
+                    for r in in_section {
+                        let name = field(r, "name").unwrap_or_default();
+                        let selected = self.selected.as_deref() == Some(name.as_str());
+                        ui.horizontal(|ui| {
+                            if ui.selectable_label(selected, &name).clicked() {
+                                clicked = Some(name.clone());
+                            }
+                            if r.get("danger").and_then(Value::as_bool) == Some(true) {
+                                chip(ui, tr(l, "security risk"), RED.tone(&v));
+                            }
+                        });
+                        let running = field(r, "running");
+                        let next = field(r, "configured");
+                        ui.label(running.clone().unwrap_or_else(|| "–".into()));
+                        ui.horizontal(|ui| match &next {
+                            Some(n) => {
+                                ui.strong(n);
+                                if running.as_ref() != Some(n) {
+                                    chip(ui, tr(l, "next boot"), AMBER.tone(&v));
+                                }
+                            }
+                            None => {
+                                ui.weak("–");
+                            }
+                        });
+                        let why = field(r, "why_id").map_or_else(String::new, |id| {
+                            i18n::template(
+                                app.lang.help,
+                                &format!("why.{id}"),
+                                &[],
+                                &field(r, "why").unwrap_or_default(),
+                            )
+                        });
+                        match field(r, "recommended") {
+                            Some(rec) => {
+                                ui.label(rec).on_hover_text(&why);
+                            }
+                            None => {
+                                ui.weak("–");
+                            }
+                        }
+                        ui.label(boot_range(r));
+                        if help::info_button(ui, Id::unique(("tuning-boot-help", &name)), &name)
+                            .clicked()
+                        {
+                            info = Some(r.clone());
+                        }
+                        ui.end_row();
+                    }
+                }
+            });
+        if let Some(c) = clicked {
+            if self.selected.as_deref() == Some(c.as_str()) {
+                self.selected = None;
+            } else {
+                self.edit = rows
+                    .iter()
+                    .find(|r| field(r, "name").as_deref() == Some(c.as_str()))
+                    .and_then(|r| field(r, "configured").or_else(|| field(r, "running")))
+                    .unwrap_or_default();
+                self.boot_confirm = false;
+                self.selected = Some(c);
+            }
+        }
+        if let Some(r) = info {
+            let name = field(&r, "name").unwrap_or_default();
+            let mut view = HelpView::new(format!("tuning.boot.{name}"), name.clone());
+            if let Some(rec) = field(&r, "recommended") {
+                let why = field(&r, "why_id").map_or_else(String::new, |id| {
+                    i18n::template(
+                        app.lang.help,
+                        &format!("why.{id}"),
+                        &[],
+                        &field(&r, "why").unwrap_or_default(),
+                    )
+                });
+                view = view.with("Recommended here", format!("**{rec}**: {why}"));
+            }
+            let value = field(&r, "recommended")
+                .or_else(|| field(&r, "configured"))
+                .unwrap_or_else(|| "…".into());
+            view = view.with(
+                "Equivalent command",
+                format!(
+                    "`/system tuning boot set key={name} value={value}`\n\n`/system tuning boot unset key={name}`"
+                ),
+            );
+            self.help = Some(view);
+        }
+        self.boot_editor(app, ui, &rows);
+    }
+
+    fn boot_editor(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, rows: &[Value]) {
+        let l = app.lang.labels;
+        let Some(r) = self.selected.as_ref().and_then(|s| {
+            rows.iter()
+                .find(|r| r.get("name").and_then(Value::as_str) == Some(s.as_str()))
+        }) else {
+            ui.weak(tr(l, "Click a parameter to change it."));
+            return;
+        };
+        let name = r.get("name").and_then(Value::as_str).unwrap_or("").to_owned();
+        let choices: Vec<String> = r
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default();
+        let danger = r.get("danger").and_then(Value::as_bool) == Some(true);
+        let can = app.can();
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(&name);
+            ui.label(tr(l, "Value"));
+            if choices.is_empty() {
+                ui.add(TextEdit::singleline(&mut self.edit).desired_width(160.0));
+            } else {
+                ComboBox::from_id_salt(("tuning-boot-choice", &name))
+                    .selected_text(self.edit.clone())
+                    .show_ui(ui, |ui| {
+                        for c in &choices {
+                            ui.selectable_value(&mut self.edit, c.clone(), c);
+                        }
+                    });
+            }
+            let needs_confirm = danger && self.edit.trim() == "off";
+            if needs_confirm {
+                ui.checkbox(&mut self.boot_confirm, tr(l, "I understand the security risk"));
+            }
+            let busy = if self.waiting > 0 {
+                Err(tr(l, "Saving…").to_owned())
+            } else {
+                Ok(())
+            };
+            let ok = busy.clone().and_then(|()| {
+                if needs_confirm && !self.boot_confirm {
+                    Err(tr(l, "I understand the security risk").to_owned())
+                } else {
+                    can.check(BOOT_SET)
+                }
+            });
+            if action(ui, tr(l, "Set"), ok) {
+                self.waiting += 1;
+                app.run_then(
+                    BOOT_SET,
+                    json!({"key": name, "value": self.edit.trim(), "confirm": self.boot_confirm}),
+                    crate::panel::then(NAME, Reply::Changed),
+                );
+            }
+            let unset_ok = busy.clone().and_then(|()| {
+                if r.get("configured").is_some_and(|c| !c.is_null()) {
+                    can.check(BOOT_UNSET)
+                } else {
+                    Err(tr(l, "Not set for the next boot").to_owned())
+                }
+            });
+            if action(ui, tr(l, "Unset"), unset_ok) {
+                self.waiting += 1;
+                app.run_then(
+                    BOOT_UNSET,
+                    json!({"key": name}),
+                    crate::panel::then(NAME, Reply::Changed),
+                );
+            }
+            if let Some(rec) = r.get("recommended").and_then(Value::as_str)
+                && action(
+                    ui,
+                    &format!("{} ({rec})", tr(l, "Use recommended")),
+                    busy.and_then(|()| can.check(BOOT_SET)),
+                )
+            {
+                self.edit = rec.to_owned();
+                self.waiting += 1;
+                app.run_then(
+                    BOOT_SET,
+                    json!({"key": name, "value": rec}),
+                    crate::panel::then(NAME, Reply::Changed),
+                );
+            }
+        });
+    }
+
     // ---- Profiles -------------------------------------------------------------
 
     fn profiles(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
@@ -1308,6 +1581,23 @@ pub(crate) fn explanation(p: &Param, why: &str, scope: &Scope) -> HelpView {
     }
     let value = p.recommended.or(p.effective()).unwrap_or(p.min);
     v.with("Equivalent command", scope.commands(&p.name, value))
+}
+
+/// The values a boot parameter takes, as the Range column shows them.
+fn boot_range(r: &Value) -> String {
+    match r.get("kind").and_then(Value::as_str) {
+        Some("cpus") => "CPU list (1-…)".into(),
+        Some("int") => format!(
+            "{} – {}",
+            r.get("min").and_then(Value::as_i64).unwrap_or(0),
+            r.get("max").and_then(Value::as_i64).unwrap_or(0)
+        ),
+        _ => r
+            .get("choices")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", "))
+            .unwrap_or_default(),
+    }
 }
 
 fn later(ui: &mut Ui, l: Lang, what: &'static str) {
