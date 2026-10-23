@@ -1,0 +1,29 @@
+[package]
+name = "corerouter-dataplane-ebpf-common"
+description = "L1 platform crate: what the XDP programs (dataplane-ebpf) and their loader (hal-linux) share — packet parse, filter decision, token bucket, map layout. no_std, no unsafe; compiled for the host too, so the logic is tested there."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+# Frames and a reference model for tests (std + proptest), never in the
+# XDP program.
+testing = ["dep:proptest"]
+
+[dependencies]
+proptest = { workspace = true, optional = true }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+corerouter-dataplane-ebpf-common = { path = ".", features = ["testing"] }
+
+[[bench]]
+name = "filter"
+harness = false
+
+[lints]
+workspace = true

@@ -1,6 +1,6 @@
 # Ferramentas de diagnóstico (Tools)
 
-Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR), G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR) G6.4a (Torch e Packet Sniffer), G6.4b (Bandwidth Test com o protocolo do iperf3) e G6.4c (traceroute de uma passada, UDP/TCP e Paris) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
+Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR), G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR), G6.4a (Torch e Packet Sniffer), G6.4b (Bandwidth Test com o protocolo do iperf3) e G6.4c (traceroute de uma passada, UDP/TCP e Paris) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
 jitter, percentis, histograma, alertas e exportação.
 
 ## 1. Tarefas (G6.1)
