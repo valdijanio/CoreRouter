@@ -169,6 +169,8 @@ impl Session {
             self.poll_links();
             self.watch_routes();
             self.scan_modules();
+            // G2.3c: CGNAT blocks on demand and port alerts.
+            self.cgnat_tick(now_unix);
             Ok(())
         });
         if ticked.is_err() {

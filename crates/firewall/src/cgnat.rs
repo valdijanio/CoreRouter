@@ -79,6 +79,7 @@ fn formula(d: &str) -> Vec<Expr> {
             set: d.into(),
             sreg: REG_1,
             dreg: Some(REG_1),
+            inv: false,
         },
         Expr::Nat {
             kind: NatKind::Snat,
@@ -187,6 +188,24 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                 })
                 .collect(),
         });
+        if p.mode == Mode::Blocks {
+            t.sets.push(Set {
+                name: name("in", p),
+                key: Type::Addr,
+                data: None,
+                interval: true,
+                dynamic_timeout: None,
+                size: None,
+                elements: merge(p.inside.iter().map(|r| (r.start, r.end)).collect())
+                    .into_iter()
+                    .map(|(a, b)| Element {
+                        key: Value::Addr(a),
+                        key_last: Some(b),
+                        data: None,
+                    })
+                    .collect(),
+            });
+        }
         if p.endpoint_independent_mapping {
             for prefix in ["eim", "eimr"] {
                 t.sets.push(Set {
@@ -224,6 +243,15 @@ pub fn table(c: &Cgnat) -> Option<Table> {
             "srcnat + 10",
         ));
     }
+    if pools.iter().any(|p| p.mode == Mode::Blocks) {
+        t.chains.push(chain(
+            "blocks",
+            ChainType::Filter,
+            Hook::Postrouting,
+            90,
+            "srcnat - 10",
+        ));
+    }
     t.chains.push(chain(
         "forward",
         ChainType::Filter,
@@ -242,6 +270,7 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                     set: "x_1to1_in".into(),
                     sreg: REG_1,
                     dreg: Some(REG_1),
+                    inv: false,
                 },
                 Expr::Nat {
                     kind: NatKind::Dnat,
@@ -268,6 +297,7 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                 set: name("d", p),
                 sreg: REG_1,
                 dreg: None,
+                inv: false,
             });
             text.push_str(&format!("ip saddr @{} ", name("d", p)));
         }
@@ -279,6 +309,7 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                 set: name("eim", p),
                 sreg: REG_1,
                 dreg: Some(REG_1),
+                inv: false,
             },
             Expr::Nat {
                 kind: NatKind::Dnat,
@@ -306,6 +337,7 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                     set: "x_1to1".into(),
                     sreg: REG_1,
                     dreg: Some(REG_1),
+                    inv: false,
                 },
                 Expr::Nat {
                     kind: NatKind::Snat,
@@ -334,6 +366,7 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                     set: name("eimr", p),
                     sreg: REG_1,
                     dreg: Some(REG_1),
+                    inv: false,
                 },
                 Expr::Nat {
                     kind: NatKind::Snat,
@@ -400,6 +433,7 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                 set: name("d", p),
                 sreg: REG_1,
                 dreg: None,
+                inv: false,
             },
             // public . port : subscriber . port
             ct(CtKey::DstIp, Dir::Reply, REG_1),
@@ -436,6 +470,42 @@ pub fn table(c: &Cgnat) -> Option<Table> {
         ));
     }
 
+    // Blocks mode (G2.3c): a subscriber without a block waits in the queue
+    // until the daemon allocates one; then its packet goes on to srcnat.
+    for p in pools.iter().filter(|p| p.mode == Mode::Blocks) {
+        let mut exprs = vec![
+            ip_addr(true, REG_1),
+            Expr::Lookup {
+                set: name("in", p),
+                sreg: REG_1,
+                dreg: None,
+                inv: false,
+            },
+            Expr::Lookup {
+                set: name("d", p),
+                sreg: REG_1,
+                dreg: None,
+                inv: true,
+            },
+        ];
+        let mut text = format!("ip saddr @{} ip saddr != @{}", name("in", p), name("d", p));
+        if !exceptions.is_empty() {
+            exprs.push(Expr::Lookup {
+                set: "x_1to1".into(),
+                sreg: REG_1,
+                dreg: None,
+                inv: true,
+            });
+            text.push_str(" ip saddr != @x_1to1");
+        }
+        exprs.push(Expr::Queue { num: QUEUE_NUM });
+        t.rules.push(rule(
+            "blocks",
+            exprs,
+            format!("{text} queue num {QUEUE_NUM}"),
+        ));
+    }
+
     // Nothing unclaimed reaches the public blocks.
     for p in &pools {
         t.rules.push(rule(
@@ -446,6 +516,7 @@ pub fn table(c: &Cgnat) -> Option<Table> {
                     set: name("pub", p),
                     sreg: REG_1,
                     dreg: None,
+                    inv: false,
                 },
                 Expr::Counter,
                 Expr::Drop,
@@ -455,6 +526,11 @@ pub fn table(c: &Cgnat) -> Option<Table> {
     }
     Some(t)
 }
+
+/// The netfilter queue that holds the first packet of a blocks-mode
+/// subscriber without a block until the daemon allocates one (RFC 7422,
+/// as a number to remember).
+pub const QUEUE_NUM: u16 = 7422;
 
 /// The table every CGNAT object lives in.
 pub const TABLE: &str = "corerouter_cgnat";

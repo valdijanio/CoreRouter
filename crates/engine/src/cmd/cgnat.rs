@@ -528,7 +528,7 @@ fn lookup(s: &mut Session, p: &Value) -> Result<Value> {
     if pool.mode == Mode::Blocks {
         return Err(EngineError::bad(
             "subscriber",
-            format!("pool '{}' hands out blocks on demand: see ip.firewall.cgnat.block.list", pool.name),
+            format!("pool '{}' hands out blocks on demand: see ip.firewall.cgnat.block.list subscriber={sub}", pool.name),
         ));
     }
     let slot = pool
