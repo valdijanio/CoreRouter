@@ -157,3 +157,81 @@ direito: copiar, copiar como comando (CoreRouter e RouterOS), ativar/desativar, 
 - **Prévia dos comandos** que serão aplicados.
 - Botões **Cancel**, **Apply** (aplica e mantém aberto) e **OK** (aplica e fecha); Enter = OK,
   Esc = Cancel. Erro do engine aparece no modal, junto do campo, sem fechar.
+
+### Como adotar (API dos componentes)
+
+Código: `crates/ui/src/list.rs` (barra, filtros, rodapé, menu de clique direito, cópias, transação)
+e `crates/ui/src/list_modal.rs` (o modal). Nada ali decide o que um item pode: a linha que o engine
+manda diz (`disabled`, `dynamic`, motivo), e o `engine.list` diz se o comando existe e está liberado.
+
+- **Barra:** `Tools::new(&app.can(), &Cmds{add, remove, set, what}, &picked)` calcula cada botão
+  (`Ok` ou o motivo do cinza: primeiro o do roteador, depois o da seleção); `list::toolbar(ui, salt,
+  &tools, &sel, lang)` desenha **+ − ✓ ✗ 💬** e devolve um `Act`. `Item::of(linha, "id", motivo)`
+  monta o que cada linha diz de si (item dinâmico fica preso, com o motivo).
+- **Filtros:** `Filters` guarda os selos ligados por campo da linha; `filters.chips(ui, "family",
+  &[("ipv4", "IPv4"), …], lang)` desenha, `filters.shows(&linha)` filtra (E entre campos, OU dentro
+  de um). O Find (`table::find_field`) vem por último, à direita.
+- **Rodapé:** `list::footer(ui, &[(n, "addresses", tom), …], lang)`; contagem zero depois da
+  primeira some. `list::count(linhas, campo, valor)` conta.
+- **Clique direito e teclado:** dentro do `Menu::Rows` do `table::show`, `list::row_menu(ui, &tools,
+  sel, comandos_conhecidos, lang)` (abrir, copiar, copiar como comando CoreRouter e RouterOS,
+  ativar, desativar, comentar, remover); `list::from_shortcut(out.shortcut, &tools, &sel)` faz o
+  mesmo pelas teclas, só quando o botão agiria.
+- **Cópias:** `list::copy_rows` (texto das células, separado por tab) e
+  `list::copy_commands(app, "ip.address.add", &linhas, Syntax::RouterOs)` — o `add` que recria cada
+  linha, com os parâmetros que o próprio `add` do roteador declara (`corerouter_shell::recreate`,
+  `command_line`): `/ip address add address=10.0.0.1/24 interface=ether1` ou
+  `ip.address.add {"address":…}`.
+- **Transação:** `app.run_steps(passos, then)` manda vários comandos como um `engine.batch`
+  atômico (tudo ou nada); um passo só vai como ele mesmo, para a proteção de perda de acesso
+  (G2.1b) poder perguntar.
+- **Modal:** a janela descreve os campos uma vez (`Spec { panel, parent, new_title, edit_title,
+  help, fields, preview }`, cada `Field { param, label, help, input, edit }`), abre com
+  `Modal::open(app, item, valores)` e, no `dialogs` do painel, chama `modal.show(app, ctx, area,
+  &SPEC, &opções)` até ele devolver `false`. O painel repassa ao modal a resposta da pré-visualização
+  (`arrived` com a chave `list_modal::PREVIEW`) e a do Apply/OK (`reply` com `list_modal::Applied`).
+
+**O comando de pré-visualização** (consulta do engine, um por janela) recebe os mesmos parâmetros do
+`add`, todos opcionais, mais `id` ao editar, e nunca falha por entrada ruim (vira checagem `error`):
+
+```text
+{ computed: [{label, value}],                 campos calculados
+  checks:   [{level, check, message, param?}], ok | warning | error | pending | info
+  commands: [{command, params}],              o que OK/Apply mandam, numa transação
+  risk?:    "por que pode cortar esta sessão" }
+```
+
+`pending` é checagem em andamento (ARP): o modal pergunta de novo em ~0,4 s. Erro com `param`
+aparece embaixo do campo; o erro do roteador ao aplicar também. `risk` pede o "Entendi" (os comandos
+vão com `force: true`) ou o botão Safe Mode.
+
+Exemplo (um painel com lista; o IP › Addresses, G1.28, é a referência completa):
+
+```rust
+const FIELDS: &[Field] = &[
+    Field { param: "address", label: "Address", help: "ip.address.address",
+            input: Input::Text("10.0.0.1/24"), edit: true },
+    Field { param: "interface", label: "Interface", help: "ip.address.interface",
+            input: Input::Choice, edit: true },
+];
+const SPEC: Spec = Spec { panel: NAME, parent: Win::Panel(WIN), new_title: "New Address",
+    edit_title: "Address", help: "ip.address", fields: FIELDS, preview: "ip.address.preview" };
+
+// window(): a barra e a tabela
+let picked: Vec<Item> = linhas_selecionadas.map(|r| Item::of(r, "id", "dynamic")).collect();
+let tools = Tools::new(&app.can(), &CMDS, &picked);
+let mut act = None;
+ui.horizontal(|ui| {
+    act = list::toolbar(ui, TABLE, &tools, &sel, app.lang.labels);
+    self.filters.chips(ui, "family", &[("ipv4", "IPv4"), ("ipv6", "IPv6")], app.lang.labels);
+    table::find_field(ui, TABLE, &mut self.table);
+});
+// … table::show(…, |ui, menu| if let Menu::Rows(sel) = menu {
+//         act = list::row_menu(ui, &tools, sel, true, l) });
+// act: Add → self.modal = Some(Modal::open(app, None, padrões)); Edit(k) → Modal::open(app, Some((k, nome)), valores)
+
+// dialogs(): o modal
+if let Some(m) = self.modal.as_mut() && !m.show(app, ctx, area, &SPEC, &|p| opções(p)) {
+    self.modal = None;
+}
+```

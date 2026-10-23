@@ -23,6 +23,7 @@
 
 mod dns_lookup_pt;
 mod en;
+mod list_pt;
 mod menu_en;
 mod menu_pt;
 mod pt;
@@ -71,6 +72,7 @@ impl Lang {
                 menu_pt::LABELS,
                 routes_pt::LABELS,
                 dns_lookup_pt::LABELS,
+                list_pt::LABELS,
             ],
         }
     }
