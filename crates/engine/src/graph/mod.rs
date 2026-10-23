@@ -26,6 +26,7 @@
 //!   ClickHouse exporter of G4.4f has not sent yet; also
 //!   [`GraphDb::export`] for code in the daemon).
 
+pub mod alert;
 pub mod query;
 pub mod rrd;
 
@@ -181,6 +182,9 @@ pub struct GraphDb {
     /// The daemon stores the history (else memory only).
     persistent: bool,
     pub disk: DiskStatus,
+    /// Bandwidth alerts: state by rule, link speeds by interface.
+    alerts: BTreeMap<corerouter_model::ItemId, alert::AlertState>,
+    speeds: alert::Speeds,
 }
 
 /// A bucket of [`GraphDb::export`]: series key, bucket start (Unix s),
@@ -543,6 +547,29 @@ impl Session {
         } else {
             None
         };
+        // Link speeds the alerts need (no capacity of their own), asked
+        // once a minute, not every second.
+        let stale: Vec<IfName> = {
+            let known = self.ext::<GraphDb>().map(|d| &d.speeds);
+            cfg.alerts
+                .iter()
+                .filter(|a| !a.disabled && a.capacity_mbps.is_none())
+                .map(|a| &a.interface)
+                .filter(|n| {
+                    known
+                        .and_then(|k| k.get(*n))
+                        .is_none_or(|(at, _)| now.saturating_sub(*at) >= alert::SPEED_EVERY)
+                })
+                .cloned()
+                .collect()
+        };
+        let speeds: Vec<(IfName, (u64, Option<u32>))> = stale
+            .into_iter()
+            .map(|n| {
+                let s = self.hal_mut().ethernet_monitor(&n).ok().and_then(|m| m.speed_mbps);
+                (n, (now, s))
+            })
+            .collect();
         // The history is taken out of the session while the store is
         // borrowed for the interface list.
         let mut db = self
@@ -571,12 +598,20 @@ impl Session {
         );
         let log = db.sample(now, &cfg, &links, resources);
         drop(links);
+        db.speeds.extend(speeds);
+        let speeds = std::mem::take(&mut db.speeds);
+        let alerts = db.judge_alerts(&cfg.alerts, &speeds);
+        db.speeds = speeds;
         if let Some(slot) = self.ext_mut::<GraphDb>() {
             *slot = db;
         }
-        for (warning, line) in log {
+        for (topic, (warning, line)) in log
+            .into_iter()
+            .map(|l| ("system", l))
+            .chain(alerts.into_iter().map(|l| ("interface", l)))
+        {
             let level = if warning { "warning" } else { "info" };
-            self.log_event(&["system", level], "graphing", line, serde_json::Value::Null);
+            self.log_event(&[topic, level], "graphing", line, serde_json::Value::Null);
         }
     }
 }
