@@ -35,8 +35,6 @@ mod menu_en;
 mod menu_pt;
 mod pt;
 mod routes_pt;
-mod torch_en;
-mod torch_pt;
 mod tuning_en;
 mod tuning_pt;
 mod traffic_flow_en;
@@ -86,7 +84,6 @@ impl Lang {
                 cgnat_pt::LABELS,
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
-                torch_pt::LABELS,
                 traffic_flow_pt::LABELS,
                 graphs_pt::LABELS,
             ],
@@ -104,7 +101,6 @@ impl Lang {
                 cgnat_en::HELP,
                 traffic_flow_en::HELP,
                 graphs_en::HELP,
-                torch_en::HELP,
             ],
             Lang::Pt => &[
                 pt::HELP,
@@ -114,7 +110,6 @@ impl Lang {
                 cgnat_pt::HELP,
                 traffic_flow_pt::HELP,
                 graphs_pt::HELP,
-                torch_pt::HELP,
             ],
         }
     }
