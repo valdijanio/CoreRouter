@@ -216,9 +216,10 @@ mod tests {
 
     #[test]
     fn every_engine_text_has_a_portuguese_template_with_the_same_places() {
+        use corerouter_engine::route_detail::CHOICES;
         use corerouter_engine::route_table::REASONS;
         use corerouter_engine::tuning::{FINDINGS, WHY};
-        let groups = [("why", WHY), ("finding", FINDINGS), ("route", REASONS)];
+        let groups = [("why", WHY), ("finding", FINDINGS), ("route", REASONS), ("choice", CHOICES)];
         let mut ids = Vec::new();
         for (prefix, texts) in groups {
             for (id, en) in texts {

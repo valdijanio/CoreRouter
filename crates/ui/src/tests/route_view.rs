@@ -215,3 +215,26 @@ fn the_lookup_bar_answers_with_the_kernel_check() {
     h.idle();
     assert!(h.has_text_containing("address"), "the error is shown");
 }
+
+#[test]
+fn the_selected_route_shows_its_detail() {
+    let mut h = lab();
+    h.click(h.route_row("*3"));
+    h.app.cache.refreshed_at = None;
+    h.idle();
+    h.idle();
+    for t in ["Source", "static route", "Chosen", "Check gateway", "Changes (24 h)", "Kernel", "matches the config"] {
+        assert!(h.has_text(t), "{t} not in the detail");
+    }
+    assert!(h.has_text_containing("rev "), "the creating revision");
+    assert!(h.has_text_containing("perde para a distância 1"), "translated");
+    // An ECMP group's line shows its first path.
+    h.click(h.route_row("ecmp main 0.0.0.0/0"));
+    h.idle();
+    h.idle();
+    assert!(h.has_text_containing("divide o tráfego com mais 1 caminho(s)"));
+    // Nothing selected: no detail.
+    h.app.tables.routes.clear();
+    h.idle();
+    assert!(!h.has_text("Chosen"));
+}

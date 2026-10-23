@@ -67,6 +67,32 @@ prefixo e os caminhos); no lab, o maior prefixo sobre o kernel simulado. Se as r
 do kernel. Num grupo ECMP o kernel responde um caminho só (o do hash do fluxo); isso não conta como
 diferença.
 
+## Detalhe da rota selecionada (`ip.route.detail`, G1.27b)
+
+Com uma rota selecionada (uma linha ECMP vale pelo primeiro caminho), um painel abaixo da tabela
+mostra `ip.route.detail {key}`:
+
+- **Origem:** rota estática → a revisão e o comando que a criaram e os que a mudaram por último
+  (`config.history`); DHCP → "DHCP client on ether1 (lease from 100.64.0.1)"; RA → a interface e a
+  validade; conectada → o endereço que a gera e a revisão dele.
+- **Escolha:** por que está em uso ("menor distância (1); a seguinte (10) assume se ela cair",
+  "divide o tráfego com mais 1 caminho") ou o motivo de não estar, e as concorrentes ao mesmo
+  prefixo como selos (com o motivo de cada uma no tooltip). Traduzida por id (`choice.<id>`,
+  `route_detail::CHOICES`), como os motivos.
+- **Check gateway:** método, intervalo, falhas seguidas, estado e há quanto tempo caiu. Hoje só nas
+  rotas de lease DHCP; em rota estática é a gap G1.27f.
+- **Trocas (24 h):** um anel por rota (até 64 trocas, as últimas 24 h) alimentado pelo tick do
+  daemon: falha de link, failover, volta. As mesmas trocas vão para o log no tópico `route` (no
+  máximo 16 por olhada, e uma linha "N more routes changed state" — uma porta com 10 000 rotas atrás
+  não inunda o log). Some com o restart, como o Changed.
+- **No kernel:** o que a config põe no plano de dados para esta rota (`expected`), o que o kernel
+  tem para o mesmo prefixo (`present`), o que falta e o que está lá sem ser nosso (`extra`).
+  Reaproveita o drift da G1.3 (`Hal::snapshot`, `drift::kernel_routes_of`); conectadas e RA dizem
+  que é o kernel quem as faz.
+
+O painel pede o detalhe junto com cada atualização da janela (um painel sem janela própria,
+`ui/src/route_detail.rs`), só enquanto a janela Routes está aberta e há uma rota selecionada.
+
 ## Pesquisa
 
 Fontes lidas em 2026-10-23 (resumo completo nas notas da sessão):
@@ -114,6 +140,13 @@ resposta do Linux, comparada com a do kernel (o que o RouterOS não faz).
 
 **Melhorias além dos outros:** o motivo traduzido com argumentos; "há quanto tempo mudou" por rota;
 a comparação motor × kernel no próprio lookup; o grupo ECMP numa linha que abre.
+
+**Parte b (detalhe):** o RouterOS mostra só `belongs-to` (texto da origem) e nenhum histórico por
+rota; o Junos `show route X detail` traz `State`, `Inactive reason` e `Age` (há quanto tempo); o FRR
+`show ip route X` traz "Known via static, distance 1, metric 0, best" e "Last update … ago"; o
+Cisco, "Known via" e um bloco por caminho ECMP. Adotado: a origem com a revisão do journal (que só
+o CoreRouter tem: tudo é comando), a escolha comparada com as concorrentes, as trocas das últimas
+24 h (o FRR e o Junos só dão a idade da última) e a comparação com o kernel por rota.
 
 **Ficou para depois:** a janela Nexthops (`/routing nexthop`: estado por gateway, flaps); a vista
 RIB × FIB do Junos/FRR (selecionada × instalada); regras de política (G1.27e); vizinhos ARP/ND para

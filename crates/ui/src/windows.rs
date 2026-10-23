@@ -162,7 +162,7 @@ impl Win {
             Win::Interfaces => [780.0, 520.0],
             Win::Neighbors => [820.0, 320.0],
             Win::Addresses => [760.0, 300.0],
-            Win::Routes => [980.0, 420.0],
+            Win::Routes => [1000.0, 640.0],
             Win::Panel(id) => crate::panel::find(id).map_or([380.0, 200.0], |(_, w)| w.size),
             Win::Vrf => [600.0, 260.0],
             Win::Firewall => [980.0, 420.0],
