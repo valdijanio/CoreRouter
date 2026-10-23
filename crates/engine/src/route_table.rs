@@ -517,33 +517,58 @@ pub struct RouteWatch {
     /// First look with a clock.
     pub since: Option<u64>,
     last_look: Option<u64>,
-    /// Key → (state, Unix second it took it; `None`: already so when
-    /// watching began).
-    states: HashMap<String, (State, Option<u64>)>,
+    states: HashMap<String, Seen>,
+    /// Bumped by every look: an entry not seen by the last one is gone.
+    generation: u64,
+}
+
+/// What the watch knows of one route.
+#[derive(Debug, Clone, Copy)]
+struct Seen {
+    state: State,
+    /// Unix second it took `state`; `None`: already so when watching began.
+    at: Option<u64>,
+    generation: u64,
 }
 
 impl RouteWatch {
     /// Note the states of `lines` at `now`; routes gone are forgotten.
+    /// In place: a key already known is not copied again.
     pub fn observe(&mut self, lines: &[Line], now: u64) {
         let first = self.since.is_none();
         self.since.get_or_insert(now);
         self.last_look = Some(now);
-        let mut seen: HashMap<String, (State, Option<u64>)> = HashMap::with_capacity(lines.len());
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
         for l in lines.iter().take(MAX_WATCHED) {
-            let entry = match self.states.get(&l.key) {
-                Some((s, at)) if *s == l.state => (*s, *at),
-                Some(_) => (l.state, Some(now)),
-                None if first => (l.state, None),
-                None => (l.state, Some(now)),
-            };
-            seen.insert(l.key.clone(), entry);
+            match self.states.get_mut(&l.key) {
+                Some(seen) => {
+                    if seen.state != l.state {
+                        seen.state = l.state;
+                        seen.at = Some(now);
+                    }
+                    seen.generation = generation;
+                }
+                None => {
+                    self.states.insert(
+                        l.key.clone(),
+                        Seen {
+                            state: l.state,
+                            at: (!first).then_some(now),
+                            generation,
+                        },
+                    );
+                }
+            }
         }
-        self.states = seen;
+        if self.states.len() > lines.len().min(MAX_WATCHED) {
+            self.states.retain(|_, s| s.generation == generation);
+        }
     }
 
     /// Unix second `key` took its current state, if known.
     pub fn changed_at(&self, key: &str) -> Option<u64> {
-        self.states.get(key).and_then(|(_, at)| *at)
+        self.states.get(key).and_then(|s| s.at)
     }
 
     fn due(&self, routes: usize, now: u64) -> bool {

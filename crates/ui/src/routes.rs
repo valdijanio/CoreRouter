@@ -763,10 +763,10 @@ impl CoreRouterUi {
         );
         footer(ui, &counts(&routes), langs.labels);
         // A click on an ECMP group's line opens or closes it.
-        if let Some(key) = out.clicked.filter(|k| k.starts_with(GROUP)) {
-            if !self.route_view.open.remove(&key) {
-                self.route_view.open.insert(key);
-            }
+        if let Some(key) = out.clicked.filter(|k| k.starts_with(GROUP))
+            && !self.route_view.open.remove(&key)
+        {
+            self.route_view.open.insert(key);
         }
         if let Some(key) = out.opened.filter(|k| !k.starts_with(GROUP)) {
             act = Some(Act::Open(vec![key]));
@@ -868,10 +868,10 @@ impl CoreRouterUi {
         });
         let address = self.route_view.lookup.trim().to_owned();
         if go && !address.is_empty() {
-            let mut p = json!({ "address": address });
-            if let Some(t) = &self.route_view.table {
-                p["table"] = json!(t);
-            }
+            let p = match &self.route_view.table {
+                Some(t) => json!({ "address": address, "table": t }),
+                None => json!({ "address": address }),
+            };
             self.run_then(
                 "ip.route.lookup",
                 p,

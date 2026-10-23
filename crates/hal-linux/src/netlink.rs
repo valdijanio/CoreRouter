@@ -629,13 +629,20 @@ fn readable(e: &rtnetlink::Error) -> String {
     }
 }
 
+/// Static routes per (table, prefix, metric): the paths of one kernel route.
+type Paths = std::collections::HashMap<(u32, IpNet, u32), Vec<KernelRoute>>;
+
+fn group_of(r: &KernelRoute) -> (u32, IpNet, u32) {
+    (r.table, r.dst, r.metric)
+}
+
 struct Kernel {
     handle: Handle,
     /// The kernel's static routes, one entry per next hop, read at the
     /// first route op of a run and kept up to date by the run's own route
     /// ops (G1.27: an ECMP group is one multipath route in the kernel, so
     /// adding or removing one path rewrites the route with its siblings).
-    hops: std::cell::RefCell<Option<std::collections::BTreeSet<KernelRoute>>>,
+    hops: std::cell::RefCell<Option<Paths>>,
     /// Paths that are CoreRouter's (see [`apply`]); another program's
     /// route with the same prefix and metric is never merged with ours.
     owned: std::collections::BTreeSet<KernelRoute>,
@@ -1131,10 +1138,10 @@ impl Kernel {
         })
     }
 
-    /// The kernel's static routes per next hop (see [`Kernel::hops`]).
-    async fn static_hops(&self) -> Result<std::collections::BTreeSet<KernelRoute>, String> {
-        if let Some(h) = self.hops.borrow().as_ref() {
-            return Ok(h.clone());
+    /// Read the kernel's static routes once per run (see [`Kernel::hops`]).
+    async fn load_hops(&self) -> Result<(), String> {
+        if self.hops.borrow().is_some() {
+            return Ok(());
         }
         let links: Vec<LinkMessage> = self
             .handle
@@ -1156,27 +1163,33 @@ impl Kernel {
             })
             .collect();
         let (_, routes) = self.held(&names).await?;
-        *self.hops.borrow_mut() = Some(routes.clone());
-        Ok(routes)
+        let mut paths = Paths::new();
+        for r in routes {
+            paths.entry(group_of(&r)).or_default().push(r);
+        }
+        *self.hops.borrow_mut() = Some(paths);
+        Ok(())
     }
 
     /// The paths the kernel holds of `r`'s route (same table, prefix and
     /// metric), `r` itself included if present.
     async fn siblings(&self, r: &KernelRoute) -> Result<Vec<KernelRoute>, String> {
+        self.load_hops().await?;
         Ok(self
-            .static_hops()
-            .await?
-            .into_iter()
-            .filter(|h| h.table == r.table && h.dst == r.dst && h.metric == r.metric)
-            .collect())
+            .hops
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.get(&group_of(r)))
+            .cloned()
+            .unwrap_or_default())
     }
 
     fn note_hop(&self, r: &KernelRoute, present: bool) {
         if let Some(h) = self.hops.borrow_mut().as_mut() {
+            let group = h.entry(group_of(r)).or_default();
+            group.retain(|x| x != r);
             if present {
-                h.insert(r.clone());
-            } else {
-                h.remove(r);
+                group.push(r.clone());
             }
         }
     }
