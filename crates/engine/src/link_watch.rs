@@ -95,6 +95,8 @@ impl Session {
     pub(crate) fn poll_links(&mut self) {
         let live = self.hal_mut().poll();
         self.watch_links(&live);
+        // G4.5: the same poll feeds the traffic graphs.
+        self.graph_sample(&live);
     }
 }
 

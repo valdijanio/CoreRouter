@@ -123,6 +123,14 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
   argumentos.
 - Os rótulos das janelas antigas ainda não passam pelo `tr` (G0.15b).
 
+**Janela nova: traduções em `crates/ui/src/i18n/auto/`.** Um par de arquivos por janela,
+`<escopo>_en.rs` e `<escopo>_pt.rs` (constantes `LABELS`, `HELP`, `TEMPLATES`), que o `build.rs`
+registra sozinho: não edite as listas do `i18n/mod.rs` (era o arquivo onde todo PR com tela
+conflitava). Os rótulos da janela usam `i18n::tr_in("<escopo>", lang, "Texto")`: o catálogo do
+escopo vem primeiro, então a mesma palavra em inglês pode ter traduções diferentes em janelas
+diferentes ("Last" = "Última" numa, "Últimos" noutra) sem quebrar o teste. Explicações usam chaves
+com o escopo na frente (`traffic_flow.active_timeout`). Veja `i18n/auto/README.md`.
+
 ## Menu lateral e ícones (G0.23)
 
 - Toda janela tem **entrada em `crates/ui/src/menu.rs`** (`CATALOG`): subgrupo (`DHCP`, `DNS`)

@@ -548,7 +548,12 @@ pub(crate) fn show(
                 } else {
                     0.0
                 };
-                *w = w.max(icon + text_width(ui, &shown_text(cell), &font));
+                let cw = if cell.starts_with(crate::spark::SEP) {
+                    crate::spark::WIDTH
+                } else {
+                    text_width(ui, &shown_text(cell), &font)
+                };
+                *w = w.max(icon + cw);
             }
         }
     }
@@ -1088,7 +1093,11 @@ fn cut_under_pointer(
         left += w;
         hit.then_some(i)
     })?;
-    let (text, _) = crate::chip::split(row.cells.get(col)?);
+    let cell = row.cells.get(col)?;
+    if let Some(tip) = crate::spark::tip(cell) {
+        return Some(tip.to_owned());
+    }
+    let (text, _) = crate::chip::split(cell);
     // Only a cut cell has a tooltip.
     text.char_indices().nth(CELL_CHARS)?;
     let mut tip: String = text.chars().take(TIP_CHARS).collect();
@@ -1177,6 +1186,13 @@ fn paint_cells<'a>(
                 paint_bubble(painter, pos2(x + CELL_PAD + 6.0, y - 1.0), style.accent);
                 paint_comment_text(painter, x + CELL_PAD + CELL_ICON, y, cell, style.ink, font);
             }
+            x += w;
+            continue;
+        }
+        // G4.5: a mini graph instead of text (`spark.rs`).
+        if text(i).starts_with(crate::spark::SEP) {
+            let cell = Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height()));
+            crate::spark::paint(ui.painter(), cell, text(i));
             x += w;
             continue;
         }
