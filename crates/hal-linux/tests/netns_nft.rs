@@ -162,7 +162,7 @@ fn rules_fill_address_lists_from_the_packet_path() {
     let act = |json: &str| corerouter_firewall::sample::act(json).unwrap();
     let rule = |id, chain, m, a| corerouter_firewall::sample::rule(id, chain, m, a).unwrap();
     let mut cfg = Config::default();
-    cfg.ip.firewall.filter = vec![
+    *cfg.ip.firewall.filter = vec![
         rule(
             1,
             "input",

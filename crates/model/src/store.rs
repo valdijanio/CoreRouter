@@ -47,10 +47,16 @@ pub enum DiffLine {
     },
 }
 
+/// Copies of the config here share their sections (`crate::cow`): a
+/// revision, the running config and the candidate cost one copy of what
+/// changed between them, not one of the whole tree each (G0.16).
 #[derive(Debug, Clone)]
 pub struct ConfigStore {
     running: Config,
     candidate: Config,
+    /// The candidate was handed out for writing (or replaced) since it was
+    /// last equal to running: `is_dirty` compares only then (G0.16).
+    touched: bool,
     history: Vec<Revision>,
     max_history: usize,
 }
@@ -74,6 +80,7 @@ impl ConfigStore {
         Self {
             running: initial.clone(),
             candidate: initial,
+            touched: false,
             history: vec![rev0],
             max_history: Self::DEFAULT_MAX_HISTORY,
         }
@@ -95,6 +102,7 @@ impl ConfigStore {
         Self {
             candidate: running.clone(),
             running,
+            touched: false,
             history,
             max_history,
         }
@@ -109,16 +117,21 @@ impl ConfigStore {
     }
 
     pub fn candidate_mut(&mut self) -> &mut Config {
+        self.touched = true;
         &mut self.candidate
     }
 
     /// Replace the candidate wholesale (used by the engine guard on rollback).
     pub fn set_candidate(&mut self, cfg: Config) {
+        self.touched = true;
         self.candidate = cfg;
     }
 
+    /// Candidate differs from running. O(1) while nobody wrote to the
+    /// candidate; otherwise the sections both still share compare by
+    /// pointer, so only what was written is compared in full.
     pub fn is_dirty(&self) -> bool {
-        self.running != self.candidate
+        self.touched && self.running != self.candidate
     }
 
     pub fn history(&self) -> &[Revision] {
@@ -137,6 +150,7 @@ impl ConfigStore {
         }
         let number = self.current_revision().saturating_add(1);
         self.running = self.candidate.clone();
+        self.touched = false;
         self.history.push(Revision {
             number,
             comment: comment.chars().take(256).collect(),
@@ -152,6 +166,7 @@ impl ConfigStore {
 
     pub fn discard(&mut self) {
         self.candidate = self.running.clone();
+        self.touched = false;
     }
 
     /// Load revision `number` into the candidate.
@@ -162,6 +177,7 @@ impl ConfigStore {
             .find(|r| r.number == number)
             .ok_or(StoreError::UnknownRevision(number))?;
         self.candidate = rev.config.clone();
+        self.touched = true;
         Ok(())
     }
 
@@ -266,6 +282,54 @@ mod tests {
         st.candidate_mut().system.identity = "x".into();
         st.discard();
         assert!(!st.is_dirty());
+    }
+
+    #[test]
+    fn copies_share_what_was_not_written() {
+        use crate::cow::CowArc;
+        let mut st = ConfigStore::default();
+        st.candidate_mut().ip.routes.push(crate::RouteEntry {
+            id: crate::ItemId(1),
+            dst_address: "10.9.0.0/16".parse().unwrap(),
+            gateway: crate::Gateway::ip("192.0.2.254".parse().unwrap()),
+            distance: 1,
+            routing_table: crate::RoutingTable::Main,
+            disabled: false,
+            comment: String::new(),
+        });
+        st.commit("routes", None).unwrap();
+        // Running, candidate and the new revision are one copy.
+        let rev = &st.history()[1].config;
+        assert!(CowArc::ptr_eq(&st.running().ip, &rev.ip));
+        assert!(CowArc::ptr_eq(&st.candidate().ip, &rev.ip));
+
+        // Writing the system section leaves the routes shared...
+        st.candidate_mut().system.identity = "edge".into();
+        assert!(CowArc::ptr_eq(&st.candidate().ip, &st.running().ip));
+        st.commit("rename", None).unwrap();
+        let [.., a, b] = st.history() else { panic!() };
+        assert!(CowArc::ptr_eq(&a.config.ip, &b.config.ip));
+        // ...and writing the routes copies them, not the interfaces.
+        st.candidate_mut().ip.routes.clear();
+        assert!(!CowArc::ptr_eq(&st.candidate().ip, &st.running().ip));
+        assert!(CowArc::ptr_eq(&st.candidate().interfaces, &st.running().interfaces));
+        assert_eq!(st.running().ip.routes.len(), 1, "running kept its routes");
+    }
+
+    #[test]
+    fn a_write_that_changes_nothing_is_not_dirty() {
+        let mut st = ConfigStore::default();
+        let same = st.candidate().system.identity.clone();
+        st.candidate_mut().system.identity = same;
+        st.candidate_mut().ip.routes.clear();
+        assert!(!st.is_dirty());
+        assert_eq!(st.commit("noop", None), Err(StoreError::NothingToCommit));
+        st.candidate_mut().system.identity = "x".into();
+        assert!(st.is_dirty());
+        st.discard();
+        assert!(!st.is_dirty());
+        st.rollback(0).unwrap();
+        assert!(!st.is_dirty(), "revision 0 is what runs");
     }
 
     #[test]

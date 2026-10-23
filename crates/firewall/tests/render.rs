@@ -266,7 +266,7 @@ fn validator_refuses_what_the_kernel_or_routeros_would() {
 #[test]
 fn jump_loops_are_refused() {
     let mut cfg = Config::default();
-    cfg.ip.firewall.filter = vec![
+    *cfg.ip.firewall.filter = vec![
         rule(
             1,
             "input",

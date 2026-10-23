@@ -155,6 +155,19 @@ MCP (Headless/Remote) ──┘        1. acha o CommandSpec (ou "did you mean")
 Modos: `immediate` (RouterOS: cada comando vira revisão) e `transactional` (VyOS/Junos:
 `config.diff` → `config.commit`; `config.rollback {revision}` carrega histórico).
 
+Cópias da config (G0.16): as seções grandes (`interfaces`, `ip` e, dentro dele, endereços,
+rotas, firewall com cada tabela e as address lists, DNS estático, zonas, servidor DHCP) são
+`model::cow::CowArc` — um `Arc` que copia só quando alguém escreve (`Arc::make_mut`). O
+snapshot do passo 4, a running, as revisões do histórico e o store da entrada do Safe Mode
+compartilham o que ninguém escreveu: clonar a `Config` custa alguns contadores de referência, e
+um comando paga a cópia só das seções que escreve (com 10 000 rotas, um `interface.set` em modo
+transacional caiu de 90 µs para 4 µs, **medido**). A igualdade compara o ponteiro primeiro, e o
+`ConfigStore` só compara candidate × running depois de alguém pedir `candidate_mut`. Comparado
+com estruturas persistentes (`im`/`imbl`, cópia O(log n) também dentro de uma lista): elas
+trocariam o tipo de toda lista da config (centenas de usos como slice) e trariam uma
+dependência nova; fica para quando uma lista sozinha for o gargalo (hoje, acrescentar a uma
+address list de 60 000 entradas ainda copia a lista: ~0,6 ms, **medido**).
+
 ### Safe Mode (G1.4)
 
 Como no RouterOS: `config.safe-mode.enter` guarda a config running da entrada (a própria
