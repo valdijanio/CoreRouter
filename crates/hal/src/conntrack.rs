@@ -32,6 +32,7 @@ pub struct Tuple {
     pub dst: IpAddr,
     /// TCP/UDP/SCTP ports, or the ICMP query id in `src_port` (0 otherwise).
     pub src_port: u16,
+    /// The destination port; for ICMP, type and code (`type << 8 | code`).
     pub dst_port: u16,
 }
 
