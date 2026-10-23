@@ -21,6 +21,7 @@ pub mod sff;
 pub mod sim;
 pub mod tuning;
 pub mod virt;
+pub mod xdp;
 
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
@@ -407,6 +408,24 @@ pub trait Hal: Send {
     fn boot_cmdline(&mut self) -> Result<String, HalError> {
         Err(HalError::Unsupported(format!(
             "{} does not say how it booted",
+            self.describe()
+        )))
+    }
+
+    /// IP › Firewall › XDP (G2.5a): where the filter is attached, its
+    /// counters and the most dropped sources (`top` of them).
+    fn xdp_status(&mut self, top: usize) -> Result<xdp::XdpStatus, HalError> {
+        let _ = top;
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
+    /// Zero the XDP counters and forget the dropped sources.
+    fn xdp_reset(&mut self) -> Result<(), HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
             self.describe()
         )))
     }

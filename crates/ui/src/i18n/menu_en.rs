@@ -45,4 +45,5 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.traffic-flow", "## What it does\nExports a record of every connection to flow collectors, in IPFIX or NetFlow v9, with the addresses and ports before and after NAT and RFC 8158 NAT events: the connection log a provider keeps (Marco Civil). Also shows the top talkers without a collector."),
     ("menu.tuning", "## What it does\nKernel and hardware tuning for routing: network buffers, conntrack, CPU governor, IRQ and RPS/XPS per interface, and the boot parameters — with recommended values and why."),
     ("menu.vrf", "## What it does\nVRFs: separate routing tables on the same router, for customers or management kept apart."),
+    ("menu.xdp", "## What it does\nA filter in the network card driver (XDP), before the kernel: drops sources in block lists, sources over a per-source rate, malformed headers and impossible TCP flags. RouterOS has no equivalent; the closest is a `raw` rule with an address list and `dst-limit`."),
 ];

@@ -34,6 +34,8 @@ pub struct VirtualHal {
     ticks: u64,
     /// Busy and total CPU ticks handed out by `resources` so far.
     cpu: (u64, u64),
+    /// `ticks` when the XDP counters were last zeroed (G2.5a).
+    xdp_zero: u64,
     applies: u64,
     /// The nftables script the last firewall change would have loaded
     /// (the lab records it; nothing runs it).
@@ -141,6 +143,7 @@ impl VirtualHal {
             applied: Config::default(),
             ticks: 0,
             cpu: (0, 0),
+            xdp_zero: 0,
             applies: 0,
             ruleset: None,
             dynamic: Vec::new(),
@@ -600,6 +603,84 @@ impl Hal for VirtualHal {
             irqbalance: true,
             notes: Vec::new(),
         })
+    }
+
+    /// The lab's XDP filter: attached natively on its Ethernet ports,
+    /// generically elsewhere, with counters that grow with the polls in
+    /// proportion to what the filter has turned on, and the first blocked
+    /// prefixes as the top sources.
+    fn xdp_status(&mut self, top: usize) -> Result<crate::xdp::XdpStatus, HalError> {
+        use crate::xdp::{XdpPlan, XdpPort, XdpStatus, XdpTop};
+        let plan = XdpPlan::of(&self.applied, &self.dynamic);
+        let t = self.ticks.saturating_sub(self.xdp_zero);
+        let on = |b: bool, n: u64| if b { t.saturating_mul(n) } else { 0 };
+        let mut ports = Vec::new();
+        for (name, mode) in &plan.interfaces {
+            let ether = self
+                .applied
+                .interfaces
+                .get(name)
+                .is_some_and(|i| i.kind == InterfaceKind::Ethernet);
+            let generic = *mode == corerouter_model::xdp::XdpMode::Generic;
+            let (active, note) = if ether && !generic {
+                ("native", None)
+            } else if generic {
+                ("generic", None)
+            } else {
+                (
+                    "generic",
+                    Some("native XDP needs a NIC driver; running generic".to_owned()),
+                )
+            };
+            let packets = [
+                on(true, 12_000),
+                on(!plan.block.is_empty(), 3_000),
+                on(plan.rate_limit > 0, 500),
+                on(plan.drop_malformed, 40),
+                on(plan.drop_invalid_tcp_flags, 15),
+            ];
+            ports.push(XdpPort {
+                interface: name.clone(),
+                mode: *mode,
+                active: Some(active),
+                note,
+                counters: packets
+                    .iter()
+                    .map(|p| (*p, p.saturating_mul(800)))
+                    .collect(),
+            });
+        }
+        let lists = &self.applied.ip.xdp.filter.block_lists;
+        let tops = plan
+            .block
+            .iter()
+            .take(top)
+            .enumerate()
+            .map(|(i, (net, list))| {
+                let packets = t.saturating_mul(600) / (i as u64 + 1);
+                XdpTop {
+                    address: net.network(),
+                    packets,
+                    bytes: packets.saturating_mul(800),
+                    reason: "blocked",
+                    list: lists.get(*list as usize).cloned(),
+                    last_secs: 0,
+                }
+            })
+            .filter(|t| t.packets > 0)
+            .collect();
+        Ok(XdpStatus {
+            unavailable: None,
+            ports,
+            top: tops,
+            block_prefixes: plan.block.len(),
+            allow_prefixes: plan.allow.len(),
+        })
+    }
+
+    fn xdp_reset(&mut self) -> Result<(), HalError> {
+        self.xdp_zero = self.ticks;
+        Ok(())
     }
 
     /// Counters that grow with the polls, with a squeezed CPU 3, a

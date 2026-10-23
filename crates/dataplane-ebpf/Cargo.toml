@@ -1,0 +1,35 @@
+# The XDP programs (G2.5). Not a member of the main workspace: they build
+# only for `bpfel-unknown-none` with the nightly pinned in
+# rust-toolchain.toml, `-Z build-std=core` and bpf-linker. `cargo xtask
+# ebpf` builds them and refreshes prebuilt/ (the object hal-linux embeds),
+# so the stable workspace never needs that toolchain. See docs/xdp.md.
+[package]
+name = "corerouter-dataplane-ebpf"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[workspace]
+
+[dependencies]
+aya-ebpf = "=0.2.1"
+corerouter-dataplane-ebpf-common = { path = "../dataplane-ebpf-common" }
+
+[[bin]]
+name = "corerouter-xdp"
+path = "src/main.rs"
+
+[profile.dev]
+panic = "abort"
+opt-level = 3
+debug = false
+overflow-checks = false
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+debug = false
+codegen-units = 1
+lto = true
+overflow-checks = false
