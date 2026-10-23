@@ -22,9 +22,13 @@
 //! (`prefs.rs`).
 
 mod dns_lookup_pt;
+mod cgnat_en;
+mod cgnat_pt;
 mod connections_en;
 mod connections_pt;
 mod en;
+mod graphs_en;
+mod graphs_pt;
 mod list_pt;
 mod menu_en;
 mod menu_pt;
@@ -34,6 +38,8 @@ mod torch_en;
 mod torch_pt;
 mod tuning_en;
 mod tuning_pt;
+mod traffic_flow_en;
+mod traffic_flow_pt;
 
 /// A language the GUI speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -76,9 +82,12 @@ impl Lang {
                 menu_pt::LABELS,
                 routes_pt::LABELS,
                 connections_pt::LABELS,
+                cgnat_pt::LABELS,
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
                 torch_pt::LABELS,
+                traffic_flow_pt::LABELS,
+                graphs_pt::LABELS,
             ],
         }
     }
@@ -86,8 +95,26 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, torch_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, torch_pt::HELP],
+            Lang::En => &[
+                en::HELP,
+                tuning_en::HELP,
+                menu_en::HELP,
+                connections_en::HELP,
+                cgnat_en::HELP,
+                traffic_flow_en::HELP,
+                graphs_en::HELP,
+                torch_en::HELP,
+            ],
+            Lang::Pt => &[
+                pt::HELP,
+                tuning_pt::HELP,
+                menu_pt::HELP,
+                connections_pt::HELP,
+                cgnat_pt::HELP,
+                traffic_flow_pt::HELP,
+                graphs_pt::HELP,
+                torch_pt::HELP,
+            ],
         }
     }
 
@@ -251,6 +278,13 @@ mod tests {
                 assert_eq!(places(en), places(pt), "{key}");
                 ids.push(key);
             }
+        }
+        for (id, en) in corerouter_engine::dns_upstreams::TEXTS {
+            let key = format!("dnsbench.{id}");
+            let pt = lookup(Lang::Pt.templates(), &key)
+                .unwrap_or_else(|| panic!("dns_lookup_pt.rs lacks {key}"));
+            assert_eq!(places(en), places(pt), "{key}");
+            ids.push(key);
         }
         for (id, en) in corerouter_engine::dns_lookup::WHY_TEXTS {
             let key = format!("dnswhy.{id}");

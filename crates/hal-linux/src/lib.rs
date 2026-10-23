@@ -587,11 +587,21 @@ mod linux {
             crate::ctnl::stats()
         }
 
+        fn conntrack_events(
+            &mut self,
+        ) -> Result<Box<dyn corerouter_hal::conntrack::EventSource>, HalError> {
+            Ok(Box::new(crate::ctnl::Events::open()?))
+        }
+
         fn connections_kill(
             &mut self,
             conns: &[corerouter_hal::conntrack::Conn],
         ) -> Result<usize, HalError> {
             crate::ctnl::delete(conns)
+        }
+
+        fn resources(&mut self) -> Option<corerouter_hal::resources::Resources> {
+            Some(self.sysctl.root.resources())
         }
 
         fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {

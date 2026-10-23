@@ -119,7 +119,23 @@ backend.**
 | NTP | Cliente SNTP próprio (G4.6: `proto-ntp` L2 puro + thread no daemon); `ntpd-rs` fica como opção para o servidor NTP e a disciplina do relógio (G4.6b/G4.6c) | Medir o offset é um pacote de 48 bytes e quatro timestamps (RFC 5905 §8/§14): um processo externo a mais não paga isso, e o status vai direto para `system.ntp.client.get` sem parsear saída. Ajustar o relógio (slew/step, `CAP_SYS_TIME`) e servir hora são outra conversa: lá a maturidade do `ntpd-rs`/chrony pesa mais |
 | Syslog remoto | Codec RFC 5424 próprio (`proto-syslog`, só encode) + UDP (RFC 5426) no daemon | Regras e ações estilo `/system logging` do RouterOS no engine; TCP/TLS (RFC 5425) depois |
 | Gerência remota | `rustls` + provedor `ring` (TLS do canal de controle e do WebSocket), `rcgen` (certificado autoassinado), `argon2` (hash de senha), `keyring` ("Remember password" da GUI nativa); `russh` (CLI SSH) depois | G0.3 feito |
-| Telemetria | `prometheus-client`, export IPFIX/sFlow | G4.4 |
+| Telemetria | `prometheus-client`; fluxos IPFIX/NetFlow v9 em Rust puro (`proto-flow`, G4.4b), dos eventos do conntrack; sFlow depois | Veja 1.4.1 e `docs/traffic-flow.md` |
+
+#### 1.4.1 Fluxos: eventos do conntrack em Rust (G4.4b, **medido**)
+
+O exportador de fluxos lê os eventos `NEW`/`DESTROY` do conntrack por ctnetlink, monta os registros
+num medidor puro (`proto-flow`) e codifica IPFIX/NetFlow v9 sem processo externo.
+
+| Opção | Por que não |
+|---|---|
+| **ipt-netflow** (módulo de kernel) | Módulo fora da árvore: precisa ser recompilado a cada kernel e pode derrubar o roteador. Os eventos de NAT saem com `natEvent` 1/2 (Historic na RFC 8158). Para o NAT ele já usa os eventos do conntrack, a mesma fonte que adotamos |
+| **softflowd / pmacctd** (pcap) | Copia cada pacote para o espaço do usuário: inviável a 10–100 Gbit/s. Não vê a tradução do NAT |
+| **amostragem por pacote** (sFlow, NFLOG) | Perde conexões curtas, e o NAT de cada uma é exatamente o que o Marco Civil pede para guardar |
+
+Números (`docs/traffic-flow.md`): o codec faz 16 M registros/s. Ponta a ponta, em netns e com o
+daemon sem otimização, 20 mil conexões com NAT saem em 0,24 s, a 4,7 µs de CPU por registro, sem
+perda. A interface de cada fluxo vem da tabela de rotas; a fonte XDP (G2.5) pode dar a interface
+real depois, sem mudar o codec.
 
 ## 2. Camadas do workspace
 
@@ -132,9 +148,10 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L0 | `crates/buildinfo` | Versão e commit do build (`COREROUTER_COMMIT` pelo `build.rs`): `server.info` e o aviso de daemon de outro commit na GUI. Crate à parte para um commit novo não recompilar o workspace | nada do workspace |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, `prober`, entradas dinâmicas de address-list, transporte do cliente DHCP `dhcp_port`/`DhcpPort`, G4.7; DHCPv6 `dhcp6_port`/`Dhcp6Port` e o que o kernel aprendeu por RA `ipv6_learned`/`Learned`, G4.7b; `sfp_module`/`cable_tester`, G1.20) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria; simula um SFP+ e o teste de cabo); `probe` (trait `Prober`/`ProbeSocket` das ferramentas), `sim` (rede simulada determinística, G6.2) e `sff` (EEPROM SFF-8472/8636 decodificado em código puro, G1.20) | L0, `firewall` (lateral permitido) |
 | L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; a tabela `ip corerouter_cgnat` do CGNAT (`cgnat`, G2.3); sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT por nfnetlink (`nfnl`, `cgnat`, G2.3b) e conntrack por ctnetlink (`ctnl`, G2.2); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT por nfnetlink (`nfnl`, `cgnat`, G2.3b) e conntrack por ctnetlink (`ctnl`, G2.2; eventos `NEW`/`DESTROY` para o Traffic Flow, `ctnl::Events`, G4.4b); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`); o mesmo para DHCPv6 com codec próprio (`v6`, `client6`, `lab6`; G4.7b) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
+| L2 | `crates/proto-flow` | Exportação de fluxos (G4.4b): IPFIX (RFC 7011) e NetFlow v9 (RFC 3954), codificador e decodificador; eventos de NAT (RFC 8158); o medidor que transforma eventos do conntrack em registros (timeouts, amostragem, cache limitado). Puro, compila em wasm. Veja `docs/traffic-flow.md` | L0, L1 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU, MTR; G6.1–G6.3), clientes DHCP em execução (`dhcp_client`: `Session::dhcp_service`, concessões como entradas dinâmicas vistas pelo HAL em `Session::effective`; G4.7; DHCPv6 em `dhcp6_client`, com os endereços `from_pool` resolvidos no mesmo `effective`, G4.7b) | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial`; `ThreadRunner` das tarefas (G6.1) | L0–L3 |
@@ -760,6 +777,42 @@ própria. Grupos abertos são preferência da janela (`prefs.rs`, chave `menu`).
   Compila em `wasm32-unknown-unknown` (é só `include_bytes!`). O teste `the_font_has_every_icon`
   reprova ícone sem glifo. Quando o `egui-phosphor` acompanhar o egui do workspace, dá para trocar
   o subconjunto pelo crate (macro `subset!`) sem mudar `icons.rs`.
+
+### Histórico de tráfego (G4.5)
+
+O roteador guarda um histórico **leve e local** de cada interface escolhida (bps, pps, erros e
+drops) e dele mesmo (CPU, memória, conntrack), estilo RRDtool, em resolução decrescente:
+1 s na última hora, 1 min no último dia, 5 min na última semana, 1 h no último ano. O ClickHouse
+(G4.4f) é externo e opcional; ele lê daqui (`system.graph.export` ou `GraphDb::export`).
+
+- **Onde mora:** `engine::graph` (puro, compila em wasm): o formato (`graph::rrd`), a coleta e as
+  consultas. A coleta vai no `Session::tick` que já faz a varredura de links por segundo
+  (`poll_links`): sem dump extra de netlink. CPU, memória e conntrack vêm de `Hal::resources`
+  (`/proc/stat`, `/proc/meminfo`, `nf_conntrack_count`). O disco é do daemon
+  (`service/graphing.rs`, `<config-dir>/graphs/`): o engine entrega `Patch`es e recebe os
+  arquivos de volta no boot, sem I/O próprio. A GUI sem daemon tem o histórico só em memória.
+- **Formato próprio × `redb` × `fjall` (decisão, com números):** um RRD tem tamanho fixo e é
+  escrito sempre no mesmo lugar; o que se quer é **zero amplificação de escrita** (flash) e
+  teto de disco natural. Formato próprio: um arquivo por série (cabeçalho + quatro anéis de
+  `f32`, média e máximo por slot), escrito no lugar: um store de 5 min grava só os baldes de
+  1 min, 5 min e 1 h fechados desde o último (~0,5 KB por interface, **medido** no teste
+  `a_restart_reads_back_what_was_stored`), e o anel de 1 s (o grosso) só no desligamento
+  limpo. O `redb` (B-tree copy-on-write) reescreve páginas inteiras e a raiz a cada commit
+  (4 KiB+ por série por store, mais o fsync do arquivo inteiro) e cresce até o `compact`; o
+  `fjall` (LSM) reescreve tudo nas compactações e precisa de tuning de memória — os dois resolvem
+  um problema (chave-valor geral, transações) que o RRD não tem, e acrescentariam um crate
+  grande ao daemon. Ficou o formato próprio (~500 linhas com testes).
+- **Teto:** o tamanho de uma série é fixo (672.984 bytes por interface, 336.600 a do sistema);
+  `max_memory_mib` (64 MiB por padrão, ~90 interfaces) recusa o que não cabe, registra no log e
+  lista em `system.graph.print`. Memória e disco são o mesmo número.
+- **Custos (medidos, release, `cargo bench -p corerouter-engine --bench graph`, 2026-10-23):**
+  um segundo de coleta 1,9 µs / 20 µs / 355 µs com 8 / 64 / 512 interfaces (dentro do lock da
+  sessão); tirar as mudanças de um store 4,7 µs / 33 µs / 547 µs; consultar um ano de uma
+  interface 1,36 ms. Daemon inteiro em `docs/changes/G4.5a.md`.
+- **Revisitar se:** o operador quiser cobrança mensal exata (p95 de amostras de 5 min por 30
+  dias, que o anel de 5 min de uma semana não tem: um quinto anel de 5 min × 35 dias custa
+  +168 KB por interface — gap G4.5b) ou milhares de interfaces (aí o anel de 1 h pode ficar só
+  no disco e ser lido sob demanda).
 
 ## Histórico de revisão
 
