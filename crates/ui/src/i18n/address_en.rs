@@ -34,11 +34,6 @@ IPv6 needs no such check: the kernel runs Duplicate Address Detection (RFC 4862)
 Uncheck it to skip the probe (one packet, up to 2 s)."##,
     ),
     (
-        "ip.address.comment",
-        r##"## What it is
-Free text kept with the address (who, what for, the circuit id). Shown in the list."##,
-    ),
-    (
         "ip.address.disabled",
         r##"## What it is
 A disabled address stays in the configuration and leaves the data plane (the kernel): no traffic, no connected route. Enable it again with ✓.
@@ -59,11 +54,38 @@ The interface (port, VLAN, bridge, bond, loopback) that gets the address. Its VR
 Two interfaces in the same table with overlapping networks would claim the same hosts, and the connected route goes to only one of them: the window refuses it."##,
     ),
     (
+        "ip.address.lifetime",
+        r##"## What it is
+For addresses that expire (SLAAC from Router Advertisements, DHCP leases): the valid lifetime, and after the slash the preferred one (RFC 4862 §5.5.4). Empty: forever (a static address)."##,
+    ),
+    (
+        "ip.address.network",
+        r##"## What it is
+The network the address belongs to (the address with the host bits cleared). It is also the connected route the address creates in its interface's table."##,
+    ),
+    (
+        "ip.address.state",
+        r##"## What it says
+- **active**: in the kernel and in use.
+- **disabled**: kept in the configuration, out of the kernel (✓ brings it back).
+- **invalid**: cannot be used: its interface is missing or disabled, or its pool has no prefix yet.
+- **tentative**: IPv6 duplicate address detection is running (RFC 4862 §5.4), about a second.
+- **dad-failed**: another host on the link has this IPv6 address; the kernel will not use it.
+- **deprecated**: its preferred lifetime ran out (RFC 4862 §5.5.4): kept for open connections only.
+
+An **access** chip marks the address this session depends on: removing or disabling it asks first."##,
+    ),
+    (
         "ip.address.to",
         r##"## What it is
 Optional: the last address of a **series**. `10.20.0.1/24` to `10.20.0.5` adds five addresses, all in one transaction: all of them or none.
 
 ## Limits
 Same family and inside the same network; at most 256 at a time."##,
+    ),
+    (
+        "ip.address.vrf",
+        r##"## What it is
+The routing table (VRF) of the interface. Empty: the main table. Addresses in different VRFs may overlap; inside one they may not."##,
     ),
 ];

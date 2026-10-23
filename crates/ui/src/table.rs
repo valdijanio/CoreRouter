@@ -36,6 +36,8 @@ const NOTE_INDENT: f32 = 30.0;
 const NOTE_CHARS: usize = 512;
 /// Room for the speech-bubble icon before a comment in the Comment column.
 const CELL_ICON: f32 = 18.0;
+/// Room for a column title's ⓘ.
+const HELP_W: f32 = 18.0;
 /// Characters of a cell drawn; a longer value ends in "…" and the whole
 /// text is in the tooltip (docs/ui-style.md › Tabelas). Keeps one huge
 /// comment from making its column thousands of points wide.
@@ -51,6 +53,17 @@ pub(crate) struct Column {
     pub comment: bool,
     /// Secondary text (why a route is inactive): drawn in the weak colour.
     pub weak: bool,
+    /// Explanation key (`i18n::explain`) of the column: an ⓘ after its
+    /// title, whose click comes back in [`TableOutput::help`]. Empty: none.
+    pub help: &'static str,
+}
+
+impl Column {
+    /// This column with an ⓘ opening explanation `key`.
+    pub(crate) const fn help(mut self, key: &'static str) -> Self {
+        self.help = key;
+        self
+    }
 }
 
 pub(crate) const fn col(title: &'static str) -> Column {
@@ -59,6 +72,7 @@ pub(crate) const fn col(title: &'static str) -> Column {
         right: false,
         comment: false,
         weak: false,
+        help: "",
     }
 }
 
@@ -68,6 +82,7 @@ pub(crate) const fn num(title: &'static str) -> Column {
         right: true,
         comment: false,
         weak: false,
+        help: "",
     }
 }
 
@@ -78,6 +93,7 @@ pub(crate) const fn weak(title: &'static str) -> Column {
         right: false,
         comment: false,
         weak: true,
+        help: "",
     }
 }
 
@@ -88,6 +104,7 @@ pub(crate) const fn comment() -> Column {
         right: false,
         comment: true,
         weak: false,
+        help: "",
     }
 }
 
@@ -191,6 +208,8 @@ pub(crate) struct TableOutput {
     /// A row was dragged and dropped (tables with [`TableState::reorder`]):
     /// (dragged key, key of the row it lands above; `None` = after the last).
     pub dropped: Option<(String, Option<String>)>,
+    /// The ⓘ of a column title was clicked: its explanation key.
+    pub help: Option<&'static str>,
 }
 
 /// UI-local state of one table: selection, Shift anchor, find text, and
@@ -533,7 +552,11 @@ pub(crate) fn show(
     // CELL_CHARS is cut with "…" (its tooltip has it all).
     let mut layout: Vec<(usize, f32)> = shown
         .iter()
-        .filter_map(|&i| Some((i, text_width(ui, columns.get(i)?.title, &font))))
+        .filter_map(|&i| {
+            let c = columns.get(i)?;
+            let icon = if c.help.is_empty() { 0.0 } else { HELP_W };
+            Some((i, icon + text_width(ui, c.title, &font)))
+        })
         .collect();
     for r in visible.iter().filter(|r| !r.section) {
         for (i, w) in &mut layout {
@@ -583,6 +606,29 @@ pub(crate) fn show(
                 head.bottom(),
                 visuals.widgets.noninteractive.bg_stroke,
             );
+            // The ⓘ of each explained column: after a left title, before a
+            // right-aligned one.
+            let mut x = head.left();
+            for &(i, w) in &layout {
+                if let Some(c) = columns.get(i).filter(|c| !c.help.is_empty()) {
+                    let left = if c.right {
+                        x + CELL_PAD
+                    } else {
+                        x + CELL_PAD + text_width(ui, c.title, &font) + 2.0
+                    };
+                    let at = Rect::from_min_size(pos2(left, head.top()), vec2(HELP_W, row_h));
+                    let tip = format!("What is {}?", c.title);
+                    let clicked = ui
+                        .scope_builder(egui::UiBuilder::new().max_rect(at), |ui| {
+                            crate::help::info_button(ui, id.with(("help", i)), &tip).clicked()
+                        })
+                        .inner;
+                    if clicked {
+                        out.help = Some(c.help);
+                    }
+                }
+                x += w;
+            }
 
             // Empty space below the rows: clears the selection on click and
             // owns the "Add / Select All / Refresh" menu. Registered before

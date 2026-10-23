@@ -184,3 +184,26 @@ fn the_access_address_asks_before_the_bar_acts() {
     h.idle();
     assert_eq!(addresses(&h)[0]["state"], "disabled");
 }
+
+#[test]
+fn every_column_explains_itself() {
+    let mut s = Session::virtual_lab();
+    s.execute("ip.address.add", &json!({"address": "10.0.0.1/24", "interface": "ether1"})).unwrap();
+    let mut h = open(s);
+    let at = h
+        .ctx
+        .read_response(crate::table::table_id("addresses").with(("help", 1usize)))
+        .expect("the Address column has an ⓘ")
+        .rect
+        .center();
+    h.click(at);
+    let help = panel(&mut h).help.clone().expect("the ⓘ opens the explanation");
+    assert_eq!(help.key, "ip.address.address");
+    // Every key the window uses has its text, in both languages.
+    for key in ["ip.address.state", "ip.address.network", "ip.address.vrf", "ip.address.lifetime"] {
+        for lang in crate::i18n::Lang::ALL {
+            let langs = crate::i18n::Langs { labels: lang, help: lang };
+            assert_eq!(crate::i18n::explain(langs, key).map(|(l, _)| l), Some(lang), "{key}");
+        }
+    }
+}

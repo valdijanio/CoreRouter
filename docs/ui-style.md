@@ -171,6 +171,10 @@ manda diz (`disabled`, `dynamic`, motivo), e o `engine.list` diz se o comando ex
 - **Filtros:** `Filters` guarda os selos ligados por campo da linha; `filters.chips(ui, "family",
   &[("ipv4", "IPv4"), …], lang)` desenha, `filters.shows(&linha)` filtra (E entre campos, OU dentro
   de um). O Find (`table::find_field`) vem por último, à direita.
+- **ⓘ nas colunas:** `col("Address").help("ip.address.address")` põe o ⓘ depois do título da
+  coluna; o clique volta em `TableOutput::help` (a chave), e a janela abre
+  `HelpView::new(chave, título)` com `help::modal` no seu `dialogs`. No modal, cada `Field` tem a
+  sua chave em `help`; `help: ""` só para o que é óbvio (Comment).
 - **Rodapé:** `list::footer(ui, &[(n, "addresses", tom), …], lang)`; contagem zero depois da
   primeira some. `list::count(linhas, campo, valor)` conta.
 - **Clique direito e teclado:** dentro do `Menu::Rows` do `table::show`, `list::row_menu(ui, &tools,

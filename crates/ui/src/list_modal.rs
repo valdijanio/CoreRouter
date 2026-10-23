@@ -59,7 +59,8 @@ pub(crate) enum Input {
 }
 
 /// One field: the parameter it fills, its label (English, through `tr`)
-/// and the explanation key of its ⓘ.
+/// and the explanation key of its ⓘ (empty: none, for what is obvious, as
+/// Comment; docs/ui-style.md, "Explicação ⓘ em todo lugar que couber").
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Field {
     pub param: &'static str,
@@ -336,7 +337,9 @@ impl Modal {
                     for f in &fields {
                         ui.horizontal(|ui| {
                             ui.label(tr(l, f.label));
-                            if help::info_button(ui, form.window().with(("help", f.param)), tr(app.lang.help, "Explain")).clicked() {
+                            // No ⓘ for what explains itself (Comment).
+                            if !f.help.is_empty()
+                                && help::info_button(ui, form.window().with(("help", f.param)), tr(app.lang.help, "Explain")).clicked() {
                                 help = Some(HelpView::new(f.help, tr(l, f.label)));
                             }
                         });

@@ -77,7 +77,7 @@ const FIELDS: &[Field] = &[
     Field {
         param: "comment",
         label: "Comment",
-        help: "ip.address.comment",
+        help: "",
         input: Input::Text(""),
         edit: true,
     },
@@ -108,12 +108,12 @@ pub(crate) const SPEC: Spec = Spec {
 };
 
 const COLUMNS: [table::Column; 7] = [
-    col(""),
-    col("Address"),
-    col("Network"),
-    col("Interface"),
-    col("VRF"),
-    col("Lifetime"),
+    col("State").help("ip.address.state"),
+    col("Address").help("ip.address.address"),
+    col("Network").help("ip.address.network"),
+    col("Interface").help("ip.address.interface"),
+    col("VRF").help("ip.address.vrf"),
+    col("Lifetime").help("ip.address.lifetime"),
     comment(),
 ];
 
@@ -122,6 +122,8 @@ pub(crate) struct AddressPanel {
     pub(crate) filters: Filters,
     pub(crate) modal: Option<Modal>,
     pub(crate) note: Option<NoteDialog>,
+    /// The explanation a column's ⓘ opened.
+    pub(crate) help: Option<crate::help::HelpView>,
 }
 
 /// 💬 on the selection: one comment for all of them.
@@ -379,6 +381,10 @@ impl PanelState for AddressPanel {
                 }
             },
         );
+        if let Some(key) = out.help {
+            let title = COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            self.help = Some(crate::help::HelpView::new(key, crate::i18n::tr(l, title)));
+        }
         act = act
             .or_else(|| list::from_shortcut(out.shortcut, &tools, &selection))
             .or_else(|| out.opened.or(out.comment).map(Act::Edit));
@@ -412,6 +418,7 @@ impl PanelState for AddressPanel {
             }
         }
         self.note_dialog(app, ctx, area);
+        crate::help::modal(ctx, app.lang, &mut self.help);
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {

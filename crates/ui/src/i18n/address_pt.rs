@@ -93,11 +93,6 @@ No IPv6 não precisa: o kernel faz sozinho a detecção de endereço duplicado (
 Desmarque para pular a sonda. Ela é um pacote e leva até 2 s."##,
     ),
     (
-        "ip.address.comment",
-        r##"## O que é
-Texto livre guardado com o endereço: quem usa, para quê, o id do circuito. Aparece na lista."##,
-    ),
-    (
         "ip.address.disabled",
         r##"## O que é
 Um endereço desativado fica na configuração e sai do plano de dados (o kernel): sem tráfego e sem rota conectada. Para voltar, ative com ✓.
@@ -118,11 +113,38 @@ A interface que recebe o endereço: porta, VLAN, bridge, bond ou loopback. A VRF
 Duas interfaces na mesma tabela com redes que se sobrepõem disputam os mesmos hosts, e a rota conectada vai para uma só delas. Por isso a janela recusa."##,
     ),
     (
+        "ip.address.lifetime",
+        r##"## O que é
+Vale para endereços que expiram, como SLAAC por Router Advertisement e concessões DHCP. Mostra o tempo de vida válido e, depois da barra, o preferido (RFC 4862 §5.5.4). Vazio quer dizer para sempre, como num endereço estático."##,
+    ),
+    (
+        "ip.address.network",
+        r##"## O que é
+A rede a que o endereço pertence: o endereço com os bits de host zerados. É também a rota conectada que o endereço cria na tabela da interface."##,
+    ),
+    (
+        "ip.address.state",
+        r##"## O que diz
+- **active**: está no kernel, em uso.
+- **disabled**: fica na configuração e sai do kernel. Para voltar, use ✓.
+- **invalid**: não pode ser usado. A interface não existe ou está desativada, ou o pool ainda não tem prefixo.
+- **tentative**: a detecção de endereço duplicado do IPv6 está rodando (RFC 4862 §5.4). Leva cerca de um segundo.
+- **dad-failed**: outro host do enlace tem este endereço IPv6, e o kernel não o usa.
+- **deprecated**: acabou o tempo de vida preferido (RFC 4862 §5.5.4). O endereço segue só para as conexões já abertas.
+
+O selo **access** marca o endereço de que esta sessão depende: removê-lo ou desativá-lo pede confirmação antes."##,
+    ),
+    (
         "ip.address.to",
         r##"## O que é
 Opcional: o último endereço de uma **série**. De `10.20.0.1/24` até `10.20.0.5` são cinco endereços numa transação só: entram todos ou nenhum.
 
 ## Limites
 A série fica na mesma família e na mesma rede, com no máximo 256 endereços de uma vez."##,
+    ),
+    (
+        "ip.address.vrf",
+        r##"## O que é
+A tabela de rotas (VRF) da interface. Vazio quer dizer a tabela principal. Endereços em VRFs diferentes podem se sobrepor; dentro da mesma VRF, não."##,
     ),
 ];
