@@ -43,6 +43,10 @@ pub fn header(kind: &str) -> Option<String> {
         )),
         "cable-test" => Some(format!("{:<4} {:<20} DISTANCE", "PAIR", "STATUS")),
         "torch" => Some(super::torch::text_header()),
+        "bandwidth-test" => Some(format!(
+            "{:>5} {:>12} {:>12} {:>8} {:>10} {:>6}",
+            "TIME", "TX-RATE", "RX-RATE", "LOST", "JITTER", "CPU"
+        )),
         "sniffer" => Some(format!("{:>5} {:>10} {:>12} {:>12}", "TIME", "PACKETS", "BYTES", "FILE-SIZE")),
         _ => None,
     }
@@ -127,6 +131,20 @@ pub fn line(kind: &str, ev: &Value) -> String {
         // G6.6: the `dig` text, or a compare/trace row (may be several lines).
         "dns-lookup" => crate::dns_lookup::text_line(ev),
         "torch" => super::torch::text_line(ev),
+        // The table at the end is the output (`traceroute` prints per hop).
+        "traceroute" => String::new(),
+        "bandwidth-test" => {
+            let f = |k: &str| ev.get(k).and_then(Value::as_f64);
+            format!(
+                "{:>4}s {:>12} {:>12} {:>8} {:>10} {:>6}",
+                f("t").map_or(String::new(), |t| format!("{t:.0}")),
+                super::torch::rate(f("tx_bps").unwrap_or(0.0)),
+                super::torch::rate(f("rx_bps").unwrap_or(0.0)),
+                s(ev, "lost"),
+                f("jitter_ms").map_or(String::new(), |j| format!("{j:.3}ms")),
+                f("cpu").map_or(String::new(), |c| format!("{c:.0}%")),
+            )
+        }
         "sniffer" => format!(
             "{:>4}s {:>10} {:>12} {:>12}",
             s(ev, "t"),
@@ -292,6 +310,39 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
         }
         "dns-lookup" => crate::dns_lookup::summary_lines(summary),
         "torch" => Vec::new(),
+        "traceroute" => traceroute_table(summary),
+        "bandwidth-test" => {
+            let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
+            let mut out = Vec::new();
+            for (name, way) in [("tx", "upload"), ("rx", "download")] {
+                let Some(w) = summary.get(way).filter(|w| !w.is_null()) else {
+                    continue;
+                };
+                let mut line = format!(
+                    "{name}-total-average={} (sent {} received {} bytes)",
+                    super::torch::rate(f(w, "received_bps").unwrap_or(0.0)),
+                    s(w, "sent"),
+                    s(w, "received"),
+                );
+                if let Some(l) = w.get("lost").filter(|l| !l.is_null()) {
+                    line += &format!(" lost-packets={l} loss={}%", s(w, "loss_pct"));
+                }
+                if let Some(j) = f(w, "jitter_ms") {
+                    line += &format!(" jitter={j:.3}ms");
+                }
+                if let Some(r) = w.get("retransmits").filter(|r| !r.is_null()) {
+                    line += &format!(" retransmits={r}");
+                }
+                out.push(line);
+            }
+            out.push(format!(
+                "cpu-load={}% (max {}%) remote-cpu-load={}%",
+                s(summary, "cpu_avg"),
+                s(summary, "cpu_max"),
+                s(summary, "remote_cpu"),
+            ));
+            out
+        }
         "sniffer" => vec![format!(
             "packets={} bytes={} file-size={} ({}): tool.sniffer.download id=<task>",
             s(summary, "packets"),
@@ -303,6 +354,64 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
         "dns-upstreams" => crate::dns_upstreams::summary_lines(summary),
         _ => vec![summary.to_string()],
     }
+}
+
+/// The classic `traceroute` output: one line per hop, its address(es),
+/// name and AS, then each probe's RTT (`*` for none) and why it ended.
+fn traceroute_table(summary: &Value) -> Vec<String> {
+    let mut out = vec![format!(
+        "traceroute to {} ({}), {} hops max, {}{}{}",
+        s(summary, "host"),
+        s(summary, "address"),
+        s(summary, "max_hops"),
+        s(summary, "protocol"),
+        summary
+            .get("port")
+            .and_then(Value::as_u64)
+            .map(|p| format!(" port {p}"))
+            .unwrap_or_default(),
+        if summary.get("paris").and_then(Value::as_bool) == Some(true) { ", paris" } else { "" },
+    )];
+    for h in summary.get("hops").and_then(Value::as_array).into_iter().flatten() {
+        let hosts: Vec<String> = h
+            .get("hosts_info")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|x| {
+                let ip = s(x, "address");
+                let mut t = match x.get("name").and_then(Value::as_str) {
+                    Some(n) => format!("{n} ({ip})"),
+                    None => ip,
+                };
+                if let Some(a) = x.get("asn").and_then(Value::as_u64) {
+                    t += &format!(" [AS{a}]");
+                }
+                if let Some(m) = x.get("mpls_text").and_then(Value::as_str) {
+                    t += &format!(" <MPLS {m}>");
+                }
+                t
+            })
+            .collect();
+        let rtts: Vec<String> = h
+            .get("rtts")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|r| r.as_f64().map_or_else(|| "*".to_owned(), |ms| format!("{ms:.3} ms")))
+            .collect();
+        let note = match h.get("note").and_then(Value::as_str) {
+            Some("host unreachable") => " !H",
+            Some("network unreachable") => " !N",
+            Some("protocol unreachable") => " !P",
+            Some("fragmentation needed") => " !F",
+            Some(n) if n.contains("prohibited") => " !X",
+            _ => "",
+        };
+        let who = if hosts.is_empty() { String::new() } else { format!("{}  ", hosts.join(" / ")) };
+        out.push(format!("{:>2}  {who}{}{note}", s(h, "hop"), rtts.join("  ")).trim_end().to_owned());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -389,3 +498,4 @@ mod tests {
         assert!(s[0].contains("path MTU 1500"));
     }
 }
+

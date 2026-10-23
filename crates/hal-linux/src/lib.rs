@@ -109,6 +109,10 @@ pub mod ra;
 #[cfg(target_os = "linux")]
 pub mod icmp;
 
+/// UDP and TCP SYN probes for traceroute (G6.4c), next to the ICMP ones.
+#[cfg(target_os = "linux")]
+pub mod trace;
+
 /// Packet capture for Torch and the sniffer (G6.4a): `AF_PACKET`.
 #[cfg(target_os = "linux")]
 pub mod capture;

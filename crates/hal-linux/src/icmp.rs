@@ -43,11 +43,11 @@ use rustix::net::sockopt::{
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
 const ICMP_ECHO_REPLY: u8 = 0;
-const ICMP_UNREACH: u8 = 3;
+pub(crate) const ICMP_UNREACH: u8 = 3;
 const ICMP_ECHO: u8 = 8;
 const ICMP_TIME_EXCEEDED: u8 = 11;
 const ICMP_FRAG_NEEDED: u8 = 4;
-const ICMP6_UNREACH: u8 = 1;
+pub(crate) const ICMP6_UNREACH: u8 = 1;
 const ICMP6_TOO_BIG: u8 = 2;
 const ICMP6_TIME_EXCEEDED: u8 = 3;
 const ICMP6_ECHO: u8 = 128;
@@ -56,10 +56,10 @@ const IPPROTO_ICMP: u8 = 1;
 const IPPROTO_ICMPV6: u8 = 58;
 /// `SO_EE_ORIGIN_*` of `sock_extended_err`.
 const ORIGIN_LOCAL: u8 = 1;
-const ORIGIN_ICMP: u8 = 2;
-const ORIGIN_ICMP6: u8 = 3;
+pub(crate) const ORIGIN_ICMP: u8 = 2;
+pub(crate) const ORIGIN_ICMP6: u8 = 3;
 /// Default TTL / hop limit when a probe names none.
-const DEFAULT_TTL: u8 = 64;
+pub(crate) const DEFAULT_TTL: u8 = 64;
 /// Past this many remembered probes, those older than [`SENT_TTL`] are
 /// forgotten (at most once per [`SENT_SWEEP`]). The table is keyed by the
 /// `u16` sequence, so it never holds more than 65 536 entries; probes still
@@ -73,7 +73,7 @@ const SENT_SWEEP: Duration = Duration::from_secs(1);
 const MIN_MTU_V4: u16 = 68;
 const MIN_MTU_V6: u16 = 1280;
 /// Control messages (TTL, hop limit, extended error + offender) fit easily.
-const CMSG_BUF: usize = 512;
+pub(crate) const CMSG_BUF: usize = 512;
 /// Receive buffer: the largest IPv4 packet.
 const BUF: usize = 65_536;
 
@@ -163,6 +163,9 @@ impl Prober for HostProber {
     }
 
     fn open(&self, options: &SocketOptions) -> Result<Box<dyn ProbeSocket>, ProbeError> {
+        if options.proto != corerouter_hal::probe::ProbeProto::Icmp {
+            return Ok(Box::new(crate::trace::TraceSocket::new(options.clone())));
+        }
         Ok(Box::new(HostSocket {
             options: options.clone(),
             prefer: self.v4,
@@ -270,7 +273,7 @@ fn next_ident() -> u16 {
         .hash_one((std::process::id(), n)) as u16
 }
 
-fn nix_io(e: Errno) -> io::Error {
+pub(crate) fn nix_io(e: Errno) -> io::Error {
     io::Error::from_raw_os_error(e as i32)
 }
 
@@ -362,8 +365,11 @@ fn checksum(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// Echo request: header + `payload` bytes of a counting pattern.
-pub fn echo_request(family: Family, ident: u16, seq: u16, payload: usize) -> Vec<u8> {
+/// Echo request: header + `payload` bytes of a counting pattern. With
+/// `paris`, the first payload word compensates `seq` so the checksum (which
+/// per-flow load balancers hash with the rest of the first 8 bytes) is the
+/// same for every probe (G6.4c).
+pub fn echo_request(family: Family, ident: u16, seq: u16, payload: usize, paris: bool) -> Vec<u8> {
     let ty = match family {
         Family::V4 => ICMP_ECHO,
         Family::V6 => ICMP6_ECHO,
@@ -373,6 +379,9 @@ pub fn echo_request(family: Family, ident: u16, seq: u16, payload: usize) -> Vec
     p.extend_from_slice(&ident.to_be_bytes());
     p.extend_from_slice(&seq.to_be_bytes());
     p.extend((0..payload).map(|i| (i % 256) as u8));
+    if paris && let Some(w) = p.get_mut(8..10) {
+        w.copy_from_slice(&corerouter_hal::probe::paris_word(seq).to_be_bytes());
+    }
     // ICMPv6 checksums cover a pseudo-header: the kernel fills them in.
     if family == Family::V4 {
         let c = checksum(&p).to_be_bytes();
@@ -530,18 +539,18 @@ pub fn parse_raw_v6(icmp: &[u8], hop_limit: Option<u8>) -> Option<Parsed> {
     })
 }
 
-fn to_ip(a: &SockaddrStorage) -> Option<IpAddr> {
+pub(crate) fn to_ip(a: &SockaddrStorage) -> Option<IpAddr> {
     if let Some(v4) = a.as_sockaddr_in() {
         return Some(IpAddr::V4(v4.ip()));
     }
     a.as_sockaddr_in6().map(|v6| IpAddr::V6(v6.ip()))
 }
 
-fn ip_of_v4(sa: &nix::libc::sockaddr_in) -> IpAddr {
+pub(crate) fn ip_of_v4(sa: &nix::libc::sockaddr_in) -> IpAddr {
     IpAddr::V4(Ipv4Addr::from(u32::from_be(sa.sin_addr.s_addr)))
 }
 
-fn ip_of_v6(sa: &nix::libc::sockaddr_in6) -> IpAddr {
+pub(crate) fn ip_of_v6(sa: &nix::libc::sockaddr_in6) -> IpAddr {
     IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr))
 }
 
@@ -555,7 +564,7 @@ enum Got {
 }
 
 /// What an error-queue entry says about a probe (`None`: not about one).
-fn error_kind(ee: &nix::libc::sock_extended_err) -> Option<ReplyKind> {
+pub(crate) fn error_kind(ee: &nix::libc::sock_extended_err) -> Option<ReplyKind> {
     let mtu = u16::try_from(ee.ee_info).ok().filter(|m| *m > 0);
     Some(match (ee.ee_origin, ee.ee_type, ee.ee_code) {
         (ORIGIN_ICMP, ICMP_TIME_EXCEEDED, _) | (ORIGIN_ICMP6, ICMP6_TIME_EXCEEDED, _) => {
@@ -766,6 +775,7 @@ fn first_match(
 impl ProbeSocket for HostSocket {
     fn send(&mut self, probe: &Probe) -> Result<(), ProbeError> {
         let family = Family::of(probe.dst);
+        let paris = self.options.paris;
         let side = self.side(family)?;
         let ttl = probe.ttl.unwrap_or(DEFAULT_TTL);
         if side.ttl != Some(ttl) {
@@ -777,7 +787,7 @@ impl ProbeSocket for HostSocket {
             side.ttl = Some(ttl);
         }
         let payload = usize::from(probe.size.saturating_sub(overhead(probe.dst)));
-        let packet = echo_request(family, side.ident, probe.seq, payload);
+        let packet = echo_request(family, side.ident, probe.seq, payload, paris);
         let to = SockAddr::from(SocketAddr::new(probe.dst, 0));
         let at = Instant::now();
         match side.sock.send_to(&packet, &to) {
@@ -839,11 +849,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn paris_echoes_keep_one_checksum() {
+        // Per-flow balancers hash the first 8 bytes: type, code, checksum…
+        let sum = |seq: u16| echo_request(Family::V4, 0x4242, seq, 32, true)[2..4].to_vec();
+        let first = sum(1);
+        for seq in [2u16, 3, 100, 0xFFFE, 0xFFFF, 0] {
+            assert_eq!(sum(seq), first, "seq {seq}");
+        }
+        // Without Paris the checksum follows the sequence.
+        let classic = |seq: u16| echo_request(Family::V4, 0x4242, seq, 32, false)[2..4].to_vec();
+        assert_ne!(classic(1), classic(2));
+    }
+
+    #[test]
     fn checksum_of_a_known_echo() {
         // ping -c1 style request: type 8, id 0x1234, seq 1, no payload.
-        let p = echo_request(Family::V4, 0x1234, 1, 0);
+        let p = echo_request(Family::V4, 0x1234, 1, 0, false);
         assert_eq!(checksum(&p), 0, "a packet with its checksum sums to zero");
-        let p = echo_request(Family::V4, 7, 9, 57);
+        let p = echo_request(Family::V4, 7, 9, 57, false);
         assert_eq!(p.len(), 65);
         assert_eq!(checksum(&p), 0);
     }
@@ -860,7 +883,7 @@ mod tests {
 
     #[test]
     fn parses_raw_v4_replies_and_errors() {
-        let mut reply = echo_request(Family::V4, 0x55, 3, 4);
+        let mut reply = echo_request(Family::V4, 0x55, 3, 4, false);
         reply[0] = ICMP_ECHO_REPLY;
         let p = parse_raw_v4(&ipv4(1, 61, &reply)).unwrap();
         assert_eq!(
@@ -869,7 +892,7 @@ mod tests {
         );
         assert_eq!(p.kind, ReplyKind::Echo);
 
-        let quoted = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0));
+        let quoted = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0, false));
         let mut te = vec![ICMP_TIME_EXCEEDED, 0, 0, 0, 0, 0, 0, 0];
         te.extend_from_slice(&quoted);
         let p = parse_raw_v4(&ipv4(1, 255, &te)).unwrap();
@@ -898,21 +921,21 @@ mod tests {
         assert_eq!((p.seq, p.mpls), (4, vec![label]));
 
         // Our own echo request (loopback) and garbage are not replies.
-        assert!(parse_raw_v4(&ipv4(1, 64, &echo_request(Family::V4, 1, 1, 0))).is_none());
+        assert!(parse_raw_v4(&ipv4(1, 64, &echo_request(Family::V4, 1, 1, 0, false))).is_none());
         assert!(parse_raw_v4(&[0x45, 0]).is_none());
         assert!(parse_raw_v4(&ipv4(17, 64, &[0; 8])).is_none());
     }
 
     #[test]
     fn parses_raw_v6_replies_and_errors() {
-        let mut reply = echo_request(Family::V6, 9, 2, 8);
+        let mut reply = echo_request(Family::V6, 9, 2, 8, false);
         reply[0] = ICMP6_ECHO_REPLY;
         let p = parse_raw_v6(&reply, Some(64)).unwrap();
         assert_eq!((p.ident, p.seq, p.size), (9, 2, Some(56)));
 
         let mut inner = vec![0x60, 0, 0, 0, 0, 8, IPPROTO_ICMPV6, 1];
         inner.extend_from_slice(&[0; 32]);
-        inner.extend_from_slice(&echo_request(Family::V6, 9, 5, 0));
+        inner.extend_from_slice(&echo_request(Family::V6, 9, 5, 0, false));
         let mut big = vec![ICMP6_TOO_BIG, 0, 0, 0, 0, 0, 0x05, 0x00];
         big.extend_from_slice(&inner);
         let p = parse_raw_v6(&big, None).unwrap();
@@ -964,7 +987,7 @@ mod tests {
             },
         );
         let quote = |inner_dst: [u8; 4]| {
-            let mut q = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0));
+            let mut q = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0, false));
             q[16..20].copy_from_slice(&inner_dst);
             let mut te = vec![ICMP_TIME_EXCEEDED, 0, 0, 0, 0, 0, 0, 0];
             te.extend_from_slice(&q);
@@ -977,7 +1000,7 @@ mod tests {
         let real = t.matched(quote([198, 51, 100, 1]), router).unwrap();
         assert_eq!((real.seq, real.from), (4, router));
         // A "too big" below the IPv4 minimum keeps no number.
-        let mut q = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0));
+        let mut q = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0, false));
         q[16..20].copy_from_slice(&[198, 51, 100, 1]);
         let mut fragn = vec![ICMP_UNREACH, ICMP_FRAG_NEEDED, 0, 0, 0, 0, 0, 20];
         fragn.extend_from_slice(&q);

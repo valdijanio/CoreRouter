@@ -67,6 +67,7 @@ const DNS: Option<&str> = Some("DNS");
 /// Every window of the menu, by key (sorted, a test checks).
 pub(crate) const CATALOG: &[Entry] = &[
     e("addresses", None, None, icons::MAP_PIN, "/ip address", &["ip.address"], &["ip address", "ipv4", "endereço", "endereco", "gateway", "subnet"]),
+    e("bandwidth", None, None, icons::GAUGE, "/tool bandwidth-test", &["tool.bandwidth-test", "tool.bandwidth-server"], &["iperf", "iperf3", "btest", "speed test", "teste de velocidade", "throughput", "vazão", "banda", "bandwidth server"]),
     e("bgp", None, None, icons::GLOBE_HEMISPHERE_WEST, "/routing bgp", &["routing.bgp"], &["peer", "asn", "ebgp", "ibgp", "transit", "trânsito", "upstream"]),
     e("bonding", None, None, icons::LINK, "/interface bonding", &["interface.bonding"], &["lacp", "802.3ad", "bond", "link aggregation", "agregação"]),
     e("cgnat", None, None, icons::ARROWS_SPLIT, "/ip firewall cgnat", &["ip.firewall.cgnat"], &["nat444", "cgn", "port block", "ipv4 compartilhado", "rfc 6598", "who was", "quem era", "marco civil", "pba", "deterministic", "determinístico", "rfc 7422", "netmap", "abuse", "abuso"]),
@@ -98,7 +99,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("log", None, None, icons::SCROLL, "/log", &["log"], &["eventos", "messages", "mensagens"]),
     e("logging", None, None, icons::NOTEBOOK, "/system logging", &["system.logging"], &["syslog", "remote log", "topics", "rules", "regras"]),
     e("mpls", None, None, icons::TAG, "/mpls", &[], &["ldp", "label", "vpls", "rótulo"]),
-    e("mtr", None, None, icons::PATH, "/tool traceroute", &["tool.mtr"], &["traceroute", "tracert", "path", "caminho", "perda", "loss"]),
+    e("mtr", None, None, icons::PATH, "/tool traceroute", &["tool.mtr", "tool.traceroute"], &["traceroute", "tracert", "path", "caminho", "perda", "loss", "paris", "ecmp", "tcp traceroute", "tcptraceroute"]),
     e("neighbors", None, None, icons::USERS_THREE, "/ip neighbor", &["ip.neighbor"], &["vizinhos", "lldp", "mndp", "cdp", "discovery"]),
     e("ntp-client", None, None, icons::CLOCK, "/system ntp client", &["system.ntp.client"], &["time", "hora", "relógio", "sntp", "clock"]),
     e("ospf", None, None, icons::GRAPH, "/routing ospf", &[], &["area", "lsa", "igp"]),

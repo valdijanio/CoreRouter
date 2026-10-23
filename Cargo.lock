@@ -1122,6 +1122,7 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
+ "corerouter-proto-iperf",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",
  "corerouter-proto-ntp",
@@ -1177,6 +1178,7 @@ dependencies = [
  "corerouter-proto-discovery",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
+ "corerouter-proto-iperf",
  "corerouter-proto-mpls",
  "corerouter-proto-ospf",
  "criterion",
@@ -1345,6 +1347,15 @@ dependencies = [
  "criterion",
  "proptest",
  "serde",
+]
+
+[[package]]
+name = "corerouter-proto-iperf"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

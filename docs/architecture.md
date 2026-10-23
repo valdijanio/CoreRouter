@@ -589,6 +589,13 @@ cobre 12,8 Mpps a 35 % de um núcleo). Fica de fora por ora o `TPACKET_V3` (anel
 `unsafe`): sem amostrar, `recvmsg` lê ~2 Mpps por thread, e o caminho mais rápido de verdade é
 contar fluxos num mapa XDP (G2.5) atrás do mesmo trait, sem copiar quadros.
 
+**Bandwidth Test (G6.4b):** o protocolo do iperf3 em Rust (`proto-iperf`, L2, puro; sockets no
+daemon), em vez de orquestrar o binário `iperf3`: um processo externo a menos, dados
+estruturados por segundo (o binário só dá JSON no fim, ou texto), limites e ACL do servidor
+aplicados antes de ler qualquer coisa, e interoperabilidade mantida porque o formato é simples e
+estável desde a 3.0 (testes contra o `iperf3` quando instalado). Números (**medido**, loopback):
+`docs/changes` da G6.4b.
+
 ### DNS (G4.1)
 
 **Decisão do usuário (2026-10-22):** o DNS inteiro é **Hickory DNS, em Rust puro**, embutido no

@@ -34,6 +34,7 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-lldp", 2),
     ("corerouter-proto-mndp", 2),
     ("corerouter-proto-ntp", 2),
+    ("corerouter-proto-iperf", 2),
     ("corerouter-proto-syslog", 2),
     ("corerouter-proto-flow", 2),
     ("corerouter-engine", 3),

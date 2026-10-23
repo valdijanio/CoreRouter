@@ -51,6 +51,9 @@ pub struct System {
     /// `system.tuning.*` (G1.26): kernel and hardware settings.
     #[serde(skip_serializing_if = "crate::tuning::Tuning::is_default")]
     pub tuning: crate::tuning::Tuning,
+    /// `/tool bandwidth-server` (G6.4b): iperf3 tests against the router.
+    #[serde(skip_serializing_if = "crate::bandwidth::BandwidthServer::is_default")]
+    pub bandwidth_server: crate::bandwidth::BandwidthServer,
     /// `/tool graphing` (G4.5): what the traffic history keeps.
     #[serde(skip_serializing_if = "crate::graphing::Graphing::is_default")]
     pub graphing: crate::graphing::Graphing,
@@ -64,6 +67,7 @@ impl Default for System {
             logging: Logging::default(),
             metrics: MetricsService::default(),
             tuning: crate::tuning::Tuning::default(),
+            bandwidth_server: crate::bandwidth::BandwidthServer::default(),
             graphing: crate::graphing::Graphing::default(),
         }
     }
