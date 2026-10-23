@@ -13,7 +13,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Current", "Atual"),
     ("Day", "Dia"),
     ("Drops", "Descartes"),
-    ("Enabled", "Ativado"),
+    ("Enabled", "Ligado"),
     ("Errors", "Erros"),
     ("Exclude", "Excluir"),
     ("Export", "Exportar"),
