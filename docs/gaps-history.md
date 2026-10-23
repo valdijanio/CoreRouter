@@ -80,3 +80,6 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G0.16 feito (comando sem cópia da config inteira; critério refeito com o medido)
 - 2026-10-23 — G1.26a–f criados (System › Tuning, pedido do usuário); G1.26a feito (Resumo, Kernel e Perfis)
 - 2026-10-23 — G0.20 criado (histórico em memória como diferenças: boot e RAM com config grande)
+- 2026-10-23 — G1.26b feito (Tuning › Interfaces); G1.26g criado (RSS)
+- 2026-10-23 — G1.26c feito (Tuning › CPU e IRQ); G0.15c criado (glifos que a fonte não tem)
+- 2026-10-23 — G0.20 resolvido por audit-history-share (revisões restauradas dividem as seções CowArc; boot de 64 revisões de 10 MiB em 208 ms, RAM igual à de antes)
