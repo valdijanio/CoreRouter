@@ -202,7 +202,7 @@ anteriores leem), e cada revisão vira um arquivo próprio (`rev-<n>.json`,
 `persist::encode_revision`), escrito uma vez pelo commit que a criou e apagado quando sai do
 histórico. O commit serializa a config uma vez (o texto vai para o slot e para o arquivo da
 revisão), então o custo é o tamanho da config, não do histórico: `commit/routes/10000` com 64
-revisões em disco (fsync) caiu de 396 ms para 13,6 ms (**medido**, `storage_fs/commit/*`). Ordem:
+revisões em disco (fsync) caiu de 396 ms para 11,0 ms (**medido**, `storage_fs/commit/*`). Ordem:
 arquivos de revisão que faltam → slot → apagar os que saíram. No boot, os arquivos mais antigos
 que o slot completam o histórico; um ilegível custa só aquela revisão (`storage.boot_errors`); um
 mais novo que o slot (gravação interrompida) é ignorado e reescrito. Arquivos de versões

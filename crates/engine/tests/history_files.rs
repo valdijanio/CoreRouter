@@ -75,7 +75,8 @@ fn the_history_survives_a_reboot_and_old_files_are_deleted() {
     assert_eq!(numbers(&s), history);
     assert_eq!(s.store().history()[0].config.system.identity, "r6");
     assert_eq!(s.store().history()[0].comment, "system.identity.set");
-    s.execute("config.rollback", &json!({"revision": 7})).unwrap();
+    s.execute("config.rollback", &json!({"revision": 7}))
+        .unwrap();
     assert_eq!(s.store().running().system.identity, "r6");
 }
 
@@ -98,7 +99,9 @@ fn an_unreadable_revision_file_costs_that_revision_only() {
     assert_eq!(errors.len(), 2, "{errors:?}");
     for n in 2..=3 {
         assert!(
-            errors.iter().any(|e| e.starts_with(&format!("revision {n}:"))),
+            errors
+                .iter()
+                .any(|e| e.starts_with(&format!("revision {n}:"))),
             "{errors:?}"
         );
     }
@@ -144,7 +147,10 @@ fn a_revision_file_newer_than_the_slot_is_replaced() {
     drop(s);
     // A save cut short after the file of revision 3, before its slot; and
     // a damaged current slot: the boot falls back to revision 1.
-    let stray = storage.revision(2).unwrap().replace("\"number\":2", "\"number\":3");
+    let stray = storage
+        .revision(2)
+        .unwrap()
+        .replace("\"number\":2", "\"number\":3");
     storage.put_revision(3, Some(stray));
     storage.put(Slot::Current, Some("{".into()));
 

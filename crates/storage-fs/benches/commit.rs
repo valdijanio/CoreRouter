@@ -15,7 +15,9 @@ use std::time::Duration;
 
 use corerouter_engine::{ConfigStorage, Session};
 use corerouter_hal::VirtualHal;
-use corerouter_model::{AddressEntry, Config, ConfigStore, Gateway, RouteEntry, RoutingTable, persist};
+use corerouter_model::{
+    AddressEntry, Config, ConfigStore, Gateway, RouteEntry, RoutingTable, persist,
+};
 use corerouter_storage_fs::FileStorage;
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use serde_json::json;

@@ -11,9 +11,18 @@ use serde_json::json;
 fn queries_leave_the_candidate_alone() {
     let mut s = Session::virtual_lab();
     for (id, params) in [
-        ("ip.address.add", json!({"address": "192.0.2.1/24", "interface": "ether1"})),
-        ("ip.route.add", json!({"dst_address": "198.51.100.0/24", "gateway": "192.0.2.254"})),
-        ("ip.firewall.filter.add", json!({"chain": "input", "action": "accept"})),
+        (
+            "ip.address.add",
+            json!({"address": "192.0.2.1/24", "interface": "ether1"}),
+        ),
+        (
+            "ip.route.add",
+            json!({"dst_address": "198.51.100.0/24", "gateway": "192.0.2.254"}),
+        ),
+        (
+            "ip.firewall.filter.add",
+            json!({"chain": "input", "action": "accept"}),
+        ),
         ("config.mode.set", json!({"mode": "transactional"})),
         ("system.identity.set", json!({"name": "pending"})),
     ] {
@@ -31,6 +40,11 @@ fn queries_leave_the_candidate_alone() {
             "query {} changed the candidate",
             spec.id
         );
-        assert_eq!(s.store().current_revision(), revision, "{} committed", spec.id);
+        assert_eq!(
+            s.store().current_revision(),
+            revision,
+            "{} committed",
+            spec.id
+        );
     }
 }

@@ -81,12 +81,11 @@ pub(crate) fn restore_history(
     // The newest revision is in the slot itself; its file counts as saved
     // only if it holds the same config (it is rewritten otherwise).
     let newest = store.current_revision();
-    if files.present.contains(&newest) {
-        if let Some((rev, size)) = load(storage, newest, &mut Vec::new()) {
-            if rev.config == *store.running() {
-                files.saved.insert(newest, size);
-            }
-        }
+    if files.present.contains(&newest)
+        && let Some((rev, size)) = load(storage, newest, &mut Vec::new())
+        && rev.config == *store.running()
+    {
+        files.saved.insert(newest, size);
     }
     let room = ConfigStore::DEFAULT_MAX_HISTORY.saturating_sub(store.history().len());
     let mut older: Vec<Revision> = Vec::new();
