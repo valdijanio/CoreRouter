@@ -15,7 +15,6 @@ use crate::backend::RequestId;
 use crate::chip;
 use crate::dhcp_client::{flag, text};
 use crate::help::{self, HelpView};
-use crate::i18n::tr;
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::action;
 use crate::{CoreRouterUi, Win, form_number};
@@ -32,6 +31,12 @@ const RULES: &str = "system.logging.list";
 const FLOW: &str = "ip.traffic-flow.get";
 /// The levels a rule sends to `analytics` when the window adds them.
 const LEVELS: [&str; 4] = ["info", "warning", "error", "critical"];
+
+/// A label of this window: its own catalog (`i18n/auto/analytics_pt.rs`)
+/// first, then the shared ones.
+fn tr(lang: crate::i18n::Lang, en: &'static str) -> &'static str {
+    crate::i18n::tr_in(NAME, lang, en)
+}
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,

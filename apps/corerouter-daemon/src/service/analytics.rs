@@ -44,7 +44,7 @@ use rustls::ClientConfig;
 use serde_json::json;
 
 use super::analytics_queue::{Limits, Queue};
-use super::analytics_rows::{flow_row, log_row, metric_rows, nat_row};
+use super::analytics_rows::{flow_row, graph_rows, log_row, metric_rows, nat_row};
 use super::https::{self, Response, Stream, Url};
 
 const TICK: Duration = Duration::from_millis(250);
@@ -379,6 +379,10 @@ struct Exporter {
     read_seq: u64,
     /// Log events gone from the log's window before they were read.
     lost: u64,
+    /// The traffic history (G4.5) was sent up to this bucket start (Unix
+    /// seconds; `None`: not read yet, starts from now: a restart of the
+    /// daemon does not send the history again).
+    graph_since: Option<u64>,
     /// The last error was logged (once per outage, not every try).
     logged: bool,
 }
@@ -399,6 +403,7 @@ impl Exporter {
             status: AnalyticsStatus::default(),
             read_seq: 0,
             lost: 0,
+            graph_since: None,
             logged: false,
         }
     }
@@ -537,6 +542,43 @@ impl Exporter {
     }
 }
 
+/// Resolution of the traffic history sent: one-minute buckets (G4.5 keeps
+/// them for days; the second ones only for minutes).
+const GRAPH_STEP: u64 = 60;
+/// Buckets read per tick at most (a long pause catches up over ticks).
+const GRAPH_ROWS: usize = 1000;
+
+/// The traffic history (G4.5) closed since the last tick into `metrics`:
+/// CPU, memory and conntrack, and per interface rx/tx bps, pps, errors and
+/// drops, average and maximum of each minute. Read under the lock (a
+/// bounded copy), encoded without it.
+fn send_graphs(session: &Shared, ex: &mut Exporter, router: &str, now: Instant) {
+    use corerouter_engine::graph::GraphDb;
+    let since = *ex
+        .graph_since
+        .get_or_insert_with(|| (now_ms() / 1000 / GRAPH_STEP).saturating_sub(1) * GRAPH_STEP);
+    let mut rows = lock(session)
+        .ext::<GraphDb>()
+        .map(|db| db.export(GRAPH_STEP, since, None, GRAPH_ROWS))
+        .unwrap_or_default();
+    // A full page may stop inside a minute (rows are by time, then
+    // series): that minute comes whole with the next page.
+    if rows.len() >= GRAPH_ROWS
+        && let Some(last) = rows.last().map(|r| r.1)
+        && rows.first().is_some_and(|r| r.1 != last)
+    {
+        rows.retain(|r| r.1 != last);
+    }
+    if let Some(last) = rows.iter().map(|r| r.1).max() {
+        ex.graph_since = Some(last);
+    }
+    for row in &rows {
+        for line in graph_rows(router, row) {
+            ex.queue.push(Table::Metrics, &line, now);
+        }
+    }
+}
+
 /// A CGNAT port block given or taken back (G2.3c, blocks mode): logged
 /// with topic `cgnat` and the block in the detail. RFC 8158 natEvent 16/17
 /// (NAT44 port block allocation / de-allocation).
@@ -671,6 +713,9 @@ fn tick(session: &Shared, health: &super::Health, ex: &mut Exporter) {
             for row in metric_rows(&router, ms, &text) {
                 ex.queue.push(Table::Metrics, &row, now);
             }
+        }
+        if cfg.metrics {
+            send_graphs(session, ex, &router, now);
         }
         let taken = std::mem::take(&mut *items(inbox()));
         for item in taken {

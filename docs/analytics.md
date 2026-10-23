@@ -184,7 +184,7 @@ FROM corerouter.logs;
 
 | Tabela | Fonte hoje | Uma linha por |
 |---|---|---|
-| `metrics` | os contadores do `/metrics` (interfaces, comandos, commits, serviços, DHCP, Safe Mode…) a cada `metrics_interval`; os gráficos locais (G4.5), quando entrarem | amostra (nome + rótulos + valor) |
+| `metrics` | os contadores do `/metrics` (interfaces, comandos, commits, serviços, DHCP, Safe Mode…) a cada `metrics_interval`; e o histórico de tráfego local (G4.5, System › Graphing): a média e o máximo de cada minuto de `corerouter_system_{cpu,memory,conntrack}` e `corerouter_interface_{rx,tx}_{bps,pps}`, `…_errors`, `…_drops` (rótulo `interface`), sufixo `_max` para o máximo | amostra (nome + rótulos + valor) |
 | `logs` | eventos do log do roteador (G4.6d) que uma regra manda para a ação `analytics` | evento |
 | `flows` | Traffic Flow (G4.4b, IP › Traffic Flow ligado): os mesmos registros que ele manda por IPFIX; interfaces por nome | fluxo terminado |
 | `nat_events` | blocos de portas do CGNAT no modo `blocks` (G2.3c, lidos do log): `block_alloc`/`block_release`; sessões NAT44 do Traffic Flow com eventos de NAT ligados: `session_create`/`session_delete` (RFC 8158 natEvent 4/5) | evento |
@@ -286,7 +286,13 @@ SELECT router, severity, count() FROM corerouter.logs
 WHERE time > now() - INTERVAL 1 DAY AND severity_number >= 13
 GROUP BY router, severity ORDER BY count() DESC;
 
--- Tráfego de entrada por interface em Mbit/s, de 5 em 5 minutos (contador → taxa)
+-- Tráfego por interface em Mbit/s, média de cada minuto (histórico G4.5)
+SELECT router, labels['interface'] AS iface, time, value / 1e6 AS mbps
+FROM corerouter.metrics
+WHERE name = 'corerouter_interface_rx_bps' AND time > now() - INTERVAL 1 DAY
+ORDER BY time;
+
+-- O mesmo a partir do contador do /metrics, de 5 em 5 minutos (contador → taxa)
 SELECT router, labels['interface'] AS iface, toStartOfFiveMinutes(time) AS t,
        (max(value) - min(value)) * 8 / 300 / 1e6 AS mbps
 FROM corerouter.metrics

@@ -54,6 +54,9 @@ pub struct System {
     /// `/system analytics` (G4.4f): export to an external ClickHouse.
     #[serde(skip_serializing_if = "crate::analytics::Analytics::is_default")]
     pub analytics: crate::analytics::Analytics,
+    /// `/tool graphing` (G4.5): what the traffic history keeps.
+    #[serde(skip_serializing_if = "crate::graphing::Graphing::is_default")]
+    pub graphing: crate::graphing::Graphing,
 }
 
 impl Default for System {
@@ -65,6 +68,7 @@ impl Default for System {
             metrics: MetricsService::default(),
             tuning: crate::tuning::Tuning::default(),
             analytics: crate::analytics::Analytics::default(),
+            graphing: crate::graphing::Graphing::default(),
         }
     }
 }

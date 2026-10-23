@@ -340,6 +340,7 @@ pub fn main() -> ExitCode {
         options,
         Box::new(move |cc| {
             let _ = ctx_slot.set(cc.egui_ctx.clone());
+            corerouter_ui::export::install(&cc.egui_ctx, Arc::new(save_export));
             Ok(Box::new(app.with_storage(cc)))
         }),
     );
@@ -702,6 +703,63 @@ fn mac_text(m: &[u8; 6]) -> String {
         .map(|b| format!("{b:02X}"))
         .collect::<Vec<_>>()
         .join(":")
+}
+
+/// Where exports go: `$XDG_DOWNLOAD_DIR`, else `~/Downloads`, else home.
+fn download_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    std::env::var_os("XDG_DOWNLOAD_DIR")
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .or_else(|| {
+            home.as_ref()
+                .map(|h| h.join("Downloads"))
+                .filter(|d| d.is_dir())
+        })
+        .or(home)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Save what a window exports (G4.5: a graph's CSV or PNG) in the
+/// Downloads folder, never over an existing file (`-1`, `-2`… appended).
+fn save_export(name: &str, export: corerouter_ui::export::Export) -> Result<String, String> {
+    use corerouter_ui::export::Export;
+    let bytes = match export {
+        Export::Text(t) => t.into_bytes(),
+        Export::Image(img) => encode_png(&img)?,
+    };
+    // Only the file name: a name with a path in it stays in the folder.
+    let name = std::path::Path::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("export");
+    let dir = download_dir();
+    let (stem, ext) = name.rsplit_once('.').unwrap_or((name, ""));
+    for n in 0..1000 {
+        let file = if n == 0 {
+            name.to_owned()
+        } else {
+            format!("{stem}-{n}.{ext}")
+        };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                use std::io::Write as _;
+                f.write_all(&bytes)
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                return Ok(format!("saved {}", path.display()));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+    }
+    Err(format!("{}: too many files named {name}", dir.display()))
 }
 
 /// `$XDG_CONFIG_HOME` (or `~/.config`, or `%APPDATA%`)`/corerouter/saved-routers.json`.

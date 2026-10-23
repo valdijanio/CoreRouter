@@ -1,0 +1,30 @@
+//! English explanations of Tools › Graphs (G4.5), sorted by key.
+
+/// Explanations: (key, Markdown).
+pub(super) const HELP: &[(&str, &str)] = &[
+    ("graphs.avg", "## Average\nThe mean of the known points of the range."),
+    ("graphs.billing", "## p95 billing\n**p95 billing** is the larger of the receive and transmit 95th percentiles: what most transit contracts and LibreNMS bill.\n\n**p95 of Rx+Tx** takes the 95th percentile of receive plus transmit per sample (the \"aggregate\" of LibreNMS and Cacti), used by some data centers.\n\nCheck your contract: the difference can be large on an asymmetric link."),
+    ("graphs.compare", "## Compare\nDraws other interfaces on the same chart, each in the colour of its name: receive solid, transmit dashed. Up to 6.\n\nUseful to see which uplink carries the peak, or whether two links of a bond share the load."),
+    ("graphs.conntrack", "## Conntrack\nEntries in the connection tracking table. Near its maximum (IP › Firewall › Connections, System › Tuning) new connections are dropped: a CGNAT box watches this one."),
+    ("graphs.coverage", "## Coverage\nHow much of the range has data. Time with the router off, a new series, or a counter that went backwards (an interface recreated) is unknown: a hole in the line, never a zero.\n\nTotals and averages count only the known part."),
+    ("graphs.cpu", "## CPU\nThe share of CPU time all cores spent busy (not idle, not waiting for disk), averaged over the cores: 100 % is every core busy."),
+    ("graphs.current", "## Current\nThe last second the router counted (within the last 10 s)."),
+    ("graphs.export", "## Export\n**CSV**: every point of the range (time in UTC, Unix time, series and each value; empty where unknown), for a spreadsheet or a billing report.\n\n**PNG**: the chart as it is on screen.\n\nThe desktop app saves to the Downloads folder; in the browser both go to the clipboard."),
+    ("graphs.max", "## Maximum\nThe highest value of the range. In the day, week, month and year ranges each slot keeps the peak of its seconds, so a short burst still shows (MikroTik's graphing shows the largest average instead)."),
+    ("graphs.memory", "## Memory\nMemory in use: the total minus what programs can still get (Linux `MemAvailable`, which counts the reclaimable cache as free)."),
+    ("graphs.p95", "## 95th percentile\nThe rate the link stays at or below 95 % of the time: sort the 5-minute averages, drop the top 5 %, take the next. It is how transit and IP links are billed (burstable billing): bursts shorter than 5 % of the month are free.\n\nUp to a week it comes from 5-minute samples (8640 in a 30-day month: the top 432 are dropped). Beyond, only 1-hour averages exist, which hide bursts and give a **lower** number: the window says so with a chip."),
+    ("graphs.range", "## Range\nHow far back: **hour** (1-second points), **day** (1 minute), **week** (5 minutes), **month** and **year** (1 hour).\n\nEach range is read from the finest history that covers it. Points coarser than that average its slots; the faint line is the largest maximum."),
+    ("graphs.resolution", "## Resolution\nThe step of the history the range is read from (1 s, 1 min, 5 min or 1 h), and how far apart the points drawn are.\n\nThe router keeps 1 s for an hour, 1 min for a day, 5 min for a week and 1 h for a year, in a fixed size (RRDtool's idea)."),
+    ("graphs.series", "## Series\nWhat the chart shows: one interface the router keeps a history of, or **System** (CPU, memory and the conntrack table).\n\nOnly kept interfaces are listed; **Settings…** chooses which (physical ports by default)."),
+    ("graphs.set.bridges", "## Bridges\nBridge interfaces. Their traffic is also on their ports; keep them when the bridge itself matters (a LAN gateway)."),
+    ("graphs.set.enabled", "## Enabled\nCollect at all. Off keeps what was collected (holes from then on)."),
+    ("graphs.set.exclude", "## Exclude\nInterface names never kept, even when their class is (a lab port). Exclude wins over include."),
+    ("graphs.set.include", "## Include\nInterface names always kept, whatever their class (a loopback, one VLAN). Comma separated."),
+    ("graphs.set.max_memory_mib", "## Max Memory\nThe ceiling of the history, in MiB; the same bytes go to disk. A year of one interface takes 0.67 MiB, so 64 MiB (the default) holds about 90. Interfaces past it are not kept and are listed (and logged).\n\nLowering it does not drop what is kept: exclude interfaces for that."),
+    ("graphs.set.physical", "## Physical\nEthernet ports and bonds. On by default: these are the links you pay for."),
+    ("graphs.set.resources", "## Resources\nCPU, memory and the conntrack table of the router itself (the **System** series)."),
+    ("graphs.set.store_every", "## Store Every\nSeconds between writes of the history to disk (RouterOS `store-every`, 5 minutes by default). Flash wears with every write: each store writes only what changed (a few hundred bytes an interface), and the 1-second hour only at a clean shutdown.\n\nA crash loses at most this much of the coarser history."),
+    ("graphs.set.tunnels", "## Tunnels\nPPP, PPPoE, GRE, IPIP, WireGuard, VXLAN, EoIP and other tunnels. Off by default, for the same reason as VLANs."),
+    ("graphs.set.vlans", "## VLANs\nVLAN interfaces. Off by default: a carrier box has hundreds, and each costs about 0.7 MiB of memory and disk. Prefer **Include** for the few that matter (a transit, a big customer)."),
+    ("graphs.total", "## Total\nWhat crossed the interface in the range: each known slot's average rate times its length, in decimal units (1 GB = 10⁹ bytes, as operators bill). Unknown time adds nothing."),
+];

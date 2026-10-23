@@ -185,6 +185,39 @@ pub(crate) fn metric_rows(router: &str, time_ms: u64, text: &str) -> Vec<Vec<u8>
         .collect()
 }
 
+/// Rows of `metrics` from the router's traffic history (G4.5, one closed
+/// bucket of `GraphDb::export`): one row per value, named
+/// `corerouter_<series>_<field>` (`corerouter_interface_rx_bps` with label
+/// `interface`, `corerouter_system_cpu`), the bucket's maximum as
+/// `…_max`. A value that is not a number (no sample in the bucket) is
+/// skipped.
+pub(crate) fn graph_rows(router: &str, row: &corerouter_engine::graph::ExportRow) -> Vec<Vec<u8>> {
+    use corerouter_engine::graph::{INTERFACE, sources};
+    let (key, start, avg, max) = row;
+    let (series, labels) = match key.strip_prefix(INTERFACE) {
+        Some(name) => ("interface", json!({ "interface": name })),
+        None => (key.as_str(), json!({})),
+    };
+    let time = datetime(start.saturating_mul(1000));
+    let mut out = Vec::new();
+    for (i, src) in sources(key).iter().enumerate() {
+        let values = [(avg.get(i), ""), (max.as_ref().and_then(|m| m.get(i)), "_max")];
+        for (v, suffix) in values {
+            let Some(v) = v.copied().filter(|v| v.is_finite()) else {
+                continue;
+            };
+            out.push(line(&json!({
+                "router": router,
+                "time": time,
+                "name": format!("corerouter_{series}_{}{suffix}", src.key),
+                "labels": labels,
+                "value": f64::from(v),
+            })));
+        }
+    }
+    out
+}
+
 /// `name{k="v",…} value [timestamp]`.
 fn sample(l: &str) -> Option<(&str, serde_json::Map<String, Value>, f64)> {
     let name_end = l.find(['{', ' '])?;
@@ -331,6 +364,28 @@ mod tests {
         assert_eq!(rows[1]["labels"], json!({}));
         assert_eq!(rows[2]["labels"], json!({"a": "q\"uote\\", "b": "line\nbreak"}));
         assert_eq!(rows[2]["value"], 1500.0);
+    }
+
+    #[test]
+    fn graph_buckets_become_metric_rows() {
+        let row: corerouter_engine::graph::ExportRow = (
+            "interface:ether1".into(),
+            1_792_758_840,
+            vec![1e6, 2e6, 100.0, f32::NAN, 0.0, 0.0],
+            Some(vec![3e6, 4e6, 150.0, f32::NAN, 1.0, 0.0]),
+        );
+        let rows: Vec<Value> = graph_rows("r", &row).iter().map(|r| parse(r)).collect();
+        assert_eq!(rows.len(), 10, "NaN (no sample) skipped, avg and max of the rest");
+        assert_eq!(rows[0]["name"], "corerouter_interface_rx_bps");
+        assert_eq!(rows[0]["labels"], json!({"interface": "ether1"}));
+        assert_eq!(rows[0]["time"], "2026-10-23 12:34:00.000");
+        assert_eq!(rows[1]["name"], "corerouter_interface_rx_bps_max");
+        assert_eq!(rows[1]["value"], 3e6);
+        let sys: corerouter_engine::graph::ExportRow = ("system".into(), 60, vec![12.5, 1e9, 400.0], None);
+        let rows: Vec<Value> = graph_rows("r", &sys).iter().map(|r| parse(r)).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0]["name"], "corerouter_system_cpu");
+        assert_eq!(rows[0]["labels"], json!({}));
     }
 
     #[test]
