@@ -110,6 +110,8 @@ fn services_window_lists_rows_with_chips() {
         .map(|r| (r.name.clone(), r.action))
         .collect();
     assert_eq!(queued, [("dns-server".to_owned(), ServiceAction::Restart)]);
+    // The window says the command went (the row follows with the refresh).
+    assert!(h.has_text("restart sent to dns-server"));
 }
 
 #[test]
