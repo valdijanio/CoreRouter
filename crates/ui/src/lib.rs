@@ -254,6 +254,8 @@ pub struct CoreRouterUi {
     open_after: Vec<(RequestId, String)>,
     /// Light, dark or the system's (a window preference, see `prefs`).
     theme: egui::ThemePreference,
+    /// Languages of the labels and of the explanations (G0.15, `prefs`).
+    pub(crate) lang: i18n::Langs,
     /// "New Route" / "Route <dst>" / route "Comment" windows.
     route_dialogs: Vec<routes::RouteDialogWin>,
     /// Routes to open once an `ip.route.list` sent after this id arrives.
@@ -320,6 +322,7 @@ impl CoreRouterUi {
             next_dialog: 0,
             open_after: Vec::new(),
             theme: egui::ThemePreference::System,
+            lang: i18n::Langs::default(),
             route_dialogs: Vec::new(),
             open_route_after: Vec::new(),
             vrf_dialogs: Vec::new(),
@@ -853,7 +856,7 @@ impl CoreRouterUi {
                 &ctx,
                 area,
                 win_id(*win),
-                win.title(),
+                i18n::tr(self.lang.labels, win.title()),
                 &mut open,
                 |w| w.default_size(win.default_size()),
                 |ui| self.window(*win, ui),
@@ -1190,7 +1193,7 @@ impl CoreRouterUi {
                 match items.as_slice() {
                     [only] if only.title() == group => self.menu_item(ui, *only),
                     _ => {
-                        ui.collapsing(group, |ui| {
+                        ui.collapsing(i18n::tr(self.lang.labels, group), |ui| {
                             for w in &items {
                                 self.menu_item(ui, *w);
                             }
@@ -1202,10 +1205,11 @@ impl CoreRouterUi {
     }
 
     fn menu_item(&mut self, ui: &mut egui::Ui, win: Win) {
+        let title = i18n::tr(self.lang.labels, win.title());
         let label = if win.gap().is_some() {
-            RichText::new(win.title()).weak()
+            RichText::new(title).weak()
         } else {
-            RichText::new(win.title())
+            RichText::new(title)
         };
         if ui
             .selectable_label(self.open.contains(&win), label)

@@ -52,6 +52,8 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("Tools", &[Win::Ping, Win::Mtr]),
     // The Log window is a panel (`system_log.rs`, G4.6d).
     ("Log", &[]),
+    // Preferences of this GUI, not of the router (G0.15, `settings.rs`).
+    ("Settings", &[]),
 ];
 
 /// The side menu as drawn: every group with its built-in and panel windows,
