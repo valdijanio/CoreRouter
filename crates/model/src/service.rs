@@ -141,6 +141,10 @@ pub struct ServiceRow {
     pub depends: Vec<String>,
     /// The config command that turns it on (or "always on").
     pub enable: String,
+    /// `enable` as a command to run, `{id, params}`, when it is complete (a
+    /// switch like `ip.dns.set allow_remote_requests=yes`); `None` when it
+    /// needs values only the admin knows (`interface=…`).
+    pub turn_on: Option<serde_json::Value>,
     /// Topic of its lines in the router's log (`log.print topics=…`).
     pub topic: String,
     /// Restart policy, for people ("always, 1 s → 60 s; gives up after 5

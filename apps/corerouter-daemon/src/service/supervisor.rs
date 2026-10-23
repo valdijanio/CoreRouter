@@ -606,6 +606,7 @@ impl Supervisor {
                 last_error: slot.last_error.clone(),
                 depends: slot.depends.iter().map(|d| (*d).to_owned()).collect(),
                 enable: slot.enable.into(),
+                turn_on: turn_on(slot.enable),
                 topic: slot.topic.into(),
                 policy: text.clone(),
                 protected: false,
@@ -616,6 +617,28 @@ impl Supervisor {
 }
 
 /// Start again with a clean failure window (the admin asked).
+/// `enable` ("ip.dns.set allow_remote_requests=yes") as `{id, params}` when
+/// it is a whole command; `None` when it has a placeholder (`…`) or is prose
+/// ("always on").
+fn turn_on(enable: &str) -> Option<serde_json::Value> {
+    if enable.contains('…') {
+        return None;
+    }
+    let mut words = enable.split_whitespace();
+    let id = words.next().filter(|w| w.contains('.'))?;
+    let mut params = serde_json::Map::new();
+    for w in words {
+        let (k, v) = w.split_once('=')?;
+        let v = match v {
+            "yes" => json!(true),
+            "no" => json!(false),
+            _ => v.parse::<u64>().map_or_else(|_| json!(v), |n| json!(n)),
+        };
+        params.insert(k.to_owned(), v);
+    }
+    Some(json!({ "id": id, "params": params }))
+}
+
 fn fresh_start(slot: &mut Slot) {
     slot.failures.clear();
     slot.phase = Phase::Waiting;
@@ -878,5 +901,21 @@ mod tests {
         sup.add(leak("quitter", &[]), Box::new(|_: &Health| Ok(())));
         let r = until(&mut sup, "quitter", |r| r.restarts >= 1);
         assert_eq!(r.last_error.as_deref(), Some("ended without being asked to"));
+    }
+
+    #[test]
+    fn turn_on_is_the_enable_text_when_it_is_a_whole_command() {
+        assert_eq!(
+            turn_on("ip.dns.set allow_remote_requests=yes"),
+            Some(json!({"id": "ip.dns.set", "params": {"allow_remote_requests": true}}))
+        );
+        assert_eq!(
+            turn_on("ip.service.metrics.set enabled=yes port=9100"),
+            Some(json!({"id": "ip.service.metrics.set", "params": {"enabled": true, "port": 9100}}))
+        );
+        assert_eq!(turn_on("ip.dhcp-server.add interface=… address_pool=…"), None);
+        assert_eq!(turn_on("always on (ip.dns.set servers=…)"), None);
+        assert_eq!(turn_on("always on"), None);
+        assert_eq!(turn_on("system.logging.action.add + system.logging.add"), None);
     }
 }
