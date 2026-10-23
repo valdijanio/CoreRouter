@@ -249,10 +249,10 @@ impl Supervisor {
                 .map(|t| std::mem::take(&mut t.requests))
                 .unwrap_or_default()
         };
-        for r in requests {
-            self.request(&r, now);
-        }
         let mut notes: Vec<Note> = Vec::new();
+        for r in requests {
+            notes.extend(self.request(&r, now));
+        }
         for i in 0..self.slots.len() {
             self.reap(i, now, &mut notes);
         }
@@ -274,11 +274,14 @@ impl Supervisor {
         }
     }
 
-    fn request(&mut self, r: &ServiceRequest, now: Instant) {
+    /// A `system.service.*` command; what it did goes to the router's log
+    /// (the service's topic), so Log and the Services window show it.
+    fn request(&mut self, r: &ServiceRequest, now: Instant) -> Option<Note> {
         let Some(slot) = self.slots.iter_mut().find(|s| s.name == r.name) else {
-            return; // `control`: nothing to do (stop/restart are refused).
+            return None; // `control`: nothing to do (stop/restart are refused).
         };
         log::info!("service {}: {} (command)", slot.name, r.action.as_str());
+        let before = slot.phase;
         match r.action {
             ServiceAction::Stop => match slot.phase {
                 Phase::Running | Phase::Ending { .. } => {
@@ -317,6 +320,24 @@ impl Supervisor {
                 }
             }
         }
+        let what = match (r.action, before, slot.phase) {
+            (_, _, Phase::Ending { again: false }) => "parando",
+            (_, _, Phase::Ending { again: true }) => "reiniciando",
+            (_, _, Phase::Stopped) if before == Phase::Stopped => "já estava parado",
+            (_, _, Phase::Stopped) => "parado",
+            (ServiceAction::ResetFailures, _, _) => "falhas zeradas",
+            (_, Phase::Running | Phase::Waiting, Phase::Running | Phase::Waiting) => {
+                "já estava rodando"
+            }
+            (_, _, Phase::Waiting) => "iniciando",
+            _ => "sem mudança",
+        };
+        Some((
+            slot.topic,
+            "info",
+            format!("Serviço {}: {what} ({} por comando).", slot.name, r.action.as_str()),
+            json!({"service": slot.name, "action": r.action.as_str()}),
+        ))
     }
 
     /// A run whose thread ended: what next.
@@ -349,6 +370,12 @@ impl Supervisor {
             Phase::Ending { again: false } => {
                 slot.phase = Phase::Stopped;
                 slot.last_event = "stopped (command)".into();
+                notes.push((
+                    slot.topic,
+                    "info",
+                    format!("Serviço {}: parado (stop por comando).", slot.name),
+                    json!({"service": slot.name, "action": "stop"}),
+                ));
                 return;
             }
             Phase::Ending { again: true } => {
@@ -521,16 +548,18 @@ impl Supervisor {
                     ServiceState::Starting
                 }
                 Phase::Running | Phase::Ending { .. } => {
-                    if matches!(slot.phase, Phase::Ending { .. }) {
-                        reason = Some("stopping".into());
-                    }
-                    match &report.disabled {
+                    let state = match &report.disabled {
                         Some(why) => {
                             reason = Some(why.clone());
                             ServiceState::Disabled
                         }
                         None => ServiceState::Running,
+                    };
+                    // A stop on its way says so, whatever the config.
+                    if let Phase::Ending { again } = slot.phase {
+                        reason = Some(if again { "restarting" } else { "stopping" }.into());
                     }
+                    state
                 }
                 Phase::Backoff(at) => {
                     restart_in = Some(at.saturating_duration_since(now).as_millis().div_ceil(1000))
@@ -744,6 +773,12 @@ mod tests {
             r.state == ServiceState::Running && r.last_event == "started"
         });
         assert_eq!(r.restarts, 0, "an admin restart does not count");
+        // What each command did is in the router's log, not only on stderr.
+        let log = lock(&session).execute("log.print", &json!({})).unwrap();
+        let text = log.to_string();
+        for want in ["steady: parando (stop", "steady: parado (stop", "steady: iniciando (start", "steady: reiniciando (restart"] {
+            assert!(text.contains(want), "{want} not in {text}");
+        }
         // The protected row is listed and its stop refused.
         let e = lock(&session)
             .execute("system.service.stop", &json!({"name": "control"}))
