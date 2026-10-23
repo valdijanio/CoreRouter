@@ -347,6 +347,24 @@ fn check_gateway_arp_withholds_the_routes_while_the_gateway_is_silent() {
     );
     assert_eq!(dhcp["check_gateway"]["state"], "down");
     assert_eq!(dhcp["state"], "inactive");
+    // G1.27b: the detail names the client and the check.
+    let det = l.ok("ip.route.detail", json!({"key": dhcp["key"]}));
+    assert_eq!(det["source"]["kind"], "dhcp");
+    assert!(
+        det["source"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("DHCP client on ether1"),
+        "{det}"
+    );
+    assert!(
+        det["check_gateway"]["misses"].as_u64().unwrap() >= 2,
+        "{det}"
+    );
+    assert!(
+        det["check_gateway"]["down_secs"].as_u64().is_some(),
+        "{det}"
+    );
     let backup = d.iter().find(|r| r["dynamic"] == false).unwrap();
     assert_eq!(backup["active"], true, "{d:?}");
     assert!(

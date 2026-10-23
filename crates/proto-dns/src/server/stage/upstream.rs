@@ -5,8 +5,9 @@
 
 use hickory_proto::op::ResponseCode;
 
+use crate::resolver::{Source, Transport};
+use crate::server::explain::Note;
 use crate::server::{Forwarder, Query, Reply, Stage, Step};
-use crate::resolver::Transport;
 
 pub(crate) const STAGE: Stage = Stage {
     name: "upstream",
@@ -17,14 +18,37 @@ pub(crate) const STAGE: Stage = Stage {
 
 fn handle(f: &Forwarder, q: &mut Query, t: Option<&mut dyn Transport>) -> Step {
     let Some(t) = t else { return Step::Wait };
+    let held = if q.explaining() {
+        f.resolver.held_secs(&q.name.key, q.qtype, t.now_ms())
+    } else {
+        None
+    };
     match f
         .resolver
         .resolve(t, &q.name, q.qtype, q.forward_to.as_ref())
     {
         Ok(r) => {
             q.source = Some(r.source);
+            let via = match &q.forward_to {
+                Some(_) => " (the servers a static entry or zone named)",
+                None => "",
+            };
+            q.note(|| match r.source {
+                Source::Server(ip) => Note::new("upstream.server").arg("server", ip).arg("via", via),
+                Source::Cache => Note::new("upstream.cached"),
+                Source::Stale => Note::new("upstream.stale"),
+            });
             Step::Reply(Reply::from_answer(&r.answer))
         }
-        Err(_) => Step::Reply(Reply::code(ResponseCode::ServFail)),
+        Err(e) => {
+            q.note(|| match held {
+                Some(secs) => Note::new("upstream.held").arg("secs", secs),
+                None => {
+                    let why: String = e.to_string().chars().take(200).collect();
+                    Note::new("upstream.failed").arg("why", why)
+                }
+            });
+            Step::Reply(Reply::code(ResponseCode::ServFail))
+        }
     }
 }

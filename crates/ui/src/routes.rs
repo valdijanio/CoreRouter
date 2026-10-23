@@ -29,6 +29,10 @@ pub(crate) const TABLE: &str = "routes";
 /// Property windows opened at once from one selection.
 const MAX_OPEN: usize = 8;
 const MAIN: &str = "main";
+/// Height of the detail under the table (G1.27b).
+const DETAIL_H: f32 = 150.0;
+/// State changes the detail lists (the newest).
+const DETAIL_CHANGES: usize = 4;
 /// Key prefix of an ECMP group's own line.
 const GROUP: &str = "ecmp ";
 
@@ -248,6 +252,8 @@ pub(crate) struct View {
     pub lookup: String,
     /// The last lookup's answer (or error).
     pub found: Option<Result<Value, String>>,
+    /// The one route selected, whose detail shows under the table (G1.27b).
+    pub selected: Option<String>,
 }
 
 impl View {
@@ -501,6 +507,196 @@ fn lookup_answer(ui: &mut Ui, found: &Result<Value, String>, l: Lang) {
     resp.on_hover_text(if tip.is_empty() { rule } else { format!("{tip}\n{rule}") });
 }
 
+fn state_tone(v: &egui::Visuals, state: &str) -> chip::Tone {
+    match state {
+        "active" => chip::GREEN.tone(v),
+        "standby" => chip::AMBER.tone(v),
+        _ => chip::RED.tone(v),
+    }
+}
+
+/// An engine text in the explanations' language: the template `id`
+/// (`prefix.<id>` when `prefix` is given) filled with `args`, else the
+/// English `text`.
+fn localized(v: &Value, text: &str, id: &str, args: &str, prefix: Option<&str>, lang: Lang) -> String {
+    let english = v.get(text).map(value_text).unwrap_or_default();
+    let Some(id) = v.get(id).and_then(Value::as_str) else {
+        return english;
+    };
+    let key = match prefix {
+        Some(p) => format!("{p}.{id}"),
+        None => id.to_owned(),
+    };
+    let args: Vec<(String, String)> = v
+        .get(args)
+        .and_then(Value::as_object)
+        .map(|m| m.iter().map(|(k, v)| (k.clone(), value_text(v))).collect())
+        .unwrap_or_default();
+    let args: Vec<(&str, &str)> = args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    i18n::template(lang, &key, &args, &english)
+}
+
+/// "rev 7 · ip.route.add · 3m ago".
+fn revision_text(r: &Value) -> Option<String> {
+    let n = r.get("revision")?.as_u64()?;
+    let mut t = format!("rev {n} · {}", r.get("command").map(value_text).unwrap_or_default());
+    if let Some(a) = r.get("ago_secs").and_then(Value::as_u64) {
+        t.push_str(&format!(" · {} ago", age(Some(a))));
+    }
+    Some(t)
+}
+
+/// The detail of the selected route (`ip.route.detail`).
+fn detail(ui: &mut Ui, d: Option<&Value>, langs: i18n::Langs) {
+    let l = langs.labels;
+    let Some(d) = d else {
+        ui.weak(tr(l, "Loading the route's detail…"));
+        return;
+    };
+    let v = ui.visuals().clone();
+    egui::ScrollArea::vertical()
+        .id_salt("route-detail")
+        .max_height(DETAIL_H - 12.0)
+        .auto_shrink([false, true])
+        .show(ui, |ui| {
+            Grid::new("route-detail-grid")
+                .num_columns(2)
+                .spacing([12.0, 4.0])
+                .show(ui, |ui| {
+                    let src = &d["source"];
+                    ui.label(tr(l, "Source"));
+                    ui.horizontal(|ui| {
+                        ui.label(src.get("text").map(value_text).unwrap_or_default());
+                        // "changed" only when it is not the creation.
+                        let same = src["changed"].get("revision") == src["created"].get("revision");
+                        for k in ["created", "changed"] {
+                            if k == "changed" && same {
+                                continue;
+                            }
+                            if let Some(t) = src.get(k).and_then(revision_text) {
+                                let t = format!("{} {t}", tr(l, k));
+                                chip::chip(ui, &t, chip::neutral_tone(&v));
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label(tr(l, "Chosen"));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(localized(d, "chosen", "chosen_id", "chosen_args", None, langs.help));
+                        let others = d["competitors"].as_array().cloned().unwrap_or_default();
+                        if others.len() > 1 {
+                            for c in &others {
+                                let state = c.get("state").map(value_text).unwrap_or_default();
+                                let name = c
+                                    .get("id")
+                                    .filter(|i| !i.is_null())
+                                    .map_or_else(|| "connected".to_owned(), value_text);
+                                let text = format!(
+                                    "{name} d{} {}",
+                                    c.get("distance").map(value_text).unwrap_or_default(),
+                                    c.get("gateway").map(value_text).unwrap_or_default()
+                                );
+                                let resp = chip::chip(ui, &text, state_tone(&v, &state));
+                                if c.get("reason").is_some_and(|r| !r.is_null()) {
+                                    resp.on_hover_text(localized(
+                                        c,
+                                        "reason",
+                                        "reason_id",
+                                        "reason_args",
+                                        Some("route"),
+                                        langs.help,
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label(tr(l, "Check gateway"));
+                    match d.get("check_gateway").filter(|c| c.is_object()) {
+                        Some(c) => {
+                            ui.horizontal(|ui| {
+                                let s = |k: &str| c.get(k).map(value_text).unwrap_or_default();
+                                ui.label(format!(
+                                    "{}, every {} s, {} {}",
+                                    s("method"),
+                                    s("interval_secs"),
+                                    s("misses"),
+                                    tr(l, "misses")
+                                ));
+                                let up = s("state") == "up";
+                                let tone = if up { chip::GREEN.tone(&v) } else { chip::RED.tone(&v) };
+                                chip::chip(ui, &s("state"), tone);
+                                if let Some(secs) = c.get("down_secs").and_then(Value::as_u64).filter(|_| !up) {
+                                    ui.weak(format!("{} {}", tr(l, "down for"), age(Some(secs))));
+                                }
+                            });
+                        }
+                        None => {
+                            ui.weak(tr(l, "none"));
+                        }
+                    }
+                    ui.end_row();
+
+                    ui.label(tr(l, "Changes (24 h)"));
+                    let changes = d["history"].as_array().cloned().unwrap_or_default();
+                    ui.vertical(|ui| {
+                        if changes.is_empty() {
+                            ui.weak(tr(l, "no change seen"));
+                        }
+                        for c in changes.iter().take(DETAIL_CHANGES) {
+                            ui.horizontal(|ui| {
+                                let s = |k: &str| c.get(k).map(value_text).unwrap_or_default();
+                                ui.weak(format!(
+                                    "{} {}",
+                                    age(c.get("ago_secs").and_then(Value::as_u64)),
+                                    tr(l, "ago")
+                                ));
+                                chip::chip(ui, &s("from"), state_tone(&v, &s("from")));
+                                ui.label("->");
+                                chip::chip(ui, &s("to"), state_tone(&v, &s("to")));
+                                if c.get("reason").is_some_and(|r| !r.is_null()) {
+                                    ui.weak(localized(
+                                        c,
+                                        "reason",
+                                        "reason_id",
+                                        "reason_args",
+                                        Some("route"),
+                                        langs.help,
+                                    ));
+                                }
+                            });
+                        }
+                        if changes.len() > DETAIL_CHANGES {
+                            ui.weak(format!("+{} {}", changes.len() - DETAIL_CHANGES, tr(l, "more")));
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label(tr(l, "Kernel"));
+                    let k = &d["kernel"];
+                    ui.horizontal_wrapped(|ui| match k.get("same").and_then(Value::as_bool) {
+                        Some(true) => {
+                            chip::chip(ui, tr(l, "matches the config"), chip::GREEN.tone(&v));
+                        }
+                        Some(false) => {
+                            chip::chip(ui, tr(l, "differs from the config"), chip::AMBER.tone(&v));
+                            for (what, key) in [("missing", "missing"), ("not ours", "extra")] {
+                                for r in k[key].as_array().into_iter().flatten() {
+                                    ui.weak(format!("{}: {}", tr(l, what), value_text(r)));
+                                }
+                            }
+                        }
+                        None => {
+                            ui.weak(k.get("note").map(value_text).unwrap_or_default());
+                        }
+                    });
+                    ui.end_row();
+                });
+        });
+}
+
 /// A filter chip: blue when on. Returns whether it was clicked.
 fn filter_chip(ui: &mut Ui, text: &str, on: bool) -> bool {
     let tone = if on {
@@ -656,6 +852,11 @@ enum Button {
 }
 
 impl CoreRouterUi {
+    /// The route whose detail the Routes window shows (G1.27b).
+    pub(crate) fn route_selected(&self) -> Option<&str> {
+        self.route_view.selected.as_deref()
+    }
+
     fn route_rows(&self) -> Vec<Route> {
         self.cache.routes.iter().map(Route::from_row).collect()
     }
@@ -683,6 +884,18 @@ impl CoreRouterUi {
             .collect();
         let mut act: Option<Act> = None;
         let can = self.can();
+        // One row selected (an ECMP group: its first path): its detail.
+        let single = match selection.as_slice() {
+            [one] => paths_of(std::slice::from_ref(one), &routes).into_iter().next(),
+            _ => None,
+        };
+        if single != self.route_view.selected {
+            self.route_view.selected = single.clone();
+            // Ask for its detail now, not at the next refresh.
+            if single.is_some() {
+                self.cache.refreshed_at = None;
+            }
+        }
 
         ui.horizontal(|ui| {
             if table::tool(ui, TABLE, Icon::Add, "Add", can.check("ip.route.add")).clicked() {
@@ -738,7 +951,8 @@ impl CoreRouterUi {
                 _ => None,
             })
             .collect();
-        let footer_h = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+        let line = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
+        let footer_h = line + if single.is_some() { DETAIL_H } else { 0.0 };
         let out = table::show(
             ui,
             TABLE,
@@ -762,6 +976,15 @@ impl CoreRouterUi {
             },
         );
         footer(ui, &counts(&routes), langs.labels);
+        if let Some(key) = &single {
+            let shown = self
+                .panel_mut::<crate::route_detail::Detail>()
+                .and_then(|d| d.shown.clone())
+                .filter(|(k, _)| k == key)
+                .map(|(_, v)| v);
+            ui.separator();
+            detail(ui, shown.as_ref(), langs);
+        }
         // A click on an ECMP group's line opens or closes it.
         if let Some(key) = out.clicked.filter(|k| k.starts_with(GROUP))
             && !self.route_view.open.remove(&key)

@@ -20,14 +20,16 @@ use std::net::IpAddr;
 
 use corerouter_model::Config;
 use corerouter_model::dns_static::{StaticEntry, StaticType};
+use corerouter_model::types::ItemId;
 use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::{CNAME, MX, NS, PTR, SRV, TXT};
 use hickory_proto::rr::{Name, RData, Record, RecordType};
 use regex::{Regex, RegexBuilder};
 
-use crate::server::{Effect, Forwarder, Query, Reply, Stage, Step};
 use crate::message::QName;
 use crate::resolver::{Transport, Upstreams};
+use crate::server::explain::{Note, Rule, matched_by};
+use crate::server::{Effect, Forwarder, Query, Reply, Stage, Step};
 
 pub(crate) const STAGE: Stage = Stage {
     name: "static",
@@ -63,8 +65,8 @@ pub(crate) struct Statics {
     /// Name → positions in `names` (a lookup is a few hash probes, not a
     /// scan of every entry).
     by_name: HashMap<String, Vec<usize>>,
-    /// Address → (name, TTL) of the A/AAAA entries, for PTR.
-    ptr: HashMap<IpAddr, (String, u32)>,
+    /// Address → (name, TTL, id) of the A/AAAA entries, for PTR.
+    ptr: HashMap<IpAddr, (String, u32, ItemId)>,
 }
 
 impl Statics {
@@ -75,7 +77,7 @@ impl Statics {
                 let mut e = e.clone();
                 e.name = e.name.trim_end_matches('.').to_ascii_lowercase();
                 if let (StaticType::A | StaticType::Aaaa, Some(ip)) = (e.rtype, e.address) {
-                    s.ptr.entry(ip).or_insert((e.name.clone(), e.ttl_secs));
+                    s.ptr.entry(ip).or_insert((e.name.clone(), e.ttl_secs, e.id));
                 }
                 s.by_name.entry(e.name.clone()).or_default().push(s.names.len());
                 s.names.push(e);
@@ -178,6 +180,7 @@ fn chunks(text: &str) -> Vec<String> {
 fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
     let statics = f.compiled(&q.config, Statics::build);
     if statics.names.is_empty() && statics.regexps.is_empty() {
+        q.note(|| Note::new("static.none"));
         return Step::Next;
     }
     if q.qtype == RecordType::PTR
@@ -185,6 +188,8 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
     {
         return step;
     }
+    // A CNAME was answered: its note stays when the target matches nothing.
+    let mut followed = false;
     for _ in 0..MAX_CNAMES {
         let key = q.name.key.clone();
         let wanted = q.qtype;
@@ -192,8 +197,12 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
             record_type(e.rtype) == Some(wanted)
                 || matches!(e.rtype, StaticType::Cname | StaticType::Nxdomain | StaticType::Fwd)
         }) else {
+            if !followed {
+                q.note(|| Note::new("static.none"));
+            }
             return Step::Next;
         };
+        let (id, by) = (first.id, matched_by(&first.name, &first.regexp));
         if !first.address_list.is_empty() {
             q.address_list = Some(first.address_list.clone());
         }
@@ -208,12 +217,25 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
                 })
                 .filter_map(|e| record(e, &owner))
                 .collect();
+            q.note(|| {
+                Note::new("static.answered")
+                    .arg("id", id)
+                    .arg("match", by)
+                    .arg("type", wanted)
+                    .rule(Rule::Static(id.0))
+            });
             return Step::Reply(r);
         }
         match first.rtype {
             StaticType::Nxdomain => {
                 let mut r = Reply::code(ResponseCode::NXDomain);
                 r.authoritative = true;
+                q.note(|| {
+                    Note::new("static.nxdomain")
+                        .arg("id", id)
+                        .arg("match", by)
+                        .rule(Rule::Static(id.0))
+                });
                 return Step::Reply(r);
             }
             StaticType::Fwd => {
@@ -224,6 +246,19 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
                 } else {
                     Upstreams::group(&q.config.config, &first.forwarder)
                 };
+                let (group, servers) = (first.forwarder.clone(), first.forward_to.clone());
+                let found = q.forward_to.is_some();
+                q.note(|| {
+                    let n = if group.is_empty() {
+                        let list: Vec<String> = servers.iter().map(ToString::to_string).collect();
+                        Note::new("static.fwd").arg("servers", list.join(", "))
+                    } else if found {
+                        Note::new("static.fwd-group").arg("group", &group)
+                    } else {
+                        Note::new("static.fwd-group-gone").arg("group", &group)
+                    };
+                    n.arg("id", id).arg("match", by).rule(Rule::Static(id.0))
+                });
                 return Step::Next;
             }
             // A CNAME: answer it and go on with its target.
@@ -236,6 +271,14 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
                 };
                 q.prefix.push(rec);
                 q.name = QName::from_name(&target);
+                followed = true;
+                q.note(|| {
+                    Note::new("static.cname")
+                        .arg("id", id)
+                        .arg("match", by)
+                        .arg("target", target.to_ascii())
+                        .rule(Rule::Static(id.0))
+                });
             }
         }
     }
@@ -244,7 +287,7 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
 }
 
 /// RFC 1035 §3.5 / RFC 3596 §2.5: `in-addr.arpa` and `ip6.arpa` names.
-fn ptr(statics: &Statics, q: &Query) -> Option<Step> {
+fn ptr(statics: &Statics, q: &mut Query) -> Option<Step> {
     let net = q.name.name.parse_arpa_name().ok()?;
     let full = match net.addr() {
         IpAddr::V4(_) => 32,
@@ -253,8 +296,9 @@ fn ptr(statics: &Statics, q: &Query) -> Option<Step> {
     if net.prefix_len() != full {
         return None;
     }
-    let (name, ttl) = statics.ptr.get(&net.addr())?;
+    let (name, ttl, id) = statics.ptr.get(&net.addr())?;
     let target = host(name)?;
+    q.note(|| Note::new("static.ptr").arg("id", id).arg("name", name).rule(Rule::Static(id.0)));
     let mut r = Reply::code(ResponseCode::NoError);
     r.authoritative = true;
     r.answers = vec![Record::from_rdata(

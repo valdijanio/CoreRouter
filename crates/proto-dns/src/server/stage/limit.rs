@@ -10,8 +10,9 @@ use std::sync::Mutex;
 
 use hickory_proto::op::ResponseCode;
 
-use crate::server::{Forwarder, Query, Reply, Stage, Step};
 use crate::resolver::Transport;
+use crate::server::explain::Note;
+use crate::server::{Forwarder, Query, Reply, Stage, Step};
 
 pub(crate) const STAGE: Stage = Stage {
     name: "limit",
@@ -54,6 +55,18 @@ fn client_key(ip: IpAddr) -> IpAddr {
 }
 
 impl Buckets {
+    /// Whether `client`'s bucket holds a query now, without taking it (a
+    /// simulated client, G6.8: it sent nothing).
+    pub(crate) fn peek(&self, client: IpAddr, rate: u32, now_ms: u64) -> bool {
+        let rate = u64::from(rate);
+        let cap = rate * 2 * 1000;
+        let table = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        table.map.get(&client_key(client)).is_none_or(|b| {
+            let refill = now_ms.saturating_sub(b.last_ms).saturating_mul(rate);
+            b.milli.saturating_add(refill).min(cap) >= 1000
+        })
+    }
+
     /// Takes one query from `client`'s bucket; false when it is empty.
     pub(crate) fn take(&self, client: IpAddr, rate: u32, now_ms: u64) -> bool {
         let rate = u64::from(rate);
@@ -99,9 +112,32 @@ impl Buckets {
 
 fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
     let rate = q.config.config.ip.dns.max_queries_per_client;
-    if rate == 0 || q.client.is_loopback() || f.state::<Buckets>().take(q.client, rate, q.now_ms) {
+    let client = q.client;
+    if rate == 0 {
+        q.note(|| Note::new("limit.off"));
         return Step::Next;
     }
+    if client.is_loopback() {
+        q.note(|| Note::new("limit.router"));
+        return Step::Next;
+    }
+    let buckets = f.state::<Buckets>();
+    let within = if q.simulated() {
+        buckets.peek(client, rate, q.now_ms)
+    } else {
+        buckets.take(client, rate, q.now_ms)
+    };
+    if within {
+        q.note(|| Note::new("limit.within").arg("client", client).arg("rate", rate));
+        return Step::Next;
+    }
+    let tcp = q.tcp;
+    q.note(|| {
+        Note::new("limit.over")
+            .arg("client", client)
+            .arg("rate", rate)
+            .arg("action", if tcp { "REFUSED (TCP)" } else { "dropped (UDP)" })
+    });
     if q.tcp {
         Step::Reply(Reply::code(ResponseCode::Refused))
     } else {
@@ -139,6 +175,17 @@ mod tests {
         let t = b.0.lock().unwrap();
         assert!(t.sweeps <= 1, "{} sweeps", t.sweeps);
         assert_eq!(t.map.len(), MAX_CLIENTS);
+    }
+
+    #[test]
+    fn peek_takes_nothing() {
+        let b = Buckets::default();
+        let c: IpAddr = [192, 168, 88, 10].into();
+        assert!(b.peek(c, 1, 0), "an unknown client has a full bucket");
+        assert!(b.take(c, 1, 0) && b.take(c, 1, 0));
+        assert!(!b.peek(c, 1, 0), "empty now");
+        assert!(!b.peek(c, 1, 0) && !b.take(c, 1, 0), "peeking took nothing back either");
+        assert!(b.peek(c, 1, 1000), "one second later, one token");
     }
 
     #[test]

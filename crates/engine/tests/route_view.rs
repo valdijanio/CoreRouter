@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use corerouter_engine::Session;
 use corerouter_engine::route_table::REASONS;
-use corerouter_hal::drift::KernelRoute;
+use corerouter_hal::drift::{KernelRoute, Snapshot};
 use corerouter_hal::route_get::{KernelLookup, RouteQuery};
 use corerouter_hal::virt::LabKernel;
 use corerouter_hal::{Hal, HalError, LinkInfo, LinkState, VirtualHal};
@@ -49,6 +49,9 @@ impl Hal for Lab {
     }
     fn route_get(&mut self, cfg: &Config, q: &RouteQuery) -> Result<KernelLookup, HalError> {
         self.inner.route_get(cfg, q)
+    }
+    fn snapshot(&mut self, cfg: &Config) -> Result<Snapshot, HalError> {
+        self.inner.snapshot(cfg)
     }
 }
 
@@ -524,5 +527,171 @@ fn lookup_refuses_bad_requests() {
     ] {
         let err = t.s.execute("ip.route.lookup", &p).unwrap_err().to_string();
         assert!(err.contains(needle), "{p}: '{err}' lacks '{needle}'");
+    }
+}
+
+// ---- ip.route.detail (G1.27b) ----
+
+impl T {
+    fn detail(&mut self, key: &str) -> Value {
+        ok(&mut self.s, "ip.route.detail", json!({ "key": key }))
+    }
+}
+
+#[test]
+fn detail_says_where_a_static_route_came_from() {
+    let mut t = lab();
+    let id = t.add(json!({"dst_address": "192.0.2.0/24", "gateway": "10.0.1.1"}));
+    let d = t.detail(&id);
+    assert_eq!(d["source"]["kind"], "static");
+    assert_eq!(d["source"]["created"]["command"], "ip.route.add");
+    let created = d["source"]["created"]["revision"].clone();
+    ok(
+        &mut t.s,
+        "ip.route.set",
+        json!({"id": id, "comment": "transit"}),
+    );
+    let d = t.detail(&id);
+    assert_eq!(d["source"]["created"]["revision"], created);
+    assert_eq!(d["source"]["changed"]["command"], "ip.route.set");
+    assert_eq!(d["route"]["comment"], "transit");
+    // A connected route names its address.
+    let d = t.detail("connected main 10.0.1.0/24 ether2");
+    assert_eq!(d["source"]["kind"], "connected");
+    assert_eq!(d["source"]["text"], "address 10.0.1.2/24 on ether2");
+    assert_eq!(d["source"]["created"]["command"], "ip.address.add");
+}
+
+#[test]
+fn detail_compares_with_the_competitors() {
+    let mut t = lab();
+    let primary = t.add(json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}));
+    let backup = t.add(json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.1.1", "distance": 5}));
+    let d = t.detail(&primary);
+    assert!(
+        d["chosen"]
+            .as_str()
+            .unwrap()
+            .contains("lowest distance (1)"),
+        "{d}"
+    );
+    assert!(
+        d["chosen"].as_str().unwrap().contains("(5) takes over"),
+        "{d}"
+    );
+    assert_eq!(d["chosen_id"], "choice.lowest");
+    assert_eq!(d["chosen_args"]["next"], "5");
+    let comp = d["competitors"].as_array().unwrap();
+    assert_eq!(comp.len(), 2);
+    assert_eq!(
+        (&comp[0]["this"], &comp[1]["state"]),
+        (&json!(true), &json!("standby"))
+    );
+    let d = t.detail(&backup);
+    assert!(
+        d["chosen"]
+            .as_str()
+            .unwrap()
+            .starts_with("loses to distance 1"),
+        "{d}"
+    );
+    assert_eq!(d["chosen_id"], "route.loses-distance");
+    assert_eq!(
+        d["check_gateway"],
+        Value::Null,
+        "static routes have none yet"
+    );
+}
+
+#[test]
+fn detail_keeps_the_failovers_of_the_last_day() {
+    let mut t = lab();
+    let primary = t.add(json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.1.1"}));
+    let backup = t.add(json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "distance": 5}));
+    t.tick(1);
+    t.unplug("ether2", true);
+    t.tick(10);
+    t.unplug("ether2", false);
+    t.tick(20);
+    let d = t.detail(&primary);
+    let h = d["history"].as_array().unwrap();
+    assert_eq!(h.len(), 2, "{d}");
+    assert_eq!(
+        (&h[0]["from"], &h[0]["to"], &h[0]["ago_secs"]),
+        (&json!("inactive"), &json!("active"), &json!(0))
+    );
+    assert_eq!(
+        (&h[1]["to"], &h[1]["ago_secs"]),
+        (&json!("inactive"), &json!(20))
+    );
+    assert_eq!(h[1]["reason"], "interface 'ether2' has no link");
+    assert_eq!(h[1]["reason_id"], "interface-down");
+    let b = t.detail(&backup);
+    let bh = b["history"].as_array().unwrap();
+    assert_eq!(
+        (&bh[1]["from"], &bh[1]["to"]),
+        (&json!("standby"), &json!("active")),
+        "{b}"
+    );
+    // The log has the failover (topic route).
+    let log = ok(&mut t.s, "log.print", json!({"topics": "route"})).to_string();
+    assert!(
+        log.contains("0.0.0.0/0: active -> inactive: interface 'ether2' has no link"),
+        "{log}"
+    );
+    // A day later the changes are gone.
+    t.tick(86_401);
+    assert_eq!(t.detail(&primary)["history"], json!([]));
+}
+
+#[test]
+fn detail_says_whether_the_kernel_holds_it() {
+    let mut t = lab();
+    let id = t.add(json!({"dst_address": "192.0.2.0/24", "gateway": "10.0.1.1"}));
+    let d = t.detail(&id);
+    assert_eq!(d["kernel"]["same"], true, "{d}");
+    assert_eq!(d["kernel"]["expected"].as_array().unwrap().len(), 1);
+    // Someone deletes it, and adds another path by hand.
+    {
+        let mut k = t.kernel.lock().unwrap();
+        k.routes.retain(|r| r.dst.to_string() != "192.0.2.0/24");
+        k.routes.insert(KernelRoute {
+            table: 254,
+            dst: "192.0.2.0/24".parse().unwrap(),
+            metric: 1,
+            link: "ether1".parse::<IfName>().unwrap(),
+            gateway: Some("10.0.0.77".parse().unwrap()),
+        });
+    }
+    let d = t.detail(&id);
+    assert_eq!(d["kernel"]["same"], false);
+    assert!(
+        d["kernel"]["missing"][0]
+            .as_str()
+            .unwrap()
+            .contains("via 10.0.1.1"),
+        "{d}"
+    );
+    assert!(
+        d["kernel"]["extra"][0]
+            .as_str()
+            .unwrap()
+            .contains("via 10.0.0.77"),
+        "{d}"
+    );
+    let c = t.detail("connected main 10.0.1.0/24 ether2");
+    assert_eq!(c["kernel"]["same"], Value::Null);
+}
+
+#[test]
+fn detail_refuses_unknown_keys() {
+    let mut t = lab();
+    for (p, needle) in [
+        (json!({"key": "*99"}), "no route '*99'"),
+        (json!({"key": "x".repeat(300)}), "at most 256 bytes"),
+        (json!({}), "'key': is required"),
+    ] {
+        let err = t.s.execute("ip.route.detail", &p).unwrap_err().to_string();
+        assert!(err.contains(needle), "{p}: {err}");
     }
 }

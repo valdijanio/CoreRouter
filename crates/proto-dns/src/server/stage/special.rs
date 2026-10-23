@@ -9,8 +9,9 @@ use hickory_proto::op::ResponseCode;
 use hickory_proto::rr::rdata::{A, AAAA, HINFO};
 use hickory_proto::rr::{RData, Record, RecordType};
 
-use crate::server::{Forwarder, Query, Reply, Stage, Step};
 use crate::resolver::Transport;
+use crate::server::explain::Note;
+use crate::server::{Forwarder, Query, Reply, Stage, Step};
 
 pub(crate) const STAGE: Stage = Stage {
     name: "special",
@@ -26,7 +27,10 @@ const LOCAL_TTL: u32 = 86_400;
 fn handle(_: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
     let k = q.name.key.as_str();
     let owner = q.name.name.clone();
+    let k = k.to_owned();
+    let k = k.as_str();
     if k == "localhost" || k.ends_with(".localhost") {
+        q.note(|| Note::new("special.localhost"));
         let data = match q.qtype {
             RecordType::A => Some(RData::A(A(Ipv4Addr::LOCALHOST))),
             RecordType::AAAA => Some(RData::AAAA(AAAA(Ipv6Addr::LOCALHOST))),
@@ -41,11 +45,13 @@ fn handle(_: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
         return Step::Reply(r);
     }
     if k == "invalid" || k.ends_with(".invalid") {
+        q.note(|| Note::new("special.invalid"));
         let mut r = Reply::code(ResponseCode::NXDomain);
         r.authoritative = true;
         return Step::Reply(r);
     }
     if q.qtype == RecordType::ANY {
+        q.note(|| Note::new("special.any"));
         let mut r = Reply::code(ResponseCode::NoError);
         r.answers = vec![Record::from_rdata(
             owner,
@@ -54,5 +60,6 @@ fn handle(_: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
         )];
         return Step::Reply(r);
     }
+    q.note(|| Note::new("special.none"));
     Step::Next
 }

@@ -259,6 +259,15 @@ impl DnsBackend for RouterDns {
         super::dns_lookup::exchange(self, to, query, tcp)
     }
 
+    fn ask_router(
+        &self,
+        query: &[u8],
+        tcp: bool,
+        how: corerouter_engine::dns_lookup::RouterAsk,
+    ) -> Result<corerouter_engine::dns_lookup::Exchanged, String> {
+        super::dns_lookup::ask_router(query, tcp, how)
+    }
+
     fn exchange_all(
         &self,
         asks: &[(corerouter_engine::dns_lookup::LookupServer, Vec<u8>)],
