@@ -348,6 +348,22 @@ fn pool_checks(cfg: &Config, p: &Pool, router: &[Ipv4Addr], out: &mut Out) {
     }
     match p.layout() {
         Ok(l) => {
+            if p.mode == Mode::Blocks && l.subscribers() > l.capacity() {
+                // Blocks are handed out on demand: more subscribers than
+                // blocks is the point, while not all are online at once.
+                warn(
+                    out,
+                    "outside",
+                    "oversubscribed",
+                    format!(
+                        "{} subscribers for {} blocks ({} per public address): fine while at most {} are online at once",
+                        l.subscribers(),
+                        l.capacity(),
+                        l.per_address(),
+                        l.capacity()
+                    ),
+                );
+            }
             if p.ports_per_subscriber < FEW_PORTS {
                 warn(
                     out,
@@ -359,7 +375,7 @@ fn pool_checks(cfg: &Config, p: &Pool, router: &[Ipv4Addr], out: &mut Out) {
                     ),
                 );
             }
-            let unused = l.public_addresses() - l.public_used();
+            let unused = l.public_addresses().saturating_sub(l.public_used());
             let what = if p.mode == Mode::Blocks {
                 "blocks"
             } else {

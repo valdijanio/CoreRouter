@@ -97,6 +97,11 @@ const NFTA_CT_DIRECTION: u16 = 3;
 const NFTA_LOOKUP_SET: u16 = 1;
 const NFTA_LOOKUP_SREG: u16 = 2;
 const NFTA_LOOKUP_DREG: u16 = 3;
+const NFTA_LOOKUP_FLAGS: u16 = 5;
+const NFT_LOOKUP_F_INV: u32 = 1;
+const NFTA_QUEUE_NUM: u16 = 1;
+const NFTA_QUEUE_TOTAL: u16 = 2;
+const NFTA_QUEUE_FLAGS: u16 = 3;
 const NFTA_NAT_TYPE: u16 = 1;
 const NFTA_NAT_FAMILY: u16 = 2;
 const NFTA_NAT_REG_ADDR_MIN: u16 = 3;
@@ -354,6 +359,7 @@ impl Batch {
             Expr::Update { .. } => "dynset",
             Expr::Counter => "counter",
             Expr::Drop => "immediate",
+            Expr::Queue { .. } => "queue",
         };
         self.str(NFTA_EXPR_NAME, name);
         self.begin(NFTA_EXPR_DATA);
@@ -398,12 +404,26 @@ impl Batch {
                     self.put(NFTA_CT_DIRECTION, &[if *d == Dir::Reply { 1 } else { 0 }]);
                 }
             }
-            Expr::Lookup { set, sreg, dreg } => {
+            Expr::Lookup {
+                set,
+                sreg,
+                dreg,
+                inv,
+            } => {
                 self.str(NFTA_LOOKUP_SET, set);
                 self.be32(NFTA_LOOKUP_SREG, *sreg);
                 if let Some(d) = dreg {
                     self.be32(NFTA_LOOKUP_DREG, *d);
                 }
+                if *inv {
+                    self.be32(NFTA_LOOKUP_FLAGS, NFT_LOOKUP_F_INV);
+                }
+            }
+            Expr::Queue { num } => {
+                // u16 attributes go as 2 big-endian bytes, padded.
+                self.put(NFTA_QUEUE_NUM, &num.to_be_bytes());
+                self.put(NFTA_QUEUE_TOTAL, &1u16.to_be_bytes());
+                self.put(NFTA_QUEUE_FLAGS, &0u16.to_be_bytes());
             }
             Expr::Nat {
                 kind,
