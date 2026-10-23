@@ -39,5 +39,9 @@ proptest.workspace = true
 name = "execute"
 harness = false
 
+[[bench]]
+name = "dhcp_round"
+harness = false
+
 [lints]
 workspace = true

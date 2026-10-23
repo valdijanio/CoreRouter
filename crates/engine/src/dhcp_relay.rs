@@ -218,14 +218,14 @@ impl Session {
         if let Some(u) = uplink.as_mut() {
             for _ in 0..RECV_BUDGET {
                 match u.recv() {
-                    Ok(Some(h)) => replies.push(h.payload),
+                    Ok(Some(h)) => replies.push((h.src, h.payload)),
                     Ok(None) | Err(_) => break,
                 }
             }
         }
         heard |= !replies.is_empty();
-        for r in replies {
-            self.dhcp_relay_down(&r);
+        for (src, r) in replies {
+            self.dhcp_relay_down(&r, Some(src));
         }
         heard
     }
@@ -237,8 +237,11 @@ impl Session {
             .is_some_and(|r| r.plans.iter().any(|p| p.giaddr == ip))
     }
 
-    /// A server's reply for one of our relays: down to its client.
-    pub(crate) fn dhcp_relay_down(&mut self, payload: &[u8]) {
+    /// A server's reply for one of our relays: down to its client. `from`:
+    /// the address it came from on the uplink (`None`: the router's own
+    /// server). The uplink listens on port 67 of every interface: only the
+    /// relay's servers may answer through it.
+    pub(crate) fn dhcp_relay_down(&mut self, payload: &[u8], from: Option<Ipv4Addr>) {
         let Some(rt) = self.ext_mut::<RelayRuntime>() else {
             return;
         };
@@ -250,6 +253,10 @@ impl Session {
         let Some(plan) = rt.plans.iter().find(|p| p.giaddr == giaddr).cloned() else {
             return;
         };
+        if from.is_some_and(|src| !plan.servers.contains(&src)) {
+            dropped(&mut rt.counters, &plan.name, relay::RelayDrop::NotFromServer.as_str());
+            return;
+        }
         match relay::down(&plan, payload) {
             Ok((msg, to, _)) => {
                 let sent = rt

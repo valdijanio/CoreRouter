@@ -187,6 +187,7 @@ const SERVER: ItemKind = ItemKind {
         text_field("address_lists", "Address Lists", "lan-hosts, …"),
         text_field("client_mac_limit", "Client MAC Limit", "unlimited"),
         text_field("client_rate_limit", "Client Rate Limit", "10 messages/s"),
+        bool_field("relay_info_trusted", "Trust Option 82 Without Relay"),
         bool_field("disabled", "Disabled"),
         text_field("comment", "Comment", ""),
     ],

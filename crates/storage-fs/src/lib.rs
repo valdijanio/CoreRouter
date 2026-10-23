@@ -207,10 +207,7 @@ impl ConfigStorage for FileStorage {
             Err(e) => return Err(self.err(&format!("open {file}"), &e)),
         };
         let limit = u64::try_from(MAX_JOURNAL_BYTES).unwrap_or(u64::MAX);
-        let mut bytes = Vec::new();
-        f.take(limit)
-            .read_to_end(&mut bytes)
-            .map_err(|e| self.err(&format!("read {file}"), &e))?;
+        let bytes = read_tail(f, limit).map_err(|e| self.err(&format!("read {file}"), &e))?;
         Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
     }
 
@@ -248,4 +245,27 @@ impl ConfigStorage for FileStorage {
             .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))?;
         self.sync_dir().map_err(|e| self.err("sync", &e))
     }
+}
+
+/// The last `limit` bytes of `f`, from the first line that starts inside
+/// them (the whole file when it is smaller). A journal is "the last line
+/// wins": past the limit the newest lines are the ones to keep, never the
+/// oldest (a journal that could not be compacted keeps growing).
+pub fn read_tail(mut f: File, limit: u64) -> io::Result<Vec<u8>> {
+    use std::io::{Seek, SeekFrom};
+    let len = f.metadata()?.len();
+    let mut bytes = Vec::new();
+    if len <= limit {
+        f.take(limit).read_to_end(&mut bytes)?;
+        return Ok(bytes);
+    }
+    log::warn!("journal of {len} bytes is over {limit}: only its newest lines are read");
+    f.seek(SeekFrom::Start(len - limit))?;
+    f.take(limit).read_to_end(&mut bytes)?;
+    // The first line is cut: it starts after the first newline.
+    let start = bytes
+        .iter()
+        .position(|b| *b == b'\n')
+        .map_or(bytes.len(), |i| i + 1);
+    Ok(bytes.split_off(start))
 }

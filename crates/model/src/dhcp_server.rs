@@ -168,6 +168,13 @@ pub struct DhcpServer {
     /// counted (`rate-limited`). 0: no limit.
     #[serde(default = "default_client_rate")]
     pub client_rate_limit: u32,
+    /// Believe option 82 in requests that came without a relay (`giaddr`
+    /// 0): a layer-2 agent on this interface (an OLT, a switch with DHCP
+    /// snooping) inserts it. Off (the default), a client's own option 82 is
+    /// ignored (RFC 3046 §2.1/§5: only trusted agents' is believed; Cisco's
+    /// `ip dhcp relay information trusted` is off by default too).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay_info_trusted: bool,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -204,6 +211,7 @@ impl DhcpServer {
             address_lists: Vec::new(),
             client_mac_limit: None,
             client_rate_limit: DEFAULT_CLIENT_RATE,
+            relay_info_trusted: false,
             disabled: false,
             comment: String::new(),
         }

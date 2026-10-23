@@ -42,13 +42,14 @@ const COLUMNS: [table::Column; 8] = [
 ];
 
 /// Form fields: (key, label, hint, is a yes/no).
-const FIELDS: [(&str, &str, &str, bool); 8] = [
+const FIELDS: [(&str, &str, &str, bool); 9] = [
     ("name", "Name", "relay1", false),
     ("interface", "Interface", "vlan20 (the clients' side)", false),
     ("dhcp_server", "DHCP Servers", "10.0.0.2, 10.0.0.3", false),
     ("local_address", "Local Address", "the interface's (giaddr)", false),
     ("add_relay_info", "Add Relay Info", "", true),
     ("relay_info_remote_id", "Relay Info Remote ID", "the client's MAC", false),
+    ("relay_info_trusted", "Trust Client Option 82", "", true),
     ("disabled", "Disabled", "", true),
     ("comment", "Comment", "", false),
 ];

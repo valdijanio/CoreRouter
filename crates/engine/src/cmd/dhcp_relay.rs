@@ -15,7 +15,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add DHCP Relay",
         ["IP", "DHCP Relay"],
         None,
-        "{name?: string (default relayN), interface: string (where the clients are), dhcp_server: [ipv4] | string (servers each request goes to, all of them), local_address?: ipv4 (giaddr; empty: the interface's address), add_relay_info?: bool (add option 82: circuit id = the interface's name, remote id = the client's MAC), relay_info_remote_id?: string (remote id instead of the MAC), disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{name?: string (default relayN), interface: string (where the clients are), dhcp_server: [ipv4] | string (servers each request goes to, all of them), local_address?: ipv4 (giaddr; empty: the interface's address), add_relay_info?: bool (add option 82: circuit id = the interface's name, remote id = the client's MAC), relay_info_remote_id?: string (remote id instead of the MAC), relay_info_trusted?: bool (relay requests that already carry option 82 without a giaddr, added by a layer-2 agent; default no: they are dropped), disabled?: bool, comment?: string} → {id, name, warnings}",
         always,
         add
     ),
@@ -24,7 +24,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set DHCP Relay",
         [],
         None,
-        "{id: *hex | name, name?: string, interface?: string, dhcp_server?: [ipv4] | string, local_address?: ipv4, add_relay_info?: bool, relay_info_remote_id?: string, disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{id: *hex | name, name?: string, interface?: string, dhcp_server?: [ipv4] | string, local_address?: ipv4, add_relay_info?: bool, relay_info_remote_id?: string, relay_info_trusted?: bool, disabled?: bool, comment?: string} → {id, name, warnings}",
         has_relays,
         set
     ),
@@ -38,7 +38,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.dhcp-relay.print", "DHCP Relay", ["IP", "DHCP Relay"], None,
-        "{} → [{id, name, interface, dhcp_server, local_address?, add_relay_info, relay_info_remote_id?, disabled, comment?, status (running | disabled | invalid | starting | error), giaddr?, error?, requests (sent up), replies (sent down), dropped: {reason: count}, checks: [{label, level, text}]}]",
+        "{} → [{id, name, interface, dhcp_server, local_address?, add_relay_info, relay_info_remote_id?, relay_info_trusted, disabled, comment?, status (running | disabled | invalid | starting | error), giaddr?, error?, requests (sent up), replies (sent down), dropped: {reason: count}, checks: [{label, level, text}]}]",
         always, print),
 ];
 
@@ -68,6 +68,9 @@ fn apply(r: &mut DhcpRelay, p: &Value) -> Result<()> {
     }
     if let Some(t) = opt_text(p, "relay_info_remote_id", 64)? {
         r.relay_info_remote_id = t;
+    }
+    if let Some(b) = opt_bool(p, "relay_info_trusted")? {
+        r.relay_info_trusted = b;
     }
     if let Some(b) = opt_bool(p, "disabled")? {
         r.disabled = b;
@@ -157,6 +160,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
                 "interface": r.interface,
                 "dhcp_server": r.dhcp_server,
                 "add_relay_info": r.add_relay_info,
+                "relay_info_trusted": r.relay_info_trusted,
                 "disabled": r.disabled,
                 "status": state,
                 "requests": counters.requests,
