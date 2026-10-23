@@ -76,3 +76,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-22 — G6.6 feito (DNS Lookup estilo dig em Tools)
 - 2026-10-22 — G0.14 feito (validação do firewall linear no commit, auditoria)
 - 2026-10-22 — G1.23 feito (histórico em arquivos de revisão, pelo audit-perf)
+- 2026-10-23 — G0.15 criado e feito (idioma dos rótulos e das explicações, separados); G0.15b criado (traduzir os rótulos existentes)
+- 2026-10-23 — G0.16 feito (comando sem cópia da config inteira; critério refeito com o medido)
+- 2026-10-23 — G1.26a–f criados (System › Tuning, pedido do usuário); G1.26a feito (Resumo, Kernel e Perfis)
+- 2026-10-23 — G0.20 criado (histórico em memória como diferenças: boot e RAM com config grande)
