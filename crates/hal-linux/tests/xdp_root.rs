@@ -395,6 +395,15 @@ fn perf_veth_blast() {
             let mut f = udp4([198, 18 + (i >> 16) as u8 % 2, (i >> 8) as u8, i as u8]);
             f[..6].copy_from_slice(&mac);
             f[30..34].copy_from_slice(&[10, 98, 0, 1]);
+            // A valid IPv4 header checksum: the stack drops bad ones in
+            // ip_rcv, before nftables would see them.
+            let sum = f[14..34]
+                .chunks(2)
+                .map(|w| u32::from(u16::from_be_bytes([w[0], w[1]])))
+                .sum::<u32>();
+            let sum = (sum & 0xffff) + (sum >> 16);
+            let sum = (sum & 0xffff) + (sum >> 16);
+            f[24..26].copy_from_slice(&(!(sum as u16)).to_be_bytes());
             f
         })
         .collect();

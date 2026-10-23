@@ -89,7 +89,8 @@ O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-
   veth; **diferencial kernel × host**: 4000 quadros gerados, cortados e corrompidos passam pelo
   programa real (`BPF_PROG_TEST_RUN`) e pelo `decide` do host com as mesmas listas, e o veredito
   tem de ser o mesmo; tráfego real (ping de outro namespace) para contadores, top origens,
-  exceção vencendo o bloqueio e limite de taxa; medições (abaixo).
+  exceção vencendo o bloqueio e limite de taxa; medições (abaixo). Cada teste roda com prazo
+  próprio (`timeout`), com a saída direto no log do CI.
 - `crates/engine/src/cmd/firewall_xdp.rs` e `crates/engine/tests/xdp.rs`: sucesso, validação,
   rollback, lockout com `force`; `command_sweep` cobre parâmetros lixo.
 - `crates/ui/src/tests/xdp.rs`: janela, formulário, top, explicações em PT e EN.
@@ -184,10 +185,36 @@ bloqueio por destino (RTBH local), FlowSpec alimentando as listas (G2.5d).
 
 ## Desempenho
 
-**Medido** no runner do GitHub Actions (ubuntu-latest, 4 vCPUs, kernel do runner), build de
-teste (o programa XDP é o objeto release; o userspace é debug), saída `PERF |` do
-`xdp_root.rs`. Ver a tabela em `docs/changes/G2.5a.md` (seção `## perf`), consolidada no
-`docs/perf.md` pela fila.
+**Medido** no runner do GitHub Actions (ubuntu-latest, 4 vCPUs, kernel do runner, 2026-10-23),
+objeto XDP release, saída `PERF |` do `xdp_root.rs`.
+
+Custo por pacote no kernel (`BPF_PROG_TEST_RUN`, 2 milhões de repetições, quadro UDP de 64 bytes,
+média por execução; inclui o custo fixo do próprio test run, que não existe no driver):
+
+| prefixos na LPM | carga dos prefixos | passa (origem fora da lista) | descartado (bloqueado) | passa com limite de taxa ligado |
+|---:|---:|---:|---:|---:|
+| 0 | 212 ms | 158 ns | — | 223 ns |
+| 1 000 | 193 ms | 175 ns | 289 ns | 237 ns |
+| 10 000 | 210 ms | 177 ns | 312 ns | 242 ns |
+| 100 000 | 414 ms | 179 ns | 331 ns | 237 ns |
+| 1 000 000 | 2 551 ms | 173 ns | 342 ns | 238 ns |
+
+Leitura:
+
+- **Custo da LPM**: ~17 ns por pacote com a árvore não vazia, e plano de mil a um milhão de
+  prefixos (a busca percorre no máximo 32 níveis, não o número de entradas).
+- O descarte custa mais que o passe porque grava a origem na tabela de top origens (LRU por CPU):
+  ~110–170 ns. Se pesar numa placa real, a tabela pode virar amostrada (G2.5c).
+- O limite de taxa soma ~60 ns (o balde da origem num LRU hash).
+- Carga: um milhão de prefixos em 2,6 s (uma chamada de mapa por prefixo, só na primeira vez;
+  depois só a diferença).
+- O host faz a mesma decisão sem mapas em 13–18 ns (`benches/filter.rs`, AMD Ryzen AI Max+ 395,
+  release): o resto é busca em mapa e o custo fixo do test run.
+
+O remetente em veth (sem filtro × nftables raw × XDP generic/native) está na seção `## perf` do
+`docs/changes/G2.5a.md`. O pktgen do kernel ficou fora do CI: mesmo com `reset` antes de apagar a
+interface, ele travou a VM do runner duas vezes (sem log); a medida usa um remetente AF_PACKET em
+userspace.
 
 O que só uma **placa real em modo native** mede, e que veth, modo generic e `BPF_PROG_TEST_RUN`
 não mostram: a taxa de descarte no driver antes da alocação do `skb` (o ganho grande do XDP),
@@ -220,8 +247,10 @@ gerador ligado a ela.
    sudo /usr/src/linux/samples/pktgen/pktgen_sample05_flow_per_thread.sh -i <if> -m <mac do roteador> \
      -d 10.0.0.1 -s 64 -t 4 -n 0
    ```
-   (sem as amostras do kernel: os mesmos comandos de `/proc/net/pktgen` que o `xdp_root.rs`
-   usa, com `flag IPSRC_RND`.)
+   (sem as amostras do kernel: `Documentation/networking/pktgen.rst`, com `flag IPSRC_RND` e
+   `src_min`/`src_max`.) Ao terminar, `echo reset > /proc/net/pktgen/pgctrl` antes de mexer na
+   interface: um dispositivo que o pktgen ainda segura não termina de sair, com o lock de rede
+   do kernel preso (foi o que travou a VM do CI).
 4. No roteador, leia a taxa a cada segundo e a CPU:
    ```sh
    watch -n1 "$C run ip.firewall.xdp.interface.list"
