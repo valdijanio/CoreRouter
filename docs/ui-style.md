@@ -100,3 +100,10 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
   lugar no menu, caminho do RouterOS e sinônimos da entrada. Janela nova: ponha nos sinônimos as
   palavras que o operador usaria (inclusive em português e o nome em outros roteadores). Atalhos:
   `/` foca a busca, Ctrl+K abre a paleta; nenhuma janela deve usar esses dois.
+- **Selos de estado no menu** (`crates/ui/src/menu_badges.rs`): só de consultas que já existem,
+  sem regra de negócio na UI; vermelho para o que está quebrado (`1 failed` em Services), âmbar
+  para o que pede um olhar (`2 conflict` no DHCP Server, `drift 1` em History). Grupo ou subgrupo
+  fechado mostra o selo dos seus itens (ou quantos são, na cor do pior); detalhes no tooltip.
+- **Partes de uma janela são abas dela, não itens do menu** (DNS Zones: Zones, Records, Zone File;
+  DHCP Server: …, History, Statistics). Item novo no menu só para uma janela que o operador abre
+  por si.
