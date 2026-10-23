@@ -80,6 +80,13 @@ check_once() {
     failed=" ci"
     return 1
   fi
+  # Um run cancelado sem outro verde no mesmo commit: o GitHub cancela o CI de um commit quando
+  # chega um push novo na branch. Esse commit não vai mais ficar verde; esperar 30 min por ele
+  # travou o lote do #144 (2026-10-23). Sai logo; o PR volta com o head novo na próxima rodada.
+  if printf '%s\n' "$runs" | grep -q ' cancelled$' && ! printf '%s\n' "$runs" | grep -q ' success$'; then
+    failed=" cancelado: a branch recebeu um push novo"
+    return 1
+  fi
   printf '%s\n' "$runs" | grep -q ' success$' || return 3
   return 0
 }
