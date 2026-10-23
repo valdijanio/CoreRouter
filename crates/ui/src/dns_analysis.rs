@@ -278,7 +278,7 @@ pub(crate) fn bench_results(ui: &mut Ui, langs: Langs, b: &TaskView) {
         .num_columns(7)
         .spacing([14.0, 3.0])
         .show(ui, |ui| {
-            for h in ["Server", "Via", "p50", "p99", "Loss", "SERVFAIL", "Checks"] {
+            for h in ["Server", "Via", "p50", "p99", "Loss", "SERVFAIL", "Tests"] {
                 ui.strong(tr(langs.labels, h));
             }
             ui.end_row();
