@@ -240,7 +240,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             "certificate and private_key go together (ClickHouse's certificate login)",
         ));
     }
-    let tls = check_url(&a.url).is_ok_and(|(tls, _)| tls);
+    let (tls, host) = check_url(&a.url).unwrap_or((false, String::new()));
+    let local = host == "localhost"
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if !a.certificate.is_empty() && !a.url.is_empty() && !tls {
         return Err(EngineError::bad(
             "certificate",
@@ -248,7 +250,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let mut warnings = Vec::new();
-    if a.enabled && !tls && !a.password.is_empty() {
+    if a.enabled && !tls && !local && !a.password.is_empty() {
         warnings.push(
             "the password crosses the network in clear text over http://; use https:// (port 8443) \
              unless the server is on a trusted management network",
