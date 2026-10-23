@@ -10,6 +10,7 @@ pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
 pub mod drift;
+pub mod fastpath;
 pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
@@ -448,6 +449,19 @@ pub trait Hal: Send {
     /// queue to ask through (the lab's pretend online subscribers).
     fn cgnat_waiting(&mut self) -> Vec<cgnat::Waiting> {
         Vec::new()
+    }
+
+    /// What port `name`'s card offers the fast path (G2.4).
+    fn eswitch(&mut self, name: &IfName) -> Result<fastpath::Eswitch, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} cannot tell what '{name}' offloads",
+            self.describe()
+        )))
+    }
+
+    /// The fast path as the last apply installed it (G2.4).
+    fn fastpath_state(&mut self) -> fastpath::FastPathState {
+        fastpath::FastPathState::default()
     }
 
     /// The queue of first packets of subscribers without a block (G2.3c).

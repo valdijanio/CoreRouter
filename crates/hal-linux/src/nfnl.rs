@@ -14,7 +14,7 @@
 //! is big-endian, element and register data are packet-order bytes.
 
 use corerouter_firewall::program::{
-    Base, Chain, Dir, Element, Expr, FAMILY_IPV4, NatKind, Rule, Set, Table,
+    Base, Chain, Dir, Element, Expr, FAMILY_IPV4, Family, Flowtable, NatKind, Rule, Set, Table,
 };
 
 const NLA_HDR: usize = 4;
@@ -36,6 +36,7 @@ const NFT_MSG_NEWRULE: u16 = 6;
 const NFT_MSG_NEWSET: u16 = 9;
 const NFT_MSG_NEWSETELEM: u16 = 12;
 const NFT_MSG_DELSETELEM: u16 = 14;
+const NFT_MSG_NEWFLOWTABLE: u16 = 22;
 
 const NFTA_TABLE_NAME: u16 = 1;
 const NFTA_CHAIN_TABLE: u16 = 1;
@@ -75,6 +76,19 @@ const NFTA_DATA_VERDICT: u16 = 2;
 const NFTA_VERDICT_CODE: u16 = 1;
 const NF_ACCEPT: u32 = 1;
 const NF_DROP: u32 = 0;
+
+// Flowtables (`NFTA_FLOWTABLE_*`, `NFTA_FLOWTABLE_HOOK_*`).
+const NFTA_FLOWTABLE_TABLE: u16 = 1;
+const NFTA_FLOWTABLE_NAME: u16 = 2;
+const NFTA_FLOWTABLE_HOOK: u16 = 3;
+const NFTA_FLOWTABLE_FLAGS: u16 = 7;
+const NFTA_FLOWTABLE_HOOK_NUM: u16 = 1;
+const NFTA_FLOWTABLE_HOOK_PRIORITY: u16 = 2;
+const NFTA_FLOWTABLE_HOOK_DEVS: u16 = 3;
+const NFTA_DEVICE_NAME: u16 = 1;
+/// `NF_NETDEV_INGRESS`.
+const NF_NETDEV_INGRESS: u32 = 0;
+const NFTA_FLOW_TABLE_NAME: u16 = 1;
 
 // Expression attributes.
 const NFTA_PAYLOAD_DREG: u16 = 1;
@@ -138,6 +152,8 @@ pub struct Batch {
     /// Sequence numbers of the messages that want an answer.
     first: u32,
     set_ids: u32,
+    /// `NFPROTO_*` of every nf_tables message (the table's family).
+    family: u8,
 }
 
 impl Batch {
@@ -149,6 +165,7 @@ impl Batch {
             seq,
             first: seq.wrapping_add(1),
             set_ids: 0,
+            family: FAMILY_IPV4,
         };
         b.header(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 0, NFNL_SUBSYS_NFTABLES);
         b.close_msg();
@@ -182,7 +199,7 @@ impl Batch {
     /// Start an nf_tables message of type `msg`.
     fn begin_msg(&mut self, msg: u16, flags: u16) {
         let kind = (NFNL_SUBSYS_NFTABLES << 8) | msg;
-        self.header(kind, NLM_F_REQUEST | NLM_F_ACK | flags, FAMILY_IPV4, 0);
+        self.header(kind, NLM_F_REQUEST | NLM_F_ACK | flags, self.family, 0);
     }
 
     fn put(&mut self, kind: u16, data: &[u8]) {
@@ -226,6 +243,30 @@ impl Batch {
         self.begin(kind);
         self.put(NFTA_DATA_VALUE, bytes);
         self.end();
+    }
+
+    /// The family of the messages that follow (`ip` by default).
+    pub fn family(&mut self, f: Family) {
+        self.family = f.number();
+    }
+
+    pub fn new_flowtable(&mut self, table: &str, f: &Flowtable) {
+        self.begin_msg(NFT_MSG_NEWFLOWTABLE, NLM_F_CREATE);
+        self.str(NFTA_FLOWTABLE_TABLE, table);
+        self.str(NFTA_FLOWTABLE_NAME, &f.name);
+        self.begin(NFTA_FLOWTABLE_HOOK);
+        self.be32(NFTA_FLOWTABLE_HOOK_NUM, NF_NETDEV_INGRESS);
+        self.put(NFTA_FLOWTABLE_HOOK_PRIORITY, &0i32.to_be_bytes());
+        self.begin(NFTA_FLOWTABLE_HOOK_DEVS);
+        for d in &f.devices {
+            self.str(NFTA_DEVICE_NAME, d);
+        }
+        self.end();
+        self.end();
+        if f.flags() != 0 {
+            self.be32(NFTA_FLOWTABLE_FLAGS, f.flags());
+        }
+        self.close_msg();
     }
 
     pub fn new_table(&mut self, name: &str) {
@@ -360,6 +401,7 @@ impl Batch {
             Expr::Counter => "counter",
             Expr::Drop => "immediate",
             Expr::Queue { .. } => "queue",
+            Expr::FlowAdd { .. } => "flow_offload",
         };
         self.str(NFTA_EXPR_NAME, name);
         self.begin(NFTA_EXPR_DATA);
@@ -456,6 +498,7 @@ impl Batch {
                 self.be32(NFTA_DYNSET_SREG_DATA, *sreg_data);
             }
             Expr::Counter => {}
+            Expr::FlowAdd { table } => self.str(NFTA_FLOW_TABLE_NAME, table),
             Expr::Drop => {
                 self.be32(NFTA_IMMEDIATE_DREG, 0);
                 self.begin(NFTA_IMMEDIATE_DATA);
@@ -482,12 +525,16 @@ impl Batch {
 /// never fails), delete it, create it again with everything in it.
 pub fn replace(t: &Table, seq: u32) -> Batch {
     let mut b = Batch::new(seq);
+    b.family(t.family);
     b.new_table(&t.name);
     b.del_table(&t.name);
-    if t.sets.is_empty() && t.chains.is_empty() {
+    if t.sets.is_empty() && t.chains.is_empty() && t.flowtables.is_empty() {
         return b;
     }
     b.new_table(&t.name);
+    for f in &t.flowtables {
+        b.new_flowtable(&t.name, f);
+    }
     for s in &t.sets {
         b.new_set(&t.name, s);
         b.elements(&t.name, s, &s.elements, true);
@@ -559,6 +606,7 @@ pub fn update(from: &Table, to: &Table, seq: u32) -> Option<Batch> {
         return None;
     }
     let mut b = Batch::new(seq);
+    b.family(to.family);
     for (old, new) in from.sets.iter().zip(&to.sets) {
         if old.elements == new.elements {
             continue;

@@ -277,6 +277,9 @@ pub struct Ip {
     /// `/ip firewall cgnat` (G2.3): CGNAT pools and 1:1 exceptions.
     #[serde(skip_serializing_if = "crate::cgnat::Cgnat::is_empty")]
     pub cgnat: crate::cgnat::Cgnat,
+    /// `/ip firewall fastpath` (G2.4): the flowtable.
+    #[serde(skip_serializing_if = "crate::fastpath::FastPath::is_empty")]
+    pub fastpath: crate::fastpath::FastPath,
     /// `/ip traffic-flow` (G4.4b): IPFIX / NetFlow v9 export.
     #[serde(skip_serializing_if = "crate::traffic_flow::TrafficFlow::is_default")]
     pub traffic_flow: crate::traffic_flow::TrafficFlow,

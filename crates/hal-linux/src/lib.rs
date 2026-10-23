@@ -69,6 +69,10 @@ pub mod ctnl;
 #[cfg(target_os = "linux")]
 mod cgnat;
 
+/// The fast path (flowtable) in the kernel and the cards' eSwitch (G2.4).
+#[cfg(target_os = "linux")]
+mod fastpath;
+
 /// The netfilter queue of first packets of blocks-mode subscribers
 /// (G2.3c): codec pure, socket Linux.
 pub mod nfqueue;
@@ -156,6 +160,8 @@ mod linux {
         cpu: crate::cpu_tuning::Cpu,
         /// CGNAT blocks installed in the kernel (G2.3c).
         cgnat_blocks: crate::cgnat::Blocks,
+        /// What the last apply installed of the fast path (G2.4).
+        fastpath: corerouter_hal::fastpath::FastPathState,
     }
 
     impl LinuxHal {
@@ -436,12 +442,35 @@ mod linux {
                 }
                 return Err(e);
             }
+            // The fast path (G2.4): its own table; rebuilt when the firewall
+            // changed too, so flows a new rule drops leave the flowtable.
+            let fast = corerouter_firewall::fastpath::changed(from, to)
+                || (firewall && self.fastpath.active);
+            if fast && let Err(e) = crate::fastpath::apply(to, &mut self.fastpath) {
+                if cgnat
+                    && let Err(back) =
+                        crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat, &mut self.cgnat_blocks)
+                {
+                    log::error!("restoring the previous CGNAT table: {back}");
+                }
+                if firewall {
+                    let dynamic = crate::nft::dynamic();
+                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
+                    {
+                        log::error!("restoring the previous firewall: {back}");
+                    }
+                }
+                return Err(e);
+            }
             let undo_cgnat = |me: &mut Self| {
                 if cgnat
                     && let Err(back) =
                         crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat, &mut me.cgnat_blocks)
                 {
                     log::error!("restoring the previous CGNAT table: {back}");
+                }
+                if fast && let Err(back) = crate::fastpath::apply(from, &mut me.fastpath) {
+                    log::error!("restoring the previous fast path: {back}");
                 }
             };
             // Ethernet settings next: validated by the engine against what
@@ -568,6 +597,17 @@ mod linux {
             changes: &[corerouter_hal::cgnat::BlockChange],
         ) -> Result<(), HalError> {
             crate::cgnat::set_blocks(changes, &mut self.cgnat_blocks)
+        }
+
+        fn eswitch(
+            &mut self,
+            name: &IfName,
+        ) -> Result<corerouter_hal::fastpath::Eswitch, HalError> {
+            crate::fastpath::eswitch(name.as_str())
+        }
+
+        fn fastpath_state(&mut self) -> corerouter_hal::fastpath::FastPathState {
+            self.fastpath.clone()
         }
 
         fn cgnat_queue(&mut self) -> Result<Box<dyn corerouter_hal::cgnat::CgnatQueue>, HalError> {

@@ -22,6 +22,50 @@ pub const REG32_3: u32 = 11;
 /// `NFPROTO_IPV4`.
 pub const FAMILY_IPV4: u8 = 2;
 
+/// The family of a table: `ip` (CGNAT) or `inet` (both IP versions: the
+/// fast path).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Family {
+    #[default]
+    Ip,
+    Inet,
+}
+
+impl Family {
+    /// `NFPROTO_*`.
+    pub fn number(self) -> u8 {
+        match self {
+            Family::Ip => FAMILY_IPV4,
+            Family::Inet => 1,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Family::Ip => "ip",
+            Family::Inet => "inet",
+        }
+    }
+}
+
+/// A flowtable (`nf_flowtable`): hook ingress, priority 0, on `devices`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Flowtable {
+    pub name: String,
+    pub devices: Vec<String>,
+    /// `flags offload`: the card forwards the flows (`NFT_FLOWTABLE_HW_OFFLOAD`).
+    pub hw_offload: bool,
+    /// `counter` (`NFT_FLOWTABLE_COUNTER`, kernel 5.7+).
+    pub counter: bool,
+}
+
+impl Flowtable {
+    /// `NFTA_FLOWTABLE_FLAGS`.
+    pub fn flags(&self) -> u32 {
+        u32::from(self.hw_offload) | (u32::from(self.counter) << 1)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hook {
     Prerouting,
@@ -343,6 +387,11 @@ pub enum Expr {
     },
     Counter,
     Drop,
+    /// `flow add @<table>` (`flow_offload`): the connection enters the
+    /// flowtable.
+    FlowAdd {
+        table: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -356,10 +405,12 @@ pub struct Rule {
     pub nft: Option<String>,
 }
 
-/// A whole table of family `ip`.
+/// A whole table.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Table {
+    pub family: Family,
     pub name: String,
+    pub flowtables: Vec<Flowtable>,
     pub sets: Vec<Set>,
     pub chains: Vec<Chain>,
     pub rules: Vec<Rule>,
@@ -385,6 +436,8 @@ impl Table {
     /// [`Self::skeleton`] compares, without copying the elements).
     pub fn same_skeleton(&self, other: &Table) -> bool {
         self.name == other.name
+            && self.family == other.family
+            && self.flowtables == other.flowtables
             && self.chains == other.chains
             && self.rules == other.rules
             && self.sets.len() == other.sets.len()
@@ -401,7 +454,23 @@ impl Table {
     /// The table as `nft list table` writes it (and `nft -f` reads it).
     pub fn text(&self) -> String {
         let mut s = String::new();
-        let _ = writeln!(s, "table ip {} {{", self.name);
+        let _ = writeln!(s, "table {} {} {{", self.family.name(), self.name);
+        for f in &self.flowtables {
+            let devices: Vec<&str> = f.devices.iter().map(String::as_str).collect();
+            let _ = writeln!(
+                s,
+                "\tflowtable {} {{\n\t\thook ingress priority filter;\n\t\tdevices = {{ {} }}",
+                f.name,
+                devices.join(", ")
+            );
+            if f.hw_offload {
+                let _ = writeln!(s, "\t\tflags offload");
+            }
+            if f.counter {
+                let _ = writeln!(s, "\t\tcounter");
+            }
+            let _ = writeln!(s, "\t}}");
+        }
         for set in &self.sets {
             let what = if set.data.is_some() { "map" } else { "set" };
             let _ = writeln!(s, "\t{what} {} {{", set.name);
