@@ -50,7 +50,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use corerouter_hal::Hal;
-    use corerouter_hal_linux::LinuxHal;
+    use corerouter_hal_linux::{LinuxHal, Policy};
     use corerouter_model::Config;
     use criterion::{Criterion, Throughput};
     use nix::ifaddrs::getifaddrs;
@@ -165,7 +165,11 @@ mod linux {
             Self {
                 sock: None,
                 frames: Vec::new(),
-                hal: LinuxHal::new(),
+                // veth and dummy are managed only when listed.
+                hal: LinuxHal::with_policy(Policy {
+                    manage: vec!["fa".into(), "fb".into(), "fo".into()],
+                    unmanaged: Vec::new(),
+                }),
                 applied: Config::default(),
             }
         }
@@ -173,13 +177,14 @@ mod linux {
         /// Apply `values` like the router does, then make the links again:
         /// an interface takes `conf.default.*` when it is created, and the
         /// kernel uses the larger `rp_filter` of `all` and the interface.
-        fn tune(&mut self, values: &[(&str, i64)]) {
+        fn tune(&mut self, values: &[(&str, i64)], ports: &[(&str, &str, i64)]) {
             let mut to = Config::default();
             for (n, v) in values {
                 to.system.tuning.sysctl.insert((*n).to_owned(), *v);
             }
+            // The links are made again below: no port settings until then.
             self.hal.apply(&self.applied, &to).unwrap();
-            self.applied = to;
+            self.applied = to.clone();
             self.sock = None;
             let _ = Command::new("ip").args(["link", "del", "fa"]).output();
             let _ = Command::new("ip").args(["link", "del", "fo"]).output();
@@ -197,6 +202,17 @@ mod linux {
             bind(sock.as_raw_fd(), &fa).unwrap();
             self.frames = (0..=255u8).map(|h| frame(fb_mac, fa_mac, h)).collect();
             self.sock = Some(sock);
+            // Port settings (G1.26b) on the fresh links.
+            for (port, key, v) in ports {
+                to.system
+                    .tuning
+                    .ports
+                    .entry(port.parse().unwrap())
+                    .or_default()
+                    .insert((*key).to_owned(), *v);
+            }
+            self.hal.apply(&self.applied, &to).unwrap();
+            self.applied = to;
             self.burst(BURST); // warm the route and neighbor caches
         }
 
@@ -229,28 +245,41 @@ mod linux {
         g.throughput(Throughput::Elements(BURST));
         g.sample_size(20);
         // A common distribution default (strict reverse path filter).
-        lab.tune(&[
-            ("net.ipv4.ip_forward", 1),
-            ("net.ipv4.conf.all.rp_filter", 1),
-            ("net.ipv4.conf.default.rp_filter", 1),
-        ]);
+        lab.tune(
+            &[
+                ("net.ipv4.ip_forward", 1),
+                ("net.ipv4.conf.all.rp_filter", 1),
+                ("net.ipv4.conf.default.rp_filter", 1),
+            ],
+            &[],
+        );
         g.bench_function("udp64/before (rp_filter strict)", |b| {
             b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
         });
         let (_, got) = lab.burst(BURST);
         eprintln!("before: {got} of {BURST} frames forwarded");
         // What the throughput profile sets in a namespace.
-        lab.tune(&[
+        let profile = [
             ("net.ipv4.ip_forward", 1),
             ("net.ipv4.conf.all.rp_filter", 0),
             ("net.ipv4.conf.default.rp_filter", 0),
             ("net.ipv4.fib_multipath_hash_policy", 1),
-        ]);
+        ];
+        lab.tune(&profile, &[]);
         g.bench_function("udp64/after (throughput profile)", |b| {
             b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
         });
         let (_, got) = lab.burst(BURST);
         eprintln!("after: {got} of {BURST} frames forwarded");
+        // G1.26b: the egress port's root qdisc. A dummy (or veth) has
+        // `noqueue`; fq_codel, the AQM the profile gives a single-queue
+        // NIC, costs some per-packet work.
+        lab.tune(&profile, &[("fo", "qdisc", 0)]);
+        g.bench_function("udp64/after + fq_codel on the egress port", |b| {
+            b.iter_custom(|iters| (0..iters).map(|_| lab.burst(BURST).0).sum())
+        });
+        let (_, got) = lab.burst(BURST);
+        eprintln!("after + fq_codel: {got} of {BURST} frames forwarded");
         g.finish();
     }
 }

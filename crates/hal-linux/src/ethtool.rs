@@ -33,7 +33,11 @@ const LINKSTATE_GET: u8 = 6;
 const FEATURES_GET: u8 = 11;
 const FEATURES_SET: u8 = 12;
 const RINGS_GET: u8 = 15;
+const RINGS_SET: u8 = 16;
 const CHANNELS_GET: u8 = 17;
+const CHANNELS_SET: u8 = 18;
+const COALESCE_GET: u8 = 19;
+const COALESCE_SET: u8 = 20;
 const PAUSE_GET: u8 = 21;
 const PAUSE_SET: u8 = 22;
 const CABLE_TEST_ACT: u8 = 26;
@@ -54,6 +58,23 @@ const PAUSE_TX: u16 = 4;
 const FEATURES_HW: u16 = 2;
 const FEATURES_WANTED: u16 = 3;
 const FEATURES_ACTIVE: u16 = 4;
+
+// `ETHTOOL_A_RINGS_*`, `ETHTOOL_A_CHANNELS_*`, `ETHTOOL_A_COALESCE_*`
+// (G1.26b).
+const RINGS_RX_MAX: u16 = 2;
+const RINGS_TX_MAX: u16 = 5;
+const RINGS_RX: u16 = 6;
+const RINGS_TX: u16 = 9;
+const CHANNELS_RX_MAX: u16 = 2;
+const CHANNELS_TX_MAX: u16 = 3;
+const CHANNELS_COMBINED_MAX: u16 = 5;
+const CHANNELS_RX: u16 = 6;
+const CHANNELS_TX: u16 = 7;
+const CHANNELS_COMBINED: u16 = 9;
+const COALESCE_RX_USECS: u16 = 2;
+const COALESCE_TX_USECS: u16 = 6;
+const COALESCE_ADAPTIVE_RX: u16 = 11;
+const COALESCE_ADAPTIVE_TX: u16 = 12;
 
 // `ETHTOOL_A_MODULE_EEPROM_*`.
 const EEPROM_OFFSET: u16 = 2;
@@ -285,6 +306,112 @@ impl Ethtool {
             m.end().end();
         })
         .map(|_| ())
+    }
+
+    /// Rings, channels and interrupt coalescing (G1.26b), by
+    /// `corerouter_model::tuning::PORT_PARAMS` key: current values and
+    /// the NIC's maxima. A query the driver lacks leaves its keys out (and
+    /// a note); a maximum of 0 means the NIC has no such knob.
+    pub fn tuning(&mut self) -> (BTreeMap<String, i64>, BTreeMap<String, i64>) {
+        let mut now = BTreeMap::new();
+        let mut max = BTreeMap::new();
+        let put = |m: &mut BTreeMap<String, i64>, k: &str, v: Option<u32>| {
+            if let Some(v) = v {
+                m.insert(k.to_owned(), i64::from(v));
+            }
+        };
+        if let Some(a) = self.get("rings", RINGS_GET, 1, 0) {
+            for at in attrs(&a) {
+                match at.kind {
+                    RINGS_RX_MAX => put(&mut max, "rx_ring", at.u32()),
+                    RINGS_TX_MAX => put(&mut max, "tx_ring", at.u32()),
+                    RINGS_RX => put(&mut now, "rx_ring", at.u32()),
+                    RINGS_TX => put(&mut now, "tx_ring", at.u32()),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(a) = self.get("channels", CHANNELS_GET, 1, 0) {
+            for at in attrs(&a) {
+                match at.kind {
+                    CHANNELS_RX_MAX => put(&mut max, "rx_channels", at.u32()),
+                    CHANNELS_TX_MAX => put(&mut max, "tx_channels", at.u32()),
+                    CHANNELS_COMBINED_MAX => put(&mut max, "combined_channels", at.u32()),
+                    CHANNELS_RX => put(&mut now, "rx_channels", at.u32()),
+                    CHANNELS_TX => put(&mut now, "tx_channels", at.u32()),
+                    CHANNELS_COMBINED => put(&mut now, "combined_channels", at.u32()),
+                    _ => {}
+                }
+            }
+        }
+        if let Some(a) = self.get("coalesce", COALESCE_GET, 1, 0) {
+            for at in attrs(&a) {
+                match at.kind {
+                    COALESCE_RX_USECS => put(&mut now, "rx_usecs", at.u32()),
+                    COALESCE_TX_USECS => put(&mut now, "tx_usecs", at.u32()),
+                    COALESCE_ADAPTIVE_RX => put(&mut now, "adaptive_rx", at.u8().map(u32::from)),
+                    COALESCE_ADAPTIVE_TX => put(&mut now, "adaptive_tx", at.u8().map(u32::from)),
+                    _ => {}
+                }
+            }
+        }
+        // A knob with a maximum of 0 does not exist on this NIC.
+        for (k, m) in &max {
+            if *m == 0 {
+                now.remove(k);
+            }
+        }
+        max.retain(|_, m| *m > 0);
+        (now, max)
+    }
+
+    /// `RINGS_SET` / `CHANNELS_SET` / `COALESCE_SET` of `values` (keys of
+    /// one group only: the caller groups them, one request per group).
+    pub fn set_tuning(&mut self, values: &BTreeMap<String, i64>) -> Result<(), GenlError> {
+        let mut rings = Vec::new();
+        let mut channels = Vec::new();
+        let mut coalesce_u32 = Vec::new();
+        let mut coalesce_u8 = Vec::new();
+        for (k, v) in values {
+            let v32 = u32::try_from(*v).unwrap_or(0);
+            match k.as_str() {
+                "rx_ring" => rings.push((RINGS_RX, v32)),
+                "tx_ring" => rings.push((RINGS_TX, v32)),
+                "rx_channels" => channels.push((CHANNELS_RX, v32)),
+                "tx_channels" => channels.push((CHANNELS_TX, v32)),
+                "combined_channels" => channels.push((CHANNELS_COMBINED, v32)),
+                "rx_usecs" => coalesce_u32.push((COALESCE_RX_USECS, v32)),
+                "tx_usecs" => coalesce_u32.push((COALESCE_TX_USECS, v32)),
+                "adaptive_rx" => coalesce_u8.push((COALESCE_ADAPTIVE_RX, u8::from(*v != 0))),
+                "adaptive_tx" => coalesce_u8.push((COALESCE_ADAPTIVE_TX, u8::from(*v != 0))),
+                _ => {}
+            }
+        }
+        if !rings.is_empty() {
+            self.request(RINGS_SET, 1, 0, |m| {
+                for (k, v) in &rings {
+                    m.u32(*k, *v);
+                }
+            })?;
+        }
+        if !channels.is_empty() {
+            self.request(CHANNELS_SET, 1, 0, |m| {
+                for (k, v) in &channels {
+                    m.u32(*k, *v);
+                }
+            })?;
+        }
+        if !coalesce_u32.is_empty() || !coalesce_u8.is_empty() {
+            self.request(COALESCE_SET, 1, 0, |m| {
+                for (k, v) in &coalesce_u32 {
+                    m.u32(*k, *v);
+                }
+                for (k, v) in &coalesce_u8 {
+                    m.u8(*k, *v);
+                }
+            })?;
+        }
+        Ok(())
     }
 
     /// `len` bytes (at most 128, not across offset 128) of `page` at I²C

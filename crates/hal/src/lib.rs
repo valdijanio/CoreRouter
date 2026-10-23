@@ -365,6 +365,16 @@ pub trait Hal: Send {
         )))
     }
 
+    /// Port `name`'s tuning settings (rings, queues, coalescing,
+    /// transmit queue, `rp_filter`) and the NIC's maxima (G1.26b).
+    fn port_tuning(&mut self, name: &IfName) -> Result<tuning::PortTuning, HalError> {
+        let _ = name;
+        Err(HalError::Unsupported(format!(
+            "{} has no port settings",
+            self.describe()
+        )))
+    }
+
     /// Counters behind the tuning diagnosis.
     fn kernel_stats(&mut self) -> Result<tuning::KernelStats, HalError> {
         Err(HalError::Unsupported(format!(

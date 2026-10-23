@@ -26,8 +26,12 @@ fn panel(h: &mut Harness) -> &mut TuningPanel {
 
 #[test]
 fn every_parameter_is_explained_in_both_languages() {
-    for p in corerouter_model::tuning::PARAMS {
-        let key = format!("tuning.{}", p.name);
+    use corerouter_model::tuning::{PARAMS, PORT_PARAMS};
+    let keys = PARAMS
+        .iter()
+        .map(|p| format!("tuning.{}", p.name))
+        .chain(PORT_PARAMS.iter().map(|p| format!("tuning.port.{}", p.name)));
+    for key in keys {
         for l in [Lang::En, Lang::Pt] {
             let got = i18n::explain(Langs { labels: l, help: l }, &key);
             assert_eq!(got.map(|(l, _)| l), Some(l), "{key} in {l:?}");
@@ -103,7 +107,7 @@ fn kernel_tab_lists_edits_and_explains() {
     // ⓘ: explanation in Portuguese, the value recommended here and the
     // command, with English labels.
     let p = rows.iter().find(|p| p.name == "net.core.netdev_budget").unwrap().clone();
-    panel(&mut h).help = Some(crate::tuning::explanation(&p, &p.why));
+    panel(&mut h).help = Some(crate::tuning::explanation(&p, &p.why, &crate::tuning::Scope::Kernel));
     h.idle();
     h.idle();
     assert!(h.has_text("O que faz"));
@@ -176,4 +180,54 @@ fn numbers_read_well() {
     assert_eq!(grouped(i64::MIN), "-9 223 372 036 854 775 808");
     assert_eq!(cpu_ranges(&[0, 1, 2, 3, 8, 10, 11]), "0–3,8,10–11");
     assert_eq!(cpu_ranges(&[]), "");
+}
+
+#[test]
+fn interfaces_tab_lists_a_port_edits_it_and_applies_the_profile() {
+    let mut h = open(Tab::Interfaces);
+    refresh(&mut h);
+    assert_eq!(panel(&mut h).port.as_deref(), Some("ether1"), "the first port");
+    assert!(h.has_text("Rings and queues (3)"));
+    assert!(h.has_text("rx_ring"));
+    assert!(h.has_text("flaps link"));
+    assert!(h.has_text("fixed"), "LRO of the lab NIC");
+    assert!(h.has_text("16 – 4096"), "range up to the NIC's maximum");
+
+    // Edit rx_ring of ether1.
+    h.click(h.text("rx_ring"));
+    h.idle();
+    panel(&mut h).edit = "4096".into();
+    h.idle();
+    h.click(h.text("Set"));
+    refresh(&mut h);
+    let set = lock(&h.session).store().running().system.tuning.ports.clone();
+    assert_eq!(
+        set.get(&"ether1".parse().unwrap()).and_then(|m| m.get("rx_ring")),
+        Some(&4096),
+        "{:?}",
+        h.app.log()
+    );
+    // ⓘ of a port setting: its own explanation and the port command.
+    let rows = params(
+        &panel(&mut h).port_print.as_ref().unwrap()["ports"][0],
+    );
+    let p = rows.iter().find(|p| p.name == "rx_ring").unwrap().clone();
+    panel(&mut h).help = Some(crate::tuning::explanation(
+        &p,
+        &p.why,
+        &crate::tuning::Scope::Port("ether1".into()),
+    ));
+    h.idle();
+    h.idle();
+    assert!(h.has_text_containing("Descritores no anel de RX"));
+    assert!(h.has_text_containing("/system tuning interface set name=ether1 key=rx_ring"));
+    panel(&mut h).help = None;
+    h.idle();
+
+    // Apply to all ports, inside Safe Mode.
+    h.click(h.text("Apply to all ports with Safe Mode"));
+    refresh(&mut h);
+    let s = lock(&h.session);
+    assert!(s.in_safe_mode());
+    assert_eq!(s.store().running().system.tuning.ports.len(), 8, "{:?}", h.app.log());
 }

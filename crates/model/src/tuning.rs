@@ -8,10 +8,16 @@
 //! one out puts back the value the kernel had before CoreRouter first
 //! changed it. [`PARAMS`] is the catalog: which kernel parameters exist
 //! here, where the window shows them and the values they accept.
+//! [`PORT_PARAMS`] is the same for the settings of each port (G1.26b):
+//! rings, queues, interrupt coalescing, transmit queue and filter, kept in
+//! [`Tuning::ports`]; its offload and flow-control rows live in the port's
+//! `ethernet` settings (`interface.ethernet.set`, G1.20).
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
+
+use crate::types::IfName;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -20,6 +26,10 @@ pub struct Tuning {
     /// the value to keep there. Only names of [`PARAMS`].
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub sysctl: BTreeMap<String, i64>,
+    /// Settings of each port (G1.26b), by [`PORT_PARAMS`] key
+    /// (`rx_ring`): the value to keep there.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub ports: BTreeMap<IfName, BTreeMap<String, i64>>,
 }
 
 impl Tuning {
@@ -63,6 +73,13 @@ pub struct Param {
     /// Affects the router's own sockets (BGP, the API), not forwarded
     /// traffic.
     pub control_plane: bool,
+    /// Changing it resets the port: the link goes down for a moment.
+    pub link_flap: bool,
+    /// Valid from the next boot only.
+    pub reboot: bool,
+    /// A port setting kept in the port's `ethernet` settings (offloads,
+    /// flow control: `interface.ethernet.set`), not in [`Tuning::ports`].
+    pub ethernet: bool,
 }
 
 const OFF_ON: &[(i64, &str)] = &[(0, "off"), (1, "on")];
@@ -97,6 +114,9 @@ const fn p(
         init_ns_only: false,
         obsolete: false,
         control_plane: false,
+        link_flap: false,
+        reboot: false,
+        ethernet: false,
     }
 }
 
@@ -321,6 +341,82 @@ pub const PARAMS: &[Param] = &[
     )),
 ];
 
+pub const SEC_RINGS: &str = "Rings and queues";
+pub const SEC_COALESCE: &str = "Interrupt coalescing";
+pub const SEC_OFFLOADS: &str = "Offloads";
+pub const SEC_FLOW: &str = "Flow control";
+pub const SEC_TXQ: &str = "Transmit queue";
+pub const SEC_FILTER: &str = "Filtering";
+
+/// Root queueing disciplines a port may get, by code.
+pub const QDISCS: &[(i64, &str)] = &[
+    (0, "fq_codel"),
+    (1, "fq"),
+    (2, "pfifo_fast"),
+    (3, "mq"),
+    (4, "noqueue"),
+];
+
+const fn port(mut p: Param) -> Param {
+    p.tab = Tab::Interfaces;
+    p
+}
+
+const fn flaps(mut p: Param) -> Param {
+    p.link_flap = true;
+    p
+}
+
+const fn ethernet(mut p: Param) -> Param {
+    p.ethernet = true;
+    p
+}
+
+/// The settings of each port, in display order. The maxima of rings and
+/// queues come from the NIC (the engine narrows them per port).
+pub const PORT_PARAMS: &[Param] = &[
+    port(flaps(p("rx_ring", SEC_RINGS, (16, 65_536), "descriptors", None))),
+    port(flaps(p("tx_ring", SEC_RINGS, (16, 65_536), "descriptors", None))),
+    port(flaps(p("combined_channels", SEC_RINGS, (1, 4096), "queues", None))),
+    port(flaps(p("rx_channels", SEC_RINGS, (1, 4096), "queues", None))),
+    port(flaps(p("tx_channels", SEC_RINGS, (1, 4096), "queues", None))),
+    port(choice("adaptive_rx", SEC_COALESCE, OFF_ON, 1)),
+    port(p("rx_usecs", SEC_COALESCE, (0, 10_000), "µs", None)),
+    port(choice("adaptive_tx", SEC_COALESCE, OFF_ON, 1)),
+    port(p("tx_usecs", SEC_COALESCE, (0, 10_000), "µs", None)),
+    port(ethernet(choice("gro", SEC_OFFLOADS, OFF_ON, 1))),
+    port(ethernet(choice("lro", SEC_OFFLOADS, OFF_ON, 0))),
+    port(ethernet(choice("tso", SEC_OFFLOADS, OFF_ON, 1))),
+    port(ethernet(choice("gso", SEC_OFFLOADS, OFF_ON, 1))),
+    port(ethernet(choice("rx_pause", SEC_FLOW, OFF_ON, 0))),
+    port(ethernet(choice("tx_pause", SEC_FLOW, OFF_ON, 0))),
+    port(p("txqueuelen", SEC_TXQ, (0, 100_000), "packets", Some(1000))),
+    port(qdisc()),
+    port(choice("rp_filter", SEC_FILTER, RP_FILTER, 0)),
+];
+
+const fn qdisc() -> Param {
+    let mut q = p("qdisc", SEC_TXQ, (0, 4), "", None);
+    q.choices = QDISCS;
+    q
+}
+
+/// The kernel feature behind an offload row (`gro` → `rx-gro`).
+pub fn offload_feature(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "gro" => "rx-gro",
+        "lro" => "rx-lro",
+        "tso" => "tx-tcp-segmentation",
+        "gso" => "tx-generic-segmentation",
+        _ => return None,
+    })
+}
+
+/// The catalog entry of port setting `key`.
+pub fn port_param(key: &str) -> Option<&'static Param> {
+    PORT_PARAMS.iter().find(|p| p.name == key)
+}
+
 /// The catalog entry of `name`.
 pub fn param(name: &str) -> Option<&'static Param> {
     PARAMS.iter().find(|p| p.name == name)
@@ -373,6 +469,12 @@ mod tests {
                 assert_eq!(*v, i as i64, "{} choices are 0..n", p.name);
             }
         }
+        for p in PORT_PARAMS {
+            assert_eq!(p.tab, Tab::Interfaces, "{}", p.name);
+            assert!(p.min <= p.max, "{}", p.name);
+            assert_eq!(p.ethernet, offload_feature(p.name).is_some() || p.name.ends_with("_pause"));
+        }
+        assert_eq!(port_param("rx_ring").map(|p| p.link_flap), Some(true));
         assert_eq!(proc_path("net.core.netdev_budget"), "net/core/netdev_budget");
         assert!(is_conntrack("net.netfilter.nf_conntrack_max"));
         assert!(!is_conntrack("net.core.somaxconn"));
@@ -385,6 +487,10 @@ mod tests {
         assert_eq!(serde_json::to_string(&t).unwrap(), "{}");
         let mut t = Tuning::default();
         t.sysctl.insert("net.core.netdev_budget".into(), 600);
+        t.ports
+            .entry("ether1".parse().unwrap())
+            .or_default()
+            .insert("rx_ring".into(), 4096);
         let back: Tuning = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
         assert_eq!(back, t);
         assert_eq!(
