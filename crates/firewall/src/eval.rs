@@ -229,7 +229,7 @@ mod tests {
             interface_lists: crate::sample::sample().interface_lists,
             ..Config::default()
         };
-        c.ip.firewall.filter = rules;
+        c.ip.firewall.filter = rules.into();
         c
     }
 
@@ -320,7 +320,7 @@ mod tests {
             )
             .unwrap(),
         ]);
-        c.ip.firewall.address_lists = crate::sample::sample().ip.firewall.address_lists;
+        c.ip.firewall.address_lists = crate::sample::sample().ip.firewall.address_lists.clone();
         let p = ssh("203.0.113.5", "ether1", ConnState::New);
         assert_eq!(
             walk(&c, &[], Table::Filter, "input", &p).rule,

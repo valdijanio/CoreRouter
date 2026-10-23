@@ -15,6 +15,7 @@ use std::str::FromStr;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::cow::CowArc;
 use crate::types::{IfName, ItemId, ParseError};
 
 /// Implements Serialize/Deserialize through `Display` + `FromStr`.
@@ -89,8 +90,11 @@ impl fmt::Display for Table {
 /// A name the operator gives: address list, interface list, chain, mark.
 /// 1..=63 bytes of ASCII letters, digits, `-`, `_`, `.` — safe to embed in
 /// an nftables identifier without quoting.
+///
+/// Shared text: copying an address list (65 536 entries, each naming its
+/// list) copies no strings (G0.16).
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct Name(String);
+pub struct Name(std::sync::Arc<str>);
 
 impl Name {
     pub const MAX: usize = 63;
@@ -121,7 +125,7 @@ impl FromStr for Name {
                 "allowed: ASCII letters, digits, '-', '_', '.'",
             ));
         }
-        Ok(Name(s.to_owned()))
+        Ok(Name(s.into()))
     }
 }
 
@@ -1252,10 +1256,11 @@ pub struct DynamicAddress {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Firewall {
-    pub filter: Vec<FirewallRule>,
-    pub nat: Vec<FirewallRule>,
-    pub mangle: Vec<FirewallRule>,
-    pub address_lists: Vec<AddressListEntry>,
+    // Each table is shared between copies of the config until written (G0.16).
+    pub filter: CowArc<Vec<FirewallRule>>,
+    pub nat: CowArc<Vec<FirewallRule>>,
+    pub mangle: CowArc<Vec<FirewallRule>>,
+    pub address_lists: CowArc<Vec<AddressListEntry>>,
     /// Next rule id (shared by the three tables; never reused).
     pub next_rule_id: u32,
     pub next_address_list_id: u32,

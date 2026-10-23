@@ -276,6 +276,8 @@ impl Session {
         // (`queries_leave_the_candidate_alone` runs every one of them).
         // Inside an atomic batch a failed step undoes the whole batch from
         // its own copy: one per step made `/import` quadratic (audit-perf).
+        // The copy shares every section with the candidate (G0.16): the
+        // command pays for copying only the sections it writes.
         let in_atomic = self.ext::<AtomicBatch>().is_some_and(|a| a.0);
         let snapshot = (spec.journal && !in_atomic).then(|| self.store.candidate().clone());
         let rev_before = self.store.current_revision();

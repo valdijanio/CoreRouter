@@ -871,7 +871,9 @@ pub(super) fn al_add(s: &mut Session, p: &Value) -> Result<Value> {
         .firewall
         .address_lists
         .iter()
-        .any(|e| e.list == list && e.address == address)
+        // The address first: compared in place, the list name is behind a
+        // pointer (G0.16).
+        .any(|e| e.address == address && e.list == list)
         || s.dynamic_addresses.find(&list, &address).is_some();
     if duplicate {
         return Err(EngineError::bad(
@@ -980,7 +982,7 @@ fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
         .firewall
         .address_lists
         .iter()
-        .any(|o| o.id != id && o.list == e.list && o.address == e.address)
+        .any(|o| o.id != id && o.address == e.address && o.list == e.list)
         || s.dynamic_addresses.find(&e.list, &e.address).is_some()
     {
         return Err(EngineError::bad(

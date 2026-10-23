@@ -76,7 +76,7 @@ fn build() -> Option<Config> {
     section.comment = "Router protection".into();
     let mut disabled = rule(9, "input", Matchers::default(), Action::Drop)?;
     disabled.disabled = true;
-    fw.filter = vec![
+    *fw.filter = vec![
         section,
         rule(
             2,
@@ -176,7 +176,7 @@ fn build() -> Option<Config> {
         )?,
         rule(13, "output", m(&[("protocol", "icmpv6")])?, Action::Accept)?,
     ];
-    fw.nat = vec![
+    *fw.nat = vec![
         rule(
             14,
             "srcnat",
@@ -212,7 +212,7 @@ fn build() -> Option<Config> {
             act(r#"{"type": "dst-nat", "to_addresses": "2001:db8::20", "to_ports": "8443"}"#)?,
         )?,
     ];
-    fw.mangle = vec![
+    *fw.mangle = vec![
         rule(
             18,
             "prerouting",

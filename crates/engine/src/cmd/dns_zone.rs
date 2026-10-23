@@ -325,7 +325,7 @@ fn commit_zones(s: &mut Session, dz: DnsZones, key: &str) -> Result<()> {
     if let Some(why) = dz.problem() {
         return Err(EngineError::bad(key, why));
     }
-    s.store_mut().candidate_mut().ip.dns_zones = dz;
+    s.store_mut().candidate_mut().ip.dns_zones = dz.into();
     Ok(())
 }
 
