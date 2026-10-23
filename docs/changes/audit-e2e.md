@@ -39,11 +39,11 @@ Corrigido (cada um com teste que falha na `main`):
   um pedido cuja resposta se perdeu **não** é reenviado ("may or may not have run").
   `Client::is_stale` detecta o fechamento entre pedidos. Testes:
   `mcp/tests/remote_reconnect.rs` (3).
-- **`/import` grande era quadrático (média, desempenho).** Cada passo de um `engine.batch`
-  atômico copiava o candidate inteiro (ponto de rollback próprio), embora o batch já guarde um.
-  Medido no daemon (release): 20 000 entradas de address-list 22,8 s → 0,62 s; 10 000 rotas
-  18,3 s → 0,25 s; 4000 regras 1,02 s → 0,08 s. Benchmark novo `engine/benches/batch_import.rs`
-  (abaixo). Mudança pequena em `session.rs` (`in_batch: Option<bool>`).
+- **`/import` grande era quadrático (média, desempenho) — corrigido pelo #130 (audit-perf).**
+  Cada passo de um `engine.batch` atômico copiava o candidate inteiro. Achado aqui no daemon
+  (release: 20 000 entradas de address-list 22,8 s, 10 000 rotas 18,3 s); a correção que ficou é
+  a do #130 (`AtomicBatch` nas extensões da sessão). Este PR só acrescenta o benchmark
+  `engine/benches/batch_import.rs` e os números de ponta a ponta (abaixo).
 - **`/export` de um bond saía com nota falsa (baixa).** O bond aparece em `/interface` (tipo
   `bonding`) e em `/interface bonding`, que tem `print` próprio: o export trazia
   `# add name=bond1: slaves is not exported` (como se fosse segredo) ao lado do `add` correto.
@@ -68,10 +68,10 @@ até falar; em Safe Mode, mudanças de outro cliente também são desfeitas (com
 
 Para outras frentes (não mexido aqui):
 
-- **Desempenho (persistência):** cada commit regrava o arquivo inteiro com o histórico; com 4000
-  regras + 20 000 entradas + 10 000 rotas o `running.json` bate no teto de 32 MiB e um commit
-  leva p50 110 ms / máx. 297 ms (release, **medido**); 16 clientes ficam em ~77 commits/s com
-  p50 de 208 ms de fila.
+- **Desempenho (persistência):** antes do #130 cada commit regravava o arquivo inteiro com o
+  histórico (`running.json` no teto de 32 MiB, commit p50 110 ms / máx. 297 ms com 4000 regras
+  + 20 000 entradas + 10 000 rotas). Resolvido pelo #130 (revisões em arquivos, G1.23): mesma
+  config, commit p50 36 ms / máx. 55 ms (release, **medido**).
 - **DNS:** com `--backend virtual`, `allow_remote_requests` abre o encaminhador em
   `0.0.0.0`/`[::]` do host (a ACL `allowed_from` filtra, mas a porta fica exposta em todas as
   interfaces da máquina de desenvolvimento).
@@ -80,24 +80,28 @@ Para outras frentes (não mexido aqui):
 
 ## perf
 
-### audit-e2e — batch atômico sem cópia do candidate por passo (**medido**)
+### audit-e2e — import grande ponta a ponta (**medido**)
 
 AMD Ryzen AI MAX+ 395 (32 CPUs), build release, 2026-10-22. `cargo bench -p corerouter-engine
---bench batch_import` (N entradas de address-list num `Session::batch` atômico, lab novo):
+--bench batch_import` (N entradas de address-list num `Session::batch` atômico, lab novo), antes
+= `main` anterior ao #130, depois = `main` com o `AtomicBatch` do #130:
 
 | N | antes | depois | mudança |
 |---|---|---|---|
-| 1000 | 16,4 ms | 4,67 ms | −72,7% |
-| 4000 | 237 ms | 29,3 ms | −87,9% |
+| 1000 | 16,4 ms | 3,49 ms | −78,7% |
+| 4000 | 237 ms | 29,4 ms | −87,6% |
 
-No daemon real (release, um `engine.batch` por bloco): 4000 regras 1,02 s → 0,08 s; 20 000
-entradas de address-list 22,8 s → 0,62 s; 10 000 rotas 18,3 s → 0,25 s; 10 000 concessões fixas
-64,0 s → 17,0 s (resto: G0.18).
+No daemon real (release, um `engine.batch` por bloco), antes → depois do #130: 4000 regras
+1,02 s → 0,06 s; 20 000 entradas de address-list 22,8 s → 0,54 s; 10 000 rotas 18,3 s → 0,17 s;
+10 000 concessões fixas 64,0 s → 17,0 s (resto: G0.18). Commit com essa config: p50 110 ms →
+36 ms, máx. 297 ms → 55 ms.
 
-Memória do daemon (VmRSS/VmHWM de `/proc/<pid>/status`, release, backend virtual): ocioso
+Memória do daemon (VmRSS/VmHWM de `/proc/<pid>/status`, release, backend virtual, medido antes
+do #130): ocioso
 10,8 MiB; + 4000 regras 47 MiB; + 20 000 entradas de address-list 137 MiB; + 10 000 rotas
-150 MiB (pico 257 MiB durante os commits seguintes, que serializam o arquivo de 32 MiB);
+150 MiB (pico 257 MiB durante os commits seguintes, que serializavam o arquivo de 32 MiB; com o
+#130: 118 MiB depois das rotas, 220 MiB após 20 commits);
 + 10 000 concessões fixas 244 MiB (pico 310 MiB); cache DNS com 50 000 nomes distintos
 (encaminhador em loopback, upstream DoH local) 289 MiB, pico 354 MiB. Concessões dinâmicas não
 foram medidas (o lab virtual não tem caminho de DHCP sem namespace). 16 clientes × 60 s de
-escritas mistas: 4665 commits, 77/s, p50 208 ms, p99 450 ms, 0 erros; RSS 217 MiB.
+escritas mistas (antes do #130): 4665 commits, 77/s, p50 208 ms, p99 450 ms, 0 erros; RSS 217 MiB.
