@@ -162,6 +162,15 @@ impl DnsBackend for RouterDns {
         self.resolver.cache_rows(self.now_ms())
     }
 
+    fn cache_rows_matching(&self, name: Option<&str>, qtype: Option<&str>, limit: usize) -> Vec<CacheRow> {
+        self.resolver
+            .cache_rows_matching(self.now_ms(), name, qtype, limit)
+    }
+
+    fn cache_len(&self) -> usize {
+        self.resolver.cache_len()
+    }
+
     fn cache_used_bytes(&self) -> usize {
         self.resolver.cache_used_bytes()
     }

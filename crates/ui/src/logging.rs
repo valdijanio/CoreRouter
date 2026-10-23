@@ -368,7 +368,7 @@ fn some(sel: &[String], what: &str) -> Result<(), String> {
     }
 }
 
-fn can_enable(rules: &[Value], sel: &[String], enable: bool) -> Result<(), String> {
+fn can_enable(rules: &[Value], sel: &table::Selection, enable: bool) -> Result<(), String> {
     some(sel, "rules")?;
     let any = rules
         .iter()
@@ -549,7 +549,7 @@ impl LogPanel {
             }
             let remove = can.and(remove_cmd, some(&selection, what));
             if table::tool(ui, salt, Icon::Remove, "Remove", remove).clicked() {
-                act = Some(Act::Remove(selection.clone()));
+                act = Some(Act::Remove(selection.to_vec()));
             }
             if rules_tab {
                 let tools = [
@@ -560,9 +560,9 @@ impl LogPanel {
                     let ok = can.and(set_cmd, can_enable(&rules, &selection, enable));
                     if table::tool(ui, salt, icon, tip, ok).clicked() {
                         act = Some(if enable {
-                            Act::Enable(selection.clone())
+                            Act::Enable(selection.to_vec())
                         } else {
-                            Act::Disable(selection.clone())
+                            Act::Disable(selection.to_vec())
                         });
                     }
                 }
@@ -626,10 +626,10 @@ impl LogPanel {
             };
             if allowed {
                 act = Some(match s {
-                    Shortcut::Remove => Act::Remove(sel),
-                    Shortcut::Enable => Act::Enable(sel),
-                    Shortcut::Disable => Act::Disable(sel),
-                    Shortcut::Comment | Shortcut::Open => Act::Open(sel),
+                    Shortcut::Remove => Act::Remove(sel.into_vec()),
+                    Shortcut::Enable => Act::Enable(sel.into_vec()),
+                    Shortcut::Disable => Act::Disable(sel.into_vec()),
+                    Shortcut::Comment | Shortcut::Open => Act::Open(sel.into_vec()),
                 });
             }
         }

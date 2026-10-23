@@ -35,7 +35,7 @@ corerouter-cli --connect 127.0.0.1:7979 run ip.dns.cache.flush
 |---|---|
 | `ip.dns.set` | `servers` (endereços IP, até 8), `allow_remote_requests` (aceito, vale na G4.1b), `cache_size` (KiB, 0 desliga), `cache_max_ttl_secs`, `query_server_timeout_ms`, `query_total_timeout_ms`, `max_udp_packet_size` |
 | `ip.dns.get` | a config + `dynamic_servers` (DHCP `use_peer_dns`), `cache_used` (KiB), `resolver: router\|simulated` |
-| `ip.dns.cache.print` | `name?`, `type?`; linhas `{name, type, kind, data, addresses, ttl, hits, server, stale}` (desde a G4.1b) |
+| `ip.dns.cache.print` | `name?`, `type?`, `limit?` (padrão 1000); linhas `{name, type, kind, data, addresses, ttl, hits, server, stale}` (desde a G4.1b) |
 | `ip.dns.cache.flush` | esvazia o cache; devolve quantas entradas saíram |
 
 **Como funciona.**
@@ -182,7 +182,10 @@ RouterOS (o dnsmasq faz o mesmo desde a 2.86). PTR automático para as entradas 
 na porta 53, IPv4 e IPv6 separados; responde do endereço para o qual a consulta foi
 (`IP_PKTINFO`/`IPV6_RECVPKTINFO`), senão um roteador com dois endereços na LAN responderia do
 outro e o cliente descartaria. Abre e fecha os sockets conforme `allow_remote_requests`, sem
-reiniciar. TCP com prefixo de tamanho, várias consultas por conexão, 10 s ociosa fecha.
+reiniciar. TCP com prefixo de tamanho, várias consultas por conexão, 10 s ociosa fecha; quem não
+pode perguntar nada (fora de `allowed_from` e dos pares das zonas) é fechado no accept, cada origem
+tem no máximo 1/4 das `max_concurrent_tcp_sessions`, uma mensagem tem 10 s do primeiro ao último
+byte e a conexão não lê consulta nova depois de 2 min. UPDATE por UDP roda no thread `dns-update`.
 
 **Regras de RFC no código:**
 

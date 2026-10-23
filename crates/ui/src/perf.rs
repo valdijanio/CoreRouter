@@ -1,0 +1,134 @@
+//! Hooks for `benches/frames.rs`: the real UI drawing big lists, so the
+//! per-frame cost of a table, the firewall rules tab or a terminal shows up
+//! in numbers (docs/perf.md). Not part of the API.
+//!
+//! The lists are put in the UI's cache as the router would send them (not
+//! added through the engine: 10 000 adds would measure the engine), and the
+//! UI clock stays put so no refresh replaces them between frames.
+
+use corerouter_engine::{Session, shared};
+use serde_json::{Value, json};
+
+use crate::{CoreRouterUi, RequestId, Win, table};
+
+/// One UI and the egui context it draws into.
+pub struct Frames {
+    ctx: egui::Context,
+    app: CoreRouterUi,
+    /// UI time: fixed, so no refresh runs between measured frames.
+    time: f64,
+}
+
+impl Frames {
+    fn with(session: Session, win: Option<Win>) -> Self {
+        let mut app = CoreRouterUi::new(shared(session));
+        app.open.clear();
+        if let Some(w) = win {
+            app.open(w);
+        }
+        let mut me = Self {
+            ctx: egui::Context::default(),
+            app,
+            time: 0.0,
+        };
+        // Load every list (the local backend answers within the frame).
+        me.frame();
+        me.frame();
+        me
+    }
+
+    /// IP › Addresses over `n` addresses whose comments are `comment_len`
+    /// characters long; `select_all` selects every row first (Ctrl+A).
+    pub fn addresses(n: usize, comment_len: usize, select_all: bool) -> Self {
+        let mut me = Self::with(Session::virtual_lab(), Some(Win::Addresses));
+        let comment = "c".repeat(comment_len);
+        me.app.cache.addresses = (0..n)
+            .map(|i| {
+                json!({
+                    "id": format!("*{:x}", i + 1),
+                    "flags": "",
+                    "address": format!("10.{}.{}.1/32", i / 256 % 256, i % 256),
+                    "network": format!("10.{}.{}.1", i / 256 % 256, i % 256),
+                    "interface": "ether1",
+                    "origin": "static",
+                    "comment": comment,
+                })
+            })
+            .collect();
+        if select_all {
+            let rows: Vec<table::Row> = me
+                .app
+                .cache
+                .addresses
+                .iter()
+                .map(|r| table::Row {
+                    key: r.get("id").map(crate::value_text).unwrap_or_default(),
+                    cells: Vec::new(),
+                    dimmed: false,
+                    section: false,
+                    tint: None,
+                })
+                .collect();
+            me.app.tables.addresses.select_all(&rows);
+        }
+        me.frame();
+        me
+    }
+
+    /// IP › Firewall (Filter Rules) over `n` rules; every one after the
+    /// first is shadowed by it (flag S, the "NUNCA CASA" description).
+    pub fn firewall(n: usize) -> Self {
+        let mut me = Self::with(Session::virtual_lab(), Some(Win::Firewall));
+        let rules: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({
+                    "id": format!("*{:x}", i + 1),
+                    "position": i,
+                    "chain": "forward",
+                    "family": "ip",
+                    "action": "accept",
+                    "flags": if i == 0 { "" } else { "S" },
+                    "disabled": false,
+                    "shadowed_by": if i == 0 { Value::Null } else { json!("*1") },
+                    "section": null,
+                    "src_address": format!("10.{}.{}.0/24", i / 256 % 256, i % 256),
+                    "in_interface_list": "LAN",
+                    "description": "aceita tudo que chega",
+                    "comment": format!("rule {i}"),
+                })
+            })
+            .collect();
+        me.app
+            .fw_arrived(crate::firewall::Feed::Filter, RequestId::MAX, rules);
+        me.frame();
+        me
+    }
+
+    /// A terminal window holding `lines` output lines of `len` characters.
+    pub fn terminal(lines: usize, len: usize) -> Self {
+        let mut me = Self::with(Session::virtual_lab(), None);
+        me.app.new_terminal();
+        let line = "x ".repeat(len / 2);
+        if let Some(t) = me.app.terminals.first_mut() {
+            t.print((0..lines).map(|_| corerouter_shell::Line::plain(&line)));
+        }
+        me.frame();
+        me
+    }
+
+    /// Draw one frame of a 1400×900 screen.
+    pub fn frame(&mut self) {
+        let raw = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            time: Some(self.time),
+            ..Default::default()
+        };
+        let app = &mut self.app;
+        self.ctx
+            .run_ui(raw, |ui| app.ui(ui))
+            .drop_without_applying_deltas();
+    }
+}

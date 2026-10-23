@@ -576,7 +576,7 @@ pub struct Diff {
 }
 
 impl Diff {
-    fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.removed.len() + self.added.len() + 2
     }
 }
@@ -689,7 +689,7 @@ fn runtime(f: &Forwarder) -> Arc<Runtime> {
 /// NOTIFY).
 pub fn zones(f: &Forwarder, cfg: &ServerConfig) -> Arc<Zones> {
     let rt = runtime(f);
-    let (dyn_version, dynamic) = rt.dynamic.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let dyn_version = rt.dynamic.read().unwrap_or_else(|e| e.into_inner()).0;
     let key = (cfg.generation, dyn_version);
     if let Some((k, z)) = rt
         .current
@@ -701,6 +701,20 @@ pub fn zones(f: &Forwarder, cfg: &ServerConfig) -> Arc<Zones> {
         return z.clone();
     }
     let mut cur = rt.current.write().unwrap_or_else(|e| e.into_inner());
+    // A query that captured an older config than the one already built
+    // never rebuilds it (that would journal a reversed diff and NOTIFY the
+    // old serial): it gets the zones of the latest config.
+    let latest;
+    let cfg = if cur.as_ref().is_some_and(|(k, _)| k.0 > cfg.generation) {
+        latest = f.config();
+        &*latest
+    } else {
+        cfg
+    };
+    // The dynamic records as of now (another thread may have moved them
+    // while this one waited for the lock).
+    let (dyn_version, dynamic) = rt.dynamic.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let key = (cfg.generation, dyn_version);
     if let Some((k, z)) = cur.as_ref()
         && *k == key
     {

@@ -315,12 +315,12 @@ impl Resolver {
     /// New settings (config change or a DHCP lease). The cache stays,
     /// shrunk to the new budget; a server no longer listed stops being
     /// preferred.
-    pub fn configure(&self, settings: Settings, now_ms: u64) {
+    pub fn configure(&self, settings: Settings, _now_ms: u64) {
         let mut st = self.state();
         if st.settings == settings {
             return;
         }
-        st.cache.set_budget(settings.cache_bytes, now_ms);
+        st.cache.set_budget(settings.cache_bytes);
         st.cache.set_stale(settings.stale_secs);
         if st.preferred.is_some_and(|p| !settings.servers.contains(&p)) {
             st.preferred = None;
@@ -334,6 +334,21 @@ impl Resolver {
 
     pub fn cache_rows(&self, now_ms: u64) -> Vec<CacheRow> {
         self.state().cache.rows(now_ms)
+    }
+
+    /// See [`Cache::rows_matching`].
+    pub fn cache_rows_matching(
+        &self,
+        now_ms: u64,
+        name: Option<&str>,
+        qtype: Option<&str>,
+        limit: usize,
+    ) -> Vec<CacheRow> {
+        self.state().cache.rows_matching(now_ms, name, qtype, limit)
+    }
+
+    pub fn cache_len(&self) -> usize {
+        self.state().cache.len()
     }
 
     pub fn cache_used_bytes(&self) -> usize {

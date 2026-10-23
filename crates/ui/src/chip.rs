@@ -108,6 +108,15 @@ pub(crate) fn hashed(key: u64) -> usize {
     (h >> 29) as usize
 }
 
+/// The palette entry of a name (an interface list, a VRF): FNV-1a of its
+/// bytes, stable across runs (never `std::hash`), then [`hashed`].
+pub(crate) fn name_hue(name: &str) -> usize {
+    let h = name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    hashed(h)
+}
+
 /// The colour of each key down a list (the ASs of a path): its own
 /// (`hashed`), except when the key right before it (a different one)
 /// already has it; then the next one, so a change always shows (a hand-over

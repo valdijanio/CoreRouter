@@ -67,6 +67,48 @@ fn bench(c: &mut Criterion) {
                 .unwrap()
         })
     });
+
+    // Insert into a full cache (16 MiB, ~60 000 entries): every put evicts.
+    let mut full = Cache::new(16 << 20);
+    let rec = |i: u32| {
+        Answer::local(
+            Rcode::NoError,
+            vec![Record::from_rdata(
+                n(&format!("h{i}.example.")),
+                3600,
+                RData::A(A(Ipv4Addr::from(i))),
+            )],
+        )
+    };
+    let mut i = 0u32;
+    while full.used_bytes() + 1024 < 16 << 20 {
+        i += 1;
+        full.put(
+            &format!("h{i}.example"),
+            RecordType::A,
+            &rec(i),
+            None,
+            u64::from(i),
+            604_800,
+            60,
+        );
+    }
+    let filled = full.len();
+    c.bench_function("dns_cache_put_full", |b| {
+        b.iter(|| {
+            i += 1;
+            full.put(
+                &format!("h{i}.example"),
+                RecordType::A,
+                &rec(i),
+                None,
+                u64::from(i),
+                604_800,
+                60,
+            );
+        })
+    });
+    assert!(full.len() >= filled / 2);
 }
 
 criterion_group!(benches, bench);

@@ -17,7 +17,9 @@
 //! ways draw the comment with the same colours ([`comment_style`]): the
 //! accent blue for an enabled item, dark grey for a disabled (dimmed) one.
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashSet};
+use std::ops::Deref;
 
 use egui::{
     Align2, Button, Color32, EventFilter, Id, Key, Modifiers, Rect, ScrollArea, Sense, Stroke,
@@ -34,6 +36,12 @@ const NOTE_INDENT: f32 = 30.0;
 const NOTE_CHARS: usize = 512;
 /// Room for the speech-bubble icon before a comment in the Comment column.
 const CELL_ICON: f32 = 18.0;
+/// Characters of a cell drawn; a longer value ends in "…" and the whole
+/// text is in the tooltip (docs/ui-style.md › Tabelas). Keeps one huge
+/// comment from making its column thousands of points wide.
+pub(crate) const CELL_CHARS: usize = 120;
+/// Characters of a cut cell the tooltip shows.
+const TIP_CHARS: usize = 4096;
 
 pub(crate) struct Column {
     pub title: &'static str,
@@ -88,10 +96,59 @@ impl Row {
     }
 }
 
+/// The selected keys of a table: in display order (what actions act on)
+/// and as a set, so a window asking "is this row selected?" for each of
+/// 10 000 rows does not scan the whole selection each time.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Selection {
+    keys: Vec<String>,
+    set: HashSet<String>,
+}
+
+impl Selection {
+    pub fn contains(&self, key: &str) -> bool {
+        self.set.contains(key)
+    }
+
+    pub fn as_slice(&self) -> &[String] {
+        &self.keys
+    }
+
+    /// The keys in display order.
+    pub fn into_vec(self) -> Vec<String> {
+        self.keys
+    }
+}
+
+impl<'a> IntoIterator for &'a Selection {
+    type Item = &'a String;
+    type IntoIter = std::slice::Iter<'a, String>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.keys.iter()
+    }
+}
+
+impl FromIterator<String> for Selection {
+    fn from_iter<I: IntoIterator<Item = String>>(iter: I) -> Self {
+        let keys: Vec<String> = iter.into_iter().collect();
+        let set = keys.iter().cloned().collect();
+        Self { keys, set }
+    }
+}
+
+impl Deref for Selection {
+    type Target = [String];
+
+    fn deref(&self) -> &[String] {
+        &self.keys
+    }
+}
+
 /// What a context menu is about.
 pub(crate) enum Menu<'a> {
     /// Right click on a row: act on these selected keys (display order).
-    Rows(&'a [String]),
+    Rows(&'a Selection),
     /// Right click on the empty space below the rows.
     Empty,
 }
@@ -142,7 +199,10 @@ impl TableState {
     }
 
     /// Selected keys in display order.
-    pub fn selection(&self, rows: &[Row]) -> Vec<String> {
+    pub fn selection(&self, rows: &[Row]) -> Selection {
+        if self.selected.is_empty() {
+            return Selection::default();
+        }
         self.visible(rows)
             .filter(|r| self.selected.contains(&r.key))
             .map(|r| r.key.clone())
@@ -243,7 +303,9 @@ impl TableState {
     /// Forget rows that are gone or filtered out: actions never touch rows
     /// the operator cannot see.
     fn retain(&mut self, order: &[&str]) {
-        self.selected.retain(|k| order.contains(&k.as_str()));
+        // A set: `order.contains` per key was O(rows × selected) per frame.
+        let shown: HashSet<&str> = order.iter().copied().collect();
+        self.selected.retain(|k| shown.contains(k.as_str()));
     }
 }
 
@@ -435,7 +497,8 @@ pub(crate) fn show(
         })
         .collect();
 
-    // Column widths fit the widest cell, so no text is ever cut.
+    // Column widths fit the widest cell as drawn: a cell longer than
+    // CELL_CHARS is cut with "…" (its tooltip has it all).
     let mut layout: Vec<(usize, f32)> = shown
         .iter()
         .filter_map(|&i| Some((i, text_width(ui, columns.get(i)?.title, &font))))
@@ -448,7 +511,7 @@ pub(crate) fn show(
                 } else {
                     0.0
                 };
-                *w = w.max(icon + text_width(ui, cell, &font));
+                *w = w.max(icon + text_width(ui, &shown_text(cell), &font));
             }
         }
     }
@@ -508,13 +571,27 @@ pub(crate) fn show(
             // Where each item is, for a drop; and the item being dragged.
             let mut placed: Vec<(&str, Rect)> = Vec::with_capacity(visible.len());
             let mut dragging: Option<(&str, bool)> = None;
+            // The selection the row menu acts on: once per frame, not once
+            // per row (that was O(rows²) every frame).
+            let sel = state.selection(rows);
+            // Only the rows in view are drawn and take input: a 10 000-row
+            // list costs what one screenful does. The others only take
+            // their place (and a dragged row keeps its input off screen).
+            let clip = ui.clip_rect();
+            let dragged = ui.ctx().dragged_id();
+            let mut y = top;
 
             for (i, (row, note)) in visible.iter().zip(&notes).enumerate() {
                 // One item: the comment band (if any) and the row under it.
                 let item_h = if note.is_some() { 2.0 * row_h } else { row_h };
-                let (item, _) = ui.allocate_exact_size(vec2(width, item_h), Sense::hover());
-                let resp = ui.interact(item, row_id(salt, &row.key), row_sense);
+                let item = Rect::from_min_size(pos2(head.left(), y), vec2(width, item_h));
+                y += item_h;
                 placed.push((row.key.as_str(), item));
+                let rid = row_id(salt, &row.key);
+                if !clip.intersects(item) && dragged != Some(rid) {
+                    continue;
+                }
+                let resp = ui.interact(item, rid, row_sense);
                 if resp.dragged() || resp.drag_stopped() {
                     dragging = Some((row.key.as_str(), resp.drag_stopped()));
                 }
@@ -564,6 +641,11 @@ pub(crate) fn show(
                         &font,
                     );
                 }
+                // A cut cell: the whole value in the tooltip.
+                let resp = match cut_under_pointer(ui, &resp, rect, &layout, row) {
+                    Some(full) => resp.on_hover_text(full),
+                    None => resp,
+                };
 
                 if state.open.contains(&row.key) && open_mark(ui, salt, &row.key, rect, selected) {
                     out.opened = Some(row.key.clone());
@@ -592,7 +674,6 @@ pub(crate) fn show(
                         out.opened = Some(row.key.clone());
                     }
                 }
-                let sel = state.selection(rows);
                 let inline_comments = &mut state.inline_comments;
                 resp.context_menu(|ui| {
                     menu(ui, Menu::Rows(&sel));
@@ -620,8 +701,7 @@ pub(crate) fn show(
                     }
                 }
             }
-            let rest = (body.bottom() - ui.cursor().min.y).max(0.0);
-            ui.allocate_space(vec2(width, rest));
+            ui.advance_cursor_after_rect(body);
 
             // Only a real click: the table holds the focus under this id,
             // and egui turns Enter/Space on a focused widget into a click.
@@ -922,6 +1002,57 @@ fn keyboard(
     });
 }
 
+/// A cell as the table draws it: on one line, its text cut at
+/// [`CELL_CHARS`] with "…" (the chips after it stay).
+pub(crate) fn shown_text(cell: &str) -> Cow<'_, str> {
+    let (text, chips) = match cell.find(crate::chip::SEP) {
+        Some(at) => (cell.get(..at).unwrap_or(cell), cell.get(at..).unwrap_or("")),
+        None => (cell, ""),
+    };
+    let long = text.char_indices().nth(CELL_CHARS).is_some();
+    if !long && !text.contains(['\n', '\r', '\t']) {
+        return Cow::Borrowed(cell);
+    }
+    let mut out: String = text
+        .chars()
+        .take(if long { CELL_CHARS - 1 } else { CELL_CHARS })
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if long {
+        out.push('…');
+    }
+    out.push_str(chips);
+    Cow::Owned(out)
+}
+
+/// The whole text of the cut cell under the pointer, for its tooltip.
+fn cut_under_pointer(
+    ui: &Ui,
+    resp: &egui::Response,
+    rect: Rect,
+    layout: &[(usize, f32)],
+    row: &Row,
+) -> Option<String> {
+    if !resp.hovered() || row.section {
+        return None;
+    }
+    let x = ui.input(|i| i.pointer.latest_pos())?.x;
+    let mut left = rect.left();
+    let col = layout.iter().find_map(|&(i, w)| {
+        let hit = x >= left && x < left + w;
+        left += w;
+        hit.then_some(i)
+    })?;
+    let (text, _) = crate::chip::split(row.cells.get(col)?);
+    // Only a cut cell has a tooltip.
+    text.char_indices().nth(CELL_CHARS)?;
+    let mut tip: String = text.chars().take(TIP_CHARS).collect();
+    if text.char_indices().nth(TIP_CHARS).is_some() {
+        tip.push('…');
+    }
+    Some(tip)
+}
+
 fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
     // A cell may carry chips after its text (`chip::cell`).
     let (text, chips) = crate::chip::split(text);
@@ -954,7 +1085,8 @@ fn paint_cells<'a>(
     let mut x = rect.left();
     for &(i, w) in layout {
         if let Some((_, style)) = ink.note.filter(|(c, _)| *c == i) {
-            let cell = text(i);
+            let cell = shown_text(text(i));
+            let cell = cell.as_ref();
             if !cell.trim().is_empty() {
                 let painter = ui.painter();
                 let y = rect.center().y;
@@ -973,7 +1105,8 @@ fn paint_cells<'a>(
         } else {
             (Align2::LEFT_CENTER, pos2(x + CELL_PAD, rect.center().y))
         };
-        let (cell, chips) = crate::chip::split(text(i));
+        let shown = shown_text(text(i));
+        let (cell, chips) = crate::chip::split(&shown);
         let drawn = ui.painter().text(at, anchor, cell, font.clone(), color);
         if !chips.is_empty() {
             crate::chip::paint_cell_chips(
@@ -1039,6 +1172,74 @@ mod tests {
         s.step(false, false, &[]);
     }
 
+    fn big(n: usize, comment: &str) -> Vec<Row> {
+        (0..n)
+            .map(|i| Row {
+                key: format!("k{i}"),
+                cells: vec![format!("item {i}"), comment.to_owned()],
+                dimmed: false,
+                section: false,
+                tint: None,
+            })
+            .collect()
+    }
+
+    /// One frame of `rows` in a 1400×900 window; the texts it painted.
+    fn frame(state: &mut TableState, rows: &[Row]) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let raw = egui::RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1400.0, 900.0))),
+            ..Default::default()
+        };
+        let cols = [col("Name"), comment()];
+        let mut out = ctx.run_ui(raw, |ui| {
+            show(ui, "t", 0.0, state, &cols, rows, |_, _| {});
+        });
+        out.textures_delta.clear();
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+                egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+                _ => {}
+            }
+        }
+        let mut texts = Vec::new();
+        for s in &out.shapes {
+            walk(&s.shape, &mut texts);
+        }
+        texts
+    }
+
+    #[test]
+    fn only_the_rows_in_view_are_drawn() {
+        let rows = big(MAX_ROWS, "note");
+        let mut s = TableState::default();
+        s.select_all(&rows);
+        let texts = frame(&mut s, &rows);
+        assert!(texts.iter().any(|t| t == "item 0"));
+        assert!(!texts.iter().any(|t| t == "item 9999"), "off screen");
+        assert!(texts.len() < 500, "{} texts painted", texts.len());
+        assert_eq!(s.selection(&rows).len(), MAX_ROWS, "selection kept");
+        assert!(s.selection(&rows).contains("k9999"));
+    }
+
+    #[test]
+    fn a_long_cell_is_cut_with_an_ellipsis() {
+        let huge = "x".repeat(100_000);
+        let rows = big(3, &huge);
+        let texts = frame(&mut TableState::default(), &rows);
+        let longest = texts.iter().map(|t| t.chars().count()).max().unwrap_or(0);
+        assert!(longest <= CELL_CHARS, "a cell of {longest} chars drawn");
+        assert!(texts.iter().any(|t| t.ends_with('…')));
+        assert_eq!(shown_text("short"), "short");
+        assert_eq!(shown_text("a\nb"), "a b", "one line per row");
+        let chipped = crate::chip::cell(&"y".repeat(500), &[("LAN", crate::chip::Kind::Blue)]);
+        let shown = shown_text(&chipped);
+        let (text, chips) = crate::chip::split(&shown);
+        assert_eq!(text.chars().count(), CELL_CHARS);
+        assert_eq!(chips.len(), 1, "the chips stay");
+    }
+
     #[test]
     fn filter_hides_and_drops_selection() {
         let rows: Vec<Row> = ["ether1", "ether2", "vlan100"]
@@ -1055,10 +1256,10 @@ mod tests {
         s.select_all(&rows);
         assert_eq!(s.selection(&rows).len(), 3);
         s.filter = " VLAN ".into();
-        assert_eq!(s.selection(&rows), ["vlan100"]);
+        assert_eq!(s.selection(&rows).as_slice(), ["vlan100"]);
         let order: Vec<&str> = s.visible(&rows).map(|r| r.key.as_str()).collect();
         s.retain(&order);
         s.filter.clear();
-        assert_eq!(s.selection(&rows), ["vlan100"]);
+        assert_eq!(s.selection(&rows).as_slice(), ["vlan100"]);
     }
 }

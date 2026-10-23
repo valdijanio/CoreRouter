@@ -9,7 +9,8 @@
 //! `CoreRouterUi::run`; the engine validates (the error lands in the dialog,
 //! on the field it names).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::sync::Arc;
 
 use egui::{Color32, Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
@@ -18,6 +19,7 @@ use crate::avail::Avail;
 use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
 use crate::firewall_assist::{Wizard, WizardForm};
 use crate::interfaces::{cascade, dialog_id};
+use crate::chip;
 use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
 use crate::{CoreRouterUi, RequestId, Then, Win, value_text};
 
@@ -249,7 +251,8 @@ pub(crate) struct State {
     pub if_tab: IfTab,
     /// Chain filter of each rule table ("" = all).
     chain: [String; 3],
-    rows: [Vec<Value>; 7],
+    /// Shared, so a frame borrows a list instead of copying every rule.
+    rows: [Arc<Vec<Value>>; 7],
     pub dialogs: Vec<FwDialogWin>,
     /// Items to open once a list sent after this request arrives.
     open_after: Vec<(RequestId, Feed, String)>,
@@ -269,7 +272,12 @@ fn feed_index(f: Feed) -> usize {
 
 impl State {
     pub(crate) fn rows(&self, f: Feed) -> &[Value] {
-        self.rows.get(feed_index(f)).map_or(&[], Vec::as_slice)
+        self.rows.get(feed_index(f)).map_or(&[], |r| r.as_slice())
+    }
+
+    /// The list of `f`, without copying it.
+    pub(crate) fn shared(&self, f: Feed) -> Arc<Vec<Value>> {
+        self.rows.get(feed_index(f)).cloned().unwrap_or_default()
     }
 
     /// A list arrived (request `id`). Returns items to open now.
@@ -280,7 +288,7 @@ impl State {
         rows: Vec<Value>,
     ) -> Vec<(Feed, String)> {
         if let Some(slot) = self.rows.get_mut(feed_index(f)) {
-            *slot = rows;
+            *slot = Arc::new(rows);
         }
         let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_after)
             .into_iter()
@@ -809,14 +817,17 @@ fn listed(row: &Value, k: &str, mark: &str) -> String {
     }
 }
 
-/// An interface list in a cell: `[LAN]`, `![LAN]`.
-fn bracketed(row: &Value, k: &str) -> String {
-    let v = text(row, k);
-    match (v.is_empty(), v.strip_prefix('!')) {
-        (true, _) => v,
-        (false, Some(rest)) => format!("![{rest}]"),
-        (false, None) => format!("[{v}]"),
+/// An interface and/or an interface list in a cell: the list is a chip
+/// coloured by its name (`LAN`, `!LAN` when negated), never `[LAN]`
+/// (docs/ui-style.md).
+fn iface_cell(row: &Value, iface: &str, list: &str) -> String {
+    let name = text(row, iface);
+    let list = text(row, list);
+    if list.is_empty() {
+        return name;
     }
+    let hue = chip::name_hue(list.strip_prefix('!').unwrap_or(&list));
+    chip::cell(&name, &[(&list, chip::Kind::Hashed(hue))])
 }
 
 pub(crate) fn arrow_id(salt: &str, up: bool) -> egui::Id {
@@ -872,22 +883,29 @@ fn arrow(ui: &mut Ui, salt: &str, up: bool, enabled: Result<(), String>) -> bool
     resp.clicked()
 }
 
+/// Each rule's `#` (its `position`) by id, built once per frame so a
+/// shadowed rule names its shadow without a search through every rule.
+pub(crate) fn positions(all: &[Value]) -> HashMap<&str, &Value> {
+    all.iter()
+        .filter_map(|r| Some((r.get("id")?.as_str()?, r.get("position")?)))
+        .collect()
+}
+
 /// The Portuguese description, with a warning in front when an earlier
 /// rule takes every packet this one would see (named by its `#`, the
 /// number the table shows).
-pub(crate) fn description(r: &Value, all: &[Value]) -> String {
+pub(crate) fn description(r: &Value, positions: &HashMap<&str, &Value>) -> String {
     let d = text(r, "description");
     let Some(by) = r.get("shadowed_by").and_then(Value::as_str) else {
         return d;
     };
-    let by = all
-        .iter()
-        .find(|o| o.get("id").and_then(Value::as_str) == Some(by))
-        .map_or_else(|| by.to_owned(), |o| format!("#{}", text(o, "position")));
+    let by = positions
+        .get(by)
+        .map_or_else(|| by.to_owned(), |p| format!("#{}", value_text(p)));
     format!("NUNCA CASA: a regra {by} acima já decide estes pacotes. {d}")
 }
 
-fn rule_row(r: &Value, all: &[Value], visuals: &egui::Visuals) -> Row {
+fn rule_row(r: &Value, positions: &HashMap<&str, &Value>, visuals: &egui::Visuals) -> Row {
     let section = is_section(r);
     let flags = text(r, "flags");
     let action = text(r, "action");
@@ -911,12 +929,12 @@ fn rule_row(r: &Value, all: &[Value], visuals: &egui::Visuals) -> Row {
             text(r, "protocol"),
             text(r, "src_port"),
             text(r, "dst_port"),
-            join(text(r, "in_interface"), bracketed(r, "in_interface_list")),
-            join(text(r, "out_interface"), bracketed(r, "out_interface_list")),
+            iface_cell(r, "in_interface", "in_interface_list"),
+            iface_cell(r, "out_interface", "out_interface_list"),
             if section {
                 String::new()
             } else {
-                description(r, all)
+                description(r, positions)
             },
             text(r, "comment"),
         ],
@@ -1009,7 +1027,7 @@ fn list_row(r: &Value) -> Row {
 }
 
 /// Rules the zone matrix generated change only through the matrix.
-fn not_zone(rows: &[Value], sel: &[String]) -> Result<(), String> {
+fn not_zone(rows: &[Value], sel: &table::Selection) -> Result<(), String> {
     let zone = rows
         .iter()
         .any(|r| flag(r, "zone") && sel.contains(&text(r, "id")));
@@ -1029,7 +1047,7 @@ fn some(sel: &[String], what: &str) -> Result<(), String> {
 }
 
 /// Enable/Disable greyed when nothing selected would change.
-fn can_toggle(rows: &[Value], f: Feed, sel: &[String], enable: bool) -> Result<(), String> {
+fn can_toggle(rows: &[Value], f: Feed, sel: &table::Selection, enable: bool) -> Result<(), String> {
     some(sel, "items")?;
     not_zone(rows, sel)?;
     let picked: Vec<&Value> = rows
@@ -1133,12 +1151,13 @@ impl CoreRouterUi {
         let visuals = ui.visuals().clone();
         let chain_ix = feed_index(f);
         let chain = self.fw.chain.get(chain_ix).cloned().unwrap_or_default();
-        let all: Vec<Value> = self.fw_rows(f).to_vec();
+        let all = self.fw.shared(f);
+        let at = positions(&all);
         let shown: Vec<&Value> = all
             .iter()
             .filter(|r| chain.is_empty() || text(r, "chain") == chain)
             .collect();
-        let rows: Vec<Row> = shown.iter().map(|r| rule_row(r, &all, &visuals)).collect();
+        let rows: Vec<Row> = shown.iter().map(|r| rule_row(r, &at, &visuals)).collect();
         let order: Vec<String> = all.iter().map(|r| text(r, "id")).collect();
         self.fw_table(f).reorder = chain.is_empty();
         let selection = self.fw_table(f).selection(&rows);
@@ -1151,7 +1170,7 @@ impl CoreRouterUi {
             _ => Err("Select one rule to move it".to_owned()),
         };
         let editable =
-            |sel: &[String], what: &str| some(sel, what).and_then(|()| not_zone(&all, sel));
+            |sel: &table::Selection, what: &str| some(sel, what).and_then(|()| not_zone(&all, sel));
         let up = one.clone().and_then(|k| {
             if order.first() == Some(&k) {
                 Err("Already the first rule".into())
@@ -1197,10 +1216,10 @@ impl CoreRouterUi {
             for (icon, tip, enabled) in tools {
                 if table::tool(ui, t.salt(), icon, tip, enabled).clicked() {
                     act = Some(match icon {
-                        Icon::Remove => Act::Remove(sel()),
-                        Icon::Enable => Act::Enable(sel()),
-                        Icon::Disable => Act::Disable(sel()),
-                        Icon::Add | Icon::Comment => Act::Comment(sel()),
+                        Icon::Remove => Act::Remove(sel().into_vec()),
+                        Icon::Enable => Act::Enable(sel().into_vec()),
+                        Icon::Disable => Act::Disable(sel().into_vec()),
+                        Icon::Add | Icon::Comment => Act::Comment(sel().into_vec()),
                     });
                 }
             }
@@ -1224,7 +1243,7 @@ impl CoreRouterUi {
             let mut picked = chain.clone();
             let mut chains: Vec<String> = vec![String::new()];
             chains.extend(t.chains().iter().map(|c| (*c).to_owned()));
-            for r in &all {
+            for r in all.iter() {
                 let c = text(r, "chain");
                 if !c.is_empty() && !chains.contains(&c) {
                     chains.push(c);
@@ -1362,7 +1381,7 @@ impl CoreRouterUi {
         }
         if let Some(s) = shortcut {
             let sel = self.fw_table(f).selection(rows);
-            let all = self.fw_rows(f).to_vec();
+            let all = self.fw.shared(f);
             let can = self.can();
             let allowed = match s {
                 Shortcut::Remove => can.and(&f.remove_cmd(), some(&sel, "items")).is_ok(),
@@ -1377,11 +1396,11 @@ impl CoreRouterUi {
             };
             if allowed && f != Feed::Lists || matches!(s, Shortcut::Open | Shortcut::Remove) {
                 *act = Some(match s {
-                    Shortcut::Remove => Act::Remove(sel),
-                    Shortcut::Enable => Act::Enable(sel),
-                    Shortcut::Disable => Act::Disable(sel),
-                    Shortcut::Comment => Act::Comment(sel),
-                    Shortcut::Open => Act::Open(sel),
+                    Shortcut::Remove => Act::Remove(sel.into_vec()),
+                    Shortcut::Enable => Act::Enable(sel.into_vec()),
+                    Shortcut::Disable => Act::Disable(sel.into_vec()),
+                    Shortcut::Comment => Act::Comment(sel.into_vec()),
+                    Shortcut::Open => Act::Open(sel.into_vec()),
                 });
                 if !allowed {
                     *act = None;
@@ -1392,7 +1411,7 @@ impl CoreRouterUi {
 
     /// Address lists, members, lists: same toolbar without ordering.
     fn simple_tab(&mut self, ui: &mut Ui, f: Feed) {
-        let rows_v: Vec<Value> = self.fw_rows(f).to_vec();
+        let rows_v = self.fw.shared(f);
         let rows: Vec<Row> = rows_v
             .iter()
             .map(|r| match f {
@@ -1446,10 +1465,10 @@ impl CoreRouterUi {
             for (icon, tip, enabled) in tools {
                 if table::tool(ui, f.salt(), icon, tip, enabled).clicked() {
                     act = Some(match icon {
-                        Icon::Remove => Act::Remove(sel()),
-                        Icon::Enable => Act::Enable(sel()),
-                        Icon::Disable => Act::Disable(sel()),
-                        Icon::Add | Icon::Comment => Act::Comment(sel()),
+                        Icon::Remove => Act::Remove(sel().into_vec()),
+                        Icon::Enable => Act::Enable(sel().into_vec()),
+                        Icon::Disable => Act::Disable(sel().into_vec()),
+                        Icon::Add | Icon::Comment => Act::Comment(sel().into_vec()),
                     });
                 }
             }

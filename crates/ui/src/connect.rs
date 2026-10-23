@@ -758,7 +758,7 @@ impl ConnectScreen {
         );
         let after = self.saved_table.selection(&rows);
         if out.shortcut == Some(Shortcut::Remove) {
-            remove = Some(after.clone());
+            remove = Some(after.to_vec());
         }
         if let Some(gone) = remove.filter(|g| !g.is_empty()) {
             self.saved.retain(|s| !gone.contains(&s.address));
