@@ -76,13 +76,19 @@ fn a_signed_zone_validates() {
     std::fs::create_dir_all(&dir).unwrap();
     let log = std::fs::File::create(std::env::temp_dir().join("g41c2-netns.log")).unwrap();
     let mut c = Command::new(DAEMON);
-    c.args(["--no-discovery", "--control", PORT, "--config-dir"])
-        .arg(dir.join("cfg"))
-        .arg("--token-file")
-        .arg(common::token_file(None, &dir))
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::null())
-        .stderr(log);
+    c.args([
+        "--no-discovery",
+        "--dns-lab-any",
+        "--control",
+        PORT,
+        "--config-dir",
+    ])
+    .arg(dir.join("cfg"))
+    .arg("--token-file")
+    .arg(common::token_file(None, &dir))
+    .env("RUST_LOG", "info")
+    .stdout(Stdio::null())
+    .stderr(log);
     let _daemon = Kill(c.spawn().unwrap());
     wait_for("the daemon", || run("interface.list", json!({})).is_ok());
 

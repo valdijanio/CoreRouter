@@ -466,16 +466,33 @@ fn servfail(query: &[u8]) -> Option<Vec<u8>> {
     r.to_vec().ok()
 }
 
+/// Where the forwarder listens: every address of the host, or only its
+/// loopback when the daemon runs the virtual lab (its interfaces are not
+/// the host's, so the host's LAN must not reach it; as CRDP, G5.4).
+fn listen_ips(lab: bool) -> [IpAddr; 2] {
+    if lab {
+        [IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]
+    } else {
+        [IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)]
+    }
+}
+
+/// Whether the session runs the virtual lab (`--backend virtual`).
+fn is_lab(session: &Shared) -> bool {
+    lock(session).backend().starts_with("virtual lab")
+}
+
 /// The sockets of one epoch, their threads counted in `health`; where
 /// they listen.
 fn open(
     srv: &Arc<Server>,
     port: u16,
+    lab: bool,
     epoch: u64,
     health: &super::Health,
 ) -> Result<Vec<SocketAddr>, String> {
     let mut opened = Vec::new();
-    for ip in [IpAddr::V4(Ipv4Addr::UNSPECIFIED), IpAddr::V6(Ipv6Addr::UNSPECIFIED)] {
+    for ip in listen_ips(lab) {
         let addr = SocketAddr::new(ip, port);
         let udp = match Udp::bind(addr) {
             Ok(u) => Arc::new(u),
@@ -533,7 +550,7 @@ pub(crate) fn spawn(
     let health = super::Health::new(shutdown);
     thread::Builder::new()
         .name("dns-server".into())
-        .spawn(move || follow(&session, &keep, port, &health))?;
+        .spawn(move || follow(&session, &keep, port, false, &health))?;
     Ok(srv)
 }
 
@@ -584,11 +601,13 @@ fn prepare(
 /// Copies the config in when it changes, or when what `allowed_from`
 /// stands for does (a DHCP lease, a delegated prefix); opens and closes the
 /// sockets.
-fn follow(session: &Shared, srv: &Arc<Server>, port: u16, health: &super::Health) {
+/// `any`: listen on every address even in the virtual lab (`--dns-lab-any`).
+fn follow(session: &Shared, srv: &Arc<Server>, port: u16, any: bool, health: &super::Health) {
     let mut last: Option<Config> = None;
     let mut last_allowed = Vec::new();
     let mut listening = false;
     let mut retry_at = 0u64;
+    let lab = !any && is_lab(session);
     loop {
         if health.stopping() {
             srv.epoch.fetch_add(1, Ordering::AcqRel);
@@ -618,7 +637,7 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, health: &super::Health
         let now = srv.dns.now_ms();
         if want && !listening && now >= retry_at {
             let epoch = srv.epoch.fetch_add(1, Ordering::AcqRel) + 1;
-            match open(srv, port, epoch, health) {
+            match open(srv, port, lab, epoch, health) {
                 Ok(at) => {
                     health.listen(at.iter().flat_map(|a| [Listen::new("udp", *a), Listen::new("tcp", *a)]).collect());
                     health.clear_error();
@@ -647,11 +666,18 @@ fn follow(session: &Shared, srv: &Arc<Server>, port: u16, health: &super::Health
 
 pub(crate) const SERVICE: super::Service = super::Service {
     name: "dns-server",
-    flags: &[super::Flag {
-        name: "--dns-port",
-        value: Some("<port>"),
-        help: "port of the LAN DNS forwarder (default 53; on with\nip.dns.set allow_remote_requests=yes)",
-    }],
+    flags: &[
+        super::Flag {
+            name: "--dns-port",
+            value: Some("<port>"),
+            help: "port of the LAN DNS forwarder (default 53; on with\nip.dns.set allow_remote_requests=yes)",
+        },
+        super::Flag {
+            name: "--dns-lab-any",
+            value: None,
+            help: "virtual lab: the LAN DNS forwarder listens on every address\n(default: loopback only; for a lab inside a network namespace)",
+        },
+    ],
     topic: "dns",
     enable: "ip.dns.set allow_remote_requests=yes",
     depends: &["dns-resolver"],
@@ -667,6 +693,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
             .parse()
             .map_err(|_| format!("--dns-port: '{p}' is not a port"))?,
     };
+    let any = ctx.flag("--dns-lab-any").is_some();
     let session = ctx.session.clone();
     let shutdown = ctx.shutdown.clone();
     Ok(Box::new(move |health: &super::Health| {
@@ -679,7 +706,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
                 SERVER.get_or_init(|| srv).clone()
             }
         };
-        follow(&session, &srv, port, health);
+        follow(&session, &srv, port, any, health);
         Ok(())
     }))
 }
@@ -974,6 +1001,15 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    #[test]
+    fn the_virtual_lab_answers_only_on_the_loopback() {
+        // audit-e2e: with `--backend virtual` the forwarder listened on
+        // 0.0.0.0/[::], so the host's LAN reached the lab's resolver.
+        assert!(is_lab(&shared(Session::virtual_lab())));
+        assert!(listen_ips(true).iter().all(IpAddr::is_loopback));
+        assert!(listen_ips(false).iter().all(IpAddr::is_unspecified));
     }
 
     #[test]

@@ -138,13 +138,19 @@ fn the_lan_is_served_and_outsiders_refused() {
     let _ = std::fs::remove_dir_all(&dir);
     let log = std::fs::File::create(std::env::temp_dir().join("g41b-netns.log")).unwrap();
     let mut c = Command::new(DAEMON);
-    c.args(["--no-discovery", "--control", PORT, "--config-dir"])
-        .arg(&dir)
-        .arg("--token-file")
-        .arg(common::token_file(None, &dir))
-        .env("RUST_LOG", "info")
-        .stdout(Stdio::null())
-        .stderr(log);
+    c.args([
+        "--no-discovery",
+        "--dns-lab-any",
+        "--control",
+        PORT,
+        "--config-dir",
+    ])
+    .arg(&dir)
+    .arg("--token-file")
+    .arg(common::token_file(None, &dir))
+    .env("RUST_LOG", "info")
+    .stdout(Stdio::null())
+    .stderr(log);
     let _daemon = Kill(c.spawn().unwrap());
     wait_for("the daemon", || run("interface.list", json!({})).is_ok());
 
