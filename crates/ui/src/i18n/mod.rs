@@ -25,6 +25,8 @@ mod en;
 mod pt;
 mod tuning_en;
 mod tuning_pt;
+mod xdp_en;
+mod xdp_pt;
 
 /// A language the GUI speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -61,15 +63,15 @@ impl Lang {
     fn labels(self) -> &'static [Table] {
         match self {
             Lang::En => &[],
-            Lang::Pt => &[pt::LABELS, tuning_pt::LABELS],
+            Lang::Pt => &[pt::LABELS, tuning_pt::LABELS, xdp_pt::LABELS],
         }
     }
 
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, xdp_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, xdp_pt::HELP],
         }
     }
 

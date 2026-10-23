@@ -45,6 +45,15 @@ Layout da imagem:
    determinístico com port-block allocation** (RFC 6888/7422 — log por bloco, não por sessão),
    ACL de borda e mitigação de DDoS. Programas no crate isolado `dataplane-ebpf` (único lugar
    com `unsafe`), tipos compartilhados em `dataplane-ebpf-common`, loader no `hal-linux`.
+   **G2.5a (feito):** filtro anti-DDoS em XDP (`docs/xdp.md`). Escolhas e porquê: programa em
+   Rust (`aya-ebpf`) em vez de C/libbpf (uma linguagem só; a lógica de parse e decisão é a mesma
+   função no kernel e nos testes do host, com diferencial kernel × host no CI); objeto
+   pré-compilado com hash das fontes em vez de compilar no build normal (o workspace continua
+   estável, sem nightly nem `bpf-linker`); mapas com chaves e valores de inteiros/arrays (o
+   loader não precisa de `unsafe impl Pod`); links por processo (daemon morto = fail-open).
+   Números medidos no CI (ns/pacote por tamanho da LPM, pktgen em veth contra a tabela raw do
+   nftables) no `docs/perf.md`; native numa placa real fica com o usuário (roteiro no
+   `docs/xdp.md`).
 3. **DPDK/VPP:** não entra no caminho crítico. Se um cliente precisar de >100 Gbit/s de CGNAT
    por caixa, vira um terceiro backend do mesmo trait (VPP pela API binária).
 
@@ -114,6 +123,8 @@ CoreRouter/
 │   ├── model/            # L0
 │   ├── hal/              # L1 (traits + virtual)
 │   ├── hal-linux/        # L1 plataforma
+│   ├── dataplane-ebpf-common/ # L1 plataforma: parse/decisão do XDP, no_std (G2.5)
+│   ├── dataplane-ebpf/   # programas XDP (bpfel, nightly; fora do workspace) (G2.5)
 │   ├── firewall/         # L1 puro: validação + render nftables (G2.1)
 │   ├── proto-bgp/ proto-ospf/ proto-mpls/ proto-cgnat/ proto-dns/ proto-dhcp/   # L2
 │   ├── proto-lldp/ proto-mndp/   # L2: codecs de descoberta (G5.2)
@@ -133,8 +144,9 @@ CoreRouter/
 └── xtask/                # L7
 ```
 
-Planejados (gaps): `crates/hal-frr` (L1 plataforma, G3.1), `crates/dataplane-ebpf` e
-`crates/dataplane-ebpf-common` (L1 plataforma, G2.5).
+Planejado (gap): `crates/hal-frr` (L1 plataforma, G3.1). `crates/dataplane-ebpf` (programas XDP,
+fora do workspace, `cargo xtask ebpf`) e `crates/dataplane-ebpf-common` (L1 plataforma, usado só
+pelo programa e pelo `hal-linux`) existem desde a G2.5a.
 
 ## 3. Fluxo de um comando
 

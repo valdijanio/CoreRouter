@@ -54,7 +54,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set XDP Filter",
         [],
         None,
-        "{block_lists?: [string] | string (comma-separated address lists; empty clears), allow_lists?: [string] | string, rate_limit?: integer (packets/s per source, 0 = off), rate_burst?: integer (0 = one second's worth), drop_malformed?: bool, drop_invalid_tcp_flags?: bool, force?: bool (commit even if it cuts this management connection)} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, warnings}",
+        "{block_lists?: [string] | string (comma-separated address lists; empty clears), allow_lists?: [string] | string, rate_limit?: u32 (packets/s per source, 0 = off), rate_burst?: u32 (0 = one second's worth), drop_malformed?: bool, drop_invalid_tcp_flags?: bool, force?: bool (commit even if it cuts this management connection)} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, warnings}",
         always,
         set
     ),
@@ -62,7 +62,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, block_prefixes, allow_prefixes, available, unavailable, lists: [{name, entries}]}",
         always, print),
     cmd!(query "ip.firewall.xdp.top", "XDP Top Sources", [], None,
-        "{count?: integer (1..=1000, default 20)} → [{address, packets, bytes, reason, list, last_secs}]",
+        "{count?: u32 (1..=1000, default 20)} → [{address, packets, bytes, reason, list, last_secs}]",
         always, top),
     cmd!(
         "ip.firewall.xdp.reset-counters",
@@ -358,7 +358,8 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
     let st = status(s, 0);
-    let now = s.hal().monotonic_secs();
+    // The session clock: the platform's, else the one the daemon ticks.
+    let now = s.now();
     if let Some(r) = s.ext_mut::<XdpRates>() {
         r.sample(&st, now);
     }

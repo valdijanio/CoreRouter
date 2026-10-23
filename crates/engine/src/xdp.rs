@@ -13,7 +13,7 @@ use corerouter_model::{Config, IfName};
 /// query can turn counters into rates.
 #[derive(Debug, Default)]
 pub struct XdpRates {
-    /// Monotonic seconds of `counts`.
+    /// Seconds (session clock) of `counts`.
     at: Option<u64>,
     counts: BTreeMap<(IfName, usize), u64>,
     /// Packets per second by interface and reason, from the last two
@@ -22,7 +22,7 @@ pub struct XdpRates {
 }
 
 impl XdpRates {
-    /// Take `status`'s counters at `now` (monotonic seconds). Samples less
+    /// Take `status`'s counters at `now` (seconds). Samples less
     /// than a second apart keep the previous rates (the clock counts
     /// seconds); a counter that went down (reset) restarts at 0 pps.
     pub fn sample(&mut self, status: &XdpStatus, now: Option<u64>) {

@@ -1,0 +1,264 @@
+# XDP — filtro antes do kernel e fast path do CGNAT (G2.5)
+
+O CoreRouter roda programas eBPF **escritos em Rust** (`aya-ebpf`) no driver da placa de rede
+(XDP), antes de o kernel alocar o pacote. A G2.5a entrega a base e o **filtro anti-DDoS**
+(IP › Firewall XDP); a G2.5b, o **fast path do CGNAT determinístico** (desenho no fim, depende
+da G2.3).
+
+| Peça | Onde | Camada |
+|---|---|---|
+| Programa XDP (`no_std`, alvo `bpfel-unknown-none`) | `crates/dataplane-ebpf` (fora do workspace) | plataforma |
+| Parse, decisão, token bucket, layout dos mapas (`no_std`, sem `unsafe`) | `crates/dataplane-ebpf-common` | L1 plataforma |
+| Objeto pré-compilado + hash das fontes | `crates/dataplane-ebpf/prebuilt/` | — |
+| Carregador, mapas, contadores (aya, userspace) | `crates/hal-linux/src/xdp.rs` | L1 plataforma |
+| Plano puro (config → prefixos, interfaces) e estado | `crates/hal/src/xdp.rs` | L1 |
+| Config | `crates/model/src/xdp.rs` (`ip.xdp`) | L0 |
+| Comandos `ip.firewall.xdp.*`, pps, lockout | `crates/engine/src/cmd/firewall_xdp.rs`, `engine/src/xdp.rs` | L3 |
+| Janela IP › Firewall XDP | `crates/ui/src/xdp.rs` | L5 |
+
+## Como usar
+
+```sh
+corerouter-cli run ip.firewall.address-list.add '{"list":"attackers","address":"203.0.113.0/24"}'
+corerouter-cli run ip.firewall.address-list.add '{"list":"noc","address":"192.0.2.10"}'
+corerouter-cli run ip.firewall.xdp.interface.add '{"interface":"ether1"}'          # auto: native, senão generic
+corerouter-cli run ip.firewall.xdp.set '{"block_lists":"attackers","allow_lists":"noc","rate_limit":20000}'
+corerouter-cli run ip.firewall.xdp.interface.list    # modo ativo, pps passando e descartados por motivo
+corerouter-cli run ip.firewall.xdp.top '{"count":20}'
+corerouter-cli run ip.firewall.xdp.reset-counters
+```
+
+Ordem da decisão (a mesma função no kernel e nos testes, `filter::decide`):
+
+1. não IP (ARP, LLDP, MPLS, PPPoE): passa;
+2. cabeçalho malformado: descarta se `drop_malformed` (motivo `malformed`); flags TCP impossíveis
+   (tabela `tcp_valid_flags` do `nf_conntrack`): descarta se `drop_invalid_tcp_flags`
+   (`tcp-flags`);
+3. origem numa lista de exceção (`allow_lists`): passa, sem bloqueio nem taxa;
+4. origem numa lista de bloqueio (`block_lists`, LPM trie IPv4 e IPv6): descarta (`blocked`);
+5. limite de taxa por origem ligado: uma ficha do balde da origem (LRU hash), ou descarta
+   (`rate-limit`);
+6. passa.
+
+Comportamento que o operador precisa saber:
+
+- **Nada carrega** enquanto não houver interface configurada: um roteador sem XDP não faz
+  nenhuma chamada BPF.
+- `auto` tenta native e cai para generic (a coluna Nota diz o motivo da recusa); `native` falha
+  onde o driver não tem XDP e o commit inteiro é desfeito (o `apply` do `hal-linux` aplica o XDP
+  por último e, se ele recusar, volta o resto para a config anterior).
+- Os links XDP pertencem ao processo do daemon (bpf_link): se ele morre, o kernel solta o filtro
+  e o tráfego passa sem filtro (**fail-open**), nunca por mapas velhos.
+- Listas: prefixos e faixas (viram blocos CIDR exatos) das address lists do firewall, inclusive
+  as entradas dinâmicas com timeout; a sincronização é por diferença (uma chamada de mapa por
+  prefixo que mudou, não uma recarga).
+- **Lockout:** se a mudança faria o filtro descartar o endereço da própria sessão de gerência
+  (na interface por onde ela chega), o commit é recusado como no firewall (G2.1b), a menos de
+  `force: true` ou Safe Mode. A lista de exceção resolve.
+- O comando avisa (`warnings`) de lista sem entradas e de taxa abaixo de 100 pps.
+- No laboratório virtual o filtro é simulado (contadores crescem com o que está ligado).
+
+## Toolchain do programa
+
+O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-none` e o
+`bpf-linker`. O workspace estável nunca precisa disso:
+
+- `crates/dataplane-ebpf/rust-toolchain.toml` fixa o nightly (`nightly-2026-10-22`) e
+  `.cargo/config.toml` o alvo e o linker; o crate tem `[workspace]` próprio e está em `exclude`
+  no workspace.
+- `cargo xtask ebpf` compila e grava `prebuilt/corerouter-xdp.o` (o que o `hal-linux` embute com
+  `include_bytes_aligned!`) e `prebuilt/corerouter-xdp.sources` (SHA-256 das fontes e do objeto).
+- O passo `ebpf-check` do `cargo xtask ci` confere o hash **sem** nightly (fonte mudada sem
+  recompilar = FAIL) e, onde o toolchain existe, compila o programa; sem ele, `skip` com o
+  motivo.
+- Instalar: `rustup toolchain install nightly-2026-10-22 --profile minimal -c rust-src` e o
+  `bpf-linker` 0.12 do release oficial (`bpf-linker-x86_64-unknown-linux-musl.tar.zst` em
+  github.com/aya-rs/bpf-linker/releases, com o sha256 da API do release conferido) ou
+  `cargo binstall bpf-linker`. O `cargo install` do fonte pede o LLVM 23 do sistema.
+- Licença do programa no kernel: `AGPL-3.0-or-later`. O kernel o trata como não-GPL: ele não
+  pode chamar helpers `gpl_only` (o filtro não usa nenhum; veja a G2.5b).
+
+## Testes
+
+- `crates/dataplane-ebpf-common/tests/filter_props.rs` (host, proptest, 2000 casos por
+  propriedade): ruído nunca dá panic; quadro montado (VLAN/QinQ, IPv4/IPv6, TCP/UDP/ICMP) volta
+  igual do parse; quadro cortado em qualquer ponto do datagrama nunca sai limpo; padding Ethernet
+  não muda nada; listas decidem como um LPM de referência linear; flags TCP seguem a opção; o
+  limite de taxa é um token bucket (rajada exata, nunca acima de `burst + taxa × tempo`).
+- `crates/hal-linux/tests/xdp_root.rs` (root, no CI): o verificador aceita; native e generic em
+  veth; **diferencial kernel × host**: 4000 quadros gerados, cortados e corrompidos passam pelo
+  programa real (`BPF_PROG_TEST_RUN`) e pelo `decide` do host com as mesmas listas, e o veredito
+  tem de ser o mesmo; tráfego real (ping de outro namespace) para contadores, top origens,
+  exceção vencendo o bloqueio e limite de taxa; medições (abaixo).
+- `crates/engine/src/cmd/firewall_xdp.rs` e `crates/engine/tests/xdp.rs`: sucesso, validação,
+  rollback, lockout com `force`; `command_sweep` cobre parâmetros lixo.
+- `crates/ui/src/tests/xdp.rs`: janela, formulário, top, explicações em PT e EN.
+- `cargo xtask xdp-root`: só onde `COREROUTER_REQUIRE_XDP=1` (o runner do CI, que liga a variável
+  pelo arquivo `ci/kernel-modules/veth`); roda o binário de teste com `sudo` num namespace
+  descartável. Localmente vira `skip` e imprime o comando.
+
+## Blocos `unsafe` (revisão humana)
+
+Todos em `crates/dataplane-ebpf/src/main.rs`, cada um com `SAFETY:`:
+
+1. `Frame::bytes`: `read_unaligned` de `[u8; N]` em `data + off` depois de conferir
+   `data + off + N <= data_end` (a mesma checagem que o verificador exige).
+2. `Maps::bucket`: `&mut *p` do ponteiro que o kernel devolve para o valor do LRU hash `RATE`
+   (válido durante a execução, RCU); a corrida entre CPUs só aproxima a taxa.
+3. `count`: incremento do valor por CPU de `COUNTERS` (só esta CPU o toca, sem preempção).
+4. `top`: o mesmo para `TOP` (LRU por CPU).
+5. `bpf_ktime_get_ns()`: helper sem argumentos.
+6. Atributos `#[unsafe(link_section = "license")]` e `#[unsafe(no_mangle)]` do `LICENSE`.
+
+## Pesquisa
+
+Fontes (abertas em 2026-10-23):
+
+- **MikroTik RouterOS v7**: não tem XDP nem eBPF (só um pedido sem resposta no fórum:
+  forum.mikrotik.com/t/feature-request-use-ebpf-xdp-in-the-back-end-of-routeros/155667). O
+  equivalente é `/ip firewall raw` (`prerouting`, antes do connection tracking;
+  manual.mikrotik.com/docs/7.25/cli-reference/ip/firewall/raw/) com `src-address-list` e o
+  matcher `dst-limit=rate[/time],burst,mode[/expire]` no modo `src-address`
+  (help.mikrotik.com/docs/spaces/ROS/pages/250708064/Matchers). O guia "DDoS Protection"
+  (help.mikrotik.com/docs/spaces/ROS/pages/28606504/DDoS+Protection) detecta por `dst-limit`
+  numa regra de filtro, põe atacante e alvo em address lists com timeout e descarta no `raw`.
+- **VyOS**: `set interfaces ethernet ethX xdp` existiu na linha 1.3 e foi desligado como
+  "highly experimental" (T2666, forum.vyos.io/t/xdp-option-missing-on-version-1-3/10326); a T8202
+  tirou o XDP como driver do VPP (vyos.dev/T8202).
+- **Junos** `system ddos-protection` (policer por protocolo do tráfego para o host) e BGP
+  FlowSpec instalado no PFE; **Nokia SR OS** FlowSpec para mitigação; **Cisco** CoPP. Nenhum
+  expõe um filtro programável antes da pilha como XDP. **OpenWrt**: protótipo de offload XDP/TC
+  (GSoC 2024). **OPNsense/pfSense** (FreeBSD): sem XDP.
+- **Cloudflare L4Drop** (blog.cloudflare.com/l4drop-xdp-ebpf-based-ddos-mitigations/): regras do
+  Gatebot em cBPF compiladas para eBPF, amostragem para userspace antes do descarte, >8 Mpps num
+  servidor; o blog de arquitetura cita token buckets sem corrida como difíceis antes do
+  `bpf_spin_lock`. **Katran** (Meta): LB L4 em XDP com tabela LRU de conexões, sem fragmentos.
+  **Cilium prefilter** (`bpf/bpf_xdp.c`): mapas HASH (/32) e LPM_TRIE (CIDR) de origens
+  descartadas. **xdp-filter** (xdp-tools): portas, IPs e MACs em PERCPU_HASH de 10 000 entradas,
+  match exato, modos native/skb/hw, política allow/deny (deny pode trancar o operador).
+  **Polycube**: "cubes" encadeados, NAT só IPv4.
+- **Verificador** (docs.kernel.org/bpf/verifier.html, bpf_design_QA.html, LWN 794934): ~1 milhão
+  de instruções exploradas, pilha de 512 bytes, laços limitados desde o 5.3, todo acesso ao
+  pacote conferido contra `data_end`, tail calls até 33. LPM trie: chave big-endian,
+  `BPF_F_NO_PREALLOC` obrigatório (docs.kernel.org/bpf/map_lpm_trie.html). LRU hash
+  (docs.kernel.org/bpf/map_hash.html).
+- **Drivers com XDP nativo** (bcc docs/kernel-versions.md): mlx4 4.8, mlx5 4.9, virtio_net 4.10,
+  bnxt 4.11, ixgbe 4.12, i40e 4.13, veth 4.14, ice 5.5, ena 5.6, igb 5.10, igc 5.13; generic
+  desde o 4.12. Números de terceiros: mlx5, 1 núcleo, XDP_DROP native 19,8 Mpps contra 8,4 no
+  generic (prototype-kernel, xdp25_eval_generic_xdp_tx); artigo do XDP (CoNEXT 2018,
+  doi.org/10.1145/3281411.3281443): 24 Mpps/núcleo de drop numa ConnectX-5, ~108 Mpps em 6
+  núcleos, contra 4,8 Mpps da tabela raw do iptables e 1,8 Mpps com conntrack.
+- **NAT em XDP**: einat-ebpf (TC, EIM/EIF); `bpf_csum_diff` existe em XDP desde o 4.16, mas os
+  `bpf_l3/l4_csum_replace` são só de TC, então a reescrita de checksum no XDP é à mão (RFC 1624);
+  nenhum CGNAT em XDP maduro e aberto encontrado.
+- **RFCs**: 7422 (Informational, errata 4211 editorial; f1(IP interno) → (IP externo, faixa) e
+  f2(IP externo, porta) → IP interno), 1624 (HC' = ~(~HC + ~m + m'); errata 4782: com m = m' e
+  HC = 0 dá 0xFFFF, então não reescrever o que não mudou), 4787 (atualizada pelas 6888 e 7857:
+  REQ-1 EIM, REQ-4 paridade, REQ-5 timeout UDP ≥ 2 min, REQ-9 hairpin, REQ-12 ICMP não destrói
+  mapeamento, REQ-14 fragmentos), 1858 §3 (fragmento minúsculo e sobreposição).
+
+O que adotamos:
+
+- Nomes e modelo do RouterOS onde ele tem equivalente: as **address lists do firewall** são a
+  fonte das listas (o operador já as alimenta, inclusive por regras com timeout), e o limite por
+  origem segue o `dst-limit … src-address` (taxa + rajada).
+- Do Cilium: LPM trie para CIDR (em vez do match exato do xdp-filter, que não serve para listas
+  de reputação). Do xdp-filter: modos native/generic explícitos, com `auto` como padrão.
+- Da tabela do `nf_conntrack`: quais flags TCP são válidas (nenhum descarte que o kernel não
+  marcaria como inválido).
+
+Melhorias sobre os outros:
+
+- **Lista de exceção** que vence bloqueio e taxa, e **lockout** checado no commit (o
+  xdp-filter documenta que o modo deny pode trancar o operador; aqui o commit é recusado).
+- **Diferencial kernel × host** no CI: a mesma função de decisão compila para o kernel e para o
+  host, e milhares de quadros gerados têm de dar o mesmo veredito nos dois.
+- Tudo é comando: transação, Safe Mode, diff e rollback valem para o filtro como para o resto;
+  MCP e CLI veem o mesmo.
+- **Top origens** com motivo e lista, para alimentar uma regra ou investigar.
+
+Fica de fora (gaps novas): entradas que regras `add-src-to-address-list` põem na lista (vivem
+só no set do nftables; G2.5c), programas fixados no bpffs para sobreviver ao restart do daemon e
+amostragem de pacotes descartados para userspace estilo L4Drop (G2.5c), PPPoE e MPLS no parse,
+bloqueio por destino (RTBH local), FlowSpec alimentando as listas (G2.5d).
+
+## Desempenho
+
+**Medido** no runner do GitHub Actions (ubuntu-latest, 4 vCPUs, kernel do runner), build de
+teste (o programa XDP é o objeto release; o userspace é debug), saída `PERF |` do
+`xdp_root.rs`. Ver a tabela em `docs/changes/G2.5a.md` (seção `## perf`), consolidada no
+`docs/perf.md` pela fila.
+
+O que só uma **placa real em modo native** mede, e que veth, modo generic e `BPF_PROG_TEST_RUN`
+não mostram: a taxa de descarte no driver antes da alocação do `skb` (o ganho grande do XDP),
+o espalhamento por filas (RSS) e a escala com núcleos, o limite do PCIe e do anel de recepção,
+o efeito de cache com milhões de origens distintas e a latência sob carga.
+
+### Roteiro para medir no seu hardware
+
+Estes comandos rodam como root na **sua** máquina de teste (os agentes nunca usam `sudo`).
+Precisa de duas máquinas: o roteador (com a placa, ex. ConnectX-4/5, Intel X710/E810) e um
+gerador ligado a ela.
+
+1. No roteador, compile e rode o daemon com o backend real (como você já faz no namespace
+   `corerouter`):
+   ```sh
+   cargo build --release -p corerouter-daemon -p corerouter-cli
+   sudo ./target/release/corerouter-daemon --backend linux --control 7979 --config-dir /var/lib/corerouter-hw
+   ```
+2. Ponha o filtro na porta de entrada em modo native, com uma lista que pega o tráfego de teste:
+   ```sh
+   C="./target/release/corerouter-cli --connect 127.0.0.1:7979"
+   $C run ip.firewall.address-list.add '{"list":"bench","address":"198.18.0.0/15"}'
+   $C run ip.firewall.xdp.interface.add '{"interface":"<porta>","mode":"native"}'
+   $C run ip.firewall.xdp.set '{"block_lists":"bench"}'
+   ```
+3. No gerador, pktgen do kernel (64 bytes, origens aleatórias em 198.18.0.0/15, uma thread por
+   fila; troque `<if>` e `<mac do roteador>`):
+   ```sh
+   sudo modprobe pktgen
+   sudo /usr/src/linux/samples/pktgen/pktgen_sample05_flow_per_thread.sh -i <if> -m <mac do roteador> \
+     -d 10.0.0.1 -s 64 -t 4 -n 0
+   ```
+   (sem as amostras do kernel: os mesmos comandos de `/proc/net/pktgen` que o `xdp_root.rs`
+   usa, com `flag IPSRC_RND`.)
+4. No roteador, leia a taxa a cada segundo e a CPU:
+   ```sh
+   watch -n1 "$C run ip.firewall.xdp.interface.list"
+   mpstat -P ALL 1
+   ```
+5. Repita com `"mode":"generic"`, com o filtro desligado e com a regra equivalente no nftables
+   (`table inet t { chain raw { type filter hook prerouting priority -300; ip saddr 198.18.0.0/15 drop; } }`)
+   para a comparação. Para o custo por regra da LPM no seu processador, rode o teste de medição
+   (namespace descartável, nada sai dele):
+   ```sh
+   cargo test --release -p corerouter-hal-linux --test xdp_root --no-run
+   sudo ip netns add crxdp
+   sudo ip netns exec crxdp env COREROUTER_XDP_ROOT=1 target/release/deps/xdp_root-* perf_lpm_cost --nocapture
+   sudo ip netns del crxdp
+   ```
+6. Mande a saída: entra no `docs/perf.md` como **medido** (máquina, placa, kernel, data).
+
+## G2.5b — fast path do CGNAT determinístico (desenho)
+
+Depende da G2.3 (sessão Firewall/CGNAT): a **função de mapeamento determinístico** (RFC 7422)
+fica num lugar só. Plano:
+
+- A parte de cálculo da G2.3 (dado o IP interno: IP externo e faixa de portas; e o inverso) vai
+  para um módulo `no_std` sem alocação que o `dataplane-ebpf-common` usa — ou a própria G2.3 a
+  expõe assim (`proto-cgnat` com `#![no_std]` na parte de cálculo). Nunca duas implementações:
+  um teste no `hal-linux` compara as duas pontas para milhares de endereços.
+- Saída (interno → externo): parse, `f1(src)` dá IP externo e faixa; a porta sai de um mapa de
+  fluxos (LRU hash 5-tupla → porta) ou, se novo, da próxima livre na faixa do assinante (um mapa
+  por assinante com o cursor); reescreve origem e porta e corrige os checksums IP e TCP/UDP de
+  forma incremental (RFC 1624 Eqn 3, sem reescrever o que não mudou: errata 4782).
+- Entrada (externo → interno): `f2(dst, porta)` dá o assinante sem estado nenhum (a vantagem do
+  determinístico); o mapa de fluxos confirma a 5-tupla (filtro EIM/EIF conforme a G2.3).
+- Fica no kernel (XDP_PASS para o caminho nftables da G2.3): fragmentos, ICMP de erro com
+  payload (precisa traduzir o cabeçalho interno), ALG (FTP, SIP), o que a tabela de fluxos não
+  conhece ainda e o que vai para o próprio roteador.
+- Encaminhar no XDP (`XDP_TX`/`XDP_REDIRECT`) pede `bpf_fib_lookup`, que é `gpl_only`: com a
+  licença AGPL do programa, o kernel recusa. Opções: passar ao kernel depois da tradução
+  (XDP_PASS, ganho menor) ou declarar o programa com licença compatível com GPL — **decisão de
+  licença do usuário**.
+- "Quem era?" da G2.3: a mesma fórmula responde, sem log a mais.
