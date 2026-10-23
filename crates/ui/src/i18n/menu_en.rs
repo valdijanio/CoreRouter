@@ -24,6 +24,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.dns-tsig", "## What it does\nTSIG keys (RFC 8945): shared secrets that sign zone transfers and dynamic updates between DNS servers."),
     ("menu.dns-zones", "## What it does\nZones the router is authoritative for: primary or secondary, transfers, DNSSEC and dynamic updates.\n\nThree tabs: **Zones**, the **Records** of a zone (SOA, NS, A, MX…) and the **Zone File** in the standard (BIND) format, to export or import."),
     ("menu.firewall", "## What it does\nPacket filtering and translation: filter rules (what passes), NAT (masquerade, port forwarding), mangle, address lists and zones.\n\nA rule that would cut your own access is held and explained before it applies."),
+    ("menu.graphs", "## What it does\nThe traffic history the router keeps: bits and packets per second, errors and drops of each kept interface, and the router's CPU, memory and conntrack, for the last hour, day, week, month or year. Shows the average, maximum, 95th percentile (billing) and totals; compares interfaces; exports CSV and PNG.\n\n**Settings…** chooses what is kept (physical ports by default) and the memory ceiling."),
     ("menu.history", "## What it does\nEvery committed change of the configuration, who made it and when. Pick a revision to see the difference or to go back to it (rollback)."),
     ("menu.identity", "## What it does\nThe router's name: shown in the terminal prompt, in the neighbors' lists and in the logs."),
     ("menu.interface-list", "## What it does\nNamed groups of interfaces (LAN, WAN…) that firewall rules, DNS and other features name instead of each port."),
@@ -44,6 +45,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.settings", "## What it does\nPreferences of this GUI, not of the router: the language of the labels and of the explanations. Kept on this computer."),
     ("menu.sniffer", "## What it does\nRecords an interface's frames into a pcap file for Wireshark, with a filter and a bounded size and duration; download the file from the GUI. Headers only by default (the data is subscribers')."),
     ("menu.torch", "## What it does\nAn interface's traffic live, per flow: who talks to whom and how much each way, grouped by source, destination, protocol, port, VLAN, DSCP or MAC, with the destination's AS. Above ~500 kpps it samples 1:N and says so."),
+    ("menu.traffic-flow", "## What it does\nExports a record of every connection to flow collectors, in IPFIX or NetFlow v9, with the addresses and ports before and after NAT and RFC 8158 NAT events: the connection log a provider keeps (Marco Civil). Also shows the top talkers without a collector."),
     ("menu.tuning", "## What it does\nKernel and hardware tuning for routing: network buffers, conntrack, CPU governor, IRQ and RPS/XPS per interface, and the boot parameters — with recommended values and why."),
     ("menu.vrf", "## What it does\nVRFs: separate routing tables on the same router, for customers or management kept apart."),
 ];

@@ -53,6 +53,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.dns-tsig", "## O que faz\nChaves TSIG (RFC 8945): segredos compartilhados que assinam transferências de zona e atualizações dinâmicas entre servidores DNS."),
     ("menu.dns-zones", "## O que faz\nZonas em que o roteador é autoritativo: primária ou secundária, transferências, DNSSEC e atualizações dinâmicas.\n\nTrês abas: **Zones**, os **Records** de uma zona (SOA, NS, A, MX…) e o **Zone File** no formato padrão (BIND), para exportar ou importar."),
     ("menu.firewall", "## O que faz\nFiltragem e tradução de pacotes: regras de filtro (o que passa), NAT (masquerade, redirecionamento de portas), mangle, address lists e zonas.\n\nUma regra que cortaria o seu próprio acesso fica retida e é explicada antes de valer."),
+    ("menu.graphs", "## O que faz\nO histórico de tráfego que o roteador guarda: bits e pacotes por segundo, erros e descartes de cada interface guardada, e CPU, memória e conntrack do roteador, na última hora, dia, semana, mês ou ano. Mostra média, máximo, percentil 95 (cobrança) e totais; compara interfaces; exporta CSV e PNG.\n\n**Configurações…** escolhe o que é guardado (as portas físicas por padrão) e o teto de memória."),
     ("menu.history", "## O que faz\nCada mudança da configuração com commit, quem fez e quando. Escolha uma revisão para ver a diferença ou voltar a ela (rollback)."),
     ("menu.identity", "## O que faz\nO nome do roteador: aparece no prompt do terminal, na lista de vizinhos e nos logs."),
     ("menu.interface-list", "## O que faz\nGrupos nomeados de interfaces (LAN, WAN…) que as regras de firewall, o DNS e outras funções usam em vez de cada porta."),
@@ -73,6 +74,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.settings", "## O que faz\nPreferências desta GUI, não do roteador: o idioma dos rótulos e das explicações. Guardadas neste computador."),
     ("menu.sniffer", "## O que faz\nGrava os quadros de uma interface num arquivo pcap para abrir no Wireshark, com filtro, tamanho e duração limitados; baixe o arquivo pela GUI. Por padrão só os cabeçalhos (os dados são dos assinantes)."),
     ("menu.torch", "## O que faz\nO tráfego de uma interface ao vivo, por fluxo: quem fala com quem, quanto em cada sentido, agrupado por origem, destino, protocolo, porta, VLAN, DSCP ou MAC, com o AS do destino. Acima de ~500 kpps amostra 1:N e avisa."),
+    ("menu.traffic-flow", "## O que faz\nExporta um registro de cada conexão para coletores de fluxo, em IPFIX ou NetFlow v9, com endereços e portas antes e depois do NAT e os eventos de NAT da RFC 8158: o registro de conexão que o provedor guarda (Marco Civil). Mostra também os maiores consumidores sem coletor."),
     ("menu.tuning", "## O que faz\nAjustes de kernel e hardware para roteamento: buffers de rede, conntrack, governor da CPU, IRQ e RPS/XPS por interface e os parâmetros de boot — com valores recomendados e o porquê."),
     ("menu.vrf", "## O que faz\nVRFs: tabelas de rotas separadas no mesmo roteador, para manter clientes ou gerência isolados."),
 ];

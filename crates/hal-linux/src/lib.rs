@@ -600,6 +600,10 @@ mod linux {
             crate::ctnl::delete(conns)
         }
 
+        fn resources(&mut self) -> Option<corerouter_hal::resources::Resources> {
+            Some(self.sysctl.root.resources())
+        }
+
         fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {
             Ok(self.sysctl.root.kernel_stats())
         }

@@ -785,6 +785,42 @@ própria. Grupos abertos são preferência da janela (`prefs.rs`, chave `menu`).
   reprova ícone sem glifo. Quando o `egui-phosphor` acompanhar o egui do workspace, dá para trocar
   o subconjunto pelo crate (macro `subset!`) sem mudar `icons.rs`.
 
+### Histórico de tráfego (G4.5)
+
+O roteador guarda um histórico **leve e local** de cada interface escolhida (bps, pps, erros e
+drops) e dele mesmo (CPU, memória, conntrack), estilo RRDtool, em resolução decrescente:
+1 s na última hora, 1 min no último dia, 5 min na última semana, 1 h no último ano. O ClickHouse
+(G4.4f) é externo e opcional; ele lê daqui (`system.graph.export` ou `GraphDb::export`).
+
+- **Onde mora:** `engine::graph` (puro, compila em wasm): o formato (`graph::rrd`), a coleta e as
+  consultas. A coleta vai no `Session::tick` que já faz a varredura de links por segundo
+  (`poll_links`): sem dump extra de netlink. CPU, memória e conntrack vêm de `Hal::resources`
+  (`/proc/stat`, `/proc/meminfo`, `nf_conntrack_count`). O disco é do daemon
+  (`service/graphing.rs`, `<config-dir>/graphs/`): o engine entrega `Patch`es e recebe os
+  arquivos de volta no boot, sem I/O próprio. A GUI sem daemon tem o histórico só em memória.
+- **Formato próprio × `redb` × `fjall` (decisão, com números):** um RRD tem tamanho fixo e é
+  escrito sempre no mesmo lugar; o que se quer é **zero amplificação de escrita** (flash) e
+  teto de disco natural. Formato próprio: um arquivo por série (cabeçalho + quatro anéis de
+  `f32`, média e máximo por slot), escrito no lugar: um store de 5 min grava só os baldes de
+  1 min, 5 min e 1 h fechados desde o último (~0,5 KB por interface, **medido** no teste
+  `a_restart_reads_back_what_was_stored`), e o anel de 1 s (o grosso) só no desligamento
+  limpo. O `redb` (B-tree copy-on-write) reescreve páginas inteiras e a raiz a cada commit
+  (4 KiB+ por série por store, mais o fsync do arquivo inteiro) e cresce até o `compact`; o
+  `fjall` (LSM) reescreve tudo nas compactações e precisa de tuning de memória — os dois resolvem
+  um problema (chave-valor geral, transações) que o RRD não tem, e acrescentariam um crate
+  grande ao daemon. Ficou o formato próprio (~500 linhas com testes).
+- **Teto:** o tamanho de uma série é fixo (672.984 bytes por interface, 336.600 a do sistema);
+  `max_memory_mib` (64 MiB por padrão, ~90 interfaces) recusa o que não cabe, registra no log e
+  lista em `system.graph.print`. Memória e disco são o mesmo número.
+- **Custos (medidos, release, `cargo bench -p corerouter-engine --bench graph`, 2026-10-23):**
+  um segundo de coleta 1,9 µs / 20 µs / 355 µs com 8 / 64 / 512 interfaces (dentro do lock da
+  sessão); tirar as mudanças de um store 4,7 µs / 33 µs / 547 µs; consultar um ano de uma
+  interface 1,36 ms. Daemon inteiro em `docs/changes/G4.5a.md`.
+- **Revisitar se:** o operador quiser cobrança mensal exata (p95 de amostras de 5 min por 30
+  dias, que o anel de 5 min de uma semana não tem: um quinto anel de 5 min × 35 dias custa
+  +168 KB por interface — gap G4.5b) ou milhares de interfaces (aí o anel de 1 h pode ficar só
+  no disco e ser lido sob demanda).
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

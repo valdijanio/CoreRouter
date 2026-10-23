@@ -143,7 +143,8 @@ pub fn table(
                         src: s,
                         dst: d,
                         src_port: if protocol == 1 { icmp_id } else { sport },
-                        dst_port: dport,
+                        // ICMP: type and code, an echo request.
+                        dst_port: if protocol == 1 { 8 << 8 } else { dport },
                     },
                     // ICMP: the query id is the translated "port", carried
                     // in both tuples' id (here `src_port`).
