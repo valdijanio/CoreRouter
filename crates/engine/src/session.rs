@@ -104,6 +104,11 @@ pub struct Session {
     ext: crate::ext::Extensions,
 }
 
+/// Inside an atomic [`Session::batch`]: its steps need no rollback point
+/// of their own (a failure restores the batch's).
+#[derive(Debug, Default)]
+struct AtomicBatch(bool);
+
 /// Session shared between the UI thread and the control server.
 pub type Shared = Arc<Mutex<Session>>;
 
@@ -119,6 +124,8 @@ pub fn lock(s: &Shared) -> MutexGuard<'_, Session> {
 }
 
 const MAX_JOURNAL: usize = 1024;
+/// Entries past [`MAX_JOURNAL`] kept before a trim (see `record`).
+const JOURNAL_SLACK: usize = 256;
 /// Steps of one batch. `/import` sends a whole script as one atomic batch
 /// (at most 1 MiB, ~30 bytes a command at the least): a router must be able
 /// to import its own `/export` (audit #9).
@@ -239,15 +246,21 @@ impl Session {
 
     /// The one door: UI, CLI, control channel and MCP all call this.
     pub fn execute(&mut self, id: &str, params: &Value) -> Result<Value> {
-        let result = self.execute_counted(id, params);
-        let journal = cmd::find(id).map(|spec| spec.journal);
-        self.counters.note_command(journal, result.is_ok());
+        let spec = cmd::find(id);
+        let result = self.execute_counted(spec, id, params);
+        self.counters
+            .note_command(spec.map(|spec| spec.journal), result.is_ok());
         result
     }
 
-    fn execute_counted(&mut self, id: &str, params: &Value) -> Result<Value> {
+    fn execute_counted(
+        &mut self,
+        spec: Option<&'static cmd::CommandSpec>,
+        id: &str,
+        params: &Value,
+    ) -> Result<Value> {
         self.expire_safe_mode();
-        let spec = cmd::find(id).ok_or_else(|| unknown_command(id))?;
+        let spec = spec.ok_or_else(|| unknown_command(id))?;
         self.permit(auth::required_group(spec.id, spec.journal))
             .map_err(|reason| EngineError::Denied {
                 id: id.to_owned(),
@@ -259,7 +272,12 @@ impl Session {
             reason,
         })?;
 
-        let snapshot = self.store.candidate().clone();
+        // Queries never change the config: no rollback point to copy
+        // (`queries_leave_the_candidate_alone` runs every one of them).
+        // Inside an atomic batch a failed step undoes the whole batch from
+        // its own copy: one per step made `/import` quadratic (audit-perf).
+        let in_atomic = self.ext::<AtomicBatch>().is_some_and(|a| a.0);
+        let snapshot = (spec.journal && !in_atomic).then(|| self.store.candidate().clone());
         let rev_before = self.store.current_revision();
         // The commit runs inside the guard too: a panic in a validator or
         // the data plane must not leave the edit behind for the next
@@ -271,7 +289,7 @@ impl Session {
             }
             Ok(value)
         });
-        if result.is_err() {
+        if let (Err(_), Some(snapshot)) = (&result, snapshot) {
             self.store.set_candidate(snapshot);
         }
         if !self.in_batch {
@@ -351,7 +369,10 @@ impl Session {
             self.mode = CommitMode::Transactional;
         }
         let outer_batch = std::mem::replace(&mut self.in_batch, true);
+        let outer_atomic = self.ext::<AtomicBatch>().is_some_and(|a| a.0);
+        self.ext.set(AtomicBatch(atomic || outer_atomic));
         let out = self.batch_steps(steps, atomic, saved_mode, snapshot);
+        self.ext.set(AtomicBatch(outer_atomic));
         self.in_batch = outer_batch;
         if !outer_batch {
             self.lockout_ack = false;
@@ -457,23 +478,29 @@ impl Session {
             )]));
         }
         // The data plane also holds what DHCP clients installed (G4.7).
-        let running = self.effective(self.store.running()).into_owned();
-        let to = self.effective(self.store.candidate()).into_owned();
+        // Copied only when DHCP added something (audit-perf: two copies of
+        // the whole config per commit before).
+        let running_dyn = owned(self.effective(self.store.running()));
+        let to_dyn = owned(self.effective(self.store.candidate()));
+        let running = running_dyn.as_ref().unwrap_or(self.store.running());
+        let to = to_dyn.as_ref().unwrap_or(self.store.candidate());
         // The lockout check sees the same: a DHCP address can be the one
         // the operator is connected to.
         if lockout {
             let dynamic = self.dynamic_now();
-            self.check_lockout(&running, &to, &dynamic, &dynamic)?;
+            self.check_lockout(running, to, &dynamic, &dynamic)?;
         }
         // The boot apply failed: the data plane may hold nothing of the
         // running config, so install all of it, not only the change.
+        let empty;
         let from = if self.storage_status.boot_apply_error.is_some() {
-            Config::default()
+            empty = Config::default();
+            &empty
         } else {
             running
         };
         self.hal
-            .apply(&from, &to)
+            .apply(from, to)
             .map_err(|e| EngineError::Hal(e.to_string()))?;
         if self.storage_status.boot_apply_error.take().is_some() {
             log::info!("the whole config reached the data plane with this commit");
@@ -612,8 +639,12 @@ impl Session {
                 .err()
                 .map(|e| crate::logging::cut(&e.to_string(), 512)),
         });
-        if self.journal.len() > MAX_JOURNAL {
-            self.journal.remove(0);
+        // Trimmed in chunks: one shift of the whole journal per
+        // `JOURNAL_SLACK` commands instead of one per command (audit-perf);
+        // `journal()` shows the newest `MAX_JOURNAL` either way.
+        if self.journal.len() > MAX_JOURNAL.saturating_add(JOURNAL_SLACK) {
+            let excess = self.journal.len().saturating_sub(MAX_JOURNAL);
+            self.journal.drain(..excess);
         }
         self.log_journal(self.seq, id, &params, result, revision);
     }
@@ -652,7 +683,7 @@ impl Session {
                 },
                 "paths": ["system", "interfaces", "interface_lists", "ip", "ip.firewall", "routing", "running", "journal"],
             })),
-            Some("journal") => serde_json::to_value(&self.journal)
+            Some("journal") => serde_json::to_value(self.journal())
                 .map_err(|e| EngineError::Internal(e.to_string())),
             Some(p) => {
                 let (root, rest) = match p.strip_prefix("running") {
@@ -706,8 +737,10 @@ impl Session {
         self.mode = mode;
     }
 
+    /// The newest journal entries (at most `MAX_JOURNAL`), oldest first.
     pub fn journal(&self) -> &[JournalEntry] {
-        &self.journal
+        let start = self.journal.len().saturating_sub(MAX_JOURNAL);
+        self.journal.get(start..).unwrap_or_default()
     }
 
     pub fn storage_status(&self) -> &StorageStatus {
@@ -953,4 +986,12 @@ fn resolve_refs(v: &Value, results: &[Value]) -> Result<Value> {
         ),
         other => other.clone(),
     })
+}
+
+/// The value of a `Cow` that had to be built, `None` for a borrowed one.
+fn owned<T: Clone>(c: std::borrow::Cow<'_, T>) -> Option<T> {
+    match c {
+        std::borrow::Cow::Owned(v) => Some(v),
+        std::borrow::Cow::Borrowed(_) => None,
+    }
 }

@@ -84,8 +84,33 @@ pub fn all() -> impl Iterator<Item = &'static CommandSpec> {
     AREAS.iter().flat_map(|area| area.iter())
 }
 
+/// Every command by id, with its declared parameter keys, built once:
+/// `execute` looked the id up by a linear scan of the registry (twice) and
+/// re-parsed the `params` doc on every call (audit-perf).
+type Index = std::collections::HashMap<&'static str, (&'static CommandSpec, Vec<(&'static str, bool)>)>;
+
+fn index() -> &'static Index {
+    static INDEX: std::sync::OnceLock<Index> = std::sync::OnceLock::new();
+    INDEX.get_or_init(|| {
+        let mut index = Index::new();
+        for c in all() {
+            // The first wins, as the scan did (ids are unique: tested).
+            index.entry(c.id).or_insert_with(|| (c, doc_keys(c.params)));
+        }
+        index
+    })
+}
+
 pub fn find(id: &str) -> Option<&'static CommandSpec> {
-    all().find(|c| c.id == id)
+    index().get(id).map(|(c, _)| *c)
+}
+
+/// [`doc_keys`] of `spec`, parsed once for the registered commands.
+fn declared_keys(spec: &CommandSpec) -> std::borrow::Cow<'static, [(&'static str, bool)]> {
+    match index().get(spec.id) {
+        Some((c, keys)) if c.params == spec.params => std::borrow::Cow::Borrowed(keys.as_slice()),
+        _ => std::borrow::Cow::Owned(doc_keys(spec.params)),
+    }
 }
 
 pub fn unknown_command(id: &str) -> EngineError {
@@ -140,7 +165,7 @@ pub fn doc_keys(doc: &str) -> Vec<(&str, bool)> {
 /// Reject non-object params, unknown keys (with a suggestion) and missing
 /// required keys — before the command runs.
 pub fn check_params(spec: &CommandSpec, params: &Value) -> Result<()> {
-    let declared = doc_keys(spec.params);
+    let declared = declared_keys(spec);
     let empty = serde_json::Map::new();
     let obj = match params {
         Value::Null => &empty,
@@ -155,7 +180,7 @@ pub fn check_params(spec: &CommandSpec, params: &Value) -> Result<()> {
             });
         }
     }
-    for (key, required) in declared {
+    for &(key, required) in declared.iter() {
         if required && obj.get(key).is_none_or(Value::is_null) {
             return Err(EngineError::bad(key, "is required"));
         }

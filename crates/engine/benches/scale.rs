@@ -1,7 +1,9 @@
 //! Engine cost with a big config already committed (audit-net): what one
 //! more commit costs with N filter rules, routes, addresses or address-list
 //! entries in place, the whole-config validation alone, and `ip.route.list`.
-//! Before audit-net several of these grew quadratically with N.
+//! Before audit-net several of these grew quadratically with N. And
+//! `import/*` (audit-perf): an atomic batch of N adds, what `/import` of an
+//! `/export` sends (every step copied the whole candidate before).
 //!
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-engine --bench scale`.
 
@@ -183,6 +185,26 @@ fn scale(c: &mut Criterion) {
                 });
             }
         }
+    }
+    // `/import`: one atomic batch of N address-list adds on a fresh lab.
+    for n in [1000usize, 5000] {
+        let steps: Vec<_> = (0..n)
+            .map(|i| {
+                json!({"command": "ip.firewall.address-list.add",
+                       "params": {"list": "blocked", "address": host(i).to_string()}})
+            })
+            .collect();
+        let steps = json!(steps);
+        g.bench_function(BenchmarkId::new("import/address_lists", n), |b| {
+            b.iter_batched(
+                Session::virtual_lab,
+                |mut s| {
+                    s.batch(black_box(&steps), true).unwrap();
+                    s
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
     }
     g.finish();
 }
