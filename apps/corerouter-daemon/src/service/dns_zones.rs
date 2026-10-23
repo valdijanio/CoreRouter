@@ -13,7 +13,7 @@
 //!   not refreshed for EXPIRE stops answering (SERVFAIL); a failed
 //!   transfer keeps the old copy (RFC 5936 §6). Timers come from the
 //!   loaded SOA, clamped like BIND (refresh 300 s..4 weeks, retry 60 s..2
-//!   weeks).
+//!   weeks, expire at least refresh + retry).
 //! - **DNSSEC** (G4.1c-2): every second the engine's key life cycle runs
 //!   (`Session::dnssec_tick`, with ring generating the keys here); a
 //!   signed zone is re-signed in a thread of its own when its data or keys
@@ -62,6 +62,9 @@ const MIN_REFRESH_SECS: u32 = 300;
 const MAX_REFRESH_SECS: u32 = 2_419_200;
 const MIN_RETRY_SECS: u32 = 60;
 const MAX_RETRY_SECS: u32 = 1_209_600;
+/// An UPDATE whose records moved under it is checked again this many
+/// times before SERVFAIL.
+const UPDATE_TRIES: usize = 4;
 
 fn unix_now() -> u64 {
     SystemTime::now()
@@ -133,11 +136,15 @@ fn timers(data: Option<&ZoneData>, conf: &ZoneConf) -> (u32, u32, u32) {
         (conf.refresh_secs, conf.retry_secs, conf.expire_secs),
         ZoneData::timers,
     );
-    (
+    let (r, y) = (
         r.clamp(MIN_REFRESH_SECS, MAX_REFRESH_SECS),
         y.clamp(MIN_RETRY_SECS, MAX_RETRY_SECS),
-        e,
-    )
+    );
+    // RFC 1912 §2.2 / BIND: EXPIRE at least REFRESH + RETRY, or a short
+    // one drops the copy long before the next check (SERVFAIL most of the
+    // time).
+    let floor = r.saturating_add(y);
+    (r, y, e.max(floor))
 }
 
 fn bind_for(ip: IpAddr) -> std::io::Result<UdpSocket> {
@@ -302,30 +309,51 @@ impl Zones {
     /// the engine (saved before the answer, §3.5), then answered.
     fn update(&self, packet: &[u8], client: IpAddr) -> Option<Vec<u8>> {
         let now = unix_now();
+        // The forwarder's copy of the records as of now, and its version:
+        // what the prerequisites are checked against.
+        self.dynamic();
+        let seen = zone::dynamic_version(self.fwd());
         let u = match zone::update::read(self.fwd(), packet, client, now) {
             Ok(u) => u,
             Err(reply) => return Some(reply),
         };
+        Some(self.commit(&u, seen, now))
+    }
+
+    /// Applies a checked UPDATE if the records are still those its
+    /// prerequisites saw (version `seen`); when they moved (another
+    /// UPDATE, a lease), checks them again (RFC 2136 §3.7: both atomic).
+    fn commit(&self, u: &zone::update::Update, mut seen: u64, now: u64) -> Vec<u8> {
         let source = match &u.key {
             Some(k) => format!("update {} key {k}", u.client),
             None => format!("update {}", u.client),
         };
-        let applied = lock(&self.session).dns_dynamic_apply(&u.zone, &u.ops, &source, None, now);
-        let ok = match applied {
-            Ok(n) => {
-                if n > 0 {
-                    log::info!("DNS: zone {}: {n} records changed by {source}", u.zone);
+        for _ in 0..UPDATE_TRIES {
+            let applied = lock(&self.session).dns_dynamic_update(&u.zone, &u.ops, &source, seen, now);
+            match applied {
+                Ok(Some(n)) => {
+                    if n > 0 {
+                        log::info!("DNS: zone {}: {n} records changed by {source}", u.zone);
+                    }
+                    self.dynamic();
+                    return zone::update::finish(u, true, now);
                 }
-                self.dynamic();
-                true
+                Ok(None) => {
+                    self.dynamic();
+                    seen = zone::dynamic_version(self.fwd());
+                    if let Err(reply) = zone::update::recheck(self.fwd(), u, now) {
+                        return reply;
+                    }
+                }
+                Err(e) => {
+                    // §3.4.2.7: nothing applied, SERVFAIL.
+                    log::warn!("DNS: zone {}: update by {source} failed: {e}", u.zone);
+                    return zone::update::finish(u, false, now);
+                }
             }
-            Err(e) => {
-                // §3.4.2.7: nothing applied, SERVFAIL.
-                log::warn!("DNS: zone {}: update by {source} failed: {e}", u.zone);
-                false
-            }
-        };
-        Some(zone::update::finish(&u, ok, now))
+        }
+        log::warn!("DNS: zone {}: update by {source} not applied: the records kept moving", u.zone);
+        zone::update::finish(u, false, now)
     }
 
     /// The key life cycle, then a signing thread for each signed zone due.
@@ -1100,6 +1128,112 @@ mod tests {
         let ptr = Message::from_vec(&buf[..n]).unwrap();
         assert_eq!(ptr.answers[0].data.to_string(), "laptop.lan.example.");
         wait("the lease's end", || answer(port, "laptop.lan.example.").is_none());
+        shutdown.close();
+    }
+
+    /// RFC 1912 §2.2: an EXPIRE shorter than REFRESH + RETRY is raised to
+    /// it (else the copy is dropped long before the next check).
+    #[test]
+    fn expire_is_at_least_refresh_plus_retry() {
+        let conf = ZoneConf {
+            name: "example.com".into(),
+            ztype: ZoneType::Secondary,
+            allow_transfer: Vec::new(),
+            notify: Vec::new(),
+            primaries: Vec::new(),
+            refresh_secs: 3600,
+            retry_secs: 600,
+            expire_secs: 60,
+            update_keys: Vec::new(),
+            allow_update: Vec::new(),
+            dnssec: false,
+            signature_validity_secs: 0,
+        };
+        assert_eq!(timers(None, &conf), (3600, 600, 4200));
+        let long = ZoneConf { expire_secs: 1_209_600, ..conf };
+        assert_eq!(timers(None, &long).2, 1_209_600);
+    }
+
+    fn update_msg(owner: &str, ip: [u8; 4]) -> Vec<u8> {
+        use hickory_proto::op::OpCode;
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::{DNSClass, RData, Record};
+        let mut m = Message::query();
+        m.metadata.op_code = OpCode::Update;
+        m.add_query(Query::query(Name::from_ascii("lan.example.").unwrap(), RecordType::SOA));
+        // §2.4.5: the name is not in use.
+        let mut none = Record::from_rdata(Name::from_ascii(owner).unwrap(), 0, RData::Update0(RecordType::ANY));
+        none.dns_class = DNSClass::NONE;
+        m.add_answer(none);
+        m.add_authority(Record::from_rdata(
+            Name::from_ascii(owner).unwrap(),
+            300,
+            RData::A(A::new(ip[0], ip[1], ip[2], ip[3])),
+        ));
+        m.to_vec().unwrap()
+    }
+
+    fn rcode(reply: &[u8]) -> hickory_proto::op::ResponseCode {
+        Message::from_vec(reply).unwrap().metadata.response_code
+    }
+
+    /// An unsigned-update zone from 127.0.0.0/8 and the services on a
+    /// free port.
+    fn update_lab() -> (Shared, Arc<Zones>, u16, Shutdown) {
+        let port = free_port();
+        let shutdown = Shutdown::default();
+        let session = shared(Session::virtual_lab());
+        run(&session, "ip.dns.set", json!({"allow_remote_requests": true}));
+        run(&session, "ip.dns.zone.add", json!({"name": "lan.example", "allow_update": "127.0.0.0/8"}));
+        let srv = super::super::dns_server::spawn(
+            session.clone(),
+            Arc::new(RouterDns::new()),
+            port,
+            shutdown.clone(),
+        )
+        .unwrap();
+        let z = spawn(&session, srv, port, shutdown.clone()).unwrap();
+        wait("the zone", || ask(port, "lan.example.").is_some_and(|m| m.metadata.authoritative));
+        (session, z, port, shutdown)
+    }
+
+    /// RFC 2136 §3.7: two UPDATEs whose prerequisites ("pc is not in use")
+    /// were both checked before either applied: the second is checked
+    /// again against what the first did, and fails.
+    #[test]
+    fn prerequisites_hold_when_the_update_applies() {
+        let (session, z, _port, shutdown) = update_lab();
+        let from = IpAddr::from([127, 0, 0, 1]);
+        let now = unix_now();
+        z.dynamic();
+        let seen = zone::dynamic_version(z.fwd());
+        let one = zone::update::read(z.fwd(), &update_msg("pc.lan.example.", [192, 168, 88, 50]), from, now).unwrap();
+        let two = zone::update::read(z.fwd(), &update_msg("pc.lan.example.", [192, 168, 88, 51]), from, now).unwrap();
+        assert_eq!(rcode(&z.commit(&one, seen, now)), hickory_proto::op::ResponseCode::NoError);
+        assert_eq!(rcode(&z.commit(&two, seen, now)), hickory_proto::op::ResponseCode::YXDomain);
+        let rows = run(&session, "ip.dns.zone.record.print", json!({"zone": "lan.example"}));
+        assert_eq!(rows.as_array().unwrap().len(), 1, "{rows}");
+        shutdown.close();
+    }
+
+    /// An UPDATE over UDP waits for the session lock on its own thread:
+    /// queries on the same socket are answered meanwhile.
+    #[test]
+    fn an_update_never_holds_up_queries() {
+        let (session, _z, port, shutdown) = update_lab();
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let held = lock(&session);
+        s.send_to(&update_msg("pc.lan.example.", [192, 168, 88, 50]), ("127.0.0.1", port)).unwrap();
+        thread::sleep(Duration::from_millis(100));
+        let t = Instant::now();
+        assert!(ask(port, "lan.example.").is_some(), "a query while the UPDATE waits");
+        assert!(t.elapsed() < Duration::from_millis(300), "{:?}", t.elapsed());
+        thread::sleep(Duration::from_millis(500));
+        drop(held);
+        let mut buf = [0u8; 4096];
+        let (n, _) = s.recv_from(&mut buf).unwrap();
+        assert_eq!(rcode(&buf[..n]), hickory_proto::op::ResponseCode::NoError);
         shutdown.close();
     }
 }

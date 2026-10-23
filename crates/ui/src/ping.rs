@@ -133,7 +133,10 @@ impl TaskView {
         self.state = p.get("state").map(value_text).unwrap_or_default();
         self.reason = p.get("reason").and_then(Value::as_str).map(str::to_owned);
         self.done = p.get("done").and_then(Value::as_bool).unwrap_or(false);
-        self.lost += p.get("lost").and_then(Value::as_u64).unwrap_or(0);
+        // Saturating: the count comes from the router (hostile input).
+        self.lost = self
+            .lost
+            .saturating_add(p.get("lost").and_then(Value::as_u64).unwrap_or(0));
         if let Some(s) = p.get("summary").filter(|s| !s.is_null()) {
             self.summary = s.clone();
         }
@@ -184,11 +187,20 @@ fn ms(v: Option<f64>) -> String {
 }
 
 /// A CSV field: quoted when it holds a comma, a quote or a line break.
+/// Text a spreadsheet would run as a formula (`=`, `+`, `-`, `@`, tab, CR
+/// first; a router's reply is not trusted) starts with `'` (OWASP "CSV
+/// injection"); a number such as `-1` stays a number.
 fn csv_field(s: &str) -> String {
+    let formula = s.starts_with(['=', '+', '-', '@', '\t', '\r']) && s.parse::<f64>().is_err();
+    let s = if formula {
+        format!("'{s}")
+    } else {
+        s.to_owned()
+    };
     if s.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_owned()
+        s
     }
 }
 
@@ -253,9 +265,10 @@ impl PingWin {
 
     fn take_events(&mut self, events: Vec<Value>) {
         for ev in events {
-            let target = ev.get("target").and_then(Value::as_u64).unwrap_or(0) as usize;
+            // `try_from`: on wasm32 an `as` cast would wrap 2^32 to target 0.
+            let target = usize::try_from(ev.get("target").and_then(Value::as_u64).unwrap_or(0)).ok();
             let seq = num(&ev, "icmp_seq");
-            if let (Some(s), Some(x)) = (self.series.get_mut(target), seq) {
+            if let (Some(s), Some(x)) = (target.and_then(|t| self.series.get_mut(t)), seq) {
                 match (ev.get("status").and_then(Value::as_str), num(&ev, "rtt_ms")) {
                     (Some("ok"), Some(rtt)) => {
                         s.points.push_back([x, rtt]);
@@ -310,6 +323,19 @@ impl CoreRouterUi {
         }
         for (req, id, after) in due {
             self.tool_poll(req, id, after);
+        }
+    }
+
+    /// A poll got no answer in time: poll again (the task may be fine;
+    /// only an error reply ends it).
+    pub(crate) fn tool_timed_out(&mut self, req: ToolReq) {
+        let task = match req {
+            ToolReq::Ping => self.ping.ping.as_mut(),
+            ToolReq::Mtu => self.ping.mtu.as_mut(),
+            ToolReq::Mtr => self.mtr.task.as_mut(),
+        };
+        if let Some(t) = task {
+            t.polling = false;
         }
     }
 
@@ -777,11 +803,8 @@ impl CoreRouterUi {
                     if let Some(e) = s.get("error").and_then(Value::as_str) {
                         ui.colored_label(err_color(ui), e);
                     } else if let Some(a) = alert(s, loss, latency) {
-                        ui.label(
-                            RichText::new(format!("ALERT {a}"))
-                                .color(Color32::WHITE)
-                                .background_color(LOSS),
-                        );
+                        let tone = crate::chip::RED.tone(ui.visuals());
+                        crate::chip::chip(ui, "alerta", tone).on_hover_text(a);
                     } else {
                         ui.label("");
                     }
@@ -930,6 +953,10 @@ mod tests {
     fn csv_quotes_what_needs_it() {
         assert_eq!(csv_field("8.8.8.8"), "8.8.8.8");
         assert_eq!(csv_field("a,b"), "\"a,b\"");
+        assert_eq!(csv_field("=1+1"), "'=1+1");
+        assert_eq!(csv_field("@SUM(A1)"), "'@SUM(A1)");
+        assert_eq!(csv_field("-1"), "-1");
+        assert_eq!(csv_field("+cmd,x"), "\"'+cmd,x\"");
         assert_eq!(csv_field("say \"hi\""), "\"say \"\"hi\"\"\"");
         let mut w = PingWin::default();
         w.reset(1, vec!["x".into()]);

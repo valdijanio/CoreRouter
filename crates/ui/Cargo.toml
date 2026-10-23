@@ -17,9 +17,14 @@ egui_plot.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+criterion.workspace = true
 corerouter-hal.workspace = true
 corerouter-model.workspace = true
 corerouter-proto-dns.workspace = true
+
+[[bench]]
+name = "frames"
+harness = false
 
 [lints]
 workspace = true
