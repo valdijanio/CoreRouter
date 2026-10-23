@@ -33,6 +33,10 @@ rustix = { version = "1.1.5", default-features = false, features = ["std", "net"
 # (the same crate rtnetlink uses underneath; its API is safe).
 netlink-sys = { version = "0.9.0", default-features = false }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+# Tests open sockets inside nested namespaces (netns_cgnat.rs).
+nix = { version = "0.30.1", default-features = false, features = ["sched"] }
+
 [dev-dependencies]
 criterion.workspace = true
 proptest.workspace = true

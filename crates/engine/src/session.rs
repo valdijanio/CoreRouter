@@ -514,6 +514,8 @@ impl Session {
             (true, false) => format!("{comment} [safe mode]"),
         };
         let revision = self.store.commit(&comment, self.now())?;
+        // G2.3: the CGNAT mapping history ("who was") follows every commit.
+        self.cgnat_note();
         if let Some(files) = self.ext_mut::<crate::history_files::RevisionFiles>() {
             files.note_encoded(revision, encoded);
         }
