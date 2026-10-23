@@ -24,7 +24,17 @@ pub struct HistoryRuntime {
     appended: u64,
     compacted_at: u64,
     error: Option<String>,
+    /// Lines of this round, written in one append at its end.
+    pending: String,
+    pending_lines: u64,
+    /// No compaction before this after one failed (a full disk).
+    retry_at: u64,
+    /// The cap kept the journal from being compacted (logged once).
+    held: bool,
 }
+
+/// A failed compaction is tried again after this.
+const COMPACT_RETRY_SECS: u64 = 60;
 
 impl Session {
     fn history_retention(&self) -> u64 {
@@ -65,22 +75,37 @@ impl Session {
             settled = rt.history.settle(|a, m| bound.contains(&(a, m)));
         }
         self.history_write(&settled);
+        self.dhcp_history_flush();
     }
 
+    /// Lines for the journal, written by [`Session::dhcp_history_flush`]
+    /// (once per server round: one fsync for a storm of bindings).
     fn history_write(&mut self, entries: &[Entry]) {
         if entries.is_empty() {
             return;
         }
-        let mut text = String::new();
+        let Some(rt) = self.ext_mut::<HistoryRuntime>() else {
+            return;
+        };
         for e in entries {
             if let Ok(l) = serde_json::to_string(e) {
-                text.push_str(&l);
-                text.push('\n');
+                rt.pending.push_str(&l);
+                rt.pending.push('\n');
+                rt.pending_lines += 1;
             }
         }
+    }
+
+    /// The round's history lines, in one append.
+    pub(crate) fn dhcp_history_flush(&mut self) {
+        let Some((text, n)) = self.ext_mut::<HistoryRuntime>().and_then(|rt| {
+            (rt.pending_lines > 0).then(|| (std::mem::take(&mut rt.pending), std::mem::take(&mut rt.pending_lines)))
+        }) else {
+            return;
+        };
         let r = self.storage_mut().append_journal(JOURNAL, &text);
         if let Some(rt) = self.ext_mut::<HistoryRuntime>() {
-            rt.appended += entries.len() as u64;
+            rt.appended += n;
             rt.error = r.err().map(|e| e.to_string());
         }
     }
@@ -113,12 +138,39 @@ impl Session {
         let retention = self.history_retention();
         let due = self.ext::<HistoryRuntime>().is_some_and(|rt| {
             rt.loaded
+                && now.unix >= rt.retry_at
                 && (rt.appended > 2 * rt.history.len() as u64 + 1024
                     || now.unix >= rt.compacted_at + COMPACT_EVERY_SECS
                     || (retention == 0 && !rt.history.is_empty()))
         });
         if !due {
             return;
+        }
+        // Entries the memory cap dropped are on disk only: a compaction
+        // (written from memory) would erase records still inside the
+        // retention. The journal is kept whole until they are past it.
+        let held = self
+            .ext::<HistoryRuntime>()
+            .and_then(|rt| (!rt.history.can_compact(now.unix, retention)).then(|| rt.history.evicted_until()))
+            .flatten();
+        if let Some(until) = held {
+            let first = self.ext_mut::<HistoryRuntime>().is_some_and(|rt| {
+                rt.compacted_at = now.unix;
+                !std::mem::replace(&mut rt.held, true)
+            });
+            if first {
+                let when = corerouter_proto_dhcp::server::history::utc(until.saturating_add(retention));
+                let text = format!(
+                    "lease history is over its memory cap ({} entries): its journal is kept whole, not compacted, until {when}",
+                    corerouter_proto_dhcp::server::history::MAX_ENTRIES
+                );
+                log::error!("dhcp history: {text}");
+                self.log_event(&["dhcp", "error"], "dhcp-server", text, serde_json::json!({}));
+            }
+            return;
+        }
+        if let Some(rt) = self.ext_mut::<HistoryRuntime>() {
+            rt.held = false;
         }
         let Some(text) = self
             .ext_mut::<HistoryRuntime>()
@@ -132,7 +184,10 @@ impl Session {
             rt.compacted_at = now.unix;
             match r {
                 Ok(()) => rt.appended = lines,
-                Err(e) => rt.error = Some(e.to_string()),
+                Err(e) => {
+                    rt.error = Some(e.to_string());
+                    rt.retry_at = now.unix + COMPACT_RETRY_SECS;
+                }
             }
         }
     }

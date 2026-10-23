@@ -10,7 +10,7 @@
 //! entry (address + start) wins, compaction drops what is older than the
 //! retention.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
 
@@ -20,8 +20,9 @@ use super::agent;
 use super::leases::Lease;
 
 /// Entries kept in memory (**estimado**: a year of a few thousand
-/// subscribers with daily churn; ~150 bytes each). Past it the oldest go
-/// first (they are on disk until the retention drops them).
+/// subscribers with daily churn; ~150 bytes each). Past it the oldest
+/// leave memory first; the journal on disk keeps them (it is not compacted
+/// while one of them is inside the retention: [`History::can_compact`]).
 pub const MAX_ENTRIES: usize = 500_000;
 /// Rows one query returns at most.
 pub const MAX_ROWS: usize = 10_000;
@@ -94,7 +95,7 @@ impl Entry {
 
     /// Whether the address was this entry's at Unix time `t`.
     pub fn covers(&self, t: u64) -> bool {
-        self.start <= t && t < self.until.max(self.start + 1)
+        self.start <= t && t < self.until.max(self.start.saturating_add(1))
     }
 }
 
@@ -114,9 +115,19 @@ pub struct Query {
 
 #[derive(Debug, Default, Clone)]
 pub struct History {
-    entries: Vec<Entry>,
-    /// Address → index of its open entry.
-    open: HashMap<Ipv4Addr, usize>,
+    /// Oldest first. A deque: at the cap each new binding drops the front
+    /// in O(1) (a `Vec::drain` plus an index rebuild was ~5 ms a binding
+    /// at 500k entries, under the session lock: **medido**).
+    entries: VecDeque<Entry>,
+    /// Sequence number of `entries[0]`: entries are numbered as they come
+    /// in, so dropping the front does not move the others' numbers.
+    base: u64,
+    /// Address → sequence number of its open entry.
+    open: HashMap<Ipv4Addr, u64>,
+    /// The latest end of an entry the cap dropped from memory: until that
+    /// is past the retention, the journal is the only copy of it, and a
+    /// compaction (written from memory) would erase it.
+    evicted_until: Option<u64>,
 }
 
 impl History {
@@ -128,22 +139,52 @@ impl History {
         self.entries.is_empty()
     }
 
+    fn at(&self, seq: u64) -> Option<usize> {
+        usize::try_from(seq.checked_sub(self.base)?).ok()
+    }
+
+    fn get_mut(&mut self, seq: u64) -> Option<&mut Entry> {
+        let i = self.at(seq)?;
+        self.entries.get_mut(i)
+    }
+
     fn reindex(&mut self) {
+        let base = self.base;
         self.open = self
             .entries
             .iter()
-            .enumerate()
-            .filter(|(_, e)| !e.closed)
-            .map(|(i, e)| (e.address, i))
+            .zip(base..)
+            .filter(|(e, _)| !e.closed)
+            .map(|(e, seq)| (e.address, seq))
             .collect();
     }
 
     fn trim(&mut self) {
-        if self.entries.len() > MAX_ENTRIES {
-            let extra = self.entries.len() - MAX_ENTRIES;
-            self.entries.drain(..extra);
-            self.reindex();
+        while self.entries.len() > MAX_ENTRIES {
+            let Some(e) = self.entries.pop_front() else {
+                break;
+            };
+            if !e.closed && self.open.get(&e.address) == Some(&self.base) {
+                self.open.remove(&e.address);
+            }
+            self.evicted_until = Some(self.evicted_until.unwrap_or(0).max(e.until));
+            self.base = self.base.saturating_add(1);
         }
+    }
+
+    /// Whether a compaction at `now` keeps every entry inside `retention`
+    /// (none was dropped from memory by the cap, or those are all past it).
+    pub fn can_compact(&self, now: u64, retention: u64) -> bool {
+        retention == 0
+            || self
+                .evicted_until
+                .is_none_or(|u| u.saturating_add(retention) <= now)
+    }
+
+    /// Entries the cap dropped from memory that the retention still keeps
+    /// (on disk only), and until when: `Some(latest end)`.
+    pub fn evicted_until(&self) -> Option<u64> {
+        self.evicted_until
     }
 
     /// A lease bound to a new client: a new entry (the address's open one,
@@ -151,8 +192,9 @@ impl History {
     pub fn open(&mut self, l: &Lease, now: u64) -> Vec<Entry> {
         let mut out = self.close(l.address, now);
         let e = Entry::of(l, now);
-        self.entries.push(e.clone());
-        self.open.insert(l.address, self.entries.len() - 1);
+        let seq = self.base.saturating_add(self.entries.len() as u64);
+        self.entries.push_back(e.clone());
+        self.open.insert(l.address, seq);
         out.push(e);
         self.trim();
         out
@@ -160,11 +202,10 @@ impl History {
 
     /// The lease was renewed: its end moves.
     pub fn renew(&mut self, l: &Lease) -> Vec<Entry> {
-        let Some(e) = self
-            .open
-            .get(&l.address)
-            .and_then(|i| self.entries.get_mut(*i))
-        else {
+        let Some(seq) = self.open.get(&l.address).copied() else {
+            return Vec::new();
+        };
+        let Some(e) = self.get_mut(seq) else {
             return Vec::new();
         };
         if e.mac != l.mac {
@@ -179,10 +220,10 @@ impl History {
 
     /// The lease of `address` ended at `now`.
     pub fn close(&mut self, address: Ipv4Addr, now: u64) -> Vec<Entry> {
-        let Some(i) = self.open.remove(&address) else {
+        let Some(seq) = self.open.remove(&address) else {
             return Vec::new();
         };
-        let Some(e) = self.entries.get_mut(i) else {
+        let Some(e) = self.get_mut(seq) else {
             return Vec::new();
         };
         e.until = e.until.min(now).max(e.start);
@@ -196,7 +237,10 @@ impl History {
         let stale: Vec<Ipv4Addr> = self
             .open
             .iter()
-            .filter_map(|(a, i)| self.entries.get(*i).map(|e| (*a, e.mac)))
+            .filter_map(|(a, seq)| {
+                let e = self.entries.get(self.at(*seq)?)?;
+                Some((*a, e.mac))
+            })
             .filter(|(a, m)| !bound(*a, *m))
             .map(|(a, _)| a)
             .collect();
@@ -205,7 +249,8 @@ impl History {
             let until = self
                 .open
                 .get(&a)
-                .and_then(|i| self.entries.get(*i))
+                .and_then(|seq| self.at(*seq))
+                .and_then(|i| self.entries.get(i))
                 .map_or(0, |e| e.until);
             out.extend(self.close(a, until));
         }
@@ -222,7 +267,8 @@ impl History {
             .enumerate()
             .map(|(i, e)| ((e.address, e.start), i))
             .collect();
-        for line in lines {
+        // A hostile or runaway journal: its newest lines (the last wins).
+        for line in super::leases::newest(lines, super::leases::MAX_RECORDS) {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -236,15 +282,15 @@ impl History {
                     }
                     None => {
                         at.insert((e.address, e.start), self.entries.len());
-                        self.entries.push(e);
+                        self.entries.push_back(e);
                     }
                 },
                 Err(_) => bad += 1,
             }
         }
-        self.entries.sort_by_key(|e| e.start);
-        self.trim();
+        self.entries.make_contiguous().sort_by_key(|e| e.start);
         self.reindex();
+        self.trim();
         bad
     }
 
@@ -255,11 +301,15 @@ impl History {
             // No history kept at all.
             self.entries.clear();
             self.open.clear();
+            self.evicted_until = None;
             return String::new();
         }
         self.entries
             .retain(|e| !e.closed || e.until.saturating_add(retention) > now);
         self.reindex();
+        if self.can_compact(now, retention) {
+            self.evicted_until = None;
+        }
         let mut out = String::with_capacity(self.entries.len() * 140);
         for e in &self.entries {
             if let Ok(l) = serde_json::to_string(e) {
@@ -331,7 +381,8 @@ pub fn parse_time(text: &str) -> Option<u64> {
     let y: i64 = d.next()?.parse().ok()?;
     let m: i64 = d.next()?.parse().ok()?;
     let dd: i64 = d.next()?.parse().ok()?;
-    if !(1..=12).contains(&m) || !(1..=31).contains(&dd) {
+    // RFC 3339 §5.6: four-digit years; nothing here may overflow.
+    if !(0..=9999).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&dd) {
         return None;
     }
     let (clock, offset) = match rest.find(['Z', '+', '-']) {
@@ -349,12 +400,19 @@ pub fn parse_time(text: &str) -> Option<u64> {
         .unwrap_or("0")
         .parse()
         .ok()?;
+    if !(0..=23).contains(&hh) || !(0..=59).contains(&mm) || !(0..=60).contains(&ss) {
+        return None;
+    }
     let off = match offset {
         "Z" | "" => 0,
         o => {
             let sign = if o.starts_with('-') { -1 } else { 1 };
             let (oh, om) = o.get(1..)?.split_once(':').unwrap_or((o.get(1..)?, "0"));
-            sign * (oh.parse::<i64>().ok()? * 3600 + om.parse::<i64>().ok()? * 60)
+            let (oh, om) = (oh.parse::<i64>().ok()?, om.parse::<i64>().ok()?);
+            if !(0..=23).contains(&oh) || !(0..=59).contains(&om) {
+                return None;
+            }
+            sign * (oh * 3600 + om * 60)
         }
     };
     // days_from_civil.
@@ -371,10 +429,17 @@ pub fn parse_time(text: &str) -> Option<u64> {
 /// The entries as CSV (RFC 4180), UTC times.
 pub fn csv(entries: &[&Entry]) -> String {
     let field = |s: &str| {
-        if s.contains([',', '"', '\n']) {
-            format!("\"{}\"", s.replace('"', "\"\""))
+        // OWASP CSV injection: a cell a spreadsheet would run as a formula
+        // (host names and option 82 are the client's) is made text.
+        let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+            format!("'{s}")
         } else {
             s.to_owned()
+        };
+        if s.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s
         }
     };
     let mut out = String::from(
@@ -418,6 +483,7 @@ mod tests {
             last_seen: 0,
             reason: String::new(),
             relay_info: agent::build(b"olt1 0/1/3:12", b"line-77"),
+            hw: None,
         }
     }
 
@@ -505,5 +571,79 @@ mod tests {
         assert!(text.starts_with("address,mac,"));
         assert!(text.contains("\"a,\"\"b\"\"\""), "{text}");
         assert!(text.contains("1970-01-01T00:01:40Z"));
+    }
+
+    /// OWASP CSV injection: a host name (client-controlled) that a
+    /// spreadsheet would run as a formula is exported as text.
+    #[test]
+    fn csv_cells_are_never_formulas() {
+        let mut h = History::default();
+        for (n, name) in ["=1+1", "+cmd", "-2", "@SUM(A1)", "\tx", "\rx"]
+            .iter()
+            .enumerate()
+        {
+            let mut l = lease([10, 0, 0, 1 + n as u8], 1, 700);
+            l.host_name = (*name).into();
+            h.open(&l, 100);
+        }
+        let text = csv(&h.query(&Query::default(), 10));
+        for line in text.lines().skip(1) {
+            let host = line.split(',').nth(3).unwrap();
+            assert!(
+                !host.starts_with(['=', '+', '-', '@', '\t', '\r']),
+                "{line}"
+            );
+        }
+    }
+
+    /// Hostile times: no overflow (a panic in debug, a wrong instant in
+    /// release).
+    #[test]
+    fn hostile_times_do_not_overflow() {
+        assert_eq!(parse_time("999999999999999-01-01"), None);
+        assert_eq!(parse_time("2026-01-01T99999999999999:00"), None);
+        assert_eq!(parse_time("2026-01-01T24:00:00Z"), None);
+        assert_eq!(parse_time("2026-01-01T10:60:00Z"), None);
+        assert_eq!(parse_time("2026-01-01T10:00:00+999999999999:00"), None);
+        assert_eq!(parse_time("10000-01-01"), None);
+        assert_eq!(parse_time("9999-12-31T23:59:59Z"), Some(253_402_300_799));
+        let mut e = Entry::of(&lease([10, 0, 0, 1], 1, 0), u64::MAX);
+        e.until = 0;
+        // No overflow at the end of time (a hostile journal line).
+        let _ = e.covers(u64::MAX);
+        assert!(!e.covers(0));
+    }
+
+    /// A flood of new bindings at the cap costs O(1) each (not a 500k
+    /// memmove plus an index rebuild under the session lock).
+    #[test]
+    fn opening_at_the_cap_is_cheap() {
+        let mut h = History::default();
+        for n in 0..MAX_ENTRIES as u32 {
+            let [_, _, a, b] = n.to_be_bytes();
+            h.open(&lease([10, 1, a, b], 1, 700), u64::from(n));
+        }
+        let t = std::time::Instant::now();
+        for n in 0..2_000u32 {
+            let [_, _, a, b] = n.to_be_bytes();
+            h.open(&lease([10, 2, a, b], 2, 700), 1_000_000 + u64::from(n));
+        }
+        assert!(
+            t.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            t.elapsed()
+        );
+        assert_eq!(h.len(), MAX_ENTRIES);
+        // The open entries still renew and close.
+        let l = lease([10, 2, 0, 5], 2, 9_000_000);
+        assert_eq!(h.renew(&l).len(), 1);
+        assert_eq!(h.close(l.address, 2_000_000).len(), 1);
+        // What left memory is on disk only: a compaction now would erase
+        // records inside the retention (laundering one's own history by
+        // flooding new bindings).
+        let year = 365 * 86_400;
+        assert!(!h.can_compact(2_000_000, year));
+        assert!(h.can_compact(2_000_000 + 2 * year, year));
+        assert!(h.can_compact(2_000_000, 0), "history turned off");
     }
 }

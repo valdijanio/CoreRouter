@@ -25,6 +25,22 @@ impl TempDir {
     }
 }
 
+/// A journal over the read limit: the newest lines are read (the last
+/// line wins), starting at a whole line; never the oldest.
+#[test]
+fn an_oversized_journal_keeps_its_newest_lines() {
+    let dir = TempDir::new();
+    fs::create_dir_all(&dir.0).unwrap();
+    let path = dir.0.join("j.log");
+    let text: String = (0..100).map(|n| format!("line {n:03}\n")).collect();
+    fs::write(&path, &text).unwrap();
+    let tail = corerouter_storage_fs::read_tail(fs::File::open(&path).unwrap(), 35).unwrap();
+    let tail = String::from_utf8(tail).unwrap();
+    assert_eq!(tail, "line 097\nline 098\nline 099\n");
+    let all = corerouter_storage_fs::read_tail(fs::File::open(&path).unwrap(), 10_000).unwrap();
+    assert_eq!(all.len(), text.len());
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);

@@ -24,7 +24,7 @@
 //! What a binding means outside the server (the route to a delegated
 //! prefix, the AAAA/PTR of an address) is the engine's, from the effects.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::net::Ipv6Addr;
 
 use corerouter_model::dhcp6_server::{Dhcp6Binding, Ipv6Pool, parse_duid};
@@ -40,6 +40,12 @@ use crate::v6::{self, ClientMsg, msg, opt, status};
 pub const OFFER_HOLD: u64 = 120;
 /// RFC 9915 §7.6: HOP_COUNT_LIMIT.
 pub const HOP_COUNT_LIMIT: u8 = 8;
+/// Records the table holds at most (a SOLICIT flood from random DUIDs on
+/// a /64 would otherwise grow it without end): ~400 bytes each, ~50 MB
+/// (**estimado**).
+pub const MAX_BINDINGS6: usize = 1 << 17;
+/// The greatest prefix (bounds a range of the expiry index).
+const NET_MAX: Ipv6Net = Ipv6Net::new_assert(Ipv6Addr::from_bits(u128::MAX), 128);
 /// Free bindings remember their client this long (affinity, **estimado**).
 pub const KEEP_FREE_SECS: u64 = 7 * 86_400;
 /// Candidates an address pool tries from the client's hash.
@@ -128,10 +134,30 @@ pub enum Record6 {
     },
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct Leases6 {
     by_net: HashMap<Ipv6Net, Lease6>,
     by_client: HashMap<(Vec<u8>, u32, IaKind), Ipv6Net>,
+    /// Every record by (free?, end, prefix): what `tick` is due to change
+    /// and the free record idle the longest are found without a walk.
+    by_end: BTreeSet<(bool, u64, Ipv6Net)>,
+    /// Records held at most ([`MAX_BINDINGS6`]).
+    cap: usize,
+    /// Moves when a record becomes free or goes: a pool known to be full
+    /// may have room again.
+    generation: u64,
+}
+
+impl Default for Leases6 {
+    fn default() -> Self {
+        Self {
+            by_net: HashMap::new(),
+            by_client: HashMap::new(),
+            by_end: BTreeSet::new(),
+            cap: MAX_BINDINGS6,
+            generation: 0,
+        }
+    }
 }
 
 impl Leases6 {
@@ -155,9 +181,35 @@ impl Leases6 {
         self.by_client.get(key).and_then(|n| self.by_net.get(n))
     }
 
+    fn end_key(l: &Lease6) -> (bool, u64, Ipv6Net) {
+        (l.state.free(), l.expires, l.net)
+    }
+
+    /// Room for a record of `net`: it has one already, the table is under
+    /// its cap, or the free record idle the longest goes. False: full of
+    /// bindings and offers (the caller refuses the client).
+    fn admit(&mut self, net: &Ipv6Net) -> bool {
+        if self.by_net.contains_key(net) || self.by_net.len() < self.cap {
+            return true;
+        }
+        let oldest_free = self
+            .by_end
+            .range((true, 0, Ipv6Net::default())..)
+            .next()
+            .map(|(_, _, n)| *n);
+        match oldest_free {
+            Some(n) => {
+                self.remove(&n);
+                true
+            }
+            None => false,
+        }
+    }
+
     fn put(&mut self, l: Lease6) {
         if let Some(old) = self.by_net.get(&l.net) {
             let k = old.key();
+            self.by_end.remove(&Self::end_key(old));
             if k != l.key() && self.by_client.get(&k) == Some(&l.net) {
                 self.by_client.remove(&k);
             }
@@ -167,29 +219,60 @@ impl Leases6 {
             && let Some(p) = self.by_net.get(&prev)
             && p.key() == l.key()
         {
-            // The client moved: its old record stays, unindexed.
+            // The client moved: its old record stays, unindexed (an offer
+            // it did not take just goes).
             let mut p = p.clone();
-            p.state = if p.state.free() {
-                p.state
+            if p.state == State::Offered {
+                self.by_end.remove(&Self::end_key(&p));
+                self.by_net.remove(&prev);
+                self.generation = self.generation.wrapping_add(1);
             } else {
-                State::Released
-            };
-            self.by_net.insert(prev, p);
+                if !p.state.free() {
+                    self.by_end.remove(&Self::end_key(&p));
+                    p.state = State::Released;
+                    self.by_end.insert(Self::end_key(&p));
+                    self.generation = self.generation.wrapping_add(1);
+                }
+                self.by_net.insert(prev, p);
+            }
         }
+        if l.state.free() {
+            self.generation = self.generation.wrapping_add(1);
+        }
+        self.by_end.insert(Self::end_key(&l));
         self.by_net.insert(l.net, l);
     }
 
     fn remove(&mut self, n: &Ipv6Net) -> Option<Lease6> {
         let l = self.by_net.remove(n)?;
+        self.by_end.remove(&Self::end_key(&l));
         if self.by_client.get(&l.key()) == Some(n) {
             self.by_client.remove(&l.key());
         }
+        self.generation = self.generation.wrapping_add(1);
         Some(l)
+    }
+
+    /// Records not free whose end is at or before `now`.
+    fn due(&self, now: u64) -> Vec<(Ipv6Net, State)> {
+        self.by_end
+            .range(..=(false, now, NET_MAX))
+            .filter_map(|(_, _, n)| self.by_net.get(n).map(|l| (l.net, l.state)))
+            .collect()
+    }
+
+    /// Free records that ended at or before `before`.
+    fn old_free(&self, before: u64) -> Vec<Ipv6Net> {
+        self.by_end
+            .range((true, 0, Ipv6Net::default())..)
+            .take_while(|(_, e, _)| *e <= before)
+            .map(|(_, _, n)| *n)
+            .collect()
     }
 
     pub fn replay<'a>(&mut self, lines: impl Iterator<Item = &'a str>) -> usize {
         let mut bad = 0;
-        for line in lines.take(crate::server::leases::MAX_RECORDS) {
+        for line in crate::server::leases::newest(lines, crate::server::leases::MAX_RECORDS) {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -527,6 +610,10 @@ pub struct Server6 {
     leases: Leases6,
     stats: Stats6,
     cursor: HashMap<String, u128>,
+    /// PD pools found full, at the table's generation: a SOLICIT flood on
+    /// a full pool of 2^16 prefixes scanned all of them per message
+    /// (~6 ms each, **medido**).
+    exhausted: HashMap<String, u64>,
     last_tick: u64,
 }
 
@@ -541,6 +628,7 @@ impl Server6 {
             leases: Leases6::default(),
             stats: Stats6::default(),
             cursor: HashMap::new(),
+            exhausted: HashMap::new(),
             last_tick: 0,
         }
     }
@@ -583,6 +671,7 @@ impl Server6 {
             }
         }
         self.plan = plan;
+        self.exhausted.clear();
         out
     }
 
@@ -630,10 +719,16 @@ impl Server6 {
             return out;
         };
         let me = v6::duid_ll(mac);
-        // §16: identifiers.
-        let Some(duid) = m.client_id.clone() else {
-            self.drop("no-client-id");
-            return out;
+        // §16: identifiers. §16.12: an Information-request SHOULD carry a
+        // Client Identifier; §18.3.6 answers it either way (stateless
+        // clients), without one in the reply.
+        let duid = match m.client_id.clone() {
+            Some(d) => d,
+            None if m.kind == msg::INFORMATION_REQUEST => Vec::new(),
+            None => {
+                self.drop("no-client-id");
+                return out;
+            }
         };
         let for_us = m.server_id.as_ref().is_none_or(|s| *s == me);
         let needs_us = matches!(
@@ -780,7 +875,9 @@ impl Server6 {
     fn head(&self, kind: u8, xid: u32, client: &[u8], me: &[u8]) -> Vec<u8> {
         let mut r = vec![kind];
         r.extend_from_slice(xid.to_be_bytes().get(1..).unwrap_or(&[0, 0, 0]));
-        v6::put(&mut r, opt::CLIENTID, client);
+        if !client.is_empty() {
+            v6::put(&mut r, opt::CLIENTID, client);
+        }
         v6::put(&mut r, opt::SERVERID, me);
         r
     }
@@ -954,6 +1051,9 @@ impl Server6 {
                 None
             }
             IaKind::Pd => {
+                if self.exhausted.get(&pool.name) == Some(&self.leases.generation) {
+                    return None;
+                }
                 let count: u128 =
                     1u128 << bits.min(corerouter_model::dhcp6_server::MAX_POOL_BITS.into());
                 let start = self.cursor.get(&pool.name).copied().unwrap_or(0) % count;
@@ -970,6 +1070,8 @@ impl Server6 {
                         return Some(net);
                     }
                 }
+                self.exhausted
+                    .insert(pool.name.clone(), self.leases.generation);
                 None
             }
         }
@@ -1098,6 +1200,10 @@ impl Server6 {
         let now = ctx.now;
         match act {
             Act::Offer => match self.choose(ctx, kind, iaid, hint) {
+                Some(net) if !self.leases.admit(&net) => {
+                    self.drop("table-full");
+                    IaResult::None
+                }
                 Some(net) => {
                     let held = self
                         .leases
@@ -1122,6 +1228,10 @@ impl Server6 {
                 }
             },
             Act::Bind => match self.choose(ctx, kind, iaid, hint) {
+                Some(net) if !self.leases.admit(&net) => {
+                    self.drop("table-full");
+                    IaResult::None
+                }
                 Some(net) => {
                     self.bind(ctx, kind, iaid, net, out);
                     IaResult::Ok(net)
@@ -1152,7 +1262,8 @@ impl Server6 {
                         IaResult::Status(status::NO_BINDING, "no binding")
                     }
                     (_, Some(h)) => {
-                        if self.free_for(ctx.srv, kind, &h, &key, now.unix) {
+                        if self.free_for(ctx.srv, kind, &h, &key, now.unix) && self.leases.admit(&h)
+                        {
                             // §18.3.5: appropriate and free: bound again.
                             self.bind(ctx, kind, iaid, h, out);
                             IaResult::Ok(h)
@@ -1207,20 +1318,14 @@ impl Server6 {
             return out;
         }
         self.last_tick = now.unix;
-        let due: Vec<(Ipv6Net, State)> = self
-            .leases
-            .iter()
-            .filter(|l| !l.state.free() && l.expires <= now.unix)
-            .map(|l| (l.net, l.state))
-            .collect();
+        let due = self.leases.due(now.unix);
         for (net, state) in due {
             match state {
                 State::Bound => self.end(&net, State::Expired, now, 0, &mut out),
                 State::Offered => {
-                    if let Some(mut l) = self.leases.get(&net).cloned() {
-                        l.state = State::Expired;
-                        self.leases.put(l);
-                    }
+                    // Never bound nor journaled: nothing to remember (a
+                    // SOLICIT flood leaves nothing behind its holds).
+                    self.leases.remove(&net);
                 }
                 _ => {
                     if let Some(mut l) = self.leases.get(&net).cloned() {
@@ -1231,12 +1336,9 @@ impl Server6 {
                 }
             }
         }
-        let old: Vec<Ipv6Net> = self
+        let old = self
             .leases
-            .iter()
-            .filter(|l| l.state.free() && l.expires.saturating_add(KEEP_FREE_SECS) <= now.unix)
-            .map(|l| l.net)
-            .collect();
+            .old_free(now.unix.saturating_sub(KEEP_FREE_SECS));
         for n in old {
             self.leases.remove(&n);
             out.push(Effect6::Journal(Record6::Forget { forget: n }));

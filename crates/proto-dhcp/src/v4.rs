@@ -256,13 +256,35 @@ pub fn clip(s: &str) -> String {
 
 /// Every option of a message as (code, bytes), in order of first
 /// appearance, with split options (RFC 3396) joined. Pads and the end
-/// marker are left out; a truncated option ends the walk.
+/// marker are left out; a truncated option ends the walk. RFC 2132 §9.3:
+/// when option 52 says so, the `file` and then the `sname` field hold
+/// options too (RFC 3396 §5: options, file, sname is the joining order).
 pub fn raw_options(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
     let mut out: Vec<(u8, Vec<u8>)> = Vec::new();
     if bytes.len() > MAX_MESSAGE || bytes.get(236..OPTIONS_AT) != Some(&MAGIC[..]) {
         return out;
     }
-    let mut rest = bytes.get(OPTIONS_AT..).unwrap_or(&[]);
+    walk_options(bytes.get(OPTIONS_AT..).unwrap_or(&[]), &mut out);
+    let overload = out
+        .iter()
+        .find(|(c, _)| *c == 52)
+        .and_then(|(_, d)| match d.as_slice() {
+            [v @ 1..=3] => Some(*v),
+            _ => None,
+        });
+    if let Some(v) = overload {
+        if v & 1 != 0 {
+            walk_options(bytes.get(108..236).unwrap_or(&[]), &mut out);
+        }
+        if v & 2 != 0 {
+            walk_options(bytes.get(44..108).unwrap_or(&[]), &mut out);
+        }
+    }
+    out
+}
+
+fn walk_options(area: &[u8], out: &mut Vec<(u8, Vec<u8>)>) {
+    let mut rest = area;
     while let Some((&code, tail)) = rest.split_first() {
         match code {
             0 => rest = tail,
@@ -282,7 +304,6 @@ pub fn raw_options(bytes: &[u8]) -> Vec<(u8, Vec<u8>)> {
             }
         }
     }
-    out
 }
 
 /// How an option's bytes read.

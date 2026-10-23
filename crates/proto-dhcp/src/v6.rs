@@ -578,8 +578,14 @@ pub fn decode_client(bytes: &[u8]) -> Result<ClientMsg, CodecError> {
     let mut budget = MAX_OPTIONS.saturating_sub(raw.options.len());
     for (code, data) in raw.options {
         match code {
-            opt::CLIENTID if data.len() <= MAX_DUID => m.client_id = Some(data.to_vec()),
-            opt::SERVERID if data.len() <= MAX_DUID => m.server_id = Some(data.to_vec()),
+            // RFC 9915 §11.1: a DUID is at least its 2-byte type (an empty
+            // one would be a key every such client shares).
+            opt::CLIENTID if (2..=MAX_DUID).contains(&data.len()) => {
+                m.client_id = Some(data.to_vec());
+            }
+            opt::SERVERID if (2..=MAX_DUID).contains(&data.len()) => {
+                m.server_id = Some(data.to_vec());
+            }
             opt::RAPID_COMMIT => m.rapid_commit = true,
             opt::ELAPSED_TIME => m.elapsed_cs = u16_at(data, 0),
             opt::ORO => {

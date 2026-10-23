@@ -43,5 +43,9 @@ harness = false
 name = "scale"
 harness = false
 
+[[bench]]
+name = "dhcp_round"
+harness = false
+
 [lints]
 workspace = true

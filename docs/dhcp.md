@@ -206,22 +206,29 @@ tempestade cabe em poucas escritas por segundo. A sonda de 0,5 s atrasa a oferta
 | `local_address` | o da interface | o `giaddr`: para onde o servidor responde e por onde escolhe a rede |
 | `add_relay_info` | `no` | acrescenta a opção 82: circuit id = o **nome da interface** (o RouterOS põe o MAC dela; o nome diz a porta), remote id = o MAC do cliente |
 | `relay_info_remote_id` | — | remote id fixo no lugar do MAC |
+| `relay_info_trusted` | `no` | um pedido que já chega com 82 e `giaddr` 0 (posta por um agente L2 nesta interface) sobe intacto; com `no`, é descartado (`untrusted-82`) |
 
 Subida (RFC 1542 §4.1.1, RFC 2131 §4.1): `giaddr` posto quando zero (o de outro agente fica),
 `hops` + 1, descartado a partir de 16; opção 82 por último e só se couber (RFC 3046 §2.1); um pedido
-que já traz 82 não ganha outra. Descida (RFC 1542 §4.1.2, RFC 3046 §2.2): só respostas com o nosso
-`giaddr`, a 82 sai antes do cliente ver, broadcast se o cliente pediu (ou NAK), senão unicast ao
+com `giaddr` 0 que já traz 82 veio do lado do cliente: descartado (RFC 3046 §2.1, circuito não
+confiável; o cliente poderia dizer o circuito de outro assinante; o Cisco também descarta por padrão),
+ou subido intacto com `relay_info_trusted`. Descida (RFC 1542 §4.1.2, RFC 3046 §2.2): só respostas
+com o nosso `giaddr` e vindas de um dos `dhcp_server` do relay (o socket escuta a porta 67 de todas
+as interfaces; resposta de outro endereço é descartada, `not-from-server`), a 82 sai antes do cliente ver, broadcast se o cliente pediu (ou NAK), senão unicast ao
 `yiaddr`/`chaddr`. Se o servidor é o próprio roteador (um servidor com `relay` = o `giaddr`), a
 conversa é em memória, sem socket: o lab funciona assim. Para servidores de fora, um socket UDP 67
 sem interface (`hal-linux` `LinuxDhcpUplink`); os do servidor ficam presos às suas interfaces.
 `ip.dhcp-relay.print` traz pedidos subidos, respostas descidas e descartes por motivo
-(`malformed`, `hops`, `not-ours`, `send`, `no-uplink`). Checagens: interface e servidores
+(`malformed`, `hops`, `not-ours`, `untrusted-82`, `not-from-server`, `send`, `no-uplink`). Checagens: interface e servidores
 existentes, `local_address` do roteador, um servidor do roteador na mesma interface é erro (o
 cliente teria duas respostas), servidor no mesmo enlace é aviso.
 
 ## 12. Opção 82 no servidor
 
-- A concessão guarda a 82 (como chegou); `lease.print` mostra `agent_circuit_id` e
+- Só a 82 de um agente vale (RFC 3046 §2.1, §5): num pedido sem relay (`giaddr` 0) ela é do próprio
+  cliente e é ignorada (não casa concessão fixa, não vai ao histórico, não ecoa), a menos que o
+  servidor tenha `relay_info_trusted` (uma OLT ou switch com DHCP snooping que a insere na camada 2).
+- A concessão guarda a 82 (como chegou, e a guardada continua nas renovações sem relay); `lease.print` mostra `agent_circuit_id` e
   `agent_remote_id` (texto quando imprimível, `0x…` senão: a RFC 3046 §3.1/§3.2 diz que são opacos).
 - Concessão fixa por porta: `agent_circuit_id` e/ou `agent_remote_id` (RouterOS 7.21) no lugar de
   MAC/client id, ou junto (todos os que estiverem preenchidos têm de bater). Um endereço por porta
