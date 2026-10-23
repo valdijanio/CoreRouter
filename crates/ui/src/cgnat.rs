@@ -7,14 +7,16 @@
 use egui::{ComboBox, Grid, Id, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
+use std::collections::BTreeMap;
+
 use crate::backend::RequestId;
 use crate::chip::{self, Kind};
-use crate::dialog::{self, Footer, Press, Status};
 use crate::help::{self, HelpView};
 use crate::i18n::{Lang, tr};
-use crate::interfaces::{cascade, dialog_id};
+use crate::list::{self, Act, Cmds, Item, Tools};
+use crate::list_modal::{self, Field, Input, Modal, Spec};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
-use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment, num};
+use crate::table::{self, Menu, Row, TableState, col, comment, num};
 use crate::{CoreRouterUi, Win, value_text};
 
 pub(crate) const NAME: &str = "cgnat";
@@ -77,26 +79,74 @@ const ALERT_COLUMNS: [table::Column; 6] = [
 ];
 const HISTORY_COLUMNS: [table::Column; 4] = [col("Since"), col("Until"), col("Pools"), num("Exceptions")];
 
-/// The fields of a pool, in dialog order: (key, label, hint).
-pub(crate) const POOL_FIELDS: &[(&str, &str, &str)] = &[
-    ("name", "Name", "cgnat1"),
-    ("inside", "Inside", "100.64.0.0/22"),
-    ("outside", "Outside", "203.0.113.0/28"),
-    ("ports_per_subscriber", "Ports per Subscriber", "1000"),
-    ("port_range", "Port Range", "1024-65535"),
-    ("max_blocks", "Max Blocks", "4"),
-    ("block_timeout", "Block Timeout", "2m"),
-    ("out_interface", "Out. Interface", "ether1"),
-    ("alert_percent", "Alert %", "90"),
-    ("comment", "Comment", ""),
+/// The pool modal's fields (G0.24 list window pattern).
+const POOL_FIELDS: &[Field] = &[
+    Field { param: "name", label: "Name", help: "cgnat.name", input: Input::Text("cgnat1"), edit: true },
+    Field { param: "mode", label: "Mode", help: "cgnat.mode", input: Input::Choice, edit: true },
+    Field { param: "inside", label: "Inside", help: "cgnat.inside", input: Input::Text("100.64.0.0/22"), edit: true },
+    Field { param: "outside", label: "Outside", help: "cgnat.outside", input: Input::Text("203.0.113.0/28"), edit: true },
+    Field { param: "ports_per_subscriber", label: "Ports per Subscriber", help: "cgnat.ports_per_subscriber", input: Input::Text("1000"), edit: true },
+    Field { param: "port_range", label: "Port Range", help: "cgnat.port_range", input: Input::Text("1024-65535"), edit: true },
+    Field { param: "max_blocks", label: "Max Blocks", help: "cgnat.max_blocks", input: Input::Text("4"), edit: true },
+    Field { param: "block_timeout", label: "Block Timeout", help: "cgnat.block_timeout", input: Input::Text("2m"), edit: true },
+    Field { param: "out_interface", label: "Out. Interface", help: "cgnat.out_interface", input: Input::Text("ether1"), edit: true },
+    Field { param: "alert_percent", label: "Alert %", help: "cgnat.alert_percent", input: Input::Text("90"), edit: true },
+    Field { param: "endpoint_independent_mapping", label: "Endpoint-Independent Mapping", help: "cgnat.endpoint_independent_mapping", input: Input::Check, edit: true },
+    Field { param: "endpoint_independent_filtering", label: "Endpoint-Independent Filtering", help: "cgnat.endpoint_independent_filtering", input: Input::Check, edit: true },
+    Field { param: "hairpin", label: "Hairpin", help: "cgnat.hairpin", input: Input::Check, edit: true },
+    Field { param: "comment", label: "Comment", help: "cgnat.comment", input: Input::Text(""), edit: true },
 ];
-/// The pool's switches: (key, label).
-pub(crate) const POOL_FLAGS: &[(&str, &str)] = &[
-    ("endpoint_independent_mapping", "Endpoint-Independent Mapping"),
-    ("endpoint_independent_filtering", "Endpoint-Independent Filtering"),
-    ("hairpin", "Hairpin"),
-    ("disabled", "Disabled"),
+const POOL_SPEC: Spec = Spec {
+    panel: NAME,
+    parent: Win::Panel(WIN),
+    new_title: "New CGNAT Pool",
+    edit_title: "CGNAT Pool",
+    help: "cgnat.pool",
+    fields: POOL_FIELDS,
+    preview: "ip.firewall.cgnat.pool.preview",
+};
+const POOL_CMDS: Cmds = Cmds {
+    add: "ip.firewall.cgnat.pool.add",
+    remove: "ip.firewall.cgnat.pool.remove",
+    set: Some("ip.firewall.cgnat.pool.set"),
+    what: "pools",
+};
+const EXCEPTION_FIELDS: &[Field] = &[
+    Field { param: "subscriber", label: "Subscriber", help: "cgnat.exception.subscriber", input: Input::Text("100.64.0.9"), edit: true },
+    Field { param: "public", label: "Public", help: "cgnat.exception.public", input: Input::Text("198.51.100.9"), edit: true },
+    Field { param: "comment", label: "Comment", help: "cgnat.exception.comment", input: Input::Text(""), edit: true },
 ];
+const EXCEPTION_SPEC: Spec = Spec {
+    panel: NAME,
+    parent: Win::Panel(WIN),
+    new_title: "New CGNAT Exception",
+    edit_title: "CGNAT Exception",
+    help: "cgnat.exception",
+    fields: EXCEPTION_FIELDS,
+    preview: "ip.firewall.cgnat.exception.preview",
+};
+const EXCEPTION_CMDS: Cmds = Cmds {
+    add: "ip.firewall.cgnat.exception.add",
+    remove: "ip.firewall.cgnat.exception.remove",
+    set: Some("ip.firewall.cgnat.exception.set"),
+    what: "exceptions",
+};
+
+/// Which list the open modal edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Which {
+    Pool,
+    Exception,
+}
+
+impl Which {
+    fn spec(self) -> &'static Spec {
+        match self {
+            Which::Pool => &POOL_SPEC,
+            Which::Exception => &EXCEPTION_SPEC,
+        }
+    }
+}
 
 #[derive(Default)]
 pub(crate) struct Cgnat {
@@ -119,8 +169,8 @@ pub(crate) struct Cgnat {
     blocks_t: TableState,
     alerts_t: TableState,
     history_t: TableState,
-    pub(crate) pool_dialog: Option<PoolDialog>,
-    pub(crate) exception_dialog: Option<ExceptionDialog>,
+    pub(crate) modal: Option<(Which, Modal)>,
+    pub(crate) filters: list::Filters,
     pub(crate) help: Option<HelpView>,
 }
 
@@ -135,41 +185,7 @@ pub(crate) struct WhoWas {
     pub lookup: Option<Result<Value, String>>,
 }
 
-pub(crate) struct PoolDialog {
-    id: u64,
-    item: Option<String>,
-    mode: String,
-    values: Vec<String>,
-    flags: Vec<bool>,
-    orig: (String, Vec<String>, Vec<bool>),
-    status: Status,
-}
-
-impl PoolDialog {
-    /// Fill field `key` (tests drive the dialog).
-    #[cfg(test)]
-    pub(crate) fn set(&mut self, key: &str, value: &str) {
-        if let Some(i) = POOL_FIELDS.iter().position(|(k, _, _)| *k == key)
-            && let Some(v) = self.values.get_mut(i)
-        {
-            *v = value.to_owned();
-        }
-    }
-}
-
-pub(crate) struct ExceptionDialog {
-    id: u64,
-    item: Option<String>,
-    subscriber: String,
-    public: String,
-    comment: String,
-    orig: (String, String, String),
-    status: Status,
-}
-
 enum Reply {
-    Pool(u64),
-    Exception(u64),
     WhoWas,
     Lookup,
     Other,
@@ -255,116 +271,191 @@ impl Cgnat {
         app.run_then("ip.firewall.cgnat.who-was", Value::Object(p), crate::panel::then(NAME, Reply::WhoWas));
     }
 
-    fn pools_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
-        let rows: Vec<Row> = self.pools.iter().map(pool_row).collect();
-        let selection = self.pools_t.selection(&rows);
-        let can = app.can();
-        let (mut new, mut remove) = (false, false);
-        ui.horizontal(|ui| {
-            new = table::tool(ui, POOLS, Icon::Add, tr(l, "Add"), can.check("ip.firewall.cgnat.pool.add")).clicked();
-            let picked = if selection.is_empty() { Err(tr(l, "Select a pool first").to_owned()) } else { Ok(()) };
-            remove = table::tool(ui, POOLS, Icon::Remove, tr(l, "Remove"), can.and("ip.firewall.cgnat.pool.remove", picked)).clicked();
-            ui.separator();
-            let days = text(&self.settings, "history_days");
-            let since = self.settings.get("history").map(|h| text(h, "since")).unwrap_or_default();
-            ui.weak(format!("{}: {days} {}", tr(l, "History kept"), tr(l, "days")));
-            if !since.is_empty() {
-                ui.weak(format!("({} {since})", tr(l, "since")));
+    /// What a row of the pool list says of itself, for the bar.
+    fn pool_values(row: Option<&Value>) -> BTreeMap<&'static str, String> {
+        let mut v: BTreeMap<&'static str, String> = BTreeMap::new();
+        for f in POOL_FIELDS {
+            let text = match (row, f.input) {
+                (Some(r), Input::Check) => {
+                    if r.get(f.param).and_then(Value::as_bool).unwrap_or(false) { "yes" } else { "no" }.to_owned()
+                }
+                (Some(r), _) => match f.param {
+                    "inside" | "outside" => list_text(r, f.param),
+                    _ => text(r, f.param),
+                },
+                (None, Input::Check) => {
+                    if matches!(f.param, "endpoint_independent_mapping" | "hairpin") { "yes" } else { "no" }.to_owned()
+                }
+                (None, _) if f.param == "mode" => "deterministic".to_owned(),
+                (None, _) => String::new(),
+            };
+            v.insert(f.param, text);
+        }
+        v
+    }
+
+    /// Open item `k` of `which` in the modal.
+    fn edit(&mut self, app: &mut CoreRouterUi, which: Which, k: &str) {
+        let (rows, key) = match which {
+            Which::Pool => (&self.pools, "name"),
+            Which::Exception => (&self.exceptions, "id"),
+        };
+        let Some(r) = rows.iter().find(|r| text(r, key) == k).cloned() else { return };
+        let values = match which {
+            Which::Pool => Self::pool_values(Some(&r)),
+            Which::Exception => EXCEPTION_FIELDS.iter().map(|f| (f.param, text(&r, f.param))).collect(),
+        };
+        let name = match which {
+            Which::Pool => text(&r, "name"),
+            Which::Exception => format!("{} – {}", text(&r, "subscriber"), text(&r, "public")),
+        };
+        self.modal = Some((which, Modal::open(app, Some((k.to_owned(), name)), values)));
+    }
+
+    /// Act on a list's bar, menu or keys: one dispatcher for both lists.
+    fn act(&mut self, app: &mut CoreRouterUi, ui: &Ui, which: Which, act: Act) {
+        let (cmds, rows, key) = match which {
+            Which::Pool => (POOL_CMDS, &self.pools, "name"),
+            Which::Exception => (EXCEPTION_CMDS, &self.exceptions, "id"),
+        };
+        let set = cmds.set.unwrap_or(cmds.remove);
+        let steps = |keys: &[String], extra: Value| -> Vec<Value> {
+            keys.iter()
+                .map(|k| {
+                    let mut p = extra.clone();
+                    if let Some(o) = p.as_object_mut() {
+                        o.insert("id".into(), json!(k));
+                    }
+                    json!({"command": set, "params": p})
+                })
+                .collect()
+        };
+        match act {
+            Act::Add => {
+                let values = match which {
+                    Which::Pool => Self::pool_values(None),
+                    Which::Exception => EXCEPTION_FIELDS.iter().map(|f| (f.param, String::new())).collect(),
+                };
+                self.modal = Some((which, Modal::open(app, None, values)));
             }
+            // Comment: the modal has the comment field (one item at a time).
+            Act::Edit(k) => self.edit(app, which, &k),
+            Act::Comment(keys) => {
+                if let Some(k) = keys.first() {
+                    self.edit(app, which, k);
+                }
+            }
+            Act::Remove(keys) => {
+                let steps: Vec<Value> = keys.iter().map(|k| json!({"command": cmds.remove, "params": {"id": k}})).collect();
+                app.run_steps(steps, crate::panel::then(NAME, Reply::Other));
+            }
+            Act::Enable(keys) => {
+                app.run_steps(steps(&keys, json!({"disabled": false})), crate::panel::then(NAME, Reply::Other));
+            }
+            Act::Disable(keys) => {
+                app.run_steps(steps(&keys, json!({"disabled": true})), crate::panel::then(NAME, Reply::Other));
+            }
+            Act::Copy(keys) => {
+                let rows: Vec<Row> = rows
+                    .iter()
+                    .filter(|r| keys.contains(&text(r, key)))
+                    .map(|r| match which {
+                        Which::Pool => pool_row(r),
+                        Which::Exception => exception_row(r),
+                    })
+                    .collect();
+                let refs: Vec<&Row> = rows.iter().collect();
+                ui.ctx().copy_text(list::copy_rows(&refs));
+            }
+            Act::CopyAs(keys, syntax) => {
+                let picked: Vec<Value> = rows.iter().filter(|r| keys.contains(&text(r, key))).cloned().collect();
+                let refs: Vec<&Value> = picked.iter().collect();
+                ui.ctx().copy_text(list::copy_commands(app, cmds.add, &refs, syntax));
+            }
+        }
+    }
+
+    fn pools_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
+        let shown: Vec<&Value> = self.pools.iter().filter(|r| self.filters.shows(r)).collect();
+        let rows: Vec<Row> = shown.iter().map(|r| pool_row(r)).collect();
+        let selection = self.pools_t.selection(&rows);
+        let picked: Vec<Item> = self
+            .pools
+            .iter()
+            .filter(|r| selection.contains(&text(r, "name")))
+            .map(|r| Item::of(r, "name", ""))
+            .collect();
+        let tools = Tools::new(&app.can(), &POOL_CMDS, &picked);
+        let mut act = None;
+        ui.horizontal(|ui| {
+            act = list::toolbar(ui, POOLS, &tools, &selection, l);
+            self.filters.chips(ui, "mode", &[("deterministic", "deterministic"), ("blocks", "blocks")], l);
+            let days = text(&self.settings, "history_days");
+            ui.weak(format!("{}: {days} {}", tr(l, "History kept"), tr(l, "days")));
             if help::info_button(ui, Id::unique("cgnat-help-history"), tr(l, "History kept")).clicked() {
                 self.help = Some(HelpView::new("cgnat.history_days", tr(l, "History kept")));
             }
             table::find_field(ui, POOLS, &mut self.pools_t);
         });
-        ui.separator();
-        let out = table::show(ui, POOLS, 0.0, &mut self.pools_t, &POOL_COLUMNS, &rows, |ui, menu| {
-            if let Menu::Empty = menu
-                && action(ui, tr(l, "Add Pool…"), can.check("ip.firewall.cgnat.pool.add"))
-            {
-                new = true;
+        let can_copy = !app.cache.commands.is_empty();
+        let foot = ui.spacing().interact_size.y + 4.0;
+        let out = table::show(ui, POOLS, foot, &mut self.pools_t, &POOL_COLUMNS, &rows, |ui, menu| {
+            if let Menu::Rows(sel) = menu {
+                act = list::row_menu(ui, &tools, sel, can_copy, l).or(act.take());
             }
         });
-        if matches!(out.shortcut, Some(Shortcut::Remove)) && !selection.is_empty() {
-            remove = true;
-        }
-        if remove {
-            for name in &selection {
-                app.run_then("ip.firewall.cgnat.pool.remove", json!({"id": name}), crate::panel::then(NAME, Reply::Other));
-            }
-        }
-        let key = out.opened.or(out.comment).or_else(|| {
-            matches!(out.shortcut, Some(Shortcut::Open)).then(|| selection.first().cloned()).flatten()
-        });
-        let opened = key.and_then(|k| self.pools.iter().find(|p| text(p, "name") == k).cloned());
-        if (new || opened.is_some()) && self.pool_dialog.is_none() {
-            app.next_dialog = app.next_dialog.wrapping_add(1);
-            let get = |k: &str| match &opened {
-                Some(p) => match k {
-                    "inside" | "outside" => list_text(p, k),
-                    "block_timeout" => text(p, k),
-                    _ => text(p, k),
-                },
-                None => String::new(),
-            };
-            let values: Vec<String> = POOL_FIELDS.iter().map(|(k, _, _)| get(k)).collect();
-            let flags: Vec<bool> = POOL_FLAGS
-                .iter()
-                .map(|(k, _)| match &opened {
-                    Some(p) => p.get(*k).and_then(Value::as_bool).unwrap_or(false),
-                    None => matches!(*k, "endpoint_independent_mapping" | "hairpin"),
-                })
-                .collect();
-            let mode = opened.as_ref().map_or_else(|| "deterministic".to_owned(), |p| text(p, "mode"));
-            self.pool_dialog = Some(PoolDialog {
-                id: app.next_dialog,
-                item: opened.as_ref().map(|p| text(p, "name")),
-                orig: (mode.clone(), values.clone(), flags.clone()),
-                mode,
-                values,
-                flags,
-                status: Status::default(),
-            });
+        act = act
+            .or_else(|| list::from_shortcut(out.shortcut, &tools, &selection))
+            .or_else(|| out.opened.map(Act::Edit));
+        let total = self.pools.len();
+        let disabled = list::count(&self.pools, "disabled", "true");
+        let blocks = list::count(&self.pools, "mode", "blocks");
+        list::footer(
+            ui,
+            &[
+                (total, "pools", chip::neutral_tone(ui.visuals())),
+                (blocks, "blocks mode", chip::BLUE.tone(ui.visuals())),
+                (disabled, "disabled", chip::neutral_tone(ui.visuals())),
+            ],
+            l,
+        );
+        if let Some(a) = act {
+            self.act(app, ui, Which::Pool, a);
         }
     }
 
     fn exceptions_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         let rows: Vec<Row> = self.exceptions.iter().map(exception_row).collect();
         let selection = self.exceptions_t.selection(&rows);
-        let can = app.can();
-        let (mut new, mut remove) = (false, false);
+        let picked: Vec<Item> = self
+            .exceptions
+            .iter()
+            .filter(|r| selection.contains(&text(r, "id")))
+            .map(|r| Item::of(r, "id", ""))
+            .collect();
+        let tools = Tools::new(&app.can(), &EXCEPTION_CMDS, &picked);
+        let mut act = None;
         ui.horizontal(|ui| {
-            new = table::tool(ui, EXCEPTIONS, Icon::Add, tr(l, "Add"), can.check("ip.firewall.cgnat.exception.add")).clicked();
-            let picked = if selection.is_empty() { Err(tr(l, "Select an exception first").to_owned()) } else { Ok(()) };
-            remove = table::tool(ui, EXCEPTIONS, Icon::Remove, tr(l, "Remove"), can.and("ip.firewall.cgnat.exception.remove", picked)).clicked();
+            act = list::toolbar(ui, EXCEPTIONS, &tools, &selection, l);
             ui.weak(tr(l, "A subscriber with a public address of its own (1:1), outside every pool."));
             if help::info_button(ui, Id::unique("cgnat-help-exception"), tr(l, "Exceptions")).clicked() {
                 self.help = Some(HelpView::new("cgnat.exception", tr(l, "Exceptions")));
             }
+            table::find_field(ui, EXCEPTIONS, &mut self.exceptions_t);
         });
-        ui.separator();
-        let out = table::show(ui, EXCEPTIONS, 0.0, &mut self.exceptions_t, &EXCEPTION_COLUMNS, &rows, |_, _| {});
-        if matches!(out.shortcut, Some(Shortcut::Remove)) && !selection.is_empty() {
-            remove = true;
-        }
-        if remove {
-            for id in &selection {
-                app.run_then("ip.firewall.cgnat.exception.remove", json!({"id": id}), crate::panel::then(NAME, Reply::Other));
+        let can_copy = !app.cache.commands.is_empty();
+        let foot = ui.spacing().interact_size.y + 4.0;
+        let out = table::show(ui, EXCEPTIONS, foot, &mut self.exceptions_t, &EXCEPTION_COLUMNS, &rows, |ui, menu| {
+            if let Menu::Rows(sel) = menu {
+                act = list::row_menu(ui, &tools, sel, can_copy, l).or(act.take());
             }
-        }
-        let opened = out.opened.and_then(|k| self.exceptions.iter().find(|e| text(e, "id") == k).cloned());
-        if (new || opened.is_some()) && self.exception_dialog.is_none() {
-            app.next_dialog = app.next_dialog.wrapping_add(1);
-            let get = |k: &str| opened.as_ref().map(|e| text(e, k)).unwrap_or_default();
-            let vals = (get("subscriber"), get("public"), get("comment"));
-            self.exception_dialog = Some(ExceptionDialog {
-                id: app.next_dialog,
-                item: opened.as_ref().map(|e| text(e, "id")),
-                subscriber: vals.0.clone(),
-                public: vals.1.clone(),
-                comment: vals.2.clone(),
-                orig: vals,
-                status: Status::default(),
-            });
+        });
+        act = act
+            .or_else(|| list::from_shortcut(out.shortcut, &tools, &selection))
+            .or_else(|| out.opened.map(Act::Edit));
+        list::footer(ui, &[(self.exceptions.len(), "exceptions", chip::neutral_tone(ui.visuals()))], l);
+        if let Some(a) = act {
+            self.act(app, ui, Which::Exception, a);
         }
     }
 
@@ -725,6 +816,12 @@ impl PanelState for Cgnat {
     }
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
+        if key == list_modal::PREVIEW {
+            if let Some((_, m)) = self.modal.as_mut() {
+                m.arrived(value);
+            }
+            return;
+        }
         match (key, value) {
             ("pools", Value::Array(a)) => self.pools = a,
             ("exceptions", Value::Array(a)) => self.exceptions = a,
@@ -774,29 +871,34 @@ impl PanelState for Cgnat {
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         help::modal(ctx, app.lang, &mut self.help);
-        self.pool_dialog_ui(app, ctx, area);
-        self.exception_dialog_ui(app, ctx, area);
+        if let Some((which, modal)) = self.modal.as_mut() {
+            let options = |param: &str| -> Vec<String> {
+                match param {
+                    "mode" => vec!["deterministic".into(), "blocks".into()],
+                    _ => Vec::new(),
+                }
+            };
+            if !modal.show(app, ctx, area, which.spec(), &options) {
+                self.modal = None;
+            }
+        }
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let then = match then.downcast::<list_modal::Applied>() {
+            Ok(applied) => {
+                if let Some((_, m)) = self.modal.as_mut().filter(|(_, m)| m.id == applied.0)
+                    && m.replied(app, result)
+                {
+                    self.modal = None;
+                }
+                app.cache.refreshed_at = None;
+                return;
+            }
+            Err(other) => other,
+        };
         if let Ok(r) = then.downcast::<Reply>() {
             match *r {
-                Reply::Pool(id) => {
-                    if let Some(d) = self.pool_dialog.as_mut().filter(|d| d.id == id)
-                        && d.status.replied(result)
-                    {
-                        app.floats.forget(dialog_id(d.id));
-                        self.pool_dialog = None;
-                    }
-                }
-                Reply::Exception(id) => {
-                    if let Some(d) = self.exception_dialog.as_mut().filter(|d| d.id == id)
-                        && d.status.replied(result)
-                    {
-                        app.floats.forget(dialog_id(d.id));
-                        self.exception_dialog = None;
-                    }
-                }
                 Reply::WhoWas => self.who.answer = Some(result.clone()),
                 Reply::Lookup => self.who.lookup = Some(result.clone()),
                 Reply::Other => {}
@@ -853,168 +955,4 @@ fn in_range(range: &str, ip: &str) -> bool {
         return u32::from(a) & mask == ip & mask;
     }
     range.parse::<std::net::Ipv4Addr>().is_ok_and(|a| u32::from(a) == ip)
-}
-
-impl Cgnat {
-    fn pool_dialog_ui(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
-        let Some(mut d) = self.pool_dialog.take() else { return };
-        let l = app.lang.labels;
-        let wid = dialog_id(d.id);
-        let can = app.can();
-        let title = match &d.item {
-            Some(n) => format!("{} <{n}>", tr(l, "CGNAT Pool")),
-            None => tr(l, "New CGNAT Pool").to_owned(),
-        };
-        let cmd = if d.item.is_some() { "ip.firewall.cgnat.pool.set" } else { "ip.firewall.cgnat.pool.add" };
-        let head = dialog::Head {
-            id: wid,
-            title: &title,
-            dirty: (d.mode.clone(), d.values.clone(), d.flags.clone()) != d.orig,
-            pos: cascade(area, d.id),
-            parent: Some(crate::win_id(Win::Panel(WIN))),
-        };
-        let mut info: Option<(String, String)> = None;
-        let blocks = d.mode == "blocks";
-        let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
-            Grid::new("cgnat-pool-fields").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
-                ui.label(tr(l, "Mode"));
-                ComboBox::from_id_salt("cgnat-pool-mode")
-                    .selected_text(d.mode.clone())
-                    .show_ui(ui, |ui| {
-                        for m in ["deterministic", "blocks"] {
-                            ui.selectable_value(&mut d.mode, m.to_owned(), m);
-                        }
-                    });
-                if help::info_button(ui, Id::unique(("cgnat-pool-help", "mode")), tr(l, "Mode")).clicked() {
-                    info = Some(("cgnat.mode".into(), tr(l, "Mode").into()));
-                }
-                ui.end_row();
-                for ((key, label, hint), value) in POOL_FIELDS.iter().zip(d.values.iter_mut()) {
-                    if !blocks && matches!(*key, "max_blocks" | "block_timeout") {
-                        continue;
-                    }
-                    ui.label(tr(l, label));
-                    let h = ui.spacing().interact_size.y;
-                    let id = crate::dialog::field_id(f.window(), key);
-                    ui.add_sized([220.0, h], TextEdit::singleline(value).id(id).hint_text(*hint));
-                    if help::info_button(ui, Id::unique(("cgnat-pool-help", *key)), tr(l, label)).clicked() {
-                        info = Some((format!("cgnat.{key}"), tr(l, label).into()));
-                    }
-                    ui.end_row();
-                }
-                for ((key, label), on) in POOL_FLAGS.iter().zip(d.flags.iter_mut()) {
-                    ui.label(tr(l, label));
-                    ui.checkbox(on, "");
-                    if help::info_button(ui, Id::unique(("cgnat-pool-help", *key)), tr(l, label)).clicked() {
-                        info = Some((format!("cgnat.{key}"), tr(l, label).into()));
-                    }
-                    ui.end_row();
-                }
-            });
-            Footer::<()>::edit(false, can.check(cmd))
-        });
-        if let Some((key, title)) = info {
-            self.help = Some(HelpView::new(key, title));
-        }
-        match pressed {
-            Some(Press::Cancel) => {
-                app.floats.forget(wid);
-                return;
-            }
-            Some(Press::Ok | Press::Apply) => {
-                let mut p = Map::new();
-                if let Some(item) = &d.item {
-                    p.insert("id".into(), json!(item));
-                }
-                if d.item.is_none() || d.mode != d.orig.0 {
-                    p.insert("mode".into(), json!(d.mode));
-                }
-                for (((key, _, _), v), o) in POOL_FIELDS.iter().zip(&d.values).zip(&d.orig.1) {
-                    if d.item.is_some() && v == o {
-                        continue;
-                    }
-                    let t = v.trim();
-                    if t.is_empty() && !matches!(*key, "comment" | "out_interface") {
-                        continue;
-                    }
-                    let val = match *key {
-                        "ports_per_subscriber" | "max_blocks" | "alert_percent" => {
-                            t.parse::<u64>().map_or_else(|_| json!(t), |n| json!(n))
-                        }
-                        _ => json!(t),
-                    };
-                    p.insert((*key).into(), val);
-                }
-                for (((key, _), on), o) in POOL_FLAGS.iter().zip(&d.flags).zip(&d.orig.2) {
-                    if d.item.is_none() || on != o {
-                        p.insert((*key).into(), json!(on));
-                    }
-                }
-                d.status.close_on_success = true;
-                d.status.sent();
-                app.run_then(cmd, Value::Object(p), crate::panel::then(NAME, Reply::Pool(d.id)));
-            }
-            _ => {}
-        }
-        self.pool_dialog = Some(d);
-    }
-
-    fn exception_dialog_ui(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
-        let Some(mut d) = self.exception_dialog.take() else { return };
-        let l = app.lang.labels;
-        let wid = dialog_id(d.id);
-        let can = app.can();
-        let title = match &d.item {
-            Some(n) => format!("{} <{n}>", tr(l, "CGNAT Exception")),
-            None => tr(l, "New CGNAT Exception").to_owned(),
-        };
-        let cmd = if d.item.is_some() { "ip.firewall.cgnat.exception.set" } else { "ip.firewall.cgnat.exception.add" };
-        let head = dialog::Head {
-            id: wid,
-            title: &title,
-            dirty: (d.subscriber.clone(), d.public.clone(), d.comment.clone()) != d.orig,
-            pos: cascade(area, d.id),
-            parent: Some(crate::win_id(Win::Panel(WIN))),
-        };
-        let mut info: Option<(&str, &str)> = None;
-        let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut d.status, |ui, f| {
-            Grid::new("cgnat-exception-fields").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
-                for (key, label, value, hint) in [
-                    ("subscriber", "Subscriber", &mut d.subscriber, "100.64.0.9"),
-                    ("public", "Public", &mut d.public, "198.51.100.9"),
-                    ("comment", "Comment", &mut d.comment, ""),
-                ] {
-                    ui.label(tr(l, label));
-                    let h = ui.spacing().interact_size.y;
-                    let id = crate::dialog::field_id(f.window(), key);
-                    ui.add_sized([200.0, h], TextEdit::singleline(value).id(id).hint_text(hint));
-                    if help::info_button(ui, Id::unique(("cgnat-exception-help", key)), tr(l, label)).clicked() {
-                        info = Some((key, label));
-                    }
-                    ui.end_row();
-                }
-            });
-            Footer::<()>::edit(false, can.check(cmd))
-        });
-        if let Some((key, label)) = info {
-            self.help = Some(HelpView::new(format!("cgnat.exception.{key}"), tr(l, label)));
-        }
-        match pressed {
-            Some(Press::Cancel) => {
-                app.floats.forget(wid);
-                return;
-            }
-            Some(Press::Ok | Press::Apply) => {
-                let mut p = json!({"subscriber": d.subscriber.trim(), "public": d.public.trim(), "comment": d.comment});
-                if let (Some(item), Some(o)) = (&d.item, p.as_object_mut()) {
-                    o.insert("id".into(), json!(item));
-                }
-                d.status.close_on_success = true;
-                d.status.sent();
-                app.run_then(cmd, p, crate::panel::then(NAME, Reply::Exception(d.id)));
-            }
-            _ => {}
-        }
-        self.exception_dialog = Some(d);
-    }
 }

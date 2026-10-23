@@ -42,24 +42,41 @@ fn the_pools_tab_shows_the_numbers() {
 }
 
 #[test]
-fn the_dialog_adds_a_pool() {
+fn the_modal_adds_a_pool_after_its_preview() {
     let mut h = harness(&[]);
     h.click(h.ctx.read_response(table::tool_id("cgnat-pools", table::Icon::Add)).unwrap().rect.center());
     {
         let c = h.app.panel_mut::<Cgnat>().unwrap();
-        let d = c.pool_dialog.as_mut().expect("the dialog opened");
-        d.set("name", "p2");
-        d.set("inside", "100.65.0.0/24");
-        d.set("outside", "198.51.100.0/30");
-        d.set("ports_per_subscriber", "500");
+        let (_, m) = c.modal.as_mut().expect("the modal opened");
+        for (k, v) in [("name", "p2"), ("inside", "100.65.0.0/24"), ("outside", "198.51.100.0/30"), ("ports_per_subscriber", "500")] {
+            m.values.insert(k, v.into());
+        }
     }
-    h.idle();
+    // The preview answers (numbers, checks, the command), then OK.
+    for _ in 0..30 {
+        h.time += 0.1;
+        h.idle();
+    }
+    assert!(h.has_text("129"), "per public address, from the preview");
+    assert!(h.has_text_containing("ip firewall cgnat pool add"), "the command shown");
     h.click(h.text("OK"));
     refresh(&mut h);
     let pools = lock(&h.session).store().running().ip.cgnat.pools.clone();
     assert_eq!(pools.len(), 1, "{:?}", h.app.log());
     assert_eq!(pools[0].ports_per_subscriber, 500);
-    assert!(h.app.panel_mut::<Cgnat>().unwrap().pool_dialog.is_none());
+    assert!(h.app.panel_mut::<Cgnat>().unwrap().modal.is_none());
+}
+
+#[test]
+fn the_bar_disables_and_enables_a_pool() {
+    let mut h = harness(&[pool()]);
+    h.click(h.text("c1"));
+    h.click(h.ctx.read_response(table::tool_id("cgnat-pools", table::Icon::Disable)).unwrap().rect.center());
+    refresh(&mut h);
+    assert!(lock(&h.session).store().running().ip.cgnat.pools[0].disabled, "{:?}", h.app.log());
+    h.click(h.ctx.read_response(table::tool_id("cgnat-pools", table::Icon::Enable)).unwrap().rect.center());
+    refresh(&mut h);
+    assert!(!lock(&h.session).store().running().ip.cgnat.pools[0].disabled);
 }
 
 #[test]

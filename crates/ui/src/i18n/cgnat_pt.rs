@@ -3,7 +3,6 @@
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
     ("A subscriber with a public address of its own (1:1), outside every pool.", "Assinante com IP público próprio (1:1), fora de qualquer pool."),
-    ("Add Pool…", "Adicionar pool…"),
     ("Alert %", "Alerta %"),
     ("Alerts", "Alertas"),
     ("Asked for (UTC)", "Pedido (UTC)"),
@@ -15,7 +14,6 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("CGNAT Pool", "Pool CGNAT"),
     ("Capacity", "Capacidade"),
     ("Date and Time", "Data e hora"),
-    ("Disabled", "Desativado"),
     ("Endpoint-Independent Filtering", "Filtro independente do destino"),
     ("Endpoint-Independent Mapping", "Mapeamento independente do destino"),
     ("Every change of the pools, with its time (RFC 7422 §3): who was reads the one in force.", "Cada mudança dos pools, com a hora (RFC 7422 §3): o Quem era? usa a que estava em vigor."),
@@ -42,8 +40,6 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Ports per Subscriber", "Portas por assinante"),
     ("Public", "Público"),
     ("Public Address", "IP público"),
-    ("Select a pool first", "Selecione um pool primeiro"),
-    ("Select an exception first", "Selecione uma exceção primeiro"),
     ("Since", "Desde"),
     ("Subscriber or public", "Assinante ou público"),
     ("Subscribers", "Assinantes"),
@@ -219,6 +215,12 @@ Os endereços **públicos** do pool, na ordem da fórmula. O bloco deve estar **
 **Quantos:** assinantes ÷ (portas da faixa ÷ portas por assinante). A validação diz quantos faltam. O planner em Tools › IP Calculator faz a conta.
 
 **Cuidado:** não use o IP do próprio roteador (as conexões dele disputam as portas) nem endereços privados.",
+    ),
+    (
+        "cgnat.pool",
+        "## Pool CGNAT
+
+Um conjunto de assinantes (faixas internas) que sai pelos mesmos IPs públicos, com uma faixa de portas para cada um. Os números (assinantes por IP, capacidade, quantos assinantes mudam de lugar ao editar) e as checagens aparecem enquanto você digita; o OK manda exatamente os comandos mostrados.",
     ),
     (
         "cgnat.port_range",

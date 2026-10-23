@@ -7,7 +7,6 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Clear", "Limpar"),
     ("Connection Tracking", "Rastreamento de conexões"),
     ("Connection table", "Tabela de conexões"),
-    ("Connections", "Conexões"),
     ("Conns", "Conexões"),
     ("Dst.", "Destino"),
     ("Dst. Address", "End. destino"),

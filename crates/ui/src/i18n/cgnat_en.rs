@@ -130,6 +130,12 @@ Translate only traffic leaving here (empty: any).",
 The public addresses, routed to the router. The check says how many are missing.",
     ),
     (
+        "cgnat.pool",
+        "## CGNAT pool
+
+A set of subscribers sharing the same public addresses, each with its own port range. Numbers and checks update as you type; OK sends the commands shown.",
+    ),
+    (
         "cgnat.port_range",
         "## Port Range
 
