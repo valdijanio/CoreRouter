@@ -7,6 +7,8 @@
 
 pub mod backend;
 pub mod connect;
+#[doc(hidden)]
+pub mod perf;
 // Every other `src/*.rs` is a module, and the ones defining `PANEL` are
 // panels: `build.rs` lists them, so a new window is just a new file.
 include!(concat!(env!("OUT_DIR"), "/ui_modules.rs"));
@@ -30,6 +32,14 @@ const REFRESH_SECS: f64 = 1.0;
 /// Repaint this often while replies are outstanding (a remote router).
 const PENDING_REPAINT: Duration = Duration::from_millis(50);
 const MAX_LOG: usize = 500;
+/// Seconds a query, a tool poll or an interface tab's query may go
+/// unanswered before it counts as lost (a reply dropped on the way, a
+/// reply with no id): the refresh and the polls start again instead of
+/// waiting for it forever.
+const QUERY_TIMEOUT_SECS: f64 = 30.0;
+/// The same for an operator's action and a terminal's call (the control
+/// client's own read timeout).
+const ACTION_TIMEOUT_SECS: f64 = 120.0;
 
 #[derive(Debug, Clone)]
 pub struct LogLine {
@@ -218,6 +228,11 @@ pub(crate) enum Then {
 pub struct CoreRouterUi {
     backend: Box<dyn Backend>,
     pending: BTreeMap<RequestId, Pending>,
+    /// UI time of the first frame each pending request was seen in.
+    sent_at: BTreeMap<RequestId, f64>,
+    /// Since when (UI time) a refresh got no answer and the lists may be
+    /// out of date; cleared by the next answered query.
+    stale: Option<f64>,
     /// Last link state seen, and whether its loss was already logged.
     link: Link,
     link_down_logged: bool,
@@ -286,6 +301,8 @@ impl CoreRouterUi {
         Self {
             backend,
             pending: BTreeMap::new(),
+            sent_at: BTreeMap::new(),
+            stale: None,
             link,
             link_down_logged: false,
             open,
@@ -470,6 +487,7 @@ impl CoreRouterUi {
         let Ok(value) = result else {
             return;
         };
+        self.stale = None;
         if self
             .cache
             .applied
@@ -610,6 +628,76 @@ impl CoreRouterUi {
         self.update_can();
     }
 
+    /// Give up on requests that got no answer in time (see
+    /// [`QUERY_TIMEOUT_SECS`]): a lost reply must not freeze the refresh,
+    /// a Ping or a terminal for good.
+    fn expire_pending(&mut self, now: f64) {
+        self.stamp_pending(now);
+        let late: Vec<(RequestId, f64)> = self
+            .pending
+            .iter()
+            .filter_map(|(id, p)| {
+                let limit = match p {
+                    Pending::Action { .. } | Pending::Terminal { .. } => ACTION_TIMEOUT_SECS,
+                    Pending::Query(_) | Pending::Tool(_) | Pending::Nic(_) => QUERY_TIMEOUT_SECS,
+                };
+                let sent = self.sent_at.get(id)?;
+                (now - sent >= limit).then_some((*id, limit))
+            })
+            .collect();
+        let mut lost_query = false;
+        for (id, limit) in late {
+            self.sent_at.remove(&id);
+            match self.pending.get(&id) {
+                Some(Pending::Query(_)) => {
+                    self.pending.remove(&id);
+                    lost_query = true;
+                }
+                // The interface window asks again on its own (STALE_SECS).
+                Some(Pending::Nic(_)) | None => {
+                    self.pending.remove(&id);
+                }
+                // A lost poll: poll again, the task itself may be fine.
+                Some(Pending::Tool(req)) => {
+                    let req = *req;
+                    self.pending.remove(&id);
+                    self.tool_timed_out(req);
+                }
+                Some(Pending::Action { .. } | Pending::Terminal { .. }) => {
+                    let why = format!(
+                        "no answer from the router in {limit:.0} s (it may still have \
+                         applied it: check before trying again)"
+                    );
+                    self.on_reply(id, Err(why));
+                }
+            }
+        }
+        if lost_query {
+            if self.stale.is_none() {
+                self.stale = Some(now);
+                self.push_log(LogLine {
+                    ok: false,
+                    command: "refresh".into(),
+                    message: format!(
+                        "no answer from the router in {QUERY_TIMEOUT_SECS:.0} s: \
+                         the lists may be out of date; asking again"
+                    ),
+                });
+            }
+            self.cache.refreshed_at = None;
+        }
+    }
+
+    /// Note when each request still waiting was first seen (end of the
+    /// frame that sent it), and forget the answered ones.
+    fn stamp_pending(&mut self, now: f64) {
+        let pending = &self.pending;
+        self.sent_at.retain(|id, _| pending.contains_key(id));
+        for id in self.pending.keys() {
+            self.sent_at.entry(*id).or_insert(now);
+        }
+    }
+
     fn refresh(&mut self, now: f64) {
         // One refresh at a time: a slow router must not pile requests up.
         if self
@@ -716,6 +804,7 @@ impl CoreRouterUi {
         let now = ui.input(|i| i.time);
         self.floats.begin_frame(ui.ctx());
         self.pump();
+        self.expire_pending(now);
         self.refresh(now);
         self.tools_tick(ui.ctx(), now);
         self.nic_tick(now);
@@ -818,6 +907,7 @@ impl CoreRouterUi {
         self.password_window(&ctx);
         self.lockout_window(&ctx);
         self.floats.end_frame(&ctx);
+        self.stamp_pending(now);
     }
 
     fn link_label(&self, ui: &mut egui::Ui) {
@@ -1053,7 +1143,22 @@ impl CoreRouterUi {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         let busy = self.busy();
-        ui.horizontal(|ui| match self.log.last() {
+        let now = ui.input(|i| i.time);
+        ui.horizontal(|ui| {
+            if let Some(since) = self.stale {
+                let tone = chip::AMBER.tone(ui.visuals());
+                chip::chip(ui, "stale", tone).on_hover_text(format!(
+                    "The router has not answered a refresh for {:.0} s: \
+                     the lists show older data",
+                    (now - since).max(0.0) + QUERY_TIMEOUT_SECS
+                ));
+            }
+            self.status_text(ui, busy);
+        });
+    }
+
+    fn status_text(&self, ui: &mut egui::Ui, busy: usize) {
+        match self.log.last() {
             _ if busy > 0 => {
                 ui.weak(format!("waiting for the router ({busy})…"));
             }
@@ -1068,7 +1173,7 @@ impl CoreRouterUi {
             None => {
                 ui.weak("ready");
             }
-        });
+        }
     }
 
     fn menu(&mut self, ui: &mut egui::Ui) {
@@ -1667,7 +1772,7 @@ mod tests {
                     tint: None,
                 })
                 .collect();
-            self.app.tables.interfaces.selection(&rows)
+            self.app.tables.interfaces.selection(&rows).into_vec()
         }
 
         /// The interface as the engine has it (not the UI cache).

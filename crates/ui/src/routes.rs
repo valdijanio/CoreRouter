@@ -306,10 +306,10 @@ impl CoreRouterUi {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Remove => Act::Remove(sel),
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        Icon::Add | Icon::Comment => Act::Comment(sel),
+                        Icon::Remove => Act::Remove(sel.into_vec()),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        Icon::Add | Icon::Comment => Act::Comment(sel.into_vec()),
                     });
                 }
             }
@@ -368,11 +368,11 @@ impl CoreRouterUi {
             };
             if allowed {
                 act = Some(match s {
-                    Shortcut::Remove => Act::Remove(sel),
-                    Shortcut::Enable => Act::Enable(sel),
-                    Shortcut::Disable => Act::Disable(sel),
-                    Shortcut::Comment => Act::Comment(sel),
-                    Shortcut::Open => Act::Open(sel),
+                    Shortcut::Remove => Act::Remove(sel.into_vec()),
+                    Shortcut::Enable => Act::Enable(sel.into_vec()),
+                    Shortcut::Disable => Act::Disable(sel.into_vec()),
+                    Shortcut::Comment => Act::Comment(sel.into_vec()),
+                    Shortcut::Open => Act::Open(sel.into_vec()),
                 });
             }
         }
@@ -678,7 +678,7 @@ fn can_enable(picked: &[&Route], enable: bool) -> Result<(), String> {
     }
 }
 
-fn row_menu(ui: &mut Ui, act: &mut Option<Act>, routes: &[Route], sel: &[String], can: &Avail) {
+fn row_menu(ui: &mut Ui, act: &mut Option<Act>, routes: &[Route], sel: &table::Selection, can: &Avail) {
     let picked: Vec<&Route> = routes.iter().filter(|r| sel.contains(&r.key)).collect();
     let owned = || sel.to_vec();
     if action(

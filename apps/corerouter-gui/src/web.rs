@@ -21,7 +21,7 @@
 //! by `--ws-listen` talks `wss://` to the same port.
 
 use std::cell::RefCell;
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 use std::rc::{Rc, Weak};
 
 use corerouter_engine::{Session, shared};
@@ -41,6 +41,10 @@ use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
 
 /// Milliseconds between reconnection attempts.
 const RETRY_MS: f64 = 2000.0;
+/// A request with no answer after this long fails (a reply lost on the way
+/// or sent without its id), like the native control client's read timeout,
+/// so nothing waits on it forever.
+const REQUEST_TIMEOUT_MS: f64 = 120_000.0;
 
 pub enum Choice {
     Lab,
@@ -250,8 +254,8 @@ struct State {
     /// A closed socket whose callbacks may still be running: dropped on the
     /// next `poll`, never from inside its own callback.
     dead: Option<Conn>,
-    /// Sent on the socket, not answered yet.
-    in_flight: BTreeSet<RequestId>,
+    /// Sent on the socket, not answered yet, with when (ms).
+    in_flight: BTreeMap<RequestId, f64>,
     /// Submitted while the socket was opening or logging in.
     outbox: Vec<(RequestId, String, Value)>,
     replies: Vec<Reply>,
@@ -275,7 +279,7 @@ impl State {
         let sent = self.conn.as_ref().map(|c| c.ws.send_with_str(&text));
         match sent {
             Some(Ok(())) => {
-                self.in_flight.insert(id);
+                self.in_flight.insert(id, js_sys::Date::now());
             }
             _ => self
                 .replies
@@ -290,7 +294,7 @@ impl State {
         }
         let msg = format!("connection to {} lost: {reason}", self.url);
         let waiting: Vec<RequestId> = std::mem::take(&mut self.in_flight)
-            .into_iter()
+            .into_keys()
             .chain(
                 std::mem::take(&mut self.outbox)
                     .into_iter()
@@ -333,6 +337,29 @@ impl State {
         true
     }
 
+    /// Fail the requests that waited too long; a lost login answer starts
+    /// the connection over.
+    fn expire(&mut self, now: f64) {
+        let late: Vec<RequestId> = self
+            .in_flight
+            .iter()
+            .filter(|(_, sent)| now - **sent >= REQUEST_TIMEOUT_MS)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            self.in_flight.remove(&id);
+            if id == LOGIN_ID {
+                self.lost("the login got no answer".into());
+                return;
+            }
+            let secs = REQUEST_TIMEOUT_MS / 1000.0;
+            self.replies.push((
+                id,
+                Err(format!("no answer from {} in {secs:.0} s", self.url)),
+            ));
+        }
+    }
+
     fn flush(&mut self) {
         for (id, method, params) in std::mem::take(&mut self.outbox) {
             self.send(id, &method, params);
@@ -368,7 +395,7 @@ impl State {
         let Some(id) = reply.get("id").and_then(Value::as_u64) else {
             return;
         };
-        if !self.in_flight.remove(&id) {
+        if self.in_flight.remove(&id).is_none() {
             return;
         }
         let result = if reply.get("ok").and_then(Value::as_bool) == Some(true) {
@@ -411,7 +438,7 @@ impl WsBackend {
                 url,
                 conn: None,
                 dead: None,
-                in_flight: BTreeSet::new(),
+                in_flight: BTreeMap::new(),
                 outbox: Vec::new(),
                 replies: Vec::new(),
                 retry_at: 0.0,
@@ -508,7 +535,9 @@ impl Backend for WsBackend {
         let retry = {
             let mut s = self.state.borrow_mut();
             s.dead = None;
-            s.conn.is_none() && !s.refused && js_sys::Date::now() >= s.retry_at
+            let now = js_sys::Date::now();
+            s.expire(now);
+            s.conn.is_none() && !s.refused && now >= s.retry_at
         };
         if retry {
             self.connect();

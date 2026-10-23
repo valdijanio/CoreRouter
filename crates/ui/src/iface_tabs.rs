@@ -557,17 +557,13 @@ fn status(ui: &mut Ui, view: &NicView) {
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
             ui.label("Status");
-            let green = if ui.visuals().dark_mode {
-                egui::Color32::from_rgb(90, 200, 110)
+            // A state: a GREEN or RED chip (docs/ui-style.md).
+            let (hue, label) = if ok {
+                (&crate::chip::GREEN, "link-ok")
             } else {
-                egui::Color32::from_rgb(30, 130, 50)
+                (&crate::chip::RED, "no-link")
             };
-            let (color, label) = if ok {
-                (green, "link-ok")
-            } else {
-                (ui.visuals().error_fg_color, "no-link")
-            };
-            ui.label(RichText::new(label).color(color).strong());
+            crate::chip::chip(ui, label, hue.tone(ui.visuals()));
             ui.end_row();
             row(
                 ui,

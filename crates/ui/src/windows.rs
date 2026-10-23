@@ -272,7 +272,7 @@ impl CoreRouterUi {
             };
             let enabled = can.and("ip.address.remove", picked);
             if table::tool(ui, "addresses", Icon::Remove, "Remove", enabled).clicked() {
-                remove = Some(selection.clone());
+                remove = Some(selection.to_vec());
             }
             table::find_field(ui, "addresses", &mut self.tables.addresses);
         });
@@ -296,7 +296,7 @@ impl CoreRouterUi {
             },
         );
         if out.shortcut == Some(Shortcut::Remove) {
-            remove = Some(self.tables.addresses.selection(&rows));
+            remove = Some(self.tables.addresses.selection(&rows).into_vec());
         }
         if select_all {
             self.tables.addresses.select_all(&rows);

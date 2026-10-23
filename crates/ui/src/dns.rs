@@ -914,9 +914,9 @@ impl DnsPanel {
                 if table::tool(ui, STATIC_TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        _ => Act::Remove(sel),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        _ => Act::Remove(sel.into_vec()),
                     });
                 }
             }
@@ -981,11 +981,11 @@ impl DnsPanel {
                 .filter(|r| sel.contains(&text(r, "id")))
                 .collect();
             act = match s {
-                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(sel)),
-                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(sel)),
-                Shortcut::Enable if can_enable(&picked, true).is_ok() => Some(Act::Enable(sel)),
+                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(sel.into_vec())),
+                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(sel.into_vec())),
+                Shortcut::Enable if can_enable(&picked, true).is_ok() => Some(Act::Enable(sel.into_vec())),
                 Shortcut::Disable if can_enable(&picked, false).is_ok() => {
-                    Some(Act::Disable(sel))
+                    Some(Act::Disable(sel.into_vec()))
                 }
                 _ => act,
             };
@@ -1156,7 +1156,7 @@ impl DnsPanel {
                 .on_hover_text("Tools › DNS Lookup, with the selected entry")
                 .clicked()
             {
-                let picked = self.cache_table.selection(&rows).into_iter().next();
+                let picked = self.cache_table.selection(&rows).into_vec().into_iter().next();
                 let (name, rtype) = picked
                     .as_deref()
                     .and_then(|k| k.split_once(' '))
