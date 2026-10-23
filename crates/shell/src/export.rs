@@ -420,6 +420,52 @@ pub fn script(
     s
 }
 
+/// The parameters of `add_id` that recreate `row` (a list row), as an
+/// export writes them: required ones always, optional ones unless empty.
+/// "Copy as command" in the GUI's lists (G0.24). `None`: no such command,
+/// or the row lacks a required parameter (a secret the router never sends).
+pub fn recreate(reg: &Registry, add_id: &str, row: &Value) -> Option<Value> {
+    let (_, cmd) = reg.by_id(add_id)?;
+    let args = args_of(cmd, row, false).ok()?;
+    let mut out = serde_json::Map::new();
+    for (k, _) in args {
+        if let Some(v) = row.get(&k) {
+            out.insert(k, v.clone());
+        }
+    }
+    Some(Value::Object(out))
+}
+
+/// Command `id` with `params` as typed in the terminal, on one line:
+/// `/ip address set *3 disabled=yes`. `id` goes first and bare (the item),
+/// the rest as `key=value` in the order the command declares them, then
+/// any others; null values are left out. `None`: no such command.
+pub fn command_line(reg: &Registry, id: &str, params: &Value) -> Option<String> {
+    let (path, cmd) = reg.by_id(id)?;
+    let mut s = format!("{} {}", path_text(path), cmd.verb);
+    let empty = serde_json::Map::new();
+    let obj = params.as_object().unwrap_or(&empty);
+    if let Some(item) = obj.get("id").filter(|v| !v.is_null()) {
+        s.push(' ');
+        s.push_str(&quote(&arg_text(item)));
+    }
+    let declared = cmd.params.iter().map(|p| p.key.as_str());
+    let others = obj
+        .keys()
+        .map(String::as_str)
+        .filter(|k| cmd.param(k).is_none());
+    for k in declared.chain(others).filter(|k| *k != "id") {
+        let Some(v) = obj.get(k).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        s.push(' ');
+        s.push_str(&kebab(k));
+        s.push('=');
+        s.push_str(&quote(&arg_text(v)));
+    }
+    Some(s)
+}
+
 /// Width of an export with no terminal (a file, a pipe): RouterOS's 80.
 pub const DEFAULT_WIDTH: usize = 80;
 
@@ -495,6 +541,39 @@ pub fn terse(script: &str) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn copy_as_command_lines() {
+        let reg = Registry::from_list(&json!([
+            {"id": "ip.address.add", "params": "{address: cidr, interface: string, disabled?: bool, comment?: string, from_pool?: string} → {id}", "kind": "action", "enabled": true},
+            {"id": "ip.address.set", "params": "{id: *hex, disabled?: bool, comment?: string} → {id}", "kind": "action", "enabled": true},
+        ]));
+        let row = json!({"id": "*3", "address": "10.0.0.1/24", "interface": "ether1",
+            "disabled": false, "comment": "lan side", "from_pool": null, "network": "10.0.0.0/24"});
+        let p = recreate(&reg, "ip.address.add", &row).unwrap();
+        assert_eq!(
+            p,
+            json!({"address": "10.0.0.1/24", "interface": "ether1", "comment": "lan side"})
+        );
+        assert_eq!(
+            command_line(&reg, "ip.address.add", &p).unwrap(),
+            "/ip address add address=10.0.0.1/24 interface=ether1 comment=\"lan side\""
+        );
+        assert_eq!(
+            command_line(
+                &reg,
+                "ip.address.set",
+                &json!({"disabled": true, "id": "*3"})
+            )
+            .unwrap(),
+            "/ip address set *3 disabled=yes"
+        );
+        assert_eq!(command_line(&reg, "ip.route.add", &json!({})), None);
+        assert_eq!(
+            recreate(&reg, "ip.address.add", &json!({"address": "10.0.0.1/24"})),
+            None
+        );
+    }
 
     #[test]
     fn unmanaged_and_dynamic_rows_are_not_exported() {

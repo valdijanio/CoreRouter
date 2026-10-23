@@ -5,6 +5,7 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod cgnat;
 pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
@@ -429,6 +430,30 @@ pub trait Hal: Send {
     fn connection_stats(&mut self) -> Result<conntrack::Stats, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no connection tracking",
+            self.describe()
+        )))
+    }
+
+    /// Set or remove CGNAT port blocks (G2.3c): elements of a blocks-mode
+    /// pool's map, kept across a replace of the table.
+    fn cgnat_blocks(&mut self, changes: &[cgnat::BlockChange]) -> Result<(), HalError> {
+        let _ = changes;
+        Err(HalError::Unsupported(format!(
+            "{} has no CGNAT data plane",
+            self.describe()
+        )))
+    }
+
+    /// Subscribers of blocks-mode pools that want a block and have no
+    /// queue to ask through (the lab's pretend online subscribers).
+    fn cgnat_waiting(&mut self) -> Vec<cgnat::Waiting> {
+        Vec::new()
+    }
+
+    /// The queue of first packets of subscribers without a block (G2.3c).
+    fn cgnat_queue(&mut self) -> Result<Box<dyn cgnat::CgnatQueue>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no packet queue",
             self.describe()
         )))
     }
