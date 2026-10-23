@@ -554,7 +554,7 @@ impl TrafficFlowPanel {
         let mut help = false;
         let mut export = false;
         ui.horizontal(|ui| {
-            ui.label(tr(l, "Last"));
+            ui.label(tr(l, "Period"));
             ComboBox::from_id_salt("tf-top-minutes")
                 .width(80.0)
                 .selected_text(format!("{minutes} min"))
