@@ -34,6 +34,8 @@ const COMMAND: &str = "ip.identity.lookup";
 pub(crate) const STALE_SECS: f64 = 30.0;
 /// Addresses of one request (the command takes up to 4096).
 const BATCH: usize = 1024;
+/// Instants asked in one refresh (CGNAT › Who Was asks about the past).
+const MAX_INSTANTS: usize = 4;
 /// More names than this kept: forget them all and ask again.
 const MAX_KNOWN: usize = 20_000;
 
@@ -239,11 +241,29 @@ impl PanelState for Identity {
         if !self.enabled || self.wanted.is_empty() || !app.has_command(COMMAND) {
             return Vec::new();
         }
-        vec![Query {
-            key: "lookup",
-            command: COMMAND,
-            params: json!({"addresses": self.wanted.iter().take(BATCH).collect::<Vec<_>>(), "sources": self.sources()}),
-        }]
+        // One request per instant asked (`address@instant`; none: now).
+        let mut by_at: Vec<(Option<&str>, Vec<&str>)> = Vec::new();
+        for key in self.wanted.iter().take(BATCH) {
+            let (address, at) = match key.split_once('@') {
+                Some((a, t)) => (a, Some(t)),
+                None => (key.as_str(), None),
+            };
+            if let Some((_, list)) = by_at.iter_mut().find(|(t, _)| *t == at) {
+                list.push(address);
+            } else if by_at.len() < MAX_INSTANTS {
+                by_at.push((at, vec![address]));
+            }
+        }
+        by_at
+            .into_iter()
+            .map(|(at, addresses)| {
+                let mut params = json!({"addresses": addresses, "sources": self.sources()});
+                if let (Some(o), Some(at)) = (params.as_object_mut(), at) {
+                    o.insert("at".into(), json!(at));
+                }
+                Query { key: "lookup", command: COMMAND, params }
+            })
+            .collect()
     }
 
     fn arrived(&mut self, _: &mut CoreRouterUi, _: &'static str, _: RequestId, value: Value) {
@@ -254,7 +274,10 @@ impl PanelState for Identity {
             self.known.clear();
         }
         for r in rows {
-            let address = text(r, "address");
+            let address = match r.get("at").and_then(Value::as_str) {
+                Some(at) => format!("{}@{at}", text(r, "address")),
+                None => text(r, "address"),
+            };
             self.wanted.remove(&address);
             self.known.insert(address, (self.now, r.clone()));
         }
@@ -441,6 +464,17 @@ pub(crate) fn table_chip(
 /// The chip of `address` on its own (a form, a result line): the name and
 /// `+N`, its tooltip, and a click opening the item. Nothing while unknown.
 pub(crate) fn badge(app: &mut CoreRouterUi, ui: &mut Ui, place: &str, address: &str) {
+    badge_at(app, ui, place, address, None);
+}
+
+/// [`badge`] with the name of who held `address` at instant `at` (as the
+/// command takes it: RFC 3339 or Unix seconds), from the lease history.
+pub(crate) fn badge_at(app: &mut CoreRouterUi, ui: &mut Ui, place: &str, address: &str, at: Option<&str>) {
+    let key = match at {
+        Some(t) if !t.is_empty() && !t.contains('@') => format!("{address}@{t}"),
+        _ => address.to_owned(),
+    };
+    let address = key.as_str();
     let Some(r) = lookup(app, ui, place, address) else {
         return;
     };
@@ -455,8 +489,13 @@ pub(crate) fn badge(app: &mut CoreRouterUi, ui: &mut Ui, place: &str, address: &
     }
     let resp = ui
         .interact(resp.rect, Id::unique(("identity-badge", address)), egui::Sense::click())
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .on_hover_ui(|ui| tooltip_ui(ui, l, &r));
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+    // At once, like the table chip's (a plain tooltip waits for the
+    // pointer to rest).
+    if resp.hovered() {
+        Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), resp.id, PopupAnchor::Pointer)
+            .show(|ui| tooltip_ui(ui, l, &r));
+    }
     if resp.clicked() {
         open(app, &r);
     }

@@ -292,4 +292,80 @@ mod tests {
         assert_eq!(rows[2]["data"], json!(["A 203.0.113.66"]));
         assert_eq!(done["summary"]["majority"], json!(["A 192.0.2.7"]));
     }
+
+    /// An honest upstream on `ip`:`port` that answers after `delay`: the
+    /// popular names exist, anything else is NXDOMAIN.
+    fn honest(ip: &str, port: u16, delay: Duration) {
+        use hickory_proto::op::{Message, OpCode, ResponseCode};
+        use hickory_proto::rr::{RData, Record, rdata::A};
+        let sock = UdpSocket::bind((ip, port)).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let q = Message::from_vec(&buf[..n]).unwrap();
+                let name = q.queries[0].name().to_ascii();
+                let mut m = Message::response(q.metadata.id, OpCode::Query);
+                m.metadata.recursion_available = true;
+                m.add_queries(q.queries.clone());
+                if corerouter_engine::dns_upstreams::POPULAR.contains(&name.trim_end_matches('.')) {
+                    m.add_answer(Record::from_rdata(q.queries[0].name().clone(), 60, RData::A(A::new(192, 0, 2, 1))));
+                } else {
+                    m.metadata.response_code = ResponseCode::NXDomain;
+                }
+                thread::sleep(delay);
+                let _ = sock.send_to(&m.to_vec().unwrap(), from);
+            }
+        });
+    }
+
+    /// G6.8: the upstream benchmark against real sockets: a slow server is
+    /// ranked last, a hijacker (an address for any name) is caught.
+    #[test]
+    fn upstreams_benchmark_on_the_wire() {
+        let port = free_port();
+        honest("127.0.0.1", port, Duration::ZERO);
+        honest("127.0.0.2", port, Duration::from_millis(150));
+        upstream("127.0.0.3", port, Some([203, 0, 113, 66]));
+        let session = shared(Session::virtual_lab());
+        let dns = Arc::new(RouterDns::new());
+        let id = {
+            let mut s = corerouter_engine::lock(&session);
+            s.set_runner(corerouter_control::thread_runner());
+            s.execute("ip.dns.set", &json!({"servers": ["127.0.0.1", "127.0.0.2", "127.0.0.3"]}))
+                .unwrap();
+            let mut settings = s.dns_settings();
+            settings.port = port;
+            dns.resolver.configure(settings, 0);
+            s.set_dns_backend(dns.clone());
+            let r = s.execute("tool.dns.upstreams", &json!({"count": 20})).unwrap();
+            r["id"].as_u64().unwrap()
+        };
+        let started = Instant::now();
+        let done = loop {
+            let p = corerouter_engine::lock(&session)
+                .execute("tool.task.poll", &json!({"id": id, "max": 256}))
+                .unwrap();
+            if p["done"] == true {
+                break p;
+            }
+            assert!(started.elapsed() < Duration::from_secs(60), "{p}");
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(done["state"], "done", "{done}");
+        let rows = done["summary"]["servers"].as_array().unwrap();
+        let row = |srv: &str| rows.iter().find(|r| r["server"] == srv).unwrap();
+        assert_eq!(row("127.0.0.1")["answered"], 20);
+        assert!(row("127.0.0.2")["p50_ms"].as_f64().unwrap() >= 140.0, "{}", row("127.0.0.2"));
+        assert!(row("127.0.0.1")["p50_ms"].as_f64().unwrap() < 100.0);
+        assert_eq!(row("127.0.0.1")["nxdomain_hijack"], false);
+        assert_eq!(row("127.0.0.3")["nxdomain_hijack"], true);
+        assert_eq!(row("127.0.0.1")["forwarder"], true, "a loopback server forwards");
+        let advice = done["summary"]["recommend"].as_array().unwrap();
+        let says = |kind: &str, srv: &str, why: &str| {
+            advice.iter().any(|a| a["kind"] == kind && a["server"] == srv && a["why"] == why)
+        };
+        assert!(says("use", "127.0.0.1", "use"), "{advice:?}");
+        assert!(says("remove", "127.0.0.2", "slow"), "{advice:?}");
+        assert!(says("remove", "127.0.0.3", "hijack"), "{advice:?}");
+    }
 }

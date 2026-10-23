@@ -163,3 +163,38 @@ fn hostile_or_unknown_rows_draw_nothing() {
     assert!(is_chip(&chips[0].0) && is_chip("+3"));
     assert!(!is_chip("c1") && !is_chip("+") && !is_chip("+x"));
 }
+
+#[test]
+fn cgnat_who_was_names_the_subscriber_at_that_time() {
+    use crate::cgnat::{Cgnat, WIN};
+    let mut s = Session::virtual_lab();
+    s.tick(1_780_000_000);
+    s.execute(
+        "ip.firewall.cgnat.pool.add",
+        &json!({"name": "c1", "inside": "100.64.0.0/22", "outside": "203.0.113.0/28"}),
+    )
+    .unwrap();
+    s.execute(
+        "ip.dhcp-server.lease.add",
+        &json!({"address": "100.64.0.65", "mac_address": "02:00:00:00:00:65", "comment": "Pedro"}),
+    )
+    .unwrap();
+    s.tick(1_780_000_001);
+    let mut h = Harness::with_session(s);
+    h.app.open.clear();
+    h.app.open(Win::Panel(WIN));
+    refresh(&mut h);
+    h.click(h.text("Who Was"));
+    {
+        let c = h.app.panel_mut::<Cgnat>().unwrap();
+        c.who.public = "203.0.113.1".into();
+        c.who.port = "2500".into();
+    }
+    h.idle();
+    h.click(h.text("Find"));
+    refresh(&mut h);
+    assert!(h.has_text("100.64.0.65"), "{:?}", h.app.log());
+    let at = chip_at(&h, "Pedro").expect("the name next to the subscriber");
+    h.hover(at);
+    assert!(h.has_text("Static lease comment"));
+}

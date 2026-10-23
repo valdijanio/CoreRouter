@@ -264,6 +264,7 @@ fn host_names_now_and_at_a_past_time() {
     assert!(now.get("primary").is_none(), "{now}");
     let then = &who(&mut s, json!({"addresses": [ip], "at": bound_at}))[0];
     assert_eq!(then["primary"]["name"], "lab-laptop", "{then}");
+    assert_eq!(then["at"], bound_at, "the instant echoed");
     // Before any lease: nobody.
     let before = &who(&mut s, json!({"addresses": [ip], "at": 1_600_000_000}))[0];
     assert!(before.get("primary").is_none(), "{before}");

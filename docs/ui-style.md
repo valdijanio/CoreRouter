@@ -65,8 +65,9 @@ Como usar numa janela:
 - **Numa tabela:** `identity::add_chips(app, ui, "<tela>", &mut row, coluna, &ip)` depois de montar
   a linha, e `identity::table_chip(app, ui, "<tela>", &out, &rows, |chave| ip_da_linha)` depois do
   `table::show` (tooltip e clique; o `TableOutput.chip` diz qual selo está sob o ponteiro).
-- **Fora de tabela** (formulário, linha de resultado como o Quem era?):
-  `identity::badge(app, ui, "<tela>", &ip)`.
+- **Fora de tabela** (formulário, linha de resultado): `identity::badge(app, ui, "<tela>", &ip)`;
+  num instante passado (CGNAT › Quem era?), `identity::badge_at(app, ui, "cgnat", &ip,
+  Some(instante))`: o nome de quem tinha o IP naquela hora (histórico de concessões).
 - IP público com porta (`203.0.113.5:40001`) vai como está: o engine passa pelo CGNAT.
 
 Um selo de célula com ícone: um rótulo que começa por um code point de uso privado (os do

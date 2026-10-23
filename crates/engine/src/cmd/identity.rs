@@ -19,7 +19,7 @@ use crate::{EngineError, Result, Session};
 const ONE_BY_ONE: usize = 32;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "ip.identity.lookup", "Subscriber Identity", [], None,
-    "{addresses: [string] | string (1..4096 addresses: 100.64.3.7, 2001:db8::7, or a public address with its port, 203.0.113.5:40001, which goes through CGNAT to the subscriber), at?: time (who held the address then, from the DHCP lease history and the CGNAT history: 2026-10-03T14:02:00-03:00, a date, or Unix seconds; default now), sources?: [string] | string (the order to try and which to use; default pppoe, dhcp-static, dhcp-dynamic, address, address-list, dns-ptr)} → [{address, ip (the address named), cgnat? {public, port, subscriber, via}, cgnat_error? (a port given, but the address is in no CGNAT pool: named as itself), primary? {source, name, ref}, more (other names than the primary's), all: [{source, name, detail?, ref {window, tab?, id, zone?}}], error? (not an address)}]",
+    "{addresses: [string] | string (1..4096 addresses: 100.64.3.7, 2001:db8::7, or a public address with its port, 203.0.113.5:40001, which goes through CGNAT to the subscriber), at?: time (who held the address then, from the DHCP lease history and the CGNAT history: 2026-10-03T14:02:00-03:00, a date, or Unix seconds; default now), sources?: [string] | string (the order to try and which to use; default pppoe, dhcp-static, dhcp-dynamic, address, address-list, dns-ptr)} → [{address, at? (as given), ip (the address named), cgnat? {public, port, subscriber, via}, cgnat_error? (a port given, but the address is in no CGNAT pool: named as itself), primary? {source, name, ref}, more (other names than the primary's), all: [{source, name, detail?, ref {window, tab?, id, zone?}}], error? (not an address)}]",
     always, lookup)];
 
 fn time(p: &Value) -> Result<Option<u64>> {
@@ -192,6 +192,11 @@ fn lookup(s: &mut Session, p: &Value) -> Result<Value> {
     let mut out = Vec::with_capacity(asks.len());
     for a in asks {
         let mut v = json!({"address": a.shown, "all": [], "more": 0});
+        // The instant asked, as given, so a caller with several can tell
+        // the answers apart.
+        if let (Some(o), Some(t)) = (v.as_object_mut(), at.and(p.get("at"))) {
+            o.insert("at".into(), t.clone());
+        }
         let Some(o) = v.as_object_mut() else {
             continue;
         };
