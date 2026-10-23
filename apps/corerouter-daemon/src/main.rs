@@ -682,6 +682,7 @@ fn run_until_signal(
             None => log::warn!("shutting down: LLDP shutdown not sent in time"),
         }
     }
+    service::graphing::final_store(session);
     // Held until the process ends: a commit in progress finishes first and
     // no new one (no new save) starts.
     let s = corerouter_engine::lock(session);
@@ -825,6 +826,7 @@ fn main() -> ExitCode {
         shutdown: shutdown.clone(),
         flags: args.service_flags.clone(),
         control: control_listens(&args),
+        config_dir: config_dir.clone(),
     };
     if let Err(e) = service::start_all(&ctx) {
         eprintln!("{e}");

@@ -182,6 +182,31 @@ impl Root {
     }
 }
 
+impl Root {
+    /// CPU, memory and conntrack readings for the graphs (G4.5): four
+    /// small `/proc` files, read every second.
+    pub fn resources(&self) -> corerouter_hal::resources::Resources {
+        use corerouter_hal::resources::{Resources, parse_meminfo, parse_proc_stat};
+        let (cpu_busy, cpu_total) = read(&self.proc.join("stat"))
+            .and_then(|t| parse_proc_stat(&t))
+            .unwrap_or_default();
+        let (mem_total, mem_available) = read(&self.proc.join("meminfo"))
+            .and_then(|t| parse_meminfo(&t))
+            .unwrap_or_default();
+        let ct = |f: &str| {
+            read(&self.proc.join("sys/net/netfilter").join(f)).and_then(|t| t.trim().parse().ok())
+        };
+        Resources {
+            cpu_busy,
+            cpu_total,
+            mem_total,
+            mem_available,
+            conntrack: ct("nf_conntrack_count"),
+            conntrack_max: ct("nf_conntrack_max"),
+        }
+    }
+}
+
 fn mem_total(text: &str, key: &str) -> Option<u64> {
     text.lines()
         .find_map(|l| l.strip_prefix(key))?
