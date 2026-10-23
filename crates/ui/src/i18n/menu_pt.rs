@@ -34,6 +34,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 
 pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.addresses", "## O que faz\nOs endereços IPv4 das interfaces do roteador. Cada endereço também cria a rota conectada da sua rede.\n\nUm endereço pode vir de um pool (delegação de prefixo) ou de uma concessão DHCP; a coluna Origin diz de onde."),
+    ("menu.bandwidth", "## O que faz\nMede a vazão até um servidor iperf3 (qualquer `iperf3 -s` ou outro CoreRouter), TCP ou UDP, em um ou nos dois sentidos, com perda, jitter e a CPU do roteador; na aba Server, o roteador responde a testes do iperf3."),
     ("menu.bgp", "## O que faz\nA instância BGP: o AS do roteador, o router id e as sessões com os peers (operadoras, IX, clientes). O protocolo roda no FRR; esta janela o configura."),
     ("menu.bonding", "## O que faz\nBonds juntam várias portas num link só (LACP 802.3ad, active-backup, balance-xor…) para ter mais capacidade e redundância quando um cabo ou porta cai."),
     ("menu.cgnat", "## O que faz\nNAT de operadora para assinantes (IPv4 compartilhado, RFC 6598 100.64.0.0/10), com blocos de portas e os registros que a lei exige. Ainda não implementado."),

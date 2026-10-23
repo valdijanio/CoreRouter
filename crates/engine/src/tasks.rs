@@ -278,6 +278,7 @@ fn tool_words(kind: &str, title: &str) -> (String, String) {
         "cable-test" => ("Teste de cabo", "cable test ", " em "),
         "torch" => ("Torch", "torch ", " em "),
         "sniffer" => ("Sniffer", "sniffer ", " em "),
+        "bandwidth-test" => ("Bandwidth test", "bandwidth-test ", " com "),
         other => (other, "", " "),
     };
     let target = title.strip_prefix(verb).unwrap_or(title);

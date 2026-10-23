@@ -22,6 +22,8 @@
 //! (`prefs.rs`).
 
 mod dns_lookup_pt;
+mod bandwidth_en;
+mod bandwidth_pt;
 mod connections_en;
 mod connections_pt;
 mod en;
@@ -79,6 +81,7 @@ impl Lang {
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
                 torch_pt::LABELS,
+                bandwidth_pt::LABELS,
             ],
         }
     }
@@ -86,8 +89,8 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, torch_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, torch_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, torch_en::HELP, bandwidth_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, torch_pt::HELP, bandwidth_pt::HELP],
         }
     }
 

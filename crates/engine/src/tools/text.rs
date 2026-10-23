@@ -43,6 +43,10 @@ pub fn header(kind: &str) -> Option<String> {
         )),
         "cable-test" => Some(format!("{:<4} {:<20} DISTANCE", "PAIR", "STATUS")),
         "torch" => Some(super::torch::text_header()),
+        "bandwidth-test" => Some(format!(
+            "{:>5} {:>12} {:>12} {:>8} {:>10} {:>6}",
+            "TIME", "TX-RATE", "RX-RATE", "LOST", "JITTER", "CPU"
+        )),
         "sniffer" => Some(format!("{:>5} {:>10} {:>12} {:>12}", "TIME", "PACKETS", "BYTES", "FILE-SIZE")),
         _ => None,
     }
@@ -127,6 +131,18 @@ pub fn line(kind: &str, ev: &Value) -> String {
         // G6.6: the `dig` text, or a compare/trace row (may be several lines).
         "dns-lookup" => crate::dns_lookup::text_line(ev),
         "torch" => super::torch::text_line(ev),
+        "bandwidth-test" => {
+            let f = |k: &str| ev.get(k).and_then(Value::as_f64);
+            format!(
+                "{:>4}s {:>12} {:>12} {:>8} {:>10} {:>6}",
+                f("t").map_or(String::new(), |t| format!("{t:.0}")),
+                super::torch::rate(f("tx_bps").unwrap_or(0.0)),
+                super::torch::rate(f("rx_bps").unwrap_or(0.0)),
+                s(ev, "lost"),
+                f("jitter_ms").map_or(String::new(), |j| format!("{j:.3}ms")),
+                f("cpu").map_or(String::new(), |c| format!("{c:.0}%")),
+            )
+        }
         "sniffer" => format!(
             "{:>4}s {:>10} {:>12} {:>12}",
             s(ev, "t"),
@@ -290,6 +306,38 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
         }
         "dns-lookup" => crate::dns_lookup::summary_lines(summary),
         "torch" => Vec::new(),
+        "bandwidth-test" => {
+            let f = |v: &Value, k: &str| v.get(k).and_then(Value::as_f64);
+            let mut out = Vec::new();
+            for (name, way) in [("tx", "upload"), ("rx", "download")] {
+                let Some(w) = summary.get(way).filter(|w| !w.is_null()) else {
+                    continue;
+                };
+                let mut line = format!(
+                    "{name}-total-average={} (sent {} received {} bytes)",
+                    super::torch::rate(f(w, "received_bps").unwrap_or(0.0)),
+                    s(w, "sent"),
+                    s(w, "received"),
+                );
+                if let Some(l) = w.get("lost").filter(|l| !l.is_null()) {
+                    line += &format!(" lost-packets={l} loss={}%", s(w, "loss_pct"));
+                }
+                if let Some(j) = f(w, "jitter_ms") {
+                    line += &format!(" jitter={j:.3}ms");
+                }
+                if let Some(r) = w.get("retransmits").filter(|r| !r.is_null()) {
+                    line += &format!(" retransmits={r}");
+                }
+                out.push(line);
+            }
+            out.push(format!(
+                "cpu-load={}% (max {}%) remote-cpu-load={}%",
+                s(summary, "cpu_avg"),
+                s(summary, "cpu_max"),
+                s(summary, "remote_cpu"),
+            ));
+            out
+        }
         "sniffer" => vec![format!(
             "packets={} bytes={} file-size={} ({}): tool.sniffer.download id=<task>",
             s(summary, "packets"),

@@ -65,7 +65,7 @@ fn narrow<T: TryFrom<u32>>(key: &str, v: u32) -> Result<T> {
 /// A DNS name: 1..=253 characters, labels of 1..=63 letters, digits, `-`
 /// and `_`, not starting or ending with `-`, and a last label that is not
 /// all digits (RFC 3696 §2: so a mistyped `192.168.0.` is not a name).
-fn valid_name(s: &str) -> bool {
+pub(super) fn valid_name(s: &str) -> bool {
     let s = s.strip_suffix('.').unwrap_or(s);
     let numeric_tld = s
         .rsplit('.')

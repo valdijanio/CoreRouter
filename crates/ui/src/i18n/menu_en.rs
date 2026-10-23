@@ -5,6 +5,7 @@
 
 pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.addresses", "## What it does\nThe IPv4 addresses of the router's interfaces. Each address also makes the connected route of its network.\n\nAn address can come from a pool (prefix delegation) or from a DHCP lease; the Origin column says which."),
+    ("menu.bandwidth", "## What it does\nMeasures throughput to an iperf3 server (any `iperf3 -s` or another CoreRouter), TCP or UDP, one way or both, with loss, jitter and the router's CPU; in the Server tab, the router answers iperf3 tests."),
     ("menu.bgp", "## What it does\nThe BGP instance: the router's AS, router id and the sessions with peers (upstreams, IXs, customers). The protocol itself runs in FRR; this window configures it."),
     ("menu.bonding", "## What it does\nBonds join several ports into one link (LACP 802.3ad, active-backup, balance-xor…) for more capacity and for redundancy when a cable or port fails."),
     ("menu.cgnat", "## What it does\nCarrier-grade NAT for subscribers (shared IPv4, RFC 6598 100.64.0.0/10), with port blocks and the logs the law asks for. Not implemented yet."),
