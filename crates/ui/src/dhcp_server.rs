@@ -1,7 +1,7 @@
 //! IP › DHCP Server (G4.2a), WinBox style: one window with the tabs DHCP
 //! (the servers), Networks, Leases, Options, Option Sets, Matchers and
-//! Alerts, one row per item; and IP › DHCP Statistics (KPIs, pool use,
-//! messages, why messages were dropped).
+//! Alerts, one row per item, plus History and Statistics (KPIs, pool use,
+//! messages, why messages were dropped; a window of its own until G0.23c).
 //!
 //! Leases show their state as chips (bound, offered, static, conflict,
 //! blocked) and their name in the DNS / option 82 as chips next to the
@@ -28,7 +28,6 @@ use crate::{CoreRouterUi, Win};
 
 const NAME: &str = "dhcp-server";
 pub(crate) const WIN: &str = "dhcp-server";
-pub(crate) const WIN_STATS: &str = "dhcp-server-stats";
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -37,14 +36,7 @@ pub(crate) const PANEL: Panel = Panel {
             id: WIN,
             group: "IP",
             title: "DHCP Server",
-            size: [980.0, 420.0],
-            escape: true,
-        },
-        WinDef {
-            id: WIN_STATS,
-            group: "IP",
-            title: "DHCP Statistics",
-            size: [760.0, 560.0],
+            size: [980.0, 520.0],
             escape: true,
         },
     ],
@@ -403,6 +395,8 @@ pub(crate) struct DhcpServerPanel {
     reset_tables: TableState,
     /// The History tab (G4.2b) instead of the item tabs.
     pub(crate) show_history: bool,
+    /// The Statistics tab (G0.23c) instead of the item tabs.
+    pub(crate) show_stats: bool,
     pub(crate) history_form: HistoryForm,
     /// `ip.dhcp-server.history.print`.
     pub(crate) history: Option<Value>,
@@ -719,13 +713,6 @@ pub(crate) fn params(kind: &ItemKind, d: &ItemDialog) -> Value {
     Value::Object(p)
 }
 
-fn open_window(app: &mut CoreRouterUi, win: &'static str) {
-    if !app.open.insert(Win::Panel(win)) {
-        app.floats.raise(crate::win_id(Win::Panel(win)));
-    }
-    app.cache.refreshed_at = None;
-}
-
 impl PanelState for DhcpServerPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
         let mut out = Vec::new();
@@ -749,7 +736,7 @@ impl PanelState for DhcpServerPanel {
                 params: self.history_form.params(),
             });
         }
-        if (main || app.open.contains(&Win::Panel(WIN_STATS)))
+        if main
             && app.has_command("ip.dhcp-server.statistics.print")
         {
             out.push(Query {
@@ -778,11 +765,8 @@ impl PanelState for DhcpServerPanel {
     }
 
     fn window(&mut self, app: &mut CoreRouterUi, win: &'static str, ui: &mut Ui) {
-        if win == WIN_STATS {
-            self.stats_window(app, ui);
-        } else {
-            self.main_window(app, ui);
-        }
+        let _ = win;
+        self.main_window(app, ui);
     }
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
@@ -821,7 +805,8 @@ impl PanelState for DhcpServerPanel {
     }
 
     fn escape(&mut self, win: &'static str) -> bool {
-        if win == WIN_STATS {
+        let _ = win;
+        if self.show_stats {
             return self.reset_tables.escape();
         }
         if self.show_history {
@@ -848,19 +833,31 @@ impl DhcpServerPanel {
     fn main_window(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         ui.horizontal(|ui| {
             for t in Tab::ALL {
-                if ui.selectable_label(self.tab == t && !self.show_history, t.title()).clicked() {
+                let on = self.tab == t && !self.show_history && !self.show_stats;
+                if ui.selectable_label(on, t.title()).clicked() {
                     self.tab = t;
                     self.show_history = false;
+                    self.show_stats = false;
                 }
             }
             if ui.selectable_label(self.show_history, "History").clicked() {
                 self.show_history = true;
+                self.show_stats = false;
+                app.cache.refreshed_at = None;
+            }
+            if ui.selectable_label(self.show_stats, "Statistics").clicked() {
+                self.show_stats = true;
+                self.show_history = false;
                 app.cache.refreshed_at = None;
             }
         });
         ui.separator();
         if self.show_history {
             self.history_tab(app, ui);
+            return;
+        }
+        if self.show_stats {
+            self.stats_window(app, ui);
             return;
         }
         let tab = self.tab;
@@ -876,7 +873,6 @@ impl DhcpServerPanel {
         let mut new = false;
         let mut remove = false;
         let mut lease_cmd: Option<&'static str> = None;
-        let mut stats = false;
         let picked = if selection.is_empty() {
             Err("Select a row first".to_owned())
         } else {
@@ -903,7 +899,6 @@ impl DhcpServerPanel {
             if tab == Tab::Alerts && action(ui, "Reset Alert", can.and("ip.dhcp-server.alert.reset-alert", picked.clone())) {
                 lease_cmd = Some("ip.dhcp-server.alert.reset-alert");
             }
-            stats = action(ui, "Statistics", can.check("ip.dhcp-server.statistics.print"));
             table::find_field(ui, tab.salt(), self.tables.entry(tab).or_default());
         });
         if tab == Tab::Leases {
@@ -945,9 +940,6 @@ impl DhcpServerPanel {
                 };
                 app.run(cmd, p);
             }
-        }
-        if stats {
-            open_window(app, WIN_STATS);
         }
     }
 

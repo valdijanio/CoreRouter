@@ -26,7 +26,6 @@ pub(crate) const CHART_BAR: &str = "\u{E150}";
 pub(crate) const CLOCK: &str = "\u{E19A}";
 pub(crate) const CLOCK_COUNTER_CLOCKWISE: &str = "\u{E1A0}";
 pub(crate) const DATABASE: &str = "\u{E1DE}";
-pub(crate) const FILE_TEXT: &str = "\u{E23A}";
 pub(crate) const FOLDERS: &str = "\u{E260}";
 pub(crate) const GAUGE: &str = "\u{E628}";
 pub(crate) const GEAR: &str = "\u{E270}";
@@ -40,7 +39,6 @@ pub(crate) const IDENTIFICATION_BADGE: &str = "\u{E6F6}";
 pub(crate) const KEY: &str = "\u{E2D6}";
 pub(crate) const LAPTOP: &str = "\u{E586}";
 pub(crate) const LINK: &str = "\u{E2E2}";
-pub(crate) const LIST: &str = "\u{E2F0}";
 pub(crate) const LIST_BULLETS: &str = "\u{E2F2}";
 pub(crate) const LOCK_SIMPLE: &str = "\u{E308}";
 pub(crate) const MAGNIFYING_GLASS: &str = "\u{E30C}";
@@ -124,7 +122,6 @@ pub(crate) const ALL: &[&str] = &[
     CLOCK,
     CLOCK_COUNTER_CLOCKWISE,
     DATABASE,
-    FILE_TEXT,
     FOLDERS,
     GAUGE,
     GEAR,
@@ -138,7 +135,6 @@ pub(crate) const ALL: &[&str] = &[
     KEY,
     LAPTOP,
     LINK,
-    LIST,
     LIST_BULLETS,
     LOCK_SIMPLE,
     MAGNIFYING_GLASS,

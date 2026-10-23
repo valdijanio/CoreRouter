@@ -3,7 +3,7 @@
 //! shows the engine's checks; the Statistics window draws its KPIs.
 
 use super::*;
-use crate::dhcp_server::{DhcpServerPanel, Tab, WIN, WIN_STATS, params, row};
+use crate::dhcp_server::{DhcpServerPanel, Tab, WIN, params, row};
 use corerouter_engine::lock;
 
 fn refresh(h: &mut Harness) {
@@ -95,8 +95,11 @@ fn a_network_form_shows_the_checks() {
 fn statistics_draw_kpis_and_pool_bars() {
     let mut h = lab();
     h.app.open.clear();
-    h.app.open(Win::Panel(WIN_STATS));
+    h.app.open(Win::Panel(WIN));
     refresh(&mut h);
+    h.click(h.text("Statistics"));
+    refresh(&mut h);
+    assert!(h.app.panel_mut::<DhcpServerPanel>().unwrap().show_stats, "a tab of DHCP Server");
     for t in ["Active leases", "ACK/s", "p99 reply", "Dropped", "Pools", "lan", "DISCOVER", "Why no answer"] {
         assert!(h.has_text(t), "{t}");
     }

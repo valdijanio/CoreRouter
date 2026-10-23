@@ -73,7 +73,7 @@ fn ip_groups_dhcp_and_dns_and_keeps_single_items_loose() {
     };
     assert_eq!(
         sub("DHCP").unwrap(),
-        ["Client", "Pool", "Relay", "Server", "Statistics"]
+        ["Client", "Pool", "Relay", "Server"]
     );
     let dns = sub("DNS").unwrap();
     for l in ["Settings", "Adlist", "Cache", "Forwarders", "Static", "Statistics", "TSIG Keys", "Zones"] {
@@ -110,7 +110,7 @@ fn groups_open_close_and_are_remembered() {
     assert!(h.menu_row("IP/DNS").is_some(), "IP opened");
     assert!(h.has_text("DNS"));
     // Closed subgroup: its count as a chip.
-    assert!(h.has_text("5"), "DHCP shows its 5 items");
+    assert!(h.has_text("4"), "DHCP shows its 4 items");
     assert!(h.menu_row(&win_row("dns-static")).is_none());
     h.click_menu("IP/DNS");
     assert!(h.menu_row(&win_row("dns-static")).is_some(), "DNS opened");
@@ -328,4 +328,42 @@ fn esc_in_the_search_clears_it_and_leaves_the_windows_open() {
     assert!(h.app.menu.query.is_empty());
     assert!(h.app.open.contains(&Win::Interfaces), "Esc stayed in the menu");
     assert!(!h.ctx.memory(|m| m.has_focus(menu::search_id())));
+}
+
+#[test]
+fn state_badges_come_from_the_existing_queries() {
+    use crate::menu_badges::Badges;
+    use crate::panel::PanelState;
+    let mut h = Harness::new();
+    // The lab answers the three queries: nothing failed, nothing in conflict.
+    let b = h.app.panel_mut::<Badges>().unwrap();
+    assert!(b.failed.is_empty() && b.conflicts == 0, "{b:?}");
+    assert!(!h.has_text("1 failed"));
+
+    h.app.with_panel_as::<Badges, _>(|b, app| {
+        b.arrived(app, "services", 0, json!([
+            {"name": "dns", "state": "failed"},
+            {"name": "dhcp", "state": "running"},
+        ]));
+        b.arrived(app, "dhcp", 0, json!({"leases": {"bound": 3, "conflict": 2}}));
+        b.arrived(app, "drift", 0, json!({"in_sync": false, "drift": [
+            {"kind": "mtu", "interface": "ether2", "item": "", "expected": 1500, "actual": 9000},
+        ]}));
+    });
+    h.idle();
+    h.idle();
+    // Closed groups sum up their windows' badges.
+    assert!(h.has_text("2"), "System: two badges (Services, History)");
+    assert!(h.has_text("2 conflict"), "IP: the DHCP conflict");
+    h.click_menu("System");
+    assert!(h.has_text("1 failed"));
+    assert!(h.has_text("drift 1"));
+    let red = crate::chip::RED.tone(&h.ctx.global_style().visuals).ink;
+    assert_eq!(h.text_color("1 failed"), red, "failed is red");
+    h.click_menu("IP");
+    assert!(h.menu_row("IP/DHCP").is_some());
+    assert!(h.has_text("2 conflict"), "DHCP subgroup, closed");
+    h.click_menu("IP/DHCP");
+    assert!(h.menu_row(&win_row("dhcp-server")).is_some());
+    assert!(h.has_text("2 conflict"), "the DHCP Server item");
 }
