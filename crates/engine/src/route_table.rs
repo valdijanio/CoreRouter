@@ -11,7 +11,7 @@
 //! matching prefix (§5.2.4.3 "Longest Match", RFC 4632 §5.1).
 
 use std::cmp::Ordering;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 
 use corerouter_hal::Learned;
@@ -520,6 +520,37 @@ pub struct RouteWatch {
     states: HashMap<String, Seen>,
     /// Bumped by every look: an entry not seen by the last one is gone.
     generation: u64,
+    /// Each route's state changes (G1.27b): failover, link down and back.
+    /// At most [`MAX_CHANGES`] per route, the last [`KEEP_SECS`].
+    changes: HashMap<String, VecDeque<Change>>,
+}
+
+/// Changes kept per route, and for how long (the detail panel shows the
+/// last 24 h; a flapping link fills the ring, not the memory).
+pub const MAX_CHANGES: usize = 64;
+pub const KEEP_SECS: u64 = 86_400;
+/// Transitions logged per look (topic `route`): a table that flips all at
+/// once (a link with 10 000 routes behind it) does not flood the log.
+const MAX_LOGGED: usize = 16;
+
+/// One state change of a route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Change {
+    /// Unix second.
+    pub at: u64,
+    pub from: State,
+    pub to: State,
+    /// Why it is in `to` (none when it became active).
+    pub reason: Option<Why>,
+}
+
+/// A change the look saw, for the log.
+#[derive(Debug, Clone)]
+pub struct Transition {
+    pub key: String,
+    pub dst: IpNet,
+    pub table: RoutingTable,
+    pub change: Change,
 }
 
 /// What the watch knows of one route.
@@ -533,17 +564,36 @@ struct Seen {
 
 impl RouteWatch {
     /// Note the states of `lines` at `now`; routes gone are forgotten.
-    /// In place: a key already known is not copied again.
-    pub fn observe(&mut self, lines: &[Line], now: u64) {
+    /// In place: a key already known is not copied again. Returns the
+    /// state changes it saw.
+    pub fn observe(&mut self, lines: &[Line], now: u64) -> Vec<Transition> {
         let first = self.since.is_none();
         self.since.get_or_insert(now);
         self.last_look = Some(now);
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
+        let mut out = Vec::new();
         for l in lines.iter().take(MAX_WATCHED) {
             match self.states.get_mut(&l.key) {
                 Some(seen) => {
                     if seen.state != l.state {
+                        let change = Change {
+                            at: now,
+                            from: seen.state,
+                            to: l.state,
+                            reason: l.why.clone(),
+                        };
+                        let ring = self.changes.entry(l.key.clone()).or_default();
+                        if ring.len() >= MAX_CHANGES {
+                            ring.pop_front();
+                        }
+                        ring.push_back(change.clone());
+                        out.push(Transition {
+                            key: l.key.clone(),
+                            dst: l.dst,
+                            table: l.table.clone(),
+                            change,
+                        });
                         seen.state = l.state;
                         seen.at = Some(now);
                     }
@@ -563,7 +613,26 @@ impl RouteWatch {
         }
         if self.states.len() > lines.len().min(MAX_WATCHED) {
             self.states.retain(|_, s| s.generation == generation);
+            let states = &self.states;
+            self.changes.retain(|k, _| states.contains_key(k));
         }
+        let old = now.saturating_sub(KEEP_SECS);
+        for ring in self.changes.values_mut() {
+            while ring.front().is_some_and(|c| c.at < old) {
+                ring.pop_front();
+            }
+        }
+        self.changes.retain(|_, r| !r.is_empty());
+        out
+    }
+
+    /// The changes of `key` in the last 24 h, newest first.
+    pub fn changes_of(&self, key: &str, now: u64) -> Vec<&Change> {
+        let old = now.saturating_sub(KEEP_SECS);
+        self.changes
+            .get(key)
+            .map(|r| r.iter().rev().filter(|c| c.at >= old).collect())
+            .unwrap_or_default()
     }
 
     /// Unix second `key` took its current state, if known.
@@ -588,8 +657,48 @@ impl Session {
             return;
         }
         let lines = self.route_lines();
-        if let Some(w) = self.ext_mut::<RouteWatch>() {
-            w.observe(&lines, now);
+        let seen = self
+            .ext_mut::<RouteWatch>()
+            .map(|w| w.observe(&lines, now))
+            .unwrap_or_default();
+        self.log_route_changes(&seen);
+    }
+
+    /// Topic `route`, like RouterOS' route log: a failover, a link down.
+    fn log_route_changes(&mut self, seen: &[Transition]) {
+        for t in seen.iter().take(MAX_LOGGED) {
+            let c = &t.change;
+            let table = if t.table.is_main() {
+                String::new()
+            } else {
+                format!(" (table {})", t.table)
+            };
+            let why = c
+                .reason
+                .as_ref()
+                .map(|r| format!(": {}", r.text))
+                .unwrap_or_default();
+            let message = format!(
+                "route {} {}{table}: {} -> {}{why}",
+                t.key,
+                t.dst,
+                c.from.as_str(),
+                c.to.as_str()
+            );
+            self.log_event(
+                &["route", "info"],
+                crate::logging::DAEMON,
+                message,
+                serde_json::json!({"key": t.key, "from": c.from.as_str(), "to": c.to.as_str()}),
+            );
+        }
+        if seen.len() > MAX_LOGGED {
+            self.log_event(
+                &["route", "info"],
+                crate::logging::DAEMON,
+                format!("{} more routes changed state", seen.len() - MAX_LOGGED),
+                serde_json::Value::Null,
+            );
         }
     }
 
@@ -598,8 +707,12 @@ impl Session {
     pub(crate) fn watched_route_lines(&mut self) -> (Vec<Line>, Option<u64>) {
         let lines = self.route_lines();
         let now = self.now();
-        if let (Some(now), Some(w)) = (now, self.ext_mut::<RouteWatch>()) {
-            w.observe(&lines, now);
+        if let Some(now) = now {
+            let seen = self
+                .ext_mut::<RouteWatch>()
+                .map(|w| w.observe(&lines, now))
+                .unwrap_or_default();
+            self.log_route_changes(&seen);
         }
         (lines, now)
     }
