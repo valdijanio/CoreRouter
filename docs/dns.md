@@ -178,7 +178,7 @@ RouterOS (o dnsmasq faz o mesmo desde a 2.86). PTR automático para as entradas 
 `address_list`, os endereços respondidos entram nessa lista do firewall pelo TTL da resposta +
 `address_list_extra_time_secs` (uma entrada já lá só é renovada com menos da metade do tempo).
 
-**Daemon** (`service/dns_server.rs`, serviço `dns server`, opção `--dns-port`): sockets UDP/TCP
+**Daemon** (`service/dns_server.rs`, serviço `dns server`, opção `--dns-port`; no lab virtual só o loopback, salvo `--dns-lab-any`): sockets UDP/TCP
 na porta 53, IPv4 e IPv6 separados; responde do endereço para o qual a consulta foi
 (`IP_PKTINFO`/`IPV6_RECVPKTINFO`), senão um roteador com dois endereços na LAN responderia do
 outro e o cliente descartaria. Abre e fecha os sockets conforme `allow_remote_requests`, sem
