@@ -128,7 +128,13 @@ struct Slot {
     last_error: Option<String>,
     /// The late heartbeat was logged.
     stalled: bool,
+    /// Restart asked for: the next run waits until the last run's helper
+    /// threads ended (they may still hold its sockets), or this time.
+    drain_until: Option<Instant>,
 }
+
+/// Longest a restart waits for the old run's helper threads.
+const HELPER_GRACE: Duration = Duration::from_secs(2);
 
 /// The supervisor's state; [`Supervisor::tick`] does one round.
 pub(crate) struct Supervisor {
@@ -138,6 +144,35 @@ pub(crate) struct Supervisor {
     shutdown: Shutdown,
     control: Vec<Listen>,
     born: Instant,
+}
+
+/// A run's thread could not be created (thread exhaustion): a failure like
+/// any other, so a service that can never start ends `failed` after the
+/// burst instead of retrying every minute forever.
+fn spawn_failed(slot: &mut Slot, policy: &Policy, now: Instant, e: &str) {
+    slot.last_error = Some(format!("cannot start its thread: {e}"));
+    slot.failures.push_back(now);
+    while slot
+        .failures
+        .front()
+        .is_some_and(|t| now.saturating_duration_since(*t) > policy.window)
+    {
+        slot.failures.pop_front();
+    }
+    if slot.failures.len() >= policy.burst {
+        slot.phase = Phase::Failed;
+        slot.last_event = format!(
+            "gave up: {} failures in {}",
+            slot.failures.len(),
+            secs(policy.window)
+        );
+        log::error!("service {}: cannot start its thread ({e}); giving up", slot.name);
+        return;
+    }
+    slot.phase = Phase::Backoff(now + slot.delay);
+    slot.restarts = slot.restarts.saturating_add(1);
+    slot.delay = (slot.delay * 2).min(policy.max_delay);
+    slot.last_event = format!("cannot start its thread: {e}");
 }
 
 /// Start the supervisor's thread with every service prepared by `start_all`.
@@ -192,6 +227,7 @@ impl Supervisor {
             last_event: String::new(),
             last_error: None,
             stalled: false,
+            drain_until: None,
         });
     }
 
@@ -317,6 +353,7 @@ impl Supervisor {
             }
             Phase::Ending { again: true } => {
                 slot.phase = Phase::Waiting;
+                slot.drain_until = Some(now + HELPER_GRACE);
                 return;
             }
             _ if closing => {
@@ -405,6 +442,11 @@ impl Supervisor {
         if !due {
             return;
         }
+        // A restart: the old run's helpers (a listener's accept thread)
+        // first let go of its sockets, or the new run fails to bind.
+        if slot.health.helpers() > 0 && slot.drain_until.is_some_and(|t| now < t) {
+            return;
+        }
         let missing: Vec<&str> = slot
             .depends
             .iter()
@@ -429,6 +471,7 @@ impl Supervisor {
                 catch_unwind(AssertUnwindSafe(|| run(&body)))
                     .unwrap_or_else(|p| Err(format!("panic: {}", panic_text(p.as_ref()))))
             });
+        slot.drain_until = None;
         match spawned {
             Ok(t) => {
                 slot.health = health;
@@ -438,12 +481,7 @@ impl Supervisor {
                 slot.stalled = false;
                 slot.last_event = "started".into();
             }
-            Err(e) => {
-                // Counted as a failure next round: a finished fake run.
-                slot.last_error = Some(format!("cannot start its thread: {e}"));
-                slot.phase = Phase::Backoff(now + slot.delay);
-                slot.delay = (slot.delay * 2).min(self.policy.max_delay);
-            }
+            Err(e) => spawn_failed(slot, &self.policy, now, &e.to_string()),
         }
     }
 
@@ -712,6 +750,67 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("protected"), "{e}");
+    }
+
+    /// audit-services #12a: a failed thread spawn was never counted, so the
+    /// service retried forever and never reached `failed`.
+    #[test]
+    fn spawn_failures_count_and_give_up() {
+        let (mut sup, _) = sup();
+        sup.add(leak("nothread", &[]), steady());
+        let policy = sup.policy;
+        let slot = sup.slots.first_mut().unwrap();
+        let now = Instant::now();
+        for i in 1..policy.burst {
+            spawn_failed(slot, &policy, now, "Resource temporarily unavailable");
+            assert!(matches!(slot.phase, Phase::Backoff(_)));
+            assert_eq!(slot.restarts as usize, i);
+        }
+        spawn_failed(slot, &policy, now, "Resource temporarily unavailable");
+        assert_eq!(slot.phase, Phase::Failed);
+        assert!(slot.last_event.contains("gave up"), "{}", slot.last_event);
+    }
+
+    /// audit-services #12b: a restart started the new run while the old
+    /// run's helper still held its port, so the new bind failed.
+    #[test]
+    fn a_restart_waits_for_the_old_helpers() {
+        let (mut sup, session) = sup();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        sup.add(
+            leak("listener", &[]),
+            Box::new(move |h: &Health| {
+                let l = std::net::TcpListener::bind(("127.0.0.1", port))
+                    .map_err(|e| format!("bind: {e}"))?;
+                let helper = h.clone();
+                h.spawn("accept", move || {
+                    while !helper.stopping() {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    // Notices the stop late (a POLL timeout), then lets go.
+                    thread::sleep(Duration::from_millis(150));
+                    drop(l);
+                })
+                .map_err(|e| e.to_string())?;
+                while h.sleep(Duration::from_millis(5)) {
+                    h.beat();
+                }
+                Ok(())
+            }),
+        );
+        until(&mut sup, "listener", |r| r.state == ServiceState::Running);
+        lock(&session)
+            .execute("system.service.restart", &json!({"name": "listener"}))
+            .unwrap();
+        let r = until(&mut sup, "listener", |r| {
+            r.state == ServiceState::Running && r.last_event == "started"
+        });
+        assert_eq!(r.restarts, 0, "{r:?}");
+        assert_eq!(r.last_error, None, "{r:?}");
     }
 
     #[test]

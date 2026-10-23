@@ -93,12 +93,19 @@ impl Lab {
         self.srv.tick(self.now)
     }
 
+    /// From the client itself: the Ethernet source is its `chaddr`.
     fn send(&mut self, payload: Vec<u8>, dst: Ipv4Addr) -> Vec<Effect> {
+        let mut src_mac = [0u8; 6];
+        src_mac.copy_from_slice(&payload[28..34]);
+        self.send_from(payload, dst, src_mac)
+    }
+
+    fn send_from(&mut self, payload: Vec<u8>, dst: Ipv4Addr, src_mac: [u8; 6]) -> Vec<Effect> {
         let heard = Heard {
             payload,
             src: Ipv4Addr::UNSPECIFIED,
             dst,
-            src_mac: mac(0),
+            src_mac,
             to_server: true,
         };
         self.srv
@@ -605,6 +612,8 @@ fn options_matchers_and_relay_echo() {
         comment: String::new(),
     });
     d.networks[0].dhcp_option = vec!["tftp".into()];
+    // The option 82 below comes without a relay: an L2 agent trusted here.
+    d.servers[0].relay_info_trusted = true;
     d.matchers.push(Matcher {
         id: ItemId(33),
         name: "onu".into(),
@@ -1031,4 +1040,376 @@ fn relayed_replies_heard_on_67_are_not_counted() {
     reply[0] = 2;
     assert!(lab.send(reply, ip("192.168.88.1")).is_empty());
     assert_eq!(lab.srv.stats().dropped_of(Drop::Malformed), 0);
+}
+
+// ---- audit of G4.2 (hostile clients) ----------------------------------
+
+/// A static lease keyed by circuit id on the directly attached server.
+fn circuit_static(c: &mut Config) {
+    let mut st = StaticLease::new(ItemId(40), ip("192.168.88.77"));
+    st.agent_circuit_id = "olt1".into();
+    c.ip.dhcp_server.leases.push(st);
+}
+
+fn discover_with_82(m: [u8; 6]) -> Vec<u8> {
+    with_82(
+        msg(MessageType::Discover, m, None, None, Ipv4Addr::UNSPECIFIED),
+        &[1, 4, b'o', b'l', b't', b'1'],
+    )
+}
+
+/// RFC 3046 §2.1/§5: option 82 is only believed from a trusted agent. A
+/// client on the link (giaddr 0) cannot claim another subscriber's circuit.
+#[test]
+fn option_82_from_a_client_is_not_believed() {
+    let mut c = cfg();
+    c.ip.dhcp_server.servers[0].conflict_detection = false;
+    circuit_static(&mut c);
+    let mut lab = Lab::new(&c);
+    let fx = lab.send(discover_with_82(mac(9)), Ipv4Addr::BROADCAST);
+    let (bytes, _) = sent(&fx, Kind::Offer).unwrap();
+    let yi = v4::decode(&bytes).unwrap().yiaddr;
+    assert_ne!(
+        yi,
+        ip("192.168.88.77"),
+        "the static of circuit olt1 went to a client that only claimed it"
+    );
+    assert!(
+        !v4::raw_options(&bytes).iter().any(|(c, _)| *c == 82),
+        "an untrusted option 82 is not echoed"
+    );
+    let a = lab.select(mac(9), yi);
+    assert!(sent(&a, Kind::Ack).is_some());
+    let l = lab.srv.leases().get(yi).unwrap();
+    assert_eq!(l.relay_info, None, "not recorded (nor in the history)");
+
+    // An L2 agent the operator trusts (an OLT inserting option 82).
+    c.ip.dhcp_server.servers[0].relay_info_trusted = true;
+    let mut lab = Lab::new(&c);
+    let fx = lab.send(discover_with_82(mac(9)), Ipv4Addr::BROADCAST);
+    let (bytes, _) = sent(&fx, Kind::Offer).unwrap();
+    assert_eq!(v4::decode(&bytes).unwrap().yiaddr, ip("192.168.88.77"));
+}
+
+/// A client behind a relay renews by unicast without option 82, twice: the
+/// lease keeps the agent's option 82 (its static lease still matches).
+#[test]
+fn renewals_keep_the_relay_agent_information() {
+    let mut c = cfg();
+    let mut s = DhcpServer::new(ItemId(6), "relay50".into(), "ether2".parse().unwrap());
+    s.relay = Some(ip("10.50.0.1"));
+    c.ip.dhcp_server.servers.push(s);
+    let mut n = DhcpNetwork::new(ItemId(7), "10.50.0.0/24".parse().unwrap());
+    n.gateway = vec![ip("10.50.0.1")];
+    c.ip.dhcp_server.networks.push(n);
+    let mut st = StaticLease::new(ItemId(8), ip("10.50.0.77"));
+    st.agent_circuit_id = "olt1 0/1/3".into();
+    c.ip.dhcp_server.leases.push(st);
+    let mut lab = Lab::new(&c);
+    let mut m = msg(
+        MessageType::Request,
+        mac(4),
+        Some(ip("10.50.0.77")),
+        Some(ip("192.168.88.1")),
+        Ipv4Addr::UNSPECIFIED,
+    );
+    m[24..28].copy_from_slice(&[10, 50, 0, 1]);
+    let fx = lab.send(
+        with_82(m, &agent::build(b"olt1 0/1/3", b"line-9").unwrap()),
+        ip("192.168.88.1"),
+    );
+    assert!(sent(&fx, Kind::Ack).is_some(), "{fx:?}");
+    for _ in 0..2 {
+        lab.later(60_000);
+        let fx = lab.send(
+            msg(MessageType::Request, mac(4), None, None, ip("10.50.0.77")),
+            ip("192.168.88.1"),
+        );
+        assert!(sent(&fx, Kind::Ack).is_some(), "{fx:?}");
+    }
+    assert!(
+        lab.srv
+            .leases()
+            .get(ip("10.50.0.77"))
+            .unwrap()
+            .relay_info
+            .is_some()
+    );
+}
+
+/// RFC 2132 §9.14 / RFC 3046 §2.0: one option is at most 255 bytes; a
+/// split one (RFC 3396) longer than that would not survive the journal.
+#[test]
+fn oversized_client_id_or_agent_info_is_refused() {
+    for code in [61u8, 82] {
+        let mut m = msg(
+            MessageType::Discover,
+            mac(1),
+            None,
+            None,
+            Ipv4Addr::UNSPECIFIED,
+        );
+        while m.last() == Some(&0) {
+            m.pop();
+        }
+        assert_eq!(m.pop(), Some(255));
+        for _ in 0..2 {
+            m.push(code);
+            m.push(150);
+            m.extend(std::iter::repeat_n(7u8, 150));
+        }
+        m.push(255);
+        assert_eq!(request::parse(&m), Err(Bad::Option(code)));
+    }
+}
+
+/// RFC 2131 §4.2: a non-Ethernet client (htype 6, no client id) is its
+/// `htype` + `chaddr`: OFFER then ACK, not a NAK loop.
+#[test]
+fn non_ethernet_clients_are_bound() {
+    let mut c = cfg();
+    c.ip.dhcp_server.servers[0].conflict_detection = false;
+    let mut lab = Lab::new(&c);
+    let tr = |kind, m: [u8; 6], req: Option<Ipv4Addr>, sid: Option<Ipv4Addr>| {
+        let mut b = msg(kind, m, req, sid, Ipv4Addr::UNSPECIFIED);
+        b[1] = 6;
+        b
+    };
+    let fx = lab.send(
+        tr(MessageType::Discover, mac(1), None, None),
+        Ipv4Addr::BROADCAST,
+    );
+    let yi = v4::decode(&sent(&fx, Kind::Offer).unwrap().0)
+        .unwrap()
+        .yiaddr;
+    let fx = lab.send(
+        tr(
+            MessageType::Request,
+            mac(1),
+            Some(yi),
+            Some(ip("192.168.88.1")),
+        ),
+        Ipv4Addr::BROADCAST,
+    );
+    assert!(sent(&fx, Kind::Ack).is_some(), "{fx:?}");
+    // Another htype-6 client is another client.
+    let fx = lab.send(
+        tr(MessageType::Discover, mac(2), None, None),
+        Ipv4Addr::BROADCAST,
+    );
+    let other = v4::decode(&sent(&fx, Kind::Offer).unwrap().0)
+        .unwrap()
+        .yiaddr;
+    assert_ne!(other, yi);
+    // And survives the journal.
+    let mut back = Leases::default();
+    back.replay(lab.srv.compact(lab.now.unix).lines());
+    let mut key = vec![6];
+    key.extend_from_slice(&mac(1));
+    assert_eq!(back.get(yi).unwrap().client_key(), key);
+}
+
+/// The client itself answering the probe of the address offered to it is
+/// not a conflict (RFC 5227 hosts defend the address they still hold).
+#[test]
+fn the_clients_own_arp_answer_is_not_a_conflict() {
+    let mut lab = Lab::new(&cfg());
+    let fx = lab.discover(mac(1));
+    let probed = probes(&fx)[0];
+    let fx = lab
+        .srv
+        .probe_reply(lab.now, &"ether2".parse().unwrap(), probed, mac(1));
+    let (bytes, _) = sent(&fx, Kind::Offer).unwrap_or_else(|| panic!("{fx:?}"));
+    assert_eq!(v4::decode(&bytes).unwrap().yiaddr, probed);
+    assert_eq!(lab.srv.stats().conflicts, 0);
+}
+
+/// A RELEASE (or DECLINE) on the link whose Ethernet source is not the
+/// client's: someone else ending the victim's lease.
+#[test]
+fn spoofed_release_is_dropped() {
+    let mut lab = Lab::new(&cfg());
+    let a = lab.dora(mac(1));
+    let release = msg(
+        MessageType::Release,
+        mac(1),
+        None,
+        Some(ip("192.168.88.1")),
+        a,
+    );
+    let fx = lab.send_from(release.clone(), ip("192.168.88.1"), mac(66));
+    assert!(fx.is_empty(), "{fx:?}");
+    assert_eq!(lab.srv.leases().get(a).unwrap().state, State::Bound);
+    assert_eq!(lab.srv.stats().dropped_of(Drop::Unexpected), 1);
+    let decline = msg(
+        MessageType::Decline,
+        mac(1),
+        Some(a),
+        Some(ip("192.168.88.1")),
+        Ipv4Addr::UNSPECIFIED,
+    );
+    lab.send_from(decline, Ipv4Addr::BROADCAST, mac(66));
+    assert_eq!(lab.srv.leases().get(a).unwrap().state, State::Bound);
+    // From the client itself: released.
+    lab.send(release, ip("192.168.88.1"));
+    assert_eq!(lab.srv.leases().get(a).unwrap().state, State::Released);
+}
+
+/// A full pool under a random-MAC flood: one warning a minute, not one per
+/// DISCOVER (the log is not flooded).
+#[test]
+fn a_full_pool_is_logged_once_a_minute() {
+    let mut c = cfg();
+    c.ip.pools.pools[0].ranges = vec!["192.168.88.10-192.168.88.11".parse().unwrap()];
+    c.ip.dhcp_server.servers[0].conflict_detection = false;
+    let mut lab = Lab::new(&c);
+    lab.dora(mac(1));
+    lab.dora(mac(2));
+    let mut logs = 0;
+    for n in 10..60 {
+        let fx = lab.discover(mac(n));
+        logs += fx
+            .iter()
+            .filter(|e| matches!(e, Effect::Log { .. }))
+            .count();
+    }
+    assert_eq!(logs, 1);
+    assert_eq!(lab.srv.stats().dropped_of(Drop::PoolExhausted), 50);
+    lab.later(61_000);
+    let fx = lab.discover(mac(99));
+    assert_eq!(
+        fx.iter()
+            .filter(|e| matches!(e, Effect::Log { .. }))
+            .count(),
+        1
+    );
+}
+
+/// RFC 2132 §9.3: option 52 says the `file` (1), `sname` (2) or both (3)
+/// fields hold options too: a message type there is read.
+#[test]
+fn option_overload_is_honoured() {
+    let mut c = cfg();
+    c.ip.dhcp_server.servers[0].conflict_detection = false;
+    let mut lab = Lab::new(&c);
+    let mut m = vec![0u8; 240];
+    m[0] = 1;
+    m[1] = 1;
+    m[2] = 6;
+    m[28..34].copy_from_slice(&mac(5));
+    m[108..112].copy_from_slice(&[53, 1, 1, 255]);
+    m[236..240].copy_from_slice(&[99, 130, 83, 99]);
+    m.extend_from_slice(&[52, 1, 1, 255]);
+    let fx = lab.send(m, Ipv4Addr::BROADCAST);
+    assert!(sent(&fx, Kind::Offer).is_some(), "{fx:?}");
+}
+
+/// With thousands of static leases (MAC, client id and circuit keyed),
+/// each still goes to its own client and only to it.
+#[test]
+fn many_static_leases_are_found_by_index() {
+    let mut c = cfg();
+    c.ip.dhcp_server.servers[0].conflict_detection = false;
+    c.ip.addresses[0].address = "192.168.0.1/16".parse().unwrap();
+    c.ip.dhcp_server.networks[0].address = "192.168.0.0/16".parse().unwrap();
+    for i in 0..3000u32 {
+        let [_, _, a, b] = i.to_be_bytes();
+        let mut st = StaticLease::new(ItemId(100 + i), Ipv4Addr::new(192, 168, 100 + a, b));
+        match i % 3 {
+            0 => st.mac_address = Some(MacAddr([0x0a, 0, 0, 0, a, b])),
+            1 => st.client_id = format!("1:0a:00:00:01:{a:02x}:{b:02x}"),
+            _ => st.agent_circuit_id = format!("port-{i}"),
+        }
+        c.ip.dhcp_server.leases.push(st);
+    }
+    c.ip.dhcp_server.servers[0].relay_info_trusted = true;
+    let mut lab = Lab::new(&c);
+    let offer_of = |lab: &mut Lab, payload: Vec<u8>| {
+        let fx = lab.send(payload, Ipv4Addr::BROADCAST);
+        v4::decode(&sent(&fx, Kind::Offer).unwrap().0)
+            .unwrap()
+            .yiaddr
+    };
+    // MAC keyed: #2997 (i % 3 == 0).
+    let [_, _, a, b] = 2997u32.to_be_bytes();
+    let got = offer_of(
+        &mut lab,
+        msg(
+            MessageType::Discover,
+            [0x0a, 0, 0, 0, a, b],
+            None,
+            None,
+            Ipv4Addr::UNSPECIFIED,
+        ),
+    );
+    assert_eq!(got, Ipv4Addr::new(192, 168, 100 + a, b));
+    // Client-id keyed: #2998.
+    let [_, _, a, b] = 2998u32.to_be_bytes();
+    let id = [1, 0x0a, 0, 0, 1, a, b];
+    let m = Outgoing {
+        kind: MessageType::Discover,
+        xid: 1,
+        secs: 0,
+        mac: mac(77),
+        ciaddr: Ipv4Addr::UNSPECIFIED,
+        broadcast: true,
+        requested: None,
+        server_id: None,
+        client_id: &id,
+        host_name: None,
+        vendor_class: None,
+        extra: &[],
+    }
+    .encode()
+    .unwrap();
+    assert_eq!(offer_of(&mut lab, m), Ipv4Addr::new(192, 168, 100 + a, b));
+    // Circuit keyed: #2999.
+    let [_, _, a, b] = 2999u32.to_be_bytes();
+    let m = with_82(
+        msg(
+            MessageType::Discover,
+            mac(78),
+            None,
+            None,
+            Ipv4Addr::UNSPECIFIED,
+        ),
+        &agent::build(b"port-2999", b"x").unwrap(),
+    );
+    assert_eq!(offer_of(&mut lab, m), Ipv4Addr::new(192, 168, 100 + a, b));
+    // Nobody's: from the pool, never a static address.
+    let got = offer_of(&mut lab, lab_discover(mac(79)));
+    assert!(got.octets()[2] < 100, "{got}");
+}
+
+fn lab_discover(m: [u8; 6]) -> Vec<u8> {
+    msg(MessageType::Discover, m, None, None, Ipv4Addr::UNSPECIFIED)
+}
+
+/// The leases journal keeps the last `cap` lines when it is longer than
+/// that (the newest state wins, never the oldest).
+#[test]
+fn replay_keeps_the_newest_lines() {
+    let mut l = Lease {
+        address: ip("192.168.88.10"),
+        server: "dhcp1".into(),
+        state: State::Bound,
+        mac: mac(1),
+        client_id: None,
+        host_name: String::new(),
+        vendor_class: String::new(),
+        expires: 10,
+        lease_time: 10,
+        last_seen: 0,
+        reason: String::new(),
+        relay_info: None,
+        hw: None,
+    };
+    let mut lines = Vec::new();
+    for n in 0..20 {
+        l.mac = mac(n);
+        lines.push(serde_json::to_string(&Record::Lease(l.clone())).unwrap());
+    }
+    let mut t = Leases::default();
+    t.replay_capped(lines.iter().map(String::as_str), 5);
+    assert_eq!(t.get(l.address).unwrap().mac, mac(19));
 }

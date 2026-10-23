@@ -4,6 +4,8 @@
 //! each one through `Hal::address_list_dynamic` and expires it by itself;
 //! this table only mirrors it for `ip.firewall.address-list.list`.
 
+use std::collections::BTreeMap;
+
 use corerouter_hal::DynamicChange;
 use corerouter_model::ItemId;
 use corerouter_model::firewall::{AddrMatch, DynamicAddress, Name};
@@ -49,6 +51,9 @@ impl DynamicEntry {
 #[derive(Debug, Default)]
 pub struct DynamicLists {
     entries: Vec<DynamicEntry>,
+    /// (list, address) → position in `entries`: the duplicate check of
+    /// every add was a scan of up to [`MAX_DYNAMIC`] entries.
+    index: BTreeMap<(Name, AddrMatch), usize>,
     next: u32,
 }
 
@@ -58,9 +63,8 @@ impl DynamicLists {
     }
 
     pub fn find(&self, list: &Name, address: &AddrMatch) -> Option<&DynamicEntry> {
-        self.entries
-            .iter()
-            .find(|e| e.list == *list && e.address == *address)
+        let pos = self.index.get(&(list.clone(), *address))?;
+        self.entries.get(*pos)
     }
 
     pub fn next_id(&mut self) -> ItemId {
@@ -69,12 +73,25 @@ impl DynamicLists {
     }
 
     pub fn push(&mut self, e: DynamicEntry) {
+        self.index
+            .insert((e.list.clone(), e.address), self.entries.len());
         self.entries.push(e);
     }
 
     pub fn remove(&mut self, id: ItemId) -> Option<DynamicEntry> {
         let pos = self.entries.iter().position(|e| e.id == id)?;
-        Some(self.entries.remove(pos))
+        let e = self.entries.remove(pos);
+        self.reindex();
+        Some(e)
+    }
+
+    fn reindex(&mut self) {
+        self.index = self
+            .entries
+            .iter()
+            .enumerate()
+            .map(|(i, e)| ((e.list.clone(), e.address), i))
+            .collect();
     }
 
     /// Drop the entries whose time ran out at `now`; start the countdown of
@@ -83,10 +100,14 @@ impl DynamicLists {
         for e in &mut self.entries {
             e.added.get_or_insert(now);
         }
+        if !self.entries.iter().any(|e| e.left(Some(now)) == 0) {
+            return Vec::new();
+        }
         let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
             .into_iter()
             .partition(|e| e.left(Some(now)) == 0);
         self.entries = keep;
+        self.reindex();
         gone
     }
 }
@@ -95,15 +116,24 @@ impl Session {
     /// Expire dynamic address-list entries (called on every clock tick).
     pub(crate) fn expire_dynamic_addresses(&mut self) {
         let Some(now) = self.now() else { return };
-        for e in self.dynamic_addresses.expire(now) {
-            // The kernel already dropped it; the lab backend needs telling.
-            let d = e.data_plane(Some(now));
-            if let Err(err) = self
-                .hal_mut()
-                .address_list_dynamic(DynamicChange::Remove(&d))
-            {
-                log::debug!("expired {} from {}: {err}", e.address, e.list);
-            }
+        let gone: Vec<DynamicAddress> = self
+            .dynamic_addresses
+            .expire(now)
+            .iter()
+            .map(|e| e.data_plane(Some(now)))
+            .collect();
+        if gone.is_empty() {
+            return;
+        }
+        // The kernel already dropped them (its set has the same timeout);
+        // one call for all of them, so the lab backend forgets them and a
+        // backend that must act does it in one go, not once per entry
+        // under the session lock.
+        if let Err(err) = self
+            .hal_mut()
+            .address_list_dynamic(DynamicChange::Expired(&gone))
+        {
+            log::debug!("expired {} dynamic address-list entries: {err}", gone.len());
         }
     }
 }

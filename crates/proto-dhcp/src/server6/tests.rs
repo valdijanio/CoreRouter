@@ -493,3 +493,156 @@ fn the_fqdn_names_the_address() {
     assert_eq!(b.dns, Some(("lan.example".into(), "cpe-garage".into())));
     assert_eq!(b.ttl, 1200, "a third of the lease");
 }
+
+// ---- audit of G4.2 (hostile clients) ----------------------------------
+
+fn flood_solicit(n: u32, na: bool) -> Vec<u8> {
+    let [a, b, c, d] = n.to_be_bytes();
+    let duid = v6::duid_ll([2, 0x66, a, b, c, d]);
+    let ia = IaReq {
+        iaid: 1,
+        addrs: vec![],
+        prefixes: vec![],
+    };
+    Outgoing {
+        kind: msg::SOLICIT,
+        xid: n,
+        client_id: &duid,
+        server_id: None,
+        elapsed_cs: 0,
+        rapid_commit: false,
+        ia_na: na.then(|| ia.clone()),
+        ia_pd: (!na).then_some(ia),
+        oro: &[],
+    }
+    .encode()
+}
+
+/// A SOLICIT flood from random DUIDs on an IA_NA /64 (a space of 2^64):
+/// the table stays under its cap, and offers nobody took are gone once
+/// their hold is over (RFC 9915 §18.3.1 binds nothing on a Solicit).
+#[test]
+fn a_solicit_flood_cannot_fill_memory() {
+    let mut c = cfg();
+    c.ipv6.dhcp_server.servers[0].prefix_pool = None;
+    let mut lab = Lab::new(&c);
+    let n = u32::try_from(MAX_BINDINGS6).unwrap() + 20_000;
+    for i in 0..n {
+        lab.send(ll(1), &flood_solicit(i, true));
+    }
+    assert!(
+        lab.srv.leases().len() <= MAX_BINDINGS6,
+        "{} records",
+        lab.srv.leases().len()
+    );
+    assert!(lab.srv.stats().dropped.contains_key("table-full"));
+    // The holds run out: nothing is left (they were never bound).
+    lab.now.unix += OFFER_HOLD + 1;
+    lab.srv.tick(lab.now);
+    assert_eq!(lab.srv.leases().len(), 0);
+    // A real client gets an address again.
+    let fx = lab.send(ll(1), &out(msg::SOLICIT, 1, None, false, None, None));
+    assert!(!sent(&fx).unwrap().0.ia_na[0].addrs.is_empty());
+}
+
+/// RFC 9915 §18.3.6: an Information-request without a Client Identifier
+/// is answered (stateless clients); §11.1: a DUID is at least its 2-byte
+/// type, an empty one identifies nobody.
+#[test]
+fn information_request_without_client_id_and_empty_duids() {
+    let mut lab = Lab::new(&cfg());
+    let info = Outgoing {
+        kind: msg::INFORMATION_REQUEST,
+        xid: 9,
+        client_id: &[],
+        server_id: None,
+        elapsed_cs: 0,
+        rapid_commit: false,
+        ia_na: None,
+        ia_pd: None,
+        oro: &[],
+    }
+    .encode();
+    // `Outgoing` always writes option 1: take it out (an empty one here).
+    let mut bare = info.get(..4).unwrap().to_vec();
+    let mut budget = v6::MAX_OPTIONS;
+    for (code, data) in v6::split(&info[4..], &mut budget).unwrap() {
+        if code != opt::CLIENTID {
+            v6::put(&mut bare, code, data);
+        }
+    }
+    let (rep, _, _) = sent(&lab.send(ll(1), &bare)).unwrap_or_else(|| panic!("no reply"));
+    assert_eq!(rep.kind, msg::REPLY);
+    assert_eq!(rep.domains, ["lan.example"]);
+    // A Solicit with an empty option 1: dropped.
+    let empty = Outgoing {
+        kind: msg::SOLICIT,
+        xid: 9,
+        client_id: &[],
+        server_id: None,
+        elapsed_cs: 0,
+        rapid_commit: false,
+        ia_na: Some(IaReq {
+            iaid: 1,
+            addrs: vec![],
+            prefixes: vec![],
+        }),
+        ia_pd: None,
+        oro: &[],
+    }
+    .encode();
+    assert!(lab.send(ll(1), &empty).is_empty());
+}
+
+/// A PD pool known to be full is not scanned again for every SOLICIT,
+/// and a prefix that comes free is found at once.
+#[test]
+fn a_full_pd_pool_is_remembered_until_a_prefix_frees() {
+    let mut c = cfg();
+    c.ipv6.dhcp_server.servers[0].address_pool = None;
+    c.ipv6.dhcp_server.servers[0].rapid_commit = true;
+    let mut lab = Lab::new(&c);
+    // The /54 holds four /56: all bound.
+    for n in 1..=4u8 {
+        let fx = lab.send(ll(n), &out(msg::SOLICIT, n, None, true, None, None));
+        assert!(!sent(&fx).unwrap().0.ia_pd[0].prefixes.is_empty());
+    }
+    for n in 5..=7u8 {
+        let fx = lab.send(ll(n), &out(msg::SOLICIT, n, None, false, None, None));
+        assert_eq!(
+            sent(&fx).unwrap().0.ia_pd[0].status_code(),
+            status::NO_PREFIX_AVAIL
+        );
+    }
+    lab.send(ll(2), &out(msg::RELEASE, 2, Some(&me()), false, None, None));
+    let fx = lab.send(ll(8), &out(msg::SOLICIT, 8, None, false, None, None));
+    assert!(
+        !sent(&fx).unwrap().0.ia_pd[0].prefixes.is_empty(),
+        "the released prefix"
+    );
+}
+/// A bound client that moves to another address leaves a free record
+/// (affinity), which the cap may evict before refusing anyone.
+#[test]
+fn the_cap_evicts_free_records_first() {
+    let mut c = cfg();
+    c.ipv6.dhcp_server.servers[0].prefix_pool = None;
+    c.ipv6.dhcp_server.servers[0].rapid_commit = true;
+    let mut lab = Lab::new(&c);
+    // One bound client, then released: a free record.
+    lab.send(ll(1), &out(msg::SOLICIT, 1, None, true, None, None));
+    lab.send(ll(1), &out(msg::RELEASE, 1, Some(&me()), false, None, None));
+    assert_eq!(lab.srv.leases().len(), 1);
+    let mut s = lab.srv;
+    s.leases.cap = 1;
+    let mut lab = Lab {
+        srv: s,
+        now: lab.now,
+    };
+    let fx = lab.send(ll(2), &flood_solicit(7, true));
+    assert!(
+        !sent(&fx).unwrap().0.ia_na[0].addrs.is_empty(),
+        "the free record made room"
+    );
+    assert_eq!(lab.srv.leases().len(), 1);
+}

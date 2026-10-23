@@ -22,7 +22,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corerouter_engine::{Shared, lock};
-use corerouter_model::ntp::{NtpClient, NtpState, NtpStatus};
+use corerouter_model::ntp::{NtpClient, NtpState, NtpStatus, POLL_RANGE};
 use corerouter_proto_ntp::{Packet, ReplyError, Sample, Timestamp, check_reply, sample_of};
 
 /// How long to wait for one server's answer.
@@ -61,7 +61,7 @@ fn run(session: &Shared, port: u16, health: &super::Health) {
         health.beat();
         let now_cfg = lock(session).store().running().system.ntp_client.clone();
         if cfg.as_ref() != Some(&now_cfg) {
-            poll_exp = now_cfg.min_poll;
+            poll_exp = poll_bounds(&now_cfg).0;
             next = Instant::now();
             denied.clear();
             status = NtpStatus {
@@ -77,7 +77,14 @@ fn run(session: &Shared, port: u16, health: &super::Health) {
         }
         if now_cfg.enabled && Instant::now() >= next {
             let resolve = |host: &str| super::dns::resolve(session, host);
-            let round = poll_round(&now_cfg.servers, port, &mut denied, &resolve);
+            let alive = || {
+                health.beat();
+                !health.stopping()
+            };
+            let round = poll_round(&now_cfg.servers, port, &mut denied, &resolve, &alive);
+            if health.stopping() {
+                return;
+            }
             poll_exp = next_poll(poll_exp, &now_cfg, &round);
             let wait = 1u64 << poll_exp.min(17);
             status = round.status(&status, wait);
@@ -157,13 +164,23 @@ impl Round {
     }
 }
 
+/// `(min_poll, max_poll)` inside [`POLL_RANGE`] and in order, whatever the
+/// config says: `system.ntp.client.set` checks them, but a saved file is
+/// loaded as written (and `clamp` panics when min > max).
+fn poll_bounds(cfg: &NtpClient) -> (u8, u8) {
+    let (lo, hi) = (*POLL_RANGE.start(), *POLL_RANGE.end());
+    let (a, b) = (cfg.min_poll.clamp(lo, hi), cfg.max_poll.clamp(lo, hi));
+    (a.min(b), a.max(b))
+}
+
 fn next_poll(exp: u8, cfg: &NtpClient, round: &Round) -> u8 {
+    let (min, max) = poll_bounds(cfg);
     if round.rate_limited {
-        cfg.max_poll
+        max
     } else if round.best.is_some() {
-        exp.saturating_add(1).clamp(cfg.min_poll, cfg.max_poll)
+        exp.saturating_add(1).clamp(min, max)
     } else {
-        cfg.min_poll
+        min
     }
 }
 
@@ -171,15 +188,21 @@ fn next_poll(exp: u8, cfg: &NtpClient, round: &Round) -> u8 {
 /// never the host's.
 pub type Resolve<'a> = &'a dyn Fn(&str) -> Result<Vec<IpAddr>, String>;
 
-/// Asks every server not denied; keeps the smallest round trip.
+/// Asks every server not denied; keeps the smallest round trip. `alive`
+/// runs before each server (the service beats its heartbeat there) and
+/// ends the round early when it says no (a stop).
 pub fn poll_round(
     servers: &[String],
     port: u16,
     denied: &mut BTreeSet<String>,
     resolve: Resolve<'_>,
+    alive: &dyn Fn() -> bool,
 ) -> Round {
     let mut round = Round::default();
     for server in servers {
+        if !alive() {
+            break;
+        }
         if denied.contains(server) {
             continue;
         }
@@ -195,6 +218,13 @@ pub fn poll_round(
             continue;
         };
         match query(addr, ANSWER_WAIT) {
+            // RFC 5905 §8 bounds the delay below by the precision: a
+            // negative one is a broken or lying server, and would win.
+            Ok((_, sample)) if sample.delay_nanos < 0 => {
+                round
+                    .errors
+                    .push(format!("{server}: negative round trip (bad timestamps)"));
+            }
             Ok((reply, sample)) => {
                 let better = round
                     .best
@@ -371,7 +401,7 @@ mod tests {
             _ => Err("name 'nope.example' does not exist".to_owned()),
         };
         let servers = ["time.example".into(), "nope.example".into()];
-        let r = poll_round(&servers, port, &mut BTreeSet::new(), &via);
+        let r = poll_round(&servers, port, &mut BTreeSet::new(), &via, &|| true);
         assert_eq!(r.best.unwrap().0, "time.example");
         assert!(r.errors[0].starts_with("nope.example: name"), "{:?}", r.errors);
     }
@@ -380,17 +410,17 @@ mod tests {
     fn deny_drops_the_server_and_rate_slows_down() {
         let deny = server(0, Some(b"DENY"));
         let mut denied = BTreeSet::new();
-        let r = poll_round(&["127.0.0.1".into()], deny, &mut denied, &literal);
+        let r = poll_round(&["127.0.0.1".into()], deny, &mut denied, &literal, &|| true);
         assert!(r.best.is_none());
         assert!(denied.contains("127.0.0.1"));
         assert!(
-            poll_round(&["127.0.0.1".into()], deny, &mut denied, &literal)
+            poll_round(&["127.0.0.1".into()], deny, &mut denied, &literal, &|| true)
                 .errors
                 .is_empty()
         );
 
         let rate = server(0, Some(b"RATE"));
-        let r = poll_round(&["127.0.0.1".into()], rate, &mut BTreeSet::new(), &literal);
+        let r = poll_round(&["127.0.0.1".into()], rate, &mut BTreeSet::new(), &literal, &|| true);
         let cfg = NtpClient::default();
         assert_eq!(next_poll(cfg.min_poll, &cfg, &r), cfg.max_poll);
     }
@@ -417,6 +447,76 @@ mod tests {
         assert_eq!(next_poll(6, &cfg, &good), 7);
         assert_eq!(next_poll(8, &cfg, &good), 8);
         assert_eq!(next_poll(8, &cfg, &Round::default()), 6);
+
+        // audit-services #5: min > max (or out of range) from a saved file
+        // panicked in `clamp`, and the supervisor gave up on the service.
+        let bad = NtpClient {
+            min_poll: 10,
+            max_poll: 6,
+            ..NtpClient::default()
+        };
+        assert_eq!(next_poll(6, &bad, &good), 7);
+        assert!((6..=10).contains(&next_poll(10, &bad, &good)));
+        let low = NtpClient {
+            min_poll: 0,
+            max_poll: 30,
+            ..NtpClient::default()
+        };
+        assert_eq!(next_poll(0, &low, &Round::default()), 6, "RFC 4330 §5");
+        assert_eq!(next_poll(17, &low, &good), 17);
+    }
+
+    /// audit-services #11: a reply with T3 < T2 gave a negative delay and
+    /// always won the "smallest round trip" selection.
+    #[test]
+    fn a_negative_round_trip_never_wins() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let liar = sock.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut buf = [0u8; 128];
+            while let Ok((n, from)) = sock.recv_from(&mut buf) {
+                let req = Packet::decode(&buf[..n]).unwrap();
+                let now = unix_nanos();
+                let reply = Packet {
+                    version: 4,
+                    mode: MODE_SERVER,
+                    stratum: 1,
+                    reference_id: *b"LIAR",
+                    origin: req.transmit,
+                    // Held the request "ten seconds" in a 1 ms round trip.
+                    receive: Timestamp::from_unix_nanos(now - 10_000_000_000),
+                    transmit: Timestamp::from_unix_nanos(now),
+                    ..Packet::default()
+                };
+                let _ = sock.send_to(&reply.encode(), from);
+            }
+        });
+        let r = poll_round(
+            &["127.0.0.1".into()],
+            liar,
+            &mut BTreeSet::new(),
+            &literal,
+            &|| true,
+        );
+        assert!(r.best.is_none(), "{:?}", r.best);
+        assert!(r.errors[0].contains("negative"), "{:?}", r.errors);
+    }
+
+    /// audit-services #15: a round over mute servers ignored a stop for up
+    /// to 8 × (resolve + 2 s).
+    #[test]
+    fn a_round_stops_between_servers() {
+        let mute = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = mute.local_addr().unwrap().port();
+        let servers: Vec<String> = (0..8).map(|_| "127.0.0.1".to_owned()).collect();
+        let asked = std::cell::Cell::new(0);
+        let start = Instant::now();
+        let r = poll_round(&servers, port, &mut BTreeSet::new(), &literal, &|| {
+            asked.set(asked.get() + 1);
+            asked.get() <= 1
+        });
+        assert_eq!(r.errors.len(), 1, "{:?}", r.errors);
+        assert!(start.elapsed() < ANSWER_WAIT + Duration::from_secs(1));
     }
 
     #[test]

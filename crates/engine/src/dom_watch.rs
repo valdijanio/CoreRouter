@@ -8,7 +8,7 @@
 //! an alert is logged even with no window open. Operational state: never
 //! saved.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_hal::HalError;
 use corerouter_hal::sff::{Level, SfpModule};
@@ -32,6 +32,11 @@ struct PortState {
 pub struct DomWatch {
     ports: BTreeMap<IfName, PortState>,
     last_scan: Option<u64>,
+    /// Ports that answered "no module EEPROM" (copper, a driver without
+    /// module access): the scan skips them instead of asking the kernel
+    /// again every [`SCAN_SECS`] under the session lock. Reading one by
+    /// hand (`interface.ethernet.monitor`) still asks.
+    no_cage: BTreeSet<IfName>,
 }
 
 /// `-25.10 dBm`.
@@ -161,17 +166,25 @@ impl Session {
             return;
         }
         self.dom.last_scan = Some(now);
-        let ports: Vec<IfName> = self
+        let ethernet: BTreeSet<IfName> = self
             .store()
             .running()
             .interfaces
             .values()
             .filter(|i| i.kind == InterfaceKind::Ethernet)
             .map(|i| i.name.clone())
+            .collect();
+        // A port gone from the config is asked again if it comes back.
+        self.dom.no_cage.retain(|n| ethernet.contains(n));
+        let ports: Vec<IfName> = ethernet
+            .difference(&self.dom.no_cage)
             .take(MAX_SCAN)
+            .cloned()
             .collect();
         for p in ports {
-            let _ = self.read_module(&p);
+            if let Err(HalError::Unsupported(_)) = self.read_module(&p) {
+                self.dom.no_cage.insert(p);
+            }
         }
     }
 }

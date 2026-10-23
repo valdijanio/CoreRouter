@@ -39,5 +39,17 @@ proptest.workspace = true
 name = "execute"
 harness = false
 
+[[bench]]
+name = "neighbors"
+harness = false
+
+[[bench]]
+name = "scale"
+harness = false
+
+[[bench]]
+name = "dhcp_round"
+harness = false
+
 [lints]
 workspace = true

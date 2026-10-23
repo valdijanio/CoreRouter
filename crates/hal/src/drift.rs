@@ -18,7 +18,7 @@ use std::fmt;
 use std::net::IpAddr;
 
 use corerouter_model::route::{self, Reach};
-use corerouter_model::{Config, IfName, InterfaceKind};
+use corerouter_model::{Config, IfName, InterfaceKind, RouteEntry};
 use ipnet::IpNet;
 use serde::Serialize;
 
@@ -96,9 +96,15 @@ pub fn master<'a>(cfg: &'a Config, name: &IfName) -> Option<&'a IfName> {
 /// Which ones those are is `corerouter_model::route::reach` — the same
 /// function behind the A flag of `ip.route.list`.
 pub fn kernel_routes(cfg: &Config) -> BTreeSet<KernelRoute> {
-    cfg.ip
-        .routes
-        .iter()
+    kernel_routes_of(cfg, cfg.ip.routes.iter())
+}
+
+/// [`kernel_routes`] of some of the routes of `cfg`.
+pub fn kernel_routes_of<'a>(
+    cfg: &Config,
+    routes: impl Iterator<Item = &'a RouteEntry>,
+) -> BTreeSet<KernelRoute> {
+    routes
         .filter_map(|r| {
             let Reach::Active { link, gateway } = route::reach(cfg, r) else {
                 return None;
@@ -117,21 +123,25 @@ pub fn kernel_routes(cfg: &Config) -> BTreeSet<KernelRoute> {
 /// What applying `cfg` leaves in the data plane.
 pub fn expected(cfg: &Config) -> Snapshot {
     Snapshot {
-        links: cfg
-            .interfaces
-            .values()
-            .map(|i| {
-                let snap = LinkSnap {
-                    up: !i.disabled,
-                    mtu: u32::from(i.mtu),
-                    master: master(cfg, &i.name).cloned(),
-                };
-                (i.name.clone(), snap)
-            })
-            .collect(),
+        links: expected_links(cfg),
         addresses: active_addresses(cfg),
         routes: kernel_routes(cfg),
     }
+}
+
+/// The links part of [`expected`].
+pub fn expected_links(cfg: &Config) -> BTreeMap<IfName, LinkSnap> {
+    cfg.interfaces
+        .values()
+        .map(|i| {
+            let snap = LinkSnap {
+                up: !i.disabled,
+                mtu: u32::from(i.mtu),
+                master: master(cfg, &i.name).cloned(),
+            };
+            (i.name.clone(), snap)
+        })
+        .collect()
 }
 
 /// What drifted.

@@ -25,7 +25,8 @@
 use std::net::{IpAddr, SocketAddr};
 
 use corerouter_firewall::eval::{Outcome, Packet, Verdict, walk};
-use corerouter_model::Config;
+use corerouter_model::route::{self, Reach};
+use corerouter_model::{Config, IfName, RoutingTable};
 use corerouter_model::firewall::{ConnState, DynamicAddress, Protocol, Table};
 use serde_json::Value;
 
@@ -80,9 +81,55 @@ struct Probe {
     packet: Packet,
 }
 
+/// The interface the caller's packets come in on (and our replies leave
+/// by): the one routing points at for `peer`, in the table of the
+/// interface that holds `local`. With management on a loopback /32 the
+/// connection still arrives on the WAN port, not on `lo0` (audit-net).
+/// `local_interface` when nothing routes to the peer.
+fn ingress_interface(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String> {
+    let holder = local_interface(cfg, local);
+    if local.is_loopback() {
+        return holder;
+    }
+    let table = holder
+        .as_deref()
+        .and_then(|h| h.parse::<IfName>().ok())
+        .map_or(RoutingTable::Main, |h| route::table_of(cfg, &h));
+    // Longest prefix wins; a connected network beats a route of the same
+    // length (distance 0), then the lower distance.
+    let mut best: Option<(u8, u8, IfName)> = None;
+    let mut consider = |len: u8, distance: u8, link: &IfName| {
+        let better = best
+            .as_ref()
+            .is_none_or(|(l, d, _)| len > *l || (len == *l && distance < *d));
+        if better {
+            best = Some((len, distance, link.clone()));
+        }
+    };
+    for a in &cfg.ip.addresses {
+        if !a.disabled
+            && a.address.contains(&peer)
+            && route::is_up(cfg, &a.interface)
+            && route::table_of(cfg, &a.interface) == table
+        {
+            consider(a.address.prefix_len(), 0, &a.interface);
+        }
+    }
+    for r in &cfg.ip.routes {
+        if r.routing_table != table || !r.dst_address.contains(&peer) {
+            continue;
+        }
+        if let Reach::Active { link, .. } = route::reach(cfg, r) {
+            consider(r.dst_address.prefix_len(), r.distance, &link);
+        }
+    }
+    best.map(|(_, _, link)| link.as_str().to_owned())
+        .or(holder)
+}
+
 fn probes(cfg: &Config, link: &Link) -> Vec<Probe> {
     let (peer, local) = (plain(link.peer.ip()), plain(link.local.ip()));
-    let iface = local_interface(cfg, local);
+    let iface = ingress_interface(cfg, peer, local);
     let inbound = |state| Packet {
         src: peer,
         dst: local,

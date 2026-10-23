@@ -2,7 +2,8 @@
 //! matches them (`in_interface_list=WAN`); neighbor discovery may use them
 //! later. New configs come with the empty lists LAN and WAN.
 
-use corerouter_model::firewall::{Name, Table};
+use corerouter_model::dns::AllowedFrom;
+use corerouter_model::firewall::{Name, Table, Zone};
 use corerouter_model::interface_list::{
     DEFAULT_LISTS, InterfaceList, InterfaceListMember, RESERVED,
 };
@@ -30,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set Interface List",
         [],
         None,
-        "{name: string, new_name?: string, comment?: string} → {name}",
+        "{name: string, new_name?: string (the RA and DNS settings that name the list follow it; refused while firewall rules or zone cells use it), comment?: string} → {name}",
         always,
         set
     ),
@@ -121,9 +122,19 @@ fn existing_list(cfg: &Config, p: &Value, key: &str) -> Result<(usize, Name)> {
     Ok((pos, name))
 }
 
-/// Firewall rules that name `list` (they would break without it).
+/// Firewall rules and zone cells that name `list` (they would break
+/// without it). Settings that name a list (RA, DNS `allowed_from`) follow
+/// a rename instead (see `set`).
 fn used_by(cfg: &Config, list: &Name) -> Vec<String> {
     let mut out = Vec::new();
+    for z in &cfg.ip.firewall.zones {
+        if [&z.from, &z.to]
+            .into_iter()
+            .any(|side| matches!(side, Zone::List(l) if l == list))
+        {
+            out.push(format!("zone cell {} → {}", z.from, z.to));
+        }
+    }
     for table in Table::ALL {
         for r in cfg.ip.firewall.rules(table) {
             let m = &r.matchers;
@@ -137,6 +148,11 @@ fn used_by(cfg: &Config, list: &Name) -> Vec<String> {
         }
     }
     out
+}
+
+/// An `ip.dns allowed_from` item that names `list`.
+fn dns_names(item: &str, list: &Name) -> bool {
+    matches!(AllowedFrom::parse(item), Ok(AllowedFrom::List(l)) if l == list.as_str())
 }
 
 fn add(s: &mut Session, p: &Value) -> Result<Value> {
@@ -183,7 +199,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(EngineError::bad(
                 "new_name",
                 format!(
-                    "firewall rules use '{name}' ({}); change them first",
+                    "the firewall uses '{name}' ({}); change it first",
                     users.join(", ")
                 ),
             ));
@@ -191,6 +207,16 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         for m in &mut cfg.interface_lists.members {
             if m.list == name {
                 m.list = to.clone();
+            }
+        }
+        // Settings that name the list follow it, as in RouterOS (before,
+        // RA acceptance turned off and DNS refused the old name).
+        if cfg.ipv6.settings.accept_router_advertisements_on == name {
+            cfg.ipv6.settings.accept_router_advertisements_on = to.clone();
+        }
+        for item in &mut cfg.ip.dns.allowed_from {
+            if dns_names(item, &name) {
+                *item = to.to_string();
             }
         }
         if let Some(l) = cfg.interface_lists.lists.get_mut(pos) {
@@ -218,12 +244,21 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
             ),
         ));
     }
+    if cfg.ip.dns.allowed_from.iter().any(|i| dns_names(i, &name)) {
+        return Err(EngineError::bad(
+            "name",
+            format!(
+                "DNS answers '{name}' (ip.dns allowed_from); take it out of allowed_from first \
+                 (ip.dns.set)"
+            ),
+        ));
+    }
     let users = used_by(cfg, &name);
     if !users.is_empty() {
         return Err(EngineError::bad(
             "name",
             format!(
-                "firewall rules use '{name}' ({}); remove or change them first",
+                "the firewall uses '{name}' ({}); remove or change it first",
                 users.join(", ")
             ),
         ));

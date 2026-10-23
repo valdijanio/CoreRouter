@@ -370,6 +370,11 @@ impl Hal for Recording {
                 ..
             }) => format!("add {list} {address} {timeout_secs}"),
             DynamicChange::Remove(d) => format!("remove {} {}", d.list, d.address),
+            DynamicChange::Expired(all) => all
+                .iter()
+                .map(|d| format!("expired {} {}", d.list, d.address))
+                .collect::<Vec<_>>()
+                .join(", "),
         };
         self.1.0.lock().unwrap().push(text);
         Ok(())
@@ -432,7 +437,7 @@ fn dynamic_entries_reach_the_data_plane_and_expire() {
     assert_eq!(rows.as_array().unwrap().len(), 1, "expired");
     assert_eq!(
         *rec.0.lock().unwrap(),
-        ["add bad 192.0.2.7 90", "remove bad 192.0.2.7"]
+        ["add bad 192.0.2.7 90", "expired bad 192.0.2.7"]
     );
     let (param, _) = bad(
         &mut s,

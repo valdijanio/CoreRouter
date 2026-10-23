@@ -89,12 +89,20 @@ mod linux {
         let mut hal = LinuxHal::new();
         let base = common::base(PORT);
         hal.apply(&Config::default(), &base).unwrap();
-        let mut kinds: Vec<(&str, Build)> = vec![
-            ("addresses", |b, n| common::addresses(b, PORT, n)),
-            ("routes", common::routes),
+        // (name, config, timed direction: false = base → config, true = back).
+        let mut kinds: Vec<(&str, Build, bool)> = vec![
+            ("addresses", |b, n| common::addresses(b, PORT, n), false),
+            // Removing them: one RTM_DELADDR each (audit-net; it used to
+            // dump every address of the namespace per address).
+            (
+                "addresses_remove",
+                |b, n| common::addresses(b, PORT, n),
+                true,
+            ),
+            ("routes", common::routes, false),
         ];
         if nft::available() {
-            kinds.push(("filter_rules", common::filter_rules));
+            kinds.push(("filter_rules", common::filter_rules, false));
         } else {
             eprintln!("skipped filter_rules: the `nft` program (nftables) is not installed");
         }
@@ -103,7 +111,7 @@ mod linux {
         g.sampling_mode(SamplingMode::Flat)
             .sample_size(10)
             .warm_up_time(Duration::from_millis(500));
-        for (kind, build) in kinds {
+        for (kind, build, back) in kinds {
             for n in common::SIZES {
                 let to = build(&base, n);
                 g.throughput(Throughput::Elements(n as u64));
@@ -113,8 +121,14 @@ mod linux {
                         for _ in 0..iters {
                             let t = Instant::now();
                             hal.apply(black_box(&base), black_box(to)).unwrap();
-                            spent += t.elapsed();
+                            if !back {
+                                spent += t.elapsed();
+                            }
+                            let t = Instant::now();
                             hal.apply(to, &base).unwrap();
+                            if back {
+                                spent += t.elapsed();
+                            }
                         }
                         spent
                     });

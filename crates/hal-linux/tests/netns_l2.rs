@@ -246,6 +246,8 @@ fn mndp_listener_gets_broadcasts_with_the_arrival_interface() {
         .find(|d| d.interface == Some(n("mndpb")))
         .unwrap_or_else(|| panic!("no datagram on mndpb: {got:?}"));
     assert_eq!(d.payload, b"\0\0\0\x01announce");
+    // The destination is known, so a unicast copy can be told apart.
+    assert_eq!(d.dst, Some("10.56.0.255".parse().unwrap()));
     assert_eq!(
         d.src,
         SocketAddr::from(([10, 56, 0, 1], s.local_addr().unwrap().port()))

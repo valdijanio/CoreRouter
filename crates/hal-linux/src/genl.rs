@@ -246,6 +246,7 @@ pub(crate) use io::Genl;
 #[cfg(target_os = "linux")]
 mod io {
     use std::os::fd::AsFd;
+    use std::time::{Duration, Instant};
 
     use netlink_sys::{Socket, protocols::NETLINK_GENERIC};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
@@ -379,10 +380,23 @@ mod io {
                 .send(&req, 0)
                 .map_err(|e| GenlError::Io(format!("netlink send: {e}")))?;
             let mut out = Vec::new();
+            // One deadline for the whole answer: unrelated notifications
+            // (a socket that joined a multicast group) kept re-arming a
+            // per-poll timeout forever.
+            let start = Instant::now();
+            let deadline = start
+                .checked_add(Duration::from_millis(u64::from(TIMEOUT_MS)))
+                .unwrap_or(start);
             loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let left_ms = u16::try_from(left.as_millis()).unwrap_or(TIMEOUT_MS);
                 let mut fds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
-                let ready = poll(&mut fds, PollTimeout::from(TIMEOUT_MS))
-                    .map_err(|e| GenlError::Io(format!("netlink poll: {e}")))?;
+                let ready = if left_ms == 0 {
+                    0
+                } else {
+                    poll(&mut fds, PollTimeout::from(left_ms))
+                        .map_err(|e| GenlError::Io(format!("netlink poll: {e}")))?
+                };
                 if ready == 0 {
                     return Err(GenlError::Io("no answer from the kernel in 1 s".into()));
                 }

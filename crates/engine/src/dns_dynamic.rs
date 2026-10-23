@@ -37,6 +37,11 @@ struct DynamicRuntime {
     state: DynamicState,
     /// Bumped on every change: the daemon copies the state when it moved.
     version: u64,
+    /// Changes are kept in memory and saved by `dns_dynamic_flush` (a DHCP
+    /// round names hundreds of leases: one save, not two per lease).
+    deferred: bool,
+    /// Zones changed while deferred (their serial moves at the flush).
+    dirty: Vec<String>,
 }
 
 /// A lease for [`Session::dns_dynamic_lease`].
@@ -108,6 +113,57 @@ impl Session {
     /// Replaces the state with `next` (when it differs), moving the serial
     /// of `zones`, and saves it.
     fn dyn_commit(&mut self, mut next: DynamicState, zones: &[String], now: u64) -> Result<(), String> {
+        if self.ext::<DynamicRuntime>().is_some_and(|r| r.deferred) {
+            let rt = self.dyn_rt().ok_or("no dynamic DNS state")?;
+            rt.state = next;
+            rt.version = rt.version.wrapping_add(1);
+            for z in zones {
+                if !rt.dirty.contains(z) {
+                    rt.dirty.push(z.clone());
+                }
+            }
+            return Ok(());
+        }
+        self.dyn_bump_and_save(&mut next, zones, now)?;
+        let rt = self.dyn_rt().ok_or("no dynamic DNS state")?;
+        rt.state = next;
+        rt.version = rt.version.wrapping_add(1);
+        Ok(())
+    }
+
+    /// Changes from now on are saved by [`Session::dns_dynamic_flush`].
+    pub(crate) fn dns_dynamic_defer(&mut self) {
+        if let Some(rt) = self.ext_mut::<DynamicRuntime>() {
+            rt.deferred = true;
+        }
+    }
+
+    /// Save what changed since [`Session::dns_dynamic_defer`] (once), the
+    /// serials of the changed zones moved.
+    pub(crate) fn dns_dynamic_flush(&mut self, now: u64) {
+        let Some(zones) = self.ext_mut::<DynamicRuntime>().map(|r| {
+            r.deferred = false;
+            std::mem::take(&mut r.dirty)
+        }) else {
+            return;
+        };
+        if zones.is_empty() {
+            return;
+        }
+        let Some(mut next) = self.ext_mut::<DynamicRuntime>().map(|r| std::mem::take(&mut r.state)) else {
+            return;
+        };
+        if let Err(e) = self.dyn_bump_and_save(&mut next, &zones, now) {
+            log::error!("{e}");
+        }
+        if let Some(rt) = self.ext_mut::<DynamicRuntime>() {
+            rt.state = next;
+            rt.version = rt.version.wrapping_add(1);
+        }
+    }
+
+    /// The serials of `zones` moved in `next` (§3.6), then saved.
+    fn dyn_bump_and_save(&mut self, next: &mut DynamicState, zones: &[String], now: u64) -> Result<(), String> {
         for zone in zones {
             let Some(z) = self.store().running().ip.dns_zones.zone(zone).cloned() else {
                 continue;
@@ -119,14 +175,10 @@ impl Session {
             };
             next.serials.insert(zone.clone(), next_serial(z.serial_policy, base, now));
         }
-        let text = serde_json::to_string(&next).map_err(|e| e.to_string())?;
+        let text = serde_json::to_string(&*next).map_err(|e| e.to_string())?;
         self.storage_mut()
             .save_state(STATE, &text)
-            .map_err(|e| format!("dynamic DNS records not saved: {e}"))?;
-        let rt = self.dyn_rt().ok_or("no dynamic DNS state")?;
-        rt.state = next;
-        rt.version = rt.version.wrapping_add(1);
-        Ok(())
+            .map_err(|e| format!("dynamic DNS records not saved: {e}"))
     }
 
     /// An RFC 2136 UPDATE of primary `zone` (already authorised and its
@@ -158,6 +210,38 @@ impl Session {
             .filter(|r| !r.disabled)
             .cloned()
             .collect();
+        // Deferred (a DHCP round naming hundreds of leases): ops that cannot
+        // fail are applied in place, without copying the whole state per
+        // update (that copy was most of a storm round, **medido**). Only an
+        // invalid record or the cap can fail an update, both known before.
+        let adds = ops.iter().filter(|o| matches!(o, DynamicOp::Add(_))).count();
+        let valid = ops.iter().all(|o| match o {
+            DynamicOp::Add(r) => {
+                let mut r = r.clone();
+                r.zone = zone.to_owned();
+                r.problem().is_none()
+            }
+            _ => true,
+        });
+        let fits = self
+            .dyn_rt()
+            .is_some_and(|r| r.deferred && r.state.records.len() + adds <= MAX_DYNAMIC);
+        if valid && fits {
+            let Some(rt) = self.dyn_rt() else {
+                return Err("no dynamic DNS state".into());
+            };
+            let mut changed = 0usize;
+            for op in ops {
+                changed += apply(&mut rt.state, &config, zone, op, source, expires_unix, now)?;
+            }
+            if changed > 0 {
+                rt.version = rt.version.wrapping_add(1);
+                if !rt.dirty.iter().any(|z| z == zone) {
+                    rt.dirty.push(zone.to_owned());
+                }
+            }
+            return Ok(changed);
+        }
         let (_, mut next) = self.dns_dynamic();
         let mut changed = 0usize;
         for op in ops {

@@ -2,6 +2,9 @@
 //! owned by the engine plus each `proto-*` subsystem validator.
 
 use std::collections::BTreeMap;
+use std::net::Ipv6Addr;
+
+use ipnet::IpNet;
 
 use corerouter_model::route::{self, FIRST_VRF_TABLE, LAST_VRF_TABLE, Reach};
 use corerouter_model::{
@@ -89,6 +92,14 @@ fn core_checks(cfg: &Config) -> Vec<Issue> {
             ));
         }
     }
+    if cfg.ip.addresses.len() > MAX_ADDRESSES {
+        out.push(Issue::new(
+            "ip.addresses",
+            format!("at most {MAX_ADDRESSES} addresses"),
+        ));
+    }
+    // (Addresses from different pools differ once the prefixes are in.)
+    let mut v6: BTreeMap<(&IfName, Ipv6Addr, Option<&str>), IpNet> = BTreeMap::new();
     for a in &cfg.ip.addresses {
         if !cfg.interfaces.contains_key(&a.interface) {
             out.push(Issue::new(
@@ -96,16 +107,81 @@ fn core_checks(cfg: &Config) -> Vec<Issue> {
                 format!("interface '{}' does not exist", a.interface),
             ));
         }
+        if let IpNet::V6(net) = a.address
+            && let Some(other) = v6.insert(
+                (&a.interface, net.addr(), a.from_pool.as_deref()),
+                a.address,
+            )
+            && other != a.address
+        {
+            out.push(Issue::new(
+                format!("ip.addresses[{}].address", a.id),
+                v6_twice(net.addr(), &a.interface, other),
+            ));
+        }
     }
-    for (i, r) in cfg.ip.routes.iter().enumerate() {
-        let earlier = cfg.ip.routes.iter().take(i);
+    // Duplicates can only be among routes to the same destination in the
+    // same table: compare inside those groups (O(R log R); comparing every
+    // pair was O(R²) on each commit, with up to MAX_ROUTES routes).
+    let mut groups: BTreeMap<(&RoutingTable, IpNet), Vec<&RouteEntry>> = BTreeMap::new();
+    for r in &cfg.ip.routes {
+        let group = groups
+            .entry((&r.routing_table, r.dst_address))
+            .or_default();
         out.extend(
-            route_issues(cfg, r, earlier)
+            route_issues(cfg, r, group.iter().copied())
                 .into_iter()
                 .map(|(field, m)| Issue::new(format!("ip.routes[{}].{field}", r.id), m)),
         );
+        group.push(r);
     }
+    ntp_checks(cfg, &mut out);
     out
+}
+
+/// What `system.ntp.client.set` enforces, for a config that did not come
+/// through it (a saved or hand-edited file).
+fn ntp_checks(cfg: &Config, out: &mut Vec<Issue>) {
+    use corerouter_model::ntp::{MAX_SERVERS, POLL_RANGE, valid_server};
+    let c = &cfg.system.ntp_client;
+    for (field, v) in [("min_poll", c.min_poll), ("max_poll", c.max_poll)] {
+        if !POLL_RANGE.contains(&v) {
+            out.push(Issue::new(
+                format!("system.ntp_client.{field}"),
+                format!("must be {}..={}", POLL_RANGE.start(), POLL_RANGE.end()),
+            ));
+        }
+    }
+    if c.min_poll > c.max_poll {
+        out.push(Issue::new(
+            "system.ntp_client.min_poll",
+            "min_poll must not be above max_poll",
+        ));
+    }
+    if c.servers.len() > MAX_SERVERS {
+        out.push(Issue::new(
+            "system.ntp_client.servers",
+            format!("at most {MAX_SERVERS} servers"),
+        ));
+    }
+    for s in c.servers.iter().take(MAX_SERVERS.saturating_add(1)) {
+        if let Err(e) = valid_server(s) {
+            out.push(Issue::new("system.ntp_client.servers", e));
+        }
+    }
+}
+
+/// Bound on `ip.addresses` (hostile input; every other list has one).
+/// Far above what a router holds (**estimado**).
+pub const MAX_ADDRESSES: usize = 65_536;
+
+/// Linux keys an IPv6 address by address and interface only: a second
+/// prefix length for the same address is refused by the kernel (EEXIST).
+pub(crate) fn v6_twice(addr: Ipv6Addr, iface: &IfName, other: IpNet) -> String {
+    format!(
+        "{addr} is already on {iface} as {other}; an IPv6 address can be on an interface \
+         with one prefix length only (remove the other first)"
+    )
 }
 
 /// What is wrong with route `r` in `cfg`, as (field, message). `others` are

@@ -8,17 +8,30 @@
 //! What it does with the server's [`Effect`]s, in order, each round:
 //!
 //! 1. journal lines go to the storage in one append, synced, before any
-//!    reply of the round leaves (an ACK the server would forget after a
-//!    crash is never sent; one fsync per round, not per lease: group
+//!    reply of the round leaves (one fsync per round, not per lease: group
 //!    commit). The journal is compacted (one line per live record, an
 //!    atomic rewrite) hourly or when it has grown to twice the records —
-//!    Kea's LFC, in-process;
+//!    Kea's LFC, in-process. A failed append does not hold the replies
+//!    back: availability first (a full disk would otherwise stop every
+//!    client on the network), and the error is on the service's row; a
+//!    failed compaction is tried again after [`COMPACT_RETRY_SECS`];
 //! 2. replies and probes go to the sockets;
 //! 3. a bound lease is named in the DNS (A + PTR through
 //!    [`Session::dns_dynamic_lease`], G4.1c-3) and joins its firewall
 //!    address lists (dynamic entries that time out with the lease); an
-//!    ended lease leaves both;
+//!    ended lease leaves both. The DNS records are saved once per round,
+//!    the list entries are checked against lockout once per round, the
+//!    lease history gets one append per round (a storm of N bindings was
+//!    N history fsyncs, 2N DNS state rewrites and N config clones);
 //! 4. log lines go to the router's log (topic `dhcp`).
+//!
+//! A round reads at most [`RECV_BUDGET`] messages per socket and stops
+//! reading after [`ROUND_BUDGET_US`]: the session lock it holds is the one
+//! the control channel and the GUI need too.
+//!
+//! After a restart the bound leases of the journal get their address-list
+//! entries back (they are not stored) and their DNS names are adopted, so
+//! they leave the zone when the lease ends.
 //!
 //! Leases are operational state, like RouterOS': never in the config nor a
 //! revision; `ip.dhcp-server.lease.make-static` copies one into the config.
@@ -42,6 +55,12 @@ use crate::firewall_dyn::{DynamicEntry, MAX_DYNAMIC};
 pub const JOURNAL: &str = "dhcp-leases";
 /// Messages read per socket per round (a flood cannot stall the rest).
 const RECV_BUDGET: usize = 256;
+/// Microseconds a round may spend reading messages (the rest wait for the
+/// next round; the session lock is released in between).
+pub const ROUND_BUDGET_US: u64 = 20_000;
+/// A compaction that failed (a full or read-only disk) is tried again
+/// after this, not every round (each try serializes the whole table).
+pub const COMPACT_RETRY_SECS: u64 = 60;
 /// Retry opening a socket that failed.
 const PORT_RETRY_MS: u64 = 10_000;
 /// Compact at least this often (Kea's `lfc-interval` default).
@@ -79,6 +98,14 @@ pub struct DhcpServerRuntime {
     /// The daemon's service drives it; the session clock leaves it alone.
     external: bool,
     last_ms: u64,
+    /// Address-list entries of this round's bindings, (list, address,
+    /// timeout): added together, after one lockout check.
+    pending_lists: Vec<(String, Ipv4Addr, u64)>,
+    /// The journal was just loaded: its bound leases get their lists and
+    /// names back.
+    restore: bool,
+    /// No compaction before this (Unix time) after one failed.
+    compact_retry_at: u64,
 }
 
 /// A socket, for `ip.dhcp-server.print` and the service's row.
@@ -166,10 +193,21 @@ impl Session {
     /// reads a monotonic clock in microseconds (the processing time of each
     /// reply goes into the statistics). Returns whether anything was heard.
     pub fn dhcp_server_poll(&mut self, now_ms: u64, clock_us: &dyn Fn() -> u64) -> bool {
+        // The DNS records the round changes are saved once, at its end.
+        self.dns_dynamic_defer();
+        let heard = self.dhcp_server_round(now_ms, clock_us);
+        let now = self.dhcp_now(now_ms);
+        self.dns_dynamic_flush(now.unix);
+        heard
+    }
+
+    fn dhcp_server_round(&mut self, now_ms: u64, clock_us: &dyn Fn() -> u64) -> bool {
+        let start = clock_us();
         let now = self.dhcp_now(now_ms);
         let mut fx: Vec<(Effect, Option<u64>)> = Vec::new();
         self.dhcp_server_sync(now, &mut fx);
         self.dhcp_history_load(now);
+        self.dhcp_server_restore(now);
         // G4.2b: the relays first; requests for our own servers come back.
         let mut relayed: Vec<(IfName, Heard)> = Vec::new();
         let mut heard = self.dhcp_relay_poll(now, &mut relayed);
@@ -192,6 +230,10 @@ impl Session {
             };
             port.tick(now.unix);
             for _ in 0..RECV_BUDGET {
+                if clock_us().saturating_sub(start) >= ROUND_BUDGET_US {
+                    // The rest waits for the next round (the lock is let go).
+                    break;
+                }
                 match port.recv() {
                     Ok(Some(h)) => {
                         heard = true;
@@ -219,6 +261,53 @@ impl Session {
         self.dhcp_server_compact(now, false);
         self.dhcp_history_compact(now);
         heard
+    }
+
+    /// After the journal was loaded: the bound leases' address-list
+    /// entries (not stored) come back, and their DNS names (stored in the
+    /// dynamic records) are known again, to be removed when they end.
+    fn dhcp_server_restore(&mut self, now: Now) {
+        let due = self
+            .ext_mut::<DhcpServerRuntime>()
+            .is_some_and(|r| std::mem::take(&mut r.restore));
+        if !due {
+            return;
+        }
+        let bindings: Vec<Binding> = self
+            .dhcp_server()
+            .map(|c| c.leases().iter().filter_map(|l| c.binding_of(l)).collect())
+            .unwrap_or_default();
+        if bindings.is_empty() {
+            return;
+        }
+        let (_, state) = self.dns_dynamic();
+        let names: std::collections::HashSet<(&str, &str, Option<IpAddr>)> = state
+            .records
+            .iter()
+            .map(|r| (r.record.zone.as_str(), r.record.name.as_str(), r.record.address))
+            .collect();
+        for b in bindings {
+            let ip = b.lease.address;
+            // A name is adopted only if it is in the zone (the client may
+            // have asked for none: RFC 4702 N).
+            let dns = b
+                .dns
+                .filter(|(zone, host)| names.contains(&(zone.as_str(), host.as_str(), Some(IpAddr::V4(ip)))));
+            let timeout = b.lease.left(now.unix) + LIST_SLACK;
+            if let Some(rt) = self.ext_mut::<DhcpServerRuntime>() {
+                for l in &b.address_lists {
+                    rt.pending_lists.push((l.clone(), ip, timeout));
+                }
+                rt.registered.insert(
+                    ip,
+                    Registered {
+                        dns,
+                        lists: b.address_lists,
+                    },
+                );
+            }
+        }
+        self.dhcp_lists_flush(now);
     }
 
     /// Follow the running config: the plan, the journal (first time), the
@@ -267,6 +356,7 @@ impl Session {
                     rt.loaded = true;
                     rt.appended = lines;
                     rt.compacted_at = now.unix;
+                    rt.restore = lines > 0;
                     // Records of servers that are gone end now.
                     let plan = core.plan().clone();
                     fx.extend(core.configure(plan).into_iter().map(|e| (e, None)));
@@ -396,7 +486,7 @@ impl Session {
             }
         }
         for r in to_relays {
-            self.dhcp_relay_down(&r);
+            self.dhcp_relay_down(&r, None);
         }
         // 3. and 4.
         for e in later {
@@ -420,6 +510,8 @@ impl Session {
                 _ => {}
             }
         }
+        self.dhcp_lists_flush(now);
+        self.dhcp_history_flush();
     }
 
     fn dhcp_bound(&mut self, b: &Binding, now: Now) {
@@ -462,18 +554,23 @@ impl Session {
                 self.dhcp_list_remove(l, ip);
             }
         }
+        // Joined at the end of the round, with the round's other bindings
+        // (`dhcp_lists_flush`: one lockout check for all of them).
         let timeout = b.lease.left(now.unix) + LIST_SLACK;
-        reg.lists.retain(|l| self.dhcp_list_put(l, ip, timeout, now));
         if let Some(rt) = self.ext_mut::<DhcpServerRuntime>() {
+            for l in &reg.lists {
+                rt.pending_lists.retain(|(pl, pip, _)| !(pl == l && *pip == ip));
+                rt.pending_lists.push((l.clone(), ip, timeout));
+            }
             rt.registered.insert(ip, reg);
         }
     }
 
     fn dhcp_gone(&mut self, ip: Ipv4Addr, now: Now) {
-        let Some(reg) = self
-            .ext_mut::<DhcpServerRuntime>()
-            .and_then(|r| r.registered.remove(&ip))
-        else {
+        let Some(reg) = self.ext_mut::<DhcpServerRuntime>().and_then(|r| {
+            r.pending_lists.retain(|(_, pip, _)| *pip != ip);
+            r.registered.remove(&ip)
+        }) else {
             return;
         };
         if let Some((zone, host)) = &reg.dns {
@@ -484,9 +581,66 @@ impl Session {
         }
     }
 
+    /// The round's address-list entries: one lockout check for all the new
+    /// ones (against the running config, borrowed), then each is added;
+    /// when the check fails, each is checked alone (and the refused ones
+    /// leave the lease's lists).
+    fn dhcp_lists_flush(&mut self, now: Now) {
+        let pending = self
+            .ext_mut::<DhcpServerRuntime>()
+            .map(|r| std::mem::take(&mut r.pending_lists))
+            .unwrap_or_default();
+        if pending.is_empty() {
+            return;
+        }
+        let at = self.now();
+        let mut before: Option<Vec<_>> = None;
+        let mut after = Vec::new();
+        for (list, ip, timeout) in &pending {
+            let Ok(name) = list.parse::<Name>() else {
+                continue;
+            };
+            let addr = AddrMatch::Net(ipnet::IpNet::from(IpAddr::V4(*ip)));
+            if self.dynamic_addresses.find(&name, &addr).is_some() {
+                continue;
+            }
+            let entry = DynamicEntry {
+                id: self.dynamic_addresses.next_id(),
+                list: name,
+                address: addr,
+                timeout_secs: (*timeout).max(1),
+                added: Some(now.unix),
+                comment: "dhcp".into(),
+            };
+            let b = before.get_or_insert_with(|| self.dynamic_now());
+            if after.is_empty() {
+                after = b.clone();
+            }
+            after.push(entry.data_plane(at));
+        }
+        let all_ok = match &before {
+            None => true,
+            Some(b) => {
+                let running = self.store().running();
+                self.check_lockout(running, running, b, &after).is_ok()
+            }
+        };
+        for (list, ip, timeout) in pending {
+            if !self.dhcp_list_put(&list, ip, timeout, now, !all_ok)
+                && let Some(reg) = self
+                    .ext_mut::<DhcpServerRuntime>()
+                    .and_then(|r| r.registered.get_mut(&ip))
+            {
+                reg.lists.retain(|l| *l != list);
+            }
+        }
+    }
+
     /// `ip` in firewall list `list` for `timeout` seconds (a dynamic entry,
     /// refreshed when it has less than half left). False if refused.
-    fn dhcp_list_put(&mut self, list: &str, ip: Ipv4Addr, timeout: u64, now: Now) -> bool {
+    /// `check`: the lockout check for this entry alone (else the caller
+    /// checked the round's entries together).
+    fn dhcp_list_put(&mut self, list: &str, ip: Ipv4Addr, timeout: u64, now: Now, check: bool) -> bool {
         let Ok(name) = list.parse::<Name>() else {
             return false;
         };
@@ -516,18 +670,20 @@ impl Session {
         };
         // Operational state, not a commit: the lockout check is here (a
         // list that a drop rule uses could cut the operator off).
-        let before = self.dynamic_now();
-        let mut after = before.clone();
-        after.push(entry.data_plane(at));
-        let running = self.store().running().clone();
-        if let Err(e) = self.check_lockout(&running, &running, &before, &after) {
-            self.log_event(
-                &["dhcp", "warning"],
-                "dhcp-server",
-                format!("{ip} not added to address list {list}: {e}"),
-                json!({}),
-            );
-            return false;
+        if check {
+            let before = self.dynamic_now();
+            let mut after = before.clone();
+            after.push(entry.data_plane(at));
+            let running = self.store().running();
+            if let Err(e) = self.check_lockout(running, running, &before, &after) {
+                self.log_event(
+                    &["dhcp", "warning"],
+                    "dhcp-server",
+                    format!("{ip} not added to address list {list}: {e}"),
+                    json!({}),
+                );
+                return false;
+            }
         }
         if let Err(e) = self
             .hal_mut()
@@ -563,6 +719,7 @@ impl Session {
             let records = r.core.as_ref().map_or(0, |c| c.leases().len() as u64);
             r.loaded
                 && r.appended > 0
+                && (force || now.unix >= r.compact_retry_at)
                 && (force
                     || r.appended > 2 * records + 1024
                     || now.unix >= r.compacted_at + COMPACT_EVERY_SECS)
@@ -579,7 +736,10 @@ impl Session {
             rt.compacted_at = now.unix;
             match r {
                 Ok(()) => rt.appended = lines,
-                Err(e) => rt.journal_error = Some(e.to_string()),
+                Err(e) => {
+                    rt.journal_error = Some(e.to_string());
+                    rt.compact_retry_at = now.unix + COMPACT_RETRY_SECS;
+                }
             }
         }
     }
@@ -589,7 +749,9 @@ impl Session {
         let now_ms = self.ext::<DhcpServerRuntime>().map_or(0, |r| r.last_ms);
         let now = self.dhcp_now(now_ms);
         let ms = now.ms;
+        self.dns_dynamic_defer();
         self.dhcp_server_apply(now, fx.into_iter().map(|e| (e, None)).collect(), &|| ms * 1000);
+        self.dns_dynamic_flush(now.unix);
     }
 
     pub(crate) fn dhcp_server_clock(&self) -> Now {

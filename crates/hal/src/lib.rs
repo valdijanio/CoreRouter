@@ -73,6 +73,21 @@ pub struct LinkState {
     /// (another program's bridge, a container's veth, the host `lo`…).
     /// It is listed, never applied to, and commands refuse to change it.
     pub unmanaged: Option<String>,
+    /// Error and drop counters when the poll already carries them (Linux:
+    /// `IFLA_STATS64`), so `system.metrics` needs no per-link query.
+    /// `None`: ask `counters` (or the platform does not count them).
+    #[serde(skip)]
+    pub errors: Option<LinkErrors>,
+}
+
+/// The four error/drop counters `system.metrics` exports per link, named
+/// as in the platform's `interface` counter group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LinkErrors {
+    pub rx_errors: u64,
+    pub tx_errors: u64,
+    pub rx_dropped: u64,
+    pub tx_dropped: u64,
 }
 
 /// Why `ip.vrf.add` is disabled, and what a failed `vrf` link create means.
@@ -125,6 +140,10 @@ pub enum Learned {
 pub enum DynamicChange<'a> {
     Add(&'a DynamicAddress),
     Remove(&'a DynamicAddress),
+    /// Their timeout ran out: the data plane's own timer already dropped
+    /// them (the kernel set has the same timeout), so a backend only
+    /// forgets them; all of one tick in one call.
+    Expired(&'a [DynamicAddress]),
 }
 
 pub trait Hal: Send {
