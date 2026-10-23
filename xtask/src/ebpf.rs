@@ -295,7 +295,9 @@ pub fn root_test(root: &Path) -> Outcome {
             .status();
         match status {
             Ok(s) if s.success() => {}
-            Ok(s) if s.code() == Some(124) => failed.push(format!("{test}: timed out after {secs} s")),
+            Ok(s) if s.code() == Some(124) => {
+                failed.push(format!("{test}: timed out after {secs} s"))
+            }
             Ok(s) => failed.push(format!("{test}: {s}")),
             Err(e) => failed.push(format!("{test}: {e}")),
         }

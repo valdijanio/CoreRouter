@@ -461,7 +461,9 @@ echo start > /proc/net/pktgen/pgctrl
 "
     );
     // pktgen blocks until done; a stuck generator must not hold the test.
-    let ok = sh_ok(&["timeout", "60", "ip", "netns", "exec", PEER_NS, "sh", "-c", &script]);
+    let ok = sh_ok(&[
+        "timeout", "60", "ip", "netns", "exec", PEER_NS, "sh", "-c", &script,
+    ]);
     if !ok {
         println!("PERF | pktgen did not finish in 60 s");
     }
