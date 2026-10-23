@@ -28,12 +28,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Remove Address",
         [],
         None,
-        "{id: *hex} → {id}",
+        "{id: *hex, force?: bool (remove it even if it cuts this session's own connection)} → {id}",
         has_addresses,
         remove
     ),
     cmd!(query "ip.address.list", "Addresses", ["IP", "Addresses"], None,
-        "{interface?: string} → [{id, flags (X disabled, I invalid, D dynamic), address, network, interface, disabled, dynamic, comment, from_pool, origin (static | dhcp | dhcpv6 | ra | pool), valid_after, preferred_after, reason}]",
+        "{interface?: string} → [{id, flags (X disabled, I invalid, D dynamic), address, network, interface, disabled, dynamic, comment, from_pool, origin (static | dhcp | dhcpv6 | ra | pool), valid_after, preferred_after, reason, state (active | disabled | invalid | tentative | dad-failed | deprecated), family (ipv4 | ipv6), vrf, access (why this session depends on it, or null)}]",
         always, list),
 ];
 
@@ -116,15 +116,9 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let id: ItemId = req_parse(p, "id")?;
     if is_dynamic(id) {
-        return Err(EngineError::bad(
-            "id",
-            format!(
-                "{id} is dynamic (a DHCP client's lease or a Router Advertisement); release, \
-                 disable or remove the client instead (ip.dhcp-client.*, ipv6.dhcp-client.*), or \
-                 stop accepting RA (ipv6.settings.set)"
-            ),
-        ));
+        return Err(super::ip_address::dynamic_error(id));
     }
+    crate::lockout::take_force(s, p)?;
     let list = &mut s.store_mut().candidate_mut().ip.addresses;
     let before = list.len();
     list.retain(|a| a.id != id);
@@ -241,5 +235,64 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             }));
         }
     }
+    decorate(s, &mut rows);
     Ok(Value::Array(rows))
+}
+
+/// What G1.28 adds to every row: `state`, `family`, `vrf` and `access`
+/// (the flags stay for the terminal).
+fn decorate(s: &mut Session, rows: &mut [Value]) {
+    let states = s.hal_mut().address_states().unwrap_or_else(|e| {
+        log::debug!("address states: {e}");
+        Vec::new()
+    });
+    let cfg = s.effective(s.store().candidate()).into_owned();
+    let access: Vec<(ItemId, String)> = s
+        .caller()
+        .link
+        .map(|l| crate::lockout::access_addresses(&cfg, &l))
+        .unwrap_or_default();
+    for row in rows.iter_mut() {
+        let text = |k: &str| row.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+        let (address, interface, flags) = (text("address"), text("interface"), text("flags"));
+        let iface: Option<IfName> = interface.parse().ok();
+        let link = iface.as_ref().and_then(|i| cfg.interfaces.get(i));
+        let kernel = states
+            .iter()
+            .find(|k| k.interface.as_str() == interface && k.address.to_string() == address);
+        let state = if flags.contains('X') {
+            "disabled"
+        } else if flags.contains('I') || link.is_none_or(|l| l.disabled) {
+            "invalid"
+        } else if let Some(k) = kernel {
+            if k.dad_failed {
+                "dad-failed"
+            } else if k.tentative {
+                "tentative"
+            } else {
+                "deprecated"
+            }
+        } else {
+            "active"
+        };
+        let family = if address.contains(':') { "ipv6" } else { "ipv4" };
+        let vrf = iface
+            .as_ref()
+            .map(|i| corerouter_model::route::table_of(&cfg, i).to_string())
+            .unwrap_or_default();
+        let id = row.get("id").and_then(Value::as_str).and_then(|i| i.parse::<ItemId>().ok());
+        let why = id.and_then(|id| access.iter().find(|(a, _)| *a == id).map(|(_, w)| w.clone()));
+        if let Some(o) = row.as_object_mut() {
+            o.insert("state".into(), json!(state));
+            o.insert("family".into(), json!(family));
+            o.insert("vrf".into(), json!(vrf));
+            o.insert("access".into(), json!(why));
+            if let Some(k) = kernel
+                && !o.get("valid_after").is_some_and(|v| !v.is_null())
+            {
+                o.insert("valid_after".into(), json!(k.valid_secs.map(|v| duration_text(u64::from(v)))));
+                o.insert("preferred_after".into(), json!(k.preferred_secs.map(|v| duration_text(u64::from(v)))));
+            }
+        }
+    }
 }

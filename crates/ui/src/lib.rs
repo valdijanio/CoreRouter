@@ -97,10 +97,6 @@ struct Cache {
 /// Text fields of the forms (UI-local state only).
 #[derive(Default)]
 struct Forms {
-    addr_address: String,
-    addr_interface: String,
-    addr_comment: String,
-    addr_pool: String,
     bgp_name: String,
     bgp_asn: String,
     bgp_router_id: String,
@@ -196,7 +192,6 @@ pub struct Export {
 /// What to do when an action's reply arrives.
 pub(crate) enum Then {
     Nothing,
-    ClearAddressForm,
     ShowFrr,
     Dialog {
         id: u64,
@@ -575,12 +570,6 @@ impl CoreRouterUi {
     fn then(&mut self, then: Then, result: &Result<Value, String>) {
         match then {
             Then::Nothing => {}
-            Then::ClearAddressForm => {
-                if result.is_ok() {
-                    self.forms.addr_address.clear();
-                    self.forms.addr_comment.clear();
-                }
-            }
             Then::ShowFrr => {
                 if let Ok(r) = result {
                     self.forms.bgp_frr = r.get("frr").map(value_text).unwrap_or_default();

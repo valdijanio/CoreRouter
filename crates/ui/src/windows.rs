@@ -3,7 +3,7 @@
 use egui::{Grid, TextEdit};
 use serde_json::{Value, json};
 
-use crate::table::{self, Icon, Menu, Row, Shortcut, action, col, comment};
+use crate::table::action;
 use crate::{CoreRouterUi, value_text};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -161,7 +161,7 @@ impl Win {
         match self {
             Win::Interfaces => [780.0, 520.0],
             Win::Neighbors => [820.0, 320.0],
-            Win::Addresses => [760.0, 300.0],
+            Win::Addresses => [900.0, 380.0],
             Win::Routes => [1000.0, 640.0],
             Win::Panel(id) => crate::panel::find(id).map_or([380.0, 200.0], |(_, w)| w.size),
             Win::Vrf => [600.0, 260.0],
@@ -214,139 +214,12 @@ impl CoreRouterUi {
             .collect()
     }
 
+    /// IP › Addresses: the list window pattern (G0.24); the panel
+    /// `ip_address.rs` (G1.28) draws it.
     fn addresses(&mut self, ui: &mut egui::Ui) {
-        const COLUMNS: [table::Column; 7] = [
-            col(""),
-            col("#"),
-            col("Address"),
-            col("Network"),
-            col("Interface"),
-            col("Origin"),
-            comment(),
-        ];
-        let rows: Vec<Row> = self
-            .cache
-            .addresses
-            .iter()
-            .map(|r| {
-                let get = |k: &str| r.get(k).map(value_text).unwrap_or_default();
-                // Where it comes from (G4.7b): a pool (and why it waits),
-                // a DHCP lease, a Router Advertisement; static says nothing.
-                let origin = match (get("origin").as_str(), r.get("from_pool")) {
-                    ("pool", Some(Value::String(pool))) => match r.get("reason") {
-                        Some(Value::String(why)) => format!("pool {pool}: {why}"),
-                        _ => format!("pool {pool}"),
-                    },
-                    ("static", _) => String::new(),
-                    (o, _) => o.to_owned(),
-                };
-                let [flags, id, address, network, interface, comment] =
-                    ["flags", "id", "address", "network", "interface", "comment"].map(get);
-                Row {
-                    key: id.clone(),
-                    cells: vec![flags, id, address, network, interface, origin, comment],
-                    dimmed: r.get("disabled").and_then(Value::as_bool).unwrap_or(false),
-                    section: false,
-                    tint: None,
-                }
-            })
-            .collect();
-        let selection = self.tables.addresses.selection(&rows);
-        let mut remove: Option<Vec<String>> = None;
-        let mut select_all = false;
-        let can = self.can();
-        ui.horizontal(|ui| {
-            let dynamic = self.cache.addresses.iter().any(|r| {
-                r.get("dynamic").and_then(Value::as_bool).unwrap_or(false)
-                    && selection.contains(&r.get("id").map(value_text).unwrap_or_default())
-            });
-            let picked = if selection.is_empty() {
-                Err("Select one or more addresses first".to_owned())
-            } else if dynamic {
-                Err(
-                    "Dynamic addresses come from a DHCP client or a Router Advertisement: \
-                     release or disable the client (IP › DHCP Client, IPv6 › DHCPv6 Client) \
-                     or stop accepting RA (IPv6 › IPv6 Settings)"
-                        .to_owned(),
-                )
-            } else {
-                Ok(())
-            };
-            let enabled = can.and("ip.address.remove", picked);
-            if table::tool(ui, "addresses", Icon::Remove, "Remove", enabled).clicked() {
-                remove = Some(selection.to_vec());
-            }
-            table::find_field(ui, "addresses", &mut self.tables.addresses);
+        self.with_panel(crate::ip_address::NAME, |p, app| {
+            p.window(app, crate::ip_address::WIN, ui);
         });
-        ui.separator();
-        let out = table::show(
-            ui,
-            "addresses",
-            ui.spacing().interact_size.y * 2.0,
-            &mut self.tables.addresses,
-            &COLUMNS,
-            &rows,
-            |ui, menu| match menu {
-                Menu::Rows(sel) => {
-                    if action(ui, "Remove", can.check("ip.address.remove")) {
-                        remove = Some(sel.to_vec());
-                    }
-                }
-                Menu::Empty => {
-                    select_all = ui.button("Select All").clicked();
-                }
-            },
-        );
-        if out.shortcut == Some(Shortcut::Remove) {
-            remove = Some(self.tables.addresses.selection(&rows).into_vec());
-        }
-        if select_all {
-            self.tables.addresses.select_all(&rows);
-        }
-        for id in remove.unwrap_or_default() {
-            self.run("ip.address.remove", json!({ "id": id }));
-        }
-
-        ui.separator();
-        let names = self.interface_names(None);
-        let mut add = false;
-        ui.horizontal(|ui| {
-            ui.add(
-                TextEdit::singleline(&mut self.forms.addr_address)
-                    .hint_text("10.0.0.1/24")
-                    .desired_width(140.0),
-            );
-            combo(
-                ui,
-                "addr-iface",
-                "interface",
-                &mut self.forms.addr_interface,
-                &names,
-            );
-            ui.add(
-                TextEdit::singleline(&mut self.forms.addr_pool)
-                    .hint_text("from pool")
-                    .desired_width(80.0),
-            )
-            .on_hover_text("IPv6 pool of a DHCPv6 client: ::1/64 takes the delegated prefix");
-            ui.add(
-                TextEdit::singleline(&mut self.forms.addr_comment)
-                    .hint_text("comment")
-                    .desired_width(120.0),
-            );
-            add = action(ui, "Add", can.check("ip.address.add"));
-        });
-        if add {
-            let comment = &self.forms.addr_comment;
-            let pool = self.forms.addr_pool.trim();
-            let p = json!({
-                "address": self.forms.addr_address.trim(),
-                "interface": self.forms.addr_interface,
-                "comment": (!comment.is_empty()).then_some(comment),
-                "from_pool": (!pool.is_empty()).then_some(pool),
-            });
-            self.run_then("ip.address.add", p, crate::Then::ClearAddressForm);
-        }
     }
 
     fn bgp(&mut self, ui: &mut egui::Ui) {

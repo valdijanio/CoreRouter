@@ -21,6 +21,8 @@
 //! A preference of the window, not of the router: stored with the theme
 //! (`prefs.rs`).
 
+mod address_en;
+mod address_pt;
 mod dns_lookup_pt;
 mod en;
 mod list_pt;
@@ -73,6 +75,7 @@ impl Lang {
                 routes_pt::LABELS,
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
+                address_pt::LABELS,
             ],
         }
     }
@@ -80,8 +83,8 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, address_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, address_pt::HELP],
         }
     }
 

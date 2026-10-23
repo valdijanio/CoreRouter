@@ -17,10 +17,6 @@
 //! The add/edit modal is [`crate::list_modal`]. Nothing here decides what a
 //! row may do: the engine says it (`disabled`, `dynamic`, a reason).
 
-// First adopted by IP › Addresses (G1.28, the next PR); until then only
-// the tests use it. G1.28 drops this allow.
-#![allow(dead_code)]
-
 use std::collections::BTreeSet;
 
 use egui::{Sense, Ui};

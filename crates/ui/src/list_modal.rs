@@ -28,10 +28,6 @@
 //! shortly. A `risk` needs the operator's yes (or Safe Mode) before OK; the
 //! commands then go with `force: true`.
 
-// First adopted by IP › Addresses (G1.28, the next PR); until then only
-// the tests use it. G1.28 drops this allow.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use egui::{Grid, RichText, TextEdit, Ui};
@@ -177,7 +173,9 @@ impl Modal {
                 Input::Check => {
                     p.insert(f.param.into(), json!(v == "yes"));
                 }
-                _ if v.trim().is_empty() => {}
+                // A new item leaves empty fields out; an edit sends them
+                // (an emptied comment is cleared).
+                _ if v.trim().is_empty() && self.item.is_none() => {}
                 _ => {
                     p.insert(f.param.into(), json!(v.trim()));
                 }
@@ -187,6 +185,14 @@ impl Modal {
             p.insert("id".into(), json!(id));
         }
         Value::Object(p)
+    }
+
+    /// Edited since opened (or applied): an empty field equals a missing one.
+    fn dirty(&self) -> bool {
+        let filled = |m: &BTreeMap<&'static str, String>| -> Vec<(&'static str, String)> {
+            m.iter().filter(|(_, v)| !v.is_empty()).map(|(k, v)| (*k, v.clone())).collect()
+        };
+        filled(&self.values) != filled(&self.orig)
     }
 
     /// The preview answers the fields as they are now.
@@ -303,7 +309,7 @@ impl Modal {
         let head = dialog::Head {
             id: wid,
             title: &title,
-            dirty: self.values != self.orig,
+            dirty: self.dirty(),
             pos: cascade(area, self.id),
             parent: Some(crate::win_id(spec.parent)),
         };
@@ -335,6 +341,7 @@ impl Modal {
                             }
                         });
                         ui.vertical(|ui| {
+                            ui.set_max_width(320.0);
                             let v = values.entry(f.param).or_default();
                             field_input(ui, form, f, v, &options(f.param));
                             for m in field_messages(preview.as_ref(), error.as_deref(), f.param) {

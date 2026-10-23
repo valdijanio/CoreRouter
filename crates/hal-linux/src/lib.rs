@@ -761,6 +761,13 @@ mod linux {
             crate::netlink::learned(&names)
         }
 
+        fn address_states(
+            &mut self,
+        ) -> Result<Vec<corerouter_hal::address_state::AddressState>, HalError> {
+            let names = self.managed_indexes()?;
+            crate::netlink::address_states(&names)
+        }
+
         fn prober(&self) -> Result<corerouter_hal::SharedProber, String> {
             let p = self
                 .prober

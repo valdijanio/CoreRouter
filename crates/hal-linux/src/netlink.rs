@@ -269,6 +269,26 @@ pub(crate) fn learned(
     with_kernel(|k| async move { k.learned(names).await.map_err(HalError::Io) })
 }
 
+/// The addresses on the links of `names` the kernel holds in a state other
+/// than plainly usable: tentative or failed DAD, deprecated (G1.28).
+pub(crate) fn address_states(
+    names: &std::collections::BTreeMap<u32, IfName>,
+) -> Result<Vec<corerouter_hal::address_state::AddressState>, HalError> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    with_kernel(|k| async move {
+        let all = k.addresses_v6().await.map_err(HalError::Io)?;
+        Ok(all
+            .iter()
+            .filter_map(|m| {
+                let interface = names.get(&m.header.index)?.clone();
+                address_state(m, interface)
+            })
+            .collect())
+    })
+}
+
 /// Remove what [`learned`] would show on `links`, except addresses in
 /// `keep` (the config's own). Returns how many entries went.
 pub(crate) fn flush_learned(links: &[IfName], keep: &[(IfName, IpNet)]) -> Result<usize, HalError> {
@@ -407,6 +427,46 @@ fn self_made(m: &AddressMessage) -> Option<(Ipv6Net, Option<u32>, Option<u32>)> 
     }
     let net = Ipv6Net::new(addr?, m.header.prefix_len).ok()?;
     Some((net, life.0, life.1))
+}
+
+/// The state of one IPv6 address, when it is not plainly usable.
+fn address_state(
+    m: &AddressMessage,
+    interface: IfName,
+) -> Option<corerouter_hal::address_state::AddressState> {
+    let h = &m.header.flags;
+    let (mut tentative, mut dad_failed, mut deprecated) = (
+        h.contains(AddressHeaderFlags::Tentative),
+        h.contains(AddressHeaderFlags::Dadfailed),
+        h.contains(AddressHeaderFlags::Deprecated),
+    );
+    let (mut addr, mut life) = (None, (None, None));
+    for a in &m.attributes {
+        match a {
+            AddressAttribute::Address(ip) => addr = Some(*ip),
+            AddressAttribute::Flags(f) => {
+                tentative |= f.contains(AddressFlags::Tentative);
+                dad_failed |= f.contains(AddressFlags::Dadfailed);
+                deprecated |= f.contains(AddressFlags::Deprecated);
+            }
+            AddressAttribute::CacheInfo(c) => {
+                life = (infinite_or(c.ifa_valid), infinite_or(c.ifa_preferred));
+            }
+            _ => {}
+        }
+    }
+    if !(tentative || dad_failed || deprecated) {
+        return None;
+    }
+    Some(corerouter_hal::address_state::AddressState {
+        interface,
+        address: IpNet::new(addr?, m.header.prefix_len).ok()?,
+        tentative,
+        dad_failed,
+        deprecated,
+        valid_secs: life.0,
+        preferred_secs: life.1,
+    })
 }
 
 /// An RA route, as (destination, gateway, oif, metric, table, expires).

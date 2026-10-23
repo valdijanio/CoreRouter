@@ -5,6 +5,7 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod address_state;
 pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
@@ -325,6 +326,13 @@ pub trait Hal: Send {
     /// (G4.7b). Which interfaces accept RA follows the applied config
     /// (`corerouter_model::ipv6::ra_mode`).
     fn ipv6_learned(&mut self) -> Result<Vec<Learned>, HalError> {
+        Ok(Vec::new())
+    }
+
+    /// The kernel's states of the managed addresses that are not plainly
+    /// usable (G1.28): tentative or failed IPv6 DAD, deprecated. Default:
+    /// nothing to report (the virtual lab runs no DAD).
+    fn address_states(&mut self) -> Result<Vec<address_state::AddressState>, HalError> {
         Ok(Vec::new())
     }
 

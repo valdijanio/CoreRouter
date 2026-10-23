@@ -91,6 +91,14 @@ fn ingress_interface(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String
     if local.is_loopback() {
         return holder;
     }
+    way_back(cfg, peer, local).or(holder)
+}
+
+/// The interface routing points at for `peer` (the way back to the
+/// caller), in the table of the interface that holds `local`; `None` when
+/// no connected network nor active route reaches it.
+fn way_back(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String> {
+    let holder = local_interface(cfg, local);
     let table = holder
         .as_deref()
         .and_then(|h| h.parse::<IfName>().ok())
@@ -124,7 +132,37 @@ fn ingress_interface(cfg: &Config, peer: IpAddr, local: IpAddr) -> Option<String
         }
     }
     best.map(|(_, _, link)| link.as_str().to_owned())
-        .or(holder)
+}
+
+/// The addresses of `cfg` this connection depends on (G1.28), with why:
+/// the one it connects to, and the connected network it arrives through.
+/// Taking one of them away (remove, disable, move) is refused without
+/// `force` or Safe Mode. Only these few are checked, so a long list costs
+/// one pass.
+pub fn access_addresses(cfg: &Config, link: &Link) -> Vec<(corerouter_model::ItemId, String)> {
+    let (peer, local) = (plain(link.peer.ip()), plain(link.local.ip()));
+    if local.is_loopback() {
+        return Vec::new();
+    }
+    let via = way_back(cfg, peer, local);
+    cfg.ip
+        .addresses
+        .iter()
+        .filter(|a| !a.disabled)
+        .filter_map(|a| {
+            let why = if a.address.addr() == local {
+                format!("this session (tcp {} -> {}) connects to this address", link.peer, link.local)
+            } else if a.address.contains(&peer) && via.as_deref() == Some(a.interface.as_str()) {
+                format!(
+                    "this session (tcp {} -> {}) arrives through this network on {}",
+                    link.peer, link.local, a.interface
+                )
+            } else {
+                return None;
+            };
+            Some((a.id, why))
+        })
+        .collect()
 }
 
 fn probes(cfg: &Config, link: &Link) -> Vec<Probe> {
@@ -209,9 +247,24 @@ impl Session {
         if self.lockout_ack || self.in_safe_mode() {
             return Ok(());
         }
-        let Some(link) = self.caller().link else {
-            return Ok(());
-        };
+        match self.lockout_reason(before, after, dyn_before, dyn_after) {
+            Some(why) => Err(EngineError::Lockout(why)),
+            None => Ok(()),
+        }
+    }
+
+    /// Why going from `before` to `after` would cut the caller's
+    /// connection, whatever `force` and Safe Mode say (a preview asks
+    /// before the change is sent, G1.28). `None`: it would not, or the
+    /// caller has no connection.
+    pub(crate) fn lockout_reason(
+        &self,
+        before: &Config,
+        after: &Config,
+        dyn_before: &[DynamicAddress],
+        dyn_after: &[DynamicAddress],
+    ) -> Option<String> {
+        let link = self.caller().link?;
         let local = plain(link.local.ip());
         let (iface_before, iface_after) =
             (local_interface(before, local), local_interface(after, local));
@@ -235,20 +288,31 @@ impl Session {
                 Some(_) => None,
             };
             if let Some(what) = lost {
-                return Err(EngineError::Lockout(format!(
+                return Some(format!(
                     "{what} this connection uses (tcp {} -> {} on {was_on}). {}",
-                    link.peer,
-                    link.local,
-                    HOW_TO_PROCEED
-                )));
+                    link.peer, link.local, HOW_TO_PROCEED
+                ));
             }
+        }
+        // The way back goes: the connected network (or route) the caller's
+        // packets arrive through, removed or disabled (G1.28).
+        let peer = plain(link.peer.ip());
+        if !local.is_loopback()
+            && let Some(was) = way_back(before, peer, local)
+            && way_back(after, peer, local).is_none()
+        {
+            return Some(format!(
+                "would remove the way back to {peer} (the network or route on {was}) this \
+                 connection uses (tcp {} -> {}). {HOW_TO_PROCEED}",
+                link.peer, link.local
+            ));
         }
         let same = before.ip.firewall == after.ip.firewall
             && before.interface_lists == after.interface_lists
             && dyn_before == dyn_after
             && iface_before == iface_after;
         if same {
-            return Ok(());
+            return None;
         }
         let was_probes = probes(before, &link);
         for (probe, old) in probes(after, &link).into_iter().zip(was_probes) {
@@ -274,12 +338,12 @@ impl Session {
                 .as_deref()
                 .map(|i| format!(" on {i}"))
                 .unwrap_or_default();
-            return Err(EngineError::Lockout(format!(
+            return Some(format!(
                 "{by} {} (tcp {} -> {}{via}). {HOW_TO_PROCEED}",
                 probe.what, link.peer, link.local
-            )));
+            ));
         }
-        Ok(())
+        None
     }
 }
 
