@@ -11,9 +11,10 @@
 //!   falls back to the other chosen one and then to English.
 //!
 //! Catalogs: one file per language (`en.rs`, `pt.rs`), and a feature with
-//! many texts gets its own pair (`tuning_en.rs`, `tuning_pt.rs`), so
-//! parallel features do not edit the same list. Each table is sorted by
-//! key: a lookup is a binary search per table.
+//! many texts gets its own pair (`tuning_en.rs`, `tuning_pt.rs`). **New
+//! windows put theirs in `auto/`** (`<scope>_<lang>.rs`, registered by
+//! `build.rs`, labels looked up by scope with [`tr_in`]), editing no list
+//! here. Each table is sorted by key: a lookup is a binary search per table.
 //! - [`template`]: the GUI's own wording of a text the engine sends in
 //!   English with arguments (`why.<id>`: why a value is recommended),
 //!   `{name}` places filled by [`fill`].
@@ -122,6 +123,53 @@ impl Default for Langs {
 /// A catalog: (key, text), sorted by key.
 type Table = &'static [(&'static str, &'static str)];
 
+/// The catalogs of `i18n/auto/` (`<scope>_<lang>.rs`), registered by
+/// `build.rs`: a window adds its own files and edits no list here. Its labels
+/// are looked up with [`tr_in`] and its scope first, so two windows can give
+/// the same English word different translations ("Last": "Última" in one,
+/// "Últimos" in another).
+mod auto {
+    include!(concat!(env!("OUT_DIR"), "/i18n_auto.rs"));
+}
+
+impl Lang {
+    fn auto(self, kind: Kind) -> &'static [(&'static str, Table)] {
+        match (self, kind) {
+            (Lang::En, Kind::Labels) => auto::EN_LABELS,
+            (Lang::En, Kind::Help) => auto::EN_HELP,
+            (Lang::En, Kind::Templates) => auto::EN_TEMPLATES,
+            (Lang::Pt, Kind::Labels) => auto::PT_LABELS,
+            (Lang::Pt, Kind::Help) => auto::PT_HELP,
+            (Lang::Pt, Kind::Templates) => auto::PT_TEMPLATES,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum Kind {
+    Labels,
+    Help,
+    Templates,
+}
+
+/// `key` in the auto catalogs: `scope`'s table first, then any.
+fn lookup_auto(
+    tables: &'static [(&'static str, Table)],
+    scope: Option<&str>,
+    key: &str,
+) -> Option<&'static str> {
+    let find = |table: &Table| {
+        table
+            .binary_search_by(|(k, _)| (*k).cmp(key))
+            .ok()
+            .and_then(|i| table.get(i))
+            .map(|(_, text)| *text)
+    };
+    scope
+        .and_then(|s| tables.iter().filter(|(t, _)| *t == s).find_map(|(_, t)| find(t)))
+        .or_else(|| tables.iter().find_map(|(_, t)| find(t)))
+}
+
 fn lookup(tables: &'static [Table], key: &str) -> Option<&'static str> {
     tables.iter().find_map(|table| {
         table
@@ -134,7 +182,21 @@ fn lookup(tables: &'static [Table], key: &str) -> Option<&'static str> {
 
 /// Label `en` in `lang`; English when there is no translation.
 pub fn tr(lang: Lang, en: &'static str) -> &'static str {
-    lookup(lang.labels(), en).unwrap_or(en)
+    lookup(lang.labels(), en)
+        .or_else(|| lookup_auto(lang.auto(Kind::Labels), None, en))
+        .unwrap_or(en)
+}
+
+/// Label `en` in `lang` as window `scope` says it: its own catalog
+/// (`i18n/auto/<scope>_<lang>.rs`) first, then the shared ones ([`tr`]).
+// The windows that move to `i18n/auto/` call it; none does yet.
+#[allow(dead_code)]
+pub fn tr_in(scope: &str, lang: Lang, en: &'static str) -> &'static str {
+    lang.auto(Kind::Labels)
+        .iter()
+        .filter(|(s, _)| *s == scope)
+        .find_map(|(_, t)| lookup(std::slice::from_ref(t), en))
+        .unwrap_or_else(|| tr(lang, en))
 }
 
 /// The explanation `key`: in `langs.help`, else `langs.labels`, else
@@ -142,13 +204,19 @@ pub fn tr(lang: Lang, en: &'static str) -> &'static str {
 pub fn explain(langs: Langs, key: &str) -> Option<(Lang, &'static str)> {
     [langs.help, langs.labels, Lang::En]
         .into_iter()
-        .find_map(|l| lookup(l.help(), key).map(|text| (l, text)))
+        .find_map(|l| {
+            lookup(l.help(), key)
+                .or_else(|| lookup_auto(l.auto(Kind::Help), None, key))
+                .map(|text| (l, text))
+        })
 }
 
 /// The engine's English text `english` (template `key`, arguments
 /// `args`) in `lang`: the catalog's template filled, else `english`.
 pub fn template(lang: Lang, key: &str, args: &[(&str, &str)], english: &str) -> String {
-    lookup(lang.templates(), key).map_or_else(|| english.to_owned(), |t| fill(t, args))
+    lookup(lang.templates(), key)
+        .or_else(|| lookup_auto(lang.auto(Kind::Templates), None, key))
+        .map_or_else(|| english.to_owned(), |t| fill(t, args))
 }
 
 /// Put `args` into the `{name}` places of `template`.
@@ -337,5 +405,33 @@ mod tests {
                 "pt.rs translates {en:?}, which no code asks for"
             );
         }
+    }
+
+    /// `i18n/auto/` catalogs: each sorted and without repeats, and every
+    /// explanation of a scope in both languages. Across scopes a word may
+    /// differ (that is what scopes are for).
+    #[test]
+    fn auto_catalogs_are_sorted_and_explanations_paired() {
+        for l in Lang::ALL {
+            for kind in [Kind::Labels, Kind::Help, Kind::Templates] {
+                for (scope, t) in l.auto(kind) {
+                    sorted_unique(&format!("{l:?} {kind:?} {scope}"), t);
+                }
+            }
+        }
+        let help_keys = |l: Lang| {
+            let mut k: Vec<(&str, &str)> = l
+                .auto(Kind::Help)
+                .iter()
+                .flat_map(|(s, t)| t.iter().map(move |(k, _)| (*s, *k)))
+                .collect();
+            k.sort_unstable();
+            k
+        };
+        assert_eq!(
+            help_keys(Lang::En),
+            help_keys(Lang::Pt),
+            "every auto explanation key in English and in Portuguese"
+        );
     }
 }
