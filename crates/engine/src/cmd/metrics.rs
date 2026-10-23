@@ -4,9 +4,13 @@
 //!
 //! Interfaces are the config's plus the platform's links outside it
 //! (unmanaged ones included: their traffic is still the router's). Error
-//! and drop counters come from the platform's `interface` counter group
+//! and drop counters are those of the platform's `interface` counter group
 //! (`interface.stats`); a platform that has none reports `null`, never a
-//! made-up zero.
+//! made-up zero. They ride on the poll itself (`LinkState::errors`, Linux
+//! `IFLA_STATS64`): asking `counters` per link meant a netlink and an
+//! ethtool round trip per interface under the session lock, per scrape.
+
+use std::collections::BTreeMap;
 
 use corerouter_hal::LinkState;
 use corerouter_model::IfName;
@@ -20,19 +24,16 @@ pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "system.metrics", "Metr
     "{} → {revision, mode (immediate | transactional), safe_mode, engine: {changes_ok, changes_failed, queries_ok, queries_failed, unknown, commits_ok, commits_failed}, interfaces: [{name, type, managed, disabled, running, rx_bytes, tx_bytes, rx_packets, tx_packets, rx_errors, tx_errors, rx_dropped, tx_dropped, link_downs}], services: [{name, state, up, restarts}], dhcp_server (null until a DHCP server ran; else as ip.dhcp-server.statistics.print)}",
     always, metrics)];
 
-/// Error and drop counters of the platform's `interface` group, by the
-/// names `interface.stats` shows.
-const ERROR_COUNTERS: [&str; 4] = ["rx_errors", "tx_errors", "rx_dropped", "tx_dropped"];
-
 fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
     let live = s.hal_mut().poll();
     s.watch_links(&live);
+    let by_name: BTreeMap<&IfName, &LinkState> = live.iter().map(|l| (&l.name, l)).collect();
     let mut names: Vec<(IfName, Option<&LinkState>)> = s
         .store()
         .candidate()
         .interfaces
         .keys()
-        .map(|n| (n.clone(), live.iter().find(|l| &l.name == n)))
+        .map(|n| (n.clone(), by_name.get(n).copied()))
         .collect();
     names.extend(
         live.iter()
@@ -41,10 +42,7 @@ fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
     );
     let mut rows = Vec::with_capacity(names.len());
     for (name, st) in names {
-        let [rx_errors, tx_errors, rx_dropped, tx_dropped] = match st {
-            Some(_) => interface_errors(s, &name),
-            None => [None; 4],
-        };
+        let errors = st.and_then(|l| l.errors);
         let cfg = s.store().candidate().interfaces.get(&name);
         let kind = cfg.map_or_else(
             || st.map_or("", |l| l.kind.as_str()).to_owned(),
@@ -60,10 +58,10 @@ fn metrics(s: &mut Session, _: &Value) -> Result<Value> {
             "tx_bytes": st.map(|l| l.tx_bytes),
             "rx_packets": st.map(|l| l.rx_packets),
             "tx_packets": st.map(|l| l.tx_packets),
-            "rx_errors": rx_errors,
-            "tx_errors": tx_errors,
-            "rx_dropped": rx_dropped,
-            "tx_dropped": tx_dropped,
+            "rx_errors": errors.map(|e| e.rx_errors),
+            "tx_errors": errors.map(|e| e.tx_errors),
+            "rx_dropped": errors.map(|e| e.rx_dropped),
+            "tx_dropped": errors.map(|e| e.tx_dropped),
             "link_downs": s.links.get(&name).map(|t| t.downs),
         }));
     }
@@ -96,16 +94,4 @@ fn services(s: &Session) -> Vec<Value> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// `[rx_errors, tx_errors, rx_dropped, tx_dropped]`, `None` where the
-/// platform does not count it.
-fn interface_errors(s: &mut Session, name: &IfName) -> [Option<u64>; 4] {
-    let Ok(c) = s.hal_mut().counters(name) else {
-        return [None; 4];
-    };
-    let group = c.groups.iter().find(|g| g.name == "interface");
-    ERROR_COUNTERS.map(|key| {
-        group.and_then(|g| g.counters.iter().find(|x| x.name == key).map(|x| x.value))
-    })
 }

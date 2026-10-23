@@ -60,9 +60,18 @@ const ORIGIN_ICMP: u8 = 2;
 const ORIGIN_ICMP6: u8 = 3;
 /// Default TTL / hop limit when a probe names none.
 const DEFAULT_TTL: u8 = 64;
-/// Probes remembered for RTT and matching (older ones are forgotten).
+/// Past this many remembered probes, those older than [`SENT_TTL`] are
+/// forgotten (at most once per [`SENT_SWEEP`]). The table is keyed by the
+/// `u16` sequence, so it never holds more than 65 536 entries; probes still
+/// in flight are never dropped.
 const MAX_SENT: usize = 8192;
 const SENT_TTL: Duration = Duration::from_secs(120);
+const SENT_SWEEP: Duration = Duration::from_secs(1);
+/// Smallest MTU an ICMP "too big" may claim (RFC 791: 68; RFC 8200 §5:
+/// 1280). A smaller one is forged or broken: the probe still failed, but
+/// the number is not reported.
+const MIN_MTU_V4: u16 = 68;
+const MIN_MTU_V6: u16 = 1280;
 /// Control messages (TTL, hop limit, extended error + offender) fit easily.
 const CMSG_BUF: usize = 512;
 /// Receive buffer: the largest IPv4 packet.
@@ -159,7 +168,7 @@ impl Prober for HostProber {
             prefer: self.v4,
             v4: None,
             v6: None,
-            sent: HashMap::new(),
+            sent: SentTable::default(),
             buf: vec![0u8; BUF],
         }))
     }
@@ -180,19 +189,85 @@ struct Sent {
     dst: IpAddr,
 }
 
+/// Probes sent, by sequence number, for RTT and matching.
+#[derive(Default)]
+struct SentTable {
+    map: HashMap<u16, Sent>,
+    swept: Option<Instant>,
+}
+
+impl SentTable {
+    fn insert(&mut self, seq: u16, sent: Sent) {
+        self.forget_old(sent.at);
+        self.map.insert(seq, sent);
+    }
+
+    fn get(&self, seq: u16) -> Option<&Sent> {
+        self.map.get(&seq)
+    }
+
+    /// Turn a parsed message into a reply to one of our probes.
+    fn matched(&self, p: Parsed, from: IpAddr) -> Option<Reply> {
+        let sent = self.get(p.seq)?;
+        // An echo reply must come from where the probe went; an ICMP error
+        // must quote a probe that went there (any router on the path may
+        // send it, so its source proves nothing: an off-path host that
+        // guessed ident and seq could otherwise fake an MTU or a dead end).
+        let ours = match p.kind {
+            ReplyKind::Echo => from == sent.dst,
+            _ => p.quoted_dst == Some(sent.dst),
+        };
+        if !ours {
+            return None;
+        }
+        Some(Reply {
+            seq: p.seq,
+            from,
+            kind: p.kind,
+            size: p.size,
+            ttl: p.ttl,
+            rtt: sent.at.elapsed(),
+            mpls: p.mpls,
+        })
+    }
+
+    /// Forget probes older than [`SENT_TTL`] once the table is large. It
+    /// used to clear everything when all were young (more than ~68 probes/s
+    /// sustained), turning the replies in flight into false timeouts.
+    fn forget_old(&mut self, now: Instant) {
+        if self.map.len() < MAX_SENT
+            || self
+                .swept
+                .is_some_and(|t| now.saturating_duration_since(t) < SENT_SWEEP)
+        {
+            return;
+        }
+        self.swept = Some(now);
+        self.map
+            .retain(|_, s| now.saturating_duration_since(s.at) < SENT_TTL);
+    }
+}
+
 struct HostSocket {
     options: SocketOptions,
     prefer: Kind,
     v4: Option<Result<Side, ProbeError>>,
     v6: Option<Result<Side, ProbeError>>,
-    sent: HashMap<u16, Sent>,
+    sent: SentTable,
     buf: Vec<u8>,
 }
 
+/// Echo identifier of a new raw socket: unpredictable (std's per-process
+/// random hash keys), so an off-path host cannot guess which ICMP errors to
+/// forge; distinct per socket through the counter.
 fn next_ident() -> u16 {
+    use std::hash::BuildHasher;
     static NEXT: AtomicU16 = AtomicU16::new(0);
-    let pid = std::process::id() as u16;
-    pid.wrapping_add(NEXT.fetch_add(0x9e37, Ordering::Relaxed))
+    static KEYS: std::sync::OnceLock<std::collections::hash_map::RandomState> =
+        std::sync::OnceLock::new();
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    KEYS.get_or_init(Default::default)
+        .hash_one((std::process::id(), n)) as u16
 }
 
 fn nix_io(e: Errno) -> io::Error {
@@ -359,27 +434,33 @@ pub struct Parsed {
     pub ttl: Option<u8>,
     /// RFC 4950 labels of an ICMP error (raw sockets only).
     pub mpls: Vec<MplsLabel>,
+    /// Where the probe an ICMP error is about was going (the quoted IP
+    /// header; a ping socket's error queue gives it too). `None` for an
+    /// echo reply.
+    pub quoted_dst: Option<IpAddr>,
 }
 
-/// The echo header quoted inside an ICMP error: `(ident, seq)`.
-fn quoted_v4(inner: &[u8]) -> Option<(u16, u16)> {
+/// The echo quoted inside an ICMP error: `(ident, seq, destination)`.
+fn quoted_v4(inner: &[u8]) -> Option<(u16, u16, IpAddr)> {
     let ihl = usize::from(*inner.first()? & 0x0f) * 4;
-    if *inner.get(9)? != IPPROTO_ICMP {
+    if ihl < 20 || *inner.get(9)? != IPPROTO_ICMP {
         return None;
     }
+    let dst: [u8; 4] = inner.get(16..20)?.try_into().ok()?;
     let echo = inner.get(ihl..)?;
     (*echo.first()? == ICMP_ECHO).then_some(())?;
-    Some((be16(echo, 4)?, be16(echo, 6)?))
+    Some((be16(echo, 4)?, be16(echo, 6)?, IpAddr::from(dst)))
 }
 
-fn quoted_v6(inner: &[u8]) -> Option<(u16, u16)> {
+fn quoted_v6(inner: &[u8]) -> Option<(u16, u16, IpAddr)> {
     // No extension headers: our probes carry none.
     if *inner.get(6)? != IPPROTO_ICMPV6 {
         return None;
     }
+    let dst: [u8; 16] = inner.get(24..40)?.try_into().ok()?;
     let echo = inner.get(40..)?;
     (*echo.first()? == ICMP6_ECHO).then_some(())?;
-    Some((be16(echo, 4)?, be16(echo, 6)?))
+    Some((be16(echo, 4)?, be16(echo, 6)?, IpAddr::from(dst)))
 }
 
 /// A raw IPv4 packet (IP header included).
@@ -392,24 +473,25 @@ pub fn parse_raw_v4(pkt: &[u8]) -> Option<Parsed> {
     let total = be16(pkt, 2)?;
     let icmp = pkt.get(ihl..)?;
     let (ty, code) = (*icmp.first()?, *icmp.get(1)?);
-    let (ident, seq, kind) = match ty {
-        ICMP_ECHO_REPLY => (be16(icmp, 4)?, be16(icmp, 6)?, ReplyKind::Echo),
+    let (ident, seq, kind, quoted_dst) = match ty {
+        ICMP_ECHO_REPLY => (be16(icmp, 4)?, be16(icmp, 6)?, ReplyKind::Echo, None),
         ICMP_TIME_EXCEEDED | ICMP_UNREACH => {
-            let (ident, seq) = quoted_v4(icmp.get(8..)?)?;
+            let (ident, seq, dst) = quoted_v4(icmp.get(8..)?)?;
             let kind = match (ty, code) {
                 (ICMP_TIME_EXCEEDED, _) => ReplyKind::TtlExceeded,
                 (_, ICMP_FRAG_NEEDED) => ReplyKind::TooBig {
-                    mtu: be16(icmp, 6).filter(|m| *m > 0),
+                    mtu: be16(icmp, 6).filter(|m| *m >= MIN_MTU_V4),
                 },
                 _ => ReplyKind::Unreachable(unreach_v4(code)),
             };
-            (ident, seq, kind)
+            (ident, seq, kind, Some(dst))
         }
         _ => return None,
     };
     Some(Parsed {
         seq,
         ident,
+        quoted_dst,
         mpls: icmp_ext::mpls_labels(icmp, false),
         kind,
         size: Some(total),
@@ -420,24 +502,27 @@ pub fn parse_raw_v4(pkt: &[u8]) -> Option<Parsed> {
 /// A raw ICMPv6 message (the kernel strips the IPv6 header).
 pub fn parse_raw_v6(icmp: &[u8], hop_limit: Option<u8>) -> Option<Parsed> {
     let (ty, code) = (*icmp.first()?, *icmp.get(1)?);
-    let (ident, seq, kind) = match ty {
-        ICMP6_ECHO_REPLY => (be16(icmp, 4)?, be16(icmp, 6)?, ReplyKind::Echo),
+    let (ident, seq, kind, quoted_dst) = match ty {
+        ICMP6_ECHO_REPLY => (be16(icmp, 4)?, be16(icmp, 6)?, ReplyKind::Echo, None),
         ICMP6_TIME_EXCEEDED | ICMP6_UNREACH | ICMP6_TOO_BIG => {
-            let (ident, seq) = quoted_v6(icmp.get(8..)?)?;
+            let (ident, seq, dst) = quoted_v6(icmp.get(8..)?)?;
             let kind = match ty {
                 ICMP6_TIME_EXCEEDED => ReplyKind::TtlExceeded,
                 ICMP6_TOO_BIG => ReplyKind::TooBig {
-                    mtu: be32(icmp, 4).map(|m| u16::try_from(m).unwrap_or(u16::MAX)),
+                    mtu: be32(icmp, 4)
+                        .map(|m| u16::try_from(m).unwrap_or(u16::MAX))
+                        .filter(|m| *m >= MIN_MTU_V6),
                 },
                 _ => ReplyKind::Unreachable(unreach_v6(code)),
             };
-            (ident, seq, kind)
+            (ident, seq, kind, Some(dst))
         }
         _ => return None,
     };
     Some(Parsed {
         seq,
         ident,
+        quoted_dst,
         mpls: icmp_ext::mpls_labels(icmp, true),
         kind,
         size: u16::try_from(icmp.len() + 40).ok(),
@@ -548,6 +633,7 @@ impl Side {
                             size: u16::try_from(n + usize::from(overhead(from)) - 8).ok(),
                             ttl,
                             mpls: Vec::new(),
+                            quoted_dst: None,
                         })
                     })
                     .flatten()
@@ -608,6 +694,8 @@ impl Side {
                 // The error queue holds our probe, not the router's
                 // message: its ICMP extensions are not visible here.
                 mpls: Vec::new(),
+                // ip(7) IP_RECVERR: msg_name is the original destination.
+                quoted_dst: dst,
             },
             from,
         ))
@@ -624,68 +712,60 @@ impl HostSocket {
         opened.as_mut().map_err(|e| e.clone())
     }
 
-    fn forget_old(&mut self) {
-        if self.sent.len() < MAX_SENT {
-            return;
-        }
-        let now = Instant::now();
-        self.sent.retain(|_, s| now.duration_since(s.at) < SENT_TTL);
-        if self.sent.len() >= MAX_SENT {
-            self.sent.clear();
-        }
-    }
-
-    /// Turn a parsed message into a reply to one of our probes.
-    fn matched(&self, p: Parsed, from: IpAddr) -> Option<Reply> {
-        let sent = self.sent.get(&p.seq)?;
-        // An echo reply must come from where the probe went.
-        if p.kind == ReplyKind::Echo && from != sent.dst {
-            return None;
-        }
-        Some(Reply {
-            seq: p.seq,
-            from,
-            kind: p.kind,
-            size: p.size,
-            ttl: p.ttl,
-            rtt: sent.at.elapsed(),
-            mpls: p.mpls,
-        })
-    }
-
-    /// Everything readable now, first match wins.
+    /// Everything readable now, first match wins; at most
+    /// [`DRAIN_BUDGET`] messages, so a flood of unrelated ICMP (a raw
+    /// socket sees all of the host's) cannot keep `recv` from returning at
+    /// its deadline and the tool from seeing a stop.
     fn drain(&mut self) -> Result<Option<Reply>, ProbeError> {
         let io = |e: io::Error| ProbeError::Io(e.to_string());
+        let mut budget = DRAIN_BUDGET;
         for family in [Family::V4, Family::V6] {
-            loop {
-                let slot = match family {
-                    Family::V4 => &self.v4,
-                    Family::V6 => &self.v6,
-                };
-                let Some(Ok(side)) = slot else { break };
-                let mut got = side.read_error(&mut self.buf).map_err(io)?;
-                if matches!(got, Got::Empty) {
-                    got = side.read(&mut self.buf).map_err(io)?;
-                }
-                match got {
-                    Got::Empty => break,
-                    Got::Skip => {}
-                    Got::Msg(p, from) => {
-                        if let Some(r) = self.matched(p, from) {
-                            return Ok(Some(r));
-                        }
-                    }
-                }
+            let slot = match family {
+                Family::V4 => &self.v4,
+                Family::V6 => &self.v6,
+            };
+            let Some(Ok(side)) = slot else { continue };
+            let buf = &mut self.buf;
+            let read = || match side.read_error(buf)? {
+                Got::Empty => side.read(buf),
+                got => Ok(got),
+            };
+            if let Some(r) = first_match(read, &self.sent, &mut budget).map_err(io)? {
+                return Ok(Some(r));
             }
         }
         Ok(None)
     }
 }
 
+/// Messages one `drain` reads at most, over both families.
+const DRAIN_BUDGET: usize = 256;
+
+/// Read with `read` until a message matches one of `sent`, nothing is left,
+/// or `budget` messages were read.
+fn first_match(
+    mut read: impl FnMut() -> io::Result<Got>,
+    sent: &SentTable,
+    budget: &mut usize,
+) -> io::Result<Option<Reply>> {
+    while *budget > 0 {
+        *budget -= 1;
+        match read()? {
+            Got::Empty => break,
+            Got::Skip => {}
+            Got::Msg(p, from) => {
+                if let Some(r) = sent.matched(p, from) {
+                    return Ok(Some(r));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 impl ProbeSocket for HostSocket {
     fn send(&mut self, probe: &Probe) -> Result<(), ProbeError> {
         let family = Family::of(probe.dst);
-        self.forget_old();
         let side = self.side(family)?;
         let ttl = probe.ttl.unwrap_or(DEFAULT_TTL);
         if side.ttl != Some(ttl) {
@@ -844,5 +924,90 @@ mod tests {
             ReplyKind::Unreachable("address unreachable".into())
         );
         assert!(parse_raw_v6(&[ICMP6_ECHO, 0, 0], None).is_none());
+    }
+
+    /// audit-services #3: past 8192 probes younger than two minutes (any
+    /// rate above ~68/s) the table was cleared, in-flight probes included,
+    /// and their replies became false timeouts.
+    #[test]
+    fn a_full_sent_table_keeps_probes_in_flight() {
+        let mut t = SentTable::default();
+        let now = Instant::now();
+        let dst: IpAddr = "198.51.100.1".parse().unwrap();
+        for seq in 0..9000u16 {
+            t.insert(seq, Sent { at: now, dst });
+        }
+        for seq in 8900..9000u16 {
+            assert!(t.get(seq).is_some(), "seq {seq} forgotten");
+        }
+        // Old ones do go, once the table is large.
+        let mut t = SentTable::default();
+        let old = now.checked_sub(SENT_TTL + Duration::from_secs(1)).unwrap();
+        for seq in 0..MAX_SENT as u16 {
+            t.insert(seq, Sent { at: old, dst });
+        }
+        t.insert(60_000, Sent { at: now, dst });
+        assert!(t.get(0).is_none());
+        assert!(t.get(60_000).is_some());
+    }
+
+    /// audit-services #6: an ICMP error was matched on ident and seq only.
+    #[test]
+    fn an_icmp_error_must_quote_the_probe_destination() {
+        let mut t = SentTable::default();
+        let dst: IpAddr = "198.51.100.1".parse().unwrap();
+        t.insert(
+            4,
+            Sent {
+                at: Instant::now(),
+                dst,
+            },
+        );
+        let quote = |inner_dst: [u8; 4]| {
+            let mut q = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0));
+            q[16..20].copy_from_slice(&inner_dst);
+            let mut te = vec![ICMP_TIME_EXCEEDED, 0, 0, 0, 0, 0, 0, 0];
+            te.extend_from_slice(&q);
+            parse_raw_v4(&ipv4(1, 255, &te)).unwrap()
+        };
+        let router: IpAddr = "203.0.113.7".parse().unwrap();
+        let forged = quote([192, 0, 2, 99]);
+        assert_eq!(forged.quoted_dst, Some("192.0.2.99".parse().unwrap()));
+        assert!(t.matched(forged, router).is_none());
+        let real = t.matched(quote([198, 51, 100, 1]), router).unwrap();
+        assert_eq!((real.seq, real.from), (4, router));
+        // A "too big" below the IPv4 minimum keeps no number.
+        let mut q = ipv4(1, 1, &echo_request(Family::V4, 0x55, 4, 0));
+        q[16..20].copy_from_slice(&[198, 51, 100, 1]);
+        let mut fragn = vec![ICMP_UNREACH, ICMP_FRAG_NEEDED, 0, 0, 0, 0, 0, 20];
+        fragn.extend_from_slice(&q);
+        let p = parse_raw_v4(&ipv4(1, 255, &fragn)).unwrap();
+        assert_eq!(p.kind, ReplyKind::TooBig { mtu: None });
+    }
+
+    /// audit-services #10: under an ICMP flood `drain` never returned.
+    #[test]
+    fn draining_stops_after_its_budget() {
+        let t = SentTable::default();
+        let mut reads = 0usize;
+        let mut budget = DRAIN_BUDGET;
+        let r = first_match(
+            || {
+                reads += 1;
+                Ok(Got::Skip)
+            },
+            &t,
+            &mut budget,
+        )
+        .unwrap();
+        assert!(r.is_none());
+        assert_eq!(reads, DRAIN_BUDGET);
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn idents_differ_between_sockets() {
+        let a: std::collections::BTreeSet<u16> = (0..64).map(|_| next_ident()).collect();
+        assert!(a.len() > 50, "{a:?}");
     }
 }

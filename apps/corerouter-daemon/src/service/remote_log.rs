@@ -11,6 +11,8 @@
 use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -32,8 +34,35 @@ pub fn spawn(session: Shared) -> std::io::Result<()> {
     let health = super::Health::new(corerouter_control::Shutdown::default());
     thread::Builder::new()
         .name("remote-log".into())
-        .spawn(move || run(&session, &health))
+        .spawn(move || run(&session, &health, &Resume::default()))
         .map(|_| ())
+}
+
+/// Where the next run of the service starts reading the log: the first
+/// run from now (the boot's history is not replayed), a restart from where
+/// the last run stopped, so what was logged while it was down (other
+/// services' "failed" lines among them) is still sent. The log keeps a
+/// bounded window (`MAX_RECENT`), so this never replays without bound.
+#[derive(Debug)]
+struct Resume(AtomicU64);
+
+impl Default for Resume {
+    fn default() -> Self {
+        Self(AtomicU64::new(u64::MAX))
+    }
+}
+
+impl Resume {
+    fn start(&self, now: u64) -> u64 {
+        match self.0.load(Ordering::Relaxed) {
+            u64::MAX => now,
+            seq => seq.min(now),
+        }
+    }
+
+    fn save(&self, seq: u64) {
+        self.0.store(seq, Ordering::Relaxed);
+    }
 }
 
 fn now_micros() -> i64 {
@@ -43,8 +72,9 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-fn run(session: &Shared, health: &super::Health) {
-    let mut last_seq = lock(session).log_seq();
+fn run(session: &Shared, health: &super::Health, resume: &Resume) {
+    let mut last_seq = resume.start(lock(session).log_seq());
+    resume.save(last_seq);
     let pid = std::process::id().to_string();
     let mut sender = Sender::default();
     while health.sleep(TICK) {
@@ -68,6 +98,8 @@ fn run(session: &Shared, health: &super::Health) {
                 }
             }
         }
+        resume.save(last_seq);
+        sender.forget_removed(&logging);
         let remote = logging
             .rules
             .iter()
@@ -125,6 +157,12 @@ struct Sender {
 }
 
 impl Sender {
+    /// Errors of actions that no longer exist (deleted or renamed: the
+    /// operator's fix) stop being reported.
+    fn forget_removed(&mut self, logging: &corerouter_model::logging::Logging) {
+        self.errors.retain(|name, _| logging.action(name).is_some());
+    }
+
     fn send(&mut self, action: &LogAction, bytes: &[u8]) {
         let to = SocketAddr::new(action.remote, action.remote_port);
         let result = self.socket(action).and_then(|s| s.send_to(bytes, to));
@@ -170,8 +208,9 @@ pub(crate) const SERVICE: super::Service = super::Service {
 
 fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let session = ctx.session.clone();
+    let resume = Arc::new(Resume::default());
     Ok(Box::new(move |health: &super::Health| {
-        run(&session, health);
+        run(&session, health, &resume);
         Ok(())
     }))
 }
@@ -251,5 +290,32 @@ mod tests {
             msg.ends_with(" system - \u{feff}Nome do roteador alterado para «edge1»"),
             "{msg}"
         );
+    }
+
+    /// audit-services #13: an action's error stayed in the service row
+    /// after the action was deleted.
+    #[test]
+    fn errors_of_removed_actions_are_forgotten() {
+        let mut logging = corerouter_model::logging::Logging::default();
+        logging.actions.push(action(514));
+        let mut sender = Sender::default();
+        sender.errors.insert("a".into(), "unreachable".into());
+        sender.errors.insert("gone".into(), "unreachable".into());
+        sender.forget_removed(&logging);
+        assert_eq!(sender.errors.keys().collect::<Vec<_>>(), ["a"]);
+        logging.actions.clear();
+        sender.forget_removed(&logging);
+        assert!(sender.errors.is_empty());
+    }
+
+    /// audit-services #13: a restart started at the log's end, dropping
+    /// what was logged while the service was down.
+    #[test]
+    fn a_restart_resumes_where_the_last_run_stopped() {
+        let r = Resume::default();
+        assert_eq!(r.start(40), 40, "first run: from now");
+        r.save(40);
+        assert_eq!(r.start(55), 40, "restart: from where it stopped");
+        assert_eq!(r.start(10), 10, "never past the log (a new log book)");
     }
 }

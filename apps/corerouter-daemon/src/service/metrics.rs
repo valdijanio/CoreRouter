@@ -31,7 +31,12 @@ pub const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 /// Longest request head read; a scrape sends a few hundred bytes.
 const MAX_REQUEST: usize = 8 * 1024;
 const READ_TIMEOUT: Duration = Duration::from_secs(2);
-const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Longest the whole answer may take to go out: a client that takes a few
+/// bytes every few seconds (each `write` making progress) is cut off here,
+/// not when it has drained the body at its own pace.
+const WRITE_DEADLINE: Duration = Duration::from_secs(10);
+/// Bytes per `write`, so the deadline is checked as the answer goes out.
+const WRITE_CHUNK: usize = 16 * 1024;
 /// Longest label value written (interface names are shorter; a platform
 /// link name is not ours to trust).
 const MAX_LABEL: usize = 128;
@@ -410,10 +415,14 @@ pub fn spawn(
 }
 
 fn serve(mut stream: TcpStream, session: &Shared) -> std::io::Result<()> {
-    stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
     let head = read_head(&mut stream)?;
     let (status, ctype, body, head_only) = match route(&head) {
-        Route::Metrics { head } => ("200 OK", CONTENT_TYPE, scrape(session).into_bytes(), head),
+        Route::Metrics { head } => (
+            "200 OK",
+            CONTENT_TYPE,
+            scrape(session).into_bytes(),
+            head,
+        ),
         Route::Index { head } => (
             "200 OK",
             "text/html; charset=utf-8",
@@ -444,16 +453,38 @@ fn serve(mut stream: TcpStream, session: &Shared) -> std::io::Result<()> {
     } else {
         ""
     };
-    write!(
-        stream,
+    let deadline = Instant::now() + WRITE_DEADLINE;
+    let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\n{allow}\
          Connection: close\r\n\r\n",
         body.len()
-    )?;
+    );
+    write_by(&mut stream, header.as_bytes(), deadline)?;
     if !head_only {
-        stream.write_all(&body)?;
+        write_by(&mut stream, &body, deadline)?;
     }
     stream.flush()
+}
+
+/// Write all of `data` before `deadline`, or fail (`TimedOut`).
+fn write_by(stream: &mut TcpStream, mut data: &[u8], deadline: Instant) -> std::io::Result<()> {
+    while !data.is_empty() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the client did not take the answer in time",
+            ));
+        }
+        stream.set_write_timeout(Some(left))?;
+        let chunk = data.get(..WRITE_CHUNK.min(data.len())).unwrap_or_default();
+        let n = stream.write(chunk)?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::WriteZero.into());
+        }
+        data = data.get(n..).unwrap_or_default();
+    }
+    Ok(())
 }
 
 const INDEX: &str = "<!doctype html><title>CoreRouter metrics</title>\
@@ -481,7 +512,8 @@ fn read_head(stream: &mut TcpStream) -> std::io::Result<Vec<u8>> {
     Ok(head)
 }
 
-/// One scrape: the query under the session lock, then the text outside it.
+/// One scrape: the query under the session lock (one platform poll, no
+/// per-interface query), then the text outside it.
 fn scrape(session: &Shared) -> String {
     let start = Instant::now();
     let m = lock(session)
@@ -955,5 +987,33 @@ mod tests {
         let st = wait_status(&session, MetricsState::Listening, None);
         assert_eq!(st.status, MetricsState::Listening, "{st:?}");
         shutdown.close();
+    }
+
+    /// audit-services #9: a client that drains a byte now and then used to
+    /// keep the single-threaded endpoint for as long as it liked (each
+    /// `write` made progress within the per-call timeout).
+    #[test]
+    fn a_slow_reader_is_cut_off_at_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let reader = thread::spawn(move || {
+            let mut c = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            let mut b = [0u8; 1];
+            for _ in 0..40 {
+                if c.read(&mut b).unwrap_or(0) == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let (mut stream, _) = l.accept().unwrap();
+        let body = vec![b'x'; 64 << 20];
+        let start = Instant::now();
+        let r = write_by(&mut stream, &body, start + Duration::from_millis(500));
+        let took = start.elapsed();
+        assert!(r.is_err());
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        drop(stream);
+        reader.join().unwrap();
     }
 }

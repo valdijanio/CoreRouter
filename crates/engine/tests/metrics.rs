@@ -101,3 +101,61 @@ fn a_disabled_interface_is_reported_as_such() {
     assert_eq!(e3["disabled"], true);
     assert_eq!(e3["running"], false);
 }
+
+/// The lab, counting `counters` calls (one netlink + ethtool round trip
+/// per call on Linux, under the session lock).
+struct Counting {
+    lab: corerouter_hal::VirtualHal,
+    calls: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl corerouter_hal::Hal for Counting {
+    fn describe(&self) -> String {
+        self.lab.describe()
+    }
+    fn discover_links(
+        &mut self,
+    ) -> Result<Vec<corerouter_hal::LinkInfo>, corerouter_hal::HalError> {
+        self.lab.discover_links()
+    }
+    fn apply(
+        &mut self,
+        from: &corerouter_model::Config,
+        to: &corerouter_model::Config,
+    ) -> Result<(), corerouter_hal::HalError> {
+        self.lab.apply(from, to)
+    }
+    fn poll(&mut self) -> Vec<corerouter_hal::LinkState> {
+        self.lab.poll()
+    }
+    fn now_unix(&self) -> Option<u64> {
+        None
+    }
+    fn counters(
+        &mut self,
+        name: &corerouter_model::IfName,
+    ) -> Result<corerouter_hal::LinkCounters, corerouter_hal::HalError> {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lab.counters(name)
+    }
+}
+
+/// audit-services #2: one scrape asked the platform for every link's
+/// counter groups (N netlink + ethtool round trips under the session lock).
+#[test]
+fn a_scrape_does_not_query_counters_per_interface() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hal = Counting {
+        lab: corerouter_hal::VirtualHal::new(100),
+        calls: calls.clone(),
+    };
+    let mut s = Session::new(Box::new(hal));
+    let m = metrics(&mut s);
+    assert_eq!(m["interfaces"].as_array().unwrap().len(), 100);
+    assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 0);
+    // Still the platform's error counters, from the poll.
+    let e3 = iface(&m, "ether3");
+    assert!(e3["rx_errors"].is_u64(), "{e3}");
+    assert!(e3["rx_dropped"].is_u64(), "{e3}");
+}
