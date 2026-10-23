@@ -49,5 +49,9 @@ harness = false
 name = "netns_forward"
 harness = false
 
+[[bench]]
+name = "netns_cgnat"
+harness = false
+
 [lints]
 workspace = true

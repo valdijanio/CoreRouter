@@ -85,7 +85,7 @@ fn a_pool_maps_subscribers_and_answers_who_was() {
     assert_eq!(m["total"], 64);
     assert_eq!(m["rows"][0]["subscriber"], "100.64.0.128");
     let r = ok(&mut s, "ip.firewall.cgnat.rules", json!({}));
-    assert_eq!(r["elements"], 1024);
+    assert_eq!(r["elements"], 1024 + 1, "the map and the public range");
     assert!(
         r["script"]
             .as_str()

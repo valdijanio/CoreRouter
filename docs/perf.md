@@ -627,3 +627,56 @@ De onde vêm os números da coluna #141:
 - O boot foi medido no próprio #141, antes do G0.16.
 - O commit foi medido nesta rodada, com G0.16: é a comparação dos textos inteiros que o #141 fazia.
 - O RSS não foi medido, porque o bench de RSS veio com este PR.
+
+### G1.27a — IP › Routes (estado, motivo, ECMP)
+
+**Medido** em 2026-10-23, AMD Ryzen AI MAX+ 395 (32 CPUs), Linux 7.0, build release:
+`cargo xtask bench --save-baseline antes 'ip.route.list|apply/routes'` na `main` (6485e6e) e
+`--baseline antes` na branch.
+
+| benchmark | antes | depois | mudança |
+|---|---|---|---|
+| `engine_scale/ip.route.list/1000` | 1,12 ms | 2,19 ms | +95% |
+| `engine_scale/ip.route.list/10000` | 18,7 ms | 45,9 ms | +146% |
+| `hal_linux_apply/routes/100` | 2,04 ms | 2,05 ms | +0,7% |
+| `hal_linux_apply/routes/1000` | 20,2 ms | 19,3 ms | −4% |
+| `hal_virtual_apply/routes/1000` | 130 µs | 120 µs | −7% |
+
+O `ip.route.list` ficou ~2× mais caro por causa do JSON: cada linha passou de 15 para ~30 campos.
+O cálculo em si (estado, motivo, ECMP, watch) custa 0,40 ms por 1000 rotas e 4,2 ms por 10 000
+(**medido** com a linha JSON trocada por `{key}`); o resto é montar o `serde_json::Value`. A G1.27c
+(tabela cheia) pagina e resume no engine para não mandar a lista inteira.
+
+O primeiro rascunho do multipath clonava o cache de caminhos do kernel a cada op de rota
+(`hal_linux_apply/routes/1000` em 35,4 ms, +75%, **medido**); com o cache agrupado por
+(tabela, prefixo, métrica) voltou a 19,3 ms.
+
+### CGNAT: carga da tabela, netlink × `nft` (G2.3b, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0.0, nft 1.0.9, build release, netns sem root,
+2026-10-23, `cargo bench -p corerouter-hal-linux --bench netns_cgnat`. Pool de 1000 portas por
+assinante (64 por IP), a tabela inteira trocada num lote.
+
+| Operação | netlink (`nfnl`) | `nft -f` |
+|---|---|---|
+| 1 Ki assinantes | 17,5 ms | 23,7 ms |
+| 16 Ki assinantes | 26,5 ms | 90,0 ms |
+| 64 Ki assinantes | 66,0 ms | 303 ms |
+| um assinante a mais em 64 Ki (diff incluído) | 0,155 ms | 2,40 ms |
+
+### G6.8a — notas do "Why this answer" na cadeia e linha de origem na adlist (2026-10-23, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 threads), build de bench (release), com a máquina carregada (load ~7):
+`main` e branch rodados em seguida, duas vezes; valores de cada rodada.
+
+| benchmark | main | branch |
+|---|---|---|
+| `dns_adlist/parse_and_build_1m` | 214 / 228 ms | 281 / 315 ms |
+| `dns_adlist_lookup_hit` | 80 / 83 ns | 77 / 87 ns |
+| `dns_forward_cache_hit` | 1,06 / 1,25 µs | 1,12 / 1,11 µs |
+| `dns_forward_cache_miss` | 2,49 / 3,29 µs | 2,50 / 2,65 µs |
+
+A consulta (cadeia e lookup na adlist) não mudou além do ruído: sem `explain`, cada etapa paga um
+teste de `Option`. Carregar uma lista de 1 milhão de nomes ficou ~30% mais lento (linha e forma
+de cada nome, ordenadas junto): ~0,3 s na thread do carregador, a cada 4 h, nunca na consulta.
+Memória: 36,8 MB contra 31,8 MB para 1 milhão de nomes (+5 bytes por nome).

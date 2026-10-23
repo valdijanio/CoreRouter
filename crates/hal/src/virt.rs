@@ -280,7 +280,7 @@ impl VirtualHal {
 
     /// The CGNAT table (G2.3) the last applied config would load.
     pub fn cgnat_script(&self) -> String {
-        corerouter_firewall::cgnat::script(&self.applied.ip.cgnat)
+        corerouter_firewall::cgnat::render(&self.applied.ip.cgnat, None).script
     }
 
     pub fn dynamic(&self) -> &[DynamicAddress] {
