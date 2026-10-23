@@ -321,20 +321,38 @@ impl PanelState for Graphs {
             ui.weak(tr(app.lang.labels, "Loading…"));
             return;
         };
-        self.chips(app, ui, &data);
-        if self.is_system() {
-            self.system_view(app, ui, &data);
-        } else {
-            self.stats(app, ui, &data);
-            ui.add_space(4.0);
-            self.chart(app, ui, &data);
-        }
+        // The PNG is this report: chips, numbers and chart with its axes.
+        let report = ui
+            .scope(|ui| {
+                self.chips(app, ui, &data);
+                if self.is_system() {
+                    self.system_view(app, ui, &data);
+                } else {
+                    self.stats(app, ui, &data);
+                    ui.add_space(4.0);
+                    self.chart(app, ui, &data);
+                }
+            })
+            .response
+            .rect;
+        self.plot_rect = Some(report);
         self.shot_result();
-        if let Some(st) = &self.status {
-            match st {
-                Ok(m) => ui.weak(m),
-                Err(e) => ui.colored_label(ui.visuals().error_fg_color, e),
-            };
+        // Always one line (the chart takes the height left above it, so a
+        // line appearing later would grow the window): the file name, the
+        // whole path on hover.
+        let (text, full, bad) = match &self.status {
+            Some(Ok(m)) => (short_path(m), m.clone(), false),
+            Some(Err(e)) => (short_path(e), e.clone(), true),
+            None => (String::new(), String::new(), false),
+        };
+        let line = if bad {
+            RichText::new(text).color(ui.visuals().error_fg_color)
+        } else {
+            RichText::new(text).weak()
+        };
+        let r = ui.add(egui::Label::new(line).truncate());
+        if !full.is_empty() {
+            r.on_hover_text(full);
         }
     }
 
@@ -449,7 +467,8 @@ impl Graphs {
             let mem = print.get("memory_bytes").and_then(Value::as_f64).unwrap_or(0.0);
             let cap = print.get("max_memory_bytes").and_then(Value::as_f64).unwrap_or(0.0);
             let n = print.get("series").and_then(Value::as_array).map_or(0, Vec::len);
-            ui.label(format!("{n} {}: {} / {}", tr(l, "series kept"), bytes(mem), bytes(cap)));
+            let mib = |b: f64| format!("{:.1} MiB", b / 1_048_576.0);
+            ui.label(format!("{n} {}: {} / {}", tr(l, "series kept"), mib(mem), mib(cap)));
             let disk = print.get("disk").cloned().unwrap_or(Value::Null);
             match disk.get("dir").and_then(Value::as_str) {
                 Some(dir) => {
@@ -673,14 +692,17 @@ impl Graphs {
         let unit = fields[0].2;
         let range = self.range;
         let one = series.len() == 1;
+        let (x0, x1) = span(data);
         let colors: Vec<Color32> = series
             .iter()
             .map(|s| line_color(ui, s.get("series").and_then(Value::as_str).map(short).unwrap_or("")))
             .collect();
-        let resp = Plot::new("graphs-chart")
-            .height(ui.available_height().max(160.0) - 24.0)
-            .legend(Legend::default())
+        Plot::new("graphs-chart")
+            .height((ui.available_height() - ui.spacing().interact_size.y - 8.0).max(160.0))
+            .legend(Legend::default().position(egui_plot::Corner::LeftTop))
             .include_y(0.0)
+            .include_x(x0)
+            .include_x(x1)
             .y_axis_formatter(move |m, _| rate(m.value, unit))
             .x_axis_formatter(move |m, _| time_label(m.value, range))
             .label_formatter(move |h| hover(h, unit))
@@ -720,7 +742,6 @@ impl Graphs {
                     }
                 }
             });
-        self.plot_rect = Some(resp.response.rect);
     }
 
     /// CPU, memory and conntrack, one small chart each.
@@ -752,27 +773,27 @@ impl Graphs {
             }
         });
         let range = self.range;
-        let h = ((ui.available_height() - 40.0) / 3.0).max(90.0);
-        let mut area: Option<egui::Rect> = None;
+        let (x0, x1) = span(data);
+        let h = ((ui.available_height() - ui.spacing().interact_size.y - 24.0) / 3.0).max(90.0);
         for (i, (field, label, unit)) in SYSTEM_FIELDS.iter().enumerate() {
             let unit: &'static str = unit;
             let color = chip::palette_tone(ui.visuals(), i * 3).ink;
-            let resp = Plot::new(("graphs-system", *field))
+            Plot::new(("graphs-system", *field))
                 .height(h)
                 .include_y(0.0)
+                .include_x(x0)
+                .include_x(x1)
                 .y_axis_formatter(move |m, _| rate(m.value, unit))
                 .x_axis_formatter(move |m, _| time_label(m.value, range))
                 .label_formatter(move |h| hover(h, unit))
                 .allow_scroll(false)
-                .legend(Legend::default())
+                .legend(Legend::default().position(egui_plot::Corner::LeftTop))
                 .show(ui, |p| {
                     for run in runs(&s, data, field) {
                         p.line(Line::new(tr(l, label), PlotPoints::from(run)).color(color).width(1.5));
                     }
                 });
-            area = Some(area.map_or(resp.response.rect, |a| a.union(resp.response.rect)));
         }
-        self.plot_rect = area;
     }
 
     /// The points of the range as CSV: one line per point and series.
@@ -882,6 +903,13 @@ fn line_color(ui: &Ui, name: &str) -> Color32 {
     chip::palette_tone(ui.visuals(), chip::name_hue(name)).ink
 }
 
+/// The whole range on the time axis (an hour of which one minute is known
+/// still reads as an hour).
+fn span(data: &Value) -> (f64, f64) {
+    let n = |k: &str| data.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+    (n("start"), n("end"))
+}
+
 /// The known points of `field`, split where values are unknown (a hole in
 /// the line, not a dive to zero).
 fn runs(s: &Value, data: &Value, field: &str) -> Vec<Vec<[f64; 2]>> {
@@ -918,6 +946,17 @@ fn time_label(x: f64, range: Range) -> String {
     }
 }
 
+/// `saved /home/x/Downloads/graph.png` → `saved graph.png`.
+fn short_path(m: &str) -> String {
+    match m.split_once(' ') {
+        Some((verb, path)) if path.contains('/') || path.contains('\\') => {
+            let name = path.rsplit(['/', '\\']).next().unwrap_or(path);
+            format!("{verb} {name}")
+        }
+        _ => m.to_owned(),
+    }
+}
+
 /// `1 s`, `5 min`, `1 h`.
 pub(crate) fn duration(secs: u64) -> String {
     match secs {
@@ -939,6 +978,8 @@ pub(crate) fn rate(v: f64, unit: &str) -> String {
     if unit == "B" {
         return bytes(v);
     }
+    // A count: `227.9 k`, not `227.9 kentries`.
+    let unit = if unit == "entries" { "" } else { unit };
     let a = v.abs();
     let (n, p) = if a >= 1e9 {
         (v / 1e9, "G")
@@ -947,9 +988,10 @@ pub(crate) fn rate(v: f64, unit: &str) -> String {
     } else if a >= 1e3 {
         (v / 1e3, "k")
     } else {
-        return if a >= 10.0 || a == 0.0 { format!("{v:.0} {unit}") } else { format!("{v:.2} {unit}") };
+        let s = if a >= 10.0 || a == 0.0 { format!("{v:.0} {unit}") } else { format!("{v:.2} {unit}") };
+        return s.trim_end().to_owned();
     };
-    format!("{n:.1} {p}{unit}")
+    format!("{n:.1} {p}{unit}").trim_end().to_owned()
 }
 
 /// Bytes in decimal units (the totals: `12.34 GB`).

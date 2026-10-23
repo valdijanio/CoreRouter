@@ -128,6 +128,16 @@ fn interfaces_show_a_mini_graph() {
 }
 
 #[test]
+fn numbers_read_well() {
+    use crate::graphs::rate;
+    assert_eq!(rate(12_500_000.0, "bps"), "12.5 Mbps");
+    assert_eq!(rate(227_900.0, "entries"), "227.9 k");
+    assert_eq!(rate(5.0, "entries"), "5.00");
+    assert_eq!(rate(41.26, "%"), "41.3 %");
+    assert_eq!(rate(f64::NAN, "bps"), "–");
+}
+
+#[test]
 fn spark_cells_scale_to_the_top_and_mark_holes() {
     let c = crate::spark::cell(&[Some(0.0), Some(50.0), None, Some(100.0)], &[Some(100.0), None]);
     let body = c.strip_prefix(crate::spark::SEP).unwrap();

@@ -268,6 +268,13 @@ fn stats(
                 peak = top;
             }
         }
+        // The newest second may be past the last closed slot: a maximum
+        // below the current value would read as a bug.
+        if let Some(c) = current_row.and_then(|r| r.get(*i)).filter(|c| c.is_finite())
+            && (peak.is_nan() || *c > peak)
+        {
+            peak = *c;
+        }
         known = known.max(n);
         let mut samples: Vec<f32> = slots(rrd, p95_tier, start, end)
             .filter_map(|(_, a, _)| a.get(*i).copied().filter(|v| v.is_finite()))
