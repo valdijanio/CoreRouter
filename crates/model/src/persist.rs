@@ -195,6 +195,118 @@ fn encode_from(store: &ConfigStore, users: &Users, skip: usize) -> Result<String
     Ok(out)
 }
 
+/// `cfg` as compact JSON: the text a save splices into its files, so a
+/// commit serializes its config once (G1.23).
+pub fn encode_config(cfg: &Config) -> Result<String, PersistError> {
+    serde_json::to_string(cfg).map_err(|e| PersistError::Malformed(e.to_string()))
+}
+
+/// The running file of a store whose older revisions live in revision
+/// files (G1.23): the same layout as [`encode_with_users`], with the
+/// newest revision as the only history entry, so an older build still
+/// loads it. `config` is [`encode_config`] of the running config; it is
+/// spliced in twice instead of serialized twice.
+pub fn encode_running(newest: &Revision, config: &str, users: &Users) -> Result<String, PersistError> {
+    let mut out = String::with_capacity(config.len().saturating_mul(2).saturating_add(512));
+    out.push_str("{\"format_version\":");
+    out.push_str(&FORMAT_VERSION.to_string());
+    out.push_str(",\"revision\":");
+    out.push_str(&newest.number.to_string());
+    out.push_str(",\"running\":");
+    out.push_str(config);
+    out.push_str(",\"history\":[");
+    push_revision(&mut out, newest, config)?;
+    out.push(']');
+    if !users.is_empty() {
+        out.push_str(",\"users\":");
+        out.push_str(&to_json(users)?);
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+/// One revision as `{"number","comment","timestamp","config"}`.
+fn push_revision(out: &mut String, rev: &Revision, config: &str) -> Result<(), PersistError> {
+    out.push_str("{\"number\":");
+    out.push_str(&rev.number.to_string());
+    out.push_str(",\"comment\":");
+    out.push_str(&to_json(&rev.comment)?);
+    out.push_str(",\"timestamp\":");
+    out.push_str(&to_json(&rev.timestamp)?);
+    out.push_str(",\"config\":");
+    out.push_str(config);
+    out.push('}');
+    Ok(())
+}
+
+fn to_json<T: Serialize + ?Sized>(v: &T) -> Result<String, PersistError> {
+    serde_json::to_string(v).map_err(|e| PersistError::Malformed(e.to_string()))
+}
+
+/// A revision file (G1.23): one older revision, written once when it is
+/// committed and read back at boot. `config` is [`encode_config`] of it.
+/// Self-describing (it carries its number), so the files need no index.
+pub fn encode_revision(rev: &Revision, config: &str) -> Result<String, PersistError> {
+    let mut out = String::with_capacity(config.len().saturating_add(320));
+    out.push_str("{\"format_version\":");
+    out.push_str(&FORMAT_VERSION.to_string());
+    out.push(',');
+    // The revision's fields follow, inside the same object.
+    let mut body = String::new();
+    push_revision(&mut body, rev, config)?;
+    out.push_str(body.get(1..).unwrap_or_default());
+    out.push('\n');
+    Ok(out)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionFileIn {
+    #[serde(rename = "format_version")]
+    _format_version: u32, // checked by VersionProbe first
+    number: u32,
+    comment: String,
+    timestamp: Option<u64>,
+    config: Config,
+}
+
+/// Parse a revision file written by [`encode_revision`]; it must hold
+/// revision `number` (a file is hostile input like the running file).
+pub fn decode_revision(text: &str, number: u32) -> Result<Revision, PersistError> {
+    check_version(text)?;
+    let file: RevisionFileIn = serde_json::from_str(text).map_err(malformed)?;
+    if file.number != number {
+        return Err(PersistError::Inconsistent(format!(
+            "holds revision {} instead of {number}",
+            file.number
+        )));
+    }
+    Ok(Revision {
+        number,
+        comment: file.comment.chars().take(256).collect(),
+        timestamp: file.timestamp,
+        config: file.config,
+    })
+}
+
+/// Size bound, then `format_version` before anything else.
+fn check_version(text: &str) -> Result<(), PersistError> {
+    if text.len() > MAX_FILE_BYTES {
+        return Err(PersistError::TooLarge(text.len()));
+    }
+    let probe: VersionProbe = serde_json::from_str(text).map_err(malformed)?;
+    match probe.format_version {
+        None => Err(PersistError::Malformed("missing format_version".into())),
+        Some(v) => match v.as_u64() {
+            Some(n) if n == u64::from(FORMAT_VERSION) => Ok(()),
+            Some(n) => Err(PersistError::UnknownVersion(n)),
+            None => Err(PersistError::Malformed(
+                "format_version must be an integer".into(),
+            )),
+        },
+    }
+}
+
 /// Parse and verify a file written by [`encode`] (accounts are dropped).
 pub fn decode(text: &str) -> Result<ConfigStore, PersistError> {
     decode_with_users(text).map(|(store, _)| store)
@@ -203,22 +315,7 @@ pub fn decode(text: &str) -> Result<ConfigStore, PersistError> {
 /// Parse and verify a file written by [`encode_with_users`]. A file
 /// without `users` (older builds) gives an empty list.
 pub fn decode_with_users(text: &str) -> Result<(ConfigStore, Users), PersistError> {
-    if text.len() > MAX_FILE_BYTES {
-        return Err(PersistError::TooLarge(text.len()));
-    }
-    let probe: VersionProbe = serde_json::from_str(text).map_err(malformed)?;
-    match probe.format_version {
-        None => return Err(PersistError::Malformed("missing format_version".into())),
-        Some(v) => match v.as_u64() {
-            Some(n) if n == u64::from(FORMAT_VERSION) => {}
-            Some(n) => return Err(PersistError::UnknownVersion(n)),
-            None => {
-                return Err(PersistError::Malformed(
-                    "format_version must be an integer".into(),
-                ));
-            }
-        },
-    }
+    check_version(text)?;
     let file: FileIn = serde_json::from_str(text).map_err(malformed)?;
 
     let mut history = Vec::with_capacity(file.history.len());
@@ -553,6 +650,57 @@ mod tests {
         assert!(matches!(
             encode_bounded(&st, &Users::default(), one),
             Err(PersistError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn spliced_running_file_is_the_one_revision_file() {
+        use crate::users::{Group, User};
+        let st = sample();
+        let newest = st.history().last().unwrap().clone();
+        let mut users = Users::default();
+        let config = encode_config(st.running()).unwrap();
+        for with_users in [false, true] {
+            if with_users {
+                users.put(User {
+                    name: "admin".into(),
+                    group: Group::Full,
+                    password_hash: None,
+                    disabled: false,
+                    comment: String::new(),
+                });
+            }
+            let text = encode_running(&newest, &config, &users).unwrap();
+            // Byte for byte what an older build writes for a one-revision
+            // store, so it loads there too.
+            let one = ConfigStore::restore(st.running().clone(), vec![newest.clone()]);
+            assert_eq!(text, encode_with_users(&one, &users).unwrap());
+            let (back, u) = decode_with_users(&text).unwrap();
+            assert_eq!((back.current_revision(), back.running()), (2, st.running()));
+            assert_eq!(u, users);
+        }
+    }
+
+    #[test]
+    fn revision_files_round_trip_and_are_checked() {
+        let st = sample();
+        let rev = st.history()[1].clone();
+        let text = encode_revision(&rev, &encode_config(&rev.config).unwrap()).unwrap();
+        let back = decode_revision(&text, 1).unwrap();
+        assert_eq!(
+            (back.number, back.comment.as_str(), back.timestamp),
+            (1, "rename", Some(1_700_000_000))
+        );
+        assert_eq!(back.config, rev.config);
+        assert!(matches!(
+            decode_revision(&text, 2),
+            Err(PersistError::Inconsistent(_))
+        ));
+        let cut = text.get(..text.len() / 2).unwrap();
+        assert!(matches!(decode_revision(cut, 1), Err(PersistError::Malformed(_))));
+        assert!(matches!(
+            decode_revision(&text.replacen("\"format_version\":1", "\"format_version\":9", 1), 1),
+            Err(PersistError::UnknownVersion(9))
         ));
     }
 

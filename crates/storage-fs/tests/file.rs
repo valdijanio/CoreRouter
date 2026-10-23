@@ -200,7 +200,7 @@ fn failed_save_keeps_the_old_file_and_is_reported() {
         status["storage"]["last_error"]
             .as_str()
             .unwrap()
-            .contains(TEMP)
+            .contains(".tmp")
     );
     assert_eq!(fs::read(dir.0.join(CURRENT)).unwrap(), before);
 
@@ -310,4 +310,43 @@ fn stale_temp_files_of_state_and_journals_are_removed_on_open() {
     assert!(!dir.0.join("state-dhcp-leases.json.tmp").exists());
     assert!(!dir.0.join("journal-dhcp-leases.log.tmp").exists());
     assert!(dir.0.join("state-dhcp-leases.json").exists());
+}
+
+/// G1.23: each revision is a file of its own, written once; the slot holds
+/// the newest only; a revision write cut short is discarded on open.
+#[test]
+fn revisions_are_files_of_their_own() {
+    use corerouter_storage_fs::revision_file;
+    let dir = TempDir::new();
+    let mut s = boot(&dir);
+    add(&mut s, "10.0.0.1/24");
+    add(&mut s, "10.0.1.1/24");
+    drop(s);
+    for n in 0..=2 {
+        assert!(dir.0.join(revision_file(n)).exists(), "revision {n}");
+    }
+    let first = fs::read(dir.0.join(revision_file(1))).unwrap();
+    let slot = fs::read_to_string(dir.0.join(CURRENT)).unwrap();
+    assert_eq!(slot.matches("\"number\":").count(), 1, "{slot}");
+    let torn = dir.0.join(format!("{}.tmp", revision_file(3)));
+    fs::write(&torn, "{").unwrap();
+
+    let mut s = boot(&dir);
+    assert!(!torn.exists());
+    let history: Vec<u32> = s.store().history().iter().map(|r| r.number).collect();
+    assert_eq!(history, [0, 1, 2]);
+    add(&mut s, "10.0.2.1/24");
+    assert_eq!(fs::read(dir.0.join(revision_file(1))).unwrap(), first);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(dir.0.join(revision_file(3)))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+    s.execute("config.rollback", &json!({"revision": 1}))
+        .unwrap();
+    assert_eq!(addresses(&s), ["10.0.0.1/24"]);
 }

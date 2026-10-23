@@ -94,7 +94,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU, MTR; G6.1–G6.3), clientes DHCP em execução (`dhcp_client`: `Session::dhcp_service`, concessões como entradas dinâmicas vistas pelo HAL em `Session::effective`; G4.7; DHCPv6 em `dhcp6_client`, com os endereços `from_pool` resolvidos no mesmo `effective`, G4.7b) | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial`; `ThreadRunner` das tarefas (G6.1) | L0–L3 |
 | L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
-| L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, escrita atômica | L0–L3 |
+| L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev` e um `rev-<n>.json` por revisão, escrita atômica | L0–L3 |
 | L4 | `crates/shell` | Terminal estilo RouterOS gerado do `engine.list`: parser, Tab, cores, `print`, `/export`/`/import`. Puro (sem I/O, wasm): pede chamadas do canal de controle ao front end (janela da GUI, `corerouter-cli shell`, SSH). Veja `docs/terminal.md` | `serde_json` (nada do workspace; testes usam o engine) |
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
 | L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe); trait `Backend` assíncrono + `Local`; janelas novas são **painéis** (`panel.rs`: `pub(crate) const PANEL` num arquivo, descoberto pelo `build.rs` com os módulos e os testes de `src/tests/`) | L0–L4 + egui |
@@ -196,10 +196,23 @@ de versões anteriores. Em Safe Mode qualquer gravação escreve o store da entr
 restaurada não chega ao plano de dados no boot, `storage.boot_apply_error` mostra o motivo, o
 tick tenta de novo a cada segundo e o próximo commit aplica a config inteira.
 
+Histórico em arquivos (G1.23): num backend com `revision_files()` (os dois de baixo) o slot guarda
+só a running e a revisão mais nova (o mesmo formato, com histórico de uma entrada, que versões
+anteriores leem), e cada revisão vira um arquivo próprio (`rev-<n>.json`,
+`persist::encode_revision`), escrito uma vez pelo commit que a criou e apagado quando sai do
+histórico. O commit serializa a config uma vez (o texto vai para o slot e para o arquivo da
+revisão), então o custo é o tamanho da config, não do histórico: `commit/routes/10000` com 64
+revisões em disco (fsync) caiu de 396 ms para 11,0 ms (**medido**, `storage_fs/commit/*`). Ordem:
+arquivos de revisão que faltam → slot → apagar os que saíram. No boot, os arquivos mais antigos
+que o slot completam o histórico; um ilegível custa só aquela revisão (`storage.boot_errors`); um
+mais novo que o slot (gravação interrompida) é ignorado e reescrito. Arquivos de versões
+anteriores (histórico inteiro no slot) carregam e migram no primeiro commit. O limite de 32 MiB
+vale para a soma dos arquivos de revisão.
+
 | Backend | Onde | Uso |
 |---|---|---|
 | `MemoryStorage` | engine | GUI, wasm, testes, daemon em lab sem `--config-dir` |
-| `FileStorage` | `storage-fs` (L4) | daemon: temp + fsync → rename current→prev → rename temp→current → fsync do diretório |
+| `FileStorage` | `storage-fs` (L4) | daemon: temp + fsync → rename current→prev → rename temp→current → fsync do diretório; `rev-<n>.json` (temp + fsync + rename) antes do slot |
 
 ### GUI como cliente do daemon (G0.4)
 

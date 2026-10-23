@@ -8,6 +8,12 @@
 //!
 //! Two slots are kept so a torn or corrupted write never loses everything:
 //! [`Slot::Current`] is the last save, [`Slot::Previous`] the one before.
+//!
+//! A backend with [`ConfigStorage::revision_files`] keeps each older
+//! revision in a file of its own, written once (G1.23, see
+//! `crate::history_files`): a slot then holds the running config and its
+//! newest revision only, so a commit costs the size of the config, not of
+//! the history.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -83,6 +89,37 @@ pub trait ConfigStorage: Send {
         let _ = (name, text);
         Ok(())
     }
+
+    /// Whether older revisions are kept one per file (G1.23): a save then
+    /// writes the running config and the new revision, not the whole
+    /// history. `false` (the default): every save carries the history.
+    fn revision_files(&self) -> bool {
+        false
+    }
+
+    /// Numbers of the revision files present (any order).
+    fn list_revisions(&mut self) -> Result<Vec<u32>, StorageError> {
+        Ok(Vec::new())
+    }
+
+    /// Contents of revision file `number`, or `None` if there is none.
+    fn load_revision(&mut self, number: u32) -> Result<Option<String>, StorageError> {
+        let _ = number;
+        Ok(None)
+    }
+
+    /// Write revision file `number` (complete and synced, or absent, after
+    /// a crash; it becomes durable with the next [`Self::save`]).
+    fn save_revision(&mut self, number: u32, data: &str) -> Result<(), StorageError> {
+        let _ = (number, data);
+        Err(StorageError("revision files are not supported".into()))
+    }
+
+    /// Delete revision file `number` (a revision past the history).
+    fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {
+        let _ = number;
+        Ok(())
+    }
 }
 
 /// Largest journal read back (**estimado**: a /12 of leases at ~200 bytes
@@ -110,6 +147,7 @@ struct Slots {
     quarantined: Vec<String>,
     state: std::collections::BTreeMap<String, String>,
     journals: std::collections::BTreeMap<String, String>,
+    revisions: std::collections::BTreeMap<u32, String>,
 }
 
 /// In-memory storage. Clones share the same slots, so a test can keep a
@@ -139,6 +177,28 @@ impl MemoryStorage {
 
     pub fn quarantined(&self) -> usize {
         self.with(|s| s.quarantined.len())
+    }
+
+    /// Revision file `number` (tests: inspect or corrupt it).
+    pub fn revision(&self, number: u32) -> Option<String> {
+        self.with(|s| s.revisions.get(&number).cloned())
+    }
+
+    /// Overwrite or delete revision file `number` (tests).
+    pub fn put_revision(&self, number: u32, data: Option<String>) {
+        self.with(|s| match data {
+            Some(d) => {
+                s.revisions.insert(number, d);
+            }
+            None => {
+                s.revisions.remove(&number);
+            }
+        });
+    }
+
+    /// Bytes stored in revision files (tests: what the history costs).
+    pub fn revision_bytes(&self) -> usize {
+        self.with(|s| s.revisions.values().map(String::len).sum())
     }
 }
 
@@ -208,6 +268,28 @@ impl ConfigStorage for MemoryStorage {
             return Err(StorageError(format!("journal '{name}' refused")));
         }
         self.with(|s| s.journals.insert(name.to_owned(), text.to_owned()));
+        Ok(())
+    }
+
+    fn revision_files(&self) -> bool {
+        true
+    }
+
+    fn list_revisions(&mut self) -> Result<Vec<u32>, StorageError> {
+        Ok(self.with(|s| s.revisions.keys().copied().collect()))
+    }
+
+    fn load_revision(&mut self, number: u32) -> Result<Option<String>, StorageError> {
+        Ok(self.revision(number))
+    }
+
+    fn save_revision(&mut self, number: u32, data: &str) -> Result<(), StorageError> {
+        self.put_revision(number, Some(data.to_owned()));
+        Ok(())
+    }
+
+    fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {
+        self.put_revision(number, None);
         Ok(())
     }
 }
