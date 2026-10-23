@@ -13,6 +13,7 @@
 //! `CoreRouterUi::run`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
 use egui::{Grid, Sense, TextEdit, Ui};
 use serde_json::{Map, Value, json};
@@ -79,6 +80,9 @@ pub(crate) struct Route {
     /// Outgoing interface when usable.
     pub interface: Option<String>,
     pub ecmp: u64,
+    /// An aggregate line of `ip.route.page` (G1.27c): the routes inside
+    /// one /16, counted (`routes`); opened by searching its prefix.
+    pub bucket: Option<u64>,
     pub reason: Option<String>,
     pub reason_id: Option<String>,
     pub reason_args: Vec<(String, String)>,
@@ -138,6 +142,8 @@ impl Route {
             immediate: opt("immediate_gw"),
             interface: opt("interface"),
             ecmp: row.get("ecmp").and_then(Value::as_u64).unwrap_or(1),
+            bucket: flag("bucket")
+                .then(|| row.get("routes").and_then(Value::as_u64).unwrap_or(0)),
             reason: opt("reason"),
             reason_id: opt("reason_id"),
             reason_args,
@@ -254,6 +260,67 @@ pub(crate) struct View {
     pub found: Option<Result<Value, String>>,
     /// The one route selected, whose detail shows under the table (G1.27b).
     pub selected: Option<String>,
+    // ---- G1.27c: a full table is asked for page by page ----
+    /// Prefix search ("10.0.0.0/8", "8.8.8.8"); empty: none.
+    pub prefix: String,
+    pub prefix_mode: PrefixMode,
+    /// Routes longer than /16 (IPv6 /32) folded, one line per /16.
+    pub aggregate: bool,
+    /// First row of the page asked for.
+    pub offset: usize,
+    /// The last page's place: (rows that match, its offset); `None` for an
+    /// older router that sent the whole list.
+    pub page: Option<(usize, usize)>,
+    /// Counts of the whole table (`ip.route.page`'s `summary`).
+    pub summary: Option<Value>,
+    /// Bumped when the rows must be built again (a reply, a filter, a
+    /// group opened); the rows are kept per version, not rebuilt per frame.
+    pub version: u64,
+    /// The parsed routes and table rows of `version` (and the languages).
+    pub built: Option<Built>,
+    /// The prefix searched is an aggregate line opened: clearing it goes
+    /// back to the aggregated view.
+    pub opened_bucket: bool,
+}
+
+/// The rows built for a version of the view (and the languages).
+pub(crate) type Built = (u64, i18n::Langs, Arc<Vec<Route>>, Arc<Vec<Row>>);
+
+/// How the prefix search matches (`ip.route.page`'s `match`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum PrefixMode {
+    /// The routes inside it (Junos `orlonger`).
+    #[default]
+    Contained,
+    /// The routes that contain it (a lookup's candidates).
+    Contains,
+    Exact,
+}
+
+impl PrefixMode {
+    fn param(self) -> &'static str {
+        match self {
+            Self::Contained => "orlonger",
+            Self::Contains => "covering",
+            Self::Exact => "exact",
+        }
+    }
+}
+
+/// Rows asked for per page.
+pub(crate) const PAGE: usize = 500;
+
+/// "10.0.0.0/8", "2001:db8::/32" or a bare address: what `ip.route.page`
+/// takes as `prefix` (checked here, so a typo does not empty the table).
+pub(crate) fn valid_prefix(text: &str) -> bool {
+    let t = text.trim();
+    match t.split_once('/') {
+        Some((a, len)) => match (a.parse::<std::net::IpAddr>(), len.parse::<u8>()) {
+            (Ok(a), Ok(l)) => l <= if a.is_ipv4() { 32 } else { 128 },
+            _ => false,
+        },
+        None => t.parse::<std::net::IpAddr>().is_ok(),
+    }
 }
 
 impl View {
@@ -279,6 +346,19 @@ pub(crate) struct Counts {
     pub inactive: usize,
     pub v4: usize,
     pub v6: usize,
+}
+
+/// The counts of `ip.route.page`'s summary (the whole table).
+pub(crate) fn summary_counts(s: &Value) -> Counts {
+    let n = |k: &str| s.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+    Counts {
+        total: n("total"),
+        active: n("active"),
+        standby: n("standby"),
+        inactive: n("inactive"),
+        v4: n("ipv4"),
+        v6: n("ipv6"),
+    }
 }
 
 pub(crate) fn counts(routes: &[Route]) -> Counts {
@@ -316,6 +396,10 @@ pub(crate) fn rows_of(routes: &[Route], view: &View, lang: i18n::Langs) -> Vec<R
     let mut out = Vec::with_capacity(routes.len());
     let mut done: BTreeSet<&str> = BTreeSet::new();
     for r in routes.iter().filter(|r| view.shows(r)) {
+        if let Some(n) = r.bucket {
+            out.push(bucket_row(r, n, lang));
+            continue;
+        }
         let Some(g) = group_key(r) else {
             out.push(route_row(r, lang, false));
             continue;
@@ -348,6 +432,32 @@ fn group_row(key: &str, first: &Route, paths: usize, open: bool, lang: i18n::Lan
             first.distance.clone(),
             cell("", &[(&first.table, Kind::Hashed(chip::name_hue(&first.table)))]),
             age(first.changed_secs),
+            String::new(),
+            String::new(),
+        ],
+        dimmed: false,
+        section: false,
+        tint: None,
+    }
+}
+
+/// Key prefix of an aggregate line (`ip.route.page` with `aggregate`).
+pub(crate) const BUCKET: &str = "bucket ";
+
+fn bucket_row(r: &Route, routes: u64, lang: i18n::Langs) -> Row {
+    let (state, kind) = r.state_chip();
+    Row {
+        key: r.key.clone(),
+        cells: vec![
+            cell("", &[(state, kind)]),
+            cell(
+                &r.dst,
+                &[(&format!("{routes} {}", tr(lang.labels, "routes")), Kind::Blue)],
+            ),
+            format!("+ {}", tr(lang.labels, "open")),
+            String::new(),
+            cell("", &[(&r.table, Kind::Hashed(chip::name_hue(&r.table)))]),
+            String::new(),
             String::new(),
             String::new(),
         ],
@@ -412,6 +522,10 @@ fn paths_of(selection: &[String], routes: &[Route]) -> Vec<String> {
         }
     }
     out
+}
+
+fn prefix_id() -> egui::Id {
+    egui::Id::unique("corerouter-route-prefix")
 }
 
 fn lookup_id() -> egui::Id {
@@ -852,6 +966,97 @@ enum Button {
 }
 
 impl CoreRouterUi {
+    /// The routes and table rows of the last reply, built once per reply,
+    /// filter or opened group, not per frame (G1.27c; G1.25's lesson).
+    fn route_built(&mut self, langs: i18n::Langs) -> (Arc<Vec<Route>>, Arc<Vec<Row>>) {
+        let v = &self.route_view;
+        if let Some((version, l, routes, rows)) = &v.built
+            && *version == v.version
+            && *l == langs
+        {
+            return (Arc::clone(routes), Arc::clone(rows));
+        }
+        let routes = Arc::new(self.route_rows());
+        let rows = Arc::new(rows_of(&routes, &self.route_view, langs));
+        self.route_view.built = Some((
+            self.route_view.version,
+            langs,
+            Arc::clone(&routes),
+            Arc::clone(&rows),
+        ));
+        (routes, rows)
+    }
+
+    /// What the refresh asks for the Routes window: a page of
+    /// `ip.route.page` with the window's filters (G1.27c), or the whole
+    /// `ip.route.list` from a router without it.
+    pub(crate) fn route_query(&self) -> Value {
+        if !self.has_command("ip.route.page") {
+            return json!({ "command": "ip.route.list" });
+        }
+        let v = &self.route_view;
+        let mut p = Map::new();
+        match v.family {
+            Family::All => {}
+            Family::V4 => {
+                p.insert("family".into(), json!("ipv4"));
+            }
+            Family::V6 => {
+                p.insert("family".into(), json!("ipv6"));
+            }
+        }
+        if let Some(st) = v.state {
+            p.insert("state".into(), json!(st));
+        }
+        if !v.origins.is_empty() {
+            let o: Vec<&str> = v.origins.iter().map(String::as_str).collect();
+            p.insert("origin".into(), json!(o.join(",")));
+        }
+        if let Some(t) = &v.table {
+            p.insert("routing_table".into(), json!(t));
+        }
+        if valid_prefix(&v.prefix) {
+            p.insert("prefix".into(), json!(v.prefix.trim()));
+            p.insert("match".into(), json!(v.prefix_mode.param()));
+        }
+        if v.aggregate {
+            p.insert("aggregate".into(), json!(true));
+        }
+        p.insert("offset".into(), json!(v.offset));
+        p.insert("limit".into(), json!(PAGE));
+        json!({ "command": "ip.route.page", "params": p })
+    }
+
+    /// The reply of [`Self::route_query`].
+    pub(crate) fn route_page_arrived(&mut self, value: Value) {
+        let v = &mut self.route_view;
+        match value {
+            Value::Array(rows) => {
+                self.cache.routes = rows;
+                v.page = None;
+                v.summary = None;
+            }
+            Value::Object(mut o) => {
+                self.cache.routes = match o.remove("rows") {
+                    Some(Value::Array(rows)) => rows,
+                    _ => Vec::new(),
+                };
+                let n = |k: &str| o.get(k).and_then(Value::as_u64).unwrap_or(0) as usize;
+                v.page = Some((n("total"), n("offset")));
+                v.summary = o.remove("summary");
+            }
+            _ => {}
+        }
+        v.version = v.version.wrapping_add(1);
+    }
+
+    /// The window's query changed: ask again now, from the first page.
+    fn route_requery(&mut self) {
+        self.route_view.offset = 0;
+        self.route_view.version = self.route_view.version.wrapping_add(1);
+        self.cache.refreshed_at = None;
+    }
+
     /// The route whose detail the Routes window shows (G1.27b).
     pub(crate) fn route_selected(&self) -> Option<&str> {
         self.route_view.selected.as_deref()
@@ -874,8 +1079,7 @@ impl CoreRouterUi {
 
     pub(crate) fn routes(&mut self, ui: &mut Ui) {
         let langs = self.lang;
-        let routes = self.route_rows();
-        let rows = rows_of(&routes, &self.route_view, langs);
+        let (routes, rows) = self.route_built(langs);
         let selection = self.tables.routes.selection(&rows);
         let keys = paths_of(&selection, &routes);
         let picked: Vec<&Route> = routes
@@ -952,7 +1156,13 @@ impl CoreRouterUi {
             })
             .collect();
         let line = ui.spacing().interact_size.y + ui.spacing().item_spacing.y;
-        let footer_h = line + if single.is_some() { DETAIL_H } else { 0.0 };
+        let pager = self
+            .route_view
+            .page
+            .is_some_and(|(total, offset)| total > PAGE || offset > 0);
+        let footer_h = line
+            + if pager { line } else { 0.0 }
+            + if single.is_some() { DETAIL_H } else { 0.0 };
         let out = table::show(
             ui,
             TABLE,
@@ -975,7 +1185,13 @@ impl CoreRouterUi {
                 }
             },
         );
-        footer(ui, &counts(&routes), langs.labels);
+        self.route_pager(ui);
+        let c = self
+            .route_view
+            .summary
+            .as_ref()
+            .map_or_else(|| counts(&routes), summary_counts);
+        footer(ui, &c, langs.labels);
         if let Some(key) = &single {
             let shown = self
                 .panel_mut::<crate::route_detail::Detail>()
@@ -986,12 +1202,30 @@ impl CoreRouterUi {
             detail(ui, shown.as_ref(), langs);
         }
         // A click on an ECMP group's line opens or closes it.
-        if let Some(key) = out.clicked.filter(|k| k.starts_with(GROUP))
-            && !self.route_view.open.remove(&key)
-        {
-            self.route_view.open.insert(key);
+        if let Some(key) = out.clicked.clone().filter(|k| k.starts_with(GROUP)) {
+            if !self.route_view.open.remove(&key) {
+                self.route_view.open.insert(key);
+            }
+            self.route_view.version = self.route_view.version.wrapping_add(1);
         }
-        if let Some(key) = out.opened.filter(|k| !k.starts_with(GROUP)) {
+        // A click on an aggregate line opens it: its routes, searched.
+        if let Some(r) = out
+            .clicked
+            .as_ref()
+            .filter(|k| k.starts_with(BUCKET))
+            .and_then(|k| routes.iter().find(|r| r.key == *k))
+        {
+            let v = &mut self.route_view;
+            v.prefix = r.dst.clone();
+            v.prefix_mode = PrefixMode::Contained;
+            v.opened_bucket = v.aggregate;
+            v.aggregate = false;
+            self.route_requery();
+        }
+        if let Some(key) = out
+            .opened
+            .filter(|k| !k.starts_with(GROUP) && !k.starts_with(BUCKET))
+        {
             act = Some(Act::Open(vec![key]));
         }
         // Double click on an inline comment: only static routes have one.
@@ -1023,26 +1257,35 @@ impl CoreRouterUi {
         }
     }
 
-    /// The quick filters: family, origin, state and table, as chips.
+    /// The quick filters: family, origin, state and table, as chips; then
+    /// the prefix search and the aggregation (G1.27c). The router filters:
+    /// a change asks again.
     fn route_filters(&mut self, ui: &mut Ui, tables: &[String]) {
         let l = self.lang.labels;
+        let page = self.has_command("ip.route.page");
         let v = &mut self.route_view;
+        let mut changed = false;
         ui.horizontal_wrapped(|ui| {
             for (f, label) in [(Family::All, "All"), (Family::V4, "IPv4"), (Family::V6, "IPv6")] {
                 if filter_chip(ui, tr(l, label), v.family == f) {
                     v.family = f;
+                    changed = true;
                 }
             }
             ui.separator();
             for o in ["connected", "static", "dhcp", "ra"] {
-                if filter_chip(ui, o, v.origins.contains(o)) && !v.origins.remove(o) {
-                    v.origins.insert(o.to_owned());
+                if filter_chip(ui, o, v.origins.contains(o)) {
+                    if !v.origins.remove(o) {
+                        v.origins.insert(o.to_owned());
+                    }
+                    changed = true;
                 }
             }
             ui.separator();
-            for s in ["active", "standby", "inactive"] {
-                if filter_chip(ui, s, v.state == Some(s)) {
-                    v.state = if v.state == Some(s) { None } else { Some(s) };
+            for st in ["active", "standby", "inactive"] {
+                if filter_chip(ui, st, v.state == Some(st)) {
+                    v.state = if v.state == Some(st) { None } else { Some(st) };
+                    changed = true;
                 }
             }
             // Tables only when there is more than main.
@@ -1055,10 +1298,79 @@ impl CoreRouterUi {
                         } else {
                             Some(t.clone())
                         };
+                        changed = true;
                     }
                 }
             }
         });
+        if page {
+            ui.horizontal(|ui| {
+                ui.label(tr(l, "Prefix"));
+                let ok = v.prefix.trim().is_empty() || valid_prefix(&v.prefix);
+                let mut edit = TextEdit::singleline(&mut v.prefix)
+                    .id(prefix_id())
+                    .hint_text("10.0.0.0/8")
+                    .desired_width(150.0);
+                if !ok {
+                    edit = edit.text_color(chip::RED.tone(ui.visuals()).ink);
+                }
+                let resp = ui.add(edit);
+                if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) && ok {
+                    changed = true;
+                }
+                for (mode, label) in [
+                    (PrefixMode::Contained, "contained"),
+                    (PrefixMode::Contains, "contains"),
+                    (PrefixMode::Exact, "exact"),
+                ] {
+                    if filter_chip(ui, tr(l, label), v.prefix_mode == mode) {
+                        v.prefix_mode = mode;
+                        changed = true;
+                    }
+                }
+                if !v.prefix.is_empty() && filter_chip(ui, "x", false) {
+                    v.prefix.clear();
+                    v.aggregate |= v.opened_bucket;
+                    v.opened_bucket = false;
+                    changed = true;
+                }
+                ui.separator();
+                if filter_chip(ui, tr(l, "aggregate /16"), v.aggregate) {
+                    v.aggregate = !v.aggregate;
+                    changed = true;
+                }
+            });
+        }
+        if changed {
+            self.route_requery();
+        }
+    }
+
+    /// Previous / next page of a big table (G1.27c).
+    fn route_pager(&mut self, ui: &mut Ui) {
+        let Some((total, offset)) = self.route_view.page else {
+            return;
+        };
+        if total <= PAGE && offset == 0 {
+            return;
+        }
+        let l = self.lang.labels;
+        let mut to = None;
+        ui.horizontal(|ui| {
+            let last = (offset + PAGE).min(total);
+            ui.weak(format!("{}–{last} {} {total}", offset + 1, tr(l, "of")));
+            if ui.add_enabled(offset > 0, egui::Button::new("<")).clicked() {
+                to = Some(offset.saturating_sub(PAGE));
+            }
+            if ui.add_enabled(last < total, egui::Button::new(">")).clicked() {
+                to = Some(offset + PAGE);
+            }
+        });
+        if let Some(o) = to {
+            self.route_view.offset = o;
+            self.route_view.version = self.route_view.version.wrapping_add(1);
+            self.cache.refreshed_at = None;
+        }
     }
 
     /// "Lookup": which route a packet to an address takes, and its answer.
@@ -1195,6 +1507,10 @@ impl CoreRouterUi {
 
     /// Draw every open route dialog as its own floating window.
     pub(crate) fn route_dialogs(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        // Every frame: no parsing of the rows unless a dialog is open.
+        if self.route_dialogs.is_empty() {
+            return;
+        }
         let routes = self.route_rows();
         let tables = self.tables();
         let mut dialogs = std::mem::take(&mut self.route_dialogs);
