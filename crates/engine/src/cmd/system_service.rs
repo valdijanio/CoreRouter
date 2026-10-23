@@ -10,7 +10,9 @@
 //! and never touches the config (the config command that turns a service
 //! off is in the row's `enable`).
 
-use corerouter_model::service::{MAX_REQUESTS, ServiceAction, ServiceRequest, ServiceTable};
+use corerouter_model::service::{
+    MAX_REQUESTS, ServiceAction, ServiceRequest, ServiceState, ServiceTable,
+};
 use serde_json::{Value, json};
 
 use super::args::{opt_str, req_str};
@@ -105,6 +107,19 @@ fn request(s: &mut Session, p: &Value, action: ServiceAction) -> Result<Value> {
             ),
         ));
     }
+    if action == ServiceAction::Start && row.state == ServiceState::Disabled {
+        // Running but idle by its config: start has nothing more to run, and
+        // an OK with nothing changing looked like a broken button.
+        let why = row.reason.as_deref().unwrap_or("its config");
+        return Err(EngineError::bad(
+            "name",
+            format!(
+                "'{}' is already running, idle because of its config ({why}); \
+                 turn it on with {}",
+                row.name, row.enable
+            ),
+        ));
+    }
     let state = row.state;
     let name = row.name.clone();
     let Some(t) = s.ext_mut::<ServiceTable>() else {
@@ -160,6 +175,13 @@ mod tests {
                     ..ServiceRow::default()
                 },
                 ServiceRow {
+                    name: "dns-server".into(),
+                    state: ServiceState::Disabled,
+                    reason: Some("ip.dns allow_remote_requests=no".into()),
+                    enable: "ip.dns.set allow_remote_requests=yes".into(),
+                    ..ServiceRow::default()
+                },
+                ServiceRow {
                     name: "control".into(),
                     state: ServiceState::Running,
                     protected: true,
@@ -192,7 +214,7 @@ mod tests {
     fn print_and_actions_reach_the_supervisor_queue() {
         let mut s = supervised();
         let rows = s.execute("system.service.print", &json!({})).unwrap();
-        assert_eq!(rows.as_array().unwrap().len(), 2);
+        assert_eq!(rows.as_array().unwrap().len(), 3);
         assert_eq!(rows[0]["state"], "running");
         let one = s
             .execute("system.service.print", &json!({"name": "control"}))
@@ -233,7 +255,7 @@ mod tests {
             .execute("system.service.print", &json!({"name": "nope"}))
             .unwrap_err()
             .to_string();
-        assert!(e.contains("services: dns-resolver, control"), "{e}");
+        assert!(e.contains("services: dns-resolver, dns-server, control"), "{e}");
         assert!(queued(&s).is_empty());
     }
 
@@ -277,5 +299,22 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(e.contains("too many"), "{e}");
+    }
+
+    /// Start on a service its config keeps idle used to answer OK and change
+    /// nothing: now it says why and how to turn it on. Stop still works.
+    #[test]
+    fn start_on_a_service_off_in_the_config_says_how_to_turn_it_on() {
+        let mut s = supervised();
+        let e = s
+            .execute("system.service.start", &json!({"name": "dns-server"}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("allow_remote_requests=no"), "{e}");
+        assert!(e.contains("ip.dns.set allow_remote_requests=yes"), "{e}");
+        assert!(queued(&s).is_empty(), "nothing queued");
+        s.execute("system.service.stop", &json!({"name": "dns-server"}))
+            .unwrap();
+        assert_eq!(queued(&s), vec![("dns-server".into(), ServiceAction::Stop)]);
     }
 }
