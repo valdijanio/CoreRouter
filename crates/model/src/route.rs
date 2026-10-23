@@ -23,6 +23,38 @@ pub const MAIN_TABLE_ID: u32 = 254;
 pub const FIRST_VRF_TABLE: u32 = 1000;
 pub const LAST_VRF_TABLE: u32 = 1_000_000;
 
+/// Why a route is not usable: a stable `id` (the GUI translates it with
+/// `args`, G0.15) and the English text, which is what `Display` prints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Why {
+    pub id: &'static str,
+    pub args: Vec<(&'static str, String)>,
+    pub text: String,
+}
+
+impl Why {
+    pub fn new(id: &'static str, text: String) -> Self {
+        Self {
+            id,
+            args: Vec::new(),
+            text,
+        }
+    }
+
+    /// With argument `key` (a `{key}` of the translated template).
+    #[must_use]
+    pub fn arg(mut self, key: &'static str, value: impl std::fmt::Display) -> Self {
+        self.args.push((key, value.to_string()));
+        self
+    }
+}
+
+impl std::fmt::Display for Why {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// What a static route does right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reach {
@@ -33,14 +65,14 @@ pub enum Reach {
     },
     /// Well formed but not usable now: the route, its interface or the
     /// address that reaches its gateway is disabled.
-    Inactive(String),
+    Inactive(Why),
     /// Wrong whatever the state: nothing in its table can reach the gateway,
     /// mixed address families, unknown table or interface. `field` is the
     /// `RouteEntry` field to fix.
-    Invalid { field: &'static str, why: String },
+    Invalid { field: &'static str, why: Why },
 }
 
-fn invalid(field: &'static str, why: String) -> Reach {
+fn invalid(field: &'static str, why: Why) -> Reach {
     Reach::Invalid { field, why }
 }
 
@@ -95,49 +127,78 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
     {
         return invalid(
             "gateway",
-            format!(
-                "gateway {g} is {} but dst-address {} is {}",
-                family(g),
-                r.dst_address,
-                family(r.dst_address.addr())
-            ),
+            Why::new(
+                "family-mismatch",
+                format!(
+                    "gateway {g} is {} but dst-address {} is {}",
+                    family(g),
+                    r.dst_address,
+                    family(r.dst_address.addr())
+                ),
+            )
+            .arg("gateway", g)
+            .arg("dst", r.dst_address),
         );
     }
     if table_id(cfg, &r.routing_table).is_none() {
         return invalid(
             "routing_table",
-            format!(
-                "routing table '{}' does not exist (create it with ip.vrf.add)",
-                r.routing_table
-            ),
+            Why::new(
+                "no-table",
+                format!(
+                    "routing table '{}' does not exist (create it with ip.vrf.add)",
+                    r.routing_table
+                ),
+            )
+            .arg("table", &r.routing_table),
         );
     }
     if let Some(i) = r.gateway.iface() {
         let Some(iface) = cfg.interfaces.get(i) else {
-            return invalid("gateway", format!("interface '{i}' does not exist"));
+            return invalid(
+                "gateway",
+                Why::new("no-interface", format!("interface '{i}' does not exist"))
+                    .arg("interface", i),
+            );
         };
         if let Some(b) = &iface.bridge {
             return invalid(
                 "gateway",
-                format!("'{i}' is a port of bridge '{b}'; route through '{b}' instead"),
+                Why::new(
+                    "bridge-port",
+                    format!("'{i}' is a port of bridge '{b}'; route through '{b}' instead"),
+                )
+                .arg("interface", i)
+                .arg("master", b),
             );
         }
         if let Some(b) = &iface.bond {
             return invalid(
                 "gateway",
-                format!("'{i}' is a slave of bond '{b}'; route through '{b}' instead"),
+                Why::new(
+                    "bond-slave",
+                    format!("'{i}' is a slave of bond '{b}'; route through '{b}' instead"),
+                )
+                .arg("interface", i)
+                .arg("master", b),
             );
         }
         let t = table_of(cfg, i);
         if t != r.routing_table {
             return invalid(
                 "gateway",
-                format!("'{i}' is in routing table '{t}', not '{}'", r.routing_table),
+                Why::new(
+                    "other-table",
+                    format!("'{i}' is in routing table '{t}', not '{}'", r.routing_table),
+                )
+                .arg("interface", i)
+                .arg("table", &t)
+                .arg("route_table", &r.routing_table),
             );
         }
     }
     if r.disabled {
-        return Reach::Inactive("route is disabled".into());
+        return Reach::Inactive(Why::new("disabled", "route is disabled".into()));
     }
     match (gw, r.gateway.iface()) {
         (None, Some(i)) => up_or(cfg, i, None),
@@ -155,19 +216,29 @@ pub fn reach(cfg: &Config, r: &RouteEntry) -> Reach {
             if nets.is_empty() {
                 return invalid(
                     "gateway",
-                    format!("{g} is not in a network of '{i}' (see ip.address.list)"),
+                    Why::new(
+                        "not-on-interface",
+                        format!("{g} is not in a network of '{i}' (see ip.address.list)"),
+                    )
+                    .arg("gateway", g)
+                    .arg("interface", i),
                 );
             }
             if !nets.iter().any(|a| !a.disabled) {
-                return Reach::Inactive(format!(
-                    "the address of '{i}' that reaches {g} is disabled"
-                ));
+                return Reach::Inactive(
+                    Why::new(
+                        "address-disabled",
+                        format!("the address of '{i}' that reaches {g} is disabled"),
+                    )
+                    .arg("interface", i)
+                    .arg("gateway", g),
+                );
             }
             up_or(cfg, i, Some(g))
         }
         (Some(g), None) => resolve_ip(cfg, g, &r.routing_table),
         // `Gateway` cannot be built empty; a hand-edited file still is not.
-        (None, None) => invalid("gateway", "gateway is empty".into()),
+        (None, None) => invalid("gateway", Why::new("empty", "gateway is empty".into())),
     }
 }
 
@@ -178,16 +249,29 @@ fn up_or(cfg: &Config, link: &IfName, gateway: Option<IpAddr>) -> Reach {
             gateway,
         }
     } else {
-        Reach::Inactive(format!("interface '{link}' (or its VRF) is disabled"))
+        Reach::Inactive(
+            Why::new(
+                "interface-disabled",
+                format!("interface '{link}' (or its VRF) is disabled"),
+            )
+            .arg("interface", link),
+        )
     }
 }
 
-fn own_address(cfg: &Config, g: IpAddr, table: &RoutingTable) -> Option<String> {
+fn own_address(cfg: &Config, g: IpAddr, table: &RoutingTable) -> Option<Why> {
     cfg.ip
         .addresses
         .iter()
         .find(|a| a.address.addr() == g && table_of(cfg, &a.interface) == *table)
-        .map(|a| format!("{g} is an address of this router (on '{}')", a.interface))
+        .map(|a| {
+            Why::new(
+                "own-address",
+                format!("{g} is an address of this router (on '{}')", a.interface),
+            )
+            .arg("gateway", g)
+            .arg("interface", &a.interface)
+        })
 }
 
 /// A bare IP gateway: the connected network that holds it, longest prefix
@@ -196,7 +280,11 @@ fn resolve_ip(cfg: &Config, g: IpAddr, table: &RoutingTable) -> Reach {
     if is_link_local(g) {
         return invalid(
             "gateway",
-            format!("link-local gateway {g} needs an interface: {g}%<interface>"),
+            Why::new(
+                "needs-interface",
+                format!("link-local gateway {g} needs an interface: {g}%<interface>"),
+            )
+            .arg("gateway", g),
         );
     }
     if let Some(why) = own_address(cfg, g, table) {
@@ -212,9 +300,14 @@ fn resolve_ip(cfg: &Config, g: IpAddr, table: &RoutingTable) -> Reach {
     if nets.is_empty() {
         return invalid(
             "gateway",
-            format!(
-                "{g} is not in any connected network of routing table '{table}' (see ip.address.list)"
-            ),
+            Why::new(
+                "unreachable",
+                format!(
+                    "{g} is not in any connected network of routing table '{table}' (see ip.address.list)"
+                ),
+            )
+            .arg("gateway", g)
+            .arg("table", table),
         );
     }
     nets.sort_by(|a, b| {
@@ -231,9 +324,13 @@ fn resolve_ip(cfg: &Config, g: IpAddr, table: &RoutingTable) -> Reach {
             link: a.interface.clone(),
             gateway: Some(g),
         },
-        None => Reach::Inactive(format!(
-            "the network of {g} is on a disabled address or interface"
-        )),
+        None => Reach::Inactive(
+            Why::new(
+                "network-disabled",
+                format!("the network of {g} is on a disabled address or interface"),
+            )
+            .arg("gateway", g),
+        ),
     }
 }
 
@@ -330,7 +427,7 @@ mod tests {
 
     fn invalid(r: Reach, needle: &str) {
         match r {
-            Reach::Invalid { why, .. } => assert!(why.contains(needle), "{why}"),
+            Reach::Invalid { why, .. } => assert!(why.text.contains(needle), "{why}"),
             other => panic!("expected Invalid({needle}), got {other:?}"),
         }
     }
