@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, Slot, StorageError};
 use corerouter_hal::VirtualHal;
+use corerouter_model::cow::CowArc;
 use corerouter_model::store::Revision;
 use corerouter_model::{ConfigStore, Users, persist};
 use serde_json::json;
@@ -145,6 +146,34 @@ fn all_64_revisions_of_a_big_config_survive_a_reboot() {
             (b.number, &b.comment, b.timestamp)
         );
         assert!(a.config == b.config, "revision {} differs", a.number);
+    }
+    // Built from each other: a section two neighbours have equal is one
+    // allocation (64 revisions cost about one config in memory). The
+    // sections no commit touched are one for the whole history.
+    for pair in back.windows(2) {
+        let (old, new) = (&pair[0].config, &pair[1].config);
+        let n = pair[0].number;
+        assert_eq!(
+            *old.ip == *new.ip,
+            CowArc::ptr_eq(&old.ip, &new.ip),
+            "ip of {n}"
+        );
+        let (a, b) = (&old.ip.firewall, &new.ip.firewall);
+        assert_eq!(**a == **b, CowArc::ptr_eq(a, b), "firewall of {n}");
+        let (a, b) = (&a.address_lists, &b.address_lists);
+        assert_eq!(**a == **b, CowArc::ptr_eq(a, b), "address lists of {n}");
+    }
+    let newest = &back[63].config;
+    for rev in back {
+        let c = &rev.config;
+        assert!(CowArc::ptr_eq(&c.interfaces, &newest.interfaces));
+        assert!(CowArc::ptr_eq(&c.ip.routes, &newest.ip.routes));
+        assert!(CowArc::ptr_eq(&c.ip.addresses, &newest.ip.addresses));
+        assert!(CowArc::ptr_eq(
+            &c.ip.firewall.filter,
+            &newest.ip.firewall.filter
+        ));
+        assert!(CowArc::ptr_eq(&c.ip.dhcp_server, &newest.ip.dhcp_server));
     }
     // Rolling back to the oldest gives its exact config.
     let oldest = memory[0].number;
