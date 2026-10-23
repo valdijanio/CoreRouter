@@ -7,6 +7,8 @@
 //! | `running.json` | [`Slot::Current`] |
 //! | `running.json.prev` | [`Slot::Previous`] |
 //! | `running.json.tmp` | write in progress (removed on open) |
+//! | `rev-<n>.json` | revision `n` of the history, written once (G1.23) |
+//! | `rev-<n>.json.tmp` | revision write in progress (removed on open) |
 //! | `*.corrupt`, `*.corrupt.<n>` | quarantined unreadable slot (each one kept) |
 //! | `state-<name>.json` | operational state outside the revisions (DHCP client leases) |
 //! | `journal-<name>.log` | append-only journal (the DHCP server's leases, G4.2a) |
@@ -16,6 +18,12 @@
 //! directory. Renames are atomic, so after a crash at any step each slot is a
 //! complete file (old or new) or absent; the engine then loads the newest
 //! readable one.
+//!
+//! A slot holds the running config and its newest revision; the older ones
+//! are `rev-<n>.json` files (temp file, fsync, rename), each written once by
+//! the commit that made it, before the slot that needs it (the slot's
+//! directory fsync makes both renames durable). See the engine's
+//! `history_files` for the order and what a crash leaves.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
@@ -29,6 +37,29 @@ pub const CURRENT: &str = "running.json";
 pub const PREVIOUS: &str = "running.json.prev";
 pub const TEMP: &str = "running.json.tmp";
 pub const CORRUPT_SUFFIX: &str = ".corrupt";
+/// Revision files: `rev-<n>.json`.
+pub const REVISION_PREFIX: &str = "rev-";
+const REVISION_SUFFIX: &str = ".json";
+
+/// File name of revision `number`.
+pub fn revision_file(number: u32) -> String {
+    format!("{REVISION_PREFIX}{number}{REVISION_SUFFIX}")
+}
+
+/// The revision a file name holds (`rev-12.json` gives 12), strictly: no
+/// sign, no leading zero, nothing after.
+fn revision_number(name: &str) -> Option<u32> {
+    let digits = name
+        .strip_prefix(REVISION_PREFIX)?
+        .strip_suffix(REVISION_SUFFIX)?;
+    let canonical = !digits.is_empty()
+        && digits.bytes().all(|b| b.is_ascii_digit())
+        && (digits == "0" || !digits.starts_with('0'));
+    if !canonical {
+        return None;
+    }
+    digits.parse().ok()
+}
 
 #[derive(Debug, Clone)]
 pub struct FileStorage {
@@ -59,7 +90,9 @@ impl FileStorage {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            let stale = (name.starts_with("state-") || name.starts_with("journal-"))
+            let stale = (name.starts_with("state-")
+                || name.starts_with("journal-")
+                || name.starts_with(REVISION_PREFIX))
                 && name.ends_with(".tmp");
             if stale {
                 match fs::remove_file(entry.path()) {
@@ -266,6 +299,60 @@ impl ConfigStorage for FileStorage {
             .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))?;
         self.sync_dir().map_err(|e| self.err("sync", &e))
     }
+
+    fn revision_files(&self) -> bool {
+        true
+    }
+
+    fn list_revisions(&mut self) -> Result<Vec<u32>, StorageError> {
+        let entries = fs::read_dir(&self.dir).map_err(|e| self.err("list", &e))?;
+        let mut found = Vec::new();
+        for entry in entries {
+            let Ok(entry) = entry else { continue };
+            if let Some(n) = entry.file_name().to_str().and_then(revision_number) {
+                found.push(n);
+            }
+        }
+        Ok(found)
+    }
+
+    fn load_revision(&mut self, number: u32) -> Result<Option<String>, StorageError> {
+        let file = revision_file(number);
+        let f = match File::open(self.path(&file)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(self.err(&format!("open {file}"), &e)),
+        };
+        // Like a slot: past the limit it comes back as text the decoder
+        // refuses.
+        let limit = u64::try_from(MAX_FILE_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        let mut bytes = Vec::new();
+        f.take(limit)
+            .read_to_end(&mut bytes)
+            .map_err(|e| self.err(&format!("read {file}"), &e))?;
+        Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
+    }
+
+    fn save_revision(&mut self, number: u32, data: &str) -> Result<(), StorageError> {
+        let file = revision_file(number);
+        let temp = format!("{file}.tmp");
+        self.write_file(&temp, data)
+            .map_err(|e| self.err(&format!("write {temp}"), &e))?;
+        // Durable with the slot's directory fsync, which comes next.
+        fs::rename(self.path(&temp), self.path(&file))
+            .map_err(|e| self.err(&format!("rename {temp} → {file}"), &e))
+    }
+
+    fn remove_revision(&mut self, number: u32) -> Result<(), StorageError> {
+        let file = revision_file(number);
+        match fs::remove_file(self.path(&file)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(self.err(&format!("remove {file}"), &e)),
+        }
+    }
 }
 
 /// The last `limit` bytes of `f`, from the first line that starts inside
@@ -289,4 +376,29 @@ pub fn read_tail(mut f: File, limit: u64) -> io::Result<Vec<u8>> {
         .position(|b| *b == b'\n')
         .map_or(bytes.len(), |i| i + 1);
     Ok(bytes.split_off(start))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn revision_names_are_strict() {
+        assert_eq!(revision_number(&revision_file(0)), Some(0));
+        assert_eq!(
+            revision_number(&revision_file(4_000_000_000)),
+            Some(4_000_000_000)
+        );
+        for bad in [
+            "rev-.json",
+            "rev-01.json",
+            "rev-+1.json",
+            "rev-1.json.tmp",
+            "rev-1.jsonx",
+            "rev-99999999999.json",
+            "running.json",
+        ] {
+            assert_eq!(revision_number(bad), None, "{bad}");
+        }
+    }
 }

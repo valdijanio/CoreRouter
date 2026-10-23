@@ -162,11 +162,18 @@ impl Session {
         hal.offer_dhcp6_lab_server(Arc::new(corerouter_proto_dhcp::lab6::LabServer6::default()));
         hal.offer_dhcp_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts::LabHosts::default()));
         hal.offer_dhcp6_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts6::LabHosts6::default()));
-        let (restored, boot_errors) = restore(storage.as_mut());
+        let (restored, mut boot_errors) = restore(storage.as_mut());
         let (restored, users) = match restored {
             Some((store, users, slot)) => (Some((store, slot)), users),
             None => (None, Users::default()),
         };
+        // The older revisions kept in files of their own (G1.23).
+        let (slot, store) = restored.map_or((None, None), |(store, slot)| (Some(slot), Some(store)));
+        let (store, files) =
+            crate::history_files::restore_history(storage.as_mut(), store, &mut boot_errors);
+        let restored = store.zip(slot);
+        let mut ext = crate::ext::Extensions::default();
+        ext.set(files);
         let mut status = StorageStatus {
             backend: storage.describe(),
             loaded_from: None,
@@ -221,7 +228,7 @@ impl Session {
             dom: DomWatch::default(),
             ntp: Default::default(),
             counters: EngineCounters::default(),
-            ext: crate::ext::Extensions::default(),
+            ext,
         }
     }
 
@@ -430,7 +437,15 @@ impl Session {
         }
         // It must fit in the saved file with its copy in the history, or
         // the next boot could not load it (audit #1).
-        let size = persist::encoded_len(self.store.candidate());
+        // Serialized once: the save after the commit reuses the text (G1.23).
+        let encoded = persist::encode_config(self.store.candidate())
+            .map_err(|e| {
+                EngineError::Validation(vec![corerouter_model::validate::Issue::new(
+                    "config",
+                    format!("cannot be encoded: {e}"),
+                )])
+            })?;
+        let size = encoded.len();
         if size > persist::MAX_CONFIG_BYTES {
             return Err(EngineError::Validation(vec![corerouter_model::validate::Issue::new(
                 "config",
@@ -470,6 +485,9 @@ impl Session {
             (true, false) => format!("{comment} [safe mode]"),
         };
         let revision = self.store.commit(&comment, self.now())?;
+        if let Some(files) = self.ext_mut::<crate::history_files::RevisionFiles>() {
+            files.note_encoded(revision, encoded);
+        }
         if !pending {
             self.save();
         }
@@ -514,14 +532,32 @@ impl Session {
     pub(crate) fn save(&mut self) {
         let entry_store = self.safe_mode_entry_store();
         let store = entry_store.as_ref().unwrap_or(&self.store);
-        let saved = persist::encode_bounded(store, &self.users, persist::SAVE_BUDGET_BYTES)
-            .map_err(|e| e.to_string())
-            .and_then(|(text, skipped)| {
-                self.storage
-                    .save(&text)
-                    .map(|()| skipped)
-                    .map_err(|e| e.to_string())
-            });
+        let saved = if self.storage.revision_files() {
+            // Only what is new is written (G1.23).
+            let mut files = self
+                .ext
+                .get_mut::<crate::history_files::RevisionFiles>()
+                .map(std::mem::take)
+                .unwrap_or_default();
+            let saved = crate::history_files::save(
+                self.storage.as_mut(),
+                &mut files,
+                store,
+                &self.users,
+                persist::SAVE_BUDGET_BYTES,
+            );
+            self.ext.set(files);
+            saved
+        } else {
+            persist::encode_bounded(store, &self.users, persist::SAVE_BUDGET_BYTES)
+                .map_err(|e| e.to_string())
+                .and_then(|(text, skipped)| {
+                    self.storage
+                        .save(&text)
+                        .map(|()| skipped)
+                        .map_err(|e| e.to_string())
+                })
+        };
         match saved {
             Ok(skipped) => {
                 if skipped > 0 && skipped != self.storage_status.revisions_not_saved {
