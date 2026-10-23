@@ -40,7 +40,8 @@ seja JSON fecha a conexão** (isso bloqueia um `fetch`/form HTTP de uma página 
 
 Conexões ainda sem login (auditoria do controle, `control::conn`): no máximo 8 das 16 vagas, 4 por
 origem de rede (endereço IPv4 ou /64 IPv6; loopback não tem limite por origem); 30 s ociosas e
-caem; o handshake TLS e o cabeçalho HTTP do WebSocket têm **prazo total** de 10 s (não por
+caem, e nenhuma fica mais de 60 s sem login no total (como o `LoginGraceTime` do SSH: quem pinga
+ou manda um byte a cada 29 s sem nunca logar também cai); o handshake TLS e o cabeçalho HTTP do WebSocket têm **prazo total** de 10 s (não por
 `read`: quem manda um byte a cada 9 s também cai). Da rede, antes do login, a linha vai até
 64 KiB; os `params` só viram JSON depois de conferido o token. Acima do limite: linha JSON no
 TCP, `503` no WebSocket, nada no TLS. Toda conexão tem TCP keepalive (15 s + 3 × 5 s) e, no

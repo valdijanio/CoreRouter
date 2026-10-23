@@ -43,6 +43,7 @@ fn quick() -> Timeouts {
     Timeouts {
         handshake: Duration::from_millis(500),
         unauthenticated_idle: Duration::from_millis(300),
+        login_grace: Duration::from_millis(800),
         ..Timeouts::default()
     }
 }
@@ -297,4 +298,90 @@ fn server_info_on_loopback_is_complete() {
     let info = c.call("server.info", Value::Null).unwrap();
     assert_eq!(info["auth"], "required");
     assert!(info.get("version").is_some() && info.get("commit").is_some());
+}
+
+/// audit-e2e: 16 local clients (each with a good token) connecting while
+/// a commit holds the session: the first 8 waited for the lock still
+/// counted as logged out, and the 9th got "too many connections that have
+/// not logged in". A good token now counts as logged in before the command
+/// waits for its turn.
+#[test]
+fn clients_waiting_for_the_session_are_not_logged_out() {
+    let (session, gate, token) = lab();
+    let listener = bind_loopback(0).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    spawn(
+        Endpoint::loopback(listener),
+        SharedHost(session.clone()),
+        gate,
+    )
+    .unwrap();
+    let busy = corerouter_engine::lock(&session);
+    let clients: Vec<_> = (0..12)
+        .map(|_| {
+            let (addr, token) = (addr.clone(), token.clone());
+            let t = std::thread::spawn(move || {
+                let mut c = Client::connect(&addr, Duration::from_secs(2))?;
+                c.set_token(Some(token));
+                c.call("engine.execute", json!({"command": "interface.list"}))
+            });
+            std::thread::sleep(Duration::from_millis(30));
+            t
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+    drop(busy);
+    for c in clients {
+        let r = c.join().unwrap();
+        assert!(r.is_ok(), "{r:?}");
+    }
+}
+
+/// audit-e2e: a stranger that is never idle (a byte of a line that never
+/// ends, or a complete `ping`, before every idle timeout) used to keep its
+/// logged-out slot forever: 8 of them locked every new client out of the
+/// endpoint, the operator's included (seen against the real daemon). Now a
+/// connection stays logged out at most the login grace time; once logged
+/// in it has no deadline.
+#[test]
+fn busy_strangers_are_cut_at_the_login_grace() {
+    let (session, gate, token) = lab();
+    let listener = bind_loopback(0).unwrap();
+    let addr = listener.local_addr().unwrap().to_string();
+    spawn(
+        Endpoint::loopback(listener).with_timeouts(quick()),
+        SharedHost(session),
+        gate,
+    )
+    .unwrap();
+    let feed = |line: &'static [u8]| {
+        let mut s = TcpStream::connect(&addr).unwrap();
+        let mut writer = s.try_clone().unwrap();
+        let feeder = std::thread::spawn(move || {
+            for _ in 0..40 {
+                if writer.write_all(line).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        });
+        let t = closed_within(&mut s, Duration::from_secs(3));
+        feeder.join().unwrap();
+        t
+    };
+    assert!(
+        feed(b"a").is_some(),
+        "a trickled line is still open after 3 s"
+    );
+    assert!(
+        feed(b"{\"id\":1,\"method\":\"ping\"}\n").is_some(),
+        "a logged-out ping loop is still open after 3 s"
+    );
+    // Logged in (the local token): no deadline.
+    let mut c = Client::connect(&addr, Duration::from_secs(2)).unwrap();
+    c.set_token(Some(token));
+    for _ in 0..12 {
+        assert!(c.call("auth.whoami", Value::Null).is_ok());
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

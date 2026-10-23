@@ -89,8 +89,9 @@ pub struct Session {
     /// The command being run said `force: true`: a lockout is accepted
     /// (G2.1b, see `crate::lockout`). Reset after each command or batch.
     pub(crate) lockout_ack: bool,
-    /// Inside [`Session::batch`]: the steps share one acknowledgement.
-    in_batch: bool,
+    /// Inside [`Session::batch`] (`Some(atomic)`): the steps share one
+    /// acknowledgement.
+    in_batch: Option<bool>,
     /// When links went up/down (operational, never saved; G1.19).
     pub(crate) links: LinkWatch,
     /// SFP diagnostics past their thresholds (operational; G1.20).
@@ -216,7 +217,7 @@ impl Session {
             users,
             logins: Logins::default(),
             lockout_ack: false,
-            in_batch: false,
+            in_batch: None,
             links: LinkWatch::default(),
             dom: DomWatch::default(),
             ntp: Default::default(),
@@ -252,7 +253,10 @@ impl Session {
             reason,
         })?;
 
-        let snapshot = self.store.candidate().clone();
+        // An atomic batch keeps one snapshot for all its steps and restores
+        // it on any failure: a copy of the whole candidate per step made a
+        // 20 000-step import quadratic (audit-e2e: 22.8 s in release).
+        let snapshot = (self.in_batch != Some(true)).then(|| self.store.candidate().clone());
         let rev_before = self.store.current_revision();
         // The commit runs inside the guard too: a panic in a validator or
         // the data plane must not leave the edit behind for the next
@@ -264,10 +268,10 @@ impl Session {
             }
             Ok(value)
         });
-        if result.is_err() {
+        if let (Err(_), Some(snapshot)) = (&result, snapshot) {
             self.store.set_candidate(snapshot);
         }
-        if !self.in_batch {
+        if self.in_batch.is_none() {
             self.lockout_ack = false;
         }
         if spec.journal {
@@ -343,10 +347,10 @@ impl Session {
         if atomic {
             self.mode = CommitMode::Transactional;
         }
-        let outer_batch = std::mem::replace(&mut self.in_batch, true);
+        let outer_batch = self.in_batch.replace(atomic);
         let out = self.batch_steps(steps, atomic, saved_mode, snapshot);
         self.in_batch = outer_batch;
-        if !outer_batch {
+        if outer_batch.is_none() {
             self.lockout_ack = false;
         }
         out

@@ -178,11 +178,17 @@ fn rows_of(
         {
             continue;
         }
-        let typed = row
+        let typed_menu = row
             .get("type")
             .and_then(Value::as_str)
-            .and_then(|t| menu.children.get(t).map(|m| (t, m)))
-            .and_then(|(t, m)| m.commands.get("add").map(|c| (t, c)));
+            .and_then(|t| menu.children.get(t).map(|m| (t, m)));
+        let typed = typed_menu.and_then(|(t, m)| m.commands.get("add").map(|c| (t, c)));
+        // A sub-menu with its own `print` (`/interface bonding`) exports
+        // its rows itself, with fields this menu's row lacks (`slaves`):
+        // here only what its `add` cannot take, as a `set`.
+        let exported_below = typed_menu
+            .and_then(|(_, m)| m.print())
+            .is_some_and(|p| p.required().next().is_none());
         // Present in every new config: set, never add.
         let preset = row.get("default").and_then(Value::as_bool) == Some(true);
         let (add_path, add) = match typed {
@@ -196,7 +202,7 @@ fn rows_of(
         let add = add.filter(|_| !preset);
         match (add, set) {
             (Some(add), _) => {
-                if !push(out, &add_path, add, row, false, true) {
+                if !exported_below && !push(out, &add_path, add, row, false, true) {
                     continue;
                 }
                 // What `add` cannot take, `set` sets afterwards.

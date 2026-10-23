@@ -12,11 +12,12 @@
 //!   sending one byte every few seconds cannot hold a slot). [`Sock`] sets
 //!   the remaining time before every read system call.
 //! - **Logged out = short leash.** Until a request on the connection is
-//!   authenticated it may stay idle only [`Timeouts::unauthenticated_idle`],
-//!   and only [`MAX_UNAUTHENTICATED`] of an endpoint's
+//!   authenticated it may stay idle only [`Timeouts::unauthenticated_idle`]
+//!   and stay logged out at most [`Timeouts::login_grace`] in total; only
+//!   [`MAX_UNAUTHENTICATED`] of an endpoint's
 //!   [`crate::server::MAX_CONNECTIONS`] slots (at most
 //!   [`MAX_UNAUTHENTICATED_PER_SOURCE`] per network source) may be in that
-//!   state, so idle strangers cannot lock the operator out. Once logged in
+//!   state, so idle or trickling strangers cannot lock the operator out. Once logged in
 //!   there is no idle limit (an MCP server or a GUI may sit idle for hours):
 //!   keepalive finds the dead ones.
 
@@ -40,6 +41,10 @@ pub struct Timeouts {
     pub handshake: Duration,
     /// How long a connection that has not logged in may stay silent.
     pub unauthenticated_idle: Duration,
+    /// How long a connection may stay logged out in total, busy or not
+    /// (SSH's `LoginGraceTime`): a stranger trickling a byte, or a `ping`,
+    /// before every idle timeout would otherwise keep its slot forever.
+    pub login_grace: Duration,
     /// TCP keepalive: silence before the first probe.
     pub keepalive_idle: Duration,
     /// TCP keepalive: time between probes.
@@ -56,6 +61,7 @@ impl Default for Timeouts {
         Self {
             handshake: Duration::from_secs(10),
             unauthenticated_idle: Duration::from_secs(30),
+            login_grace: Duration::from_secs(60),
             keepalive_idle: Duration::from_secs(15),
             keepalive_interval: Duration::from_secs(5),
             keepalive_probes: 3,
@@ -242,12 +248,13 @@ impl Sock {
         self.deadline = deadline.and_then(|d| Instant::now().checked_add(d));
     }
 
-    /// Handshake over: no deadline, and the logged-out idle limit until
-    /// [`Sock::authenticated`].
+    /// Handshake over: until [`Sock::authenticated`], the logged-out idle
+    /// limit and the login grace deadline (no deadline once logged in).
     pub fn handshake_done(&mut self) {
         self.deadline = None;
         if !self.authenticated {
             self.idle = Some(self.timeouts.unauthenticated_idle);
+            self.deadline = Instant::now().checked_add(self.timeouts.login_grace);
         }
     }
 
@@ -256,6 +263,7 @@ impl Sock {
     pub fn authenticated(&mut self) {
         self.authenticated = true;
         self.idle = None;
+        self.deadline = None;
         if let Some(slot) = self.slot.as_mut() {
             slot.authenticated();
         }
@@ -273,7 +281,7 @@ impl Sock {
                 if left.is_zero() {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "handshake deadline passed",
+                        "deadline passed (handshake or login grace)",
                     ));
                 }
                 Some(left)

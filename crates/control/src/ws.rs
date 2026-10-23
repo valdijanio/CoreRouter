@@ -31,7 +31,7 @@ use corerouter_engine::Caller;
 use crate::auth::Gate;
 use crate::dispatch::Host;
 use crate::server::{
-    Conn, Endpoint, Shutdown, accept_loop, answer, line_limit, serve_then_hang_up,
+    Conn, Endpoint, Shutdown, accept_loop, answer_with, line_limit, serve_then_hang_up,
 };
 use crate::wire::MAX_REQUEST_LINE;
 
@@ -281,10 +281,14 @@ fn messages(
         if text.trim().is_empty() {
             continue;
         }
-        let Some(answer) = answer(host, gate, caller, peer, &text) else {
+        let was_authenticated = ws.get_mut().stream.sock().is_authenticated();
+        let sock = ws.get_mut().stream.sock();
+        let Some(answer) = answer_with(host, gate, caller, peer, &text, &mut || {
+            sock.authenticated();
+        }) else {
             return ws.close(None).or_else(closed);
         };
-        if answer.authenticated && !ws.get_mut().stream.sock().is_authenticated() {
+        if answer.authenticated && !was_authenticated {
             ws.get_mut().stream.sock().authenticated();
             ws.set_config(|c| {
                 c.max_message_size = Some(MAX_REQUEST_LINE);
