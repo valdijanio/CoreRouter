@@ -60,7 +60,6 @@ const MAX_INBOX: usize = 200_000;
 const MAX_BODY: usize = 64 * 1024;
 
 /// What other services hand to the exporter.
-#[cfg_attr(not(test), allow(dead_code))]
 enum Item {
     Flow(FlowRecord),
     Nat(NatEvent),
@@ -96,18 +95,85 @@ fn submit(item: Item, bit: u64) {
     }
 }
 
-/// A finished flow for the `flows` table (G4.4b calls this). Cheap: a
-/// push onto a bounded list; nothing happens unless the exporter is on and
-/// sends flows.
-#[cfg_attr(not(test), allow(dead_code))]
+/// A finished flow for the `flows` table. Cheap: a push onto a bounded
+/// list; nothing happens unless the exporter is on and sends flows.
 pub(crate) fn submit_flow(f: FlowRecord) {
     submit(Item::Flow(f), 1);
 }
 
 /// A NAT event for the `nat_events` table (G4.4b, CGNAT).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn submit_nat(e: NatEvent) {
     submit(Item::Nat(e), 2);
+}
+
+/// What Traffic Flow (G4.4b) metered this tick: flows to `flows`, NAT44
+/// sessions created and deleted (RFC 8158 natEvent 4/5) to `nat_events`.
+/// Port blocks are not taken here: the exporter reads them from the
+/// router's log (G2.3c), with or without Traffic Flow, once.
+/// `router` names the interfaces (ifIndex → name); without it the index
+/// goes as text.
+pub(crate) fn submit_records(
+    recs: &[corerouter_proto_flow::Record],
+    router: Option<&corerouter_engine::traffic_flow::IfRouter>,
+) {
+    use corerouter_proto_flow::{NatEventType, Record};
+    let wanted = inbox().wanted.load(Ordering::Relaxed);
+    if wanted == 0 || recs.is_empty() {
+        return;
+    }
+    let names = router.map(|r| r.names()).unwrap_or_default();
+    let name = |i: u32| {
+        names
+            .iter()
+            .find(|(n, _)| *n == i)
+            .map_or_else(|| if i == 0 { String::new() } else { i.to_string() }, |(_, s)| s.clone())
+    };
+    for r in recs {
+        match r {
+            Record::Flow(f) if wanted & 1 != 0 => {
+                let nat = f.post_src != f.src || f.post_src_port != f.src_port;
+                submit_flow(FlowRecord {
+                    start_ms: f.start_ms,
+                    end_ms: f.end_ms,
+                    src_addr: f.src,
+                    dst_addr: f.dst,
+                    src_port: f.src_port,
+                    dst_port: f.dst_port,
+                    proto: f.protocol,
+                    in_if: name(f.ingress),
+                    out_if: name(f.egress),
+                    bytes: f.octets,
+                    packets: f.packets,
+                    tcp_flags: 0,
+                    sampling_rate: 1,
+                    nat_src_addr: nat.then_some(f.post_src),
+                    nat_src_port: nat.then_some(f.post_src_port),
+                });
+            }
+            Record::Nat(n) if wanted & 2 != 0 => {
+                let event = match n.event {
+                    NatEventType::Nat44SessionCreate => "session_create",
+                    NatEventType::Nat44SessionDelete => "session_delete",
+                    NatEventType::PortBlockAllocation => "block_alloc",
+                    NatEventType::PortBlockDeallocation => "block_release",
+                };
+                submit_nat(NatEvent {
+                    time_ms: n.time_ms,
+                    event: event.into(),
+                    proto: n.protocol,
+                    src_addr: IpAddr::V4(n.src),
+                    src_port: n.src_port,
+                    nat_addr: IpAddr::V4(n.post_src),
+                    nat_port: n.post_src_port,
+                    dst_addr: Some(IpAddr::V4(n.dst)),
+                    dst_port: Some(n.dst_port),
+                    port_start: 0,
+                    port_end: 0,
+                });
+            }
+            _ => {}
+        }
+    }
 }
 
 fn now_ms() -> u64 {
@@ -939,6 +1005,68 @@ pub(crate) mod tests {
         assert!(cgnat_block_event(&other).is_none());
         let bad = corerouter_model::logging::LogEvent { detail: json!({"event": "alloc", "subscriber": "x"}), ..ev };
         assert!(cgnat_block_event(&bad).is_none(), "hostile detail: no row");
+    }
+
+    #[test]
+    fn traffic_flow_records_become_flows_and_nat_sessions() {
+        use corerouter_proto_flow::{Direction, EndReason, Flow, NatEventType, PortBlock, Record};
+        let _serial = serial();
+        items(inbox()).clear();
+        inbox().wanted.store(3, Ordering::Relaxed);
+        let flow = Flow {
+            start_ms: 1,
+            end_ms: 2,
+            protocol: 6,
+            src: "100.64.0.9".parse().unwrap(),
+            dst: "198.51.100.7".parse().unwrap(),
+            src_port: 40000,
+            dst_port: 443,
+            post_src: "203.0.113.5".parse().unwrap(),
+            post_dst: "198.51.100.7".parse().unwrap(),
+            post_src_port: 1025,
+            post_dst_port: 443,
+            octets: 1500,
+            packets: 3,
+            ingress: 0,
+            egress: 7,
+            end_reason: EndReason::End,
+            direction: Direction::Initiator,
+        };
+        let nat = corerouter_proto_flow::NatEvent {
+            time_ms: 5,
+            start_ms: 5,
+            event: NatEventType::Nat44SessionCreate,
+            protocol: 17,
+            src: "100.64.0.9".parse().unwrap(),
+            dst: "8.8.8.8".parse().unwrap(),
+            src_port: 5353,
+            dst_port: 53,
+            post_src: "203.0.113.5".parse().unwrap(),
+            post_dst: "8.8.8.8".parse().unwrap(),
+            post_src_port: 2000,
+            post_dst_port: 53,
+        };
+        let block = PortBlock {
+            time_ms: 5,
+            event: NatEventType::PortBlockAllocation,
+            src: "100.64.0.9".parse().unwrap(),
+            post_src: "203.0.113.5".parse().unwrap(),
+            port_start: 1024,
+            port_end: 2047,
+            step: 1,
+            ports: 1024,
+        };
+        submit_records(&[Record::Flow(flow), Record::Nat(nat), Record::PortBlock(block)], None);
+        let got = std::mem::take(&mut *items(inbox()));
+        inbox().wanted.store(0, Ordering::Relaxed);
+        assert_eq!(got.len(), 2, "port blocks come from the log, not twice");
+        let Some(Item::Flow(f)) = got.first() else { panic!("flow first") };
+        assert_eq!(f.nat_src_port, Some(1025));
+        assert_eq!((f.in_if.as_str(), f.out_if.as_str()), ("", "7"));
+        let Some(Item::Nat(n)) = got.get(1) else { panic!("nat second") };
+        assert_eq!(n.event, "session_create");
+        assert_eq!(n.nat_port, 2000);
+        assert_eq!(n.dst_port, Some(53));
     }
 
     #[test]

@@ -779,7 +779,7 @@ mantém. Desenho, esquema e operação em `docs/analytics.md`.
   (`s.ext::<AnalyticsStatus>()`, escrito pelo daemon); rede só no daemon (L6). A cada 250 ms o
   serviço copia sob o lock o que é novo no log (`log_since`) e, a cada `metrics_interval`, o
   resultado de `system.metrics` (o mesmo texto do `/metrics`, convertido em linhas); envia sem o
-  lock. Outros serviços entregam fluxos e eventos de NAT por `submit_flow`/`submit_nat` (lista com
+  lock. O Traffic Flow (G4.4b) entrega fluxos e sessões de NAT por `submit_records` (lista com
   teto, sem lock da sessão); os blocos do CGNAT (G2.3c) chegam pelo próprio log.
 - **Comparado** (Rust puro × externo, como pede o AGENTS.md):
   - *Vector ou Fluent Bit ao lado do daemon*: maduros, mas um processo a mais para supervisionar,

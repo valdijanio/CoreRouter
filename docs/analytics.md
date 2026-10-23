@@ -186,8 +186,8 @@ FROM corerouter.logs;
 |---|---|---|
 | `metrics` | os contadores do `/metrics` (interfaces, comandos, commits, serviços, DHCP, Safe Mode…) a cada `metrics_interval`; os gráficos locais (G4.5), quando entrarem | amostra (nome + rótulos + valor) |
 | `logs` | eventos do log do roteador (G4.6d) que uma regra manda para a ação `analytics` | evento |
-| `flows` | Traffic Flow (G4.4b), quando entrar | fluxo terminado |
-| `nat_events` | blocos de portas do CGNAT no modo `blocks` (G2.3c): `block_alloc`/`block_release`; eventos por conexão com a G4.4b | evento |
+| `flows` | Traffic Flow (G4.4b, IP › Traffic Flow ligado): os mesmos registros que ele manda por IPFIX; interfaces por nome | fluxo terminado |
+| `nat_events` | blocos de portas do CGNAT no modo `blocks` (G2.3c, lidos do log): `block_alloc`/`block_release`; sessões NAT44 do Traffic Flow com eventos de NAT ligados: `session_create`/`session_delete` (RFC 8158 natEvent 4/5) | evento |
 
 `logs`: `severity` é o nível do RouterOS (`debug`, `info`, `warning`, `error`, `critical`);
 `severity_number` é o do OpenTelemetry (5, 9, 13, 17, 21); `priority` é a severidade do syslog
@@ -406,6 +406,10 @@ Collector, Akvorado). **Adotamos** o que esses coletores fazem bem, dentro do ro
 processo extra: JSONEachRow com gzip, lotes grandes, reenvio com espera crescente e sorteio, a
 mesma classificação de respostas, fila com teto e descarte contado, disco opcional, token de
 deduplicação (que eles não usam por padrão) e um esquema com nomes do OpenTelemetry na view.
+
+Os fluxos e as sessões de NAT vêm do serviço do Traffic Flow (G4.4b), que entrega ao exportador os
+mesmos registros que manda por IPFIX (`submit_records`); os blocos de portas, só pelo log, para
+não chegarem duas vezes.
 
 **Ficou de fora, como gaps:** a janela de Métricas avançado que consulta o ClickHouse (G4.4g); a
 política por tabela quando a fila enche (bloquear para NAT, descartar o mais antigo para métricas)

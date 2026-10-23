@@ -535,6 +535,8 @@ impl Running {
             recs.extend(port_blocks(&log));
         }
         self.export(now, &recs, meta);
+        // G4.4f: the same records to the ClickHouse exporter, if it wants them.
+        super::analytics::submit_records(&recs, Some(router));
         if !recs.is_empty() && tf.retention_hours > 0 && tf.retention_records > 0 {
             lock(session).traffic_flow_store(&recs, now);
         }
@@ -553,6 +555,7 @@ impl Running {
         let mut recs = Vec::new();
         self.meter.flush(now, &mut recs);
         self.export(now, &recs, meta);
+        super::analytics::submit_records(&recs, None);
         if !recs.is_empty() {
             lock(session).traffic_flow_store(&recs, now);
         }

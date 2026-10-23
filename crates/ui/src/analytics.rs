@@ -28,6 +28,8 @@ const PRINT: &str = "system.analytics.print";
 const TEST: &str = "system.analytics.test";
 const SCHEMA: &str = "system.analytics.schema";
 const RULES: &str = "system.logging.list";
+/// Traffic Flow (G4.4b): the source of flows and NAT sessions.
+const FLOW: &str = "ip.traffic-flow.get";
 /// The levels a rule sends to `analytics` when the window adds them.
 const LEVELS: [&str; 4] = ["info", "warning", "error", "critical"];
 
@@ -61,6 +63,8 @@ pub(crate) struct AnalyticsPanel {
     pub(crate) error: Option<String>,
     /// Some rule sends log events to the `analytics` action.
     pub(crate) has_log_rule: Option<bool>,
+    /// Traffic Flow is on (`None`: no such command on this router).
+    pub(crate) traffic_flow: Option<bool>,
     /// The schema's SQL (tab Schema), once asked.
     pub(crate) schema: Option<String>,
     help: Option<HelpView>,
@@ -189,6 +193,13 @@ impl PanelState for AnalyticsPanel {
                 params: Value::Null,
             });
         }
+        if app.has_command(FLOW) {
+            q.push(Query {
+                key: "flow",
+                command: FLOW,
+                params: Value::Null,
+            });
+        }
         q
     }
 
@@ -210,6 +221,7 @@ impl PanelState for AnalyticsPanel {
                 });
                 self.has_log_rule = Some(has);
             }
+            "flow" => self.traffic_flow = Some(flag(&value, "enabled")),
             _ => {}
         }
     }
@@ -354,15 +366,15 @@ impl AnalyticsPanel {
             self.label(ui, l, "flows", "Flows");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.form.flows, "");
-                chip::chip(ui, tr(l, "no source yet"), chip::neutral_tone(ui.visuals()))
-                    .on_hover_text(tr(l, "Traffic Flow (G4.4b) will feed this table"));
+                flow_chip(ui, l, self.traffic_flow, self.form.flows);
             });
             ui.end_row();
             self.label(ui, l, "nat_events", "NAT Events");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.form.nat_events, "");
                 chip::chip(ui, tr(l, "CGNAT blocks"), chip::BLUE.tone(ui.visuals()))
-                    .on_hover_text(tr(l, "Port blocks given and taken back by CGNAT (blocks mode); per-connection events come with Traffic Flow (G4.4b)"));
+                    .on_hover_text(tr(l, "Port blocks given and taken back by CGNAT (blocks mode)"));
+                flow_chip(ui, l, self.traffic_flow, self.form.nat_events);
             });
             ui.end_row();
         });
@@ -567,5 +579,21 @@ impl AnalyticsPanel {
             ui.add(TextEdit::multiline(&mut shown).code_editor().desired_width(f32::INFINITY));
         });
         ui.label(RichText::new(tr(l, "TTL: metrics 395 days, logs 90, flows 30, NAT events 400 (Marco Civil). Change the days with system.analytics.schema.")).weak());
+    }
+}
+
+/// Where flows and NAT sessions come from: Traffic Flow (IP › Traffic
+/// Flow), on or off.
+fn flow_chip(ui: &mut Ui, l: crate::i18n::Lang, on: Option<bool>, wanted: bool) {
+    match on {
+        Some(true) => {
+            chip::chip(ui, tr(l, "Traffic Flow"), chip::BLUE.tone(ui.visuals()))
+                .on_hover_text(tr(l, "Fed by IP › Traffic Flow (conntrack)"));
+        }
+        Some(false) if wanted => {
+            chip::chip(ui, tr(l, "Traffic Flow off"), chip::AMBER.tone(ui.visuals()))
+                .on_hover_text(tr(l, "Turn on IP › Traffic Flow for flows and NAT sessions to reach this table"));
+        }
+        _ => {}
     }
 }
