@@ -120,7 +120,7 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
 ## Janela de lista e modal de adicionar (padrão aprovado, G0.24)
 
 Toda janela que lista itens configuráveis (endereços, regras, pools, estáticas, concessões…)
-segue este padrão; a referência é IP › Addresses (G1.28). Os componentes são reutilizáveis (não
+segue este padrão; a referência é IP › Addresses (G1.28, `crates/ui/src/ip_address.rs`). Os componentes são reutilizáveis (não
 copie o código de uma janela para outra).
 
 **Barra de ações**, nesta ordem, com ícone e dica:

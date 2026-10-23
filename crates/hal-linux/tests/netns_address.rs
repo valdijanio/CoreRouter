@@ -154,7 +154,10 @@ fn ipv6_dad_is_tentative_then_active_or_failed() {
         if free.is_none() && dup.as_ref().is_some_and(|d| d.dad_failed) {
             break;
         }
-        assert!(Instant::now() < deadline, "free {free:?}, duplicate {dup:?}");
+        assert!(
+            Instant::now() < deadline,
+            "free {free:?}, duplicate {dup:?}"
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     hal.apply(&to, &base).unwrap();
@@ -191,6 +194,10 @@ fn the_arp_probe_finds_who_holds_an_address() {
         .collect::<Vec<_>>()
         .join(":");
     assert!(mac.contains(&text), "{text} not in {mac}");
-    assert_eq!(found(&mut hal, Ipv4Addr::new(10, 4, 0, 3)), None, "nobody holds .3");
+    assert_eq!(
+        found(&mut hal, Ipv4Addr::new(10, 4, 0, 3)),
+        None,
+        "nobody holds .3"
+    );
     hal.apply(&base, &Config::default()).unwrap();
 }
