@@ -23,5 +23,4 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("error", "erro"),
     ("info", "info"),
     ("ok", "ok"),
-    ("warning", "aviso"),
 ];
