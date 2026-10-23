@@ -14,9 +14,12 @@
 //! The engine has no clock of its own (it compiles for wasm32): time comes
 //! from [`Hal::now_unix`](corerouter_hal::Hal::now_unix) or from
 //! [`Session::tick`], which the daemon calls every second. Expiry is checked
-//! on every tick and before every command.
+//! on every tick and before every command. The deadline follows
+//! [`Hal::monotonic_secs`](corerouter_hal::Hal::monotonic_secs) when the
+//! platform has it, so an NTP step of the wall clock neither fires nor
+//! disarms the switch (audit #7); the wall clock is only shown (`since`).
 
-use corerouter_model::Config;
+use corerouter_model::{Config, ConfigStore, Revision};
 use serde::Serialize;
 use serde_json::{Value, json};
 
@@ -118,7 +121,20 @@ pub(crate) struct Active {
     entry_revision: u32,
     since: Option<u64>,
     timeout_secs: Option<u32>,
+    /// On the wall clock (platforms without a monotonic one).
     deadline: Option<u64>,
+    /// On the monotonic clock, when the platform has one: preferred.
+    mono_deadline: Option<u64>,
+}
+
+impl Active {
+    /// Seconds left, or `None` without a timeout (or a clock).
+    fn left(&self, now: Option<u64>, mono: Option<u64>) -> Option<u64> {
+        match (self.mono_deadline, mono) {
+            (Some(d), Some(m)) => Some(d.saturating_sub(m)),
+            _ => self.deadline.zip(now).map(|(d, n)| d.saturating_sub(n)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -139,14 +155,24 @@ impl SafeMode {
 
 impl Session {
     /// Advance the clock (seconds since the Unix epoch) and undo an expired
-    /// Safe Mode. The daemon calls this every second.
+    /// Safe Mode. The daemon calls this every second. Runs inside the panic
+    /// guard: a bug in one of the jobs must not take the daemon's clock
+    /// thread down, nor leave a half-done undo pending (audit #6).
     pub fn tick(&mut self, now_unix: u64) {
         self.safe_mode_mut().clock = Some(now_unix);
-        self.expire_safe_mode();
-        self.expire_dynamic_addresses();
-        self.expire_tasks();
-        self.poll_links();
-        self.scan_modules();
+        let snapshot = self.store().candidate().clone();
+        let ticked = crate::guard::run("tick", || {
+            self.retry_boot_apply();
+            self.expire_safe_mode();
+            self.expire_dynamic_addresses();
+            self.expire_tasks();
+            self.poll_links();
+            self.scan_modules();
+            Ok(())
+        });
+        if ticked.is_err() {
+            self.store_mut().set_candidate(snapshot);
+        }
     }
 
     /// The connection `caller_id` closed. If it owned Safe Mode, its changes
@@ -168,16 +194,40 @@ impl Session {
         self.hal_now().or(self.safe_mode().clock)
     }
 
+    /// The store as it was when Safe Mode was entered (what a reboot must
+    /// boot), or `None` outside Safe Mode. Built from the history: the
+    /// revisions up to the entry, the entry config last.
+    pub(crate) fn safe_mode_entry_store(&self) -> Option<ConfigStore> {
+        let a = self.safe_mode().active.as_ref()?;
+        let mut history: Vec<Revision> = self
+            .store()
+            .history()
+            .iter()
+            .filter(|r| r.number <= a.entry_revision)
+            .cloned()
+            .collect();
+        if history.last().map(|r| r.number) != Some(a.entry_revision) {
+            // More than a history's worth of commits since the entry.
+            history.push(Revision {
+                number: a.entry_revision,
+                comment: "safe mode entry".into(),
+                timestamp: a.since,
+                config: a.entry.clone(),
+            });
+        }
+        Some(ConfigStore::restore(a.entry.clone(), history))
+    }
+
     /// Undo if the deadline passed. Called before every command.
     pub(crate) fn expire_safe_mode(&mut self) {
         let now = self.now();
+        let mono = self.hal().monotonic_secs();
         let expired = self
             .safe_mode()
             .active
             .as_ref()
-            .and_then(|a| a.deadline)
-            .zip(now)
-            .is_some_and(|(deadline, now)| now >= deadline);
+            .and_then(|a| a.left(now, mono))
+            .is_some_and(|left| left == 0);
         if expired {
             let reason = "the timeout expired without confirmation";
             let result = self.undo_safe_mode(reason);
@@ -206,6 +256,10 @@ impl Session {
                 ));
             }
         };
+        let mono = self.hal().monotonic_secs();
+        let mono_deadline = timeout_secs
+            .zip(mono)
+            .map(|(t, m)| m.saturating_add(u64::from(t)));
         let caller = self.caller().clone();
         if let Some(a) = self.safe_mode().active.as_ref() {
             if a.owner.id != caller.id {
@@ -228,6 +282,7 @@ impl Session {
             Some(a) => {
                 a.timeout_secs = timeout_secs;
                 a.deadline = deadline;
+                a.mono_deadline = mono_deadline;
             }
             None => {
                 state.active = Some(Active {
@@ -237,6 +292,7 @@ impl Session {
                     since: now,
                     timeout_secs,
                     deadline,
+                    mono_deadline,
                 });
                 log::info!("safe mode entered at revision {entry_revision}");
             }
@@ -282,6 +338,7 @@ impl Session {
             return json!({ "active": false, "last": state.last });
         };
         let now = self.now();
+        let mono = self.hal().monotonic_secs();
         json!({
             "active": true,
             "owner": a.owner.name,
@@ -290,7 +347,7 @@ impl Session {
             "entry_revision": a.entry_revision,
             "pending_revisions": self.store().current_revision().saturating_sub(a.entry_revision),
             "timeout_secs": a.timeout_secs,
-            "expires_in": a.deadline.zip(now).map(|(d, n)| d.saturating_sub(n)),
+            "expires_in": a.left(now, mono),
             "last": state.last,
         })
     }
@@ -323,17 +380,27 @@ impl Session {
         };
         let from = active.entry_revision;
         let candidate = self.store().candidate().clone();
+        // Uncommitted edits (transactional mode) are undone too, as in
+        // RouterOS; say so instead of "nothing to undo" (audit #13).
+        let pending = self.store().diff().len();
+        let dropped = if pending == 0 {
+            String::new()
+        } else {
+            format!("; {pending} pending change(s) discarded")
+        };
         self.store_mut().set_candidate(active.entry);
+        let undo = format!("safe mode undo: {reason}");
         let result = if self.store().is_dirty() {
-            self.commit_restoring(&format!("safe mode undo: {reason}"))
+            crate::guard::run("config.safe-mode.cancel", || self.commit_restoring(&undo))
                 .map(Some)
         } else {
             Ok(None)
         };
         let msg = match &result {
-            Ok(Some(rev)) => {
-                format!("undone ({reason}): config of revision {from} restored as revision {rev}")
-            }
+            Ok(Some(rev)) => format!(
+                "undone ({reason}): config of revision {from} restored as revision {rev}{dropped}"
+            ),
+            Ok(None) if pending > 0 => format!("ended ({reason}){dropped}"),
             Ok(None) => format!("ended ({reason}); nothing to undo since revision {from}"),
             Err(e) => {
                 self.store_mut().set_candidate(candidate);
@@ -401,6 +468,35 @@ pub(crate) fn utc(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Audit #2: whatever saves during Safe Mode (account changes today
+    /// are refused there; a future caller of `save` may not be) writes the
+    /// store of the entry, never the unconfirmed one.
+    #[test]
+    fn a_save_in_safe_mode_writes_the_entry_config() {
+        use crate::MemoryStorage;
+        let storage = MemoryStorage::default();
+        let mut s = Session::with_storage(
+            Box::new(corerouter_hal::VirtualHal::default()),
+            Box::new(storage.clone()),
+        );
+        s.execute("system.identity.set", &json!({"name": "before"}))
+            .unwrap();
+        s.execute("config.safe-mode.enter", &json!({})).unwrap();
+        for i in 0..70 {
+            s.execute("system.identity.set", &json!({"name": format!("x{i}")}))
+                .unwrap();
+        }
+        let users = s.users().clone();
+        s.set_users(users); // saves
+        drop(s);
+        let s = Session::with_storage(
+            Box::new(corerouter_hal::VirtualHal::default()),
+            Box::new(storage),
+        );
+        assert_eq!(s.store().running().system.identity, "before");
+        assert_eq!(s.store().current_revision(), 1);
+    }
 
     #[test]
     fn formats_utc() {

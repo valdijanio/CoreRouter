@@ -3,8 +3,12 @@
 //! `exit` confirms them; a restart in the middle boots the entry config.
 #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use corerouter_engine::{Caller, EngineError, MemoryStorage, Principal, Session};
-use corerouter_hal::VirtualHal;
+use corerouter_hal::{Hal, HalError, LinkInfo, LinkState, VirtualHal};
+use corerouter_model::Config;
 use serde_json::{Value, json};
 
 const T0: u64 = 1_792_591_389;
@@ -271,4 +275,98 @@ fn transactional_cancel_also_drops_pending_edits() {
             .values()
             .any(|i| i.disabled)
     );
+}
+
+/// Audit #13: a cancel with only pending (uncommitted) edits dropped them
+/// and said "nothing to undo".
+#[test]
+fn cancel_says_when_it_drops_pending_edits() {
+    let mut s = boot(&MemoryStorage::default());
+    s.execute("config.mode.set", &json!({"mode": "transactional"}))
+        .unwrap();
+    enter(&mut s, &gui(), json!({}));
+    disable(&mut s, &gui(), "ether3"); // not committed
+    s.execute_as(&gui(), "config.safe-mode.cancel", &json!({}))
+        .unwrap();
+    assert!(!s.store().is_dirty());
+    let last = summary(&mut s, &gui())["last"].clone();
+    let last = last.as_str().unwrap();
+    assert!(last.contains("1 pending change(s) discarded"), "{last}");
+}
+
+/// Audit #2 (verified false): account changes save the store, which in
+/// Safe Mode would hold the unconfirmed config; the user commands are
+/// refused there. The save itself now writes the entry store anyway
+/// (`safe_mode::tests::a_save_in_safe_mode_writes_the_entry_config`).
+#[test]
+fn user_changes_wait_for_the_end_of_safe_mode() {
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    enter(&mut s, &gui(), json!({}));
+    disable(&mut s, &gui(), "ether2");
+    let err = s
+        .execute_as(
+            &gui(),
+            "user.add",
+            &json!({"name": "op", "group": "write", "password": "s3cret-Passw0rd"}),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("leave Safe Mode first"), "{err}");
+}
+
+/// A clock pair the test moves by hand: the wall clock (NTP may step it)
+/// and a monotonic one (seconds since boot).
+struct Clocks {
+    inner: VirtualHal,
+    wall: Arc<AtomicU64>,
+    mono: Arc<AtomicU64>,
+}
+
+impl Hal for Clocks {
+    fn describe(&self) -> String {
+        "lab with clocks".into()
+    }
+    fn discover_links(&mut self) -> Result<Vec<LinkInfo>, HalError> {
+        self.inner.discover_links()
+    }
+    fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+        self.inner.apply(from, to)
+    }
+    fn poll(&mut self) -> Vec<LinkState> {
+        self.inner.poll()
+    }
+    fn now_unix(&self) -> Option<u64> {
+        Some(self.wall.load(Ordering::SeqCst))
+    }
+    fn monotonic_secs(&self) -> Option<u64> {
+        Some(self.mono.load(Ordering::SeqCst))
+    }
+}
+
+/// Audit #7: the Safe Mode deadline followed the wall clock, so an NTP
+/// step (a router without RTC boots in 1970) undid the change at once.
+#[test]
+fn the_deadline_follows_the_monotonic_clock() {
+    let wall = Arc::new(AtomicU64::new(1_000));
+    let mono = Arc::new(AtomicU64::new(5));
+    let hal = Clocks {
+        inner: VirtualHal::default(),
+        wall: Arc::clone(&wall),
+        mono: Arc::clone(&mono),
+    };
+    let mut s = Session::new(Box::new(hal));
+    enter(&mut s, &gui(), json!({"timeout_secs": 60}));
+    disable(&mut s, &gui(), "ether2");
+    // NTP steps the clock 56 years ahead, one second later.
+    wall.store(1_800_000_000, Ordering::SeqCst);
+    mono.store(6, Ordering::SeqCst);
+    s.tick(1_800_000_000);
+    assert!(s.in_safe_mode(), "a clock step is not elapsed time");
+    assert_eq!(summary(&mut s, &gui())["expires_in"], 59);
+    // And a step back does not push the deadline away.
+    wall.store(10, Ordering::SeqCst);
+    mono.store(65, Ordering::SeqCst);
+    s.tick(10);
+    assert!(!s.in_safe_mode());
+    assert!(!disabled(&s, "ether2"));
 }

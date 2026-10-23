@@ -296,6 +296,69 @@ fn reset_admin_password_clears_it_again() {
     assert!(t.has_no_password("admin") && t.password_hash("root").is_some());
 }
 
+/// Audit #3: a TSIG secret went into the journal and the log in clear, and
+/// a read-only account could read it back.
+#[test]
+fn tsig_secrets_stay_out_of_the_journal_the_log_and_read_accounts() {
+    let (mut s, _) = with_team();
+    let key = "c2VjcmV0LXRzaWcta2V5LWJ5dGVzLTAxMjM0NTY3ODk=";
+    s.execute(
+        "ip.dns.tsig-key.add",
+        &json!({"name": "ddns", "secret": key}),
+    )
+    .unwrap();
+    // A generated one comes back to the caller, but not in the log.
+    let made = s
+        .execute("ip.dns.tsig-key.add", &json!({"name": "gen"}))
+        .unwrap();
+    let generated = made["secret"].as_str().unwrap().to_owned();
+    s.execute("ip.dns.tsig-key.set", &json!({"id": "ddns", "secret": key}))
+        .unwrap_or_default();
+    let journal = s.inspect(Some("journal")).unwrap().to_string();
+    let log = s.execute("log.print", &json!({})).unwrap().to_string();
+    for (what, text) in [("journal", &journal), ("log", &log)] {
+        assert!(!text.contains(key), "{what}: {text}");
+        assert!(!text.contains(&generated), "{what}: {text}");
+    }
+
+    let noc = as_user("noc");
+    let tree = s.inspect_as(&noc, Some("ip.dns_tsig")).unwrap().to_string();
+    assert!(!tree.contains(key), "{tree}");
+    let running = s.inspect_as(&noc, Some("running")).unwrap().to_string();
+    assert!(!running.contains(key), "{running}");
+    let denied = s.execute_as(&noc, "ip.dns.tsig-key.print", &json!({"show_secret": true}));
+    assert!(denied.is_err(), "{denied:?}");
+    let rows = s
+        .execute_as(&noc, "ip.dns.tsig-key.print", &json!({}))
+        .unwrap();
+    assert!(!rows.to_string().contains(key));
+    // A pending change to a secret shows masked in config.diff too.
+    s.execute("config.mode.set", &json!({"mode": "transactional"}))
+        .unwrap();
+    s.execute("ip.dns.tsig-key.set", &json!({"id": "gen", "secret": key}))
+        .unwrap();
+    let diff = s
+        .execute_as(&noc, "config.diff", &json!({}))
+        .unwrap()
+        .to_string();
+    assert!(diff.contains("secret") && !diff.contains(key), "{diff}");
+    // Group full still reads it, to copy it to the DHCP server.
+    let admin = as_user("admin");
+    let shown = s
+        .execute_as(
+            &admin,
+            "ip.dns.tsig-key.print",
+            &json!({"show_secret": true}),
+        )
+        .unwrap();
+    assert!(shown.to_string().contains(key));
+    let tree = s
+        .inspect_as(&admin, Some("ip.dns_tsig"))
+        .unwrap()
+        .to_string();
+    assert!(tree.contains(key));
+}
+
 #[test]
 fn reset_like_the_daemon() {
     let (mut s, _) = with_team();

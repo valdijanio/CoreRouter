@@ -1118,7 +1118,7 @@ mostra os registros dinâmicos com `D` (Remove os tira).
 
 | Comando | Parâmetros |
 |---|---|
-| `ip.dns.tsig-key.add/set/remove/print` | `name`, `algorithm` (`hmac-sha256` padrão, `hmac-sha384`, `hmac-sha512`), `secret` (base64, 16 a 256 bytes; ausente: 32 aleatórios), `comment`; `print show_secret=yes` mostra o secret, que o `print` normal e o `/export` escondem |
+| `ip.dns.tsig-key.add/set/remove/print` | `name`, `algorithm` (`hmac-sha256` padrão, `hmac-sha384`, `hmac-sha512`), `secret` (base64, 16 a 256 bytes; ausente: 32 aleatórios), `comment`; `print show_secret=yes` mostra o secret (só grupo `full`), que o `print` normal e o `/export` escondem; o secret também não vai para o journal nem para o log, e abaixo do grupo `full` aparece como `***` no `state.inspect` e no `config.diff` |
 | `ip.dns.zone.add/set` | + `update_keys` (chaves que podem atualizar), `allow_update` (de onde; sem `update_keys`, sem assinatura de lá) |
 | `ip.dns.zone.record.print` | + as linhas `D` (dinâmicas): `dynamic`, `source` (quem pôs), `expires_unix` |
 | `ip.dns.zone.dynamic.remove` / `.flush` | `{id}` / `{zone}` |

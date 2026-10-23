@@ -151,6 +151,14 @@ pub trait Hal: Send {
     /// Wall clock in seconds since the Unix epoch, if the platform has one.
     fn now_unix(&self) -> Option<u64>;
 
+    /// Seconds on a clock that only moves forward at a steady rate (an NTP
+    /// step does not move it), from any fixed origin, if the platform has
+    /// one. Deadlines (the Safe Mode timeout) follow it rather than the
+    /// wall clock. Default: none (deadlines fall back to the wall clock).
+    fn monotonic_secs(&self) -> Option<u64> {
+        None
+    }
+
     /// What this platform supports. Cheap after the first call: backends
     /// that probe the kernel do it once and cache the answer.
     fn features(&self) -> Features {
