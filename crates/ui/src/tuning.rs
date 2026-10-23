@@ -39,6 +39,13 @@ const PORT_PRINT: &str = "system.tuning.interface.parameter.print";
 const PORT_SET: &str = "system.tuning.interface.set";
 const PORT_UNSET: &str = "system.tuning.interface.unset";
 const PORT_APPLY: &str = "system.tuning.interface.apply";
+const CPU_PRINT: &str = "system.tuning.cpu.parameter.print";
+const CPU_SET: &str = "system.tuning.cpu.set";
+const CPU_UNSET: &str = "system.tuning.cpu.unset";
+
+/// The CPU sections (G1.26c), and the port section shown with them.
+const CPU_SECTIONS: [&str; 3] = ["Frequency", "Idle states", "Watchdog"];
+const CPU_PORT_SECTIONS: [&str; 1] = ["CPU and IRQ"];
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -105,6 +112,7 @@ const PORT_SECTIONS: [&str; 6] = [
 pub(crate) enum Scope {
     Kernel,
     Port(String),
+    Cpu,
 }
 
 impl Scope {
@@ -113,6 +121,7 @@ impl Scope {
         match self {
             Scope::Kernel => format!("tuning.{key}"),
             Scope::Port(_) => format!("tuning.port.{key}"),
+            Scope::Cpu => format!("tuning.cpu.{key}"),
         }
     }
 
@@ -120,6 +129,7 @@ impl Scope {
         match self {
             Scope::Kernel => (SET, json!({"name": key, "value": value})),
             Scope::Port(p) => (PORT_SET, json!({"name": p, "key": key, "value": value})),
+            Scope::Cpu => (CPU_SET, json!({"key": key, "value": value})),
         }
     }
 
@@ -127,6 +137,7 @@ impl Scope {
         match self {
             Scope::Kernel => (UNSET, json!({"name": key})),
             Scope::Port(p) => (PORT_UNSET, json!({"name": p, "key": key})),
+            Scope::Cpu => (CPU_UNSET, json!({"key": key})),
         }
     }
 
@@ -140,6 +151,9 @@ impl Scope {
                 "`/system tuning interface set name={p} key={key} value={value}`\n\n\
                  `/system tuning interface unset name={p} key={key}`"
             ),
+            Scope::Cpu => format!(
+                "`/system tuning cpu set key={key} value={value}`\n\n`/system tuning cpu unset key={key}`"
+            ),
         }
     }
 
@@ -147,6 +161,7 @@ impl Scope {
         match self {
             Scope::Kernel => "kernel".into(),
             Scope::Port(p) => format!("port-{p}"),
+            Scope::Cpu => "cpu".into(),
         }
     }
 }
@@ -333,6 +348,8 @@ pub(crate) struct TuningPanel {
     /// The Interfaces tab: the port shown and its settings.
     pub(crate) port: Option<String>,
     pub(crate) port_print: Option<Value>,
+    /// The CPU and IRQ tab: `system.tuning.cpu.parameter.print`.
+    pub(crate) cpu_print: Option<Value>,
 }
 
 impl TuningPanel {
@@ -359,7 +376,14 @@ impl PanelState for TuningPanel {
             command: PRINT,
             params: json!({"profile": self.profile()}),
         }];
-        if self.tab == Tab::Interfaces
+        if self.tab == Tab::Cpu && app.has_command(CPU_PRINT) {
+            q.push(Query {
+                key: "cpu",
+                command: CPU_PRINT,
+                params: json!({"profile": self.profile()}),
+            });
+        }
+        if matches!(self.tab, Tab::Interfaces | Tab::Cpu)
             && let Some(port) = &self.port
             && app.has_command(PORT_PRINT)
         {
@@ -369,7 +393,7 @@ impl PanelState for TuningPanel {
                 params: json!({"name": port, "profile": self.profile()}),
             });
         }
-        if matches!(self.tab, Tab::Summary | Tab::Interfaces) {
+        if matches!(self.tab, Tab::Summary | Tab::Interfaces | Tab::Cpu) {
             q.push(Query {
                 key: "hardware",
                 command: HARDWARE,
@@ -408,6 +432,7 @@ impl PanelState for TuningPanel {
                 self.hardware = Some(value);
             }
             "port" => self.port_print = Some(value),
+            "cpu" => self.cpu_print = Some(value),
             "diagnose" => self.diagnosis = Some(value),
             k => {
                 if let Some(slot) = self.compare.iter_mut().find(|(c, _)| *c == k) {
@@ -501,11 +526,7 @@ impl TuningPanel {
             Tab::Kernel => self.kernel(app, ui),
             Tab::Profiles => self.profiles(app, ui),
             Tab::Interfaces => self.interfaces(app, ui),
-            Tab::Cpu => later(
-                ui,
-                l,
-                "Interrupt affinity per NUMA node, RPS/XPS, the CPU governor and C-states arrive with G1.26c.",
-            ),
+            Tab::Cpu => self.cpu(app, ui),
             Tab::Boot => later(
                 ui,
                 l,
@@ -744,7 +765,7 @@ impl TuningPanel {
                 ));
             }
         });
-        self.list(app, ui, &rows, &SECTIONS, &Scope::Kernel);
+        self.list(app, ui, &rows, &SECTIONS, &Scope::Kernel, None);
     }
 
     /// The property list of `rows`, grouped by `sections`, and the editor
@@ -756,10 +777,11 @@ impl TuningPanel {
         rows: &[Param],
         sections: &[&'static str],
         scope: &Scope,
+        height: Option<f32>,
     ) {
         let l = app.lang.labels;
         let editor_h = ui.spacing().interact_size.y * 3.0;
-        let list_h = (ui.available_height() - editor_h).max(80.0);
+        let list_h = height.unwrap_or_else(|| (ui.available_height() - editor_h).max(80.0));
         ScrollArea::both()
             .id_salt(("tuning-list", scope.salt()))
             .max_height(list_h)
@@ -900,7 +922,100 @@ impl TuningPanel {
             let text: Vec<&str> = notes.iter().filter_map(Value::as_str).collect();
             ui.weak(text.join("; "));
         }
-        self.list(app, ui, &rows, &PORT_SECTIONS, &Scope::Port(port));
+        self.list(app, ui, &rows, &PORT_SECTIONS, &Scope::Port(port), None);
+    }
+
+    // ---- CPU and IRQ ----------------------------------------------------------
+
+    fn cpu(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        if !app.has_command(CPU_PRINT) {
+            later(ui, l, "This router has no CPU tuning yet: update corerouter-daemon.");
+            return;
+        }
+        let Some(cpu) = self.cpu_print.clone() else {
+            ui.weak(tr(l, "waiting for the router…"));
+            return;
+        };
+        if cpu.get("irqbalance").and_then(Value::as_bool) == Some(true) {
+            ui.horizontal(|ui| {
+                let v = ui.visuals().clone();
+                chip(ui, tr(l, "warning"), AMBER.tone(&v));
+                ui.label(tr(l, "irqbalance is running: it undoes the IRQ affinity."));
+            });
+        }
+        let rows = params(&cpu);
+        let row_h = ui.spacing().interact_size.y + 4.0;
+        let h = row_h * (rows.len() + CPU_SECTIONS.len() + 2) as f32;
+        self.list(app, ui, &rows, &CPU_SECTIONS, &Scope::Cpu, Some(h));
+        ui.separator();
+        // Each port's IRQ affinity, RPS and XPS.
+        let names: Vec<String> = self
+            .hardware
+            .as_ref()
+            .and_then(|h| h.get("nics"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.get("name").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(tr(l, "Port"));
+            let current = self.port.clone().unwrap_or_default();
+            let mut picked = current.clone();
+            ComboBox::from_id_salt("tuning-cpu-port")
+                .selected_text(&current)
+                .show_ui(ui, |ui| {
+                    for n in &names {
+                        ui.selectable_value(&mut picked, n.clone(), n);
+                    }
+                });
+            if picked != current {
+                self.port = Some(picked);
+                self.port_print = None;
+                self.selected = None;
+                app.cache.refreshed_at = None;
+            }
+        });
+        let Some(port) = self.port.clone() else {
+            return;
+        };
+        let data = self.port_print.as_ref().and_then(|v| {
+            v.get("ports")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().find(|p| p.get("name").and_then(Value::as_str) == Some(&port)))
+                .cloned()
+        });
+        let Some(data) = data else {
+            ui.weak(tr(l, "waiting for the router…"));
+            return;
+        };
+        let irqs: Vec<String> = data
+            .get("irqs")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|i| {
+                        // "→" is not in the GUI's font.
+                        Some(format!(
+                            "{}: {}",
+                            i.get("irq")?.as_u64()?,
+                            i.get("cpus")?.as_str()?
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !irqs.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(tr(l, "Queue IRQs"));
+                ui.label(irqs.join(", "));
+            });
+        }
+        let rows = params(&data);
+        self.list(app, ui, &rows, &CPU_PORT_SECTIONS, &Scope::Port(port), None);
     }
 
     fn param_row(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, p: &Param, scope: &Scope) {
@@ -1020,7 +1135,9 @@ impl TuningPanel {
             .as_ref()
             .and_then(|s| rows.iter().find(|p| &p.name == s))
         else {
-            ui.weak(tr(l, "Click a parameter to change it."));
+            if *scope != Scope::Cpu {
+                ui.weak(tr(l, "Click a parameter to change it."));
+            }
             return;
         };
         let can = app.can();
@@ -1078,6 +1195,8 @@ impl TuningPanel {
                     can.check(scope.unset(&p.name).0)
                 } else if *scope == Scope::Kernel {
                     Err(tr(l, "Not set: the kernel's own value is in use").to_owned())
+                } else if *scope == Scope::Cpu {
+                    Err(tr(l, "Not set: the machine's own value is in use").to_owned())
                 } else {
                     Err(tr(l, "Not set: the port's own value is in use").to_owned())
                 }

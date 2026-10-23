@@ -29,11 +29,13 @@ const FORWARDING: [&str; 2] = ["net.ipv4.ip_forward", "net.ipv6.conf.all.forward
 /// ~600 KiB; anything bigger is not what we think it is).
 const MAX_FILE: u64 = 1 << 20;
 
-/// Where `/proc` and `/sys` are.
+/// Where `/proc`, `/sys` and `/dev` are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Root {
     pub proc: PathBuf,
     pub sys: PathBuf,
+    /// `/dev` (PM QoS and watchdog devices, G1.26c).
+    pub dev: PathBuf,
 }
 
 impl Default for Root {
@@ -41,6 +43,7 @@ impl Default for Root {
         Self {
             proc: "/proc".into(),
             sys: "/sys".into(),
+            dev: "/dev".into(),
         }
     }
 }
@@ -280,6 +283,7 @@ mod tests {
         let root = Root {
             proc: dir.join("proc"),
             sys: dir.join("sys"),
+            dev: dir.join("dev"),
         };
         (Scratch(dir), root)
     }

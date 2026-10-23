@@ -139,7 +139,12 @@ fn read_machine(s: &mut Session) -> Option<Machine> {
             }
         })
         .collect();
-    Some(Machine { sys, nics })
+    let irqbalance = s.hal_mut().cpu_tuning().is_ok_and(|c| c.irqbalance);
+    Some(Machine {
+        sys,
+        nics,
+        irqbalance,
+    })
 }
 
 /// The machine, read again after [`MACHINE_TTL_SECS`]; `None`: the

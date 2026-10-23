@@ -11,7 +11,10 @@
 //! [`PORT_PARAMS`] is the same for the settings of each port (G1.26b):
 //! rings, queues, interrupt coalescing, transmit queue and filter, kept in
 //! [`Tuning::ports`]; its offload and flow-control rows live in the port's
-//! `ethernet` settings (`interface.ethernet.set`, G1.20).
+//! `ethernet` settings (`interface.ethernet.set`, G1.20). [`CPU_PARAMS`]
+//! (G1.26c): the CPU frequency governor, the C-state limit (PM QoS) and the
+//! hardware watchdog, kept in [`Tuning::cpu`]; each port's IRQ affinity,
+//! RPS and XPS are port settings of section [`SEC_CPU_IRQ`].
 
 use std::collections::BTreeMap;
 
@@ -30,6 +33,9 @@ pub struct Tuning {
     /// (`rx_ring`): the value to keep there.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub ports: BTreeMap<IfName, BTreeMap<String, i64>>,
+    /// CPU settings (G1.26c), by [`CPU_PARAMS`] key (`governor`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub cpu: BTreeMap<String, i64>,
 }
 
 impl Tuning {
@@ -347,6 +353,23 @@ pub const SEC_OFFLOADS: &str = "Offloads";
 pub const SEC_FLOW: &str = "Flow control";
 pub const SEC_TXQ: &str = "Transmit queue";
 pub const SEC_FILTER: &str = "Filtering";
+pub const SEC_CPU_IRQ: &str = "CPU and IRQ";
+pub const SEC_FREQ: &str = "Frequency";
+pub const SEC_IDLE: &str = "Idle states";
+pub const SEC_WATCHDOG: &str = "Watchdog";
+
+/// CPU frequency governors, by code.
+pub const GOVERNORS: &[(i64, &str)] = &[
+    (0, "performance"),
+    (1, "schedutil"),
+    (2, "ondemand"),
+    (3, "powersave"),
+    (4, "conservative"),
+];
+
+/// IRQ affinity of a port: the kernel's, or one queue per CPU of the
+/// port's NUMA node.
+const IRQ_MODES: &[(i64, &str)] = &[(0, "kernel"), (1, "local node")];
 
 /// Root queueing disciplines a port may get, by code.
 pub const QDISCS: &[(i64, &str)] = &[
@@ -393,7 +416,33 @@ pub const PORT_PARAMS: &[Param] = &[
     port(p("txqueuelen", SEC_TXQ, (0, 100_000), "packets", Some(1000))),
     port(qdisc()),
     port(choice("rp_filter", SEC_FILTER, RP_FILTER, 0)),
+    port(choice("irq_affinity", SEC_CPU_IRQ, IRQ_MODES, 0)),
+    port(choice("rps", SEC_CPU_IRQ, OFF_ON, 0)),
+    port(choice("xps", SEC_CPU_IRQ, OFF_ON, 0)),
 ];
+
+const fn cpu(mut p: Param) -> Param {
+    p.tab = Tab::Cpu;
+    p
+}
+
+const fn governor() -> Param {
+    let mut g = p("governor", SEC_FREQ, (0, 4), "", None);
+    g.choices = GOVERNORS;
+    g
+}
+
+/// The CPU settings, in display order.
+pub const CPU_PARAMS: &[Param] = &[
+    cpu(governor()),
+    cpu(p("cpu_dma_latency", SEC_IDLE, (0, 2000), "µs", None)),
+    cpu(choice("hw_watchdog", SEC_WATCHDOG, OFF_ON, 0)),
+];
+
+/// The catalog entry of CPU setting `key`.
+pub fn cpu_param(key: &str) -> Option<&'static Param> {
+    CPU_PARAMS.iter().find(|p| p.name == key)
+}
 
 const fn qdisc() -> Param {
     let mut q = p("qdisc", SEC_TXQ, (0, 4), "", None);
@@ -475,6 +524,10 @@ mod tests {
             assert_eq!(p.ethernet, offload_feature(p.name).is_some() || p.name.ends_with("_pause"));
         }
         assert_eq!(port_param("rx_ring").map(|p| p.link_flap), Some(true));
+        for p in CPU_PARAMS {
+            assert_eq!(p.tab, Tab::Cpu, "{}", p.name);
+        }
+        assert!(cpu_param("governor").is_some());
         assert_eq!(proc_path("net.core.netdev_budget"), "net/core/netdev_budget");
         assert!(is_conntrack("net.netfilter.nf_conntrack_max"));
         assert!(!is_conntrack("net.core.somaxconn"));

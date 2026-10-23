@@ -18,7 +18,7 @@ Partes:
 |---|---|---|
 | G1.26a | Resumo (hardware, diagnóstico, perfil), Kernel (sysctl), Perfis, medida de pps | este documento |
 | G1.26b | Interfaces: anel, filas, coalescência, offloads, flow control, txqueuelen, qdisc, `rp_filter` por porta | este documento (RSS: G1.26g) |
-| G1.26c | CPU e IRQ: afinidade por nó NUMA, RPS/XPS, governor, C-states por PM QoS, watchdog | aberto |
+| G1.26c | CPU e IRQ: afinidade por nó NUMA, RPS/XPS, governor, C-states por PM QoS, watchdog | este documento |
 | G1.26d | Boot: parâmetros da imagem A/B | aberto |
 
 ## Como funciona
@@ -212,6 +212,66 @@ Teste em netns (`tests/netns_tuning.rs`), num veth de 4 filas:
 O `netdevsim`, que teria anel e coalescência, precisa de root no namespace do host para criar o
 dispositivo, então fica fora dos testes sem root.
 
+## CPU e IRQ (G1.26c)
+
+Ajustes da máquina em `system.tuning.cpu` (catálogo `CPU_PARAMS`), todos por arquivo, sem
+`irqbalance`, `cpupower` nem `tuned`:
+
+| Chave | O quê | Como |
+|---|---|---|
+| `governor` | performance, schedutil, ondemand, powersave, conservative | `scaling_governor` de toda política do cpufreq; recusa o que o driver não oferece (`scaling_available_governors`) |
+| `cpu_dma_latency` | C-state máximo, como a latência de despertar em µs (1 = C1, 0 = polling) | requisição PM QoS em `/dev/cpu_dma_latency` (s32 binário), **mantida aberta pelo daemon**: se ele cair, o limite some (falha segura); sem reboot |
+| `hw_watchdog` | watchdog de hardware | `/dev/watchdog` aberto e alimentado a cada `poll`; desligar envia o fechamento mágico (`V`) |
+
+Por porta (chaves de porta da seção "CPU and IRQ", nos comandos `system.tuning.interface.*`):
+
+| Chave | O quê |
+|---|---|
+| `irq_affinity` | `local node`: uma IRQ de fila por CPU do nó NUMA da porta (fila *i* → CPU *i* do nó), em `/proc/irq/<n>/smp_affinity_list`; `kernel`: todas as CPUs |
+| `rps` | `rps_cpus` das filas de recepção = CPUs do nó (placa de fila única) |
+| `xps` | `xps_cpus`: cada fila de transmissão com uma CPU do nó (placa de várias filas) |
+
+Como funciona:
+
+- **IRQs da porta**: os vetores MSI cujo nome em `/proc/interrupts` cita a porta (`eth0-TxRx-3`); o
+  vetor de administração fica de fora.
+- **IRQ gerenciada** (o driver fixa a CPU, como a flag `o` do MikroTik): a escrita falha com EIO e
+  o CoreRouter diz o motivo.
+- **Valor original**: o de IRQ, RPS e XPS fica guardado na primeira mudança; desligar o devolve
+  (inclusive o mapa de XPS que o driver tinha feito).
+
+**Por que não `irqbalance`.** Ele move as IRQs a cada 10 s pela carga, ignora o nó NUMA quando o
+firmware não o informa e sobrescreve a afinidade manual (`scaling.rst`): o trabalho troca de CPU,
+o cache esfria e os fluxos chegam fora de ordem. O guia da Intel série 800 manda desligá-lo. O
+diagnóstico avisa quando ele roda (laboratório incluído).
+
+Recomendação:
+
+- `governor` performance;
+- `cpu_dma_latency` 1 µs só no perfil de baixa latência;
+- watchdog ligado onde existe;
+- por porta:
+  - afinidade no nó local;
+  - RPS só em fila única;
+  - XPS só com várias filas.
+
+O conservador não muda nada disso.
+
+Janela, aba CPU e IRQ:
+
+- o aviso do irqbalance;
+- a lista da CPU (governor, C-states, watchdog);
+- o seletor de porta, com o mapa "IRQ: CPUs" e as chaves `irq_affinity`, `rps` e `xps`.
+
+Testes:
+
+- unidade sobre um `/proc`, `/sys` e `/dev` de mentira: governor, PM QoS (o valor binário),
+  watchdog com fechamento mágico, espalhamento de IRQ, máscaras de RPS/XPS, recusa e restauração;
+- engine;
+- headless.
+
+Fora do namespace de teste nada disso é seguro de gravar: são arquivos do host.
+
 ## Medida antes e depois
 
 `crates/hal-linux/benches/netns_forward.rs` (rode com `cargo xtask bench netns_forward`) mede, num
@@ -326,3 +386,42 @@ Pesquisa completa nas notas da sessão (`G1.26-research.md`). Resumo:
 - `dev_weight` sem recomendação além do padrão: só importa com RPS (G1.26c).
 - `tcp_rmem`/`tcp_wmem`: tráfego terminado no host.
 - `busy_poll`: não serve ao encaminhamento.
+
+## Achados dos testes
+
+O que os testes e as medidas mostraram e mudou o código ou as explicações (o ⓘ de cada parâmetro
+traz o que for dele, numa seção "Medido" quando há número):
+
+- **`rp_filter` estrito custa ~12 % de encaminhamento** (1,61 contra 1,82 Mpps, uma CPU, veth). E
+  desligar só o `all` não basta: o kernel usa o maior entre `all` e o da interface, e a interface
+  nova herda o `default`.
+  - Por isso o catálogo tem `conf.default.rp_filter` e o `rp_filter` de cada porta.
+  - O perfil põe os três no mesmo valor.
+- **`fq_codel` numa porta virtual custa 7 %** (1,82 para 1,70 Mpps). O perfil mantém `noqueue` em
+  porta virtual e só põe `fq_codel` em placa de fila única; com várias filas, `mq`.
+- **Mudar `ip_forward` reinicia outros parâmetros** (`ip-sysctl.rst`). O CoreRouter sempre o grava
+  primeiro, senão um valor gravado antes podia voltar ao padrão.
+- **Num namespace (container, teste)**:
+  - `netdev_budget`, `netdev_max_backlog` e os `gc_thresh` não existem;
+  - `rmem_max`, `kernel.panic`, `vm.min_free_kbytes` e `nf_conntrack_max` são só leitura;
+  - a janela mostra "–" e o comando recusa com o motivo;
+  - a medida desses parâmetros fica para o host com root (G1.26f).
+- **`/sys/class/net` dentro de um namespace mostra o host**, não o namespace (o sysfs é do
+  namespace que o montou). Por isso:
+  - o bench conta os pacotes por rtnetlink;
+  - os testes de IRQ, RPS e XPS usam um `/sys` de mentira, nunca o real.
+- **Os contadores do diagnóstico são desde o boot.** Depois de aplicar a sugestão o achado não
+  some sozinho. Quando o parâmetro já tem o valor sugerido, ele vira nota sem botão; a taxa recente
+  fica para o G1.26e.
+- **O `/export` do terminal vira `print` + `set`.** Uma visão rica no `print` quebraria o export.
+  Por isso `system.tuning.print` lista só o configurado e a visão completa fica em
+  `….parameter.print`.
+- **Veth não tem anel nem coalescência; seus canais são RX/TX, não combinados.** O caminho "a
+  placa não tem" é o normal, não erro.
+- **Veth e dummy só são gerenciados quando listados** (`--manage`), e um veth com o par no mesmo
+  namespace já é gerenciado. Os ajustes de porta respeitam a mesma regra de posse.
+- **`netdevsim` não serve sem root**: criar o dispositivo exige o namespace do host.
+- **A fonte da GUI não tem "→", "⚠", "ⓘ", "▸", "▾"** (viram um quadrado). Para não depender deles:
+  - ⓘ e as setas das seções são desenhados;
+  - um teste impede esses glifos nos catálogos;
+  - o System › Log ainda usa "→" (G0.15c).

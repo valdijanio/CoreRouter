@@ -95,6 +95,11 @@ pub mod tuning;
 #[cfg(target_os = "linux")]
 mod port_tuning;
 
+/// System › Tuning, CPU and IRQ (G1.26c): governor, PM QoS, watchdog, IRQ
+/// affinity, RPS and XPS.
+#[cfg(target_os = "linux")]
+mod cpu_tuning;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
@@ -102,7 +107,7 @@ mod linux {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use corerouter_hal::drift::{LinkSnap, Snapshot};
-    use corerouter_hal::tuning::{KernelStats, PortTuning, Sysctls, SystemInfo};
+    use corerouter_hal::tuning::{CpuTuning, KernelStats, PortTuning, Sysctls, SystemInfo};
     use corerouter_hal::{
         CableTest, DynamicChange, EthernetMonitor, Features, Hal, HalError, LinkCounters, LinkInfo,
         LinkState, NicHardware, SfpModule,
@@ -132,6 +137,9 @@ mod linux {
         sysctl: crate::tuning::Sysctl,
         /// Port settings of `system.tuning.ports` and their originals.
         ports: crate::port_tuning::Ports,
+        /// CPU settings of `system.tuning.cpu` (holds the PM QoS request
+        /// and the watchdog open while the daemon runs).
+        cpu: crate::cpu_tuning::Cpu,
     }
 
     impl LinuxHal {
@@ -403,6 +411,22 @@ mod linux {
             let tuning = (&from.system.tuning.sysctl, &to.system.tuning.sysctl);
             let ports = (&from_ports, &to_ports);
             let root = self.sysctl.root.clone();
+            let cpu = (&from.system.tuning.cpu, &to.system.tuning.cpu);
+            if let Err(e) = self.cpu.transition(cpu.0, cpu.1, &root) {
+                if firewall {
+                    let dynamic = crate::nft::dynamic();
+                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
+                    {
+                        log::error!("restoring the previous firewall: {back}");
+                    }
+                }
+                return Err(e);
+            }
+            let undo_cpu = |me: &mut Self| {
+                if let Err(b) = me.cpu.transition(cpu.1, cpu.0, &root) {
+                    log::error!("restoring CPU settings: {b}");
+                }
+            };
             let tuned = self.sysctl.transition(tuning.0, tuning.1).and_then(|()| {
                 self.ports
                     .transition(ports.0, ports.1, &root)
@@ -420,6 +444,7 @@ mod linux {
                     })
             });
             if let Err(e) = tuned {
+                undo_cpu(self);
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -469,6 +494,7 @@ mod linux {
                     if let Err(back) = self.sysctl.transition(tuning.1, tuning.0) {
                         log::error!("restoring kernel parameters: {back}");
                     }
+                    undo_cpu(self);
                     if firewall {
                         // The links went back to `from`: so does the firewall.
                         let dynamic = crate::nft::dynamic();
@@ -497,11 +523,17 @@ mod linux {
             Ok(self.sysctl.root.kernel_stats())
         }
 
+        fn cpu_tuning(&mut self) -> Result<CpuTuning, HalError> {
+            Ok(self.cpu.read(&self.sysctl.root))
+        }
+
         fn port_tuning(&mut self, name: &IfName) -> Result<PortTuning, HalError> {
             Ok(crate::port_tuning::read(name, &self.sysctl.root))
         }
 
         fn poll(&mut self) -> Vec<LinkState> {
+            // The hardware watchdog (G1.26c) is fed as long as polls come.
+            self.cpu.feed();
             let view = match self.view(&self.claims) {
                 Ok(v) => v,
                 Err(e) => {

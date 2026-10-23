@@ -375,6 +375,14 @@ pub trait Hal: Send {
         )))
     }
 
+    /// The CPU settings: governor, C-state limit, watchdog (G1.26c).
+    fn cpu_tuning(&mut self) -> Result<tuning::CpuTuning, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no CPU settings",
+            self.describe()
+        )))
+    }
+
     /// Counters behind the tuning diagnosis.
     fn kernel_stats(&mut self) -> Result<tuning::KernelStats, HalError> {
         Err(HalError::Unsupported(format!(

@@ -4,6 +4,33 @@
 /// Explanations by key (`tuning.<parameter>`, `tuning.<topic>`).
 pub(super) const HELP: &[(&str, &str)] = &[
     (
+        "tuning.cpu.cpu_dma_latency",
+        r##"## O que faz
+O C-state mais profundo em que as CPUs podem dormir, dado como a latência de despertar permitida em µs: uma requisição PM QoS em `/dev/cpu_dma_latency`. 1 µs as mantém em C1; 0 as faz ficar em polling (nunca dormem). Sem valor: a escolha do próprio kernel.
+## Quando mudar
+Baixa latência: C-states profundos levam de dezenas a centenas de µs para acordar, e os primeiros pacotes de uma rajada esperam por isso. **Não precisa de reboot**, ao contrário do `intel_idle.max_cstate` (aba Boot).
+## Cuidado
+A requisição vale enquanto o arquivo fica aberto: o daemon a segura, então se o daemon parar o limite some (falha segura). C-states rasos gastam energia; 0 (polling) queima núcleos inteiros."##,
+    ),
+    (
+        "tuning.cpu.governor",
+        r##"## O que faz
+O governor do cpufreq de cada política de CPU: como o kernel escolhe o clock. **performance** o mantém no máximo; schedutil e ondemand seguem a carga; powersave o mantém baixo.
+## Quando mudar
+performance num roteador: a carga de softirq chega em rajadas, e subir o clock leva milissegundos, o bastante para descartar pacotes com o anel cheio (o tuned e o VyOS fazem o mesmo).
+## Cuidado
+Mais consumo e calor. Sem cpufreq (muitas VMs, alguns ajustes de firmware) a linha fica vazia: o clock não é o kernel quem escolhe."##,
+    ),
+    (
+        "tuning.cpu.hw_watchdog",
+        r##"## O que faz
+O watchdog de hardware (`/dev/watchdog`): o daemon o alimenta a cada segundo; se parar (travado, morto, kernel preso) a placa reinicia sozinha.
+## Quando mudar
+Ligado num roteador onde ninguém chega em pessoa. Junto com o `kernel.panic` ele traz a máquina de volta de qualquer travamento.
+## Cuidado
+Desligar envia o fechamento mágico, que para o temporizador. Um driver sem fechamento mágico continua contando depois que o CoreRouter solta: reinicia, a menos que outra coisa o alimente."##,
+    ),
+    (
         "tuning.kernel.panic",
         r##"## O que faz
 Segundos depois de um kernel panic até a máquina reiniciar sozinha; 0 espera para sempre na tela do panic.
@@ -37,7 +64,8 @@ Quantos pacotes uma rodada do softirq de recepção trata, somando todas as fila
 ## Quando aumentar
 Quando o `time_squeeze` cresce (aba Resumo): a rodada termina com trabalho sobrando e o resto espera a próxima. 600 é um valor comum em roteador; 1000 ou mais para portas de 10/40 Gb/s.
 ## Cuidado
-Uma rodada mais longa atrasa todo o resto naquela CPU (programas, o daemon de roteamento). Aumente junto com o `netdev_budget_usecs`."##,
+Uma rodada mais longa atrasa todo o resto naquela CPU (programas, o daemon de roteamento). Aumente junto com o `netdev_budget_usecs`.
+Vale para o host todo: um container ou um namespace de rede não o tem (aparece como –)."##,
     ),
     (
         "tuning.net.core.netdev_budget_usecs",
@@ -91,7 +119,9 @@ Filtro de caminho reverso: confere o endereço de origem de cada pacote na tabel
 ## Quando mudar
 Solto é a escolha segura num roteador de provedor: descarta origem falsa e mantém o roteamento assimétrico (dois links, BGP com vários upstreams) funcionando. Desligado economiza uma consulta de rota por pacote quando o anti-spoofing é feito no firewall.
 ## Cuidado
-Estrito quebra o roteamento assimétrico em silêncio: a resposta entra por outro link e é descartada. O padrão do MikroTik é desligado."##,
+Estrito quebra o roteamento assimétrico em silêncio: a resposta entra por outro link e é descartada. O padrão do MikroTik é desligado.
+## Medido
+Encaminhando UDP de 64 bytes numa CPU (veth num namespace): estrito 1,61 Mpps, desligado 1,82 Mpps (+13 %). Desligar o `all` não basta: o valor da própria interface (e o `default`, para as novas) também precisa baixar."##,
     ),
     (
         "tuning.net.ipv4.conf.default.rp_filter",
@@ -118,7 +148,8 @@ Se o kernel encaminha pacotes IPv4 entre interfaces. Um roteador precisa dele li
 ## Quando mudar
 Nunca num roteador. Desligado é para um host.
 ## Cuidado
-Desligar para todo o roteamento IPv4 na hora. Ligar também desliga o LRO de todas as portas (o kernel faz isso)."##,
+Desligar para todo o roteamento IPv4 na hora. Ligar também desliga o LRO de todas as portas (o kernel faz isso).
+Mudá-lo reinicia outros parâmetros de configuração para o padrão de host ou de roteador (`ip-sysctl.rst`): o CoreRouter sempre o grava antes dos outros."##,
     ),
     (
         "tuning.net.ipv4.neigh.default.gc_thresh1",
@@ -382,6 +413,15 @@ Não importa para o tráfego encaminhado, que já chega cortado no MTU do cabo. 
 Ajuda o TCP do próprio roteador (BGP com tabelas completas, a API); desligar só custa CPU."##,
     ),
     (
+        "tuning.port.irq_affinity",
+        r##"## O que faz
+Onde rodam as interrupções das filas da porta. **local node**: cada IRQ de fila numa CPU própria do nó NUMA da porta (fila 0 na primeira CPU, fila 1 na segunda…), gravado em `/proc/irq/<n>/smp_affinity_list`. **kernel**: todas as CPUs online (o padrão do kernel).
+## Quando mudar
+Nó local num roteador (o `set_irq_affinity -X local` da Intel, `scaling.rst`): uma fila atendida por uma CPU mantém o cache quente, e uma CPU do outro nó chegaria à placa atravessando a interconexão.
+## Cuidado
+**Pare o irqbalance** antes: ele move as IRQs a cada 10 s, ignora onde a placa está (muitos firmwares não informam o nó NUMA) e sobrescreve a afinidade manual, então o trabalho troca de CPU e os fluxos chegam fora de ordem. A aba Resumo avisa quando ele roda. Alguns drivers fixam a CPU das suas IRQs (IRQs gerenciadas, a flag `o` do MikroTik): o CoreRouter avisa."##,
+    ),
+    (
         "tuning.port.lro",
         r##"## O que faz
 Large Receive Offload: a placa junta pacotes no hardware e reescreve os cabeçalhos de um jeito que não tem volta.
@@ -402,7 +442,9 @@ A disciplina de fila raiz da porta: como os pacotes esperam para sair.
 ## Quando mudar
 Uma porta de várias filas fica com mq; uma de fila única recebe fq_codel. Limitação de banda (HTB, CAKE) é outra feature.
 ## Cuidado
-fq_codel na raiz de uma placa de várias filas faz todas as CPUs passarem por uma trava: menos vazão."##,
+fq_codel na raiz de uma placa de várias filas faz todas as CPUs passarem por uma trava: menos vazão.
+## Medido
+Numa porta virtual (veth, dummy: `noqueue`), o fq_codel custou 7 % da taxa de encaminhamento (de 1,82 para 1,70 Mpps, uma CPU): o perfil mantém `noqueue` ali."##,
     ),
     (
         "tuning.port.rp_filter",
@@ -411,7 +453,18 @@ O filtro de caminho reverso desta porta. O kernel usa o maior entre o `net.ipv4.
 ## Quando mudar
 Para o mesmo valor do `all` (o perfil faz isso): solto (2) para um provedor com vários links, desligado (0) com anti-spoofing no firewall.
 ## Cuidado
-Estrito (1) num link de saída descarta respostas que voltam por outro link (roteamento assimétrico)."##,
+Estrito (1) num link de saída descarta respostas que voltam por outro link (roteamento assimétrico).
+## Medido
+Estrito custou 12 % da taxa de encaminhamento contra desligado (1,61 contra 1,82 Mpps, uma CPU, veth)."##,
+    ),
+    (
+        "tuning.port.rps",
+        r##"## O que faz
+Receive Packet Steering: o kernel espalha os fluxos recebidos pelas CPUs do nó NUMA da porta em software (`rps_cpus` de cada fila de recepção), como o RSS faz no hardware.
+## Quando mudar
+Ligado numa porta com uma única fila de recepção (placa antiga, VM, túnel), cuja única IRQ carregaria uma CPU só.
+## Cuidado
+Desligado quando a placa tem várias filas: o RSS já espalha os fluxos e o RPS só acrescenta um passo (o MikroTik e a documentação do kernel dizem o mesmo)."##,
     ),
     (
         "tuning.port.rx_channels",
@@ -502,6 +555,15 @@ Pacotes que o kernel enfileira para a porta quando a placa está ocupada (na qdi
 Raramente: com fq_codel a qdisc mantém a fila curta de qualquer jeito. Uma interface virtual (VLAN, túnel) com 0 não tem fila nenhuma.
 ## Cuidado
 Uma fila grande sem qdisc com AQM é bufferbloat: segundos de atraso sob carga."##,
+    ),
+    (
+        "tuning.port.xps",
+        r##"## O que faz
+Transmit Packet Steering: cada CPU envia pela própria fila de transmissão (`xps_cpus`), a mesma CPU da IRQ daquela fila.
+## Quando mudar
+Ligado em portas de várias filas: sem trava dividida entre CPUs na transmissão, e as conclusões ficam na CPU que enviou.
+## Cuidado
+Alguns drivers configuram o XPS sozinhos; desligar devolve o mapa deles."##,
     ),
     (
         "tuning.profiles",
@@ -598,12 +660,16 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Controle de fluxo"##,
     ),
     (
+        "Frequency",
+        r##"Frequência"##,
+    ),
+    (
         "High throughput",
         r##"Alto desempenho"##,
     ),
     (
-        "Interrupt affinity per NUMA node, RPS/XPS, the CPU governor and C-states arrive with G1.26c.",
-        r##"A afinidade das interrupções por nó NUMA, RPS/XPS, o governor da CPU e os C-states chegam com o G1.26c."##,
+        "Idle states",
+        r##"Estados de repouso"##,
     ),
     (
         "Interrupt coalescing",
@@ -632,6 +698,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Not set: the kernel's own value is in use",
         r##"Não definido: vale o valor do próprio kernel"##,
+    ),
+    (
+        "Not set: the machine's own value is in use",
+        r##"Não definido: vale o valor da própria máquina"##,
     ),
     (
         "Not set: the port's own value is in use",
@@ -664,6 +734,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Profiles",
         r##"Perfis"##,
+    ),
+    (
+        "Queue IRQs",
+        r##"IRQs das filas"##,
     ),
     (
         "Queues",
@@ -746,6 +820,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Este backend não descreve a máquina: as faixas vêm só do kernel."##,
     ),
     (
+        "This router has no CPU tuning yet: update corerouter-daemon.",
+        r##"Este roteador ainda não tem ajuste de CPU: atualize o corerouter-daemon."##,
+    ),
+    (
         "This router has no System › Tuning yet: update corerouter-daemon.",
         r##"Este roteador ainda não tem System › Tuning: atualize o corerouter-daemon."##,
     ),
@@ -802,6 +880,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"pisca o link"##,
     ),
     (
+        "irqbalance is running: it undoes the IRQ affinity.",
+        r##"O irqbalance está rodando: ele desfaz a afinidade das IRQs."##,
+    ),
+    (
         "needs reboot",
         r##"pede reboot"##,
     ),
@@ -843,6 +925,10 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"O encaminhamento IPv4 está desligado: este roteador não roteia."##,
     ),
     (
+        "finding.irqbalance",
+        r##"O irqbalance está rodando: ele move as IRQs a cada 10 s e desfaz a afinidade (pare-o: systemctl disable --now irqbalance)."##,
+    ),
+    (
         "finding.lro_on",
         r##"O LRO está ligado em {nics}: ele junta pacotes de um jeito que um roteador não pode encaminhar (aba Interfaces)."##,
     ),
@@ -873,6 +959,10 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
     (
         "why.budget_low",
         r##"O valor do kernel: rodadas de recepção curtas, menos espera ({profile})."##,
+    ),
+    (
+        "why.c_states",
+        r##"1 µs: as CPUs ficam no máximo em C1 e acordam na hora para um pacote (C-states profundos levam dezenas de µs)."##,
     ),
     (
         "why.coalesce_adaptive",
@@ -907,12 +997,20 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"Um roteador encaminha pacotes."##,
     ),
     (
+        "why.governor",
+        r##"performance: as CPUs ficam no clock máximo; subir o clock numa rajada custa latência e descartes."##,
+    ),
+    (
         "why.gro",
         r##"O GRO junta os pacotes de um fluxo na recepção e o kernel os separa de novo no envio: menos custo por pacote, seguro para encaminhar."##,
     ),
     (
         "why.hash_l4",
         r##"Espalha os fluxos pelas rotas de mesmo custo também pela porta, não só pelo endereço."##,
+    ),
+    (
+        "why.irq_local",
+        r##"Uma IRQ de fila por CPU do nó NUMA da porta ({cpus} CPUs), fixa: sem tráfego de memória entre nós."##,
     ),
     (
         "why.keep",
@@ -971,11 +1069,31 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"Desligado: nenhuma consulta de rota extra por pacote; filtre origens falsas no firewall."##,
     ),
     (
+        "why.rps_off",
+        r##"Várias filas: o RSS já espalha os fluxos; o RPS só acrescentaria trabalho."##,
+    ),
+    (
+        "why.rps_on",
+        r##"Uma fila de recepção: o RPS espalha os fluxos pelas CPUs do nó, em software."##,
+    ),
+    (
         "why.sockbuf",
         r##"Deixa o BGP e a API pedirem buffers de socket de 16 MiB (tabelas completas)."##,
     ),
     (
         "why.v6_routes",
         r##"O Linux {kernel} ainda limita as rotas IPv6 ao max_size: espaço para a tabela completa."##,
+    ),
+    (
+        "why.watchdog",
+        r##"O hardware reinicia o roteador se o daemon parar de responder."##,
+    ),
+    (
+        "why.xps_off",
+        r##"Uma fila de transmissão: nada a escolher."##,
+    ),
+    (
+        "why.xps_on",
+        r##"Cada CPU envia pela própria fila: sem trava dividida entre CPUs."##,
     ),
 ];

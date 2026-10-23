@@ -79,6 +79,20 @@ pub struct PortTuning {
     pub max: BTreeMap<String, i64>,
     /// Why some values are missing (`coalesce: not supported`).
     pub notes: Vec<String>,
+    /// The port's queue IRQs and the CPUs each one is served by now
+    /// (`smp_affinity_list`, G1.26c).
+    pub irqs: Vec<(u32, String)>,
+}
+
+/// The CPU settings of `corerouter_model::tuning::CPU_PARAMS` as the
+/// platform has them (G1.26c).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CpuTuning {
+    /// By key; `None`: no such knob here (no cpufreq, no watchdog).
+    pub values: BTreeMap<String, Option<i64>>,
+    /// `irqbalance` runs: it moves IRQs every 10 s and undoes an affinity.
+    pub irqbalance: bool,
+    pub notes: Vec<String>,
 }
 
 /// The current value of each asked kernel parameter; `None`: this kernel

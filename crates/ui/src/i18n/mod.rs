@@ -225,6 +225,23 @@ mod tests {
         }
     }
 
+    /// Glyphs the GUI's default fonts lack: they would show as boxes
+    /// (found on the G1.26 screenshots).
+    const MISSING_GLYPHS: [char; 5] = ['→', '⚠', 'ⓘ', '▸', '▾'];
+
+    #[test]
+    fn catalogs_use_only_glyphs_the_font_has() {
+        for l in Lang::ALL {
+            for t in l.help().iter().chain(l.labels()).chain(l.templates()) {
+                for (k, text) in t.iter() {
+                    for g in MISSING_GLYPHS {
+                        assert!(!text.contains(g), "{l:?} {k}: {g} shows as a box");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn labels_fall_back_to_english() {
         assert_eq!(tr(Lang::Pt, "Settings"), "Configurações");

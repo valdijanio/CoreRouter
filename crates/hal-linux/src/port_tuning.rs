@@ -36,6 +36,8 @@ enum Group {
     TxQueueLen,
     Qdisc,
     RpFilter,
+    /// IRQ affinity, RPS, XPS (G1.26c): files under `/proc` and `/sys`.
+    Cpu,
 }
 
 fn group(key: &str) -> Option<Group> {
@@ -46,6 +48,7 @@ fn group(key: &str) -> Option<Group> {
         "txqueuelen" => Group::TxQueueLen,
         "qdisc" => Group::Qdisc,
         "rp_filter" => Group::RpFilter,
+        "irq_affinity" | "rps" | "xps" => Group::Cpu,
         _ => return None,
     })
 }
@@ -194,6 +197,9 @@ pub(crate) fn read(name: &IfName, root: &Root) -> PortTuning {
         .ok()
         .and_then(|t| t.trim().parse().ok());
     values.insert("rp_filter".into(), rp);
+    let (cpu, irqs) = crate::cpu_tuning::read_port(root, name.as_str());
+    values.extend(cpu);
+    out.irqs = irqs;
     out.values = values;
     out
 }
@@ -220,6 +226,8 @@ fn write(name: &IfName, root: &Root, g: Group, vals: &BTreeMap<String, i64>) -> 
             let (index, _) = link(name.as_str())?;
             set_root_qdisc(index, kind)
         }
+        // Ports::port handles these itself (it keeps the files' originals).
+        Group::Cpu => Err("CPU settings go through Ports".into()),
         Group::RpFilter => {
             let v = vals.get("rp_filter").copied().unwrap_or(0);
             std::fs::write(rp_filter_path(root, name.as_str()), format!("{v}\n"))
@@ -232,6 +240,9 @@ fn write(name: &IfName, root: &Root, g: Group, vals: &BTreeMap<String, i64>) -> 
 #[derive(Debug, Default)]
 pub struct Ports {
     orig: BTreeMap<(IfName, String), i64>,
+    /// IRQ affinity, RPS and XPS: the files as they were before the
+    /// first change (what turning one off puts back).
+    files: BTreeMap<(IfName, String), crate::cpu_tuning::Saved>,
 }
 
 /// One port's settings, by key.
@@ -298,6 +309,43 @@ impl Ports {
         for k in from.keys().filter(|k| !to.contains_key(*k)) {
             if let (Some(g), Some(o)) = (group(k), self.orig.get(&(name.clone(), k.clone()))) {
                 target.entry(g).or_default().insert(k.clone(), *o);
+            }
+        }
+        // IRQ affinity, RPS, XPS first: plain files, with their originals.
+        if let Some(vals) = target.remove(&Group::Cpu) {
+            let mut done: Vec<(String, Option<crate::cpu_tuning::Saved>)> = Vec::new();
+            for (k, v) in &vals {
+                if cur(k) == Some(*v) {
+                    continue;
+                }
+                let key = (name.clone(), k.clone());
+                let res = if *v != 0 {
+                    crate::cpu_tuning::write_port(root, name.as_str(), k, true).map(|saved| {
+                        let had = self.files.contains_key(&key);
+                        self.files.entry(key.clone()).or_insert(saved);
+                        (!had).then_some(())
+                    })
+                } else {
+                    match self.files.remove(&key) {
+                        Some(saved) => {
+                            crate::cpu_tuning::restore(&saved);
+                            Ok(None)
+                        }
+                        None => crate::cpu_tuning::write_port(root, name.as_str(), k, false)
+                            .map(|_| None),
+                    }
+                };
+                match res {
+                    Ok(_) => done.push((k.clone(), None)),
+                    Err(e) => {
+                        for (k, _) in done.iter().rev() {
+                            if let Some(saved) = self.files.remove(&(name.clone(), k.clone())) {
+                                crate::cpu_tuning::restore(&saved);
+                            }
+                        }
+                        return Err(HalError::Rejected(format!("{name}: {e}")));
+                    }
+                }
             }
         }
         let mut written: Vec<(Group, BTreeMap<String, i64>)> = Vec::new();
