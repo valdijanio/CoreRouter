@@ -1,13 +1,15 @@
 //! /system logging (G4.6): remote syslog actions and the rules that send
 //! events with some topics to them; the built-in `memory` action keeps the
-//! router's own log (`log.print`, G4.6d) and only takes `memory_lines`.
+//! router's own log (`log.print`, G4.6d) and only takes `memory_lines`;
+//! the built-in `analytics` action is the ClickHouse exporter's `logs`
+//! table (G4.4f), configured with `system.analytics.*`.
 
 use std::net::IpAddr;
 
 use corerouter_model::ItemId;
 use corerouter_model::logging::{
     Facility, LogAction, LogRule, Logging, MAX_ACTIONS, MAX_MEMORY_LINES, MAX_NAME, MAX_PREFIX,
-    MAX_RULES, MAX_TOPICS, MEMORY_ACTION, SeverityChoice, valid_topic,
+    ANALYTICS_ACTION, MAX_RULES, MAX_TOPICS, MEMORY_ACTION, SeverityChoice, valid_topic,
 };
 use serde_json::{Value, json};
 
@@ -220,6 +222,12 @@ fn action_set(s: &mut Session, p: &Value) -> Result<Value> {
     if name == MEMORY_ACTION {
         return memory_set(s, p);
     }
+    if name == ANALYTICS_ACTION {
+        return Err(EngineError::bad(
+            "name",
+            "analytics is the ClickHouse exporter: configure it with system.analytics.set",
+        ));
+    }
     if p.get("memory_lines").is_some_and(|v| !v.is_null()) {
         return Err(EngineError::bad(
             "memory_lines",
@@ -256,6 +264,12 @@ fn action_remove(s: &mut Session, p: &Value) -> Result<Value> {
             "memory is the router's own log: it cannot be removed (disable its rules instead)",
         ));
     }
+    if name == ANALYTICS_ACTION {
+        return Err(EngineError::bad(
+            "name",
+            "analytics is built in: it cannot be removed (disable its rules, or system.analytics.set logs=no)",
+        ));
+    }
     let l = &s.store().candidate().system.logging;
     if l.action(&name).is_none() {
         return Err(no_action(&name));
@@ -288,8 +302,21 @@ fn action_list(s: &mut Session, _: &Value) -> Result<Value> {
         "syslog_severity": null,
         "comment": "",
     });
+    let analytics = json!({
+        "name": ANALYTICS_ACTION,
+        "target": "analytics",
+        "default": true,
+        "memory_lines": null,
+        "remote": null,
+        "remote_port": null,
+        "src_address": null,
+        "syslog_facility": null,
+        "syslog_severity": null,
+        "comment": "",
+    });
     Ok(Value::Array(
-        std::iter::once(memory)
+        [memory, analytics]
+            .into_iter()
             .chain(l.actions.iter().map(action_json))
             .collect(),
     ))

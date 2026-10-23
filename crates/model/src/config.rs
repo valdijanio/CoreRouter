@@ -51,6 +51,9 @@ pub struct System {
     /// `system.tuning.*` (G1.26): kernel and hardware settings.
     #[serde(skip_serializing_if = "crate::tuning::Tuning::is_default")]
     pub tuning: crate::tuning::Tuning,
+    /// `/system analytics` (G4.4f): export to an external ClickHouse.
+    #[serde(skip_serializing_if = "crate::analytics::Analytics::is_default")]
+    pub analytics: crate::analytics::Analytics,
 }
 
 impl Default for System {
@@ -61,6 +64,7 @@ impl Default for System {
             logging: Logging::default(),
             metrics: MetricsService::default(),
             tuning: crate::tuning::Tuning::default(),
+            analytics: crate::analytics::Analytics::default(),
         }
     }
 }

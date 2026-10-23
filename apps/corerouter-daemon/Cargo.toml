@@ -31,6 +31,9 @@ serde_json.workspace = true
 rustls.workspace = true
 webpki-roots = "1.0.10"
 httparse = "1.10.1"
+# service/analytics_queue.rs (G4.4f): gzip of the INSERT bodies, pure Rust
+# (miniz_oxide), no C library.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 # ip.dns.resolve (G4.1d): record types by name.
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 

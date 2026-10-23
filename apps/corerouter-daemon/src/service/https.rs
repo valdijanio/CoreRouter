@@ -1,5 +1,6 @@
 //! A small HTTP/1.1 client over TCP or TLS (rustls), blocking, for what the
-//! daemon fetches itself: adlists (G4.1d) and, later, DNS over HTTPS.
+//! daemon fetches itself: adlists (G4.1d), the ClickHouse exporter (G4.4f)
+//! and, later, DNS over HTTPS.
 //!
 //! Why not a crate's client: the router has no system resolver (no
 //! `/etc/resolv.conf` in its namespace or image), so host names go through
@@ -141,6 +142,64 @@ pub(crate) fn tls_config(verify: bool) -> Result<Arc<ClientConfig>, String> {
     cell.get_or_init(make).clone()
 }
 
+/// A client config of its own (G4.4f, the ClickHouse exporter): the
+/// server checked against `ca_pem` (PEM certificates; empty: the Mozilla
+/// roots) or not at all (`verify == false`), and a client certificate
+/// (`client`: certificate chain and private key, PEM) for servers that log
+/// in by certificate.
+pub(crate) fn custom_tls_config(
+    verify: bool,
+    ca_pem: &str,
+    client: Option<(&str, &str)>,
+) -> Result<Arc<ClientConfig>, String> {
+    use rustls::pki_types::PrivateKeyDer;
+    use rustls::pki_types::pem::PemObject;
+    let p = provider();
+    let builder = ClientConfig::builder_with_provider(p.clone())
+        .with_safe_default_protocol_versions()
+        .map_err(|e| format!("TLS: {e}"))?;
+    let builder = if !verify {
+        builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AnyCert {
+                algs: p.signature_verification_algorithms,
+            }))
+    } else if ca_pem.trim().is_empty() {
+        builder.with_root_certificates(rustls::RootCertStore {
+            roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+        })
+    } else {
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
+            let cert = cert.map_err(|e| format!("ca_certificate: {e}"))?;
+            roots
+                .add(cert)
+                .map_err(|e| format!("ca_certificate: {e}"))?;
+        }
+        if roots.is_empty() {
+            return Err("ca_certificate: no certificate in the PEM text".into());
+        }
+        builder.with_root_certificates(roots)
+    };
+    let config = match client {
+        None => builder.with_no_client_auth(),
+        Some((cert, key)) => {
+            let chain = CertificateDer::pem_slice_iter(cert.as_bytes())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("certificate: {e}"))?;
+            if chain.is_empty() {
+                return Err("certificate: no certificate in the PEM text".into());
+            }
+            let key = PrivateKeyDer::from_pem_slice(key.as_bytes())
+                .map_err(|e| format!("private_key: {e}"))?;
+            builder
+                .with_client_auth_cert(chain, key)
+                .map_err(|e| format!("certificate and private_key: {e}"))?
+        }
+    };
+    Ok(Arc::new(config))
+}
+
 /// `ssl_verify=no`: the connection is still encrypted and the handshake
 /// signature checked, but the certificate is not.
 #[derive(Debug)]
@@ -262,17 +321,27 @@ pub(crate) fn connect(
     verify: bool,
     deadline: Instant,
 ) -> Result<Stream, String> {
+    let config = if tls { Some(tls_config(verify)?) } else { None };
+    connect_with(addr, config, name, deadline)
+}
+
+/// Connects to `addr`, with TLS when `tls` gives a config.
+pub(crate) fn connect_with(
+    addr: SocketAddr,
+    tls: Option<Arc<ClientConfig>>,
+    name: &str,
+    deadline: Instant,
+) -> Result<Stream, String> {
     let left = deadline.saturating_duration_since(Instant::now());
     if left.is_zero() {
         return Err("timed out".into());
     }
     let tcp = TcpStream::connect_timeout(&addr, left).map_err(|e| format!("{addr}: {e}"))?;
     let _ = tcp.set_nodelay(true);
-    let stream = if tls {
+    let stream = if let Some(config) = tls {
         let server =
             ServerName::try_from(name.to_owned()).map_err(|e| format!("TLS name {name}: {e}"))?;
-        let conn =
-            ClientConnection::new(tls_config(verify)?, server).map_err(|e| format!("TLS: {e}"))?;
+        let conn = ClientConnection::new(config, server).map_err(|e| format!("TLS: {e}"))?;
         Stream::Tls(Box::new(StreamOwned::new(conn, tcp)))
     } else {
         Stream::Plain(tcp)
@@ -297,6 +366,8 @@ pub(crate) struct Response {
     pub content_type: Option<String>,
     /// The server keeps the connection open for another request.
     pub keep_alive: bool,
+    /// ClickHouse's error code (`X-ClickHouse-Exception-Code`), G4.4f.
+    pub exception_code: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -392,6 +463,7 @@ fn read_response(
             "transfer-encoding" => chunked = v.to_ascii_lowercase().contains("chunked"),
             "location" => out.location = Some(v.chars().take(2048).collect()),
             "content-type" => out.content_type = Some(v.chars().take(128).collect()),
+            "x-clickhouse-exception-code" => out.exception_code = Some(v.chars().take(16).collect()),
             "connection" => {
                 let v = v.to_ascii_lowercase();
                 if v.contains("close") {

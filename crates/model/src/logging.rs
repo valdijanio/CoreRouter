@@ -5,7 +5,9 @@
 //! and a rule matches when the event has every topic of the rule and none
 //! of its `!`-negated ones. Action targets: `remote` (syslog over UDP,
 //! RFC 5424 + RFC 5426) and the built-in `memory` (the router's own log,
-//! `log.print`; G4.6d), which keeps the last [`Logging::memory_lines`].
+//! `log.print`; G4.6d), which keeps the last [`Logging::memory_lines`],
+//! and the built-in `analytics` (G4.4f), the `logs` table of the external
+//! ClickHouse (`system.analytics`).
 
 use std::fmt;
 use std::net::IpAddr;
@@ -25,6 +27,9 @@ pub const DEFAULT_PORT: u16 = 514;
 /// The built-in action of the router's own log (RouterOS `memory`): always
 /// there, never in [`Logging::actions`], cannot be removed.
 pub const MEMORY_ACTION: &str = "memory";
+/// The built-in action of the ClickHouse exporter (G4.4f): like
+/// [`MEMORY_ACTION`], always there and never in [`Logging::actions`].
+pub const ANALYTICS_ACTION: &str = "analytics";
 /// RouterOS `memory-lines` default and range.
 pub const DEFAULT_MEMORY_LINES: u32 = 1000;
 pub const MAX_MEMORY_LINES: u32 = 65_535;
@@ -398,9 +403,18 @@ impl Logging {
         self.actions.iter().find(|a| a.name == name)
     }
 
-    /// `name` is an action a rule may name: a remote one or `memory`.
+    /// `name` is an action a rule may name: a remote one, `memory` or
+    /// `analytics`.
     pub fn has_action(&self, name: &str) -> bool {
-        name == MEMORY_ACTION || self.action(name).is_some()
+        name == MEMORY_ACTION || name == ANALYTICS_ACTION || self.action(name).is_some()
+    }
+
+    /// The first enabled rule that sends events with `topics` to
+    /// `analytics` (its prefix goes in front of the message).
+    pub fn to_analytics(&self, topics: &[String]) -> Option<&LogRule> {
+        self.rules
+            .iter()
+            .find(|r| r.action == ANALYTICS_ACTION && r.matches(topics))
     }
 
     /// Some enabled rule sends events with `topics` to `memory`.
