@@ -24,6 +24,8 @@
 mod address_en;
 mod address_pt;
 mod dns_lookup_pt;
+mod cgnat_en;
+mod cgnat_pt;
 mod connections_en;
 mod connections_pt;
 mod en;
@@ -76,6 +78,7 @@ impl Lang {
                 menu_pt::LABELS,
                 routes_pt::LABELS,
                 connections_pt::LABELS,
+                cgnat_pt::LABELS,
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
                 address_pt::LABELS,
@@ -91,6 +94,7 @@ impl Lang {
                 tuning_en::HELP,
                 menu_en::HELP,
                 connections_en::HELP,
+                cgnat_en::HELP,
                 address_en::HELP,
             ],
             Lang::Pt => &[
@@ -98,6 +102,7 @@ impl Lang {
                 tuning_pt::HELP,
                 menu_pt::HELP,
                 connections_pt::HELP,
+                cgnat_pt::HELP,
                 address_pt::HELP,
             ],
         }
@@ -263,6 +268,13 @@ mod tests {
                 assert_eq!(places(en), places(pt), "{key}");
                 ids.push(key);
             }
+        }
+        for (id, en) in corerouter_engine::dns_upstreams::TEXTS {
+            let key = format!("dnsbench.{id}");
+            let pt = lookup(Lang::Pt.templates(), &key)
+                .unwrap_or_else(|| panic!("dns_lookup_pt.rs lacks {key}"));
+            assert_eq!(places(en), places(pt), "{key}");
+            ids.push(key);
         }
         for (id, en) in corerouter_engine::dns_lookup::WHY_TEXTS {
             let key = format!("dnswhy.{id}");

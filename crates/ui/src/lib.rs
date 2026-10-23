@@ -520,7 +520,7 @@ impl CoreRouterUi {
             }
             Field::Addresses => self.cache.addresses = arr(value),
             Field::Routes => {
-                self.cache.routes = arr(value);
+                self.route_page_arrived(value);
                 let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.open_route_after)
                     .into_iter()
                     .partition(|(req, _)| *req <= id);
@@ -738,7 +738,8 @@ impl CoreRouterUi {
             "engine.execute",
             exec("ip.address.list"),
         );
-        ask(self, Field::Routes, "engine.execute", exec("ip.route.list"));
+        let routes = self.route_query();
+        ask(self, Field::Routes, "engine.execute", routes);
         ask(self, Field::Vrfs, "engine.execute", exec("ip.vrf.list"));
         ask(
             self,
@@ -2650,7 +2651,8 @@ mod tests {
                 "engine.execute"
                     if command.ends_with(".list")
                         || command.ends_with(".history")
-                        || command == "config.diff" =>
+                        || command == "config.diff"
+                        || command == "ip.route.page" =>
                 {
                     Ok(json!([]))
                 }

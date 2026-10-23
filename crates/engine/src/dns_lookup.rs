@@ -123,7 +123,7 @@ pub(crate) struct Job {
 }
 
 /// The query's bytes for `to` (DoH: id 0, RFC 8484 §4.1).
-fn bytes_for(ask: &Ask, to: &LookupServer) -> Result<Vec<u8>, String> {
+pub(crate) fn bytes_for(ask: &Ask, to: &LookupServer) -> Result<Vec<u8>, String> {
     let id = matches!(to, LookupServer::Secure(_)).then_some(0);
     dig::query(ask, id).map(|(_, b)| b)
 }
@@ -201,7 +201,7 @@ const AS_WAIT: Duration = Duration::from_secs(3);
 
 /// The origin AS of `addrs` (the MTR's lookup, Team Cymru over DNS:
 /// G6.3b), waiting at most [`AS_WAIT`]; unknown ones are left out.
-fn origin_as(
+pub(crate) fn origin_as(
     ctx: &TaskCtx,
     prober: Option<&SharedProber>,
     addrs: &[IpAddr],
@@ -228,7 +228,7 @@ fn origin_as(
 }
 
 /// The addresses among `rows` (A and AAAA data), without repeats.
-fn addresses<'a>(rows: impl IntoIterator<Item = &'a Row>) -> Vec<IpAddr> {
+pub(crate) fn addresses<'a>(rows: impl IntoIterator<Item = &'a Row>) -> Vec<IpAddr> {
     let mut out: Vec<IpAddr> = Vec::new();
     for row in rows.into_iter().filter(|x| x.rtype == "A" || x.rtype == "AAAA") {
         if let Ok(ip) = row.data.parse::<IpAddr>()
@@ -301,7 +301,7 @@ fn one(
 
 /// The data a server answered, comparable across servers (TTLs left out:
 /// they count down differently in each cache).
-fn compared(r: &Reply) -> Vec<String> {
+pub(crate) fn compared(r: &Reply) -> Vec<String> {
     let mut d: Vec<String> = r
         .answer
         .iter()
