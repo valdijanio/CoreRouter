@@ -586,3 +586,44 @@ diferença para a revisão seguinte.
 O commit fica ~7–16 ms mais caro (comparar os textos das duas configs) e grava menos (2× a config
 no slot, antes 3×). O boot cresce com o número de revisões montadas (~20 ms cada com 5 MiB):
 restaura 64 em vez de 3–6; G0.20 trata disso.
+
+G1.26b — `netns_forward` com um terceiro caso: o perfil de alto desempenho mais `fq_codel` como qdisc
+raiz da porta de saída (um dummy, que tem `noqueue`). AMD Ryzen AI MAX+ 395, Linux 7.0.0-38, build
+release, 2026-10-23, **medido** (mesma rodada):
+
+| Caso | Encaminhamento |
+|---|---|
+| Antes (`rp_filter` estrito) | 1,61 Mpps |
+| Perfil de alto desempenho (parâmetros por namespace) | 1,82 Mpps (+13 %) |
+| O mesmo, com `fq_codel` na porta de saída virtual | 1,70 Mpps (−7 % contra `noqueue`) |
+
+Por isso o perfil mantém `noqueue` em porta virtual e só põe `fq_codel` em placa de fila única.
+
+### audit-history-share: boot e RAM com 64 revisões de config grande (2026-10-23, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release, `storage_fs/history64/*`: `FileStorage` em disco
+de verdade (fsync), 64 revisões, commit pequeno (`interface.set` comment). O pico de RSS é o
+`VmHWM` de um processo que só faz o boot. As configs são as do audit-history:
+
+- 5 MiB: 4000 regras, 20 000 entradas de address-list, 10 000 rotas, 10 000 leases;
+- 10 MiB: 4000 regras, 65 536 entradas, 30 000 rotas.
+
+As três versões comparadas:
+
+- **G0.16**: a `main` antes do #141, com uma cópia inteira por revisão;
+- **#141**: diferenças em disco, mas cada revisão desserializada inteira no boot;
+- **agora**: este PR.
+
+| medida | 5 MiB G0.16 | 5 MiB #141 | 5 MiB agora | 10 MiB G0.16 | 10 MiB #141 | 10 MiB agora |
+|---|---|---|---|---|---|---|
+| revisões restauradas | 6 | 64 | 64 | 3 | 64 | 64 |
+| boot | 260 ms | 1,46 s | 149 ms | 297 ms | 1,21 s | 208 ms |
+| pico de RSS do boot | 79 MiB | — | 79 MiB | 147 MiB | — | 149 MiB |
+| RSS depois do boot | 75 MiB | — | 63 MiB | 117 MiB | — | 117 MiB |
+| commit (mediana) | 28,7 ms | 40,2 ms | 26,6 ms | 44,1 ms | 69,4 ms | 42,9 ms |
+
+De onde vêm os números da coluna #141:
+
+- O boot foi medido no próprio #141, antes do G0.16.
+- O commit foi medido nesta rodada, com G0.16: é a comparação dos textos inteiros que o #141 fazia.
+- O RSS não foi medido, porque o bench de RSS veio com este PR.
