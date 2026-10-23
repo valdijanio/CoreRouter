@@ -1368,6 +1368,7 @@ dependencies = [
  "corerouter-hal",
  "corerouter-model",
  "corerouter-proto-dns",
+ "corerouter-proto-flow",
  "corerouter-shell",
  "criterion",
  "egui",

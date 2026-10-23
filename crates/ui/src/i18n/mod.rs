@@ -34,6 +34,8 @@ mod pt;
 mod routes_pt;
 mod tuning_en;
 mod tuning_pt;
+mod traffic_flow_en;
+mod traffic_flow_pt;
 
 /// A language the GUI speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -79,6 +81,7 @@ impl Lang {
                 cgnat_pt::LABELS,
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
+                traffic_flow_pt::LABELS,
             ],
         }
     }
@@ -86,8 +89,8 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, cgnat_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, cgnat_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, cgnat_en::HELP, traffic_flow_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, cgnat_pt::HELP, traffic_flow_pt::HELP],
         }
     }
 

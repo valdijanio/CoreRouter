@@ -66,6 +66,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         always,
         target_remove
     ),
+    cmd!(query "ip.traffic-flow.target.preview", "Traffic Flow Target Preview", [], None,
+        "{id?: string, dst_address?: ip, port?: int 1..65535, src_address?: ip|\"\", version?: 9|ipfix, transport?: udp|tcp, template_refresh?: int 0..1000000, template_timeout?: int 0..86400, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, target_preview),
     cmd!(query "ip.traffic-flow.target.list", "Traffic Flow Targets", [], None,
         "{} → [{id, dst_address, port, src_address, version, transport, template_refresh, template_timeout, disabled, comment, state: disabled|sending|connecting|error, records, messages, bytes, records_per_min, template_sends, last_template, queue, dropped, send_errors, last_error}]",
         always, target_list),
@@ -303,6 +306,95 @@ fn apply_target(s: &Session, t: &mut FlowTarget, p: &Value) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// The modal's numbers come as text: as numbers for the commands.
+fn normalized(p: &Value) -> Value {
+    let mut out = p.as_object().cloned().unwrap_or_default();
+    for k in ["port", "template_refresh", "template_timeout"] {
+        if let Some(Value::String(v)) = out.get(k)
+            && let Ok(n) = v.trim().parse::<u64>()
+        {
+            out.insert(k.into(), json!(n));
+        }
+    }
+    Value::Object(out)
+}
+
+/// The add/edit modal's preview (G0.24): never fails for bad input, says
+/// what is wrong as a check instead.
+fn target_preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let p = normalized(p);
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    let check = |level: &str, check: &str, message: String, param: Option<&str>| {
+        json!({"level": level, "check": check, "message": message, "param": param})
+    };
+    let id = match p.get("id") {
+        Some(v) => match v.as_str().map(str::parse::<ItemId>) {
+            Some(Ok(id)) if s.store().candidate().ip.traffic_flow.target(id).is_some() => Some(id),
+            _ => {
+                checks.push(check("error", "id", "no such target".into(), None));
+                None
+            }
+        },
+        None => None,
+    };
+    let base = id.and_then(|id| s.store().candidate().ip.traffic_flow.target(id).cloned());
+    let dst_given = p.get("dst_address").and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty());
+    if base.is_none() && !dst_given {
+        checks.push(check("error", "required", "the collector's address is required".into(), Some("dst_address")));
+    } else if checks.is_empty() {
+        let mut t = base.clone().unwrap_or_else(|| FlowTarget::new(ItemId(0), IpAddr::from([0, 0, 0, 0])));
+        let mut q = p.clone();
+        if let Some(o) = q.as_object_mut() {
+            o.remove("id");
+        }
+        match apply_target(s, &mut t, &q).and_then(|()| duplicate(&s.store().candidate().ip.traffic_flow, &t)) {
+            Err(EngineError::BadParam { param, reason }) => {
+                checks.push(check("error", "invalid", reason, Some(param.as_str())));
+            }
+            Err(e) => checks.push(check("error", "invalid", e.to_string(), None)),
+            Ok(()) => {
+                let (version, transport) = (
+                    if t.version == FlowVersion::V9 { "NetFlow v9" } else { "IPFIX" },
+                    t.transport.as_str().to_uppercase(),
+                );
+                let from = t.src_address.map_or_else(|| "the route's address".to_owned(), |a| a.to_string());
+                computed.push(json!({"label": "Sends", "value": format!("{version} over {transport} to {}:{} from {from}", t.dst_address, t.port)}));
+                let templates = match t.transport {
+                    FlowTransport::Tcp => "once per connection (and on every reconnect)".to_owned(),
+                    FlowTransport::Udp => format!(
+                        "every {} packets and every {} s",
+                        t.template_refresh, t.template_timeout
+                    ),
+                };
+                computed.push(json!({"label": "Templates", "value": templates}));
+                checks.push(check("ok", "valid", "ready to send".into(), None));
+                let tf = &s.store().candidate().ip.traffic_flow;
+                if !tf.enabled {
+                    checks.push(check("warning", "off", "traffic flow is off: nothing is sent until it is enabled (General)".into(), None));
+                }
+                if t.transport == FlowTransport::Udp {
+                    checks.push(check("info", "udp", "over UDP a collector that is down loses what is sent; TCP queues it".into(), Some("transport")));
+                }
+                if t.version == FlowVersion::Ipfix && t.port == corerouter_model::traffic_flow::DEFAULT_PORT {
+                    checks.push(check("info", "port", "2055 is the NetFlow port most collectors use; IPFIX's own is 4739".into(), Some("port")));
+                }
+                let mut params = q.as_object().cloned().unwrap_or_default();
+                params.retain(|_, v| !v.is_null());
+                match id {
+                    Some(id) => {
+                        params.insert("id".into(), json!(id.to_string()));
+                        commands.push(json!({"command": "ip.traffic-flow.target.set", "params": params}));
+                    }
+                    None => commands.push(json!({"command": "ip.traffic-flow.target.add", "params": params})),
+                }
+            }
+        }
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
 }
 
 fn target_id(s: &Session, p: &Value) -> Result<ItemId> {
@@ -639,6 +731,28 @@ mod tests {
         assert_eq!(list[0]["state"], "disabled");
         ok(&mut s, "ip.traffic-flow.target.remove", json!({"id": id}));
         assert!(err(&mut s, "ip.traffic-flow.target.remove", json!({"id": id})).contains("no traffic-flow target"));
+    }
+
+    #[test]
+    fn the_preview_says_what_is_wrong_and_what_it_would_run() {
+        let mut s = session();
+        let p = ok(&mut s, "ip.traffic-flow.target.preview", json!({}));
+        assert_eq!(p["checks"][0]["param"], "dst_address");
+        let p = ok(&mut s, "ip.traffic-flow.target.preview", json!({"dst_address": "192.0.2.10", "port": "9", "version": "9", "transport": "tcp"}));
+        assert_eq!(p["checks"][0]["level"], "error");
+        assert_eq!(p["checks"][0]["param"], "transport");
+        assert!(p["commands"].as_array().unwrap().is_empty());
+        let p = ok(&mut s, "ip.traffic-flow.target.preview", json!({"dst_address": "192.0.2.10", "port": "4739"}));
+        assert_eq!(p["commands"][0]["command"], "ip.traffic-flow.target.add");
+        assert_eq!(p["commands"][0]["params"]["port"], 4739, "the modal's text became a number");
+        assert!(p["computed"][0]["value"].as_str().unwrap().contains("IPFIX over UDP to 192.0.2.10:4739"));
+        assert!(p["checks"].as_array().unwrap().iter().any(|c| c["check"] == "off"));
+        // And what it would run, runs.
+        let cmd = p["commands"][0].clone();
+        let id = ok(&mut s, cmd["command"].as_str().unwrap(), cmd["params"].clone())["id"].clone();
+        let p = ok(&mut s, "ip.traffic-flow.target.preview", json!({"id": id, "port": "2055"}));
+        assert_eq!(p["commands"][0]["command"], "ip.traffic-flow.target.set");
+        assert_eq!(p["checks"][0]["level"], "ok");
     }
 
     #[test]
