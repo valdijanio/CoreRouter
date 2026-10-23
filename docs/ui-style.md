@@ -107,3 +107,44 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
 - **Partes de uma janela são abas dela, não itens do menu** (DNS Zones: Zones, Records, Zone File;
   DHCP Server: …, History, Statistics). Item novo no menu só para uma janela que o operador abre
   por si.
+
+## Janela de lista e modal de adicionar (padrão aprovado, G0.24)
+
+Toda janela que lista itens configuráveis (endereços, regras, pools, estáticas, concessões…)
+segue este padrão; a referência é IP › Addresses (G1.28). Os componentes são reutilizáveis (não
+copie o código de uma janela para outra).
+
+**Barra de ações**, nesta ordem, com ícone e dica:
+
+| Botão | Ação | Cinza quando |
+|---|---|---|
+| **+** | abre o modal de adicionar | o roteador não tem o comando `…add` |
+| **−** | remove a seleção (com confirmação se for mais de um) | nada selecionado; item dinâmico (DHCP, RA) que não se remove |
+| **✓** | ativa a seleção | nada desativado selecionado |
+| **✗** | desativa a seleção (fica na config, sai do kernel) | nada ativo selecionado; item sem `disabled` |
+| **💬** | comenta a seleção | nada selecionado |
+
+Depois dos botões: os filtros em selos (família, origem, estado…) e o Find à direita. Botão
+cinza diz por quê na dica (a regra vem do engine: `enabled`/`disabledReason`).
+
+**Tabela:** selo de **estado** (`active`, `disabled`, `invalid`, `tentative`…) e de **origem**
+(`static`, `dhcp`, `ra`, …) no lugar das flags de letra do RouterOS (que continuam no terminal);
+interface e VRF em selo colorido por chave; item desativado em cinza; rodapé com contagens
+(total, por estado, por família). Duplo clique abre o mesmo modal preenchido (editar); clique
+direito: copiar, copiar como comando (CoreRouter e RouterOS), ativar/desativar, remover.
+
+**Modal de adicionar e editar:**
+
+- **ⓘ em cada rótulo** e no título da janela, abrindo a explicação no idioma configurado (o que
+  é, quando mudar, cuidado, padrão recomendado, RFC). Rótulos em inglês, explicações em português.
+- **Campos calculados** ao digitar (rede, broadcast e hosts de um endereço; quantos itens uma
+  faixa gera), sem regra na UI: o engine calcula (comando de consulta ou de pré-visualização).
+- **Cadastro em série** quando faz sentido (faixa, lista colada, contador): gera vários itens
+  numa **transação só**, com teto e aviso acima dele.
+- **Checagens antes de aplicar**, com selo `ok`/`aviso`/`erro` e o motivo: conflito e
+  sobreposição com o que existe, uso na rede quando dá para conferir (ARP, RFC 5227), e o
+  **risco de perder o acesso** (mexer na interface por onde a sessão chega pede confirmação e
+  sugere o Safe Mode).
+- **Prévia dos comandos** que serão aplicados.
+- Botões **Cancel**, **Apply** (aplica e mantém aberto) e **OK** (aplica e fecha); Enter = OK,
+  Esc = Cancel. Erro do engine aparece no modal, junto do campo, sem fechar.
