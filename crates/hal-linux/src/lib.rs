@@ -424,6 +424,7 @@ mod linux {
                         mtu: l.mtu,
                         mac: l.mac,
                         unmanaged: o.reason().map(str::to_owned),
+                        errors: l.errors,
                     })
                 })
                 .collect()

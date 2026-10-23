@@ -5,7 +5,7 @@
 //! (RFC 8767). The clock is the caller's (milliseconds of any monotonic
 //! clock), so tests drive time and the crate stays wasm-safe.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::IpAddr;
 
 use corerouter_model::dns::{CacheKind, CacheRow};
@@ -20,11 +20,18 @@ pub const MAX_NEGATIVE_TTL: u32 = 3600;
 /// RFC 8767 §4: a stale answer goes out with TTL 30 s, so clients come
 /// back soon for a fresh one.
 pub const STALE_TTL: u32 = 30;
-/// Book-keeping per entry on top of the records (estimated: map node,
-/// key, vectors, the entry itself).
-const ENTRY_OVERHEAD: usize = 128;
-/// Per record: owner name, header, rdata (estimated from the wire size).
-const RECORD_OVERHEAD: usize = 64;
+/// Book-keeping per entry on top of the records (map node, key, vectors,
+/// the entry itself). With [`RECORD_OVERHEAD`], sized so `used_bytes`
+/// follows the process's real memory: one A answer measured 690 bytes of
+/// RSS per entry (200 000 entries, release build, 2026-10-22), the
+/// estimate gives ~670.
+const ENTRY_OVERHEAD: usize = 256;
+/// Per record: hickory's `Record` (owner `Name` on the heap, header,
+/// rdata), on top of its wire size.
+const RECORD_OVERHEAD: usize = 256;
+/// The expiry index's node per entry (its key and tree overhead,
+/// estimated).
+const INDEX_OVERHEAD: usize = 64;
 
 type Key = (String, u16);
 
@@ -49,6 +56,10 @@ pub struct Hit {
 #[derive(Debug, Default)]
 pub struct Cache {
     map: BTreeMap<Key, Entry>,
+    /// The same entries by expiry: eviction takes the first one in
+    /// O(log n), never a scan of the cache (it runs under the resolver's
+    /// lock that every lookup also takes).
+    by_expiry: BTreeSet<(u64, Key)>,
     used: usize,
     budget: usize,
     stale_ms: u64,
@@ -67,9 +78,9 @@ impl Cache {
     }
 
     /// A new budget (config change); evicts down to it.
-    pub fn set_budget(&mut self, budget_bytes: usize, now_ms: u64) {
+    pub fn set_budget(&mut self, budget_bytes: usize) {
         self.budget = budget_bytes;
-        self.shrink(now_ms);
+        self.shrink();
     }
 
     /// How long past its TTL an answer is kept for serve-stale (0: not).
@@ -91,6 +102,7 @@ impl Cache {
 
     pub fn flush(&mut self) {
         self.map.clear();
+        self.by_expiry.clear();
         self.used = 0;
     }
 
@@ -159,68 +171,77 @@ impl Cache {
             return;
         }
         let records = answer.records.len() + answer.authority.len();
-        let size = ENTRY_OVERHEAD + name.len() + records * RECORD_OVERHEAD + wire;
+        let size = ENTRY_OVERHEAD
+            + INDEX_OVERHEAD
+            + 2 * name.len()
+            + records.saturating_mul(RECORD_OVERHEAD)
+            + wire;
         if size > self.budget {
             return;
         }
         let k = key(name, rtype);
         self.remove(&k);
-        self.used += size;
+        self.used = self.used.saturating_add(size);
+        let expires_ms = now_ms.saturating_add(u64::from(ttl) * 1000);
+        self.by_expiry.insert((expires_ms, k.clone()));
         self.map.insert(
             k,
             Entry {
                 answer: answer.clone(),
-                expires_ms: now_ms.saturating_add(u64::from(ttl) * 1000),
+                expires_ms,
                 server,
                 hits: 0,
                 size,
             },
         );
-        self.shrink(now_ms);
+        self.shrink();
     }
 
     fn remove(&mut self, k: &Key) {
         if let Some(old) = self.map.remove(k) {
             self.used = self.used.saturating_sub(old.size);
+            self.by_expiry.remove(&(old.expires_ms, k.clone()));
         }
     }
 
-    /// Evicts until under budget: answers past their stale window first,
-    /// then those that expire soonest (stale ones are the soonest of all).
-    fn shrink(&mut self, now_ms: u64) {
-        if self.used <= self.budget {
-            return;
-        }
-        let stale_ms = self.stale_ms;
-        let dead: Vec<Key> = self
-            .map
-            .iter()
-            .filter(|(_, e)| e.expires_ms.saturating_add(stale_ms) <= now_ms)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in &dead {
-            self.remove(k);
-        }
+    /// Evicts until under budget, those that expire soonest first:
+    /// answers past their stale window, then stale ones, then the rest.
+    /// O(log n) per entry evicted.
+    fn shrink(&mut self) {
         while self.used > self.budget {
-            let Some(k) = self
-                .map
-                .iter()
-                .min_by_key(|(_, e)| e.expires_ms)
-                .map(|(k, _)| k.clone())
-            else {
+            let Some((_, k)) = self.by_expiry.pop_first() else {
+                self.map.clear();
                 self.used = 0;
                 break;
             };
-            self.remove(&k);
+            if let Some(old) = self.map.remove(&k) {
+                self.used = self.used.saturating_sub(old.size);
+            }
         }
     }
 
     /// Entries by name (`ip.dns.cache.print`), stale ones included.
     pub fn rows(&self, now_ms: u64) -> Vec<CacheRow> {
+        self.rows_matching(now_ms, None, None, usize::MAX)
+    }
+
+    /// At most `limit` rows whose name contains `name` and whose type is
+    /// `qtype`: filtered on the key, so only the rows returned are
+    /// formatted.
+    pub fn rows_matching(
+        &self,
+        now_ms: u64,
+        name: Option<&str>,
+        qtype: Option<&str>,
+        limit: usize,
+    ) -> Vec<CacheRow> {
         let stale_ms = self.stale_ms;
         self.map
             .iter()
             .filter(|(_, e)| e.expires_ms.saturating_add(stale_ms) > now_ms)
+            .filter(|((n, _), _)| name.is_none_or(|f| n.contains(f)))
+            .filter(|((_, t), _)| qtype.is_none_or(|q| RecordType::from(*t).to_string() == q))
+            .take(limit)
             .map(|((name, t), e)| {
                 let rtype = RecordType::from(*t);
                 CacheRow {
@@ -334,7 +355,7 @@ mod tests {
 
     #[test]
     fn budget_evicts_the_soonest_to_expire() {
-        let one = ENTRY_OVERHEAD + 2 + RECORD_OVERHEAD + 40;
+        let one = ENTRY_OVERHEAD + INDEX_OVERHEAD + 2 * 2 + RECORD_OVERHEAD + 40;
         let mut c = Cache::new(3 * one);
         for (i, ttl) in [(1u8, 500u32), (2, 100), (3, 900), (4, 700)] {
             c.put(
@@ -350,10 +371,53 @@ mod tests {
         assert_eq!(c.len(), 3);
         assert!(c.get("h2", A, 0).is_none(), "shortest TTL went first");
         assert!(c.used_bytes() <= 3 * one);
-        c.set_budget(0, 0);
+        c.set_budget(0);
         assert!(c.is_empty());
         c.put("x", A, &addrs([192, 0, 2, 9], 60), None, 0, WEEK, 40);
         assert!(c.is_empty(), "cache_size 0 turns the cache off");
+    }
+
+    #[test]
+    fn eviction_follows_the_expiry_index() {
+        let one = ENTRY_OVERHEAD + INDEX_OVERHEAD + 2 * 2 + RECORD_OVERHEAD + 40;
+        let mut c = Cache::new(100 * one);
+        c.set_stale(10);
+        for i in 0..100u32 {
+            let ttl = 1000 - i;
+            c.put(
+                &format!("{:02}", i),
+                A,
+                &addrs([192, 0, 2, 1], ttl),
+                None,
+                0,
+                WEEK,
+                40,
+            );
+        }
+        // Replacing an entry moves it in the index; an expired one read
+        // past its stale window leaves both.
+        c.put("00", A, &addrs([192, 0, 2, 1], 5), None, 0, WEEK, 40);
+        assert!(c.get("00", A, 20_000).is_none());
+        assert_eq!((c.len(), c.by_expiry.len()), (99, 99));
+        for i in 0..50u32 {
+            c.put(
+                &format!("n{:01}", i % 10),
+                A,
+                &addrs([192, 0, 2, 2], 5000),
+                None,
+                0,
+                WEEK,
+                40,
+            );
+        }
+        assert_eq!(c.len(), c.by_expiry.len());
+        assert!(c.used_bytes() <= 100 * one);
+        // 99 + 10 names in room for 100: the 9 that expire soonest went
+        // (TTL 901..=909), the rest stayed.
+        assert_eq!(c.len(), 100);
+        assert!(c.get("99", A, 0).is_none() && c.get("91", A, 0).is_none());
+        assert!(c.get("90", A, 0).is_some() && c.get("01", A, 0).is_some());
+        assert!(c.get("n9", A, 0).is_some());
     }
 
     #[test]

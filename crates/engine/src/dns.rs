@@ -21,6 +21,21 @@ use crate::Session;
 pub trait DnsBackend: Send + Sync {
     fn lookup(&self, name: &str) -> Result<Vec<IpAddr>, ResolveError>;
     fn cache_rows(&self) -> Vec<CacheRow>;
+    /// At most `limit` entries whose name contains `name` and whose type
+    /// is `qtype` (upper case). Implementations filter before formatting,
+    /// under their lock: a large cache is never copied whole.
+    fn cache_rows_matching(&self, name: Option<&str>, qtype: Option<&str>, limit: usize) -> Vec<CacheRow> {
+        self.cache_rows()
+            .into_iter()
+            .filter(|r| name.is_none_or(|f| r.name.contains(f)))
+            .filter(|r| qtype.is_none_or(|t| r.qtype == t))
+            .take(limit)
+            .collect()
+    }
+    /// Entries in the cache (without formatting them).
+    fn cache_len(&self) -> usize {
+        self.cache_rows().len()
+    }
     fn cache_used_bytes(&self) -> usize;
     fn flush(&self);
     /// What the resolver measured of each upstream server.

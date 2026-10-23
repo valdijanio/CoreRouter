@@ -28,6 +28,10 @@ use crate::server::Forwarder;
 const MESSAGE_BYTES: usize = 16_000;
 /// RFC 1035 §4.2.1, for IXFR over UDP without EDNS.
 const UDP_BYTES: usize = 512;
+/// The smallest record on the wire (a compressed owner, the fixed header,
+/// a little data): more records than `payload / this` cannot fit one UDP
+/// message, so they are not even encoded to find out.
+const MIN_RECORD_BYTES: usize = 12;
 /// Messages one transfer may take (a zone at the record limit fits in far
 /// fewer).
 const MAX_MESSAGES: usize = 100_000;
@@ -62,6 +66,32 @@ fn peek(packet: &[u8]) -> Option<(u8, Option<u16>)> {
     Some((opcode, None))
 }
 
+/// Whether `client` may have anything from the DNS server at all: the
+/// router itself, `allowed_from`, or a peer a zone names (a secondary in
+/// `allow_transfer`, an updater in `allow_update` or, for a zone updated
+/// with TSIG from anywhere, anyone; a primary of one of our secondaries,
+/// for NOTIFY). The daemon asks before it gives a TCP connection a slot:
+/// the chain's ACL only runs once a whole message was read.
+pub fn may_connect(f: &Forwarder, client: IpAddr) -> bool {
+    let c = client.to_canonical();
+    if c.is_loopback() {
+        return true;
+    }
+    let cfg = f.config();
+    if cfg.allowed.iter().any(|n| n.contains(&c)) {
+        return true;
+    }
+    let zones = super::zones(f, &cfg);
+    zones.conf.values().any(|z| {
+        z.may_transfer(c)
+            || z.primaries.contains(&c)
+            || z.allow_update.iter().any(|n| n.contains(&c))
+            || (z.ztype == ZoneType::Primary
+                && z.allow_update.is_empty()
+                && !z.update_keys.is_empty())
+    })
+}
+
 /// Answers a transfer or NOTIFY from `client`; `None`: an ordinary query
 /// (or junk), for the chain.
 pub fn intercept(f: &Forwarder, packet: &[u8], client: IpAddr, tcp: bool) -> Option<Vec<Vec<u8>>> {
@@ -87,7 +117,17 @@ pub fn intercept(f: &Forwarder, packet: &[u8], client: IpAddr, tcp: bool) -> Opt
     } else {
         serve(f, &m, client, tcp)
     };
-    Some(out.into_iter().flatten().collect())
+    // A message that failed to encode is never just left out: the peer
+    // would take SOA … SOA with records missing for the whole zone.
+    match whole(out) {
+        Some(out) => Some(out),
+        None => Some(error(&m, ResponseCode::ServFail).into_iter().collect()),
+    }
+}
+
+/// Every message, or `None` when any of them failed to encode.
+pub fn whole(parts: Vec<Option<Vec<u8>>>) -> Option<Vec<Vec<u8>>> {
+    parts.into_iter().collect()
 }
 
 /// A bare reply to `m` with `rcode` (its question echoed).
@@ -162,13 +202,26 @@ fn serve(f: &Forwarder, m: &Message, client: IpAddr, tcp: bool) -> Vec<Option<Ve
     let Some(theirs) = m.authorities.iter().find_map(soa_serial_of) else {
         return vec![error(m, ResponseCode::FormErr)];
     };
+    // RFC 1995 §2: over UDP, what cannot fit one message is answered with
+    // the current SOA (the client comes back over TCP). Decided by the
+    // record count first: a spoofed UDP IXFR must never cost a copy and
+    // an encoding of the whole zone on the listener thread.
+    let fits = |count: usize| tcp || count <= udp_limit(m) / MIN_RECORD_BYTES;
+    let soa_only = || messages(m, std::slice::from_ref(&zone.soa));
     let records = if !serial_gt(zone.serial, theirs) {
         // RFC 1995 §4: up to date (or ahead of us): one SOA.
         vec![zone.soa.clone()]
     } else if let Some(diffs) = super::changes_since(f, &zone, theirs) {
+        let count = diffs.iter().map(super::Diff::size).sum::<usize>() + 2;
+        if !fits(count) {
+            return soa_only();
+        }
         ixfr_records(&zone, &diffs)
     } else {
         // §4: no history from that serial: the whole zone, AXFR style.
+        if !fits(axfr_count(&zone)) {
+            return soa_only();
+        }
         axfr_records(&zone)
     };
     let out = messages(m, &records);
@@ -181,9 +234,19 @@ fn serve(f: &Forwarder, m: &Message, client: IpAddr, tcp: bool) -> Vec<Option<Ve
     {
         // RFC 1995 §2: too big for UDP: the current SOA tells the client
         // to come back over TCP.
-        return messages(m, std::slice::from_ref(&zone.soa));
+        return soa_only();
     }
     out
+}
+
+/// At least as many records as [`axfr_records`] gives, without copying
+/// them (a signed zone has one RRSIG per set at least, and its NSEC3s).
+fn axfr_count(z: &ZoneData) -> usize {
+    let signed = z
+        .dnssec
+        .as_ref()
+        .map_or(0, |s| s.rrsigs.len().saturating_add(s.nsec3.len()));
+    z.len().saturating_add(signed).saturating_add(2)
 }
 
 fn udp_limit(m: &Message) -> usize {

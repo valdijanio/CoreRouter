@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 use std::io::{self, IoSliceMut};
-use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::AsRawFd;
 use std::time::{Duration, Instant};
 
@@ -303,6 +303,9 @@ pub struct UdpDatagram {
     /// Interface it arrived on (from `IP_PKTINFO`), when known.
     pub interface: Option<IfName>,
     pub src: SocketAddr,
+    /// Destination address of the packet (from the packet info), when
+    /// known: a broadcast or multicast for a real announcement.
+    pub dst: Option<IpAddr>,
     pub payload: Vec<u8>,
 }
 
@@ -372,7 +375,7 @@ impl MndpListener {
 /// with no usable source).
 fn recv_one(s: &Socket, buf: &mut [u8]) -> nix::Result<Option<UdpDatagram>> {
     let mut cmsg = nix::cmsg_space!(nix::libc::in6_pktinfo);
-    let (n, truncated, src, ifindex) = {
+    let (n, truncated, src, ifindex, dst) = {
         let mut iov = [IoSliceMut::new(buf)];
         let msg = recvmsg::<SockaddrStorage>(
             s.as_raw_fd(),
@@ -381,18 +384,24 @@ fn recv_one(s: &Socket, buf: &mut [u8]) -> nix::Result<Option<UdpDatagram>> {
             MsgFlags::MSG_DONTWAIT,
         )?;
         let mut ifindex = None;
+        let mut dst = None;
         for c in msg.cmsgs()? {
             match c {
-                ControlMessageOwned::Ipv4PacketInfo(pi) => ifindex = Some(pi.ipi_ifindex),
+                ControlMessageOwned::Ipv4PacketInfo(pi) => {
+                    ifindex = Some(pi.ipi_ifindex);
+                    // ip(7): ipi_addr is the header's destination address.
+                    dst = Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(pi.ipi_addr.s_addr))));
+                }
                 ControlMessageOwned::Ipv6PacketInfo(pi) => {
                     ifindex = i32::try_from(pi.ipi6_ifindex).ok();
+                    dst = Some(IpAddr::V6(Ipv6Addr::from(pi.ipi6_addr.s6_addr)));
                 }
                 _ => {}
             }
         }
         let src = msg.address.and_then(|a| sock_addr(&a));
         let truncated = msg.flags.contains(MsgFlags::MSG_TRUNC);
-        (msg.bytes, truncated, src, ifindex)
+        (msg.bytes, truncated, src, ifindex, dst)
     };
     let (Some(src), false) = (src, truncated) else {
         return Ok(None);
@@ -405,6 +414,7 @@ fn recv_one(s: &Socket, buf: &mut [u8]) -> nix::Result<Option<UdpDatagram>> {
     Ok(Some(UdpDatagram {
         interface,
         src,
+        dst,
         payload: buf.get(..n).unwrap_or(&[]).to_vec(),
     }))
 }

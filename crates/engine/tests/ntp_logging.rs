@@ -358,3 +358,25 @@ fn settings_survive_a_save_and_reload() {
     let plain = serde_json::to_value(corerouter_model::Config::default()).unwrap();
     assert_eq!(plain["system"], json!({"identity": "CoreRouter"}));
 }
+
+/// audit-services #5: a saved file with min_poll > max_poll loaded as is
+/// and crashed the NTP client; whole-config validation now names it.
+#[test]
+fn a_loaded_config_with_bad_poll_bounds_is_reported() {
+    let mut cfg = corerouter_model::Config::default();
+    assert!(corerouter_engine::validate::validate_all(&cfg).is_empty());
+    cfg.system.ntp_client.min_poll = 10;
+    cfg.system.ntp_client.max_poll = 6;
+    cfg.system.ntp_client.servers = vec!["bad host!".into()];
+    let issues: Vec<String> = corerouter_engine::validate::validate_all(&cfg)
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert!(issues.iter().any(|i| i.contains("max_poll")), "{issues:?}");
+    assert!(issues.iter().any(|i| i.contains("servers")), "{issues:?}");
+    cfg.system.ntp_client.min_poll = 2;
+    cfg.system.ntp_client.max_poll = 6;
+    cfg.system.ntp_client.servers.clear();
+    let issues = corerouter_engine::validate::validate_all(&cfg);
+    assert_eq!(issues.len(), 1, "{issues:?}");
+}

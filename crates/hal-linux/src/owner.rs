@@ -63,6 +63,8 @@ pub struct KernelLink {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    /// `IFLA_STATS64` error/drop counters (none without the attribute).
+    pub errors: Option<corerouter_hal::LinkErrors>,
 }
 
 impl KernelLink {

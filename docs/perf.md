@@ -338,3 +338,119 @@ corerouter-proto-dhcp --example storm` (p50/p99 de cada mensagem com `Instant`):
 Antes de trocar a busca linear de ofertas estacionadas por um conjunto, `probed/10000` dava 20 k
 leases/s e p99 de 64 µs (O(n²) numa tempestade). No daemon soma-se uma `fdatasync` do diário por
 rodada (todas as concessões da rodada juntas, antes dos ACKs).
+
+### Auditoria do canal de controle (2026-10-22, **medido**)
+
+`cargo bench -p corerouter-control --bench control`, release, AMD Ryzen AI MAX+ 395 (32 CPUs),
+`--save-baseline antes` na `origin/main` (19b550e) e `--baseline antes` na branch
+`stream/audit-control` (envelope com `RawValue`, `Sock` com prazo/ociosidade, keepalive):
+
+| Benchmark | antes | depois | variação |
+|---|---|---|---|
+| `control/tcp/ping` | 8,20 µs | 8,13 µs | −1,8 % |
+| `control/tcp/interface.list` | 54,9 µs | 55,2 µs | sem mudança (p = 0,25) |
+| `control/tls/ping` | 9,20 µs | 9,07 µs | −1,4 % |
+| `control/tls/interface.list` | 55,3 µs | 51,0 µs | −7,9 % |
+
+Sem regressão: o `setsockopt` do timeout de leitura só roda quando o valor muda (depois do login
+não muda mais), e o `ping` não confere token.
+
+**Medido** (AMD Ryzen AI MAX+ 395, 32 CPUs, build release, 2026-10-22; criterion, `antes` = código
+da `origin/main` 19b550e com os mesmos benchmarks, `depois` = este PR):
+
+| Benchmark | Antes | Depois | Mudança |
+|---|---|---|---|
+| `engine_dhcp_round/mem` (1 rodada: 128 vinculações + 128 ofertas, histórico, zona DNS + reversa, address list; 2.560 concessões antes) | 220,7 ms | 14,1 ms | −93,6 % |
+| `engine_dhcp_round/fsync` (idem, arquivos sincronizados no NVMe; 640 concessões antes) | 844 ms | 8,1 ms | −99,0 % |
+| escritas por rodada de tempestade (appends / saves de estado) | 129 / 256 | 2 / 1 | |
+| `dhcp_attack/exhausted_pool_random_mac/16k` (1.000 DISCOVERs, pool cheio de ofertas) | 18,4 ms | 1,95 ms | −89 % |
+| `dhcp_attack/statics_dora/0` (200 DORAs) | 0,90 ms | 1,02 ms | +29 % (índices novos da tabela) |
+| `dhcp_attack/statics_dora/10000` | 37,9 ms | 1,30 ms | −96,6 % |
+| `dhcp_attack/statics_dora/65536` | 351 ms | 3,05 ms | −99,2 % |
+| `dhcp_attack/arp_spoof_probe_replies/4096` (200 DISCOVERs, cada sonda respondida 3×) | 0,93 ms | 0,51 ms | −45 % |
+| `dhcp_attack/history_open_at_cap/500k` (100 vinculações com o histórico no teto, inclui soltar a cópia) | 520 ms | 14,1 ms | −97,3 % |
+| `dhcp6_attack/solicit_flood_ia_na/100k` (tempo; a memória agora tem teto de 131.072 registros e as ofertas somem após 120 s) | 122 ms | 150 ms | +19 % |
+| `dhcp6_attack/solicit_pd_exhausted/65536` (100 SOLICITs, pool PD cheio) | 639 ms | 0,052 ms | −99,99 % |
+
+O lock da sessão fica com o DHCP no máximo ~20 ms de leitura por rodada (`ROUND_BUDGET_US`) e é
+solto por ≥ 1 ms entre rodadas; numa rodada de tempestade o tempo total sob o lock caiu de 220–844 ms
+para 8–14 ms (linhas acima).
+
+### audit-dns — cache do DNS cheio (2026-10-22, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release, criterion (`--warm-up-time 1 --measurement-time 3`),
+`antes` = `origin/main` (dbbd394), depois = `stream/audit-dns`:
+
+| benchmark | antes | depois |
+|---|---|---|
+| `dns_cache_put_full` (inserir num cache de 16 MiB cheio, ~60 000 entradas) | 298,9 µs | 0,611 µs (−99,8 %) |
+| `dns_forward_cache_miss_full` (cadeia inteira, miss que despeja num cache de 8 MiB cheio) | 151,2 µs | 3,89 µs (−97,4 %) |
+| `dns_forward_cache_hit_full` (acerto com o cache cheio) | 945 ns | 959 ns (ruído) |
+| `dns_forward_cache_hit` (quente, cache pequeno) | 915 ns | 964 ns (ruído: `dns_query_encode`, código não tocado, variou o mesmo +5 %) |
+| `dns_forward_cache_miss` (frio, upstream instantâneo, TTL 0) | 2,45 µs | 2,59 µs (ruído) |
+
+Memória por entrada (uma resposta A, 200 000 entradas, RSS de `/proc/self/statm` antes e depois
+num teste release): **690 bytes**. A estimativa que o cache usa contra o `cache_size` dava 352
+(o `cache_size` permitia ~2× a memória configurada); com o índice por expiração e os overheads
+corrigidos ela dá 672. Efeito: o mesmo `cache_size` guarda cerca de metade das entradas de
+antes, mas agora corresponde à memória de verdade.
+
+### audit-net: validação, listagem e remoção com tabelas grandes (2026-10-23, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release (`cargo bench`), criterion. Bench novo
+`crates/engine/benches/scale.rs` (config grande já em vigor, restaurada do armazenamento):
+`validate_all/<tipo>/N` é a validação do commit; `commit/<tipo>/N` é um `interface.set comment`
+(não toca a lista grande); antes = `main` dbbd394, depois = esta branch.
+
+| Bench | Antes | Depois |
+|---|---|---|
+| `engine_scale/validate_all/filter_rules/1000` | 54,9 ms | 73 µs |
+| `engine_scale/validate_all/filter_rules/3000` | 562 ms | 0,22 ms |
+| `engine_scale/commit/filter_rules/1000` | 77 ms | 16,9 ms |
+| `engine_scale/commit/filter_rules/3000` | 584 ms | 48,9 ms |
+| `engine_scale/validate_all/routes/1000` | 499 µs | 103 µs |
+| `engine_scale/validate_all/routes/10000` | 48,2 ms | 1,21 ms |
+| `engine_scale/ip.route.list/1000` | 1,37 ms | 1,05 ms |
+| `engine_scale/ip.route.list/10000` | 64,6 ms | 14,0 ms |
+| `engine_scale/commit/routes/10000` | 344 ms | 364 ms (gravação; G1.23) |
+| `engine_scale/commit/address_lists/20000` | 355 ms | 328 ms (gravação; G1.23) |
+
+Kernel (netns sem root, `hal-linux/benches/netns_apply.rs`; antes = 63116ed):
+
+| Bench | Antes | Depois |
+|---|---|---|
+| `hal_linux_apply/addresses_remove/100` (novo: remover N endereços) | 4,85 ms | 2,82 ms |
+| `hal_linux_apply/addresses_remove/1000` | 260 ms | 31,6 ms |
+
+`hal_virtual_apply/*` ficou igual (±5%: o `carry` só ganha em commit que não muda rotas nem
+endereços; esse bench aplica N itens novos). `engine_execute/*` igual (±1%), exceto
+`rejected_param` (1,17 → 1,60 µs) e `virtual_lab_new` (7,0 → 7,5 µs), caminhos que este PR não
+toca: o "antes" foi medido em 63116ed, antes do merge do #123.
+
+### audit-persist: tamanho do arquivo de config e latência de commit (2026-10-22, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release, `cargo test --release -p corerouter-engine
+--test persistence a_big_config_with_a_full_history_still_boots`.
+
+| Medida | Antes | Depois |
+|---|---|---|
+| Uma cópia da config (4000 entradas de address-list com comentário de 200 caracteres) | 1,47 MB (indentado) | 1,16 MB (compacto, −21%) |
+| Arquivo com a running + 65 revisões | ~97 MB (recusado no boot: limite 64 MiB) | 32,4 MB (27 revisões mais novas; boot ok) |
+| Teste inteiro (4000 adds, 65 commits, gravação, boot) | — | 1,1 s |
+| Commit de `system.identity.set` com 3000 regras de filtro | 0,87 s (`validate_all` → `corerouter_firewall::validate`) | igual (gap G0.14) |
+
+### audit-services: tabela de vizinhos por datagrama recebido (**medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release (`cargo bench`), 2026-10-22,
+`cargo bench -p corerouter-engine --bench neighbors` (tabela cheia: 4096 entradas em 16
+interfaces; inclui montar a entrada):
+
+| caso | antes | depois |
+|---|---|---|
+| vizinho novo (expulsa um) | 121 µs | 0,84 µs |
+| refresh de vizinho conhecido | 52 µs | 0,24 µs |
+
+"Antes" é o caminho do receptor na `main`: varrer a tabela clonando chaves para saber se é novo
+e depois `record` (outra varredura para expulsar). Com o lock da sessão ocupado ~120 µs por
+datagrama, ~8 000 anúncios/s bastavam para segurá-lo o tempo todo; agora seriam ~1,2 M/s, e o
+limite de 200/s corta antes disso.

@@ -25,6 +25,8 @@ use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, SignatureSch
 /// Longest header block read (status line and headers).
 const MAX_HEAD: usize = 16 * 1024;
 const MAX_HEADERS: usize = 64;
+/// Trailer lines after a chunked body (we read none of them).
+const MAX_TRAILERS: usize = 64;
 /// Redirects followed at most (browsers stop near 20; lists need 1–2).
 pub(crate) const MAX_REDIRECTS: usize = 5;
 
@@ -207,6 +209,25 @@ impl Stream {
     }
 }
 
+/// Reads from a stream until `deadline`, however the bytes trickle in:
+/// each read waits only for what is left (a socket timeout alone restarts
+/// with every byte).
+struct Timed<'a> {
+    s: &'a mut Stream,
+    deadline: Instant,
+}
+
+impl Read for Timed<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out"));
+        }
+        self.s.tcp().set_read_timeout(Some(left))?;
+        self.s.read(buf)
+    }
+}
+
 impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
@@ -320,13 +341,13 @@ pub(crate) fn exchange(
     read_response(s, method == "HEAD", max, deadline)
 }
 
-fn read_response<R: Read>(
-    r: &mut R,
+fn read_response(
+    s: &mut Stream,
     head_only: bool,
     max: usize,
     deadline: Instant,
 ) -> Result<Response, String> {
-    let mut r = BufReader::new(r);
+    let mut r = BufReader::new(Timed { s, deadline });
     // The header block, up to the blank line.
     let mut head = Vec::new();
     loop {
@@ -398,8 +419,12 @@ fn read_response<R: Read>(
             let size = text.split(';').next().unwrap_or_default().trim();
             let size = usize::from_str_radix(size, 16).map_err(|_| "bad chunk size".to_owned())?;
             if size == 0 {
-                // Trailers, up to the blank line.
-                loop {
+                // Trailers, up to the blank line (a few: an endless list
+                // would hold the thread forever).
+                for n in 0.. {
+                    if n >= MAX_TRAILERS {
+                        return Err(format!("more than {MAX_TRAILERS} trailer lines"));
+                    }
                     let mut t = Vec::new();
                     let n = (&mut r)
                         .take(MAX_HEAD as u64)
@@ -444,6 +469,39 @@ fn read_response<R: Read>(
     Ok(out)
 }
 
+/// The router itself, its LANs and link-local: places a list on the
+/// Internet has no business sending the router to.
+fn inward(ip: IpAddr) -> bool {
+    match ip.to_canonical() {
+        IpAddr::V4(v4) => {
+            let [a, b, ..] = v4.octets();
+            v4.is_loopback()
+                || v4.is_unspecified()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                // RFC 6598 shared space (CGNAT).
+                || (a == 100 && (64..128).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            let first = v6.segments().first().copied().unwrap_or(0);
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 unique local, fe80::/10 link-local.
+                || (first & 0xfe00) == 0xfc00
+                || (first & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// A redirect from a server at `from` to one at `to` is followed unless it
+/// points inward (loopback, LAN, link-local) from outside: an adlist server
+/// (or anyone on the path of an `http://` list) must not make the router
+/// fetch from its own services. A list that was inside already may move.
+fn redirect_ok(from: &[IpAddr], to: &[IpAddr]) -> bool {
+    from.iter().any(|ip| inward(*ip)) || !to.iter().any(|ip| inward(*ip))
+}
+
 /// GET `url`, following redirects, the body at most `max` bytes. Host
 /// names go through `resolve` (the router's resolver).
 pub(crate) fn get(
@@ -455,11 +513,19 @@ pub(crate) fn get(
 ) -> Result<Vec<u8>, String> {
     let deadline = Instant::now() + timeout;
     let mut url = Url::parse(url)?;
+    let mut first: Option<Vec<IpAddr>> = None;
     for _ in 0..=MAX_REDIRECTS {
         let addrs = match url.host.parse::<IpAddr>() {
             Ok(ip) => vec![ip],
             Err(_) => resolve(&url.host)?,
         };
+        match &first {
+            None => first = Some(addrs.clone()),
+            Some(f) if !redirect_ok(f, &addrs) => {
+                return Err(format!("redirect to {} refused: it points inside the router or its LAN", url.host));
+            }
+            Some(_) => {}
+        }
         let mut last = format!("{}: no address", url.host);
         let mut resp = None;
         for ip in addrs.iter().take(4) {
@@ -574,6 +640,59 @@ pub(crate) mod tests {
         let port = serve(vec![huge]);
         let err = get(&format!("http://127.0.0.1:{port}/"), true, 100, t, &no_dns).unwrap_err();
         assert!(err.contains("headers longer"), "{err}");
+    }
+
+    /// A server that sends a chunked header, then one byte every 200 ms:
+    /// the whole exchange still ends at the deadline.
+    #[test]
+    fn a_slow_server_never_outlives_the_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            let _ = s.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1000\r\n");
+            for _ in 0..100 {
+                if s.write_all(b"x").is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+        let t = std::time::Instant::now();
+        let err = get(&format!("http://127.0.0.1:{port}/"), true, 1 << 20, Duration::from_secs(1), &no_dns)
+            .unwrap_err();
+        assert!(t.elapsed() < Duration::from_millis(1600), "{:?}: {err}", t.elapsed());
+    }
+
+    /// Endless trailer lines end the response with an error.
+    #[test]
+    fn endless_trailers_are_refused() {
+        let mut reply = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nok\r\n0\r\n".to_vec();
+        for _ in 0..10_000 {
+            reply.extend_from_slice(b"X: y\r\n");
+        }
+        let port = serve(vec![reply]);
+        let err = get(&format!("http://127.0.0.1:{port}/"), true, 100, Duration::from_secs(5), &no_dns)
+            .unwrap_err();
+        assert!(err.contains("trailer"), "{err}");
+    }
+
+    /// A redirect from a public server into the router or its LAN is not
+    /// followed (the router would fetch from its own namespace).
+    #[test]
+    fn redirects_inward_are_refused() {
+        let public: IpAddr = "198.51.100.7".parse().unwrap();
+        let home: IpAddr = "127.0.0.1".parse().unwrap();
+        let lan: IpAddr = "192.168.88.1".parse().unwrap();
+        assert!(!redirect_ok(&[public], &[home]));
+        assert!(!redirect_ok(&[public], &[lan]));
+        assert!(!redirect_ok(&[public], &["fe80::1".parse().unwrap()]));
+        assert!(!redirect_ok(&[public], &["::ffff:127.0.0.1".parse().unwrap()]));
+        assert!(redirect_ok(&[public], &["203.0.113.9".parse().unwrap()]));
+        // A list that was inside to begin with may move inside.
+        assert!(redirect_ok(&[lan], &[home]));
     }
 
     /// A TLS server with a self-signed certificate for `localhost`,

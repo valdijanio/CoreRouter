@@ -1321,3 +1321,488 @@ continuação indentadas).
 
   Como testar: abra Tools › DNS Lookup (só o formulário), pergunte `uol.com.br` (a janela cresce
   com as respostas); DNS Cache › selecione uma entrada › **Resolve…**; Tools › MTR.
+
+- 2026-10-22 — audit-control: Auditoria do canal de controle (TCP/TLS/WebSocket, login, MCP, CLI): 13 dos 14 achados
+  corrigidos, 1 parcialmente (vira gap). Cada teste abaixo falhou na `origin/main` (19b550e) antes
+  da correção (**medido**: rodados numa cópia da `main` com a API adaptada).
+
+  - **Safe Mode nunca desfeito quando o caminho do dono morre em silêncio** (alta). Sem keepalive
+    nem timeout, a thread da conexão ficava presa no `read` para sempre quando rota, endereço ou
+    firewall cortavam a gerência (nenhum FIN/RST chega), e o `hang_up` nunca rodava. Agora todo
+    socket aceito tem TCP keepalive (15 s + 3 × 5 s) e `TCP_USER_TIMEOUT` de 30 s no Linux
+    (`control::conn::keepalive`, crate `socket2` já presente no lockfile). Teste
+    `netns_safe_mode_drop` (namespace sem root: TLS em `10.77.0.1`, Safe Mode, `ip addr del`): o
+    desfazer roda em 3,1 s com keepalive curto (**medido**); na `main`, nada em 20 s.
+  - **Vagas esgotadas antes do login / slowloris** (alta). 16 conexões TLS ociosas seguravam
+    todas as vagas para sempre, e os 10 s do handshake/cabeçalho eram por `read`, não prazo. Agora
+    `conn::Sock` aplica um **prazo total** (handshake TLS e cabeçalho HTTP: 10 s), conexão sem
+    login cai após 30 s ociosa, só 8 das 16 vagas podem estar sem login e 4 por origem de rede
+    (IPv4 ou /64 IPv6). Testes `idle_strangers_do_not_lock_the_operator_out`,
+    `a_trickled_tls_handshake_is_cut_at_the_deadline`, `websocket_head_deadline_and_503`,
+    `conn::tests::*`.
+  - **Requisição de 16 MiB virava `Value` antes de conferir o token** (alta). O envelope agora é
+    lido com `&RawValue` (`id`, `params`); `params` só é convertido depois do token (ou, no
+    `auth.login`, até 4 KiB); da rede, antes do login, a linha (e a mensagem WebSocket) vai até
+    64 KiB, subindo para 16 MiB depois. Teste `params_are_parsed_only_after_the_token_check` e a
+    parte "stranger" do `netns_safe_mode_drop`.
+  - **Limite de login furado por paralelismo e IPv6; Argon2 sem limite** (média). Falhas contam
+    por origem IPv4 ou /64 IPv6; a tentativa conta ao começar (checar e contar sob a mesma trava);
+    no máximo 2 verificações Argon2 ao mesmo tempo (`LOGIN_BUSY` após 5 s); mapa cheio descarta
+    primeiro origens não bloqueadas, nunca `user admin`, e fica sempre ≤ 4096. Testes
+    `a_full_failure_map_keeps_the_user_keys`, `parallel_and_rotated_attempts_are_all_counted`
+    (16 tentativas paralelas de um /64 → 6 Argon2, 10 recusadas).
+  - **`localhost` mandava o token local para quem escutasse em `[::1]`** (média). `dial` resolve
+    `localhost` como `127.0.0.1`, tenta todos os endereços em ordem e só envia o token local se o
+    par conectado for `127.0.0.1` (único endereço em que o roteador escuta em claro). Teste
+    `dial::tests::the_local_token_goes_only_to_127_0_0_1`.
+  - **MCP `run_task` (read-only) executava qualquer comando** (média). Agora só `tool.*` (fora
+    `tool.task.*`), recusado antes de rodar. Teste `run_task_refuses_anything_but_a_tool`.
+  - **Um usuário derrubava as sessões dos outros** (baixa). Limite de 16 sessões por usuário no
+    `Gate` e no `Logins` do engine (o 17º login tira o mais antigo **dele**); token despejado
+    encerra o login em `user.active.list`. Testes `repeated_logins_do_not_evict_other_users`,
+    `engine::auth::tests::repeated_logins_evict_only_the_same_user`.
+  - **Panic numa thread de conexão vazava a vaga e pulava o `hang_up`** (baixa). A vaga vive no
+    socket (devolvida no `Drop`) e `serve_then_hang_up` roda o `hang_up` sob `catch_unwind`.
+    Teste `a_panicking_connection_frees_its_slot_and_undoes_safe_mode`.
+  - **Erro de `accept` girava a 100 % de CPU** (baixa): pausa de 100 ms após a falha (sem teste:
+    exigiria esgotar descritores).
+  - **Arquivo estático lido inteiro na memória, sem timeout de escrita** (baixa): arquivos vão em
+    fluxo (`io::copy`) e todo socket tem timeout de escrita de 30 s.
+  - **Conexão WebSocket acima do limite recebia uma linha JSON, não `503`** (baixa): `503` no
+    WebSocket/HTTP, linha JSON no TCP, nada no TLS (coberto em `websocket_head_deadline_and_503`).
+  - **`server.info` revelava versão e commit sem login pela rede** (baixa): da rede, sem login, só
+    `{name, auth}`; loopback inalterado (`server_info_on_loopback_is_complete`, netns).
+  - **Chave TLS restaurada com 0644 ficava legível** (baixa): escrita em arquivo temporário 0600 +
+    `rename`, e chave existente com bits de grupo/outros volta a 0600 com aviso. Teste
+    `tls::tests::a_world_readable_key_is_made_private`.
+  - **MCP respondia respostas JSON-RPC e ecoava `id` objeto/array** (baixa): resposta não é
+    respondida (§5), `id` não escalar dá `-32600` com `id: null` (§4). Teste
+    `responses_are_not_answered_and_ids_are_scalars`.
+
+  Conferido e correto (sem mudança): ping do servidor WebSocket não é necessário (o keepalive TCP
+  acha o par morto); depois do login não há limite de ociosidade de propósito (MCP e GUI ficam
+  horas parados, o token local não expira, e o MCP `Remote` não reconecta).
+
+  Ficou para depois:
+
+- 2026-10-22 — audit-dhcp: Auditoria do DHCP (servidor v4/v6, relay, histórico): 19 achados verificados no código, 18
+  corrigidos (um em parte), dois viram gaps. Cada correção tem um teste que falhava na `main`.
+
+  Altos:
+
+  - **DHCPv6: SOLICIT de DUIDs aleatórios enchia a memória.** Cada SOLICIT num pool IA_NA /64 criava
+    um registro `offered` guardado 120 s + 7 dias, sem teto (100k SOLICITs = 100k registros, **medido**).
+    Agora a tabela tem teto (`MAX_BINDINGS6` = 131.072; cheia, sai primeiro o registro livre mais
+    antigo, senão o cliente é recusado com `table-full`), uma oferta não aceita some quando o prazo
+    acaba (nunca foi vinculada nem escrita no diário) e o `tick` acha o que vence por um índice
+    ordenado, sem percorrer a tabela. Testes `a_solicit_flood_cannot_fill_memory`,
+    `the_cap_evicts_free_records_first`.
+  - **Opção 82 do próprio cliente era acreditada.** Um cliente na rede (`giaddr` 0) com a 82 de outro
+    assinante pegava a concessão fixa dele, e o histórico (Marco Civil) gravava o circuito da vítima.
+    RFC 3046 §2.1/§5: o servidor ignora a 82 sem relay, a menos que `relay_info_trusted` (novo, em
+    `ip.dhcp-server`: agente L2 confiável, como uma OLT); o relay descarta o pedido que já chega com
+    82 (`untrusted-82`) a menos que `relay_info_trusted` (novo, em `ip.dhcp-relay`; o Cisco faz o
+    mesmo por padrão). Junto: a renovação sem relay apagava a 82 guardada na concessão, e a segunda
+    renovação de uma fixa por circuito levava NAK — corrigido. Testes
+    `option_82_from_a_client_is_not_believed`, `renewals_keep_the_relay_agent_information`,
+    `a_clients_option_82_is_not_relayed`.
+  - **Tempestade: escritas síncronas por concessão, sob o lock da sessão.** Uma rodada de 128
+    vinculações fazia 129 appends com fsync (o histórico, um por concessão), 256 regravações do estado
+    do DNS dinâmico (A e PTR, cada uma com o estado inteiro e dois syncs) e 128 cópias da config
+    inteira para a checagem de lockout das address lists: 220 ms por rodada em memória, 840 ms com
+    fsync no NVMe (**medido**), tudo com o `Mutex<Session>` preso. Agora o histórico é um append por
+    rodada, o DNS é salvo uma vez por rodada (o serial das zonas sobe uma vez) e as entradas de lista
+    da rodada passam por uma checagem de lockout só, contra a config emprestada. Teste
+    `a_storm_round_writes_once_per_journal` (2 appends e 1 save por rodada; era 129 e 256).
+  - **O serviço DHCP matava de fome o plano de controle.** Com mensagens chegando, o laço voltava a
+    pegar o lock sem pausa (o mutex não é justo): canal de controle, MCP e GUI quase não entravam.
+    Agora há sempre 1 ms entre rodadas, e cada rodada para de ler depois de 20 ms
+    (`ROUND_BUDGET_US`), além do limite de 256 mensagens. Testes `a_storm_round_is_bounded_in_time`,
+    `the_loop_always_rests`.
+
+  Médios:
+
+  - **Depois de reiniciar, as concessões perdiam as address lists e os nomes no DNS ficavam para
+    sempre.** As entradas de lista (não guardadas) voltam ao carregar o diário, e os nomes A/PTR
+    guardados são reconhecidos para sair quando a concessão acaba. Teste
+    `bindings_get_their_names_and_lists_back_after_a_restart`.
+  - **Histórico no teto (500k): O(N) por vinculação e a compactação apagava registros legais.** Agora
+    é um `VecDeque` com numeração (descartar o mais antigo é O(1): 5,2 ms → microssegundos por
+    vinculação, **medido**). O que sai da memória pelo teto fica só no disco: a compactação (escrita
+    da memória) não roda enquanto houver registro assim dentro da retenção, e isso é avisado uma vez no
+    log (`dhcp,error`). Testes `opening_at_the_cap_is_cheap` (inclui `can_compact`). O arquivo
+    segmentado que limita o disco virou a gap G4.2g.
+  - **Custo por DISCOVER linear em fixas, concessões e pool.** Fixas indexadas por client id, MAC,
+    circuit id, remote id e endereço (65.536 fixas: 1,76 ms → µs por DORA, **medido**); reuso do
+    endereço livre mais antigo por um índice ordenado; pool esgotado lembrado mesmo com endereços
+    pulados (quem responde a todo ARP fazia cada resposta varrer o pool); `client_mac_limit` por
+    índice de MAC; "pool cheio" no log uma vez por minuto por pool (era um aviso por DISCOVER).
+    Testes `many_static_leases_are_found_by_index`, `a_full_pool_is_logged_once_a_minute`.
+  - **DHCPv6 PD esgotado: o pool inteiro varrido a cada SOLICIT** (2^16 prefixos: 6,4 ms por mensagem,
+    **medido**). O pool cheio é lembrado até um prefixo se soltar. Teste
+    `a_full_pd_pool_is_remembered_until_a_prefix_frees`.
+  - **Client id ou opção 82 com mais de 255 bytes (RFC 3396)** passavam no servidor e eram recusados na
+    volta do diário, trazendo de volta a linha anterior do endereço (outro cliente). Agora o pedido é
+    recusado (RFC 2132 §9.14, RFC 3046 §2.0). Teste `oversized_client_id_or_agent_info_is_refused`.
+  - **Cliente não-Ethernet sem client id levava NAK em laço** (e todos dividiam a mesma chave). A
+    concessão guarda `htype` + `chaddr` (campo `hw` no diário, opcional). Teste
+    `non_ethernet_clients_are_bound`.
+
+  Baixos:
+
+  - Diário com falha: o ACK continua saindo (escolha documentada: disponibilidade primeiro, o erro
+    fica na linha do serviço), mas a compactação que falha só é tentada de novo depois de 60 s (era a
+    cada rodada, serializando a tabela inteira). Teste `a_failing_disk_is_not_rewritten_every_round`.
+  - CSV do histórico: célula que começa com `= + - @ tab CR` sai como texto (`'`), OWASP. Teste
+    `csv_cells_are_never_formulas`.
+  - `parse_time` com ano, hora ou fuso absurdos dava overflow (panic em debug); `covers` também.
+    Teste `hostile_times_do_not_overflow`.
+  - DHCPv6: Information-request sem Client Identifier agora tem resposta (RFC 9915 §18.3.6); DUID
+    vazio (ou de 1 byte) é recusado (§11.1). Teste `information_request_without_client_id_and_empty_duids`.
+  - A resposta ARP do próprio cliente ao endereço oferecido a ele não é conflito (RFC 5227). Teste
+    `the_clients_own_arp_answer_is_not_a_conflict`.
+  - Relay: resposta que não vem de um dos `dhcp_server` dele é descartada (`not-from-server`). Teste
+    `the_relay_only_takes_replies_from_its_servers`.
+  - RELEASE/DECLINE no enlace do servidor só valem vindos do MAC Ethernet e da porta do próprio
+    cliente. Teste `spoofed_release_is_dropped`.
+  - Opção 52 (overload, RFC 2132 §9.3) agora é lida (`file` e `sname`). Teste
+    `option_overload_is_honoured`. A segunda metade do achado (resposta acima da opção 57 mesmo sem as
+    opções não forçadas) ficou como está: descartar a resposta transformaria uma opção forçada grande
+    demais numa queda do DHCP, e os clientes reais aceitam 1500.
+  - Diário maior que o limite de leitura (512 MB) agora é lido pelo fim (as linhas mais novas; "a
+    última vence"), e os replays de concessões v4/v6 e do histórico guardam as últimas linhas, não as
+    primeiras. Testes `an_oversized_journal_keeps_its_newest_lines`, `replay_keeps_the_newest_lines`.
+
+  Verificado e certo: o que o revisor listou em "Checked, looks fine" confere. Limite de taxa por
+  cliente no DHCPv6 já é parte da G4.2f (não virou gap nova).
+
+  Como testar: `cargo test -p corerouter-proto-dhcp`, `cargo test -p corerouter-engine --test
+  dhcp_storm`; benchmarks `cargo bench -p corerouter-proto-dhcp --bench server_attack` e `cargo bench
+  -p corerouter-engine --bench dhcp_round` (rodada de tempestade com histórico, zona DNS e address
+  list; `fsync` grava arquivos de verdade).
+
+- 2026-10-22 — audit-dns: Auditoria do DNS (resolvedor, encaminhador da LAN, zonas, transferências, UPDATE/TSIG, cliente
+  HTTP das adlists e do DoH). Corrigido, cada um com teste que falhava antes:
+
+  - **TCP/53 tomado por quem não pode perguntar nada, e por gotejamento** (alta). O accept dava
+    vaga de `max_concurrent_tcp_sessions` a qualquer um antes do ACL, e o `TCP_IDLE` valia por
+    `read()`: 20 conexões mandando um byte a cada 9 s seguravam o TCP da LAN (fallback do TC,
+    AXFR, UPDATE) por dias. Agora o accept fecha quem não é o roteador, `allowed_from` nem um par
+    que alguma zona nomeia (`zone::xfr::may_connect`: `allow_transfer`, `allow_update`,
+    `primaries`; zona com TSIG sem `allow_update` aceita qualquer origem), cada origem fica com no
+    máximo 1/4 das vagas, a mensagem tem 10 s do primeiro ao último byte (o buffer cresce com o
+    que chega, o tamanho 65 535 sozinho não aloca nada) e a conexão não lê consulta nova depois
+    de 2 min. Testes `who_may_connect`, `tcp_slots_survive_slow_and_greedy_peers`.
+  - **IXFR falsificado por UDP serializava a zona inteira no thread do listener** (média). Um IXFR
+    de serial antigo vindo (forjado) de um endereço de `allow_transfer` copiava e codificava a zona
+    toda (200 ms por pacote numa zona de 50 000 registros, build de debug, **medido**) só para
+    descobrir que não cabia no UDP. Agora a contagem de registros decide antes (RFC 1995 §2: o SOA
+    na hora). Teste `udp_ixfr_of_a_big_zone_is_the_soa_without_encoding_it`.
+  - **Despejo do cache O(n) por inserção, sob o lock do resolvedor** (média). Com o cache cheio,
+    cada `put` varria o mapa duas vezes sob o mutex que todo acerto de cache também pega. Agora um
+    índice por expiração (`BTreeSet`) despeja em O(log n). Teste
+    `eviction_follows_the_expiry_index`; números em `## perf`.
+  - **Pré-requisitos do RFC 2136 checados fora do que aplica** (média, RFC 2136 §3.7). Dois UPDATEs
+    "nome não está em uso" lidos antes de qualquer um aplicar passavam os dois. Agora o UPDATE
+    guarda a versão dos registros dinâmicos que viu; `Session::dns_dynamic_update` só aplica se ela
+    não mudou, senão o daemon confere os pré-requisitos de novo (`zone::update::recheck`) e tenta
+    outra vez (YXDOMAIN no segundo). Testes `prerequisites_hold_when_the_update_applies`,
+    `an_update_checked_against_old_records_waits`.
+  - **UPDATE por UDP esperava o lock da sessão e a gravação em disco no thread do listener**
+    (média). Agora vai para o thread `dns-update` (fila de 64; cheia, descarta e o cliente
+    repete). Teste `an_update_never_holds_up_queries`.
+  - **Cliente HTTP sem prazo de verdade** (média). O timeout do socket recomeçava a cada byte e o
+    laço de trailers não tinha limite: um servidor de adlist lento segurava o thread por semanas e
+    trailers sem fim, para sempre. Agora cada leitura espera só o que falta até o prazo, e no
+    máximo 64 linhas de trailer. Testes `a_slow_server_never_outlives_the_deadline`,
+    `endless_trailers_are_refused`.
+  - **EXPIRE da secundária sem piso** (média). `refresh 3600 expire 60` derrubava a cópia 60 s depois
+    de cada checagem (SERVFAIL ~59 min por hora). Agora EXPIRE ≥ REFRESH + RETRY (RFC 1912 §2.2,
+    como o BIND). Teste `expire_is_at_least_refresh_plus_retry`.
+  - **Tabela do limite por cliente varrida a cada pacote novo com ela cheia** (baixa). Agora no
+    máximo uma varredura por segundo. Teste `a_full_table_is_swept_once_a_second`.
+  - **Janela do TSIG vinha do Fudge do cliente (até 18 h)** (baixa). Agora vale também o nosso
+    limite de 300 s (RFC 8945 §5.2.3/§10), a mesma mensagem (mesmo Time Signed e MAC) é recusada
+    como repetição, e um Time Signed menor que o Fudge é recusado antes do hickory (que subtrai sem
+    checar e daria panic no build de debug). Teste `signed_updates_follow_rfc8945`.
+  - **`ip.dns.cache.print/flush` formatavam o cache inteiro sob o lock** (baixa). O flush conta sem
+    formatar (`DnsBackend::cache_len`); o print filtra nome e tipo dentro do cache antes de formatar
+    e para em `limit` (novo parâmetro, padrão 1000, máximo 100 000). Teste
+    `cache_print_is_bounded_and_flush_does_not_format`.
+  - **Config antiga reconstruía as zonas para trás** (baixa). Uma consulta com o `ServerConfig`
+    anterior que chegava depois do novo construído refazia as zonas velhas (diff invertido no
+    diário do IXFR, NOTIFY com o serial antigo). Agora usa a config mais nova; os registros
+    dinâmicos são relidos sob o lock. Teste `an_older_config_never_rolls_the_zones_back`. (A
+    reconstrução de todas as zonas a cada mudança virou a G4.1p.)
+  - **Fila de efeitos sem limite** (baixa). Agora `sync_channel(4096)`; cheia, descarta (a próxima
+    resposta acrescenta o endereço de novo). Teste `effects_queue_is_bounded`.
+  - **Redirect de adlist para dentro do roteador** (baixa, SSRF cego). Um redirect de um servidor
+    de fora para loopback, rede privada, CGNAT, ULA ou link-local é recusado (uma lista que já
+    estava dentro pode). Teste `redirects_inward_are_refused`.
+  - **Respostas perdidas em silêncio** (baixa). Transferência com mensagem que falha ao codificar
+    vira SERVFAIL em vez de SOA … SOA incompleto (`xfr::whole`); falha ao criar o thread de uma
+    consulta UDP responde SERVFAIL; resposta TCP acima de 64 KiB vira SERVFAIL.
+
+  Teste instável `answers_the_lan_over_udp_and_tcp` (saiu FLAKY num CI completo da `main`): o
+  upstream de teste tinha 300 ms de timeout e o cliente 500 ms; numa máquina carregada o resolvedor
+  perguntava duas vezes (contador do upstream em 2) ou o cliente desistia antes da resposta. Agora
+  3 s no upstream, 5 s no cliente para as respostas que dependem do upstream e 20 s no `wait`.
+
+  Conferido e sem mudança: o restante da lista "Checked, looks fine" do auditor (limites do parser,
+  TTLs, ACL antes do limite, NOTIFY só de primário, transferência de entrada limitada).
+
+  Ficou para depois:
+
+- 2026-10-22 — audit-net: Auditoria de interfaces, endereços, rotas, VRF, listas de interface e firewall (com a aplicação no
+  kernel): 12 dos 14 achados corrigidos aqui, 2 já tinham entrado pelo `audit-persist` (#123), 1
+  parte vira gap. Resolve a gap **G0.14** (validação do firewall O(n²) no commit). Cada teste
+  abaixo falhou na `main` (63116ed) antes da correção (**medido**: rodados com o código da `main` e
+  a API adaptada); os de desempenho têm bench antes/depois na seção `## perf`.
+
+  Corrigido:
+
+  - **Alto — validar o firewall era O(N²) em todo commit** (#1, G0.14). `rule_issues` clonava a
+    tabela inteira e remontava o grafo de jumps para cada regra; com 3000 regras qualquer commit
+    levava ~0,58 s em release. Agora `validate` monta as arestas uma vez por tabela
+    (`graph::edges`) e guarda as raízes de cada chain (`graph::roots_in`); o comando de uma regra
+    só monta o grafo uma vez, sem clonar. Bench `engine_scale/validate_all/filter_rules/3000`:
+    562 ms → 0,22 ms; `commit/filter_rules/3000`: 584 ms → 49 ms (o resto é gravar o arquivo).
+  - **Alto — validar rotas era O(R²) em todo commit** (#2). Cada rota era comparada com todas as
+    anteriores; agora só com as do mesmo `(routing_table, dst_address)` (`BTreeMap`).
+    `validate_all/routes/10000`: 48 ms → 1,2 ms. Teste `duplicate_routes_are_found_across_the_list`
+    (guarda: duplicata separada por outras rotas ainda é achada).
+  - **Médio — expirar entradas dinâmicas rodava um `nft` por entrada, sob o lock** (#3). Agora a
+    expiração vai num só `DynamicChange::Expired(&[..])` (variante nova, aditiva, em `hal`); o
+    `LinuxHal` não roda nada (o timeout do próprio set já as tirou do kernel), o lab esquece todas
+    de uma vez. Teste `dynamic_entries_expiring_together_are_one_data_plane_change` (300 entradas:
+    1 chamada, eram 300).
+  - **Médio — porta sem gaiola SFP era sondada a cada 30 s, sob o lock** (#3). O `scan_modules`
+    lembra as portas que respondem "sem EEPROM de módulo" (`Unsupported`) e não pergunta de novo
+    (porta que sai da config volta a ser sondada). Teste
+    `ports_without_a_cage_are_not_probed_on_every_scan` (4 varreduras de 8 portas: 8 leituras,
+    eram 32). Tirar a varredura de dentro do lock vira a gap G1.22.
+  - **Médio — remover endereços era O(n²) no kernel** (#4). Cada `DelAddress` fazia um dump
+    `RTM_GETADDR` de todos os endereços do namespace (filtrado em espaço de usuário); agora manda
+    `RTM_DELADDR` com o endereço montado (`AddressMessageBuilder`), e o kernel responde
+    EADDRNOTAVAIL se ele já não está. Bench netns novo `hal_linux_apply/addresses_remove/1000`:
+    260 ms → 32 ms.
+  - **Médio — IPv6 com o mesmo endereço e outro prefixo era aceito e não instalado** (#5). O Linux
+    identifica o endereço IPv6 só por endereço + interface (EEXIST no segundo), o plano adotava o
+    erro como "já existe" e, removido o primeiro, a interface ficava sem endereço. Agora
+    `ip.address.add` e `validate_all` recusam ("2001:db8::1 is already on ether1 as
+    2001:db8::1/64"); outra interface, outro pool e IPv4 com outra máscara continuam valendo.
+    Testes `an_ipv6_address_cannot_be_on_one_interface_twice_with_two_prefixes`,
+    `validation_refuses_an_ipv6_address_twice_on_one_interface`.
+  - **Médio — renomear lista de interfaces quebrava RA e DNS** (#6). `interface.list.set
+    new_name` agora leva junto `ipv6.settings accept_router_advertisements_on` e os itens de
+    `ip.dns allowed_from` (como o RouterOS); células da matriz de zonas entram no `used_by` (a
+    renomeação é recusada, como já era com regras). `interface.list.remove` de uma lista que o DNS
+    usa é recusado com o motivo (antes: erro de validação sem relação no commit). Testes
+    `renaming_an_interface_list_renames_its_references`,
+    `removing_an_interface_list_dns_uses_is_refused`.
+  - **Médio — checagem de lockout via a interface errada** (#7, parte que faltava). A sonda usava
+    como entrada a interface que tem o endereço local: com gerência num loopback /32 (`lo0`)
+    alcançado pela WAN, um `drop` na lista WAN passava. Agora a entrada é a interface para onde o
+    roteamento aponta o par (rede conectada ou rota mais específica, na tabela do endereço local;
+    sem rota, a de antes). E `ip.firewall.address-list.add` com timeout checa sobre a config
+    efetiva (endereços/rotas de DHCP), como o commit. Testes
+    `lockout_sees_the_wan_ingress_of_a_loopback_management_address`,
+    `lockout_uses_the_port_facing_a_connected_peer`.
+  - **Baixo — `ip.route.list` era O(L²)** (#8): o vencedor de cada grupo (tabela, destino) sai numa
+    passada. `ip.route.list/10000`: 64,6 ms → 14,0 ms.
+  - **Baixo — endereços sem limite e com etapas quadráticas** (#9). `MAX_ADDRESSES` = 65 536 em
+    `ip.address.add` e `validate_all` (`corerouter_engine::validate::MAX_ADDRESSES`);
+    `route::connected` deduplica com `BTreeMap`; `plan::rebuilt_links` calcula os links com IPv4
+    uma vez. Teste `addresses_are_bounded`.
+  - **Baixo — address-lists: varreduras lineares e render duplo** (#10). `render` agrupa entradas
+    por lista e regras por chain uma vez (era O(listas × entradas)); `nft::changed` só renderiza
+    quando firewall ou listas de interface mudaram (o `LinuxHal` e o lab renderizavam as duas
+    configs em todo commit); entradas dinâmicas têm índice `(lista, endereço)`.
+  - **Baixo — `address-list.set` duplicava uma entrada dinâmica** (#11). Agora confere as
+    dinâmicas como o `add`. Teste `address_list_set_refuses_an_address_a_dynamic_entry_has`.
+  - **Baixo — `nft` e genl sem prazo total** (#12). `nft::run_bounded` mata o `nft` depois de 30 s
+    (stdin, stdout e stderr em threads, para um filho que não lê nem sai também não travar), usado
+    por `run` e `list_json`; `Genl::call` tem um prazo de 1 s para a resposta inteira (notificações
+    de multicast reiniciavam o timeout de cada `poll`). Testes `nft::tests::*`.
+  - **Baixo — `LinkWatch::observe` era O(vigiados × vivos) por segundo** (#13): `BTreeSet`.
+  - **Lab — `VirtualHal::carry`** recalculava o estado esperado inteiro das duas configs em todo
+    apply; agora só a parte cujas entradas mudaram (links/endereços só se interfaces ou endereços
+    mudaram; com só rotas mudando, só as rotas alteradas). Um commit que não toca rotas não resolve
+    nenhuma. `hal_virtual_apply/routes/1000` (todas as rotas novas) continua ~120 µs: é o custo de
+    resolver 1000 rotas novas.
+
+  Já corrigidos pelo `audit-persist` (#123), conferidos na `main`: #14 (o lockout só olhava o
+  firewall; agora também endereço e interface) e a parte de #7 sobre a interface do endereço em
+  cada lado.
+
+  Conferido e falso ou parcial: #6 dizia que nenhuma validação conferia
+  `accept_router_advertisements_on` — o `proto-dhcp` confere; o problema real era o modo
+  transacional aceitar a renomeação e todo commit seguinte falhar com erro sem relação (corrigido
+  acima).
+
+  Como testar: `cargo test -p corerouter-engine --test net_audit`; `cargo bench -p
+  corerouter-engine --bench scale`; `COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net
+  -- cargo bench -p corerouter-hal-linux --bench netns_apply -- addresses_remove`.
+
+  Observação (**estimado**, sem perfil: `perf` não é permitido na máquina): com as validações
+  lineares, o commit com 10 000 rotas ou 20 000 entradas de address-list ainda leva ~0,3 s; o resto
+  é gravar o arquivo (a running + até 64 revisões inteiras, até 32 MiB, a cada commit). Vira a gap
+  G1.23.
+
+- 2026-10-22 — audit-persist: Auditoria do núcleo do engine (persistência, Safe Mode, transações, journal, import, script do
+  terminal). Cada correção tem um teste que falhava na `main` antes dela.
+
+  Corrigido:
+
+  - **Crítico — config grande fazia o roteador subir em branco** (#1). O arquivo guardava a running
+    e as 64 revisões completas em JSON indentado, sem limite; com ~4000 entradas de address-list
+    comentadas passava dos 64 MiB que a leitura aceita, as duas cópias iam para quarentena e o boot
+    voltava às portas descobertas, sem endereço nem firewall. Agora o JSON é compacto, a gravação
+    fica abaixo de 32 MiB (`persist::encode_bounded` deixa de fora as revisões mais antigas, nunca
+    a running; `storage.revisions_not_saved` mostra quantas), um commit cuja config sozinha passaria
+    de ~15 MiB é recusado com o motivo e a leitura aceita até 256 MiB (arquivos de versões
+    anteriores ainda carregam). Testes: `a_big_config_with_a_full_history_still_boots`,
+    `bounded_encoding_leaves_the_oldest_revisions_out`, `encoded_len_is_exact`.
+  - **Alto — segredos TSIG no journal, no log e para o grupo `read`** (#3). `secret` (e `psk`,
+    `private_key`, `passphrase`, para o que vier) entrou em `SECRET_KEYS`: some do journal, da
+    mensagem e do detalhe do log (e portanto do syslog remoto), inclusive o secret gerado no
+    resultado do `add`. Abaixo do grupo `full`, `state.inspect` e `config.diff` mostram `***`, e
+    `ip.dns.tsig-key.print show_secret` exige `full` (como a política `sensitive` do RouterOS).
+    Nenhum outro parâmetro secreto existe hoje na `main` (DHCP, relay e DHCPv6 não têm chave).
+    Teste: `tsig_secrets_stay_out_of_the_journal_the_log_and_read_accounts`.
+  - **Médio — journal sem limite** (#4): parâmetros guardados inteiros (16 MiB × 1024 entradas).
+    Agora limitados como o detalhe do log (2 KiB) e o erro a 512 bytes. Teste:
+    `journal_entries_are_bounded`.
+  - **Médio — `config.commit`/`config.mode.set` dentro de batch atômico** (#5) comitava de verdade e
+    um passo seguinte com erro deixava diferença escondida no candidate. O batch atômico agora
+    recusa `config.commit`, `config.discard`, `config.mode.set` e `config.safe-mode.*` antes de rodar
+    qualquer passo. Teste: `an_atomic_batch_refuses_transaction_control_steps`.
+  - **Médio — commit fora do guarda de panic** (#6): um panic no validador ou no plano de dados
+    deixava a edição no candidate para o próximo comando comitar. O commit do `execute`, o do batch,
+    o desfazer do Safe Mode e o `tick` inteiro rodam no `guard`. Teste:
+    `a_panic_while_committing_leaves_nothing_pending`.
+  - **Médio — prazo do Safe Mode no relógio de parede** (#7): `Hal::monotonic_secs` (novo, padrão
+    `None`; o `hal-linux` usa `CLOCK_MONOTONIC`) conduz o prazo; um passo do NTP não dispara nem
+    desarma mais o Safe Mode. Teste: `the_deadline_follows_the_monotonic_clock`. O resto dos prazos
+    por relógio de parede virou a gap G0.13.
+  - **Médio — falha ao aplicar a config restaurada no boot** (#8) só ia para o log; kernel e
+    `running` divergiam para sempre. Agora `storage.boot_apply_error` mostra o motivo, o `tick`
+    tenta de novo a config inteira a cada segundo e o próximo commit aplica tudo a partir do vazio.
+    Testes: `a_failed_boot_apply_is_reported_and_retried`,
+    `a_commit_after_a_failed_boot_apply_applies_everything`.
+  - **Médio — `/import` de um `/export` com mais de 256 comandos** (#9) era recusado. `MAX_BATCH`
+    subiu para 32 768 (cobre qualquer script de 1 MiB). Testes: `an_atomic_batch_takes_a_big_import`,
+    `a_big_export_imports_back`.
+  - **Baixo — lockout só olhava o firewall** (#10): remover ou desativar o endereço da sessão de
+    gerência, ou desativar a interface dele, agora é lockout; e cada lado da comparação usa a
+    interface que tem o endereço naquela config (mover o endereço atrás de `in-interface` é pego).
+    Teste: `removing_the_management_address_or_its_interface_is_a_lockout`.
+  - **Baixo — contadores de id atrasados num arquivo editado** (#11): o `decode` acerta cada
+    `next_*` para o maior id da sua lista e renumera ids duplicados (`persist::repair_ids`). Testes:
+    `a_counter_behind_its_items_is_repaired_on_load`, `counters_behind_their_items_are_repaired`.
+  - **Baixo — `tool.task.stop`/`poll` sem dono** (#12): só quem iniciou a tarefa (mesma conta) ou o
+    grupo `write` para cima. Teste: `only_the_owner_or_a_writer_stops_or_polls_a_task`.
+  - **Baixo — Safe Mode desfeito em modo transacional** (#13) descartava edições pendentes dizendo
+    "nothing to undo"; agora `last` diz quantas foram descartadas. Teste:
+    `cancel_says_when_it_drops_pending_edits`.
+  - **Baixo — caracteres de controle na mensagem do log** (#14): viram espaço (linha forjada, ESC).
+    Teste: `log_messages_carry_no_control_characters`.
+  - **Baixo — script terminado em `\`** (#15) perdia o último comando em silêncio; agora é erro com o
+    número da linha. Teste: `a_script_ending_in_a_continuation_is_refused`.
+  - **Baixo — storage-fs** (#16): cada quarentena ganha seu arquivo (`.corrupt`, `.corrupt.1`, …) e
+    `state-*.tmp`/`journal-*.tmp` de gravação interrompida são apagados no `open`. Testes:
+    `every_quarantine_keeps_its_own_copy`,
+    `stale_temp_files_of_state_and_journals_are_removed_on_open`.
+
+  Verificado e falso:
+
+  - #2 (mudar usuários em Safe Mode gravava a config não confirmada): `user.add/set/remove` já são
+    recusados em Safe Mode desde o G0.3 (`not_in_safe_mode`). Mesmo assim o `save()` agora grava o
+    store da entrada sempre que o Safe Mode está ativo (defesa em profundidade; teste
+    `a_save_in_safe_mode_writes_the_entry_config`, e `user_changes_wait_for_the_end_of_safe_mode`
+    documenta a recusa).
+  - Em #1, "regras de firewall sem limite" não procede (`MAX_RULES` = 4096 por tabela); as
+    address-lists (65 536) e o DNS estático bastam para o problema.
+
+  Como testar: `cargo test -p corerouter-engine -p corerouter-model -p corerouter-shell -p
+  corerouter-storage-fs`. No daemon, `state.inspect` mostra `storage.boot_apply_error` e
+  `storage.revisions_not_saved`.
+
+- 2026-10-22 — audit-services: Auditoria dos serviços do daemon (supervisor, NTP, syslog remoto, métricas Prometheus), das
+  ferramentas ping/MTR/MTU e da descoberta de vizinhos (CRDP/LLDP/MNDP). Corrigido:
+
+  - **CRDP travava o lock da sessão por datagrama (alta).** Cada anúncio pegava o lock e varria a
+    tabela de vizinhos clonando todas as chaves (~120 µs com a tabela cheia), sem limite de taxa:
+    poucos milhares de pps paravam comandos, GUI, MCP e serviços. Agora a `NeighborTable` tem
+    índices (idade por interface, contagem por interface), `record` diz se o vizinho é novo em
+    O(log n) (`Session::hear_neighbor`), e o receptor CRDP aceita no máximo 200 anúncios/s (50 por
+    origem) antes do lock. Testes: `recording_into_a_full_table_is_cheap`,
+    `receive_rate_is_limited_per_second_and_per_source`; benchmark `neighbors` (abaixo).
+  - **Raspagem `/metrics` fazia netlink + ethtool por interface sob o lock (média).** Os contadores
+    de erro/descarte vêm agora do próprio `poll` (`LinkState::errors`, `IFLA_STATS64`), a junção
+    config × kernel é por mapa: uma raspagem custa um lock e um `poll`, como a doc prometia.
+    Teste: `a_scrape_does_not_query_counters_per_interface`.
+  - **Ping/MTR acima de ~68 sondas/s mostravam perda falsa (média).** Com 8192 sondas recentes a
+    tabela de enviadas era apagada inteira, inclusive as em voo. Agora só sai o que passou de
+    120 s (no máximo uma varredura por segundo); a chave `u16` limita a tabela a 65 536. Teste:
+    `a_full_sent_table_keeps_probes_in_flight`.
+  - **Tabela de vizinhos envenenada por 18 h (média).** A expulsão tirava a entrada que expira
+    primeiro (sempre a legítima) e não havia teto por interface. Agora o hold aceito é no máximo
+    14 400 s, cada interface guarda até 256 vizinhos e sai a entrada ouvida há mais tempo da mesma
+    interface (ou da interface com mais entradas). Teste:
+    `a_flood_on_one_port_does_not_evict_the_others`, `a_full_table_evicts_from_the_busiest_port`.
+  - **Cliente NTP dava panic com `min_poll > max_poll` vindo do disco (média).** `clamp` com
+    mínimo acima do máximo; o supervisor desistia do serviço. `next_poll` normaliza os limites
+    (6..=17, em ordem) e a validação da config inteira (`validate_all`, que também roda ao
+    restaurar) aponta `min_poll`/`max_poll` fora da faixa, invertidos, mais de 8 servidores ou
+    servidor inválido. Testes: `poll_interval_backs_off_and_resets`,
+    `a_loaded_config_with_bad_poll_bounds_is_reported`.
+  - **Erros ICMP aceitos só por ident+seq (média).** Um host fora do caminho forjava "frag
+    needed mtu=68" ou "unreachable" e mudava o resultado do MTU/MTR/ping. Agora o erro precisa
+    citar uma sonda que ia para o mesmo destino (cabeçalho IP citado; na fila de erros do socket
+    ping, o `msg_name`), o ident do socket raw é aleatório (`RandomState`) e "too big" abaixo de
+    68/1280 não informa MTU. Teste: `an_icmp_error_must_quote_the_probe_destination`.
+  - **MNDP aceitava unicast de qualquer lugar (média).** O listener escuta em `0.0.0.0:5678`;
+    agora só valem datagramas para 255.255.255.255, para o broadcast de uma sub-rede da interface
+    de chegada ou para multicast IPv6 (destino lido do `IP_PKTINFO`). Teste:
+    `mndp_takes_only_broadcast_and_link_multicast` (e o `netns_l2` confere o destino).
+  - **Listener CRDP da GUI com fila sem limite (média).** Com a GUI conectada (sem `poll`), cada
+    anúncio da LAN se acumulava. Agora `sync_channel(MAX_HEARD)` com `try_send` (cheio: descarta).
+    Teste: `the_queue_is_bounded_while_nobody_polls`.
+  - **Leitor lento segurava o endpoint de métricas (baixa).** Prazo total de 10 s para a resposta,
+    escrita em blocos de 16 KB. Teste: `a_slow_reader_is_cut_off_at_the_deadline`.
+  - **`HostSocket::recv` girava sem fim sob enxurrada ICMP (baixa).** `drain` lê no máximo 256
+    mensagens por vez; `recv` volta no prazo e a tarefa vê o stop. Teste:
+    `draining_stops_after_its_budget`.
+  - **SNTP: atraso negativo sempre vencia e receive = 0 era aceito (baixa).** `check_reply`
+    recusa receive zero e T3 < T2 (RFC 5905 §8); `poll_round` descarta amostra com atraso
+    negativo. Testes: `replies_are_checked_like_rfc_4330_section_5`,
+    `a_negative_round_trip_never_wins`.
+  - **Supervisor (baixa).** (a) falha ao criar a thread agora conta como falha e chega a `failed`
+    depois da rajada; (b) um `restart` espera (até 2 s) as threads auxiliares da execução antiga
+    soltarem os sockets antes de subir a nova. Testes: `spawn_failures_count_and_give_up`,
+    `a_restart_waits_for_the_old_helpers`.
+  - **Syslog remoto (baixa).** O erro de uma ação apagada ou renomeada deixa de aparecer na linha
+    do serviço, e um reinício do serviço continua de onde parou no log (eventos do período em
+    backoff, como "falhou", também vão). Testes: `errors_of_removed_actions_are_forgotten`,
+    `a_restart_resumes_where_the_last_run_stopped`.
+  - **NTP: rodada ignorava stop e heartbeat (baixa).** `poll_round` bate o heartbeat e confere o
+    stop entre servidores. Teste: `a_round_stops_between_servers`.
+  - **`tool.ping.mtu` com `max_size=65535` (baixa).** O sentinela "nenhum falhou" saturava em
+    65535 e aparecia como `smallest_failing`. Agora é `u32`. Teste:
+    `a_clean_path_passes_at_the_maximum`.
+
+  Verificado e sem mudança: o achado "qualquer usuário consulta ou para tarefas de outro" já foi
+  corrigido pelo audit-persist (#123). `tool.dns.query` ser comando de consulta é igual a
+  `tool.ping.start`/`tool.mtr.start` (mesma permissão); falta uma política para ferramentas que
+  geram tráfego, que virou gap (abaixo). A porta `--metrics` (flag de linha de comando, só
+  loopback por padrão) continua sem `available_from`: é escolha explícita do operador.
+
+  Como testar: `cargo test -p corerouter-engine neighbors`, `cargo test -p corerouter-daemon
+  service::`, `cargo test -p corerouter-hal-linux icmp`, `cargo test -p corerouter-discovery`,
+  `cargo bench -p corerouter-engine --bench neighbors`.
+
+- 2026-10-22 — processo: Fila de entrada: o merge do fold não para mais a fila quando o GitHub já apagou a branch. O
+  `gh pr merge --delete-branch` saía com erro (404 ao apagar a branch que o GitHub apaga sozinho no
+  merge) depois de um merge que tinha dado certo, e a fila parou em #120. Agora o merge é feito sem
+  `--delete-branch`, o estado do PR decide se houve falha, e a branch é apagada à parte, sem erro.

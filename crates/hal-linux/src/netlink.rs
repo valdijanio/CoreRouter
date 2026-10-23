@@ -202,6 +202,12 @@ fn kernel_link(m: &LinkMessage) -> KernelLink {
                 l.tx_bytes = st.tx_bytes;
                 l.rx_packets = st.rx_packets;
                 l.tx_packets = st.tx_packets;
+                l.errors = Some(corerouter_hal::LinkErrors {
+                    rx_errors: st.rx_errors,
+                    tx_errors: st.tx_errors,
+                    rx_dropped: st.rx_dropped,
+                    tx_dropped: st.tx_dropped,
+                });
             }
             LinkAttribute::LinkInfo(infos) => {
                 for i in infos {

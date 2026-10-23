@@ -21,6 +21,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use corerouter_engine::neighbors::Heard;
 use corerouter_engine::{Session, Shared, lock};
 use corerouter_model::{
     Config, IfName, MgmtPorts, NeighborDiscovery, NeighborEntry, NeighborProtocol,
@@ -41,6 +42,55 @@ const RESCAN: Duration = Duration::from_secs(1);
 /// A link that just came up has no IPv6 link-local address for a moment
 /// (duplicate address detection): complain only after this.
 const SETTLE: Duration = Duration::from_secs(10);
+/// Announcements a receiver accepts per second, all sources together. Each
+/// one takes the session lock; past this a flood is dropped before it, so
+/// commands, the GUI and the other services keep running. Real neighbors
+/// announce once per interval (30 s by default) on each link.
+const RATE_TOTAL: u32 = 200;
+/// Of those, per source address: one noisy host cannot use all of them.
+const RATE_PER_SOURCE: u32 = 50;
+
+/// Fixed one-second window over [`RATE_TOTAL`] and [`RATE_PER_SOURCE`].
+#[derive(Debug, Default)]
+struct RateLimit {
+    window: Option<Instant>,
+    total: u32,
+    /// At most `RATE_TOTAL` keys: a source is only added when it is let in.
+    per_source: BTreeMap<IpAddr, u32>,
+    dropped: u64,
+}
+
+impl RateLimit {
+    fn allow(&mut self, src: IpAddr, now: Instant) -> bool {
+        let fresh = self
+            .window
+            .is_none_or(|w| now.saturating_duration_since(w) >= Duration::from_secs(1));
+        if fresh {
+            if self.dropped > 0 {
+                log::debug!(
+                    "CRDP: {} announcements over the rate limit dropped",
+                    self.dropped
+                );
+            }
+            *self = RateLimit {
+                window: Some(now),
+                ..RateLimit::default()
+            };
+        }
+        if self.total >= RATE_TOTAL {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        let n = self.per_source.entry(src).or_insert(0);
+        if *n >= RATE_PER_SOURCE {
+            self.dropped = self.dropped.saturating_add(1);
+            return false;
+        }
+        *n += 1;
+        self.total += 1;
+        true
+    }
+}
 
 /// Where announcements go and come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,11 +574,16 @@ fn receive_loop(rx: &UdpSocket, session: &Shared, cfg: &AgentConfig, stop: &Atom
     let mut buf = [0u8; MAX_PACKET + 1];
     let mut kernel = ifaces::read();
     let mut scanned = Instant::now();
+    let mut rate = RateLimit::default();
     while !stop.load(Ordering::Relaxed) {
         let Some((a, from)) = sock::receive(rx, &mut buf) else {
             continue;
         };
         if a.node_id == cfg.node_id {
+            continue;
+        }
+        // Before the session lock: a flood costs a decode, not the lock.
+        if !rate.allow(from.ip(), Instant::now()) {
             continue;
         }
         let scope = match from {
@@ -555,10 +610,8 @@ fn receive_loop(rx: &UdpSocket, session: &Shared, cfg: &AgentConfig, stop: &Atom
             continue;
         };
         let entry = to_entry(a, interface, from.ip(), unix_now());
-        let key = entry.key();
-        let new = !s.neighbors().iter().any(|e| e.key() == key);
         let (identity, iface) = (entry.identity.clone(), entry.interface.clone());
-        if s.record_neighbor(entry) && new {
+        if s.hear_neighbor(entry) == Heard::New {
             log::info!("CRDP neighbor '{identity}' ({}) on {iface}", from.ip());
         }
     }
@@ -650,6 +703,24 @@ mod tests {
     use super::*;
     use corerouter_model::AddressEntry;
     use corerouter_model::ItemId;
+
+    /// audit-services #1: a flood is cut before the session lock.
+    #[test]
+    fn receive_rate_is_limited_per_second_and_per_source() {
+        let mut r = RateLimit::default();
+        let t0 = Instant::now();
+        let a: IpAddr = "fe80::1".parse().unwrap();
+        let ok = (0..1000).filter(|_| r.allow(a, t0)).count();
+        assert_eq!(ok, RATE_PER_SOURCE as usize, "one source");
+        let ok = (0..10_000u32)
+            .filter(|i| r.allow(IpAddr::V4(Ipv4Addr::from(*i)), t0))
+            .count();
+        assert_eq!(ok, (RATE_TOTAL - RATE_PER_SOURCE) as usize, "all sources");
+        assert!(r.per_source.len() <= RATE_TOTAL as usize);
+        // Next second: room again.
+        assert!(!r.allow(a, t0 + Duration::from_millis(999)));
+        assert!(r.allow(a, t0 + Duration::from_secs(1)));
+    }
 
     #[test]
     fn arrival_by_subnet_prefers_an_active_interface() {

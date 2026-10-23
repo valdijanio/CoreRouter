@@ -135,7 +135,40 @@ fn core_checks(cfg: &Config) -> Vec<Issue> {
         );
         group.push(r);
     }
+    ntp_checks(cfg, &mut out);
     out
+}
+
+/// What `system.ntp.client.set` enforces, for a config that did not come
+/// through it (a saved or hand-edited file).
+fn ntp_checks(cfg: &Config, out: &mut Vec<Issue>) {
+    use corerouter_model::ntp::{MAX_SERVERS, POLL_RANGE, valid_server};
+    let c = &cfg.system.ntp_client;
+    for (field, v) in [("min_poll", c.min_poll), ("max_poll", c.max_poll)] {
+        if !POLL_RANGE.contains(&v) {
+            out.push(Issue::new(
+                format!("system.ntp_client.{field}"),
+                format!("must be {}..={}", POLL_RANGE.start(), POLL_RANGE.end()),
+            ));
+        }
+    }
+    if c.min_poll > c.max_poll {
+        out.push(Issue::new(
+            "system.ntp_client.min_poll",
+            "min_poll must not be above max_poll",
+        ));
+    }
+    if c.servers.len() > MAX_SERVERS {
+        out.push(Issue::new(
+            "system.ntp_client.servers",
+            format!("at most {MAX_SERVERS} servers"),
+        ));
+    }
+    for s in c.servers.iter().take(MAX_SERVERS.saturating_add(1)) {
+        if let Err(e) = valid_server(s) {
+            out.push(Issue::new("system.ntp_client.servers", e));
+        }
+    }
 }
 
 /// Bound on `ip.addresses` (hostile input; every other list has one).
