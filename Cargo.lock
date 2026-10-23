@@ -1078,6 +1078,7 @@ dependencies = [
  "corerouter-model",
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
+ "corerouter-proto-flow",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",
  "corerouter-proto-ntp",
@@ -1122,6 +1123,7 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-discovery",
  "corerouter-proto-dns",
+ "corerouter-proto-flow",
  "corerouter-proto-mpls",
  "corerouter-proto-ospf",
  "criterion",
@@ -1276,6 +1278,16 @@ dependencies = [
  "regex",
  "rustls-pki-types",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "corerouter-proto-flow"
+version = "0.1.0"
+dependencies = [
+ "corerouter-hal",
+ "criterion",
+ "proptest",
+ "serde",
 ]
 
 [[package]]
