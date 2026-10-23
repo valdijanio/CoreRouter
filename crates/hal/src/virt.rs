@@ -32,6 +32,8 @@ pub struct VirtualHal {
     ports: Vec<IfName>,
     applied: Config,
     ticks: u64,
+    /// Busy and total CPU ticks handed out by `resources` so far.
+    cpu: (u64, u64),
     applies: u64,
     /// The nftables script the last firewall change would have loaded
     /// (the lab records it; nothing runs it).
@@ -136,6 +138,7 @@ impl VirtualHal {
             ports,
             applied: Config::default(),
             ticks: 0,
+            cpu: (0, 0),
             applies: 0,
             ruleset: None,
             dynamic: Vec::new(),
@@ -343,11 +346,20 @@ impl VirtualHal {
             .map(|(i, iface)| {
                 let up = !iface.disabled;
                 let rate = if up { 1_000 * (i as u64 + 1) } else { 0 };
+                // Traffic swings between half and one and a half times the
+                // mean (a triangle of the poll count, a phase per port), so
+                // the graphs (G4.5) move; still strictly growing.
+                let swing = |t: u64, phase: u64| {
+                    let x = t.wrapping_add(phase) % 240;
+                    2 * t + if x < 120 { x } else { 240 - x }
+                };
+                let rx = swing(t, i as u64 * 37);
+                let tx = swing(t, i as u64 * 53 + 90);
                 LinkState {
                     name: iface.name.clone(),
                     running: up,
-                    rx_bytes: rate.wrapping_mul(t).wrapping_mul(1_500),
-                    tx_bytes: rate.wrapping_mul(t).wrapping_mul(900),
+                    rx_bytes: rate.wrapping_mul(rx).wrapping_mul(750),
+                    tx_bytes: rate.wrapping_mul(tx).wrapping_mul(450),
                     rx_packets: rate.wrapping_mul(t),
                     tx_packets: rate.wrapping_mul(t) / 2,
                     kind: iface.kind.label().to_owned(),
@@ -402,6 +414,28 @@ impl Hal for VirtualHal {
 
     fn connections(&mut self) -> Result<Vec<crate::conntrack::Conn>, HalError> {
         Ok(crate::lab_conntrack::table(&self.applied, &self.killed))
+    }
+
+    /// A lab that looks alive: the load and the table follow slow waves of
+    /// the poll count (deterministic, so tests can count on it).
+    fn resources(&mut self) -> Option<crate::resources::Resources> {
+        let t = self.ticks;
+        let wave = |period: u64, amp: u64| {
+            let x = t % period;
+            let half = period / 2;
+            amp * (if x < half { x } else { period - x }) / half.max(1)
+        };
+        // 16 CPUs at 100 ticks/s: busy ticks grow 160..=1440 a poll.
+        self.cpu.0 = self.cpu.0.wrapping_add(160 + wave(600, 1280));
+        self.cpu.1 = self.cpu.1.wrapping_add(1600);
+        Some(crate::resources::Resources {
+            cpu_busy: self.cpu.0,
+            cpu_total: self.cpu.1,
+            mem_total: LAB_MEM_KIB * 1024,
+            mem_available: LAB_MEM_KIB * 1024 / 2 + wave(3600, 4 << 30),
+            conntrack: Some(200_000 + wave(900, 80_000)),
+            conntrack_max: Some(1 << 20),
+        })
     }
 
     fn connection_stats(&mut self) -> Result<crate::conntrack::Stats, HalError> {

@@ -52,6 +52,10 @@ name = "dhcp_round"
 harness = false
 
 [[bench]]
+name = "graph"
+harness = false
+
+[[bench]]
 name = "batch_import"
 harness = false
 

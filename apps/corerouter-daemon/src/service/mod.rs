@@ -86,6 +86,9 @@ pub(crate) struct Ctx {
     pub flags: BTreeMap<&'static str, String>,
     /// Where the control channel listens (the protected `control` row).
     pub control: Vec<Listen>,
+    /// `--config-dir` when the config is on disk (services keep their own
+    /// files under it, like the graph history).
+    pub config_dir: Option<std::path::PathBuf>,
 }
 
 impl Ctx {
