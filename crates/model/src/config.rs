@@ -243,6 +243,9 @@ pub struct Ip {
     /// `/ip firewall` (G2.1): filter, nat, mangle and address lists,
     /// IPv4 and IPv6 together.
     pub firewall: CowArc<Firewall>,
+    /// `ip.firewall.xdp` (G2.5a): the filter in the NIC driver.
+    #[serde(skip_serializing_if = "crate::xdp::Xdp::is_default")]
+    pub xdp: crate::xdp::Xdp,
     /// `/ip dns adlist` (G4.1d): block lists of the LAN forwarder.
     #[serde(skip_serializing_if = "crate::dns_adlist::DnsAdlist::is_empty")]
     pub dns_adlist: crate::dns_adlist::DnsAdlist,

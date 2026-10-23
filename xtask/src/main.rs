@@ -3,12 +3,13 @@
 
 mod bench;
 mod changes;
+mod ebpf;
 mod layers;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|docs|layers|agents-sync|wasm|bench|docs fold [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|ebpf|docs fold [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -39,15 +40,20 @@ const CI: &[Step] = &[
     // so a renamed command parameter fails here instead of rotting.
     ("bench-check", bench::check),
     ("netns", netns),
+    // G2.5: the XDP object loaded for real, as root (CI runner only).
+    ("xdp-root", ebpf::root_test),
     // docs/changes/*.md (one file per PR) parse and fold into the docs.
     ("docs", changes::check),
+    // G2.5: prebuilt XDP object up to date with its sources (and rebuilt
+    // where the nightly + bpf-linker are installed).
+    ("ebpf-check", ebpf::check),
     ("layers", layers_step),
     ("agents-sync", agents_sync),
     ("wasm", wasm),
 ];
 
 /// Left out of `cargo xtask ci --fast`.
-const SLOW: &[&str] = &["bench-check", "netns"];
+const SLOW: &[&str] = &["bench-check", "netns", "xdp-root"];
 
 fn main() -> ExitCode {
     let root = workspace_root();
@@ -60,6 +66,15 @@ fn main() -> ExitCode {
             CI.iter().filter(|(name, _)| !SLOW.contains(name)).collect()
         }
         "ci" => CI.iter().collect(),
+        "ebpf" => {
+            return match ebpf::refresh(&root) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL ebpf: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         "bench" => {
             let rest: Vec<String> = std::env::args().skip(2).collect();
             return match bench::main(&root, &rest) {

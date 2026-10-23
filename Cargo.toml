@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "apps/*", "xtask"]
+# The XDP programs build only for BPF with a pinned nightly (`cargo xtask ebpf`).
+exclude = ["crates/dataplane-ebpf"]
 
 [workspace.package]
 version = "0.1.0"
@@ -35,6 +37,7 @@ corerouter-storage-fs = { path = "crates/storage-fs" }
 corerouter-discovery = { path = "crates/discovery" }
 corerouter-ui = { path = "crates/ui" }
 corerouter-shell = { path = "crates/shell" }
+corerouter-dataplane-ebpf-common = { path = "crates/dataplane-ebpf-common" }
 
 # External: heavy crates enter with default-features = false.
 serde = { version = "1.0.229", features = ["derive"] }
