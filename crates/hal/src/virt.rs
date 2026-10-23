@@ -20,7 +20,8 @@ use crate::nic::{
 };
 use crate::sff::{self, SfpModule};
 use crate::{
-    DynamicChange, Features, Hal, HalError, Learned, LinkInfo, LinkState, SharedProber, SimProber,
+    DynamicChange, Features, Hal, HalError, Learned, LinkErrors, LinkInfo, LinkState, SharedProber,
+    SimProber,
 };
 
 #[derive(Clone)]
@@ -257,6 +258,13 @@ impl VirtualHal {
                     mtu: u32::from(iface.mtu),
                     mac: iface.mac.map(|m| m.to_string()),
                     unmanaged: None,
+                    // Same numbers as `counters` (its `interface` group).
+                    errors: Some(LinkErrors {
+                        rx_errors: rate.wrapping_mul(t) / 500_000,
+                        tx_errors: 0,
+                        rx_dropped: rate.wrapping_mul(t) / 250_000,
+                        tx_dropped: 0,
+                    }),
                 }
             })
     }

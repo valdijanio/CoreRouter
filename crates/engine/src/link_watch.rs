@@ -103,6 +103,7 @@ mod tests {
             mtu: 1500,
             mac: None,
             unmanaged: None,
+            errors: None,
         }
     }
 

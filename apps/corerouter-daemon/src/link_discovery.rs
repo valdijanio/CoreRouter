@@ -21,6 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use corerouter_engine::neighbors::Heard;
 use corerouter_engine::{Shared, lock};
 use corerouter_hal_linux::l2::{LldpFrame, LldpIo, MndpListener, UdpDatagram};
 use corerouter_model::{Config, IfName, InterfaceKind, MacAddr, NeighborEntry, NeighborProtocol};
@@ -259,6 +260,28 @@ pub fn lldp_entry(frame: &LldpFrame, now: u64) -> Option<NeighborEntry> {
 
 /// Received MNDP datagram → table row (pure). `None` when it does not
 /// decode or its arrival interface is unknown.
+/// Whether an MNDP datagram was sent to the link, as MNDP announcements
+/// are (255.255.255.255, a subnet broadcast of the arrival interface, or
+/// IPv6 multicast such as ff02::1), not unicast to one of our addresses:
+/// a unicast one may come from anywhere on the Internet (the listener
+/// binds the wildcard address), a broadcast or link multicast cannot.
+pub fn mndp_to_us(d: &UdpDatagram, cfg: &Config) -> bool {
+    let (Some(dst), Some(iface)) = (d.dst, d.interface.as_ref()) else {
+        return false;
+    };
+    match dst {
+        IpAddr::V6(v6) => v6.is_multicast(),
+        IpAddr::V4(v4) if v4.is_broadcast() || v4.is_multicast() => true,
+        IpAddr::V4(v4) => cfg.ip.addresses.iter().any(|a| {
+            !a.disabled
+                && a.interface == *iface
+                && a.address.addr().is_ipv4()
+                && a.address.prefix_len() < 31
+                && a.address.broadcast() == IpAddr::V4(v4)
+        }),
+    }
+}
+
 pub fn mndp_entry(d: &UdpDatagram, now: u64) -> Option<NeighborEntry> {
     let interface = d.interface.clone()?;
     let a = match corerouter_proto_mndp::decode(&d.payload) {
@@ -492,17 +515,22 @@ fn run(
         let datagrams = mndp.as_mut().map(MndpListener::recv).unwrap_or_default();
         if !frames.is_empty() || !datagrams.is_empty() {
             let at = unix_now();
-            let entries = frames
+            let mut s = lock(session);
+            let running = s.store().running();
+            let entries: Vec<NeighborEntry> = frames
                 .iter()
                 .filter_map(|f| lldp_entry(f, at))
-                .chain(datagrams.iter().filter_map(|d| mndp_entry(d, at)));
-            let mut s = lock(session);
+                .chain(
+                    datagrams
+                        .iter()
+                        .filter(|d| mndp_to_us(d, running))
+                        .filter_map(|d| mndp_entry(d, at)),
+                )
+                .collect();
             for e in entries {
-                let key = e.key();
-                let new = e.hold_secs > 0 && !s.neighbors().iter().any(|x| x.key() == key);
                 let (proto, identity, iface) =
                     (e.protocol, e.identity.clone(), e.interface.clone());
-                if s.record_neighbor(e) && new {
+                if s.hear_neighbor(e) == Heard::New {
                     log::info!("{proto} neighbor '{identity}' on {iface}");
                 }
             }
@@ -636,6 +664,7 @@ mod tests {
         let d = UdpDatagram {
             interface: Some(name("ether1")),
             src: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(192, 168, 88, 1), 5678)),
+            dst: Some(IpAddr::V4(Ipv4Addr::BROADCAST)),
             payload: mndp_packet(),
         };
         let e = mndp_entry(&d, 10).unwrap();
@@ -662,6 +691,40 @@ mod tests {
             ..d
         };
         assert!(mndp_entry(&junk, 10).is_none());
+    }
+
+    /// audit-services #7: the listener binds the wildcard address, so a
+    /// unicast datagram from anywhere made a neighbor row.
+    #[test]
+    fn mndp_takes_only_broadcast_and_link_multicast() {
+        let mut cfg = Config::default();
+        cfg.ip.addresses.push(corerouter_model::AddressEntry {
+            id: corerouter_model::ItemId(1),
+            address: "10.56.0.1/24".parse().unwrap(),
+            interface: name("ether1"),
+            disabled: false,
+            comment: String::new(),
+            from_pool: None,
+        });
+        let to = |dst: &str, iface: &str| UdpDatagram {
+            interface: Some(name(iface)),
+            src: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 9), 5678)),
+            dst: Some(dst.parse().unwrap()),
+            payload: mndp_packet(),
+        };
+        assert!(mndp_to_us(&to("255.255.255.255", "ether1"), &cfg));
+        assert!(mndp_to_us(&to("10.56.0.255", "ether1"), &cfg));
+        assert!(mndp_to_us(&to("ff02::1", "ether1"), &cfg));
+        // Unicast to our address, a broadcast of another port's subnet,
+        // a global unicast v6, or no packet info: dropped.
+        assert!(!mndp_to_us(&to("10.56.0.1", "ether1"), &cfg));
+        assert!(!mndp_to_us(&to("10.56.0.255", "ether2"), &cfg));
+        assert!(!mndp_to_us(&to("2001:db8::1", "ether1"), &cfg));
+        let unknown = UdpDatagram {
+            dst: None,
+            ..to("255.255.255.255", "ether1")
+        };
+        assert!(!mndp_to_us(&unknown, &cfg));
     }
 
     #[test]

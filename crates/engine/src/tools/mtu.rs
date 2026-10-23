@@ -137,7 +137,9 @@ pub fn run(job: MtuJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
         "prober": prober.describe(),
         "max_size": max,
     });
-    let report = |good: Option<u16>, bad: u16, state: &str, probes: u32| {
+    // `bad` is a u32: "none failed yet" is `max + 1`, which a u16 cannot
+    // hold when `max` is 65535.
+    let report = |good: Option<u16>, bad: u32, state: &str, probes: u32| {
         let mut v = base.clone();
         if let Value::Object(o) = &mut v {
             o.insert("state".into(), json!(state));
@@ -145,13 +147,14 @@ pub fn run(job: MtuJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
             o.insert("payload".into(), json!(good.map(|g| g.saturating_sub(min))));
             o.insert(
                 "smallest_failing".into(),
-                json!((bad <= max).then_some(bad)),
+                json!((bad <= u32::from(max)).then_some(bad)),
             );
             o.insert("probes".into(), json!(probes));
         }
         v
     };
-    ctx.summary(report(None, max.saturating_add(1), "searching", 0));
+    let none_failed = u32::from(max) + 1;
+    ctx.summary(report(None, none_failed, "searching", 0));
 
     match s.probe(min)? {
         None => return Ok(()),
@@ -169,13 +172,15 @@ pub fn run(job: MtuJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
     }
     let mut good = min;
     // Smallest size known to fail; `max + 1` = none yet.
-    let mut bad = max.saturating_add(1);
+    let mut bad = none_failed;
     let mut next = Some(max);
-    while good.saturating_add(1) < bad {
+    while u32::from(good) + 1 < bad {
+        let g = u32::from(good);
         let size = next
             .take()
-            .filter(|n| *n > good && *n < bad)
-            .unwrap_or(good + (bad - good) / 2);
+            .filter(|n| u32::from(*n) > g && u32::from(*n) < bad)
+            .or_else(|| u16::try_from(g + (bad - g) / 2).ok())
+            .unwrap_or(max);
         let Some(t) = s.probe(size)? else {
             ctx.summary(report(Some(good), bad, "stopped", s.probes));
             return Ok(());
@@ -183,14 +188,14 @@ pub fn run(job: MtuJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
         match t {
             Try::Pass(_) => good = size,
             Try::TooBig(m) => {
-                bad = size;
+                bad = u32::from(size);
                 // The router named the next-hop MTU: everything above it fails.
                 if let Some(m) = m.filter(|m| *m > good && *m < size) {
-                    bad = m.saturating_add(1);
+                    bad = u32::from(m) + 1;
                     next = Some(m);
                 }
             }
-            Try::Lost => bad = size,
+            Try::Lost => bad = u32::from(size),
             Try::Unreachable(why) => return Err(format!("{addr} became unreachable: {why}")),
         }
         ctx.summary(report(Some(good), bad, "searching", s.probes));
@@ -261,6 +266,12 @@ mod tests {
         let (_, _, s) = mtu("::1", 9000);
         assert_eq!(s["mtu"], 9000);
         assert_eq!(s["payload"], 9000 - 48);
+        // audit-services #16: at the largest max_size the "none failed"
+        // sentinel saturated to 65535 and was reported as failing.
+        let (r, _, s) = mtu("::1", u16::MAX);
+        r.unwrap();
+        assert_eq!(s["mtu"], u16::MAX);
+        assert_eq!(s["smallest_failing"], Value::Null);
     }
 
     #[test]

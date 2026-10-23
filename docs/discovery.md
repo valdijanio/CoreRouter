@@ -96,10 +96,19 @@ lê v1. Mudança incompatível = nova versão no cabeçalho.
 Depois de decodificar, o receptor:
 
 1. ignora o próprio node id (cópias de loopback);
-2. descobre a interface de chegada: o *scope id* do endereço link-local de origem (IPv6), ou a
+2. aceita no máximo 200 anúncios por segundo (50 por endereço de origem) **antes** de pegar o
+   lock da sessão; o excesso é descartado, para uma enxurrada não travar comandos e serviços;
+3. descobre a interface de chegada: o *scope id* do endereço link-local de origem (IPv6), ou a
    sub-rede configurada que contém a origem (IPv4);
-3. só guarda o vizinho se a descoberta estiver ativa nessa interface (config **running**);
-4. a tabela tem no máximo 4096 entradas; cheia, a que expira primeiro sai.
+4. só guarda o vizinho se a descoberta estiver ativa nessa interface (config **running**);
+5. o hold time aceito é no máximo 14 400 s (4 × 3600 s, o nosso maior intervalo); a tabela tem
+   no máximo 4096 entradas no total e 256 por interface. Cheia, sai a entrada ouvida há mais
+   tempo da mesma interface (ou, com a tabela toda cheia, da interface com mais entradas): uma
+   enxurrada numa porta só despeja vizinhos daquela porta. Vale para CRDP, LLDP e MNDP.
+
+O MNDP (só escuta) aceita apenas datagramas enviados para 255.255.255.255, para o broadcast de
+uma sub-rede da interface de chegada ou para multicast IPv6 (`ff02::1`): um datagrama unicast
+para um endereço do roteador pode vir de qualquer lugar da Internet.
 
 ## 5. Configuração e estado
 

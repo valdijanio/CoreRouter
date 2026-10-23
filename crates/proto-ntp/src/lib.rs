@@ -190,6 +190,10 @@ pub enum ReplyError {
     WrongOrigin,
     #[error("server sent a zero transmit timestamp")]
     ZeroTransmit,
+    #[error("server sent a zero receive timestamp")]
+    ZeroReceive,
+    #[error("server says it answered before it received the request")]
+    TransmitBeforeReceive,
     #[error("server is not synchronized")]
     Unsynchronized,
     /// RFC 5905 §7.4: DENY and RSTR mean stop asking this server; RATE
@@ -201,7 +205,8 @@ pub enum ReplyError {
 /// RFC 4330 §5 reply checks, with RFC 5905 §7.3/§7.4 meanings: mode 4,
 /// version 1..=4 (§5 lets the server answer in an older version), Origin
 /// equal to the Transmit we sent, Transmit non-zero, stratum 0 is a kiss,
-/// LI 3 or stratum ≥ 16 is an unsynchronized server.
+/// LI 3 or stratum ≥ 16 is an unsynchronized server. RFC 5905 §8 packet
+/// sanity: Receive non-zero too, and not after Transmit (T2 ≤ T3).
 pub fn check_reply(sent: Timestamp, reply: &Packet) -> Result<(), ReplyError> {
     if reply.mode != MODE_SERVER {
         return Err(ReplyError::NotServer(reply.mode));
@@ -217,6 +222,12 @@ pub fn check_reply(sent: Timestamp, reply: &Packet) -> Result<(), ReplyError> {
     }
     if reply.transmit.is_zero() {
         return Err(ReplyError::ZeroTransmit);
+    }
+    if reply.receive.is_zero() {
+        return Err(ReplyError::ZeroReceive);
+    }
+    if reply.transmit.to_unix_nanos() < reply.receive.to_unix_nanos() {
+        return Err(ReplyError::TransmitBeforeReceive);
     }
     if reply.leap == LEAP_ALARM || reply.stratum >= STRATUM_UNSYNC {
         return Err(ReplyError::Unsynchronized);
@@ -336,6 +347,28 @@ mod tests {
                 }
             ),
             Err(ReplyError::ZeroTransmit)
+        );
+        // audit-services #11, RFC 5905 §8: a zero receive timestamp (it
+        // reads as 2036) and T3 < T2 are not used.
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    receive: Timestamp(0),
+                    ..ok
+                }
+            ),
+            Err(ReplyError::ZeroReceive)
+        );
+        assert_eq!(
+            check_reply(
+                sent,
+                &Packet {
+                    receive: Timestamp(sent.0 + 5),
+                    ..ok
+                }
+            ),
+            Err(ReplyError::TransmitBeforeReceive)
         );
         assert_eq!(
             check_reply(sent, &Packet { leap: 3, ..ok }),

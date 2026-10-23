@@ -54,6 +54,7 @@ impl Hal for Host {
             mtu: 1400,
             mac: None,
             unmanaged: Some(WHY.into()),
+            errors: None,
         });
         out
     }
