@@ -2,8 +2,9 @@
 //!
 //! One JSON request per line: `{"id","method","params","token"}` →
 //! `{"id","ok":true,"result"}` | `{"id","ok":false,"error"}`.
-//! At most 16 connections per endpoint, any non-JSON line closes the
-//! connection (this blocks a browser `fetch` from a web page).
+//! At most 16 connections per endpoint (half of them, at most, not logged
+//! in yet: [`conn`]), any non-JSON line closes the connection (this blocks
+//! a browser `fetch` from a web page).
 //!
 //! G0.3: every request but `ping`/`server.info`/`auth.login` needs a token
 //! ([`auth`]): a session token from `auth.login`, or the [`local_token`]
@@ -19,6 +20,7 @@
 pub mod auth;
 pub mod client;
 pub mod clock;
+pub mod conn;
 pub mod dial;
 pub mod dispatch;
 #[doc(hidden)]
@@ -34,6 +36,7 @@ pub mod ws;
 pub use auth::{Gate, Limits, UNAUTHORIZED};
 pub use client::{Client, reply_result};
 pub use clock::spawn_clock;
+pub use conn::Timeouts;
 pub use dial::{Login, Target, Trust, dial};
 pub use dispatch::{Host, NO_UI, SharedHost, dispatch, dispatch_as, hang_up, new_caller};
 pub use known_hosts::KnownHosts;

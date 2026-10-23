@@ -37,7 +37,7 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Name sent in SNI. Clients pin the certificate, so it is not checked.
 const SERVER_NAME: &str = "corerouter";
 
-pub type ServerStream = StreamOwned<ServerConnection, TcpStream>;
+pub type ServerStream = StreamOwned<ServerConnection, crate::conn::Sock>;
 pub type ClientStream = StreamOwned<ClientConnection, TcpStream>;
 
 fn provider() -> Arc<CryptoProvider> {
@@ -87,6 +87,8 @@ pub fn load_or_create(dir: &Path) -> Result<(ServerIdentity, bool), String> {
         write_private(&key_path, key_pem.as_bytes())
             .map_err(|e| format!("{}: {e}", key_path.display()))?;
         fs::write(&cert_path, cert_pem).map_err(|e| format!("{}: {e}", cert_path.display()))?;
+    } else {
+        keep_private(&key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
     }
     let cert = read_bounded(&cert_path).map_err(|e| format!("{}: {e}", cert_path.display()))?;
     let key = read_bounded(&key_path).map_err(|e| format!("{}: {e}", key_path.display()))?;
@@ -117,30 +119,60 @@ pub fn identity_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<ServerIdenti
     })
 }
 
+/// Write a private file: a new temporary file created with mode 0600, then
+/// renamed over `path`. Opening `path` itself would keep the mode of a file
+/// already there (a restored 0644 key would stay world-readable).
 fn write_private(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("pem.tmp");
+    let _ = fs::remove_file(&tmp);
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true);
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(data)?;
-    f.sync_all()
+    {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(data)?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path)
 }
 
-/// Run the server side of the handshake on an accepted connection.
-pub fn accept(tcp: TcpStream, config: Arc<ServerConfig>) -> io::Result<ServerStream> {
-    tcp.set_read_timeout(Some(HANDSHAKE_TIMEOUT))?;
-    tcp.set_write_timeout(Some(HANDSHAKE_TIMEOUT))?;
+/// An existing private key readable by group or others is tightened to
+/// 0600 (with a warning): the key is the router's identity.
+fn keep_private(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = fs::metadata(path)?.permissions().mode();
+        if mode & 0o077 != 0 {
+            log::warn!(
+                "{}: private key was readable by others (mode {:o}); set to 0600",
+                path.display(),
+                mode & 0o777
+            );
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Run the server side of the handshake on an accepted connection. The
+/// time limit is the transport's: the control server hands in a
+/// [`crate::conn::Sock`] whose reads stop at the handshake deadline.
+pub fn accept<S: Read + Write>(
+    sock: S,
+    config: Arc<ServerConfig>,
+) -> io::Result<StreamOwned<ServerConnection, S>> {
     let conn = ServerConnection::new(config).map_err(io::Error::other)?;
-    let mut s = StreamOwned::new(conn, tcp);
+    let mut s = StreamOwned::new(conn, sock);
     while s.conn.is_handshaking() {
         s.conn.complete_io(&mut s.sock)?;
     }
-    s.sock.set_read_timeout(None)?;
-    s.sock.set_write_timeout(None)?;
     Ok(s)
 }
 
@@ -339,6 +371,30 @@ mod tests {
         }
         fs::write(dir.join(CERT_FILE), "junk").unwrap();
         assert!(load_or_create(&dir).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A key restored with mode 0644 never stays world-readable: neither
+    /// when the certificate is missing (both are made again) nor when both
+    /// are there (it is tightened on load).
+    #[cfg(unix)]
+    #[test]
+    fn a_world_readable_key_is_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("cr-tls-mode-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let key = dir.join(KEY_FILE);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        fs::write(&key, "old").unwrap();
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        let (_, created) = load_or_create(&dir).unwrap();
+        assert!(created);
+        assert_eq!(mode(&key), 0o600);
+        fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
+        let (_, created) = load_or_create(&dir).unwrap();
+        assert!(!created);
+        assert_eq!(mode(&key), 0o600);
         let _ = fs::remove_dir_all(&dir);
     }
 }

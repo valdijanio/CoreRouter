@@ -229,6 +229,9 @@ pub struct Login {
 
 /// Most logins tracked at once; the oldest is dropped beyond it.
 pub const MAX_LOGINS: usize = 256;
+/// Most logins of one user: beyond it that user's oldest is dropped, so no
+/// account can push the others out by logging in over and over.
+pub const MAX_LOGINS_PER_USER: usize = 16;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Logins {
@@ -239,7 +242,12 @@ pub(crate) struct Logins {
 impl Logins {
     pub(crate) fn begin(&mut self, user: &str, via: &str, now: Option<u64>) -> u64 {
         self.next = self.next.saturating_add(1);
-        if self.list.len() >= MAX_LOGINS {
+        let mine = self.list.iter().filter(|l| l.user == user).count();
+        if mine >= MAX_LOGINS_PER_USER {
+            if let Some(i) = self.list.iter().position(|l| l.user == user) {
+                self.list.remove(i);
+            }
+        } else if self.list.len() >= MAX_LOGINS && !self.list.is_empty() {
             self.list.remove(0);
         }
         self.list.push(Login {
@@ -330,5 +338,19 @@ mod tests {
         assert!(check_password("long enough").is_ok());
         assert!(check_password("tab\there!").is_err());
         assert!(check_password(&"x".repeat(MAX_PASSWORD + 1)).is_err());
+    }
+
+    /// Audit (control finding 7): a user logging in over and over drops
+    /// only its own oldest logins, never another account's.
+    #[test]
+    fn repeated_logins_evict_only_the_same_user() {
+        let mut l = Logins::default();
+        let admin = l.begin("admin", "tcp 10.0.0.1:1", None);
+        for _ in 0..MAX_LOGINS + 5 {
+            l.begin("noc", "tcp 10.0.0.2:1", None);
+        }
+        assert!(l.touch(admin, None), "admin's login was evicted");
+        let noc = l.list.iter().filter(|x| x.user == "noc").count();
+        assert_eq!(noc, MAX_LOGINS_PER_USER);
     }
 }
