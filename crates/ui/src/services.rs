@@ -57,6 +57,9 @@ pub(crate) struct ServicesPanel {
     /// Each row's rectangle last frame (clicks select).
     rects: BTreeMap<String, egui::Rect>,
     pub(crate) error: Option<String>,
+    /// What the last command did ("stop sent to dns-server"); the row and
+    /// the log line follow with the next refresh.
+    pub(crate) notice: Option<String>,
 }
 
 /// A command's reply: the action, for the message.
@@ -72,10 +75,15 @@ fn n(v: &Value, k: &str) -> Option<u64> {
 
 /// The text and tone of a state chip.
 pub(crate) fn state_chip(v: &egui::Visuals, row: &Value) -> (String, Tone) {
-    let state = s(row, "state");
+    // A stop or restart on its way shows over the state it leaves.
+    let state = match row.get("reason").and_then(Value::as_str) {
+        Some(r @ ("stopping" | "restarting")) => r,
+        _ => s(row, "state"),
+    };
     let tone = match state {
         "running" => GREEN.tone(v),
-        "restarting" => AMBER.tone(v),
+        // Stopped by the admin stands out from "off in the config".
+        "restarting" | "stopping" | "stopped" => AMBER.tone(v),
         "failed" => RED.tone(v),
         "starting" => BLUE.tone(v),
         _ => neutral_tone(v),
@@ -318,6 +326,9 @@ impl ServicesPanel {
 
     fn draw(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         self.toolbar(app, ui);
+        if let Some(n) = &self.notice {
+            ui.weak(n);
+        }
         if let Some(e) = &self.error {
             ui.colored_label(ui.visuals().error_fg_color, e);
         }
@@ -437,10 +448,17 @@ impl PanelState for ServicesPanel {
         let Ok(a) = then.downcast::<Acted>() else {
             return;
         };
-        self.error = match result {
-            Ok(_) => None,
-            Err(e) => Some(format!("{}: {e}", a.0)),
-        };
+        let action = a.0.rsplit('.').next().unwrap_or(a.0);
+        match result {
+            Ok(v) => {
+                self.error = None;
+                self.notice = Some(format!("{action} sent to {}", s(v, "name")));
+            }
+            Err(e) => {
+                self.notice = None;
+                self.error = Some(format!("{action}: {e}"));
+            }
+        }
     }
 
     fn escape(&mut self, _win: &'static str) -> bool {
