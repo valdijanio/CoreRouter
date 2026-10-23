@@ -2043,3 +2043,197 @@ continuação indentadas).
   **medidos** de antes e depois e o que ficou de fora. Também acerta o limite do `command_batch` do
   MCP, que a descrição da ferramenta e o `docs/mcp.md` ainda davam como 256 passos (é 32 768 desde
   o #123).
+
+- 2026-10-23 — G0.15: Idioma configurável na GUI, com **dois idiomas independentes**: o dos rótulos (menus, títulos,
+  colunas, botões) e o das explicações (texto de ajuda, modal do botão ⓘ). Padrão: rótulos em
+  inglês, como o resto do app, e explicações em português. Menu novo **Settings** com a janela
+  Settings (seletores English/Português) e a nota "guardado neste computador, não no roteador": a
+  escolha vai para as preferências da janela (`prefs.rs`, `labels_lang`/`help_lang`), no arquivo do
+  eframe no nativo e no `localStorage` no WASM; nenhum comando vai ao roteador. Base de i18n em
+  `crates/ui/src/i18n/` (catálogo por idioma, ordenado, busca binária): `tr` para rótulos (texto em
+  inglês como chave e fallback) e `explain` para explicações em Markdown simples por chave (cai
+  para o idioma dos rótulos e depois para o inglês); `help.rs` (botão ⓘ desenhado, sem depender de
+  glifo da fonte, e o modal) e `markdown.rs` (títulos, parágrafos, listas, código e negrito, sem
+  panic com marcação solta). Títulos de janela e grupos do menu passam pelo `tr` (sem tradução, ficam
+  em inglês). O `build.rs` da UI passou a aceitar módulos em pasta (`src/<nome>/mod.rs`). Como
+  testar: Settings › Settings, troque "Labels" para Português (título, menu e campos mudam) e clique
+  no ⓘ (explicação em português; com "Explanations" em English, em inglês). Testes: catálogos
+  ordenados e sem repetição, toda chave de explicação em EN e PT, fallback de rótulo e de explicação,
+  tradução sem uso no código (erro de digitação da chave), preferências hostis, Markdown com marcação
+  solta, janela headless (padrão, troca pelo seletor, modal). Screenshots claro e escuro conferidos.
+  Como uma janela nova usa rótulos e explicações traduzíveis: `docs/ui-style.md`.
+
+- 2026-10-23 — G0.16: Comando sem cópia da config inteira. As seções grandes da `Config` (`interfaces`, `ip` e, dentro
+  dele, endereços, rotas, firewall com `filter`/`nat`/`mangle`/`address_lists`, DNS estático, zonas
+  e servidor DHCP) passaram a ser `model::cow::CowArc<T>`: um `Arc` que só copia quando alguém
+  escreve (`Arc::make_mut` no `DerefMut`), serializado igual a `T` (os arquivos salvos não mudam).
+  Com isso o ponto de rollback de cada comando, a running, as revisões do histórico, o snapshot do
+  `engine.batch` e o store da entrada do Safe Mode compartilham o que ninguém escreveu, e um comando
+  paga a cópia só das seções em que escreve. A igualdade compara o ponteiro antes do conteúdo, e o
+  `ConfigStore` só compara candidate × running depois de um `candidate_mut`/`set_candidate`/
+  `rollback` (antes, toda checagem de `is_dirty` comparava a árvore inteira). O `Name` do firewall
+  (nome de lista, chain, mark) virou `Arc<str>`: copiar uma address list não copia texto. A busca de
+  duplicata do `ip.firewall.address-list.add`/`set` compara o endereço antes do nome.
+
+  A semântica não muda: um comando que falha (inclusive no commit, no data plane ou por panic)
+  devolve exatamente a candidate de antes, Safe Mode, transações, `config.diff` e o build WASM
+  seguem iguais. Testes novos: `crates/engine/tests/cow_sections.rs` (comando que falha depois de
+  mexer na candidate a devolve bit a bit e sem cópia; um `interface.set` não copia as rotas; a
+  revisão nova compartilha as rotas com a anterior; um ponto de rollback sobrevive a escritas),
+  `store::tests::copies_share_what_was_not_written`, `a_write_that_changes_nothing_is_not_dirty` e
+  os de `model::cow`. Bench novo `engine_txn` (`crates/engine/benches/transactional.rs`): um
+  comando por vez em modo transacional sobre uma config grande.
+
+  O que o critério antigo supunha não se confirmou: das 6,6 ms de um commit com 10 000 rotas, as
+  cópias eram ~0,5 ms (**medido**: 6,57 → 6,04 ms). O resto é trabalho O(N) do próprio commit, fora
+  desta gap: `validate_all` da config inteira (~1,2 ms), `persist::encode_config` para conferir o
+  tamanho (~2,2 ms) e o `Hal::apply` do lab virtual (~1,5 ms), **medidos** com 10 000 rotas. Também
+  fica de fora: acrescentar a uma lista enorme ainda copia aquela lista (60 000 entradas: ~0,6 ms
+  por comando, **medido**), então montar uma config item a item continua crescendo com o tamanho
+  da lista tocada; resolver isso pede listas persistentes (cópia O(log n)) ou índice por chave.
+  Sugestões de gaps novas (sem id: a sessão principal atribui): commit incremental (validar,
+  codificar e aplicar só as seções que mudaram, usando `CowArc::ptr_eq`) e listas persistentes
+  para address lists e rotas.
+
+  Como testar: `cargo test -p corerouter-engine --test cow_sections`, `cargo test -p
+  corerouter-model`, `cargo bench -p corerouter-engine --bench transactional`.
+
+- 2026-10-23 — G1.26a: System › Tuning, parte 1 (Resumo, Kernel, Perfis): o CoreRouter ajusta o kernel para encaminhamento
+  em Rust puro (arquivos de `/proc/sys`, sem `tuned`, `irqbalance` nem `sysctl.conf`).
+
+  - **Valores na config** (`system.tuning.sysctl`): transação, diff, Safe Mode e rollback como
+    qualquer comando.
+  - **Catálogo de 38 parâmetros** em `model::tuning`, em seis grupos:
+    - recepção (`netdev_max_backlog`, `netdev_budget(_usecs)`, `dev_weight`);
+    - roteamento (forwarding v4/v6, `rp_filter` all/default, hash ECMP v4/v6, `route.max_size`
+      v4/v6);
+    - conntrack (max, buckets e 10 timeouts);
+    - vizinhos (`gc_thresh1/2/3` v4/v6);
+    - estabilidade (`kernel.panic`, `panic_on_oops`, `vm.min_free_kbytes`);
+    - plano de controle (`rmem/wmem_max`, `somaxconn`, `tcp_syncookies`, `tcp_max_syn_backlog`).
+  - **`hal-linux`**:
+    - grava tudo ou nada; o `ip_forward` vai primeiro;
+    - o valor original fica guardado na primeira mudança, e tirar o parâmetro o restaura;
+    - recusa com o motivo o parâmetro ausente, só leitura ou que o kernel não aceitou;
+    - lê a máquina (CPUs, NUMA, RAM, kernel) e os contadores (`softnet_stat`,
+      `nf_conntrack_count`, `table_fulls` de `arp_cache`/`ndisc_cache`).
+  - **Laboratório virtual**: simula um servidor de 16 CPUs, 2 nós NUMA e 32 GiB, com contadores que
+    disparam o diagnóstico.
+  - **Engine** (`engine::tuning`, puro):
+    - perfis conservador, balanceado, alto desempenho e baixa latência, calculados da RAM, das CPUs e
+      da velocidade das portas, cada valor com o motivo;
+    - timeouts de CGNAT dentro das RFCs 5382, 4787 e 5508;
+    - faixas com teto pela RAM;
+    - diagnóstico com sugestão.
+  - **Comandos**: `system.tuning.print|parameter.print|set|unset|profile.diff|profile.apply|hardware|diagnose`.
+  - **Janela System › Tuning**:
+    - abas Resumo, Kernel e Perfis; Interfaces, CPU e IRQ e Boot dizem em que gap chegam;
+    - lista de propriedades com seções e Find;
+    - selos `differs`, `not applied`, `control plane`, `obsolete`;
+    - editor da linha selecionada;
+    - ⓘ com explicação em EN/PT (G0.15), valor recomendado aqui e comando equivalente;
+    - "Show differences" (modal com motivo) e "Apply with Safe Mode".
+
+  Como testar: `cargo run -p corerouter-gui -- --control 7979`, Virtual lab › System › Tuning. No
+  terminal:
+
+  - `/system tuning parameter print`;
+  - `/system tuning profile diff profile=throughput`;
+  - `/system tuning set name=net.core.netdev_budget value=600`.
+
+  Testes:
+
+  - catálogo;
+  - perfis dentro da faixa em 1/4/32/512 GiB, com a ordem dos `gc_thresh`;
+  - diagnóstico;
+  - comandos (sucesso, faixa, nome desconhecido com "did you mean", obsoleto, ordem dos `gc_thresh`,
+    perfil num commit e rollback de uma vez);
+  - `hal-linux` sobre um `/proc` de mentira (tudo ou nada, restauração, nome fora do catálogo);
+  - netns (grava e restaura os parâmetros por namespace; o só leitura e o ausente desfazem a mudança
+    toda);
+  - explicação de todo parâmetro em EN e PT;
+  - todo motivo do engine com modelo em PT e os mesmos argumentos;
+  - janela headless (Resumo, Kernel, ⓘ, Find, rótulos PT, Aplicar com Safe Mode, Perfis, Ver
+    diferenças).
+
+  Screenshots claro e escuro conferidos. O `netdevsim` não serviu: criar um dispositivo exige root no
+  namespace do host. Pesquisa e decisões: `docs/tuning.md` e `docs/architecture.md`.
+
+- 2026-10-23 — audit-history: Histórico de revisões em disco como diferenças, não cópias inteiras (auditoria de 2026-10-23).
+
+  - **Só 6 das 64 revisões sobreviviam ao reboot com config de 5 MiB (3 com 10 MiB)** — severidade
+    média (a running nunca se perdia; o `config.rollback` para trás depois de um reboot, sim).
+    Causa: desde o G1.23 cada revisão é um arquivo `rev-<n>.json` com a config inteira, e a soma
+    cabe em 32 MiB (`SAVE_BUDGET_BYTES`). Correção: o arquivo da revisão `k` guarda a diferença
+    estrutural para a revisão `k+1` (delta reverso; `base` + `delta` no lugar de `config`); a mais
+    nova não tem arquivo, o slot a guarda inteira. Módulo novo `model::json_delta` (objetos por
+    chave, listas por `id` em trechos copiados + itens novos, listas sem id por prefixo/sufixo;
+    `diff_text` compara os textos JSON que o commit já tem sem montar as árvores; `apply_owned`
+    move as partes mantidas). `engine::history_files` grava a diferença do penúltimo no commit e
+    percorre a cadeia do slot para trás no boot. Testes:
+    `all_64_revisions_of_a_big_config_survive_a_reboot` (config de ~750 KB, 64 commits, reboot com
+    as 64 iguais às da memória e rollback exato para a mais velha; na `main` falha com 19 revisões
+    não salvas), `a_crash_between_the_steps_of_a_save_loses_only_that_revision` (storage que falha
+    na gravação do arquivo de revisão, do slot ou na remoção: só a revisão em voo se perde, e os
+    commits seguintes continuam), `a_broken_revision_file_costs_it_and_the_older_ones_only`,
+    `a_difference_that_does_not_fit_its_base_is_refused` (trecho fora da lista, base errada, base
+    mais velha, delta que não dá uma `Config`), `full_copy_revision_files_from_g1_23_load_and_become_differences`,
+    `a_file_with_the_whole_history_from_an_older_build_loads_and_moves_to_files`,
+    `a_revision_file_newer_than_the_slot_is_replaced`; em `json_delta`, proptest de ida e volta
+    (`apply(diff(a, b)) == b`, `diff_text == diff`) e de lixo (`apply` nunca entra em pânico),
+    entradas hostis (trecho fora, trechos sobrepostos, profundidade > 64) e a troca de um item numa
+    lista de 65 536 em menos de 200 bytes.
+
+  Propriedades de segurança mantidas do G1.23: ordem arquivos novos → slot → apagar; arquivo da
+  revisão do slot ou mais novo é ignorado no boot e reescrito; `.tmp` limpo ao abrir; histórico
+  inteiro no slot (antes do G1.23) e arquivos com cópia inteira (G1.23) carregam e migram no próximo
+  commit. Muda: um arquivo ilegível no meio custa ele **e os mais velhos** (dependem dele), relatado
+  em `storage.boot_errors` como `revisions a..b: N left out`; o boot pelo slot `previous` não perde
+  nada. Uma versão anterior lendo o diretório novo (downgrade) carrega a running e acusa as revisões
+  antigas como ilegíveis. Escolha e números em `docs/architecture.md` (Persistência).
+
+  Como testar: `cargo test -p corerouter-engine --test history_files`; `cargo test -p
+  corerouter-model json_delta`; `cargo bench -p corerouter-storage-fs --bench commit -- history64`
+  (imprime quantas revisões o reboot restaura e os bytes em disco).
+
+- 2026-10-23 — docs: `docs/desempenho.md`: painel com os números de referência de desempenho e de memória medidos na
+  auditoria de outubro de 2026 (motor, import, kernel, DHCP, DNS, canal de controle, descoberta,
+  GUI e memória do daemon), para comparar versões futuras.
+
+- 2026-10-23 — fix: System › Services: Start/Stop agora mostram o que fizeram (relato do usuário: "start e stop não
+  funcionam nem mostram o resultado no log"). Eles funcionavam no supervisor, mas nada aparecia:
+
+  - **Start num serviço desligado pela config** (`disabled`, ex.: dns-server com
+    `allow_remote_requests=no`) respondia OK e não mudava nada. Agora recusa dizendo por quê e
+    como ligar (`turn it on with ip.dns.set allow_remote_requests=yes`). Stop continua valendo.
+  - **O resultado de cada comando vai para o log do roteador**, no tópico do serviço (`dns`,
+    `system`…): "Serviço dns-server: parando / parado / iniciando / reiniciando / já estava
+    parado (… por comando)". Antes só ia para o stderr do daemon.
+  - **A linha mostra "stopping"/"restarting"** enquanto a parada não termina (antes continuava
+    `disabled`), e `stopped` (pelo admin) fica âmbar, separado do cinza de `disabled` (pela config).
+  - A janela diz "stop sent to dns-server" ao enviar; o erro do comando aparece no lugar.
+
+  Como testar: System › Services › dns-server › Start (mensagem explicando), Stop (stopping →
+  stopped, âmbar; linha no Log · dns), Start de novo.
+
+- 2026-10-23 — fix: System › Services: serviço desligado pela config ganha **Enable** e **Open settings** (relato do
+  usuário: "quando dou start dá o erro e não mostra startado"). Start num serviço `disabled` não
+  tem o que iniciar (ele já roda, ocioso, porque a config o desliga), então:
+
+  - **Start fica cinza** nesses serviços, com o motivo na dica.
+  - **Enable** aparece no detalhe quando ligar é só um interruptor da config (dns-server:
+    `ip.dns.set allow_remote_requests=yes`; metrics: `ip.service.metrics.set enabled=yes`): um
+    clique roda esse comando (journal, transação e Safe Mode como qualquer outro), e o serviço
+    passa a `running` em seguida.
+  - **Open settings** abre a janela que configura o serviço (DNS, Adlist, Zones, DHCP Server,
+    NTP, Logging) quando ligar pede valores que só o operador sabe (interface, pool, servidores).
+  - `system.service.print` ganha `turn_on: {id, params}|null`, o `enable` como comando quando ele
+    está completo (sem `…`).
+
+  Como testar: System › Services › dns-server (disabled): Start cinza com a dica; Enable → o
+  serviço vira `running` e o `ip.dns.get` mostra `allow_remote_requests: true`; dhcp-server:
+  Open settings abre IP › DHCP Server.
+
+  Também: o e2e `hostile_lines_never_crash_or_hang_it` espera o daemon soltar as 500 conexões
+  fechadas de uma vez antes de conectar de novo (falhava com a máquina carregada: "too many
+  connections that have not logged in").
