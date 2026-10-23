@@ -528,3 +528,61 @@ local, N conexões pedindo sem parar; latência de cada pedido):
 | 16 (`MAX_CONNECTIONS`) | 77,1 mil/s | 201 µs | 578 µs |
 
 A vazão satura em ~77 mil pedidos/s (~13 µs cada, o tempo com o lock da sessão).
+
+### G0.16 — comando sem cópia da config inteira (2026-10-23)
+
+**Medido** em AMD Ryzen AI MAX+ 395 (32 CPUs), build release (`cargo bench`), 2026-10-23, máquina
+compartilhada com outras sessões (load ~6). Antes = `origin/main` d682d4a; depois = esta branch.
+
+| Bench | Antes | Depois | Mudança |
+|---|---|---|---|
+| `engine_txn/single/interface.set/routes_10000` | 89,7 µs | 4,4 µs | −95 % |
+| `engine_txn/single/address_list_add_remove/60000` (2 comandos) | 2,70 ms | 1,23 ms | −53 % |
+| `engine_txn/build/2000` | 49,4 ms | 18,4 ms | −63 % |
+| `engine_txn/build/8000` | 665 ms | 235 ms | −65 % |
+| `engine_execute/ip.address.add` | 20,1 µs | 14,5 µs | −28 % |
+| `engine_execute/ip.firewall.filter.add` | 25,9 µs | 22,3 µs | −14 % |
+| `engine_execute/virtual_lab_new` | 7,52 µs | 5,22 µs | −31 % |
+| `engine_scale/commit/filter_rules/3000` | 2,02 ms | 1,05 ms | −47 % |
+| `engine_scale/commit/routes/10000` | 6,57 ms | 6,04 ms | −11 % |
+| `engine_scale/commit/addresses/10000` | 3,63 ms | 3,15 ms | −15 % |
+| `engine_scale/commit/address_lists/20000` | 6,62 ms | 4,91 ms | −28 % |
+| `engine_scale/import/address_lists/5000` | 39,4 ms | 32,7 ms | −18 % |
+| `engine_scale/ip.route.list/10000` | 14,9 ms | 17,4 ms | +15 % (ruído entre +15 e +44 % em duas rodadas; um `Arc` a mais por acesso a `cfg.ip`) |
+
+`build/N`: o lab montado com N comandos (65 % address list, 30 % rotas, 5 % filtro), o caso de
+323 s com 10 MiB em escala menor. Por comando: antes 25 → 83 µs de N = 2000 para 8000; depois
+9 → 29 µs. Continua crescendo com a lista tocada (veja acima), mas ~3× abaixo.
+
+G1.26a — encaminhamento de UDP de 64 bytes num namespace (`netns_forward`: `AF_PACKET` → veth →
+rota → dummy, uma CPU), antes e depois dos parâmetros por namespace do perfil de alto desempenho.
+AMD Ryzen AI MAX+ 395 (32 CPUs), 62 GiB, Linux 7.0.0-38, build release (bench), 2026-10-23,
+**medido**:
+
+| Benchmark | Antes (`rp_filter` estrito) | Depois (perfil alto desempenho) |
+|---|---|---|
+| `netns_forward/udp64` | 1,60 Mpps (12,5 ms por 20 000 quadros) | 1,78 Mpps (11,2 ms), +11 % |
+
+Os parâmetros do host (`netdev_budget`, `netdev_max_backlog`) não existem num namespace: G1.26f.
+
+### audit-history: histórico de 64 revisões com config grande (2026-10-23, **medido**)
+
+AMD Ryzen AI MAX+ 395 (32 CPUs), build release, `cargo bench -p corerouter-storage-fs --bench
+commit` (`storage_fs/history64/*`, novo): `FileStorage` em disco de verdade (fsync) sob o tmp do
+target, 64 revisões, commit pequeno (`interface.set` comment). Config de 5 MiB = 4000 regras de
+filtro, 20 000 entradas de address-list, 10 000 rotas, 10 000 leases estáticos; 10 MiB = 4000
+regras, 65 536 entradas, 30 000 rotas. Antes = `main` (cópia inteira por revisão); depois =
+diferença para a revisão seguinte.
+
+| medida | 5 MiB antes | 5 MiB depois | 10 MiB antes | 10 MiB depois |
+|---|---|---|---|---|
+| revisões restauradas no reboot | 6 de 64 | 64 de 64 | 3 de 64 | 64 de 64 |
+| bytes em disco (total) | 50,9 MiB | 20,4 MiB | 68,1 MiB | 38,9 MiB |
+| bytes nos arquivos de revisão | ~30 MiB (6 cópias) | 0,01 MiB (63 deltas) | ~29 MiB (3 cópias) | 0,01 MiB |
+| commit (mediana) | 39,8 ms | 47,4 ms (49,0 na 2ª rodada) | 70,1 ms | 85,8 ms (104,7, rodada ruidosa) |
+| boot (`Session::with_storage`) | 265 ms | 1,46 s | 329 ms | 1,21 s |
+| `storage_fs/commit/routes_history64/10000` | 11,6 ms | 15,5 ms | | |
+
+O commit fica ~7–16 ms mais caro (comparar os textos das duas configs) e grava menos (2× a config
+no slot, antes 3×). O boot cresce com o número de revisões montadas (~20 ms cada com 5 MiB):
+restaura 64 em vez de 3–6; G0.20 trata disso.
