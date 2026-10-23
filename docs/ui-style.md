@@ -49,6 +49,15 @@ operadora e começa a outra).
   clique de novo desmarca; clique direito abre o menu com as cópias úteis (endereço, nome).
 - Confira no tema claro **e** no escuro (screenshot), como manda o AGENTS.md.
 
+## Explicação ⓘ em todo lugar que couber (regra)
+
+Sempre que der, todo rótulo de campo, parâmetro, coluna, aba, item de menu e título de janela leva
+o ícone **ⓘ**, que abre o **modal de explicações**: o que é, quando mudar, cuidado, o padrão ou
+recomendado e a RFC quando houver. O texto vem do catálogo de explicações (abaixo), **em
+português por padrão** (configurável em Settings). Janela ou campo novo sem explicação é
+incompleto: o teste do catálogo confere que toda chave usada tem texto. Só fica sem ⓘ o que é
+óbvio por si (um botão OK, um campo Comment).
+
 ## Idioma: rótulos e explicações (G0.15)
 
 A GUI tem **dois idiomas independentes**, escolhidos em Settings › Settings e guardados com o tema
@@ -107,3 +116,122 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
 - **Partes de uma janela são abas dela, não itens do menu** (DNS Zones: Zones, Records, Zone File;
   DHCP Server: …, History, Statistics). Item novo no menu só para uma janela que o operador abre
   por si.
+
+## Janela de lista e modal de adicionar (padrão aprovado, G0.24)
+
+Toda janela que lista itens configuráveis (endereços, regras, pools, estáticas, concessões…)
+segue este padrão; a referência é IP › Addresses (G1.28). Os componentes são reutilizáveis (não
+copie o código de uma janela para outra).
+
+**Barra de ações**, nesta ordem, com ícone e dica:
+
+| Botão | Ação | Cinza quando |
+|---|---|---|
+| **+** | abre o modal de adicionar | o roteador não tem o comando `…add` |
+| **−** | remove a seleção (com confirmação se for mais de um) | nada selecionado; item dinâmico (DHCP, RA) que não se remove |
+| **✓** | ativa a seleção | nada desativado selecionado |
+| **✗** | desativa a seleção (fica na config, sai do kernel) | nada ativo selecionado; item sem `disabled` |
+| **💬** | comenta a seleção | nada selecionado |
+
+Depois dos botões: os filtros em selos (família, origem, estado…) e o Find à direita. Botão
+cinza diz por quê na dica (a regra vem do engine: `enabled`/`disabledReason`).
+
+**Tabela:** selo de **estado** (`active`, `disabled`, `invalid`, `tentative`…) e de **origem**
+(`static`, `dhcp`, `ra`, …) no lugar das flags de letra do RouterOS (que continuam no terminal);
+interface e VRF em selo colorido por chave; item desativado em cinza; rodapé com contagens
+(total, por estado, por família). Duplo clique abre o mesmo modal preenchido (editar); clique
+direito: copiar, copiar como comando (CoreRouter e RouterOS), ativar/desativar, remover.
+
+**Modal de adicionar e editar:**
+
+- **ⓘ em cada rótulo** e no título da janela, abrindo a explicação no idioma configurado (o que
+  é, quando mudar, cuidado, padrão recomendado, RFC). Rótulos em inglês, explicações em português.
+- **Campos calculados** ao digitar (rede, broadcast e hosts de um endereço; quantos itens uma
+  faixa gera), sem regra na UI: o engine calcula (comando de consulta ou de pré-visualização).
+- **Cadastro em série** quando faz sentido (faixa, lista colada, contador): gera vários itens
+  numa **transação só**, com teto e aviso acima dele.
+- **Checagens antes de aplicar**, com selo `ok`/`aviso`/`erro` e o motivo: conflito e
+  sobreposição com o que existe, uso na rede quando dá para conferir (ARP, RFC 5227), e o
+  **risco de perder o acesso** (mexer na interface por onde a sessão chega pede confirmação e
+  sugere o Safe Mode).
+- **Prévia dos comandos** que serão aplicados.
+- Botões **Cancel**, **Apply** (aplica e mantém aberto) e **OK** (aplica e fecha); Enter = OK,
+  Esc = Cancel. Erro do engine aparece no modal, junto do campo, sem fechar.
+
+### Como adotar (API dos componentes)
+
+Código: `crates/ui/src/list.rs` (barra, filtros, rodapé, menu de clique direito, cópias, transação)
+e `crates/ui/src/list_modal.rs` (o modal). Nada ali decide o que um item pode: a linha que o engine
+manda diz (`disabled`, `dynamic`, motivo), e o `engine.list` diz se o comando existe e está liberado.
+
+- **Barra:** `Tools::new(&app.can(), &Cmds{add, remove, set, what}, &picked)` calcula cada botão
+  (`Ok` ou o motivo do cinza: primeiro o do roteador, depois o da seleção); `list::toolbar(ui, salt,
+  &tools, &sel, lang)` desenha **+ − ✓ ✗ 💬** e devolve um `Act`. `Item::of(linha, "id", motivo)`
+  monta o que cada linha diz de si (item dinâmico fica preso, com o motivo).
+- **Filtros:** `Filters` guarda os selos ligados por campo da linha; `filters.chips(ui, "family",
+  &[("ipv4", "IPv4"), …], lang)` desenha, `filters.shows(&linha)` filtra (E entre campos, OU dentro
+  de um). O Find (`table::find_field`) vem por último, à direita.
+- **Rodapé:** `list::footer(ui, &[(n, "addresses", tom), …], lang)`; contagem zero depois da
+  primeira some. `list::count(linhas, campo, valor)` conta.
+- **Clique direito e teclado:** dentro do `Menu::Rows` do `table::show`, `list::row_menu(ui, &tools,
+  sel, comandos_conhecidos, lang)` (abrir, copiar, copiar como comando CoreRouter e RouterOS,
+  ativar, desativar, comentar, remover); `list::from_shortcut(out.shortcut, &tools, &sel)` faz o
+  mesmo pelas teclas, só quando o botão agiria.
+- **Cópias:** `list::copy_rows` (texto das células, separado por tab) e
+  `list::copy_commands(app, "ip.address.add", &linhas, Syntax::RouterOs)` — o `add` que recria cada
+  linha, com os parâmetros que o próprio `add` do roteador declara (`corerouter_shell::recreate`,
+  `command_line`): `/ip address add address=10.0.0.1/24 interface=ether1` ou
+  `ip.address.add {"address":…}`.
+- **Transação:** `app.run_steps(passos, then)` manda vários comandos como um `engine.batch`
+  atômico (tudo ou nada); um passo só vai como ele mesmo, para a proteção de perda de acesso
+  (G2.1b) poder perguntar.
+- **Modal:** a janela descreve os campos uma vez (`Spec { panel, parent, new_title, edit_title,
+  help, fields, preview }`, cada `Field { param, label, help, input, edit }`), abre com
+  `Modal::open(app, item, valores)` e, no `dialogs` do painel, chama `modal.show(app, ctx, area,
+  &SPEC, &opções)` até ele devolver `false`. O painel repassa ao modal a resposta da pré-visualização
+  (`arrived` com a chave `list_modal::PREVIEW`) e a do Apply/OK (`reply` com `list_modal::Applied`).
+
+**O comando de pré-visualização** (consulta do engine, um por janela) recebe os mesmos parâmetros do
+`add`, todos opcionais, mais `id` ao editar, e nunca falha por entrada ruim (vira checagem `error`):
+
+```text
+{ computed: [{label, value}],                 campos calculados
+  checks:   [{level, check, message, param?}], ok | warning | error | pending | info
+  commands: [{command, params}],              o que OK/Apply mandam, numa transação
+  risk?:    "por que pode cortar esta sessão" }
+```
+
+`pending` é checagem em andamento (ARP): o modal pergunta de novo em ~0,4 s. Erro com `param`
+aparece embaixo do campo; o erro do roteador ao aplicar também. `risk` pede o "Entendi" (os comandos
+vão com `force: true`) ou o botão Safe Mode.
+
+Exemplo (um painel com lista; o IP › Addresses, G1.28, é a referência completa):
+
+```rust
+const FIELDS: &[Field] = &[
+    Field { param: "address", label: "Address", help: "ip.address.address",
+            input: Input::Text("10.0.0.1/24"), edit: true },
+    Field { param: "interface", label: "Interface", help: "ip.address.interface",
+            input: Input::Choice, edit: true },
+];
+const SPEC: Spec = Spec { panel: NAME, parent: Win::Panel(WIN), new_title: "New Address",
+    edit_title: "Address", help: "ip.address", fields: FIELDS, preview: "ip.address.preview" };
+
+// window(): a barra e a tabela
+let picked: Vec<Item> = linhas_selecionadas.map(|r| Item::of(r, "id", "dynamic")).collect();
+let tools = Tools::new(&app.can(), &CMDS, &picked);
+let mut act = None;
+ui.horizontal(|ui| {
+    act = list::toolbar(ui, TABLE, &tools, &sel, app.lang.labels);
+    self.filters.chips(ui, "family", &[("ipv4", "IPv4"), ("ipv6", "IPv6")], app.lang.labels);
+    table::find_field(ui, TABLE, &mut self.table);
+});
+// … table::show(…, |ui, menu| if let Menu::Rows(sel) = menu {
+//         act = list::row_menu(ui, &tools, sel, true, l) });
+// act: Add → self.modal = Some(Modal::open(app, None, padrões)); Edit(k) → Modal::open(app, Some((k, nome)), valores)
+
+// dialogs(): o modal
+if let Some(m) = self.modal.as_mut() && !m.show(app, ctx, area, &SPEC, &|p| opções(p)) {
+    self.modal = None;
+}
+```

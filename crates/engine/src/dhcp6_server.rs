@@ -137,6 +137,14 @@ impl Session {
 
     /// Whether no delegated-prefix route is up (the data plane is the
     /// config's).
+    /// The delegated-prefix routes, as text (G1.27c: the route cache
+    /// notices when they change).
+    pub(crate) fn dhcp6_server_routes_text(&self) -> String {
+        self.ext::<Dhcp6Runtime>()
+            .map(|r| format!("{:?}", r.routes))
+            .unwrap_or_default()
+    }
+
     pub(crate) fn dhcp6_server_quiet(&self) -> bool {
         self.ext::<Dhcp6Runtime>().is_none_or(|r| r.routes.is_empty())
     }

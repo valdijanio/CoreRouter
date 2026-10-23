@@ -11,7 +11,8 @@
 //! matching prefix (§5.2.4.3 "Longest Match", RFC 4632 §5.1).
 
 use std::cmp::Ordering;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::Arc;
 use std::net::IpAddr;
 
 use corerouter_hal::Learned;
@@ -486,10 +487,64 @@ impl Session {
     }
 
     /// Every route of the candidate config (what `ip.route.list` shows;
-    /// the running one outside a transaction), with state.
-    pub(crate) fn route_lines(&mut self) -> Vec<Line> {
+    /// the running one outside a transaction), with state. From the
+    /// [`RouteCache`] when nothing it was built from changed (G1.27c).
+    pub(crate) fn route_lines(&mut self) -> Arc<Vec<Line>> {
+        self.cached_routes().0
+    }
+
+    /// The lines, their counts and the cache generation.
+    pub(crate) fn cached_routes(&mut self) -> (Arc<Vec<Line>>, Arc<Summary>, u64) {
         let base = self.store().candidate().clone();
-        self.route_lines_of(&base).1
+        let live = self.route_live(&base);
+        let mut checks: Vec<(ItemId, RouteCheck)> =
+            live.checks.iter().map(|(k, v)| (*k, v.clone())).collect();
+        checks.sort_by_key(|(k, _)| *k);
+        let key = CacheKey {
+            generation: self.store().generation(),
+            dynamic: self.dynamic_fingerprint(),
+            learned: live.learned.clone(),
+            down: live.down.clone(),
+            checks,
+        };
+        // A withheld lease route says how long ago its check failed: never
+        // kept (only on a router with a failing DHCP gateway).
+        let keep = live.withheld.is_empty();
+        if keep
+            && let Some(c) = self.ext::<RouteCache>()
+            && c.key.as_ref() == Some(&key)
+        {
+            return (Arc::clone(&c.lines), Arc::clone(&c.summary), c.generation);
+        }
+        let cfg = self.effective(&base).into_owned();
+        let lines = Arc::new(build(&cfg, &live));
+        let summary = Arc::new(Summary::of(&lines));
+        let Some(c) = self.ext_mut::<RouteCache>() else {
+            return (lines, summary, 0);
+        };
+        c.key = keep.then_some(key);
+        c.lines = Arc::clone(&lines);
+        c.summary = Arc::clone(&summary);
+        c.generation = c.generation.wrapping_add(1);
+        (lines, summary, c.generation)
+    }
+
+    /// What the DHCP and DHCPv6 clients and the DHCPv6 server add to the
+    /// config now, as a hash: the cache is rebuilt when it changes.
+    fn dynamic_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        for (id, r) in &self.dhcp.runners {
+            id.hash(&mut h);
+            format!("{:?}{:?}{:?}", r.addresses, r.routes, r.fallback).hash(&mut h);
+            (r.gw.down, r.gw.target).hash(&mut h);
+        }
+        for (id, r) in &self.dhcp6.runners {
+            id.hash(&mut h);
+            format!("{:?}{:?}{:?}", r.addresses, r.routes, r.pool.as_ref().map(|p| p.value)).hash(&mut h);
+        }
+        self.dhcp6_server_routes_text().hash(&mut h);
+        h.finish()
     }
 
     /// The effective `base` (with the DHCP routes) and its routes.
@@ -648,6 +703,79 @@ impl RouteWatch {
     }
 }
 
+/// What the lines were built from: the candidate's generation, the dynamic
+/// entries (DHCP, DHCPv6) and the live state. Equal key, same lines.
+#[derive(Debug, Clone, PartialEq)]
+struct CacheKey {
+    generation: u64,
+    dynamic: u64,
+    learned: Vec<Learned>,
+    down: Vec<IfName>,
+    checks: Vec<(ItemId, RouteCheck)>,
+}
+
+/// The counts of the whole table, kept with the lines (the window's footer
+/// asks for them every refresh: no pass over a million routes each time).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Summary {
+    pub total: usize,
+    pub active: usize,
+    pub standby: usize,
+    pub inactive: usize,
+    pub ipv4: usize,
+    pub ipv6: usize,
+    pub origins: BTreeMap<&'static str, usize>,
+    pub tables: BTreeMap<String, usize>,
+}
+
+impl Summary {
+    pub fn of(lines: &[Line]) -> Self {
+        let mut s = Self::default();
+        let mut run: Option<(&RoutingTable, usize)> = None;
+        for l in lines {
+            s.total += 1;
+            match l.state {
+                State::Active => s.active += 1,
+                State::Standby => s.standby += 1,
+                State::Inactive => s.inactive += 1,
+            }
+            if l.dst.addr().is_ipv4() {
+                s.ipv4 += 1;
+            } else {
+                s.ipv6 += 1;
+            }
+            *s.origins.entry(l.origin.as_str()).or_default() += 1;
+            // Lines come sorted by table: count each run, name it once.
+            match &mut run {
+                Some((t, n)) if *t == &l.table => *n += 1,
+                _ => {
+                    if let Some((t, n)) = run.take() {
+                        *s.tables.entry(t.to_string()).or_default() += n;
+                    }
+                    run = Some((&l.table, 1));
+                }
+            }
+        }
+        if let Some((t, n)) = run {
+            *s.tables.entry(t.to_string()).or_default() += n;
+        }
+        s
+    }
+}
+
+/// The lines of the candidate config and their counts (G1.27c): built once
+/// and kept until the config, a DHCP lease, a link or what the kernel
+/// learned changes. A million routes cost a few hundred ms to build; a read
+/// that finds them here costs only its own pass.
+#[derive(Debug, Default)]
+pub struct RouteCache {
+    key: Option<CacheKey>,
+    pub lines: Arc<Vec<Line>>,
+    pub summary: Arc<Summary>,
+    /// Bumped by every rebuild: the GUI can tell a new table from a reread.
+    pub generation: u64,
+}
+
 impl Session {
     /// Note route state changes (from `tick`, once a second).
     pub(crate) fn watch_routes(&mut self) {
@@ -704,7 +832,7 @@ impl Session {
 
     /// `route_lines`, noted by the watch too (`ip.route.list` and the
     /// lookup see the change at once, not at the next tick).
-    pub(crate) fn watched_route_lines(&mut self) -> (Vec<Line>, Option<u64>) {
+    pub(crate) fn watched_route_lines(&mut self) -> (Arc<Vec<Line>>, Option<u64>) {
         let lines = self.route_lines();
         let now = self.now();
         if let Some(now) = now {

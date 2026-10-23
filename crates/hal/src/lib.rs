@@ -5,13 +5,17 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod cgnat;
 pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
 pub mod drift;
 pub mod icmp_ext;
+pub mod lab_conntrack;
+pub mod lab_flow;
 pub mod nic;
 pub mod probe;
+pub mod resources;
 pub mod route_get;
 pub mod sff;
 pub mod sim;
@@ -430,6 +434,69 @@ pub trait Hal: Send {
     fn kernel_stats(&mut self) -> Result<tuning::KernelStats, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no kernel counters",
+            self.describe()
+        )))
+    }
+
+    /// The connection tracking table (G2.2), at most `conntrack::MAX_READ`.
+    fn connections(&mut self) -> Result<Vec<conntrack::Conn>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking",
+            self.describe()
+        )))
+    }
+
+    /// How full the table is and its trouble counters (G2.2).
+    fn connection_stats(&mut self) -> Result<conntrack::Stats, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking",
+            self.describe()
+        )))
+    }
+
+    /// Set or remove CGNAT port blocks (G2.3c): elements of a blocks-mode
+    /// pool's map, kept across a replace of the table.
+    fn cgnat_blocks(&mut self, changes: &[cgnat::BlockChange]) -> Result<(), HalError> {
+        let _ = changes;
+        Err(HalError::Unsupported(format!(
+            "{} has no CGNAT data plane",
+            self.describe()
+        )))
+    }
+
+    /// Subscribers of blocks-mode pools that want a block and have no
+    /// queue to ask through (the lab's pretend online subscribers).
+    fn cgnat_waiting(&mut self) -> Vec<cgnat::Waiting> {
+        Vec::new()
+    }
+
+    /// The queue of first packets of subscribers without a block (G2.3c).
+    fn cgnat_queue(&mut self) -> Result<Box<dyn cgnat::CgnatQueue>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no packet queue",
+            self.describe()
+        )))
+    }
+
+    /// Remove these connections; how many went (G2.2).
+    fn connections_kill(&mut self, conns: &[conntrack::Conn]) -> Result<usize, HalError> {
+        let _ = conns;
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking",
+            self.describe()
+        )))
+    }
+
+    /// CPU, memory and conntrack readings for the graphs (G4.5), taken
+    /// every second: `None` where the platform has none.
+    fn resources(&mut self) -> Option<resources::Resources> {
+        None
+    }
+
+    /// A live feed of conntrack events for the flow exporter (G4.4b).
+    fn conntrack_events(&mut self) -> Result<Box<dyn conntrack::EventSource>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking events",
             self.describe()
         )))
     }

@@ -1114,6 +1114,7 @@ dependencies = [
  "corerouter-model",
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
+ "corerouter-proto-flow",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",
  "corerouter-proto-ntp",
@@ -1167,6 +1168,7 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-discovery",
  "corerouter-proto-dns",
+ "corerouter-proto-flow",
  "corerouter-proto-mpls",
  "corerouter-proto-ospf",
  "criterion",
@@ -1327,6 +1329,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "corerouter-proto-flow"
+version = "0.1.0"
+dependencies = [
+ "corerouter-hal",
+ "criterion",
+ "proptest",
+ "serde",
+]
+
+[[package]]
 name = "corerouter-proto-lldp"
 version = "0.1.0"
 dependencies = [
@@ -1404,6 +1416,7 @@ dependencies = [
  "corerouter-hal",
  "corerouter-model",
  "corerouter-proto-dns",
+ "corerouter-proto-flow",
  "corerouter-shell",
  "criterion",
  "egui",

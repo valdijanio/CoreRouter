@@ -51,6 +51,9 @@ pub struct System {
     /// `system.tuning.*` (G1.26): kernel and hardware settings.
     #[serde(skip_serializing_if = "crate::tuning::Tuning::is_default")]
     pub tuning: crate::tuning::Tuning,
+    /// `/tool graphing` (G4.5): what the traffic history keeps.
+    #[serde(skip_serializing_if = "crate::graphing::Graphing::is_default")]
+    pub graphing: crate::graphing::Graphing,
 }
 
 impl Default for System {
@@ -61,6 +64,7 @@ impl Default for System {
             logging: Logging::default(),
             metrics: MetricsService::default(),
             tuning: crate::tuning::Tuning::default(),
+            graphing: crate::graphing::Graphing::default(),
         }
     }
 }
@@ -280,6 +284,9 @@ pub struct Ip {
     /// `/ip firewall cgnat` (G2.3): CGNAT pools and 1:1 exceptions.
     #[serde(skip_serializing_if = "crate::cgnat::Cgnat::is_empty")]
     pub cgnat: crate::cgnat::Cgnat,
+    /// `/ip traffic-flow` (G4.4b): IPFIX / NetFlow v9 export.
+    #[serde(skip_serializing_if = "crate::traffic_flow::TrafficFlow::is_default")]
+    pub traffic_flow: crate::traffic_flow::TrafficFlow,
 }
 
 impl Ip {

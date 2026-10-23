@@ -18,6 +18,9 @@ fn frames(c: &mut Criterion) {
     g.bench_function("addresses_1k_4kB_comments", |b| b.iter(|| f.frame()));
     let mut f = Frames::firewall(5_000);
     g.bench_function("firewall_5k_shadowed", |b| b.iter(|| f.frame()));
+    // G1.27c: a full BGP table in IP › Routes.
+    let mut f = Frames::routes(1_000_000);
+    g.bench_function("routes_1m", |b| b.iter(|| f.frame()));
     let mut f = Frames::terminal(5_000, 200);
     g.bench_function("terminal_5000_lines", |b| b.iter(|| f.frame()));
     g.finish();

@@ -19,6 +19,7 @@ corerouter-proto-cgnat.workspace = true
 corerouter-proto-dns.workspace = true
 corerouter-proto-dhcp.workspace = true
 corerouter-proto-discovery.workspace = true
+corerouter-proto-flow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -48,7 +49,15 @@ name = "scale"
 harness = false
 
 [[bench]]
+name = "routes_full"
+harness = false
+
+[[bench]]
 name = "dhcp_round"
+harness = false
+
+[[bench]]
+name = "graph"
 harness = false
 
 [[bench]]

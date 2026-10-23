@@ -51,6 +51,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         has_pools,
         pool_remove
     ),
+    cmd!(query "ip.firewall.cgnat.pool.preview", "Preview CGNAT Pool", [], None,
+        "{id?: *hex | name (the pool being edited), name?: string, inside?: [string] | string, outside?: [string] | string, mode?: string, ports_per_subscriber?: u16, port_range?: string, max_blocks?: u8, block_timeout?: duration, out_interface?: string, endpoint_independent_mapping?: bool, endpoint_independent_filtering?: bool, hairpin?: bool, alert_percent?: u8, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level (ok, warning, error), check, message, param?}], commands: [{command, params}]} (what add/set would do; bad input is an error check, never a failure)",
+        always, pool_preview),
     cmd!(query "ip.firewall.cgnat.pool.list", "CGNAT Pools", ["IP", "Firewall"], None,
         "{} → [{id, name, mode, disabled, inside: [string], outside: [string], ports_per_subscriber, port_range, max_blocks, block_timeout, out_interface?, endpoint_independent_mapping, endpoint_independent_filtering, hairpin, alert_percent, comment?, subscribers, public_addresses, per_address (subscribers or blocks per public address), capacity, public_used, checks: [{label, level, text}]}]",
         always, pool_list),
@@ -81,6 +84,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         has_exceptions,
         exception_remove
     ),
+    cmd!(query "ip.firewall.cgnat.exception.preview", "Preview CGNAT Exception", [], None,
+        "{id?: *hex, subscriber?: ipv4, public?: ipv4, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param?}], commands: [{command, params}]}",
+        always, exception_preview),
     cmd!(query "ip.firewall.cgnat.exception.list", "CGNAT Exceptions", [], None,
         "{} → [{id, subscriber, public, disabled, comment?, pool? (the pool the subscriber would otherwise use), checks: [{label, level, text}]}]",
         always, exception_list),
@@ -143,8 +149,19 @@ fn ranges(p: &Value, key: &str) -> Result<Option<Vec<Range>>> {
         .map(Some)
 }
 
+/// An integer in `lo..=hi`, given as a number or as its digits (the
+/// list window's modal sends text).
 fn opt_small(p: &Value, key: &str, lo: u32, hi: u32) -> Result<Option<u32>> {
-    match opt_u32(p, key)? {
+    let n = match p.get(key) {
+        Some(Value::String(t)) if t.trim().is_empty() => None,
+        Some(Value::String(t)) => Some(
+            t.trim()
+                .parse::<u32>()
+                .map_err(|_| EngineError::bad(key, format!("must be {lo}..={hi}")))?,
+        ),
+        _ => opt_u32(p, key)?,
+    };
+    match n {
         Some(n) if !(lo..=hi).contains(&n) => {
             Err(EngineError::bad(key, format!("must be {lo}..={hi}")))
         }
@@ -347,6 +364,179 @@ fn pool_remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({"id": pool.id, "name": pool.name}))
 }
 
+/// A check of a preview.
+fn preview_check(level: &str, check: &str, message: &str, param: Option<&str>) -> Value {
+    let mut v = json!({"level": level, "check": check, "message": message});
+    if let (Some(p), Some(o)) = (param, v.as_object_mut()) {
+        o.insert("param".into(), json!(p));
+    }
+    v
+}
+
+/// The checks of item `kind[id]` in `cfg`, as preview checks (the field
+/// each is about is the last part of its path).
+fn preview_checks(cfg: &corerouter_model::Config, kind: &str, id: ItemId) -> Vec<Value> {
+    let mine = about(kind, id);
+    checks::checks(cfg)
+        .iter()
+        .filter(|c| mine(c))
+        .map(|c| {
+            let level = match c.level {
+                Level::Ok => "ok",
+                Level::Warn => "warning",
+                Level::Error => "error",
+            };
+            preview_check(level, c.label, &c.text, c.path.rsplit('.').next())
+        })
+        .collect()
+}
+
+fn bad_param(e: EngineError) -> Value {
+    match e {
+        EngineError::BadParam { param, reason } => preview_check("error", "parameter", &reason, Some(&param)),
+        other => preview_check("error", "parameter", &other.to_string(), None),
+    }
+}
+
+/// The params a command gets from the modal's: empty texts dropped (a
+/// blank optional field keeps the default or the current value).
+fn sent(p: &Value) -> Value {
+    let Some(o) = p.as_object() else { return json!({}) };
+    Value::Object(
+        o.iter()
+            .filter(|(_, v)| !matches!(v, Value::String(t) if t.trim().is_empty()))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    )
+}
+
+fn pool_preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let p = &sent(p);
+    let cand = s.store().candidate().clone();
+    let editing = match opt_str(p, "id")? {
+        None => None,
+        Some(_) => match pool_index(s, p) {
+            Ok(i) => cand.ip.cgnat.pools.get(i).cloned(),
+            Err(e) => return Ok(json!({"computed": [], "checks": [bad_param(e)], "commands": []})),
+        },
+    };
+    let mut pool = match &editing {
+        Some(old) => old.clone(),
+        None => {
+            let name = opt_str(p, "name")?.unwrap_or("").trim().to_owned();
+            if name.is_empty() {
+                return Ok(json!({"computed": [], "checks": [preview_check("error", "name", "a name is required", Some("name"))], "commands": []}));
+            }
+            match serde_json::from_value::<Pool>(json!({"id": "*ffffffff", "name": name, "inside": [], "outside": []})) {
+                Ok(d) => d,
+                Err(e) => return Ok(json!({"computed": [], "checks": [preview_check("error", "name", &e.to_string(), Some("name"))], "commands": []})),
+            }
+        }
+    };
+    if let Err(e) = apply_pool(&mut pool, p) {
+        return Ok(json!({"computed": [], "checks": [bad_param(e)], "commands": []}));
+    }
+    let mut checks_out = Vec::new();
+    for key in ["inside", "outside"] {
+        if editing.is_none() && p.get(key).is_none() {
+            checks_out.push(preview_check("error", key, "is required", Some(key)));
+        }
+    }
+    if cand.ip.cgnat.pools.iter().any(|q| q.name == pool.name && Some(q.id) != editing.as_ref().map(|e| e.id)) {
+        checks_out.push(preview_check("error", "name", &format!("pool '{}' exists", pool.name), Some("name")));
+    }
+    let mut cfg = cand.clone();
+    match &editing {
+        Some(old) => {
+            if let Some(slot) = cfg.ip.cgnat.pools.iter_mut().find(|q| q.id == old.id) {
+                *slot = pool.clone();
+            }
+        }
+        None => cfg.ip.cgnat.pools.push(pool.clone()),
+    }
+    if checks_out.is_empty() {
+        checks_out.extend(preview_checks(&cfg, "pools", pool.id));
+    }
+    let mut computed = Vec::new();
+    if let Ok(l) = pool.layout() {
+        for (label, value) in [
+            ("Subscribers", l.subscribers().to_string()),
+            ("Public addresses", l.public_addresses().to_string()),
+            ("Per public address", l.per_address().to_string()),
+            ("Capacity", l.capacity().to_string()),
+            ("Public addresses used", l.public_used().to_string()),
+        ] {
+            computed.push(json!({"label": label, "value": value}));
+        }
+    }
+    if let Some(old) = &editing {
+        computed.push(json!({"label": "Subscribers remapped", "value": remapped(old, &pool).to_string()}));
+    }
+    let error = checks_out.iter().any(|c| c["level"] == "error");
+    let commands = if error {
+        Vec::new()
+    } else {
+        let command = if editing.is_some() { "ip.firewall.cgnat.pool.set" } else { "ip.firewall.cgnat.pool.add" };
+        vec![json!({"command": command, "params": p})]
+    };
+    Ok(json!({"computed": computed, "checks": checks_out, "commands": commands}))
+}
+
+fn exception_preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let p = &sent(p);
+    let cand = s.store().candidate().clone();
+    let editing = match opt_str(p, "id")? {
+        None => None,
+        Some(_) => match exception_index(s, p) {
+            Ok(i) => cand.ip.cgnat.exceptions.get(i).cloned(),
+            Err(e) => return Ok(json!({"computed": [], "checks": [bad_param(e)], "commands": []})),
+        },
+    };
+    let mut e = editing.clone().unwrap_or(Exception {
+        id: ItemId(u32::MAX),
+        subscriber: Ipv4Addr::UNSPECIFIED,
+        public: Ipv4Addr::UNSPECIFIED,
+        disabled: false,
+        comment: String::new(),
+    });
+    if let Err(err) = exception_apply(&mut e, p) {
+        return Ok(json!({"computed": [], "checks": [bad_param(err)], "commands": []}));
+    }
+    let mut checks_out = Vec::new();
+    for key in ["subscriber", "public"] {
+        if editing.is_none() && p.get(key).is_none() {
+            checks_out.push(preview_check("error", key, "is required", Some(key)));
+        }
+    }
+    let mut cfg = cand.clone();
+    match &editing {
+        Some(old) => {
+            if let Some(slot) = cfg.ip.cgnat.exceptions.iter_mut().find(|x| x.id == old.id) {
+                *slot = e.clone();
+            }
+        }
+        None => cfg.ip.cgnat.exceptions.push(e.clone()),
+    }
+    if checks_out.is_empty() {
+        checks_out.extend(preview_checks(&cfg, "exceptions", e.id));
+    }
+    let mut computed = Vec::new();
+    if let Some(pool) = cand.ip.cgnat.pool_of(e.subscriber) {
+        computed.push(json!({"label": "Pool", "value": pool.name}));
+        if let Some(slot) = pool.layout().ok().and_then(|l| l.forward(e.subscriber)) {
+            computed.push(json!({"label": "Slot kept empty", "value": slot.to_string()}));
+        }
+    }
+    let error = checks_out.iter().any(|c| c["level"] == "error");
+    let commands = if error {
+        Vec::new()
+    } else {
+        let command = if editing.is_some() { "ip.firewall.cgnat.exception.set" } else { "ip.firewall.cgnat.exception.add" };
+        vec![json!({"command": command, "params": p})]
+    };
+    Ok(json!({"computed": computed, "checks": checks_out, "commands": commands}))
+}
+
 fn pool_list(s: &mut Session, _: &Value) -> Result<Value> {
     let cand = s.store().candidate();
     let all = checks::checks(cand);
@@ -528,7 +718,7 @@ fn lookup(s: &mut Session, p: &Value) -> Result<Value> {
     if pool.mode == Mode::Blocks {
         return Err(EngineError::bad(
             "subscriber",
-            format!("pool '{}' hands out blocks on demand: see ip.firewall.cgnat.block.list", pool.name),
+            format!("pool '{}' hands out blocks on demand: see ip.firewall.cgnat.block.list subscriber={sub}", pool.name),
         ));
     }
     let slot = pool

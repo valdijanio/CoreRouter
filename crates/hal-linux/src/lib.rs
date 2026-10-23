@@ -74,6 +74,10 @@ pub mod ctnl;
 #[cfg(target_os = "linux")]
 mod cgnat;
 
+/// The netfilter queue of first packets of blocks-mode subscribers
+/// (G2.3c): codec pure, socket Linux.
+pub mod nfqueue;
+
 #[cfg(target_os = "linux")]
 pub mod l2;
 
@@ -159,6 +163,8 @@ mod linux {
         /// CPU settings of `system.tuning.cpu` (holds the PM QoS request
         /// and the watchdog open while the daemon runs).
         cpu: crate::cpu_tuning::Cpu,
+        /// CGNAT blocks installed in the kernel (G2.3c).
+        cgnat_blocks: crate::cgnat::Blocks,
         /// The XDP filter (G2.5a); nothing loaded until configured.
         xdp: crate::xdp::XdpState,
     }
@@ -407,7 +413,10 @@ mod linux {
             }
             // CGNAT (G2.3): its own table, replaced whole in one batch.
             let cgnat = corerouter_firewall::cgnat::changed(&from.ip.cgnat, &to.ip.cgnat);
-            if cgnat && let Err(e) = crate::cgnat::apply(&from.ip.cgnat, &to.ip.cgnat) {
+            if cgnat
+                && let Err(e) =
+                    crate::cgnat::apply(&from.ip.cgnat, &to.ip.cgnat, &mut self.cgnat_blocks)
+            {
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -417,8 +426,11 @@ mod linux {
                 }
                 return Err(e);
             }
-            let undo_cgnat = || {
-                if cgnat && let Err(back) = crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat) {
+            let undo_cgnat = |me: &mut Self| {
+                if cgnat
+                    && let Err(back) =
+                        crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat, &mut me.cgnat_blocks)
+                {
                     log::error!("restoring the previous CGNAT table: {back}");
                 }
             };
@@ -430,7 +442,7 @@ mod linux {
             let root = self.sysctl.root.clone();
             let cpu = (&from.system.tuning.cpu, &to.system.tuning.cpu);
             if let Err(e) = self.cpu.transition(cpu.0, cpu.1, &root) {
-                undo_cgnat();
+                undo_cgnat(self);
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -463,7 +475,7 @@ mod linux {
             });
             if let Err(e) = tuned {
                 undo_cpu(self);
-                undo_cgnat();
+                undo_cgnat(self);
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -516,7 +528,7 @@ mod linux {
                         log::error!("restoring kernel parameters: {back}");
                     }
                     undo_cpu(self);
-                    undo_cgnat();
+                    undo_cgnat(self);
                     if firewall {
                         // The links went back to `from`: so does the firewall.
                         let dynamic = crate::nft::dynamic();
@@ -587,6 +599,43 @@ mod linux {
 
         fn sysctls(&mut self, names: &[&str]) -> Result<Sysctls, HalError> {
             Ok(self.sysctl.root.sysctls(names))
+        }
+
+        fn cgnat_blocks(
+            &mut self,
+            changes: &[corerouter_hal::cgnat::BlockChange],
+        ) -> Result<(), HalError> {
+            crate::cgnat::set_blocks(changes, &mut self.cgnat_blocks)
+        }
+
+        fn cgnat_queue(&mut self) -> Result<Box<dyn corerouter_hal::cgnat::CgnatQueue>, HalError> {
+            crate::nfqueue::Queue::open(corerouter_hal::cgnat::QUEUE_NUM)
+                .map(|q| Box::new(q) as Box<dyn corerouter_hal::cgnat::CgnatQueue>)
+        }
+
+        fn connections(&mut self) -> Result<Vec<corerouter_hal::conntrack::Conn>, HalError> {
+            crate::ctnl::dump()
+        }
+
+        fn connection_stats(&mut self) -> Result<corerouter_hal::conntrack::Stats, HalError> {
+            crate::ctnl::stats()
+        }
+
+        fn conntrack_events(
+            &mut self,
+        ) -> Result<Box<dyn corerouter_hal::conntrack::EventSource>, HalError> {
+            Ok(Box::new(crate::ctnl::Events::open()?))
+        }
+
+        fn connections_kill(
+            &mut self,
+            conns: &[corerouter_hal::conntrack::Conn],
+        ) -> Result<usize, HalError> {
+            crate::ctnl::delete(conns)
+        }
+
+        fn resources(&mut self) -> Option<corerouter_hal::resources::Resources> {
+            Some(self.sysctl.root.resources())
         }
 
         fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {

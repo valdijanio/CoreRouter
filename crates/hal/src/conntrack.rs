@@ -32,6 +32,7 @@ pub struct Tuple {
     pub dst: IpAddr,
     /// TCP/UDP/SCTP ports, or the ICMP query id in `src_port` (0 otherwise).
     pub src_port: u16,
+    /// The destination port; for ICMP, type and code (`type << 8 | code`).
     pub dst_port: u16,
 }
 
@@ -134,3 +135,64 @@ pub struct Stats {
 /// What `connections` reads at most (a CGNAT box holds millions; the
 /// engine filters and pages what comes back).
 pub const MAX_READ: usize = 2_000_000;
+
+/// What a conntrack event says happened (ctnetlink multicast groups
+/// `NFNLGRP_CONNTRACK_NEW` and `NFNLGRP_CONNTRACK_DESTROY`; G4.4b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EventKind {
+    /// The connection was confirmed (its first packet left the stack):
+    /// the NAT mapping is decided by now.
+    New,
+    /// The connection ended (closed or timed out); the counters are final.
+    Destroy,
+}
+
+/// One conntrack event, as the flow exporter reads it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Event {
+    pub kind: EventKind,
+    pub conn: Conn,
+    /// `CTA_TIMESTAMP_START`/`_STOP`, Unix nanoseconds, when the kernel
+    /// stamps connections (`net.netfilter.nf_conntrack_timestamp=1`).
+    pub start_ns: Option<u64>,
+    pub stop_ns: Option<u64>,
+}
+
+/// A live feed of conntrack events (G4.4b): the kernel's, or the lab's.
+/// Its own sockets, used outside the session lock by the flow exporter.
+pub trait EventSource: Send {
+    /// Append the events that arrive within `wait_ms` (at most `max`) to
+    /// `out`. Events the kernel could not deliver (a full socket buffer:
+    /// `ENOBUFS`) are counted in [`EventSource::lost`], not an error.
+    fn recv(
+        &mut self,
+        wait_ms: u32,
+        max: usize,
+        out: &mut Vec<Event>,
+    ) -> Result<(), crate::HalError>;
+
+    /// A reader of the whole table, for the active and inactive timeouts
+    /// (used from another thread than `recv`).
+    fn table_reader(&self) -> Box<dyn TableReader>;
+
+    /// What feeds it, for people: `conntrack` (the kernel) or `lab`.
+    fn name(&self) -> &'static str {
+        "conntrack"
+    }
+
+    /// Times the kernel dropped events since the source opened.
+    fn lost(&self) -> u64;
+
+    /// Whether the kernel counts bytes and packets of connections, and
+    /// stamps their start and end (`None`: not known).
+    fn accounting(&self) -> (Option<bool>, Option<bool>) {
+        (None, None)
+    }
+}
+
+/// Reads the whole conntrack table (at most [`MAX_READ`]): the
+/// connections and whether the read reached the end.
+pub trait TableReader: Send {
+    fn read(&mut self) -> Result<(Vec<Conn>, bool), crate::HalError>;
+}

@@ -280,6 +280,24 @@ fn subscribers_leave_with_their_formula_address_and_ports() {
         );
     }
 
+    // The Connections window's view of it (G2.2): the kernel's table over
+    // ctnetlink, with the translation and the table's size.
+    let conns = hal.connections().unwrap();
+    let udp = conns
+        .iter()
+        .find(|c| c.orig.src_port == 40000 && c.protocol == 17)
+        .expect("the UDP connection is in the table");
+    assert!(udp.has(status::SRC_NAT));
+    assert!(l.forward("100.64.0.1".parse().unwrap()).unwrap().contains(
+        match udp.reply.dst {
+            std::net::IpAddr::V4(a) => a,
+            std::net::IpAddr::V6(_) => panic!(),
+        },
+        udp.reply.dst_port
+    ));
+    let st = hal.connection_stats().unwrap();
+    assert!(st.count >= 1 && st.max > 0, "{st:?}");
+
     // TCP from the same subscriber stays in the same slot (RFC 6888 REQ-2).
     let listener = lab
         .net
@@ -529,6 +547,7 @@ fn a_refused_batch_changes_nothing() {
                 set: "nope".into(),
                 sreg: corerouter_firewall::program::REG_1,
                 dreg: None,
+                inv: false,
             },
         );
     }
@@ -536,4 +555,101 @@ fn a_refused_batch_changes_nothing() {
     assert!(err.to_string().contains("nothing changed"), "{err}");
     assert_eq!(map_text("d_1"), before, "the old table is intact");
     hal.apply(&c, &Config::default()).unwrap();
+}
+
+/// Blocks mode (G2.3c): the first packet of a subscriber without a block
+/// waits in the netfilter queue. With nobody serving the queue it is
+/// dropped (never let out untranslated); served, the block is put in the
+/// map and the packet leaves inside it; a replace of the table keeps it.
+#[test]
+fn blocks_mode_holds_the_first_packet_until_a_block_is_given() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab();
+    let mut p = pool(1000);
+    p.mode = corerouter_model::cgnat::Mode::Blocks;
+    p.endpoint_independent_mapping = false;
+    let l = p.layout().unwrap();
+    let c = cfg(p.clone(), vec![]);
+    let hal = std::sync::Arc::new(std::sync::Mutex::new(LinuxHal::new()));
+    hal.lock().unwrap().apply(&Config::default(), &c).unwrap();
+    let text = run(Command::new("nft").args(["list", "chain", "ip", "corerouter_cgnat", "blocks"]));
+    assert!(
+        text.contains("queue to 7422") || text.contains("queue num 7422"),
+        "{text}"
+    );
+
+    // Nobody serves the queue: the packet is dropped.
+    let server = lab
+        .net
+        .within(|| UdpSocket::bind("192.0.2.2:7700").unwrap());
+    server
+        .set_read_timeout(Some(Duration::from_millis(800)))
+        .unwrap();
+    lab.subs.within(|| {
+        UdpSocket::bind("100.64.0.65:43000")
+            .unwrap()
+            .send_to(b"x", "192.0.2.2:7700")
+            .unwrap();
+    });
+    let mut buf = [0u8; 8];
+    assert!(
+        server.recv_from(&mut buf).is_err(),
+        "no block, no listener: dropped, not leaked"
+    );
+
+    // Serve it: allocate block 3 of the first public address.
+    let mut q = hal.lock().unwrap().cgnat_queue().unwrap();
+    let slot = l.block(0, 3).unwrap();
+    let h2 = hal.clone();
+    let serving = std::thread::spawn(move || {
+        let pending = loop {
+            if let Some(p) = q.recv(Duration::from_secs(5)).unwrap() {
+                break p;
+            }
+        };
+        h2.lock()
+            .unwrap()
+            .cgnat_blocks(&[corerouter_hal::cgnat::BlockChange {
+                pool: ItemId(1),
+                subscriber: pending.subscriber,
+                slot: Some(slot),
+            }])
+            .unwrap();
+        q.verdict(pending.id, true).unwrap();
+        pending.subscriber
+    });
+    lab.subs.within(|| {
+        UdpSocket::bind("100.64.0.65:43001")
+            .unwrap()
+            .send_to(b"y", "192.0.2.2:7700")
+            .unwrap();
+    });
+    let (_, seen) = server.recv_from(&mut buf).expect("the held packet went on");
+    assert_eq!(serving.join().unwrap(), Ipv4Addr::new(100, 64, 0, 65));
+    let SocketAddr::V4(seen) = seen else { panic!() };
+    assert!(
+        slot.contains(*seen.ip(), seen.port()),
+        "{seen} outside {slot}"
+    );
+
+    // A change that rebuilds the table (an exception adds maps) keeps the
+    // block in the map.
+    let ex = Exception {
+        id: ItemId(9),
+        subscriber: "100.64.0.9".parse().unwrap(),
+        public: "198.51.100.9".parse().unwrap(),
+        disabled: false,
+        comment: String::new(),
+    };
+    let c2 = cfg(p, vec![ex]);
+    hal.lock().unwrap().apply(&c, &c2).unwrap();
+    assert!(
+        map_text("d_1").contains("100.64.0.65 : 203.0.113.0 . 4024-5023"),
+        "{}",
+        map_text("d_1")
+    );
+    hal.lock().unwrap().apply(&c2, &Config::default()).unwrap();
 }

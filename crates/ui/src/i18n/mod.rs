@@ -22,13 +22,20 @@
 //! (`prefs.rs`).
 
 mod dns_lookup_pt;
+mod cgnat_en;
+mod cgnat_pt;
+mod connections_en;
+mod connections_pt;
 mod en;
+mod list_pt;
 mod menu_en;
 mod menu_pt;
 mod pt;
 mod routes_pt;
 mod tuning_en;
 mod tuning_pt;
+mod traffic_flow_en;
+mod traffic_flow_pt;
 mod xdp_en;
 mod xdp_pt;
 
@@ -72,7 +79,11 @@ impl Lang {
                 tuning_pt::LABELS,
                 menu_pt::LABELS,
                 routes_pt::LABELS,
+                connections_pt::LABELS,
+                cgnat_pt::LABELS,
                 dns_lookup_pt::LABELS,
+                list_pt::LABELS,
+                traffic_flow_pt::LABELS,
                 xdp_pt::LABELS,
             ],
         }
@@ -81,8 +92,8 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, xdp_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, xdp_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, cgnat_en::HELP, traffic_flow_en::HELP, xdp_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, cgnat_pt::HELP, traffic_flow_pt::HELP, xdp_pt::HELP],
         }
     }
 
@@ -177,8 +188,20 @@ mod tests {
                 for t in tables {
                     sorted_unique(&format!("{l:?} {what}"), t);
                 }
-                let all = keys(tables);
-                sorted_unique(&format!("{l:?} {what} (all tables)"), &all.iter().map(|k| (*k, "")).collect::<Vec<_>>());
+                // Across tables a key may repeat (two features both say "of"), as long
+                // as the text is the same: lookup takes the first, so only a different
+                // text would make one window show the other's word. Parallel PRs kept
+                // colliding on identical entries ("changed", "of", 2026-10-23).
+                let mut all: Vec<(&str, &str)> = tables.iter().flat_map(|t| t.iter().copied()).collect();
+                all.sort_unstable();
+                for w in all.windows(2) {
+                    if let [(a, ta), (b, tb)] = w {
+                        assert!(
+                            a != b || ta == tb,
+                            "{l:?} {what}: {a:?} has two different texts across tables: {ta:?} and {tb:?}"
+                        );
+                    }
+                }
             }
         }
     }
@@ -234,6 +257,13 @@ mod tests {
                 assert_eq!(places(en), places(pt), "{key}");
                 ids.push(key);
             }
+        }
+        for (id, en) in corerouter_engine::dns_upstreams::TEXTS {
+            let key = format!("dnsbench.{id}");
+            let pt = lookup(Lang::Pt.templates(), &key)
+                .unwrap_or_else(|| panic!("dns_lookup_pt.rs lacks {key}"));
+            assert_eq!(places(en), places(pt), "{key}");
+            ids.push(key);
         }
         for (id, en) in corerouter_engine::dns_lookup::WHY_TEXTS {
             let key = format!("dnswhy.{id}");
