@@ -1,0 +1,17 @@
+[package]
+name = "corerouter-cgnat-map"
+description = "L0: the deterministic CGNAT port arithmetic (RFC 7422), no_std and pure, shared by the model's Layout and the XDP fast path (G2.5b) so there is one formula"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
