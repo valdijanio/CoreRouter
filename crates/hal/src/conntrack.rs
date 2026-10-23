@@ -175,8 +175,19 @@ pub trait EventSource: Send {
     /// (used from another thread than `recv`).
     fn table_reader(&self) -> Box<dyn TableReader>;
 
-    /// Events the kernel dropped since the source opened.
+    /// What feeds it, for people: `conntrack` (the kernel) or `lab`.
+    fn name(&self) -> &'static str {
+        "conntrack"
+    }
+
+    /// Times the kernel dropped events since the source opened.
     fn lost(&self) -> u64;
+
+    /// Whether the kernel counts bytes and packets of connections, and
+    /// stamps their start and end (`None`: not known).
+    fn accounting(&self) -> (Option<bool>, Option<bool>) {
+        (None, None)
+    }
 }
 
 /// Reads the whole conntrack table (at most [`MAX_READ`]): the

@@ -112,6 +112,7 @@ fn bench(c: &mut Criterion) {
                 refresh_packets: 20,
                 stream: false,
                 boot_ms: 0,
+                nat_destination: false,
             });
             let mut out = Vec::new();
             b.iter(|| {

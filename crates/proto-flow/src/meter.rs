@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry as Slot;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use corerouter_hal::conntrack::{Conn, Event, EventKind, Tuple, status};
 
@@ -39,6 +39,10 @@ pub struct MeterConfig {
     pub max_entries: usize,
     pub flows: bool,
     pub nat_events: bool,
+    /// Keep the destination in NAT events (off: 0.0.0.0 and port 0, the
+    /// connection log of Marco Civil art. 13 without the application
+    /// access art. 14 forbids).
+    pub nat_destination: bool,
 }
 
 impl Default for MeterConfig {
@@ -50,6 +54,7 @@ impl Default for MeterConfig {
             max_entries: 262_144,
             flows: true,
             nat_events: true,
+            nat_destination: false,
         }
     }
 }
@@ -197,7 +202,13 @@ impl Meter {
         self.cfg.sampling <= 1 || hash(c).is_multiple_of(u64::from(self.cfg.sampling))
     }
 
-    fn nat(&mut self, c: &Conn, event: NatEventType, time_ms: u64, out: &mut Vec<Record>) {
+    fn nat(
+        &mut self,
+        c: &Conn,
+        event: NatEventType,
+        (start_ms, time_ms): (u64, u64),
+        out: &mut Vec<Record>,
+    ) {
         if !self.cfg.nat_events || !(c.has(status::SRC_NAT) || c.has(status::DST_NAT)) {
             return;
         }
@@ -207,18 +218,25 @@ impl Meter {
             return;
         };
         self.stats.nat_events += 1;
+        let keep = self.cfg.nat_destination;
+        let (dst, post_dst, dst_port, post_dst_port) = if keep {
+            (dst, post_dst, c.orig.dst_port, c.reply.src_port)
+        } else {
+            (Ipv4Addr::UNSPECIFIED, Ipv4Addr::UNSPECIFIED, 0, 0)
+        };
         out.push(Record::Nat(NatEvent {
             time_ms,
+            start_ms,
             event,
             protocol: c.protocol,
             src,
             dst,
             src_port: c.orig.src_port,
-            dst_port: c.orig.dst_port,
+            dst_port,
             post_src,
             post_dst,
             post_src_port: c.reply.dst_port,
-            post_dst_port: c.reply.src_port,
+            post_dst_port,
         }));
     }
 
@@ -293,7 +311,7 @@ impl Meter {
         match ev.kind {
             EventKind::New => {
                 let start = ns_to_ms(ev.start_ns).unwrap_or(now_ms);
-                self.nat(c, NatEventType::Nat44SessionCreate, start, out);
+                self.nat(c, NatEventType::Nat44SessionCreate, (start, start), out);
                 if !self.cfg.flows {
                     return;
                 }
@@ -324,7 +342,8 @@ impl Meter {
             }
             EventKind::Destroy => {
                 let end = ns_to_ms(ev.stop_ns).unwrap_or(now_ms);
-                self.nat(c, NatEventType::Nat44SessionDelete, end, out);
+                let began = ns_to_ms(ev.start_ns).unwrap_or(0);
+                self.nat(c, NatEventType::Nat44SessionDelete, (began, end), out);
                 let entry = self.entries.remove(&key(c));
                 if !self.cfg.flows {
                     return;

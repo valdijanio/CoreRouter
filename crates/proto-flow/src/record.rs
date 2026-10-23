@@ -154,6 +154,10 @@ impl NatEventType {
 pub struct NatEvent {
     /// Unix milliseconds of the event.
     pub time_ms: u64,
+    /// When the session started (Unix ms; 0 unknown). On a delete it makes
+    /// the record complete by itself — start, end, both tuples — even when
+    /// the create was lost (a kernel overrun).
+    pub start_ms: u64,
     pub event: NatEventType,
     pub protocol: u8,
     pub src: Ipv4Addr,

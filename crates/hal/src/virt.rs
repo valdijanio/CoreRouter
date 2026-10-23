@@ -404,6 +404,11 @@ impl Hal for VirtualHal {
         Ok(crate::lab_conntrack::table(&self.applied, &self.killed))
     }
 
+    fn conntrack_events(&mut self) -> Result<Box<dyn crate::conntrack::EventSource>, HalError> {
+        let table = crate::lab_conntrack::table(&self.applied, &self.killed);
+        Ok(Box::new(crate::lab_flow::LabEvents::new(table)))
+    }
+
     fn connection_stats(&mut self) -> Result<crate::conntrack::Stats, HalError> {
         let n = crate::lab_conntrack::table(&self.applied, &self.killed).len();
         Ok(crate::lab_conntrack::stats(n))

@@ -342,14 +342,15 @@ pub fn to_record(d: &DataRecord, m: &Message) -> Option<Record> {
         }
         return Some(Record::Nat(NatEvent {
             time_ms,
+            start_ms: d.uint(id::FLOW_START_MILLISECONDS).unwrap_or(0),
             event,
             protocol: u8::try_from(d.uint(id::PROTOCOL_IDENTIFIER)?).ok()?,
             src: v4(id::SOURCE_IPV4_ADDRESS)?,
-            dst: v4(id::DESTINATION_IPV4_ADDRESS)?,
+            dst: v4(id::DESTINATION_IPV4_ADDRESS).unwrap_or(Ipv4Addr::UNSPECIFIED),
             src_port: u16v(id::SOURCE_TRANSPORT_PORT),
             dst_port: u16v(id::DESTINATION_TRANSPORT_PORT),
             post_src: v4(id::POST_NAT_SOURCE_IPV4_ADDRESS)?,
-            post_dst: v4(id::POST_NAT_DESTINATION_IPV4_ADDRESS)?,
+            post_dst: v4(id::POST_NAT_DESTINATION_IPV4_ADDRESS).unwrap_or(Ipv4Addr::UNSPECIFIED),
             post_src_port: u16v(id::POST_NAPT_SOURCE_TRANSPORT_PORT),
             post_dst_port: u16v(id::POST_NAPT_DESTINATION_TRANSPORT_PORT),
         }));

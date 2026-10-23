@@ -39,6 +39,9 @@ pub struct Config {
     pub stream: bool,
     /// Unix ms the v9 sysUpTime counts from.
     pub boot_ms: u64,
+    /// NAT events with the destination (template `NAT44`) or without
+    /// (`NAT44_SRC`, the default of `/ip traffic-flow`).
+    pub nat_destination: bool,
 }
 
 /// What an exporter sent, for the statistics.
@@ -227,7 +230,10 @@ impl Exporter {
     /// Append one data record, finishing the message first when it would
     /// not fit.
     fn add(&mut self, m: &mut Msg, row: Row<'_>, now_ms: u64, out: &mut Vec<Vec<u8>>) {
-        let tid = row.template();
+        let tid = match row {
+            Row::Nat(_) if !self.cfg.nat_destination => template::NAT44_SRC,
+            _ => row.template(),
+        };
         let Some(t) = self.template(tid) else { return };
         let len = t.record_len();
         let same = matches!(m.set, Some((_, id)) if id == tid);

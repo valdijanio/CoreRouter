@@ -36,6 +36,10 @@ pub const NAT44: u16 = 258;
 pub const PORT_BLOCK: u16 = 259;
 pub const OPT_SAMPLING: u16 = 260;
 pub const OPT_INTERFACE: u16 = 261;
+/// NAT44 session events without the destination (RFC 8158 §4.2.1 makes
+/// it optional; Marco Civil art. 14 forbids a connection provider to keep
+/// it).
+pub const NAT44_SRC: u16 = 262;
 
 /// Fixed length of `interfaceName` (v9 has no variable length; Linux names
 /// are at most 15 bytes, our `IfName` a little more).
@@ -141,6 +145,9 @@ pub fn all(v: Version) -> Vec<Template> {
             scope: 0,
             fields: vec![
                 f(id::OBSERVATION_TIME_MILLISECONDS, 8),
+                // Not in RFC 8158's list, allowed by it (§4.2: more IEs MAY
+                // be added): the session's start, so a delete stands alone.
+                f(id::FLOW_START_MILLISECONDS, 8),
                 f(id::NAT_EVENT, 1),
                 f(id::PROTOCOL_IDENTIFIER, 1),
                 f(id::SOURCE_IPV4_ADDRESS, 4),
@@ -151,6 +158,20 @@ pub fn all(v: Version) -> Vec<Template> {
                 f(id::POST_NAPT_SOURCE_TRANSPORT_PORT, 2),
                 f(id::DESTINATION_TRANSPORT_PORT, 2),
                 f(id::POST_NAPT_DESTINATION_TRANSPORT_PORT, 2),
+            ],
+        },
+        Template {
+            id: NAT44_SRC,
+            scope: 0,
+            fields: vec![
+                f(id::OBSERVATION_TIME_MILLISECONDS, 8),
+                f(id::FLOW_START_MILLISECONDS, 8),
+                f(id::NAT_EVENT, 1),
+                f(id::PROTOCOL_IDENTIFIER, 1),
+                f(id::SOURCE_IPV4_ADDRESS, 4),
+                f(id::POST_NAT_SOURCE_IPV4_ADDRESS, 4),
+                f(id::SOURCE_TRANSPORT_PORT, 2),
+                f(id::POST_NAPT_SOURCE_TRANSPORT_PORT, 2),
             ],
         },
         // RFC 8158 §4.2.10/§4.2.11 (port block allocation/de-allocation).
@@ -271,6 +292,7 @@ pub(crate) fn put(out: &mut Vec<u8>, field: Field, row: Row<'_>, boot_ms: u64) {
         },
         Row::Nat(n) => match field.id {
             id::OBSERVATION_TIME_MILLISECONDS => uint(out, n.time_ms),
+            id::FLOW_START_MILLISECONDS => uint(out, n.start_ms),
             id::NAT_EVENT => uint(out, u64::from(n.event.code())),
             id::PROTOCOL_IDENTIFIER => uint(out, u64::from(n.protocol)),
             id::SOURCE_IPV4_ADDRESS => put_addr(out, n.src.into(), len),

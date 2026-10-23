@@ -559,6 +559,12 @@ mod linux {
             crate::ctnl::stats()
         }
 
+        fn conntrack_events(
+            &mut self,
+        ) -> Result<Box<dyn corerouter_hal::conntrack::EventSource>, HalError> {
+            Ok(Box::new(crate::ctnl::Events::open()?))
+        }
+
         fn connections_kill(
             &mut self,
             conns: &[corerouter_hal::conntrack::Conn],

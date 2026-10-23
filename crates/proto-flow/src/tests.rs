@@ -184,6 +184,7 @@ fn exporter(v: Version) -> Exporter {
         refresh_packets: 20,
         stream: false,
         boot_ms: 1_699_999_000_000,
+        nat_destination: true,
     })
 }
 
@@ -199,6 +200,7 @@ fn sample_records() -> Vec<Record> {
         Record::Flow(v6),
         Record::Nat(NatEvent {
             time_ms: 1_700_000_000_123,
+            start_ms: 1_700_000_000_100,
             event: NatEventType::Nat44SessionCreate,
             protocol: 17,
             src: v4("100.64.0.9"),
@@ -276,7 +278,7 @@ fn ipfix_sequence_counts_data_records_and_v9_counts_packets() {
             u32::try_from(i).unwrap(),
             "RFC 3954 §5.1: packets"
         );
-        let templates = if i == 0 { 6 } else { 0 };
+        let templates = if i == 0 { 7 } else { 0 };
         assert_eq!(usize::from(m.count), m.records.len() + templates);
     }
 }
@@ -292,17 +294,17 @@ fn templates_come_back_by_time_and_by_count() {
         e.encode(t, &one, &mut out);
         d.decode(&out[0]).unwrap().templates
     };
-    assert_eq!(sent(&mut e, t0), 6, "first message: every template");
+    assert_eq!(sent(&mut e, t0), 7, "first message: every template");
     for i in 1..20 {
         assert_eq!(sent(&mut e, t0 + i), 0, "message {i}");
     }
     assert_eq!(
         sent(&mut e, t0 + 20),
-        6,
+        7,
         "after 20 messages (v9-template-refresh)"
     );
     assert_eq!(sent(&mut e, t0 + 30), 0);
-    assert_eq!(sent(&mut e, t0 + 600_030), 6, "after the timeout");
+    assert_eq!(sent(&mut e, t0 + 600_030), 7, "after the timeout");
     // Nothing to send, but they are due: a message with only templates.
     let mut out = Vec::new();
     e.encode(t0 + 1_300_000, &[], &mut out);
@@ -428,7 +430,7 @@ fn a_nat_connection_gives_session_events_and_two_flows_with_both_tuples() {
     assert_eq!(create.event, NatEventType::Nat44SessionCreate);
     assert_eq!(create.post_src, v4("203.0.113.1"));
     assert_eq!(create.post_src_port, 2100);
-    assert_eq!(create.time_ms, 1000);
+    assert_eq!((create.time_ms, create.start_ms), (1000, 1000));
     let Record::Nat(delete) = &out[1] else {
         panic!()
     };
@@ -477,6 +479,14 @@ fn kernel_timestamps_win_over_the_clock() {
     e.start_ns = Some(1_000_000_000);
     e.stop_ns = Some(9_000_000_000);
     m.event(&e, 99_999, &AnyInterface, &mut out);
+    let Record::Nat(n) = &out[0] else {
+        panic!("{out:?}")
+    };
+    assert_eq!(
+        (n.start_ms, n.time_ms),
+        (1000, 9000),
+        "the delete alone is the whole session"
+    );
     let Record::Flow(f) = &out[1] else {
         panic!("{out:?}")
     };

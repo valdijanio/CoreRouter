@@ -10,11 +10,12 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use corerouter_hal::conntrack::{Conn, Stats, Tuple};
+use corerouter_hal::conntrack::{Conn, Event, EventKind, Stats, Tuple};
 
 use crate::genl::{Attr, attrs, find};
 
 pub const NFNL_SUBSYS_CTNETLINK: u16 = 1;
+const IPCTNL_MSG_CT_NEW: u16 = 0;
 const IPCTNL_MSG_CT_GET: u16 = 1;
 const IPCTNL_MSG_CT_DELETE: u16 = 2;
 const IPCTNL_MSG_CT_GET_STATS_CPU: u16 = 4;
@@ -29,6 +30,9 @@ const CTA_MARK: u16 = 8;
 const CTA_COUNTERS_ORIG: u16 = 9;
 const CTA_COUNTERS_REPLY: u16 = 10;
 const CTA_ID: u16 = 12;
+const CTA_TIMESTAMP: u16 = 20;
+const CTA_TIMESTAMP_START: u16 = 1;
+const CTA_TIMESTAMP_STOP: u16 = 2;
 const CTA_TUPLE_IP: u16 = 1;
 const CTA_TUPLE_PROTO: u16 = 2;
 const CTA_IP_V4_SRC: u16 = 1;
@@ -148,6 +152,31 @@ pub fn parse_conn(body: &[u8]) -> Option<Conn> {
         orig_bytes,
         reply_packets,
         reply_bytes,
+    })
+}
+
+/// One event message (G4.4b): `IPCTNL_MSG_CT_NEW` from the NEW group,
+/// `IPCTNL_MSG_CT_DELETE` from the DESTROY group (`msg` is the low byte
+/// of the netlink type), with the kernel's timestamps when it stamps.
+pub fn parse_event(msg: u16, body: &[u8]) -> Option<Event> {
+    let kind = match msg {
+        IPCTNL_MSG_CT_NEW => EventKind::New,
+        IPCTNL_MSG_CT_DELETE => EventKind::Destroy,
+        _ => return None,
+    };
+    let conn = parse_conn(body)?;
+    let ts = find(attrs(body), CTA_TIMESTAMP);
+    let stamp = |kind| {
+        ts.as_ref()
+            .and_then(|t| find(t.nested(), kind))
+            .and_then(|a| be64(&a))
+            .filter(|v| *v > 0)
+    };
+    Some(Event {
+        kind,
+        conn,
+        start_ns: stamp(CTA_TIMESTAMP_START),
+        stop_ns: stamp(CTA_TIMESTAMP_STOP),
     })
 }
 
@@ -358,12 +387,34 @@ mod tests {
         assert_eq!(back.via(), corerouter_hal::conntrack::Via::Rules);
     }
 
+    #[test]
+    fn an_event_carries_its_timestamps() {
+        let c = conn();
+        let mut r = Req::new(IPCTNL_MSG_CT_DELETE, 0, AF_INET, 0);
+        r.tuple(CTA_TUPLE_ORIG, &c.orig, c.protocol);
+        r.tuple(CTA_TUPLE_REPLY, &c.reply, c.protocol);
+        r.begin(CTA_TIMESTAMP);
+        r.put(CTA_TIMESTAMP_START, &1_000u64.to_be_bytes());
+        r.put(CTA_TIMESTAMP_STOP, &3_000u64.to_be_bytes());
+        r.end();
+        let bytes = r.finish();
+        let e = parse_event(IPCTNL_MSG_CT_DELETE, &bytes[20..]).unwrap();
+        assert_eq!(e.kind, EventKind::Destroy);
+        assert_eq!((e.start_ns, e.stop_ns), (Some(1000), Some(3000)));
+        assert_eq!(
+            parse_event(IPCTNL_MSG_CT_NEW, &bytes[20..]).unwrap().kind,
+            EventKind::New
+        );
+        assert!(parse_event(IPCTNL_MSG_CT_GET, &bytes[20..]).is_none());
+    }
+
     proptest! {
         /// Hostile bytes never panic, and a cut message gives no conn or a
         /// partial one, never garbage tuples.
         #[test]
         fn hostile_bytes_never_panic(junk in proptest::collection::vec(any::<u8>(), 0..512), cut in 0usize..400) {
             let _ = parse_conn(&junk);
+            let _ = parse_event(0, &junk);
             let mut s = Stats::default();
             add_stats(&mut s, &junk);
             let good = reply_bytes(&conn());
@@ -376,6 +427,8 @@ mod tests {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use events::Events;
 #[cfg(target_os = "linux")]
 pub use io::{delete, dump, stats};
 
@@ -532,3 +585,143 @@ mod io {
         Ok(done)
     }
 }
+
+#[cfg(target_os = "linux")]
+mod events {
+    //! The conntrack event feed (G4.4b): a netlink socket in the NEW and
+    //! DESTROY multicast groups, with a big receive buffer. When the
+    //! exporter falls behind the kernel drops events and `recv` says
+    //! `ENOBUFS`: counted, never fatal (the next table read finds what was
+    //! missed).
+
+    use std::os::fd::AsFd;
+
+    use corerouter_hal::HalError;
+    use corerouter_hal::conntrack::{Conn, Event, EventSource, MAX_READ, TableReader};
+    use netlink_sys::{Socket, protocols::NETLINK_NETFILTER};
+    use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+
+    /// `NFNLGRP_CONNTRACK_NEW` and `NFNLGRP_CONNTRACK_DESTROY`.
+    const GROUP_NEW: u32 = 1;
+    const GROUP_DESTROY: u32 = 3;
+    /// 32 MiB: about 100 thousand events of slack (**estimado**, ~300
+    /// bytes each) while the exporter reads the table or a collector is slow.
+    const RCVBUF: usize = 32 << 20;
+    const ENOBUFS: i32 = 105;
+
+    fn io(e: impl std::fmt::Display) -> HalError {
+        HalError::Io(format!("conntrack events: {e}"))
+    }
+
+    /// Turn on what the flow records need, in this network namespace: byte
+    /// counters (`nf_conntrack_acct`, off by default) and start/stop times
+    /// (`nf_conntrack_timestamp`). Whether each one is on afterwards.
+    pub fn enable_accounting() -> (Option<bool>, Option<bool>) {
+        let set = |name: &str| {
+            let path = format!("/proc/sys/net/netfilter/{name}");
+            let _ = std::fs::write(&path, "1");
+            std::fs::read_to_string(&path).ok().map(|v| v.trim() == "1")
+        };
+        (set("nf_conntrack_acct"), set("nf_conntrack_timestamp"))
+    }
+
+    pub struct Events {
+        sock: Socket,
+        buf: Vec<u8>,
+        lost: u64,
+        accounting: (Option<bool>, Option<bool>),
+    }
+
+    impl Events {
+        pub fn open() -> Result<Self, HalError> {
+            let mut sock = Socket::new(NETLINK_NETFILTER).map_err(io)?;
+            sock.bind_auto().map_err(io)?;
+            use nix::sys::socket::{setsockopt, sockopt};
+            if setsockopt(&sock.as_fd(), sockopt::RcvBufForce, &RCVBUF).is_err() {
+                let _ = setsockopt(&sock.as_fd(), sockopt::RcvBuf, &RCVBUF);
+            }
+            sock.add_membership(GROUP_NEW).map_err(io)?;
+            sock.add_membership(GROUP_DESTROY).map_err(io)?;
+            sock.set_non_blocking(true).map_err(io)?;
+            Ok(Self {
+                sock,
+                buf: vec![0u8; 1 << 17],
+                lost: 0,
+                accounting: enable_accounting(),
+            })
+        }
+
+        /// Parse one datagram (several messages) into `out`.
+        fn take(bytes: &[u8], out: &mut Vec<Event>) {
+            let mut rest = bytes;
+            while let Some(hdr) = rest.get(..16) {
+                let len = hdr
+                    .get(..4)
+                    .and_then(|b| b.try_into().ok())
+                    .map_or(0, u32::from_ne_bytes);
+                let kind = hdr
+                    .get(4..6)
+                    .and_then(|b| b.try_into().ok())
+                    .map_or(0, u16::from_ne_bytes);
+                let len = usize::try_from(len).unwrap_or(0);
+                if len < 16 {
+                    break;
+                }
+                let msg = rest.get(..len).unwrap_or(rest);
+                rest = rest.get(len.div_ceil(4) * 4..).unwrap_or(&[]);
+                if kind >> 8 != super::NFNL_SUBSYS_CTNETLINK {
+                    continue;
+                }
+                if let Some(e) = super::parse_event(kind & 0xff, msg.get(20..).unwrap_or(&[])) {
+                    out.push(e);
+                }
+            }
+        }
+    }
+
+    impl EventSource for Events {
+        fn recv(&mut self, wait_ms: u32, max: usize, out: &mut Vec<Event>) -> Result<(), HalError> {
+            let start = out.len();
+            let ms = u16::try_from(wait_ms).unwrap_or(u16::MAX);
+            let mut fds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
+            if poll(&mut fds, PollTimeout::from(ms)).map_err(io)? == 0 {
+                return Ok(());
+            }
+            while out.len() - start < max {
+                match self.sock.recv(&mut &mut self.buf[..], 0) {
+                    Ok(n) => Self::take(self.buf.get(..n).unwrap_or(&[]), out),
+                    Err(e) if e.raw_os_error() == Some(ENOBUFS) => self.lost += 1,
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(e) => return Err(io(e)),
+                }
+            }
+            Ok(())
+        }
+
+        fn table_reader(&self) -> Box<dyn TableReader> {
+            Box::new(Dump)
+        }
+
+        fn lost(&self) -> u64 {
+            self.lost
+        }
+
+        fn accounting(&self) -> (Option<bool>, Option<bool>) {
+            self.accounting
+        }
+    }
+
+    struct Dump;
+
+    impl TableReader for Dump {
+        fn read(&mut self) -> Result<(Vec<Conn>, bool), HalError> {
+            let v = super::dump()?;
+            let complete = v.len() < MAX_READ;
+            Ok((v, complete))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub use events::enable_accounting;
