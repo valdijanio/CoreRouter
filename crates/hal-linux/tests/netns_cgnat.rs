@@ -280,6 +280,24 @@ fn subscribers_leave_with_their_formula_address_and_ports() {
         );
     }
 
+    // The Connections window's view of it (G2.2): the kernel's table over
+    // ctnetlink, with the translation and the table's size.
+    let conns = hal.connections().unwrap();
+    let udp = conns
+        .iter()
+        .find(|c| c.orig.src_port == 40000 && c.protocol == 17)
+        .expect("the UDP connection is in the table");
+    assert!(udp.has(status::SRC_NAT));
+    assert!(l.forward("100.64.0.1".parse().unwrap()).unwrap().contains(
+        match udp.reply.dst {
+            std::net::IpAddr::V4(a) => a,
+            std::net::IpAddr::V6(_) => panic!(),
+        },
+        udp.reply.dst_port
+    ));
+    let st = hal.connection_stats().unwrap();
+    assert!(st.count >= 1 && st.max > 0, "{st:?}");
+
     // TCP from the same subscriber stays in the same slot (RFC 6888 REQ-2).
     let listener = lab
         .net

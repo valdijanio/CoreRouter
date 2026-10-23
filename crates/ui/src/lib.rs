@@ -1203,6 +1203,11 @@ impl CoreRouterUi {
                 firewall::Tab::Mangle => &mut self.tables.fw_mangle,
                 firewall::Tab::Addr => &mut self.tables.fw_addr,
                 firewall::Tab::Zones => return false,
+                firewall::Tab::Connections => {
+                    return self
+                        .with_panel(crate::connections::NAME, |s, _| s.escape("fw-connections"))
+                        .unwrap_or(false);
+                }
             },
             Win::InterfaceList => match self.fw.if_tab {
                 firewall::IfTab::Members => &mut self.tables.if_members,

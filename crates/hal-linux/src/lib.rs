@@ -551,6 +551,21 @@ mod linux {
             Ok(self.sysctl.root.sysctls(names))
         }
 
+        fn connections(&mut self) -> Result<Vec<corerouter_hal::conntrack::Conn>, HalError> {
+            crate::ctnl::dump()
+        }
+
+        fn connection_stats(&mut self) -> Result<corerouter_hal::conntrack::Stats, HalError> {
+            crate::ctnl::stats()
+        }
+
+        fn connections_kill(
+            &mut self,
+            conns: &[corerouter_hal::conntrack::Conn],
+        ) -> Result<usize, HalError> {
+            crate::ctnl::delete(conns)
+        }
+
         fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {
             Ok(self.sysctl.root.kernel_stats())
         }
