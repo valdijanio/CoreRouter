@@ -1030,6 +1030,13 @@ impl Shell {
                 }
             }
         }
+        // A last line that ends in `\` (a script cut short in transfer):
+        // its command would be silently lost.
+        if !joined.is_empty() {
+            return Err(format!(
+                "line {first_line}: the last line is continued (ends in \\) but nothing follows"
+            ));
+        }
         Ok(steps)
     }
 

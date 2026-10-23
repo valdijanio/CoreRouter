@@ -43,7 +43,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.dns.tsig-key.print", "DNS TSIG Keys", ["IP", "DNS"], None,
-        "{show_secret?: bool} → [{id, name, algorithm, secret? (only with show_secret), comment?, zones (that let it update)}]",
+        "{show_secret?: bool (group full only)} → [{id, name, algorithm, secret? (only with show_secret), comment?, zones (that let it update)}]",
         always, print),
 ];
 
@@ -172,6 +172,15 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn print(s: &mut Session, p: &Value) -> Result<Value> {
     let show = opt_bool(p, "show_secret")?.unwrap_or(false);
+    // Whoever holds the secret can forge RFC 2136 updates: like RouterOS's
+    // `sensitive` policy, only group full reads it back.
+    if show {
+        s.permit(crate::auth::Group::Full)
+            .map_err(|reason| EngineError::Denied {
+                id: "ip.dns.tsig-key.print".into(),
+                reason: format!("show_secret: {reason}"),
+            })?;
+    }
     let cand = s.store().candidate();
     let rows: Vec<Value> = cand
         .ip

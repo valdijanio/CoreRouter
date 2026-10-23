@@ -51,6 +51,13 @@ pub struct StorageStatus {
     pub boot_errors: Vec<String>,
     /// Last save failure; cleared by the next successful save.
     pub last_error: Option<String>,
+    /// The restored config did not reach the data plane at boot: why. While
+    /// set, every tick retries the whole config and the next commit applies
+    /// everything, not only its change (audit #8).
+    pub boot_apply_error: Option<String>,
+    /// Oldest revisions the last save left out of the file to keep it
+    /// under the size limit (they stay in memory until the restart).
+    pub revisions_not_saved: usize,
 }
 
 pub struct Session {
@@ -105,13 +112,28 @@ pub fn shared(session: Session) -> Shared {
 }
 
 /// Lock without unwrap: a poisoned lock still holds a consistent session,
-/// because every mutation runs inside `guard` and is rolled back on panic.
+/// because every mutation (command, commit, tick) runs inside `guard` and
+/// its candidate is rolled back on panic.
 pub fn lock(s: &Shared) -> MutexGuard<'_, Session> {
     s.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 const MAX_JOURNAL: usize = 1024;
-pub const MAX_BATCH: usize = 256;
+/// Steps of one batch. `/import` sends a whole script as one atomic batch
+/// (at most 1 MiB, ~30 bytes a command at the least): a router must be able
+/// to import its own `/export` (audit #9).
+pub const MAX_BATCH: usize = 32_768;
+
+/// Steps an atomic batch refuses: they commit, end the transaction or
+/// change how commits happen, so "all or nothing" could not hold (audit #5).
+const NOT_IN_ATOMIC_BATCH: &[&str] = &[
+    "config.commit",
+    "config.discard",
+    "config.mode.set",
+    "config.safe-mode.enter",
+    "config.safe-mode.exit",
+    "config.safe-mode.cancel",
+];
 
 impl Session {
     /// A feature's runtime state of type `T` (crate::ext), if set.
@@ -150,6 +172,8 @@ impl Session {
             loaded_from: None,
             boot_errors,
             last_error: None,
+            boot_apply_error: None,
+            revisions_not_saved: 0,
         };
         let store = match restored {
             Some((store, slot)) => {
@@ -166,7 +190,8 @@ impl Session {
                 let mut boot = store.running().clone();
                 boot.ip.addresses.retain(|a| a.from_pool.is_none());
                 if let Err(e) = hal.apply(&Config::default(), &boot) {
-                    log::error!("restored config not applied: {e}");
+                    log::error!("restored config not applied (retried every second): {e}");
+                    status.boot_apply_error = Some(e.to_string());
                 }
                 status.loaded_from = Some(slot.name());
                 store
@@ -229,7 +254,11 @@ impl Session {
 
         let snapshot = self.store.candidate().clone();
         let rev_before = self.store.current_revision();
-        let result = guard::run(id, || (spec.run)(self, params)).and_then(|value| {
+        // The commit runs inside the guard too: a panic in a validator or
+        // the data plane must not leave the edit behind for the next
+        // command to commit (audit #6).
+        let result = guard::run(id, || {
+            let value = (spec.run)(self, params)?;
             if spec.journal && self.mode == CommitMode::Immediate && self.store.is_dirty() {
                 self.commit_candidate(id)?;
             }
@@ -290,6 +319,25 @@ impl Session {
                 format!("at most {MAX_BATCH} steps"),
             ));
         }
+        if atomic {
+            let control = steps.iter().enumerate().find_map(|(i, step)| {
+                let id = step.get("command").and_then(Value::as_str)?;
+                NOT_IN_ATOMIC_BATCH.contains(&id).then_some((i, id))
+            });
+            if let Some((i, id)) = control {
+                return Err(EngineError::Batch {
+                    step: i.saturating_add(1),
+                    error: Box::new(EngineError::bad(
+                        "command",
+                        format!(
+                            "{id} cannot run inside an atomic batch (the batch is one \
+                             transaction: it commits at the end, or nothing does); \
+                             send it on its own, or use atomic: false"
+                        ),
+                    )),
+                });
+            }
+        }
         let saved_mode = self.mode;
         let snapshot = self.store.candidate().clone();
         if atomic {
@@ -342,7 +390,8 @@ impl Session {
                     return Err(e);
                 }
                 Ok(()) if saved_mode == CommitMode::Immediate && self.store.is_dirty() => {
-                    if let Err(e) = self.commit_candidate("batch") {
+                    let committed = guard::run("batch", || self.commit_candidate("batch"));
+                    if let Err(e) = committed {
                         self.store.set_candidate(snapshot);
                         return Err(e);
                     }
@@ -379,18 +428,41 @@ impl Session {
         if !issues.is_empty() {
             return Err(EngineError::Validation(issues));
         }
+        // It must fit in the saved file with its copy in the history, or
+        // the next boot could not load it (audit #1).
+        let size = persist::encoded_len(self.store.candidate());
+        if size > persist::MAX_CONFIG_BYTES {
+            return Err(EngineError::Validation(vec![corerouter_model::validate::Issue::new(
+                "config",
+                format!(
+                    "would be {} MiB, over the {} MiB that can be saved; remove items first",
+                    size >> 20,
+                    persist::MAX_CONFIG_BYTES >> 20
+                ),
+            )]));
+        }
         // The data plane also holds what DHCP clients installed (G4.7).
-        let from = self.effective(self.store.running()).into_owned();
+        let running = self.effective(self.store.running()).into_owned();
         let to = self.effective(self.store.candidate()).into_owned();
         // The lockout check sees the same: a DHCP address can be the one
         // the operator is connected to.
         if lockout {
             let dynamic = self.dynamic_now();
-            self.check_lockout(&from, &to, &dynamic, &dynamic)?;
+            self.check_lockout(&running, &to, &dynamic, &dynamic)?;
         }
+        // The boot apply failed: the data plane may hold nothing of the
+        // running config, so install all of it, not only the change.
+        let from = if self.storage_status.boot_apply_error.is_some() {
+            Config::default()
+        } else {
+            running
+        };
         self.hal
             .apply(&from, &to)
             .map_err(|e| EngineError::Hal(e.to_string()))?;
+        if self.storage_status.boot_apply_error.take().is_some() {
+            log::info!("the whole config reached the data plane with this commit");
+        }
         let pending = self.safe_mode.is_active();
         let comment = match (pending, comment.is_empty()) {
             (false, _) => comment.to_owned(),
@@ -404,14 +476,64 @@ impl Session {
         Ok(revision)
     }
 
-    /// Persist running + history. A failure does not undo the commit (the
-    /// data plane already runs it): it is logged and shown by `state.inspect`.
+    /// Retry the boot apply that failed (called by [`Session::tick`]).
+    pub(crate) fn retry_boot_apply(&mut self) {
+        if self.storage_status.boot_apply_error.is_none() {
+            return;
+        }
+        let to = self.effective(self.store.running()).into_owned();
+        let tried = guard::run("boot apply", || {
+            self.hal
+                .apply(&Config::default(), &to)
+                .map_err(|e| EngineError::Hal(e.to_string()))
+        });
+        match tried {
+            Ok(()) => {
+                log::info!(
+                    "restored config (revision {}) applied on retry",
+                    self.store.current_revision()
+                );
+                self.storage_status.boot_apply_error = None;
+            }
+            Err(e) => {
+                let e = e.to_string();
+                if self.storage_status.boot_apply_error.as_deref() != Some(e.as_str()) {
+                    log::error!("restored config still not applied: {e}");
+                }
+                self.storage_status.boot_apply_error = Some(e);
+            }
+        }
+    }
+
+    /// Persist running + history (bounded: the oldest revisions are left
+    /// out when the file would be too big). In Safe Mode what is saved is
+    /// the store as it was at the entry, so a reboot never boots the
+    /// unconfirmed changes, whatever triggers the save (audit #2). A
+    /// failure does not undo the commit (the data plane already runs it):
+    /// it is logged and shown by `state.inspect`.
     pub(crate) fn save(&mut self) {
-        let saved = persist::encode_with_users(&self.store, &self.users)
+        let entry_store = self.safe_mode_entry_store();
+        let store = entry_store.as_ref().unwrap_or(&self.store);
+        let saved = persist::encode_bounded(store, &self.users, persist::SAVE_BUDGET_BYTES)
             .map_err(|e| e.to_string())
-            .and_then(|text| self.storage.save(&text).map_err(|e| e.to_string()));
+            .and_then(|(text, skipped)| {
+                self.storage
+                    .save(&text)
+                    .map(|()| skipped)
+                    .map_err(|e| e.to_string())
+            });
         match saved {
-            Ok(()) => self.storage_status.last_error = None,
+            Ok(skipped) => {
+                if skipped > 0 && skipped != self.storage_status.revisions_not_saved {
+                    log::warn!(
+                        "config file kept under {} MiB: the {skipped} oldest revision(s) \
+                         were left out",
+                        persist::SAVE_BUDGET_BYTES >> 20
+                    );
+                }
+                self.storage_status.revisions_not_saved = skipped;
+                self.storage_status.last_error = None;
+            }
             Err(e) => {
                 log::error!(
                     "revision {} is running but was not saved: {e}",
@@ -442,12 +564,17 @@ impl Session {
         self.seq = self.seq.saturating_add(1);
         // Passwords and tokens never reach the journal nor the log (G0.3).
         let params = auth::mask_secrets(params);
+        // Bounded like the log detail: a 16 MiB parameter must not be kept
+        // 1024 times (audit #4).
         self.journal.push(JournalEntry {
             seq: self.seq,
             command: id.to_owned(),
-            params: params.clone(),
+            params: crate::logging::bounded(&params),
             ok: result.is_ok(),
-            error: result.as_ref().err().map(ToString::to_string),
+            error: result
+                .as_ref()
+                .err()
+                .map(|e| crate::logging::cut(&e.to_string(), 512)),
         });
         if self.journal.len() > MAX_JOURNAL {
             self.journal.remove(0);
@@ -504,7 +631,7 @@ impl Session {
                         .cloned()
                         .ok_or_else(|| EngineError::bad("path", format!("no '{seg}' in '{p}'")))?;
                 }
-                Ok(v)
+                Ok(self.redact(v))
             }
         }
     }
@@ -566,6 +693,16 @@ impl Session {
                 .get(name)
                 .filter(|u| !u.disabled)
                 .map(|u| u.group),
+        }
+    }
+
+    /// `v` as the current caller may see it: secrets (TSIG keys, …) are
+    /// masked below group `full`, like RouterOS's `sensitive` policy.
+    pub(crate) fn redact(&self, v: Value) -> Value {
+        if self.permit(Group::Full).is_ok() {
+            v
+        } else {
+            auth::mask_secrets(&v)
         }
     }
 

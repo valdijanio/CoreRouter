@@ -189,6 +189,12 @@ Todo commit bem-sucedido grava running + histórico (`model::persist::encode`, J
 (truncado, lixo, versão desconhecida, invariantes quebradas) vai para quarentena (`*.corrupt`) e
 gera `storage.boot_errors` no `state.inspect`. Nada legível → config descoberta dos ports. O
 candidate nunca é gravado (edição não commitada não sobrevive a reinício, como no Junos/VyOS).
+O arquivo é JSON compacto e limitado a 32 MiB (`SAVE_BUDGET_BYTES`): quando não cabe, as
+revisões mais antigas ficam de fora (`storage.revisions_not_saved`), nunca a running; um commit
+cuja config sozinha passaria de ~15 MiB é recusado. A leitura aceita até 256 MiB, para arquivos
+de versões anteriores. Em Safe Mode qualquer gravação escreve o store da entrada. Se a config
+restaurada não chega ao plano de dados no boot, `storage.boot_apply_error` mostra o motivo, o
+tick tenta de novo a cada segundo e o próximo commit aplica a config inteira.
 
 | Backend | Onde | Uso |
 |---|---|---|

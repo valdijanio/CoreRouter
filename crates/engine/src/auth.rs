@@ -29,8 +29,25 @@ pub use corerouter_model::{Group, User, Users};
 pub const MIN_PASSWORD: usize = 8;
 /// Longest accepted password (bounds the hashing work per request).
 pub const MAX_PASSWORD: usize = 256;
-/// Parameter names whose values never reach the journal.
-pub const SECRET_KEYS: &[&str] = &["password", "old_password", "new_password", "token"];
+/// Parameter and config field names whose values never reach the journal
+/// or the log, and that only group `full` reads back (TSIG `secret`, and
+/// the keys of features to come: `psk`, `private_key`, `passphrase`).
+pub const SECRET_KEYS: &[&str] = &[
+    "password",
+    "old_password",
+    "new_password",
+    "token",
+    "secret",
+    "psk",
+    "private_key",
+    "passphrase",
+];
+
+/// A `config.diff` path that ends in a secret field (`ip.dns_tsig.keys[*1].secret`).
+pub fn is_secret_path(path: &str) -> bool {
+    let last = path.rsplit('.').next().unwrap_or(path);
+    SECRET_KEYS.contains(&last)
+}
 
 /// Who sends a command.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
@@ -212,6 +229,9 @@ pub struct Login {
 
 /// Most logins tracked at once; the oldest is dropped beyond it.
 pub const MAX_LOGINS: usize = 256;
+/// Most logins of one user: beyond it that user's oldest is dropped, so no
+/// account can push the others out by logging in over and over.
+pub const MAX_LOGINS_PER_USER: usize = 16;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Logins {
@@ -222,7 +242,12 @@ pub(crate) struct Logins {
 impl Logins {
     pub(crate) fn begin(&mut self, user: &str, via: &str, now: Option<u64>) -> u64 {
         self.next = self.next.saturating_add(1);
-        if self.list.len() >= MAX_LOGINS {
+        let mine = self.list.iter().filter(|l| l.user == user).count();
+        if mine >= MAX_LOGINS_PER_USER {
+            if let Some(i) = self.list.iter().position(|l| l.user == user) {
+                self.list.remove(i);
+            }
+        } else if self.list.len() >= MAX_LOGINS && !self.list.is_empty() {
             self.list.remove(0);
         }
         self.list.push(Login {
@@ -313,5 +338,19 @@ mod tests {
         assert!(check_password("long enough").is_ok());
         assert!(check_password("tab\there!").is_err());
         assert!(check_password(&"x".repeat(MAX_PASSWORD + 1)).is_err());
+    }
+
+    /// Audit (control finding 7): a user logging in over and over drops
+    /// only its own oldest logins, never another account's.
+    #[test]
+    fn repeated_logins_evict_only_the_same_user() {
+        let mut l = Logins::default();
+        let admin = l.begin("admin", "tcp 10.0.0.1:1", None);
+        for _ in 0..MAX_LOGINS + 5 {
+            l.begin("noc", "tcp 10.0.0.2:1", None);
+        }
+        assert!(l.touch(admin, None), "admin's login was evicted");
+        let noc = l.list.iter().filter(|x| x.user == "noc").count();
+        assert_eq!(noc, MAX_LOGINS_PER_USER);
     }
 }

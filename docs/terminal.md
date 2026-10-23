@@ -186,8 +186,10 @@ registro:
 mesmo: o script inteiro é traduzido antes (erro de sintaxe → "line N: …", nada aplicado) e vai
 num único `engine.batch` atômico (`atomic: true`): ou tudo entra numa revisão, ou nada. Números de
 item não valem em script (use nomes ou `*ids`); `print`/`export` também não. Linhas terminadas em
-`\` continuam na seguinte. Limites: 1 MiB de script; o engine aceita até 256 passos por batch
-(`MAX_BATCH`) — configurações maiores precisam ser importadas em partes por enquanto.
+`\` continuam na seguinte (uma última linha terminada em `\` é erro: o script veio cortado).
+Limites: 1 MiB de script; o engine aceita até 32 768 passos por batch (`MAX_BATCH`), o que cobre
+qualquer script de 1 MiB. Um batch atômico recusa `config.commit`, `config.discard`,
+`config.mode.set` e `config.safe-mode.*` como passo (o batch já é uma transação).
 
 Teste de ida e volta: config com bridge, portas, VLAN sobre bridge e sobre VLAN, loopback, VRF com
 membros, endereços (um desativado, comentários com aspas), rotas (VRF, distance, desativada), BGP,

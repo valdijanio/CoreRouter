@@ -22,7 +22,6 @@ use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
 
 use tungstenite::protocol::WebSocketConfig;
 use tungstenite::{Message, WebSocket};
@@ -30,16 +29,16 @@ use tungstenite::{Message, WebSocket};
 use corerouter_engine::Caller;
 
 use crate::auth::Gate;
-use crate::dispatch::{Host, hang_up};
-use crate::server::{Conn, Endpoint, Shutdown, accept_loop, answer};
+use crate::dispatch::Host;
+use crate::server::{
+    Conn, Endpoint, Shutdown, accept_loop, answer, line_limit, serve_then_hang_up,
+};
 use crate::wire::MAX_REQUEST_LINE;
 
 /// Largest HTTP request head (request line + headers).
 const MAX_HEAD: usize = 16 * 1024;
 /// Largest static file served from `web_root` (the wasm GUI is ~10 MiB).
 const MAX_FILE: u64 = 64 * 1024 * 1024;
-/// Time a client gets to send its request head.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Who may connect and what else the port serves.
 #[derive(Debug, Clone, Default)]
@@ -94,9 +93,9 @@ pub fn serve_ws_until<H: Host + Clone + Send + 'static>(
     let policy = Arc::new(policy);
     accept_loop(endpoint, "ws", shutdown, move |conn, caller, peer| {
         let mut host = host.clone();
-        let out = handle(conn, &mut host, &gate, &caller, peer, &policy);
-        hang_up(&mut host, &caller);
-        out
+        serve_then_hang_up(&mut host, &caller, |host| {
+            handle(conn, host, &gate, &caller, peer, &policy)
+        })
     });
 }
 
@@ -213,7 +212,9 @@ fn handle<H: Host>(
     peer: Option<IpAddr>,
     policy: &WsPolicy,
 ) -> io::Result<()> {
-    stream.tcp().set_read_timeout(Some(HEAD_TIMEOUT))?;
+    // The whole head within the handshake time, however slowly it trickles.
+    let head_time = stream.sock().timeouts().handshake;
+    stream.sock().set_deadline(Some(head_time));
     let Some((raw, rest)) = read_head(stream.as_mut())? else {
         return respond(stream.as_mut(), "400 Bad Request", "bad request");
     };
@@ -242,13 +243,17 @@ fn handle<H: Host>(
         front: io::Cursor::new(front),
         stream,
     };
+    // Small messages until the connection logs in (see `server::line_limit`).
+    let mut io = io;
+    let max = line_limit(io.stream.as_mut(), peer);
     let config = WebSocketConfig::default()
-        .max_message_size(Some(MAX_REQUEST_LINE))
-        .max_frame_size(Some(MAX_REQUEST_LINE));
+        .max_message_size(Some(max))
+        .max_frame_size(Some(max));
     let mut ws = tungstenite::accept_with_config(io, Some(config))
         .map_err(|e| io::Error::other(format!("handshake: {e}")))?;
-    // Idle browser tabs are normal: no read timeout after the handshake.
-    ws.get_mut().stream.tcp().set_read_timeout(None)?;
+    // Logged out: the short idle limit. Logged in, idle browser tabs are
+    // normal: no limit (TCP keepalive finds a dead peer).
+    ws.get_mut().stream.sock().handshake_done();
     messages(&mut ws, host, gate, caller, peer)
 }
 
@@ -276,10 +281,17 @@ fn messages(
         if text.trim().is_empty() {
             continue;
         }
-        let Some(reply) = answer(host, gate, caller, peer, &text) else {
+        let Some(answer) = answer(host, gate, caller, peer, &text) else {
             return ws.close(None).or_else(closed);
         };
-        if let Err(e) = ws.send(Message::text(reply.to_string())) {
+        if answer.authenticated && !ws.get_mut().stream.sock().is_authenticated() {
+            ws.get_mut().stream.sock().authenticated();
+            ws.set_config(|c| {
+                c.max_message_size = Some(MAX_REQUEST_LINE);
+                c.max_frame_size = Some(MAX_REQUEST_LINE);
+            });
+        }
+        if let Err(e) = ws.send(Message::text(answer.reply.to_string())) {
             return closed(e);
         }
     }
@@ -307,26 +319,25 @@ fn static_file(stream: &mut dyn Conn, head: &Head, root: Option<&Path>) -> io::R
     let Some(path) = resolve(root, &head.target) else {
         return respond(stream, "404 Not Found", "not found");
     };
-    let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX);
+    // Streamed, not read into memory: 16 slow readers of the 10 MiB wasm
+    // would otherwise hold 160 MiB (the write timeout drops a stalled one).
+    let Ok(file) = fs::File::open(&path) else {
+        return respond(stream, "404 Not Found", "not found");
+    };
+    let size = file.metadata().map(|m| m.len()).unwrap_or(u64::MAX);
     if size > MAX_FILE {
         return respond(stream, "404 Not Found", "not found");
     }
-    let body = match fs::read(&path) {
-        Ok(b) => b,
-        Err(_) => return respond(stream, "404 Not Found", "not found"),
-    };
-    let mut reply = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\n\
+    let head_bytes = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {size}\r\n\
          X-Content-Type-Options: nosniff\r\nCache-Control: no-cache\r\n\
          Connection: close\r\n\r\n",
         mime(&path),
-        body.len()
-    )
-    .into_bytes();
+    );
+    stream.write_all(head_bytes.as_bytes())?;
     if head.method == "GET" {
-        reply.extend_from_slice(&body);
+        io::copy(&mut file.take(size), stream)?;
     }
-    stream.write_all(&reply)?;
     stream.flush()
 }
 
@@ -376,6 +387,7 @@ mod tests {
     use corerouter_engine::{Session, shared};
     use serde_json::{Value, json};
     use std::net::TcpStream;
+    use std::time::Duration;
     use tungstenite::client::IntoClientRequest;
     use tungstenite::http::HeaderValue;
 

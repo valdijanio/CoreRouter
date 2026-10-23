@@ -12,6 +12,10 @@
 //! - our replies in `output`,
 //! - the new connection in `dstnat` (a redirect would send it elsewhere).
 //!
+//! Each walk sees the interface that holds our address in *that* config,
+//! and a change that takes the address away (removed, disabled, or its
+//! interface disabled) is refused as well: no packet reaches us then.
+//!
 //! If the candidate drops one of them and the running config did not, the
 //! commit is refused with the rule that would do it, unless the command
 //! said `force: true` (or Safe Mode is on: then losing the connection
@@ -64,6 +68,10 @@ pub(crate) fn take_force(s: &mut Session, p: &Value) -> Result<()> {
     }
     Ok(())
 }
+
+const HOW_TO_PROCEED: &str = "Enter Safe Mode first \
+     (config.safe-mode.enter: if the connection is lost the change is undone), \
+     or repeat with force=true (transactional mode: config.commit force=true)";
 
 struct Probe {
     what: &'static str,
@@ -157,15 +165,48 @@ impl Session {
         let Some(link) = self.caller().link else {
             return Ok(());
         };
+        let local = plain(link.local.ip());
+        let (iface_before, iface_after) =
+            (local_interface(before, local), local_interface(after, local));
+        let up = |cfg: &Config, iface: &Option<String>| {
+            iface.as_deref().is_none_or(|name| {
+                cfg.interfaces
+                    .values()
+                    .find(|i| i.name.as_str() == name)
+                    .is_none_or(|i| !i.disabled)
+            })
+        };
+        // The address itself goes away, or its interface goes down.
+        if let Some(was_on) = &iface_before
+            && up(before, &iface_before)
+        {
+            let lost = match &iface_after {
+                None => Some(format!("would remove or disable {local}, the address")),
+                Some(on) if !up(after, &iface_after) => {
+                    Some(format!("would disable {on}, the interface holding {local},"))
+                }
+                Some(_) => None,
+            };
+            if let Some(what) = lost {
+                return Err(EngineError::Lockout(format!(
+                    "{what} this connection uses (tcp {} -> {} on {was_on}). {}",
+                    link.peer,
+                    link.local,
+                    HOW_TO_PROCEED
+                )));
+            }
+        }
         let same = before.ip.firewall == after.ip.firewall
             && before.interface_lists == after.interface_lists
-            && dyn_before == dyn_after;
+            && dyn_before == dyn_after
+            && iface_before == iface_after;
         if same {
             return Ok(());
         }
-        for probe in probes(after, &link) {
+        let was_probes = probes(before, &link);
+        for (probe, old) in probes(after, &link).into_iter().zip(was_probes) {
             let now = walk(after, dyn_after, probe.table, probe.chain, &probe.packet);
-            let was = walk(before, dyn_before, probe.table, probe.chain, &probe.packet);
+            let was = walk(before, dyn_before, old.table, old.chain, &old.packet);
             if !cut(probe.table, now) || cut(probe.table, was) {
                 continue;
             }
@@ -187,9 +228,7 @@ impl Session {
                 .map(|i| format!(" on {i}"))
                 .unwrap_or_default();
             return Err(EngineError::Lockout(format!(
-                "{by} {} (tcp {} -> {}{via}). Enter Safe Mode first \
-                 (config.safe-mode.enter: if the connection is lost the change is undone), \
-                 or repeat with force=true (transactional mode: config.commit force=true)",
+                "{by} {} (tcp {} -> {}{via}). {HOW_TO_PROCEED}",
                 probe.what, link.peer, link.local
             )));
         }

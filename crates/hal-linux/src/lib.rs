@@ -499,6 +499,17 @@ mod linux {
                 .map(|d| d.as_secs())
         }
 
+        fn monotonic_secs(&self) -> Option<u64> {
+            // CLOCK_MONOTONIC: an NTP step of the wall clock does not move it.
+            static START: OnceLock<std::time::Instant> = OnceLock::new();
+            Some(
+                START
+                    .get_or_init(std::time::Instant::now)
+                    .elapsed()
+                    .as_secs(),
+            )
+        }
+
         fn features(&self) -> Features {
             *self.features.get_or_init(crate::netlink::features)
         }

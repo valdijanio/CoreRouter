@@ -3,33 +3,57 @@
 
 use std::io::{self, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread;
 use std::time::Duration;
 
 use serde::Deserialize;
+use serde_json::value::RawValue;
 use serde_json::{Value, json};
 
 use corerouter_engine::{Caller, Link};
 
 use crate::auth::Gate;
+use crate::conn::{Slots, Sock, Timeouts, keepalive};
 use crate::dispatch::{Host, dispatch_as, hang_up, new_caller};
 use crate::tls::{self, ServerStream};
 use crate::wire::{Line, MAX_REQUEST_LINE, read_line_bounded, write_line};
 
 pub const MAX_CONNECTIONS: usize = 16;
+/// Longest request a network peer may send before it has logged in (a
+/// login is a few hundred bytes); [`MAX_REQUEST_LINE`] afterwards. Loopback
+/// clients send their token with the first request, so they get the full
+/// size from the start (and `params` is parsed only after the token check).
+pub const MAX_UNAUTHENTICATED_LINE: usize = 64 * 1024;
+/// Largest `id` echoed back; a bigger one is answered with `null`.
+const MAX_ID: usize = 1024;
+/// Largest `params` parsed before the token check (`auth.login`).
+const MAX_OPEN_PARAMS: usize = 4096;
+/// Pause after a failed `accept` (out of file descriptors): retrying at once
+/// would spin a core and flood the log.
+const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 
+/// The envelope of a request. `params` and `id` stay raw text until the
+/// token is checked, so a stranger's 16 MiB array is never turned into a
+/// tree of values (hundreds of MiB).
 #[derive(Deserialize)]
-struct Request {
-    #[serde(default)]
-    id: Value,
+struct Request<'a> {
+    #[serde(default, borrow)]
+    id: Option<&'a RawValue>,
     method: String,
-    #[serde(default)]
-    params: Value,
+    #[serde(default, borrow)]
+    params: Option<&'a RawValue>,
     /// Session or local token (G0.3); never in a URL.
     #[serde(default)]
     token: Option<String>,
+}
+
+fn parse_raw(raw: Option<&RawValue>) -> Result<Value, String> {
+    raw.map_or(Ok(Value::Null), |r| {
+        serde_json::from_str(r.get()).map_err(|e| format!("params: {e}"))
+    })
 }
 
 /// Bind `127.0.0.1:port` (0 = ephemeral). Never binds a routable address.
@@ -94,6 +118,7 @@ impl Shutdown {
 pub struct Endpoint {
     pub listener: TcpListener,
     pub tls: Option<Arc<rustls::ServerConfig>>,
+    pub timeouts: Timeouts,
 }
 
 impl Endpoint {
@@ -101,6 +126,7 @@ impl Endpoint {
         Self {
             listener,
             tls: None,
+            timeouts: Timeouts::default(),
         }
     }
 
@@ -108,7 +134,14 @@ impl Endpoint {
         Self {
             listener,
             tls: Some(config),
+            timeouts: Timeouts::default(),
         }
+    }
+
+    /// Other socket timeouts than [`Timeouts::default`] (tests, tuning).
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts;
+        self
     }
 
     /// Shown in caller names: "tcp", "tls", "ws", "wss".
@@ -124,19 +157,42 @@ impl Endpoint {
 
 /// A connection after the optional TLS handshake.
 pub trait Conn: Read + Write + Send {
+    fn sock(&mut self) -> &mut Sock;
+
     fn tcp(&self) -> &TcpStream;
 }
 
-impl Conn for TcpStream {
-    fn tcp(&self) -> &TcpStream {
+impl Conn for Sock {
+    fn sock(&mut self) -> &mut Sock {
         self
+    }
+
+    fn tcp(&self) -> &TcpStream {
+        Sock::tcp(self)
     }
 }
 
 impl Conn for ServerStream {
-    fn tcp(&self) -> &TcpStream {
-        &self.sock
+    fn sock(&mut self) -> &mut Sock {
+        &mut self.sock
     }
+
+    fn tcp(&self) -> &TcpStream {
+        self.sock.tcp()
+    }
+}
+
+/// Run `serve` for one connection, then [`hang_up`] (undo its Safe Mode)
+/// even when `serve` panicked: a panic outside the engine's own guard
+/// must neither leave a Safe Mode in place nor kill more than this thread.
+pub(crate) fn serve_then_hang_up<H: Host>(
+    host: &mut H,
+    caller: &Caller,
+    serve: impl FnOnce(&mut H) -> io::Result<()>,
+) -> io::Result<()> {
+    let out = catch_unwind(AssertUnwindSafe(|| serve(&mut *host)));
+    hang_up(host, caller);
+    out.unwrap_or_else(|_| Err(io::Error::other("connection thread panicked")))
 }
 
 /// Accept loop shared by the TCP and WebSocket servers: loopback check,
@@ -146,7 +202,7 @@ pub(crate) fn accept_loop<F>(endpoint: Endpoint, what: &str, shutdown: &Shutdown
 where
     F: Fn(Box<dyn Conn>, Caller, Option<IpAddr>) -> io::Result<()> + Clone + Send + 'static,
 {
-    let active = Arc::new(AtomicUsize::new(0));
+    let slots = Slots::default();
     let kind = endpoint.kind(what);
     shutdown.watch(&endpoint.listener);
     // A close that ran before `watch` did not wake this loop.
@@ -162,6 +218,7 @@ where
             Ok(s) => s,
             Err(e) => {
                 log::warn!("{what}: accept failed: {e}");
+                thread::sleep(ACCEPT_BACKOFF);
                 continue;
             }
         };
@@ -174,17 +231,21 @@ where
             log::warn!("{what}: rejected non-loopback peer");
             continue;
         }
-        if active.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
-            active.fetch_sub(1, Ordering::SeqCst);
-            if endpoint.tls.is_none() {
-                let _ = write_line(
-                    &mut stream,
-                    &json!({"id": null, "ok": false, "error": "too many connections"}),
-                );
+        let slot = match slots.take(peer.map(|p| p.ip()), MAX_CONNECTIONS) {
+            Ok(slot) => slot,
+            Err(why) => {
+                log::debug!("{what}: refused a connection: {why}");
+                reject(&mut stream, kind, why);
+                continue;
             }
-            continue;
+        };
+        let timeouts = endpoint.timeouts.clone();
+        if let Err(e) = stream.set_write_timeout(Some(timeouts.write)) {
+            log::debug!("{what}: write timeout not set: {e}");
         }
-        let counter = Arc::clone(&active);
+        if let Err(e) = keepalive(&stream, &timeouts) {
+            log::warn!("{what}: TCP keepalive not set: {e}");
+        }
         let caller = match (peer, stream.local_addr().ok()) {
             // The lockout check (G2.1b) needs both ends of the connection.
             (Some(p), Some(local)) => new_caller(kind, p).with_link(Link { peer: p, local }),
@@ -197,21 +258,43 @@ where
         let spawned = thread::Builder::new()
             .name(format!("{what}-conn"))
             .spawn(move || {
+                // The slot lives in the socket: given back with it, panic or not.
+                let sock = Sock::new(stream, timeouts, Some(slot));
                 let conn: io::Result<Box<dyn Conn>> = match tls {
-                    None => Ok(Box::new(stream)),
-                    Some(cfg) => tls::accept(stream, cfg).map(|s| Box::new(s) as Box<dyn Conn>),
+                    None => Ok(Box::new(sock)),
+                    Some(cfg) => tls::accept(sock, cfg).map(|s| Box::new(s) as Box<dyn Conn>),
                 };
-                let result = conn.and_then(|c| serve(c, caller, peer.map(|p| p.ip())));
+                let result = conn.and_then(|mut c| {
+                    c.sock().handshake_done();
+                    serve(c, caller, peer.map(|p| p.ip()))
+                });
                 if let Err(e) = result {
                     log::debug!("{label}: connection closed: {e}");
                 }
-                counter.fetch_sub(1, Ordering::SeqCst);
             });
         if let Err(e) = spawned {
-            active.fetch_sub(1, Ordering::SeqCst);
             log::error!("{what}: cannot spawn connection thread: {e}");
         }
     }
+}
+
+/// Tell a refused client why, where its protocol allows it before any
+/// handshake: a JSON line on plain TCP, `503` on a plain WebSocket/HTTP
+/// port; nothing over TLS.
+fn reject(stream: &mut TcpStream, kind: &str, why: &str) {
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+    let _ = match kind {
+        "tcp" => write_line(stream, &json!({"id": null, "ok": false, "error": why})),
+        "ws" => {
+            let reply = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: text/plain; charset=utf-8\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{why}",
+                why.len()
+            );
+            stream.write_all(reply.as_bytes())
+        }
+        _ => Ok(()),
+    };
 }
 
 /// Serve forever on the current thread.
@@ -228,9 +311,9 @@ pub fn serve_until<H: Host + Clone + Send + 'static>(
 ) {
     accept_loop(endpoint, "control", shutdown, move |conn, caller, peer| {
         let mut host = host.clone();
-        let out = handle(conn, &mut host, &gate, &caller, peer);
-        hang_up(&mut host, &caller);
-        out
+        serve_then_hang_up(&mut host, &caller, |host| {
+            handle(conn, host, &gate, &caller, peer)
+        })
     });
 }
 
@@ -258,6 +341,12 @@ pub fn spawn_until<H: Host + Clone + Send + 'static>(
 /// Methods answered without a token.
 const OPEN_METHODS: &[&str] = &["ping", "server.info"];
 
+/// The reply to one request, and whether its token (or login) was good.
+pub(crate) struct Answer {
+    pub(crate) reply: Value,
+    pub(crate) authenticated: bool,
+}
+
 /// The reply to one request, or `None` when it is not a JSON request (the
 /// caller then drops the connection). Shared by TCP, TLS and WebSocket.
 pub(crate) fn answer(
@@ -266,32 +355,67 @@ pub(crate) fn answer(
     caller: &Caller,
     peer: Option<IpAddr>,
     text: &str,
-) -> Option<Value> {
+) -> Option<Answer> {
     let req = serde_json::from_str::<Request>(text).ok()?;
+    let id = req
+        .id
+        .filter(|r| r.get().len() <= MAX_ID)
+        .and_then(|r| serde_json::from_str::<Value>(r.get()).ok())
+        .unwrap_or(Value::Null);
     let token = req.token.as_deref();
+    let mut authenticated = false;
     let result = match req.method.as_str() {
-        m if OPEN_METHODS.contains(&m) => dispatch_as(host, caller, m, &req.params).map(|mut v| {
-            if m == "server.info"
-                && let Some(o) = v.as_object_mut()
-            {
-                o.entry("auth").or_insert(json!("required"));
+        m if OPEN_METHODS.contains(&m) => {
+            // The exact build tells which known bugs a router has: strangers
+            // on the network get it only after logging in. (`ping` checks no
+            // token: it is the hot path of health checks.)
+            let stranger = m == "server.info" && !peer.is_some_and(|p| p.is_loopback()) && {
+                let logged_in = token.is_some() && gate.principal(host, token).is_ok();
+                authenticated = logged_in;
+                !logged_in
+            };
+            if stranger {
+                Ok(json!({"name": "corerouter", "auth": "required"}))
+            } else {
+                dispatch_as(host, caller, m, &Value::Null).map(|mut v| {
+                    if m == "server.info"
+                        && let Some(o) = v.as_object_mut()
+                    {
+                        o.entry("auth").or_insert(json!("required"));
+                    }
+                    v
+                })
             }
-            v
-        }),
-        "auth.login" => gate.login(host, caller, peer, &req.params),
+        }
+        "auth.login" => {
+            if req.params.is_some_and(|r| r.get().len() > MAX_OPEN_PARAMS) {
+                Err(format!("auth.login params exceed {MAX_OPEN_PARAMS} bytes"))
+            } else {
+                parse_raw(req.params).and_then(|p| {
+                    let r = gate.login(host, caller, peer, &p);
+                    authenticated = r.is_ok();
+                    r
+                })
+            }
+        }
         "auth.logout" => gate.logout(host, token),
         method => gate.principal(host, token).and_then(|p| {
+            authenticated = true;
             let caller = caller.clone().with_principal(p);
             if method == "auth.whoami" {
                 whoami(host, &caller)
             } else {
-                dispatch_as(host, &caller, method, &req.params)
+                parse_raw(req.params).and_then(|params| dispatch_as(host, &caller, method, &params))
             }
         }),
     };
-    Some(match result {
-        Ok(result) => json!({"id": req.id, "ok": true, "result": result}),
-        Err(error) => json!({"id": req.id, "ok": false, "error": error}),
+    let reply = match result {
+        Ok(result) => json!({"id": id, "ok": true, "result": result}),
+        Err(error) => json!({"id": id, "ok": false, "error": error}),
+    };
+    Some(Answer {
+        reply,
+        authenticated,
     })
 }
 
@@ -310,6 +434,15 @@ fn whoami(host: &mut dyn Host, caller: &Caller) -> Result<Value, String> {
         })
 }
 
+/// The longest request this connection may send now.
+pub(crate) fn line_limit(conn: &mut dyn Conn, peer: Option<IpAddr>) -> usize {
+    if conn.sock().is_authenticated() || peer.is_some_and(|p| p.is_loopback()) {
+        MAX_REQUEST_LINE
+    } else {
+        MAX_UNAUTHENTICATED_LINE
+    }
+}
+
 /// Runs until the client hangs up; the caller then calls [`hang_up`].
 fn handle<H: Host>(
     stream: Box<dyn Conn>,
@@ -320,12 +453,18 @@ fn handle<H: Host>(
 ) -> io::Result<()> {
     let mut reader = BufReader::new(stream);
     loop {
-        let line = match read_line_bounded(&mut reader, MAX_REQUEST_LINE)? {
+        let max = line_limit(reader.get_mut().as_mut(), peer);
+        let line = match read_line_bounded(&mut reader, max)? {
             Line::Eof => return Ok(()),
             Line::TooLong => {
+                let error = if max == MAX_REQUEST_LINE {
+                    "request line exceeds 16 MiB".to_owned()
+                } else {
+                    format!("request line exceeds {} KiB before login", max / 1024)
+                };
                 write_line(
                     reader.get_mut(),
-                    &json!({"id": null, "ok": false, "error": "request line exceeds 16 MiB"}),
+                    &json!({"id": null, "ok": false, "error": error}),
                 )?;
                 return Ok(());
             }
@@ -335,9 +474,12 @@ fn handle<H: Host>(
             continue;
         }
         // Not JSON (e.g. an HTTP request from a web page): drop the connection.
-        let Some(reply) = answer(host, gate, caller, peer, &line) else {
+        let Some(answer) = answer(host, gate, caller, peer, &line) else {
             return Ok(());
         };
-        write_line(reader.get_mut(), &reply)?;
+        if answer.authenticated {
+            reader.get_mut().sock().authenticated();
+        }
+        write_line(reader.get_mut(), &answer.reply)?;
     }
 }
