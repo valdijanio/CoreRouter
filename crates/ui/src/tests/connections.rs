@@ -19,6 +19,8 @@ fn harness() -> Harness {
         &json!({"name": "c1", "inside": "100.64.0.0/22", "outside": "203.0.113.0/28"}),
     )
     .unwrap();
+    // The fast path on, so the Via column has flowtable rows (G2.4).
+    s.execute("ip.firewall.fastpath.set", &json!({"enabled": true})).unwrap();
     let mut h = Harness::with_session(s);
     h.app.open.clear();
     h.app.open(Win::Firewall);

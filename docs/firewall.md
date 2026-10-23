@@ -20,7 +20,8 @@ Entregue em três PRs:
 | `/ip firewall` e `/ipv6 firewall` separados | uma lista só; cada regra tem `family` (`both`, `ipv4`, `ipv6`) | uma política, um lugar; endereços IPv4/IPv6, `protocol=icmp`/`icmpv6` e `to-addresses` restringem a família sozinhos (conflito = erro) |
 | regra comum com comentário como título | regra-cabeçalho de seção (`section`) | agrupa regras na GUI (faixa de título) sem tocar o data plane |
 | `log=yes` em qualquer regra | ação `log` (+ `log_prefix`), que continua para a próxima regra | o mesmo efeito; `log=yes` fica para depois |
-| ações `redirect`, `netmap`, `tarpit`, `fasttrack-connection` … | ainda não | G2.4/G2.3 |
+| ações `redirect`, `netmap`, `tarpit` … | ainda não | G2.3 |
+| `fasttrack-connection` | uma opção só, `ip.firewall.fastpath.set` (o flowtable roda depois das regras; `docs/fastpath.md`); exceções por regra no G2.4c | G2.4 |
 | `limit=50/5s,2:packet` (qualquer tempo, modo `bit`) | `limit=50/1s,2` — tempo 1s, 1m, 1h ou 1d, só pacotes | são as unidades do `limit` do nftables |
 | `address-list-timeout=none-dynamic` / `none-static` | sem `address_list_timeout` = até reiniciar; não existe entrada estática criada por regra | entradas de regra moram no kernel (§3) |
 | marcas como nomes | nomes também; no kernel viram números estáveis (§3) | — |

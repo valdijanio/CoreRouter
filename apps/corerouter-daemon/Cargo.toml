@@ -21,6 +21,10 @@ corerouter-proto-mndp.workspace = true
 # Signs zones (G4.1c-2): ring stays out of the engine and the GUI.
 corerouter-proto-dns = { workspace = true, features = ["dnssec"] }
 corerouter-proto-ntp.workspace = true
+# Tools › Bandwidth Test (G6.4b): the iperf3 protocol; socket2 for the UDP
+# stream sockets that share the server port (SO_REUSEADDR/SO_REUSEPORT).
+corerouter-proto-iperf.workspace = true
+socket2 = { version = "0.6.5", features = ["all"] }
 corerouter-proto-syslog.workspace = true
 corerouter-proto-flow.workspace = true
 log.workspace = true
@@ -32,6 +36,9 @@ serde_json.workspace = true
 rustls.workspace = true
 webpki-roots = "1.0.10"
 httparse = "1.10.1"
+# service/analytics_queue.rs (G4.4f): gzip of the INSERT bodies, pure Rust
+# (miniz_oxide), no C library.
+flate2 = { version = "1.1.10", default-features = false, features = ["rust_backend"] }
 # ip.dns.resolve (G4.1d): record types by name.
 hickory-proto = { version = "0.26.3", default-features = false, features = ["std"] }
 
@@ -48,7 +55,6 @@ rcgen.workspace = true
 # dependency too).
 # netns_dhcp.rs: a DHCP server thread inside another network namespace.
 corerouter-proto-dhcp.workspace = true
-socket2 = { version = "0.6.5", features = ["all"] }
 nix = { version = "0.30.1", default-features = false, features = ["sched", "net"] }
 
 [lints]

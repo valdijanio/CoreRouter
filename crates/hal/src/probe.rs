@@ -50,6 +50,23 @@ impl Family {
     }
 }
 
+/// What a probe is (G6.4c). ICMP echo is what ping and the MTR send;
+/// traceroute can also send UDP or TCP SYN, which firewalls that drop ICMP
+/// let through and which reach a service's own path.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase", tag = "proto")]
+pub enum ProbeProto {
+    #[default]
+    Icmp,
+    /// UDP to `port` (classic traceroute: `port + seq`, so each probe is a
+    /// flow of its own; Paris: `port`, the same flow). The destination
+    /// answers "port unreachable".
+    Udp { port: u16 },
+    /// A TCP SYN to `port` (a `connect`). The destination answers SYN-ACK
+    /// (a service listens; the connection is reset at once) or RST.
+    Tcp { port: u16 },
+}
+
 /// Socket-wide options, fixed when the socket is opened.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SocketOptions {
@@ -63,6 +80,14 @@ pub struct SocketOptions {
     /// Device to send through (`SO_BINDTODEVICE`): an interface, or a VRF
     /// device to use that VRF's routing table.
     pub device: Option<String>,
+    /// What the probes are (default ICMP echo).
+    pub proto: ProbeProto,
+    /// Paris traceroute (Augustin et al., IMC 2006): every probe of the
+    /// socket is the same flow for a per-flow load balancer — same ports,
+    /// and for ICMP the same checksum (a payload word compensates the
+    /// sequence number) — so all of them take one of the ECMP paths
+    /// instead of zig-zagging between them.
+    pub paris: bool,
 }
 
 /// One echo request.
@@ -89,6 +114,16 @@ pub enum ReplyKind {
     /// Too big for a link on the path: IPv4 "fragmentation needed" with DF,
     /// IPv6 "packet too big". `mtu`: the next-hop MTU, when reported.
     TooBig { mtu: Option<u16> },
+    /// The destination answered a UDP or TCP probe: "port unreachable",
+    /// "syn-ack" or "rst" (for traceroute, the end of the path).
+    Reached(String),
+}
+
+/// The 16-bit word that, put in an ICMP echo's payload, keeps its checksum
+/// the same whatever `seq` is (Paris): `seq + word` is `0xFFFF` in one's
+/// complement, so the sum over the header and payload does not change.
+pub fn paris_word(seq: u16) -> u16 {
+    !seq
 }
 
 /// One answer to a probe.

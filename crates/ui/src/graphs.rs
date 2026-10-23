@@ -37,6 +37,9 @@ pub(crate) const WIN: &str = "graphs";
 pub(crate) const QUERY: &str = "system.graph.query";
 pub(crate) const PRINT: &str = "system.graph.print";
 pub(crate) const SET: &str = "system.graph.set";
+pub(crate) const ALERTS: &str = "system.graph.alert.print";
+pub(crate) const ALERT_ADD: &str = "system.graph.alert.add";
+pub(crate) const ALERT_REMOVE: &str = "system.graph.alert.remove";
 /// Most interfaces compared on one chart.
 pub(crate) const MAX_COMPARE: usize = 6;
 /// Refreshes between two asks for the list of series.
@@ -173,6 +176,59 @@ pub(crate) struct Graphs {
     /// The last `system.graph.print` (settings and disk status).
     pub(crate) print: Value,
     pub(crate) settings: Option<SettingsDialog>,
+    /// `system.graph.alert.print` rows.
+    pub(crate) alerts: Vec<Value>,
+    /// The Alerts window and its "new rule" form.
+    pub(crate) alerts_open: bool,
+    pub(crate) new_alert: NewAlert,
+}
+
+/// The form under the alert rules.
+#[derive(Clone)]
+pub(crate) struct NewAlert {
+    pub(crate) interface: String,
+    pub(crate) direction: &'static str,
+    pub(crate) percent: String,
+    pub(crate) minutes: String,
+    pub(crate) capacity: String,
+    pub(crate) error: Option<String>,
+}
+
+impl Default for NewAlert {
+    fn default() -> Self {
+        Self {
+            interface: String::new(),
+            direction: "any",
+            percent: "80".into(),
+            minutes: "5".into(),
+            capacity: String::new(),
+            error: None,
+        }
+    }
+}
+
+impl NewAlert {
+    /// The `system.graph.alert.add` parameters (the router checks them).
+    pub(crate) fn params(&self) -> Value {
+        let num = |t: &str| t.trim().parse::<u64>().map_or_else(|_| json!(t.trim()), |n| json!(n));
+        let mut p = json!({
+            "interface": self.interface,
+            "direction": self.direction,
+            "percent": num(&self.percent),
+            "minutes": num(&self.minutes),
+        });
+        if !self.capacity.trim().is_empty()
+            && let Some(o) = p.as_object_mut()
+        {
+            o.insert("capacity_mbps".into(), num(&self.capacity));
+        }
+        p
+    }
+}
+
+/// A reply to an alert add or remove.
+struct AlertDone {
+    added: bool,
 }
 
 /// The switches of `system.graph.set`: (key, label).
@@ -252,6 +308,15 @@ impl PanelState for Graphs {
                 params: json!({}),
             });
         }
+        // The rules' state changes once a minute; asked with the list, and
+        // every refresh while their window is open.
+        if app.has_command(ALERTS) && (self.alerts_open || n.is_multiple_of(PRINT_EVERY)) {
+            out.push(Query {
+                key: "alerts",
+                command: ALERTS,
+                params: json!({}),
+            });
+        }
         let params = self.params();
         let fresh = self.asked.as_ref() == Some(&params);
         let ready = !self.series.is_empty() && self.wanted().iter().all(|s| self.knows(s));
@@ -296,6 +361,9 @@ impl PanelState for Graphs {
                 }
                 let kept = self.kept.clone();
                 self.compare.retain(|c| kept.iter().any(|k| short(k) == c));
+            }
+            "alerts" => {
+                self.alerts = value.as_array().cloned().unwrap_or_default();
             }
             "query" => {
                 // The answer to what is asked now (an older one is dropped).
@@ -358,10 +426,23 @@ impl PanelState for Graphs {
 
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         self.settings_dialog(app, ctx, area);
+        self.alerts_window(app, ctx, area);
         help::modal(ctx, app.lang, &mut self.help);
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: crate::panel::PanelThen, result: &Result<Value, String>) {
+        let then = match then.downcast::<AlertDone>() {
+            Ok(done) => {
+                match result {
+                    Ok(_) if done.added => self.new_alert = NewAlert::default(),
+                    Ok(_) => {}
+                    Err(e) => self.new_alert.error = Some(e.clone()),
+                }
+                self.tick.set(0);
+                return;
+            }
+            Err(other) => other,
+        };
         if let Ok(r) = then.downcast::<Saved>()
             && let Some(d) = self.settings.as_mut().filter(|d| d.id == r.0)
             && d.status.replied(result)
@@ -502,6 +583,138 @@ impl Graphs {
         self.settings = Some(d);
     }
 
+    /// The bandwidth alert rules: state, remove, and a form to add one.
+    fn alerts_window(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
+        if !self.alerts_open {
+            return;
+        }
+        let l = app.lang.labels;
+        let mut open = true;
+        let mut info: Option<(&'static str, &'static str)> = None;
+        let mut remove: Option<String> = None;
+        let mut add = false;
+        let can_add = app.can().check(ALERT_ADD);
+        let can_remove = app.can().check(ALERT_REMOVE);
+        let interfaces: Vec<String> = self
+            .kept
+            .iter()
+            .filter(|k| k.starts_with("interface:"))
+            .map(|k| short(k).to_owned())
+            .collect();
+        egui::Window::new(tr(l, "Bandwidth Alerts"))
+            .id(Id::unique("graphs-alerts"))
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(area.center())
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                Grid::new("graphs-alert-rules").striped(true).spacing([12.0, 4.0]).show(ui, |ui| {
+                    for (key, title) in [
+                        ("interface", "Interface"),
+                        ("direction", "Direction"),
+                        ("percent", "Above (%)"),
+                        ("minutes", "For (min)"),
+                        ("capacity", "Capacity"),
+                        ("state", "State"),
+                    ] {
+                        ui.horizontal(|ui| {
+                            ui.strong(tr(l, title));
+                            if help::info_button(ui, Id::unique(("graphs-alert-help", key)), tr(l, title)).clicked() {
+                                info = Some((key, title));
+                            }
+                        });
+                    }
+                    ui.label("");
+                    ui.end_row();
+                    for a in &self.alerts {
+                        let t = |k: &str| a.get(k).map(crate::value_text).unwrap_or_default();
+                        ui.label(t("interface"));
+                        ui.label(t("direction"));
+                        ui.label(t("percent"));
+                        ui.label(t("minutes"));
+                        // Judged against, else the rule's own (not judged yet).
+                        let cap = a
+                            .get("capacity_used_mbps")
+                            .and_then(Value::as_f64)
+                            .or_else(|| a.get("capacity_mbps").and_then(Value::as_f64));
+                        let from = t("capacity_from");
+                        ui.label(cap.map_or("–".into(), |c| rate(c * 1e6, "bps")))
+                            .on_hover_text(if from.is_empty() { tr(l, "unknown").to_owned() } else { from });
+                        let state = t("state");
+                        let tone = match state.as_str() {
+                            "alerting" => chip::RED.tone(ui.visuals()),
+                            "ok" => chip::GREEN.tone(ui.visuals()),
+                            _ => chip::neutral_tone(ui.visuals()),
+                        };
+                        let mut tip = t("reason");
+                        if let Some(p) = a.get("last_percent").and_then(Value::as_f64) {
+                            tip = format!("{} {p:.1} %. {tip}", tr(l, "Last minute:"));
+                        }
+                        let word: &'static str = match state.as_str() {
+                            "alerting" => "alerting",
+                            "ok" => "ok",
+                            _ => "unknown",
+                        };
+                        let r = chip::chip(ui, tr(l, word), tone);
+                        if !tip.trim().is_empty() {
+                            r.on_hover_text(tip.trim());
+                        }
+                        let id = t("id");
+                        let r = ui.add_enabled(can_remove.is_ok(), egui::Button::new("−"));
+                        if r.on_hover_text(tr(l, "Remove this rule")).clicked() {
+                            remove = Some(id);
+                        }
+                        ui.end_row();
+                    }
+                    // The new rule.
+                    let f = &mut self.new_alert;
+                    if f.interface.is_empty() {
+                        f.interface = interfaces.first().cloned().unwrap_or_default();
+                    }
+                    ComboBox::from_id_salt("graphs-alert-iface")
+                        .selected_text(f.interface.clone())
+                        .show_ui(ui, |ui| {
+                            for i in &interfaces {
+                                ui.selectable_value(&mut f.interface, i.clone(), i);
+                            }
+                        });
+                    ComboBox::from_id_salt("graphs-alert-dir")
+                        .selected_text(f.direction)
+                        .show_ui(ui, |ui| {
+                            for d in ["any", "rx", "tx"] {
+                                ui.selectable_value(&mut f.direction, d, d);
+                            }
+                        });
+                    let h = ui.spacing().interact_size.y;
+                    ui.add_sized([50.0, h], TextEdit::singleline(&mut f.percent));
+                    ui.add_sized([50.0, h], TextEdit::singleline(&mut f.minutes));
+                    ui.add_sized([120.0, h], TextEdit::singleline(&mut f.capacity).hint_text(tr(l, "link speed")));
+                    ui.label("");
+                    add = ui
+                        .add_enabled(can_add.is_ok(), egui::Button::new("+"))
+                        .on_hover_text(tr(l, "Add the rule"))
+                        .clicked();
+                    ui.end_row();
+                });
+                if let Some(e) = &self.new_alert.error {
+                    ui.colored_label(ui.visuals().error_fg_color, e);
+                }
+                ui.weak(tr(l, "Judged on 1-minute averages; a line goes to the log when it starts and when it ends."));
+            });
+        if let Some((key, title)) = info {
+            self.help = Some(HelpView::new(format!("graphs.alert.{key}"), tr(l, title)));
+        }
+        if let Some(id) = remove {
+            app.run_then(ALERT_REMOVE, json!({"id": id}), crate::panel::then(NAME, AlertDone { added: false }));
+        }
+        if add {
+            self.new_alert.error = None;
+            app.run_then(ALERT_ADD, self.new_alert.params(), crate::panel::then(NAME, AlertDone { added: true }));
+        }
+        self.alerts_open = open;
+    }
+
     fn toolbar(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let l = app.lang.labels;
         ui.horizontal_wrapped(|ui| {
@@ -580,6 +793,17 @@ impl Graphs {
                 .on_hover_text(tr(l, "What the router keeps: system.graph.set"));
             if r.clicked() {
                 self.open_settings(app);
+            }
+            if app.has_command(ALERTS) {
+                let firing = self.alerts.iter().filter(|a| a.get("state").and_then(Value::as_str) == Some("alerting")).count();
+                let r = ui.button(format!("{} ({})", tr(l, "Alerts…"), self.alerts.len()));
+                if r.clicked() {
+                    self.alerts_open = true;
+                    self.tick.set(0);
+                }
+                if firing > 0 {
+                    chip::chip(ui, &format!("{firing} {}", tr(l, "alerting")), chip::RED.tone(ui.visuals()));
+                }
             }
         });
         if !self.refused.is_empty() {
@@ -693,6 +917,36 @@ impl Graphs {
         let range = self.range;
         let one = series.len() == 1;
         let (x0, x1) = span(data);
+        let visuals = ui.visuals().clone();
+        let peak = series
+            .first()
+            .and_then(|s| s.get("stats"))
+            .map(|st| {
+                fields
+                    .iter()
+                    .filter_map(|(f, _, _)| st.get(f).and_then(|x| x.get("max")).and_then(Value::as_f64))
+                    .fold(0.0, f64::max)
+            })
+            .unwrap_or(0.0);
+        // The alert rules of the series shown, as lines at their threshold.
+        let thresholds: Vec<(String, f64)> = if one && self.view == View::Traffic {
+            self.alerts
+                .iter()
+                .filter(|a| a.get("interface").and_then(Value::as_str) == Some(self.series.as_str()))
+                .filter(|a| a.get("disabled").and_then(Value::as_bool) != Some(true))
+                .filter_map(|a| {
+                    let cap = a.get("capacity_used_mbps").and_then(Value::as_f64)?;
+                    let pct = a.get("percent").and_then(Value::as_f64)?;
+                    let dir = a.get("direction").and_then(Value::as_str).unwrap_or("any");
+                    Some((format!("{} {dir} {pct:.0} %", tr(l, "alert")), cap * 1e6 * pct / 100.0))
+                })
+                // A limit far above the traffic would squash the lines to
+                // the floor: drawn only within twice the peak.
+                .filter(|(_, bps)| *bps <= 2.0 * peak)
+                .collect()
+        } else {
+            Vec::new()
+        };
         let colors: Vec<Color32> = series
             .iter()
             .map(|s| line_color(ui, s.get("series").and_then(Value::as_str).map(short).unwrap_or("")))
@@ -708,6 +962,9 @@ impl Graphs {
             .label_formatter(move |h| hover(h, unit))
             .allow_scroll(false)
             .show(ui, |p| {
+                for (label, bps) in &thresholds {
+                    p.hline(HLine::new(label.clone(), *bps).color(AMBER.tone(&visuals).ink).style(LineStyle::dashed_loose()));
+                }
                 for (si, s) in series.iter().enumerate() {
                     let name = s.get("series").and_then(Value::as_str).map(short).unwrap_or("");
                     for (fi, (field, label, _)) in fields.iter().enumerate() {

@@ -275,7 +275,11 @@ fn tool_words(kind: &str, title: &str) -> (String, String) {
         "ping" => ("Ping", "ping ", " para "),
         "mtu" => ("Descoberta de MTU", "mtu ", " para "),
         "mtr" => ("MTR", "mtr ", " para "),
+        "traceroute" => ("Traceroute", "traceroute ", " para "),
         "cable-test" => ("Teste de cabo", "cable test ", " em "),
+        "torch" => ("Torch", "torch ", " em "),
+        "sniffer" => ("Sniffer", "sniffer ", " em "),
+        "bandwidth-test" => ("Bandwidth test", "bandwidth-test ", " com "),
         other => (other, "", " "),
     };
     let target = title.strip_prefix(verb).unwrap_or(title);
@@ -566,6 +570,21 @@ impl Session {
             "more": more,
             "lost": lost,
         }))
+    }
+
+    /// Whether task `id` of `kind` still runs, if the caller may drive it
+    /// (the sniffer's download).
+    pub(crate) fn task_running(&mut self, id: u64, kind: &str) -> Result<bool> {
+        let e = self.task(id)?;
+        if e.kind != kind {
+            return Err(EngineError::bad("id", format!("task {id} is a {}, not a {kind}", e.kind)));
+        }
+        Ok(e.cell.state() == TaskState::Running)
+    }
+
+    /// Whether task `id` is still kept (running or finished).
+    pub(crate) fn task_kept(&self, id: u64) -> bool {
+        self.tasks.entries.contains_key(&id)
     }
 
     pub(crate) fn task_stop(&mut self, id: u64) -> Result<Value> {

@@ -1,6 +1,6 @@
 # Ferramentas de diagnóstico (Tools)
 
-Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR) e G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
+Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR), G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR), G6.4a (Torch e Packet Sniffer), G6.4b (Bandwidth Test com o protocolo do iperf3) e G6.4c (traceroute de uma passada, UDP/TCP e Paris) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
 jitter, percentis, histograma, alertas e exportação.
 
 ## 1. Tarefas (G6.1)
@@ -128,6 +128,36 @@ routing_table?}` — traceroute contínuo, IPv4 e IPv6:
 
 Perda que começa num salto e continua até o destino é um enlace com perda; perda num salto só
 (o resto 0 %) é um roteador que limita respostas ICMP — a leitura é a mesma do `mtr`.
+
+### 4.1b Traceroute, sondas UDP/TCP e Paris (G6.4c)
+
+O traceroute é um **modo do MTR**, não uma janela nova (Tools › MTR, selos MTR | Traceroute):
+
+- `tool.traceroute.start {address, probes? (3, 1–10), timeout_ms?, max_hops?, size? (60),
+  dscp?, src_address?, interface?, routing_table?, use_dns?, as_lookup?, protocol?, port?,
+  paris?}` — **uma passada**: `probes` sondas por salto (as de um salto saem a 50 ms uma da
+  outra: roteadores limitam suas respostas ICMP), o RTT de cada uma em `rtts` por salto, e no
+  terminal (`/tool traceroute 8.8.8.8 protocol=tcp port=443`) a tabela clássica do `traceroute`
+  (`*` sem resposta, `!H`/`!N`/`!P`/`!F`/`!X`, nome, `[AS…]`, `<MPLS …>`). O resumo tem
+  `mode: traceroute`.
+- `tool.mtr.start` ganhou os mesmos `protocol`, `port` e `paris`.
+- **`protocol`**: `icmp` (eco, padrão), `udp` (porta 33434; o destino responde "port
+  unreachable") ou `tcp` (SYN para a porta, padrão 80; o destino responde SYN-ACK ou RST — passa
+  por firewalls que descartam ICMP e UDP). Nenhum usa socket raw: os erros ICMP chegam pela fila
+  de erros do socket (`IP_RECVERR`/`IPV6_RECVERR`, ip(7)), com o roteador que os mandou
+  (`SO_EE_OFFENDER`). No TCP o handshake é completo e resetado na hora (`SO_LINGER` 0), como o
+  `tcpconn` do `traceroute -T` e o `mtr --tcp`: o serviço do destino vê uma conexão aberta e
+  fechada. Fim do caminho: `reached` e `note` = `port unreachable`, `syn-ack` ou `rst`.
+- **`paris`** (padrão **ligado**; Augustin et al., "Avoiding traceroute anomalies with Paris
+  traceroute", IMC 2006): toda sonda é o mesmo fluxo para um balanceador por fluxo — mesmas
+  portas (UDP/TCP) e, no ICMP, o mesmo checksum (uma palavra da carga compensa a sequência:
+  `seq + palavra = 0xFFFF` em complemento de um). Assim o traço segue **um** caminho ECMP real.
+  Desligado (clássico), cada sonda é um fluxo: um salto atrás de ECMP mostra os roteadores
+  alternando (selo `ECMP n` na janela). Paris sobre UDP e TCP manda **uma sonda por vez**: um
+  roteador que cita só os 8 bytes da RFC 792 não deixa distinguir duas sondas do mesmo fluxo
+  (no UDP Paris a sequência vai na carga, que roteadores RFC 1812 §4.3.2.3 citam); a passada
+  fica mais lenta quando há saltos mudos (um timeout cada).
+- Lab: na rede simulada, caminhos de 6 saltos ou mais têm um par ECMP no salto 3 (`sim.rs`).
 
 ### 4.2 Nomes, ASN, privado/CGNAT e MPLS (G6.3b)
 
@@ -280,6 +310,133 @@ Codec em `crates/proto-dns/src/dig.rs` (sem sockets, compila em WASM); a tarefa 
 `crates/engine/src/dns_lookup.rs`; o transporte no daemon em
 `apps/corerouter-daemon/src/service/dns_lookup.rs` (`DnsBackend::exchange`).
 
+### 4.4 Torch (G6.4a)
+
+O `/tool torch` do RouterOS: o tráfego de uma interface ao vivo, **por fluxo**.
+
+`tool.torch.start {interface, group?, src_address?, dst_address?, port?, protocol?, vlan_id?,
+dscp?, mac_address?, sampling?, duration?, interval_ms?, top?, as_lookup?}` — tarefa como o
+Ping (`tool.task.poll` / `tool.task.stop`); no terminal, `/tool torch ether1` ou `torch ether1`.
+
+- **Agrupamento** (`group`): `src`, `dst`, `proto`, `port`, `vlan`, `dscp`, `mac` (padrão
+  `src,dst`). Campo fora do agrupamento não separa linhas (o `0.0.0.0/0` do RouterOS). `vlan`
+  inclui as interfaces VLAN da interface (cada quadro é contado uma vez, na VLAN dele).
+- **Orientação:** cada linha é uma conversa vista da interface. `src` é o lado da interface (quem
+  manda o que chega: num acesso, o assinante), `dst` o outro lado; **Rx** é o que chegou pela
+  interface e **Tx** o que o roteador mandou por ela. O filtro usa a mesma orientação.
+- **Por intervalo** (`interval_ms`, padrão 1 s, o *freeze-frame* do RouterOS) um evento com as
+  `top` linhas mais pesadas (padrão 64; o resto soma em `others`), `total`, os **contadores da
+  própria interface** (`kernel`) e quanto deles a captura leu (`seen_pct`). Taxas em bit/s e
+  pacotes/s.
+- **AS do destino** (`as_lookup`, padrão ligado): o mesmo do MTR (`Prober::origin_as`, Team
+  Cymru ou a tabela BGP), sem esperar; privados e CGNAT ganham `dst_scope` e não são
+  consultados.
+- **Amostragem** (`sampling`): `auto` (padrão) lê tudo até **500 kpps**; acima, um em
+  N = ⌈pps / 250 k⌉ (no máximo 4096), escolhido ao acaso **no kernel** (filtro BPF clássico,
+  `SKF_AD_RANDOM`), e cada quadro lido conta N vezes; volta a ler tudo abaixo de 300 kpps
+  (histerese; só troca N quando muda 2× ou mais). As linhas viram estimativas (`estimated`,
+  aviso em `warnings`). `off` lê sempre tudo (avisa quando `seen_pct` < 90 %); `2..4096` fixa N.
+- **Assinante:** a GUI pede `ip.identity.lookup` (G0.25) para as origens, quando o roteador tem o
+  comando, e mostra o selo ao lado do endereço.
+
+Captura: `corerouter_hal::capture::PacketCapture` (L1). `hal-linux` (`capture.rs`): um socket
+`AF_PACKET` (`SOCK_RAW`, `ETH_P_ALL`) por dispositivo, preso a ele (endereço do `getifaddrs`), lido
+por `recvmsg` com `MSG_TRUNC` (tamanho real no fio) em lotes de 1024, numa thread de tarefa, fora
+do lock. O filtro BPF de cada socket faz a amostragem e, no pai de VLANs capturadas à parte,
+descarta os quadros com tag (tirada pela NIC, `SKF_AD_VLAN_TAG_PRESENT`, ou no quadro). Sem
+`unsafe`: nada de `TPACKET_V3` (anel em `mmap`) nem `PACKET_AUXDATA` (opção sem API segura); o
+caminho rápido futuro é um backend XDP (G2.5) atrás do mesmo trait. O lab virtual tem
+`SimCapture`: tráfego determinístico (assinantes CGNAT e privados, uma VLAN 100, um fluxo IPv6)
+para os destinos da rede simulada (§5.2), com contadores próprios.
+
+Números (**medido**, 2026-10-23, release, 32 CPUs, veth num namespace,
+`hal-linux/benches/netns_capture.rs` e `engine/benches/torch.rs`): uma thread de captura lê até
+**~2,0 Mpps** sem amostrar (100 % de um núcleo; com 8,3 Mpps oferecidos vê 25 %); com 1:8 no
+kernel cobre 11,3 Mpps (100 % estimado) a 87 % de CPU, e com 1:64 cobre 12,8 Mpps a 35 %.
+Agrupar custa 75–83 ns por quadro (12–14 milhões/s), então o socket domina. Com `auto`, 500 kpps
+custam ~30 % de um núcleo e acima disso o custo fica em ~250 kpps lidos.
+
+### 4.5 Packet Sniffer (G6.4a)
+
+O `/tool sniffer` do RouterOS, limitado: grava os quadros de uma interface num **pcap** (formato
+clássico da libpcap, `draft-ietf-opsawg-pcap`: magic `A1B2C3D4`, versão 2.4, LinkType 1
+Ethernet, carimbo em µs) para abrir no Wireshark.
+
+- `tool.sniffer.start {interface, src_address?, dst_address?, port?, protocol?, vlan_id?,
+  mac_address?, snaplen?, file_limit?, duration?}` — o mesmo filtro do Torch; `snaplen` bytes de
+  cada quadro (64–9216, padrão **128 = só cabeçalhos**); `file_limit` em KiB (1–65536, padrão
+  4096); `duration` em s (1–3600, padrão 60). Termina sozinho no prazo ou no limite
+  (`end: duration reached | file limit reached | stopped`); pacotes além do limite contam em
+  `dropped_by_limit`.
+- `tool.sniffer.download {id, offset?, length?}` — o arquivo em pedaços de até 4 MiB (base64),
+  com `total` e `complete`; a GUI junta e salva como o CSV do Ping (`$COREROUTER_EXPORT_DIR`,
+  `~/Downloads`; download no navegador).
+- O arquivo fica **na memória** do roteador (o engine não tem disco: roda em wasm também) até a
+  tarefa sumir (300 s depois da última consulta) ou outra captura precisar do lugar: no máximo
+  **2 capturas** guardadas (≤ 128 MiB no pior caso).
+- **Privacidade:** quadros inteiros são dados dos assinantes. `tool.sniffer.start` exige o grupo
+  **write** (o Torch, só cabeçalhos agregados, fica em `read`); a GUI mostra o selo âmbar
+  `payloads` quando `snaplen` > 128.
+
+### 4.6 Bandwidth Test (G6.4b)
+
+Teste de vazão com o **protocolo do iperf3**: o roteador testa contra qualquer `iperf3 -s` (3.x)
+e responde a qualquer `iperf3 -c`. Não é o btest do MikroTik (formato proprietário, decisão G5 em
+`docs/gaps.md`): um RouterOS não responde a ele, e ele não responde ao `/tool bandwidth-test` do
+RouterOS.
+
+**Cliente** — `tool.bandwidth-test.start {address, port?, protocol?, direction?, streams?,
+duration?, bandwidth?, length?, dscp?, force?}` (tarefa; terminal `/tool bandwidth-test
+198.51.100.7` ou `bandwidth-test …`):
+
+| Parâmetro | Padrão | Notas |
+|---|---|---|
+| `address` | — | IP ou nome (DNS do roteador) de um servidor iperf3 |
+| `port` | 5201 | a do iperf3; os streams de dados usam a mesma porta, TCP e UDP |
+| `protocol` | `tcp` | `udp`: taxa fixa, mede perda e jitter (RFC 1889 §6.3.1) |
+| `direction` | `send` | `receive` = `-R`; `both` = `--bidir`; `transmit` é sinônimo de `send` (RouterOS) |
+| `streams` | 1 | 1–128 (`-P`) |
+| `duration` | 10 | 1–300 s: **prazo máximo** do teste |
+| `bandwidth` | TCP ilimitado, UDP `10M` | por stream, bit/s com k/M/G (×1000, como o `-b`) |
+| `length` | TCP 128 KiB, UDP 1460 | bloco TCP / carga UDP |
+| `force` | não | testar pela porta desta conexão fora do Safe Mode |
+
+- **Risco (lotar um enlace):** a resposta traz `warning` ("fills the path with 1.2 Gbit/s for 8 s
+  through ether1") e a interface de saída (`ip.route.lookup`); se ela carrega a conexão de quem
+  pediu, o teste é **recusado** fora do Safe Mode (sem `force`) — encher o enlace de gerência é
+  perder o acesso. A GUI pede confirmação antes de todo Start.
+- **Eventos** por segundo: `tx_bps`, `rx_bps`, UDP `lost`/`packets`/`jitter_ms`, e `cpu` = a CPU
+  do **roteador inteiro** (`/proc/stat`, todos os núcleos) — a pergunta é "o teste carregou o
+  roteador?". **Resumo:** médias e picos, `samples` (o gráfico), `cpu_avg`/`cpu_max` e, no fim,
+  `upload`/`download` com o que o **receptor** contou (no `send`, o número do servidor), perda %,
+  jitter, retransmissões (quando o outro lado informa), `remote_cpu` e o relatório de texto do
+  servidor (`get_server_output`).
+- Sem daemon (lab no processo da GUI/CLI) o teste roda num backend **simulado** determinístico
+  (940 Mbit/s; `198.51.100.0/24` com 25 % de perda no UDP), marcado `simulated`.
+
+**Servidor** — `tool.bandwidth-server.set {enabled?, port?, allowed_addresses?, max_duration?,
+max_streams?, max_rate?}` (config, journal e rollback) e `tool.bandwidth-server.get` (configuração
+e `status`: `state` stopped/listening/testing/failed, `tests_served`, `refused`, o teste atual e o
+último, `last_error`):
+
+- **Desligado por padrão**; ligar exige `allowed_addresses` (`0.0.0.0/0`, `::/0` = qualquer um).
+  Cliente fora da lista recebe o "servidor ocupado" do iperf3 (`ACCESS_DENIED`) antes de qualquer
+  leitura e conta em `refused` (com linha no log).
+- Um teste por vez (o próximo recebe "busy"); limites `max_duration` (padrão 60 s, até 3600),
+  `max_streams` (8), `max_rate` (total do teste; com limite, TCP sem `-b` é recusado). Recusa
+  com o código de erro do iperf3 (37 duração, 6 streams, 27 taxa), que o `iperf3 -c` imprime.
+- Serviço `bandwidth-server` sob o supervisor (G0.10): System › Services mostra o estado e a
+  porta; a cada segundo relê a config (porta nova religa, `enabled=no` fecha).
+- Autenticação RSA do iperf3 (`--username`/`--rsa-public-key-path`) fica para a G6.11; a ACL e
+  os limites cobrem o uso num ISP.
+
+Implementação: protocolo puro em `crates/proto-iperf` (estados de um byte, cookie de 37 bytes,
+JSON com tamanho em 4 bytes big-endian, parâmetros e resultados com os tipos que o iperf3 lê,
+cabeçalho UDP de 32 ou 64 bits, perda e jitter; proptest); sockets no daemon
+(`service/iperf.rs`: uma thread por stream, timeouts de 200 ms, ritmo por stream; UDP com buffer
+de recepção de 4 MiB; `service/bandwidth_server.rs`). Especificação do protocolo, lida do código
+do iperf3 3.22: nota de pesquisa da G6.4b.
+
 ## 5. Quem envia os pacotes
 
 O engine só fala com o trait `corerouter_hal::probe::Prober` (L1): `resolve`, `open` →
@@ -348,10 +505,20 @@ A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
   20 000 respostas: arquivo em `$COREROUTER_EXPORT_DIR`, `~/Downloads` ou o diretório atual na
   nativa, download no navegador); **Discover MTU** (primeiro endereço). Botões cinza com o motivo
   (G1.16). Fechar a janela para as tarefas dela.
-- **GUI** — Tools › MTR: endereço, rodadas, intervalo, saltos máximos, origem, interface,
+- **GUI** — Tools › MTR: modo MTR ou Traceroute, endereço, rodadas (ou sondas por salto),
+  protocolo, porta, Paris (ⓘ em cada um), intervalo, saltos máximos, origem, interface,
   tabela; Start (Enter) / Stop (Esc); tabela por salto ao vivo (Hop, Host, Loss %, Sent,
   Last, Avg, Best, Worst, StDev) com a perda colorida e uma barra da média relativa ao salto
   mais lento.
+- **GUI** — Tools › Torch: interface, agrupamento em selos, filtro (origem, destino, porta,
+  protocolo), amostragem; tabela ao vivo com a pílula do AS no destino, `CGNAT`/`privada` e o
+  selo do assinante na origem, selos de amostragem e de cobertura (`seen`), totais e os
+  contadores da interface embaixo; ⓘ em cada campo. Tools › Packet Sniffer: interface, filtro,
+  bytes por quadro, limite e duração; barra do arquivo e **Download .pcap**.
+- **GUI** — Tools › Bandwidth Test: aba Test (endereço, porta, protocolo, direção, streams,
+  duração, taxa; confirmação antes do Start; gráfico Tx/Rx por segundo; selos da CPU do roteador
+  e da remota; tabela por direção com média, pico, perda, jitter e retransmissões) e aba Server
+  (estado, testes atendidos e recusados, último teste, formulário com ⓘ em cada campo).
 - **Terminal** (G0.8 + G6.5) — como no RouterOS: `ping 8.8.8.8`, `/ping 8.8.8.8`,
   `/tool ping 8.8.8.8 count=5 size=1400`, `/tool ping address=…`; `traceroute 8.8.8.8`,
   `/tool traceroute …` ou `mtr …` para o MTR; `/tool ping mtu 198.51.100.3`. Sem `count` roda

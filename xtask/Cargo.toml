@@ -9,6 +9,8 @@ repository.workspace = true
 
 [dependencies]
 serde_json.workspace = true
+# G2.5: hash of the XDP sources behind the prebuilt object (`ebpf.rs`).
+sha2 = "0.10.9"
 
 [lints]
 workspace = true

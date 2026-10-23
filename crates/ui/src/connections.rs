@@ -172,6 +172,12 @@ fn via_kind(via: &str) -> Kind {
     }
 }
 
+/// The source address of a connection, without its port.
+fn source_ip(r: &Value) -> String {
+    let src = text(r, "src");
+    src.split([' ', ':']).next().unwrap_or("").to_owned()
+}
+
 pub(crate) fn row(r: &Value) -> Row {
     let total = r.get("orig_bytes").and_then(Value::as_u64).unwrap_or(0)
         + r.get("repl_bytes").and_then(Value::as_u64).unwrap_or(0);
@@ -415,12 +421,27 @@ impl PanelState for Connections {
         if self.filters(ui, l) {
             app.cache.refreshed_at = None;
         }
+        if !self.filters.subscriber.is_empty() {
+            let sub = self.filters.subscriber.clone();
+            ui.horizontal(|ui| {
+                ui.weak(format!("{}: {sub}", tr(l, "Subscriber")));
+                crate::identity::badge(app, ui, "connections", &sub);
+            });
+        }
         let total = self.total();
         let rows: Vec<Row> = self
             .list
             .get("rows")
             .and_then(Value::as_array)
-            .map(|a| a.iter().map(row).collect())
+            .map(|a| {
+                a.iter()
+                    .map(|r| {
+                        let mut row = row(r);
+                        crate::identity::add_chips(app, ui, "connections", &mut row, 1, &source_ip(r));
+                        row
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         let selection = self.table.selection(&rows);
         let can = app.can();
@@ -482,13 +503,17 @@ impl PanelState for Connections {
                                 .and_then(|a| a.iter().find(|r| text(r, "id") == *first))
                             && action(ui, tr(l, "Filter by this source"), Ok(()))
                         {
-                            let src = text(r, "src");
-                            let addr = src.split([' ', ':']).next().unwrap_or("").to_owned();
-                            pick_subscriber = Some(addr);
+                            pick_subscriber = Some(source_ip(r));
                         }
                     }
                 });
-                let _ = out;
+                let list = &self.list;
+                crate::identity::table_chip(app, ui, "connections", &out, &rows, |key| {
+                    list.get("rows")
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.iter().find(|r| text(r, "id") == key))
+                        .map(source_ip)
+                });
             });
             ui.vertical(|ui| {
                 ui.set_width(side);
@@ -498,8 +523,17 @@ impl PanelState for Connections {
                         self.help = Some(HelpView::new("connections.top", tr(l, "Top subscribers")));
                     }
                 });
-                let rows: Vec<Row> = self.top.iter().map(top_row).collect();
+                let rows: Vec<Row> = self
+                    .top
+                    .iter()
+                    .map(|r| {
+                        let mut row = top_row(r);
+                        crate::identity::add_chips(app, ui, "connections", &mut row, 0, &text(r, "subscriber"));
+                        row
+                    })
+                    .collect();
                 let out = table::show(ui, TOP_TABLE, 0.0, &mut self.top_table, &TOP_COLUMNS, &rows, |_, _| {});
+                crate::identity::table_chip(app, ui, "connections", &out, &rows, |key| Some(key.to_owned()));
                 if let Some(k) = out.clicked.or(out.opened) {
                     pick_subscriber = Some(k);
                 }

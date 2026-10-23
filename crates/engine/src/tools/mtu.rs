@@ -75,7 +75,7 @@ impl Search<'_> {
                     return ControlFlow::Continue(());
                 }
                 got = Some(match r.kind {
-                    ReplyKind::Echo => Try::Pass(ms(r.rtt)),
+                    ReplyKind::Echo | ReplyKind::Reached(_) => Try::Pass(ms(r.rtt)),
                     ReplyKind::TooBig { mtu } => Try::TooBig(mtu),
                     ReplyKind::Unreachable(why) => Try::Unreachable(why),
                     ReplyKind::TtlExceeded => Try::Unreachable("TTL exceeded".into()),

@@ -2871,3 +2871,421 @@ continuação indentadas).
   se a tradução divergir). Sessões em paralelo registravam a mesma palavra ("changed", "of") em
   catálogos diferentes, e cada combinação quebrava o lote da fila (#159, #165, 2026-10-23) sem
   nenhum erro de verdade: o `lookup` pega a primeira, e com o mesmo texto não há diferença na tela.
+
+- 2026-10-23 — G0.25: Identidade do assinante: um selo com o nome ao lado do IP.
+
+  - Comando `ip.identity.lookup {addresses, at?, sources?}`:
+    - até 4096 endereços por chamada;
+    - fontes em ordem configurável: login PPPoE (gancho para a G4.3), comentário da concessão fixa,
+      host-name da concessão, comentário de IP › Addresses (/29 ou menor), comentário de
+      address-list (até 256 endereços) e PTR das zonas próprias;
+    - devolve o primário, `more` (nomes diferentes além dele) e todos com fonte, detalhe e `ref`
+      (janela, aba, id);
+    - IP público com porta passa pelo CGNAT (a função de mapeamento da G2.3, no instante pedido);
+    - `at` usa o histórico de concessões (G4.2b);
+    - nomes limpos (sem controle nem bidi) e cortados em 64 caracteres.
+  - Desempenho: o índice da config é feito uma vez por mudança das seções (comparação de ponteiro
+    dos `CowArc`) e guardado no `Session::ext`; uma consulta é um hash por endereço, sem I/O sob o
+    lock.
+  - GUI (`crates/ui/src/identity.rs`):
+    - selo reutilizável: o nome com ícone, `+N`, tooltip com todas as fontes e clique que abre o item
+      de origem selecionado;
+    - aplicado em IP › Firewall › Connections (origem, top assinantes e filtro de assinante) e em
+      CGNAT › Quem era? (o nome de quem tinha o IP no instante consultado, `badge_at`) e em
+      IP › Traffic Flow › Top talkers (no lugar do selo simples da G4.4b);
+    - traduções em `crates/ui/src/i18n/auto/identity_{en,pt}.rs`;
+    - Settings › Subscriber identity: liga/desliga, ordem das fontes, onde mostrar; guardado com o
+      tema (preferência do cliente);
+    - ⓘ com explicação em PT e EN; padrão documentado em `docs/ui-style.md`.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test identity
+  cargo test -p corerouter-ui --lib identity
+  corerouter-cli run ip.identity.lookup '{"addresses":["100.64.0.1","203.0.113.0:1100"]}'
+  ```
+
+  Na GUI (daemon de lab): crie um pool CGNAT, ponha um comentário numa concessão fixa de
+  100.64.0.1 e abra IP › Firewall › Connections. Passe o mouse no selo e clique nele.
+
+- 2026-10-23 — G2.3e: CGNAT, parte 5: a bateria final e os números.
+
+  - **Esgotamento no kernel** (`netns_cgnat::a_subscriber_out_of_ports_never_borrows_another_s`, RFC 6888
+    REQ-3/11): um assinante com 64 portas abre 80 fluxos para o mesmo servidor. Passam exatamente 64,
+    todos dentro do slot dele (nunca uma porta do vizinho), e o kernel conta as recusas, que é o que os
+    alertas leem.
+  - **Propriedades** (`crates/engine/tests/cgnat_battery.rs`):
+    - para formas aleatórias de pool, o que o planner (`tool.ip-calc.cgnat.plan`) diz que cabe é o que
+      o pool criado com os parâmetros dele faz;
+    - a prévia é a tabela do pool;
+    - todo assinante volta pelo "Quem era?" a partir do próprio slot;
+    - entrada hostil no planner, na exportação e no "Quem era?" vira erro, nunca panic.
+  - **Benchmarks:**
+    - `hal-linux/benches/netns_cgnat_pps.rs`: gerador `AF_PACKET` em Rust; as respostas de cada fluxo
+      saem do conntrack, para os fluxos UDP ficarem estabelecidos e entrarem no flowtable. Mede pps sem
+      NAT, com CGNAT e com CGNAT + fast path, e conexões novas/s com e sem EIM e só com conntrack;
+    - `engine/benches/cgnat_who_was.rs`: latência do "Quem era?" com 1 e 365 épocas.
+  - **Relatório** em `docs/cgnat.md` §6, incluindo o que veth mede e o que só hardware mostra.
+    - Achado: com o slot quase cheio, abrir conexão fica ~20× mais caro (a busca de porta livre no
+      `nf_nat`). O alerta de 90 % avisa antes.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test cgnat_battery
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_cgnat
+  COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p corerouter-hal-linux --bench netns_cgnat_pps
+  cargo bench -p corerouter-engine --bench cgnat_who_was
+  ```
+
+- 2026-10-23 — G2.4: Fast path (G2.4a): o flowtable do Linux (`nf_flowtable`), equivalente ao FastTrack do RouterOS, por
+  nfnetlink no mesmo encoder do CGNAT (tabela `inet corerouter_fastpath`, sem o binário `nft`).
+
+  - **Uma opção, não duas regras:** `ip.firewall.fastpath.set {enabled}`. A cadeia que põe as
+    conexões no flowtable (`ct state established flow add @ft`, TCP e UDP, IPv4 e IPv6) roda em
+    `forward` com prioridade `filter + 10`, **depois** do firewall: só entra o que as regras
+    aceitaram, e uma regra de drop sempre vale. Ao mudar o firewall o flowtable é recriado, e as
+    conexões voltam a passar pelas regras.
+  - **Portas:** `interfaces` vazio = todas as Ethernet e bonds (sem os slaves). Nomear uma VLAN é
+    recusado, com a sugestão de nomear a porta (o kernel 5.13+ segue as VLANs).
+  - **Hardware:** `hw_offload`:
+    - `auto` (padrão) pede `flags offload` e, se o kernel recusar, cai para software, e o
+      `status` diz por quê;
+    - `yes` recusa a mudança, já no comando quando nenhuma porta é capaz;
+    - `no` fica só em software.
+  - **`ip.firewall.fastpath.status`:** porta a porta, com:
+    - `hardware`/`software`/`off`;
+    - driver, firmware, devlink, modo do eSwitch (`DEVLINK_CMD_ESWITCH_GET`), representor e
+      `hw-tc-offload`;
+    - o motivo e o comando que falta (`devlink dev eswitch set … mode switchdev`, ou o
+      `interface.ethernet.set` do hw-tc-offload);
+    - quantas conexões estão no flowtable (software e hardware, pelo conntrack).
+  - **Lab:** ether7 e ether8 simulam portas ConnectX-6 Dx (legacy e switchdev). A coluna Via de
+    Connections só mostra flowtable com o fast path ligado.
+  - **Janela IP › Fast Path:**
+    - formulário com ⓘ;
+    - selos de estado;
+    - tabela das portas, com os selos da placa;
+    - os comandos de correção com Copiar.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test fastpath
+  cargo test -p corerouter-ui fastpath
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_fastpath
+  ```
+
+  O teste em namespace (veth + CGNAT) abre uma conexão TCP de um assinante e confere no conntrack que
+  ela foi traduzida e entrou no flowtable (`OFFLOAD`). `flags offload` numa veth é recusado: `auto`
+  roda em software, `yes` é recusado inteiro, e desligar remove a tabela. **Medido** (Ryzen AI MAX+ 395,
+  2026-10-23). A vazão com e sem flowtable fica para a bateria do G2.3e.
+
+- 2026-10-23 — G2.5a: XDP, parte 1: base e filtro anti-DDoS antes do kernel (`docs/xdp.md`).
+
+  - **Programa XDP em Rust** (`crates/dataplane-ebpf`, `aya-ebpf`, fora do workspace, nightly
+    fixado + `bpf-linker`), único crate com `unsafe` (6 blocos com `SAFETY:`, listados no
+    `docs/xdp.md` para revisão humana). A lógica (parse Ethernet/QinQ/IPv4/IPv6/TCP/UDP/ICMP,
+    decisão, token bucket, layout dos mapas) fica em `crates/dataplane-ebpf-common` (`no_std`, sem
+    `unsafe`), compilada também para o host e testada lá.
+  - **Objeto pré-compilado** em `crates/dataplane-ebpf/prebuilt/` com o hash das fontes:
+    `cargo xtask ebpf` recompila; o passo `ebpf-check` do `cargo xtask ci` reprova fonte mudada sem
+    recompilar, sem precisar do nightly.
+  - **Filtro**: listas de bloqueio (address lists do firewall, prefixos v4/v6 em LPM trie, faixas
+    em CIDR exato, entradas dinâmicas inclusive), listas de exceção, limite de taxa por origem
+    (token bucket em LRU hash), descarte de malformados (RFC 1858 incluso) e de flags TCP
+    impossíveis (tabela do `nf_conntrack`), contadores por interface e motivo, top origens.
+  - **`hal-linux`**: carrega só quando há interface configurada, `auto` = native senão generic,
+    sincroniza os mapas por diferença, XDP por último no `apply` (falhou: o resto volta), links do
+    processo do daemon (morreu: fail-open).
+  - **Comandos** `ip.firewall.xdp.interface.add/set/remove/list`, `ip.firewall.xdp.set/print/top`,
+    `ip.firewall.xdp.reset-counters`; pps calculado no engine; **lockout**: bloquear o endereço da
+    própria sessão de gerência é recusado (`force`/Safe Mode), avisos de lista vazia e taxa baixa.
+  - **Janela** IP › Firewall XDP: Interfaces (modo, ativo, pps, descartes por motivo), Filtro, Top
+    Sources, ⓘ em cada rótulo (PT e EN). Laboratório virtual simula os contadores.
+  - **Testes**: proptest no host (parse, cortes, padding, listas contra LPM de referência, token
+    bucket); no CI com root (`cargo xtask xdp-root`, ligado por `ci/kernel-modules/veth`): o
+    verificador aceita, native e generic em veth, **diferencial kernel × host** em 4000 quadros
+    gerados/cortados/corrompidos pelo `BPF_PROG_TEST_RUN`, ping real para contadores, top, exceção
+    e taxa; engine (sucesso, validação, rollback, lockout) e UI.
+  - Teste: `cargo test -p corerouter-dataplane-ebpf-common -p corerouter-engine --test xdp`,
+    `cargo test -p corerouter-ui xdp`; na GUI, IP › Firewall XDP.
+
+- 2026-10-23 — G2.5b: XDP, parte 2a: a aritmética de portas do CGNAT determinístico (RFC 7422 §2) sai do
+  `Layout` do model para o crate novo `corerouter-cgnat-map` (L0, `no_std`, sem alocação, sem
+  `unsafe`, sem panic): número do assinante ↔ (número do endereço público, bloco) e bloco ↔ portas
+  (`Geometry::split/join/ports_of/block_of`). O `Layout` chama essas funções e mantém a API
+  pública (`forward/reverse/slot/locate/block/subscriber_index/per_address/capacity`); ganha
+  `geometry()`. O programa XDP da G2.5b vai usar as mesmas funções: uma fórmula só para o fast path
+  e para o "Quem era?". Combinado com a sessão do CGNAT (G2.3).
+
+  Testes: os proptests do `model::cgnat` passam sem mudança; no crate novo, o exemplo da RFC 7422
+  §2.3, geometria degenerada sem panic e proptests (ida e volta, blocos sem sobreposição, igual à
+  fórmula em inteiros largos). `cargo test -p corerouter-cgnat-map -p corerouter-model cgnat`.
+
+- 2026-10-23 — G4.4b: Traffic Flow, parte 3: a janela **IP › Traffic Flow**, com quatro abas.
+
+  - **Estado** no topo: `running`/`stopped`/`error`, a fonte (`conntrack` ou `lab`), se o kernel
+    conta bytes e marca tempos, registros por minuto, e estouros do kernel e descartes da fila
+    quando há.
+  - **General:** as configurações, com Apply e Revert. O destino nos eventos de NAT mostra o selo
+    "Marco Civil art. 14" quando ligado.
+  - **Targets:** os coletores no padrão de lista (G0.24): barra + − ✓ ✗ 💬, estado por selo, coletor,
+    versão e transporte, registros por minuto, templates (quantas vezes e a última), fila e perda. O
+    modal de adicionar e editar usa a pré-visualização nova `ip.traffic-flow.target.preview`, que
+    diz o que vai enviar, as checagens e os comandos.
+  - **Top Talkers:** os últimos 1, 5, 15 ou 60 minutos, por bytes, pacotes ou conexões, com envio e
+    recebido. O nome do assinante aparece quando o roteador tem `ip.identity.lookup` (G0.25). **Copy
+    CSV** copia os registros do período.
+  - **Statistics:** todos os contadores.
+
+  Toda caixa e todo rótulo têm ⓘ com a explicação em português e inglês. A entrada do menu tem
+  sinônimos (netflow, ipfix, log de NAT, Marco Civil…). O lab ficou com um tráfego mais realista,
+  de poucos Mbit/s por assinante pesado.
+
+  Teste: `cargo test -p corerouter-ui traffic_flow` e `cargo test -p corerouter-engine
+  traffic_flow`. Screenshots nos temas escuro e claro olhados.
+
+- 2026-10-23 — G4.5: Gráficos de tráfego, parte 3: **alertas de banda**.
+
+  - Regras em `system.graphing.alerts` (config, com revisão e transação):
+    - comandos `system.graph.alert.add/set/remove/print`;
+    - campos: interface, direção (`rx`, `tx` ou `any`, a mais ocupada a cada minuto), `percent` (1–100), `minutes` (1–1440), `capacity_mbps` opcional e `disabled`;
+    - a interface precisa estar guardada no histórico; o erro diz como incluí-la.
+  - **Avaliação** (`engine::graph::alert`):
+    - nas médias de 1 minuto do histórico, a cada minuto fechado: rajada menor que um minuto não conta, e um minuto desconhecido quebra a sequência;
+    - a capacidade é a da regra ou a velocidade negociada da porta (`Hal::ethernet_monitor`, consultada uma vez por minuto, nunca a cada segundo);
+    - sem nenhuma das duas, o estado é `unknown`, com o motivo.
+  - **Log:**
+    - uma linha `warning` (tópico `interface`) quando começa, como `graphing: ether8 any 50% of 40 Mbit/s: above for 2 min (last minute 62.5%)`;
+    - uma linha `info` quando termina (`back below`), uma vez cada;
+    - o log remoto (`system.logging`) pode encaminhar as duas.
+  - **GUI:** botão "Alerts… (n)" na janela Graphs, com selo vermelho quando há regra alertando.
+    - A janela lista as regras: estado em selo (ok, alertando, desconhecido; o tooltip mostra o último minuto e o motivo), capacidade, remover, e um formulário para adicionar. ⓘ em cada coluna.
+    - O gráfico de uma interface traz a linha tracejada do limiar de cada regra dela.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --lib graphing_alert
+  cargo test -p corerouter-ui --lib graphs
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run system.graph.alert.add '{"interface":"ether8","percent":50,"minutes":2,"capacity_mbps":40}'
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run system.graph.alert.print '{}'
+  ```
+
+  No lab, `ether8` passa de 50 % de 40 Mbit/s em 2 a 3 minutos: o alerta aparece no log e na janela.
+
+- 2026-10-23 — G4.5: Gráficos de tráfego, parte 1: o histórico local.
+
+  - `engine::graph`: banco round-robin próprio (`graph::rrd`), de tamanho fixo, com média e máximo
+    por slot. São quatro anéis: 1 s por 1 h, 1 min por 1 dia, 5 min por 1 semana e 1 h por 1 ano.
+    - Balde com menos da metade dos segundos conhecidos fica desconhecido (`xff` 0,5).
+    - Contador que volta (reset, link recriado) é desconhecido, nunca pico (`DERIVE min=0` do
+      RRDtool).
+    - Buraco maior que 10 s é desconhecido; relógio que volta é ignorado.
+  - Coleta no `Session::tick` (a mesma varredura de links de todo segundo, sem dump extra):
+    - por interface: bps e pps de entrada e saída, erros e drops por segundo;
+    - do roteador, por `Hal::resources` (novo; `/proc/stat`, `/proc/meminfo`,
+      `nf_conntrack_count`): CPU, memória e conntrack.
+  - `system.graph.set` (config `system.graphing`, estilo `/tool graphing`):
+    - escolhe por classe: físicas e bonds por padrão; bridges, VLANs e túneis opcionais;
+    - `include`/`exclude` por nome;
+    - `max_memory_mib`, 64 MiB por padrão: série que não cabe é recusada, vai para o log e aparece
+      em `system.graph.print`;
+    - `store_every`, 5 min por padrão.
+  - Série que deixa de ser guardada sai depois de 10 min (uma varredura que falhou não apaga um ano).
+  - `system.graph.query {series, range, step?}`:
+    - pontos de hora, dia, semana, mês ou ano;
+    - corrente, média, máximo, **p95** e totais;
+    - o p95 vem das médias de 5 min (padrão de cobrança, posto mais próximo, descarta os 5 % de
+      cima); acima de uma semana vem das de 1 h e a resposta diz `p95_approximate`;
+    - `p95_billing` (maior entre entrada e saída, como o LibreNMS) e `p95_sum`.
+  - `system.graph.export {since, resolution}` entrega os baldes fechados depois de um cursor, sem
+    cortar um balde entre páginas: é o que o exportador ClickHouse (G4.4f) ainda não enviou. Em
+    Rust: `GraphDb::export`.
+  - Daemon: serviço `graphing` (`<config-dir>/graphs/`, um arquivo por série).
+    - Grava em lote, no lugar, só os baldes fechados desde o último store.
+    - O anel de 1 s vai só no desligamento limpo (`final_store` no shutdown do `main.rs`).
+    - Arquivo novo vai por temporário + rename; arquivo ilegível vira `*.corrupt`.
+    - `service::Ctx` ganhou `config_dir`.
+  - O lab virtual varia o tráfego e a CPU (ondas determinísticas), para os gráficos se mexerem.
+  - A decisão formato próprio × `redb` × `fjall` está em `docs/architecture.md` ("Histórico de
+    tráfego").
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --lib graph
+  cargo test -p corerouter-daemon graphing
+  cargo bench -p corerouter-engine --bench graph
+  cargo run -p corerouter-daemon -- --control 7979 --config-dir /tmp/cr
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run system.graph.query '{"series":"ether1","range":"hour","step":60}'
+  ```
+
+- 2026-10-23 — G4.5: Gráficos de tráfego, parte 2: a janela **Tools › Graphs** (`crates/ui/src/graphs.rs`).
+
+  - Mostra uma interface guardada ou o **Sistema** (CPU, memória e conntrack, um gráfico de cada), na
+    última hora, dia, semana, mês ou ano (egui_plot, como o Ping).
+    - Uma série: Rx azul e Tx vermelho (como a aba Traffic), o máximo em linha clara e o p95
+      tracejado.
+    - **Comparar** até 6 interfaces no mesmo gráfico, cada uma na cor do seu nome (`chip::name_hue`),
+      com Rx em linha cheia e Tx tracejado.
+    - Tempo desconhecido aparece como buraco na linha, nunca como zero.
+  - Abaixo do gráfico, os números que o roteador calculou (`system.graph.query`; a UI não calcula):
+    - atual, média, máximo, **percentil 95** e total em GB;
+    - o **p95 de cobrança** (a maior das direções) e o p95 de Rx+Tx.
+  - Selos:
+    - resolução;
+    - cobertura abaixo de 95 %;
+    - "p95 de médias de 1 h" quando a faixa passa de uma semana.
+  - **CSV** (todos os pontos, hora UTC e Unix) e **PNG** (só o gráfico, recortado de um screenshot
+    da janela).
+    - A GUI nativa salva na pasta Downloads, sem sobrescrever (`export.rs`: o app instala o
+      `SaveFile` no contexto do egui; a UI não faz I/O).
+    - No navegador vão para a área de transferência.
+  - **Configurações…** abre o diálogo de `system.graph.set`:
+    - classes (físicas, bridges, VLANs, túneis, recursos);
+    - include e exclude;
+    - memória máxima e intervalo de gravação;
+    - a ocupação e o estado do disco.
+  - ⓘ em cada rótulo, coluna e campo, com explicação em português e inglês
+    (`i18n/graphs_pt.rs`, `graphs_en.rs`). Entrada no menu pela tabela central (`menu.rs`, "graphs",
+    `/tool graphing`).
+  - **Mini gráfico na janela Interfaces** (coluna Traffic, `spark.rs`):
+    - os últimos 5 minutos de Rx e Tx de cada interface guardada, numa consulta só a cada 5 s;
+    - a célula leva o desenho codificado, como os selos, e o `table.rs` o pinta (mudança mínima nos
+      dois arquivos);
+    - o tooltip mostra os valores.
+  - Ícone: `CHART_BAR`, por ora (um ícone novo pede o `pyftsubset`, que não está nesta máquina).
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-ui --lib graphs
+  cargo run -p corerouter-daemon -- --control 7979 --config-dir /tmp/cr
+  cargo run -p corerouter-gui -- --connect 127.0.0.1:7979 --control 7990
+  ```
+
+  Depois abra Tools › Graphs (ou Ctrl+K "graphs") e a janela Interfaces (coluna Traffic). Os
+  screenshots claro e escuro foram olhados.
+
+- 2026-10-23 — G6.4: G6.4b — Tools › Bandwidth Test com o **protocolo do iperf3**, interoperável com qualquer `iperf3`
+  (não é o btest proprietário do MikroTik). Cliente `tool.bandwidth-test.start` (tarefa; terminal
+  `/tool bandwidth-test`): TCP ou UDP, 1–128 streams, `send`/`receive`/`both`, taxa por stream,
+  **prazo máximo** de 300 s, gráfico Tx/Rx por segundo, perda e jitter no UDP, a **CPU do roteador**
+  durante o teste e o que o outro lado mediu; recusa o teste que sairia pela porta da própria
+  conexão fora do Safe Mode e avisa quanto vai encher o caminho (a GUI confirma antes). Servidor
+  `tool.bandwidth-server.set/get` (config com journal e rollback): **desligado por padrão**, ligar
+  exige a lista de prefixos permitidos, um teste por vez, limites de duração, streams e taxa,
+  recusa com os códigos de erro do iperf3; serviço `bandwidth-server` sob o supervisor. Protocolo
+  puro em `crates/proto-iperf` (novo, L2), sockets no daemon. Testar: GUI › Tools › Bandwidth Test
+  (aba Server: ligue com `127.0.0.0/8`; aba Test: `127.0.0.1`), `corerouter-cli --connect … watch
+  tool.bandwidth-test.start '{"address":"…","protocol":"udp","bandwidth":"100M"}'`, `iperf3 -c
+  <roteador>`; testes de codec (proptest), do cliente contra o servidor em loopback (TCP nos dois
+  sentidos, UDP com perda e jitter, limites, ocupado), do serviço (ACL, contagem, desligar fecha a
+  porta), dos comandos e headless da janela; interoperabilidade com o binário `iperf3`
+  (`interop_*` em `service/iperf.rs`) roda quando ele está instalado. Screenshots em
+  `docs/changes/G6.4-bandwidth-test-screenshots/`.
+
+- 2026-10-23 — G6.4: G6.4a — Tools › Torch e Tools › Packet Sniffer. **Torch** (`tool.torch.start`, tarefa; terminal
+  `/tool torch ether1`): o tráfego de uma interface por fluxo, agrupado em selos (src, dst,
+  protocolo, porta, VLAN, DSCP, MAC) e filtrado (prefixos, porta, protocolo, VLAN, DSCP, MAC), com
+  Tx/Rx em bit/s e pacotes/s, a pílula do AS no destino (como no MTR), `CGNAT`/`privada` e o lugar do
+  selo do assinante (`ip.identity.lookup` do G0.25, pedido só quando o roteador tem o comando).
+  Cada linha é a conversa vista da interface (origem = o lado dela). Captura em Rust puro no
+  `hal-linux`: `AF_PACKET` por dispositivo, filtro BPF clássico que amostra 1:N no kernel e evita
+  contar duas vezes um quadro de VLAN; `sampling: auto` amostra acima de 500 kpps e avisa; os
+  contadores da interface conferem quanto a captura viu. Lab virtual com tráfego simulado
+  determinístico. **Packet Sniffer** (`tool.sniffer.start` / `tool.sniffer.download`): pcap em
+  memória, limitado em tamanho (≤ 64 MiB) e duração (≤ 1 h), só cabeçalhos por padrão, grupo write
+  para iniciar, download em pedaços pela GUI (abre no Wireshark/tcpdump). Testar: GUI › Tools ›
+  Torch (escolha ether1, Start) e Tools › Packet Sniffer (Start, Download .pcap);
+  `corerouter-cli watch tool.torch.start '{"interface":"ether1","duration":3}'`; testes de codec
+  (proptest), do job com relógio falso, dos comandos, headless das janelas e em netns com veth
+  (`netns_capture`: ida e volta, tamanho no fio, amostragem do kernel, VLAN contada uma vez).
+  Screenshots em `docs/changes/G6.4-torch-screenshots/`.
+
+- 2026-10-23 — G6.4: G6.4c — **traceroute como modo do MTR**: `tool.traceroute.start` (terminal `/tool traceroute`,
+  `traceroute`) faz uma passada com N sondas por salto e imprime a tabela clássica do
+  `traceroute`; o MTR e o traceroute sondam por **ICMP, UDP ou TCP SYN** (porta escolhida; sem
+  socket raw, pela fila de erros do socket) e no modo **Paris** (padrão: o mesmo fluxo em toda
+  sonda — no ICMP uma palavra da carga mantém o checksum —, então um balanceador ECMP manda todas
+  pelo mesmo caminho; Paris UDP/TCP vai uma sonda por vez). Reaproveita nomes, ASN e MPLS do MTR.
+  Janela Tools › MTR: selos MTR | Traceroute, protocolo, porta, Paris (ⓘ em cada um), coluna Probes
+  e o selo `ECMP n` num salto que respondeu de vários roteadores. Lab: par ECMP simulado no salto
+  3. Testar: GUI › Tools › MTR › Traceroute (8.8.8.8, tcp 443, Paris ligado e desligado);
+  `corerouter-cli watch tool.traceroute.start '{"address":"8.8.8.8","protocol":"udp"}'`; testes do
+  job (Paris × clássico no ECMP, fim por port unreachable/SYN-ACK), dos comandos, do checksum
+  Paris, headless da janela e em netns (`netns_icmp`: UDP e TCP, clássico e Paris, IPv4 e IPv6,
+  time exceeded do roteador e port unreachable/RST/SYN-ACK do destino). Screenshots em
+  `docs/changes/G6.4-traceroute-screenshots/`.
+
+- 2026-10-23 — G6.9: Tools › IP Calculator: um painel (`crates/ui/src/ip_calc.rs`) no grupo Tools, com três abas. Todo
+  número vem dos comandos novos `tool.ip-calc.*` (`crates/engine/src/cmd/ip_calc.rs`), que o CLI, o
+  MCP e o terminal também usam.
+
+  - **Subnet** (`tool.ip-calc.subnet`, `split`, `summarize`, `range`):
+    - aceita prefixo, máscara ou IPv6;
+    - mostra rede, broadcast, primeiro e último host, hosts (/31 tem 2, RFC 3021), máscara,
+      wildcard e escopo (RFC 1918, RFC 6598, documentação…);
+    - avisa sobreposição com endereços, rotas, pools e faixas de CGNAT já configurados;
+    - dividir por prefixo ou por quantidade, sumarizar (com a super-rede e os endereços que ela
+      acrescenta), faixa → menor conjunto de prefixos.
+  - **IPv6 PD** (`tool.ip-calc.pd`): quantas delegações de /48 a /64 cabem num prefixo (em texto:
+    passa de 2^64), as primeiras e a última, e os pools de DHCPv6-PD dentro dele.
+  - **CGNAT planner** (`tool.ip-calc.cgnat.plan`, `cgnat.export`):
+    - usa o `Layout` do `corerouter-model` (a mesma fórmula RFC 7422 dos pools): o que ele mostra é o
+      que o pool faz;
+    - aceita faixas ou só quantidades (`4096` assinantes, `32` IPs);
+    - mostra assinantes por IP, capacidade, IPs necessários e sobrando, portas sobrando, as
+      checagens do pool e sugestões ("acrescente 48 IPs, ou use 252 portas");
+    - prévia da correspondência;
+    - botões: **Create CGNAT pool** (manda o `ip.firewall.cgnat.pool.add` com os parâmetros do
+      plano), **Copy CSV**, **Copy printable**, **Copy as RouterOS script** (uma regra src-nat por
+      assinante e protocolo, para quem ainda opera MikroTik) e **View rules** (o nftables que o pool
+      gera).
+    - recalcula 0,4 s depois que você para de digitar.
+  - ⓘ em cada campo (PT e EN), o item de menu tem explicação e sinônimos ("sub-rede", "máscara",
+    "planejar cgnat"…).
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test ip_calc
+  cargo test -p corerouter-ui ip_calc
+  cargo run -p corerouter-cli -- run tool.ip-calc.cgnat.plan '{"inside":"4096","outside":"32","ports_per_subscriber":500}'
+  ```
+
+  O PDF ficou de fora de propósito: o texto imprimível sai em colunas fixas e qualquer editor
+  imprime ou gera PDF dele, sem crate novo de PDF.
+
+- 2026-10-23 — fix: conntrack: matar conexões não para mais numa conexão ICMP. O `delete` por ctnetlink mandava o
+  tuple ICMP só com o id, e o kernel exige também tipo e código (`CTA_PROTO_ICMP_TYPE`/`CODE`):
+  devolvia EINVAL, e o laço desistia no primeiro erro, deixando vivas as conexões que vinham
+  depois. No CGNAT isso deixava assinantes remapeados com a tradução antiga (o "Quem era?" erraria
+  para elas), e o `ip.firewall.connection.kill` parava no primeiro ping.
+
+  - o parser guarda tipo e código do ICMP no `dst_port` (`tipo << 8 | código`) e o pedido de
+    delete os devolve;
+  - o `delete` tenta todas e só depois devolve a primeira recusa;
+  - o filtro `port` de `ip.firewall.connection.list` ignora ICMP (o campo é tipo/código ali).
+
+  Era a causa do teste instável `netns_cgnat::element_changes_go_incremental_and_remaps_kill_connections`
+  ("killed: left 1, right 0"): falhava quando um teste anterior do mesmo binário deixava um ping no
+  conntrack. **Medido** (Ryzen AI MAX+ 395, 2026-10-23): antes 2 falhas em 4 execuções do binário,
+  depois 10 de 10 verdes. Teste novo de bytes: `ctnl::an_icmp_tuple_carries_type_and_code`.
+
+- 2026-10-23 — processo: i18n: traduções de janela nova em `crates/ui/src/i18n/auto/<escopo>_<idioma>.rs`, registradas
+  pelo `build.rs` (sem editar as listas do `i18n/mod.rs`), com rótulos procurados primeiro no escopo
+  da janela (`i18n::tr_in`). O `i18n/mod.rs` era o ponto quente da rodada de 2026-10-23: todo PR com
+  tela acrescentava linhas nas mesmas listas (a fila só conseguia integrar um por lote), e a mesma
+  palavra em inglês com traduções diferentes em janelas diferentes ("Checks", "Last") reprovava o
+  lote. O registro antigo continua valendo (mudança aditiva); `AGENTS.md` e `docs/ui-style.md`
+  explicam o caminho novo.
+
+- 2026-10-23 — processo: Fila de entrada: o PR pai de um PR empilhado é reconhecido por **qualquer** commit dele que esteja
+  na branch do filho, não só pelo último. A fila manda merges da `main` na branch do pai antes do
+  squash, e esse último commit não está na branch do filho; a resolução automática não reconhecia o
+  pai e devolvia o PR à sessão (#177 e #186, 2026-10-23). Testado no #186 real: os 4 arquivos do
+  conflito resolvidos sozinhos.

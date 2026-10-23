@@ -45,6 +45,16 @@ Layout da imagem:
    determinístico com port-block allocation** (RFC 6888/7422 — log por bloco, não por sessão),
    ACL de borda e mitigação de DDoS. Programas no crate isolado `dataplane-ebpf` (único lugar
    com `unsafe`), tipos compartilhados em `dataplane-ebpf-common`, loader no `hal-linux`.
+   **G2.5a (feito):** filtro anti-DDoS em XDP (`docs/xdp.md`). Escolhas e porquê: programa em
+   Rust (`aya-ebpf`) em vez de C/libbpf (uma linguagem só; a lógica de parse e decisão é a mesma
+   função no kernel e nos testes do host, com diferencial kernel × host no CI); objeto
+   pré-compilado com hash das fontes em vez de compilar no build normal (o workspace continua
+   estável, sem nightly nem `bpf-linker`); mapas com chaves e valores de inteiros/arrays (o
+   loader não precisa de `unsafe impl Pod`); links por processo (daemon morto = fail-open).
+   Medido no CI: a LPM custa ~17 ns por pacote, plana até um milhão de prefixos; em veth o XDP
+   (402–409 kpps) **não** ganha do nftables raw (471 kpps), porque o veth já entrega um `skb`. A
+   razão de ser do XDP (não alocar o `skb`) só aparece no modo native de uma placa real: a medida
+   que confirma ou derruba esta decisão é o roteiro do `docs/xdp.md`, no hardware do usuário.
 3. **DPDK/VPP:** não entra no caminho crítico. Se um cliente precisar de >100 Gbit/s de CGNAT
    por caixa, vira um terceiro backend do mesmo trait (VPP pela API binária).
 
@@ -120,6 +130,7 @@ backend.**
 | Syslog remoto | Codec RFC 5424 próprio (`proto-syslog`, só encode) + UDP (RFC 5426) no daemon | Regras e ações estilo `/system logging` do RouterOS no engine; TCP/TLS (RFC 5425) depois |
 | Gerência remota | `rustls` + provedor `ring` (TLS do canal de controle e do WebSocket), `rcgen` (certificado autoassinado), `argon2` (hash de senha), `keyring` ("Remember password" da GUI nativa); `russh` (CLI SSH) depois | G0.3 feito |
 | Telemetria | `prometheus-client`; fluxos IPFIX/NetFlow v9 em Rust puro (`proto-flow`, G4.4b), dos eventos do conntrack; sFlow depois | Veja 1.4.1 e `docs/traffic-flow.md` |
+| Histórico de longo prazo (métricas, logs, fluxos, NAT) | ClickHouse **externo e opcional**, alimentado pelo serviço `analytics` do daemon (G4.4f): `INSERT … JSONEachRow` com gzip pela interface HTTP, cliente HTTP/TLS próprio (rustls), sem driver em C nem processo auxiliar | O roteador fica leve e não guarda nada de longo prazo; veja "Exportador ClickHouse (G4.4f)" na seção 3 e `docs/analytics.md` |
 
 #### 1.4.1 Fluxos: eventos do conntrack em Rust (G4.4b, **medido**)
 
@@ -147,8 +158,8 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas), `users` (contas e grupos, salvos fora das revisões), `firewall` e `interface_list` (G2.1), `cgnat` (G2.3: pools e a função de mapeamento `Layout`, RFC 7422, a mesma para engine, kernel e XDP; `docs/cgnat.md`) | serde, ipnet, thiserror |
 | L0 | `crates/buildinfo` | Versão e commit do build (`COREROUTER_COMMIT` pelo `build.rs`): `server.info` e o aviso de daemon de outro commit na GUI. Crate à parte para um commit novo não recompilar o workspace | nada do workspace |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, `prober`, entradas dinâmicas de address-list, transporte do cliente DHCP `dhcp_port`/`DhcpPort`, G4.7; DHCPv6 `dhcp6_port`/`Dhcp6Port` e o que o kernel aprendeu por RA `ipv6_learned`/`Learned`, G4.7b; `sfp_module`/`cable_tester`, G1.20) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria; simula um SFP+ e o teste de cabo); `probe` (trait `Prober`/`ProbeSocket` das ferramentas), `sim` (rede simulada determinística, G6.2) e `sff` (EEPROM SFF-8472/8636 decodificado em código puro, G1.20) | L0, `firewall` (lateral permitido) |
-| L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; a tabela `ip corerouter_cgnat` do CGNAT (`cgnat`, G2.3); sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT por nfnetlink (`nfnl`, `cgnat`, G2.3b) e conntrack por ctnetlink (`ctnl`, G2.2; eventos `NEW`/`DESTROY` para o Traffic Flow, `ctnl::Events`, G4.4b); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
+| L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; a tabela `ip corerouter_cgnat` do CGNAT (`cgnat`, G2.3); o flowtable `inet corerouter_fastpath` (`fastpath`, G2.4); sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT e fast path por nfnetlink (`nfnl`, `cgnat`, G2.3b; `fastpath`, flowtable e eSwitch por devlink, G2.4) e conntrack por ctnetlink (`ctnl`, G2.2; eventos `NEW`/`DESTROY` para o Traffic Flow, `ctnl::Events`, G4.4b); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`); o mesmo para DHCPv6 com codec próprio (`v6`, `client6`, `lab6`; G4.7b) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-flow` | Exportação de fluxos (G4.4b): IPFIX (RFC 7011) e NetFlow v9 (RFC 3954), codificador e decodificador; eventos de NAT (RFC 8158); o medidor que transforma eventos do conntrack em registros (timeouts, amostragem, cache limitado). Puro, compila em wasm. Veja `docs/traffic-flow.md` | L0, L1 |
@@ -176,6 +187,8 @@ CoreRouter/
 │   ├── model/            # L0
 │   ├── hal/              # L1 (traits + virtual)
 │   ├── hal-linux/        # L1 plataforma
+│   ├── dataplane-ebpf-common/ # L1 plataforma: parse/decisão do XDP, no_std (G2.5)
+│   ├── dataplane-ebpf/   # programas XDP (bpfel, nightly; fora do workspace) (G2.5)
 │   ├── firewall/         # L1 puro: validação + render nftables (G2.1)
 │   ├── proto-bgp/ proto-ospf/ proto-mpls/ proto-cgnat/ proto-dns/ proto-dhcp/   # L2
 │   ├── proto-lldp/ proto-mndp/   # L2: codecs de descoberta (G5.2)
@@ -195,8 +208,9 @@ CoreRouter/
 └── xtask/                # L7
 ```
 
-Planejados (gaps): `crates/hal-frr` (L1 plataforma, G3.1), `crates/dataplane-ebpf` e
-`crates/dataplane-ebpf-common` (L1 plataforma, G2.5).
+Planejado (gap): `crates/hal-frr` (L1 plataforma, G3.1). `crates/dataplane-ebpf` (programas XDP,
+fora do workspace, `cargo xtask ebpf`) e `crates/dataplane-ebpf-common` (L1 plataforma, usado só
+pelo programa e pelo `hal-linux`) existem desde a G2.5a.
 
 ## 3. Fluxo de um comando
 
@@ -566,6 +580,23 @@ monotônico e `sleep`) do job; o RTT é medido pelo socket. Os jobs (`engine/src
 lógica pura sobre `ProbeSocket` + `TaskCtx` e são testados com a rede simulada e um relógio
 falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools.md`.
 
+**Captura (G6.4a, Torch e Sniffer):** `Hal::packet_capture()` → `PacketCapture` (L1) → um
+`CaptureSocket` que enche um `FrameBatch`; o decodificador de cabeçalhos e o pcap são puros no
+`hal`, a agregação no engine (`tools/torch.rs`). Decisão, com números (**medido**,
+`docs/tools.md` §4.4): **Rust puro** com `AF_PACKET` + filtro BPF clássico, em vez de orquestrar
+`tcpdump`/libpcap — tira um processo externo e o parsing de texto, dá dados estruturados por
+quadro e a amostragem 1:N no kernel (o que mantém a CPU sob controle acima de 500 kpps: 1:64
+cobre 12,8 Mpps a 35 % de um núcleo). Fica de fora por ora o `TPACKET_V3` (anel em `mmap`, exige
+`unsafe`): sem amostrar, `recvmsg` lê ~2 Mpps por thread, e o caminho mais rápido de verdade é
+contar fluxos num mapa XDP (G2.5) atrás do mesmo trait, sem copiar quadros.
+
+**Bandwidth Test (G6.4b):** o protocolo do iperf3 em Rust (`proto-iperf`, L2, puro; sockets no
+daemon), em vez de orquestrar o binário `iperf3`: um processo externo a menos, dados
+estruturados por segundo (o binário só dá JSON no fim, ou texto), limites e ACL do servidor
+aplicados antes de ler qualquer coisa, e interoperabilidade mantida porque o formato é simples e
+estável desde a 3.0 (testes contra o `iperf3` quando instalado). Números (**medido**, loopback):
+`docs/changes` da G6.4b.
+
 ### DNS (G4.1)
 
 **Decisão do usuário (2026-10-22):** o DNS inteiro é **Hickory DNS, em Rust puro**, embutido no
@@ -768,6 +799,34 @@ própria. Grupos abertos são preferência da janela (`prefs.rs`, chave `menu`).
   reprova ícone sem glifo. Quando o `egui-phosphor` acompanhar o egui do workspace, dá para trocar
   o subconjunto pelo crate (macro `subset!`) sem mudar `icons.rs`.
 
+### Exportador ClickHouse (G4.4f)
+
+Histórico de longo prazo **fora** do roteador (decisão do usuário, 2026-10-23): o serviço
+`analytics` do daemon envia métricas, logs, fluxos e eventos de NAT a um ClickHouse que o operador
+mantém. Desenho, esquema e operação em `docs/analytics.md`.
+
+- **Caminho:** o engine só guarda a configuração (`system.analytics`) e o status
+  (`s.ext::<AnalyticsStatus>()`, escrito pelo daemon); rede só no daemon (L6). A cada 250 ms o
+  serviço copia sob o lock o que é novo no log (`log_since`) e, a cada `metrics_interval`, o
+  resultado de `system.metrics` (o mesmo texto do `/metrics`, convertido em linhas); envia sem o
+  lock. O Traffic Flow (G4.4b) entrega fluxos e sessões de NAT por `submit_records` (lista com
+  teto, sem lock da sessão); os blocos do CGNAT (G2.3c) chegam pelo próprio log.
+- **Comparado** (Rust puro × externo, como pede o AGENTS.md):
+  - *Vector ou Fluent Bit ao lado do daemon*: maduros, mas um processo a mais para supervisionar,
+    configurar fora das transações e atualizar, e o roteador ainda teria de exportar para ele;
+    reenvio, fila com teto e descarte contado, que são o que eles agregam, cabem em ~1400 linhas com comentários (**medido**: `analytics.rs`, `analytics_queue.rs`, `analytics_rows.rs`, sem os testes).
+  - *Crate `clickhouse` (HTTP, RowBinary)*: puxa `hyper`/`tokio` para um daemon que é síncrono, e
+    `RowBinary` amarra a ordem das colunas ao esquema (uma coluna nova no servidor quebra o
+    envio). *Drivers nativos* (protocolo TCP 9000): em C++ ou com FFI; fora (sem C).
+  - **Escolhido:** o cliente HTTP/1.1 do daemon (`service/https.rs`, rustls, já usado pelas
+    adlists) com `JSONEachRow` + gzip (`flate2` com `miniz_oxide`, puro Rust).
+- **Números** (**medidos**, release, 32 núcleos, ClickHouse 26.9 na mesma máquina, 2026-10-23):
+  codificar + comprimir ~510 000 linhas de log/s num núcleo (≈ 1,9 µs de CPU por linha) e
+  ~1,1 milhão de linhas de métrica/s; enviar ao ClickHouse ~665 000 linhas/s em lotes de 10 000
+  (CPU do roteador desprezível no envio). Um roteador de borda gera dezenas a milhares de linhas
+  por segundo: o JSONEachRow não é o gargalo, e `RowBinary` fica para quando for (G4.4h). Com o
+  servidor fora do ar 10 minutos, a fila guardou tudo e esvaziou em segundos quando ele voltou,
+  sem perda (`docs/perf.md`).
 ### Histórico de tráfego (G4.5)
 
 O roteador guarda um histórico **leve e local** de cada interface escolhida (bps, pps, erros e

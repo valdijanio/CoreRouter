@@ -99,3 +99,15 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G2.3d feito (janela CGNAT)
 - 2026-10-23 — G4.4b em partes (comandos e serviço do Traffic Flow)
 - 2026-10-23 — G6.8 feito (análise no Tools › DNS Lookup)
+- 2026-10-23 — G0.25 criado e feito (identidade do assinante: selo com o nome ao lado do IP)
+- 2026-10-23 — G2.3e feito; testes em servidor real viraram G2.3f
+- 2026-10-23 — G2.4 feito em software e com detecção; teste em hardware real virou G2.4b, exclusões por regra G2.4c
+- 2026-10-23 — G2.5a–d criados (G2.5 em partes); G2.5a feito (base XDP e filtro anti-DDoS)
+- 2026-10-23 — G2.5b iniciado (fórmula do CGNAT determinístico extraída para `corerouter-cgnat-map`)
+- 2026-10-23 — G4.4b feito (Traffic Flow: exportador e janela)
+- 2026-10-23 — G4.5 feito (histórico de tráfego, janela Graphs, alertas de banda)
+- 2026-10-23 — G4.5 redefinida (histórico local estilo RRD no daemon + janela Graphs; ClickHouse externo no G4.4f)
+- 2026-10-23 — G6.4b feito: Bandwidth Test (cliente e servidor iperf3)
+- 2026-10-23 — G6.4 redefinido (bandwidth-test pelo protocolo do iperf3, traceroute como modo do MTR) e em andamento: Torch e Packet Sniffer
+- 2026-10-23 — G6.4 feito: traceroute de uma passada, sondas UDP/TCP e Paris (G6.4c)
+- 2026-10-23 — G6.9 feito (IP Calculator)

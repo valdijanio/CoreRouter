@@ -307,6 +307,19 @@ impl Session {
                 link.peer, link.local
             ));
         }
+        // G2.5a: the XDP filter drops in the driver, before any rule.
+        let ingress = ingress_interface(after, peer, local);
+        if let Some(list) = crate::xdp::blocks(after, dyn_after, ingress.as_deref(), peer) {
+            let was = ingress_interface(before, peer, local);
+            if crate::xdp::blocks(before, dyn_before, was.as_deref(), peer).is_none() {
+                return Some(format!(
+                    "the XDP filter would drop {peer}, which is in its block list '{list}' \
+                     (tcp {} -> {}); put it in an allow list (ip.firewall.xdp.set allow_lists). \
+                     {HOW_TO_PROCEED}",
+                    link.peer, link.local
+                ));
+            }
+        }
         let same = before.ip.firewall == after.ip.firewall
             && before.interface_lists == after.interface_lists
             && dyn_before == dyn_after

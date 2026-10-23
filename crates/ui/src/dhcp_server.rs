@@ -406,6 +406,17 @@ pub(crate) struct DhcpServerPanel {
     pub(crate) exported: Option<String>,
 }
 
+impl DhcpServerPanel {
+    /// Show lease `address` selected in the Leases tab (G0.25: the
+    /// subscriber chip opens the lease its name came from).
+    pub(crate) fn reveal_lease(&mut self, address: &str) {
+        self.tab = Tab::Leases;
+        self.show_history = false;
+        self.show_stats = false;
+        self.tables.entry(Tab::Leases).or_default().reveal(address);
+    }
+}
+
 /// The History tab's search.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HistoryForm {

@@ -17,7 +17,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "ip.route.lookup", "Rou
     always, run)
 .positional("address")];
 
-fn run(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn run(s: &mut Session, p: &Value) -> Result<Value> {
     let dst: IpAddr = req_parse(p, "address")?;
     let table: Option<RoutingTable> = opt_parse(p, "table")?;
     let src: Option<IpAddr> = opt_parse(p, "src")?;

@@ -188,6 +188,8 @@ pub(crate) struct ActionForm {
     pub name: String,
     /// The built-in `memory` action: only `memory_lines` applies.
     pub memory: bool,
+    /// The built-in `analytics` action (G4.4f): nothing to edit here.
+    pub analytics: bool,
     pub memory_lines: String,
     pub remote: String,
     pub remote_port: String,
@@ -204,6 +206,7 @@ impl ActionForm {
         Self {
             name: String::new(),
             memory: false,
+            analytics: false,
             memory_lines: String::new(),
             remote: String::new(),
             remote_port: "514".into(),
@@ -218,6 +221,7 @@ impl ActionForm {
         Self {
             name: text(row, "name"),
             memory: text(row, "target") == "memory",
+            analytics: text(row, "target") == "analytics",
             memory_lines: text(row, "memory_lines"),
             remote: text(row, "remote"),
             remote_port: text(row, "remote_port"),
@@ -231,6 +235,9 @@ impl ActionForm {
     /// The keys that differ from `base`, as add/set take them.
     fn diff(&self, base: &ActionForm) -> Map<String, Value> {
         let mut p = Map::new();
+        if self.analytics {
+            return p;
+        }
         if self.memory {
             if self.memory_lines.trim() != base.memory_lines {
                 p.insert("memory_lines".into(), form_number(&self.memory_lines));
@@ -997,8 +1004,20 @@ fn dialog_body(
                     f.text(ui, "Name", "name", &mut form.name, "remote1");
                 }
                 ui.label("Type");
-                ui.label(if form.memory { "memory" } else { "remote" });
+                ui.label(if form.memory {
+                    "memory"
+                } else if form.analytics {
+                    "analytics"
+                } else {
+                    "remote"
+                });
                 ui.end_row();
+                if form.analytics {
+                    ui.label("");
+                    ui.weak("The ClickHouse exporter's logs table: set it up in System › Analytics");
+                    ui.end_row();
+                    return;
+                }
                 if form.memory {
                     f.text(ui, "Lines", "memory_lines", &mut form.memory_lines, "1000");
                     ui.label("");
@@ -1044,7 +1063,7 @@ fn dialog_body(
                 ),
                 ("Remove", Button::Remove, can.check("system.logging.remove")),
             ];
-        } else if text(r, "target") != "memory" {
+        } else if text(r, "target") == "remote" {
             footer.extra = vec![(
                 "Remove",
                 Button::Remove,

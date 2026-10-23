@@ -164,10 +164,7 @@ pub(crate) fn small(ui: &Ui) -> f32 {
 
 /// A small rounded pill, never taller than a table row.
 pub(crate) fn chip(ui: &mut Ui, text: &str, tone: Tone) -> egui::Response {
-    let font = egui::FontId::proportional(small(ui));
-    let galley = ui
-        .painter()
-        .layout_no_wrap(text.to_owned(), font, tone.ink);
+    let galley = label_galley(ui.painter(), text, small(ui), tone.ink);
     let pad = egui::vec2(7.0, 2.0);
     let h = (galley.size().y + 2.0 * pad.y).min(ui.spacing().interact_size.y - 2.0);
     let (rect, resp) = ui.allocate_exact_size(
@@ -268,14 +265,35 @@ pub(crate) fn split(cell: &str) -> (&str, Vec<(Kind, &str)>) {
 const CELL_GAP: f32 = 6.0;
 const CELL_PAD: egui::Vec2 = egui::vec2(6.0, 1.0);
 
+/// A chip's label laid out. A leading icon (a private-use code point, as
+/// `icons` names them: the subscriber chip of G0.25) is drawn in the icon
+/// font; before that font is active it is left out.
+pub(crate) fn label_galley(painter: &egui::Painter, label: &str, size: f32, color: Color32) -> std::sync::Arc<egui::Galley> {
+    let mut chars = label.chars();
+    let icon = chars.next().filter(|c| ('\u{E000}'..='\u{F8FF}').contains(c));
+    let Some(icon) = icon else {
+        return painter.layout_no_wrap(label.to_owned(), egui::FontId::proportional(size), color);
+    };
+    let rest = chars.as_str().trim_start();
+    if !crate::icons::ready(painter.ctx()) {
+        return painter.layout_no_wrap(rest.to_owned(), egui::FontId::proportional(size), color);
+    }
+    let mut job = egui::text::LayoutJob::default();
+    job.append(&icon.to_string(), 0.0, egui::TextFormat::simple(crate::icons::font(size), color));
+    job.append(rest, size * 0.3, egui::TextFormat::simple(egui::FontId::proportional(size), color));
+    painter.layout_job(job)
+}
+
+/// Width of one chip of a cell, the gap before it included.
+pub(crate) fn cell_chip_width(painter: &egui::Painter, label: &str, size: f32) -> f32 {
+    CELL_GAP + label_galley(painter, label, size, Color32::PLACEHOLDER).size().x + 2.0 * CELL_PAD.x
+}
+
 /// Width of a cell's chips (after its text).
 pub(crate) fn cell_chips_width(painter: &egui::Painter, chips: &[(Kind, &str)], size: f32) -> f32 {
     chips
         .iter()
-        .map(|(_, label)| {
-            let g = painter.layout_no_wrap((*label).to_owned(), egui::FontId::proportional(size), Color32::PLACEHOLDER);
-            CELL_GAP + g.size().x + 2.0 * CELL_PAD.x
-        })
+        .map(|(_, label)| cell_chip_width(painter, label, size))
         .sum()
 }
 
@@ -285,7 +303,7 @@ pub(crate) fn paint_cell_chips(painter: &egui::Painter, v: &egui::Visuals, x: f3
     let mut x = x;
     for (kind, label) in chips {
         let tone = kind.tone(v);
-        let g = painter.layout_no_wrap((*label).to_owned(), egui::FontId::proportional(size), tone.ink);
+        let g = label_galley(painter, label, size, tone.ink);
         let h = (g.size().y + 2.0 * CELL_PAD.y).min(height - 2.0);
         x += CELL_GAP;
         let rect = egui::Rect::from_min_size(egui::pos2(x, y - h / 2.0), egui::vec2(g.size().x + 2.0 * CELL_PAD.x, h));

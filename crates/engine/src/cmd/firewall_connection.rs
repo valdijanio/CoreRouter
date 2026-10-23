@@ -76,6 +76,13 @@ pub struct ConnCache {
     stats: Stats,
 }
 
+impl ConnCache {
+    /// Read again next time (the fast path changed what Via says).
+    pub(crate) fn forget(&mut self) {
+        self.at = None;
+    }
+}
+
 impl Session {
     /// The kernel's connections, read at most every [`CACHE_SECS`].
     /// `fresh`: read now (after a kill).

@@ -27,6 +27,14 @@ use crate::{
     SimProber,
 };
 
+/// Lab ports that pretend to be NVIDIA ConnectX-6 Dx ports (G2.4): the
+/// first in the default `legacy` eSwitch mode (software flowtable only,
+/// with the command to switch), the second a switchdev uplink
+/// representor with `hw-tc-offload` on.
+pub const LAB_MLX5: [&str; 2] = ["ether7", "ether8"];
+/// The one of [`LAB_MLX5`] in switchdev mode.
+pub const LAB_SWITCHDEV: [&str; 1] = ["ether8"];
+
 #[derive(Clone)]
 pub struct VirtualHal {
     ports: Vec<IfName>,
@@ -34,6 +42,8 @@ pub struct VirtualHal {
     ticks: u64,
     /// Busy and total CPU ticks handed out by `resources` so far.
     cpu: (u64, u64),
+    /// `ticks` when the XDP counters were last zeroed (G2.5a).
+    xdp_zero: u64,
     applies: u64,
     /// The nftables script the last firewall change would have loaded
     /// (the lab records it; nothing runs it).
@@ -141,6 +151,7 @@ impl VirtualHal {
             applied: Config::default(),
             ticks: 0,
             cpu: (0, 0),
+            xdp_zero: 0,
             applies: 0,
             ruleset: None,
             dynamic: Vec::new(),
@@ -429,6 +440,60 @@ impl Hal for VirtualHal {
         Ok(())
     }
 
+    fn eswitch(&mut self, name: &IfName) -> Result<crate::fastpath::Eswitch, HalError> {
+        use crate::fastpath::{Eswitch, EswitchMode};
+        let iface = self
+            .applied
+            .interfaces
+            .get(name)
+            .ok_or_else(|| self.missing(name))?;
+        if iface.kind != InterfaceKind::Ethernet || self.port_index(name).is_none() {
+            return Ok(Eswitch {
+                notes: vec!["a software interface: its ports' cards decide".into()],
+                ..Eswitch::default()
+            });
+        }
+        let Some(i) = LAB_MLX5.iter().position(|p| *p == name.as_str()) else {
+            return Ok(Eswitch {
+                driver: Some("corerouter-virt".into()),
+                notes: vec!["the lab's virtual NIC has no flow offload".into()],
+                ..Eswitch::default()
+            });
+        };
+        let switchdev = LAB_SWITCHDEV.contains(&name.as_str());
+        Ok(Eswitch {
+            driver: Some("mlx5_core".into()),
+            firmware: Some("22.39.1002".into()),
+            devlink: Some(format!("pci/0000:3b:00.{i}")),
+            mode: Some(if switchdev {
+                EswitchMode::Switchdev
+            } else {
+                EswitchMode::Legacy
+            }),
+            representor: switchdev,
+            hw_tc_offload: Some(switchdev),
+            notes: vec!["simulated ConnectX-6 Dx (virtual lab)".into()],
+        })
+    }
+
+    fn fastpath_state(&mut self) -> crate::fastpath::FastPathState {
+        let fp = &self.applied.ip.fastpath;
+        let devices = crate::lab_conntrack::fastpath_ports(&self.applied);
+        if !fp.enabled || devices.is_empty() {
+            return crate::fastpath::FastPathState::default();
+        }
+        let capable = devices.iter().any(|d| LAB_SWITCHDEV.contains(&d.as_str()));
+        let asked = fp.hw_offload != corerouter_model::fastpath::HwOffload::No;
+        crate::fastpath::FastPathState {
+            active: true,
+            hardware: asked && capable,
+            note: (asked && !capable).then(|| {
+                "hardware offload refused (Operation not supported): no port in switchdev mode; running in software".into()
+            }),
+            devices,
+        }
+    }
+
     fn cgnat_waiting(&mut self) -> Vec<crate::cgnat::Waiting> {
         crate::lab_conntrack::waiting(&self.applied, &self.blocks)
     }
@@ -602,6 +667,84 @@ impl Hal for VirtualHal {
         })
     }
 
+    /// The lab's XDP filter: attached natively on its Ethernet ports,
+    /// generically elsewhere, with counters that grow with the polls in
+    /// proportion to what the filter has turned on, and the first blocked
+    /// prefixes as the top sources.
+    fn xdp_status(&mut self, top: usize) -> Result<crate::xdp::XdpStatus, HalError> {
+        use crate::xdp::{XdpPlan, XdpPort, XdpStatus, XdpTop};
+        let plan = XdpPlan::of(&self.applied, &self.dynamic);
+        let t = self.ticks.saturating_sub(self.xdp_zero);
+        let on = |b: bool, n: u64| if b { t.saturating_mul(n) } else { 0 };
+        let mut ports = Vec::new();
+        for (name, mode) in &plan.interfaces {
+            let ether = self
+                .applied
+                .interfaces
+                .get(name)
+                .is_some_and(|i| i.kind == InterfaceKind::Ethernet);
+            let generic = *mode == corerouter_model::xdp::XdpMode::Generic;
+            let (active, note) = if ether && !generic {
+                ("native", None)
+            } else if generic {
+                ("generic", None)
+            } else {
+                (
+                    "generic",
+                    Some("native XDP needs a NIC driver; running generic".to_owned()),
+                )
+            };
+            let packets = [
+                on(true, 12_000),
+                on(!plan.block.is_empty(), 3_000),
+                on(plan.rate_limit > 0, 500),
+                on(plan.drop_malformed, 40),
+                on(plan.drop_invalid_tcp_flags, 15),
+            ];
+            ports.push(XdpPort {
+                interface: name.clone(),
+                mode: *mode,
+                active: Some(active),
+                note,
+                counters: packets
+                    .iter()
+                    .map(|p| (*p, p.saturating_mul(800)))
+                    .collect(),
+            });
+        }
+        let lists = &self.applied.ip.xdp.filter.block_lists;
+        let tops = plan
+            .block
+            .iter()
+            .take(top)
+            .enumerate()
+            .map(|(i, (net, list))| {
+                let packets = t.saturating_mul(600) / (i as u64 + 1);
+                XdpTop {
+                    address: net.network(),
+                    packets,
+                    bytes: packets.saturating_mul(800),
+                    reason: "blocked",
+                    list: lists.get(*list as usize).cloned(),
+                    last_secs: 0,
+                }
+            })
+            .filter(|t| t.packets > 0)
+            .collect();
+        Ok(XdpStatus {
+            unavailable: None,
+            ports,
+            top: tops,
+            block_prefixes: plan.block.len(),
+            allow_prefixes: plan.allow.len(),
+        })
+    }
+
+    fn xdp_reset(&mut self) -> Result<(), HalError> {
+        self.xdp_zero = self.ticks;
+        Ok(())
+    }
+
     /// Counters that grow with the polls, with a squeezed CPU 3, a
     /// conntrack table near its stock limit and a few neighbor overflows.
     fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {
@@ -685,6 +828,11 @@ impl Hal for VirtualHal {
 
     fn prober(&self) -> Result<SharedProber, String> {
         Ok(Arc::clone(&self.prober))
+    }
+
+    /// Simulated traffic on any lab port (`capture::SimCapture`).
+    fn packet_capture(&self) -> Result<crate::capture::SharedCapture, String> {
+        Ok(Arc::new(crate::capture::SimCapture))
     }
 
     /// Lab ports negotiate their top speed, full duplex, with an equal

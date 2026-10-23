@@ -80,11 +80,21 @@ fn list_filters_and_pages() {
         );
         assert_eq!(r["pool"], "c1");
     }
+    // Nothing is in the flowtable while the fast path is off (G2.4)…
     let sw = ok(
         &mut s,
         "ip.firewall.connection.list",
         json!({"via": "software", "count": 50}),
     );
+    assert_eq!(sw["total"], 0, "{sw}");
+    // …and some established connections are once it is on.
+    ok(&mut s, "ip.firewall.fastpath.set", json!({"enabled": true}));
+    let sw = ok(
+        &mut s,
+        "ip.firewall.connection.list",
+        json!({"via": "software", "count": 50}),
+    );
+    assert!(sw["total"].as_u64().unwrap() > 0, "{sw}");
     assert!(
         sw["rows"]
             .as_array()
