@@ -26,12 +26,14 @@ fn panel(h: &mut Harness) -> &mut TuningPanel {
 
 #[test]
 fn every_parameter_is_explained_in_both_languages() {
-    use corerouter_model::tuning::{CPU_PARAMS, PARAMS, PORT_PARAMS};
+    use corerouter_model::tuning::{BOOT_PARAMS, CPU_PARAMS, PARAMS, PORT_PARAMS};
     let keys = PARAMS
         .iter()
         .map(|p| format!("tuning.{}", p.name))
         .chain(PORT_PARAMS.iter().map(|p| format!("tuning.port.{}", p.name)))
-        .chain(CPU_PARAMS.iter().map(|p| format!("tuning.cpu.{}", p.name)));
+        .chain(CPU_PARAMS.iter().map(|p| format!("tuning.cpu.{}", p.name)))
+        .chain(BOOT_PARAMS.iter().map(|p| format!("tuning.boot.{}", p.name)))
+        .chain(["tuning.boot".to_owned(), "tuning.profiles".to_owned()]);
     for key in keys {
         for l in [Lang::En, Lang::Pt] {
             let got = i18n::explain(Langs { labels: l, help: l }, &key);
@@ -260,4 +262,39 @@ fn cpu_tab_sets_the_governor_and_spreads_a_ports_irqs() {
     h.click(h.text("Set"));
     refresh(&mut h);
     assert!(h.has_text_containing("101: 1,"), "one CPU per IRQ");
+}
+
+#[test]
+fn boot_tab_saves_for_the_next_boot_and_guards_mitigations() {
+    let mut h = open(Tab::Boot);
+    refresh(&mut h);
+    assert!(h.has_text("next boot"));
+    assert!(h.has_text_containing("corerouter-a"), "the running command line");
+    assert!(h.has_text("security risk"), "mitigations");
+
+    h.click(h.text("isolcpus"));
+    h.idle();
+    panel(&mut h).edit = "2-7".into();
+    h.idle();
+    h.click(h.text("Set"));
+    refresh(&mut h);
+    let boot = lock(&h.session).store().running().system.tuning.boot.clone();
+    assert_eq!(boot.get("isolcpus").map(String::as_str), Some("2-7"), "{:?}", h.app.log());
+    assert!(h.has_text("isolcpus=2-7"));
+
+    // mitigations=off: Set stays grey until the risk is acknowledged.
+    h.click(h.text("mitigations"));
+    h.idle();
+    panel(&mut h).edit = "off".into();
+    h.idle();
+    assert!(h.has_text("I understand the security risk"));
+    h.click(h.text("Set"));
+    refresh(&mut h);
+    assert!(!lock(&h.session).store().running().system.tuning.boot.contains_key("mitigations"));
+    panel(&mut h).boot_confirm = true;
+    h.idle();
+    h.click(h.text("Set"));
+    refresh(&mut h);
+    let boot = lock(&h.session).store().running().system.tuning.boot.clone();
+    assert_eq!(boot.get("mitigations").map(String::as_str), Some("off"));
 }

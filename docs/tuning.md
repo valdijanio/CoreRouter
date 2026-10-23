@@ -19,7 +19,7 @@ Partes:
 | G1.26a | Resumo (hardware, diagnóstico, perfil), Kernel (sysctl), Perfis, medida de pps | este documento |
 | G1.26b | Interfaces: anel, filas, coalescência, offloads, flow control, txqueuelen, qdisc, `rp_filter` por porta | este documento (RSS: G1.26g) |
 | G1.26c | CPU e IRQ: afinidade por nó NUMA, RPS/XPS, governor, C-states por PM QoS, watchdog | este documento |
-| G1.26d | Boot: parâmetros da imagem A/B | aberto |
+| G1.26d | Boot: parâmetros da imagem A/B (modelo, comandos e tela; aplicação na imagem: G1.26h) | este documento |
 
 ## Como funciona
 
@@ -272,6 +272,45 @@ Testes:
 
 Fora do namespace de teste nada disso é seguro de gravar: são arquivos do host.
 
+## Boot (G1.26d)
+
+São parâmetros da linha de comando do kernel **da imagem**: o CoreRouter não tem GRUB, a imagem é
+imutável e A/B (`docs/architecture.md`). Valem no próximo boot; um boot que falha volta para a
+imagem anterior, com a linha de comando dela.
+
+| Parâmetro | Valores | Recomendado |
+|---|---|---|
+| `isolcpus`, `nohz_full` | lista de CPUs (`2-7,10`); a CPU 0 fica com o sistema | nunca (dependem do que roda; o encaminhamento do kernel roda em softirq na CPU da IRQ) |
+| `intel_idle.max_cstate`, `processor.max_cstate` | 0–9 | 1 na baixa latência (o `cpu_dma_latency` da aba CPU faz o mesmo sem reboot) |
+| `pcie_aspm` | off, force | off na baixa latência |
+| `iommu` | pt, nopt, off | pt no alto desempenho e na baixa latência |
+| `mitigations` | auto, auto,nosmt, off | **nunca**; `off` exige `confirm=yes` e aparece com o selo vermelho "security risk" |
+
+Os valores ficam em `system.tuning.boot` e passam pela validação de `model::tuning::boot_value`:
+
+- só caracteres de uma lista de CPUs, um número ou uma das opções;
+- nada de espaço, aspas ou `=`, porque o valor vai direto para a linha de comando (impede
+  `isolcpus=2 init=/bin/sh`);
+- CPU que a máquina não tem é recusada.
+
+Comandos:
+
+- `system.tuning.boot.print`: o configurado, para o `/export`;
+- `….parameter.print {profile}`: em uso (`/proc/cmdline`), próximo boot, recomendado com o motivo e
+  a faixa;
+- `….set {key, value, confirm?}`;
+- `….unset {key}`.
+
+Na janela, a aba Boot mostra:
+
+- a linha "em uso" e a do "próximo boot";
+- o selo "next boot" em cada valor pendente;
+- o editor, que só libera `mitigations=off` depois da caixa "I understand the security risk".
+
+**A imagem A/B ainda não existe** (G1.6): os parâmetros ficam gravados na config, e a imagem os lê
+quando existir (G1.26h: gravar na cmdline do slot inativo, trocar de slot e voltar ao anterior se o
+boot falhar).
+
 ## Medida antes e depois
 
 `crates/hal-linux/benches/netns_forward.rs` (rode com `cargo xtask bench netns_forward`) mede, num
@@ -421,6 +460,9 @@ traz o que for dele, numa seção "Medido" quando há número):
 - **Veth e dummy só são gerenciados quando listados** (`--manage`), e um veth com o par no mesmo
   namespace já é gerenciado. Os ajustes de porta respeitam a mesma regra de posse.
 - **`netdevsim` não serve sem root**: criar o dispositivo exige o namespace do host.
+- **Um valor de boot vai cru para a linha de comando do kernel**: `isolcpus=2 init=/bin/sh` tomaria
+  a máquina. Só passam listas de CPU, números e opções do catálogo, sem espaço nem `=` (teste no
+  model e no comando).
 - **A fonte da GUI não tem "→", "⚠", "ⓘ", "▸", "▾"** (viram um quadrado). Para não depender deles:
   - ⓘ e as setas das seções são desenhados;
   - um teste impede esses glifos nos catálogos;

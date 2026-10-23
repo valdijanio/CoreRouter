@@ -4,6 +4,76 @@
 /// Explanations by key (`tuning.<parameter>`, `tuning.<topic>`).
 pub(super) const HELP: &[(&str, &str)] = &[
     (
+        "tuning.boot",
+        r##"## Parâmetros de boot
+Vão na linha de comando do kernel da imagem do roteador e valem a partir do **próximo boot**. A imagem é imutável e A/B: um boot que falha volta sozinho para a imagem anterior, com a linha de comando dela.
+## Hoje
+A imagem A/B (G1.6) ainda não existe: os parâmetros ficam gravados na config e aparecem como pendentes; a imagem vai lê-los quando existir (G1.26h). "Running" é o que este boot usou (`/proc/cmdline`)."##,
+    ),
+    (
+        "tuning.boot.intel_idle.max_cstate",
+        r##"## O que faz
+O C-state mais profundo que o driver de ociosidade intel_idle pode usar, desde o boot: 0 desliga esse driver, 1 mantém as CPUs em C1. Vale a partir do próximo boot.
+## Quando mudar
+Menor latência num hardware em que o limite de C-state da aba CPU (PM QoS, sem reboot) não basta.
+## Cuidado
+Mais consumo e calor. O `cpu_dma_latency` da aba CPU faz o mesmo em tempo de execução e some se o daemon parar: prefira-o."##,
+    ),
+    (
+        "tuning.boot.iommu",
+        r##"## O que faz
+**pt** (passthrough): os dispositivos do host fazem DMA sem a tradução do IOMMU, e os dispositivos entregues a VMs (VFIO, SR-IOV) continuam com ela. **off** desliga o IOMMU; **nopt** traduz tudo.
+## Quando mudar
+pt num roteador com o IOMMU ligado: sem isso, o mapeamento de DMA de cada pacote custa CPU.
+## Cuidado
+off perde a proteção contra um dispositivo escrevendo onde não deve (ataques por DMA) e quebra o VFIO."##,
+    ),
+    (
+        "tuning.boot.isolcpus",
+        r##"## O que faz
+Tira estas CPUs do escalonador desde o boot: nenhuma tarefa comum roda ali, a não ser fixada. Vale a partir do **próximo boot**.
+## Quando mudar
+Raramente num roteador com o kernel: o encaminhamento roda em softirq na CPU da IRQ de cada fila, que o isolcpus não move. Ajuda um plano de dados em busy polling (DPDK, AF_XDP) que é dono de CPUs inteiras.
+## Cuidado
+O escalonador não volta a usá-las até um reboot (a documentação do kernel prefere cpusets para o que é dinâmico). A CPU 0 fica com o sistema."##,
+    ),
+    (
+        "tuning.boot.mitigations",
+        r##"## O que faz
+As defesas do kernel contra canais laterais da CPU (Spectre, Meltdown, MDS, Retbleed…). **auto** (padrão) as mantém; **auto,nosmt** também desliga o hyper-threading onde precisa; **off** tira todas.
+## Quando mudar
+off ganha alguns por cento só numa máquina que não roda nada além do próprio código.
+## Cuidado
+**Risco de segurança.** Um roteador ainda trata entrada hostil: a API, a web, o BGP e o DNS de fora. Com off, uma falha em qualquer um deles pode ler a memória de todos os outros processos, chaves inclusive. O CoreRouter pede confirmação explícita e nunca o recomenda."##,
+    ),
+    (
+        "tuning.boot.nohz_full",
+        r##"## O que faz
+Para o tick periódico do temporizador nestas CPUs enquanto rodam uma única tarefa (e tira delas os callbacks de RCU). Vale a partir do próximo boot.
+## Quando mudar
+Junto com o isolcpus, em CPUs que fazem busy polling de pacotes: nenhum tick as interrompe.
+## Cuidado
+Precisa de um kernel com NO_HZ_FULL. A CPU de boot não pode estar na lista. Sem uma única tarefa ocupada por CPU, só acrescenta custo."##,
+    ),
+    (
+        "tuning.boot.pcie_aspm",
+        r##"## O que faz
+Active State Power Management do PCIe. **off**: o kernel deixa o ASPM como o firmware o deixou e não o liga; **force**: liga mesmo onde o firmware proíbe.
+## Quando mudar
+off num roteador: uma placa cujo link PCIe dorme acrescenta microssegundos aos primeiros pacotes depois de uma pausa.
+## Cuidado
+force pode travar máquinas cujos dispositivos não suportam bem o ASPM."##,
+    ),
+    (
+        "tuning.boot.processor.max_cstate",
+        r##"## O que faz
+O C-state mais profundo que o driver de ociosidade ACPI (processor) pode usar, desde o boot: 0 desliga esse driver, 1 mantém as CPUs em C1. Vale a partir do próximo boot.
+## Quando mudar
+Menor latência num hardware em que o limite de C-state da aba CPU (PM QoS, sem reboot) não basta.
+## Cuidado
+Mais consumo e calor. O `cpu_dma_latency` da aba CPU faz o mesmo em tempo de execução e some se o daemon parar: prefira-o."##,
+    ),
+    (
         "tuning.cpu.cpu_dma_latency",
         r##"## O que faz
 O C-state mais profundo em que as CPUs podem dormir, dado como a latência de despertar permitida em µs: uma requisição PM QoS em `/dev/cpu_dma_latency`. 1 µs as mantém em C1; 0 as faz ficar em polling (nunca dormem). Sem valor: a escolha do próprio kernel.
@@ -604,12 +674,12 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Balanceado"##,
     ),
     (
-        "Boot parameters of the image (isolcpus, nohz_full, C-states, IOMMU, mitigations) arrive with G1.26d.",
-        r##"Os parâmetros de boot da imagem (isolcpus, nohz_full, C-states, IOMMU, mitigations) chegam com o G1.26d."##,
-    ),
-    (
         "CPU and IRQ",
         r##"CPU e IRQ"##,
+    ),
+    (
+        "CPU isolation",
+        r##"Isolamento de CPUs"##,
     ),
     (
         "Changing rings or queues resets the port: its link drops for a moment. Use Safe Mode on a port you manage the router through.",
@@ -668,6 +738,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Alto desempenho"##,
     ),
     (
+        "I understand the security risk",
+        r##"Entendo o risco de segurança"##,
+    ),
+    (
         "Idle states",
         r##"Estados de repouso"##,
     ),
@@ -692,8 +766,16 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Tabelas de vizinhos"##,
     ),
     (
+        "Next boot",
+        r##"Próximo boot"##,
+    ),
+    (
         "Not in this kernel or network namespace (conntrack: not loaded yet).",
         r##"Não existe neste kernel ou namespace de rede (conntrack: ainda não carregado)."##,
+    ),
+    (
+        "Not set for the next boot",
+        r##"Não definido para o próximo boot"##,
     ),
     (
         "Not set: the kernel's own value is in use",
@@ -726,6 +808,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Port",
         r##"Porta"##,
+    ),
+    (
+        "Power saving",
+        r##"Economia de energia"##,
     ),
     (
         "Profile",
@@ -772,6 +858,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Roteamento"##,
     ),
     (
+        "Running",
+        r##"Em uso"##,
+    ),
+    (
         "Safe Mode is held by",
         r##"O Safe Mode está com"##,
     ),
@@ -782,6 +872,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Saving…",
         r##"Salvando…"##,
+    ),
+    (
+        "Security",
+        r##"Segurança"##,
     ),
     (
         "Set",
@@ -828,6 +922,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Este roteador ainda não tem System › Tuning: atualize o corerouter-daemon."##,
     ),
     (
+        "This router has no boot parameters yet: update corerouter-daemon.",
+        r##"Este roteador ainda não tem parâmetros de boot: atualize o corerouter-daemon."##,
+    ),
+    (
         "This router has no port tuning yet: update corerouter-daemon.",
         r##"Este roteador ainda não tem ajuste de portas: atualize o corerouter-daemon."##,
     ),
@@ -850,6 +948,14 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Use recommended",
         r##"Usar o recomendado"##,
+    ),
+    (
+        "Valid from the next boot. The A/B image does not exist yet (G1.6): the parameters are saved in the config and wait for it (G1.26h).",
+        r##"Vale a partir do próximo boot. A imagem A/B ainda não existe (G1.6): os parâmetros ficam gravados na config e esperam por ela (G1.26h)."##,
+    ),
+    (
+        "Valid from the next boot; a boot that fails goes back to the previous image.",
+        r##"Vale a partir do próximo boot; um boot que falha volta para a imagem anterior."##,
     ),
     (
         "Value",
@@ -888,6 +994,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"pede reboot"##,
     ),
     (
+        "next boot",
+        r##"próximo boot"##,
+    ),
+    (
         "not applied",
         r##"não aplicado"##,
     ),
@@ -898,6 +1008,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "parameters differ from this profile.",
         r##"parâmetros diferem deste perfil."##,
+    ),
+    (
+        "security risk",
+        r##"risco de segurança"##,
     ),
     (
         "waiting for the router…",
@@ -951,6 +1065,18 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
     (
         "why.backlog",
         r##"Dimensionado para {gbps} Gb/s de portas: uma rajada espera no backlog em vez de ser descartada."##,
+    ),
+    (
+        "why.boot_aspm",
+        r##"Economia de energia do link PCIe desligada: uma placa acordando o link PCIe acrescenta latência aos primeiros pacotes."##,
+    ),
+    (
+        "why.boot_cstate",
+        r##"C-state máximo 1 desde o boot: sem atraso de despertar para os pacotes (mais consumo; o limite de C-state da aba CPU faz o mesmo sem reboot)."##,
+    ),
+    (
+        "why.boot_iommu_pt",
+        r##"Passthrough: o DMA do próprio host pula a tradução do IOMMU (menos custo por pacote); VFIO e SR-IOV continuam com ela."##,
     ),
     (
         "why.budget",

@@ -36,6 +36,10 @@ pub struct Tuning {
     /// CPU settings (G1.26c), by [`CPU_PARAMS`] key (`governor`).
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub cpu: BTreeMap<String, i64>,
+    /// Kernel command line of the next boot (G1.26d), by [`BOOT_PARAMS`]
+    /// name (`isolcpus` → `2-7`); checked by [`boot_value`].
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub boot: BTreeMap<String, String>,
 }
 
 impl Tuning {
@@ -439,6 +443,157 @@ pub const CPU_PARAMS: &[Param] = &[
     cpu(choice("hw_watchdog", SEC_WATCHDOG, OFF_ON, 0)),
 ];
 
+/// What a boot parameter takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BootKind {
+    /// A CPU list (`2-7,10`); CPU 0 stays with the system.
+    Cpus,
+    Int(i64, i64),
+    Choice(&'static [&'static str]),
+}
+
+/// One kernel command-line parameter of the image (G1.26d).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootParam {
+    pub name: &'static str,
+    /// Group inside the Boot tab (an English label).
+    pub section: &'static str,
+    pub kind: BootKind,
+    /// Weakens security: needs an explicit confirmation.
+    pub danger: bool,
+}
+
+pub const SEC_ISOLATION: &str = "CPU isolation";
+pub const SEC_POWER: &str = "Power saving";
+pub const SEC_IOMMU: &str = "IOMMU";
+pub const SEC_SECURITY: &str = "Security";
+
+/// The kernel command-line parameters of the Boot tab, in display order.
+pub const BOOT_PARAMS: &[BootParam] = &[
+    BootParam {
+        name: "isolcpus",
+        section: SEC_ISOLATION,
+        kind: BootKind::Cpus,
+        danger: false,
+    },
+    BootParam {
+        name: "nohz_full",
+        section: SEC_ISOLATION,
+        kind: BootKind::Cpus,
+        danger: false,
+    },
+    BootParam {
+        name: "intel_idle.max_cstate",
+        section: SEC_IDLE,
+        kind: BootKind::Int(0, 9),
+        danger: false,
+    },
+    BootParam {
+        name: "processor.max_cstate",
+        section: SEC_IDLE,
+        kind: BootKind::Int(0, 9),
+        danger: false,
+    },
+    BootParam {
+        name: "pcie_aspm",
+        section: SEC_POWER,
+        kind: BootKind::Choice(&["off", "force"]),
+        danger: false,
+    },
+    BootParam {
+        name: "iommu",
+        section: SEC_IOMMU,
+        kind: BootKind::Choice(&["pt", "nopt", "off"]),
+        danger: false,
+    },
+    BootParam {
+        name: "mitigations",
+        section: SEC_SECURITY,
+        kind: BootKind::Choice(&["auto", "auto,nosmt", "off"]),
+        danger: true,
+    },
+];
+
+/// Longest boot parameter value (a CPU list of a 4096-CPU box fits).
+pub const MAX_BOOT_VALUE: usize = 256;
+
+/// The catalog entry of boot parameter `name`.
+pub fn boot_param(name: &str) -> Option<&'static BootParam> {
+    BOOT_PARAMS.iter().find(|p| p.name == name)
+}
+
+/// `value` for `p`, checked and written as the kernel reads it; `cpus`:
+/// the machine's CPU count, when known. The text never holds a space, a
+/// quote or `=`: it goes onto the kernel command line as is.
+pub fn boot_value(p: &BootParam, value: &str, cpus: Option<u32>) -> Result<String, String> {
+    let v = value.trim();
+    if v.is_empty() || v.len() > MAX_BOOT_VALUE {
+        return Err(format!("{}: 1..={MAX_BOOT_VALUE} characters", p.name));
+    }
+    match p.kind {
+        BootKind::Int(min, max) => match v.parse::<i64>() {
+            Ok(n) if (min..=max).contains(&n) => Ok(n.to_string()),
+            _ => Err(format!("{} must be {min}..={max}", p.name)),
+        },
+        BootKind::Choice(list) => list
+            .iter()
+            .find(|c| **c == v)
+            .map(|c| (*c).to_owned())
+            .ok_or_else(|| format!("{} must be one of {}", p.name, list.join(", "))),
+        BootKind::Cpus => {
+            for part in v.split(',') {
+                let (a, b) = part.split_once('-').unwrap_or((part, part));
+                let (Ok(a), Ok(b)) = (a.parse::<u32>(), b.parse::<u32>()) else {
+                    return Err(format!(
+                        "{}: a CPU list like 2-7,10 (no spaces), not '{}'",
+                        p.name,
+                        part.chars().take(32).collect::<String>()
+                    ));
+                };
+                if a > b {
+                    return Err(format!("{}: {a}-{b} goes backwards", p.name));
+                }
+                if let Some(n) = cpus
+                    && b >= n
+                {
+                    return Err(format!(
+                        "{}: CPU {b} does not exist (this machine has 0-{})",
+                        p.name,
+                        n.saturating_sub(1)
+                    ));
+                }
+                if a == 0 {
+                    return Err(format!(
+                        "{}: CPU 0 stays with the system (the boot CPU runs the kernel's own                          housekeeping)",
+                        p.name
+                    ));
+                }
+            }
+            Ok(v.to_owned())
+        }
+    }
+}
+
+/// The parameters as the kernel command line writes them.
+pub fn cmdline(boot: &BTreeMap<String, String>) -> String {
+    BOOT_PARAMS
+        .iter()
+        .filter_map(|p| boot.get(p.name).map(|v| format!("{}={v}", p.name)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The catalog parameters on a kernel command line (`/proc/cmdline`).
+pub fn parse_cmdline(text: &str) -> BTreeMap<String, String> {
+    text.split_whitespace()
+        .take(1024)
+        .filter_map(|w| {
+            let (k, v) = w.split_once('=')?;
+            boot_param(k).map(|p| (p.name.to_owned(), v.chars().take(MAX_BOOT_VALUE).collect()))
+        })
+        .collect()
+}
+
 /// The catalog entry of CPU setting `key`.
 pub fn cpu_param(key: &str) -> Option<&'static Param> {
     CPU_PARAMS.iter().find(|p| p.name == key)
@@ -528,6 +683,21 @@ mod tests {
             assert_eq!(p.tab, Tab::Cpu, "{}", p.name);
         }
         assert!(cpu_param("governor").is_some());
+        let iso = boot_param("isolcpus").unwrap();
+        assert_eq!(boot_value(iso, "2-7,10", Some(16)), Ok("2-7,10".into()));
+        for bad in ["0-3", "2-40", "2 3", "a", "7-2", "", "2=3"] {
+            assert!(boot_value(iso, bad, Some(16)).is_err(), "{bad}");
+        }
+        let mit = boot_param("mitigations").unwrap();
+        assert!(mit.danger);
+        assert!(boot_value(mit, "off", None).is_ok());
+        assert!(boot_value(mit, "off quiet", None).is_err());
+        let mut b = BTreeMap::new();
+        b.insert("mitigations".to_owned(), "off".to_owned());
+        b.insert("isolcpus".to_owned(), "2-7".to_owned());
+        assert_eq!(cmdline(&b), "isolcpus=2-7 mitigations=off");
+        let back = parse_cmdline("BOOT_IMAGE=/vmlinuz ro quiet isolcpus=2-7 mitigations=off foo=bar");
+        assert_eq!(back, b);
         assert_eq!(proc_path("net.core.netdev_budget"), "net/core/netdev_budget");
         assert!(is_conntrack("net.netfilter.nf_conntrack_max"));
         assert!(!is_conntrack("net.core.somaxconn"));
