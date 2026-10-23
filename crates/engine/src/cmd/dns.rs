@@ -28,7 +28,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → {servers, dynamic_servers, allow_remote_requests, allowed_from, allowed_networks (what allowed_from stands for now), max_queries_per_client, server_selection, serve_stale_secs, max_concurrent_queries, max_concurrent_tcp_sessions, address_list_extra_time_secs, cache_size, cache_max_ttl_secs, query_server_timeout_ms, query_total_timeout_ms, max_udp_packet_size, use_doh_server, verify_doh_cert, cache_used, resolver: router|simulated, upstream: [{server, srtt_ms, answers, failures, down}]}",
         always, get),
     cmd!(query "ip.dns.cache.print", "DNS Cache", [], None,
-        "{name?: string, type?: string (A, MX, …)} → [{name, type, kind: records|nx-domain|no-data, data: [record text], addresses, ttl, hits, server, stale}]",
+        "{name?: string, type?: string (A, MX, …), limit?: integer (1..=100000, default 1000)} → [{name, type, kind: records|nx-domain|no-data, data: [record text], addresses, ttl, hits, server, stale}]",
         always, cache_print),
     cmd!(
         "ip.dns.cache.flush",
@@ -306,14 +306,36 @@ fn get(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(out)
 }
 
+/// `ip.dns.cache.print` rows by default, and at most: the cache can hold
+/// millions of entries, all formatted under the resolver's lock.
+const CACHE_PRINT_DEFAULT: u32 = 1000;
+const CACHE_PRINT_MAX: u32 = 100_000;
+
 fn cache_print(s: &mut Session, p: &Value) -> Result<Value> {
     let filter = opt_str(p, "name")?.map(|n| n.trim().trim_end_matches('.').to_ascii_lowercase());
     let qtype = opt_str(p, "type")?.map(|t| t.trim().to_ascii_uppercase());
-    let rows = s.dns_backend().map(|b| b.cache_rows()).unwrap_or_default();
+    let limit = match opt_u32(p, "limit")? {
+        None => CACHE_PRINT_DEFAULT,
+        Some(n) if (1..=CACHE_PRINT_MAX).contains(&n) => n,
+        Some(_) => {
+            return Err(EngineError::bad(
+                "limit",
+                format!("must be 1..={CACHE_PRINT_MAX}"),
+            ));
+        }
+    };
+    let rows = s
+        .dns_backend()
+        .map(|b| {
+            b.cache_rows_matching(
+                filter.as_deref(),
+                qtype.as_deref(),
+                usize::try_from(limit).unwrap_or(usize::MAX),
+            )
+        })
+        .unwrap_or_default();
     let rows: Vec<Value> = rows
         .into_iter()
-        .filter(|r| filter.as_ref().is_none_or(|f| r.name.contains(f.as_str())))
-        .filter(|r| qtype.as_ref().is_none_or(|t| r.qtype == *t))
         .filter_map(|r| serde_json::to_value(r).ok())
         .collect();
     Ok(Value::Array(rows))
@@ -323,7 +345,7 @@ fn cache_flush(s: &mut Session, _: &Value) -> Result<Value> {
     let Some(b) = s.dns_backend() else {
         return Ok(json!({"flushed": 0}));
     };
-    let n = b.cache_rows().len();
+    let n = b.cache_len();
     b.flush();
     Ok(json!({"flushed": n}))
 }
@@ -398,6 +420,61 @@ mod tests {
         assert_eq!(s.store().candidate().ip.dns.servers.len(), 1);
         s.execute("config.discard", &json!({})).unwrap();
         assert!(s.store().candidate().ip.dns.servers.is_empty());
+    }
+
+    /// A big cache: flush counts it without formatting it, print stops at
+    /// its limit.
+    #[test]
+    fn cache_print_is_bounded_and_flush_does_not_format() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use corerouter_model::dns::{CacheKind, CacheRow};
+        use corerouter_proto_dns::resolver::ResolveError;
+
+        #[derive(Default)]
+        struct Big(AtomicUsize);
+        impl crate::dns::DnsBackend for Big {
+            fn lookup(&self, _: &str) -> std::result::Result<Vec<IpAddr>, ResolveError> {
+                Err(ResolveError::NoServers)
+            }
+            fn cache_rows(&self) -> Vec<CacheRow> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                (0..5000)
+                    .map(|i| CacheRow {
+                        name: format!("h{i}.example"),
+                        qtype: "A".into(),
+                        kind: CacheKind::Records,
+                        data: Vec::new(),
+                        addresses: Vec::new(),
+                        ttl: 60,
+                        hits: 0,
+                        server: None,
+                        stale: false,
+                    })
+                    .collect()
+            }
+            fn cache_len(&self) -> usize {
+                100_000
+            }
+            fn cache_used_bytes(&self) -> usize {
+                0
+            }
+            fn flush(&self) {}
+        }
+        let mut s = Session::virtual_lab();
+        let big = Arc::new(Big::default());
+        s.set_dns_backend(big.clone());
+        let out = s.execute("ip.dns.cache.flush", &json!({})).unwrap();
+        assert_eq!(out["flushed"], 100_000);
+        assert_eq!(big.0.load(Ordering::Relaxed), 0, "flush formats nothing");
+        let rows = s.execute("ip.dns.cache.print", &json!({})).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1000, "default limit");
+        let rows = s
+            .execute("ip.dns.cache.print", &json!({"name": "h49", "limit": 5}))
+            .unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 5);
+        assert!(s.execute("ip.dns.cache.print", &json!({"limit": 0})).is_err());
     }
 
     #[test]

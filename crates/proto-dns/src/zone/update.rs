@@ -369,6 +369,17 @@ pub fn read(f: &Forwarder, packet: &[u8], client: IpAddr, now: u64) -> Result<Up
     Ok(u)
 }
 
+/// The prerequisites of an already read UPDATE, against the zone as it is
+/// now (the records moved since [`read`]: RFC 2136 §3.7 wants them checked
+/// against what the update applies to). `Err`: the reply to send.
+pub fn recheck(f: &Forwarder, u: &Update, now: u64) -> Result<(), Vec<u8>> {
+    let cfg = f.config();
+    let Some(Ok(data)) = super::find(f, &cfg, &u.zone) else {
+        return Err(answer(u, ResponseCode::ServFail, now));
+    };
+    prerequisites(&data, &u.request).map_err(|rcode| answer(u, rcode, now))
+}
+
 #[cfg(feature = "dnssec")]
 mod sign {
     use std::collections::HashMap;
@@ -384,9 +395,17 @@ mod sign {
     use crate::server::Forwarder;
 
     /// RFC 8945 §5.2.3: the last Time Signed seen per key (a replayed
-    /// message is older).
+    /// message is older) and the MACs seen in that second (an exact
+    /// replay has the same time and MAC).
     #[derive(Default)]
-    pub(super) struct Replay(Mutex<HashMap<String, u64>>);
+    pub(super) struct Replay(Mutex<HashMap<String, Seen>>);
+
+    /// The last Time Signed of a key and the MACs seen in that second.
+    type Seen = (u64, Vec<Vec<u8>>);
+
+    /// MACs remembered for one key and second (a DHCP server renewing
+    /// many leases at once signs many updates in the same second).
+    const MACS_PER_SECOND: usize = 256;
 
     fn alg(a: TsigAlgorithm) -> HAlg {
         match a {
@@ -453,6 +472,12 @@ mod sign {
         let Some(secret) = base64_decode(&k.secret) else {
             return Err(unknown());
         };
+        // hickory computes `time - fudge` unchecked: a Time Signed below
+        // the client's fudge (1970) would overflow. No real clock is there;
+        // refused before hickory sees it.
+        if sig.data.time < u64::from(sig.data.fudge) {
+            return Err(bytes(&notauth()));
+        }
         let Ok(signer) = TSigner::new(
             secret,
             alg(k.algorithm),
@@ -479,11 +504,15 @@ mod sign {
                 );
             }
         };
-        // §5.2.3: the time, and never older than the last one of the key.
+        // §5.2.3: the time within the client's fudge and ours (§10: 300 s;
+        // the client's alone may be 18 h), never older than the last one
+        // of the key, and never the exact same message again.
         let replay = f.state::<Replay>();
         let mut last = replay.0.lock().unwrap_or_else(|e| e.into_inner());
-        let older = last.get(&name).is_some_and(|l| time < *l);
-        if now < window.start || now > window.end || older {
+        let replayed = last
+            .get(&name)
+            .is_some_and(|(l, macs)| time < *l || (time == *l && macs.contains(&mac)));
+        if now < window.start || now > window.end || now.abs_diff(time) > FUDGE_SECS || replayed {
             return Err(signed(
                 &notauth(),
                 signer,
@@ -492,7 +521,14 @@ mod sign {
                 now,
             ));
         }
-        last.insert(name, time);
+        let seen = last.entry(name).or_insert_with(|| (time, Vec::new()));
+        if seen.0 != time {
+            *seen = (time, Vec::new());
+        }
+        if seen.1.len() >= MACS_PER_SECOND {
+            seen.1.remove(0);
+        }
+        seen.1.push(mac.clone());
         Ok(Some((signer, mac)))
     }
 }

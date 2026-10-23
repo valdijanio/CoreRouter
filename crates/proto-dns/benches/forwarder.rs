@@ -59,6 +59,27 @@ impl Transport for Instant0 {
     }
 }
 
+/// The same upstream, with a long TTL (the answer is cached).
+struct Ttl300;
+
+impl Transport for Ttl300 {
+    fn now_ms(&self) -> u64 {
+        1000
+    }
+    fn exchange(
+        &mut self,
+        s: SocketAddr,
+        q: &[u8],
+        tcp: bool,
+        w: u64,
+        accept: &mut dyn FnMut(&[u8]) -> bool,
+    ) -> Result<Vec<u8>, TransportError> {
+        let mut m = Message::from_vec(&Instant0.exchange(s, q, tcp, w, accept)?).unwrap();
+        m.answers[0].ttl = 300;
+        Ok(m.to_vec().unwrap())
+    }
+}
+
 fn ask(name: &str) -> Vec<u8> {
     let mut m = Message::query();
     m.metadata.recursion_desired = true;
@@ -87,25 +108,6 @@ fn forwarder(statics: usize) -> Forwarder {
 fn bench(c: &mut Criterion) {
     let client = IpAddr::from([192, 168, 88, 10]);
     let f = forwarder(0);
-    // Warms the cache: the same upstream, with a long TTL.
-    struct Ttl300;
-    impl Transport for Ttl300 {
-        fn now_ms(&self) -> u64 {
-            1000
-        }
-        fn exchange(
-            &mut self,
-            s: SocketAddr,
-            q: &[u8],
-            tcp: bool,
-            w: u64,
-            accept: &mut dyn FnMut(&[u8]) -> bool,
-        ) -> Result<Vec<u8>, TransportError> {
-            let mut m = Message::from_vec(&Instant0.exchange(s, q, tcp, w, accept)?).unwrap();
-            m.answers[0].ttl = 300;
-            Ok(m.to_vec().unwrap())
-        }
-    }
     let warm = ask("www.example.com.");
     match f.start(&warm, client, false, 1000) {
         Start::Pending(p) => {
@@ -135,6 +137,38 @@ fn bench(c: &mut Criterion) {
             Start::Pending(p) => f.finish(*p, &mut Instant0).reply.unwrap(),
             Start::Done(_) => panic!("hit"),
         })
+    });
+
+    // A full cache (8 MiB, ~30 000 entries, filled with 40 000 names):
+    // a hit, and a miss whose answer must evict another entry.
+    let mut full_cfg = Config::default();
+    full_cfg.ip.dns.servers = vec![IpAddr::from([192, 0, 2, 53])];
+    full_cfg.ip.dns.allow_remote_requests = true;
+    full_cfg.ip.dns.max_queries_per_client = 0;
+    full_cfg.ip.dns.cache_size = 8192;
+    let resolver = Arc::new(Resolver::new(Settings::new(&full_cfg.ip.dns, &[])));
+    let ff = Forwarder::new(resolver);
+    ff.configure(Arc::new(full_cfg), vec!["192.168.88.0/24".parse().unwrap()]);
+    let mut n = 0u64;
+    let miss = |f: &Forwarder, n: &mut u64| {
+        *n += 1;
+        match f.start(&ask(&format!("h{n}.example.com.")), client, false, 2000) {
+            Start::Pending(p) => f.finish(*p, &mut Ttl300).reply.unwrap(),
+            Start::Done(_) => panic!("hit"),
+        }
+    };
+    for _ in 0..40_000 {
+        miss(&ff, &mut n);
+    }
+    let last = ask(&format!("h{n}.example.com."));
+    c.bench_function("dns_forward_cache_hit_full", |b| {
+        b.iter(|| match ff.start(black_box(&last), client, false, 2000) {
+            Start::Done(d) => d.reply.unwrap(),
+            Start::Pending(_) => panic!("miss"),
+        })
+    });
+    c.bench_function("dns_forward_cache_miss_full", |b| {
+        b.iter(|| miss(&ff, &mut n))
     });
 }
 

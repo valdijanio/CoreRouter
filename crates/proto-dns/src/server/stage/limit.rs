@@ -22,6 +22,9 @@ pub(crate) const STAGE: Stage = Stage {
 
 /// Clients tracked at once; past it, idle ones are forgotten first.
 const MAX_CLIENTS: usize = 65_536;
+/// A full table is swept for idle clients at most this often: under a
+/// flood from many sources every new one would otherwise scan it all.
+const SWEEP_EVERY_MS: u64 = 1000;
 
 #[derive(Debug, Clone, Copy)]
 struct Bucket {
@@ -31,7 +34,14 @@ struct Bucket {
 }
 
 #[derive(Default)]
-pub(crate) struct Buckets(Mutex<HashMap<IpAddr, Bucket>>);
+struct Table {
+    map: HashMap<IpAddr, Bucket>,
+    last_sweep_ms: Option<u64>,
+    sweeps: u64,
+}
+
+#[derive(Default)]
+pub(crate) struct Buckets(Mutex<Table>);
 
 fn client_key(ip: IpAddr) -> IpAddr {
     match ip {
@@ -48,17 +58,29 @@ impl Buckets {
     pub(crate) fn take(&self, client: IpAddr, rate: u32, now_ms: u64) -> bool {
         let rate = u64::from(rate);
         let cap = rate * 2 * 1000;
-        let mut map = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= MAX_CLIENTS && !map.contains_key(&client_key(client)) {
-            // Full buckets (idle clients) carry no information.
-            map.retain(|_, b| b.milli + now_ms.saturating_sub(b.last_ms) * rate < cap);
-            if map.len() >= MAX_CLIENTS {
+        let mut table = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let t = &mut *table;
+        if t.map.len() >= MAX_CLIENTS && !t.map.contains_key(&client_key(client)) {
+            let due = t
+                .last_sweep_ms
+                .is_none_or(|l| now_ms.saturating_sub(l) >= SWEEP_EVERY_MS);
+            if due {
+                // Full buckets (idle clients) carry no information.
+                t.last_sweep_ms = Some(now_ms);
+                t.sweeps = t.sweeps.saturating_add(1);
+                t.map.retain(|_, b| {
+                    b.milli
+                        .saturating_add(now_ms.saturating_sub(b.last_ms).saturating_mul(rate))
+                        < cap
+                });
+            }
+            if t.map.len() >= MAX_CLIENTS {
                 // Under a spoofed flood from many sources: do not grow; the
                 // query goes on, still bounded by max_concurrent_queries.
                 return true;
             }
         }
-        let b = map.entry(client_key(client)).or_insert(Bucket {
+        let b = t.map.entry(client_key(client)).or_insert(Bucket {
             milli: cap,
             last_ms: now_ms,
         });
@@ -101,6 +123,22 @@ mod tests {
         assert!(b.take(c, 10, 100), "one per 100 ms at 10/s");
         let other: IpAddr = [192, 168, 88, 11].into();
         assert!(b.take(other, 10, 100), "per client");
+    }
+
+    /// A full table of active clients and a flood from new sources: at
+    /// most one sweep per second, not one per packet.
+    #[test]
+    fn a_full_table_is_swept_once_a_second() {
+        let b = Buckets::default();
+        for i in 0..u32::try_from(MAX_CLIENTS).unwrap() {
+            assert!(b.take(IpAddr::from(std::net::Ipv4Addr::from((10u32 << 24) | i)), 10, 0));
+        }
+        for i in 0..10_000u32 {
+            assert!(b.take(IpAddr::from(std::net::Ipv4Addr::from((172u32 << 24) | i)), 10, u64::from(i) / 100));
+        }
+        let t = b.0.lock().unwrap();
+        assert!(t.sweeps <= 1, "{} sweeps", t.sweeps);
+        assert_eq!(t.map.len(), MAX_CLIENTS);
     }
 
     #[test]

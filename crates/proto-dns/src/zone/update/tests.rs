@@ -272,7 +272,11 @@ mod tsig {
     use super::*;
 
     fn signed(m: &Message, secret: &[u8], key: &str, at: u64) -> Vec<u8> {
-        let signer = TSigner::new(secret.to_vec(), HAlg::HmacSha256, name(key), 300).unwrap();
+        signed_fudge(m, secret, key, at, 300)
+    }
+
+    fn signed_fudge(m: &Message, secret: &[u8], key: &str, at: u64, fudge: u16) -> Vec<u8> {
+        let signer = TSigner::new(secret.to_vec(), HAlg::HmacSha256, name(key), fudge).unwrap();
         let (tsig, _) = signer.sign_message(m, at).unwrap();
         let mut out = m.clone();
         out.set_signature(tsig);
@@ -321,6 +325,37 @@ mod tsig {
             .err()
             .unwrap();
         assert!(tsig_error(&e).unwrap().contains("BadTime"));
+        // RFC 8945 §5.2.3 / §10: the window is ours (300 s), not the
+        // client's Fudge: a captured update with fudge 65535 is not good
+        // for 18 hours.
+        let e = read(
+            &f,
+            &signed_fudge(&m, &SECRET, "ddns.", NOW + 20 - 3600, 65_535),
+            from,
+            NOW + 20,
+        )
+        .err()
+        .unwrap();
+        assert!(tsig_error(&e).unwrap().contains("BadTime"));
+        // The exact same message again: a replay.
+        let once = signed(&m, &SECRET, "ddns.", NOW + 30);
+        read(&f, &once, from, NOW + 30).unwrap();
+        let e = read(&f, &once, from, NOW + 31).err().unwrap();
+        assert!(tsig_error(&e).unwrap().contains("BadTime"));
+        // Another message signed in the same second is not one.
+        let m2 = update(vec![], vec![add_a("pc2.lan.example.", [192, 168, 88, 51])]);
+        read(&f, &signed(&m2, &SECRET, "ddns.", NOW + 30), from, NOW + 31).unwrap();
+        // Time Signed below the fudge (1970): refused, and never a panic
+        // in hickory's window arithmetic.
+        let e = read(
+            &f,
+            &signed_fudge(&m, &SECRET, "ddns.", 10, 300),
+            from,
+            NOW + 31,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(rcode(&e), ResponseCode::NotAuth);
         // A good key from outside allow_update: REFUSED.
         let f2 =
             fwd(|c| c.ip.dns_zones.zones[0].allow_update = vec!["10.0.0.0/8".parse().unwrap()]);
