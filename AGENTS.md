@@ -295,6 +295,8 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
     grupo do menu ficam em ordem alfabética (como no WinBox); grupo novo é uma linha em `MENU`;
   - testes de UI de uma feature: `crates/ui/src/tests/<feature>.rs` (descoberto), não no fim do
     `mod tests` do `lib.rs`;
+  - traduções de uma janela nova: `crates/ui/src/i18n/auto/<escopo>_<idioma>.rs` (registradas pelo
+    `build.rs`, rótulos por `i18n::tr_in`); **não edite** as listas do `i18n/mod.rs`;
   - teste em namespace: `tests/netns<nome>.rs` em qualquer pacote — o `cargo xtask netns`
     descobre; não há lista para editar;
   - módulo novo no engine, no model ou no mcp: só o arquivo `src/<nome>.rs` (ou
