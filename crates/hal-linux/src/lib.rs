@@ -33,6 +33,11 @@
 //!   taking one out restores it; see [`tuning`]); `system_info`,
 //!   `sysctls` and `kernel_stats` read `/proc` and `/sys`.
 //!
+//! - XDP (G2.5a): `xdp` loads `dataplane-ebpf`'s prebuilt object with aya,
+//!   attaches it where `ip.firewall.xdp` says (native, else generic) and
+//!   keeps its maps in step with the config, last in `apply` (a failure
+//!   there undoes the rest of the apply too).
+//!
 //! Integration tests run against a real kernel inside a throwaway network
 //! namespace, without root: see `tests/netns.rs`.
 
@@ -118,6 +123,10 @@ mod port_tuning;
 #[cfg(target_os = "linux")]
 mod cpu_tuning;
 
+/// IP › Firewall › XDP (G2.5a): the XDP filter's loader, maps and counters.
+#[cfg(target_os = "linux")]
+pub mod xdp;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
@@ -162,6 +171,8 @@ mod linux {
         cgnat_blocks: crate::cgnat::Blocks,
         /// What the last apply installed of the fast path (G2.4).
         fastpath: corerouter_hal::fastpath::FastPathState,
+        /// The XDP filter (G2.5a); nothing loaded until configured.
+        xdp: crate::xdp::XdpState,
     }
 
     impl LinuxHal {
@@ -385,33 +396,12 @@ mod linux {
             .collect()
     }
 
-    impl Hal for LinuxHal {
-        fn describe(&self) -> String {
-            "linux (rtnetlink)".into()
-        }
-
-        /// Managed ports only (`owner` rules 6–8); everything else is in
-        /// `poll`, marked unmanaged.
-        fn discover_links(&mut self) -> Result<Vec<LinkInfo>, HalError> {
-            Ok(self
-                .view(&self.claims)?
-                .into_iter()
-                .filter(|(_, o)| *o == Owner::Managed)
-                .filter_map(|(l, _)| {
-                    Some(LinkInfo {
-                        name: l.name.parse().ok()?,
-                        mtu: u16::try_from(l.mtu).ok()?,
-                        mac: l.mac,
-                        up: l.up,
-                    })
-                })
-                .collect())
-        }
-
-        /// Ops on links CoreRouter does not own are dropped (logged), so a
-        /// stale config can never reach another program's link; conflicts
-        /// go to the executor, which refuses them and rolls back.
-        fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+    impl LinuxHal {
+        /// `apply` without XDP. Ops on links CoreRouter does not own are
+        /// dropped (logged), so a stale config can never reach another
+        /// program's link; conflicts go to the executor, which refuses them
+        /// and rolls back.
+        fn apply_links(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
             let ops = crate::plan::plan(from, to)?;
             // Before anything changes: port settings only reach links
             // CoreRouter manages, as the Ethernet settings do (another
@@ -582,6 +572,54 @@ mod linux {
                     Err(e)
                 }
             }
+        }
+    }
+
+    impl Hal for LinuxHal {
+        fn describe(&self) -> String {
+            "linux (rtnetlink)".into()
+        }
+
+        /// Managed ports only (`owner` rules 6–8); everything else is in
+        /// `poll`, marked unmanaged.
+        fn discover_links(&mut self) -> Result<Vec<LinkInfo>, HalError> {
+            Ok(self
+                .view(&self.claims)?
+                .into_iter()
+                .filter(|(_, o)| *o == Owner::Managed)
+                .filter_map(|(l, _)| {
+                    Some(LinkInfo {
+                        name: l.name.parse().ok()?,
+                        mtu: u16::try_from(l.mtu).ok()?,
+                        mac: l.mac,
+                        up: l.up,
+                    })
+                })
+                .collect())
+        }
+
+        /// Everything else first (the interfaces must exist), XDP last; if
+        /// XDP refuses, the rest goes back to `from`.
+        fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
+            self.apply_links(from, to)?;
+            if let Err(e) = self.xdp.sync(to) {
+                if let Err(back) = self.xdp.sync(from) {
+                    log::error!("restoring the previous XDP filter: {back}");
+                }
+                if let Err(back) = self.apply_links(to, from) {
+                    log::error!("restoring the rest after XDP refused: {back}");
+                }
+                return Err(e);
+            }
+            Ok(())
+        }
+
+        fn xdp_status(&mut self, top: usize) -> Result<corerouter_hal::xdp::XdpStatus, HalError> {
+            Ok(self.xdp.status(top))
+        }
+
+        fn xdp_reset(&mut self) -> Result<(), HalError> {
+            self.xdp.reset()
         }
 
         fn system_info(&mut self) -> Result<SystemInfo, HalError> {
@@ -783,6 +821,7 @@ mod linux {
         }
 
         fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
+            self.xdp.dynamic(change);
             match change {
                 DynamicChange::Add(d) => crate::nft::add_dynamic(d),
                 DynamicChange::Remove(d) => crate::nft::remove_dynamic(d),

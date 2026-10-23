@@ -2,6 +2,12 @@
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
+    ("graphs.alert.capacity", "## Capacity\nWhat 100 % is, in Mbit/s. Empty: the negotiated speed of the port (asked once a minute). Set it when the contract is smaller than the port (a 300 Mbit/s transit on a 1 Gbit/s port) or for VLANs and tunnels, which have no speed of their own."),
+    ("graphs.alert.direction", "## Direction\n**rx** (receive), **tx** (transmit) or **any**: the busier of the two, minute by minute."),
+    ("graphs.alert.interface", "## Interface\nThe interface the rule watches. It must be kept by the history (Settings…): the rule is judged on its 1-minute averages."),
+    ("graphs.alert.minutes", "## For\nHow many 1-minute averages in a row must be above before the line goes to the log (1 to 1440). Short bursts do not count; one minute below ends the alert, with another line."),
+    ("graphs.alert.percent", "## Above\nThe use of the capacity, in %, that counts as busy. 80 % is a common warning for a transit or uplink: beyond it queues grow and latency rises."),
+    ("graphs.alert.state", "## State\n**ok**: below, or not long enough above. **alerting**: above for the whole period; the log has a `warning` line (topic `interface`), which remote logging can send on. **unknown**: no capacity known or no history of the interface; the hover says why."),
     ("graphs.avg", "## Average\nThe mean of the known points of the range."),
     ("graphs.billing", "## p95 billing\n**p95 billing** is the larger of the receive and transmit 95th percentiles: what most transit contracts and LibreNMS bill.\n\n**p95 of Rx+Tx** takes the 95th percentile of receive plus transmit per sample (the \"aggregate\" of LibreNMS and Cacti), used by some data centers.\n\nCheck your contract: the difference can be large on an asymmetric link."),
     ("graphs.compare", "## Compare\nDraws other interfaces on the same chart, each in the colour of its name: receive solid, transmit dashed. Up to 6.\n\nUseful to see which uplink carries the peak, or whether two links of a bond share the load."),

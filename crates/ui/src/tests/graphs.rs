@@ -143,3 +143,31 @@ fn spark_cells_scale_to_the_top_and_mark_holes() {
     let body = c.strip_prefix(crate::spark::SEP).unwrap();
     assert!(body.starts_with("08-f/f-/"), "{body}");
 }
+
+#[test]
+fn alerts_window_adds_and_removes_rules() {
+    let mut h = harness(130);
+    h.click(h.text("Alerts… (0)"));
+    refresh(&mut h);
+    assert!(h.has_text("Bandwidth Alerts"));
+    let g = graphs(&mut h);
+    assert_eq!(g.new_alert.interface, "ether1", "the first kept interface");
+    g.new_alert.percent = "70".into();
+    g.new_alert.capacity = "1".into();
+    h.click(h.text("+"));
+    refresh(&mut h);
+    let alerts = lock(&h.session).store().running().system.graphing.alerts.clone();
+    assert_eq!(alerts.len(), 1);
+    assert_eq!((alerts[0].percent, alerts[0].capacity_mbps), (70, Some(1)));
+    assert_eq!(graphs(&mut h).alerts.len(), 1);
+    assert!(h.has_text("1.0 Mbps"), "the capacity in the row");
+    // A refused rule keeps the form and says why.
+    graphs(&mut h).new_alert.percent = "300".into();
+    h.click(h.text("+"));
+    refresh(&mut h);
+    let err = graphs(&mut h).new_alert.error.clone().unwrap();
+    assert!(err.contains("percent"), "{err}");
+    h.click(h.text("−"));
+    refresh(&mut h);
+    assert!(lock(&h.session).store().running().system.graphing.alerts.is_empty());
+}

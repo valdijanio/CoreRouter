@@ -25,8 +25,6 @@
 mod dns_lookup_pt;
 mod cgnat_en;
 mod cgnat_pt;
-mod fastpath_en;
-mod fastpath_pt;
 mod ip_calc_en;
 mod ip_calc_pt;
 mod connections_en;
@@ -43,6 +41,8 @@ mod tuning_en;
 mod tuning_pt;
 mod traffic_flow_en;
 mod traffic_flow_pt;
+mod xdp_en;
+mod xdp_pt;
 
 /// A language the GUI speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,12 +86,12 @@ impl Lang {
                 routes_pt::LABELS,
                 connections_pt::LABELS,
                 cgnat_pt::LABELS,
-                fastpath_pt::LABELS,
                 ip_calc_pt::LABELS,
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
                 traffic_flow_pt::LABELS,
                 graphs_pt::LABELS,
+                xdp_pt::LABELS,
             ],
         }
     }
@@ -106,9 +106,9 @@ impl Lang {
                 connections_en::HELP,
                 cgnat_en::HELP,
                 ip_calc_en::HELP,
-                fastpath_en::HELP,
                 traffic_flow_en::HELP,
                 graphs_en::HELP,
+                xdp_en::HELP,
             ],
             Lang::Pt => &[
                 pt::HELP,
@@ -117,9 +117,9 @@ impl Lang {
                 connections_pt::HELP,
                 cgnat_pt::HELP,
                 ip_calc_pt::HELP,
-                fastpath_pt::HELP,
                 traffic_flow_pt::HELP,
                 graphs_pt::HELP,
+                xdp_pt::HELP,
             ],
         }
     }

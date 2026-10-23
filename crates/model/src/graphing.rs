@@ -12,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::IfName;
+use crate::types::{IfName, ItemId};
 
 /// Default `store_every`: RouterOS `store-every=5min`.
 pub const DEFAULT_STORE_EVERY: u32 = 300;
@@ -24,6 +24,53 @@ pub const MIN_MAX_MEMORY_MIB: u32 = 1;
 pub const MAX_MAX_MEMORY_MIB: u32 = 4096;
 /// Most names in `include` or `exclude`.
 pub const MAX_NAMES: usize = 1024;
+/// Most bandwidth alert rules.
+pub const MAX_ALERTS: usize = 256;
+/// Longest streak an alert can ask for: a day of minutes.
+pub const MAX_ALERT_MINUTES: u32 = 1440;
+
+/// Which way a bandwidth alert looks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Direction {
+    /// The busier of the two, minute by minute.
+    #[default]
+    Any,
+    Rx,
+    Tx,
+}
+
+impl Direction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Any => "any",
+            Self::Rx => "rx",
+            Self::Tx => "tx",
+        }
+    }
+}
+
+/// "Above `percent` % of the link for `minutes` minutes": a line in the
+/// log when it starts and when it ends (G4.5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BandwidthAlert {
+    pub id: ItemId,
+    pub interface: IfName,
+    #[serde(default)]
+    pub direction: Direction,
+    /// 1..=100.
+    pub percent: u8,
+    /// 1..=[`MAX_ALERT_MINUTES`].
+    pub minutes: u32,
+    /// The link's capacity, Mbit/s; `None`: its negotiated speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_mbps: Option<u32>,
+    #[serde(default)]
+    pub disabled: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -49,6 +96,16 @@ pub struct Graphing {
     /// Memory for the history, MiB; the same bytes go to disk. Interfaces
     /// past it are not kept (and `system.graph.print` says which).
     pub max_memory_mib: u32,
+    /// Bandwidth alerts (`system.graph.alert.*`).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub alerts: Vec<BandwidthAlert>,
+    /// The last alert id handed out (ids are never reused).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub next_alert_id: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 impl Default for Graphing {
@@ -64,6 +121,8 @@ impl Default for Graphing {
             include: Vec::new(),
             exclude: Vec::new(),
             max_memory_mib: DEFAULT_MAX_MEMORY_MIB,
+            alerts: Vec::new(),
+            next_alert_id: 0,
         }
     }
 }
@@ -121,6 +180,12 @@ impl Graphing {
             Class::Tunnel => self.tunnels,
             Class::Other => false,
         }
+    }
+
+    /// A new alert id (`*1`, `*2`…).
+    pub fn next_alert_id(&mut self) -> ItemId {
+        self.next_alert_id = self.next_alert_id.saturating_add(1);
+        ItemId(self.next_alert_id)
     }
 
     pub fn max_memory_bytes(&self) -> u64 {
