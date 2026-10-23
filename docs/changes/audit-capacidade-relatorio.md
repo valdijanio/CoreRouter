@@ -1,4 +1,4 @@
-id: audit-capacidade
+id: audit-capacidade-relatorio
 
 Relatório da auditoria (`docs/audit-2026-10.md`), seção nova "Capacidade e persistência": limites
 da config (15 MiB por config; tetos por item), medição de commit, boot e revisões que voltam do
