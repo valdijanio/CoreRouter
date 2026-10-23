@@ -3024,3 +3024,68 @@ continuação indentadas).
   palavra em inglês com traduções diferentes em janelas diferentes ("Checks", "Last") reprovava o
   lote. O registro antigo continua valendo (mudança aditiva); `AGENTS.md` e `docs/ui-style.md`
   explicam o caminho novo.
+
+- 2026-10-23 — G2.5a: XDP, parte 1: base e filtro anti-DDoS antes do kernel (`docs/xdp.md`).
+
+  - **Programa XDP em Rust** (`crates/dataplane-ebpf`, `aya-ebpf`, fora do workspace, nightly
+    fixado + `bpf-linker`), único crate com `unsafe` (6 blocos com `SAFETY:`, listados no
+    `docs/xdp.md` para revisão humana). A lógica (parse Ethernet/QinQ/IPv4/IPv6/TCP/UDP/ICMP,
+    decisão, token bucket, layout dos mapas) fica em `crates/dataplane-ebpf-common` (`no_std`, sem
+    `unsafe`), compilada também para o host e testada lá.
+  - **Objeto pré-compilado** em `crates/dataplane-ebpf/prebuilt/` com o hash das fontes:
+    `cargo xtask ebpf` recompila; o passo `ebpf-check` do `cargo xtask ci` reprova fonte mudada sem
+    recompilar, sem precisar do nightly.
+  - **Filtro**: listas de bloqueio (address lists do firewall, prefixos v4/v6 em LPM trie, faixas
+    em CIDR exato, entradas dinâmicas inclusive), listas de exceção, limite de taxa por origem
+    (token bucket em LRU hash), descarte de malformados (RFC 1858 incluso) e de flags TCP
+    impossíveis (tabela do `nf_conntrack`), contadores por interface e motivo, top origens.
+  - **`hal-linux`**: carrega só quando há interface configurada, `auto` = native senão generic,
+    sincroniza os mapas por diferença, XDP por último no `apply` (falhou: o resto volta), links do
+    processo do daemon (morreu: fail-open).
+  - **Comandos** `ip.firewall.xdp.interface.add/set/remove/list`, `ip.firewall.xdp.set/print/top`,
+    `ip.firewall.xdp.reset-counters`; pps calculado no engine; **lockout**: bloquear o endereço da
+    própria sessão de gerência é recusado (`force`/Safe Mode), avisos de lista vazia e taxa baixa.
+  - **Janela** IP › Firewall XDP: Interfaces (modo, ativo, pps, descartes por motivo), Filtro, Top
+    Sources, ⓘ em cada rótulo (PT e EN). Laboratório virtual simula os contadores.
+  - **Testes**: proptest no host (parse, cortes, padding, listas contra LPM de referência, token
+    bucket); no CI com root (`cargo xtask xdp-root`, ligado por `ci/kernel-modules/veth`): o
+    verificador aceita, native e generic em veth, **diferencial kernel × host** em 4000 quadros
+    gerados/cortados/corrompidos pelo `BPF_PROG_TEST_RUN`, ping real para contadores, top, exceção
+    e taxa; engine (sucesso, validação, rollback, lockout) e UI.
+  - Teste: `cargo test -p corerouter-dataplane-ebpf-common -p corerouter-engine --test xdp`,
+    `cargo test -p corerouter-ui xdp`; na GUI, IP › Firewall XDP.
+
+- 2026-10-23 — G4.5: Gráficos de tráfego, parte 3: **alertas de banda**.
+
+  - Regras em `system.graphing.alerts` (config, com revisão e transação):
+    - comandos `system.graph.alert.add/set/remove/print`;
+    - campos: interface, direção (`rx`, `tx` ou `any`, a mais ocupada a cada minuto), `percent` (1–100), `minutes` (1–1440), `capacity_mbps` opcional e `disabled`;
+    - a interface precisa estar guardada no histórico; o erro diz como incluí-la.
+  - **Avaliação** (`engine::graph::alert`):
+    - nas médias de 1 minuto do histórico, a cada minuto fechado: rajada menor que um minuto não conta, e um minuto desconhecido quebra a sequência;
+    - a capacidade é a da regra ou a velocidade negociada da porta (`Hal::ethernet_monitor`, consultada uma vez por minuto, nunca a cada segundo);
+    - sem nenhuma das duas, o estado é `unknown`, com o motivo.
+  - **Log:**
+    - uma linha `warning` (tópico `interface`) quando começa, como `graphing: ether8 any 50% of 40 Mbit/s: above for 2 min (last minute 62.5%)`;
+    - uma linha `info` quando termina (`back below`), uma vez cada;
+    - o log remoto (`system.logging`) pode encaminhar as duas.
+  - **GUI:** botão "Alerts… (n)" na janela Graphs, com selo vermelho quando há regra alertando.
+    - A janela lista as regras: estado em selo (ok, alertando, desconhecido; o tooltip mostra o último minuto e o motivo), capacidade, remover, e um formulário para adicionar. ⓘ em cada coluna.
+    - O gráfico de uma interface traz a linha tracejada do limiar de cada regra dela.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --lib graphing_alert
+  cargo test -p corerouter-ui --lib graphs
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run system.graph.alert.add '{"interface":"ether8","percent":50,"minutes":2,"capacity_mbps":40}'
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run system.graph.alert.print '{}'
+  ```
+
+  No lab, `ether8` passa de 50 % de 40 Mbit/s em 2 a 3 minutos: o alerta aparece no log e na janela.
+
+- 2026-10-23 — processo: Fila de entrada: o PR pai de um PR empilhado é reconhecido por **qualquer** commit dele que esteja
+  na branch do filho, não só pelo último. A fila manda merges da `main` na branch do pai antes do
+  squash, e esse último commit não está na branch do filho; a resolução automática não reconhecia o
+  pai e devolvia o PR à sessão (#177 e #186, 2026-10-23). Testado no #186 real: os 4 arquivos do
+  conflito resolvidos sozinhos.

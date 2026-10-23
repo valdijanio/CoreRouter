@@ -763,3 +763,22 @@ Daemon de lab (`--backend virtual`, VLANs para chegar a 64 e 512, `vlans=yes`):
 - **Restart:** com 8, 64 e 512 interfaces, a consulta da última hora de `ether1` antes do
   SIGTERM e depois de subir de novo deu os mesmos totais e a mesma média. O teste
   `a_restart_reads_back_what_was_stored` confere os pontos.
+
+- 2026-10-23 — G2.5a, XDP (**medido**, runner do GitHub Actions ubuntu-latest, 4 vCPUs, kernel do
+  runner; objeto XDP release; `cargo xtask xdp-root`). `BPF_PROG_TEST_RUN`, 2 milhões de
+  repetições, UDP 64 bytes, ns por pacote (inclui o custo fixo do test run):
+
+  | prefixos na LPM | carga | passa | bloqueado | passa com taxa |
+  |---:|---:|---:|---:|---:|
+  | 0 | 208 ms | 159 | — | 216 |
+  | 1 000 | 202 ms | 176 | 285 | 234 |
+  | 10 000 | 215 ms | 175 | 322 | 233 |
+  | 100 000 | 441 ms | 170 | 339 | 229 |
+  | 1 000 000 | 2 682 ms | 173 | 347 | 231 |
+
+  LPM: ~17 ns, plano de mil a um milhão de prefixos. Remetente AF_PACKET em veth (2 s, 64 bytes,
+  um núcleo para envio e recepção): sem filtro 450 kpps, nftables raw drop 471 kpps, XDP generic
+  drop 402 kpps, XDP native (veth) drop 409 kpps. Em veth o XDP não ganha (o veth já entrega um
+  `skb`); o ganho exige o modo native numa placa real (roteiro em `docs/xdp.md`). Host, mesma
+  decisão sem mapas (`benches/filter.rs`, AMD Ryzen AI Max+ 395, release): parse 9,4 ns,
+  decisão com taxa 18,4 ns, bloqueado 13,2 ns.

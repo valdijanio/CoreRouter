@@ -102,3 +102,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G2.5b iniciado (fórmula do CGNAT determinístico extraída para `corerouter-cgnat-map`)
 - 2026-10-23 — G4.4b feito (Traffic Flow: exportador e janela)
 - 2026-10-23 — G4.5 redefinida (histórico local estilo RRD no daemon + janela Graphs; ClickHouse externo no G4.4f)
+- 2026-10-23 — G2.5a–d criados (G2.5 em partes); G2.5a feito (base XDP e filtro anti-DDoS)
+- 2026-10-23 — G4.5 feito (histórico de tráfego, janela Graphs, alertas de banda)
