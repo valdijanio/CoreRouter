@@ -172,6 +172,25 @@ impl Session {
         Ok(changed)
     }
 
+    /// An RFC 2136 UPDATE whose prerequisites were checked against
+    /// version `seen` of the dynamic records: applied only if they are
+    /// still at that version (§3.7: prerequisites and update are atomic).
+    /// `Ok(None)`: they moved in between (another UPDATE, a lease, an
+    /// expiry); check the prerequisites again.
+    pub fn dns_dynamic_update(
+        &mut self,
+        zone: &str,
+        ops: &[DynamicOp],
+        source: &str,
+        seen: u64,
+        now: u64,
+    ) -> Result<Option<usize>, String> {
+        if self.dns_dynamic_version() != seen {
+            return Ok(None);
+        }
+        self.dns_dynamic_apply(zone, ops, source, None, now).map(Some)
+    }
+
     /// A DHCP lease's names (G4.2 calls this): the A/AAAA `host.zone`
     /// (replacing what an earlier lease of that host put there) and, when
     /// one of our primary zones covers the address's reverse name, its PTR.
@@ -474,6 +493,21 @@ mod tests {
         assert!(names(&mut s).is_empty());
         // Not ours, or a secondary: refused.
         assert!(s.dns_dynamic_apply("other.example", &[], "t", None, 0).is_err());
+    }
+
+    /// RFC 2136 §3.7: an UPDATE checked against an older version of the
+    /// records is not applied (the caller checks again).
+    #[test]
+    fn an_update_checked_against_old_records_waits() {
+        let mut s = lab();
+        let z = "lan.example";
+        let seen = s.dns_dynamic_version();
+        let add = |n: &str| [DynamicOp::Add(a(n, "192.168.88.50"))];
+        assert_eq!(s.dns_dynamic_update(z, &add("pc"), "t", seen, 0).unwrap(), Some(1));
+        assert_eq!(s.dns_dynamic_update(z, &add("pc2"), "t", seen, 0).unwrap(), None);
+        assert_eq!(names(&mut s), ["lan.example pc 192.168.88.50"]);
+        let now = s.dns_dynamic_version();
+        assert_eq!(s.dns_dynamic_update(z, &add("pc2"), "t", now, 0).unwrap(), Some(1));
     }
 
     #[test]

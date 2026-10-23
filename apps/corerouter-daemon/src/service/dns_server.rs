@@ -15,23 +15,32 @@
 //!   own, at most `max_concurrent_queries` of them (more: SERVFAIL), so
 //!   one slow upstream never holds the cache hits back.
 //! - one TCP thread per family; a thread per connection, at most
-//!   `max_concurrent_tcp_sessions`, closed after 10 s idle (RFC 7766 §6.2.3).
+//!   `max_concurrent_tcp_sessions` (a quarter of them per source), closed
+//!   after 10 s idle (RFC 7766 §6.2.3). A peer that may not ask anything
+//!   (not the router, not `allowed_from`, not a peer a zone names) is
+//!   closed at accept, before it takes a slot; a message must arrive whole
+//!   within 10 s of its first byte and a connection reads no new query
+//!   after 2 minutes (a slow drip never holds a slot).
+//! - "dns-update": RFC 2136 UPDATEs that came over UDP, applied off the
+//!   listener (they wait for the session lock and a disk write).
 //! - "dns-effects": applies what the chain asks of the rest of the router
 //!   (a static entry's address list) under the session lock, off the
-//!   answering threads.
+//!   answering threads; its queue is bounded (full: dropped, the next
+//!   answer adds the address again).
 //!
 //! On Linux, UDP sockets read the destination address of each query (IP_PKTINFO /
 //! IPV6_RECVPKTINFO) and answer from it: a router with several addresses
 //! on the LAN would otherwise answer from another one, and the client drops
 //! the reply (dnsmasq and Unbound do the same).
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use corerouter_control::Shutdown;
 use corerouter_engine::{Shared, lock};
@@ -49,8 +58,23 @@ const TICK: Duration = Duration::from_secs(1);
 const POLL: Duration = Duration::from_millis(250);
 /// RFC 7766 §6.2.3: idle TCP connections are closed (a few seconds).
 const TCP_IDLE: Duration = Duration::from_secs(10);
+/// A message, from its first byte to its last (a peer sending one byte
+/// every few seconds is not idle, and must not hold a slot for days).
+const TCP_MESSAGE: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(10)
+};
+/// No new query is read on a connection older than this.
+const TCP_SESSION: Duration = Duration::from_secs(120);
 /// Queries answered on one TCP connection before it is closed.
 const TCP_MAX_QUERIES: usize = 1000;
+/// Address-list effects waiting for the session lock; more are dropped
+/// (each answer sends its addresses again).
+const EFFECTS_QUEUE: usize = 4096;
+/// UDP UPDATEs waiting for the updater; more are dropped (the client
+/// retries, RFC 2136 §7.6).
+const UPDATE_QUEUE: usize = 64;
 
 /// A bounded count (queries or TCP sessions in flight).
 #[derive(Default)]
@@ -81,6 +105,49 @@ enum Which {
     Tcp,
 }
 
+/// A TCP session's place per source: one source holds at most a quarter
+/// of `max_concurrent_tcp_sessions` (at least one).
+struct SourcePass {
+    srv: Arc<Server>,
+    ip: IpAddr,
+}
+
+impl SourcePass {
+    fn enter(srv: &Arc<Server>, ip: IpAddr, max: u32) -> Option<Self> {
+        let cap = (max / 4).max(1);
+        let mut per = srv.tcp_sources.lock().unwrap_or_else(|e| e.into_inner());
+        let n = per.entry(ip).or_insert(0);
+        if *n >= cap {
+            return None;
+        }
+        *n += 1;
+        Some(Self {
+            srv: srv.clone(),
+            ip,
+        })
+    }
+}
+
+impl Drop for SourcePass {
+    fn drop(&mut self) {
+        let mut per = self.srv.tcp_sources.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(n) = per.get_mut(&self.ip) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                per.remove(&self.ip);
+            }
+        }
+    }
+}
+
+/// An RFC 2136 UPDATE that came over UDP, for the "dns-update" thread.
+struct UdpUpdate {
+    packet: Vec<u8>,
+    from: SocketAddr,
+    local: Option<IpAddr>,
+    sock: Arc<Udp>,
+}
+
 /// A place in a gate, given back when dropped (it can move to a thread).
 struct Pass {
     srv: Arc<Server>,
@@ -108,7 +175,12 @@ pub(crate) struct Server {
     dns: Arc<RouterDns>,
     queries: Gate,
     tcp: Gate,
-    effects: Mutex<Sender<Effect>>,
+    /// TCP sessions per source address.
+    tcp_sources: Mutex<HashMap<IpAddr, u32>>,
+    effects: SyncSender<Effect>,
+    /// Effects dropped because the queue was full.
+    effects_dropped: AtomicU64,
+    updates: SyncSender<UdpUpdate>,
     /// Socket threads of an older epoch stop (the config turned the
     /// forwarder off, or the daemon is closing).
     epoch: AtomicU64,
@@ -135,9 +207,10 @@ impl Server {
         if done.effects.is_empty() {
             return;
         }
-        let tx = self.effects.lock().unwrap_or_else(|e| e.into_inner());
         for e in done.effects.drain(..) {
-            let _ = tx.send(e);
+            if let Err(TrySendError::Full(_)) = self.effects.try_send(e) {
+                self.effects_dropped.fetch_add(1, Ordering::Relaxed);
+            }
         }
     }
 
@@ -172,6 +245,20 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
             }
         };
         let packet = buf.get(..n).unwrap_or_default();
+        // RFC 2136 UPDATE: applied on its own thread (it waits for the
+        // session lock and a disk write; queries must not).
+        if is_update(packet) {
+            let job = UdpUpdate {
+                packet: packet.to_vec(),
+                from,
+                local,
+                sock: sock.clone(),
+            };
+            if srv.updates.try_send(job).is_err() {
+                log::debug!("DNS: UPDATE from {from} dropped: too many waiting");
+            }
+            continue;
+        }
         // Zone transfers and NOTIFY (G4.1c), before the chain.
         if let Some(replies) = zone::xfr::intercept(&srv.fwd, packet, from.ip(), false) {
             for r in &replies {
@@ -196,26 +283,45 @@ fn udp_loop(srv: Arc<Server>, sock: Arc<Udp>, epoch: u64) {
                     }
                     continue;
                 };
-                let sock = sock.clone();
+                let sock_w = sock.clone();
                 let worker = move || {
                     let mut d = pass.srv.finish(*p);
                     if let Some(r) = &d.reply {
-                        sock.send(r, from, local);
+                        sock_w.send(r, from, local);
                     }
                     pass.srv.effects(&mut d);
                 };
                 if let Err(e) = thread::Builder::new().name("dns-query".into()).spawn(worker) {
+                    // The query went down with the closure: SERVFAIL from
+                    // its bytes, so the client tries elsewhere at once.
                     log::warn!("DNS: no thread for a query: {e}");
+                    if let Some(r) = servfail(packet) {
+                        sock.send(&r, from, local);
+                    }
                 }
             }
         }
     }
 }
 
+/// The opcode of `packet` is UPDATE (RFC 2136 §2.2: opcode 5, a query).
+fn is_update(packet: &[u8]) -> bool {
+    packet.get(2).is_some_and(|f| f & 0x80 == 0 && (f >> 3) & 0x0f == 5)
+}
+
+/// One UDP UPDATE on the "dns-update" thread, answered from there.
+fn apply_updates_one(srv: &Server, u: UdpUpdate) {
+    if let Some(replies) = zone::xfr::intercept(&srv.fwd, &u.packet, u.from.ip(), false) {
+        for r in &replies {
+            u.sock.send(r, u.from, u.local);
+        }
+    }
+}
+
 fn tcp_loop(srv: Arc<Server>, listener: TcpListener, epoch: u64) {
     while srv.alive(epoch) {
-        let stream = match listener.accept() {
-            Ok((s, _)) => s,
+        let (stream, peer) = match listener.accept() {
+            Ok(got) => got,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 thread::sleep(Duration::from_millis(20));
                 continue;
@@ -226,16 +332,69 @@ fn tcp_loop(srv: Arc<Server>, listener: TcpListener, epoch: u64) {
                 continue;
             }
         };
+        // Who may not ask anything never takes a slot (the chain's ACL
+        // only runs on a whole message).
+        if !zone::xfr::may_connect(&srv.fwd, peer.ip()) {
+            continue;
+        }
         let max = srv.fwd.config().config.ip.dns.max_concurrent_tcp_sessions;
-        // Over the limit the connection just closes.
+        // Over the limits the connection just closes.
+        let Some(source) = SourcePass::enter(&srv, peer.ip().to_canonical(), max) else {
+            continue;
+        };
         let Some(pass) = Pass::enter(&srv, Which::Tcp, max) else {
             continue;
         };
-        let session = move || tcp_session(&pass.srv, stream, epoch);
+        let session = move || {
+            let _source = source;
+            tcp_session(&pass.srv, stream, epoch);
+        };
         if let Err(e) = thread::Builder::new().name("dns-tcp".into()).spawn(session) {
             log::warn!("DNS: no thread for a TCP session: {e}");
         }
     }
+}
+
+/// Fills `buf` from `s` before `deadline` (the socket's timeout follows
+/// what is left, so a byte now and then does not stretch it).
+fn read_by(s: &mut TcpStream, buf: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+    let mut at = 0;
+    while at < buf.len() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        s.set_read_timeout(Some(left))?;
+        let Some(rest) = buf.get_mut(at..) else { break };
+        match s.read(rest) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => at += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// One framed message: up to [`TCP_IDLE`] for its first byte, then
+/// [`TCP_MESSAGE`] for the rest. The buffer grows as bytes come (a
+/// length of 65 535 alone allocates nothing).
+fn read_message(s: &mut TcpStream, session_end: Instant) -> Option<Vec<u8>> {
+    let mut first = [0u8; 1];
+    read_by(s, &mut first, (Instant::now() + TCP_IDLE).min(session_end)).ok()?;
+    let deadline = Instant::now() + TCP_MESSAGE;
+    let mut second = [0u8; 1];
+    read_by(s, &mut second, deadline).ok()?;
+    let len = usize::from(u16::from_be_bytes([first[0], second[0]]));
+    let mut msg = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while msg.len() < len {
+        let want = (len - msg.len()).min(chunk.len());
+        let part = chunk.get_mut(..want)?;
+        read_by(s, part, deadline).ok()?;
+        msg.extend_from_slice(part);
+    }
+    Some(msg)
 }
 
 /// RFC 1035 §4.2.2 / RFC 7766: 2-byte length, then the message; several
@@ -243,20 +402,15 @@ fn tcp_loop(srv: Arc<Server>, listener: TcpListener, epoch: u64) {
 fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
     let Ok(peer) = s.peer_addr() else { return };
     let _ = s.set_nonblocking(false);
-    let _ = s.set_read_timeout(Some(TCP_IDLE));
     let _ = s.set_write_timeout(Some(TCP_IDLE));
+    let session_end = Instant::now() + TCP_SESSION;
     for _ in 0..TCP_MAX_QUERIES {
-        if !srv.alive(epoch) {
+        if !srv.alive(epoch) || Instant::now() >= session_end {
             return;
         }
-        let mut head = [0u8; 2];
-        if s.read_exact(&mut head).is_err() {
+        let Some(msg) = read_message(&mut s, session_end) else {
             return;
-        }
-        let mut msg = vec![0u8; usize::from(u16::from_be_bytes(head))];
-        if s.read_exact(&mut msg).is_err() {
-            return;
-        }
+        };
         // AXFR/IXFR (several messages) and NOTIFY (G4.1c), before the chain.
         if let Some(replies) = zone::xfr::intercept(&srv.fwd, &msg, peer.ip(), true) {
             for r in replies {
@@ -283,6 +437,15 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
             // Refused by the limit or junk: the connection ends.
             return;
         };
+        // An answer over 64 KiB cannot be framed: SERVFAIL, not silence.
+        let reply = if reply.len() > usize::from(u16::MAX) {
+            match servfail(&msg) {
+                Some(r) => r,
+                None => return,
+            }
+        } else {
+            reply
+        };
         let Ok(len) = u16::try_from(reply.len()) else {
             return;
         };
@@ -292,6 +455,15 @@ fn tcp_session(srv: &Arc<Server>, mut s: TcpStream, epoch: u64) {
             return;
         }
     }
+}
+
+/// SERVFAIL for `query` (its id, opcode and question).
+fn servfail(query: &[u8]) -> Option<Vec<u8>> {
+    use hickory_proto::op::{Message, ResponseCode};
+    let q = Message::from_vec(query).ok()?;
+    let mut r = Message::error_msg(q.metadata.id, q.metadata.op_code, ResponseCode::ServFail);
+    r.add_queries(q.queries);
+    r.to_vec().ok()
 }
 
 /// The sockets of one epoch, their threads counted in `health`; where
@@ -373,13 +545,17 @@ fn prepare(
     dns: Arc<RouterDns>,
     shutdown: Shutdown,
 ) -> std::io::Result<Arc<Server>> {
-    let (tx, rx) = channel();
+    let (tx, rx) = sync_channel(EFFECTS_QUEUE);
+    let (utx, urx) = sync_channel(UPDATE_QUEUE);
     let srv = Arc::new(Server {
         fwd: Forwarder::new(dns.resolver.clone()),
         dns,
         queries: Gate::default(),
         tcp: Gate::default(),
-        effects: Mutex::new(tx),
+        tcp_sources: Mutex::new(HashMap::new()),
+        effects: tx,
+        effects_dropped: AtomicU64::new(0),
+        updates: utx,
         epoch: AtomicU64::new(0),
         shutdown,
     });
@@ -388,6 +564,17 @@ fn prepare(
         thread::Builder::new()
             .name("dns-effects".into())
             .spawn(move || apply_effects(&session, &rx))?;
+    }
+    {
+        // Weak: the server's last reference going away ends the thread
+        // (its sender with it).
+        let weak = Arc::downgrade(&srv);
+        thread::Builder::new().name("dns-update".into()).spawn(move || {
+            while let Ok(u) = urx.recv() {
+                let Some(srv) = weak.upgrade() else { return };
+                apply_updates_one(&srv, u);
+            }
+        })?;
     }
     // `ip.dns.statistics.print` reads what the chain counts.
     lock(session).set_dns_statistics(srv.fwd.state::<Statistics>());
@@ -753,9 +940,15 @@ mod tests {
         m.to_vec().unwrap()
     }
 
+    /// A UDP query with a short wait (also used to see the listener is
+    /// closed).
     fn udp(port: u16, q: &[u8]) -> Option<Message> {
+        udp_within(port, q, Duration::from_millis(500))
+    }
+
+    fn udp_within(port: u16, q: &[u8], wait: Duration) -> Option<Message> {
         let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        s.set_read_timeout(Some(wait)).unwrap();
         s.send_to(q, ("127.0.0.1", port)).unwrap();
         let mut buf = [0u8; 4096];
         let (n, from) = s.recv_from(&mut buf).ok()?;
@@ -776,7 +969,7 @@ mod tests {
     }
 
     fn wait(what: &str, mut ok: impl FnMut() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(20);
         while !ok() {
             assert!(Instant::now() < deadline, "timed out waiting for {what}");
             thread::sleep(Duration::from_millis(50));
@@ -791,7 +984,9 @@ mod tests {
         let st = Settings {
             servers: vec![IpAddr::from([127, 0, 0, 1])],
             port: up_port,
-            server_timeout_ms: 300,
+            // Generous: under a loaded full CI a 300 ms upstream timeout
+            // made the resolver ask twice (the upstream count went to 2).
+            server_timeout_ms: 3000,
             ..Settings::default()
         };
         dns.resolver.configure(st, 0);
@@ -824,14 +1019,17 @@ mod tests {
         assert_eq!(m.answers[0].data.to_string(), "192.168.88.2");
         assert_eq!(count.load(Ordering::Relaxed), 0, "static: upstream not asked");
 
-        let m = udp(port, &query("www.example.com.", RecordType::A)).unwrap();
+        // Answers that wait for the upstream get a longer client wait
+        // than the 500 ms of `udp` (the flaky part on a loaded machine).
+        let slow = Duration::from_secs(5);
+        let m = udp_within(port, &query("www.example.com.", RecordType::A), slow).unwrap();
         assert_eq!(m.answers[0].data.to_string(), "192.0.2.10");
         let m = tcp(port, &query("www.example.com.", RecordType::A));
         assert_eq!(m.answers[0].data.to_string(), "192.0.2.10");
         assert_eq!(count.load(Ordering::Relaxed), 1, "TCP answered from the cache");
 
         // FWD + address-list: the address lands in the firewall list.
-        let m = udp(port, &query("vpn.lan.", RecordType::A)).unwrap();
+        let m = udp_within(port, &query("vpn.lan.", RecordType::A), slow).unwrap();
         assert_eq!(m.metadata.response_code, ResponseCode::NoError);
         wait("the address list", || {
             let rows = lock(&session)
@@ -858,5 +1056,92 @@ mod tests {
         });
         shutdown.close();
         drop(srv);
+    }
+
+    /// A forwarder answering the LAN on a free port; static `nas.lan`.
+    fn lab() -> (Shared, Arc<Server>, u16, Shutdown) {
+        let session = shared(Session::virtual_lab());
+        lock(&session)
+            .execute("ip.dns.static.add", &json!({"name": "nas.lan", "address": "192.168.88.2"}))
+            .unwrap();
+        lock(&session)
+            .execute(
+                "ip.dns.set",
+                &json!({"allow_remote_requests": true, "max_concurrent_tcp_sessions": 4}),
+            )
+            .unwrap();
+        let port = free_port();
+        let shutdown = Shutdown::default();
+        let srv = spawn(session.clone(), Arc::new(RouterDns::new()), port, shutdown.clone()).unwrap();
+        wait("the listener", || udp(port, &query("nas.lan.", RecordType::A)).is_some());
+        (session, srv, port, shutdown)
+    }
+
+    #[cfg(target_os = "linux")]
+    /// Connects from source address `src` (any 127/8 address works on
+    /// Linux loopback) and sends the first byte of a length.
+    fn connect_from(src: [u8; 4], port: u16) -> TcpStream {
+        use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrIn, bind, connect, socket};
+        use std::os::fd::AsRawFd;
+        let fd = socket(AddressFamily::Inet, SockType::Stream, SockFlag::SOCK_CLOEXEC, None).unwrap();
+        bind(fd.as_raw_fd(), &SockaddrIn::new(src[0], src[1], src[2], src[3], 0)).unwrap();
+        connect(fd.as_raw_fd(), &SockaddrIn::new(127, 0, 0, 1, port)).unwrap();
+        let mut s = TcpStream::from(fd);
+        s.write_all(&[0]).unwrap();
+        s
+    }
+
+    /// RFC 7766 slots: one source cannot take them all, and a message that
+    /// trickles in is cut at its deadline.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn tcp_slots_survive_slow_and_greedy_peers() {
+        let (_session, srv, port, shutdown) = lab();
+        // 127.0.0.2 opens every slot there is and sends one byte each.
+        let greedy: Vec<TcpStream> = (0..4).map(|_| connect_from([127, 0, 0, 2], port)).collect();
+        thread::sleep(Duration::from_millis(300));
+        // The LAN client still gets an answer over TCP.
+        let m = tcp(port, &query("nas.lan.", RecordType::A));
+        assert_eq!(m.answers[0].data.to_string(), "192.168.88.2");
+        // A message trickling in one byte at a time is cut at its
+        // deadline (TCP_MESSAGE, 2 s in tests), not kept alive by each byte.
+        let mut slow = connect_from([127, 0, 0, 3], port);
+        let t = Instant::now();
+        let mut closed = false;
+        while t.elapsed() < Duration::from_secs(6) {
+            thread::sleep(Duration::from_millis(300));
+            if slow.write_all(&[1]).is_err() {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the slow message was never cut");
+        drop(greedy);
+        shutdown.close();
+        drop(srv);
+    }
+
+    /// The effects queue is bounded: with the session lock held, a flood
+    /// of address-list effects is dropped past the queue, not kept.
+    #[test]
+    fn effects_queue_is_bounded() {
+        let (session, srv, _port, shutdown) = lab();
+        let held = lock(&session);
+        let mut d = Done {
+            reply: None,
+            effects: (0..100_000u32)
+                .map(|i| Effect::AddressList {
+                    list: "vpn".into(),
+                    address: IpAddr::from(Ipv4Addr::from(i)),
+                    timeout_secs: 60,
+                })
+                .collect(),
+            answered_by: "test",
+        };
+        srv.effects(&mut d);
+        let dropped = srv.effects_dropped.load(Ordering::Relaxed);
+        assert!(dropped >= 100_000 - EFFECTS_QUEUE as u64 - 1, "{dropped} dropped");
+        drop(held);
+        shutdown.close();
     }
 }

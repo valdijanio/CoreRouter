@@ -415,6 +415,101 @@ fn ixfr_sends_what_changed() {
     );
 }
 
+/// A (spoofable) UDP IXFR from an old serial of a big zone gets the SOA at
+/// once: the zone is never copied and encoded to find out it does not fit
+/// (RFC 1995 §2).
+#[test]
+fn udp_ixfr_of_a_big_zone_is_the_soa_without_encoding_it() {
+    let f = forwarder(|c| {
+        *c = config(|c2| c2.ip.dns = c.ip.dns.clone());
+        for i in 0..50_000u32 {
+            c.ip.dns_zones
+                .records
+                .push(rec(100 + i, &format!("h{i}"), ZType::A, "192.0.2.7"));
+        }
+    });
+    reload(&f);
+    let from = IpAddr::from(SECONDARY);
+    let q = xfr_query(RecordType::IXFR, Some(0));
+    // Warm: the zone is built once (that cost is the config's, not the
+    // query's).
+    xfr::intercept(&f, &q, from, false).unwrap();
+    let t = std::time::Instant::now();
+    for _ in 0..10 {
+        let out = xfr::intercept(&f, &q, from, false).unwrap();
+        let ms = messages(&out);
+        assert_eq!(ms.len(), 1);
+        assert_eq!(ms[0].answers.len(), 1);
+        assert_eq!(ms[0].answers[0].record_type(), RecordType::SOA);
+    }
+    let per = t.elapsed() / 10;
+    assert!(
+        per < std::time::Duration::from_millis(5),
+        "UDP IXFR took {per:?} per query"
+    );
+}
+
+/// A query that captured the previous config and reaches the zones after
+/// the new one was built never rebuilds the old zones (a reversed diff in
+/// the journal, a NOTIFY with the old serial).
+#[test]
+fn an_older_config_never_rolls_the_zones_back() {
+    let f = forwarder(|c| *c = config(|c2| c2.ip.dns = c.ip.dns.clone()));
+    reload(&f);
+    let old = f.config();
+    let mut cfg = (*old.config).clone();
+    cfg.ip.dns_zones.zones[0].serial += 1;
+    cfg.ip.dns_zones.records[2].address = Some("192.0.2.81".parse().unwrap());
+    f.configure(std::sync::Arc::new(cfg), Vec::new());
+    assert_eq!(reload(&f).len(), 1);
+    let new_serial = data(&f.config().config).serial;
+    let z = zones(&f, &old);
+    assert_eq!(z.primaries["example.com"].serial, new_serial);
+    assert!(reload(&f).is_empty(), "no NOTIFY for a rollback");
+    let zd = find(&f, &f.config(), "example.com").unwrap().unwrap();
+    assert_eq!(
+        changes_since(&f, &zd, new_serial - 1).map(|d| d.len()),
+        Some(1),
+        "one diff in the journal"
+    );
+}
+
+#[test]
+fn who_may_connect() {
+    let lan: ipnet::IpNet = "192.168.88.0/24".parse().unwrap();
+    let f = forwarder(|c| *c = config(|c2| c2.ip.dns = c.ip.dns.clone()));
+    f.configure(f.config().config.clone(), vec![lan]);
+    let ok = |ip: [u8; 4]| xfr::may_connect(&f, IpAddr::from(ip));
+    assert!(ok([127, 0, 0, 1]), "the router itself");
+    assert!(ok([192, 168, 88, 7]), "allowed_from");
+    assert!(ok(SECONDARY), "allow_transfer");
+    assert!(!ok([203, 0, 113, 9]), "anyone else");
+    assert!(xfr::may_connect(&f, "::ffff:192.168.88.7".parse().unwrap()));
+    // An update ACL, a primary of a secondary, a key from anywhere.
+    let mut cfg = (*f.config().config).clone();
+    cfg.ip.dns_zones.zones[0].allow_update = vec!["198.51.100.0/24".parse().unwrap()];
+    let mut sec = Zone::new(ItemId(2), "example.org");
+    sec.ztype = ZoneType::Secondary;
+    sec.primaries = vec![IpAddr::from([203, 0, 113, 1])];
+    cfg.ip.dns_zones.zones.push(sec);
+    f.configure(std::sync::Arc::new(cfg.clone()), vec![lan]);
+    assert!(ok([198, 51, 100, 4]) && ok([203, 0, 113, 1]));
+    assert!(!ok([203, 0, 113, 9]));
+    cfg.ip.dns_zones.zones[0].allow_update.clear();
+    cfg.ip.dns_zones.zones[0].update_keys = vec!["ddns".into()];
+    f.configure(std::sync::Arc::new(cfg), vec![lan]);
+    assert!(ok([203, 0, 113, 9]), "TSIG from anywhere");
+}
+
+#[test]
+fn a_transfer_with_a_message_that_fails_is_servfail() {
+    assert_eq!(
+        xfr::whole(vec![Some(vec![1]), Some(vec![2])]),
+        Some(vec![vec![1], vec![2]])
+    );
+    assert_eq!(xfr::whole(vec![Some(vec![1]), None, Some(vec![3])]), None);
+}
+
 #[test]
 fn notify_in_and_out() {
     let primary = IpAddr::from([192, 0, 2, 1]);
