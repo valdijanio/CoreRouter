@@ -10,7 +10,8 @@
 //! [`Slot::Current`] is the last save, [`Slot::Previous`] the one before.
 //!
 //! A backend with [`ConfigStorage::revision_files`] keeps each older
-//! revision in a file of its own, written once (G1.23, see
+//! revision in a file of its own, written once, as a difference to the
+//! next newer revision (G1.23 and audit-history, see
 //! `crate::history_files`): a slot then holds the running config and its
 //! newest revision only, so a commit costs the size of the config, not of
 //! the history.

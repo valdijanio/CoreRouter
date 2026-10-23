@@ -1,5 +1,7 @@
 //! The configuration tree. `Config` is plain data: cloning it is how the store
-//! snapshots candidate/running and how the engine guard rolls back.
+//! snapshots candidate/running and how the engine guard rolls back. The big
+//! sections are [`CowArc`]s, so that clone shares them until one side writes
+//! (G0.16).
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -8,6 +10,7 @@ use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
 use crate::bonding::{BondMode, HashPolicy, LacpRate, default_mii_interval};
+use crate::cow::CowArc;
 use crate::dhcp_client::DhcpClient;
 use crate::dns::Dns;
 use crate::firewall::Firewall;
@@ -23,10 +26,10 @@ use crate::types::{Asn, Gateway, IfName, ItemId, MacAddr, RoutingTable, VlanId};
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     pub system: System,
-    pub interfaces: BTreeMap<IfName, Interface>,
+    pub interfaces: CowArc<BTreeMap<IfName, Interface>>,
     /// `/interface list` (G2.1): named groups of interfaces.
     pub interface_lists: InterfaceLists,
-    pub ip: Ip,
+    pub ip: CowArc<Ip>,
     /// `/ipv6` (G4.7b): DHCPv6 clients and the Router Advertisement policy.
     pub ipv6: Ipv6,
     pub routing: Routing,
@@ -227,19 +230,19 @@ impl InterfaceKind {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ip {
-    pub addresses: Vec<AddressEntry>,
+    pub addresses: CowArc<Vec<AddressEntry>>,
     /// Next id handed out by `next_address_id` (never reused, like RouterOS).
     pub next_id: u32,
     /// Static routes (`/ip route`), IPv4 and IPv6 together. Connected routes
     /// are not stored: they are derived from `addresses` (see `route`).
-    pub routes: Vec<RouteEntry>,
+    pub routes: CowArc<Vec<RouteEntry>>,
     /// Next id handed out by `next_route_id`.
     pub next_route_id: u32,
     /// Where neighbor discovery listens and announces (`ip.neighbor.discovery.set`).
     pub neighbor_discovery: NeighborDiscovery,
     /// `/ip firewall` (G2.1): filter, nat, mangle and address lists,
     /// IPv4 and IPv6 together.
-    pub firewall: Firewall,
+    pub firewall: CowArc<Firewall>,
     /// `/ip dns adlist` (G4.1d): block lists of the LAN forwarder.
     #[serde(skip_serializing_if = "crate::dns_adlist::DnsAdlist::is_empty")]
     pub dns_adlist: crate::dns_adlist::DnsAdlist,
@@ -255,10 +258,10 @@ pub struct Ip {
     pub dns: Dns,
     /// `/ip dns static` (G4.1b).
     #[serde(skip_serializing_if = "crate::dns_static::DnsStatic::is_empty")]
-    pub dns_static: crate::dns_static::DnsStatic,
+    pub dns_static: CowArc<crate::dns_static::DnsStatic>,
     /// `/ip dns zone` (G4.1c): authoritative zones and their records.
     #[serde(skip_serializing_if = "crate::dns_zone::DnsZones::is_empty")]
-    pub dns_zones: crate::dns_zone::DnsZones,
+    pub dns_zones: CowArc<crate::dns_zone::DnsZones>,
     /// `/ip dns tsig-key` (G4.1c-3): TSIG keys for RFC 2136 UPDATE.
     #[serde(skip_serializing_if = "crate::dns_tsig::DnsTsig::is_empty")]
     pub dns_tsig: crate::dns_tsig::DnsTsig,
@@ -267,7 +270,7 @@ pub struct Ip {
     pub pools: crate::ip_pool::IpPools,
     /// `/ip dhcp-server` (G4.2a): servers, networks, static leases, options.
     #[serde(skip_serializing_if = "crate::dhcp_server::DhcpServers::is_empty")]
-    pub dhcp_server: crate::dhcp_server::DhcpServers,
+    pub dhcp_server: CowArc<crate::dhcp_server::DhcpServers>,
     /// `/ip dhcp-relay` (G4.2b).
     #[serde(skip_serializing_if = "crate::dhcp_relay::DhcpRelays::is_empty")]
     pub dhcp_relays: crate::dhcp_relay::DhcpRelays,

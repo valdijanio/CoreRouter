@@ -7,7 +7,7 @@
 //! | `running.json` | [`Slot::Current`] |
 //! | `running.json.prev` | [`Slot::Previous`] |
 //! | `running.json.tmp` | write in progress (removed on open) |
-//! | `rev-<n>.json` | revision `n` of the history, written once (G1.23) |
+//! | `rev-<n>.json` | revision `n` of the history as a difference to revision `n+1`, written once (G1.23, audit-history) |
 //! | `rev-<n>.json.tmp` | revision write in progress (removed on open) |
 //! | `*.corrupt`, `*.corrupt.<n>` | quarantined unreadable slot (each one kept) |
 //! | `state-<name>.json` | operational state outside the revisions (DHCP client leases) |
@@ -21,7 +21,7 @@
 //!
 //! A slot holds the running config and its newest revision; the older ones
 //! are `rev-<n>.json` files (temp file, fsync, rename), each written once by
-//! the commit that made it, before the slot that needs it (the slot's
+//! the commit after it, before the slot that needs it (the slot's
 //! directory fsync makes both renames durable). See the engine's
 //! `history_files` for the order and what a crash leaves.
 

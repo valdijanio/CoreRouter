@@ -109,6 +109,19 @@ fn scope_chip(v: &egui::Visuals, scope: &str) -> (&'static str, Tone, &'static s
     }
 }
 
+/// The window that configures a service, for its Open settings button.
+fn settings_window(service: &str) -> Option<&'static str> {
+    Some(match service {
+        "dns-resolver" | "dns-server" => crate::dns::WIN,
+        "dns-adlist" => crate::dns_adlist::WIN,
+        "dns-zones" => crate::dns_zones::WIN,
+        "dhcp-server" => crate::dhcp_server::WIN,
+        "ntp-client" => crate::ntp_client::WIN,
+        "remote-logging" => crate::logging::WIN,
+        _ => return None,
+    })
+}
+
 fn cut(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_owned();
@@ -137,6 +150,13 @@ impl ServicesPanel {
             };
             if stops && r.get("protected").and_then(Value::as_bool) == Some(true) {
                 return Err("protected: it carries this management session".into());
+            }
+            if id == "system.service.start" && s(r, "state") == "disabled" {
+                return Err(format!(
+                    "it already runs, idle: its config turns it off ({}). Use Enable or Open \
+                     settings below",
+                    s(r, "reason")
+                ));
             }
             Ok(())
         };
@@ -258,11 +278,12 @@ impl ServicesPanel {
         self.selected = selected;
     }
 
-    fn detail(&self, ui: &mut Ui) {
+    fn detail(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
         let Some(r) = self.selected.as_deref().and_then(|n| self.row(n)) else {
             ui.weak("Select a service to see how it is turned on, its policy and its log.");
             return;
         };
+        let mut open: Option<&'static str> = None;
         ui.strong(s(r, "name"));
         Grid::new("services-detail")
             .num_columns(2)
@@ -276,6 +297,36 @@ impl ServicesPanel {
                 ui.weak("Turned on by");
                 ui.label(RichText::new(s(r, "enable")).monospace());
                 ui.end_row();
+                if s(r, "state") == "disabled" {
+                    ui.label("");
+                    ui.horizontal(|ui| {
+                        // A switch in the config: one click turns it on (the
+                        // command goes through the journal and Safe Mode).
+                        if let Some(t) = r.get("turn_on").filter(|t| !t.is_null()) {
+                            let id = s(t, "id").to_owned();
+                            if action(ui, "Enable", app.can().check(&id)) {
+                                let params = t.get("params").cloned().unwrap_or(Value::Null);
+                                app.run_then(
+                                    &id,
+                                    params,
+                                    crate::panel::then(NAME, Acted("enable")),
+                                );
+                            }
+                        }
+                        if let Some(win) = settings_window(s(r, "name"))
+                            && ui.button("Open settings").clicked()
+                        {
+                            open = Some(win);
+                        }
+                    });
+        if let Some(win) = open {
+            if !app.open.insert(crate::Win::Panel(win)) {
+                app.floats.raise(crate::win_id(crate::Win::Panel(win)));
+            }
+            app.cache.refreshed_at = None;
+        }
+                    ui.end_row();
+                }
                 let deps: Vec<&str> = r
                     .get("depends")
                     .and_then(Value::as_array)
@@ -347,7 +398,7 @@ impl ServicesPanel {
         ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("services-detail")
-            .show(ui, |ui| self.detail(ui));
+            .show(ui, |ui| self.detail(app, ui));
     }
 }
 
@@ -452,7 +503,11 @@ impl PanelState for ServicesPanel {
         match result {
             Ok(v) => {
                 self.error = None;
-                self.notice = Some(format!("{action} sent to {}", s(v, "name")));
+                self.notice = Some(if action == "enable" {
+                    "turned on in the config; the service follows in a second".to_owned()
+                } else {
+                    format!("{action} sent to {}", s(v, "name"))
+                });
             }
             Err(e) => {
                 self.notice = None;
