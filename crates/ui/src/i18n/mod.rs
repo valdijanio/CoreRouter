@@ -39,6 +39,8 @@ mod tuning_en;
 mod tuning_pt;
 mod traffic_flow_en;
 mod traffic_flow_pt;
+mod xdp_en;
+mod xdp_pt;
 
 /// A language the GUI speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -86,6 +88,7 @@ impl Lang {
                 list_pt::LABELS,
                 traffic_flow_pt::LABELS,
                 graphs_pt::LABELS,
+                xdp_pt::LABELS,
             ],
         }
     }
@@ -101,6 +104,7 @@ impl Lang {
                 cgnat_en::HELP,
                 traffic_flow_en::HELP,
                 graphs_en::HELP,
+                xdp_en::HELP,
             ],
             Lang::Pt => &[
                 pt::HELP,
@@ -110,6 +114,7 @@ impl Lang {
                 cgnat_pt::HELP,
                 traffic_flow_pt::HELP,
                 graphs_pt::HELP,
+                xdp_pt::HELP,
             ],
         }
     }

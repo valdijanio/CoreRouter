@@ -107,6 +107,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("traffic-flow", None, None, icons::SHARE_NETWORK, "/ip traffic-flow", &["ip.traffic-flow"], &["netflow", "ipfix", "sflow", "flow export", "fluxos", "nat log", "log de nat", "marco civil", "top talkers", "coletor", "collector", "pmacct", "goflow"]),
     e("tuning", None, None, icons::GAUGE, "/system tuning", &["system.tuning"], &["sysctl", "performance", "desempenho", "irq", "rps", "governor", "boot", "kernel"]),
     e("vrf", None, None, icons::STACK, "/ip vrf", &["ip.vrf"], &["routing table", "tabela de rotas", "l3vpn"]),
+    e("xdp", None, None, icons::SHIELD_CHECK, "", &["ip.firewall.xdp"], &["ddos", "anti-ddos", "ebpf", "bpf", "raw", "rate limit", "limite de taxa", "bloquear", "blacklist", "drop"]),
 ];
 
 /// The groups' icons, by `windows::MENU` name.
