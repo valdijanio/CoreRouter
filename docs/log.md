@@ -2871,3 +2871,148 @@ continuação indentadas).
   se a tradução divergir). Sessões em paralelo registravam a mesma palavra ("changed", "of") em
   catálogos diferentes, e cada combinação quebrava o lote da fila (#159, #165, 2026-10-23) sem
   nenhum erro de verdade: o `lookup` pega a primeira, e com o mesmo texto não há diferença na tela.
+
+- 2026-10-23 — G2.5b: XDP, parte 2a: a aritmética de portas do CGNAT determinístico (RFC 7422 §2) sai do
+  `Layout` do model para o crate novo `corerouter-cgnat-map` (L0, `no_std`, sem alocação, sem
+  `unsafe`, sem panic): número do assinante ↔ (número do endereço público, bloco) e bloco ↔ portas
+  (`Geometry::split/join/ports_of/block_of`). O `Layout` chama essas funções e mantém a API
+  pública (`forward/reverse/slot/locate/block/subscriber_index/per_address/capacity`); ganha
+  `geometry()`. O programa XDP da G2.5b vai usar as mesmas funções: uma fórmula só para o fast path
+  e para o "Quem era?". Combinado com a sessão do CGNAT (G2.3).
+
+  Testes: os proptests do `model::cgnat` passam sem mudança; no crate novo, o exemplo da RFC 7422
+  §2.3, geometria degenerada sem panic e proptests (ida e volta, blocos sem sobreposição, igual à
+  fórmula em inteiros largos). `cargo test -p corerouter-cgnat-map -p corerouter-model cgnat`.
+
+- 2026-10-23 — G4.4b: Traffic Flow, parte 3: a janela **IP › Traffic Flow**, com quatro abas.
+
+  - **Estado** no topo: `running`/`stopped`/`error`, a fonte (`conntrack` ou `lab`), se o kernel
+    conta bytes e marca tempos, registros por minuto, e estouros do kernel e descartes da fila
+    quando há.
+  - **General:** as configurações, com Apply e Revert. O destino nos eventos de NAT mostra o selo
+    "Marco Civil art. 14" quando ligado.
+  - **Targets:** os coletores no padrão de lista (G0.24): barra + − ✓ ✗ 💬, estado por selo, coletor,
+    versão e transporte, registros por minuto, templates (quantas vezes e a última), fila e perda. O
+    modal de adicionar e editar usa a pré-visualização nova `ip.traffic-flow.target.preview`, que
+    diz o que vai enviar, as checagens e os comandos.
+  - **Top Talkers:** os últimos 1, 5, 15 ou 60 minutos, por bytes, pacotes ou conexões, com envio e
+    recebido. O nome do assinante aparece quando o roteador tem `ip.identity.lookup` (G0.25). **Copy
+    CSV** copia os registros do período.
+  - **Statistics:** todos os contadores.
+
+  Toda caixa e todo rótulo têm ⓘ com a explicação em português e inglês. A entrada do menu tem
+  sinônimos (netflow, ipfix, log de NAT, Marco Civil…). O lab ficou com um tráfego mais realista,
+  de poucos Mbit/s por assinante pesado.
+
+  Teste: `cargo test -p corerouter-ui traffic_flow` e `cargo test -p corerouter-engine
+  traffic_flow`. Screenshots nos temas escuro e claro olhados.
+
+- 2026-10-23 — G4.5: Gráficos de tráfego, parte 1: o histórico local.
+
+  - `engine::graph`: banco round-robin próprio (`graph::rrd`), de tamanho fixo, com média e máximo
+    por slot. São quatro anéis: 1 s por 1 h, 1 min por 1 dia, 5 min por 1 semana e 1 h por 1 ano.
+    - Balde com menos da metade dos segundos conhecidos fica desconhecido (`xff` 0,5).
+    - Contador que volta (reset, link recriado) é desconhecido, nunca pico (`DERIVE min=0` do
+      RRDtool).
+    - Buraco maior que 10 s é desconhecido; relógio que volta é ignorado.
+  - Coleta no `Session::tick` (a mesma varredura de links de todo segundo, sem dump extra):
+    - por interface: bps e pps de entrada e saída, erros e drops por segundo;
+    - do roteador, por `Hal::resources` (novo; `/proc/stat`, `/proc/meminfo`,
+      `nf_conntrack_count`): CPU, memória e conntrack.
+  - `system.graph.set` (config `system.graphing`, estilo `/tool graphing`):
+    - escolhe por classe: físicas e bonds por padrão; bridges, VLANs e túneis opcionais;
+    - `include`/`exclude` por nome;
+    - `max_memory_mib`, 64 MiB por padrão: série que não cabe é recusada, vai para o log e aparece
+      em `system.graph.print`;
+    - `store_every`, 5 min por padrão.
+  - Série que deixa de ser guardada sai depois de 10 min (uma varredura que falhou não apaga um ano).
+  - `system.graph.query {series, range, step?}`:
+    - pontos de hora, dia, semana, mês ou ano;
+    - corrente, média, máximo, **p95** e totais;
+    - o p95 vem das médias de 5 min (padrão de cobrança, posto mais próximo, descarta os 5 % de
+      cima); acima de uma semana vem das de 1 h e a resposta diz `p95_approximate`;
+    - `p95_billing` (maior entre entrada e saída, como o LibreNMS) e `p95_sum`.
+  - `system.graph.export {since, resolution}` entrega os baldes fechados depois de um cursor, sem
+    cortar um balde entre páginas: é o que o exportador ClickHouse (G4.4f) ainda não enviou. Em
+    Rust: `GraphDb::export`.
+  - Daemon: serviço `graphing` (`<config-dir>/graphs/`, um arquivo por série).
+    - Grava em lote, no lugar, só os baldes fechados desde o último store.
+    - O anel de 1 s vai só no desligamento limpo (`final_store` no shutdown do `main.rs`).
+    - Arquivo novo vai por temporário + rename; arquivo ilegível vira `*.corrupt`.
+    - `service::Ctx` ganhou `config_dir`.
+  - O lab virtual varia o tráfego e a CPU (ondas determinísticas), para os gráficos se mexerem.
+  - A decisão formato próprio × `redb` × `fjall` está em `docs/architecture.md` ("Histórico de
+    tráfego").
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --lib graph
+  cargo test -p corerouter-daemon graphing
+  cargo bench -p corerouter-engine --bench graph
+  cargo run -p corerouter-daemon -- --control 7979 --config-dir /tmp/cr
+  cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run system.graph.query '{"series":"ether1","range":"hour","step":60}'
+  ```
+
+- 2026-10-23 — G4.5: Gráficos de tráfego, parte 2: a janela **Tools › Graphs** (`crates/ui/src/graphs.rs`).
+
+  - Mostra uma interface guardada ou o **Sistema** (CPU, memória e conntrack, um gráfico de cada), na
+    última hora, dia, semana, mês ou ano (egui_plot, como o Ping).
+    - Uma série: Rx azul e Tx vermelho (como a aba Traffic), o máximo em linha clara e o p95
+      tracejado.
+    - **Comparar** até 6 interfaces no mesmo gráfico, cada uma na cor do seu nome (`chip::name_hue`),
+      com Rx em linha cheia e Tx tracejado.
+    - Tempo desconhecido aparece como buraco na linha, nunca como zero.
+  - Abaixo do gráfico, os números que o roteador calculou (`system.graph.query`; a UI não calcula):
+    - atual, média, máximo, **percentil 95** e total em GB;
+    - o **p95 de cobrança** (a maior das direções) e o p95 de Rx+Tx.
+  - Selos:
+    - resolução;
+    - cobertura abaixo de 95 %;
+    - "p95 de médias de 1 h" quando a faixa passa de uma semana.
+  - **CSV** (todos os pontos, hora UTC e Unix) e **PNG** (só o gráfico, recortado de um screenshot
+    da janela).
+    - A GUI nativa salva na pasta Downloads, sem sobrescrever (`export.rs`: o app instala o
+      `SaveFile` no contexto do egui; a UI não faz I/O).
+    - No navegador vão para a área de transferência.
+  - **Configurações…** abre o diálogo de `system.graph.set`:
+    - classes (físicas, bridges, VLANs, túneis, recursos);
+    - include e exclude;
+    - memória máxima e intervalo de gravação;
+    - a ocupação e o estado do disco.
+  - ⓘ em cada rótulo, coluna e campo, com explicação em português e inglês
+    (`i18n/graphs_pt.rs`, `graphs_en.rs`). Entrada no menu pela tabela central (`menu.rs`, "graphs",
+    `/tool graphing`).
+  - **Mini gráfico na janela Interfaces** (coluna Traffic, `spark.rs`):
+    - os últimos 5 minutos de Rx e Tx de cada interface guardada, numa consulta só a cada 5 s;
+    - a célula leva o desenho codificado, como os selos, e o `table.rs` o pinta (mudança mínima nos
+      dois arquivos);
+    - o tooltip mostra os valores.
+  - Ícone: `CHART_BAR`, por ora (um ícone novo pede o `pyftsubset`, que não está nesta máquina).
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-ui --lib graphs
+  cargo run -p corerouter-daemon -- --control 7979 --config-dir /tmp/cr
+  cargo run -p corerouter-gui -- --connect 127.0.0.1:7979 --control 7990
+  ```
+
+  Depois abra Tools › Graphs (ou Ctrl+K "graphs") e a janela Interfaces (coluna Traffic). Os
+  screenshots claro e escuro foram olhados.
+
+- 2026-10-23 — fix: conntrack: matar conexões não para mais numa conexão ICMP. O `delete` por ctnetlink mandava o
+  tuple ICMP só com o id, e o kernel exige também tipo e código (`CTA_PROTO_ICMP_TYPE`/`CODE`):
+  devolvia EINVAL, e o laço desistia no primeiro erro, deixando vivas as conexões que vinham
+  depois. No CGNAT isso deixava assinantes remapeados com a tradução antiga (o "Quem era?" erraria
+  para elas), e o `ip.firewall.connection.kill` parava no primeiro ping.
+
+  - o parser guarda tipo e código do ICMP no `dst_port` (`tipo << 8 | código`) e o pedido de
+    delete os devolve;
+  - o `delete` tenta todas e só depois devolve a primeira recusa;
+  - o filtro `port` de `ip.firewall.connection.list` ignora ICMP (o campo é tipo/código ali).
+
+  Era a causa do teste instável `netns_cgnat::element_changes_go_incremental_and_remaps_kill_connections`
+  ("killed: left 1, right 0"): falhava quando um teste anterior do mesmo binário deixava um ping no
+  conntrack. **Medido** (Ryzen AI MAX+ 395, 2026-10-23): antes 2 falhas em 4 execuções do binário,
+  depois 10 de 10 verdes. Teste novo de bytes: `ctnl::an_icmp_tuple_carries_type_and_code`.

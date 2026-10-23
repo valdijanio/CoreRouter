@@ -731,3 +731,35 @@ uma vez pelo ctnetlink. O coletor é IPFIX por TCP.
 Em user namespace o buffer do socket fica no `rmem_max` (8 MiB efetivos). No roteador o daemon é
 root e pede 32 MiB com `SO_RCVBUFFORCE`. Mesmo com estouro, todo delete leva o início da sessão:
 nenhuma sessão some do registro.
+
+### G4.5 — histórico de tráfego (**medido**, 2026-10-23, AMD Ryzen AI MAX+ 395, 32 threads, build release, ext4 em NVMe)
+
+Coleta e consulta, do `cargo bench -p corerouter-engine --bench graph` (criterion, mediana):
+
+| | 8 interfaces | 64 interfaces | 512 interfaces |
+|---|---|---|---|
+| um segundo de coleta (no tick, sob o lock da sessão) | 1,9 µs | 20,0 µs | 355 µs |
+| tirar as mudanças de um store de 5 min (sob o lock) | 4,7 µs | 32,7 µs | 547 µs |
+
+Consulta de uma interface com o histórico cheio: hora 294 µs, dia 299 µs, semana 542 µs, mês
+279 µs, **ano 1,36 ms**.
+
+Daemon de lab (`--backend virtual`, VLANs para chegar a 64 e 512, `vlans=yes`):
+
+| | 8 | 64 | 512 |
+|---|---|---|---|
+| histórico (memória = disco) | 5,72 MB | 43,4 MB | 344,9 MB |
+| RSS do daemon | 18,5 MB | 56,9 MB | 359,4 MB |
+| CPU do daemon inteiro (60 s, ticks de 10 ms) | 12 | 14 | 24 |
+| store de 1 min: bytes, tempo (fora do lock) | 696 B, 16 ms | 5.176 B, 94 ms | 41.016 B, 511 ms |
+| store final com o anel de 1 s | 26 KB, 8 ms | 199 KB, 64 ms | 1,57 MB, 491 ms |
+
+- Uma série de interface ocupa 672.984 bytes e a do sistema 336.600, fixos.
+- Com 512 VLANs e o graphing desligado, o daemon fica com 24,9 MB de RSS e 18 ticks em 60 s. O
+  histórico de 512 interfaces custa então 6 ticks a cada 60 s (0,1 % de um núcleo) e 334 MB.
+- O store custa ~80 B por série por minuto de histórico. No padrão de 5 min, a flash recebe
+  ~115 KB por interface por dia (**estimado** a partir do medido). O tempo do store é o
+  `fsync` de cada arquivo.
+- **Restart:** com 8, 64 e 512 interfaces, a consulta da última hora de `ether1` antes do
+  SIGTERM e depois de subir de novo deu os mesmos totais e a mesma média. O teste
+  `a_restart_reads_back_what_was_stored` confere os pontos.
