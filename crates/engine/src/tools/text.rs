@@ -42,6 +42,8 @@ pub fn header(kind: &str) -> Option<String> {
             "ROUND", "HOP", "ADDRESS", "TIME"
         )),
         "cable-test" => Some(format!("{:<4} {:<20} DISTANCE", "PAIR", "STATUS")),
+        "torch" => Some(super::torch::text_header()),
+        "sniffer" => Some(format!("{:>5} {:>10} {:>12} {:>12}", "TIME", "PACKETS", "BYTES", "FILE-SIZE")),
         _ => None,
     }
 }
@@ -124,6 +126,14 @@ pub fn line(kind: &str, ev: &Value) -> String {
         .to_owned(),
         // G6.6: the `dig` text, or a compare/trace row (may be several lines).
         "dns-lookup" => crate::dns_lookup::text_line(ev),
+        "torch" => super::torch::text_line(ev),
+        "sniffer" => format!(
+            "{:>4}s {:>10} {:>12} {:>12}",
+            s(ev, "t"),
+            s(ev, "packets"),
+            s(ev, "bytes"),
+            s(ev, "file_size")
+        ),
         "dns-watch" => crate::dns_watch::text_line(ev),
         "dns-upstreams" => crate::dns_upstreams::text_line(ev),
         _ => ev.to_string(),
@@ -281,6 +291,14 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
             out
         }
         "dns-lookup" => crate::dns_lookup::summary_lines(summary),
+        "torch" => Vec::new(),
+        "sniffer" => vec![format!(
+            "packets={} bytes={} file-size={} ({}): tool.sniffer.download id=<task>",
+            s(summary, "packets"),
+            s(summary, "bytes"),
+            s(summary, "file_size"),
+            s(summary, "end"),
+        )],
         "dns-watch" => crate::dns_watch::summary_lines(summary),
         "dns-upstreams" => crate::dns_upstreams::summary_lines(summary),
         _ => vec![summary.to_string()],

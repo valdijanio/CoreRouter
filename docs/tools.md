@@ -1,6 +1,6 @@
 # Ferramentas de diagnóstico (Tools)
 
-Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR) e G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
+Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR), G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR) e G6.4a (Torch e Packet Sniffer) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
 jitter, percentis, histograma, alertas e exportação.
 
 ## 1. Tarefas (G6.1)
@@ -280,6 +280,74 @@ Codec em `crates/proto-dns/src/dig.rs` (sem sockets, compila em WASM); a tarefa 
 `crates/engine/src/dns_lookup.rs`; o transporte no daemon em
 `apps/corerouter-daemon/src/service/dns_lookup.rs` (`DnsBackend::exchange`).
 
+### 4.4 Torch (G6.4a)
+
+O `/tool torch` do RouterOS: o tráfego de uma interface ao vivo, **por fluxo**.
+
+`tool.torch.start {interface, group?, src_address?, dst_address?, port?, protocol?, vlan_id?,
+dscp?, mac_address?, sampling?, duration?, interval_ms?, top?, as_lookup?}` — tarefa como o
+Ping (`tool.task.poll` / `tool.task.stop`); no terminal, `/tool torch ether1` ou `torch ether1`.
+
+- **Agrupamento** (`group`): `src`, `dst`, `proto`, `port`, `vlan`, `dscp`, `mac` (padrão
+  `src,dst`). Campo fora do agrupamento não separa linhas (o `0.0.0.0/0` do RouterOS). `vlan`
+  inclui as interfaces VLAN da interface (cada quadro é contado uma vez, na VLAN dele).
+- **Orientação:** cada linha é uma conversa vista da interface. `src` é o lado da interface (quem
+  manda o que chega: num acesso, o assinante), `dst` o outro lado; **Rx** é o que chegou pela
+  interface e **Tx** o que o roteador mandou por ela. O filtro usa a mesma orientação.
+- **Por intervalo** (`interval_ms`, padrão 1 s, o *freeze-frame* do RouterOS) um evento com as
+  `top` linhas mais pesadas (padrão 64; o resto soma em `others`), `total`, os **contadores da
+  própria interface** (`kernel`) e quanto deles a captura leu (`seen_pct`). Taxas em bit/s e
+  pacotes/s.
+- **AS do destino** (`as_lookup`, padrão ligado): o mesmo do MTR (`Prober::origin_as`, Team
+  Cymru ou a tabela BGP), sem esperar; privados e CGNAT ganham `dst_scope` e não são
+  consultados.
+- **Amostragem** (`sampling`): `auto` (padrão) lê tudo até **500 kpps**; acima, um em
+  N = ⌈pps / 250 k⌉ (no máximo 4096), escolhido ao acaso **no kernel** (filtro BPF clássico,
+  `SKF_AD_RANDOM`), e cada quadro lido conta N vezes; volta a ler tudo abaixo de 300 kpps
+  (histerese; só troca N quando muda 2× ou mais). As linhas viram estimativas (`estimated`,
+  aviso em `warnings`). `off` lê sempre tudo (avisa quando `seen_pct` < 90 %); `2..4096` fixa N.
+- **Assinante:** a GUI pede `ip.identity.lookup` (G0.25) para as origens, quando o roteador tem o
+  comando, e mostra o selo ao lado do endereço.
+
+Captura: `corerouter_hal::capture::PacketCapture` (L1). `hal-linux` (`capture.rs`): um socket
+`AF_PACKET` (`SOCK_RAW`, `ETH_P_ALL`) por dispositivo, preso a ele (endereço do `getifaddrs`), lido
+por `recvmsg` com `MSG_TRUNC` (tamanho real no fio) em lotes de 1024, numa thread de tarefa, fora
+do lock. O filtro BPF de cada socket faz a amostragem e, no pai de VLANs capturadas à parte,
+descarta os quadros com tag (tirada pela NIC, `SKF_AD_VLAN_TAG_PRESENT`, ou no quadro). Sem
+`unsafe`: nada de `TPACKET_V3` (anel em `mmap`) nem `PACKET_AUXDATA` (opção sem API segura); o
+caminho rápido futuro é um backend XDP (G2.5) atrás do mesmo trait. O lab virtual tem
+`SimCapture`: tráfego determinístico (assinantes CGNAT e privados, uma VLAN 100, um fluxo IPv6)
+para os destinos da rede simulada (§5.2), com contadores próprios.
+
+Números (**medido**, 2026-10-23, release, 32 CPUs, veth num namespace,
+`hal-linux/benches/netns_capture.rs` e `engine/benches/torch.rs`): uma thread de captura lê até
+**~2,0 Mpps** sem amostrar (100 % de um núcleo; com 8,3 Mpps oferecidos vê 25 %); com 1:8 no
+kernel cobre 11,3 Mpps (100 % estimado) a 87 % de CPU, e com 1:64 cobre 12,8 Mpps a 35 %.
+Agrupar custa 75–83 ns por quadro (12–14 milhões/s), então o socket domina. Com `auto`, 500 kpps
+custam ~30 % de um núcleo e acima disso o custo fica em ~250 kpps lidos.
+
+### 4.5 Packet Sniffer (G6.4a)
+
+O `/tool sniffer` do RouterOS, limitado: grava os quadros de uma interface num **pcap** (formato
+clássico da libpcap, `draft-ietf-opsawg-pcap`: magic `A1B2C3D4`, versão 2.4, LinkType 1
+Ethernet, carimbo em µs) para abrir no Wireshark.
+
+- `tool.sniffer.start {interface, src_address?, dst_address?, port?, protocol?, vlan_id?,
+  mac_address?, snaplen?, file_limit?, duration?}` — o mesmo filtro do Torch; `snaplen` bytes de
+  cada quadro (64–9216, padrão **128 = só cabeçalhos**); `file_limit` em KiB (1–65536, padrão
+  4096); `duration` em s (1–3600, padrão 60). Termina sozinho no prazo ou no limite
+  (`end: duration reached | file limit reached | stopped`); pacotes além do limite contam em
+  `dropped_by_limit`.
+- `tool.sniffer.download {id, offset?, length?}` — o arquivo em pedaços de até 4 MiB (base64),
+  com `total` e `complete`; a GUI junta e salva como o CSV do Ping (`$COREROUTER_EXPORT_DIR`,
+  `~/Downloads`; download no navegador).
+- O arquivo fica **na memória** do roteador (o engine não tem disco: roda em wasm também) até a
+  tarefa sumir (300 s depois da última consulta) ou outra captura precisar do lugar: no máximo
+  **2 capturas** guardadas (≤ 128 MiB no pior caso).
+- **Privacidade:** quadros inteiros são dados dos assinantes. `tool.sniffer.start` exige o grupo
+  **write** (o Torch, só cabeçalhos agregados, fica em `read`); a GUI mostra o selo âmbar
+  `payloads` quando `snaplen` > 128.
+
 ## 5. Quem envia os pacotes
 
 O engine só fala com o trait `corerouter_hal::probe::Prober` (L1): `resolve`, `open` →
@@ -352,6 +420,11 @@ A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
   tabela; Start (Enter) / Stop (Esc); tabela por salto ao vivo (Hop, Host, Loss %, Sent,
   Last, Avg, Best, Worst, StDev) com a perda colorida e uma barra da média relativa ao salto
   mais lento.
+- **GUI** — Tools › Torch: interface, agrupamento em selos, filtro (origem, destino, porta,
+  protocolo), amostragem; tabela ao vivo com a pílula do AS no destino, `CGNAT`/`privada` e o
+  selo do assinante na origem, selos de amostragem e de cobertura (`seen`), totais e os
+  contadores da interface embaixo; ⓘ em cada campo. Tools › Packet Sniffer: interface, filtro,
+  bytes por quadro, limite e duração; barra do arquivo e **Download .pcap**.
 - **Terminal** (G0.8 + G6.5) — como no RouterOS: `ping 8.8.8.8`, `/ping 8.8.8.8`,
   `/tool ping 8.8.8.8 count=5 size=1400`, `/tool ping address=…`; `traceroute 8.8.8.8`,
   `/tool traceroute …` ou `mtr …` para o MTR; `/tool ping mtu 198.51.100.3`. Sem `count` roda
