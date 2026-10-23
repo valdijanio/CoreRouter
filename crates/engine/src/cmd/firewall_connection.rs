@@ -277,7 +277,7 @@ fn flags(c: &Conn) -> String {
 }
 
 fn table_json(s: &Stats) -> Value {
-    let percent = if s.max == 0 { 0 } else { s.count.saturating_mul(100) / s.max };
+    let percent = s.count.saturating_mul(100).checked_div(s.max).unwrap_or(0);
     json!({
         "count": s.count, "max": s.max, "percent": percent,
         "insert_failed": s.insert_failed, "drop": s.drop, "early_drop": s.early_drop,

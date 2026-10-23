@@ -67,17 +67,25 @@ pub fn table(cfg: &Config, killed: &BTreeSet<u32>) -> Vec<Conn> {
                     6..=8 => 17,
                     _ => 1,
                 };
-                let server = servers[(h % servers.len() as u64) as usize];
+                let pick = |list: &[u16], at: u64| {
+                    list.get(usize::try_from(at % list.len() as u64).unwrap_or(0))
+                        .copied()
+                        .unwrap_or(0)
+                };
+                let server = servers
+                    .get(usize::try_from(h % servers.len() as u64).unwrap_or(0))
+                    .copied()
+                    .unwrap_or(Ipv4Addr::new(8, 8, 8, 8));
                 let dport = match protocol {
-                    6 => [443u16, 443, 80, 993, 5222][(h >> 8) as usize % 5],
-                    17 => [53u16, 443, 123, 3478, 27015][(h >> 8) as usize % 5],
+                    6 => pick(&[443, 443, 80, 993, 5222], h >> 8),
+                    17 => pick(&[53, 443, 123, 3478, 27015], h >> 8),
                     _ => 0,
                 };
                 let span = u64::from(slot.ports());
                 let public_port = slot.first_port + u16::try_from(k % span).unwrap_or(0);
                 let sport = 32_768 + u16::try_from(h % 28_000).unwrap_or(0);
                 let mut st = status::CONFIRMED | status::SRC_NAT | status::SEEN_REPLY;
-                if protocol == 6 && h % 4 != 0 {
+                if protocol == 6 && !h.is_multiple_of(4) {
                     st |= status::ASSURED;
                 }
                 match h % 23 {
@@ -112,7 +120,7 @@ pub fn table(cfg: &Config, killed: &BTreeSet<u32>) -> Vec<Conn> {
                         17 => 5 + u32::try_from(h % 180).unwrap_or(0),
                         _ => 1 + u32::try_from(h % 30).unwrap_or(0),
                     },
-                    tcp_state: (protocol == 6).then_some(if h % 9 == 0 { 7 } else { 3 }),
+                    tcp_state: (protocol == 6).then_some(if h.is_multiple_of(9) { 7 } else { 3 }),
                     mark: 0,
                     orig_packets: if protocol == 1 {
                         1 + h % 5
