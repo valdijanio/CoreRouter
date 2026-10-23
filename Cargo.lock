@@ -1339,6 +1339,7 @@ dependencies = [
  "corerouter-engine",
  "corerouter-hal",
  "corerouter-model",
+ "criterion",
  "log",
  "serde_json",
 ]
