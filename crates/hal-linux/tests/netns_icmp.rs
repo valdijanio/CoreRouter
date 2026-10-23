@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use corerouter_hal::probe::{
-    Probe, ProbeError, ProbeSocket, Prober, Reply, ReplyKind, SocketOptions,
+    Probe, ProbeError, ProbeProto, ProbeSocket, Prober, Reply, ReplyKind, SocketOptions,
 };
 use corerouter_hal_linux::icmp::{HostProber, Kind};
 
@@ -458,4 +458,71 @@ fn source_address_and_device_are_honored() {
         size: 56,
     };
     assert!(matches!(bad.send(&probe), Err(ProbeError::Unavailable(_))));
+}
+
+/// G6.4c: UDP and TCP SYN probes (no raw socket), classic and Paris, walk
+/// the path: the router answers "time exceeded", the host "port
+/// unreachable" (UDP), RST (TCP, nothing listening) or SYN-ACK (TCP, a
+/// listener).
+#[test]
+fn udp_and_tcp_probes_walk_the_path() {
+    if !in_netns() {
+        return;
+    }
+    let lab = lab(4);
+    // A listener on the far host, port 8080, both families.
+    let pid = lab._host.pid();
+    let mut listener = Command::new("nsenter")
+        .args(["-t", pid.as_str(), "-n", "python3", "-c",
+            "import socket,time\ns=socket.socket(socket.AF_INET6)\ns.setsockopt(socket.IPPROTO_IPV6,socket.IPV6_V6ONLY,0)\ns.bind(('::',8080))\ns.listen(64)\ntime.sleep(60)"])
+        .stdin(Stdio::null())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    let prober = HostProber::with_kind(Kind::Ping);
+    // Neighbor discovery on the fresh links takes a second once: not the
+    // probes' RTT.
+    let mut warm = prober.open(&SocketOptions::default()).unwrap();
+    for far in [&lab.far, &lab.far6] {
+        ask_retry(warm.as_mut(), far, 1, None, 64);
+    }
+    let cases = [
+        (ProbeProto::Udp { port: 33434 }, "port unreachable"),
+        (ProbeProto::Tcp { port: 9 }, "rst"),
+        (ProbeProto::Tcp { port: 8080 }, "syn-ack"),
+    ];
+    for (proto, end) in cases {
+        for paris in [false, true] {
+            for (near, far) in [(&lab.near, &lab.far), (&lab.near6, &lab.far6)] {
+                let mut sock = prober
+                    .open(&SocketOptions {
+                        proto,
+                        paris,
+                        ..SocketOptions::default()
+                    })
+                    .unwrap();
+                let r = ask_retry(sock.as_mut(), far, 10, Some(1), 64);
+                assert_eq!(
+                    r.kind,
+                    ReplyKind::TtlExceeded,
+                    "{proto:?} paris={paris} {far}"
+                );
+                assert_eq!(r.from.to_string(), *near);
+                let r = ask_retry(sock.as_mut(), far, 20, Some(8), 64);
+                assert_eq!(
+                    r.kind,
+                    ReplyKind::Reached(end.into()),
+                    "{proto:?} paris={paris} {far}"
+                );
+                assert_eq!(r.from.to_string(), *far);
+                assert!(
+                    r.rtt < Duration::from_secs(1),
+                    "{proto:?} paris={paris} {far}: {:?}",
+                    r.rtt
+                );
+            }
+        }
+    }
+    let _ = listener.kill();
+    let _ = listener.wait();
 }

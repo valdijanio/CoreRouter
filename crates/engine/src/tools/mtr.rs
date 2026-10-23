@@ -14,14 +14,23 @@
 //! looked up: RFC 6598 §4 says reverse queries for shared space "MUST NOT
 //! be forwarded to the global DNS", and RFC 6303 §3 keeps the RFC 1918 and
 //! ULA reverse zones local.
+//!
+//! G6.4c: the probes can also be UDP or TCP SYN (`options.proto`), and
+//! Paris (`options.paris`): every probe the same flow, so a per-flow load
+//! balancer keeps them on one path. Paris UDP and TCP probes go one at a
+//! time (`serial`), since only one probe of a flow can be told apart from
+//! a router's short quote. `traceroute` is the one-pass mode
+//! (`tool.traceroute.start`): `count` probes per hop, the RTT of each kept
+//! per hop (`rtts`), the classic `traceroute` table at the end.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::time::Duration;
 
 use corerouter_hal::probe::{
-    AsInfo, Lookup, MplsLabel, Probe, ProbeError, Prober, ReplyKind, SocketOptions, overhead,
+    AsInfo, Lookup, MplsLabel, Probe, ProbeError, ProbeProto, Prober, ReplyKind, SocketOptions,
+    overhead,
 };
 use serde_json::{Value, json};
 
@@ -36,6 +45,8 @@ const LOOKUP_GRACE: Duration = Duration::from_secs(3);
 /// Addresses remembered per hop (a hop can answer from several when the
 /// path load-balances).
 const MAX_HOSTS: usize = 4;
+/// RTTs kept per hop in the traceroute mode (one per probe).
+pub const MAX_PROBES: u32 = 10;
 
 #[derive(Debug, Clone)]
 pub struct MtrJob {
@@ -51,6 +62,15 @@ pub struct MtrJob {
     pub use_dns: bool,
     /// Origin AS of the hops (Team Cymru over DNS).
     pub as_lookup: bool,
+    /// One-pass traceroute: keep each probe's RTT per hop.
+    pub traceroute: bool,
+}
+
+impl MtrJob {
+    /// Probes go one at a time: Paris over UDP or TCP.
+    fn serial(&self) -> bool {
+        self.options.paris && self.options.proto != ProbeProto::Icmp
+    }
 }
 
 /// What kind of address `ip` is, when it is not a public one: such
@@ -180,6 +200,8 @@ struct Hop {
     stats: Stats,
     /// Last non-echo answer that is not "TTL exceeded" (unreachable…).
     note: Option<String>,
+    /// Traceroute mode: each probe's RTT by round (`None`: no answer).
+    rtts: BTreeMap<u32, Option<f64>>,
 }
 
 struct InFlight {
@@ -191,7 +213,13 @@ struct InFlight {
 pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String> {
     let v6 = job.options.src.map(|a| a.is_ipv6());
     let dst = job.target.resolve(prober, v6)?;
-    let size = job.size.max(overhead(dst));
+    // Paris ICMP needs a payload word to keep the checksum.
+    let paris_word = if job.options.paris { 2 } else { 0 };
+    let size = job.size.max(overhead(dst) + paris_word);
+    let serial = job.serial();
+    // Probes of the current round not sent yet (all at once, or one at a
+    // time when serial): (round, ttl).
+    let mut pending: VecDeque<(u32, u8)> = VecDeque::new();
     let mut sock = prober.open(&job.options).map_err(|e| e.to_string())?;
     let describe = prober.describe();
     let mut hops: BTreeMap<u8, Hop> = BTreeMap::new();
@@ -231,6 +259,9 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
                         Value::Array(h.hosts.iter().map(Host::to_json).collect()),
                     );
                     o.insert("note".into(), json!(h.note));
+                    if job.traceroute {
+                        o.insert("rtts".into(), json!(h.rtts.values().collect::<Vec<_>>()));
+                    }
                     // MTR names.
                     o.insert(
                         "best_ms".into(),
@@ -253,6 +284,17 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
             "max_hops": job.max_hops,
             "use_dns": job.use_dns,
             "as_lookup": job.as_lookup,
+            "protocol": match job.options.proto {
+                ProbeProto::Icmp => "icmp",
+                ProbeProto::Udp { .. } => "udp",
+                ProbeProto::Tcp { .. } => "tcp",
+            },
+            "port": match job.options.proto {
+                ProbeProto::Icmp => None,
+                ProbeProto::Udp { port } | ProbeProto::Tcp { port } => Some(port),
+            },
+            "paris": job.options.paris,
+            "mode": if job.traceroute { "traceroute" } else { "mtr" },
             "hops": rows,
         })
     };
@@ -260,14 +302,28 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
 
     loop {
         let more = job.count == 0 || round < job.count;
-        if !more && flights.is_empty() {
+        if !more && flights.is_empty() && pending.is_empty() {
             break;
         }
         let now = ctx.now();
         let mut changed = false;
-        if more && now >= next {
+        // Serial: a new round only once the last one is through.
+        if more && now >= next && (!serial || (pending.is_empty() && flights.is_empty())) {
             round = round.saturating_add(1);
-            for ttl in 1..=last {
+            pending.extend((1..=last).map(|ttl| (round, ttl)));
+            changed = true;
+            next = next.saturating_add(job.interval);
+            if next < now {
+                next = now.saturating_add(job.interval);
+            }
+        }
+        pending.retain(|(_, ttl)| *ttl <= last);
+        while let Some(&(r, ttl)) = pending.front() {
+            if serial && !flights.is_empty() {
+                break;
+            }
+            pending.pop_front();
+            {
                 wire = wire.wrapping_add(1);
                 let hop = hops.entry(ttl).or_default();
                 hop.stats.sent += 1;
@@ -283,7 +339,7 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
                             wire,
                             InFlight {
                                 hop: ttl,
-                                round,
+                                round: r,
                                 sent: ctx.now(),
                             },
                         );
@@ -291,15 +347,13 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
                     Err(ProbeError::Unreachable(why)) => {
                         hop.stats.record(Outcome::Unreachable, None);
                         hop.note = Some(why);
+                        if job.traceroute {
+                            hop.rtts.insert(r, None);
+                        }
                     }
                     Err(ProbeError::TooBig(_)) => hop.stats.record(Outcome::TooBig, None),
                     Err(e) => return Err(e.to_string()),
                 }
-            }
-            changed = true;
-            next = next.saturating_add(job.interval);
-            if next < now {
-                next = now.saturating_add(job.interval);
             }
         }
         let now = ctx.now();
@@ -313,6 +367,9 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
                 && let Some(h) = hops.get_mut(&f.hop)
             {
                 h.stats.record(Outcome::Timeout, None);
+                if job.traceroute {
+                    h.rtts.insert(f.round, None);
+                }
                 if f.hop <= last {
                     ctx.emit(json!({"round": f.round, "hop": f.hop, "status": "timeout"}));
                 }
@@ -328,11 +385,13 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
             ctx.summary(summary(&hops, last, reached, round));
         }
         let more = job.count == 0 || round < job.count;
-        if !more && flights.is_empty() {
+        if !more && flights.is_empty() && pending.is_empty() {
             break;
         }
         let mut until = now.saturating_add(Duration::from_millis(250));
-        if more {
+        // The next round only matters once it may start (serial: after this
+        // one is through).
+        if more && (!serial || (pending.is_empty() && flights.is_empty())) {
             until = until.min(next);
         }
         if let Some(first) = flights.values().map(|f| f.sent).min() {
@@ -347,6 +406,10 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
             let rtt = ms(r.rtt);
             let (status, end) = match &r.kind {
                 ReplyKind::Echo => ("ok", true),
+                ReplyKind::Reached(how) => {
+                    h.note = Some(how.clone());
+                    ("ok", true)
+                }
                 ReplyKind::TtlExceeded => ("ttl-exceeded", false),
                 ReplyKind::Unreachable(why) => {
                     h.note = Some(why.clone());
@@ -359,6 +422,9 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
             };
             // An answer from the hop is what MTR counts, whatever it says.
             h.stats.record(Outcome::Ok, Some(rtt));
+            if job.traceroute {
+                h.rtts.insert(f.round, Some(rtt));
+            }
             let known = h.hosts.len();
             match h.hosts.iter_mut().find(|x| x.ip == r.from) {
                 Some(x) if !r.mpls.is_empty() => x.mpls.clone_from(&r.mpls),
@@ -375,7 +441,7 @@ pub fn run(job: MtrJob, prober: &dyn Prober, ctx: &TaskCtx) -> Result<(), String
             if end && f.hop < last {
                 last = f.hop;
             }
-            if r.kind == ReplyKind::Echo {
+            if matches!(r.kind, ReplyKind::Echo | ReplyKind::Reached(_)) {
                 reached = true;
             }
             if f.hop <= last {
@@ -455,9 +521,12 @@ mod tests {
             timeout: Duration::from_millis(800),
             max_hops: 30,
             size: 56,
-            options: SocketOptions::default(),
+            // Paris, as `tool.mtr.start` defaults: one path through the
+            // simulated ECMP pair.
+            options: SocketOptions { paris: true, ..SocketOptions::default() },
             use_dns: true,
             as_lookup: true,
+            traceroute: false,
         };
         let r = run(job, prober, &ctx);
         let (events, summary) = cell.snapshot();
@@ -481,7 +550,10 @@ mod tests {
         for h in &hops[..hops.len() - 1] {
             let n = h["hop"].as_u64().unwrap() as u8;
             if h["received"].as_u64().unwrap() > 0 {
-                assert_eq!(h["host"], SimProber::router(dst, n).to_string());
+                // Hop 3 is an ECMP pair: Paris lands on one of the two.
+                let ok = [SimProber::router(dst, n), SimProber::ecmp_router(dst, n)];
+                assert!(ok.iter().any(|r| h["host"] == r.to_string()), "{h}");
+                assert_eq!(h["hosts"].as_array().unwrap().len(), 1, "one path");
             } else {
                 assert_eq!(h["loss_pct"], 100.0);
             }
@@ -617,5 +689,57 @@ mod tests {
         let last = s["hops"].as_array().unwrap().last().unwrap().clone();
         assert!(last["name"].is_null());
         assert_eq!(last["hosts_info"][0]["name_pending"], true);
+    }
+
+    /// A one-pass traceroute on the simulated network: `probes` per hop.
+    fn trace(host: &str, proto: ProbeProto, paris: bool) -> Value {
+        trace_n(host, proto, paris, 3)
+    }
+
+    fn trace_n(host: &str, proto: ProbeProto, paris: bool, probes: u32) -> Value {
+        let cell = TaskCell::for_test();
+        let clock = Fake(Cell::new(Duration::ZERO));
+        let ctx = TaskCtx::new(&cell, &clock);
+        let job = MtrJob {
+            target: Target { input: host.into(), addr: host.parse().ok() },
+            count: probes,
+            interval: Duration::from_millis(50),
+            timeout: Duration::from_millis(800),
+            max_hops: 30,
+            size: 60,
+            options: SocketOptions { proto, paris, ..SocketOptions::default() },
+            use_dns: false,
+            as_lookup: false,
+            traceroute: true,
+        };
+        run(job, &SimProber::default(), &ctx).unwrap();
+        cell.snapshot().1
+    }
+
+    #[test]
+    fn traceroute_keeps_each_probe_and_ends_at_port_unreachable() {
+        let s = trace("8.8.8.8", ProbeProto::Udp { port: 33434 }, true);
+        assert_eq!((s["mode"].as_str(), s["protocol"].as_str(), s["paris"].as_bool()), (Some("traceroute"), Some("udp"), Some(true)));
+        assert_eq!(s["reached"], true);
+        let hops = s["hops"].as_array().unwrap();
+        assert!(hops.iter().all(|h| h["rtts"].as_array().unwrap().len() == 3), "{s}");
+        let last = hops.last().unwrap();
+        assert_eq!(last["note"], "port unreachable");
+        assert_eq!(last["host"], "8.8.8.8");
+    }
+
+    #[test]
+    fn paris_keeps_one_path_classic_zig_zags() {
+        for proto in [ProbeProto::Icmp, ProbeProto::Udp { port: 33434 }, ProbeProto::Tcp { port: 80 }] {
+            let hop3 = |paris: bool| {
+                let s = trace_n("8.8.8.8", proto, paris, MAX_PROBES);
+                s["hops"][2]["hosts"].as_array().unwrap().len()
+            };
+            assert_eq!(hop3(true), 1, "{proto:?} Paris: one path");
+            let s = trace_n("8.8.8.8", proto, false, MAX_PROBES);
+            assert_eq!(hop3(false), 2, "{proto:?} classic: both ECMP routers {}", s["hops"][2]);
+        }
+        let s = trace("8.8.8.8", ProbeProto::Tcp { port: 443 }, true);
+        assert_eq!(s["hops"].as_array().unwrap().last().unwrap()["note"], "syn-ack");
     }
 }

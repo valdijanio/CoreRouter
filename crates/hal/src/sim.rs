@@ -24,6 +24,12 @@
 //! (RFC 6996 private-use ASNs); destinations are AS64999 "SIM-DEST". On
 //! paths of 5 hops or more, hops 3 to the third-to-last report an MPLS
 //! label (RFC 4950), the middle one a stack of two.
+//!
+//! ECMP (G6.4c): on paths of 6 hops or more, hop 3 is two routers behind a
+//! per-flow load balancer. A socket whose probes are each a flow of their
+//! own (classic traceroute, `paris` off) sees both, alternating; a Paris
+//! socket always lands on the same one. UDP probes reaching the
+//! destination get "port unreachable", TCP ones a SYN-ACK.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -32,8 +38,8 @@ use std::time::Duration;
 use ipnet::IpNet;
 
 use crate::probe::{
-    AsInfo, Lookup, MplsLabel, Probe, ProbeError, ProbeSocket, Prober, Reply, ReplyKind,
-    SocketOptions,
+    AsInfo, Lookup, MplsLabel, Probe, ProbeError, ProbeProto, ProbeSocket, Prober, Reply,
+    ReplyKind, SocketOptions,
 };
 
 /// What happens to a probe that reaches the end of a path.
@@ -250,8 +256,38 @@ impl SimProber {
         vec![top]
     }
 
-    /// What answers `probe` (sent with DF = `df`), if anything.
+    /// The second router of the ECMP pair at `hop` on the path to `dst`.
+    pub fn ecmp_router(dst: IpAddr, hop: u8) -> IpAddr {
+        match Self::router(dst, hop) {
+            IpAddr::V4(v) => {
+                let [a, b, c, d] = v.octets();
+                IpAddr::V4(Ipv4Addr::new(a, b, c, d.wrapping_add(127).max(1)))
+            }
+            IpAddr::V6(v) => {
+                let mut seg = v.segments();
+                if let Some(last) = seg.last_mut() {
+                    *last = last.wrapping_add(0x80);
+                }
+                IpAddr::V6(Ipv6Addr::from(seg))
+            }
+        }
+    }
+
+    /// What answers `probe` (sent with DF = `df`), if anything: an ICMP
+    /// echo, no load balancing.
     pub fn answer(&self, probe: &Probe, df: bool) -> Option<Reply> {
+        self.answer_as(probe, df, ProbeProto::Icmp, None)
+    }
+
+    /// What answers `probe` of protocol `proto`; `flow` is what a per-flow
+    /// load balancer hashes (`None`: none on the way).
+    pub fn answer_as(
+        &self,
+        probe: &Probe,
+        df: bool,
+        proto: ProbeProto,
+        flow: Option<u64>,
+    ) -> Option<Reply> {
         let path = self.path(probe.dst);
         let dst = addr_bytes(probe.dst);
         let seq = probe.seq.to_be_bytes();
@@ -316,14 +352,28 @@ impl SimProber {
         }
         if ttl < hops {
             // Every 7th router (by hash) does not answer TTL exceeded.
-            let router = Self::router(probe.dst, ttl);
+            let mut router = Self::router(probe.dst, ttl);
+            if let Some(f) = flow
+                && hops >= 6
+                && ttl == 3
+                && (hash(&[&dst, &f.to_be_bytes(), b"ecmp"]) >> 40) % 2 == 1
+            {
+                router = Self::ecmp_router(probe.dst, ttl);
+            }
             if hops > 2 && hash(&[&dst, &[ttl], b"quiet"]).is_multiple_of(7) {
                 return None;
             }
             return Some(reply(router, ReplyKind::TtlExceeded, ttl));
         }
         match path.fate {
-            Fate::Reply | Fate::Unreachable(_) => Some(reply(probe.dst, ReplyKind::Echo, hops)),
+            Fate::Reply | Fate::Unreachable(_) => {
+                let kind = match proto {
+                    ProbeProto::Icmp => ReplyKind::Echo,
+                    ProbeProto::Udp { .. } => ReplyKind::Reached("port unreachable".into()),
+                    ProbeProto::Tcp { .. } => ReplyKind::Reached("syn-ack".into()),
+                };
+                Some(reply(probe.dst, kind, hops))
+            }
             Fate::Silent => None,
         }
     }
@@ -393,6 +443,8 @@ impl Prober for SimProber {
         Ok(Box::new(SimSocket {
             net: self.clone(),
             df: options.dont_fragment,
+            proto: options.proto,
+            paris: options.paris,
             queue: VecDeque::new(),
         }))
     }
@@ -403,6 +455,8 @@ impl Prober for SimProber {
 struct SimSocket {
     net: SimProber,
     df: bool,
+    proto: ProbeProto,
+    paris: bool,
     queue: VecDeque<Reply>,
 }
 
@@ -412,7 +466,10 @@ impl ProbeSocket for SimSocket {
         if self.df && !loopback && probe.size > LOCAL_MTU {
             return Err(ProbeError::TooBig(Some(LOCAL_MTU)));
         }
-        if let Some(r) = self.net.answer(probe, self.df || probe.dst.is_ipv6()) {
+        // Paris: one flow for the whole socket; classic: each probe its own.
+        let flow = if self.paris { 0 } else { u64::from(probe.seq) };
+        let df = self.df || probe.dst.is_ipv6();
+        if let Some(r) = self.net.answer_as(probe, df, self.proto, Some(flow)) {
             self.queue.push_back(r);
         }
         Ok(())
@@ -541,6 +598,53 @@ mod tests {
             !ttl3.mpls.is_empty(),
             "the lossy 6-hop path has MPLS at hop 3"
         );
+    }
+
+    #[test]
+    fn classic_probes_see_both_ecmp_routers_paris_one() {
+        let dst: IpAddr = "8.8.8.8".parse().unwrap();
+        let sim = SimProber::default();
+        assert!(sim.path(dst).hops >= 6, "a long enough path");
+        let hop3 = |paris: bool, proto: ProbeProto| {
+            let mut sock = sim
+                .open(&SocketOptions {
+                    paris,
+                    proto,
+                    ..SocketOptions::default()
+                })
+                .unwrap();
+            let mut seen = std::collections::BTreeSet::new();
+            for seq in 0..40 {
+                sock.send(&probe("8.8.8.8", seq, Some(3), 64)).unwrap();
+                if let Some(r) = sock.recv(Duration::ZERO).unwrap() {
+                    seen.insert(r.from);
+                }
+            }
+            seen
+        };
+        assert_eq!(hop3(false, ProbeProto::Icmp).len(), 2, "zig-zag");
+        assert_eq!(hop3(true, ProbeProto::Icmp).len(), 1, "one path");
+        assert_eq!(hop3(true, ProbeProto::Udp { port: 33434 }).len(), 1);
+        // The destination answers in kind.
+        let mut sock = sim
+            .open(&SocketOptions {
+                proto: ProbeProto::Tcp { port: 443 },
+                ..SocketOptions::default()
+            })
+            .unwrap();
+        sock.send(&probe("8.8.8.8", 1, Some(64), 64)).unwrap();
+        assert_eq!(
+            sock.recv(Duration::ZERO).unwrap().unwrap().kind,
+            ReplyKind::Reached("syn-ack".into())
+        );
+        // Plain `answer` (ping, MTU) sees no load balancer.
+        let a = sim
+            .answer(&probe("8.8.8.8", 1, Some(3), 64), false)
+            .unwrap();
+        let b = sim
+            .answer(&probe("8.8.8.8", 2, Some(3), 64), false)
+            .unwrap();
+        assert_eq!(a.from, b.from);
     }
 
     #[test]

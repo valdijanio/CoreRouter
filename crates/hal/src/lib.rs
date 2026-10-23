@@ -5,11 +5,13 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod capture;
 pub mod cgnat;
 pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
 pub mod drift;
+pub mod fastpath;
 pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
@@ -21,6 +23,7 @@ pub mod sff;
 pub mod sim;
 pub mod tuning;
 pub mod virt;
+pub mod xdp;
 
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
@@ -202,6 +205,12 @@ pub trait Hal: Send {
     /// is none. Cheap: backends build it once and hand out clones.
     fn prober(&self) -> Result<SharedProber, String> {
         Err(format!("{} cannot send probes", self.describe()))
+    }
+
+    /// Packet capture for Torch and the sniffer (G6.4a), shared with task
+    /// threads; `Err(why)` when this backend has none.
+    fn packet_capture(&self) -> Result<capture::SharedCapture, String> {
+        Err(format!("{} cannot capture packets", self.describe()))
     }
 
     /// Live Ethernet state of `name` (G1.19). Fields the driver does not
@@ -411,6 +420,24 @@ pub trait Hal: Send {
         )))
     }
 
+    /// IP › Firewall › XDP (G2.5a): where the filter is attached, its
+    /// counters and the most dropped sources (`top` of them).
+    fn xdp_status(&mut self, top: usize) -> Result<xdp::XdpStatus, HalError> {
+        let _ = top;
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
+    /// Zero the XDP counters and forget the dropped sources.
+    fn xdp_reset(&mut self) -> Result<(), HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
     /// Counters behind the tuning diagnosis.
     fn kernel_stats(&mut self) -> Result<tuning::KernelStats, HalError> {
         Err(HalError::Unsupported(format!(
@@ -449,6 +476,19 @@ pub trait Hal: Send {
     /// queue to ask through (the lab's pretend online subscribers).
     fn cgnat_waiting(&mut self) -> Vec<cgnat::Waiting> {
         Vec::new()
+    }
+
+    /// What port `name`'s card offers the fast path (G2.4).
+    fn eswitch(&mut self, name: &IfName) -> Result<fastpath::Eswitch, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} cannot tell what '{name}' offloads",
+            self.describe()
+        )))
+    }
+
+    /// The fast path as the last apply installed it (G2.4).
+    fn fastpath_state(&mut self) -> fastpath::FastPathState {
+        fastpath::FastPathState::default()
     }
 
     /// The queue of first packets of subscribers without a block (G2.3c).

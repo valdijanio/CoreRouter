@@ -177,3 +177,22 @@ fn every_label_has_an_explanation_in_both_languages() {
         }
     }
 }
+
+/// G0.25: the subscriber chip on the top talkers, with its sources.
+#[test]
+fn top_talkers_carry_the_subscriber_chip() {
+    let mut s = lab();
+    s.execute(
+        "ip.dhcp-server.lease.add",
+        &json!({"address": "100.64.0.7", "mac_address": "02:00:00:00:00:07", "comment": "Ana Lima"}),
+    )
+    .unwrap();
+    let mut h = open(s);
+    h.app.panel_mut::<TrafficFlowPanel>().unwrap().tab = Tab::Top;
+    refresh(&mut h);
+    refresh(&mut h);
+    let name = format!("{}Ana Lima", crate::icons::IDENTIFICATION_BADGE);
+    let at = h.find_text(&name).or_else(|| h.find_text("Ana Lima")).expect("the name chip");
+    h.hover(at);
+    assert!(h.has_text("Static lease comment"), "tooltip");
+}

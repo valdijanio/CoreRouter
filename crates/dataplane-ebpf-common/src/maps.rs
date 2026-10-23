@@ -1,0 +1,88 @@
+//! The maps of the XDP filter: names (the loader finds them by name in the
+//! object), sizes and value layouts. Keys and values are plain integers or
+//! byte arrays, which both aya sides already treat as plain data.
+//!
+//! | map | type | key | value |
+//! |---|---|---|---|
+//! | `SETTINGS` | array | index | `u64` ([`crate::filter::Settings::to_words`]) |
+//! | `BLOCK_V4` / `BLOCK_V6` | LPM trie | prefix of `[u8; 4]` / `[u8; 16]` | block list index `u32` |
+//! | `ALLOW_V4` / `ALLOW_V6` | LPM trie | same | allow list index `u32` |
+//! | `RATE` | LRU hash | source ([`crate::parse::Addr::mapped`]) | [`crate::bucket::Bucket`] |
+//! | `COUNTERS` | per-CPU hash | [`counter_key`] | [`Counter`] |
+//! | `TOP` | LRU per-CPU hash | dropped source (mapped) | [`Top`] |
+
+use crate::filter::Reason;
+
+pub const SETTINGS: &str = "SETTINGS";
+pub const BLOCK_V4: &str = "BLOCK_V4";
+pub const BLOCK_V6: &str = "BLOCK_V6";
+pub const ALLOW_V4: &str = "ALLOW_V4";
+pub const ALLOW_V6: &str = "ALLOW_V6";
+pub const RATE: &str = "RATE";
+pub const COUNTERS: &str = "COUNTERS";
+pub const TOP: &str = "TOP";
+/// The XDP program's name in the object.
+pub const PROGRAM: &str = "corerouter_xdp";
+
+/// Prefixes the IPv4 block (and allow) trie holds. An LPM trie is not
+/// preallocated: memory follows the entries (~64 bytes per node in the
+/// kernel, **estimated**), so this is a ceiling, not a cost.
+pub const PREFIXES_V4: u32 = 1 << 20;
+pub const PREFIXES_V6: u32 = 1 << 18;
+/// Sources with a rate-limit bucket. Preallocated (LRU): ~100 bytes each
+/// with the kernel's per-element overhead, **estimated** ~25 MiB. Past it
+/// the least recently seen source loses its bucket (and starts full again).
+pub const RATE_SOURCES: u32 = 1 << 18;
+/// Dropped sources remembered for the top-sources table (LRU).
+pub const TOP_SOURCES: u32 = 1 << 14;
+/// Interfaces × reasons of the counters map.
+pub const MAX_INTERFACES: u32 = 256;
+pub const COUNTER_ENTRIES: u32 = MAX_INTERFACES * Reason::ALL.len() as u32;
+/// Array slots of `SETTINGS`.
+pub const SETTINGS_SLOTS: u32 = 8;
+
+/// `[packets, bytes]`, per CPU.
+pub type Counter = [u64; 2];
+/// `[packets, bytes, last_ns, last reason | block list index << 8]`, per
+/// CPU (the loader sums the counts and keeps the latest tag).
+pub type Top = [u64; 4];
+
+/// The counters map key of interface `ifindex`, reason `reason`.
+pub fn counter_key(ifindex: u32, reason: Reason) -> u64 {
+    (u64::from(ifindex) << 8) | reason as u64
+}
+
+/// Back from [`counter_key`].
+pub fn split_counter_key(key: u64) -> (u32, Option<Reason>) {
+    let ifindex = u32::try_from(key >> 8).unwrap_or(u32::MAX);
+    (ifindex, Reason::from_u8((key & 0xff) as u8))
+}
+
+/// The last word of [`Top`].
+pub fn top_tag(reason: Reason, list: Option<u32>) -> u64 {
+    let list = u64::from(list.map_or(0xff_ffff, |l| l.min(0xff_fffe)));
+    reason as u64 | (list << 8)
+}
+
+/// Back from [`top_tag`].
+pub fn split_top_tag(tag: u64) -> (Option<Reason>, Option<u32>) {
+    let list = u32::try_from((tag >> 8) & 0xff_ffff).unwrap_or(0xff_ffff);
+    (
+        Reason::from_u8((tag & 0xff) as u8),
+        (list != 0xff_ffff).then_some(list),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keys_round_trip() {
+        for r in Reason::ALL {
+            assert_eq!(split_counter_key(counter_key(7, r)), (7, Some(r)));
+            assert_eq!(split_top_tag(top_tag(r, Some(3))), (Some(r), Some(3)));
+            assert_eq!(split_top_tag(top_tag(r, None)), (Some(r), None));
+        }
+    }
+}

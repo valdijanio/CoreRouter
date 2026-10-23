@@ -54,6 +54,9 @@ pub struct System {
     /// `/system analytics` (G4.4f): export to an external ClickHouse.
     #[serde(skip_serializing_if = "crate::analytics::Analytics::is_default")]
     pub analytics: crate::analytics::Analytics,
+    /// `/tool bandwidth-server` (G6.4b): iperf3 tests against the router.
+    #[serde(skip_serializing_if = "crate::bandwidth::BandwidthServer::is_default")]
+    pub bandwidth_server: crate::bandwidth::BandwidthServer,
     /// `/tool graphing` (G4.5): what the traffic history keeps.
     #[serde(skip_serializing_if = "crate::graphing::Graphing::is_default")]
     pub graphing: crate::graphing::Graphing,
@@ -68,6 +71,7 @@ impl Default for System {
             metrics: MetricsService::default(),
             tuning: crate::tuning::Tuning::default(),
             analytics: crate::analytics::Analytics::default(),
+            bandwidth_server: crate::bandwidth::BandwidthServer::default(),
             graphing: crate::graphing::Graphing::default(),
         }
     }
@@ -251,6 +255,9 @@ pub struct Ip {
     /// `/ip firewall` (G2.1): filter, nat, mangle and address lists,
     /// IPv4 and IPv6 together.
     pub firewall: CowArc<Firewall>,
+    /// `ip.firewall.xdp` (G2.5a): the filter in the NIC driver.
+    #[serde(skip_serializing_if = "crate::xdp::Xdp::is_default")]
+    pub xdp: crate::xdp::Xdp,
     /// `/ip dns adlist` (G4.1d): block lists of the LAN forwarder.
     #[serde(skip_serializing_if = "crate::dns_adlist::DnsAdlist::is_empty")]
     pub dns_adlist: crate::dns_adlist::DnsAdlist,
@@ -285,6 +292,9 @@ pub struct Ip {
     /// `/ip firewall cgnat` (G2.3): CGNAT pools and 1:1 exceptions.
     #[serde(skip_serializing_if = "crate::cgnat::Cgnat::is_empty")]
     pub cgnat: crate::cgnat::Cgnat,
+    /// `/ip firewall fastpath` (G2.4): the flowtable.
+    #[serde(skip_serializing_if = "crate::fastpath::FastPath::is_empty")]
+    pub fastpath: crate::fastpath::FastPath,
     /// `/ip traffic-flow` (G4.4b): IPFIX / NetFlow v9 export.
     #[serde(skip_serializing_if = "crate::traffic_flow::TrafficFlow::is_default")]
     pub traffic_flow: crate::traffic_flow::TrafficFlow,
