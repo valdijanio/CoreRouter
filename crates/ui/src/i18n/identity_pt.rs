@@ -17,8 +17,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Sources, in order", "Fontes, em ordem"),
     ("Static lease comment", "Comentário da concessão fixa"),
     ("Subscriber identity", "Identidade do assinante"),
-    ("Try earlier", "Tentar antes"),
-    ("Try later", "Tentar depois"),
+    ("Tried first", "Já é a primeira"),
+    ("Tried last", "Já é a última"),
     ("soon: G4.3", "em breve: G4.3"),
 ];
 

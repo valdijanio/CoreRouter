@@ -40,6 +40,38 @@ operadora e começa a outra).
 - O texto do selo é curto (`AS7162 UOL`); o nome completo vai no tooltip.
 - Nunca use a cor como a única informação: o texto do selo diz o que é.
 
+## Selo de identidade do assinante (G0.25)
+
+Ao lado de um endereço IP que pode ser de um assinante, o nome dele num selo azul com o ícone de
+crachá (`IDENTIFICATION_BADGE` do Phosphor, o equivalente ao `ti-user`): `100.64.0.1 [crachá João
+Pereira] +2`. Código: `crates/ui/src/identity.rs`; dados: `ip.identity.lookup`.
+
+- **O selo é a primeira fonte com nome**, na ordem de Settings › Subscriber identity; os outros
+  nomes diferentes viram um selo neutro `+N`. O nome chega limpo e cortado pelo engine (64
+  caracteres, sem controle nem bidi).
+- **Tooltip** lista todos os nomes, cada um com a fonte e o detalhe (MAC, lista, zona), e o passo do
+  CGNAT quando houve (`203.0.113.0:1100 → 100.64.0.0`).
+- **Clique** abre o item de origem com ele selecionado: a concessão (DHCP Server › Leases), o
+  endereço (IP › Addresses), a entrada (Firewall › Address Lists) ou o registro PTR (DNS › Zones ›
+  Records).
+- Sem nome conhecido: nada (o endereço sozinho). O nome é pedido em lote no refresh seguinte e
+  guardado 30 s; uma janela nunca pede endereço a endereço.
+- **Onde aparece** é preferência do cliente (Settings › Subscriber identity › Show in), como os
+  idiomas: cada tela passa a sua chave (`torch`, `connections`, `traffic-flow`, `cgnat`, `leases`,
+  `mtr`).
+
+Como usar numa janela:
+
+- **Numa tabela:** `identity::add_chips(app, ui, "<tela>", &mut row, coluna, &ip)` depois de montar
+  a linha, e `identity::table_chip(app, ui, "<tela>", &out, &rows, |chave| ip_da_linha)` depois do
+  `table::show` (tooltip e clique; o `TableOutput.chip` diz qual selo está sob o ponteiro).
+- **Fora de tabela** (formulário, linha de resultado como o Quem era?):
+  `identity::badge(app, ui, "<tela>", &ip)`.
+- IP público com porta (`203.0.113.5:40001`) vai como está: o engine passa pelo CGNAT.
+
+Um selo de célula com ícone: um rótulo que começa por um code point de uso privado (os do
+`icons.rs`) é desenhado com esse ícone na fonte de ícones (`chip::label_galley`).
+
 ## Tabelas
 
 - Uma linha por item, todas com a mesma altura; o valor longo termina em `…` com o completo no

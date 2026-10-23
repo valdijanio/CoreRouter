@@ -181,16 +181,15 @@ impl Identity {
             for (i, (src, on)) in self.order.iter_mut().enumerate() {
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
-                    ui.add_enabled_ui(i > 0, |ui| {
-                        if ui.small_button("↑").on_hover_text(tr(l, "Try earlier")).clicked() {
-                            swap = Some((i, i - 1));
-                        }
-                    });
-                    ui.add_enabled_ui(i < last, |ui| {
-                        if ui.small_button("↓").on_hover_text(tr(l, "Try later")).clicked() {
-                            swap = Some((i, i + 1));
-                        }
-                    });
+                    let salt = format!("identity-source-{i}");
+                    let first = if i > 0 { Ok(()) } else { Err(tr(l, "Tried first").to_owned()) };
+                    if crate::firewall::arrow(ui, &salt, true, first) {
+                        swap = Some((i, i - 1));
+                    }
+                    let last_one = if i < last { Ok(()) } else { Err(tr(l, "Tried last").to_owned()) };
+                    if crate::firewall::arrow(ui, &salt, false, last_one) {
+                        swap = Some((i, i + 1));
+                    }
                     let label = SOURCES.iter().find(|(s, _)| s == src).map_or(*src, |(_, l)| l);
                     let text = if *src == "pppoe" {
                         format!("{} ({})", tr(l, label), tr(l, "soon: G4.3"))
