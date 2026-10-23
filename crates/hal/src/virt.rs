@@ -55,6 +55,8 @@ pub struct VirtualHal {
     reenabled: BTreeMap<IfName, u32>,
     /// Lab connections killed (G2.2), by id.
     killed: std::collections::BTreeSet<u32>,
+    /// CGNAT blocks the engine installed (G2.3c), by (pool, subscriber).
+    blocks: BTreeMap<(corerouter_model::ItemId, std::net::Ipv4Addr), corerouter_model::cgnat::Slot>,
     /// The lab's "kernel" (G1.3): what each apply left, which a test (or
     /// a lab script) can change behind CoreRouter's back to make drift.
     kernel: LabKernel,
@@ -149,6 +151,7 @@ impl VirtualHal {
             dhcp6_hosts: None,
             reenabled: BTreeMap::new(),
             killed: std::collections::BTreeSet::new(),
+            blocks: BTreeMap::new(),
             kernel: Arc::new(Mutex::new(kernel)),
         }
     }
@@ -412,8 +415,30 @@ impl Hal for VirtualHal {
             .collect())
     }
 
+    fn cgnat_blocks(&mut self, changes: &[crate::cgnat::BlockChange]) -> Result<(), HalError> {
+        for c in changes {
+            match c.slot {
+                Some(slot) => {
+                    self.blocks.insert((c.pool, c.subscriber), slot);
+                }
+                None => {
+                    self.blocks.remove(&(c.pool, c.subscriber));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn cgnat_waiting(&mut self) -> Vec<crate::cgnat::Waiting> {
+        crate::lab_conntrack::waiting(&self.applied, &self.blocks)
+    }
+
     fn connections(&mut self) -> Result<Vec<crate::conntrack::Conn>, HalError> {
-        Ok(crate::lab_conntrack::table(&self.applied, &self.killed))
+        Ok(crate::lab_conntrack::table(
+            &self.applied,
+            &self.killed,
+            &self.blocks,
+        ))
     }
 
     /// A lab that looks alive: the load and the table follow slow waves of
@@ -439,13 +464,13 @@ impl Hal for VirtualHal {
     }
 
     fn connection_stats(&mut self) -> Result<crate::conntrack::Stats, HalError> {
-        let n = crate::lab_conntrack::table(&self.applied, &self.killed).len();
+        let n = crate::lab_conntrack::table(&self.applied, &self.killed, &self.blocks).len();
         Ok(crate::lab_conntrack::stats(n))
     }
 
     fn connections_kill(&mut self, conns: &[crate::conntrack::Conn]) -> Result<usize, HalError> {
         let live: std::collections::BTreeSet<u32> =
-            crate::lab_conntrack::table(&self.applied, &self.killed)
+            crate::lab_conntrack::table(&self.applied, &self.killed, &self.blocks)
                 .iter()
                 .map(|c| c.id)
                 .collect();

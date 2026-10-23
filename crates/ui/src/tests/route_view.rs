@@ -238,3 +238,84 @@ fn the_selected_route_shows_its_detail() {
     h.idle();
     assert!(!h.has_text("Chosen"));
 }
+
+// ---- G1.27c: a full table, page by page ----
+
+/// The Routes window over a table of `n` routes (no connected ones but
+/// ether1's two networks).
+fn big(n: usize) -> Harness {
+    let s = corerouter_engine::perf::with_running(corerouter_engine::perf::full_table(n));
+    let mut h = Harness::with_session(s);
+    h.app.open.clear();
+    h.app.open(Win::Routes);
+    h.app.cache.refreshed_at = None;
+    h.idle();
+    h.idle();
+    h
+}
+
+#[test]
+fn a_big_table_comes_a_page_at_a_time() {
+    let mut h = big(1_200);
+    assert_eq!(h.app.cache.routes.len(), crate::routes::PAGE, "one page only");
+    assert!(h.has_text_containing("1–500 of 1202"), "the pager");
+    assert!(h.has_text("1202 routes"), "the counts are the whole table's");
+    h.click(h.text(">"));
+    h.idle();
+    assert_eq!(h.app.route_view.page, Some((1202, 500)), "{:?}", h.app.route_view.offset);
+    assert!(h.has_text_containing("501–1000 of 1202"));
+    assert_eq!(h.app.route_view.offset, 500);
+    // A filter goes back to the first page.
+    h.click(topmost(&h, "IPv6"));
+    h.idle();
+    assert_eq!(h.app.route_view.offset, 0);
+    assert!(h.app.cache.routes.iter().all(|r| r["family"] == "ipv6"));
+}
+
+#[test]
+fn aggregate_lines_open_on_a_click() {
+    let mut h = big(600);
+    h.click(h.text("aggregate /16"));
+    h.idle();
+    assert!(h.app.cache.routes.iter().any(|r| r["bucket"] == true));
+    // 11.0.0.0/16: its /24s folded (the route 11.0.0.0/16 itself stays).
+    let bucket = "bucket main 11.0.0.0/16";
+    assert!(h.has_text_containing("routes"), "the bucket says how many");
+    h.click(h.route_row(bucket));
+    h.idle();
+    assert_eq!(h.app.route_view.prefix, "11.0.0.0/16");
+    assert!(!h.app.route_view.aggregate);
+    assert!(h.app.cache.routes.iter().all(|r| r["dst_address"]
+        .as_str()
+        .unwrap()
+        .starts_with("11.0.")));
+    // Clearing the search goes back to the aggregated view.
+    h.click(h.text("x"));
+    h.idle();
+    assert!(h.app.route_view.aggregate && h.app.route_view.prefix.is_empty());
+}
+
+#[test]
+fn the_prefix_search_asks_the_router() {
+    let mut h = big(600);
+    h.click(h.text("10.0.0.0/8"));
+    h.type_text("11.0.2.0/24");
+    h.key(egui::Key::Enter, egui::Modifiers::NONE);
+    h.idle();
+    let dsts: Vec<&str> = h
+        .app
+        .cache
+        .routes
+        .iter()
+        .filter_map(|r| r["dst_address"].as_str())
+        .collect();
+    assert_eq!(dsts, ["11.0.2.0/24"]);
+    // What contains it: the /16 and the /24.
+    h.click(topmost(&h, "contains"));
+    h.idle();
+    assert_eq!(h.app.cache.routes.len(), 2, "{:?}", h.app.cache.routes);
+    // A typo is not sent (the table keeps its rows).
+    assert!(!crate::routes::valid_prefix("11.0.1.0/33"));
+    assert!(crate::routes::valid_prefix("2001:db8::/32"));
+    assert!(crate::routes::valid_prefix(" 8.8.8.8 "));
+}

@@ -93,6 +93,34 @@ mostra `ip.route.detail {key}`:
 O painel pede o detalhe junto com cada atualização da janela (um painel sem janela própria,
 `ui/src/route_detail.rs`), só enquanto a janela Routes está aberta e há uma rota selecionada.
 
+## Tabela cheia (`ip.route.page`, G1.27c)
+
+Para uma tabela do tamanho de um BGP full table (~1 milhão de rotas), a janela não recebe mais a lista
+inteira: pede `ip.route.page` com os filtros dela e recebe **uma página** (500 linhas), quantas linhas
+casam (`total`) e as **contagens da tabela inteira** (`summary`: estados, famílias, por origem, por
+tabela). O `ip.route.list` continua igual para quem quer tudo (CLI, MCP, um daemon antigo).
+
+- **Busca por prefixo** (`prefix` + `match`), com os nomes do Junos e o `ip route show
+  root|match|exact` do Linux: `exact`; `longer` (só os mais específicos); `orlonger` (ele e os mais
+  específicos: "contido", o padrão para um prefixo); `covering` (os que o contêm: "contém", o padrão
+  para um endereço — os candidatos de um lookup).
+- **Agregação** (`aggregate`): as rotas mais longas que /16 (IPv6 /32) viram uma linha por /16 com
+  quantas são e em que estado; um clique nela abre o /16 (busca `contido` daquele prefixo) e o `x`
+  da busca volta para a vista agregada.
+- **Páginas:** `offset`/`limit` (até 5000); a janela mostra "1–500 de 1 000 000" com `<` e `>`.
+- **Sem varrer tudo a cada leitura:** o engine guarda as linhas calculadas (`RouteCache`) e só refaz
+  quando muda algo de que elas dependem: a geração do candidato (`ConfigStore::generation`, nova a
+  cada escrita), o que os clientes DHCP/DHCPv6 instalaram, o que o kernel aprendeu por RA, os links
+  sem carrier e os check-gateway. As contagens vêm junto com as linhas. Uma rota de lease retida
+  pelo check-gateway (o motivo diz "há N s") faz refazer sempre.
+- **Na GUI:** as linhas da tabela são montadas uma vez por resposta (ou por filtro/grupo aberto), não
+  por quadro (a lição da G1.25); os diálogos não releem a lista quando não há nenhum aberto.
+
+Números (**medido**, release, 1 M de rotas): uma página com as linhas guardadas custa 4–12 ms
+(primeira, última, com prefixo, só inativas, agregada); refazer as linhas, 0,79 s; o quadro da GUI
+com a tabela aberta, 0,8 ms (antes: 4,47 s por quadro, recebendo e desenhando a lista inteira).
+Detalhes em `docs/perf.md`.
+
 ## Pesquisa
 
 Fontes lidas em 2026-10-23 (resumo completo nas notas da sessão):
@@ -148,7 +176,12 @@ Cisco, "Known via" e um bloco por caminho ECMP. Adotado: a origem com a revisão
 o CoreRouter tem: tudo é comando), a escolha comparada com as concorrentes, as trocas das últimas
 24 h (o FRR e o Junos só dão a idade da última) e a comparação com o kernel por rota.
 
+**Parte c (escala):** o Junos busca por `exact | longer | orlonger` e conta com `show route
+summary`; o FRR conta com `show ip route summary`; o Linux tem `ip route show root|match|exact`; o
+WinBox carrega a tabela toda (lento com um full table, relato comum em fórum). Adotado: os modos do
+Junos com nomes do operador na GUI (contido, contém, exato), a contagem por origem sempre à mão, a
+agregação por /16 que abre sob demanda e a paginação no engine.
+
 **Ficou para depois:** a janela Nexthops (`/routing nexthop`: estado por gateway, flaps); a vista
 RIB × FIB do Junos/FRR (selecionada × instalada); regras de política (G1.27e); vizinhos ARP/ND para
-o `incomplete` (G1.27d); busca por prefixo contém/contido e escala para a tabela cheia (G1.27c);
-avisos ao criar uma rota que esconde outra (RFC 4632) ou com distância 255.
+o `incomplete` (G1.27d); avisos ao criar uma rota que esconde outra (RFC 4632) ou com distância 255.

@@ -5,7 +5,7 @@ log por conexão. Determinístico por padrão (RFC 7422); por blocos sob demanda
 (G2.3c). O "Quem era?" responde IP público + porta + data/hora → assinante, que é o que o Marco
 Civil (Lei 12.965/2014, art. 13) cobra do provedor de conexão.
 
-Estado: **G2.3a** e **G2.3b** (este documento descreve o que entrou e o plano das partes seguintes).
+Estado: **G2.3a**, **G2.3b** e **G2.3c** (este documento descreve o que entrou e o plano das partes seguintes).
 
 ## 1. Como funciona
 
@@ -203,6 +203,76 @@ Depois de aplicar, o `hal-linux` faz duas coisas:
 
 Aumentar a faixa de assinantes no fim não remapeia ninguém e não derruba nada.
 
+### 1.7 Modo blocos (PBA, G2.3c)
+
+`mode: blocks` dá a cada assinante, **sob demanda**, um bloco de `ports_per_subscriber` portas, com a
+mesma geometria da fórmula (`Layout::block`). A RFC 6888 §5 (REQ-13/14) e a RFC 7422 §1 tratam disso.
+
+**Primeiro pacote:**
+
+- Um assinante sem bloco tem o primeiro pacote segurado numa fila do netfilter, a número **7422**,
+  por uma regra `filter` em `postrouting` com prioridade `srcnat - 10`.
+- O serviço `cgnat` do daemon atende a fila: pede o bloco ao engine (`Session::cgnat_block_for`), que
+  o põe no mapa `d_<id>` do kernel, e solta o pacote.
+- O pacote segue para o NAT e já acha o elemento. Medido em netns.
+- Sem ninguém atendendo a fila, o pacote **cai**. Ele nunca sai com o IP privado: a regra não tem
+  `bypass`.
+- Sem bloco livre, ou com o assinante no máximo de blocos, o pacote cai também (RFC 6888 REQ-11). O
+  ICMP code 1 da REQ-11b é a G2.7.
+
+**Pareado (REQ-2):** todos os blocos de um assinante ficam no mesmo IP público. O primeiro vai para o
+IP com menos blocos.
+
+**Cresce:** quando o bloco atual passa de 80 % de uso (o protocolo mais cheio), o assinante ganha
+outro, até `max_blocks`. As conexões novas vão para o novo; as velhas continuam no antigo.
+
+**Solta e segura:**
+
+- Um bloco sem conexão por `block_timeout` é liberado.
+- O bloco liberado não vai para ninguém por **120 s** (RFC 6888 REQ-8), para uma conexão atrasada não
+  cair noutro assinante.
+- Quando a geometria do pool muda (outras portas, outros IPs), os blocos velhos são liberados na hora,
+  sem quarentena, e as conexões deles são derrubadas, como num remapeamento determinístico.
+
+**Log por bloco:**
+
+- Cada alocação e liberação vira uma linha no log do roteador, tópico `cgnat`:
+  - `ALLOC 100.64.0.9 -> 203.0.113.1:1024-2023 pool pba (first packet)`;
+  - `RELEASE … (idle)`.
+- Para mandar ao syslog remoto (RFC 5424):
+  - `system.logging.action.add {name: "isp", remote: <ip>}`;
+  - `system.logging.add {topics: ["cgnat"], action: "isp"}`.
+- O mesmo vai no journal `journal-cgnat-blocks.log`, que o "Quem era?" lê e que reconstrói os blocos
+  no boot. No boot, os blocos são reinstalados no kernel antes de qualquer alocação nova.
+- O formato segue a RFC 6888 §4: assinante, IP externo, faixa de portas e data; sem destino
+  (REQ-12).
+
+**Quem era? em blocos:** o bloco que cobria aquela porta daquele IP naquela hora, pelo histórico de
+blocos (`ip.firewall.cgnat.block.history`).
+
+### 1.8 Alerta de portas esgotadas
+
+Vale para os dois modos (RFC 7422 §2.2).
+
+**O que conta:** a cada 10 s, o engine lê o conntrack e conta, por assinante, as portas públicas
+distintas em uso, por protocolo; vale o protocolo mais cheio.
+
+**Quando dispara:**
+
+- no modo determinístico, quando o assinante passa de `alert_percent` (padrão 90 %) do seu slot;
+- no modo blocos, quando ele já está no máximo de blocos.
+
+**O que fica registrado:**
+
+- Cada **travessia** do limite vira uma linha `warning` no log, tópico `cgnat`.
+- A travessia também entra em `ip.firewall.cgnat.alert.list`, com:
+  - portas usadas, % e pico;
+  - quantas vezes cruzou;
+  - primeira e última vez.
+
+O kernel não avisa quando uma conexão nova não acha porta livre: só conta em `insert_failed`. O alerta
+mostra o crescimento desse contador desde o início.
+
 ## 2. Comandos
 
 | Comando | O que faz |
@@ -215,6 +285,9 @@ Aumentar a faixa de assinantes no fim não remapeia ninguém e não derruba nada
 | `ip.firewall.cgnat.mapping.list {pool, offset?, count?, subscriber?, public?}` | tabela de correspondência por página (≤ 5000 linhas) |
 | `ip.firewall.cgnat.history.list` | as épocas (RFC 7422 §3) |
 | `ip.firewall.cgnat.rules {pool?}` | o nftables gerado |
+| `ip.firewall.cgnat.block.list {pool?, subscriber?}` | blocos ativos (modo blocos), o atual de cada assinante e há quanto tempo está ocioso |
+| `ip.firewall.cgnat.block.history {subscriber?, public?, port?, from?, to?}` | o log de blocos (alocação e liberação) |
+| `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel |
 
 Exemplo:
 
@@ -240,6 +313,13 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
   - modo transacional;
   - o histórico atravessando um reinício.
 - **Parâmetros lixo:** o `command_sweep` cobre.
+- **Blocos (`crates/engine/tests/cgnat_blocks.rs`, no lab):**
+  - os assinantes "online" do lab recebem blocos pareados, espalhados pelos IPs;
+  - os pesados ganham um segundo bloco no mesmo IP;
+  - o ocioso solta o bloco, com log, e não recebe o mesmo de volta antes de 120 s;
+  - os blocos sobrevivem a um reinício;
+  - pool esgotado recusa; pool mudado solta;
+  - alertas: uma linha por travessia.
 - **Kernel (`crates/hal-linux/tests/netns_cgnat.rs`, netns sem root):**
   - assinantes num namespace saem pelo NAT deste até um servidor num terceiro;
   - UDP, TCP e ICMP saem no IP e na faixa da fórmula, e a volta da fórmula sobre o que o servidor
@@ -248,7 +328,9 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
   - EIM: a mesma porta pública para dois destinos;
   - EIF: um estranho alcança o mapeamento;
   - hairpin: quem recebe vê o IP público de quem mandou;
-  - tirar os pools apaga a tabela.
+  - tirar os pools apaga a tabela;
+  - modo blocos: sem ouvinte da fila, o primeiro pacote cai; com ouvinte, sai no bloco alocado; o
+    bloco sobrevive à troca da tabela.
 
 ## 4. Plano das próximas partes
 
@@ -256,7 +338,7 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
 |---|---|
 | G2.3b (feito) | nftables por nfnetlink, sem o binário `nft`; diferença de elementos; uma regra para todos os protocolos; remapeados derrubados e mapeamentos UDP esquecidos; números em `docs/architecture.md` §1.2.1 |
 | G2.2a | IP › Firewall › Connections (ctnetlink: lista, filtros, assinantes com mais conexões, kill, timeouts, uso da tabela, coluna Via) |
-| G2.3c | Modo blocos (PBA): blocos sob demanda, log por bloco (log do roteador + syslog), "Quem era?" pelo histórico de blocos, alerta de portas esgotadas por assinante |
+| G2.3c (feito) | Modo blocos (fila 7422 + alocador pareado, cresce, solta com quarentena de 120 s), log por bloco (log do roteador e syslog), "Quem era?" pelo histórico de blocos, alerta de portas |
 | G2.3d | Janela IP › Firewall › CGNAT: pools, exceções, Quem era?, mapeamento, histórico, alertas; ⓘ em cada campo |
 | G6.9a | Tools › IP Calculator: Subnet, IPv6/PD, CGNAT planner (criar pool, exportar, ver regras, script RouterOS) |
 | G2.4a | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |

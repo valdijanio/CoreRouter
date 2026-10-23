@@ -261,6 +261,28 @@ impl Session {
             });
         };
         let since = epoch.t;
+        // Blocks mode: the block log answers (who held the block then).
+        let blocks_pool = epoch
+            .cgnat
+            .pools
+            .iter()
+            .find(|p| !p.disabled && p.mode == Mode::Blocks && p.outside.iter().any(|r| r.contains(public)))
+            .map(|p| p.name.clone());
+        if let Some(name) = blocks_pool {
+            let Some(r) = self.cgnat_block_who_was(public, port, t) else {
+                return Err(format!(
+                    "no block of pool '{name}' held port {port} of {public} at that time"
+                ));
+            };
+            return Ok(WhoWas {
+                subscriber: r.subscriber,
+                via: r.pool,
+                mode: Mode::Blocks.as_str(),
+                slot: r.slot,
+                since: r.from,
+                until: r.until,
+            });
+        }
         let (subscriber, via, mode, slot) = lookup(&epoch.cgnat, public, port)?;
         Ok(WhoWas {
             subscriber,

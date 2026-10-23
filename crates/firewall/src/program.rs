@@ -316,10 +316,17 @@ pub enum Expr {
         dir: Option<Dir>,
         dreg: u32,
     },
+    /// Set (or map key) membership; `inv`: not a member.
     Lookup {
         set: String,
         sreg: u32,
         dreg: Option<u32>,
+        inv: bool,
+    },
+    /// `queue num <num>` (no bypass: without a listener the packet is
+    /// dropped, never let through untranslated).
+    Queue {
+        num: u16,
     },
     Nat {
         kind: NatKind,
