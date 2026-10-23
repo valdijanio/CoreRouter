@@ -80,3 +80,23 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
   cai para o texto do engine; um teste confere que todo id do engine tem modelo em PT com os mesmos
   argumentos.
 - Os rótulos das janelas antigas ainda não passam pelo `tr` (G0.15b).
+
+## Menu lateral e ícones (G0.23)
+
+- Toda janela tem **entrada em `crates/ui/src/menu.rs`** (`CATALOG`): subgrupo (`DHCP`, `DNS`)
+  quando o grupo passaria de ~8 itens soltos, rótulo curto dentro do subgrupo ("Static" em
+  IP › DNS; o título da janela continua "DNS Static"), ícone, caminho no RouterOS, prefixos dos
+  comandos e sinônimos de busca. Janela nova sem entrada reprova o teste do menu.
+- **Ícones só do Phosphor** (`crates/ui/src/icons.rs`), nunca emoji nem glifo solto: a fonte da
+  GUI não tem a maioria. Ícone novo: constante em `icons.rs` + `scripts/icons-subset.sh`.
+  Escolha pelo que a janela **é**: servidor (`HARD_DRIVES`), cliente (`LAPTOP`), escudo
+  (firewall), placa de rua (rotas), globo (DNS), coração (Services), medidor (Tuning).
+- Grupos principais em negrito com ícone; subgrupo recolhido mostra a contagem num selo neutro;
+  área ainda sem comandos aparece apagada, com cadeado e o selo `soon`.
+- A explicação de uma janela (ⓘ do item selecionado) é `menu.<chave>` nos catálogos
+  `i18n/menu_en.rs` e `i18n/menu_pt.rs`; caminho do RouterOS e comandos o modal acrescenta sozinho.
+
+- **Busca** (campo do menu e Ctrl+K, `crates/ui/src/menu_search.rs`): acha pelo título, rótulo,
+  lugar no menu, caminho do RouterOS e sinônimos da entrada. Janela nova: ponha nos sinônimos as
+  palavras que o operador usaria (inclusive em português e o nome em outros roteadores). Atalhos:
+  `/` foca a busca, Ctrl+K abre a paleta; nenhuma janela deve usar esses dois.

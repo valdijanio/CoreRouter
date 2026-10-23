@@ -25,7 +25,7 @@ use rtnetlink::packet_route::link::{
     InfoVlan, InfoVrf, LinkAttribute, LinkFlags, LinkInfo, LinkMessage, State,
 };
 use rtnetlink::packet_route::route::{
-    RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
+    RouteAddress, RouteAttribute, RouteMessage, RouteNextHop, RouteProtocol, RouteScope,
 };
 use rtnetlink::{
     AddressMessageBuilder, Handle, LinkBond, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec,
@@ -52,12 +52,20 @@ const PROBE_TABLE: u32 = 0xFFFF_FFF0;
 /// Names `probe_vrf` tries before giving up (each taken one is skipped).
 const PROBE_TRIES: u32 = 8;
 
-/// Run `ops` against the kernel of the current network namespace.
-pub(crate) fn apply(ops: &[Op]) -> Result<(), HalError> {
+/// Run `ops` against the kernel of the current network namespace. `owned`
+/// are the static routes (per path) CoreRouter puts there, before and
+/// after: only those are ever merged into one ECMP route with a new path.
+pub(crate) fn apply(
+    ops: &[Op],
+    owned: &std::collections::BTreeSet<KernelRoute>,
+) -> Result<(), HalError> {
     if ops.is_empty() {
         return Ok(());
     }
-    with_kernel(|k| async move { run(&k, ops).await })
+    with_kernel(|mut k| async move {
+        k.owned = owned.clone();
+        run(&k, ops).await
+    })
 }
 
 /// Every link of the current network namespace (`RTM_GETLINK` dump): the
@@ -287,6 +295,13 @@ pub(crate) fn held(
     with_kernel(|k| async move { k.held(names).await.map_err(HalError::Io) })
 }
 
+/// `ip route get <dst> [from <src>] table <t>` (G1.27).
+pub(crate) fn route_get(
+    q: &corerouter_hal::route_get::RouteQuery,
+) -> Result<corerouter_hal::route_get::KernelLookup, HalError> {
+    with_kernel(|k| async move { k.route_get(q).await.map_err(HalError::Io) })
+}
+
 /// A configured (permanent) address of `m`, as a prefix.
 fn configured_address(m: &AddressMessage) -> Option<IpNet> {
     let mut permanent = m.header.flags.contains(AddressHeaderFlags::Permanent);
@@ -307,17 +322,19 @@ fn configured_address(m: &AddressMessage) -> Option<IpNet> {
     IpNet::new(local.or(address)?, m.header.prefix_len).ok()
 }
 
-/// A static unicast route of `m`, given the link names by index.
-fn static_route(
+/// The static unicast route of `m` as one entry per next hop (a multipath
+/// route has several), given the link names by index.
+fn static_routes(
     m: &RouteMessage,
     names: &std::collections::BTreeMap<u32, IfName>,
-) -> Option<KernelRoute> {
+) -> Vec<KernelRoute> {
     let h = &m.header;
     if h.protocol != RouteProtocol::Static {
-        return None;
+        return Vec::new();
     }
     let mut table = u32::from(h.table);
     let (mut dst, mut gateway, mut oif, mut metric) = (None, None, None, 0);
+    let mut multipath: &[RouteNextHop] = &[];
     for a in &m.attributes {
         match a {
             RouteAttribute::Table(t) => table = *t,
@@ -325,6 +342,7 @@ fn static_route(
             RouteAttribute::Gateway(g) => gateway = ip_of(g),
             RouteAttribute::Oif(i) => oif = Some(*i),
             RouteAttribute::Priority(p) => metric = *p,
+            RouteAttribute::MultiPath(hops) => multipath = hops,
             _ => {}
         }
     }
@@ -333,15 +351,33 @@ fn static_route(
         (Some(d), _) => d,
         (None, AddressFamily::Inet) => IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         (None, AddressFamily::Inet6) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
-        (None, _) => return None,
+        (None, _) => return Vec::new(),
     };
-    Some(KernelRoute {
-        table,
-        dst: IpNet::new(dst, h.destination_prefix_length).ok()?,
-        metric,
-        link: names.get(&oif?)?.clone(),
-        gateway,
-    })
+    let Ok(dst) = IpNet::new(dst, h.destination_prefix_length) else {
+        return Vec::new();
+    };
+    let hop = |index: u32, gateway: Option<IpAddr>| {
+        Some(KernelRoute {
+            table,
+            dst,
+            metric,
+            link: names.get(&index)?.clone(),
+            gateway,
+        })
+    };
+    if multipath.is_empty() {
+        return oif.and_then(|i| hop(i, gateway)).into_iter().collect();
+    }
+    multipath
+        .iter()
+        .filter_map(|nh| {
+            let gw = nh.attributes.iter().find_map(|a| match a {
+                RouteAttribute::Gateway(g) => ip_of(g),
+                _ => None,
+            });
+            hop(nh.interface_index, gw)
+        })
+        .collect()
 }
 
 fn infinite_or(secs: u32) -> Option<u32> {
@@ -416,7 +452,12 @@ where
         let (conn, handle, _) = rtnetlink::new_connection()
             .map_err(|e| HalError::Io(format!("netlink socket: {e}")))?;
         let task = tokio::spawn(conn);
-        let out = f(Kernel { handle }).await;
+        let out = f(Kernel {
+            handle,
+            hops: std::cell::RefCell::new(None),
+            owned: std::collections::BTreeSet::new(),
+        })
+        .await;
         task.abort();
         out
     })
@@ -588,8 +629,23 @@ fn readable(e: &rtnetlink::Error) -> String {
     }
 }
 
+/// Static routes per (table, prefix, metric): the paths of one kernel route.
+type Paths = std::collections::HashMap<(u32, IpNet, u32), Vec<KernelRoute>>;
+
+fn group_of(r: &KernelRoute) -> (u32, IpNet, u32) {
+    (r.table, r.dst, r.metric)
+}
+
 struct Kernel {
     handle: Handle,
+    /// The kernel's static routes, one entry per next hop, read at the
+    /// first route op of a run and kept up to date by the run's own route
+    /// ops (G1.27: an ECMP group is one multipath route in the kernel, so
+    /// adding or removing one path rewrites the route with its siblings).
+    hops: std::cell::RefCell<Option<Paths>>,
+    /// Paths that are CoreRouter's (see [`apply`]); another program's
+    /// route with the same prefix and metric is never merged with ours.
+    owned: std::collections::BTreeSet<KernelRoute>,
 }
 
 impl Kernel {
@@ -961,8 +1017,229 @@ impl Kernel {
         }
     }
 
+    async fn route_get(
+        &self,
+        q: &corerouter_hal::route_get::RouteQuery,
+    ) -> Result<corerouter_hal::route_get::KernelLookup, String> {
+        use corerouter_hal::route_get::{KernelHop, KernelLookup, RouteKind};
+        use rtnetlink::packet_route::route::{RouteFlags, RouteType};
+        const ENETUNREACH: i32 = 101;
+        const EHOSTUNREACH: i32 = 113;
+        let full = if q.dst.is_ipv4() { 32 } else { 128 };
+        let ask = |fib_match: bool| -> Result<RouteMessage, String> {
+            let b = RouteMessageBuilder::<IpAddr>::new()
+                .destination_prefix(q.dst, full)
+                .map_err(|e| e.to_string())?
+                .table_id(q.table);
+            let b = match q.src {
+                Some(s) => b.source_prefix(s, full).map_err(|e| e.to_string())?,
+                None => b,
+            };
+            let mut m = b.build();
+            m.header.flags |= RouteFlags::LookupTable;
+            if fib_match {
+                m.header.flags |= RouteFlags::FibMatch;
+            }
+            Ok(m)
+        };
+        let unreachable = KernelLookup {
+            kind: RouteKind::Unreachable,
+            prefix: None,
+            hops: Vec::new(),
+            src: None,
+            table: q.table,
+        };
+        let get = |m: RouteMessage| async move {
+            let mut s = self.handle.route().get(m).execute();
+            s.try_next().await
+        };
+        let resolved = match get(ask(false)?).await {
+            Ok(Some(m)) => m,
+            Ok(None) => return Ok(unreachable),
+            Err(e) if matches!(errno(&e), Some(ENETUNREACH | EHOSTUNREACH)) => {
+                return Ok(unreachable);
+            }
+            Err(e) => return Err(format!("route get {}: {}", q.dst, readable(&e))),
+        };
+        // The FIB entry itself: its prefix and every path of a multipath.
+        let entry = get(ask(true)?).await.ok().flatten();
+        let mut src = None;
+        let mut table = q.table;
+        for a in &resolved.attributes {
+            match a {
+                RouteAttribute::PrefSource(p) => src = ip_of(p),
+                RouteAttribute::Table(t) => table = *t,
+                _ => {}
+            }
+        }
+        let kind = match resolved.header.kind {
+            RouteType::Local => RouteKind::Local,
+            RouteType::Unicast => RouteKind::Unicast,
+            _ => RouteKind::Unreachable,
+        };
+        let from = entry.as_ref().unwrap_or(&resolved);
+        let prefix = entry.as_ref().and_then(|m| {
+            let dst = m.attributes.iter().find_map(|a| match a {
+                RouteAttribute::Destination(d) => ip_of(d),
+                _ => None,
+            });
+            let dst = dst.or_else(|| {
+                Some(if q.dst.is_ipv4() {
+                    IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                } else {
+                    IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                })
+            })?;
+            IpNet::new(dst, m.header.destination_prefix_length).ok()
+        });
+        let mut raw: Vec<(u32, Option<IpAddr>)> = Vec::new();
+        let (mut oif, mut gw) = (None, None);
+        for a in &from.attributes {
+            match a {
+                RouteAttribute::Oif(i) => oif = Some(*i),
+                RouteAttribute::Gateway(g) => gw = ip_of(g),
+                RouteAttribute::MultiPath(hops) => {
+                    for nh in hops {
+                        let g = nh.attributes.iter().find_map(|a| match a {
+                            RouteAttribute::Gateway(g) => ip_of(g),
+                            _ => None,
+                        });
+                        raw.push((nh.interface_index, g));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if raw.is_empty()
+            && let Some(i) = oif
+        {
+            raw.push((i, gw));
+        }
+        let mut hops = Vec::with_capacity(raw.len());
+        for (index, gateway) in raw {
+            if let Some(interface) = self.name_of(index).await? {
+                hops.push(KernelHop { gateway, interface });
+            }
+        }
+        Ok(KernelLookup {
+            kind,
+            prefix: if kind == RouteKind::Local {
+                IpNet::new(q.dst, full).ok()
+            } else {
+                prefix
+            },
+            hops,
+            src: src.or(if kind == RouteKind::Local {
+                Some(q.dst)
+            } else {
+                None
+            }),
+            table,
+        })
+    }
+
+    /// Read the kernel's static routes once per run (see [`Kernel::hops`]).
+    async fn load_hops(&self) -> Result<(), String> {
+        if self.hops.borrow().is_some() {
+            return Ok(());
+        }
+        let links: Vec<LinkMessage> = self
+            .handle
+            .link()
+            .get()
+            .execute()
+            .take(MAX_LINKS)
+            .try_collect()
+            .await
+            .map_err(|e| format!("listing links: {}", readable(&e)))?;
+        let names: std::collections::BTreeMap<u32, IfName> = links
+            .iter()
+            .filter_map(|m| {
+                let name = m.attributes.iter().find_map(|a| match a {
+                    LinkAttribute::IfName(n) => n.parse().ok(),
+                    _ => None,
+                })?;
+                Some((m.header.index, name))
+            })
+            .collect();
+        let (_, routes) = self.held(&names).await?;
+        let mut paths = Paths::new();
+        for r in routes {
+            paths.entry(group_of(&r)).or_default().push(r);
+        }
+        *self.hops.borrow_mut() = Some(paths);
+        Ok(())
+    }
+
+    /// The paths the kernel holds of `r`'s route (same table, prefix and
+    /// metric), `r` itself included if present.
+    async fn siblings(&self, r: &KernelRoute) -> Result<Vec<KernelRoute>, String> {
+        self.load_hops().await?;
+        Ok(self
+            .hops
+            .borrow()
+            .as_ref()
+            .and_then(|p| p.get(&group_of(r)))
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn note_hop(&self, r: &KernelRoute, present: bool) {
+        if let Some(h) = self.hops.borrow_mut().as_mut() {
+            let group = h.entry(group_of(r)).or_default();
+            group.retain(|x| x != r);
+            if present {
+                group.push(r.clone());
+            }
+        }
+    }
+
+    /// Put `paths` (one table, prefix and metric) in the kernel as one
+    /// route, replacing what is there: multipath when there are several.
+    async fn replace_paths(&self, paths: &[KernelRoute]) -> Result<(), String> {
+        let msg = match paths {
+            [] => return Ok(()),
+            [one] => route_msg(one, self.require(&one.link).await?.index)?,
+            many => {
+                let mut hops = Vec::with_capacity(many.len());
+                for p in many {
+                    hops.push(next_hop(p, self.require(&p.link).await?.index));
+                }
+                multipath_msg(many, hops)?
+            }
+        };
+        self.handle
+            .route()
+            .add(msg)
+            .replace()
+            .execute()
+            .await
+            .map_err(|e| readable(&e))
+    }
+
     async fn add_route(&self, r: &KernelRoute) -> Result<Vec<Op>, String> {
         let l = self.require(&r.link).await?;
+        let siblings = self.siblings(r).await?;
+        if siblings.contains(r) {
+            // Exactly ours already (daemon restart): adopt it, nothing to undo.
+            return Ok(vec![]);
+        }
+        if siblings.iter().any(|s| !self.owned.contains(s)) {
+            return Err(format!(
+                "the kernel already has another route to {} with metric {} in table {}; \
+                 refusing to replace it",
+                r.dst, r.metric, r.table
+            ));
+        }
+        if !siblings.is_empty() {
+            // Another path of an ECMP group: the route gets this one too.
+            let mut paths = siblings;
+            paths.push(r.clone());
+            paths.sort();
+            self.replace_paths(&paths).await?;
+            self.note_hop(r, true);
+            return Ok(vec![Op::DelRoute(r.clone())]);
+        }
         match self
             .handle
             .route()
@@ -970,19 +1247,16 @@ impl Kernel {
             .execute()
             .await
         {
-            Ok(()) => Ok(vec![Op::DelRoute(r.clone())]),
-            // Exactly ours already (daemon restart): adopt it, nothing to undo.
-            Err(e) if errno(&e) == Some(EEXIST) => {
-                if self.has_route(r, l.index).await? {
-                    Ok(vec![])
-                } else {
-                    Err(format!(
-                        "the kernel already has another route to {} with metric {} in table {}; \
-                         refusing to replace it",
-                        r.dst, r.metric, r.table
-                    ))
-                }
+            Ok(()) => {
+                self.note_hop(r, true);
+                Ok(vec![Op::DelRoute(r.clone())])
             }
+            // Not a static route of ours (another protocol, by hand).
+            Err(e) if errno(&e) == Some(EEXIST) => Err(format!(
+                "the kernel already has another route to {} with metric {} in table {}; \
+                 refusing to replace it",
+                r.dst, r.metric, r.table
+            )),
             Err(e) => Err(readable(&e)),
         }
     }
@@ -990,8 +1264,20 @@ impl Kernel {
     async fn del_route(&self, r: &KernelRoute) -> Result<Vec<Op>, String> {
         // No link, no route: the kernel removed it with the link.
         let Some(l) = self.find(&r.link).await? else {
+            self.note_hop(r, false);
             return Ok(vec![]);
         };
+        let siblings = self.siblings(r).await?;
+        if !siblings.contains(r) {
+            return Ok(vec![]);
+        }
+        if siblings.len() > 1 {
+            // One path of an ECMP group leaves: the others stay.
+            let rest: Vec<KernelRoute> = siblings.into_iter().filter(|s| s != r).collect();
+            self.replace_paths(&rest).await?;
+            self.note_hop(r, false);
+            return Ok(vec![Op::AddRoute(r.clone())]);
+        }
         match self
             .handle
             .route()
@@ -999,8 +1285,14 @@ impl Kernel {
             .execute()
             .await
         {
-            Ok(()) => Ok(vec![Op::AddRoute(r.clone())]),
-            Err(e) if matches!(errno(&e), Some(ESRCH | ENOENT)) => Ok(vec![]),
+            Ok(()) => {
+                self.note_hop(r, false);
+                Ok(vec![Op::AddRoute(r.clone())])
+            }
+            Err(e) if matches!(errno(&e), Some(ESRCH | ENOENT)) => {
+                self.note_hop(r, false);
+                Ok(vec![])
+            }
             Err(e) => Err(readable(&e)),
         }
     }
@@ -1067,7 +1359,7 @@ impl Kernel {
             .await
             .map_err(|e| format!("listing routes: {}", readable(&e)))?;
         for m in v4.iter().chain(self.routes_v6().await?.iter()) {
-            routes.extend(static_route(m, names));
+            routes.extend(static_routes(m, names));
         }
         Ok((addresses, routes))
     }
@@ -1161,23 +1453,6 @@ impl Kernel {
         }
         Ok(gone)
     }
-
-    /// Whether the kernel holds `r` exactly (static, same next hop).
-    async fn has_route(&self, r: &KernelRoute, oif: u32) -> Result<bool, String> {
-        let probe = match r.dst {
-            IpNet::V4(_) => RouteMessageBuilder::<std::net::Ipv4Addr>::new().build(),
-            IpNet::V6(_) => RouteMessageBuilder::<std::net::Ipv6Addr>::new().build(),
-        };
-        let all: Vec<RouteMessage> = self
-            .handle
-            .route()
-            .get(probe)
-            .execute()
-            .try_collect()
-            .await
-            .map_err(|e| format!("listing routes: {}", readable(&e)))?;
-        Ok(all.iter().any(|m| same_route(m, r, oif)))
-    }
 }
 
 /// Why creating `spec` failed, in words an operator can act on.
@@ -1214,32 +1489,30 @@ fn route_msg(r: &KernelRoute, oif: u32) -> Result<RouteMessage, String> {
     Ok(b.build())
 }
 
-fn same_route(m: &RouteMessage, r: &KernelRoute, oif: u32) -> bool {
-    let h = &m.header;
-    let mut table = u32::from(h.table);
-    let (mut dst, mut gw, mut out, mut prio) = (None, None, None, 0);
-    for a in &m.attributes {
-        match a {
-            RouteAttribute::Table(t) => table = *t,
-            RouteAttribute::Destination(d) => dst = ip_of(d),
-            RouteAttribute::Gateway(g) => gw = ip_of(g),
-            RouteAttribute::Oif(i) => out = Some(*i),
-            RouteAttribute::Priority(p) => prio = *p,
-            _ => {}
-        }
+/// One path of a multipath route.
+fn next_hop(r: &KernelRoute, oif: u32) -> RouteNextHop {
+    let mut nh = RouteNextHop::default();
+    nh.interface_index = oif;
+    if let Some(g) = r.gateway {
+        nh.attributes.push(RouteAttribute::Gateway(match g {
+            IpAddr::V4(v4) => RouteAddress::Inet(v4),
+            IpAddr::V6(v6) => RouteAddress::Inet6(v6),
+        }));
     }
-    let dst_ok = match dst {
-        Some(d) => d == r.dst.addr(),
-        // The default route carries no RTA_DST.
-        None => r.dst.prefix_len() == 0,
-    };
-    h.protocol == RouteProtocol::Static
-        && table == r.table
-        && h.destination_prefix_length == r.dst.prefix_len()
-        && dst_ok
-        && prio == r.metric
-        && out == Some(oif)
-        && gw == r.gateway
+    nh
+}
+
+/// The multipath route of `paths` (one table, prefix and metric).
+fn multipath_msg(paths: &[KernelRoute], hops: Vec<RouteNextHop>) -> Result<RouteMessage, String> {
+    let first = paths.first().ok_or("no paths")?;
+    Ok(RouteMessageBuilder::<IpAddr>::new()
+        .destination_prefix(first.dst.addr(), first.dst.prefix_len())
+        .map_err(|e| e.to_string())?
+        .priority(first.metric)
+        .table_id(first.table)
+        .protocol(RouteProtocol::Static)
+        .multipath(hops)
+        .build())
 }
 
 fn ip_of(a: &RouteAddress) -> Option<IpAddr> {

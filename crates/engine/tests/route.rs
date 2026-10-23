@@ -177,7 +177,13 @@ fn backup_route_waits_behind_a_lower_distance() {
     );
     let r = row(&mut s, &backup);
     assert_eq!(r["flags"], "S");
-    assert_eq!(r["reason"], "route *1 has a lower distance");
+    assert_eq!(r["state"], "standby");
+    assert_eq!(
+        r["reason"],
+        "loses to distance 1 (route *1 via 10.0.0.1%ether1)"
+    );
+    assert_eq!(r["reason_id"], "loses-distance");
+    assert_eq!(r["reason_args"]["distance"], "1");
     // The primary goes down: the backup takes over.
     ok(
         &mut s,
@@ -193,7 +199,7 @@ fn backup_route_waits_behind_a_lower_distance() {
     );
     assert_eq!(
         row(&mut s, &shadow)["reason"],
-        "connected network on ether1 wins"
+        "the connected network on ether1 wins"
     );
 }
 
@@ -224,10 +230,6 @@ fn add_rejects_bad_routes_and_changes_nothing() {
         (
             json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1", "distance": 9}),
             "route *1 already goes to 0.0.0.0/0 via 10.0.0.1",
-        ),
-        (
-            json!({"dst_address": "0.0.0.0/0", "gateway": "192.168.88.254"}),
-            "has distance 1 too",
         ),
         (
             json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.2", "distance": 3}),
@@ -277,11 +279,36 @@ fn add_rejects_bad_routes_and_changes_nothing() {
     for (p, needle) in cases {
         fails(&mut s, "ip.route.add", p, needle);
     }
-    // A disabled duplicate-distance route is a valid standby.
+}
+
+#[test]
+fn equal_distance_routes_share_the_traffic() {
+    let mut s = lab();
     add(
         &mut s,
-        json!({"dst_address": "0.0.0.0/0", "gateway": "192.168.88.254", "disabled": true}),
+        json!({"dst_address": "0.0.0.0/0", "gateway": "10.0.0.1"}),
     );
+    let second = add(
+        &mut s,
+        json!({"dst_address": "0.0.0.0/0", "gateway": "192.168.88.254"}),
+    );
+    for id in ["*1", second.as_str()] {
+        let r = row(&mut s, id);
+        assert_eq!(
+            (&r["state"], &r["ecmp"]),
+            (&json!("active"), &json!(2)),
+            "{r}"
+        );
+        assert_eq!(r["flags"], "AS+");
+    }
+    // One path disabled: the other carries alone.
+    ok(
+        &mut s,
+        "ip.route.set",
+        json!({"id": second, "disabled": true}),
+    );
+    assert_eq!(row(&mut s, "*1")["ecmp"], 1);
+    assert_eq!(row(&mut s, &second)["reason_id"], "disabled");
 }
 
 // ---- ip.route.set / remove ----
@@ -308,12 +335,6 @@ fn set_changes_only_what_is_given_and_validates_the_result() {
         (&json!(3), &json!("primary"), &json!("10.0.0.1"))
     );
 
-    fails(
-        &mut s,
-        "ip.route.set",
-        json!({"id": "*1", "distance": 5}),
-        "has distance 5 too",
-    );
     fails(
         &mut s,
         "ip.route.set",
