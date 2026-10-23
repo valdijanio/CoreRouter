@@ -311,9 +311,10 @@ pub fn root_test(root: &Path) -> Outcome {
 }
 
 /// The root tests and how long each may take (seconds).
-const XDP_TESTS: [(&str, u32); 2] = [
+const XDP_TESTS: [(&str, u32); 3] = [
     ("loads_attaches_and_counts", 180),
     ("kernel_and_host_agree", 300),
+    ("perf_lpm_cost", 600),
 ];
 
 fn test_binary(root: &Path) -> Result<PathBuf, String> {
