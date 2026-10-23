@@ -7,7 +7,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.addresses", "## What it does\nThe IPv4 addresses of the router's interfaces. Each address also makes the connected route of its network.\n\nAn address can come from a pool (prefix delegation) or from a DHCP lease; the Origin column says which."),
     ("menu.bgp", "## What it does\nThe BGP instance: the router's AS, router id and the sessions with peers (upstreams, IXs, customers). The protocol itself runs in FRR; this window configures it."),
     ("menu.bonding", "## What it does\nBonds join several ports into one link (LACP 802.3ad, active-backup, balance-xor…) for more capacity and for redundancy when a cable or port fails."),
-    ("menu.cgnat", "## What it does\nCarrier-grade NAT for subscribers (shared IPv4, RFC 6598 100.64.0.0/10), with port blocks and the logs the law asks for. Not implemented yet."),
+    ("menu.cgnat", "## What it does\nCarrier-grade NAT for subscribers on shared IPv4 (RFC 6598): deterministic pools (RFC 7422, nothing logged per connection) or port blocks on demand (RFC 6888, one log line per block), 1:1 exceptions, EIM/EIF and hairpin (RFC 4787), \"who was\" (public address + port + time – subscriber), the mapping table, blocks and port alerts."),
     ("menu.dhcp-client", "## What it does\nGets an IPv4 address, gateway and DNS servers from a DHCP server on an interface: the usual WAN of a link that hands out a dynamic address."),
     ("menu.dhcp-relay", "## What it does\nForwards the DHCP requests of a LAN to a central DHCP server in another network (option 82 included), so one server serves many sites."),
     ("menu.dhcp-server", "## What it does\nHands out IPv4 addresses to the hosts of a LAN: servers, networks (gateway, DNS), leases (dynamic and static), options and alerts of rogue servers.\n\nStatistics, history and conflicts of the leases are in the same window. The Statistics tab shows counters and how full each pool is."),
@@ -41,6 +41,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.routes", "## What it does\nThe routing table: static routes (the default route 0.0.0.0/0 included), connected and learned ones, which one is active and in which VRF."),
     ("menu.services", "## What it does\nThe router's own services (DNS, DHCP, metrics…) as the supervisor sees them: running, stopped or failed, restarts and the last error. Start, stop and restart them here."),
     ("menu.settings", "## What it does\nPreferences of this GUI, not of the router: the language of the labels and of the explanations. Kept on this computer."),
+    ("menu.traffic-flow", "## What it does\nExports a record of every connection to flow collectors, in IPFIX or NetFlow v9, with the addresses and ports before and after NAT and RFC 8158 NAT events: the connection log a provider keeps (Marco Civil). Also shows the top talkers without a collector."),
     ("menu.tuning", "## What it does\nKernel and hardware tuning for routing: network buffers, conntrack, CPU governor, IRQ and RPS/XPS per interface, and the boot parameters — with recommended values and why."),
     ("menu.vrf", "## What it does\nVRFs: separate routing tables on the same router, for customers or management kept apart."),
 ];

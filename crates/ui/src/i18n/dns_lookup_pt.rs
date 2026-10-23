@@ -1,25 +1,58 @@
-//! Portuguese for Tools › DNS Lookup (G6.8): labels, and the wording of
-//! "Why this answer" (the engine's English texts by id,
-//! `corerouter_engine::dns_lookup::WHY_TEXTS`, key `dnswhy.<id>`).
+//! Portuguese for Tools › DNS Lookup (G6.8): labels, the wording of "Why
+//! this answer" (the engine's English texts by id,
+//! `corerouter_engine::dns_lookup::WHY_TEXTS`, key `dnswhy.<id>`) and of
+//! the Upstreams advice (`corerouter_engine::dns_upstreams::TEXTS`, key
+//! `dnsbench.<id>`).
 
 pub(super) const LABELS: &[(&str, &str)] = &[
+    ("Answer", "Resposta"),
     ("Ask as", "Perguntar como"),
+    ("Check hijack", "Checar sequestro"),
     ("Decision", "Decisão"),
+    ("Interval", "Intervalo"),
+    ("Latency", "Latência"),
+    ("Loss", "Perda"),
+    ("NXDOMAIN hijacked", "NXDOMAIN sequestrado"),
     ("Open entry", "Abrir entrada"),
     ("Open group", "Abrir grupo"),
     ("Open list", "Abrir lista"),
     ("Open zone", "Abrir zona"),
+    ("Queries per server", "Consultas por servidor"),
+    ("Recommendation", "Recomendação"),
     ("Stage", "Etapa"),
+    ("Tests", "Testes"),
+    ("Time", "Hora"),
+    ("Upstreams", "Upstreams"),
+    ("Watch", "Acompanhar"),
     ("Why this answer", "Por que esta resposta"),
     ("answered", "respondeu"),
+    ("down", "fora do ar"),
     ("dropped", "descartou"),
+    ("forwarder", "encaminhador"),
     ("not reached", "não chegou"),
+    ("note", "nota"),
+    ("other network", "outra rede"),
     ("passed", "passou"),
+    ("proxy on the path", "proxy no caminho"),
     ("refused", "recusou"),
+    ("remove", "remover"),
     ("router itself", "o próprio roteador"),
+    ("spike", "pico"),
+    ("use", "usar"),
 ];
 
 pub(super) const TEMPLATES: &[(&str, &str)] = &[
+    ("dnsbench.down", "{server} nunca respondeu: remova"),
+    ("dnsbench.forwarder", "{server} é um encaminhador em endereço privado: as respostas vêm de {egress}"),
+    ("dnsbench.hijack", "{server} responde nomes que não existem ({data}) em vez de NXDOMAIN: remova"),
+    ("dnsbench.loss", "{server} perdeu {loss}% das consultas: remova"),
+    ("dnsbench.no-edns", "{server} descarta o EDNS (sem OPT nas respostas): DNSSEC e respostas grandes falham (RFC 8906)"),
+    ("dnsbench.no-tcp", "{server} não responde por TCP: respostas truncadas falham (RFC 7766)"),
+    ("dnsbench.other-network", "{server} chega aos autoritativos por {egress} ({egress_as}), fora da rede dele ({server_as}): um parceiro anycast ou um proxy (confira)"),
+    ("dnsbench.proxy", "quem responde por {server} é {egress} ({egress_as}), da rede do próprio cliente: há um proxy no caminho"),
+    ("dnsbench.servfail", "{server} respondeu SERVFAIL a {servfail}% das consultas: remova"),
+    ("dnsbench.slow", "{server} é lento: p50 de {p50} ms contra {best} ms do melhor"),
+    ("dnsbench.use", "use {server}: p50 de {p50} ms, p99 de {p99} ms, sem perda"),
     ("dnswhy.acl.allowed", "{client} está no allowed_from ({net})"),
     ("dnswhy.acl.loopback", "{client} é o próprio roteador"),
     ("dnswhy.acl.refused", "{client} não está no allowed_from: REFUSED"),
