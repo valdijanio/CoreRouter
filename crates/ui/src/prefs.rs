@@ -69,6 +69,7 @@ impl CoreRouterUi {
             "inline_comments": inline,
             "labels_lang": self.lang.labels.code(),
             "help_lang": self.lang.help.code(),
+            "menu": self.menu.prefs(),
         })
         .to_string()
     }
@@ -91,6 +92,9 @@ impl CoreRouterUi {
         }
         if let Some(l) = lang("help_lang") {
             self.lang.help = l;
+        }
+        if let Some(m) = v.get("menu") {
+            self.menu.apply_prefs(m);
         }
         if let Some(list) = v.get("inline_comments").and_then(Value::as_array) {
             let panels = self.panels.iter_mut().flatten().flat_map(|p| p.tables_mut());

@@ -501,7 +501,9 @@ mod linux {
                 let why = external.get(op.link().as_str()).map_or("", String::as_str);
                 log::warn!("not applied: {op} ('{}' is not managed: {why})", op.link());
             }
-            match crate::netlink::apply(&run) {
+            let mut owned = crate::plan::kernel_routes(from);
+            owned.extend(crate::plan::kernel_routes(to));
+            match crate::netlink::apply(&run, &owned) {
                 Ok(()) => {
                     self.claims = claims_of(to);
                     self.sync_ra(to);
@@ -631,6 +633,16 @@ mod linux {
             })
         }
 
+        /// `RTM_GETROUTE` (G1.27).
+        fn route_get(
+            &mut self,
+            cfg: &Config,
+            q: &corerouter_hal::route_get::RouteQuery,
+        ) -> Result<corerouter_hal::route_get::KernelLookup, HalError> {
+            let _ = cfg;
+            crate::netlink::route_get(q)
+        }
+
         /// One round of [`crate::plan::repair`], all or nothing.
         fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
             let have = self.snapshot(cfg)?;
@@ -638,7 +650,7 @@ mod linux {
             for op in &ops {
                 log::info!("reconcile: {op}");
             }
-            crate::netlink::apply(&ops)
+            crate::netlink::apply(&ops, &crate::plan::kernel_routes(cfg))
         }
 
         fn unmanaged(&mut self) -> Vec<(IfName, String)> {

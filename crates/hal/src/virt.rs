@@ -539,6 +539,15 @@ impl Hal for VirtualHal {
             .clone())
     }
 
+    fn route_get(
+        &mut self,
+        cfg: &Config,
+        q: &crate::route_get::RouteQuery,
+    ) -> Result<crate::route_get::KernelLookup, HalError> {
+        let k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(crate::route_get::lookup(cfg, &k, q))
+    }
+
     fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
         let mut k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
         *k = drift::repaired(cfg, &k);

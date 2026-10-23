@@ -167,6 +167,7 @@ impl Session {
             self.expire_dynamic_addresses();
             self.expire_tasks();
             self.poll_links();
+            self.watch_routes();
             self.scan_modules();
             Ok(())
         });
