@@ -10,6 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
+use crate::json_delta;
 use crate::store::{ConfigStore, Revision};
 use crate::users::Users;
 
@@ -259,6 +260,32 @@ pub fn encode_revision(rev: &Revision, config: &str) -> Result<String, PersistEr
     Ok(out)
 }
 
+/// A revision file stored as a difference (audit-history): how to build
+/// revision `number` from revision `base`, the next newer one, as a
+/// [`json_delta`] of their configs. Same header as [`encode_revision`];
+/// `base` and `delta` instead of `config` tell the two apart.
+pub fn encode_revision_delta(
+    rev: &Revision,
+    base: u32,
+    delta: &serde_json::Value,
+) -> Result<String, PersistError> {
+    let mut out = String::new();
+    out.push_str("{\"format_version\":");
+    out.push_str(&FORMAT_VERSION.to_string());
+    out.push_str(",\"number\":");
+    out.push_str(&rev.number.to_string());
+    out.push_str(",\"comment\":");
+    out.push_str(&to_json(&rev.comment)?);
+    out.push_str(",\"timestamp\":");
+    out.push_str(&to_json(&rev.timestamp)?);
+    out.push_str(",\"base\":");
+    out.push_str(&base.to_string());
+    out.push_str(",\"delta\":");
+    out.push_str(&to_json(delta)?);
+    out.push_str("}\n");
+    Ok(out)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevisionFileIn {
@@ -267,12 +294,33 @@ struct RevisionFileIn {
     number: u32,
     comment: String,
     timestamp: Option<u64>,
-    config: Config,
+    #[serde(default)]
+    config: Option<Config>,
+    #[serde(default)]
+    base: Option<u32>,
+    #[serde(default)]
+    delta: Option<serde_json::Value>,
 }
 
-/// Parse a revision file written by [`encode_revision`]; it must hold
-/// revision `number` (a file is hostile input like the running file).
-pub fn decode_revision(text: &str, number: u32) -> Result<Revision, PersistError> {
+/// What a revision file holds.
+#[derive(Debug, Clone)]
+pub enum RevisionFile {
+    /// The whole config ([`encode_revision`], G1.23 builds).
+    Full(Revision),
+    /// A difference against the newer revision `base`
+    /// ([`encode_revision_delta`]); `rev.config` is left default until
+    /// [`apply_revision_delta`] builds it.
+    Delta {
+        rev: Revision,
+        base: u32,
+        delta: serde_json::Value,
+    },
+}
+
+/// Parse a revision file written by [`encode_revision`] or
+/// [`encode_revision_delta`]; it must hold revision `number` (a file is
+/// hostile input like the running file).
+pub fn decode_revision_file(text: &str, number: u32) -> Result<RevisionFile, PersistError> {
     check_version(text)?;
     let file: RevisionFileIn = serde_json::from_str(text).map_err(malformed)?;
     if file.number != number {
@@ -281,12 +329,55 @@ pub fn decode_revision(text: &str, number: u32) -> Result<Revision, PersistError
             file.number
         )));
     }
-    Ok(Revision {
+    let mut rev = Revision {
         number,
         comment: file.comment.chars().take(256).collect(),
         timestamp: file.timestamp,
-        config: file.config,
-    })
+        config: Config::default(),
+    };
+    match (file.config, file.base, file.delta) {
+        (Some(config), None, None) => {
+            rev.config = config;
+            Ok(RevisionFile::Full(rev))
+        }
+        (None, Some(base), Some(delta)) if base > number => {
+            Ok(RevisionFile::Delta { rev, base, delta })
+        }
+        (None, Some(base), Some(_)) => Err(PersistError::Inconsistent(format!(
+            "revision {number} is a difference against {base}, which is not newer"
+        ))),
+        _ => Err(PersistError::Malformed(
+            "a revision file holds either config or base + delta".into(),
+        )),
+    }
+}
+
+/// Parse a full revision file (see [`decode_revision_file`]).
+pub fn decode_revision(text: &str, number: u32) -> Result<Revision, PersistError> {
+    match decode_revision_file(text, number)? {
+        RevisionFile::Full(rev) => Ok(rev),
+        RevisionFile::Delta { base, .. } => Err(PersistError::Inconsistent(format!(
+            "revision {number} is a difference against {base}"
+        ))),
+    }
+}
+
+/// `cfg` as a JSON tree, what [`json_delta`] compares.
+pub fn config_value(cfg: &Config) -> Result<serde_json::Value, PersistError> {
+    serde_json::to_value(cfg).map_err(|e| PersistError::Malformed(e.to_string()))
+}
+
+/// The config of a revision file stored as a difference: `delta` applied
+/// to `base` (the [`config_value`] of the newer revision, consumed and
+/// turned into this revision's tree, the base of the next older one).
+pub fn apply_revision_delta(
+    base: serde_json::Value,
+    delta: &serde_json::Value,
+) -> Result<(Config, serde_json::Value), PersistError> {
+    let tree = json_delta::apply_owned(base, delta)
+        .map_err(|e| PersistError::Inconsistent(e.to_string()))?;
+    let cfg = Config::deserialize(&tree).map_err(malformed)?;
+    Ok((cfg, tree))
 }
 
 /// Size bound, then `format_version` before anything else.
@@ -702,6 +793,36 @@ mod tests {
             decode_revision(&text.replacen("\"format_version\":1", "\"format_version\":9", 1), 1),
             Err(PersistError::UnknownVersion(9))
         ));
+    }
+
+    #[test]
+    fn revision_differences_round_trip_and_are_told_apart() {
+        let st = sample();
+        let (old, new) = (&st.history()[1], &st.history()[2]);
+        let base = config_value(&new.config).unwrap();
+        let delta = json_delta::diff(&base, &config_value(&old.config).unwrap());
+        let text = encode_revision_delta(old, 2, &delta).unwrap();
+        let RevisionFile::Delta { rev, base: b, delta: d } = decode_revision_file(&text, 1).unwrap()
+        else {
+            panic!("not a delta: {text}");
+        };
+        assert_eq!((rev.number, rev.comment.as_str(), b), (1, "rename", 2));
+        let (cfg, _) = apply_revision_delta(base, &d).unwrap();
+        assert_eq!(cfg, old.config);
+        // A full file is still a full file; the two never mix.
+        let full = encode_revision(old, &encode_config(&old.config).unwrap()).unwrap();
+        assert!(matches!(decode_revision_file(&full, 1), Ok(RevisionFile::Full(_))));
+        assert!(matches!(decode_revision(&text, 1), Err(PersistError::Inconsistent(_))));
+        for bad in [
+            text.replace("\"base\":2", "\"base\":1"),
+            text.replace(",\"base\":2", ""),
+            full.replace("\"timestamp\"", "\"base\":2,\"delta\":{},\"timestamp\""),
+        ] {
+            assert!(decode_revision_file(&bad, 1).is_err(), "{bad}");
+        }
+        // A delta that builds something that is not a config.
+        let wrong = serde_json::json!({"o": {"system": {"=": 7}}});
+        assert!(apply_revision_delta(config_value(&new.config).unwrap(), &wrong).is_err());
     }
 
     #[test]

@@ -212,9 +212,9 @@ fn a_big_config_with_a_full_history_still_boots() {
     assert_eq!(status.loaded_from, Some("current"));
     assert_eq!(s.store().running(), &running);
     assert_eq!(s.store().current_revision(), 65);
-    // Older revisions were left out of the file, the newest ones kept.
-    let kept = s.store().history().len();
-    assert!((2..64).contains(&kept), "{kept} revisions kept");
+    // Every revision kept: the older ones are differences (audit-history;
+    // as full copies only the newest fit).
+    assert_eq!(s.store().history().len(), 64);
 }
 
 /// Audit #11: a hand-edited file whose id counter is behind its items
