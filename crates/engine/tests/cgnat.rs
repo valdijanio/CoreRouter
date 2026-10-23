@@ -361,3 +361,112 @@ fn settings_are_bounded() {
     let (param, _) = bad(&mut s, "ip.firewall.cgnat.set", json!({"history_days": 0}));
     assert_eq!(param, "history_days");
 }
+
+/// The list window's modal (G0.24) asks a preview as the fields change:
+/// calculated numbers, checks with the field they are about, and the
+/// commands OK would send. Bad input is a check, never a failure.
+#[test]
+fn previews_compute_check_and_show_the_command() {
+    let mut s = Session::virtual_lab();
+    let v = ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.preview",
+        json!({"name": "c1", "inside": "100.64.0.0/22", "outside": "203.0.113.0/28", "ports_per_subscriber": "1000"}),
+    );
+    let computed: Vec<(String, String)> = v["computed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| {
+            (
+                c["label"].as_str().unwrap().to_owned(),
+                c["value"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert!(
+        computed.contains(&("Per public address".into(), "64".into())),
+        "{v}"
+    );
+    assert_eq!(v["commands"][0]["command"], "ip.firewall.cgnat.pool.add");
+    assert!(
+        v["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["level"] != "error"),
+        "{v}"
+    );
+    // Not enough public addresses: an error on the outside field, no command.
+    let v = ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.preview",
+        json!({"name": "c1", "inside": "100.64.0.0/22", "outside": "203.0.113.0/30"}),
+    );
+    let err = v["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["level"] == "error")
+        .unwrap()
+        .clone();
+    assert_eq!(err["param"], "outside", "{v}");
+    assert_eq!(v["commands"], json!([]));
+    // Garbage: a check on that field.
+    let v = ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.preview",
+        json!({"name": "x", "inside": "nope"}),
+    );
+    assert_eq!(v["checks"][0]["param"], "inside");
+    // Editing: how many subscribers move.
+    pool(&mut s);
+    let v = ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.preview",
+        json!({"id": "cgnat1", "ports_per_subscriber": "500"}),
+    );
+    assert!(
+        v["computed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["label"] == "Subscribers remapped" && c["value"] == "1024"),
+        "{v}"
+    );
+    assert_eq!(v["commands"][0]["command"], "ip.firewall.cgnat.pool.set");
+    // The modal sends numbers as text: add takes them.
+    ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.set",
+        json!({"id": "cgnat1", "ports_per_subscriber": "900", "alert_percent": "80"}),
+    );
+    assert_eq!(
+        s.store().running().ip.cgnat.pools[0].ports_per_subscriber,
+        900
+    );
+    // An exception's preview names the pool and the slot left empty.
+    let v = ok(
+        &mut s,
+        "ip.firewall.cgnat.exception.preview",
+        json!({"subscriber": "100.64.0.65", "public": "198.51.100.9"}),
+    );
+    assert!(
+        v["computed"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["label"] == "Pool" && c["value"] == "cgnat1"),
+        "{v}"
+    );
+    assert_eq!(
+        v["commands"][0]["command"],
+        "ip.firewall.cgnat.exception.add"
+    );
+    let v = ok(
+        &mut s,
+        "ip.firewall.cgnat.exception.preview",
+        json!({"subscriber": "100.64.0.65", "public": "203.0.113.3"}),
+    );
+    assert_eq!(v["checks"][0]["level"], "error");
+}
