@@ -439,6 +439,14 @@ mod tests {
         assert_eq!(a.compression, Compression::Gzip);
     }
 
+    /// docs/analytics.md shows the schema the router generates, verbatim.
+    #[test]
+    fn the_documented_schema_is_the_generated_one() {
+        let doc = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/analytics.md")).unwrap();
+        let sql = schema(DEFAULT_DATABASE, |_| None);
+        assert!(doc.contains(sql.trim_end()), "update the SQL block of docs/analytics.md:\n{sql}");
+    }
+
     #[test]
     fn identifiers_are_safe_for_sql() {
         assert!(valid_identifier("corerouter"));

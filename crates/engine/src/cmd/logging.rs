@@ -223,10 +223,18 @@ fn action_set(s: &mut Session, p: &Value) -> Result<Value> {
         return memory_set(s, p);
     }
     if name == ANALYTICS_ACTION {
-        return Err(EngineError::bad(
-            "name",
-            "analytics is the ClickHouse exporter: configure it with system.analytics.set",
-        ));
+        // Nothing to set (an /export round trip names it); any field is a
+        // mistake: the exporter has its own command.
+        if let Some(k) = p
+            .as_object()
+            .and_then(|o| o.iter().find(|(k, v)| *k != "name" && !v.is_null()).map(|(k, _)| k.clone()))
+        {
+            return Err(EngineError::bad(
+                &k,
+                "analytics is the ClickHouse exporter: configure it with system.analytics.set",
+            ));
+        }
+        return Ok(json!({ "name": name }));
     }
     if p.get("memory_lines").is_some_and(|v| !v.is_null()) {
         return Err(EngineError::bad(

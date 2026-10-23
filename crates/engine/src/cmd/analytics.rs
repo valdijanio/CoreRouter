@@ -442,6 +442,13 @@ mod tests {
         s.execute("system.logging.add", &json!({"topics": ["info"], "action": "analytics"}))
             .unwrap();
         assert!(s.execute("system.logging.action.remove", &json!({"name": "analytics"})).is_err());
+        // An /export round trip sets it with nothing: fine; a field is not.
+        s.execute("system.logging.action.set", &json!({"name": "analytics"})).unwrap();
+        let e = s
+            .execute("system.logging.action.set", &json!({"name": "analytics", "remote_port": 514}))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("system.analytics.set"), "{e}");
         assert!(
             s.execute("system.logging.action.add", &json!({"name": "analytics", "remote": "192.0.2.1"}))
                 .is_err()

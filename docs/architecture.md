@@ -120,6 +120,7 @@ backend.**
 | Syslog remoto | Codec RFC 5424 próprio (`proto-syslog`, só encode) + UDP (RFC 5426) no daemon | Regras e ações estilo `/system logging` do RouterOS no engine; TCP/TLS (RFC 5425) depois |
 | Gerência remota | `rustls` + provedor `ring` (TLS do canal de controle e do WebSocket), `rcgen` (certificado autoassinado), `argon2` (hash de senha), `keyring` ("Remember password" da GUI nativa); `russh` (CLI SSH) depois | G0.3 feito |
 | Telemetria | `prometheus-client`, export IPFIX/sFlow | G4.4 |
+| Histórico de longo prazo (métricas, logs, fluxos, NAT) | ClickHouse **externo e opcional**, alimentado pelo serviço `analytics` do daemon (G4.4f): `INSERT … JSONEachRow` com gzip pela interface HTTP, cliente HTTP/TLS próprio (rustls), sem driver em C nem processo auxiliar | O roteador fica leve e não guarda nada de longo prazo; veja "Exportador ClickHouse (G4.4f)" na seção 3 e `docs/analytics.md` |
 
 ## 2. Camadas do workspace
 
@@ -750,6 +751,35 @@ própria. Grupos abertos são preferência da janela (`prefs.rs`, chave `menu`).
   Compila em `wasm32-unknown-unknown` (é só `include_bytes!`). O teste `the_font_has_every_icon`
   reprova ícone sem glifo. Quando o `egui-phosphor` acompanhar o egui do workspace, dá para trocar
   o subconjunto pelo crate (macro `subset!`) sem mudar `icons.rs`.
+
+### Exportador ClickHouse (G4.4f)
+
+Histórico de longo prazo **fora** do roteador (decisão do usuário, 2026-10-23): o serviço
+`analytics` do daemon envia métricas, logs, fluxos e eventos de NAT a um ClickHouse que o operador
+mantém. Desenho, esquema e operação em `docs/analytics.md`.
+
+- **Caminho:** o engine só guarda a configuração (`system.analytics`) e o status
+  (`s.ext::<AnalyticsStatus>()`, escrito pelo daemon); rede só no daemon (L6). A cada 250 ms o
+  serviço copia sob o lock o que é novo no log (`log_since`) e, a cada `metrics_interval`, o
+  resultado de `system.metrics` (o mesmo texto do `/metrics`, convertido em linhas); envia sem o
+  lock. Outros serviços entregam fluxos e eventos de NAT por `submit_flow`/`submit_nat` (lista com
+  teto, sem lock da sessão); os blocos do CGNAT (G2.3c) chegam pelo próprio log.
+- **Comparado** (Rust puro × externo, como pede o AGENTS.md):
+  - *Vector ou Fluent Bit ao lado do daemon*: maduros, mas um processo a mais para supervisionar,
+    configurar fora das transações e atualizar, e o roteador ainda teria de exportar para ele;
+    reenvio, fila com teto e descarte contado, que são o que eles agregam, cabem em ~1400 linhas com comentários (**medido**: `analytics.rs`, `analytics_queue.rs`, `analytics_rows.rs`, sem os testes).
+  - *Crate `clickhouse` (HTTP, RowBinary)*: puxa `hyper`/`tokio` para um daemon que é síncrono, e
+    `RowBinary` amarra a ordem das colunas ao esquema (uma coluna nova no servidor quebra o
+    envio). *Drivers nativos* (protocolo TCP 9000): em C++ ou com FFI; fora (sem C).
+  - **Escolhido:** o cliente HTTP/1.1 do daemon (`service/https.rs`, rustls, já usado pelas
+    adlists) com `JSONEachRow` + gzip (`flate2` com `miniz_oxide`, puro Rust).
+- **Números** (**medidos**, release, 32 núcleos, ClickHouse 26.9 na mesma máquina, 2026-10-23):
+  codificar + comprimir ~510 000 linhas de log/s num núcleo (≈ 1,9 µs de CPU por linha) e
+  ~1,1 milhão de linhas de métrica/s; enviar ao ClickHouse ~665 000 linhas/s em lotes de 10 000
+  (CPU do roteador desprezível no envio). Um roteador de borda gera dezenas a milhares de linhas
+  por segundo: o JSONEachRow não é o gargalo, e `RowBinary` fica para quando for (G4.4h). Com o
+  servidor fora do ar 10 minutos, a fila guardou tudo e esvaziou em segundos quando ele voltou,
+  sem perda (`docs/perf.md`).
 
 ## Histórico de revisão
 

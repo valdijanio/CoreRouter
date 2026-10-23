@@ -361,8 +361,8 @@ impl AnalyticsPanel {
             self.label(ui, l, "nat_events", "NAT Events");
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.form.nat_events, "");
-                chip::chip(ui, tr(l, "no source yet"), chip::neutral_tone(ui.visuals()))
-                    .on_hover_text(tr(l, "Traffic Flow (G4.4b) will feed this table"));
+                chip::chip(ui, tr(l, "CGNAT blocks"), chip::BLUE.tone(ui.visuals()))
+                    .on_hover_text(tr(l, "Port blocks given and taken back by CGNAT (blocks mode); per-connection events come with Traffic Flow (G4.4b)"));
             });
             ui.end_row();
         });
@@ -560,7 +560,9 @@ impl AnalyticsPanel {
         if ui.button(tr(l, "Copy")).clicked() {
             ui.ctx().copy_text(sql.clone());
         }
-        ScrollArea::both().auto_shrink([false, false]).show(ui, |ui| {
+        // The note stays under the SQL; the SQL scrolls (never the window).
+        let h = (ui.available_height() - 28.0).max(80.0);
+        ScrollArea::both().max_height(h).auto_shrink([false, false]).show(ui, |ui| {
             let mut shown = sql.as_str();
             ui.add(TextEdit::multiline(&mut shown).code_editor().desired_width(f32::INFINITY));
         });

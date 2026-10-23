@@ -309,6 +309,10 @@ struct Exporter {
     spool: Option<PathBuf>,
     spool_opened: bool,
     status: AnalyticsStatus,
+    /// The number the next log event read should have (0: none read yet).
+    read_seq: u64,
+    /// Log events gone from the log's window before they were read.
+    lost: u64,
     /// The last error was logged (once per outage, not every try).
     logged: bool,
 }
@@ -327,6 +331,8 @@ impl Exporter {
             spool,
             spool_opened: false,
             status: AnalyticsStatus::default(),
+            read_seq: 0,
+            lost: 0,
             logged: false,
         }
     }
@@ -465,6 +471,36 @@ impl Exporter {
     }
 }
 
+/// A CGNAT port block given or taken back (G2.3c, blocks mode): logged
+/// with topic `cgnat` and the block in the detail. RFC 8158 natEvent 16/17
+/// (NAT44 port block allocation / de-allocation).
+pub(crate) fn cgnat_block_event(ev: &corerouter_model::logging::LogEvent) -> Option<NatEvent> {
+    if !ev.topics.iter().any(|t| t == "cgnat") {
+        return None;
+    }
+    let d = &ev.detail;
+    let event = match d.get("event")?.as_str()? {
+        "alloc" => "block_alloc",
+        "release" => "block_release",
+        _ => return None,
+    };
+    let addr = |k: &str| d.get(k)?.as_str()?.parse::<IpAddr>().ok();
+    let port = |k: &str| d.get(k)?.as_u64().and_then(|p| u16::try_from(p).ok());
+    Some(NatEvent {
+        time_ms: ev.time.saturating_mul(1000),
+        event: event.into(),
+        proto: 0,
+        src_addr: addr("subscriber")?,
+        src_port: 0,
+        nat_addr: addr("public")?,
+        nat_port: 0,
+        dst_addr: None,
+        dst_port: None,
+        port_start: port("first_port")?,
+        port_end: port("last_port")?,
+    })
+}
+
 fn limits(cfg: &Analytics) -> Limits {
     Limits {
         batch_rows: u64::from(cfg.batch_size.max(1)),
@@ -492,7 +528,11 @@ fn tick(session: &Shared, health: &super::Health, ex: &mut Exporter) {
         let s = lock(session);
         let cfg = s.store().running().system.analytics.clone();
         let since = ex.last_seq.unwrap_or_else(|| s.log_seq());
-        let events = if cfg.enabled && cfg.logs { s.log_since(since) } else { Vec::new() };
+        let events = if cfg.enabled && (cfg.logs || cfg.nat_events) {
+            s.log_since(since)
+        } else {
+            Vec::new()
+        };
         ex.last_seq = Some(events.last().map_or_else(|| s.log_seq().max(since), |e| e.seq));
         let requested = s.ext::<AnalyticsStatus>().map_or(0, |st| st.test.requested);
         (
@@ -503,6 +543,10 @@ fn tick(session: &Shared, health: &super::Health, ex: &mut Exporter) {
             requested,
         )
     };
+    if !(cfg.enabled && (cfg.logs || cfg.nat_events)) {
+        // Not read on purpose: no gap to count when reading starts again.
+        ex.read_seq = 0;
+    }
     let wanted = u64::from(cfg.enabled && cfg.flows) | (u64::from(cfg.enabled && cfg.nat_events) << 1);
     inbox().wanted.store(wanted, Ordering::Relaxed);
     let router = if cfg.router_id.is_empty() { identity } else { cfg.router_id.clone() };
@@ -531,11 +575,26 @@ fn tick(session: &Shared, health: &super::Health, ex: &mut Exporter) {
     if cfg.enabled {
         health.disabled(None);
         let ms = now_ms();
+        // The log keeps a window of recent events: a gap in the numbers
+        // is events gone before this tick read them (counted, not hidden).
+        let mut next = ex.read_seq;
         for ev in &events {
-            if let Some(rule) = logging.to_analytics(&ev.topics) {
+            if next != 0 && ev.seq > next {
+                ex.lost = ex.lost.saturating_add(ev.seq - next);
+            }
+            next = ev.seq.saturating_add(1);
+            if cfg.logs
+                && let Some(rule) = logging.to_analytics(&ev.topics)
+            {
                 ex.queue.push(Table::Logs, &log_row(&router, ev, &rule.prefix, ms), now);
             }
+            if cfg.nat_events
+                && let Some(e) = cgnat_block_event(ev)
+            {
+                ex.queue.push(Table::NatEvents, &nat_row(&router, &e), now);
+            }
         }
+        ex.read_seq = next;
         let every = Duration::from_secs(u64::from(cfg.metrics_interval.max(1)));
         if cfg.metrics && ex.last_metrics.is_none_or(|t| now.saturating_duration_since(t) >= every) {
             ex.last_metrics = Some(now);
@@ -595,7 +654,7 @@ fn tick(session: &Shared, health: &super::Health, ex: &mut Exporter) {
     ex.status.disk_rows = q.disk_rows();
     ex.status.disk_bytes = q.disk_bytes();
     let inbox_dropped = inbox().dropped.load(Ordering::Relaxed);
-    ex.status.dropped_rows = q.dropped().saturating_add(inbox_dropped);
+    ex.status.dropped_rows = q.dropped().saturating_add(inbox_dropped).saturating_add(ex.lost);
     ex.status.sent_rows = q.sent();
     ex.status.tables = q
         .counters
@@ -861,6 +920,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cgnat_block_log_lines_become_nat_events() {
+        let ev = corerouter_model::logging::LogEvent {
+            seq: 3,
+            time: 1_792_758_896,
+            topics: vec!["cgnat".into(), "info".into()],
+            origin: "cgnat".into(),
+            message: "ALLOC 100.64.0.9 -> 203.0.113.5:4096-6143 pool p1".into(),
+            detail: json!({"event": "alloc", "subscriber": "100.64.0.9", "public": "203.0.113.5",
+                           "first_port": 4096, "last_port": 6143, "pool": "p1"}),
+        };
+        let e = cgnat_block_event(&ev).unwrap();
+        assert_eq!(e.event, "block_alloc");
+        assert_eq!((e.port_start, e.port_end), (4096, 6143));
+        assert_eq!(e.nat_addr.to_string(), "203.0.113.5");
+        assert_eq!(e.time_ms, 1_792_758_896_000);
+        let other = corerouter_model::logging::LogEvent { topics: vec!["system".into()], ..ev.clone() };
+        assert!(cgnat_block_event(&other).is_none());
+        let bad = corerouter_model::logging::LogEvent { detail: json!({"event": "alloc", "subscriber": "x"}), ..ev };
+        assert!(cgnat_block_event(&bad).is_none(), "hostile detail: no row");
+    }
+
+    #[test]
     fn answers_are_classified_like_vector_and_fluent_bit() {
         let r = |status| Response { status, ..Response::default() };
         assert_eq!(classify(&r(200)), Outcome::Sent);
@@ -1106,6 +1187,105 @@ pub(crate) mod tests {
         run_ticks(&session, &mut ex, 1);
         assert!(!ex.status.test.ok);
         assert!(ex.status.test.message.contains("cannot reach"), "{:?}", ex.status.test);
+    }
+
+    /// CPU seconds of this process (user + system), from /proc.
+    fn cpu_secs() -> f64 {
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap_or_default();
+        let after = stat.rsplit(')').next().unwrap_or("");
+        let f: Vec<&str> = after.split_whitespace().collect();
+        // Fields 14 and 15 (utime, stime) are the 12th and 13th after ')'.
+        let n = |i: usize| f.get(i).and_then(|x| x.parse::<f64>().ok()).unwrap_or(0.0);
+        (n(11) + n(12)) / 100.0
+    }
+
+    fn sample_event(i: u64) -> corerouter_model::logging::LogEvent {
+        corerouter_model::logging::LogEvent {
+            seq: i,
+            time: 1_792_758_896 + i / 1000,
+            topics: vec!["dhcp".into(), "info".into()],
+            origin: "daemon".into(),
+            message: format!("Concessão 10.{}.{}.{} entregue a 00:11:22:33:{:02x}:{:02x} (servidor lan)", i >> 16 & 255, i >> 8 & 255, i & 255, i >> 8 & 255, i & 255),
+            detail: json!({"server": "lan", "address": format!("10.0.{}.{}", i >> 8 & 255, i & 255), "lease_time": 3600}),
+        }
+    }
+
+    /// G4.4f battery, **medido** in release: `cargo test --release -p
+    /// corerouter-daemon --bin corerouter-daemon bench_analytics -- --ignored --nocapture`
+    /// (with `COREROUTER_CLICKHOUSE_URL` also into a real server).
+    #[test]
+    #[ignore]
+    fn bench_analytics() {
+        const N: u64 = 500_000;
+        // 1. Encode + queue + gzip, no network.
+        let mut q = Queue::new(Limits { batch_rows: 10_000, mem_bytes: 1 << 30, ..Limits::default() });
+        let (t, c) = (Instant::now(), cpu_secs());
+        let now = Instant::now();
+        let mut raw = 0usize;
+        for i in 0..N {
+            let row = log_row("pop-centro-1", &sample_event(i), "", 0);
+            raw += row.len();
+            q.push(Table::Logs, &row, now);
+        }
+        q.tick(now, true);
+        let (secs, cpu) = (t.elapsed().as_secs_f64(), cpu_secs() - c);
+        println!(
+            "logs encode+gzip: {N} rows in {secs:.2} s = {:.0} rows/s, CPU {cpu:.2} s; {:.0} B/row raw, {:.1} B/row gzip; queue {:.1} MiB",
+            N as f64 / secs,
+            raw as f64 / N as f64,
+            q.queued_bytes() as f64 / N as f64,
+            q.queued_bytes() as f64 / f64::from(1u32 << 20)
+        );
+        let text = (0..200).map(|i| format!("corerouter_interface_receive_bytes_total{{interface=\"ether{i}\"}} {}\n", i * 1_000_003)).collect::<String>();
+        let (t, mut rows) = (Instant::now(), 0usize);
+        let mut mq = Queue::new(Limits { batch_rows: 10_000, mem_bytes: 1 << 30, ..Limits::default() });
+        for k in 0..2500u64 {
+            for r in metric_rows("pop-centro-1", k * 1000, &text) {
+                mq.push(Table::Metrics, &r, now);
+                rows += 1;
+            }
+        }
+        mq.tick(now, true);
+        println!(
+            "metrics parse+encode+gzip: {rows} rows in {:.2} s = {:.0} rows/s; {:.1} B/row gzip",
+            t.elapsed().as_secs_f64(),
+            rows as f64 / t.elapsed().as_secs_f64(),
+            mq.queued_bytes() as f64 / rows as f64
+        );
+        // 2. Into a real ClickHouse.
+        let Ok(url) = std::env::var("COREROUTER_CLICKHOUSE_URL") else {
+            return;
+        };
+        let db = format!("corerouter_bench_{}", std::process::id());
+        for stmt in corerouter_model::analytics::schema(&db, |_| None).split(';') {
+            let stmt: Vec<&str> = stmt.lines().filter(|l| !l.trim_start().starts_with("--")).collect();
+            if !stmt.join("").trim().is_empty() {
+                admin_query(&url, &stmt.join("\n"));
+            }
+        }
+        let session = shared(Session::virtual_lab());
+        let cfg = Analytics { enabled: true, url: url.clone(), database: db.clone(), ..Analytics::default() };
+        let mut ex = Exporter::new(None);
+        ex.queue = q;
+        ex.target = Some(Target::new(&cfg));
+        let (t, c) = (Instant::now(), cpu_secs());
+        while ex.queue.front().is_some() {
+            ex.next_try = Instant::now();
+            ex.send(&session, Instant::now());
+            assert!(ex.status.state != AnalyticsState::Retrying, "{:?}", ex.status.last_error);
+        }
+        let (secs, cpu) = (t.elapsed().as_secs_f64(), cpu_secs() - c);
+        let stored = admin_query(&url, &format!("SELECT count() FROM {db}.logs"));
+        println!(
+            "logs into ClickHouse: {N} rows in {secs:.2} s = {:.0} rows/s, router CPU {cpu:.2} s ({:.1} µs/row), {} batches, {:.1} MiB on the wire; stored {}",
+            N as f64 / secs,
+            cpu * 1e6 / N as f64,
+            ex.status.sent_batches,
+            ex.status.sent_bytes as f64 / f64::from(1u32 << 20),
+            stored.trim()
+        );
+        assert_eq!(stored.trim(), N.to_string());
+        admin_query(&url, &format!("DROP DATABASE {db}"));
     }
 
 }
