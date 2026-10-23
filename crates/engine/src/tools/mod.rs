@@ -5,8 +5,10 @@
 pub mod mtr;
 pub mod mtu;
 pub mod ping;
+pub mod sniffer;
 pub mod stats;
 pub mod text;
+pub mod torch;
 
 use std::net::IpAddr;
 use std::ops::ControlFlow;

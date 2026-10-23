@@ -61,5 +61,9 @@ harness = false
 name = "netns_cgnat"
 harness = false
 
+[[bench]]
+name = "netns_capture"
+harness = false
+
 [lints]
 workspace = true

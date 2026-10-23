@@ -105,6 +105,10 @@ pub mod ra;
 #[cfg(target_os = "linux")]
 pub mod icmp;
 
+/// Packet capture for Torch and the sniffer (G6.4a): `AF_PACKET`.
+#[cfg(target_os = "linux")]
+pub mod capture;
+
 /// System › Tuning (G1.26): kernel parameters, the machine, counters.
 #[cfg(target_os = "linux")]
 pub mod tuning;
@@ -871,6 +875,10 @@ mod linux {
 
         fn sfp_module(&mut self, name: &IfName) -> Result<SfpModule, HalError> {
             crate::nic::sfp_module(name.as_str())
+        }
+
+        fn packet_capture(&self) -> Result<corerouter_hal::capture::SharedCapture, String> {
+            Ok(std::sync::Arc::new(crate::capture::HostCapture))
         }
 
         fn cable_tester(&mut self, name: &IfName) -> Result<Box<dyn CableTest>, HalError> {

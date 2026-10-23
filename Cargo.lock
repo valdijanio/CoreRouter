@@ -1167,6 +1167,7 @@ name = "corerouter-engine"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64",
  "corerouter-firewall",
  "corerouter-hal",
  "corerouter-model",
@@ -1419,6 +1420,7 @@ dependencies = [
 name = "corerouter-ui"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "corerouter-buildinfo",
  "corerouter-engine",
  "corerouter-hal",
