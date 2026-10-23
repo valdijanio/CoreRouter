@@ -16,6 +16,7 @@ pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod nic;
 pub mod probe;
+pub mod resources;
 pub mod route_get;
 pub mod sff;
 pub mod sim;
@@ -473,6 +474,12 @@ pub trait Hal: Send {
             "{} has no connection tracking",
             self.describe()
         )))
+    }
+
+    /// CPU, memory and conntrack readings for the graphs (G4.5), taken
+    /// every second: `None` where the platform has none.
+    fn resources(&mut self) -> Option<resources::Resources> {
+        None
     }
 
     /// A live feed of conntrack events for the flow exporter (G4.4b).

@@ -85,6 +85,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("dns-tsig", DNS, Some("TSIG Keys"), icons::KEY, "/ip dns tsig-key", &["ip.dns.tsig-key"], &["tsig", "key", "chave", "rfc 8945"]),
     e("dns-zones", DNS, Some("Zones"), icons::FOLDERS, "/ip dns zone", &["ip.dns.zone"], &["zone", "zona", "authoritative", "autoritativo", "dnssec", "record", "registro", "soa", "mx", "zone file", "arquivo de zona", "bind", "import", "export"]),
     e("firewall", None, None, icons::SHIELD_CHECK, "/ip firewall", &["ip.firewall"], &["nat", "masquerade", "srcnat", "dstnat", "port forward", "redirecionar porta", "filter", "mangle", "address list", "blacklist", "bloquear", "acl", "connections", "conexões", "conntrack", "connection tracking"]),
+    e("graphs", None, None, icons::CHART_BAR, "/tool graphing", &["system.graph"], &["graphing", "gráfico", "grafico", "gráficos", "traffic", "tráfego", "trafego", "banda", "bandwidth", "p95", "percentil", "95th percentile", "cobrança", "billing", "mrtg", "rrd", "cacti", "librenms", "histórico", "cpu", "memória", "conntrack"]),
     e("history", None, None, icons::CLOCK_COUNTER_CLOCKWISE, "/system history", &["config.history", "config.rollback"], &["undo", "rollback", "desfazer", "revision", "revisão", "commit"]),
     e("identity", None, None, icons::IDENTIFICATION_BADGE, "/system identity", &["system.identity"], &["hostname", "nome", "name"]),
     e("interface-list", None, None, icons::LIST_BULLETS, "/interface list", &["interface.list"], &["lan", "wan", "lista", "member"]),
@@ -103,6 +104,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("routes", None, None, icons::SIGNPOST, "/ip route", &["ip.route"], &["rota", "rotas", "rota padrão", "default route", "gateway", "0.0.0.0/0", "static route", "ipv4"]),
     e("services", None, None, icons::HEARTBEAT, "/system service", &["system.service"], &["supervisor", "daemon", "processo", "failed", "restart", "reiniciar"]),
     e("settings", None, None, icons::SLIDERS_HORIZONTAL, "", &[], &["language", "idioma", "theme", "tema", "preferences", "preferências"]),
+    e("traffic-flow", None, None, icons::SHARE_NETWORK, "/ip traffic-flow", &["ip.traffic-flow"], &["netflow", "ipfix", "sflow", "flow export", "fluxos", "nat log", "log de nat", "marco civil", "top talkers", "coletor", "collector", "pmacct", "goflow"]),
     e("tuning", None, None, icons::GAUGE, "/system tuning", &["system.tuning"], &["sysctl", "performance", "desempenho", "irq", "rps", "governor", "boot", "kernel"]),
     e("vrf", None, None, icons::STACK, "/ip vrf", &["ip.vrf"], &["routing table", "tabela de rotas", "l3vpn"]),
 ];

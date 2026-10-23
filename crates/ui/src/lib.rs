@@ -7,6 +7,8 @@
 
 pub mod backend;
 pub mod connect;
+/// Saving exported files (the app installs how, G4.5).
+pub mod export;
 #[doc(hidden)]
 pub mod perf;
 // Every other `src/*.rs` is a module, and the ones defining `PANEL` are
@@ -2652,7 +2654,8 @@ mod tests {
                     if command.ends_with(".list")
                         || command.ends_with(".history")
                         || command == "config.diff"
-                        || command == "ip.route.page" =>
+                        || command == "ip.route.page"
+                        || command == crate::graphs::QUERY =>
                 {
                     Ok(json!([]))
                 }

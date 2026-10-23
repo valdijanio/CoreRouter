@@ -1,4 +1,4 @@
-//! English explanations of IP › Addresses (G1.28), sorted by key.
+//! English explanations of IP › Addresses (G1.28), sorted by key (registered by `build.rs`).
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[

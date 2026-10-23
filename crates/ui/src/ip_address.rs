@@ -383,7 +383,7 @@ impl PanelState for AddressPanel {
         );
         if let Some(key) = out.help {
             let title = COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
-            self.help = Some(crate::help::HelpView::new(key, crate::i18n::tr(l, title)));
+            self.help = Some(crate::help::HelpView::new(key, crate::i18n::tr_in("addresses", l, title)));
         }
         act = act
             .or_else(|| list::from_shortcut(out.shortcut, &tools, &selection))

@@ -11,6 +11,9 @@ use std::fmt;
 pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-model", 0),
     ("corerouter-buildinfo", 0),
+    // G2.5b: the CGNAT port arithmetic (no_std), under the model and the XDP
+    // fast path alike.
+    ("corerouter-cgnat-map", 0),
     ("corerouter-hal", 1),
     ("corerouter-hal-linux", 1),
     // Pure (no I/O, wasm-safe): firewall validation + nftables render, needed by
@@ -43,6 +46,8 @@ pub const LAYERS: &[(&str, u8)] = &[
 
 /// Allowed same-layer edges, each with its reason.
 pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
+    // The model's CGNAT Layout runs the shared port arithmetic (G2.5b).
+    ("corerouter-model", "corerouter-cgnat-map"),
     // MCP's Remote backend speaks the control protocol.
     ("corerouter-mcp", "corerouter-control"),
     // Platform backends implement the L1 traits.
