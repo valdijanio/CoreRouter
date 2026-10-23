@@ -198,16 +198,45 @@ tick tenta de novo a cada segundo e o próximo commit aplica a config inteira.
 
 Histórico em arquivos (G1.23): num backend com `revision_files()` (os dois de baixo) o slot guarda
 só a running e a revisão mais nova (o mesmo formato, com histórico de uma entrada, que versões
-anteriores leem), e cada revisão vira um arquivo próprio (`rev-<n>.json`,
-`persist::encode_revision`), escrito uma vez pelo commit que a criou e apagado quando sai do
-histórico. O commit serializa a config uma vez (o texto vai para o slot e para o arquivo da
-revisão), então o custo é o tamanho da config, não do histórico: `commit/routes/10000` com 64
+anteriores leem), e cada revisão mais antiga vira um arquivo próprio (`rev-<n>.json`), escrito uma
+vez e apagado quando sai do histórico. O commit serializa a config uma vez (o texto vai para o
+slot), então o custo é o tamanho da config, não do histórico: `commit/routes/10000` com 64
 revisões em disco (fsync) caiu de 396 ms para 11,0 ms (**medido**, `storage_fs/commit/*`). Ordem:
-arquivos de revisão que faltam → slot → apagar os que saíram. No boot, os arquivos mais antigos
-que o slot completam o histórico; um ilegível custa só aquela revisão (`storage.boot_errors`); um
-mais novo que o slot (gravação interrompida) é ignorado e reescrito. Arquivos de versões
-anteriores (histórico inteiro no slot) carregam e migram no primeiro commit. O limite de 32 MiB
-vale para a soma dos arquivos de revisão.
+arquivos de revisão que faltam → slot → apagar os que saíram. Um arquivo da revisão do slot ou
+mais novo (gravação interrompida, ou boot pelo slot `previous`) é ignorado no boot e reescrito.
+Arquivos de versões anteriores (histórico inteiro no slot) carregam e migram no primeiro commit.
+O limite de 32 MiB vale para a soma dos arquivos de revisão.
+
+Revisões como diferença (audit-history): com uma cópia inteira por arquivo, o limite guardava só
+6 das 64 revisões de uma config de 5 MiB e 3 de uma de 10 MiB (**medido**); a running nunca se
+perdia, mas o rollback depois de um reboot sim. Agora o arquivo da revisão `k` guarda a diferença
+para a revisão seguinte, `k+1` (`base`), e não a config: delta reverso, como o RCS. A mais nova
+não tem arquivo (o slot a guarda inteira); o arquivo de `k` é escrito pelo commit de `k+1`, uma
+vez. No boot a cadeia é percorrida do slot para trás, cada diferença aplicada à árvore da revisão
+seguinte. Comparado com delta para a frente + cópia inteira a cada K revisões: o reverso não
+precisa de cópia inteira nenhuma além do slot (com K=16 seriam 4 cópias de 10 MiB, de novo acima
+do limite), o arquivo nunca é reescrito quando a revisão mais velha sai do histórico, e a revisão
+que mais importa (a anterior à running) depende só do slot. O preço: um arquivo ilegível no meio
+custa ele e todos os mais velhos (dependem dele), relatados em `storage.boot_errors` (`revisions
+a..b: N left out`); a running e as revisões mais novas não são afetadas. O boot pelo slot
+`previous` não perde nada: a cadeia começa nele. Arquivo inteiro de versão G1.23 (`config` em vez
+de `base` + `delta`) é lido sozinho, recomeça a cadeia, e o próximo commit o regrava como
+diferença.
+
+A diferença (`model::json_delta`) é estrutural, sobre o JSON compacto da config: objetos por
+chave (`{"o": {…}, "d": […]}`); listas por `id` (toda lista da config tem `id` único
+`*1A`) em trechos copiados `[início, tamanho]` e itens novos `{"i": […]}`; listas sem id por
+prefixo e sufixo comuns. Trocar uma entrada numa address-list de 65 536 grava essa entrada e dois
+trechos (menos de 200 bytes); trocar a seção inteira gravaria a lista toda (~4 MiB). O commit
+compara o texto que já tem (o da running nova e o da anterior, guardado do save anterior) sem
+montar as árvores: só o que difere é lido (`json_delta::diff_text`). Na leitura o delta é entrada
+hostil: profundidade limitada, cada trecho conferido contra a base e usado uma vez só (o arquivo
+não multiplica a lista), o resultado tem de ser uma `Config` válida. Números (**medido**,
+`storage_fs/history64/*`, 64 revisões, fsync em disco): config de 5 MiB, commit 40 → 47 ms, boot
+265 ms → 1,46 s, 64 revisões restauradas (eram 6), 51 → 20 MiB em disco (os 63 deltas somam 0,01 MiB; o resto são
+os dois slots); 10 MiB, commit 70 → 86
+ms, boot 329 ms → 1,21 s, 64 (eram 3), 68 → 39 MiB. O boot mais lento é o custo de ter as 64
+revisões em memória (~20 ms por revisão de 5 MiB, menos que ler uma cópia inteira).
 
 | Backend | Onde | Uso |
 |---|---|---|

@@ -322,8 +322,9 @@ fn revisions_are_files_of_their_own() {
     add(&mut s, "10.0.0.1/24");
     add(&mut s, "10.0.1.1/24");
     drop(s);
+    // The older revisions have files (differences); the newest is the slot.
     for n in 0..=2 {
-        assert!(dir.0.join(revision_file(n)).exists(), "revision {n}");
+        assert_eq!(dir.0.join(revision_file(n)).exists(), n < 2, "revision {n}");
     }
     let first = fs::read(dir.0.join(revision_file(1))).unwrap();
     let slot = fs::read_to_string(dir.0.join(CURRENT)).unwrap();
@@ -340,7 +341,8 @@ fn revisions_are_files_of_their_own() {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(dir.0.join(revision_file(3)))
+        assert!(!dir.0.join(revision_file(3)).exists());
+        let mode = fs::metadata(dir.0.join(revision_file(2)))
             .unwrap()
             .permissions()
             .mode();
