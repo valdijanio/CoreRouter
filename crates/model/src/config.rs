@@ -277,6 +277,9 @@ pub struct Ip {
     /// `/ip dhcp-relay` (G4.2b).
     #[serde(skip_serializing_if = "crate::dhcp_relay::DhcpRelays::is_empty")]
     pub dhcp_relays: crate::dhcp_relay::DhcpRelays,
+    /// `/ip firewall cgnat` (G2.3): CGNAT pools and 1:1 exceptions.
+    #[serde(skip_serializing_if = "crate::cgnat::Cgnat::is_empty")]
+    pub cgnat: crate::cgnat::Cgnat,
 }
 
 impl Ip {

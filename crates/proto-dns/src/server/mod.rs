@@ -35,6 +35,10 @@ use crate::resolver::{Resolver, Source, Transport};
 
 include!(concat!(env!("OUT_DIR"), "/stages.rs"));
 
+pub mod explain;
+
+use explain::{Decision, Note, Outcome};
+
 pub use statistics::{ClientStats, Counters, Snapshot, Statistics};
 
 /// The smallest message a client must accept (RFC 1035 §4.2.1).
@@ -155,6 +159,14 @@ pub struct Query {
     /// Where the upstream stage got its answer.
     pub source: Option<Source>,
     pub effects: Vec<Effect>,
+    /// `explain` (G6.8): each stage's decision so far.
+    explain: Option<Vec<Decision>>,
+    /// What the running stage said about itself ([`Query::note`]).
+    pending: Option<Note>,
+    /// Asked on behalf of a LAN address (`as_client`, G6.8): no packet
+    /// came, so nothing is counted, no bucket token taken, no address
+    /// list touched.
+    simulated: bool,
     /// The client's message (id, flags, question, EDNS), for the reply.
     request: Message,
     /// Largest reply the client takes over UDP.
@@ -176,7 +188,22 @@ pub struct Done {
     pub reply: Option<Vec<u8>>,
     pub effects: Vec<Effect>,
     pub answered_by: &'static str,
+    /// Each stage's decision, when asked with [`How::explain`].
+    pub explain: Vec<Decision>,
 }
+
+/// How a query the router asks itself (DNS Lookup, G6.8) goes down the
+/// chain.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct How {
+    /// Keep each stage's decision ([`Done::explain`]).
+    pub explain: bool,
+    /// The client is simulated (`as_client`): see [`Query`].
+    pub simulated: bool,
+}
+
+/// Stages that only count (they never decide): left out of `explain`.
+const NOT_EXPLAINED: [&str; 1] = ["statistics"];
 
 pub enum Start {
     Done(Done),
@@ -312,6 +339,18 @@ impl Forwarder {
     /// A message from `client`: runs the chain as far as it can without
     /// waiting on the network.
     pub fn start(&self, packet: &[u8], client: IpAddr, tcp: bool, now_ms: u64) -> Start {
+        self.start_as(packet, client, tcp, now_ms, How::default())
+    }
+
+    /// [`Self::start`] for a query the router asks itself (G6.8).
+    pub fn start_as(
+        &self,
+        packet: &[u8],
+        client: IpAddr,
+        tcp: bool,
+        now_ms: u64,
+        how: How,
+    ) -> Start {
         let request = match parse_request(packet) {
             Ok(m) => m,
             Err(reply) => {
@@ -319,17 +358,25 @@ impl Forwarder {
                     reply,
                     effects: Vec::new(),
                     answered_by: "parse",
+                    explain: Vec::new(),
                 });
             }
         };
         let config = self.config();
         let mut query = match Query::new(request, client, tcp, now_ms, config) {
-            Ok(q) => q,
+            Ok(mut q) => {
+                q.simulated = how.simulated;
+                if how.explain {
+                    q.explain = Some(Vec::new());
+                }
+                q
+            }
             Err(reply) => {
                 return Start::Done(Done {
                     reply: Some(reply),
                     effects: Vec::new(),
                     answered_by: "parse",
+                    explain: Vec::new(),
                 });
             }
         };
@@ -367,20 +414,30 @@ impl Forwarder {
                 Some(ref mut x) => Some(&mut **x),
                 None => None,
             };
-            match (stage.handle)(self, q, tt) {
-                Step::Next => {}
-                Step::Wait if waiting => return Some(i),
+            let step = (stage.handle)(self, q, tt);
+            match step {
+                Step::Next => q.decided(stage, Outcome::Passed),
+                Step::Wait if waiting => {
+                    // Called again on a worker: it decides then.
+                    q.pending = None;
+                    return Some(i);
+                }
                 Step::Wait => {
+                    q.decided(stage, Outcome::Answered);
                     q.answered_by = stage.name;
                     q.reply = Some(Reply::code(ResponseCode::ServFail));
+                    q.not_reached(i + 1);
                     return None;
                 }
                 Step::Drop => {
+                    q.decided(stage, Outcome::Dropped);
                     q.answered_by = stage.name;
                     q.dropped = true;
+                    q.not_reached(i + 1);
                     return None;
                 }
                 Step::Reply(mut r) => {
+                    q.decided(stage, Outcome::Answered);
                     q.answered_by = stage.name;
                     if !q.prefix.is_empty() {
                         let mut all = q.prefix.clone();
@@ -388,6 +445,7 @@ impl Forwarder {
                         r.answers = all;
                     }
                     q.reply = Some(r);
+                    q.not_reached(i + 1);
                     return None;
                 }
             }
@@ -402,22 +460,28 @@ impl Forwarder {
             .reply
             .take()
             .unwrap_or_else(|| Reply::code(ResponseCode::ServFail));
-        for stage in stages() {
-            if let Some(after) = stage.after {
-                after(self, &mut q, &reply);
+        // A simulated client sent nothing: nothing to count or act on.
+        if !q.simulated {
+            for stage in stages() {
+                if let Some(after) = stage.after {
+                    after(self, &mut q, &reply);
+                }
             }
         }
+        let explain = q.explain.take().unwrap_or_default();
         if q.dropped {
             return Done {
                 reply: None,
                 effects: q.effects,
                 answered_by: q.answered_by,
+                explain,
             };
         }
         Done {
             reply: encode(&q, &reply),
             effects: std::mem::take(&mut q.effects),
             answered_by: q.answered_by,
+            explain,
         }
     }
 }
@@ -468,11 +532,55 @@ impl Query {
             answered_by: "",
             source: None,
             effects: Vec::new(),
+            explain: None,
+            pending: None,
+            simulated: false,
             request,
             udp_limit,
             reply: None,
             dropped: false,
         })
+    }
+
+    /// Asked for a simulated client (`as_client`): no packet came.
+    pub fn simulated(&self) -> bool {
+        self.simulated
+    }
+
+    /// `stage` is done with the query: its decision, with what it noted.
+    fn decided(&mut self, stage: &Stage, outcome: Outcome) {
+        let Some(log) = self.explain.as_mut() else {
+            return;
+        };
+        let note = self.pending.take().unwrap_or_default();
+        if NOT_EXPLAINED.contains(&stage.name) {
+            return;
+        }
+        log.push(Decision {
+            stage: stage.name,
+            outcome,
+            why: note.why,
+            args: note.args,
+            rule: note.rule,
+        });
+    }
+
+    /// The stages from `from` on never saw the query.
+    fn not_reached(&mut self, from: usize) {
+        let Some(log) = self.explain.as_mut() else {
+            return;
+        };
+        for stage in stages().iter().skip(from) {
+            if !NOT_EXPLAINED.contains(&stage.name) {
+                log.push(Decision {
+                    stage: stage.name,
+                    outcome: Outcome::NotReached,
+                    why: "not-reached",
+                    args: vec![("stage", self.answered_by.to_owned())],
+                    rule: None,
+                });
+            }
+        }
     }
 
     /// A stage dropped it: no reply goes out.

@@ -207,27 +207,17 @@ pub(crate) fn route_issues<'a>(
         ));
     }
     if let Reach::Invalid { field, why } = route::reach(cfg, r) {
-        out.push((field, why));
+        out.push((field, why.text));
     }
+    // Equal distance is ECMP (RouterOS v7, G1.27): only the very same
+    // next hop twice is refused.
     for o in others.filter(|o| o.id != r.id && o.routing_table == r.routing_table) {
-        if o.dst_address != r.dst_address {
-            continue;
-        }
-        if o.gateway == r.gateway {
+        if o.dst_address == r.dst_address && o.gateway == r.gateway {
             out.push((
                 "gateway",
                 format!(
                     "route {} already goes to {dst} via {} in table {}",
                     o.id, o.gateway, r.routing_table
-                ),
-            ));
-        } else if o.distance == r.distance && !o.disabled && !r.disabled {
-            out.push((
-                "distance",
-                format!(
-                    "route {} to {dst} in table {} has distance {} too; give a backup route \
-                     another distance, or disable one of them",
-                    o.id, r.routing_table, r.distance
                 ),
             ));
         }

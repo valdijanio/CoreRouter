@@ -6,8 +6,9 @@
 
 use hickory_proto::op::ResponseCode;
 
-use crate::server::{Forwarder, Query, Reply, Stage, Step};
 use crate::resolver::Transport;
+use crate::server::explain::Note;
+use crate::server::{Forwarder, Query, Reply, Stage, Step};
 
 pub(crate) const STAGE: Stage = Stage {
     name: "acl",
@@ -17,9 +18,15 @@ pub(crate) const STAGE: Stage = Stage {
 };
 
 fn handle(_: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
-    if q.client.is_loopback() || q.config.allowed.iter().any(|n| n.contains(&q.client)) {
-        Step::Next
-    } else {
-        Step::Reply(Reply::code(ResponseCode::Refused))
+    let client = q.client;
+    if client.is_loopback() {
+        q.note(|| Note::new("acl.loopback").arg("client", client));
+        return Step::Next;
     }
+    if let Some(net) = q.config.allowed.iter().find(|n| n.contains(&client)).copied() {
+        q.note(|| Note::new("acl.allowed").arg("client", client).arg("net", net));
+        return Step::Next;
+    }
+    q.note(|| Note::new("acl.refused").arg("client", client));
+    Step::Reply(Reply::code(ResponseCode::Refused))
 }

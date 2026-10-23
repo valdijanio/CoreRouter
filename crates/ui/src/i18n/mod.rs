@@ -21,8 +21,12 @@
 //! A preference of the window, not of the router: stored with the theme
 //! (`prefs.rs`).
 
+mod dns_lookup_pt;
 mod en;
+mod menu_en;
+mod menu_pt;
 mod pt;
+mod routes_pt;
 mod tuning_en;
 mod tuning_pt;
 mod xdp_en;
@@ -63,15 +67,22 @@ impl Lang {
     fn labels(self) -> &'static [Table] {
         match self {
             Lang::En => &[],
-            Lang::Pt => &[pt::LABELS, tuning_pt::LABELS, xdp_pt::LABELS],
+            Lang::Pt => &[
+                pt::LABELS,
+                tuning_pt::LABELS,
+                menu_pt::LABELS,
+                routes_pt::LABELS,
+                dns_lookup_pt::LABELS,
+                xdp_pt::LABELS,
+            ],
         }
     }
 
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, xdp_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, xdp_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, xdp_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, xdp_pt::HELP],
         }
     }
 
@@ -79,7 +90,7 @@ impl Lang {
     fn templates(self) -> &'static [Table] {
         match self {
             Lang::En => &[],
-            Lang::Pt => &[tuning_pt::TEMPLATES],
+            Lang::Pt => &[tuning_pt::TEMPLATES, routes_pt::TEMPLATES, dns_lookup_pt::TEMPLATES],
         }
     }
 }
@@ -210,17 +221,26 @@ mod tests {
 
     #[test]
     fn every_engine_text_has_a_portuguese_template_with_the_same_places() {
+        use corerouter_engine::route_detail::CHOICES;
+        use corerouter_engine::route_table::REASONS;
         use corerouter_engine::tuning::{FINDINGS, WHY};
-        let groups = [("why", WHY), ("finding", FINDINGS)];
+        let groups = [("why", WHY), ("finding", FINDINGS), ("route", REASONS), ("choice", CHOICES)];
         let mut ids = Vec::new();
         for (prefix, texts) in groups {
             for (id, en) in texts {
                 let key = format!("{prefix}.{id}");
                 let pt = lookup(Lang::Pt.templates(), &key)
-                    .unwrap_or_else(|| panic!("tuning_pt.rs lacks {key}"));
+                    .unwrap_or_else(|| panic!("no Portuguese template {key}"));
                 assert_eq!(places(en), places(pt), "{key}");
                 ids.push(key);
             }
+        }
+        for (id, en) in corerouter_engine::dns_lookup::WHY_TEXTS {
+            let key = format!("dnswhy.{id}");
+            let pt = lookup(Lang::Pt.templates(), &key)
+                .unwrap_or_else(|| panic!("dns_lookup_pt.rs lacks {key}"));
+            assert_eq!(places(en), places(pt), "{key}");
+            ids.push(key);
         }
         for (k, _) in Lang::Pt.templates().iter().flat_map(|t| t.iter()) {
             assert!(ids.iter().any(|i| i == k), "{k}: the engine has no such text");

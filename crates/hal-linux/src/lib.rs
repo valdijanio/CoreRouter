@@ -64,6 +64,16 @@ mod netlink;
 #[cfg(target_os = "linux")]
 pub mod nft;
 
+/// nf_tables over nfnetlink (G2.3b): the encoder is pure, the socket Linux.
+pub mod nfnl;
+
+/// Conntrack over ctnetlink (G2.2): codec pure, socket Linux.
+pub mod ctnl;
+
+/// The CGNAT table in the kernel (G2.3).
+#[cfg(target_os = "linux")]
+mod cgnat;
+
 #[cfg(target_os = "linux")]
 pub mod l2;
 
@@ -395,6 +405,23 @@ mod linux {
                 let dynamic = crate::nft::dynamic();
                 crate::nft::run(&corerouter_firewall::script(to, &dynamic))?;
             }
+            // CGNAT (G2.3): its own table, replaced whole in one batch.
+            let cgnat = corerouter_firewall::cgnat::changed(&from.ip.cgnat, &to.ip.cgnat);
+            if cgnat && let Err(e) = crate::cgnat::apply(&from.ip.cgnat, &to.ip.cgnat) {
+                if firewall {
+                    let dynamic = crate::nft::dynamic();
+                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
+                    {
+                        log::error!("restoring the previous firewall: {back}");
+                    }
+                }
+                return Err(e);
+            }
+            let undo_cgnat = || {
+                if cgnat && let Err(back) = crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat) {
+                    log::error!("restoring the previous CGNAT table: {back}");
+                }
+            };
             // Ethernet settings next: validated by the engine against what
             // the port supports, they rarely fail; if the plan below does,
             // they go back too.
@@ -403,6 +430,7 @@ mod linux {
             let root = self.sysctl.root.clone();
             let cpu = (&from.system.tuning.cpu, &to.system.tuning.cpu);
             if let Err(e) = self.cpu.transition(cpu.0, cpu.1, &root) {
+                undo_cgnat();
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -435,6 +463,7 @@ mod linux {
             });
             if let Err(e) = tuned {
                 undo_cpu(self);
+                undo_cgnat();
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -467,7 +496,9 @@ mod linux {
                 let why = external.get(op.link().as_str()).map_or("", String::as_str);
                 log::warn!("not applied: {op} ('{}' is not managed: {why})", op.link());
             }
-            match crate::netlink::apply(&run) {
+            let mut owned = crate::plan::kernel_routes(from);
+            owned.extend(crate::plan::kernel_routes(to));
+            match crate::netlink::apply(&run, &owned) {
                 Ok(()) => {
                     self.claims = claims_of(to);
                     self.sync_ra(to);
@@ -485,6 +516,7 @@ mod linux {
                         log::error!("restoring kernel parameters: {back}");
                     }
                     undo_cpu(self);
+                    undo_cgnat();
                     if firewall {
                         // The links went back to `from`: so does the firewall.
                         let dynamic = crate::nft::dynamic();
@@ -644,6 +676,16 @@ mod linux {
             })
         }
 
+        /// `RTM_GETROUTE` (G1.27).
+        fn route_get(
+            &mut self,
+            cfg: &Config,
+            q: &corerouter_hal::route_get::RouteQuery,
+        ) -> Result<corerouter_hal::route_get::KernelLookup, HalError> {
+            let _ = cfg;
+            crate::netlink::route_get(q)
+        }
+
         /// One round of [`crate::plan::repair`], all or nothing.
         fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {
             let have = self.snapshot(cfg)?;
@@ -651,7 +693,7 @@ mod linux {
             for op in &ops {
                 log::info!("reconcile: {op}");
             }
-            crate::netlink::apply(&ops)
+            crate::netlink::apply(&ops, &crate::plan::kernel_routes(cfg))
         }
 
         fn unmanaged(&mut self) -> Vec<(IfName, String)> {

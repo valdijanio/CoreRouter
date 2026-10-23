@@ -57,6 +57,51 @@ Layout da imagem:
 3. **DPDK/VPP:** não entra no caminho crítico. Se um cliente precisar de >100 Gbit/s de CGNAT
    por caixa, vira um terceiro backend do mesmo trait (VPP pela API binária).
 
+#### 1.2.1 nftables: netlink direto × o binário `nft` (G2.3b, **medido**)
+
+O CGNAT fala com o nf_tables por **nfnetlink**, num lote atômico (`NFNL_MSG_BATCH_BEGIN/END`), sem
+o programa `nft`. O encoder é próprio, em `crates/hal-linux/src/nfnl.rs`, sem `unsafe`.
+
+Descrição única: `corerouter_firewall::program::Table`. Dela saem tanto o texto de "Ver regras"
+quanto as mensagens.
+
+Números do CGNAT: AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0, nft 1.0.9, build release,
+netns sem root, 2026-10-23, `cargo bench -p corerouter-hal-linux --bench netns_cgnat`.
+
+| Operação | netlink (Rust) | `nft -f` |
+|---|---|---|
+| tabela com 1 Ki assinantes | 17,5 ms | 23,7 ms |
+| tabela com 16 Ki assinantes | 26,5 ms | 90,0 ms |
+| tabela com 64 Ki assinantes | 66,0 ms | 303 ms |
+| um assinante a mais numa tabela de 64 Ki (com o diff) | 0,155 ms | 2,40 ms |
+
+**Por que netlink:**
+
+- É 4,6× mais rápido para carregar e 15× para mudar um elemento.
+- O `nft` precisa de uma correspondência de protocolo para mapear portas; o kernel, não. Por
+  isso uma regra só cobre TCP, UDP, ICMP e o resto, e o mapa `a_` por pool deixou de existir.
+- Sem um processo externo nem texto gerado para outro parser, a mudança vai como diferença de
+  elementos. Os mapeamentos UDP vivos (EIM) sobrevivem a uma mudança que não remapeia ninguém.
+- O kernel continua dono da atomicidade: o lote entra inteiro ou nada.
+
+**O que se paga:**
+
+- Mantemos os números de atributo da UAPI (`nf_tables.h`, que só cresce por acréscimo) e um
+  subconjunto pequeno de expressões: `payload`, `meta`, `cmp`, `bitwise`, `ct`, `lookup`, `nat`,
+  `dynset`, `counter`, `immediate`.
+- Os testes em netns conferem que o kernel aceita e que o `nft list` lê o que foi carregado.
+- Os crates Rust disponíveis não cobriam faixas na NAT, `dynset` nem dados de mapa com faixa:
+  `rustables` 0.9 (GPL, bindgen e `unsafe`) e `netlink-packet-netfilter` 0.4 (sem `nat`, `ct` e
+  `dynset`).
+
+**Limite em user namespace:**
+
+- Lá o `SO_SNDBUFFORCE` é recusado e o lote cabe em 2 × `wmem_max`, cerca de 8 MiB, ou seja, uns
+  150 mil assinantes (**estimado**).
+- No roteador o daemon é root e o limite some.
+
+O firewall do G2.1 continua no `nft -f` por enquanto: a migração para o mesmo encoder é a G2.8.
+
 ### 1.3 Control plane (BGP, OSPF, MPLS/LDP, BFD)
 
 **Decisão: orquestrar FRRouting sob a camada transacional do engine; avaliar holo como segundo
@@ -92,11 +137,11 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 
 | Camada | Crate | Responsabilidade | Pode depender de |
 |---|---|---|---|
-| L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas), `users` (contas e grupos, salvos fora das revisões), `firewall` e `interface_list` (G2.1) | serde, ipnet, thiserror |
+| L0 | `crates/model` | Tipos (Asn, VlanId, IfName, MacAddr, ItemId, Gateway, RoutingTable, prefixos `ipnet`), árvore `Config`, `ConfigStore` (candidate/running, commit, rollback, diff, histórico), `route` (resolução de gateway e rotas conectadas), `users` (contas e grupos, salvos fora das revisões), `firewall` e `interface_list` (G2.1), `cgnat` (G2.3: pools e a função de mapeamento `Layout`, RFC 7422, a mesma para engine, kernel e XDP; `docs/cgnat.md`) | serde, ipnet, thiserror |
 | L0 | `crates/buildinfo` | Versão e commit do build (`COREROUTER_COMMIT` pelo `build.rs`): `server.info` e o aviso de daemon de outro commit na GUI. Crate à parte para um commit novo não recompilar o workspace | nada do workspace |
 | L1 | `crates/hal` | Trait `Hal` (discover, apply transacional, poll, relógio, features, `prober`, entradas dinâmicas de address-list, transporte do cliente DHCP `dhcp_port`/`DhcpPort`, G4.7; DHCPv6 `dhcp6_port`/`Dhcp6Port` e o que o kernel aprendeu por RA `ipv6_learned`/`Learned`, G4.7b; `sfp_module`/`cable_tester`, G1.20) + `VirtualHal` (lab, wasm, CI; guarda o ruleset que aplicaria; simula um SFP+ e o teste de cabo); `probe` (trait `Prober`/`ProbeSocket` das ferramentas), `sim` (rede simulada determinística, G6.2) e `sff` (EEPROM SFF-8472/8636 decodificado em código puro, G1.20) | L0, `firewall` (lateral permitido) |
-| L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
-| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
+| L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; a tabela `ip corerouter_cgnat` do CGNAT (`cgnat`, G2.3); sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
+| L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT por nfnetlink (`nfnl`, `cgnat`, G2.3b) e conntrack por ctnetlink (`ctnl`, G2.2); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`); o mesmo para DHCPv6 com codec próprio (`v6`, `client6`, `lab6`; G4.7b) | L0, L1 |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
@@ -477,6 +522,18 @@ escrevem regras comuns pelo mesmo `add` dos comandos de regra; a GUI só junta p
   recoloca depois, para que o desfazer de uma falha devolva tudo. Rota existente no kernel só é
   adotada se for idêntica (static, mesma tabela/métrica/next hop); outra rota no mesmo destino e
   métrica faz o apply falhar e desfazer.
+- **ECMP (G1.27a):** rotas de mesma distância ao mesmo destino formam um grupo (como no RouterOS
+  v7). O plano e o drift continuam vendo um `KernelRoute` por caminho; quem junta é o executor
+  netlink: o primeiro op de rota de um apply lê as rotas `static` do kernel uma vez (cache do
+  apply), e acrescentar/tirar um caminho de um grupo reescreve a rota inteira com
+  `RTA_MULTIPATH` (`NLM_F_REPLACE`). Só caminhos que o config de origem ou de destino põe no
+  kernel entram num grupo: uma rota `static` de outro programa no mesmo destino e métrica
+  continua fazendo o apply falhar. Escolhido em vez de mudar o `Op` do plano para "grupo" porque
+  o IPv4 apaga a rota multipath inteira se o delete casa só o primeiro caminho, então o executor
+  precisa da visão do kernel de qualquer jeito, e o plano (e os testes dele) ficam como estão.
+  Custo: uma leitura de links e rotas por apply que mexe em rota (`hal_linux_apply/routes` em
+  `docs/routes.md` e no `docs/perf.md`). Detalhes da janela, do motivo e do lookup:
+  `docs/routes.md`.
 
 Proteções do host: só interfaces do config entram no plano; o `lo` do kernel não é descoberto;
 link existente só é adotado se tiver o mesmo tipo (e VLAN id/pai) do config, e nunca se apaga
@@ -680,6 +737,31 @@ também o roda), o engine guarda o estado e aplica os efeitos, o daemon só o di
   (tirar da config o restaura).
 - O engine (`tuning.rs`) calcula perfis, faixas e diagnóstico, puro e testado sem kernel.
 - Medida de pps em netns: `docs/tuning.md`.
+
+### Menu lateral e ícones (G0.23)
+
+O menu é uma árvore (grupo › subgrupo › janela) montada de uma **tabela central**,
+`crates/ui/src/menu.rs` (`CATALOG`, indexada pela chave da janela): subgrupo, rótulo curto,
+ícone, caminho no RouterOS, comandos e sinônimos de busca. Os painéis continuam declarando só o
+grupo (`WinDef::group`); a tabela evita editar cada painel (arquivos de outras sessões) e um teste
+garante que toda janela tem entrada, ícone, explicação em EN e PT e sinônimos. Os comandos do ⓘ
+vêm do `engine.list` do roteador, filtrados pelos prefixos da tabela: a UI não mantém lista
+própria. Grupos abertos são preferência da janela (`prefs.rs`, chave `menu`).
+
+**Ícones: Phosphor Icons (MIT), fonte embutida em subconjunto, sem dependência nova.**
+
+- **Comparado:** o crate `egui-phosphor` (MIT/Apache-2.0) era o caminho óbvio, mas a 0.14 (a mais
+  nova, 2026-09) depende de egui 0.36 e o workspace está no 0.37: seriam duas versões do egui no
+  build (tempo de compilação, wasm maior) só para ler bytes e constantes. Ícones desenhados à mão
+  (como o ⓘ do G0.15) não escalam para ~50 desenhos.
+- **Como fica:** `crates/ui/assets/phosphor/Phosphor-subset.ttf` (16,0 KB, 50 ícones, **medido**;
+  a fonte completa tem 489 KB) é cortado da `Phosphor.ttf` do próprio crate `egui-phosphor`
+  0.14.0 por `scripts/icons-subset.sh` (pyftsubset), a partir dos códigos listados em
+  `crates/ui/src/icons.rs`. A fonte entra numa família própria (`FontFamily::Name("phosphor")`),
+  porque a fonte de emoji do egui usa os mesmos códigos da área privada para outros desenhos.
+  Compila em `wasm32-unknown-unknown` (é só `include_bytes!`). O teste `the_font_has_every_icon`
+  reprova ícone sem glifo. Quando o `egui-phosphor` acompanhar o egui do workspace, dá para trocar
+  o subconjunto pelo crate (macro `subset!`) sem mudar `icons.rs`.
 
 ## Histórico de revisão
 

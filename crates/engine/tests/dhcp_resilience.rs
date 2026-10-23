@@ -321,6 +321,10 @@ fn check_gateway_arp_withholds_the_routes_while_the_gateway_is_silent() {
     let d = l.defaults();
     assert_eq!(d[0]["dynamic"], true);
     assert_eq!(d[0]["active"], true);
+    // G1.27: the route shows its check-gateway.
+    assert_eq!(d[0]["check_gateway"]["method"], "arp");
+    assert_eq!(d[0]["check_gateway"]["state"], "up");
+    assert_eq!(d[0]["origin"], "dhcp");
 
     l.server.set(|k| k.gateway_down = true);
     // Two unanswered checks, 10 s apart.
@@ -334,6 +338,32 @@ fn check_gateway_arp_withholds_the_routes_while_the_gateway_is_silent() {
             .as_str()
             .unwrap()
             .contains("check-gateway=arp")
+    );
+    // G1.27: how long ago it failed.
+    assert_eq!(dhcp["reason_id"], "check-gateway", "{dhcp}");
+    assert!(
+        dhcp["reason"].as_str().unwrap().contains(" s ago"),
+        "{dhcp}"
+    );
+    assert_eq!(dhcp["check_gateway"]["state"], "down");
+    assert_eq!(dhcp["state"], "inactive");
+    // G1.27b: the detail names the client and the check.
+    let det = l.ok("ip.route.detail", json!({"key": dhcp["key"]}));
+    assert_eq!(det["source"]["kind"], "dhcp");
+    assert!(
+        det["source"]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("DHCP client on ether1"),
+        "{det}"
+    );
+    assert!(
+        det["check_gateway"]["misses"].as_u64().unwrap() >= 2,
+        "{det}"
+    );
+    assert!(
+        det["check_gateway"]["down_secs"].as_u64().is_some(),
+        "{det}"
     );
     let backup = d.iter().find(|r| r["dynamic"] == false).unwrap();
     assert_eq!(backup["active"], true, "{d:?}");

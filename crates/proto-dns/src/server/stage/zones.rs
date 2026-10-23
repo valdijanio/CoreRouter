@@ -21,6 +21,7 @@ use hickory_proto::rr::RData;
 
 use crate::message::QName;
 use crate::resolver::Transport;
+use crate::server::explain::{Note, Rule};
 use crate::server::{Forwarder, Query, Reply, Stage, Step};
 use crate::zone::{self, Found, dnssec};
 
@@ -36,15 +37,23 @@ const MAX_CNAMES: usize = 8;
 
 fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
     if q.config.config.ip.dns_zones.zones.is_empty() {
+        q.note(|| Note::new("zones.none"));
         return Step::Next;
     }
     for _ in 0..MAX_CNAMES {
         let Some(found) = zone::find(f, &q.config, &q.name.key) else {
+            if !q.explaining() || q.prefix.is_empty() {
+                q.note(|| Note::new("zones.none"));
+            }
             return Step::Next;
         };
         let Ok(z) = found else {
+            let key = q.name.key.clone();
+            q.note(|| Note::new("zones.not-loaded").arg("zone", key));
             return Step::Reply(Reply::code(ResponseCode::ServFail));
         };
+        let zname = z.key.clone();
+        q.note(|| Note::new("zones.answered").arg("zone", &zname).rule(Rule::Zone(zname.clone())));
         let mut r = Reply::code(ResponseCode::NoError);
         r.authoritative = true;
         let found = z.lookup(&q.name.name, &q.name.key, q.qtype);
@@ -78,9 +87,17 @@ fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
                     })
                     .collect();
                 if q.recursion_desired() && !addrs.is_empty() {
+                    q.note(|| {
+                        let list: Vec<String> = addrs.iter().map(ToString::to_string).collect();
+                        Note::new("zones.delegated")
+                            .arg("zone", &zname)
+                            .arg("servers", list.join(", "))
+                            .rule(Rule::Zone(zname.clone()))
+                    });
                     q.forward_to = Some(crate::resolver::Upstreams::plain(addrs));
                     return Step::Next;
                 }
+                q.note(|| Note::new("zones.referral").arg("zone", &zname).rule(Rule::Zone(zname.clone())));
                 r.authoritative = false;
                 r.authority = ns;
                 r.additional = glue;

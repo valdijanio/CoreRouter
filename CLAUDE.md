@@ -53,6 +53,30 @@ outros roteadores, RFCs, kernel, crates). Antes de planejar:
 Quando um humano pede uma feature, mostre a ele esse resumo (MikroTik, outros, melhorias
 propostas) **antes** de implementar e deixe-o escolher o escopo.
 
+### Todo pedido, feature ou correção: o que mostrar antes de implementar
+
+Vale para pedido de feature nova, melhoria de tela e correção de bug. Antes do código, entregue
+ao usuário, nesta ordem (pule o que não cabe no pedido e diga que pulou):
+
+1. **O que existe hoje:** como o código, a tela e os comandos se comportam agora e onde moram
+   (arquivo e linha); num bug, a causa reproduzida, não a suposta.
+2. **Os padrões do projeto que se aplicam:** `docs/ui-style.md` (selos, tabelas, padrão de
+   janela de lista e de modal), comandos (`cmd!`, `params`), i18n (rótulos em inglês,
+   explicações em português, ⓘ), tabelas centrais (menu, ícones). O pedido segue o padrão; se o
+   padrão não serve, diga por quê e proponha mudar o padrão, não abrir exceção.
+3. **Mockup** quando o pedido mexe em tela: uma ou mais opções lado a lado, com a recomendada
+   marcada, para o usuário escolher.
+4. **Como deve funcionar pela norma:** a RFC e as atualizações e errata quando há protocolo; a
+   documentação do MikroTik v7 e de pelo menos dois outros (seção "Pesquisa antes de
+   implementar").
+5. **Extras:** ideias que o usuário não pediu e que fariam diferença (operação, diagnóstico,
+   segurança por padrão, o que o motor permite: transação, Safe Mode, MCP).
+6. **Riscos do próprio pedido:** o que ele pode quebrar ou piorar (lockout, desempenho,
+   compatibilidade, dado perdido, conflito com outra sessão), e como evitar.
+
+Só depois da escolha do usuário o trabalho começa. O mesmo resumo vai no corpo do PR (seção
+`## Pesquisa` e, quando houver, `## Extras e riscos`).
+
 ## Desempenho e escolha de implementação (Rust puro × ferramenta externa)
 
 Decisões de desempenho se tomam com números, não com preferência.

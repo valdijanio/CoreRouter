@@ -10,12 +10,14 @@ use serde_json::{Value, json};
 
 use super::CommandSpec;
 use super::args::{opt_bool, opt_str, req_str};
-use crate::dns_lookup::{Job, LookupServer, Mode, NEEDS_DAEMON, command_line, record_type, run};
+use crate::dns_lookup::{
+    Job, LookupServer, Mode, NEEDS_DAEMON, RouterAsk, command_line, record_type, run,
+};
 use crate::tasks::can_run;
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "tool.dns.query", "DNS Lookup", ["Tools", "DNS Lookup"], None,
-    "{name: string (a name, or an address for its PTR), type?: A | AAAA | ANY | CAA | CNAME | DNSKEY | DS | HTTPS | MX | NS | PTR | SOA | SRV | SSHFP | SVCB | TLSA | TXT (default A; PTR for an address), server?: string (empty or router = the router's own chain; an IP; https://… DoH or tls://… DoT; all = every upstream, as compare), recursion?: bool (RD, default true), dnssec?: bool (DO), tcp?: bool, trace?: bool (from the root down), compare?: bool (every upstream side by side)} → {id, task_id, mode, name, type, command}; events {kind: answer|asn|compare|trace|error, …}",
+    "{name: string (a name, or an address for its PTR), type?: A | AAAA | ANY | CAA | CNAME | DNSKEY | DS | HTTPS | MX | NS | PTR | SOA | SRV | SSHFP | SVCB | TLSA | TXT (default A; PTR for an address), server?: string (empty or router = the router's own chain; an IP; https://… DoH or tls://… DoT; all = every upstream, as compare), recursion?: bool (RD, default true), dnssec?: bool (DO), tcp?: bool, trace?: bool (from the root down), compare?: bool (every upstream side by side), explain?: bool (with the router as server: what each stage of its chain decided, and the rule), as_client?: string (with the router as server: an IP of the LAN to ask as; the ACL, the per-client limit and the per-source rules see it, no packet is sent)} → {id, task_id, mode, name, type, command, as_client?}; events {kind: answer|why|asn|compare|trace|error, …}",
     can_lookup, query)
 .alias("dns-lookup")
 .positional("name")
@@ -111,6 +113,28 @@ fn query(s: &mut Session, p: &Value) -> Result<Value> {
         (false, false, Some(to)) => Mode::One(to),
         (false, false, None) => Mode::Compare(upstreams(s)),
     };
+    let explain = opt_bool(p, "explain")?.unwrap_or(false);
+    let as_client = match opt_str(p, "as_client")?.map(str::trim) {
+        None | Some("") => None,
+        Some(raw) => {
+            let shown: String = raw.chars().take(64).collect();
+            let ip = raw
+                .parse::<IpAddr>()
+                .map_err(|_| EngineError::bad("as_client", format!("'{shown}' is not an IP address")))?
+                .to_canonical();
+            if ip.is_unspecified() || ip.is_multicast() {
+                return Err(EngineError::bad("as_client", format!("{ip} cannot send a query")));
+            }
+            Some(ip)
+        }
+    };
+    if (explain || as_client.is_some()) && !matches!(mode, Mode::One(LookupServer::Router)) {
+        let key = if explain { "explain" } else { "as_client" };
+        return Err(EngineError::bad(
+            key,
+            "only with the router as the server (no server, trace or compare)",
+        ));
+    }
     let job = Job {
         typed,
         ask: Ask {
@@ -122,6 +146,7 @@ fn query(s: &mut Session, p: &Value) -> Result<Value> {
         rtype,
         tcp: opt_bool(p, "tcp")?.unwrap_or(false),
         mode,
+        router: RouterAsk { explain, as_client },
     };
     let backend = s
         .dns_backend()
@@ -133,12 +158,15 @@ fn query(s: &mut Session, p: &Value) -> Result<Value> {
         Mode::Trace => ("trace", None),
     };
     let command = command_line(&job, server_name.as_deref());
-    let title = format!("dig {}", command.chars().take(80).collect::<String>());
+    let mut title = format!("dig {}", command.chars().take(80).collect::<String>());
+    if let Some(ip) = as_client {
+        title.push_str(&format!(" (as {ip})"));
+    }
     let id = s.start_task("dns-lookup", title, move |ctx| {
         run(ctx, &backend, prober.as_ref(), &job)
     })?;
     Ok(json!({"id": id, "task_id": id, "mode": mode, "name": name, "type": rtype,
-        "command": format!("dig {command}")}))
+        "command": format!("dig {command}"), "as_client": as_client}))
 }
 
 #[cfg(test)]
@@ -227,7 +255,90 @@ mod tests {
                 ms: 4,
                 stage,
                 source: None,
+                explain: Vec::new(),
             })
+        }
+    }
+
+    /// The chain's answer to [`RouterAsk`]: the static stage answered.
+    #[derive(Default)]
+    struct Explained(Mutex<Vec<RouterAsk>>);
+
+    impl DnsBackend for Explained {
+        fn lookup(&self, _: &str) -> std::result::Result<Vec<IpAddr>, ResolveError> {
+            Ok(Vec::new())
+        }
+        fn cache_rows(&self) -> Vec<corerouter_model::dns::CacheRow> {
+            Vec::new()
+        }
+        fn cache_used_bytes(&self) -> usize {
+            0
+        }
+        fn flush(&self) {}
+        fn ask_router(&self, q: &[u8], _: bool, how: RouterAsk) -> std::result::Result<Exchanged, String> {
+            use corerouter_proto_dns::server::explain::{Decision, Outcome, Rule};
+            self.0.lock().unwrap().push(how);
+            let d = |stage, outcome, why: &'static str, args: Vec<(&'static str, String)>, rule| Decision { stage, outcome, why, args, rule };
+            Ok(Exchanged {
+                bytes: reply(q, 0, &[[192, 168, 88, 2]]),
+                server: "127.0.0.1#53(router)".into(),
+                transport: "UDP".into(),
+                ms: 0,
+                stage: Some("static".into()),
+                source: None,
+                explain: vec![
+                    d("acl", Outcome::Passed, "acl.allowed", vec![("client", "192.168.88.10".into()), ("net", "192.168.88.0/24".into())], None),
+                    d("static", Outcome::Answered, "static.answered", vec![("id", "*3".into()), ("match", "name=nas.lan".into()), ("type", "A".into())], Some(Rule::Static(3))),
+                    d("cache", Outcome::NotReached, "", Vec::new(), None),
+                ],
+            })
+        }
+    }
+
+    #[test]
+    fn explain_and_as_client_go_to_the_router_chain() {
+        let fake = Arc::new(Explained::default());
+        let mut s = Session::virtual_lab();
+        s.set_runner(test_runner::threads());
+        s.set_dns_backend(fake.clone());
+        let r = s
+            .execute("tool.dns.query", &json!({"name": "nas.lan", "explain": true, "as_client": "192.168.88.10"}))
+            .unwrap();
+        assert_eq!(r["as_client"], "192.168.88.10");
+        let done = until_done(&mut s, r["id"].as_u64().unwrap());
+        assert_eq!(done["state"], "done", "{done}");
+        assert_eq!(
+            fake.0.lock().unwrap()[0],
+            RouterAsk { explain: true, as_client: Some("192.168.88.10".parse().unwrap()) }
+        );
+        let events = done["events"].as_array().unwrap();
+        assert_eq!(events[0]["as_client"], "192.168.88.10");
+        let why: Vec<&Value> = events.iter().filter(|e| e["kind"] == "why").collect();
+        assert_eq!(why.len(), 3);
+        assert_eq!(why[1]["stage"], "static");
+        assert_eq!(why[1]["outcome"], "answered");
+        assert_eq!(why[1]["text"], "static entry *3 (name=nas.lan) answers A");
+        assert_eq!(why[1]["rule"], json!({"kind": "static", "id": "*3"}));
+        assert_eq!(why[1]["args"]["match"], "name=nas.lan");
+        assert_eq!(why[2]["outcome"], "not-reached");
+        let lines: Vec<&str> = done["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+        assert!(lines.iter().any(|l| l.starts_with(";; WHY static") && l.contains("answered")), "{lines:?}");
+        // An IPv4-mapped IPv6 address is the IPv4 one.
+        let r = s
+            .execute("tool.dns.query", &json!({"name": "nas.lan", "as_client": "::ffff:192.168.88.20"}))
+            .unwrap();
+        until_done(&mut s, r["id"].as_u64().unwrap());
+        assert_eq!(fake.0.lock().unwrap()[1].as_client, Some("192.168.88.20".parse().unwrap()));
+        for p in [
+            json!({"name": "a.example", "explain": true, "server": "1.1.1.1"}),
+            json!({"name": "a.example", "as_client": "192.168.88.10", "trace": true}),
+            json!({"name": "a.example", "explain": true, "compare": true}),
+            json!({"name": "a.example", "as_client": "lan-pc"}),
+            json!({"name": "a.example", "as_client": "0.0.0.0"}),
+            json!({"name": "a.example", "as_client": "224.0.0.1"}),
+        ] {
+            let err = s.execute("tool.dns.query", &p).unwrap_err();
+            assert!(matches!(err, EngineError::BadParam { .. }), "{p}: {err}");
         }
     }
 
@@ -400,7 +511,7 @@ mod tests {
                 }
                 other => return Err(format!("unexpected server {other}")),
             }
-            Ok(Exchanged { bytes: m.to_vec().unwrap(), server: ip.to_string(), transport: "UDP".into(), ms: 1, stage: None, source: None })
+            Ok(Exchanged { bytes: m.to_vec().unwrap(), server: ip.to_string(), transport: "UDP".into(), ms: 1, stage: None, source: None, explain: Vec::new() })
         }
     }
 

@@ -83,6 +83,19 @@ pub trait DnsBackend: Send + Sync {
         Err(crate::dns_lookup::NEEDS_DAEMON.into())
     }
 
+    /// `tool.dns.query` to the router's own chain with `explain` or
+    /// `as_client` (G6.8): the reply, and each stage's decision. Without a
+    /// daemon chain that knows them: [`Self::exchange`] to the router.
+    fn ask_router(
+        &self,
+        query: &[u8],
+        tcp: bool,
+        how: crate::dns_lookup::RouterAsk,
+    ) -> Result<crate::dns_lookup::Exchanged, String> {
+        let _ = how;
+        self.exchange(&crate::dns_lookup::LookupServer::Router, query, tcp)
+    }
+
     /// [`Self::exchange`] with every `(server, query)` at once (`compare`):
     /// the daemon asks them in parallel, so the slowest sets the time.
     fn exchange_all(

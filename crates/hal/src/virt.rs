@@ -281,6 +281,11 @@ impl VirtualHal {
         self.ruleset.as_deref()
     }
 
+    /// The CGNAT table (G2.3) the last applied config would load.
+    pub fn cgnat_script(&self) -> String {
+        corerouter_firewall::cgnat::render(&self.applied.ip.cgnat, None).script
+    }
+
     pub fn dynamic(&self) -> &[DynamicAddress] {
         &self.dynamic
     }
@@ -613,6 +618,15 @@ impl Hal for VirtualHal {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone())
+    }
+
+    fn route_get(
+        &mut self,
+        cfg: &Config,
+        q: &crate::route_get::RouteQuery,
+    ) -> Result<crate::route_get::KernelLookup, HalError> {
+        let k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
+        Ok(crate::route_get::lookup(cfg, &k, q))
     }
 
     fn reconcile(&mut self, cfg: &Config) -> Result<(), HalError> {

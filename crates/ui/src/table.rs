@@ -49,6 +49,8 @@ pub(crate) struct Column {
     pub right: bool,
     /// The item's comment: drawn above the row with Inline Comments on.
     pub comment: bool,
+    /// Secondary text (why a route is inactive): drawn in the weak colour.
+    pub weak: bool,
 }
 
 pub(crate) const fn col(title: &'static str) -> Column {
@@ -56,6 +58,7 @@ pub(crate) const fn col(title: &'static str) -> Column {
         title,
         right: false,
         comment: false,
+        weak: false,
     }
 }
 
@@ -64,6 +67,17 @@ pub(crate) const fn num(title: &'static str) -> Column {
         title,
         right: true,
         comment: false,
+        weak: false,
+    }
+}
+
+/// A column of secondary text, in grey (G1.27: the reason of a route).
+pub(crate) const fn weak(title: &'static str) -> Column {
+    Column {
+        title,
+        right: false,
+        comment: false,
+        weak: true,
     }
 }
 
@@ -73,6 +87,7 @@ pub(crate) const fn comment() -> Column {
         title: "Comment",
         right: false,
         comment: true,
+        weak: false,
     }
 }
 
@@ -167,6 +182,8 @@ pub(crate) enum Shortcut {
 pub(crate) struct TableOutput {
     /// Key of the row that was double-clicked.
     pub opened: Option<String>,
+    /// Key of the row clicked this frame (G1.27: an ECMP group opens).
+    pub clicked: Option<String>,
     /// Key of the item whose inline comment was double-clicked: edit the
     /// comment (a window without a comment dialog treats it as `opened`).
     pub comment: Option<String>,
@@ -191,6 +208,8 @@ pub(crate) struct TableState {
     /// a mark at the left end of the row, and a click on the mark brings
     /// that window to the front (as a double click on the row does).
     pub open: BTreeSet<String>,
+    /// [`Self::reveal`]: the selection waits for the rows to arrive.
+    revealing: bool,
 }
 
 impl TableState {
@@ -259,6 +278,15 @@ impl TableState {
         self.anchor = Some(key.to_owned());
     }
 
+    /// Select `key` in a table that may not have its rows yet (a window
+    /// opened to show that item): the selection holds until rows arrive,
+    /// and the find filter is cleared so the row shows.
+    pub fn reveal(&mut self, key: &str) {
+        self.select_only(key);
+        self.filter.clear();
+        self.revealing = true;
+    }
+
     pub fn select_all(&mut self, rows: &[Row]) {
         self.selected = self.visible(rows).map(|r| r.key.clone()).collect();
     }
@@ -303,6 +331,10 @@ impl TableState {
     /// Forget rows that are gone or filtered out: actions never touch rows
     /// the operator cannot see.
     fn retain(&mut self, order: &[&str]) {
+        if std::mem::take(&mut self.revealing) && order.is_empty() {
+            self.revealing = true;
+            return;
+        }
         // A set: `order.contains` per key was O(rows × selected) per frame.
         let shown: HashSet<&str> = order.iter().copied().collect();
         self.selected.retain(|k| shown.contains(k.as_str()));
@@ -651,6 +683,7 @@ pub(crate) fn show(
                     out.opened = Some(row.key.clone());
                 }
                 if resp.clicked() {
+                    out.clicked = Some(row.key.clone());
                     let m = ui.input(|i| i.modifiers);
                     state.click(&row.key, m.command, m.shift, &order);
                     ui.memory_mut(|mem| mem.request_focus(id));
@@ -1107,7 +1140,15 @@ fn paint_cells<'a>(
         };
         let shown = shown_text(text(i));
         let (cell, chips) = crate::chip::split(&shown);
-        let drawn = ui.painter().text(at, anchor, cell, font.clone(), color);
+        // A weak column greys plain text only (a selected, dimmed or
+        // tinted row keeps its colour).
+        let weak = columns.get(i).is_some_and(|c| c.weak) && color == ui.visuals().text_color();
+        let ink = if weak {
+            ui.visuals().weak_text_color()
+        } else {
+            color
+        };
+        let drawn = ui.painter().text(at, anchor, cell, font.clone(), ink);
         if !chips.is_empty() {
             crate::chip::paint_cell_chips(
                 ui.painter(),
@@ -1156,6 +1197,23 @@ mod tests {
         // Shift with no anchor behaves as a plain click.
         s.click("c", false, true, &ORDER);
         assert_eq!(sel(&s), ["c"]);
+    }
+
+    /// A window opened to show one item: the selection waits for its rows.
+    #[test]
+    fn reveal_waits_for_the_rows() {
+        let mut s = TableState {
+            filter: "zzz".into(),
+            ..TableState::default()
+        };
+        s.reveal("b");
+        assert!(s.filter.is_empty());
+        s.retain(&[]);
+        assert!(s.is_selected("b"), "no rows yet: kept");
+        s.retain(&ORDER);
+        assert!(s.is_selected("b"));
+        s.retain(&[]);
+        assert!(!s.is_selected("b"), "rows came: the usual rule again");
     }
 
     #[test]

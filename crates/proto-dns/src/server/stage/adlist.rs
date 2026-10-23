@@ -18,6 +18,7 @@ use hickory_proto::rr::{RData, Record, RecordType};
 
 use crate::adlist::Adlists;
 use crate::resolver::Transport;
+use crate::server::explain::{Note, Rule};
 use crate::server::{Forwarder, Query, Reply, Stage, Step};
 
 pub(crate) const STAGE: Stage = Stage {
@@ -34,12 +35,31 @@ pub const BLOCKED_TTL: u32 = 10;
 fn handle(f: &Forwarder, q: &mut Query, _: Option<&mut dyn Transport>) -> Step {
     let lists = f.state::<Adlists>();
     let Some(list) = lists.find(&q.name.key) else {
+        q.note(|| match lists.lists().len() {
+            0 => Note::new("adlist.off"),
+            n => Note::new("adlist.none").arg("count", n),
+        });
         return Step::Next;
     };
+    let key = q.name.key.clone();
+    let line = |why| {
+        let b = list.blocking(&key);
+        let (line, text) = b.map_or((0, String::new()), |b| (b.line, b.text));
+        Note::new(why)
+            .arg("list", corerouter_model::types::ItemId(list.id))
+            .arg("line", line)
+            .arg("text", text)
+            .rule(Rule::Adlist(list.id))
+    };
     if super::statics::forwarded(f, q, &q.name.key) {
+        q.note(|| line("adlist.allowed"));
         return Step::Next;
     }
-    list.hits.fetch_add(1, Ordering::Relaxed);
+    q.note(|| line("adlist.blocked"));
+    // A simulated client asked nothing: the match-count stays.
+    if !q.simulated() {
+        list.hits.fetch_add(1, Ordering::Relaxed);
+    }
     let owner = q.name.name.clone();
     let data = match q.qtype {
         RecordType::A => Some(RData::A(Ipv4Addr::UNSPECIFIED.into())),

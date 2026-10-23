@@ -2,15 +2,17 @@
 //! windows. The Zones button of the DNS window opens "DNS Zones" (found by
 //! its title).
 //!
-//! - **DNS Zones**: one row per zone (type, serial, records, status), New
+//! One window, "DNS Zones", with three tabs (G0.23c: they were three
+//! windows and three menu items):
+//! - **Zones**: one row per zone (type, serial, records, status), New
 //!   and properties dialogs (SOA timers, who may transfer, NOTIFY targets,
 //!   a secondary's primaries); the selected zone's records or zone file
 //!   open from the tool bar.
-//! - **DNS Zone Records**: the records of one zone, New/properties dialogs
-//!   with the fields of the type.
-//! - **DNS Zone File**: the zone file of a zone (RFC 1035 §5), to read,
-//!   copy, edit and load back (a window, not a dialog: Enter is a new line
-//!   there, never "OK").
+//! - **Records**: the records of one zone, New/properties dialogs with the
+//!   fields of the type.
+//! - **Zone File**: the zone file of a zone (RFC 1035 §5), to read, copy,
+//!   edit and load back (Enter is a new line there, never "OK"; Esc does
+//!   not close the window).
 //!
 //! The engine validates (`ip.dns.zone.*`) and moves the serial; the windows
 //! only show and send. A panel (`panel.rs`): its state lives here.
@@ -30,8 +32,6 @@ use crate::{CoreRouterUi, Win, form_number};
 
 const NAME: &str = "dns-zones";
 pub(crate) const WIN: &str = "dns-zones";
-pub(crate) const WIN_RECORDS: &str = "dns-zone-records";
-pub(crate) const WIN_FILE: &str = "dns-zone-file";
 pub(crate) const ZONE_TABLE: &str = "dns-zones";
 pub(crate) const RECORD_TABLE: &str = "dns-zone-records";
 const MAX_OPEN: usize = 8;
@@ -44,22 +44,8 @@ pub(crate) const PANEL: Panel = Panel {
             id: WIN,
             group: "IP",
             title: "DNS Zones",
-            size: [720.0, 300.0],
+            size: [720.0, 420.0],
             escape: true,
-        },
-        WinDef {
-            id: WIN_RECORDS,
-            group: "IP",
-            title: "DNS Zone Records",
-            size: [720.0, 360.0],
-            escape: true,
-        },
-        WinDef {
-            id: WIN_FILE,
-            group: "IP",
-            title: "DNS Zone File",
-            size: [640.0, 480.0],
-            escape: false,
         },
     ],
     new: || Box::new(ZonesPanel::default()),
@@ -84,8 +70,31 @@ const RECORD_COLUMNS: [table::Column; 6] = [
     comment(),
 ];
 
+/// The tabs of the DNS Zones window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ZoneTab {
+    #[default]
+    Zones,
+    Records,
+    File,
+}
+
+impl ZoneTab {
+    const ALL: [ZoneTab; 3] = [ZoneTab::Zones, ZoneTab::Records, ZoneTab::File];
+
+    fn title(self) -> &'static str {
+        match self {
+            ZoneTab::Zones => "Zones",
+            ZoneTab::Records => "Records",
+            ZoneTab::File => "Zone File",
+        }
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct ZonesPanel {
+    /// The tab the window shows.
+    pub(crate) tab: ZoneTab,
     /// `ip.dns.zone.print`.
     pub(crate) zones: Vec<Value>,
     pub(crate) zone_table: TableState,
@@ -647,8 +656,8 @@ fn open_window(app: &mut CoreRouterUi, win: &'static str) {
 
 impl PanelState for ZonesPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
-        let open = |w| app.open.contains(&Win::Panel(w));
-        let any = open(WIN) || open(WIN_RECORDS) || open(WIN_FILE) || !self.dialogs.is_empty();
+        let shown = app.open.contains(&Win::Panel(WIN));
+        let any = shown || !self.dialogs.is_empty();
         let mut out = Vec::new();
         if self.dialogs.iter().any(|d| matches!(d.dialog, Dialog::Zone { .. }))
             && app.has_command("ip.dns.zone.dnssec.print")
@@ -666,7 +675,7 @@ impl PanelState for ZonesPanel {
                 params: Value::Null,
             });
         }
-        if (open(WIN_RECORDS) || self.dialogs.iter().any(|d| !d.dialog.is_zone()))
+        if ((shown && self.tab == ZoneTab::Records) || self.dialogs.iter().any(|d| !d.dialog.is_zone()))
             && app.has_command("ip.dns.zone.record.print")
         {
             out.push(Query {
@@ -700,11 +709,21 @@ impl PanelState for ZonesPanel {
         }
     }
 
-    fn window(&mut self, app: &mut CoreRouterUi, win: &'static str, ui: &mut egui::Ui) {
-        match win {
-            WIN_RECORDS => self.records_window(app, ui),
-            WIN_FILE => self.file_window(app, ui),
-            _ => self.zones_window(app, ui),
+    fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            for t in ZoneTab::ALL {
+                if ui.selectable_label(self.tab == t, t.title()).clicked() && self.tab != t {
+                    self.tab = t;
+                    // The records are only asked for while their tab shows.
+                    app.cache.refreshed_at = None;
+                }
+            }
+        });
+        ui.separator();
+        match self.tab {
+            ZoneTab::Zones => self.zones_window(app, ui),
+            ZoneTab::Records => self.records_window(app, ui),
+            ZoneTab::File => self.file_window(app, ui),
         }
     }
 
@@ -748,11 +767,12 @@ impl PanelState for ZonesPanel {
         app.cache.refreshed_at = None;
     }
 
-    fn escape(&mut self, win: &'static str) -> bool {
-        match win {
-            WIN => self.zone_table.escape(),
-            WIN_RECORDS => self.record_table.escape(),
-            _ => false,
+    fn escape(&mut self, _win: &'static str) -> bool {
+        match self.tab {
+            ZoneTab::Zones => self.zone_table.escape(),
+            ZoneTab::Records => self.record_table.escape(),
+            // The zone file is being edited: Esc must not throw it away.
+            ZoneTab::File => true,
         }
     }
 
@@ -915,11 +935,13 @@ impl ZonesPanel {
             Act::New => self.open_dialog(app, Dialog::NewZone(Box::default())),
             Act::Records(zone) => {
                 self.zone = zone;
-                open_window(app, WIN_RECORDS);
+                self.tab = ZoneTab::Records;
+                open_window(app, WIN);
             }
             Act::File(zone) => {
                 self.fetch_file(app, &zone);
-                open_window(app, WIN_FILE);
+                self.tab = ZoneTab::File;
+                open_window(app, WIN);
             }
             Act::Refresh(zone) => {
                 app.run("ip.dns.zone.refresh", json!({ "zone": zone }));
@@ -1255,13 +1277,13 @@ impl ZonesPanel {
                     }
                     (format!("DNS Zone <{}>", form.name), WIN)
                 }
-                Dialog::NewRecord(f) => (format!("New Record in {}", f.zone), WIN_RECORDS),
+                Dialog::NewRecord(f) => (format!("New Record in {}", f.zone), WIN),
                 Dialog::Record { id, form, .. } => {
                     if gone(&records, id) {
                         app.floats.forget(wid);
                         return false;
                     }
-                    (format!("DNS Record <{} {}>", form.name, form.rtype), WIN_RECORDS)
+                    (format!("DNS Record <{} {}>", form.name, form.rtype), WIN)
                 }
             };
             let status_row = match &d.dialog {

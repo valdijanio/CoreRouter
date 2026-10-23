@@ -1280,6 +1280,9 @@ name = "corerouter-proto-cgnat"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+ "proptest",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

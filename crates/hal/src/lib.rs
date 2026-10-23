@@ -5,12 +5,14 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
 pub mod drift;
 pub mod icmp_ext;
 pub mod nic;
 pub mod probe;
+pub mod route_get;
 pub mod sff;
 pub mod sim;
 pub mod tuning;
@@ -325,6 +327,20 @@ pub trait Hal: Send {
     /// (`corerouter_model::ipv6::ra_mode`).
     fn ipv6_learned(&mut self) -> Result<Vec<Learned>, HalError> {
         Ok(Vec::new())
+    }
+
+    /// Where the data plane sends a packet to `q.dst` (G1.27, Linux
+    /// `RTM_GETROUTE`, see [`route_get`]); `cfg` is the applied config.
+    fn route_get(
+        &mut self,
+        cfg: &Config,
+        q: &route_get::RouteQuery,
+    ) -> Result<route_get::KernelLookup, HalError> {
+        let _ = (cfg, q);
+        Err(HalError::Unsupported(format!(
+            "{} cannot look routes up",
+            self.describe()
+        )))
     }
 
     /// What the data plane holds now of what `cfg` (the applied config)

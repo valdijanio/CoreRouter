@@ -6,9 +6,11 @@
 //! terminal text of each.
 //!
 //! Events of a task (kind `dns-lookup`):
-//! - `{kind: "answer", server, transport, ms, stage?, source?, rcode, id,
-//!   flags, question, answer, authority, additional, edns, size, dig}`
-//!   then `{kind: "asn", address, asn, as_name, prefix}` per address;
+//! - `{kind: "answer", server, transport, ms, stage?, source?, as_client?,
+//!   rcode, id, flags, question, answer, authority, additional, edns, size,
+//!   dig}`, then with `explain` (G6.8) `{kind: "why", stage, outcome, why,
+//!   args, text, rule?}` per stage of the router's chain, then `{kind:
+//!   "asn", address, asn, as_name, prefix}` per address;
 //! - `{kind: "compare", server, transport, rcode, ms, data, error?,
 //!   timeout}` per upstream; the summary adds `diverge` to each;
 //! - `{kind: "trace", zone, asked, address, ms, rcode, answer, records,
@@ -55,6 +57,27 @@ impl LookupServer {
     }
 }
 
+/// The English texts of "Why this answer", by id (the GUI words them in
+/// its languages).
+pub use corerouter_proto_dns::server::explain::TEXTS as WHY_TEXTS;
+
+/// How the router's own chain is asked (G6.8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RouterAsk {
+    /// Each stage's decision ("Why this answer").
+    pub explain: bool,
+    /// As if this LAN address asked: the ACL, the per-client limit and the
+    /// per-source rules see it; no packet is sent.
+    pub as_client: Option<IpAddr>,
+}
+
+impl RouterAsk {
+    /// Plain `exchange` does it.
+    pub fn plain(&self) -> bool {
+        !self.explain && self.as_client.is_none()
+    }
+}
+
 /// A reply as the daemon got it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Exchanged {
@@ -69,6 +92,8 @@ pub struct Exchanged {
     pub stage: Option<String>,
     /// `cache`, `stale` or the upstream server that answered.
     pub source: Option<String>,
+    /// [`RouterAsk::explain`]: each stage's decision.
+    pub explain: Vec<corerouter_proto_dns::server::explain::Decision>,
 }
 
 /// An error that means "no reply in time".
@@ -93,6 +118,8 @@ pub(crate) struct Job {
     pub rtype: &'static str,
     pub tcp: bool,
     pub mode: Mode,
+    /// With the router as the server (G6.8).
+    pub router: RouterAsk,
 }
 
 /// The query's bytes for `to` (DoH: id 0, RFC 8484 §4.1).
@@ -143,8 +170,28 @@ fn answer_event(job: &Job, r: &Reply, x: &Exchanged, server: Option<&str>) -> Va
         "additional": rows(&r.additional),
         "edns": r.edns.map(|e| json!({"version": e.version, "do": e.dnssec_ok, "udp": e.udp})),
         "size": r.size,
+        "as_client": job.router.as_client,
         "dig": dig::dig_text(r, &meta),
     })
+}
+
+/// The `why` event of one stage's decision.
+fn why_event(d: &corerouter_proto_dns::server::explain::Decision) -> Value {
+    use corerouter_model::ItemId;
+    use corerouter_proto_dns::server::explain::Rule;
+    let args: serde_json::Map<String, Value> = d
+        .args
+        .iter()
+        .map(|(k, v)| ((*k).to_owned(), json!(v)))
+        .collect();
+    let rule = d.rule.as_ref().map(|r| match r {
+        Rule::Static(id) => json!({"kind": "static", "id": ItemId(*id).to_string()}),
+        Rule::Adlist(id) => json!({"kind": "adlist", "id": ItemId(*id).to_string()}),
+        Rule::Forwarders(name) => json!({"kind": "forwarders", "name": name}),
+        Rule::Zone(name) => json!({"kind": "zone", "name": name}),
+    });
+    json!({"kind": "why", "stage": d.stage, "outcome": d.outcome.as_str(), "why": d.why,
+        "args": args, "text": d.text(), "rule": rule})
 }
 
 /// Addresses whose AS is looked up at most (the pills of the table).
@@ -227,12 +274,17 @@ fn one(
     to: &LookupServer,
 ) -> Result<(), String> {
     let q = bytes_for(&job.ask, to)?;
-    let got = backend
-        .exchange(to, &q, job.tcp)
-        .and_then(|x| dig::decode(&x.bytes).map(|r| (r, x)));
+    let sent = match to {
+        LookupServer::Router if !job.router.plain() => backend.ask_router(&q, job.tcp, job.router),
+        _ => backend.exchange(to, &q, job.tcp),
+    };
+    let got = sent.and_then(|x| dig::decode(&x.bytes).map(|r| (r, x)));
     match got {
         Ok((r, x)) => {
             ctx.emit(answer_event(job, &r, &x, to.dig_name().as_deref()));
+            for d in &x.explain {
+                ctx.emit(why_event(d));
+            }
             ctx.summary(json!({"mode": "query", "rcode": r.status, "ms": x.ms,
                 "server": x.server, "answers": r.answer.len()}));
             as_events(ctx, prober, &r);
@@ -579,6 +631,9 @@ pub fn text_line(ev: &Value) -> String {
             .trim_end()
             .to_owned()
         }
+        Some("why") => format!(";; WHY {:<9} {:<12} {}", s(ev, "stage"), s(ev, "outcome"), s(ev, "text"))
+            .trim_end()
+            .to_owned(),
         Some("error") => format!(";; {}: {}", s(ev, "server"), s(ev, "error")),
         _ => ev.to_string(),
     }

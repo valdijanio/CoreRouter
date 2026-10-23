@@ -1,13 +1,8 @@
 //! /ip route — static routes, plus the connected routes derived from IP
 //! addresses in `ip.route.list` (flagged dynamic/connected, as in RouterOS).
 
-use std::cmp::Ordering;
-
-use corerouter_hal::Learned;
-use corerouter_model::route::{self, Reach};
 use corerouter_model::{
-    Config, DEFAULT_DISTANCE, Gateway, InterfaceKind, ItemId, RouteEntry, RoutingTable,
-    parse_destination,
+    Config, DEFAULT_DISTANCE, Gateway, ItemId, RouteEntry, RoutingTable, parse_destination,
 };
 use ipnet::IpNet;
 use serde_json::{Value, json};
@@ -15,7 +10,7 @@ use serde_json::{Value, json};
 use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32, req_parse, req_str};
 use super::{CommandSpec, always};
 use crate::dhcp_client::is_dynamic;
-use crate::dhcp6_client::ra_id;
+use crate::route_table::{Line, Origin, RouteWatch, State};
 use crate::validate::route_issues;
 use crate::{EngineError, Result, Session};
 
@@ -52,7 +47,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string} → [{id (null if connected), dst_address, gateway, distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (static | connect | dhcp | ra), disabled, immediate_gw, reason, comment}]",
+        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable; null if connected), check_gateway (null | {method, interval_secs, misses, state (up | down)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
         always, list),
 ];
 
@@ -201,208 +196,97 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "id": id }))
 }
 
-/// One line of `ip.route.list` before it becomes JSON.
-struct Line {
-    id: Option<ItemId>,
-    dst: IpNet,
-    gateway: String,
-    distance: u8,
-    table: RoutingTable,
-    usable: bool,
-    connected: bool,
-    disabled: bool,
-    immediate: Option<String>,
-    reason: Option<String>,
-    comment: String,
-    /// Learned from a Router Advertisement (G4.7b).
-    ra: bool,
+/// A filter value of `ip.route.list`, checked against its choices.
+fn opt_choice<'a>(p: &'a Value, key: &str, choices: &[&str]) -> Result<Option<&'a str>> {
+    match opt_str(p, key)? {
+        Some(v) if choices.contains(&v) => Ok(Some(v)),
+        Some(v) => Err(EngineError::bad(
+            key,
+            format!(
+                "'{}' is not one of {}",
+                v.chars().take(32).collect::<String>(),
+                choices.join(", ")
+            ),
+        )),
+        None => Ok(None),
+    }
 }
 
-/// Main table first, then VRFs by name; inside a table by destination,
-/// then distance (the winner first).
-fn order(a: &Line, b: &Line) -> Ordering {
-    (!a.table.is_main(), &a.table, a.dst, a.distance, a.id).cmp(&(
-        !b.table.is_main(),
-        &b.table,
-        b.dst,
-        b.distance,
-        b.id,
-    ))
+/// `ip.route.list`'s view of one route.
+pub(crate) fn row(l: &Line, watch: Option<&RouteWatch>, now: Option<u64>) -> Value {
+    let (reason, reason_id, reason_args) = match &l.why {
+        Some(w) => (
+            Some(w.text.clone()),
+            Some(w.id),
+            Some(
+                w.args
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), Value::String(v.clone())))
+                    .collect::<serde_json::Map<_, _>>(),
+            ),
+        ),
+        None => (None, None, None),
+    };
+    let changed_at = watch.and_then(|w| w.changed_at(&l.key));
+    let gateway_status = match l.origin {
+        Origin::Connected => None,
+        _ if l.via.is_some() => Some("reachable"),
+        _ => Some("unreachable"),
+    };
+    let check = l.check.as_ref().map(|c| {
+        json!({
+            "method": c.method,
+            "interval_secs": c.interval_secs,
+            "misses": c.misses,
+            "state": if c.down { "down" } else { "up" },
+        })
+    });
+    json!({
+        "key": l.key,
+        "id": l.id,
+        "dst_address": l.dst.to_string(),
+        "family": if l.dst.addr().is_ipv4() { "ipv4" } else { "ipv6" },
+        "gateway": l.gateway,
+        "gateway_address": l.gateway_address,
+        "gateway_interface": l.gateway_interface,
+        "gateway_status": gateway_status,
+        "check_gateway": check,
+        "distance": l.distance,
+        "routing_table": l.table,
+        "flags": l.flags(),
+        "state": l.state.as_str(),
+        "active": l.state == State::Active,
+        "static": matches!(l.origin, Origin::Static | Origin::Dhcp),
+        "origin": l.origin.as_str(),
+        "connected": l.origin == Origin::Connected,
+        "dynamic": l.origin != Origin::Static,
+        "disabled": l.disabled,
+        "immediate_gw": l.immediate_gw(),
+        "interface": l.via.as_ref().map(|v| &v.link),
+        "ecmp": l.ecmp,
+        "reason": reason,
+        "reason_id": reason_id,
+        "reason_args": reason_args,
+        "changed_at": changed_at,
+        "changed_secs": changed_at.zip(now).map(|(at, now)| now.saturating_sub(at)),
+        "comment": l.comment,
+    })
 }
 
 fn list(s: &mut Session, p: &Value) -> Result<Value> {
-    let filter: Option<RoutingTable> = opt_parse(p, "routing_table")?;
-    // With the routes DHCP clients installed (flags DS, as in RouterOS v6).
-    let learned = s.hal_mut().ipv6_learned().unwrap_or_default();
-    let cfg = s.effective(s.store().candidate());
-    let cfg = cfg.as_ref();
-    let mut lines: Vec<Line> = cfg
-        .ip
-        .routes
+    let table: Option<RoutingTable> = opt_parse(p, "routing_table")?;
+    let family = opt_choice(p, "family", &["ipv4", "ipv6"])?;
+    let state = opt_choice(p, "state", &["active", "standby", "inactive"])?;
+    let origin = opt_choice(p, "origin", &["connected", "static", "dhcp", "ra"])?;
+    let (lines, now) = s.watched_route_lines();
+    let watch = s.ext::<RouteWatch>();
+    let rows = lines
         .iter()
-        .map(|r| {
-            let (usable, immediate, reason) = match route::reach(cfg, r) {
-                Reach::Active { link, gateway } => {
-                    let via = match gateway {
-                        Some(g) => format!("{g}%{link}"),
-                        None => link.to_string(),
-                    };
-                    (true, Some(via), None)
-                }
-                Reach::Inactive(why) => (false, None, Some(why)),
-                Reach::Invalid { why, .. } => (false, None, Some(why)),
-            };
-            Line {
-                id: Some(r.id),
-                dst: r.dst_address,
-                gateway: r.gateway.to_string(),
-                distance: r.distance,
-                table: r.routing_table.clone(),
-                usable,
-                connected: false,
-                disabled: r.disabled,
-                immediate,
-                reason,
-                comment: r.comment.clone(),
-                ra: false,
-            }
-        })
+        .filter(|l| table.as_ref().is_none_or(|t| *t == l.table))
+        .filter(|l| family.is_none_or(|f| (f == "ipv4") == l.dst.addr().is_ipv4()))
+        .filter(|l| state.is_none_or(|st| st == l.state.as_str()))
+        .filter(|l| origin.is_none_or(|o| o == l.origin.as_str()))
+        .map(|l| row(l, watch, now))
         .collect();
-    // Lease routes whose gateway fails check-gateway (G4.7c): inactive.
-    lines.extend(s.dhcp_withheld(cfg).into_iter().map(|(r, why)| Line {
-        id: Some(r.id),
-        dst: r.dst_address,
-        gateway: r.gateway.to_string(),
-        distance: r.distance,
-        table: r.routing_table.clone(),
-        usable: false,
-        connected: false,
-        disabled: false,
-        immediate: None,
-        reason: Some(why),
-        comment: r.comment.clone(),
-        ra: false,
-    }));
-    lines.extend(route::connected(cfg).into_iter().map(|c| Line {
-        id: None,
-        dst: c.dst,
-        gateway: c.interface.to_string(),
-        distance: 0,
-        table: c.table,
-        usable: c.active,
-        connected: true,
-        disabled: false,
-        immediate: c.active.then(|| c.interface.to_string()),
-        reason:
-            (!c.active).then(|| format!("interface '{}' or its address is disabled", c.interface)),
-        comment: String::new(),
-        ra: false,
-    }));
-    // What the kernel learned from Router Advertisements: its metric (1024
-    // for a default router) is above every static distance, so they sort
-    // last and lose to a static route, as in the kernel.
-    for (n, l) in learned.into_iter().enumerate() {
-        let Learned::Route {
-            interface,
-            dst,
-            gateway,
-            table,
-            expires_secs,
-            ..
-        } = l
-        else {
-            continue;
-        };
-        let table = cfg
-            .interfaces
-            .iter()
-            .find_map(|(name, i)| match i.kind {
-                InterfaceKind::Vrf { table: t } if t == table => {
-                    Some(RoutingTable::Vrf(name.clone()))
-                }
-                _ => None,
-            })
-            .unwrap_or(RoutingTable::Main);
-        let via = match gateway {
-            Some(g) => format!("{g}%{interface}"),
-            None => interface.to_string(),
-        };
-        lines.push(Line {
-            id: Some(ra_id(n)),
-            dst: IpNet::V6(dst),
-            gateway: via.clone(),
-            distance: u8::MAX,
-            table,
-            usable: true,
-            connected: false,
-            disabled: false,
-            immediate: Some(via),
-            reason: None,
-            comment: match expires_secs {
-                Some(e) => format!("router advertisement, expires in {e}s"),
-                None => "router advertisement".into(),
-            },
-            ra: true,
-        });
-    }
-    lines.sort_by(order);
-
-    let mut rows = Vec::with_capacity(lines.len());
-    // Lines are sorted by distance inside (table, dst): the first usable
-    // one of each group is the active route, as the kernel picks the lowest
-    // metric. Groups are contiguous, so one pass finds it (O(L), was O(L²)).
-    let mut first: Option<&Line> = None;
-    for l in &lines {
-        if first.is_some_and(|w| w.table != l.table || w.dst != l.dst) {
-            first = None;
-        }
-        let winner = first;
-        if l.usable && first.is_none() {
-            first = Some(l);
-        }
-        if filter.as_ref().is_some_and(|t| *t != l.table) {
-            continue;
-        }
-        let active = l.usable && winner.is_none();
-        let reason = match (&l.reason, winner) {
-            (Some(why), _) => Some(why.clone()),
-            (None, Some(w)) if l.usable => Some(match w.id {
-                Some(id) => format!("route {id} has a lower distance"),
-                None => format!("connected network on {} wins", w.gateway),
-            }),
-            (None, _) => None,
-        };
-        let dynamic = l.connected || l.id.is_some_and(is_dynamic);
-        let mut flags = String::new();
-        if l.disabled {
-            flags.push('X');
-        }
-        if active {
-            flags.push('A');
-        }
-        flags.push_str(match (l.connected, dynamic, l.ra) {
-            (true, _, _) => "DC",
-            (false, _, true) => "D",
-            (false, true, false) => "DS",
-            (false, false, false) => "S",
-        });
-        rows.push(json!({
-            "id": l.id,
-            "dst_address": l.dst.to_string(),
-            "gateway": l.gateway,
-            "distance": l.distance,
-            "routing_table": l.table,
-            "flags": flags,
-            "active": active,
-            "static": !l.connected && !l.ra,
-            "origin": if l.ra { "ra" } else if l.connected { "connect" } else if dynamic { "dhcp" } else { "static" },
-            "connected": l.connected,
-            "dynamic": dynamic,
-            "disabled": l.disabled,
-            "immediate_gw": l.immediate,
-            "reason": reason,
-            "comment": l.comment,
-        }));
-    }
     Ok(Value::Array(rows))
 }
