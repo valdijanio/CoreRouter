@@ -1032,6 +1032,13 @@ name = "corerouter-buildinfo"
 version = "0.1.0"
 
 [[package]]
+name = "corerouter-cgnat-map"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "corerouter-cli"
 version = "0.1.0"
 dependencies = [
@@ -1215,6 +1222,7 @@ dependencies = [
 name = "corerouter-model"
 version = "0.1.0"
 dependencies = [
+ "corerouter-cgnat-map",
  "ipnet",
  "proptest",
  "serde",
