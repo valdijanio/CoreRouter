@@ -7,8 +7,11 @@
 //!   `hops` + 1, dropped past [`MAX_HOPS`]; option 82 added (RFC 3046
 //!   §2.1) with the circuit id and the remote id, last, when asked and when
 //!   it fits (§2.1: without room the request goes without it). A request
-//!   that already carries option 82 from the client side keeps it untouched
-//!   (§2.1: a relay does not add a second one).
+//!   that already carries option 82 with `giaddr` 0 came from the client
+//!   side: dropped (§2.1: an untrusted circuit; a client could claim
+//!   another subscriber's circuit id), or relayed untouched when the relay
+//!   trusts a layer-2 agent there (`relay_info_trusted`; a relay does not
+//!   add a second one).
 //! - Down (RFC 1542 §4.1.2, RFC 3046 §2.2): only replies whose `giaddr` is
 //!   this relay's; option 82 removed before the client sees it; to the
 //!   client by broadcast when it asked (or for a NAK), else by unicast to
@@ -40,6 +43,8 @@ pub struct RelayPlan {
     pub add_info: bool,
     /// Custom remote id (empty: the client's MAC).
     pub remote_id: Vec<u8>,
+    /// Option 82 from the client side (`giaddr` 0) is relayed, not dropped.
+    pub trusted: bool,
 }
 
 /// Why a message was not relayed.
@@ -51,6 +56,11 @@ pub enum RelayDrop {
     Hops,
     /// A reply for another relay (its `giaddr` is not ours).
     NotOurs,
+    /// A client's request that already carried option 82 (RFC 3046 §2.1:
+    /// from an untrusted circuit).
+    Untrusted82,
+    /// A reply from an address that is not one of the relay's servers.
+    NotFromServer,
 }
 
 impl RelayDrop {
@@ -59,6 +69,8 @@ impl RelayDrop {
             Self::Malformed => "malformed",
             Self::Hops => "hops",
             Self::NotOurs => "not-ours",
+            Self::Untrusted82 => "untrusted-82",
+            Self::NotFromServer => "not-from-server",
         }
     }
 }
@@ -86,6 +98,7 @@ pub fn plans(cfg: &Config) -> Vec<RelayPlan> {
                 giaddr,
                 add_info: r.add_relay_info,
                 remote_id: r.relay_info_remote_id.as_bytes().to_vec(),
+                trusted: r.relay_info_trusted,
             })
         })
         .collect()
@@ -146,6 +159,9 @@ pub fn up(plan: &RelayPlan, payload: &[u8], src_mac: [u8; 6]) -> Result<Vec<u8>,
         g.copy_from_slice(&plan.giaddr.octets());
     }
     let has_82 = opts.iter().any(|(c, _)| *c == 82);
+    if giaddr_was_zero && has_82 && !plan.trusted {
+        return Err(RelayDrop::Untrusted82);
+    }
     if plan.add_info && giaddr_was_zero && !has_82 {
         let mac: Vec<u8> = src_mac.to_vec();
         let remote = if plan.remote_id.is_empty() {
@@ -218,6 +234,7 @@ mod tests {
             giaddr: "10.88.0.1".parse().unwrap(),
             add_info,
             remote_id: Vec::new(),
+            trusted: false,
         }
     }
 
@@ -321,6 +338,31 @@ mod tests {
         let mut other = plan(true);
         other.giaddr = "10.88.1.1".parse().unwrap();
         assert_eq!(down(&other, &reply), Err(RelayDrop::NotOurs));
+    }
+
+    /// RFC 3046 §2.1: a client's own option 82 (giaddr 0) is dropped on an
+    /// untrusted circuit, relayed untouched on a trusted one.
+    #[test]
+    fn a_clients_option_82_is_not_relayed() {
+        let mut m = discover();
+        assert_eq!(m.pop(), Some(255));
+        m.extend_from_slice(&[82, 6, 1, 4, b'o', b'l', b't', b'1', 255]);
+        assert_eq!(
+            up(&plan(true), &m, [2, 0, 0, 0, 0, 7]),
+            Err(RelayDrop::Untrusted82)
+        );
+        assert_eq!(
+            up(&plan(false), &m, [2, 0, 0, 0, 0, 7]),
+            Err(RelayDrop::Untrusted82)
+        );
+        let mut trusted = plan(true);
+        trusted.trusted = true;
+        let out = up(&trusted, &m, [2, 0, 0, 0, 0, 7]).unwrap();
+        let info = crate::server::request::parse(&out)
+            .unwrap()
+            .relay_info
+            .unwrap();
+        assert_eq!(agent::get(&info, agent::CIRCUIT_ID).unwrap(), b"olt1");
     }
 
     proptest! {

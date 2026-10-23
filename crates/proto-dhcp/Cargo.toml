@@ -30,6 +30,10 @@ harness = false
 name = "server_storm"
 harness = false
 
+[[bench]]
+name = "server_attack"
+harness = false
+
 [[example]]
 name = "storm"
 
