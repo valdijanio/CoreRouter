@@ -83,3 +83,12 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G1.26b feito (Tuning › Interfaces); G1.26g criado (RSS)
 - 2026-10-23 — G1.26c feito (Tuning › CPU e IRQ); G0.15c criado (glifos que a fonte não tem)
 - 2026-10-23 — G0.20 resolvido por audit-history-share (revisões restauradas dividem as seções CowArc; boot de 64 revisões de 10 MiB em 208 ms, RAM igual à de antes)
+- 2026-10-23 — G0.23a, G0.23b e G0.23c criados (menu lateral da GUI, pedido do usuário); G0.23a feito
+- 2026-10-23 — G0.23b feito (busca rápida, paleta, recentes, favoritos e teclado do menu)
+- 2026-10-23 — G0.23c feito (abas no lugar de itens do menu e selos de estado)
+- 2026-10-23 — G1.26d feito (Tuning › Boot, sem a imagem A/B); G1.26h criado (aplicar na imagem)
+- 2026-10-23 — G1.27 criada (IP › Routes melhorada, pedido do usuário) em três partes; G1.27a feito; G1.27d e G1.27e criadas
+- 2026-10-23 — G1.27b feito (detalhe da rota selecionada); G1.27f criada
+- 2026-10-23 — G2.3 redefinido e dividido em G2.3a–e; G2.2 e G2.4 com critério detalhado; G6.9 e G2.7 criados; G2.3a feito (núcleo do CGNAT)
+- 2026-10-23 — G2.3b feito (CGNAT por nfnetlink); G2.8 criado
+- 2026-10-23 — G6.8 criado (análise no Tools › DNS Lookup: Why this answer, Ask as, Watch, Upstreams, Check hijack); parte 1 em `stream/G6.8a-dns-why-ask-as`
