@@ -49,6 +49,15 @@ operadora e começa a outra).
   clique de novo desmarca; clique direito abre o menu com as cópias úteis (endereço, nome).
 - Confira no tema claro **e** no escuro (screenshot), como manda o AGENTS.md.
 
+## Explicação ⓘ em todo lugar que couber (regra)
+
+Sempre que der, todo rótulo de campo, parâmetro, coluna, aba, item de menu e título de janela leva
+o ícone **ⓘ**, que abre o **modal de explicações**: o que é, quando mudar, cuidado, o padrão ou
+recomendado e a RFC quando houver. O texto vem do catálogo de explicações (abaixo), **em
+português por padrão** (configurável em Settings). Janela ou campo novo sem explicação é
+incompleto: o teste do catálogo confere que toda chave usada tem texto. Só fica sem ⓘ o que é
+óbvio por si (um botão OK, um campo Comment).
+
 ## Idioma: rótulos e explicações (G0.15)
 
 A GUI tem **dois idiomas independentes**, escolhidos em Settings › Settings e guardados com o tema
