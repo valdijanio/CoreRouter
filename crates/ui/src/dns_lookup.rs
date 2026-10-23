@@ -41,6 +41,8 @@ const NAME: &str = "dns-lookup";
 pub(crate) const WIN: &str = "dns-lookup";
 const QUERY: &str = "tool.dns.query";
 const STOP: &str = "tool.task.stop";
+const WATCH: &str = "tool.dns.watch";
+const UPSTREAMS: &str = "tool.dns.upstreams";
 pub(crate) const TYPES: [&str; 10] = [
     "A", "AAAA", "MX", "TXT", "NS", "SOA", "PTR", "CAA", "SRV", "ANY",
 ];
@@ -62,6 +64,17 @@ pub(crate) const PANEL: Panel = Panel {
     }],
     new: || Box::new(LookupPanel::default()),
 };
+
+/// The window's tabs (G6.8).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Tab {
+    #[default]
+    Lookup,
+    /// `tool.dns.watch`: the same query over and over.
+    Watch,
+    /// `tool.dns.upstreams`: every upstream measured.
+    Upstreams,
+}
 
 /// Who is asked.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -99,6 +112,14 @@ pub(crate) struct LookupPanel {
     pub(crate) selected: Option<(&'static str, usize)>,
     /// Each row's rectangle from the last frame (the click area).
     rows: BTreeMap<(&'static str, usize), egui::Rect>,
+    pub(crate) tab: Tab,
+    /// Watch: milliseconds between queries, as typed.
+    pub(crate) interval: String,
+    pub(crate) watch: crate::dns_analysis::TaskView,
+    /// Upstreams: queries per server, as typed, and the hijack checks.
+    pub(crate) count: String,
+    pub(crate) hijack: bool,
+    pub(crate) bench: crate::dns_analysis::TaskView,
 }
 
 /// Open Tools › DNS Lookup asking the router for `name` (DNS Cache's
@@ -140,6 +161,12 @@ impl Default for LookupPanel {
             command: String::new(),
             selected: None,
             rows: BTreeMap::new(),
+            tab: Tab::Lookup,
+            interval: "1000".into(),
+            watch: Default::default(),
+            count: "200".into(),
+            hijack: true,
+            bench: Default::default(),
         }
     }
 }
@@ -345,6 +372,150 @@ impl LookupPanel {
     }
 
     /// The results; a rule whose window the operator asked to open.
+    /// `tool.dns.watch` params from the form.
+    pub(crate) fn watch_params(&self) -> Value {
+        let mut p = Map::new();
+        p.insert("name".into(), json!(self.name.trim()));
+        p.insert("type".into(), json!(self.rtype));
+        if self.ask == Ask::Server {
+            p.insert("server".into(), json!(self.server.trim()));
+        }
+        if let Ok(ms) = self.interval.trim().parse::<u32>() {
+            p.insert("interval_ms".into(), json!(ms));
+        }
+        if self.tcp {
+            p.insert("tcp".into(), json!(true));
+        }
+        Value::Object(p)
+    }
+
+    /// `tool.dns.upstreams` params from the form.
+    pub(crate) fn bench_params(&self) -> Value {
+        let mut p = Map::new();
+        if let Ok(n) = self.count.trim().parse::<u32>() {
+            p.insert("count".into(), json!(n));
+        }
+        if !self.hijack {
+            p.insert("hijack".into(), json!(false));
+        }
+        Value::Object(p)
+    }
+
+    /// Start/Stop of a tab's task.
+    fn start_stop(
+        app: &mut CoreRouterUi,
+        ui: &mut Ui,
+        view: &mut crate::dns_analysis::TaskView,
+        ok: Result<(), String>,
+    ) -> bool {
+        let mut go = false;
+        if view.running() {
+            if action(ui, "Stop", app.can().check(STOP))
+                && let Some(id) = view.task
+            {
+                app.run(STOP, json!({"id": id}));
+            }
+            ui.spinner();
+        } else if action(ui, "Start", ok) {
+            go = true;
+        }
+        go
+    }
+
+    fn watch_form(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let mut go = false;
+        Grid::new("dns-watch-form")
+            .num_columns(4)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Name");
+                // Sized: inside this grid a desired width alone collapses.
+                let r = ui.add_sized([260.0, 20.0], TextEdit::singleline(&mut self.name).hint_text("example.com"));
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    go = true;
+                }
+                ui.label("Type");
+                egui::ComboBox::from_id_salt("dns-watch-type")
+                    .selected_text(self.rtype.as_str())
+                    .width(80.0)
+                    .show_ui(ui, |ui| {
+                        for t in TYPES {
+                            ui.selectable_value(&mut self.rtype, t.to_owned(), t);
+                        }
+                    });
+                ui.end_row();
+                ui.label("Server");
+                ui.horizontal(|ui| {
+                    if self.ask == Ask::All {
+                        self.ask = Ask::Router;
+                    }
+                    let shown = if self.ask == Ask::Server { "Server" } else { "Router" };
+                    egui::ComboBox::from_id_salt("dns-watch-ask")
+                        .selected_text(shown)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut self.ask, Ask::Router, "Router");
+                            ui.selectable_value(&mut self.ask, Ask::Server, "Server");
+                        });
+                    if self.ask == Ask::Server {
+                        ui.add_sized(
+                            [220.0, 20.0],
+                            TextEdit::singleline(&mut self.server).hint_text("IP, https://… or tls://…"),
+                        );
+                    }
+                });
+                ui.label(tr(app.lang.labels, "Interval"));
+                ui.horizontal(|ui| {
+                    ui.add_sized([60.0, 20.0], TextEdit::singleline(&mut self.interval));
+                    ui.label("ms");
+                });
+                ui.end_row();
+            });
+        let ok = if self.name.trim().is_empty() {
+            Err("Type a name first".to_owned())
+        } else if self.ask == Ask::Server && self.server.trim().is_empty() {
+            Err("Type the server: an IP, https://… or tls://…".to_owned())
+        } else if !self.interval.trim().parse::<u32>().is_ok_and(|n| (100..=60_000).contains(&n)) {
+            Err("Interval: 100 to 60000 ms".to_owned())
+        } else {
+            app.can().check(WATCH)
+        };
+        let mut start = false;
+        ui.horizontal(|ui| {
+            start = Self::start_stop(app, ui, &mut self.watch, ok.clone());
+        });
+        if (start || go) && ok.is_ok() && !self.watch.running() {
+            self.watch.reset();
+            app.run_then(WATCH, self.watch_params(), crate::panel::then(NAME, Tab::Watch));
+        }
+    }
+
+    fn bench_form(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label(tr(app.lang.labels, "Queries per server"));
+            ui.add_sized([60.0, 20.0], TextEdit::singleline(&mut self.count));
+            toggle(
+                ui,
+                tr(app.lang.labels, "Check hijack"),
+                &mut self.hijack,
+                "Names that cannot exist (NXDOMAIN hijacking) and the resolver that reaches the authoritative servers (a proxy on the way).",
+            );
+        });
+        let ok = if !self.count.trim().parse::<u32>().is_ok_and(|n| (10..=2000).contains(&n)) {
+            Err("Queries per server: 10 to 2000".to_owned())
+        } else {
+            app.can().check(UPSTREAMS)
+        };
+        let mut start = false;
+        ui.horizontal(|ui| {
+            start = Self::start_stop(app, ui, &mut self.bench, ok.clone());
+        });
+        if start && ok.is_ok() && !self.bench.running() {
+            self.bench.reset();
+            app.run_then(UPSTREAMS, self.bench_params(), crate::panel::then(NAME, Tab::Upstreams));
+        }
+    }
+
     /// `right`: the farthest right the tables may reach (the window grows
     /// up to the work area's width).
     fn results(&mut self, langs: Langs, right: f32, ui: &mut Ui) -> Option<Value> {
@@ -945,19 +1116,40 @@ fn trace_table(ui: &mut Ui, list: &[Value], rows: &mut Rows) {
 
 impl PanelState for LookupPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
-        match self.task {
-            Some(id) if !self.done && app.open.contains(&crate::Win::Panel(WIN)) => vec![Query {
+        let mut out = Vec::new();
+        if !app.open.contains(&crate::Win::Panel(WIN)) {
+            return out;
+        }
+        if let Some(id) = self.task.filter(|_| !self.done) {
+            out.push(Query {
                 key: "poll",
                 command: "tool.task.poll",
                 params: json!({"id": id, "after_seq": 0, "max": 256, "text": true}),
-            }],
-            _ => Vec::new(),
+            });
         }
+        if let Some(id) = self.watch.task.filter(|_| !self.watch.done) {
+            out.push(Query {
+                key: "watch-poll",
+                command: "tool.task.poll",
+                params: self.watch.poll(id),
+            });
+        }
+        if let Some(id) = self.bench.task.filter(|_| !self.bench.done) {
+            out.push(Query {
+                key: "bench-poll",
+                command: "tool.task.poll",
+                params: json!({"id": id, "after_seq": 0, "max": 256}),
+            });
+        }
+        out
     }
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
-        if key != "poll" {
-            return;
+        match key {
+            "watch-poll" => return self.watch.arrived(&value, true),
+            "bench-poll" => return self.bench.arrived(&value, false),
+            "poll" => {}
+            _ => return,
         }
         if let Some(ev) = value.get("events").and_then(Value::as_array) {
             self.events = ev.clone();
@@ -984,6 +1176,53 @@ impl PanelState for LookupPanel {
     }
 
     fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
+        for t in [&mut self.watch, &mut self.bench] {
+            if std::mem::take(&mut t.stop)
+                && let Some(id) = t.task.filter(|_| !t.done)
+            {
+                app.run(STOP, json!({"id": id}));
+            }
+        }
+        ui.horizontal(|ui| {
+            for (tab, label) in [(Tab::Lookup, "Lookup"), (Tab::Watch, "Watch"), (Tab::Upstreams, "Upstreams")] {
+                let mut text = RichText::new(tr(app.lang.labels, label));
+                let running = match tab {
+                    Tab::Watch => self.watch.running(),
+                    Tab::Upstreams => self.bench.running(),
+                    Tab::Lookup => self.running(),
+                };
+                if running {
+                    text = text.italics();
+                }
+                if ui.selectable_label(self.tab == tab, text).clicked() {
+                    self.tab = tab;
+                }
+            }
+        });
+        ui.separator();
+        match self.tab {
+            Tab::Lookup => {}
+            Tab::Watch => {
+                self.watch_form(app, ui);
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("dns-watch-results")
+                    .auto_shrink([false, true])
+                    .min_scrolled_height(crate::windows::grow_height(ui))
+                    .show(ui, |ui| crate::dns_analysis::watch_results(ui, app.lang, &self.watch));
+                return;
+            }
+            Tab::Upstreams => {
+                self.bench_form(app, ui);
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .id_salt("dns-upstreams-results")
+                    .auto_shrink([false, true])
+                    .min_scrolled_height(crate::windows::grow_height(ui))
+                    .show(ui, |ui| crate::dns_analysis::bench_results(ui, app.lang, &self.bench));
+                return;
+            }
+        }
         self.form(app, ui);
         ui.separator();
         // The window grows with its tables up to the work area's width (it
@@ -998,7 +1237,23 @@ impl PanelState for LookupPanel {
         }
     }
 
-    fn reply(&mut self, app: &mut CoreRouterUi, _then: PanelThen, result: &Result<Value, String>) {
+    fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let view = match then.downcast::<Tab>().map(|t| *t) {
+            Ok(Tab::Watch) => Some(&mut self.watch),
+            Ok(Tab::Upstreams) => Some(&mut self.bench),
+            _ => None,
+        };
+        if let Some(view) = view {
+            match result {
+                Ok(v) => view.task = v.get("id").and_then(Value::as_u64),
+                Err(e) => {
+                    view.error = Some(e.clone());
+                    view.done = true;
+                }
+            }
+            app.cache.refreshed_at = None;
+            return;
+        }
         match result {
             Ok(v) => {
                 self.task = v.get("id").and_then(Value::as_u64);
@@ -1013,6 +1268,18 @@ impl PanelState for LookupPanel {
     }
 
     fn escape(&mut self, _win: &'static str) -> bool {
+        // Esc stops a running watch (or benchmark) of the tab shown.
+        let view = match self.tab {
+            Tab::Watch => Some(&mut self.watch),
+            Tab::Upstreams => Some(&mut self.bench),
+            Tab::Lookup => None,
+        };
+        if let Some(v) = view
+            && v.running()
+        {
+            v.stop = true;
+            return true;
+        }
         self.selected.take().is_some()
     }
 }

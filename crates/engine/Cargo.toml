@@ -20,6 +20,7 @@ corerouter-proto-dns.workspace = true
 corerouter-proto-dhcp.workspace = true
 corerouter-proto-discovery.workspace = true
 corerouter-proto-iperf.workspace = true
+corerouter-proto-flow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

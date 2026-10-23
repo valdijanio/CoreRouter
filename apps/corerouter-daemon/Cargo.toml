@@ -26,6 +26,7 @@ corerouter-proto-ntp.workspace = true
 corerouter-proto-iperf.workspace = true
 socket2 = { version = "0.6.5", features = ["all"] }
 corerouter-proto-syslog.workspace = true
+corerouter-proto-flow.workspace = true
 log.workspace = true
 env_logger.workspace = true
 signal-hook.workspace = true

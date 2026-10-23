@@ -2655,3 +2655,219 @@ continuação indentadas).
   faziam à mão, uma volta de CI cada (#112, G4.2b/c, #146, #147 duas vezes, 2026-10-22/23).
   `AGENTS.md`: "Pode empilhar". Testado com repositório de mentira: pai integrado por squash e filho
   empilhado (resolve, nas duas direções), e main que mudou o mesmo trecho depois (recusa).
+
+- 2026-10-23 — G0.24: Componentes do padrão de janela de lista e modal de adicionar (`docs/ui-style.md`, seção nova
+  "Como adotar"): `crates/ui/src/list.rs` (`Tools`/`toolbar` com o motivo de cada botão cinza — o do
+  roteador pelo `engine.list`, depois o da seleção —, `Filters`, `footer`, `row_menu`,
+  `from_shortcut`, `copy_rows`, `copy_commands`, `run_steps` = `engine.batch` atômico) e
+  `crates/ui/src/list_modal.rs` (`Spec`/`Field`/`Modal`: ⓘ no título e em cada rótulo, pede a
+  pré-visualização do engine enquanto se digita, mostra campos calculados, checagens com selo
+  ok/aviso/erro, risco de perda de acesso com "Entendi" ou Safe Mode, prévia dos comandos na sintaxe
+  do terminal; erro embaixo do campo; Enter = OK, Ctrl+Enter = Apply, Esc = Cancel). No terminal,
+  `corerouter_shell::command_line` e `recreate` escrevem um comando como se digita
+  (`/ip address set *3 disabled=yes`) e o `add` que recria uma linha. Rótulos em PT em
+  `i18n/list_pt.rs`. Testes: `crates/ui/src/tests/list.rs` (botões cinza com o porquê, teclas,
+  filtros, cópias, série atômica, Apply × OK, erro que bloqueia, risco que pede `force`) e
+  `copy_as_command_lines` no shell. A primeira janela a adotar é IP › Addresses (G1.28, PR seguinte).
+
+- 2026-10-23 — G1.27c: IP › Routes, parte 3 (escala para a tabela cheia, ~1 milhão de rotas). Comando novo `ip.route.page`
+  com os filtros do `ip.route.list` (origem aceita várias), busca por prefixo (`exact`, `longer`,
+  `orlonger` = contido, `covering` = contém; padrão: contido para um prefixo, contém para um endereço),
+  agregação (`aggregate`: as rotas mais longas que /16, IPv6 /32, numa linha por /16 com as contagens),
+  `offset`/`limit` (até 5000) e as contagens da tabela inteira (estados, famílias, por origem, por
+  tabela). O engine guarda as linhas calculadas (`route_table::RouteCache`) e só refaz quando muda a
+  geração do candidato (`ConfigStore::generation`, novo, aditivo), o que DHCP/DHCPv6 instalaram, o que
+  o kernel aprendeu, os links sem carrier ou um check-gateway; `ip.route.list` e o lookup usam o mesmo
+  cache. Na GUI a janela pede uma página (500) com os filtros, mostra "1–500 de N" com `<`/`>`, o rodapé
+  vem das contagens, a busca por prefixo tem os modos contido/contém/exato, "aggregate /16" dobra a
+  tabela e um clique numa linha agregada abre aquele /16; as linhas são montadas uma vez por resposta,
+  não por quadro. Gancho de benchmark escondido `corerouter_engine::perf` (sessão com uma tabela cheia
+  direto na memória: ela não cabe na config salva, de 32 MB).
+
+  Como testar: `cargo nextest run -p corerouter-engine --test route_page`; `cargo nextest run -p
+  corerouter-ui route`; `corerouter-cli run ip.route.page '{"prefix":"192.0.2.0/24","match":"longer"}'`;
+  `cargo xtask bench routes_1m`.
+
+- 2026-10-23 — G2.2: IP › Firewall › Connections:
+
+  - A tabela do conntrack vem por ctnetlink, sem o programa `conntrack`:
+    - `Hal::connections`, `connection_stats` e `connections_kill`;
+    - `hal-linux` usa `ctnl`; o lab simula a tabela pelos pools de CGNAT.
+  - Os comandos `ip.firewall.connection.list`, `top`, `kill`, `tracking.info` e `tracking.set`:
+    - páginas de até 5000 linhas e uma leitura do kernel reaproveitada por 2 s;
+    - `kill` sem filtro exige `all=true`;
+    - os timeouts são os parâmetros `nf_conntrack_*` do Tuning.
+  - A aba Connections da janela Firewall:
+    - barra de uso ligada ao Tuning;
+    - filtros e páginas de 500;
+    - selos de estado e de Via, e o pool na origem;
+    - "Top subscribers" com o selo de % do bloco;
+    - Kill e "Kill matching", que pede confirmação;
+    - diálogo "Tracking…" com ⓘ em cada campo; as explicações em PT e EN citam as RFCs.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test connections
+  cargo test -p corerouter-ui connections
+  cargo test -p corerouter-hal-linux --lib ctnl
+  ```
+
+  Na GUI (daemon de lab), crie um pool CGNAT, abra IP › Firewall › Connections e clique num assinante do
+  top.
+
+  Os screenshots claro e escuro, do diálogo e do modal foram olhados.
+
+- 2026-10-23 — G2.3c: CGNAT, parte 3:
+
+  - **Modo blocos (RFC 6888 §5).** O primeiro pacote de um assinante sem bloco espera na fila do
+    netfilter 7422:
+    - `hal-linux::nfqueue` (nfnetlink, sem libnetfilter_queue);
+    - o serviço `cgnat` do daemon atende a fila, o engine (`cgnat_blocks.rs`) aloca e o bloco vai para o
+      mapa (`Hal::cgnat_blocks`).
+  - **Regras do alocador:**
+    - pareado: um IP por assinante (REQ-2);
+    - novo bloco a 80 % de uso, até `max_blocks`;
+    - liberação após `block_timeout` sem conexões, com quarentena de 120 s (REQ-8);
+    - geometria mudada: libera na hora e derruba as conexões;
+    - sem bloco livre: o pacote cai (REQ-11).
+  - **Log por bloco:** `ALLOC` e `RELEASE` no log do roteador, tópico `cgnat` (novo), que vai ao syslog
+    remoto por uma regra do `/system logging`. O journal `cgnat-blocks` reconstrói os blocos no boot e
+    responde ao "Quem era?".
+  - **Alertas de portas, nos dois modos:** uma linha por travessia de `alert_percent`, a lista com
+    contagem e pico, e o `insert_failed` do kernel.
+  - **Comandos:** `ip.firewall.cgnat.block.list`, `block.history`, `alert.list` e `alert.clear`.
+  - **Lab:** finge 40 assinantes online por pool de blocos; os pesados (um a cada 17) usam 95 % das
+    portas TCP.
+  - **Correção:** `Pool::layout` aceita mais assinantes que blocos no modo blocos (a validação avisa
+    "oversubscribed"). Removido também um overflow no texto de capacidade de um pool superlotado.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-engine --test cgnat_blocks
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_cgnat
+  ```
+
+  O netns (**medido**) confere três coisas: sem ouvinte da fila o primeiro pacote cai; com ouvinte, ele
+  sai no bloco dado; o bloco sobrevive à troca da tabela.
+
+- 2026-10-23 — G2.3d: CGNAT, parte 4: a janela. É um painel (`crates/ui/src/cgnat.rs`) no grupo CGNAT do menu, que deixou de
+  estar trancado com o selo "soon". O placeholder `Win::Cgnat` saiu.
+
+  Abas:
+
+  - **Pools:** no **padrão de janela de lista do G0.24** (primeira janela a adotá-lo, com
+    `list.rs`/`list_modal.rs`):
+    - barra + − ✓ ✗ 💬;
+    - filtro por modo em selos;
+    - rodapé com contagens;
+    - menu de clique direito: abrir, copiar, copiar como comando CoreRouter e RouterOS, ativar,
+      desativar, remover;
+    - modal com ⓘ em cada rótulo.
+    - Os novos `ip.firewall.cgnat.pool.preview` e `exception.preview` calculam enquanto você digita:
+      assinantes, por IP, capacidade, IPs usados e, ao editar, quantos assinantes mudam de lugar. Mostram
+      também as checagens e o comando exato que o OK manda.
+    - Linhas: modo como selo e selo de capacidade "IPs usados/IPs", com os avisos da validação.
+    - O `pool.add`/`set` aceita números também como texto, como o modal manda.
+  - **Exceptions:** as exceções 1:1, no mesmo padrão; a pré-visualização mostra o pool e o slot que fica
+    vazio.
+  - **Who Was:**
+    - IP público, porta e data/hora com fuso; a resposta traz o assinante, o pool, o slot, a validade do
+      mapeamento e o DHCP daquela hora;
+    - consulta de um assinante: o slot dele agora.
+  - **Mapping:** a tabela de correspondência em páginas de 500, filtrada por assinante ou IP público. As
+    exceções aparecem apagadas, com o selo 1:1.
+  - **Blocks** (só com pool de blocos): os blocos ativos, com os selos `current` e `idle`, e o log de
+    blocos.
+  - **Alerts:** assinantes no limite, com % em uso, pico e vezes, mais o selo `insert failed`.
+  - **History:** as definições ao longo do tempo (RFC 7422 §3).
+
+  As explicações (ⓘ) estão em PT e EN (`i18n/cgnat_pt.rs`, `cgnat_en.rs`): o que é, quando mudar,
+  cuidado, padrão e a RFC.
+
+  Como testar: `cargo test -p corerouter-ui cgnat` (headless: abas, diálogo que cria pool, Who Was,
+  página do mapeamento, blocos e alertas). Screenshots claro e escuro olhados.
+
+- 2026-10-23 — G4.4b: Traffic Flow, parte 1: o crate `corerouter-proto-flow` (L2, puro, compila em wasm). Codifica e
+  decodifica IPFIX (RFC 7011) e NetFlow v9 (RFC 3954) com templates de fluxo IPv4 e IPv6 que levam
+  os endereços e portas antes e depois do NAT, eventos de sessão NAT44 e de bloco de portas
+  (RFC 8158) e registros de opções (taxa de amostragem, nomes das interfaces). Os templates voltam
+  por tempo e por contagem de pacotes no UDP e uma vez por conexão no TCP. O medidor transforma os
+  eventos `NEW`/`DESTROY` do conntrack e leituras periódicas da tabela em registros de fluxo, com
+  timeouts ativo e inativo, amostragem determinística 1 em N (os eventos de NAT nunca são
+  amostrados), filtro por interface e cache limitado sem perder bytes. O HAL ganhou o tipo
+  `conntrack::Event` e o trait `EventSource`. Teste: `cargo test -p corerouter-proto-flow` (exemplo
+  do RFC 7011 Apêndice A, pacote v9, retirada de template, ida e volta das duas versões, números de
+  sequência, reenvio de templates, timeouts, proptest de ida e volta e de bytes hostis).
+
+- 2026-10-23 — G4.4b: Traffic Flow, parte 2: o exportador funcionando.
+
+  - **Comandos:** `ip.traffic-flow.set/get` (interfaces, cache, timeouts ativo e inativo, amostragem,
+    eventos de NAT, destino nos eventos de NAT, retenção local) e `ip.traffic-flow.target.*`
+    (IPFIX/UDP, IPFIX/TCP, NetFlow v9/UDP; templates reenviados por pacotes e por tempo; `src_address`
+    só do roteador).
+  - **Saídas:** `ip.traffic-flow.stats`, `ip.traffic-flow.top` (top talkers dos últimos minutos, sem
+    coletor), `ip.traffic-flow.records` (lote com `since`/`next`, para o exportador de ClickHouse) e
+    `ip.traffic-flow.export` (CSV).
+  - **Fonte:** o HAL ganhou `conntrack_events`. No `hal-linux` são os grupos multicast NEW/DESTROY
+    do ctnetlink, com `CTA_TIMESTAMP`, `ENOBUFS` contado e `nf_conntrack_acct`/`timestamp` ligados. No
+    lab, as conexões simuladas do G2.2 abrem e fecham.
+  - **Serviço `traffic-flow` no daemon:** um leitor põe os eventos numa fila fixa (o descarte é
+    contado). O exportador roda o medidor e lê a tabela para os timeouts. Ele também lê o log de
+    blocos do CGNAT (G2.3c) e emite `natEvent` 16/17. Codifica uma vez por destino e envia fora do
+    lock.
+  - **Marco Civil (art. 14):** os eventos de NAT saem sem destino por padrão. O delete leva o início
+    da sessão e por isso basta sozinho.
+
+  Documentação em `docs/traffic-flow.md` (pesquisa, riscos, números).
+
+  Teste:
+
+  ```sh
+  cargo test -p corerouter-engine traffic_flow
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_traffic_flow -- --nocapture
+  ```
+
+  O teste em netns abre conexões TCP e UDP reais através de um SNAT para dois coletores em Rust (v9
+  por UDP e IPFIX por TCP). Ele confere:
+
+  - o NAT antes e depois;
+  - os tempos do kernel;
+  - o top talker;
+  - que um destino removido não recebe mais nada;
+  - uma rajada sem perda.
+
+- 2026-10-23 — G6.8: DNS Lookup, parte 2 de 2 (G6.8b): **Watch**, **Upstreams** e **Check hijack**.
+
+  - `tool.dns.watch` (`/tool dns-watch`, aba Watch): a mesma pergunta a cada intervalo até o Stop
+    ou o Esc, como o `dnsping`; latência × tempo com os picos marcados e a tabela (hora, ms,
+    etapa, TTL, resposta) com o selo `changed` quando a resposta troca.
+  - `tool.dns.upstreams` (`/tool dns-upstreams`, aba Upstreams): cada servidor de `ip.dns`,
+    `use_doh_server` e dos grupos de forwarders recebe 200 consultas (nomes populares e
+    aleatórios abaixo deles), com p50, p99, perda, SERVFAIL, TCP, EDNS e DoH/DoT; um servidor
+    morto é largado depois de 6 timeouts. Check hijack: NXDOMAIN sequestrado (nomes aleatórios) e
+    proxy no caminho (o resolvedor que chega ao autoritativo, por `whoami.ds.akahelp.net` e
+    `o-o.myaddr.l.google.com`, é da rede do próprio cliente). Recomendação de quais usar e quais
+    remover, explicada, no idioma das explicações.
+  - Achado no lab (rede real, **medido**): 1.1.1.1 e 8.8.8.8 saem pelas redes deles; 9.9.9.9 sai
+    pelo AS7195 (parceiro do Quad9), por isso "outra rede" é nota e não "proxy". A primeira
+    versão tomava o `"ip"` da resposta da Akamai (o IP público do cliente) como resolvedor e
+    marcava os três como proxy: o teste de unidade cobre o formato.
+
+  Como testar: `corerouter-cli --connect 127.0.0.1:7979 watch tool.dns.upstreams '{"count":50}'`;
+  `… watch tool.dns.watch '{"name":"www.netflix.com","server":"8.8.8.8","interval_ms":300}'`
+  (Ctrl+C para); na GUI, Tools › DNS Lookup, abas Watch e Upstreams. Testes: watch detecta a
+  mudança e o pico; benchmark com upstream lento, sequestrador, interceptado e morto (engine) e
+  com sockets reais (daemon: lento e sequestrador); headless das abas (Esc para o watch).
+
+- 2026-10-23 — docs: `docs/ui-style.md`: padrão aprovado pelo usuário para janelas de lista e o modal de adicionar
+  (G0.24): barra **+ − ✓ ✗ 💬** com filtros e Find, selos de estado e origem, rodapé com contagens,
+  editar por duplo clique, modal com ⓘ em cada rótulo, campos calculados, cadastro em série numa
+  transação, checagens (conflito, uso na rede, perda de acesso), prévia dos comandos e Cancel/Apply/OK.
+  A referência é IP › Addresses (G1.28). Também: regra geral "Explicação ⓘ em todo lugar que couber" (`docs/ui-style.md` e `AGENTS.md`), em português por padrão.
+
+- 2026-10-23 — fix: i18n: a mesma chave em duas tabelas de rótulos passa no teste quando o texto é igual (só reprova
+  se a tradução divergir). Sessões em paralelo registravam a mesma palavra ("changed", "of") em
+  catálogos diferentes, e cada combinação quebrava o lote da fila (#159, #165, 2026-10-23) sem
+  nenhum erro de verdade: o `lookup` pega a primeira, e com o mesmo texto não há diferença na tela.

@@ -13,6 +13,7 @@ pub mod dhcp_server;
 pub mod drift;
 pub mod icmp_ext;
 pub mod lab_conntrack;
+pub mod lab_flow;
 pub mod nic;
 pub mod probe;
 pub mod route_get;
@@ -469,6 +470,14 @@ pub trait Hal: Send {
         let _ = conns;
         Err(HalError::Unsupported(format!(
             "{} has no connection tracking",
+            self.describe()
+        )))
+    }
+
+    /// A live feed of conntrack events for the flow exporter (G4.4b).
+    fn conntrack_events(&mut self) -> Result<Box<dyn conntrack::EventSource>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking events",
             self.describe()
         )))
     }

@@ -24,7 +24,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "tool.dns.query", "DNS 
 .task()];
 
 /// Tasks, and the daemon's resolver to carry the bytes.
-fn can_lookup(s: &Session) -> std::result::Result<(), String> {
+pub(super) fn can_lookup(s: &Session) -> std::result::Result<(), String> {
     can_run(s)?;
     if s.dns_backend().is_none() {
         return Err(NEEDS_DAEMON.into());
@@ -32,7 +32,7 @@ fn can_lookup(s: &Session) -> std::result::Result<(), String> {
     Ok(())
 }
 
-fn server(raw: &str) -> Result<Option<LookupServer>> {
+pub(super) fn server(raw: &str) -> Result<Option<LookupServer>> {
     let t = raw.trim();
     let shown: String = t.chars().take(64).collect();
     if t.is_empty() || t.eq_ignore_ascii_case("router") {
@@ -60,7 +60,7 @@ fn server(raw: &str) -> Result<Option<LookupServer>> {
 }
 
 /// Every upstream the router asks: the servers, then `use_doh_server`.
-fn upstreams(s: &Session) -> Vec<LookupServer> {
+pub(super) fn upstreams(s: &Session) -> Vec<LookupServer> {
     let settings = s.dns_settings();
     let mut out: Vec<LookupServer> = settings.servers.iter().map(|ip| LookupServer::Plain(*ip)).collect();
     out.extend(settings.secure.iter().map(|x| LookupServer::Secure(x.url())));

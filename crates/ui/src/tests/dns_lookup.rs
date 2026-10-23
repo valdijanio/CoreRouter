@@ -322,3 +322,104 @@ fn ask_as_is_a_router_field() {
     h.idle();
     assert!(!h.has_text("Ask as"), "only for the router's chain");
 }
+
+/// G6.8 Watch: Start runs `tool.dns.watch` on the router; the rows come in
+/// as the task goes, and Esc stops it.
+#[test]
+fn watch_runs_until_esc() {
+    let mut s = Session::virtual_lab();
+    s.set_runner(Arc::new(Threads));
+    s.set_dns_backend(Arc::new(Cached));
+    s.tick(1_000);
+    let mut h = open(s);
+    h.click(h.text("Watch"));
+    h.idle();
+    {
+        let p = h.app.panel_mut::<LookupPanel>().unwrap();
+        p.name = "www.example.com".into();
+        p.interval = "100".into();
+    }
+    h.idle();
+    h.click(h.text("Start"));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let n = h.app.panel_mut::<LookupPanel>().unwrap().watch.events.iter().filter(|e| e["kind"] == "watch").count();
+        if n >= 3 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "no rows: {:?}", h.app.log());
+        thread::sleep(Duration::from_millis(50));
+        h.app.cache.refreshed_at = None;
+        h.time += 0.3;
+        h.idle();
+    }
+    h.idle();
+    assert!(h.has_text("Latency") && h.has_text("Answer"), "{:?}", painted(&h));
+    assert!(h.has_text("A 192.0.2.7"));
+    assert!(h.has_text("Stop"));
+    // Esc stops the watch (the window stays).
+    h.key(egui::Key::Escape, egui::Modifiers::NONE);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while h.app.panel_mut::<LookupPanel>().unwrap().watch.running() {
+        assert!(Instant::now() < deadline, "still running");
+        thread::sleep(Duration::from_millis(50));
+        h.app.cache.refreshed_at = None;
+        h.time += 0.3;
+        h.idle();
+    }
+    assert!(h.app.open.contains(&Win::Panel(WIN)));
+}
+
+/// Watch rows: `changed` and `spike` chips, newest first.
+#[test]
+fn watch_rows_mark_changes_and_spikes() {
+    let mut h = open(Session::virtual_lab());
+    h.app.with_panel_as::<LookupPanel, _>(|p, app| {
+        p.tab = crate::dns_lookup::Tab::Watch;
+        p.watch.task = Some(1);
+        p.arrived(app, "watch-poll", 0, json!({"done": false, "events": [
+            {"kind": "begin", "seq": 0},
+            {"kind": "watch", "seq": 1, "n": 1, "at": 3600.0, "t_ms": 0, "ms": 10, "rcode": "NOERROR", "stage": "cache", "ttl": 60, "data": ["A 192.0.2.7"], "changed": false, "spike": false, "timeout": false},
+            {"kind": "watch", "seq": 2, "n": 2, "at": 3601.0, "t_ms": 1000, "ms": 250, "rcode": "NOERROR", "stage": "upstream", "ttl": 300, "data": ["A 192.0.2.8"], "changed": true, "spike": true, "timeout": false}
+        ], "summary": {"mode": "watch", "sent": 2, "answered": 2, "loss_pct": 0.0, "p50_ms": 10.0, "p95_ms": 250.0, "max_ms": 250.0, "changes": 1, "spikes": 1}}));
+    });
+    for _ in 0..3 {
+        h.idle();
+    }
+    assert_eq!(h.app.panel_mut::<LookupPanel>().unwrap().watch.last_seq, Some(2), "next poll asks after 2");
+    assert!(h.has_text("changed") && h.has_text("spike"), "{:?}", painted(&h));
+    assert!(h.has_text("01:00:01") && h.has_text("A 192.0.2.8"));
+    assert!(h.has_text("1 × changed"));
+    let rows = painted(&h);
+    let first = rows.iter().position(|t| t == "01:00:01").unwrap();
+    let second = rows.iter().position(|t| t == "01:00:00").unwrap();
+    assert!(first < second, "newest first");
+}
+
+/// Upstreams: a row per server with its chips, then the advice in the
+/// explanations' language.
+#[test]
+fn upstreams_rows_and_advice() {
+    let mut h = open(Session::virtual_lab());
+    h.app.with_panel_as::<LookupPanel, _>(|p, app| {
+        p.tab = crate::dns_lookup::Tab::Upstreams;
+        p.bench.task = Some(1);
+        p.arrived(app, "bench-poll", 0, json!({"done": true, "state": "done", "events": [], "summary": {"mode": "upstreams",
+            "servers": [
+                {"server": "1.1.1.1", "groups": [], "transport": "UDP", "sent": 200, "answered": 200, "loss_pct": 0.0, "servfail_pct": 0.0, "p50_ms": 9.0, "p99_ms": 31.0, "tcp": true, "edns": true, "edns_udp": 1232, "nxdomain_hijack": false, "proxy": false, "forwarder": false, "down": false},
+                {"server": "203.0.113.53", "groups": ["CORP"], "transport": "UDP", "sent": 200, "answered": 200, "loss_pct": 0.0, "servfail_pct": 0.0, "p50_ms": 7.0, "p99_ms": 20.0, "tcp": false, "edns": false, "nxdomain_hijack": true, "nx_data": ["A 203.0.113.66"], "proxy": true, "egress": ["198.51.100.77"], "egress_as": 64511, "server_as": 64500, "forwarder": false, "down": false}
+            ],
+            "recommend": [
+                {"kind": "remove", "server": "203.0.113.53", "why": "hijack", "args": {"server": "203.0.113.53", "data": "A 203.0.113.66"}, "text": "203.0.113.53 answers names that do not exist (A 203.0.113.66) instead of NXDOMAIN: remove it"},
+                {"kind": "use", "server": "1.1.1.1", "why": "use", "args": {"server": "1.1.1.1", "p50": "9", "p99": "31"}, "text": "use 1.1.1.1: p50 9 ms, p99 31 ms, no loss"}
+            ]}}));
+    });
+    for _ in 0..4 {
+        h.idle();
+    }
+    for t in ["1.1.1.1", "CORP", "9 ms", "NXDOMAIN hijacked", "proxy on the path", "EDNS 1232", "Recommendation"] {
+        assert!(h.has_text(t), "{t}: {:?}", painted(&h));
+    }
+    assert!(h.has_text("203.0.113.53 responde nomes que não existem (A 203.0.113.66) em vez de NXDOMAIN: remova"));
+    assert!(h.has_text("use 1.1.1.1: p50 de 9 ms, p99 de 31 ms, sem perda"));
+}

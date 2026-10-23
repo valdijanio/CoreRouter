@@ -150,6 +150,8 @@ pub fn line(kind: &str, ev: &Value) -> String {
             s(ev, "bytes"),
             s(ev, "file_size")
         ),
+        "dns-watch" => crate::dns_watch::text_line(ev),
+        "dns-upstreams" => crate::dns_upstreams::text_line(ev),
         _ => ev.to_string(),
     }
 }
@@ -345,6 +347,8 @@ pub fn summary(kind: &str, summary: &Value) -> Vec<String> {
             s(summary, "file_size"),
             s(summary, "end"),
         )],
+        "dns-watch" => crate::dns_watch::summary_lines(summary),
+        "dns-upstreams" => crate::dns_upstreams::summary_lines(summary),
         _ => vec![summary.to_string()],
     }
 }

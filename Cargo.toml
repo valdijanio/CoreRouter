@@ -29,6 +29,7 @@ corerouter-proto-mndp = { path = "crates/proto-mndp" }
 corerouter-proto-ntp = { path = "crates/proto-ntp" }
 corerouter-proto-iperf = { path = "crates/proto-iperf" }
 corerouter-proto-syslog = { path = "crates/proto-syslog" }
+corerouter-proto-flow = { path = "crates/proto-flow" }
 corerouter-engine = { path = "crates/engine" }
 corerouter-control = { path = "crates/control" }
 corerouter-mcp = { path = "crates/mcp" }

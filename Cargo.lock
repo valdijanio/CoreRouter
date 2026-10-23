@@ -1078,7 +1078,7 @@ dependencies = [
  "corerouter-model",
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
- "corerouter-proto-iperf",
+ "corerouter-proto-flow",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",
  "corerouter-proto-ntp",
@@ -1115,7 +1115,6 @@ name = "corerouter-engine"
 version = "0.1.0"
 dependencies = [
  "argon2",
- "base64",
  "corerouter-firewall",
  "corerouter-hal",
  "corerouter-model",
@@ -1124,7 +1123,7 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-discovery",
  "corerouter-proto-dns",
- "corerouter-proto-iperf",
+ "corerouter-proto-flow",
  "corerouter-proto-mpls",
  "corerouter-proto-ospf",
  "criterion",
@@ -1282,12 +1281,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "corerouter-proto-iperf"
+name = "corerouter-proto-flow"
 version = "0.1.0"
 dependencies = [
+ "corerouter-hal",
+ "criterion",
  "proptest",
- "serde_json",
- "thiserror 2.0.21",
+ "serde",
 ]
 
 [[package]]
@@ -1363,7 +1363,6 @@ dependencies = [
 name = "corerouter-ui"
 version = "0.1.0"
 dependencies = [
- "base64",
  "corerouter-buildinfo",
  "corerouter-engine",
  "corerouter-hal",
