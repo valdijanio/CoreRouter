@@ -33,6 +33,7 @@ fn the_tick_collects_physical_ports_and_the_system() {
     assert!(rx["avg"].as_f64().unwrap() > 0.0, "{rx}");
     assert!(rx["max"].as_f64().unwrap() >= rx["avg"].as_f64().unwrap());
     assert!(rx["current"].as_f64().unwrap() > 0.0);
+    assert!(rx["max"].as_f64().unwrap() >= rx["current"].as_f64().unwrap(), "{rx}");
     assert!(e1["totals"]["rx_bytes"].as_f64().unwrap() > 0.0);
     assert!(e1["data"]["rx_bps"].as_array().unwrap().len() == 60);
     let cpu = &q["series"][1]["stats"]["cpu"];
