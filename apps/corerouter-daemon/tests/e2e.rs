@@ -425,7 +425,20 @@ fn hostile_lines_never_crash_or_hang_it() {
     for _ in 0..500 {
         drop(TcpStream::connect(d.addr()).unwrap());
     }
-    let mut c = d.client().unwrap();
+    // The daemon reaps them on its own threads; until then the limit on
+    // connections that have not logged in refuses a new one (it flaked under
+    // a loaded machine). It must accept again soon, not instantly.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut c = loop {
+        match d.client() {
+            Ok(c) => break c,
+            Err(e) if std::time::Instant::now() < deadline => {
+                assert!(e.contains("have not logged in"), "{e}");
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => panic!("still refused after 10 s: {e}"),
+        }
+    };
     assert_eq!(c.call("ping", Value::Null).unwrap()["pong"], true);
     assert_eq!(
         ok(&mut c, "system.identity.get", json!({}))["name"],

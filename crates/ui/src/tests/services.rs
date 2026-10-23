@@ -135,3 +135,38 @@ fn without_a_daemon_the_window_says_so() {
          Connect to corerouter-daemon to see them."
     ));
 }
+
+/// A service its config keeps off: Start is grey with why; Enable turns the
+/// switch on through the config command; Open settings opens its window.
+#[test]
+fn a_service_off_in_the_config_offers_enable_and_settings() {
+    let mut s = Session::virtual_lab();
+    if let Some(t) = s.ext_mut::<ServiceTable>() {
+        t.supervised = true;
+        t.rows = vec![ServiceRow {
+            name: "dns-server".into(),
+            state: ServiceState::Disabled,
+            reason: Some("ip.dns allow_remote_requests=no".into()),
+            enable: "ip.dns.set allow_remote_requests=yes".into(),
+            turn_on: Some(json!({"id": "ip.dns.set", "params": {"allow_remote_requests": true}})),
+            topic: "dns".into(),
+            ..ServiceRow::default()
+        }];
+    }
+    let mut h = open(s);
+    h.click(h.text("dns-server"));
+    refresh(&mut h);
+    h.tooltip_at(h.text("Start"));
+    assert!(h.has_text_containing("its config turns it off"), "Start explains");
+    h.click(h.text("Enable"));
+    refresh(&mut h);
+    let on = lock(&h.session)
+        .execute("ip.dns.get", &json!({}))
+        .unwrap()["allow_remote_requests"]
+        .clone();
+    assert_eq!(on, json!(true), "Enable ran ip.dns.set");
+    assert!(h.has_text_containing("turned on in the config"));
+    h.click(h.text("Open settings"));
+    h.idle();
+    assert!(h.app.open.contains(&Win::Panel(crate::dns::WIN)));
+}

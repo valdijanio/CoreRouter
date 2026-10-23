@@ -24,7 +24,7 @@ const MAX_NAME: usize = 64;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "system.service.print", "Services", ["System", "Services"], None,
-        "{name?: string} → [{name, state: disabled|starting|running|restarting|stopped|failed, reason, restart_in_secs, uptime_secs, restarts, recent_failures, threads, heartbeat_age_ms, listen: [{proto, address, scope: all|local|lan|public}], last_event, last_error, depends, enable, topic, policy, protected}]",
+        "{name?: string} → [{name, state: disabled|starting|running|restarting|stopped|failed, reason, restart_in_secs, uptime_secs, restarts, recent_failures, threads, heartbeat_age_ms, listen: [{proto, address, scope: all|local|lan|public}], last_event, last_error, depends, enable, turn_on: {id, params}|null, topic, policy, protected}]",
         always, print)
     .positional("name"),
     cmd!("system.service.start", "Start Service", [], None,
