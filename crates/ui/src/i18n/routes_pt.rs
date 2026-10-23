@@ -4,17 +4,35 @@
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
     ("All", "Todas"),
+    ("Changes (24 h)", "Trocas (24 h)"),
+    ("Check gateway", "Check gateway"),
+    ("Chosen", "Escolha"),
     ("IPv4", "IPv4"),
     ("IPv6", "IPv6"),
+    ("Kernel", "Kernel"),
+    ("Loading the route's detail…", "Carregando o detalhe da rota…"),
     ("Lookup", "Consultar"),
     ("Route Lookup", "Consulta de rota"),
+    ("Source", "Origem"),
     ("active", "ativas"),
+    ("ago", "atrás"),
+    ("changed", "mudou"),
+    ("created", "criada"),
+    ("differs from the config", "diferente da config"),
+    ("down for", "fora há"),
     ("inactive", "inativas"),
     ("kernel agrees", "kernel confere"),
     ("kernel differs", "kernel difere"),
     ("kernel not checked", "kernel não consultado"),
     ("local", "local"),
+    ("matches the config", "igual à config"),
+    ("misses", "falhas"),
+    ("missing", "falta"),
+    ("more", "mais"),
     ("next-hops", "próximos saltos"),
+    ("no change seen", "nenhuma troca vista"),
+    ("none", "nenhum"),
+    ("not ours", "não é nossa"),
     ("routes", "rotas"),
     ("standby", "em espera"),
     ("unreachable", "inalcançável"),
@@ -23,6 +41,22 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 /// Why a route is standby or inactive (`route.<reason_id>`), with the
 /// engine's arguments.
 pub(super) const TEMPLATES: &[(&str, &str)] = &[
+    (
+        "choice.ecmp",
+        "divide o tráfego com mais {others} caminho(s) na distância {distance}",
+    ),
+    (
+        "choice.lowest",
+        "menor distância ({distance}) entre as rotas usáveis; a seguinte ({next}) assume se ela cair",
+    ),
+    (
+        "choice.only",
+        "a única rota para este prefixo",
+    ),
+    (
+        "choice.only-usable",
+        "a única rota usável ({others} outra(s) inativa(s))",
+    ),
     (
         "route.address-disabled",
         "o endereço de '{interface}' que alcança {gateway} está desativado",

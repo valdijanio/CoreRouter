@@ -27,7 +27,6 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Watch", "Acompanhar"),
     ("Why this answer", "Por que esta resposta"),
     ("answered", "respondeu"),
-    ("changed", "mudou"),
     ("down", "fora do ar"),
     ("dropped", "descartou"),
     ("forwarder", "encaminhador"),

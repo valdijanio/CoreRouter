@@ -1,16 +1,23 @@
-//! L2 — CGNAT policies (NAT44, port-block allocation, deterministic NAT).
+//! L2 — CGNAT policies (G2.3): what a pool definition gets wrong.
 //!
-//! Scope: inside/outside pools, port-block allocation (RFC 6888/7422),
-//! deterministic mapping, logging; rendered to nftables (G2.3) and later to the
-//! XDP fast path in `dataplane-ebpf` (G2.5).
+//! The mapping itself (subscriber → public address and ports) is
+//! `corerouter_model::cgnat::Layout`, shared with the kernel backend and
+//! the XDP path, and the rules they become are `corerouter_firewall::cgnat`
+//! (L1, so `hal-linux` renders them too); this crate checks the pools
+//! against each other and the rest of the config ([`checks`]).
 //!
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
+pub mod checks;
+
 use corerouter_model::{Config, Issue};
 
-/// Validate this subsystem's part of the candidate. No config section exists
-/// yet, so there is nothing to reject.
-pub fn validate(_cfg: &Config) -> Vec<Issue> {
-    Vec::new()
+/// The errors of [`checks::checks`]: the engine refuses the commit.
+pub fn validate(cfg: &Config) -> Vec<Issue> {
+    checks::checks(cfg)
+        .into_iter()
+        .filter(|c| c.level == checks::Level::Error)
+        .map(|c| Issue::new(c.path, c.text))
+        .collect()
 }

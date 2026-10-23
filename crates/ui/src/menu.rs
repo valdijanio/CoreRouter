@@ -10,7 +10,7 @@
 //! the theme. The selected item shows an ⓘ: what the window does, its
 //! RouterOS path and its commands, in the language of the explanations.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use egui::{Id, Rect, Response, Sense, Ui, pos2, vec2};
 use serde_json::{Value, json};
@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use crate::help::{self, HelpView};
 use crate::i18n::{self, tr};
 use crate::windows::{self, Win};
+use crate::menu_badges::{Badge, Level};
 use crate::menu_search::{self, Hit};
 use crate::{CoreRouterUi, icons, win_id};
 
@@ -71,8 +72,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("cgnat", None, None, icons::ARROWS_SPLIT, "", &[], &["nat444", "cgn", "port block", "ipv4 compartilhado", "rfc 6598"]),
     e("dhcp-client", DHCP, Some("Client"), icons::LAPTOP, "/ip dhcp-client", &["ip.dhcp-client"], &["wan", "ip dinâmico", "obter ip", "dynamic ip", "ipv4"]),
     e("dhcp-relay", DHCP, Some("Relay"), icons::ARROWS_LEFT_RIGHT, "/ip dhcp-relay", &["ip.dhcp-relay"], &["helper", "ip helper", "option 82"]),
-    e("dhcp-server", DHCP, Some("Server"), icons::HARD_DRIVES, "/ip dhcp-server", &["ip.dhcp-server"], &["lease", "leases", "concessão", "network", "option", "reserva", "static lease", "ipv4"]),
-    e("dhcp-server-stats", DHCP, Some("Statistics"), icons::CHART_BAR, "/ip dhcp-server statistics", &["ip.dhcp-server.statistics"], &["estatísticas", "lease count", "pool usage", "uso do pool"]),
+    e("dhcp-server", DHCP, Some("Server"), icons::HARD_DRIVES, "/ip dhcp-server", &["ip.dhcp-server"], &["lease", "leases", "concessão", "network", "option", "reserva", "static lease", "ipv4", "statistics", "estatísticas", "pool usage", "uso do pool", "history", "histórico"]),
     e("dhcp6-server", DHCP, Some("Server"), icons::HARD_DRIVES, "/ipv6 dhcp-server", &["ipv6.dhcp-server"], &["dhcpv6", "binding", "prefix delegation", "pd"]),
     e("dhcpv6-client", DHCP, Some("Client"), icons::LAPTOP, "/ipv6 dhcp-client", &["ipv6.dhcp-client"], &["dhcpv6", "prefix delegation", "pd", "ia_pd", "wan"]),
     e("dns", DNS, Some("Settings"), icons::GEAR_SIX, "/ip dns", &["ip.dns.get", "ip.dns.set"], &["resolver", "servers", "doh", "dot", "dns server", "allow remote requests"]),
@@ -83,9 +83,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("dns-static", DNS, Some("Static"), icons::PUSH_PIN, "/ip dns static", &["ip.dns.static"], &["hosts", "a record", "registro", "fwd", "cname", "estático"]),
     e("dns-statistics", DNS, Some("Statistics"), icons::CHART_BAR, "/ip dns statistics", &["ip.dns.statistics"], &["queries", "consultas", "top clients", "estatísticas"]),
     e("dns-tsig", DNS, Some("TSIG Keys"), icons::KEY, "/ip dns tsig-key", &["ip.dns.tsig-key"], &["tsig", "key", "chave", "rfc 8945"]),
-    e("dns-zone-file", DNS, Some("Zone File"), icons::FILE_TEXT, "/ip dns zone file", &["ip.dns.zone.file"], &["zone file", "import", "export", "bind"]),
-    e("dns-zone-records", DNS, Some("Zone Records"), icons::LIST, "/ip dns zone record", &["ip.dns.zone.record"], &["record", "registro", "soa", "mx", "ns"]),
-    e("dns-zones", DNS, Some("Zones"), icons::FOLDERS, "/ip dns zone", &["ip.dns.zone"], &["zone", "zona", "authoritative", "autoritativo", "dnssec"]),
+    e("dns-zones", DNS, Some("Zones"), icons::FOLDERS, "/ip dns zone", &["ip.dns.zone"], &["zone", "zona", "authoritative", "autoritativo", "dnssec", "record", "registro", "soa", "mx", "zone file", "arquivo de zona", "bind", "import", "export"]),
     e("firewall", None, None, icons::SHIELD_CHECK, "/ip firewall", &["ip.firewall"], &["nat", "masquerade", "srcnat", "dstnat", "port forward", "redirecionar porta", "filter", "mangle", "address list", "blacklist", "bloquear", "acl"]),
     e("history", None, None, icons::CLOCK_COUNTER_CLOCKWISE, "/system history", &["config.history", "config.rollback"], &["undo", "rollback", "desfazer", "revision", "revisão", "commit"]),
     e("identity", None, None, icons::IDENTIFICATION_BADGE, "/system identity", &["system.identity"], &["hostname", "nome", "name"]),
@@ -321,6 +319,8 @@ pub(crate) struct MenuState {
     pub recent: Vec<String>,
     /// Windows pinned at the top of the menu (keys), in pinning order.
     pub favorites: Vec<String>,
+    /// State badges this frame, by window key (`menu_badges.rs`).
+    pub badges: BTreeMap<&'static str, Badge>,
 }
 
 /// The Ctrl+K palette.
@@ -517,6 +517,34 @@ pub(crate) fn place(win: Win, labels: i18n::Lang) -> String {
     }
 }
 
+/// A state badge as a chip, its details on hover.
+fn badge_chip(ui: &mut Ui, b: &Badge) {
+    let v = ui.visuals();
+    let tone = match b.level {
+        Level::Alert => crate::chip::RED.tone(v),
+        Level::Notice => crate::chip::AMBER.tone(v),
+    };
+    crate::chip::chip(ui, &b.text, tone).on_hover_text(&b.tip);
+}
+
+/// What a closed group or subgroup shows of its windows' badges: the
+/// only one, or how many, in the worst one's colour.
+fn summary(badges: &[&Badge]) -> Option<Badge> {
+    let worst = badges.iter().max_by_key(|b| b.level)?;
+    Some(match badges {
+        [one] => (*one).clone(),
+        _ => Badge {
+            level: worst.level,
+            text: badges.len().to_string(),
+            tip: badges
+                .iter()
+                .map(|b| b.text.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        },
+    })
+}
+
 /// Id of the selected item's ⓘ.
 pub(crate) fn info_id() -> Id {
     Id::unique("corerouter-menu-info")
@@ -614,6 +642,7 @@ impl CoreRouterUi {
     /// The side menu: the search field, New Terminal, the favorites and
     /// the tree; or, while the field has text, what it finds.
     pub(crate) fn menu(&mut self, ui: &mut Ui) {
+        self.menu.badges = self.menu_badges();
         self.menu_shortcuts(ui.ctx());
         ui.add_space(4.0);
         self.search_field(ui);
@@ -880,7 +909,25 @@ impl CoreRouterUi {
             active: false,
             selected: self.menu.cursor == Some(Nav::Group(g.name)),
         };
-        if row(ui, row_id(g.name), &look, |_| {}).clicked() {
+        let shut = if open {
+            None
+        } else {
+            let wins: Vec<Win> = g
+                .nodes
+                .iter()
+                .flat_map(|n| match n {
+                    Node::Item(w) => vec![*w],
+                    Node::Sub { items, .. } => items.clone(),
+                })
+                .collect();
+            self.badges_of(&wins)
+        };
+        let resp = row(ui, row_id(g.name), &look, |ui| {
+            if let Some(b) = &shut {
+                badge_chip(ui, b);
+            }
+        });
+        if resp.clicked() {
             self.menu.toggle(g.name, None);
             self.menu.cursor = Some(Nav::Group(g.name));
         }
@@ -903,9 +950,13 @@ impl CoreRouterUi {
                         selected: self.menu.cursor == Some(Nav::Sub(g.name, name)),
                     };
                     let count = items.len().to_string();
+                    let shut = if open { None } else { self.badges_of(items) };
                     let resp = row(ui, row_id(&node_key(g.name, Some(name))), &look, |ui| {
                         if !open {
                             crate::chip::chip(ui, &count, crate::chip::neutral_tone(ui.visuals()));
+                        }
+                        if let Some(b) = &shut {
+                            badge_chip(ui, b);
                         }
                     });
                     if resp.clicked() {
@@ -948,10 +999,14 @@ impl CoreRouterUi {
             selected,
         };
         let mut info = false;
+        let badge = self.menu.badges.get(key(win)).cloned();
         let resp = row(ui, row_id(&format!("{salt}:{}", key(win))), &look, |ui| {
             if selected && salt == "win" {
                 info = help::info_button(ui, info_id(), tr(labels, "What this window does"))
                     .clicked();
+            }
+            if let Some(b) = &badge {
+                badge_chip(ui, b);
             }
             if soon.is_some() {
                 crate::chip::chip(ui, tr(labels, "soon"), crate::chip::neutral_tone(ui.visuals()));
@@ -982,6 +1037,12 @@ impl CoreRouterUi {
             self.menu.cursor = Some(Nav::Item(win));
             self.open_from_menu(win);
         }
+    }
+
+    /// The badges of `wins` summed up for their closed group.
+    fn badges_of(&self, wins: &[Win]) -> Option<Badge> {
+        let list: Vec<&Badge> = wins.iter().filter_map(|w| self.menu.badges.get(key(*w))).collect();
+        summary(&list)
     }
 
     /// Open `win`, or bring it to the front when it is open.
