@@ -1806,3 +1806,240 @@ continuação indentadas).
   `gh pr merge --delete-branch` saía com erro (404 ao apagar a branch que o GitHub apaga sozinho no
   merge) depois de um merge que tinha dado certo, e a fila parou em #120. Agora o merge é feito sem
   `--delete-branch`, o estado do PR decide se houve falha, e a branch é apagada à parte, sem erro.
+
+- 2026-10-22 — G0.14: A validação do firewall no commit deixou de ser O(n²): entrou no PR da auditoria de rede (#125),
+  com o benchmark `crates/engine/benches/scale.rs`; detalhes em `docs/audit-2026-10.md`.
+
+- 2026-10-22 — G1.23: Commit não regrava mais o histórico: resolvido pelo `audit-perf` (detalhes e números em
+  `docs/changes/audit-perf.md`).
+
+- 2026-10-22 — audit-dns-lab: Auditoria (achado do teste de ponta a ponta, `audit-e2e`): com `--backend virtual` e
+  `ip.dns.set allow_remote_requests=yes`, o encaminhador DNS escutava em `0.0.0.0`/`[::]` do
+  **host**, então a rede real da máquina chegava ao resolvedor do lab (as interfaces do lab não são
+  as do host, e a ACL `allowed_from` compara com as redes do lab, que podem coincidir com a LAN de
+  verdade). Agora o lab virtual escuta só em `127.0.0.1` e `::1`, como o CRDP do G5.4; no backend
+  Linux nada muda. Teste: `service::dns_server::tests::the_virtual_lab_answers_only_on_the_loopback`.
+  Os outros sockets do daemon que usam endereço curinga são clientes de porta efêmera (zonas,
+  syslog) ou só rótulo de exibição (DHCP, que no lab usa os sockets simulados) — conferidos.
+
+  Quem roda o lab num network namespace e quer o encaminhador nas interfaces do namespace (os
+  testes `netns_dns_*`) passa `--dns-lab-any`; no backend Linux a opção não muda nada.
+
+- 2026-10-22 — audit-e2e: Auditoria ponta a ponta: o `corerouter-daemon` de verdade (backend virtual, `--config-dir`
+  temporário, porta alta, `--no-discovery`), dirigido pela CLI (`--connect`, token local), pelo
+  MCP (`corerouter-cli mcp`, JSON-RPC no stdin) e por um harness em Python no canal de controle.
+
+  Cenários exercitados (todos passaram, salvo os bugs abaixo, já corrigidos): bridge + porta, VLAN
+  sobre ether e sobre bridge, bonding 802.3ad, VRF com membro, endereços v4/v6 (comentário com
+  aspas), rotas (main e VRF), address-list, filter, NAT, DNS (servidores, estático, zona primária
+  com registro), pool + servidor DHCP + rede + concessão fixa, NTP, syslog remoto, identidade;
+  modo transacional (`config.diff`, commit, discard, rollback + commit); Safe Mode (exit mantém,
+  cancel desfaz, outro cliente não entra nem sai sem `force`, dono desconecta e dono morto com
+  `kill -9` desfazem); `/export` → `/import` num daemon novo (export idêntico; running idêntico a
+  menos dos ids internos, que seguem a ordem do script); SIGTERM e reinício no mesmo diretório
+  (running e histórico idênticos); `kill -9` no meio de uma rajada de commits (sobe na última
+  revisão salva, com todo commit confirmado presente); entradas hostis no TCP e no stdin do MCP
+  (lixo, HTTP, UTF-8 inválido, NUL, array, tipos errados, chave desconhecida, aninhamento de
+  100 000 níveis, id gigante, linha de 17 MiB com e sem `\n`, 1000 conexões seguidas, conexões
+  meio abertas): o daemon nunca caiu nem travou; 16 clientes escrevendo em paralelo por 60 s.
+
+  Corrigido (cada um com teste que falha na `main`):
+
+  - **Estranho "ocupado" segurava vaga sem login para sempre (média).** O limite de ociosidade
+    (30 s) zerava a cada byte: 8 conexões mandando um byte (ou um `ping`) a cada 29 s ocupavam
+    todas as vagas sem login e **ninguém mais entrava**, nem o operador com token (medido contra o
+    daemon: após 45 s, `too many connections that have not logged in`). Agora uma conexão fica no
+    máximo `login_grace` (60 s) sem login no total, como o `LoginGraceTime` do SSH; logada, não há
+    prazo. Teste: `control/tests/limits.rs::busy_strangers_are_cut_at_the_login_grace`.
+  - **Clientes com token esperando o lock contavam como "sem login" (média).** A conexão só virava
+    logada depois de respondida; com um commit em curso, os 8 primeiros clientes que chegavam
+    esperavam o lock ainda "sem login" e o 9º era recusado. Na rodada de 16 clientes por 60 s:
+    548 recusas e 517 `Broken pipe` em 1740 operações. Agora o token conferido marca a conexão
+    antes de o comando esperar a vez (`answer_with`, TCP/TLS e WebSocket). Depois: 4665 operações,
+    zero erros. Teste: `limits.rs::clients_waiting_for_the_session_are_not_logged_out`.
+  - **MCP morto depois de reiniciar o daemon (média).** O backend `Remote` nunca reconectava: toda
+    tool call respondia `send: Broken pipe` até reiniciar o próprio MCP (o daemon é recompilado e
+    reiniciado pela fila de entrada). Agora a próxima chamada redisca (relê o token local, loga de
+    novo com `--user`, no TLS exige o mesmo certificado), uma sessão de login expirada é refeita, e
+    um pedido cuja resposta se perdeu **não** é reenviado ("may or may not have run").
+    `Client::is_stale` detecta o fechamento entre pedidos. Testes:
+    `mcp/tests/remote_reconnect.rs` (3).
+  - **`/import` grande era quadrático (média, desempenho) — corrigido pelo #130 (audit-perf).**
+    Cada passo de um `engine.batch` atômico copiava o candidate inteiro. Achado aqui no daemon
+    (release: 20 000 entradas de address-list 22,8 s, 10 000 rotas 18,3 s); a correção que ficou é
+    a do #130 (`AtomicBatch` nas extensões da sessão). Este PR só acrescenta o benchmark
+    `engine/benches/batch_import.rs` e os números de ponta a ponta (abaixo).
+  - **`/export` de um bond saía com nota falsa (baixa).** O bond aparece em `/interface` (tipo
+    `bonding`) e em `/interface bonding`, que tem `print` próprio: o export trazia
+    `# add name=bond1: slaves is not exported` (como se fosse segredo) ao lado do `add` correto.
+    Agora o submenu com `print` exporta a linha uma vez, e `/interface set` guarda o que só a
+    interface sabe (`disabled`). Teste: `shell/tests/terminal.rs::bond_exports_once_without_a_note`.
+
+  Processo: a etiqueta de `docs/changes/` aceita dígitos (`audit-e2e`), começando por letra
+  (`xtask/src/changes.rs`).
+
+  Testes duráveis novos: `apps/corerouter-daemon/tests/e2e.rs` sobe o binário real (porta
+  efêmera, sem descoberta) — config de todas as áreas sobrevive a SIGTERM e a `kill -9` no meio de
+  commits, linhas hostis, Safe Mode desfeito quando o dono morre, 8 escritores paralelos sem perda
+  nem duplicata (~13 s em debug, **medido**).
+
+  Verificado e OK (sem mudança): limite de 16 MiB por linha (TCP e MCP), `recursion limit` do
+  serde para JSON profundo, `MAX_BATCH`, limites de tamanho por parâmetro, lote JSON-RPC recusado,
+  MCP sai no EOF do stdin, histórico sempre crescente, journal coerente (seq = revisão).
+  Comportamentos registrados, não bugs: no máximo 16 conexões por porta (o 17º cliente simultâneo
+  é recusado), e 8 delas sem login; uma conexão que conecta e não manda nada ocupa vaga sem login
+  até falar; em Safe Mode, mudanças de outro cliente também são desfeitas (como no RouterOS,
+  `docs/architecture.md`).
+
+  Para outras frentes (não mexido aqui):
+
+  - **Desempenho (persistência):** antes do #130 cada commit regravava o arquivo inteiro com o
+    histórico (`running.json` no teto de 32 MiB, commit p50 110 ms / máx. 297 ms com 4000 regras
+    + 20 000 entradas + 10 000 rotas). Resolvido pelo #130 (revisões em arquivos, G1.23): mesma
+    config, commit p50 36 ms / máx. 55 ms (release, **medido**).
+  - **DNS:** com `--backend virtual`, `allow_remote_requests` abre o encaminhador em
+    `0.0.0.0`/`[::]` do host (a ACL `allowed_from` filtra, mas a porta fica exposta em todas as
+    interfaces da máquina de desenvolvimento).
+
+- 2026-10-22 — audit-gui: Auditoria da GUI (`crates/ui`, `apps/corerouter-gui`): 11 dos 12 achados corrigidos aqui, 1 vira
+  gap (G1.24) e o resto de custo por quadro com listas enormes vira a G1.25. Os testes novos
+  falharam com o código da `main` (rodados com a correção desligada, **medido**); os de desempenho
+  têm bench antes/depois na seção `## perf` (bench novo `crates/ui/benches/frames.rs`, que desenha a
+  UI de verdade sobre listas grandes postas no cache, pelos ganchos `corerouter_ui::perf`).
+
+  Corrigido:
+
+  - **Médio — seleção de tabela O(n²) por quadro** (#1). `table::show` recalculava a seleção
+    inteira (`state.selection(rows)`) uma vez **por linha**, e `retain` fazia `order.contains`
+    (um `Vec`) para cada chave selecionada; cada janela ainda filtrava as linhas com
+    `selection.contains` num `Vec<String>`. Com 10 000 endereços e Ctrl+A, **15 s por quadro**. Agora
+    a seleção é um `table::Selection` (ordem de exibição + `HashSet`, `contains` O(1)), calculada uma
+    vez por quadro; `retain` usa um `HashSet`; e a tabela só desenha e registra as linhas que estão
+    na tela (as outras só ocupam o lugar; a linha arrastada continua viva fora da tela). Testes
+    `table::tests::only_the_rows_in_view_are_drawn` e o bench `ui_frame/addresses_10k_all_selected`:
+    15,15 s → 28 ms.
+  - **Médio — aba Filter Rules copiava todas as regras a cada quadro e o "NUNCA CASA" era O(n²)**
+    (#2). As listas do firewall ficam num `Arc<Vec<Value>>` (o quadro pega emprestado, não copia), e
+    a posição de cada regra por id é um `HashMap` montado uma vez por quadro (`firewall::positions`).
+    Bench `ui_frame/firewall_5k_shadowed`: 155 ms → 21 ms.
+  - **Médio — célula de tabela nunca era cortada** (#3, docs/ui-style.md › Tabelas). Um valor longo
+    esticava a coluna sem limite e era medido inteiro em toda linha e todo quadro. Agora a célula
+    mostra até 120 caracteres (`table::CELL_CHARS`) numa linha só, termina em `…` e o texto inteiro
+    (até 4096 caracteres) vai no tooltip da célula; os selos (chips) depois do texto ficam. Teste
+    `table::tests::a_long_cell_is_cut_with_an_ellipsis`; bench `addresses_1k_4kB_comments`: 94 ms →
+    1,8 ms. (O engine já limita `comment` a 256 caracteres; a correção vale para toda célula.)
+  - **Médio — consulta ou poll sem resposta travava a atualização para sempre** (#4). O `refresh` não
+    manda nada enquanto houver consulta pendente, e o Ping/MTR só pede de novo quando a resposta
+    chega. Agora cada pedido pendente tem prazo: consulta, poll de ferramenta e aba de interface
+    30 s, ação e terminal 120 s (o mesmo do cliente nativo). Consulta vencida: a UI pede de novo,
+    registra no log e mostra o selo âmbar `stale` na barra de status até a próxima resposta; poll
+    vencido: pergunta de novo sem dar a tarefa por perdida; ação vencida: sai do "waiting for the
+    router" com erro ("pode ter sido aplicada: confira"). Na web, o `WsBackend` também dá prazo de
+    120 s a cada id em voo (e um login sem resposta reabre a conexão). Testes
+    `a_lost_query_reply_does_not_freeze_the_refresh`,
+    `a_lost_poll_polls_again_and_a_lost_action_is_released`.
+  - **Médio — terminal re-quebrava e re-diagramava as 5000 linhas a cada quadro** (#5). As linhas
+    quebradas ficam em cache por largura (só as novas são quebradas), só as linhas visíveis viram
+    `Label`, e uma linha de saída guarda no máximo 64 Ki caracteres (`…` no fim). Teste
+    `a_full_terminal_lays_out_only_what_is_in_view`; bench `terminal_5000_lines`: 8,5 ms → 0,09 ms.
+  - **Baixo — firewall mostrava listas de interface entre colchetes** (`[LAN]`, `![LAN]`, #6). Agora
+    é um selo colorido pelo nome da lista (`chip::name_hue`, FNV-1a; a mesma função passou a servir
+    o DHCP Server). Teste `firewall::interface_lists_are_chips_not_brackets`.
+  - **Baixo — cores escolhidas na hora** (#7): o `ALERT …` branco sobre vermelho fixo do Ping virou o
+    selo vermelho `alerta` com os detalhes no tooltip; o status do NTP (`synchronized`/`waiting`) e
+    o `link-ok`/`no-link` da aba Status da interface viraram selos GREEN/AMBER/RED; o âmbar da aba
+    Ethernet vem do `chip::AMBER`. Ficou o vermelho do botão Safe Mode (`SAFE_MODE_FILL`): é o
+    botão no estilo do WinBox, não um selo de estado.
+  - **Baixo — `TaskView::absorb` somava o contador `lost` do router sem saturar** (#8): dois
+    `u64::MAX` davam panic em debug. Agora `saturating_add`. Teste `a_hostile_lost_counter_saturates`.
+  - **Baixo — `target as usize` no wasm32** (#9): `usize::try_from`, o evento fora de faixa é
+    ignorado (só reproduz com ponteiro de 32 bits; sem teste que falhe em x86_64).
+  - **Baixo — CSV do Ping** (#10): campo que começa com `=`, `+`, `-`, `@`, tab ou CR (e não é
+    número) ganha `'` na frente (injeção de fórmula em planilha); o app nativo nunca sobrescreve um
+    arquivo (`create_new`, depois `ping-1-2.csv`, …). Testes `csv_quotes_what_needs_it` e
+    `export::tests::a_second_export_never_replaces_the_first`.
+  - **Baixo — cobertura headless** (#12): `every_window_renders_with_data_and_long_values` abre
+    todas as janelas (IPv6, rotas, VRF, DHCP Server/Relay com `relay_info_trusted`, firewall…) sobre
+    um lab com dados e comentários longos e confere que nada sai inteiro nem entre colchetes;
+    `every_interface_tab_renders_with_data` passa por todas as abas de "Interface <ether2>" com
+    amostras de tráfego.
+
+  Conferido: os dois checkboxes `relay_info_trusted` (DHCP Server "Trust Option 82 Without Relay",
+  DHCP Relay "Trust Client Option 82") alinham no formulário (screenshots no PR). Como testar:
+  `cargo test -p corerouter-ui`, `cargo bench -p corerouter-ui --bench frames`; na GUI, IP ›
+  Addresses com comentários longos (passe o mouse no `…`) e IP › Firewall com
+  `in_interface_list=!LAN`.
+
+- 2026-10-22 — audit-perf: Desempenho do caminho de commit e de `Session::execute`, e o canal de controle sob carga.
+  Resolve G1.23. Números na seção `## perf` (antes = `main` c5db148, mesma máquina).
+
+  Corrigido:
+
+  - **Alto — todo commit regravava o histórico inteiro** (G1.23). A gravação serializava a
+    running e as até 64 revisões (até 32 MiB) e fazia fsync disso a cada comando: com 10 000 rotas
+    um commit levava ~0,4 s. Agora o backend com arquivos de revisão (`FileStorage` e
+    `MemoryStorage`, `ConfigStorage::revision_files`) guarda cada revisão num arquivo próprio
+    (`rev-<n>.json`, `persist::encode_revision`), escrito uma vez pelo commit que a criou e
+    apagado quando sai do histórico; o slot (`running.json`/`.prev`) guarda só a running e a
+    revisão mais nova, no mesmo formato de antes (versões anteriores leem o arquivo, com
+    histórico de uma entrada). O commit serializa a config uma vez (`persist::encode_config`, que
+    também mede o limite de tamanho) e o texto é emendado no slot e no arquivo da revisão. Ordem
+    da gravação: arquivos que faltam (temp + fsync + rename) → slot (como antes: temp, fsync,
+    rotação, fsync do diretório, que torna os renames dos arquivos duráveis) → apagar os que saíram
+    do histórico. Boot: os arquivos mais antigos que o slot completam o histórico; um ilegível ou
+    com outro número custa só aquela revisão (`storage.boot_errors`); um mais novo que o slot
+    (gravação interrompida, ou volta ao `previous`) é ignorado e reescrito pelo próximo commit;
+    `rev-*.json.tmp` é apagado ao abrir. Arquivo de versão anterior (histórico inteiro no slot)
+    carrega e migra no primeiro commit. O limite de 32 MiB vale para a soma dos arquivos de
+    revisão. Testes `a_commit_writes_its_revision_not_the_whole_history` (o slot tinha 22 cópias
+    da config, agora 2), `the_history_survives_a_reboot_and_old_files_are_deleted`,
+    `an_unreadable_revision_file_costs_that_revision_only`,
+    `a_file_with_the_whole_history_from_an_older_build_loads_and_moves_to_files`,
+    `a_revision_file_newer_than_the_slot_is_replaced`, `safe_mode_saves_nothing_of_its_revisions`
+    (`crates/engine/tests/history_files.rs`), `revisions_are_files_of_their_own` e
+    `revision_names_are_strict` (storage-fs), `spliced_running_file_is_the_one_revision_file` e
+    `revision_files_round_trip_and_are_checked` (model). Bench novo
+    `storage_fs/commit/routes_history64/*` (arquivo de verdade, fsync, 64 revisões):
+    396 → 11,0 ms com 10 000 rotas.
+  - **Médio — `/import` era quadrático** (achado nesta auditoria). Cada passo de um batch
+    atômico copiava o candidate inteiro como ponto de rollback, mas um passo que falha desfaz o
+    batch inteiro pela cópia do próprio batch. Dentro de um batch atômico os passos não copiam
+    mais. Bench novo `engine_scale/import/address_lists/5000`: 423 → 61 ms.
+  - **Médio — consultas copiavam a config** (`store.candidate().clone()` em todo `execute`). Só
+    comandos de ação (`journal`) copiam agora; teste `queries_leave_the_candidate_alone` roda toda
+    consulta do registro sobre um candidate sujo e confere que nada muda.
+  - **Médio — `cmd::find` varria o registro duas vezes por `execute`** e `doc_keys` reanalisava o
+    `params` em toda chamada. Índice por id (`OnceLock<HashMap>`, montado uma vez, com as chaves
+    já analisadas); `execute` procura uma vez. `ip.address.list`: 1,39 µs → 0,22 µs.
+  - **Baixo — commit copiava a config duas vezes para o plano de dados** (`effective(..)
+    .into_owned()` mesmo sem nada de DHCP para acrescentar): agora só copia quando o DHCP
+    acrescenta algo.
+  - **Baixo — journal com `Vec::remove(0)`** a cada comando depois de 1024: agora apara em blocos
+    de 256 (`journal()` continua mostrando as 1024 mais novas).
+
+  Verificado e mantido:
+
+  - `is_dirty` compara a config inteira (1,6 µs na config do lab, **medido**; O(config) com 10 000
+    rotas) e `ConfigStore::commit` copia a candidate duas vezes; junto com o ponto de rollback por
+    comando de ação é o que resta do custo por comando proporcional à config. Tirar isso pede
+    `Arc`/cópia na escrita no `ConfigStore`: vira a gap G0.16.
+  - `engine_execute/virtual_lab_new` (3,42 µs na tabela; 8,0 µs na `main` → 7,4 µs): não é um bug, a `Config` do lab
+    cresceu (clonar 1,1 µs, comparar 1,6 µs, aplicar no lab virtual 2,2 µs, **medido**), e o
+    `ConfigStore::new` a copia duas vezes. Fica com a G0.16.
+  - `rejected_param` 1,21 → 0,81 µs com o índice; o resto é a sugestão "did you mean".
+  - Canal de controle sob carga (bench novo `control_load/tcp/interface.list/{1,4,16}`): escala de
+    18 mil para 77 mil pedidos/s com 16 conexões; com 16 o p50 sobe para 0,2 ms porque cada
+    `interface.list` passa ~9 µs com o lock da sessão (uma sessão, um lock, por desenho). Não há
+    gargalo além desse. 32 conexões não cabem: `MAX_CONNECTIONS` = 16 por endpoint, de propósito.
+
+
+  Como testar: `cargo test -p corerouter-engine --test history_files --test query_purity`,
+  `cargo test -p corerouter-storage-fs`, `cargo bench -p corerouter-storage-fs --bench commit`,
+  `cargo bench -p corerouter-engine --bench scale -- 'commit|import'`,
+  `cargo bench -p corerouter-control --bench load`.
+
+- 2026-10-22 — audit-relatorio: Relatório da auditoria de outubro de 2026 em `docs/audit-2026-10.md`: o que foi testado por
+  área, os bugs achados (corrigidos nos PRs #122–#127 e #129–#132, ou virados gap), os números
+  **medidos** de antes e depois e o que ficou de fora. Também acerta o limite do `command_batch` do
+  MCP, que a descrição da ferramenta e o `docs/mcp.md` ainda davam como 256 passos (é 32 768 desde
+  o #123).

@@ -74,3 +74,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-22 — G4.2b feito (relay, opção 82, histórico); criado G4.2e (sonda ICMP para relays e limite por remote id)
 - 2026-10-22 — G4.2c feito (servidor DHCPv6 com IA_NA, IA_PD e relay v6); criado G4.2f (DHCPv6: reconfigure, opções, estatísticas)
 - 2026-10-22 — G6.6 feito (DNS Lookup estilo dig em Tools)
+- 2026-10-22 — G0.14 feito (validação do firewall linear no commit, auditoria)
+- 2026-10-22 — G1.23 feito (histórico em arquivos de revisão, pelo audit-perf)
