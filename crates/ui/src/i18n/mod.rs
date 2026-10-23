@@ -22,6 +22,8 @@
 //! (`prefs.rs`).
 
 mod en;
+mod menu_en;
+mod menu_pt;
 mod pt;
 mod tuning_en;
 mod tuning_pt;
@@ -61,15 +63,15 @@ impl Lang {
     fn labels(self) -> &'static [Table] {
         match self {
             Lang::En => &[],
-            Lang::Pt => &[pt::LABELS, tuning_pt::LABELS],
+            Lang::Pt => &[pt::LABELS, tuning_pt::LABELS, menu_pt::LABELS],
         }
     }
 
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP],
         }
     }
 
