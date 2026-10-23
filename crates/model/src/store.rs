@@ -59,6 +59,16 @@ pub struct ConfigStore {
     touched: bool,
     history: Vec<Revision>,
     max_history: usize,
+    /// Bumped whenever the candidate may have changed (G1.27c: what is
+    /// computed from it can be kept until then). Not saved.
+    generation: u64,
+}
+
+/// Generations come from one counter for the whole process, so two stores
+/// (one replacing the other) never share one.
+fn next_generation() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Default for ConfigStore {
@@ -83,6 +93,7 @@ impl ConfigStore {
             touched: false,
             history: vec![rev0],
             max_history: Self::DEFAULT_MAX_HISTORY,
+            generation: next_generation(),
         }
     }
 
@@ -105,6 +116,7 @@ impl ConfigStore {
             touched: false,
             history,
             max_history,
+            generation: next_generation(),
         }
     }
 
@@ -118,13 +130,22 @@ impl ConfigStore {
 
     pub fn candidate_mut(&mut self) -> &mut Config {
         self.touched = true;
+        self.generation = next_generation();
         &mut self.candidate
     }
 
     /// Replace the candidate wholesale (used by the engine guard on rollback).
     pub fn set_candidate(&mut self, cfg: Config) {
         self.touched = true;
+        self.generation = next_generation();
         self.candidate = cfg;
+    }
+
+    /// Changes whenever the candidate may have changed (handed out for
+    /// writing, replaced, discarded, rolled back): equal generations, equal
+    /// candidate.
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Candidate differs from running. O(1) while nobody wrote to the
@@ -166,6 +187,7 @@ impl ConfigStore {
 
     pub fn discard(&mut self) {
         self.candidate = self.running.clone();
+        self.generation = next_generation();
         self.touched = false;
     }
 
@@ -177,6 +199,7 @@ impl ConfigStore {
             .find(|r| r.number == number)
             .ok_or(StoreError::UnknownRevision(number))?;
         self.candidate = rev.config.clone();
+        self.generation = next_generation();
         self.touched = true;
         Ok(())
     }

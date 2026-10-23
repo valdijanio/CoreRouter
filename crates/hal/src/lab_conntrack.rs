@@ -5,11 +5,11 @@
 //! hardware, to show the Via column), and a few of the router's own.
 //! Killed connections stay away until the config changes.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::{IpAddr, Ipv4Addr};
 
-use corerouter_model::Config;
-use corerouter_model::cgnat::Mode;
+use corerouter_model::cgnat::{Mode, Slot};
+use corerouter_model::{Config, ItemId};
 
 use crate::conntrack::{Conn, Stats, Tuple, status};
 
@@ -25,7 +25,43 @@ fn mix(x: u64) -> u64 {
         >> 17
 }
 
-pub fn table(cfg: &Config, killed: &BTreeSet<u32>) -> Vec<Conn> {
+/// Subscribers of each blocks-mode pool the lab pretends are online.
+pub const ONLINE: u64 = 40;
+
+/// The lab's online subscribers of blocks-mode pools without a block.
+pub fn waiting(
+    cfg: &Config,
+    blocks: &BTreeMap<(ItemId, Ipv4Addr), Slot>,
+) -> Vec<crate::cgnat::Waiting> {
+    let mut out = Vec::new();
+    for p in cfg
+        .ip
+        .cgnat
+        .pools
+        .iter()
+        .filter(|p| !p.disabled && p.mode == Mode::Blocks)
+    {
+        let Ok(l) = p.layout() else { continue };
+        for i in 0..l.subscribers().min(ONLINE) {
+            if let Some(sub) = l.subscriber(i)
+                && !blocks.contains_key(&(p.id, sub))
+                && cfg.ip.cgnat.exception_of(sub).is_none()
+            {
+                out.push(crate::cgnat::Waiting {
+                    pool: p.id,
+                    subscriber: sub,
+                });
+            }
+        }
+    }
+    out
+}
+
+pub fn table(
+    cfg: &Config,
+    killed: &BTreeSet<u32>,
+    blocks: &BTreeMap<(ItemId, Ipv4Addr), Slot>,
+) -> Vec<Conn> {
     let mut out = Vec::new();
     let servers = [
         Ipv4Addr::new(142, 250, 79, 46),
@@ -39,30 +75,33 @@ pub fn table(cfg: &Config, killed: &BTreeSet<u32>) -> Vec<Conn> {
             out.push(c);
         }
     };
-    for p in cfg
-        .ip
-        .cgnat
-        .pools
-        .iter()
-        .filter(|p| !p.disabled && p.mode == Mode::Deterministic)
-    {
+    for p in cfg.ip.cgnat.pools.iter().filter(|p| !p.disabled) {
         let Ok(l) = p.layout() else { continue };
         for i in 0..l.subscribers().min(SUBSCRIBERS) {
-            let (Some(sub), Some(slot)) = (l.subscriber(i), l.slot(i)) else {
-                continue;
+            let Some(sub) = l.subscriber(i) else { continue };
+            // Blocks mode: only subscribers with a block talk.
+            let slot = match p.mode {
+                Mode::Deterministic => l.slot(i),
+                Mode::Blocks => blocks.get(&(p.id, sub)).copied(),
             };
+            let Some(slot) = slot else { continue };
             if cfg.ip.cgnat.exception_of(sub).is_some() {
                 continue;
             }
             // A few heavy users, most light: like a real access network.
+            // Every 17th subscriber (from the 4th) is a heavy one.
+            let heavy = i % 17 == 3;
             let n = match mix(i) % 17 {
-                0 => u64::from(slot.ports()).min(1000) * 19 / 20,
+                _ if heavy => u64::from(slot.ports()).min(1000) * 19 / 20,
                 1 | 2 => 60 + mix(i + 1) % 120,
                 _ => 2 + mix(i + 2) % 25,
             };
             for k in 0..n {
                 let h = mix(i.wrapping_mul(1009).wrapping_add(k));
+                // Heavy users fill their TCP ports (a P2P client, a
+                // crawler): what runs a slot out first.
                 let protocol = match h % 10 {
+                    _ if heavy => 6,
                     0..=5 => 6,
                     6..=8 => 17,
                     _ => 1,

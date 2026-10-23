@@ -182,8 +182,20 @@ mod tests {
                 for t in tables {
                     sorted_unique(&format!("{l:?} {what}"), t);
                 }
-                let all = keys(tables);
-                sorted_unique(&format!("{l:?} {what} (all tables)"), &all.iter().map(|k| (*k, "")).collect::<Vec<_>>());
+                // Across tables a key may repeat (two features both say "of"), as long
+                // as the text is the same: lookup takes the first, so only a different
+                // text would make one window show the other's word. Parallel PRs kept
+                // colliding on identical entries ("changed", "of", 2026-10-23).
+                let mut all: Vec<(&str, &str)> = tables.iter().flat_map(|t| t.iter().copied()).collect();
+                all.sort_unstable();
+                for w in all.windows(2) {
+                    if let [(a, ta), (b, tb)] = w {
+                        assert!(
+                            a != b || ta == tb,
+                            "{l:?} {what}: {a:?} has two different texts across tables: {ta:?} and {tb:?}"
+                        );
+                    }
+                }
             }
         }
     }

@@ -49,6 +49,10 @@ name = "scale"
 harness = false
 
 [[bench]]
+name = "routes_full"
+harness = false
+
+[[bench]]
 name = "dhcp_round"
 harness = false
 
