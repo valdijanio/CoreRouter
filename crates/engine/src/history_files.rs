@@ -11,13 +11,15 @@
 //!   writes and reads, with a one-entry history);
 //! - each older revision `k` of the history has a file of its own
 //!   (`rev-<k>.json`, [`persist::encode_revision_delta`]): a
-//!   [`json_delta`] that builds its config from the config of the next
+//!   `model::json_delta` that builds its config from the config of the next
 //!   newer revision (its `base`). The newest revision has no file: the
 //!   slot holds it whole. File `k` is written by the save after `k` stops
 //!   being the newest, once, and deleted when `k` leaves the history.
 //!
 //! At boot the chain is walked from the slot's revision down: each file
-//! applied to the tree of its base gives the next older one. A save writes
+//! applied to the config of its base gives the next older one, sharing
+//! every section the difference does not touch (`model::config_delta`),
+//! so 64 revisions in memory cost about one config. A save writes
 //! the missing revision files first, then the slot, then deletes the files
 //! past the history. After a crash at any step the slot is complete (the
 //! old or the new one) and every file it needs was written before it; a
@@ -31,16 +33,15 @@
 //!
 //! The commit serializes the new config once
 //! ([`RevisionFiles::note_encoded`]) for the slot; the file of the previous
-//! newest revision costs two JSON trees and their comparison (**medido**:
+//! newest revision serializes only the sections the commit changed (the
+//! others are shared with the new revision, G0.16) (**medido**:
 //! `storage_fs/history64/*` in docs/changes/audit-history.md).
 
-use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_model::persist::{self, RevisionFile};
 use corerouter_model::store::Revision;
-use corerouter_model::{ConfigStore, Users, json_delta};
-use serde_json::Value;
+use corerouter_model::{ConfigStore, Users};
 
 use crate::storage::ConfigStorage;
 
@@ -64,10 +65,6 @@ pub(crate) struct RevisionFiles {
     /// Compact JSON of the config the last commit made (its revision), so
     /// the save that follows does not serialize it again.
     encoded: Option<(u32, String)>,
-    /// Compact JSON of the newest revision the last save wrote: the next
-    /// commit turns it into a revision file (compared with the new text,
-    /// so neither is serialized again).
-    previous: Option<(u32, String)>,
 }
 
 impl RevisionFiles {
@@ -107,9 +104,9 @@ pub(crate) fn restore_history(
     let first = oldest.number;
     let room = ConfigStore::DEFAULT_MAX_HISTORY.saturating_sub(store.history().len());
     let mut older: Vec<Revision> = Vec::new();
-    // The newer end of the chain: a revision number and its tree (built
-    // when a difference first needs it), or `None` once the chain broke.
-    let mut chain: Option<(u32, Option<Value>)> = Some((first, None));
+    // The newer end of the chain (the revision `older.last()`, or the
+    // slot's oldest), or `None` once the chain broke.
+    let mut chain: Option<u32> = Some(first);
     let mut lost: Vec<u32> = Vec::new();
     for &n in files.present.range(..first).rev() {
         if older.len() >= room {
@@ -124,29 +121,25 @@ pub(crate) fn restore_history(
                 continue;
             }
         };
-        let (rev, tree, base) = match file {
+        let (rev, base) = match file {
             // A full copy (G1.23) needs nothing newer.
-            RevisionFile::Full(rev) => (rev, None, None),
+            RevisionFile::Full(rev) => (rev, None),
             RevisionFile::Delta {
                 mut rev,
                 base,
                 delta,
             } => {
-                let Some((_, tree)) = chain.take().filter(|(newer, _)| *newer == base) else {
+                if chain.take() != Some(base) {
                     lost.push(n);
                     continue;
-                };
-                let tree = match tree {
-                    Some(t) => Ok(t),
-                    None => {
-                        let cfg = older.last().map_or(&oldest.config, |r| &r.config);
-                        persist::config_value(cfg)
-                    }
-                };
-                match tree.and_then(|t| persist::apply_revision_delta(t, &delta)) {
-                    Ok((cfg, tree)) => {
+                }
+                // Built from the newer revision: what the delta does not
+                // touch stays shared with it.
+                let newer = older.last().map_or(&oldest.config, |r| &r.config);
+                match persist::apply_revision_delta(newer, &delta) {
+                    Ok(cfg) => {
                         rev.config = cfg;
-                        (rev, Some(tree), Some(base))
+                        (rev, Some(base))
                     }
                     Err(e) => {
                         log::error!("revision {n} file does not apply, left out: {e}");
@@ -157,7 +150,7 @@ pub(crate) fn restore_history(
             }
         };
         files.saved.insert(n, Saved { size, base });
-        chain = Some((n, tree));
+        chain = Some(n);
         older.push(rev);
     }
     if let (Some(hi), Some(lo)) = (lost.first(), lost.last()) {
@@ -218,31 +211,16 @@ pub(crate) fn save(
     let mut used = 0usize;
     let mut keep: BTreeSet<u32> = BTreeSet::new();
     let mut write: Vec<(u32, String, u32)> = Vec::new();
-    // The text of the revision just encoded: the base of the next one.
-    let mut newer: Option<(u32, String)> = None;
     for pair in history.windows(2).rev() {
         let [rev, base] = pair else { continue };
         let size = match files.saved.get(&rev.number) {
-            Some(f) if f.base == Some(base.number) => {
-                newer = None;
-                f.size
-            }
+            Some(f) if f.base == Some(base.number) => f.size,
             _ => {
-                let base_text: Cow<'_, str> = match newer.take() {
-                    Some((n, t)) if n == base.number => Cow::Owned(t),
-                    _ if base.number == newest.number => Cow::Borrowed(&config),
-                    _ => Cow::Owned(persist::encode_config(&base.config).map_err(|e| e.to_string())?),
-                };
-                let text = match files.previous.take() {
-                    // The newest of the save before: its text is at hand.
-                    Some((n, t)) if n == rev.number => t,
-                    _ => persist::encode_config(&rev.config).map_err(|e| e.to_string())?,
-                };
-                let delta = json_delta::diff_text(&base_text, &text).map_err(|e| e.to_string())?;
-                drop(base_text);
+                // Only the sections the two do not share are serialized.
+                let delta = persist::revision_delta(&base.config, &rev.config)
+                    .map_err(|e| e.to_string())?;
                 let file = persist::encode_revision_delta(rev, base.number, &delta)
                     .map_err(|e| e.to_string())?;
-                newer = Some((rev.number, text));
                 let size = file.len();
                 write.push((rev.number, file, base.number));
                 size
@@ -255,7 +233,6 @@ pub(crate) fn save(
         used = used.saturating_add(size);
         keep.insert(rev.number);
     }
-    drop(newer);
     // The newest revision is in the slot.
     let skipped = history.len().saturating_sub(keep.len()).saturating_sub(1);
     for (number, text, base) in &write {
@@ -275,9 +252,6 @@ pub(crate) fn save(
     }
     let text = persist::encode_running(newest, &config, users).map_err(|e| e.to_string())?;
     storage.save(&text).map_err(|e| e.to_string())?;
-    drop(text);
-    // The base of the next save's revision file.
-    files.previous = Some((newest.number, config));
     // Past the history now, or the newest (whole in the slot): the slot
     // that needed them was just replaced.
     let stale: Vec<u32> = files.present.difference(&keep).copied().collect();
