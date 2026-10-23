@@ -51,6 +51,8 @@ pub struct VirtualHal {
     /// Times each port was enabled again (each one is a simulated link
     /// down and up, G1.19).
     reenabled: BTreeMap<IfName, u32>,
+    /// Lab connections killed (G2.2), by id.
+    killed: std::collections::BTreeSet<u32>,
     /// The lab's "kernel" (G1.3): what each apply left, which a test (or
     /// a lab script) can change behind CoreRouter's back to make drift.
     kernel: LabKernel,
@@ -143,6 +145,7 @@ impl VirtualHal {
             dhcp_hosts: None,
             dhcp6_hosts: None,
             reenabled: BTreeMap::new(),
+            killed: std::collections::BTreeSet::new(),
             kernel: Arc::new(Mutex::new(kernel)),
         }
     }
@@ -395,6 +398,30 @@ impl Hal for VirtualHal {
                 up: true,
             })
             .collect())
+    }
+
+    fn connections(&mut self) -> Result<Vec<crate::conntrack::Conn>, HalError> {
+        Ok(crate::lab_conntrack::table(&self.applied, &self.killed))
+    }
+
+    fn connection_stats(&mut self) -> Result<crate::conntrack::Stats, HalError> {
+        let n = crate::lab_conntrack::table(&self.applied, &self.killed).len();
+        Ok(crate::lab_conntrack::stats(n))
+    }
+
+    fn connections_kill(&mut self, conns: &[crate::conntrack::Conn]) -> Result<usize, HalError> {
+        let live: std::collections::BTreeSet<u32> =
+            crate::lab_conntrack::table(&self.applied, &self.killed)
+                .iter()
+                .map(|c| c.id)
+                .collect();
+        let mut n = 0;
+        for c in conns {
+            if live.contains(&c.id) && self.killed.insert(c.id) {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {

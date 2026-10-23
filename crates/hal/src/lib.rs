@@ -10,6 +10,7 @@ pub mod dhcp;
 pub mod dhcp_server;
 pub mod drift;
 pub mod icmp_ext;
+pub mod lab_conntrack;
 pub mod nic;
 pub mod probe;
 pub mod route_get;
@@ -411,6 +412,31 @@ pub trait Hal: Send {
     fn kernel_stats(&mut self) -> Result<tuning::KernelStats, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no kernel counters",
+            self.describe()
+        )))
+    }
+
+    /// The connection tracking table (G2.2), at most `conntrack::MAX_READ`.
+    fn connections(&mut self) -> Result<Vec<conntrack::Conn>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking",
+            self.describe()
+        )))
+    }
+
+    /// How full the table is and its trouble counters (G2.2).
+    fn connection_stats(&mut self) -> Result<conntrack::Stats, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking",
+            self.describe()
+        )))
+    }
+
+    /// Remove these connections; how many went (G2.2).
+    fn connections_kill(&mut self, conns: &[conntrack::Conn]) -> Result<usize, HalError> {
+        let _ = conns;
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking",
             self.describe()
         )))
     }
