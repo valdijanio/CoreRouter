@@ -60,7 +60,9 @@ pub(crate) const SLIDERS_HORIZONTAL: &str = "\u{E434}";
 pub(crate) const SQUARES_FOUR: &str = "\u{E464}";
 pub(crate) const STACK: &str = "\u{E466}";
 pub(crate) const STACK_SIMPLE: &str = "\u{E468}";
+pub(crate) const STAR: &str = "\u{E46A}";
 pub(crate) const TAG: &str = "\u{E478}";
+pub(crate) const TERMINAL: &str = "\u{E47E}";
 pub(crate) const TERMINAL_WINDOW: &str = "\u{EAE8}";
 pub(crate) const TREE_STRUCTURE: &str = "\u{E67C}";
 pub(crate) const TREE_VIEW: &str = "\u{EE48}";
@@ -156,7 +158,9 @@ pub(crate) const ALL: &[&str] = &[
     SQUARES_FOUR,
     STACK,
     STACK_SIMPLE,
+    STAR,
     TAG,
+    TERMINAL,
     TERMINAL_WINDOW,
     TREE_STRUCTURE,
     TREE_VIEW,
