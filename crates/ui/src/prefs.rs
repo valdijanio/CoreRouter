@@ -1,5 +1,6 @@
 //! Preferences of the window, not of the router: the theme (light, dark or
-//! the system's) and which tables show comments inline. They never go
+//! the system's), which tables show comments inline and the languages of
+//! the labels and of the explanations (G0.15). They never go
 //! through the engine; the app stores them where eframe keeps app state
 //! (a file natively, `localStorage` on the web) as the JSON of
 //! [`CoreRouterUi::prefs`].
@@ -8,6 +9,7 @@ use egui::{Color32, Id, Rect, Sense, Stroke, ThemePreference, Ui, pos2, vec2};
 use serde_json::{Value, json};
 
 use crate::CoreRouterUi;
+use crate::i18n::Lang;
 
 /// Larger stored preferences are ignored: they were not written by us.
 const MAX_PREFS: usize = 16 * 1024;
@@ -62,7 +64,13 @@ impl CoreRouterUi {
                 .filter(|(_, t)| t.inline_comments)
                 .map(|(salt, _)| salt),
         );
-        json!({"theme": theme_name(self.theme), "inline_comments": inline}).to_string()
+        json!({
+            "theme": theme_name(self.theme),
+            "inline_comments": inline,
+            "labels_lang": self.lang.labels.code(),
+            "help_lang": self.lang.help.code(),
+        })
+        .to_string()
     }
 
     /// Restore stored preferences. Anything unreadable is ignored and the
@@ -76,6 +84,13 @@ impl CoreRouterUi {
         };
         if let Some(pref) = theme_in(&v) {
             self.theme = pref;
+        }
+        let lang = |k: &str| v.get(k).and_then(Value::as_str).and_then(Lang::from_code);
+        if let Some(l) = lang("labels_lang") {
+            self.lang.labels = l;
+        }
+        if let Some(l) = lang("help_lang") {
+            self.lang.help = l;
         }
         if let Some(list) = v.get("inline_comments").and_then(Value::as_array) {
             let panels = self.panels.iter_mut().flatten().flat_map(|p| p.tables_mut());
@@ -196,6 +211,8 @@ mod tests {
         assert_eq!(a.theme(), ThemePreference::System);
         a.set_theme(ThemePreference::Light);
         a.tables.addresses.inline_comments = true;
+        a.lang.labels = Lang::Pt;
+        a.lang.help = Lang::En;
         let saved = a.prefs();
 
         let mut b = app();
@@ -203,6 +220,7 @@ mod tests {
         assert_eq!(b.theme(), ThemePreference::Light);
         assert!(b.tables.addresses.inline_comments);
         assert!(!b.tables.interfaces.inline_comments);
+        assert_eq!((b.lang.labels, b.lang.help), (Lang::Pt, Lang::En));
         assert_eq!(b.prefs(), saved);
     }
 
@@ -216,11 +234,14 @@ mod tests {
             "null",
             r#"{"theme": 7, "inline_comments": "interfaces"}"#,
             r#"{"theme": "neon", "inline_comments": [1, null, {}]}"#,
+            r#"{"labels_lang": "klingon", "help_lang": 7}"#,
+            r#"{"labels_lang": null, "help_lang": ["pt"]}"#,
         ];
         for j in junk {
             a.apply_prefs(j);
             assert_eq!(a.theme(), ThemePreference::System, "{j}");
             assert!(!a.tables.interfaces.inline_comments, "{j}");
+            assert_eq!(a.lang, crate::i18n::Langs::default(), "{j}");
         }
         let huge = format!(r#"{{"theme": "dark", "pad": "{}"}}"#, "x".repeat(MAX_PREFS));
         a.apply_prefs(&huge);

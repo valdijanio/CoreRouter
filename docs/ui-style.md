@@ -48,3 +48,29 @@ operadora e começa a outra).
 - Clique numa linha seleciona (destaque com a cor de seleção do tema, pintado atrás do texto);
   clique de novo desmarca; clique direito abre o menu com as cópias úteis (endereço, nome).
 - Confira no tema claro **e** no escuro (screenshot), como manda o AGENTS.md.
+
+## Idioma: rótulos e explicações (G0.15)
+
+A GUI tem **dois idiomas independentes**, escolhidos em Settings › Settings e guardados com o tema
+(preferência deste computador ou navegador, nunca do roteador):
+
+- **rótulos** — menus, títulos de janela, colunas, botões. Padrão: inglês (os nomes do RouterOS);
+- **explicações** — o texto de ajuda e o modal do botão ⓘ. Padrão: português.
+
+Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela chave), `help.rs` (botão
+ⓘ e modal) e `markdown.rs` (o Markdown simples das explicações). Uma janela **nova** faz assim:
+
+- **Rótulo:** `tr(app.lang.labels, "Ring size")`. O texto em inglês é a chave e o fallback: sem
+  tradução aparece em inglês, nunca uma chave. A tradução entra em `i18n/pt.rs` (`LABELS`, na
+  ordem). O título da janela (`WinDef::title`) e o nome do grupo do menu já passam pelo `tr`.
+- **Explicação:** uma chave estável por parâmetro ou tópico (`tuning.net.core.netdev_max_backlog`),
+  com o texto em `HELP` de `en.rs` **e** de `pt.rs` (o teste
+  `every_explanation_exists_in_both_languages` confere). Markdown simples: `## Título`,
+  parágrafos separados por linha em branco, `- item`, `` `código` `` e `**negrito**`.
+- **Botão ⓘ:** `help::info_button(ui, id, dica)` ao lado do valor; clicado, guarde
+  `Some(HelpView::new(chave, título))` no estado do painel e desenhe `help::modal(ctx, app.lang,
+  &mut self.help)` em `PanelState::dialogs`. Faltou a explicação no idioma escolhido? Ela aparece
+  no idioma dos rótulos e depois em inglês, sem panic.
+- Texto calculado (valor recomendado, comando equivalente) entra como seção extra do `HelpView`,
+  com o título em inglês passado ao `tr` no idioma das explicações.
+- Os rótulos das janelas antigas ainda não passam pelo `tr` (G0.15b).
