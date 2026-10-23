@@ -230,8 +230,10 @@ build_combo() {
       members+=("$n")
       HEADS[$n]=$head
     else
-      say "  #$n fora: conflito com o lote em $conflicts— a sessão dona resolve"
-      SKIP[$n]=$head
+      # Sem SKIP: o conflito é com outro PR do lote (ou do lote especulativo), não com a main;
+      # quando aquele entra, este pode mesclar limpo. Marcar fazia a fila ignorá-lo até a branch
+      # mudar (o #144 ficou parado assim, 2026-10-23). Ele volta na próxima rodada.
+      say "  #$n fica para a próxima rodada: conflito com o lote em $conflicts"
     fi
   done
   if [ ${#members[@]} = 0 ]; then
