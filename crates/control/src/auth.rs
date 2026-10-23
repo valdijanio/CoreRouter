@@ -21,16 +21,21 @@
 //! not affected.
 //!
 //! Tokens are compared in constant time. Failed logins are counted per
-//! source address and per user name: after [`Limits::free_failures`] each
-//! new attempt waits longer ([`Limits::base_delay`] doubling up to
-//! [`Limits::max_delay`]), and an address with [`Limits::block_after`]
-//! failures in [`Limits::window`] is refused outright until the window
-//! passes. Every failure gives the same message, [`INVALID_LOGIN`], and an
-//! unknown user costs the same Argon2 time as a wrong password.
+//! source (an IPv4 address or an IPv6 /64, [`crate::conn::source_of`]) and
+//! per user name: after [`Limits::free_failures`] each new attempt waits
+//! longer ([`Limits::base_delay`] doubling up to [`Limits::max_delay`]), and
+//! a source with [`Limits::block_after`] failures in [`Limits::window`] is
+//! refused outright until the window passes. An attempt is counted when it
+//! starts and forgiven when it succeeds, so parallel attempts cannot all
+//! slip under the limit. At most [`MAX_PARALLEL_VERIFY`] Argon2
+//! verifications (19 MiB each) run at once. Every failure gives the same
+//! message, [`INVALID_LOGIN`], and an unknown user costs the same Argon2
+//! time as a wrong password.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -54,8 +59,17 @@ pub const NO_PASSWORD_REMOTE: &str = "login from the network is refused while an
      e.g. `corerouter-cli shell` or the GUI at 127.0.0.1, or user.set)";
 /// Most tokens held at once (the oldest session token goes first).
 pub const MAX_TOKENS: usize = 256;
+/// Most session tokens of one user: its oldest goes first, so no account
+/// can push the others' tokens out by logging in over and over.
+pub const MAX_TOKENS_PER_USER: usize = 16;
 /// Most tracked sources of failed logins.
 const MAX_TRACKED: usize = 4096;
+/// Most Argon2 verifications at once (19 MiB and a core each).
+pub const MAX_PARALLEL_VERIFY: usize = 2;
+/// How long a login waits for a verification slot before giving up.
+const VERIFY_WAIT: Duration = Duration::from_secs(5);
+/// The answer when every verification slot stayed busy.
+pub const LOGIN_BUSY: &str = "too many logins at once; try again";
 
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -106,6 +120,22 @@ struct Inner {
     tokens: Mutex<Vec<Token>>,
     failures: Mutex<HashMap<String, Failures>>,
     limits: Limits,
+    /// Argon2 verifications running now, and its wake-up.
+    verifying: Mutex<usize>,
+    verified: Condvar,
+    /// Verifications run so far (tests, diagnostics).
+    verifications: AtomicU64,
+}
+
+/// One of the [`MAX_PARALLEL_VERIFY`] verification slots.
+struct VerifySlot<'a>(&'a Inner);
+
+impl Drop for VerifySlot<'_> {
+    fn drop(&mut self) {
+        let mut n = lock(&self.0.verifying);
+        *n = n.saturating_sub(1);
+        self.0.verified.notify_one();
+    }
 }
 
 /// Shared by every connection of a router (TCP, TLS and WebSocket).
@@ -169,7 +199,36 @@ impl Gate {
             tokens: Mutex::new(Vec::new()),
             failures: Mutex::new(HashMap::new()),
             limits,
+            verifying: Mutex::new(0),
+            verified: Condvar::new(),
+            verifications: AtomicU64::new(0),
         }))
+    }
+
+    /// Wait (at most [`VERIFY_WAIT`]) for an Argon2 verification slot.
+    fn verify_slot(&self) -> Result<VerifySlot<'_>, String> {
+        let deadline = Instant::now() + VERIFY_WAIT;
+        let mut n = lock(&self.0.verifying);
+        while *n >= MAX_PARALLEL_VERIFY {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(LOGIN_BUSY.into());
+            }
+            n = self
+                .0
+                .verified
+                .wait_timeout(n, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        *n = n.saturating_add(1);
+        self.0.verifications.fetch_add(1, Ordering::Relaxed);
+        Ok(VerifySlot(&self.0))
+    }
+
+    /// Argon2 verifications run so far.
+    pub fn verifications(&self) -> u64 {
+        self.0.verifications.load(Ordering::Relaxed)
     }
 
     /// Accept `token` as [`Principal::Local`] until the process ends.
@@ -212,10 +271,15 @@ impl Gate {
             }
         }
         let keys = [
-            format!("ip {}", peer.map(|p| p.to_string()).unwrap_or_default()),
+            format!(
+                "ip {}",
+                peer.map(|p| crate::conn::source_of(p).to_string())
+                    .unwrap_or_default()
+            ),
             format!("user {}", user.chars().take(64).collect::<String>()),
         ];
-        let delay = self.delay_for(&keys)?;
+        // Counted now, forgiven on success: N parallel attempts are N.
+        let delay = self.attempt(&keys)?;
         if !delay.is_zero() {
             thread::sleep(delay);
         }
@@ -232,16 +296,19 @@ impl Gate {
             .unwrap_or(Value::Null)
         };
         let ok = match &stored {
-            Value::String(h) => verify_password(h, password),
+            Value::String(h) => {
+                let _slot = self.verify_slot()?;
+                verify_password(h, password)
+            }
             // An account without a password: the empty one, from loopback.
             Value::Bool(true) if loopback => password.is_empty(),
             _ => {
+                let _slot = self.verify_slot()?;
                 burn_verification(password);
                 false
             }
         };
         if !ok {
-            self.failed(&keys);
             log::warn!(
                 "control: failed login for {:?} from {} ({})",
                 user.chars().take(64).collect::<String>(),
@@ -266,11 +333,27 @@ impl Gate {
         let now = Instant::now();
         let dropped = {
             let mut tokens = lock(&self.0.tokens);
-            let dropped = self.expire(&mut tokens, now);
-            if tokens.len() >= MAX_TOKENS
-                && let Some(i) = tokens.iter().position(|t| t.login.is_some())
+            let mut dropped = self.expire(&mut tokens, now);
+            // This user's oldest first; only then anyone's oldest. Its
+            // login ends with it (`user.active.list`).
+            let me = Principal::User(name.clone());
+            let mine = tokens
+                .iter()
+                .filter(|t| t.login.is_some() && t.principal == me)
+                .count();
+            let evict = if mine >= MAX_TOKENS_PER_USER {
+                tokens
+                    .iter()
+                    .position(|t| t.login.is_some() && t.principal == me)
+            } else if tokens.len() >= MAX_TOKENS {
+                tokens.iter().position(|t| t.login.is_some())
+            } else {
+                None
+            };
+            if let Some(i) = evict
+                && i < tokens.len()
             {
-                tokens.remove(i);
+                dropped.extend(tokens.remove(i).login);
             }
             tokens.push(Token {
                 digest: sha256(&token),
@@ -371,8 +454,11 @@ impl Gate {
         ended
     }
 
-    /// How long this attempt waits, or why it is refused.
-    fn delay_for(&self, keys: &[String]) -> Result<Duration, String> {
+    /// Count a login attempt under `keys` (a source, then a user name)
+    /// and say how long it waits first, or why it is refused. Checking and
+    /// counting under one lock: parallel attempts cannot all pass the
+    /// check before any of them counts.
+    fn attempt(&self, keys: &[String]) -> Result<Duration, String> {
         let l = &self.0.limits;
         let now = Instant::now();
         let mut map = lock(&self.0.failures);
@@ -390,6 +476,14 @@ impl Gate {
             }
             worst = worst.max(f.count);
         }
+        for key in keys {
+            if !map.contains_key(key) {
+                self.make_room(&mut map, now);
+            }
+            let f = map.entry(key.clone()).or_default();
+            f.count = f.count.saturating_add(1);
+            f.last = Some(now);
+        }
         let Some(extra) = worst.checked_sub(l.free_failures) else {
             return Ok(Duration::ZERO);
         };
@@ -397,22 +491,27 @@ impl Gate {
         Ok(l.base_delay.saturating_mul(factor).min(l.max_delay))
     }
 
-    fn failed(&self, keys: &[String]) {
-        let now = Instant::now();
-        let window = self.0.limits.window;
-        let mut map = lock(&self.0.failures);
-        if map.len() >= MAX_TRACKED {
-            map.retain(|_, f| f.last.is_some_and(|t| now.duration_since(t) < window));
+    /// Keep the failure map under [`MAX_TRACKED`]: forget expired entries;
+    /// still full, forget the least useful one: a source that is not
+    /// blocked before a user name (user names are what an attacker aims
+    /// at, `user admin` must survive a flood), the oldest first.
+    fn make_room(&self, map: &mut HashMap<String, Failures>, now: Instant) {
+        if map.len() < MAX_TRACKED {
+            return;
         }
-        if map.len() >= MAX_TRACKED {
-            // Still full of fresh entries: forget the user-name keys first
-            // (cheap to forge), keep the per-address ones.
-            map.retain(|k, _| k.starts_with("ip "));
+        let l = &self.0.limits;
+        map.retain(|_, f| f.last.is_some_and(|t| now.duration_since(t) < l.window));
+        if map.len() < MAX_TRACKED {
+            return;
         }
-        for key in keys {
-            let f = map.entry(key.clone()).or_default();
-            f.count = f.count.saturating_add(1);
-            f.last = Some(now);
+        let victim = map
+            .iter()
+            .filter(|(k, f)| !(k.starts_with("ip ") && f.count >= l.block_after))
+            .min_by_key(|(k, f)| (k.starts_with("user "), f.last))
+            .or_else(|| map.iter().min_by_key(|(_, f)| f.last))
+            .map(|(k, _)| k.clone());
+        if let Some(k) = victim {
+            map.remove(&k);
         }
     }
 
@@ -533,16 +632,97 @@ mod tests {
         );
         assert!(other.is_ok());
         let d = Gate::new(Limits::default());
-        d.failed(&["ip a".into(), "user b".into()]);
-        assert_eq!(d.delay_for(&["ip a".into()]).unwrap(), Duration::ZERO);
+        assert_eq!(
+            d.attempt(&["ip a".into(), "user b".into()]).unwrap(),
+            Duration::ZERO
+        );
         for _ in 0..4 {
-            d.failed(&["ip a".into()]);
+            d.attempt(&["ip a".into()]).unwrap();
         }
         assert_eq!(
-            d.delay_for(&["ip a".into()]).unwrap(),
+            d.attempt(&["ip a".into()]).unwrap(),
             Duration::from_secs(1),
             "5 failures: 2 past the free ones, 250 ms doubled twice"
         );
+    }
+
+    /// Audit (control finding 4): a flood of fresh sources must not wipe the counter of
+    /// the user name under attack, and the map stays bounded.
+    #[test]
+    fn a_full_failure_map_keeps_the_user_keys() {
+        let d = Gate::new(Limits::default());
+        for _ in 0..5 {
+            d.attempt(&["ip 192.0.2.1".into(), "user admin".into()])
+                .unwrap();
+        }
+        for n in 0..5000u32 {
+            d.attempt(&[format!("ip 2001:db8:{n:x}::")]).unwrap();
+        }
+        assert!(lock(&d.0.failures).len() <= MAX_TRACKED);
+        let wait = d
+            .attempt(&["ip 2001:db8:ffff::".into(), "user admin".into()])
+            .unwrap();
+        assert!(!wait.is_zero(), "the per-user count was forgotten");
+    }
+
+    /// Audit (control finding 4): one subscriber's /64 is one source; parallel attempts
+    /// are all counted before any Argon2 runs, so no more verifications
+    /// run than the limit allows.
+    #[test]
+    fn parallel_and_rotated_attempts_are_all_counted() {
+        let gate = Gate::new(quick());
+        let shared = corerouter_engine::shared(lab());
+        let threads: Vec<_> = (0..16u32)
+            .map(|n| {
+                let gate = gate.clone();
+                let mut host = crate::SharedHost(shared.clone());
+                thread::spawn(move || {
+                    let ip: IpAddr = format!("2001:db8:1:2::{n:x}").parse().unwrap();
+                    gate.login(
+                        &mut host,
+                        &Caller::new(u64::from(n), "x"),
+                        Some(ip),
+                        &json!({"user": "admin", "password": "wrong"}),
+                    )
+                })
+            })
+            .collect();
+        let refused = threads
+            .into_iter()
+            .map(|t| t.join().unwrap().unwrap_err())
+            .filter(|e| e.contains("too many failed logins"))
+            .count();
+        assert_eq!(refused, 10, "block_after = 6 for the whole /64");
+        assert_eq!(gate.verifications(), 6);
+    }
+
+    /// Audit (control finding 7): logging in over and over pushes out only the
+    /// same user's oldest token, never another account's.
+    #[test]
+    fn repeated_logins_do_not_evict_other_users() {
+        let gate = Gate::new(quick());
+        let mut s = lab();
+        s.execute(
+            "user.add",
+            &json!({"name": "noc", "group": "read", "password": "noc-password"}),
+        )
+        .unwrap();
+        let admin = try_login(&gate, &mut s, "admin", "right-password").unwrap()["token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let mut first_noc = None;
+        for _ in 0..MAX_TOKENS + 10 {
+            let t = try_login(&gate, &mut s, "noc", "noc-password").unwrap();
+            first_noc.get_or_insert(t["token"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(
+            gate.principal(&mut s, Some(&admin)).unwrap(),
+            Principal::User("admin".into())
+        );
+        assert!(gate.principal(&mut s, Some(&first_noc.unwrap())).is_err());
+        let noc = s.logins().iter().filter(|l| l.user == "noc").count();
+        assert_eq!(noc, MAX_TOKENS_PER_USER, "evicted tokens end their login");
     }
 
     #[test]

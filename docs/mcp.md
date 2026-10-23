@@ -35,7 +35,7 @@ claude mcp add corerouter -- corerouter-cli mcp
 | `run_command` / `command_run` | `{command, params}` → `Session::execute` | destrutiva |
 | `command_batch` | Até 256 passos, `"$N.chave"` referencia resultados; `atomic` (padrão true) = um commit | destrutiva |
 | `inspect_state` / `state_inspect` | Resumo, ou uma subárvore por `path` (`interfaces`, `routing.bgp`, `running.ip`, `journal`) | read-only |
-| `run_task` / `task_run` | Inicia uma ferramenta em segundo plano (`tool.ping.start`, `tool.ping.mtu`…), junta eventos até terminar ou `wait_secs` (≤ 60), para se preciso; devolve `summary` + últimos 50 eventos (`docs/tools.md`) | read-only |
+| `run_task` / `task_run` | Inicia uma ferramenta em segundo plano (`tool.ping.start`, `tool.ping.mtu`…), junta eventos até terminar ou `wait_secs` (≤ 60), para se preciso; devolve `summary` + últimos 50 eventos (`docs/tools.md`). Só comandos `tool.*` (outro id é recusado antes de rodar) | read-only |
 | `ui_screenshot` / `screenshot` | PNG da janela (só Remote com GUI) | read-only |
 
 Erros de tool voltam como texto com `isError: true` ("unknown parameter 'adress'; did you mean

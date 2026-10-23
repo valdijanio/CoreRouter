@@ -16,7 +16,7 @@ Uma requisição JSON por linha, sobre TCP puro **só em loopback** (`--control`
 | Método | Params | Resultado |
 |---|---|---|
 | `ping` | — | `{pong: true}` (sem token) |
-| `server.info` | — | `{name, version, backend, has_ui, auth: "required"}` (sem token) |
+| `server.info` | — | `{name, version, commit, backend, has_ui, auth: "required"}` (sem token em loopback; da rede, sem login, só `{name, auth}`) |
 | `auth.login` | `{user, password}` | `{token, user, group, idle_timeout_secs, no_password}` (sem token) |
 | `auth.logout` | — | `{}`: o token de sessão deixa de valer |
 | `auth.whoami` | — | `{user, group, via, no_password?}` (`no_password`: contas `full` sem senha, só para quem é `full`) |
@@ -37,6 +37,17 @@ Com `corerouter-gui --connect HOST:PORT --control P`, a porta `P` da GUI respond
 Segurança e limites: o TCP puro faz bind só em loopback e confere o peer; no máximo 16 conexões
 por endpoint; linha de até 16 MiB (resposta até 256 MiB no cliente); **qualquer linha que não
 seja JSON fecha a conexão** (isso bloqueia um `fetch`/form HTTP de uma página web).
+
+Conexões ainda sem login (auditoria do controle, `control::conn`): no máximo 8 das 16 vagas, 4 por
+origem de rede (endereço IPv4 ou /64 IPv6; loopback não tem limite por origem); 30 s ociosas e
+caem; o handshake TLS e o cabeçalho HTTP do WebSocket têm **prazo total** de 10 s (não por
+`read`: quem manda um byte a cada 9 s também cai). Da rede, antes do login, a linha vai até
+64 KiB; os `params` só viram JSON depois de conferido o token. Acima do limite: linha JSON no
+TCP, `503` no WebSocket, nada no TLS. Toda conexão tem TCP keepalive (15 s + 3 × 5 s) e, no
+Linux, `TCP_USER_TIMEOUT` de 30 s; escrita sem progresso por 30 s derruba a conexão. Depois do
+login não há limite de ociosidade (GUI e MCP ficam horas parados): o keepalive acha o par morto.
+O cliente (`dial`) resolve `localhost` como `127.0.0.1` e só manda o token local para
+`127.0.0.1` (o único endereço em que o roteador escuta em claro), nunca para `[::1]`.
 
 ## Autenticação, usuários e TLS (G0.3)
 
@@ -93,9 +104,13 @@ uso, 12 h após o login, ou quando a conta muda (senha, desativada, removida). E
 autenticação começam com `unauthorized:` (o cliente sabe que deve logar de novo). Login errado,
 usuário inexistente ou desativado dão a **mesma** resposta, `invalid user or password`, no mesmo
 tempo (um usuário inexistente gasta uma verificação Argon2 falsa). Contra força bruta, falhas
-contam por endereço de origem e por nome de usuário (janela de 15 min): 3 falhas livres, depois
-cada tentativa espera 250 ms dobrando até 8 s, e um endereço com 20 falhas é recusado até a
-janela passar. Segredo nunca vai em URL: o token anda no corpo JSON.
+contam por origem (endereço IPv4 ou /64 IPv6) e por nome de usuário (janela de 15 min): 3 falhas
+livres, depois cada tentativa espera 250 ms dobrando até 8 s, e uma origem com 20 falhas é
+recusada até a janela passar. A tentativa conta ao começar e é perdoada se der certo, então
+tentativas em paralelo não escapam do limite; no máximo 2 verificações Argon2 (19 MiB cada)
+rodam ao mesmo tempo (`too many logins at once` após 5 s de espera). Cada usuário tem no máximo
+16 sessões: o 17º login derruba o mais antigo **dele**, nunca o de outra conta. Segredo nunca
+vai em URL: o token anda no corpo JSON.
 
 **Token local (CLI e MCP na mesma máquina).** Quem serve uma porta de controle (daemon, GUI
 com `--control`) grava ao iniciar um token aleatório em `control-<porta>.token`, legível só pelo
@@ -149,7 +164,9 @@ COREROUTER_PASSWORD=… corerouter-cli mcp --connect 10.0.0.1:8729 --user admin 
 
 Cada conexão TCP ou WebSocket é um cliente (`Caller`, ex. `tcp 127.0.0.1:50412`). O
 `config.safe-mode.enter` pertence à conexão que o executou; quando ela fecha, o daemon desfaz
-tudo o que mudou desde a entrada. Por isso `corerouter-cli --connect … run
+tudo o que mudou desde a entrada. Isso vale também quando o caminho morre em silêncio (rota,
+endereço ou firewall cortam a gerência: nenhum FIN ou RST chega): o keepalive TCP derruba a
+conexão em ~30 s e o desfazer roda. Por isso `corerouter-cli --connect … run
 config.safe-mode.enter` não serve para nada (a conexão fecha logo depois): use a GUI, o MCP
 (conexão persistente) ou um cliente que fique conectado. `state.inspect` mostra
 `safe_mode: {active, owner, yours, since, entry_revision, pending_revisions, timeout_secs,
@@ -188,8 +205,9 @@ Cada mensagem leva o `token`, como no TCP (a GUI web faz `auth.login` a cada con
 senha só na memória da aba, nunca em `localStorage`).
 
 **Limites**, como no TCP: `--ws` só peers loopback; no máximo 16 conexões WebSocket/HTTP simultâneas
-(`503` acima disso); cabeçalho HTTP até 16 KiB em até 10 s; mensagem e frame até 16 MiB
-(acima disso a conexão cai); texto que não é JSON ou mensagem binária fecha a conexão.
+(`503` acima disso); cabeçalho HTTP até 16 KiB em até 10 s no total; mensagem e frame até 16 MiB
+(64 KiB da rede antes do login; acima disso a conexão cai); arquivos estáticos vão em fluxo,
+sem carregar o arquivo inteiro na memória; texto que não é JSON ou mensagem binária fecha a conexão.
 
 **Arquivos estáticos** (`--web-root`): só `GET`/`HEAD`; `/` → `index.html`; segmentos com
 `..`, nome oculto (`.x`), `\`, `%`, `:` ou NUL são `404`; o caminho canônico precisa ficar dentro

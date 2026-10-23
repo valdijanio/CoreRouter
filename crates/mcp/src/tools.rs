@@ -71,6 +71,7 @@ const TOOLS: &[Tool] = &[
             `wait_secs` (default 10, max 60) pass, then stops it if still running. Returns the \
             summary (per target: sent, received, loss_pct, min/avg/max/jitter/p95 ms…) and the \
             last events. Example: {\"command\":\"tool.ping.start\",\"params\":{\"address\":\"8.8.8.8\",\"count\":5}}. \
+            Only tool.* commands (it is read-only: anything else is refused). \
             For long runs use run_command with tool.task.poll / tool.task.stop instead.",
         schema: || {
             json!({"type": "object", "required": ["command"], "properties": {
@@ -119,6 +120,15 @@ fn run_task(backend: &mut dyn Backend, args: &Value) -> Result<Value, String> {
         .and_then(Value::as_u64)
         .unwrap_or(TASK_WAIT_DEFAULT)
         .clamp(1, TASK_WAIT_MAX);
+    // The tool is annotated read-only, and clients may run such tools
+    // without asking: only the diagnostic tools, never a config change.
+    if !command.starts_with("tool.") || command.starts_with("tool.task.") {
+        return Err(format!(
+            "run_task only runs diagnostic tools (tool.ping.start, tool.mtr.start…), not '{}'; \
+             use run_command",
+            command.chars().take(64).collect::<String>()
+        ));
+    }
     let params = args.get("params").cloned().unwrap_or(Value::Null);
     let started = backend.call(
         "engine.execute",
@@ -141,7 +151,7 @@ fn run_task(backend: &mut dyn Backend, args: &Value) -> Result<Value, String> {
     let mut stopped = false;
     loop {
         let p = poll(backend, after)?;
-        lost += p.get("lost").and_then(Value::as_u64).unwrap_or(0);
+        lost = lost.saturating_add(p.get("lost").and_then(Value::as_u64).unwrap_or(0));
         for ev in p
             .get("events")
             .and_then(Value::as_array)
@@ -151,7 +161,7 @@ fn run_task(backend: &mut dyn Backend, args: &Value) -> Result<Value, String> {
             events.push_back(ev.clone());
             if events.len() > TASK_EVENTS {
                 events.pop_front();
-                lost += 1;
+                lost = lost.saturating_add(1);
             }
         }
         after = p.get("next_seq").and_then(Value::as_u64).unwrap_or(after);

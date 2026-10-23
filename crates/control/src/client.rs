@@ -50,13 +50,24 @@ pub struct Client {
     fingerprint: Option<String>,
 }
 
+/// Connect to the first address of `addr` that answers, in resolver order.
 fn open(addr: &str, timeout: Duration) -> Result<TcpStream, String> {
-    let sock: SocketAddr = addr
+    let socks: Vec<SocketAddr> = addr
         .to_socket_addrs()
         .map_err(|e| format!("{addr}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("{addr}: no address"))?;
-    let stream = TcpStream::connect_timeout(&sock, timeout).map_err(|e| format!("{addr}: {e}"))?;
+        .collect();
+    let mut last = format!("{addr}: no address");
+    let mut found = None;
+    for sock in socks {
+        match TcpStream::connect_timeout(&sock, timeout) {
+            Ok(s) => {
+                found = Some(s);
+                break;
+            }
+            Err(e) => last = format!("{addr}: {e}"),
+        }
+    }
+    let stream = found.ok_or(last)?;
     // Requests are small and answered one by one: send each at once.
     stream.set_nodelay(true).map_err(|e| e.to_string())?;
     stream
@@ -102,6 +113,14 @@ impl Client {
 
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    /// The socket address actually connected to.
+    pub fn peer(&self) -> Option<SocketAddr> {
+        match self.reader.get_ref() {
+            Stream::Plain(s) => s.peer_addr().ok(),
+            Stream::Tls(s) => s.sock.peer_addr().ok(),
+        }
     }
 
     /// The router's certificate fingerprint (TLS only).

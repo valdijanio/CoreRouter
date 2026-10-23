@@ -12,12 +12,14 @@ repository.workspace = true
 corerouter-engine.workspace = true
 corerouter-buildinfo.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 log.workspace = true
 tungstenite.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
 ring.workspace = true
+# TCP keepalive and TCP_USER_TIMEOUT on accepted sockets (dead peers, Safe Mode).
+socket2 = { version = "0.6.5", features = ["all"] }
 
 [dev-dependencies]
 criterion.workspace = true

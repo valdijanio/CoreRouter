@@ -52,6 +52,42 @@ fn initialize_list_and_call() {
     assert_eq!(out[5]["error"]["code"], -32601);
 }
 
+/// Audit (control finding 6): `run_task` is annotated read-only, so it must
+/// not run a config change before noticing it started no task.
+#[test]
+fn run_task_refuses_anything_but_a_tool() {
+    let out = run(&[
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"run_task",
+            "arguments":{"command":"system.identity.set","params":{"name":"pwned"}}}}),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"inspect_state",
+            "arguments":{}}}),
+    ]);
+    assert_eq!(out[0]["result"]["isError"], true);
+    let state = out[1]["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(!state.contains("pwned"), "{state}");
+}
+
+/// Audit (control finding 14): JSON-RPC 2.0 §5, a response is never
+/// answered; §4, an id is a string, a number or null.
+#[test]
+fn responses_are_not_answered_and_ids_are_scalars() {
+    let out = run(&[
+        json!({"jsonrpc":"2.0","id":1,"result":{}}),
+        json!({"jsonrpc":"2.0","id":2,"error":{"code":-1,"message":"x"}}),
+        json!({"jsonrpc":"2.0","id":{"a":1},"method":"ping"}),
+        json!({"jsonrpc":"2.0","id":[1],"method":"ping"}),
+        json!({"jsonrpc":"2.0","id":"s","method":"ping"}),
+    ]);
+    assert_eq!(out.len(), 3, "{out:?}");
+    for bad in &out[..2] {
+        assert_eq!(
+            (&bad["id"], &bad["error"]["code"]),
+            (&Value::Null, &json!(-32600))
+        );
+    }
+    assert_eq!(out[2]["id"], "s");
+}
+
 #[test]
 fn tool_errors_are_readable_text() {
     let out = run(&[
