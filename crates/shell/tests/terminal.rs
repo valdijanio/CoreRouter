@@ -862,6 +862,24 @@ fn quit_and_hostile_lines() {
     assert!(t.run("# a comment").is_empty());
 }
 
+/// G1.26: `/system tuning` exports what the config sets as `set` lines,
+/// and an import puts them back.
+#[test]
+fn tuning_exports_as_set_lines() {
+    let mut a = Term::new();
+    a.ok("/system tuning set name=net.core.netdev_budget value=600");
+    let script = a.export();
+    assert!(!script.contains("is not exported"), "{script}");
+    assert!(
+        script.contains("/system tuning\nset name=net.core.netdev_budget value=600"),
+        "{script}"
+    );
+    let mut b = Term::new();
+    b.router.files.insert("t.rsc".into(), script.clone());
+    b.ok("/import file=t.rsc");
+    assert_eq!(b.export(), script);
+}
+
 mod hostile {
     use super::*;
     use proptest::prelude::*;

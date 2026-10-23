@@ -41,5 +41,9 @@ proptest.workspace = true
 name = "netns_apply"
 harness = false
 
+[[bench]]
+name = "netns_forward"
+harness = false
+
 [lints]
 workspace = true

@@ -13,6 +13,7 @@ pub mod nic;
 pub mod probe;
 pub mod sff;
 pub mod sim;
+pub mod tuning;
 pub mod virt;
 
 use corerouter_model::firewall::DynamicAddress;
@@ -342,6 +343,32 @@ pub trait Hal: Send {
         let _ = cfg;
         Err(HalError::Unsupported(format!(
             "{} cannot reconcile",
+            self.describe()
+        )))
+    }
+
+    /// The machine, for System › Tuning (G1.26, [`tuning`]).
+    fn system_info(&mut self) -> Result<tuning::SystemInfo, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} does not describe the machine",
+            self.describe()
+        )))
+    }
+
+    /// The current value of kernel parameters `names` (catalog names of
+    /// `corerouter_model::tuning`).
+    fn sysctls(&mut self, names: &[&str]) -> Result<tuning::Sysctls, HalError> {
+        let _ = names;
+        Err(HalError::Unsupported(format!(
+            "{} has no kernel parameters",
+            self.describe()
+        )))
+    }
+
+    /// Counters behind the tuning diagnosis.
+    fn kernel_stats(&mut self) -> Result<tuning::KernelStats, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no kernel counters",
             self.describe()
         )))
     }

@@ -28,6 +28,12 @@ impl HelpView {
             extra: Vec::new(),
         }
     }
+
+    /// Add a computed section (heading in English, given to `tr`).
+    pub fn with(mut self, heading: &'static str, body: impl Into<String>) -> Self {
+        self.extra.push((heading, body.into()));
+        self
+    }
 }
 
 /// A small round "i"; `tip` on hover. Clicked: open the explanation.
