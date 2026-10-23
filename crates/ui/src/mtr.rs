@@ -184,8 +184,8 @@ impl CoreRouterUi {
         let mut enter = false;
         let mut help: Option<crate::help::HelpView> = None;
         let mut info = |ui: &mut Ui, key: &str, title: &'static str| {
-            if crate::help::info_button(ui, egui::Id::unique(("mtr-help", key)), crate::i18n::tr(l, title)).clicked() {
-                help = Some(crate::help::HelpView::new(format!("mtr.{key}"), crate::i18n::tr(l, title)));
+            if crate::help::info_button(ui, egui::Id::unique(("mtr-help", key)), crate::i18n::tr_in("traceroute", l, title)).clicked() {
+                help = Some(crate::help::HelpView::new(format!("mtr.{key}"), crate::i18n::tr_in("traceroute", l, title)));
             }
         };
         ui.horizontal(|ui| {

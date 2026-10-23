@@ -16,7 +16,7 @@ use serde_json::{Map, Value, json};
 use crate::backend::RequestId;
 use crate::chip;
 use crate::help::{self, HelpView};
-use crate::i18n::{Lang, tr};
+use crate::i18n::{Lang, tr_in};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::windows::combo;
 use crate::{CoreRouterUi, Win};
@@ -147,18 +147,18 @@ impl SnifferPanel {
     }
 
     fn info(&mut self, ui: &mut Ui, l: Lang, key: &str, title: &'static str) {
-        if help::info_button(ui, Id::unique(("sniffer-help", key)), tr(l, title)).clicked() {
-            self.help = Some(HelpView::new(format!("sniffer.{key}"), tr(l, title)));
+        if help::info_button(ui, Id::unique(("sniffer-help", key)), tr_in("torch", l, title)).clicked() {
+            self.help = Some(HelpView::new(format!("sniffer.{key}"), tr_in("torch", l, title)));
         }
     }
 
     fn form(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         let on = !self.running();
         ui.horizontal_wrapped(|ui| {
-            ui.label(tr(l, "Interface"));
+            ui.label(tr_in("torch", l, "Interface"));
             let names = app.interface_names(None);
             ui.add_enabled_ui(on, |ui| {
-                combo(ui, "sniffer-iface", tr(l, "pick one"), &mut self.interface, &names);
+                combo(ui, "sniffer-iface", tr_in("torch", l, "pick one"), &mut self.interface, &names);
             });
             self.info(ui, l, "interface", "Interface");
             for (label, key, hint, w) in [
@@ -167,7 +167,7 @@ impl SnifferPanel {
                 ("Port", "port", "53", 45.0),
                 ("Protocol", "protocol", "udp", 50.0),
             ] {
-                ui.label(tr(l, label));
+                ui.label(tr_in("torch", l, label));
                 let field = match key {
                     "src" => &mut self.src,
                     "dst" => &mut self.dst,
@@ -176,45 +176,45 @@ impl SnifferPanel {
                 };
                 ui.add_enabled(on, TextEdit::singleline(field).hint_text(hint).desired_width(w));
                 // The filter means what Torch's does: one explanation.
-                if help::info_button(ui, Id::unique(("sniffer-help", key)), tr(l, label)).clicked() {
-                    self.help = Some(HelpView::new(format!("torch.{key}"), tr(l, label)));
+                if help::info_button(ui, Id::unique(("sniffer-help", key)), tr_in("torch", l, label)).clicked() {
+                    self.help = Some(HelpView::new(format!("torch.{key}"), tr_in("torch", l, label)));
                 }
             }
         });
         ui.horizontal_wrapped(|ui| {
-            ui.label(tr(l, "Bytes per frame"));
+            ui.label(tr_in("torch", l, "Bytes per frame"));
             let opts: Vec<String> = SNAPLENS.iter().map(|s| (*s).to_owned()).collect();
             ui.add_enabled_ui(on, |ui| {
                 combo(ui, "sniffer-snaplen", "128", &mut self.snaplen, &opts);
             });
             self.info(ui, l, "snaplen", "Bytes per frame");
             if self.snaplen.trim().parse::<u32>().is_ok_and(|n| n > 128) {
-                chip::chip(ui, tr(l, "payloads"), chip::AMBER.tone(ui.visuals()))
-                    .on_hover_text(tr(l, "Whole frames carry subscribers' data: keep the file safe"));
+                chip::chip(ui, tr_in("torch", l, "payloads"), chip::AMBER.tone(ui.visuals()))
+                    .on_hover_text(tr_in("torch", l, "Whole frames carry subscribers' data: keep the file safe"));
             }
-            ui.label(tr(l, "File limit (KiB)"));
+            ui.label(tr_in("torch", l, "File limit (KiB)"));
             ui.add_enabled(on, TextEdit::singleline(&mut self.file_limit).desired_width(60.0));
             self.info(ui, l, "file_limit", "File limit (KiB)");
-            ui.label(tr(l, "Duration (s)"));
+            ui.label(tr_in("torch", l, "Duration (s)"));
             ui.add_enabled(on, TextEdit::singleline(&mut self.duration).desired_width(45.0));
             self.info(ui, l, "duration", "Duration (s)");
             ui.separator();
             let can = app.can();
             if self.running() {
-                if ui.button(tr(l, "Stop")).clicked()
+                if ui.button(tr_in("torch", l, "Stop")).clicked()
                     && let Some(id) = self.task
                 {
                     app.run_then(STOP, json!({"id": id}), crate::panel::then(NAME, Stopped));
                 }
             } else {
                 let ready = if self.interface.trim().is_empty() {
-                    Err(tr(l, "Pick an interface first").to_owned())
+                    Err(tr_in("torch", l, "Pick an interface first").to_owned())
                 } else {
                     Ok(())
                 };
                 let check = can.and(START, ready);
                 if ui
-                    .add_enabled(check.is_ok() && !self.starting, egui::Button::new(tr(l, "Start")))
+                    .add_enabled(check.is_ok() && !self.starting, egui::Button::new(tr_in("torch", l, "Start")))
                     .on_disabled_hover_text(check.err().unwrap_or_default())
                     .clicked()
                 {
@@ -258,14 +258,14 @@ impl SnifferPanel {
             ui.label(format!(
                 "{} {}  ·  {} {}",
                 u(&s, "packets"),
-                tr(l, "packets"),
+                tr_in("torch", l, "packets"),
                 size(u(&s, "bytes")),
-                tr(l, "on the wire"),
+                tr_in("torch", l, "on the wire"),
             ));
             if u(&s, "dropped_by_limit") > 0 {
                 chip::chip(
                     ui,
-                    &format!("{} {}", u(&s, "dropped_by_limit"), tr(l, "past the limit")),
+                    &format!("{} {}", u(&s, "dropped_by_limit"), tr_in("torch", l, "past the limit")),
                     chip::AMBER.tone(ui.visuals()),
                 );
             }
@@ -282,23 +282,23 @@ impl SnifferPanel {
         .max(1);
         let file = u(&s, "file_size");
         ui.horizontal(|ui| {
-            ui.label(tr(l, "File"));
+            ui.label(tr_in("torch", l, "File"));
             ui.add(
                 egui::ProgressBar::new((file as f32 / limit as f32).clamp(0.0, 1.0))
                     .desired_width(260.0)
                     .text(format!("{} / {}", size(file), size(limit))),
             );
             let ready = match (&self.download, self.task) {
-                (Some(_), _) => Err(tr(l, "Downloading…").to_owned()),
-                (None, None) => Err(tr(l, "Nothing captured yet").to_owned()),
-                (None, Some(_)) if file == 0 => Err(tr(l, "Nothing captured yet").to_owned()),
+                (Some(_), _) => Err(tr_in("torch", l, "Downloading…").to_owned()),
+                (None, None) => Err(tr_in("torch", l, "Nothing captured yet").to_owned()),
+                (None, Some(_)) if file == 0 => Err(tr_in("torch", l, "Nothing captured yet").to_owned()),
                 (None, Some(_)) => Ok(()),
             };
             let check = app.can().and(DOWNLOAD, ready);
             if ui
-                .add_enabled(check.is_ok(), egui::Button::new(tr(l, "Download .pcap")))
+                .add_enabled(check.is_ok(), egui::Button::new(tr_in("torch", l, "Download .pcap")))
                 .on_disabled_hover_text(check.err().unwrap_or_default())
-                .on_hover_text(tr(l, "Save the capture so far, for Wireshark"))
+                .on_hover_text(tr_in("torch", l, "Save the capture so far, for Wireshark"))
                 .clicked()
                 && let Some(id) = self.task
             {

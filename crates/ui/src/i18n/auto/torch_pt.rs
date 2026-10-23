@@ -1,4 +1,4 @@
-//! Portuguese labels and explanations of Tools › Torch and Packet Sniffer (G6.4a), sorted by key.
+//! Portuguese labels and explanations of Tools › Torch and Packet Sniffer (G6.4a), scope `torch`, sorted by key.
 
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
@@ -41,6 +41,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
+    ("menu.sniffer", "## O que faz\nGrava os quadros de uma interface num arquivo pcap para abrir no Wireshark, com filtro, tamanho e duração limitados; baixe o arquivo pela GUI. Por padrão só os cabeçalhos (os dados são dos assinantes)."),
+    ("menu.torch", "## O que faz\nO tráfego de uma interface ao vivo, por fluxo: quem fala com quem, quanto em cada sentido, agrupado por origem, destino, protocolo, porta, VLAN, DSCP ou MAC, com o AS do destino. Acima de ~500 kpps amostra 1:N e avisa."),
     ("sniffer.duration", "## Duração\n\nQuanto tempo a captura roda, em segundos (1 a 3600; padrão 60). Ela termina sozinha ao chegar lá, mesmo que ninguém pare: uma captura esquecida não fica gravando."),
     ("sniffer.file_limit", "## Limite do arquivo\n\nO tamanho máximo do arquivo pcap, em KiB (1 a 65536; padrão 4096 = 4 MiB). Ao chegar nele a captura para (`file limit reached`) e os pacotes seguintes são contados em **além do limite**. O arquivo fica na memória do roteador até ser baixado; no máximo duas capturas guardadas ao mesmo tempo."),
     ("sniffer.interface", "## Interface\n\nOnde capturar: os quadros recebidos **e** enviados por ela. Com um filtro de VLAN, as interfaces VLAN dela entram também.\n\nAlterar nada: a captura só lê (socket `AF_PACKET`), não mexe no tráfego."),

@@ -5,7 +5,6 @@
 
 pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.addresses", "## What it does\nThe IPv4 addresses of the router's interfaces. Each address also makes the connected route of its network.\n\nAn address can come from a pool (prefix delegation) or from a DHCP lease; the Origin column says which."),
-    ("menu.bandwidth", "## What it does\nMeasures throughput to an iperf3 server (any `iperf3 -s` or another CoreRouter), TCP or UDP, one way or both, with loss, jitter and the router's CPU; in the Server tab, the router answers iperf3 tests."),
     ("menu.bgp", "## What it does\nThe BGP instance: the router's AS, router id and the sessions with peers (upstreams, IXs, customers). The protocol itself runs in FRR; this window configures it."),
     ("menu.bonding", "## What it does\nBonds join several ports into one link (LACP 802.3ad, active-backup, balance-xor…) for more capacity and for redundancy when a cable or port fails."),
     ("menu.cgnat", "## What it does\nCarrier-grade NAT for subscribers on shared IPv4 (RFC 6598): deterministic pools (RFC 7422, nothing logged per connection) or port blocks on demand (RFC 6888, one log line per block), 1:1 exceptions, EIM/EIF and hairpin (RFC 4787), \"who was\" (public address + port + time – subscriber), the mapping table, blocks and port alerts."),
@@ -43,8 +42,6 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.routes", "## What it does\nThe routing table: static routes (the default route 0.0.0.0/0 included), connected and learned ones, which one is active and in which VRF."),
     ("menu.services", "## What it does\nThe router's own services (DNS, DHCP, metrics…) as the supervisor sees them: running, stopped or failed, restarts and the last error. Start, stop and restart them here."),
     ("menu.settings", "## What it does\nPreferences of this GUI, not of the router: the language of the labels and of the explanations. Kept on this computer."),
-    ("menu.sniffer", "## What it does\nRecords an interface's frames into a pcap file for Wireshark, with a filter and a bounded size and duration; download the file from the GUI. Headers only by default (the data is subscribers')."),
-    ("menu.torch", "## What it does\nAn interface's traffic live, per flow: who talks to whom and how much each way, grouped by source, destination, protocol, port, VLAN, DSCP or MAC, with the destination's AS. Above ~500 kpps it samples 1:N and says so."),
     ("menu.traffic-flow", "## What it does\nExports a record of every connection to flow collectors, in IPFIX or NetFlow v9, with the addresses and ports before and after NAT and RFC 8158 NAT events: the connection log a provider keeps (Marco Civil). Also shows the top talkers without a collector."),
     ("menu.tuning", "## What it does\nKernel and hardware tuning for routing: network buffers, conntrack, CPU governor, IRQ and RPS/XPS per interface, and the boot parameters — with recommended values and why."),
     ("menu.vrf", "## What it does\nVRFs: separate routing tables on the same router, for customers or management kept apart."),

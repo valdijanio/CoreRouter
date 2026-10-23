@@ -1,4 +1,4 @@
-//! Portuguese labels and explanations of Tools › Bandwidth Test (G6.4b), sorted by key.
+//! Portuguese labels and explanations of Tools › Bandwidth Test (G6.4b), scope `btest`, sorted by key.
 
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
@@ -54,4 +54,5 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("bandwidth.server_max_streams", "## Max streams\n\nQuantos streams paralelos (`-P`) um teste pode abrir (1 a 128; padrão 8). Cada stream é uma thread no roteador."),
     ("bandwidth.server_port", "## Port\n\nPorta TCP e UDP do servidor (padrão 5201). Mudar religa o servidor na porta nova."),
     ("bandwidth.streams", "## Streams\n\nQuantas conexões em paralelo (`-P` do iperf3, 1 a 128). Um stream TCP sozinho pode não encher um enlace de alta latência (janela); vários dividem a carga entre núcleos e filas."),
+    ("menu.bandwidth", "## O que faz\nMede a vazão até um servidor iperf3 (qualquer `iperf3 -s` ou outro CoreRouter), TCP ou UDP, em um ou nos dois sentidos, com perda, jitter e a CPU do roteador; na aba Server, o roteador responde a testes do iperf3."),
 ];

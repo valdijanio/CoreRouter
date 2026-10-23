@@ -34,7 +34,6 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 
 pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.addresses", "## O que faz\nOs endereços IPv4 das interfaces do roteador. Cada endereço também cria a rota conectada da sua rede.\n\nUm endereço pode vir de um pool (delegação de prefixo) ou de uma concessão DHCP; a coluna Origin diz de onde."),
-    ("menu.bandwidth", "## O que faz\nMede a vazão até um servidor iperf3 (qualquer `iperf3 -s` ou outro CoreRouter), TCP ou UDP, em um ou nos dois sentidos, com perda, jitter e a CPU do roteador; na aba Server, o roteador responde a testes do iperf3."),
     ("menu.bgp", "## O que faz\nA instância BGP: o AS do roteador, o router id e as sessões com os peers (operadoras, IX, clientes). O protocolo roda no FRR; esta janela o configura."),
     ("menu.bonding", "## O que faz\nBonds juntam várias portas num link só (LACP 802.3ad, active-backup, balance-xor…) para ter mais capacidade e redundância quando um cabo ou porta cai."),
     ("menu.cgnat", "## O que faz\nNAT de operadora (CGNAT) para assinantes em IPv4 compartilhado (RFC 6598, 100.64.0.0/10): pools determinísticos (RFC 7422, sem log por conexão) ou em blocos sob demanda (RFC 6888, log por bloco), exceções 1:1, EIM/EIF e hairpin (RFC 4787), o \"Quem era?\" (IP público + porta + hora – assinante, o que o Marco Civil pede), a tabela de correspondência, os blocos e os alertas de portas esgotadas."),
@@ -72,8 +71,6 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.routes", "## O que faz\nA tabela de rotas: rotas estáticas (inclusive a rota padrão 0.0.0.0/0), conectadas e aprendidas, qual está ativa e em qual VRF."),
     ("menu.services", "## O que faz\nOs serviços do próprio roteador (DNS, DHCP, métricas…) como o supervisor os vê: rodando, parado ou com falha, reinícios e o último erro. Inicie, pare e reinicie por aqui."),
     ("menu.settings", "## O que faz\nPreferências desta GUI, não do roteador: o idioma dos rótulos e das explicações. Guardadas neste computador."),
-    ("menu.sniffer", "## O que faz\nGrava os quadros de uma interface num arquivo pcap para abrir no Wireshark, com filtro, tamanho e duração limitados; baixe o arquivo pela GUI. Por padrão só os cabeçalhos (os dados são dos assinantes)."),
-    ("menu.torch", "## O que faz\nO tráfego de uma interface ao vivo, por fluxo: quem fala com quem, quanto em cada sentido, agrupado por origem, destino, protocolo, porta, VLAN, DSCP ou MAC, com o AS do destino. Acima de ~500 kpps amostra 1:N e avisa."),
     ("menu.traffic-flow", "## O que faz\nExporta um registro de cada conexão para coletores de fluxo, em IPFIX ou NetFlow v9, com endereços e portas antes e depois do NAT e os eventos de NAT da RFC 8158: o registro de conexão que o provedor guarda (Marco Civil). Mostra também os maiores consumidores sem coletor."),
     ("menu.tuning", "## O que faz\nAjustes de kernel e hardware para roteamento: buffers de rede, conntrack, governor da CPU, IRQ e RPS/XPS por interface e os parâmetros de boot — com valores recomendados e o porquê."),
     ("menu.vrf", "## O que faz\nVRFs: tabelas de rotas separadas no mesmo roteador, para manter clientes ou gerência isolados."),

@@ -14,6 +14,7 @@ repository = "https://github.com/valdijanio/CoreRouter"
 # Workspace crates (path deps; the layer table lives in xtask/src/layers.rs).
 corerouter-model = { path = "crates/model" }
 corerouter-buildinfo = { path = "crates/buildinfo" }
+corerouter-cgnat-map = { path = "crates/cgnat-map" }
 corerouter-hal = { path = "crates/hal" }
 corerouter-hal-linux = { path = "crates/hal-linux" }
 corerouter-firewall = { path = "crates/firewall" }

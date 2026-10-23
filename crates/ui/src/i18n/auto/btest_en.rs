@@ -1,4 +1,4 @@
-//! English explanations of Tools › Bandwidth Test (G6.4b), sorted by key.
+//! English explanations of Tools › Bandwidth Test (G6.4b), scope `btest`, sorted by key.
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
@@ -17,4 +17,5 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("bandwidth.server_max_streams", "## Max streams\n\nHow many parallel streams (`-P`) a test may open (1 to 128; default 8). Each stream is a thread on the router."),
     ("bandwidth.server_port", "## Port\n\nThe server's TCP and UDP port (default 5201). Changing it rebinds the server."),
     ("bandwidth.streams", "## Streams\n\nHow many connections in parallel (iperf3's `-P`, 1 to 128). A single TCP stream may not fill a high-latency link (window); several spread the load over cores and queues."),
+    ("menu.bandwidth", "## What it does\nMeasures throughput to an iperf3 server (any `iperf3 -s` or another CoreRouter), TCP or UDP, one way or both, with loss, jitter and the router's CPU; in the Server tab, the router answers iperf3 tests."),
 ];

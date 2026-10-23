@@ -1,4 +1,4 @@
-//! Portuguese explanations of the MTR window's traceroute options (G6.4c), sorted by key.
+//! Portuguese explanations of the MTR window's traceroute options (G6.4c), scope `traceroute`, sorted by key.
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[

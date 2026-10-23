@@ -1,7 +1,9 @@
-//! English explanations of Tools › Torch and Packet Sniffer (G6.4a), sorted by key.
+//! English explanations of Tools › Torch and Packet Sniffer (G6.4a), scope `torch`, sorted by key.
 
 /// Explanations: (key, Markdown).
 pub(super) const HELP: &[(&str, &str)] = &[
+    ("menu.sniffer", "## What it does\nRecords an interface's frames into a pcap file for Wireshark, with a filter and a bounded size and duration; download the file from the GUI. Headers only by default (the data is subscribers')."),
+    ("menu.torch", "## What it does\nAn interface's traffic live, per flow: who talks to whom and how much each way, grouped by source, destination, protocol, port, VLAN, DSCP or MAC, with the destination's AS. Above ~500 kpps it samples 1:N and says so."),
     ("sniffer.duration", "## Duration\n\nHow long the capture runs, in seconds (1 to 3600; default 60). It ends by itself, even if nobody stops it: a forgotten capture does not keep recording."),
     ("sniffer.file_limit", "## File limit\n\nThe largest the pcap file gets, in KiB (1 to 65536; default 4096 = 4 MiB). There the capture stops (`file limit reached`) and later packets are counted as **past the limit**. The file stays in the router's memory until downloaded; at most two captures are kept at once."),
     ("sniffer.interface", "## Interface\n\nWhere to capture: the frames it receives **and** sends. With a VLAN filter its VLAN interfaces are included.\n\nIt changes nothing: the capture only reads (an `AF_PACKET` socket)."),
