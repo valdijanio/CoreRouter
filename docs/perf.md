@@ -731,3 +731,111 @@ uma vez pelo ctnetlink. O coletor é IPFIX por TCP.
 Em user namespace o buffer do socket fica no `rmem_max` (8 MiB efetivos). No roteador o daemon é
 root e pede 32 MiB com `SO_RCVBUFFORCE`. Mesmo com estouro, todo delete leva o início da sessão:
 nenhuma sessão some do registro.
+
+### G2.3e — CGNAT: pps, conexões novas, "Quem era?" (**medido**, 2026-10-23)
+
+Ryzen AI MAX+ 395 (32 threads), kernel 7.0, build release, netns sem root, carga 8–16 na máquina (CIs
+de outras sessões). Valores em mediana, num núcleo (veth).
+
+| Medida | Valor |
+|---|---|
+| UDP 64 B, só roteamento (sem conntrack) | ~830 mil pps |
+| UDP 64 B, CGNAT | ~650 mil pps |
+| UDP 64 B, CGNAT + fast path em software | ~1,04 milhão pps |
+| conexões novas/s, só conntrack | ~551 mil |
+| conexões novas/s, CGNAT sem EIM | ~274 mil |
+| conexões novas/s, CGNAT (EIM, padrão) | ~255 mil |
+| conexões novas/s, CGNAT com o slot quase cheio | ~13 mil |
+| "Quem era?", 64 Ki assinantes, 1 época | 1,4 µs |
+| "Quem era?", 64 Ki assinantes, 365 épocas | 3,0 µs |
+
+- 2026-10-23 — G2.5a, XDP (**medido**, runner do GitHub Actions ubuntu-latest, 4 vCPUs, kernel do
+  runner; objeto XDP release; `cargo xtask xdp-root`). `BPF_PROG_TEST_RUN`, 2 milhões de
+  repetições, UDP 64 bytes, ns por pacote (inclui o custo fixo do test run):
+
+  | prefixos na LPM | carga | passa | bloqueado | passa com taxa |
+  |---:|---:|---:|---:|---:|
+  | 0 | 208 ms | 159 | — | 216 |
+  | 1 000 | 202 ms | 176 | 285 | 234 |
+  | 10 000 | 215 ms | 175 | 322 | 233 |
+  | 100 000 | 441 ms | 170 | 339 | 229 |
+  | 1 000 000 | 2 682 ms | 173 | 347 | 231 |
+
+  LPM: ~17 ns, plano de mil a um milhão de prefixos. Remetente AF_PACKET em veth (2 s, 64 bytes,
+  um núcleo para envio e recepção): sem filtro 450 kpps, nftables raw drop 471 kpps, XDP generic
+  drop 402 kpps, XDP native (veth) drop 409 kpps. Em veth o XDP não ganha (o veth já entrega um
+  `skb`); o ganho exige o modo native numa placa real (roteiro em `docs/xdp.md`). Host, mesma
+  decisão sem mapas (`benches/filter.rs`, AMD Ryzen AI Max+ 395, release): parse 9,4 ns,
+  decisão com taxa 18,4 ns, bloqueado 13,2 ns.
+
+### G4.5 — histórico de tráfego (**medido**, 2026-10-23, AMD Ryzen AI MAX+ 395, 32 threads, build release, ext4 em NVMe)
+
+Coleta e consulta, do `cargo bench -p corerouter-engine --bench graph` (criterion, mediana):
+
+| | 8 interfaces | 64 interfaces | 512 interfaces |
+|---|---|---|---|
+| um segundo de coleta (no tick, sob o lock da sessão) | 1,9 µs | 20,0 µs | 355 µs |
+| tirar as mudanças de um store de 5 min (sob o lock) | 4,7 µs | 32,7 µs | 547 µs |
+
+Consulta de uma interface com o histórico cheio: hora 294 µs, dia 299 µs, semana 542 µs, mês
+279 µs, **ano 1,36 ms**.
+
+Daemon de lab (`--backend virtual`, VLANs para chegar a 64 e 512, `vlans=yes`):
+
+| | 8 | 64 | 512 |
+|---|---|---|---|
+| histórico (memória = disco) | 5,72 MB | 43,4 MB | 344,9 MB |
+| RSS do daemon | 18,5 MB | 56,9 MB | 359,4 MB |
+| CPU do daemon inteiro (60 s, ticks de 10 ms) | 12 | 14 | 24 |
+| store de 1 min: bytes, tempo (fora do lock) | 696 B, 16 ms | 5.176 B, 94 ms | 41.016 B, 511 ms |
+| store final com o anel de 1 s | 26 KB, 8 ms | 199 KB, 64 ms | 1,57 MB, 491 ms |
+
+- Uma série de interface ocupa 672.984 bytes e a do sistema 336.600, fixos.
+- Com 512 VLANs e o graphing desligado, o daemon fica com 24,9 MB de RSS e 18 ticks em 60 s. O
+  histórico de 512 interfaces custa então 6 ticks a cada 60 s (0,1 % de um núcleo) e 334 MB.
+- O store custa ~80 B por série por minuto de histórico. No padrão de 5 min, a flash recebe
+  ~115 KB por interface por dia (**estimado** a partir do medido). O tempo do store é o
+  `fsync` de cada arquivo.
+- **Restart:** com 8, 64 e 512 interfaces, a consulta da última hora de `ether1` antes do
+  SIGTERM e depois de subir de novo deu os mesmos totais e a mesma média. O teste
+  `a_restart_reads_back_what_was_stored` confere os pontos.
+
+### G6.4b — Bandwidth Test (2026-10-23, **medido**)
+
+Máquina de desenvolvimento (32 CPUs) **carregada por outras sessões** (load average 26–39
+durante as medições: os números de CPU incluem essa carga), daemon e CLI em release, cliente e
+servidor do próprio daemon em loopback (`127.0.0.1:5299`), 5 s por teste. CPU = o roteador inteiro.
+
+| Teste | Recebido | Perda | Jitter | CPU média (máx.) |
+|---|---|---|---|---|
+| TCP, 1 stream | 86,7 Gbit/s | – | – | 25 % (34 %) |
+| TCP, 4 streams | 310 Gbit/s | – | – | 40 % (45 %) |
+| UDP 1 Gbit/s, 1 stream | 1,00 Gbit/s | 0,0 % | 0,002 ms | 23 % (26 %) |
+| UDP 2 Gbit/s, 1 stream | 2,0 Gbit/s | 0,0 % (148 de ~180 mil) | 0,001 ms | 69 % (90 %) |
+| UDP receive, 4 × 500 Mbit/s | 1,9 Gbit/s | 0,0 % | 0,001 ms | 57 % (78 %) |
+
+Antes de dar 4 MiB de buffer de recepção aos sockets UDP (o padrão do kernel é ~208 KiB), o UDP
+a 1 Gbit/s perdia 29,7 % em loopback; depois, 0,0 %. Loopback mede o software dos dois lados, não
+uma NIC; o número que importa num ISP é o do enlace real, que esta ferramenta passa a medir.
+
+### G6.4a — Torch e Packet Sniffer (2026-10-23, **medido**)
+
+Máquina de desenvolvimento (32 CPUs), build release (`cargo bench`), veth num namespace sem root.
+`COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p
+corerouter-hal-linux --bench netns_capture`: emissores escrevem quadros UDP de 64 bytes (256
+fluxos) por `AF_PACKET` em `cpa`; a captura do Torch (`HostCapture`) lê e decodifica em `cpb`.
+"Coberto" = lidos × N ÷ o contador da interface.
+
+| Caso | Oferecido | Lido | Coberto | CPU da thread de captura |
+|---|---|---|---|---|
+| 1 emissor, tudo | 1717 kpps | 1717 kpps | 100 % | 99 % |
+| 1 emissor, 1:8 no kernel | 1289 kpps | 162 kpps | 100 % | 26 % |
+| 6 emissores, tudo | 8318 kpps | 2059 kpps | 25 % | 100 % |
+| 6 emissores, 1:8 no kernel | 11257 kpps | 1406 kpps | 100 % | 87 % |
+| 6 emissores, 1:64 no kernel | 12787 kpps | 200 kpps | 100 % | 35 % |
+
+`cargo bench -p corerouter-engine --bench torch` (agregar um lote de 1024 quadros):
+`torch_ingest/src_dst` 75,4 µs (13,6 M quadros/s), `torch_ingest/five_tuple` 83,2 µs
+(12,3 M quadros/s). Conclusão: ~0,5 µs por quadro é o socket (`recvmsg`), não a agregação; o
+`sampling: auto` (500 kpps → ~30 % de um núcleo; acima, ~250 kpps lidos) mantém o custo
+limitado, e o próximo salto é XDP (G6.10).
