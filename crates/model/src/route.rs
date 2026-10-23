@@ -8,6 +8,7 @@
 //! A gateway is resolved inside the route's own routing table: `main` holds
 //! the interfaces outside any VRF, a VRF table holds its member interfaces.
 
+use std::collections::BTreeMap;
 use std::net::IpAddr;
 
 use ipnet::IpNet;
@@ -248,27 +249,30 @@ pub struct Connected {
 
 /// Connected routes of `cfg`, one per (table, network, interface), sorted.
 pub fn connected(cfg: &Config) -> Vec<Connected> {
-    let mut out: Vec<Connected> = Vec::new();
+    // Keyed, so many addresses stay O(A log A) (a linear search per
+    // address was O(A²)).
+    let mut out: BTreeMap<(RoutingTable, IpNet, IfName), bool> = BTreeMap::new();
     for a in &cfg.ip.addresses {
         if !cfg.interfaces.contains_key(&a.interface) {
             continue;
         }
-        let c = Connected {
-            table: table_of(cfg, &a.interface),
-            dst: a.address.trunc(),
-            interface: a.interface.clone(),
-            active: !a.disabled && is_up(cfg, &a.interface),
-        };
-        match out
-            .iter_mut()
-            .find(|o| o.table == c.table && o.dst == c.dst && o.interface == c.interface)
-        {
-            Some(o) => o.active |= c.active,
-            None => out.push(c),
-        }
+        let active = !a.disabled && is_up(cfg, &a.interface);
+        let key = (
+            table_of(cfg, &a.interface),
+            a.address.trunc(),
+            a.interface.clone(),
+        );
+        *out.entry(key).or_default() |= active;
     }
-    out.sort();
-    out
+    // The key order is the sort order of `Connected` (table, dst, interface).
+    out.into_iter()
+        .map(|((table, dst, interface), active)| Connected {
+            table,
+            dst,
+            interface,
+            active,
+        })
+        .collect()
 }
 
 #[cfg(test)]

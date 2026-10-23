@@ -348,16 +348,21 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     lines.sort_by(order);
 
     let mut rows = Vec::with_capacity(lines.len());
-    for (i, l) in lines.iter().enumerate() {
+    // Lines are sorted by distance inside (table, dst): the first usable
+    // one of each group is the active route, as the kernel picks the lowest
+    // metric. Groups are contiguous, so one pass finds it (O(L), was O(L²)).
+    let mut first: Option<&Line> = None;
+    for l in &lines {
+        if first.is_some_and(|w| w.table != l.table || w.dst != l.dst) {
+            first = None;
+        }
+        let winner = first;
+        if l.usable && first.is_none() {
+            first = Some(l);
+        }
         if filter.as_ref().is_some_and(|t| *t != l.table) {
             continue;
         }
-        // Lines are sorted by distance inside (table, dst): the first usable
-        // one is the active route, as the kernel picks the lowest metric.
-        let winner = lines
-            .iter()
-            .take(i)
-            .find(|o| o.usable && o.table == l.table && o.dst == l.dst);
         let active = l.usable && winner.is_none();
         let reason = match (&l.reason, winner) {
             (Some(why), _) => Some(why.clone()),

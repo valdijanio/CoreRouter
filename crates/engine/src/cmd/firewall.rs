@@ -906,8 +906,10 @@ pub(super) fn al_add(s: &mut Session, p: &Value) -> Result<Value> {
         let before = s.dynamic_now();
         let mut after = before.clone();
         after.push(entry.data_plane(now));
-        let running = s.store().running();
-        s.check_lockout(running, running, &before, &after)?;
+        // As the commit path sees it: with the addresses and routes DHCP
+        // clients installed (the operator may be on one of them).
+        let running = s.effective(s.store().running());
+        s.check_lockout(&running, &running, &before, &after)?;
         s.hal_mut()
             .address_list_dynamic(DynamicChange::Add(&entry.data_plane(now)))
             .map_err(|e| EngineError::Hal(e.to_string()))?;
@@ -952,7 +954,7 @@ fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
     let address: Option<AddrMatch> = opt_parse(p, "address")?;
     let disabled = opt_bool(p, "disabled")?;
     let comment = opt_text(p, "comment", 256)?;
-    let cfg = s.store_mut().candidate_mut();
+    let cfg = s.store().candidate();
     let pos = static_entry(cfg, id)?;
     let mut e = cfg
         .ip
@@ -979,12 +981,14 @@ fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
         .address_lists
         .iter()
         .any(|o| o.id != id && o.list == e.list && o.address == e.address)
+        || s.dynamic_addresses.find(&e.list, &e.address).is_some()
     {
         return Err(EngineError::bad(
             "address",
             format!("{} is already in list {}", e.address, e.list),
         ));
     }
+    let cfg = s.store_mut().candidate_mut();
     if let Some(slot) = cfg.ip.firewall.address_lists.get_mut(pos) {
         *slot = e;
     }

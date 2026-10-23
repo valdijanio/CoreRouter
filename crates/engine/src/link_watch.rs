@@ -5,7 +5,7 @@
 //! the native GUI's clock thread, once a second) and every `interface.list`.
 //! Operational state: never saved, gone after a restart.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_hal::LinkState;
 use corerouter_model::IfName;
@@ -63,8 +63,10 @@ impl LinkWatch {
                 None => {}
             }
         }
-        // Links gone from the platform are forgotten.
-        self.links.retain(|n, _| live.iter().any(|l| l.name == *n));
+        // Links gone from the platform are forgotten (a set: a scan of
+        // `live` per watched link was O(watched × live) every second).
+        let present: BTreeSet<&IfName> = live.iter().map(|l| &l.name).collect();
+        self.links.retain(|n, _| present.contains(n));
     }
 
     pub fn get(&self, name: &IfName) -> Option<&LinkTimes> {
