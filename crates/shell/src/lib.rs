@@ -24,6 +24,7 @@ mod shell;
 pub mod style;
 
 pub use complete::{Candidate, Completion};
+pub use export::{command_line, recreate};
 pub use registry::{Registry, path_text};
 pub use shell::{
     Job, MAX_SCRIPT, Reply, Request, SafeMode, Shell, Step, convert, script_line, script_lines,
