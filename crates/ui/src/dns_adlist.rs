@@ -310,9 +310,9 @@ impl AdlistPanel {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        _ => Act::Remove(sel),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        _ => Act::Remove(sel.into_vec()),
                     });
                 }
             }
@@ -320,7 +320,7 @@ impl AdlistPanel {
                 act = Some(if selection.is_empty() {
                     Act::ReloadAll
                 } else {
-                    Act::Reload(selection.clone())
+                    Act::Reload(selection.to_vec())
                 });
             }
             ui.separator();
@@ -398,10 +398,10 @@ impl AdlistPanel {
                 .filter(|r| sel.contains(&text(r, "id")))
                 .collect();
             act = match s {
-                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(sel)),
-                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(sel)),
-                Shortcut::Enable if can_enable(&picked, true).is_ok() => Some(Act::Enable(sel)),
-                Shortcut::Disable if can_enable(&picked, false).is_ok() => Some(Act::Disable(sel)),
+                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(sel.into_vec())),
+                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(sel.into_vec())),
+                Shortcut::Enable if can_enable(&picked, true).is_ok() => Some(Act::Enable(sel.into_vec())),
+                Shortcut::Disable if can_enable(&picked, false).is_ok() => Some(Act::Disable(sel.into_vec())),
                 _ => act,
             };
         }

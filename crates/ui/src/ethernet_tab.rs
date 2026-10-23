@@ -212,11 +212,7 @@ pub(crate) enum Cable {
 }
 
 fn amber(ui: &Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        Color32::from_rgb(240, 190, 80)
-    } else {
-        Color32::from_rgb(170, 110, 0)
-    }
+    crate::chip::AMBER.tone(ui.visuals()).ink
 }
 
 /// Colour of a DOM level: amber for warnings, red for alarms.

@@ -796,9 +796,9 @@ impl ZonesPanel {
                 if table::tool(ui, ZONE_TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        _ => Act::Remove(sel),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        _ => Act::Remove(sel.into_vec()),
                     });
                 }
             }
@@ -874,13 +874,13 @@ impl ZonesPanel {
         }
         if let Some(s) = out.shortcut {
             act = match s {
-                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(selection.clone())),
-                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(selection.clone())),
+                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(selection.to_vec())),
+                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(selection.to_vec())),
                 Shortcut::Enable if can_enable(&picked, true).is_ok() => {
-                    Some(Act::Enable(selection.clone()))
+                    Some(Act::Enable(selection.to_vec()))
                 }
                 Shortcut::Disable if can_enable(&picked, false).is_ok() => {
-                    Some(Act::Disable(selection.clone()))
+                    Some(Act::Disable(selection.to_vec()))
                 }
                 _ => act,
             };
@@ -993,9 +993,9 @@ impl ZonesPanel {
                 if table::tool(ui, RECORD_TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        _ => Act::Remove(sel),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        _ => Act::Remove(sel.into_vec()),
                     });
                 }
             }
@@ -1063,13 +1063,13 @@ impl ZonesPanel {
         }
         if let Some(s) = out.shortcut {
             act = match s {
-                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(selection.clone())),
-                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(selection.clone())),
+                Shortcut::Remove if some(&picked).is_ok() => Some(Act::Remove(selection.to_vec())),
+                Shortcut::Open if some(&picked).is_ok() => Some(Act::Open(selection.to_vec())),
                 Shortcut::Enable if can_enable(&picked, true).is_ok() => {
-                    Some(Act::Enable(selection.clone()))
+                    Some(Act::Enable(selection.to_vec()))
                 }
                 Shortcut::Disable if can_enable(&picked, false).is_ok() => {
-                    Some(Act::Disable(selection.clone()))
+                    Some(Act::Disable(selection.to_vec()))
                 }
                 _ => act,
             };

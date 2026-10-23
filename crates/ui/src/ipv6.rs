@@ -518,10 +518,10 @@ impl Ipv6Panel {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Remove => Act::Remove(sel),
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        Icon::Add | Icon::Comment => Act::Comment(sel),
+                        Icon::Remove => Act::Remove(sel.into_vec()),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        Icon::Add | Icon::Comment => Act::Comment(sel.into_vec()),
                     });
                 }
             }
@@ -531,14 +531,14 @@ impl Ipv6Panel {
                 "Renew",
                 can.and("ipv6.dhcp-client.renew", running(&picked)),
             ) {
-                act = Some(Act::Renew(selection.clone()));
+                act = Some(Act::Renew(selection.to_vec()));
             }
             if action(
                 ui,
                 "Release",
                 can.and("ipv6.dhcp-client.release", running(&picked)),
             ) {
-                act = Some(Act::Release(selection.clone()));
+                act = Some(Act::Release(selection.to_vec()));
             }
             table::find_field(ui, TABLE, &mut self.table);
         });
@@ -640,11 +640,11 @@ impl Ipv6Panel {
             };
             if allowed {
                 act = Some(match s {
-                    Shortcut::Remove => Act::Remove(sel),
-                    Shortcut::Enable => Act::Enable(sel),
-                    Shortcut::Disable => Act::Disable(sel),
-                    Shortcut::Comment => Act::Comment(sel),
-                    Shortcut::Open => Act::Open(sel),
+                    Shortcut::Remove => Act::Remove(sel.into_vec()),
+                    Shortcut::Enable => Act::Enable(sel.into_vec()),
+                    Shortcut::Disable => Act::Disable(sel.into_vec()),
+                    Shortcut::Comment => Act::Comment(sel.into_vec()),
+                    Shortcut::Open => Act::Open(sel.into_vec()),
                 });
             }
         }

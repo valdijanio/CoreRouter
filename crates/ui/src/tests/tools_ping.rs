@@ -102,7 +102,9 @@ fn ping_two_targets_chart_stats_export_and_mtu() {
     // The lossy target trips the 10 % loss alert, loopback does not.
     let lossy = &h.app.ping.ping.as_ref().unwrap().summary["targets"][1];
     if lossy["loss_pct"].as_f64().unwrap() > 10.0 {
-        assert!(h.has_text_containing("ALERT loss"));
+        // A red chip (docs/ui-style.md), the details in its tooltip.
+        assert!(h.has_text("alerta"));
+        assert!(!h.has_text_containing("ALERT"));
     }
     // Statistics come from the engine, not the UI.
     assert!(h.has_text_containing("Loss %"));

@@ -8,7 +8,7 @@
 //!
 //! A panel (`panel.rs`): its state lives here, not in `CoreRouterUi`.
 
-use egui::{Color32, Grid, RichText, TextEdit, Ui};
+use egui::{Grid, TextEdit, Ui};
 use serde_json::{Map, Value, json};
 
 use crate::backend::RequestId;
@@ -237,9 +237,10 @@ impl NtpPanel {
 
 fn status(ui: &mut Ui, s: &Value) {
     let state = text(s, "status");
-    let colour = match state.as_str() {
-        "synchronized" => Some(Color32::from_rgb(0x2e, 0x9e, 0x44)),
-        "waiting" => Some(Color32::from_rgb(0xc8, 0x8a, 0x00)),
+    // A state is a chip in the theme's tones (docs/ui-style.md).
+    let tone = match state.as_str() {
+        "synchronized" => Some(crate::chip::GREEN.tone(ui.visuals())),
+        "waiting" => Some(crate::chip::AMBER.tone(ui.visuals())),
         _ => None,
     };
     let ms = |k: &str| {
@@ -253,8 +254,8 @@ fn status(ui: &mut Ui, s: &Value) {
         .spacing([12.0, 4.0])
         .show(ui, |ui| {
             ui.label("Status");
-            match colour {
-                Some(c) => ui.label(RichText::new(&state).color(c).strong()),
+            match tone {
+                Some(t) => crate::chip::chip(ui, &state, t),
                 None => ui.label(&state),
             };
             ui.end_row();

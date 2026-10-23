@@ -36,9 +36,63 @@ fn save(file: &Export) -> Result<String, String> {
     let name = std::path::Path::new(&file.file_name)
         .file_name()
         .ok_or("no file name")?;
-    let path = dir().join(name);
-    std::fs::write(&path, &file.bytes).map_err(|e| e.to_string())?;
-    Ok(path.display().to_string())
+    save_in(&dir(), std::path::Path::new(name), &file.bytes)
+}
+
+/// Write `bytes` to a new file in `dir`: `name`, or `name-2`, `name-3`…
+/// when it is taken. Never replaces a file (the counter in "ping-1.csv"
+/// starts again with every run of the GUI).
+#[cfg(not(target_arch = "wasm32"))]
+fn save_in(dir: &std::path::Path, name: &std::path::Path, bytes: &[u8]) -> Result<String, String> {
+    use std::io::Write as _;
+    let stem = name
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("export");
+    let ext = name.extension().and_then(|s| s.to_str());
+    for n in 1..=1000u32 {
+        let file = match (n, ext) {
+            (1, _) => name.to_path_buf(),
+            (_, Some(e)) => format!("{stem}-{n}.{e}").into(),
+            (_, None) => format!("{stem}-{n}").into(),
+        };
+        let path = dir.join(file);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                f.write_all(bytes).map_err(|e| e.to_string())?;
+                return Ok(path.display().to_string());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Err(format!(
+        "{}: 1000 files of that name already",
+        name.display()
+    ))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_export_never_replaces_the_first() {
+        let dir = std::env::temp_dir().join(format!("cr-export-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let name = std::path::Path::new("ping-1.csv");
+        let a = save_in(&dir, name, b"first").unwrap();
+        let b = save_in(&dir, name, b"second").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(std::fs::read(&a).unwrap(), b"first");
+        assert_eq!(std::fs::read(&b).unwrap(), b"second");
+        assert!(b.ends_with("ping-1-2.csv"), "{b}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

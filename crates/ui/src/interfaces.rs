@@ -298,10 +298,10 @@ impl CoreRouterUi {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Remove => Act::Remove(sel),
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        Icon::Add | Icon::Comment => Act::Comment(sel),
+                        Icon::Remove => Act::Remove(sel.into_vec()),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        Icon::Add | Icon::Comment => Act::Comment(sel.into_vec()),
                     });
                 }
             }
@@ -347,11 +347,11 @@ impl CoreRouterUi {
             let sel = self.tables.interfaces.selection(&rows);
             if !sel.is_empty() {
                 act = Some(match s {
-                    Shortcut::Remove => Act::Remove(sel),
-                    Shortcut::Enable => Act::Enable(sel),
-                    Shortcut::Disable => Act::Disable(sel),
-                    Shortcut::Comment => Act::Comment(sel),
-                    Shortcut::Open => Act::Open(sel),
+                    Shortcut::Remove => Act::Remove(sel.into_vec()),
+                    Shortcut::Enable => Act::Enable(sel.into_vec()),
+                    Shortcut::Disable => Act::Disable(sel.into_vec()),
+                    Shortcut::Comment => Act::Comment(sel.into_vec()),
+                    Shortcut::Open => Act::Open(sel.into_vec()),
                 });
             }
         }

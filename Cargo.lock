@@ -1353,6 +1353,7 @@ dependencies = [
  "corerouter-model",
  "corerouter-proto-dns",
  "corerouter-shell",
+ "criterion",
  "egui",
  "egui_plot",
  "serde_json",

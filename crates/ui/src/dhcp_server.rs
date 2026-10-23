@@ -448,12 +448,9 @@ const HISTORY_COLUMNS: [table::Column; 8] = [
     col("State"),
 ];
 
-/// FNV-1a of a name, for its chip colour (docs/ui-style.md).
+/// A name's chip colour (docs/ui-style.md).
 fn hue_of(text: &str) -> usize {
-    let h = text.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
-        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
-    });
-    crate::chip::hashed(h)
+    crate::chip::name_hue(text)
 }
 
 fn history_row(r: &Value) -> Row {

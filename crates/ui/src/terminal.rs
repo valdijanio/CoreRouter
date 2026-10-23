@@ -35,6 +35,36 @@ pub(crate) const WRAP: &str = "\n\u{21b3} ";
 const MAX_OUTPUT: usize = 5000;
 /// Commands kept in a terminal's history.
 const MAX_HISTORY: usize = 500;
+/// Characters kept of one output line (a 1 MB value printed on one line);
+/// the rest is cut with "…".
+pub(crate) const MAX_LINE_CHARS: usize = 64 * 1024;
+
+/// One output line as displayed: its wrapped spans and how many rows.
+struct Wrapped {
+    spans: Vec<Span>,
+    rows: usize,
+}
+
+/// A line cut at [`MAX_LINE_CHARS`] with "…".
+fn capped(mut line: Line) -> Line {
+    let mut left = MAX_LINE_CHARS;
+    let mut keep = 0;
+    for s in &mut line.0 {
+        let n = s.text.chars().count();
+        if n <= left {
+            left -= n;
+            keep += 1;
+            continue;
+        }
+        let at = s.text.char_indices().nth(left).map_or(s.text.len(), |(b, _)| b);
+        s.text.truncate(at);
+        s.text.push('…');
+        keep += 1;
+        line.0.truncate(keep);
+        break;
+    }
+    line
+}
 
 /// A job waiting for its replies.
 struct Running {
@@ -51,6 +81,11 @@ pub(crate) struct TermWin {
     pub(crate) id: u64,
     pub(crate) shell: Shell,
     pub(crate) output: Vec<Line>,
+    /// `output` as wrapped for display at `wrap_cols` columns, one entry per
+    /// line from the first: a frame wraps only the lines printed since the
+    /// last one, not all 5000.
+    wrap: Vec<Wrapped>,
+    wrap_cols: usize,
     pub(crate) input: String,
     history: Vec<String>,
     /// Position while walking the history with ↑/↓.
@@ -85,6 +120,8 @@ impl TermWin {
             id,
             shell: Shell::new(user),
             output: Vec::new(),
+            wrap: Vec::new(),
+            wrap_cols: 0,
             input: String::new(),
             history: Vec::new(),
             browse: None,
@@ -103,12 +140,34 @@ impl TermWin {
         self.running.is_some()
     }
 
-    fn print(&mut self, lines: impl IntoIterator<Item = Line>) {
-        self.output.extend(lines);
+    pub(crate) fn print(&mut self, lines: impl IntoIterator<Item = Line>) {
+        self.output.extend(lines.into_iter().map(capped));
         if self.output.len() > MAX_OUTPUT {
             let extra = self.output.len() - MAX_OUTPUT;
             self.output.drain(..extra);
+            self.wrap.drain(..extra.min(self.wrap.len()));
         }
+    }
+
+    fn clear_output(&mut self) {
+        self.output.clear();
+        self.wrap.clear();
+    }
+
+    /// Wrap what was printed since the last frame (all of it again when
+    /// the width changed).
+    fn sync_wrap(&mut self, cols: usize) {
+        if cols != self.wrap_cols {
+            self.wrap.clear();
+            self.wrap_cols = cols;
+        }
+        let done = self.wrap.len();
+        let new = self.output.get(done..).unwrap_or_default();
+        self.wrap.extend(new.iter().map(|l| {
+            let spans = wrapped(&l.0, cols);
+            let rows = 1 + spans.iter().map(|s| s.text.matches('\n').count()).sum::<usize>();
+            Wrapped { spans, rows }
+        }));
     }
 
     fn remember(&mut self, line: &str) {
@@ -542,6 +601,7 @@ impl CoreRouterUi {
         let cols = ((ui.available_width() - 16.0) / glyph).floor().max(20.0) as usize;
         if let Some(t) = self.terminals.get_mut(idx) {
             t.shell.set_width(Some(cols));
+            t.sync_wrap(cols);
         }
         let Some(t) = self.terminals.get(idx) else {
             return;
@@ -647,8 +707,18 @@ impl CoreRouterUi {
             .stick_to_bottom(true)
             .show(ui, |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                for line in &t.output {
-                    let job = job_of(ui, &wrapped(&line.0, cols), &font);
+                // Only the lines in view are laid out; the others just take
+                // their height (every row of the monospace font is as tall).
+                let row_h = ui.fonts_mut(|f| f.row_height(&font));
+                let clip = ui.clip_rect();
+                for line in &t.wrap {
+                    let h = row_h * line.rows as f32;
+                    let top = ui.cursor().min.y;
+                    if top > clip.bottom() || top + h < clip.top() {
+                        ui.add_space(h);
+                        continue;
+                    }
+                    let job = job_of(ui, &line.spans, &font);
                     let r = ui.add(egui::Label::new(job).selectable(true).extend());
                     r.context_menu(|ui| {
                         if ui.button("Copy All").clicked() {
@@ -736,7 +806,7 @@ impl CoreRouterUi {
             t.browse = None;
         }
         if clear {
-            t.output.clear();
+            t.clear_output();
         }
         if copy {
             let all: String = t.output.iter().map(|l| l.text() + "\n").collect();

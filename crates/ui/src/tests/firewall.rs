@@ -82,7 +82,7 @@ fn rules_sections_and_colours_are_listed() {
     let h = Harness::firewall();
     assert!(h.has_text("Router"), "section title");
     assert!(h.has_text("keep"), "comment");
-    assert!(h.has_text("![LAN]"), "interface list");
+    assert!(h.has_text("!LAN"), "interface list (a chip)");
     let dark = h.ctx.global_style().visuals.dark_mode;
     assert_eq!(
         Some(h.text_color("drop")),
@@ -236,4 +236,13 @@ fn address_lists_and_interface_lists_tabs() {
     h.idle();
     h.idle();
     assert!(h.has_text("ether2"));
+}
+
+#[test]
+fn interface_lists_are_chips_not_brackets() {
+    let h = Harness::firewall();
+    // docs/ui-style.md: a list name is a chip coloured by its name.
+    assert!(h.has_text("!LAN"), "the negated list as a chip");
+    assert!(!h.has_text_containing("[LAN]"));
+    assert!(!h.has_text_containing("![LAN]"));
 }

@@ -417,10 +417,10 @@ impl BondPanel {
                 if table::tool(ui, TABLE, icon, tip, enabled).clicked() {
                     let sel = selection.clone();
                     act = Some(match icon {
-                        Icon::Remove => Act::Remove(sel),
-                        Icon::Enable => Act::Enable(sel),
-                        Icon::Disable => Act::Disable(sel),
-                        Icon::Add | Icon::Comment => Act::Open(sel),
+                        Icon::Remove => Act::Remove(sel.into_vec()),
+                        Icon::Enable => Act::Enable(sel.into_vec()),
+                        Icon::Disable => Act::Disable(sel.into_vec()),
+                        Icon::Add | Icon::Comment => Act::Open(sel.into_vec()),
                     });
                 }
             }
@@ -506,10 +506,10 @@ impl BondPanel {
             };
             if allowed {
                 act = Some(match s {
-                    Shortcut::Remove => Act::Remove(sel),
-                    Shortcut::Enable => Act::Enable(sel),
-                    Shortcut::Disable => Act::Disable(sel),
-                    Shortcut::Comment | Shortcut::Open => Act::Open(sel),
+                    Shortcut::Remove => Act::Remove(sel.into_vec()),
+                    Shortcut::Enable => Act::Enable(sel.into_vec()),
+                    Shortcut::Disable => Act::Disable(sel.into_vec()),
+                    Shortcut::Comment | Shortcut::Open => Act::Open(sel.into_vec()),
                 });
             }
         }
