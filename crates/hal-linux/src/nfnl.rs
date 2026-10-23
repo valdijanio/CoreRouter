@@ -606,7 +606,7 @@ mod tests {
         while at < bytes.len() {
             let len = u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             let kind = u16::from_ne_bytes(bytes[at + 4..at + 6].try_into().unwrap());
-            assert!(len >= 20 && len <= 65_535 + 20, "message of {len} bytes");
+            assert!((20..=65_535 + 20).contains(&len), "message of {len} bytes");
             kinds.push(kind);
             at += len.div_ceil(4) * 4;
         }
