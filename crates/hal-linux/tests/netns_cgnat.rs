@@ -653,3 +653,57 @@ fn blocks_mode_holds_the_first_packet_until_a_block_is_given() {
     );
     hal.lock().unwrap().apply(&c2, &Config::default()).unwrap();
 }
+
+/// Port exhaustion (RFC 6888 REQ-3, REQ-11): a subscriber with 64 ports
+/// that opens 80 flows to the same server gets at most 64 through, every
+/// one inside its own slot — it never borrows a neighbour's port — and the
+/// kernel counts the refused ones (what the engine's alerts read).
+#[test]
+fn a_subscriber_out_of_ports_never_borrows_another_s() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab();
+    let p = pool(64);
+    let c = cfg(p.clone(), vec![]);
+    let mut hal = LinuxHal::new();
+    hal.apply(&Config::default(), &c).unwrap();
+    let before = hal.connection_stats().unwrap();
+    let server = lab
+        .net
+        .within(|| UdpSocket::bind("192.0.2.2:7600").unwrap());
+    server
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    // 80 sockets, each its own flow (another local port).
+    let sockets: Vec<UdpSocket> = lab.subs.within(|| {
+        (0..80)
+            .map(|_| {
+                let s = UdpSocket::bind("100.64.0.1:0").unwrap();
+                s.send_to(b"x", "192.0.2.2:7600").unwrap();
+                s
+            })
+            .collect()
+    });
+    let mut seen = std::collections::BTreeSet::new();
+    let mut buf = [0u8; 8];
+    while let Ok((_, from)) = server.recv_from(&mut buf) {
+        seen.insert(from);
+    }
+    let slot = layout_of(&p)
+        .forward("100.64.0.1".parse().unwrap())
+        .unwrap();
+    assert!(!seen.is_empty() && seen.len() <= 64, "{} flows through", seen.len());
+    for from in &seen {
+        let SocketAddr::V4(v4) = from else { panic!() };
+        assert!(slot.contains(*v4.ip(), v4.port()), "{from} outside the slot {slot:?}");
+    }
+    let after = hal.connection_stats().unwrap();
+    let refused = (after.insert_failed + after.drop).saturating_sub(before.insert_failed + before.drop);
+    eprintln!("{} of 80 flows through, {refused} refused by the kernel", seen.len());
+    assert_eq!(seen.len(), 64, "the whole slot, no more");
+    assert!(refused > 0, "the kernel counted the refused flows");
+    drop(sockets);
+    hal.apply(&c, &Config::default()).unwrap();
+}
