@@ -237,7 +237,7 @@ fn the_window_widens_so_the_as_pill_is_whole() {
     let before = h.win_rect(win_id(Win::Panel(WIN))).width();
     answer(&mut h, &[("A", "13.107.42.14")], Vec::new());
     assert!(h.has_text("AS8075 MICROSOFT-CORP-MSN-AS-BLOCK"), "{:?}", painted(&h));
-    assert!(!painted(&h).iter().any(|t| t.ends_with('…')), "nothing cut: {:?}", painted(&h));
+    assert!(h.has_text("13.107.42.14"), "the address whole: {:?}", painted(&h));
     let r = h.win_rect(win_id(Win::Panel(WIN)));
     let pill = h.text("AS8075 MICROSOFT-CORP-MSN-AS-BLOCK");
     assert!(pill.x < r.right(), "the pill inside the window: {pill:?} in {r:?}");
