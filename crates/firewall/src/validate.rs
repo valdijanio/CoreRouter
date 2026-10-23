@@ -136,6 +136,24 @@ fn clean_text(s: &str) -> bool {
 /// Problems with rule `r` of `table` in `cfg`, as (field, message). The
 /// rule may or may not be in `cfg` yet (the commands check before adding).
 pub fn rule_issues(cfg: &Config, table: Table, r: &FirewallRule) -> Vec<(&'static str, String)> {
+    // The table as it would be with `r` (replacing the rule with its id).
+    let rules = cfg.ip.firewall.rules(table);
+    let with_r = rules
+        .iter()
+        .filter(|o| o.id != r.id)
+        .chain(std::iter::once(r));
+    let edges = graph::edges(with_r);
+    let roots = graph::roots_in(table, &edges, r.chain.as_str());
+    issues_in(cfg, table, r, &roots)
+}
+
+/// [`rule_issues`] with the built-in chains that reach `r`'s chain known.
+fn issues_in(
+    cfg: &Config,
+    table: Table,
+    r: &FirewallRule,
+    roots: &BTreeSet<&str>,
+) -> Vec<(&'static str, String)> {
     let mut out = Vec::new();
     if r.comment.chars().count() > MAX_COMMENT {
         out.push(("comment", format!("at most {MAX_COMMENT} characters")));
@@ -157,12 +175,8 @@ pub fn rule_issues(cfg: &Config, table: Table, r: &FirewallRule) -> Vec<(&'stati
     }
 
     // Where the rule runs: its chain, or the built-in chains jumping to it.
-    let rules = cfg.ip.firewall.rules(table);
-    let mut with_r: Vec<FirewallRule> = rules.iter().filter(|o| o.id != r.id).cloned().collect();
-    with_r.push(r.clone());
     let chain = r.chain.as_str();
     let builtin = graph::is_builtin(table, chain);
-    let roots = graph::roots(table, &with_r, chain);
     if !builtin
         && table
             .builtin_chains()
@@ -328,6 +342,10 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
             ));
         }
         let mut ids = BTreeSet::new();
+        // Jumps and the roots of each chain once per table: O(N log N)
+        // for the table instead of a copy and a graph per rule (audit-net).
+        let edges = graph::edges(rules);
+        let mut roots: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for r in rules {
             if !ids.insert(r.id) {
                 out.push(Issue::new(
@@ -335,8 +353,12 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
                     "duplicate rule id",
                 ));
             }
+            let chain = r.chain.as_str();
+            let reach = roots
+                .entry(chain)
+                .or_insert_with(|| graph::roots_in(table, &edges, chain));
             out.extend(
-                rule_issues(cfg, table, r)
+                issues_in(cfg, table, r, reach)
                     .into_iter()
                     .map(|(f, m)| Issue::new(format!("ip.firewall.{table}[{}].{f}", r.id), m)),
             );

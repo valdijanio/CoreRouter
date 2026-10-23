@@ -12,7 +12,7 @@
 //! address wins", and compacting it is writing one line per live record —
 //! Kea's memfile and its LFC.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::Ipv4Addr;
 
 use serde::{Deserialize, Serialize};
@@ -106,14 +106,26 @@ pub struct Lease {
         with = "hexopt"
     )]
     pub relay_info: Option<Vec<u8>>,
+    /// `htype` + `chaddr` of a client that is not Ethernet (`htype` 1,
+    /// `hlen` 6): its identity without a client id (RFC 2131 §4.2). `None`
+    /// for Ethernet (`[1] + mac`) and in lines written before it existed.
+    #[serde(
+        rename = "hw",
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "hexopt"
+    )]
+    pub hw: Option<Vec<u8>>,
 }
 
 impl Lease {
-    /// RFC 2131 §4.2: the client id, else `htype` 1 + the MAC.
+    /// RFC 2131 §4.2: the client id, else `htype` + `chaddr` (1 + the MAC
+    /// for Ethernet).
     pub fn client_key(&self) -> Vec<u8> {
-        match &self.client_id {
-            Some(id) => id.clone(),
-            None => {
+        match (&self.client_id, &self.hw) {
+            (Some(id), _) => id.clone(),
+            (None, Some(hw)) => hw.clone(),
+            (None, None) => {
                 let mut k = Vec::with_capacity(7);
                 k.push(1);
                 k.extend_from_slice(&self.mac);
@@ -196,12 +208,32 @@ pub enum Record {
 /// plus history; hostile file).
 pub const MAX_RECORDS: usize = 1 << 21;
 
+/// The last `cap` of `lines` (all of them when there are fewer), in order.
+pub fn newest<'a>(lines: impl Iterator<Item = &'a str>, cap: usize) -> VecDeque<&'a str> {
+    let mut keep: VecDeque<&'a str> = VecDeque::new();
+    for line in lines {
+        if keep.len() >= cap {
+            keep.pop_front();
+        }
+        if cap > 0 {
+            keep.push_back(line);
+        }
+    }
+    keep
+}
+
 /// The table.
 #[derive(Debug, Default, Clone)]
 pub struct Leases {
     by_addr: HashMap<Ipv4Addr, Lease>,
     /// Client key → its addresses (on any server).
     by_client: HashMap<Vec<u8>, Vec<Ipv4Addr>>,
+    /// The free records (released, expired) by (end, address): the one
+    /// idle the longest is the first (a full pool reuses it without
+    /// walking the table).
+    free: BTreeSet<(u64, u32)>,
+    /// MAC → its addresses (`client_mac_limit` counts them per DISCOVER).
+    by_mac: HashMap<[u8; 6], Vec<Ipv4Addr>>,
 }
 
 impl Leases {
@@ -231,19 +263,49 @@ impl Leases {
             .filter(move |l| l.server == server)
     }
 
+    /// The records of hardware address `mac` (any client id, any server).
+    pub fn of_mac(&self, mac: [u8; 6]) -> impl Iterator<Item = &Lease> {
+        self.by_mac
+            .get(&mac)
+            .into_iter()
+            .flatten()
+            .filter_map(|ip| self.by_addr.get(ip))
+    }
+
+    /// The free records, the one idle the longest first.
+    pub fn free_oldest_first(&self) -> impl Iterator<Item = &Lease> {
+        self.free
+            .iter()
+            .filter_map(|(_, ip)| self.by_addr.get(&Ipv4Addr::from(*ip)))
+    }
+
     /// Insert or replace the record of `l.address`.
     pub fn put(&mut self, l: Lease) {
         let ip = l.address;
         let key = l.client_key();
         if let Some(old) = self.by_addr.get(&ip) {
             let old_key = old.client_key();
+            let (old_mac, old_free) = (old.mac, old.state.free().then_some(old.expires));
             if old_key != key {
                 self.unindex(&old_key, ip);
+            }
+            if old_mac != l.mac {
+                self.unindex_mac(old_mac, ip);
+            }
+            if let Some(e) = old_free {
+                self.free.remove(&(e, u32::from(ip)));
             }
         }
         let list = self.by_client.entry(key).or_default();
         if !list.contains(&ip) {
             list.push(ip);
+        }
+        let macs = self.by_mac.entry(l.mac).or_default();
+        if !macs.contains(&ip) {
+            macs.push(ip);
+        }
+        if l.state.free() {
+            self.free.insert((l.expires, u32::from(ip)));
         }
         self.by_addr.insert(ip, l);
     }
@@ -257,9 +319,22 @@ impl Leases {
         }
     }
 
+    fn unindex_mac(&mut self, mac: [u8; 6], ip: Ipv4Addr) {
+        if let Some(list) = self.by_mac.get_mut(&mac) {
+            list.retain(|a| *a != ip);
+            if list.is_empty() {
+                self.by_mac.remove(&mac);
+            }
+        }
+    }
+
     pub fn remove(&mut self, ip: Ipv4Addr) -> Option<Lease> {
         let l = self.by_addr.remove(&ip)?;
         self.unindex(&l.client_key(), ip);
+        self.unindex_mac(l.mac, ip);
+        if l.state.free() {
+            self.free.remove(&(l.expires, u32::from(ip)));
+        }
         Some(l)
     }
 
@@ -272,10 +347,19 @@ impl Leases {
 
     /// Apply journal lines: the last line of each address wins. Lines that
     /// do not parse are skipped and counted (a torn last line after a
-    /// crash, a hostile file).
+    /// crash, a hostile file). Past [`MAX_RECORDS`] lines only the newest
+    /// are read (the last line wins: the oldest are the ones to lose).
     pub fn replay<'a>(&mut self, lines: impl Iterator<Item = &'a str>) -> usize {
+        self.replay_capped(lines, MAX_RECORDS)
+    }
+
+    pub(crate) fn replay_capped<'a>(
+        &mut self,
+        lines: impl Iterator<Item = &'a str>,
+        cap: usize,
+    ) -> usize {
         let mut bad = 0;
-        for line in lines.take(MAX_RECORDS) {
+        for line in newest(lines, cap) {
             let line = line.trim();
             if line.is_empty() {
                 continue;
@@ -330,6 +414,7 @@ mod tests {
             last_seen: 400,
             reason: String::new(),
             relay_info: None,
+            hw: None,
         }
     }
 

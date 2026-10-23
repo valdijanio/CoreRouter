@@ -304,8 +304,10 @@ pub fn parse(bytes: &[u8]) -> Result<Request, Bad> {
             },
             50 => r.requested = Some(ip()?),
             54 => r.server_id = Some(ip()?),
-            // RFC 2132 §9.14: at least 2 bytes.
-            61 if d.len() >= 2 => r.client_id = Some(d.clone()),
+            // RFC 2132 §9.14: at least 2 bytes; one option holds at most
+            // 255 (a longer RFC 3396 concatenation would not survive the
+            // journal, which keeps what the wire allows for one option).
+            61 if (2..=255).contains(&d.len()) => r.client_id = Some(d.clone()),
             61 => return Err(Bad::Option(61)),
             12 if !d.is_empty() => r.host_name = Some(text(d)).filter(|h| !h.is_empty()),
             81 => r.fqdn = fqdn(d),
@@ -317,6 +319,8 @@ pub fn parse(bytes: &[u8]) -> Result<Request, Bad> {
                 }
             }
             60 if !d.is_empty() => r.vendor_class = Some(d.clone()),
+            // RFC 3046 §2.0: one option, at most 255 bytes.
+            82 if d.len() > 255 => return Err(Bad::Option(82)),
             82 if !d.is_empty() => r.relay_info = Some(d.clone()),
             _ => {}
         }

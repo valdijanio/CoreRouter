@@ -29,7 +29,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add DHCP Server",
         ["IP", "DHCP Server"],
         None,
-        "{name?: string (default dhcpN), interface: string, address_pool?: string (a pool; static-only or empty: only static leases, the default), lease_time?: duration (30m default; 1m..=365d; seconds or 1h30m), authoritative?: yes | no | after-2sec-delay | after-10sec-delay (default yes: NAK requests for addresses it cannot give), conflict_detection?: bool (default yes: ARP probe before offering, ~0.5 s; an address that answers is held as conflict), always_broadcast?: bool, server_address?: ipv4 (empty: the interface's address in the client's network), relay?: ipv4 (serve only requests relayed by this agent; empty: clients on the link), dhcp_option_set?: string, address_lists?: [string] | string (firewall lists each bound address joins), client_mac_limit?: u32 (leases one MAC may hold; 0 or empty: unlimited), client_rate_limit?: u32 (messages a second per client, default 10; 0: no limit), disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{name?: string (default dhcpN), interface: string, address_pool?: string (a pool; static-only or empty: only static leases, the default), lease_time?: duration (30m default; 1m..=365d; seconds or 1h30m), authoritative?: yes | no | after-2sec-delay | after-10sec-delay (default yes: NAK requests for addresses it cannot give), conflict_detection?: bool (default yes: ARP probe before offering, ~0.5 s; an address that answers is held as conflict), always_broadcast?: bool, server_address?: ipv4 (empty: the interface's address in the client's network), relay?: ipv4 (serve only requests relayed by this agent; empty: clients on the link), dhcp_option_set?: string, address_lists?: [string] | string (firewall lists each bound address joins), client_mac_limit?: u32 (leases one MAC may hold; 0 or empty: unlimited), client_rate_limit?: u32 (messages a second per client, default 10; 0: no limit), relay_info_trusted?: bool (believe option 82 in requests without a relay, giaddr 0: a layer-2 agent such as an OLT adds it; default no: a client's own option 82 is ignored), disabled?: bool, comment?: string} → {id, name, warnings}",
         always,
         add
     ),
@@ -38,7 +38,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set DHCP Server",
         [],
         None,
-        "{id: *hex | name, name?: string, interface?: string, address_pool?: string (a pool; static-only or empty: only static leases, the default), lease_time?: duration (30m default; 1m..=365d; seconds or 1h30m), authoritative?: yes | no | after-2sec-delay | after-10sec-delay (default yes: NAK requests for addresses it cannot give), conflict_detection?: bool (default yes: ARP probe before offering, ~0.5 s; an address that answers is held as conflict), always_broadcast?: bool, server_address?: ipv4 (empty: the interface's address in the client's network), relay?: ipv4 (serve only requests relayed by this agent; empty: clients on the link), dhcp_option_set?: string, address_lists?: [string] | string (firewall lists each bound address joins), client_mac_limit?: u32 (leases one MAC may hold; 0 or empty: unlimited), client_rate_limit?: u32 (messages a second per client, default 10; 0: no limit), disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{id: *hex | name, name?: string, interface?: string, address_pool?: string (a pool; static-only or empty: only static leases, the default), lease_time?: duration (30m default; 1m..=365d; seconds or 1h30m), authoritative?: yes | no | after-2sec-delay | after-10sec-delay (default yes: NAK requests for addresses it cannot give), conflict_detection?: bool (default yes: ARP probe before offering, ~0.5 s; an address that answers is held as conflict), always_broadcast?: bool, server_address?: ipv4 (empty: the interface's address in the client's network), relay?: ipv4 (serve only requests relayed by this agent; empty: clients on the link), dhcp_option_set?: string, address_lists?: [string] | string (firewall lists each bound address joins), client_mac_limit?: u32 (leases one MAC may hold; 0 or empty: unlimited), client_rate_limit?: u32 (messages a second per client, default 10; 0: no limit), relay_info_trusted?: bool (believe option 82 in requests without a relay, giaddr 0: a layer-2 agent such as an OLT adds it; default no: a client's own option 82 is ignored), disabled?: bool, comment?: string} → {id, name, warnings}",
         has_servers,
         set
     ),
@@ -52,7 +52,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.dhcp-server.print", "DHCP Server", ["IP", "DHCP Server"], None,
-        "{} → [{id, name, interface, address_pool (static-only when none), lease_time, lease_time_secs, authoritative, conflict_detection, always_broadcast, server_address?, relay?, dhcp_option_set?, address_lists, client_mac_limit?, client_rate_limit, disabled, comment?, status (running | disabled | invalid | starting | error), listening?, error?, bound (leases bound now), checks: [{label, level (ok | warn | error), text}]}]",
+        "{} → [{id, name, interface, address_pool (static-only when none), lease_time, lease_time_secs, authoritative, conflict_detection, always_broadcast, server_address?, relay?, dhcp_option_set?, address_lists, client_mac_limit?, client_rate_limit, relay_info_trusted, disabled, comment?, status (running | disabled | invalid | starting | error), listening?, error?, bound (leases bound now), checks: [{label, level (ok | warn | error), text}]}]",
         always, print),
 ];
 
@@ -256,6 +256,9 @@ fn apply(d: &mut DhcpServer, p: &Value) -> Result<()> {
     if let Some(n) = opt_u32(p, "client_rate_limit")? {
         d.client_rate_limit = n;
     }
+    if let Some(b) = opt_bool(p, "relay_info_trusted")? {
+        d.relay_info_trusted = b;
+    }
     if let Some(b) = opt_bool(p, "disabled")? {
         d.disabled = b;
     }
@@ -396,6 +399,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
                 "always_broadcast": d.always_broadcast,
                 "address_lists": d.address_lists.iter().map(Name::as_str).collect::<Vec<_>>(),
                 "client_rate_limit": d.client_rate_limit,
+                "relay_info_trusted": d.relay_info_trusted,
                 "disabled": d.disabled,
                 "status": status,
                 "bound": bound,

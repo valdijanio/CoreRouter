@@ -140,6 +140,10 @@ pub enum Learned {
 pub enum DynamicChange<'a> {
     Add(&'a DynamicAddress),
     Remove(&'a DynamicAddress),
+    /// Their timeout ran out: the data plane's own timer already dropped
+    /// them (the kernel set has the same timeout), so a backend only
+    /// forgets them; all of one tick in one call.
+    Expired(&'a [DynamicAddress]),
 }
 
 pub trait Hal: Send {

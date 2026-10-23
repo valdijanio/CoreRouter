@@ -692,10 +692,15 @@ fn rebuilt_links(
     old_addrs: &BTreeSet<(IfName, IpNet)>,
     new_addrs: &BTreeSet<(IfName, IpNet)>,
 ) -> BTreeSet<IfName> {
-    let has_v4 = |set: &BTreeSet<(IfName, IpNet)>, link: &IfName| {
+    // Links with an IPv4 address, once per set (a scan of every address
+    // per interface was O(links × addresses)).
+    let v4_links = |set: &'_ BTreeSet<(IfName, IpNet)>| -> BTreeSet<IfName> {
         set.iter()
-            .any(|(l, a)| l == link && matches!(a, IpNet::V4(_)))
+            .filter(|(_, a)| matches!(a, IpNet::V4(_)))
+            .map(|(l, _)| l.clone())
+            .collect()
     };
+    let (had_v4, has_v4) = (v4_links(old_addrs), v4_links(new_addrs));
     let mut out: BTreeSet<IfName> = doomed.iter().chain(remastered).cloned().collect();
     out.extend(fresh.iter().map(|n| (*n).clone()));
     // Linux disables IPv4 on a link that loses its last IPv4 address,
@@ -703,7 +708,7 @@ fn rebuilt_links(
     out.extend(
         from.interfaces
             .keys()
-            .filter(|l| has_v4(old_addrs, l) && !has_v4(new_addrs, l))
+            .filter(|l| had_v4.contains(*l) && !has_v4.contains(*l))
             .cloned(),
     );
     out

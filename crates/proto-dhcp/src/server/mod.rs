@@ -70,6 +70,9 @@ pub const KEEP_FREE_SECS: u64 = 7 * 86_400;
 pub const ALERT_PROBE_SECS: u64 = 60;
 /// Offers waiting for a probe at once (a DISCOVER flood is bounded here).
 pub const MAX_PARKED: usize = 4096;
+/// A full pool is logged at most this often (a random-MAC flood on a full
+/// pool would write one warning per DISCOVER).
+pub const FULL_LOG_SECS: u64 = 60;
 /// Clients the rate limiter remembers (random-MAC floods are bounded).
 pub const MAX_CLIENTS_TRACKED: usize = 65_536;
 /// An address whose probe came back clean is offered again without a
@@ -215,6 +218,7 @@ impl PoolUse {
     }
 }
 
+#[derive(Clone)]
 pub struct Server {
     plan: Plan,
     leases: Leases,
@@ -241,6 +245,8 @@ pub struct Server {
     agent: Option<Vec<u8>>,
     /// Last DISCOVER sent per alert interface (Unix time).
     alert_probe: HashMap<IfName, u64>,
+    /// When "pool is full" was last logged, per (server, pool).
+    full_logged: HashMap<(String, String), u64>,
 }
 
 fn mac_text(m: &[u8; 6]) -> String {
@@ -291,6 +297,7 @@ impl Server {
             last_tick: 0,
             agent: None,
             alert_probe: HashMap::new(),
+            full_logged: HashMap::new(),
         }
     }
 
@@ -389,7 +396,7 @@ impl Server {
             self.observe(now, iface, heard, &mut out);
             return out;
         }
-        let req = match request::parse(&heard.payload) {
+        let mut req = match request::parse(&heard.payload) {
             Ok(r) => r,
             // A reply to a relay (ours, G4.2b): not for the server.
             Err(Bad::Reply) => return out,
@@ -421,6 +428,26 @@ impl Server {
         };
         if !self.allow(&srv, req.mac(), now.ms) {
             self.stats.drop(Drop::RateLimited);
+            return out;
+        }
+        // RFC 3046 §2.1, §5: option 82 is the relay agent's; one that came
+        // without a relay (giaddr 0) is the client's own unless an L2 agent
+        // on this link is trusted to add it. Believed, it would pick another
+        // subscriber's static lease and write their circuit in the history.
+        if req.giaddr.is_unspecified() && !srv.relay_info_trusted && req.relay_info.is_some() {
+            req.relay_info = None;
+            req.options.retain(|(c, _)| *c != 82);
+        }
+        // RELEASE and DECLINE end a lease: on the server's own link, only
+        // from the client's own Ethernet address and port (RFC 2131 has no
+        // authentication, but a neighbour need not end someone else's).
+        if matches!(req.kind, Kind::Release | Kind::Decline)
+            && req.giaddr.is_unspecified()
+            && srv.relay.is_none()
+            && (*iface != srv.interface
+                || (req.htype == 1 && req.hlen == 6 && heard.src_mac != req.mac()))
+        {
+            self.stats.drop(Drop::Unexpected);
             return out;
         }
         self.set_agent(&srv.name, &req);
@@ -619,18 +646,19 @@ impl Server {
                     return Some(ip);
                 }
                 None => {
-                    if skip.is_empty() {
-                        self.exhausted.insert(name.clone(), self.generation);
-                    }
+                    // Even with `skip`: what it holds was probed and now
+                    // has a record (a conflict), so it is not never-used
+                    // either. Without this an attacker answering every ARP
+                    // probe made each answer rescan the whole pool.
+                    self.exhausted.insert(name.clone(), self.generation);
                 }
             }
         }
-        // Reuse: the free record idle the longest.
+        // Reuse: the free record idle the longest (kept in that order).
         self.leases
-            .iter()
-            .filter(|l| l.state.free() && !skip.contains(&l.address))
-            .filter(|l| self.free_for(srv, Some(chain), l.address, key, mac))
-            .min_by_key(|l| (l.expires, u32::from(l.address)))
+            .free_oldest_first()
+            .filter(|l| !skip.contains(&l.address))
+            .find(|l| self.free_for(srv, Some(chain), l.address, key, mac))
             .map(|l| l.address)
     }
 
@@ -707,16 +735,13 @@ impl Server {
         }
         if let Some(limit) = srv.client_mac_limit
             && !is_static
+            // Not Ethernet: no MAC to count by.
+            && mac != [0; 6]
         {
             let others = self
                 .leases
-                .iter()
-                .filter(|l| {
-                    l.server == srv.name
-                        && l.mac == mac
-                        && l.state.active()
-                        && l.client_key() != key
-                })
+                .of_mac(mac)
+                .filter(|l| l.server == srv.name && l.state.active() && l.client_key() != key)
                 .count();
             let has = self
                 .leases
@@ -730,15 +755,22 @@ impl Server {
         let tried = tried.unwrap_or_default();
         let Some((ip, probe)) = self.choose(srv, &req, chain.as_deref(), &tried, now) else {
             self.stats.drop(Drop::PoolExhausted);
-            out.push(Effect::Log {
-                level: Level::Warning,
-                text: format!(
-                    "{}: no free address for {} (pool {} is full)",
-                    srv.name,
-                    mac_text(&mac),
-                    chain.as_deref().unwrap_or("static-only")
-                ),
-            });
+            let pool = chain.as_deref().unwrap_or("static-only").to_owned();
+            let at = self
+                .full_logged
+                .entry((srv.name.clone(), pool.clone()))
+                .or_insert(0);
+            if *at == 0 || now.unix >= at.saturating_add(FULL_LOG_SECS) {
+                *at = now.unix;
+                out.push(Effect::Log {
+                    level: Level::Warning,
+                    text: format!(
+                        "{}: no free address for {} (pool {pool} is full; more are counted as pool-exhausted)",
+                        srv.name,
+                        mac_text(&mac),
+                    ),
+                });
+            }
             return;
         };
         let recently_ok = self
@@ -816,7 +848,11 @@ impl Server {
             lease_time,
             last_seen: now.unix,
             reason: String::new(),
-            relay_info: req.relay_info.clone(),
+            // The request's option 82, else the one the client's lease kept
+            // (a renewal comes straight, without it): `set_agent`.
+            relay_info: self.agent.clone(),
+            hw: (!(req.htype == 1 && req.hlen == 6) && req.client_id.is_none())
+                .then(|| req.client_key()),
         }
     }
 
@@ -1262,22 +1298,8 @@ impl Server {
         }
         self.leases.put(rec.clone());
         out.push(Effect::Journal(Record::Lease(rec.clone())));
-        // DNS: the static lease's name wins over the client's.
-        let net = self.plan.network_of(ip);
-        let label = st
-            .as_ref()
-            .map(|s| s.cfg.host_name.clone())
-            .filter(|h| !h.is_empty())
-            .unwrap_or_else(|| dns_label(&rec.host_name));
         let no_update = req.fqdn.as_ref().is_some_and(|f| f.flags & FQDN_N != 0);
-        let dns = net
-            .and_then(|n| n.cfg.dns_zone.clone())
-            .filter(|_| !label.is_empty() && !no_update)
-            .map(|z| (z, dns_label(&label)));
-        let mut lists = srv.address_lists.clone();
-        if let Some(s) = &st {
-            lists.extend(s.cfg.address_lists.iter().map(|n| n.as_str().to_owned()));
-        }
+        let (dns, lists) = self.outside(srv, st.as_ref(), ip, &rec.host_name, no_update);
         if !renewed {
             out.push(Effect::Log {
                 level: Level::Info,
@@ -1311,6 +1333,56 @@ impl Server {
             st.as_ref(),
             out,
         );
+    }
+
+    /// What a binding of `ip` means outside the server: its DNS name
+    /// (zone, label) and its address lists. The static lease's name wins
+    /// over the client's.
+    fn outside(
+        &self,
+        srv: &ServerPlan,
+        st: Option<&StaticPlan>,
+        ip: Ipv4Addr,
+        host_name: &str,
+        no_update: bool,
+    ) -> (Option<(String, String)>, Vec<String>) {
+        let label = st
+            .map(|s| s.cfg.host_name.clone())
+            .filter(|h| !h.is_empty())
+            .unwrap_or_else(|| dns_label(host_name));
+        let dns = self
+            .plan
+            .network_of(ip)
+            .and_then(|n| n.cfg.dns_zone.clone())
+            .filter(|_| !label.is_empty() && !no_update)
+            .map(|z| (z, dns_label(&label)));
+        let mut lists = srv.address_lists.clone();
+        if let Some(s) = st {
+            lists.extend(s.cfg.address_lists.iter().map(|n| n.as_str().to_owned()));
+        }
+        (dns, lists)
+    }
+
+    /// The binding a bound record stands for (after a restart: its DNS
+    /// name and address lists are put back from it). `None` when the
+    /// record is not bound or its server is gone.
+    pub fn binding_of(&self, l: &Lease) -> Option<Binding> {
+        if l.state != State::Bound {
+            return None;
+        }
+        let srv = self.server(&l.server)?;
+        let st = self
+            .plan
+            .static_for(&srv.name, &l.client_key(), l.mac, l.relay_info.as_deref())
+            .filter(|s| s.cfg.address == l.address);
+        let (dns, address_lists) = self.outside(srv, st, l.address, &l.host_name, false);
+        Some(Binding {
+            lease: l.clone(),
+            new: false,
+            dns,
+            ttl: dns_ttl(l.lease_time),
+            address_lists,
+        })
     }
 
     fn decline(&mut self, now: Now, srv: &ServerPlan, req: &Request, out: &mut Vec<Effect>) {
@@ -1441,6 +1513,17 @@ impl Server {
         let Some(srv) = self.server(&p.server).cloned() else {
             return out;
         };
+        if p.req.htype == 1 && p.req.hlen == 6 && mac == p.req.mac() {
+            // The client itself still holds the address (RFC 5227 hosts
+            // answer for theirs): not a conflict, offer it now.
+            self.probed_ok.insert(p.ip, now.ms);
+            self.set_agent(&srv.name, &p.req);
+            let key = p.req.client_key();
+            if self.free_for(&srv, p.matcher_pool.as_deref(), p.ip, &key, mac) {
+                self.offer(now, &p.interface, &srv, &p.req, p.ip, &mut out);
+            }
+            return out;
+        }
         self.stats.conflicts = self.stats.conflicts.saturating_add(1);
         self.set_agent(&srv.name, &p.req);
         let mut rec = self.record_for(

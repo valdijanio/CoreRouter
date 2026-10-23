@@ -13,9 +13,10 @@
 //! Only table `inet corerouter` is ever named: rules of other owners
 //! (Docker, libvirt, the distribution's firewall) are not read or touched.
 
-use std::io::Write as _;
+use std::io::{Read, Write as _};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use corerouter_hal::HalError;
 use corerouter_model::firewall::{AddrMatch, DynamicAddress, Family, Name};
@@ -53,12 +54,22 @@ fn first_lines(s: &str) -> String {
     text.chars().take(600).collect()
 }
 
-/// Run `nft -f -` with `script` as one transaction.
-pub fn run(script: &str) -> Result<(), HalError> {
-    let mut child = Command::new(nft_bin())
-        .args(["-f", "-"])
+/// How long one `nft` may take before it is killed: a 65 536-entry
+/// ruleset loads in about a second (**estimado**); a kernel netlink stall
+/// must not hold the commit, and the engine with it, forever.
+pub const DEADLINE: Duration = Duration::from_secs(30);
+
+/// Run `cmd` with `input` on its stdin, collecting stdout and stderr,
+/// killing it after `deadline`. The pipes are served by their own threads,
+/// so a child that neither reads nor exits cannot block us either.
+pub(crate) fn run_bounded(
+    mut cmd: Command,
+    input: Vec<u8>,
+    deadline: Duration,
+) -> Result<Output, HalError> {
+    let mut child = cmd
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| {
@@ -66,14 +77,64 @@ pub fn run(script: &str) -> Result<(), HalError> {
                 "cannot run nft ({e}); install nftables or set COREROUTER_NFT"
             ))
         })?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(script.as_bytes())
-            .map_err(|e| HalError::Io(format!("nft stdin: {e}")))?;
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            // A child that exits early closes the pipe: EPIPE, not our error.
+            let _ = stdin.write_all(&input);
+        })
+    });
+    let reader = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut p) = pipe {
+                let _ = p.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let stdout = reader(
+        child
+            .stdout
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let stderr = reader(
+        child
+            .stderr
+            .take()
+            .map(|p| Box::new(p) as Box<dyn Read + Send>),
+    );
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if start.elapsed() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(HalError::Io(format!(
+                    "nft did not finish in {} s and was killed (nothing changed)",
+                    deadline.as_secs()
+                )));
+            }
+            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
+            Err(e) => return Err(HalError::Io(format!("nft: {e}"))),
+        }
+    };
+    if let Some(w) = writer {
+        let _ = w.join();
     }
-    let out = child
-        .wait_with_output()
-        .map_err(|e| HalError::Io(format!("nft: {e}")))?;
+    Ok(Output {
+        status,
+        stdout: stdout.join().unwrap_or_default(),
+        stderr: stderr.join().unwrap_or_default(),
+    })
+}
+
+/// Run `nft -f -` with `script` as one transaction.
+pub fn run(script: &str) -> Result<(), HalError> {
+    let mut cmd = Command::new(nft_bin());
+    cmd.args(["-f", "-"]);
+    let out = run_bounded(cmd, script.as_bytes().to_vec(), DEADLINE)?;
     if out.status.success() {
         Ok(())
     } else {
@@ -86,11 +147,9 @@ pub fn run(script: &str) -> Result<(), HalError> {
 
 /// `nft -j list table inet corerouter`, or `None` if the table is absent.
 pub fn list_json() -> Option<Value> {
-    let out = Command::new(nft_bin())
-        .args(["-j", "list", "table", "inet", TABLE])
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(nft_bin());
+    cmd.args(["-j", "list", "table", "inet", TABLE]);
+    let out = run_bounded(cmd, Vec::new(), DEADLINE).ok()?;
     if !out.status.success() {
         return None;
     }
@@ -200,4 +259,32 @@ pub fn remove_dynamic(d: &DynamicAddress) -> Result<(), HalError> {
         "delete element inet {TABLE} {set} {{ {} }}\n",
         d.address
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stuck `nft` (here `sleep`, which never reads its stdin either) is
+    /// killed at the deadline instead of holding the commit forever.
+    #[test]
+    fn a_hung_nft_is_killed_at_the_deadline() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let start = Instant::now();
+        let err = run_bounded(cmd, vec![b'x'; 1 << 20], Duration::from_millis(200)).unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            start.elapsed()
+        );
+        assert!(err.to_string().contains("killed"), "{err}");
+    }
+
+    #[test]
+    fn output_and_status_are_collected() {
+        let out = run_bounded(Command::new("cat"), b"table inet x\n".to_vec(), DEADLINE).unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout, b"table inet x\n");
+    }
 }

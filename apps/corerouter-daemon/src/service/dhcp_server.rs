@@ -1,6 +1,6 @@
 //! The DHCPv4 server (G4.2a) as a service: one loop that runs the
 //! engine's server round (`Session::dhcp_server_poll`) every few
-//! milliseconds — at once again while messages keep coming (a storm after
+//! milliseconds — [`STORM`] apart while messages keep coming (a storm after
 //! a power cut), 5 ms apart when the link is quiet — under the supervisor
 //! (heartbeat, the sockets it listens on, its errors). From its first run
 //! the session clock stops driving the server, so `system.service.stop
@@ -18,6 +18,12 @@ use corerouter_model::service::Listen;
 
 /// Rest between rounds when nothing was heard.
 const QUIET: Duration = Duration::from_millis(5);
+/// Rest between rounds in a storm. Never zero: the session lock is a
+/// plain mutex (not fair), and a loop that takes it again at once starves
+/// the control channel, the GUI and the other services — the operator
+/// could not log in to stop the storm. Each round is bounded too (the
+/// engine's `ROUND_BUDGET_US`).
+const STORM: Duration = Duration::from_millis(1);
 /// Rest while idle (no server configured).
 const IDLE: Duration = Duration::from_millis(500);
 
@@ -93,14 +99,26 @@ fn run(session: &Shared, health: &super::Health) {
         } else {
             health.error(errors.join("; "));
         }
-        // A storm: straight into the next round.
-        rest = if heard { Duration::ZERO } else { QUIET };
+        rest = rest_after(heard);
     }
+}
+
+/// How long to rest after a round that heard something (`heard`) or not.
+fn rest_after(heard: bool) -> Duration {
+    if heard { STORM } else { QUIET }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Between two rounds the lock is always let go for a while, storm or
+    /// not (others get their turn).
+    #[test]
+    fn the_loop_always_rests() {
+        assert!(rest_after(true) >= Duration::from_millis(1));
+        assert!(rest_after(false) >= rest_after(true));
+    }
     use corerouter_control::Shutdown;
     use corerouter_engine::{Session, shared};
     use serde_json::json;

@@ -335,8 +335,7 @@ mod linux {
             let ops = crate::plan::plan(from, to)?;
             // nftables first (a refusal changes nothing), and only when the
             // firewall changed: a host without nftables still runs the rest.
-            let firewall =
-                corerouter_firewall::render(from, &[]) != corerouter_firewall::render(to, &[]);
+            let firewall = corerouter_firewall::nft::changed(from, to);
             if firewall {
                 let dynamic = crate::nft::dynamic();
                 crate::nft::run(&corerouter_firewall::script(to, &dynamic))?;
@@ -519,6 +518,10 @@ mod linux {
             match change {
                 DynamicChange::Add(d) => crate::nft::add_dynamic(d),
                 DynamicChange::Remove(d) => crate::nft::remove_dynamic(d),
+                // The set's own timeout already removed them from the
+                // kernel: nothing to run (it was one `nft` process per
+                // entry, under the session lock).
+                DynamicChange::Expired(_) => Ok(()),
             }
         }
 

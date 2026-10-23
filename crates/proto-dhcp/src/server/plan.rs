@@ -78,6 +78,8 @@ pub struct ServerPlan {
     pub address_lists: Vec<String>,
     pub client_mac_limit: Option<u32>,
     pub client_rate_limit: u32,
+    /// Option 82 without a relay (`giaddr` 0) is believed (an L2 agent).
+    pub relay_info_trusted: bool,
 }
 
 impl ServerPlan {
@@ -201,6 +203,42 @@ pub struct Plan {
     pub chains: HashMap<String, Vec<(String, Vec<PoolRange>)>>,
     /// The router's addresses (never handed out, whatever the pools say).
     pub router: Vec<Ipv4Addr>,
+    /// Positions in `statics` by what they are matched with: every message
+    /// looks a client's static lease up 3 or 4 times, and an ISP has tens
+    /// of thousands (a linear scan was ~2 ms a DORA at 65,536, **medido**).
+    index: StaticIndex,
+}
+
+/// Positions in [`Plan::statics`], in config order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct StaticIndex {
+    by_client_id: HashMap<Vec<u8>, Vec<usize>>,
+    /// By MAC, the ones without a client id.
+    by_mac: HashMap<[u8; 6], Vec<usize>>,
+    /// By circuit id, the ones with neither client id nor MAC.
+    by_circuit: HashMap<Vec<u8>, Vec<usize>>,
+    /// By remote id, the ones with only a remote id.
+    by_remote: HashMap<Vec<u8>, Vec<usize>>,
+    by_address: HashMap<Ipv4Addr, Vec<usize>>,
+}
+
+impl StaticIndex {
+    fn of(statics: &[StaticPlan]) -> Self {
+        let mut ix = Self::default();
+        for (i, s) in statics.iter().enumerate() {
+            ix.by_address.entry(s.cfg.address).or_default().push(i);
+            if let Some(id) = &s.client_id {
+                ix.by_client_id.entry(id.clone()).or_default().push(i);
+            } else if let Some(m) = s.cfg.mac_address {
+                ix.by_mac.entry(m.0).or_default().push(i);
+            } else if let Some(c) = &s.circuit {
+                ix.by_circuit.entry(c.clone()).or_default().push(i);
+            } else if let Some(r) = &s.remote {
+                ix.by_remote.entry(r.clone()).or_default().push(i);
+            }
+        }
+        ix
+    }
 }
 
 fn options_of(
@@ -258,6 +296,7 @@ impl Plan {
                     .collect(),
                 client_mac_limit: s.client_mac_limit,
                 client_rate_limit: s.client_rate_limit,
+                relay_info_trusted: s.relay_info_trusted,
             })
             .collect();
         // Option 6 when the network names none: the router itself when its
@@ -297,7 +336,7 @@ impl Plan {
                 }
             })
             .collect();
-        let statics = d
+        let statics: Vec<StaticPlan> = d
             .leases
             .iter()
             .filter(|l| !l.disabled)
@@ -366,12 +405,13 @@ impl Plan {
         Self {
             servers,
             networks,
-            statics,
             matchers,
             alerts,
+            index: StaticIndex::of(&statics),
             pools: cfg.ip.pools.clone(),
             chains,
             router: mine.iter().map(|(a, _)| a.addr()).collect(),
+            statics,
         }
     }
 
@@ -425,22 +465,48 @@ impl Plan {
         mac: [u8; 6],
         agent: Option<&[u8]>,
     ) -> Option<&StaticPlan> {
+        let ix = &self.index;
+        let hit = |i: &usize| {
+            self.statics
+                .get(*i)
+                .filter(|s| s.matches(server, key, mac, agent))
+        };
         // A client-id match beats a MAC match (the more specific identity).
-        self.statics
-            .iter()
-            .find(|s| s.client_id.is_some() && s.matches(server, key, mac, agent))
-            .or_else(|| {
-                self.statics
-                    .iter()
-                    .find(|s| s.matches(server, key, mac, agent))
-            })
+        if let Some(s) = ix.by_client_id.get(key).into_iter().flatten().find_map(hit) {
+            return Some(s);
+        }
+        // Else the first in config order of those it may be.
+        let circuit =
+            agent.and_then(|a| crate::server::agent::get(a, crate::server::agent::CIRCUIT_ID));
+        let remote =
+            agent.and_then(|a| crate::server::agent::get(a, crate::server::agent::REMOTE_ID));
+        let mut cands: Vec<usize> = Vec::new();
+        cands.extend(ix.by_mac.get(&mac).into_iter().flatten());
+        cands.extend(
+            circuit
+                .and_then(|c| ix.by_circuit.get(c))
+                .into_iter()
+                .flatten(),
+        );
+        cands.extend(
+            remote
+                .and_then(|r| ix.by_remote.get(r))
+                .into_iter()
+                .flatten(),
+        );
+        cands.sort_unstable();
+        cands.iter().find_map(hit)
     }
 
     /// The static lease of `ip` on `server`, whoever it is for.
     pub fn static_of(&self, server: &str, ip: Ipv4Addr) -> Option<&StaticPlan> {
-        self.statics
-            .iter()
-            .find(|s| s.cfg.address == ip && s.cfg.server.as_deref().is_none_or(|x| x == server))
+        self.index
+            .by_address
+            .get(&ip)
+            .into_iter()
+            .flatten()
+            .filter_map(|i| self.statics.get(*i))
+            .find(|s| s.cfg.server.as_deref().is_none_or(|x| x == server))
     }
 
     pub fn alert_on(&self, iface: &IfName) -> Option<&AlertPlan> {

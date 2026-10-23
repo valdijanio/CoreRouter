@@ -36,6 +36,13 @@ pub struct DhcpRelay {
     /// Remote id to send instead of the client's MAC.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub relay_info_remote_id: String,
+    /// Relay requests that already carry option 82 although no relay set
+    /// `giaddr` (a layer-2 agent on this interface added it). Off (the
+    /// default), they are dropped: a client's own option 82 could claim
+    /// another subscriber's circuit (RFC 3046 §2.1; Cisco's
+    /// `ip dhcp relay information trusted`, off by default).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub relay_info_trusted: bool,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -52,6 +59,7 @@ impl DhcpRelay {
             local_address: None,
             add_relay_info: false,
             relay_info_remote_id: String::new(),
+            relay_info_trusted: false,
             disabled: false,
             comment: String::new(),
         }

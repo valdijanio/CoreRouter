@@ -10,7 +10,7 @@
 //! are no-ops with no undo, so applying twice is harmless.
 
 use std::fmt::Write as _;
-use std::net::{IpAddr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use corerouter_hal::{Features, HalError, Learned, NO_VRF};
 use corerouter_model::{BondMode, HashPolicy, IfName, LacpRate};
@@ -28,8 +28,8 @@ use rtnetlink::packet_route::route::{
     RouteAddress, RouteAttribute, RouteMessage, RouteProtocol, RouteScope,
 };
 use rtnetlink::{
-    Handle, LinkBond, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec, LinkVlan, LinkVrf,
-    RouteMessageBuilder,
+    AddressMessageBuilder, Handle, LinkBond, LinkBridge, LinkDummy, LinkMessageBuilder, LinkUnspec,
+    LinkVlan, LinkVrf, RouteMessageBuilder,
 };
 
 use crate::owner::KernelLink;
@@ -937,19 +937,19 @@ impl Kernel {
         let Some(l) = self.find(link).await? else {
             return Ok(vec![]);
         };
-        let found: Vec<AddressMessage> = self
-            .handle
-            .address()
-            .get()
-            .set_link_index_filter(l.index)
-            .set_address_filter(addr.addr())
-            .set_prefix_length_filter(addr.prefix_len())
-            .execute()
-            .try_collect()
-            .await
-            .map_err(|e| format!("listing addresses of '{link}': {}", readable(&e)))?;
-        let Some(msg) = found.into_iter().next() else {
-            return Ok(vec![]);
+        // RTM_DELADDR with the address itself: the kernel finds it by
+        // (link, local address, prefix length) and answers EADDRNOTAVAIL if
+        // it is not there. (Looking it up first was a full RTM_GETADDR dump
+        // filtered in userspace, per address: O(n²) to remove n.)
+        let msg = match addr.addr() {
+            IpAddr::V4(a) => AddressMessageBuilder::<Ipv4Addr>::new()
+                .index(l.index)
+                .address(a, addr.prefix_len())
+                .build(),
+            IpAddr::V6(a) => AddressMessageBuilder::<Ipv6Addr>::new()
+                .index(l.index)
+                .address(a, addr.prefix_len())
+                .build(),
         };
         match self.handle.address().del(msg).execute().await {
             Ok(()) => Ok(vec![Op::AddAddress {
