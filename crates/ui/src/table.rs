@@ -191,6 +191,11 @@ pub(crate) struct TableOutput {
     /// A row was dragged and dropped (tables with [`TableState::reorder`]):
     /// (dragged key, key of the row it lands above; `None` = after the last).
     pub dropped: Option<(String, Option<String>)>,
+    /// The chip under the pointer: (row key, column, chip index), and
+    /// whether it was clicked this frame (G0.25: the subscriber chip shows
+    /// its sources and opens its item).
+    pub chip: Option<(String, usize, usize)>,
+    pub chip_clicked: bool,
 }
 
 /// UI-local state of one table: selection, Shift anchor, find text, and
@@ -679,6 +684,13 @@ pub(crate) fn show(
                     None => resp,
                 };
 
+                if resp.hovered()
+                    && !row.section
+                    && let Some((col, n)) = chip_under_pointer(ui, rect, &layout, columns, row, &font)
+                {
+                    out.chip = Some((row.key.clone(), col, n));
+                    out.chip_clicked = resp.clicked();
+                }
                 if state.open.contains(&row.key) && open_mark(ui, salt, &row.key, rect, selected) {
                     out.opened = Some(row.key.clone());
                 }
@@ -1084,6 +1096,45 @@ fn cut_under_pointer(
         tip.push('…');
     }
     Some(tip)
+}
+
+/// The chip under the pointer in a row: (column, chip index). Chips follow
+/// the text of a left-aligned cell, as `paint_cells` draws them.
+fn chip_under_pointer(
+    ui: &Ui,
+    rect: Rect,
+    layout: &[(usize, f32)],
+    columns: &[Column],
+    row: &Row,
+    font: &egui::FontId,
+) -> Option<(usize, usize)> {
+    let p = ui.input(|i| i.pointer.latest_pos())?;
+    let mut left = rect.left();
+    let (col, cell_left) = layout.iter().find_map(|&(i, w)| {
+        let at = left;
+        left += w;
+        (p.x >= at && p.x < at + w).then_some((i, at))
+    })?;
+    if columns.get(col).is_some_and(|c| c.right) {
+        return None;
+    }
+    let shown = shown_text(row.cells.get(col)?);
+    let (text, chips) = crate::chip::split(&shown);
+    let size = crate::chip::cell_size(font);
+    let mut x = cell_left
+        + CELL_PAD
+        + ui.painter()
+            .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
+            .size()
+            .x;
+    for (n, (_, label)) in chips.iter().enumerate() {
+        let w = crate::chip::cell_chip_width(ui.painter(), label, size);
+        if p.x >= x && p.x < x + w {
+            return Some((col, n));
+        }
+        x += w;
+    }
+    None
 }
 
 fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {

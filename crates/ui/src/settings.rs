@@ -1,5 +1,6 @@
 //! Settings › Settings (G0.15): preferences of this GUI, not of the router.
-//! For now the two languages: the labels' and the explanations'. They are
+//! The two languages (the labels' and the explanations') and the
+//! subscriber chip (G0.25, `identity.rs`). They are
 //! stored with the theme (`prefs.rs`), on this computer or in this
 //! browser, so nothing here sends a command.
 //!
@@ -26,7 +27,7 @@ pub(crate) const PANEL: Panel = Panel {
         id: WIN,
         group: "Settings",
         title: "Settings",
-        size: [420.0, 200.0],
+        size: [460.0, 420.0],
         escape: false,
     }],
     new: || Box::new(SettingsPanel::default()),
@@ -72,6 +73,8 @@ impl PanelState for SettingsPanel {
                     ui.end_row();
                 }
             });
+        ui.add_space(8.0);
+        crate::identity::settings_ui(app, ui);
         ui.add_space(4.0);
         ui.weak(tr(l, "Stored on this computer, not on the router."));
     }
