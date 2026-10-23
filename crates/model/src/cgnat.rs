@@ -23,6 +23,7 @@ use std::fmt;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
 
+pub use corerouter_cgnat_map::Geometry;
 use ipnet::Ipv4Net;
 use serde::{Deserialize, Serialize};
 
@@ -524,9 +525,8 @@ impl Line {
 pub struct Layout {
     inside: Line,
     outside: Line,
-    first_port: u16,
-    ports: u16,
-    per_address: u32,
+    /// The port arithmetic, shared with the XDP fast path (G2.5b).
+    geometry: Geometry,
 }
 
 impl Layout {
@@ -579,9 +579,11 @@ impl Layout {
         Ok(Self {
             inside,
             outside,
-            first_port: port_range.first,
-            ports,
-            per_address,
+            geometry: Geometry {
+                first_port: port_range.first,
+                ports,
+                per_address,
+            },
         })
     }
 
@@ -595,22 +597,27 @@ impl Layout {
 
     /// Blocks (subscribers, in deterministic mode) on each public address.
     pub fn per_address(&self) -> u32 {
-        self.per_address
+        self.geometry.per_address
     }
 
     pub fn capacity(&self) -> u64 {
-        self.outside.len * u64::from(self.per_address)
+        self.outside.len * u64::from(self.geometry.per_address)
     }
 
     pub fn ports(&self) -> u16 {
-        self.ports
+        self.geometry.ports
+    }
+
+    /// The port arithmetic alone (what the XDP fast path runs).
+    pub fn geometry(&self) -> Geometry {
+        self.geometry
     }
 
     /// Public addresses the subscribers actually use.
     pub fn public_used(&self) -> u64 {
         self.inside
             .len
-            .div_ceil(u64::from(self.per_address))
+            .div_ceil(u64::from(self.geometry.per_address))
             .min(self.outside.len)
     }
 
@@ -625,16 +632,12 @@ impl Layout {
 
     /// Block `block` of public address number `address`.
     pub fn block(&self, address: u64, block: u32) -> Option<Slot> {
-        if block >= self.per_address {
-            return None;
-        }
+        let (first_port, last_port) = self.geometry.ports_of(block)?;
         let public = self.outside.at(address)?;
-        let first = u32::from(self.first_port) + block * u32::from(self.ports);
-        let last = first + u32::from(self.ports) - 1;
         Some(Slot {
             public,
-            first_port: u16::try_from(first).ok()?,
-            last_port: u16::try_from(last).ok()?,
+            first_port,
+            last_port,
         })
     }
 
@@ -643,8 +646,8 @@ impl Layout {
         if index >= self.inside.len {
             return None;
         }
-        let per = u64::from(self.per_address);
-        self.block(index / per, u32::try_from(index % per).ok()?)
+        let (address, block) = self.geometry.split(index)?;
+        self.block(address, block)
     }
 
     /// Deterministic forward mapping: the subscriber's public address and
@@ -656,17 +659,14 @@ impl Layout {
     /// The (address number, block number) holding `port` on `public`.
     pub fn locate(&self, public: Ipv4Addr, port: u16) -> Option<(u64, u32)> {
         let address = self.outside.index(public)?;
-        let off = u32::from(port).checked_sub(u32::from(self.first_port))?;
-        let block = off / u32::from(self.ports);
-        (block < self.per_address).then_some((address, block))
+        Some((address, self.geometry.block_of(port)?))
     }
 
     /// Deterministic reverse mapping (RFC 7422 §2: "who was"): the
     /// subscriber that owns `port` on `public`, if any.
     pub fn reverse(&self, public: Ipv4Addr, port: u16) -> Option<Ipv4Addr> {
         let (address, block) = self.locate(public, port)?;
-        let index = address * u64::from(self.per_address) + u64::from(block);
-        self.subscriber(index)
+        self.subscriber(self.geometry.join(address, block)?)
     }
 
     /// Every subscriber with its slot, in index order.
