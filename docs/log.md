@@ -2399,3 +2399,259 @@ continuação indentadas).
   mais marcado até a branch mudar. O conflito é com o vizinho, não com a `main`: quando o vizinho
   entra, ele pode mesclar limpo. O #144 ficou parado assim (2026-10-23). Agora ele volta na rodada
   seguinte; só o conflito com a própria `main` e o CI vermelho seguem marcando o PR.
+
+- 2026-10-23 — G0.23a: Menu lateral da GUI, parte 1: árvore com subgrupos e ícones.
+
+  - **Subgrupos**: IP › DHCP (Client, Pool, Relay, Server, Statistics), IP › DNS (Settings,
+    Adlist, Cache, Forwarders, Static, Statistics, TSIG Keys, Zones…) e IPv6 › DHCP (Client,
+    Pool, Server). Itens únicos ficam soltos (Addresses, Firewall, Neighbors, Routes, VRF). Dentro
+    do subgrupo o rótulo é curto ("Static"); o título da janela continua "DNS Static". O nome "IP"
+    continua (RouterOS/WinBox; DNS, DHCP Server e Firewall servem às duas famílias).
+  - **Grupos principais em negrito com ícone**; subgrupo recolhido mostra a contagem num selo; o
+    menu lembra o que está aberto (preferência da GUI, chave `menu` do `prefs`).
+  - **Ícone em todo item** (Phosphor Icons, MIT): subconjunto de 50 ícones embutido
+    (`crates/ui/assets/phosphor/`, 16,0 KB, **medido**), cortado por `scripts/icons-subset.sh`; o
+    `egui-phosphor` 0.14 pede egui 0.36 e o workspace está no 0.37 (decisão em
+    `docs/architecture.md`).
+  - **Item selecionado mostra ⓘ**: o modal da G0.15 com o que a janela faz (idioma das
+    explicações, `i18n/menu_pt.rs`/`menu_en.rs`), o caminho no RouterOS (`/ip dns static`) e os
+    comandos do roteador para ela (do `engine.list`).
+  - **Áreas sem comandos** (MPLS, CGNAT, OSPF): apagadas, com cadeado e o selo `soon`; a dica diz a
+    gap.
+  - Tabela central `crates/ui/src/menu.rs` (`CATALOG`, por chave da janela): subgrupo, rótulo,
+    ícone, caminho, comandos e sinônimos; nenhum painel foi editado. Teste: toda janela tem
+    entrada, ícone com glifo na fonte, explicação em EN e PT, sinônimos e comandos que existem.
+
+  Como testar: `cargo run -p corerouter-gui -- --control 7979`, abra IP › DNS, clique em Static e
+  no ⓘ. Testes: `cargo test -p corerouter-ui menu` (árvore, abre/fecha e lembra, ⓘ, cadeado).
+
+- 2026-10-23 — G0.23b: Menu lateral da GUI, parte 2: busca rápida e teclado.
+
+  - **Campo "Search menu…"** no topo do menu: acha a janela pelo nome (EN ou PT), pelo lugar no
+    menu (`IP DNS Static`), pelo **caminho do RouterOS** (`/ip dns static`) e por **sinônimos** da
+    tabela central (nat, masquerade, rota padrão, lease, blacklist, ipv4…), sem diferença de
+    maiúsculas e acentos. Cada resultado mostra onde fica (`IP › DNS`). Enter abre o primeiro (ou
+    o escolhido com as setas) e mostra a janela na árvore; Esc limpa e não fecha a janela de baixo.
+  - **Ctrl+K abre a paleta**: a mesma busca, mais os **comandos** do roteador (do `engine.list`,
+    por id ou caminho: `ip dns static add`). Num comando, Enter abre um terminal com ele digitado
+    (`/ip dns static add `), esperando os parâmetros. Com a busca vazia, mostra as **recentes**
+    (e os favoritos).
+  - **Favoritos**: botão direito num item, "Add to favorites"; ficam no topo do menu.
+  - **Teclado**: `/` (nada com foco) vai para a busca; com o campo vazio, as setas andam pela árvore
+    (direita abre o grupo, esquerda fecha ou sobe), Enter abre a janela; o item selecionado mostra
+    o ⓘ.
+  - Recentes e favoritos são preferências da GUI (chave `menu` do `prefs`); chaves desconhecidas ou
+    repetidas guardadas são descartadas.
+
+  Como testar: `cargo run -p corerouter-gui -- --control 7979`, digite `nat` no campo do menu ou
+  aperte Ctrl+K e `ip dns static add`. Testes: `cargo test -p corerouter-ui menu` (busca por nome,
+  sinônimo e caminho; `/` e Enter; paleta com recentes e comando no terminal; setas na árvore;
+  favoritos lembrados; Esc).
+
+- 2026-10-23 — G0.23c: Menu lateral da GUI, parte 3: abas e selos de estado.
+
+  - **Abas em vez de itens do menu**: DNS Zone Records e DNS Zone File viraram as abas **Records** e
+    **Zone File** da janela DNS Zones (os botões da barra abrem a aba da zona escolhida; Esc não
+    fecha a janela na aba do arquivo, que pode estar sendo editado). DHCP Statistics virou a aba
+    **Statistics** da janela DHCP Server, ao lado de History (o botão Statistics da barra saiu).
+    IP › DNS passa de 10 para 8 itens e IP › DHCP de 5 para 4.
+  - **DNS Statistics continua janela própria**: é outro painel (`dns_statistics.rs`), um monitor
+    que se deixa aberto ao lado do DNS Settings, e a janela DNS já é um formulário, não uma janela
+    com abas. Pode virar aba quando a janela DNS for redesenhada.
+  - **Selos de estado no menu** (`crates/ui/src/menu_badges.rs`, um painel sem janela): a cada
+    5 s pergunta `system.service.print`, `ip.dhcp-server.statistics.print` e `config.drift.list`
+    (só os que o roteador tem) e o menu mostra `1 failed` em vermelho em System › Services,
+    `2 conflict` em âmbar em IP › DHCP › Server e `drift 1` em âmbar em System › History
+    (tooltip com o que divergiu e `/config drift reconcile`). Grupo ou subgrupo fechado mostra o
+    selo dos seus itens. Nada é decidido na UI: os estados vêm do engine.
+  - Ícones: saíram os de Zone File e Zone Records; o subconjunto Phosphor volta a 50 ícones, 16,0 KB
+    (**medido**).
+
+  Como testar: `cargo test -p corerouter-ui` (`tests::menu::state_badges_come_from_the_existing_queries`,
+  `tests::dns_zones`, `tests::dhcp_server`). Manual: IP › DNS › Zones e as abas; IP › DHCP ›
+  Server › Statistics.
+
+- 2026-10-23 — G1.26d: System › Tuning, parte 4 (Boot): parâmetros da linha de comando do kernel **da imagem** (não há
+  GRUB; a imagem é imutável e A/B), valendo no próximo boot.
+
+  - **Parâmetros**:
+    - `isolcpus` e `nohz_full` (listas de CPU, a CPU 0 fica com o sistema);
+    - `intel_idle.max_cstate` e `processor.max_cstate`;
+    - `pcie_aspm=off`;
+    - `iommu=pt`;
+    - `mitigations`: `off` exige `confirm=yes` e aparece com o selo vermelho "security risk".
+  - **Onde ficam**: `system.tuning.boot`, validados no model. Nada de espaço, aspas ou `=`, porque o
+    valor vai direto para a linha de comando.
+  - **Comandos**: `system.tuning.boot.print|parameter.print|set|unset`, com a linha em uso
+    (`/proc/cmdline`, `Hal::boot_cmdline`) e a do próximo boot.
+  - **Recomendação**:
+    - C-state 1 e ASPM desligado na baixa latência;
+    - `iommu=pt` no alto desempenho e na baixa latência;
+    - isolamento e `mitigations` nunca, com a explicação.
+  - **Janela**: aba Boot com as duas linhas, o selo "next boot" nos pendentes, o ⓘ em EN/PT e a
+    confirmação do risco.
+  - **Imagem A/B**: ainda não existe (G1.6). Os parâmetros ficam gravados na config e a aplicação na
+    imagem é a G1.26h.
+
+  Como testar: Virtual lab › System › Tuning › Boot. No terminal:
+
+  - `/system tuning boot set key=isolcpus value=2-7`;
+  - `/system tuning boot set key=mitigations value=off confirm=yes`.
+
+  Testes:
+
+  - validação no model: lista de CPU, CPU 0, CPU inexistente, injeção na linha de comando, inteiro e
+    opção;
+  - `cmdline` e `parse_cmdline` de ida e volta;
+  - comandos: pendente até o reboot, confirmação, recusas, `rollback`;
+  - explicações EN/PT;
+  - headless (salvar para o próximo boot, `mitigations` só com a caixa marcada).
+
+  Screenshots claro e escuro conferidos.
+
+- 2026-10-23 — G1.27a: IP › Routes, parte 1 (leitura e diagnóstico). `ip.route.list` traz por rota `state`
+  (`active`/`standby`/`inactive`), `origin` (`connected`/`static`/`dhcp`/`ra`), o gateway separado
+  (`gateway_address`, `gateway_interface`, `interface`, `gateway_status`), `check_gateway` das rotas de
+  lease, `ecmp`, o motivo (`reason` + `reason_id` + `reason_args`, lista em `route_table::REASONS`) e
+  `changed_secs` (o daemon olha a cada segundo; acima de 4096 rotas, a cada 10 s); filtros `family`,
+  `state`, `origin`; as flags do RouterOS continuam para o terminal (`+` no ECMP). Motivos novos:
+  interface sem link (carrier), "perde para a distância N (rota X via Y)", "check-gateway=arp falhou há
+  N s". Rotas de mesma distância formam ECMP (como no RouterOS v7; antes o validador recusava) e viram
+  uma rota multipath no kernel (`RTA_MULTIPATH`, só com caminhos do CoreRouter). `ip.route.lookup
+  {address, table?, src?}` (o `ip route get`): local, maior prefixo entre as ativas, ECMP, tabela pela
+  VRF da origem, IP de origem; compara com o plano de dados (`Hal::route_get`: `RTM_GETROUTE` no Linux,
+  o kernel simulado no lab) e lista as diferenças. Janela: selos de estado e origem, gateway com selos
+  de interface e alcançabilidade, tabela em selo colorido pelo nome, colunas Changed e Reason (em cinza,
+  traduzida), filtros em selos, rodapé com as contagens, grupo ECMP numa linha que abre com um clique,
+  campo Route Lookup na barra. Pesquisa e detalhes em `docs/routes.md`.
+
+  Como testar: `cargo nextest run -p corerouter-engine --test route_view`; `cargo xtask netns`
+  (`netns_routes`: multipath e `RTM_GETROUTE` num namespace); na GUI, IP › Routes com duas rotas
+  padrão de distância 1 e uma de distância 10; `corerouter-cli run ip.route.lookup '{"address":"8.8.8.8"}'`.
+
+- 2026-10-23 — G1.27b: IP › Routes, parte 2 (detalhe da rota selecionada). `ip.route.detail {key}` diz de onde a rota veio
+  (a revisão e o comando que a criaram e mudaram; "DHCP client on ether1 (lease from …)"; RA; o
+  endereço de uma conectada), por que foi escolhida ou não (distância comparada com as concorrentes,
+  traduzida por id: `route_detail::CHOICES`), o check-gateway (método, intervalo, falhas, estado, há
+  quanto tempo caiu), as trocas de estado das últimas 24 h (anel de até 64 por rota, alimentado pelo
+  tick do daemon) e o que o kernel tem para ela (esperado, presente, faltando, alheio; reaproveita o
+  drift da G1.3). As trocas também vão para o log no tópico `route` (no máximo 16 por olhada). Na GUI,
+  um painel abaixo da tabela com uma rota selecionada (o painel `route_detail` pede a consulta com a
+  atualização da janela). A janela Routes abre com 1000×640.
+
+  Como testar: `cargo nextest run -p corerouter-engine --test route_view --test dhcp_resilience`
+  (origem, escolha, failover e volta, 24 h, kernel com drift, chave inválida); na GUI, selecione uma
+  rota e desligue/religue a interface dela.
+
+  O custo no tick é o do G1.27a (o anel só grava quando um estado muda); a consulta só roda com a
+  janela aberta e uma rota selecionada (**estimado**: uma `ip.route.list` interna + um `snapshot`).
+
+- 2026-10-23 — G2.3a: CGNAT, parte 1 (núcleo):
+
+  - `corerouter_model::cgnat`: pools, exceções e a função de mapeamento `Layout`. É a RFC 7422 §2,
+    ida e volta. Fica no L0 e é pura, para o kernel, o engine e o XDP (G2.5) usarem a mesma.
+  - `proto-cgnat::checks`: erros e avisos antes do commit.
+  - Os comandos `ip.firewall.cgnat.pool.*`, `exception.*`, `lookup`, `who-was`, `mapping.list`,
+    `history.list`, `rules`, `set`/`get`.
+  - O histórico de definições num journal próprio. "Quem era?" usa a definição em vigor naquela
+    hora (RFC 7422 §3), junto com o MAC e o Option 82 do DHCP.
+  - `corerouter_firewall::cgnat` gera a tabela `ip corerouter_cgnat`: um mapa por pool, EIM, EIF e
+    hairpin com mapas dinâmicos, e o drop do bloco público não reclamado. O `hal-linux` a carrega
+    numa transação.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-model cgnat
+  cargo test -p corerouter-proto-cgnat
+  cargo test -p corerouter-engine --test cgnat
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_cgnat
+  ```
+
+  O teste em netns (**medido**) passou nestes casos:
+
+  - UDP, TCP e ICMP saem no IP e na faixa da fórmula, e a volta da fórmula dá o assinante;
+  - a exceção 1:1 mantém a porta;
+  - EIM, EIF e hairpin funcionam;
+  - tirar os pools apaga a tabela.
+
+  Carga de 65 536 elementos pelo `nft -f`: 0,60–0,63 s (**medido** na pesquisa, Ryzen AI MAX+ 395,
+  kernel 7.0).
+
+- 2026-10-23 — G2.3b: CGNAT, parte 2:
+
+  - A tabela `ip corerouter_cgnat` chega ao kernel por **nfnetlink direto**:
+    - encoder próprio em `crates/hal-linux/src/nfnl.rs`, sem `unsafe`;
+    - lote atômico `NFNL_MSG_BATCH_BEGIN/END`, sem o programa `nft`.
+  - Descrição única `corerouter_firewall::program::Table`: dela saem o texto de "Ver regras" e as
+    mensagens, e o `nft list` lê o mesmo.
+  - Mudança só de elementos vai como diferença:
+    - o diff é posicional, com hash só no que sobra desalinhado;
+    - os mapeamentos UDP vivos sobrevivem;
+    - lote incremental recusado → troca da tabela.
+  - Uma regra `snat` por pool cobre TCP, UDP, ICMP e o resto: o kernel aceita faixa de portas sem
+    correspondência de protocolo, o `nft` não. O mapa `a_` saiu.
+  - Depois de um remapeamento:
+    - as conexões dos remapeados são derrubadas, por ctnetlink (`crates/hal-linux/src/ctnl.rs`,
+      codec com proptest);
+    - os mapeamentos UDP do pool são esquecidos.
+  - `hal::conntrack` traz os tipos da tabela de conexões (base do G2.2).
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-firewall
+  cargo test -p corerouter-hal-linux --lib
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_cgnat
+  COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p corerouter-hal-linux --bench netns_cgnat
+  ```
+
+  O netns cobre:
+
+  - NAT de UDP, TCP e ICMP pela fórmula;
+  - 1:1, EIM, EIF e hairpin;
+  - crescer a faixa mantém conexões e mapeamentos;
+  - mudar portas derruba as conexões e esquece os mapeamentos;
+  - um lote recusado não muda nada.
+
+- 2026-10-23 — G6.8: DNS Lookup, parte 1 de 2 (G6.8a): **Why this answer**, **Ask as** e a janela da largura do
+  conteúdo.
+
+  - `tool.dns.query explain=yes` (só com o roteador como servidor): o evento `why`, um por etapa
+    da cadeia (acl, limit, special, adlist, static, zones, cache, upstream), diz o que ela decidiu
+    (`passed`, `answered`, `dropped`, `not-reached`) e a regra exata: a entrada static (id e
+    `name=`/`regexp=`), a adlist e a linha que bloqueou (número e texto), o grupo de forwarders de
+    um FWD, a zona, o servidor que respondeu, o serve-stale (RFC 8767) e o nome retido no cache de
+    falhas (RFC 9520 §3.2). Terminal: `;; WHY <etapa> <decisão> <texto>`.
+  - `as_client=<IP>`: pergunta como se fosse um IP da LAN, sem pacote: ACL `allowed_from`, limite
+    por cliente e regras por origem veem o endereço; não gasta ficha do limite, não conta em
+    estatística nem no `match-count` da adlist e não põe endereço em address list.
+  - Janela: campo **Ask as**, seção "Why this answer" (selo da decisão, texto no idioma das
+    explicações, botões Open entry/list/group/zone que abrem a janela da regra com ela
+    selecionada, `TableState::reveal` espera as linhas chegarem). A janela alarga com as tabelas
+    até a área de trabalho: o selo `AS8075 MICROSOFT-CORP-MSN-AS-BLOCK` sai inteiro (relato do
+    usuário: saía `AS8075 MICROSOFT-CORP-…`); "…" com tooltip só quando não cabe mesmo.
+  - Adlist: cada nome guarda a linha e o texto da linha (+5 bytes por nome, **medido**).
+
+  Como testar: `corerouter-cli --connect 127.0.0.1:7979 watch tool.dns.query
+  '{"name":"nas.lan","explain":true,"as_client":"192.168.88.10"}'`; na GUI, Tools › DNS Lookup com
+  Ask as preenchido. Testes: cada etapa no `server/explain.rs`, `as_client` recusado pela ACL
+  (proto-dns e daemon), limite visto sem gastar, linha da adlist, comando e validação no engine,
+  headless da janela (largura, AS inteiro, corte só no que não cabe, Open entry/list).
+
+- 2026-10-23 — processo: `AGENTS.md`/`CLAUDE.md`: "Todo pedido, feature ou correção: o que mostrar antes de implementar"
+  (pedido do usuário). Antes do código, para feature, melhoria de tela ou bug: o que existe hoje
+  (no bug, a causa reproduzida), os padrões do projeto que se aplicam, mockup com opções quando há
+  tela, como deve funcionar pela RFC e pelo MikroTik/outros, uma seção de **extras** (ideias não
+  pedidas) e os **riscos** do próprio pedido. O mesmo resumo vai no corpo do PR.
+
+- 2026-10-23 — processo: Fila de entrada: resolve sozinha o conflito de **PR empilhado**. Quando a parte seguinte de uma
+  feature sai da branch da anterior e a anterior entra por squash, a seguinte traz as mudanças dela
+  duas vezes (os commits originais e o squash na `main`), e o GitHub acusa conflito. A fila agora
+  confere, arquivo por arquivo, se a `main` tem exatamente o que o PR pai tinha (o pai é um PR já
+  integrado cujo último commit é ancestral da branch); se sim, fica com o lado do PR (pai + o que
+  ele mudou), dá push na branch e segue, no lote e no merge da `main` antes do squash. Arquivo que
+  não bate com o pai continua sendo conflito de verdade, para a sessão dona. Era o que as sessões
+  faziam à mão, uma volta de CI cada (#112, G4.2b/c, #146, #147 duas vezes, 2026-10-22/23).
+  `AGENTS.md`: "Pode empilhar". Testado com repositório de mentira: pai integrado por squash e filho
+  empilhado (resolve, nas duas direções), e main que mudou o mesmo trecho depois (recusa).

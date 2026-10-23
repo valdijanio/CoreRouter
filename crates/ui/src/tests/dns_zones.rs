@@ -1,7 +1,7 @@
 //! IP › DNS › Zones (G4.1c), a panel: zones, records and the zone file.
 
 use super::*;
-use crate::dns_zones::{RECORD_TABLE, WIN, WIN_FILE, WIN_RECORDS, ZONE_TABLE, ZonesPanel, record_row, zone_row};
+use crate::dns_zones::{RECORD_TABLE, WIN, ZONE_TABLE, ZoneTab, ZonesPanel, record_row, zone_row};
 
 fn lab() -> Session {
     let mut s = Session::virtual_lab();
@@ -20,12 +20,17 @@ fn lab() -> Session {
     s
 }
 
-fn open(s: Session, win: &'static str) -> Harness {
+fn open(s: Session, tab: ZoneTab) -> Harness {
     let mut h = Harness::with_session(s);
     h.app.open.clear();
-    h.app.open(Win::Panel(win));
-    refresh(&mut h);
+    h.app.open(Win::Panel(WIN));
+    tab_to(&mut h, tab);
     h
+}
+
+fn tab_to(h: &mut Harness, tab: ZoneTab) {
+    h.app.panel_mut::<ZonesPanel>().unwrap().tab = tab;
+    refresh(h);
 }
 
 fn refresh(h: &mut Harness) {
@@ -37,7 +42,7 @@ fn refresh(h: &mut Harness) {
 
 #[test]
 fn zones_window_lists_zones_and_opens_records() {
-    let mut h = open(lab(), WIN);
+    let mut h = open(lab(), ZoneTab::Zones);
     assert!(h.has_text("DNS Zones"));
     assert!(h.has_text("example.com"));
     assert!(h.has_text("secondary"));
@@ -46,16 +51,20 @@ fn zones_window_lists_zones_and_opens_records() {
     assert_eq!(p.zones.len(), 2);
     assert_eq!(p.zone, "example.com", "the records window follows the first zone");
     // Records of the zone.
-    h.app.open(Win::Panel(WIN_RECORDS));
+    // The tool bar's Zone File opens the tab of the same window.
+    h.click(h.text("example.com"));
+    h.click(h.text("Zone File"));
     refresh(&mut h);
-    assert!(h.has_text("DNS Zone Records"));
+    assert_eq!(h.app.panel_mut::<ZonesPanel>().unwrap().tab, ZoneTab::File, "a tab");
+    assert_eq!(h.app.open.len(), 1, "no other window");
+    tab_to(&mut h, ZoneTab::Records);
     assert!(h.has_text("192.0.2.80"));
     let _ = (ZONE_TABLE, RECORD_TABLE);
 }
 
 #[test]
 fn a_new_record_by_dialog_reaches_the_engine() {
-    let mut h = open(lab(), WIN_RECORDS);
+    let mut h = open(lab(), ZoneTab::Records);
     let add = h
         .ctx
         .read_response(table::tool_id(RECORD_TABLE, table::Icon::Add))
@@ -86,13 +95,12 @@ fn a_new_record_by_dialog_reaches_the_engine() {
 
 #[test]
 fn the_zone_file_window_reads_and_loads() {
-    let mut h = open(lab(), WIN);
+    let mut h = open(lab(), ZoneTab::Zones);
     {
         let p = h.app.panel_mut::<ZonesPanel>().unwrap();
         p.file.zone = "example.com".into();
     }
-    h.app.open(Win::Panel(WIN_FILE));
-    refresh(&mut h);
+    tab_to(&mut h, ZoneTab::File);
     h.click(h.text("Reload"));
     refresh(&mut h);
     let text = h.app.panel_mut::<ZonesPanel>().unwrap().file.text.clone();
@@ -146,7 +154,7 @@ fn the_zone_dialog_shows_dnssec_keys() {
         })
     };
     s.dnssec_tick(0, &mut fake).unwrap();
-    let mut h = open(s, WIN);
+    let mut h = open(s, ZoneTab::Zones);
     // Select the zone and open its properties (Enter).
     h.click(h.text("example.com"));
     h.idle();
@@ -182,7 +190,7 @@ fn dynamic_records_show_and_go() {
         0,
     )
     .unwrap();
-    let mut h = open(s, WIN_RECORDS);
+    let mut h = open(s, ZoneTab::Records);
     assert!(h.has_text("192.0.2.50"));
     assert!(h.has_text("D"));
     h.click(h.text("192.0.2.50"));

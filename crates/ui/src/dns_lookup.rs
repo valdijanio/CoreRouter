@@ -13,6 +13,15 @@
 //! delegation from the root, `assinada` when a DS (or RRSIG) came with it
 //! — signed, not validated: validation is G4.1f.
 //!
+//! With the router as the server, "Why this answer" (G6.8) lists what each
+//! stage of its chain decided (passed, answered, not reached) with the rule
+//! that matched and a button to its window; "Ask as" asks as a LAN address
+//! would (the ACL, the per-client limit and the per-source rules see it).
+//!
+//! The window is as wide as its tables, up to the work area's edge (as the
+//! height grows: `windows::grow_height`): a value ends in "…" only when it
+//! does not fit even then.
+//!
 //! No logic here: the engine decides divergence, signatures and the text.
 
 use std::collections::BTreeMap;
@@ -23,6 +32,7 @@ use serde_json::{Map, Value, json};
 use crate::backend::RequestId;
 use crate::chip::{AMBER, BLUE, GREEN, RED, chip, hashed, neutral_tone, palette_tone};
 use crate::dhcp_client::text;
+use crate::i18n::{self, Langs, tr};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::action;
 use crate::{CoreRouterUi, Win, err_color};
@@ -34,8 +44,11 @@ const STOP: &str = "tool.task.stop";
 pub(crate) const TYPES: [&str; 10] = [
     "A", "AAAA", "MX", "TXT", "NS", "SOA", "PTR", "CAA", "SRV", "ANY",
 ];
-/// Data longer than this is cut in the table (the whole in the tooltip).
-const MAX_SHOWN: usize = 72;
+/// Room kept between the tables and the work area's width (the window's
+/// frame and its scroll bar).
+const RIGHT_MARGIN: f32 = 40.0;
+/// Narrowest a value gets before "…" (when the window cannot grow more).
+const MIN_ROOM: f32 = 120.0;
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -67,6 +80,8 @@ pub(crate) struct LookupPanel {
     pub(crate) rtype: String,
     pub(crate) ask: Ask,
     pub(crate) server: String,
+    /// "Ask as": a LAN address (empty: the router itself).
+    pub(crate) as_client: String,
     pub(crate) recursion: bool,
     pub(crate) dnssec: bool,
     pub(crate) tcp: bool,
@@ -111,6 +126,7 @@ impl Default for LookupPanel {
             rtype: "A".into(),
             ask: Ask::Router,
             server: String::new(),
+            as_client: String::new(),
             recursion: true,
             dnssec: false,
             tcp: false,
@@ -135,6 +151,14 @@ impl LookupPanel {
         p.insert("name".into(), json!(self.name.trim()));
         p.insert("type".into(), json!(self.rtype));
         match self.ask {
+            // Why this answer: only the router's chain has stages (and
+            // trace starts at the root, not there).
+            Ask::Router if !self.trace => {
+                p.insert("explain".into(), json!(true));
+                if !self.as_client.trim().is_empty() {
+                    p.insert("as_client".into(), json!(self.as_client.trim()));
+                }
+            }
             Ask::Router => {}
             Ask::Server => {
                 p.insert("server".into(), json!(self.server.trim()));
@@ -242,6 +266,17 @@ impl LookupPanel {
                     }
                 });
                 ui.end_row();
+                if self.ask == Ask::Router && !self.trace {
+                    ui.label(tr(app.lang.labels, "Ask as")).on_hover_text(
+                        "Ask as if this LAN address asked: the ACL (allowed_from), the per-client limit and the per-source rules see it. No packet is sent. Empty: the router itself.",
+                    );
+                    ui.add(
+                        TextEdit::singleline(&mut self.as_client)
+                            .hint_text(tr(app.lang.labels, "router itself"))
+                            .desired_width(160.0),
+                    );
+                    ui.end_row();
+                }
                 ui.label("Options");
                 ui.horizontal(|ui| {
                     toggle(ui, "recursion", &mut self.recursion, "RD: the server resolves for us (dig +norecurse clears it).");
@@ -309,7 +344,10 @@ impl LookupPanel {
         }
     }
 
-    fn results(&mut self, ui: &mut Ui) {
+    /// The results; a rule whose window the operator asked to open.
+    /// `right`: the farthest right the tables may reach (the window grows
+    /// up to the work area's width).
+    fn results(&mut self, langs: Langs, right: f32, ui: &mut Ui) -> Option<Value> {
         if let Some(e) = &self.error {
             ui.colored_label(err_color(ui), e.as_str());
         }
@@ -318,7 +356,9 @@ impl LookupPanel {
             last,
             now: BTreeMap::new(),
             selected: self.selected,
+            right,
         };
+        let mut open = None;
         egui::ScrollArea::vertical()
             .id_salt("dns-lookup-results")
             .auto_shrink([false, true])
@@ -347,6 +387,12 @@ impl LookupPanel {
                         ui.strong(title);
                         records(ui, salt, &recs, &asn, &mut ctx);
                     }
+                    let why: Vec<Value> = self.of("why").into_iter().cloned().collect();
+                    if !why.is_empty() {
+                        ui.add_space(6.0);
+                        ui.strong(tr(langs.labels, "Why this answer"));
+                        open = why_table(ui, langs, &why, &mut ctx);
+                    }
                 } else if !compare.is_empty() {
                     // The summary carries the divergence once all answered.
                     let rows: Vec<Value> = match self.summary.get("servers").and_then(Value::as_array) {
@@ -370,7 +416,147 @@ impl LookupPanel {
             });
         self.rows = ctx.now;
         self.selected = ctx.selected;
+        open
     }
+}
+
+/// Opens the window of a rule from "Why this answer", with it selected.
+fn open_rule(app: &mut CoreRouterUi, rule: &Value) {
+    let id = text(rule, "id");
+    let name = text(rule, "name");
+    let by_name = |rows: &[Value]| {
+        rows.iter()
+            .find(|r| text(r, "name") == name)
+            .map(|r| text(r, "id"))
+    };
+    let win = match text(rule, "kind").as_str() {
+        "static" => {
+            if let Some(p) = app.panel_mut::<crate::dns::DnsPanel>() {
+                p.static_table.reveal(&id);
+            }
+            crate::dns::WIN_STATIC
+        }
+        "adlist" => {
+            if let Some(p) = app.panel_mut::<crate::dns_adlist::AdlistPanel>() {
+                p.table.reveal(&id);
+            }
+            crate::dns_adlist::WIN
+        }
+        "forwarders" => {
+            if let Some(p) = app.panel_mut::<crate::dns_forwarders::ForwardersPanel>()
+                && let Some(id) = by_name(&p.lists)
+            {
+                p.table.reveal(&id);
+            }
+            crate::dns_forwarders::WIN
+        }
+        "zone" => {
+            if let Some(p) = app.panel_mut::<crate::dns_zones::ZonesPanel>()
+                && let Some(id) = by_name(&p.zones)
+            {
+                p.zone_table.reveal(&id);
+            }
+            crate::dns_zones::WIN
+        }
+        _ => return,
+    };
+    if !app.open.insert(Win::Panel(win)) {
+        app.floats.raise(crate::win_id(Win::Panel(win)));
+    }
+    app.cache.refreshed_at = None;
+}
+
+/// The button of a rule's window.
+fn rule_button(rule: &Value) -> Option<&'static str> {
+    Some(match rule.get("kind").and_then(Value::as_str)? {
+        "static" => "Open entry",
+        "adlist" => "Open list",
+        "forwarders" => "Open group",
+        "zone" => "Open zone",
+        _ => return None,
+    })
+}
+
+/// The text of one decision, in the explanations' language: the GUI's
+/// wording of the engine's id (`i18n/dns_lookup_pt.rs`), else the engine's
+/// English.
+pub(crate) fn why_text(lang: i18n::Lang, ev: &Value) -> String {
+    let args: Vec<(String, String)> = ev
+        .get("args")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .map(|(k, v)| (k.clone(), v.as_str().map_or_else(|| v.to_string(), str::to_owned)))
+        .collect();
+    let args: Vec<(&str, &str)> = args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    match text(ev, "why").as_str() {
+        "" => text(ev, "outcome"),
+        id => i18n::template(lang, &format!("dnswhy.{id}"), &args, &text(ev, "text")),
+    }
+}
+
+/// Why this answer: Stage, Decision, Why, one row per stage of the chain,
+/// with the button to the rule's window.
+fn why_table(ui: &mut Ui, langs: Langs, list: &[Value], rows: &mut Rows) -> Option<Value> {
+    let mut open = None;
+    Grid::new("dns-lookup-why")
+        .striped(true)
+        .num_columns(4)
+        .spacing([14.0, 3.0])
+        .show(ui, |ui| {
+            for h in ["Stage", "Decision", "Why", ""] {
+                ui.strong(tr(langs.labels, h));
+            }
+            ui.end_row();
+            for (i, ev) in list.iter().enumerate() {
+                let key = ("why", i);
+                let says = why_text(langs.help, ev);
+                let top = rows.begin(ui, key, &[("Copy", format!("{}: {says}", text(ev, "stage")))]);
+                let outcome = text(ev, "outcome");
+                let reached = outcome != "not-reached";
+                let stage = text(ev, "stage");
+                if reached {
+                    ui.label(stage);
+                } else {
+                    ui.label(RichText::new(stage).weak());
+                }
+                let v = ui.visuals().clone();
+                let (label, tone) = match outcome.as_str() {
+                    "answered" if text(ev, "why").ends_with("refused") => ("refused", RED.tone(&v)),
+                    "answered" => ("answered", GREEN.tone(&v)),
+                    "dropped" => ("dropped", RED.tone(&v)),
+                    "passed" => ("passed", neutral_tone(&v)),
+                    _ => ("not reached", neutral_tone(&v)),
+                };
+                chip(ui, tr(langs.labels, label), tone);
+                let room = (rows.right - ui.cursor().min.x - 110.0).max(MIN_ROOM);
+                let (shown, cut) = fit(ui, &says, room);
+                let l = if reached {
+                    ui.label(shown)
+                } else {
+                    ui.label(RichText::new(shown).weak())
+                };
+                let mut right = l.rect.right();
+                if cut {
+                    l.on_hover_text(&says);
+                }
+                match ev.get("rule").filter(|r| !r.is_null()).and_then(|r| rule_button(r).map(|b| (r, b))) {
+                    Some((rule, button)) => {
+                        let b = ui.small_button(tr(langs.labels, button));
+                        right = b.rect.right();
+                        if b.clicked() {
+                            open = Some(rule.clone());
+                        }
+                    }
+                    None => {
+                        ui.label("");
+                    }
+                }
+                ui.end_row();
+                rows.end(ui, key, top, right);
+            }
+        });
+    open
 }
 
 /// A chip that switches an option: blue when on, quiet when off.
@@ -425,6 +611,10 @@ fn status_line(ui: &mut Ui, a: &Value) {
         } else {
             shown
         };
+        let shown = match a.get("as_client").and_then(Value::as_str) {
+            Some(ip) => format!("{shown} · as {ip}"),
+            None => shown,
+        };
         chip(ui, &format!("{shown} · {}", text(a, "transport")), BLUE.tone(&v)).on_hover_text(server);
         match (text(a, "source").as_str(), text(a, "stage").as_str()) {
             (_, "") => {}
@@ -447,9 +637,16 @@ struct Rows {
     last: BTreeMap<(&'static str, usize), egui::Rect>,
     now: BTreeMap<(&'static str, usize), egui::Rect>,
     selected: Option<(&'static str, usize)>,
+    /// The farthest right a cell may reach (the window's widest).
+    right: f32,
 }
 
 impl Rows {
+    /// Room for a value starting where the cursor is, leaving `after`.
+    fn room(&self, ui: &Ui, after: f32) -> f32 {
+        (self.right - ui.cursor().min.x - after).max(MIN_ROOM)
+    }
+
     /// Before a row: the click area from last frame, painted when selected
     /// or hovered; the right-click menu copies `copies`.
     fn begin(&mut self, ui: &mut Ui, key: (&'static str, usize), copies: &[(&str, String)]) -> egui::Pos2 {
@@ -491,27 +688,81 @@ impl Rows {
     }
 }
 
-/// At most [`MAX_SHOWN`] characters, with "…" when cut.
-fn cut(s: &str) -> String {
-    if s.chars().count() <= MAX_SHOWN {
-        return s.to_owned();
+/// `s` as it fits in `room` points of body text: whole, or cut with "…"
+/// (then `true`: the whole goes in the tooltip).
+pub(crate) fn fit(ui: &Ui, s: &str, room: f32) -> (String, bool) {
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let width = |t: &str| {
+        ui.painter()
+            .layout_no_wrap(t.to_owned(), font.clone(), egui::Color32::WHITE)
+            .size()
+            .x
+    };
+    if width(s) <= room {
+        return (s.to_owned(), false);
     }
-    let mut t: String = s.chars().take(MAX_SHOWN - 1).collect();
-    t.push('…');
-    t
+    let chars: Vec<char> = s.chars().collect();
+    let cut = |n: usize| {
+        let mut t: String = chars.iter().take(n).collect();
+        t.push('…');
+        t
+    };
+    // The longest prefix that fits with its "…".
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if width(&cut(mid)) <= room {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    (cut(lo), true)
 }
 
-/// A data cell: the text (cut, whole in the tooltip) and, for an address,
-/// its AS pill coloured by the AS number (as in the MTR).
-fn data_cell(ui: &mut Ui, data: &str, asn: Option<&Value>) -> f32 {
+/// The AS pill's text: the number and the registry name's first word, whole
+/// (the window grows for it; the MTR's columns cut it at 16).
+fn as_label(a: &Value) -> Option<String> {
+    let n = a.get("asn").and_then(Value::as_u64)?;
+    let word = a
+        .get("as_name")
+        .and_then(Value::as_str)
+        .and_then(|name| name.split(',').next())
+        .and_then(|name| name.split_whitespace().next())
+        .filter(|w| !w.eq_ignore_ascii_case(&format!("AS{n}")));
+    Some(match word {
+        Some(w) => format!("AS{n} {w}"),
+        None => format!("AS{n}"),
+    })
+}
+
+/// Width of a chip with `label` (as `chip` draws it), and the gap before it.
+fn chip_width(ui: &Ui, label: &str) -> f32 {
+    let font = egui::FontId::proportional(crate::chip::small(ui));
+    let w = ui
+        .painter()
+        .layout_no_wrap(label.to_owned(), font, egui::Color32::WHITE)
+        .size()
+        .x;
+    w + 14.0 + 4.0 + ui.spacing().item_spacing.x
+}
+
+/// A data cell: the text (whole when it fits, else cut with the whole in
+/// the tooltip) and, for an address, its AS pill coloured by the AS number
+/// (as in the MTR).
+fn data_cell(ui: &mut Ui, data: &str, asn: Option<&Value>, rows: &Rows) -> f32 {
+    let pill = asn.and_then(as_label);
+    let after = pill.as_deref().map_or(0.0, |p| chip_width(ui, p));
+    let room = rows.room(ui, after);
     let r = ui
         .horizontal(|ui| {
-            let l = ui.label(cut(data));
-            if data.chars().count() > MAX_SHOWN {
+            let (shown, cut) = fit(ui, data, room);
+            let l = ui.label(shown);
+            if cut {
                 l.on_hover_text(data);
             }
             if let Some(a) = asn
-                && let (Some(label), Some(n)) = (crate::mtr::as_text(a), a.get("asn").and_then(Value::as_u64))
+                && let (Some(label), Some(n)) = (pill.clone(), a.get("asn").and_then(Value::as_u64))
             {
                 ui.add_space(4.0);
                 let mut tip = format!("AS{n}");
@@ -560,7 +811,7 @@ fn records(ui: &mut Ui, salt: &'static str, recs: &[&Value], asn: &BTreeMap<Stri
                 ui.label(text(r, "name"));
                 ui.label(text(r, "ttl"));
                 ui.label(text(r, "type"));
-                let right = data_cell(ui, &data, asn.get(&data));
+                let right = data_cell(ui, &data, asn.get(&data), rows);
                 ui.end_row();
                 rows.end(ui, key, top, right);
             }
@@ -616,9 +867,10 @@ fn compare_table(ui: &mut Ui, list: &[Value], rows: &mut Rows) {
                     ui.label(RichText::new(what).weak()).rect.right()
                 } else {
                     let all = data.join(", ");
-                    let l = ui.label(cut(&all));
+                    let (shown, cut) = fit(ui, &all, rows.room(ui, 0.0));
+                    let l = ui.label(shown);
                     let right = l.rect.right();
-                    if all.chars().count() > MAX_SHOWN {
+                    if cut {
                         l.on_hover_text(data.join("\n"));
                     }
                     right
@@ -647,18 +899,26 @@ fn trace_table(ui: &mut Ui, list: &[Value], rows: &mut Rows) {
                 ui.label(text(r, "zone"));
                 ui.label(text(r, "asked")).on_hover_text(text(r, "address"));
                 ui.label(r.get("ms").and_then(Value::as_u64).map_or("–".into(), |m| format!("{m} ms")));
+                // The signature chip after the answer.
+                let room = rows.room(ui, 110.0);
                 let right = ui
                     .horizontal(|ui| {
                         if r.get("error").is_some() {
                             if r.get("timeout").and_then(Value::as_bool) == Some(true) {
                                 chip(ui, "timeout", RED.tone(ui.visuals()));
                             }
-                            ui.label(RichText::new(cut(&text(r, "error"))).weak());
+                            let error = text(r, "error");
+                            let (shown, cut) = fit(ui, &error, room);
+                            let l = ui.label(RichText::new(shown).weak());
+                            if cut {
+                                l.on_hover_text(error);
+                            }
                             return;
                         }
                         let answer = text(r, "answer");
-                        let l = ui.label(cut(&answer));
-                        if answer.chars().count() > MAX_SHOWN {
+                        let (shown, cut) = fit(ui, &answer, room);
+                        let l = ui.label(shown);
+                        if cut {
                             l.on_hover_text(&answer);
                         }
                         match r.get("signed").and_then(Value::as_bool) {
@@ -726,7 +986,16 @@ impl PanelState for LookupPanel {
     fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
         self.form(app, ui);
         ui.separator();
-        self.results(ui);
+        // The window grows with its tables up to the work area's width (it
+        // is kept inside the area: growing past its edge moves it left).
+        let width = app
+            .floats
+            .area
+            .map_or_else(|| ui.ctx().content_rect().width(), |a| a.width());
+        let right = ui.max_rect().left() + width - RIGHT_MARGIN;
+        if let Some(rule) = self.results(app.lang, right, ui) {
+            open_rule(app, &rule);
+        }
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, _then: PanelThen, result: &Result<Value, String>) {
@@ -758,7 +1027,15 @@ mod tests {
             name: " example.com ".into(),
             ..LookupPanel::default()
         };
-        assert_eq!(p.params(), json!({"name": "example.com", "type": "A"}));
+        assert_eq!(p.params(), json!({"name": "example.com", "type": "A", "explain": true}));
+        p.as_client = " 192.168.88.10 ".into();
+        assert_eq!(
+            p.params(),
+            json!({"name": "example.com", "type": "A", "explain": true, "as_client": "192.168.88.10"})
+        );
+        p.trace = true;
+        assert_eq!(p.params(), json!({"name": "example.com", "type": "A", "trace": true}), "trace: from the root");
+        p.trace = false;
         p.ask = Ask::Server;
         p.server = "https://dns.google/dns-query".into();
         p.rtype = "MX".into();
@@ -773,6 +1050,5 @@ mod tests {
         p.dnssec = false;
         p.recursion = true;
         assert_eq!(p.params(), json!({"name": "example.com", "type": "MX", "compare": true}));
-        assert_eq!(cut(&"x".repeat(100)).chars().count(), MAX_SHOWN);
     }
 }

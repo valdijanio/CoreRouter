@@ -856,6 +856,8 @@ impl CoreRouterUi {
 
         let ctx = ui.ctx().clone();
         let mut floats = std::mem::take(&mut self.floats);
+        // Windows that size themselves to the work area read it here.
+        self.floats.area = Some(area);
         for win in &Win::all() {
             if !self.open.contains(win) {
                 continue;

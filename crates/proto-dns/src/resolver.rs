@@ -370,6 +370,16 @@ impl Resolver {
             .count()
     }
 
+    /// Seconds `key`/`rtype` stays held after a failure (RFC 9520 §3.2):
+    /// no server is asked until then. `None`: not held.
+    pub fn held_secs(&self, key: &str, rtype: RecordType, now_ms: u64) -> Option<u64> {
+        self.state()
+            .failures
+            .get(&(key.to_owned(), rtype))
+            .filter(|f| f.until_ms > now_ms)
+            .map(|f| f.until_ms.saturating_sub(now_ms).div_ceil(1000))
+    }
+
     /// What the resolver measured of each server it asked.
     pub fn server_stats(&self) -> Vec<(IpAddr, ServerStats)> {
         self.state().stats.iter().map(|(k, v)| (*k, *v)).collect()

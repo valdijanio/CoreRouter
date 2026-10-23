@@ -167,6 +167,14 @@ pub(crate) const STAGE: Stage = Stage {
 - Config própria: uma seção nova no modelo (`ip.dns_<algo>`), comandos em
   `engine/src/cmd/dns_<algo>.rs`; nada de editar `server/mod.rs`, `cmd/dns.rs` ou outra etapa.
 - `server::tests::stages_are_in_order` lista a ordem esperada: acrescente o nome.
+- "Why this answer" (G6.8): diga por que decidiu com `q.note(|| Note::new("<etapa>.<caso>")
+  .arg(…).rule(…))` (só roda quando a consulta pediu `explain`; nas da LAN não custa nada) e
+  ponha o texto em inglês em `server/explain.rs` (`TEXTS`) e o português em
+  `crates/ui/src/i18n/dns_lookup_pt.rs` (um teste confere os dois). Uma etapa que só conta, como
+  `statistics`, fica de fora (`NOT_EXPLAINED`).
+- Consulta simulada (`as_client`, G6.8: `q.simulated()`): ninguém mandou pacote. Não gaste
+  ficha do limite, não conte acerto nem estatística, não mexa em address list (os `after` não
+  rodam).
 
 **Static** (RouterOS v7): entradas habilitadas, de cima para baixo, as de `regexp` antes das de
 `name`. Um nome casa consigo mesmo e, com `match_subdomain`, com tudo abaixo dele. Decide a

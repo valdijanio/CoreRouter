@@ -169,7 +169,8 @@ A janela Tools › MTR tem as caixas **Use DNS** e **AS lookup**, o nome em cima
 
 ### 4.3 DNS Lookup (G6.6)
 
-`tool.dns.query {name, type?, server?, recursion?, dnssec?, tcp?, trace?, compare?}` — um `dig`
+`tool.dns.query {name, type?, server?, recursion?, dnssec?, tcp?, trace?, compare?, explain?,
+as_client?}` — um `dig`
 como tarefa (`tool.task.poll`/`stop`): a espera pela rede é numa thread do runner, nunca sob o
 lock do `Session`. Terminal: `/tool dns-lookup example.com type=MX dnssec=yes` (ou
 `dns-lookup …` de qualquer menu). Janela: Tools › DNS Lookup.
@@ -178,7 +179,8 @@ lock do `Session`. Terminal: `/tool dns-lookup example.com type=MX dnssec=yes` (
   ANY, CAA, CNAME, DNSKEY, DS, HTTPS, MX, NS, PTR, SOA, SRV, SSHFP, SVCB, TLSA, TXT (AXFR/IXFR
   não: transferência de zona não é consulta).
 - `server`: vazio ou `router` (padrão) é o **próprio roteador**: a pergunta desce a cadeia do
-  encaminhador da LAN (G4.1b: acl → adlist → static → zones → cache → upstream) dentro do
+  encaminhador da LAN (G4.1b: acl → limit → special → adlist → static → zones → cache →
+  upstream) dentro do
   processo, como um cliente da LAN seria atendido, e a resposta diz a **etapa** que respondeu
   (`;; STAGE: cache`; na janela, o selo `from cache · etapa cache` ou `etapa upstream`). Um IP
   pergunta direto a ele (UDP; TCP com `tcp`, ou quando a resposta vem truncada, RFC 7766 §5).
@@ -209,6 +211,34 @@ lock do `Session`. Terminal: `/tool dns-lookup example.com type=MX dnssec=yes` (
   recusada (laço).
 - Texto vindo da rede sai só com ASCII imprimível (o resto como `\DDD`), limitado por campo e
   por seção (64 registros).
+
+#### Why this answer e Ask as (G6.8)
+
+- **`explain`** (só com o roteador como servidor): o evento `why`, um por etapa da cadeia (acl,
+  limit, special, adlist, static, zones, cache, upstream), diz o que ela decidiu (`passed`,
+  `answered`, `dropped` ou `not-reached`, quando uma etapa anterior já respondeu) e por quê,
+  com a regra exata: a entrada static (id e `name=`/`regexp=`), a adlist e a **linha** que
+  bloqueou (número e texto da linha como a lista tinha), o grupo de forwarders de um FWD, a
+  zona, o servidor que respondeu, o `serve-stale` (RFC 8767) e o nome retido no cache de
+  falhas (RFC 9520 §3.2, com os segundos que faltam). Campos: `stage`, `outcome`, `why` (id
+  estável), `args`, `text` (inglês) e `rule` (`{kind: static|adlist|forwarders|zone, id|name}`).
+  Terminal: uma linha `;; WHY <etapa> <decisão> <texto>` por etapa. Janela: a seção "Why this
+  answer" abaixo da resposta, o texto no idioma das explicações (G0.15) e o botão **Open
+  entry**/**Open list**/**Open group**/**Open zone** que abre a janela da regra com ela
+  selecionada.
+- **`as_client`** (só com o roteador): pergunta como se fosse um IP da LAN, sem pacote de
+  verdade: a ACL `allowed_from`, o limite por cliente e as regras por origem veem esse endereço
+  (`203.0.113.9 is not in allowed_from: REFUSED`). Não gasta ficha do limite, não conta nas
+  estatísticas nem no `match-count` da adlist e não põe endereço em address list. Janela: campo
+  **Ask as** (vazio = o próprio roteador); o selo do servidor mostra `router · as <IP>`.
+- A adlist guarda, por nome, a linha de onde veio (4 bytes) e qual dos textos de linha da lista
+  era (1 byte; até 255 textos distintos por lista, o que cobre `0.0.0.0 <nome>` e `||<nome>^`).
+  Linha com texto próprio além disso (comentário por linha) mostra a regra refeita a partir do
+  nome. São +5 bytes por nome (**medido**: 36,8 MB contra 31,8 MB para 1 milhão de nomes).
+- A janela alarga com as tabelas (Answer, Authority, Additional, Compare, Trace) até a largura
+  da área de trabalho, como a altura já crescia: o selo do AS sai inteiro (`AS8075
+  MICROSOFT-CORP-MSN-AS-BLOCK`), e um valor só termina em "…" (com o todo no tooltip) quando não
+  cabe nem assim.
 
 Codec em `crates/proto-dns/src/dig.rs` (sem sockets, compila em WASM); a tarefa em
 `crates/engine/src/dns_lookup.rs`; o transporte no daemon em

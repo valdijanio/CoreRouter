@@ -59,6 +59,16 @@ mod netlink;
 #[cfg(target_os = "linux")]
 pub mod nft;
 
+/// nf_tables over nfnetlink (G2.3b): the encoder is pure, the socket Linux.
+pub mod nfnl;
+
+/// Conntrack over ctnetlink (G2.2): codec pure, socket Linux.
+pub mod ctnl;
+
+/// The CGNAT table in the kernel (G2.3).
+#[cfg(target_os = "linux")]
+mod cgnat;
+
 #[cfg(target_os = "linux")]
 pub mod l2;
 
@@ -405,6 +415,23 @@ mod linux {
                 let dynamic = crate::nft::dynamic();
                 crate::nft::run(&corerouter_firewall::script(to, &dynamic))?;
             }
+            // CGNAT (G2.3): its own table, replaced whole in one batch.
+            let cgnat = corerouter_firewall::cgnat::changed(&from.ip.cgnat, &to.ip.cgnat);
+            if cgnat && let Err(e) = crate::cgnat::apply(&from.ip.cgnat, &to.ip.cgnat) {
+                if firewall {
+                    let dynamic = crate::nft::dynamic();
+                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
+                    {
+                        log::error!("restoring the previous firewall: {back}");
+                    }
+                }
+                return Err(e);
+            }
+            let undo_cgnat = || {
+                if cgnat && let Err(back) = crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat) {
+                    log::error!("restoring the previous CGNAT table: {back}");
+                }
+            };
             // Ethernet settings next: validated by the engine against what
             // the port supports, they rarely fail; if the plan below does,
             // they go back too.
@@ -413,6 +440,7 @@ mod linux {
             let root = self.sysctl.root.clone();
             let cpu = (&from.system.tuning.cpu, &to.system.tuning.cpu);
             if let Err(e) = self.cpu.transition(cpu.0, cpu.1, &root) {
+                undo_cgnat();
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -445,6 +473,7 @@ mod linux {
             });
             if let Err(e) = tuned {
                 undo_cpu(self);
+                undo_cgnat();
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -497,6 +526,7 @@ mod linux {
                         log::error!("restoring kernel parameters: {back}");
                     }
                     undo_cpu(self);
+                    undo_cgnat();
                     if firewall {
                         // The links went back to `from`: so does the firewall.
                         let dynamic = crate::nft::dynamic();
