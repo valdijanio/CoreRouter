@@ -278,9 +278,9 @@ fn engine_errors_come_through_as_they_are() {
     );
     // A verb the engine has no command for is not improvised: the menu
     // says what it has.
-    let e = t.fails("/ip address set 0 comment=x");
+    let e = t.fails("/ip address zap 0 comment=x");
     assert!(
-        e.contains("bad command name 'set'") && e.contains("here: ") && e.contains("add"),
+        e.contains("bad command name 'zap'") && e.contains("here: ") && e.contains("add"),
         "{e}"
     );
     // A disabled command answers with the engine's reason.
