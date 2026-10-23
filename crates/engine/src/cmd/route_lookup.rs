@@ -30,8 +30,16 @@ fn run(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     // What forwards now: the running config, not a transaction's candidate.
+    // Without a transaction pending they are the same, and the lines kept
+    // for the list (G1.27c) answer: no rebuild of a full table per lookup.
     let base = s.store().running().clone();
-    let (cfg, lines) = s.route_lines_of(&base);
+    let (cfg, lines) = if s.store().is_dirty() {
+        let (cfg, lines) = s.route_lines_of(&base);
+        (cfg, std::sync::Arc::new(lines))
+    } else {
+        let lines = s.route_lines();
+        (s.effective(&base).into_owned(), lines)
+    };
     let (table, rule) =
         choose_table(&cfg, table.as_ref(), src).map_err(|(field, why)| EngineError::bad(field, why))?;
     let found = lookup(&cfg, &lines, dst, table, rule, src);
