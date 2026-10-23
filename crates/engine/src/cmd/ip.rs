@@ -10,6 +10,7 @@ use corerouter_hal::Learned;
 
 use crate::dhcp_client::{duration_text, is_dynamic};
 use crate::dhcp6_client::{is_dynamic6, ra_id};
+use crate::validate::{MAX_ADDRESSES, v6_twice};
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
@@ -76,6 +77,28 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::bad(
             "address",
             format!("{address} already exists on {interface}"),
+        ));
+    }
+    if let IpNet::V6(net) = address
+        && let Some(other) = cfg
+            .ip
+            .addresses
+            .iter()
+            .find(|a| {
+                a.interface == interface
+                    && a.address.addr() == address.addr()
+                    && a.from_pool == from_pool
+            })
+    {
+        return Err(EngineError::bad(
+            "address",
+            v6_twice(net.addr(), &interface, other.address),
+        ));
+    }
+    if cfg.ip.addresses.len() >= MAX_ADDRESSES {
+        return Err(EngineError::bad(
+            "address",
+            format!("at most {MAX_ADDRESSES} addresses"),
         ));
     }
     let id = cfg.ip.next_address_id();

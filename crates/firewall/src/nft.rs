@@ -28,13 +28,13 @@
 //! (letters, digits, `-`, `_`, `.`), and the log prefix is checked by the
 //! validator; [`quoted`] still drops anything that could break a string.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use std::fmt::Write as _;
 
 use corerouter_model::firewall::{
-    Action, AddrMatch, ConnState, DynamicAddress, Family, FirewallRule, Flags, Name, NatState,
-    NatTarget, Neg, PortRange, PortSet, Protocol, RejectWith, Table,
+    Action, AddrMatch, AddressListEntry, ConnState, DynamicAddress, Family, FirewallRule, Flags,
+    Name, NatState, NatTarget, Neg, PortRange, PortSet, Protocol, RejectWith, Table,
 };
 use corerouter_model::{Config, IfName, ItemId};
 
@@ -526,24 +526,37 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
     let mut out = String::new();
     let _ = writeln!(out, "table inet {TABLE} {{");
     let filled = filled_lists(cfg);
+    // Entries grouped by list once: filtering every entry for every list
+    // was O(lists × entries) (65 536 entries over 500 lists).
+    let mut statics: BTreeMap<&Name, Vec<&AddressListEntry>> = BTreeMap::new();
+    for e in fw.address_lists.iter().filter(|e| !e.disabled) {
+        statics.entry(&e.list).or_default().push(e);
+    }
+    let mut dynamics: BTreeMap<&Name, Vec<&DynamicAddress>> = BTreeMap::new();
+    for d in dynamic {
+        dynamics.entry(&d.list).or_default().push(d);
+    }
+    let none_s: Vec<&AddressListEntry> = Vec::new();
+    let none_d: Vec<&DynamicAddress> = Vec::new();
 
     for list in address_lists(cfg, dynamic) {
+        let list_statics = statics.get(list).unwrap_or(&none_s);
+        let list_dynamic = dynamics.get(list).unwrap_or(&none_d);
         for (fam, name, ty) in [
             (Family::Ipv4, set_v4(list), "ipv4_addr"),
             (Family::Ipv6, set_v6(list), "ipv6_addr"),
         ] {
-            let mut items: Vec<String> = fw
-                .address_lists
+            let mut items: Vec<String> = list_statics
                 .iter()
-                .filter(|e| !e.disabled && e.list == *list && e.address.family() == fam)
+                .filter(|e| e.address.family() == fam)
                 .map(|e| addr_text(&e.address))
                 .collect();
             // Entries a rule added go back to the dynamic set below (and
             // are dropped once no rule fills the list).
             items.extend(
-                dynamic
+                list_dynamic
                     .iter()
-                    .filter(|d| d.list == *list && d.address.family() == fam)
+                    .filter(|d| d.address.family() == fam)
                     .filter(|d| !d.added_by_rule)
                     .map(|d| {
                         format!(
@@ -567,9 +580,9 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
             (Family::Ipv6, dyn_v6(list), "ipv6_addr"),
         ] {
             // Only single addresses fit a plain set.
-            let items: Vec<String> = dynamic
+            let items: Vec<String> = list_dynamic
                 .iter()
-                .filter(|d| d.added_by_rule && d.list == *list && d.address.family() == fam)
+                .filter(|d| d.added_by_rule && d.address.family() == fam)
                 .filter_map(|d| match d.address {
                     AddrMatch::Net(n) if n.prefix_len() == n.max_prefix_len() => {
                         Some(if d.timeout_secs > 0 {
@@ -606,11 +619,15 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
 
     for table in Table::ALL {
         let rules = fw.rules(table);
-        let live: Vec<&FirewallRule> = rules.iter().filter(|r| !r.disabled && !r.section).collect();
+        // Live rules by chain, in order (one pass, not one per chain).
+        let mut live: BTreeMap<&str, Vec<&FirewallRule>> = BTreeMap::new();
+        for r in rules.iter().filter(|r| !r.disabled && !r.section) {
+            live.entry(r.chain.as_str()).or_default().push(r);
+        }
         let mut chains: Vec<String> = table
             .builtin_chains()
             .iter()
-            .filter(|c| live.iter().any(|r| r.chain.as_str() == **c))
+            .filter(|c| live.contains_key(**c))
             .map(|c| (*c).to_owned())
             .collect();
         chains.extend(
@@ -626,7 +643,7 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
                     "\t\ttype {ty} hook {hook} priority {prio}; policy accept;"
                 );
             }
-            for r in live.iter().filter(|r| r.chain.as_str() == chain) {
+            for r in live.get(chain.as_str()).into_iter().flatten() {
                 for line in kernel_rules(table, r, &filled) {
                     let _ = writeln!(out, "\t\t{line}");
                 }
@@ -636,6 +653,15 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
     }
     let _ = writeln!(out, "}}");
     Some(out)
+}
+
+/// Whether going from `from` to `to` changes the ruleset. `render` reads
+/// only the firewall and the interface lists, so a commit that touches
+/// neither does not render at all (both configs were rendered on every
+/// commit, ~1 ms per 1000 rules).
+pub fn changed(from: &Config, to: &Config) -> bool {
+    (from.ip.firewall != to.ip.firewall || from.interface_lists != to.interface_lists)
+        && render(from, &[]) != render(to, &[])
 }
 
 /// The text `nft -f -` applies as one transaction: our table is replaced

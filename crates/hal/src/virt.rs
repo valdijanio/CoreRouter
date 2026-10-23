@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use corerouter_model::firewall::DynamicAddress;
-use corerouter_model::{Config, FlowControl, IfName, InterfaceKind};
+use corerouter_model::{Config, FlowControl, IfName, InterfaceKind, ItemId, RouteEntry};
 
 use crate::dhcp::{
     Datagram, Datagram6, Dest, Dhcp6Port, DhcpPort, SharedResponder, SharedResponder6, eui64,
@@ -109,28 +109,72 @@ impl VirtualHal {
 
     /// The lab kernel after `from` → `to`: like a real one, only what
     /// changed is touched, so drift elsewhere stays.
+    ///
+    /// Only the parts whose inputs changed are recomputed: links and
+    /// addresses depend on the interfaces and addresses, routes also on the
+    /// routes. When only routes changed, only the changed entries are
+    /// resolved (the expected state of both whole configs was computed on
+    /// every apply: 1000 routes cost ~120 µs per commit, **medido**).
     fn carry(&self, from: &Config, to: &Config) {
-        let (a, b) = (drift::expected(from), drift::expected(to));
+        let ifaces = from.interfaces != to.interfaces;
+        let addrs = ifaces || from.ip.addresses != to.ip.addresses;
+        let routes = from.ip.routes != to.ip.routes;
+        if !addrs && !routes {
+            return;
+        }
         let mut k = self.kernel.lock().unwrap_or_else(PoisonError::into_inner);
-        for name in a.links.keys().filter(|n| !b.links.contains_key(*n)) {
-            if drift::recreatable(from, name) {
-                k.links.remove(name);
+        if ifaces {
+            let (a, b) = (drift::expected_links(from), drift::expected_links(to));
+            for name in a.keys().filter(|n| !b.contains_key(*n)) {
+                if drift::recreatable(from, name) {
+                    k.links.remove(name);
+                }
+            }
+            for (name, link) in &b {
+                if a.get(name) != Some(link) {
+                    k.links.insert(name.clone(), link.clone());
+                }
             }
         }
-        for (name, link) in &b.links {
-            if a.links.get(name) != Some(link) {
-                k.links.insert(name.clone(), link.clone());
+        if addrs {
+            let (a, b) = (drift::active_addresses(from), drift::active_addresses(to));
+            for x in a.difference(&b) {
+                k.addresses.remove(x);
+            }
+            k.addresses.extend(b.difference(&a).cloned());
+        }
+        // Routes resolve through interfaces and addresses: with those
+        // unchanged, an unchanged route entry resolves the same.
+        let (a, b) = if addrs {
+            (drift::kernel_routes(from), drift::kernel_routes(to))
+        } else {
+            fn by_id(c: &Config) -> BTreeMap<ItemId, &RouteEntry> {
+                c.ip.routes.iter().map(|r| (r.id, r)).collect()
+            }
+            let (old, new) = (by_id(from), by_id(to));
+            let gone = old.iter().filter(|(id, r)| new.get(id) != Some(r));
+            let came = new.iter().filter(|(id, r)| old.get(id) != Some(r));
+            (
+                drift::kernel_routes_of(from, gone.map(|(_, r)| *r)),
+                drift::kernel_routes_of(to, came.map(|(_, r)| *r)),
+            )
+        };
+        for r in a.difference(&b) {
+            // Another entry of `to` may still put the same route there.
+            let kept = !addrs
+                && drift::kernel_routes_of(
+                    to,
+                    to.ip
+                        .routes
+                        .iter()
+                        .filter(|e| e.dst_address.trunc() == r.dst),
+                )
+                .contains(r);
+            if !kept {
+                k.routes.remove(r);
             }
         }
-        for x in a.addresses.difference(&b.addresses) {
-            k.addresses.remove(x);
-        }
-        k.addresses
-            .extend(b.addresses.difference(&a.addresses).cloned());
-        for r in a.routes.difference(&b.routes) {
-            k.routes.remove(r);
-        }
-        k.routes.extend(b.routes.difference(&a.routes).cloned());
+        k.routes.extend(b.difference(&a).cloned());
     }
 
     /// Answer DHCP clients with `server` (a test's own scenario) instead of
@@ -297,7 +341,7 @@ impl Hal for VirtualHal {
     }
 
     fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
-        if corerouter_firewall::render(from, &[]) != corerouter_firewall::render(to, &[]) {
+        if corerouter_firewall::nft::changed(from, to) {
             self.ruleset = Some(corerouter_firewall::script(to, &self.dynamic));
         }
         for (name, iface) in &to.interfaces {
@@ -355,6 +399,12 @@ impl Hal for VirtualHal {
             DynamicChange::Remove(d) => {
                 self.dynamic
                     .retain(|x| x.list != d.list || x.address != d.address);
+            }
+            DynamicChange::Expired(gone) => {
+                let gone: std::collections::BTreeSet<_> =
+                    gone.iter().map(|d| (&d.list, d.address)).collect();
+                self.dynamic
+                    .retain(|x| !gone.contains(&(&x.list, x.address)));
             }
         }
         Ok(())

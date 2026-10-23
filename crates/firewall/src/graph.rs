@@ -5,11 +5,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_model::firewall::{Action, FirewallRule, Name, Table};
 
+/// Jumps of one table: `chain → jump targets`.
+pub type Edges<'a> = BTreeMap<&'a str, BTreeSet<&'a str>>;
+
 /// Edges `chain → jump target` of one table (disabled rules included: a
 /// later enable must not create a loop the validator never saw).
-fn edges(rules: &[FirewallRule]) -> BTreeMap<&str, BTreeSet<&str>> {
-    let mut out: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-    for r in rules.iter().filter(|r| !r.section) {
+pub fn edges<'a>(rules: impl IntoIterator<Item = &'a FirewallRule>) -> Edges<'a> {
+    let mut out: Edges<'a> = BTreeMap::new();
+    for r in rules.into_iter().filter(|r| !r.section) {
         if let Action::Jump { jump_target } = &r.action {
             out.entry(r.chain.as_str())
                 .or_default()
@@ -26,7 +29,12 @@ pub fn is_builtin(table: Table, chain: &str) -> bool {
 /// Built-in chains from which `chain` can be reached (itself, if built-in).
 /// Bounded by the number of chains, so hostile configs cannot hang it.
 pub fn roots<'a>(table: Table, rules: &'a [FirewallRule], chain: &'a str) -> BTreeSet<&'a str> {
-    let edges = edges(rules);
+    roots_in(table, &edges(rules), chain)
+}
+
+/// [`roots`] over edges built once (the whole-table validation used to
+/// rebuild them, from a copy of the table, for every rule: O(N²)).
+pub fn roots_in<'a>(table: Table, edges: &Edges<'a>, chain: &'a str) -> BTreeSet<&'a str> {
     let mut out = BTreeSet::new();
     for root in table.builtin_chains() {
         let mut seen: BTreeSet<&str> = BTreeSet::new();
