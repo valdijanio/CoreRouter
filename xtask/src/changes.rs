@@ -273,16 +273,16 @@ pub fn fold(date: &str, changes: &[Change], docs: &Docs) -> Result<Docs, String>
         mut history,
         mut perf,
     } = docs.clone();
+    // Already folded: a branch made from another PR's branch still
+    // carries that PR's change file after its squash reached the main
+    // (the file never existed there, so the merge keeps it). Drop it.
+    let changes: Vec<&Change> = changes.iter().filter(|c| !is_folded(&log, c)).collect();
+    // New rows first: a file may set the status of a gap another file
+    // (sorted after it, `docs-…` after `G0.24`) creates.
+    for row in changes.iter().flat_map(|c| &c.rows) {
+        gaps = insert_row(&gaps, row)?;
+    }
     for c in changes {
-        // Already folded: a branch made from another PR's branch still
-        // carries that PR's change file after its squash reached the main
-        // (the file never existed there, so the merge keeps it). Drop it.
-        if is_folded(&log, c) {
-            continue;
-        }
-        for row in &c.rows {
-            gaps = insert_row(&gaps, row)?;
-        }
         if let Some(s) = &c.status {
             gaps = apply_status(&gaps, &c.id, s)?;
         }

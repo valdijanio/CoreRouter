@@ -131,6 +131,9 @@ Decisões de desempenho se tomam com números, não com preferência.
   params)`. Nenhuma regra de negócio em `crates/ui`. Visual: siga `docs/ui-style.md` — selos (chips) e
   selos coloridos por hash de chave (AS, VLAN, VRF) com `crates/ui/src/chip.rs`, nunca texto entre
   colchetes nem cores ad hoc; tabelas com uma linha por item e seleção por clique.
+  **Explicação ⓘ sempre que couber:** todo rótulo, coluna, aba, item de menu e título de janela
+  leva o ⓘ que abre o modal de explicações, em português por padrão (regra em
+  `docs/ui-style.md`, "Explicação ⓘ em todo lugar que couber").
 - **Só Rust.** Nada de JS/TS escrito à mão (o `index.html` do trunk é a exceção).
 - **Nunca quebrar o WASM.** model, hal, engine, ui e gui compilam para `wasm32-unknown-unknown`.
   Não use `std::time::SystemTime::now`, threads ou `std::net` nessas camadas (o relógio vem do

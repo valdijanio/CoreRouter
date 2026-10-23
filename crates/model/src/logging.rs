@@ -33,6 +33,7 @@ pub const MAX_MEMORY_LINES: u32 = 65_535;
 /// make a rule that never matches.
 pub const TOPICS: &[&str] = &[
     "account",
+    "cgnat",
     "critical",
     "debug",
     "dhcp",
