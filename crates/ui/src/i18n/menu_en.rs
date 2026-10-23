@@ -44,6 +44,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.settings", "## What it does\nPreferences of this GUI, not of the router: the language of the labels and of the explanations. Kept on this computer."),
     ("menu.sniffer", "## What it does\nRecords an interface's frames into a pcap file for Wireshark, with a filter and a bounded size and duration; download the file from the GUI. Headers only by default (the data is subscribers')."),
     ("menu.torch", "## What it does\nAn interface's traffic live, per flow: who talks to whom and how much each way, grouped by source, destination, protocol, port, VLAN, DSCP or MAC, with the destination's AS. Above ~500 kpps it samples 1:N and says so."),
+    ("menu.traffic-flow", "## What it does\nExports a record of every connection to flow collectors, in IPFIX or NetFlow v9, with the addresses and ports before and after NAT and RFC 8158 NAT events: the connection log a provider keeps (Marco Civil). Also shows the top talkers without a collector."),
     ("menu.tuning", "## What it does\nKernel and hardware tuning for routing: network buffers, conntrack, CPU governor, IRQ and RPS/XPS per interface, and the boot parameters — with recommended values and why."),
     ("menu.vrf", "## What it does\nVRFs: separate routing tables on the same router, for customers or management kept apart."),
 ];

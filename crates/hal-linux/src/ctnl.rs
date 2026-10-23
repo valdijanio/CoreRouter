@@ -43,7 +43,11 @@ const CTA_PROTO_NUM: u16 = 1;
 const CTA_PROTO_SRC_PORT: u16 = 2;
 const CTA_PROTO_DST_PORT: u16 = 3;
 const CTA_PROTO_ICMP_ID: u16 = 4;
+const CTA_PROTO_ICMP_TYPE: u16 = 5;
+const CTA_PROTO_ICMP_CODE: u16 = 6;
 const CTA_PROTO_ICMPV6_ID: u16 = 7;
+const CTA_PROTO_ICMPV6_TYPE: u16 = 8;
+const CTA_PROTO_ICMPV6_CODE: u16 = 9;
 const CTA_PROTOINFO_TCP: u16 = 1;
 const CTA_PROTOINFO_TCP_STATE: u16 = 1;
 const CTA_COUNTERS_PACKETS: u16 = 1;
@@ -105,6 +109,14 @@ fn tuple(nest: &Attr<'_>) -> Option<(Tuple, u8)> {
             CTA_PROTO_SRC_PORT => sport = be16(&a).unwrap_or(0),
             CTA_PROTO_DST_PORT => dport = be16(&a).unwrap_or(0),
             CTA_PROTO_ICMP_ID | CTA_PROTO_ICMPV6_ID => sport = be16(&a).unwrap_or(0),
+            // Type and code ride in `dst_port` (type << 8 | code): a delete
+            // must send them back, the kernel refuses an ICMP tuple without.
+            CTA_PROTO_ICMP_TYPE | CTA_PROTO_ICMPV6_TYPE => {
+                dport = (dport & 0x00ff) | (u16::from(a.u8().unwrap_or(0)) << 8);
+            }
+            CTA_PROTO_ICMP_CODE | CTA_PROTO_ICMPV6_CODE => {
+                dport = (dport & 0xff00) | u16::from(a.u8().unwrap_or(0));
+            }
             _ => {}
         }
     }
@@ -257,8 +269,20 @@ impl Req {
         self.begin(CTA_TUPLE_PROTO);
         self.put(CTA_PROTO_NUM, &[protocol]);
         match protocol {
-            1 => self.put(CTA_PROTO_ICMP_ID, &t.src_port.to_be_bytes()),
-            58 => self.put(CTA_PROTO_ICMPV6_ID, &t.src_port.to_be_bytes()),
+            // The kernel wants id, type and code of an ICMP tuple (EINVAL
+            // otherwise); type and code come from `dst_port`.
+            1 => {
+                let [ty, code] = t.dst_port.to_be_bytes();
+                self.put(CTA_PROTO_ICMP_ID, &t.src_port.to_be_bytes());
+                self.put(CTA_PROTO_ICMP_TYPE, &[ty]);
+                self.put(CTA_PROTO_ICMP_CODE, &[code]);
+            }
+            58 => {
+                let [ty, code] = t.dst_port.to_be_bytes();
+                self.put(CTA_PROTO_ICMPV6_ID, &t.src_port.to_be_bytes());
+                self.put(CTA_PROTO_ICMPV6_TYPE, &[ty]);
+                self.put(CTA_PROTO_ICMPV6_CODE, &[code]);
+            }
             6 | 17 | 132 | 136 | 33 => {
                 self.put(CTA_PROTO_SRC_PORT, &t.src_port.to_be_bytes());
                 self.put(CTA_PROTO_DST_PORT, &t.dst_port.to_be_bytes());
@@ -385,6 +409,33 @@ mod tests {
         assert_eq!(back, c);
         assert_eq!(back.state(), "established");
         assert_eq!(back.via(), corerouter_hal::conntrack::Via::Rules);
+    }
+
+    /// An ICMP echo keeps id, type and code (the kernel refuses a delete
+    /// whose ICMP tuple lacks type or code: a killed ping must not stop
+    /// the kill of the connections after it).
+    #[test]
+    fn an_icmp_tuple_carries_type_and_code() {
+        let mut c = conn();
+        c.protocol = 1;
+        c.tcp_state = None;
+        c.orig.src_port = 12955;
+        c.orig.dst_port = 8 << 8; // echo request, code 0
+        c.reply.src_port = 2542;
+        c.reply.dst_port = 0; // echo reply
+        let back = parse_conn(&reply_bytes(&c)[20..]).unwrap();
+        assert_eq!(back, c);
+        let req = delete_request(&c, 7);
+        let has = |kind: u16, data: &[u8]| {
+            let mut a = Vec::new();
+            a.extend_from_slice(&((NLA_HDR + data.len()) as u16).to_ne_bytes());
+            a.extend_from_slice(&kind.to_ne_bytes());
+            a.extend_from_slice(data);
+            req.windows(a.len()).any(|w| w == a.as_slice())
+        };
+        assert!(has(CTA_PROTO_ICMP_ID, &12955u16.to_be_bytes()));
+        assert!(has(CTA_PROTO_ICMP_TYPE, &[8]));
+        assert!(has(CTA_PROTO_ICMP_CODE, &[0]));
     }
 
     #[test]
@@ -569,20 +620,32 @@ mod io {
     }
 
     /// Kill `conns` (one request each); how many the kernel removed (one
-    /// already gone is not an error).
+    /// already gone is not an error). One the kernel refuses does not stop
+    /// the others: the first refusal is returned after all were tried.
     pub fn delete(conns: &[Conn]) -> Result<usize, HalError> {
         let mut sock = open()?;
         let mut done = 0;
+        let mut refused: Option<HalError> = None;
         for (i, c) in conns.iter().enumerate() {
             let seq = u32::try_from(i).unwrap_or(u32::MAX).wrapping_add(10);
             sock.send(&super::delete_request(c, seq), 0).map_err(io)?;
             match read(&mut sock, seq, |_, _| true) {
                 Ok(()) => done += 1,
                 Err(HalError::Rejected(e)) if e.contains("No such file") => {}
+                Err(e @ HalError::Rejected(_)) => {
+                    refused.get_or_insert(e);
+                }
                 Err(e) => return Err(e),
             }
         }
-        Ok(done)
+        match refused {
+            Some(e) if done == 0 => Err(e),
+            Some(e) => {
+                log::warn!("conntrack: {done} of {} killed; {e}", conns.len());
+                Ok(done)
+            }
+            None => Ok(done),
+        }
     }
 }
 
