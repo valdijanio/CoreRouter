@@ -49,6 +49,8 @@ pub(crate) struct Column {
     pub right: bool,
     /// The item's comment: drawn above the row with Inline Comments on.
     pub comment: bool,
+    /// Secondary text (why a route is inactive): drawn in the weak colour.
+    pub weak: bool,
 }
 
 pub(crate) const fn col(title: &'static str) -> Column {
@@ -56,6 +58,7 @@ pub(crate) const fn col(title: &'static str) -> Column {
         title,
         right: false,
         comment: false,
+        weak: false,
     }
 }
 
@@ -64,6 +67,17 @@ pub(crate) const fn num(title: &'static str) -> Column {
         title,
         right: true,
         comment: false,
+        weak: false,
+    }
+}
+
+/// A column of secondary text, in grey (G1.27: the reason of a route).
+pub(crate) const fn weak(title: &'static str) -> Column {
+    Column {
+        title,
+        right: false,
+        comment: false,
+        weak: true,
     }
 }
 
@@ -73,6 +87,7 @@ pub(crate) const fn comment() -> Column {
         title: "Comment",
         right: false,
         comment: true,
+        weak: false,
     }
 }
 
@@ -167,6 +182,8 @@ pub(crate) enum Shortcut {
 pub(crate) struct TableOutput {
     /// Key of the row that was double-clicked.
     pub opened: Option<String>,
+    /// Key of the row clicked this frame (G1.27: an ECMP group opens).
+    pub clicked: Option<String>,
     /// Key of the item whose inline comment was double-clicked: edit the
     /// comment (a window without a comment dialog treats it as `opened`).
     pub comment: Option<String>,
@@ -651,6 +668,7 @@ pub(crate) fn show(
                     out.opened = Some(row.key.clone());
                 }
                 if resp.clicked() {
+                    out.clicked = Some(row.key.clone());
                     let m = ui.input(|i| i.modifiers);
                     state.click(&row.key, m.command, m.shift, &order);
                     ui.memory_mut(|mem| mem.request_focus(id));
@@ -1107,7 +1125,15 @@ fn paint_cells<'a>(
         };
         let shown = shown_text(text(i));
         let (cell, chips) = crate::chip::split(&shown);
-        let drawn = ui.painter().text(at, anchor, cell, font.clone(), color);
+        // A weak column greys plain text only (a selected, dimmed or
+        // tinted row keeps its colour).
+        let weak = columns.get(i).is_some_and(|c| c.weak) && color == ui.visuals().text_color();
+        let ink = if weak {
+            ui.visuals().weak_text_color()
+        } else {
+            color
+        };
+        let drawn = ui.painter().text(at, anchor, cell, font.clone(), ink);
         if !chips.is_empty() {
             crate::chip::paint_cell_chips(
                 ui.painter(),

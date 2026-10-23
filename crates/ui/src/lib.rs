@@ -260,6 +260,8 @@ pub struct CoreRouterUi {
     route_dialogs: Vec<routes::RouteDialogWin>,
     /// Routes to open once an `ip.route.list` sent after this id arrives.
     open_route_after: Vec<(RequestId, String)>,
+    /// IP › Routes filters, lookup and open ECMP groups (G1.27).
+    route_view: routes::View,
     /// "New VRF" / "VRF <name>" / VRF "Comment" windows.
     vrf_dialogs: Vec<vrf::VrfDialogWin>,
     /// VRFs to open once an `ip.vrf.list` sent after this id arrives.
@@ -327,6 +329,7 @@ impl CoreRouterUi {
             lang: i18n::Langs::default(),
             route_dialogs: Vec::new(),
             open_route_after: Vec::new(),
+            route_view: routes::View::default(),
             vrf_dialogs: Vec::new(),
             open_vrf_after: Vec::new(),
             fw: firewall::State::default(),
@@ -1989,7 +1992,10 @@ mod tests {
     #[test]
     fn new_route_dialog_adds_a_default_route() {
         let mut h = Harness::routes();
-        assert!(h.has_text("ADC"), "connected route listed");
+        assert!(
+            h.has_text("10.0.0.0/24") && h.has_text("connected"),
+            "connected route listed"
+        );
         h.click(h.route_tool(table::Icon::Add).rect.center());
         assert!(h.has_text("New Route"));
         h.click(h.text("0.0.0.0/0"));
@@ -2000,10 +2006,12 @@ mod tests {
         assert!(h.app.route_dialogs.is_empty(), "OK closes on success");
         let r = h.route("*1").expect("route created");
         assert_eq!((&r["flags"], &r["distance"]), (&json!("AS"), &json!(1)));
+        // G1.27: the gateway in parts, the state as a chip.
         assert!(
-            h.has_text("10.0.0.1 reachable ether1"),
-            "WinBox gateway column"
+            h.has_text("10.0.0.1") && h.has_text("reachable") && h.has_text("ether1"),
+            "gateway column"
         );
+        assert!(h.has_text("active"));
 
         // A bad gateway keeps the dialog open with the engine's reason.
         h.click(h.route_tool(table::Icon::Add).rect.center());

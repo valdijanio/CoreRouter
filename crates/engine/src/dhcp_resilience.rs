@@ -78,6 +78,19 @@ fn from_hex(s: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// The check-gateway of one route, as `ip.route.list` shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RouteCheck {
+    /// `arp` | `ping`.
+    pub method: &'static str,
+    pub interval_secs: u64,
+    /// Checks unanswered in a row.
+    pub misses: u32,
+    pub down: bool,
+    /// Session clock (ms) when it went down.
+    pub down_since_ms: Option<u64>,
+}
+
 /// The gateway check of one client.
 #[derive(Default)]
 pub(crate) struct GatewayCheck {
@@ -88,6 +101,8 @@ pub(crate) struct GatewayCheck {
     misses: u32,
     /// Its routes are withheld.
     pub down: bool,
+    /// Session clock (ms) when it went down (G1.27: "failed N s ago").
+    pub down_since: Option<u64>,
     seq: u16,
     ping: Option<Box<dyn ProbeSocket>>,
 }
@@ -386,7 +401,10 @@ impl Session {
             if answered {
                 r.gw.misses = 0;
                 if r.gw.down {
-                    self.dhcp_change(id, |r| r.gw.down = false);
+                    self.dhcp_change(id, |r| {
+                        r.gw.down = false;
+                        r.gw.down_since = None;
+                    });
                     self.dhcp_note_id(
                         id,
                         "gateway",
@@ -397,7 +415,10 @@ impl Session {
                 r.gw.misses = r.gw.misses.saturating_add(1);
                 if r.gw.misses >= CHECK_MISSES && !r.gw.down {
                     let how = mode.as_str();
-                    self.dhcp_change(id, |r| r.gw.down = true);
+                    self.dhcp_change(id, |r| {
+                        r.gw.down = true;
+                        r.gw.down_since = Some(now);
+                    });
                     self.dhcp_note_id(
                         id,
                         "gateway",
@@ -441,6 +462,32 @@ impl Session {
         if let Some(iface) = self.dhcp.runners.get(&id).map(|r| r.cfg.interface.clone()) {
             self.dhcp_note(id, iface, event, message);
         }
+    }
+
+    /// The check-gateway of every lease route that has one, by route id
+    /// (G1.27: the Routes window shows it next to the gateway).
+    pub(crate) fn dhcp_route_checks(&self) -> Vec<(ItemId, RouteCheck)> {
+        let mut out = Vec::new();
+        for r in self.dhcp.runners.values() {
+            let Some(gw) = r.gw.target else { continue };
+            for route in r
+                .routes
+                .iter()
+                .filter(|rt| rt.gateway.address() == Some(IpAddr::V4(gw)))
+            {
+                out.push((
+                    route.id,
+                    RouteCheck {
+                        method: r.cfg.check_gateway.as_str(),
+                        interval_secs: CHECK_INTERVAL_MS / 1000,
+                        misses: r.gw.misses,
+                        down: r.gw.down,
+                        down_since_ms: r.gw.down_since,
+                    },
+                ));
+            }
+        }
+        out
     }
 
     /// Lease routes withheld because their gateway is down, with why (for
