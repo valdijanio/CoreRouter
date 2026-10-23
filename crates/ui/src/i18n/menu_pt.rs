@@ -34,6 +34,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
 
 pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.addresses", "## O que faz\nOs endereços IPv4 das interfaces do roteador. Cada endereço também cria a rota conectada da sua rede.\n\nUm endereço pode vir de um pool (delegação de prefixo) ou de uma concessão DHCP; a coluna Origin diz de onde."),
+    ("menu.analytics", "## O que faz\nEnvia as métricas, o log, os fluxos e os eventos de NAT do roteador para um ClickHouse que você mantém, em lotes, para ter meses de histórico e todos os roteadores num lugar só (o Grafana lê de lá).\n\nO roteador não guarda nada de longo prazo aqui: uma fila em memória (e, se quiser, em disco) segura as linhas enquanto o servidor está fora."),
     ("menu.bgp", "## O que faz\nA instância BGP: o AS do roteador, o router id e as sessões com os peers (operadoras, IX, clientes). O protocolo roda no FRR; esta janela o configura."),
     ("menu.bonding", "## O que faz\nBonds juntam várias portas num link só (LACP 802.3ad, active-backup, balance-xor…) para ter mais capacidade e redundância quando um cabo ou porta cai."),
     ("menu.cgnat", "## O que faz\nNAT de operadora (CGNAT) para assinantes em IPv4 compartilhado (RFC 6598, 100.64.0.0/10): pools determinísticos (RFC 7422, sem log por conexão) ou em blocos sob demanda (RFC 6888, log por bloco), exceções 1:1, EIM/EIF e hairpin (RFC 4787), o \"Quem era?\" (IP público + porta + hora – assinante, o que o Marco Civil pede), a tabela de correspondência, os blocos e os alertas de portas esgotadas."),

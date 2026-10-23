@@ -1129,6 +1129,7 @@ dependencies = [
  "corerouter-proto-syslog",
  "corerouter-storage-fs",
  "env_logger",
+ "flate2",
  "hickory-proto",
  "httparse",
  "log",
