@@ -104,6 +104,27 @@ impl Frames {
         me
     }
 
+    /// IP › Routes over a full table of `n` routes (G1.27c): a session
+    /// holding them, which the window asks for a page at a time (before
+    /// G1.27c it received and drew the whole list each frame: 4.47 s per
+    /// frame for a million, **medido**).
+    pub fn routes(n: usize) -> Self {
+        let mut me = Self::with(
+            corerouter_engine::perf::with_running(corerouter_engine::perf::full_table(n)),
+            Some(Win::Routes),
+        );
+        // Answers within the frame (local backend): let the page arrive.
+        me.app.cache.refreshed_at = None;
+        me.frame();
+        me.frame();
+        me
+    }
+
+    /// Rows the Routes window holds now (the page it received).
+    pub fn routes_shown(&self) -> usize {
+        self.app.cache.routes.len()
+    }
+
     /// A terminal window holding `lines` output lines of `len` characters.
     pub fn terminal(lines: usize, len: usize) -> Self {
         let mut me = Self::with(Session::virtual_lab(), None);

@@ -240,6 +240,42 @@ lock do `Session`. Terminal: `/tool dns-lookup example.com type=MX dnssec=yes` (
   MICROSOFT-CORP-MSN-AS-BLOCK`), e um valor só termina em "…" (com o todo no tooltip) quando não
   cabe nem assim.
 
+#### Watch e Upstreams (G6.8)
+
+- **`tool.dns.watch {name, type?, server?, interval_ms?, count?, tcp?}`** (`/tool dns-watch`,
+  aba **Watch**), como o `dnsping` do dnsdiag: a mesma pergunta a cada `interval_ms` (100 a
+  60 000, padrão 1000) até o Stop (ou Esc na janela), ou `count` consultas (no máximo 100 000).
+  Cada consulta é um evento `watch` (hora UTC, latência, status, etapa do roteador, menor TTL e
+  a resposta comparável: sem TTL e em ordem). `changed` quando a resposta difere da anterior;
+  `spike` quando a latência passa de 3× a mediana até ali e de 20 ms a mais (depois de 5
+  respostas). Janela: gráfico latência × tempo (picos em vermelho, mudanças em âmbar, perdas
+  como ×) e a tabela, mais nova primeiro, com os selos `changed` e `spike`.
+- **`tool.dns.upstreams {count?, hijack?}`** (`/tool dns-upstreams`, aba **Upstreams**), como
+  o `dnseval` e o namebench: cada servidor que o roteador pode perguntar (`ip.dns servers`,
+  `use_doh_server` e os servidores de cada grupo de forwarders, uma linha só por servidor com
+  os grupos que o citam) recebe `count` consultas (padrão 200, 10 a 2000), alternando nomes
+  populares (em cache no servidor) e nomes aleatórios abaixo deles (nunca em cache: mede a
+  recursão do próprio servidor). Até 48 consultas em voo; um servidor que dá 6 timeouts
+  seguidos antes de responder é dado como fora do ar e não é mais perguntado.
+  - Por servidor: p50 e p99, perda, % de SERVFAIL, transporte (UDP, DoH, DoT), TCP (uma
+    consulta por TCP: o caminho da resposta truncada, RFC 7766 §5) e EDNS (o buffer que o
+    servidor oferece; sem OPT na resposta é a falha da RFC 8906 §8.2).
+  - **Check hijack** (servidores sem cifra): dois nomes aleatórios `.com` que não existem; uma
+    resposta no lugar de NXDOMAIN é `NXDOMAIN hijacked` (o teste do namebench). E quem chega aos
+    autoritativos: `whoami.ds.akahelp.net` TXT (o par `"ns"` é o resolvedor; o `"ip"` é o
+    endereço público deste roteador) e `o-o.myaddr.l.google.com` TXT. Se esse resolvedor é da
+    **rede do próprio cliente** (o AS do IP público do roteador) e não da do servidor, é
+    `proxy on the path` (Liu et al., USENIX Security 2018: a interceptação responde de dentro
+    do provedor). Se é de outra rede que não a do cliente, vira só uma nota `other network`:
+    o Quad9 sai por redes de parceiros (no lab: 9.9.9.9 por 200.25.72.0/24, AS7195). Servidor
+    em endereço privado ou CGNAT é um encaminhador: a nota diz por onde ele sai.
+  - **Recomendação** (`summary.recommend`): sai quem sequestra NXDOMAIN, é interceptado, nunca
+    respondeu, perde ≥ 10% ou dá SERVFAIL em ≥ 10%; sai também quem tem p50 ≥ 3× (e 20 ms a
+    mais) o melhor **do mesmo tipo** (DoH/DoT comparados entre si: pagam o handshake pela
+    privacidade); dos que ficam, os dois mais rápidos (p50, depois p99) são os indicados.
+    Notas: sem TCP, sem EDNS, outra rede, encaminhador. Cada item tem `why` (id) e `args`; a
+    janela mostra o texto no idioma das explicações.
+
 Codec em `crates/proto-dns/src/dig.rs` (sem sockets, compila em WASM); a tarefa em
 `crates/engine/src/dns_lookup.rs`; o transporte no daemon em
 `apps/corerouter-daemon/src/service/dns_lookup.rs` (`DnsBackend::exchange`).
