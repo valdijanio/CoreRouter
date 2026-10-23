@@ -24,6 +24,35 @@ use crate::dhcp_client::is_dynamic;
 use crate::dhcp_resilience::RouteCheck;
 use crate::dhcp6_client::ra_id;
 
+/// Every reason a route can be standby or inactive (`reason_id`), with the
+/// English wording and its `{argument}` places (`reason_args`): the GUI
+/// translates by id (G0.15), and a test checks each translation has the
+/// same places. The ids from `corerouter_model::route::reach` are here too.
+pub const REASONS: &[(&str, &str)] = &[
+    ("address-disabled", "the address of '{interface}' that reaches {gateway} is disabled"),
+    ("bond-slave", "'{interface}' is a slave of bond '{master}'; route through '{master}' instead"),
+    ("bridge-port", "'{interface}' is a port of bridge '{master}'; route through '{master}' instead"),
+    ("check-gateway", "check-gateway={method} failed {secs} s ago: {gateway} does not answer"),
+    ("check-gateway-down", "check-gateway={method}: {gateway} does not answer"),
+    ("connected-disabled", "interface '{interface}' or its address is disabled"),
+    ("connected-wins", "the connected network on {interface} wins"),
+    ("disabled", "route is disabled"),
+    ("empty", "gateway is empty"),
+    ("family-mismatch", "gateway {gateway} and dst-address {dst} are of different families"),
+    ("interface-disabled", "interface '{interface}' (or its VRF) is disabled"),
+    ("interface-down", "interface '{interface}' has no link"),
+    ("loses-distance", "loses to distance {distance} (route {route} via {via})"),
+    ("needs-interface", "link-local gateway {gateway} needs an interface: {gateway}%<interface>"),
+    ("network-disabled", "the network of {gateway} is on a disabled address or interface"),
+    ("no-interface", "interface '{interface}' does not exist"),
+    ("no-table", "routing table '{table}' does not exist (create it with ip.vrf.add)"),
+    ("not-on-interface", "{gateway} is not in a network of '{interface}'"),
+    ("other-table", "'{interface}' is in routing table '{table}', not '{route_table}'"),
+    ("own-address", "{gateway} is an address of this router (on '{interface}')"),
+    ("tie", "route {route} via {via} has the same distance and wins"),
+    ("unreachable", "{gateway} is not in any connected network of routing table '{table}'"),
+];
+
 /// Where a route comes from (RouterOS' `c s d` … source flags).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {

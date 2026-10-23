@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use corerouter_engine::Session;
+use corerouter_engine::route_table::REASONS;
 use corerouter_hal::drift::KernelRoute;
 use corerouter_hal::route_get::{KernelLookup, RouteQuery};
 use corerouter_hal::virt::LabKernel;
@@ -110,10 +111,12 @@ impl T {
     }
 
     fn list(&mut self, p: Value) -> Vec<Value> {
-        ok(&mut self.s, "ip.route.list", p)
+        let rows = ok(&mut self.s, "ip.route.list", p)
             .as_array()
             .unwrap()
-            .clone()
+            .clone();
+        rows.iter().for_each(listed_reason);
+        rows
     }
 
     fn row(&mut self, id: &str) -> Value {
@@ -140,6 +143,34 @@ impl T {
             u.remove(name);
         }
     }
+}
+
+/// A row's reason is one of `REASONS`, with exactly its places as args
+/// (what the GUI's translation fills in).
+fn listed_reason(r: &Value) {
+    let Some(id) = r["reason_id"].as_str() else {
+        assert_eq!(r["reason"], Value::Null, "{r}");
+        return;
+    };
+    let (_, en) = REASONS
+        .iter()
+        .find(|(i, _)| *i == id)
+        .unwrap_or_else(|| panic!("reason {id} not in REASONS"));
+    let mut places: Vec<&str> = en
+        .split('{')
+        .skip(1)
+        .filter_map(|p| p.split_once('}').map(|(n, _)| n))
+        .collect();
+    places.sort_unstable();
+    places.dedup();
+    let mut args: Vec<&str> = r["reason_args"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    args.sort_unstable();
+    assert_eq!(args, places, "{id}: {r}");
 }
 
 // ---- ip.route.list ----

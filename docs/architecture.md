@@ -465,6 +465,18 @@ escrevem regras comuns pelo mesmo `add` dos comandos de regra; a GUI só junta p
   recoloca depois, para que o desfazer de uma falha devolva tudo. Rota existente no kernel só é
   adotada se for idêntica (static, mesma tabela/métrica/next hop); outra rota no mesmo destino e
   métrica faz o apply falhar e desfazer.
+- **ECMP (G1.27a):** rotas de mesma distância ao mesmo destino formam um grupo (como no RouterOS
+  v7). O plano e o drift continuam vendo um `KernelRoute` por caminho; quem junta é o executor
+  netlink: o primeiro op de rota de um apply lê as rotas `static` do kernel uma vez (cache do
+  apply), e acrescentar/tirar um caminho de um grupo reescreve a rota inteira com
+  `RTA_MULTIPATH` (`NLM_F_REPLACE`). Só caminhos que o config de origem ou de destino põe no
+  kernel entram num grupo: uma rota `static` de outro programa no mesmo destino e métrica
+  continua fazendo o apply falhar. Escolhido em vez de mudar o `Op` do plano para "grupo" porque
+  o IPv4 apaga a rota multipath inteira se o delete casa só o primeiro caminho, então o executor
+  precisa da visão do kernel de qualquer jeito, e o plano (e os testes dele) ficam como estão.
+  Custo: uma leitura de links e rotas por apply que mexe em rota (`hal_linux_apply/routes` em
+  `docs/routes.md` e no `docs/perf.md`). Detalhes da janela, do motivo e do lookup:
+  `docs/routes.md`.
 
 Proteções do host: só interfaces do config entram no plano; o `lo` do kernel não é descoberto;
 link existente só é adotado se tiver o mesmo tipo (e VLAN id/pai) do config, e nunca se apaga
