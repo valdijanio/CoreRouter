@@ -198,7 +198,7 @@ runs do Actions, não dos check-runs (o GitHub já deixou um check-run preso em 
   roda **um** CI completo nessa combinação, que é o que a `main` vai ser: o "sozinho passa,
   junto quebra" aparece aqui. Verde: squash de cada PR em ordem, sem esperar mais CI. Um PR que
   conflita de verdade fica de fora (a sessão dona resolve); conflito só nos documentos do fold
-  a fila resolve sozinha. Um CI por lote (~4–6 min de ponta a ponta, **medido**).
+  ou de **PR empilhado** a fila resolve sozinha (abaixo). Um CI por lote (~4–6 min de ponta a ponta, **medido**).
 - **Lote vermelho:** bisseção — a fila divide ao meio e testa cada metade, até isolar quem quebra
   (~log₂ N CIs); os outros entram, quem quebra fica de fora para a sessão dona corrigir.
 - **Fold periódico:** os `docs/changes/` são consolidados em log, gaps, histórico e perf só com
@@ -252,6 +252,12 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
   principal (sessões não planejadas mexem nos mesmos arquivos e geram conflito).
 - **PRs pequenos e focados**: entram mais rápido e reduzem a janela de conflito. Feature grande
   vira vários PRs sequenciais, um por sessão.
+- **Pode empilhar.** A parte seguinte pode sair da branch da anterior (`git switch -c
+  stream/<id>-c stream/<id>-b`), sem esperar a fila. Quando a anterior entra por squash, a
+  seguinte passa a trazer as mudanças dela duas vezes e o GitHub acusa conflito; a fila resolve
+  sozinha: se, em cada arquivo em conflito, a `main` tem exatamente o que o PR pai tinha, ela fica
+  com o lado do PR (pai + o que ele mudou), dá push na branch e segue. Arquivo que não bate com o
+  pai é conflito de verdade e volta para a sessão dona.
 - **Arquivo novo em vez de lista compartilhada.** Os registros que todo PR editava (e onde PRs
   paralelos conflitavam) agora são gerados a partir dos arquivos:
   - área de comandos nova: `crates/engine/src/cmd/<área>.rs` com `COMMANDS` — o `build.rs` do

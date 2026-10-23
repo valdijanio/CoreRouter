@@ -121,18 +121,75 @@ FOLD_DOCS="docs/log.md docs/gaps-history.md docs/perf.md docs/gaps.md"
 # `git merge` de $1 (mensagem $2) que resolve sozinho os conflitos só em FOLD_DOCS. 0: limpo ou
 # resolvido; 1: conflito de verdade (merge abortado; arquivos em $conflicts).
 conflicts=""
+# Heads de PRs já integrados que são ancestrais de $1: os "pais" de um PR empilhado.
+merged_parents() {
+  local s
+  gh pr list -R "$repo" --state merged --limit 60 --json headRefOid --jq '.[].headRefOid' 2>/dev/null |
+    while read -r s; do
+      git merge-base --is-ancestor "$s" "$1" 2>/dev/null && printf '%s\n' "$s"
+    done
+  return 0
+}
+
+# O lado da main tem em $1 exatamente o que um pai ($2…) tinha: o conflito é o squash desse pai.
+from_parent() {
+  local f=$1 main_side=$2 m p
+  shift 2
+  m=$(git rev-parse -q --verify "$main_side:$f" 2>/dev/null || true)
+  for p in "$@"; do
+    [ "$m" = "$(git rev-parse -q --verify "$p:$f" 2>/dev/null || true)" ] && return 0
+  done
+  return 1
+}
+
+# Merge que resolve sozinho dois conflitos que não são de verdade:
+# - nos documentos do fold (union das entradas);
+# - de **PR empilhado**: a branch saiu da branch de outro PR que entrou por squash, então traz os
+#   commits originais do pai e a main traz o squash dele. Se, em cada arquivo em conflito, a main
+#   tem exatamente o que o pai tinha, o lado certo é o do PR (pai + o que ele mudou). Foi o que as
+#   sessões fizeram à mão em #112, G4.2b/c, #146 e #147 (2026-10-22/23).
+# Qualquer outro arquivo em conflito: aborta (a sessão dona resolve). $3 = pr-is-ours quando o PR
+# é o HEAD (a main entra na branch do PR); sem ele, o PR é quem entra (lote).
 merge_fold_aware() {
-  local f
+  local f pr_side main_side parents stacked=""
   conflicts=""
   git merge --quiet --no-edit "$1" -m "$2" >/dev/null 2>&1 && return 0
   conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ')
+  if [ "${3:-}" = pr-is-ours ]; then
+    pr_side=HEAD main_side=MERGE_HEAD
+  else
+    pr_side=MERGE_HEAD main_side=HEAD
+  fi
+  parents=""
   for f in $conflicts; do
     case " $FOLD_DOCS " in
-      *" $f "*) ;;
-      *) git merge --abort; return 1 ;;
+      *" $f "*) continue ;;
     esac
+    if [ -z "$parents" ]; then
+      parents=$(merged_parents "$(git rev-parse "$pr_side")" | tr '\n' ' ')
+      [ -n "$parents" ] || parents=none
+    fi
+    # shellcheck disable=SC2086 # a lista de shas, um por palavra
+    if [ "$parents" != none ] && from_parent "$f" "$main_side" $parents; then
+      stacked="$stacked$f "
+      continue
+    fi
+    git merge --abort
+    return 1
   done
+  for f in $stacked; do
+    if git cat-file -e "$pr_side:$f" 2>/dev/null; then
+      git show "$pr_side:$f" > "$f"
+      git add "$f"
+    else
+      git rm --quiet "$f"
+    fi
+  done
+  [ -z "$stacked" ] || say "  PR empilhado: conflito do squash do pai resolvido com o lado do PR ($stacked)"
   for f in $conflicts; do
+    case " $stacked " in
+      *" $f "*) continue ;;
+    esac
     git show ":1:$f" > "$f.base" 2>/dev/null || : > "$f.base"
     git show ":2:$f" > "$f.ours"
     git show ":3:$f" > "$f.theirs"
@@ -147,7 +204,8 @@ merge_fold_aware() {
     git add "$f"
   done
   git commit --quiet --no-edit
-  say "  conflito só nos documentos do fold ($conflicts): resolvido, entradas dos dois lados"
+  [ "$stacked" = "$conflicts" ] ||
+    say "  conflito nos documentos do fold ($conflicts): resolvido, entradas dos dois lados"
   return 0
 }
 
@@ -165,7 +223,7 @@ refresh_if_conflicting() {
   w="$dir/refresh-$n"
   git -C "$root" worktree remove --force "$w" 2>/dev/null || true
   git -C "$root" worktree add --quiet --detach "$w" "origin/$branch"
-  if (cd "$w" && merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)" &&
+  if (cd "$w" && merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)" pr-is-ours &&
     git push --quiet origin "HEAD:refs/heads/$branch"); then
     head=$(git -C "$w" rev-parse HEAD)
     git -C "$root" worktree remove --force "$w"
@@ -490,7 +548,7 @@ for n in "${serial[@]}"; do
   git -C "$root" worktree add --quiet --detach "$wt" "origin/$branch"
   cd "$wt"
 
-  if ! merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)"; then
+  if ! merge_fold_aware "origin/$base" "Merge origin/$base em $branch (fila de entrada)" pr-is-ours; then
     stop "$n" "conflito real com a $base em: $conflicts— a sessão dona resolve na branch"
   fi
 
