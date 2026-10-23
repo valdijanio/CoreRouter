@@ -277,6 +277,65 @@ tabela e na matriz: aceitar verde, bloquear (drop/reject) vermelho, NAT azul, ma
 inválida na cor de erro e sombreada na de aviso do tema. Testado: contraste WCAG ≥ 4,5:1 com o
 fundo nos temas claro e escuro.
 
+## 12. Connections (G2.2)
+
+A aba **Connections** da janela IP › Firewall é a tabela do conntrack, como o
+`/ip firewall connection` do RouterOS. O `hal-linux` a lê por **ctnetlink** (`crates/hal-linux/src/ctnl.rs`:
+dump, estatísticas, delete), sem o programa `conntrack`. O lab mostra uma tabela simulada, feita a partir
+dos pools de CGNAT (`crates/hal/src/lab_conntrack.rs`).
+
+| Comando | O que faz |
+|---|---|
+| `ip.firewall.connection.list` | uma página (≤ 5000 linhas) do que casa com os filtros, mais o uso da tabela |
+| `ip.firewall.connection.top` | os assinantes com mais conexões e quanto do bloco de portas do CGNAT cada um usa |
+| `ip.firewall.connection.kill` | derruba uma conexão, por `id`, ou todas as que casam com um filtro |
+| `ip.firewall.connection.tracking.info` | os timeouts e o tamanho da tabela |
+| `ip.firewall.connection.tracking.set` | muda os timeouts e o tamanho da tabela |
+
+`list` filtra por:
+
+- protocolo;
+- origem e destino (endereço ou prefixo);
+- porta;
+- estado;
+- assinante;
+- IP público;
+- Via;
+- srcnat ou dstnat.
+
+`list` ordena por timeout, bytes ou pacotes.
+
+`kill` sem nenhum filtro exige `all=true`.
+
+Os nomes de `tracking.info` e `tracking.set` são os do RouterOS.
+
+Detalhes:
+
+- **Timeouts são parâmetros do Tuning.** `tracking.set` grava os mesmos `net.netfilter.nf_conntrack_*` de
+  System › Tuning (G1.26), com as mesmas faixas. Os valores ficam num lugar só e são exportados lá. Os
+  padrões do Linux diferem dos do RouterOS: `udp-timeout` é 30 s nos dois, mas `tcp-established` é 5 dias
+  no Linux e 1 dia no RouterOS. As explicações do ⓘ citam as RFCs: 5382 REQ-5, 4787 REQ-5, 5508 REQ-2,
+  7857 §2.1.
+- **Uso da tabela.** A barra mostra `count / nf_conntrack_max`, verde, âmbar a partir de 70 % e vermelha a
+  partir de 90 %. Um clique abre System › Tuning. Selos vermelhos mostram `insert failed`, `dropped` e
+  `early drop` quando passam de zero. Sem tupla livre no NAT, o kernel descarta e só conta
+  `insert_failed`.
+- **Coluna Via.** `rules` (o caminho normal), `software` (flowtable, o "fasttrack") e `hardware` (offload
+  na placa). Vem dos bits `IPS_OFFLOAD` e `IPS_HW_OFFLOAD` do conntrack. As flags seguem o RouterOS:
+  - `S` seen-reply;
+  - `A` assured;
+  - `C` confirmed;
+  - `s` srcnat;
+  - `d` dstnat;
+  - `F` fasttrack;
+  - `H` hw-offload.
+- **Sem travar.** A janela pede uma página de 500 linhas por vez (`‹ 1–500 de N ›`), nunca a tabela
+  inteira. O engine lê o kernel no máximo a cada 2 s e reaproveita a leitura entre as páginas e o top.
+  O botão Pause congela a leitura.
+- **Top subscribers.** Conta as conexões e as portas públicas distintas de cada assinante, por
+  protocolo; vale o protocolo mais cheio. O selo fica âmbar a partir de 70 % do bloco e vermelho a partir
+  de 90 %. Um clique filtra a tabela por aquele assinante.
+
 ## Histórico de revisão
 
 - 2026-10-22 — versão inicial (G2.1a).

@@ -227,6 +227,8 @@ pub(crate) enum Tab {
     Mangle,
     Addr,
     Zones,
+    /// The conntrack table (G2.2, `connections.rs`).
+    Connections,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -1119,6 +1121,7 @@ impl CoreRouterUi {
                 (Tab::Mangle, "Mangle"),
                 (Tab::Addr, "Address Lists"),
                 (Tab::Zones, "Zones"),
+                (Tab::Connections, "Connections"),
             ] {
                 ui.selectable_value(&mut self.fw.tab, tab, label);
             }
@@ -1130,7 +1133,14 @@ impl CoreRouterUi {
             Tab::Mangle => self.rules_tab(ui, FwTable::Mangle),
             Tab::Addr => self.simple_tab(ui, Feed::Addr),
             Tab::Zones => self.zones_tab(ui),
+            Tab::Connections => self.connections_tab(ui),
         }
+    }
+
+    /// Whether the Firewall window shows its Connections tab (the
+    /// Connections panel asks for the table only then).
+    pub(crate) fn firewall_tab_is_connections(&self) -> bool {
+        self.fw.tab == Tab::Connections
     }
 
     /// Interfaces › Interface List.

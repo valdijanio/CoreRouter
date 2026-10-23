@@ -22,6 +22,8 @@
 //! (`prefs.rs`).
 
 mod dns_lookup_pt;
+mod connections_en;
+mod connections_pt;
 mod en;
 mod menu_en;
 mod menu_pt;
@@ -70,6 +72,7 @@ impl Lang {
                 tuning_pt::LABELS,
                 menu_pt::LABELS,
                 routes_pt::LABELS,
+                connections_pt::LABELS,
                 dns_lookup_pt::LABELS,
             ],
         }
@@ -78,8 +81,8 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP],
         }
     }
 
