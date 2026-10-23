@@ -21,6 +21,7 @@
 //! A preference of the window, not of the router: stored with the theme
 //! (`prefs.rs`).
 
+mod dns_lookup_pt;
 mod en;
 mod menu_en;
 mod menu_pt;
@@ -69,6 +70,7 @@ impl Lang {
                 tuning_pt::LABELS,
                 menu_pt::LABELS,
                 routes_pt::LABELS,
+                dns_lookup_pt::LABELS,
             ],
         }
     }
@@ -85,7 +87,7 @@ impl Lang {
     fn templates(self) -> &'static [Table] {
         match self {
             Lang::En => &[],
-            Lang::Pt => &[tuning_pt::TEMPLATES, routes_pt::TEMPLATES],
+            Lang::Pt => &[tuning_pt::TEMPLATES, routes_pt::TEMPLATES, dns_lookup_pt::TEMPLATES],
         }
     }
 }
@@ -228,6 +230,13 @@ mod tests {
                 assert_eq!(places(en), places(pt), "{key}");
                 ids.push(key);
             }
+        }
+        for (id, en) in corerouter_engine::dns_lookup::WHY_TEXTS {
+            let key = format!("dnswhy.{id}");
+            let pt = lookup(Lang::Pt.templates(), &key)
+                .unwrap_or_else(|| panic!("dns_lookup_pt.rs lacks {key}"));
+            assert_eq!(places(en), places(pt), "{key}");
+            ids.push(key);
         }
         for (k, _) in Lang::Pt.templates().iter().flat_map(|t| t.iter()) {
             assert!(ids.iter().any(|i| i == k), "{k}: the engine has no such text");

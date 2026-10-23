@@ -155,7 +155,7 @@ pub(crate) fn neutral_tone(v: &egui::Visuals) -> Tone {
 }
 
 /// Font size of the pills: a step below the table's.
-fn small(ui: &Ui) -> f32 {
+pub(crate) fn small(ui: &Ui) -> f32 {
     ui.style()
         .text_styles
         .get(&egui::TextStyle::Body)
