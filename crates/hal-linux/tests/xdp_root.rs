@@ -13,7 +13,7 @@
 //!    counters, the top-sources table, the allow list winning.
 //! 4. Measured (printed as `PERF |` lines): ns per packet in the kernel by
 //!    block-trie size (the cost per LPM entry), time to load N prefixes,
-//!    and pktgen over veth with no filter, nftables raw drop and XDP drop.
+//!    and a userspace sender over veth: no filter, nftables raw drop, XDP drop.
 #![allow(
     clippy::unwrap_used,
     clippy::expect_used,
@@ -363,43 +363,84 @@ fn perf_lpm_cost() {
     }
 }
 
-/// Measured (4): pktgen blasting 64-byte UDP over veth into `xa` from
-/// random sources; how many packets per second the receive side gets
-/// through with no filter, with an nftables raw-table drop of the sources
-/// (the kernel path the Firewall uses), and with XDP generic and native
-/// drop. One core does both sides (veth), so this compares costs; it is
-/// not a NIC's line rate.
+/// Measured (4): a userspace sender blasting 64-byte UDP frames from
+/// random sources in 198.18.0.0/15 out of `yb` into its veth peer `ya`
+/// (both here), for two seconds per case: no filter (the kernel stack
+/// drops them), an nftables raw-table drop of those sources (the kernel
+/// path the Firewall uses), and XDP drop by block list, generic and native.
+/// The sender and the receive side share one core for the stack and generic
+/// cases (veth hands the frame over in the sender's softirq), so the send
+/// rate is what the receive cost allows; native veth XDP runs in the
+/// peer's NAPI instead. It compares costs; it is not a NIC's line rate.
+/// (pktgen hung the CI VM even with a reset: never again.)
 #[test]
-fn perf_pktgen_veth() {
+fn perf_veth_blast() {
     if !enabled() {
         return;
     }
-    if !std::path::Path::new("/proc/net/pktgen").exists() && !sh_ok(&["modprobe", "pktgen"]) {
-        println!("PERF | pktgen unavailable: skipped");
-        return;
-    }
-    let pair = Pair::new();
-    let _ = &pair;
-    let mac = sh(&["cat", "/sys/class/net/xa/address"]).trim().to_owned();
-    let count: u64 = 1_000_000;
-    let run = |label: &str, counter: &dyn Fn() -> u64| {
-        let before = counter();
+    let _ = sh_ok(&["ip", "link", "del", "ya"]);
+    sh(&[
+        "ip", "link", "add", "ya", "type", "veth", "peer", "name", "yb",
+    ]);
+    sh(&["ip", "addr", "add", "10.98.0.1/24", "dev", "ya"]);
+    sh(&["ip", "link", "set", "ya", "up"]);
+    sh(&["ip", "link", "set", "yb", "up"]);
+    let mac: Vec<u8> = sh(&["cat", "/sys/class/net/ya/address"])
+        .trim()
+        .split(':')
+        .filter_map(|h| u8::from_str_radix(h, 16).ok())
+        .collect();
+    let frames: Vec<Vec<u8>> = (0..1024u32)
+        .map(|i| {
+            let mut f = udp4([198, 18 + (i >> 16) as u8 % 2, (i >> 8) as u8, i as u8]);
+            f[..6].copy_from_slice(&mac);
+            f[30..34].copy_from_slice(&[10, 98, 0, 1]);
+            f
+        })
+        .collect();
+    let sock = socket2::Socket::new(socket2::Domain::PACKET, socket2::Type::RAW, None).unwrap();
+    let link = nix::ifaddrs::getifaddrs()
+        .unwrap()
+        .find(|a| {
+            a.interface_name == "yb" && a.address.as_ref().and_then(|x| x.as_link_addr()).is_some()
+        })
+        .and_then(|a| a.address.and_then(|x| x.as_link_addr().copied()))
+        .expect("yb link address");
+    nix::sys::socket::bind(std::os::fd::AsRawFd::as_raw_fd(&sock), &link).unwrap();
+    let blast = |secs: f64| -> u64 {
         let t = Instant::now();
-        pktgen(&mac, count);
-        let secs = t.elapsed().as_secs_f64();
-        let seen = counter().saturating_sub(before);
-        println!(
-            "PERF | pktgen veth | {label} | {:.0} kpps handled | {seen} of {count} in {secs:.2} s",
-            seen as f64 / secs / 1000.0
-        );
+        let mut sent = 0u64;
+        while t.elapsed().as_secs_f64() < secs {
+            for f in &frames {
+                if nix::sys::socket::send(
+                    std::os::fd::AsRawFd::as_raw_fd(&sock),
+                    f,
+                    nix::sys::socket::MsgFlags::empty(),
+                )
+                .is_ok()
+                {
+                    sent += 1;
+                }
+            }
+        }
+        sent
     };
-    let rx = || {
-        sh(&["cat", "/sys/class/net/xa/statistics/rx_packets"])
+    let rx = || -> u64 {
+        sh(&["cat", "/sys/class/net/ya/statistics/rx_packets"])
             .trim()
             .parse()
             .unwrap_or(0)
     };
-    run("no filter (kernel stack)", &rx);
+    let secs = 2.0;
+    let report = |label: &str, sent: u64, seen: u64| {
+        println!(
+            "PERF | veth blast | {label} | {:.0} kpps sent | {seen} handled of {sent}",
+            sent as f64 / secs / 1000.0
+        );
+    };
+    let r0 = rx();
+    let sent = blast(secs);
+    report("no filter (kernel stack)", sent, rx().saturating_sub(r0));
     if sh_ok(&["nft", "--version"]) {
         sh(&["nft", "add table inet crxdp"]);
         sh(&[
@@ -410,64 +451,39 @@ fn perf_pktgen_veth() {
             "nft",
             "add rule inet crxdp raw ip saddr 198.18.0.0/15 counter drop",
         ]);
-        let nft_count = || {
-            let out = sh(&["nft", "list chain inet crxdp raw"]);
-            out.split("packets ")
-                .nth(1)
-                .and_then(|t| t.split_whitespace().next())
-                .and_then(|n| n.parse().ok())
-                .unwrap_or(0)
-        };
-        run("nftables raw drop", &nft_count);
+        let sent = blast(secs);
+        let out = sh(&["nft", "list chain inet crxdp raw"]);
+        let seen = out
+            .split("packets ")
+            .nth(1)
+            .and_then(|t| t.split_whitespace().next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        report("nftables raw drop", sent, seen);
         sh(&["nft", "delete table inet crxdp"]);
     }
+    let ya: IfName = "ya".parse().unwrap();
     for mode in [XdpMode::Generic, XdpMode::Native] {
-        let mut x = XdpState::default();
-        x.sync(&config(mode, &["198.18.0.0/15"], &[])).unwrap();
-        let blocked = |x: &mut XdpState| port(&x.status(0)).counters[1].0;
-        let before = blocked(&mut x);
-        let t = Instant::now();
-        pktgen(&mac, count);
-        let secs = t.elapsed().as_secs_f64();
-        let seen = blocked(&mut x).saturating_sub(before);
-        println!(
-            "PERF | pktgen veth | XDP {} drop | {:.0} kpps handled | {seen} of {count} in {secs:.2} s",
-            mode.name(),
-            seen as f64 / secs / 1000.0
+        let mut cfg = config(mode, &["198.18.0.0/15"], &[]);
+        cfg.interfaces.insert(
+            ya.clone(),
+            Interface::new(ya.clone(), InterfaceKind::Ethernet),
         );
+        cfg.ip.xdp.interfaces[0].interface = ya.clone();
+        let mut x = XdpState::default();
+        x.sync(&cfg).unwrap();
+        let blocked = |x: &mut XdpState| {
+            x.status(0)
+                .ports
+                .iter()
+                .find(|p| p.interface == ya)
+                .map_or(0, |p| p.counters[1].0)
+        };
+        let before = blocked(&mut x);
+        let sent = blast(secs);
+        let seen = blocked(&mut x).saturating_sub(before);
+        report(&format!("XDP {} drop", mode.name()), sent, seen);
         x.sync(&Config::default()).unwrap();
     }
-}
-
-/// Send `count` UDP packets from 198.18.0.0/15 to `xa` (MAC `mac`) out of
-/// `xb`, with the kernel's packet generator, in the peer namespace.
-fn pktgen(mac: &str, count: u64) {
-    let script = format!(
-        "set -e
-pg() {{ echo \"$2\" > /proc/net/pktgen/$1; }}
-pg kpktgend_0 rem_device_all
-pg kpktgend_0 'add_device xb'
-pg xb 'count {count}'
-pg xb 'pkt_size 64'
-pg xb 'delay 0'
-pg xb 'dst 10.99.0.1'
-pg xb 'dst_mac {mac}'
-pg xb 'src_min 198.18.0.1'
-pg xb 'src_max 198.19.255.254'
-pg xb 'flag IPSRC_RND'
-pg xb 'udp_dst_min 9'
-pg xb 'udp_dst_max 9'
-echo start > /proc/net/pktgen/pgctrl
-# Let go of xb before anyone deletes it: a device pktgen still holds never
-# finishes unregistering, with the rtnl lock held (the CI VM hung on it).
-echo reset > /proc/net/pktgen/pgctrl
-"
-    );
-    // pktgen blocks until done; a stuck generator must not hold the test.
-    let ok = sh_ok(&[
-        "timeout", "60", "ip", "netns", "exec", PEER_NS, "sh", "-c", &script,
-    ]);
-    if !ok {
-        println!("PERF | pktgen did not finish in 60 s");
-    }
+    let _ = sh_ok(&["ip", "link", "del", "ya"]);
 }
