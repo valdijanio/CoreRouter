@@ -236,20 +236,31 @@ a..b: N left out`); a running e as revisões mais novas não são afetadas. O bo
 de `base` + `delta`) é lido sozinho, recomeça a cadeia, e o próximo commit o regrava como
 diferença.
 
-A diferença (`model::json_delta`) é estrutural, sobre o JSON compacto da config: objetos por
-chave (`{"o": {…}, "d": […]}`); listas por `id` (toda lista da config tem `id` único
-`*1A`) em trechos copiados `[início, tamanho]` e itens novos `{"i": […]}`; listas sem id por
-prefixo e sufixo comuns. Trocar uma entrada numa address-list de 65 536 grava essa entrada e dois
-trechos (menos de 200 bytes); trocar a seção inteira gravaria a lista toda (~4 MiB). O commit
-compara o texto que já tem (o da running nova e o da anterior, guardado do save anterior) sem
-montar as árvores: só o que difere é lido (`json_delta::diff_text`). Na leitura o delta é entrada
-hostil: profundidade limitada, cada trecho conferido contra a base e usado uma vez só (o arquivo
-não multiplica a lista), o resultado tem de ser uma `Config` válida. Números (**medido**,
-`storage_fs/history64/*`, 64 revisões, fsync em disco): config de 5 MiB, commit 40 → 47 ms, boot
-265 ms → 1,46 s, 64 revisões restauradas (eram 6), 51 → 20 MiB em disco (os 63 deltas somam 0,01 MiB; o resto são
-os dois slots); 10 MiB, commit 70 → 86
-ms, boot 329 ms → 1,21 s, 64 (eram 3), 68 → 39 MiB. O boot mais lento é o custo de ter as 64
-revisões em memória (~20 ms por revisão de 5 MiB, menos que ler uma cópia inteira).
+A diferença (`model::json_delta`) é estrutural, sobre o JSON da config. Objetos por chave
+(`{"o": {…}, "d": […]}`). Listas por `id` (toda lista da config tem `id` único `*1A`), em trechos
+copiados `[início, tamanho]` e itens novos `{"i": […]}`. Listas sem id, por prefixo e sufixo
+comuns. Trocar uma entrada numa address-list de 65 536 grava essa entrada e dois trechos (menos de
+200 bytes); trocar a seção inteira gravaria a lista toda (~4 MiB).
+
+As seções grandes são `CowArc` (G0.16), e `model::config_delta` trabalha seção por seção nos dois
+sentidos:
+- **No commit**, uma seção que a revisão nova divide com a anterior (mesmo ponteiro) nem é
+  serializada: o arquivo custa o que o commit mudou.
+- **No boot**, a revisão `k` é um clone da `k+1` com só as seções que o delta toca reconstruídas;
+  as outras continuam a mesma alocação. As 64 revisões em memória custam perto de uma config.
+
+Na leitura o delta é entrada hostil: profundidade limitada, cada trecho conferido contra a base e
+usado uma vez só (o arquivo não multiplica a lista), e o resultado tem de ser uma `Config` válida.
+
+Números (**medido**, `storage_fs/history64/*`, 64 revisões, fsync em disco, contra a `main` com
+G0.16):
+
+| config | commit | boot | pico de RSS no boot | revisões restauradas | em disco |
+|---|---|---|---|---|---|
+| 5 MiB | 28,7 → 26,6 ms | 260 → 149 ms | 79 → 79 MiB | 6 → 64 | 51 → 20 MiB |
+| 10 MiB | 44,1 → 42,9 ms | 297 → 208 ms | 147 → 149 MiB | 3 → 64 | 68 → 39 MiB |
+
+Os 63 deltas somam 0,01 MiB; o resto do disco são os dois slots.
 
 | Backend | Onde | Uso |
 |---|---|---|

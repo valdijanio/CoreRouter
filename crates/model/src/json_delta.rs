@@ -24,7 +24,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 /// Nesting followed by [`diff`] and accepted by [`apply`]; config trees
@@ -85,116 +84,6 @@ fn diff_at(old: &Value, new: &Value, depth: usize) -> Option<Value> {
         _ if old == new => None,
         _ => Some(replace(new)),
     }
-}
-
-/// [`diff`] of two JSON texts, without building their trees: equal parts
-/// are compared as text and only what differs is parsed (a commit compares
-/// the text of its config with the one the commit before wrote). Fails
-/// only on text that is not JSON.
-pub fn diff_text(old: &str, new: &str) -> Result<Value, DeltaError> {
-    let a: &RawValue = serde_json::from_str(old).map_err(not_json)?;
-    let b: &RawValue = serde_json::from_str(new).map_err(not_json)?;
-    Ok(diff_raw(a, b, 0)?.unwrap_or_else(|| Value::Object(Map::new())))
-}
-
-fn not_json(e: serde_json::Error) -> DeltaError {
-    bad("", format!("not JSON: {e}"))
-}
-
-fn parse(raw: &RawValue) -> Result<Value, DeltaError> {
-    serde_json::from_str(raw.get()).map_err(not_json)
-}
-
-#[derive(serde::Deserialize)]
-struct IdProbe<'a> {
-    #[serde(borrow)]
-    id: Option<&'a RawValue>,
-}
-
-/// The `"id"` of a list item as text (`"*1A"`, quotes included) when it
-/// is a string.
-fn raw_id(raw: &RawValue) -> Option<&str> {
-    if !raw.get().starts_with('{') {
-        return None;
-    }
-    let probe: IdProbe<'_> = serde_json::from_str(raw.get()).ok()?;
-    probe.id.map(RawValue::get).filter(|t| t.starts_with('"'))
-}
-
-fn diff_raw(old: &RawValue, new: &RawValue, depth: usize) -> Result<Option<Value>, DeltaError> {
-    let (a, b) = (old.get(), new.get());
-    if a == b {
-        return Ok(None);
-    }
-    let kind = |t: &str| t.as_bytes().first().copied();
-    match (kind(a), kind(b)) {
-        (Some(b'{'), Some(b'{')) if depth < MAX_DEPTH => {
-            let a = parse_object(a)?;
-            let b = parse_object(b)?;
-            let new: Vec<(&str, &RawValue)> = b.iter().map(|(k, v)| (k.as_str(), *v)).collect();
-            diff_object(
-                a.iter().map(|(k, v)| (k.as_str(), *v)),
-                &new,
-                |o, n| diff_raw(o, n, depth + 1),
-                parse,
-            )
-        }
-        (Some(b'['), Some(b'[')) if depth < MAX_DEPTH => {
-            let a: Vec<&RawValue> = serde_json::from_str(a).map_err(not_json)?;
-            let b: Vec<&RawValue> = serde_json::from_str(b).map_err(not_json)?;
-            let a: Vec<Item<'_, Raw<'_>>> =
-                a.into_iter().map(|v| Item { id: raw_id(v), v: Raw(v) }).collect();
-            let b: Vec<Item<'_, Raw<'_>>> =
-                b.into_iter().map(|v| Item { id: raw_id(v), v: Raw(v) }).collect();
-            diff_array(&a, &b, |v| parse(v.0))
-        }
-        _ => {
-            // The same value written another way (`1.0`, `"A"`)?
-            // Rare: compare the trees.
-            let (a, b) = (parse(old)?, parse(new)?);
-            Ok((a != b).then(|| replace(&b)))
-        }
-    }
-}
-
-/// A raw JSON value compared by its text (this build writes compact JSON,
-/// so equal values are equal texts).
-#[derive(Clone, Copy)]
-struct Raw<'a>(&'a RawValue);
-
-impl PartialEq for Raw<'_> {
-    fn eq(&self, other: &Self) -> bool {
-        self.0.get() == other.0.get()
-    }
-}
-
-/// The members of a JSON object, in order, values left as text.
-fn parse_object(text: &str) -> Result<Vec<(String, &RawValue)>, DeltaError> {
-    struct Pairs<'a>(Vec<(String, &'a RawValue)>);
-    impl<'de> serde::Deserialize<'de> for Pairs<'de> {
-        fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-            struct V;
-            impl<'de> serde::de::Visitor<'de> for V {
-                type Value = Pairs<'de>;
-                fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    f.write_str("an object")
-                }
-                fn visit_map<M: serde::de::MapAccess<'de>>(
-                    self,
-                    mut m: M,
-                ) -> Result<Pairs<'de>, M::Error> {
-                    let mut out = Vec::new();
-                    while let Some((k, v)) = m.next_entry::<String, &'de RawValue>()? {
-                        out.push((k, v));
-                    }
-                    Ok(Pairs(out))
-                }
-            }
-            d.deserialize_map(V)
-        }
-    }
-    let pairs: Pairs<'_> = serde_json::from_str(text).map_err(not_json)?;
-    Ok(pairs.0)
 }
 
 /// Object diff over any representation: `old` and `new` as (key, value)
@@ -492,8 +381,6 @@ mod tests {
         let d = diff(a, b);
         let back: Value = serde_json::from_str(&d.to_string()).unwrap();
         assert_eq!(apply(a, &back).unwrap(), *b, "delta {d}");
-        // The text form gives the same delta.
-        assert_eq!(diff_text(&a.to_string(), &b.to_string()).unwrap(), d);
         d
     }
 
@@ -613,7 +500,6 @@ mod tests {
         fn apply_of_diff_gives_the_new_tree(a in value(), b in value()) {
             let d = diff(&a, &b);
             prop_assert_eq!(apply(&a, &d).unwrap(), b.clone());
-            prop_assert_eq!(diff_text(&a.to_string(), &b.to_string()).unwrap(), d);
         }
 
         #[test]
