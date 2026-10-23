@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use crate::help::{self, HelpView};
 use crate::i18n::{self, tr};
 use crate::windows::{self, Win};
+use crate::menu_search::{self, Hit};
 use crate::{CoreRouterUi, icons, win_id};
 
 /// How the menu shows one window.
@@ -36,7 +37,6 @@ pub(crate) struct Entry {
     /// `ip.dns.static.*` too).
     pub commands: &'static [&'static str],
     /// Other words an operator searches it by, lowercase.
-    #[cfg_attr(not(test), allow(dead_code))] // the search reads them (G0.23b)
     pub synonyms: &'static [&'static str],
 }
 
@@ -201,6 +201,13 @@ pub(crate) enum Node {
 }
 
 impl Node {
+    fn holds(&self, win: Win) -> bool {
+        match self {
+            Node::Item(w) => *w == win,
+            Node::Sub { items, .. } => items.contains(&win),
+        }
+    }
+
     fn label(&self) -> &'static str {
         match self {
             Node::Item(w) => label(*w),
@@ -264,16 +271,65 @@ fn node_key(group: &str, sub: Option<&str>) -> String {
 
 /// Longest stored list of open groups; more were not written by us.
 const MAX_OPEN: usize = 64;
+/// Recent windows kept (the palette and the empty search show them).
+pub(crate) const MAX_RECENT: usize = 8;
+const MAX_FAVORITES: usize = 32;
 
-/// The menu's own state (UI-local; `open` is a stored preference).
+/// A line of the tree the keyboard can stand on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Nav {
+    Group(&'static str),
+    Sub(&'static str, &'static str),
+    Item(Win),
+}
+
+/// The window of catalog key `key`.
+pub(crate) fn win_by_key(key: &str) -> Option<Win> {
+    Win::all().into_iter().find(|w| self::key(*w) == key)
+}
+
+/// Stored keys of windows: known ones only, at most `max`, once each.
+fn keys_in(v: &Value, max: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for k in v.as_array().into_iter().flatten().filter_map(Value::as_str) {
+        if out.len() >= max {
+            break;
+        }
+        if win_by_key(k).is_some() && !out.iter().any(|o| o == k) {
+            out.push(k.to_owned());
+        }
+    }
+    out
+}
+
+/// The menu's own state (UI-local; `open`, `recent` and `favorites` are
+/// stored preferences).
 #[derive(Debug, Default)]
 pub(crate) struct MenuState {
     /// Open groups and subgroups (`IP`, `IP/DNS`).
     pub open: BTreeSet<String>,
-    /// The selected item: it shows the ⓘ.
-    pub selected: Option<Win>,
+    /// Where the keyboard stands; an item there is the selected one (ⓘ).
+    pub cursor: Option<Nav>,
     /// The explanation modal of the ⓘ.
     pub help: Option<HelpView>,
+    /// The search field at the top of the menu, and its highlighted hit.
+    pub query: String,
+    pub hit: usize,
+    /// The Ctrl+K palette, while open.
+    pub palette: Option<Palette>,
+    /// Windows opened from the menu, newest first (keys).
+    pub recent: Vec<String>,
+    /// Windows pinned at the top of the menu (keys), in pinning order.
+    pub favorites: Vec<String>,
+}
+
+/// The Ctrl+K palette.
+#[derive(Debug, Default)]
+pub(crate) struct Palette {
+    pub query: String,
+    pub hit: usize,
+    /// Focus the field on the first frame.
+    pub fresh: bool,
 }
 
 impl MenuState {
@@ -288,9 +344,52 @@ impl MenuState {
         }
     }
 
+    /// The selected item (it shows the ⓘ).
+    pub(crate) fn selected(&self) -> Option<Win> {
+        match self.cursor {
+            Some(Nav::Item(w)) => Some(w),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn is_favorite(&self, win: Win) -> bool {
+        self.favorites.iter().any(|k| k == key(win))
+    }
+
+    pub(crate) fn toggle_favorite(&mut self, win: Win) {
+        let k = key(win);
+        if self.is_favorite(win) {
+            self.favorites.retain(|f| f != k);
+        } else if self.favorites.len() < MAX_FAVORITES {
+            self.favorites.push(k.to_owned());
+        }
+    }
+
+    /// `win` was opened: first of the recent ones.
+    pub(crate) fn opened(&mut self, win: Win) {
+        let k = key(win);
+        self.recent.retain(|r| r != k);
+        self.recent.insert(0, k.to_owned());
+        self.recent.truncate(MAX_RECENT);
+    }
+
+    /// Open the groups that hold `win`, so it shows in the tree.
+    pub(crate) fn reveal(&mut self, win: Win) {
+        let Some(g) = tree()
+            .into_iter()
+            .find(|g| g.leaf.is_none() && g.nodes.iter().any(|n| n.holds(win)))
+        else {
+            return;
+        };
+        self.open.insert(node_key(g.name, None));
+        if let Some(sub) = entry(win).and_then(|e| e.sub) {
+            self.open.insert(node_key(g.name, Some(sub)));
+        }
+    }
+
     /// For `prefs.rs`.
     pub(crate) fn prefs(&self) -> Value {
-        json!({ "open": self.open })
+        json!({ "open": self.open, "recent": self.recent, "favorites": self.favorites })
     }
 
     pub(crate) fn apply_prefs(&mut self, v: &Value) {
@@ -303,12 +402,119 @@ impl MenuState {
                 .map(str::to_owned)
                 .collect();
         }
+        if let Some(r) = v.get("recent") {
+            self.recent = keys_in(r, MAX_RECENT);
+        }
+        if let Some(f) = v.get("favorites") {
+            self.favorites = keys_in(f, MAX_FAVORITES);
+        }
+    }
+
+    /// The lines the arrows walk, in the order drawn.
+    pub(crate) fn nav_rows(&self) -> Vec<Nav> {
+        let mut out = Vec::new();
+        for g in tree() {
+            if let Some(w) = g.leaf {
+                out.push(Nav::Item(w));
+                continue;
+            }
+            out.push(Nav::Group(g.name));
+            if !self.is_open(g.name, None) {
+                continue;
+            }
+            for n in &g.nodes {
+                match n {
+                    Node::Item(w) => out.push(Nav::Item(*w)),
+                    Node::Sub { name, items } => {
+                        out.push(Nav::Sub(g.name, name));
+                        if self.is_open(g.name, Some(name)) {
+                            out.extend(items.iter().map(|w| Nav::Item(*w)));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// An arrow, Enter or Esc on the tree (the search field focused and
+    /// empty). `Some(win)`: open it.
+    pub(crate) fn tree_key(&mut self, key: egui::Key) -> Option<Win> {
+        use egui::Key;
+        let rows = self.nav_rows();
+        let at = self.cursor.and_then(|c| rows.iter().position(|r| *r == c));
+        match key {
+            Key::ArrowDown => {
+                let next = at.map_or(0, |i| (i + 1).min(rows.len().saturating_sub(1)));
+                self.cursor = rows.get(next).copied();
+            }
+            Key::ArrowUp => {
+                let prev = at.map_or(0, |i| i.saturating_sub(1));
+                self.cursor = rows.get(prev).copied();
+            }
+            Key::ArrowRight => match self.cursor {
+                Some(Nav::Group(g)) if !self.is_open(g, None) => self.toggle(g, None),
+                Some(Nav::Sub(g, s)) if !self.is_open(g, Some(s)) => self.toggle(g, Some(s)),
+                _ => {}
+            },
+            Key::ArrowLeft => match self.cursor {
+                Some(Nav::Group(g)) if self.is_open(g, None) => self.toggle(g, None),
+                Some(Nav::Sub(g, s)) if self.is_open(g, Some(s)) => self.toggle(g, Some(s)),
+                // Else up to the line that holds it.
+                Some(c) => {
+                    let sub = match c {
+                        Nav::Item(w) => entry(w).and_then(|e| e.sub),
+                        _ => None,
+                    };
+                    // The nearest line above that holds it: its subgroup,
+                    // else its group.
+                    let parent = at.and_then(|i| {
+                        rows.iter().take(i).rev().find(|r| match (c, r) {
+                            (Nav::Sub(g, _), Nav::Group(p)) => g == *p,
+                            (Nav::Item(_), Nav::Sub(_, s)) => sub == Some(*s),
+                            (Nav::Item(_), Nav::Group(_)) => sub.is_none(),
+                            _ => false,
+                        })
+                    });
+                    if let Some(p) = parent {
+                        self.cursor = Some(*p);
+                    }
+                }
+                None => {}
+            },
+            Key::Enter => match self.cursor {
+                Some(Nav::Group(g)) => self.toggle(g, None),
+                Some(Nav::Sub(g, s)) => self.toggle(g, Some(s)),
+                Some(Nav::Item(w)) => return Some(w),
+                None => {}
+            },
+            _ => {}
+        }
+        None
     }
 }
 
 /// Id of a menu row (tests click them).
 pub(crate) fn row_id(name: &str) -> Id {
     Id::unique(("corerouter-menu-row", name))
+}
+
+/// Id of the search field at the top of the menu.
+pub(crate) fn search_id() -> Id {
+    Id::unique("corerouter-menu-search")
+}
+
+/// Where `win` sits in the menu, for a hit (`IP › DNS`).
+pub(crate) fn place(win: Win, labels: i18n::Lang) -> String {
+    let group = windows::menu()
+        .into_iter()
+        .find(|(_, items)| items.contains(&win))
+        .map(|(g, _)| tr(labels, g))
+        .unwrap_or_default();
+    match entry(win).and_then(|e| e.sub) {
+        Some(sub) => format!("{group} › {}", tr(labels, sub)),
+        None => group.to_owned(),
+    }
 }
 
 /// Id of the selected item's ⓘ.
@@ -397,7 +603,7 @@ fn row(ui: &mut Ui, id: Id, look: &Look, right: impl FnOnce(&mut Ui)) -> Respons
     }
     let mut strip = ui.new_child(
         egui::UiBuilder::new()
-            .max_rect(rect.shrink2(vec2(4.0, 0.0)))
+            .max_rect(rect.shrink2(vec2(8.0, 0.0)))
             .layout(egui::Layout::right_to_left(egui::Align::Center)),
     );
     right(&mut strip);
@@ -405,11 +611,26 @@ fn row(ui: &mut Ui, id: Id, look: &Look, right: impl FnOnce(&mut Ui)) -> Respons
 }
 
 impl CoreRouterUi {
-    /// The side menu: New Terminal, then the tree.
+    /// The side menu: the search field, New Terminal, the favorites and
+    /// the tree; or, while the field has text, what it finds.
     pub(crate) fn menu(&mut self, ui: &mut Ui) {
+        self.menu_shortcuts(ui.ctx());
         ui.add_space(4.0);
+        self.search_field(ui);
+        ui.add_space(2.0);
         egui::ScrollArea::vertical().show(ui, |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            if !self.menu.query.trim().is_empty() {
+                let hits = self.menu_search(&self.menu.query);
+                self.menu.hit = self.menu.hit.min(hits.len().saturating_sub(1));
+                if let Some(i) = self.hit_rows(ui, "menu", &hits, self.menu.hit) {
+                    self.menu.hit = i;
+                    if let Some(h) = hits.get(i) {
+                        self.activate(h);
+                    }
+                }
+                return;
+            }
             let look = Look {
                 depth: 0,
                 caret: None,
@@ -426,11 +647,220 @@ impl CoreRouterUi {
             {
                 self.new_terminal();
             }
+            self.menu_favorites(ui);
             for g in tree() {
                 self.menu_group(ui, &g);
             }
         });
+        self.palette(ui.ctx());
         help::modal(ui.ctx(), self.lang, &mut self.menu.help);
+    }
+
+    /// Ctrl+K opens the palette; `/` (nothing focused) goes to the search
+    /// field and starts the query; with the field focused, the arrows and
+    /// Enter walk the tree (empty field) or the hits.
+    fn menu_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+        if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, Key::K)) {
+            self.menu.palette = Some(Palette {
+                fresh: true,
+                ..Palette::default()
+            });
+        }
+        if self.menu.palette.is_some() || self.menu.help.is_some() {
+            return;
+        }
+        let nothing_focused = ctx.memory(|m| m.focused().is_none());
+        let slash = ctx.input(|i| {
+            i.events
+                .iter()
+                .any(|e| matches!(e, egui::Event::Text(t) if t == "/"))
+        });
+        if nothing_focused && slash {
+            ctx.memory_mut(|m| m.request_focus(search_id()));
+        }
+        if !ctx.memory(|m| m.has_focus(search_id())) {
+            return;
+        }
+        // Esc clears the field and leaves it; taken here, so it does not
+        // also reach (and close) the window under the menu.
+        if ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::Escape)) {
+            self.menu.query.clear();
+            self.menu.hit = 0;
+            ctx.memory_mut(|m| m.surrender_focus(search_id()));
+            return;
+        }
+        let empty = self.menu.query.trim().is_empty();
+        let keys: &[Key] = if empty {
+            &[Key::ArrowDown, Key::ArrowUp, Key::ArrowLeft, Key::ArrowRight, Key::Enter]
+        } else {
+            &[Key::ArrowDown, Key::ArrowUp, Key::Enter]
+        };
+        for k in keys {
+            if !ctx.input_mut(|i| i.consume_key(Modifiers::NONE, *k)) {
+                continue;
+            }
+            if empty {
+                if let Some(w) = self.menu.tree_key(*k) {
+                    self.open_from_menu(w);
+                }
+                continue;
+            }
+            match k {
+                Key::ArrowDown => self.menu.hit = self.menu.hit.saturating_add(1),
+                Key::ArrowUp => self.menu.hit = self.menu.hit.saturating_sub(1),
+                _ => {
+                    let hits = self.menu_search(&self.menu.query);
+                    if let Some(h) = hits.get(self.menu.hit.min(hits.len().saturating_sub(1))) {
+                        self.activate(h);
+                    }
+                }
+            }
+        }
+    }
+
+    fn search_field(&mut self, ui: &mut Ui) {
+        let labels = self.lang.labels;
+        ui.horizontal(|ui| {
+            let h = ui.spacing().interact_size.y;
+            let (rect, _) = ui.allocate_exact_size(vec2(18.0, h), Sense::hover());
+            icons::paint(ui, rect, icons::MAGNIFYING_GLASS, 14.0, ui.visuals().weak_text_color());
+            let resp = ui.add(
+                egui::TextEdit::singleline(&mut self.menu.query)
+                    .id(search_id())
+                    .event_filter(menu_search::KEEP_KEYS)
+                    .hint_text(tr(labels, "Search menu…"))
+                    .char_limit(menu_search::MAX_QUERY)
+                    .desired_width(f32::INFINITY),
+            );
+            let resp = resp.on_hover_text(tr(labels, "Search the menu (/ or Ctrl+K)"));
+            if resp.changed() {
+                self.menu.hit = 0;
+            }
+        });
+    }
+
+    /// What `query` finds among the windows and the router's commands.
+    pub(crate) fn menu_search(&self, query: &str) -> Vec<Hit> {
+        let ids = self
+            .cache
+            .commands
+            .iter()
+            .filter_map(|c| c.get("id").and_then(Value::as_str));
+        menu_search::search(query, ids)
+    }
+
+    /// The recent windows, then the favorites not among them.
+    pub(crate) fn recent_hits(&self) -> Vec<Hit> {
+        let mut wins: Vec<Win> = Vec::new();
+        for k in self.menu.recent.iter().chain(&self.menu.favorites) {
+            if let Some(w) = win_by_key(k)
+                && !wins.contains(&w)
+            {
+                wins.push(w);
+            }
+        }
+        wins.into_iter().map(Hit::Win).collect()
+    }
+
+    /// The hits as menu rows, `sel` highlighted; the clicked one.
+    pub(crate) fn hit_rows(&mut self, ui: &mut Ui, salt: &str, hits: &[Hit], sel: usize) -> Option<usize> {
+        let labels = self.lang.labels;
+        if hits.is_empty() {
+            ui.add_space(4.0);
+            ui.weak(tr(labels, "Nothing found"));
+            return None;
+        }
+        let mut clicked = None;
+        let mut commands_heading = false;
+        for (i, h) in hits.iter().enumerate() {
+            let id = row_id(&format!("{salt}:hit:{i}"));
+            let resp = match h {
+                Hit::Win(w) => {
+                    let place = place(*w, labels);
+                    let look = Look {
+                        depth: 0,
+                        caret: None,
+                        icon: if w.gap().is_some() { icons::LOCK_SIMPLE } else { icon(*w) },
+                        label: tr(labels, w.title()),
+                        strong: false,
+                        weak: w.gap().is_some(),
+                        active: self.open.contains(w),
+                        selected: i == sel,
+                    };
+                    row(ui, id, &look, |ui| {
+                        ui.weak(place);
+                    })
+                }
+                Hit::Command(c) => {
+                    if !commands_heading {
+                        commands_heading = true;
+                        ui.add_space(4.0);
+                        ui.weak(tr(labels, "Commands"));
+                    }
+                    let look = Look {
+                        depth: 0,
+                        caret: None,
+                        icon: icons::TERMINAL,
+                        label: c,
+                        strong: false,
+                        weak: false,
+                        active: false,
+                        selected: i == sel,
+                    };
+                    row(ui, id, &look, |_| {}).on_hover_text(tr(labels, "Open in a terminal"))
+                }
+            };
+            if i == sel {
+                resp.scroll_to_me(None);
+            }
+            if resp.clicked() {
+                clicked = Some(i);
+            }
+        }
+        clicked
+    }
+
+    /// Enter or a click on a hit: open the window (shown in the tree), or a
+    /// terminal with the command typed, waiting for its parameters.
+    pub(crate) fn activate(&mut self, hit: &Hit) {
+        match hit {
+            Hit::Win(w) => {
+                self.menu.reveal(*w);
+                self.menu.cursor = Some(Nav::Item(*w));
+                self.open_from_menu(*w);
+            }
+            Hit::Command(id) => {
+                self.new_terminal();
+                if let Some(t) = self.terminals.last_mut() {
+                    t.input = menu_search::terminal_line(id);
+                }
+            }
+        }
+        self.menu.query.clear();
+        self.menu.hit = 0;
+        self.menu.palette = None;
+    }
+
+    fn menu_favorites(&mut self, ui: &mut Ui) {
+        let favs: Vec<Win> = self.menu.favorites.iter().filter_map(|k| win_by_key(k)).collect();
+        if favs.is_empty() {
+            return;
+        }
+        let look = Look {
+            depth: 0,
+            caret: None,
+            icon: icons::STAR,
+            label: tr(self.lang.labels, "Favorites"),
+            strong: true,
+            weak: false,
+            active: false,
+            selected: false,
+        };
+        row(ui, row_id("Favorites"), &look, |_| {});
+        for w in favs {
+            self.menu_item_as(ui, w, 1, None, false, "fav");
+        }
     }
 
     fn menu_group(&mut self, ui: &mut Ui, g: &Group) {
@@ -448,10 +878,11 @@ impl CoreRouterUi {
             strong: true,
             weak: false,
             active: false,
-            selected: false,
+            selected: self.menu.cursor == Some(Nav::Group(g.name)),
         };
         if row(ui, row_id(g.name), &look, |_| {}).clicked() {
             self.menu.toggle(g.name, None);
+            self.menu.cursor = Some(Nav::Group(g.name));
         }
         if !open {
             return;
@@ -469,7 +900,7 @@ impl CoreRouterUi {
                         strong: false,
                         weak: false,
                         active: false,
-                        selected: false,
+                        selected: self.menu.cursor == Some(Nav::Sub(g.name, name)),
                     };
                     let count = items.len().to_string();
                     let resp = row(ui, row_id(&node_key(g.name, Some(name))), &look, |ui| {
@@ -479,6 +910,7 @@ impl CoreRouterUi {
                     });
                     if resp.clicked() {
                         self.menu.toggle(g.name, Some(name));
+                        self.menu.cursor = Some(Nav::Sub(g.name, name));
                     }
                     if open {
                         for w in items {
@@ -490,10 +922,15 @@ impl CoreRouterUi {
         }
     }
 
-    /// A window's row; `icon` overrides the catalog's (a leaf group).
+    /// A window's row in the tree; `icon` overrides the catalog's (a leaf group).
     fn menu_item(&mut self, ui: &mut Ui, win: Win, depth: u8, icon: Option<&'static str>, strong: bool) {
+        self.menu_item_as(ui, win, depth, icon, strong, "win");
+    }
+
+    /// A window's row; `salt` tells the favorites' copy from the tree's.
+    fn menu_item_as(&mut self, ui: &mut Ui, win: Win, depth: u8, icon: Option<&'static str>, strong: bool, salt: &str) {
         let labels = self.lang.labels;
-        let selected = self.menu.selected == Some(win);
+        let selected = self.menu.selected() == Some(win);
         let soon = win.gap();
         let look = Look {
             depth,
@@ -503,15 +940,16 @@ impl CoreRouterUi {
             } else {
                 icon.unwrap_or_else(|| self::icon(win))
             },
-            label: tr(labels, label(win)),
+            // Out of its subgroup a favorite needs its whole title.
+            label: tr(labels, if salt == "fav" { win.title() } else { label(win) }),
             strong,
             weak: soon.is_some(),
             active: self.open.contains(&win),
             selected,
         };
         let mut info = false;
-        let resp = row(ui, row_id(&format!("win:{}", key(win))), &look, |ui| {
-            if selected {
+        let resp = row(ui, row_id(&format!("{salt}:{}", key(win))), &look, |ui| {
+            if selected && salt == "win" {
                 info = help::info_button(ui, info_id(), tr(labels, "What this window does"))
                     .clicked();
             }
@@ -526,10 +964,22 @@ impl CoreRouterUi {
             )),
             None => resp,
         };
+        let favorite = self.menu.is_favorite(win);
+        resp.context_menu(|ui| {
+            let text = if favorite {
+                "Remove from favorites"
+            } else {
+                "Add to favorites"
+            };
+            if ui.button(tr(labels, text)).clicked() {
+                self.menu.toggle_favorite(win);
+                ui.close();
+            }
+        });
         if info {
             self.menu.help = Some(self.menu_help(win));
         } else if resp.clicked() {
-            self.menu.selected = Some(win);
+            self.menu.cursor = Some(Nav::Item(win));
             self.open_from_menu(win);
         }
     }
@@ -540,6 +990,7 @@ impl CoreRouterUi {
             // Already open: to the front, with its dialogs over it.
             self.floats.raise(win_id(win));
         }
+        self.menu.opened(win);
         // Some lists are only asked for while their window is open.
         self.cache.refreshed_at = None;
     }
