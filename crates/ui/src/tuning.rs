@@ -35,6 +35,10 @@ const UNSET: &str = "system.tuning.unset";
 const APPLY: &str = "system.tuning.profile.apply";
 const DIFF: &str = "system.tuning.profile.diff";
 const SAFE_MODE: &str = "config.safe-mode.enter";
+const PORT_PRINT: &str = "system.tuning.interface.parameter.print";
+const PORT_SET: &str = "system.tuning.interface.set";
+const PORT_UNSET: &str = "system.tuning.interface.unset";
+const PORT_APPLY: &str = "system.tuning.interface.apply";
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
@@ -86,8 +90,69 @@ const SECTIONS: [&str; 6] = [
     "Control plane (TCP)",
 ];
 
+/// The port sections, in order (G1.26b).
+const PORT_SECTIONS: [&str; 6] = [
+    "Rings and queues",
+    "Interrupt coalescing",
+    "Offloads",
+    "Flow control",
+    "Transmit queue",
+    "Filtering",
+];
+
+/// Whose settings a property list shows: the kernel's or a port's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Kernel,
+    Port(String),
+}
+
+impl Scope {
+    /// `i18n` key of `key`'s explanation.
+    fn help_key(&self, key: &str) -> String {
+        match self {
+            Scope::Kernel => format!("tuning.{key}"),
+            Scope::Port(_) => format!("tuning.port.{key}"),
+        }
+    }
+
+    fn set(&self, key: &str, value: i64) -> (&'static str, Value) {
+        match self {
+            Scope::Kernel => (SET, json!({"name": key, "value": value})),
+            Scope::Port(p) => (PORT_SET, json!({"name": p, "key": key, "value": value})),
+        }
+    }
+
+    fn unset(&self, key: &str) -> (&'static str, Value) {
+        match self {
+            Scope::Kernel => (UNSET, json!({"name": key})),
+            Scope::Port(p) => (PORT_UNSET, json!({"name": p, "key": key})),
+        }
+    }
+
+    /// The terminal commands that set and unset `key`.
+    fn commands(&self, key: &str, value: i64) -> String {
+        match self {
+            Scope::Kernel => format!(
+                "`/system tuning set name={key} value={value}`\n\n`/system tuning unset name={key}`"
+            ),
+            Scope::Port(p) => format!(
+                "`/system tuning interface set name={p} key={key} value={value}`\n\n\
+                 `/system tuning interface unset name={p} key={key}`"
+            ),
+        }
+    }
+
+    fn salt(&self) -> String {
+        match self {
+            Scope::Kernel => "kernel".into(),
+            Scope::Port(p) => format!("port-{p}"),
+        }
+    }
+}
+
 /// Width of the property list's columns.
-const COLS: [f32; 6] = [340.0, 170.0, 150.0, 170.0, 150.0, 28.0];
+const COLS: [f32; 6] = [320.0, 165.0, 150.0, 165.0, 200.0, 28.0];
 
 /// One parameter as `system.tuning.print` describes it.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -110,6 +175,8 @@ pub(crate) struct Param {
     pub reboot: bool,
     /// Changing it takes the port down for a moment (G1.26b).
     pub link_flap: bool,
+    /// The driver keeps it as it is (an offload marked fixed).
+    pub fixed: bool,
 }
 
 impl Param {
@@ -152,6 +219,7 @@ impl Param {
             control_plane: flag("control_plane"),
             reboot: flag("reboot"),
             link_flap: flag("link_flap"),
+            fixed: flag("fixed"),
         })
     }
 
@@ -188,7 +256,7 @@ impl Param {
         } else {
             self.choices
                 .iter()
-                .map(|(v, _)| v.to_string())
+                .map(|(_, n)| n.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")
         }
@@ -262,6 +330,9 @@ pub(crate) struct TuningPanel {
     pub(crate) help: Option<HelpView>,
     /// `system.tuning.profile.diff` shown in a modal.
     pub(crate) diff: Option<Value>,
+    /// The Interfaces tab: the port shown and its settings.
+    pub(crate) port: Option<String>,
+    pub(crate) port_print: Option<Value>,
 }
 
 impl TuningPanel {
@@ -288,7 +359,17 @@ impl PanelState for TuningPanel {
             command: PRINT,
             params: json!({"profile": self.profile()}),
         }];
-        if self.tab == Tab::Summary {
+        if self.tab == Tab::Interfaces
+            && let Some(port) = &self.port
+            && app.has_command(PORT_PRINT)
+        {
+            q.push(Query {
+                key: "port",
+                command: PORT_PRINT,
+                params: json!({"name": port, "profile": self.profile()}),
+            });
+        }
+        if matches!(self.tab, Tab::Summary | Tab::Interfaces) {
             q.push(Query {
                 key: "hardware",
                 command: HARDWARE,
@@ -313,7 +394,20 @@ impl PanelState for TuningPanel {
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
         match key {
             "print" => self.print = Some(value),
-            "hardware" => self.hardware = Some(value),
+            "hardware" => {
+                // The Interfaces tab starts on the first port.
+                if self.port.is_none() {
+                    self.port = value
+                        .get("nics")
+                        .and_then(Value::as_array)
+                        .and_then(|a| a.first())
+                        .and_then(|n| n.get("name"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                self.hardware = Some(value);
+            }
+            "port" => self.port_print = Some(value),
             "diagnose" => self.diagnosis = Some(value),
             k => {
                 if let Some(slot) = self.compare.iter_mut().find(|(c, _)| *c == k) {
@@ -370,6 +464,9 @@ impl TuningPanel {
         ui.horizontal(|ui| {
             for (tab, label) in TABS {
                 if ui.selectable_label(self.tab == tab, tr(l, label)).clicked() {
+                    if self.tab != tab {
+                        self.selected = None;
+                    }
                     self.tab = tab;
                     app.cache.refreshed_at = None;
                 }
@@ -403,11 +500,7 @@ impl TuningPanel {
             Tab::Summary => self.summary(app, ui),
             Tab::Kernel => self.kernel(app, ui),
             Tab::Profiles => self.profiles(app, ui),
-            Tab::Interfaces => later(
-                ui,
-                l,
-                "Rings, queues, RSS, interrupt coalescing, offloads, flow control and txqueuelen per port arrive with G1.26b.",
-            ),
+            Tab::Interfaces => self.interfaces(app, ui),
             Tab::Cpu => later(
                 ui,
                 l,
@@ -651,10 +744,24 @@ impl TuningPanel {
                 ));
             }
         });
+        self.list(app, ui, &rows, &SECTIONS, &Scope::Kernel);
+    }
+
+    /// The property list of `rows`, grouped by `sections`, and the editor
+    /// of the selected row under it.
+    fn list(
+        &mut self,
+        app: &mut CoreRouterUi,
+        ui: &mut Ui,
+        rows: &[Param],
+        sections: &[&'static str],
+        scope: &Scope,
+    ) {
+        let l = app.lang.labels;
         let editor_h = ui.spacing().interact_size.y * 3.0;
         let list_h = (ui.available_height() - editor_h).max(80.0);
         ScrollArea::both()
-            .id_salt("tuning-kernel")
+            .id_salt(("tuning-list", scope.salt()))
             .max_height(list_h)
             .auto_shrink(false)
             .show(ui, |ui| {
@@ -670,10 +777,10 @@ impl TuningPanel {
                     ],
                 );
                 let needle = self.find.to_lowercase();
-                for section in SECTIONS {
+                for section in sections {
                     let in_section: Vec<&Param> = rows
                         .iter()
-                        .filter(|p| p.section == section)
+                        .filter(|p| p.section == *section)
                         .filter(|p| {
                             needle.is_empty()
                                 || p.name.contains(&needle)
@@ -683,24 +790,120 @@ impl TuningPanel {
                     if in_section.is_empty() {
                         continue;
                     }
-                    let open = !self.collapsed.contains(section) || !needle.is_empty();
+                    let open = !self.collapsed.contains(*section) || !needle.is_empty();
                     if section_row(ui, tr(l, section), in_section.len(), open)
-                        && !self.collapsed.remove(section)
+                        && !self.collapsed.remove(*section)
                     {
-                        self.collapsed.insert(section.to_owned());
+                        self.collapsed.insert((*section).to_owned());
                     }
                     if !open {
                         continue;
                     }
                     for p in in_section {
-                        self.param_row(app, ui, p);
+                        self.param_row(app, ui, p, scope);
                     }
                 }
             });
-        self.editor(app, ui, &rows);
+        self.editor(app, ui, rows, scope);
     }
 
-    fn param_row(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, p: &Param) {
+    // ---- Interfaces -----------------------------------------------------------
+
+    fn interfaces(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        if !app.has_command(PORT_PRINT) {
+            later(
+                ui,
+                l,
+                "This router has no port tuning yet: update corerouter-daemon.",
+            );
+            return;
+        }
+        let names: Vec<String> = self
+            .hardware
+            .as_ref()
+            .and_then(|h| h.get("nics"))
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|n| n.get("name").and_then(Value::as_str).map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        ui.horizontal(|ui| {
+            ui.label(tr(l, "Port"));
+            let current = self.port.clone().unwrap_or_default();
+            let mut picked = current.clone();
+            ComboBox::from_id_salt("tuning-port")
+                .selected_text(&current)
+                .show_ui(ui, |ui| {
+                    for n in &names {
+                        ui.selectable_value(&mut picked, n.clone(), n);
+                    }
+                });
+            if picked != current {
+                self.port = Some(picked);
+                self.port_print = None;
+                self.selected = None;
+                app.cache.refreshed_at = None;
+            }
+            ui.add(
+                TextEdit::singleline(&mut self.find)
+                    .hint_text(tr(l, "Find"))
+                    .desired_width(160.0),
+            );
+            let ok = safe_mode_ok(app).and_then(|()| app.can().check(PORT_APPLY));
+            if action(ui, tr(l, "Apply to all ports with Safe Mode"), ok) {
+                if !safe_mode_mine(app) {
+                    app.run(SAFE_MODE, json!({}));
+                }
+                self.waiting += 1;
+                app.run_then(
+                    PORT_APPLY,
+                    json!({"profile": self.profile()}),
+                    crate::panel::then(NAME, Reply::Changed),
+                );
+            }
+        });
+        let Some(port) = self.port.clone() else {
+            ui.weak(tr(l, "waiting for the router…"));
+            return;
+        };
+        let data = self.port_print.as_ref().and_then(|v| {
+            v.get("ports")
+                .and_then(Value::as_array)
+                .and_then(|a| a.iter().find(|p| p.get("name").and_then(Value::as_str) == Some(&port)))
+        });
+        let Some(data) = data.cloned() else {
+            ui.weak(tr(l, "waiting for the router…"));
+            return;
+        };
+        let rows = params(&data);
+        ui.horizontal_wrapped(|ui| {
+            let text = |k: &str| data.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+            ui.strong(&port);
+            ui.label(format!("{} {}", text("driver"), text("model")));
+            if let Some(sp) = data.get("speed_mbps").and_then(Value::as_u64) {
+                ui.label(speed(sp));
+            }
+            if rows.iter().any(|p| p.link_flap && p.differs()) {
+                let v = ui.visuals().clone();
+                chip(ui, tr(l, "flaps link"), AMBER.tone(&v)).on_hover_text(tr(
+                    l,
+                    "Changing rings or queues resets the port: its link drops for a moment. Use Safe Mode on a port you manage the router through.",
+                ));
+            }
+        });
+        if let Some(notes) = data.get("notes").and_then(Value::as_array)
+            && !notes.is_empty()
+        {
+            let text: Vec<&str> = notes.iter().filter_map(Value::as_str).collect();
+            ui.weak(text.join("; "));
+        }
+        self.list(app, ui, &rows, &PORT_SECTIONS, &Scope::Port(port));
+    }
+
+    fn param_row(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, p: &Param, scope: &Scope) {
         let l = app.lang.labels;
         let h = ui.spacing().interact_size.y + 2.0;
         let width: f32 = COLS.iter().sum();
@@ -754,6 +957,10 @@ impl TuningPanel {
             if p.link_flap {
                 chip(ui, tr(l, "flaps link"), AMBER.tone(&v));
             }
+            if p.fixed {
+                chip(ui, tr(l, "fixed"), neutral_tone(&v))
+                    .on_hover_text(tr(l, "The driver does not let it change."));
+            }
         });
         cell(ui, 1, &mut |ui| match p.current {
             Some(c) => {
@@ -797,15 +1004,16 @@ impl TuningPanel {
         });
         let mut info = false;
         cell(ui, 5, &mut |ui| {
-            info = help::info_button(ui, Id::unique(("tuning-help", &p.name)), &p.name).clicked();
+            let id = Id::unique(("tuning-help", scope.salt(), &p.name));
+            info = help::info_button(ui, id, &p.name).clicked();
         });
         if info {
-            self.help = Some(explanation(p, &why));
+            self.help = Some(explanation(p, &why, scope));
         }
     }
 
     /// Under the list: change the selected parameter.
-    fn editor(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, rows: &[Param]) {
+    fn editor(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, rows: &[Param], scope: &Scope) {
         let l = app.lang.labels;
         let Some(p) = self
             .selected
@@ -849,49 +1057,47 @@ impl TuningPanel {
             } else {
                 Ok(())
             };
+            let busy = if p.fixed {
+                Err(tr(l, "The driver does not let it change.").to_owned())
+            } else {
+                busy
+            };
             let set_ok = busy
                 .clone()
                 .and_then(|()| value.clone().map(|_| ()))
-                .and_then(|()| can.check(SET));
+                .and_then(|()| can.check(scope.set(&p.name, 0).0));
             if action(ui, tr(l, "Set"), set_ok)
                 && let Ok(v) = value
             {
                 self.waiting += 1;
-                app.run_then(
-                    SET,
-                    json!({"name": p.name, "value": v}),
-                    crate::panel::then(NAME, Reply::Changed),
-                );
+                let (id, params) = scope.set(&p.name, v);
+                app.run_then(id, params, crate::panel::then(NAME, Reply::Changed));
             }
             let unset_ok = busy.clone().and_then(|()| {
                 if p.configured.is_some() {
-                    can.check(UNSET)
-                } else {
+                    can.check(scope.unset(&p.name).0)
+                } else if *scope == Scope::Kernel {
                     Err(tr(l, "Not set: the kernel's own value is in use").to_owned())
+                } else {
+                    Err(tr(l, "Not set: the port's own value is in use").to_owned())
                 }
             });
             if action(ui, tr(l, "Unset"), unset_ok) {
                 self.waiting += 1;
-                app.run_then(
-                    UNSET,
-                    json!({"name": p.name}),
-                    crate::panel::then(NAME, Reply::Changed),
-                );
+                let (id, params) = scope.unset(&p.name);
+                app.run_then(id, params, crate::panel::then(NAME, Reply::Changed));
             }
             if let Some(r) = p.recommended
                 && action(
                     ui,
                     &format!("{} ({})", tr(l, "Use recommended"), p.value_text(r)),
-                    busy.and_then(|()| can.check(SET)),
+                    busy.and_then(|()| can.check(scope.set(&p.name, r).0)),
                 )
             {
                 self.edit = r.to_string();
                 self.waiting += 1;
-                app.run_then(
-                    SET,
-                    json!({"name": p.name, "value": r}),
-                    crate::panel::then(NAME, Reply::Changed),
-                );
+                let (id, params) = scope.set(&p.name, r);
+                app.run_then(id, params, crate::panel::then(NAME, Reply::Changed));
             }
         });
     }
@@ -976,19 +1182,13 @@ impl TuningPanel {
 
 /// The ⓘ modal of `p`: its explanation, the value recommended here and
 /// the command that sets it.
-pub(crate) fn explanation(p: &Param, why: &str) -> HelpView {
-    let mut v = HelpView::new(format!("tuning.{}", p.name), p.name.clone());
+pub(crate) fn explanation(p: &Param, why: &str, scope: &Scope) -> HelpView {
+    let mut v = HelpView::new(scope.help_key(&p.name), p.name.clone());
     if let Some(r) = p.recommended {
         v = v.with("Recommended here", format!("**{}**: {why}", p.value_text(r)));
     }
     let value = p.recommended.or(p.effective()).unwrap_or(p.min);
-    v.with(
-        "Equivalent command",
-        format!(
-            "`/system tuning set name={} value={value}`\n\n`/system tuning unset name={}`",
-            p.name, p.name
-        ),
-    )
+    v.with("Equivalent command", scope.commands(&p.name, value))
 }
 
 fn later(ui: &mut Ui, l: Lang, what: &'static str) {

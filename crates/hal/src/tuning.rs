@@ -69,6 +69,18 @@ pub struct KernelStats {
     pub neigh_full_v6: Option<u64>,
 }
 
+/// One port's settings of `corerouter_model::tuning::PORT_PARAMS` as the
+/// platform has them (G1.26b).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct PortTuning {
+    /// By key; `None`: the driver does not report it (veth has no rings).
+    pub values: BTreeMap<String, Option<i64>>,
+    /// The NIC's own maxima (`rx_ring` 4096, `combined_channels` 8).
+    pub max: BTreeMap<String, i64>,
+    /// Why some values are missing (`coalesce: not supported`).
+    pub notes: Vec<String>,
+}
+
 /// The current value of each asked kernel parameter; `None`: this kernel
 /// (or namespace) does not have it, or conntrack is not loaded.
 pub type Sysctls = BTreeMap<String, Option<i64>>;

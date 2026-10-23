@@ -28,7 +28,7 @@ use corerouter_model::{
     persist,
 };
 use corerouter_storage_fs::FileStorage;
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group};
 use serde_json::json;
 
 /// The lab's own config with 192.0.2.1/24 on ether1 and `n` distinct
@@ -233,6 +233,15 @@ fn history64(c: &mut Criterion) {
             disk_bytes(&dir, "rev-"),
         );
         drop(restored);
+        // The boot's peak memory, alone in a process of its own.
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(BOOT_RSS, &dir)
+            .output()
+            .unwrap();
+        eprint!(
+            "history64/{name}: {}",
+            String::from_utf8_lossy(&child.stdout)
+        );
         g.bench_function(BenchmarkId::new("boot", name), |b| {
             b.iter(|| boot(&dir).store().history().len());
         });
@@ -241,5 +250,44 @@ fn history64(c: &mut Criterion) {
     g.finish();
 }
 
+/// Set to a config directory: the bench process only boots it and prints
+/// the peak resident memory (`VmHWM`) and what stays resident (`VmRSS`).
+const BOOT_RSS: &str = "COREROUTER_BENCH_BOOT_RSS";
+
+fn status_kib(field: &str) -> u64 {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    status
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix(field)?
+                .trim()
+                .strip_suffix("kB")?
+                .trim()
+                .parse()
+                .ok()
+        })
+        .unwrap_or(0)
+}
+
+fn boot_rss(dir: &str) {
+    let before = status_kib("VmRSS:");
+    let s = boot(Path::new(dir));
+    let n = s.store().history().len();
+    println!(
+        "boot of {n} revisions: peak RSS {} MiB, resident after {} MiB (process start {} MiB)",
+        status_kib("VmHWM:") / 1024,
+        status_kib("VmRSS:") / 1024,
+        before / 1024,
+    );
+}
+
 criterion_group!(benches, commit, history64);
-criterion_main!(benches);
+
+fn main() {
+    if let Ok(dir) = std::env::var(BOOT_RSS) {
+        boot_rss(&dir);
+        return;
+    }
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

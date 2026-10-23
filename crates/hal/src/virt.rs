@@ -19,7 +19,7 @@ use crate::nic::{
     NicHardware, Offload, base_t_modes, mode_speed,
 };
 use crate::sff::{self, SfpModule};
-use crate::tuning::{KernelStats, NumaNode, SoftnetCpu, Sysctls, SystemInfo};
+use crate::tuning::{KernelStats, NumaNode, PortTuning, SoftnetCpu, Sysctls, SystemInfo};
 use crate::{
     DynamicChange, Features, Hal, HalError, Learned, LinkErrors, LinkInfo, LinkState, SharedProber,
     SimProber,
@@ -53,6 +53,22 @@ pub struct VirtualHal {
     /// a lab script) can change behind CoreRouter's back to make drift.
     kernel: LabKernel,
 }
+
+/// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
+const LAB_PORT: &[(&str, Option<i64>)] = &[
+    ("rx_ring", Some(1024)),
+    ("tx_ring", Some(1024)),
+    ("combined_channels", Some(4)),
+    ("rx_channels", None),
+    ("tx_channels", None),
+    ("adaptive_rx", Some(1)),
+    ("rx_usecs", Some(50)),
+    ("adaptive_tx", Some(1)),
+    ("tx_usecs", Some(50)),
+    ("txqueuelen", Some(1000)),
+    ("qdisc", Some(3)),
+    ("rp_filter", Some(0)),
+];
 
 /// Memory of the lab's made-up server (32 GiB).
 const LAB_MEM_KIB: u64 = 32 << 20;
@@ -411,6 +427,36 @@ impl Hal for VirtualHal {
             .collect())
     }
 
+    /// A lab port's settings: what the applied config set, else a 4-queue
+    /// NIC with 1024-descriptor rings (max 4096, 8 queues).
+    fn port_tuning(&mut self, name: &IfName) -> Result<PortTuning, HalError> {
+        self.lab_port(name)?;
+        let mut values: BTreeMap<String, Option<i64>> = LAB_PORT
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), *v))
+            .collect();
+        if let Some(set) = self.applied.system.tuning.ports.get(name) {
+            for (k, v) in set {
+                if values.get(k).is_some_and(Option::is_some) {
+                    values.insert(k.clone(), Some(*v));
+                }
+            }
+        }
+        let max = [
+            ("rx_ring", 4096),
+            ("tx_ring", 4096),
+            ("combined_channels", 8),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v))
+        .collect();
+        Ok(PortTuning {
+            values,
+            max,
+            notes: vec!["separate rx/tx queues: the lab NIC has combined ones only".into()],
+        })
+    }
+
     /// Counters that grow with the polls, with a squeezed CPU 3, a
     /// conntrack table near its stock limit and a few neighbor overflows.
     fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {
@@ -616,6 +662,12 @@ impl Hal for VirtualHal {
             });
         };
         let n = u32::try_from(index).unwrap_or(0).saturating_add(1);
+        let set = self.applied.system.tuning.ports.get(name);
+        let tuned = |k: &str, lab: u32| {
+            set.and_then(|m| m.get(k))
+                .and_then(|v| u32::try_from(*v).ok())
+                .unwrap_or(lab)
+        };
         let wanted = &iface.ethernet.offloads;
         let offload = |name: &str, feature: &str, active: bool, fixed: bool| Offload {
             name: name.into(),
@@ -648,11 +700,11 @@ impl Hal for VirtualHal {
             numa_node: Some(u32::from(index >= self.ports.len() / 2)),
             rx_queues: Some(4),
             tx_queues: Some(4),
-            combined_channels: Some(4),
+            combined_channels: Some(tuned("combined_channels", 4)),
             combined_channels_max: Some(8),
-            ring_rx: Some(1024),
+            ring_rx: Some(tuned("rx_ring", 1024)),
             ring_rx_max: Some(4096),
-            ring_tx: Some(1024),
+            ring_tx: Some(tuned("tx_ring", 1024)),
             ring_tx_max: Some(4096),
             offloads: vec![
                 offload("TSO", "tx-tcp-segmentation", true, false),

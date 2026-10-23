@@ -10,7 +10,10 @@
 //! hash, rp_filter, forwarding, TCP of the control plane), which `apply`
 //! writes and puts back; the host-wide ones (`netdev_budget`, neighbor
 //! tables) are absent and the read-only ones (`rmem_max`, `kernel.panic`)
-//! refuse, and either way the whole change is rolled back. `netdevsim`
+//! refuse, and either way the whole change is rolled back. Port settings
+//! (G1.26b) run on a veth with four queues: its channels, `txqueuelen`,
+//! root qdisc and `rp_filter` change and come back; rings and coalescing
+//! are the "this NIC does not let" path. `netdevsim`
 //! cannot help here: creating one needs root in the host's namespace.
 //!
 //! Helpers outside `#[test]` fns may unwrap/panic too.
@@ -21,7 +24,7 @@ use std::process::Command;
 use std::sync::{Mutex, OnceLock};
 
 use corerouter_hal::Hal;
-use corerouter_hal_linux::LinuxHal;
+use corerouter_hal_linux::{LinuxHal, Policy};
 use corerouter_model::Config;
 use corerouter_model::tuning::PARAMS;
 
@@ -155,4 +158,116 @@ fn reads_the_machine_and_the_counters() {
         !k.softnet.is_empty(),
         "softnet_stat is per host, readable here"
     );
+}
+
+fn ip(args: &[&str]) {
+    let out = Command::new("ip").args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "ip {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn ports(values: &[(&str, i64)]) -> Config {
+    let mut c = Config::default();
+    let port = c
+        .system
+        .tuning
+        .ports
+        .entry("pa".parse().unwrap())
+        .or_default();
+    for (k, v) in values {
+        port.insert((*k).to_owned(), *v);
+    }
+    c
+}
+
+#[test]
+fn port_settings_are_written_and_put_back() {
+    if !in_netns() {
+        return;
+    }
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    ip(&[
+        "link",
+        "add",
+        "pa",
+        "numtxqueues",
+        "4",
+        "numrxqueues",
+        "4",
+        "type",
+        "veth",
+        "peer",
+        "name",
+        "pb",
+        "numtxqueues",
+        "4",
+        "numrxqueues",
+        "4",
+    ]);
+    ip(&["link", "set", "pa", "up"]);
+    ip(&["link", "set", "pb", "up"]);
+    let mut hal = LinuxHal::with_policy(Policy {
+        manage: vec!["pa".into()],
+        unmanaged: Vec::new(),
+    });
+    let name = "pa".parse().unwrap();
+    let before = hal.port_tuning(&name).unwrap();
+    let v = |t: &corerouter_hal::tuning::PortTuning, k: &str| t.values.get(k).copied().flatten();
+    assert_eq!(v(&before, "txqueuelen"), Some(1000), "{before:?}");
+    assert_eq!(v(&before, "qdisc"), Some(4), "veth: noqueue");
+    assert!(v(&before, "rp_filter").is_some());
+    assert_eq!(v(&before, "rx_ring"), None, "veth has no rings");
+    assert_eq!(before.max.get("rx_channels"), Some(&4), "{before:?}");
+
+    let base = Config::default();
+    let tuned = ports(&[
+        ("txqueuelen", 5000),
+        ("qdisc", 0),
+        ("rp_filter", 2),
+        ("rx_channels", 2),
+    ]);
+    hal.apply(&base, &tuned).unwrap();
+    let now = hal.port_tuning(&name).unwrap();
+    assert_eq!(v(&now, "txqueuelen"), Some(5000));
+    assert_eq!(v(&now, "qdisc"), Some(0), "fq_codel");
+    assert_eq!(v(&now, "rp_filter"), Some(2));
+    assert_eq!(v(&now, "rx_channels"), Some(2));
+
+    // A knob this NIC lacks: the whole change goes back.
+    let bad = ports(&[
+        ("txqueuelen", 7000),
+        ("qdisc", 0),
+        ("rp_filter", 2),
+        ("rx_channels", 2),
+        ("rx_ring", 512),
+    ]);
+    let err = hal.apply(&tuned, &bad).unwrap_err().to_string();
+    assert!(err.contains("does not let"), "{err}");
+    assert_eq!(
+        v(&hal.port_tuning(&name).unwrap(), "txqueuelen"),
+        Some(5000)
+    );
+
+    // Taken out: the port's own values.
+    hal.apply(&tuned, &base).unwrap();
+    let back = hal.port_tuning(&name).unwrap();
+    for k in ["txqueuelen", "qdisc", "rp_filter", "rx_channels"] {
+        assert_eq!(v(&back, k), v(&before, k), "{k}");
+    }
+
+    // A link CoreRouter does not manage (`--unmanaged pa`) is never touched.
+    let mut other = LinuxHal::with_policy(Policy {
+        manage: Vec::new(),
+        unmanaged: vec!["pa".into()],
+    });
+    other.apply(&base, &tuned).unwrap();
+    assert_eq!(
+        v(&other.port_tuning(&name).unwrap(), "txqueuelen"),
+        Some(1000)
+    );
+    ip(&["link", "del", "pa"]);
 }

@@ -336,6 +336,173 @@ Longer keeps VoIP and VPN through NAT without keepalives (MikroTik: 3 min).
 RFC 4787 REQ-5: a NAT mapping must last at least 2 minutes (5 recommended)."##,
     ),
     (
+        "tuning.port.adaptive_rx",
+        r##"## What it does
+Adaptive interrupt coalescing on receive: the driver waits longer between interrupts when traffic is heavy and fires at once when it is light (Intel ITR, Mellanox DIM).
+## When to change
+On for most routers. Off, with `rx_usecs` = 0, for the lowest latency (an interrupt per packet).
+## Careful
+Off with a high `rx_usecs` delays every packet; off with 0 can use a whole CPU on interrupts at line rate."##,
+    ),
+    (
+        "tuning.port.adaptive_tx",
+        r##"## What it does
+Adaptive interrupt coalescing on transmit: the driver waits longer between interrupts when traffic is heavy and fires at once when it is light (Intel ITR, Mellanox DIM).
+## When to change
+On for most routers. Off, with `tx_usecs` = 0, for the lowest latency (an interrupt per packet).
+## Careful
+Off with a high `tx_usecs` delays every packet; off with 0 can use a whole CPU on interrupts at line rate."##,
+    ),
+    (
+        "tuning.port.combined_channels",
+        r##"## What it does
+Queue pairs (receive and transmit together) the port uses. Each queue has its own interrupt, served by one CPU: more queues spread the receive work (RSS hashes each flow to one queue).
+## When to change
+One queue per CPU of the port's NUMA node (`scaling.rst`): a CPU on the other node reaches the NIC across the interconnect. More queues than CPUs only add interrupts.
+## Careful
+Changing it **resets the port** (the link drops for a moment) and moves interrupts: CPU and IRQ affinity follows in G1.26c."##,
+    ),
+    (
+        "tuning.port.gro",
+        r##"## What it does
+Generic Receive Offload: the kernel merges consecutive packets of a flow into one before routing them, and splits them again when sending. Fewer per-packet costs.
+## When to change
+Keep it on: it is reversible, so it is safe for routing and bridging (unlike LRO).
+## Careful
+Off only to debug packet captures."##,
+    ),
+    (
+        "tuning.port.gso",
+        r##"## What it does
+Generic Segmentation Offload: big TCP packets the router itself sends are cut by the NIC (or late in the stack) instead of by the CPU.
+## When to change
+It does not matter for forwarded traffic, which arrives already cut to the wire's MTU. Leave it as the driver has it.
+## Careful
+It helps the router's own TCP (BGP with full tables, the API); turning it off only costs CPU."##,
+    ),
+    (
+        "tuning.port.lro",
+        r##"## What it does
+Large Receive Offload: the NIC merges packets in hardware and rewrites their headers in a way that cannot be undone.
+## When to change
+Keep it off on a router: the kernel turns it off by itself when forwarding is on. Only a host that terminates the traffic gains from it.
+## Careful
+Forwarding LRO-merged packets breaks PMTU and TCP on the far end. CoreRouter refuses to turn it on here (`interface.ethernet.set force=yes` for a port that only terminates traffic)."##,
+    ),
+    (
+        "tuning.port.qdisc",
+        r##"## What it does
+The root queueing discipline of the port: how packets wait to be sent.
+- **mq**: one child qdisc per transmit queue (the kernel default for multi-queue NICs); no lock shared by all CPUs.
+- **fq_codel**: fair queuing with CoDel AQM: low delay, no bufferbloat (the default child qdisc).
+- **fq**: fair queuing with pacing, for hosts sending TCP.
+- **pfifo_fast**: the old three-band FIFO.
+- **noqueue**: no queue (virtual interfaces).
+## When to change
+A multi-queue port keeps mq; a single-queue port gets fq_codel. Shaping (HTB, CAKE) is a different feature.
+## Careful
+fq_codel at the root of a multi-queue NIC funnels every CPU through one lock: lower throughput."##,
+    ),
+    (
+        "tuning.port.rp_filter",
+        r##"## What it does
+The reverse path filter of this port. The kernel uses the larger of `net.ipv4.conf.all.rp_filter` and this value: turning `all` off does nothing on a port left at strict.
+## When to change
+To the same value as `all` (the profile does so): loose (2) for an ISP with several uplinks, off (0) with anti-spoofing in the firewall.
+## Careful
+Strict (1) on an uplink drops replies that come back by another uplink (asymmetric routing)."##,
+    ),
+    (
+        "tuning.port.rx_channels",
+        r##"## What it does
+Receive-only queues the port uses (NICs without combined queues, veth). Each queue has its own interrupt, served by one CPU: more queues spread the receive work (RSS hashes each flow to one queue).
+## When to change
+One queue per CPU of the port's NUMA node (`scaling.rst`): a CPU on the other node reaches the NIC across the interconnect. More queues than CPUs only add interrupts.
+## Careful
+Changing it **resets the port** (the link drops for a moment) and moves interrupts: CPU and IRQ affinity follows in G1.26c."##,
+    ),
+    (
+        "tuning.port.rx_pause",
+        r##"## What it does
+802.3x flow control, receive: the port obeys pause frames from the other end and stops sending.
+## When to change
+Off on a router (Intel's ice default): a pause stops the whole port, so one slow receiver delays every flow (head-of-line blocking). Drops are cheaper than stalls; TCP handles them.
+## Careful
+Some switches and storage networks rely on pause; match the other end. Changing it may renegotiate the link."##,
+    ),
+    (
+        "tuning.port.rx_ring",
+        r##"## What it does
+Descriptors in the port's RX ring: packets the NIC can hold for the kernel (receive) before it has to drop ("missed").
+## When to raise
+When `rx_missed_errors` grows (Summary tab) or the port takes bursts at 10 Gb/s and up. Intel and Mellanox guides raise it to the maximum for forwarding.
+## Careful
+Changing it **resets the port**: the link drops for a moment (use Safe Mode). A bigger ring uses more memory and lets a queue hold more delay under overload."##,
+    ),
+    (
+        "tuning.port.rx_usecs",
+        r##"## What it does
+Microseconds the NIC waits after a receive packet before it interrupts the CPU (with adaptive coalescing off). Intel: 80 µs ≈ 12 500 interrupts per second per queue.
+## When to change
+0 for the lowest latency; 50–100 to save CPU at high packet rates. With adaptive on, the driver decides.
+## Careful
+Some drivers round it (to multiples of 2 or 4 µs); CoreRouter checks what the driver kept."##,
+    ),
+    (
+        "tuning.port.tso",
+        r##"## What it does
+TCP Segmentation Offload: big TCP packets the router itself sends are cut by the NIC (or late in the stack) instead of by the CPU.
+## When to change
+It does not matter for forwarded traffic, which arrives already cut to the wire's MTU. Leave it as the driver has it.
+## Careful
+It helps the router's own TCP (BGP with full tables, the API); turning it off only costs CPU."##,
+    ),
+    (
+        "tuning.port.tx_channels",
+        r##"## What it does
+Transmit-only queues the port uses (NICs without combined queues, veth). Each queue has its own interrupt, served by one CPU: more queues spread the receive work (RSS hashes each flow to one queue).
+## When to change
+One queue per CPU of the port's NUMA node (`scaling.rst`): a CPU on the other node reaches the NIC across the interconnect. More queues than CPUs only add interrupts.
+## Careful
+Changing it **resets the port** (the link drops for a moment) and moves interrupts: CPU and IRQ affinity follows in G1.26c."##,
+    ),
+    (
+        "tuning.port.tx_pause",
+        r##"## What it does
+802.3x flow control, transmit: the port sends pause frames when its receive ring fills.
+## When to change
+Off on a router (Intel's ice default): a pause stops the whole port, so one slow receiver delays every flow (head-of-line blocking). Drops are cheaper than stalls; TCP handles them.
+## Careful
+Some switches and storage networks rely on pause; match the other end. Changing it may renegotiate the link."##,
+    ),
+    (
+        "tuning.port.tx_ring",
+        r##"## What it does
+Descriptors in the port's TX ring: packets the NIC can queue for the wire (transmit) before it has to drop ("missed").
+## When to raise
+When transmit drops grow or the port takes bursts at 10 Gb/s and up. Intel and Mellanox guides raise it to the maximum for forwarding.
+## Careful
+Changing it **resets the port**: the link drops for a moment (use Safe Mode). A bigger ring uses more memory and lets a queue hold more delay under overload."##,
+    ),
+    (
+        "tuning.port.tx_usecs",
+        r##"## What it does
+Microseconds the NIC waits after a transmit packet before it interrupts the CPU (with adaptive coalescing off). Intel: 80 µs ≈ 12 500 interrupts per second per queue.
+## When to change
+0 for the lowest latency; 50–100 to save CPU at high packet rates. With adaptive on, the driver decides.
+## Careful
+Some drivers round it (to multiples of 2 or 4 µs); CoreRouter checks what the driver kept."##,
+    ),
+    (
+        "tuning.port.txqueuelen",
+        r##"## What it does
+Packets the kernel queues for the port when the NIC is busy (in the qdisc, before the TX ring). Default 1000.
+## When to change
+Rarely: with fq_codel the queue is kept short by the qdisc anyway. A virtual interface (VLAN, tunnel) with 0 has no queue at all.
+## Careful
+A big queue without an AQM qdisc is bufferbloat: seconds of delay under load."##,
+    ),
+    (
         "tuning.profiles",
         r##"## Profiles
 Each profile is calculated from this machine (RAM, CPUs, port speeds), not copied from a table:

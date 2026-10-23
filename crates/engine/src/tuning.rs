@@ -70,6 +70,10 @@ pub struct Nic {
     /// Frames the NIC dropped for lack of a free RX descriptor
     /// (`rx_missed_errors`), since the driver loaded.
     pub rx_missed: Option<u64>,
+    /// LRO is on (G1.26b): it corrupts forwarded packets.
+    pub lro: Option<bool>,
+    /// Pause frames are on in either direction.
+    pub pause: Option<bool>,
 }
 
 /// The machine.
@@ -113,18 +117,28 @@ pub const WHY: &[(&str, &str)] = &[
     ("backlog", "Sized for {gbps} Gb/s of ports: a burst waits in the backlog instead of being dropped."),
     ("budget", "More packets per receive round ({profile}): fewer squeezes under load."),
     ("budget_low", "The kernel's value: shorter receive rounds, less waiting ({profile})."),
+    ("coalesce_adaptive", "Adaptive interrupt coalescing: few interrupts under load, quick ones when idle."),
+    ("coalesce_off", "An interrupt per packet: the lowest latency, at the cost of CPU."),
     ("ct_buckets", "A quarter of nf_conntrack_max: short hash chains on every lookup."),
     ("ct_max", "{share} of the RAM ({mem}) for connection tracking, ~320 B per entry."),
     ("ct_timeout", "{value} s ({profile}): dead connections leave the table sooner."),
     ("ct_timeout_rfc", "{value} s ({profile}): dead connections leave the table sooner, within {rfc}."),
     ("default", "The kernel's default."),
     ("forward", "A router forwards packets."),
+    ("gro", "GRO merges a flow's packets on receive and the kernel splits them again on send: fewer per-packet costs, safe for forwarding."),
     ("hash_l4", "Spreads flows over equal-cost routes by port too, not only by address."),
     ("keep", "{profile} keeps the kernel's value."),
+    ("lro", "LRO rewrites headers and cannot be undone: a router must not forward what it built (the kernel turns it off with forwarding)."),
     ("min_free", "A reserve for allocations in interrupts (NIC rings): {share} of the RAM."),
     ("neigh", "{entries} neighbors for {mem} of RAM; the other thresholds at 1/2 and 1/8 of it."),
     ("oops", "An oops leaves the kernel unsure of itself: treat it as a panic and reboot."),
     ("panic", "Reboot 10 s after a kernel panic instead of hanging."),
+    ("pause", "Pause frames stop the whole port when one queue fills: head-of-line blocking for every flow."),
+    ("qdisc_fq_codel", "One transmit queue: fq_codel keeps queuing delay low (no bufferbloat)."),
+    ("qdisc_noqueue", "A virtual port sends at once, with no queue of its own: a qdisc there only adds work."),
+    ("qdisc_mq", "Several transmit queues: mq keeps one qdisc per queue (the default one, fq_codel), without a lock shared by all CPUs."),
+    ("queues", "One queue per CPU of the port's NUMA node ({cpus}), up to the NIC's {max}."),
+    ("ring", "{value} descriptors ({profile}), of the NIC's {max}: room for a burst without missed frames."),
     ("rp_loose", "Loose: drops sources with no route at all and keeps asymmetric routing (several uplinks) working."),
     ("rp_off", "Off: no extra route lookup per packet; filter spoofed sources in the firewall."),
     ("sockbuf", "Lets BGP and the API ask for 16 MiB socket buffers (full tables)."),
@@ -132,7 +146,10 @@ pub const WHY: &[(&str, &str)] = &[
 ];
 
 fn rec(id: &'static str, value: i64, args: &[(&'static str, String)]) -> Rec {
-    let args: BTreeMap<&'static str, String> = args.iter().cloned().collect();
+    let mut args: BTreeMap<&'static str, String> = args.iter().cloned().collect();
+    if id == "ring" {
+        args.insert("value", value.to_string());
+    }
     let template = WHY
         .iter()
         .find(|(k, _)| *k == id)
@@ -143,6 +160,11 @@ fn rec(id: &'static str, value: i64, args: &[(&'static str, String)]) -> Rec {
         why_id: id,
         why_args: args,
     }
+}
+
+/// A recommendation of `value` with reason `id` (one of [`WHY`]).
+pub(crate) fn why(id: &'static str, value: i64, args: &[(&'static str, String)]) -> Rec {
+    rec(id, value, args)
 }
 
 /// Put `args` into `{name}` places of `template`.
@@ -358,7 +380,9 @@ pub struct Finding {
 
 pub const FINDINGS: &[(&str, &str)] = &[
     ("conntrack_full", "The conntrack table is {pct}% full ({count} of {max}): new connections are dropped when it fills."),
+    ("flow_control_on", "Flow control (pause frames) is on on {nics}: one full queue stops the whole port (Interfaces tab)."),
     ("forwarding_off", "IPv4 forwarding is off: this router does not route."),
+    ("lro_on", "LRO is on on {nics}: it merges packets in a way a router must not forward (Interfaces tab)."),
     ("neigh_full", "The {family} neighbor table overflowed {count} times since boot: hosts lose connectivity."),
     ("nic_missed", "{nics} dropped {count} frames for lack of RX descriptors, with the RX ring below its maximum (Interfaces tab)."),
     ("softnet_dropped", "{count} packets dropped since boot: the backlog was full (CPU {cpu} the most)."),
@@ -510,6 +534,24 @@ pub fn diagnose(m: &Machine, stats: &KernelStats, cur: &Sysctls) -> Vec<Finding>
             None,
         ));
     }
+    for (id, severity, on) in [
+        ("lro_on", Severity::Warning, (|n: &Nic| n.lro) as fn(&Nic) -> Option<bool>),
+        ("flow_control_on", Severity::Info, |n: &Nic| n.pause),
+    ] {
+        let names: Vec<&str> = m
+            .nics
+            .iter()
+            .filter(|n| on(n) == Some(true))
+            .map(|n| n.name.as_str())
+            .collect();
+        if !names.is_empty() {
+            let mut shown: Vec<&str> = names.iter().copied().take(4).collect();
+            if names.len() > 4 {
+                shown.push("…");
+            }
+            out.push(finding(severity, id, &[("nics", shown.join(", "))], None, None));
+        }
+    }
     out.sort_by_key(|f| std::cmp::Reverse(f.severity));
     out
 }
@@ -617,6 +659,8 @@ mod tests {
             nics: vec![Nic {
                 name: "ether1".into(),
                 rx_missed: Some(50),
+                lro: Some(true),
+                pause: Some(true),
                 ring_rx: Some(512),
                 ring_rx_max: Some(4096),
                 ..Nic::default()
@@ -639,7 +683,16 @@ mod tests {
         let ids: Vec<&str> = f.iter().map(|f| f.id).collect();
         assert_eq!(
             ids,
-            ["forwarding_off", "conntrack_full", "softnet_dropped", "softnet_squeeze", "neigh_full", "nic_missed"]
+            [
+                "forwarding_off",
+                "conntrack_full",
+                "softnet_dropped",
+                "softnet_squeeze",
+                "neigh_full",
+                "lro_on",
+                "nic_missed",
+                "flow_control_on"
+            ]
         );
         let squeeze = &f[3];
         assert!(squeeze.text.contains("CPU 1"), "{}", squeeze.text);

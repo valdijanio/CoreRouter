@@ -90,6 +90,11 @@ pub mod icmp;
 #[cfg(target_os = "linux")]
 pub mod tuning;
 
+/// System › Tuning, Interfaces (G1.26b): rings, queues, coalescing,
+/// txqueuelen, root qdisc and `rp_filter` of each port.
+#[cfg(target_os = "linux")]
+mod port_tuning;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
@@ -97,7 +102,7 @@ mod linux {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use corerouter_hal::drift::{LinkSnap, Snapshot};
-    use corerouter_hal::tuning::{KernelStats, Sysctls, SystemInfo};
+    use corerouter_hal::tuning::{KernelStats, PortTuning, Sysctls, SystemInfo};
     use corerouter_hal::{
         CableTest, DynamicChange, EthernetMonitor, Features, Hal, HalError, LinkCounters, LinkInfo,
         LinkState, NicHardware, SfpModule,
@@ -125,6 +130,8 @@ mod linux {
         ether_orig: BTreeMap<IfName, EtherState>,
         /// Kernel parameters set by `system.tuning` and their originals.
         sysctl: crate::tuning::Sysctl,
+        /// Port settings of `system.tuning.ports` and their originals.
+        ports: crate::port_tuning::Ports,
     }
 
     impl LinuxHal {
@@ -309,6 +316,38 @@ mod linux {
         }
     }
 
+    impl LinuxHal {
+        /// `ports` without the links CoreRouter does not manage (logged).
+        fn managed_ports(
+            &self,
+            cfg: &Config,
+            ports: &BTreeMap<IfName, BTreeMap<String, i64>>,
+        ) -> Result<BTreeMap<IfName, BTreeMap<String, i64>>, HalError> {
+            if ports.is_empty() {
+                return Ok(BTreeMap::new());
+            }
+            let external: BTreeMap<String, String> = self
+                .view(&claims_of(cfg))?
+                .into_iter()
+                .filter_map(|(l, o)| match o {
+                    Owner::External(r) => Some((l.name, r)),
+                    Owner::Managed | Owner::Conflict(_) => None,
+                })
+                .collect();
+            Ok(ports
+                .iter()
+                .filter(|(n, _)| match external.get(n.as_str()) {
+                    Some(why) => {
+                        log::warn!("tuning of '{n}' not applied ({why})");
+                        false
+                    }
+                    None => true,
+                })
+                .map(|(n, v)| (n.clone(), v.clone()))
+                .collect())
+        }
+    }
+
     fn claims_of(cfg: &Config) -> BTreeMap<IfName, InterfaceKind> {
         cfg.interfaces
             .iter()
@@ -344,6 +383,13 @@ mod linux {
         /// go to the executor, which refuses them and rolls back.
         fn apply(&mut self, from: &Config, to: &Config) -> Result<(), HalError> {
             let ops = crate::plan::plan(from, to)?;
+            // Before anything changes: port settings only reach links
+            // CoreRouter manages, as the Ethernet settings do (another
+            // program's link is never touched).
+            let (from_ports, to_ports) = (
+                self.managed_ports(from, &from.system.tuning.ports)?,
+                self.managed_ports(to, &to.system.tuning.ports)?,
+            );
             // nftables first (a refusal changes nothing), and only when the
             // firewall changed: a host without nftables still runs the rest.
             let firewall = corerouter_firewall::nft::changed(from, to);
@@ -355,12 +401,23 @@ mod linux {
             // the port supports, they rarely fail; if the plan below does,
             // they go back too.
             let tuning = (&from.system.tuning.sysctl, &to.system.tuning.sysctl);
+            let ports = (&from_ports, &to_ports);
+            let root = self.sysctl.root.clone();
             let tuned = self.sysctl.transition(tuning.0, tuning.1).and_then(|()| {
-                self.ether_transition(from, to).inspect_err(|_| {
-                    if let Err(b) = self.sysctl.transition(tuning.1, tuning.0) {
-                        log::error!("restoring kernel parameters: {b}");
-                    }
-                })
+                self.ports
+                    .transition(ports.0, ports.1, &root)
+                    .and_then(|()| {
+                        self.ether_transition(from, to).inspect_err(|_| {
+                            if let Err(b) = self.ports.transition(ports.1, ports.0, &root) {
+                                log::error!("restoring port settings: {b}");
+                            }
+                        })
+                    })
+                    .inspect_err(|_| {
+                        if let Err(b) = self.sysctl.transition(tuning.1, tuning.0) {
+                            log::error!("restoring kernel parameters: {b}");
+                        }
+                    })
             });
             if let Err(e) = tuned {
                 if firewall {
@@ -406,6 +463,9 @@ mod linux {
                     if let Err(back) = self.ether_transition(to, from) {
                         log::error!("restoring Ethernet settings: {back}");
                     }
+                    if let Err(back) = self.ports.transition(ports.1, ports.0, &root) {
+                        log::error!("restoring port settings: {back}");
+                    }
                     if let Err(back) = self.sysctl.transition(tuning.1, tuning.0) {
                         log::error!("restoring kernel parameters: {back}");
                     }
@@ -435,6 +495,10 @@ mod linux {
 
         fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {
             Ok(self.sysctl.root.kernel_stats())
+        }
+
+        fn port_tuning(&mut self, name: &IfName) -> Result<PortTuning, HalError> {
+            Ok(crate::port_tuning::read(name, &self.sysctl.root))
         }
 
         fn poll(&mut self) -> Vec<LinkState> {

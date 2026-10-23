@@ -10,7 +10,6 @@
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
-use crate::json_delta;
 use crate::store::{ConfigStore, Revision};
 use crate::users::Users;
 
@@ -262,7 +261,7 @@ pub fn encode_revision(rev: &Revision, config: &str) -> Result<String, PersistEr
 
 /// A revision file stored as a difference (audit-history): how to build
 /// revision `number` from revision `base`, the next newer one, as a
-/// [`json_delta`] of their configs. Same header as [`encode_revision`];
+/// [`crate::json_delta`] of their configs. Same header as [`encode_revision`];
 /// `base` and `delta` instead of `config` tell the two apart.
 pub fn encode_revision_delta(
     rev: &Revision,
@@ -362,22 +361,23 @@ pub fn decode_revision(text: &str, number: u32) -> Result<Revision, PersistError
     }
 }
 
-/// `cfg` as a JSON tree, what [`json_delta`] compares.
+/// `cfg` as a JSON tree, what [`crate::json_delta`] compares.
 pub fn config_value(cfg: &Config) -> Result<serde_json::Value, PersistError> {
     serde_json::to_value(cfg).map_err(|e| PersistError::Malformed(e.to_string()))
 }
 
+/// The delta a revision file stores: how to build `rev` from `base`, the
+/// config of the next newer revision. Sections the two share are not
+/// serialized ([`crate::config_delta::diff`]).
+pub fn revision_delta(base: &Config, rev: &Config) -> Result<serde_json::Value, PersistError> {
+    crate::config_delta::diff(base, rev)
+}
+
 /// The config of a revision file stored as a difference: `delta` applied
-/// to `base` (the [`config_value`] of the newer revision, consumed and
-/// turned into this revision's tree, the base of the next older one).
-pub fn apply_revision_delta(
-    base: serde_json::Value,
-    delta: &serde_json::Value,
-) -> Result<(Config, serde_json::Value), PersistError> {
-    let tree = json_delta::apply_owned(base, delta)
-        .map_err(|e| PersistError::Inconsistent(e.to_string()))?;
-    let cfg = Config::deserialize(&tree).map_err(malformed)?;
-    Ok((cfg, tree))
+/// to `base`, the config of the newer revision. The sections the delta
+/// does not touch stay shared with `base` ([`crate::config_delta`]).
+pub fn apply_revision_delta(base: &Config, delta: &serde_json::Value) -> Result<Config, PersistError> {
+    crate::config_delta::apply(base, delta)
 }
 
 /// Size bound, then `format_version` before anything else.
@@ -581,6 +581,7 @@ fn malformed(e: serde_json::Error) -> PersistError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::json_delta;
 
     fn sample() -> ConfigStore {
         let mut st = ConfigStore::default();
@@ -807,7 +808,7 @@ mod tests {
             panic!("not a delta: {text}");
         };
         assert_eq!((rev.number, rev.comment.as_str(), b), (1, "rename", 2));
-        let (cfg, _) = apply_revision_delta(base, &d).unwrap();
+        let cfg = apply_revision_delta(&new.config, &d).unwrap();
         assert_eq!(cfg, old.config);
         // A full file is still a full file; the two never mix.
         let full = encode_revision(old, &encode_config(&old.config).unwrap()).unwrap();
@@ -822,7 +823,7 @@ mod tests {
         }
         // A delta that builds something that is not a config.
         let wrong = serde_json::json!({"o": {"system": {"=": 7}}});
-        assert!(apply_revision_delta(config_value(&new.config).unwrap(), &wrong).is_err());
+        assert!(apply_revision_delta(&new.config, &wrong).is_err());
     }
 
     #[test]
