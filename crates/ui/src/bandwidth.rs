@@ -18,7 +18,7 @@ use serde_json::{Map, Value, json};
 use crate::backend::RequestId;
 use crate::chip;
 use crate::help::{self, HelpView};
-use crate::i18n::{Lang, tr};
+use crate::i18n::{Lang, tr_in};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::torch::rate;
 use crate::windows::combo;
@@ -175,14 +175,14 @@ impl BandwidthPanel {
     }
 
     fn info(&mut self, ui: &mut Ui, l: Lang, key: &str, title: &'static str) {
-        if help::info_button(ui, Id::unique(("bw-help", key)), tr(l, title)).clicked() {
-            self.help = Some(HelpView::new(format!("bandwidth.{key}"), tr(l, title)));
+        if help::info_button(ui, Id::unique(("bw-help", key)), tr_in("btest", l, title)).clicked() {
+            self.help = Some(HelpView::new(format!("bandwidth.{key}"), tr_in("btest", l, title)));
         }
     }
 
     fn field(&mut self, ui: &mut Ui, l: Lang, key: &str, label: &'static str, hint: &str, width: f32) {
         let on = !self.running();
-        ui.label(tr(l, label));
+        ui.label(tr_in("btest", l, label));
         let value = match key {
             "address" => &mut self.address,
             "port" => &mut self.port,
@@ -199,13 +199,13 @@ impl BandwidthPanel {
         ui.horizontal_wrapped(|ui| {
             self.field(ui, l, "address", "Address", "iperf3 server (IP or name)", 200.0);
             self.field(ui, l, "port", "Port", "5201", 50.0);
-            ui.label(tr(l, "Protocol"));
+            ui.label(tr_in("btest", l, "Protocol"));
             ui.add_enabled_ui(on, |ui| {
                 let opts = ["tcp".to_owned(), "udp".to_owned()];
                 combo(ui, "bw-proto", "tcp", &mut self.protocol, &opts);
             });
             self.info(ui, l, "protocol", "Protocol");
-            ui.label(tr(l, "Direction"));
+            ui.label(tr_in("btest", l, "Direction"));
             ui.add_enabled_ui(on, |ui| {
                 let opts = ["send".to_owned(), "receive".to_owned(), "both".to_owned()];
                 combo(ui, "bw-dir", "send", &mut self.direction, &opts);
@@ -215,24 +215,24 @@ impl BandwidthPanel {
         ui.horizontal_wrapped(|ui| {
             self.field(ui, l, "streams", "Streams", "1", 40.0);
             self.field(ui, l, "duration", "Duration (s)", "10", 40.0);
-            let hint = if self.protocol == "udp" { "10M" } else { tr(l, "unlimited") };
+            let hint = if self.protocol == "udp" { "10M" } else { tr_in("btest", l, "unlimited") };
             self.field(ui, l, "bandwidth", "Rate per stream", hint, 80.0);
             ui.separator();
             if self.running() {
-                if ui.button(tr(l, "Stop")).clicked()
+                if ui.button(tr_in("btest", l, "Stop")).clicked()
                     && let Some(id) = self.task
                 {
                     app.run_then(STOP, json!({"id": id}), crate::panel::then(NAME, Stopped));
                 }
             } else {
                 let ready = if self.address.trim().is_empty() {
-                    Err(tr(l, "Type the server's address first").to_owned())
+                    Err(tr_in("btest", l, "Type the server's address first").to_owned())
                 } else {
                     Ok(())
                 };
                 let check = app.can().and(START, ready);
                 if ui
-                    .add_enabled(check.is_ok() && !self.starting, egui::Button::new(tr(l, "Start")))
+                    .add_enabled(check.is_ok() && !self.starting, egui::Button::new(tr_in("btest", l, "Start")))
                     .on_disabled_hover_text(check.err().unwrap_or_default())
                     .clicked()
                 {
@@ -280,11 +280,11 @@ impl BandwidthPanel {
             .show(ui, |p| {
                 let tx = series("tx_bps");
                 if tx.iter().any(|x| x[1] > 0.0) {
-                    p.line(Line::new(tr(l, "Tx"), PlotPoints::from(tx)).color(tx_ink).width(2.0));
+                    p.line(Line::new(tr_in("btest", l, "Tx"), PlotPoints::from(tx)).color(tx_ink).width(2.0));
                 }
                 let rx = series("rx_bps");
                 if rx.iter().any(|x| x[1] > 0.0) {
-                    p.line(Line::new(tr(l, "Rx"), PlotPoints::from(rx)).color(rx_ink).width(2.0));
+                    p.line(Line::new(tr_in("btest", l, "Rx"), PlotPoints::from(rx)).color(rx_ink).width(2.0));
                 }
             });
     }
@@ -305,12 +305,12 @@ impl BandwidthPanel {
             }
             if let (Some(avg), Some(max)) = (f(&s, "cpu_avg"), f(&s, "cpu_max")) {
                 let tone = if max >= 90.0 { chip::RED } else if max >= 70.0 { chip::AMBER } else { chip::GREEN };
-                chip::chip(ui, &format!("{} {avg:.0}% (max {max:.0}%)", tr(l, "router CPU")), tone.tone(ui.visuals()))
-                    .on_hover_text(tr(l, "All cores of this router while the test ran"));
+                chip::chip(ui, &format!("{} {avg:.0}% (max {max:.0}%)", tr_in("btest", l, "router CPU")), tone.tone(ui.visuals()))
+                    .on_hover_text(tr_in("btest", l, "All cores of this router while the test ran"));
             }
             if let Some(r) = f(&s, "remote_cpu") {
-                chip::chip(ui, &format!("{} {r:.0}%", tr(l, "remote CPU")), chip::neutral_tone(ui.visuals()))
-                    .on_hover_text(tr(l, "What the far end reported (iperf3: its own process)"));
+                chip::chip(ui, &format!("{} {r:.0}%", tr_in("btest", l, "remote CPU")), chip::neutral_tone(ui.visuals()))
+                    .on_hover_text(tr_in("btest", l, "What the far end reported (iperf3: its own process)"));
             }
         });
         if !self.warning.is_empty() && self.running() {
@@ -326,7 +326,7 @@ impl BandwidthPanel {
         let s = self.summary.clone();
         egui::Grid::new("bw-results").num_columns(6).striped(true).show(ui, |ui| {
             for h in ["", "Average", "Peak", "Loss", "Jitter", "Retransmits"] {
-                ui.strong(tr(l, h));
+                ui.strong(tr_in("btest", l, h));
             }
             ui.end_row();
             for (label, way, avg, peak) in [
@@ -338,7 +338,7 @@ impl BandwidthPanel {
                 if w.is_none() && live == 0.0 {
                     continue;
                 }
-                ui.label(tr(l, label));
+                ui.label(tr_in("btest", l, label));
                 // At the end, what the receiver got; while running, ours.
                 let shown = w.and_then(|w| f(w, "received_bps")).unwrap_or(live);
                 ui.label(rate(shown));
@@ -385,9 +385,9 @@ impl BandwidthPanel {
             ui.label(format!(
                 "{} {}  ·  {} {}",
                 st.get("tests_served").and_then(Value::as_u64).unwrap_or(0),
-                tr(l, "tests served"),
+                tr_in("btest", l, "tests served"),
                 st.get("refused").and_then(Value::as_u64).unwrap_or(0),
-                tr(l, "refused"),
+                tr_in("btest", l, "refused"),
             ));
             self.info(ui, l, "server", "Bandwidth Server");
         });
@@ -396,7 +396,7 @@ impl BandwidthPanel {
                 let g = |k: &str| t.get(k).map(crate::value_text).unwrap_or_default();
                 ui.label(format!(
                     "{}: {} {} {} · {} streams · {} s · {} bytes",
-                    tr(l, title),
+                    tr_in("btest", l, title),
                     g("client"),
                     g("protocol"),
                     g("direction"),
@@ -411,11 +411,11 @@ impl BandwidthPanel {
         }
         ui.separator();
         let Some(mut form) = self.server_form.clone() else {
-            ui.weak(tr(l, "Loading…"));
+            ui.weak(tr_in("btest", l, "Loading…"));
             return;
         };
         egui::Grid::new("bw-server").num_columns(3).show(ui, |ui| {
-            ui.label(tr(l, "Enabled"));
+            ui.label(tr_in("btest", l, "Enabled"));
             ui.checkbox(&mut form.enabled, "");
             self.info(ui, l, "server_enabled", "Enabled");
             ui.end_row();
@@ -426,12 +426,12 @@ impl BandwidthPanel {
                 ("Max streams", "server_max_streams", &mut form.max_streams, "8"),
                 ("Max rate", "server_max_rate", &mut form.max_rate, "0 = no cap"),
             ] {
-                ui.label(tr(l, label));
+                ui.label(tr_in("btest", l, label));
                 // A Grid squeezes a TextEdit to its content: fixed size.
                 let h = ui.spacing().interact_size.y;
                 ui.add_sized([300.0, h], TextEdit::singleline(value).hint_text(hint));
-                if help::info_button(ui, Id::unique(("bw-help", key)), tr(l, label)).clicked() {
-                    self.help = Some(HelpView::new(format!("bandwidth.{key}"), tr(l, label)));
+                if help::info_button(ui, Id::unique(("bw-help", key)), tr_in("btest", l, label)).clicked() {
+                    self.help = Some(HelpView::new(format!("bandwidth.{key}"), tr_in("btest", l, label)));
                 }
                 ui.end_row();
             }
@@ -440,14 +440,14 @@ impl BandwidthPanel {
         ui.horizontal(|ui| {
             let check = app.can().check(SERVER_SET);
             if ui
-                .add_enabled(check.is_ok(), egui::Button::new(tr(l, "Apply")))
+                .add_enabled(check.is_ok(), egui::Button::new(tr_in("btest", l, "Apply")))
                 .on_disabled_hover_text(check.err().unwrap_or_default())
                 .clicked()
             {
                 self.server_error = None;
                 app.run_then(SERVER_SET, form.params(), crate::panel::then(NAME, Saved));
             }
-            if ui.button(tr(l, "Reset")).clicked() {
+            if ui.button(tr_in("btest", l, "Reset")).clicked() {
                 self.server_form = Some(ServerForm::of(&self.server));
             }
             if let Some(e) = &self.server_error {
@@ -498,8 +498,8 @@ impl PanelState for BandwidthPanel {
     fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
         let l = app.lang.labels;
         ui.horizontal(|ui| {
-            ui.selectable_value(&mut self.tab, Tab::Test, tr(l, "Test"));
-            ui.selectable_value(&mut self.tab, Tab::Server, tr(l, "Server"));
+            ui.selectable_value(&mut self.tab, Tab::Test, tr_in("btest", l, "Test"));
+            ui.selectable_value(&mut self.tab, Tab::Server, tr_in("btest", l, "Server"));
         });
         ui.separator();
         match self.tab {
@@ -522,7 +522,7 @@ impl PanelState for BandwidthPanel {
         let l = app.lang.labels;
         let mut answer = None;
         let load = if self.bandwidth.trim().is_empty() && self.protocol == "tcp" {
-            tr(l, "as much as TCP can push").to_owned()
+            tr_in("btest", l, "as much as TCP can push").to_owned()
         } else {
             format!(
                 "{} × {}",
@@ -532,23 +532,23 @@ impl PanelState for BandwidthPanel {
         };
         egui::Modal::new(Id::unique("bw-confirm")).show(ctx, |ui| {
             ui.set_max_width(460.0);
-            ui.strong(format!("{} {}?", tr(l, "Start a bandwidth test to"), self.address.trim()));
+            ui.strong(format!("{} {}?", tr_in("btest", l, "Start a bandwidth test to"), self.address.trim()));
             ui.label(format!(
                 "{} {} s ({}, {}, {load}).",
-                tr(l, "It fills the path for"),
+                tr_in("btest", l, "It fills the path for"),
                 self.duration.trim(),
                 self.protocol,
                 self.direction,
             ));
             ui.colored_label(
                 ui.visuals().warn_fg_color,
-                tr(l, "Subscribers on the same links will feel it while it runs."),
+                tr_in("btest", l, "Subscribers on the same links will feel it while it runs."),
             );
             ui.horizontal(|ui| {
-                if ui.button(tr(l, "Start")).clicked() {
+                if ui.button(tr_in("btest", l, "Start")).clicked() {
                     answer = Some(true);
                 }
-                if ui.button(tr(l, "Cancel")).clicked() {
+                if ui.button(tr_in("btest", l, "Cancel")).clicked() {
                     answer = Some(false);
                 }
             });

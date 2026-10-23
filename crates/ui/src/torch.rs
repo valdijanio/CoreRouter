@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use crate::backend::RequestId;
 use crate::chip::{self, Kind};
 use crate::help::{self, HelpView};
-use crate::i18n::{Lang, tr};
+use crate::i18n::{Lang, tr_in};
 use crate::list::filter_chip;
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::{self, Column, Row, TableState, col, num, weak};
@@ -304,25 +304,25 @@ impl TorchPanel {
     }
 
     fn info(&mut self, ui: &mut Ui, l: Lang, key: &str, title: &'static str) {
-        if help::info_button(ui, Id::unique(("torch-help", key)), tr(l, title)).clicked() {
-            self.help = Some(HelpView::new(format!("torch.{key}"), tr(l, title)));
+        if help::info_button(ui, Id::unique(("torch-help", key)), tr_in("torch", l, title)).clicked() {
+            self.help = Some(HelpView::new(format!("torch.{key}"), tr_in("torch", l, title)));
         }
     }
 
     fn form(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         let running = self.running();
         ui.horizontal_wrapped(|ui| {
-            ui.label(tr(l, "Interface"));
+            ui.label(tr_in("torch", l, "Interface"));
             let names = app.interface_names(None);
             ui.add_enabled_ui(!running, |ui| {
-                combo(ui, "torch-iface", tr(l, "pick one"), &mut self.interface, &names);
+                combo(ui, "torch-iface", tr_in("torch", l, "pick one"), &mut self.interface, &names);
             });
             self.info(ui, l, "interface", "Interface");
             ui.separator();
-            ui.label(tr(l, "Group by"));
+            ui.label(tr_in("torch", l, "Group by"));
             for (i, (_, label)) in GROUPS.iter().enumerate() {
                 let on = self.group.get(i).copied().unwrap_or(false);
-                if filter_chip(ui, tr(l, label), on)
+                if filter_chip(ui, tr_in("torch", l, label), on)
                     && !running
                     && let Some(g) = self.group.get_mut(i)
                 {
@@ -333,16 +333,16 @@ impl TorchPanel {
         });
         ui.add_space(2.0);
         ui.horizontal_wrapped(|ui| {
-            text_field(ui, !running, tr(l, "Src."), &mut self.src, "100.64.0.0/10", 120.0);
+            text_field(ui, !running, tr_in("torch", l, "Src."), &mut self.src, "100.64.0.0/10", 120.0);
             self.info(ui, l, "src", "Src.");
-            text_field(ui, !running, tr(l, "Dst."), &mut self.dst, "0.0.0.0/0", 120.0);
+            text_field(ui, !running, tr_in("torch", l, "Dst."), &mut self.dst, "0.0.0.0/0", 120.0);
             self.info(ui, l, "dst", "Dst.");
-            text_field(ui, !running, tr(l, "Port"), &mut self.port, "443", 50.0);
+            text_field(ui, !running, tr_in("torch", l, "Port"), &mut self.port, "443", 50.0);
             self.info(ui, l, "port", "Port");
-            text_field(ui, !running, tr(l, "Protocol"), &mut self.protocol, "tcp", 60.0);
+            text_field(ui, !running, tr_in("torch", l, "Protocol"), &mut self.protocol, "tcp", 60.0);
             self.info(ui, l, "protocol", "Protocol");
             ui.separator();
-            ui.label(tr(l, "Sampling"));
+            ui.label(tr_in("torch", l, "Sampling"));
             ui.add_enabled_ui(!running, |ui| {
                 let opts: Vec<String> = ["auto", "off", "10", "100", "1000"]
                     .iter()
@@ -354,20 +354,20 @@ impl TorchPanel {
             ui.separator();
             let can = app.can();
             if running {
-                if ui.button(tr(l, "Stop")).clicked()
+                if ui.button(tr_in("torch", l, "Stop")).clicked()
                     && let Some(id) = self.task
                 {
                     app.run_then(STOP, json!({"id": id}), crate::panel::then(NAME, Stopped));
                 }
             } else {
                 let ready = if self.interface.trim().is_empty() {
-                    Err(tr(l, "Pick an interface first").to_owned())
+                    Err(tr_in("torch", l, "Pick an interface first").to_owned())
                 } else {
                     Ok(())
                 };
                 let check = can.and(START, ready);
                 if ui
-                    .add_enabled(check.is_ok() && !self.starting, egui::Button::new(tr(l, "Start")))
+                    .add_enabled(check.is_ok() && !self.starting, egui::Button::new(tr_in("torch", l, "Start")))
                     .on_disabled_hover_text(check.err().unwrap_or_default())
                     .clicked()
                 {
@@ -402,12 +402,12 @@ impl TorchPanel {
             let sample = s.get("sampling").and_then(Value::as_u64).unwrap_or(1);
             if sample > 1 {
                 chip::chip(ui, &format!("1:{sample}"), chip::AMBER.tone(ui.visuals()))
-                    .on_hover_text(tr(l, "Sampled: one packet in N is read and counted N times; the rows are estimates"));
+                    .on_hover_text(tr_in("torch", l, "Sampled: one packet in N is read and counted N times; the rows are estimates"));
             }
             if let Some(seen) = s.get("seen_pct").and_then(Value::as_f64) {
                 let kind = if seen >= 90.0 { Kind::Green } else { Kind::Amber };
-                chip::chip(ui, &format!("{} {seen:.0} %", tr(l, "seen")), kind.tone(ui.visuals()))
-                    .on_hover_text(tr(l, "Share of the interface's packets (its own counters) the capture read"));
+                chip::chip(ui, &format!("{} {seen:.0} %", tr_in("torch", l, "seen")), kind.tone(ui.visuals()))
+                    .on_hover_text(tr_in("torch", l, "Share of the interface's packets (its own counters) the capture read"));
             }
             if let Some(b) = s.get("backend").and_then(Value::as_str) {
                 chip::chip(ui, b, chip::neutral_tone(ui.visuals()));
@@ -442,17 +442,17 @@ impl TorchPanel {
         };
         ui.horizontal_wrapped(|ui| {
             if let Some(t) = s.get("total") {
-                ui.strong(tr(l, "Total"));
+                ui.strong(tr_in("torch", l, "Total"));
                 ui.label(line(t));
             }
             if let Some(o) = s.get("others").filter(|o| f64_of(o, "rows") > 0.0) {
                 ui.separator();
-                ui.label(format!("{} {}", f64_of(o, "rows"), tr(l, "more rows")));
+                ui.label(format!("{} {}", f64_of(o, "rows"), tr_in("torch", l, "more rows")));
                 ui.weak(line(o));
             }
             if let Some(k) = s.get("kernel") {
                 ui.separator();
-                ui.label(tr(l, "Interface counters"));
+                ui.label(tr_in("torch", l, "Interface counters"));
                 ui.weak(line(k));
                 self.info(ui, l, "counters", "Interface counters");
             }
