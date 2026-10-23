@@ -730,6 +730,45 @@ pub(crate) fn ask(query: &[u8], tcp: bool) -> Option<(Option<Vec<u8>>, &'static 
     Some((done.reply, done.answered_by))
 }
 
+/// [`ask`] as a LAN client would be answered (G6.8): from `as_client`
+/// (the router itself when `None`: then like [`ask`]), keeping each
+/// stage's decision when `explain`. A simulated client sent nothing: its
+/// query takes no limit token, counts in no statistics and touches no
+/// address list.
+pub(crate) fn ask_as(
+    query: &[u8],
+    tcp: bool,
+    as_client: Option<IpAddr>,
+    explain: bool,
+) -> Option<corerouter_proto_dns::server::Done> {
+    Some(SERVER.get()?.ask_as(query, tcp, as_client, explain))
+}
+
+impl Server {
+    /// [`ask_as`] on this server.
+    fn ask_as(
+        &self,
+        query: &[u8],
+        tcp: bool,
+        as_client: Option<IpAddr>,
+        explain: bool,
+    ) -> corerouter_proto_dns::server::Done {
+        let how = corerouter_proto_dns::server::How {
+            explain,
+            simulated: as_client.is_some(),
+        };
+        let client = as_client.unwrap_or(IpAddr::V4(Ipv4Addr::LOCALHOST));
+        let mut done = match self.fwd.start_as(query, client, tcp, self.dns.now_ms(), how) {
+            Start::Done(d) => d,
+            Start::Pending(p) => self.finish(*p),
+        };
+        if as_client.is_none() {
+            self.effects(&mut done);
+        }
+        done
+    }
+}
+
 /// The block lists the forwarder matches (G4.1d), once it started.
 pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
     SERVER.get().map(|s| s.fwd.state())
@@ -1157,6 +1196,28 @@ mod tests {
         drop(srv);
     }
 
+    /// G6.8: DNS Lookup asking as a LAN address, with each stage's
+    /// decision. Outside allowed_from: REFUSED by the ACL and nothing
+    /// counted; the router itself reaches the static entry.
+    #[test]
+    fn ask_as_a_client_goes_through_the_acl() {
+        let (_session, srv, _port, shutdown) = lab();
+        let before = srv.fwd.state::<corerouter_proto_dns::server::Statistics>().snapshot(10).counters.queries;
+        let q = query("nas.lan.", RecordType::A);
+        let d = srv.ask_as(&q, false, Some(IpAddr::from([203, 0, 113, 9])), true);
+        assert_eq!(d.answered_by, "acl");
+        let m = Message::from_vec(d.reply.as_deref().unwrap()).unwrap();
+        assert_eq!(m.metadata.response_code, hickory_proto::op::ResponseCode::Refused);
+        assert_eq!(d.explain[0].text(), "203.0.113.9 is not in allowed_from: REFUSED");
+        let after = srv.fwd.state::<corerouter_proto_dns::server::Statistics>().snapshot(10).counters.queries;
+        assert_eq!(after, before, "a simulated query is not counted");
+        let d = srv.ask_as(&q, false, None, true);
+        assert_eq!(d.answered_by, "static");
+        let s = d.explain.iter().find(|x| x.stage == "static").unwrap();
+        assert_eq!(s.text(), "static entry *1 (name=nas.lan) answers A");
+        shutdown.close();
+    }
+
     /// The effects queue is bounded: with the session lock held, a flood
     /// of address-list effects is dropped past the queue, not kept.
     #[test]
@@ -1173,6 +1234,7 @@ mod tests {
                 })
                 .collect(),
             answered_by: "test",
+            explain: Vec::new(),
         };
         srv.effects(&mut d);
         let dropped = srv.effects_dropped.load(Ordering::Relaxed);

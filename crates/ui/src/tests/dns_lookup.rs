@@ -1,5 +1,6 @@
 //! Tools › DNS Lookup (G6.6): `tool.dns.query` as a task, the answer with
-//! its chips and AS pills, and the compare and trace tables.
+//! its chips and AS pills, and the compare and trace tables; G6.8: the
+//! window as wide as its tables, "Why this answer" and "Ask as".
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -75,6 +76,7 @@ impl DnsBackend for Cached {
             ms: 0,
             stage: Some("cache".into()),
             source: Some("cache".into()),
+            explain: Vec::new(),
         })
     }
 }
@@ -184,4 +186,139 @@ fn trace_rows_say_signed_or_not() {
     h.click(h.text("a.iana-servers.net."));
     h.idle();
     assert_eq!(h.app.panel_mut::<LookupPanel>().unwrap().selected, None);
+}
+
+/// Every text painted, as the screen has it.
+fn painted(h: &Harness) -> Vec<String> {
+    fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(t) => out.push(t.galley.text().to_owned()),
+            egui::Shape::Vec(v) => v.iter().for_each(|s| walk(s, out)),
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    for s in &h.shapes {
+        walk(&s.shape, &mut out);
+    }
+    out
+}
+
+/// An answer for `name` with `records` (type, data) and the AS of
+/// 13.107.42.14, as the task's poll brings it.
+fn answer(h: &mut Harness, records: &[(&str, &str)], more: Vec<Value>) {
+    let rows: Vec<Value> = records
+        .iter()
+        .map(|(t, d)| json!({"name": "www.example.com.", "ttl": 60, "class": "IN", "type": t, "data": d}))
+        .collect();
+    let mut events = vec![
+        json!({"kind": "answer", "server": "127.0.0.1#53(router)", "transport": "UDP", "ms": 3,
+            "stage": "upstream", "rcode": "NOERROR", "flags": ["qr", "rd", "ra"], "answer": rows,
+            "authority": [], "additional": [], "size": 120}),
+        json!({"kind": "asn", "address": "13.107.42.14", "asn": 8075,
+            "as_name": "MICROSOFT-CORP-MSN-AS-BLOCK, US", "prefix": "13.104.0.0/14"}),
+    ];
+    events.extend(more);
+    h.app.with_panel_as::<LookupPanel, _>(|p, app| {
+        p.task = Some(1);
+        p.arrived(app, "poll", 0, json!({"done": true, "state": "done", "events": events}));
+    });
+    // The window follows its contents over a few frames.
+    for _ in 0..6 {
+        h.idle();
+    }
+}
+
+/// The user's report: the AS pill in Data came out cut
+/// ("AS8075 MICROSOFT-CORP-…"); the window now widens for it.
+#[test]
+fn the_window_widens_so_the_as_pill_is_whole() {
+    let mut h = open(Session::virtual_lab());
+    let before = h.win_rect(win_id(Win::Panel(WIN))).width();
+    answer(&mut h, &[("A", "13.107.42.14")], Vec::new());
+    assert!(h.has_text("AS8075 MICROSOFT-CORP-MSN-AS-BLOCK"), "{:?}", painted(&h));
+    assert!(!painted(&h).iter().any(|t| t.ends_with('…')), "nothing cut: {:?}", painted(&h));
+    let r = h.win_rect(win_id(Win::Panel(WIN)));
+    let pill = h.text("AS8075 MICROSOFT-CORP-MSN-AS-BLOCK");
+    assert!(pill.x < r.right(), "the pill inside the window: {pill:?} in {r:?}");
+    assert!(r.width() >= before, "{before} → {}", r.width());
+}
+
+/// A value longer than the screen: the window stops near the screen's
+/// width, and only that value ends in "…" (the whole in its tooltip).
+#[test]
+fn a_value_wider_than_the_screen_is_cut() {
+    let mut h = open(Session::virtual_lab());
+    let long = format!("\"v=spf1 {}~all\"", "include:_spf.example.net ".repeat(20));
+    answer(&mut h, &[("A", "13.107.42.14"), ("TXT", &long)], Vec::new());
+    let r = h.win_rect(win_id(Win::Panel(WIN)));
+    assert!(r.width() > 900.0, "it grew: {r:?}");
+    assert!(r.right() <= h.screen.x + 1.0, "and stayed on the screen: {r:?}");
+    let shown = painted(&h);
+    assert!(!shown.contains(&long), "not whole");
+    assert!(shown.iter().any(|t| t.starts_with("\"v=spf1 include") && t.ends_with('…')), "{shown:?}");
+    assert!(h.has_text("AS8075 MICROSOFT-CORP-MSN-AS-BLOCK"), "the pill stays whole");
+}
+
+/// Why this answer: one row per stage, the texts in the explanations'
+/// language (Portuguese by default), and "Open entry" opens IP › DNS ›
+/// Static with the entry selected.
+#[test]
+fn why_this_answer_lists_the_stages_and_opens_the_rule() {
+    let mut s = Session::virtual_lab();
+    let id = s
+        .execute("ip.dns.static.add", &json!({"name": "nas.lan", "address": "192.168.88.2"}))
+        .unwrap();
+    let id = id["id"].as_str().unwrap_or("*1").to_owned();
+    let list = s.execute("ip.dns.adlist.add", &json!({"file": "ads.txt"})).unwrap();
+    let list = list["id"].as_str().unwrap_or("*1").to_owned();
+    let mut h = open(s);
+    let why = |stage: &str, outcome: &str, id: &str, args: Value, text: &str, rule: Value| {
+        json!({"kind": "why", "stage": stage, "outcome": outcome, "why": id, "args": args, "text": text, "rule": rule})
+    };
+    answer(&mut h, &[("A", "192.168.88.2")], vec![
+        why("acl", "passed", "acl.allowed", json!({"client": "192.168.88.10", "net": "192.168.88.0/24"}),
+            "192.168.88.10 is in allowed_from (192.168.88.0/24)", Value::Null),
+        why("adlist", "passed", "adlist.allowed", json!({"list": list, "line": "2", "text": "0.0.0.0 nas.lan"}),
+            "listed in adlist … but a static FWD entry lets it through", json!({"kind": "adlist", "id": list})),
+        why("static", "answered", "static.answered", json!({"id": "*3", "match": "name=nas.lan", "type": "A"}),
+            "static entry *3 (name=nas.lan) answers A", json!({"kind": "static", "id": id})),
+        why("cache", "not-reached", "not-reached", json!({"stage": "static"}), "not reached: static answered first", Value::Null),
+    ]);
+    assert!(h.has_text("Why this answer"));
+    assert!(h.has_text("192.168.88.10 está no allowed_from (192.168.88.0/24)"), "{:?}", painted(&h));
+    assert!(h.has_text("a entrada static *3 (name=nas.lan) responde A"));
+    assert!(h.has_text("não chegou: static respondeu antes"));
+    assert!(h.has_text("answered") && h.has_text("not reached") && h.has_text("passed"));
+    h.click(h.text("Open entry"));
+    h.idle();
+    assert!(h.app.open.contains(&Win::Panel(crate::dns::WIN_STATIC)));
+    for _ in 0..3 {
+        h.idle();
+    }
+    assert!(h.app.panel_mut::<crate::dns::DnsPanel>().unwrap().static_table.is_selected(&id), "{id}");
+    // The adlist window was never open (no rows yet): the list is
+    // selected once they arrive.
+    h.click(h.text("Open list"));
+    for _ in 0..4 {
+        h.idle();
+    }
+    assert!(h.app.open.contains(&Win::Panel(crate::dns_adlist::WIN)));
+    assert!(h.app.panel_mut::<crate::dns_adlist::AdlistPanel>().unwrap().table.is_selected(&list), "{list}");
+    // In English when the explanations are.
+    h.app.lang.help = crate::i18n::Lang::En;
+    h.idle();
+    h.idle();
+    assert!(h.has_text("static entry *3 (name=nas.lan) answers A"));
+}
+
+/// "Ask as" shows with the router as the server and goes into the params.
+#[test]
+fn ask_as_is_a_router_field() {
+    let mut h = open(Session::virtual_lab());
+    assert!(h.has_text("Ask as"));
+    h.app.panel_mut::<LookupPanel>().unwrap().ask = crate::dns_lookup::Ask::All;
+    h.idle();
+    h.idle();
+    assert!(!h.has_text("Ask as"), "only for the router's chain");
 }

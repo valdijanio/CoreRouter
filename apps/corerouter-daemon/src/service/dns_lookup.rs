@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Instant;
 
 use corerouter_engine::dns::DnsBackend;
-use corerouter_engine::dns_lookup::{Exchanged, LookupServer};
+use corerouter_engine::dns_lookup::{Exchanged, LookupServer, RouterAsk};
 use corerouter_proto_dns::dig;
 use corerouter_proto_dns::encrypted::{Proto, SecureServer};
 use corerouter_proto_dns::resolver::{SECURE_TIMEOUT_MS, Transport, TransportError};
@@ -56,6 +56,7 @@ pub(crate) fn exchange(
                 ms: ms(),
                 stage: Some(stage.to_owned()),
                 source: (stage == "cache").then(|| "cache".to_owned()),
+                explain: Vec::new(),
             })
         }
         LookupServer::Plain(ip) => {
@@ -84,6 +85,7 @@ pub(crate) fn exchange(
                 ms: ms(),
                 stage: None,
                 source: None,
+                explain: Vec::new(),
             })
         }
         LookupServer::Secure(url) => {
@@ -120,9 +122,50 @@ pub(crate) fn exchange(
                 ms: ms(),
                 stage: None,
                 source: None,
+                explain: Vec::new(),
             })
         }
     }
+}
+
+/// The router's chain with `explain` or `as_client` (G6.8).
+pub(crate) fn ask_router(query: &[u8], tcp: bool, how: RouterAsk) -> Result<Exchanged, String> {
+    const DOWN: &str = "the router's DNS forwarder is not running (system.service print)";
+    let started = Instant::now();
+    let ask = |tcp| super::dns_server::ask_as(query, tcp, how.as_client, how.explain).ok_or(DOWN);
+    let mut done = ask(tcp)?;
+    let mut over_tcp = tcp;
+    if !tcp && done.reply.as_deref().is_some_and(dig::truncated) {
+        done = ask(true)?;
+        over_tcp = true;
+    }
+    let stage = done.answered_by;
+    let bytes = match done.reply {
+        Some(b) => b,
+        // The limit drops a flood over UDP: say so with what decided it.
+        None => {
+            let why = done
+                .explain
+                .iter()
+                .find(|d| d.stage == stage)
+                .map(|d| format!(": {}", d.text()))
+                .unwrap_or_default();
+            return Err(format!("the router dropped the query (stage {stage}){why}"));
+        }
+    };
+    let server = match how.as_client {
+        Some(ip) => format!("127.0.0.1#53(router, as {ip})"),
+        None => "127.0.0.1#53(router)".into(),
+    };
+    Ok(Exchanged {
+        bytes,
+        server,
+        transport: if over_tcp { "TCP" } else { "UDP" }.into(),
+        ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        stage: Some(stage.to_owned()),
+        source: (stage == "cache").then(|| "cache".to_owned()),
+        explain: done.explain,
+    })
 }
 
 /// Every `(server, query)` at once, a thread each (a handful: the
