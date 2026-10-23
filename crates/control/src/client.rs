@@ -132,6 +132,34 @@ impl Client {
         matches!(self.reader.get_ref(), Stream::Tls(_))
     }
 
+    /// True when, between requests, the router has closed this plain
+    /// connection (restart, idle cut) or sent bytes nobody asked for: a
+    /// request on it would fail or read a stale reply, so long-lived
+    /// clients (the MCP backend) reconnect first. Over TLS only a closed
+    /// or broken socket counts (session tickets may arrive unasked).
+    pub fn is_stale(&self) -> bool {
+        if !self.reader.buffer().is_empty() {
+            return true;
+        }
+        let (sock, tls) = match self.reader.get_ref() {
+            Stream::Plain(s) => (s, false),
+            Stream::Tls(s) => (&s.sock, true),
+        };
+        if sock.set_nonblocking(true).is_err() {
+            return true;
+        }
+        let mut b = [0u8; 1];
+        let peeked = sock.peek(&mut b);
+        if sock.set_nonblocking(false).is_err() {
+            return true;
+        }
+        match peeked {
+            Err(e) => e.kind() != io::ErrorKind::WouldBlock,
+            Ok(0) => true,
+            Ok(_) => !tls,
+        }
+    }
+
     /// The token sent with every request from now on.
     pub fn set_token(&mut self, token: Option<String>) {
         self.token = token;

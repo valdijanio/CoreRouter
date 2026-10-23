@@ -701,6 +701,33 @@ fn zone_matrix_export_import_round_trip() {
     assert_eq!(b.export(), script);
 }
 
+/// audit-e2e: a bond is listed both in `/interface` (type `bonding`) and in
+/// `/interface bonding`, which has its own `print`. The `/interface` row
+/// came out as "# add name=bond1: slaves is not exported" (as if a secret
+/// had been held back) next to the real `/interface bonding add`; now the
+/// sub-menu with a `print` exports it once, and `/interface set` keeps
+/// what only the interface knows (disabled).
+#[test]
+fn bond_exports_once_without_a_note() {
+    let mut a = Term::new();
+    a.ok("/interface bonding add name=bond1 slaves=ether3,ether4 mode=802.3ad comment=uplink");
+    a.ok("/interface set bond1 disabled=yes");
+    a.ok("/ip address add address=10.9.0.1/24 interface=bond1");
+    let script = a.export();
+    assert!(!script.contains("is not exported"), "{script}");
+    assert_eq!(script.matches("add name=bond1").count(), 1, "{script}");
+    let mut b = Term::new();
+    b.router.files.insert("cfg.rsc".into(), script.clone());
+    b.ok("/import file=cfg.rsc");
+    assert_eq!(b.export(), script);
+    let running = |t: &Term| t.router.session.inspect(Some("running")).unwrap();
+    assert_eq!(running(&b)["interfaces"], running(&a)["interfaces"]);
+    assert_eq!(
+        running(&b)["ip"]["addresses"],
+        running(&a)["ip"]["addresses"]
+    );
+}
+
 #[test]
 fn import_is_atomic_and_says_where_it_failed() {
     let mut t = Term::new();

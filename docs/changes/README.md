@@ -25,7 +25,8 @@ como **medido** ou **estimado**. Pode ter várias linhas e parágrafos.
 
 - **Cabeçalho** (até a primeira linha em branco):
   - `id:` obrigatório: o id da gap (`G4.7c`) ou, para trabalho sem gap, uma etiqueta minúscula
-    (`processo`, `docs`). O nome do arquivo começa com ele.
+    (`processo`, `docs`, `audit-e2e`: letras minúsculas, dígitos e `-`, começando por letra). O
+    nome do arquivo começa com ele.
   - `status:` opcional: o texto novo da coluna Status da linha `id` em `docs/gaps.md`.
   - `history:` opcional: uma linha para `docs/gaps-history.md` (criou, redefiniu ou mudou o
     status de um item).

@@ -356,6 +356,23 @@ pub(crate) fn answer(
     peer: Option<IpAddr>,
     text: &str,
 ) -> Option<Answer> {
+    answer_with(host, gate, caller, peer, text, &mut || {})
+}
+
+/// [`answer`], calling `on_token` as soon as the request's token is good,
+/// before the command runs: a connection waiting its turn for the session
+/// (another client's commit) is no longer "logged out", so it does not hold
+/// one of the few logged-out slots (audit-e2e: 16 local clients connecting
+/// at once got "too many connections that have not logged in" while the
+/// first ones' requests queued behind a commit).
+pub(crate) fn answer_with(
+    host: &mut dyn Host,
+    gate: &Gate,
+    caller: &Caller,
+    peer: Option<IpAddr>,
+    text: &str,
+    on_token: &mut dyn FnMut(),
+) -> Option<Answer> {
     let req = serde_json::from_str::<Request>(text).ok()?;
     let id = req
         .id
@@ -401,6 +418,7 @@ pub(crate) fn answer(
         "auth.logout" => gate.logout(host, token),
         method => gate.principal(host, token).and_then(|p| {
             authenticated = true;
+            on_token();
             let caller = caller.clone().with_principal(p);
             if method == "auth.whoami" {
                 whoami(host, &caller)
@@ -474,7 +492,10 @@ fn handle<H: Host>(
             continue;
         }
         // Not JSON (e.g. an HTTP request from a web page): drop the connection.
-        let Some(answer) = answer(host, gate, caller, peer, &line) else {
+        let conn = reader.get_mut();
+        let Some(answer) = answer_with(host, gate, caller, peer, &line, &mut || {
+            conn.sock().authenticated();
+        }) else {
             return Ok(());
         };
         if answer.authenticated {

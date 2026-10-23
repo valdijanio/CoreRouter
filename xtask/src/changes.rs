@@ -56,9 +56,11 @@ fn gap_key(id: &str) -> Option<(u32, u32, String)> {
 /// A gap id (`G4.7c`) or a lowercase tag for work without one (`processo`, `docs`).
 fn valid_id(id: &str) -> bool {
     gap_key(id).is_some()
-        || (!id.is_empty()
-            && id.len() <= 32
-            && id.chars().all(|c| c.is_ascii_lowercase() || c == '-'))
+        || (id.len() <= 32
+            && id.starts_with(|c: char| c.is_ascii_lowercase())
+            && id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'))
 }
 
 /// Id of a `docs/gaps.md` table row (`| G1.2 | …`).
