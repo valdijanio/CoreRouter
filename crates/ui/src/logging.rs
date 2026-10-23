@@ -45,8 +45,9 @@ pub(crate) const PANEL: Panel = Panel {
 
 /// The topics an event can carry (`corerouter_model::logging::TOPICS`,
 /// which a test keeps in step; the engine refuses any other).
-pub(crate) const TOPICS: [&str; 14] = [
+pub(crate) const TOPICS: [&str; 15] = [
     "account",
+    "cgnat",
     "critical",
     "debug",
     "dhcp",

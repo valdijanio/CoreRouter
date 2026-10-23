@@ -308,12 +308,15 @@ impl Pool {
         self.outside.iter().map(Range::len).sum()
     }
 
+    /// The pool's geometry. Blocks mode may have more subscribers than
+    /// blocks (they are handed out on demand): no capacity check there.
     pub fn layout(&self) -> Result<Layout, LayoutError> {
-        Layout::new(
+        Layout::build(
             &self.inside,
             &self.outside,
             self.port_range,
             self.ports_per_subscriber,
+            self.mode == Mode::Deterministic,
         )
     }
 }
@@ -533,6 +536,18 @@ impl Layout {
         port_range: PortRange,
         ports: u16,
     ) -> Result<Self, LayoutError> {
+        Self::build(inside, outside, port_range, ports, true)
+    }
+
+    /// [`Layout::new`]; `capacity`: refuse more subscribers than slots
+    /// (deterministic), or not (blocks on demand).
+    pub fn build(
+        inside: &[Range],
+        outside: &[Range],
+        port_range: PortRange,
+        ports: u16,
+        capacity: bool,
+    ) -> Result<Self, LayoutError> {
         if inside.is_empty() {
             return Err(LayoutError::NoInside);
         }
@@ -552,11 +567,11 @@ impl Layout {
         if inside.len > MAX_SUBSCRIBERS || outside.len > MAX_PUBLIC {
             return Err(LayoutError::TooBig);
         }
-        let capacity = outside.len * u64::from(per_address);
-        if inside.len > capacity {
+        let slots = outside.len * u64::from(per_address);
+        if capacity && inside.len > slots {
             return Err(LayoutError::Capacity {
                 subscribers: inside.len,
-                capacity,
+                capacity: slots,
                 per_address,
                 public_needed: inside.len.div_ceil(u64::from(per_address)),
             });
@@ -593,7 +608,10 @@ impl Layout {
 
     /// Public addresses the subscribers actually use.
     pub fn public_used(&self) -> u64 {
-        self.inside.len.div_ceil(u64::from(self.per_address))
+        self.inside
+            .len
+            .div_ceil(u64::from(self.per_address))
+            .min(self.outside.len)
     }
 
     /// The subscriber's number in the pool.
