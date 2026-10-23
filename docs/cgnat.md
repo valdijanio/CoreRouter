@@ -288,6 +288,8 @@ mostra o crescimento desse contador desde o início.
 | `ip.firewall.cgnat.block.list {pool?, subscriber?}` | blocos ativos (modo blocos), o atual de cada assinante e há quanto tempo está ocioso |
 | `ip.firewall.cgnat.block.history {subscriber?, public?, port?, from?, to?}` | o log de blocos (alocação e liberação) |
 | `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel |
+| `tool.ip-calc.cgnat.plan {inside, outside, ports_per_subscriber?, port_range?, mode?, preview?}` | o planner (Tools › IP Calculator): números, checagens, sugestões, prévia e os parâmetros do `pool.add`; aceita quantidades (`"4096"`) |
+| `tool.ip-calc.cgnat.export {…, format: csv \| text \| routeros \| nft}` | a tabela do plano em CSV, texto imprimível, script RouterOS ou o nftables |
 
 Exemplo:
 
@@ -339,8 +341,8 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
 | G2.3b (feito) | nftables por nfnetlink, sem o binário `nft`; diferença de elementos; uma regra para todos os protocolos; remapeados derrubados e mapeamentos UDP esquecidos; números em `docs/architecture.md` §1.2.1 |
 | G2.2a | IP › Firewall › Connections (ctnetlink: lista, filtros, assinantes com mais conexões, kill, timeouts, uso da tabela, coluna Via) |
 | G2.3c (feito) | Modo blocos (fila 7422 + alocador pareado, cresce, solta com quarentena de 120 s), log por bloco (log do roteador e syslog), "Quem era?" pelo histórico de blocos, alerta de portas |
-| G2.3d | Janela IP › Firewall › CGNAT: pools, exceções, Quem era?, mapeamento, histórico, alertas; ⓘ em cada campo |
-| G6.9a | Tools › IP Calculator: Subnet, IPv6/PD, CGNAT planner (criar pool, exportar, ver regras, script RouterOS) |
+| G2.3d (feito) | Janela IP › Firewall › CGNAT: pools, exceções, Quem era?, mapeamento, histórico, alertas; ⓘ em cada campo |
+| G6.9a (feito) | Tools › IP Calculator: Subnet, IPv6/PD, CGNAT planner (criar pool, exportar, ver regras, script RouterOS); comandos `tool.ip-calc.*` |
 | G2.4a | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |
 | G2.3e | Bateria final de bugs e desempenho e o relatório (seção 6) |
 

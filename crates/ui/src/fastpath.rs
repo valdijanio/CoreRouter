@@ -16,12 +16,14 @@ use serde_json::{Value, json};
 use crate::backend::RequestId;
 use crate::chip::{self, Kind};
 use crate::help::{self, HelpView};
-use crate::i18n::{Lang, tr};
+use crate::i18n::{Lang, tr_in};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
 use crate::table::{self, Row, TableState, col, weak};
 use crate::{CoreRouterUi, Win, value_text};
 
 const NAME: &str = "fastpath";
+/// The i18n scope of this window (`i18n/auto/fastpath_*.rs`).
+const SCOPE: &str = "fastpath";
 pub(crate) const WIN: &str = "fastpath";
 const PORTS: &str = "fastpath-ports";
 
@@ -142,14 +144,14 @@ impl FastPath {
 
     fn settings(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         let Some(mut f) = self.form.clone().or_else(|| self.saved.clone()) else {
-            ui.weak(tr(l, "Reading…"));
+            ui.weak(tr_in(SCOPE, l, "Reading…"));
             return;
         };
         ui.horizontal_wrapped(|ui| {
-            ui.checkbox(&mut f.enabled, tr(l, "Enabled"));
-            self.info(ui, "fastpath.enabled", tr(l, "Enabled"));
+            ui.checkbox(&mut f.enabled, tr_in(SCOPE, l, "Enabled"));
+            self.info(ui, "fastpath.enabled", tr_in(SCOPE, l, "Enabled"));
             ui.add_space(12.0);
-            ui.label(tr(l, "HW Offload"));
+            ui.label(tr_in(SCOPE, l, "HW Offload"));
             ComboBox::from_id_salt("fastpath-hw")
                 .selected_text(f.hw_offload.clone())
                 .show_ui(ui, |ui| {
@@ -157,23 +159,23 @@ impl FastPath {
                         ui.selectable_value(&mut f.hw_offload, v.to_owned(), v);
                     }
                 });
-            self.info(ui, "fastpath.hw_offload", tr(l, "HW Offload"));
+            self.info(ui, "fastpath.hw_offload", tr_in(SCOPE, l, "HW Offload"));
             ui.add_space(12.0);
-            ui.checkbox(&mut f.counters, tr(l, "Counters"));
-            self.info(ui, "fastpath.counters", tr(l, "Counters"));
+            ui.checkbox(&mut f.counters, tr_in(SCOPE, l, "Counters"));
+            self.info(ui, "fastpath.counters", tr_in(SCOPE, l, "Counters"));
         });
         ui.horizontal(|ui| {
-            ui.label(tr(l, "Interfaces"));
+            ui.label(tr_in(SCOPE, l, "Interfaces"));
             let h = ui.spacing().interact_size.y;
             ui.add_sized(
                 [320.0, h],
-                TextEdit::singleline(&mut f.interfaces).hint_text(tr(l, "every Ethernet and bond port")),
+                TextEdit::singleline(&mut f.interfaces).hint_text(tr_in(SCOPE, l, "every Ethernet and bond port")),
             );
-            self.info(ui, "fastpath.interfaces", tr(l, "Interfaces"));
+            self.info(ui, "fastpath.interfaces", tr_in(SCOPE, l, "Interfaces"));
             let changed = Some(&f) != self.saved.as_ref();
             let can = app.can().check("ip.firewall.fastpath.set");
             if ui
-                .add_enabled(changed && can.is_ok(), egui::Button::new(tr(l, "Apply")))
+                .add_enabled(changed && can.is_ok(), egui::Button::new(tr_in(SCOPE, l, "Apply")))
                 .on_disabled_hover_text(can.err().unwrap_or_default())
                 .clicked()
             {
@@ -205,24 +207,24 @@ impl FastPath {
             let hardware = st.get("hardware").and_then(Value::as_bool) == Some(true);
             let v = ui.visuals().clone();
             if active {
-                chip::chip(ui, tr(l, "installed"), chip::GREEN.tone(&v));
+                chip::chip(ui, tr_in(SCOPE, l, "installed"), chip::GREEN.tone(&v));
                 if hardware {
-                    chip::chip(ui, tr(l, "hardware asked"), chip::GREEN.tone(&v));
+                    chip::chip(ui, tr_in(SCOPE, l, "hardware asked"), chip::GREEN.tone(&v));
                 } else {
-                    chip::chip(ui, tr(l, "software"), chip::BLUE.tone(&v));
+                    chip::chip(ui, tr_in(SCOPE, l, "software"), chip::BLUE.tone(&v));
                 }
             } else {
-                chip::chip(ui, tr(l, "off"), chip::neutral_tone(&v));
+                chip::chip(ui, tr_in(SCOPE, l, "off"), chip::neutral_tone(&v));
             }
             let flows = st.get("flows").cloned().unwrap_or(Value::Null);
             ui.label(format!(
                 "{} {} · {} {} · {} {}",
                 text(&flows, "total"),
-                tr(l, "connections"),
+                tr_in(SCOPE, l, "connections"),
                 text(&flows, "software"),
-                tr(l, "in software"),
+                tr_in(SCOPE, l, "in software"),
                 text(&flows, "hardware"),
-                tr(l, "in hardware"),
+                tr_in(SCOPE, l, "in hardware"),
             ));
         });
         if let Some(n) = st.get("note").map(value_text) {
@@ -256,15 +258,15 @@ impl PanelState for FastPath {
     fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
         let l = app.lang.labels;
         ui.horizontal(|ui| {
-            ui.strong(tr(l, "Fast Path"));
-            self.info(ui, "fastpath.window", tr(l, "Fast Path"));
+            ui.strong(tr_in(SCOPE, l, "Fast Path"));
+            self.info(ui, "fastpath.window", tr_in(SCOPE, l, "Fast Path"));
         });
         self.settings(app, ui, l);
         ui.separator();
         self.state(ui, l);
         ui.horizontal(|ui| {
-            ui.strong(tr(l, "Ports"));
-            self.info(ui, "fastpath.ports", tr(l, "Ports"));
+            ui.strong(tr_in(SCOPE, l, "Ports"));
+            self.info(ui, "fastpath.ports", tr_in(SCOPE, l, "Ports"));
         });
         let rows: Vec<Row> = self
             .status
@@ -293,13 +295,13 @@ impl PanelState for FastPath {
         table::show(ui, PORTS, reserve, &mut self.ports_t, &COLUMNS, &rows, |_, _| {});
         if !fixes.is_empty() {
             ui.horizontal(|ui| {
-                ui.strong(tr(l, "Fix"));
-                self.info(ui, "fastpath.fix", tr(l, "Fix"));
+                ui.strong(tr_in(SCOPE, l, "Fix"));
+                self.info(ui, "fastpath.fix", tr_in(SCOPE, l, "Fix"));
             });
             for (port, fix) in fixes {
                 ui.horizontal(|ui| {
                     ui.label(port);
-                    if ui.small_button(tr(l, "Copy")).clicked() {
+                    if ui.small_button(tr_in(SCOPE, l, "Copy")).clicked() {
                         ui.ctx().copy_text(fix.clone());
                     }
                     ui.label(egui::RichText::new(fix).monospace().small());

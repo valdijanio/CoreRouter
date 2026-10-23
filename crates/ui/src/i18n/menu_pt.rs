@@ -58,6 +58,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.identity", "## O que faz\nO nome do roteador: aparece no prompt do terminal, na lista de vizinhos e nos logs."),
     ("menu.interface-list", "## O que faz\nGrupos nomeados de interfaces (LAN, WAN…) que as regras de firewall, o DNS e outras funções usam em vez de cada porta."),
     ("menu.interfaces", "## O que faz\nTodas as interfaces do roteador: portas, VLANs, bridges, bonds e loopbacks, com estado, MTU e tráfego. Duplo clique abre os detalhes."),
+    ("menu.ip-calc", "## O que faz\nCalculadora de IP: rede, broadcast, hosts, máscara e wildcard de um endereço (IPv4 e IPv6), dividir uma rede, sumarizar prefixos, faixa para prefixos e o aviso de sobreposição com o que já está configurado; quantas delegações IPv6 (PD) um prefixo comporta; e o planejador de CGNAT, com a mesma fórmula dos pools (RFC 7422): o que cabe, o que mudar, a prévia do mapeamento, criar o pool e exportar."),
     ("menu.ip-pool", "## O que faz\nFaixas de endereços IPv4 que o servidor DHCP (e depois PPP e CGNAT) entregam, e quais estão em uso."),
     ("menu.ipv6-pool", "## O que faz\nPrefixos IPv6 para dividir em menores: o prefixo que a operadora delegou (cliente DHCPv6) vira os /64 das LANs."),
     ("menu.ipv6-settings", "## O que faz\nChaves globais do IPv6: encaminhamento entre interfaces e se os anúncios de roteador são aceitos (SLAAC na WAN)."),
@@ -75,4 +76,5 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.traffic-flow", "## O que faz\nExporta um registro de cada conexão para coletores de fluxo, em IPFIX ou NetFlow v9, com endereços e portas antes e depois do NAT e os eventos de NAT da RFC 8158: o registro de conexão que o provedor guarda (Marco Civil). Mostra também os maiores consumidores sem coletor."),
     ("menu.tuning", "## O que faz\nAjustes de kernel e hardware para roteamento: buffers de rede, conntrack, governor da CPU, IRQ e RPS/XPS por interface e os parâmetros de boot — com valores recomendados e o porquê."),
     ("menu.vrf", "## O que faz\nVRFs: tabelas de rotas separadas no mesmo roteador, para manter clientes ou gerência isolados."),
+    ("menu.xdp", "## O que faz\nUm filtro no driver da placa de rede (XDP), antes do kernel: descarta origens em listas de bloqueio, origens acima de uma taxa, cabeçalhos malformados e flags TCP impossíveis. O RouterOS não tem equivalente; o mais próximo é uma regra `raw` com address list e `dst-limit`."),
 ];
