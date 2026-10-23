@@ -365,11 +365,23 @@ fn set_tos(sock: &Sock, tos: u8, v6: bool) {
         Sock::Tcp(t) => socket2::SockRef::from(t),
         Sock::Udp(u) => socket2::SockRef::from(u),
     };
-    let _ = if v6 {
-        s.set_tclass_v6(u32::from(tos))
+    if v6 {
+        set_tclass(&s, tos);
     } else {
-        s.set_tos_v4(u32::from(tos))
-    };
+        let _ = s.set_tos_v4(u32::from(tos));
+    }
+}
+
+/// The IPv6 traffic class (DSCP) of a stream.
+#[cfg(unix)]
+fn set_tclass(s: &socket2::SockRef<'_>, tos: u8) {
+    let _ = s.set_tclass_v6(u32::from(tos));
+}
+
+/// Windows has no `IPV6_TCLASS` in socket2: IPv6 streams go unmarked.
+#[cfg(not(unix))]
+fn set_tclass(_: &socket2::SockRef<'_>, tos: u8) {
+    log::info!("bandwidth test: DSCP {} not set on IPv6 (unsupported on this OS)", tos >> 2);
 }
 
 /// The client: `tool.bandwidth-test.start` on the daemon.
@@ -672,7 +684,11 @@ fn udp_listener(local: SocketAddr) -> Result<UdpSocket, String> {
     let s = socket2::Socket::new(domain, socket2::Type::DGRAM, Some(socket2::Protocol::UDP))
         .map_err(|e| io("UDP stream socket", &e))?;
     s.set_reuse_address(true)
-        .and_then(|()| s.set_reuse_port(true))
+        .map_err(|e| io("UDP stream socket", &e))?;
+    // Linux needs SO_REUSEPORT for a second socket on the port; on Windows
+    // SO_REUSEADDR alone allows it (and there is no SO_REUSEPORT).
+    #[cfg(unix)]
+    s.set_reuse_port(true)
         .map_err(|e| io("UDP stream socket", &e))?;
     if local.is_ipv6() {
         let _ = s.set_only_v6(false);

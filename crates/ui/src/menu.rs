@@ -91,6 +91,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("identity", None, None, icons::IDENTIFICATION_BADGE, "/system identity", &["system.identity"], &["hostname", "nome", "name"]),
     e("interface-list", None, None, icons::LIST_BULLETS, "/interface list", &["interface.list"], &["lan", "wan", "lista", "member"]),
     e("interfaces", None, None, icons::PLUGS, "/interface", &["interface.print", "interface.set", "interface.ethernet", "interface.vlan", "interface.bridge"], &["ethernet", "porta", "port", "vlan", "bridge", "mtu", "link"]),
+    e("ip-calc", None, None, icons::SQUARES_FOUR, "/tool ip-calc", &["tool.ip-calc"], &["subnet", "sub-rede", "calculadora", "calculator", "cidr", "máscara", "mask", "wildcard", "broadcast", "summarize", "sumarizar", "supernet", "pd", "prefix delegation", "cgnat planner", "planejar cgnat"]),
     e("ip-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ip pool", &["ip.pool"], &["faixa", "range", "address pool", "ipv4"]),
     e("ipv6-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ipv6 pool", &["ipv6.pool"], &["prefix", "prefixo", "prefix delegation"]),
     e("ipv6-settings", None, Some("Settings"), icons::GEAR_SIX, "/ipv6 settings", &["ipv6.settings"], &["forward", "ra", "accept router advertisements", "slaac"]),
@@ -110,6 +111,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("traffic-flow", None, None, icons::SHARE_NETWORK, "/ip traffic-flow", &["ip.traffic-flow"], &["netflow", "ipfix", "sflow", "flow export", "fluxos", "nat log", "log de nat", "marco civil", "top talkers", "coletor", "collector", "pmacct", "goflow"]),
     e("tuning", None, None, icons::GAUGE, "/system tuning", &["system.tuning"], &["sysctl", "performance", "desempenho", "irq", "rps", "governor", "boot", "kernel"]),
     e("vrf", None, None, icons::STACK, "/ip vrf", &["ip.vrf"], &["routing table", "tabela de rotas", "l3vpn"]),
+    e("xdp", None, None, icons::SHIELD_CHECK, "", &["ip.firewall.xdp"], &["ddos", "anti-ddos", "ebpf", "bpf", "raw", "rate limit", "limite de taxa", "bloquear", "blacklist", "drop"]),
 ];
 
 /// The groups' icons, by `windows::MENU` name.

@@ -122,11 +122,20 @@ FOLD_DOCS="docs/log.md docs/gaps-history.md docs/perf.md docs/gaps.md"
 # resolvido; 1: conflito de verdade (merge abortado; arquivos em $conflicts).
 conflicts=""
 # Heads de PRs já integrados que são ancestrais de $1: os "pais" de um PR empilhado.
+# Qualquer commit do pai serve, não só o último: a fila manda merges da main na branch do pai antes
+# do squash, e esse último commit não está na branch do filho (#177, #186 em 2026-10-23). Por PR
+# integrado, o commit mais novo dele que está na história do filho.
 merged_parents() {
-  local s
-  gh pr list -R "$repo" --state merged --limit 60 --json headRefOid --jq '.[].headRefOid' 2>/dev/null |
-    while read -r s; do
-      git merge-base --is-ancestor "$s" "$1" 2>/dev/null && printf '%s\n' "$s"
+  local n s
+  gh pr list -R "$repo" --state merged --limit 40 --json number --jq '.[].number' 2>/dev/null |
+    while read -r n; do
+      gh api "repos/$repo/pulls/$n/commits?per_page=100" --jq '.[].sha' 2>/dev/null |
+        tac | while read -r s; do
+          if git merge-base --is-ancestor "$s" "$1" 2>/dev/null; then
+            printf '%s\n' "$s"
+            break
+          fi
+        done
     done
   return 0
 }

@@ -3,7 +3,8 @@
 //! 1. Every workspace crate has a layer in `LAYERS` (new crate = classify it here).
 //! 2. A crate depends only on strictly lower layers (sideways only via `SIDEWAYS_ALLOWED`).
 //! 3. UI libraries (`UI_CRATES`) only from layer `UI_MIN_LAYER` up.
-//! 4. Platform crates (`PLATFORM_CRATES`) only from the apps (`APP_LAYER`).
+//! 4. Platform crates (`PLATFORM_CRATES`) only from the apps (`APP_LAYER`),
+//!    or from the platform crate that drives them (`PLATFORM_ALLOWED`).
 //! 5. Tooling (`xtask`) depends on no workspace crate.
 
 use std::fmt;
@@ -19,6 +20,10 @@ pub const LAYERS: &[(&str, u8)] = &[
     // Pure (no I/O, wasm-safe): firewall validation + nftables render, needed by
     // hal-linux (L1) and the engine, so it cannot be an L2 proto-* crate.
     ("corerouter-firewall", 1),
+    // G2.5: what the XDP programs and their loader share (no_std, pure). The
+    // programs themselves (`crates/dataplane-ebpf`) build for BPF outside
+    // the workspace (`cargo xtask ebpf`), so cargo metadata never lists them.
+    ("corerouter-dataplane-ebpf-common", 1),
     ("corerouter-proto-bgp", 2),
     ("corerouter-proto-ospf", 2),
     ("corerouter-proto-mpls", 2),
@@ -57,6 +62,8 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     ("corerouter-hal", "corerouter-firewall"),
     // hal-linux applies the ruleset corerouter-firewall renders (G2.1).
     ("corerouter-hal-linux", "corerouter-firewall"),
+    // hal-linux loads the XDP programs and reads their maps (G2.5).
+    ("corerouter-hal-linux", "corerouter-dataplane-ebpf-common"),
 ];
 
 pub const UI_CRATES: &[&str] = &[
@@ -77,7 +84,13 @@ pub const PLATFORM_CRATES: &[&str] = &[
     "corerouter-hal-linux",
     "corerouter-hal-frr",
     "corerouter-dataplane-ebpf",
+    "corerouter-dataplane-ebpf-common",
 ];
+
+/// Platform crates a platform crate below the apps may use: the loader and
+/// the programs it loads (G2.5).
+pub const PLATFORM_ALLOWED: &[(&str, &str)] =
+    &[("corerouter-hal-linux", "corerouter-dataplane-ebpf-common")];
 pub const APP_LAYER: u8 = 6;
 pub const TOOLING_LAYER: u8 = 7;
 
@@ -169,6 +182,11 @@ pub fn check(pkgs: &[Pkg]) -> Vec<Violation> {
             continue;
         };
         for dep in &p.deps {
+            // A crate's dev-dependency on itself (to turn on a feature for
+            // its own tests) is no edge.
+            if *dep == p.name {
+                continue;
+            }
             if UI_CRATES.contains(&dep.as_str()) && layer < UI_MIN_LAYER {
                 out.push(Violation::UiDep {
                     from: p.name.clone(),
@@ -176,7 +194,10 @@ pub fn check(pkgs: &[Pkg]) -> Vec<Violation> {
                     layer,
                 });
             }
-            if PLATFORM_CRATES.contains(&dep.as_str()) && layer < APP_LAYER {
+            if PLATFORM_CRATES.contains(&dep.as_str())
+                && layer < APP_LAYER
+                && !PLATFORM_ALLOWED.contains(&(p.name.as_str(), dep.as_str()))
+            {
                 out.push(Violation::PlatformDep {
                     from: p.name.clone(),
                     dep: dep.clone(),
