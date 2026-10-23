@@ -2237,3 +2237,107 @@ continuação indentadas).
   Também: o e2e `hostile_lines_never_crash_or_hang_it` espera o daemon soltar as 500 conexões
   fechadas de uma vez antes de conectar de novo (falhava com a máquina carregada: "too many
   connections that have not logged in").
+
+- 2026-10-23 — G1.26b: System › Tuning, parte 2 (Interfaces): os ajustes de cada porta em Rust puro, sem `ethtool` nem
+  `tc`.
+
+  - **Onde ficam**: `system.tuning.ports` (porta → chave → valor, catálogo `PORT_PARAMS` no model).
+  - **Como gravam**:
+    - anel RX/TX e filas (combinadas ou RX/TX) por `RINGS_SET`/`CHANNELS_SET`, com o máximo da
+      própria placa como limite;
+    - coalescência (adaptativa, `rx-usecs`/`tx-usecs`) por `COALESCE_SET`;
+    - `txqueuelen` e qdisc raiz (fq_codel, fq, pfifo_fast, mq, noqueue) por rtnetlink;
+    - `rp_filter` da porta por `/proc/sys`.
+  - **Offloads e controle de fluxo**: aparecem na mesma lista e editam as opções Ethernet da porta
+    (G1.20), um lugar só. Ligar o LRO aqui é recusado.
+  - **Aplicação** (`hal-linux::port_tuning`):
+    - tudo ou nada por porta, com o valor original guardado: tirar o ajuste o restaura;
+    - um valor que o driver arredondou ou não guardou desfaz a mudança da porta;
+    - só alcança portas que o CoreRouter gerencia (regra de posse do G1.18).
+  - **Laboratório virtual**: placa de 4 filas (máximo 8) e anéis de 1024 (máximo 4096), metade das
+    portas em cada nó NUMA.
+  - **Engine** (`engine::tuning_port`): recomendação por porta.
+    - anéis de 2048 no balanceado e no máximo no alto desempenho;
+    - uma fila por CPU do nó NUMA da porta;
+    - coalescência adaptativa (desligada na baixa latência);
+    - GRO ligado, LRO desligado, controle de fluxo desligado;
+    - qdisc: `mq` com várias filas, `fq_codel` com uma, `noqueue` mantido em porta virtual;
+    - `rp_filter` igual ao `all` do perfil.
+  - **Diagnóstico**: "LRO ligado" e "controle de fluxo ligado".
+  - **Comandos**: `system.tuning.interface.print|parameter.print|set|unset|apply`. O `apply` é um
+    commit só; `set` avisa quando a mudança pisca o link.
+  - **Janela**: aba Interfaces com seletor de porta, a lista de propriedades (selos `flaps link` e
+    `fixed`), ⓘ com o comando da porta e "Apply to all ports with Safe Mode". Na faixa, valores
+    nomeados aparecem pelo nome.
+  - **`/export`** escreve `/system tuning interface set name=… key=… value=…`.
+
+  Como testar: Virtual lab › System › Tuning › Interfaces. No terminal:
+
+  - `/system tuning interface parameter print name=ether1`;
+  - `/system tuning interface set name=ether1 key=rx_ring value=4096`.
+
+  Testes:
+
+  - catálogo de portas;
+  - recomendação por porta (faixa da placa, nó NUMA, `mq`/`fq_codel`/`noqueue`);
+  - comandos:
+    - máximo da placa;
+    - chave ausente;
+    - LRO fixo;
+    - chave desconhecida;
+    - controle de fluxo nas opções Ethernet;
+    - `unset`;
+    - `apply` num commit e `rollback`;
+  - netns num veth de 4 filas:
+    - canais, `txqueuelen`, qdisc e `rp_filter` mudam e voltam;
+    - um anel (o veth não tem) desfaz tudo;
+    - uma porta `--unmanaged` fica intacta;
+  - `/export` e `/import` de ida e volta;
+  - explicações das 18 chaves em EN e PT;
+  - headless da aba Interfaces (editar, ⓘ, aplicar com Safe Mode).
+
+  Screenshots claro e escuro conferidos. O `netdevsim` não serve sem root: criar o dispositivo exige
+  o namespace do host.
+
+- 2026-10-23 — audit-history-share: Continuação do audit-history (#141), em cima do G0.16 (#139). Depois do #141, o boot desserializava
+  cada uma das 64 revisões como uma `Config` independente. Com 10 MiB, isso deixava 64 cópias
+  inteiras na RAM e o boot ia de ~0,3 s para 1,2–1,5 s. Este PR **resolve a G0.20**: a coluna Status
+  da linha G0.20 em `docs/gaps.md` pode passar a "feito (`stream/audit-history-share`)".
+
+  - `model::config_delta` (novo): aplica e calcula a diferença seção por seção sobre os `CowArc` do
+    G0.16, nos níveis `Config`, `Ip` e `Firewall`.
+    - **Boot:** a revisão `k` é um clone da `k+1` (só contadores de referência), com só as seções
+      que o delta toca reconstruídas. Os campos pequenos de cada nível passam pelo JSON com as
+      seções grandes vazias. Uma seção que o delta não cita continua a mesma alocação nas duas
+      revisões (`CowArc::ptr_eq`).
+    - **Commit:** uma seção que a revisão nova divide com a anterior (o que o commit não tocou) nem
+      é serializada. O arquivo de revisão custa o que o commit mudou, e saiu a comparação dos dois
+      textos inteiros (`json_delta::diff_text` e o texto guardado entre saves foram removidos).
+    - O formato dos arquivos não muda. O resultado é o mesmo da árvore inteira, e a diferença
+      tipada é a mesma da árvore (testado). Os deltas continuam sendo tratados como entrada hostil.
+  - Testes:
+    - `all_64_revisions_of_a_big_config_survive_a_reboot` agora confere que, depois do reboot,
+      seção igual entre revisões vizinhas ⇔ mesmo ponteiro (`ip`, `firewall`, address lists), e que
+      as seções que nenhum commit tocou (interfaces, rotas, endereços, filtro, DHCP) são uma
+      alocação só nas 64 revisões.
+    - Em `config_delta`: igualdade com o caminho da árvore, compartilhamento, seções que somem e
+      voltam do JSON, e deltas hostis recusados.
+  - Bench: `storage_fs/history64/*` mede também o pico de RSS do boot (`VmHWM`), num processo filho
+    que só faz o `Session::with_storage`.
+
+  Como testar:
+
+  - `cargo test -p corerouter-engine --test history_files`
+  - `cargo test -p corerouter-model config_delta`
+  - `cargo bench -p corerouter-storage-fs --bench commit -- storage_fs/history64`
+
+- 2026-10-23 — processo: Fila de entrada: um CI cancelado não trava mais o lote por 30 minutos. Quando a sessão dona envia
+  um push novo, o GitHub cancela o CI do commit anterior; a fila, que tinha montado o lote com esse
+  commit, esperava um verde que nunca vinha até o prazo de 30 min (lote do #144, 2026-10-23). Agora
+  um run cancelado sem outro verde no mesmo commit tira o PR do lote na hora, e ele volta com o head
+  novo na rodada seguinte.
+
+- 2026-10-23 — processo: Fila de entrada: um PR que conflita só com outro PR do lote (ou do lote especulativo) não fica
+  mais marcado até a branch mudar. O conflito é com o vizinho, não com a `main`: quando o vizinho
+  entra, ele pode mesclar limpo. O #144 ficou parado assim (2026-10-23). Agora ele volta na rodada
+  seguinte; só o conflito com a própria `main` e o CI vermelho seguem marcando o PR.
