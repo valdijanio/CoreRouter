@@ -89,6 +89,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("identity", None, None, icons::IDENTIFICATION_BADGE, "/system identity", &["system.identity"], &["hostname", "nome", "name"]),
     e("interface-list", None, None, icons::LIST_BULLETS, "/interface list", &["interface.list"], &["lan", "wan", "lista", "member"]),
     e("interfaces", None, None, icons::PLUGS, "/interface", &["interface.print", "interface.set", "interface.ethernet", "interface.vlan", "interface.bridge"], &["ethernet", "porta", "port", "vlan", "bridge", "mtu", "link"]),
+    e("ip-calc", None, None, icons::SQUARES_FOUR, "/tool ip-calc", &["tool.ip-calc"], &["subnet", "sub-rede", "calculadora", "calculator", "cidr", "máscara", "mask", "wildcard", "broadcast", "summarize", "sumarizar", "supernet", "pd", "prefix delegation", "cgnat planner", "planejar cgnat"]),
     e("ip-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ip pool", &["ip.pool"], &["faixa", "range", "address pool", "ipv4"]),
     e("ipv6-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ipv6 pool", &["ipv6.pool"], &["prefix", "prefixo", "prefix delegation"]),
     e("ipv6-settings", None, Some("Settings"), icons::GEAR_SIX, "/ipv6 settings", &["ipv6.settings"], &["forward", "ra", "accept router advertisements", "slaac"]),

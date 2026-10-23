@@ -27,6 +27,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.identity", "## What it does\nThe router's name: shown in the terminal prompt, in the neighbors' lists and in the logs."),
     ("menu.interface-list", "## What it does\nNamed groups of interfaces (LAN, WAN…) that firewall rules, DNS and other features name instead of each port."),
     ("menu.interfaces", "## What it does\nEvery interface of the router: ports, VLANs, bridges, bonds and loopbacks, with their state, MTU and traffic. Double-click one for its details."),
+    ("menu.ip-calc", "## What it does\nIP calculator: network, broadcast, hosts, mask and wildcard of an address (IPv4 and IPv6), split a network, summarize prefixes, range to prefixes and the overlap warning against the configuration; how many IPv6 delegations (PD) a prefix holds; and the CGNAT planner, with the pools' own formula (RFC 7422): what fits, what to change, the mapping preview, create the pool, export."),
     ("menu.ip-pool", "## What it does\nRanges of IPv4 addresses that the DHCP server (and later PPP and CGNAT) hand out, and which ones are in use."),
     ("menu.ipv6-pool", "## What it does\nIPv6 prefixes to split into smaller ones: the prefix the upstream delegated (DHCPv6 client) becomes the /64s of the LANs."),
     ("menu.ipv6-settings", "## What it does\nGlobal IPv6 switches: forwarding between interfaces and whether router advertisements are accepted (SLAAC on the WAN)."),
