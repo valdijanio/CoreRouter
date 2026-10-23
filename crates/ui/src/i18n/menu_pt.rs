@@ -57,6 +57,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.identity", "## O que faz\nO nome do roteador: aparece no prompt do terminal, na lista de vizinhos e nos logs."),
     ("menu.interface-list", "## O que faz\nGrupos nomeados de interfaces (LAN, WAN…) que as regras de firewall, o DNS e outras funções usam em vez de cada porta."),
     ("menu.interfaces", "## O que faz\nTodas as interfaces do roteador: portas, VLANs, bridges, bonds e loopbacks, com estado, MTU e tráfego. Duplo clique abre os detalhes."),
+    ("menu.ip-calc", "## O que faz\nCalculadora de IP: rede, broadcast, hosts, máscara e wildcard de um endereço (IPv4 e IPv6), dividir uma rede, sumarizar prefixos, faixa para prefixos e o aviso de sobreposição com o que já está configurado; quantas delegações IPv6 (PD) um prefixo comporta; e o planejador de CGNAT, com a mesma fórmula dos pools (RFC 7422): o que cabe, o que mudar, a prévia do mapeamento, criar o pool e exportar."),
     ("menu.ip-pool", "## O que faz\nFaixas de endereços IPv4 que o servidor DHCP (e depois PPP e CGNAT) entregam, e quais estão em uso."),
     ("menu.ipv6-pool", "## O que faz\nPrefixos IPv6 para dividir em menores: o prefixo que a operadora delegou (cliente DHCPv6) vira os /64 das LANs."),
     ("menu.ipv6-settings", "## O que faz\nChaves globais do IPv6: encaminhamento entre interfaces e se os anúncios de roteador são aceitos (SLAAC na WAN)."),
