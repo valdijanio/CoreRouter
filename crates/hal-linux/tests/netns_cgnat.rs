@@ -31,7 +31,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use corerouter_hal::Hal;
-use corerouter_hal_linux::{LinuxHal, nft};
+use corerouter_hal::conntrack::status;
+use corerouter_hal_linux::{LinuxHal, ctnl, nfnl, nft};
 use corerouter_model::Config;
 use corerouter_model::ItemId;
 use corerouter_model::cgnat::{Exception, Pool};
@@ -359,9 +360,20 @@ fn subscribers_leave_with_their_formula_address_and_ports() {
         SocketAddrV4::new(Ipv4Addr::new(198, 51, 100, 9), 40002)
     );
 
-    // Unclaimed packets to the pool are dropped, not routed back.
+    // Unclaimed packets to the pool are dropped, not routed back. And `nft`
+    // reads what netlink loaded as we print it: one rule for every
+    // protocol, ranged map data.
     let text = run(Command::new("nft").args(["list", "table", "ip", "corerouter_cgnat"]));
     assert!(text.contains("counter packets 0"), "{text}");
+    assert!(
+        text.contains("type ipv4_addr : interval ipv4_addr . inet_service"),
+        "{text}"
+    );
+    assert!(text.contains("snat ip to ip saddr map @d_1"), "{text}");
+    assert!(
+        text.contains("100.64.0.65 : 203.0.113.1 . 2024-3023"),
+        "{text}"
+    );
 
     // Removing the pools removes the table.
     hal.apply(&c, &Config::default()).unwrap();
@@ -430,5 +442,98 @@ fn eim_eif_and_hairpin() {
         slot.contains(*from.ip(), from.port()),
         "hairpin source {from} is the public one"
     );
+    hal.apply(&c, &Config::default()).unwrap();
+}
+
+fn map_text(name: &str) -> String {
+    run(Command::new("nft").args(["list", "map", "ip", "corerouter_cgnat", name]))
+}
+
+/// Live connections from `sub`:`port` that went through the NAT.
+fn nat_conns(sub: &str, port: u16) -> usize {
+    let sub: std::net::IpAddr = sub.parse().unwrap();
+    ctnl::dump()
+        .unwrap()
+        .iter()
+        .filter(|c| c.orig.src == sub && c.orig.src_port == port && c.has(status::SRC_NAT))
+        .count()
+}
+
+#[test]
+fn element_changes_go_incremental_and_remaps_kill_connections() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab();
+    let mut small = pool(1000);
+    small.inside = vec!["100.64.0.0/26".parse().unwrap()];
+    let a = cfg(small, vec![]);
+    let mut hal = LinuxHal::new();
+    hal.apply(&Config::default(), &a).unwrap();
+    let seen = udp_seen(
+        &lab,
+        SocketAddrV4::new(Ipv4Addr::new(100, 64, 0, 1), 45000),
+        SocketAddrV4::new(Ipv4Addr::new(192, 0, 2, 2), 7500),
+    );
+    assert!(
+        map_text("eim_1").contains(&format!("{} . {}", seen.ip(), seen.port())),
+        "{}",
+        map_text("eim_1")
+    );
+    assert_eq!(nat_conns("100.64.0.1", 45000), 1);
+
+    // More subscribers: only elements change, so the live UDP mapping and
+    // the connection survive (.1 keeps its slot).
+    let b = cfg(pool(1000), vec![]);
+    hal.apply(&a, &b).unwrap();
+    assert!(map_text("d_1").contains("100.64.0.200"), "grown");
+    assert!(
+        map_text("eim_1").contains(&format!("{} . {}", seen.ip(), seen.port())),
+        "kept"
+    );
+    assert_eq!(nat_conns("100.64.0.1", 45000), 1);
+
+    // Other ports per subscriber remap everyone: their connections and
+    // UDP mappings go, so "who was" names who the new formula names.
+    let mut p = pool(500);
+    p.inside = vec!["100.64.0.0/24".parse().unwrap()];
+    let c = cfg(p, vec![]);
+    hal.apply(&b, &c).unwrap();
+    assert_eq!(nat_conns("100.64.0.1", 45000), 0, "killed");
+    assert!(
+        !map_text("eim_1").contains("elements"),
+        "{}",
+        map_text("eim_1")
+    );
+    hal.apply(&c, &Config::default()).unwrap();
+}
+
+#[test]
+fn a_refused_batch_changes_nothing() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let c = cfg(pool(1000), vec![]);
+    let mut hal = LinuxHal::new();
+    hal.apply(&Config::default(), &c).unwrap();
+    let before = map_text("d_1");
+    // A rule naming a set that does not exist: the kernel refuses the
+    // batch, after the delete of the table in it.
+    let mut bad = corerouter_firewall::cgnat::table(&c.ip.cgnat).unwrap();
+    if let Some(r) = bad.rules.first_mut() {
+        r.exprs.insert(
+            1,
+            corerouter_firewall::program::Expr::Lookup {
+                set: "nope".into(),
+                sreg: corerouter_firewall::program::REG_1,
+                dreg: None,
+            },
+        );
+    }
+    let err = nfnl::apply(nfnl::replace(&bad, 1), "test").unwrap_err();
+    assert!(err.to_string().contains("nothing changed"), "{err}");
+    assert_eq!(map_text("d_1"), before, "the old table is intact");
     hal.apply(&c, &Config::default()).unwrap();
 }

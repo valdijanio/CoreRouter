@@ -5,7 +5,7 @@ log por conexão. Determinístico por padrão (RFC 7422); por blocos sob demanda
 (G2.3c). O "Quem era?" responde IP público + porta + data/hora → assinante, que é o que o Marco
 Civil (Lei 12.965/2014, art. 13) cobra do provedor de conexão.
 
-Estado: **G2.3a** (este documento descreve o que entrou e o plano das partes seguintes).
+Estado: **G2.3a** e **G2.3b** (este documento descreve o que entrou e o plano das partes seguintes).
 
 ## 1. Como funciona
 
@@ -100,29 +100,41 @@ Como é feito (RFC 4787 §4, sem módulo fora da árvore do kernel):
 
 ### 1.4 O que o kernel recebe
 
-A tabela é `ip corerouter_cgnat`, separada da `inet corerouter` do firewall: uma nunca substitui
-a outra. Por pool:
+Tudo fica na tabela `ip corerouter_cgnat`, separada da `inet corerouter` do firewall, para uma
+nunca substituir a outra. Por pool, **um mapa e poucas regras**, nunca uma regra por assinante (o
+script RouterOS clássico tem duas por assinante: 76 mil linhas para um /21).
 
-- **um mapa e poucas regras**, nunca uma regra por assinante. O script RouterOS clássico gera
-  duas regras por assinante: 76 mil linhas para um /21;
-- `d_<id>`: assinante → `público . porta_inicial-porta_final`, um elemento por assinante,
-  servindo uma regra para `{tcp, udp, icmp}`;
-- `a_<id>`: assinante → público, para os outros protocolos;
-- `in_<id>` e `pub_<id>`: as faixas, para o hairpin e para o `forward`, que descarta pacote
-  para o bloco público que nenhuma conexão reclama. Sem esse descarte, o bloco roteado ao CGN
-  voltaria pela rota padrão;
-- exceções: `x_1to1` (saída) e `x_1to1_in` (entrada), antes de qualquer pool.
+| Objeto | O que guarda | Para quê |
+|---|---|---|
+| `d_<id>` | assinante → `público . porta_inicial-porta_final`, um elemento por assinante | **uma** regra `snat` para todos os protocolos |
+| `pub_<id>` | as faixas públicas (conjunto de intervalos) | o `forward` descarta pacote para o bloco público que nenhuma conexão reclama; sem isso, o bloco roteado ao CGN voltaria pela rota padrão |
+| `eim_<id>` / `eimr_<id>` | os mapeamentos UDP vivos (seção 1.3) | EIM, EIF e hairpin |
+| `x_1to1` / `x_1to1_in` | as exceções | antes de qualquer pool |
 
-`ip.firewall.cgnat.rules` mostra o script ("Ver regras geradas"). Em G2.3a, o `hal-linux`
-carrega o script inteiro com `nft -f -`: uma transação, só quando o CGNAT mudou. Em G2.3b, os
-mesmos objetos vão por nfnetlink direto, sem o binário (seção 4).
+A regra `snat` de cada pool vale para todos os protocolos:
 
-Sintaxe que o kernel aceita, conferida em netns (kernel 7.0, nft 1.0.9):
+- TCP e UDP recebem a faixa nas portas, e o ICMP no id de consulta;
+- GRE, ESP e os demais saem só com o endereço, porque o kernel ignora a faixa de portas de quem
+  não tem porta.
 
-- `type ipv4_addr : interval ipv4_addr . inet_service` (com `interval` no tipo do dado);
-- `typeof … tcp sport` não serve: reclama de TCP × UDP;
-- sem `meta l4proto {…}`, o `nft` recusa mapear porta;
-- o kernel não exige isso; no nfnetlink (G2.3b) uma regra só cobre os três protocolos.
+Assim o IP pareado (RFC 6888 REQ-2) vale para todos.
+
+Como chega ao kernel (G2.3b):
+
+- `hal-linux` fala **nfnetlink direto**, num lote atômico, sem o programa `nft`. A decisão e os
+  números estão em `docs/architecture.md` §1.2.1.
+- Quando só elementos mudam (portas por assinante, mais assinantes na faixa, o endereço de uma
+  exceção), o lote leva só os elementos que saíram e os que entraram. Os mapeamentos UDP vivos
+  sobrevivem.
+- Qualquer outra mudança troca a tabela inteira no mesmo lote.
+- Se o kernel recusar o lote incremental (alguém esvaziou a tabela), a tabela inteira vai em
+  seguida.
+
+`ip.firewall.cgnat.rules` mostra exatamente o que o kernel tem ("Ver regras geradas"): o texto e
+as mensagens saem da mesma descrição (`corerouter_firewall::program::Table`), e o `nft list table
+ip corerouter_cgnat` lê o mesmo.
+
+O `nft` recusaria a regra única: ele exige `meta l4proto {…}` para mapear portas; o kernel não.
 
 ### 1.5 "Quem era?" ao longo do tempo
 
@@ -180,9 +192,16 @@ No modo blocos, mais assinantes que blocos é aviso ("oversubscribed"), não err
 **OK:** o selo de capacidade (assinantes, por IP, IPs usados e sobrando).
 
 `pool.set` responde `remapped`: quantos assinantes mudam de IP ou portas. Mudar
-`ports_per_subscriber` remapeia todo mundo. As conexões vivas dos remapeados continuam com o
-mapeamento antigo até acabar. Em G2.3b o commit derruba essas conexões pelo ctnetlink, como o
-VyOS faz com `conntrack -D`, e o "Quem era?" fica exato.
+`ports_per_subscriber` remapeia todo mundo.
+
+Depois de aplicar, o `hal-linux` faz duas coisas:
+
+- **derruba as conexões dos remapeados** pelo ctnetlink, como o VyOS faz com `conntrack -D`. Elas
+  ainda levam a tradução antiga; derrubadas, o "Quem era?" da época nova fica exato;
+- **esquece os mapeamentos UDP vivos** do pool, porque eles apontariam para portas que agora podem
+  ser de outro assinante. Cada um é reaprendido no próximo pacote.
+
+Aumentar a faixa de assinantes no fim não remapeia ninguém e não derruba nada.
 
 ## 2. Comandos
 
@@ -235,7 +254,7 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
 
 | Parte | O que entra |
 |---|---|
-| G2.3b | nftables por nfnetlink (encoder próprio no `hal-linux`, lote `NFNL_MSG_BATCH_BEGIN/END`), sem o binário `nft`; números netlink × `nft` em `docs/architecture.md`; commit que remapeia derruba as conexões dos remapeados (ctnetlink); uma regra para TCP+UDP+ICMP |
+| G2.3b (feito) | nftables por nfnetlink, sem o binário `nft`; diferença de elementos; uma regra para todos os protocolos; remapeados derrubados e mapeamentos UDP esquecidos; números em `docs/architecture.md` §1.2.1 |
 | G2.2a | IP › Firewall › Connections (ctnetlink: lista, filtros, assinantes com mais conexões, kill, timeouts, uso da tabela, coluna Via) |
 | G2.3c | Modo blocos (PBA): blocos sob demanda, log por bloco (log do roteador + syslog), "Quem era?" pelo histórico de blocos, alerta de portas esgotadas por assinante |
 | G2.3d | Janela IP › Firewall › CGNAT: pools, exceções, Quem era?, mapeamento, histórico, alertas; ⓘ em cada campo |
@@ -355,7 +374,16 @@ Kernel:
 
 ## 6. Desempenho
 
-Medido em G2.3e. Antecipação **medida** na pesquisa (AMD Ryzen AI MAX+ 395, kernel 7.0, nft
+Carga da tabela (G2.3b, **medido**, release, netns, Ryzen AI MAX+ 395, kernel 7.0, 2026-10-23):
+
+| Operação | netlink | `nft -f` |
+|---|---|---|
+| 64 Ki assinantes | 66 ms | 303 ms |
+| um assinante a mais | 0,155 ms | 2,40 ms |
+
+Tabela completa em `docs/architecture.md` §1.2.1. O resto é medido em G2.3e.
+
+Antecipação **medida** na pesquisa (AMD Ryzen AI MAX+ 395, kernel 7.0, nft
 1.0.9, 2026-10-23):
 
 - 65 536 elementos de mapa carregam em 0,60–0,63 s pelo `nft -f`;
