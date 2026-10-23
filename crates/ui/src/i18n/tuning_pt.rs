@@ -337,6 +337,173 @@ Maior mantém VoIP e VPN atrás do NAT sem keepalive (MikroTik: 3 min).
 RFC 4787 REQ-5: um mapeamento de NAT deve durar pelo menos 2 minutos (5 recomendados)."##,
     ),
     (
+        "tuning.port.adaptive_rx",
+        r##"## O que faz
+Coalescência adaptativa de interrupções na recepção: o driver espera mais entre interrupções com tráfego pesado e dispara logo com tráfego leve (ITR da Intel, DIM da Mellanox).
+## Quando mudar
+Ligada na maioria dos roteadores. Desligada, com `rx_usecs` = 0, para a menor latência (uma interrupção por pacote).
+## Cuidado
+Desligada com `rx_usecs` alto atrasa cada pacote; desligada com 0 pode gastar uma CPU inteira em interrupções a plena taxa."##,
+    ),
+    (
+        "tuning.port.adaptive_tx",
+        r##"## O que faz
+Coalescência adaptativa de interrupções na transmissão: o driver espera mais entre interrupções com tráfego pesado e dispara logo com tráfego leve (ITR da Intel, DIM da Mellanox).
+## Quando mudar
+Ligada na maioria dos roteadores. Desligada, com `tx_usecs` = 0, para a menor latência (uma interrupção por pacote).
+## Cuidado
+Desligada com `tx_usecs` alto atrasa cada pacote; desligada com 0 pode gastar uma CPU inteira em interrupções a plena taxa."##,
+    ),
+    (
+        "tuning.port.combined_channels",
+        r##"## O que faz
+Pares de filas (recepção e transmissão juntas) que a porta usa. Cada fila tem a própria interrupção, atendida por uma CPU: mais filas espalham o trabalho de recepção (o RSS manda cada fluxo para uma fila).
+## Quando mudar
+Uma fila por CPU do nó NUMA da porta (`scaling.rst`): uma CPU do outro nó chega à placa atravessando a interconexão. Mais filas que CPUs só acrescentam interrupções.
+## Cuidado
+Mudar **reinicia a porta** (o link cai por um instante) e move as interrupções: a afinidade de CPU e IRQ vem no G1.26c."##,
+    ),
+    (
+        "tuning.port.gro",
+        r##"## O que faz
+Generic Receive Offload: o kernel junta pacotes seguidos de um fluxo num só antes de roteá-los e os separa de novo no envio. Menos custo por pacote.
+## Quando mudar
+Deixe ligado: ele é reversível, então é seguro para roteamento e bridge (ao contrário do LRO).
+## Cuidado
+Desligue só para depurar capturas de pacotes."##,
+    ),
+    (
+        "tuning.port.gso",
+        r##"## O que faz
+Generic Segmentation Offload: pacotes TCP grandes que o próprio roteador envia são cortados pela placa (ou no fim da pilha) em vez de pela CPU.
+## Quando mudar
+Não importa para o tráfego encaminhado, que já chega cortado no MTU do cabo. Deixe como o driver tem.
+## Cuidado
+Ajuda o TCP do próprio roteador (BGP com tabelas completas, a API); desligar só custa CPU."##,
+    ),
+    (
+        "tuning.port.lro",
+        r##"## O que faz
+Large Receive Offload: a placa junta pacotes no hardware e reescreve os cabeçalhos de um jeito que não tem volta.
+## Quando mudar
+Deixe desligado num roteador: o kernel o desliga sozinho quando o forwarding está ligado. Só um host que termina o tráfego ganha com ele.
+## Cuidado
+Encaminhar pacotes juntados pelo LRO quebra o PMTU e o TCP do outro lado. O CoreRouter recusa ligá-lo aqui (`interface.ethernet.set force=yes` para uma porta que só termina tráfego)."##,
+    ),
+    (
+        "tuning.port.qdisc",
+        r##"## O que faz
+A disciplina de fila raiz da porta: como os pacotes esperam para sair.
+- **mq**: uma qdisc filha por fila de transmissão (o padrão do kernel em placas de várias filas); sem trava dividida por todas as CPUs.
+- **fq_codel**: fila justa com AQM CoDel: pouco atraso, sem bufferbloat (a qdisc filha padrão).
+- **fq**: fila justa com pacing, para hosts que enviam TCP.
+- **pfifo_fast**: a FIFO antiga de três faixas.
+- **noqueue**: sem fila (interfaces virtuais).
+## Quando mudar
+Uma porta de várias filas fica com mq; uma de fila única recebe fq_codel. Limitação de banda (HTB, CAKE) é outra feature.
+## Cuidado
+fq_codel na raiz de uma placa de várias filas faz todas as CPUs passarem por uma trava: menos vazão."##,
+    ),
+    (
+        "tuning.port.rp_filter",
+        r##"## O que faz
+O filtro de caminho reverso desta porta. O kernel usa o maior entre o `net.ipv4.conf.all.rp_filter` e este valor: desligar o `all` não muda nada numa porta deixada em estrito.
+## Quando mudar
+Para o mesmo valor do `all` (o perfil faz isso): solto (2) para um provedor com vários links, desligado (0) com anti-spoofing no firewall.
+## Cuidado
+Estrito (1) num link de saída descarta respostas que voltam por outro link (roteamento assimétrico)."##,
+    ),
+    (
+        "tuning.port.rx_channels",
+        r##"## O que faz
+Filas só de recepção que a porta usa (placas sem filas combinadas, veth). Cada fila tem a própria interrupção, atendida por uma CPU: mais filas espalham o trabalho de recepção (o RSS manda cada fluxo para uma fila).
+## Quando mudar
+Uma fila por CPU do nó NUMA da porta (`scaling.rst`): uma CPU do outro nó chega à placa atravessando a interconexão. Mais filas que CPUs só acrescentam interrupções.
+## Cuidado
+Mudar **reinicia a porta** (o link cai por um instante) e move as interrupções: a afinidade de CPU e IRQ vem no G1.26c."##,
+    ),
+    (
+        "tuning.port.rx_pause",
+        r##"## O que faz
+Controle de fluxo 802.3x, recepção: a porta obedece aos quadros de pausa do outro lado e para de enviar.
+## Quando mudar
+Desligado num roteador (o padrão do ice da Intel): uma pausa para a porta inteira, então um receptor lento atrasa todos os fluxos (bloqueio de cabeça de fila). Descartar sai mais barato que parar; o TCP lida com o descarte.
+## Cuidado
+Alguns switches e redes de storage dependem da pausa; combine com o outro lado. Mudar pode renegociar o link."##,
+    ),
+    (
+        "tuning.port.rx_ring",
+        r##"## O que faz
+Descritores no anel de RX da porta: pacotes que a placa guarda para o kernel (recepção) antes de ter de descartar ("missed").
+## Quando aumentar
+Quando o `rx_missed_errors` cresce (aba Resumo) ou a porta recebe rajadas a 10 Gb/s ou mais. Os guias da Intel e da Mellanox sobem até o máximo para encaminhamento.
+## Cuidado
+Mudar **reinicia a porta**: o link cai por um instante (use Safe Mode). Um anel maior usa mais memória e deixa uma fila guardar mais atraso numa sobrecarga."##,
+    ),
+    (
+        "tuning.port.rx_usecs",
+        r##"## O que faz
+Microssegundos que a placa espera depois de um pacote de recepção antes de interromper a CPU (com a coalescência adaptativa desligada). Intel: 80 µs ≈ 12 500 interrupções por segundo por fila.
+## Quando mudar
+0 para a menor latência; 50–100 para poupar CPU com muitos pacotes por segundo. Com a adaptativa ligada, o driver decide.
+## Cuidado
+Alguns drivers arredondam (para múltiplos de 2 ou 4 µs); o CoreRouter confere o que o driver guardou."##,
+    ),
+    (
+        "tuning.port.tso",
+        r##"## O que faz
+TCP Segmentation Offload: pacotes TCP grandes que o próprio roteador envia são cortados pela placa (ou no fim da pilha) em vez de pela CPU.
+## Quando mudar
+Não importa para o tráfego encaminhado, que já chega cortado no MTU do cabo. Deixe como o driver tem.
+## Cuidado
+Ajuda o TCP do próprio roteador (BGP com tabelas completas, a API); desligar só custa CPU."##,
+    ),
+    (
+        "tuning.port.tx_channels",
+        r##"## O que faz
+Filas só de transmissão que a porta usa (placas sem filas combinadas, veth). Cada fila tem a própria interrupção, atendida por uma CPU: mais filas espalham o trabalho de recepção (o RSS manda cada fluxo para uma fila).
+## Quando mudar
+Uma fila por CPU do nó NUMA da porta (`scaling.rst`): uma CPU do outro nó chega à placa atravessando a interconexão. Mais filas que CPUs só acrescentam interrupções.
+## Cuidado
+Mudar **reinicia a porta** (o link cai por um instante) e move as interrupções: a afinidade de CPU e IRQ vem no G1.26c."##,
+    ),
+    (
+        "tuning.port.tx_pause",
+        r##"## O que faz
+Controle de fluxo 802.3x, transmissão: a porta envia quadros de pausa quando o anel de recepção enche.
+## Quando mudar
+Desligado num roteador (o padrão do ice da Intel): uma pausa para a porta inteira, então um receptor lento atrasa todos os fluxos (bloqueio de cabeça de fila). Descartar sai mais barato que parar; o TCP lida com o descarte.
+## Cuidado
+Alguns switches e redes de storage dependem da pausa; combine com o outro lado. Mudar pode renegociar o link."##,
+    ),
+    (
+        "tuning.port.tx_ring",
+        r##"## O que faz
+Descritores no anel de TX da porta: pacotes que a placa enfileira para o cabo (transmissão) antes de ter de descartar ("missed").
+## Quando aumentar
+Quando os descartes de transmissão crescem ou a porta envia rajadas a 10 Gb/s ou mais. Os guias da Intel e da Mellanox sobem até o máximo para encaminhamento.
+## Cuidado
+Mudar **reinicia a porta**: o link cai por um instante (use Safe Mode). Um anel maior usa mais memória e deixa uma fila guardar mais atraso numa sobrecarga."##,
+    ),
+    (
+        "tuning.port.tx_usecs",
+        r##"## O que faz
+Microssegundos que a placa espera depois de um pacote de transmissão antes de interromper a CPU (com a coalescência adaptativa desligada). Intel: 80 µs ≈ 12 500 interrupções por segundo por fila.
+## Quando mudar
+0 para a menor latência; 50–100 para poupar CPU com muitos pacotes por segundo. Com a adaptativa ligada, o driver decide.
+## Cuidado
+Alguns drivers arredondam (para múltiplos de 2 ou 4 µs); o CoreRouter confere o que o driver guardou."##,
+    ),
+    (
+        "tuning.port.txqueuelen",
+        r##"## O que faz
+Pacotes que o kernel enfileira para a porta quando a placa está ocupada (na qdisc, antes do anel de TX). Padrão 1000.
+## Quando mudar
+Raramente: com fq_codel a qdisc mantém a fila curta de qualquer jeito. Uma interface virtual (VLAN, túnel) com 0 não tem fila nenhuma.
+## Cuidado
+Uma fila grande sem qdisc com AQM é bufferbloat: segundos de atraso sob carga."##,
+    ),
+    (
         "tuning.profiles",
         r##"## Perfis
 Cada perfil é calculado para esta máquina (RAM, CPUs, velocidade das portas), não copiado de uma tabela:
@@ -363,6 +530,10 @@ Essa memória fica indisponível para os programas; mais de 5 % da RAM raramente
 /// Labels by their English text.
 pub(super) const LABELS: &[(&str, &str)] = &[
     (
+        "Apply to all ports with Safe Mode",
+        r##"Aplicar em todas as portas com Safe Mode"##,
+    ),
+    (
         "Apply with Safe Mode",
         r##"Aplicar com Safe Mode"##,
     ),
@@ -377,6 +548,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "CPU and IRQ",
         r##"CPU e IRQ"##,
+    ),
+    (
+        "Changing rings or queues resets the port: its link drops for a moment. Use Safe Mode on a port you manage the router through.",
+        r##"Mudar anéis ou filas reinicia a porta: o link cai por um instante. Use Safe Mode numa porta pela qual você gerencia o roteador."##,
     ),
     (
         "Click a parameter to change it.",
@@ -411,8 +586,16 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Comando equivalente"##,
     ),
     (
+        "Filtering",
+        r##"Filtragem"##,
+    ),
+    (
         "Find",
         r##"Buscar"##,
+    ),
+    (
+        "Flow control",
+        r##"Controle de fluxo"##,
     ),
     (
         "High throughput",
@@ -421,6 +604,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Interrupt affinity per NUMA node, RPS/XPS, the CPU governor and C-states arrive with G1.26c.",
         r##"A afinidade das interrupções por nó NUMA, RPS/XPS, o governor da CPU e os C-states chegam com o G1.26c."##,
+    ),
+    (
+        "Interrupt coalescing",
+        r##"Coalescência de interrupções"##,
     ),
     (
         "Low latency",
@@ -445,6 +632,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Not set: the kernel's own value is in use",
         r##"Não definido: vale o valor do próprio kernel"##,
+    ),
+    (
+        "Not set: the port's own value is in use",
+        r##"Não definido: vale o valor da própria porta"##,
     ),
     (
         "Nothing to change",
@@ -499,8 +690,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Recomendado aqui"##,
     ),
     (
-        "Rings, queues, RSS, interrupt coalescing, offloads, flow control and txqueuelen per port arrive with G1.26b.",
-        r##"Anéis, filas, RSS, coalescência de interrupções, offloads, controle de fluxo e txqueuelen por porta chegam com o G1.26b."##,
+        "Rings and queues",
+        r##"Anéis e filas"##,
     ),
     (
         "Routing",
@@ -543,6 +734,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Anel TX"##,
     ),
     (
+        "The driver does not let it change.",
+        r##"O driver não deixa mudar."##,
+    ),
+    (
         "The four profiles for this machine, side by side. The profile picked at the top is the one Summary applies.",
         r##"Os quatro perfis para esta máquina, lado a lado. O perfil escolhido no alto é o que o Resumo aplica."##,
     ),
@@ -553,6 +748,14 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "This router has no System › Tuning yet: update corerouter-daemon.",
         r##"Este roteador ainda não tem System › Tuning: atualize o corerouter-daemon."##,
+    ),
+    (
+        "This router has no port tuning yet: update corerouter-daemon.",
+        r##"Este roteador ainda não tem ajuste de portas: atualize o corerouter-daemon."##,
+    ),
+    (
+        "Transmit queue",
+        r##"Fila de transmissão"##,
     ),
     (
         "Tuning",
@@ -589,6 +792,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "differs",
         r##"difere"##,
+    ),
+    (
+        "fixed",
+        r##"fixo"##,
     ),
     (
         "flaps link",
@@ -628,8 +835,16 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"A tabela do conntrack está {pct}% cheia ({count} de {max}): conexões novas são descartadas quando ela enche."##,
     ),
     (
+        "finding.flow_control_on",
+        r##"O controle de fluxo (quadros de pausa) está ligado em {nics}: uma fila cheia para a porta inteira (aba Interfaces)."##,
+    ),
+    (
         "finding.forwarding_off",
         r##"O encaminhamento IPv4 está desligado: este roteador não roteia."##,
+    ),
+    (
+        "finding.lro_on",
+        r##"O LRO está ligado em {nics}: ele junta pacotes de um jeito que um roteador não pode encaminhar (aba Interfaces)."##,
     ),
     (
         "finding.neigh_full",
@@ -660,6 +875,14 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"O valor do kernel: rodadas de recepção curtas, menos espera ({profile})."##,
     ),
     (
+        "why.coalesce_adaptive",
+        r##"Coalescência adaptativa: poucas interrupções sob carga, rápidas com a placa ociosa."##,
+    ),
+    (
+        "why.coalesce_off",
+        r##"Uma interrupção por pacote: a menor latência, ao custo de CPU."##,
+    ),
+    (
         "why.ct_buckets",
         r##"Um quarto do nf_conntrack_max: correntes curtas em cada busca."##,
     ),
@@ -684,12 +907,20 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
         r##"Um roteador encaminha pacotes."##,
     ),
     (
+        "why.gro",
+        r##"O GRO junta os pacotes de um fluxo na recepção e o kernel os separa de novo no envio: menos custo por pacote, seguro para encaminhar."##,
+    ),
+    (
         "why.hash_l4",
         r##"Espalha os fluxos pelas rotas de mesmo custo também pela porta, não só pelo endereço."##,
     ),
     (
         "why.keep",
         r##"O perfil {profile} mantém o valor do kernel."##,
+    ),
+    (
+        "why.lro",
+        r##"O LRO reescreve cabeçalhos sem volta: um roteador não pode encaminhar o que ele montou (o kernel o desliga junto com o forwarding)."##,
     ),
     (
         "why.min_free",
@@ -706,6 +937,26 @@ pub(super) const TEMPLATES: &[(&str, &str)] = &[
     (
         "why.panic",
         r##"Reiniciar 10 s depois de um kernel panic em vez de ficar parado."##,
+    ),
+    (
+        "why.pause",
+        r##"Quadros de pausa param a porta inteira quando uma fila enche: bloqueio de cabeça de fila para todos os fluxos."##,
+    ),
+    (
+        "why.qdisc_fq_codel",
+        r##"Uma fila de transmissão: o fq_codel mantém baixo o atraso de fila (sem bufferbloat)."##,
+    ),
+    (
+        "why.qdisc_mq",
+        r##"Várias filas de transmissão: o mq mantém uma qdisc por fila (a padrão, fq_codel), sem uma trava dividida por todas as CPUs."##,
+    ),
+    (
+        "why.queues",
+        r##"Uma fila por CPU do nó NUMA da porta ({cpus}), até as {max} da placa."##,
+    ),
+    (
+        "why.ring",
+        r##"{value} descritores ({profile}), das {max} da placa: espaço para uma rajada sem quadros perdidos."##,
     ),
     (
         "why.rp_loose",

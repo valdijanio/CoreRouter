@@ -862,13 +862,19 @@ fn quit_and_hostile_lines() {
     assert!(t.run("# a comment").is_empty());
 }
 
-/// G1.26: `/system tuning` exports what the config sets as `set` lines,
+/// G1.26: `/system tuning` and `/system tuning interface` (G1.26b) export
+/// what the config sets as `set` lines,
 /// and an import puts them back.
 #[test]
 fn tuning_exports_as_set_lines() {
     let mut a = Term::new();
     a.ok("/system tuning set name=net.core.netdev_budget value=600");
+    a.ok("/system tuning interface set name=ether2 key=rx_ring value=4096");
     let script = a.export();
+    assert!(
+        script.contains("/system tuning interface\nset name=ether2 key=rx_ring value=4096"),
+        "{script}"
+    );
     assert!(!script.contains("is not exported"), "{script}");
     assert!(
         script.contains("/system tuning\nset name=net.core.netdev_budget value=600"),

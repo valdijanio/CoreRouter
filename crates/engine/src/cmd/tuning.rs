@@ -97,13 +97,22 @@ fn read_machine(s: &mut Session) -> Option<Machine> {
         .map(|name| {
             let hal = s.hal_mut();
             let hw = hal.hardware(&name).unwrap_or_default();
-            let speed = hal.ethernet_monitor(&name).ok().and_then(|m| {
+            let mon = hal.ethernet_monitor(&name).ok();
+            let speed = mon.as_ref().and_then(|m| {
                 m.supported
                     .iter()
                     .filter_map(|mode| mode_speed(mode).map(|(s, _)| s))
                     .max()
                     .or(m.speed_mbps)
             });
+            let pause = mon.as_ref().and_then(|m| {
+                Some(m.rx_flow_control? || m.tx_flow_control.unwrap_or(false))
+            });
+            let lro = hw
+                .offloads
+                .iter()
+                .find(|o| o.feature == "rx-lro")
+                .map(|o| o.active);
             let rx_missed = hal.counters(&name).ok().and_then(|c| {
                 c.groups
                     .iter()
@@ -125,6 +134,8 @@ fn read_machine(s: &mut Session) -> Option<Machine> {
                 ring_tx: hw.ring_tx,
                 ring_tx_max: hw.ring_tx_max,
                 rx_missed,
+                lro,
+                pause,
             }
         })
         .collect();
@@ -133,7 +144,7 @@ fn read_machine(s: &mut Session) -> Option<Machine> {
 
 /// The machine, read again after [`MACHINE_TTL_SECS`]; `None`: the
 /// backend cannot describe it (ranges then come from the catalog only).
-fn machine(s: &mut Session) -> Option<Machine> {
+pub(super) fn machine(s: &mut Session) -> Option<Machine> {
     let now = s.hal_now();
     if let Some(c) = s.ext::<MachineCache>()
         && let (Some(at), Some(now), Some(m)) = (c.at, now, &c.machine)
@@ -169,7 +180,7 @@ fn profile_param(p: &Value) -> Result<Profile> {
     }
 }
 
-fn tab_id(t: Tab) -> &'static str {
+pub(super) fn tab_id(t: Tab) -> &'static str {
     match t {
         Tab::Kernel => "kernel",
         Tab::Interfaces => "interfaces",
