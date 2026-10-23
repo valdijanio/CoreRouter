@@ -13,6 +13,8 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 ipnet.workspace = true
+# G2.5b: the CGNAT port arithmetic, shared with the XDP fast path.
+corerouter-cgnat-map.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
