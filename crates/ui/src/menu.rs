@@ -96,7 +96,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("log", None, None, icons::SCROLL, "/log", &["log"], &["eventos", "messages", "mensagens"]),
     e("logging", None, None, icons::NOTEBOOK, "/system logging", &["system.logging"], &["syslog", "remote log", "topics", "rules", "regras"]),
     e("mpls", None, None, icons::TAG, "/mpls", &[], &["ldp", "label", "vpls", "rótulo"]),
-    e("mtr", None, None, icons::PATH, "/tool traceroute", &["tool.mtr"], &["traceroute", "tracert", "path", "caminho", "perda", "loss"]),
+    e("mtr", None, None, icons::PATH, "/tool traceroute", &["tool.mtr", "tool.traceroute"], &["traceroute", "tracert", "path", "caminho", "perda", "loss", "paris", "ecmp", "tcp traceroute", "tcptraceroute"]),
     e("neighbors", None, None, icons::USERS_THREE, "/ip neighbor", &["ip.neighbor"], &["vizinhos", "lldp", "mndp", "cdp", "discovery"]),
     e("ntp-client", None, None, icons::CLOCK, "/system ntp client", &["system.ntp.client"], &["time", "hora", "relógio", "sntp", "clock"]),
     e("ospf", None, None, icons::GRAPH, "/routing ospf", &[], &["area", "lsa", "igp"]),

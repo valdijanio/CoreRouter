@@ -221,6 +221,7 @@ fn on_reply(
     };
     let (outcome, detail) = match &reply.kind {
         ReplyKind::Echo => (Outcome::Ok, None),
+        ReplyKind::Reached(how) => (Outcome::Ok, Some(how.clone())),
         ReplyKind::TtlExceeded => (Outcome::TtlExceeded, Some("TTL exceeded".to_owned())),
         ReplyKind::Unreachable(why) => (Outcome::Unreachable, Some(why.clone())),
         ReplyKind::TooBig { mtu } => (

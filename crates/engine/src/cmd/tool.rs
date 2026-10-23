@@ -7,7 +7,7 @@
 use std::net::IpAddr;
 use std::time::Duration;
 
-use corerouter_hal::probe::{MAX_PACKET, SocketOptions, V4_OVERHEAD};
+use corerouter_hal::probe::{MAX_PACKET, ProbeProto, SocketOptions, V4_OVERHEAD};
 use corerouter_model::{IfName, InterfaceKind, RoutingTable};
 use serde_json::{Value, json};
 
@@ -34,9 +34,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     .positional("address")
     .task(),
     cmd!(query "tool.mtr.start", "MTR", ["Tools", "MTR"], None,
-        "{address: string, count?: int 0..1000000 (rounds, 0 = until stopped), interval_ms?: int 100..60000, timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string, use_dns?: bool (default true: hop names by PTR), as_lookup?: bool (default false: origin AS via Team Cymru DNS)} → {id, task_id, columns}",
+        "{address: string, count?: int 0..1000000 (rounds, 0 = until stopped), interval_ms?: int 100..60000, timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string, use_dns?: bool (default true: hop names by PTR), as_lookup?: bool (default false: origin AS via Team Cymru DNS), protocol?: icmp|udp|tcp (default icmp), port?: int 1..65535 (udp default 33434, tcp default 80), paris?: bool (default true: one flow, one ECMP path)} → {id, task_id, columns}",
         can_start, mtr_start)
-    .alias("traceroute,mtr")
+    .alias("mtr")
+    .positional("address")
+    .task(),
+    cmd!(query "tool.traceroute.start", "Traceroute", ["Tools", "MTR"], None,
+        "{address: string, probes?: int 1..10 (per hop, default 3), timeout_ms?: int 10..10000, max_hops?: int 1..64, size?: int 28..65535, dscp?: int 0..63, src_address?: ip, interface?: string, routing_table?: string, use_dns?: bool (default true), as_lookup?: bool (default false), protocol?: icmp|udp|tcp (default icmp), port?: int 1..65535 (udp default 33434, tcp default 80), paris?: bool (default true: one flow, one ECMP path)} → {id, task_id, columns}",
+        can_start, traceroute_start)
+    .alias("traceroute")
     .positional("address")
     .task(),
     cmd!(query "tool.task.list", "Tasks", [], None,
@@ -205,6 +211,7 @@ fn options(s: &Session, p: &Value, targets: &[Target]) -> Result<SocketOptions> 
         dont_fragment: opt_bool(p, "do_not_fragment")?.unwrap_or(false),
         src,
         device: device.map(|d| d.to_string()),
+        ..SocketOptions::default()
     })
 }
 
@@ -284,6 +291,65 @@ fn ping_mtu(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+/// `protocol`, `port` and `paris` of MTR and traceroute (G6.4c).
+fn probe_kind(p: &Value, options: &mut SocketOptions) -> Result<()> {
+    let port = opt_u32(p, "port")?;
+    if let Some(v) = port
+        && !(1..=65_535).contains(&v)
+    {
+        return Err(EngineError::bad("port", "must be 1..=65535"));
+    }
+    let port = |default: u16| port.map_or(default, |v| u16::try_from(v).unwrap_or(default));
+    options.proto = match super::args::opt_str(p, "protocol")?.map(str::trim) {
+        None | Some("" | "icmp") => {
+            if p.get("port").is_some_and(|v| !v.is_null()) {
+                return Err(EngineError::bad("port", "only for protocol udp or tcp"));
+            }
+            ProbeProto::Icmp
+        }
+        Some("udp") => ProbeProto::Udp { port: port(33_434) },
+        Some("tcp") => ProbeProto::Tcp { port: port(80) },
+        Some(_) => return Err(EngineError::bad("protocol", "must be icmp, udp or tcp")),
+    };
+    options.paris = opt_bool(p, "paris")?.unwrap_or(true);
+    Ok(())
+}
+
+fn traceroute_start(s: &mut Session, p: &Value) -> Result<Value> {
+    let raw = super::args::req_str(p, "address")?;
+    let target = target("address", raw)?;
+    let probes = ranged(p, "probes", 1, mtr::MAX_PROBES, 3)?;
+    let timeout = ranged(p, "timeout_ms", 10, 10_000, 1000)?;
+    let max_hops = ranged(p, "max_hops", 1, 64, 30)?;
+    let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 60)?;
+    let targets = [target.clone()];
+    let mut options = options(s, p, &targets)?;
+    probe_kind(p, &mut options)?;
+    let prober = s.tool_prober().map_err(EngineError::Hal)?;
+    let job = mtr::MtrJob {
+        target,
+        count: probes,
+        // The probes of one hop leave 50 ms apart: routers rate-limit
+        // their ICMP errors.
+        interval: Duration::from_millis(50),
+        timeout: Duration::from_millis(u64::from(timeout)),
+        max_hops: narrow("max_hops", max_hops)?,
+        size: narrow("size", size)?,
+        options,
+        use_dns: opt_bool(p, "use_dns")?.unwrap_or(true),
+        as_lookup: opt_bool(p, "as_lookup")?.unwrap_or(false),
+        traceroute: true,
+    };
+    let id = s.start_task("traceroute", title("traceroute", &targets), move |ctx| {
+        mtr::run(job, prober.as_ref(), ctx)
+    })?;
+    Ok(json!({
+        "id": id,
+        "task_id": id,
+        "columns": ["round", "hop", "address", "rtt_ms", "status", "mpls"],
+    }))
+}
+
 fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
     let raw = super::args::req_str(p, "address")?;
     let target = target("address", raw)?;
@@ -293,7 +359,8 @@ fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
     let max_hops = ranged(p, "max_hops", 1, 64, 30)?;
     let size = ranged(p, "size", u32::from(V4_OVERHEAD), u32::from(MAX_PACKET), 56)?;
     let targets = [target.clone()];
-    let options = options(s, p, &targets)?;
+    let mut options = options(s, p, &targets)?;
+    probe_kind(p, &mut options)?;
     let prober = s.tool_prober().map_err(EngineError::Hal)?;
     let job = mtr::MtrJob {
         target,
@@ -305,6 +372,7 @@ fn mtr_start(s: &mut Session, p: &Value) -> Result<Value> {
         options,
         use_dns: opt_bool(p, "use_dns")?.unwrap_or(true),
         as_lookup: opt_bool(p, "as_lookup")?.unwrap_or(false),
+        traceroute: false,
     };
     let id = s.start_task("mtr", title("mtr", &targets), move |ctx| {
         mtr::run(job, prober.as_ref(), ctx)
@@ -357,6 +425,8 @@ fn add_text(reply: &mut Value) {
                 .map(str::to_owned)
                 .collect::<Vec<_>>()
         })
+        // A traceroute prints its table at the end, nothing per probe.
+        .filter(|l| kind != "traceroute" || !l.is_empty())
         .collect();
     let done = reply.get("done").and_then(Value::as_bool) == Some(true);
     let summary = done.then(|| text::summary(&kind, reply.get("summary").unwrap_or(&Value::Null)));
@@ -509,6 +579,49 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn traceroute_one_pass_over_udp_tcp_and_icmp() {
+        let mut s = lab();
+        for (proto, end) in [("udp", "port unreachable"), ("tcp", "syn-ack"), ("icmp", "")] {
+            let r = s
+                .execute(
+                    "tool.traceroute.start",
+                    &json!({"address": "8.8.8.8", "protocol": proto, "timeout_ms": 50, "use_dns": false}),
+                )
+                .unwrap();
+            let id = r["task_id"].as_u64().unwrap();
+            let p = until_done(&mut s, id);
+            assert_eq!(p["kind"], "traceroute");
+            let sum = &p["summary"];
+            assert_eq!((sum["mode"].as_str(), sum["protocol"].as_str(), sum["paris"].as_bool()), (Some("traceroute"), Some(proto), Some(true)));
+            assert_eq!(sum["reached"], true);
+            let hops = sum["hops"].as_array().unwrap();
+            assert!(hops.iter().all(|h| h["rtts"].as_array().unwrap().len() == 3), "{sum}");
+            if !end.is_empty() {
+                assert_eq!(hops.last().unwrap()["note"], end);
+            }
+            let t = s.execute("tool.task.poll", &json!({"id": id, "text": true})).unwrap();
+            let table = t["summary_lines"].as_array().unwrap();
+            assert!(table.iter().any(|l| l.as_str().unwrap().contains("8.8.8.8")), "{table:?}");
+            assert!(t["lines"].as_array().unwrap().is_empty(), "the table is the output");
+        }
+        for bad in [
+            json!({"address": "8.8.8.8", "protocol": "sctp"}),
+            json!({"address": "8.8.8.8", "port": 80}),
+            json!({"address": "8.8.8.8", "protocol": "udp", "port": 0}),
+            json!({"address": "8.8.8.8", "probes": 11}),
+            json!({"address": "8.8.8.8", "paris": "yes"}),
+        ] {
+            assert!(s.execute("tool.traceroute.start", &bad).is_err(), "accepted {bad}");
+        }
+        // The MTR takes the same knobs.
+        let r = s
+            .execute("tool.mtr.start", &json!({"address": "8.8.8.8", "count": 1, "protocol": "tcp", "port": 443, "paris": false, "interval_ms": 100, "timeout_ms": 50}))
+            .unwrap();
+        let p = until_done(&mut s, r["task_id"].as_u64().unwrap());
+        assert_eq!((p["summary"]["protocol"].as_str(), p["summary"]["port"].as_u64(), p["summary"]["paris"].as_bool()), (Some("tcp"), Some(443), Some(false)));
     }
 
     #[test]

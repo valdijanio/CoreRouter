@@ -1,6 +1,6 @@
 # Ferramentas de diagnóstico (Tools)
 
-Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR), G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR) G6.4a (Torch e Packet Sniffer) e G6.4b (Bandwidth Test com o protocolo do iperf3) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
+Status: G6.1 (tarefas), G6.2 (Ping, vários destinos, descoberta de MTU) , G6.3 (MTR), G6.3b (nomes, ASN, privado/CGNAT e MPLS no MTR) G6.4a (Torch e Packet Sniffer), G6.4b (Bandwidth Test com o protocolo do iperf3) e G6.4c (traceroute de uma passada, UDP/TCP e Paris) feitos. Inspirado no `/tool ping` do RouterOS, com mais para ver: gráfico, perdas,
 jitter, percentis, histograma, alertas e exportação.
 
 ## 1. Tarefas (G6.1)
@@ -128,6 +128,36 @@ routing_table?}` — traceroute contínuo, IPv4 e IPv6:
 
 Perda que começa num salto e continua até o destino é um enlace com perda; perda num salto só
 (o resto 0 %) é um roteador que limita respostas ICMP — a leitura é a mesma do `mtr`.
+
+### 4.1b Traceroute, sondas UDP/TCP e Paris (G6.4c)
+
+O traceroute é um **modo do MTR**, não uma janela nova (Tools › MTR, selos MTR | Traceroute):
+
+- `tool.traceroute.start {address, probes? (3, 1–10), timeout_ms?, max_hops?, size? (60),
+  dscp?, src_address?, interface?, routing_table?, use_dns?, as_lookup?, protocol?, port?,
+  paris?}` — **uma passada**: `probes` sondas por salto (as de um salto saem a 50 ms uma da
+  outra: roteadores limitam suas respostas ICMP), o RTT de cada uma em `rtts` por salto, e no
+  terminal (`/tool traceroute 8.8.8.8 protocol=tcp port=443`) a tabela clássica do `traceroute`
+  (`*` sem resposta, `!H`/`!N`/`!P`/`!F`/`!X`, nome, `[AS…]`, `<MPLS …>`). O resumo tem
+  `mode: traceroute`.
+- `tool.mtr.start` ganhou os mesmos `protocol`, `port` e `paris`.
+- **`protocol`**: `icmp` (eco, padrão), `udp` (porta 33434; o destino responde "port
+  unreachable") ou `tcp` (SYN para a porta, padrão 80; o destino responde SYN-ACK ou RST — passa
+  por firewalls que descartam ICMP e UDP). Nenhum usa socket raw: os erros ICMP chegam pela fila
+  de erros do socket (`IP_RECVERR`/`IPV6_RECVERR`, ip(7)), com o roteador que os mandou
+  (`SO_EE_OFFENDER`). No TCP o handshake é completo e resetado na hora (`SO_LINGER` 0), como o
+  `tcpconn` do `traceroute -T` e o `mtr --tcp`: o serviço do destino vê uma conexão aberta e
+  fechada. Fim do caminho: `reached` e `note` = `port unreachable`, `syn-ack` ou `rst`.
+- **`paris`** (padrão **ligado**; Augustin et al., "Avoiding traceroute anomalies with Paris
+  traceroute", IMC 2006): toda sonda é o mesmo fluxo para um balanceador por fluxo — mesmas
+  portas (UDP/TCP) e, no ICMP, o mesmo checksum (uma palavra da carga compensa a sequência:
+  `seq + palavra = 0xFFFF` em complemento de um). Assim o traço segue **um** caminho ECMP real.
+  Desligado (clássico), cada sonda é um fluxo: um salto atrás de ECMP mostra os roteadores
+  alternando (selo `ECMP n` na janela). Paris sobre UDP e TCP manda **uma sonda por vez**: um
+  roteador que cita só os 8 bytes da RFC 792 não deixa distinguir duas sondas do mesmo fluxo
+  (no UDP Paris a sequência vai na carga, que roteadores RFC 1812 §4.3.2.3 citam); a passada
+  fica mais lenta quando há saltos mudos (um timeout cada).
+- Lab: na rede simulada, caminhos de 6 saltos ou mais têm um par ECMP no salto 3 (`sim.rs`).
 
 ### 4.2 Nomes, ASN, privado/CGNAT e MPLS (G6.3b)
 
@@ -475,7 +505,8 @@ A GUI nativa sem `--connect` (lab no processo) usa sempre a rede simulada.
   20 000 respostas: arquivo em `$COREROUTER_EXPORT_DIR`, `~/Downloads` ou o diretório atual na
   nativa, download no navegador); **Discover MTU** (primeiro endereço). Botões cinza com o motivo
   (G1.16). Fechar a janela para as tarefas dela.
-- **GUI** — Tools › MTR: endereço, rodadas, intervalo, saltos máximos, origem, interface,
+- **GUI** — Tools › MTR: modo MTR ou Traceroute, endereço, rodadas (ou sondas por salto),
+  protocolo, porta, Paris (ⓘ em cada um), intervalo, saltos máximos, origem, interface,
   tabela; Start (Enter) / Stop (Esc); tabela por salto ao vivo (Hop, Host, Loss %, Sent,
   Last, Avg, Best, Worst, StDev) com a perda colorida e uma barra da média relativa ao salto
   mais lento.

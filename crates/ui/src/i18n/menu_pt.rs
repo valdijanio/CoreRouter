@@ -63,7 +63,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.log", "## O que faz\nAs mensagens do roteador à medida que acontecem, por tópico e severidade, com busca."),
     ("menu.logging", "## O que faz\nPara onde vão as mensagens: regras por tópico e ações (memória, disco, syslog remoto)."),
     ("menu.mpls", "## O que faz\nComutação por rótulos MPLS e LDP, para VPLS e L3VPN entre locais. Ainda não implementado."),
-    ("menu.mtr", "## O que faz\nTraceroute contínuo: cada salto do caminho com perda e latência ao longo do tempo, AS e operadora de cada salto. Mostra em que ponto do caminho o problema começa."),
+    ("menu.mtr", "## O que faz\nTraceroute contínuo (MTR) ou de uma passada (Traceroute), por ICMP, UDP ou TCP, com o modo Paris para seguir um só caminho ECMP: cada salto do caminho com perda e latência ao longo do tempo, AS e operadora de cada salto. Mostra em que ponto do caminho o problema começa."),
     ("menu.neighbors", "## O que faz\nEquipamentos vistos nos links por LLDP e pela descoberta do próprio roteador: nome, endereço, plataforma e a porta onde estão."),
     ("menu.ntp-client", "## O que faz\nMantém o relógio do roteador certo a partir de servidores NTP. Logs, certificados e concessões DHCP dependem da hora certa."),
     ("menu.ospf", "## O que faz\nOSPF, o protocolo de roteamento interno: áreas, interfaces e vizinhos. Ainda não implementado."),

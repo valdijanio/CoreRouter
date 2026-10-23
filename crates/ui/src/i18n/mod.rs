@@ -36,6 +36,8 @@ mod pt;
 mod routes_pt;
 mod torch_en;
 mod torch_pt;
+mod traceroute_en;
+mod traceroute_pt;
 mod tuning_en;
 mod tuning_pt;
 
@@ -92,8 +94,8 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, cgnat_en::HELP, torch_en::HELP, bandwidth_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, cgnat_pt::HELP, torch_pt::HELP, bandwidth_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, cgnat_en::HELP, torch_en::HELP, bandwidth_en::HELP, traceroute_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, cgnat_pt::HELP, torch_pt::HELP, bandwidth_pt::HELP, traceroute_pt::HELP],
         }
     }
 

@@ -14,6 +14,12 @@
 //! is the AS as a pill whose colour comes from the AS number, so every hop
 //! of one operator shares a colour and the hand-over to the next one
 //! stands out. Full names, addresses and labels are in the tooltips.
+//!
+//! G6.4c: a Traceroute mode (one pass, `tool.traceroute.start`: N probes
+//! per hop, each RTT in the Probes column), the probe protocol (ICMP, UDP,
+//! TCP SYN, with the port) and Paris (one flow, so per-flow load balancers
+//! keep every probe on one path; off, a hop behind ECMP shows its routers
+//! with an `ECMP n` chip). Each new field has its ⓘ.
 
 use std::collections::BTreeMap;
 
@@ -30,6 +36,12 @@ use crate::windows::combo;
 use crate::{CoreRouterUi, Then, err_color, form_number, value_text};
 
 pub(crate) struct MtrForm {
+    /// `traceroute` (one pass) or the continuous MTR.
+    pub(crate) traceroute: bool,
+    pub(crate) probes: String,
+    pub(crate) protocol: String,
+    pub(crate) port: String,
+    pub(crate) paris: bool,
     pub(crate) address: String,
     pub(crate) count: String,
     pub(crate) interval: String,
@@ -44,6 +56,11 @@ pub(crate) struct MtrForm {
 impl Default for MtrForm {
     fn default() -> Self {
         Self {
+            traceroute: false,
+            probes: "3".into(),
+            protocol: "icmp".into(),
+            port: String::new(),
+            paris: true,
             address: String::new(),
             count: String::new(),
             interval: "1000".into(),
@@ -60,6 +77,7 @@ impl Default for MtrForm {
 #[derive(Default)]
 pub(crate) struct MtrWin {
     pub(crate) form: MtrForm,
+    pub(crate) help: Option<crate::help::HelpView>,
     pub(crate) task: Option<TaskView>,
     error: Option<String>,
     starting: bool,
@@ -132,26 +150,9 @@ impl CoreRouterUi {
             return;
         }
         let f = &self.mtr.form;
-        let text = |s: &str| {
-            let s = s.trim();
-            (!s.is_empty()).then(|| json!(s))
-        };
-        let mut p = json!({
-            "address": f.address.trim(),
-            "count": form_number(&f.count),
-            "interval_ms": form_number(&f.interval),
-            "max_hops": form_number(&f.max_hops),
-            "src_address": text(&f.src),
-            "interface": text(&f.interface),
-            "routing_table": text(&f.routing_table),
-            "use_dns": f.use_dns,
-            "as_lookup": f.as_lookup,
-        });
-        if let Value::Object(o) = &mut p {
-            o.retain(|_, v| !v.is_null());
-        }
+        let (command, p) = mtr_params(f);
         self.mtr.starting = true;
-        self.run_then("tool.mtr.start", p, Then::Tool(ToolReq::Mtr));
+        self.run_then(command, p, Then::Tool(ToolReq::Mtr));
     }
 
     /// Stop (Esc) a running MTR; `false` if none ran.
@@ -177,9 +178,27 @@ impl CoreRouterUi {
         let interfaces = self.interface_names(None);
         let mut tables = vec!["main".to_owned()];
         tables.extend(self.interface_names(Some("vrf")));
+        let langs = self.lang;
+        let l = langs.labels;
         let f = &mut self.mtr.form;
         let mut enter = false;
+        let mut help: Option<crate::help::HelpView> = None;
+        let mut info = |ui: &mut Ui, key: &str, title: &'static str| {
+            if crate::help::info_button(ui, egui::Id::unique(("mtr-help", key)), crate::i18n::tr(l, title)).clicked() {
+                help = Some(crate::help::HelpView::new(format!("mtr.{key}"), crate::i18n::tr(l, title)));
+            }
+        };
         ui.horizontal(|ui| {
+            ui.add_enabled_ui(!running, |ui| {
+                if crate::list::filter_chip(ui, "MTR", !f.traceroute) {
+                    f.traceroute = false;
+                }
+                if crate::list::filter_chip(ui, "Traceroute", f.traceroute) {
+                    f.traceroute = true;
+                }
+            });
+            info(ui, "mode", "Mode");
+            ui.separator();
             ui.label("Address");
             let r = ui.add(
                 TextEdit::singleline(&mut f.address)
@@ -191,19 +210,40 @@ impl CoreRouterUi {
                     .desired_width(260.0),
             );
             enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-            ui.label("Count");
-            ui.add(
-                TextEdit::singleline(&mut f.count)
-                    .hint_text("until stopped")
-                    .desired_width(90.0),
-            );
+            if f.traceroute {
+                ui.label("Probes");
+                ui.add(TextEdit::singleline(&mut f.probes).hint_text("3").desired_width(40.0));
+                info(ui, "probes", "Probes");
+            } else {
+                ui.label("Count");
+                ui.add(
+                    TextEdit::singleline(&mut f.count)
+                        .hint_text("until stopped")
+                        .desired_width(90.0),
+                );
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Protocol");
+            let opts = ["icmp".to_owned(), "udp".to_owned(), "tcp".to_owned()];
+            combo(ui, "mtr-proto", "icmp", &mut f.protocol, &opts);
+            info(ui, "protocol", "Protocol");
+            if f.protocol != "icmp" {
+                ui.label("Port");
+                let hint = if f.protocol == "tcp" { "80" } else { "33434" };
+                ui.add(TextEdit::singleline(&mut f.port).hint_text(hint).desired_width(60.0));
+                info(ui, "port", "Port");
+            }
+            ui.checkbox(&mut f.paris, "Paris");
+            info(ui, "paris", "Paris");
         });
         Grid::new("mtr-form")
             .num_columns(6)
             .spacing([10.0, 4.0])
             .show(ui, |ui| {
                 ui.label("Interval (ms)");
-                ui.add(TextEdit::singleline(&mut f.interval).desired_width(70.0));
+                // One pass: the probes of a hop leave 50 ms apart.
+                ui.add_enabled(!f.traceroute, TextEdit::singleline(&mut f.interval).desired_width(70.0));
                 ui.label("Max hops");
                 ui.add(TextEdit::singleline(&mut f.max_hops).desired_width(50.0));
                 ui.label("Src. address");
@@ -232,6 +272,10 @@ impl CoreRouterUi {
                 );
                 ui.end_row();
             });
+        if help.is_some() {
+            self.mtr.help = help;
+        }
+        crate::help::modal(ui.ctx(), langs, &mut self.mtr.help);
         ui.separator();
         let mut start = false;
         let mut stop = false;
@@ -243,7 +287,8 @@ impl CoreRouterUi {
             } else {
                 Ok(())
             };
-            start = action(ui, "Start", can.and("tool.mtr.start", start_ok));
+            let command = if self.mtr.form.traceroute { "tool.traceroute.start" } else { "tool.mtr.start" };
+            start = action(ui, "Start", can.and(command, start_ok));
             let stop_ok = if running {
                 Ok(())
             } else {
@@ -326,6 +371,7 @@ impl CoreRouterUi {
             .fold(0.0f64, f64::max);
         let bar = ui.visuals().selection.bg_fill;
         let as_col = t.summary.get("as_lookup").and_then(Value::as_bool) == Some(true);
+        let trace = t.summary.get("mode").and_then(Value::as_str) == Some("traceroute");
         let hues = path_hues(hops.iter().filter_map(|h| h.get("asn").and_then(Value::as_u64)));
         let mut selected = self.mtr.selected;
         let last_rows = std::mem::take(&mut self.mtr.rows);
@@ -345,8 +391,12 @@ impl CoreRouterUi {
                             heads.push("Network");
                         }
                         heads.extend([
-                            "Loss %", "Sent", "Last", "Avg", "Best", "Worst", "StDev", "",
+                            "Loss %", "Sent", "Last", "Avg", "Best", "Worst", "StDev",
                         ]);
+                        if trace {
+                            heads.push("Probes");
+                        }
+                        heads.push("");
                         for h in heads {
                             ui.strong(h);
                         }
@@ -387,6 +437,9 @@ impl CoreRouterUi {
                             for k in ["last_ms", "avg_ms", "best_ms", "worst_ms", "stddev_ms"] {
                                 ui.label(ms(num(h, k)));
                             }
+                            if trace {
+                                ui.label(probes_text(h));
+                            }
                             let frac = match num(h, "avg_ms") {
                                 Some(a) if slowest > 0.0 => (a / slowest) as f32,
                                 _ => 0.0,
@@ -414,6 +467,50 @@ impl CoreRouterUi {
         self.mtr.rows = rows;
         self.mtr.selected = selected;
     }
+}
+
+/// `tool.mtr.start` or `tool.traceroute.start`, and its parameters.
+pub(crate) fn mtr_params(f: &MtrForm) -> (&'static str, Value) {
+    let text = |s: &str| {
+        let s = s.trim();
+        (!s.is_empty()).then(|| json!(s))
+    };
+    let mut p = json!({
+        "address": f.address.trim(),
+        "max_hops": form_number(&f.max_hops),
+        "src_address": text(&f.src),
+        "interface": text(&f.interface),
+        "routing_table": text(&f.routing_table),
+        "use_dns": f.use_dns,
+        "as_lookup": f.as_lookup,
+        "protocol": f.protocol,
+        "paris": f.paris,
+    });
+    if let Value::Object(o) = &mut p {
+        if f.protocol != "icmp" {
+            o.insert("port".into(), form_number(&f.port));
+        }
+        if f.traceroute {
+            o.insert("probes".into(), form_number(&f.probes));
+        } else {
+            o.insert("count".into(), form_number(&f.count));
+            o.insert("interval_ms".into(), form_number(&f.interval));
+        }
+        o.retain(|_, v| !v.is_null());
+    }
+    let command = if f.traceroute { "tool.traceroute.start" } else { "tool.mtr.start" };
+    (command, p)
+}
+
+/// A hop's probes in the traceroute mode: `1.21 1.30 *`.
+fn probes_text(h: &Value) -> String {
+    h.get("rtts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|r| r.as_f64().map_or_else(|| "*".to_owned(), |v| format!("{v:.2}")))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Right click on a hop: copy what an operator pastes into a ticket.
@@ -559,7 +656,8 @@ fn host_cell(ui: &mut Ui, h: &Value) {
         ui.add(egui::Label::new(truncate(shown, HOST_CHARS)).selectable(false));
         ui.spacing_mut().item_spacing.x = 4.0;
         if hosts.len() > 1 {
-            ui.weak(format!("+{}", hosts.len() - 1));
+            // Several routers answered for this hop: a load balancer.
+            chip(ui, &format!("ECMP {}", hosts.len()), AMBER.tone(ui.visuals()));
         }
         if let Some(s) = scope {
             let tone = if s == "cgnat" {
