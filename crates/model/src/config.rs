@@ -48,6 +48,9 @@ pub struct System {
     /// Prometheus `/metrics` as a service (G4.4c).
     #[serde(skip_serializing_if = "MetricsService::is_default")]
     pub metrics: MetricsService,
+    /// `system.tuning.*` (G1.26): kernel and hardware settings.
+    #[serde(skip_serializing_if = "crate::tuning::Tuning::is_default")]
+    pub tuning: crate::tuning::Tuning,
 }
 
 impl Default for System {
@@ -57,6 +60,7 @@ impl Default for System {
             ntp_client: NtpClient::default(),
             logging: Logging::default(),
             metrics: MetricsService::default(),
+            tuning: crate::tuning::Tuning::default(),
         }
     }
 }

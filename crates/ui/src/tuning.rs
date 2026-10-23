@@ -1,0 +1,1186 @@
+//! System › Tuning (G1.26): the kernel and hardware settings of a box that
+//! forwards packets. Tabs Summary (the machine, the diagnosis, the profile
+//! and its actions), Kernel (the parameters as a property list: current,
+//! configured, recommended, range, ⓘ), Interfaces, CPU and IRQ, Boot (the
+//! next parts, G1.26b–d) and Profiles (the four profiles side by side).
+//!
+//! The engine calculates everything (`system.tuning.*`); the window shows
+//! it, in the languages of Settings (G0.15): labels through `tr`, the ⓘ
+//! modal and the engine's reasons in the language of the explanations.
+
+use std::collections::BTreeSet;
+
+use egui::{
+    Align, ComboBox, Grid, Id, Layout, RichText, ScrollArea, Sense, TextEdit, Ui, UiBuilder, pos2,
+    vec2,
+};
+use serde_json::{Value, json};
+
+use crate::backend::RequestId;
+use crate::chip::{AMBER, BLUE, RED, chip, neutral_tone};
+use crate::help::{self, HelpView};
+use crate::i18n::{self, Lang, tr};
+use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
+use crate::table::action;
+use crate::{CoreRouterUi, Win, human_bytes};
+
+const NAME: &str = "tuning";
+/// The window's id (`Win::Panel`).
+pub(crate) const WIN: &str = "tuning";
+const PRINT: &str = "system.tuning.parameter.print";
+const HARDWARE: &str = "system.tuning.hardware";
+const DIAGNOSE: &str = "system.tuning.diagnose";
+const SET: &str = "system.tuning.set";
+const UNSET: &str = "system.tuning.unset";
+const APPLY: &str = "system.tuning.profile.apply";
+const DIFF: &str = "system.tuning.profile.diff";
+const SAFE_MODE: &str = "config.safe-mode.enter";
+
+pub(crate) const PANEL: Panel = Panel {
+    name: NAME,
+    windows: &[WinDef {
+        id: WIN,
+        group: "System",
+        title: "Tuning",
+        size: [1080.0, 760.0],
+        escape: true,
+    }],
+    new: || Box::new(TuningPanel::default()),
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Tab {
+    #[default]
+    Summary,
+    Kernel,
+    Interfaces,
+    Cpu,
+    Boot,
+    Profiles,
+}
+
+const TABS: [(Tab, &str); 6] = [
+    (Tab::Summary, "Summary"),
+    (Tab::Kernel, "Kernel"),
+    (Tab::Interfaces, "Interfaces"),
+    (Tab::Cpu, "CPU and IRQ"),
+    (Tab::Boot, "Boot"),
+    (Tab::Profiles, "Profiles"),
+];
+
+/// Profiles: (engine id, label, query key of the Profiles tab).
+const PROFILES: [(&str, &str, &str); 4] = [
+    ("conservative", "Conservative", "p-conservative"),
+    ("balanced", "Balanced", "p-balanced"),
+    ("throughput", "High throughput", "p-throughput"),
+    ("latency", "Low latency", "p-latency"),
+];
+
+/// The engine's sections, in order (their labels, translated with `tr`).
+const SECTIONS: [&str; 6] = [
+    "Packet receive",
+    "Routing",
+    "Connection tracking",
+    "Neighbor tables",
+    "Stability",
+    "Control plane (TCP)",
+];
+
+/// Width of the property list's columns.
+const COLS: [f32; 6] = [340.0, 170.0, 150.0, 170.0, 150.0, 28.0];
+
+/// One parameter as `system.tuning.print` describes it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct Param {
+    pub name: String,
+    pub section: String,
+    pub current: Option<i64>,
+    pub configured: Option<i64>,
+    pub recommended: Option<i64>,
+    pub why: String,
+    pub why_id: String,
+    pub why_args: Vec<(String, String)>,
+    pub min: i64,
+    pub max: i64,
+    pub unit: String,
+    pub choices: Vec<(i64, String)>,
+    pub obsolete: bool,
+    pub control_plane: bool,
+    /// Valid from the next boot (G1.26d).
+    pub reboot: bool,
+    /// Changing it takes the port down for a moment (G1.26b).
+    pub link_flap: bool,
+}
+
+impl Param {
+    fn of(v: &Value) -> Option<Self> {
+        let int = |k: &str| v.get(k).and_then(Value::as_i64);
+        let text = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+        let flag = |k: &str| v.get(k).and_then(Value::as_bool).unwrap_or(false);
+        Some(Self {
+            name: v.get("name")?.as_str()?.to_owned(),
+            section: text("section"),
+            current: int("current"),
+            configured: int("configured"),
+            recommended: int("recommended"),
+            why: text("why"),
+            why_id: text("why_id"),
+            why_args: v
+                .get("why_args")
+                .and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            min: int("min").unwrap_or(0),
+            max: int("max").unwrap_or(0),
+            unit: text("unit"),
+            choices: v
+                .get("choices")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| {
+                            Some((c.get("value")?.as_i64()?, c.get("name")?.as_str()?.to_owned()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            obsolete: flag("obsolete"),
+            control_plane: flag("control_plane"),
+            reboot: flag("reboot"),
+            link_flap: flag("link_flap"),
+        })
+    }
+
+    /// What the kernel will have: the configured value, else the current.
+    fn effective(&self) -> Option<i64> {
+        self.configured.or(self.current)
+    }
+
+    /// The recommendation differs from what the router has.
+    pub(crate) fn differs(&self) -> bool {
+        self.current.is_some()
+            && self
+                .recommended
+                .is_some_and(|r| Some(r) != self.effective())
+    }
+
+    /// `v` as the operator reads it: a choice's name, bytes in KiB/MiB.
+    pub(crate) fn value_text(&self, v: i64) -> String {
+        if let Some((_, n)) = self.choices.iter().find(|(c, _)| *c == v) {
+            return format!("{v} ({n})");
+        }
+        let bytes = |b: i64| human_bytes(u64::try_from(b).unwrap_or(0));
+        match self.unit.as_str() {
+            "B" => bytes(v),
+            "KiB" => bytes(v.saturating_mul(1024)),
+            "s" | "µs" => format!("{} {}", grouped(v), self.unit),
+            _ => grouped(v),
+        }
+    }
+
+    fn range_text(&self) -> String {
+        if self.choices.is_empty() {
+            format!("{} – {}", grouped(self.min), grouped(self.max))
+        } else {
+            self.choices
+                .iter()
+                .map(|(v, _)| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    /// The reason in the language of the explanations.
+    fn why_text(&self, lang: Lang) -> String {
+        // The profile's engine id reads as its label.
+        let args: Vec<(&str, &str)> = self
+            .why_args
+            .iter()
+            .map(|(k, v)| {
+                let label = PROFILES
+                    .iter()
+                    .find(|(id, ..)| k == "profile" && id == v)
+                    .map(|(_, label, _)| tr(lang, label));
+                (k.as_str(), label.unwrap_or(v.as_str()))
+            })
+            .collect();
+        i18n::template(lang, &format!("why.{}", self.why_id), &args, &self.why)
+    }
+}
+
+/// `6684672` → `6 684 672` (from five digits on: `7440` stays).
+pub(crate) fn grouped(v: i64) -> String {
+    let digits = v.unsigned_abs().to_string();
+    if digits.len() < 5 {
+        return v.to_string();
+    }
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    if v < 0 { format!("-{out}") } else { out }
+}
+
+pub(crate) fn params(print: &Value) -> Vec<Param> {
+    print
+        .get("params")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Param::of).collect())
+        .unwrap_or_default()
+}
+
+/// A command reply.
+enum Reply {
+    Changed,
+    Diff,
+}
+
+#[derive(Default)]
+pub(crate) struct TuningPanel {
+    pub(crate) tab: Tab,
+    /// Engine id of the profile the Recommended column follows.
+    pub(crate) profile: &'static str,
+    pub(crate) print: Option<Value>,
+    hardware: Option<Value>,
+    pub(crate) diagnosis: Option<Value>,
+    /// The Profiles tab: `print` of each profile, by query key.
+    compare: Vec<(&'static str, Value)>,
+    pub(crate) find: String,
+    collapsed: BTreeSet<String>,
+    pub(crate) selected: Option<String>,
+    /// The value typed for the selected parameter.
+    pub(crate) edit: String,
+    pub(crate) error: Option<String>,
+    waiting: usize,
+    pub(crate) help: Option<HelpView>,
+    /// `system.tuning.profile.diff` shown in a modal.
+    pub(crate) diff: Option<Value>,
+}
+
+impl TuningPanel {
+    fn profile(&self) -> &'static str {
+        if self.profile.is_empty() {
+            "balanced"
+        } else {
+            self.profile
+        }
+    }
+
+    fn rows(&self) -> Vec<Param> {
+        self.print.as_ref().map(params).unwrap_or_default()
+    }
+}
+
+impl PanelState for TuningPanel {
+    fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
+        if !app.open.contains(&Win::Panel(WIN)) || !app.has_command(PRINT) {
+            return Vec::new();
+        }
+        let mut q = vec![Query {
+            key: "print",
+            command: PRINT,
+            params: json!({"profile": self.profile()}),
+        }];
+        if self.tab == Tab::Summary {
+            q.push(Query {
+                key: "hardware",
+                command: HARDWARE,
+                params: json!({}),
+            });
+            q.push(Query {
+                key: "diagnose",
+                command: DIAGNOSE,
+                params: json!({}),
+            });
+        }
+        if self.tab == Tab::Profiles {
+            q.extend(PROFILES.iter().map(|(id, _, key)| Query {
+                key,
+                command: PRINT,
+                params: json!({"profile": id, "tab": "kernel"}),
+            }));
+        }
+        q
+    }
+
+    fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
+        match key {
+            "print" => self.print = Some(value),
+            "hardware" => self.hardware = Some(value),
+            "diagnose" => self.diagnosis = Some(value),
+            k => {
+                if let Some(slot) = self.compare.iter_mut().find(|(c, _)| *c == k) {
+                    slot.1 = value;
+                } else {
+                    self.compare.push((k, value));
+                }
+            }
+        }
+    }
+
+    fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
+        self.draw(app, ui);
+    }
+
+    fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, _area: egui::Rect) {
+        help::modal(ctx, app.lang, &mut self.help);
+        self.diff_modal(app, ctx);
+    }
+
+    fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let Ok(r) = then.downcast::<Reply>() else {
+            return;
+        };
+        self.waiting = self.waiting.saturating_sub(1);
+        match (*r, result) {
+            (_, Err(e)) => self.error = Some(e.clone()),
+            (Reply::Changed, Ok(_)) => self.error = None,
+            (Reply::Diff, Ok(v)) => self.diff = Some(v.clone()),
+        }
+        app.cache.refreshed_at = None;
+    }
+
+    fn escape(&mut self, _win: &'static str) -> bool {
+        if !self.find.is_empty() {
+            self.find.clear();
+            true
+        } else {
+            self.selected.take().is_some()
+        }
+    }
+}
+
+impl TuningPanel {
+    fn draw(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        if !app.has_command(PRINT) {
+            ui.weak(tr(
+                l,
+                "This router has no System › Tuning yet: update corerouter-daemon.",
+            ));
+            return;
+        }
+        ui.horizontal(|ui| {
+            for (tab, label) in TABS {
+                if ui.selectable_label(self.tab == tab, tr(l, label)).clicked() {
+                    self.tab = tab;
+                    app.cache.refreshed_at = None;
+                }
+            }
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let current = PROFILES
+                    .iter()
+                    .find(|(id, ..)| *id == self.profile())
+                    .map_or("", |(_, label, _)| *label);
+                let before = self.profile();
+                let mut picked = before;
+                ComboBox::from_id_salt("tuning-profile")
+                    .selected_text(tr(l, current))
+                    .show_ui(ui, |ui| {
+                        for (id, label, _) in PROFILES {
+                            ui.selectable_value(&mut picked, id, tr(l, label));
+                        }
+                    });
+                ui.label(tr(l, "Profile"));
+                if picked != before {
+                    self.profile = picked;
+                    app.cache.refreshed_at = None;
+                }
+            });
+        });
+        ui.separator();
+        if let Some(e) = &self.error {
+            ui.colored_label(ui.visuals().error_fg_color, e.as_str());
+        }
+        match self.tab {
+            Tab::Summary => self.summary(app, ui),
+            Tab::Kernel => self.kernel(app, ui),
+            Tab::Profiles => self.profiles(app, ui),
+            Tab::Interfaces => later(
+                ui,
+                l,
+                "Rings, queues, RSS, interrupt coalescing, offloads, flow control and txqueuelen per port arrive with G1.26b.",
+            ),
+            Tab::Cpu => later(
+                ui,
+                l,
+                "Interrupt affinity per NUMA node, RPS/XPS, the CPU governor and C-states arrive with G1.26c.",
+            ),
+            Tab::Boot => later(
+                ui,
+                l,
+                "Boot parameters of the image (isolcpus, nohz_full, C-states, IOMMU, mitigations) arrive with G1.26d.",
+            ),
+        }
+    }
+
+    // ---- Summary ----------------------------------------------------------
+
+    fn summary(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            ui.strong(tr(l, "Hardware"));
+            match &self.hardware {
+                Some(hw) => hardware(ui, l, hw),
+                None => {
+                    ui.weak(tr(l, "waiting for the router…"));
+                }
+            }
+            ui.add_space(8.0);
+            ui.strong(tr(l, "Diagnosis"));
+            self.findings(app, ui);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.strong(tr(l, "Profile"));
+                if help::info_button(ui, Id::unique("tuning-profiles-help"), tr(l, "Profiles"))
+                    .clicked()
+                {
+                    self.help = Some(HelpView::new("tuning.profiles", tr(l, "Profiles")));
+                }
+            });
+            self.profile_actions(app, ui);
+        });
+    }
+
+    fn findings(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        let list: Vec<Value> = self
+            .diagnosis
+            .as_ref()
+            .and_then(|d| d.get("findings"))
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        if self.diagnosis.is_none() {
+            ui.weak(tr(l, "waiting for the router…"));
+            return;
+        }
+        if list.is_empty() {
+            ui.weak(tr(l, "Nothing to report: the counters look healthy."));
+            return;
+        }
+        let can = app.can();
+        for f in list {
+            let text = |k: &str| f.get(k).and_then(Value::as_str).unwrap_or("");
+            let args: Vec<(String, String)> = f
+                .get("args")
+                .and_then(Value::as_object)
+                .map(|o| {
+                    o.iter()
+                        .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let args: Vec<(&str, &str)> = args.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            let says = i18n::template(
+                app.lang.help,
+                &format!("finding.{}", text("id")),
+                &args,
+                text("text"),
+            );
+            ui.horizontal_wrapped(|ui| {
+                let v = ui.visuals().clone();
+                let (label, tone) = match text("severity") {
+                    "critical" => ("critical", RED.tone(&v)),
+                    "warning" => ("warning", AMBER.tone(&v)),
+                    _ => ("info", BLUE.tone(&v)),
+                };
+                chip(ui, tr(l, label), tone);
+                ui.label(says);
+                let param = f.get("param").and_then(Value::as_str);
+                let value = f.get("suggest").and_then(Value::as_i64);
+                if let (Some(p), Some(v)) = (param, value)
+                    && action(ui, &format!("{} {p} = {v}", tr(l, "Set")), can.check(SET))
+                {
+                    self.waiting += 1;
+                    app.run_then(
+                        SET,
+                        json!({"name": p, "value": v}),
+                        crate::panel::then(NAME, Reply::Changed),
+                    );
+                }
+            });
+        }
+    }
+
+    fn profile_actions(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        let rows = self.rows();
+        let n = rows.iter().filter(|p| p.differs()).count();
+        let label = PROFILES
+            .iter()
+            .find(|(id, ..)| *id == self.profile())
+            .map_or("", |(_, label, _)| *label);
+        ui.label(format!(
+            "{}: {n} {}",
+            tr(l, label),
+            tr(l, "parameters differ from this profile.")
+        ));
+        ui.horizontal(|ui| {
+            let can = app.can();
+            if action(ui, tr(l, "Show differences"), can.check(DIFF)) {
+                self.waiting += 1;
+                app.run_then(
+                    DIFF,
+                    json!({"profile": self.profile()}),
+                    crate::panel::then(NAME, Reply::Diff),
+                );
+            }
+            let ok = if n == 0 {
+                Err(tr(l, "Nothing to change").to_owned())
+            } else {
+                safe_mode_ok(app).and_then(|()| can.check(APPLY))
+            };
+            if action(ui, tr(l, "Apply with Safe Mode"), ok) {
+                self.apply_profile(app);
+            }
+        });
+        ui.weak(tr(
+            l,
+            "Safe Mode: confirm with the Safe Mode button on the top bar; if the connection drops, every change goes back.",
+        ));
+    }
+
+    fn apply_profile(&mut self, app: &mut CoreRouterUi) {
+        if !safe_mode_mine(app) {
+            app.run(SAFE_MODE, json!({}));
+        }
+        self.waiting += 1;
+        app.run_then(
+            APPLY,
+            json!({"profile": self.profile()}),
+            crate::panel::then(NAME, Reply::Changed),
+        );
+    }
+
+    fn diff_modal(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context) {
+        let Some(diff) = &self.diff else {
+            return;
+        };
+        let l = app.lang.labels;
+        let rows: Vec<Value> = diff.as_array().cloned().unwrap_or_default();
+        let by_name = self.rows();
+        let mut apply = false;
+        let shown = egui::Modal::new(Id::unique("tuning-diff")).show(ctx, |ui| {
+            ui.set_max_width(1100.0);
+            ui.label(RichText::new(tr(l, "Show differences")).strong().heading());
+            ui.separator();
+            if rows.is_empty() {
+                ui.weak(tr(l, "Nothing to change"));
+            }
+            ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
+                Grid::new("tuning-diff-grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing([12.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.strong(tr(l, "Parameter"));
+                        ui.strong(tr(l, "Current"));
+                        ui.strong(tr(l, "Recommended"));
+                        ui.strong(tr(l, "Why"));
+                        ui.end_row();
+                        for r in &rows {
+                            let name = r.get("name").and_then(Value::as_str).unwrap_or("");
+                            let p = by_name.iter().find(|p| p.name == name);
+                            let show = |v: Option<i64>| match (v, p) {
+                                (Some(v), Some(p)) => p.value_text(v),
+                                (Some(v), None) => v.to_string(),
+                                (None, _) => "–".into(),
+                            };
+                            let now = r
+                                .get("configured")
+                                .and_then(Value::as_i64)
+                                .or_else(|| r.get("current").and_then(Value::as_i64));
+                            let why = p.map_or_else(
+                                || r.get("why").and_then(Value::as_str).unwrap_or("").to_owned(),
+                                |p| p.why_text(app.lang.help),
+                            );
+                            ui.label(name);
+                            ui.label(show(now));
+                            ui.strong(show(r.get("recommended").and_then(Value::as_i64)));
+                            ui.weak(why);
+                            ui.end_row();
+                        }
+                    });
+            });
+            ui.separator();
+            let mut close = false;
+            ui.horizontal(|ui| {
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    close = ui.button(tr(l, "Close")).clicked();
+                    let ok = if rows.is_empty() {
+                        Err(tr(l, "Nothing to change").to_owned())
+                    } else {
+                        safe_mode_ok(app).and_then(|()| app.can().check(APPLY))
+                    };
+                    apply = action(ui, tr(l, "Apply with Safe Mode"), ok);
+                });
+            });
+            close || apply
+        });
+        if apply {
+            self.apply_profile(app);
+        }
+        if shown.inner || shown.should_close() {
+            self.diff = None;
+        }
+    }
+
+    // ---- Kernel -------------------------------------------------------------
+
+    fn kernel(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        let rows = self.rows();
+        ui.horizontal(|ui| {
+            ui.add(
+                TextEdit::singleline(&mut self.find)
+                    .hint_text(tr(l, "Find"))
+                    .desired_width(220.0),
+            );
+            if self.print.as_ref().and_then(|p| p.get("machine")) == Some(&Value::Bool(false)) {
+                ui.weak(tr(
+                    l,
+                    "This backend does not describe the machine: ranges come from the kernel only.",
+                ));
+            }
+        });
+        let editor_h = ui.spacing().interact_size.y * 3.0;
+        let list_h = (ui.available_height() - editor_h).max(80.0);
+        ScrollArea::both()
+            .id_salt("tuning-kernel")
+            .max_height(list_h)
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                header(
+                    ui,
+                    l,
+                    &[
+                        "Parameter",
+                        "Current",
+                        "Configured",
+                        "Recommended",
+                        "Range",
+                    ],
+                );
+                let needle = self.find.to_lowercase();
+                for section in SECTIONS {
+                    let in_section: Vec<&Param> = rows
+                        .iter()
+                        .filter(|p| p.section == section)
+                        .filter(|p| {
+                            needle.is_empty()
+                                || p.name.contains(&needle)
+                                || tr(l, section).to_lowercase().contains(&needle)
+                        })
+                        .collect();
+                    if in_section.is_empty() {
+                        continue;
+                    }
+                    let open = !self.collapsed.contains(section) || !needle.is_empty();
+                    if section_row(ui, tr(l, section), in_section.len(), open)
+                        && !self.collapsed.remove(section)
+                    {
+                        self.collapsed.insert(section.to_owned());
+                    }
+                    if !open {
+                        continue;
+                    }
+                    for p in in_section {
+                        self.param_row(app, ui, p);
+                    }
+                }
+            });
+        self.editor(app, ui, &rows);
+    }
+
+    fn param_row(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, p: &Param) {
+        let l = app.lang.labels;
+        let h = ui.spacing().interact_size.y + 2.0;
+        let width: f32 = COLS.iter().sum();
+        let (rect, resp) = ui.allocate_exact_size(vec2(width, h), Sense::click());
+        let selected = self.selected.as_deref() == Some(p.name.as_str());
+        let v = ui.visuals().clone();
+        if selected {
+            ui.painter().rect_filled(rect, 2.0, v.selection.bg_fill);
+        } else if resp.hovered() {
+            ui.painter().rect_filled(rect, 2.0, v.widgets.hovered.weak_bg_fill);
+        }
+        if resp.clicked() {
+            if selected {
+                self.selected = None;
+            } else {
+                self.selected = Some(p.name.clone());
+                self.edit = p.effective().map(|v| v.to_string()).unwrap_or_default();
+            }
+        }
+        let mut x = rect.left() + 6.0;
+        let mut cell = |ui: &mut Ui, i: usize, add: &mut dyn FnMut(&mut Ui)| {
+            let w = COLS.get(i).copied().unwrap_or(100.0);
+            let r = egui::Rect::from_min_size(pos2(x, rect.top()), vec2(w - 6.0, h));
+            x += w;
+            let mut child = ui.new_child(
+                UiBuilder::new()
+                    .max_rect(r)
+                    .layout(Layout::left_to_right(Align::Center)),
+            );
+            child.set_clip_rect(r.intersect(ui.clip_rect()));
+            // A click on the text selects the row, not the text.
+            child.style_mut().interaction.selectable_labels = false;
+            add(&mut child);
+        };
+        let text_color = if selected {
+            v.selection.stroke.color
+        } else {
+            v.text_color()
+        };
+        cell(ui, 0, &mut |ui| {
+            ui.label(RichText::new(&p.name).color(text_color));
+            if p.control_plane {
+                chip(ui, tr(l, "control plane"), BLUE.tone(&v));
+            }
+            if p.obsolete {
+                chip(ui, tr(l, "obsolete"), neutral_tone(&v));
+            }
+            if p.reboot {
+                chip(ui, tr(l, "needs reboot"), AMBER.tone(&v));
+            }
+            if p.link_flap {
+                chip(ui, tr(l, "flaps link"), AMBER.tone(&v));
+            }
+        });
+        cell(ui, 1, &mut |ui| match p.current {
+            Some(c) => {
+                ui.label(RichText::new(p.value_text(c)).color(text_color));
+                if p.differs() && p.configured.is_none() {
+                    chip(ui, tr(l, "differs"), AMBER.tone(&v));
+                }
+            }
+            None => {
+                ui.weak("–").on_hover_text(tr(
+                    l,
+                    "Not in this kernel or network namespace (conntrack: not loaded yet).",
+                ));
+            }
+        });
+        cell(ui, 2, &mut |ui| match p.configured {
+            Some(c) => {
+                ui.label(RichText::new(p.value_text(c)).color(text_color));
+                if p.current.is_some_and(|now| now != c) {
+                    chip(ui, tr(l, "not applied"), RED.tone(&v));
+                } else if p.differs() {
+                    chip(ui, tr(l, "differs"), AMBER.tone(&v));
+                }
+            }
+            None => {
+                ui.weak("–");
+            }
+        });
+        let why = p.why_text(app.lang.help);
+        cell(ui, 3, &mut |ui| match p.recommended {
+            Some(r) => {
+                ui.label(RichText::new(p.value_text(r)).color(text_color).strong())
+                    .on_hover_text(&why);
+            }
+            None => {
+                ui.weak("–");
+            }
+        });
+        cell(ui, 4, &mut |ui| {
+            ui.label(RichText::new(p.range_text()).color(text_color));
+        });
+        let mut info = false;
+        cell(ui, 5, &mut |ui| {
+            info = help::info_button(ui, Id::unique(("tuning-help", &p.name)), &p.name).clicked();
+        });
+        if info {
+            self.help = Some(explanation(p, &why));
+        }
+    }
+
+    /// Under the list: change the selected parameter.
+    fn editor(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, rows: &[Param]) {
+        let l = app.lang.labels;
+        let Some(p) = self
+            .selected
+            .as_ref()
+            .and_then(|s| rows.iter().find(|p| &p.name == s))
+        else {
+            ui.weak(tr(l, "Click a parameter to change it."));
+            return;
+        };
+        let can = app.can();
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(&p.name);
+            ui.label(tr(l, "Value"));
+            if p.choices.is_empty() {
+                ui.add(TextEdit::singleline(&mut self.edit).desired_width(120.0));
+                if !p.unit.is_empty() {
+                    ui.weak(&p.unit);
+                }
+            } else {
+                let mut pick: Option<i64> = self.edit.trim().parse().ok();
+                let shown = pick.map(|v| p.value_text(v)).unwrap_or_default();
+                ComboBox::from_id_salt(("tuning-choice", &p.name))
+                    .selected_text(shown)
+                    .show_ui(ui, |ui| {
+                        for (v, _) in &p.choices {
+                            ui.selectable_value(&mut pick, Some(*v), p.value_text(*v));
+                        }
+                    });
+                if let Some(v) = pick {
+                    self.edit = v.to_string();
+                }
+            }
+            let value: Result<i64, String> = self
+                .edit
+                .trim()
+                .parse()
+                .map_err(|_| tr(l, "Type a whole number").to_owned());
+            let busy = if self.waiting > 0 {
+                Err(tr(l, "Saving…").to_owned())
+            } else {
+                Ok(())
+            };
+            let set_ok = busy
+                .clone()
+                .and_then(|()| value.clone().map(|_| ()))
+                .and_then(|()| can.check(SET));
+            if action(ui, tr(l, "Set"), set_ok)
+                && let Ok(v) = value
+            {
+                self.waiting += 1;
+                app.run_then(
+                    SET,
+                    json!({"name": p.name, "value": v}),
+                    crate::panel::then(NAME, Reply::Changed),
+                );
+            }
+            let unset_ok = busy.clone().and_then(|()| {
+                if p.configured.is_some() {
+                    can.check(UNSET)
+                } else {
+                    Err(tr(l, "Not set: the kernel's own value is in use").to_owned())
+                }
+            });
+            if action(ui, tr(l, "Unset"), unset_ok) {
+                self.waiting += 1;
+                app.run_then(
+                    UNSET,
+                    json!({"name": p.name}),
+                    crate::panel::then(NAME, Reply::Changed),
+                );
+            }
+            if let Some(r) = p.recommended
+                && action(
+                    ui,
+                    &format!("{} ({})", tr(l, "Use recommended"), p.value_text(r)),
+                    busy.and_then(|()| can.check(SET)),
+                )
+            {
+                self.edit = r.to_string();
+                self.waiting += 1;
+                app.run_then(
+                    SET,
+                    json!({"name": p.name, "value": r}),
+                    crate::panel::then(NAME, Reply::Changed),
+                );
+            }
+        });
+    }
+
+    // ---- Profiles -------------------------------------------------------------
+
+    fn profiles(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
+        let l = app.lang.labels;
+        ui.horizontal(|ui| {
+            ui.label(tr(
+                l,
+                "The four profiles for this machine, side by side. The profile picked at the top is the one Summary applies.",
+            ));
+            if help::info_button(ui, Id::unique("tuning-profiles-help-2"), tr(l, "Profiles"))
+                .clicked()
+            {
+                self.help = Some(HelpView::new("tuning.profiles", tr(l, "Profiles")));
+            }
+        });
+        let by: Vec<(&str, Vec<Param>)> = PROFILES
+            .iter()
+            .map(|(_, label, key)| {
+                let rows = self
+                    .compare
+                    .iter()
+                    .find(|(k, _)| k == key)
+                    .map(|(_, v)| params(v))
+                    .unwrap_or_default();
+                (*label, rows)
+            })
+            .collect();
+        let Some((_, first)) = by.iter().find(|(_, r)| !r.is_empty()) else {
+            ui.weak(tr(l, "waiting for the router…"));
+            return;
+        };
+        let first = first.clone();
+        ScrollArea::both()
+            .id_salt("tuning-profiles")
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                Grid::new("tuning-profiles-grid")
+                    .striped(true)
+                    .num_columns(6)
+                    .spacing([14.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.strong(tr(l, "Parameter"));
+                        ui.strong(tr(l, "Current"));
+                        for (label, _) in &by {
+                            ui.strong(tr(l, label));
+                        }
+                        ui.end_row();
+                        for section in SECTIONS {
+                            let mut first_in = true;
+                            for p in first.iter().filter(|p| p.section == section) {
+                                if first_in {
+                                    ui.label(RichText::new(tr(l, section)).strong().italics());
+                                    ui.end_row();
+                                    first_in = false;
+                                }
+                                ui.label(&p.name);
+                                ui.label(p.current.map_or_else(|| "–".into(), |v| p.value_text(v)));
+                                for (_, rows) in &by {
+                                    let r = rows.iter().find(|r| r.name == p.name);
+                                    match r.and_then(|r| r.recommended.map(|v| (r, v))) {
+                                        Some((r, v)) => {
+                                            let t = RichText::new(r.value_text(v));
+                                            let t = if Some(v) == p.current { t } else { t.strong() };
+                                            ui.label(t).on_hover_text(r.why_text(app.lang.help));
+                                        }
+                                        None => {
+                                            ui.weak("–");
+                                        }
+                                    }
+                                }
+                                ui.end_row();
+                            }
+                        }
+                    });
+            });
+    }
+}
+
+/// The ⓘ modal of `p`: its explanation, the value recommended here and
+/// the command that sets it.
+pub(crate) fn explanation(p: &Param, why: &str) -> HelpView {
+    let mut v = HelpView::new(format!("tuning.{}", p.name), p.name.clone());
+    if let Some(r) = p.recommended {
+        v = v.with("Recommended here", format!("**{}**: {why}", p.value_text(r)));
+    }
+    let value = p.recommended.or(p.effective()).unwrap_or(p.min);
+    v.with(
+        "Equivalent command",
+        format!(
+            "`/system tuning set name={} value={value}`\n\n`/system tuning unset name={}`",
+            p.name, p.name
+        ),
+    )
+}
+
+fn later(ui: &mut Ui, l: Lang, what: &'static str) {
+    ui.add_space(12.0);
+    ui.weak(tr(l, what));
+}
+
+fn header(ui: &mut Ui, l: Lang, titles: &[&'static str]) {
+    let h = ui.spacing().interact_size.y;
+    let width: f32 = COLS.iter().sum();
+    let (rect, _) = ui.allocate_exact_size(vec2(width, h), Sense::hover());
+    let mut x = rect.left() + 6.0;
+    let font = egui::TextStyle::Body.resolve(ui.style());
+    let color = ui.visuals().strong_text_color();
+    for (i, t) in titles.iter().enumerate() {
+        ui.painter().text(
+            pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            tr(l, t),
+            font.clone(),
+            color,
+        );
+        x += COLS.get(i).copied().unwrap_or(100.0);
+    }
+    ui.painter().hline(
+        rect.x_range(),
+        rect.bottom(),
+        ui.visuals().widgets.noninteractive.bg_stroke,
+    );
+}
+
+/// A section band; whether it was clicked (open or close it).
+fn section_row(ui: &mut Ui, title: &str, n: usize, open: bool) -> bool {
+    let h = ui.spacing().interact_size.y + 4.0;
+    let width: f32 = COLS.iter().sum();
+    let (rect, resp) = ui.allocate_exact_size(vec2(width, h), Sense::click());
+    let v = ui.visuals();
+    ui.painter()
+        .rect_filled(rect.shrink2(vec2(0.0, 1.0)), 2.0, v.faint_bg_color);
+    // Painted: the default fonts have no ▸/▾.
+    let c = pos2(rect.left() + 11.0, rect.center().y);
+    let r = 4.0;
+    let tri = if open {
+        vec![c + vec2(-r, -r * 0.6), c + vec2(r, -r * 0.6), c + vec2(0.0, r * 0.7)]
+    } else {
+        vec![c + vec2(-r * 0.6, -r), c + vec2(r * 0.7, 0.0), c + vec2(-r * 0.6, r)]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        tri,
+        v.strong_text_color(),
+        egui::Stroke::NONE,
+    ));
+    ui.painter().text(
+        pos2(rect.left() + 22.0, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        format!("{title} ({n})"),
+        egui::TextStyle::Body.resolve(ui.style()),
+        v.strong_text_color(),
+    );
+    resp.clicked()
+}
+
+fn hardware(ui: &mut Ui, l: Lang, hw: &Value) {
+    let int = |v: &Value, k: &str| v.get(k).and_then(Value::as_u64);
+    let text = |v: &Value, k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_owned();
+    let gib = |kib: u64| format!("{:.1} GiB", kib as f64 / 1_048_576.0);
+    Grid::new("tuning-hw").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+        ui.label(tr(l, "CPUs"));
+        ui.label(format!(
+            "{} × {}",
+            int(hw, "cpus").unwrap_or(0),
+            text(hw, "cpu_model")
+        ));
+        ui.end_row();
+        let nodes: Vec<String> = hw
+            .get("numa")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .map(|n| {
+                        let cpus = cpu_ranges(
+                            &n.get("cpus")
+                                .and_then(Value::as_array)
+                                .map(|c| c.iter().filter_map(Value::as_u64).collect::<Vec<_>>())
+                                .unwrap_or_default(),
+                        );
+                        let mem = int(n, "mem_kib").map(gib).unwrap_or_default();
+                        format!("{}: {cpus} {mem}", int(n, "id").unwrap_or(0))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        ui.label(tr(l, "NUMA nodes"));
+        ui.label(if nodes.is_empty() {
+            "1".to_owned()
+        } else {
+            format!("{} ({})", nodes.len(), nodes.join("; "))
+        });
+        ui.end_row();
+        ui.label(tr(l, "Memory"));
+        ui.label(gib(int(hw, "mem_kib").unwrap_or(0)));
+        ui.end_row();
+        ui.label(tr(l, "Kernel"));
+        ui.label(text(hw, "kernel"));
+        ui.end_row();
+    });
+    let nics: Vec<Value> = hw
+        .get("nics")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if nics.is_empty() {
+        return;
+    }
+    ui.add_space(4.0);
+    Grid::new("tuning-nics")
+        .striped(true)
+        .num_columns(8)
+        .spacing([14.0, 3.0])
+        .show(ui, |ui| {
+            for t in [
+                "Port", "Driver", "Speed", "NUMA", "Queues", "RX ring", "TX ring", "RX missed",
+            ] {
+                ui.strong(tr(l, t));
+            }
+            ui.end_row();
+            let of = |n: &Value, a: &str, b: &str| match (int(n, a), int(n, b)) {
+                (Some(x), Some(y)) => format!("{x} / {y}"),
+                (Some(x), None) => x.to_string(),
+                _ => "–".into(),
+            };
+            for n in &nics {
+                ui.label(text(n, "name"));
+                ui.label(text(n, "driver"));
+                ui.label(int(n, "speed_mbps").map_or_else(|| "–".into(), speed));
+                ui.label(int(n, "numa_node").map_or_else(|| "–".into(), |v| v.to_string()));
+                ui.label(of(n, "queues", "queues_max"));
+                ui.label(of(n, "ring_rx", "ring_rx_max"));
+                ui.label(of(n, "ring_tx", "ring_tx_max"));
+                ui.label(int(n, "rx_missed").map_or_else(|| "–".into(), |v| v.to_string()));
+                ui.end_row();
+            }
+        });
+}
+
+fn speed(mbps: u64) -> String {
+    if mbps >= 1000 && mbps.is_multiple_of(1000) {
+        format!("{} Gb/s", mbps / 1000)
+    } else {
+        format!("{mbps} Mb/s")
+    }
+}
+
+/// `0-7,16-23` from a list of CPU numbers.
+pub(crate) fn cpu_ranges(cpus: &[u64]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut it = cpus.iter().copied().peekable();
+    while let Some(a) = it.next() {
+        let mut b = a;
+        while it.peek() == Some(&(b + 1)) {
+            b += 1;
+            it.next();
+        }
+        out.push(if a == b { a.to_string() } else { format!("{a}–{b}") });
+    }
+    out.join(",")
+}
+
+/// Safe Mode held by this connection.
+fn safe_mode_mine(app: &CoreRouterUi) -> bool {
+    let sm = app.cache.summary.get("safe_mode");
+    sm.and_then(|s| s.get("active")).and_then(Value::as_bool) == Some(true)
+        && sm.and_then(|s| s.get("yours")).and_then(Value::as_bool) == Some(true)
+}
+
+/// Whether this connection can enter (or already holds) Safe Mode.
+fn safe_mode_ok(app: &CoreRouterUi) -> Result<(), String> {
+    let sm = app.cache.summary.get("safe_mode");
+    let active = sm.and_then(|s| s.get("active")).and_then(Value::as_bool) == Some(true);
+    if active && !safe_mode_mine(app) {
+        let owner = sm
+            .and_then(|s| s.get("owner"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        return Err(format!(
+            "{} {owner}",
+            tr(app.lang.labels, "Safe Mode is held by")
+        ));
+    }
+    if safe_mode_mine(app) {
+        Ok(())
+    } else {
+        app.can().check(SAFE_MODE)
+    }
+}

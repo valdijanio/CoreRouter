@@ -62,7 +62,9 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
 
 - **Rótulo:** `tr(app.lang.labels, "Ring size")`. O texto em inglês é a chave e o fallback: sem
   tradução aparece em inglês, nunca uma chave. A tradução entra em `i18n/pt.rs` (`LABELS`, na
-  ordem). O título da janela (`WinDef::title`) e o nome do grupo do menu já passam pelo `tr`.
+  ordem); uma feature com muitos textos ganha o seu par de arquivos (`i18n/tuning_en.rs`,
+  `tuning_pt.rs`) e uma linha em `Lang::labels`/`help`, para PRs paralelos não editarem a mesma
+  lista. O título da janela (`WinDef::title`) e o nome do grupo do menu já passam pelo `tr`.
 - **Explicação:** uma chave estável por parâmetro ou tópico (`tuning.net.core.netdev_max_backlog`),
   com o texto em `HELP` de `en.rs` **e** de `pt.rs` (o teste
   `every_explanation_exists_in_both_languages` confere). Markdown simples: `## Título`,
@@ -71,6 +73,10 @@ Código: `crates/ui/src/i18n/` (catálogos `en.rs` e `pt.rs`, ordenados pela cha
   `Some(HelpView::new(chave, título))` no estado do painel e desenhe `help::modal(ctx, app.lang,
   &mut self.help)` em `PanelState::dialogs`. Faltou a explicação no idioma escolhido? Ela aparece
   no idioma dos rótulos e depois em inglês, sem panic.
-- Texto calculado (valor recomendado, comando equivalente) entra como seção extra do `HelpView`,
-  com o título em inglês passado ao `tr` no idioma das explicações.
+- Texto calculado (valor recomendado, comando equivalente) entra como seção extra do `HelpView`
+  (`.with(título, markdown)`), com o título em inglês passado ao `tr` no idioma das explicações.
+- Texto que o **engine** manda em inglês com argumentos (o motivo de um valor recomendado) vem com
+  um id: `i18n::template(lang, "why.<id>", args, inglês)` usa o modelo do catálogo (`TEMPLATES`) e
+  cai para o texto do engine; um teste confere que todo id do engine tem modelo em PT com os mesmos
+  argumentos.
 - Os rótulos das janelas antigas ainda não passam pelo `tr` (G0.15b).

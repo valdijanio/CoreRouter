@@ -19,6 +19,7 @@ use crate::nic::{
     NicHardware, Offload, base_t_modes, mode_speed,
 };
 use crate::sff::{self, SfpModule};
+use crate::tuning::{KernelStats, NumaNode, SoftnetCpu, Sysctls, SystemInfo};
 use crate::{
     DynamicChange, Features, Hal, HalError, Learned, LinkErrors, LinkInfo, LinkState, SharedProber,
     SimProber,
@@ -51,6 +52,24 @@ pub struct VirtualHal {
     /// The lab's "kernel" (G1.3): what each apply left, which a test (or
     /// a lab script) can change behind CoreRouter's back to make drift.
     kernel: LabKernel,
+}
+
+/// Memory of the lab's made-up server (32 GiB).
+const LAB_MEM_KIB: u64 = 32 << 20;
+
+/// A stock kernel's value of `name` on the lab's server (6.8, HZ=250),
+/// already forwarding (a router's boot scripts turn that on).
+fn lab_sysctl_default(name: &str) -> Option<i64> {
+    use corerouter_model::tuning::{INT_MAX, param};
+    Some(match name {
+        "net.ipv4.ip_forward" | "net.ipv6.conf.all.forwarding" => 1,
+        "net.core.netdev_budget_usecs" => 8000,
+        "net.netfilter.nf_conntrack_max" | "net.netfilter.nf_conntrack_buckets" => 262_144,
+        "net.ipv4.route.max_size" | "net.ipv6.route.max_size" => INT_MAX,
+        "vm.min_free_kbytes" => 67_584,
+        "net.ipv4.tcp_max_syn_backlog" => 1024,
+        _ => param(name)?.default?,
+    })
 }
 
 /// Handle on the virtual lab's data plane, shared with the [`VirtualHal`].
@@ -365,6 +384,52 @@ impl Hal for VirtualHal {
         Ok(())
     }
 
+    /// A made-up server (G1.26): 16 CPUs in two NUMA nodes, 32 GiB.
+    fn system_info(&mut self) -> Result<SystemInfo, HalError> {
+        let node = |id: u32| NumaNode {
+            id,
+            cpus: (id * 8..id * 8 + 8).collect(),
+            mem_kib: Some(LAB_MEM_KIB / 2),
+        };
+        Ok(SystemInfo {
+            cpus: 16,
+            cpu_model: Some("Virtual CPU (lab)".into()),
+            numa: vec![node(0), node(1)],
+            mem_kib: LAB_MEM_KIB,
+            kernel: "6.8.0-corerouter-lab".into(),
+        })
+    }
+
+    /// What the applied config set, else what a stock kernel has.
+    fn sysctls(&mut self, names: &[&str]) -> Result<Sysctls, HalError> {
+        Ok(names
+            .iter()
+            .map(|n| {
+                let set = self.applied.system.tuning.sysctl.get(*n).copied();
+                ((*n).to_owned(), set.or_else(|| lab_sysctl_default(n)))
+            })
+            .collect())
+    }
+
+    /// Counters that grow with the polls, with a squeezed CPU 3, a
+    /// conntrack table near its stock limit and a few neighbor overflows.
+    fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {
+        let t = self.ticks.saturating_add(1);
+        Ok(KernelStats {
+            softnet: (0..16u32)
+                .map(|cpu| SoftnetCpu {
+                    cpu,
+                    processed: t.saturating_mul(100_000 + u64::from(cpu) * 1000),
+                    dropped: 0,
+                    time_squeeze: if cpu == 3 { t.saturating_mul(400) } else { t },
+                })
+                .collect(),
+            conntrack_count: Some(240_000),
+            neigh_full_v4: Some(7),
+            neigh_full_v6: Some(0),
+        })
+    }
+
     fn snapshot(&mut self, cfg: &Config) -> Result<Snapshot, HalError> {
         let _ = cfg;
         Ok(self
@@ -578,6 +643,9 @@ impl Hal for VirtualHal {
             driver_version: Some(env!("CARGO_PKG_VERSION").into()),
             firmware: Some("lab-1.0".into()),
             serial: Some(format!("CRV{n:05}")),
+            // The made-up server has two NUMA nodes (G1.26): half the
+            // ports on each.
+            numa_node: Some(u32::from(index >= self.ports.len() / 2)),
             rx_queues: Some(4),
             tx_queues: Some(4),
             combined_channels: Some(4),

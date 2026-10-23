@@ -10,13 +10,21 @@
 //!   Markdown (`markdown.rs` draws it). Missing in the chosen language, it
 //!   falls back to the other chosen one and then to English.
 //!
-//! Catalogs: one file per language (`en.rs`, `pt.rs`), sorted by key, so a
-//! lookup is a binary search and a new entry has one obvious place.
+//! Catalogs: one file per language (`en.rs`, `pt.rs`), and a feature with
+//! many texts gets its own pair (`tuning_en.rs`, `tuning_pt.rs`), so
+//! parallel features do not edit the same list. Each table is sorted by
+//! key: a lookup is a binary search per table.
+//! - [`template`]: the GUI's own wording of a text the engine sends in
+//!   English with arguments (`why.<id>`: why a value is recommended),
+//!   `{name}` places filled by [`fill`].
+//!
 //! A preference of the window, not of the router: stored with the theme
 //! (`prefs.rs`).
 
 mod en;
 mod pt;
+mod tuning_en;
+mod tuning_pt;
 
 /// A language the GUI speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -50,18 +58,26 @@ impl Lang {
     }
 
     /// Label translations: (English, this language), sorted by English.
-    fn labels(self) -> &'static [(&'static str, &'static str)] {
+    fn labels(self) -> &'static [Table] {
         match self {
             Lang::En => &[],
-            Lang::Pt => pt::LABELS,
+            Lang::Pt => &[pt::LABELS, tuning_pt::LABELS],
         }
     }
 
     /// Explanations: (key, Markdown), sorted by key.
-    fn help(self) -> &'static [(&'static str, &'static str)] {
+    fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => en::HELP,
-            Lang::Pt => pt::HELP,
+            Lang::En => &[en::HELP, tuning_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP],
+        }
+    }
+
+    /// Wordings of the engine's English texts: (key, template).
+    fn templates(self) -> &'static [Table] {
+        match self {
+            Lang::En => &[],
+            Lang::Pt => &[tuning_pt::TEMPLATES],
         }
     }
 }
@@ -82,15 +98,17 @@ impl Default for Langs {
     }
 }
 
-fn lookup(
-    table: &'static [(&'static str, &'static str)],
-    key: &str,
-) -> Option<&'static str> {
-    table
-        .binary_search_by(|(k, _)| (*k).cmp(key))
-        .ok()
-        .and_then(|i| table.get(i))
-        .map(|(_, text)| *text)
+/// A catalog: (key, text), sorted by key.
+type Table = &'static [(&'static str, &'static str)];
+
+fn lookup(tables: &'static [Table], key: &str) -> Option<&'static str> {
+    tables.iter().find_map(|table| {
+        table
+            .binary_search_by(|(k, _)| (*k).cmp(key))
+            .ok()
+            .and_then(|i| table.get(i))
+            .map(|(_, text)| *text)
+    })
 }
 
 /// Label `en` in `lang`; English when there is no translation.
@@ -106,9 +124,30 @@ pub fn explain(langs: Langs, key: &str) -> Option<(Lang, &'static str)> {
         .find_map(|l| lookup(l.help(), key).map(|text| (l, text)))
 }
 
+/// The engine's English text `english` (template `key`, arguments
+/// `args`) in `lang`: the catalog's template filled, else `english`.
+pub fn template(lang: Lang, key: &str, args: &[(&str, &str)], english: &str) -> String {
+    lookup(lang.templates(), key).map_or_else(|| english.to_owned(), |t| fill(t, args))
+}
+
+/// Put `args` into the `{name}` places of `template`.
+pub fn fill(template: &str, args: &[(&str, &str)]) -> String {
+    let mut out = template.to_owned();
+    for (k, v) in args {
+        out = out.replace(&format!("{{{k}}}"), v);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn keys(tables: &[Table]) -> Vec<&'static str> {
+        let mut k: Vec<&str> = tables.iter().flat_map(|t| t.iter().map(|(k, _)| *k)).collect();
+        k.sort_unstable();
+        k
+    }
 
     fn sorted_unique(name: &str, table: &[(&str, &str)]) {
         for w in table.windows(2) {
@@ -121,18 +160,68 @@ mod tests {
     #[test]
     fn catalogs_are_sorted_and_unique() {
         for l in Lang::ALL {
-            sorted_unique(&format!("{l:?} labels"), l.labels());
-            sorted_unique(&format!("{l:?} help"), l.help());
+            for (what, tables) in [("labels", l.labels()), ("help", l.help()), ("templates", l.templates())] {
+                for t in tables {
+                    sorted_unique(&format!("{l:?} {what}"), t);
+                }
+                let all = keys(tables);
+                sorted_unique(&format!("{l:?} {what} (all tables)"), &all.iter().map(|k| (*k, "")).collect::<Vec<_>>());
+            }
         }
     }
 
     #[test]
     fn every_explanation_exists_in_both_languages() {
-        let en: Vec<_> = en::HELP.iter().map(|(k, _)| *k).collect();
-        let pt: Vec<_> = pt::HELP.iter().map(|(k, _)| *k).collect();
-        assert_eq!(en, pt, "every explanation key in en.rs and pt.rs");
-        for (k, text) in en::HELP.iter().chain(pt::HELP) {
-            assert!(!text.trim().is_empty(), "{k}: empty");
+        assert_eq!(
+            keys(Lang::En.help()),
+            keys(Lang::Pt.help()),
+            "every explanation key in English and in Portuguese"
+        );
+        for l in Lang::ALL {
+            for (k, text) in l.help().iter().flat_map(|t| t.iter()) {
+                assert!(!text.trim().is_empty(), "{k}: empty");
+            }
+        }
+    }
+
+    #[test]
+    fn templates_fill_and_fall_back() {
+        let args = [("gbps", "20")];
+        assert_eq!(
+            template(Lang::Pt, "why.backlog", &args, "english"),
+            "Dimensionado para 20 Gb/s de portas: uma rajada espera no backlog em vez de ser descartada."
+        );
+        assert_eq!(template(Lang::En, "why.backlog", &args, "english"), "english");
+        assert_eq!(template(Lang::Pt, "why.nope", &args, "english"), "english");
+    }
+
+    /// `{name}` places of a template, sorted.
+    fn places(t: &str) -> Vec<&str> {
+        let mut out: Vec<&str> = t
+            .split('{')
+            .skip(1)
+            .filter_map(|p| p.split_once('}').map(|(n, _)| n))
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn every_engine_text_has_a_portuguese_template_with_the_same_places() {
+        use corerouter_engine::tuning::{FINDINGS, WHY};
+        let groups = [("why", WHY), ("finding", FINDINGS)];
+        let mut ids = Vec::new();
+        for (prefix, texts) in groups {
+            for (id, en) in texts {
+                let key = format!("{prefix}.{id}");
+                let pt = lookup(Lang::Pt.templates(), &key)
+                    .unwrap_or_else(|| panic!("tuning_pt.rs lacks {key}"));
+                assert_eq!(places(en), places(pt), "{key}");
+                ids.push(key);
+            }
+        }
+        for (k, _) in Lang::Pt.templates().iter().flat_map(|t| t.iter()) {
+            assert!(ids.iter().any(|i| i == k), "{k}: the engine has no such text");
         }
     }
 
@@ -176,7 +265,7 @@ mod tests {
                 }
             }
         }
-        for (en, _) in pt::LABELS {
+        for (en, _) in Lang::Pt.labels().iter().flat_map(|t| t.iter()) {
             assert!(
                 code.contains(&format!("{en:?}")),
                 "pt.rs translates {en:?}, which no code asks for"

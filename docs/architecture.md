@@ -603,6 +603,32 @@ Camadas: o servidor é L2 puro (`proto-dhcp/src/server/`, compila em wasm: o lab
 também o roda), o engine guarda o estado e aplica os efeitos, o daemon só o dirige
 (`service/dhcp_server.rs`) e o `hal-linux` só carrega bytes (`dhcp_server.rs`).
 
+### Tuning do sistema (G1.26)
+
+**Decisão: Rust puro, sem `tuned`, `irqbalance`, `ethtool` nem `sysctl.conf`.**
+
+**Comparado:**
+
+- **Números.** Aplicar um perfil grava ~40 arquivos de `/proc/sys`: < 1 ms em Rust (**estimado**),
+  contra ~200 ms para subir o `tuned-adm`, um processo Python (**estimado**). Não é o gargalo de
+  ninguém. O que pesa é o resto.
+- **O que pesa:**
+  - Os perfis do `tuned` são para servidor: buffers TCP, busy_poll, THP. Os de roteador precisam
+    de outros valores.
+  - O `irqbalance` move as IRQs a cada 10 s e sobrescreve a afinidade manual (`scaling.rst`), o
+    contrário do que um roteador quer.
+  - Nenhum dos dois tem transação nem rollback, nem diz por que escolheu um valor.
+  - Os dois são processos externos e superfície a mais na imagem.
+
+**Como fica:**
+
+- Os valores vivem na config (`system.tuning`) e passam pelo mesmo caminho de tudo: comando, diff,
+  Safe Mode, journal, rollback.
+- O `hal-linux` (`tuning.rs`) grava tudo ou nada, com o valor original guardado na primeira mudança
+  (tirar da config o restaura).
+- O engine (`tuning.rs`) calcula perfis, faixas e diagnóstico, puro e testado sem kernel.
+- Medida de pps em netns: `docs/tuning.md`.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

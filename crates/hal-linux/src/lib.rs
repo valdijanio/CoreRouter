@@ -28,6 +28,10 @@
 //!   over a snapshot of the port taken before the first change, so taking
 //!   a setting out restores the driver's own); `sfp_module` reads the
 //!   module EEPROM and `cable_tester` runs the PHY's cable test.
+//! - tuning (G1.26): `apply` writes the kernel parameters of
+//!   `system.tuning` under `/proc/sys` (snapshot of the first value, so
+//!   taking one out restores it; see [`tuning`]); `system_info`,
+//!   `sysctls` and `kernel_stats` read `/proc` and `/sys`.
 //!
 //! Integration tests run against a real kernel inside a throwaway network
 //! namespace, without root: see `tests/netns.rs`.
@@ -82,6 +86,10 @@ pub mod ra;
 #[cfg(target_os = "linux")]
 pub mod icmp;
 
+/// System › Tuning (G1.26): kernel parameters, the machine, counters.
+#[cfg(target_os = "linux")]
+pub mod tuning;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
@@ -89,6 +97,7 @@ mod linux {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use corerouter_hal::drift::{LinkSnap, Snapshot};
+    use corerouter_hal::tuning::{KernelStats, Sysctls, SystemInfo};
     use corerouter_hal::{
         CableTest, DynamicChange, EthernetMonitor, Features, Hal, HalError, LinkCounters, LinkInfo,
         LinkState, NicHardware, SfpModule,
@@ -114,6 +123,8 @@ mod linux {
         /// Each port's Ethernet settings before CoreRouter first changed
         /// them (G1.20): what a setting taken out of the config returns to.
         ether_orig: BTreeMap<IfName, EtherState>,
+        /// Kernel parameters set by `system.tuning` and their originals.
+        sysctl: crate::tuning::Sysctl,
     }
 
     impl LinuxHal {
@@ -343,7 +354,15 @@ mod linux {
             // Ethernet settings next: validated by the engine against what
             // the port supports, they rarely fail; if the plan below does,
             // they go back too.
-            if let Err(e) = self.ether_transition(from, to) {
+            let tuning = (&from.system.tuning.sysctl, &to.system.tuning.sysctl);
+            let tuned = self.sysctl.transition(tuning.0, tuning.1).and_then(|()| {
+                self.ether_transition(from, to).inspect_err(|_| {
+                    if let Err(b) = self.sysctl.transition(tuning.1, tuning.0) {
+                        log::error!("restoring kernel parameters: {b}");
+                    }
+                })
+            });
+            if let Err(e) = tuned {
                 if firewall {
                     let dynamic = crate::nft::dynamic();
                     if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
@@ -387,6 +406,9 @@ mod linux {
                     if let Err(back) = self.ether_transition(to, from) {
                         log::error!("restoring Ethernet settings: {back}");
                     }
+                    if let Err(back) = self.sysctl.transition(tuning.1, tuning.0) {
+                        log::error!("restoring kernel parameters: {back}");
+                    }
                     if firewall {
                         // The links went back to `from`: so does the firewall.
                         let dynamic = crate::nft::dynamic();
@@ -401,6 +423,18 @@ mod linux {
                     Err(e)
                 }
             }
+        }
+
+        fn system_info(&mut self) -> Result<SystemInfo, HalError> {
+            Ok(self.sysctl.root.system_info())
+        }
+
+        fn sysctls(&mut self, names: &[&str]) -> Result<Sysctls, HalError> {
+            Ok(self.sysctl.root.sysctls(names))
+        }
+
+        fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {
+            Ok(self.sysctl.root.kernel_stats())
         }
 
         fn poll(&mut self) -> Vec<LinkState> {
