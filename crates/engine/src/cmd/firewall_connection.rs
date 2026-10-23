@@ -221,7 +221,9 @@ impl Filter {
             && self.protocol.is_none_or(|n| c.protocol == n)
             && self.src.is_none_or(|n| n.contains(&c.orig.src))
             && self.dst.is_none_or(|n| n.contains(&c.orig.dst))
-            && self.port.is_none_or(|n| c.orig.src_port == n || c.orig.dst_port == n)
+            && self
+                .port
+                .is_none_or(|n| !matches!(c.protocol, 1 | 58) && (c.orig.src_port == n || c.orig.dst_port == n))
             && self.state.as_deref().is_none_or(|s| c.state() == s)
             && self.subscriber.is_none_or(|a| c.orig.src == a)
             && self.public.is_none_or(|a| c.has(status::SRC_NAT) && c.reply.dst == a)
