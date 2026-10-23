@@ -504,6 +504,8 @@ impl Cgnat {
                     let via = text(v, "via");
                     chip::chip(ui, &via, chip::palette_tone(ui.visuals(), chip::name_hue(&via)));
                     chip::chip(ui, &text(v, "mode"), chip::neutral_tone(ui.visuals()));
+                    // G0.25: who that subscriber was then.
+                    crate::identity::badge_at(app, ui, "cgnat", &text(v, "subscriber"), Some(&text(v, "time")));
                 });
                 Grid::new("cgnat-who-answer").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
                     ui.weak(tr(l, "Public"));

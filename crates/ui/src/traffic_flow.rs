@@ -10,7 +10,7 @@
 //!   state, records a minute, templates sent, queue and loss;
 //! - **Top Talkers:** subscribers by traffic over the last minutes, from
 //!   the router's own records (no collector needed), with the subscriber's
-//!   name when the router knows it (`ip.identity.lookup`, G0.25), and the
+//!   name when the router knows it (the subscriber chip, `identity.rs`, G0.25), and the
 //!   records as CSV;
 //! - **Statistics:** every counter of the exporter.
 
@@ -226,8 +226,6 @@ pub(crate) struct TrafficFlowPanel {
     pub(crate) targets: Vec<Value>,
     pub(crate) stats: Value,
     pub(crate) top: Vec<Value>,
-    /// Subscriber names by address (`ip.identity.lookup`).
-    pub(crate) names: BTreeMap<String, String>,
     pub(crate) form: Form,
     base: Form,
     waiting: usize,
@@ -305,16 +303,12 @@ pub(crate) fn target_row(t: &Value) -> Row {
     }
 }
 
-fn top_row(r: &Value, name: Option<&String>) -> Row {
+fn top_row(r: &Value) -> Row {
     let address = text(r, "address");
-    let cell = match name {
-        Some(n) => chip::cell(&address, &[(n.as_str(), Kind::Blue)]),
-        None => address.clone(),
-    };
     Row {
-        key: address,
+        key: address.clone(),
         cells: vec![
-            cell,
+            address,
             bytes(n(r, "bytes")),
             bytes(n(r, "up_bytes")),
             bytes(n(r, "down_bytes")),
@@ -595,8 +589,18 @@ impl TrafficFlowPanel {
                 crate::panel::then(NAME, Csv),
             );
         }
-        let rows: Vec<Row> = self.top.iter().map(|r| top_row(r, self.names.get(&text(r, "address")))).collect();
-        table::show(ui, TOP, 0.0, &mut self.top_table, &TOP_COLUMNS, &rows, |_, _| {});
+        // The subscriber chip (G0.25): name, +N, tooltip, click opens the source.
+        let rows: Vec<Row> = self
+            .top
+            .iter()
+            .map(|r| {
+                let mut row = top_row(r);
+                crate::identity::add_chips(app, ui, "traffic-flow", &mut row, 0, &text(r, "address"));
+                row
+            })
+            .collect();
+        let out = table::show(ui, TOP, 0.0, &mut self.top_table, &TOP_COLUMNS, &rows, |_, _| {});
+        crate::identity::table_chip(app, ui, "traffic-flow", &out, &rows, |key| Some(key.to_owned()));
         if rows.is_empty() {
             ui.weak(tr(l, "No traffic in this window yet (turn Traffic Flow on in General)"));
         }
@@ -669,11 +673,6 @@ impl PanelState for TrafficFlowPanel {
                     command: "ip.traffic-flow.top",
                     params: json!({"minutes": self.minutes(), "by": self.by(), "limit": 50}),
                 });
-                // The subscribers' names, in one batch (G0.25).
-                let addresses: Vec<String> = self.top.iter().map(|r| text(r, "address")).collect();
-                if !addresses.is_empty() && app.has_command("ip.identity.lookup") {
-                    q.push(Query { key: "names", command: "ip.identity.lookup", params: json!({"addresses": addresses}) });
-                }
             }
             Tab::General | Tab::Statistics => {}
         }
@@ -699,17 +698,6 @@ impl PanelState for TrafficFlowPanel {
             "top" => {
                 if let Value::Array(a) = value {
                     self.top = a;
-                }
-            }
-            "names" => {
-                if let Value::Array(a) = value {
-                    self.names = a
-                        .iter()
-                        .filter_map(|r| {
-                            let name = r.get("primary")?.get("name")?.as_str()?.to_owned();
-                            Some((text(r, "address"), name))
-                        })
-                        .collect();
                 }
             }
             list_modal::PREVIEW => {

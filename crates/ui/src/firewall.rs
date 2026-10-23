@@ -837,7 +837,7 @@ pub(crate) fn arrow_id(salt: &str, up: bool) -> egui::Id {
 }
 
 /// ▲/▼ toolbar button, painted (the bundled fonts have no such glyphs).
-fn arrow(ui: &mut Ui, salt: &str, up: bool, enabled: Result<(), String>) -> bool {
+pub(crate) fn arrow(ui: &mut Ui, salt: &str, up: bool, enabled: Result<(), String>) -> bool {
     let h = ui.spacing().interact_size.y;
     let (rect, _) = ui.allocate_exact_size(egui::vec2(h * 1.5, h), egui::Sense::hover());
     let sense = if enabled.is_ok() {

@@ -70,6 +70,7 @@ impl CoreRouterUi {
             "labels_lang": self.lang.labels.code(),
             "help_lang": self.lang.help.code(),
             "menu": self.menu.prefs(),
+            "identity": crate::identity::prefs(self),
         })
         .to_string()
     }
@@ -95,6 +96,9 @@ impl CoreRouterUi {
         }
         if let Some(m) = v.get("menu") {
             self.menu.apply_prefs(m);
+        }
+        if let Some(i) = v.get("identity") {
+            crate::identity::apply_prefs(self, i);
         }
         if let Some(list) = v.get("inline_comments").and_then(Value::as_array) {
             let panels = self.panels.iter_mut().flatten().flat_map(|p| p.tables_mut());
