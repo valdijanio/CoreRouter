@@ -23,7 +23,6 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Stage", "Etapa"),
     ("Time", "Hora"),
     ("Upstreams", "Upstreams"),
-    ("Via", "Via"),
     ("Watch", "Acompanhar"),
     ("Why this answer", "Por que esta resposta"),
     ("answered", "respondeu"),
