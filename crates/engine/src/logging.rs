@@ -233,7 +233,7 @@ fn journal_detail(
 }
 
 /// `v`, or its JSON text cut short when it is too big to keep.
-fn bounded(v: &Value) -> Value {
+pub(crate) fn bounded(v: &Value) -> Value {
     let text = v.to_string();
     if text.len() <= MAX_DETAIL_TEXT {
         v.clone()
@@ -385,6 +385,13 @@ pub fn routes<'a>(logging: &'a Logging, ev: &LogEvent) -> Vec<&'a LogRule> {
     out
 }
 
+/// `s` with every control character (newline, ESC, …) as a space.
+fn one_line(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect()
+}
+
 pub(crate) fn cut(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_owned();
@@ -414,7 +421,9 @@ impl Session {
             time,
             topics,
             origin: origin.to_owned(),
-            message,
+            // One line, no terminal escapes: a failed command's parameters
+            // end up here, and the log is shown in terminals (audit #14).
+            message: one_line(&message),
             detail,
         };
         if keep {

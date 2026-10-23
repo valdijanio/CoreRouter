@@ -623,3 +623,74 @@ fn zone_matrix_generates_a_managed_block() {
         }
     }
 }
+
+/// Audit #10: only firewall changes were checked; removing the address the
+/// operator is connected to, or disabling its interface, went through.
+#[test]
+fn removing_the_management_address_or_its_interface_is_a_lockout() {
+    let mut s = router();
+    let lan = from_lan();
+    let id = |s: &mut Session, addr: &str| -> String {
+        ok(s, "ip.address.list", json!({}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["address"] == addr)
+            .unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let mine = id(&mut s, "192.168.88.1/24");
+    let msg = lockout(&mut s, &lan, "ip.address.remove", json!({"id": mine}));
+    assert!(msg.contains("192.168.88.1"), "{msg}");
+    let msg = lockout(
+        &mut s,
+        &lan,
+        "interface.set",
+        json!({"name": "ether2", "disabled": true}),
+    );
+    assert!(msg.contains("ether2"), "{msg}");
+    assert_eq!(s.store().running().ip.addresses.len(), 2);
+    // Another address or interface is fine.
+    let wan = id(&mut s, "203.0.113.1/24");
+    ok_as(&mut s, &lan, "ip.address.remove", json!({"id": wan}));
+    ok_as(
+        &mut s,
+        &lan,
+        "interface.set",
+        json!({"name": "ether3", "disabled": true}),
+    );
+    // Moving the address behind `in-interface=ether2 accept; drop` (the
+    // probes now see the interface the address will be on).
+    ok(
+        &mut s,
+        "ip.firewall.filter.add",
+        json!({"chain": "input", "action": "accept", "in_interface": "ether2"}),
+    );
+    ok(
+        &mut s,
+        "ip.firewall.filter.add",
+        json!({"chain": "input", "action": "drop"}),
+    );
+    ok_as(
+        &mut s,
+        &lan,
+        "config.mode.set",
+        json!({"mode": "transactional"}),
+    );
+    ok_as(&mut s, &lan, "ip.address.remove", json!({"id": mine}));
+    ok_as(
+        &mut s,
+        &lan,
+        "ip.address.add",
+        json!({"address": "192.168.88.1/24", "interface": "ether4"}),
+    );
+    let msg = match s.execute_as(&lan, "config.commit", &json!({})) {
+        Err(e @ EngineError::Lockout(_)) => e.to_string(),
+        other => panic!("expected a lockout, got {other:?}"),
+    };
+    assert!(msg.contains("ether4"), "{msg}");
+    // force=true accepts it.
+    ok_as(&mut s, &lan, "config.commit", json!({"force": true}));
+}

@@ -741,6 +741,46 @@ fn import_is_atomic_and_says_where_it_failed() {
     );
 }
 
+/// Audit #9: a router with more than 256 config commands could not import
+/// its own `/export` (one atomic batch, at most 256 steps).
+#[test]
+fn a_big_export_imports_back() {
+    let mut a = Term::new();
+    let mut script = String::from("/ip firewall address-list\n");
+    for i in 0..300u32 {
+        script.push_str(&format!(
+            "add address=10.0.{}.{} list=blocked\n",
+            i / 256,
+            i % 256
+        ));
+    }
+    a.router.files.insert("big.rsc".into(), script);
+    a.ok("/import file=big.rsc");
+    let exported = a.export();
+    let mut b = Term::new();
+    b.router.files.insert("cfg.rsc".into(), exported);
+    b.ok("/import file=cfg.rsc");
+    let lists = &b.router.session.store().running().ip.firewall.address_lists;
+    assert_eq!(lists.len(), 300);
+}
+
+/// Audit #15: a script whose last line ended in `\` lost that command.
+#[test]
+fn a_script_ending_in_a_continuation_is_refused() {
+    let t = Term::new();
+    let err = t
+        .shell
+        .script_steps("/system identity\nset name=a \\")
+        .unwrap_err();
+    assert!(err.contains("line 2") && err.contains("continu"), "{err}");
+    // Continued lines that do end still work.
+    let steps = t
+        .shell
+        .script_steps("/system identity\nset \\\nname=a\n")
+        .unwrap();
+    assert_eq!(steps.len(), 1);
+}
+
 #[test]
 fn help_shows_menus_commands_and_params() {
     let mut t = Term::new();

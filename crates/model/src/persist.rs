@@ -17,9 +17,20 @@ use crate::users::Users;
 /// [`decode`] to migrate the older ones.
 pub const FORMAT_VERSION: u32 = 1;
 
-/// Larger files are refused before parsing (64 revisions of a big config fit
-/// with plenty of room; **estimado**).
-pub const MAX_FILE_BYTES: usize = 64 * 1024 * 1024;
+/// Larger files are refused before parsing. Well above what a save writes
+/// ([`SAVE_BUDGET_BYTES`]), so a file written by an older build (pretty
+/// JSON, history never trimmed) still loads.
+pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
+
+/// What a save may write: [`encode_bounded`] leaves the oldest revisions
+/// out until the file fits (audit: 64 full copies of a big config made a
+/// file the next boot refused, and the router came up blank).
+pub const SAVE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+
+/// Largest running config a commit may produce: it is written twice (as
+/// `running` and as the newest revision) and must leave room for the
+/// accounts. About 50 000 firewall rules (**estimado**).
+pub const MAX_CONFIG_BYTES: usize = SAVE_BUDGET_BYTES / 2 - 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PersistError {
@@ -85,8 +96,80 @@ pub fn encode(store: &ConfigStore) -> Result<String, PersistError> {
     encode_with_users(store, &Users::default())
 }
 
-/// [`encode`] plus the router accounts.
+/// [`encode`] plus the router accounts (whole history, no size bound).
 pub fn encode_with_users(store: &ConfigStore, users: &Users) -> Result<String, PersistError> {
+    encode_from(store, users, 0)
+}
+
+/// The file of `store` and `users` in at most `budget` bytes, and how many
+/// of the oldest revisions were left out to fit. Compact JSON; the newest
+/// revision (the running config) is always kept, and when even that does
+/// not fit the result is [`PersistError::TooLarge`] (nothing to write).
+pub fn encode_bounded(
+    store: &ConfigStore,
+    users: &Users,
+    budget: usize,
+) -> Result<(String, usize), PersistError> {
+    let text = encode_from(store, users, 0)?;
+    if text.len() <= budget {
+        return Ok((text, 0));
+    }
+    // Too big: keep the newest revisions that fit next to the rest. The
+    // sizes are measured, so the result is exact.
+    let history = store.history();
+    let rest = text.len().saturating_sub(
+        history
+            .iter()
+            .map(|r| encoded_len(&r.config).saturating_add(r.comment.len()))
+            .sum::<usize>(),
+    );
+    let mut used = rest;
+    let mut keep = 0usize;
+    for r in history.iter().rev() {
+        let size = encoded_len(&r.config)
+            .saturating_add(r.comment.len())
+            .saturating_add(64);
+        if keep > 0 && used.saturating_add(size) > budget {
+            break;
+        }
+        used = used.saturating_add(size);
+        keep += 1;
+    }
+    let mut skip = history.len().saturating_sub(keep);
+    loop {
+        let text = encode_from(store, users, skip)?;
+        if text.len() <= budget {
+            return Ok((text, skip));
+        }
+        // The estimate was short (escaped comments): one more out.
+        if skip.saturating_add(1) >= history.len() {
+            return Err(PersistError::TooLarge(text.len()));
+        }
+        skip += 1;
+    }
+}
+
+/// Bytes of `cfg` as compact JSON, counted without building the text.
+pub fn encoded_len(cfg: &Config) -> usize {
+    struct Count(usize);
+    impl std::io::Write for Count {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.saturating_add(buf.len());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut n = Count(0);
+    // Plain serde data: it cannot fail; a failure counts as "too big".
+    match serde_json::to_writer(&mut n, cfg) {
+        Ok(()) => n.0,
+        Err(_) => usize::MAX,
+    }
+}
+
+fn encode_from(store: &ConfigStore, users: &Users, skip: usize) -> Result<String, PersistError> {
     let file = FileOut {
         format_version: FORMAT_VERSION,
         revision: store.current_revision(),
@@ -94,6 +177,7 @@ pub fn encode_with_users(store: &ConfigStore, users: &Users) -> Result<String, P
         history: store
             .history()
             .iter()
+            .skip(skip)
             .map(|r| RevisionOut {
                 number: r.number,
                 comment: &r.comment,
@@ -103,8 +187,10 @@ pub fn encode_with_users(store: &ConfigStore, users: &Users) -> Result<String, P
             .collect(),
         users,
     };
+    // Compact: 21% smaller than pretty-printed (**medido**: 4000
+    // address-list entries, 1.16 MB against 1.47 MB a copy).
     let mut out =
-        serde_json::to_string_pretty(&file).map_err(|e| PersistError::Malformed(e.to_string()))?;
+        serde_json::to_string(&file).map_err(|e| PersistError::Malformed(e.to_string()))?;
     out.push('\n');
     Ok(out)
 }
@@ -168,7 +254,134 @@ pub fn decode_with_users(text: &str) -> Result<(ConfigStore, Users), PersistErro
         ));
     }
     file.users.check().map_err(PersistError::Inconsistent)?;
-    Ok((ConfigStore::restore(file.running, history), file.users))
+    // A hand-edited or restored file may have counters behind its items:
+    // the next `add` would reuse an id. Repaired the same way in both
+    // copies, so they stay equal.
+    let running = repair_ids(file.running);
+    if let Some(newest) = history.last_mut() {
+        newest.config = running.clone();
+    }
+    Ok((ConfigStore::restore(running, history), file.users))
+}
+
+/// `cfg` with every `next_*` id counter at least the largest id it hands
+/// out, and duplicate ids inside one list renumbered (they would collapse
+/// into one entry in `config.diff`). A counter `next_<word>_id` covers the
+/// lists named after `<word>` (`next_route_id` → `routes`); `next_id`
+/// covers the other lists of the same object. Unchanged when consistent.
+pub fn repair_ids(cfg: Config) -> Config {
+    let Ok(mut v) = serde_json::to_value(&cfg) else {
+        return cfg;
+    };
+    if !repair_value(&mut v, 0) {
+        return cfg;
+    }
+    serde_json::from_value(v).unwrap_or(cfg)
+}
+
+fn item_id(item: &serde_json::Value) -> Option<u32> {
+    let hex = item.get("id")?.as_str()?.strip_prefix('*')?;
+    u32::from_str_radix(hex, 16).ok()
+}
+
+/// Repair one object and what it holds; `true` when anything changed.
+fn repair_value(v: &mut serde_json::Value, depth: usize) -> bool {
+    use serde_json::Value;
+    // Config nesting is shallow; a bound keeps hostile input harmless.
+    if depth > 32 {
+        return false;
+    }
+    let mut changed = false;
+    match v {
+        Value::Array(items) => {
+            for item in items {
+                changed |= repair_value(item, depth + 1);
+            }
+        }
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                changed |= repair_value(child, depth + 1);
+            }
+            let counters: Vec<String> = map
+                .keys()
+                .filter(|k| k.starts_with("next_") && k.ends_with("id"))
+                .cloned()
+                .collect();
+            let lists: Vec<String> = map
+                .iter()
+                .filter(|(_, x)| x.as_array().is_some_and(|a| a.iter().any(|i| item_id(i).is_some())))
+                .map(|(k, _)| k.clone())
+                .collect();
+            let word = |c: &str| -> Option<String> {
+                c.strip_prefix("next_")
+                    .and_then(|w| w.strip_suffix("_id"))
+                    .map(str::to_owned)
+            };
+            // Words that name a list here (`route` → `routes`), empty or not.
+            let named: Vec<String> = counters
+                .iter()
+                .filter_map(|c| word(c))
+                .filter(|w| {
+                    map.iter()
+                        .any(|(k, x)| x.is_array() && k.starts_with(w.as_str()))
+                })
+                .collect();
+            for c in &counters {
+                let mine: Vec<&String> = match word(c).filter(|w| named.contains(w)) {
+                    Some(w) => lists.iter().filter(|l| l.starts_with(w.as_str())).collect(),
+                    // `next_id`, or a counter shared by lists of other
+                    // names (`next_rule_id` → filter, nat, mangle).
+                    None => lists
+                        .iter()
+                        .filter(|l| !named.iter().any(|w| l.starts_with(w.as_str())))
+                        .collect(),
+                };
+                if mine.is_empty() {
+                    continue;
+                }
+                let Some(mut next) = map.get(c).and_then(Value::as_u64) else {
+                    continue;
+                };
+                let max = mine
+                    .iter()
+                    .filter_map(|l| map.get(l.as_str()).and_then(Value::as_array))
+                    .flatten()
+                    .filter_map(item_id)
+                    .max()
+                    .map_or(0, u64::from);
+                if max > next {
+                    next = max;
+                    changed = true;
+                }
+                for l in &mine {
+                    let Some(Value::Array(items)) = map.get_mut(l.as_str()) else {
+                        continue;
+                    };
+                    let mut seen = std::collections::HashSet::new();
+                    for item in items.iter_mut() {
+                        let Some(id) = item_id(item) else {
+                            continue;
+                        };
+                        if seen.insert(id) {
+                            continue;
+                        }
+                        let Some(fresh) = next.checked_add(1).filter(|n| *n <= u64::from(u32::MAX))
+                        else {
+                            continue;
+                        };
+                        next = fresh;
+                        if let Some(o) = item.as_object_mut() {
+                            o.insert("id".into(), Value::String(format!("*{fresh:X}")));
+                            changed = true;
+                        }
+                    }
+                }
+                map.insert(c.clone(), Value::from(next));
+            }
+        }
+        _ => {}
+    }
+    changed
 }
 
 fn malformed(e: serde_json::Error) -> PersistError {
@@ -299,6 +512,78 @@ mod tests {
             decode(&big).err(),
             Some(PersistError::TooLarge(MAX_FILE_BYTES + 1))
         );
+    }
+
+    /// A store with `n` more revisions, each a config of `rules` rules.
+    fn big(n: usize, rules: u32) -> ConfigStore {
+        use crate::firewall::FirewallRule;
+        let mut st = ConfigStore::default();
+        for i in 0..rules {
+            let mut r: FirewallRule =
+                serde_json::from_value(serde_json::json!({"id": "*1", "chain": "forward", "action": {"type": "accept"}}))
+                    .unwrap();
+            r.id = crate::ItemId(i + 1);
+            r.comment = "c".repeat(100);
+            st.candidate_mut().ip.firewall.filter.push(r);
+        }
+        st.candidate_mut().ip.firewall.next_rule_id = rules;
+        for i in 0..n {
+            st.candidate_mut().system.identity = format!("r{i}");
+            st.commit("", None).unwrap();
+        }
+        st
+    }
+
+    #[test]
+    fn bounded_encoding_leaves_the_oldest_revisions_out() {
+        let st = big(10, 50);
+        let (full, skipped) = encode_bounded(&st, &Users::default(), usize::MAX).unwrap();
+        assert_eq!(skipped, 0);
+        assert!(!full.contains("\n "), "compact JSON");
+        let one = encoded_len(st.running());
+        let budget = one * 4;
+        let (text, skipped) = encode_bounded(&st, &Users::default(), budget).unwrap();
+        assert!(text.len() <= budget, "{} > {budget}", text.len());
+        assert!(skipped >= 8, "{skipped}");
+        let back = decode(&text).unwrap();
+        assert_eq!(back.running(), st.running());
+        assert_eq!(back.current_revision(), 10);
+        assert_eq!(back.history().len(), st.history().len() - skipped);
+        // Not even the running config fits: nothing to write.
+        assert!(matches!(
+            encode_bounded(&st, &Users::default(), one),
+            Err(PersistError::TooLarge(_))
+        ));
+    }
+
+    #[test]
+    fn encoded_len_is_exact() {
+        let st = big(0, 7);
+        assert_eq!(
+            encoded_len(st.running()),
+            serde_json::to_string(st.running()).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn counters_behind_their_items_are_repaired() {
+        let mut st = big(1, 3);
+        let mut cfg = st.running().clone();
+        cfg.ip.firewall.next_rule_id = 1;
+        cfg.ip.firewall.filter[2].id = crate::ItemId(2); // *1 *2 *2
+        let fixed = repair_ids(cfg);
+        let ids: Vec<u32> = fixed.ip.firewall.filter.iter().map(|r| r.id.0).collect();
+        assert_eq!(ids, [1, 2, 3]);
+        assert_eq!(fixed.ip.firewall.next_rule_id, 3);
+        // A consistent config is left as it is.
+        let same = st.running().clone();
+        assert_eq!(crate::store::diff_configs(&same, &repair_ids(same.clone())), []);
+        // Through decode: the next id handed out is a new one.
+        let mut v: serde_json::Value = serde_json::from_str(&encode(&st).unwrap()).unwrap();
+        v["running"]["ip"]["firewall"]["next_rule_id"] = 0.into();
+        v["history"][1]["config"]["ip"]["firewall"]["next_rule_id"] = 0.into();
+        st = decode(&v.to_string()).unwrap();
+        assert_eq!(st.running().ip.firewall.next_rule_id, 3);
     }
 
     #[test]

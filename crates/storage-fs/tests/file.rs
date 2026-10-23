@@ -71,7 +71,7 @@ fn reboot_restores_running_and_history() {
     assert_eq!(s.storage_status().loaded_from, Some("current"));
     assert!(s.storage_status().backend.starts_with("file "));
     let text = fs::read_to_string(dir.0.join(CURRENT)).unwrap();
-    assert!(text.contains("\"format_version\": 1"));
+    assert!(text.contains("\"format_version\":1"));
 }
 
 #[test]
@@ -154,7 +154,7 @@ fn corrupt_current_is_quarantined_and_previous_loaded() {
     // Next commit: the good previous slot is kept, not overwritten.
     add(&mut s, "10.0.2.1/24");
     let prev = fs::read_to_string(dir.0.join(PREVIOUS)).unwrap();
-    assert!(prev.contains("\"revision\": 1"));
+    assert!(prev.contains("\"revision\":1"));
     drop(s);
     assert_eq!(addresses(&boot(&dir)), ["10.0.0.1/24", "10.0.2.1/24"]);
 }
@@ -255,4 +255,43 @@ fn journals_append_and_compact() {
             .mode();
         assert_eq!(mode & 0o777, 0o600);
     }
+}
+
+/// Audit #16: a second quarantine of the same slot overwrote the first
+/// forensic copy.
+#[test]
+fn every_quarantine_keeps_its_own_copy() {
+    let dir = TempDir::new();
+    let mut s = FileStorage::open(&dir.0).unwrap();
+    for junk in ["first", "second", "third"] {
+        fs::write(dir.0.join(CURRENT), junk).unwrap();
+        s.quarantine(Slot::Current).unwrap();
+    }
+    let first = dir.0.join(format!("{CURRENT}{CORRUPT_SUFFIX}"));
+    assert_eq!(fs::read_to_string(first).unwrap(), "first");
+    let mut kept: Vec<String> = fs::read_dir(&dir.0)
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect();
+    kept.sort();
+    assert_eq!(kept, ["first", "second", "third"]);
+}
+
+/// Audit #16: temp files of state and journal saves interrupted by a crash
+/// were never removed (only the config's was).
+#[test]
+fn stale_temp_files_of_state_and_journals_are_removed_on_open() {
+    let dir = TempDir::new();
+    fs::create_dir_all(&dir.0).unwrap();
+    for f in [
+        "state-dhcp-leases.json.tmp",
+        "journal-dhcp-leases.log.tmp",
+        "state-dhcp-leases.json",
+    ] {
+        fs::write(dir.0.join(f), "x").unwrap();
+    }
+    FileStorage::open(&dir.0).unwrap();
+    assert!(!dir.0.join("state-dhcp-leases.json.tmp").exists());
+    assert!(!dir.0.join("journal-dhcp-leases.log.tmp").exists());
+    assert!(dir.0.join("state-dhcp-leases.json").exists());
 }

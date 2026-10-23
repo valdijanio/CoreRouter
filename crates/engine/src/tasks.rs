@@ -205,6 +205,8 @@ struct Entry {
     kind: &'static str,
     title: String,
     owner: String,
+    /// Who started it: only they (or group write and up) poll or stop it.
+    principal: crate::auth::Principal,
     /// Who started it, as the log shows it (G4.6d).
     origin: String,
     /// Its end is in the log already.
@@ -415,6 +417,7 @@ impl Session {
                 kind,
                 title: title.clone(),
                 owner: self.caller().name.clone(),
+                principal: self.caller().principal.clone(),
                 origin: crate::logging::origin(self.caller()),
                 logged_end: false,
                 started: now,
@@ -499,7 +502,25 @@ impl Session {
         )
     }
 
+    /// Task `id`, if the caller may drive it: its owner, or group write
+    /// and up. A read-only account could otherwise stop anyone's MTR, or
+    /// keep an abandoned task alive by polling it (audit #12).
     fn task(&mut self, id: u64) -> Result<&mut Entry> {
+        let mine = self
+            .tasks
+            .entries
+            .get(&id)
+            .map(|e| e.principal == self.caller().principal);
+        let writer = self.permit(crate::auth::Group::Write).is_ok();
+        if mine == Some(false) && !writer {
+            return Err(EngineError::Denied {
+                id: "tool.task".into(),
+                reason: format!(
+                    "task {id} is not yours (started by another account); \
+                     group write may stop or poll any task"
+                ),
+            });
+        }
         self.tasks.entries.get_mut(&id).ok_or_else(|| {
             EngineError::bad(
                 "id",
@@ -753,6 +774,38 @@ mod tests {
         s.tick(1_000 + 2 * ABANDON_SECS + KEEP_SECS);
         assert!(s.task_list().as_array().unwrap().is_empty());
         assert!(s.task_poll(id, 0, 1).is_err());
+    }
+
+    /// Audit #12: stop and poll were plain queries with no owner check.
+    #[test]
+    fn only_the_owner_or_a_writer_stops_or_polls_a_task() {
+        use crate::{Caller, Principal};
+        let mut s = session();
+        for (name, group) in [("op", "write"), ("noc", "read")] {
+            s.execute(
+                "user.add",
+                &json!({"name": name, "group": group, "password": "s3cret-Passw0rd"}),
+            )
+            .unwrap();
+        }
+        let id = s
+            .start_task("test", "forever".into(), |ctx| {
+                while ctx.sleep(Duration::from_secs(3600)) {}
+                Ok(())
+            })
+            .unwrap();
+        let noc = Caller::new(5, "tcp 10.0.0.9:1").with_principal(Principal::User("noc".into()));
+        let op = Caller::new(6, "tcp 10.0.0.8:1").with_principal(Principal::User("op".into()));
+        for cmd in ["tool.task.stop", "tool.task.poll"] {
+            let err = s.execute_as(&noc, cmd, &json!({"id": id})).unwrap_err();
+            assert!(err.to_string().contains("not yours"), "{cmd}: {err}");
+        }
+        assert_eq!(s.task_list()[0]["state"], "running");
+        s.execute_as(&op, "tool.task.poll", &json!({"id": id}))
+            .unwrap();
+        s.execute_as(&op, "tool.task.stop", &json!({"id": id}))
+            .unwrap();
+        assert_eq!(wait_done(&mut s, id)["state"], "stopped");
     }
 
     #[test]

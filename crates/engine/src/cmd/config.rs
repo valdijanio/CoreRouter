@@ -113,7 +113,27 @@ fn history(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 fn diff(s: &mut Session, _: &Value) -> Result<Value> {
-    serde_json::to_value(s.store().diff()).map_err(|e| EngineError::Internal(e.to_string()))
+    let mut lines =
+        serde_json::to_value(s.store().diff()).map_err(|e| EngineError::Internal(e.to_string()))?;
+    // Below group full a changed secret shows as changed, not its value.
+    if s.permit(crate::auth::Group::Full).is_err()
+        && let Some(lines) = lines.as_array_mut()
+    {
+        for line in lines {
+            let secret = line
+                .get("path")
+                .and_then(Value::as_str)
+                .is_some_and(crate::auth::is_secret_path);
+            if let (true, Some(o)) = (secret, line.as_object_mut()) {
+                for k in ["value", "from", "to"] {
+                    if let Some(v) = o.get_mut(k) {
+                        *v = json!("***");
+                    }
+                }
+            }
+        }
+    }
+    Ok(lines)
 }
 
 // A query (no journal, no auto-commit): it changes the session, not the config.

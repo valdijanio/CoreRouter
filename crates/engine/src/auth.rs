@@ -29,8 +29,25 @@ pub use corerouter_model::{Group, User, Users};
 pub const MIN_PASSWORD: usize = 8;
 /// Longest accepted password (bounds the hashing work per request).
 pub const MAX_PASSWORD: usize = 256;
-/// Parameter names whose values never reach the journal.
-pub const SECRET_KEYS: &[&str] = &["password", "old_password", "new_password", "token"];
+/// Parameter and config field names whose values never reach the journal
+/// or the log, and that only group `full` reads back (TSIG `secret`, and
+/// the keys of features to come: `psk`, `private_key`, `passphrase`).
+pub const SECRET_KEYS: &[&str] = &[
+    "password",
+    "old_password",
+    "new_password",
+    "token",
+    "secret",
+    "psk",
+    "private_key",
+    "passphrase",
+];
+
+/// A `config.diff` path that ends in a secret field (`ip.dns_tsig.keys[*1].secret`).
+pub fn is_secret_path(path: &str) -> bool {
+    let last = path.rsplit('.').next().unwrap_or(path);
+    SECRET_KEYS.contains(&last)
+}
 
 /// Who sends a command.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]

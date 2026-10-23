@@ -7,7 +7,7 @@
 //! | `running.json` | [`Slot::Current`] |
 //! | `running.json.prev` | [`Slot::Previous`] |
 //! | `running.json.tmp` | write in progress (removed on open) |
-//! | `*.corrupt` | quarantined unreadable slot |
+//! | `*.corrupt`, `*.corrupt.<n>` | quarantined unreadable slot (each one kept) |
 //! | `state-<name>.json` | operational state outside the revisions (DHCP client leases) |
 //! | `journal-<name>.log` | append-only journal (the DHCP server's leases, G4.2a) |
 //!
@@ -52,6 +52,21 @@ impl FileStorage {
             Ok(()) => log::warn!("removed {TEMP} left by an interrupted save"),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(e),
+        }
+        // The same for state and journal rewrites (`state-x.json.tmp`,
+        // `journal-x.log.tmp`): never renamed into place, so partial.
+        for entry in fs::read_dir(&me.dir)? {
+            let Ok(entry) = entry else { continue };
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let stale = (name.starts_with("state-") || name.starts_with("journal-"))
+                && name.ends_with(".tmp");
+            if stale {
+                match fs::remove_file(entry.path()) {
+                    Ok(()) => log::warn!("removed {name} left by an interrupted save"),
+                    Err(e) => log::warn!("cannot remove {name}: {e}"),
+                }
+            }
         }
         Ok(me)
     }
@@ -160,7 +175,13 @@ impl ConfigStorage for FileStorage {
 
     fn quarantine(&mut self, slot: Slot) -> Result<(), StorageError> {
         let file = Self::slot_file(slot);
-        let bad = format!("{file}{CORRUPT_SUFFIX}");
+        // Never over an earlier copy: each one is evidence.
+        let mut bad = format!("{file}{CORRUPT_SUFFIX}");
+        let mut n = 0u32;
+        while self.path(&bad).exists() && n < 1000 {
+            n += 1;
+            bad = format!("{file}{CORRUPT_SUFFIX}.{n}");
+        }
         match fs::rename(self.path(file), self.path(&bad)) {
             Ok(()) => {
                 log::warn!("moved unreadable {file} to {bad}");
