@@ -623,6 +623,11 @@ impl Hal for VirtualHal {
         Ok(Arc::clone(&self.prober))
     }
 
+    /// Simulated traffic on any lab port (`capture::SimCapture`).
+    fn packet_capture(&self) -> Result<crate::capture::SharedCapture, String> {
+        Ok(Arc::new(crate::capture::SimCapture))
+    }
+
     /// Lab ports negotiate their top speed, full duplex, with an equal
     /// partner; each has a few link downs from "before" plus one per
     /// re-enable. What `interface.ethernet.set` applied shows here: forced

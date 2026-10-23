@@ -30,6 +30,8 @@ mod menu_en;
 mod menu_pt;
 mod pt;
 mod routes_pt;
+mod torch_en;
+mod torch_pt;
 mod tuning_en;
 mod tuning_pt;
 
@@ -76,6 +78,7 @@ impl Lang {
                 connections_pt::LABELS,
                 dns_lookup_pt::LABELS,
                 list_pt::LABELS,
+                torch_pt::LABELS,
             ],
         }
     }
@@ -83,8 +86,8 @@ impl Lang {
     /// Explanations: (key, Markdown), sorted by key.
     fn help(self) -> &'static [Table] {
         match self {
-            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP],
-            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP],
+            Lang::En => &[en::HELP, tuning_en::HELP, menu_en::HELP, connections_en::HELP, torch_en::HELP],
+            Lang::Pt => &[pt::HELP, tuning_pt::HELP, menu_pt::HELP, connections_pt::HELP, torch_pt::HELP],
         }
     }
 

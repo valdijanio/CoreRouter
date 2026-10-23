@@ -70,6 +70,8 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.routes", "## O que faz\nA tabela de rotas: rotas estáticas (inclusive a rota padrão 0.0.0.0/0), conectadas e aprendidas, qual está ativa e em qual VRF."),
     ("menu.services", "## O que faz\nOs serviços do próprio roteador (DNS, DHCP, métricas…) como o supervisor os vê: rodando, parado ou com falha, reinícios e o último erro. Inicie, pare e reinicie por aqui."),
     ("menu.settings", "## O que faz\nPreferências desta GUI, não do roteador: o idioma dos rótulos e das explicações. Guardadas neste computador."),
+    ("menu.sniffer", "## O que faz\nGrava os quadros de uma interface num arquivo pcap para abrir no Wireshark, com filtro, tamanho e duração limitados; baixe o arquivo pela GUI. Por padrão só os cabeçalhos (os dados são dos assinantes)."),
+    ("menu.torch", "## O que faz\nO tráfego de uma interface ao vivo, por fluxo: quem fala com quem, quanto em cada sentido, agrupado por origem, destino, protocolo, porta, VLAN, DSCP ou MAC, com o AS do destino. Acima de ~500 kpps amostra 1:N e avisa."),
     ("menu.tuning", "## O que faz\nAjustes de kernel e hardware para roteamento: buffers de rede, conntrack, governor da CPU, IRQ e RPS/XPS por interface e os parâmetros de boot — com valores recomendados e o porquê."),
     ("menu.vrf", "## O que faz\nVRFs: tabelas de rotas separadas no mesmo roteador, para manter clientes ou gerência isolados."),
 ];

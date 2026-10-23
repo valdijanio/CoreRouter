@@ -5,6 +5,7 @@
 //! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
 //! Windows, macOS and iOS, without root.
 
+pub mod capture;
 pub mod conntrack;
 pub mod dhcp;
 pub mod dhcp_server;
@@ -199,6 +200,12 @@ pub trait Hal: Send {
     /// is none. Cheap: backends build it once and hand out clones.
     fn prober(&self) -> Result<SharedProber, String> {
         Err(format!("{} cannot send probes", self.describe()))
+    }
+
+    /// Packet capture for Torch and the sniffer (G6.4a), shared with task
+    /// threads; `Err(why)` when this backend has none.
+    fn packet_capture(&self) -> Result<capture::SharedCapture, String> {
+        Err(format!("{} cannot capture packets", self.describe()))
     }
 
     /// Live Ethernet state of `name` (G1.19). Fields the driver does not

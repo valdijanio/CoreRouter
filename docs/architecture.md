@@ -549,6 +549,16 @@ monotônico e `sleep`) do job; o RTT é medido pelo socket. Os jobs (`engine/src
 lógica pura sobre `ProbeSocket` + `TaskCtx` e são testados com a rede simulada e um relógio
 falso (sem esperar de verdade). Detalhes, limites e a rede simulada: `docs/tools.md`.
 
+**Captura (G6.4a, Torch e Sniffer):** `Hal::packet_capture()` → `PacketCapture` (L1) → um
+`CaptureSocket` que enche um `FrameBatch`; o decodificador de cabeçalhos e o pcap são puros no
+`hal`, a agregação no engine (`tools/torch.rs`). Decisão, com números (**medido**,
+`docs/tools.md` §4.4): **Rust puro** com `AF_PACKET` + filtro BPF clássico, em vez de orquestrar
+`tcpdump`/libpcap — tira um processo externo e o parsing de texto, dá dados estruturados por
+quadro e a amostragem 1:N no kernel (o que mantém a CPU sob controle acima de 500 kpps: 1:64
+cobre 12,8 Mpps a 35 % de um núcleo). Fica de fora por ora o `TPACKET_V3` (anel em `mmap`, exige
+`unsafe`): sem amostrar, `recvmsg` lê ~2 Mpps por thread, e o caminho mais rápido de verdade é
+contar fluxos num mapa XDP (G2.5) atrás do mesmo trait, sem copiar quadros.
+
 ### DNS (G4.1)
 
 **Decisão do usuário (2026-10-22):** o DNS inteiro é **Hickory DNS, em Rust puro**, embutido no
