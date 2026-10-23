@@ -51,9 +51,10 @@ Layout da imagem:
    pré-compilado com hash das fontes em vez de compilar no build normal (o workspace continua
    estável, sem nightly nem `bpf-linker`); mapas com chaves e valores de inteiros/arrays (o
    loader não precisa de `unsafe impl Pod`); links por processo (daemon morto = fail-open).
-   Números medidos no CI (ns/pacote por tamanho da LPM, pktgen em veth contra a tabela raw do
-   nftables) no `docs/perf.md`; native numa placa real fica com o usuário (roteiro no
-   `docs/xdp.md`).
+   Medido no CI: a LPM custa ~17 ns por pacote, plana até um milhão de prefixos; em veth o XDP
+   (402–409 kpps) **não** ganha do nftables raw (471 kpps), porque o veth já entrega um `skb`. A
+   razão de ser do XDP (não alocar o `skb`) só aparece no modo native de uma placa real: a medida
+   que confirma ou derruba esta decisão é o roteiro do `docs/xdp.md`, no hardware do usuário.
 3. **DPDK/VPP:** não entra no caminho crítico. Se um cliente precisar de >100 Gbit/s de CGNAT
    por caixa, vira um terceiro backend do mesmo trait (VPP pela API binária).
 

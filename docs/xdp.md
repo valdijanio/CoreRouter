@@ -193,11 +193,14 @@ média por execução; inclui o custo fixo do próprio test run, que não existe
 
 | prefixos na LPM | carga dos prefixos | passa (origem fora da lista) | descartado (bloqueado) | passa com limite de taxa ligado |
 |---:|---:|---:|---:|---:|
-| 0 | 212 ms | 158 ns | — | 223 ns |
-| 1 000 | 193 ms | 175 ns | 289 ns | 237 ns |
-| 10 000 | 210 ms | 177 ns | 312 ns | 242 ns |
-| 100 000 | 414 ms | 179 ns | 331 ns | 237 ns |
-| 1 000 000 | 2 551 ms | 173 ns | 342 ns | 238 ns |
+| 0 | 208 ms | 159 ns | — | 216 ns |
+| 1 000 | 202 ms | 176 ns | 285 ns | 234 ns |
+| 10 000 | 215 ms | 175 ns | 322 ns | 233 ns |
+| 100 000 | 441 ms | 170 ns | 339 ns | 229 ns |
+| 1 000 000 | 2 682 ms | 173 ns | 347 ns | 231 ns |
+
+(Outra rodada no mesmo dia deu 123–131 ns no passe: o runner varia ~25%; as diferenças entre
+colunas se mantêm.)
 
 Leitura:
 
@@ -211,10 +214,23 @@ Leitura:
 - O host faz a mesma decisão sem mapas em 13–18 ns (`benches/filter.rs`, AMD Ryzen AI Max+ 395,
   release): o resto é busca em mapa e o custo fixo do test run.
 
-O remetente em veth (sem filtro × nftables raw × XDP generic/native) está na seção `## perf` do
-`docs/changes/G2.5a.md`. O pktgen do kernel ficou fora do CI: mesmo com `reset` antes de apagar a
-interface, ele travou a VM do runner duas vezes (sem log); a medida usa um remetente AF_PACKET em
-userspace.
+Remetente AF_PACKET em userspace num par veth, 2 s por caso, quadros UDP de 64 bytes de origens
+aleatórias em 198.18.0.0/15 (o remetente e a recepção dividem um núcleo):
+
+| caso | enviados (kpps) | tratados pelo filtro |
+|---|---:|---|
+| sem filtro (a pilha do kernel descarta) | 450 | 900 101 pacotes recebidos |
+| nftables `raw` prerouting, `ip saddr 198.18.0.0/15 drop` | 471 | 941 056 no contador da regra |
+| XDP generic, lista de bloqueio | 402 | 803 840 bloqueados |
+| XDP native (veth), lista de bloqueio | 409 | 817 152 bloqueados |
+
+**Em veth o XDP não ganha do nftables raw** (~14% mais lento aqui). O veth já entrega ao receptor
+um `skb` pronto; o XDP generic ainda copia o quadro para ter o headroom que o XDP exige, e o
+"native" do veth converte o `skb`. O ganho do XDP é **não alocar o `skb`**, e isso só acontece no
+driver de uma placa real (artigo do XDP: 24 Mpps por núcleo de XDP_DROP contra 4,8 Mpps da tabela
+raw do iptables numa ConnectX-5). Por isso a comparação que decide é a do roteiro abaixo, numa
+placa em modo native. O pktgen do kernel ficou fora do CI: mesmo com `reset` antes de apagar a
+interface, ele travou a VM do runner duas vezes (sem log).
 
 O que só uma **placa real em modo native** mede, e que veth, modo generic e `BPF_PROG_TEST_RUN`
 não mostram: a taxa de descarte no driver antes da alocação do `skb` (o ganho grande do XDP),

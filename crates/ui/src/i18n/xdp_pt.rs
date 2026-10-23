@@ -8,7 +8,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
         r##"## O que é
 Um filtro que roda **dentro do driver da placa de rede** (XDP, eXpress Data Path), antes de o kernel gastar qualquer coisa com o pacote: antes do `raw`, do connection tracking e do roteamento. Descarta o que um ataque manda em volume: origens em listas de bloqueio, origens acima de uma taxa, cabeçalhos quebrados e combinações de flags TCP que nenhuma conexão usa.
 ## Por que
-Uma placa em modo nativo descarta dezenas de milhões de pacotes por segundo com poucas CPUs (artigo do XDP, CoNEXT 2018: 24 Mpps por núcleo numa ConnectX-5; **estimado** para o seu hardware até medir). O mesmo descarte numa regra `raw` do nftables custa várias vezes mais por pacote.
+Uma placa em modo nativo descarta dezenas de milhões de pacotes por segundo com poucas CPUs (artigo do XDP, CoNEXT 2018: 24 Mpps por núcleo numa ConnectX-5; **estimado** para o seu hardware até medir). No mesmo artigo, a tabela raw do iptables descartava 4,8 Mpps por núcleo. O ganho vem de não alocar o pacote no kernel, e só aparece no modo native de uma placa real: num par veth, sem placa, o XDP não ganhou do nftables (**medido**, docs/xdp.md).
 ## Equivalente no RouterOS
 Não existe XDP no RouterOS. O mais próximo é `/ip firewall raw add chain=prerouting src-address-list=… action=drop` com `dst-limit=…,src-address` para a taxa.
 ## Cuidado

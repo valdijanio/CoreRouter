@@ -7,7 +7,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
         r##"## What it is
 A filter that runs **inside the NIC driver** (XDP, eXpress Data Path), before the kernel spends anything on the packet: before `raw`, connection tracking and routing. It drops what an attack sends in volume: sources in block lists, sources over a rate, broken headers and TCP flag combinations no connection uses.
 ## Why
-A NIC in native mode drops tens of millions of packets per second on a few CPUs (XDP paper, CoNEXT 2018: 24 Mpps per core on a ConnectX-5; **estimated** for your hardware until measured). The same drop in an nftables `raw` rule costs several times more per packet.
+A NIC in native mode drops tens of millions of packets per second on a few CPUs (XDP paper, CoNEXT 2018: 24 Mpps per core on a ConnectX-5; **estimated** for your hardware until measured). In the same paper, the iptables raw table dropped 4.8 Mpps per core. The gain comes from not allocating the packet in the kernel, and shows only in native mode on a real NIC: on a veth pair, without a NIC, XDP did not beat nftables (**measured**, docs/xdp.md).
 ## RouterOS equivalent
 RouterOS has no XDP. The closest is `/ip firewall raw add chain=prerouting src-address-list=… action=drop`, with `dst-limit=…,src-address` for the rate.
 ## Careful
