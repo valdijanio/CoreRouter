@@ -70,6 +70,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.routes", "## O que faz\nA tabela de rotas: rotas estáticas (inclusive a rota padrão 0.0.0.0/0), conectadas e aprendidas, qual está ativa e em qual VRF."),
     ("menu.services", "## O que faz\nOs serviços do próprio roteador (DNS, DHCP, métricas…) como o supervisor os vê: rodando, parado ou com falha, reinícios e o último erro. Inicie, pare e reinicie por aqui."),
     ("menu.settings", "## O que faz\nPreferências desta GUI, não do roteador: o idioma dos rótulos e das explicações. Guardadas neste computador."),
+    ("menu.traffic-flow", "## O que faz\nExporta um registro de cada conexão para coletores de fluxo, em IPFIX ou NetFlow v9, com endereços e portas antes e depois do NAT e os eventos de NAT da RFC 8158: o registro de conexão que o provedor guarda (Marco Civil). Mostra também os maiores consumidores sem coletor."),
     ("menu.tuning", "## O que faz\nAjustes de kernel e hardware para roteamento: buffers de rede, conntrack, governor da CPU, IRQ e RPS/XPS por interface e os parâmetros de boot — com valores recomendados e o porquê."),
     ("menu.vrf", "## O que faz\nVRFs: tabelas de rotas separadas no mesmo roteador, para manter clientes ou gerência isolados."),
 ];

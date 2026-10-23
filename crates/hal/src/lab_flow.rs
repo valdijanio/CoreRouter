@@ -33,12 +33,17 @@ impl Lab {
         self.step += 1;
         let step = self.step;
         for (i, c) in self.conns.iter_mut().enumerate() {
+            // An eighth of the connections move each step (about 20 steps
+            // a second): a few Mbit/s per heavy subscriber, like a stream.
+            if (i as u64 + step) % 8 != 0 {
+                continue;
+            }
             let h = mix(step ^ (i as u64).wrapping_mul(0x9e37));
             // Most connections trickle; one in 16 is a heavy download.
             let (up, down) = if i % 16 == 0 {
-                (h % 4, 40 + h % 40)
+                (h % 3, 4 + h % 8)
             } else {
-                (h % 2, h % 3)
+                (h % 2, h % 2)
             };
             c.orig_packets += up;
             c.orig_bytes += up * (60 + h % 400);
