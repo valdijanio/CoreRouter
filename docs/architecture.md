@@ -681,6 +681,31 @@ também o roda), o engine guarda o estado e aplica os efeitos, o daemon só o di
 - O engine (`tuning.rs`) calcula perfis, faixas e diagnóstico, puro e testado sem kernel.
 - Medida de pps em netns: `docs/tuning.md`.
 
+### Menu lateral e ícones (G0.23)
+
+O menu é uma árvore (grupo › subgrupo › janela) montada de uma **tabela central**,
+`crates/ui/src/menu.rs` (`CATALOG`, indexada pela chave da janela): subgrupo, rótulo curto,
+ícone, caminho no RouterOS, comandos e sinônimos de busca. Os painéis continuam declarando só o
+grupo (`WinDef::group`); a tabela evita editar cada painel (arquivos de outras sessões) e um teste
+garante que toda janela tem entrada, ícone, explicação em EN e PT e sinônimos. Os comandos do ⓘ
+vêm do `engine.list` do roteador, filtrados pelos prefixos da tabela: a UI não mantém lista
+própria. Grupos abertos são preferência da janela (`prefs.rs`, chave `menu`).
+
+**Ícones: Phosphor Icons (MIT), fonte embutida em subconjunto, sem dependência nova.**
+
+- **Comparado:** o crate `egui-phosphor` (MIT/Apache-2.0) era o caminho óbvio, mas a 0.14 (a mais
+  nova, 2026-09) depende de egui 0.36 e o workspace está no 0.37: seriam duas versões do egui no
+  build (tempo de compilação, wasm maior) só para ler bytes e constantes. Ícones desenhados à mão
+  (como o ⓘ do G0.15) não escalam para ~50 desenhos.
+- **Como fica:** `crates/ui/assets/phosphor/Phosphor-subset.ttf` (16,0 KB, 50 ícones, **medido**;
+  a fonte completa tem 489 KB) é cortado da `Phosphor.ttf` do próprio crate `egui-phosphor`
+  0.14.0 por `scripts/icons-subset.sh` (pyftsubset), a partir dos códigos listados em
+  `crates/ui/src/icons.rs`. A fonte entra numa família própria (`FontFamily::Name("phosphor")`),
+  porque a fonte de emoji do egui usa os mesmos códigos da área privada para outros desenhos.
+  Compila em `wasm32-unknown-unknown` (é só `include_bytes!`). O teste `the_font_has_every_icon`
+  reprova ícone sem glifo. Quando o `egui-phosphor` acompanhar o egui do workspace, dá para trocar
+  o subconjunto pelo crate (macro `subset!`) sem mudar `icons.rs`.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

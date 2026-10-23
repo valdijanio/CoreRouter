@@ -288,6 +288,8 @@ pub struct CoreRouterUi {
     /// A change the router refused as a lockout, waiting for the
     /// operator's answer (G2.1b).
     lockout: Option<lockout::Held>,
+    /// The side menu's open groups and selection (G0.23).
+    menu: menu::MenuState,
 }
 
 impl CoreRouterUi {
@@ -340,6 +342,7 @@ impl CoreRouterUi {
             terminal_user: "admin".into(),
             password_ask: first_login::PasswordAsk::default(),
             lockout: None,
+            menu: menu::MenuState::default(),
         }
     }
 
@@ -808,6 +811,8 @@ impl CoreRouterUi {
     /// Draw one frame into the root `Ui`.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let now = ui.input(|i| i.time);
+        // Before any text, so the icons work from the first frame.
+        icons::install(ui.ctx());
         self.floats.begin_frame(ui.ctx());
         self.pump();
         self.expire_pending(now);
@@ -837,7 +842,7 @@ impl CoreRouterUi {
         egui::Panel::bottom("status-bar").show(ui, |ui| self.status_bar(ui));
         egui::Panel::left("menu")
             .resizable(false)
-            .exact_size(170.0)
+            .exact_size(200.0)
             .show(ui, |ui| self.menu(ui));
         let area = egui::CentralPanel::default()
             .show(ui, |ui| {
@@ -1179,51 +1184,6 @@ impl CoreRouterUi {
             None => {
                 ui.weak("ready");
             }
-        }
-    }
-
-    fn menu(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(4.0);
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if ui
-                .selectable_label(false, "New Terminal")
-                .on_hover_text("RouterOS-style terminal: /ip address print, Tab, ?, Ctrl+X")
-                .clicked()
-            {
-                self.new_terminal();
-            }
-            for (group, items) in windows::menu() {
-                match items.as_slice() {
-                    [only] if only.title() == group => self.menu_item(ui, *only),
-                    _ => {
-                        ui.collapsing(i18n::tr(self.lang.labels, group), |ui| {
-                            for w in &items {
-                                self.menu_item(ui, *w);
-                            }
-                        });
-                    }
-                }
-            }
-        });
-    }
-
-    fn menu_item(&mut self, ui: &mut egui::Ui, win: Win) {
-        let title = i18n::tr(self.lang.labels, win.title());
-        let label = if win.gap().is_some() {
-            RichText::new(title).weak()
-        } else {
-            RichText::new(title)
-        };
-        if ui
-            .selectable_label(self.open.contains(&win), label)
-            .clicked()
-        {
-            if !self.open.insert(win) {
-                // Already open: to the front, with its dialogs over it.
-                self.floats.raise(win_id(win));
-            }
-            // Some lists are only asked for while their window is open.
-            self.cache.refreshed_at = None;
         }
     }
 }
