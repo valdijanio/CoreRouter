@@ -11,7 +11,8 @@ use serde_json::{Value, json};
 const T0: u64 = 1_780_000_000;
 
 fn ok(s: &mut Session, id: &str, p: Value) -> Value {
-    s.execute(id, &p).unwrap_or_else(|e| panic!("{id} {p}: {e}"))
+    s.execute(id, &p)
+        .unwrap_or_else(|e| panic!("{id} {p}: {e}"))
 }
 
 proptest! {

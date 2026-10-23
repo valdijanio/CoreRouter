@@ -694,14 +694,25 @@ fn a_subscriber_out_of_ports_never_borrows_another_s() {
     let slot = layout_of(&p)
         .forward("100.64.0.1".parse().unwrap())
         .unwrap();
-    assert!(!seen.is_empty() && seen.len() <= 64, "{} flows through", seen.len());
+    assert!(
+        !seen.is_empty() && seen.len() <= 64,
+        "{} flows through",
+        seen.len()
+    );
     for from in &seen {
         let SocketAddr::V4(v4) = from else { panic!() };
-        assert!(slot.contains(*v4.ip(), v4.port()), "{from} outside the slot {slot:?}");
+        assert!(
+            slot.contains(*v4.ip(), v4.port()),
+            "{from} outside the slot {slot:?}"
+        );
     }
     let after = hal.connection_stats().unwrap();
-    let refused = (after.insert_failed + after.drop).saturating_sub(before.insert_failed + before.drop);
-    eprintln!("{} of 80 flows through, {refused} refused by the kernel", seen.len());
+    let refused =
+        (after.insert_failed + after.drop).saturating_sub(before.insert_failed + before.drop);
+    eprintln!(
+        "{} of 80 flows through, {refused} refused by the kernel",
+        seen.len()
+    );
     assert_eq!(seen.len(), 64, "the whole slot, no more");
     assert!(refused > 0, "the kernel counted the refused flows");
     drop(sockets);

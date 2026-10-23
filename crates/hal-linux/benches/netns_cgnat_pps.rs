@@ -63,6 +63,8 @@ mod linux {
     const ENV: &str = "COREROUTER_NETNS_BENCH";
     /// Frames per iteration.
     const BURST: u64 = 20_000;
+    /// New connections per iteration of the setup benchmark.
+    const NEW: u64 = 5_000;
     /// Subscribers, one flow each.
     const FLOWS: u8 = 255;
 
@@ -119,7 +121,8 @@ mod linux {
             let ns = Ns(child);
             let mine = std::fs::read_link("/proc/self/ns/net").unwrap();
             let deadline = Instant::now() + Duration::from_secs(5);
-            while std::fs::read_link(format!("/proc/{}/ns/net", ns.pid())).ok() == Some(mine.clone())
+            while std::fs::read_link(format!("/proc/{}/ns/net", ns.pid())).ok()
+                == Some(mine.clone())
             {
                 assert!(Instant::now() < deadline, "unshare --net did not start");
                 std::thread::sleep(Duration::from_millis(10));
@@ -180,7 +183,12 @@ mod linux {
     }
 
     /// A 64-byte Ethernet/IPv4/UDP frame.
-    fn frame(dst_mac: [u8; 6], src_mac: [u8; 6], src: (Ipv4Addr, u16), dst: (Ipv4Addr, u16)) -> Vec<u8> {
+    fn frame(
+        dst_mac: [u8; 6],
+        src_mac: [u8; 6],
+        src: (Ipv4Addr, u16),
+        dst: (Ipv4Addr, u16),
+    ) -> Vec<u8> {
         let mut f = Vec::with_capacity(64);
         f.extend_from_slice(&dst_mac);
         f.extend_from_slice(&src_mac);
@@ -215,6 +223,12 @@ mod linux {
         Route,
         Cgnat,
         CgnatFastPath,
+        /// The pool without endpoint-independent mapping (no dynamic set
+        /// updated per connection).
+        CgnatNoEim,
+        /// Conntrack without NAT (the fast path's table alone turns the
+        /// connection tracking on): the cost of a new connection itself.
+        ConntrackOnly,
     }
 
     fn config(mode: Mode) -> Config {
@@ -222,9 +236,16 @@ mod linux {
         if mode == Mode::Route {
             return c;
         }
+        if mode == Mode::ConntrackOnly {
+            c.ip.fastpath.enabled = true;
+            c.ip.fastpath.hw_offload = corerouter_model::fastpath::HwOffload::No;
+            c.ip.fastpath.interfaces = vec!["fb".parse().unwrap(), "fo".parse().unwrap()];
+            return c;
+        }
         let p: Pool = serde_json::from_value(serde_json::json!({
             "id": "*1", "name": "bench", "inside": ["100.64.0.0/24"], "outside": ["203.0.113.0/28"],
             "ports_per_subscriber": 1000,
+            "endpoint_independent_mapping": mode != Mode::CgnatNoEim,
         }))
         .unwrap();
         c.ip.cgnat.pools = vec![p];
@@ -255,7 +276,18 @@ mod linux {
             let server = Ns::new();
             ip(&["link", "set", "lo", "up"]);
             ip(&["link", "add", "fa", "type", "veth", "peer", "name", "fb"]);
-            ip(&["link", "add", "fo", "type", "veth", "peer", "name", "fp", "netns", &server.pid()]);
+            ip(&[
+                "link",
+                "add",
+                "fo",
+                "type",
+                "veth",
+                "peer",
+                "name",
+                "fp",
+                "netns",
+                &server.pid(),
+            ]);
             for d in ["fa", "fb", "fo"] {
                 ip(&["link", "set", d, "up"]);
             }
@@ -274,8 +306,20 @@ mod linux {
             let (_, fo_mac) = link("fo");
             // The answers back to the subscribers leave by fb: no ARP for them.
             for h in 1..=FLOWS {
-                let mac = fa_mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
-                ip(&["neigh", "replace", &subscriber(h).to_string(), "lladdr", &mac, "dev", "fb"]);
+                let mac = fa_mac
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect::<Vec<_>>()
+                    .join(":");
+                ip(&[
+                    "neigh",
+                    "replace",
+                    &subscriber(h).to_string(),
+                    "lladdr",
+                    &mac,
+                    "dev",
+                    "fb",
+                ]);
             }
             let (fp_mac, reply) = server.within(|| {
                 let (fp, fp_mac) = link("fp");
@@ -285,7 +329,11 @@ mod linux {
             });
             // The server's address must be resolved before a flow can be
             // offloaded (the flowtable keeps the next hop's MAC).
-            let mac = fp_mac.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(":");
+            let mac = fp_mac
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(":");
             ip(&["neigh", "replace", "192.0.2.2", "lladdr", &mac, "dev", "fo"]);
             let tx = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(0))).unwrap();
             bind(tx.as_raw_fd(), &fa).unwrap();
@@ -362,6 +410,17 @@ mod linux {
             })
         }
 
+        /// Forget the connections the setup benchmark made (untimed), so
+        /// every round starts with the slots as empty as a router's are.
+        fn forget_new(&mut self) {
+            let conns = ctnl::dump().unwrap();
+            let new: Vec<_> = conns
+                .into_iter()
+                .filter(|c| c.orig.src_port != 40000)
+                .collect();
+            let _ = ctnl::delete(&new);
+        }
+
         /// Configure `mode` and make every flow established: one packet
         /// out, its reply back (from the conntrack's reply tuple), one
         /// more out (which enters the flowtable when it is on).
@@ -374,15 +433,26 @@ mod linux {
             if mode != Mode::Route {
                 let conns = ctnl::dump().unwrap();
                 let mut replies = 0;
-                for c in conns.iter().filter(|c| c.protocol == 17 && c.orig.src_port == 40000) {
+                for c in conns
+                    .iter()
+                    .filter(|c| c.protocol == 17 && c.orig.src_port == 40000)
+                {
                     let (IpAddr::V4(src), IpAddr::V4(dst)) = (c.reply.src, c.reply.dst) else {
                         continue;
                     };
-                    let f = frame(self.fo_mac, self.fp_mac, (src, c.reply.src_port), (dst, c.reply.dst_port));
+                    let f = frame(
+                        self.fo_mac,
+                        self.fp_mac,
+                        (src, c.reply.src_port),
+                        (dst, c.reply.dst_port),
+                    );
                     let _ = send(self.reply.as_raw_fd(), &f, MsgFlags::empty());
                     replies += 1;
                 }
-                assert!(replies >= usize::from(FLOWS) * 9 / 10, "{replies} replies for {FLOWS} flows");
+                assert!(
+                    replies >= usize::from(FLOWS) * 9 / 10,
+                    "{replies} replies for {FLOWS} flows"
+                );
                 std::thread::sleep(Duration::from_millis(50));
             }
             self.burst(u64::from(FLOWS) * 4);
@@ -394,7 +464,10 @@ mod linux {
                     .filter(|c| c.orig.src_port == 40000 && c.has(status::OFFLOAD))
                     .count();
                 eprintln!("{offloaded} of {FLOWS} flows in the flowtable");
-                assert!(offloaded > usize::from(FLOWS) / 2, "the flows entered the flowtable");
+                assert!(
+                    offloaded > usize::from(FLOWS) / 2,
+                    "the flows entered the flowtable"
+                );
             }
         }
     }
@@ -417,12 +490,34 @@ mod linux {
             eprintln!("{name}: {got} of {BURST} frames forwarded");
         }
         // Connection setup: every frame a new connection through the NAT.
-        lab.set(Mode::Cgnat);
-        g.bench_function("udp64/new connection each frame (cgnat)", |b| {
-            b.iter_custom(|iters| (0..iters).map(|_| lab.new_connections(BURST).0).sum())
-        });
-        let (_, got) = lab.new_connections(BURST);
-        eprintln!("new connections: {got} of {BURST} frames forwarded");
+        g.sample_size(10);
+        g.throughput(Throughput::Elements(NEW));
+        for (mode, name) in [
+            (Mode::Cgnat, "udp64/new connection each frame (cgnat)"),
+            (
+                Mode::CgnatNoEim,
+                "udp64/new connection each frame (cgnat, EIM off)",
+            ),
+            (
+                Mode::ConntrackOnly,
+                "udp64/new connection each frame (conntrack, no NAT)",
+            ),
+        ] {
+            lab.set(mode);
+            g.bench_function(name, |b| {
+                b.iter_custom(|iters| {
+                    (0..iters)
+                        .map(|_| {
+                            lab.forget_new();
+                            lab.new_connections(NEW).0
+                        })
+                        .sum()
+                })
+            });
+            lab.forget_new();
+            let (_, got) = lab.new_connections(NEW);
+            eprintln!("{name}: {got} of {NEW} frames forwarded");
+        }
         g.finish();
         lab.hal.apply(&lab.applied, &Config::default()).unwrap();
     }

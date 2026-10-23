@@ -30,8 +30,11 @@ fn lab(epochs: u64) -> Session {
         s.tick(T0 + d * DAY);
         // Alternate the ports so every day is a new definition.
         let ports = if d % 2 == 0 { 1000 } else { 960 };
-        s.execute("ip.firewall.cgnat.pool.set", &json!({"id": "c1", "ports_per_subscriber": ports}))
-            .unwrap();
+        s.execute(
+            "ip.firewall.cgnat.pool.set",
+            &json!({"id": "c1", "ports_per_subscriber": ports}),
+        )
+        .unwrap();
     }
     s.tick(T0 + epochs * DAY);
     s
