@@ -311,7 +311,7 @@ pub fn root_test(root: &Path) -> Outcome {
 }
 
 /// The root tests and how long each may take (seconds).
-const XDP_TESTS: [(&str, u32); 7] = [
+const XDP_TESTS: [(&str, u32); 8] = [
     ("loads_attaches_and_counts", 180),
     ("kernel_and_host_agree", 300),
     ("perf_lpm_cost", 600),
@@ -319,6 +319,7 @@ const XDP_TESTS: [(&str, u32); 7] = [
     ("fast_nat_forwards_both_directions", 180),
     ("perf_fast_nat", 300),
     ("conntrack_puts_flows_in_the_fast_path", 180),
+    ("perf_fast_nat_forward", 180),
 ];
 
 fn test_binary(root: &Path) -> Result<PathBuf, String> {

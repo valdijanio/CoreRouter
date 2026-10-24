@@ -127,6 +127,15 @@ Todos em `crates/dataplane-ebpf/src/main.rs`, cada um com `SAFETY:`:
 4. `top`: o mesmo para `TOP` (LRU por CPU).
 5. `bpf_ktime_get_ns()`: helper sem argumentos.
 6. Atributos `#[unsafe(link_section = "license")]` e `#[unsafe(no_mangle)]` do `LICENSE`.
+7. `Frame::store` (G2.5b): `write_unaligned` de `[u8; N]` depois da mesma checagem de limite.
+8. `fast_nat`: leitura (`*flow`) do valor de `NAT_FLOWS` que o kernel devolveu; o daemon troca
+   valores inteiros e as CPUs só gravam palavras inteiras (último uso, pacotes).
+9. `fast_nat`: `bpf_fib_lookup` com o contexto do programa e uma `bpf_fib_lookup` inteira na
+   pilha, com o tamanho dela.
+10. `fast_nat`: gravação do último uso e da contagem de pacotes do fluxo (palavras inteiras; uma
+    corrida perde uma contagem, só estatística).
+11. `fast_nat`: `bpf_redirect` com o índice de interface que a FIB devolveu.
+12. `miss`: incremento do contador por CPU de `NAT_MISS`.
 
 ## Pesquisa
 
@@ -301,24 +310,41 @@ gerador ligado a ela.
    ```
 6. Mande a saída: entra no `docs/perf.md` como **medido** (máquina, placa, kernel, data).
 
-## G2.5b — fast path do CGNAT determinístico (desenho)
+## G2.5b — caminho rápido do CGNAT
 
-Depende da G2.3 (sessão Firewall/CGNAT): a **função de mapeamento determinístico** (RFC 7422)
-fica num lugar só. Plano:
+Desenho escolhido pelo usuário (opção 1, 2026-10-24): **offload guiado pelo conntrack**, como a
+flowtable da G2.4a, só que em XDP.
 
-- A parte de cálculo da G2.3 (dado o IP interno: IP externo e faixa de portas; e o inverso) vai
-  para um módulo `no_std` sem alocação que o `dataplane-ebpf-common` usa — ou a própria G2.3 a
-  expõe assim (`proto-cgnat` com `#![no_std]` na parte de cálculo). Nunca duas implementações:
-  um teste no `hal-linux` compara as duas pontas para milhares de endereços.
-- Saída (interno → externo): parse, `f1(src)` dá IP externo e faixa; a porta sai de um mapa de
-  fluxos (LRU hash 5-tupla → porta) ou, se novo, da próxima livre na faixa do assinante (um mapa
-  por assinante com o cursor); reescreve origem e porta e corrige os checksums IP e TCP/UDP de
-  forma incremental (RFC 1624 Eqn 3, sem reescrever o que não mudou: errata 4782).
-- Entrada (externo → interno): `f2(dst, porta)` dá o assinante sem estado nenhum (a vantagem do
-  determinístico); o mapa de fluxos confirma a 5-tupla (filtro EIM/EIF conforme a G2.3).
-- Fica no kernel (XDP_PASS para o caminho nftables da G2.3): fragmentos, ICMP de erro com
-  payload (precisa traduzir o cabeçalho interno), ALG (FTP, SIP), o que a tabela de fluxos não
-  conhece ainda e o que vai para o próprio roteador.
-- Encaminhar no XDP (`XDP_TX`/`XDP_REDIRECT`) com `bpf_fib_lookup` (`gpl_only`): liberado pela
-  licença GPL dos crates do XDP (§ Licença, decisão do usuário em 2026-10-23).
-- "Quem era?" da G2.3: a mesma fórmula responde, sem log a mais.
+- **O kernel decide tudo.** Os primeiros pacotes de cada conexão passam pelo nftables da G2.3,
+  que escolhe a porta dentro da faixa determinística do assinante (RFC 7422, a fórmula de
+  `corerouter-cgnat-map`). Não há segunda escolha de porta: o "Quem era?" segue exato e não há
+  colisão com o que fica no kernel.
+- **O serviço `xdp-nat` do daemon** (`apps/corerouter-daemon/src/service/xdp_nat.rs`) ouve o
+  conntrack (ctnetlink, grupos NEW, UPDATE e DESTROY). Quando uma conexão IPv4 TCP/UDP com NAT
+  fica `ASSURED` (TCP em `established`), ele instala os dois sentidos no mapa `NAT_FLOWS`
+  (LRU hash, chave = 5-tupla como chega, valor = origem e destino novos). Quando o conntrack a
+  destrói, ou o TCP sai de `established`, ele os tira. Eventos perdidos (`ENOBUFS`) ou um mapa
+  novo (o XDP recarregou) levam a uma releitura da tabela inteira. A política é pura
+  (`corerouter_hal::xdp_nat::Book`) e testada em qualquer plataforma.
+- **O XDP** (`fastnat` no `dataplane-ebpf-common`), depois do filtro: pacote de um fluxo
+  conhecido, sem VLAN, sem opções IP, sem SYN/FIN/RST e com TTL > 1 tem o destino consultado
+  na tabela de rotas (`bpf_fib_lookup`). Se ela resolver, troca endereço e porta, corrige os
+  checksums IP e TCP/UDP de forma incremental (RFC 1624), desconta o TTL, grava os MACs e
+  redireciona (`bpf_redirect`). Se não resolver, o pacote vai intacto para o kernel: nada é
+  escrito antes da consulta dar certo. O motivo conta em `NAT_MISS` ("Enviado ao kernel" na
+  janela): códigos da FIB (sem vizinho, MTU, sem rota…), VLAN, opções IP, controle TCP, TTL.
+- **Timeout:** o conntrack não vê os pacotes do caminho rápido. A cada 2 s o serviço renova o
+  timeout (`IPCTNL_MSG_CT_NEW` sem `NLM_F_CREATE`, `CTA_TIMEOUT`) das conexões que o XDP
+  carregou desde a última vez, com o valor do próprio kernel para o estado (TCP established,
+  UDP stream).
+- **Fica no kernel:** IPv6, ICMP (inclusive os de erro com payload), fragmentos, ALG, o que vai
+  para o próprio roteador e tudo o que não for uma conexão estabelecida.
+- **Capacidade:** 262 144 conexões ao mesmo tempo (524 288 sentidos). O mapa é preallocado
+  (~50 MiB, **estimado**) só com o caminho rápido ligado; ligar ou desligar recarrega o objeto.
+- **Comando:** `ip.firewall.xdp.set fast_nat=yes` (avisa sem pool de CGNAT e com menos de duas
+  interfaces com XDP); `ip.firewall.xdp.print` traz `fast_nat_flows`, `fast_nat_misses` e o
+  estado do serviço; `ip.firewall.xdp.interface.list` traz `fast_nat_pps`.
+- **Por que só IPv4 sem opções:** o verificador do kernel recusa aritmética de ponteiro de
+  pacote com offset sem limite conhecido. Um `IpInfo` copiado pela pilha perde o limite que o
+  verificador conhecia. Sem VLAN e sem opções, os offsets são constantes (IP em 14, transporte
+  em 34). Pacotes com opções IP são raros e vão ao kernel.

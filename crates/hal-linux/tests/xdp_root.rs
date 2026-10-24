@@ -703,18 +703,42 @@ fn perf_fast_nat() {
     });
     f[22] = 64;
     let la = ifindex("la");
-    let reps = 2_000_000;
-    let (action, nat) = x.test_run_on(&f, reps, Some(la)).unwrap();
+    // Once: a known flow is translated and redirected.
+    let (action, _) = x.test_run_on(&f, 1, Some(la)).unwrap();
     let misses = x.status(0).fast_nat_misses;
-    println!("fast path misses after the test run: {misses:?}");
     assert_eq!(action, 4, "XDP_REDIRECT ({misses:?})");
-    let other = {
-        let mut g = f.clone();
-        g[37] = 8; // another destination port: no flow
-        g
+    // BPF_PROG_TEST_RUN repeats on one buffer, which the first run
+    // rewrote: time an identity flow instead (same 5-tuple in and out),
+    // TTL 255, in batches of 250 runs (the TTL goes down by one each).
+    let ip = |s: &str| -> std::net::Ipv4Addr { s.parse().unwrap() };
+    let same = NatFlow {
+        proto: IPPROTO_UDP,
+        src: (ip("100.64.0.2"), 5001),
+        dst: (ip("198.51.100.2"), 7),
+        new_src: (ip("100.64.0.2"), 5001),
+        new_dst: (ip("198.51.100.2"), 7),
     };
-    let (action, plain) = x.test_run_on(&other, reps, Some(la)).unwrap();
-    assert_eq!(action, XDP_PASS);
+    x.nat_install(&[same]).unwrap();
+    let mut g = f.clone();
+    g[35] = 0x89; // source port 5001
+    g[22] = 255;
+    let (batches, per) = (4000u32, 250u32);
+    let mut total = Duration::ZERO;
+    for _ in 0..batches {
+        let (action, d) = x.test_run_on(&g, per, Some(la)).unwrap();
+        assert_eq!(action, 4);
+        total += d;
+    }
+    let nat = total / batches;
+    let mut h = g.clone();
+    h[37] = 8; // another destination port: no flow
+    let mut total = Duration::ZERO;
+    for _ in 0..batches {
+        let (action, d) = x.test_run_on(&h, per, Some(la)).unwrap();
+        assert_eq!(action, XDP_PASS);
+        total += d;
+    }
+    let plain = total / batches;
     println!(
         "PERF | fast-nat | redirect ns/pkt {} | no flow (pass) ns/pkt {}",
         nat.as_nanos(),
@@ -743,7 +767,7 @@ fn conntrack_puts_flows_in_the_fast_path() {
     ]);
     sh(&[
         "nft",
-        "add rule ip crxnat post oifname \"wa\" ip saddr 100.64.0.0/24 snat to 198.51.100.1:20000-20999",
+        "add rule ip crxnat post oifname \"wa\" ip saddr 100.64.0.0/24 meta l4proto udp snat to 198.51.100.1:20000-20999",
     ]);
     let (mut x, _) = fast_nat_router();
     // Only conntrack fills the map in this test.
@@ -878,4 +902,82 @@ fn fast_nat_router_flows() -> [NatFlow; 2] {
             new_dst: (ip("100.64.0.2"), 5000),
         },
     ]
+}
+
+/// Measured: UDP through the router for 2 s, sent from the subscriber's
+/// namespace (64-byte frames), counted as they arrive in the internet
+/// namespace: the kernel's NAT (an nftables SNAT rule, conntrack, routing)
+/// against the XDP fast path (generic, on veth). Sender, router and
+/// receiver share the CPU that runs the sender (veth hands frames over in
+/// its softirq): a comparison of costs, not a NIC's line rate.
+#[test]
+fn perf_fast_nat_forward() {
+    if !enabled() {
+        return;
+    }
+    let _t = Triangle::new();
+    let rx = || -> u64 {
+        sh(&[
+            "ip",
+            "netns",
+            "exec",
+            INET_NS,
+            "cat",
+            "/sys/class/net/wb/statistics/rx_packets",
+        ])
+        .trim()
+        .parse()
+        .unwrap_or(0)
+    };
+    let blast = |port: u16| -> u64 {
+        Triangle::spawn_in(SUB_NS, move || {
+            let s = std::net::UdpSocket::bind(("100.64.0.2", port)).unwrap();
+            let t = Instant::now();
+            let mut sent = 0u64;
+            while t.elapsed() < Duration::from_secs(2) {
+                for _ in 0..256 {
+                    if s.send_to(&[0u8; 18], "198.51.100.2:7").is_ok() {
+                        sent += 1;
+                    }
+                }
+            }
+            sent
+        })
+        .join()
+        .unwrap()
+    };
+    // Kernel: SNAT rule, no XDP.
+    sh(&["nft", "add table ip crxnat"]);
+    sh(&[
+        "nft",
+        "add chain ip crxnat post { type nat hook postrouting priority 100; }",
+    ]);
+    sh(&[
+        "nft",
+        "add rule ip crxnat post oifname \"wa\" ip saddr 100.64.0.0/24 meta l4proto udp snat to 198.51.100.1:20000",
+    ]);
+    let before = rx();
+    let sent = blast(5000);
+    let seen = rx().saturating_sub(before);
+    println!(
+        "PERF | forward | kernel NAT (nftables + conntrack) | {:.0} kpps delivered | {seen} of {sent}",
+        seen as f64 / 2000.0
+    );
+    let _ = sh_ok(&["nft", "delete table ip crxnat"]);
+    // XDP fast path (generic): the flows of `fast_nat_router`.
+    let (mut x, _) = fast_nat_router();
+    let before = rx();
+    let sent = blast(5000);
+    let seen = rx().saturating_sub(before);
+    let fast: u64 = x
+        .status(0)
+        .ports
+        .iter()
+        .map(|p| p.counters[corerouter_hal::xdp::FAST_NAT].0)
+        .sum();
+    println!(
+        "PERF | forward | XDP fast path (generic, veth) | {:.0} kpps delivered | {seen} of {sent} (fast path {fast})",
+        seen as f64 / 2000.0
+    );
+    x.sync(&Config::default()).unwrap();
 }
