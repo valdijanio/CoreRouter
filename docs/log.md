@@ -3379,3 +3379,75 @@ continuação indentadas).
   corerouter-daemon real_clickhouse` (docs/analytics.md §8: logs, métricas, fluxo, NAT e a view;
   TLS com CA própria e login por certificado com `COREROUTER_CLICKHOUSE_TLS_URL`), testado com o
   ClickHouse 26.9.25.15.
+
+- 2026-10-24 — G2.5b: XDP, parte 2d: o caminho rápido do CGNAT (`docs/xdp.md` § G2.5b), desenho escolhido pelo
+  usuário (offload guiado pelo conntrack).
+
+  - **Kernel decide, XDP executa.** Os primeiros pacotes de cada conexão passam pelo nftables da
+    G2.3, que escolhe a porta na faixa determinística; o serviço novo `xdp-nat` do daemon ouve o
+    conntrack (NEW/UPDATE/DESTROY) e instala os dois sentidos de cada conexão IPv4 TCP/UDP com NAT
+    já `ASSURED` (TCP `established`) no mapa `NAT_FLOWS`; tira quando o conntrack a destrói ou o
+    TCP sai de `established`; relê a tabela depois de eventos perdidos ou de um mapa novo; renova
+    a cada 2 s o timeout do conntrack das conexões que o XDP carregou (`IPCTNL_MSG_CT_NEW` com
+    `CTA_TIMEOUT`, o valor do kernel para o estado).
+  - **No XDP** (`dataplane-ebpf-common::fastnat`), depois do filtro: fluxo conhecido, sem VLAN,
+    sem opções IP, sem SYN/FIN/RST, TTL > 1 → `bpf_fib_lookup`; se resolver, reescrita com
+    checksum incremental (RFC 1624), TTL − 1, MACs da FIB e `bpf_redirect`; senão, intacto para o
+    kernel, com o motivo contado em `NAT_MISS`. Motivo novo de contador `fast-nat`.
+  - **Comando** `ip.firewall.xdp.set fast_nat` (avisos: sem pool de CGNAT, menos de duas
+    interfaces com XDP); `print` com `fast_nat_flows`, `fast_nat_misses` e o estado do serviço;
+    `interface.list` com `fast_nat_pps`. Mapa preallocado só com o caminho rápido ligado (ligar ou
+    desligar recarrega o objeto). Até 262 144 conexões.
+  - **Janela** IP › Firewall XDP: "CGNAT Fast Path" no Filtro (ⓘ PT/EN), conexões carregadas,
+    sentidos, timeouts renovados, "Enviado ao kernel" por motivo, coluna Fast NAT pps.
+  - **Verificador:** offsets constantes no caminho rápido (IP em 14, transporte em 34): o
+    verificador recusava aritmética de pacote com o offset do `IpInfo` copiado pela pilha; o
+    `IpInfo::v4_offsets` dá limites visíveis (máscaras identidade, provadas por proptest).
+  - **Testes:** proptest no host dos dois sentidos de uma conexão contra o quadro já traduzido
+    (byte a byte, TTL − 1, checksums), do que fica no kernel e da política (`xdp_nat::Book`:
+    ciclo de vida, limite, releitura, renovação); engine (opção e avisos); UI; no CI com root:
+    tradução e encaminhamento dos dois sentidos por três namespaces sem NAT no kernel, e de ponta
+    a ponta com SNAT do nftables, eventos do conntrack instalando o fluxo, renovação aceita e a
+    conexão morta saindo do mapa.
+
+- 2026-10-24 — G4.3b: BNG, parte RADIUS: crate novo `crates/proto-radius` (L2, Rust puro, sans-IO, sem `unsafe`),
+  desenho e pesquisa em `docs/radius.md`.
+
+  - **Codec** zero cópia (RFC 2865/2866/2869/3162/6911/6929): `Packet::parse` valida tudo uma vez,
+    iteradores sem alocação, VSA com vários sub-atributos (RFC 4679), atributos estendidos e longos
+    com fragmentação; Message-Authenticator, User-Password, sal (Tunnel-Password, MS-MPPE), CHAP,
+    MS-CHAPv1/v2 e chaves MPPE (RFC 2759/3079), Error-Cause (RFC 5176).
+  - **Dicionário** tipado (RFC 8044) com padrão, Microsoft, DSL Forum, MikroTik, Juniper/ERX
+    (só leitura), Ascend e Redback; estendível com texto de dicionário do FreeRADIUS.
+  - **`Mikrotik-Rate-Limit`** (`rate_limit::RateLimit`), o mesmo tipo do `rate-limit` do perfil PPP.
+  - **Cliente:** Access/Accounting/Status-Server, retransmissão da RFC 5080 §2.2.1 (recuo e
+    dispersão), failover, servidor morto com Status-Server ou `dead-time`, 256 identificadores por
+    socket e mais sockets sob carga, Message-Authenticator exigido por padrão (Blast-RADIUS),
+    Acct-Delay-Time por tentativa, interim novo substitui o pendente, interims com dispersão.
+  - **CoA/DM (RFC 5176):** lista de fontes com segredo por fonte, janela de Event-Timestamp de 300 s,
+    cache de duplicados, seletor de sessão, prechecks com Error-Cause, Authorize Only (trocar IP por
+    CoA, o que o RouterOS não faz); o daemon aplica de forma atômica e responde ACK/NAK.
+  - **Servidor de teste** em Rust puro (PAP/CHAP/MS-CHAPv1/v2, atrasos e perdas programados) para o
+    laboratório em massa do G4.3d.
+  - **Testes:** exemplos da RFC 2865 §7 (com as erratas 1469 e 6486), RFC 5997 §6, RFC 2759 §9 e
+    RFC 3079 §3.5.3 como testes dourados; proptest em tudo; alvo de fuzz `radius`; cliente contra o
+    servidor de teste (12 cenários); UDP real em 127.0.0.1; simulação de 100 000 Access-Requests e
+    100 000 interims com 3 % de perda e o servidor primário morto por um minuto, conferindo a cada
+    datagrama que nenhum identificador se repete enquanto pendente e que retransmissões são
+    idênticas (**medido**: 233 243 datagramas, 30 199 retransmissões, 3 034 failovers, 17 timeouts,
+    4 s em debug).
+
+  Como testar: `cargo test -p corerouter-proto-radius` e
+  `cargo bench -p corerouter-proto-radius --bench radius`.
+
+- 2026-10-24 — processo: Teste instável `corerouter-control conn::tests::deadline_bounds_the_total_not_each_read`: o limite
+  de 900 ms estourou num runner do CI carregado (2026-10-24, branch da G2.5b, TRY 2 FAIL). Agora o
+  limite é 1600 ms, ainda bem abaixo dos 2 s em que o alimentador mantém cada leitura viva, então o
+  teste continua provando que o prazo vale para o total, não para cada leitura.
+
+- 2026-10-24 — processo: Teste que precisa de root (`cargo xtask xdp-root`): o usuário roda na máquina dele, num namespace
+  descartável, e o `sudo` pede a senha dele. A receita está em `AGENTS.md`, "Acesso root e testes de
+  rede". O agente continua sem `sudo`. Uma rodada local leva segundos; um `workflow_dispatch` no
+  runner leva cerca de 15 min (**medido**, 2026-10-24). A saída local traz o `Verifier output`
+  inteiro, que o log do CI corta. A primeira rodada local mostrou que o verificador aceita o
+  programa da G2.5b e isolou a única falha restante (`perf_fast_nat`).
