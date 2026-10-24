@@ -20,6 +20,7 @@ const ALL_ON: Settings = Settings {
     allow: true,
     rate_pps: 0,
     burst: 0,
+    fast_nat: false,
 };
 
 proptest! {
@@ -61,6 +62,30 @@ proptest! {
         }
         if s.proto == IPPROTO_UDP {
             prop_assert_eq!((info.src_port, info.dst_port), (s.sport, s.dport));
+        }
+    }
+
+    /// The verifier-visible offsets of an IPv4 packet are its offsets
+    /// (the masks of `IpInfo::v4_offsets` never change a parsed value),
+    /// also with options and two VLAN tags.
+    #[test]
+    fn v4_offset_masks_are_identity(s in spec(), opts in 0u8..=10) {
+        let mut f = build(&s);
+        let Addr::V4(_) = s.src else { return Ok(()) };
+        let at = 14 + 4 * s.vlans.len();
+        if opts > 0 {
+            // Grow the header with `opts` words of NOP options.
+            let total = u16::from_be_bytes([f[at + 2], f[at + 3]]) + u16::from(opts) * 4;
+            f[at] = 0x45 + opts;
+            f[at + 2..at + 4].copy_from_slice(&total.to_be_bytes());
+            for _ in 0..opts {
+                for _ in 0..4 {
+                    f.insert(at + 20, 1);
+                }
+            }
+        }
+        if let Parsed::Ip(info) = parse(&f[..]) {
+            prop_assert_eq!(info.v4_offsets(), (info.ip_off, info.l4_off));
         }
     }
 

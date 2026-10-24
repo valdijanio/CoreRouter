@@ -25,6 +25,7 @@ pub mod sim;
 pub mod tuning;
 pub mod virt;
 pub mod xdp;
+pub mod xdp_nat;
 
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
@@ -432,6 +433,15 @@ pub trait Hal: Send {
     /// counters and the most dropped sources (`top` of them).
     fn xdp_status(&mut self, top: usize) -> Result<xdp::XdpStatus, HalError> {
         let _ = top;
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
+    /// The CGNAT fast path's link to the XDP flow map and to conntrack
+    /// (G2.5b), for the daemon's `xdp-nat` service.
+    fn xdp_nat_link(&mut self) -> Result<Box<dyn xdp_nat::NatLink>, HalError> {
         Err(HalError::Unsupported(format!(
             "{} has no XDP data plane",
             self.describe()

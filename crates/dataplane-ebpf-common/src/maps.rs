@@ -11,6 +11,7 @@
 //! | `RATE` | LRU hash | source ([`crate::parse::Addr::mapped`]) | [`crate::bucket::Bucket`] |
 //! | `COUNTERS` | per-CPU hash | [`counter_key`] | [`Counter`] |
 //! | `TOP` | LRU per-CPU hash | dropped source (mapped) | [`Top`] |
+//! | `NAT_FLOWS` | LRU hash | [`crate::fastnat::FlowKey`] | [`crate::fastnat::FlowValue`] |
 
 use crate::filter::Reason;
 
@@ -22,6 +23,8 @@ pub const ALLOW_V6: &str = "ALLOW_V6";
 pub const RATE: &str = "RATE";
 pub const COUNTERS: &str = "COUNTERS";
 pub const TOP: &str = "TOP";
+pub const NAT_FLOWS: &str = "NAT_FLOWS";
+pub const NAT_MISS: &str = "NAT_MISS";
 /// The XDP program's name in the object.
 pub const PROGRAM: &str = "corerouter_xdp";
 
@@ -36,6 +39,12 @@ pub const PREFIXES_V6: u32 = 1 << 18;
 pub const RATE_SOURCES: u32 = 1 << 18;
 /// Dropped sources remembered for the top-sources table (LRU).
 pub const TOP_SOURCES: u32 = 1 << 14;
+/// Flow directions the CGNAT fast path holds (two per connection) when it
+/// is on (G2.5b). LRU, so preallocated: ~100 bytes each with the kernel's
+/// per-element overhead, **estimated** ~50 MiB; the loader sizes the map
+/// to 1 entry while the fast path is off. Past it the least recently used
+/// flow falls back to the kernel (still correct, slower).
+pub const NAT_FLOWS_MAX: u32 = 1 << 19;
 /// Interfaces × reasons of the counters map.
 pub const MAX_INTERFACES: u32 = 256;
 pub const COUNTER_ENTRIES: u32 = MAX_INTERFACES * Reason::ALL.len() as u32;

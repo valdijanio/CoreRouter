@@ -28,6 +28,8 @@ pub struct XdpPlan {
     /// a list holding them, sorted and without duplicates.
     pub block: Vec<(IpNet, u32)>,
     pub allow: Vec<(IpNet, u32)>,
+    /// The CGNAT fast path is on (G2.5b).
+    pub fast_nat: bool,
 }
 
 impl XdpPlan {
@@ -52,6 +54,7 @@ impl XdpPlan {
             rate_burst: u64::from(f.burst()),
             block: prefixes(cfg, dynamic, &f.block_lists),
             allow: prefixes(cfg, dynamic, &f.allow_lists),
+            fast_nat: x.fast_nat,
         }
     }
 
@@ -148,7 +151,18 @@ pub fn cover(a: &AddrMatch) -> Vec<IpNet> {
 }
 
 /// Why a frame passed or was dropped, with its stable name.
-pub const REASONS: [&str; 5] = ["pass", "blocked", "rate-limit", "malformed", "tcp-flags"];
+pub const REASONS: [&str; 6] = [
+    "pass",
+    "blocked",
+    "rate-limit",
+    "malformed",
+    "tcp-flags",
+    "fast-nat",
+];
+/// The reasons that are drops (indexes in [`REASONS`]).
+pub const DROPS: [usize; 4] = [1, 2, 3, 4];
+/// The CGNAT fast path's index in [`REASONS`] (G2.5b).
+pub const FAST_NAT: usize = 5;
 
 /// One interface of the filter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -188,6 +202,10 @@ pub struct XdpStatus {
     /// Prefixes in the block and allow tries.
     pub block_prefixes: usize,
     pub allow_prefixes: usize,
+    /// Flow directions in the CGNAT fast path's map (G2.5b).
+    pub fast_nat_flows: usize,
+    /// Why packets of known flows went to the kernel (reason, packets).
+    pub fast_nat_misses: Vec<(&'static str, u64)>,
 }
 
 #[cfg(test)]

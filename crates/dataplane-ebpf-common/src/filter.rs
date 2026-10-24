@@ -14,7 +14,7 @@
 
 use crate::bucket;
 use crate::packet::Packet;
-use crate::parse::{self, Addr, Malformed, Parsed};
+use crate::parse::{self, Addr, IpInfo, Malformed, Parsed};
 
 /// Why a frame passed or was dropped: the counter it adds to. The order
 /// is the map layout (`maps::counter_key`); new reasons go at the end.
@@ -26,15 +26,18 @@ pub enum Reason {
     RateLimited = 2,
     Malformed = 3,
     BadTcpFlags = 4,
+    /// Translated and forwarded by the CGNAT fast path (G2.5b).
+    FastNat = 5,
 }
 
 impl Reason {
-    pub const ALL: [Reason; 5] = [
+    pub const ALL: [Reason; 6] = [
         Reason::Pass,
         Reason::Blocked,
         Reason::RateLimited,
         Reason::Malformed,
         Reason::BadTcpFlags,
+        Reason::FastNat,
     ];
 
     /// Stable name (commands, metrics).
@@ -45,6 +48,7 @@ impl Reason {
             Reason::RateLimited => "rate-limit",
             Reason::Malformed => "malformed",
             Reason::BadTcpFlags => "tcp-flags",
+            Reason::FastNat => "fast-nat",
         }
     }
 
@@ -67,12 +71,15 @@ pub struct Settings {
     pub rate_pps: u64,
     /// Packets a source may send at once above the rate.
     pub burst: u64,
+    /// Translate and forward the flows of `NAT_FLOWS` here (G2.5b).
+    pub fast_nat: bool,
 }
 
 const F_MALFORMED: u64 = 1;
 const F_TCP_FLAGS: u64 = 1 << 1;
 const F_BLOCK: u64 = 1 << 2;
 const F_ALLOW: u64 = 1 << 3;
+const F_FAST_NAT: u64 = 1 << 4;
 
 /// Words of the settings map: flags, rate, burst.
 pub const SETTINGS_WORDS: usize = 3;
@@ -85,6 +92,7 @@ impl Settings {
             (self.drop_bad_tcp_flags, F_TCP_FLAGS),
             (self.block, F_BLOCK),
             (self.allow, F_ALLOW),
+            (self.fast_nat, F_FAST_NAT),
         ] {
             if on {
                 flags |= bit;
@@ -99,6 +107,7 @@ impl Settings {
             drop_bad_tcp_flags: flags & F_TCP_FLAGS != 0,
             block: flags & F_BLOCK != 0,
             allow: flags & F_ALLOW != 0,
+            fast_nat: flags & F_FAST_NAT != 0,
             rate_pps,
             burst,
         }
@@ -127,6 +136,9 @@ pub struct Verdict {
     pub src: Option<Addr>,
     /// The block list that matched (index), for `Reason::Blocked`.
     pub list: Option<u32>,
+    /// A clean IP packet that passed: what the CGNAT fast path looks at
+    /// (G2.5b). `None` when dropped, not IP or malformed.
+    pub ip: Option<IpInfo>,
 }
 
 impl Verdict {
@@ -136,6 +148,7 @@ impl Verdict {
             reason: Reason::Pass,
             src,
             list: None,
+            ip: None,
         }
     }
 
@@ -145,6 +158,7 @@ impl Verdict {
             reason,
             src,
             list: None,
+            ip: None,
         }
     }
 }
@@ -171,8 +185,12 @@ pub fn decide<P: Packet + ?Sized, L: Lookups>(
         Some(_) if s.drop_malformed => return Verdict::drop(Reason::Malformed, Some(src)),
         Some(_) => {}
     }
+    let clean = (info.malformed.is_none()).then_some(info);
     if s.allow && l.allowed(&src) {
-        return Verdict::pass(Some(src));
+        return Verdict {
+            ip: clean,
+            ..Verdict::pass(Some(src))
+        };
     }
     if s.block
         && let Some(list) = l.blocked(&src)
@@ -192,7 +210,10 @@ pub fn decide<P: Packet + ?Sized, L: Lookups>(
             None => l.new_bucket(&src, bucket::fresh(now_ns, s.burst)),
         }
     }
-    Verdict::pass(Some(src))
+    Verdict {
+        ip: clean,
+        ..Verdict::pass(Some(src))
+    }
 }
 
 #[cfg(test)]
@@ -208,6 +229,7 @@ mod tests {
             allow: true,
             rate_pps: 1000,
             burst: 50,
+            fast_nat: true,
         };
         assert_eq!(Settings::from_words(s.to_words()), s);
         assert_eq!(Settings::from_words([0; 3]), Settings::default());

@@ -97,6 +97,8 @@ pub enum Fragment {
 /// An IP packet's headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpInfo {
+    /// Offset of the IP header in the frame (14 when untagged).
+    pub ip_off: usize,
     pub src: Addr,
     pub dst: Addr,
     /// Upper-layer protocol (after IPv6 extension headers, when walked).
@@ -112,6 +114,19 @@ pub struct IpInfo {
     /// source is known, so the block lists still apply when malformed
     /// packets are let through.
     pub malformed: Option<Malformed>,
+}
+
+impl IpInfo {
+    /// The IPv4 header and transport offsets with a bound the eBPF
+    /// verifier can see. An `IpInfo` copied through memory loses the range
+    /// the verifier knew, and it refuses packet arithmetic with an
+    /// unbounded offset. The masks change nothing for an IPv4 packet this
+    /// parser accepted: the IP header starts at 14, 18 or 22 (< 64) and the
+    /// transport at most 60 bytes later (< 128).
+    #[inline(always)]
+    pub fn v4_offsets(&self) -> (usize, usize) {
+        (self.ip_off & 0x3f, self.l4_off & 0x7f)
+    }
 }
 
 /// The outcome of [`parse`].
@@ -205,6 +220,7 @@ fn ipv4<P: Packet + ?Sized>(p: &P, off: usize) -> Parsed {
         _ => Fragment::Later,
     };
     let info = IpInfo {
+        ip_off: off,
         src: Addr::V4([s0, s1, s2, s3]),
         dst: Addr::V4([d0, d1, d2, d3]),
         proto,
@@ -241,6 +257,7 @@ fn ipv6<P: Packet + ?Sized>(p: &P, off: usize) -> Parsed {
     }
     let (src, dst) = split16(rest);
     let mut info = IpInfo {
+        ip_off: off,
         src: Addr::V6(src),
         dst: Addr::V6(dst),
         proto: next,

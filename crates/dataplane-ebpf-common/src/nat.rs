@@ -24,6 +24,7 @@ impl PacketMut for [u8] {
 }
 
 /// Fold a one's-complement sum to 16 bits (end-around carry, RFC 1071).
+#[inline(always)]
 pub fn fold(mut sum: u32) -> u16 {
     sum = (sum & 0xffff) + (sum >> 16);
     sum = (sum & 0xffff) + (sum >> 16);
@@ -34,6 +35,7 @@ pub fn fold(mut sum: u32) -> u16 {
 /// became `new`: HC' = ~(~HC + ~m + m'). A word that did not change
 /// leaves the checksum alone (errata 4782: with HC = 0 the equation would
 /// give 0xFFFF).
+#[inline(always)]
 pub fn update16(hc: u16, old: u16, new: u16) -> u16 {
     if old == new {
         return hc;
@@ -42,6 +44,7 @@ pub fn update16(hc: u16, old: u16, new: u16) -> u16 {
 }
 
 /// [`update16`] for a 32-bit field (an IPv4 address): its two words.
+#[inline(always)]
 pub fn update32(hc: u16, old: [u8; 4], new: [u8; 4]) -> u16 {
     let [o0, o1, o2, o3] = old;
     let [n0, n1, n2, n3] = new;
@@ -80,9 +83,9 @@ pub enum NotHere {
 /// updated. Nothing is written unless everything fits (all reads first).
 /// A UDP checksum of 0 (none, RFC 768) stays 0; a computed 0 is sent as
 /// 0xFFFF.
+#[inline(always)]
 pub fn rewrite<P: PacketMut + ?Sized>(
     p: &mut P,
-    ip_off: usize,
     info: &IpInfo,
     src: Option<Endpoint>,
     dst: Option<Endpoint>,
@@ -90,9 +93,10 @@ pub fn rewrite<P: PacketMut + ?Sized>(
     if info.fragment != Fragment::No {
         return Err(NotHere::Fragment);
     }
+    let (ip_off, l4_off) = info.v4_offsets();
     let csum_off = match info.proto {
-        IPPROTO_TCP => info.l4_off + 16,
-        IPPROTO_UDP => info.l4_off + 6,
+        IPPROTO_TCP => l4_off + 16,
+        IPPROTO_UDP => l4_off + 6,
         _ => return Err(NotHere::Protocol),
     };
     let (crate::parse::Addr::V4(old_src), crate::parse::Addr::V4(old_dst)) = (info.src, info.dst)
@@ -102,8 +106,8 @@ pub fn rewrite<P: PacketMut + ?Sized>(
     let ip_csum = p.be16(ip_off + 10).ok_or(NotHere::Short)?;
     let l4_csum = p.be16(csum_off).ok_or(NotHere::Short)?;
     // Ports are read from the frame, not trusted from `info`.
-    let old_sport = p.be16(info.l4_off).ok_or(NotHere::Short)?;
-    let old_dport = p.be16(info.l4_off + 2).ok_or(NotHere::Short)?;
+    let old_sport = p.be16(l4_off).ok_or(NotHere::Short)?;
+    let old_dport = p.be16(l4_off + 2).ok_or(NotHere::Short)?;
     let src = src.unwrap_or(Endpoint {
         addr: old_src,
         port: old_sport,
@@ -134,8 +138,8 @@ pub fn rewrite<P: PacketMut + ?Sized>(
     p.store(ip_off + 12, src.addr).ok_or(NotHere::Short)?;
     p.store(ip_off + 16, dst.addr).ok_or(NotHere::Short)?;
     w(p, ip_off + 10, ip.to_be_bytes())?;
-    w(p, info.l4_off, src.port.to_be_bytes())?;
-    w(p, info.l4_off + 2, dst.port.to_be_bytes())?;
+    w(p, l4_off, src.port.to_be_bytes())?;
+    w(p, l4_off + 2, dst.port.to_be_bytes())?;
     w(p, csum_off, l4.to_be_bytes())?;
     Ok(())
 }

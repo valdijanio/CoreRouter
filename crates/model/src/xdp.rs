@@ -30,6 +30,12 @@ pub struct Xdp {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<XdpInterface>,
     pub filter: XdpFilter,
+    /// CGNAT fast path (G2.5b): the connections the kernel's CGNAT
+    /// (nftables, G2.3) already translated are translated and forwarded
+    /// here, in the driver; their first packets, and everything this does
+    /// not take, still go through the kernel.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fast_nat: bool,
 }
 
 impl Xdp {

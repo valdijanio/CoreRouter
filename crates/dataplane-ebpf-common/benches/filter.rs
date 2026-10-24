@@ -59,6 +59,7 @@ fn bench(c: &mut Criterion) {
         allow: false,
         rate_pps: 1_000_000,
         burst: 1_000,
+        fast_nat: false,
     };
     let mut l = Plain::default();
     let mut now = 0u64;

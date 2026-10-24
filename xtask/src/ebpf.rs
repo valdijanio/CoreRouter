@@ -271,7 +271,18 @@ pub fn root_test(root: &Path) -> Outcome {
     // One test at a time, each with a deadline, output straight to the log:
     // a hang shows which test, and never holds the CI job.
     let mut failed = Vec::new();
+    // `COREROUTER_XDP_TESTS=a,b`: only those (the quick workflow runs the
+    // one being fixed first, then all).
+    let only: Vec<String> = std::env::var("COREROUTER_XDP_TESTS")
+        .unwrap_or_default()
+        .split(',')
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .collect();
     for (test, secs) in XDP_TESTS {
+        if !only.is_empty() && !only.iter().any(|o| o == test) {
+            continue;
+        }
         eprintln!("--- xdp_root {test}");
         let status = Command::new("timeout")
             .args([
@@ -310,12 +321,17 @@ pub fn root_test(root: &Path) -> Outcome {
     }
 }
 
-/// The root tests and how long each may take (seconds).
-const XDP_TESTS: [(&str, u32); 4] = [
-    ("loads_attaches_and_counts", 180),
-    ("kernel_and_host_agree", 300),
-    ("perf_lpm_cost", 600),
-    ("perf_veth_blast", 300),
+/// The root tests and how long each may take (seconds; a few times what
+/// they take on the CI runner).
+const XDP_TESTS: [(&str, u32); 8] = [
+    ("loads_attaches_and_counts", 60),
+    ("kernel_and_host_agree", 60),
+    ("perf_lpm_cost", 180),
+    ("perf_veth_blast", 60),
+    ("fast_nat_forwards_both_directions", 60),
+    ("perf_fast_nat", 120),
+    ("conntrack_puts_flows_in_the_fast_path", 60),
+    ("perf_fast_nat_forward", 60),
 ];
 
 fn test_binary(root: &Path) -> Result<PathBuf, String> {

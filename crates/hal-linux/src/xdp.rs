@@ -21,8 +21,10 @@ use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, PerCpuHashMap, PerCpuValues};
 use aya::programs::xdp::XdpLinkId;
 use aya::programs::{Xdp as XdpProgram, XdpMode as AttachMode};
+use corerouter_dataplane_ebpf_common::fastnat::{self, FlowKey, FlowValue};
 use corerouter_dataplane_ebpf_common::filter::{Reason, Settings};
 use corerouter_dataplane_ebpf_common::maps as m;
+use corerouter_dataplane_ebpf_common::nat::Endpoint;
 use corerouter_dataplane_ebpf_common::parse::Addr;
 use corerouter_hal::HalError;
 use corerouter_hal::xdp::{REASONS, XdpPlan, XdpPort, XdpStatus, XdpTop};
@@ -50,7 +52,15 @@ fn why(e: &dyn std::error::Error) -> String {
              `setcap cap_bpf,cap_net_admin,cap_perfmon+ep corerouter-daemon`)",
         );
     }
-    text.chars().take(2000).collect()
+    // The verifier's reason is at the end of its log: keep the head and
+    // the tail.
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= 3000 {
+        return text;
+    }
+    let head: String = chars.iter().take(500).collect();
+    let tail: String = chars.iter().skip(chars.len() - 2500).collect();
+    format!("{head} … {tail}")
 }
 
 fn rejected(what: &str, e: &dyn std::error::Error) -> HalError {
@@ -68,6 +78,8 @@ struct Attached {
 struct Loaded {
     ebpf: Ebpf,
     links: BTreeMap<IfName, Attached>,
+    /// `NAT_FLOWS` was sized for the fast path (G2.5b); a change reloads.
+    fast_nat: bool,
 }
 
 /// The XDP part of [`crate::LinuxHal`] (public for the root tests and
@@ -81,6 +93,8 @@ pub struct XdpState {
     dynamic: Vec<DynamicAddress>,
     /// The last load failure, for the status.
     error: Option<String>,
+    /// The CGNAT fast path's flow map, shared with the daemon's link.
+    nat: SharedNat,
 }
 
 impl std::fmt::Debug for XdpState {
@@ -138,12 +152,30 @@ impl XdpState {
         if plan.is_empty() {
             // Dropping the object detaches every link and frees the maps.
             self.loaded = None;
+            self.set_nat(None);
             self.applied = plan;
             return Ok(());
         }
+        // The flow map is preallocated: sized only while the fast path is
+        // on, so turning it on or off reloads the object (links come back
+        // in this same call).
+        if self
+            .loaded
+            .as_ref()
+            .is_some_and(|l| l.fast_nat != plan.fast_nat)
+        {
+            self.loaded = None;
+            self.set_nat(None);
+        }
         if self.loaded.is_none() {
-            match load() {
-                Ok(l) => {
+            match load(plan.fast_nat) {
+                Ok(mut l) => {
+                    let map = if l.fast_nat {
+                        take_nat(&mut l.ebpf)?
+                    } else {
+                        None
+                    };
+                    self.set_nat(map);
                     self.loaded = Some(l);
                     self.error = None;
                     // Fresh maps: everything goes in.
@@ -182,6 +214,7 @@ impl XdpState {
     }
 
     pub fn status(&mut self, top: usize) -> XdpStatus {
+        let misses = self.nat_misses();
         let Some(l) = self.loaded.as_mut() else {
             return XdpStatus {
                 unavailable: self.error.clone(),
@@ -218,6 +251,8 @@ impl XdpState {
                 read_top(&mut l.ebpf, top, &lists)
             },
             block_prefixes: self.applied.block.len(),
+            fast_nat_flows: lock_nat(&self.nat).count(),
+            fast_nat_misses: misses,
             allow_prefixes: self.applied.allow.len(),
         }
     }
@@ -242,7 +277,158 @@ impl XdpState {
     }
 }
 
+pub use corerouter_hal::xdp_nat::{FlowUse, NatFlow};
+
+/// The fast path's flow map (owned: taken out of the object at load).
+type NatMap = aya::maps::HashMap<aya::maps::MapData, FlowKey, FlowValue>;
+
+/// The fast path's flow map, shared by the loader and the daemon's link
+/// (`xdp_nat`): `None` while the fast path is off; `generation` changes
+/// with every new map (a reload empties it, and the link must refill it).
+#[derive(Default)]
+pub(crate) struct NatSlot {
+    pub generation: u64,
+    pub map: Option<NatMap>,
+}
+
+pub(crate) type SharedNat = std::sync::Arc<std::sync::Mutex<NatSlot>>;
+
+pub(crate) fn lock_nat(slot: &SharedNat) -> std::sync::MutexGuard<'_, NatSlot> {
+    slot.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn take_nat(ebpf: &mut Ebpf) -> Result<Option<NatMap>, HalError> {
+    let map = ebpf
+        .take_map(m::NAT_FLOWS)
+        .ok_or_else(|| HalError::Rejected("XDP: no NAT_FLOWS map".into()))?;
+    NatMap::try_from(map)
+        .map(Some)
+        .map_err(|e| rejected("NAT_FLOWS map", &e))
+}
+
+pub(crate) fn flow_key(f: &NatFlow) -> FlowKey {
+    fastnat::key(
+        f.proto,
+        f.src.0.octets(),
+        f.dst.0.octets(),
+        f.src.1,
+        f.dst.1,
+    )
+}
+
+fn endpoint((a, p): (std::net::Ipv4Addr, u16)) -> Endpoint {
+    Endpoint {
+        addr: a.octets(),
+        port: p,
+    }
+}
+
+impl NatSlot {
+    fn map(&mut self) -> Result<&mut NatMap, HalError> {
+        self.map
+            .as_mut()
+            .ok_or_else(|| HalError::Rejected("XDP: the CGNAT fast path is off".into()))
+    }
+
+    pub(crate) fn install(&mut self, flows: &[NatFlow]) -> Result<(), HalError> {
+        let map = self.map()?;
+        for f in flows {
+            map.insert(
+                flow_key(f),
+                fastnat::value(endpoint(f.new_src), endpoint(f.new_dst)),
+                0,
+            )
+            .map_err(|e| rejected("NAT_FLOWS insert", &e))?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove(&mut self, flows: &[NatFlow]) -> Result<(), HalError> {
+        let map = self.map()?;
+        for f in flows {
+            let _ = map.remove(&flow_key(f));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn used(&mut self, flow: &NatFlow) -> Option<FlowUse> {
+        let map = self.map.as_ref()?;
+        map.get(&flow_key(flow), 0)
+            .ok()
+            .map(|[_, _, last_ns, packets]| FlowUse { last_ns, packets })
+    }
+
+    pub(crate) fn count(&self) -> usize {
+        self.map
+            .as_ref()
+            .map_or(0, |m| m.keys().filter(Result::is_ok).count())
+    }
+}
+
 impl XdpState {
+    fn set_nat(&self, map: Option<NatMap>) {
+        let mut slot = lock_nat(&self.nat);
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.map = map;
+    }
+
+    /// The flow map's slot, for the daemon's link (`xdp_nat`).
+    pub(crate) fn nat_slot(&self) -> SharedNat {
+        self.nat.clone()
+    }
+
+    /// The fast path's link to this map and to conntrack (what the
+    /// daemon's service gets through `Hal::xdp_nat_link`).
+    pub fn nat_link(&self) -> Result<Box<dyn corerouter_hal::xdp_nat::NatLink>, HalError> {
+        Ok(Box::new(crate::xdp_nat::LinuxNatLink::open(
+            self.nat_slot(),
+        )?))
+    }
+
+    /// Put flow directions in the fast path (replacing what a key held).
+    pub fn nat_install(&mut self, flows: &[NatFlow]) -> Result<(), HalError> {
+        lock_nat(&self.nat).install(flows)
+    }
+
+    /// Take flow directions out (one already gone is not an error).
+    pub fn nat_remove(&mut self, flows: &[NatFlow]) -> Result<(), HalError> {
+        lock_nat(&self.nat).remove(flows)
+    }
+
+    /// What the fast path did with `flow` (`None`: not there).
+    pub fn nat_use(&mut self, flow: &NatFlow) -> Result<Option<FlowUse>, HalError> {
+        Ok(lock_nat(&self.nat).used(flow))
+    }
+
+    /// Flow directions in the fast path now.
+    pub fn nat_count(&mut self) -> usize {
+        lock_nat(&self.nat).count()
+    }
+
+    /// Why packets of known flows went to the kernel, by reason (only the
+    /// reasons seen), summed over the CPUs.
+    pub fn nat_misses(&mut self) -> Vec<(&'static str, u64)> {
+        let Some(l) = self.loaded.as_mut().filter(|l| l.fast_nat) else {
+            return Vec::new();
+        };
+        let Some(map) = l.ebpf.map_mut(m::NAT_MISS) else {
+            return Vec::new();
+        };
+        let Ok(arr) = aya::maps::PerCpuArray::<_, u64>::try_from(map) else {
+            return Vec::new();
+        };
+        fastnat::MISS_NAMES
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| !name.is_empty())
+            .filter_map(|(i, name)| {
+                let total: u64 = arr.get(&(i as u32), 0).ok()?.iter().sum();
+                (total > 0).then_some((*name, total))
+            })
+            .collect()
+    }
+
     /// Run the loaded program on `frame` `repeat` times in the kernel
     /// (`BPF_PROG_TEST_RUN`), with its maps as they are: the XDP action
     /// (1 drop, 2 pass) and the mean time per run. For tests and
@@ -252,7 +438,27 @@ impl XdpState {
         frame: &[u8],
         repeat: u32,
     ) -> Result<(u32, std::time::Duration), HalError> {
+        self.test_run_on(frame, repeat, None)
+    }
+
+    /// [`XdpState::test_run`] as if the frame arrived on interface
+    /// `ingress` (its index): the CGNAT fast path's FIB lookup starts there.
+    pub fn test_run_on(
+        &mut self,
+        frame: &[u8],
+        repeat: u32,
+        ingress: Option<u32>,
+    ) -> Result<(u32, std::time::Duration), HalError> {
         use aya::programs::{TestRun, TestRunOptions};
+        // `struct xdp_md`: data, data_end, data_meta, ingress_ifindex,
+        // rx_queue_index, egress_ifindex.
+        let ctx: Option<Vec<u8>> = ingress.map(|i| {
+            let len = u32::try_from(frame.len()).unwrap_or(u32::MAX);
+            [0u32, len, 0, i, 0, 0]
+                .iter()
+                .flat_map(|w| w.to_ne_bytes())
+                .collect()
+        });
         let l = self
             .loaded
             .as_mut()
@@ -268,6 +474,7 @@ impl XdpState {
             .test_run(TestRunOptions {
                 data_in: Some(frame),
                 data_out: Some(&mut out),
+                ctx_in: ctx.as_deref(),
                 repeat: repeat.max(1),
                 ..TestRunOptions::default()
             })
@@ -276,8 +483,12 @@ impl XdpState {
     }
 }
 
-fn load() -> Result<Loaded, HalError> {
-    let mut ebpf = Ebpf::load(OBJECT).map_err(|e| rejected("loading the object", &e))?;
+fn load(fast_nat: bool) -> Result<Loaded, HalError> {
+    let flows = if fast_nat { m::NAT_FLOWS_MAX } else { 1 };
+    let mut ebpf = aya::EbpfLoader::new()
+        .map_max_entries(m::NAT_FLOWS, flows)
+        .load(OBJECT)
+        .map_err(|e| rejected("loading the object", &e))?;
     let prog: &mut XdpProgram = ebpf
         .program_mut(m::PROGRAM)
         .ok_or_else(|| HalError::Rejected(format!("XDP: no program {} in the object", m::PROGRAM)))?
@@ -288,6 +499,7 @@ fn load() -> Result<Loaded, HalError> {
     Ok(Loaded {
         ebpf,
         links: BTreeMap::new(),
+        fast_nat,
     })
 }
 
@@ -299,6 +511,7 @@ fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan) -> Result<(), HalError> {
         allow: !plan.allow.is_empty(),
         rate_pps: plan.rate_limit,
         burst: plan.rate_burst,
+        fast_nat: plan.fast_nat,
     };
     let map = ebpf
         .map_mut(m::SETTINGS)
@@ -544,6 +757,11 @@ mod tests {
     #[test]
     fn limits_agree_with_the_model() {
         assert_eq!(
+            corerouter_hal::xdp_nat::MAX_CARRIED * 2,
+            m::NAT_FLOWS_MAX as usize,
+            "two flow directions per carried connection"
+        );
+        assert_eq!(
             m::MAX_INTERFACES as usize,
             corerouter_model::xdp::MAX_INTERFACES
         );
@@ -598,6 +816,8 @@ mod tests {
             m::RATE,
             m::COUNTERS,
             m::TOP,
+            m::NAT_FLOWS,
+            m::NAT_MISS,
         ] {
             assert!(
                 obj.maps.contains_key(name),

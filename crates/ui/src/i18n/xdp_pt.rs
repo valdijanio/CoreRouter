@@ -52,6 +52,17 @@ Pacotes descartados porque a origem está numa lista de bloqueio (e em nenhuma l
 Pacotes descartados por segundo nesta interface, somando todos os motivos (bloqueio, taxa, malformado, flags TCP). Calculado da diferença dos contadores entre duas leituras com pelo menos um segundo de intervalo."##,
     ),
     (
+        "xdp.fast_nat",
+        r##"## O que faz
+Caminho rápido do CGNAT: as conexões que o CGNAT do kernel (nftables) já traduziu passam a ser traduzidas e encaminhadas aqui, no driver, sem passar pelo conntrack, pelas regras nem pelo roteamento do kernel.
+## Como funciona
+O kernel continua decidindo tudo: os primeiros pacotes de cada conexão passam pelo nftables, que escolhe a porta na faixa determinística do assinante. Quando o conntrack diz que a conexão está estabelecida (os dois sentidos vistos), o serviço `xdp-nat` copia os dois sentidos para o mapa do XDP; dali em diante o XDP troca endereço e porta, corrige os checksums (RFC 1624), desconta o TTL e manda o pacote pela interface que a tabela de rotas indica (`bpf_fib_lookup`). O serviço renova o timeout do conntrack das conexões que o XDP carregou e tira do mapa as que o conntrack encerrou.
+## Fica no kernel
+IPv6, ICMP, fragmentos, quadros com VLAN, pacotes com opções IP, SYN/FIN/RST (o conntrack acompanha a abertura e o fechamento), TTL 1, e o que a tabela de rotas não resolve na hora (vizinho ainda sem MAC, MTU). "Enviado ao kernel" mostra quantos de cada motivo.
+## Precisa
+XDP nas interfaces dos assinantes e nas de saída para a internet. Até 262 144 conexões ao mesmo tempo; as que passarem disso seguem pelo kernel. O "Quem era?" continua exato: a porta foi o kernel que escolheu."##,
+    ),
+    (
         "xdp.malformed",
         r##"## O que descarta
 Quadros com cabeçalho impossível: cortado no meio do cabeçalho Ethernet, VLAN, IP ou de transporte; versão do IP diferente do EtherType; IHL abaixo de 20 bytes; comprimento total menor que o cabeçalho ou maior que o quadro; comprimento UDP impossível; offset TCP abaixo de 20 bytes.
@@ -130,9 +141,11 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Blocked", "Bloqueados"),
     ("Blocked prefixes", "Prefixos bloqueados"),
     ("Burst (packets)", "Rajada (pacotes)"),
+    ("CGNAT Fast Path", "Caminho rápido do CGNAT"),
     ("Drop Invalid TCP Flags", "Descartar flags TCP inválidas"),
     ("Drop Malformed", "Descartar malformados"),
     ("Drop pps", "Descartados pps"),
+    ("Fast NAT pps", "Caminho rápido pps"),
     ("Filter", "Filtro"),
     ("Malformed", "Malformados"),
     ("Most dropped sources", "Origens mais descartadas"),
@@ -142,11 +155,12 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Rate Limit (pps per source)", "Limite de taxa (pps por origem)"),
     ("Reset Counters", "Zerar contadores"),
     ("Select an interface first", "Selecione uma interface primeiro"),
+    ("Sent to the kernel:", "Enviado ao kernel:"),
     ("TCP Flags", "Flags TCP"),
-    (
-        "This router has no XDP filter yet: update corerouter-daemon.",
-        "Este roteador ainda não tem o filtro XDP: atualize o corerouter-daemon.",
-    ),
+    ("This router has no XDP filter yet: update corerouter-daemon.", "Este roteador ainda não tem o filtro XDP: atualize o corerouter-daemon."),
     ("Top Sources", "Top origens"),
+    ("connections", "conexões"),
+    ("flow directions", "sentidos de fluxo"),
+    ("timeouts renewed", "timeouts renovados"),
     ("unavailable", "indisponível"),
 ];
