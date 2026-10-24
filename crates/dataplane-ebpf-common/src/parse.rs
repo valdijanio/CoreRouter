@@ -116,6 +116,19 @@ pub struct IpInfo {
     pub malformed: Option<Malformed>,
 }
 
+impl IpInfo {
+    /// The IPv4 header and transport offsets with a bound the eBPF
+    /// verifier can see. An `IpInfo` copied through memory loses the range
+    /// the verifier knew, and it refuses packet arithmetic with an
+    /// unbounded offset. The masks change nothing for an IPv4 packet this
+    /// parser accepted: the IP header starts at 14, 18 or 22 (< 64) and the
+    /// transport at most 60 bytes later (< 128).
+    #[inline(always)]
+    pub fn v4_offsets(&self) -> (usize, usize) {
+        (self.ip_off & 0x3f, self.l4_off & 0x7f)
+    }
+}
+
 /// The outcome of [`parse`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Parsed {

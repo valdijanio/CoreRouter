@@ -90,7 +90,8 @@ pub fn admit<P: crate::packet::Packet + ?Sized>(p: &P, info: &IpInfo) -> Result<
     if info.proto == IPPROTO_TCP && info.tcp_flags & (TCP_SYN | TCP_FIN | TCP_RST) != 0 {
         return Err(Kernel::Control);
     }
-    match p.u8_at(info.ip_off + 8) {
+    let (ip_off, _) = info.v4_offsets();
+    match p.u8_at(ip_off + 8) {
         Some(ttl) if ttl > 1 => Ok(()),
         Some(_) => Err(Kernel::Ttl),
         None => Err(Kernel::Short),
@@ -107,16 +108,14 @@ pub fn translate<P: PacketMut + ?Sized>(
 ) -> Result<(), Kernel> {
     let [src, dst, ..] = *v;
     nat::rewrite(p, info, Some(decode(src)), Some(decode(dst))).map_err(|_| Kernel::Short)?;
-    let ttl_off = info.ip_off + 8;
+    let (ip_off, _) = info.v4_offsets();
+    let ttl_off = ip_off + 8;
     let word = p.be16(ttl_off).ok_or(Kernel::Short)?;
     let new = word.checked_sub(0x0100).ok_or(Kernel::Ttl)?;
-    let csum = p.be16(info.ip_off + 10).ok_or(Kernel::Short)?;
+    let csum = p.be16(ip_off + 10).ok_or(Kernel::Short)?;
     p.store(ttl_off, new.to_be_bytes()).ok_or(Kernel::Short)?;
-    p.store(
-        info.ip_off + 10,
-        nat::update16(csum, word, new).to_be_bytes(),
-    )
-    .ok_or(Kernel::Short)?;
+    p.store(ip_off + 10, nat::update16(csum, word, new).to_be_bytes())
+        .ok_or(Kernel::Short)?;
     Ok(())
 }
 

@@ -89,10 +89,10 @@ pub fn rewrite<P: PacketMut + ?Sized>(
     if info.fragment != Fragment::No {
         return Err(NotHere::Fragment);
     }
-    let ip_off = info.ip_off;
+    let (ip_off, l4_off) = info.v4_offsets();
     let csum_off = match info.proto {
-        IPPROTO_TCP => info.l4_off + 16,
-        IPPROTO_UDP => info.l4_off + 6,
+        IPPROTO_TCP => l4_off + 16,
+        IPPROTO_UDP => l4_off + 6,
         _ => return Err(NotHere::Protocol),
     };
     let (crate::parse::Addr::V4(old_src), crate::parse::Addr::V4(old_dst)) = (info.src, info.dst)
@@ -102,8 +102,8 @@ pub fn rewrite<P: PacketMut + ?Sized>(
     let ip_csum = p.be16(ip_off + 10).ok_or(NotHere::Short)?;
     let l4_csum = p.be16(csum_off).ok_or(NotHere::Short)?;
     // Ports are read from the frame, not trusted from `info`.
-    let old_sport = p.be16(info.l4_off).ok_or(NotHere::Short)?;
-    let old_dport = p.be16(info.l4_off + 2).ok_or(NotHere::Short)?;
+    let old_sport = p.be16(l4_off).ok_or(NotHere::Short)?;
+    let old_dport = p.be16(l4_off + 2).ok_or(NotHere::Short)?;
     let src = src.unwrap_or(Endpoint {
         addr: old_src,
         port: old_sport,
@@ -134,8 +134,8 @@ pub fn rewrite<P: PacketMut + ?Sized>(
     p.store(ip_off + 12, src.addr).ok_or(NotHere::Short)?;
     p.store(ip_off + 16, dst.addr).ok_or(NotHere::Short)?;
     w(p, ip_off + 10, ip.to_be_bytes())?;
-    w(p, info.l4_off, src.port.to_be_bytes())?;
-    w(p, info.l4_off + 2, dst.port.to_be_bytes())?;
+    w(p, l4_off, src.port.to_be_bytes())?;
+    w(p, l4_off + 2, dst.port.to_be_bytes())?;
     w(p, csum_off, l4.to_be_bytes())?;
     Ok(())
 }
