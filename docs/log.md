@@ -3289,3 +3289,93 @@ continuação indentadas).
   squash, e esse último commit não está na branch do filho; a resolução automática não reconhecia o
   pai e devolvia o PR à sessão (#177 e #186, 2026-10-23). Testado no #186 real: os 4 arquivos do
   conflito resolvidos sozinhos.
+
+- 2026-10-23 — G1.28: IP › Addresses é a primeira janela no padrão de lista (G0.24) e serve de referência
+  (`crates/ui/src/ip_address.rs`).
+
+  - **Engine:**
+    - `ip.address.set {id, address?, interface?, disabled?, comment?, force?}`: editar, ativar,
+      desativar e comentar; o `disabled` fica na config e sai do kernel.
+    - `ip.address.remove` aceita `force?`.
+    - `ip.address.list` ganhou `state` (`active`, `disabled`, `invalid`, `tentative`, `dad-failed`,
+      `deprecated`), `family`, `vrf` e `access` (por que esta sessão depende do endereço); as flags
+      continuam para o terminal.
+    - `ip.address.check` é a consulta por trás do modal. Ela calcula rede, máscara, broadcast,
+      hosts e faixa, monta a série `to` (até 256 endereços, numa transação) e confere: endereço
+      repetido, sobreposição com outra interface da mesma VRF, endereço de rede ou broadcast, ARP e
+      risco de acesso. Também devolve os comandos.
+    - O `ip.address.add` não mudou.
+  - **Perda de acesso:** a checagem de lockout passa a recusar também a remoção da rede, ou da rota,
+    por onde a sessão de gerência chega (antes só o próprio endereço). O `lockout_reason` responde
+    sem aplicar, para a pré-visualização avisar antes.
+  - **ARP (RFC 5227):** uma sonda com remetente 0.0.0.0 pelo socket do cliente DHCP (`AF_PACKET`)
+    e resposta lida entre 1 e 2 s, em segundo plano: a janela mostra "checando…" e pergunta de novo.
+    Desligável, só para um endereço IPv4. No lab virtual, quem responde é o roteador do lab.
+  - **HAL:** `address_states` (Linux, rtnetlink) informa DAD do IPv6 (RFC 4862: tentative,
+    dadfailed) e deprecated.
+  - **GUI:**
+    - barra + − ✓ ✗ 💬, filtros IPv4/IPv6 e por estado, selos de estado, origem, interface e VRF,
+      coluna Lifetime e rodapé com contagens;
+    - clique direito com copiar como comando, duplo clique para editar, 💬 para comentar vários de
+      uma vez;
+    - ⓘ em cada coluna (`Column::help`, novo no `table.rs`: o clique volta em
+      `TableOutput::help`) e em cada campo do modal, menos o Comment, que é óbvio (regra "Explicação
+      ⓘ em todo lugar que couber"); explicações em PT e EN em `i18n/address_*.rs`;
+    - ✗ e − num endereço de gerência abrem antes a janela "This change would lock you out" (Safe
+      Mode ou aplicar mesmo assim).
+
+  Como testar:
+  - **Engine:** `cargo test -p corerouter-engine --test ip_address`. Cobre disable e volta, rollback
+    em modo transacional e em lote atômico, cálculo, série com teto, sobreposição e VRF, edição só
+    do que mudou, ARP pendente → em uso/livre, e lockout do endereço e da rede de chegada.
+  - **GUI:** `cargo test -p corerouter-ui --lib tests::ip_address`.
+  - **Kernel:** `cargo xtask netns` (`hal-linux/tests/netns_address.rs`: disabled sai e volta, DAD
+    tentative → livre ou dad-failed, sonda ARP acha o MAC de quem tem o endereço; 1,7–2,2 s,
+    **medido** em 3 execuções).
+
+- 2026-10-23 — G2.5b: Licença dos crates do XDP (decisão do usuário, opção "c"): `crates/dataplane-ebpf`,
+  `crates/dataplane-ebpf-common` e `crates/cgnat-map` passam a **GPL-2.0-or-later** (valor explícito
+  no `Cargo.toml` e cabeçalho SPDX em cada arquivo); o programa declara `"GPL"` ao kernel, o que
+  libera os helpers `gpl_only`, como o `bpf_fib_lookup` que o fast path do CGNAT usa para encaminhar
+  no próprio XDP. O resto do projeto continua AGPL-3.0-or-later; GPL-2.0-or-later combina com ela
+  (GPL-2.0-only não combinaria) e o copyleft continua. Objeto pré-compilado regerado; o teste
+  `the_xdp_crates_and_object_are_gpl` (`hal-linux`) confere a string do objeto e os manifestos.
+  Registro em `docs/xdp.md` § Licença e `docs/architecture.md`.
+
+- 2026-10-23 — G2.5b: XDP, parte 2c: `dataplane-ebpf-common::nat`, a reescrita do fast path do CGNAT. Troca origem e/ou
+  destino (endereço IPv4 e porta TCP/UDP) no lugar e atualiza os checksums IP e TCP/UDP de forma
+  incremental, sem somar o payload: RFC 1624 Eqn 3, HC' = ~(~HC + ~m + m'), pulando a palavra que
+  não mudou (errata 4782). UDP sem checksum (0, RFC 768) continua sem; um checksum calculado 0
+  sai 0xFFFF. Fragmento e protocolo que não seja TCP/UDP ficam no kernel (`NotHere`). Nada é
+  escrito se algum campo não couber. Ainda não é chamada pelo programa (G2.5b, próxima parte).
+
+  Teste: exemplo da RFC 1624 §4; proptest (3000 casos) contra o recálculo completo
+  (`testing::with_checksums`/`checksums_ok`): checksums válidos depois de qualquer reescrita,
+  campos novos, payload intacto, ida e volta devolve o quadro original. `cargo test -p
+  corerouter-dataplane-ebpf-common --test nat_props`.
+
+- 2026-10-23 — G4.4f: Exportador para um ClickHouse externo e opcional (`docs/analytics.md`): o roteador não guarda
+  nada de longo prazo, envia em lotes. Comandos `system.analytics.set|print|test|schema` (destino,
+  credenciais por senha ou certificado, CA própria, o que enviar, lote, intervalo, fila em memória e
+  em disco, compressão; segredos sempre `***`); serviço `analytics` do daemon sob o supervisor
+  (`INSERT … FORMAT JSONEachRow` com gzip pela interface HTTP, cliente HTTP/TLS do próprio daemon
+  com rustls, sem driver em C; reenvio com espera de 1 s a 60 s e sorteio, `insert_deduplication_token`
+  por lote, 4xx de dado ruim descartado e contado, 401/403/404/408/429/5xx guardados; fila de
+  tamanho fixo que descarta o lote mais antigo e conta, disco opcional com teto em
+  `--analytics-spool`, que sobrevive a reinício); ação de log embutida `analytics` (regras do
+  `/system logging` escolhem os eventos, esquema único com severidade, prioridade, tópico, origem,
+  mensagem e detalhe JSON); métricas do `/metrics` a cada `metrics_interval` e o histórico de
+  tráfego da G4.5 (média e máximo de cada minuto, CPU, memória, conntrack e por interface); blocos de portas do
+  CGNAT (G2.3c, pelo log) e sessões NAT44 do Traffic Flow em `nat_events`; fluxos do Traffic Flow
+  (G4.4b) em `flows`, com as interfaces por nome. Esquema SQL pronto (MergeTree, partição por dia, ordem por roteador e tempo, TTL, view
+  `otel_logs` com os nomes do OpenTelemetry), igual ao gerado pelo roteador (teste). Janela
+  System › Analytics: estado em selos, contadores, Test Connection (versão e tabelas que faltam),
+  formulário com ⓘ em cada rótulo, "Add rules" para os logs e aba Schema com Copy.
+
+  Como testar: `corerouter-cli run system.analytics.set '{"enabled": true, "url":
+  "http://127.0.0.1:18123"}'`, regras `system.logging.add topics=info action=analytics`,
+  `system.analytics.test`, `system.analytics.print`; com um ClickHouse de verdade sem root,
+  `COREROUTER_CLICKHOUSE_URL=http://127.0.0.1:18123 cargo test -p corerouter-daemon --bin
+  corerouter-daemon real_clickhouse` (docs/analytics.md §8: logs, métricas, fluxo, NAT e a view;
+  TLS com CA própria e login por certificado com `COREROUTER_CLICKHOUSE_TLS_URL`), testado com o
+  ClickHouse 26.9.25.15.
