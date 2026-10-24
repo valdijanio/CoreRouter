@@ -66,3 +66,432 @@ fn wrong_password_is_refused_and_cleaned_up() {
     );
     l.check().unwrap();
 }
+
+// ---------------------------------------------------------------- raw frames
+
+const AC: Mac = Mac([0x02, 0xac, 0, 0, 0, 9]);
+const HOST: Mac = Mac([0x02, 0x11, 0, 0, 0, 1]);
+const HOST2: Mac = Mac([0x02, 0x11, 0, 0, 0, 2]);
+
+fn server(f: impl FnOnce(&mut ServerConfig)) -> (Server, ServerOutput) {
+    let mut c = ServerConfig {
+        ac_mac: AC,
+        ..ServerConfig::default()
+    };
+    f(&mut c);
+    (Server::new(c, [5; 32], 0), ServerOutput::new())
+}
+
+fn padi(src: Mac, f: impl FnOnce(&mut DiscoveryWriter<'_>)) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut b, Mac::BROADCAST, src, Vlans::NONE, Code::Padi, 0);
+    f(&mut w);
+    w.finish().unwrap();
+    b
+}
+
+fn padi_std(src: Mac) -> Vec<u8> {
+    padi(src, |w| {
+        w.tag(tag::SERVICE_NAME, b"");
+        w.tag(tag::HOST_UNIQ, b"hu");
+    })
+}
+
+/// Parses every frame of `out` as Discovery.
+fn replies(out: &ServerOutput) -> Vec<Discovery<'_>> {
+    out.frames()
+        .filter_map(|(_, f)| discovery::parse(f).ok())
+        .collect()
+}
+
+fn padr_from(pado: &Discovery<'_>, src: Mac, f: impl FnOnce(&mut DiscoveryWriter<'_>)) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut b, AC, src, Vlans::NONE, Code::Padr, 0);
+    w.tag(tag::SERVICE_NAME, pado.tags.service_name.unwrap_or(b""));
+    if let Some(h) = pado.tags.host_uniq {
+        w.tag(tag::HOST_UNIQ, h);
+    }
+    if let Some(c) = pado.tags.ac_cookie {
+        w.tag(tag::AC_COOKIE, c);
+    }
+    f(&mut w);
+    w.finish().unwrap();
+    b
+}
+
+/// PADI → PADO → PADR; returns the PADR frame and the PADS SID.
+fn discover(s: &mut Server, out: &mut ServerOutput, now: Millis, src: Mac) -> (Vec<u8>, u16) {
+    out.clear();
+    s.handle_frame(now, 1, &padi_std(src), out);
+    let padr = {
+        let r = replies(out);
+        let pado = r.first().expect("PADO");
+        padr_from(pado, src, |_| {})
+    };
+    out.clear();
+    s.handle_frame(now, 1, &padr, out);
+    let sid = replies(out)
+        .iter()
+        .find(|d| d.code == Code::Pads)
+        .map(|d| d.session_id)
+        .expect("PADS");
+    (padr, sid)
+}
+
+#[test]
+fn rfc2516_5_2_pado_carries_ac_name_same_service_and_echoes() {
+    let (mut s, mut out) = server(|_| {});
+    let f = padi(HOST, |w| {
+        w.tag(tag::SERVICE_NAME, b"internet");
+        w.tag(tag::HOST_UNIQ, &[9, 9]);
+        w.tag(tag::RELAY_SESSION_ID, b"relay-7");
+    });
+    s.handle_frame(0, 1, &f, &mut out);
+    let r = replies(&out);
+    assert_eq!(r.len(), 1);
+    let p = r[0];
+    assert_eq!(p.code, Code::Pado);
+    assert_eq!((p.dst, p.src, p.session_id), (HOST, AC, 0));
+    assert_eq!(p.tags.ac_name, Some(&b"CoreRouter"[..]));
+    assert_eq!(p.tags.service_name, Some(&b"internet"[..]));
+    assert_eq!(p.tags.host_uniq, Some(&[9u8, 9][..]));
+    assert_eq!(p.tags.relay_session_id, Some(&b"relay-7"[..]));
+    assert_eq!(
+        p.tags.ac_cookie.map(<[u8]>::len),
+        Some(crate::guard::COOKIE_LEN)
+    );
+    assert_eq!(p.tags.ppp_max_payload, None, "RFC 4638 off by default");
+}
+
+#[test]
+fn rfc2516_5_2_unserved_service_or_bad_padi_gets_no_answer() {
+    let (mut s, mut out) = server(|c| c.service_names = vec![b"internet".to_vec()]);
+    for f in [
+        padi(HOST, |w| {
+            w.tag(tag::SERVICE_NAME, b"iptv");
+        }),
+        // §5.1: exactly one Service-Name.
+        padi(HOST, |_| {}),
+        padi(HOST, |w| {
+            w.tag(tag::SERVICE_NAME, b"");
+            w.tag(tag::SERVICE_NAME, b"internet");
+        }),
+    ] {
+        s.handle_frame(0, 1, &f, &mut out);
+    }
+    assert!(out.frames.is_empty());
+    assert_eq!(s.stats().padi_refused, 3);
+    // An empty Service-Name ("any service") and the offered one are served.
+    s.handle_frame(0, 1, &padi_std(HOST), &mut out);
+    let f = padi(HOST2, |w| {
+        w.tag(tag::SERVICE_NAME, b"internet");
+    });
+    s.handle_frame(0, 1, &f, &mut out);
+    assert_eq!(replies(&out).len(), 2);
+}
+
+#[test]
+fn group_source_mac_is_ignored() {
+    let (mut s, mut out) = server(|_| {});
+    s.handle_frame(0, 1, &padi_std(Mac([0x03, 0, 0, 0, 0, 1])), &mut out);
+    assert!(out.frames.is_empty());
+}
+
+#[test]
+fn rfc4638_ppp_max_payload_echoed_only_when_supported() {
+    let (mut s, mut out) = server(|c| c.max_payload = Some(1500));
+    for (v, echoed) in [(1500, true), (1508, false), (1492, false)] {
+        out.clear();
+        let f = padi(HOST, |w| {
+            w.tag(tag::SERVICE_NAME, b"");
+            w.tag_u16(tag::PPP_MAX_PAYLOAD, v);
+        });
+        s.handle_frame(0, 1, &f, &mut out);
+        let r = replies(&out);
+        assert_eq!(r[0].tags.ppp_max_payload.is_some(), echoed, "{v}");
+    }
+}
+
+fn pado_for(s: &mut Server, out: &mut ServerOutput, now: Millis, src: Mac) -> Vec<u8> {
+    out.clear();
+    s.handle_frame(now, 1, &padi_std(src), out);
+    let r = replies(out);
+    padr_from(r.first().expect("PADO"), src, |_| {})
+}
+
+fn pads(out: &ServerOutput) -> Option<Discovery<'_>> {
+    replies(out).into_iter().find(|d| d.code == Code::Pads)
+}
+
+#[test]
+fn rfc2516_9_padr_without_valid_cookie_creates_nothing() {
+    let (mut s, mut out) = server(|_| {});
+    let good = pado_for(&mut s, &mut out, 0, HOST);
+    // Forged: one bit of the tag flipped.
+    let mut forged = good.clone();
+    let n = forged.len();
+    forged[n - 1] ^= 1;
+    // Replayed by another MAC.
+    let mut stolen = good.clone();
+    stolen[6..12].copy_from_slice(&HOST2.0);
+    // Without the cookie at all.
+    let bare = {
+        let mut b = Vec::new();
+        let mut w = DiscoveryWriter::begin(&mut b, AC, HOST, Vlans::NONE, Code::Padr, 0);
+        w.tag(tag::SERVICE_NAME, b"");
+        w.finish().unwrap();
+        b
+    };
+    for f in [&forged, &stolen, &bare] {
+        out.clear();
+        s.handle_frame(10, 1, f, &mut out);
+        assert!(out.frames.is_empty());
+    }
+    assert_eq!(s.stats().padr_bad_cookie, 3);
+    assert_eq!(s.active(), 0);
+    // Expired: past cookie_timeout_ms (5 s).
+    out.clear();
+    s.handle_frame(7000, 1, &good, &mut out);
+    assert_eq!(s.active(), 0);
+    // In time: a session.
+    let fresh = pado_for(&mut s, &mut out, 8000, HOST);
+    out.clear();
+    s.handle_frame(8000, 1, &fresh, &mut out);
+    assert_eq!(s.active(), 1);
+    s.check_invariants().unwrap();
+}
+
+#[test]
+fn cookie_survives_a_secret_rotation() {
+    let (mut s, mut out) = server(|_| {});
+    let padr = pado_for(&mut s, &mut out, 0, HOST);
+    s.rotate_cookie_secret([42; 32]);
+    out.clear();
+    s.handle_frame(100, 1, &padr, &mut out);
+    assert!(pads(&out).is_some_and(|p| p.session_id != 0));
+}
+
+#[test]
+fn rfc2516_5_4_duplicate_padr_gets_the_same_session() {
+    let (mut s, mut out) = server(|_| {});
+    let (padr, sid) = discover(&mut s, &mut out, 0, HOST);
+    out.clear();
+    s.handle_frame(500, 1, &padr, &mut out);
+    assert_eq!(pads(&out).map(|p| p.session_id), Some(sid));
+    assert_eq!(s.active(), 1);
+    assert_eq!(s.stats().padr_duplicate, 1);
+}
+
+#[test]
+fn rfc2516_5_4_bad_service_in_padr_is_service_name_error_with_sid_zero() {
+    let (mut s, mut out) = server(|c| c.service_names = vec![b"internet".to_vec()]);
+    out.clear();
+    let f = padi(HOST, |w| {
+        w.tag(tag::SERVICE_NAME, b"internet");
+    });
+    s.handle_frame(0, 1, &f, &mut out);
+    let padr = {
+        let r = replies(&out);
+        padr_from(&r[0], HOST, |w| {
+            w.tag(tag::SERVICE_NAME, b"second");
+        })
+    };
+    out.clear();
+    s.handle_frame(0, 1, &padr, &mut out);
+    let p = pads(&out).unwrap();
+    assert_eq!(p.session_id, 0);
+    assert!(p.tags.service_name_error.is_some());
+    assert_eq!(s.active(), 0);
+}
+
+#[test]
+fn max_sessions_answers_ac_system_error_and_stops_offering() {
+    let (mut s, mut out) = server(|c| c.max_sessions = 2);
+    discover(&mut s, &mut out, 0, Mac([2, 0, 0, 0, 0, 1]));
+    let padr3 = pado_for(&mut s, &mut out, 0, Mac([2, 0, 0, 0, 0, 3]));
+    discover(&mut s, &mut out, 0, Mac([2, 0, 0, 0, 0, 2]));
+    // Full: no PADO (RFC 2516 §5.2 "able to serve")…
+    out.clear();
+    s.handle_frame(0, 1, &padi_std(Mac([2, 0, 0, 0, 0, 4])), &mut out);
+    assert!(out.frames.is_empty());
+    // …and a PADR from an earlier offer gets AC-System-Error, SID 0.
+    s.handle_frame(0, 1, &padr3, &mut out);
+    let p = pads(&out).unwrap();
+    assert_eq!(p.session_id, 0);
+    assert!(p.tags.ac_system_error.is_some());
+    s.check_invariants().unwrap();
+}
+
+#[test]
+fn one_session_per_host_replaces_the_old_session() {
+    let (mut s, mut out) = server(|_| {});
+    let (_, sid1) = discover(&mut s, &mut out, 0, HOST);
+    // The host restarts with another Host-Uniq.
+    out.clear();
+    let f = padi(HOST, |w| {
+        w.tag(tag::SERVICE_NAME, b"");
+        w.tag(tag::HOST_UNIQ, b"new");
+    });
+    s.handle_frame(10, 1, &f, &mut out);
+    let padr = {
+        let r = replies(&out);
+        padr_from(&r[0], HOST, |_| {})
+    };
+    out.clear();
+    s.handle_frame(10, 1, &padr, &mut out);
+    let r = replies(&out);
+    assert!(
+        r.iter()
+            .any(|d| d.code == Code::Padt && d.session_id == sid1),
+        "old one PADT'd"
+    );
+    let sid2 = pads(&out).unwrap().session_id;
+    assert_ne!(sid1, sid2);
+    assert_eq!(s.active(), 1);
+    assert!(out.events.iter().any(|e| matches!(
+        e,
+        Event::Down {
+            reason: DownReason::Replaced,
+            ..
+        }
+    )));
+    s.check_invariants().unwrap();
+}
+
+#[test]
+fn several_sessions_per_host_when_allowed() {
+    let (mut s, mut out) = server(|c| c.one_session_per_host = false);
+    discover(&mut s, &mut out, 0, HOST);
+    let f = padi(HOST, |w| {
+        w.tag(tag::SERVICE_NAME, b"");
+        w.tag(tag::HOST_UNIQ, b"second");
+    });
+    out.clear();
+    s.handle_frame(0, 1, &f, &mut out);
+    let padr = padr_from(&replies(&out)[0], HOST, |_| {});
+    out.clear();
+    s.handle_frame(0, 1, &padr, &mut out);
+    assert_eq!(s.active(), 2);
+    s.check_invariants().unwrap();
+}
+
+#[test]
+fn rfc2516_4_sids_are_unique_nonzero_and_never_ffff() {
+    let (mut s, mut out) = server(|c| c.max_sessions = 300);
+    let mut seen = std::collections::HashSet::new();
+    for i in 0..300u32 {
+        let b = i.to_be_bytes();
+        let (_, sid) = discover(&mut s, &mut out, 0, Mac([2, 1, b[0], b[1], b[2], b[3]]));
+        assert!(sid != 0 && sid != 0xffff);
+        assert!(seen.insert(sid));
+    }
+    s.check_invariants().unwrap();
+}
+
+#[test]
+fn rfc2516_5_5_padt_from_the_host_frees_at_once_and_silently() {
+    let (mut s, mut out) = server(|_| {});
+    let (_, sid) = discover(&mut s, &mut out, 0, HOST);
+    let padt = |src: Mac| {
+        let mut b = Vec::new();
+        DiscoveryWriter::begin(&mut b, AC, src, Vlans::NONE, Code::Padt, sid)
+            .finish()
+            .unwrap();
+        b
+    };
+    // A PADT from another MAC for that SID does nothing.
+    out.clear();
+    s.handle_frame(0, 1, &padt(HOST2), &mut out);
+    assert_eq!(s.active(), 1);
+    s.handle_frame(0, 1, &padt(HOST), &mut out);
+    assert_eq!(s.active(), 0);
+    assert!(out.frames.is_empty(), "nothing sent after a PADT");
+    assert!(matches!(
+        out.events.last(),
+        Some(Event::Down {
+            reason: DownReason::PeerPadt,
+            ..
+        })
+    ));
+    // And no timer resurrects it.
+    out.clear();
+    for t in 1..100 {
+        s.handle_timers(t * 1000, &mut out);
+    }
+    assert!(out.frames.is_empty());
+    s.check_invariants().unwrap();
+}
+
+#[test]
+fn silent_host_after_pads_is_cleaned_up_by_max_configure() {
+    let (mut s, mut out) = server(|_| {});
+    discover(&mut s, &mut out, 0, HOST);
+    let mut padt = false;
+    for t in 1..=40 {
+        out.clear();
+        s.handle_timers(t * 1000, &mut out);
+        padt |= replies(&out).iter().any(|d| d.code == Code::Padt);
+    }
+    assert!(padt);
+    assert_eq!(s.active(), 0);
+    assert!(s.next_deadline().is_none_or(|d| d > 40_000));
+}
+
+#[test]
+fn per_mac_padi_limit() {
+    let (mut s, mut out) = server(|c| {
+        c.mac_padi_limit = 1;
+        c.mac_padi_burst = 2;
+    });
+    for _ in 0..10 {
+        s.handle_frame(0, 1, &padi_std(HOST), &mut out);
+    }
+    s.handle_frame(0, 1, &padi_std(HOST2), &mut out);
+    assert_eq!(replies(&out).len(), 3, "2 for HOST, 1 for HOST2");
+    assert_eq!(s.stats().padi_limited, 8);
+}
+
+#[test]
+fn pado_delay_tiers() {
+    let (mut s, mut out) = server(|c| c.pado_delay = vec![(0, 0), (1, 300)]);
+    discover(&mut s, &mut out, 0, HOST);
+    out.clear();
+    s.handle_frame(1000, 1, &padi_std(HOST2), &mut out);
+    assert!(out.frames.is_empty(), "delayed with one session up");
+    assert_eq!(s.next_deadline().map(|d| d <= 1300), Some(true));
+    s.handle_timers(1299, &mut out);
+    assert!(replies(&out).is_empty());
+    s.handle_timers(1300, &mut out);
+    assert_eq!(
+        replies(&out)
+            .iter()
+            .filter(|d| d.code == Code::Pado)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn vlan_range_filter() {
+    let (mut s, mut out) = server(|c| c.vlans = VlanFilter::Ranges(vec![100..=199]));
+    let tagged = |vid| {
+        let mut b = Vec::new();
+        let mut w = DiscoveryWriter::begin(
+            &mut b,
+            Mac::BROADCAST,
+            HOST,
+            Vlans::single(vid),
+            Code::Padi,
+            0,
+        );
+        w.tag(tag::SERVICE_NAME, b"");
+        w.finish().unwrap();
+        b
+    };
+    s.handle_frame(0, 1, &tagged(99), &mut out);
+    s.handle_frame(0, 1, &padi_std(HOST), &mut out);
+    assert!(out.frames.is_empty());
+    s.handle_frame(0, 1, &tagged(150), &mut out);
+    let r = replies(&out);
+    assert_eq!(r[0].vlans, Vlans::single(150), "answered on the same VLAN");
+}
