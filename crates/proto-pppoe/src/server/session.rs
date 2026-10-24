@@ -910,6 +910,11 @@ impl Session {
         if self.dead.is_some() {
             return;
         }
+        // Echo runs only in Opened (RFC 1661 §5.8); a deadline left from
+        // before LCP went down is dropped, not kept firing.
+        if self.echo_at != 0 && self.echo_at <= now && !self.lcp.is_opened() {
+            self.echo_at = 0;
+        }
         if self.echo_at != 0 && self.echo_at <= now && self.lcp.is_opened() {
             if self.echo_misses >= env.cfg.keepalive_misses {
                 // The subscriber is gone: it would not answer Terminate.

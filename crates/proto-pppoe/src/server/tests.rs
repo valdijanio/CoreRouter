@@ -476,7 +476,7 @@ fn pado_delay_tiers() {
 
 #[test]
 fn vlan_range_filter() {
-    let (mut s, mut out) = server(|c| c.vlans = VlanFilter::Ranges(vec![100..=199]));
+    let (mut s, mut out) = server(|c| c.vlans = VlanFilter::Ranges(vec![100..=149, 150..=199]));
     let tagged = |vid| {
         let mut b = Vec::new();
         let mut w = DiscoveryWriter::begin(

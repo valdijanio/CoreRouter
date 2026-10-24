@@ -117,6 +117,9 @@ pub enum ClientPhase {
 
 pub type ClientOutput = Output<ClientEvent>;
 
+/// A CHAP Response sent: Identifier, expected MS-CHAPv2 authenticator, body.
+type Answered = (u8, Option<[u8; AUTH_STRING_LEN]>, Box<[u8]>);
+
 pub struct Client {
     cfg: ClientConfig,
     phase: ClientPhase,
@@ -146,7 +149,7 @@ pub struct Client {
     /// repeated until Success/Failure (RFC 1994 §4.1): a stale Challenge
     /// (from before an LCP renegotiation, reordered on the wire) may have
     /// been answered after the live one.
-    answered: Vec<(u8, Option<[u8; AUTH_STRING_LEN]>, Box<[u8]>)>,
+    answered: Vec<Answered>,
     echo_at: Millis,
     echo_misses: u8,
     echo_id: u8,
@@ -765,6 +768,11 @@ impl Client {
     }
 
     pub fn handle_timers(&mut self, now: Millis, out: &mut ClientOutput) {
+        // Echo runs only in Opened (RFC 1661 §5.8); a deadline left from
+        // before LCP went down is dropped, not kept firing.
+        if self.echo_at != 0 && self.echo_at <= now && !self.lcp.is_opened() {
+            self.echo_at = 0;
+        }
         if self.echo_at != 0 && self.echo_at <= now && self.lcp.is_opened() {
             if self.echo_misses >= self.cfg.keepalive_misses {
                 // The BNG is gone; it will not answer Terminate either.

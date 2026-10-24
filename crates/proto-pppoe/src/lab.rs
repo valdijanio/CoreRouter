@@ -118,6 +118,9 @@ enum Answer {
     Address(usize, SessionRef),
 }
 
+/// Edits a frame in flight (`true` = toward a server).
+pub type Mutator = Box<dyn FnMut(bool, &mut Vec<u8>)>;
+
 /// A frame on the wire: arrival time, sequence (FIFO among equals), where.
 type InFlight = (Millis, u64, Dest, Vec<u8>);
 
@@ -137,6 +140,8 @@ pub struct LabStats {
     pub server_reasons: std::collections::BTreeMap<String, u64>,
     /// Client downs other than a server PADT: (time, client, reason).
     pub odd_downs: Vec<(Millis, usize, String)>,
+    /// Clients whose timers did not advance (a bug if not empty).
+    pub stuck: Vec<(Millis, usize)>,
 }
 
 pub struct Lab {
@@ -148,11 +153,14 @@ pub struct Lab {
     /// Clients whose session is up, by (shard, SID).
     pub up: HashMap<(usize, u16), usize>,
     pub tapped: Vec<Vec<u8>>,
+    /// Edits frames in flight (`true` = toward a server): the fuzzer's hook.
+    pub mutate: Option<Mutator>,
     queue: BinaryHeap<Reverse<InFlight>>,
     answers: BinaryHeap<Reverse<(Millis, u64, Answer)>>,
     client_timers: BinaryHeap<Reverse<(Millis, usize)>>,
     starts: BinaryHeap<Reverse<(Millis, usize)>>,
     server_tick: Millis,
+    timers_ran: Option<usize>,
     by_mac: HashMap<Mac, usize>,
     pool_next: u32,
     pool_free: Vec<Ipv4Addr>,
@@ -170,6 +178,11 @@ pub fn client_mac(i: usize) -> Mac {
 
 pub fn ac_mac(shard: usize) -> Mac {
     Mac([0x02, 0xac, 0, 0, 0, shard as u8])
+}
+
+/// The seed of shard `k`'s server (its AC-Cookie key derives from it).
+pub fn server_seed(seed: u64, k: usize) -> [u8; 32] {
+    seed32(seed, 1_000_000 + k as u64)
 }
 
 fn seed32(seed: u64, i: u64) -> [u8; 32] {
@@ -191,7 +204,7 @@ impl Lab {
                 let mut sc = cfg.server.clone();
                 sc.ac_mac = ac_mac(k);
                 sc.ipv6 = cfg.ipv6 || sc.ipv6;
-                Server::new(sc, seed32(cfg.seed, 1_000_000 + k as u64), 0)
+                Server::new(sc, server_seed(cfg.seed, k), 0)
             })
             .collect();
         let cycle = if cfg.auth_cycle.is_empty() {
@@ -231,11 +244,13 @@ impl Lab {
             stats: LabStats::default(),
             up: HashMap::new(),
             tapped: Vec::new(),
+            mutate: None,
             queue: BinaryHeap::new(),
             answers: BinaryHeap::new(),
             client_timers: BinaryHeap::new(),
             starts: BinaryHeap::new(),
             server_tick: 0,
+            timers_ran: None,
             by_mac,
             pool_next: 0,
             pool_free: Vec::new(),
@@ -303,6 +318,12 @@ impl Lab {
         } else {
             1
         };
+        let mut frame = std::borrow::Cow::Borrowed(frame);
+        if let Some(m) = self.mutate.as_mut() {
+            let mut f = frame.into_owned();
+            m(matches!(dest, Dest::Server(_)), &mut f);
+            frame = std::borrow::Cow::Owned(f);
+        }
         for _ in 0..copies {
             let mut at = self.now + self.cfg.delay_ms;
             if self.dice.hit(self.cfg.reorder_ppm) {
@@ -374,6 +395,13 @@ impl Lab {
         if let Some(c) = self.clients.get(i)
             && let Some(d) = c.next_deadline()
         {
+            // Right after its timers ran, a past deadline is a stuck one
+            // (recorded above): look again 1 ms later instead of spinning.
+            let d = if self.timers_ran == Some(i) {
+                d.max(self.now + 1)
+            } else {
+                d
+            };
             self.client_timers.push(Reverse((d, i)));
         }
     }
@@ -586,8 +614,15 @@ impl Lab {
                 if due == Some(at) {
                     if let Some(c) = self.clients.get_mut(i) {
                         c.handle_timers(now, &mut self.cout);
+                        // A deadline that does not move after its timer ran
+                        // would spin the simulation: record it as a bug.
+                        if c.next_deadline().is_some_and(|d| d <= now) {
+                            self.stats.stuck.push((now, i));
+                        }
                     }
+                    self.timers_ran = Some(i);
                     self.flush_client(i);
+                    self.timers_ran = None;
                 }
             }
             if self.server_tick <= now {
@@ -636,6 +671,12 @@ impl Lab {
 
     /// Cross-checks servers, clients and the address pool.
     pub fn check(&self) -> Result<(), String> {
+        if let Some((t, i)) = self.stats.stuck.first() {
+            return Err(format!(
+                "client {i} timer stuck at {t} ms ({} times)",
+                self.stats.stuck.len()
+            ));
+        }
         for s in &self.servers {
             s.check_invariants()?;
         }

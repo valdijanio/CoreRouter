@@ -7,6 +7,7 @@ pub mod descriptor;
 pub mod discovery;
 pub mod eth;
 pub mod fsm;
+pub mod fuzz;
 pub mod guard;
 pub mod lab;
 pub mod layers;

@@ -3,6 +3,7 @@
 //! server's indexes, the address pool and the client/server views
 //! (`Lab::check`): unique SESSION_IDs, one session per subscriber, no lease
 //! or session left behind.
+#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
 
 use corerouter_proto_pppoe::client::ClientPhase;
 use corerouter_proto_pppoe::lab::{Lab, LabConfig};
@@ -152,7 +153,7 @@ fn heavy_loss_duplication_and_reordering() {
     // With 5 % loss a session may die of keepalive, time out in setup, or
     // be replaced when its host gives up waiting for a PADS and starts
     // over, but never on a protocol error.
-    for (reason, _) in &l.stats.server_reasons {
+    for reason in l.stats.server_reasons.keys() {
         assert!(
             [
                 "Keepalive",
@@ -333,7 +334,7 @@ fn ac_cookie_replay_is_refused() {
 #[test]
 fn authentication_failures_at_scale_leave_nothing_behind() {
     let n = 10_000;
-    let mut l = run(
+    let l = run(
         LabConfig {
             clients: n,
             bad_password_every: 10,
