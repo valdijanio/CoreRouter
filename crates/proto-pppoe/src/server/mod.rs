@@ -770,15 +770,6 @@ impl Server {
             self.stats.ignored += 1;
             return;
         }
-        // RFC 2516 §9: no valid cookie, no state.
-        let cookie_ok = d
-            .tags
-            .ac_cookie
-            .is_some_and(|c| self.cookies.verify(now, c, d.src, ifindex, d.vlans));
-        if self.cfg.require_cookie && !cookie_ok {
-            self.stats.padr_bad_cookie += 1;
-            return;
-        }
         let host = HostKey {
             ifindex,
             vlans: d.vlans,
@@ -788,14 +779,24 @@ impl Server {
         // A copy of the PADR that created a session (retransmitted because
         // our PADS was lost, or duplicated on the wire and late) gets the
         // same SESSION_ID. The cookie makes it the same request: a host that
-        // starts over sends a new PADI and brings a new cookie. Without
-        // cookies, only before LCP starts.
+        // starts over sends a new PADI and brings a new cookie. Checked
+        // before the cookie's age: we validated these exact bytes when the
+        // session was made. Without cookies, only before LCP starts.
         let same_request = |s: &Session| d.tags.ac_cookie.is_some() || s.in_discovery();
         if let Some(&sid) = self.by_uniq.get(&(host, uniq))
             && self.slot(sid).is_some_and(same_request)
         {
             self.stats.padr_duplicate += 1;
             self.send_pads(ifindex, d, sid, out);
+            return;
+        }
+        // RFC 2516 §9: no valid cookie, no state.
+        let cookie_ok = d
+            .tags
+            .ac_cookie
+            .is_some_and(|c| self.cookies.verify(now, c, d.src, ifindex, d.vlans));
+        if self.cfg.require_cookie && !cookie_ok {
+            self.stats.padr_bad_cookie += 1;
             return;
         }
         // RFC 2516 §5.3: exactly one Service-Name; §5.4: one we do not

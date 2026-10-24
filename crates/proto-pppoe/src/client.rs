@@ -140,7 +140,13 @@ pub struct Client {
     expect: Option<[u8; AUTH_STRING_LEN]>,
     /// Last CHAP Response body, repeated until Success/Failure arrives
     /// (RFC 1994 §4.1).
-    chap_response: Option<Box<[u8]>>,
+    last_challenge: Option<(u8, Box<[u8]>)>,
+    /// Responses sent in this Authenticate phase (at most 4): Identifier,
+    /// the MS-CHAPv2 authenticator string we expect back, the body. All are
+    /// repeated until Success/Failure (RFC 1994 §4.1): a stale Challenge
+    /// (from before an LCP renegotiation, reordered on the wire) may have
+    /// been answered after the live one.
+    answered: Vec<(u8, Option<[u8; AUTH_STRING_LEN]>, Box<[u8]>)>,
     echo_at: Millis,
     echo_misses: u8,
     echo_id: u8,
@@ -221,7 +227,8 @@ impl Client {
             auth_deadline: 0,
             auth_retries: 0,
             expect: None,
-            chap_response: None,
+            last_challenge: None,
+            answered: Vec::new(),
             echo_at: 0,
             echo_misses: 0,
             echo_id: 0,
@@ -528,7 +535,8 @@ impl Client {
             self.v6.down();
             // RFC 1661 §3.5: back through Authenticate after renegotiation.
             self.auth_deadline = 0;
-            self.chap_response = None;
+            self.last_challenge = None;
+            self.answered.clear();
             self.expect = None;
             if self.phase != ClientPhase::Terminate {
                 self.phase = ClientPhase::Establish;
@@ -587,15 +595,18 @@ impl Client {
         self.auth_deadline = now + self.cfg.fsm.restart_ms;
     }
 
-    fn send_chap_response(&mut self, now: Millis, out: &mut ClientOutput) {
-        if let Some(body) = &self.chap_response {
-            let mut tx = ClientTx {
-                out: &mut *out,
-                link: self.link(),
-                sid: self.sid,
-                ifindex: self.cfg.ifindex,
-            };
-            tx.send(proto::CHAP, ac::CHAP_RESPONSE, self.auth_id, body);
+    /// Sends the Response for `only`, or all of this phase's.
+    fn send_chap_response(&mut self, now: Millis, out: &mut ClientOutput, only: Option<u8>) {
+        let mut tx = ClientTx {
+            out: &mut *out,
+            link: self.link(),
+            sid: self.sid,
+            ifindex: self.cfg.ifindex,
+        };
+        for (id, _, body) in &self.answered {
+            if only.is_none_or(|o| o == *id) {
+                tx.send(proto::CHAP, ac::CHAP_RESPONSE, *id, body);
+            }
         }
         self.auth_retries = self.auth_retries.saturating_sub(1);
         self.auth_deadline = now + self.cfg.fsm.restart_ms;
@@ -627,6 +638,16 @@ impl Client {
                 let Ok(v) = ChapValue::parse(pkt.data) else {
                     return;
                 };
+                // A repeated Challenge (duplicated or retransmitted with the
+                // same Identifier and value) gets the same Response: a new
+                // MS-CHAPv2 Peer-Challenge would not match the Success the
+                // authenticator computes for the first one.
+                let key = Some((pkt.id, v.value.to_vec().into_boxed_slice()));
+                if self.last_challenge == key && self.answered.iter().any(|a| a.0 == pkt.id) {
+                    self.send_chap_response(now, out, Some(pkt.id));
+                    return;
+                }
+                self.last_challenge = key;
                 let mut value = Vec::with_capacity(auth::MSCHAP_RESPONSE);
                 match self.auth {
                     Some(AuthProto::ChapMd5) => {
@@ -675,14 +696,21 @@ impl Client {
                     name: &self.cfg.username,
                 };
                 if cv.put(&mut body).is_ok() {
-                    self.chap_response = Some(body.into());
                     self.auth_retries = self.cfg.fsm.max_configure;
-                    self.send_chap_response(now, out);
+                    self.answered.retain(|a| a.0 != pkt.id);
+                    if self.answered.len() >= 4 {
+                        self.answered.remove(0);
+                    }
+                    self.answered.push((pkt.id, self.expect, body.into()));
+                    self.send_chap_response(now, out, Some(pkt.id));
                 }
             }
-            (proto::CHAP, ac::CHAP_SUCCESS) if pkt.id == self.auth_id => {
+            (proto::CHAP, ac::CHAP_SUCCESS) => {
+                let Some(expect) = self.answered.iter().find(|a| a.0 == pkt.id).map(|a| a.1) else {
+                    return;
+                };
                 // RFC 2759 §8.8: check the authenticator before trusting it.
-                if let Some(e) = self.expect
+                if let Some(e) = expect
                     && !auth::mschap2_check_authenticator(&e, pkt.data)
                 {
                     self.auth_failed(now, out);
@@ -690,7 +718,9 @@ impl Client {
                 }
                 self.network(now, out);
             }
-            (proto::CHAP, ac::CHAP_FAILURE) if pkt.id == self.auth_id => self.auth_failed(now, out),
+            (proto::CHAP, ac::CHAP_FAILURE) if self.answered.iter().any(|a| a.0 == pkt.id) => {
+                self.auth_failed(now, out)
+            }
             _ => {}
         }
     }
@@ -760,6 +790,15 @@ impl Client {
         if self.disc_deadline != 0 && self.disc_deadline <= now {
             self.disc_deadline = 0;
             if self.attempts >= self.cfg.discovery_attempts {
+                if self.phase == ClientPhase::Requesting {
+                    // No PADS: the offer (and its cookie) went stale; start
+                    // Discovery over for a fresh one.
+                    self.phase = ClientPhase::Discovering;
+                    self.attempts = 0;
+                    self.disc_timeout = self.cfg.discovery_timeout_ms;
+                    self.send_padi(now, out);
+                    return;
+                }
                 self.down(ClientDown::NoOffer, out);
                 return;
             }
@@ -772,13 +811,13 @@ impl Client {
         if self.auth_deadline != 0 && self.auth_deadline <= now {
             self.auth_deadline = 0;
             let pap = self.auth == Some(AuthProto::Pap);
-            if self.phase == ClientPhase::Authenticate && (pap || self.chap_response.is_some()) {
+            if self.phase == ClientPhase::Authenticate && (pap || !self.answered.is_empty()) {
                 if self.auth_retries == 0 {
                     self.auth_failed(now, out);
                 } else if pap {
                     self.send_pap(now, out);
                 } else {
-                    self.send_chap_response(now, out);
+                    self.send_chap_response(now, out, None);
                 }
             }
         }

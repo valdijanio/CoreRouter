@@ -25,7 +25,11 @@ pub struct Dice(u64);
 
 impl Dice {
     pub fn new(seed: u64) -> Dice {
-        Dice(seed | 1)
+        // splitmix64 of the seed: every seed its own (non-zero) state.
+        let mut z = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Dice((z ^ (z >> 31)) | 1)
     }
     pub fn roll(&mut self) -> u64 {
         // xorshift64*
@@ -71,6 +75,9 @@ pub struct LabConfig {
     pub reconnect: bool,
     /// Prints every frame to or from this MAC (debugging a simulation).
     pub trace: Option<Mac>,
+    /// Frames toward the servers for which this returns true are copied
+    /// into [`Lab::tapped`] (to replay them later).
+    pub tap: Option<fn(&[u8]) -> bool>,
     pub seed: u64,
 }
 
@@ -92,6 +99,7 @@ impl Default for LabConfig {
             ipv6: false,
             reconnect: true,
             trace: None,
+            tap: None,
             seed: 1,
         }
     }
@@ -139,6 +147,7 @@ pub struct Lab {
     pub stats: LabStats,
     /// Clients whose session is up, by (shard, SID).
     pub up: HashMap<(usize, u16), usize>,
+    pub tapped: Vec<Vec<u8>>,
     queue: BinaryHeap<Reverse<InFlight>>,
     answers: BinaryHeap<Reverse<(Millis, u64, Answer)>>,
     client_timers: BinaryHeap<Reverse<(Millis, usize)>>,
@@ -221,6 +230,7 @@ impl Lab {
             clients,
             stats: LabStats::default(),
             up: HashMap::new(),
+            tapped: Vec::new(),
             queue: BinaryHeap::new(),
             answers: BinaryHeap::new(),
             client_timers: BinaryHeap::new(),
@@ -277,6 +287,11 @@ impl Lab {
                 "trace t={} {dest:?} lost={lost} {ctl:x?} {disc:?} client={phase:?}",
                 self.now
             );
+        }
+        if let (Dest::Server(_), Some(tap)) = (dest, self.cfg.tap)
+            && tap(frame)
+        {
+            self.tapped.push(frame.to_vec());
         }
         if lost {
             self.stats.lost += 1;
