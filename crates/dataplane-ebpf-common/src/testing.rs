@@ -167,3 +167,75 @@ impl Lookups for Model {
         self.buckets.insert(src.mapped(), b);
     }
 }
+
+/// One's-complement sum of `bytes` as 16-bit big-endian words (an odd
+/// last byte padded with zero), plus `seed`.
+pub fn ones_sum(bytes: &[u8], seed: u32) -> u32 {
+    bytes.chunks(2).fold(seed, |acc, w| {
+        let word = match *w {
+            [a, b] => u16::from_be_bytes([a, b]),
+            [a] => u16::from_be_bytes([a, 0]),
+            _ => 0,
+        };
+        acc + u32::from(word)
+    })
+}
+
+/// Fill in the IPv4 header checksum and the TCP/UDP checksum of an
+/// untagged IPv4 frame from [`build`] (computed in full, the reference the
+/// incremental rewrite is checked against). Other frames are left alone.
+pub fn with_checksums(mut f: Vec<u8>) -> Vec<u8> {
+    let Some(&[0x08, 0x00]) = f.get(12..14) else {
+        return f;
+    };
+    let ihl = usize::from(f.get(14).copied().unwrap_or(0) & 0x0f) * 4;
+    let l4 = 14 + ihl;
+    let proto = f.get(23).copied().unwrap_or(0);
+    if let Some(h) = f.get_mut(24..26) {
+        h.copy_from_slice(&[0, 0]);
+    }
+    let ip = !crate::nat::fold(ones_sum(f.get(14..l4).unwrap_or(&[]), 0));
+    if let Some(h) = f.get_mut(24..26) {
+        h.copy_from_slice(&ip.to_be_bytes());
+    }
+    let csum_at = match proto {
+        IPPROTO_TCP => l4 + 16,
+        IPPROTO_UDP => l4 + 6,
+        _ => return f,
+    };
+    let seg_len = f.len() - l4;
+    if let Some(h) = f.get_mut(csum_at..csum_at + 2) {
+        h.copy_from_slice(&[0, 0]);
+    }
+    let pseudo = ones_sum(
+        f.get(26..34).unwrap_or(&[]),
+        u32::from(proto) + seg_len as u32,
+    );
+    let mut c = !crate::nat::fold(ones_sum(f.get(l4..).unwrap_or(&[]), pseudo));
+    if proto == IPPROTO_UDP && c == 0 {
+        c = 0xffff;
+    }
+    if let Some(h) = f.get_mut(csum_at..csum_at + 2) {
+        h.copy_from_slice(&c.to_be_bytes());
+    }
+    f
+}
+
+/// Whether the IPv4 header and TCP/UDP checksums of `f` verify (a full
+/// sum over each comes to 0xFFFF; a UDP checksum of 0 means none).
+pub fn checksums_ok(f: &[u8]) -> bool {
+    let ihl = usize::from(f.get(14).copied().unwrap_or(0) & 0x0f) * 4;
+    let l4 = 14 + ihl;
+    let proto = f.get(23).copied().unwrap_or(0);
+    let ip_ok = crate::nat::fold(ones_sum(f.get(14..l4).unwrap_or(&[]), 0)) == 0xffff;
+    let udp_none = proto == IPPROTO_UDP && f.get(l4 + 6..l4 + 8) == Some(&[0, 0]);
+    if udp_none || !matches!(proto, IPPROTO_TCP | IPPROTO_UDP) {
+        return ip_ok;
+    }
+    let seg_len = f.len() - l4;
+    let pseudo = ones_sum(
+        f.get(26..34).unwrap_or(&[]),
+        u32::from(proto) + seg_len as u32,
+    );
+    ip_ok && crate::nat::fold(ones_sum(f.get(l4..).unwrap_or(&[]), pseudo)) == 0xffff
+}

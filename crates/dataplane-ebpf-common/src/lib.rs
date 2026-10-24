@@ -12,6 +12,8 @@
 //!   [`filter::Lookups`] the program backs with maps and the tests with
 //!   plain collections.
 //! - [`bucket`]: the per-source token bucket.
+//! - [`nat`]: the CGNAT fast path's rewrite, with checksums updated
+//!   incrementally (RFC 1624).
 //! - [`maps`]: map names, sizes and value layouts (plain integers and
 //!   arrays, so the loader needs no `unsafe impl Pod`).
 //!
@@ -26,6 +28,7 @@
 pub mod bucket;
 pub mod filter;
 pub mod maps;
+pub mod nat;
 pub mod packet;
 pub mod parse;
 #[cfg(feature = "testing")]
