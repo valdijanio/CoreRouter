@@ -117,6 +117,13 @@ O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-
 - `cargo xtask xdp-root`: só onde `COREROUTER_REQUIRE_XDP=1` (o runner do CI, que liga a variável
   pelo arquivo `ci/kernel-modules/veth`); roda o binário de teste com `sudo` num namespace
   descartável. Localmente vira `skip` e imprime o comando.
+  O usuário pode rodar com `COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root` na máquina dele: o
+  `sudo` pede a senha dele, e o agente nunca roda `sudo`. É o caminho rápido para ajustar o
+  programa (receita em `AGENTS.md`, "Acesso root e testes de rede"). A primeira rodada local foi
+  em AMD Ryzen AI Max+ 395, kernel 7.0.0, 2026-10-24, **medido**. Pacote liberado: 42 ns
+  (134 no runner). Pacote bloqueado com 1 milhão de prefixos: 126 ns (271 no runner). Carga de
+  1 milhão de prefixos: 698 ms. Envio em veth, em kpps: sem filtro 2027, nftables raw 2171, XDP
+  generic 1855, XDP native 1811.
 
 ## Blocos `unsafe` (revisão humana)
 
