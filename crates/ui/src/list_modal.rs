@@ -56,6 +56,8 @@ pub(crate) enum Input {
     Choice,
     /// A checkbox; sent as a bool.
     Check,
+    /// A write-only secret: typed hidden; when editing, empty keeps it.
+    Secret(&'static str),
 }
 
 /// One field: the parameter it fills, its label (English, through `tr`)
@@ -423,6 +425,9 @@ fn field_input(ui: &mut Ui, form: &dialog::Form, f: &Field, v: &mut String, opti
     match f.input {
         Input::Text(hint) => {
             ui.add(TextEdit::singleline(v).id(id).hint_text(hint).desired_width(220.0));
+        }
+        Input::Secret(hint) => {
+            ui.add(TextEdit::singleline(v).password(true).id(id).hint_text(hint).desired_width(220.0));
         }
         Input::Check => {
             let mut on = v == "yes";

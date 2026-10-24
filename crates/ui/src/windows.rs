@@ -48,6 +48,9 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("MPLS", &[Win::Mpls]),
     // The CGNAT window is a panel (`cgnat.rs`, G2.3d).
     ("CGNAT", &[]),
+    // The RADIUS window is a panel (`radius.rs`, G4.3j); RouterOS has it
+    // at the top of the menu too.
+    ("RADIUS", &[]),
     ("System", &[Win::Identity, Win::History]),
     ("Tools", &[Win::Ping, Win::Mtr]),
     // The Log window is a panel (`system_log.rs`, G4.6d).

@@ -341,7 +341,8 @@ pub(crate) fn steps_text(app: &CoreRouterUi, steps: &[Value]) -> Vec<String> {
         .iter()
         .map(|s| {
             let id = s.get("command").and_then(Value::as_str).unwrap_or("");
-            let p = s.get("params").cloned().unwrap_or(Value::Null);
+            // A secret the modal sends never shows on screen.
+            let p = crate::redact::redacted(&s.get("params").cloned().unwrap_or(Value::Null));
             command_text(&reg, id, &p, Syntax::RouterOs)
         })
         .collect()
