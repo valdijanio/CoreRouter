@@ -4,7 +4,10 @@
 pub mod auth;
 pub mod discovery;
 pub mod eth;
+pub mod fsm;
+pub mod guard;
 pub mod lcp;
 pub mod ncp;
 pub mod ppp;
+pub mod timer;
 pub mod wire;
