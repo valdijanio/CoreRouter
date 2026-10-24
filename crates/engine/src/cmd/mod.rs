@@ -251,7 +251,9 @@ mod tests {
             );
             for (k, _) in doc_keys(c.params) {
                 assert!(
-                    k.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                    // Digits after a letter (`enable_ipv6_accounting`, RouterOS).
+                    k.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                        && k.bytes().next().is_some_and(|b| b.is_ascii_lowercase()),
                     "{}: bad key '{k}'",
                     c.id
                 );

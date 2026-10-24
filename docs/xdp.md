@@ -15,6 +15,7 @@ da G2.3).
 | Config | `crates/model/src/xdp.rs` (`ip.xdp`) | L0 |
 | Comandos `ip.firewall.xdp.*`, pps, lockout | `crates/engine/src/cmd/firewall_xdp.rs`, `engine/src/xdp.rs` | L3 |
 | Janela IP › Firewall XDP | `crates/ui/src/xdp.rs` | L5 |
+| Assinantes PPPoE (G4.3c): sessões, policer, encapsulamento | `dataplane-ebpf-common/src/pppoe.rs`, `policer.rs`, `hal-linux/src/xdp_pppoe.rs` | L1 plataforma |
 
 ## Como usar
 
@@ -146,6 +147,25 @@ Todos em `crates/dataplane-ebpf/src/main.rs`, cada um com `SAFETY:`:
     corrida perde uma contagem, só estatística).
 11. `fast_nat`: `bpf_redirect` com o índice de interface que a FIB devolveu.
 12. `miss`: incremento do contador por CPU de `NAT_MISS`.
+
+PPPoE (G4.3c, `docs/pppoe-dataplane.md`):
+
+13. `Frame::adjust_head`: `bpf_xdp_adjust_head` no próprio contexto; falha sem mudar nada, e toda
+    leitura seguinte relê `data`/`data_end` do contexto (nenhum ponteiro de antes sobrevive).
+14. `Subs::by_key`: leitura do `u32` que o kernel devolveu do hash `PPPOE_KEYS` (o daemon troca o
+    valor inteiro; uma palavra não rasga).
+15. `Subs::by_v4`: o mesmo para `PPPOE_V4`.
+16. `Subs::policer`: `&mut *p` do elemento de `PPPOE_POLICER` (array: nunca liberado); CPUs no
+    mesmo assinante ao mesmo tempo só tornam a taxa aproximada.
+17. `stat`: incremento do contador por CPU de `PPPOE_STATS`.
+18. `sess_add`: `atomic_xadd` (adição atômica BPF, sem fetch) numa palavra de `PPPOE_COUNTERS`,
+    com o campo mascarado para dentro do elemento: contadores exatos com várias CPUs. Pede
+    `#![feature(core_intrinsics)]` (o alvo BPF não tem `AtomicU64::fetch_add` no `core`).
+19. `encap_out`: `bpf_redirect` para a porta de acesso da sessão.
+20. `forward`: `bpf_fib_lookup` com uma `bpf_fib_lookup` inteira na pilha (IPv4 ou IPv6).
+21. `forward`: `bpf_redirect` para a interface que a FIB devolveu.
+22. `nat_sub`: leitura (`*flow`) do valor de `NAT_FLOWS` (como o 8).
+23. `nat_sub`: gravação do último uso e da contagem do fluxo (como o 10).
 
 ## Pesquisa
 
