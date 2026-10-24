@@ -826,14 +826,21 @@ fn conntrack_puts_flows_in_the_fast_path() {
         let mut got = 0;
         for i in 0..rounds {
             if i == 2 {
-                // Established now: let the main thread sync, then go on.
-                to_main.send(got).unwrap();
-                from_main.recv().unwrap();
+                // Conntrack marks a UDP flow assured only for a packet
+                // more than 2 s after its start (nf_conntrack_proto_udp:
+                // "still active after two seconds").
+                std::thread::sleep(Duration::from_millis(2300));
             }
             s.send_to(format!("{i}").as_bytes(), "198.51.100.2:9")
                 .unwrap();
-            if s.recv_from(&mut buf).is_ok() {
-                got += 1;
+            match s.recv_from(&mut buf) {
+                Ok(_) => got += 1,
+                Err(e) => println!("echo {i}: {e}"),
+            }
+            if i == 2 {
+                // Assured now: let the main thread sync, then go on.
+                to_main.send(got).unwrap();
+                from_main.recv().unwrap();
             }
         }
         got
@@ -867,7 +874,7 @@ fn conntrack_puts_flows_in_the_fast_path() {
         .sum();
     println!("fast path packets {fast}, misses {:?}", st.fast_nat_misses);
     assert!(
-        fast >= 2 * (rounds as u64 - 2) - 4,
+        fast >= 2 * (rounds as u64 - 3) - 4,
         "fast path carried {fast}"
     );
     let ct_after: u64 = link
