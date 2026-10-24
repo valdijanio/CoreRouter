@@ -115,3 +115,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G2.5b: crates do XDP passam a GPL-2.0-or-later (decisão de licença do usuário)
 - 2026-10-23 — G2.5b: reescrita NAT com checksum incremental (RFC 1624) no dataplane-ebpf-common
 - 2026-10-23 — G4.4f criado e feito (exportador para ClickHouse externo); G4.4g e G4.4h criados
+- 2026-10-24 — G2.5b feito (caminho rápido do CGNAT em XDP, offload guiado pelo conntrack, escolha do usuário)
+- 2026-10-24 — G4.3b criado e feito (RADIUS em Rust puro para o BNG, escolha do usuário em 2026-10-24)

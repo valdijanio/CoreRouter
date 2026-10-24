@@ -34,6 +34,7 @@ corerouter-proto-iperf = { path = "crates/proto-iperf" }
 corerouter-proto-syslog = { path = "crates/proto-syslog" }
 corerouter-proto-flow = { path = "crates/proto-flow" }
 corerouter-proto-pppoe = { path = "crates/proto-pppoe" }
+corerouter-proto-radius = { path = "crates/proto-radius" }
 corerouter-engine = { path = "crates/engine" }
 corerouter-control = { path = "crates/control" }
 corerouter-mcp = { path = "crates/mcp" }
@@ -75,6 +76,13 @@ rcgen = { version = "0.14.0", default-features = false, features = ["crypto", "r
 ring = "0.17.14"
 # G0.3: password prompt without echo (CLI).
 rpassword = "7.4.0"
+# G4.3b: RADIUS (RustCrypto, pure Rust): MD5/HMAC-MD5 for the authenticators,
+# MD4/SHA-1/DES for MS-CHAP (RFC 2759) and the MPPE keys (RFC 3079).
+md-5 = { version = "0.11.0", default-features = false }
+hmac = "0.13.0"
+md4 = { version = "0.11.0", default-features = false }
+sha1 = { version = "0.11.0", default-features = false }
+des = "0.9.0"
 # G0.3: "Remember password" in the OS store (Keychain, Credential Manager, Secret
 # Service over zbus: pure Rust, no libdbus headers on CI).
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
@@ -106,6 +114,10 @@ debug = false
 opt-level = 3
 
 [profile.dev.package.blake2]
+opt-level = 3
+
+# G4.3b: the RADIUS load simulation hashes every packet (100k requests).
+[profile.dev.package.md-5]
 opt-level = 3
 
 [profile.release]

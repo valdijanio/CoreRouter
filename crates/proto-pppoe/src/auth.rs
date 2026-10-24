@@ -1,6 +1,9 @@
 //! Authentication protocols: PAP (RFC 1334 §2), CHAP (RFC 1994 §4) with MD5,
 //! MS-CHAPv1 (RFC 2433) and MS-CHAPv2 (RFC 2759), plus the MPPE key
-//! derivation of RFC 3079 §3 for a later MPPE/RADIUS step.
+//! derivation of RFC 3079 §3 for a later MPPE/RADIUS step. The MS-CHAP
+//! arithmetic is `corerouter_proto_radius::mschap` (one implementation for
+//! the RADIUS NAS and the PPP authenticator); this module holds the PPP
+//! packet layouts and the checks a local-secret caller runs.
 //!
 //! The packet views borrow the frame. The verification helpers are what a
 //! caller with a local secret (`/ppp secret`) runs; a RADIUS caller instead
@@ -8,10 +11,8 @@
 //! hands the server's answer back.
 
 use crate::wire::{Reader, WireError, parse_hex, put_hex_upper};
-use des::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
-use md4::Md4;
-use md5::Md5;
-use sha1::{Digest, Sha1};
+use corerouter_proto_radius::mschap;
+use md5::{Digest, Md5};
 
 /// PAP and CHAP codes.
 pub mod code {
@@ -131,115 +132,21 @@ pub const MSCHAP_RESPONSE: usize = 49;
 /// "S=" + 40 hex digits (RFC 2759 §5).
 pub const AUTH_STRING_LEN: usize = 42;
 
-/// RFC 2759 §8.3 NtPasswordHash: MD4 of the UTF-16LE (Unicode) password.
+/// RFC 2759 §8.3 NtPasswordHash of a password given as text.
 pub fn nt_password_hash(password: &str) -> [u8; 16] {
-    let mut h = Md4::new();
-    for u in password.encode_utf16() {
-        h.update(u.to_le_bytes());
-    }
-    h.finalize().into()
+    mschap::nt_password_hash(&mschap::utf16le(password))
 }
 
-/// RFC 2759 §8.4 HashNtPasswordHash.
-pub fn hash_nt_password_hash(hash: &[u8; 16]) -> [u8; 16] {
-    Md4::digest(hash).into()
-}
-
-/// RFC 2759 §8.6 DesEncrypt: a 7-octet key spread over 8 (parity bits
-/// left at zero; DES ignores them).
-fn des_encrypt(clear: &[u8; 8], k: &[u8; 7]) -> [u8; 8] {
-    let bits = u64::from_be_bytes([0, k[0], k[1], k[2], k[3], k[4], k[5], k[6]]);
-    let mut key = [0u8; 8];
-    for (i, b) in key.iter_mut().enumerate() {
-        let shift = 49 - 7 * i as u32;
-        *b = (((bits >> shift) & 0x7f) as u8) << 1;
-    }
-    let cipher = des::Des::new(GenericArray::from_slice(&key));
-    let mut block = GenericArray::clone_from_slice(clear);
-    cipher.encrypt_block(&mut block);
-    block.into()
-}
-
-/// RFC 2759 §8.5 ChallengeResponse: the 16-octet hash zero-padded to 21 and
-/// cut in three DES keys.
-pub fn challenge_response(challenge: &[u8; 8], hash: &[u8; 16]) -> [u8; 24] {
-    let mut z = [0u8; 21];
-    z[..16].copy_from_slice(hash);
-    let mut out = [0u8; 24];
-    for (chunk, key) in out
-        .as_chunks_mut::<8>()
-        .0
-        .iter_mut()
-        .zip(z.as_chunks::<7>().0)
-    {
-        *chunk = des_encrypt(challenge, key);
-    }
-    out
-}
-
-/// RFC 2433 §A.5 NtChallengeResponse (MS-CHAPv1).
-pub fn mschap1_nt_response(challenge: &[u8; 8], password: &str) -> [u8; 24] {
-    challenge_response(challenge, &nt_password_hash(password))
-}
-
-/// RFC 2759 §8.2: only the user name, without a prepended `DOMAIN\`.
-pub fn mschap2_user(name: &[u8]) -> &[u8] {
-    match name.iter().rposition(|&b| b == b'\\') {
-        Some(i) => name.get(i + 1..).unwrap_or(name),
-        None => name,
-    }
-}
-
-/// RFC 2759 §8.2 ChallengeHash.
-pub fn challenge_hash(peer: &[u8; 16], auth: &[u8; 16], user: &[u8]) -> [u8; 8] {
-    let mut h = Sha1::new();
-    h.update(peer);
-    h.update(auth);
-    h.update(mschap2_user(user));
-    let d: [u8; 20] = h.finalize().into();
-    d.first_chunk::<8>().copied().unwrap_or_default()
-}
-
-/// RFC 2759 §8.1 GenerateNTResponse.
-pub fn mschap2_nt_response(
-    auth: &[u8; 16],
-    peer: &[u8; 16],
-    user: &[u8],
-    password: &str,
-) -> [u8; 24] {
-    challenge_response(
-        &challenge_hash(peer, auth, user),
-        &nt_password_hash(password),
-    )
-}
-
-const MAGIC1: &[u8] = b"Magic server to client signing constant";
-const MAGIC2: &[u8] = b"Pad to make it do more than one iteration";
-
-/// RFC 2759 §8.7 GenerateAuthenticatorResponse: "S=" + 40 uppercase hex.
-pub fn mschap2_authenticator_response(
-    password_hash: &[u8; 16],
-    nt_response: &[u8; 24],
-    peer: &[u8; 16],
-    auth: &[u8; 16],
-    user: &[u8],
-) -> [u8; AUTH_STRING_LEN] {
-    let hh = hash_nt_password_hash(password_hash);
-    let mut h = Sha1::new();
-    h.update(hh);
-    h.update(nt_response);
-    h.update(MAGIC1);
-    let d1 = h.finalize();
-    let mut h = Sha1::new();
-    h.update(d1);
-    h.update(challenge_hash(peer, auth, user));
-    h.update(MAGIC2);
-    let d2 = h.finalize();
+/// The 20-octet authenticator digest as "S=" + 40 uppercase hex (RFC 2759
+/// §8.7), without allocating a `String`.
+pub fn auth_string(digest: &[u8; 20]) -> [u8; AUTH_STRING_LEN] {
     let mut s = Vec::with_capacity(AUTH_STRING_LEN);
     s.extend_from_slice(b"S=");
-    put_hex_upper(&mut s, &d2);
+    put_hex_upper(&mut s, digest);
     let mut out = [0u8; AUTH_STRING_LEN];
-    out.copy_from_slice(&s);
+    for (d, b) in out.iter_mut().zip(&s) {
+        *d = *b;
+    }
     out
 }
 
@@ -251,7 +158,9 @@ pub fn mschap2_check_authenticator(expected: &[u8; AUTH_STRING_LEN], message: &[
         .is_some_and(|m| m.eq_ignore_ascii_case(expected))
 }
 
-/// An MS-CHAP Response value (49 octets; RFC 2433 §5 and RFC 2759 §4).
+/// An MS-CHAP Response value as PPP carries it (49 octets; RFC 2433 §5 and
+/// RFC 2759 §4). RADIUS wraps the same octets with Ident and Flags first
+/// (RFC 2548 §2.3.2): see [`MsChapResponse::to_radius_v2`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MsChapResponse {
     /// v2: Peer-Challenge; v1: the first 16 octets of the LM response.
@@ -279,18 +188,41 @@ impl MsChapResponse {
 
     pub fn to_bytes(&self) -> [u8; MSCHAP_RESPONSE] {
         let mut out = [0u8; MSCHAP_RESPONSE];
-        out[..16].copy_from_slice(&self.peer_challenge);
-        out[16..24].copy_from_slice(&self.reserved);
-        out[24..48].copy_from_slice(&self.nt_response);
-        out[48] = self.flags;
+        let parts: [&[u8]; 4] = [
+            &self.peer_challenge,
+            &self.reserved,
+            &self.nt_response,
+            &[self.flags],
+        ];
+        let mut i = 0;
+        for p in parts {
+            if let Some(d) = out.get_mut(i..i + p.len()) {
+                d.copy_from_slice(p);
+            }
+            i += p.len();
+        }
         out
+    }
+
+    /// The RADIUS MS-CHAP2-Response attribute value (RFC 2548 §2.3.2).
+    pub fn to_radius_v2(&self, ident: u8) -> mschap::Chap2Response {
+        mschap::Chap2Response {
+            ident,
+            flags: self.flags,
+            peer_challenge: self.peer_challenge,
+            nt_response: self.nt_response,
+        }
     }
 }
 
 /// Checks an MS-CHAPv1 response (NT response only; RFC 2433 §5: the LM
 /// response is obsolete and refused, flag 0).
 pub fn verify_mschap1(challenge: &[u8; 8], password: &str, resp: &MsChapResponse) -> bool {
-    resp.flags == 1 && ct_eq(&mschap1_nt_response(challenge, password), &resp.nt_response)
+    resp.flags == 1
+        && ct_eq(
+            &mschap::v1_nt_response(challenge, &mschap::utf16le(password)),
+            &resp.nt_response,
+        )
 }
 
 /// Checks an MS-CHAPv2 response and returns the authenticator string for
@@ -301,17 +233,38 @@ pub fn verify_mschap2(
     password: &str,
     resp: &MsChapResponse,
 ) -> Option<[u8; AUTH_STRING_LEN]> {
-    let expected = mschap2_nt_response(auth, &resp.peer_challenge, user, password);
+    // RFC 2759 §8.2: the hash takes the user name without a `DOMAIN\`.
+    let user = mschap::strip_domain(user);
+    let pw = mschap::utf16le(password);
+    let expected = mschap::generate_nt_response(auth, &resp.peer_challenge, user, &pw);
     if !ct_eq(&expected, &resp.nt_response) {
         return None;
     }
-    Some(mschap2_authenticator_response(
-        &nt_password_hash(password),
-        &resp.nt_response,
-        &resp.peer_challenge,
-        auth,
-        user,
-    ))
+    let digest =
+        mschap::authenticator_response(&pw, &resp.nt_response, &resp.peer_challenge, auth, user);
+    Some(auth_string(&digest))
+}
+
+/// The client side of RFC 2759 §8.1: the 49-octet Response for a challenge.
+pub fn mschap2_client_response(
+    auth: &[u8; 16],
+    peer: &[u8; 16],
+    user: &[u8],
+    password: &str,
+) -> (MsChapResponse, [u8; AUTH_STRING_LEN]) {
+    let user = mschap::strip_domain(user);
+    let pw = mschap::utf16le(password);
+    let nt = mschap::generate_nt_response(auth, peer, user, &pw);
+    let digest = mschap::authenticator_response(&pw, &nt, peer, auth, user);
+    (
+        MsChapResponse {
+            peer_challenge: *peer,
+            reserved: [0; 8],
+            nt_response: nt,
+            flags: 0,
+        },
+        auth_string(&digest),
+    )
 }
 
 /// RFC 2759 §6 Failure message: `E=691 R=0 C=<challenge hex> V=3 M=<text>`.
@@ -331,49 +284,6 @@ pub fn mschap2_failure_challenge(msg: &[u8]) -> Option<[u8; 16]> {
     let mut out = [0u8; 16];
     parse_hex(hex, &mut out)?;
     Some(out)
-}
-
-// ---------------------------------------------------------------- MPPE keys
-
-/// RFC 3079 §3.4 GetMasterKey.
-pub fn mppe_master_key(password_hash_hash: &[u8; 16], nt_response: &[u8; 24]) -> [u8; 16] {
-    let mut h = Sha1::new();
-    h.update(password_hash_hash);
-    h.update(nt_response);
-    h.update(b"This is the MPPE Master Key");
-    let d: [u8; 20] = h.finalize().into();
-    d.first_chunk::<16>().copied().unwrap_or_default()
-}
-
-const MPPE_MAGIC2: &[u8] =
-    b"On the client side, this is the send key; on the server side, it is the receive key.";
-const MPPE_MAGIC3: &[u8] =
-    b"On the client side, this is the receive key; on the server side, it is the send key.";
-
-/// RFC 3079 §3.4 GetAsymmetricStartKey; `len` is 8 (40/56-bit) or 16 (128-bit).
-pub fn mppe_asymmetric_start_key(
-    master: &[u8; 16],
-    len: usize,
-    is_send: bool,
-    is_server: bool,
-) -> [u8; 16] {
-    let magic = if is_send == is_server {
-        MPPE_MAGIC3
-    } else {
-        MPPE_MAGIC2
-    };
-    let mut h = Sha1::new();
-    h.update(master);
-    h.update([0u8; 40]);
-    h.update(magic);
-    h.update([0xf2u8; 40]);
-    let d = h.finalize();
-    let mut out = [0u8; 16];
-    let n = len.min(16);
-    if let (Some(dst), Some(src)) = (out.get_mut(..n), d.get(..n)) {
-        dst.copy_from_slice(src);
-    }
-    out
 }
 
 #[cfg(test)]
@@ -403,20 +313,11 @@ mod tests {
         let auth = arr::<16>(AUTH_CH);
         let peer = arr::<16>(PEER_CH);
         assert_eq!(
-            challenge_hash(&peer, &auth, USER),
-            arr::<8>("D0 2E 43 86 BC E9 12 26")
-        );
-        assert_eq!(
             nt_password_hash(PASS),
             arr::<16>("44 EB BA 8D 53 12 B8 D6 11 47 44 11 F5 69 89 AE")
         );
-        assert_eq!(
-            hash_nt_password_hash(&nt_password_hash(PASS)),
-            arr::<16>("41 C0 0C 58 4B D2 D9 1C 40 17 A2 A1 2F A5 9F 3F")
-        );
-        let nt = mschap2_nt_response(&auth, &peer, USER, PASS);
-        assert_eq!(nt, arr::<24>(NT_RESP));
-        let s = mschap2_authenticator_response(&nt_password_hash(PASS), &nt, &peer, &auth, USER);
+        let (resp, s) = mschap2_client_response(&auth, &peer, USER, PASS);
+        assert_eq!(resp.nt_response, arr::<24>(NT_RESP));
         assert_eq!(&s[..], b"S=407A5589115FD0D6209F510FE9C04566932CDA56");
     }
 
@@ -439,26 +340,21 @@ mod tests {
         assert!(verify_mschap2(&auth, USER, "wrong", &r).is_none());
         // RFC 2759 §8.2: a prepended domain does not change the hash.
         assert!(verify_mschap2(&auth, b"CORP\\User", PASS, &r).is_some());
+        // The RADIUS attribute carries the same octets after Ident/Flags.
+        let rad = r.to_radius_v2(7).encode();
+        assert_eq!(&rad[2..], &r.to_bytes()[..48]);
     }
 
     #[test]
     fn rfc3079_3_5_3_sample_128_bit_keys() {
-        let nt = arr::<24>(NT_RESP);
-        let hh = hash_nt_password_hash(&nt_password_hash(PASS));
-        let master = mppe_master_key(&hh, &nt);
+        // The sample's SendStartKey128 is the authenticator's (server's)
+        // send key (Magic3, §3.4): what the NAS hands to MPPE.
+        let keys = mschap::mppe_keys(&mschap::utf16le(PASS), &arr::<24>(NT_RESP));
         assert_eq!(
-            master,
-            arr::<16>("FD EC E3 71 7A 8C 83 8C B3 88 E5 27 AE 3C DD 31")
-        );
-        // The sample's SendStartKey128 is the server's (Magic3, §3.4); it is
-        // the client's receive key.
-        let send = mppe_asymmetric_start_key(&master, 16, true, true);
-        assert_eq!(
-            send,
+            keys.send,
             arr::<16>("8B 7C DC 14 9B 99 3A 1B A1 18 CB 15 3F 56 DC CB")
         );
-        assert_eq!(send, mppe_asymmetric_start_key(&master, 16, false, false));
-        assert_ne!(send, mppe_asymmetric_start_key(&master, 16, true, false));
+        assert_ne!(keys.send, keys.recv);
     }
 
     // RFC 2433 Appendix B.1 sample MS-CHAPv1 data.
@@ -469,15 +365,26 @@ mod tests {
             nt_password_hash("MyPw"),
             arr::<16>("FC 15 6A F7 ED CD 6C 0E DD E3 33 7D 42 7F 4E AC")
         );
-        assert_eq!(
-            mschap1_nt_response(&ch, "MyPw"),
-            arr::<24>("4E 9D 3C 8F 9C FD 38 5D 5B F4 D3 24 67 91 95 6C A4 C3 51 AB 40 9A 3D 61")
-        );
+        let resp = MsChapResponse {
+            peer_challenge: [0; 16],
+            reserved: [0; 8],
+            nt_response: arr(
+                "4E 9D 3C 8F 9C FD 38 5D 5B F4 D3 24 67 91 95 6C A4 C3 51 AB 40 9A 3D 61",
+            ),
+            flags: 1,
+        };
+        assert!(verify_mschap1(&ch, "MyPw", &resp));
+        assert!(!verify_mschap1(&ch, "MyPW", &resp));
+        assert!(!verify_mschap1(
+            &ch,
+            "MyPw",
+            &MsChapResponse { flags: 0, ..resp }
+        ));
     }
 
     #[test]
     fn rfc1994_chap_md5() {
-        // MD5(0x01 ‖ "secret" ‖ 0x00..0x0f), computed independently.
+        // MD5(0x01 ‖ "secret" ‖ 0x00..0x0f), computed with Python's hashlib.
         let ch: Vec<u8> = (0u8..16).collect();
         let r = chap_md5(1, b"secret", &ch);
         assert_eq!(r, arr::<16>("740e86463bda3a4d7017d6e0fba0699d"));

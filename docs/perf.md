@@ -868,3 +868,41 @@ parado e religado):
 
 Com a fila de 16 MiB padrão e ~18 B por linha, cabem ~900 000 linhas (**estimado**): 8 horas de
 fora do ar a 31 linhas/s antes do primeiro descarte, mais o disco se ligado.
+
+- 2026-10-24 — G2.5b, caminho rápido do CGNAT em XDP (**medido**, runner do GitHub Actions
+  ubuntu-latest, 4 vCPUs, kernel do runner; objeto XDP release; `cargo xtask xdp-root`, run
+  40063157232). `BPF_PROG_TEST_RUN` em `la` (UDP 64 bytes, fluxo conhecido, FIB resolvida):
+  **331 ns** por pacote traduzido e redirecionado, contra 159 ns de um pacote sem fluxo (só o
+  filtro). Encaminhamento UDP de 64 bytes por 2 s através do roteador (três namespaces, veth,
+  remetente UDP no namespace do assinante, mesma CPU para tudo): NAT do kernel (SNAT nftables +
+  conntrack + roteamento) **186 kpps** entregues; caminho rápido XDP (generic) **207 kpps**
+  (+11%), 414 976 de 414 976 pelo XDP. Em veth o ganho é pequeno porque o remetente e o `skb`
+  do veth dominam; o ganho real (não alocar o `skb`, não passar por conntrack nem por rotas)
+  só aparece numa placa em modo native (roteiro em `docs/xdp.md`, G2.5e).
+- 2026-10-24 — G2.5b, a mesma bateria na máquina do usuário (**medido**, AMD Ryzen AI Max+ 395,
+  kernel 7.0.0-38, objeto do prebuilt, `cargo xtask xdp-root` com root, HEAD 43026ee):
+  `BPF_PROG_TEST_RUN` **106 ns** por pacote traduzido e redirecionado contra 54 ns sem fluxo;
+  encaminhamento UDP 64 bytes em veth: NAT do kernel **700 kpps**, caminho rápido XDP (generic)
+  **792 kpps** (+13%), 1 583 360 de 1 583 361 pelo XDP. De ponta a ponta com conntrack: o fluxo
+  entrou no mapa quando ficou `ASSURED` (status 0x19e), 74 pacotes pelo XDP sem nenhum ir ao
+  kernel, contadores do conntrack parados (6 antes, 6 depois), renovação aceita, `Destroy` tirou
+  o fluxo do mapa.
+
+- 2026-10-24 — G4.3b, RADIUS (`cargo bench -p corerouter-proto-radius --bench radius`,
+  **medido**, AMD Ryzen AI MAX+ 395, build release, Linux 7.0):
+
+  | Benchmark | Mediana | Por segundo |
+  |---|---|---|
+  | `radius/decode_access_request` (13 atributos + VSAs, percorrer tudo) | 26,3 ns | 38 M |
+  | `radius/decode_dictionary` | 334 ns | 3,0 M |
+  | `radius/encode_access_request` (PAP + Message-Authenticator) | 757 ns | 1,3 M |
+  | `radius/verify_accept` (MD5 + HMAC-MD5 + ler Rate-Limit) | 758 ns | 1,3 M |
+  | `radius/rate_limit_parse` | 57 ns | 17,5 M |
+  | `radius/coa_handle_and_ack` | 1,85 µs | 541 k |
+  | `radius_client/access_round_trip_1000` (cliente + servidor de teste, uma thread) | 2,72 ms / 1000 | 368 k pedidos/s |
+
+Primeira rodada local do `xdp-root` (**medido**, AMD Ryzen AI Max+ 395, 32 threads, kernel
+7.0.0-38, objeto XDP do prebuilt, 2026-10-24). Custo por pacote (`BPF_PROG_TEST_RUN`): liberado
+42 ns (134 no runner do CI), bloqueado com 1 milhão de prefixos 126–134 ns (271 no runner),
+carga de 1 milhão de prefixos 698–702 ms. Envio em veth, em kpps: sem filtro 2027, nftables
+raw 2116–2171, XDP generic 1855–1889, XDP native 1785–1811 (duas rodadas).

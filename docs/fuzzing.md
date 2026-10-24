@@ -19,6 +19,7 @@ oráculo roda de dois jeitos:
 | `wire` | `corerouter_control::fuzz::wire` | `read_line_bounded` com limite (1..=64) e blocos de leitura (1..=4 bytes) escolhidos pelo primeiro byte: toda linha cabe no limite e não tem `\n`, a leitura sempre termina, e sem linha longa demais as linhas reconstroem a entrada |
 | `control_line` | `corerouter_control::fuzz::control_line` | uma linha de requisição como TCP/TLS/WebSocket a respondem (`server::answer`), num lab virtual novo; um objeto JSON sem `token` recebe o token local, para o fuzzer passar do portão e chegar aos comandos; resposta sempre com `ok`, nenhum pânico |
 | `mcp_messages` | `corerouter_mcp::fuzz::messages` | várias linhas no servidor MCP (`serve`) num lab novo: cada resposta é um objeto JSON-RPC 2.0 (ou lote) com exatamente um de `result`/`error`, nenhum pânico |
+| `radius` | `corerouter_proto_radius::fuzz::{packet, text}` | um datagrama por todos os caminhos de recepção do RADIUS (G4.3b): codec e iteradores, dicionário, autenticadores, cliente com pedidos pendentes, servidor CoA/DM e servidor de teste; um pacote que decodifica volta igual ao ser recodificado; os mesmos bytes como texto no `Mikrotik-Rate-Limit` (formata e lê de volta igual), no serviço Juniper e no carregador de dicionário FreeRADIUS. Testes de CI em `crates/proto-radius/tests/fuzz.rs` |
 
 **Pânico capturado também é falha.** O guarda do motor (`engine::guard`) transforma um pânico em
 `Internal` e a resposta parece normal; por isso `corerouter_engine::fuzz::panics` instala um
@@ -47,7 +48,7 @@ cargo +nightly fuzz run -s none config_file corpus/config_file seeds/config_file
     -dict=json.dict -max_total_time=600 -timeout=10
 ```
 
-Troque `config_file` por `wire`, `control_line` ou `mcp_messages`. O primeiro diretório
+Troque `config_file` por `wire`, `control_line`, `mcp_messages` ou `radius`. O primeiro diretório
 (`corpus/<alvo>`, fora do git) cresce com as entradas novas; `seeds/<alvo>` (no git) só é lido.
 `json.dict` traz os tokens JSON e os nomes de chaves, métodos e comandos.
 

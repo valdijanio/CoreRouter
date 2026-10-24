@@ -1,0 +1,4 @@
+VENDOR X 9
+BEGIN-VENDOR X
+ATTRIBUTE X-A 1 string has_tag,encrypt=2
+END-VENDOR X

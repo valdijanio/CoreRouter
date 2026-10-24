@@ -39,6 +39,8 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-flow", 2),
     // G4.3a: PPPoE/PPP codecs and the sans-IO BNG machines (pure, wasm-safe).
     ("corerouter-proto-pppoe", 2),
+    // G4.3b: RADIUS codec, client and CoA/DM server (sans-IO).
+    ("corerouter-proto-radius", 2),
     ("corerouter-engine", 3),
     ("corerouter-control", 4),
     ("corerouter-mcp", 4),
@@ -66,6 +68,9 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     ("corerouter-hal-linux", "corerouter-firewall"),
     // hal-linux loads the XDP programs and reads their maps (G2.5).
     ("corerouter-hal-linux", "corerouter-dataplane-ebpf-common"),
+    // The PPP authenticator reuses the RADIUS MS-CHAP/MPPE arithmetic and
+    // the `Mikrotik-Rate-Limit` type of the session descriptor (G4.3a).
+    ("corerouter-proto-pppoe", "corerouter-proto-radius"),
 ];
 
 pub const UI_CRATES: &[&str] = &[
