@@ -16,6 +16,7 @@ libfuzzer-sys = "0.4"
 corerouter-engine = { path = "../crates/engine" }
 corerouter-control = { path = "../crates/control" }
 corerouter-mcp = { path = "../crates/mcp" }
+corerouter-proto-radius = { path = "../crates/proto-radius" }
 
 [workspace]
 members = ["."]
@@ -48,6 +49,13 @@ bench = false
 [[bin]]
 name = "mcp_messages"
 path = "fuzz_targets/mcp_messages.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "radius"
+path = "fuzz_targets/radius.rs"
 test = false
 doc = false
 bench = false

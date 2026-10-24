@@ -1,0 +1,28 @@
+[package]
+name = "corerouter-proto-radius"
+description = "L2: RADIUS codec, sans-IO client and CoA/DM server, MikroTik/DSL Forum/Microsoft dictionaries (G4.3b)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+md-5.workspace = true
+hmac.workspace = true
+md4.workspace = true
+sha1.workspace = true
+des.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "radius"
+harness = false
+
+[lints]
+workspace = true
