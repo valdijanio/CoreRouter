@@ -304,12 +304,14 @@ pub enum Credentials {
         challenge: Vec<u8>,
         response: Vec<u8>,
     },
-    /// MS-CHAPv2 (RFC 2548 §2.3.2): the 50-byte response and the
-    /// 16-byte authenticator challenge.
+    /// MS-CHAPv2 (RFC 2759, sent as RFC 2548 §2.3.1/§2.3.2): the
+    /// authenticator challenge the NAS sent (16 bytes), the peer's
+    /// challenge (16) and NT-Response (24) from the PPP Response packet.
     MsChapV2 {
         ident: u8,
         challenge: Vec<u8>,
-        response: Vec<u8>,
+        peer_challenge: Vec<u8>,
+        nt_response: Vec<u8>,
     },
     /// No credential (IPoE/DHCP authorizing by MAC or circuit id).
     None,
