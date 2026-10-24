@@ -33,6 +33,12 @@ pub struct Config {
     /// `/ipv6` (G4.7b): DHCPv6 clients and the Router Advertisement policy.
     pub ipv6: Ipv6,
     pub routing: Routing,
+    /// `/radius` (G4.3j): servers, incoming CoA/DM.
+    #[serde(skip_serializing_if = "crate::radius::Radius::is_default")]
+    pub radius: crate::radius::Radius,
+    /// `/ppp` (G4.3): `/ppp aaa` for now.
+    #[serde(skip_serializing_if = "crate::ppp::Ppp::is_default")]
+    pub ppp: crate::ppp::Ppp,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
