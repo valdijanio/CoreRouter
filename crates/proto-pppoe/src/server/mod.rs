@@ -196,8 +196,9 @@ impl AuthRequest {
                 id,
                 challenge,
                 response,
-            } => auth::verify_chap_md5(*id, password.as_bytes(), challenge, response)
-                .then_some(None),
+            } => {
+                auth::verify_chap_md5(*id, password.as_bytes(), challenge, response).then_some(None)
+            }
             AuthMethod::MsChapV1 {
                 challenge,
                 response,
@@ -533,7 +534,13 @@ impl Server {
     }
 
     /// One received frame from `ifindex` (Ethernet header included).
-    pub fn handle_frame(&mut self, now: Millis, ifindex: u32, frame: &[u8], out: &mut ServerOutput) {
+    pub fn handle_frame(
+        &mut self,
+        now: Millis,
+        ifindex: u32,
+        frame: &[u8],
+        out: &mut ServerOutput,
+    ) {
         let Ok(e) = eth::parse(frame) else {
             self.stats.malformed += 1;
             return;
@@ -651,14 +658,8 @@ impl Server {
         let cookie = self.cookies.issue(now, d.src, ifindex, d.vlans);
         let delay = self.pado_delay();
         let start = out.buf.len();
-        let mut w = DiscoveryWriter::begin(
-            &mut out.buf,
-            d.src,
-            self.cfg.ac_mac,
-            d.vlans,
-            Code::Pado,
-            0,
-        );
+        let mut w =
+            DiscoveryWriter::begin(&mut out.buf, d.src, self.cfg.ac_mac, d.vlans, Code::Pado, 0);
         // RFC 2516 §5.2: AC-Name and the same Service-Name.
         w.tag(tag::AC_NAME, &self.cfg.ac_name);
         w.tag(tag::SERVICE_NAME, service);
@@ -699,7 +700,8 @@ impl Server {
     ) {
         // RFC 2516 §5.4: an error PADS carries SESSION_ID 0.
         let start = out.buf.len();
-        let mut w = DiscoveryWriter::begin(&mut out.buf, d.src, self.cfg.ac_mac, d.vlans, Code::Pads, 0);
+        let mut w =
+            DiscoveryWriter::begin(&mut out.buf, d.src, self.cfg.ac_mac, d.vlans, Code::Pads, 0);
         if let Some(s) = d.tags.service_name {
             w.tag(tag::SERVICE_NAME, s);
         }
@@ -713,7 +715,14 @@ impl Server {
 
     fn send_pads(&mut self, ifindex: u32, d: &Discovery<'_>, sid: u16, out: &mut ServerOutput) {
         let start = out.buf.len();
-        let mut w = DiscoveryWriter::begin(&mut out.buf, d.src, self.cfg.ac_mac, d.vlans, Code::Pads, sid);
+        let mut w = DiscoveryWriter::begin(
+            &mut out.buf,
+            d.src,
+            self.cfg.ac_mac,
+            d.vlans,
+            Code::Pads,
+            sid,
+        );
         w.tag(tag::SERVICE_NAME, d.tags.service_name.unwrap_or(&[]));
         w.tag(tag::AC_NAME, &self.cfg.ac_name);
         self.echo_tags(&mut w, d);
@@ -758,7 +767,13 @@ impl Server {
         let service = match (d.tags.service_name, d.tags.service_names) {
             (Some(s), 1) if self.service_ok(s) => s,
             _ => {
-                self.pads_error(ifindex, d, tag::SERVICE_NAME_ERROR, b"unsupported service", out);
+                self.pads_error(
+                    ifindex,
+                    d,
+                    tag::SERVICE_NAME_ERROR,
+                    b"unsupported service",
+                    out,
+                );
                 return;
             }
         };
@@ -917,7 +932,10 @@ impl Server {
             }
         }
         for ((k, u), sid) in &self.by_uniq {
-            if self.slot(*sid).is_none_or(|s| s.host_key() != *k || s.uniq != *u) {
+            if self
+                .slot(*sid)
+                .is_none_or(|s| s.host_key() != *k || s.uniq != *u)
+            {
                 return Err(format!("by_uniq points at a dead SID {sid}"));
             }
         }

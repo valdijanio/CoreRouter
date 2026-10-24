@@ -2,6 +2,7 @@
 //! sockets, no clock, no `unsafe`; compiles for `wasm32-unknown-unknown`.
 
 pub mod auth;
+pub mod descriptor;
 pub mod discovery;
 pub mod eth;
 pub mod fsm;
@@ -9,6 +10,8 @@ pub mod guard;
 pub mod layers;
 pub mod lcp;
 pub mod ncp;
+pub mod output;
 pub mod ppp;
+pub mod server;
 pub mod timer;
 pub mod wire;

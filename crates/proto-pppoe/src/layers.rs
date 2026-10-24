@@ -365,9 +365,17 @@ impl Layer for Ipcp {
             let _ = IpcpOpt::IpAddress(a).put(out);
         }
         if self.role == Role::Client && self.want_dns {
-            for (i, kind) in [ipcpopt::PRIMARY_DNS, ipcpopt::SECONDARY_DNS].into_iter().enumerate() {
+            for (i, kind) in [ipcpopt::PRIMARY_DNS, ipcpopt::SECONDARY_DNS]
+                .into_iter()
+                .enumerate()
+            {
                 if !self.rejected_dns.get(i).copied().unwrap_or(true) {
-                    let v = self.dns.get(i).copied().flatten().unwrap_or(Ipv4Addr::UNSPECIFIED);
+                    let v = self
+                        .dns
+                        .get(i)
+                        .copied()
+                        .flatten()
+                        .unwrap_or(Ipv4Addr::UNSPECIFIED);
                     let _ = put_opt(out, kind, &v.octets());
                 }
             }
@@ -394,9 +402,7 @@ impl Layer for Ipcp {
                 (Role::Server, IpcpOpt::PrimaryDns(a)) => offer(nak, rej, &o, a, self.dns[0])?,
                 (Role::Server, IpcpOpt::SecondaryDns(a)) => offer(nak, rej, &o, a, self.dns[1])?,
                 (Role::Server, IpcpOpt::PrimaryNbns(a)) => offer(nak, rej, &o, a, self.nbns[0])?,
-                (Role::Server, IpcpOpt::SecondaryNbns(a)) => {
-                    offer(nak, rej, &o, a, self.nbns[1])?
-                }
+                (Role::Server, IpcpOpt::SecondaryNbns(a)) => offer(nak, rej, &o, a, self.nbns[1])?,
                 // The BNG's own address: any non-zero value.
                 (Role::Client, IpcpOpt::IpAddress(a)) if !a.is_unspecified() => {}
                 // RFC 1332 §3.1/§3.2: IP-Addresses and VJ compression are
@@ -524,9 +530,7 @@ impl Layer for Ipv6cp {
                         Ipv6cpOpt::InterfaceId(f).put(nak)?;
                     }
                 }
-                Ipv6cpOpt::Compression(_) | Ipv6cpOpt::Unknown(_) => {
-                    put_opt(rej, o.kind, o.data)?
-                }
+                Ipv6cpOpt::Compression(_) | Ipv6cpOpt::Unknown(_) => put_opt(rej, o.kind, o.data)?,
             }
         }
         Ok(())
@@ -578,7 +582,13 @@ mod tests {
     }
 
     fn server_lcp() -> Lcp {
-        Lcp::new(Role::Server, 1480, 1480, AuthSet::routeros_default(), 0x1234_5678)
+        Lcp::new(
+            Role::Server,
+            1480,
+            1480,
+            AuthSet::routeros_default(),
+            0x1234_5678,
+        )
     }
 
     #[test]
@@ -664,9 +674,16 @@ mod tests {
         let mut l = Ipcp::server(Some(Ipv4Addr::new(10, 0, 0, 1)));
         l.peer = Some(Ipv4Addr::new(100, 64, 1, 2));
         l.dns = [Some(Ipv4Addr::new(1, 1, 1, 1)), None];
-        let (n, r) = classify(&mut l, &[3, 6, 0, 0, 0, 0, 129, 6, 0, 0, 0, 0, 131, 6, 0, 0, 0, 0]);
+        let (n, r) = classify(
+            &mut l,
+            &[3, 6, 0, 0, 0, 0, 129, 6, 0, 0, 0, 0, 131, 6, 0, 0, 0, 0],
+        );
         assert_eq!(n, [3, 6, 100, 64, 1, 2, 129, 6, 1, 1, 1, 1]);
-        assert_eq!(r, [131, 6, 0, 0, 0, 0], "RFC 1877: no secondary DNS → reject");
+        assert_eq!(
+            r,
+            [131, 6, 0, 0, 0, 0],
+            "RFC 1877: no secondary DNS → reject"
+        );
         let (n, r) = classify(&mut l, &[3, 6, 100, 64, 1, 2, 129, 6, 1, 1, 1, 1]);
         assert!(n.is_empty() && r.is_empty());
     }
@@ -684,7 +701,10 @@ mod tests {
         let mut c = Ipcp::client(true);
         let mut out = Vec::new();
         c.request(&mut out);
-        assert_eq!(out, [3, 6, 0, 0, 0, 0, 129, 6, 0, 0, 0, 0, 131, 6, 0, 0, 0, 0]);
+        assert_eq!(
+            out,
+            [3, 6, 0, 0, 0, 0, 129, 6, 0, 0, 0, 0, 131, 6, 0, 0, 0, 0]
+        );
         c.naked(&[3, 6, 100, 64, 0, 9, 129, 6, 8, 8, 8, 8]);
         assert!(c.rejected(&[131, 6, 0, 0, 0, 0]));
         out.clear();
