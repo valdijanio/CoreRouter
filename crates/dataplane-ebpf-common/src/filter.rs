@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The G2.5a filter decision: what happens to a frame before the kernel
 //! sees it. In order:
 //!

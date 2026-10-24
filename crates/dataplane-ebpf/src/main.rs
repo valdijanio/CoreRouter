@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! CoreRouter's XDP filter (G2.5a): runs in the NIC driver (native mode) or
 //! right after it (generic mode), before the kernel allocates anything for
 //! the packet. The decision is `corerouter_dataplane_ebpf_common::filter::decide`,
@@ -183,11 +184,13 @@ pub fn corerouter_xdp(ctx: XdpContext) -> u32 {
     xdp_action::XDP_DROP
 }
 
-/// Kernel-side license string. The program is CoreRouter's
-/// (AGPL-3.0-or-later); it uses no GPL-only helper.
+/// Kernel-side license string. This crate is GPL-2.0-or-later (the rest of
+/// CoreRouter is AGPL-3.0-or-later, which GPL-2.0-or-later combines with):
+/// the kernel lets only a GPL-compatible program call GPL-only helpers, and
+/// the CGNAT fast path forwards with `bpf_fib_lookup`, one of them.
 #[unsafe(link_section = "license")]
 #[unsafe(no_mangle)]
-static LICENSE: [u8; 18] = *b"AGPL-3.0-or-later\0";
+static LICENSE: [u8; 4] = *b"GPL\0";
 
 #[cfg(not(test))]
 #[panic_handler]

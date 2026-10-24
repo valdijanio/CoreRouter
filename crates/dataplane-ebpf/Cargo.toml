@@ -8,7 +8,9 @@ name = "corerouter-dataplane-ebpf"
 version = "0.1.0"
 edition = "2024"
 publish = false
-license = "AGPL-3.0-or-later"
+# GPL (the kernel string "GPL"): GPL-only helpers such as bpf_fib_lookup.
+# docs/xdp.md § Licença.
+license = "GPL-2.0-or-later"
 
 [workspace]
 

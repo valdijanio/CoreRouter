@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The deterministic CGNAT port arithmetic (RFC 7422 §2): subscriber
 //! number ↔ (public address number, port block), block ↔ ports. Scalars
 //! only, no allocation, no panic, `no_std`, so the same functions run in
