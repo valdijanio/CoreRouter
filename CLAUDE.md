@@ -263,6 +263,16 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 - Precisa de root de verdade (FRR instalado no host, XDP numa NIC física, imagem Buildroot,
   `setcap`)? Pare e entregue ao usuário o comando exato e o motivo; ele roda no terminal dele.
   Nunca proponha `sudo` sem senha (NOPASSWD) amplo.
+- **Teste que precisa de root (XDP, `BPF_PROG_LOAD`): rodada local pelo usuário.** É o caminho
+  rápido (segundos, contra ~15 min de um `workflow_dispatch` no runner do CI, **medido** em
+  2026-10-24). A sessão entrega ao usuário, pela sessão principal, o comando completo na pasta
+  dela, com saída em arquivo:
+  `cd <worktree> && COREROUTER_REQUIRE_XDP=1 CARGO_TARGET_DIR=<seu target> cargo xtask xdp-root 2>&1 | tee /tmp/xdp-root.log`.
+  O `sudo` pede a senha **ao usuário**; o teste só cria e apaga o namespace descartável `crxdp`,
+  com veth dentro, e não toca nas placas nem na rede do host. Não edite a worktree enquanto ele
+  roda. O usuário cola a saída (ou roda no terminal do app, que a sessão principal lê) e a
+  sessão principal a repassa; a saída local traz o `Verifier output` inteiro, que o log do CI
+  corta. O runner do CI continua sendo o portão: a rodada local só acelera o ajuste.
 
 ## Agentes em paralelo
 
