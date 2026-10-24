@@ -1,0 +1,31 @@
+[package]
+name = "corerouter-proto-pppoe"
+description = "L2: PPPoE (RFC 2516) and PPP (LCP, PAP, CHAP, MS-CHAP, IPCP, IPv6CP) codecs and sans-IO BNG/client state machines, pure (no I/O)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# G4.3b: MS-CHAP/MPPE crypto (RFC 2433/2759/3079) and the `Mikrotik-Rate-Limit`
+# type of the session descriptor; one implementation for RADIUS and PPP.
+corerouter-proto-radius.workspace = true
+thiserror.workspace = true
+# CHAP-MD5 (RFC 1994), AC-Cookie (HMAC-SHA-256) and the challenge/magic
+# generator (SHA-256): pure-Rust RustCrypto, the workspace's digest 0.11 line.
+md-5.workspace = true
+hmac.workspace = true
+sha2 = { version = "0.11.0", default-features = false }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "pppoe"
+harness = false
+
+[lints]
+workspace = true

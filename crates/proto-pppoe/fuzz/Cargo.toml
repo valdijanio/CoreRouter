@@ -1,0 +1,59 @@
+# G4.3a: long fuzzing runs of the PPPoE/PPP parsers and machines with
+# libFuzzer (`cargo +nightly fuzz run -s none <target>`). Outside the
+# workspace like the top-level `fuzz/`: `cargo xtask ci` runs the same
+# oracles (`src/fuzz.rs`) as proptests in `tests/fuzz.rs`.
+[package]
+name = "corerouter-proto-pppoe-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+corerouter-proto-pppoe = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "discovery"
+path = "fuzz_targets/discovery.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "session"
+path = "fuzz_targets/session.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server"
+path = "fuzz_targets/server.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client"
+path = "fuzz_targets/client.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "conversation"
+path = "fuzz_targets/conversation.rs"
+test = false
+doc = false
+bench = false

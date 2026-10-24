@@ -33,6 +33,7 @@ corerouter-proto-ntp = { path = "crates/proto-ntp" }
 corerouter-proto-iperf = { path = "crates/proto-iperf" }
 corerouter-proto-syslog = { path = "crates/proto-syslog" }
 corerouter-proto-flow = { path = "crates/proto-flow" }
+corerouter-proto-pppoe = { path = "crates/proto-pppoe" }
 corerouter-proto-radius = { path = "crates/proto-radius" }
 corerouter-engine = { path = "crates/engine" }
 corerouter-control = { path = "crates/control" }
