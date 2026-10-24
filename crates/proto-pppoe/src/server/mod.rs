@@ -142,7 +142,7 @@ impl Default for ServerConfig {
 
 /// Names a session across asynchronous answers: a stale reference (the
 /// session ended, the SID was reused) is ignored.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionRef {
     pub sid: u16,
     pub gen_: u32,
