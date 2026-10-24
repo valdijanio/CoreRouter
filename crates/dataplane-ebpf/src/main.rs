@@ -19,7 +19,7 @@ use aya_ebpf::bindings::{
 use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect};
 use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
-use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuHashMap};
+use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuArray, PerCpuHashMap};
 use aya_ebpf::programs::XdpContext;
 use corerouter_dataplane_ebpf_common::bucket::Bucket;
 use corerouter_dataplane_ebpf_common::fastnat::{self, FlowKey, FlowValue};
@@ -47,6 +47,8 @@ static COUNTERS: PerCpuHashMap<u64, Counter> =
 #[map(name = "NAT_FLOWS")]
 static NAT_FLOWS: LruHashMap<FlowKey, FlowValue> =
     LruHashMap::with_max_entries(m::NAT_FLOWS_MAX, 0);
+#[map(name = "NAT_MISS")]
+static NAT_MISS: PerCpuArray<u64> = PerCpuArray::with_max_entries(fastnat::MISS_SLOTS, 0);
 #[map(name = "TOP")]
 static TOP: LruPerCpuHashMap<[u8; 16], Top> =
     LruPerCpuHashMap::with_max_entries(m::TOP_SOURCES, 0);
@@ -191,6 +193,17 @@ fn top(src: &Addr, v: &Verdict, len: u64, now: u64) {
     }
 }
 
+/// Count one fast-path miss in slot `slot` (this CPU's copy).
+#[inline(always)]
+fn miss(slot: u32) {
+    if let Some(c) = NAT_MISS.get_ptr_mut(slot) {
+        // SAFETY: this CPU's copy of a per-CPU array element (preemption is
+        // off in XDP: no other writer); the kernel's pointer is valid and
+        // aligned for `u64`.
+        unsafe { *c += 1 };
+    }
+}
+
 /// The CGNAT fast path (G2.5b): a packet of a flow conntrack already NATed
 /// is translated and sent out of the interface the FIB names. `None`: not
 /// a known flow, or something the kernel must do (the packet is untouched
@@ -204,7 +217,10 @@ fn fast_nat(ctx: &XdpContext, frame: &mut Frame, info: &IpInfo, now: u64) -> Opt
     // replaces values whole and other CPUs only store the last-seen time and
     // bump the packet count: a torn read cannot happen on 64-bit words.
     let v: FlowValue = unsafe { *flow };
-    fastnat::admit(frame, info).ok()?;
+    if let Err(k) = fastnat::admit(frame, info) {
+        miss(k.slot());
+        return None;
+    }
     let [src, dst, ..] = v;
     let (src, dst) = (fastnat::decode(src), fastnat::decode(dst));
     let tot_len = frame.be16(fastnat::L4_OFF - 20 + 2)?;
@@ -238,9 +254,13 @@ fn fast_nat(ctx: &XdpContext, frame: &mut Frame, info: &IpInfo, now: u64) -> Opt
         )
     };
     if rc != i64::from(BPF_FIB_LKUP_RET_SUCCESS) {
+        miss(fastnat::MISS_FIB + (rc as u32).min(8));
         return None;
     }
-    fastnat::translate(frame, info, &v).ok()?;
+    if let Err(k) = fastnat::translate(frame, info, &v) {
+        miss(k.slot());
+        return None;
+    }
     frame.store(0, fib.dmac)?;
     frame.store(6, fib.smac)?;
     // SAFETY: as above; plain stores of whole words (last seen, packets).

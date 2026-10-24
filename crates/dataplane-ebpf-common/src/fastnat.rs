@@ -87,6 +87,45 @@ pub enum Kernel {
     Short,
 }
 
+impl Kernel {
+    /// Its slot in `NAT_MISS` (after the FIB lookup's return codes).
+    pub fn slot(self) -> u32 {
+        MISS_FIB
+            + 9
+            + match self {
+                Kernel::Tagged => 0,
+                Kernel::Options => 1,
+                Kernel::Control => 2,
+                Kernel::Ttl => 3,
+                Kernel::Short => 4,
+            }
+    }
+}
+
+/// `NAT_MISS` slots: why a packet of a known flow went to the kernel.
+/// `MISS_FIB + rc` for a FIB lookup that returned `rc` (1..=8: blackhole,
+/// unreachable, prohibit, not forwarded, forwarding disabled, unsupported
+/// lwt, no neighbor, fragmentation needed), then [`Kernel::slot`].
+pub const MISS_FIB: u32 = 0;
+pub const MISS_SLOTS: u32 = MISS_FIB + 9 + 5;
+/// Names of the slots, in order (`""` for the unused FIB code 0).
+pub const MISS_NAMES: [&str; MISS_SLOTS as usize] = [
+    "",
+    "fib-blackhole",
+    "fib-unreachable",
+    "fib-prohibit",
+    "fib-not-forwarded",
+    "fib-forwarding-disabled",
+    "fib-unsupported-lwt",
+    "fib-no-neighbor",
+    "fib-frag-needed",
+    "tagged",
+    "ip-options",
+    "tcp-control",
+    "ttl",
+    "short",
+];
+
 /// Whether the fast path may take this packet of a known flow (before the
 /// FIB lookup).
 #[inline(always)]

@@ -667,6 +667,7 @@ fn fast_nat_forwards_both_directions() {
         assert!(u.packets >= 1 && u.last_ns > 0, "{f:?}: {u:?}");
     }
     let st = x.status(0);
+    println!("fast path misses: {:?}", st.fast_nat_misses);
     for p in &st.ports {
         println!("{}: {:?}", p.interface, p.counters);
         assert!(
@@ -704,7 +705,9 @@ fn perf_fast_nat() {
     let la = ifindex("la");
     let reps = 2_000_000;
     let (action, nat) = x.test_run_on(&f, reps, Some(la)).unwrap();
-    assert_eq!(action, 4, "XDP_REDIRECT");
+    let misses = x.status(0).fast_nat_misses;
+    println!("fast path misses after the test run: {misses:?}");
+    assert_eq!(action, 4, "XDP_REDIRECT ({misses:?})");
     let other = {
         let mut g = f.clone();
         g[37] = 8; // another destination port: no flow
@@ -717,4 +720,163 @@ fn perf_fast_nat() {
         nat.as_nanos(),
         plain.as_nanos()
     );
+}
+
+/// G2.5b end to end, with the kernel's NAT and conntrack: the first
+/// packets of a UDP "connection" are NATed by an nftables SNAT rule; the
+/// link's conntrack events put it in the fast path once it is established;
+/// the rest goes through XDP (conntrack's counters stop growing); the
+/// timeout renewal reaches conntrack; killing the connection takes it out
+/// of the map. The same `Book` and link the daemon's `xdp-nat` service
+/// drives.
+#[test]
+fn conntrack_puts_flows_in_the_fast_path() {
+    use corerouter_hal::xdp_nat::{Action, Book, MAX_CARRIED};
+    if !enabled() {
+        return;
+    }
+    let _t = Triangle::new();
+    sh(&["nft", "add table ip crxnat"]);
+    sh(&[
+        "nft",
+        "add chain ip crxnat post { type nat hook postrouting priority 100; }",
+    ]);
+    sh(&[
+        "nft",
+        "add rule ip crxnat post oifname \"wa\" ip saddr 100.64.0.0/24 snat to 198.51.100.1:20000-20999",
+    ]);
+    let (mut x, _) = fast_nat_router();
+    // Only conntrack fills the map in this test.
+    x.nat_remove(&fast_nat_router_flows()).unwrap();
+    let mut link = x.nat_link().unwrap();
+    assert!(link.generation().is_some());
+    let mut book = Book::new(MAX_CARRIED);
+    let sync =
+        |link: &mut Box<dyn corerouter_hal::xdp_nat::NatLink>, book: &mut Book, ms: u64| {
+            let until = Instant::now() + Duration::from_millis(ms);
+            while Instant::now() < until {
+                let mut ev = Vec::new();
+                link.events(50, 1024, &mut ev).unwrap();
+                for e in &ev {
+                    match book.event(e) {
+                        Some(Action::Install(f)) => link.install(&f).unwrap(),
+                        Some(Action::Remove(f)) => link.remove(&f).unwrap(),
+                        None => {}
+                    }
+                }
+            }
+        };
+    let rounds = 40usize;
+    let server = Triangle::spawn_in(INET_NS, move || {
+        let s = std::net::UdpSocket::bind("198.51.100.2:9").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 64];
+        let mut peers = Vec::new();
+        for _ in 0..rounds {
+            let Ok((n, from)) = s.recv_from(&mut buf) else {
+                break;
+            };
+            s.send_to(&buf[..n], from).unwrap();
+            peers.push(from);
+        }
+        peers
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let (to_client, from_main) = std::sync::mpsc::channel::<()>();
+    let (to_main, from_client) = std::sync::mpsc::channel::<usize>();
+    let client = Triangle::spawn_in(SUB_NS, move || {
+        let s = std::net::UdpSocket::bind("100.64.0.2:6000").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut buf = [0u8; 64];
+        let mut got = 0;
+        for i in 0..rounds {
+            if i == 2 {
+                // Established now: let the main thread sync, then go on.
+                to_main.send(got).unwrap();
+                from_main.recv().unwrap();
+            }
+            s.send_to(format!("{i}").as_bytes(), "198.51.100.2:9")
+                .unwrap();
+            if s.recv_from(&mut buf).is_ok() {
+                got += 1;
+            }
+        }
+        got
+    });
+    let early = from_client.recv().unwrap();
+    assert_eq!(early, 3, "the kernel path answered");
+    sync(&mut link, &mut book, 1500);
+    assert_eq!(book.len(), 1, "the established connection is carried");
+    assert_eq!(x.nat_count(), 2);
+    let ct_before: u64 = link
+        .table()
+        .unwrap()
+        .iter()
+        .filter(|c| c.orig.src.to_string() == "100.64.0.2")
+        .map(|c| c.orig_packets + c.reply_packets)
+        .sum();
+    to_client.send(()).unwrap();
+    let got = client.join().unwrap();
+    let peers = server.join().unwrap();
+    assert_eq!(got, rounds, "every echo came back");
+    assert!(
+        peers.iter().all(|p| p.ip().to_string() == "198.51.100.1"),
+        "{peers:?}"
+    );
+    let st = x.status(0);
+    let fast: u64 = st
+        .ports
+        .iter()
+        .map(|p| p.counters[corerouter_hal::xdp::FAST_NAT].0)
+        .sum();
+    println!("fast path packets {fast}, misses {:?}", st.fast_nat_misses);
+    assert!(
+        fast >= 2 * (rounds as u64 - 2) - 4,
+        "fast path carried {fast}"
+    );
+    let ct_after: u64 = link
+        .table()
+        .unwrap()
+        .iter()
+        .filter(|c| c.orig.src.to_string() == "100.64.0.2")
+        .map(|c| c.orig_packets + c.reply_packets)
+        .sum();
+    println!("conntrack packets before {ct_before}, after {ct_after}");
+    // Renewal: the carried connection was used, so it is due once.
+    let due = book.due(&|f| link.used(f));
+    assert_eq!(due.len(), 1);
+    assert_eq!(link.refresh(&due).unwrap(), 1);
+    // Kill it in conntrack: the destroy event takes it out of the map.
+    let conns: Vec<_> = link
+        .table()
+        .unwrap()
+        .into_iter()
+        .filter(|c| c.orig.src.to_string() == "100.64.0.2")
+        .collect();
+    corerouter_hal_linux::ctnl::delete(&conns).unwrap();
+    sync(&mut link, &mut book, 1000);
+    assert!(book.is_empty());
+    assert_eq!(x.nat_count(), 0);
+    let _ = sh_ok(&["nft", "delete table ip crxnat"]);
+}
+
+/// The two hand-made flows of [`fast_nat_router`].
+fn fast_nat_router_flows() -> [NatFlow; 2] {
+    let ip = |s: &str| -> std::net::Ipv4Addr { s.parse().unwrap() };
+    [
+        NatFlow {
+            proto: IPPROTO_UDP,
+            src: (ip("100.64.0.2"), 5000),
+            dst: (ip("198.51.100.2"), 7),
+            new_src: (ip("198.51.100.1"), 20000),
+            new_dst: (ip("198.51.100.2"), 7),
+        },
+        NatFlow {
+            proto: IPPROTO_UDP,
+            src: (ip("198.51.100.2"), 7),
+            dst: (ip("198.51.100.1"), 20000),
+            new_src: (ip("198.51.100.2"), 7),
+            new_dst: (ip("100.64.0.2"), 5000),
+        },
+    ]
 }

@@ -24,6 +24,7 @@ pub const RATE: &str = "RATE";
 pub const COUNTERS: &str = "COUNTERS";
 pub const TOP: &str = "TOP";
 pub const NAT_FLOWS: &str = "NAT_FLOWS";
+pub const NAT_MISS: &str = "NAT_MISS";
 /// The XDP program's name in the object.
 pub const PROGRAM: &str = "corerouter_xdp";
 

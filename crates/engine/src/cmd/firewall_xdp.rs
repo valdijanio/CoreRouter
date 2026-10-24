@@ -3,7 +3,7 @@
 //! (`interface.list` with packets per second, `top`), and `reset-counters`.
 //! The data plane is `hal-linux` + `dataplane-ebpf`; see docs/xdp.md.
 
-use corerouter_hal::xdp::{REASONS, XdpStatus};
+use corerouter_hal::xdp::{FAST_NAT, REASONS, XdpStatus};
 use corerouter_model::firewall::Name;
 use corerouter_model::xdp::{self, XdpInterface, XdpMode};
 use corerouter_model::{Config, IfName, InterfaceKind};
@@ -47,19 +47,19 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.firewall.xdp.interface.list", "XDP Interfaces", ["IP", "Firewall", "XDP"], None,
-        "{} → [{interface, mode, disabled, comment, active: native|generic|null, note, pass_pps, drop_pps, counters: {pass|blocked|rate-limit|malformed|tcp-flags: {packets, bytes, pps}}}]",
+        "{} → [{interface, mode, disabled, comment, active: native|generic|null, note, pass_pps, fast_nat_pps, drop_pps, counters: {pass|blocked|rate-limit|malformed|tcp-flags|fast-nat: {packets, bytes, pps}}}]",
         always, list),
     cmd!(
         "ip.firewall.xdp.set",
         "Set XDP Filter",
         [],
         None,
-        "{block_lists?: [string] | string (comma-separated address lists; empty clears), allow_lists?: [string] | string, rate_limit?: u32 (packets/s per source, 0 = off), rate_burst?: u32 (0 = one second's worth), drop_malformed?: bool, drop_invalid_tcp_flags?: bool, force?: bool (commit even if it cuts this management connection)} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, warnings}",
+        "{block_lists?: [string] | string (comma-separated address lists; empty clears), allow_lists?: [string] | string, rate_limit?: u32 (packets/s per source, 0 = off), rate_burst?: u32 (0 = one second's worth), drop_malformed?: bool, drop_invalid_tcp_flags?: bool, fast_nat?: bool (CGNAT fast path: established NAT connections translated and forwarded in XDP), force?: bool (commit even if it cuts this management connection)} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, fast_nat, warnings}",
         always,
         set
     ),
     cmd!(query "ip.firewall.xdp.print", "XDP Filter", ["IP", "Firewall", "XDP"], None,
-        "{} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, block_prefixes, allow_prefixes, available, unavailable, lists: [{name, entries}]}",
+        "{} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, block_prefixes, allow_prefixes, available, unavailable, lists: [{name, entries}], fast_nat, fast_nat_flows, fast_nat_status: {carried, installed, removed, renewed, lost, resyncs, last_error, idle} | null}",
         always, print),
     cmd!(query "ip.firewall.xdp.top", "XDP Top Sources", [], None,
         "{count?: u32 (1..=1000, default 20)} → [{address, packets, bytes, reason, list, last_secs}]",
@@ -256,6 +256,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     let burst = opt_u32(p, "rate_burst")?;
     let malformed = opt_bool(p, "drop_malformed")?;
     let flags = opt_bool(p, "drop_invalid_tcp_flags")?;
+    let fast_nat = opt_bool(p, "fast_nat")?;
     if rate.is_some_and(|r| r > xdp::MAX_RATE) {
         return Err(EngineError::bad(
             "rate_limit",
@@ -307,7 +308,28 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             f.rate_limit
         ));
     }
+    if let Some(on) = fast_nat {
+        cfg.ip.xdp.fast_nat = on;
+    }
+    let x = &cfg.ip.xdp;
+    if x.fast_nat {
+        if cfg.ip.cgnat.pools.is_empty() {
+            warnings.push(
+                "no CGNAT pool (ip.firewall.cgnat): the fast path carries any NATed connection, \
+                 masquerade included, but it was made for CGNAT"
+                    .to_owned(),
+            );
+        }
+        if x.active().count() < 2 {
+            warnings.push(
+                "the fast path needs XDP on both sides: the subscribers' interfaces and the \
+                 internet's (ip.firewall.xdp.interface.add)"
+                    .to_owned(),
+            );
+        }
+    }
     cfg.ip.xdp.filter = f.clone();
+    let fast_nat = cfg.ip.xdp.fast_nat;
     Ok(json!({
         "block_lists": f.block_lists,
         "allow_lists": f.allow_lists,
@@ -315,6 +337,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         "rate_burst": f.rate_burst,
         "drop_malformed": f.drop_malformed,
         "drop_invalid_tcp_flags": f.drop_invalid_tcp_flags,
+        "fast_nat": fast_nat,
         "warnings": warnings,
     }))
 }
@@ -333,6 +356,7 @@ fn status(s: &mut Session, top: usize) -> XdpStatus {
 
 fn print(s: &mut Session, _: &Value) -> Result<Value> {
     let st = status(s, 0);
+    let nat = s.ext::<crate::xdp::XdpNatStatus>().cloned();
     let cfg = s.store().candidate();
     let f = &cfg.ip.xdp.filter;
     let lists: Vec<Value> = f
@@ -353,6 +377,9 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
         "available": st.unavailable.is_none(),
         "unavailable": st.unavailable,
         "lists": lists,
+        "fast_nat": cfg.ip.xdp.fast_nat,
+        "fast_nat_flows": st.fast_nat_flows,
+        "fast_nat_status": nat,
     }))
 }
 
@@ -403,6 +430,7 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 "active": port.and_then(|p| p.active),
                 "note": note,
                 "pass_pps": pps(0),
+                "fast_nat_pps": pps(FAST_NAT),
                 "drop_pps": rates.map_or(0, |x| x.drop_pps(&i.interface)),
                 "counters": counters,
             })

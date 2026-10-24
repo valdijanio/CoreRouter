@@ -343,6 +343,25 @@ pub fn delete_request(c: &Conn, seq: u32) -> Vec<u8> {
     r.finish()
 }
 
+/// Renew the timeout of the connection with this original tuple (and id)
+/// to `secs` (G2.5b: the XDP fast path carries its packets, which
+/// conntrack never sees). `IPCTNL_MSG_CT_NEW` without `NLM_F_CREATE`
+/// changes an existing connection only.
+pub fn timeout_request(c: &Conn, secs: u32, seq: u32) -> Vec<u8> {
+    let family = if c.orig.src.is_ipv4() {
+        AF_INET
+    } else {
+        AF_INET6
+    };
+    let mut r = Req::new(IPCTNL_MSG_CT_NEW, NLM_F_ACK, family, seq);
+    r.tuple(CTA_TUPLE_ORIG, &c.orig, c.protocol);
+    if c.id != 0 {
+        r.put(CTA_ID, &c.id.to_be_bytes());
+    }
+    r.put(CTA_TIMEOUT, &secs.to_be_bytes());
+    r.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -481,7 +500,7 @@ mod tests {
 #[cfg(target_os = "linux")]
 pub use events::Events;
 #[cfg(target_os = "linux")]
-pub use io::{delete, dump, stats};
+pub use io::{delete, dump, renew, stats};
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -619,6 +638,24 @@ mod io {
         Ok(s)
     }
 
+    /// Renew `conns`' timeouts (`secs` gives each one's); how many the
+    /// kernel still had (one already gone is not an error).
+    pub fn renew(conns: &[Conn], secs: &dyn Fn(&Conn) -> u32) -> Result<usize, HalError> {
+        let mut sock = open()?;
+        let mut done = 0;
+        for (i, c) in conns.iter().enumerate() {
+            let seq = u32::try_from(i).unwrap_or(u32::MAX).wrapping_add(10);
+            sock.send(&super::timeout_request(c, secs(c), seq), 0)
+                .map_err(io)?;
+            match read(&mut sock, seq, |_, _| true) {
+                Ok(()) => done += 1,
+                Err(HalError::Rejected(e)) if e.contains("No such file") => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(done)
+    }
+
     /// Kill `conns` (one request each); how many the kernel removed (one
     /// already gone is not an error). One the kernel refuses does not stop
     /// the others: the first refusal is returned after all were tried.
@@ -664,8 +701,9 @@ mod events {
     use netlink_sys::{Socket, protocols::NETLINK_NETFILTER};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
-    /// `NFNLGRP_CONNTRACK_NEW` and `NFNLGRP_CONNTRACK_DESTROY`.
+    /// `NFNLGRP_CONNTRACK_NEW`, `_UPDATE` and `_DESTROY`.
     const GROUP_NEW: u32 = 1;
+    const GROUP_UPDATE: u32 = 2;
     const GROUP_DESTROY: u32 = 3;
     /// 32 MiB: about 100 thousand events of slack (**estimado**, ~300
     /// bytes each) while the exporter reads the table or a collector is slow.
@@ -697,6 +735,13 @@ mod events {
 
     impl Events {
         pub fn open() -> Result<Self, HalError> {
+            Self::open_groups(false)
+        }
+
+        /// With `updates`, also the changes of a connection's state (the
+        /// CGNAT fast path waits for `ASSURED`, which arrives as an update;
+        /// they come as `IPCTNL_MSG_CT_NEW` messages, so as `New` events).
+        pub fn open_groups(updates: bool) -> Result<Self, HalError> {
             let mut sock = Socket::new(NETLINK_NETFILTER).map_err(io)?;
             sock.bind_auto().map_err(io)?;
             use nix::sys::socket::{setsockopt, sockopt};
@@ -704,6 +749,9 @@ mod events {
                 let _ = setsockopt(&sock.as_fd(), sockopt::RcvBuf, &RCVBUF);
             }
             sock.add_membership(GROUP_NEW).map_err(io)?;
+            if updates {
+                sock.add_membership(GROUP_UPDATE).map_err(io)?;
+            }
             sock.add_membership(GROUP_DESTROY).map_err(io)?;
             sock.set_non_blocking(true).map_err(io)?;
             Ok(Self {

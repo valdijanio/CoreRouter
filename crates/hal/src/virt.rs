@@ -737,6 +737,8 @@ impl Hal for VirtualHal {
             ports,
             top: tops,
             block_prefixes: plan.block.len(),
+            fast_nat_flows: 0,
+            fast_nat_misses: Vec::new(),
             allow_prefixes: plan.allow.len(),
         })
     }

@@ -202,6 +202,10 @@ pub struct XdpStatus {
     /// Prefixes in the block and allow tries.
     pub block_prefixes: usize,
     pub allow_prefixes: usize,
+    /// Flow directions in the CGNAT fast path's map (G2.5b).
+    pub fast_nat_flows: usize,
+    /// Why packets of known flows went to the kernel (reason, packets).
+    pub fast_nat_misses: Vec<(&'static str, u64)>,
 }
 
 #[cfg(test)]

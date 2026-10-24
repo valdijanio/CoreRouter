@@ -135,6 +135,10 @@ mod cpu_tuning;
 #[cfg(target_os = "linux")]
 pub mod xdp;
 
+/// The CGNAT fast path's link to the XDP flow map and conntrack (G2.5b).
+#[cfg(target_os = "linux")]
+pub mod xdp_nat;
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::BTreeMap;
@@ -628,6 +632,10 @@ mod linux {
 
         fn xdp_reset(&mut self) -> Result<(), HalError> {
             self.xdp.reset()
+        }
+
+        fn xdp_nat_link(&mut self) -> Result<Box<dyn corerouter_hal::xdp_nat::NatLink>, HalError> {
+            self.xdp.nat_link()
         }
 
         fn system_info(&mut self) -> Result<SystemInfo, HalError> {

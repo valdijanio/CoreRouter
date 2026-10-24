@@ -439,6 +439,15 @@ pub trait Hal: Send {
         )))
     }
 
+    /// The CGNAT fast path's link to the XDP flow map and to conntrack
+    /// (G2.5b), for the daemon's `xdp-nat` service.
+    fn xdp_nat_link(&mut self) -> Result<Box<dyn xdp_nat::NatLink>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
     /// Zero the XDP counters and forget the dropped sources.
     fn xdp_reset(&mut self) -> Result<(), HalError> {
         Err(HalError::Unsupported(format!(

@@ -1,5 +1,5 @@
 # Written by `cargo xtask ebpf`; `cargo xtask ebpf-check` compares it.
-sources 93e09c09f8642527d83091c62754cb2e8f80bb4fcd7ebfc62f5200241f2fff1c
-object ea60779fe9739d7f910bce51927fedd9486d7800dd12bbc75ec110700806c81f
+sources 4fdd1b51525247ee3e9250cea03fb20d5a996ac2a3df2ef9c05be5d31e1f864d
+object 7bbf45944b2976e068471da2820c1ffd25b6701eab86dde7ff0bec4c2f650e4c
 toolchain nightly-2026-10-22
 linker bpf-linker 0.12.0

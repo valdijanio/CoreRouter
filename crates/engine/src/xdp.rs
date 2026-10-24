@@ -70,6 +70,41 @@ impl XdpRates {
     }
 }
 
+/// What the daemon's `xdp-nat` service last reported (G2.5b), for
+/// `ip.firewall.xdp.print`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct XdpNatStatus {
+    /// Connections the fast path carries now.
+    pub carried: usize,
+    pub installed: u64,
+    pub removed: u64,
+    /// Conntrack timeouts renewed for connections XDP carried.
+    pub renewed: u64,
+    /// Events the kernel dropped (each one is followed by a table read).
+    pub lost: u64,
+    pub resyncs: u64,
+    pub last_error: Option<String>,
+    /// Why the service is idle (fast path off, no XDP attached…).
+    pub idle: Option<String>,
+}
+
+impl crate::Session {
+    /// The CGNAT fast path's link (G2.5b), for the daemon's `xdp-nat`
+    /// service.
+    pub fn xdp_nat_link(
+        &mut self,
+    ) -> Result<Box<dyn corerouter_hal::xdp_nat::NatLink>, String> {
+        self.hal_mut().xdp_nat_link().map_err(|e| e.to_string())
+    }
+
+    /// Keep the service's report.
+    pub fn xdp_nat_set_status(&mut self, st: XdpNatStatus) {
+        if let Some(slot) = self.ext_mut::<XdpNatStatus>() {
+            *slot = st;
+        }
+    }
+}
+
 /// Would the XDP filter of `cfg` drop packets from `peer` arriving on
 /// `ingress`? The block list holding it, if so (the allow lists win).
 pub fn blocks(

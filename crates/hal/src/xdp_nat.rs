@@ -35,6 +35,11 @@ pub struct FlowUse {
     pub packets: u64,
 }
 
+/// Connections the fast path carries at most: the XDP flow map holds two
+/// directions each (`dataplane-ebpf-common::maps::NAT_FLOWS_MAX`, checked
+/// by a test in hal-linux). Past it, new ones stay in the kernel.
+pub const MAX_CARRIED: usize = 1 << 18;
+
 const TCP: u8 = 6;
 const UDP: u8 = 17;
 /// `TCP_CONNTRACK_ESTABLISHED`.
@@ -229,9 +234,10 @@ impl Book {
 
 /// How the daemon's service reaches the fast path and conntrack.
 pub trait NatLink: Send {
-    /// Whether the fast path's flow map exists now (`ip.firewall.xdp.set
-    /// fast_nat=yes` with XDP attached).
-    fn active(&self) -> bool;
+    /// Which flow map is there now (`ip.firewall.xdp.set fast_nat=yes`
+    /// with XDP attached), `None` while there is none. A new number is a
+    /// new, empty map: forget what was installed and read the table again.
+    fn generation(&self) -> Option<u64>;
     /// Conntrack events (new, updated, destroyed) arriving within
     /// `wait_ms`, at most `max`. A full socket buffer drops events: counted
     /// in [`NatLink::lost`], and the caller reads the table again.
@@ -241,7 +247,7 @@ pub trait NatLink: Send {
     fn table(&mut self) -> Result<Vec<Conn>, HalError>;
     fn install(&mut self, flows: &[NatFlow]) -> Result<(), HalError>;
     fn remove(&mut self, flows: &[NatFlow]) -> Result<(), HalError>;
-    fn used(&mut self, flow: &NatFlow) -> Option<FlowUse>;
+    fn used(&self, flow: &NatFlow) -> Option<FlowUse>;
     /// Renew the timeout of `conns` (each to its protocol's default for
     /// its state); how many the kernel still had.
     fn refresh(&mut self, conns: &[Conn]) -> Result<usize, HalError>;
