@@ -46,6 +46,8 @@ struct AuthState {
     /// MS-CHAPv2 authenticator string, kept to answer a retransmitted
     /// Response after Success.
     success: Option<[u8; AUTH_STRING_LEN]>,
+    /// Verdicts to ignore: they answer an attempt LCP renegotiation ended.
+    discard: u8,
 }
 
 /// What the server knows when it creates a session (after a valid PADR).
@@ -366,6 +368,14 @@ impl Session {
             if self.phase != Phase::Terminate {
                 self.phase = Phase::Establish;
             }
+            // RFC 1661 §3.5: a renegotiated link authenticates again. An
+            // answer still on its way for the old attempt is dropped.
+            if self.auth.pending {
+                self.auth.discard = self.auth.discard.saturating_add(1);
+            }
+            self.auth.pending = false;
+            self.auth.done = false;
+            self.auth_deadline = 0;
         }
         if s.tlu {
             self.lcp_up(env);
@@ -388,8 +398,12 @@ impl Session {
                 self.heard = true;
                 self.lcp_packet(env, info);
             }
+            // RFC 1994 §4.1: after Success, repeated Responses are allowed
+            // during the Network phase (our Success may have been lost).
             proto::PAP | proto::CHAP => {
-                if self.phase == Phase::Authenticate {
+                if self.phase == Phase::Authenticate
+                    || (self.auth.done && self.phase == Phase::Network)
+                {
                     self.auth_packet(env, protocol, info);
                 }
             }
@@ -476,11 +490,6 @@ impl Session {
         if env.cfg.keepalive_interval_ms > 0 {
             self.echo_at = env.now + env.cfg.keepalive_interval_ms;
         }
-        if self.auth.done {
-            // LCP renegotiated after authentication: back to the network.
-            self.network_up(env);
-            return;
-        }
         self.auth.proto = self.lcp_l.auth_agreed;
         match self.auth.proto {
             None if env.cfg.auth.is_empty() => self.network_up(env),
@@ -537,8 +546,13 @@ impl Session {
             return;
         }
         if self.auth.done {
-            // RFC 1994 §4.2 / RFC 1334 §2.2.2: our Success/Ack was lost;
-            // answer the retransmission the same way.
+            // Our Success/Ack was lost; answer the retransmission the same
+            // way. CHAP repeats the Response with the challenge's Identifier
+            // (RFC 1994 §4.1); PAP changes it on every Authenticate-Request
+            // (RFC 1334 §2.2.1), so the Ack takes the new one.
+            if pap {
+                self.auth.id = pkt.id;
+            }
             if pkt.id == self.auth.id {
                 self.send_success(env, b"");
             }
@@ -655,6 +669,10 @@ impl Session {
 
     /// The caller's answer to `Event::Authenticate`.
     pub fn auth_verdict(&mut self, env: &mut Env<'_>, verdict: AuthVerdict) {
+        if self.auth.discard > 0 {
+            self.auth.discard -= 1;
+            return;
+        }
         if !self.auth.pending || self.phase != Phase::Authenticate {
             return;
         }

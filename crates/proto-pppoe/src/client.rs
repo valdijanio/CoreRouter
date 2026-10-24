@@ -38,6 +38,10 @@ pub struct ClientConfig {
     pub discovery_timeout_ms: u64,
     pub discovery_attempts: u8,
     pub fsm: FsmConfig,
+    /// LCP echo period once up (pppd `lcp-echo-interval`); 0 = off.
+    pub keepalive_interval_ms: u64,
+    /// Unanswered echoes before giving up (pppd `lcp-echo-failure`).
+    pub keepalive_misses: u8,
     /// Line ids a relay agent would add (RFC 4679), for tests.
     pub circuit_id: Option<Vec<u8>>,
     pub remote_id: Option<Vec<u8>>,
@@ -61,6 +65,8 @@ impl Default for ClientConfig {
             discovery_timeout_ms: 1000,
             discovery_attempts: 5,
             fsm: FsmConfig::default(),
+            keepalive_interval_ms: 10_000,
+            keepalive_misses: 3,
             circuit_id: None,
             remote_id: None,
         }
@@ -77,6 +83,8 @@ pub enum ClientDown {
     LcpFailed,
     AuthFailed,
     NcpFailed,
+    /// The BNG stopped answering LCP echoes.
+    Keepalive,
     /// [`Client::close`] or [`Client::abort`].
     Local,
 }
@@ -130,6 +138,12 @@ pub struct Client {
     auth_deadline: Millis,
     auth_retries: u8,
     expect: Option<[u8; AUTH_STRING_LEN]>,
+    /// Last CHAP Response body, repeated until Success/Failure arrives
+    /// (RFC 1994 §4.1).
+    chap_response: Option<Box<[u8]>>,
+    echo_at: Millis,
+    echo_misses: u8,
+    echo_id: u8,
     close_reason: Option<ClientDown>,
     scratch: Scratch,
     rng: Rng,
@@ -207,6 +221,10 @@ impl Client {
             auth_deadline: 0,
             auth_retries: 0,
             expect: None,
+            chap_response: None,
+            echo_at: 0,
+            echo_misses: 0,
+            echo_id: 0,
             close_reason: None,
             scratch: Scratch::default(),
             rng,
@@ -242,6 +260,7 @@ impl Client {
         [
             self.disc_deadline,
             self.auth_deadline,
+            self.echo_at,
             self.lcp.deadline().unwrap_or(0),
             self.ipcp.deadline().unwrap_or(0),
             self.v6.deadline().unwrap_or(0),
@@ -258,6 +277,7 @@ impl Client {
         self.phase = ClientPhase::Closed(reason);
         self.disc_deadline = 0;
         self.auth_deadline = 0;
+        self.echo_at = 0;
         self.lcp = Fsm::new(0);
         self.ipcp = Fsm::new(0);
         self.v6 = Fsm::new(0);
@@ -372,8 +392,14 @@ impl Client {
         if d.dst != self.cfg.mac || d.vlans != self.cfg.vlans {
             return;
         }
-        // Host-Uniq must be ours when we sent one (RFC 2516 §5.2).
-        if self.cfg.host_uniq.as_deref() != d.tags.host_uniq && self.cfg.host_uniq.is_some() {
+        // RFC 2516 §5.2/§5.4: offers and confirmations echo our Host-Uniq;
+        // one that does not is for another host process. (A PADT need not
+        // carry it.)
+        let offer = matches!(d.code, Code::Pado | Code::Pads);
+        if offer
+            && self.cfg.host_uniq.is_some()
+            && self.cfg.host_uniq.as_deref() != d.tags.host_uniq
+        {
             return;
         }
         match (d.code, self.phase) {
@@ -449,6 +475,7 @@ impl Client {
         let Ok(pkt) = ppp::parse_control(info) else {
             return;
         };
+        self.echo_misses = 0;
         match protocol {
             proto::LCP => {
                 if pkt.code == lc::TERMINATE_REQUEST {
@@ -499,8 +526,18 @@ impl Client {
         if s.tld {
             self.ipcp.down();
             self.v6.down();
+            // RFC 1661 §3.5: back through Authenticate after renegotiation.
+            self.auth_deadline = 0;
+            self.chap_response = None;
+            self.expect = None;
+            if self.phase != ClientPhase::Terminate {
+                self.phase = ClientPhase::Establish;
+            }
         }
         if s.tlu {
+            if self.cfg.keepalive_interval_ms > 0 {
+                self.echo_at = now + self.cfg.keepalive_interval_ms;
+            }
             self.auth = self.lcp_l.peer_auth;
             match self.auth {
                 None => self.network(now, out),
@@ -545,6 +582,20 @@ impl Client {
                 ifindex: self.cfg.ifindex,
             };
             tx.send(proto::PAP, ac::PAP_REQUEST, self.auth_id, &body);
+        }
+        self.auth_retries = self.auth_retries.saturating_sub(1);
+        self.auth_deadline = now + self.cfg.fsm.restart_ms;
+    }
+
+    fn send_chap_response(&mut self, now: Millis, out: &mut ClientOutput) {
+        if let Some(body) = &self.chap_response {
+            let mut tx = ClientTx {
+                out: &mut *out,
+                link: self.link(),
+                sid: self.sid,
+                ifindex: self.cfg.ifindex,
+            };
+            tx.send(proto::CHAP, ac::CHAP_RESPONSE, self.auth_id, body);
         }
         self.auth_retries = self.auth_retries.saturating_sub(1);
         self.auth_deadline = now + self.cfg.fsm.restart_ms;
@@ -624,13 +675,9 @@ impl Client {
                     name: &self.cfg.username,
                 };
                 if cv.put(&mut body).is_ok() {
-                    let mut tx = ClientTx {
-                        out: &mut *out,
-                        link: self.link(),
-                        sid: self.sid,
-                        ifindex: self.cfg.ifindex,
-                    };
-                    tx.send(proto::CHAP, ac::CHAP_RESPONSE, pkt.id, &body);
+                    self.chap_response = Some(body.into());
+                    self.auth_retries = self.cfg.fsm.max_configure;
+                    self.send_chap_response(now, out);
                 }
             }
             (proto::CHAP, ac::CHAP_SUCCESS) if pkt.id == self.auth_id => {
@@ -653,6 +700,7 @@ impl Client {
             return;
         }
         self.phase = ClientPhase::Network;
+        self.auth_deadline = 0;
         let s = cfsm!(self, now, out, ipcp, ipcp_l, |f, c, l| {
             f.open(&mut c, l);
             f.up(&mut c, l)
@@ -687,6 +735,28 @@ impl Client {
     }
 
     pub fn handle_timers(&mut self, now: Millis, out: &mut ClientOutput) {
+        if self.echo_at != 0 && self.echo_at <= now && self.lcp.is_opened() {
+            if self.echo_misses >= self.cfg.keepalive_misses {
+                // The BNG is gone; it will not answer Terminate either.
+                self.abort(out);
+                if let Some(ClientEvent::Down { reason }) = out.events.last_mut() {
+                    *reason = ClientDown::Keepalive;
+                }
+                self.phase = ClientPhase::Closed(ClientDown::Keepalive);
+                return;
+            }
+            self.echo_misses += 1;
+            self.echo_id = self.echo_id.wrapping_add(1);
+            let body = self.lcp_l.echo_magic().to_be_bytes();
+            let mut tx = ClientTx {
+                out: &mut *out,
+                link: self.link(),
+                sid: self.sid,
+                ifindex: self.cfg.ifindex,
+            };
+            tx.send(proto::LCP, lc::ECHO_REQUEST, self.echo_id, &body);
+            self.echo_at = now + self.cfg.keepalive_interval_ms;
+        }
         if self.disc_deadline != 0 && self.disc_deadline <= now {
             self.disc_deadline = 0;
             if self.attempts >= self.cfg.discovery_attempts {
@@ -701,11 +771,14 @@ impl Client {
         }
         if self.auth_deadline != 0 && self.auth_deadline <= now {
             self.auth_deadline = 0;
-            if self.phase == ClientPhase::Authenticate && self.auth == Some(AuthProto::Pap) {
+            let pap = self.auth == Some(AuthProto::Pap);
+            if self.phase == ClientPhase::Authenticate && (pap || self.chap_response.is_some()) {
                 if self.auth_retries == 0 {
                     self.auth_failed(now, out);
-                } else {
+                } else if pap {
                     self.send_pap(now, out);
+                } else {
+                    self.send_chap_response(now, out);
                 }
             }
         }

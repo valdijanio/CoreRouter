@@ -320,6 +320,8 @@ pub struct Stats {
     pub keepalive_timeouts: u64,
     pub malformed: u64,
     pub unknown_session: u64,
+    /// PADTs sent for frames of unknown sessions.
+    pub padt_unknown: u64,
     pub ignored: u64,
 }
 
@@ -362,6 +364,8 @@ pub struct Server {
     due: Vec<Entry>,
     cookies: CookieJar,
     limiter: PadiLimiter,
+    /// PADTs answering frames for sessions we do not have (100/s).
+    padt_limiter: PadiLimiter,
     rng: Rng,
     by_host: HashMap<HostKey, u16>,
     by_uniq: HashMap<(HostKey, u64), u16>,
@@ -371,9 +375,11 @@ pub struct Server {
     stats: Stats,
 }
 
-fn uniq_hash(v: Option<&[u8]>) -> u64 {
+/// Identifies the PADR that created a session: Host-Uniq and AC-Cookie.
+fn uniq_hash(host_uniq: Option<&[u8]>, cookie: Option<&[u8]>) -> u64 {
     let mut h = DefaultHasher::new();
-    v.hash(&mut h);
+    host_uniq.hash(&mut h);
+    cookie.hash(&mut h);
     h.finish()
 }
 
@@ -394,6 +400,7 @@ impl Server {
             due: Vec::new(),
             cookies: CookieJar::new(cookie_key, cfg.cookie_timeout_ms),
             limiter: PadiLimiter::new(cfg.padi_limit, cfg.mac_padi_limit, cfg.mac_padi_burst),
+            padt_limiter: PadiLimiter::new(100, 0, 0),
             rng,
             by_host: HashMap::new(),
             by_uniq: HashMap::new(),
@@ -576,6 +583,31 @@ impl Server {
         });
         if !matches || f.link.dst != self.cfg.ac_mac {
             self.stats.unknown_session += 1;
+            // A host still talking on a session we no longer have (our PADT
+            // was lost): tell it, so it starts over instead of waiting for
+            // its keepalive. Rate-limited: a spoofed source cannot turn us
+            // into a PADT reflector.
+            if f.link.dst == self.cfg.ac_mac
+                && f.link.src.is_unicast()
+                && sid != 0
+                && !matches
+                && self.padt_limiter.allow(now, Mac::ZERO)
+            {
+                let start = out.buf.len();
+                let w = DiscoveryWriter::begin(
+                    &mut out.buf,
+                    f.link.src,
+                    self.cfg.ac_mac,
+                    f.link.vlans,
+                    Code::Padt,
+                    sid,
+                );
+                if w.finish().is_ok() {
+                    out.push_frame(ifindex, start);
+                    self.stats.padt_tx += 1;
+                    self.stats.padt_unknown += 1;
+                }
+            }
             return;
         }
         let (protocol, info) = (f.protocol, f.info);
@@ -752,11 +784,15 @@ impl Server {
             vlans: d.vlans,
             mac: d.src,
         };
-        let uniq = uniq_hash(d.tags.host_uniq);
-        // A retransmitted PADR (our PADS was lost) gets the same SESSION_ID
-        // while that session has not started LCP from the peer's side.
+        let uniq = uniq_hash(d.tags.host_uniq, d.tags.ac_cookie);
+        // A copy of the PADR that created a session (retransmitted because
+        // our PADS was lost, or duplicated on the wire and late) gets the
+        // same SESSION_ID. The cookie makes it the same request: a host that
+        // starts over sends a new PADI and brings a new cookie. Without
+        // cookies, only before LCP starts.
+        let same_request = |s: &Session| d.tags.ac_cookie.is_some() || s.in_discovery();
         if let Some(&sid) = self.by_uniq.get(&(host, uniq))
-            && self.slot(sid).is_some_and(|s| s.in_discovery())
+            && self.slot(sid).is_some_and(same_request)
         {
             self.stats.padr_duplicate += 1;
             self.send_pads(ifindex, d, sid, out);

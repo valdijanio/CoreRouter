@@ -135,6 +135,9 @@ pub struct Fsm {
     req_id: u8,
     next_id: u8,
     last_req_len: u8,
+    /// Our last Configure-Request got its Ack/Nak/Reject: a copy of the
+    /// reply (duplicated or delayed on the wire) must not count twice.
+    answered: bool,
     /// Restart timer deadline; 0 = stopped.
     deadline: Millis,
     last_req: [u8; LAST_REQ_MAX],
@@ -156,6 +159,7 @@ impl Fsm {
             req_id: 0,
             next_id: first_id,
             last_req_len: 0,
+            answered: false,
             deadline: 0,
             last_req: [0; LAST_REQ_MAX],
         }
@@ -224,6 +228,7 @@ impl Fsm {
             n as u8
         };
         self.req_id = self.take_id();
+        self.answered = false;
         ctx.tx
             .send(L::PROTOCOL, code::CONFIGURE_REQUEST, self.req_id, buf);
         self.restart = self.restart.saturating_sub(1);
@@ -515,9 +520,11 @@ impl Fsm {
     fn rca<L: Layer>(&mut self, ctx: &mut Ctx<'_>, layer: &mut L, pkt: Control<'_>) -> Signals {
         let mut s = Signals::default();
         // §5.2: Identifier and options must match the last request.
-        if pkt.id != self.req_id || self.last_req() != Some(pkt.data) {
+        // §5.2: the reply to our last request, once (pppd's `seen_ack`).
+        if pkt.id != self.req_id || self.answered || self.last_req() != Some(pkt.data) {
             return s;
         }
+        self.answered = true;
         match self.state {
             State::Closed | State::Stopped => Self::sta::<L>(ctx, pkt.id),
             // Req-Sent × RCA → irc / Ack-Rcvd.
@@ -551,7 +558,7 @@ impl Fsm {
 
     fn rcn<L: Layer>(&mut self, ctx: &mut Ctx<'_>, layer: &mut L, pkt: Control<'_>) -> Signals {
         let mut s = Signals::default();
-        if pkt.id != self.req_id || !ppp::options_valid(pkt.data) {
+        if pkt.id != self.req_id || self.answered || !ppp::options_valid(pkt.data) {
             return s;
         }
         if pkt.code == code::CONFIGURE_REJECT {
@@ -566,6 +573,7 @@ impl Fsm {
                 return s;
             }
         }
+        self.answered = true;
         match self.state {
             State::Closed | State::Stopped => {
                 Self::sta::<L>(ctx, pkt.id);

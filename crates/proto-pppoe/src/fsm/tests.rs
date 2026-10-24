@@ -429,3 +429,21 @@ fn unknown_code_is_left_to_the_caller_and_code_rejected() {
     assert_eq!(c, code::CODE_REJECT);
     assert_eq!(body, raw);
 }
+
+#[test]
+fn rfc1661_5_2_a_duplicated_ack_does_not_renegotiate() {
+    let mut a = End::new(1, Toy::new(1492, 0..=u16::MAX));
+    let mut b = End::new(100, Toy::new(1492, 0..=u16::MAX));
+    a.start(0);
+    b.start(0);
+    // Keep a copy of a's request and b's Ack to it.
+    let (_, id, req) = a.wire.0.front().cloned().unwrap();
+    pump(&mut a, &mut b, 0);
+    assert_eq!(a.fsm.state(), State::Opened);
+    a.sig = Signals::default();
+    a.deliver(0, code::CONFIGURE_ACK, id, &req);
+    assert_eq!(a.fsm.state(), State::Opened, "late duplicate Ack tossed");
+    assert!(!a.sig.tld);
+    a.deliver(0, code::CONFIGURE_NAK, id, &req);
+    assert_eq!(a.fsm.state(), State::Opened, "and a late Nak for it too");
+}

@@ -52,7 +52,10 @@ fn ipv6cp_comes_up_with_ipcp() {
 
 #[test]
 fn wrong_password_is_refused_and_cleaned_up() {
-    let mut l = lab(4, |c| c.bad_password_every = 2);
+    let mut l = lab(4, |c| {
+        c.bad_password_every = 2;
+        c.reconnect = false;
+    });
     l.run_until(30_000);
     assert_eq!(l.clients_up(), 2);
     assert_eq!(l.stats.auth_rejects, 2);
@@ -494,4 +497,154 @@ fn vlan_range_filter() {
     s.handle_frame(0, 1, &tagged(150), &mut out);
     let r = replies(&out);
     assert_eq!(r[0].vlans, Vlans::single(150), "answered on the same VLAN");
+}
+
+// ------------------------------------------------- one client, hand-pumped
+
+use crate::client::{Client, ClientConfig, ClientOutput};
+use crate::layers::AuthSet;
+
+/// Moves frames between one server and one client; `drop` decides, per
+/// frame (server → client = true), whether the wire loses it.
+struct Pair {
+    s: Server,
+    c: Client,
+    so: ServerOutput,
+    co: ClientOutput,
+    now: Millis,
+    log: Vec<(bool, u16, u8)>,
+}
+
+fn ppp_of(f: &[u8]) -> Option<(u16, u8)> {
+    let s = ppp::parse_session(f).ok()?;
+    let c = ppp::parse_control(s.info).ok()?;
+    Some((s.protocol, c.code))
+}
+
+impl Pair {
+    fn new(auth: AuthProto) -> Pair {
+        let (s, so) = server(|_| {});
+        let c = Client::new(
+            ClientConfig {
+                mac: HOST,
+                username: b"u".to_vec(),
+                password: "p".into(),
+                auth: AuthSet::new(&[auth]),
+                ..ClientConfig::default()
+            },
+            [3; 32],
+        );
+        Pair {
+            s,
+            c,
+            so,
+            co: ClientOutput::new(),
+            now: 0,
+            log: Vec::new(),
+        }
+    }
+
+    fn answer(&mut self) {
+        let evs = std::mem::take(&mut self.so.events);
+        for e in evs {
+            match e {
+                Event::Authenticate { session, request } => {
+                    let ok = request.verify_local("p");
+                    let v = match ok {
+                        Some(sha) => AuthVerdict::Accept(Authorization {
+                            mschap2_success: sha,
+                            ..Authorization::default()
+                        }),
+                        None => AuthVerdict::Reject {
+                            message: b"no".as_slice().into(),
+                        },
+                    };
+                    self.s.auth_reply(self.now, session, v, &mut self.so);
+                }
+                Event::NeedAddress { session } => {
+                    let a = Ipv4Assignment {
+                        address: Ipv4Addr::new(100, 64, 0, 7),
+                        dns: [None, None],
+                        nbns: [None, None],
+                    };
+                    self.s
+                        .address_reply(self.now, session, Some(a), &mut self.so);
+                }
+                other => self.so.events.push(other),
+            }
+        }
+    }
+
+    /// Runs `ms` of simulated time in 100 ms steps.
+    fn run(&mut self, ms: u64, mut drop: impl FnMut(bool, &[u8]) -> bool) {
+        let end = self.now + ms;
+        while self.now < end {
+            for _ in 0..50 {
+                self.answer();
+                let sf: Vec<Vec<u8>> = self.so.frames().map(|(_, f)| f.to_vec()).collect();
+                let cf: Vec<Vec<u8>> = self.co.frames().map(|(_, f)| f.to_vec()).collect();
+                self.so.buf.clear();
+                self.so.frames.clear();
+                self.co.clear();
+                if sf.is_empty() && cf.is_empty() {
+                    break;
+                }
+                for f in sf {
+                    if let Some((p, c)) = ppp_of(&f) {
+                        self.log.push((true, p, c));
+                    }
+                    if !drop(true, &f) {
+                        self.c.handle_frame(self.now, &f, &mut self.co);
+                    }
+                }
+                for f in cf {
+                    if let Some((p, c)) = ppp_of(&f) {
+                        self.log.push((false, p, c));
+                    }
+                    if !drop(false, &f) {
+                        self.s.handle_frame(self.now, 1, &f, &mut self.so);
+                    }
+                }
+            }
+            self.now += 100;
+            self.s.handle_timers(self.now, &mut self.so);
+            self.c.handle_timers(self.now, &mut self.co);
+        }
+    }
+}
+
+fn drop_first(proto: u16, code: u8) -> impl FnMut(bool, &[u8]) -> bool {
+    let mut done = false;
+    move |to_client, f| {
+        if !done && to_client && ppp_of(f) == Some((proto, code)) {
+            done = true;
+            return true;
+        }
+        false
+    }
+}
+
+#[test]
+fn rfc1994_4_1_lost_success_is_recovered_by_a_repeated_response() {
+    for a in [AuthProto::ChapMd5, AuthProto::MsChapV1, AuthProto::MsChapV2] {
+        let mut p = Pair::new(a);
+        p.c.start(0, &mut p.co);
+        p.run(
+            15_000,
+            drop_first(ppp::proto::CHAP, crate::auth::code::CHAP_SUCCESS),
+        );
+        assert_eq!(p.c.phase(), ClientPhase::Up, "{a:?}: {:?}", p.log);
+        assert!(p.so.events.iter().any(|e| matches!(e, Event::Up { .. })));
+    }
+}
+
+#[test]
+fn rfc1334_lost_pap_ack_is_recovered() {
+    let mut p = Pair::new(AuthProto::Pap);
+    p.c.start(0, &mut p.co);
+    p.run(
+        15_000,
+        drop_first(ppp::proto::PAP, crate::auth::code::PAP_ACK),
+    );
+    assert_eq!(p.c.phase(), ClientPhase::Up);
 }

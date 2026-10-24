@@ -67,6 +67,10 @@ pub struct LabConfig {
     /// Spread of the clients' start times.
     pub start_spread_ms: u64,
     pub ipv6: bool,
+    /// Clients start over 1–3 s after their session ends, as a CPE does.
+    pub reconnect: bool,
+    /// Prints every frame to or from this MAC (debugging a simulation).
+    pub trace: Option<Mac>,
     pub seed: u64,
 }
 
@@ -86,6 +90,8 @@ impl Default for LabConfig {
             bad_password_every: 0,
             start_spread_ms: 1000,
             ipv6: false,
+            reconnect: true,
+            trace: None,
             seed: 1,
         }
     }
@@ -118,6 +124,11 @@ pub struct LabStats {
     pub downs: u64,
     pub client_downs: u64,
     pub auth_rejects: u64,
+    /// Why clients stopped / why the servers ended sessions.
+    pub client_reasons: std::collections::BTreeMap<String, u64>,
+    pub server_reasons: std::collections::BTreeMap<String, u64>,
+    /// Client downs other than a server PADT: (time, client, reason).
+    pub odd_downs: Vec<(Millis, usize, String)>,
 }
 
 pub struct Lab {
@@ -245,7 +256,29 @@ impl Lab {
     /// past later frames.
     fn transmit(&mut self, dest: Dest, frame: &[u8]) {
         self.stats.frames += 1;
-        if self.dice.hit(self.cfg.loss_ppm) {
+        let lost = self.dice.hit(self.cfg.loss_ppm);
+        if let Some(t) = self.cfg.trace
+            && let Ok(e) = eth::parse(frame)
+            && (e.src == t || e.dst == t)
+        {
+            let ctl = crate::ppp::parse_session(frame).ok().and_then(|s| {
+                let c = crate::ppp::parse_control(s.info).ok()?;
+                Some((s.protocol, c.code, c.id))
+            });
+            let disc = crate::discovery::parse(frame)
+                .ok()
+                .map(|d| (d.code, d.session_id));
+            let phase = self
+                .by_mac
+                .get(&t)
+                .and_then(|i| self.clients.get(*i))
+                .map(Client::phase);
+            eprintln!(
+                "trace t={} {dest:?} lost={lost} {ctl:x?} {disc:?} client={phase:?}",
+                self.now
+            );
+        }
+        if lost {
             self.stats.lost += 1;
             return;
         }
@@ -302,7 +335,23 @@ impl Lab {
         for ev in &out.events {
             match ev {
                 ClientEvent::Up { .. } => {}
-                ClientEvent::Down { .. } => self.stats.client_downs += 1,
+                ClientEvent::Down { reason } => {
+                    self.stats.client_downs += 1;
+                    if !matches!(reason, crate::client::ClientDown::Padt) {
+                        self.stats
+                            .odd_downs
+                            .push((self.now, i, format!("{reason:?}")));
+                    }
+                    *self
+                        .stats
+                        .client_reasons
+                        .entry(format!("{reason:?}"))
+                        .or_default() += 1;
+                    if self.cfg.reconnect {
+                        let at = self.now + 1000 + self.dice.below(2000);
+                        self.starts.push(Reverse((at, i)));
+                    }
+                }
             }
         }
         self.cout = out;
@@ -348,8 +397,28 @@ impl Lab {
                 }
             }
             Event::Changed { .. } => {}
-            Event::Down { session, .. } => {
+            Event::Down {
+                session,
+                reason,
+                key,
+                ..
+            } => {
                 self.stats.downs += 1;
+                *self
+                    .stats
+                    .server_reasons
+                    .entry(format!("{reason:?}"))
+                    .or_default() += 1;
+                if *reason == crate::server::DownReason::Replaced {
+                    let i = self
+                        .by_mac
+                        .get(&key.client_mac)
+                        .copied()
+                        .unwrap_or(usize::MAX);
+                    self.stats
+                        .odd_downs
+                        .push((self.now, i, "server Replaced".into()));
+                }
                 self.up.remove(&(shard, session.sid));
                 if let Some(a) = self.leased.remove(&(shard, session.sid)) {
                     self.pool_free.push(a);
@@ -419,6 +488,23 @@ impl Lab {
             let at = self.now + self.dice.below(self.cfg.start_spread_ms.max(1));
             self.starts.push(Reverse((at, i)));
         }
+    }
+
+    /// Client `i` ends its session with a PADT (or gives up discovery).
+    pub fn abort(&mut self, i: usize) {
+        if let Some(c) = self.clients.get_mut(i) {
+            c.abort(&mut self.cout);
+        }
+        self.flush_client(i);
+    }
+
+    /// Client `i` closes with LCP Terminate, then PADT.
+    pub fn close(&mut self, i: usize) {
+        let now = self.now;
+        if let Some(c) = self.clients.get_mut(i) {
+            c.close(now, &mut self.cout);
+        }
+        self.flush_client(i);
     }
 
     /// Starts one client now.
