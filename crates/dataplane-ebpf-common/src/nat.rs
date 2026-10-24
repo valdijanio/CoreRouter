@@ -82,7 +82,6 @@ pub enum NotHere {
 /// 0xFFFF.
 pub fn rewrite<P: PacketMut + ?Sized>(
     p: &mut P,
-    ip_off: usize,
     info: &IpInfo,
     src: Option<Endpoint>,
     dst: Option<Endpoint>,
@@ -90,6 +89,7 @@ pub fn rewrite<P: PacketMut + ?Sized>(
     if info.fragment != Fragment::No {
         return Err(NotHere::Fragment);
     }
+    let ip_off = info.ip_off;
     let csum_off = match info.proto {
         IPPROTO_TCP => info.l4_off + 16,
         IPPROTO_UDP => info.l4_off + 6,

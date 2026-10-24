@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 
-use corerouter_hal::xdp::{REASONS, XdpPlan, XdpStatus};
+use corerouter_hal::xdp::{DROPS, XdpPlan, XdpStatus};
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};
 
@@ -66,7 +66,7 @@ impl XdpRates {
 
     /// Dropped packets per second of `interface` (every reason but pass).
     pub fn drop_pps(&self, interface: &IfName) -> u64 {
-        (1..REASONS.len()).map(|r| self.pps(interface, r)).sum()
+        DROPS.iter().map(|r| self.pps(interface, *r)).sum()
     }
 }
 

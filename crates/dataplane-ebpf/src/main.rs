@@ -11,17 +11,23 @@
 #![no_std]
 #![no_main]
 
-use aya_ebpf::bindings::{BPF_ANY, BPF_NOEXIST, xdp_action};
-use aya_ebpf::helpers::bpf_ktime_get_ns;
+use aya_ebpf::bindings::{
+    BPF_ANY, BPF_FIB_LKUP_RET_SUCCESS, BPF_NOEXIST, bpf_fib_lookup as FibParams,
+    bpf_fib_lookup__bindgen_ty_1, bpf_fib_lookup__bindgen_ty_2, bpf_fib_lookup__bindgen_ty_3,
+    bpf_fib_lookup__bindgen_ty_4, bpf_fib_lookup__bindgen_ty_5, xdp_action,
+};
+use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect};
 use aya_ebpf::macros::{map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{Array, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuHashMap};
 use aya_ebpf::programs::XdpContext;
 use corerouter_dataplane_ebpf_common::bucket::Bucket;
+use corerouter_dataplane_ebpf_common::fastnat::{self, FlowKey, FlowValue};
+use corerouter_dataplane_ebpf_common::nat::PacketMut;
 use corerouter_dataplane_ebpf_common::filter::{self, Lookups, SETTINGS_WORDS, Settings, Verdict};
 use corerouter_dataplane_ebpf_common::maps::{self as m, Counter, Top};
 use corerouter_dataplane_ebpf_common::packet::Packet;
-use corerouter_dataplane_ebpf_common::parse::Addr;
+use corerouter_dataplane_ebpf_common::parse::{Addr, IpInfo};
 
 #[map(name = "SETTINGS")]
 static SETTINGS: Array<u64> = Array::with_max_entries(m::SETTINGS_SLOTS, 0);
@@ -38,6 +44,9 @@ static RATE: LruHashMap<[u8; 16], Bucket> = LruHashMap::with_max_entries(m::RATE
 #[map(name = "COUNTERS")]
 static COUNTERS: PerCpuHashMap<u64, Counter> =
     PerCpuHashMap::with_max_entries(m::COUNTER_ENTRIES, 0);
+#[map(name = "NAT_FLOWS")]
+static NAT_FLOWS: LruHashMap<FlowKey, FlowValue> =
+    LruHashMap::with_max_entries(m::NAT_FLOWS_MAX, 0);
 #[map(name = "TOP")]
 static TOP: LruPerCpuHashMap<[u8; 16], Top> =
     LruPerCpuHashMap::with_max_entries(m::TOP_SOURCES, 0);
@@ -63,6 +72,23 @@ impl Packet for Frame<'_> {
         // the verifier needs before it allows the load). `[u8; N]` has no
         // invalid bit patterns and `read_unaligned` needs no alignment.
         Some(unsafe { core::ptr::read_unaligned((start + off) as *const [u8; N]) })
+    }
+}
+
+impl PacketMut for Frame<'_> {
+    #[inline(always)]
+    fn store<const N: usize>(&mut self, off: usize, bytes: [u8; N]) -> Option<()> {
+        let start = self.0.data();
+        let end = self.0.data_end();
+        if start + off + N > end {
+            return None;
+        }
+        // SAFETY: `start + off .. start + off + N` lies inside the packet
+        // (checked against `data_end` just above, as the verifier wants
+        // before a store). XDP packet data is writable, and
+        // `write_unaligned` needs no alignment.
+        unsafe { core::ptr::write_unaligned((start + off) as *mut [u8; N], bytes) };
+        Some(())
     }
 }
 
@@ -165,19 +191,92 @@ fn top(src: &Addr, v: &Verdict, len: u64, now: u64) {
     }
 }
 
+/// The CGNAT fast path (G2.5b): a packet of a flow conntrack already NATed
+/// is translated and sent out of the interface the FIB names. `None`: not
+/// a known flow, or something the kernel must do (the packet is untouched
+/// then: nothing is written before the FIB lookup succeeds).
+#[inline(always)]
+fn fast_nat(ctx: &XdpContext, frame: &mut Frame, info: &IpInfo, now: u64) -> Option<u32> {
+    let key = fastnat::key_of(info)?;
+    let flow = NAT_FLOWS.get_ptr_mut(key)?;
+    // SAFETY: the kernel returned a pointer to this flow's value, valid and
+    // aligned for `FlowValue` for the rest of the run (RCU). The daemon
+    // replaces values whole and other CPUs only store the last-seen time and
+    // bump the packet count: a torn read cannot happen on 64-bit words.
+    let v: FlowValue = unsafe { *flow };
+    fastnat::admit(frame, info).ok()?;
+    let [src, dst, ..] = v;
+    let (src, dst) = (fastnat::decode(src), fastnat::decode(dst));
+    let tot_len = frame.be16(info.ip_off + 2)?;
+    let mut fib = FibParams {
+        family: 2, // AF_INET
+        l4_protocol: info.proto,
+        sport: src.port.to_be(),
+        dport: dst.port.to_be(),
+        __bindgen_anon_1: bpf_fib_lookup__bindgen_ty_1 { tot_len },
+        ifindex: ctx.ingress_ifindex() as u32,
+        __bindgen_anon_2: bpf_fib_lookup__bindgen_ty_2 { tos: 0 },
+        __bindgen_anon_3: bpf_fib_lookup__bindgen_ty_3 {
+            ipv4_src: u32::from_ne_bytes(src.addr),
+        },
+        __bindgen_anon_4: bpf_fib_lookup__bindgen_ty_4 {
+            ipv4_dst: u32::from_ne_bytes(dst.addr),
+        },
+        __bindgen_anon_5: bpf_fib_lookup__bindgen_ty_5 { tbid: 0 },
+        smac: [0; 6],
+        dmac: [0; 6],
+    };
+    // SAFETY: `ctx.ctx` is this program's context; `fib` is a fully
+    // initialized `bpf_fib_lookup` on the stack, its size passed along, as
+    // the helper requires. The helper only writes into `fib`.
+    let rc = unsafe {
+        bpf_fib_lookup(
+            ctx.ctx.cast(),
+            &mut fib,
+            core::mem::size_of::<FibParams>() as i32,
+            0,
+        )
+    };
+    if rc != i64::from(BPF_FIB_LKUP_RET_SUCCESS) {
+        return None;
+    }
+    fastnat::translate(frame, info, &v).ok()?;
+    frame.store(0, fib.dmac)?;
+    frame.store(6, fib.smac)?;
+    // SAFETY: as above; plain stores of whole words (last seen, packets).
+    // Two CPUs racing on one flow may lose a packet count: statistics only.
+    unsafe {
+        (*flow)[2] = now;
+        (*flow)[3] += 1;
+    }
+    // SAFETY: a BPF helper taking an interface index the FIB returned and
+    // no flags; it only records where the packet goes.
+    Some(unsafe { bpf_redirect(fib.ifindex, 0) } as u32)
+}
+
 #[xdp]
 pub fn corerouter_xdp(ctx: XdpContext) -> u32 {
-    let frame = Frame(&ctx);
+    let mut frame = Frame(&ctx);
     let len = frame.len() as u64;
     let s = settings();
     // SAFETY: a BPF helper with no arguments and no preconditions
     // (CLOCK_MONOTONIC in nanoseconds).
     let now = unsafe { bpf_ktime_get_ns() };
-    let v = filter::decide(&frame, &s, &mut Maps, now);
-    count(ctx.ingress_ifindex() as u32, &v, len);
+    let mut v = filter::decide(&frame, &s, &mut Maps, now);
+    let ifindex = ctx.ingress_ifindex() as u32;
     if !v.drop {
+        if s.fast_nat
+            && let Some(info) = v.ip
+            && let Some(action) = fast_nat(&ctx, &mut frame, &info, now)
+        {
+            v.reason = filter::Reason::FastNat;
+            count(ifindex, &v, len);
+            return action;
+        }
+        count(ifindex, &v, len);
         return xdp_action::XDP_PASS;
     }
+    count(ifindex, &v, len);
     if let Some(src) = &v.src {
         top(src, &v, len, now);
     }

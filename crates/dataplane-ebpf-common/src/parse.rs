@@ -97,6 +97,8 @@ pub enum Fragment {
 /// An IP packet's headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpInfo {
+    /// Offset of the IP header in the frame (14 when untagged).
+    pub ip_off: usize,
     pub src: Addr,
     pub dst: Addr,
     /// Upper-layer protocol (after IPv6 extension headers, when walked).
@@ -205,6 +207,7 @@ fn ipv4<P: Packet + ?Sized>(p: &P, off: usize) -> Parsed {
         _ => Fragment::Later,
     };
     let info = IpInfo {
+        ip_off: off,
         src: Addr::V4([s0, s1, s2, s3]),
         dst: Addr::V4([d0, d1, d2, d3]),
         proto,
@@ -241,6 +244,7 @@ fn ipv6<P: Packet + ?Sized>(p: &P, off: usize) -> Parsed {
     }
     let (src, dst) = split16(rest);
     let mut info = IpInfo {
+        ip_off: off,
         src: Addr::V6(src),
         dst: Addr::V6(dst),
         proto: next,

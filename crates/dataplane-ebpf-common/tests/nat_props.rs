@@ -4,7 +4,7 @@
 //! then any source and destination rewrite: every checksum still
 //! verifies, the fields hold the new values, the payload is untouched, and
 //! rewriting back gives the original frame.
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::indexing_slicing, clippy::panic)]
 
 use corerouter_dataplane_ebpf_common::nat::{Endpoint, NotHere, rewrite};
 use corerouter_dataplane_ebpf_common::parse::{Addr, IPPROTO_TCP, IPPROTO_UDP, Parsed, parse};
@@ -47,7 +47,7 @@ proptest! {
         prop_assert!(checksums_ok(&original));
         let mut f = original.clone();
         let Parsed::Ip(info) = parse(&f[..]) else { panic!() };
-        rewrite(&mut f[..], 14, &info, src, dst).unwrap();
+        rewrite(&mut f[..], &info, src, dst).unwrap();
         prop_assert!(checksums_ok(&f), "{f:02x?}");
         if let Some(e) = src {
             prop_assert_eq!(&f[26..30], &e.addr[..]);
@@ -63,7 +63,7 @@ proptest! {
         let back_src = src.map(|_| Endpoint { addr: original[26..30].try_into().unwrap(), port: s.sport });
         let back_dst = dst.map(|_| Endpoint { addr: original[30..34].try_into().unwrap(), port: s.dport });
         let Parsed::Ip(info) = parse(&f[..]) else { panic!() };
-        rewrite(&mut f[..], 14, &info, back_src, back_dst).unwrap();
+        rewrite(&mut f[..], &info, back_src, back_dst).unwrap();
         prop_assert!(checksums_ok(&f));
         if s.proto == IPPROTO_TCP {
             prop_assert_eq!(f, original);
@@ -79,7 +79,7 @@ proptest! {
         f[40] = 0;
         f[41] = 0;
         let Parsed::Ip(info) = parse(&f[..]) else { panic!() };
-        rewrite(&mut f[..], 14, &info, src, None).unwrap();
+        rewrite(&mut f[..], &info, src, None).unwrap();
         prop_assert_eq!(&f[40..42], &[0, 0][..]);
         prop_assert!(checksums_ok(&f));
     }
@@ -103,7 +103,7 @@ fn fragments_and_other_protocols_stay_in_the_kernel() {
         panic!()
     };
     assert_eq!(
-        rewrite(&mut f[..], 14, &info, None, None),
+        rewrite(&mut f[..], &info, None, None),
         Err(NotHere::Fragment)
     );
     let icmp = Spec { proto: 1, ..s };
@@ -112,7 +112,7 @@ fn fragments_and_other_protocols_stay_in_the_kernel() {
         panic!()
     };
     assert_eq!(
-        rewrite(&mut g[..], 14, &info, None, None),
+        rewrite(&mut g[..], &info, None, None),
         Err(NotHere::Protocol)
     );
 }

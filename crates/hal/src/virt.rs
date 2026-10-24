@@ -700,6 +700,7 @@ impl Hal for VirtualHal {
                 on(plan.rate_limit > 0, 500),
                 on(plan.drop_malformed, 40),
                 on(plan.drop_invalid_tcp_flags, 15),
+                on(plan.fast_nat, 9_000),
             ];
             ports.push(XdpPort {
                 interface: name.clone(),

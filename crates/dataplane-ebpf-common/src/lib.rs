@@ -12,6 +12,8 @@
 //!   [`filter::Lookups`] the program backs with maps and the tests with
 //!   plain collections.
 //! - [`bucket`]: the per-source token bucket.
+//! - [`fastnat`]: the CGNAT fast path (G2.5b): flows conntrack already
+//!   NATed, translated and forwarded in XDP.
 //! - [`nat`]: the CGNAT fast path's rewrite, with checksums updated
 //!   incrementally (RFC 1624).
 //! - [`maps`]: map names, sizes and value layouts (plain integers and
@@ -26,6 +28,7 @@
 #![forbid(unsafe_code)]
 
 pub mod bucket;
+pub mod fastnat;
 pub mod filter;
 pub mod maps;
 pub mod nat;

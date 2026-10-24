@@ -20,6 +20,7 @@ const ALL_ON: Settings = Settings {
     allow: true,
     rate_pps: 0,
     burst: 0,
+    fast_nat: false,
 };
 
 proptest! {

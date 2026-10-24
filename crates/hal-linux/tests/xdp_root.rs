@@ -29,7 +29,7 @@ use corerouter_dataplane_ebpf_common::filter::{Settings, decide};
 use corerouter_dataplane_ebpf_common::parse::{Addr, IPPROTO_UDP};
 use corerouter_dataplane_ebpf_common::testing::{Model, Spec, build, spec};
 use corerouter_hal::xdp::XdpStatus;
-use corerouter_hal_linux::xdp::XdpState;
+use corerouter_hal_linux::xdp::{NatFlow, XdpState};
 use corerouter_model::firewall::{AddrMatch, AddressListEntry};
 use corerouter_model::xdp::{XdpInterface, XdpMode};
 use corerouter_model::{Config, IfName, Interface, InterfaceKind, ItemId};
@@ -260,6 +260,7 @@ fn kernel_and_host_agree() {
         allow: true,
         rate_pps: 0,
         burst: 0,
+        fast_nat: false,
     };
     let mut checked = 0;
     let mut drops = 0;
@@ -495,4 +496,225 @@ fn perf_veth_blast() {
         x.sync(&Config::default()).unwrap();
     }
     let _ = sh_ok(&["ip", "link", "del", "ya"]);
+}
+
+/// The router of the fast-NAT tests: this namespace, with `la`
+/// (100.64.0.1/24) to subscriber namespace `crxsub` (100.64.0.2) and `wa`
+/// (198.51.100.1/24) to internet namespace `crxinet` (198.51.100.2).
+struct Triangle;
+
+const SUB_NS: &str = "crxsub";
+const INET_NS: &str = "crxinet";
+
+impl Triangle {
+    fn new() -> Self {
+        for ns in [SUB_NS, INET_NS] {
+            let _ = sh_ok(&["ip", "netns", "del", ns]);
+            sh(&["ip", "netns", "add", ns]);
+        }
+        for (here, there, ns, me, peer) in [
+            ("la", "lb", SUB_NS, "100.64.0.1/24", "100.64.0.2/24"),
+            ("wa", "wb", INET_NS, "198.51.100.1/24", "198.51.100.2/24"),
+        ] {
+            let _ = sh_ok(&["ip", "link", "del", here]);
+            sh(&[
+                "ip", "link", "add", here, "type", "veth", "peer", "name", there,
+            ]);
+            sh(&["ip", "link", "set", there, "netns", ns]);
+            sh(&["ip", "addr", "add", me, "dev", here]);
+            sh(&["ip", "link", "set", here, "up"]);
+            for a in [
+                vec!["ip", "addr", "add", peer, "dev", there],
+                vec!["ip", "link", "set", there, "up"],
+                vec!["ip", "link", "set", "lo", "up"],
+            ] {
+                let mut v = vec!["ip", "netns", "exec", ns];
+                v.extend(a);
+                sh(&v);
+            }
+        }
+        sh(&[
+            "ip",
+            "netns",
+            "exec",
+            SUB_NS,
+            "ip",
+            "route",
+            "add",
+            "default",
+            "via",
+            "100.64.0.1",
+        ]);
+        std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").unwrap();
+        // Neighbors both ways, so the FIB lookup finds them.
+        for (ns, to) in [(SUB_NS, "100.64.0.1"), (INET_NS, "198.51.100.1")] {
+            sh(&["ip", "netns", "exec", ns, "ping", "-c", "1", "-W", "2", to]);
+        }
+        for to in ["100.64.0.2", "198.51.100.2"] {
+            sh(&["ping", "-c", "1", "-W", "2", to]);
+        }
+        Triangle
+    }
+
+    /// Run `f` on a thread inside namespace `ns`.
+    fn spawn_in<T: Send + 'static>(
+        ns: &str,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> std::thread::JoinHandle<T> {
+        let path = format!("/run/netns/{ns}");
+        std::thread::spawn(move || {
+            let fd = std::fs::File::open(&path).unwrap();
+            nix::sched::setns(fd, nix::sched::CloneFlags::CLONE_NEWNET).unwrap();
+            f()
+        })
+    }
+}
+
+impl Drop for Triangle {
+    fn drop(&mut self) {
+        for l in ["la", "wa"] {
+            let _ = sh_ok(&["ip", "link", "del", l]);
+        }
+        for ns in [SUB_NS, INET_NS] {
+            let _ = sh_ok(&["ip", "netns", "del", ns]);
+        }
+    }
+}
+
+fn ifindex(name: &str) -> u32 {
+    sh(&["cat", &format!("/sys/class/net/{name}/ifindex")])
+        .trim()
+        .parse()
+        .unwrap()
+}
+
+/// XDP (generic) on `la` and `wa` with the CGNAT fast path on, and the two
+/// directions of one NATed UDP "connection" installed by hand:
+/// 100.64.0.2:5000 → 198.51.100.2:7 leaves as 198.51.100.1:20000.
+fn fast_nat_router() -> (XdpState, [NatFlow; 2]) {
+    let mut cfg = Config::default();
+    for n in ["la", "wa"] {
+        let name: IfName = n.parse().unwrap();
+        cfg.interfaces.insert(
+            name.clone(),
+            Interface::new(name.clone(), InterfaceKind::Ethernet),
+        );
+        cfg.ip.xdp.interfaces.push(XdpInterface {
+            interface: name,
+            mode: XdpMode::Generic,
+            disabled: false,
+            comment: String::new(),
+        });
+    }
+    cfg.ip.xdp.fast_nat = true;
+    let mut x = XdpState::default();
+    x.sync(&cfg).unwrap();
+    let ip = |s: &str| -> std::net::Ipv4Addr { s.parse().unwrap() };
+    let flows = [
+        NatFlow {
+            proto: IPPROTO_UDP,
+            src: (ip("100.64.0.2"), 5000),
+            dst: (ip("198.51.100.2"), 7),
+            new_src: (ip("198.51.100.1"), 20000),
+            new_dst: (ip("198.51.100.2"), 7),
+        },
+        NatFlow {
+            proto: IPPROTO_UDP,
+            src: (ip("198.51.100.2"), 7),
+            dst: (ip("198.51.100.1"), 20000),
+            new_src: (ip("198.51.100.2"), 7),
+            new_dst: (ip("100.64.0.2"), 5000),
+        },
+    ];
+    x.nat_install(&flows).unwrap();
+    (x, flows)
+}
+
+/// G2.5b: the fast path alone translates and forwards both directions —
+/// the kernel has no NAT here, so a reply from 198.51.100.2:7 reaching the
+/// subscriber can only be XDP's work.
+#[test]
+fn fast_nat_forwards_both_directions() {
+    if !enabled() {
+        return;
+    }
+    let _t = Triangle::new();
+    let (mut x, flows) = fast_nat_router();
+    let server = Triangle::spawn_in(INET_NS, || {
+        let s = std::net::UdpSocket::bind("198.51.100.2:7").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = s.recv_from(&mut buf).unwrap();
+        s.send_to(&buf[..n], from).unwrap();
+        from
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    let client = Triangle::spawn_in(SUB_NS, || {
+        let s = std::net::UdpSocket::bind("100.64.0.2:5000").unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        s.send_to(b"through xdp", "198.51.100.2:7").unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = s.recv_from(&mut buf).unwrap();
+        (buf[..n].to_vec(), from)
+    });
+    let seen_by_server = server.join().unwrap();
+    let (echo, from) = client.join().unwrap();
+    assert_eq!(seen_by_server.to_string(), "198.51.100.1:20000");
+    assert_eq!(echo, b"through xdp");
+    assert_eq!(from.to_string(), "198.51.100.2:7");
+    for f in &flows {
+        let u = x.nat_use(f).unwrap().unwrap();
+        assert!(u.packets >= 1 && u.last_ns > 0, "{f:?}: {u:?}");
+    }
+    let st = x.status(0);
+    for p in &st.ports {
+        println!("{}: {:?}", p.interface, p.counters);
+        assert!(
+            p.counters[corerouter_hal::xdp::FAST_NAT].0 >= 1,
+            "{}",
+            p.interface
+        );
+    }
+    assert_eq!(x.nat_count(), 2);
+    x.nat_remove(&flows).unwrap();
+    assert_eq!(x.nat_count(), 0);
+}
+
+/// Measured: the fast path's cost in the kernel (FIB lookup, rewrite,
+/// redirect) by `BPF_PROG_TEST_RUN` on `la`, against the filter's plain
+/// pass.
+#[test]
+fn perf_fast_nat() {
+    if !enabled() {
+        return;
+    }
+    let _t = Triangle::new();
+    let (mut x, _flows) = fast_nat_router();
+    let mut f = build(&Spec {
+        vlans: vec![],
+        src: Addr::V4([100, 64, 0, 2]),
+        dst: Addr::V4([198, 51, 100, 2]),
+        proto: IPPROTO_UDP,
+        sport: 5000,
+        dport: 7,
+        flags: 0,
+        payload: 18,
+    });
+    f[22] = 64;
+    let la = ifindex("la");
+    let reps = 2_000_000;
+    let (action, nat) = x.test_run_on(&f, reps, Some(la)).unwrap();
+    assert_eq!(action, 4, "XDP_REDIRECT");
+    let other = {
+        let mut g = f.clone();
+        g[37] = 8; // another destination port: no flow
+        g
+    };
+    let (action, plain) = x.test_run_on(&other, reps, Some(la)).unwrap();
+    assert_eq!(action, XDP_PASS);
+    println!(
+        "PERF | fast-nat | redirect ns/pkt {} | no flow (pass) ns/pkt {}",
+        nat.as_nanos(),
+        plain.as_nanos()
+    );
 }
