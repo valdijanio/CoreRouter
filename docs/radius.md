@@ -171,6 +171,22 @@ atributos são os mesmos para todos os servidores do failover); uma entrada com
 `require_message_auth=no` baixa a exigência da pista inteira (senão as respostas dela seriam todas
 descartadas).
 
+### Janela RADIUS
+
+Grupo próprio no menu (como no WinBox), `crates/ui/src/radius.rs`, com ⓘ em português em todo
+rótulo, coluna e aba (`i18n/auto/radius_*.rs`):
+
+- **Servers:** a lista no padrão G0.24 (+ − ✓ ✗ 💬, filtro, rodapé com up/probing/down), selo de
+  estado vindo do monitor, serviços em selos coloridos por nome, `Message-Auth` em selo
+  (`required` verde, `off` âmbar). O modal de adicionar/editar usa a prévia `radius.preview`
+  (posição no failover por serviço, retransmissão calculada, aviso de Blast-RADIUS, lembrete do
+  `ppp.aaa use_radius`); o segredo é digitado oculto (`Input::Secret`), vazio na edição mantém o
+  atual, e a prévia dos comandos nunca o mostra. **Test…** abre o diálogo que manda o
+  Access-Request de teste e mostra o resultado (selo, servidor, tempo, atributos decodificados).
+- **Incoming:** onde escuta, contadores em selos, o formulário (`accept`, porta 3799 com a nota
+  "MikroTik: 1700", VRF, janela de replay, exigências) e as origens aceitas.
+- **Monitor:** a tabela do `/radius monitor`, ao vivo.
+
 ### Testes
 
 - Comandos (`crates/engine/src/cmd/radius.rs`, `ppp_aaa.rs`): sucesso, validação, rollback,
@@ -185,6 +201,9 @@ descartadas).
 - Ponta a ponta no daemon (`apps/corerouter-daemon/tests/radius.rs`): `radius.add` e
   `radius.test` pelo canal de controle contra o servidor de teste em 127.0.0.1, o monitor, o log
   e um Disconnect respondido com NAK 503.
+- Janela (`crates/ui/src/tests/radius.rs`, sem tela): estados e selos, segredo `***`, o modal
+  adicionando pela prévia sem mostrar o segredo, Incoming aplicando a porta 1700, Monitor, o
+  diálogo Test com um serviço AAA de mentira, e toda chave de explicação nos dois idiomas.
 
 ### Desempenho (**medido**, 2026-10-24, AMD Ryzen AI MAX+ 395, build release, `cargo bench -p corerouter-daemon --bench radius_aaa`)
 

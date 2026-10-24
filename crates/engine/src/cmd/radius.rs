@@ -41,6 +41,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("radius.move", "Move RADIUS Server", [], None,
         "{id: *hex, destination?: *hex (before this entry; none = to the end)} → {id, order}",
         has_servers, move_server),
+    cmd!(query "radius.preview", "RADIUS Server Preview", [], None,
+        "{id?: *hex, address?: ip, service?: string, secret?: string, authentication_port?: int, accounting_port?: int, timeout?: int, src_address?: ip, vrf?: string, require_message_auth?: no|yes-for-request-resp, protocol?: udp|radsec, realm?: string, called_id?: string, domain?: string, accounting_backup?: bool, status_server?: bool, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
     cmd!(query "radius.list", "RADIUS", ["RADIUS"], None,
         "{} → [{id, address, service, secret: \"***\", authentication_port, accounting_port, timeout, src_address?, vrf, require_message_auth, protocol, realm?, called_id?, domain?, accounting_backup, status_server, disabled, comment?, order, flags (X disabled)}]",
         always, list),
@@ -552,6 +555,139 @@ fn monitor(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(Value::Array(rows))
 }
 
+/// The modal's numbers come as text: as numbers. An edit's empty or
+/// `***` secret means "keep it" (the window never has the secret).
+fn normalized(p: &Value) -> Value {
+    let mut out = p.as_object().cloned().unwrap_or_default();
+    for k in ["authentication_port", "accounting_port", "timeout"] {
+        if let Some(Value::String(v)) = out.get(k) {
+            match v.trim().parse::<u64>() {
+                Ok(n) => {
+                    out.insert(k.into(), json!(n));
+                }
+                Err(_) if v.trim().is_empty() => {
+                    out.remove(k);
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    if out.contains_key("id")
+        && out
+            .get("secret")
+            .and_then(Value::as_str)
+            .is_some_and(|v| v.is_empty() || v == "***")
+    {
+        out.remove("secret");
+    }
+    for k in ["vrf", "require_message_auth", "protocol"] {
+        if out.get(k).and_then(Value::as_str).is_some_and(|v| v.trim().is_empty()) {
+            out.remove(k);
+        }
+    }
+    Value::Object(out)
+}
+
+/// The add/edit modal's preview (G0.24): never fails for bad input, says
+/// what is wrong as a check instead, and what OK would run.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let p = normalized(p);
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    let check = |level: &str, check: &str, message: String, param: Option<&str>| {
+        json!({"level": level, "check": check, "message": message, "param": param})
+    };
+    let cfg = s.store().candidate().clone();
+    let id = match p.get("id") {
+        None => None,
+        Some(v) => match v.as_str().map(str::parse::<ItemId>) {
+            Some(Ok(id)) if cfg.radius.get(id).is_some() => Some(id),
+            _ => {
+                checks.push(check("error", "id", "no such RADIUS server".into(), None));
+                return Ok(json!({"computed": computed, "checks": checks, "commands": commands}));
+            }
+        },
+    };
+    let base = id.and_then(|id| cfg.radius.get(id).cloned());
+    let given = |k: &str| p.get(k).and_then(Value::as_str).is_some_and(|v| !v.trim().is_empty());
+    if base.is_none() {
+        for (k, why) in [
+            ("address", "the server's address is required"),
+            ("service", "pick who uses it: ppp, login, hotspot, dhcp…"),
+            ("secret", "the shared secret is required (RFC 2865 §3)"),
+        ] {
+            if !given(k) {
+                checks.push(check("error", "required", why.into(), Some(k)));
+            }
+        }
+        if !checks.is_empty() {
+            return Ok(json!({"computed": computed, "checks": checks, "commands": commands}));
+        }
+    }
+    let mut e = base.clone().unwrap_or_else(|| RadiusServer::new(ItemId(0), IpAddr::from([0, 0, 0, 0])));
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        o.remove("id");
+    }
+    match apply(&cfg, &mut e, &q) {
+        Err(EngineError::BadParam { param, reason }) => {
+            checks.push(check("error", "invalid", reason, Some(param.as_str())));
+        }
+        Err(err) => checks.push(check("error", "invalid", err.to_string(), None)),
+        Ok(()) => {
+            let from = e.src_address.map_or_else(|| "the route's address".to_owned(), |a| a.to_string());
+            computed.push(json!({"label": "Sends", "value": format!(
+                "authentication to {}:{}, accounting to {}:{}, from {from}",
+                e.address, e.authentication_port, e.address, e.accounting_port)}));
+            let position: Vec<String> = e
+                .service
+                .iter()
+                .map(|svc| {
+                    let before = cfg
+                        .radius
+                        .servers
+                        .iter()
+                        .take_while(|o| Some(o.id) != id)
+                        .filter(|o| o.id != e.id && o.serves(*svc))
+                        .count();
+                    format!("{} #{}", svc.as_str(), before + 1)
+                })
+                .collect();
+            computed.push(json!({"label": "Failover order", "value": position.join(", ")}));
+            computed.push(json!({"label": "Retransmission", "value": format!(
+                "{} ms, then {} and {} ms (RFC 5080 backoff)", e.timeout, e.timeout * 2, e.timeout * 4)}));
+            checks.push(check("ok", "valid", "ready".into(), None));
+            if e.require_message_auth == RequireMessageAuth::No {
+                checks.push(check("warning", "message_auth",
+                    "replies without Message-Authenticator are accepted: open to Blast-RADIUS (CVE-2024-3596); use it only for a server that cannot sign".into(),
+                    Some("require_message_auth")));
+            }
+            if e.service.contains(&AaaService::Ppp) && !cfg.ppp.aaa.use_radius {
+                checks.push(check("info", "ppp", "PPP asks RADIUS only with ppp.aaa use_radius=yes".into(), Some("service")));
+            }
+            if !e.status_server {
+                checks.push(check("info", "status_server",
+                    "a server that goes down is skipped for 30 s, then tried again with a real request; Status-Server (RFC 5997) probes it instead".into(),
+                    Some("status_server")));
+            }
+            if e.disabled {
+                checks.push(check("warning", "disabled", "disabled: nobody asks it".into(), Some("disabled")));
+            }
+            let mut params = q.as_object().cloned().unwrap_or_default();
+            params.retain(|_, v| !v.is_null());
+            match id {
+                Some(id) => {
+                    params.insert("id".into(), json!(id.to_string()));
+                    commands.push(json!({"command": "radius.set", "params": params}));
+                }
+                None => commands.push(json!({"command": "radius.add", "params": params})),
+            }
+        }
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
+}
+
 /// How long `radius.test` waits for the service's answer: every server's
 /// retries (8 s each) for a few servers.
 const TEST_WAIT: Duration = Duration::from_secs(40);
@@ -748,6 +884,37 @@ mod tests {
         let g = s.execute("radius.incoming.get", &json!({})).unwrap();
         assert_eq!(g["allowed"], json!(["10.0.0.10"]));
         assert_eq!(g["port"], 1700);
+    }
+
+    #[test]
+    fn the_preview_says_what_is_wrong_and_what_it_would_run() {
+        let mut s = lab();
+        let p = s.execute("radius.preview", &json!({})).unwrap();
+        assert_eq!(p["checks"].as_array().unwrap().len(), 3, "{p}");
+        let p = s
+            .execute("radius.preview", &json!({"address": "10.0.0.1", "service": "ppp", "secret": "x", "timeout": "abc"}))
+            .unwrap();
+        assert_eq!(p["checks"][0]["param"], "timeout", "{p}");
+        let p = s
+            .execute("radius.preview", &json!({"address": "10.0.0.1", "service": "ppp,login", "secret": "x",
+                "timeout": "2000", "require_message_auth": "no", "status_server": false}))
+            .unwrap();
+        assert_eq!(p["commands"][0]["command"], "radius.add");
+        assert_eq!(p["commands"][0]["params"]["timeout"], 2000);
+        assert!(p.to_string().contains("Blast-RADIUS"), "{p}");
+        let cmd = p["commands"][0].clone();
+        s.execute("radius.add", &cmd["params"]).unwrap();
+        // An edit keeps the secret it does not know.
+        let p = s
+            .execute("radius.preview", &json!({"id": "*1", "secret": "", "timeout": "3000", "address": "10.0.0.1", "service": "ppp,login"}))
+            .unwrap();
+        assert_eq!(p["commands"][0]["command"], "radius.set", "{p}");
+        assert!(p["commands"][0]["params"].get("secret").is_none());
+        s.execute("radius.set", &p["commands"][0]["params"]).unwrap();
+        assert_eq!(s.store().running().radius.servers[0].secret, "x");
+        assert_eq!(s.store().running().radius.servers[0].timeout, 3000);
+        let p = s.execute("radius.preview", &json!({"id": "*9"})).unwrap();
+        assert_eq!(p["checks"][0]["level"], "error");
     }
 
     #[test]
