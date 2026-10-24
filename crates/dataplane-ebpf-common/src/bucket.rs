@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Per-source token bucket, in integer arithmetic the verifier takes (no
 //! floats, no 128-bit multiply, division only by a checked non-zero rate).
 //!

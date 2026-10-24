@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Header parse: Ethernet (up to two VLAN tags, 802.1Q or 802.1ad), IPv4,
 //! IPv6 (a few extension headers), and the first bytes of TCP, UDP and
 //! ICMP. Only what the filter needs: the source, the protocol, the TCP

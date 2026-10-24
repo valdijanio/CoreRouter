@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! G2.5a: cost of the XDP filter decision on the host (the same code the
 //! kernel runs, minus the map lookups: here plain collections). A lower
 //! bound for the per-packet work in XDP; the kernel numbers come from the

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! What the XDP programs (`crates/dataplane-ebpf`, built for
 //! `bpfel-unknown-none`) and their loader (`hal-linux`, userspace) share.
 //!

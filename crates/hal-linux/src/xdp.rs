@@ -561,6 +561,25 @@ mod tests {
         );
     }
 
+    /// The XDP crates are GPL-2.0-or-later and the object says "GPL" to the
+    /// kernel (GPL-only helpers such as bpf_fib_lookup); the rest stays
+    /// AGPL (docs/xdp.md § Licença).
+    #[test]
+    fn the_xdp_crates_and_object_are_gpl() {
+        let obj = aya_obj::Object::parse(OBJECT).unwrap();
+        assert_eq!(obj.license.to_str().unwrap(), "GPL");
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        for c in ["dataplane-ebpf", "dataplane-ebpf-common", "cgnat-map"] {
+            let toml = std::fs::read_to_string(root.join(c).join("Cargo.toml")).unwrap();
+            assert!(toml.contains("license = \"GPL-2.0-or-later\""), "{c}");
+        }
+        let own = std::fs::read_to_string(root.join("hal-linux/Cargo.toml")).unwrap();
+        assert!(
+            own.contains("license.workspace = true"),
+            "hal-linux stays AGPL"
+        );
+    }
+
     /// The embedded object parses and has the program and every map.
     #[test]
     fn the_object_has_the_program_and_maps() {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Read-only, bounds-checked access to a frame.
 
 /// A frame the parser reads. Every load is checked against the end of the

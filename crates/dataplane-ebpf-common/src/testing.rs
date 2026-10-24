@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! Frames and a reference model for the tests (feature `testing`): the
 //! host proptests here and the kernel differential test of `hal-linux`
 //! (`tests/xdp_root.rs`) build the same frames and expect the same

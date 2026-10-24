@@ -55,6 +55,10 @@ Layout da imagem:
    (402–409 kpps) **não** ganha do nftables raw (471 kpps), porque o veth já entrega um `skb`. A
    razão de ser do XDP (não alocar o `skb`) só aparece no modo native de uma placa real: a medida
    que confirma ou derruba esta decisão é o roteiro do `docs/xdp.md`, no hardware do usuário.
+   **Licença do XDP (G2.5b, decisão do usuário):** `dataplane-ebpf`, `dataplane-ebpf-common` e
+   `cgnat-map` são GPL-2.0-or-later (o programa declara `"GPL"`), para o kernel liberar os helpers
+   `gpl_only` como o `bpf_fib_lookup` do fast path do CGNAT; o resto do projeto continua
+   AGPL-3.0-or-later, com que GPL-2.0-or-later combina (`docs/xdp.md` § Licença).
 3. **DPDK/VPP:** não entra no caminho crítico. Se um cliente precisar de >100 Gbit/s de CGNAT
    por caixa, vira um terceiro backend do mesmo trait (VPP pela API binária).
 

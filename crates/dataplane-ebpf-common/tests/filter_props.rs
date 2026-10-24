@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! G2.5a: properties of the XDP filter's parse and decision, the same code
 //! the kernel runs. Frames are built from parameters (Ethernet, VLAN tags,
 //! IPv4/IPv6, TCP/UDP/ICMP), then cut, corrupted or replaced by noise.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
 //! The maps of the XDP filter: names (the loader finds them by name in the
 //! object), sizes and value layouts. Keys and values are plain integers or
 //! byte arrays, which both aya sides already treat as plain data.

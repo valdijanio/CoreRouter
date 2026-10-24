@@ -58,6 +58,24 @@ Comportamento que o operador precisa saber:
 - O comando avisa (`warnings`) de lista sem entradas e de taxa abaixo de 100 pps.
 - No laboratório virtual o filtro é simulado (contadores crescem com o que está ligado).
 
+## Licença
+
+Decisão do usuário (2026-10-23, opção "c"): os crates do XDP — `crates/dataplane-ebpf`,
+`crates/dataplane-ebpf-common` e `crates/cgnat-map` — são **GPL-2.0-or-later**; o programa declara
+`"GPL"` ao kernel. Todo o resto do CoreRouter continua **AGPL-3.0-or-later**.
+
+- **Por quê:** o kernel só deixa um programa com licença compatível com GPL chamar os helpers
+  `gpl_only`, e o fast path do CGNAT (G2.5b) encaminha no próprio XDP com `bpf_fib_lookup`, que é
+  um deles. Com a string AGPL o kernel trata o programa como não-GPL e recusa a chamada; a
+  alternativa seria traduzir e devolver ao kernel (`XDP_PASS`), com ganho bem menor.
+- **Por que "or-later":** GPL-2.0-or-later combina com a AGPL-3.0 do daemon (a GPLv3 é compatível
+  com a AGPLv3 pela seção 13 de ambas); GPL-2.0-only não combinaria. O copyleft continua.
+- **Onde está:** `license` nos três `Cargo.toml` (valor explícito, não o do workspace), o
+  cabeçalho `SPDX-License-Identifier: GPL-2.0-or-later` em cada arquivo desses crates e a seção
+  `license` do objeto (`*b"GPL\0"`). O teste `the_xdp_crates_and_object_are_gpl` do `hal-linux`
+  confere o objeto embutido, os três manifestos e que o `hal-linux` segue com a licença do
+  workspace.
+
 ## Toolchain do programa
 
 O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-none` e o
@@ -75,8 +93,7 @@ O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-
   `bpf-linker` 0.12 do release oficial (`bpf-linker-x86_64-unknown-linux-musl.tar.zst` em
   github.com/aya-rs/bpf-linker/releases, com o sha256 da API do release conferido) ou
   `cargo binstall bpf-linker`. O `cargo install` do fonte pede o LLVM 23 do sistema.
-- Licença do programa no kernel: `AGPL-3.0-or-later`. O kernel o trata como não-GPL: ele não
-  pode chamar helpers `gpl_only` (o filtro não usa nenhum; veja a G2.5b).
+- Licença do programa no kernel: `GPL` (o crate é GPL-2.0-or-later; veja § Licença).
 
 ## Testes
 
@@ -302,8 +319,6 @@ fica num lugar só. Plano:
 - Fica no kernel (XDP_PASS para o caminho nftables da G2.3): fragmentos, ICMP de erro com
   payload (precisa traduzir o cabeçalho interno), ALG (FTP, SIP), o que a tabela de fluxos não
   conhece ainda e o que vai para o próprio roteador.
-- Encaminhar no XDP (`XDP_TX`/`XDP_REDIRECT`) pede `bpf_fib_lookup`, que é `gpl_only`: com a
-  licença AGPL do programa, o kernel recusa. Opções: passar ao kernel depois da tradução
-  (XDP_PASS, ganho menor) ou declarar o programa com licença compatível com GPL — **decisão de
-  licença do usuário**.
+- Encaminhar no XDP (`XDP_TX`/`XDP_REDIRECT`) com `bpf_fib_lookup` (`gpl_only`): liberado pela
+  licença GPL dos crates do XDP (§ Licença, decisão do usuário em 2026-10-23).
 - "Quem era?" da G2.3: a mesma fórmula responde, sem log a mais.
