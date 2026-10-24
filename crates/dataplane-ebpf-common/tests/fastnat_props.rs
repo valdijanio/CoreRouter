@@ -130,6 +130,15 @@ proptest! {
         s.vlans = vec![10];
         let tagged = build(&s);
         prop_assert_eq!(admit(&tagged[..], &info(&tagged)), Err(Kernel::Tagged));
+        // IP options: the kernel's.
+        let mut opt = frame(IPPROTO_UDP, c.sub, c.srv, c.sp, c.dp, 0, 64);
+        opt[14] = 0x46;
+        let total = u16::from_be_bytes([opt[16], opt[17]]) + 4;
+        opt[16..18].copy_from_slice(&total.to_be_bytes());
+        for _ in 0..4 {
+            opt.insert(34, 1);
+        }
+        prop_assert_eq!(admit(&opt[..], &info(&opt)), Err(Kernel::Options));
         for ttl in [0u8, 1] {
             let f = frame(IPPROTO_UDP, c.sub, c.srv, c.sp, c.dp, 0, ttl);
             prop_assert_eq!(admit(&f[..], &info(&f)), Err(Kernel::Ttl));

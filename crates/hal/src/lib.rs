@@ -25,6 +25,7 @@ pub mod sim;
 pub mod tuning;
 pub mod virt;
 pub mod xdp;
+pub mod xdp_nat;
 
 use corerouter_model::firewall::DynamicAddress;
 use corerouter_model::{Config, IfName};

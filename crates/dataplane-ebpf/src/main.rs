@@ -207,8 +207,7 @@ fn fast_nat(ctx: &XdpContext, frame: &mut Frame, info: &IpInfo, now: u64) -> Opt
     fastnat::admit(frame, info).ok()?;
     let [src, dst, ..] = v;
     let (src, dst) = (fastnat::decode(src), fastnat::decode(dst));
-    let (ip_off, _) = info.v4_offsets();
-    let tot_len = frame.be16(ip_off + 2)?;
+    let tot_len = frame.be16(fastnat::L4_OFF - 20 + 2)?;
     let mut fib = FibParams {
         family: 2, // AF_INET
         l4_protocol: info.proto,

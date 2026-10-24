@@ -19,6 +19,9 @@ use crate::parse::{
     Addr, ETH_HLEN, Fragment, IPPROTO_TCP, IPPROTO_UDP, IpInfo, TCP_FIN, TCP_RST, TCP_SYN,
 };
 
+/// Where the transport header starts in a frame the fast path takes.
+pub const L4_OFF: usize = ETH_HLEN + 20;
+
 /// Key of `NAT_FLOWS`: a direction's 5-tuple as it arrives,
 /// `[proto, 0, 0, 0, src (4), dst (4), sport (2), dport (2)]`, network
 /// order.
@@ -73,6 +76,9 @@ pub fn value(src: Endpoint, dst: Endpoint) -> FlowValue {
 pub enum Kernel {
     /// A VLAN tag: the egress may need another one.
     Tagged,
+    /// IP options: rare, and they would make every offset variable (the
+    /// eBPF verifier wants constant ones here).
+    Options,
     /// SYN, FIN or RST: conntrack follows the connection's life.
     Control,
     /// TTL 1 or 0: the kernel answers with time exceeded.
@@ -83,15 +89,18 @@ pub enum Kernel {
 
 /// Whether the fast path may take this packet of a known flow (before the
 /// FIB lookup).
+#[inline(always)]
 pub fn admit<P: crate::packet::Packet + ?Sized>(p: &P, info: &IpInfo) -> Result<(), Kernel> {
     if info.ip_off != ETH_HLEN {
         return Err(Kernel::Tagged);
     }
+    if info.l4_off != L4_OFF {
+        return Err(Kernel::Options);
+    }
     if info.proto == IPPROTO_TCP && info.tcp_flags & (TCP_SYN | TCP_FIN | TCP_RST) != 0 {
         return Err(Kernel::Control);
     }
-    let (ip_off, _) = info.v4_offsets();
-    match p.u8_at(ip_off + 8) {
+    match p.u8_at(ETH_HLEN + 8) {
         Some(ttl) if ttl > 1 => Ok(()),
         Some(_) => Err(Kernel::Ttl),
         None => Err(Kernel::Short),
@@ -101,14 +110,22 @@ pub fn admit<P: crate::packet::Packet + ?Sized>(p: &P, info: &IpInfo) -> Result<
 /// Rewrite the packet for flow value `v`: new endpoints, checksums, TTL
 /// minus one (its checksum too). Call after [`admit`] and a successful
 /// FIB lookup; the MACs are the caller's (they come from the lookup).
+#[inline(always)]
 pub fn translate<P: PacketMut + ?Sized>(
     p: &mut P,
     info: &IpInfo,
     v: &FlowValue,
 ) -> Result<(), Kernel> {
     let [src, dst, ..] = *v;
-    nat::rewrite(p, info, Some(decode(src)), Some(decode(dst))).map_err(|_| Kernel::Short)?;
-    let (ip_off, _) = info.v4_offsets();
+    // Constant offsets (an untagged frame without IP options, as `admit`
+    // checked): the verifier sees every access's bound.
+    let info = IpInfo {
+        ip_off: ETH_HLEN,
+        l4_off: L4_OFF,
+        ..*info
+    };
+    nat::rewrite(p, &info, Some(decode(src)), Some(decode(dst))).map_err(|_| Kernel::Short)?;
+    let ip_off = ETH_HLEN;
     let ttl_off = ip_off + 8;
     let word = p.be16(ttl_off).ok_or(Kernel::Short)?;
     let new = word.checked_sub(0x0100).ok_or(Kernel::Ttl)?;
