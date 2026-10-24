@@ -576,7 +576,8 @@ fn test(s: &mut Session, p: &Value) -> Result<Value> {
     req.nas_port_id = opt_text(p, "nas_port_id", 253)?;
     req.calling_station_id = opt_text(p, "calling_station_id", 253)?;
     let cfg = &s.store().running().radius;
-    if !cfg.servers.iter().any(|e| e.serves(service)) {
+    let ids: Vec<ItemId> = cfg.servers.iter().filter(|e| e.serves(service)).map(|e| e.id).collect();
+    if ids.is_empty() {
         return Err(EngineError::bad(
             "service",
             format!("no enabled /radius entry has service={} (radius.add first)", service.as_str()),
@@ -590,6 +591,16 @@ fn test(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let shown: String = user.chars().take(32).collect();
     let id = s.start_task("radius-test", format!("radius test {shown}"), move |ctx| {
+        // A server just added reaches the service with its next look at
+        // the config (a fraction of a second): wait for it, briefly.
+        let loading = ctx.now();
+        while !backend.status().servers.iter().any(|m| {
+            ids.contains(&m.id) && !matches!(m.state, ServerState::Idle | ServerState::Disabled)
+        }) && ctx.now().saturating_sub(loading) < Duration::from_secs(3)
+            && !ctx.stopped()
+        {
+            ctx.sleep(Duration::from_millis(50));
+        }
         let slot: Arc<Mutex<Option<AuthReply>>> = Arc::new(Mutex::new(None));
         let put = slot.clone();
         backend.authenticate(
@@ -771,7 +782,13 @@ mod tests {
         }
         fn register_owner(&self, _: Arc<dyn SessionOwner>) {}
         fn status(&self) -> RadiusStatus {
-            RadiusStatus::default()
+            let mut m: ServerMonitor = serde_json::from_value(json!({
+                "id": "*1", "address": null, "state": "up", "pending": 0, "requests": 0,
+                "accepts": 0, "rejects": 0, "acct_responses": 0, "resends": 0, "timeouts": 0,
+                "bad_replies": 0, "unsolicited": 0, "last_request_rtt": 0, "sockets": 0}))
+            .unwrap();
+            m.state = ServerState::Up;
+            RadiusStatus { servers: vec![m], ..RadiusStatus::default() }
         }
     }
 

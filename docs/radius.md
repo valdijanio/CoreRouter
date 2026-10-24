@@ -118,6 +118,86 @@ O custo é o MD5/HMAC-MD5 (três ou quatro por pedido). Uma tempestade de 10 000
 religando custa ~27 ms de CPU no cliente (**estimado** a partir da linha de cima). Melhoria
 possível: guardar o estado do HMAC (ipad/opad) por segredo — G4.3bc.
 
+## RADIUS como serviço do sistema (G4.3j)
+
+O `proto-radius` não abre socket; quem o põe na rede é o serviço `radius` do daemon
+(`apps/corerouter-daemon/src/service/radius.rs` e o driver `radius_aaa.rs`). PPP (G4.3d), IPoE
+(G4.3f), hotspot e o login do roteador pedem por ele; ninguém fala RADIUS por conta própria.
+
+### Comandos (nomes do RouterOS v7)
+
+| Comando | O quê |
+|---|---|
+| `radius.add/set/remove/enable/disable/move/list` | `/radius`: `address`, `service` (ppp, login, hotspot, wireless, dhcp, ipsec, dot1x), `secret` (só escrita: a lista mostra `***`), `authentication_port` 1812, `accounting_port` 1813, `timeout` 1100 ms, `src_address`, `vrf`, `require_message_auth` (`yes-for-request-resp`), `protocol` (udp; radsec no G4.3ba), `realm`, `called_id`, `domain`, `accounting_backup`, `status_server`, `disabled`, `comment`. A ordem é a do failover (`radius.move`) |
+| `radius.incoming.set/get` | `/radius incoming`: `accept` (no), `port` (**3799**, RFC 5176 §2.3; o RouterOS usa 1700), `vrf`, `replay_window` (300 s), `require_event_timestamp`, `require_message_auth`; o `get` traz os contadores |
+| `radius.monitor` | `/radius monitor` por servidor: estado (`up`, `down`, `probing`, `disabled`, `idle`), pending, requests, accepts, rejects, acct_responses, resends, timeouts, bad_replies, unsolicited, last_request_rtt, sockets |
+| `radius.test` | tarefa: um Access-Request de teste (PAP) pelo serviço, e a resposta com os atributos decodificados pelo nome (o RouterOS não tem) |
+| `ppp.aaa.set/get` | `/ppp aaa`: `use_radius`, `accounting`, `interim_update` (0 ou 60..86400 s, RFC 2869 §5.16), `interim_jitter` (20 %), `use_circuit_id_in_nas_port_id`, `enable_ipv6_accounting` |
+
+Recusado: segredo vazio, `src_address` que não é endereço do roteador ou é de outra família, o
+mesmo servidor (endereço, porta, VRF) duas vezes para o mesmo serviço, RadSec.
+
+### O serviço
+
+- **Uma pista por serviço** (ppp, login…): um `Client` com as entradas daquele serviço na ordem
+  do failover — autenticação na ordem da lista; contabilização com as `accounting_backup` depois
+  das outras. Cada socket UDP sai do `src_address` (e do VRF, com `SO_BINDTODEVICE`); o cliente
+  pede outro socket quando os 256 identificadores de um acabam (até 16 por servidor) e uma thread
+  leitora por socket entrega os datagramas ao driver.
+- **Estado por servidor:** `up`; `down` depois de 3 trocas falhas seguidas (pulado por 30 s);
+  `probing` quando `status_server=yes` (RFC 5997). Servidor fora do ar e de volta vão para o log.
+- **Config nova sem perder pedido:** uma mudança constrói pistas novas; as velhas terminam o que
+  têm pendente (um Stop de contabilização não se perde por um `radius.set`) e os contadores delas
+  somam nos totais do monitor.
+- **API sem async** (`corerouter_engine::radius::AaaBackend`, os tipos em
+  `corerouter_model::radius`): `authenticate(pedido, callback)` → Accept/Reject/Challenge/
+  Timeout/Error com os atributos decodificados, o pacote e o autenticador do pedido (para as chaves
+  MPPE); `account(pedido, fonte de contadores)` → Start/Interim-Update/Stop. Um Start com fonte
+  agenda os interims da sessão (intervalo do Acct-Interim-Interval ou do `ppp.aaa interim_update`,
+  com dispersão fixa por sessão dentro de `interim_jitter` % do intervalo, nunca depois do
+  intervalo); um interim novo substitui o pendente da mesma sessão. O callback roda na thread do
+  serviço, que nunca trava a sessão: os logs vão por uma fila que o serviço descarrega.
+- **CoA e Disconnect** (`/radius incoming`): as origens aceitas são as entradas ativas do
+  `/radius`, cada uma com o seu segredo; origem desconhecida é descartada sem resposta (RFC 5176
+  §5), Event-Timestamp fora da janela também; a retransmissão recebe a mesma resposta do cache,
+  sem aplicar de novo. O pedido conferido vai aos donos de sessão registrados
+  (`AaaBackend::register_owner`, o ponto em que o G4.3d se pluga) e, sem dono que o aceite, volta
+  NAK com Error-Cause 503 (Session Context Not Found).
+- **Log em português**, tópico `radius` (`servidor … fora do ar; usando o próximo da lista`,
+  `… recusado por …`, `CoA de … aceito`).
+
+Limites conhecidos: o `realm` e o `called_id` usados são os da primeira entrada do serviço (os
+atributos são os mesmos para todos os servidores do failover); uma entrada com
+`require_message_auth=no` baixa a exigência da pista inteira (senão as respostas dela seriam todas
+descartadas).
+
+### Testes
+
+- Comandos (`crates/engine/src/cmd/radius.rs`, `ppp_aaa.rs`): sucesso, validação, rollback,
+  ordem do failover, `radius.test` como tarefa.
+- Serviço contra o servidor de teste em UDP de verdade (`service/radius_aaa_tests.rs`, sem root):
+  atributos da resposta; retransmissão (primeira perdida) e timeout (três envios: 100 + 200 +
+  400 ms); failover com o primário caído (marcado `probing`, o próximo pedido vai direto ao
+  segundo); 10 000 autenticações de uma vez sem colisão de identificador; contabilização (Start,
+  Stop, Gigawords) e `accounting=no`; dispersão de 10 000 interims; CoA aceito, retransmitido
+  (cache), com Event-Timestamp velho (descartado), de origem desconhecida (descartado) e sem dono
+  (NAK 503); recarga com pedido pendente.
+- Ponta a ponta no daemon (`apps/corerouter-daemon/tests/radius.rs`): `radius.add` e
+  `radius.test` pelo canal de controle contra o servidor de teste em 127.0.0.1, o monitor, o log
+  e um Disconnect respondido com NAK 503.
+
+### Desempenho (**medido**, 2026-10-24, AMD Ryzen AI MAX+ 395, build release, `cargo bench -p corerouter-daemon --bench radius_aaa`)
+
+| Benchmark | Mediana | Por segundo |
+|---|---|---|
+| uma autenticação de cada vez, ida e volta pelo serviço (fila, PAP + Message-Authenticator, UDP em 127.0.0.1, resposta conferida e decodificada, callback) | 13,9 µs | 72 k |
+| 1000 autenticações ao mesmo tempo | 5,15 ms por lote | 194 k |
+
+O servidor de teste roda numa thread só, então o número é do caminho inteiro, não só do cliente.
+O buffer de recepção dos sockets pesa: com o padrão do kernel (~200 KiB) a rajada de 1000
+respostas transbordava e o lote levava 6,6 s (retransmissões de 5 s); com 4 MiB pedidos no socket
+(limitado por `net.core.rmem_max`), 5,15 ms.
+
 ## Pesquisa
 
 ### Fontes

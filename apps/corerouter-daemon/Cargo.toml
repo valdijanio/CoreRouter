@@ -27,6 +27,8 @@ corerouter-proto-iperf.workspace = true
 socket2 = { version = "0.6.5", features = ["all"] }
 corerouter-proto-syslog.workspace = true
 corerouter-proto-flow.workspace = true
+# service/radius.rs (G4.3j): the AAA service drives the RADIUS client.
+corerouter-proto-radius.workspace = true
 log.workspace = true
 env_logger.workspace = true
 signal-hook.workspace = true
@@ -51,11 +53,17 @@ nix = { version = "0.30.1", default-features = false, features = ["socket", "uio
 serde_json.workspace = true
 # service/https.rs: a local TLS server with a self-signed certificate.
 rcgen.workspace = true
+# benches/radius_aaa.rs (G4.3j).
+criterion.workspace = true
 # netns_dns.rs: a test DNS server (service/dns.rs uses it as a normal
 # dependency too).
 # netns_dhcp.rs: a DHCP server thread inside another network namespace.
 corerouter-proto-dhcp.workspace = true
 nix = { version = "0.30.1", default-features = false, features = ["sched", "net"] }
+
+[[bench]]
+name = "radius_aaa"
+harness = false
 
 [lints]
 workspace = true
