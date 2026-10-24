@@ -245,3 +245,14 @@ SID.
   obsoletos ou fora do caminho de um BNG de ISP; as opções são lidas e recusadas como manda a RFC.
 - **MPPE no plano de dados:** só as chaves (RFC 3079) existem, para o RADIUS; cifrar no XDP não
   faz sentido em PPPoE de ISP.
+
+## 7. Desempenho
+
+Números do `cargo bench -p corerouter-proto-pppoe --bench pppoe` (**medido**, Ryzen AI Max+ 395,
+release; a tabela completa vai para `docs/perf.md` pela fila): ler um PADI 25 ns, um
+Configure-Request do LCP 26 ns; responder um PADI com PADO (com o HMAC do cookie) 176 ns, um Echo
+numa sessão aberta 31 ns; uma sessão inteira, de PADI a IPCP Opened, 6,3 µs contando servidor,
+cliente e a rede simulada (≈ 159 mil sessões por segundo num núcleo). A sessão ocupa ≈ 750 B no
+servidor (**estimado** a partir dos 624 B **medidos** da `Session`). O plano de controle não é o
+gargalo: uma reconexão em massa de 100 mil assinantes custa menos de 1 s de CPU; o que limita é
+a rede de acesso e o RADIUS.
