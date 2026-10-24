@@ -12,6 +12,13 @@
 //! | `COUNTERS` | per-CPU hash | [`counter_key`] | [`Counter`] |
 //! | `TOP` | LRU per-CPU hash | dropped source (mapped) | [`Top`] |
 //! | `NAT_FLOWS` | LRU hash | [`crate::fastnat::FlowKey`] | [`crate::fastnat::FlowValue`] |
+//! | `PPPOE_KEYS` | hash | [`crate::pppoe::SessionKey::to_bytes`] | session index `u32` |
+//! | `PPPOE_SESSIONS` | array | session index | [`crate::pppoe::SessionWords`] |
+//! | `PPPOE_V4` | hash | subscriber IPv4 | session index |
+//! | `PPPOE_V6` | LPM trie | subscriber /64 or delegated prefix | session index |
+//! | `PPPOE_POLICER` | array | index × 2 + direction | [`crate::policer::State`] |
+//! | `PPPOE_COUNTERS` | array | session index | [`crate::pppoe::Counters`] |
+//! | `PPPOE_STATS` | per-CPU array | [`crate::pppoe::Stat`] | packets `u64` |
 
 use crate::filter::Reason;
 
@@ -25,6 +32,15 @@ pub const COUNTERS: &str = "COUNTERS";
 pub const TOP: &str = "TOP";
 pub const NAT_FLOWS: &str = "NAT_FLOWS";
 pub const NAT_MISS: &str = "NAT_MISS";
+pub const PPPOE_KEYS: &str = "PPPOE_KEYS";
+pub const PPPOE_SESSIONS: &str = "PPPOE_SESSIONS";
+pub const PPPOE_V4: &str = "PPPOE_V4";
+pub const PPPOE_V6: &str = "PPPOE_V6";
+pub const PPPOE_POLICER: &str = "PPPOE_POLICER";
+pub const PPPOE_COUNTERS: &str = "PPPOE_COUNTERS";
+pub const PPPOE_STATS: &str = "PPPOE_STATS";
+/// The PPPoE maps sized by the session count (1 entry while PPPoE is off).
+pub const PPPOE_SIZED: [&str; 4] = [PPPOE_KEYS, PPPOE_SESSIONS, PPPOE_V4, PPPOE_COUNTERS];
 /// The XDP program's name in the object.
 pub const PROGRAM: &str = "corerouter_xdp";
 
