@@ -37,6 +37,8 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-iperf", 2),
     ("corerouter-proto-syslog", 2),
     ("corerouter-proto-flow", 2),
+    // G4.3a: PPPoE/PPP codecs and the sans-IO BNG machines (pure, wasm-safe).
+    ("corerouter-proto-pppoe", 2),
     ("corerouter-engine", 3),
     ("corerouter-control", 4),
     ("corerouter-mcp", 4),

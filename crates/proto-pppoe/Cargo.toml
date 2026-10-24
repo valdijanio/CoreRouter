@@ -1,0 +1,33 @@
+[package]
+name = "corerouter-proto-pppoe"
+description = "L2: PPPoE (RFC 2516) and PPP (LCP, PAP, CHAP, MS-CHAP, IPCP, IPv6CP) codecs and sans-IO BNG/client state machines, pure (no I/O)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+# Pure-Rust digests and DES (RustCrypto, digest 0.10 line already in the lock):
+# CHAP-MD5 (RFC 1994), MS-CHAP NT hash (MD4) and DES (RFC 2433/2759),
+# MS-CHAPv2 authenticator and MPPE keys (SHA-1, RFC 3079), AC-Cookie
+# (HMAC-SHA-256) and the challenge/magic generator (SHA-256).
+md-5 = { version = "0.10.6", default-features = false }
+md4 = { version = "0.10.2", default-features = false }
+sha1 = { version = "0.10.6", default-features = false }
+sha2 = { version = "0.10.9", default-features = false }
+hmac = { version = "0.12.1", default-features = false }
+des = { version = "0.8.1", default-features = false }
+
+[dev-dependencies]
+criterion.workspace = true
+proptest.workspace = true
+
+[[bench]]
+name = "pppoe"
+harness = false
+
+[lints]
+workspace = true
