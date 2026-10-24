@@ -6,6 +6,7 @@ pub mod discovery;
 pub mod eth;
 pub mod fsm;
 pub mod guard;
+pub mod layers;
 pub mod lcp;
 pub mod ncp;
 pub mod ppp;
