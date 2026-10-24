@@ -839,3 +839,32 @@ fluxos) por `AF_PACKET` em `cpa`; a captura do Torch (`HostCapture`) lê e decod
 (12,3 M quadros/s). Conclusão: ~0,5 µs por quadro é o socket (`recvmsg`), não a agregação; o
 `sampling: auto` (500 kpps → ~30 % de um núcleo; acima, ~250 kpps lidos) mantém o custo
 limitado, e o próximo salto é XDP (G6.10).
+
+### Exportador ClickHouse (G4.4f), 2026-10-23
+
+**Medido** num AMD Ryzen AI MAX+ 395 (32 threads, 62 GB), Linux 7.0, rustc 1.99.1, ClickHouse
+26.9.25.15 na mesma máquina (loopback), build release, 3 rodadas (iguais a ±2 %):
+`cargo test --release -p corerouter-daemon --bin corerouter-daemon bench_analytics -- --ignored --nocapture`.
+
+| Etapa | Resultado |
+|---|---|
+| Logs: codificar (JSONEachRow) + fila + gzip nível 1, 500 000 linhas | ~510 000 linhas/s num núcleo, 1,9 µs de CPU por linha; 340 B/linha crua, 13 B/linha com gzip (texto sintético repetitivo: log real comprime menos) |
+| Métricas: texto Prometheus → linhas + gzip, 500 000 linhas | ~1,1 milhão de linhas/s; 9,4 B/linha com gzip |
+| Envio ao ClickHouse, 50 lotes de 10 000 linhas (6,3 MiB) | ~665 000 linhas/s; CPU do roteador no envio desprezível (< 0,01 s); 500 000 linhas gravadas |
+
+**Destino fora do ar por 10 minutos** (**medido**, daemon em debug com o lab virtual,
+`queue_size` 1 MiB, `disk_queue` 64 MiB, `metrics_interval` 10 s, `flush_interval` 2 s; ClickHouse
+parado e religado):
+
+- só métricas (12,7 linhas/s): fila chegou a 7 621 linhas em 74 KB; RSS do daemon estável em
+  35 MB; 0 descartadas; voltou 36 s depois de o servidor subir (a espera do reenvio, até 60 s) e
+  esvaziou num tique;
+- métricas + 19 eventos de log/s (31 linhas/s): fila chegou a 18 999 linhas em 347 KB (≈ 18 B
+  por linha comprimida, nada foi para o disco); RSS entre 40 e 47 MB (o crescimento vem das 12 000
+  revisões de configuração da carga, não da fila); 0 descartadas; esvaziou 56 s depois de o
+  servidor subir; o ClickHouse ficou com exatamente as 31 960 linhas que o roteador contou como
+  enviadas, sem duplicata (10 878 logs, 10 878 `seq` distintos);
+- reenvio: espera de 1 s dobrando até 60 s com 75–100 % de sorteio (34 tentativas em 10 min).
+
+Com a fila de 16 MiB padrão e ~18 B por linha, cabem ~900 000 linhas (**estimado**): 8 horas de
+fora do ar a 31 linhas/s antes do primeiro descarte, mais o disco se ligado.

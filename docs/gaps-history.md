@@ -111,3 +111,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G6.4 redefinido (bandwidth-test pelo protocolo do iperf3, traceroute como modo do MTR) e em andamento: Torch e Packet Sniffer
 - 2026-10-23 — G6.4 feito: traceroute de uma passada, sondas UDP/TCP e Paris (G6.4c)
 - 2026-10-23 — G6.9 feito (IP Calculator)
+- 2026-10-23 — G1.28 feito (IP › Addresses, referência do padrão de lista)
+- 2026-10-23 — G2.5b: crates do XDP passam a GPL-2.0-or-later (decisão de licença do usuário)
+- 2026-10-23 — G2.5b: reescrita NAT com checksum incremental (RFC 1624) no dataplane-ebpf-common
+- 2026-10-23 — G4.4f criado e feito (exportador para ClickHouse externo); G4.4g e G4.4h criados
