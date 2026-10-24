@@ -401,7 +401,10 @@ mod tests {
             }
         };
         assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
-        assert!(start.elapsed() < Duration::from_millis(900));
+        // The feeder keeps each read alive for 2 s; ending well before that
+        // proves the deadline is on the total. The bound is loose because a
+        // loaded CI runner delays the wake-ups (flaked at 900 ms, 2026-10-24).
+        assert!(start.elapsed() < Duration::from_millis(1600));
         feeder.join().unwrap();
     }
 
