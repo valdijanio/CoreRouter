@@ -7,7 +7,12 @@
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-proto-pppoe --bench pppoe`.
 
 // A benchmark is test code: fixtures may unwrap (clippy.toml only covers #[test]).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::hint::black_box;
 
@@ -24,7 +29,14 @@ const HOST: Mac = Mac([0x02, 0x11, 0, 0, 0, 1]);
 
 fn padi() -> Vec<u8> {
     let mut b = Vec::new();
-    let mut w = DiscoveryWriter::begin(&mut b, Mac::BROADCAST, HOST, Vlans::single(100), Code::Padi, 0);
+    let mut w = DiscoveryWriter::begin(
+        &mut b,
+        Mac::BROADCAST,
+        HOST,
+        Vlans::single(100),
+        Code::Padi,
+        0,
+    );
     w.tag(tag::SERVICE_NAME, b"");
     w.tag(tag::HOST_UNIQ, &[1, 2, 3, 4, 5, 6, 7, 8]);
     w.tag_bbf(Some(b"olt-1 pon 0/1/3:12"), Some(b"cust-0042"));
@@ -39,7 +51,14 @@ fn lcp_request() -> Vec<u8> {
         vlans: Vlans::single(100),
     };
     let mut b = Vec::new();
-    let mut w = SessionWriter::control(&mut b, &link, 7, proto::LCP, lcp::code::CONFIGURE_REQUEST, 1);
+    let mut w = SessionWriter::control(
+        &mut b,
+        &link,
+        7,
+        proto::LCP,
+        lcp::code::CONFIGURE_REQUEST,
+        1,
+    );
     for o in [
         lcp::LcpOpt::Mru(1492),
         lcp::LcpOpt::Magic(0x1234_5678),
@@ -55,7 +74,9 @@ fn codecs(c: &mut Criterion) {
     let mut g = c.benchmark_group("pppoe");
     g.throughput(Throughput::Elements(1));
     let f = padi();
-    g.bench_function("decode_padi", |b| b.iter(|| discovery::parse(black_box(&f)).unwrap()));
+    g.bench_function("decode_padi", |b| {
+        b.iter(|| discovery::parse(black_box(&f)).unwrap())
+    });
     let f = lcp_request();
     g.bench_function("decode_lcp_request", |b| {
         b.iter(|| {
@@ -108,7 +129,14 @@ fn server(c: &mut Criterion) {
         vlans: Vlans::NONE,
     };
     let mut echo = Vec::new();
-    let mut w = SessionWriter::control(&mut echo, &link, sid, proto::LCP, lcp::code::ECHO_REQUEST, 9);
+    let mut w = SessionWriter::control(
+        &mut echo,
+        &link,
+        sid,
+        proto::LCP,
+        lcp::code::ECHO_REQUEST,
+        9,
+    );
     w.buf().extend_from_slice(&0x0bad_cafe_u32.to_be_bytes());
     w.finish(1492).unwrap();
     let srv = &mut l.servers[0];
