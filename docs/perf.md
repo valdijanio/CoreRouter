@@ -906,3 +906,44 @@ Primeira rodada local do `xdp-root` (**medido**, AMD Ryzen AI Max+ 395, 32 threa
 42 ns (134 no runner do CI), bloqueado com 1 milhão de prefixos 126–134 ns (271 no runner),
 carga de 1 milhão de prefixos 698–702 ms. Envio em veth, em kpps: sem filtro 2027, nftables
 raw 2116–2171, XDP generic 1855–1889, XDP native 1785–1811 (duas rodadas).
+
+### G4.3a — `proto-pppoe` (**medido**, 2026-10-24)
+
+AMD Ryzen AI Max+ 395 (32 threads, SHA-NI), Linux 7.0, rustc 1.99.1, `cargo bench -p
+corerouter-proto-pppoe --bench pppoe` (release, `lto = "thin"`), máquina compartilhada (carga
+≈ 2–3).
+
+| Benchmark | Mediana | Por segundo, um núcleo |
+|---|---|---|
+| `decode_padi` (Ethernet + VLAN + todas as tags, com TR-101) | 24,6 ns | 40,6 M |
+| `decode_lcp_request` (sessão + controle + 3 opções tipadas) | 26,2 ns | 38,2 M |
+| `server_padi_to_pado` (tags, AC-Cookie HMAC-SHA-256, PADO) | 175,5 ns | 5,7 M |
+| `server_lcp_echo` (Echo-Request → Echo-Reply numa sessão aberta) | 31,4 ns | 31,8 M |
+| `session_setup_1000_chap` (PADI → IPCP Opened, servidor + cliente + rede do laboratório) | 6,27 µs por sessão | 159 mil sessões/s |
+
+Memória: 50 000 sessões em Opened somam ≈ 1549 B por sessão de RSS no laboratório (servidor,
+cliente e rede juntos, **medido**); a `Session` do servidor tem 624 B (`size_of`, **medido**), e com
+a caixa no slab, as duas entradas de índice e o nome do usuário fica em ≈ 750 B por sessão no
+servidor (**estimado**): 100 mil assinantes ≈ 75 MiB no plano de controle.
+
+A simulação de 100 mil sessões (`hundred_thousand_sessions_reach_opened_on_a_lossy_network`)
+leva ≈ 39 s em debug no `cargo test` (**medido**), 12,3 milhões de quadros simulados.
+
+- 2026-10-24 — G4.3c, PPPoE no XDP, **medido** na máquina do usuário (AMD Ryzen AI Max+ 395,
+  kernel 7.0.0-38, objeto release): `BPF_PROG_TEST_RUN` uma execução por chamada, média de
+  20 000; piso (passa) 87 ns, descida encapsulando 123 ns, subida decapsulando 139 ns com 1
+  sessão; 86–90, 124–127 e 137–139 ns com 100 000 sessões (plano). Incluir 100 000 sessões:
+  527 ms (5,3 µs cada); remover: 414 ms. Encaminhamento em veth (generic, UDP 64 B): kernel IPv4
+  sem PPPoE 1410 kpps, XDP decap + FIB 913 kpps, XDP decap + kernel 816 kpps. Policer, pior erro
+  em 3 s: 1 × 1 Gbit/s −0,00%, 100 × 20 Mbit/s −0,02%, 10 000 × 0,2 Mbit/s −1,53%.
+
+### G4.3j — autenticações por segundo pelo serviço RADIUS (**medido**, 2026-10-24, AMD Ryzen AI MAX+ 395, build release)
+
+`cargo bench -p corerouter-daemon --bench radius_aaa`: o caminho inteiro de um login (fila do serviço, Access-Request com PAP e Message-Authenticator, UDP em 127.0.0.1 até o servidor de teste numa thread, resposta conferida e decodificada, callback).
+
+| Benchmark | Mediana | Por segundo |
+|---|---|---|
+| `radius_aaa/authenticate_1_concurrent` | 13,9 µs | 72 k |
+| `radius_aaa/authenticate_1000_concurrent` | 5,15 ms por lote | 194 k |
+
+Com o buffer de recepção padrão (~200 KiB) a rajada de 1000 respostas transbordava e o lote levava 6,6 s; com 4 MiB no socket (limitado por `net.core.rmem_max`), 5,15 ms.

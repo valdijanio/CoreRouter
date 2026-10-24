@@ -3451,3 +3451,80 @@ continuação indentadas).
   runner leva cerca de 15 min (**medido**, 2026-10-24). A saída local traz o `Verifier output`
   inteiro, que o log do CI corta. A primeira rodada local mostrou que o verificador aceita o
   programa da G2.5b e isolou a única falha restante (`perf_fast_nat`).
+
+- 2026-10-24 — G4.3a: BNG, parte PPPoE/PPP: crate novo `crates/proto-pppoe` (L2, Rust puro, sans-IO, sem `unsafe`,
+  compila para wasm), desenho, pesquisa e a tabela das RFCs em `docs/pppoe.md`. A linha PPPoE/IPoE
+  de `docs/architecture.md` §1.4 passa de "orquestrar accel-ppp" para Rust puro.
+
+  - **Codecs** zero cópia e à prova de entrada hostil: Ethernet com QinQ; Discovery com todas as
+    tags (RFC 2516, PPP-Max-Payload da RFC 4638, Agent-Circuit-Id/Remote-Id da RFC 4679, PADM/PADN);
+    sessão e campo Protocol; LCP com todas as opções (multilink só leitura); PAP, CHAP-MD5,
+    MS-CHAPv1/v2 (o cálculo e as chaves MPPE vêm do `proto-radius`, aresta lateral nova em
+    `xtask/src/layers.rs`); IPCP com DNS/NBNS e IPv6CP.
+  - **Autômato** da RFC 1661 §4 célula a célula, com Max-Configure/Terminate/Failure e restart de 3 s
+    (§4.6); a lógica de opções por camada (LCP com as recusas da RFC 2516 §7, IPCP, IPv6CP).
+  - **Servidor BNG sans-IO** (`Server`): AC-Cookie HMAC-SHA-256 com segredo rotativo, `padi_limit`
+    global e por MAC, `pado_delay`, política de Service-Name, `max_sessions`,
+    `one_session_per_host`, faixa de VLAN, SIDs num slab com fila FIFO, roda de timers, autenticação e
+    endereço pedidos ao chamador por evento (`Authenticate`/`NeedAddress` → `auth_reply`/
+    `address_reply`), keepalive, PADT para sessão desconhecida (limitado). `SessionDescriptor` com
+    os nomes do mapa da G4.3c e o `RateLimit` do `proto-radius`.
+  - **Cliente** (`Client`, o gerador de carga) e **laboratório** (`lab`): N clientes × servidores
+    com relógio falso, perda, duplicação, reordenação, latência de RADIUS e pool.
+  - **Testes**: 105 de unidade (regra por regra, citando a seção; amostras das RFC 2759 §9.2,
+    RFC 2433 B, RFC 3079 §3.5.3), 9 simulações (100 mil sessões em Opened numa rede com perda; 5 %
+    de perda/duplicação e 10 % de reordenação; MS-CHAPv2 + IPv6CP em 5000; flood de 200 mil PADIs;
+    100 mil PADRs forjados; replay de cookie; 10 % de senha errada em 10 mil; apagão de 60 s com 20
+    mil; reboot de 5000 CPEs), 8 propriedades de fuzz (bytes aleatórios, quadros reais mutados,
+    conversa viva com edições em voo) e os alvos libFuzzer em `crates/proto-pppoe/fuzz`.
+  - **A simulação achou e corrigiu dez defeitos** que os testes por regra não pegavam (lista em
+    `docs/pppoe.md` §5): Ack duplicado renegociando, reautenticação depois de renegociar, Success e
+    Ack perdidos, Challenge duplicado e reordenado, PADR duplicado atrasado, PADT perdido, timer de
+    echo sobrando depois do LCP cair.
+
+  Como testar: `cargo test -p corerouter-proto-pppoe` (≈ 40 s; a de 100 mil sessões leva ≈ 39 s em
+  debug, **medido**); `SIM_N=20000 cargo test -p corerouter-proto-pppoe --test sim hundred` para uma
+  rodada menor; `PPPOE_FUZZ_CASES=20000 cargo test -p corerouter-proto-pppoe --test fuzz`;
+  `cargo bench -p corerouter-proto-pppoe --bench pppoe`.
+
+- 2026-10-24 — G4.3c: BNG, parte plano de dados: o tráfego dos assinantes PPPoE passa pelo programa XDP da G2.5, sem
+  `/dev/ppp` e sem uma interface por sessão (`docs/pppoe-dataplane.md`).
+
+  - **Mapas de sessão** (`dataplane-ebpf-common::pppoe`): `Session` e `SessionKey` `#[repr(C)]`
+    com codificação explícita para o daemon (G4.3d) preencher; chave de subida (porta, VLAN externa
+    e interna, SID, MAC do cliente), descida por IPv4 exato e por /64 ou prefixo delegado (LPM).
+  - **Subida** na porta de acesso: RFC 2516 (VER/TYPE, CODE, LENGTH), campo de protocolo pela
+    RFC 1661 (controle e descoberta intactos para o userspace), sessão e MAC conferidos (SID forjado
+    descartado), anti-spoofing de origem (IPv4 do IPCP, /64, prefixo delegado; link-local IPv6 para
+    o userspace), policer de upload, decapsulação (`bpf_xdp_adjust_head`), depois o filtro da G2.5a,
+    o fast path do CGNAT da G2.5b e a FIB (`F_FAST_UP`) ou o kernel.
+  - **Descida**: pacote para um assinante (`F_FAST_DOWN`, ou fluxo do CGNAT já aceito pelo
+    conntrack) ganha TTL − 1, cabeçalhos Ethernet, VLAN e PPPoE e sai pela porta de acesso; hairpin
+    entre assinantes; TTL ≤ 1, maior que o MTU da sessão (RFC 1191/8201/4638), sessão lenta ou uplink
+    com VLAN vão para o kernel.
+  - **Policer** (`dataplane-ebpf-common::policer`) com a semântica do `rate-limit` do RouterOS:
+    taxa, `burst-rate`, `burst-threshold` e `burst-time` (média em 16 fatias).
+  - **Contadores** por sessão (bytes e pacotes por sentido, descartes por motivo; adição atômica
+    BPF) e globais por motivo (`PPPOE_STATS`).
+  - **Carregador** (`hal-linux/src/xdp_pppoe.rs`): `XdpState::set_pppoe`, `pppoe_upsert`,
+    `pppoe_remove`, `pppoe_counters`, `pppoe_stats`; as sessões voltam sozinhas depois de um
+    reload; mapas com 1 entrada enquanto o PPPoE está desligado.
+  - O programa virou estágios em funções BPF separadas (a pilha de 512 bytes estourava inline).
+  - Testes: `dataplane-ebpf-common/tests/pppoe_props.rs` (proptest: ruído, ida e volta, cortes,
+    padding, spoofing, protocolo, caminho lento, limites do policer) e, com root, o diferencial
+    kernel × host de 6000 quadros byte a byte, tráfego real nos dois sentidos, 100 mil sessões,
+    precisão do policer (1, 100 e 10 mil assinantes, ±5%) e kpps (`xdp_root.rs`, `pppoe_*`).
+  - 11 blocos `unsafe` novos, listados em `docs/xdp.md` para revisão humana.
+
+  Como testar: `cargo test -p corerouter-dataplane-ebpf-common`; com root,
+  `COREROUTER_REQUIRE_XDP=1 COREROUTER_XDP_TESTS=pppoe_kernel_and_host_agree,pppoe_traffic_both_ways,pppoe_scale_100k_sessions,pppoe_policer_accuracy,perf_pppoe_forward cargo xtask xdp-root`.
+
+- 2026-10-24 — G4.3j: RADIUS como serviço do sistema, parte 1 (configuração e comandos): `radius.add/set/remove/enable/disable/move/list` com os nomes do RouterOS v7 (`address`, `service`, `secret`, `authentication-port` 1812, `accounting-port` 1813, `timeout` 1100 ms, `src-address`, `vrf`, `require-message-auth=yes-for-request-resp`, `protocol`, `realm`, `called-id`, `domain`, `accounting-backup`) e `status_server` (sonda RFC 5997, além do RouterOS); `radius.incoming.set/get` com a porta 3799 da RFC 5176 por padrão (o RouterOS usa 1700) e `accept=no`; `radius.monitor`; `radius.test` (tarefa: Access-Request de teste e a resposta decodificada); `ppp.aaa.set/get` (`use-radius`, `accounting`, `interim-update`, `interim_jitter`, `use-circuit-id-in-nas-port-id`, `enable-ipv6-accounting`). Recusa segredo vazio, `src_address` que não é do roteador ou de outra família, o mesmo servidor duas vezes para o mesmo serviço, RadSec (G4.3ba) e `interim_update` abaixo de 60 s (RFC 2869 §5.16). O segredo só se escreve: `radius.list` mostra `***` e o journal o mascara. Tópico de log `radius` novo. Teste: `cargo test -p corerouter-engine radius ppp_aaa`; `corerouter-cli run radius.add '{"address":"10.0.0.1","service":"ppp","secret":"x"}'` e `run radius.list`.
+
+- 2026-10-24 — G4.3j: RADIUS como serviço do sistema, parte 2 (serviço AAA no daemon): o serviço `radius` (`apps/corerouter-daemon/src/service/radius.rs` e o driver `radius_aaa.rs`) põe o `proto-radius` na rede. Uma pista por serviço (ppp, login…) com as entradas na ordem do failover; sockets UDP do `src_address`/VRF, mais um quando os 256 identificadores acabam (até 16 por servidor), buffer de recepção de 4 MiB; estado por servidor (`up`, `down`, `probing` com Status-Server); config nova sem perder pedido pendente. API sem async para o PPP (G4.3d), IPoE (G4.3f) e login: `authenticate(pedido, callback)` e `account(pedido, fonte de contadores)` com interims agendados e dispersos por sessão. CoA/Disconnect com as entradas do `/radius` como lista de origens, janela de replay, cache de retransmissão, donos de sessão registráveis (`register_owner`) e NAK 503 sem dono. Log em português no tópico `radius`. `radius.test` espera o serviço carregar um servidor recém-criado. Testes: 9 de serviço contra o servidor de teste em UDP (failover, retransmissão, timeout, 10 000 autenticações, contabilização, dispersão de 10 000 interims, CoA aceito/retransmitido/velho/desconhecido/sem dono, recarga) e 2 de ponta a ponta no daemon. Teste: `cargo test -p corerouter-daemon radius`. Detalhes em `docs/radius.md`.
+
+- 2026-10-24 — G4.3j: RADIUS como serviço do sistema, parte 3 (janela): grupo RADIUS no menu com a janela de três abas. Servers no padrão de lista G0.24 com o modal alimentado por `radius.preview` (nova consulta: posição no failover, retransmissão, avisos), segredo digitado oculto (`Input::Secret` novo no modal) e nunca mostrado na prévia dos comandos (`list::steps_text` passa pelo `redact`), e o botão **Test…** (Access-Request de teste com a resposta decodificada). Incoming com a porta 3799 e a nota do 1700 do MikroTik; Monitor ao vivo. ⓘ em português em todo rótulo. Conferido na GUI de verdade contra o daemon e um servidor RADIUS independente em Python (assinaturas e Message-Authenticator calculados por outro código): screenshots das três abas e do Test. Teste: `cargo test -p corerouter-ui radius`.
+
+- 2026-10-24 — fix-main-pppoe-policer: `main` vermelha (issue #202). Dois testes corrigidos:
+  - `pppoe_policer_accuracy` (G4.3c) media o limite do remetente, não o policer. No runner de 4 vCPUs, o AF_PACKET oferece ~1,5 Gbit/s, abaixo dos 100 × 20 Mbit/s configurados (−26%). Agora cada caso mede antes o que o remetente oferece e limita a taxa a um terço do que cada assinante recebe. A referência passou a ser por assinante: quem o policer cortou tem de receber a taxa com ±5% (tolerância mantida); quem ele não cortou tem de receber exatamente o que ofereceu. Ninguém pode passar do limite, e ao menos 90% dos assinantes têm de ser cortados (para o caso testar o policer).
+  - `netns_capture` `frames_both_ways_with_their_wire_length`, que é instável: até o linkwatch ver a portadora, o veth recém-ligado fica com a `noop_qdisc`, que descarta os quadros enviados. O teste agora espera o `state UP` dos dois lados, via netlink (`ip -o link`). Passou 5 vezes seguidas.

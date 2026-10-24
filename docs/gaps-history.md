@@ -117,3 +117,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-23 — G4.4f criado e feito (exportador para ClickHouse externo); G4.4g e G4.4h criados
 - 2026-10-24 — G2.5b feito (caminho rápido do CGNAT em XDP, offload guiado pelo conntrack, escolha do usuário)
 - 2026-10-24 — G4.3b criado e feito (RADIUS em Rust puro para o BNG, escolha do usuário em 2026-10-24)
+- 2026-10-24 — G4.3a criado e feito (PPPoE/PPP em Rust puro para o BNG, escolha do usuário em 2026-10-24); G4.3d–G4.3i criados
+- 2026-10-24 — G4.3c criado e feito (plano de dados PPPoE em XDP, Rust puro, escolha do usuário em 2026-10-24)
+- 2026-10-24 — G4.3j criado (RADIUS como serviço do sistema: `/radius`, `/radius incoming`, `/radius monitor`, `/ppp aaa`, serviço AAA no daemon e janela RADIUS)
+- 2026-10-24 — G4.3j feito (RADIUS como serviço do sistema)
