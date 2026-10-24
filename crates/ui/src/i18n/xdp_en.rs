@@ -51,6 +51,17 @@ Packets dropped because their source is in a block list (and in no allow list). 
 Packets dropped per second on this interface, all reasons together (block, rate, malformed, TCP flags). From the counters' difference between two readings at least a second apart."##,
     ),
     (
+        "xdp.fast_nat",
+        r##"## What it does
+The CGNAT fast path: the connections the kernel's CGNAT (nftables) already translated are translated and forwarded here, in the driver, without conntrack, the rules or the kernel's routing.
+## How
+The kernel still decides everything: the first packets of every connection go through nftables, which picks the port in the subscriber's deterministic range. When conntrack says the connection is established (both directions seen), the `xdp-nat` service copies its two directions into the XDP map; from then on XDP swaps address and port, fixes the checksums (RFC 1624), takes one off the TTL and sends the packet out of the interface the routing table names (`bpf_fib_lookup`). The service renews the conntrack timeout of the connections XDP carried and takes out of the map those conntrack ended.
+## Stays in the kernel
+IPv6, ICMP, fragments, VLAN-tagged frames, packets with IP options, SYN/FIN/RST (conntrack follows the opening and the closing), TTL 1, and what the routing table cannot resolve right away (a neighbor without a MAC yet, MTU). "Sent to the kernel" counts each reason.
+## Needs
+XDP on the subscribers' interfaces and on the ones toward the internet. Up to 262 144 connections at once; past that, new ones go through the kernel. "Who was?" stays exact: the kernel chose the port."##,
+    ),
+    (
         "xdp.malformed",
         r##"## What it drops
 Frames with impossible headers: cut inside the Ethernet, VLAN, IP or transport header; an IP version that does not match the EtherType; an IHL under 20 bytes; a total length shorter than the header or longer than the frame; an impossible UDP length; a TCP data offset under 20 bytes.

@@ -58,11 +58,12 @@ const TABS: [(Tab, &str); 3] = [
     (Tab::Top, "Top Sources"),
 ];
 
-const COLUMNS: [table::Column; 11] = [
+const COLUMNS: [table::Column; 12] = [
     col("Interface"),
     col("Mode"),
     col("Active"),
     num("Pass pps"),
+    num("Fast NAT pps"),
     num("Drop pps"),
     num("Blocked"),
     num("Rate Limit"),
@@ -82,7 +83,7 @@ const TOP_COLUMNS: [table::Column; 6] = [
 ];
 
 /// The labels above the Interfaces table with their ⓘ: (label, help key).
-const LEGEND: [(&str, &str); 8] = [
+const LEGEND: [(&str, &str); 9] = [
     ("Mode", "xdp.mode"),
     ("Active", "xdp.active"),
     ("Pass pps", "xdp.pass"),
@@ -91,11 +92,12 @@ const LEGEND: [(&str, &str); 8] = [
     ("Rate Limit", "xdp.rate-limit"),
     ("Malformed", "xdp.malformed"),
     ("TCP Flags", "xdp.tcp-flags"),
+    ("Fast NAT pps", "xdp.fast_nat"),
 ];
 
 /// Every explanation the window opens (the tests check both languages).
 #[cfg(test)]
-pub(crate) const HELP_KEYS: [&str; 15] = [
+pub(crate) const HELP_KEYS: [&str; 16] = [
     "xdp",
     "xdp.mode",
     "xdp.active",
@@ -111,6 +113,7 @@ pub(crate) const HELP_KEYS: [&str; 15] = [
     "xdp.rate_burst",
     "xdp.top",
     "xdp.unavailable",
+    "xdp.fast_nat",
 ];
 
 /// The Filter form's text fields: (param, label, hint, help key).
@@ -122,9 +125,10 @@ const FILTER_TEXT: [(&str, &str, &str, &str); 4] = [
 ];
 
 /// The Filter form's yes/no fields: (param, label, help key).
-const FILTER_FLAGS: [(&str, &str, &str); 2] = [
+const FILTER_FLAGS: [(&str, &str, &str); 3] = [
     ("drop_malformed", "Drop Malformed", "xdp.malformed"),
     ("drop_invalid_tcp_flags", "Drop Invalid TCP Flags", "xdp.tcp-flags"),
+    ("fast_nat", "CGNAT Fast Path", "xdp.fast_nat"),
 ];
 
 #[derive(Default)]
@@ -147,7 +151,7 @@ pub(crate) struct XdpPanel {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct FilterForm {
     pub(crate) text: [String; 4],
-    pub(crate) flags: [bool; 2],
+    pub(crate) flags: [bool; 3],
 }
 
 pub(crate) struct IfaceDialog {
@@ -210,6 +214,7 @@ pub(crate) fn row(r: &Value) -> Row {
             text(r, "mode"),
             chip::cell("", &[(label, kind)]),
             count(num_of(r, &["pass_pps"])),
+            count(num_of(r, &["fast_nat_pps"])),
             count(num_of(r, &["drop_pps"])),
             c("blocked"),
             c("rate-limit"),
@@ -399,6 +404,45 @@ impl XdpPanel {
                 num_of(&self.filter, &["allow_prefixes"]),
             ));
         });
+        // The CGNAT fast path: what the service reports, and why packets
+        // of carried connections still went to the kernel.
+        if self.filter.get("fast_nat").and_then(Value::as_bool) == Some(true) {
+            let st = self.filter.get("fast_nat_status").cloned().unwrap_or(Value::Null);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new(tr(l, "CGNAT Fast Path")).strong());
+                self.info(ui, l, "CGNAT Fast Path", "xdp.fast_nat");
+                ui.weak(format!(
+                    "{}: {} · {}: {} · {}: {}",
+                    tr(l, "connections"),
+                    num_of(&st, &["carried"]),
+                    tr(l, "flow directions"),
+                    num_of(&self.filter, &["fast_nat_flows"]),
+                    tr(l, "timeouts renewed"),
+                    num_of(&st, &["renewed"]),
+                ));
+                for k in ["idle", "last_error"] {
+                    let t = text(&st, k);
+                    if !t.is_empty() {
+                        let tone = Kind::Amber.tone(ui.visuals());
+                        chip::chip(ui, &t, tone);
+                    }
+                }
+            });
+            if let Some(m) = self.filter.get("fast_nat_misses").and_then(Value::as_array) {
+                ui.horizontal_wrapped(|ui| {
+                    ui.weak(tr(l, "Sent to the kernel:"));
+                    for row in m {
+                        if let (Some(why), Some(n)) = (
+                            row.get(0).and_then(Value::as_str),
+                            row.get(1).and_then(Value::as_u64),
+                        ) {
+                            let tone = Kind::Neutral.tone(ui.visuals());
+                            chip::chip(ui, &format!("{why} {}", count(n)), tone);
+                        }
+                    }
+                });
+            }
+        }
         ui.separator();
         let dirty = form != loaded;
         ui.horizontal(|ui| {

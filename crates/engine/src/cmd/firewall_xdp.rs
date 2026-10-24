@@ -59,7 +59,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         set
     ),
     cmd!(query "ip.firewall.xdp.print", "XDP Filter", ["IP", "Firewall", "XDP"], None,
-        "{} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, block_prefixes, allow_prefixes, available, unavailable, lists: [{name, entries}], fast_nat, fast_nat_flows, fast_nat_status: {carried, installed, removed, renewed, lost, resyncs, last_error, idle} | null}",
+        "{} → {block_lists, allow_lists, rate_limit, rate_burst, drop_malformed, drop_invalid_tcp_flags, block_prefixes, allow_prefixes, available, unavailable, lists: [{name, entries}], fast_nat, fast_nat_flows, fast_nat_misses: [[reason, packets]], fast_nat_status: {carried, installed, removed, renewed, lost, resyncs, last_error, idle} | null}",
         always, print),
     cmd!(query "ip.firewall.xdp.top", "XDP Top Sources", [], None,
         "{count?: u32 (1..=1000, default 20)} → [{address, packets, bytes, reason, list, last_secs}]",
@@ -379,6 +379,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
         "lists": lists,
         "fast_nat": cfg.ip.xdp.fast_nat,
         "fast_nat_flows": st.fast_nat_flows,
+        "fast_nat_misses": st.fast_nat_misses,
         "fast_nat_status": nat,
     }))
 }
@@ -588,6 +589,33 @@ mod tests {
         let top = s.execute("ip.firewall.xdp.top", &json!({})).unwrap();
         assert!(top.as_array().is_some_and(|t| t.len() <= 1));
         s.execute("ip.firewall.xdp.reset-counters", &json!({})).unwrap();
+    }
+
+    #[test]
+    fn fast_nat_is_a_setting_with_its_warnings() {
+        let mut s = lab();
+        s.execute("ip.firewall.xdp.interface.add", &json!({"interface": "ether1"}))
+            .unwrap();
+        let out = s
+            .execute("ip.firewall.xdp.set", &json!({"fast_nat": true}))
+            .unwrap();
+        assert_eq!(out["fast_nat"], true);
+        let w = out["warnings"].to_string();
+        assert!(w.contains("no CGNAT pool"), "{w}");
+        assert!(w.contains("both sides"), "{w}");
+        s.execute("ip.firewall.xdp.interface.add", &json!({"interface": "ether2"}))
+            .unwrap();
+        let out = s.execute("ip.firewall.xdp.set", &json!({})).unwrap();
+        assert!(!out["warnings"].to_string().contains("both sides"));
+        let p = s.execute("ip.firewall.xdp.print", &json!({})).unwrap();
+        assert_eq!(p["fast_nat"], true);
+        assert_eq!(p["fast_nat_flows"], 0);
+        let rows = s.execute("ip.firewall.xdp.interface.list", &json!({})).unwrap();
+        assert!(rows[0]["counters"]["fast-nat"]["packets"].is_u64());
+        assert!(rows[0]["fast_nat_pps"].is_u64());
+        s.execute("ip.firewall.xdp.set", &json!({"fast_nat": false}))
+            .unwrap();
+        assert!(!s.store().candidate().ip.xdp.fast_nat);
     }
 
     #[test]

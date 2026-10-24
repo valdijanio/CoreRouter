@@ -751,21 +751,20 @@ fn conntrack_puts_flows_in_the_fast_path() {
     let mut link = x.nat_link().unwrap();
     assert!(link.generation().is_some());
     let mut book = Book::new(MAX_CARRIED);
-    let sync =
-        |link: &mut Box<dyn corerouter_hal::xdp_nat::NatLink>, book: &mut Book, ms: u64| {
-            let until = Instant::now() + Duration::from_millis(ms);
-            while Instant::now() < until {
-                let mut ev = Vec::new();
-                link.events(50, 1024, &mut ev).unwrap();
-                for e in &ev {
-                    match book.event(e) {
-                        Some(Action::Install(f)) => link.install(&f).unwrap(),
-                        Some(Action::Remove(f)) => link.remove(&f).unwrap(),
-                        None => {}
-                    }
+    let sync = |link: &mut Box<dyn corerouter_hal::xdp_nat::NatLink>, book: &mut Book, ms: u64| {
+        let until = Instant::now() + Duration::from_millis(ms);
+        while Instant::now() < until {
+            let mut ev = Vec::new();
+            link.events(50, 1024, &mut ev).unwrap();
+            for e in &ev {
+                match book.event(e) {
+                    Some(Action::Install(f)) => link.install(&f).unwrap(),
+                    Some(Action::Remove(f)) => link.remove(&f).unwrap(),
+                    None => {}
                 }
             }
-        };
+        }
+    };
     let rounds = 40usize;
     let server = Triangle::spawn_in(INET_NS, move || {
         let s = std::net::UdpSocket::bind("198.51.100.2:9").unwrap();
