@@ -111,6 +111,9 @@ O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-
 - `crates/engine/src/cmd/firewall_xdp.rs` e `crates/engine/tests/xdp.rs`: sucesso, validação,
   rollback, lockout com `force`; `command_sweep` cobre parâmetros lixo.
 - `crates/ui/src/tests/xdp.rs`: janela, formulário, top, explicações em PT e EN.
+- Workflow `xdp-root` (Actions → xdp-root → Run workflow, campo `tests`): só os testes com
+  root, ~5 min em vez dos ~15 do CI completo; rode primeiro o teste que está corrigindo, depois
+  todos (`COREROUTER_XDP_TESTS=a,b` filtra; cada teste tem prazo curto próprio).
 - `cargo xtask xdp-root`: só onde `COREROUTER_REQUIRE_XDP=1` (o runner do CI, que liga a variável
   pelo arquivo `ci/kernel-modules/veth`); roda o binário de teste com `sudo` num namespace
   descartável. Localmente vira `skip` e imprime o comando.
@@ -344,6 +347,10 @@ flowtable da G2.4a, só que em XDP.
 - **Comando:** `ip.firewall.xdp.set fast_nat=yes` (avisa sem pool de CGNAT e com menos de duas
   interfaces com XDP); `ip.firewall.xdp.print` traz `fast_nat_flows`, `fast_nat_misses` e o
   estado do serviço; `ip.firewall.xdp.interface.list` traz `fast_nat_pps`.
+- **Medido** (CI, veth, generic): 331 ns por pacote traduzido e redirecionado no
+  `BPF_PROG_TEST_RUN` (159 ns sem fluxo); encaminhamento UDP 64 bytes: NAT do kernel 186 kpps,
+  caminho rápido 207 kpps (+11%; em veth o remetente domina; o ganho real precisa de placa em
+  modo native, G2.5e).
 - **Por que só IPv4 sem opções:** o verificador do kernel recusa aritmética de ponteiro de
   pacote com offset sem limite conhecido. Um `IpInfo` copiado pela pilha perde o limite que o
   verificador conhecia. Sem VLAN e sem opções, os offsets são constantes (IP em 14, transporte

@@ -781,6 +781,18 @@ fn conntrack_puts_flows_in_the_fast_path() {
             let mut ev = Vec::new();
             link.events(50, 1024, &mut ev).unwrap();
             for e in &ev {
+                println!(
+                    "event {:?} proto {} {}:{} -> {}:{} status {:#x} tcp {:?} offloadable {}",
+                    e.kind,
+                    e.conn.protocol,
+                    e.conn.orig.src,
+                    e.conn.orig.src_port,
+                    e.conn.orig.dst,
+                    e.conn.orig.dst_port,
+                    e.conn.status,
+                    e.conn.tcp_state,
+                    corerouter_hal::xdp_nat::offloadable(&e.conn)
+                );
                 match book.event(e) {
                     Some(Action::Install(f)) => link.install(&f).unwrap(),
                     Some(Action::Remove(f)) => link.remove(&f).unwrap(),
