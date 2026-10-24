@@ -16,6 +16,9 @@
 //!   NATed, translated and forwarded in XDP.
 //! - [`nat`]: the CGNAT fast path's rewrite, with checksums updated
 //!   incrementally (RFC 1624).
+//! - [`pppoe`]: the PPPoE subscriber data plane (G4.3c): session map,
+//!   upstream check and decapsulation, downstream encapsulation.
+//! - [`policer`]: the per-subscriber policer, RouterOS burst semantics.
 //! - [`maps`]: map names, sizes and value layouts (plain integers and
 //!   arrays, so the loader needs no `unsafe impl Pod`).
 //!
@@ -34,5 +37,7 @@ pub mod maps;
 pub mod nat;
 pub mod packet;
 pub mod parse;
+pub mod policer;
+pub mod pppoe;
 #[cfg(feature = "testing")]
 pub mod testing;

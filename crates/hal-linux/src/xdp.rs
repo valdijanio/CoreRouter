@@ -33,6 +33,10 @@ use corerouter_model::xdp::XdpMode;
 use corerouter_model::{Config, IfName};
 use ipnet::IpNet;
 
+#[path = "xdp_pppoe.rs"]
+mod pppoe;
+pub use pppoe::PppoeCounters;
+
 /// The XDP object, built by `cargo xtask ebpf` (crates/dataplane-ebpf).
 static OBJECT: &[u8] =
     aya::include_bytes_aligned!("../../dataplane-ebpf/prebuilt/corerouter-xdp.o");
@@ -80,6 +84,8 @@ struct Loaded {
     links: BTreeMap<IfName, Attached>,
     /// `NAT_FLOWS` was sized for the fast path (G2.5b); a change reloads.
     fast_nat: bool,
+    /// The PPPoE maps were sized for sessions (G4.3c); a change reloads.
+    pppoe: bool,
 }
 
 /// The XDP part of [`crate::LinuxHal`] (public for the root tests and
@@ -95,6 +101,9 @@ pub struct XdpState {
     error: Option<String>,
     /// The CGNAT fast path's flow map, shared with the daemon's link.
     nat: SharedNat,
+    /// PPPoE subscribers (G4.3c, `xdp_pppoe.rs`): on, and the sessions
+    /// the maps hold (written again after a reload).
+    pppoe: pppoe::PppoeState,
 }
 
 impl std::fmt::Debug for XdpState {
@@ -159,17 +168,19 @@ impl XdpState {
         // The flow map is preallocated: sized only while the fast path is
         // on, so turning it on or off reloads the object (links come back
         // in this same call).
+        let pppoe = self.pppoe.on;
         if self
             .loaded
             .as_ref()
-            .is_some_and(|l| l.fast_nat != plan.fast_nat)
+            .is_some_and(|l| l.fast_nat != plan.fast_nat || l.pppoe != pppoe)
         {
             self.loaded = None;
             self.set_nat(None);
         }
         if self.loaded.is_none() {
-            match load(plan.fast_nat) {
+            match load(plan.fast_nat, pppoe) {
                 Ok(mut l) => {
+                    pppoe::refill(&mut l.ebpf, &self.pppoe)?;
                     let map = if l.fast_nat {
                         take_nat(&mut l.ebpf)?
                     } else {
@@ -190,7 +201,7 @@ impl XdpState {
         let Some(l) = self.loaded.as_mut() else {
             return Ok(());
         };
-        write_settings(&mut l.ebpf, &plan)?;
+        write_settings(&mut l.ebpf, &plan, pppoe)?;
         sync_trie(
             &mut l.ebpf,
             m::BLOCK_V4,
@@ -449,6 +460,19 @@ impl XdpState {
         repeat: u32,
         ingress: Option<u32>,
     ) -> Result<(u32, std::time::Duration), HalError> {
+        self.test_run_out(frame, repeat, ingress)
+            .map(|(action, took, _)| (action, took))
+    }
+
+    /// [`XdpState::test_run_on`], with the frame as the program left it
+    /// (decapsulated, encapsulated, rewritten) — the PPPoE differential
+    /// test compares it byte for byte (G4.3c).
+    pub fn test_run_out(
+        &mut self,
+        frame: &[u8],
+        repeat: u32,
+        ingress: Option<u32>,
+    ) -> Result<(u32, std::time::Duration, Vec<u8>), HalError> {
         use aya::programs::{TestRun, TestRunOptions};
         // `struct xdp_md`: data, data_end, data_meta, ingress_ifindex,
         // rx_queue_index, egress_ifindex.
@@ -479,14 +503,23 @@ impl XdpState {
                 ..TestRunOptions::default()
             })
             .map_err(|e| rejected("test run", &e))?;
-        Ok((r.return_value, r.duration))
+        out.truncate(r.data_size_out as usize);
+        Ok((r.return_value, r.duration, out))
     }
 }
 
-fn load(fast_nat: bool) -> Result<Loaded, HalError> {
+fn load(fast_nat: bool, pppoe: bool) -> Result<Loaded, HalError> {
     let flows = if fast_nat { m::NAT_FLOWS_MAX } else { 1 };
-    let mut ebpf = aya::EbpfLoader::new()
-        .map_max_entries(m::NAT_FLOWS, flows)
+    let mut loader = aya::EbpfLoader::new();
+    loader.map_max_entries(m::NAT_FLOWS, flows);
+    if !pppoe {
+        for name in m::PPPOE_SIZED {
+            loader.map_max_entries(name, 1);
+        }
+        loader.map_max_entries(m::PPPOE_V6, 1);
+        loader.map_max_entries(m::PPPOE_POLICER, 2);
+    }
+    let mut ebpf = loader
         .load(OBJECT)
         .map_err(|e| rejected("loading the object", &e))?;
     let prog: &mut XdpProgram = ebpf
@@ -500,10 +533,11 @@ fn load(fast_nat: bool) -> Result<Loaded, HalError> {
         ebpf,
         links: BTreeMap::new(),
         fast_nat,
+        pppoe,
     })
 }
 
-fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan) -> Result<(), HalError> {
+fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan, pppoe: bool) -> Result<(), HalError> {
     let s = Settings {
         drop_malformed: plan.drop_malformed,
         drop_bad_tcp_flags: plan.drop_invalid_tcp_flags,
@@ -521,7 +555,12 @@ fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan) -> Result<(), HalError> {
         arr.set(i as u32, w, 0)
             .map_err(|e| rejected("writing the settings", &e))?;
     }
-    Ok(())
+    arr.set(
+        corerouter_dataplane_ebpf_common::pppoe::SETTINGS_SLOT,
+        u64::from(pppoe),
+        0,
+    )
+    .map_err(|e| rejected("writing the settings", &e))
 }
 
 /// Make tries `v4`/`v6` go from `from` to `to`: removals, then inserts

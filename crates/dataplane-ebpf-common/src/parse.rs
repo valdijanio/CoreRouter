@@ -309,7 +309,7 @@ fn ipv6<P: Packet + ?Sized>(p: &P, off: usize) -> Parsed {
 }
 
 /// Source and destination out of the last 32 bytes of the IPv6 header.
-fn split16(rest: [u8; 32]) -> ([u8; 16], [u8; 16]) {
+pub(crate) fn split16(rest: [u8; 32]) -> ([u8; 16], [u8; 16]) {
     let [
         s0,
         s1,
