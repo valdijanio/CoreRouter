@@ -1518,14 +1518,22 @@ fn pppoe_policer_accuracy() {
         .join()
         .unwrap()
     };
-    // The sender reaches ~6 Gbit/s of 1028-byte IP packets here (**medido**
-    // on the user's machine): every subscriber is offered at least three
-    // times its rate.
-    for (n, rate_bps) in [
+    // What the sender offers depends on the machine (~6 Gbit/s of
+    // 1028-byte IP packets on the user's, ~1.5 on the 4-vCPU CI runner,
+    // **medido**): each case first measures it and caps the rate at a third
+    // of what each subscriber is offered, so the policer, not the sender,
+    // is what limits. The reference is then per subscriber: one the policer
+    // cut must get its rate (after the first bucket) within ±5%; one it
+    // never cut must get exactly what it offered, never more than the limit.
+    let ip_bytes = 20 + 8 + 1000u64;
+    for (n, top_bps) in [
         (1u32, 1_000_000_000u64),
         (100, 20_000_000),
         (10_000, 200_000),
     ] {
+        let (cal_sent, cal_took) = blast(frames_for(n), 1.0);
+        let offered_each = cal_sent as f64 / cal_took * (ip_bytes * 8) as f64 / f64::from(n);
+        let rate_bps = top_bps.min((offered_each / 3.0) as u64 / 1000 * 1000);
         for i in 0..n {
             let s = Session {
                 up: Rate::mikrotik(rate_bps, 0, 0, 0),
@@ -1533,29 +1541,44 @@ fn pppoe_policer_accuracy() {
             };
             x.pppoe_upsert(i, &s).unwrap();
         }
-        let before: Vec<u64> = (0..n)
-            .map(|i| x.pppoe_counters(i).unwrap().up_bytes)
-            .collect();
+        let before: Vec<_> = (0..n).map(|i| x.pppoe_counters(i).unwrap()).collect();
         let frames = frames_for(n);
         let (sent, took) = blast(frames, 3.0);
         let want = rate_bps as f64 / 8.0 * took;
         let depth = Rate::mikrotik(rate_bps, 0, 0, 0).depth as f64;
-        let mut worst = 0f64;
-        let mut total = 0u64;
+        let (mut worst, mut total, mut limited) = (0f64, 0u64, 0u32);
         for i in 0..n {
-            let got = x.pppoe_counters(i).unwrap().up_bytes - before[i as usize];
+            let (b, c) = (before[i as usize], x.pppoe_counters(i).unwrap());
+            let got = c.up_bytes - b.up_bytes;
+            let policed = c.up_policed - b.up_policed;
+            let offered = (c.up_packets - b.up_packets + policed) * ip_bytes;
             total += got;
-            let err = ((got as f64 - depth) - want) / want;
+            assert!(
+                got as f64 <= depth + want + ip_bytes as f64,
+                "subscriber {i}: {got} bytes over the limit {:.0}",
+                depth + want
+            );
+            let err = if policed > 0 {
+                limited += 1;
+                ((got as f64 - depth) - want) / want
+            } else {
+                (got as f64 - offered as f64) / (offered.max(1) as f64)
+            };
             worst = if err.abs() > worst.abs() { err } else { worst };
         }
         println!(
-            "PERF | pppoe policer | {n} subscribers | {:.2} Mbit/s each | sent {:.0} kpps | worst error {:+.2}% | total {:.1} Mbit/s",
+            "PERF | pppoe policer | {n} subscribers | {:.2} Mbit/s each | sent {:.0} kpps | limited {limited} | worst error {:+.2}% | total {:.1} Mbit/s",
             rate_bps as f64 / 1e6,
             sent as f64 / took / 1000.0,
             worst * 100.0,
             total as f64 * 8.0 / took / 1e6
         );
         assert!(worst.abs() <= 0.05, "{n} subscribers: worst {worst:+.3}");
+        // The case must test the policer: nearly everyone over the rate.
+        assert!(
+            limited * 10 >= n * 9,
+            "{n} subscribers: only {limited} limited"
+        );
         for i in 0..n {
             x.pppoe_remove(i).unwrap();
         }

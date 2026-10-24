@@ -80,6 +80,20 @@ fn veth(p: &str) -> (String, String) {
     ip(&["link", "add", &a, "type", "veth", "peer", "name", &b]);
     ip(&["link", "set", &a, "up"]);
     ip(&["link", "set", &b, "up"]);
+    // Until linkwatch sees the carrier, the device keeps the noop qdisc,
+    // which drops every frame sent: wait for both ends to be up.
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_secs(3)
+        && ![&a, &b].iter().all(|d| {
+            // Netlink, not /sys: sysfs may still show the host's namespace.
+            Command::new("ip")
+                .args(["-o", "link", "show", "dev", d.as_str()])
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("state UP"))
+        })
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
     (a, b)
 }
 
