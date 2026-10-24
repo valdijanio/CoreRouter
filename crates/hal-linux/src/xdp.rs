@@ -52,7 +52,15 @@ fn why(e: &dyn std::error::Error) -> String {
              `setcap cap_bpf,cap_net_admin,cap_perfmon+ep corerouter-daemon`)",
         );
     }
-    text.chars().take(2000).collect()
+    // The verifier's reason is at the end of its log: keep the head and
+    // the tail.
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= 3000 {
+        return text;
+    }
+    let head: String = chars.iter().take(500).collect();
+    let tail: String = chars.iter().skip(chars.len() - 2500).collect();
+    format!("{head} … {tail}")
 }
 
 fn rejected(what: &str, e: &dyn std::error::Error) -> HalError {
