@@ -2118,5 +2118,6 @@ fn xdp_session(
         down: r.as_ref().map(|r| rate_dir(r, false)).unwrap_or_default(),
         fast_up: false,
         fast_down: true,
+        ipoe: false,
     }
 }

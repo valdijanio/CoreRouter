@@ -166,6 +166,13 @@ impl Session {
         })
     }
 
+    /// Switch the IPoE subscribers of the XDP data plane on for `ports`
+    /// (G4.3f; they share the PPPoE session maps). `Err` says why not: the
+    /// sessions then exist without the policer.
+    pub fn ipoe_dataplane(&mut self, on: bool, ports: &[IfName]) -> Result<(), String> {
+        self.hal_mut().ipoe_dataplane(on, ports).map_err(|e| e.to_string())
+    }
+
     /// Whether `server` makes sessions of its leases.
     pub(crate) fn ipoe_server(&self, server: &str) -> bool {
         self.store()

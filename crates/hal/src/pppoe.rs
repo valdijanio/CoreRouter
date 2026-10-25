@@ -39,6 +39,9 @@ pub struct PppoeSession {
     /// Upstream may be forwarded in XDP (nothing in `forward` needs it).
     pub fast_up: bool,
     pub fast_down: bool,
+    /// An IPoE subscriber (G4.3f): keyed by port and MAC (`sid` 0, no
+    /// VLAN), policed, nothing encapsulated.
+    pub ipoe: bool,
 }
 
 /// What the data plane counted for a session.

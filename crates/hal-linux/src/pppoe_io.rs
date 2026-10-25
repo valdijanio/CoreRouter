@@ -123,6 +123,15 @@ struct Side {
     vlan: Option<u16>,
 }
 
+/// The index and MAC of access port `name` (the IPoE service's XDP
+/// sessions, G4.3f).
+pub fn port_info(name: &IfName) -> io::Result<(u32, [u8; 6])> {
+    let info = if_info(name)?;
+    let ifindex = u32::try_from(info.link.ifindex())
+        .map_err(|_| io::Error::other(format!("{name}: interface index out of range")))?;
+    Ok((ifindex, info.mac))
+}
+
 /// The PPPoE sockets of one access interface.
 pub struct PppoePort {
     name: IfName,

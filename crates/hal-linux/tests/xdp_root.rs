@@ -1725,3 +1725,145 @@ fn pppoe_bng_ops_reach_the_maps() {
     let (act, _, _) = x.test_run_out(&f, 1, Some(ifindex("la"))).unwrap();
     assert_eq!(act, XDP_DROP, "unknown session after the removal");
 }
+
+// --- G4.3f: IPoE subscribers ----------------------------------------------------
+
+/// G4.3f differential: IPoE sessions (keyed by MAC, SESSION_ID 0) on an
+/// access port of `IPOE_PORTS`: upstream from the subscriber (its own
+/// address, spoofed, DHCP), downstream to it, strangers, corrupted and
+/// noise, through the kernel program and the host model. The action and
+/// every output byte must match; spoofed frames are dropped and the
+/// kernel path keeps the frame untouched.
+#[test]
+fn ipoe_kernel_and_host_agree() {
+    use corerouter_dataplane_ebpf_common::ipoe::{self, F_IPOE};
+    if !enabled() {
+        return;
+    }
+    let _pair = Pair::new();
+    let mut x = XdpState::default();
+    x.sync(&config(XdpMode::Generic, &[], &[])).unwrap();
+    let port = ifindex("xa");
+    x.set_ipoe([port].into_iter().collect()).unwrap();
+    let mut subs = Subs::default();
+    subs.ipoe_ports.insert(port);
+    let n = 300u32;
+    let mut all = Vec::new();
+    for i in 0..n {
+        let s = Session {
+            sid: ipoe::SID,
+            ..test_session(i, port, 0, F_IPOE | F_IPV4)
+        };
+        // From the top, as the IPoE service allocates.
+        let idx = pppoe::SESSIONS_MAX - 1 - i;
+        x.pppoe_upsert(idx, &s).unwrap();
+        subs.insert(idx, &s, 0);
+        all.push(s);
+    }
+    // A PPPoE session id 0 or an IPoE session with a tag is refused.
+    let bad = Session {
+        sid: 0,
+        ..test_session(1, port, 0, F_IPV4)
+    };
+    assert!(x.pppoe_upsert(1, &bad).is_err());
+    let bad = Session {
+        sid: 0,
+        ..test_session(1, port, 1, F_IPOE | F_IPV4)
+    };
+    assert!(x.pppoe_upsert(1, &bad).is_err());
+    let mut runner = TestRunner::deterministic();
+    let mut model = Model::default();
+    let (mut checked, mut spoofed) = (0, 0);
+    for k in 0..4000u32 {
+        let s = &all[(k as usize * 7) % all.len()];
+        let mut sp = spec().new_tree(&mut runner).unwrap().current();
+        sp.vlans.clear();
+        sp.flags = 0x10;
+        let Addr::V4(_) = sp.src else { continue };
+        let up = k % 2 == 0;
+        if up {
+            sp.src = Addr::V4(s.ipv4);
+            match k % 10 {
+                2 => sp.src = Addr::V4([100, 64, 250, (k % 200) as u8]),
+                4 => {
+                    sp.proto = 17;
+                    sp.dport = 67;
+                }
+                _ => {}
+            }
+        } else {
+            sp.dst = Addr::V4(s.ipv4);
+        }
+        let mut f = with_checksums(build(&sp));
+        if up {
+            f[..6].copy_from_slice(&s.server_mac);
+            f[6..12].copy_from_slice(&s.client_mac);
+            if k % 14 == 6 {
+                f[11] ^= 0x40; // a stranger
+            }
+        }
+        match k % 11 {
+            1 => f.truncate(14 + (k as usize * 7) % f.len().max(15)),
+            3 => {
+                let at = 12 + (k as usize * 13) % (f.len() - 12);
+                f[at] ^= 1 << (k % 8);
+            }
+            5 => f.extend(std::iter::repeat_n(0u8, (k % 40) as usize)),
+            _ => {}
+        }
+        if f.len() < 14 {
+            continue;
+        }
+        let (act, _, out) = x.test_run_out(&f, 1, Some(port)).unwrap();
+        let (want, want_out, _, st) =
+            program_model(&f, port, &PPPOE_FILTER, &mut subs, &mut model, 0);
+        assert_eq!(
+            (act, &out),
+            (want, &want_out),
+            "frame {k} ({st:?}) {f:02x?}"
+        );
+        if st == Some(pppoe::Stat::Spoofed) {
+            spoofed += 1;
+        }
+        checked += 1;
+    }
+    assert!(spoofed > 100, "spoofed frames seen: {spoofed}");
+    println!("IPoE: kernel and host agree on {checked} frames ({spoofed} spoofed dropped)");
+    // Time per frame in the kernel (BPF_PROG_TEST_RUN, 300 sessions):
+    // upstream from a subscriber and downstream to one, both to the kernel.
+    let s = &all[17];
+    let mut f = with_checksums(build(&Spec {
+        vlans: Vec::new(),
+        src: Addr::V4(s.ipv4),
+        dst: Addr::V4([198, 51, 100, 7]),
+        proto: 6,
+        sport: 40_000,
+        dport: 443,
+        flags: 0x10,
+        payload: 1000,
+    }));
+    f[..6].copy_from_slice(&s.server_mac);
+    f[6..12].copy_from_slice(&s.client_mac);
+    let (act, up_ns) = x.test_run_on(&f, 100_000, Some(port)).unwrap();
+    assert_eq!(act, 2);
+    let g = with_checksums(build(&Spec {
+        vlans: Vec::new(),
+        src: Addr::V4([198, 51, 100, 7]),
+        dst: Addr::V4(s.ipv4),
+        proto: 6,
+        sport: 443,
+        dport: 40_000,
+        flags: 0x10,
+        payload: 1000,
+    }));
+    let (act, down_ns) = x.test_run_on(&g, 100_000, Some(port)).unwrap();
+    assert_eq!(act, 2);
+    println!(
+        "MEASURED IPoE XDP (generic, test_run, 300 sessions): up {} ns/pkt, down {} ns/pkt",
+        up_ns.as_nanos(),
+        down_ns.as_nanos()
+    );
+    // Off again: the ports go, the sessions stay for the next time.
+    x.set_ipoe(Default::default()).unwrap();
+    assert!(x.ipoe_ports().is_empty());
+}

@@ -653,6 +653,19 @@ mod linux {
             self.xdp.set_pppoe(on)
         }
 
+        fn ipoe_dataplane(&mut self, on: bool, ports: &[IfName]) -> Result<(), HalError> {
+            let mut idx = std::collections::BTreeSet::new();
+            if on {
+                self.xdp.pppoe_ready(ports)?;
+                for p in ports {
+                    let (i, _) =
+                        crate::pppoe_io::port_info(p).map_err(|e| HalError::Io(e.to_string()))?;
+                    idx.insert(i);
+                }
+            }
+            self.xdp.set_ipoe(idx)
+        }
+
         fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), HalError> {
             self.xdp.pppoe_apply(ops)
         }
