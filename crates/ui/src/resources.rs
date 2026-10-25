@@ -197,7 +197,7 @@ impl PanelState for ResourcesPanel {
         }
         let n = self.ticks.get();
         self.ticks.set(n.wrapping_add(1));
-        if app.has_command(CHECK) && (open || n % CHIP_EVERY == 0) {
+        if app.has_command(CHECK) && (open || n.is_multiple_of(CHIP_EVERY)) {
             out.push(q("check", CHECK, Value::Null));
         }
         if !open {
