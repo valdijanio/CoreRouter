@@ -71,6 +71,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.ntp-client", "## O que faz\nMantém o relógio do roteador certo a partir de servidores NTP. Logs, certificados e concessões DHCP dependem da hora certa."),
     ("menu.ospf", "## O que faz\nOSPF, o protocolo de roteamento interno: áreas, interfaces e vizinhos. Ainda não implementado."),
     ("menu.ping", "## O que faz\nEnvia ICMP echo para um endereço e mostra latência e perda em gráfico; também descobre o MTU do caminho."),
+    ("menu.resources", "## O que faz\nA saúde do roteador: CPU (por núcleo, com os softirqs de recepção), memória e pressão (PSI), discos, interfaces, sensores com os limites, processos e verificações de saúde com o motivo e o que fazer. Como /system resource, /system health e /tool profile do RouterOS juntos."),
     ("menu.routes", "## O que faz\nA tabela de rotas: rotas estáticas (inclusive a rota padrão 0.0.0.0/0), conectadas e aprendidas, qual está ativa e em qual VRF."),
     ("menu.services", "## O que faz\nOs serviços do próprio roteador (DNS, DHCP, métricas…) como o supervisor os vê: rodando, parado ou com falha, reinícios e o último erro. Inicie, pare e reinicie por aqui."),
     ("menu.settings", "## O que faz\nPreferências desta GUI, não do roteador: o idioma dos rótulos e das explicações. Guardadas neste computador."),

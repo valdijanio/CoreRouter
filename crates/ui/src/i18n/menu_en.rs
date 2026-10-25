@@ -42,6 +42,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.ntp-client", "## What it does\nKeeps the router's clock right from NTP servers. Logs, certificates and DHCP leases depend on the time being correct."),
     ("menu.ospf", "## What it does\nOSPF, the interior routing protocol: areas, interfaces and neighbors. Not implemented yet."),
     ("menu.ping", "## What it does\nSends ICMP echo to an address and charts the latency and loss; also finds the path MTU."),
+    ("menu.resources", "## What it does\nThe router's health: CPU (per core, with the receive softirqs), memory and pressure (PSI), disks, links, sensors with their limits, processes, and health checks with the reason and what to do. Like RouterOS /system resource, /system health and /tool profile together."),
     ("menu.routes", "## What it does\nThe routing table: static routes (the default route 0.0.0.0/0 included), connected and learned ones, which one is active and in which VRF."),
     ("menu.services", "## What it does\nThe router's own services (DNS, DHCP, metrics…) as the supervisor sees them: running, stopped or failed, restarts and the last error. Start, stop and restart them here."),
     ("menu.settings", "## What it does\nPreferences of this GUI, not of the router: the language of the labels and of the explanations. Kept on this computer."),
