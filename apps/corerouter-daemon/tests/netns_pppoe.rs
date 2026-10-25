@@ -516,3 +516,39 @@ fn icmp_echo(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
     ip.extend_from_slice(&icmp);
     ip
 }
+
+/// Not a test: CPEs for screenshots and manual checks of the PPP window.
+/// With a daemon already serving `acc0` (its peer `cpe0` here), dial
+/// `PPPOE_LAB_USERS` subscribers `u0…` (password `p<i>`), three with a
+/// wrong password, and keep them up for `PPPOE_LAB_SECS`:
+///
+/// ```sh
+/// PPPOE_LAB_USERS=40 PPPOE_LAB_SECS=600 cargo test -p corerouter-daemon \
+///     --test netns_pppoe cpe_lab -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn cpe_lab() {
+    let users: usize = std::env::var("PPPOE_LAB_USERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20);
+    let secs: u64 = std::env::var("PPPOE_LAB_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let mut cpes = Cpes::new(
+        users + 3,
+        0,
+        |i| {
+            if i >= users {
+                (format!("u{i}"), "errada".into())
+            } else {
+                (format!("u{i}"), format!("p{i}"))
+            }
+        },
+        false,
+    );
+    cpes.start_all();
+    cpes.run_until(secs, |_| false);
+}

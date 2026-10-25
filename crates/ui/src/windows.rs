@@ -33,6 +33,9 @@ pub enum Win {
 /// has no place to fight over.
 pub(crate) const MENU: &[(&str, &[Win])] = &[
     ("Interfaces", &[Win::Interfaces, Win::InterfaceList]),
+    // The PPP window is a panel (`ppp.rs`, G4.3d); RouterOS has it at the
+    // top of the menu, after the interfaces.
+    ("PPP", &[]),
     (
         "IP",
         &[

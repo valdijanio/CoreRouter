@@ -1088,6 +1088,7 @@ impl Bng {
     }
 
     fn reject(&mut self, i: usize, sref: SessionRef, why: &str) {
+        guard(&self.shared).stats.auth_reject += 1;
         if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
             sub.reply_message = Some(why.to_owned());
         }
@@ -1424,7 +1425,6 @@ impl Bng {
                     self.accept(i, sref, mschap2, fixed, pool, rate, timeout, true, interim);
                 }
                 AuthOutcome::Reject | AuthOutcome::Challenge => {
-                    guard(&self.shared).stats.auth_reject += 1;
                     let m = message.unwrap_or_else(|| "rejected by RADIUS".into());
                     self.reject(i, sref, &m);
                 }
