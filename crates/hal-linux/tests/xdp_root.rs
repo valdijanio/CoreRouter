@@ -1677,7 +1677,9 @@ fn perf_pppoe_forward() {
 /// G4.3d: what the BNG service does to the maps, through the HAL's terms
 /// (`hal::pppoe`): `pppoe_ready` refuses a port without XDP, an `Upsert`
 /// makes the session known (upstream decapsulated to the kernel, counted),
-/// An IPv6 UDP packet (checksum over the pseudo-header, RFC 8200 §8.1).
+/// An Ethernet frame with an IPv6 UDP packet (checksum over the
+/// pseudo-header, RFC 8200 §8.1), the shape `pppoe_frame` takes (it keeps
+/// what follows the 14-byte Ethernet header).
 fn udp6_frame(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> Vec<u8> {
     let mut udp = vec![0x13, 0x88, 0, 7, 0, 18, 0, 0];
     udp.extend_from_slice(b"corerouter");
@@ -1697,7 +1699,8 @@ fn udp6_frame(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> Vec<u8> {
     }
     let c = !(sum as u16);
     udp[6..8].copy_from_slice(&c.to_be_bytes());
-    let mut ip = vec![0x60, 0, 0, 0];
+    let mut ip = vec![0u8; 12];
+    ip.extend_from_slice(&[0x86, 0xdd, 0x60, 0, 0, 0]);
     ip.extend_from_slice(&(udp.len() as u16).to_be_bytes());
     ip.extend_from_slice(&[17, 64]);
     ip.extend_from_slice(&src.octets());
@@ -1738,8 +1741,9 @@ fn pppoe_bng_ops_reach_the_maps() {
         fast_up: false,
         fast_down: true,
         // G4.3e: the /64 of the link and a /56 delegated by DHCPv6.
-        ipv6_prefix: Some([0x20, 0x01, 0x0d, 0xb8, 0, 0x51, 0, 0]),
-        delegated: Some(([0x20, 0x01, 0x0d, 0xb8, 0x80, 0x51, 0, 0], 56)),
+        // 2001:db8:0:51::/64 and 2001:db8:8000:5100::/56.
+        ipv6_prefix: Some([0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0x51]),
+        delegated: Some(([0x20, 0x01, 0x0d, 0xb8, 0x80, 0, 0x51, 0], 56)),
         ..PppoeSession::default()
     };
     x.pppoe_apply(&[PppoeOp::Upsert(7, s)]).unwrap();
