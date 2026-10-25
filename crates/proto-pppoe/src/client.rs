@@ -37,6 +37,11 @@ pub struct ClientConfig {
     /// First PADI/PADR retransmission (doubles up to 8×).
     pub discovery_timeout_ms: u64,
     pub discovery_attempts: u8,
+    /// Spread of each PADI/PADR retransmission, ± this % of the wait.
+    /// 0 (pppd, rp-pppoe) retransmits on the exact back-off; CPEs that
+    /// rebooted together then retry together, in waves. The load generator
+    /// uses some, as real CPEs differ in boot time and clock.
+    pub discovery_jitter_pct: u8,
     pub fsm: FsmConfig,
     /// LCP echo period once up (pppd `lcp-echo-interval`); 0 = off.
     pub keepalive_interval_ms: u64,
@@ -64,6 +69,7 @@ impl Default for ClientConfig {
             ipv6: false,
             discovery_timeout_ms: 1000,
             discovery_attempts: 5,
+            discovery_jitter_pct: 0,
             fsm: FsmConfig::default(),
             keepalive_interval_ms: 10_000,
             keepalive_misses: 3,
@@ -321,7 +327,14 @@ impl Client {
 
     fn arm_discovery(&mut self, now: Millis) {
         self.attempts += 1;
-        self.disc_deadline = now + self.disc_timeout;
+        let pct = u64::from(self.cfg.discovery_jitter_pct.min(50));
+        let wait = if pct == 0 {
+            self.disc_timeout
+        } else {
+            let spread = u64::from(self.rng.u32()) % (2 * pct + 1);
+            self.disc_timeout * (100 - pct + spread) / 100
+        };
+        self.disc_deadline = now + wait.max(1);
         self.disc_timeout = (self.disc_timeout * 2).min(self.cfg.discovery_timeout_ms * 8);
     }
 
