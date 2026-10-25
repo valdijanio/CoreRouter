@@ -28,6 +28,7 @@ pub mod lab;
 pub mod layers;
 pub mod lcp;
 pub mod ncp;
+pub mod nd;
 pub mod output;
 pub mod ppp;
 pub mod server;

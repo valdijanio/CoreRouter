@@ -6,11 +6,13 @@ mod bng_lab;
 mod changes;
 mod ebpf;
 mod layers;
+mod vm_lab;
+mod vm_tools;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -103,6 +105,17 @@ fn main() -> ExitCode {
                 }
                 Outcome::Fail(why) => {
                     eprintln!("FAIL bng-lab: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // G0.26: the VM lab where agents are root (docs/vm-lab.md).
+        "vm-lab" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match vm_lab::main(&root, &rest) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL vm-lab: {why}");
                     ExitCode::FAILURE
                 }
             };
