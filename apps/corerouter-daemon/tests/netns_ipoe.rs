@@ -504,3 +504,126 @@ fn ipoe_end_to_end() {
     drop(radius);
     drop(daemon);
 }
+
+/// A lab for the screenshots: the daemon (its local token where the GUI
+/// and CLI of this namespace look: `$COREROUTER_RUNTIME_DIR`), 40
+/// subscribers (the first 30 by RADIUS, two of them rejected, ten from the
+/// local list) kept bound for `IPOE_LAB_SECS`:
+///
+/// ```sh
+/// COREROUTER_RUNTIME_DIR=/tmp/g43f-lab IPOE_LAB_SECS=600 COREROUTER_NETNS_TESTS=1 \
+///     unshare --user --map-root-user --net -- cargo test -p corerouter-daemon \
+///     --test netns_ipoe ipoe_lab -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn ipoe_lab() {
+    if !in_netns() {
+        return;
+    }
+    let secs: u64 = std::env::var("IPOE_LAB_SECS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+    let run = std::path::PathBuf::from(std::env::var("COREROUTER_RUNTIME_DIR").unwrap());
+    std::fs::create_dir_all(&run).unwrap();
+    ip(None, &["link", "set", "lo", "up"]);
+    ip(
+        None,
+        &[
+            "link", "add", "acc0", "type", "veth", "peer", "name", "cpe0",
+        ],
+    );
+    ip(None, &["link", "set", "acc0", "up"]);
+    ip(None, &["link", "set", "cpe0", "up"]);
+    let dir = run.join("cfg");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut c = in_ns(None, DAEMON);
+    c.args([
+        "--backend",
+        "linux",
+        "--no-discovery",
+        "--manage",
+        "acc0",
+        "--control",
+        "7979",
+        "--config-dir",
+    ])
+    .arg(&dir)
+    .stdout(Stdio::null())
+    .stderr(std::fs::File::create(run.join("daemon.log")).unwrap());
+    let _daemon = Kill(c.spawn().unwrap());
+    let theirs = run.join("control-7979.token");
+    let mine = token_file(None, &run);
+    wait_for("the token", || theirs.exists());
+    let _ = std::fs::remove_file(&mine);
+    std::os::unix::fs::symlink(&theirs, &mine).unwrap();
+    wait_for("the daemon", || {
+        call(None, "interface.list", json!({})).is_ok()
+    });
+    let radius = Radius::start();
+    {
+        let mut srv = radius.srv.lock().unwrap();
+        for k in 0..30 {
+            if k == 7 || k == 21 {
+                continue;
+            }
+            let mut reply = AttrList::new();
+            reply
+                .push_vsa(
+                    14988,
+                    8,
+                    if k % 3 == 0 {
+                        b"100M/300M".as_slice()
+                    } else {
+                        b"20M/50M".as_slice()
+                    },
+                )
+                .unwrap();
+            srv.add_user(&mac_text(mac(k)), "", reply);
+        }
+    }
+    let mut steps = vec![
+        (
+            "ip.address.add",
+            json!({"address": "10.64.0.1/16", "interface": "acc0"}),
+        ),
+        (
+            "ip.pool.add",
+            json!({"name": "subs", "ranges": "10.64.1.1-10.64.80.254"}),
+        ),
+        (
+            "ppp.profile.add",
+            json!({"name": "plano-30", "rate_limit": "30M/30M"}),
+        ),
+        (
+            "radius.add",
+            json!({"address": "127.0.0.1", "authentication_port": radius.auth_port, "accounting_port": radius.acct_port, "service": "dhcp", "secret": "segredo"}),
+        ),
+        (
+            "ip.dhcp-server.add",
+            json!({"interface": "acc0", "address_pool": "subs", "use_radius": "yes", "conflict_detection": false, "lease_time": "1h", "ipoe_keepalive": "5m"}),
+        ),
+        (
+            "ip.dhcp-server.network.add",
+            json!({"address": "10.64.0.0/16", "gateway": "10.64.0.1"}),
+        ),
+    ];
+    for k in 30..40 {
+        steps.push(("ppp.secret.add", json!({"name": mac_text(mac(k)), "service": "ipoe", "profile": "plano-30", "comment": format!("cliente {k}")})));
+    }
+    for (id, p) in steps {
+        ok(id, p);
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let mut lab = Clients::new(0, 40);
+    lab.run(38, 60, 2);
+    println!(
+        "LAB READY: {} bound, pid {}",
+        lab.bound(),
+        std::process::id()
+    );
+    lab.run(usize::MAX, secs, 1);
+    drop(radius);
+}

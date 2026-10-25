@@ -522,11 +522,13 @@ impl PppPanel {
             name_chips.push(("R", Kind::Neutral));
         }
         let vlan = r.get("vlan").and_then(Value::as_u64).map(|v| v.to_string()).unwrap_or_default();
+        let service = text(r, "service");
         Row {
             key: text(r, "id"),
             cells: vec![
                 chip::cell("", &name_chips),
-                text(r, "service"),
+                // PPPoE and IPoE (G4.3f) side by side: a chip per service.
+                chip::cell("", &[(service.as_str(), Kind::Hashed(chip::name_hue(&service)))]),
                 text(r, "caller_id"),
                 text(r, "address"),
                 text(r, "uptime"),
@@ -1176,10 +1178,17 @@ fn why_answer(ui: &mut Ui, l: Lang, a: &Value, help: &mut Option<HelpView>) {
     let failed = text(&last, "event") == "failed";
     let last_stage = text(a, "last_stage");
     let active = text(a, "active");
+    // An IPoE subscriber (G4.3f) goes DHCP > Auth > Up.
+    let ipoe = attempts.contains_key("dhcp") || last_stage == "dhcp";
+    let stages: &[(&str, &str)] = if ipoe {
+        &[("dhcp", "DHCP"), ("auth", "Auth"), ("up", "Up")]
+    } else {
+        &[("padi", "PADI"), ("padr", "PADR"), ("lcp", "LCP"), ("auth", "Auth"), ("ncp", "NCP"), ("up", "Up")]
+    };
     ui.horizontal_wrapped(|ui| {
         label(ui, help, l, "why.stage", "Stages");
         let v = ui.visuals().clone();
-        for (i, (st, name)) in [("padi", "PADI"), ("padr", "PADR"), ("lcp", "LCP"), ("auth", "Auth"), ("ncp", "NCP"), ("up", "Up")].into_iter().enumerate() {
+        for (i, (st, name)) in stages.iter().copied().enumerate() {
             if i > 0 {
                 // The GUI font has no arrow glyph.
                 ui.weak(">");
@@ -1203,7 +1212,7 @@ fn why_answer(ui: &mut Ui, l: Lang, a: &Value, help: &mut Option<HelpView>) {
     }
     if last.is_null() {
         if attempts.is_empty() {
-            ui.weak(tr_in(SCOPE, l, "Nothing seen from this user or MAC yet: is the CPE on this access network and dialing PPPoE?"));
+            ui.weak(tr_in(SCOPE, l, "Nothing seen from this user or MAC yet: is the CPE on this access network and dialing PPPoE (or asking DHCP, for IPoE)?"));
         }
         return;
     }
@@ -1365,7 +1374,7 @@ impl PanelState for PppPanel {
                 "profile" | "default_profile" => {
                     if profiles.is_empty() { vec!["default".into()] } else { profiles.clone() }
                 }
-                "service" => ["pppoe", "any", "l2tp", "pptp", "sstp", "ovpn"].iter().map(|s| (*s).to_owned()).collect(),
+                "service" => ["pppoe", "ipoe", "any", "l2tp", "pptp", "sstp", "ovpn"].iter().map(|s| (*s).to_owned()).collect(),
                 "only_one" | "change_tcp_mss" => ["default", "yes", "no"].iter().map(|s| (*s).to_owned()).collect(),
                 _ => Vec::new(),
             }

@@ -52,7 +52,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.dhcp-server.print", "DHCP Server", ["IP", "DHCP Server"], None,
-        "{} → [{id, name, interface, address_pool (static-only when none), lease_time, lease_time_secs, authoritative, conflict_detection, always_broadcast, server_address?, relay?, dhcp_option_set?, address_lists, client_mac_limit?, client_rate_limit, relay_info_trusted, use_radius, ipoe (sessions from leases), ipoe_username, ipoe_unknown, ipoe_keepalive?, disabled, comment?, status (running | disabled | invalid | starting | error), listening?, error?, bound (leases bound now), checks: [{label, level (ok | warn | error), text}]}]",
+        "{} → [{id, name, interface, address_pool (static-only when none), lease_time, lease_time_secs, authoritative, conflict_detection, always_broadcast, server_address?, relay?, dhcp_option_set?, address_lists, client_mac_limit?, client_rate_limit, relay_info_trusted, use_radius, ipoe, sessions (its leases are subscriber sessions: ipoe or use_radius), ipoe_username, ipoe_unknown, ipoe_keepalive?, disabled, comment?, status (running | disabled | invalid | starting | error), listening?, error?, bound (leases bound now), checks: [{label, level (ok | warn | error), text}]}]",
         always, print),
 ];
 
@@ -425,7 +425,8 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
                 "client_rate_limit": d.client_rate_limit,
                 "relay_info_trusted": d.relay_info_trusted,
                 "use_radius": d.use_radius.as_str(),
-                "ipoe": d.sessions(),
+                "ipoe": d.ipoe,
+                "sessions": d.sessions(),
                 "ipoe_username": d.ipoe_username.as_str(),
                 "ipoe_unknown": d.ipoe_unknown.as_str(),
                 "disabled": d.disabled,
