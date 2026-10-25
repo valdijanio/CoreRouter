@@ -39,6 +39,9 @@ pub struct PppoeSession {
     /// Upstream may be forwarded in XDP (nothing in `forward` needs it).
     pub fast_up: bool,
     pub fast_down: bool,
+    /// An IPoE subscriber (G4.3f): keyed by port and MAC (`sid` 0, no
+    /// VLAN), policed, nothing encapsulated.
+    pub ipoe: bool,
     /// G4.3e: the high 64 bits of the link's /64 (the RA prefix).
     pub ipv6_prefix: Option<[u8; 8]>,
     /// G4.3e: the delegated prefix (high 64 bits) and its length, 1..=64.

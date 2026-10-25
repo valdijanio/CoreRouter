@@ -80,6 +80,9 @@ pub struct ServerPlan {
     pub client_rate_limit: u32,
     /// Option 82 without a relay (`giaddr` 0) is believed (an L2 agent).
     pub relay_info_trusted: bool,
+    /// Each client is authorized before it is served (IPoE, G4.3f:
+    /// `use_radius=yes` or `ipoe=yes`).
+    pub authorize: bool,
 }
 
 impl ServerPlan {
@@ -297,6 +300,7 @@ impl Plan {
                 client_mac_limit: s.client_mac_limit,
                 client_rate_limit: s.client_rate_limit,
                 relay_info_trusted: s.relay_info_trusted,
+                authorize: s.authorizes(),
             })
             .collect();
         // Option 6 when the network names none: the router itself when its

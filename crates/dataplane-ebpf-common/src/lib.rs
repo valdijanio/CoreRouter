@@ -18,6 +18,8 @@
 //!   incrementally (RFC 1624).
 //! - [`pppoe`]: the PPPoE subscriber data plane (G4.3c): session map,
 //!   upstream check and decapsulation, downstream encapsulation.
+//! - [`ipoe`]: IPoE subscribers (G4.3f) in the same session maps: the
+//!   IP↔MAC binding, the policer and the counters, no encapsulation.
 //! - [`policer`]: the per-subscriber policer, RouterOS burst semantics.
 //! - [`maps`]: map names, sizes and value layouts (plain integers and
 //!   arrays, so the loader needs no `unsafe impl Pod`).
@@ -33,6 +35,7 @@
 pub mod bucket;
 pub mod fastnat;
 pub mod filter;
+pub mod ipoe;
 pub mod maps;
 pub mod nat;
 pub mod packet;

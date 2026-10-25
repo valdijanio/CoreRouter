@@ -55,8 +55,10 @@ pub(crate) const HISTORY: usize = 50_000;
 /// nobody used since; G4.3g: clearing everything at 100 000 forgot every
 /// subscriber each 50 000 logins).
 pub(crate) const WHY_KEYS: usize = 2 * XDP_SLOTS as usize;
-/// Slots of the XDP session map (`dataplane-ebpf-common::pppoe::SESSIONS_MAX`).
-pub(crate) const XDP_SLOTS: u32 = 1 << 17;
+/// Slots of the XDP session map the PPPoE service may use: the lower half
+/// of `dataplane-ebpf-common::pppoe::SESSIONS_MAX` (1 << 17). The upper half
+/// is the IPoE service's (G4.3f, `ipoe_bng::SLOT_TOP` downward).
+pub(crate) const XDP_SLOTS: u32 = 1 << 16;
 /// A subscriber's address-list entry is made again this often (dynamic
 /// entries last at most 35 days; the driver adds them for 35).
 const LIST_REFRESH_MS: u64 = 30 * 86_400_000;
@@ -3194,6 +3196,7 @@ fn xdp_session(
         down: r.as_ref().map(|r| rate_dir(r, false)).unwrap_or_default(),
         fast_up: false,
         fast_down: true,
+        ipoe: false,
         ipv6_prefix: v6
             .and_then(|x| x.link.as_ref())
             .map(|(n, _)| v6::high64(*n)),

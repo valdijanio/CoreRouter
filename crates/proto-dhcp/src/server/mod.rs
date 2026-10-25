@@ -32,6 +32,7 @@
 //!   updated on ACK only, never on DISCOVER (§4.1).
 
 pub mod agent;
+pub mod authorize;
 pub mod checks;
 pub mod history;
 pub mod leases;
@@ -75,6 +76,9 @@ pub const MAX_PARKED: usize = 4096;
 pub const FULL_LOG_SECS: u64 = 60;
 /// Clients the rate limiter remembers (random-MAC floods are bounded).
 pub const MAX_CLIENTS_TRACKED: usize = 65_536;
+/// A full rate-limit table is swept for clients that are full again at
+/// most this often.
+pub const SWEEP_MS: u64 = 250;
 /// An address whose probe came back clean is offered again without a
 /// probe within this time (a client retrying its DISCOVER).
 const PROBED_OK_MS: u64 = 60_000;
@@ -159,6 +163,9 @@ pub enum Effect {
     Discover {
         interface: IfName,
     },
+    /// Ask whether this client may be served (IPoE, G4.3f): the answer
+    /// comes back through [`Server::authorized`].
+    Authorize(authorize::AuthAsk),
     Log {
         level: Level,
         text: String,
@@ -230,6 +237,8 @@ pub struct Server {
     /// Conflicts being checked again (`check-status`): address → deadline.
     checking: HashMap<Ipv4Addr, (IfName, u64)>,
     limiter: HashMap<[u8; 6], Bucket>,
+    /// When the full limiter was last swept.
+    limiter_swept_ms: u64,
     stats: Stats,
     seen: BTreeMap<(IfName, [u8; 6]), Seen>,
     /// Next offset to try per pool.
@@ -247,6 +256,8 @@ pub struct Server {
     alert_probe: HashMap<IfName, u64>,
     /// When "pool is full" was last logged, per (server, pool).
     full_logged: HashMap<(String, String), u64>,
+    /// Clients asked about, granted and refused (IPoE, G4.3f).
+    gate: authorize::Gate,
 }
 
 fn mac_text(m: &[u8; 6]) -> String {
@@ -289,6 +300,7 @@ impl Server {
             probed_ok: HashMap::new(),
             checking: HashMap::new(),
             limiter: HashMap::new(),
+            limiter_swept_ms: 0,
             stats: Stats::new(now_unix),
             seen: BTreeMap::new(),
             cursor: HashMap::new(),
@@ -298,6 +310,7 @@ impl Server {
             agent: None,
             alert_probe: HashMap::new(),
             full_logged: HashMap::new(),
+            gate: authorize::Gate::default(),
         }
     }
 
@@ -372,6 +385,8 @@ impl Server {
         }
         self.parked
             .retain(|p| plan.servers.iter().any(|s| s.name == p.server));
+        self.gate
+            .keep(|name| plan.servers.iter().any(|s| s.name == name && s.authorize));
         self.parked_keys = self
             .parked
             .iter()
@@ -452,6 +467,9 @@ impl Server {
         }
         self.set_agent(&srv.name, &req);
         let unicast = !heard.dst.is_broadcast();
+        if self.gate(now, iface, &srv, &req, unicast, &mut out) {
+            return out;
+        }
         match req.kind {
             Kind::Discover => self.discover(now, iface, &srv, req, None, &mut out),
             Kind::Request => self.request(now, iface, &srv, &req, unicast, &mut out),
@@ -460,6 +478,7 @@ impl Server {
             Kind::Inform => self.inform(now, iface, &srv, &req, &mut out),
             _ => self.stats.drop(Drop::Unexpected),
         }
+        self.forget_ended(&out);
         out
     }
 
@@ -482,14 +501,26 @@ impl Server {
         }
         let cap = rate.saturating_mul(2).max(4).saturating_mul(1000);
         if self.limiter.len() >= MAX_CLIENTS_TRACKED && !self.limiter.contains_key(&mac) {
-            // Make room: forget the clients that are full again.
-            self.limiter.retain(|_, b| {
-                b.tokens
-                    .saturating_add(now_ms.saturating_sub(b.at_ms).saturating_mul(rate))
-                    < cap
-            });
+            // Make room: forget the clients that are full again. At most
+            // every SWEEP_MS: a sweep per new client was O(table) per
+            // message once full (G4.3f, measured: 100 000 clients after a
+            // power cut ran 8× slower per lease than 10 000).
+            if now_ms >= self.limiter_swept_ms.saturating_add(SWEEP_MS) {
+                self.limiter_swept_ms = now_ms;
+                self.limiter.retain(|_, b| {
+                    b.tokens
+                        .saturating_add(now_ms.saturating_sub(b.at_ms).saturating_mul(rate))
+                        < cap
+                });
+            }
             if self.limiter.len() >= MAX_CLIENTS_TRACKED {
-                return false;
+                // Full of clients still counting: this one is served without
+                // a bucket. The table stays bounded; refusing here turned a
+                // storm of 100 000 legitimate clients into 34 000 refusals,
+                // and a per-MAC limit does not slow a flood of random MACs
+                // anyway (each is new).
+                self.stats.untracked = self.stats.untracked.saturating_add(1);
+                return true;
             }
         }
         let b = self.limiter.entry(mac).or_insert(Bucket {
@@ -598,6 +629,15 @@ impl Server {
 
     /// The chain a client draws from: a matcher's pool, else the server's.
     fn chain_for(&self, srv: &ServerPlan, req: &Request) -> (Option<String>, Vec<OptPlan>) {
+        // A grant's pool (RADIUS `Framed-Pool`) wins, when the router has it.
+        if let Some(pool) = self
+            .gate
+            .grant(&srv.name, &req.client_key())
+            .and_then(|g| g.pool.clone())
+            .filter(|p| !self.plan.chain(p).is_empty())
+        {
+            return (Some(pool), Vec::new());
+        }
         for m in &self.plan.matchers {
             if m.hits(&srv.name, req.option(m.code)) {
                 return (
@@ -673,6 +713,10 @@ impl Server {
     ) -> Option<(Ipv4Addr, bool)> {
         let key = req.client_key();
         let mac = req.mac();
+        // A granted address (`Framed-IP-Address`) and no other.
+        if let Some(ip) = self.gate.grant(&srv.name, &key).and_then(|g| g.address) {
+            return self.granted_ok(srv, ip, &key).then_some((ip, false));
+        }
         if let Some(s) = self
             .plan
             .static_for(&srv.name, &key, mac, self.agent.as_deref())
@@ -728,7 +772,11 @@ impl Server {
         let is_static = self
             .plan
             .static_for(&srv.name, &key, mac, self.agent.as_deref())
-            .is_some();
+            .is_some()
+            || self
+                .gate
+                .grant(&srv.name, &key)
+                .is_some_and(|g| g.address.is_some());
         if chain.is_none() && !is_static {
             self.stats.drop(Drop::StaticOnly);
             return;
@@ -807,8 +855,30 @@ impl Server {
         self.offer(now, iface, srv, &req, ip, out);
     }
 
-    fn lease_time(&self, srv: &ServerPlan, st: Option<&StaticPlan>) -> u32 {
-        st.and_then(|s| s.cfg.lease_time).unwrap_or(srv.lease_time)
+    /// The lease time: a grant's (`Session-Timeout`), a static lease's,
+    /// else the server's.
+    fn lease_time(&self, srv: &ServerPlan, st: Option<&StaticPlan>, key: &[u8]) -> u32 {
+        self.gate
+            .grant(&srv.name, key)
+            .and_then(|g| g.lease_time)
+            .filter(|t| *t > 0)
+            .or_else(|| st.and_then(|s| s.cfg.lease_time))
+            .unwrap_or(srv.lease_time)
+    }
+
+    /// Whether a granted address may go to `key`: on this server's
+    /// network, not the router's, and nobody else's now.
+    fn granted_ok(&self, srv: &ServerPlan, ip: Ipv4Addr, key: &[u8]) -> bool {
+        if self.plan.router.contains(&ip) || !self.on_network(srv, ip) {
+            return false;
+        }
+        match self.leases.get(ip) {
+            None => true,
+            Some(l) if l.client_key() == key && l.server == srv.name => {
+                !matches!(l.state, State::Conflict | State::Declined)
+            }
+            Some(l) => l.state.free(),
+        }
     }
 
     fn host_of(req: &Request) -> String {
@@ -870,7 +940,7 @@ impl Server {
             .plan
             .static_for(&srv.name, &key, req.mac(), self.agent.as_deref())
             .cloned();
-        let lt = self.lease_time(srv, st.as_ref());
+        let lt = self.lease_time(srv, st.as_ref(), &key);
         match self.leases.get(ip) {
             Some(l) if l.state == State::Bound && l.client_key() == key && l.server == srv.name => {
             }
@@ -1189,7 +1259,12 @@ impl Server {
             let is_static = self
                 .plan
                 .static_for(&srv.name, &key, mac, self.agent.as_deref())
-                .is_some_and(|s| s.cfg.address == ip);
+                .is_some_and(|s| s.cfg.address == ip)
+                || self
+                    .gate
+                    .grant(&srv.name, &key)
+                    .and_then(|g| g.address)
+                    .is_some_and(|g| g == ip && self.granted_ok(srv, ip, &key));
             if ours || is_static {
                 self.ack(now, iface, srv, req, ip, out);
             } else {
@@ -1221,11 +1296,18 @@ impl Server {
         let known = record
             .as_ref()
             .is_some_and(|l| l.client_key() == key && l.server == srv.name);
-        let ok = self.free_for(srv, chain, ip, &key, mac)
-            || self
-                .plan
-                .static_for(&srv.name, &key, mac, self.agent.as_deref())
-                .is_some_and(|s| s.cfg.address == ip);
+        let granted = self.gate.grant(&srv.name, &key).and_then(|g| g.address);
+        let ok = match granted {
+            // A granted address is the only one this client may have.
+            Some(g) => g == ip && self.granted_ok(srv, ip, &key),
+            None => {
+                self.free_for(srv, chain, ip, &key, mac)
+                    || self
+                        .plan
+                        .static_for(&srv.name, &key, mac, self.agent.as_deref())
+                        .is_some_and(|s| s.cfg.address == ip)
+            }
+        };
         if ok && (known || may_nak) {
             // Ours, or (authoritative) free and valid for this client: the
             // table is rebuilt from what clients hold.
@@ -1255,7 +1337,7 @@ impl Server {
             .plan
             .static_for(&srv.name, &key, req.mac(), self.agent.as_deref())
             .cloned();
-        let lt = self.lease_time(srv, st.as_ref());
+        let lt = self.lease_time(srv, st.as_ref(), &key);
         // The client's other addresses on this server end (it moved).
         let old: Vec<Ipv4Addr> = self
             .leases
@@ -1299,7 +1381,7 @@ impl Server {
         self.leases.put(rec.clone());
         out.push(Effect::Journal(Record::Lease(rec.clone())));
         let no_update = req.fqdn.as_ref().is_some_and(|f| f.flags & FQDN_N != 0);
-        let (dns, lists) = self.outside(srv, st.as_ref(), ip, &rec.host_name, no_update);
+        let (dns, lists) = self.outside(srv, st.as_ref(), ip, &rec.host_name, no_update, &key);
         if !renewed {
             out.push(Effect::Log {
                 level: Level::Info,
@@ -1345,6 +1427,7 @@ impl Server {
         ip: Ipv4Addr,
         host_name: &str,
         no_update: bool,
+        key: &[u8],
     ) -> (Option<(String, String)>, Vec<String>) {
         let label = st
             .map(|s| s.cfg.host_name.clone())
@@ -1359,6 +1442,13 @@ impl Server {
         let mut lists = srv.address_lists.clone();
         if let Some(s) = st {
             lists.extend(s.cfg.address_lists.iter().map(|n| n.as_str().to_owned()));
+        }
+        if let Some(g) = self.gate.grant(&srv.name, key) {
+            for l in &g.address_lists {
+                if !lists.contains(l) {
+                    lists.push(l.clone());
+                }
+            }
         }
         (dns, lists)
     }
@@ -1375,7 +1465,8 @@ impl Server {
             .plan
             .static_for(&srv.name, &l.client_key(), l.mac, l.relay_info.as_deref())
             .filter(|s| s.cfg.address == l.address);
-        let (dns, address_lists) = self.outside(srv, st, l.address, &l.host_name, false);
+        let (dns, address_lists) =
+            self.outside(srv, st, l.address, &l.host_name, false, &l.client_key());
         Some(Binding {
             lease: l.clone(),
             new: false,
@@ -1558,6 +1649,7 @@ impl Server {
     /// Run often (every service round): probes whose wait is over.
     pub fn tick_ms(&mut self, now: Now) -> Vec<Effect> {
         let mut out = Vec::new();
+        self.gate_tick(now);
         let (due, wait): (Vec<Parked>, Vec<Parked>) = std::mem::take(&mut self.parked)
             .into_iter()
             .partition(|p| p.deadline_ms <= now.ms);
@@ -1599,6 +1691,7 @@ impl Server {
             self.probed_ok
                 .retain(|_, at| now.ms.saturating_sub(*at) < PROBED_OK_MS);
         }
+        self.forget_ended(&out);
         out
     }
 
@@ -1669,6 +1762,7 @@ impl Server {
                 .map_or(0, |a| a.timeout);
             s.last.saturating_add(timeout) > now.unix
         });
+        self.forget_ended(&out);
         out
     }
 
@@ -1691,6 +1785,7 @@ impl Server {
             &mut out,
         );
         self.generation += 1;
+        self.forget_ended(&out);
         Ok(out)
     }
 
@@ -1704,6 +1799,7 @@ impl Server {
             out.push(Effect::Journal(Record::Forget { forget: ip }));
             self.generation += 1;
         }
+        self.forget_ended(&out);
         out
     }
 

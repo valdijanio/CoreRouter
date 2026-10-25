@@ -31,7 +31,8 @@ corerouter-proto-flow.workspace = true
 corerouter-proto-radius.workspace = true
 # service/pppoe.rs (G4.3d): the BNG drives the PPPoE server.
 corerouter-proto-pppoe.workspace = true
-# service/pppoe_bng6.rs (G4.3e): the DHCPv6 server of each PPP session.
+# service/pppoe_bng6.rs (G4.3e): the DHCPv6 server of each PPP session;
+# service/ipoe_bng.rs (G4.3f): the DHCP server's grants and leases.
 corerouter-proto-dhcp.workspace = true
 ipnet.workspace = true
 getrandom.workspace = true
@@ -66,6 +67,9 @@ criterion.workspace = true
 # netns_dhcp.rs: a DHCP server thread inside another network namespace
 # (proto-dhcp is a normal dependency too).
 nix = { version = "0.30.1", default-features = false, features = ["sched", "net"] }
+# netns_ipoe.rs (G4.3f): the simulated DHCP clients read the server's
+# message types.
+dhcproto = { version = "0.15.0", default-features = false }
 
 [[bench]]
 name = "radius_aaa"
@@ -73,6 +77,10 @@ harness = false
 
 [[bench]]
 name = "pppoe_bng"
+harness = false
+
+[[bench]]
+name = "ipoe_bng"
 harness = false
 
 [lints]

@@ -1413,3 +1413,255 @@ fn replay_keeps_the_newest_lines() {
     t.replay_capped(lines.iter().map(String::as_str), 5);
     assert_eq!(t.get(l.address).unwrap().mac, mac(19));
 }
+
+// ---- IPoE authorization (G4.3f) --------------------------------------------
+
+fn asks(fx: &[Effect]) -> Vec<authorize::AuthAsk> {
+    fx.iter()
+        .filter_map(|e| match e {
+            Effect::Authorize(a) => Some(a.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn ipoe_cfg() -> Config {
+    let mut c = cfg();
+    let s = &mut c.ip.dhcp_server.servers[0];
+    s.ipoe = true;
+    s.relay_info_trusted = true;
+    s.conflict_detection = false;
+    c
+}
+
+/// MikroTik asks RADIUS on the DISCOVER and offers nothing until it
+/// accepts; a retransmission meanwhile is not asked again.
+#[test]
+fn the_discover_waits_for_the_verdict() {
+    let mut lab = Lab::new(&ipoe_cfg());
+    let fx = lab.discover(mac(1));
+    let a = asks(&fx);
+    assert_eq!(a.len(), 1, "{fx:?}");
+    assert!(sent(&fx, Kind::Offer).is_none());
+    assert_eq!(a[0].mac, mac(1));
+    assert_eq!(a[0].kind, Kind::Discover);
+    assert!(asks(&lab.discover(mac(1))).is_empty(), "asked once");
+    assert_eq!(lab.srv.stats().dropped_of(Drop::Authorizing), 1);
+    let now = lab.now;
+    let fx = lab.srv.authorized(
+        now,
+        "dhcp1",
+        &a[0].client_key,
+        authorize::Verdict::Accept(authorize::Grant::default()),
+    );
+    let (bytes, _) = sent(&fx, Kind::Offer).expect("the offer after the accept");
+    let yi = v4::decode(&bytes).unwrap().yiaddr;
+    // The REQUEST of a client with a grant is not asked about again.
+    let fx = lab.select(mac(1), yi);
+    assert!(asks(&fx).is_empty());
+    assert!(sent(&fx, Kind::Ack).is_some(), "{fx:?}");
+    assert_eq!(lab.srv.granted(), 1);
+    assert_eq!(lab.srv.stats().auth_asked, 1);
+}
+
+/// RFC 2131 §4.3.1 meets the grant: its address (Framed-IP-Address), its
+/// pool (Framed-Pool), its lease time (Session-Timeout) and its lists.
+#[test]
+fn a_grant_chooses_address_pool_lease_and_lists() {
+    let mut c = ipoe_cfg();
+    c.ip.pools.pools.push(IpPool {
+        id: ItemId(2),
+        name: "gold".into(),
+        ranges: vec!["192.168.88.100-192.168.88.110".parse().unwrap()],
+        next_pool: None,
+        comment: String::new(),
+    });
+    let mut lab = Lab::new(&c);
+    let grant = |address, pool: Option<&str>| authorize::Grant {
+        address,
+        pool: pool.map(str::to_owned),
+        lease_time: Some(600),
+        address_lists: vec!["paid".into()],
+    };
+    for (m, g, want) in [
+        (
+            mac(1),
+            grant(Some(ip("192.168.88.77")), None),
+            ip("192.168.88.77"),
+        ),
+        (mac(2), grant(None, Some("gold")), ip("192.168.88.100")),
+    ] {
+        let a = asks(&lab.discover(m)).pop().unwrap();
+        let now = lab.now;
+        let fx = lab
+            .srv
+            .authorized(now, "dhcp1", &a.client_key, authorize::Verdict::Accept(g));
+        let offer = v4::decode(&sent(&fx, Kind::Offer).unwrap().0).unwrap();
+        assert_eq!(offer.yiaddr, want);
+        let fx = lab.select(m, want);
+        let b = fx
+            .iter()
+            .find_map(|e| match e {
+                Effect::Bound(b) => Some(b.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(b.lease.lease_time, 600);
+        assert!(b.address_lists.contains(&"paid".to_owned()));
+    }
+    // A granted address another client holds is not stolen.
+    let a = asks(&lab.discover(mac(3))).pop().unwrap();
+    let now = lab.now;
+    let fx = lab.srv.authorized(
+        now,
+        "dhcp1",
+        &a.client_key,
+        authorize::Verdict::Accept(grant(Some(ip("192.168.88.77")), None)),
+    );
+    assert!(sent(&fx, Kind::Offer).is_none(), "{fx:?}");
+}
+
+/// A reject: no offer, and the client is not asked about for a while (a
+/// DISCOVER every few seconds is not a RADIUS request each time); a
+/// rejected REQUEST is NAKed.
+#[test]
+fn a_reject_offers_nothing_and_is_remembered() {
+    let mut lab = Lab::new(&ipoe_cfg());
+    let a = asks(&lab.discover(mac(1))).pop().unwrap();
+    let now = lab.now;
+    let fx = lab.srv.authorized(
+        now,
+        "dhcp1",
+        &a.client_key,
+        authorize::Verdict::Reject("no such user".into()),
+    );
+    assert!(sent(&fx, Kind::Offer).is_none());
+    assert!(asks(&lab.discover(mac(1))).is_empty());
+    assert_eq!(lab.srv.stats().dropped_of(Drop::Rejected), 1);
+    lab.later(authorize::REJECT_HOLD_MS);
+    assert_eq!(
+        asks(&lab.discover(mac(1))).len(),
+        1,
+        "asked again after the hold"
+    );
+    // INIT-REBOOT of a client without a grant: asked, then NAKed.
+    let m = mac(5);
+    let fx = lab.send(
+        msg(
+            MessageType::Request,
+            m,
+            Some(ip("192.168.88.15")),
+            None,
+            Ipv4Addr::UNSPECIFIED,
+        ),
+        Ipv4Addr::BROADCAST,
+    );
+    let a = asks(&fx).pop().unwrap();
+    assert_eq!(a.kind, Kind::Request);
+    let now = lab.now;
+    let fx = lab.srv.authorized(
+        now,
+        "dhcp1",
+        &a.client_key,
+        authorize::Verdict::Reject("x".into()),
+    );
+    assert!(sent(&fx, Kind::Nak).is_some(), "{fx:?}");
+}
+
+/// No verdict in time: forgotten, the next retransmission asks again.
+#[test]
+fn an_unanswered_ask_times_out() {
+    let mut lab = Lab::new(&ipoe_cfg());
+    assert_eq!(asks(&lab.discover(mac(1))).len(), 1);
+    lab.later(authorize::AUTH_WAIT_MS);
+    assert_eq!(lab.srv.authorizing(), 0);
+    assert_eq!(lab.srv.stats().auth_timeouts, 1);
+    assert_eq!(asks(&lab.discover(mac(1))).len(), 1);
+    // A flood of random MACs parks at most MAX_AUTH_PENDING.
+    for i in 0..(authorize::MAX_AUTH_PENDING + 100) {
+        let b = u32::try_from(i).unwrap().to_be_bytes();
+        lab.discover([6, 0, b[0], b[1], b[2], b[3]]);
+    }
+    assert_eq!(lab.srv.authorizing(), authorize::MAX_AUTH_PENDING);
+}
+
+/// Option 82 reaches the ask (RFC 3046 §3.1, §3.2) when believed.
+#[test]
+fn the_ask_carries_option_82() {
+    let mut lab = Lab::new(&ipoe_cfg());
+    let data = agent::build(b"olt1/1/3", b"cpe-77").unwrap();
+    let fx = lab.send(
+        with_82(
+            msg(
+                MessageType::Discover,
+                mac(1),
+                None,
+                None,
+                Ipv4Addr::UNSPECIFIED,
+            ),
+            &data,
+        ),
+        Ipv4Addr::BROADCAST,
+    );
+    let a = asks(&fx).pop().unwrap();
+    assert_eq!(a.circuit_id.as_deref(), Some(&b"olt1/1/3"[..]));
+    assert_eq!(a.remote_id.as_deref(), Some(&b"cpe-77"[..]));
+}
+
+/// A revoke (Disconnect-Request) ends the lease and takes the grant: the
+/// renewal is asked about again.
+#[test]
+fn a_revoke_ends_the_lease_and_the_grant() {
+    let mut lab = Lab::new(&ipoe_cfg());
+    let a = asks(&lab.discover(mac(1))).pop().unwrap();
+    let now = lab.now;
+    let fx = lab.srv.authorized(
+        now,
+        "dhcp1",
+        &a.client_key,
+        authorize::Verdict::Accept(authorize::Grant::default()),
+    );
+    let yi = v4::decode(&sent(&fx, Kind::Offer).unwrap().0)
+        .unwrap()
+        .yiaddr;
+    lab.select(mac(1), yi);
+    let now = lab.now;
+    let fx = lab
+        .srv
+        .revoke(now, "dhcp1", &a.client_key, "disconnected by RADIUS");
+    assert!(
+        fx.iter()
+            .any(|e| matches!(e, Effect::Gone(l) if l.address == yi)),
+        "{fx:?}"
+    );
+    assert_eq!(lab.srv.granted(), 0);
+    let fx = lab.send(msg(MessageType::Request, mac(1), None, None, yi), yi);
+    assert_eq!(asks(&fx).len(), 1, "the renewal is authorized again");
+    // A plain server never asks.
+    let mut plain = Lab::new(&cfg());
+    assert!(asks(&plain.discover(mac(1))).is_empty());
+}
+
+/// A storm bigger than the rate limiter's table (a BNG with 70 000
+/// subscribers after a power cut): every client is served, the table
+/// stays bounded and is not swept once per new client (G4.3f).
+#[test]
+fn a_storm_past_the_limiter_table_is_still_served() {
+    let mut c = cfg();
+    c.ip.addresses[0].address = "10.0.0.1/14".parse().unwrap();
+    c.ip.pools.pools[0].ranges = vec!["10.0.1.0-10.3.255.254".parse().unwrap()];
+    c.ip.dhcp_server.networks.clear();
+    c.ip.dhcp_server.servers[0].conflict_detection = false;
+    c.ip.dhcp_server.servers[0].client_rate_limit = 10;
+    let mut lab = Lab::new(&c);
+    let n = MAX_CLIENTS_TRACKED + 4_000;
+    let mut offers = 0;
+    for i in 0..n {
+        let b = u32::try_from(i).unwrap().to_be_bytes();
+        let fx = lab.discover([6, 0, b[0], b[1], b[2], b[3]]);
+        offers += usize::from(sent(&fx, Kind::Offer).is_some());
+    }
+    assert_eq!(offers, n);
+    assert_eq!(lab.srv.stats().dropped_of(Drop::RateLimited), 0);
+    assert!(lab.srv.stats().untracked >= 4_000);
+}

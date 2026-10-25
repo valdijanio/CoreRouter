@@ -22,7 +22,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add DHCP Lease",
         ["IP", "DHCP Server"],
         None,
-        "{address: ipv4, mac_address?: mac, client_id?: string (option 61 as RouterOS prints it, 1:aa:bb:cc:dd:ee:ff, or 0x…; matches instead of the MAC), agent_circuit_id?: string (option 82 circuit id the request must carry: a fixed address per OLT/switch port; text or 0x…), agent_remote_id?: string (option 82 remote id), server?: string (all, the default, or a server's name), lease_time?: duration (empty or 0: the server's), block_access?: bool (the client gets its address but no gateway nor DNS), address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string (its name in the DNS; empty: the client's), disabled?: bool, comment?: string} → {id, warnings}",
+        "{address: ipv4, mac_address?: mac, client_id?: string (option 61 as RouterOS prints it, 1:aa:bb:cc:dd:ee:ff, or 0x…; matches instead of the MAC), agent_circuit_id?: string (option 82 circuit id the request must carry: a fixed address per OLT/switch port; text or 0x…), agent_remote_id?: string (option 82 remote id), server?: string (all, the default, or a server's name), lease_time?: duration (empty or 0: the server's), block_access?: bool (the client gets its address but no gateway nor DNS), address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string (its name in the DNS; empty: the client's), rate_limit?: string (RouterOS rate-limit rx/tx from the router, 10M/50M [burst …]: on an ipoe server the subscriber's XDP policer; empty clears), disabled?: bool, comment?: string} → {id, warnings}",
         always,
         add
     ),
@@ -31,7 +31,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set DHCP Lease",
         [],
         None,
-        "{id: *hex | address (a static lease; make a dynamic one static first), address?: ipv4, mac_address?: mac, client_id?: string, agent_circuit_id?: string, agent_remote_id?: string, server?: string, lease_time?: duration, block_access?: bool, address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string, disabled?: bool, comment?: string} → {id, warnings}",
+        "{id: *hex | address (a static lease; make a dynamic one static first), address?: ipv4, mac_address?: mac, client_id?: string, agent_circuit_id?: string, agent_remote_id?: string, server?: string, lease_time?: duration, block_access?: bool, address_lists?: [string] | string, dhcp_option?: [string] | string, dhcp_option_set?: string, always_broadcast?: bool, host_name?: string, rate_limit?: string, disabled?: bool, comment?: string} → {id, warnings}",
         always,
         set
     ),
@@ -81,7 +81,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         check_status
     ),
     cmd!(query "ip.dhcp-server.lease.print", "DHCP Leases", [], None,
-        "{server?: string, status?: string} → [{id? (static leases), address, dynamic, status (waiting | testing | offered | bound | conflict | declined), mac_address?, client_id?, host_name?, server?, expires_after?, expires_after_secs?, last_seen_secs?, vendor_class?, blocked, dns? (the name it has in the DNS), address_lists, reason? (of a conflict), lease_time?, always_broadcast, dhcp_option, dhcp_option_set?, disabled, comment?, agent_info? (option 82, hex), agent_circuit_id? (the request's, or the static lease's), agent_remote_id?}]",
+        "{server?: string, status?: string} → [{id? (static leases), address, dynamic, status (waiting | testing | offered | bound | conflict | declined), mac_address?, client_id?, host_name?, server?, expires_after?, expires_after_secs?, last_seen_secs?, vendor_class?, blocked, rate_limit? (a static lease's), dns? (the name it has in the DNS), address_lists, reason? (of a conflict), lease_time?, always_broadcast, dhcp_option, dhcp_option_set?, disabled, comment?, agent_info? (option 82, hex), agent_circuit_id? (the request's, or the static lease's), agent_remote_id?}]",
         always, print),
 ];
 
@@ -136,6 +136,9 @@ fn apply(l: &mut StaticLease, p: &Value) -> Result<()> {
     }
     if let Some(b) = opt_bool(p, "block_access")? {
         l.block_access = b;
+    }
+    if let Some(r) = super::ppp_common::opt_rate_limit(p)? {
+        l.rate_limit = r.unwrap_or_default();
     }
     if let Some(v) = opt_lists(p, "address_lists")? {
         l.address_lists = v;
@@ -369,6 +372,9 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
             o.insert("id".into(), json!(st.id));
             o.insert("dynamic".into(), json!(false));
             o.insert("blocked".into(), json!(st.block_access));
+            if !st.rate_limit.is_empty() {
+                o.insert("rate_limit".into(), json!(st.rate_limit));
+            }
             o.insert("address_lists".into(), json!(lists(&st.address_lists)));
             o.insert("always_broadcast".into(), json!(st.always_broadcast));
             o.insert("dhcp_option".into(), json!(st.dhcp_option));

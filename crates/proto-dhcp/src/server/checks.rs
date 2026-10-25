@@ -1015,7 +1015,84 @@ pub fn checks(cfg: &Config) -> Vec<Check> {
     network_checks(cfg, &mut out);
     lease_checks(cfg, &mut out);
     other_checks(cfg, &mut out);
+    ipoe_checks(cfg, &mut out);
     out.0
+}
+
+/// IPoE (G4.3f): the mistakes that leave subscribers without an address
+/// or without the limits the operator meant.
+fn ipoe_checks(cfg: &Config, out: &mut Out) {
+    use corerouter_model::ipoe::{IpoeUnknown, UseRadius};
+    use corerouter_model::ppp::PppService;
+    use corerouter_model::radius::AaaService;
+    let radius_dhcp = cfg
+        .radius
+        .servers
+        .iter()
+        .any(|r| !r.disabled && r.service.contains(&AaaService::Dhcp));
+    let secrets = cfg
+        .ppp
+        .secrets
+        .iter()
+        .any(|x| !x.disabled && x.service == PppService::Ipoe);
+    for s in &cfg.ip.dhcp_server.servers {
+        let at = |f: &str| format!("ip.dhcp_server.servers[{}].{f}", s.id);
+        if s.use_radius != UseRadius::No && !radius_dhcp {
+            out.warn(
+                at("use_radius"),
+                s.id,
+                "no RADIUS",
+                "use_radius is on but no /radius server has service=dhcp: new clients wait for an answer that never comes",
+            );
+        }
+        if s.authorizes()
+            && s.use_radius != UseRadius::Yes
+            && s.ipoe_unknown == IpoeUnknown::Reject
+            && !secrets
+        {
+            out.warn(
+                at("ipoe_unknown"),
+                s.id,
+                "nobody",
+                "ipoe_unknown=reject and no ppp.secret with service=ipoe: no client gets an address",
+            );
+        }
+        if s.authorizes()
+            && s.relay.is_none()
+            && !s.relay_info_trusted
+            && s.ipoe_username.needs_agent()
+        {
+            out.warn(
+                at("ipoe_username"),
+                s.id,
+                "option 82",
+                format!(
+                    "ipoe_username={} needs option 82, but clients on the link are not believed (relay_info_trusted=no): only relayed requests carry it",
+                    s.ipoe_username
+                ),
+            );
+        }
+    }
+    for l in &cfg.ip.dhcp_server.leases {
+        if l.rate_limit.is_empty() {
+            continue;
+        }
+        let on_ipoe = cfg
+            .ip
+            .dhcp_server
+            .servers
+            .iter()
+            .filter(|s| l.server.as_ref().is_none_or(|n| *n == s.name))
+            .any(|s| s.sessions());
+        if !on_ipoe {
+            out.warn(
+                format!("ip.dhcp_server.leases[{}].rate_limit", l.id),
+                l.id,
+                "rate-limit",
+                "rate_limit applies only on an ipoe server (ipoe=yes or use_radius): here it does nothing",
+            );
+        }
+    }
 }
 
 /// The errors, as validation issues: the commit is refused while any exist.

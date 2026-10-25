@@ -304,7 +304,11 @@ impl View {
 
     #[inline(always)]
     pub fn mtu(&self) -> u16 {
-        if self.mtu == 0 { DEFAULT_MTU } else { self.mtu }
+        match (self.mtu, self.has(crate::ipoe::F_IPOE)) {
+            (0, true) => crate::ipoe::DEFAULT_MTU,
+            (0, false) => DEFAULT_MTU,
+            (m, _) => m,
+        }
     }
 
     /// VLAN tags on the access side (0, 1 or 2).
@@ -396,10 +400,14 @@ pub enum Stat {
     /// Downstream on a tagged uplink (not handled in XDP yet): to the
     /// kernel.
     DownTagged = 17,
+    /// IPoE (G4.3f): a subscriber's DHCP, to the daemon untouched.
+    IpoeDhcp = 18,
+    /// IPoE downstream, policed and counted, then forwarded by the kernel.
+    IpoeDownKernel = 19,
 }
 
 impl Stat {
-    pub const ALL: [Stat; 18] = [
+    pub const ALL: [Stat; 20] = [
         Stat::UpFast,
         Stat::UpKernel,
         Stat::Discovery,
@@ -418,8 +426,10 @@ impl Stat {
         Stat::DownPoliced,
         Stat::UpFib,
         Stat::DownTagged,
+        Stat::IpoeDhcp,
+        Stat::IpoeDownKernel,
     ];
-    pub const SLOTS: u32 = 18;
+    pub const SLOTS: u32 = 20;
 
     pub fn name(self) -> &'static str {
         match self {
@@ -441,6 +451,8 @@ impl Stat {
             Stat::DownPoliced => "down-policed",
             Stat::UpFib => "up-fib",
             Stat::DownTagged => "down-tagged",
+            Stat::IpoeDhcp => "ipoe-dhcp",
+            Stat::IpoeDownKernel => "ipoe-down-kernel",
         }
     }
 }
@@ -460,6 +472,17 @@ pub trait Sessions {
     fn by_v6(&self, dst: [u8; 16]) -> Option<u32>;
     /// Policer state of session `idx`, direction `dir` (0 up, 1 down).
     fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State>;
+    /// Whether `ifindex` has IPoE subscribers (`IPOE_PORTS`, G4.3f).
+    fn ipoe_port(&self, ifindex: u32) -> bool {
+        let _ = ifindex;
+        false
+    }
+}
+
+/// [`police`] upstream, for the IPoE path (`crate::ipoe`).
+#[inline(always)]
+pub(crate) fn police_up<L: Sessions>(l: &mut L, idx: u32, now: u64, bytes: u64) -> bool {
+    police(l, idx, 0, now, bytes)
 }
 
 /// Police `bytes` of session `idx` in direction `dir`. A missing state
@@ -575,6 +598,8 @@ pub struct UpSession {
     pub ip_len: u16,
     /// [`F_FAST_UP`]: may be forwarded without the kernel.
     pub fast: bool,
+    /// An IPoE subscriber (G4.3f): nothing to strip.
+    pub ipoe: bool,
 }
 
 /// The upstream verdict.
@@ -675,6 +700,7 @@ pub fn upstream<P: Packet + ?Sized, L: Sessions>(p: &P, ifindex: u32, l: &mut L,
         v6,
         ip_len: ip_len as u16,
         fast: s.has(F_FAST_UP),
+        ipoe: false,
     })
 }
 
@@ -746,6 +772,8 @@ pub struct DownSession {
     pub server_mac: [u8; 6],
     pub ip_len: u16,
     pub v6: bool,
+    /// An IPoE subscriber (G4.3f): the MACs are rewritten, nothing pushed.
+    pub ipoe: bool,
 }
 
 /// The downstream verdict.
@@ -757,6 +785,9 @@ pub enum Down {
     Kernel(Stat, u32),
     Drop(Stat, u32),
     Encap(DownSession),
+    /// Policed and to be counted as sent (packets, IP bytes), then the
+    /// kernel forwards it (IPoE, G4.3f).
+    Counted(Stat, u32, u16),
 }
 
 /// The session owning `dst`.
@@ -788,6 +819,15 @@ pub fn downstream<L: Sessions>(
         return Down::NotSub;
     }
     if !accepted && !s.has(F_FAST_DOWN) {
+        // IPoE: the kernel reaches the subscriber itself (no header to
+        // push), so the policer and the counters act here and the packet
+        // goes on through the kernel's firewall.
+        if s.has(crate::ipoe::F_IPOE) {
+            if !police(l, idx, 1, now, u64::from(ip_len)) {
+                return Down::Drop(Stat::DownPoliced, idx);
+            }
+            return Down::Counted(Stat::IpoeDownKernel, idx, ip_len);
+        }
         return Down::Kernel(Stat::DownKernel, idx);
     }
     if ttl <= 1 {
@@ -815,6 +855,7 @@ pub fn downstream<L: Sessions>(
         server_mac: s.server_mac,
         ip_len,
         v6,
+        ipoe: s.has(crate::ipoe::F_IPOE),
     })
 }
 
@@ -824,6 +865,9 @@ pub fn downstream<L: Sessions>(
 /// where the payload ends).
 #[inline(always)]
 pub fn encap<P: PacketHead + ?Sized>(p: &mut P, d: &DownSession) -> Option<()> {
+    if d.ipoe {
+        return crate::ipoe::rewrite(p, d);
+    }
     let [s0, s1] = d.sid.to_be_bytes();
     let [l0, l1] = d.ip_len.checked_add(2)?.to_be_bytes();
     let [p0, p1] = if d.v6 { PPP_IPV6 } else { PPP_IPV4 }.to_be_bytes();

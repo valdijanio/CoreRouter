@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use aya::Ebpf;
 use aya::maps::lpm_trie::{Key, LpmTrie};
 use aya::maps::{Array, HashMap, PerCpuArray};
+use corerouter_dataplane_ebpf_common::ipoe::{self, F_IPOE};
 use corerouter_dataplane_ebpf_common::maps as m;
 use corerouter_dataplane_ebpf_common::policer;
 use corerouter_dataplane_ebpf_common::pppoe::{
@@ -30,6 +31,25 @@ use super::{XdpState, monotonic_ns, rejected};
 pub(super) struct PppoeState {
     pub on: bool,
     sessions: BTreeMap<u32, Session>,
+    /// IPoE access ports (G4.3f, `IPOE_PORTS`): IPoE is on when any.
+    pub ipoe_ports: std::collections::BTreeSet<u32>,
+}
+
+impl PppoeState {
+    /// The session maps are needed (sized for sessions).
+    pub fn maps(&self) -> bool {
+        self.on || !self.ipoe_ports.is_empty()
+    }
+
+    /// The `SETTINGS` word of the subscriber switches.
+    pub fn word(&self) -> u64 {
+        let ipoe = if self.ipoe_ports.is_empty() {
+            0
+        } else {
+            ipoe::SETTINGS_BIT
+        };
+        u64::from(self.on) | ipoe
+    }
 }
 
 /// A session's counters, summed (`pppoe::C_*`).
@@ -114,6 +134,15 @@ fn invalid(idx: u32, s: &Session) -> Option<String> {
             "delegated prefix length {} not in 1..=64",
             s.pd_len
         ));
+    }
+    if s.flags & F_IPOE != 0 && (s.sid != ipoe::SID || s.vlan != 0 || s.inner_vlan != 0) {
+        return Some(
+            "an IPoE session has SESSION_ID 0 and no VLAN tag (attach XDP to the VLAN interface)"
+                .into(),
+        );
+    }
+    if s.flags & F_IPOE == 0 && s.sid == ipoe::SID {
+        return Some("a PPPoE session never has SESSION_ID 0 (RFC 2516 §5)".into());
     }
     if s.mtu != 0 && !(576..=9000).contains(&s.mtu) {
         return Some(format!("MTU {} not in 576..=9000", s.mtu));
@@ -203,11 +232,27 @@ fn clear(ebpf: &mut Ebpf, idx: u32, old: &Session) -> Result<(), HalError> {
 
 /// After a load: every known session back into the fresh maps.
 pub(super) fn refill(ebpf: &mut Ebpf, st: &PppoeState) -> Result<(), HalError> {
-    if !st.on {
+    if !st.maps() {
         return Ok(());
     }
     for (idx, s) in &st.sessions {
         put(ebpf, *idx, s, true)?;
+    }
+    Ok(())
+}
+
+/// `IPOE_PORTS` as `st` says (≤ `ipoe::PORTS_MAX` entries).
+pub(super) fn sync_ports(ebpf: &mut Ebpf, st: &PppoeState) -> Result<(), HalError> {
+    let mut ports = HashMap::<_, u32, u32>::try_from(the_map(ebpf, m::IPOE_PORTS)?)
+        .map_err(map_err("IPOE_PORTS map"))?;
+    let old: Vec<u32> = ports.keys().filter_map(Result::ok).collect();
+    for k in old.iter().filter(|k| !st.ipoe_ports.contains(k)) {
+        ports.remove(k).map_err(map_err("IPOE_PORTS remove"))?;
+    }
+    for k in st.ipoe_ports.iter().filter(|k| !old.contains(k)) {
+        ports
+            .insert(*k, 0, 0)
+            .map_err(map_err("IPOE_PORTS insert"))?;
     }
     Ok(())
 }
@@ -235,6 +280,32 @@ impl XdpState {
         self.pppoe.on
     }
 
+    /// The IPoE access ports (by ifindex, G4.3f); empty switches IPoE off.
+    /// The session maps are shared with PPPoE: sizing them reloads the
+    /// object, as [`XdpState::set_pppoe`].
+    pub fn set_ipoe(&mut self, ports: std::collections::BTreeSet<u32>) -> Result<(), HalError> {
+        if ports.len() > ipoe::PORTS_MAX as usize {
+            return Err(HalError::Rejected(format!(
+                "IPoE: at most {} access ports",
+                ipoe::PORTS_MAX
+            )));
+        }
+        if self.pppoe.ipoe_ports == ports {
+            return Ok(());
+        }
+        self.pppoe.ipoe_ports = ports;
+        let Some(cfg) = self.cfg.clone() else {
+            return Ok(());
+        };
+        let plan = corerouter_hal::xdp::XdpPlan::of(&cfg, &self.dynamic);
+        self.applied = corerouter_hal::xdp::XdpPlan::default();
+        self.reach(plan)
+    }
+
+    pub fn ipoe_ports(&self) -> &std::collections::BTreeSet<u32> {
+        &self.pppoe.ipoe_ports
+    }
+
     /// Sessions known (in the maps when loaded).
     pub fn pppoe_sessions(&self) -> usize {
         self.pppoe.sessions.len()
@@ -250,7 +321,7 @@ impl XdpState {
         }
         let old = self.pppoe.sessions.get(&idx).copied();
         let fresh = old.is_none_or(|o| o.key() != s.key());
-        if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.on) {
+        if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.maps()) {
             if let Some(o) = &old {
                 drop_keys(&mut l.ebpf, idx, o)?;
             }
@@ -265,7 +336,7 @@ impl XdpState {
         let Some(old) = self.pppoe.sessions.remove(&idx) else {
             return Ok(());
         };
-        if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.on) {
+        if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.maps()) {
             clear(&mut l.ebpf, idx, &old)?;
         }
         Ok(())
@@ -321,6 +392,9 @@ pub fn session_of(p: &corerouter_hal::pppoe::PppoeSession) -> Session {
     }
     if p.fast_down {
         flags |= pppoe::F_FAST_DOWN;
+    }
+    if p.ipoe {
+        flags |= F_IPOE;
     }
     if p.ipv6_prefix.is_some() {
         flags |= F_IPV6;
@@ -493,6 +567,7 @@ mod tests {
             m::PPPOE_POLICER,
             m::PPPOE_COUNTERS,
             m::PPPOE_STATS,
+            m::IPOE_PORTS,
         ] {
             assert!(obj.maps.contains_key(name), "map {name}");
         }
