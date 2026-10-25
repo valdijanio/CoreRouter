@@ -69,6 +69,18 @@ const MAX_LOGS: usize = 1000;
 const BURST: usize = 4096;
 /// Requests waiting in the channel: a caller gets "busy" past this.
 const MAX_QUEUED: usize = 200_000;
+/// How often requests called off by their caller leave the client.
+const SWEEP_EVERY: Duration = Duration::from_millis(200);
+/// Logins waiting for an answer from which accounting is held back: in a
+/// wave of reconnects the server is the bottleneck, and a subscriber
+/// waits for its login while an Accounting-Start can wait (Acct-Delay-Time
+/// tells the server how long, RFC 2866 §5.2). G4.3g: 100 000 logins
+/// against a 3000/s server shared it half and half with their own Starts.
+const AUTH_BUSY: usize = 64;
+/// Accounting is never held longer than this.
+const ACCT_HOLD_MS: u64 = 60_000;
+/// Nor more of it than this (then it goes anyway).
+const ACCT_HOLD_MAX: usize = 200_000;
 /// Socket receive buffer asked for (bytes).
 const RECV_BUFFER: usize = 4 << 20;
 /// Interims scheduled at most (sessions with a counter source).
@@ -94,7 +106,7 @@ pub struct LogLine {
 }
 
 enum Msg {
-    Auth(Box<AuthRequest>, AuthDone),
+    Auth(Box<AuthRequest>, AuthDone, Option<Arc<AtomicBool>>),
     Acct(Box<AcctRequest>, Option<Arc<dyn AcctSource>>),
     Datagram {
         lane: u64,
@@ -130,6 +142,26 @@ pub struct Aaa {
 }
 
 impl Aaa {
+    fn submit_auth(&self, req: AuthRequest, done: AuthDone, cancel: Option<Arc<AtomicBool>>) {
+        // The callback comes back inside the message if it cannot be
+        // posted; answer it here then.
+        let slot: Arc<Mutex<Option<AuthDone>>> = Arc::new(Mutex::new(Some(done)));
+        let inner = slot.clone();
+        let wrapped: AuthDone = Box::new(move |r| {
+            if let Some(d) = guard(&inner).take() {
+                d(r);
+            }
+        });
+        if !self.post(Msg::Auth(Box::new(req), wrapped, cancel))
+            && let Some(d) = guard(&slot).take()
+        {
+            d(AuthReply::failed(
+                AuthOutcome::Error,
+                "the radius service is busy or stopped",
+            ));
+        }
+    }
+
     /// Lines logged since the last call, oldest first.
     pub fn take_logs(&self) -> Vec<LogLine> {
         guard(&self.shared.logs).drain(..).collect()
@@ -159,23 +191,11 @@ impl Aaa {
 
 impl AaaBackend for Aaa {
     fn authenticate(&self, req: AuthRequest, done: AuthDone) {
-        // The callback comes back inside the message if it cannot be
-        // posted; answer it here then.
-        let slot: Arc<Mutex<Option<AuthDone>>> = Arc::new(Mutex::new(Some(done)));
-        let inner = slot.clone();
-        let wrapped: AuthDone = Box::new(move |r| {
-            if let Some(d) = guard(&inner).take() {
-                d(r);
-            }
-        });
-        if !self.post(Msg::Auth(Box::new(req), wrapped))
-            && let Some(d) = guard(&slot).take()
-        {
-            d(AuthReply::failed(
-                AuthOutcome::Error,
-                "the radius service is busy or stopped",
-            ));
-        }
+        self.submit_auth(req, done, None);
+    }
+
+    fn authenticate_until(&self, req: AuthRequest, done: AuthDone, cancel: Arc<AtomicBool>) {
+        self.submit_auth(req, done, Some(cancel));
     }
 
     fn account(&self, req: AcctRequest, source: Option<Arc<dyn AcctSource>>) -> Result<(), String> {
@@ -277,8 +297,16 @@ struct LaneSpec {
 }
 
 enum Waiting {
-    Auth { done: AuthDone, realm_user: String },
-    Acct { session: String, status: AcctStatus },
+    Auth {
+        done: AuthDone,
+        realm_user: String,
+        /// Set by the caller when nobody waits for the answer any more.
+        cancel: Option<Arc<AtomicBool>>,
+    },
+    Acct {
+        session: String,
+        status: AcctStatus,
+    },
 }
 
 struct Sock {
@@ -295,6 +323,11 @@ struct Lane {
     waiting: HashMap<RequestId, Waiting>,
     /// Bind failures already logged (once per server).
     bind_failed: Vec<bool>,
+    /// Logins waiting for an answer, counted each sweep: at
+    /// [`AUTH_BUSY`] or more the accounting waits in `deferred`.
+    auth_busy: bool,
+    /// Accounting held back while logins wait (with when it happened).
+    deferred: VecDeque<(AcctRequest, u64)>,
 }
 
 impl Lane {
@@ -316,6 +349,8 @@ impl Lane {
             spec,
             sockets: HashMap::new(),
             waiting: HashMap::new(),
+            auth_busy: false,
+            deferred: VecDeque::new(),
             bind_failed: vec![false; n],
         }
     }
@@ -837,6 +872,9 @@ struct Driver<'a> {
     incoming_error: Option<String>,
     buf: Vec<u8>,
     last_status: Instant,
+    /// When [`Driver::sweep_cancelled`] last ran, and what it called off.
+    last_sweep: Instant,
+    cancelled: u64,
 }
 
 struct DynAuth {
@@ -1095,7 +1133,16 @@ impl<'a> Driver<'a> {
         self.retiring.iter_mut().find(|l| l.id == id)
     }
 
-    fn auth(&mut self, req: AuthRequest, done: AuthDone) {
+    fn auth(&mut self, req: AuthRequest, done: AuthDone, cancel: Option<Arc<AtomicBool>>) {
+        if cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed)) {
+            // Called off while queued here: never sent.
+            self.cancelled += 1;
+            done(AuthReply::failed(
+                AuthOutcome::Error,
+                "cancelled: nobody waits for it",
+            ));
+            return;
+        }
         let now = self.ms();
         let service = req.service;
         let Some(lane) = self.lanes.get_mut(&service) else {
@@ -1119,6 +1166,7 @@ impl<'a> Driver<'a> {
                     Waiting::Auth {
                         done,
                         realm_user: user,
+                        cancel,
                     },
                 );
             }
@@ -1158,6 +1206,36 @@ impl<'a> Driver<'a> {
     }
 
     fn send_acct(&mut self, req: AcctRequest, now: u64) {
+        if let Some(lane) = self.lanes.get_mut(&req.service)
+            && lane.auth_busy
+            && lane.deferred.len() < ACCT_HOLD_MAX
+        {
+            lane.deferred.push_back((req, now));
+            return;
+        }
+        self.send_acct_at(req, now, now);
+    }
+
+    /// Accounting held back that may go now: all of it once the logins
+    /// calm down, the oldest past [`ACCT_HOLD_MS`] anyway.
+    fn release_acct(&mut self, now: u64) {
+        let mut go = Vec::new();
+        for lane in self.lanes.values_mut() {
+            while let Some((_, at)) = lane.deferred.front() {
+                if lane.auth_busy && now.saturating_sub(*at) < ACCT_HOLD_MS {
+                    break;
+                }
+                if let Some(x) = lane.deferred.pop_front() {
+                    go.push(x);
+                }
+            }
+        }
+        for (req, at) in go {
+            self.send_acct_at(req, at, now);
+        }
+    }
+
+    fn send_acct_at(&mut self, req: AcctRequest, event_ms: u64, now: u64) {
         let Some(lane) = self.lanes.get_mut(&req.service) else {
             return;
         };
@@ -1174,7 +1252,7 @@ impl<'a> Driver<'a> {
         };
         // A newer interim of the same session replaces a pending one.
         let supersede = (req.status == AcctStatus::InterimUpdate).then(|| key_of(&req.session_id));
-        match lane.client.accounting(attrs, supersede, now) {
+        match lane.client.accounting_at(attrs, supersede, event_ms, now) {
             Ok(id) => {
                 lane.waiting.insert(
                     id,
@@ -1268,8 +1346,48 @@ impl<'a> Driver<'a> {
     }
 
     /// Send what the clients want sent, handle their timers and events.
+    /// Requests their caller called off: out of the client (no more
+    /// retransmissions, the queue moves on) and answered (G4.3g).
+    fn sweep_cancelled(&mut self) {
+        let mut n = 0;
+        let mut lanes: Vec<&mut Lane> = self.lanes.values_mut().collect();
+        lanes.extend(self.retiring.iter_mut());
+        for lane in lanes {
+            lane.auth_busy = lane
+                .waiting
+                .values()
+                .filter(|w| matches!(w, Waiting::Auth { .. }))
+                .count()
+                >= AUTH_BUSY;
+            let off: Vec<RequestId> = lane
+                .waiting
+                .iter()
+                .filter(|(_, w)| {
+                    matches!(w, Waiting::Auth { cancel: Some(c), .. } if c.load(Ordering::Relaxed))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            for id in off {
+                lane.client.cancel(id);
+                if let Some(Waiting::Auth { done, .. }) = lane.waiting.remove(&id) {
+                    done(AuthReply::failed(
+                        AuthOutcome::Error,
+                        "cancelled: nobody waits for it",
+                    ));
+                    n += 1;
+                }
+            }
+        }
+        self.cancelled += n;
+    }
+
     fn turn(&mut self) {
         let now = self.ms();
+        if self.last_sweep.elapsed() >= SWEEP_EVERY {
+            self.last_sweep = Instant::now();
+            self.sweep_cancelled();
+            self.release_acct(now);
+        }
         for r in self.interims.due(now) {
             self.send_acct(r, now);
         }
@@ -1549,7 +1667,9 @@ fn event(dict: &Dictionary, lane: &mut Lane, ev: Event, logs: &mut Vec<(&'static
             request_authenticator,
             rtt_ms,
         } => match lane.waiting.remove(&request) {
-            Some(Waiting::Auth { done, realm_user }) => {
+            Some(Waiting::Auth {
+                done, realm_user, ..
+            }) => {
                 let outcome = match code {
                     Code::AccessAccept => AuthOutcome::Accept,
                     Code::AccessReject => AuthOutcome::Reject,
@@ -1587,7 +1707,9 @@ fn event(dict: &Dictionary, lane: &mut Lane, ev: Event, logs: &mut Vec<(&'static
             Some(Waiting::Acct { .. }) | None => {}
         },
         Event::Failed { request, reason } => match lane.waiting.remove(&request) {
-            Some(Waiting::Auth { done, realm_user }) => {
+            Some(Waiting::Auth {
+                done, realm_user, ..
+            }) => {
                 let tried = lane
                     .spec
                     .refs
@@ -1662,6 +1784,8 @@ pub fn run(aaa: &Aaa, inbox: &Inbox, stopping: &dyn Fn() -> bool) {
         incoming_error: None,
         buf: Vec::with_capacity(4096),
         last_status: Instant::now(),
+        last_sweep: Instant::now(),
+        cancelled: 0,
     };
     'outer: loop {
         let wait = d.next_wait();
@@ -1674,9 +1798,9 @@ pub fn run(aaa: &Aaa, inbox: &Inbox, stopping: &dyn Fn() -> bool) {
         let mut n = 0;
         while let Some(m) = next.take() {
             match m {
-                Msg::Auth(req, done) => {
+                Msg::Auth(req, done, cancel) => {
                     aaa.shared.queued.fetch_sub(1, Ordering::Relaxed);
-                    d.auth(*req, done);
+                    d.auth(*req, done, cancel);
                 }
                 Msg::Acct(req, src) => {
                     aaa.shared.queued.fetch_sub(1, Ordering::Relaxed);
@@ -1710,6 +1834,13 @@ pub fn run(aaa: &Aaa, inbox: &Inbox, stopping: &dyn Fn() -> bool) {
             break;
         }
     }
+    // Accounting held back goes before the end (what can be sent is).
+    for lane in d.lanes.values_mut() {
+        lane.auth_busy = false;
+    }
+    let now = d.ms();
+    d.release_acct(now);
+    d.turn();
     // Whoever still waits gets an answer.
     let lanes: Vec<Lane> = std::mem::take(&mut d.lanes)
         .into_values()
@@ -1726,7 +1857,7 @@ pub fn run(aaa: &Aaa, inbox: &Inbox, stopping: &dyn Fn() -> bool) {
         }
     }
     while let Ok(m) = rx.try_recv() {
-        if let Msg::Auth(_, done) = m {
+        if let Msg::Auth(_, done, _) = m {
             aaa.shared.queued.fetch_sub(1, Ordering::Relaxed);
             done(AuthReply::failed(
                 AuthOutcome::Error,

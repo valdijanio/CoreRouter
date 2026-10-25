@@ -4,7 +4,10 @@
 //! - The service's thread reads the access ports (`AF_PACKET` through
 //!   `hal-linux::pppoe_io`) and, without XDP, the slow path's `bng0`, and
 //!   hands each frame to a worker by the client's MAC (like RSS: a CPE always
-//!   lands on the same worker, its PADI, PADR and session alike).
+//!   lands on the same worker, its PADI, PADR and session alike). Its
+//!   channels also absorb a power cut's PADI burst. A socket filtered per
+//!   worker was measured and set aside: 24 000 sessions/s against this
+//!   reader's 57 900 with BNG Blaster (`docs/architecture.md`).
 //! - Each worker owns a `Bng`: its servers (a lane of every port's
 //!   SESSION_IDs), sessions, timers and RADIUS questions, and sends its own
 //!   frames. The active table, the history and the address pools are shared.
@@ -169,8 +172,10 @@ mod linux {
         plane_for: Vec<corerouter_model::IfName>,
         errors: Vec<String>,
         workers: Vec<SyncSender<Msg>>,
-        /// Frames dropped because a worker's queue was full.
+        /// Frames dropped because a worker's queue was full (this second;
+        /// `lost`: since the start).
         dropped: u64,
+        lost: u64,
     }
 
     pub(super) fn run(
@@ -204,6 +209,7 @@ mod linux {
             errors: Vec::new(),
             workers: Vec::new(),
             dropped: 0,
+            lost: 0,
         };
         let mut handles = Vec::new();
         for (lane, bng) in bngs.into_iter().enumerate() {
@@ -277,8 +283,13 @@ mod linux {
                 }
                 if d.dropped > 0 {
                     d.errors.push(format!("{} frames dropped: the PPPoE workers are behind", d.dropped));
+                    d.lost += d.dropped;
                     d.dropped = 0;
                 }
+                // interface.pppoe-server.monitor › rx_dropped: the queues'
+                // losses and the kernel's (a socket's buffer full).
+                guard(&shared).stats.rx_dropped =
+                    d.lost + d.ports.values().map(|o| o.port.dropped()).sum::<u64>();
                 if d.errors.is_empty() {
                     health.clear_error();
                 } else {
