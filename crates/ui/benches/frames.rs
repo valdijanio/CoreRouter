@@ -23,6 +23,9 @@ fn frames(c: &mut Criterion) {
     g.bench_function("routes_1m", |b| b.iter(|| f.frame()));
     let mut f = Frames::terminal(5_000, 200);
     g.bench_function("terminal_5000_lines", |b| b.iter(|| f.frame()));
+    // G4.8a: System › Resources (Overview) open.
+    let mut f = Frames::panel("resources");
+    g.bench_function("resources_overview", |b| b.iter(|| f.frame()));
     g.finish();
 }
 

@@ -139,6 +139,10 @@ mod port_tuning;
 #[cfg(target_os = "linux")]
 mod cpu_tuning;
 
+/// The host's OS log (G4.8b): `/dev/kmsg` and the journal.
+#[cfg(target_os = "linux")]
+pub mod oslog;
+
 /// IP › Firewall › XDP (G2.5a): the XDP filter's loader, maps and counters.
 #[cfg(target_os = "linux")]
 pub mod xdp;

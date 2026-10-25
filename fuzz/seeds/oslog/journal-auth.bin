@@ -1,0 +1,1 @@
+{"__CURSOR":"s=1;i=2","__REALTIME_TIMESTAMP":"1792800000000000","PRIORITY":"5","SYSLOG_FACILITY":"10","SYSLOG_IDENTIFIER":"sudo","_PID":"4321","_TRANSPORT":"syslog","MESSAGE":"pam_unix(sudo:session): session opened"}

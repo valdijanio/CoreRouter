@@ -283,6 +283,12 @@ impl Session {
         }
     }
 
+    /// A sampler of its own for the daemon's `health` service, which reads
+    /// with it outside the lock.
+    pub fn resource_sampler(&self) -> std::result::Result<Box<dyn ResourceSampler>, String> {
+        self.hal().resource_sampler()
+    }
+
     /// What the service should read next (someone asked lately?).
     pub fn resource_wanted(&mut self) -> Wanted {
         let now = self.clock_secs();
@@ -297,7 +303,14 @@ impl Session {
 
     /// Make sure the readings are fresh for a command, reading inline when
     /// no service keeps them so; and tell the service someone looks.
-    pub(crate) fn resource_refresh(&mut self, processes: bool) -> std::result::Result<(), String> {
+    /// `looking`: someone watches (a window, the readout): the service
+    /// goes to one reading a second for [`WANTED_SECS`]. The top bar's
+    /// health chip asks without looking.
+    pub(crate) fn resource_refresh(
+        &mut self,
+        processes: bool,
+        looking: bool,
+    ) -> std::result::Result<(), String> {
         let now = self.clock_secs();
         let sampler = match self.ext::<ResourceMonitor>() {
             Some(m) if m.sampler.is_some() || m.unavailable.is_some() => None,
@@ -311,7 +324,7 @@ impl Session {
             Some(Err(why)) => m.unavailable = Some(why),
             None => {}
         }
-        if let Some(now) = now {
+        if let Some(now) = now.filter(|_| looking) {
             m.wanted_until = now + WANTED_SECS;
             if processes {
                 m.procs_until = now + WANTED_SECS;

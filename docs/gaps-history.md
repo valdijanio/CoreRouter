@@ -121,3 +121,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-24 — G4.3c criado e feito (plano de dados PPPoE em XDP, Rust puro, escolha do usuário em 2026-10-24)
 - 2026-10-24 — G4.3j criado (RADIUS como serviço do sistema: `/radius`, `/radius incoming`, `/radius monitor`, `/ppp aaa`, serviço AAA no daemon e janela RADIUS)
 - 2026-10-24 — G4.3j feito (RADIUS como serviço do sistema)
+- 2026-10-24 — G4.3d em andamento (modelo e comandos PPP; serviço, janela e extras em PRs empilhados)
+- 2026-10-24 — G4.8, G4.8a, G4.8b criados (System › Resources e saúde; log do sistema operacional); G4.8c–G4.8e registrados
+- 2026-10-24 — G4.8a feito (System › Resources e saúde do roteador)
+- 2026-10-24 — G4.8b feito (log do sistema operacional); G4.8ba–G4.8bd registrados
