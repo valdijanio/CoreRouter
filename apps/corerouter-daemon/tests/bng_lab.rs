@@ -1286,6 +1286,7 @@ fn workers_compare(lab: &Lab, n: usize, s: &mut Summary) {
         // The schema's ceiling (bngblaster-config.json: 65535).
         cfg["sessions"]["start-rate"] = json!(n.min(65_535));
         cfg["session-traffic"] = json!({"autostart": false, "ipv4-pps": 0});
+        let lost0 = rx_dropped();
         let c0 = thread_cpu(pid);
         let t = Instant::now();
         let bl = Blaster::start(lab, &format!("workers-{want}"), &cfg, &[]);
@@ -1323,6 +1324,7 @@ fn workers_compare(lab: &Lab, n: usize, s: &mut Summary) {
             .map(|(k, v)| format!("{k} {v:.0}%"))
             .collect();
         let blaster = (b1 - b0) * 100.0 / wall;
+        let lost = rx_dropped().saturating_sub(lost0);
         match took {
             Some(secs) => s.put(
                 &sc,
@@ -1330,7 +1332,7 @@ fn workers_compare(lab: &Lab, n: usize, s: &mut Summary) {
                 n as f64 / secs,
                 "sessões/s",
                 &format!(
-                    "{secs:.1} s; workers {total:.0}% somados, leitor {reader:.0}%, BNG Blaster {blaster:.0}% de um núcleo ({})",
+                    "{secs:.1} s; workers {total:.0}% somados, leitor {reader:.0}%, BNG Blaster {blaster:.0}% de um núcleo ({}); quadros perdidos antes do BNG {lost}",
                     top.join(", ")
                 ),
             ),
@@ -1344,6 +1346,14 @@ fn workers_compare(lab: &Lab, n: usize, s: &mut Summary) {
         let _ = bl.stop(120 + n as u64 / 500);
         wait_long("teardown", 180, || active() == 0);
     }
+}
+
+/// Frames the PPPoE service lost before its BNG read them (its sockets'
+/// and its workers' queues, G4.3g).
+fn rx_dropped() -> u64 {
+    ok("interface.pppoe-server.monitor", json!({}))["rx_dropped"]
+        .as_u64()
+        .unwrap_or(0)
 }
 
 /// RADIUS timeouts and resends of the configured servers so far.
@@ -1399,6 +1409,7 @@ fn radius_wave(lab: &Lab, n: usize, capacity: u32, s: &mut Summary) {
         // The service reads the config once a second.
         std::thread::sleep(Duration::from_millis(1500));
         let (t0, r0) = radius_counts();
+        let lost0 = rx_dropped();
         let mut cfg = blaster_config(n, "rad", 0.0, None);
         // Every CPE at once, as after a power cut: BNG Blaster's own pacing
         // out of the way.
@@ -1417,9 +1428,10 @@ fn radius_wave(lab: &Lab, n: usize, capacity: u32, s: &mut Summary) {
         });
         let (t1, r1) = radius_counts();
         let note = format!(
-            "timeouts do RADIUS {}, retransmissões {}{}",
+            "timeouts do RADIUS {}, retransmissões {}, quadros perdidos antes do BNG {}{}",
             t1 - t0,
             r1 - r0,
+            rx_dropped().saturating_sub(lost0),
             if mode == "auto" {
                 format!(", pico do limite {peak}/s")
             } else {

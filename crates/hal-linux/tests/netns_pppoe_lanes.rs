@@ -237,3 +237,153 @@ fn each_worker_reads_its_own_clients() {
         "MEASURED pppoe lanes: {n} PADIs over a veth, CPU of the busiest receiving thread:{line}"
     );
 }
+
+/// A worker's work on one frame (spun, so it shows as CPU).
+fn work(us: u64) {
+    let t = Instant::now();
+    while t.elapsed() < Duration::from_micros(us) {
+        std::hint::spin_loop();
+    }
+}
+
+/// A power cut's burst against busy workers (G4.3g, VM round 4): 100 000
+/// PADIs written at full speed, each costing a worker 5 µs, in three
+/// shapes. Before: one reader thread drains the socket into a channel per
+/// worker. Round 4: each worker reads its own socket between frames. Now:
+/// each worker its own socket, drained into its own queue every 128
+/// frames. Prints the frames the workers got and how long it took.
+#[test]
+fn a_burst_against_busy_workers() {
+    if !in_netns() {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"]);
+    ip(&["link", "add", "bwa", "type", "veth", "peer", "name", "bwb"]);
+    ip(&["link", "set", "bwa", "up"]);
+    ip(&["link", "set", "bwb", "up"]);
+    let sender = PppoePort::open(&name("bwb"), &[], true).unwrap();
+    let n: u32 = 100_000;
+    let cost = 5;
+    let mut line = String::new();
+    for lanes in [1u16, 4] {
+        for shape in ["reader", "inline", "queue"] {
+            let got = Arc::new(AtomicU64::new(0));
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut threads = Vec::new();
+            let mut ports = Vec::new();
+            if shape == "reader" {
+                let mut port = PppoePort::open(&name("bwa"), &[], true).unwrap();
+                let mut txs = Vec::new();
+                for _ in 0..lanes {
+                    let (tx, rx) = sync_channel::<Vec<u8>>(1 << 16);
+                    txs.push(tx);
+                    let got = got.clone();
+                    threads.push(std::thread::spawn(move || {
+                        while let Ok(f) = rx.recv() {
+                            std::hint::black_box(&f);
+                            work(cost);
+                            got.fetch_add(1, Ordering::Relaxed);
+                        }
+                        0
+                    }));
+                }
+                let stop = stop.clone();
+                threads.push(std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        port.recv(|f| {
+                            let _ = txs[usize::from(lane_of(f, lanes))].try_send(f.to_vec());
+                        })
+                        .unwrap();
+                        wait(&port);
+                    }
+                    0
+                }));
+            } else {
+                for lane in 0..lanes {
+                    let mut port =
+                        PppoePort::open_lane(&name("bwa"), &[], true, lane, lanes).unwrap();
+                    let (got, stop) = (got.clone(), stop.clone());
+                    let queued = shape == "queue";
+                    threads.push(std::thread::spawn(move || {
+                        let mut q: std::collections::VecDeque<Vec<u8>> = Default::default();
+                        while !stop.load(Ordering::Relaxed) {
+                            if queued {
+                                while port.recv(|f| q.push_back(f.to_vec())).unwrap() > 0 {}
+                                let mut done = 0;
+                                while let Some(f) = q.pop_front() {
+                                    std::hint::black_box(&f);
+                                    work(cost);
+                                    got.fetch_add(1, Ordering::Relaxed);
+                                    done += 1;
+                                    if done % 128 == 0 {
+                                        while port.recv(|f| q.push_back(f.to_vec())).unwrap() > 0 {}
+                                    }
+                                }
+                            } else {
+                                port.recv(|f| {
+                                    std::hint::black_box(f);
+                                    work(cost);
+                                    got.fetch_add(1, Ordering::Relaxed);
+                                })
+                                .unwrap();
+                            }
+                            wait(&port);
+                        }
+                        port.dropped()
+                    }));
+                }
+                ports.push(());
+            }
+            let t = Instant::now();
+            for i in 0..n {
+                let _ = sender.send(&padi(i));
+            }
+            // Until the workers stop getting frames.
+            let mut last = u64::MAX;
+            while got.load(Ordering::Relaxed) != last {
+                last = got.load(Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            let took = t.elapsed().as_secs_f64() - 0.3;
+            stop.store(true, Ordering::Relaxed);
+            let kernel: u64 = threads.into_iter().map(|h| h.join().unwrap()).sum();
+            let g = got.load(Ordering::Relaxed);
+            line.push_str(&format!(
+                " {lanes} worker(s) {shape}: {g} of {n} in {took:.2} s (kernel counted {kernel} dropped);"
+            ));
+        }
+    }
+    println!("MEASURED pppoe burst, {cost} µs a frame:{line}");
+}
+
+/// How many PADIs one socket holds while its worker is busy (the burst a
+/// power cut sends): written at full speed, read only afterwards.
+#[test]
+fn a_busy_worker_socket_holds_a_burst() {
+    if !in_netns() {
+        return;
+    }
+    ip(&["link", "set", "lo", "up"]);
+    ip(&["link", "add", "bra", "type", "veth", "peer", "name", "brb"]);
+    ip(&["link", "set", "bra", "up"]);
+    ip(&["link", "set", "brb", "up"]);
+    let sender = PppoePort::open(&name("brb"), &[], true).unwrap();
+    let mut port = PppoePort::open_lane(&name("bra"), &[], true, 0, 1).unwrap();
+    let n = 100_000;
+    for i in 0..n {
+        let _ = sender.send(&padi(i));
+    }
+    std::thread::sleep(Duration::from_millis(200));
+    let mut got = 0usize;
+    loop {
+        let k = port.recv(|_| {}).unwrap();
+        if k == 0 {
+            break;
+        }
+        got += k;
+    }
+    println!(
+        "MEASURED pppoe burst: {got} of {n} PADIs held by one socket (rcvbuf {:?})",
+        port.rcvbuf()
+    );
+}

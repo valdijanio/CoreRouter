@@ -1010,6 +1010,11 @@ pub struct ServiceStats {
     pub ipv6_sessions: u64,
     pub delegated: u64,
     pub ipv6_dropped: u64,
+    /// G4.3g: discovery and session frames lost before the BNG read them
+    /// (a socket's or a worker's queue full: a PADI burst bigger than the
+    /// service holds).
+    #[serde(default)]
+    pub rx_dropped: u64,
 }
 
 #[cfg(test)]

@@ -161,6 +161,7 @@ struct Counts {
     padt_tx: u64,
     auth_accept: u64,
     auth_reject: u64,
+    rx_dropped: u64,
 }
 
 /// `ppp.why`'s memory of one worker: per user and per MAC.
@@ -390,6 +391,7 @@ impl PppBackend for Backend {
         st.padt_tx = sum(|c| c.padt_tx);
         st.auth_accept = sum(|c| c.auth_accept);
         st.auth_reject = sum(|c| c.auth_reject);
+        st.rx_dropped = sum(|c| c.rx_dropped);
         st.admission_rate = sh.lanes.iter().map(|l| l.admission_rate).sum();
         st.admission_reason = sh.lanes.iter().find_map(|l| l.admission_reason.clone());
         st.workers = sh.lanes.len().max(1) as u32;
@@ -666,6 +668,8 @@ const AUTO_SAMPLES: usize = 4096;
 /// more, and the latency the rate followed was the queue's).
 const AUTO_WINDOW_MS: f64 = 300.0;
 const AUTO_WINDOW_MIN: usize = 8;
+/// The window before the server's capacity is measured.
+const AUTO_WINDOW_START: usize = 64;
 
 pub(crate) struct Admission {
     pub rate: f64,
@@ -739,13 +743,20 @@ impl Admission {
     /// RADIUS questions this worker may have in flight (`lanes` workers
     /// share it): the bandwidth-delay product, the measured capacity times
     /// the base answer time (at least [`AUTO_WINDOW_MS`]), twice that while
-    /// still probing, as BBR's cwnd gain. Before any answer the rate stands
-    /// in for the capacity. Following the rate instead let the startup's
+    /// still probing, as BBR's cwnd gain; [`AUTO_WINDOW_START`] before any
+    /// answer. Following the rate instead let the startup's
     /// doubling put 3.6× the server's capacity in flight (G4.3g, VM round
     /// 3: a 5503/s limit against ~1500 logins/s).
     fn window(&self, lanes: u16) -> usize {
         let cap = self.capacity();
-        let bw = if cap > 0.0 { cap } else { self.rate };
+        if cap == 0.0 {
+            // Nothing measured yet: a small first window, as TCP's and
+            // BBR's, that the first answers open. The starting rate's
+            // (1000/s × 0.6 s) queued 2 s at a 300/s server, past the
+            // client's 1.1 s timeout: a copy of every login.
+            return (AUTO_WINDOW_START / usize::from(lanes.max(1))).max(AUTO_WINDOW_MIN);
+        }
+        let bw = cap;
         let gain = if self.startup { 2.0 } else { 1.0 };
         let base = self.base_ms().map_or(0.0, |b| b as f64).max(AUTO_WINDOW_MS);
         let share = bw / f64::from(lanes.max(1));
@@ -1293,6 +1304,12 @@ impl Bng {
     /// The worker of slow-path address `ip`, if a session holds it.
     pub(crate) fn route_lane_in(routes: &Routes, ip: Ipv4Addr) -> Option<u16> {
         routes.read().ok().and_then(|r| r.get(&ip).copied())
+    }
+
+    /// Frames this worker's sockets and queue lost so far (published with
+    /// the counters).
+    pub(crate) fn set_rx_dropped(&mut self, n: u64) {
+        self.counts.rx_dropped = n;
     }
 
     /// The worker of a frame from a client (its source MAC; RSS-like):
@@ -3281,16 +3298,20 @@ mod admission_tests {
         let mut b = Admission::default();
         second(&mut b, 0, 0, false, true);
         assert_eq!(b.rate, AUTO_START + AUTO_STEP);
-        // The window: the rate (no capacity measured yet) times the base
-        // answer time (at least 300 ms), twice while probing, shared by the
-        // workers; the backlog: 10 s of capacity.
+        // The window: a small one before any answer; then the capacity
+        // times the base answer time (at least 300 ms), twice while
+        // probing, shared by the workers; the backlog: 10 s of capacity.
         b.rate = 2000.0;
+        assert_eq!(b.window(1), AUTO_WINDOW_START);
+        assert_eq!(b.window(4), AUTO_WINDOW_START / 4);
+        b.delivered.push_back(2000.0);
         b.startup = false;
         assert_eq!(b.window(1), 600);
         assert_eq!(b.window(4), 150);
         b.startup = true;
         assert_eq!(b.window(1), 1200);
         b.startup = false;
+        b.delivered.clear();
         assert_eq!(b.backlog(1), 20_000);
         b.rate = AUTO_MIN;
         assert_eq!(b.window(8), AUTO_WINDOW_MIN);

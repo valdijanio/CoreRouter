@@ -36,7 +36,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use corerouter_model::IfName;
 use nix::errno::Errno;
-use nix::sys::socket::{LinkAddr, MsgFlags, bind, recvmsg, send};
+use nix::sys::socket::{ControlMessageOwned, LinkAddr, MsgFlags, bind, recvmsg, send};
 use socket2::{Domain, Protocol, SockFilter, Socket, Type};
 
 use crate::l2::{if_info, io_err};
@@ -76,8 +76,21 @@ const ACCEPT: u32 = 0x0004_0000;
 type Ins = (u16, u8, u8, u32);
 
 /// The filter of one socket: `vlan` = `None` keeps untagged frames only,
-/// `Some(vid)` keeps frames whose stripped tag has that VLAN id.
+/// `Some(vid)` keeps frames whose stripped tag has that VLAN id. The copies
+/// of what this host sends (`PACKET_OUTGOING`) never reach the BNG: on an
+/// access port they are its own PADOs, PADSs and session frames, and with
+/// the workers' filters they would all land on the worker of the BNG's MAC.
 fn program(vlan: Option<u16>) -> Vec<Ins> {
+    let mut p = vec![
+        (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_PKTTYPE),
+        (JEQ_K, 0, 1, u32::from(PACKET_OUTGOING)),
+        (RET_K, 0, 0, 0),
+    ];
+    p.extend(by_vlan(vlan));
+    p
+}
+
+fn by_vlan(vlan: Option<u16>) -> Vec<Ins> {
     match vlan {
         None => vec![
             (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT),
@@ -152,6 +165,9 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
     sock.set_nonblocking(true)?;
     crate::l2::rcvbuf(&sock, RCVBUF);
     sock.attach_filter(&filter(prog))?;
+    // The kernel's count of frames it dropped on this socket (buffer full),
+    // with each frame read: `PppoePort::dropped`.
+    let _ = nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::RxqOvfl, &1);
     bind(sock.as_raw_fd(), link).map_err(io_err)?;
     Ok(sock)
 }
@@ -159,6 +175,8 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
 struct Side {
     sock: Socket,
     vlan: Option<u16>,
+    /// Frames the kernel dropped on this socket so far (`SO_RXQ_OVFL`).
+    dropped: u32,
 }
 
 /// The PPPoE sockets of one access interface.
@@ -211,6 +229,7 @@ impl PppoePort {
                 sides.push(Side {
                     sock: bound(&info.link, proto, &lane_program(program(vlan), lane, lanes))?,
                     vlan,
+                    dropped: 0,
                 });
             }
         }
@@ -231,6 +250,12 @@ impl PppoePort {
 
     pub fn name(&self) -> &IfName {
         &self.name
+    }
+
+    /// Frames the kernel dropped on this port's sockets because their
+    /// buffers were full (as of the last frame read from each).
+    pub fn dropped(&self) -> u64 {
+        self.sides.iter().map(|s| u64::from(s.dropped)).sum()
     }
 
     /// The smallest receive buffer the kernel gave this port's sockets, and
@@ -269,21 +294,29 @@ impl PppoePort {
         let mut total = 0;
         let mut framed = Vec::with_capacity(FRAME_MAX + 4);
         for k in 0..n {
-            let Some(side) = self.sides.get((first + k) % n) else {
+            let Some(side) = self.sides.get_mut((first + k) % n) else {
                 continue;
             };
             for _ in 0..BUDGET {
                 let mut iov = [IoSliceMut::new(&mut self.buf)];
+                let mut cmsg = nix::cmsg_space!(u32);
                 let msg = match recvmsg::<LinkAddr>(
                     side.sock.as_raw_fd(),
                     &mut iov,
-                    None,
+                    Some(&mut cmsg),
                     MsgFlags::MSG_DONTWAIT,
                 ) {
                     Ok(m) => m,
                     Err(Errno::EAGAIN | Errno::EINTR) => break,
                     Err(e) => return Err(io_err(e)),
                 };
+                if let Ok(cmsgs) = msg.cmsgs() {
+                    for c in cmsgs {
+                        if let ControlMessageOwned::RxqOvfl(d) = c {
+                            side.dropped = d;
+                        }
+                    }
+                }
                 let len = msg.bytes;
                 let Some(frame) = self.buf.get(..len) else {
                     continue;
@@ -724,6 +757,18 @@ mod tests {
         );
         assert_eq!(run(&v100, Some(101), 0), 0);
         assert_eq!(run(&v100, None, 0), 0);
+    }
+
+    #[test]
+    fn the_ports_never_read_back_what_the_bng_sent() {
+        for vlan in [None, Some(100)] {
+            for lanes in [1u16, 4] {
+                for lane in 0..lanes {
+                    let p = lane_program(program(vlan), lane, lanes);
+                    assert_eq!(run_frame(&p, vlan, PACKET_OUTGOING, &[0u8; 60]), 0);
+                }
+            }
+        }
     }
 
     #[test]

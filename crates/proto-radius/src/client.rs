@@ -436,6 +436,13 @@ pub struct Client {
     slots: Vec<Option<Pending>>,
     free_slots: Vec<u32>,
     next_gen: u32,
+    /// Stamps every (re)transmission, client-wide: a timer or a queued
+    /// transmission names (slot, seq), and a slot is reused by the next
+    /// request. A per-slot count restarted at 0 and let a finished
+    /// request's timer fire on the next one in its slot: logins resent
+    /// after 0–250 ms instead of ~1.1 s (G4.3g, one copy of almost every
+    /// login in a wave).
+    next_seq: u32,
     timers: BinaryHeap<Reverse<(u64, u32, u32)>>,
     transmits: VecDeque<(u32, u32)>,
     events: VecDeque<Event>,
@@ -489,6 +496,7 @@ impl Client {
             slots: Vec::new(),
             free_slots: Vec::new(),
             next_gen: 1,
+            next_seq: 1,
             timers: BinaryHeap::new(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
@@ -843,7 +851,14 @@ impl Client {
     }
 
     /// Queue a (re)transmission and arm its timer.
+    fn bump_seq(&mut self) -> u32 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        seq
+    }
+
     fn schedule_tx(&mut self, r: RequestId, now_ms: u64) {
+        let seq = self.bump_seq();
         let Some(p) = self.get_mut(r) else {
             return;
         };
@@ -852,8 +867,7 @@ impl Client {
         };
         f.tx += 1;
         f.last_tx_ms = now_ms;
-        p.seq = p.seq.wrapping_add(1);
-        let seq = p.seq;
+        p.seq = seq;
         let deadline = now_ms.saturating_add(f.rt_ms);
         self.timers.push(Reverse((deadline, r.slot(), seq)));
         self.transmits.push_back((r.slot(), seq));
@@ -1083,6 +1097,7 @@ impl Client {
     /// take it.
     fn release_id(&mut self, r: RequestId) {
         let slot = r.slot();
+        let seq = self.bump_seq();
         let Some(p) = self.get_mut(r) else {
             return;
         };
@@ -1092,7 +1107,7 @@ impl Client {
             // entries whose request is gone or already flying).
             return;
         };
-        p.seq = p.seq.wrapping_add(1);
+        p.seq = seq;
         if let Some(s) = self.servers.get_mut(server) {
             if let Some(t) = s.sockets.get_mut(usize::from(f.socket)) {
                 t.release(f.id, slot);

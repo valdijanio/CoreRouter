@@ -995,11 +995,242 @@ impl AaaBackend for SlowAaa {
     }
 }
 
+/// The wave's RADIUS, on the lab's clock.
+trait WaveAaa: AaaBackend {
+    fn pump(&self, now: u64);
+    /// Requests the client gave up on (MRC/MRD), and retransmissions.
+    fn counts(&self) -> (u64, u64);
+    /// One line of state, for `WAVE_TRACE`.
+    fn trace(&self) -> String {
+        String::new()
+    }
+}
+
+impl WaveAaa for SlowAaa {
+    fn pump(&self, now: u64) {
+        SlowAaa::pump(self, now);
+    }
+
+    fn counts(&self) -> (u64, u64) {
+        (self.st.lock().unwrap().timeouts, 0)
+    }
+}
+
+/// The wave's RADIUS with the real client in front (G4.3g, VM round 4:
+/// the simple model above has no retransmissions): `proto_radius::Client`
+/// as `radius_aaa` runs it (adaptive RTO, MRD, a server dead after three
+/// failures, accounting held while [`AUTH_BUSY`] logins are out,
+/// cancelled logins dropped), against `TestServer` behind the lab's queue:
+/// `cap` requests a second, at most two seconds of work held, a copy of a
+/// request it holds dropped (RFC 5080 §2.2.2, as FreeRADIUS).
+struct RealAaa {
+    cap: f64,
+    st: Mutex<RealState>,
+}
+
+struct RealState {
+    client: corerouter_proto_radius::client::Client,
+    server: corerouter_proto_radius::testserver::TestServer,
+    logins: HashMap<corerouter_proto_radius::client::RequestId, (AuthDone, Option<Arc<std::sync::atomic::AtomicBool>>)>,
+    held: std::collections::VecDeque<(String, u64)>,
+    queue: std::collections::VecDeque<(corerouter_proto_radius::client::SocketKey, std::net::SocketAddr, Vec<u8>)>,
+    holding: std::collections::HashSet<(u16, u8, [u8; 16])>,
+    tokens: f64,
+    at: u64,
+    now: u64,
+}
+
+const AUTH_ADDR: &str = "192.0.2.1:1812";
+const ACCT_ADDR: &str = "192.0.2.1:1813";
+
+impl RealAaa {
+    fn new(cap: f64, users: usize) -> Self {
+        use corerouter_proto_radius::client::{Client as Radius, ClientConfig as RadiusConfig, ServerConfig};
+        let mut server = corerouter_proto_radius::testserver::TestServer::new(b"lab", 7);
+        for i in 0..users {
+            server.add_user(&format!("r{i}"), "x", corerouter_proto_radius::packet::AttrList::new());
+        }
+        let client = Radius::new(
+            RadiusConfig { require_message_authenticator: false, ..RadiusConfig::default() },
+            vec![
+                ServerConfig::auth(AUTH_ADDR.parse().unwrap(), b"lab"),
+                ServerConfig::acct(ACCT_ADDR.parse().unwrap(), b"lab"),
+            ],
+            [3; 32],
+        );
+        Self {
+            cap,
+            st: Mutex::new(RealState {
+                client,
+                server,
+                logins: HashMap::new(),
+                held: Default::default(),
+                queue: Default::default(),
+                holding: Default::default(),
+                tokens: 0.0,
+                at: 0,
+                now: 0,
+            }),
+        }
+    }
+
+    fn login(&self, req: AuthRequest, done: AuthDone, cancel: Option<Arc<std::sync::atomic::AtomicBool>>) {
+        let mut st = self.st.lock().unwrap();
+        let now = st.now;
+        let mut l = corerouter_proto_radius::packet::AttrList::new();
+        corerouter_proto_radius::packet::PushAttr::push_text(&mut l, corerouter_proto_radius::packet::attr::USER_NAME, &req.user).unwrap();
+        match st.client.access(l, Some(b"x"), now) {
+            Ok(id) => {
+                st.logins.insert(id, (done, cancel));
+            }
+            Err(e) => {
+                drop(st);
+                done(AuthReply::failed(AuthOutcome::Error, e.to_string()));
+            }
+        }
+    }
+
+    fn send_acct(st: &mut RealState, session: &str, event: u64, now: u64) {
+        let r = corerouter_proto_radius::acct::Record::new(corerouter_proto_radius::acct::StatusType::Start, session);
+        let _ = st.client.accounting_at(r.encode().unwrap(), None, event, now);
+    }
+}
+
+impl AaaBackend for RealAaa {
+    fn authenticate(&self, req: AuthRequest, done: AuthDone) {
+        self.login(req, done, None);
+    }
+
+    fn authenticate_until(&self, req: AuthRequest, done: AuthDone, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        self.login(req, done, Some(cancel));
+    }
+
+    fn account(&self, req: AcctRequest, _: Option<Arc<dyn AcctSource>>) -> Result<(), String> {
+        let mut st = self.st.lock().unwrap();
+        let now = st.now;
+        if st.logins.len() >= AUTH_BUSY as usize {
+            st.held.push_back((req.session_id, now));
+        } else {
+            Self::send_acct(&mut st, &req.session_id, now, now);
+        }
+        Ok(())
+    }
+
+    fn register_owner(&self, _: Arc<dyn SessionOwner>) {}
+
+    fn status(&self) -> RadiusStatus {
+        RadiusStatus::default()
+    }
+}
+
+impl WaveAaa for RealAaa {
+    fn pump(&self, now: u64) {
+        use corerouter_proto_radius::client::Event;
+        let mut answers: Vec<(AuthDone, AuthReply)> = Vec::new();
+        {
+            let mut st = self.st.lock().unwrap();
+            let st = &mut *st;
+            st.now = now;
+            // Called-off logins leave the client (radius_aaa's sweep).
+            let off: Vec<_> = st
+                .logins
+                .iter()
+                .filter(|(_, (_, c))| c.as_ref().is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed)))
+                .map(|(id, _)| *id)
+                .collect();
+            for id in off {
+                st.client.cancel(id);
+                if let Some((done, _)) = st.logins.remove(&id) {
+                    answers.push((done, AuthReply::failed(AuthOutcome::Error, "cancelled")));
+                }
+            }
+            // Accounting held behind the logins (radius_aaa::release_acct).
+            while let Some((sid, at)) = st.held.front().cloned() {
+                if st.logins.len() >= AUTH_BUSY as usize && now.saturating_sub(at) < 60_000 {
+                    break;
+                }
+                st.held.pop_front();
+                Self::send_acct(st, &sid, at, now);
+            }
+            st.client.handle_timeout(now);
+            let mut buf = Vec::new();
+            let bound = (self.cap * 2.0) as usize;
+            while let Some(t) = st.client.poll_transmit(&mut buf) {
+                let (Some(id), Some(a)) = (buf.get(1).copied(), buf.get(4..20)) else { continue };
+                let key = (t.from.socket * 2 + t.from.server as u16, id, <[u8; 16]>::try_from(a).unwrap());
+                if st.queue.len() >= bound || !st.holding.insert(key) {
+                    continue;
+                }
+                st.queue.push_back((t.from, t.dest, buf.clone()));
+            }
+            let dt = now.saturating_sub(st.at) as f64 / 1000.0;
+            st.at = now;
+            st.tokens = (st.tokens + dt * self.cap).min(self.cap / 10.0);
+            while st.tokens >= 1.0 {
+                let Some((from, _dest, data)) = st.queue.pop_front() else { break };
+                st.tokens -= 1.0;
+                if let (Some(id), Some(a)) = (data.get(1).copied(), data.get(4..20)) {
+                    st.holding.remove(&(from.socket * 2 + from.server as u16, id, <[u8; 16]>::try_from(a).unwrap()));
+                }
+                let me: std::net::SocketAddr = format!("10.0.0.1:{}", 20_000 + from.socket + 1000 * from.server as u16).parse().unwrap();
+                let dest: std::net::SocketAddr = if from.server == 0 { AUTH_ADDR } else { ACCT_ADDR }.parse().unwrap();
+                if let Some(r) = st.server.handle(me, &data, now) {
+                    let _ = st.client.handle_input(from, dest, &r.bytes, now);
+                }
+            }
+            st.server.accounting.clear();
+            while let Some(e) = st.client.poll_event() {
+                match e {
+                    Event::Response { request, .. } => {
+                        if let Some((done, _)) = st.logins.remove(&request) {
+                            let mut r = AuthReply::failed(AuthOutcome::Accept, "");
+                            r.message = None;
+                            answers.push((done, r));
+                        }
+                    }
+                    Event::Failed { request, .. } => {
+                        if let Some((done, _)) = st.logins.remove(&request) {
+                            answers.push((done, AuthReply::failed(AuthOutcome::Timeout, "no answer")));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (d, r) in answers {
+            d(r);
+        }
+    }
+
+    fn trace(&self) -> String {
+        let st = self.st.lock().unwrap();
+        let s = |i| st.client.stats(i).map(|s| (s.timeouts, s.resends, s.rto_ms)).unwrap_or_default();
+        format!(
+            "logins out {}, accounting held {}, server queue {}; auth (timeouts, resends, rto) {:?}, acct {:?}",
+            st.logins.len(),
+            st.held.len(),
+            st.queue.len(),
+            s(0),
+            s(1)
+        )
+    }
+
+    fn counts(&self) -> (u64, u64) {
+        let st = self.st.lock().unwrap();
+        (0..2).filter_map(|i| st.client.stats(i)).fold((0, 0), |(t, r), s| (t + s.timeouts, r + s.resends))
+    }
+}
+
 /// `n` CPEs at once against a `cap`/s RADIUS with `rate` (a number or
 /// "auto"): seconds until all are up (None: not in `limit_s`) and the
 /// logins the client gave up on.
 fn wave(n: usize, cap: f64, rate: serde_json::Value, limit_s: u64) -> (Option<f64>, u64) {
-    let aaa = Arc::new(SlowAaa::new(cap));
+    let r = wave_with(Arc::new(SlowAaa::new(cap)), n, rate, limit_s);
+    (r.0, r.1)
+}
+
+/// [`wave`] against `aaa`: also the retransmissions.
+fn wave_with<A: WaveAaa + 'static>(aaa: Arc<A>, n: usize, rate: serde_json::Value, limit_s: u64) -> (Option<f64>, u64, u64) {
     let mut srv = server(serde_json::json!({}));
     match rate.as_str() {
         Some("auto") => srv.new_session_rate_auto = true,
@@ -1045,14 +1276,18 @@ fn wave(n: usize, cap: f64, rate: serde_json::Value, limit_s: u64) -> (Option<f6
         }
         lab.run(1, 50);
         aaa.pump(lab.now);
+        if std::env::var_os("WAVE_TRACE").is_some() && (lab.now - t0) % 1000 < 50 {
+            let st = lab.backend().stats();
+            eprintln!("t={:>5} up={:>6} rate={:>5} {:?} | {}", lab.now - t0, lab.ups(), st.admission_rate, st.admission_reason, aaa.trace());
+        }
         if lab.ups() == n {
-            let st = aaa.st.lock().unwrap();
-            return (Some((lab.now - t0) as f64 / 1000.0), st.timeouts);
+            let (t, r) = aaa.counts();
+            return (Some((lab.now - t0) as f64 / 1000.0), t, r);
         }
     }
-    let st = aaa.st.lock().unwrap();
+    let (t, r) = aaa.counts();
     eprintln!("wave {rate}: {} of {n} up; stats {:?}", lab.ups(), lab.backend().stats());
-    (None, st.timeouts)
+    (None, t, r)
 }
 
 #[test]
@@ -1105,4 +1340,42 @@ fn wave_of_the_vm_round() {
     let (t, timeouts) = (auto.0.expect("auto brings every CPE back"), auto.1);
     assert!(off.0.is_none_or(|o| t <= o), "auto no slower than no limit: {t} s against {off:?}");
     assert!(timeouts <= off.1, "and with fewer timeouts: {timeouts} against {}", off.1);
+}
+
+/// [`wave_of_the_vm_round`] with the real RADIUS client in front of the
+/// server ([`RealAaa`]): retransmissions, adaptive RTO, MRD. By hand,
+/// release: `cargo test --release -p corerouter-daemon --bin
+/// corerouter-daemon wave_with_the_real_client -- --ignored --nocapture`.
+#[test]
+#[ignore = "a minute of CPU; by hand in release"]
+fn wave_with_the_real_client() {
+    let (n, cap) = (60_000, 3000.0);
+    let run = |rate: serde_json::Value| wave_with(Arc::new(RealAaa::new(cap, n)), n, rate, 600);
+    let off = run(serde_json::json!(0));
+    let fixed = run(serde_json::json!(2000));
+    let auto = run(serde_json::json!("auto"));
+    eprintln!(
+        "real client, wave of {n} against {cap}/s (up in s, timeouts, resends): off {off:?}, fixed 2000 {fixed:?}, auto {auto:?}"
+    );
+    // Before the client's timers were fixed (a finished request's timer
+    // fired on the next one in its slot): auto 25.3 s, 429 timeouts, 66 205
+    // resends; now 20.1 s, 0, 0.
+    let t = auto.0.expect("auto brings every CPE back");
+    assert!(off.0.is_none_or(|o| t <= o * 1.05), "auto no slower than no limit: {t} s against {off:?}");
+    assert!(fixed.0.is_none_or(|f| t <= f), "nor than fixed 2000: {fixed:?}");
+    assert_eq!(auto.1, 0, "no login timed out: {auto:?}");
+    assert!(auto.2 * 10 <= off.2.max(10), "and next to no copies: {auto:?} against {off:?}");
+}
+
+/// `new_session_rate=auto` with the real RADIUS client: a wave of 6000
+/// against a 300/s server comes up at the server's pace, with no login
+/// timed out and next to no copies sent.
+#[test]
+fn auto_keeps_the_real_client_from_resending() {
+    let (n, cap) = (6000, 300.0);
+    let (t, timeouts, resends) = wave_with(Arc::new(RealAaa::new(cap, n)), n, serde_json::json!("auto"), 300);
+    let t = t.expect("auto brings every CPE back");
+    assert!(t <= n as f64 / cap * 1.35, "{t} s for an ideal {} s", n as f64 / cap);
+    assert_eq!(timeouts, 0);
+    assert!(resends <= n as u64 / 100, "{resends} copies for {n} logins");
 }

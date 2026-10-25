@@ -920,6 +920,21 @@ sockets AF_PACKET em cada porta, com um filtro BPF clássico que guarda só os c
   O leitor é um gargalo serial que não melhora com os workers. Na VM, ele ficou a 56% de um
   núcleo com 54 mil sessões/s. O custo do filtro é N programas de ~8 instruções por quadro,
   no softirq e antes da cópia.
+- **A fila de cada worker** (depois da rodada 4 da VM). O socket por worker sem fila caiu de
+  57,9 mil para 22,4 mil sessões/s com 6 workers: um socket de 4 MiB guarda ~8700 PADIs, e o
+  BNG Blaster manda 100 mil em 1,5 s. O canal do leitor escondia isso. Agora cada worker passa
+  o que os sockets têm para uma fila própria (até 65 536 quadros) a cada 128 quadros atendidos.
+  Com 100 mil PADIs na velocidade máxima a 5 µs por quadro (`a_burst_against_busy_workers`,
+  **medido**):
+
+  | workers | leitor + canal | socket lido entre quadros | socket + fila |
+  |---|---:|---:|---:|
+  | 1 | 77 169 | 18 756 | 100 000 |
+  | 4 | 100 000 | 95 285 | 100 000 |
+
+  As perdas do kernel por socket (`SO_RXQ_OVFL`) e as da fila aparecem no
+  `interface.pppoe-server.monitor` (`rx_dropped`). O filtro também descarta as cópias de
+  saída (`PACKET_OUTGOING`), que iriam todas ao worker do MAC do BNG.
 
 **Fica no leitor:** o caminho lento (`bng0`), distribuído pelo endereço do assinante.
 

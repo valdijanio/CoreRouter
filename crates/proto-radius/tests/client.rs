@@ -525,3 +525,21 @@ fn slowing_server_gets_an_adaptive_first_timeout() {
         st.rto_ms
     );
 }
+
+/// G4.3g: the timer of an answered request must not fire on the next
+/// request that takes its slot. Logins one after another, each answered in
+/// 100 ms, far inside the 1.1 s timeout: not one is sent twice.
+#[test]
+fn an_answered_request_leaves_no_timer_behind() {
+    let (a, sa) = auth_server("10.0.0.10:1812");
+    let mut net = Net::new(vec![(a, sa)], 1);
+    net.server(a).script.delay_ms = 100;
+    let mut c = client(vec![ServerConfig::auth(a, SECRET)]);
+    let mut log = Log::default();
+    for _ in 0..40 {
+        let r = c.access(user("ana"), Some(b"segredo"), net.now).unwrap();
+        log.run(&mut net, &mut c, 150);
+        assert_eq!(log.response(r).unwrap().0, Code::AccessAccept);
+    }
+    assert_eq!(c.stats(0).unwrap().resends, 0, "a copy before its timeout");
+}

@@ -83,7 +83,7 @@ fn run(
 /// The driver (Linux: `AF_PACKET`, `poll`, the slow path's netlink).
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
 
     use std::os::fd::{AsFd, BorrowedFd};
     use std::os::unix::net::UnixDatagram;
@@ -106,11 +106,18 @@ mod linux {
     /// The config, the counters and the limits: once a second.
     const SECOND: Duration = Duration::from_secs(1);
     const IDLE: Duration = Duration::from_millis(500);
-    /// Frames queued for one worker at most (a burst past it is dropped:
-    /// the CPEs retransmit, RFC 2516 §5 and RFC 1661 §4.6).
+    /// Frames queued for one worker at most, its own sockets' and the
+    /// reader's messages alike (a burst past it is dropped: the CPEs
+    /// retransmit, RFC 2516 §5 and RFC 1661 §4.6).
     const QUEUE: usize = 1 << 16;
-    /// Messages a worker takes in a row before its timers and RADIUS.
+    /// Messages, and frames, a worker takes in a row before its timers,
+    /// RADIUS and sends.
     const BUDGET: usize = 512;
+    /// Frames handled between two reads of the sockets: a few milliseconds
+    /// of work, while a socket holds ~8700 PADIs. Against a 100 000-PADI
+    /// burst at 5 µs a frame, 1 worker reading between frames got 18 756;
+    /// with this queue, all of them (`netns_pppoe_lanes`, **medido**).
+    const REFILL: usize = 128;
 
     fn origin() -> Instant {
         static START: OnceLock<Instant> = OnceLock::new();
@@ -330,8 +337,19 @@ mod linux {
     /// One worker: its BNG, its own sockets on the access ports (the
     /// kernel's filter hands it its clients' frames), the reader's
     /// messages (config, slow path) behind a doorbell.
+    ///
+    /// The frames wait in the worker's own queue ([`QUEUE`]), refilled from
+    /// the sockets every [`REFILL`] frames handled: a socket holds ~8700
+    /// PADIs (4 MiB, **medido**), and BNG Blaster sends 100 000 in a second
+    /// and a half. Read only between frames, the sockets overflowed and the
+    /// CPEs sent their PADIs again seconds later (G4.3g, VM round 4: 6
+    /// workers 22 400 sessions/s against 57 900 with the single reader's
+    /// queue).
     fn worker(mut bng: Bng, rx: &Receiver<Msg>, ring: &UnixDatagram, session: &Shared, health: &super::super::Health) {
         let mut ports: Vec<PppoePort> = Vec::new();
+        let mut queue: VecDeque<(u32, Vec<u8>)> = VecDeque::new();
+        // Lost in the queue, and by the kernel on sockets closed since.
+        let mut lost = 0u64;
         let mut slow: Option<SlowTx> = None;
         let mut configured = false;
         let mut last_tick = Instant::now();
@@ -345,6 +363,9 @@ mod linux {
             }
             if bng.waiting_radius() {
                 wait = wait.min(Duration::from_millis(2));
+            }
+            if !queue.is_empty() {
+                wait = Duration::ZERO;
             }
             {
                 let mut fds: Vec<BorrowedFd<'_>> = ports.iter().flat_map(|p| p.fds()).collect();
@@ -366,7 +387,10 @@ mod linux {
                                 bng.configure(now, *snap, &infos);
                                 configured = true;
                             }
-                            Msg::Ports(p) => ports = p,
+                            Msg::Ports(p) => {
+                                lost += ports.iter().map(PppoePort::dropped).sum::<u64>();
+                                ports = p;
+                            }
                             Msg::Slow(s) => slow = Some(*s),
                         }
                     }
@@ -377,13 +401,16 @@ mod linux {
                     }
                 }
             }
-            let now = ms();
-            for p in &mut ports {
-                let ifindex = p.ifindex();
-                if let Err(e) = p.recv(|f| bng.frame(now, ifindex, f))
-                    && errors.len() < 100
-                {
-                    errors.push(format!("{}: {e}", p.name()));
+            fill(&mut ports, &mut queue, &mut lost, &mut errors);
+            let mut now = ms();
+            for done in 1..=BUDGET {
+                let Some((ifindex, f)) = queue.pop_front() else {
+                    break;
+                };
+                bng.frame(now, ifindex, &f);
+                if done % REFILL == 0 {
+                    fill(&mut ports, &mut queue, &mut lost, &mut errors);
+                    now = ms();
                 }
             }
             let now = ms();
@@ -397,6 +424,7 @@ mod linux {
                 } else {
                     Vec::new()
                 };
+                bng.set_rx_dropped(lost + ports.iter().map(PppoePort::dropped).sum::<u64>());
                 bng.tick(now, &counters);
                 if !errors.is_empty() {
                     let mut s = lock(session);
@@ -412,6 +440,32 @@ mod linux {
         }
         bng.shutdown(ms());
         flush(&mut bng, &ports, slow.as_ref(), session, &mut errors);
+    }
+
+    /// What the worker's sockets hold, into its queue (until it is full:
+    /// the rest waits in the kernel, which counts what it drops).
+    fn fill(ports: &mut [PppoePort], queue: &mut VecDeque<(u32, Vec<u8>)>, lost: &mut u64, errors: &mut Vec<String>) {
+        for p in ports.iter_mut() {
+            let ifindex = p.ifindex();
+            while queue.len() < QUEUE {
+                match p.recv(|f| {
+                    if queue.len() < QUEUE {
+                        queue.push_back((ifindex, f.to_vec()));
+                    } else {
+                        *lost += 1;
+                    }
+                }) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) => {
+                        if errors.len() < 100 {
+                            errors.push(format!("{}: {e}", p.name()));
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
     /// Send what the BNG made and do what it asked.
