@@ -85,7 +85,13 @@ fn sessions(n: usize, snap: &Snapshot) -> Bng {
         },
     )]);
     bng.configure(0, snap.clone(), &ports);
-    let mut clients: Vec<Client> = (0..n)
+    up(&mut bng, 0, n);
+    bng
+}
+
+/// Bring subscribers `base..base + n` up on `bng`.
+fn up(bng: &mut Bng, base: usize, n: usize) {
+    let mut clients: Vec<Client> = (base..base + n)
         .map(|i| {
             let mac = [0x02, 0x10, (i >> 16) as u8, (i >> 8) as u8, i as u8, 1];
             let cfg = ClientConfig {
@@ -105,7 +111,7 @@ fn sessions(n: usize, snap: &Snapshot) -> Bng {
         .map(|(i, c)| (c.config().mac.0, i))
         .collect();
     let mut out = ClientOutput::new();
-    let mut up = 0;
+    let mut ups = 0;
     for c in &mut clients {
         c.start(0, &mut out);
     }
@@ -121,7 +127,7 @@ fn sessions(n: usize, snap: &Snapshot) -> Bng {
             dst.copy_from_slice(&f[..6]);
             if let Some(&c) = by_mac.get(&dst) {
                 clients[c].handle_frame(0, &f, &mut out);
-                up += out
+                ups += out
                     .events
                     .iter()
                     .filter(|e| matches!(e, ClientEvent::Up { .. }))
@@ -132,8 +138,7 @@ fn sessions(n: usize, snap: &Snapshot) -> Bng {
         wire.extend(out.frames().map(|(_, f)| f.to_vec()));
         out.clear();
     }
-    assert_eq!(up, n);
-    bng
+    assert_eq!(ups, n);
 }
 
 fn rss_kib() -> u64 {
@@ -162,6 +167,18 @@ fn bench(c: &mut Criterion) {
         after.saturating_sub(before) * 1024 / 50_000
     );
     drop((first, second));
+    // G4.3g: does a session cost more with many already up? 60 000 (one
+    // server: 16-bit SESSION_ID) in batches of 10 000, each batch timed.
+    let snap100 = snapshot(100_000);
+    let mut bng = sessions(0, &snap100);
+    let mut line = String::new();
+    for k in 0..6 {
+        let t = std::time::Instant::now();
+        up(&mut bng, k * 10_000, 10_000);
+        line.push_str(&format!(" {:.1}", t.elapsed().as_secs_f64() * 100.0));
+    }
+    eprintln!("pppoe_bng: µs per session by batch of 10 000 (0 → 60 000 up):{line}");
+    drop(bng);
     let mut g = c.benchmark_group("pppoe_bng");
     g.sample_size(10);
     g.throughput(Throughput::Elements(1000));

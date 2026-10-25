@@ -14,7 +14,8 @@
 //!   wan0 198.51.100.1/24 (what the subscribers ping)
 //! ```
 //!
-//! 1, 100 and 10 000 sessions reach Opened; a subscriber pings through the
+//! 1, 100 and n sessions reach Opened (2 000 in CI; `COREROUTER_PPPOE_E2E_SESSIONS=10000`
+//! in the lab); a subscriber pings through the
 //! slow path; `ppp.active.remove` ends one; a RADIUS user (the test server
 //! of `proto-radius`) gets its Framed-IP and rate; every CPE reboots at
 //! once and comes back. The setup rate and the daemon's memory per session
@@ -257,7 +258,14 @@ fn pppoe_server_end_to_end() {
     if !in_netns() {
         return;
     }
-    let n = 10_000;
+    // 2 000 subscribers by default: the CI runner (4 vCPUs, debug build)
+    // must finish in its budget. The lab and a release run ask for 10 000+
+    // with COREROUTER_PPPOE_E2E_SESSIONS; the checks are the same.
+    let n: usize = std::env::var("COREROUTER_PPPOE_E2E_SESSIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n >= 200)
+        .unwrap_or(2_000);
     let (daemon, _dir) = setup(n);
     let pid = daemon.0.id();
     let rss0 = rss_kib(pid);
@@ -375,18 +383,19 @@ fn pppoe_server_end_to_end() {
     ok("ppp.active.remove", json!({"server": "pppoe-acc0"}));
     wait_for("100 gone", || active() == 0);
 
-    // 10 000 sessions, timed.
+    // n sessions, timed. The deadline grows with n (at least 20 sessions a
+    // second, the slowest runner seen with the O(n) lookups, now gone).
     let rss1 = rss_kib(pid);
     let mut many = Cpes::new(n, 0, |i| (format!("u{i}"), format!("p{i}")), false);
     let t = Instant::now();
     many.start_all();
     assert!(
-        many.run_until(300, |c| c.ups() == n),
-        "10k sessions: {}",
+        many.run_until(60 + (n as u64) / 20, |c| c.ups() == n),
+        "{n} sessions: {}",
         many.ups()
     );
     let secs = t.elapsed().as_secs_f64();
-    wait_for("10k active", || active() == n);
+    wait_for("all active", || active() == n);
     let rss2 = rss_kib(pid);
     println!(
         "MEASURED pppoe e2e: {n} sessions Opened in {secs:.2} s = {:.0} sessions/s (veth, debug build, slow path); daemon RSS {rss0} → {rss1} → {rss2} KiB = {:.0} B/session",
@@ -399,27 +408,38 @@ fn pppoe_server_end_to_end() {
     assert_eq!(ips.len(), n, "one address each");
 
     // Mass reconnect: every CPE reboots without PADT, with the protections
-    // on. 1000 new sessions per second (below what this debug build sets
-    // up, so the limit is what paces it).
+    // on. The rate (n/10 a second, 100..=1000) is below what a debug build
+    // sets up, so the limit is what paces it: about ten seconds of new
+    // sessions whatever n is.
+    let rate = (n / 10).clamp(100, 1000);
     ok(
         "interface.pppoe-server.server.set",
-        json!({"id": "pppoe-acc0", "new_session_rate": 1000, "padi_limit": 2000, "mac_padi_limit": 1}),
+        json!({"id": "pppoe-acc0", "new_session_rate": rate, "padi_limit": 2000, "mac_padi_limit": 1}),
     );
     let mut again = Cpes::new(n, 0, |i| (format!("u{i}"), format!("p{i}")), false);
+    // The service reads the config once a second: until then the old rate
+    // (none) still holds, and the BNG sets up thousands in that second.
+    std::thread::sleep(Duration::from_millis(1500));
     drop(many);
     let t = Instant::now();
     again.start_all();
     assert!(
-        again.run_until(300, |c| c.ups() == n),
+        // The rate, plus the CPEs' back-off (RFC 2516 §5: 1, 2, 4… s).
+        again.run_until(120 + 6 * (n / rate) as u64, |c| c.ups() == n),
         "mass reconnect: {}",
         again.ups()
     );
     let took = t.elapsed().as_secs_f64();
     println!(
-        "MEASURED pppoe e2e: mass reconnect of {n} CPEs in {took:.2} s with new_session_rate=1000"
+        "MEASURED pppoe e2e: mass reconnect of {n} CPEs in {took:.2} s with new_session_rate={rate}"
     );
-    assert!(took >= 8.0, "the rate paced the reconnect: {took:.1} s");
-    wait_for("10k active again", || active() == n);
+    // One second of tokens to start, then `rate` a second.
+    let floor = 0.8 * (n.saturating_sub(rate) as f64) / rate as f64;
+    assert!(
+        took >= floor,
+        "the rate paced the reconnect: {took:.1} s < {floor:.1} s"
+    );
+    wait_for("all active again", || active() == n);
     let st = ok("interface.pppoe-server.monitor", json!({}));
     assert!(st["throttled"].as_u64().unwrap() > 0, "{st}");
     let replaced = ok("ppp.history", json!({"event": "down", "limit": 10000}))
