@@ -41,8 +41,8 @@ use corerouter_proto_radius::rate_limit::RateLimit;
 pub(crate) const HISTORY: usize = 50_000;
 /// Users and MACs `ppp.why` remembers.
 const WHY_KEYS: usize = 100_000;
-/// XDP slots: from the top of the shared session map down (the PPPoE
-/// service takes them from 0 up), at most half of it.
+/// XDP slots: from the top of the shared session map down, at most half
+/// of it; the PPPoE service takes the lower half (`pppoe_bng::XDP_SLOTS`).
 pub(crate) const SLOT_TOP: u32 = (1 << 17) - 1;
 pub(crate) const SLOTS: u32 = 1 << 16;
 /// RADIUS asks waiting at once (the DHCP server parks 8192).

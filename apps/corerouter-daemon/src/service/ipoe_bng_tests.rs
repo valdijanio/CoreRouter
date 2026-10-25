@@ -249,3 +249,14 @@ fn the_keepalive_pings_and_ends_a_silent_subscriber() {
     assert!(h.to_string().contains("keepalive"), "{h}");
     assert!(lab.active().len() < n);
 }
+
+/// The XDP slots of the two services never meet: PPPoE the lower half of
+/// the session map, IPoE the upper one.
+#[test]
+fn ipoe_and_pppoe_slots_are_disjoint() {
+    use super::ipoe_bng::{SLOT_TOP, SLOTS};
+    use super::pppoe_bng::XDP_SLOTS;
+    let ipoe_lowest = SLOT_TOP + 1 - SLOTS;
+    assert!(XDP_SLOTS <= ipoe_lowest, "PPPoE below {XDP_SLOTS}, IPoE from {ipoe_lowest}");
+    assert_eq!(SLOT_TOP, (1 << 17) - 1, "the top of SESSIONS_MAX");
+}

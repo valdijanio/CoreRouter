@@ -50,8 +50,10 @@ use corerouter_proto_radius::rate_limit::RateLimit;
 pub(crate) const HISTORY: usize = 50_000;
 /// Users and MACs `ppp.why` remembers.
 pub(crate) const WHY_KEYS: usize = 100_000;
-/// Slots of the XDP session map (`dataplane-ebpf-common::pppoe::SESSIONS_MAX`).
-pub(crate) const XDP_SLOTS: u32 = 1 << 17;
+/// Slots of the XDP session map the PPPoE service may use: the lower half
+/// of `dataplane-ebpf-common::pppoe::SESSIONS_MAX` (1 << 17). The upper half
+/// is the IPoE service's (G4.3f, `ipoe_bng::SLOT_TOP` downward).
+pub(crate) const XDP_SLOTS: u32 = 1 << 16;
 /// A subscriber's address-list entry is made again this often (dynamic
 /// entries last at most 35 days; the driver adds them for 35).
 const LIST_REFRESH_MS: u64 = 30 * 86_400_000;
