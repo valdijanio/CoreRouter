@@ -126,6 +126,9 @@ pub struct Stats {
     pub auth_accepted: u64,
     pub auth_rejected: u64,
     pub auth_timeouts: u64,
+    /// Messages served without a rate-limit bucket (the table was full of
+    /// clients still counting: a storm larger than `MAX_CLIENTS_TRACKED`).
+    pub untracked: u64,
     /// ACKs per second: `acks[s % 60]` for second `s`.
     acks: [u32; ACK_WINDOW],
     acks_at: [u64; ACK_WINDOW],
@@ -154,6 +157,7 @@ impl Stats {
             auth_accepted: 0,
             auth_rejected: 0,
             auth_timeouts: 0,
+            untracked: 0,
             acks: [0; ACK_WINDOW],
             acks_at: [0; ACK_WINDOW],
             peak_acks: 0,

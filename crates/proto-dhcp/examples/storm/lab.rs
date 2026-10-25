@@ -33,6 +33,18 @@ fn heard(payload: Vec<u8>) -> Heard {
 
 impl Storm {
     pub fn new(n: usize, probed: bool) -> Self {
+        Self::with(n, probed, false)
+    }
+
+    /// `ipoe`: the server authorizes each client first (G4.3f), and the
+    /// run answers every ask at once (a local secret's verdict).
+    pub fn with(n: usize, probed: bool, ipoe: bool) -> Self {
+        // A /14 past 65 000 clients (a /16 holds fewer addresses).
+        let (cidr, range, net) = if n > 60_000 {
+            ("10.0.0.1/14", "10.0.1.0-10.3.255.254", "10.0.0.0/14")
+        } else {
+            ("10.0.0.1/16", "10.0.1.0-10.0.255.254", "10.0.0.0/16")
+        };
         let iface: IfName = "ether2".parse().unwrap();
         let mut c = Config::default();
         c.interfaces.insert(
@@ -41,7 +53,7 @@ impl Storm {
         );
         c.ip.addresses.push(AddressEntry {
             id: ItemId(1),
-            address: "10.0.0.1/16".parse().unwrap(),
+            address: cidr.parse().unwrap(),
             interface: iface.clone(),
             disabled: false,
             comment: String::new(),
@@ -50,7 +62,7 @@ impl Storm {
         c.ip.pools.pools.push(IpPool {
             id: ItemId(1),
             name: "storm".into(),
-            ranges: vec!["10.0.1.0-10.0.255.254".parse().unwrap()],
+            ranges: vec![range.parse().unwrap()],
             next_pool: None,
             comment: String::new(),
         });
@@ -58,8 +70,9 @@ impl Storm {
         s.address_pool = Some("storm".into());
         s.conflict_detection = probed;
         s.client_rate_limit = 10;
+        s.ipoe = ipoe;
         c.ip.dhcp_server.servers.push(s);
-        let mut net = DhcpNetwork::new(ItemId(2), "10.0.0.0/16".parse().unwrap());
+        let mut net = DhcpNetwork::new(ItemId(2), net.parse().unwrap());
         net.gateway = vec![Ipv4Addr::new(10, 0, 0, 1)];
         net.dns_server = vec![Ipv4Addr::new(10, 0, 0, 1)];
         net.domain = "isp.example".into();
@@ -122,6 +135,7 @@ impl Storm {
         let count = |fx: Vec<Effect>, acks: &mut usize, lines: &mut usize| {
             for e in fx {
                 match e {
+                    Effect::Authorize(_) => {}
                     Effect::Send {
                         kind: corerouter_proto_dhcp::server::request::Kind::Ack,
                         ..
@@ -133,7 +147,27 @@ impl Storm {
         };
         for d in &self.discovers {
             let mut fx = Vec::new();
-            each(&mut || fx = srv.handle(now, &self.iface, d));
+            each(&mut || {
+                fx = srv.handle(now, &self.iface, d);
+                // G4.3f: the verdict at once (a local secret).
+                let asks: Vec<_> = fx
+                    .iter()
+                    .filter_map(|e| match e {
+                        Effect::Authorize(a) => Some(a.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                for a in asks {
+                    fx.extend(srv.authorized(
+                        now,
+                        &a.server,
+                        &a.client_key,
+                        corerouter_proto_dhcp::server::authorize::Verdict::Accept(
+                            Default::default(),
+                        ),
+                    ));
+                }
+            });
             count(fx, &mut acks, &mut lines);
         }
         now.ms += PROBE_WAIT_MS;
