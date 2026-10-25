@@ -908,6 +908,7 @@ de PADIs de uma volta de energia.
     | | 1 worker | 6 workers |
     |---|---:|---:|
     | leitor + canal (rodada 3) | 15,2 mil/s | **57,9 mil/s** (leitor a 51%) |
+    | leitor + canal, com o filtro de saída e o `rx_dropped` (rodada 6) | 14,5 mil/s (30 967 quadros perdidos) | **57,7 mil/s** (0 perdidos) |
     | socket por worker, sem fila (rodada 4) | 10,5 mil/s | 22,4 mil/s |
     | socket por worker + fila de 65 536 no worker (rodada 5) | 14,3 mil/s (46 234 quadros perdidos) | 24,0 mil/s (0 perdidos) |
 
