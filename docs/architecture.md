@@ -898,10 +898,11 @@ de PADIs de uma volta de energia.
 **Decisão: o leitor único fica; o socket filtrado por worker foi medido e descartado.**
 
 - **Socket por worker:** cada worker abre os próprios sockets AF_PACKET com um filtro BPF
-  clássico que só deixa passar os clientes dele (`PppoePort::open_lane`, `lane_program`: `ld [8]`,
+  clássico que só deixa passar os clientes dele (`ld [8]`,
   `mul #0x9E3779B1`, `rsh #16`, `mod #N`, `jeq #faixa`, via `SO_ATTACH_FILTER` do socket2).
   - Num netns, a parte serial caiu: a thread receptora mais ocupada passou de 550–1050 ns para
-    150–350 ns por quadro (200 mil PADIs, `tests/netns_pppoe_lanes.rs`, **medido**).
+    150–350 ns por quadro (200 mil PADIs, **medido**; o código e o teste,
+    `tests/netns_pppoe_lanes.rs`, estão no commit 8c3859f e saíram com a decisão).
   - No laboratório com o BNG Blaster (VM corerouter-lab, 8 vCPUs, 100 mil sessões, **medido**),
     ficou abaixo do leitor:
 
