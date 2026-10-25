@@ -1304,10 +1304,10 @@ impl Bng {
         routes.read().ok().and_then(|r| r.get(&ip).copied())
     }
 
-    /// The worker of a frame from a client (its source MAC; RSS-like):
-    /// the same as `hal_linux::pppoe_io::lane_of`, the classic BPF filter of
-    /// a socket per worker that was measured and set aside (a test keeps the
-    /// two equal).
+    /// The worker of a frame from a client (its source MAC; RSS-like): a
+    /// multiplicative hash of the last four bytes of the MAC (frame bytes
+    /// 8..12), so a vendor's shared OUI and a power-of-two `lanes` still
+    /// spread.
     pub(crate) fn lane_of(frame: &[u8], lanes: u16) -> u16 {
         let b = |i: usize| frame.get(i).copied().unwrap_or(0);
         let k = u32::from_be_bytes([b(8), b(9), b(10), b(11)]);

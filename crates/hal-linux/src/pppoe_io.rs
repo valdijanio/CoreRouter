@@ -58,11 +58,6 @@ const PACKET_OUTGOING: u8 = 4;
 
 // Classic BPF (linux/filter.h).
 const LD_W_ABS: u16 = 0x20;
-const ALU_MUL_K: u16 = 0x24;
-const ALU_RSH_K: u16 = 0x74;
-const ALU_MOD_K: u16 = 0x94;
-/// Fibonacci hashing (Knuth): spreads every byte into the high bits.
-const LANE_MUL: u32 = 0x9E37_79B1;
 const ALU_AND_K: u16 = 0x54;
 const JEQ_K: u16 = 0x15;
 const RET_K: u16 = 0x06;
@@ -108,39 +103,6 @@ fn by_vlan(vlan: Option<u16>) -> Vec<Ins> {
             (RET_K, 0, 0, 0),
         ],
     }
-}
-
-/// The worker of a frame from a client: a multiplicative hash of the last
-/// four bytes of its source MAC (frame bytes 8..12, before any VLAN tag;
-/// the OUI repeats among one vendor's CPEs) modulo `lanes`. A plain
-/// "MAC % lanes" would look only at the last byte's low bits whenever
-/// `lanes` is a power of two. The kernel runs the same in
-/// [`lane_program`]; the service's other paths call this.
-pub fn lane_of(frame: &[u8], lanes: u16) -> u16 {
-    let b = |i: usize| frame.get(i).copied().unwrap_or(0);
-    let k = u32::from_be_bytes([b(8), b(9), b(10), b(11)]);
-    ((k.wrapping_mul(LANE_MUL) >> 16) % u32::from(lanes.max(1))) as u16
-}
-
-/// `prog` behind a test that keeps only the frames of worker `lane` of
-/// `lanes` ([`lane_of`] in classic BPF, ALU MOD since Linux 3.7): each
-/// worker reads its own socket and the kernel hands it its frames, with no
-/// thread in between (G4.3g; PACKET_FANOUT by MAC would need an `unsafe`
-/// setsockopt, see `docs/architecture.md`).
-fn lane_program(prog: Vec<Ins>, lane: u16, lanes: u16) -> Vec<Ins> {
-    if lanes <= 1 {
-        return prog;
-    }
-    let mut p = vec![
-        (LD_W_ABS, 0, 0, 8),
-        (ALU_MUL_K, 0, 0, LANE_MUL),
-        (ALU_RSH_K, 0, 0, 16),
-        (ALU_MOD_K, 0, 0, u32::from(lanes)),
-        (JEQ_K, 1, 0, u32::from(lane % lanes)),
-        (RET_K, 0, 0, 0),
-    ];
-    p.extend(prog);
-    p
 }
 
 /// The filter of the slow path's tap on `bng0`: only what the host sends.
@@ -195,18 +157,6 @@ impl PppoePort {
     /// Open `name` for PPPoE: untagged frames when `untagged`, and those of
     /// every VLAN id in `vlans` (at most [`MAX_VLAN_IDS`]).
     pub fn open(name: &IfName, vlans: &[u16], untagged: bool) -> io::Result<Self> {
-        Self::open_lane(name, vlans, untagged, 0, 1)
-    }
-
-    /// [`PppoePort::open`] for worker `lane` of `lanes`: only the frames of
-    /// the clients whose MAC is that worker's ([`lane_of`]).
-    pub fn open_lane(
-        name: &IfName,
-        vlans: &[u16],
-        untagged: bool,
-        lane: u16,
-        lanes: u16,
-    ) -> io::Result<Self> {
         if vlans.len() > MAX_VLAN_IDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -227,7 +177,7 @@ impl PppoePort {
         for vlan in wanted {
             for proto in [ETH_P_PPP_DISC, ETH_P_PPP_SES] {
                 sides.push(Side {
-                    sock: bound(&info.link, proto, &lane_program(program(vlan), lane, lanes))?,
+                    sock: bound(&info.link, proto, &program(vlan))?,
                     vlan,
                     dropped: 0,
                 });
@@ -653,9 +603,6 @@ mod tests {
                     a = u32::from_be_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]);
                 }
                 ALU_AND_K => a &= k,
-                ALU_MUL_K => a = a.wrapping_mul(k),
-                ALU_RSH_K => a >>= k,
-                ALU_MOD_K => a %= k,
                 JEQ_K => pc += usize::from(if a == k { jt } else { jf }),
                 RET_K => return k,
                 other => panic!("opcode {other:#x}"),
@@ -666,84 +613,6 @@ mod tests {
 
     /// G4.3g: every frame passes the filter of exactly one worker, the one
     /// [`lane_of`] names, and the VLAN test still applies behind it.
-    #[test]
-    fn each_frame_reaches_exactly_its_worker() {
-        for lanes in [1u16, 2, 3, 6] {
-            for i in 0..2000u32 {
-                let mut f = vec![0u8; 60];
-                // As the labs number MACs: a counter, then a fixed last byte.
-                f[6..12].copy_from_slice(&[
-                    0x02,
-                    0x10,
-                    (i >> 16) as u8,
-                    (i >> 8) as u8,
-                    i as u8,
-                    0x01,
-                ]);
-                let hits: Vec<u16> = (0..lanes)
-                    .filter(|&l| {
-                        run_frame(&lane_program(program(None), l, lanes), None, 0, &f) == ACCEPT
-                    })
-                    .collect();
-                assert_eq!(hits, [lane_of(&f, lanes)], "frame {i}, {lanes} lanes");
-                // A tagged frame on an untagged socket stays out whatever its lane.
-                assert_eq!(
-                    run_frame(
-                        &lane_program(program(None), hits[0], lanes),
-                        Some(100),
-                        0,
-                        &f
-                    ),
-                    0
-                );
-            }
-        }
-        // Sequential MACs of one vendor, and the labs' "counter then 0x01":
-        // spread within 15 % over 4 and over 6 workers.
-        for (lanes, last) in [(4u16, None), (6, None), (4, Some(0x01u8)), (8, Some(0x01))] {
-            let mut per = vec![0u32; usize::from(lanes)];
-            let n = 12_000u32;
-            for i in 0..n {
-                let f = match last {
-                    None => [
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0x00,
-                        0x1a,
-                        0x2b,
-                        (i >> 16) as u8,
-                        (i >> 8) as u8,
-                        i as u8,
-                    ],
-                    Some(l) => [
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0x02,
-                        0x20,
-                        (i >> 16) as u8,
-                        (i >> 8) as u8,
-                        i as u8,
-                        l,
-                    ],
-                };
-                per[usize::from(lane_of(&f, lanes))] += 1;
-            }
-            let even = n / u32::from(lanes);
-            assert!(
-                per.iter().all(|c| c.abs_diff(even) * 100 <= even * 15),
-                "{lanes} lanes {last:?}: {per:?}"
-            );
-        }
-    }
-
     #[test]
     fn each_socket_keeps_only_its_vlan() {
         let untagged = program(None);
@@ -762,12 +631,11 @@ mod tests {
     #[test]
     fn the_ports_never_read_back_what_the_bng_sent() {
         for vlan in [None, Some(100)] {
-            for lanes in [1u16, 4] {
-                for lane in 0..lanes {
-                    let p = lane_program(program(vlan), lane, lanes);
-                    assert_eq!(run_frame(&p, vlan, PACKET_OUTGOING, &[0u8; 60]), 0);
-                }
-            }
+            assert_eq!(
+                run_frame(&program(vlan), vlan, PACKET_OUTGOING, &[0u8; 60]),
+                0
+            );
+            assert_eq!(run_frame(&program(vlan), vlan, 0, &[0u8; 60]), ACCEPT);
         }
     }
 
