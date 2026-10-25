@@ -617,3 +617,34 @@ fn a_called_off_login_stops_being_retransmitted() {
     r.aaa.authenticate_until(AuthRequest::pap(AaaService::Ppp, "bia", "x"), Box::new(move |x| tx.send(x).unwrap()), gone);
     assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().outcome, AuthOutcome::Error);
 }
+
+/// G4.3g: while many logins wait for the server, an Accounting-Start
+/// waits behind them, and goes once they are answered, with the time it
+/// waited in Acct-Delay-Time (RFC 2866 §5.2).
+#[test]
+fn accounting_waits_behind_a_wave_of_logins() {
+    let srv = TestRadius::start(9);
+    srv.srv.lock().unwrap().script.delay_ms = 1500;
+    let r = start(vec![srv.entry(1)]);
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..100 {
+        let tx = tx.clone();
+        r.aaa.authenticate(AuthRequest::pap(AaaService::Ppp, "ana", "segredo"), Box::new(move |x| tx.send(x).unwrap()));
+    }
+    // The next sweep sees the wave.
+    thread::sleep(Duration::from_millis(400));
+    r.aaa.account(acct(AcctStatus::Start, "S-W"), None).unwrap();
+    thread::sleep(Duration::from_millis(600));
+    assert!(srv.srv.lock().unwrap().accounting.is_empty(), "held while the logins wait");
+    for _ in 0..100 {
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap().outcome, AuthOutcome::Accept);
+    }
+    let t = Instant::now();
+    while srv.srv.lock().unwrap().accounting.is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(10), "released after the wave");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let a = srv.srv.lock().unwrap().accounting[0].clone();
+    assert_eq!(a.session_id, "S-W");
+    assert!(a.delay_time >= 1, "Acct-Delay-Time counts the wait: {}", a.delay_time);
+}

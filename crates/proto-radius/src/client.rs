@@ -567,6 +567,19 @@ impl Client {
         supersede: Option<u64>,
         now_ms: u64,
     ) -> Result<RequestId, SubmitError> {
+        self.accounting_at(attrs, supersede, now_ms, now_ms)
+    }
+
+    /// [`Client::accounting`] of an event that happened at `event_ms`
+    /// (held back by the caller): Acct-Delay-Time counts from it (RFC 2866
+    /// §5.2), so the server dates the session right.
+    pub fn accounting_at(
+        &mut self,
+        attrs: AttrList,
+        supersede: Option<u64>,
+        event_ms: u64,
+        now_ms: u64,
+    ) -> Result<RequestId, SubmitError> {
         // Header, Acct-Delay-Time.
         if HEADER_LEN + 6 + attrs.len() > MAX_PACKET_LEN {
             return Err(crate::EncodeError::PacketTooLong.into());
@@ -574,7 +587,14 @@ impl Client {
         if let Some(old) = supersede.and_then(|k| self.supersede.get(&k).copied()) {
             self.finish(old, Some(Failure::Superseded));
         }
-        let id = self.submit(Kind::Accounting, attrs, None, supersede, now_ms);
+        let id = self.submit_at(
+            Kind::Accounting,
+            attrs,
+            None,
+            supersede,
+            event_ms.min(now_ms),
+            now_ms,
+        );
         self.flush_drains(now_ms);
         let id = id?;
         if let Some(k) = supersede {
@@ -610,6 +630,18 @@ impl Client {
         supersede: Option<u64>,
         now_ms: u64,
     ) -> Result<RequestId, SubmitError> {
+        self.submit_at(kind, attrs, password, supersede, now_ms, now_ms)
+    }
+
+    fn submit_at(
+        &mut self,
+        kind: Kind,
+        attrs: AttrList,
+        password: Option<Vec<u8>>,
+        supersede: Option<u64>,
+        created_ms: u64,
+        now_ms: u64,
+    ) -> Result<RequestId, SubmitError> {
         self.last_now_ms = self.last_now_ms.max(now_ms);
         let service = Self::service_of(kind);
         let server = self
@@ -624,7 +656,7 @@ impl Client {
             attrs,
             password,
             supersede,
-            created_ms: now_ms,
+            created_ms,
             server,
             tried: 1 << server,
             flight: None,
