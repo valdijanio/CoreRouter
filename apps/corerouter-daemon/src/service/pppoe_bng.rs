@@ -23,10 +23,11 @@ use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
 use corerouter_model::MacAddr;
+use corerouter_model::cow::CowArc;
 use corerouter_model::ip_pool::IpPools;
 use corerouter_model::ppp::{
-    ActiveSession, AddrOrPool, Effective, HistoryEntry, Ppp, PppAuth, PppHook, PppService,
-    PppoeServer, ServiceStats, Stage, Why,
+    ActiveSession, AddrOrPool, Effective, HistoryEntry, Ppp, PppAuth, PppHook, PppSecret,
+    PppService, PppoeServer, ServiceStats, Stage, Why,
 };
 use corerouter_model::radius::{
     AaaService, AcctCounters, AcctRequest, AcctStatus, Attribute, AuthOutcome, AuthReply,
@@ -58,7 +59,7 @@ const LIST_REFRESH_MS: u64 = 30 * 86_400_000;
 /// RADIUS answers older than this are dropped (the server gave up first).
 const RADIUS_GRACE_MS: u64 = 35_000;
 
-fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -521,6 +522,54 @@ struct Sub {
     mtu: u16,
 }
 
+/// What the hot paths look up in [`Bng::subs`] without walking it
+/// (G4.3g: a walk per PADI, per login and per slow-path packet made a
+/// session cost grow with the sessions up: 19 → 181 µs from 0 to 60 000).
+#[derive(Default)]
+struct SubIndex {
+    /// Sessions up, by address: the slow path's downstream lookup.
+    by_ip: HashMap<Ipv4Addr, (usize, u16)>,
+    /// Sessions up per login: `only-one`.
+    users_up: HashMap<String, u32>,
+    /// Sessions between authentication and Up, per (slot, MAC): the PADI's
+    /// `new_session_rate`.
+    pending: HashMap<(usize, [u8; 6]), u32>,
+}
+
+impl SubIndex {
+    fn add(&mut self, key: (usize, u16), sub: &Sub) {
+        if sub.up_at.is_some() {
+            *self.users_up.entry(sub.user.clone()).or_default() += 1;
+            if let Some(ip) = sub.ip {
+                self.by_ip.insert(ip, key);
+            }
+        } else {
+            *self.pending.entry((sub.slot, sub.mac.0)).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, key: (usize, u16), sub: &Sub) {
+        fn dec<K: std::hash::Hash + Eq>(m: &mut HashMap<K, u32>, k: &K) {
+            if let Some(n) = m.get_mut(k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(k);
+                }
+            }
+        }
+        if sub.up_at.is_some() {
+            dec(&mut self.users_up, &sub.user);
+            if let Some(ip) = sub.ip
+                && self.by_ip.get(&ip) == Some(&key)
+            {
+                self.by_ip.remove(&ip);
+            }
+        } else {
+            dec(&mut self.pending, &(sub.slot, sub.mac.0));
+        }
+    }
+}
+
 /// An answer for the server, queued while its events are handled.
 enum Reply {
     Auth(AuthVerdict),
@@ -550,6 +599,12 @@ pub(crate) struct Snapshot {
 pub(crate) struct Bng {
     slots: Vec<Slot>,
     subs: HashMap<(usize, u16), Sub>,
+    /// Kept with `subs` (every insert, remove and Up goes through it).
+    index: SubIndex,
+    /// `/ppp secret` by name, for the list it was built from
+    /// (`Ppp::secret` walks the list: 100 000 secrets made a login cost
+    /// ~100 µs more for the last ones, G4.3g).
+    secrets: (CowArc<Vec<PppSecret>>, HashMap<String, usize>),
     pools: Pools,
     xdp_free: Vec<u32>,
     xdp_next: u32,
@@ -740,6 +795,8 @@ impl Bng {
         Self {
             slots: Vec::new(),
             subs: HashMap::new(),
+            index: SubIndex::default(),
+            secrets: (CowArc::default(), HashMap::new()),
             pools: Pools::default(),
             xdp_free: Vec::new(),
             xdp_next: 0,
@@ -784,6 +841,15 @@ impl Bng {
         ports: &HashMap<String, PortInfo>,
     ) {
         let wanted = Self::wanted(&snap.ppp);
+        if !CowArc::ptr_eq(&self.secrets.0, &snap.ppp.secrets) {
+            let mut by_name = HashMap::with_capacity(snap.ppp.secrets.len());
+            for (k, sec) in snap.ppp.secrets.iter().enumerate() {
+                // The first of a name wins, as `Ppp::secret` (the engine
+                // refuses duplicates anyway).
+                by_name.entry(sec.name.clone()).or_insert(k);
+            }
+            self.secrets = (snap.ppp.secrets.clone(), by_name);
+        }
         self.cfg = snap;
         // Servers gone or restarted: end their sessions.
         let mut keep: Vec<bool> = Vec::with_capacity(self.slots.len());
@@ -855,7 +921,7 @@ impl Bng {
     fn drop_slot(&mut self, now: Millis, i: usize) {
         let keys: Vec<(usize, u16)> = self.subs.keys().filter(|k| k.0 == i).copied().collect();
         for k in keys {
-            if let Some(sub) = self.subs.remove(&k) {
+            if let Some(sub) = self.take_sub(k) {
                 self.ended(now, sub, DownReason::Admin, true);
             }
         }
@@ -874,6 +940,18 @@ impl Bng {
             })
             .collect();
         self.subs.extend(moved);
+        // The slots were renumbered: index again (a server removed, rare).
+        self.index = SubIndex::default();
+        for (k, sub) in &self.subs {
+            self.index.add(*k, sub);
+        }
+    }
+
+    /// Remove a session, keeping the index.
+    fn take_sub(&mut self, key: (usize, u16)) -> Option<Sub> {
+        let sub = self.subs.remove(&key)?;
+        self.index.remove(key, &sub);
+        Some(sub)
     }
 
     /// The earliest time [`Bng::timers`] has work.
@@ -912,10 +990,7 @@ impl Bng {
                     // CPE asks again (RFC 2516 §5.1: PADI retransmitted with
                     // back-off). At the PADR it would be worse: the CPE
                     // repeats the PADR with an AC-Cookie that expires.
-                    let setting_up = self
-                        .subs
-                        .values()
-                        .any(|s| s.mac == src && s.slot == i && s.up_at.is_none());
+                    let setting_up = self.index.pending.contains_key(&(i, src.0));
                     if !setting_up && !slot.bucket.allow(now) {
                         self.padr_throttled += 1;
                         return;
@@ -987,9 +1062,10 @@ impl Bng {
             dst.get(3).copied().unwrap_or(0),
         );
         let Some(((slot, sid), sub)) = self
-            .subs
-            .iter()
-            .find(|(_, s)| s.ip == Some(dst) && s.up_at.is_some())
+            .index
+            .by_ip
+            .get(&dst)
+            .and_then(|k| self.subs.get_key_value(k))
         else {
             return;
         };
@@ -1115,7 +1191,7 @@ impl Bng {
                 was_up,
                 ..
             } => {
-                if let Some(sub) = self.subs.remove(&(i, session.sid)) {
+                if let Some(sub) = self.take_sub((i, session.sid)) {
                     self.ended(now, sub, reason, was_up);
                 } else {
                     // Before authentication (LCP failed, setup timeout): no
@@ -1154,49 +1230,58 @@ impl Bng {
         };
         let default_profile = slot.cfg.default_profile.clone();
         let vlan = (req.vlans.outer != 0).then_some(req.vlans.outer);
-        self.subs.insert(
-            (i, sref.sid),
-            Sub {
-                slot: i,
-                sref,
-                user: user.clone(),
-                mac,
-                stage: Stage::Auth,
-                effective: self
-                    .cfg
-                    .ppp
-                    .effective(None, &default_profile, &default_profile),
-                radius: false,
-                ip: None,
-                pool: None,
-                rate: None,
-                acct_id: String::new(),
-                interim: None,
-                xdp: None,
-                up_at: None,
-                limit_in: 0,
-                limit_out: 0,
-                session_timeout: None,
-                reply_message: None,
-                cause: None,
-                last_bytes: (0, 0),
-                prev: (0, 0, now),
-                list_at: now,
-                idle_since: now,
-                descriptor_vlan: vlan,
-                circuit_id: req
-                    .circuit_id
-                    .as_ref()
-                    .map(|c| String::from_utf8_lossy(c).into_owned()),
-                remote_id: req
-                    .remote_id
-                    .as_ref()
-                    .map(|c| String::from_utf8_lossy(c).into_owned()),
-                mtu: 1480,
-            },
-        );
+        let fresh = Sub {
+            slot: i,
+            sref,
+            user: user.clone(),
+            mac,
+            stage: Stage::Auth,
+            effective: self
+                .cfg
+                .ppp
+                .effective(None, &default_profile, &default_profile),
+            radius: false,
+            ip: None,
+            pool: None,
+            rate: None,
+            acct_id: String::new(),
+            interim: None,
+            xdp: None,
+            up_at: None,
+            limit_in: 0,
+            limit_out: 0,
+            session_timeout: None,
+            reply_message: None,
+            cause: None,
+            last_bytes: (0, 0),
+            prev: (0, 0, now),
+            list_at: now,
+            idle_since: now,
+            descriptor_vlan: vlan,
+            circuit_id: req
+                .circuit_id
+                .as_ref()
+                .map(|c| String::from_utf8_lossy(c).into_owned()),
+            remote_id: req
+                .remote_id
+                .as_ref()
+                .map(|c| String::from_utf8_lossy(c).into_owned()),
+            mtu: 1480,
+        };
+        self.index.add((i, sref.sid), &fresh);
+        if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
+            // Authenticated again (LCP renegotiated): the old entry's
+            // place in the index goes.
+            self.index.remove((i, sref.sid), &old);
+        }
         guard(&self.shared).reach(&[&user, &mac_text(mac)], Stage::Auth);
-        match self.cfg.ppp.secret(&user).cloned() {
+        let secret = self
+            .secrets
+            .1
+            .get(&user)
+            .and_then(|&k| self.secrets.0.get(k))
+            .cloned();
+        match secret {
             Some(sec) if sec.disabled => self.reject(i, sref, "secret disabled"),
             Some(sec) => self.local(i, sref, req, &sec, &default_profile),
             None => match self.cfg.aaa.clone().filter(|_| self.cfg.ppp.aaa.use_radius) {
@@ -1224,12 +1309,7 @@ impl Bng {
             .cfg
             .ppp
             .effective(Some(sec), &sec.profile, default_profile);
-        if e.only_one
-            && self
-                .subs
-                .values()
-                .any(|s| s.user == sec.name && s.up_at.is_some())
-        {
+        if e.only_one && self.index.users_up.contains_key(&sec.name) {
             return self.reject(i, sref, "only-one: the user is already connected");
         }
         let Some(mschap2) = req.verify_local(&sec.password) else {
@@ -1498,6 +1578,7 @@ impl Bng {
         let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
             return;
         };
+        self.index.remove((i, sref.sid), sub);
         sub.up_at = Some(now);
         sub.list_at = now;
         sub.stage = Stage::Up;
@@ -1508,6 +1589,7 @@ impl Bng {
         if sub.ip.is_none() {
             sub.ip = d.ipv4;
         }
+        self.index.add((i, sref.sid), sub);
         let ip = sub.ip;
         let user = sub.user.clone();
         let mac = mac_text(sub.mac);
@@ -2036,6 +2118,16 @@ impl Bng {
         let unique: HashSet<u32> = ips.iter().copied().collect();
         if unique.len() != ips.len() {
             return Err("an address is held by two sessions".into());
+        }
+        let mut again = SubIndex::default();
+        for (k, sub) in &self.subs {
+            again.add(*k, sub);
+        }
+        if again.by_ip != self.index.by_ip
+            || again.users_up != self.index.users_up
+            || again.pending != self.index.pending
+        {
+            return Err("the session index disagrees with the sessions".into());
         }
         Ok(())
     }
