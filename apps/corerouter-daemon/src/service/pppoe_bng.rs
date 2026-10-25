@@ -121,13 +121,11 @@ fn stage_index(s: Stage) -> usize {
 pub(crate) struct Shared {
     pub active: BTreeMap<String, ActiveSession>,
     pub history: VecDeque<HistoryEntry>,
-    why: HashMap<String, Track>,
-    /// Keys in the order they were used (a key used again is pushed again;
-    /// the old place is skipped when popped): the oldest is evicted first.
-    why_order: VecDeque<(String, u64)>,
-    why_seq: u64,
-    /// [`WHY_KEYS`] unless a test sets it.
-    why_cap: usize,
+    /// Each worker's "Why?" table (its own lock: a MAC always comes to
+    /// the same worker, and the workers do not wait on each other for it).
+    whys: Vec<Arc<Mutex<WhyTable>>>,
+    /// Sessions up by address (the identity chip, CGNAT's "Who was?").
+    by_ip: HashMap<Ipv4Addr, String>,
     pub stats: ServiceStats,
     /// `ppp.active.remove` and Disconnect-Requests, for the next round.
     pub terminate: Vec<String>,
@@ -138,35 +136,78 @@ pub(crate) struct Shared {
     pub lists: Vec<(String, String)>,
     /// Acct-Session-Id → session id.
     by_acct: HashMap<String, String>,
+    /// What each worker counts on its own (summed by [`Backend::stats`]).
+    lanes: Vec<LaneStats>,
 }
 
-impl Shared {
+/// One worker's share of the service counters.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LaneStats {
+    throttled: u64,
+    admission_rate: u32,
+    admission_reason: Option<String>,
+    counts: Counts,
+}
+
+/// Discovery and login counters a worker keeps without the shared lock
+/// (published once a second).
+#[derive(Debug, Clone, Copy, Default)]
+struct Counts {
+    padi: u64,
+    pado: u64,
+    padr: u64,
+    pads: u64,
+    padt_rx: u64,
+    padt_tx: u64,
+    auth_accept: u64,
+    auth_reject: u64,
+}
+
+/// `ppp.why`'s memory of one worker: per user and per MAC.
+#[derive(Default)]
+pub(crate) struct WhyTable {
+    /// The key is kept once, shared with `why_order`.
+    why: HashMap<Arc<str>, Track>,
+    /// Keys in the order they were used (a key used again is pushed again;
+    /// the old place is skipped when popped): the oldest is evicted first.
+    why_order: VecDeque<(Arc<str>, u64)>,
+    why_seq: u64,
+    /// [`WHY_KEYS`] (shared by the workers) unless a test sets it.
+    why_cap: usize,
+    lanes: usize,
+}
+
+impl WhyTable {
     fn track(&mut self, key: &str) -> Option<&mut Track> {
         let cap = if self.why_cap == 0 {
-            WHY_KEYS
+            WHY_KEYS / self.lanes.max(1)
         } else {
             self.why_cap
         };
         self.why_seq += 1;
         let seq = self.why_seq;
-        if !self.why.contains_key(key) {
-            while self.why.len() >= cap {
-                let Some((old, at)) = self.why_order.pop_front() else {
-                    break;
-                };
-                if self.why.get(&old).is_some_and(|t| t.seq == at) {
-                    self.why.remove(&old);
+        let k: Arc<str> = match self.why.get_key_value(key) {
+            Some((k, _)) => k.clone(),
+            None => {
+                while self.why.len() >= cap {
+                    let Some((old, at)) = self.why_order.pop_front() else {
+                        break;
+                    };
+                    if self.why.get(&old).is_some_and(|t| t.seq == at) {
+                        self.why.remove(&old);
+                    }
                 }
+                Arc::from(key)
             }
-        }
-        self.why_order.push_back((key.to_owned(), seq));
+        };
+        self.why_order.push_back((k.clone(), seq));
         if self.why_order.len() > 2 * cap + 1024 {
             // Mostly places of keys used again since: drop them.
             let why = &self.why;
             self.why_order
                 .retain(|(k, at)| why.get(k).is_some_and(|t| t.seq == *at));
         }
-        let t = self.why.entry(key.to_owned()).or_default();
+        let t = self.why.entry(k).or_default();
         t.seq = seq;
         Some(t)
     }
@@ -182,7 +223,7 @@ impl Shared {
         }
     }
 
-    fn record(&mut self, keys: &[&str], h: HistoryEntry) {
+    fn record(&mut self, keys: &[&str], h: &HistoryEntry) {
         for k in keys {
             if let Some(t) = self.track(k) {
                 if let Some(st) = h.stage {
@@ -193,6 +234,11 @@ impl Shared {
                 }
             }
         }
+    }
+}
+
+impl Shared {
+    fn record(&mut self, h: HistoryEntry) {
         if self.history.len() >= HISTORY {
             self.history.pop_front();
         }
@@ -259,25 +305,53 @@ impl PppBackend for Backend {
     }
 
     fn why(&self, name: Option<&str>, mac: Option<MacAddr>) -> Why {
-        let sh = guard(&self.0);
+        let (active, whys) = {
+            let sh = guard(&self.0);
+            let active = sh
+                .active
+                .values()
+                .find(|a| {
+                    name.is_some_and(|n| a.name == n)
+                        || mac.is_some_and(|m| a.caller_id == m.to_string())
+                })
+                .map(|a| a.id.clone());
+            (active, sh.whys.clone())
+        };
         let key = name
             .map(str::to_owned)
             .or_else(|| mac.map(|m| m.to_string()))
             .unwrap_or_default();
-        let active = sh
-            .active
-            .values()
-            .find(|a| {
-                name.is_some_and(|n| a.name == n)
-                    || mac.is_some_and(|m| a.caller_id == m.to_string())
-            })
-            .map(|a| a.id.clone());
-        let mut t = sh.why.get(&key).cloned().unwrap_or_default();
+        // A key may be in several workers' tables (a user from MACs that
+        // hash apart): attempts add up, the newest end is the one shown.
+        let lookup = |key: &str| -> Option<Track> {
+            let mut out: Option<Track> = None;
+            for w in &whys {
+                let Some(t) = guard(w).why.get(key).cloned() else {
+                    continue;
+                };
+                out = Some(match out {
+                    None => t,
+                    Some(mut o) => {
+                        for (a, b) in o.attempts.iter_mut().zip(t.attempts) {
+                            *a = a.saturating_add(b);
+                        }
+                        let newer = |x: &Track| x.last.as_ref().map_or(0, |l| l.at);
+                        if newer(&t) > newer(&o) {
+                            o.last = t.last;
+                            o.last_stage = t.last_stage;
+                        }
+                        o
+                    }
+                });
+            }
+            out
+        };
+        let mut t = lookup(&key).unwrap_or_default();
         // Before authentication the user is not known: the discovery
         // stages of a user are those of the MAC it last came from.
         if name.is_some()
             && let Some(m) = t.last.as_ref().map(|l| l.caller_id.clone())
-            && let Some(by_mac) = sh.why.get(&m)
+            && let Some(by_mac) = lookup(&m)
         {
             for st in [Stage::Padi, Stage::Padr, Stage::Lcp] {
                 let i = stage_index(st);
@@ -304,6 +378,21 @@ impl PppBackend for Backend {
         let sh = guard(&self.0);
         let mut st = sh.stats.clone();
         st.sessions = sh.active.len() as u64;
+        // The workers' own counters (G4.3g): the limits are per worker, the
+        // service's rate is their sum.
+        st.throttled = sh.lanes.iter().map(|l| l.throttled).sum();
+        let sum = |f: fn(&Counts) -> u64| sh.lanes.iter().map(|l| f(&l.counts)).sum::<u64>();
+        st.padi = sum(|c| c.padi);
+        st.pado = sum(|c| c.pado);
+        st.padr = sum(|c| c.padr);
+        st.pads = sum(|c| c.pads);
+        st.padt_rx = sum(|c| c.padt_rx);
+        st.padt_tx = sum(|c| c.padt_tx);
+        st.auth_accept = sum(|c| c.auth_accept);
+        st.auth_reject = sum(|c| c.auth_reject);
+        st.admission_rate = sh.lanes.iter().map(|l| l.admission_rate).sum();
+        st.admission_reason = sh.lanes.iter().find_map(|l| l.admission_reason.clone());
+        st.workers = sh.lanes.len().max(1) as u32;
         st.ipv6_sessions = sh
             .active
             .values()
@@ -314,11 +403,9 @@ impl PppBackend for Backend {
     }
 
     fn who(&self, ip: Ipv4Addr) -> Option<String> {
-        guard(&self.0)
-            .active
-            .values()
-            .find(|a| a.address == Some(ip))
-            .map(|a| a.name.clone())
+        let sh = guard(&self.0);
+        let id = sh.by_ip.get(&ip)?;
+        sh.active.get(id).map(|a| a.name.clone())
     }
 
     fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {
@@ -632,6 +719,18 @@ impl Admission {
     }
 }
 
+/// Slow path: subscriber address → the worker holding it.
+pub(crate) type Routes = Arc<std::sync::RwLock<HashMap<Ipv4Addr, u16>>>;
+
+/// A worker's share of a per-second rate (0 = no limit stays 0).
+fn share(rate: u32, lanes: u16) -> u32 {
+    if rate == 0 {
+        0
+    } else {
+        rate.div_ceil(u32::from(lanes.max(1))).max(1)
+    }
+}
+
 /// A port the driver opened for a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PortInfo {
@@ -772,7 +871,19 @@ pub(crate) struct Bng {
     subs: HashMap<(usize, u16), Sub>,
     /// Kept with `subs` (every insert, remove and Up goes through it).
     index: SubIndex,
-    pools: Pools,
+    /// Shared by the workers: an address is lent once in the whole BNG.
+    pools: Arc<Mutex<Pools>>,
+    /// This worker's "Why?" table (also in `Shared::whys` for the reads).
+    why: Arc<Mutex<WhyTable>>,
+    /// Counters published in `tick` (no shared lock per frame).
+    counts: Counts,
+    /// This worker and how many there are (G4.3g): SESSION_IDs and XDP
+    /// slots are split by `lane`, frames come by the client's MAC.
+    lane: u16,
+    lanes: u16,
+    /// Slow path: which worker holds each subscriber address (the driver
+    /// hands it the packets the kernel routes to `bng0`).
+    routes: Routes,
     xdp_free: Vec<u32>,
     xdp_next: u32,
     pub shared: Arc<Mutex<Shared>>,
@@ -796,7 +907,7 @@ pub(crate) struct Bng {
     /// The rate of the servers with `new_session_rate=auto`.
     pub admission: Admission,
     /// G4.3e: the /64s and delegated prefixes the sessions hold.
-    pools6: Pools6,
+    pools6: Arc<Mutex<Pools6>>,
     /// IPv6 packets refused before reaching a session's control plane.
     v6_dropped: u64,
 }
@@ -965,14 +1076,25 @@ pub(crate) fn explain(r: DownReason) -> (&'static str, &'static str, Stage, u32)
 impl Bng {
     pub(crate) fn new(seed: [u8; 32]) -> Self {
         let (auth_tx, auth_rx) = channel();
+        let why = Arc::new(Mutex::new(WhyTable {
+            lanes: 1,
+            ..WhyTable::default()
+        }));
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        guard(&shared).whys.push(why.clone());
         Self {
             slots: Vec::new(),
             subs: HashMap::new(),
             index: SubIndex::default(),
-            pools: Pools::default(),
+            pools: Arc::new(Mutex::new(Pools::default())),
+            lane: 0,
+            lanes: 1,
+            routes: Arc::new(std::sync::RwLock::new(HashMap::new())),
             xdp_free: Vec::new(),
             xdp_next: 0,
-            shared: Arc::new(Mutex::new(Shared::default())),
+            shared,
+            why,
+            counts: Counts::default(),
             effects: Vec::new(),
             frames: Vec::new(),
             upstream: Vec::new(),
@@ -987,9 +1109,54 @@ impl Bng {
             xdp: false,
             padr_throttled: 0,
             admission: Admission::default(),
-            pools6: Pools6::default(),
+            pools6: Arc::new(Mutex::new(Pools6::default())),
             v6_dropped: 0,
         }
+    }
+
+    /// Worker `lane` of `lanes`, sharing this one's tables: the active
+    /// table and history (`Shared`), the address pools and the slow path's
+    /// routes. Its own servers, sessions and timers (G4.3g).
+    pub(crate) fn sibling(&self, seed: [u8; 32], lane: u16, lanes: u16) -> Self {
+        let mut b = Self::new(seed);
+        b.shared = self.shared.clone();
+        guard(&b.why).lanes = usize::from(lanes.max(1));
+        guard(&b.shared).whys.push(b.why.clone());
+        b.pools = self.pools.clone();
+        b.pools6 = self.pools6.clone();
+        b.routes = self.routes.clone();
+        b.lane = lane;
+        b.lanes = lanes.max(1);
+        b
+    }
+
+    /// The first of `lanes` workers.
+    pub(crate) fn first_of(seed: [u8; 32], lanes: u16) -> Self {
+        let mut b = Self::new(seed);
+        b.lanes = lanes.max(1);
+        let n = usize::from(b.lanes);
+        guard(&b.shared).lanes = vec![LaneStats::default(); n];
+        guard(&b.why).lanes = n;
+        b
+    }
+
+    /// The slow path's address → worker table, for the reader.
+    pub(crate) fn clone_routes(&self) -> Routes {
+        self.routes.clone()
+    }
+
+    /// The worker of slow-path address `ip`, if a session holds it.
+    pub(crate) fn route_lane_in(routes: &Routes, ip: Ipv4Addr) -> Option<u16> {
+        routes.read().ok().and_then(|r| r.get(&ip).copied())
+    }
+
+    /// The worker of a frame from a client (its source MAC; RSS-like).
+    pub(crate) fn lane_of(frame: &[u8], lanes: u16) -> u16 {
+        let mac = frame.get(6..12).unwrap_or(&[]);
+        let h = mac.iter().fold(0x811c_9dc5u32, |h, b| {
+            (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
+        });
+        (h % u32::from(lanes.max(1))) as u16
     }
 
     fn log(&mut self, error: bool, text: String) {
@@ -1051,6 +1218,17 @@ impl Bng {
                 _ => None,
             };
             let mut sc = server_config(&w, port.mac, local);
+            // G4.3g: this worker's share of the port's SESSION_IDs, of the
+            // PADI limit and of the load the PADO delay looks at (a MAC
+            // always comes to the same worker: its own limit stays).
+            sc.sid_lane = (self.lane, self.lanes);
+            let lanes = u32::from(self.lanes);
+            if sc.padi_limit > 0 {
+                sc.padi_limit = sc.padi_limit.div_ceil(lanes);
+            }
+            for t in &mut sc.pado_delay {
+                t.0 = t.0.div_ceil(lanes);
+            }
             // G4.3e: IPv6CP everywhere, each session as its profile says
             // (`Reply::Ipv6` before the verdict); identifiers stable per line.
             sc.ipv6 = true;
@@ -1061,9 +1239,12 @@ impl Bng {
                     if w.new_session_rate_auto {
                         // The tick moves it; switching to auto keeps the
                         // tokens.
-                        s.bucket.set_rate(self.admission.rate as u32);
-                    } else if s.bucket.rate != w.new_session_rate || s.cfg.new_session_rate_auto {
-                        s.bucket = Bucket::new(w.new_session_rate, now);
+                        s.bucket
+                            .set_rate(share(self.admission.rate as u32, self.lanes));
+                    } else if s.bucket.rate != share(w.new_session_rate, self.lanes)
+                        || s.cfg.new_session_rate_auto
+                    {
+                        s.bucket = Bucket::new(share(w.new_session_rate, self.lanes), now);
                     }
                     s.cfg = w;
                 }
@@ -1074,21 +1255,26 @@ impl Bng {
                     }
                     let name = w.name.clone();
                     let interface = w.interface.to_string();
-                    let rate = if w.new_session_rate_auto {
-                        self.admission.rate as u32
-                    } else {
-                        w.new_session_rate
-                    };
+                    let rate = share(
+                        if w.new_session_rate_auto {
+                            self.admission.rate as u32
+                        } else {
+                            w.new_session_rate
+                        },
+                        self.lanes,
+                    );
                     self.slots.push(Slot {
                         bucket: Bucket::new(rate, now),
                         server: Server::new(sc, seed, now),
                         port,
                         cfg: w,
                     });
-                    self.log(
-                        false,
-                        format!("PPPoE: servidor {name} atendendo em {interface}"),
-                    );
+                    if self.lane == 0 {
+                        self.log(
+                            false,
+                            format!("PPPoE: servidor {name} atendendo em {interface}"),
+                        );
+                    }
                 }
             }
         }
@@ -1106,7 +1292,9 @@ impl Bng {
         }
         if i < self.slots.len() {
             let s = self.slots.remove(i);
-            self.log(false, format!("PPPoE: servidor {} parado", s.cfg.name));
+            if self.lane == 0 {
+                self.log(false, format!("PPPoE: servidor {} parado", s.cfg.name));
+            }
         }
         // Slots after `i` moved down one.
         let moved: Vec<((usize, u16), Sub)> = self
@@ -1130,6 +1318,13 @@ impl Bng {
     fn take_sub(&mut self, key: (usize, u16)) -> Option<Sub> {
         let sub = self.subs.remove(&key)?;
         self.index.remove(key, &sub);
+        if sub.up_at.is_some()
+            && let Some(ip) = sub.ip
+            && let Ok(mut r) = self.routes.write()
+            && r.get(&ip) == Some(&self.lane)
+        {
+            r.remove(&ip);
+        }
         Some(sub)
     }
 
@@ -1160,8 +1355,8 @@ impl Bng {
                 slot.cfg.max_sessions > 0 && slot.server.active() >= slot.cfg.max_sessions as usize;
             match code {
                 Code::Padi => {
-                    guard(&self.shared).stats.padi += 1;
-                    guard(&self.shared).reach(&[&key], Stage::Padi);
+                    self.counts.padi += 1;
+                    guard(&self.why).reach(&[&key], Stage::Padi);
                     if full {
                         return;
                     }
@@ -1176,13 +1371,13 @@ impl Bng {
                     }
                 }
                 Code::Padr => {
-                    guard(&self.shared).stats.padr += 1;
+                    self.counts.padr += 1;
                     if full {
                         return;
                     }
-                    guard(&self.shared).reach(&[&key], Stage::Padr);
+                    guard(&self.why).reach(&[&key], Stage::Padr);
                 }
-                Code::Padt => guard(&self.shared).stats.padt_rx += 1,
+                Code::Padt => self.counts.padt_rx += 1,
                 _ => {}
             }
             let _ = sessions;
@@ -1271,14 +1466,14 @@ impl Bng {
         let mut problems: Vec<String> = Vec::new();
         let mut alloc = |fixed: Option<ipnet::Ipv6Net>, pool: Option<&str>, what: &str| {
             if let Some(n) = fixed {
-                if self.pools6.hold(n) {
+                if guard(&self.pools6).hold(n) {
                     return Some((n, Source::Radius));
                 }
                 problems.push(format!("{what} {n} do RADIUS já está em uso"));
                 return None;
             }
             let name = pool?;
-            match self.pools6.take(&self.cfg.pools6, name) {
+            match guard(&self.pools6).take(&self.cfg.pools6, name) {
                 Some(n) => Some((n, Source::Pool(name.to_owned()))),
                 None => {
                     problems.push(format!("/ipv6 pool '{name}' sem {what} livre"));
@@ -1522,14 +1717,13 @@ impl Bng {
     fn absorb(&mut self, now: Millis, i: usize, out: &mut ServerOutput) {
         for (ifindex, f) in out.frames() {
             if let Ok(d) = discovery::parse(f) {
-                let mut sh = guard(&self.shared);
                 match d.code {
-                    Code::Pado => sh.stats.pado += 1,
+                    Code::Pado => self.counts.pado += 1,
                     Code::Pads if d.session_id != 0 => {
-                        sh.stats.pads += 1;
-                        sh.reach(&[&mac_text(d.dst)], Stage::Lcp);
+                        self.counts.pads += 1;
+                        guard(&self.why).reach(&[&mac_text(d.dst)], Stage::Lcp);
                     }
-                    Code::Padt => sh.stats.padt_tx += 1,
+                    Code::Padt => self.counts.padt_tx += 1,
                     _ => {}
                 }
             }
@@ -1556,7 +1750,7 @@ impl Bng {
                                 Some(AddrOrPool::Pool(p)) => Some(p.clone()),
                                 _ => None,
                             })?;
-                    let (ip, from) = self.pools.take(&self.cfg.pools, &pool)?;
+                    let (ip, from) = guard(&self.pools).take(&self.cfg.pools, &pool)?;
                     sub.ip = Some(ip);
                     sub.pool = Some(from);
                     Some(assignment(ip, &sub.effective.dns_server))
@@ -1602,7 +1796,7 @@ impl Bng {
     }
 
     fn reject(&mut self, i: usize, sref: SessionRef, why: &str) {
-        guard(&self.shared).stats.auth_reject += 1;
+        self.counts.auth_reject += 1;
         if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
             sub.reply_message = Some(why.to_owned());
         }
@@ -1675,7 +1869,7 @@ impl Bng {
             // place in the index goes.
             self.index.remove((i, sref.sid), &old);
         }
-        guard(&self.shared).reach(&[&user, &mac_text(mac)], Stage::Auth);
+        guard(&self.why).reach(&[&user, &mac_text(mac)], Stage::Auth);
         // O(1): the list's name index (`corerouter_model::ppp_secrets`).
         match self.cfg.ppp.secret(&user).cloned() {
             Some(sec) if sec.disabled => self.reject(i, sref, "secret disabled"),
@@ -1749,7 +1943,7 @@ impl Bng {
         // A fixed address held by another session: refuse rather than
         // hand one address to two subscribers.
         let ipv4 = match fixed {
-            Some(ip) if !self.pools.hold(ip) => {
+            Some(ip) if !guard(&self.pools).hold(ip) => {
                 sub.reply_message = Some(format!("address {ip} is in use"));
                 self.replies.push_back((
                     i,
@@ -1766,7 +1960,7 @@ impl Bng {
             }
             None => match pool
                 .as_deref()
-                .and_then(|p| self.pools.take(&self.cfg.pools, p))
+                .and_then(|p| guard(&self.pools).take(&self.cfg.pools, p))
             {
                 Some((ip, from)) => {
                     sub.ip = Some(ip);
@@ -1784,7 +1978,7 @@ impl Bng {
         sub.radius = radius;
         sub.interim = interim;
         sub.session_timeout = timeout;
-        guard(&self.shared).stats.auth_accept += 1;
+        self.counts.auth_accept += 1;
         let mode = match sub.effective.use_ipv6 {
             corerouter_model::ppp::UseIpv6::No => Ipv6Mode::Off,
             corerouter_model::ppp::UseIpv6::Require => Ipv6Mode::Require,
@@ -2004,6 +2198,12 @@ impl Bng {
             sub.ip = d.ipv4;
         }
         self.index.add((i, sref.sid), sub);
+        if xdp.is_none()
+            && let Some(ip) = sub.ip
+            && let Ok(mut r) = self.routes.write()
+        {
+            r.insert(ip, self.lane);
+        }
         let ip = sub.ip;
         let user = sub.user.clone();
         let mac = mac_text(sub.mac);
@@ -2062,23 +2262,28 @@ impl Bng {
         let list = sub.effective.address_list.clone();
         let hooks = sub.effective.on_up.clone();
         {
+            let h = HistoryEntry {
+                at: unix,
+                name: user.clone(),
+                caller_id: mac.clone(),
+                server: server.clone(),
+                event: "up".into(),
+                stage: Some(Stage::Up),
+                address: ip,
+                ..HistoryEntry::default()
+            };
+            {
+                let mut w = guard(&self.why);
+                w.reach(&[&user, &mac], Stage::Up);
+                w.record(&[&user, &mac], &h);
+            }
             let mut sh = guard(&self.shared);
             sh.active.insert(id.clone(), a);
             sh.by_acct.insert(acct_id.clone(), id.clone());
-            sh.reach(&[&user, &mac], Stage::Up);
-            sh.record(
-                &[&user, &mac],
-                HistoryEntry {
-                    at: unix,
-                    name: user.clone(),
-                    caller_id: mac.clone(),
-                    server: server.clone(),
-                    event: "up".into(),
-                    stage: Some(Stage::Up),
-                    address: ip,
-                    ..HistoryEntry::default()
-                },
-            );
+            if let Some(ip) = ip {
+                sh.by_ip.insert(ip, id.clone());
+            }
+            sh.record(h);
         }
         if radius_acct
             && self.cfg.ppp.aaa.accounting
@@ -2163,13 +2368,19 @@ impl Bng {
         }
     }
 
+    /// A free XDP slot of this worker's lane (slots `lane`, `lane +
+    /// lanes`, …: no lock between workers).
     fn slot_index(&mut self) -> Option<u32> {
         if let Some(i) = self.xdp_free.pop() {
             return Some(i);
         }
-        (self.xdp_next < XDP_SLOTS).then(|| {
+        let idx = self
+            .xdp_next
+            .checked_mul(u32::from(self.lanes))?
+            .checked_add(u32::from(self.lane))?;
+        (idx < XDP_SLOTS).then(|| {
             self.xdp_next += 1;
-            self.xdp_next - 1
+            idx
         })
     }
 
@@ -2193,7 +2404,7 @@ impl Bng {
             self.effects.push(Effect::Route { ip, add: false });
         }
         if let Some(ip) = sub.ip {
-            self.pools.give_back(ip);
+            guard(&self.pools).give_back(ip);
         }
         if let Some(x) = &sub.v6 {
             for (n, src) in [&x.link, &x.delegated].into_iter().flatten() {
@@ -2201,7 +2412,7 @@ impl Bng {
                     Source::Pool(p) => Some(p.as_str()),
                     Source::Radius => None,
                 };
-                self.pools6.give_back(*n, pool);
+                guard(&self.pools6).give_back(*n, pool);
             }
         }
         let mac = mac_text(sub.mac);
@@ -2220,6 +2431,11 @@ impl Bng {
             let mut sh = guard(&self.shared);
             let gone = sh.active.remove(&id);
             sh.by_acct.remove(&sub.acct_id);
+            if let Some(ip) = sub.ip
+                && sh.by_ip.get(&ip) == Some(&id)
+            {
+                sh.by_ip.remove(&ip);
+            }
             gone
         };
         let uptime = sub.up_at.map_or(0, |t| now.saturating_sub(t) / 1000);
@@ -2290,7 +2506,8 @@ impl Bng {
             rx_bytes: gone.as_ref().map_or(0, |a| a.rx_bytes),
             tx_bytes: gone.as_ref().map_or(0, |a| a.tx_bytes),
         };
-        guard(&self.shared).record(&[&sub.user, &mac], h);
+        guard(&self.why).record(&[&sub.user, &mac], &h);
+        guard(&self.shared).record(h);
         if was_up {
             self.log(
                 false,
@@ -2346,7 +2563,8 @@ impl Bng {
             hint: hint.into(),
             ..HistoryEntry::default()
         };
-        guard(&self.shared).record(&[&mac], h);
+        guard(&self.why).record(&[&mac], &h);
+        guard(&self.shared).record(h);
         self.log(
             false,
             format!("PPP: sessão de {mac} caiu antes do login ({key}): {hint}"),
@@ -2379,10 +2597,10 @@ impl Bng {
             .iter()
             .map(|s| s.server.stats().padi_limited)
             .sum();
-        guard(&self.shared).stats.throttled = self.padr_throttled + limited;
+        let throttled = self.padr_throttled + limited;
         // new_session_rate=auto: one AIMD step a second.
         self.admission.second(self.padr_throttled);
-        let rate = self.admission.rate as u32;
+        let rate = share(self.admission.rate as u32, self.lanes);
         let mut auto = false;
         for s in self
             .slots
@@ -2394,8 +2612,18 @@ impl Bng {
         }
         {
             let mut sh = guard(&self.shared);
-            sh.stats.admission_rate = if auto { rate } else { 0 };
-            sh.stats.admission_reason = auto.then(|| self.admission.reason.clone());
+            let lane = usize::from(self.lane);
+            if sh.lanes.len() <= lane {
+                sh.lanes.resize(lane + 1, LaneStats::default());
+            }
+            if let Some(l) = sh.lanes.get_mut(lane) {
+                *l = LaneStats {
+                    throttled,
+                    admission_rate: if auto { rate } else { 0 },
+                    admission_reason: auto.then(|| self.admission.reason.clone()),
+                    counts: self.counts,
+                };
+            }
         }
         let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
         {
@@ -2469,13 +2697,28 @@ impl Bng {
 
     /// `ppp.active.remove`, Disconnect and CoA rate changes.
     pub(crate) fn requests(&mut self, now: Millis) {
+        // Each worker takes the requests for its own SESSION_IDs and leaves
+        // the rest for the others (the id says which: `*server-sid`).
+        let (lane, lanes) = (self.lane, self.lanes);
+        let mine = |id: &str| parse_session_id(id).is_none_or(|(_, sid)| sid % lanes == lane);
         let (ids, rates, lists) = {
             let mut sh = guard(&self.shared);
-            (
-                std::mem::take(&mut sh.terminate),
-                std::mem::take(&mut sh.rates),
-                std::mem::take(&mut sh.lists),
-            )
+            if sh.terminate.is_empty() && sh.rates.is_empty() && sh.lists.is_empty() {
+                return;
+            }
+            let (ids, rest): (Vec<String>, Vec<String>) = std::mem::take(&mut sh.terminate)
+                .into_iter()
+                .partition(|id| mine(id));
+            sh.terminate = rest;
+            let (rates, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.rates)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.rates = rest;
+            let (lists, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.lists)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.lists = rest;
+            (ids, rates, lists)
         };
         for (id, list) in lists {
             let Some((i, sref)) = self.find(&id) else {
@@ -2542,11 +2785,12 @@ impl Bng {
         }
     }
 
+    /// The session of an id from `ppp.active` (`*server-sid`), in O(1)
+    /// (a walk of every session per id made removing N sessions O(N²)).
     fn find(&self, id: &str) -> Option<(usize, SessionRef)> {
-        self.subs
-            .iter()
-            .find(|((slot, sid), _)| session_id(*slot, &self.slots, *sid) == id)
-            .map(|(_, s)| (s.slot, s.sref))
+        let (server, sid) = parse_session_id(id)?;
+        let slot = self.slots.iter().position(|s| s.cfg.id.0 == server)?;
+        self.subs.get(&(slot, sid)).map(|s| (s.slot, s.sref))
     }
 
     /// End every session (service stopping): Terminate and PADT to each.
@@ -2599,12 +2843,13 @@ impl Bng {
             .map(|p| p.0)
             .collect();
         let unique6: HashSet<_> = v6.iter().copied().collect();
-        if unique6.len() != v6.len() || v6.len() != self.pools6.taken() {
+        // The pools are shared by the workers: their count is everyone's.
+        let taken = guard(&self.pools6).taken();
+        if unique6.len() != v6.len() || (self.lanes == 1 && v6.len() != taken) {
             return Err(format!(
-                "IPv6 prefixes: {} held, {} distinct, {} taken",
+                "IPv6 prefixes: {} held, {} distinct, {taken} taken",
                 v6.len(),
                 unique6.len(),
-                self.pools6.taken()
             ));
         }
         Ok(())
@@ -2640,6 +2885,12 @@ fn active_v6(x: &V6) -> ActiveV6 {
 fn session_id(slot: usize, slots: &[Slot], sid: u16) -> String {
     let server = slots.get(slot).map_or(0, |s| s.cfg.id.0);
     format!("*{server:X}-{sid}")
+}
+
+/// [`session_id`] read back: (server id, SESSION_ID).
+fn parse_session_id(id: &str) -> Option<(u32, u16)> {
+    let (server, sid) = id.strip_prefix('*')?.split_once('-')?;
+    Some((u32::from_str_radix(server, 16).ok()?, sid.parse().ok()?))
 }
 
 fn assignment(ip: Ipv4Addr, dns: &[Ipv4Addr]) -> Ipv4Assignment {
@@ -2732,16 +2983,16 @@ mod admission_tests {
 
     #[test]
     fn why_evicts_the_least_recently_used_not_everything() {
-        let mut sh = Shared {
+        let mut sh = WhyTable {
             why_cap: 3,
-            ..Shared::default()
+            ..WhyTable::default()
         };
         for k in ["a", "b", "c"] {
             sh.reach(&[k], Stage::Padi);
         }
         sh.reach(&["a"], Stage::Auth);
         sh.reach(&["d"], Stage::Padi);
-        let mut keys: Vec<&str> = sh.why.keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = sh.why.keys().map(|k| &**k).collect();
         keys.sort_unstable();
         assert_eq!(keys, ["a", "c", "d"], "b was the oldest unused");
         // A flood of new keys keeps the table at its size.

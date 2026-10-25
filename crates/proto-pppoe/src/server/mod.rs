@@ -111,6 +111,19 @@ pub struct ServerConfig {
     pub setup_timeout_ms: u64,
     /// Delayed PADOs held at most.
     pub pado_queue: usize,
+    /// `(lane, lanes)`: this server hands out only the SESSION_IDs with
+    /// `sid % lanes == lane`. Several servers on one port (the service's
+    /// workers, one per core) then share its SESSION_ID space without a
+    /// lock (RFC 2516 §4: unique per port). `(0, 1)`: all of them.
+    pub sid_lane: (u16, u16),
+}
+
+impl ServerConfig {
+    /// The SESSION_IDs this server may use, in order.
+    fn sids(&self) -> impl Iterator<Item = u16> + use<> {
+        let (lane, lanes) = (self.sid_lane.0, self.sid_lane.1.max(1));
+        (1..=self.max_sessions).filter(move |s| s % lanes == lane % lanes)
+    }
 }
 
 impl Default for ServerConfig {
@@ -141,6 +154,7 @@ impl Default for ServerConfig {
             answer_timeout_ms: 30_000,
             setup_timeout_ms: 60_000,
             pado_queue: 4096,
+            sid_lane: (0, 1),
         }
     }
 }
@@ -411,7 +425,7 @@ impl Server {
         let n = usize::from(cfg.max_sessions);
         Server {
             sessions: (0..=n).map(|_| None).collect(),
-            free: (1..=cfg.max_sessions).collect(),
+            free: cfg.sids().collect(),
             active: 0,
             generation: 0,
             wheel: Wheel::new(now),
@@ -441,6 +455,7 @@ impl Server {
     pub fn reconfigure(&mut self, mut cfg: ServerConfig) {
         cfg.ac_mac = self.cfg.ac_mac;
         cfg.max_sessions = self.cfg.max_sessions;
+        cfg.sid_lane = self.cfg.sid_lane;
         let limits = (cfg.padi_limit, cfg.mac_padi_limit, cfg.mac_padi_burst);
         if limits
             != (
@@ -991,11 +1006,12 @@ impl Server {
         if live != self.active {
             return Err(format!("active {} != live {live}", self.active));
         }
-        if live + self.free.len() != usize::from(self.cfg.max_sessions) {
+        let own = self.cfg.sids().count();
+        if live + self.free.len() != own {
             return Err(format!(
-                "live {live} + free {} != max {}",
+                "live {live} + free {} != {own} SESSION_IDs of lane {:?}",
                 self.free.len(),
-                self.cfg.max_sessions
+                self.cfg.sid_lane
             ));
         }
         let mut seen = vec![false; usize::from(MAX_SID) + 1];

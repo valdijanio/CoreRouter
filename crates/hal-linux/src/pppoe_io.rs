@@ -265,6 +265,33 @@ impl PppoePort {
             .map(|_| ())
             .map_err(io_err)
     }
+
+    /// A sender of its own for another thread (the service's workers send
+    /// while this one receives; G4.3g).
+    pub fn sender(&self) -> io::Result<PortSender> {
+        Ok(PortSender {
+            ifindex: self.ifindex,
+            tx: self.tx.try_clone()?,
+        })
+    }
+}
+
+/// The send side of a [`PppoePort`], for a worker thread.
+pub struct PortSender {
+    ifindex: u32,
+    tx: Socket,
+}
+
+impl PortSender {
+    pub fn ifindex(&self) -> u32 {
+        self.ifindex
+    }
+
+    pub fn send(&self, frame: &[u8]) -> io::Result<()> {
+        send(self.tx.as_raw_fd(), frame, MsgFlags::empty())
+            .map(|_| ())
+            .map_err(io_err)
+    }
 }
 
 /// Name of the slow path's device.
@@ -308,20 +335,7 @@ impl SlowPath {
 
     /// Send a subscriber's IPv4 packet (header included) into the stack.
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        let Some(dst) = packet.get(16..20) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "short IPv4 packet",
-            ));
-        };
-        let dst = Ipv4Addr::new(
-            dst.first().copied().unwrap_or(0),
-            dst.get(1).copied().unwrap_or(0),
-            dst.get(2).copied().unwrap_or(0),
-            dst.get(3).copied().unwrap_or(0),
-        );
-        let to = SocketAddr::V4(SocketAddrV4::new(dst, 0));
-        self.raw.send_to(packet, &to.into()).map(|_| ())
+        inject(&self.raw, packet)
     }
 
     /// IPv4 packets the kernel routed to a subscriber (`bng0`), without
@@ -363,6 +377,94 @@ impl SlowPath {
     pub fn remove_route(&self, ip: Ipv4Addr) -> io::Result<()> {
         route(self.ifindex, ip, false)
     }
+
+    /// The send side for a worker thread: its own raw socket and its own
+    /// netlink connection, kept open (one connection per route cost a
+    /// runtime and a socket each; G4.3g).
+    pub fn sender(&self) -> io::Result<SlowTx> {
+        let rt = runtime()?;
+        let handle = rt.block_on(async {
+            let (conn, handle, _) = rtnetlink::new_connection()?;
+            tokio::spawn(conn);
+            Ok::<_, io::Error>(handle)
+        })?;
+        Ok(SlowTx {
+            raw: self.raw.try_clone()?,
+            ifindex: self.ifindex,
+            rt,
+            handle,
+        })
+    }
+}
+
+/// The send side of a [`SlowPath`]: inject upstream packets and keep the
+/// `/32` routes to `bng0`.
+pub struct SlowTx {
+    raw: Socket,
+    ifindex: u32,
+    rt: tokio::runtime::Runtime,
+    handle: rtnetlink::Handle,
+}
+
+impl SlowTx {
+    pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
+        inject(&self.raw, packet)
+    }
+
+    /// Add (`true`) or remove these `/32` routes, all in one round on the
+    /// open connection. The first error is returned; the rest still run.
+    pub fn routes(&self, ops: &[(Ipv4Addr, bool)]) -> io::Result<()> {
+        use rtnetlink::RouteMessageBuilder;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let ifindex = self.ifindex;
+        self.rt.block_on(async {
+            let calls = ops.iter().map(|&(ip, add)| {
+                let h = self.handle.clone();
+                async move {
+                    let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+                        .destination_prefix(ip, 32)
+                        .output_interface(ifindex)
+                        .build();
+                    let out = if add {
+                        h.route().add(msg).replace().execute().await
+                    } else {
+                        h.route().del(msg).execute().await
+                    };
+                    match out {
+                        Ok(()) => Ok(()),
+                        Err(rtnetlink::Error::NetlinkError(e)) if !add && e.raw_code() == -3 => {
+                            Ok(())
+                        }
+                        Err(e) => Err(io::Error::other(format!(
+                            "route {ip}/32 via {SLOW_DEVICE}: {e}"
+                        ))),
+                    }
+                }
+            });
+            let results = futures_util::future::join_all(calls).await;
+            results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        })
+    }
+}
+
+/// A subscriber's IPv4 packet (header included) into the stack.
+fn inject(raw: &Socket, packet: &[u8]) -> io::Result<()> {
+    let Some(dst) = packet.get(16..20) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "short IPv4 packet",
+        ));
+    };
+    let dst = Ipv4Addr::new(
+        dst.first().copied().unwrap_or(0),
+        dst.get(1).copied().unwrap_or(0),
+        dst.get(2).copied().unwrap_or(0),
+        dst.get(3).copied().unwrap_or(0),
+    );
+    let to = SocketAddr::V4(SocketAddrV4::new(dst, 0));
+    raw.send_to(packet, &to.into()).map(|_| ())
 }
 
 fn runtime() -> io::Result<tokio::runtime::Runtime> {

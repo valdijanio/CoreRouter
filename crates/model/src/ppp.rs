@@ -127,6 +127,24 @@ pub struct Ppp {
     /// Next id of the three tables (never reused).
     #[serde(skip_serializing_if = "is_zero")]
     pub next_id: u32,
+    /// Control-plane workers of the PPPoE service (G4.3g), one per core:
+    /// 0 = auto ([`pppoe_workers_auto`]). Read when the service starts.
+    #[serde(default, skip_serializing_if = "is_zero16")]
+    pub pppoe_workers: u16,
+}
+
+fn is_zero16(v: &u16) -> bool {
+    *v == 0
+}
+
+/// Most workers the PPPoE service runs.
+pub const PPPOE_WORKERS_MAX: u16 = 64;
+
+/// `workers=auto` on a machine of `cpus` CPUs: all but two (the reader
+/// thread and the rest of the router, including the data plane's softirqs),
+/// at most 8 (past that the reader is the limit, measured in G4.3g).
+pub fn pppoe_workers_auto(cpus: usize) -> u16 {
+    u16::try_from(cpus.saturating_sub(2).clamp(1, 8)).unwrap_or(1)
 }
 
 fn no_secrets(v: &Secrets) -> bool {
@@ -976,6 +994,9 @@ pub struct ServiceStats {
     pub auth_reject: u64,
     pub throttled: u64,
     pub dataplane: bool,
+    /// Control-plane workers of the service (G4.3g; 1 = one thread).
+    #[serde(default)]
+    pub workers: u32,
     /// `new_session_rate=auto`: the rate now (0: no server uses it) and why.
     #[serde(default)]
     pub admission_rate: u32,

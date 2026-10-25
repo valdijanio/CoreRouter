@@ -40,6 +40,7 @@
 
 mod common;
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, UdpSocket};
 use std::os::unix::net::UnixStream;
@@ -129,6 +130,32 @@ fn cpu_secs(pid: u32) -> f64 {
         + f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
     let hz: f64 = sh("getconf", &["CLK_TCK"]).trim().parse().unwrap_or(100.0);
     ticks / hz
+}
+
+/// CPU time (s) of each thread of `pid`, by thread name.
+fn thread_cpu(pid: u32) -> HashMap<String, f64> {
+    let hz: f64 = sh("getconf", &["CLK_TCK"]).trim().parse().unwrap_or(100.0);
+    let mut out = HashMap::new();
+    for t in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let Ok(stat) = std::fs::read_to_string(t.path().join("stat")) else {
+            continue;
+        };
+        let name = stat
+            .split_once('(')
+            .and_then(|(_, r)| r.rsplit_once(')'))
+            .map_or("?", |(n, _)| n)
+            .to_owned();
+        let rest = stat.rsplit_once(')').map_or("", |(_, r)| r);
+        let f: Vec<&str> = rest.split_whitespace().collect();
+        let ticks: f64 = f.get(11).and_then(|v| v.parse().ok()).unwrap_or(0.0)
+            + f.get(12).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        *out.entry(name).or_insert(0.0) += ticks / hz;
+    }
+    out
 }
 
 /// One line of the summary.
@@ -1204,6 +1231,84 @@ fn radius_policer(lab: &Lab, k: usize, s: &mut Summary) {
     }
 }
 
+/// The control plane on one core and on several (G4.3g): `n` sessions set
+/// up with `workers=1` and with `auto`, the rate and each thread's CPU.
+fn workers_compare(lab: &Lab, n: usize, s: &mut Summary) {
+    let sc = format!("workers {}k", n / 1000);
+    let pid = lab.pid();
+    for w in [json!(1), json!("auto")] {
+        ok("interface.pppoe-server.settings.set", json!({"workers": w}));
+        let _ = call(None, "system.service.restart", json!({"name": "pppoe"}));
+        wait_for("the pppoe service again", || {
+            ok("interface.pppoe-server.monitor", json!({}))["running"] == true
+                && ok("interface.pppoe-server.settings.get", json!({}))["running"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    > 0
+        });
+        let workers = ok("interface.pppoe-server.settings.get", json!({}))["running"]
+            .as_u64()
+            .unwrap_or(0);
+        lab.servers(false);
+        std::thread::sleep(Duration::from_millis(1500));
+        let mut cfg = blaster_config(n, "user", 0.0, None);
+        cfg["sessions"]["max-outstanding"] = json!(n.min(60_000));
+        cfg["sessions"]["start-rate"] = json!(50_000);
+        cfg["session-traffic"] = json!({"autostart": false, "ipv4-pps": 0});
+        let c0 = thread_cpu(pid);
+        let t = Instant::now();
+        let bl = Blaster::start(lab, &format!("workers-{workers}"), &cfg, &[]);
+        let took = wait_long("setup", 120 + n as u64 / 200, || {
+            bl.established() as usize >= n
+        });
+        let wall = t.elapsed().as_secs_f64();
+        let c1 = thread_cpu(pid);
+        let mut busy: Vec<(String, f64)> = c1
+            .iter()
+            .filter(|(k, _)| k.starts_with("pppoe"))
+            .map(|(k, v)| {
+                (
+                    k.clone(),
+                    (v - c0.get(k).copied().unwrap_or(0.0)) * 100.0 / wall,
+                )
+            })
+            .collect();
+        busy.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let total: f64 = busy.iter().map(|b| b.1).sum();
+        let top: Vec<String> = busy
+            .iter()
+            .take(3)
+            .map(|(k, v)| format!("{k} {v:.0}%"))
+            .collect();
+        match took {
+            Some(secs) => s.put(
+                &sc,
+                &format!("{workers} worker(s): setup"),
+                n as f64 / secs,
+                "sessões/s",
+                &format!(
+                    "{secs:.1} s; CPU das threads pppoe {total:.0}% de um núcleo ({})",
+                    top.join(", ")
+                ),
+            ),
+            None => s.put(
+                &sc,
+                &format!("{workers} worker(s): no ar (incompleto)"),
+                bl.established() as f64,
+                "sessões",
+                "",
+            ),
+        }
+        s.check(
+            &format!("{sc} {workers} worker(s) completo"),
+            took.is_some(),
+            format!("{wall:.1} s"),
+        );
+        let _ = bl.stop(120 + n as u64 / 500);
+        wait_long("teardown", 180, || active() == 0);
+    }
+}
+
 /// RADIUS timeouts and resends of the configured servers so far.
 fn radius_counts() -> (u64, u64) {
     ok("radius.monitor", json!({}))
@@ -1599,6 +1704,13 @@ fn bng_lab() {
     if want("radius") {
         radius_policer(&lab, k, &mut s);
     }
+    if want("workers") {
+        workers_compare(
+            &lab,
+            env_or("BNG_LAB_WORKERS_N", 100_000usize).min(max),
+            &mut s,
+        );
+    }
     if want("wave") {
         let n = env_or("BNG_LAB_WAVE", 100_000usize).min(max);
         radius_wave(&lab, n, env_or("BNG_LAB_RADIUS_CAP", 3000u32), &mut s);
@@ -1633,6 +1745,7 @@ fn bng_lab() {
         "root": root,
         "BNG Blaster": version,
         "portas de acesso": ports,
+        "workers": ok("interface.pppoe-server.settings.get", json!({}))["running"].clone(),
     });
     s.write(&out, &meta);
     eprintln!("lab: summary in {}", out.join("summary.md").display());

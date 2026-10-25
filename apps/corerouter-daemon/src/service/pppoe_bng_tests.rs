@@ -803,3 +803,73 @@ fn radius_prefixes_win_and_reach_the_accounting() {
     assert!(start.attributes.iter().any(|a| a.name == "Delegated-IPv6-Prefix" && a.value == "2001:db8:bbbb::/48"));
     assert!(start.attributes.iter().any(|a| a.name == "Framed-Interface-Id"));
 }
+
+/// G4.3g: four workers on one port, frames handed out by the client's MAC
+/// as the driver does. Every subscriber comes up, no SESSION_ID or address
+/// is given twice, and the load spreads.
+#[test]
+fn workers_split_one_port_without_collisions() {
+    let n = 4000;
+    let lanes = 4u16;
+    let s = snap(n, server(serde_json::json!({})), 65_000);
+    let ports = HashMap::from([("pppoe-ether2".to_owned(), PortInfo { ifindex: IFINDEX, mac: BNG_MAC })]);
+    let mut bngs = vec![Bng::first_of([7; 32], lanes)];
+    for l in 1..lanes {
+        let b = bngs[0].sibling([7 + l as u8; 32], l, lanes);
+        bngs.push(b);
+    }
+    for b in &mut bngs {
+        b.configure(0, s.clone(), &ports);
+    }
+    // The clients of a lab (its own BNG is not used).
+    let mut lab = Lab::new(n, s.clone(), |i| (format!("u{i}"), format!("p{i}")));
+    let mut out = ClientOutput::new();
+    for c in &mut lab.clients {
+        c.start(0, &mut out);
+    }
+    let mut wire: Vec<Vec<u8>> = out.frames().map(|(_, f)| f.to_vec()).collect();
+    out.clear();
+    let mut per_lane = vec![0usize; usize::from(lanes)];
+    while !wire.is_empty() {
+        for f in wire.drain(..) {
+            let lane = Bng::lane_of(&f, lanes);
+            per_lane[usize::from(lane)] += 1;
+            bngs[usize::from(lane)].frame(0, IFINDEX, &f);
+        }
+        for b in &mut bngs {
+            b.effects.clear();
+            for (_, f) in b.frames.drain(..) {
+                let mut dst = [0u8; 6];
+                dst.copy_from_slice(&f[..6]);
+                if let Some(&c) = lab.by_mac.get(&dst) {
+                    lab.clients[c].handle_frame(0, &f, &mut out);
+                    lab.events(c, &mut out);
+                    wire.extend(out.frames().map(|(_, f)| f.to_vec()));
+                    out.clear();
+                }
+            }
+        }
+    }
+    assert_eq!(lab.ups(), n, "every subscriber up");
+    for b in &bngs {
+        b.check().unwrap();
+    }
+    let active = Backend(bngs[0].shared.clone()).active();
+    assert_eq!(active.len(), n);
+    let ips: std::collections::HashSet<_> = active.iter().filter_map(|a| a.address).collect();
+    assert_eq!(ips.len(), n, "one address each across the workers");
+    let ids: std::collections::HashSet<_> = active.iter().map(|a| a.session_id).collect();
+    assert_eq!(ids.len(), n, "one SESSION_ID each on the port");
+    for (l, frames) in per_lane.iter().enumerate() {
+        let share = *frames as f64 / per_lane.iter().sum::<usize>() as f64;
+        assert!((0.15..0.35).contains(&share), "lane {l} got {share:.2} of the frames");
+    }
+    // ppp.active.remove of one session: only its worker takes it.
+    let id = active[0].id.clone();
+    Backend(bngs[0].shared.clone()).terminate(std::slice::from_ref(&id));
+    for b in &mut bngs {
+        b.requests(0);
+    }
+    let frames: usize = bngs.iter().map(|b| b.frames.len()).sum();
+    assert!(frames >= 1, "the owner sent the Terminate-Request");
+}

@@ -747,3 +747,27 @@ fn reconfigure_keeps_the_mac_and_the_sid_space() {
     assert_eq!((s.config().padi_limit, s.config().max_mru), (10, 1400));
     s.check_invariants().unwrap();
 }
+
+/// G4.3g: the service's workers split one port's SESSION_ID space by lane,
+/// with no SID in two lanes and none left out.
+#[test]
+fn sid_lanes_split_the_space_without_overlap() {
+    let lanes = 3u16;
+    let mut seen = vec![0u8; usize::from(MAX_SID) + 1];
+    for lane in 0..lanes {
+        let cfg = ServerConfig {
+            sid_lane: (lane, lanes),
+            ..ServerConfig::default()
+        };
+        for sid in cfg.sids() {
+            seen[usize::from(sid)] += 1;
+        }
+        let s = Server::new(cfg, [lane as u8; 32], 0);
+        s.check_invariants().unwrap();
+    }
+    assert_eq!(seen[0], 0, "SID 0 is never a session (RFC 2516 §4)");
+    assert!(
+        seen[1..].iter().all(|n| *n == 1),
+        "each SID in exactly one lane"
+    );
+}
