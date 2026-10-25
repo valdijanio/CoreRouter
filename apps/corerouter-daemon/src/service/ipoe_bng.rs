@@ -90,6 +90,7 @@ struct Authz {
 struct Asked {
     at_ms: u64,
     user: String,
+    mac: String,
 }
 
 /// One session (a bound lease).
@@ -186,7 +187,11 @@ impl State {
     }
 
     fn reach(&mut self, keys: &[&str], stage: Stage) {
-        for k in keys {
+        // A subscriber named by its MAC is one key, not two.
+        for (i, k) in keys.iter().enumerate() {
+            if keys.get(..i).is_some_and(|before| before.contains(k)) {
+                continue;
+            }
             let t = self.track(k);
             if let Some(n) = t.attempts.get_mut(stage_index(stage)) {
                 *n = n.saturating_add(1);
@@ -196,7 +201,10 @@ impl State {
     }
 
     fn record(&mut self, keys: &[&str], h: HistoryEntry) {
-        for k in keys {
+        for (i, k) in keys.iter().enumerate() {
+            if keys.get(..i).is_some_and(|before| before.contains(k)) {
+                continue;
+            }
             let t = self.track(k);
             if let Some(st) = h.stage {
                 t.last_stage = Some(st);
@@ -542,15 +550,19 @@ impl Core {
             }
             other => {
                 st.stats.auth_reject += 1;
-                let why = reply.message.clone().unwrap_or_else(|| match other {
+                // The server's own words (Reply-Message), when it sent some.
+                let said = reply
+                    .attributes
+                    .iter()
+                    .find(|a| a.name == "Reply-Message")
+                    .map(|a| a.value.clone())
+                    .or_else(|| reply.message.clone())
+                    .filter(|m| !m.is_empty());
+                let why = said.clone().unwrap_or_else(|| match other {
                     AuthOutcome::Reject | AuthOutcome::Challenge => "rejected by RADIUS".into(),
                     _ => "RADIUS did not answer".into(),
                 });
-                let mac = st
-                    .servers
-                    .get(&key.0)
-                    .map(|_| asked.user.clone())
-                    .unwrap_or_default();
+                let mac = asked.mac.clone();
                 let (reason, hint) = if matches!(
                     other,
                     AuthOutcome::Reject | AuthOutcome::Challenge
@@ -574,10 +586,10 @@ impl Core {
                     stage: Some(Stage::Auth),
                     reason: reason.into(),
                     hint: hint.into(),
-                    reply_message: Some(why.clone()),
+                    reply_message: said,
                     ..HistoryEntry::default()
                 };
-                st.record(&[&asked.user], h);
+                st.record(&[&asked.user, &mac], h);
                 Verdict::Reject(why)
             }
         };
@@ -956,6 +968,7 @@ impl Core {
             Asked {
                 at_ms: self.ms(),
                 user: user.clone(),
+                mac: mac.clone(),
             },
         );
         drop(st);

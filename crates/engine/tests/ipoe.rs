@@ -101,7 +101,8 @@ fn the_new_fields_are_validated_and_printed() {
     }
     let rows = ok(&mut s, "ip.dhcp-server.print", json!({}));
     assert_eq!(rows[0]["use_radius"], "yes");
-    assert_eq!(rows[0]["ipoe"], true, "use_radius implies sessions");
+    assert_eq!(rows[0]["ipoe"], false);
+    assert_eq!(rows[0]["sessions"], true, "use_radius implies sessions");
     assert_eq!(rows[0]["ipoe_username"], "mac");
     // A lease rate-limit is parsed as RouterOS' and warned off an ipoe server.
     let e = s
