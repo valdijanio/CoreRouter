@@ -17,7 +17,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{find?: string (in name, caller id, address or circuit id), server?: string, limit?: int 1..100000 (default 10000)} → {total, running (the pppoe service is up), rows: [{id, name, service, caller_id, address?, uptime, uptime_secs, session_id, server, interface, vlan?, circuit_id?, remote_id?, rate_limit?, profile, encoding, radius, rx_bytes, tx_bytes, rx_packets, tx_packets, mtu, limit_bytes_in?, limit_bytes_out?}]}",
         always, list),
     cmd!("ppp.active.remove", "Disconnect PPP Session", [], None,
-        "{id?: string | [string] (the session ids of ppp.active.list), name?: string (every session of this user)} → {removed}",
+        "{id?: string | [string] (the session ids of ppp.active.list; at most 100000), name?: string (every session of this user), server?: string (every session of this PPPoE server)} → {removed}",
         has_service, remove),
     cmd!(query "ppp.why", "Why PPP?", [], None,
         "{name?: string (the user), mac?: mac (the CPE)} → {query, active?, attempts: [{stage, count}], last_stage?, last?: {at, event, stage?, reason, hint, reply_message?, address?, uptime_secs}}",
@@ -89,22 +89,36 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
-    let ids = opt_list(p, "id")?.unwrap_or_default();
+    let ids: Vec<String> = match p.get("id") {
+        None | Some(Value::Null) => Vec::new(),
+        Some(Value::Array(a)) if a.len() <= 100_000 => a
+            .iter()
+            .map(|v| v.as_str().map(str::to_owned).ok_or_else(|| EngineError::bad("id", "a list of session ids")))
+            .collect::<Result<_>>()?,
+        Some(Value::Array(_)) => return Err(EngineError::bad("id", "at most 100000 ids")),
+        Some(_) => opt_list(p, "id")?.unwrap_or_default(),
+    };
     let name = opt_str(p, "name")?.map(str::to_owned);
-    if ids.is_empty() && name.is_none() {
-        return Err(EngineError::bad("id", "give id (from ppp.active.list) or name"));
+    let server = opt_str(p, "server")?.map(str::to_owned);
+    if ids.is_empty() && name.is_none() && server.is_none() {
+        return Err(EngineError::bad("id", "give id (from ppp.active.list), name or server"));
     }
     let Some(b) = s.ppp_backend() else {
         return Err(EngineError::bad("id", "the pppoe service is not running"));
     };
     let mut targets = ids;
-    if let Some(n) = &name {
-        targets.extend(b.active().into_iter().filter(|a| &a.name == n).map(|a| a.id));
+    if name.is_some() || server.is_some() {
+        targets.extend(
+            b.active()
+                .into_iter()
+                .filter(|a| name.as_ref().is_some_and(|n| &a.name == n) || server.as_ref().is_some_and(|v| &a.server == v))
+                .map(|a| a.id),
+        );
     }
     let removed = b.terminate(&targets);
     if removed == 0 {
         let shown: String = targets.join(",").chars().take(64).collect();
-        let what = if shown.is_empty() { name.unwrap_or_default() } else { shown };
+        let what = if shown.is_empty() { name.or(server).unwrap_or_default() } else { shown };
         return Err(EngineError::bad("id", format!("no active session '{what}'")));
     }
     Ok(json!({"removed": removed}))

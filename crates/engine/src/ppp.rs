@@ -84,3 +84,25 @@ pub fn expand_hook(params: &serde_json::Map<String, Value>, vars: &[(&str, Strin
     }
     Value::Object(out)
 }
+
+/// The BNG service's way to the XDP session map (G4.3c) through the HAL:
+/// short calls, made once a round under the session lock.
+impl Session {
+    /// Switch the PPPoE data plane on for `ports` (by name). `Err` says why
+    /// not (no XDP, not attached there): the service then uses its slow
+    /// path.
+    pub fn pppoe_dataplane(&mut self, on: bool, ports: &[corerouter_model::IfName]) -> Result<(), String> {
+        self.hal_mut().pppoe_dataplane(on, ports).map_err(|e| e.to_string())
+    }
+
+    pub fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), String> {
+        self.hal_mut().pppoe_apply(ops).map_err(|e| e.to_string())
+    }
+
+    pub fn pppoe_counters(&mut self, slots: &[u32]) -> Vec<(u32, corerouter_hal::pppoe::PppoeCounters)> {
+        if slots.is_empty() {
+            return Vec::new();
+        }
+        self.hal_mut().pppoe_counters(slots)
+    }
+}

@@ -117,6 +117,10 @@ pub mod trace;
 #[cfg(target_os = "linux")]
 pub mod capture;
 
+/// PPPoE access ports and the slow path of the BNG (G4.3d): `AF_PACKET`.
+#[cfg(target_os = "linux")]
+pub mod pppoe_io;
+
 /// System › Tuning (G1.26): kernel parameters, the machine, counters.
 #[cfg(target_os = "linux")]
 pub mod tuning;
@@ -632,6 +636,24 @@ mod linux {
 
         fn xdp_reset(&mut self) -> Result<(), HalError> {
             self.xdp.reset()
+        }
+
+        fn pppoe_dataplane(&mut self, on: bool, ports: &[IfName]) -> Result<(), HalError> {
+            if on {
+                self.xdp.pppoe_ready(ports)?;
+            }
+            self.xdp.set_pppoe(on)
+        }
+
+        fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), HalError> {
+            self.xdp.pppoe_apply(ops)
+        }
+
+        fn pppoe_counters(
+            &mut self,
+            slots: &[u32],
+        ) -> Vec<(u32, corerouter_hal::pppoe::PppoeCounters)> {
+            self.xdp.pppoe_counters_of(slots)
         }
 
         fn xdp_nat_link(&mut self) -> Result<Box<dyn corerouter_hal::xdp_nat::NatLink>, HalError> {

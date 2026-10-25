@@ -1,0 +1,357 @@
+//! The PPPoE access concentrator (G4.3d) as a service: the I/O around the
+//! BNG of `pppoe_bng.rs`. One thread owns the access ports (`AF_PACKET`
+//! through `hal-linux::pppoe_io`), the BNG and, without XDP, the slow
+//! path. The session lock is taken once a round, and only to read the
+//! config, run what the BNG asked (XDP map, hooks, address lists, log
+//! lines) and read the XDP counters: never while waiting on the network.
+//!
+//! With the XDP data plane (G4.3c) the subscribers' traffic never reaches
+//! this thread: only control frames do (`XDP_PASS`). Without it (virtual
+//! lab, a NIC without XDP, the unprivileged namespace tests) the thread
+//! carries IPv4 itself (`pppoe_io::SlowPath`).
+
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use std::os::fd::BorrowedFd;
+use std::sync::Arc;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
+
+use corerouter_engine::{Shared, lock};
+use corerouter_hal::pppoe::PppoeOp;
+use corerouter_hal_linux::pppoe_io::{PppoePort, SlowPath};
+use corerouter_model::ppp::PppoeServer;
+use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
+use serde_json::{Value, json};
+
+use super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot, vlan_ids};
+
+/// Longest wait for a frame; timers and RADIUS answers are looked at
+/// least this often.
+const WAIT: Duration = Duration::from_millis(20);
+/// The config, the counters and the limits: once a second.
+const SECOND: Duration = Duration::from_secs(1);
+const IDLE: Duration = Duration::from_millis(500);
+
+pub(crate) const SERVICE: super::Service = super::Service {
+    name: "pppoe",
+    flags: &[],
+    topic: "ppp",
+    enable: "interface.pppoe-server.server.add interface=…",
+    depends: &["radius"],
+    start,
+};
+
+fn origin() -> Instant {
+    static START: OnceLock<Instant> = OnceLock::new();
+    *START.get_or_init(Instant::now)
+}
+
+fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
+    let session = ctx.session.clone();
+    Ok(Box::new(move |health: &super::Health| run(&session, health)))
+}
+
+fn seed() -> [u8; 32] {
+    let mut s = [0u8; 32];
+    if getrandom::fill(&mut s).is_err() {
+        // Not secret material by itself (the AC-Cookie key is drawn from
+        // it): the clock still makes two runs differ.
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        for (b, x) in s.iter_mut().zip(t.to_le_bytes().iter().cycle()) {
+            *b ^= x;
+        }
+    }
+    s
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// An open access port and what it was opened for.
+struct Open {
+    port: PppoePort,
+    vlans: Vec<u16>,
+    untagged: bool,
+}
+
+struct Driver {
+    bng: Bng,
+    ports: HashMap<String, Open>,
+    slow: Option<SlowPath>,
+    /// Data plane decided for these access ports: Some(true) XDP,
+    /// Some(false) slow path. Decided again when the ports change (for new
+    /// sessions; each session keeps the plane it started on).
+    plane: Option<bool>,
+    plane_for: Vec<corerouter_model::IfName>,
+    /// Address-list entries we added: (list, ip) → id.
+    lists: HashMap<(String, Ipv4Addr), String>,
+    errors: Vec<String>,
+}
+
+fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
+    let base = origin();
+    let ms = move || u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let unix_base = unix_now().saturating_sub(ms() / 1000);
+    let mut d = Driver {
+        bng: Bng::new(seed()),
+        ports: HashMap::new(),
+        slow: None,
+        plane: None,
+        plane_for: Vec::new(),
+        lists: HashMap::new(),
+        errors: Vec::new(),
+    };
+    let owner = Arc::new(Owner(d.bng.shared.clone()));
+    let mut owner_of: Option<usize> = None;
+    lock(session).set_ppp_backend(Arc::new(Backend(d.bng.shared.clone())));
+    let mut last_second: Option<Instant> = None;
+    loop {
+        if health.stopping() {
+            break;
+        }
+        health.beat();
+        let now = ms();
+        if last_second.is_none_or(|t| t.elapsed() >= SECOND) {
+            last_second = Some(Instant::now());
+            let (ppp, pools, aaa) = {
+                let s = lock(session);
+                let c = s.store().running();
+                (c.ppp.clone(), c.ip.pools.clone(), s.aaa_backend())
+            };
+            // CoA/Disconnect: one registration per RADIUS service.
+            if let Some(a) = &aaa {
+                let key = Arc::as_ptr(a) as *const () as usize;
+                if owner_of != Some(key) {
+                    a.register_owner(owner.clone());
+                    owner_of = Some(key);
+                }
+            }
+            let wanted = Bng::wanted(&ppp);
+            if wanted.is_empty() {
+                health.disabled(Some("no enabled PPPoE server (interface.pppoe-server.server.add)"));
+            } else {
+                health.disabled(None);
+            }
+            d.errors.clear();
+            let infos = d.open_ports(&wanted);
+            if !wanted.is_empty() {
+                let mut ifaces: Vec<_> = wanted.iter().map(|w| w.interface.clone()).collect();
+                ifaces.sort();
+                d.choose_plane(session, ifaces);
+            }
+            d.bng.configure(now, Snapshot { ppp, pools, aaa, unix_base }, &infos);
+            let counters = if d.plane == Some(true) {
+                lock(session).pppoe_counters(&d.bng.xdp_slots())
+            } else {
+                Vec::new()
+            };
+            d.bng.tick(now, &counters);
+            if d.errors.is_empty() {
+                health.clear_error();
+            } else {
+                health.error(d.errors.join("; "));
+            }
+            if wanted.is_empty() {
+                d.flush(session);
+                if !health.sleep(IDLE) {
+                    break;
+                }
+                continue;
+            }
+        }
+        d.wait(now, &d.bng);
+        let now = ms();
+        d.receive(now);
+        d.bng.radius(now);
+        d.bng.timers(now);
+        d.bng.requests(now);
+        d.flush(session);
+    }
+    // Stopping: tell the subscribers (Terminate, PADT) and clean the maps.
+    let now = ms();
+    d.bng.shutdown(now);
+    d.flush(session);
+    Ok(())
+}
+
+impl Driver {
+    /// Open the ports the servers need, close the rest; the open ones by
+    /// server name.
+    fn open_ports(&mut self, wanted: &[PppoeServer]) -> HashMap<String, PortInfo> {
+        self.ports.retain(|name, _| wanted.iter().any(|w| &w.name == name));
+        let mut infos = HashMap::new();
+        for w in wanted {
+            let vlans = vlan_ids(w);
+            let untagged = w.pppoe_over_vlan_range.is_empty() || w.accept_untagged;
+            let same = self
+                .ports
+                .get(&w.name)
+                .is_some_and(|o| o.vlans == vlans && o.untagged == untagged && o.port.name() == &w.interface);
+            if !same {
+                self.ports.remove(&w.name);
+                match PppoePort::open(&w.interface, &vlans, untagged) {
+                    Ok(port) => {
+                        self.ports.insert(w.name.clone(), Open { port, vlans, untagged });
+                    }
+                    Err(e) => {
+                        self.errors.push(format!("{}: {e}", w.interface));
+                        continue;
+                    }
+                }
+            }
+            if let Some(o) = self.ports.get(&w.name) {
+                infos.insert(w.name.clone(), PortInfo { ifindex: o.port.ifindex(), mac: o.port.mac() });
+            }
+        }
+        infos
+    }
+
+    /// XDP when the HAL has it, else the slow path (once).
+    fn choose_plane(&mut self, session: &Shared, ifaces: Vec<corerouter_model::IfName>) {
+        if self.plane.is_some() && self.plane_for == ifaces {
+            return;
+        }
+        let r = lock(session).pppoe_dataplane(true, &ifaces);
+        self.plane_for = ifaces;
+        match r {
+            Ok(()) => {
+                self.plane = Some(true);
+                self.bng.xdp = true;
+            }
+            Err(why) => {
+                self.plane = Some(false);
+                self.bng.xdp = false;
+                if self.slow.is_some() {
+                    return;
+                }
+                match SlowPath::open() {
+                    Ok(s) => self.slow = Some(s),
+                    Err(e) => self
+                        .errors
+                        .push(format!("no XDP ({why}) and no slow path ({e}): subscribers get no traffic")),
+                }
+            }
+        }
+    }
+
+    fn wait(&self, now: u64, bng: &Bng) {
+        let mut fds: Vec<BorrowedFd<'_>> = self.ports.values().flat_map(|o| o.port.fds()).collect();
+        if let Some(s) = &self.slow {
+            fds.push(s.fd());
+        }
+        let mut wait = WAIT;
+        if let Some(d) = bng.next_deadline() {
+            wait = wait.min(Duration::from_millis(d.saturating_sub(now)));
+        }
+        if bng.waiting_radius() {
+            wait = wait.min(Duration::from_millis(2));
+        }
+        if fds.is_empty() {
+            std::thread::sleep(wait);
+            return;
+        }
+        let mut polls: Vec<PollFd<'_>> = fds.into_iter().map(|f| PollFd::new(f, PollFlags::POLLIN)).collect();
+        let t = PollTimeout::try_from(wait).unwrap_or(PollTimeout::ZERO);
+        let _ = poll(&mut polls, t);
+    }
+
+    fn receive(&mut self, now: u64) {
+        let bng = &mut self.bng;
+        for o in self.ports.values_mut() {
+            let ifindex = o.port.ifindex();
+            if let Err(e) = o.port.recv(|f| bng.frame(now, ifindex, f)) {
+                self.errors.push(format!("{}: {e}", o.port.name()));
+            }
+        }
+        if let Some(s) = self.slow.as_mut()
+            && let Err(e) = s.recv(|p| bng.data_down(p))
+        {
+            self.errors.push(format!("slow path: {e}"));
+        }
+    }
+
+    /// Send what the BNG made and do what it asked.
+    fn flush(&mut self, session: &Shared) {
+        for (ifindex, f) in self.bng.frames.drain(..) {
+            if let Some(o) = self.ports.values().find(|o| o.port.ifindex() == ifindex)
+                && let Err(e) = o.port.send(&f)
+            {
+                log::debug!("pppoe: send on {}: {e}", o.port.name());
+            }
+        }
+        if let Some(s) = &self.slow {
+            for p in self.bng.upstream.drain(..) {
+                let _ = s.inject(&p);
+            }
+        } else {
+            self.bng.upstream.clear();
+        }
+        let effects: Vec<Effect> = std::mem::take(&mut self.bng.effects);
+        if effects.is_empty() {
+            return;
+        }
+        let mut ops: Vec<PppoeOp> = Vec::new();
+        let mut locked: Vec<Effect> = Vec::new();
+        for e in effects {
+            match e {
+                Effect::Xdp(op) => ops.push(op),
+                Effect::Route { ip, add } => {
+                    if let Some(s) = &self.slow {
+                        let r = if add { s.add_route(ip) } else { s.remove_route(ip) };
+                        if let Err(e) = r {
+                            self.errors.push(e.to_string());
+                        }
+                    }
+                }
+                other => locked.push(other),
+            }
+        }
+        let mut s = lock(session);
+        if !ops.is_empty()
+            && let Err(e) = s.pppoe_apply(&ops)
+        {
+            s.log_event(&["ppp", "error"], "pppoe", format!("PPPoE: mapa XDP: {e}"), json!({}));
+        }
+        for e in locked {
+            match e {
+                Effect::Run { command, params } => {
+                    if let Err(err) = s.execute(&command, &params) {
+                        s.log_event(&["ppp", "warning"], "pppoe", format!("PPP: hook {command}: {err}"), json!({}));
+                    }
+                }
+                Effect::AddressList { list, ip, add: true, comment } => {
+                    let p = json!({"list": list, "address": ip.to_string(), "timeout": "52w", "comment": comment});
+                    match s.execute("ip.firewall.address-list.add", &p) {
+                        Ok(v) => {
+                            if let Some(id) = v.get("id").and_then(Value::as_str) {
+                                self.lists.insert((list, ip), id.to_owned());
+                            }
+                        }
+                        Err(err) => s.log_event(
+                            &["ppp", "warning"],
+                            "pppoe",
+                            format!("PPP: address-list {list} {ip}: {err}"),
+                            json!({}),
+                        ),
+                    }
+                }
+                Effect::AddressList { list, ip, add: false, .. } => {
+                    if let Some(id) = self.lists.remove(&(list, ip)) {
+                        let _ = s.execute("ip.firewall.address-list.remove", &json!({"id": id}));
+                    }
+                }
+                Effect::Log { error, text } => {
+                    let level = if error { "error" } else { "info" };
+                    s.log_event(&["ppp", level], "pppoe", text, json!({}));
+                }
+                Effect::Xdp(_) | Effect::Route { .. } => {}
+            }
+        }
+    }
+}

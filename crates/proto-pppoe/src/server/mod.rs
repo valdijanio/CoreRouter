@@ -416,6 +416,26 @@ impl Server {
         &self.cfg
     }
 
+    /// Takes a new configuration for what comes next: new sessions, the
+    /// PADI limits, PADO delays, timers of sessions not yet up. The MAC and
+    /// the SESSION_ID space (`max_sessions`) stay: changing them is a new
+    /// server.
+    pub fn reconfigure(&mut self, mut cfg: ServerConfig) {
+        cfg.ac_mac = self.cfg.ac_mac;
+        cfg.max_sessions = self.cfg.max_sessions;
+        let limits = (cfg.padi_limit, cfg.mac_padi_limit, cfg.mac_padi_burst);
+        if limits
+            != (
+                self.cfg.padi_limit,
+                self.cfg.mac_padi_limit,
+                self.cfg.mac_padi_burst,
+            )
+        {
+            self.limiter = PadiLimiter::new(limits.0, limits.1, limits.2);
+        }
+        self.cfg = cfg;
+    }
+
     pub fn stats(&self) -> &Stats {
         &self.stats
     }
