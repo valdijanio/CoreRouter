@@ -878,7 +878,9 @@ fn workers_split_one_port_without_collisions() {
 /// for authentication and accounting, `cap` requests a second, at most
 /// two seconds of work queued (the rest is lost), and the client gives up
 /// on a login after 8 s (`Retry::ACCESS` MRD) while the server may still
-/// work on it. The shape of a MK-Auth/IXC in a mass reconnect.
+/// work on it. The shape of a MK-Auth/IXC in a mass reconnect. Accounting
+/// waits in the client while [`AUTH_BUSY`] logins are out, as
+/// `radius_aaa` holds it.
 struct SlowAaa {
     cap: f64,
     st: Mutex<SlowState>,
@@ -887,6 +889,9 @@ struct SlowAaa {
 #[derive(Default)]
 struct SlowState {
     queue: std::collections::VecDeque<(Option<AuthDone>, u64)>,
+    /// Accounting the client holds back; logins sent and unanswered.
+    held: u64,
+    logins: u64,
     lost: Vec<(AuthDone, u64)>,
     tokens: f64,
     at: u64,
@@ -896,6 +901,8 @@ struct SlowState {
 }
 
 const GIVE_UP_MS: u64 = 8000;
+/// `radius_aaa::AUTH_BUSY`.
+const AUTH_BUSY: u64 = 64;
 
 impl SlowAaa {
     fn new(cap: f64) -> Self {
@@ -905,6 +912,13 @@ impl SlowAaa {
     fn push(&self, done: Option<AuthDone>) {
         let mut st = self.st.lock().unwrap();
         let now = st.now;
+        if done.is_none() && st.logins >= AUTH_BUSY {
+            st.held += 1;
+            return;
+        }
+        if done.is_some() {
+            st.logins += 1;
+        }
         if st.queue.len() as f64 >= 2.0 * self.cap {
             if let Some(d) = done {
                 st.lost.push((d, now));
@@ -940,6 +954,12 @@ impl SlowAaa {
                 }
             }
             st.timeouts += answers.len() as u64;
+            if st.logins < AUTH_BUSY {
+                while st.held > 0 && (st.queue.len() as f64) < 2.0 * self.cap {
+                    st.held -= 1;
+                    st.queue.push_back((None, now));
+                }
+            }
             while st.tokens >= 1.0 {
                 let Some((d, _)) = st.queue.pop_front() else { break };
                 st.tokens -= 1.0;
@@ -951,6 +971,7 @@ impl SlowAaa {
                 }
             }
         }
+        self.st.lock().unwrap().logins -= answers.len() as u64;
         for (d, r) in answers {
             d(r);
         }
@@ -1036,10 +1057,11 @@ fn wave(n: usize, cap: f64, rate: serde_json::Value, limit_s: u64) -> (Option<f6
 
 #[test]
 fn mass_reconnect_against_a_slow_radius() {
-    // 6000 CPEs after a power cut, a 300/s RADIUS (authentication and
-    // accounting share it: at most 150 logins a second, ~40 s for all).
+    // 6000 CPEs after a power cut, a 300/s RADIUS shared by
+    // authentication and accounting; the logins go first (the accounting
+    // waits behind them), ~20 s for all.
     let (n, cap) = (6000, 300.0);
-    let ideal = n as f64 / (cap / 2.0);
+    let ideal = n as f64 / cap;
     let off = wave(n, cap, serde_json::json!(0), 300);
     let over = wave(n, cap, serde_json::json!(200), 300);
     let fixed = wave(n, cap, serde_json::json!(100), 300);
@@ -1065,4 +1087,22 @@ fn the_kernel_and_the_bng_agree_on_the_worker() {
             assert_eq!(Bng::lane_of(&f, lanes), corerouter_hal_linux::pppoe_io::lane_of(&f, lanes));
         }
     }
+}
+
+/// The VM's third round in the lab's model (G4.3g): a 3000/s RADIUS, with
+/// 60 000 CPEs (one port's SESSION_IDs and the lab's pool stop at 65 000;
+/// the VM had 100 000). By hand, release: `cargo test --release -p
+/// corerouter-daemon --bin corerouter-daemon wave_of_the_vm_round --
+/// --ignored --nocapture`.
+#[test]
+#[ignore = "a minute of CPU; by hand in release"]
+fn wave_of_the_vm_round() {
+    let (n, cap) = (60_000, 3000.0);
+    let off = wave(n, cap, serde_json::json!(0), 600);
+    let fixed = wave(n, cap, serde_json::json!(2000), 600);
+    let auto = wave(n, cap, serde_json::json!("auto"), 600);
+    eprintln!("wave of {n} against {cap}/s: off {off:?}, fixed 2000 {fixed:?}, auto {auto:?}");
+    let (t, timeouts) = (auto.0.expect("auto brings every CPE back"), auto.1);
+    assert!(off.0.is_none_or(|o| t <= o), "auto no slower than no limit: {t} s against {off:?}");
+    assert!(timeouts <= off.1, "and with fewer timeouts: {timeouts} against {}", off.1);
 }

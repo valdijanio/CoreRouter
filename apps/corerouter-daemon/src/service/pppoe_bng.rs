@@ -737,16 +737,19 @@ impl Admission {
     }
 
     /// RADIUS questions this worker may have in flight (`lanes` workers
-    /// share the rate): its rate times twice the base answer time (at least
-    /// [`AUTO_WINDOW_MS`]/2), as BBR keeps about two bandwidth-delay
-    /// products in flight.
+    /// share it): the bandwidth-delay product, the measured capacity times
+    /// the base answer time (at least [`AUTO_WINDOW_MS`]), twice that while
+    /// still probing, as BBR's cwnd gain. Before any answer the rate stands
+    /// in for the capacity. Following the rate instead let the startup's
+    /// doubling put 3.6× the server's capacity in flight (G4.3g, VM round
+    /// 3: a 5503/s limit against ~1500 logins/s).
     fn window(&self, lanes: u16) -> usize {
-        let share = self.rate / f64::from(lanes.max(1));
-        let base = self
-            .base_ms()
-            .map_or(0.0, |b| b as f64)
-            .max(AUTO_WINDOW_MS / 2.0);
-        ((share * 2.0 * base / 1000.0) as usize).max(AUTO_WINDOW_MIN)
+        let cap = self.capacity();
+        let bw = if cap > 0.0 { cap } else { self.rate };
+        let gain = if self.startup { 2.0 } else { 1.0 };
+        let base = self.base_ms().map_or(0.0, |b| b as f64).max(AUTO_WINDOW_MS);
+        let share = bw / f64::from(lanes.max(1));
+        ((share * gain * base / 1000.0) as usize).max(AUTO_WINDOW_MIN)
     }
 
     /// Logins this worker lets queue (sent or waiting for the window)
@@ -825,7 +828,8 @@ impl Admission {
             self.rate = (self.rate + AUTO_STEP).min(AUTO_MAX);
             self.reason = "subindo: sem RADIUS no caminho".into();
         } else if self.startup {
-            // Still finding the ceiling: double while the answers keep up.
+            // Still finding the ceiling: twice what was answered, while that
+            // keeps growing.
             if cap > self.best * 1.25 {
                 self.best = cap;
                 self.flat = 0;
@@ -835,7 +839,7 @@ impl Admission {
             if self.flat >= 3 {
                 self.startup = false;
             }
-            self.rate = (self.rate * 2.0).max(cap * 2.0).min(AUTO_MAX);
+            self.rate = (cap * 2.0).clamp(AUTO_MIN, AUTO_MAX);
             self.reason = format!("subindo: RADIUS responde {cap:.0}/s");
         } else {
             let gain = AUTO_GAINS
@@ -3239,9 +3243,10 @@ mod admission_tests {
             a.second(held, 0);
         };
         let mut a = Admission::default();
-        // Startup: the rate doubles while the answers keep up.
+        // Startup: twice what the server answered, while that keeps growing
+        // (not twice the last rate: that ran to 3.6× the capacity).
         second(&mut a, 100, 20, false, true);
-        assert_eq!(a.rate, 2.0 * AUTO_START);
+        assert_eq!(a.rate, 200.0);
         assert!(a.reason.contains("100/s"), "{}", a.reason);
         // The answers stop growing (the server's capacity: 100/s): after
         // three such seconds the rate is that capacity times BBR's gains.
@@ -3276,11 +3281,16 @@ mod admission_tests {
         let mut b = Admission::default();
         second(&mut b, 0, 0, false, true);
         assert_eq!(b.rate, AUTO_START + AUTO_STEP);
-        // The window: twice the rate times the base answer time (at least
-        // 150 ms), shared by the workers; the backlog: 10 s of capacity.
+        // The window: the rate (no capacity measured yet) times the base
+        // answer time (at least 300 ms), twice while probing, shared by the
+        // workers; the backlog: 10 s of capacity.
         b.rate = 2000.0;
+        b.startup = false;
         assert_eq!(b.window(1), 600);
         assert_eq!(b.window(4), 150);
+        b.startup = true;
+        assert_eq!(b.window(1), 1200);
+        b.startup = false;
         assert_eq!(b.backlog(1), 20_000);
         b.rate = AUTO_MIN;
         assert_eq!(b.window(8), AUTO_WINDOW_MIN);
