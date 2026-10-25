@@ -559,3 +559,44 @@ classificado (R-08), sessões IPoE IPv6 (DHCPv6/RA com a linha da RFC 6788) e FO
 - **BFD como keepalive**: o CPE doméstico não fala BFD.
 - **Clonar a sintaxe `lua` do accel-ppp**: os quatro formatos de `ipoe_username` cobrem os
   provedores que conhecemos; um formato novo é uma variante a mais.
+
+### 9.5 O serviço `ipoe` do daemon
+
+`apps/corerouter-daemon/src/service/ipoe.rs` (o driver) e `ipoe_bng.rs` (o núcleo, sem E/S). No
+início o serviço se registra no engine como `IpoeBackend` (o servidor DHCP pergunta e avisa) e
+como a metade IPoE do `ppp.active` (`Session::set_ipoe_sessions`); no RADIUS, como dono de sessões
+para CoA/Disconnect.
+
+- **Autorização**: a lista local (`/ppp secret service=ipoe`) primeiro; senão, com
+  `use_radius=yes`, um Access-Request `service=dhcp` com o nome de `ipoe_username` como User-Name,
+  senha vazia (RouterOS), NAS-Port-Type Ethernet (15), NAS-Port-Id = interface (ou o circuito, com
+  `ppp.aaa use_circuit_id_in_nas_port_id`), Calling-Station-Id = MAC, Called-Station-Id = servidor
+  e a opção 82 em ADSL-Agent-Circuit-Id/ADSL-Agent-Remote-Id (RFC 4679). A resposta volta por um
+  canal: o servidor DHCP a pega na rodada seguinte. Do Accept valem Framed-IP-Address,
+  Framed-Pool, Session-Timeout, Mikrotik-Rate-Limit (ou Ascend-Data-Rate/Ascend-Xmit-Rate),
+  Mikrotik-Group (o perfil e a sua taxa), Mikrotik-Address-List, Acct-Interim-Interval e Class.
+- **Sessão**: no ACK; renovação = prova de vida; endereço novo = a sessão velha acaba
+  (`replaced`). Taxa: a do RADIUS, senão o `rate_limit` do lease estático, senão o do perfil do
+  secret. Contabilização (`use_radius=yes|accounting`): Start com a Class, interims pelo serviço
+  RADIUS (Acct-Interim-Interval, senão `ppp.aaa interim_update`), Stop com
+  Acct-Terminate-Cause: User-Request (RELEASE), Lost-Carrier (lease vencido, keepalive),
+  Admin-Reset (`ppp.active.remove`, Disconnect-Request).
+- **Fim**: `ppp.active.remove` e o Disconnect-Request viram um *revoke* no servidor DHCP: o lease
+  acaba, a concessão some, a renovação recebe NAK e o CPE recomeça autorizado. CoA com
+  Mikrotik-Rate-Limit muda o policer na hora (tudo ou nada, RFC 5176 §2.3; taxa inválida = NAK
+  407); com Framed-IP-Address, o CPE pede DHCP de novo e recebe o endereço novo.
+- **XDP**: o serviço liga `Hal::ipoe_dataplane` para as interfaces dos servidores IPoE e escreve
+  cada sessão (índices do topo do mapa para baixo). Sem XDP (laboratório, NIC sem suporte, o
+  namespace sem root) a sessão existe sem o policer e a linha do serviço diz por quê; a ligação é
+  tentada de novo a cada 30 s.
+- **Keepalive** (`ip.dhcp-server … ipoe_keepalive=60s`, desligado por padrão): o assinante calado
+  por esse tempo (sem bytes de subida no XDP, sem renovação, sem resposta ARP) recebe um ARP; três
+  sem resposta, 10 s um do outro, e a sessão cai com `keepalive` no "Why?". Os pings saem pela
+  porta do servidor DHCP (o mesmo socket das sondas de conflito).
+- **Why?**: estágios `dhcp` (o DISCOVER chegou), `auth` (RADIUS perguntado) e `up`; os motivos
+  `not-authorized`, `rejected`, `radius-timeout`, `released`, `lease-expired`, `keepalive`,
+  `admin-reset`, `radius-disconnect`, `replaced`, cada um com a dica em português.
+
+Números (**medido**, 2026-10-25, 32 CPUs, build debug, veth sem XDP, `tests/netns_ipoe.rs`): 10 000
+assinantes autorizados pelo RADIUS de teste (um Access-Request e um Accounting-Start cada) com
+endereço em 3,0 s = 3 300 sessões/s; o daemon cresce ~4,3 kB por sessão (lease, sessão, histórico).

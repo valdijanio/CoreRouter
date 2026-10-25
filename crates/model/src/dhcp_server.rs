@@ -191,6 +191,12 @@ pub struct DhcpServer {
     /// A client without a secret when RADIUS is not asked.
     #[serde(default, skip_serializing_if = "is_default")]
     pub ipoe_unknown: crate::ipoe::IpoeUnknown,
+    /// Seconds a subscriber may stay silent before it is ARP-pinged
+    /// (TR-146 R-92, Juniper's layer-2 liveness): three pings 10 s apart
+    /// without an answer end the session before its lease. `None`: off,
+    /// the lease is the only liveness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipoe_keepalive: Option<u32>,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -236,6 +242,7 @@ impl DhcpServer {
             ipoe: false,
             ipoe_username: crate::ipoe::IpoeUsername::Mac,
             ipoe_unknown: crate::ipoe::IpoeUnknown::Accept,
+            ipoe_keepalive: None,
             disabled: false,
             comment: String::new(),
         }

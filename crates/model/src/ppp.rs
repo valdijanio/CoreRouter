@@ -760,6 +760,9 @@ pub enum Stage {
     Ncp,
     /// Opened, traffic flowing.
     Up,
+    /// IPoE (G4.3f): the DHCP DISCOVER/REQUEST was heard (the PADI of an
+    /// IPoE subscriber); then `auth` and `up`.
+    Dhcp,
 }
 
 impl Stage {
@@ -771,6 +774,7 @@ impl Stage {
             Self::Auth => "auth",
             Self::Ncp => "ncp",
             Self::Up => "up",
+            Self::Dhcp => "dhcp",
         }
     }
 }
