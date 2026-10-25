@@ -947,3 +947,18 @@ leva ≈ 39 s em debug no `cargo test` (**medido**), 12,3 milhões de quadros si
 | `radius_aaa/authenticate_1000_concurrent` | 5,15 ms por lote | 194 k |
 
 Com o buffer de recepção padrão (~200 KiB) a rajada de 1000 respostas transbordava e o lote levava 6,6 s; com 4 MiB no socket (limitado por `net.core.rmem_max`), 5,15 ms.
+
+- G4.8a — custo de uma leitura de System › Resources (**medido**, 2026-10-24, AMD Ryzen AI Max+ 395, 32 CPUs, 881 processos, build release, `cargo bench -p corerouter-hal-linux --bench resource`): leitura sem processos 512 µs; sensores 30 ms (NVMe ~4 ms por sensor e wifi mt7925 ~3,5 ms consultam o dispositivo; por isso são lidos a cada 10 s e reaproveitados entre leituras); com os 881 processos 5,2 ms (só sob demanda, com a aba Processes aberta).
+
+- G4.8a — trabalho do serviço `health` sob o lock da sessão por leitura (entregar a leitura + julgar as 12 verificações): 3,7 µs (**medido**, 2026-10-24, AMD Ryzen AI Max+ 395, build release, `cargo bench -p corerouter-engine --bench health`, laboratório de 16 CPUs e 8 portas). A leitura em si (~0,5 ms) fica fora do lock.
+
+- G4.8a — um quadro da GUI com System › Resources aberta (aba Overview: quatro cartões com sparkline, 8 interfaces, 12 verificações), tela 1400×900: 203 µs (**medido**, 2026-10-24, AMD Ryzen AI Max+ 395, build release, `cargo bench -p corerouter-ui --bench frames -- resources`), ~1,2 % dos 16 ms de um quadro a 60 fps.
+
+### G4.8b — OS Log (**medido**, 2026-10-24, AMD Ryzen AI Max+ 395, Linux 7.0)
+
+| O quê | Resultado |
+|---|---|
+| `OsLogBook::push`, 100 000 linhas (metade repetida), release | 339 ns/linha; `since` de 500: 1,5 µs |
+| GUI, 100 000 linhas em respostas de 2000 (20 000 guardadas), debug | 2,6 ms por quadro (tabela virtualizada); refiltrar 20 000: 14 ms, só quando filtro ou linhas mudam |
+| libFuzzer, alvo `oslog` (nightly, 1 núcleo) | 5,2 milhões de execuções em 121 s, nenhuma falha |
+| `journalctl --after-cursor` num journal de 2,0 GB | ≤ 10 ms por chamada (a cada 2 s); backfill de 500 linhas: 60 ms; pico de RSS 46 MB |
