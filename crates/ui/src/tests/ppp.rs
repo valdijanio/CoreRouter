@@ -129,9 +129,29 @@ fn active_connections_show_the_login_rate_and_counters() {
     assert!(name[0].1.contains("ana"), "sorted by name, the identity chip: {name:?}");
     let maria = rows.iter().find(|r| r.cells[0].contains("maria")).unwrap();
     assert!(crate::chip::split(&maria.cells[0]).1.iter().any(|(_, t)| *t == "R"), "RADIUS mark");
-    assert!(crate::chip::split(&rows[0].cells[5]).1.iter().any(|(_, t)| *t == "50M/100M"));
-    assert_eq!(rows[0].cells[4], "1h2m3s");
-    assert_eq!(rows[0].cells[6], "1.4 MiB");
+    assert!(crate::chip::split(&rows[0].cells[7]).1.iter().any(|(_, t)| *t == "50M/100M"));
+    assert_eq!(rows[0].cells[6], "1h2m3s");
+    assert_eq!(rows[0].cells[8], "1.4 MiB");
+}
+
+/// G4.3e: the /64 and the delegated prefix of a session, the selo saying
+/// whether the CPE holds the prefix; the profile's IPv6 in one cell.
+#[test]
+fn ipv6_columns_of_sessions_and_profiles() {
+    let r = json!({"id": "*1-1", "name": "ana", "ipv6_prefix": "2001:db8:0:5::/64", "delegated_prefix": "2001:db8:8800::/56", "delegated_bound": true});
+    let row = PppPanel::active_row(&r, None);
+    assert_eq!(row.cells[4], "2001:db8:0:5::/64");
+    let (text, chips) = crate::chip::split(&row.cells[5]);
+    assert_eq!(text, "2001:db8:8800::/56");
+    assert!(chips.iter().any(|(_, t)| *t == "bound"));
+    let r = json!({"id": "*1-2", "name": "bia", "delegated_prefix": "2001:db8:8900::/56"});
+    let row = PppPanel::active_row(&r, None);
+    assert!(crate::chip::split(&row.cells[5]).1.iter().any(|(_, t)| *t == "reserved"));
+    assert_eq!(row.cells[4], "", "no /64");
+    let p = json!({"id": "*2", "name": "dual", "use_ipv6": "require", "remote_ipv6_prefix_pool": "wan6", "dhcpv6_pd_pool": "pd6"});
+    assert_eq!(PppPanel::profile_row(&p).cells[7], "require · /64 wan6 · PD pd6");
+    let d = json!({"id": "*0", "name": "default", "use_ipv6": "default"});
+    assert_eq!(PppPanel::profile_row(&d).cells[7], "");
 }
 
 #[test]
@@ -331,6 +351,17 @@ fn every_explanation_exists_in_both_languages() {
         "ppp.why.name",
         "ppp.why.reply_message",
         "ppp.why.stage",
+        "ppp.active.ipv6_prefix",
+        "ppp.active.delegated_prefix",
+        "ppp.profile.ipv6",
+        "ppp.profile.use_ipv6",
+        "ppp.profile.remote_ipv6_prefix_pool",
+        "ppp.profile.dhcpv6_pd_pool",
+        "ppp.profile.dhcpv6_lease_time",
+        "ppp.profile.dns_server_ipv6",
+        "ppp.monitor.ipv6_sessions",
+        "ppp.monitor.delegated",
+        "ppp.monitor.ipv6_dropped",
     ];
     for key in keys {
         for l in [Lang::En, Lang::Pt] {

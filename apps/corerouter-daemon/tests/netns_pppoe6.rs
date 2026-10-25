@@ -446,3 +446,113 @@ fn pppoe_dual_stack_end_to_end() {
     wait_for("all gone", || active_rows().is_empty());
     drop(d);
 }
+
+/// Not a test: a dual-stack lab for screenshots of the PPP window. Sets up
+/// the daemon as the e2e does, with its token at
+/// `$PPPOE_LAB_DIR/control-7979.token` (a GUI or CLI in the same
+/// namespace with `COREROUTER_RUNTIME_DIR=$PPPOE_LAB_DIR` connects), dials
+/// `PPPOE_LAB_USERS` dual-stack CPEs (every third without asking for a
+/// delegated prefix) and keeps them up for `PPPOE_LAB_SECS`:
+///
+/// ```sh
+/// PPPOE_LAB_DIR=/tmp/lab6 PPPOE_LAB_USERS=30 COREROUTER_NETNS_TESTS=1 \
+///   unshare --user --map-root-user --net -- \
+///   cargo test -p corerouter-daemon --test netns_pppoe6 cpe_lab6 -- --ignored --nocapture
+/// ```
+#[test]
+#[ignore]
+fn cpe_lab6() {
+    if !in_netns() {
+        return;
+    }
+    let env = |k: &str, d: u64| {
+        std::env::var(k)
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(d)
+    };
+    let users = env("PPPOE_LAB_USERS", 30) as usize;
+    let secs = env("PPPOE_LAB_SECS", 900);
+    let dir = std::path::PathBuf::from(
+        std::env::var("PPPOE_LAB_DIR").unwrap_or_else(|_| "/tmp/lab6".into()),
+    );
+    ip(None, &["link", "set", "lo", "up"]);
+    ip(
+        None,
+        &[
+            "link", "add", "acc0", "type", "veth", "peer", "name", "cpe0",
+        ],
+    );
+    ip(None, &["link", "set", "acc0", "up"]);
+    ip(None, &["link", "set", "cpe0", "up"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = std::fs::File::create(dir.join("daemon.log")).unwrap();
+    let mut c = in_ns(None, DAEMON);
+    c.args([
+        "--backend",
+        "linux",
+        "--no-discovery",
+        "--manage",
+        "acc0",
+        "--control",
+        "7979",
+        "--config-dir",
+    ])
+    .arg(&dir)
+    .arg("--token-file")
+    .arg(dir.join("control-7979.token"))
+    .stdout(Stdio::null())
+    .stderr(log);
+    let _d = Kill(c.spawn().unwrap());
+    let _ = token_file(None, &dir);
+    // `token_file` names `local.token`: point it at the real one.
+    std::thread::sleep(Duration::from_millis(300));
+    wait_for("the daemon", || {
+        std::fs::copy(dir.join("control-7979.token"), dir.join("local.token")).is_ok()
+            && call(None, "interface.list", json!({})).is_ok()
+    });
+    ok(
+        "ip.pool.add",
+        json!({"name": "clientes", "ranges": "100.64.0.0/16"}),
+    );
+    ok(
+        "ipv6.pool.add",
+        json!({"name": "wan6", "prefix": "2001:db8:100::/48", "prefix_length": 64}),
+    );
+    ok(
+        "ipv6.pool.add",
+        json!({"name": "pd6", "prefix": "2001:db8:8000::/40", "prefix_length": 56}),
+    );
+    ok(
+        "ppp.profile.set",
+        json!({"id": "default", "remote_address": "clientes", "remote_ipv6_prefix_pool": "wan6",
+               "dhcpv6_pd_pool": "pd6", "dns_server_ipv6": "2001:db8::53", "rate_limit": "50M/100M"}),
+    );
+    ok(
+        "ppp.profile.add",
+        json!({"name": "so-ipv4", "use_ipv6": "no", "rate_limit": "10M/20M"}),
+    );
+    // Every fifth subscriber on an IPv4-only plan.
+    let steps: Vec<Value> = (0..users)
+        .map(|i| {
+            let profile = if i % 5 == 4 { "so-ipv4" } else { "default" };
+            json!({"command": "ppp.secret.add", "params": {"name": format!("u{i}"), "password": format!("p{i}"), "profile": profile}})
+        })
+        .collect();
+    batch(steps);
+    ok(
+        "interface.pppoe-server.server.add",
+        json!({"interface": "acc0", "padi_limit": 0, "mac_padi_limit": 0, "new_session_rate": 0,
+               "keepalive_timeout": 600, "authentication": ["chap"]}),
+    );
+    let mut cpes = Cpes::new(users);
+    // Every third CPE never asks for a prefix (it stays reserved).
+    for c in (0..users).step_by(3) {
+        cpes.got[c].pd = Some("::/128".parse().unwrap());
+    }
+    cpes.start_all();
+    cpes.run_until(60, |c| c.up.iter().all(|u| *u));
+    println!("LAB READY: {} up", cpes.up.iter().filter(|u| **u).count());
+    cpes.run_until(secs, |_| false);
+}

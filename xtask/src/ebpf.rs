@@ -323,7 +323,7 @@ pub fn root_test(root: &Path) -> Outcome {
 
 /// The root tests and how long each may take (seconds; a few times what
 /// they take on the CI runner).
-const XDP_TESTS: [(&str, u32); 13] = [
+const XDP_TESTS: [(&str, u32); 14] = [
     ("loads_attaches_and_counts", 60),
     ("kernel_and_host_agree", 60),
     ("perf_lpm_cost", 180),
@@ -337,6 +337,7 @@ const XDP_TESTS: [(&str, u32); 13] = [
     ("pppoe_scale_100k_sessions", 300),
     ("pppoe_policer_accuracy", 120),
     ("perf_pppoe_forward", 60),
+    ("pppoe_bng_ops_reach_the_maps", 60),
 ];
 
 fn test_binary(root: &Path) -> Result<PathBuf, String> {
@@ -362,4 +363,37 @@ fn test_binary(root: &Path) -> Result<PathBuf, String> {
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find_map(|m| m.get("executable")?.as_str().map(PathBuf::from))
         .ok_or_else(|| "xdp_root test binary not found".into())
+}
+
+#[cfg(test)]
+mod xdp_list_tests {
+    /// Every `#[test]` of `tests/xdp_root.rs` is in [`super::XDP_TESTS`]:
+    /// one left out never runs as root (G4.3d's `pppoe_bng_ops_reach_the_maps`
+    /// was missing until G4.3e).
+    #[test]
+    fn every_root_test_is_listed() {
+        let src = include_str!("../../crates/hal-linux/tests/xdp_root.rs");
+        let mut found = Vec::new();
+        let mut after_test = false;
+        for line in src.lines() {
+            let t = line.trim();
+            if t == "#[test]" {
+                after_test = true;
+                continue;
+            }
+            if after_test && let Some(rest) = t.strip_prefix("fn ") {
+                found.push(rest.split('(').next().unwrap_or_default().to_owned());
+                after_test = false;
+            } else if after_test && !t.starts_with("#[") {
+                after_test = false;
+            }
+        }
+        assert!(!found.is_empty());
+        for f in &found {
+            assert!(
+                super::XDP_TESTS.iter().any(|(n, _)| n == f),
+                "xdp_root.rs › {f} is not in XDP_TESTS: it would never run as root"
+            );
+        }
+    }
 }

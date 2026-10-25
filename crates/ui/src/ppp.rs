@@ -107,7 +107,7 @@ const SECRET_COLUMNS: [table::Column; 8] = [
     col("State").help("ppp.secret.state"),
     comment(),
 ];
-const PROFILE_COLUMNS: [table::Column; 9] = [
+const PROFILE_COLUMNS: [table::Column; 10] = [
     col("Name").help("ppp.profile.name"),
     col("Local Address").help("ppp.profile.local_address"),
     col("Remote Address").help("ppp.profile.remote_address"),
@@ -115,14 +115,17 @@ const PROFILE_COLUMNS: [table::Column; 9] = [
     col("Rate Limit").help("ppp.profile.rate_limit"),
     col("Address List").help("ppp.profile.address_list"),
     col("Only One").help("ppp.profile.only_one"),
+    col("IPv6").help("ppp.profile.ipv6"),
     num("Secrets").help("ppp.profile.secrets"),
     comment(),
 ];
-const ACTIVE_COLUMNS: [table::Column; 11] = [
+const ACTIVE_COLUMNS: [table::Column; 13] = [
     col("Name").help("ppp.active.name"),
     col("Service").help("ppp.active.service"),
     col("Caller ID").help("ppp.active.caller_id"),
     col("Address").help("ppp.active.address"),
+    col("IPv6 Prefix").help("ppp.active.ipv6_prefix"),
+    col("Delegated Prefix").help("ppp.active.delegated_prefix"),
     num("Uptime").help("ppp.active.uptime"),
     col("Rate Limit").help("ppp.active.rate_limit"),
     num("Rx").help("ppp.active.rx"),
@@ -209,6 +212,11 @@ const PROFILE_FIELDS: &[Field] = &[
     Field { param: "change_tcp_mss", label: "Change TCP MSS", help: "ppp.profile.change_tcp_mss", input: Input::Choice, edit: true },
     Field { param: "idle_timeout", label: "Idle Timeout", help: "ppp.profile.idle_timeout", input: Input::Text("(none)"), edit: true },
     Field { param: "session_timeout", label: "Session Timeout", help: "ppp.profile.session_timeout", input: Input::Text("(none)"), edit: true },
+    Field { param: "use_ipv6", label: "Use IPv6", help: "ppp.profile.use_ipv6", input: Input::Choice, edit: true },
+    Field { param: "remote_ipv6_prefix_pool", label: "Remote IPv6 Prefix Pool", help: "ppp.profile.remote_ipv6_prefix_pool", input: Input::Text("an /ipv6 pool of /64"), edit: true },
+    Field { param: "dhcpv6_pd_pool", label: "DHCPv6 PD Pool", help: "ppp.profile.dhcpv6_pd_pool", input: Input::Text("an /ipv6 pool of /48–/64"), edit: true },
+    Field { param: "dhcpv6_lease_time", label: "DHCPv6 Lease Time", help: "ppp.profile.dhcpv6_lease_time", input: Input::Text("1d"), edit: true },
+    Field { param: "dns_server_ipv6", label: "IPv6 DNS Server", help: "ppp.profile.dns_server_ipv6", input: Input::Text("2001:db8::53"), edit: true },
     Field { param: "on_up", label: "On Up", help: "ppp.profile.on_up", input: Input::Text("[{\"command\":…,\"params\":{…}}]"), edit: true },
     Field { param: "on_down", label: "On Down", help: "ppp.profile.on_down", input: Input::Text("[{\"command\":…,\"params\":{…}}]"), edit: true },
     Field { param: "comment", label: "Comment", help: "", input: Input::Text(""), edit: true },
@@ -361,6 +369,36 @@ pub(crate) fn bytes(b: u64) -> String {
 }
 
 /// A rate limit chip: the rx/tx part, the rest in the tooltip of the cell.
+/// The profile's IPv6 in one cell: `use_ipv6` (unless default) and the
+/// pools, `/64 wan6 · PD pd6`.
+fn profile_v6(r: &Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let use6 = text(r, "use_ipv6");
+    if !use6.is_empty() && use6 != "default" {
+        parts.push(use6);
+    }
+    let p64 = text(r, "remote_ipv6_prefix_pool");
+    if !p64.is_empty() {
+        parts.push(format!("/64 {p64}"));
+    }
+    let pd = text(r, "dhcpv6_pd_pool");
+    if !pd.is_empty() {
+        parts.push(format!("PD {pd}"));
+    }
+    parts.join(" · ")
+}
+
+/// The delegated prefix, with a selo when the CPE's DHCPv6 holds it
+/// (`bound`) or only reserved for the session (`reserved`).
+fn delegated_cell(r: &Value) -> String {
+    let pd = text(r, "delegated_prefix");
+    if pd.is_empty() {
+        return String::new();
+    }
+    let chips: &[(&str, Kind)] = if flag(r, "delegated_bound") { &[("bound", Kind::Green)] } else { &[("reserved", Kind::Neutral)] };
+    chip::cell(&pd, chips)
+}
+
 fn rate_chip(rate: &str) -> String {
     if rate.is_empty() {
         return "–".into();
@@ -505,6 +543,7 @@ impl PppPanel {
                 rate_chip(&text(r, "rate_limit")),
                 if list.is_empty() { String::new() } else { chip::cell("", &[(list.as_str(), Kind::Hashed(chip::name_hue(&list)))]) },
                 text(r, "only_one"),
+                profile_v6(r),
                 n(r, "secrets").to_string(),
                 text(r, "comment"),
             ],
@@ -529,6 +568,8 @@ impl PppPanel {
                 text(r, "service"),
                 text(r, "caller_id"),
                 text(r, "address"),
+                text(r, "ipv6_prefix"),
+                delegated_cell(r),
                 text(r, "uptime"),
                 rate_chip(&text(r, "rate_limit")),
                 bytes(n(r, "rx_bytes")),
@@ -576,7 +617,7 @@ impl PppPanel {
         for f in fields {
             let val = match f.param {
                 "password" => String::new(),
-                "authentication" | "dns_server" => r
+                "authentication" | "dns_server" | "dns_server_ipv6" => r
                     .get(f.param)
                     .and_then(Value::as_array)
                     .map(|a| a.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(","))
@@ -719,6 +760,7 @@ impl PppPanel {
                     Tab::Profiles => {
                         v.insert("only_one", "default".to_owned());
                         v.insert("change_tcp_mss", "default".to_owned());
+                        v.insert("use_ipv6", "default".to_owned());
                     }
                     _ => {
                         for k in ["one_session_per_host", "accept_untagged", "ac_cookie"] {
@@ -792,6 +834,7 @@ impl PppPanel {
                 ("Logins", [("sessions", "Sessions"), ("auth_accept", "Accepted"), ("auth_reject", "Rejected")]),
                 ("Discovery", [("padi", "PADI"), ("pado", "PADO"), ("padr", "PADR")]),
                 ("Discovery", [("pads", "PADS"), ("padt_rx", "PADT in"), ("padt_tx", "PADT out")]),
+                ("IPv6", [("ipv6_sessions", "IPv6 Sessions"), ("delegated", "Delegated"), ("ipv6_dropped", "IPv6 Dropped")]),
             ] {
                 ui.strong(tr_in(SCOPE, l, row));
                 for (k, name) in items {
@@ -1367,6 +1410,7 @@ impl PanelState for PppPanel {
                 }
                 "service" => ["pppoe", "any", "l2tp", "pptp", "sstp", "ovpn"].iter().map(|s| (*s).to_owned()).collect(),
                 "only_one" | "change_tcp_mss" => ["default", "yes", "no"].iter().map(|s| (*s).to_owned()).collect(),
+                "use_ipv6" => ["default", "yes", "no", "require"].iter().map(|s| (*s).to_owned()).collect(),
                 _ => Vec::new(),
             }
         };
