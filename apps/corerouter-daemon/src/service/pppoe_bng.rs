@@ -659,6 +659,13 @@ const AUTO_FAST_MS: u64 = 100;
 const AUTO_STEP: f64 = 500.0;
 /// Answers kept for the second's percentile.
 const AUTO_SAMPLES: usize = 4096;
+/// RADIUS questions in flight at most: the rate times this much time
+/// (Little's law). The window holds a wave back while the server is
+/// already busy, before its answers slow down (G4.3g: without it the
+/// queue of a 3000/s server filled with questions nobody waited for any
+/// more, and the latency the rate followed was the queue's).
+const AUTO_WINDOW_MS: f64 = 300.0;
+const AUTO_WINDOW_MIN: usize = 8;
 
 pub(crate) struct Admission {
     pub rate: f64,
@@ -690,8 +697,16 @@ impl Admission {
         }
     }
 
-    /// Once a second. `held`: sessions the limit has held back so far.
-    fn second(&mut self, held: u64) {
+    /// RADIUS questions this worker may have in flight (`lanes` workers
+    /// share the rate).
+    fn window(&self, lanes: u16) -> usize {
+        let share = self.rate / f64::from(lanes.max(1));
+        ((share * AUTO_WINDOW_MS / 1000.0) as usize).max(AUTO_WINDOW_MIN)
+    }
+
+    /// Once a second. `held`: sessions the limit has held back so far;
+    /// `pending`: questions still unanswered.
+    fn second(&mut self, held: u64, pending: usize) {
         let waiting = held > self.held_before;
         self.held_before = held;
         self.latencies.sort_unstable();
@@ -702,6 +717,10 @@ impl Admission {
         if self.timeouts > 0 {
             self.rate = (self.rate / 2.0).max(AUTO_MIN);
             self.reason = format!("RADIUS sem resposta: {} timeouts", self.timeouts);
+        } else if p90.is_none() && pending > 0 {
+            // A whole second with questions out and no answer at all.
+            self.rate = (self.rate / 2.0).max(AUTO_MIN);
+            self.reason = format!("RADIUS parado: {pending} pedidos sem resposta");
         } else if let Some(ms) = p90.filter(|ms| *ms > AUTO_SLOW_MS) {
             self.rate = (self.rate / 2.0).max(AUTO_MIN);
             self.reason = format!("RADIUS lento: {ms} ms");
@@ -1365,7 +1384,11 @@ impl Bng {
                     // back-off). At the PADR it would be worse: the CPE
                     // repeats the PADR with an AC-Cookie that expires.
                     let setting_up = self.index.pending.contains_key(&(i, src.0));
-                    if !setting_up && !slot.bucket.allow(now) {
+                    // auto: also no more questions in flight than the
+                    // server is answering (the window).
+                    let full_window = slot.cfg.new_session_rate_auto
+                        && self.pending_auth >= self.admission.window(self.lanes);
+                    if !setting_up && (full_window || !slot.bucket.allow(now)) {
                         self.padr_throttled += 1;
                         return;
                     }
@@ -2599,7 +2622,8 @@ impl Bng {
             .sum();
         let throttled = self.padr_throttled + limited;
         // new_session_rate=auto: one AIMD step a second.
-        self.admission.second(self.padr_throttled);
+        self.admission
+            .second(self.padr_throttled, self.pending_auth);
         let rate = share(self.admission.rate as u32, self.lanes);
         let mut auto = false;
         for s in self
@@ -3020,7 +3044,7 @@ mod admission_tests {
             if waiting {
                 held += 10;
             }
-            a.second(held);
+            a.second(held, 0);
         };
         // Fast answers and a queue: additive increase, up to the ceiling.
         second(&mut a, Some(20), false, true);
@@ -3048,5 +3072,16 @@ mod admission_tests {
         // Local secrets (no RADIUS answers) and a queue: it grows.
         second(&mut a, None, false, true);
         assert!(a.rate > r);
+        // Questions out and a whole second without an answer: halved.
+        let r = a.rate;
+        a.second(held + 10, 40);
+        assert_eq!(a.rate, (r / 2.0).max(AUTO_MIN));
+        assert!(a.reason.starts_with("RADIUS parado"), "{}", a.reason);
+        // The window: the rate times 300 ms, shared by the workers.
+        a.rate = 2000.0;
+        assert_eq!(a.window(1), 600);
+        assert_eq!(a.window(4), 150);
+        a.rate = AUTO_MIN;
+        assert_eq!(a.window(8), AUTO_WINDOW_MIN);
     }
 }

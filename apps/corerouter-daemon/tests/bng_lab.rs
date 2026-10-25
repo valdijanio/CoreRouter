@@ -844,12 +844,31 @@ impl Radius {
             let t0 = Instant::now();
             let mut queue: std::collections::VecDeque<(usize, std::net::SocketAddr, Vec<u8>)> =
                 std::collections::VecDeque::new();
+            // A saturated server as FreeRADIUS behaves: a copy of a request
+            // it already holds is dropped (RFC 5080 §2.2.2), and past ~2 s
+            // of work the rest is (`max_requests`), instead of answering, a
+            // minute late, questions nobody waits for any more.
+            let mut held: std::collections::HashSet<(std::net::SocketAddr, u8, [u8; 16])> =
+                std::collections::HashSet::new();
+            let bound = (capacity as usize).saturating_mul(2);
+            let key = |from: std::net::SocketAddr,
+                       d: &[u8]|
+             -> Option<(std::net::SocketAddr, u8, [u8; 16])> {
+                Some((from, *d.get(1)?, d.get(4..20)?.try_into().ok()?))
+            };
             let mut tokens = f64::from(capacity);
             let mut at = Instant::now();
             while !stop2.load(Ordering::Relaxed) {
                 for (k, s) in [&sock, &acct].into_iter().enumerate() {
                     while let Ok((n, from)) = s.recv_from(&mut buf) {
-                        queue.push_back((k, from, buf[..n].to_vec()));
+                        let d = &buf[..n];
+                        if capacity > 0 {
+                            let Some(id) = key(from, d) else { continue };
+                            if queue.len() >= bound || !held.insert(id) {
+                                continue;
+                            }
+                        }
+                        queue.push_back((k, from, d.to_vec()));
                     }
                 }
                 if capacity > 0 {
@@ -865,6 +884,9 @@ impl Radius {
                         tokens -= 1.0;
                     }
                     queue.pop_front();
+                    if let Some(id) = key(from, &data) {
+                        held.remove(&id);
+                    }
                     let s = if k == 0 { &sock } else { &acct };
                     if let Some(r) = srv.handle(from, &data, t0.elapsed().as_millis() as u64) {
                         let _ = s.send_to(&r.bytes, r.to);
@@ -1236,71 +1258,86 @@ fn radius_policer(lab: &Lab, k: usize, s: &mut Summary) {
 fn workers_compare(lab: &Lab, n: usize, s: &mut Summary) {
     let sc = format!("workers {}k", n / 1000);
     let pid = lab.pid();
-    for w in [json!(1), json!("auto")] {
+    let auto = ok("interface.pppoe-server.settings.get", json!({}))["auto_workers"]
+        .as_u64()
+        .unwrap_or(1);
+    for (w, want) in [(json!(1), 1u64), (json!("auto"), auto)] {
         ok("interface.pppoe-server.settings.set", json!({"workers": w}));
         let _ = call(None, "system.service.restart", json!({"name": "pppoe"}));
-        wait_for("the pppoe service again", || {
-            ok("interface.pppoe-server.monitor", json!({}))["running"] == true
-                && ok("interface.pppoe-server.settings.get", json!({}))["running"]
-                    .as_u64()
-                    .unwrap_or(0)
-                    > 0
+        // The service reads `workers` when it starts: wait for the new one
+        // (the old one's backend answers until the new one replaces it).
+        let up = wait_long("the pppoe service with its workers", 60, || {
+            ok("interface.pppoe-server.settings.get", json!({}))["running"].as_u64() == Some(want)
+                && ok("interface.pppoe-server.monitor", json!({}))["running"] == true
         });
-        let workers = ok("interface.pppoe-server.settings.get", json!({}))["running"]
-            .as_u64()
-            .unwrap_or(0);
+        s.check(
+            &format!("{sc} {want} worker(s) aplicado"),
+            up.is_some(),
+            format!("{}", ok("interface.pppoe-server.settings.get", json!({}))),
+        );
         lab.servers(false);
         std::thread::sleep(Duration::from_millis(1500));
         let mut cfg = blaster_config(n, "user", 0.0, None);
-        cfg["sessions"]["max-outstanding"] = json!(n.min(60_000));
-        cfg["sessions"]["start-rate"] = json!(50_000);
+        // As fast as BNG Blaster goes: its own polling at the default
+        // 0.1 ms, every CPE at once.
+        cfg["interfaces"]["tx-interval"] = json!(0.1);
+        cfg["interfaces"]["rx-interval"] = json!(0.1);
+        cfg["sessions"]["max-outstanding"] = json!(n);
+        // The schema's ceiling (bngblaster-config.json: 65535).
+        cfg["sessions"]["start-rate"] = json!(n.min(65_535));
         cfg["session-traffic"] = json!({"autostart": false, "ipv4-pps": 0});
         let c0 = thread_cpu(pid);
         let t = Instant::now();
-        let bl = Blaster::start(lab, &format!("workers-{workers}"), &cfg, &[]);
+        let bl = Blaster::start(lab, &format!("workers-{want}"), &cfg, &[]);
+        let b0 = cpu_secs(bl.child.id());
         let took = wait_long("setup", 120 + n as u64 / 200, || {
             bl.established() as usize >= n
         });
         let wall = t.elapsed().as_secs_f64();
+        let b1 = cpu_secs(bl.child.id());
         let c1 = thread_cpu(pid);
         let mut busy: Vec<(String, f64)> = c1
             .iter()
-            .filter(|(k, _)| k.starts_with("pppoe"))
+            .filter(|(k, _)| k.starts_with("pppoe") || k.starts_with("svc-pppoe"))
             .map(|(k, v)| {
                 (
                     k.clone(),
                     (v - c0.get(k).copied().unwrap_or(0.0)) * 100.0 / wall,
                 )
             })
+            .filter(|(_, v)| *v >= 1.0)
             .collect();
         busy.sort_by(|a, b| b.1.total_cmp(&a.1));
-        let total: f64 = busy.iter().map(|b| b.1).sum();
+        let reader = busy
+            .iter()
+            .find(|(k, _)| k.starts_with("svc-"))
+            .map_or(0.0, |b| b.1);
+        let total: f64 = busy
+            .iter()
+            .filter(|(k, _)| !k.starts_with("svc-"))
+            .map(|b| b.1)
+            .sum();
         let top: Vec<String> = busy
             .iter()
-            .take(3)
+            .take(4)
             .map(|(k, v)| format!("{k} {v:.0}%"))
             .collect();
+        let blaster = (b1 - b0) * 100.0 / wall;
         match took {
             Some(secs) => s.put(
                 &sc,
-                &format!("{workers} worker(s): setup"),
+                &format!("{want} worker(s): setup"),
                 n as f64 / secs,
                 "sessões/s",
                 &format!(
-                    "{secs:.1} s; CPU das threads pppoe {total:.0}% de um núcleo ({})",
+                    "{secs:.1} s; workers {total:.0}% somados, leitor {reader:.0}%, BNG Blaster {blaster:.0}% de um núcleo ({})",
                     top.join(", ")
                 ),
             ),
-            None => s.put(
-                &sc,
-                &format!("{workers} worker(s): no ar (incompleto)"),
-                bl.established() as f64,
-                "sessões",
-                "",
-            ),
+            None => s.put(&sc, &format!("{want} worker(s): no ar (incompleto)"), bl.established() as f64, "sessões", ""),
         }
         s.check(
-            &format!("{sc} {workers} worker(s) completo"),
+            &format!("{sc} {want} worker(s) completo"),
             took.is_some(),
             format!("{wall:.1} s"),
         );
@@ -1329,11 +1366,6 @@ fn radius_counts() -> (u64, u64) {
 /// server in retransmissions; fixed above its capacity fills its queue
 /// past the timeout; auto should follow it.
 fn radius_wave(lab: &Lab, n: usize, capacity: u32, s: &mut Summary) {
-    let rad = Radius::start(n, "10M/20M", capacity);
-    ok(
-        "radius.add",
-        json!({"address": "127.0.0.1", "authentication_port": rad.auth, "accounting_port": rad.acct, "service": "ppp", "secret": SECRET}),
-    );
     ok(
         "ppp.aaa.set",
         json!({"use_radius": true, "interim_update": 0}),
@@ -1344,6 +1376,20 @@ fn radius_wave(lab: &Lab, n: usize, capacity: u32, s: &mut Summary) {
         ("fixo 2000", json!(2000)),
         ("auto", json!("auto")),
     ] {
+        // A fresh server each mode: what one mode left in its queue is not
+        // the next one's problem.
+        for r in ok("radius.list", json!({}))
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            ok("radius.remove", json!({"id": r["id"]}));
+        }
+        let rad = Radius::start(n, "10M/20M", capacity);
+        ok(
+            "radius.add",
+            json!({"address": "127.0.0.1", "authentication_port": rad.auth, "accounting_port": rad.acct, "service": "ppp", "secret": SECRET}),
+        );
         for name in (0..lab.ports).map(|i| format!("pppoe-acc{i}")) {
             ok(
                 "interface.pppoe-server.server.set",
@@ -1412,7 +1458,6 @@ fn radius_wave(lab: &Lab, n: usize, capacity: u32, s: &mut Summary) {
     {
         ok("radius.remove", json!({"id": r["id"]}));
     }
-    drop(rad);
 }
 
 /// A short run of one subscriber with BNG Blaster's capture, for the
