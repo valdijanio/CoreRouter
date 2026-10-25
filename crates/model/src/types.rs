@@ -215,7 +215,7 @@ impl fmt::Display for IfName {
 string_serde!(IfName);
 
 /// MikroTik-style item id, displayed as `*1`, `*2A` (hex).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ItemId(pub u32);
 
 impl FromStr for ItemId {

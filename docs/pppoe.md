@@ -1,6 +1,6 @@
 # PPPoE / BNG em Rust puro (`proto-pppoe`, G4.3)
 
-Status: **G4.3a** feito — o crate L2 `crates/proto-pppoe`: codecs de PPPoE e PPP e as máquinas
+Status: **G4.3a** feito; **G4.3d** em andamento (modelo e comandos; serviço, janela e extras em PRs empilhados, §8) — o crate L2 `crates/proto-pppoe`: codecs de PPPoE e PPP e as máquinas
 sans-IO do concentrador (servidor BNG) e do assinante (cliente, gerador de carga). Sem I/O, sem
 `unsafe`, compila para `wasm32-unknown-unknown`. O serviço do daemon, os comandos `ppp.*` e a
 janela PPP vêm na G4.3d; o plano de dados XDP por assinante é a G4.3c; o RADIUS é a G4.3b
@@ -256,3 +256,145 @@ cliente e a rede simulada (≈ 159 mil sessões por segundo num núcleo). A sess
 servidor (**estimado** a partir dos 624 B **medidos** da `Session`). O plano de controle não é o
 gargalo: uma reconexão em massa de 100 mil assinantes custa menos de 1 s de CPU; o que limita é
 a rede de acesso e o RADIUS.
+
+## 8. Serviço (G4.3d): comandos, daemon e janela PPP
+
+A G4.3d liga o crate ao roteador em quatro PRs empilhados: **(a)** modelo e comandos, **(b)** o
+serviço `pppoe` no daemon, **(c)** a janela PPP, **(d)** os extras aprovados. Este parágrafo é o
+desenho dos quatro; cada PR atualiza o que mudou.
+
+### 8.1 Pesquisa
+
+- **MikroTik RouterOS v7** — [PPP AAA](https://help.mikrotik.com/docs/spaces/ROS/pages/132350049/PPP+AAA)
+  (o help.mikrotik.com está congelado; o manual novo é manual.mikrotik.com/docs/7.25) e
+  [PPPoE](https://help.mikrotik.com/docs/display/ROS/PPPoE):
+  - `/interface pppoe-server server`: `service-name` (vazio: qualquer), `interface`, `max-mtu` e
+    `max-mru` 1480, `mrru` desligado, `authentication` mschap2,mschap1,chap,pap,
+    `keepalive-timeout` 10 (o cliente cai depois de 2 × o tempo), `one-session-per-host` **no**,
+    `max-sessions` 0 = sem limite, `default-profile` default, `pppoe-over-vlan-range` (faixas
+    `100-115,120`), `accept-untagged` yes. `pado-delay` existe no RouterOS mas a página não o
+    documenta.
+  - `/ppp profile`: `local-address`/`remote-address` (endereço ou pool), `dns-server`,
+    `rate-limit` (`rx/tx [burst [limiar [tempo [prioridade [mínimo]]]]]`, do ponto de vista do
+    roteador: rx = upload do assinante), `address-list`, `only-one` (yes/no/default; ignorado com
+    RADIUS), `change-tcp-mss` (o manual recomenda desligar acima de 10 sessões e usar uma regra
+    mangle), `idle-timeout`, `session-timeout`, `on-up`/`on-down` (scripts com `$user`,
+    `$remote-address`, `$caller-id`, `$interface`…). Dois perfis embutidos que não se apagam:
+    `default` (only-one=no, change-tcp-mss=yes) e `default-encryption`.
+  - `/ppp secret`: `name`, `password`, `service` (any, pppoe, l2tp…), `profile` (default),
+    `local-address`, `remote-address`, `caller-id` (o MAC no PPPoE), `limit-bytes-in/out`,
+    `routes`, `comment`, `disabled`.
+  - **Precedência:** secret > perfil do secret > `default-profile` do servidor; um endereço fixo
+    ganha de um pool; com RADIUS, os atributos ganham e o que falta vem do perfil.
+  - `/ppp active`: `name`, `service`, `caller-id`, `address`, `uptime`, `encoding`,
+    `session-id`, `limit-bytes-*`, `radius`; `print stats` dá bytes e pacotes.
+- **accel-ppp** (o BNG do VyOS, `accel-ppp.conf`): `[pppoe] pado-delay=0,100:100,200:5000` (atraso
+  por número de sessões), `padi-limit`, `mac-filter`, `tr101`, `ifname-in-sid`; `[ppp]
+  lcp-echo-interval/failure`, `single-session=replace`; `[radius] interim-verbose`, `dae-server`
+  (CoA/DM); `[shaper]` aplica `Filter-Id`/vendor rate-limit; `[cli] show sessions` com colunas
+  escolhidas (ifname, username, calling-sid, ip, rate-limit, uptime, rx/tx).
+- **Juniper Junos** (subscriber management): perfis dinâmicos, `pppoe-underlying-options
+  max-sessions`, `short-cycle-protection` (atraso crescente a quem reconecta em loop), `show
+  subscribers extensive` e `show network-access aaa subscribers` com o motivo da última queda
+  (`Terminate-Cause`).
+- **Cisco IOS-XE** (BBA groups): `pppoe limit per-mac`/`per-vlan`, `pppoe throttle per-mac/
+  per-vlan` (sessões por intervalo), `ppp lcp delay`, `show pppoe session` e `debug pppoe
+  errors` — a resposta a "por que esse cliente não sobe" é um debug global, não uma consulta.
+- **RFCs:** RFC 2516 (§4 SESSION_ID, §5.5 PADT, §9 AC-Cookie), RFC 1661 §3 (fases) e §5.8
+  (Echo), RFC 2865 (Access-Request: NAS-Port-Type Virtual = 5, Service-Type Framed = 2,
+  Framed-Protocol PPP = 1, Calling-Station-Id = MAC), RFC 2866 (Acct-Status-Type
+  Start/Interim/Stop, Acct-Session-Id único, Acct-Terminate-Cause §5.10), RFC 2869 §5.16
+  (Acct-Interim-Interval ≥ 60), RFC 5080 §2.2.1 (interims dispersos), RFC 5176 (CoA/DM: §3.2
+  NAK 503 sem sessão, §3.5 Error-Cause), RFC 4679 (Agent-Circuit-Id/Remote-Id no NAS-Port-Id e no
+  RADIUS), RFC 6911 (Framed-IPv6-*; G4.3e), RFC 3046 (opção 82; G4.3f).
+
+### 8.2 O que adotamos
+
+- **Nomes do RouterOS v7** em todos os comandos: `interface.pppoe-server.server.*`,
+  `ppp.profile.*`, `ppp.secret.*`, `ppp.active.*`, `ppp.aaa.*` (G4.3j); os parâmetros usam `_` no
+  lugar de `-`, como o resto do motor.
+- **Padrões do RouterOS**, com três exceções de segurança, explicadas no ⓘ e na saída
+  (`warnings`): `one_session_per_host=yes` (um CPE que reinicia sem PADT seguraria dois
+  endereços), `ac_cookie=yes` (RFC 2516 §9; o RouterOS não documenta cookie) e limites de PADI
+  e de sessões novas por segundo (accel-ppp `padi-limit`, Cisco `pppoe throttle`).
+- **`on_up`/`on_down` são listas de comandos do motor**, não scripts: `[{command, params}]` com
+  `$user`, `$remote-address`, `$local-address`, `$caller-id`, `$interface`, `$service` nos
+  valores de texto. Validados ao gravar (o comando existe, aceita os parâmetros, não é tarefa nem
+  comando PPP — sem laço), executados pelo serviço e registrados no journal como qualquer
+  comando. Nada de interpretador.
+- **Um servidor habilitado por interface** (o RouterOS aceita vários Service-Names na mesma porta):
+  cada servidor é um espaço de SESSION_ID (RFC 2516 §4) e dois na mesma porta dariam o mesmo id a
+  dois assinantes. Vários Service-Names por porta (com perfil por nome, como o
+  `service-name-table` do Junos) ficam para uma gap.
+- **Senha só de escrita:** `ppp.secret.list` mostra `***`; o journal mascara `password`
+  (`auth::SECRET_KEYS`); o `/export` escreve o secret como linha comentada, sem a senha. Fica em claro no config porque CHAP e MS-CHAP precisam do segredo (RFC
+  1994 §4.1).
+- **Perfis embutidos** `default` e `default-encryption` existem sem entrada no config; editar um
+  grava uma cópia; não se apagam nem mudam de nome. `default-encryption` existe pelo nome (quem
+  vem do MikroTik o referencia); MPPE no plano de dados não faz sentido em PPPoE de ISP (§6).
+
+### 8.3 Melhorias propostas (entram agora)
+
+- **"Derruba N sessões" antes de aplicar:** mudar a interface, a VLAN ou o Service-Name, desligar
+  ou remover um servidor com sessões ativas é recusado com o número (`force=yes` aplica). Em
+  Safe Mode, a mudança se desfaz se o operador perder o roteador. O RouterOS derruba calado.
+- **`ppp.why {name|mac}`:** até onde chegam os logins de um assinante (PADI → PADR → LCP → auth →
+  NCP → up), quantas tentativas por etapa, e o motivo da última queda em português com o que
+  fazer (do `DownReason` do `proto-pppoe` e do Reply-Message do RADIUS). Nos outros é um debug
+  global (Cisco) ou um campo de texto (Junos).
+- **`ppp.history`:** os últimos logins, falhas e quedas, filtráveis por usuário, MAC e evento.
+- **`pado_delay_by_load`** (accel-ppp) e **`new_session_rate`**: num BNG carregado o PADO
+  atrasa e um BNG mais leve responde antes; numa reconexão em massa as sessões novas entram a
+  2000/s (padrão) em vez de uma rajada que derruba o RADIUS. 20 mil assinantes voltam em 10 s
+  (**estimado**; o plano de controle faz ≈ 159 mil sessões/s, **medido** na G4.3a).
+- **Conferências ao gravar:** pool inexistente, perfil inexistente, endereço fixo dentro de um
+  pool (o pool pode emprestá-lo a outro), dois secrets com o mesmo endereço, IP na interface de
+  acesso, VLAN que também é uma interface VLAN, autenticação vazia (recusada), só PAP, keepalive
+  desligado.
+- **Importação em massa:** um lote atômico (`command_batch`) de 10 mil `ppp.secret.add` custa
+  um snapshot só (0,47 s em debug, **medido**); um comando sozinho copia a tabela de secrets que
+  escreve (copy-on-write da seção, `CowArc`).
+
+### 8.4 O serviço `pppoe` do daemon (PR b)
+
+- **Sockets:** um AF_PACKET por interface de acesso para 0x8863 (Discovery) e 0x8864 (sessão),
+  com as APIs seguras do `hal-linux` (como `l2`/`dhcp`), VLAN pelo auxdata. Com o XDP da G4.3c
+  ativo só os quadros de controle (LCP/PAP/CHAP/IPCP) e o que o XDP não trata sobem
+  (`XDP_PASS`); sem ele (backend virtual, placa sem XDP), o serviço também carrega dados pelo
+  caminho lento e conta os bytes.
+- **Uma thread por grupo de portas** dona de um `proto_pppoe::Server` (≤ 65 534 sessões; mais
+  sessões = mais grupos). Ela não segura o lock da `Session` na rede: lê o config em execução por
+  instantâneo (os `Arc` das seções), e só pega o lock para os hooks e o journal, fora do laço de
+  pacotes.
+- **Autenticação:** `/ppp secret` primeiro (`request.verify_local`); se não houver o usuário e
+  `ppp.aaa use_radius=yes`, `AaaBackend::authenticate` da G4.3j (o callback roda na thread do
+  RADIUS e só manda a resposta por canal para a thread do PPPoE). `caller-id`, `service`,
+  `disabled`, `only-one` e `limit-bytes-*` conferidos aqui.
+- **Endereço:** fixo do secret → Framed-IP-Address → Framed-Pool → `remote_address` do perfil
+  (pool, com `next_pool`). O pool do PPP é um alocador próprio do serviço sobre as faixas do
+  `/ip pool`; `ip.pool.used.print` passa a mostrá-lo (G4.3d-b).
+- **Plano de dados:** `Event::Up`/`Changed` → `pppoe_upsert` no mapa de sessões (G4.3c) com o
+  `rate_limit` no policer; `Down` → `pppoe_remove`, devolve o endereço, Acct-Stop com
+  Acct-Terminate-Cause.
+- **Contabilização:** Start/Interim/Stop com os contadores por sessão do XDP (`AcctSource`); o
+  keepalive vira "sem tráfego há N s" lido desses contadores, como proposto na G4.3a.
+- **CoA/DM:** o serviço é um `SessionOwner` da G4.3j: rate-limit novo ao vivo (só o policer
+  muda), Disconnect-Request → Terminate + PADT; mudança de Framed-IP = desconectar e o CPE volta
+  com o endereço novo (o PPP não troca endereço numa sessão aberta sem renegociar o IPCP; isso
+  vai explicado no ⓘ).
+- **Identidade:** fonte `pppoe` do chip (G0.25) → o login de quem tem o endereço; o "Quem era?"
+  do CGNAT mostra o login no instante.
+- **address-list:** entrada dinâmica (`timeout`, não gravada) na subida, removida na queda.
+
+### 8.5 Riscos e como evitamos
+
+- **Travar o plano de controle:** nunca segurar o lock da sessão no laço de pacotes; hooks com
+  limite (8 por perfil) e fora do laço; um panic numa thread do serviço é reiniciado pelo
+  supervisor (G0.10) e as sessões caem — por isso nada de `unwrap`.
+- **Reconexão em massa** derrubando RADIUS e pool: `new_session_rate`, `pado_delay_by_load`,
+  `padi_limit`.
+- **Assinante preso no XDP depois da queda:** toda `Down` remove a entrada; o serviço, ao
+  reiniciar, limpa o mapa inteiro antes de aceitar sessões (o PADT ao SID desconhecido faz o CPE
+  reconectar).
+- **Compatibilidade com quem vem do MikroTik:** os padrões diferentes vêm com aviso na saída e
+  no ⓘ.
