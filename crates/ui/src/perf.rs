@@ -137,6 +137,18 @@ impl Frames {
         me
     }
 
+    /// The window of panel `id` open (G4.8a: System › Resources on the
+    /// lab, its Overview with the four cards, links and checks).
+    pub fn panel(id: &'static str) -> Self {
+        let mut me = Self::with(Session::virtual_lab(), Some(Win::Panel(id)));
+        // Its queries went out with the first frames; one more draws them.
+        me.app.cache.refreshed_at = None;
+        me.time += 2.0;
+        me.frame();
+        me.frame();
+        me
+    }
+
     /// Draw one frame of a 1400×900 screen.
     pub fn frame(&mut self) {
         let raw = egui::RawInput {

@@ -3528,3 +3528,95 @@ continuação indentadas).
 - 2026-10-24 — fix-main-pppoe-policer: `main` vermelha (issue #202). Dois testes corrigidos:
   - `pppoe_policer_accuracy` (G4.3c) media o limite do remetente, não o policer. No runner de 4 vCPUs, o AF_PACKET oferece ~1,5 Gbit/s, abaixo dos 100 × 20 Mbit/s configurados (−26%). Agora cada caso mede antes o que o remetente oferece e limita a taxa a um terço do que cada assinante recebe. A referência passou a ser por assinante: quem o policer cortou tem de receber a taxa com ±5% (tolerância mantida); quem ele não cortou tem de receber exatamente o que ofereceu. Ninguém pode passar do limite, e ao menos 90% dos assinantes têm de ser cortados (para o caso testar o policer).
   - `netns_capture` `frames_both_ways_with_their_wire_length`, que é instável: até o linkwatch ver a portadora, o veth recém-ligado fica com a `noop_qdisc`, que descarta os quadros enviados. O teste agora espera o `state UP` dos dois lados, via netlink (`ip -o link`). Passou 5 vezes seguidas.
+
+- 2026-10-24 — G4.3d: BNG, parte 1 (modelo e comandos, com os nomes do RouterOS v7): `interface.pppoe-server.server.*`
+  (add/set/remove/enable/disable/list e `interface.pppoe-server.monitor`), `ppp.profile.*` (com os
+  perfis embutidos `default` e `default-encryption`), `ppp.secret.*` (senha só de escrita, `***` e
+  mascarada no journal), `ppp.active.list/remove`, `ppp.why {name|mac}` e `ppp.history`, lidos do
+  serviço do daemon por `PppBackend` (`crates/engine/src/ppp.rs`). Padrões do RouterOS mais os
+  seguros: `one_session_per_host=yes`, `ac_cookie=yes`, `padi_limit` 2000/s, `mac_padi_limit` 1/s,
+  `new_session_rate` 2000/s e `pado_delay_by_load`. `on_up`/`on_down` são listas de comandos do
+  motor (validados ao gravar, com `$user`, `$remote-address`…), não scripts. Mudar a interface,
+  VLAN ou Service-Name, desligar ou remover um servidor com sessões ativas é recusado com "drops N
+  active session(s)" até `force=yes`. Precedência secret > perfil > `default-profile` > `default`
+  em `Ppp::effective`. Desenho do serviço e pesquisa em `docs/pppoe.md` §8. Testar: `cargo test -p
+  corerouter-engine ppp_`; `corerouter-cli run interface.pppoe-server.server.add
+  '{"interface":"ether2"}'`. Lote atômico de 10 mil `ppp.secret.add`: 0,47 s em debug (**medido**).
+
+- 2026-10-24 — G4.8a: System › Resources, parte 1 (coletores e comandos). `Hal::resource_sampler` (padrão: nenhum)
+  entrega um amostrador que vive fora do `Hal`, para o daemon ler `/proc` e `/sys` sem segurar o
+  lock da sessão. No Linux (`hal-linux/src/resource.rs`, sem root nem `unsafe`): tempos de CPU por
+  núcleo, memória e swap, PSI (`/proc/pressure/{cpu,memory,io}`), loadavg, softirqs e interrupções
+  por CPU, discos (`/proc/mounts` + `statvfs`, `/proc/diskstats`), sensores hwmon com `max`/`crit`
+  (limites absurdos como `temp2_max = 65261 °C` de NVMe descartados) e o `critical` da zona
+  térmica, contadores de rede, `oom_kill`, conntrack e, sob demanda, os processos. O laboratório
+  virtual inventa valores plausíveis que se movem (16 CPUs, 8 portas, uma com cabo ruim).
+  Comandos: `system.resource.print` (nomes do RouterOS: `cpu-load`, `free-memory`,
+  `free-hdd-space`, `write-sect-since-reboot`… em snake_case, mais PSI, discos, temperatura e
+  histórico de 10 min para sparklines), `system.resource.cpu.print` (carga por núcleo com
+  irq/softirq e taxa de NET_RX por CPU), `system.resource.process.print` (como `/tool profile`,
+  ordenável), `system.resource.network.print` (taxas, erros e descartes por interface) e
+  `system.health.print` (sensores com limites e estado ok/warning/error). Testes: parsers com
+  arquivos reais de um AMD Ryzen AI Max+ 395 (NVMe, r8169, mt7925) em
+  `crates/hal-linux/tests/fixtures/resource`, todo truncamento dos arquivos, proptest com lixo,
+  comandos de sucesso e de erro de validação. Como testar:
+  `cargo run -p corerouter-cli -- run system.resource.print`, `… run system.resource.process.print '{"sort":"memory","limit":5}'`.
+
+- 2026-10-24 — G4.8a: System › Resources, parte 2 (serviço e verificações). Serviço `health` do daemon
+  (`service/health.rs`, sob o supervisor): lê a máquina a cada 5 s, a cada 1 s enquanto alguém
+  olha (janela, leitura na barra ou comando nos últimos 15 s), com amostrador próprio e **fora**
+  do lock da sessão; sob o lock só entrega a leitura (`Session::resource_ingest`) e julga as
+  verificações. `system.health.check`: 12 verificações com severidade
+  (`ok`/`warning`/`error`/`unknown`), valor, motivo e ação em português e chave estável em inglês:
+  CPU sustentada (média de 5 min), pressão de memória (PSI, ou % em uso sem PSI), swap (uso e
+  leitura do swap), disco, temperatura perto do crítico, erros e descartes de NIC subindo,
+  conntrack, portas do CGNAT, OOM kills na última hora, NTP, serviços supervisionados e
+  desequilíbrio de RSS (uma CPU com mais da metade dos softirqs de recepção). Alertas: a mudança
+  de estado de uma verificação (mantida por duas leituras) vai ao log do roteador uma vez, tópicos
+  `system` + nível, origem `health` — o caminho dos alertas de banda do G4.5, que as regras de
+  logging levam ao syslog e ao ClickHouse. Testes: regras por tabela (34 casos), comando no
+  laboratório, alerta registrado uma vez, e2e no daemon real (`tests/health.rs`). Como testar:
+  `cargo run -p corerouter-daemon -- --control 7979` e
+  `cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run system.health.check`.
+
+- 2026-10-24 — G4.8a: System › Resources, parte 3 (janela e barra superior). Painel `crates/ui/src/resources.rs`,
+  abas Overview (cartões de CPU, memória, disco e temperatura com sparkline de 5 min, mini-tabela
+  de interfaces com selo de link e de erros, verificações de saúde com selo ok/aviso/erro e o
+  motivo em português, a ação no tooltip), CPU (barras por núcleo: usuário, sistema, irq,
+  softirq, e a fatia de softirq de recepção de cada CPU), Memory (uso, PSI de memória, CPU e E/S,
+  maiores processos), Disk, Network (taxas, erros e descartes por segundo), Sensors (todo sensor
+  com max/crit e estado), Processes (ordenável pelo roteador) e OS Log (marcador até a G4.8b).
+  Cabeçalho com o selo de saúde, identidade, commit e uptime. ⓘ em português em toda aba,
+  cartão, coluna e verificação (`i18n/auto/resources_*.rs`), entrada no menu System com
+  sinônimos. Barra superior: selo de saúde sempre (consulta a cada 5 s sem acelerar o serviço;
+  clique abre a janela) e, ligada em Settings › Top bar (desligada por padrão), a CPU e a memória
+  **do roteador** ao lado da troca de tema, a 1 Hz só enquanto ligada. A janela consulta a 1 Hz
+  só aberta. A parte esquerda da barra agora é cortada quando falta largura, em vez de passar por
+  cima da direita. Como testar: abra System › Resources (ou clique no selo de saúde no canto
+  superior direito) e Settings › Top bar › Show the router's CPU and memory. Screenshots nos dois
+  temas conferidos.
+
+- 2026-10-24 — G4.8b: Log do sistema operacional (System › OS Log). `crates/hal/src/oslog.rs`: a linha (RFC 5424
+  0–7, origem kernel/services/auth, unidade, dispositivo, PID, boot), parsers de `/dev/kmsg` e de
+  `journalctl -o json` tratando a entrada como hostil (tetos, sem controle nem bidi, `\xNN`,
+  UTF-8 inválido, cursor seguro), `Hal::os_log` (padrão: nenhum) e as linhas inventadas do lab.
+  `crates/hal-linux/src/oslog.rs`: kmsg non-blocking (EAGAIN/EPIPE, perdas contadas) com a hora
+  por `CLOCK_BOOTTIME` e o journal por `journalctl` com cursor, sem shell, teto de linhas e bytes,
+  prazo, grupo de processo morto e colhido; fonte ilegível diz por quê. Engine: `OsLogBook` (anel de
+  20 000 linhas, repetição = mesma origem/unidade/nível/texto sem os números em 10 min, a linha
+  conta e vai para o fim), catálogo de dados `oslog_known.rs` (anel da placa cheio → Tuning da
+  porta e gráfico; TX timeout; LACP; link flap; conntrack cheio; vizinhos; SYN flood; martian; OOM;
+  disco; MCE; temperatura; lockup; segfault; login recusado; callbacks suppressed), comandos
+  `log.os.print {since, level, source, find, limit}` e `log.os.known`. Daemon: serviço `os-log`
+  (`--os-log host|lab|off`; padrão `host` com `--backend linux`, `lab` no virtual) lê kmsg a cada
+  1 s e o journal a cada 2 s fora do lock e entrega em lote; mensagem conhecida que custa tráfego
+  ou hardware vai uma vez ao Log do roteador (`system,error`). GUI: `crates/ui/src/os_log.rs`
+  (selos de nível com contagem, de origem, busca, estado das fontes, tabela virtualizada com selo
+  `37×` e o da mensagem conhecida, detalhe com "repetido 37× em 9 min", "O que significa" e os
+  botões que abrem a janela — Tuning já na aba Interfaces da porta), ⓘ em português em tudo,
+  `os_log::tab(app, ui)` para o G4.8a. Testes: fixtures sintéticas no formato real (kmsg com
+  dicionário e journal JSON, nenhum dado de máquina), linhas truncadas e estranhas, um teste
+  `#[ignore]` que lê o journal local à mão, proptest, alvo de fuzz `oslog`, tabela do catálogo, repetições,
+  100 mil linhas no anel e na tabela, e2e do daemon (lab e host), headless da GUI. Pesquisa em
+  `docs/os-log.md`. Como testar: `cargo run -p corerouter-cli -- run log.os.print '{"level":"warning"}'`;
+  `corerouter-daemon --control 7979 --os-log host` e na GUI System › OS Log.

@@ -17,6 +17,7 @@ pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod nic;
+pub mod oslog;
 pub mod pppoe;
 pub mod probe;
 pub mod resources;
@@ -557,6 +558,18 @@ pub trait Hal: Send {
 
     /// CPU, memory and conntrack readings for the graphs (G4.5), taken
     /// every second: `None` where the platform has none.
+    /// The OS log's lines since the last call (G4.8b), at most `max`, and
+    /// how each source is; `now` is the session's clock. Cheap and never
+    /// blocking (it runs under the session lock): a backend whose sources
+    /// are slow leaves this to the daemon's `oslog` service, which reads
+    /// them on its own thread. Default: no OS log here.
+    fn os_log(&mut self, now: Option<u64>, max: usize) -> Result<oslog::OsLogBatch, HalError> {
+        let _ = (now, max);
+        Err(HalError::Unsupported(
+            "this backend has no OS log (the daemon's oslog service reads it)".into(),
+        ))
+    }
+
     fn resources(&mut self) -> Option<resources::Resources> {
         None
     }

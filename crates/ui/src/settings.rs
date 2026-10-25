@@ -75,6 +75,8 @@ impl PanelState for SettingsPanel {
             });
         ui.add_space(8.0);
         crate::identity::settings_ui(app, ui);
+        ui.add_space(8.0);
+        crate::resources::settings_ui(app, ui);
         ui.add_space(4.0);
         ui.weak(tr(l, "Stored on this computer, not on the router."));
     }

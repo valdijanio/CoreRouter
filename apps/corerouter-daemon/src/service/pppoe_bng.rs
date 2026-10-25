@@ -11,6 +11,9 @@
 //! Driven by the service's thread only; RADIUS answers come back over a
 //! channel ([`Bng::auth_inbox`]), so no callback ever touches the BNG.
 
+// Only the Linux driver (`pppoe.rs`) runs the BNG.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
+
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, Sender, channel};

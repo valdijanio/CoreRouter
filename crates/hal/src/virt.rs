@@ -70,6 +70,8 @@ pub struct VirtualHal {
     /// The lab's "kernel" (G1.3): what each apply left, which a test (or
     /// a lab script) can change behind CoreRouter's back to make drift.
     kernel: LabKernel,
+    /// The lab's made-up OS log (G4.8b).
+    oslog: crate::oslog::LabOsLog,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -164,6 +166,7 @@ impl VirtualHal {
             killed: std::collections::BTreeSet::new(),
             blocks: BTreeMap::new(),
             kernel: Arc::new(Mutex::new(kernel)),
+            oslog: crate::oslog::LabOsLog::default(),
         }
     }
 
@@ -508,6 +511,14 @@ impl Hal for VirtualHal {
 
     /// A lab that looks alive: the load and the table follow slow waves of
     /// the poll count (deterministic, so tests can count on it).
+    fn os_log(
+        &mut self,
+        now: Option<u64>,
+        max: usize,
+    ) -> Result<crate::oslog::OsLogBatch, HalError> {
+        Ok(self.oslog.read(now, max))
+    }
+
     fn resources(&mut self) -> Option<crate::resources::Resources> {
         let t = self.ticks;
         let wave = |period: u64, amp: u64| {
