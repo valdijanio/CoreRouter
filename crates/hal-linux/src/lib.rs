@@ -118,6 +118,10 @@ pub mod trace;
 pub mod capture;
 
 /// System › Tuning (G1.26): kernel parameters, the machine, counters.
+// System › Resources and health (G4.8a): /proc and /sys readings.
+#[cfg(target_os = "linux")]
+pub mod resource;
+
 #[cfg(target_os = "linux")]
 pub mod tuning;
 
@@ -692,6 +696,12 @@ mod linux {
 
         fn resources(&mut self) -> Option<corerouter_hal::resources::Resources> {
             Some(self.sysctl.root.resources())
+        }
+
+        fn resource_sampler(
+            &self,
+        ) -> Result<Box<dyn corerouter_hal::system_resource::ResourceSampler>, String> {
+            Ok(Box::new(crate::resource::Collector::default()))
         }
 
         fn kernel_stats(&mut self) -> Result<KernelStats, HalError> {

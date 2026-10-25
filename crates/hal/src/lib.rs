@@ -22,6 +22,7 @@ pub mod resources;
 pub mod route_get;
 pub mod sff;
 pub mod sim;
+pub mod system_resource;
 pub mod tuning;
 pub mod virt;
 pub mod xdp;
@@ -530,6 +531,16 @@ pub trait Hal: Send {
     /// every second: `None` where the platform has none.
     fn resources(&mut self) -> Option<resources::Resources> {
         None
+    }
+
+    /// A sampler of the machine for System › Resources and health (G4.8a,
+    /// [`system_resource`]), or why there is none. Cheap to build; the
+    /// caller keeps it and reads with it outside the session lock.
+    fn resource_sampler(&self) -> Result<Box<dyn system_resource::ResourceSampler>, String> {
+        Err(format!(
+            "{} has no system resource readings",
+            self.describe()
+        ))
     }
 
     /// A live feed of conntrack events for the flow exporter (G4.4b).
