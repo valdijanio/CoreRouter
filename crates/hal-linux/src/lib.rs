@@ -117,6 +117,10 @@ pub mod trace;
 #[cfg(target_os = "linux")]
 pub mod capture;
 
+/// PPPoE access ports and the slow path of the BNG (G4.3d): `AF_PACKET`.
+#[cfg(target_os = "linux")]
+pub mod pppoe_io;
+
 /// System › Tuning (G1.26): kernel parameters, the machine, counters.
 // System › Resources and health (G4.8a): /proc and /sys readings.
 #[cfg(target_os = "linux")]
@@ -642,6 +646,24 @@ mod linux {
             self.xdp.reset()
         }
 
+        fn pppoe_dataplane(&mut self, on: bool, ports: &[IfName]) -> Result<(), HalError> {
+            if on {
+                self.xdp.pppoe_ready(ports)?;
+            }
+            self.xdp.set_pppoe(on)
+        }
+
+        fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), HalError> {
+            self.xdp.pppoe_apply(ops)
+        }
+
+        fn pppoe_counters(
+            &mut self,
+            slots: &[u32],
+        ) -> Vec<(u32, corerouter_hal::pppoe::PppoeCounters)> {
+            self.xdp.pppoe_counters_of(slots)
+        }
+
         fn xdp_nat_link(&mut self) -> Result<Box<dyn corerouter_hal::xdp_nat::NatLink>, HalError> {
             self.xdp.nat_link()
         }
@@ -860,6 +882,22 @@ mod linux {
                 // entry, under the session lock).
                 DynamicChange::Expired(_) => Ok(()),
             }
+        }
+
+        fn address_list_dynamic_many(
+            &mut self,
+            changes: &[DynamicChange<'_>],
+        ) -> Result<(), HalError> {
+            let mut ops = Vec::with_capacity(changes.len());
+            for c in changes {
+                self.xdp.dynamic(*c);
+                match c {
+                    DynamicChange::Add(d) => ops.push((true, *d)),
+                    DynamicChange::Remove(d) => ops.push((false, *d)),
+                    DynamicChange::Expired(_) => {}
+                }
+            }
+            crate::nft::apply_dynamic(&ops)
         }
 
         fn dhcp_port(

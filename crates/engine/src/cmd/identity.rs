@@ -133,11 +133,29 @@ fn held_at(s: &Session, ips: &[Ipv4Addr], at: u64) -> HashMap<Ipv4Addr, ([u8; 6]
     out
 }
 
-/// The PPPoE login of the session that has `ip` (G4.3). There is no PPPoE
-/// server yet: this is where its active sessions (`/ppp active` name, the
-/// RADIUS User-Name, RFC 2865 §5.1) come in, first in the default order.
-fn pppoe(_s: &Session, _ip: IpAddr, _at: Option<u64>) -> Vec<Name> {
-    Vec::new()
+/// The PPPoE login of the session that has `ip` (G4.3d): now, from the
+/// active sessions (`/ppp active`), or at `at`, from the service's history
+/// (CGNAT › Who was? names the login). First in the default order: it is
+/// what the subscriber typed (or the RADIUS User-Name, RFC 2865 §5.1).
+fn pppoe(s: &Session, ip: IpAddr, at: Option<u64>) -> Vec<Name> {
+    let (IpAddr::V4(ip4), Some(b)) = (ip, s.ppp_backend()) else {
+        return Vec::new();
+    };
+    let login = match at {
+        Some(t) => b.who_at(ip4, t),
+        None => b.who(ip4),
+    };
+    login
+        .map(|l| clean(&l))
+        .filter(|l| !l.is_empty())
+        .map(|name| Name {
+            source: Source::Pppoe,
+            item: json!({"window": "ppp", "tab": "active", "id": name}),
+            name,
+            detail: None,
+        })
+        .into_iter()
+        .collect()
 }
 
 fn lookup(s: &mut Session, p: &Value) -> Result<Value> {

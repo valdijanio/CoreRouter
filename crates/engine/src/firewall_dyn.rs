@@ -85,6 +85,20 @@ impl DynamicLists {
         Some(e)
     }
 
+    /// Remove many at once: one reindex for all (a mass reconnect of the
+    /// PPP service removes thousands; one by one was O(n²)).
+    pub fn remove_many(&mut self, ids: &std::collections::HashSet<ItemId>) -> Vec<DynamicEntry> {
+        if ids.is_empty() {
+            return Vec::new();
+        }
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
+            .into_iter()
+            .partition(|e| ids.contains(&e.id));
+        self.entries = kept;
+        self.reindex();
+        gone
+    }
+
     fn reindex(&mut self) {
         self.index = self
             .entries

@@ -1673,3 +1673,55 @@ fn perf_pppoe_forward() {
     }
     x.sync(&Config::default()).unwrap();
 }
+
+/// G4.3d: what the BNG service does to the maps, through the HAL's terms
+/// (`hal::pppoe`): `pppoe_ready` refuses a port without XDP, an `Upsert`
+/// makes the session known (upstream decapsulated to the kernel, counted),
+/// a rate in RouterOS terms reaches the policer, a `Remove` makes the next
+/// frame unknown.
+#[test]
+fn pppoe_bng_ops_reach_the_maps() {
+    use corerouter_hal::pppoe::{PppoeOp, PppoeSession, Rate as HalRate};
+    if !enabled() {
+        return;
+    }
+    let _t = Triangle::new();
+    let mut x = pppoe_router();
+    assert!(x.pppoe_ready(&["la".parse().unwrap()]).is_ok());
+    assert!(x.pppoe_ready(&["nope0".parse().unwrap()]).is_err());
+    let s = PppoeSession {
+        ifindex: ifindex("la"),
+        sid: 0x51,
+        mtu: 1480,
+        client_mac: mac_of(Some(SUB_NS), "lb"),
+        server_mac: mac_of(None, "la"),
+        ipv4: Some(std::net::Ipv4Addr::new(100, 64, 9, 20)),
+        up: HalRate {
+            rate_bps: 10_000_000,
+            ..HalRate::default()
+        },
+        down: HalRate {
+            rate_bps: 50_000_000,
+            burst_bps: 80_000_000,
+            threshold_bps: 40_000_000,
+            burst_secs: 8,
+        },
+        fast_up: false,
+        fast_down: true,
+        ..PppoeSession::default()
+    };
+    x.pppoe_apply(&[PppoeOp::Upsert(7, s)]).unwrap();
+    let words = corerouter_hal_linux::xdp::pppoe_session_of(&s);
+    assert_eq!(words.up.rate, 10_000_000 / 8, "bytes per second");
+    assert!(words.down.bursts());
+    let ip = udp_frame([100, 64, 9, 20], 5000, [198, 51, 100, 2], 7, 18);
+    let f = pppoe_frame(&words, &ip, PPP_IPV4);
+    let (act, _, _) = x.test_run_out(&f, 1, Some(ifindex("la"))).unwrap();
+    assert_eq!(act, XDP_PASS, "decapsulated, to the kernel (fast_up off)");
+    let c = x.pppoe_counters_of(&[7]);
+    assert_eq!(c.len(), 1);
+    assert!(c[0].1.up_packets >= 1 && c[0].1.to_kernel >= 1, "{c:?}");
+    x.pppoe_apply(&[PppoeOp::Remove(7)]).unwrap();
+    let (act, _, _) = x.test_run_out(&f, 1, Some(ifindex("la"))).unwrap();
+    assert_eq!(act, XDP_DROP, "unknown session after the removal");
+}

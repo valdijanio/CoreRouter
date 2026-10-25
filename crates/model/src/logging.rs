@@ -48,6 +48,7 @@ pub const TOPICS: &[&str] = &[
     "info",
     "interface",
     "ntp",
+    "ppp",
     "radius",
     "route",
     "system",

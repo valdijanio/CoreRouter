@@ -302,6 +302,100 @@ impl XdpState {
     }
 }
 
+/// The map entry of a session the BNG service describes (`hal::pppoe`).
+pub fn session_of(p: &corerouter_hal::pppoe::PppoeSession) -> Session {
+    let rate = |r: &corerouter_hal::pppoe::Rate| {
+        policer::Rate::mikrotik(
+            r.rate_bps,
+            r.burst_bps,
+            r.threshold_bps,
+            u64::from(r.burst_secs) * 1_000_000_000,
+        )
+    };
+    let mut flags = F_ACTIVE;
+    if p.ipv4.is_some() {
+        flags |= F_IPV4;
+    }
+    if p.fast_up {
+        flags |= pppoe::F_FAST_UP;
+    }
+    if p.fast_down {
+        flags |= pppoe::F_FAST_DOWN;
+    }
+    Session {
+        flags,
+        ifindex: p.ifindex,
+        sid: p.sid,
+        vlan: p.vlan,
+        inner_vlan: p.inner_vlan,
+        outer_tpid: p.outer_tpid,
+        mtu: p.mtu,
+        client_mac: p.client_mac,
+        server_mac: p.server_mac,
+        ipv4: p.ipv4.map_or([0; 4], |ip| ip.octets()),
+        up: rate(&p.up),
+        down: rate(&p.down),
+        ..Session::default()
+    }
+}
+
+impl XdpState {
+    /// The XDP program is attached to every one of `ports` (PPPoE needs it
+    /// on the access side).
+    pub fn pppoe_ready(&self, ports: &[corerouter_model::IfName]) -> Result<(), HalError> {
+        let Some(l) = self.loaded.as_ref() else {
+            return Err(HalError::Unsupported(
+                "the XDP program is not loaded (ip.firewall.xdp: add the access and uplink interfaces)".into(),
+            ));
+        };
+        match ports.iter().find(|p| !l.links.contains_key(*p)) {
+            Some(p) => Err(HalError::Unsupported(format!(
+                "XDP is not attached to {p} (ip.firewall.xdp)"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The BNG service's changes, in order.
+    pub fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), HalError> {
+        for op in ops {
+            match op {
+                corerouter_hal::pppoe::PppoeOp::Upsert(idx, s) => {
+                    self.pppoe_upsert(*idx, &session_of(s))?
+                }
+                corerouter_hal::pppoe::PppoeOp::Remove(idx) => self.pppoe_remove(*idx)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// Counters of `slots`, in the HAL's terms.
+    pub fn pppoe_counters_of(
+        &mut self,
+        slots: &[u32],
+    ) -> Vec<(u32, corerouter_hal::pppoe::PppoeCounters)> {
+        slots
+            .iter()
+            .filter_map(|i| {
+                let c = self.pppoe_counters(*i)?;
+                Some((
+                    *i,
+                    corerouter_hal::pppoe::PppoeCounters {
+                        up_packets: c.up_packets,
+                        up_bytes: c.up_bytes,
+                        down_packets: c.down_packets,
+                        down_bytes: c.down_bytes,
+                        up_policed: c.up_policed,
+                        down_policed: c.down_policed,
+                        spoofed: c.spoofed,
+                        to_kernel: c.to_kernel,
+                    },
+                ))
+            })
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

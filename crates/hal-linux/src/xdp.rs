@@ -35,7 +35,7 @@ use ipnet::IpNet;
 
 #[path = "xdp_pppoe.rs"]
 mod pppoe;
-pub use pppoe::PppoeCounters;
+pub use pppoe::{PppoeCounters, session_of as pppoe_session_of};
 
 /// The XDP object, built by `cargo xtask ebpf` (crates/dataplane-ebpf).
 static OBJECT: &[u8] =

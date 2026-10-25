@@ -30,6 +30,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ppp.secret.list", "PPP Secrets", [], None,
         "{find?: string (in name, comment, caller id or address), profile?: string, limit?: int (default all), offset?: int} → [{id, name, password: \"***\", service, profile, local_address?, remote_address?, caller_id?, limit_bytes_in?, limit_bytes_out?, comment?, disabled, active (up now), flags (X disabled)}]",
         always, list),
+    cmd!(query "ppp.secret.preview", "PPP Secret Preview", [], None,
+        "{id?: *hex | name, name?: string, password?: string, service?: string, profile?: string, local_address?: ipv4, remote_address?: ipv4, caller_id?: mac, limit_bytes_in?: int, limit_bytes_out?: int, comment?: string, disabled?: bool} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
     cmd!(query "ppp.secret.count", "PPP Secret Count", [], None,
         "{find?: string, profile?: string} → {total, disabled, active}",
         always, count),
@@ -208,6 +211,30 @@ fn enable(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn disable(s: &mut Session, p: &Value) -> Result<Value> {
     toggle(s, p, true)
+}
+
+/// The modal's preview: the checks of `add`/`set`, and what the login
+/// gets from its profile.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    super::ppp_common::preview(s, p, ("ppp.secret.add", "ppp.secret.set"), (add, set), |s, v| {
+        let cand = s.store().candidate();
+        let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+        let Some(sec) = cand.ppp.secret(name) else {
+            return Vec::new();
+        };
+        let e = cand.ppp.effective(Some(sec), &sec.profile, corerouter_model::ppp::DEFAULT_PROFILE);
+        let addr = match &e.remote_address {
+            Some(corerouter_model::ppp::AddrOrPool::Address(ip)) => format!("{ip} (fixed)"),
+            Some(corerouter_model::ppp::AddrOrPool::Pool(pool)) => format!("from pool {pool}"),
+            None => "none: only RADIUS or the server's default profile can give one".into(),
+        };
+        vec![
+            json!({"label": "Profile", "value": e.profile}),
+            json!({"label": "Address", "value": addr}),
+            json!({"label": "Rate limit", "value": e.rate_limit.unwrap_or_else(|| "none".into())}),
+            json!({"label": "Only one", "value": if e.only_one { "yes" } else { "no" }}),
+        ]
+    })
 }
 
 /// The secrets `find` and `profile` select.

@@ -29,6 +29,9 @@ corerouter-proto-syslog.workspace = true
 corerouter-proto-flow.workspace = true
 # service/radius.rs (G4.3j): the AAA service drives the RADIUS client.
 corerouter-proto-radius.workspace = true
+# service/pppoe.rs (G4.3d): the BNG drives the PPPoE server.
+corerouter-proto-pppoe.workspace = true
+getrandom.workspace = true
 log.workspace = true
 env_logger.workspace = true
 signal-hook.workspace = true
@@ -47,7 +50,7 @@ hickory-proto = { version = "0.26.3", default-features = false, features = ["std
 [target.'cfg(target_os = "linux")'.dependencies]
 # service/dns_server.rs: IP_PKTINFO / IPV6_RECVPKTINFO (answer from the
 # address the query went to), which std and socket2 lack.
-nix = { version = "0.30.1", default-features = false, features = ["socket", "uio", "net"] }
+nix = { version = "0.30.1", default-features = false, features = ["socket", "uio", "net", "poll"] }
 
 [dev-dependencies]
 serde_json.workspace = true
@@ -63,6 +66,10 @@ nix = { version = "0.30.1", default-features = false, features = ["sched", "net"
 
 [[bench]]
 name = "radius_aaa"
+harness = false
+
+[[bench]]
+name = "pppoe_bng"
 harness = false
 
 [lints]
