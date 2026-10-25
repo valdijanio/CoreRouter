@@ -105,6 +105,7 @@ impl Lab {
                 password,
                 discovery_timeout_ms: 1000,
                 discovery_attempts: 10,
+                discovery_jitter_pct: 25,
                 keepalive_interval_ms: 0,
                 ..ClientConfig::default()
             };
