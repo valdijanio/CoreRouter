@@ -175,10 +175,30 @@ pub struct DhcpServer {
     /// `ip dhcp relay information trusted` is off by default too).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub relay_info_trusted: bool,
+    /// RADIUS for this server's clients (RouterOS `use-radius`): `yes`
+    /// asks about each new client (G4.3f) and accounts its lease,
+    /// `accounting` only accounts.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub use_radius: crate::ipoe::UseRadius,
+    /// Each bound lease is a subscriber session (IPoE, G4.3f): PPP › Active
+    /// Connections, the XDP policer, accounting, CoA/Disconnect. Implied
+    /// by `use_radius`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub ipoe: bool,
+    /// What names a subscriber (RADIUS User-Name, `/ppp secret`).
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ipoe_username: crate::ipoe::IpoeUsername,
+    /// A client without a secret when RADIUS is not asked.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ipoe_unknown: crate::ipoe::IpoeUnknown,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+}
+
+fn is_default<T: Default + PartialEq>(v: &T) -> bool {
+    *v == T::default()
 }
 
 fn default_lease_time() -> u32 {
@@ -212,9 +232,23 @@ impl DhcpServer {
             client_mac_limit: None,
             client_rate_limit: DEFAULT_CLIENT_RATE,
             relay_info_trusted: false,
+            use_radius: crate::ipoe::UseRadius::No,
+            ipoe: false,
+            ipoe_username: crate::ipoe::IpoeUsername::Mac,
+            ipoe_unknown: crate::ipoe::IpoeUnknown::Accept,
             disabled: false,
             comment: String::new(),
         }
+    }
+
+    /// Whether each client is authorized before it is served (IPoE).
+    pub fn authorizes(&self) -> bool {
+        self.ipoe || self.use_radius == crate::ipoe::UseRadius::Yes
+    }
+
+    /// Whether bound leases are subscriber sessions (IPoE, G4.3f).
+    pub fn sessions(&self) -> bool {
+        self.ipoe || self.use_radius != crate::ipoe::UseRadius::No
     }
 }
 
@@ -333,6 +367,11 @@ pub struct StaticLease {
     /// hostname); empty: the client's.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub host_name: String,
+    /// RouterOS lease `rate-limit` (`rx/tx`, with bursts): on an IPoE
+    /// server (G4.3f) the subscriber's XDP policer; RouterOS makes a
+    /// dynamic simple queue instead.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rate_limit: String,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -356,6 +395,7 @@ impl StaticLease {
             dhcp_option_set: None,
             always_broadcast: false,
             host_name: String::new(),
+            rate_limit: String::new(),
             disabled: false,
             comment: String::new(),
         }

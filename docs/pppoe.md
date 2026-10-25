@@ -452,3 +452,110 @@ desenho dos quatro; cada PR atualiza o que mudou.
   reconectar).
 - **Compatibilidade com quem vem do MikroTik:** os padrões diferentes vêm com aviso na saída e
   no ⓘ.
+
+## 9. IPoE: o lease DHCP como sessão de assinante (G4.3f)
+
+Um provedor com OLT/switch que insere a opção 82 não precisa de PPPoE: o CPE pede DHCP, o BNG
+autoriza (por MAC ou pela linha), entrega o endereço e trata o lease como sessão — contabilização,
+limite de banda, CoA/Disconnect, "Why?" — como uma sessão PPPoE. O CoreRouter faz isso em cima
+do servidor DHCPv4 em Rust puro (G4.2a/b), do serviço RADIUS (G4.3j) e do mesmo plano de dados
+XDP do PPPoE (G4.3c).
+
+### 9.1 Pesquisa
+
+Fontes lidas em 2026-10-24/25:
+
+- **MikroTik RouterOS v7**, `/ip dhcp-server` ([DHCP](https://help.mikrotik.com/docs/spaces/ROS/pages/24805500/DHCP))
+  e [RADIUS](https://help.mikrotik.com/docs/display/ROS/RADIUS). `use-radius` = `no` | `yes`
+  (autoriza e contabiliza) | `accounting`; precisa de `/radius … service=dhcp`. O Access-Request
+  leva o MAC como User-Name, senha vazia (ou `radius-password`), NAS-Port-Type Ethernet,
+  NAS-Port-Id = interface, Called-Station-Id = nome do servidor. Do Accept valem
+  Framed-IP-Address, Framed-Pool, Session-Timeout (vira o tempo do lease),
+  Mikrotik-Rate-Limit (ou Ascend-Data-Rate), Framed-Route, Class e Acct-Interim-Interval. Enquanto
+  espera, o lease aparece `authorizing`. O `rate-limit` do lease cria uma *simple queue*
+  dinâmica — que o tráfego em FastTrack não atravessa. A opção 82 só vai ao RADIUS com
+  `support-broadband-tr101` (7.21beta). O que acontece num Reject e se há CoA/DM para leases
+  DHCP não está documentado.
+- **RFC 3046** (opção 82): sub-opções 1 (circuit id) e 2 (remote id); o servidor ecoa a opção
+  inteira (§2.2) e **não pode esperá-la na renovação unicast** — a chave da sessão não depende de
+  a opção 82 vir em todo pacote (guardamos a do lease). §2.1/§5: só o agente confiável põe a
+  opção; a do cliente é descartada (o nosso `relay_info_trusted`, G4.2b).
+- **RFC 4679** (atributos DSL Forum, fornecedor 3561): Agent-Circuit-Id 26/3561/1,
+  Agent-Remote-Id 26/3561/2 no Access-Request e na contabilização. **RFC 4014**: sub-opção 7 (não
+  usada).
+- **RFC 5176** (CoA/Disconnect): atributos que identificam a sessão (§3), Error-Cause 503 "Session
+  Context Not Found" (§3.5), aplicar tudo ou nada (§2.3). **RFC 2131 §4.4.5**: sem renovação até o
+  fim do lease o cliente para de usar o endereço — o fim passivo da sessão. **RFC 5227**: a sonda
+  ARP (remetente 0.0.0.0) é para detectar duplicidade; um "ARP ping" de keepalive é um pedido
+  normal do nosso endereço.
+- **BBF TR-146** (Subscriber Sessions): sessão iniciada pelo DISCOVER (R-05), viva enquanto o
+  lease (R-12/R-13), identificada por circuit/remote id e MAC (R-43/R-44), com amarração IP↔MAC
+  contra spoofing (R-38), CoA/DM (R-50), Start/Interim/Stop (R-51), keepalive por ARP (R-92,
+  SHOULD) e reautorização opcional antes de estender o lease (R-47). **TR-101**: a opção 82 posta
+  pelo nó de acesso.
+- **accel-ppp `[ipoe]`** ([accel-ppp.conf(5)](https://github.com/accel-ppp/accel-ppp/blob/master/accel-pppd/accel-ppp.conf.5)):
+  `start=dhcpv4|up`, `username=ifname|lua`, `password=username|csid|empty`, `max-lease-time`
+  (liveness pelo lease), `idle-timeout`, `offer-delay` (freio sob carga), `soft-terminate` (derruba
+  na próxima renovação), `check-mac-change`, `l4-redirect-on-reject` (portal para inadimplente) e
+  `attr-dhcp-opt82-*` (opção 82 em qualquer atributo). Sem keepalive ARP.
+- **Juniper Junos** ([autenticação](https://www.juniper.net/documentation/us/en/software/junos/subscriber-mgmt-sessions/topics/topic-map/dhcp-client-external-authentication.html),
+  [liveness](https://www.juniper.net/documentation/us/en/software/junos/dhcp/topics/topic-map/dhcp-liveness-detection.html)):
+  `username-include` monta o User-Name com MAC, circuit id, remote id, VLAN, interface; perfil
+  dinâmico por assinante; `layer2-liveness-detection` por ARP/ND (30 s, depois 10 s) que apaga a
+  amarração. **Cisco ISG**: sessão por DHCP ou pacote não classificado, keepalive ARP/ICMP só
+  depois de ociosa. **Nokia SR OS**: uma "IPoE session" por MAC + circuit/remote id + SAP.
+
+### 9.2 O que adotamos
+
+- **Nomes do RouterOS** onde existem: `ip.dhcp-server … use_radius=no|yes|accounting` e o
+  `rate_limit` do lease estático (`10M/50M` com bursts, a sintaxe do RouterOS). Os nossos, quando o
+  RouterOS não tem: `ipoe=yes` (sessões mesmo sem RADIUS), `ipoe_username=mac|circuit-id|remote-id|circuit-remote`
+  (o `username-include` do Juniper nas formas comuns) e `ipoe_unknown=accept|reject` (o que recebe
+  quem não está na lista local).
+- **Lista local = `/ppp secret` com `service=ipoe`**: o nome é o que `ipoe_username` monta (o MAC
+  `AA:BB:CC:DD:EE:FF`, ou o circuito `olt1/1/3`), sem senha; o perfil traz pool, `address_list` e
+  `rate_limit`, como no PPPoE. `service=any` **não** casa IPoE (um login PPP com cara de MAC não
+  vira concessão). Primeiro a lista local, depois o RADIUS (`use_radius=yes`), como o `/ppp aaa`.
+- **Autorização no DISCOVER, como o MikroTik**: o servidor DHCP (puro, `proto-dhcp`) estaciona a
+  mensagem (`Effect::Authorize`) e só oferece depois do Accept. Um Reject não oferece nada, e o
+  cliente fica 30 s sem ser perguntado de novo (um DISCOVER a cada 4 s não vira um Access-Request
+  cada). Um REQUEST de quem não tem concessão (renovação depois de reiniciar o daemon) é
+  perguntado e depois ACK ou NAK. Sem resposta em 15 s, o cliente pergunta de novo na próxima
+  retransmissão. No máximo 8192 esperando (enxurrada de MACs aleatórios).
+- **O que o Accept muda**: Framed-IP-Address (só esse endereço; nunca o de outro cliente),
+  Framed-Pool, Session-Timeout como tempo do lease (RouterOS) e as address lists. A concessão vale
+  enquanto o cliente tiver lease; o lease que acaba a leva junto.
+- **Sessão = lease** (TR-146 R-13): começa no ACK, acaba no RELEASE, no fim do lease, num
+  Disconnect-Request ou no `ppp.active.remove` (o lease é encerrado e a próxima renovação recebe
+  NAK: o cliente recomeça autorizado de novo).
+
+### 9.3 Melhorias propostas
+
+Entram agora:
+
+- **O policer do XDP no lugar da simple queue**: o mesmo balde com burst do RouterOS do PPPoE,
+  por assinante, que nenhum FastTrack pula (o problema conhecido do MikroTik), com contadores por
+  sessão para a contabilização e o gráfico.
+- **Amarração IP↔MAC no XDP** (TR-146 R-38): o pacote do assinante com outro endereço de origem é
+  descartado e contado (`spoofed`).
+- **Opção 82 para o RADIUS no padrão** (RFC 4679 Agent-Circuit-Id/Agent-Remote-Id), sem esperar a
+  7.21, e o User-Name à escolha (Juniper).
+- **Keepalive por ARP** (TR-146 R-92, Juniper): o assinante ocioso é pingado; sem resposta, a
+  sessão cai antes do fim do lease e o "Why?" diz por quê.
+- **Aviso antes do erro**: `use_radius` sem `/radius service=dhcp`, `ipoe_unknown=reject` sem
+  nenhum secret, `ipoe_username` por opção 82 num servidor que não acredita na opção 82 do link, e
+  `rate_limit` num servidor que não é IPoE.
+- **Tudo é comando e aparece junto**: as sessões IPoE ficam em PPP › Active Connections com
+  `service=ipoe`, o "Why?" e o selo de identidade; `ppp.active.remove` e o MCP servem para as duas.
+
+Viram gap depois: reautorizar antes de estender o lease (TR-146 R-47), `soft-terminate` e
+`offer-delay` do accel-ppp, portal para rejeitado (`l4-redirect-on-reject`), início por pacote não
+classificado (R-08), sessões IPoE IPv6 (DHCPv6/RA com a linha da RFC 6788) e FORCERENEW (RFC 6704).
+
+### 9.4 O que ficou de fora e por quê
+
+- **Interface por assinante** (accel `shared=0`, Juniper perfil dinâmico): o plano de dados XDP
+  dispensa um netdev por sessão, como no PPPoE.
+- **BFD como keepalive**: o CPE doméstico não fala BFD.
+- **Clonar a sintaxe `lua` do accel-ppp**: os quatro formatos de `ipoe_username` cobrem os
+  provedores que conhecemos; um formato novo é uma variante a mais.

@@ -44,6 +44,68 @@ pub trait PppBackend: Send + Sync {
 #[derive(Default)]
 struct PppRuntime {
     backend: Option<Arc<dyn PppBackend>>,
+    /// The IPoE service's sessions (G4.3f), shown with the PPP ones.
+    ipoe: Option<Arc<dyn PppBackend>>,
+}
+
+/// The PPPoE and the IPoE services as one: `ppp.active` lists both,
+/// `ppp.why` asks both.
+struct Merged(Vec<Arc<dyn PppBackend>>);
+
+impl PppBackend for Merged {
+    fn active(&self) -> Vec<ActiveSession> {
+        self.0.iter().flat_map(|b| b.active()).collect()
+    }
+
+    fn terminate(&self, ids: &[String]) -> usize {
+        self.0.iter().map(|b| b.terminate(ids)).sum()
+    }
+
+    fn history(&self) -> Vec<HistoryEntry> {
+        let mut all: Vec<HistoryEntry> = self.0.iter().flat_map(|b| b.history()).collect();
+        all.sort_by_key(|h| h.at);
+        all
+    }
+
+    fn why(&self, name: Option<&str>, mac: Option<MacAddr>) -> Why {
+        // The one that knows most: up now, else the most attempts seen.
+        let answers: Vec<Why> = self.0.iter().map(|b| b.why(name, mac)).collect();
+        let score = |w: &Why| (w.active.is_some(), w.attempts.iter().map(|(_, n)| u64::from(*n)).sum::<u64>());
+        answers
+            .into_iter()
+            .max_by_key(score)
+            .unwrap_or_default()
+    }
+
+    fn stats(&self) -> ServiceStats {
+        let mut t = ServiceStats::default();
+        for b in &self.0 {
+            let s = b.stats();
+            t.sessions += s.sessions;
+            t.padi += s.padi;
+            t.pado += s.pado;
+            t.padr += s.padr;
+            t.pads += s.pads;
+            t.padt_rx += s.padt_rx;
+            t.padt_tx += s.padt_tx;
+            t.auth_accept += s.auth_accept;
+            t.auth_reject += s.auth_reject;
+            t.throttled += s.throttled;
+            t.dataplane |= s.dataplane;
+            if t.last_error.is_none() {
+                t.last_error = s.last_error;
+            }
+        }
+        t
+    }
+
+    fn who(&self, ip: std::net::Ipv4Addr) -> Option<String> {
+        self.0.iter().find_map(|b| b.who(ip))
+    }
+
+    fn who_at(&self, ip: std::net::Ipv4Addr, at: u64) -> Option<String> {
+        self.0.iter().find_map(|b| b.who_at(ip, at))
+    }
 }
 
 impl Session {
@@ -53,9 +115,22 @@ impl Session {
         }
     }
 
-    /// The daemon's PPP service, if it runs one.
+    /// The IPoE service's view of its sessions (G4.3f), merged into
+    /// [`Session::ppp_backend`].
+    pub fn set_ipoe_sessions(&mut self, backend: Arc<dyn PppBackend>) {
+        if let Some(rt) = self.ext_mut::<PppRuntime>() {
+            rt.ipoe = Some(backend);
+        }
+    }
+
+    /// The daemon's PPP service and IPoE sessions, if it runs them.
     pub fn ppp_backend(&self) -> Option<Arc<dyn PppBackend>> {
-        self.ext::<PppRuntime>()?.backend.clone()
+        let rt = self.ext::<PppRuntime>()?;
+        match (&rt.backend, &rt.ipoe) {
+            (Some(a), Some(b)) => Some(Arc::new(Merged(vec![a.clone(), b.clone()]))),
+            (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+            (None, None) => None,
+        }
     }
 
     /// Active sessions now (empty without the service).
