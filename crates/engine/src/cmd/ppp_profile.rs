@@ -22,6 +22,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         always, set),
     cmd!("ppp.profile.remove", "Remove PPP Profile", [], None,
         "{id: *hex | name} → {id, name}", always, remove),
+    cmd!(query "ppp.profile.preview", "PPP Profile Preview", [], None,
+        "{id?: *hex | name, name?: string, local_address?: string, remote_address?: string, dns_server?: string, rate_limit?: string, address_list?: string, only_one?: string, change_tcp_mss?: string, idle_timeout?: string, session_timeout?: string, on_up?: string, on_down?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
     cmd!(query "ppp.profile.list", "PPP Profiles", [], None,
         "{} → [{id, name, builtin, default (built in), local_address?, remote_address?, dns_server, rate_limit?, address_list?, only_one, change_tcp_mss, idle_timeout?, session_timeout?, on_up (JSON text), on_down, comment?, secrets (that use it), active (sessions up with it)}]",
         always, list),
@@ -195,6 +198,22 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     }
     s.store_mut().candidate_mut().ppp.profiles.retain(|x| x.name != pr.name);
     Ok(json!({"id": pr.id, "name": pr.name}))
+}
+
+/// The modal's preview: the checks of `add`/`set`, and what a session
+/// with this profile gets once the built-in `default` fills the gaps.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    super::ppp_common::preview(s, p, ("ppp.profile.add", "ppp.profile.set"), (add, set), |s, v| {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+        let e = s.store().candidate().ppp.effective(None, name, corerouter_model::ppp::DEFAULT_PROFILE);
+        let opt = |o: Option<String>| o.unwrap_or_else(|| "none".into());
+        vec![
+            json!({"label": "Remote address", "value": opt(e.remote_address.map(|a| a.to_string()))}),
+            json!({"label": "Rate limit", "value": opt(e.rate_limit)}),
+            json!({"label": "Only one", "value": if e.only_one { "yes" } else { "no" }}),
+            json!({"label": "Change TCP MSS", "value": if e.change_tcp_mss { "yes" } else { "no" }}),
+        ]
+    })
 }
 
 /// Hooks as one JSON text (what `add` takes back, so `/export` round-trips).

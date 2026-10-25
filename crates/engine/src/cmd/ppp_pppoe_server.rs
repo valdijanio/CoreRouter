@@ -38,6 +38,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "interface.pppoe-server.server.list", "PPPoE Servers", [], None,
         "{} → [{id, name, interface, service_name?, max_mtu, max_mru, mrru, authentication, keepalive_timeout, one_session_per_host, max_sessions, pado_delay, default_profile, pppoe_over_vlan_range, accept_untagged, ac_cookie, padi_limit, mac_padi_limit, new_session_rate, pado_delay_by_load, disabled, comment?, flags (X disabled), sessions (up now), warnings}]",
         always, list),
+    cmd!(query "interface.pppoe-server.server.preview", "PPPoE Server Preview", [], None,
+        "{id?: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: string, max_mru?: string, mrru?: string, authentication?: string, keepalive_timeout?: string, one_session_per_host?: bool, max_sessions?: string, pado_delay?: string, default_profile?: string, pppoe_over_vlan_range?: string, accept_untagged?: bool, ac_cookie?: bool, padi_limit?: string, mac_padi_limit?: string, new_session_rate?: string, pado_delay_by_load?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?}",
+        always, preview),
     cmd!(query "interface.pppoe-server.monitor", "PPPoE Server Monitor", [], None,
         "{} → {running, sessions, padi, pado, padr, pads, padt_rx, padt_tx, auth_accept, auth_reject, throttled, dataplane, last_error?}",
         always, monitor),
@@ -406,6 +409,51 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
         })
         .collect();
     Ok(Value::Array(rows))
+}
+
+/// The modal's preview. The modal sends numbers as text: they go to the
+/// command as numbers.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        for k in ["max_mtu", "max_mru", "max_sessions", "pado_delay", "padi_limit", "mac_padi_limit", "new_session_rate", "keepalive_timeout", "mrru"] {
+            if let Some(n) = o.get(k).and_then(Value::as_str).and_then(|t| t.trim().parse::<u64>().ok()) {
+                o.insert(k.into(), json!(n));
+            }
+        }
+    }
+    super::ppp_common::preview(
+        s,
+        &q,
+        ("interface.pppoe-server.server.add", "interface.pppoe-server.server.set"),
+        (add, set),
+        |s, v| {
+            let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+            let Some(srv) = s.store().candidate().ppp.pppoe_servers.iter().find(|x| x.name == name).cloned() else {
+                return Vec::new();
+            };
+            let vlans: usize = srv.pppoe_over_vlan_range.iter().map(|r| usize::from(r.last - r.first) + 1).sum();
+            let keep = srv.keepalive_timeout.map_or_else(
+                || "off".to_owned(),
+                |t| format!("LCP echo after {} s quiet, down after {t} s", t.div_ceil(2)),
+            );
+            let tiers = if srv.pado_delay_by_load.is_empty() {
+                format!("{} ms", srv.pado_delay)
+            } else {
+                srv.pado_delay_by_load
+                    .iter()
+                    .map(|t| format!("{} ms from {} sessions", srv.pado_delay_at(t.sessions), t.sessions))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            vec![
+                json!({"label": "VLANs", "value": if vlans == 0 { "untagged only".to_owned() } else { format!("{vlans} VLAN ids (without XDP: {} sockets)", vlans * 2) }}),
+                json!({"label": "Keepalive", "value": keep}),
+                json!({"label": "PADO delay", "value": tiers}),
+                json!({"label": "Sessions up", "value": s.ppp_active().iter().filter(|a| a.server == srv.name).count().to_string()}),
+            ]
+        },
+    )
 }
 
 fn monitor(s: &mut Session, _: &Value) -> Result<Value> {

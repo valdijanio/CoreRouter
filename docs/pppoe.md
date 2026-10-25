@@ -1,6 +1,6 @@
 # PPPoE / BNG em Rust puro (`proto-pppoe`, G4.3)
 
-Status: **G4.3a** feito; **G4.3d** em andamento (modelo e comandos; serviço, janela e extras em PRs empilhados, §8) — o crate L2 `crates/proto-pppoe`: codecs de PPPoE e PPP e as máquinas
+Status: **G4.3a** feito; **G4.3d** feito (comandos, serviço `pppoe`, janela PPP e extras, §8) — o crate L2 `crates/proto-pppoe`: codecs de PPPoE e PPP e as máquinas
 sans-IO do concentrador (servidor BNG) e do assinante (cliente, gerador de carga). Sem I/O, sem
 `unsafe`, compila para `wasm32-unknown-unknown`. O serviço do daemon, os comandos `ppp.*` e a
 janela PPP vêm na G4.3d; o plano de dados XDP por assinante é a G4.3c; o RADIUS é a G4.3b
@@ -23,6 +23,7 @@ de milhares de interfaces. A comparação está em `docs/architecture.md` §1.4.
 | `lcp` | códigos e todas as opções (MRU, ACCM, Auth-Protocol, Quality, Magic, PFC, ACFC, FCS-Alt, Callback, MRRU/Short-Seq/Endpoint de multilink só leitura) | RFC 1661 §6, RFC 1570, RFC 1990 §5.1 |
 | `auth` | PAP; CHAP-MD5; MS-CHAPv1/v2 (resposta, authenticator response, mensagem de falha); chaves MPPE via `proto-radius` | RFC 1334 §2, RFC 1994 §4, RFC 2433, RFC 2759, RFC 3079 §3 |
 | `ncp` | IPCP (IP-Address, DNS, NBNS, recusa VJ e IP-Addresses) e IPv6CP (Interface-Identifier) | RFC 1332 §3, RFC 1877 §1, RFC 5072 §4 |
+| `nd` | IPv6 no enlace PPP (G4.3e): link-local do IPv6CP, identificador estável e opaco, RS/RA/NS/NA/Echo, RA com PIO, MTU, RDNSS e DNSSL, tempos do RA | RFC 5072 §5, RFC 8064, RFC 7217, RFC 5453, RFC 4861, RFC 8106, RFC 8200 §8.1 |
 | `fsm` | o autômato de negociação de opções, célula por célula da tabela de transições, com os contadores do §4.6 | RFC 1661 §4 |
 | `layers` | a lógica de opções de LCP/IPCP/IPv6CP para servidor e cliente | RFC 1661 §6, RFC 2516 §7, RFC 1332, RFC 5072 |
 | `guard` | AC-Cookie HMAC-SHA-256 com segredo rotativo, limites de PADI (global e por MAC), gerador de desafios/magic | RFC 2516 §9 |
@@ -355,7 +356,7 @@ desenho dos quatro; cada PR atualiza o que mudou.
   um snapshot só (0,47 s em debug, **medido**); um comando sozinho copia a tabela de secrets que
   escreve (copy-on-write da seção, `CowArc`).
 
-### 8.4 O serviço `pppoe` do daemon (PR b)
+### 8.4 O serviço `pppoe` do daemon (PR b, feito)
 
 - **Sockets:** um AF_PACKET por interface de acesso para 0x8863 (Discovery) e 0x8864 (sessão),
   com as APIs seguras do `hal-linux` (como `l2`/`dhcp`), VLAN pelo auxdata. Com o XDP da G4.3c
@@ -372,7 +373,15 @@ desenho dos quatro; cada PR atualiza o que mudou.
   `disabled`, `only-one` e `limit-bytes-*` conferidos aqui.
 - **Endereço:** fixo do secret → Framed-IP-Address → Framed-Pool → `remote_address` do perfil
   (pool, com `next_pool`). O pool do PPP é um alocador próprio do serviço sobre as faixas do
-  `/ip pool`; `ip.pool.used.print` passa a mostrá-lo (G4.3d-b).
+  `/ip pool`: um pool serve o PPP ou o DHCP, não os dois. Um endereço fixo já em uso recusa o
+  login, em vez de dar o mesmo endereço a dois assinantes.
+- **VLAN sem `unsafe`:** a tag que o kernel tira do quadro só se lê por `PACKET_AUXDATA`, sem
+  binding seguro. Então cada VLAN do `pppoe-over-vlan-range` tem o seu socket com um filtro BPF
+  clássico (`SKF_AD_VLAN_TAG`), e o socket diz a VLAN; até 512 VLANs sem XDP. QinQ fica com o
+  XDP (G4.3l).
+- **Limite de sessões novas no PADI:** sem PADO, o CPE repete o PADI com recuo. No PADR seria
+  pior: a repetição traz um AC-Cookie que vence (5 s) durante o recuo, e 155 de 10 mil CPEs
+  desistiam no teste em namespace antes da correção.
 - **Plano de dados:** `Event::Up`/`Changed` → `pppoe_upsert` no mapa de sessões (G4.3c) com o
   `rate_limit` no policer; `Down` → `pppoe_remove`, devolve o endereço, Acct-Stop com
   Acct-Terminate-Cause.
@@ -385,16 +394,185 @@ desenho dos quatro; cada PR atualiza o que mudou.
 - **Identidade:** fonte `pppoe` do chip (G0.25) → o login de quem tem o endereço; o "Quem era?"
   do CGNAT mostra o login no instante.
 - **address-list:** entrada dinâmica (`timeout`, não gravada) na subida, removida na queda.
+- **Plano de dados escolhido sozinho:** com o XDP preso às portas de acesso
+  (`ip.firewall.xdp`), as sessões vão para o mapa da G4.3c com a descida em XDP (`F_FAST_DOWN`;
+  a entrega pelo kernel é a G4.3ca) e a subida pelo kernel (o `forward` e as filas veem tudo).
+  Sem XDP (laboratório, placa sem XDP, teste sem root), o serviço carrega o IPv4: subida por
+  socket raw com o anti-spoofing do XDP, descida por rota /32 num dummy `bng0`, lida por um
+  socket que só vê o que o host envia. Correto, não rápido: ≈ 1500 sessões/s e alguns kpps por
+  núcleo em debug.
 
-### 8.5 Riscos e como evitamos
+### 8.5 Números (**medido**, release salvo indicação)
+
+- Setup do BNG: **≈ 94 mil sessões/s** num núcleo, do PADI ao IPCP Opened, com MS-CHAPv2, pool,
+  mapa XDP e histórico (`cargo bench -p corerouter-daemon --bench pppoe_bng`).
+- Memória: **≈ 3,9 KB por sessão** com o servidor `proto-pppoe`, a tabela ativa, o histórico e o
+  "Why?". 100 mil assinantes ≈ 390 MB. Um BNG com netdev por sessão (pppd/accel-ppp) paga a
+  netdev no kernel (dezenas de KB cada, **estimado**).
+- Ponta a ponta por veth, debug: 10 mil CPEs em 6,5 s; reconexão em massa de 10 mil em 34 s com
+  `new_session_rate=1000`.
+
+### 8.6 Extras (PR d)
+
+- **Selo de identidade e "Quem era?" com o login PPPoE.** `ip.identity.lookup` pergunta ao
+  serviço (`PppBackend::who`/`who_at`): o login de quem tem o endereço agora e, num instante
+  passado, quem tinha, pelo histórico do serviço. O CGNAT › Quem era? (porta pública → endereço
+  interno, G2.3) chega ao login. Clicar no selo abre PPP › Active Connections com a sessão.
+- **Gráfico por assinante.** O serviço mede `rx_bps`/`tx_bps` a cada segundo pelos contadores da
+  sessão (XDP ou caminho lento); a coluna Traffic desenha os últimos ~2 min. O histórico longo
+  por login, no armazenamento do G4.5, é a G4.3o.
+- **Aviso de inadimplência por address-list** (o que os provedores fazem com o MikroTik):
+  1. o sistema de cobrança manda um CoA com `Mikrotik-Address-List=inadimplentes`. O endereço
+     entra na lista na hora (entrada dinâmica), sem derrubar a sessão; o valor vazio tira o
+     assinante da lista. No login vale o mesmo atributo no Access-Accept, ou o `address_list` do
+     perfil;
+  2. uma regra de dstnat leva o HTTP de quem está na lista para a página de aviso:
+
+     ```sh
+     corerouter-cli run ip.firewall.nat.add '{"chain":"dstnat","src_address_list":"inadimplentes","protocol":"tcp","dst_port":"80","action":"dst-nat","to_addresses":"10.0.0.2","to_ports":"80","comment":"aviso de inadimplência"}'
+     ```
+
+     e uma regra de filtro deixa só DNS e a página para essa lista, se o provedor bloqueia.
+- **Comandos para o MCP:** tudo é comando com `params` documentado. Por exemplo, um agente
+  responde "por que o João não conecta?" com `ppp.why {name}` e derruba um assinante com
+  `ppp.active.remove {name}`.
+
+### 8.7 Riscos e como evitamos
 
 - **Travar o plano de controle:** nunca segurar o lock da sessão no laço de pacotes; hooks com
   limite (8 por perfil) e fora do laço; um panic numa thread do serviço é reiniciado pelo
   supervisor (G0.10) e as sessões caem — por isso nada de `unwrap`.
 - **Reconexão em massa** derrubando RADIUS e pool: `new_session_rate`, `pado_delay_by_load`,
   `padi_limit`.
+- **Address-list com muitos assinantes:** as entradas dinâmicas são no máximo 65 536 no
+  roteador inteiro (`MAX_DYNAMIC`) e duram até 35 dias (o serviço as refaz a cada 30). Um perfil
+  com `address_list` para 100 mil assinantes passa do teto: use a lista para os casos (os
+  inadimplentes), não para todos.
 - **Assinante preso no XDP depois da queda:** toda `Down` remove a entrada; o serviço, ao
   reiniciar, limpa o mapa inteiro antes de aceitar sessões (o PADT ao SID desconhecido faz o CPE
   reconectar).
 - **Compatibilidade com quem vem do MikroTik:** os padrões diferentes vêm com aviso na saída e
   no ⓘ.
+
+## 9. IPv6 por assinante (G4.3e)
+
+Dual-stack no BNG: IPv6CP sobe o enlace com endereços link-local, um RA por sessão anuncia o /64
+do enlace (SLAAC), o DHCPv6 da sessão entrega o prefixo delegado (IA_PD) e, se pedido, um
+endereço (IA_NA), e o XDP leva o /64 e o PD nos mapas da G4.3c (o `PPPOE_V6` já é uma LPM com as
+duas entradas por sessão e o `owns_v6` já confere a origem). PRs empilhados:
+
+| PR | Parte |
+|---|---|
+| a | codecs: `proto-pppoe::nd` (RS/RA/NS/NA/Echo, RDNSS/DNSSL, identificador estável), `proto-dhcp::sub6` (DHCPv6 da sessão), IPv6CP com identificador estável e `use-ipv6` por sessão (`Server::set_ipv6`), simulação de 100 mil sessões dual-stack |
+| b | serviço: perfil (`use_ipv6`, pools, `dhcpv6_lease_time`), RADIUS, contabilização, mapas XDP, e2e de 10 mil sessões dual-stack |
+| c | janela PPP: colunas e ⓘ |
+
+### 9.1 Pesquisa
+
+Fontes:
+
+- **MikroTik RouterOS v7** — `/ppp profile` (manual.mikrotik.com, 7.25, "PPP AAA"): `use-ipv6`
+  (`yes | no | default | require`, padrão `default` = ligado com o pacote IPv6),
+  `remote-ipv6-prefix-pool` (um prefixo do `/ipv6 pool` por cliente, com rota; vai no RA),
+  `remote-ipv6-prefix-reuse` (um /64 só para todos os clientes do perfil), `dhcpv6-pd-pool`
+  (pool do servidor DHCPv6-PD criado por sessão), `dhcpv6-use-radius`, `dhcpv6-lease-time`
+  (desde 7.20, padrão 1d); `/ppp secret` `remote-ipv6-prefix` (prefixo fixo para o ND);
+  `/ppp aaa` `enable-ipv6-accounting` (contadores IPv4 e IPv6 separados, só com rate-limit e com
+  prefixo dado pelo PPP; não vale para o PD do DHCPv6 dinâmico). RADIUS: `Framed-IPv6-Prefix`,
+  `Framed-IPv6-Pool`, `Mikrotik-Delegated-IPv6-Pool` (VSA 22); relatos no fórum de que o
+  `Delegated-IPv6-Prefix` só funciona se o CPE pedir PD, de que o prefixo delegado **não vai na
+  contabilização** e de que é preciso um pool por cliente para PD fixo.
+- **accel-ppp** (o BNG do VyOS): `[ipv6-pool]` com `prefix` e `delegate`, `[ipv6-nd]`
+  (`AdvManagedFlag`, `AdvOtherConfigFlag`, `AdvPrefixValidLifetime`, `AdvRDNSS`, intervalo do
+  RA), `[ipv6-dhcp]` (o servidor DHCPv6 é por sessão e só entrega o que a sessão já tem,
+  `pref-lifetime`/`valid-lifetime`), `ipv6-intf-id`/`ipv6-peer-intf-id` (fixo, `random` ou
+  `calling-sid`), RADIUS `Framed-IPv6-Prefix`, `Delegated-IPv6-Prefix`, `Framed-Interface-Id`.
+- **Juniper Junos** (subscriber management): perfis dinâmicos com
+  `$junos-ipv6-ndra-prefix` (RA) e `$junos-ipv6-delegated-prefix`; `framed-ipv6-pool` e
+  `delegated-ipv6-pool` do RADIUS; contadores de IPv6 separados por VSA; o prefixo do PD vai no
+  Acct-Start.
+- **Cisco IOS-XE** (BBA): `ipv6 nd prefix framed-ipv6-prefix`, `ipv6 dhcp pool` com
+  `prefix-delegation aaa`, `ipv6 nd other-config-flag`; RA unicast por sessão.
+- **BBF TR-187** (IPv6 em PPP): IPv6CP só negocia o identificador; o /64 do WAN por RA (SLAAC)
+  ou WAN sem número (só PD); DHCPv6-PD obrigatório para a LAN do CPE; RA com O ligado quando o
+  DHCPv6 entrega DNS e PD, M quando há IA_NA; prefixo e PD vindos do RADIUS. TR-177/RFC 7084 (CPE):
+  o CPE pede IA_PD com ou sem IA_NA e aceita qualquer combinação.
+- **RFCs**: RFC 5072 (IPv6CP; atualizada pela RFC 8064, "Recommendation on Stable IPv6 Interface
+  Identifiers", que manda usar identificadores estáveis e opacos à la RFC 7217 em vez de
+  derivados do MAC), RFC 7217 (o algoritmo), RFC 5453 (identificadores reservados), RFC 4861
+  (ND: §4.1/§4.2/§4.3/§4.4 formatos, §4.6.2 PIO, §4.6.4 MTU, §6.1.1/§7.1.1 validação, §6.2.4
+  e §6.2.6 tempos; atualizada pelas RFCs 5942, 6980, 7048, 7527, 7559, 8028, 8319 — a 8319
+  sobe o limite do Router Lifetime e do MaxRtrAdvInterval), RFC 8106 (RDNSS/DNSSL; §5.1
+  lifetime ≥ 3 × MaxRtrAdvInterval), RFC 8200 §8.1 (checksum; UDP com checksum 0 é inválido),
+  RFC 9915 (DHCPv6, antes 8415; §16 validação, §18.3 respostas, §21.4/§21.21 T1/T2, §21.14
+  Rapid Commit), RFC 3162 (RADIUS e IPv6: `Framed-Interface-Id` 96, `Framed-IPv6-Prefix` 97,
+  `Framed-IPv6-Route` 99, `Framed-IPv6-Pool` 100), RFC 4818 (`Delegated-IPv6-Prefix` 123,
+  também no Accounting-Request), RFC 6911 (`Framed-IPv6-Address` 168,
+  `DNS-Server-IPv6-Address` 169, `Delegated-IPv6-Prefix-Pool` 171,
+  `Stateful-IPv6-Address-Pool` 172). O dicionário do `proto-radius` já tem todos.
+
+### 9.2 O que adotamos
+
+- **Nomes do RouterOS** no perfil: `use_ipv6`, `remote_ipv6_prefix_pool`, `dhcpv6_pd_pool`,
+  `dhcpv6_lease_time` (1d). Os pools são os `/ipv6 pool` que o DHCPv6 server já usa
+  (`prefix_length` 64 para o enlace, 48–64 para o PD).
+- **RADIUS por cima do perfil**, como no RouterOS: `Framed-IPv6-Prefix` e `Framed-IPv6-Pool`
+  para o /64, `Delegated-IPv6-Prefix`, `Delegated-IPv6-Prefix-Pool` e
+  `Mikrotik-Delegated-IPv6-Pool` para o PD, `DNS-Server-IPv6-Address` para o RDNSS,
+  `Framed-Interface-Id` para o identificador do assinante.
+- **O prefixo é da sessão** (accel-ppp, Junos): reservado quando o IPv6CP sobe, antes do
+  Solicit, e devolvido no Down. O DHCPv6 da sessão (`sub6`) não tem tabela, hash nem diário: só
+  responde com o que a sessão tem. Um CPE que reinicia com outro DUID recebe o mesmo prefixo.
+- **RA por sessão**, unicast em resposta ao RS e periódico para `ff02::1` dentro da sessão: três
+  iniciais em até 16 s, depois entre 200 e 600 s espalhados ao acaso (100 mil sessões não
+  disparam juntas), nunca dois em 3 s (RFC 4861 §6.2.4/§6.2.6). PIO com L e A, MTU = o MRU
+  negociado, RDNSS/DNSSL com lifetime de 1800 s (3 × 600, RFC 8106 §5.1), O ligado quando há PD
+  ou DNS, M quando há IA_NA.
+- **IA_NA sem pool próprio**: o endereço é o /64 do enlace + o identificador do IPv6CP do
+  assinante, o mesmo que o SLAAC daria; um CPE que só faz DHCPv6 no WAN (TR-187 permite) recebe
+  um endereço coerente.
+- **Identificador estável e opaco** (RFC 8064/7217): hash com chave secreta da porta, das VLANs
+  e do MAC do assinante; o mesmo assinante tem o mesmo link-local a cada reconexão, ninguém lê o
+  MAC nele, outro roteador dá outro valor. Vale para o nosso lado e para a sugestão no Nak quando
+  o CPE propõe zero ou colide.
+
+### 9.3 Melhorias propostas
+
+- **Entram agora:** o prefixo delegado vai no Acct-Start/Interim/Stop
+  (`Delegated-IPv6-Prefix`, `Framed-IPv6-Prefix`, RFC 4818/6911), coisa que o RouterOS não
+  manda; o PD reservado na subida (o RADIUS e o "Quem era?" sabem o prefixo antes do Solicit);
+  `ppp.why` conta os pacotes ND/DHCPv6 descartados e por quê (hop limit, checksum, outro
+  servidor); tudo testado em massa (10 mil sessões dual-stack no namespace, proptest dos codecs).
+- **Viram gap depois:** contadores IPv4 e IPv6 separados no XDP (o RouterOS exige queue para
+  isso; o nosso mapa de contadores pode ganhar as palavras de IPv6 — mexe no layout da G4.3c);
+  `remote-ipv6-prefix-reuse` (um /64 para todos); PD-Exclude (RFC 6603); IPv6 no caminho lento
+  (já é a G4.3l); prefixo fixo por secret (`remote-ipv6-prefix`).
+
+### 9.4 O que ficou de fora e por quê
+
+- **`dhcpv6-use-radius`:** no RouterOS o servidor DHCPv6 dinâmico faz outra consulta ao RADIUS no
+  Solicit. Aqui o prefixo já vem no Access-Accept da sessão: um pedido a menos por assinante, sem
+  janela em que o PPP está de pé e o PD ainda não. O parâmetro não entra.
+- **Extensões de cabeçalho no ND/DHCPv6:** num enlace PPP não aparecem; um pacote com elas não é
+  respondido (vai adiante como tráfego comum).
+- **Relay de DHCPv6 para um servidor externo:** não é o modelo do BNG (o prefixo é da sessão);
+  fica para pedido explícito.
+
+### 9.5 Desempenho
+
+`cargo bench` (**medido**, Ryzen AI Max+ 395, release, 2026-10-25): classificar um RS 8,7 ns,
+montar o RA da sessão (PIO, MTU, RDNSS com 2 servidores, DNSSL) 72 ns, o identificador estável
+(SHA-256) 70 ns, o DHCPv6 da sessão responder um Solicit com Rapid Commit (IA_NA + IA_PD + DNS)
+444 ns. Uma reconexão de 100 mil assinantes dual-stack custa ≈ 60 ms de CPU nesses passos
+(**estimado**: 100 mil × (RS + 3 RAs + Solicit)).
+
+### 9.6 Riscos e como evitamos
+
+- **Tempestade de RS/Solicit** numa reconexão em massa: a resposta é O(1) por sessão, sem
+  alocação na tabela; o RA solicitado respeita o mínimo de 3 s; o DHCPv6 da sessão não consulta
+  RADIUS.
+- **Prefixo de outro assinante:** o XDP só aceita origem do /64 ou do PD da sessão (`owns_v6`) e
+  o ND/DHCPv6 só sai pela sessão que perguntou; o pool nunca entrega o mesmo prefixo a duas
+  sessões (o RADIUS com um prefixo já em uso recusa o login, como no IPv4).
+- **Compatibilidade:** o `use_ipv6` padrão segue o RouterOS (ligado); um perfil sem pool sobe o
+  IPv6CP e o link-local, mas o RA não anuncia prefixo (o ⓘ explica).

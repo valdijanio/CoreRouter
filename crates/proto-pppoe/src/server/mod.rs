@@ -98,8 +98,12 @@ pub struct ServerConfig {
     /// Our IPCP address (RouterOS profile `local-address`); `None` =
     /// unnumbered.
     pub local_ipv4: Option<Ipv4Addr>,
-    /// Run IPv6CP (interface ids only; prefixes are G4.3e).
+    /// Run IPv6CP (interface ids; the prefixes come from the service, G4.3e).
     pub ipv6: bool,
+    /// RFC 8064 / RFC 7217 secret: our IPv6CP identifier and the one we
+    /// suggest to a subscriber are stable per (port, VLANs, MAC) and opaque
+    /// (`nd::stable_iid`). `None` = random per session.
+    pub ipv6_iid_key: Option<[u8; 32]>,
     /// How long an authentication or address answer may take (RADIUS
     /// timeouts × retries fit under it).
     pub answer_timeout_ms: u64,
@@ -133,6 +137,7 @@ impl Default for ServerConfig {
             vlans: VlanFilter::Any,
             local_ipv4: None,
             ipv6: false,
+            ipv6_iid_key: None,
             answer_timeout_ms: 30_000,
             setup_timeout_ms: 60_000,
             pado_queue: 4096,
@@ -234,6 +239,19 @@ pub struct Authorization {
     pub rate_limit: Option<RateLimit>,
     /// Seconds until the session is closed.
     pub session_timeout: Option<u32>,
+}
+
+/// IPv6 of one session (RouterOS `/ppp profile use-ipv6`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ipv6Mode {
+    /// No IPv6CP: a Configure-Request from the peer gets a Protocol-Reject
+    /// (RFC 1661 §5.7).
+    Off,
+    /// IPv6CP runs; its failure leaves the session on IPv4.
+    #[default]
+    On,
+    /// IPv6CP must open: its failure ends the session.
+    Require,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -414,6 +432,26 @@ impl Server {
 
     pub fn config(&self) -> &ServerConfig {
         &self.cfg
+    }
+
+    /// Takes a new configuration for what comes next: new sessions, the
+    /// PADI limits, PADO delays, timers of sessions not yet up. The MAC and
+    /// the SESSION_ID space (`max_sessions`) stay: changing them is a new
+    /// server.
+    pub fn reconfigure(&mut self, mut cfg: ServerConfig) {
+        cfg.ac_mac = self.cfg.ac_mac;
+        cfg.max_sessions = self.cfg.max_sessions;
+        let limits = (cfg.padi_limit, cfg.mac_padi_limit, cfg.mac_padi_burst);
+        if limits
+            != (
+                self.cfg.padi_limit,
+                self.cfg.mac_padi_limit,
+                self.cfg.mac_padi_burst,
+            )
+        {
+            self.limiter = PadiLimiter::new(limits.0, limits.1, limits.2);
+        }
+        self.cfg = cfg;
     }
 
     pub fn stats(&self) -> &Stats {
@@ -905,6 +943,23 @@ impl Server {
     ) -> bool {
         self.with_session(now, session.sid, Some(session.gen_), out, |s, env| {
             s.auth_verdict(env, verdict)
+        })
+    }
+
+    /// IPv6 for one session, from its profile. Call before
+    /// [`Server::auth_reply`] (the NCPs open with the verdict); later it
+    /// only changes how a failure of IPv6CP is taken. `On` needs
+    /// [`ServerConfig::ipv6`].
+    pub fn set_ipv6(
+        &mut self,
+        now: Millis,
+        session: SessionRef,
+        mode: Ipv6Mode,
+        out: &mut ServerOutput,
+    ) -> bool {
+        let allowed = self.cfg.ipv6;
+        self.with_session(now, session.sid, Some(session.gen_), out, |s, _env| {
+            s.v6_mode = if allowed { mode } else { Ipv6Mode::Off };
         })
     }
 
