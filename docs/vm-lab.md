@@ -45,7 +45,8 @@ humana. Por isso a instalação é do usuário, **uma vez por ferramenta nova**,
 2. O usuário roda `cargo xtask vm-lab tools`. O comando baixa cada `.deb` uma vez para
    `vm/tools/`, confere o hash no host e de novo na VM, instala tudo num `apt-get install` só (o
    apt resolve as dependências do `.deb`), imprime as versões e tira o snapshot `tools`. Se o
-   hash não bate, o arquivo é apagado e nada é instalado.
+   hash não bate, o arquivo é apagado e nada é instalado. Pode rodar dentro do `flock vm/root.lock …` de
+   sempre: a trava do próprio comando não impede o snapshot.
 3. A partir daí `reset` (e o reset automático do health-check) volta para `tools`, com as
    ferramentas dentro. Os agentes rodam `cargo xtask vm-lab tools --check` antes do lab: se
    faltar algo, a mensagem diz exatamente o que pedir ao usuário.

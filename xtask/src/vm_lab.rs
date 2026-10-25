@@ -638,7 +638,7 @@ impl Lab {
             .arg("true")
             .status()
             .map_err(|e| format!("flock: {e}"))?;
-        if free.code() == Some(75) {
+        if free.code() == Some(75) && !held_by_ancestor(&host) {
             return Err(format!(
                 "{} is held (a round the user runs by hand); try again when it ends, or --force",
                 host.display()
@@ -693,6 +693,10 @@ impl Lab {
             return Ok(());
         };
         println!("{NAME}: {state}");
+        match self.idle() {
+            Ok(()) => println!("rounds: none (snapshot/reset allowed)"),
+            Err(why) => println!("rounds: busy: {why}"),
+        }
         if state == "running" {
             match self.address() {
                 Ok(Some(ip)) => println!(
@@ -988,7 +992,7 @@ impl Lab {
         let remote = format!("{LAB_ROOT}/tools/");
         let mut debs = Vec::new();
         let mut targets = Vec::new();
-        let mut verify = String::new();
+        let mut checks = Vec::new();
         for (t, _) in list {
             match (&t.source, t.file()) {
                 (Source::Deb { url, sha256 }, Some(file)) => {
@@ -1009,7 +1013,7 @@ impl Lab {
                     }
                     eprintln!("vm-lab: {file} sha256 {sha256} ok");
                     debs.push(local.to_string_lossy().into_owned());
-                    verify.push_str(&format!("{sha256}  {remote}{file}\n"));
+                    checks.push((sha256.to_string(), format!("{remote}{file}")));
                     targets.push(format!("{remote}{file}"));
                 }
                 _ => targets.push(t.package.to_owned()),
@@ -1019,13 +1023,7 @@ impl Lab {
             let (mut rsync, to) = self.rsync(&remote)?;
             run_ok(rsync.arg("-t").args(&debs).arg(to))?;
         }
-        self.ssh_root_script(&format!(
-            "set -e\nexport DEBIAN_FRONTEND=noninteractive\n\
-             printf '{verify}' | sha256sum -c --quiet -\n\
-             apt-get update -q >/dev/null\n\
-             apt-get install -y -q --no-install-recommends {}\n",
-            targets.join(" ")
-        ))
+        self.ssh_root_script(&vm_tools::install_script(&checks, &targets))
     }
 
     /// Files from the host (a `.deb`, a capture) into `/srv/lab/inbox/`.
@@ -1151,6 +1149,46 @@ fn wire_nics(wires: u32) -> Vec<(String, String)> {
             })
         })
         .collect()
+}
+
+/// The user runs `flock vm/root.lock cargo xtask vm-lab tools`: the lock
+/// is then theirs for this very command, not another round. Linux only:
+/// walks the parent chain in /proc looking for that `flock`.
+fn held_by_ancestor(lock: &Path) -> bool {
+    let lock = lock.to_string_lossy();
+    let mut pid = std::process::id().to_string();
+    for _ in 0..32 {
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        // `pid (comm) state ppid …`: comm may hold spaces, so cut after `)`.
+        let Some(ppid) = stat
+            .rsplit_once(')')
+            .and_then(|(_, rest)| rest.split_whitespace().nth(1))
+        else {
+            return false;
+        };
+        if ppid == "0" || ppid == "1" {
+            return false;
+        }
+        let cmdline = std::fs::read(format!("/proc/{ppid}/cmdline")).unwrap_or_default();
+        let args: Vec<String> = cmdline
+            .split(|b| *b == 0)
+            .map(|a| String::from_utf8_lossy(a).into_owned())
+            .collect();
+        let is_flock = args
+            .first()
+            .is_some_and(|a| a.rsplit('/').next() == Some("flock"));
+        if is_flock
+            && args
+                .iter()
+                .any(|a| *a == lock || lock.ends_with(a.as_str()))
+        {
+            return true;
+        }
+        pid = ppid.to_owned();
+    }
+    false
 }
 
 /// The last IPv4 of the management NIC in a `virsh domifaddr` table, where

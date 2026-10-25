@@ -108,6 +108,27 @@ pub fn query(tools: &[Tool]) -> String {
     )
 }
 
+/// The root script that installs `targets` (package names, or paths of
+/// `.deb`s already copied into the VM), checking each `(sha256, path)`
+/// first. No `.deb`, no `sha256sum`: fed nothing, it fails ("no properly
+/// formatted checksum lines found", **measured** with iperf3 alone).
+pub fn install_script(checks: &[(String, String)], targets: &[String]) -> String {
+    let mut s = String::from("set -e\nexport DEBIAN_FRONTEND=noninteractive\n");
+    if !checks.is_empty() {
+        s.push_str("sha256sum -c --quiet - <<'SUMS'\n");
+        for (sha, path) in checks {
+            s.push_str(&format!("{sha}  {path}\n"));
+        }
+        s.push_str("SUMS\n");
+    }
+    s.push_str("apt-get update -q >/dev/null\n");
+    s.push_str(&format!(
+        "apt-get install -y -q --no-install-recommends {}\n",
+        targets.join(" ")
+    ));
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,6 +156,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn apt_only_installs_skip_the_checksum() {
+        let s = install_script(&[], &["iperf3".into()]);
+        assert!(!s.contains("sha256sum"), "{s}");
+        assert!(s.contains("apt-get install -y -q --no-install-recommends iperf3\n"));
+    }
+
+    #[test]
+    fn debs_are_checked_before_install() {
+        let deb = "/srv/lab/tools/bngblaster-1.0.1-ubuntu-24.04_amd64.deb";
+        let s = install_script(
+            &[("ab".repeat(32), deb.into())],
+            &[deb.into(), "iperf3".into()],
+        );
+        let check = s.find("sha256sum -c").unwrap();
+        let line = s
+            .find(&format!("{}  {deb}\nSUMS\n", "ab".repeat(32)))
+            .unwrap();
+        let install = s.find("apt-get install").unwrap();
+        assert!(check < line && line < install, "{s}");
+        assert!(s.contains(&format!("--no-install-recommends {deb} iperf3\n")));
     }
 
     #[test]
