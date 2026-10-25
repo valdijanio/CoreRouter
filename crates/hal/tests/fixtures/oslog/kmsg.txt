@@ -1,0 +1,114 @@
+# Synthetic /dev/kmsg records (G4.8b) in the kernel's format: prio,seq,usec,flag;message,
+# then ' KEY=value' dictionary lines. Made-up router, boot and times.
+5,103,5925000000,-;Linux version 6.8.0-corerouter (gcc 13.2) #1 SMP PREEMPT_DYNAMIC
+6,104,5926000000,-;Command line: BOOT_IMAGE=/vmlinuz root=/dev/sda2 ro quiet
+6,105,5927000000,-;MCE: In-kernel MCE decoding enabled.
+6,106,5927000000,-;OOM killer enabled.
+6,107,5927000000,-;thermal_sys: Registered thermal governor 'step_wise'
+6,108,5928000000,-;ACPI: thermal: Thermal Zone [TZ00] (41 C)
+6,109,5928000000,-;r8169 0000:02:00.0 eth0: RTL8125B, 02:00:5e:00:53:01, XID 641, IRQ 49
+6,110,5928000000,-;r8169 0000:03:00.0 eth1: RTL8125B, 02:00:5e:00:53:02, XID 641, IRQ 50
+6,111,5929000000,-;r8169 0000:02:00.0 ether1: renamed from eth0
+6,112,5930000000,-;r8169 0000:03:00.0 ether2: renamed from eth1
+6,113,5930000000,-;nvme nvme0: 8/0/0 default/read/poll queues
+6,114,5930000000,-; nvme0n1: p1 p2 p3
+6,115,5931000000,-;EXT4-fs (nvme0n1p2): mounted filesystem with ordered data mode. Quota mode: none.
+4,116,5931000000,-;nvme nvme0: using unchecked data buffer
+6,117,5933000000,-;usb 1-1.2: new high-speed USB device number 3 using xhci_hcd
+ SUBSYSTEM=usb
+ DEVICE=c189:2
+6,118,5942000000,-;r8169 0000:02:00.0 ether1: Link is Up - 1Gbps/Full - flow control rx/tx
+6,119,5943000000,-;r8169 0000:03:00.0 ether2: Link is Up - 1Gbps/Full - flow control rx/tx
+4,120,6355000000,-;r8169 0000:03:00.0 ether2: rx_missed 27 (ring full, frame dropped)
+4,121,6376000000,-;r8169 0000:03:00.0 ether2: rx_missed 17 (ring full, frame dropped)
+4,122,6394000000,-;r8169 0000:03:00.0 ether2: rx_missed 15 (ring full, frame dropped)
+4,123,6424000000,-;r8169 0000:03:00.0 ether2: rx_missed 5 (ring full, frame dropped)
+4,124,6435000000,-;r8169 0000:03:00.0 ether2: rx_missed 30 (ring full, frame dropped)
+6,125,6591000000,-;r8169 0000:04:00.0 ether3: Link is Down
+6,126,6601000000,-;r8169 0000:04:00.0 ether3: Link is Up - 100Mbps/Full - flow control off
+4,127,6929000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,128,6934000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,129,6939000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,130,6944000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,131,6944000000,-;net_ratelimit: 52 callbacks suppressed
+3,132,7259000000,-;Out of memory: Killed process 8225 (unbound) total-vm:812344kB, anon-rss:602112kB, file-rss:0kB, shmem-rss:0kB, UID:107 pgtables:1532kB oom_score_adj:0
+3,133,7446000000,-;I/O error, dev sda, sector 37815812 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 2
+3,134,7446000000,-;EXT4-fs warning (device sda1): ext4_end_bio:343: I/O error 10 writing to inode 1310721 starting block 524296)
+2,135,7625000000,-;mce: [Hardware Error]: Machine check events logged
+3,136,7625000000,-;EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#1_DIMM#0 (corrected error)
+4,137,7998000000,-;CPU4: Core temperature above threshold, cpu clock throttled (total events = 67)
+6,138,8069000000,-;dnsmasq[10705]: segfault at 0 ip 00005581c3a1b2c4 sp 00007ffd0a321178 error 4 in dnsmasq[5581c3a00000+6b000] likely on CPU 3 (core 3, socket 0)
+4,139,8400000000,-;TCP: request_sock_TCP: Possible SYN flooding on port 0.0.0.0:443. Sending cookies.
+4,140,9684000000,-;r8169 0000:03:00.0 ether2: rx_missed 24 (ring full, frame dropped)
+4,141,9692000000,-;r8169 0000:03:00.0 ether2: rx_missed 35 (ring full, frame dropped)
+4,142,9711000000,-;r8169 0000:03:00.0 ether2: rx_missed 10 (ring full, frame dropped)
+4,143,9739000000,-;r8169 0000:03:00.0 ether2: rx_missed 3 (ring full, frame dropped)
+4,144,9753000000,-;r8169 0000:03:00.0 ether2: rx_missed 6 (ring full, frame dropped)
+4,145,9779000000,-;r8169 0000:03:00.0 ether2: rx_missed 11 (ring full, frame dropped)
+6,146,10167000000,-;r8169 0000:04:00.0 ether3: Link is Down
+6,147,10181000000,-;r8169 0000:04:00.0 ether3: Link is Up - 100Mbps/Full - flow control off
+4,148,10309000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,149,10310000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,150,10314000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,151,10315000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,152,10315000000,-;net_ratelimit: 257 callbacks suppressed
+3,153,10532000000,-;Out of memory: Killed process 6367 (unbound) total-vm:812344kB, anon-rss:602112kB, file-rss:0kB, shmem-rss:0kB, UID:107 pgtables:1532kB oom_score_adj:0
+3,154,10737000000,-;I/O error, dev sda, sector 29780783 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 2
+3,155,10737000000,-;EXT4-fs warning (device sda1): ext4_end_bio:343: I/O error 10 writing to inode 1310721 starting block 524296)
+2,156,10993000000,-;mce: [Hardware Error]: Machine check events logged
+3,157,10993000000,-;EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#1_DIMM#0 (corrected error)
+4,158,11296000000,-;CPU2: Core temperature above threshold, cpu clock throttled (total events = 81)
+6,159,11604000000,-;dnsmasq[27593]: segfault at 0 ip 00005581c3a1b2c4 sp 00007ffd0a321178 error 4 in dnsmasq[5581c3a00000+6b000] likely on CPU 3 (core 3, socket 0)
+4,160,11721000000,-;TCP: request_sock_TCP: Possible SYN flooding on port 0.0.0.0:443. Sending cookies.
+4,161,12333000000,-;r8169 0000:03:00.0 ether2: rx_missed 15 (ring full, frame dropped)
+4,162,12352000000,-;r8169 0000:03:00.0 ether2: rx_missed 31 (ring full, frame dropped)
+4,163,12359000000,-;r8169 0000:03:00.0 ether2: rx_missed 7 (ring full, frame dropped)
+4,164,12365000000,-;r8169 0000:03:00.0 ether2: rx_missed 11 (ring full, frame dropped)
+4,165,12373000000,-;r8169 0000:03:00.0 ether2: rx_missed 4 (ring full, frame dropped)
+4,166,12396000000,-;r8169 0000:03:00.0 ether2: rx_missed 10 (ring full, frame dropped)
+4,167,12417000000,-;r8169 0000:03:00.0 ether2: rx_missed 20 (ring full, frame dropped)
+4,168,12431000000,-;r8169 0000:03:00.0 ether2: rx_missed 5 (ring full, frame dropped)
+4,169,12440000000,-;r8169 0000:03:00.0 ether2: rx_missed 26 (ring full, frame dropped)
+6,170,12828000000,-;r8169 0000:04:00.0 ether3: Link is Down
+6,171,12835000000,-;r8169 0000:04:00.0 ether3: Link is Up - 100Mbps/Full - flow control off
+4,172,13091000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,173,13092000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,174,13096000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,175,13098000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,176,13098000000,-;net_ratelimit: 256 callbacks suppressed
+3,177,13265000000,-;Out of memory: Killed process 7236 (unbound) total-vm:812344kB, anon-rss:602112kB, file-rss:0kB, shmem-rss:0kB, UID:107 pgtables:1532kB oom_score_adj:0
+3,178,13388000000,-;I/O error, dev sda, sector 61291535 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 2
+3,179,13388000000,-;EXT4-fs warning (device sda1): ext4_end_bio:343: I/O error 10 writing to inode 1310721 starting block 524296)
+2,180,13462000000,-;mce: [Hardware Error]: Machine check events logged
+3,181,13462000000,-;EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#1_DIMM#0 (corrected error)
+4,182,13811000000,-;CPU5: Core temperature above threshold, cpu clock throttled (total events = 72)
+6,183,14061000000,-;dnsmasq[25387]: segfault at 0 ip 00005581c3a1b2c4 sp 00007ffd0a321178 error 4 in dnsmasq[5581c3a00000+6b000] likely on CPU 3 (core 3, socket 0)
+4,184,14277000000,-;TCP: request_sock_TCP: Possible SYN flooding on port 0.0.0.0:443. Sending cookies.
+4,185,15180000000,-;r8169 0000:03:00.0 ether2: rx_missed 20 (ring full, frame dropped)
+4,186,15203000000,-;r8169 0000:03:00.0 ether2: rx_missed 21 (ring full, frame dropped)
+4,187,15217000000,-;r8169 0000:03:00.0 ether2: rx_missed 29 (ring full, frame dropped)
+4,188,15244000000,-;r8169 0000:03:00.0 ether2: rx_missed 18 (ring full, frame dropped)
+4,189,15269000000,-;r8169 0000:03:00.0 ether2: rx_missed 1 (ring full, frame dropped)
+6,190,15459000000,-;r8169 0000:04:00.0 ether3: Link is Down
+6,191,15463000000,-;r8169 0000:04:00.0 ether3: Link is Up - 100Mbps/Full - flow control off
+4,192,15709000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,193,15710000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,194,15711000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,195,15712000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,196,15715000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,197,15720000000,-;nf_conntrack: nf_conntrack: table full, dropping packet
+4,198,15720000000,-;net_ratelimit: 89 callbacks suppressed
+3,199,16013000000,-;Out of memory: Killed process 1844 (unbound) total-vm:812344kB, anon-rss:602112kB, file-rss:0kB, shmem-rss:0kB, UID:107 pgtables:1532kB oom_score_adj:0
+3,200,16419000000,-;I/O error, dev sda, sector 80176266 op 0x1:(WRITE) flags 0x800 phys_seg 1 prio class 2
+3,201,16419000000,-;EXT4-fs warning (device sda1): ext4_end_bio:343: I/O error 10 writing to inode 1310721 starting block 524296)
+2,202,16612000000,-;mce: [Hardware Error]: Machine check events logged
+3,203,16612000000,-;EDAC MC0: 1 CE memory read error on CPU_SrcID#0_Ha#0_Chan#1_DIMM#0 (corrected error)
+4,204,17000000000,-;CPU3: Core temperature above threshold, cpu clock throttled (total events = 49)
+6,205,17132000000,-;dnsmasq[23609]: segfault at 0 ip 00005581c3a1b2c4 sp 00007ffd0a321178 error 4 in dnsmasq[5581c3a00000+6b000] likely on CPU 3 (core 3, socket 0)
+4,206,17302000000,-;TCP: request_sock_TCP: Possible SYN flooding on port 0.0.0.0:443. Sending cookies.
+4,207,18325000000,-;r8169 0000:03:00.0 ether2: rx_missed 7 (ring full, frame dropped)
+4,208,18337000000,-;r8169 0000:03:00.0 ether2: rx_missed 21 (ring full, frame dropped)
+4,209,18349000000,-;r8169 0000:03:00.0 ether2: rx_missed 8 (ring full, frame dropped)
+4,210,18358000000,-;r8169 0000:03:00.0 ether2: rx_missed 24 (ring full, frame dropped)
+6,211,18441000000,-;r8169 0000:04:00.0 ether3: Link is Down
+6,212,18450000000,-;r8169 0000:04:00.0 ether3: Link is Up - 100Mbps/Full - flow control off

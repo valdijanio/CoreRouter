@@ -17,6 +17,7 @@ corerouter-engine = { path = "../crates/engine" }
 corerouter-control = { path = "../crates/control" }
 corerouter-mcp = { path = "../crates/mcp" }
 corerouter-proto-radius = { path = "../crates/proto-radius" }
+corerouter-hal = { path = "../crates/hal" }
 
 [workspace]
 members = ["."]
@@ -56,6 +57,13 @@ bench = false
 [[bin]]
 name = "radius"
 path = "fuzz_targets/radius.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "oslog"
+path = "fuzz_targets/oslog.rs"
 test = false
 doc = false
 bench = false
