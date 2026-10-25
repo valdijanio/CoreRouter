@@ -39,7 +39,7 @@ pub const MAX_ADDRESSES: usize = 4096;
 /// Where a name came from, in the default order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Source {
-    /// The PPPoE login of the session holding the address (G4.3; none yet).
+    /// The PPPoE login of the session holding the address (G4.3d).
     Pppoe,
     /// The comment of a static DHCP lease.
     DhcpStatic,

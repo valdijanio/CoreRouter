@@ -84,3 +84,141 @@ pub fn expand_hook(params: &serde_json::Map<String, Value>, vars: &[(&str, Strin
     }
     Value::Object(out)
 }
+
+/// One subscriber address entering or leaving a firewall address list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PppListOp {
+    pub list: String,
+    pub ip: std::net::Ipv4Addr,
+    pub add: bool,
+    pub timeout_secs: u64,
+    pub comment: String,
+}
+
+/// The BNG service's way to the XDP session map (G4.3c) through the HAL:
+/// short calls, made once a round under the session lock.
+impl Session {
+    /// Switch the PPPoE data plane on for `ports` (by name). `Err` says why
+    /// not (no XDP, not attached there): the service then uses its slow
+    /// path.
+    pub fn pppoe_dataplane(&mut self, on: bool, ports: &[corerouter_model::IfName]) -> Result<(), String> {
+        self.hal_mut().pppoe_dataplane(on, ports).map_err(|e| e.to_string())
+    }
+
+    pub fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), String> {
+        self.hal_mut().pppoe_apply(ops).map_err(|e| e.to_string())
+    }
+
+    pub fn pppoe_counters(&mut self, slots: &[u32]) -> Vec<(u32, corerouter_hal::pppoe::PppoeCounters)> {
+        if slots.is_empty() {
+            return Vec::new();
+        }
+        self.hal_mut().pppoe_counters(slots)
+    }
+}
+
+impl Session {
+    /// The PPP service's address-list entry for a subscriber (the
+    /// profile's `address_list`, RADIUS `Mikrotik-Address-List`, a CoA):
+    /// a dynamic entry, as `ip.firewall.address-list.add timeout=…` makes
+    /// one, without that command's access check. A subscriber's own address
+    /// entering a list does not change the operator's way in, and the check
+    /// copies every dynamic entry: 10 000 logins paid it 10 000 times.
+    pub fn ppp_address_list(
+        &mut self,
+        list: &str,
+        ip: std::net::Ipv4Addr,
+        add: bool,
+        timeout_secs: u64,
+        comment: &str,
+    ) -> Result<(), String> {
+        let op = PppListOp { list: list.to_owned(), ip, add, timeout_secs, comment: comment.to_owned() };
+        self.ppp_address_lists(std::slice::from_ref(&op)).into_iter().next().map_or(Ok(()), Err)
+    }
+
+    /// Many [`Session::ppp_address_list`] at once: one data-plane call
+    /// (one `nft` run on Linux) for all. Returns the errors, one line each.
+    pub fn ppp_address_lists(&mut self, ops: &[PppListOp]) -> Vec<String> {
+        use corerouter_hal::DynamicChange;
+        use corerouter_model::firewall::{AddrMatch, Name};
+        let now = self.now();
+        let mut errors = Vec::new();
+        // First what goes (one reindex for all), then what comes: a new
+        // add replaces an old entry (a fresh timeout).
+        let mut parsed = Vec::with_capacity(ops.len());
+        let mut drop = std::collections::HashSet::new();
+        for op in ops {
+            let Ok(list) = op.list.parse::<Name>() else {
+                errors.push(format!("address-list '{}': not a list name", op.list));
+                continue;
+            };
+            let address = AddrMatch::Net(ipnet::IpNet::from(std::net::IpAddr::V4(op.ip)));
+            if let Some(e) = self.dynamic_addresses.find(&list, &address) {
+                drop.insert(e.id);
+            }
+            parsed.push((op, list, address));
+        }
+        let gone: Vec<_> = self
+            .dynamic_addresses
+            .remove_many(&drop)
+            .iter()
+            .map(|e| e.data_plane(now))
+            .collect();
+        let mut added = Vec::new();
+        for (op, list, address) in parsed {
+            if !op.add || self.dynamic_addresses.find(&list, &address).is_some() {
+                continue;
+            }
+            if self.dynamic_addresses.entries().len() >= crate::firewall_dyn::MAX_DYNAMIC {
+                errors.push(format!("address-list '{}': at most {} dynamic entries", op.list, crate::firewall_dyn::MAX_DYNAMIC));
+                continue;
+            }
+            let entry = crate::firewall_dyn::DynamicEntry {
+                id: self.dynamic_addresses.next_id(),
+                list,
+                address,
+                timeout_secs: op.timeout_secs,
+                added: now,
+                comment: crate::identity::clean(&op.comment),
+            };
+            added.push(entry.data_plane(now));
+            self.dynamic_addresses.push(entry);
+        }
+        let mut changes: Vec<DynamicChange<'_>> = gone.iter().map(DynamicChange::Remove).collect();
+        changes.extend(added.iter().map(DynamicChange::Add));
+        if !changes.is_empty()
+            && let Err(e) = self.hal_mut().address_list_dynamic_many(&changes)
+        {
+            errors.push(e.to_string());
+        }
+        errors
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use crate::Session;
+
+    #[test]
+    fn subscriber_address_lists_add_renew_and_remove() {
+        let mut s = Session::virtual_lab();
+        let ip = std::net::Ipv4Addr::new(100, 64, 0, 9);
+        s.ppp_address_list("online", ip, true, 3600, "ppp joao").unwrap();
+        s.ppp_address_list("online", ip, true, 3600, "ppp joao").unwrap();
+        let rows = s.execute("ip.firewall.address-list.list", &json!({"list": "online"})).unwrap();
+        assert_eq!(rows.as_array().unwrap().len(), 1, "made again, not twice: {rows}");
+        assert_eq!(rows[0]["dynamic"], true);
+        s.ppp_address_list("online", ip, false, 0, "").unwrap();
+        let rows = s.execute("ip.firewall.address-list.list", &json!({"list": "online"})).unwrap();
+        assert!(rows.as_array().unwrap().is_empty());
+        assert!(s.ppp_address_list("bad name", ip, true, 60, "").is_err());
+        // Ten thousand logins stay cheap (no copy of every entry per add).
+        let t = std::time::Instant::now();
+        for i in 0..10_000u32 {
+            s.ppp_address_list("online", std::net::Ipv4Addr::from(0x6440_0000 + i), true, 3600, "").unwrap();
+        }
+        assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+    }
+}

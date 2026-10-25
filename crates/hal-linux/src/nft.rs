@@ -253,6 +253,38 @@ pub fn add_dynamic(d: &DynamicAddress) -> Result<(), HalError> {
     ))
 }
 
+/// Many adds and removals in one `nft` run (a script; nft applies it as
+/// one transaction).
+pub fn apply_dynamic(changes: &[(bool, &DynamicAddress)]) -> Result<(), HalError> {
+    if changes.is_empty() {
+        return Ok(());
+    }
+    let mut script = format!("add table inet {TABLE}\n");
+    let mut sets: Vec<String> = Vec::new();
+    for (add, d) in changes {
+        let (set, ty) = set_name(d);
+        if *add && !sets.contains(&set) {
+            script.push_str(&format!(
+                "add set inet {TABLE} {set} {{ type {ty}; flags interval, timeout; auto-merge; }}\n"
+            ));
+            sets.push(set.clone());
+        }
+        if *add {
+            script.push_str(&format!(
+                "add element inet {TABLE} {set} {{ {} timeout {}s }}\n",
+                d.address,
+                d.timeout_secs.max(1)
+            ));
+        } else {
+            script.push_str(&format!(
+                "delete element inet {TABLE} {set} {{ {} }}\n",
+                d.address
+            ));
+        }
+    }
+    run(&script)
+}
+
 pub fn remove_dynamic(d: &DynamicAddress) -> Result<(), HalError> {
     let (set, _) = set_name(d);
     run(&format!(

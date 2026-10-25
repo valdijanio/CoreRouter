@@ -802,6 +802,9 @@ pub struct ActiveSession {
     pub tx_bytes: u64,
     pub rx_packets: u64,
     pub tx_packets: u64,
+    /// Over the last second, bits per second (rx = from the subscriber).
+    pub rx_bps: u64,
+    pub tx_bps: u64,
     pub mtu: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_bytes_in: Option<u64>,

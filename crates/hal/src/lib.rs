@@ -18,6 +18,7 @@ pub mod lab_conntrack;
 pub mod lab_flow;
 pub mod nic;
 pub mod oslog;
+pub mod pppoe;
 pub mod probe;
 pub mod resources;
 pub mod route_get;
@@ -202,6 +203,16 @@ pub trait Hal: Send {
     /// which expires it by itself. `apply` keeps the ones present.
     fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
         let _ = change;
+        Ok(())
+    }
+
+    /// Many [`Hal::address_list_dynamic`] changes in one go (the PPP
+    /// service adds one per subscriber that logs in: one `nft` run per
+    /// round, not per entry). Applied in order; the first error stops.
+    fn address_list_dynamic_many(&mut self, changes: &[DynamicChange<'_>]) -> Result<(), HalError> {
+        for c in changes {
+            self.address_list_dynamic(*c)?;
+        }
         Ok(())
     }
 
@@ -448,6 +459,33 @@ pub trait Hal: Send {
             "{} has no XDP data plane",
             self.describe()
         )))
+    }
+
+    /// PPPoE subscribers in the XDP data plane (G4.3c, for the BNG
+    /// service G4.3d): switch it on for the access ports `ports` (the XDP
+    /// program must be attached there). `Err`: the service carries the
+    /// traffic itself.
+    fn pppoe_dataplane(&mut self, on: bool, ports: &[IfName]) -> Result<(), HalError> {
+        let _ = (on, ports);
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
+    /// Change the XDP session map, in order.
+    fn pppoe_apply(&mut self, ops: &[pppoe::PppoeOp]) -> Result<(), HalError> {
+        let _ = ops;
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
+    /// The counters of the sessions at `slots` (unknown ones left out).
+    fn pppoe_counters(&mut self, slots: &[u32]) -> Vec<(u32, pppoe::PppoeCounters)> {
+        let _ = slots;
+        Vec::new()
     }
 
     /// Zero the XDP counters and forget the dropped sources.

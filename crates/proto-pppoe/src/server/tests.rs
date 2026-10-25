@@ -727,3 +727,23 @@ fn rfc1334_lost_pap_ack_is_recovered() {
     );
     assert_eq!(p.c.phase(), ClientPhase::Up);
 }
+
+#[test]
+fn reconfigure_keeps_the_mac_and_the_sid_space() {
+    let cfg = ServerConfig {
+        max_sessions: 100,
+        ..ServerConfig::default()
+    };
+    let mac = cfg.ac_mac;
+    let mut s = Server::new(cfg, [1; 32], 0);
+    let mut next = s.config().clone();
+    next.ac_mac = Mac([9; 6]);
+    next.max_sessions = 5;
+    next.padi_limit = 10;
+    next.max_mru = 1400;
+    s.reconfigure(next);
+    assert_eq!(s.config().ac_mac, mac);
+    assert_eq!(s.config().max_sessions, 100);
+    assert_eq!((s.config().padi_limit, s.config().max_mru), (10, 1400));
+    s.check_invariants().unwrap();
+}

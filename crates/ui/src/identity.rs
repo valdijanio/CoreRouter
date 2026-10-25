@@ -409,6 +409,12 @@ pub(crate) fn open(app: &mut CoreRouterUi, r: &Value) {
             app.tables.fw_addr.reveal(&id);
             Win::Firewall
         }
+        "ppp" => {
+            if let Some(p) = app.panel_mut::<crate::ppp::PppPanel>() {
+                p.reveal_login(&id);
+            }
+            Win::Panel(crate::ppp::WIN)
+        }
         "dns-zones" => {
             if let Some(p) = app.panel_mut::<crate::dns_zones::ZonesPanel>() {
                 p.zone = text(item, "zone");

@@ -133,3 +133,66 @@ pub(super) fn guard_drops(
     }
     Ok(n)
 }
+
+/// The list modal's preview (`docs/ui-style.md`, G0.24) of a PPP list:
+/// `add` (or `set` with `id`) is tried on the candidate and undone, so the
+/// checks are exactly the command's. A change that would end sessions
+/// comes back as `risk` (the modal then sends `force`). Never fails on a
+/// bad entry: it becomes an `error` check.
+pub(super) fn preview(
+    s: &mut Session,
+    p: &Value,
+    commands: (&str, &str),
+    run: (super::Run, super::Run),
+    computed: impl Fn(&Session, &Value) -> Vec<Value>,
+) -> Result<Value> {
+    let check = |level: &str, check: &str, message: String, param: Option<&str>| {
+        serde_json::json!({"level": level, "check": check, "message": message, "param": param})
+    };
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        o.remove("force");
+    }
+    let editing = q.get("id").is_some();
+    let (command, f) = if editing { (commands.1, run.1) } else { (commands.0, run.0) };
+    let snapshot = s.store().candidate().clone();
+    let mut result = f(s, &q);
+    let mut risk = None;
+    if let Err(EngineError::BadParam { param, reason }) = &result
+        && param == "force"
+    {
+        risk = Some(reason.clone());
+        s.store_mut().set_candidate(snapshot.clone());
+        let mut forced = q.clone();
+        if let Some(o) = forced.as_object_mut() {
+            o.insert("force".into(), Value::Bool(true));
+        }
+        result = f(s, &forced);
+    }
+    let mut checks = Vec::new();
+    let mut extra = Vec::new();
+    match &result {
+        Ok(v) => {
+            checks.push(check("ok", "valid", "ready".into(), None));
+            for w in v.get("warnings").and_then(Value::as_array).into_iter().flatten() {
+                checks.push(check("warning", "warning", w.as_str().unwrap_or_default().to_owned(), None));
+            }
+            extra = computed(s, v);
+        }
+        Err(EngineError::BadParam { param, reason }) => {
+            checks.push(check("error", "invalid", reason.clone(), Some(param.as_str())));
+        }
+        Err(e) => checks.push(check("error", "invalid", e.to_string(), None)),
+    }
+    s.store_mut().set_candidate(snapshot);
+    let commands = if result.is_ok() {
+        vec![serde_json::json!({"command": command, "params": q})]
+    } else {
+        Vec::new()
+    };
+    let mut out = serde_json::json!({"computed": extra, "checks": checks, "commands": commands});
+    if let (Some(r), Some(o)) = (risk, out.as_object_mut()) {
+        o.insert("risk".into(), Value::String(r));
+    }
+    Ok(out)
+}
