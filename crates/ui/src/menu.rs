@@ -106,6 +106,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("ospf", None, None, icons::GRAPH, "/routing ospf", &[], &["area", "lsa", "igp"]),
     e("ping", None, None, icons::PULSE, "/tool ping", &["tool.ping"], &["icmp", "latência", "latency", "mtu"]),
     e("radius", None, None, icons::KEY, "/radius", &["radius", "ppp.aaa"], &["aaa", "autenticação", "authentication", "accounting", "contabilização", "coa", "disconnect", "dm", "rfc 5176", "freeradius", "mk-auth", "ixc", "sgp", "hubsoft", "pppoe", "bng", "radtest", "nas"]),
+    e("resources", None, None, icons::PULSE, "/system resource", &["system.resource", "system.health"], &["health", "saúde", "saude", "cpu", "memória", "memoria", "memory", "ram", "disk", "disco", "temperature", "temperatura", "sensores", "sensors", "fan", "ventoinha", "processos", "processes", "profile", "top", "htop", "uptime", "psi", "softirq", "irq", "rss"]),
     e("routes", None, None, icons::SIGNPOST, "/ip route", &["ip.route"], &["rota", "rotas", "rota padrão", "default route", "gateway", "0.0.0.0/0", "static route", "ipv4"]),
     e("services", None, None, icons::HEARTBEAT, "/system service", &["system.service"], &["supervisor", "daemon", "processo", "failed", "restart", "reiniciar"]),
     e("settings", None, None, icons::SLIDERS_HORIZONTAL, "", &[], &["language", "idioma", "theme", "tema", "preferences", "preferências"]),

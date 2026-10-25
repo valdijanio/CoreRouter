@@ -825,7 +825,12 @@ impl CoreRouterUi {
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     self.theme_switch(ui);
+                    resources::top_bar(self, ui);
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        // A narrow window cuts the left part instead of
+                        // drawing it over the right one (G4.8a readout).
+                        let room = ui.available_rect_before_wrap();
+                        ui.set_clip_rect(ui.clip_rect().intersect(room));
                         self.top_bar(ui);
                     });
                 });
@@ -2655,7 +2660,8 @@ mod tests {
                         || command.ends_with(".history")
                         || command == "config.diff"
                         || command == "ip.route.page"
-                        || command == crate::graphs::QUERY =>
+                        || command == crate::graphs::QUERY
+                        || command == crate::resources::CHECK =>
                 {
                     Ok(json!([]))
                 }
