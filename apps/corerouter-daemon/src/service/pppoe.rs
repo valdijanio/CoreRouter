@@ -238,6 +238,8 @@ mod linux {
             }
             let r = lock(session).pppoe_dataplane(true, &ifaces);
             self.plane_for = ifaces;
+            // `interface.pppoe-server.monitor` shows it.
+            super::super::pppoe_bng::guard(&self.bng.shared).stats.dataplane = r.is_ok();
             match r {
                 Ok(()) => {
                     self.plane = Some(true);
