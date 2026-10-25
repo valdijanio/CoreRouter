@@ -161,7 +161,6 @@ struct Counts {
     padt_tx: u64,
     auth_accept: u64,
     auth_reject: u64,
-    rx_dropped: u64,
 }
 
 /// `ppp.why`'s memory of one worker: per user and per MAC.
@@ -391,7 +390,6 @@ impl PppBackend for Backend {
         st.padt_tx = sum(|c| c.padt_tx);
         st.auth_accept = sum(|c| c.auth_accept);
         st.auth_reject = sum(|c| c.auth_reject);
-        st.rx_dropped = sum(|c| c.rx_dropped);
         st.admission_rate = sh.lanes.iter().map(|l| l.admission_rate).sum();
         st.admission_reason = sh.lanes.iter().find_map(|l| l.admission_reason.clone());
         st.workers = sh.lanes.len().max(1) as u32;
@@ -1306,18 +1304,10 @@ impl Bng {
         routes.read().ok().and_then(|r| r.get(&ip).copied())
     }
 
-    /// Frames this worker's sockets and queue lost so far (published with
-    /// the counters).
-    pub(crate) fn set_rx_dropped(&mut self, n: u64) {
-        self.counts.rx_dropped = n;
-    }
-
     /// The worker of a frame from a client (its source MAC; RSS-like):
-    /// the same as `hal_linux::pppoe_io::lane_of`, which the kernel runs in
-    /// each worker's socket filter (a test keeps the two equal).
-    // The service lets the kernel do it; the tests and the bench hand frames
-    // out the same way.
-    #[allow(dead_code)]
+    /// the same as `hal_linux::pppoe_io::lane_of`, the classic BPF filter of
+    /// a socket per worker that was measured and set aside (a test keeps the
+    /// two equal).
     pub(crate) fn lane_of(frame: &[u8], lanes: u16) -> u16 {
         let b = |i: usize| frame.get(i).copied().unwrap_or(0);
         let k = u32::from_be_bytes([b(8), b(9), b(10), b(11)]);

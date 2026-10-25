@@ -890,53 +890,49 @@ processo aparecer nos números de um roteador de verdade.
 - A tabela ativa, o histórico e os pools ficam compartilhados.
 - Num servidor, o SESSION_ID é repartido por faixa (`sid_lane`), sem lock.
 
-**Recepção: o kernel entrega cada quadro direto ao worker dono.** Cada worker abre os próprios
-sockets AF_PACKET em cada porta, com um filtro BPF clássico que guarda só os clientes dele:
+**Recepção: um leitor, um canal por worker.** A thread do serviço lê as portas de acesso e o
+`bng0` do caminho lento e entrega cada quadro ao worker do MAC do cliente, como o RSS
+(`Bng::lane_of`), por um canal de até 65 536 quadros. O canal é também o que absorve a rajada
+de PADIs de uma volta de energia.
 
-- o filtro faz um hash multiplicativo dos bytes 2..6 do MAC de origem (`ld [8]`,
-  `mul #0x9E3779B1`, `rsh #16`, `mod #N`, `jeq #faixa`);
-- é instalado com `SO_ATTACH_FILTER`, pela API segura do socket2;
-- o MAC fica antes de qualquer tag VLAN, então o offset é o mesmo com ou sem VLAN.
+**Decisão: o leitor único fica; o socket filtrado por worker foi medido e descartado.**
 
-**O que foi comparado:**
+- **Socket por worker:** cada worker abre os próprios sockets AF_PACKET com um filtro BPF
+  clássico que só deixa passar os clientes dele (`PppoePort::open_lane`, `lane_program`: `ld [8]`,
+  `mul #0x9E3779B1`, `rsh #16`, `mod #N`, `jeq #faixa`, via `SO_ATTACH_FILTER` do socket2).
+  - Num netns, a parte serial caiu: a thread receptora mais ocupada passou de 550–1050 ns para
+    150–350 ns por quadro (200 mil PADIs, `tests/netns_pppoe_lanes.rs`, **medido**).
+  - No laboratório com o BNG Blaster (VM corerouter-lab, 8 vCPUs, 100 mil sessões, **medido**),
+    ficou abaixo do leitor:
 
+    | | 1 worker | 6 workers |
+    |---|---:|---:|
+    | leitor + canal (rodada 3) | 15,2 mil/s | **57,9 mil/s** (leitor a 51%) |
+    | socket por worker, sem fila (rodada 4) | 10,5 mil/s | 22,4 mil/s |
+    | socket por worker + fila de 65 536 no worker (rodada 5) | 14,3 mil/s (46 234 quadros perdidos) | 24,0 mil/s (0 perdidos) |
+
+  - **Sem fila,** um socket de 4 MiB guarda 8739 PADIs, e o BNG Blaster manda 100 mil em
+    1,5 s: o kernel descartava, e o CPE repetia o PADI segundos depois.
+  - **Com fila,** com 6 workers nada se perdeu e mesmo assim deu 24 mil/s, com o BNG Blaster
+    a 91% de um núcleo (69–73% com o leitor a 57,9 mil/s). Gastou cerca de 3× mais CPU por
+    sessão.
+  - **Hipótese, não confirmada:** o CPE retransmite mais por latência e não por perda. O worker
+    esvazia o socket inteiro na fila antes de atender, e as respostas de LCP e IPCP esperam
+    atrás de uma rajada de PADIs. Com o leitor, cada worker recebe a sua parte já dividida e
+    em ordem de chegada. Confirmar exige os contadores de retransmissão por sessão do BNG
+    Blaster.
 - **PACKET_FANOUT por MAC:** precisa do modo CBPF com `PACKET_FANOUT_DATA` (a `sock_fprog`
-  por setsockopt). O modo HASH usa o hash de fluxo L3/L4, que a descoberta PPPoE não tem.
+  por setsockopt); o modo HASH usa o hash de fluxo L3/L4, que a descoberta PPPoE não tem.
   - Nem o socket2 nem o nix 0.30 expõem essas opções. A macro `sockopt_impl!` do nix
     expandiria `unsafe` no nosso crate, contra a regra.
   - O crate `netring` (0.32, um autor) e o `afpacket` (licença MirOS) não passaram no
     critério de dependência madura.
-- **Um leitor que distribui por canal** (a primeira versão) contra **um socket filtrado por
-  worker** (a atual): `tests/netns_pppoe_lanes.rs`, 200 mil PADIs num veth, CPU da thread
-  receptora mais ocupada por quadro (**medido**, release):
-
-  | workers | leitor + canal | socket próprio por worker |
-  |---|---:|---:|
-  | 1 | 600 ns | 550 ns |
-  | 2 | 550–650 ns | 350 ns |
-  | 4 | 800–1050 ns | 350 ns |
-  | 6 | 550–750 ns | 150 ns |
-
-  O leitor é um gargalo serial que não melhora com os workers. Na VM, ele ficou a 56% de um
-  núcleo com 54 mil sessões/s. O custo do filtro é N programas de ~8 instruções por quadro,
-  no softirq e antes da cópia.
-- **A fila de cada worker** (depois da rodada 4 da VM). O socket por worker sem fila caiu de
-  57,9 mil para 22,4 mil sessões/s com 6 workers: um socket de 4 MiB guarda ~8700 PADIs, e o
-  BNG Blaster manda 100 mil em 1,5 s. O canal do leitor escondia isso. Agora cada worker passa
-  o que os sockets têm para uma fila própria (até 65 536 quadros) a cada 128 quadros atendidos.
-  Com 100 mil PADIs na velocidade máxima a 5 µs por quadro (`a_burst_against_busy_workers`,
-  **medido**):
-
-  | workers | leitor + canal | socket lido entre quadros | socket + fila |
-  |---|---:|---:|---:|
-  | 1 | 77 169 | 18 756 | 100 000 |
-  | 4 | 100 000 | 95 285 | 100 000 |
-
-  As perdas do kernel por socket (`SO_RXQ_OVFL`) e as da fila aparecem no
-  `interface.pppoe-server.monitor` (`rx_dropped`). O filtro também descarta as cópias de
-  saída (`PACKET_OUTGOING`), que iriam todas ao worker do MAC do BNG.
-
-**Fica no leitor:** o caminho lento (`bng0`), distribuído pelo endereço do assinante.
+- **`recvmmsg` no leitor:** não entrou. O leitor ficou a 51% de um núcleo a 57,9 mil/s; ele
+  ainda não é o gargalo.
+- **Do trabalho do socket por worker, ficou:**
+  - o filtro das portas descarta as cópias do que o próprio BNG envia (`PACKET_OUTGOING`);
+  - as perdas do kernel por socket (`SO_RXQ_OVFL`) e as do canal saem no
+    `interface.pppoe-server.monitor` (`rx_dropped`).
 
 ## Histórico de revisão
 

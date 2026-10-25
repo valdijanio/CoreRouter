@@ -1,14 +1,13 @@
 //! The PPPoE access concentrator (G4.3d) as a service: the I/O around the
 //! BNG of `pppoe_bng.rs`, on several cores (G4.3g).
 //!
-//! - Each worker opens its own `AF_PACKET` sockets on every access port
-//!   (`hal-linux::pppoe_io`) with a classic BPF filter that keeps only the
-//!   clients whose MAC hashes to it: the kernel hands every frame straight to
-//!   its worker, like RSS (a CPE always lands on the same worker, its PADI,
-//!   PADR and session alike), with no thread in between.
-//! - The service's thread keeps the config, the data plane and, without
-//!   XDP, the slow path's `bng0`, whose packets it hands to the worker
-//!   holding the address.
+//! - The service's thread reads the access ports (`AF_PACKET` through
+//!   `hal-linux::pppoe_io`) and, without XDP, the slow path's `bng0`, and
+//!   hands each frame to a worker by the client's MAC (like RSS: a CPE always
+//!   lands on the same worker, its PADI, PADR and session alike). Its
+//!   channels also absorb a power cut's PADI burst. A socket filtered per
+//!   worker was measured and set aside: 24 000 sessions/s against this
+//!   reader's 57 900 with BNG Blaster (`docs/architecture.md`).
 //! - Each worker owns a `Bng`: its servers (a lane of every port's
 //!   SESSION_IDs), sessions, timers and RADIUS questions, and sends its own
 //!   frames. The active table, the history and the address pools are shared.
@@ -83,17 +82,16 @@ fn run(
 /// The driver (Linux: `AF_PACKET`, `poll`, the slow path's netlink).
 #[cfg(target_os = "linux")]
 mod linux {
-    use std::collections::{HashMap, VecDeque};
+    use std::collections::HashMap;
 
-    use std::os::fd::{AsFd, BorrowedFd};
-    use std::os::unix::net::UnixDatagram;
-    use std::sync::mpsc::{Receiver, SyncSender, TrySendError, sync_channel};
+    use std::os::fd::BorrowedFd;
+    use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TrySendError, sync_channel};
     use std::sync::{Arc, Mutex, OnceLock};
     use std::time::{Duration, Instant};
 
     use corerouter_engine::{Shared, lock};
     use corerouter_hal::pppoe::PppoeOp;
-    use corerouter_hal_linux::pppoe_io::{PppoePort, SlowPath, SlowTx};
+    use corerouter_hal_linux::pppoe_io::{PortSender, PppoePort, SlowPath, SlowTx};
     use corerouter_model::ppp::{PppoeServer, pppoe_workers_auto};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use serde_json::json;
@@ -106,18 +104,11 @@ mod linux {
     /// The config, the counters and the limits: once a second.
     const SECOND: Duration = Duration::from_secs(1);
     const IDLE: Duration = Duration::from_millis(500);
-    /// Frames queued for one worker at most, its own sockets' and the
-    /// reader's messages alike (a burst past it is dropped: the CPEs
-    /// retransmit, RFC 2516 §5 and RFC 1661 §4.6).
+    /// Frames queued for one worker at most (a burst past it is dropped:
+    /// the CPEs retransmit, RFC 2516 §5 and RFC 1661 §4.6).
     const QUEUE: usize = 1 << 16;
-    /// Messages, and frames, a worker takes in a row before its timers,
-    /// RADIUS and sends.
+    /// Messages a worker takes in a row before its timers and RADIUS.
     const BUDGET: usize = 512;
-    /// Frames handled between two reads of the sockets: a few milliseconds
-    /// of work, while a socket holds ~8700 PADIs. Against a 100 000-PADI
-    /// burst at 5 µs a frame, 1 worker reading between frames got 18 756;
-    /// with this queue, all of them (`netns_pppoe_lanes`, **medido**).
-    const REFILL: usize = 128;
 
     fn origin() -> Instant {
         static START: OnceLock<Instant> = OnceLock::new();
@@ -149,43 +140,25 @@ mod linux {
             .map_or(0, |d| d.as_secs())
     }
 
-    /// An access port the workers have open, and what for.
+    /// An open access port and what it was opened for.
     struct Open {
-        name: corerouter_model::IfName,
-        info: PortInfo,
+        port: PppoePort,
         vlans: Vec<u16>,
         untagged: bool,
-        rcvbuf: (usize, usize),
     }
 
     /// What the reader hands a worker.
     enum Msg {
+        /// A frame from a client on access port `ifindex`.
+        Frame(u32, Vec<u8>),
         /// Slow path: an IPv4 packet the kernel routed to its subscriber.
         Down(Vec<u8>),
         /// Once a second: the config, the ports open and the data plane.
         Config(Box<Snapshot>, HashMap<String, PortInfo>, bool),
-        /// The ports changed: the worker's own sockets on them (its lane).
-        Ports(Vec<PppoePort>),
+        /// The ports changed: the worker's own senders for them.
+        Ports(HashMap<u32, PortSender>),
         /// The slow path opened: the worker's own sender.
         Slow(Box<SlowTx>),
-    }
-
-    /// A worker's queue and the doorbell that wakes its `poll`.
-    struct Lane {
-        tx: SyncSender<Msg>,
-        bell: UnixDatagram,
-    }
-
-    impl Lane {
-        fn send(&self, m: Msg) -> bool {
-            let ok = match self.tx.try_send(m) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) => false,
-                Err(TrySendError::Disconnected(_)) => return false,
-            };
-            let _ = self.bell.send(&[1]);
-            ok
-        }
     }
 
     /// The reader: ports, plane, config and the workers' queues.
@@ -198,9 +171,11 @@ mod linux {
         plane: Option<bool>,
         plane_for: Vec<corerouter_model::IfName>,
         errors: Vec<String>,
-        workers: Vec<Lane>,
-        /// Slow-path packets dropped because a worker's queue was full.
+        workers: Vec<SyncSender<Msg>>,
+        /// Frames dropped because a worker's queue was full (this second;
+        /// `lost`: since the start).
         dropped: u64,
+        lost: u64,
     }
 
     pub(super) fn run(
@@ -234,19 +209,17 @@ mod linux {
             errors: Vec::new(),
             workers: Vec::new(),
             dropped: 0,
+            lost: 0,
         };
         let mut handles = Vec::new();
         for (lane, bng) in bngs.into_iter().enumerate() {
             let (tx, rx) = sync_channel::<Msg>(QUEUE);
-            let (bell, ring) = UnixDatagram::pair().map_err(|e| format!("PPPoE worker {lane}: {e}"))?;
-            let _ = ring.set_nonblocking(true);
-            let _ = bell.set_nonblocking(true);
             let s = session.clone();
             let h = health.clone();
             let t = health
-                .spawn(&format!("pppoe-{lane}"), move || worker(bng, &rx, &ring, &s, &h))
+                .spawn(&format!("pppoe-{lane}"), move || worker(bng, &rx, &s, &h))
                 .map_err(|e| format!("cannot start PPPoE worker {lane}: {e}"))?;
-            d.workers.push(Lane { tx, bell });
+            d.workers.push(tx);
             handles.push(t);
         }
         let mut last_second: Option<Instant> = None;
@@ -283,7 +256,10 @@ mod linux {
                     health.disabled(None);
                 }
                 d.errors.clear();
-                let infos = d.open_ports(&wanted);
+                let (infos, changed) = d.open_ports(&wanted);
+                if changed {
+                    d.send_senders();
+                }
                 // system.health.check › Socket buffers: a PADI burst after
                 // an outage must fit.
                 {
@@ -291,7 +267,7 @@ mod linux {
                     if let Some(t) = s.ext_mut::<corerouter_engine::health_check::SocketBuffers>() {
                         t.sockets.retain(|k, _| !k.starts_with("pppoe "));
                         for o in d.ports.values() {
-                            t.sockets.insert(format!("pppoe {}", o.name), o.rcvbuf);
+                            t.sockets.insert(format!("pppoe {}", o.port.name()), o.port.rcvbuf());
                         }
                     }
                 }
@@ -306,9 +282,14 @@ mod linux {
                     let _ = w.send(Msg::Config(Box::new(snap.clone()), infos.clone(), xdp));
                 }
                 if d.dropped > 0 {
-                    d.errors.push(format!("{} slow-path packets dropped: the PPPoE workers are behind", d.dropped));
+                    d.errors.push(format!("{} frames dropped: the PPPoE workers are behind", d.dropped));
+                    d.lost += d.dropped;
                     d.dropped = 0;
                 }
+                // interface.pppoe-server.monitor › rx_dropped: the queues'
+                // losses and the kernel's (a socket's buffer full).
+                guard(&shared).stats.rx_dropped =
+                    d.lost + d.ports.values().map(|o| o.port.dropped()).sum::<u64>();
                 if d.errors.is_empty() {
                     health.clear_error();
                 } else {
@@ -322,7 +303,7 @@ mod linux {
                 }
             }
             d.wait();
-            d.receive_slow(&routes);
+            d.receive(&routes);
             let _ = now;
         }
         // Stopping: the workers tell their subscribers (Terminate, PADT),
@@ -334,27 +315,13 @@ mod linux {
         Ok(())
     }
 
-    /// One worker: its BNG, its own sockets on the access ports (the
-    /// kernel's filter hands it its clients' frames), the reader's
-    /// messages (config, slow path) behind a doorbell.
-    ///
-    /// The frames wait in the worker's own queue ([`QUEUE`]), refilled from
-    /// the sockets every [`REFILL`] frames handled: a socket holds ~8700
-    /// PADIs (4 MiB, **medido**), and BNG Blaster sends 100 000 in a second
-    /// and a half. Read only between frames, the sockets overflowed and the
-    /// CPEs sent their PADIs again seconds later (G4.3g, VM round 4: 6
-    /// workers 22 400 sessions/s against 57 900 with the single reader's
-    /// queue).
-    fn worker(mut bng: Bng, rx: &Receiver<Msg>, ring: &UnixDatagram, session: &Shared, health: &super::super::Health) {
-        let mut ports: Vec<PppoePort> = Vec::new();
-        let mut queue: VecDeque<(u32, Vec<u8>)> = VecDeque::new();
-        // Lost in the queue, and by the kernel on sockets closed since.
-        let mut lost = 0u64;
+    /// One worker: its BNG, fed by the reader, sending on its own sockets.
+    fn worker(mut bng: Bng, rx: &Receiver<Msg>, session: &Shared, health: &super::super::Health) {
+        let mut ports: HashMap<u32, PortSender> = HashMap::new();
         let mut slow: Option<SlowTx> = None;
         let mut configured = false;
         let mut last_tick = Instant::now();
         let mut errors: Vec<String> = Vec::new();
-        let mut bell = [0u8; 64];
         loop {
             let now = ms();
             let mut wait = WAIT;
@@ -364,53 +331,36 @@ mod linux {
             if bng.waiting_radius() {
                 wait = wait.min(Duration::from_millis(2));
             }
-            if !queue.is_empty() {
-                wait = Duration::ZERO;
-            }
-            {
-                let mut fds: Vec<BorrowedFd<'_>> = ports.iter().flat_map(|p| p.fds()).collect();
-                fds.push(ring.as_fd());
-                let mut polls: Vec<PollFd<'_>> = fds.into_iter().map(|f| PollFd::new(f, PollFlags::POLLIN)).collect();
-                let t = PollTimeout::try_from(wait).unwrap_or(PollTimeout::ZERO);
-                let _ = poll(&mut polls, t);
-            }
-            while ring.recv(&mut bell).is_ok() {}
             let mut open = true;
+            let mut first = Some(rx.recv_timeout(wait));
             for _ in 0..BUDGET {
-                match rx.try_recv() {
+                let next = match first.take() {
+                    Some(r) => r,
+                    None => rx.try_recv().map_err(|e| match e {
+                        std::sync::mpsc::TryRecvError::Empty => RecvTimeoutError::Timeout,
+                        std::sync::mpsc::TryRecvError::Disconnected => RecvTimeoutError::Disconnected,
+                    }),
+                };
+                match next {
                     Ok(m) => {
                         let now = ms();
                         match m {
+                            Msg::Frame(ifindex, f) => bng.frame(now, ifindex, &f),
                             Msg::Down(p) => bng.data_down(&p),
                             Msg::Config(snap, infos, xdp) => {
                                 bng.xdp = xdp;
                                 bng.configure(now, *snap, &infos);
                                 configured = true;
                             }
-                            Msg::Ports(p) => {
-                                lost += ports.iter().map(PppoePort::dropped).sum::<u64>();
-                                ports = p;
-                            }
+                            Msg::Ports(p) => ports = p,
                             Msg::Slow(s) => slow = Some(*s),
                         }
                     }
-                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Err(RecvTimeoutError::Timeout) => break,
+                    Err(RecvTimeoutError::Disconnected) => {
                         open = false;
                         break;
                     }
-                }
-            }
-            fill(&mut ports, &mut queue, &mut lost, &mut errors);
-            let mut now = ms();
-            for done in 1..=BUDGET {
-                let Some((ifindex, f)) = queue.pop_front() else {
-                    break;
-                };
-                bng.frame(now, ifindex, &f);
-                if done % REFILL == 0 {
-                    fill(&mut ports, &mut queue, &mut lost, &mut errors);
-                    now = ms();
                 }
             }
             let now = ms();
@@ -424,7 +374,6 @@ mod linux {
                 } else {
                     Vec::new()
                 };
-                bng.set_rx_dropped(lost + ports.iter().map(PppoePort::dropped).sum::<u64>());
                 bng.tick(now, &counters);
                 if !errors.is_empty() {
                     let mut s = lock(session);
@@ -442,42 +391,16 @@ mod linux {
         flush(&mut bng, &ports, slow.as_ref(), session, &mut errors);
     }
 
-    /// What the worker's sockets hold, into its queue (until it is full:
-    /// the rest waits in the kernel, which counts what it drops).
-    fn fill(ports: &mut [PppoePort], queue: &mut VecDeque<(u32, Vec<u8>)>, lost: &mut u64, errors: &mut Vec<String>) {
-        for p in ports.iter_mut() {
-            let ifindex = p.ifindex();
-            while queue.len() < QUEUE {
-                match p.recv(|f| {
-                    if queue.len() < QUEUE {
-                        queue.push_back((ifindex, f.to_vec()));
-                    } else {
-                        *lost += 1;
-                    }
-                }) {
-                    Ok(0) => break,
-                    Ok(_) => {}
-                    Err(e) => {
-                        if errors.len() < 100 {
-                            errors.push(format!("{}: {e}", p.name()));
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
     /// Send what the BNG made and do what it asked.
     fn flush(
         bng: &mut Bng,
-        ports: &[PppoePort],
+        ports: &HashMap<u32, PortSender>,
         slow: Option<&SlowTx>,
         session: &Shared,
         errors: &mut Vec<String>,
     ) {
         for (ifindex, f) in bng.frames.drain(..) {
-            if let Some(p) = ports.iter().find(|p| p.ifindex() == ifindex)
+            if let Some(p) = ports.get(&ifindex)
                 && let Err(e) = p.send(&f)
             {
                 log::debug!("pppoe: send on ifindex {ifindex}: {e}");
@@ -546,56 +469,54 @@ mod linux {
     }
 
     impl Driver {
-        /// The ports the servers need, open for the workers (each its own
-        /// sockets, filtered to its lane); the open ones by server name.
-        /// Opened again, for every worker, when the set changes.
-        fn open_ports(&mut self, wanted: &[PppoeServer]) -> HashMap<String, PortInfo> {
-            let same = self.ports.len() == wanted.len()
-                && wanted.iter().all(|w| {
-                    self.ports.get(&w.name).is_some_and(|o| {
-                        o.vlans == vlan_ids(w)
-                            && o.untagged == (w.pppoe_over_vlan_range.is_empty() || w.accept_untagged)
-                            && o.name == w.interface
-                    })
-                });
-            if !same {
-                let lanes = u16::try_from(self.workers.len()).unwrap_or(1).max(1);
-                let mut by_lane: Vec<Vec<PppoePort>> = (0..lanes).map(|_| Vec::new()).collect();
-                self.ports.clear();
-                for w in wanted {
-                    let vlans = vlan_ids(w);
-                    let untagged = w.pppoe_over_vlan_range.is_empty() || w.accept_untagged;
-                    let mut first: Option<Open> = None;
-                    for (lane, mine) in by_lane.iter_mut().enumerate() {
-                        let lane = u16::try_from(lane).unwrap_or(0);
-                        match PppoePort::open_lane(&w.interface, &vlans, untagged, lane, lanes) {
-                            Ok(port) => {
-                                if first.is_none() {
-                                    first = Some(Open {
-                                        name: w.interface.clone(),
-                                        info: PortInfo { ifindex: port.ifindex(), mac: port.mac() },
-                                        vlans: vlans.clone(),
-                                        untagged,
-                                        rcvbuf: port.rcvbuf(),
-                                    });
-                                }
-                                mine.push(port);
-                            }
-                            Err(e) => {
-                                self.errors.push(format!("{}: {e}", w.interface));
-                                break;
-                            }
+        /// Open the ports the servers need, close the rest; the open ones by
+        /// server name, and whether the set changed.
+        fn open_ports(&mut self, wanted: &[PppoeServer]) -> (HashMap<String, PortInfo>, bool) {
+            let before = self.ports.len();
+            self.ports.retain(|name, _| wanted.iter().any(|w| &w.name == name));
+            let mut changed = before != self.ports.len();
+            let mut infos = HashMap::new();
+            for w in wanted {
+                let vlans = vlan_ids(w);
+                let untagged = w.pppoe_over_vlan_range.is_empty() || w.accept_untagged;
+                let same = self
+                    .ports
+                    .get(&w.name)
+                    .is_some_and(|o| o.vlans == vlans && o.untagged == untagged && o.port.name() == &w.interface);
+                if !same {
+                    self.ports.remove(&w.name);
+                    changed = true;
+                    match PppoePort::open(&w.interface, &vlans, untagged) {
+                        Ok(port) => {
+                            self.ports.insert(w.name.clone(), Open { port, vlans, untagged });
+                        }
+                        Err(e) => {
+                            self.errors.push(format!("{}: {e}", w.interface));
+                            continue;
                         }
                     }
-                    if let Some(o) = first {
-                        self.ports.insert(w.name.clone(), o);
-                    }
                 }
-                for (w, ports) in self.workers.iter().zip(by_lane) {
-                    let _ = w.send(Msg::Ports(ports));
+                if let Some(o) = self.ports.get(&w.name) {
+                    infos.insert(w.name.clone(), PortInfo { ifindex: o.port.ifindex(), mac: o.port.mac() });
                 }
             }
-            self.ports.iter().map(|(k, o)| (k.clone(), o.info)).collect()
+            (infos, changed)
+        }
+
+        /// Each worker its own senders for the open ports.
+        fn send_senders(&mut self) {
+            for w in &self.workers {
+                let mut m = HashMap::new();
+                for o in self.ports.values() {
+                    match o.port.sender() {
+                        Ok(s) => {
+                            m.insert(s.ifindex(), s);
+                        }
+                        Err(e) => self.errors.push(format!("{}: {e}", o.port.name())),
+                    }
+                }
+                let _ = w.send(Msg::Ports(m));
+            }
         }
 
         /// XDP when the HAL has it, else the slow path (once).
@@ -634,29 +555,47 @@ mod linux {
             }
         }
 
-        /// The slow path's packets, or a nap (the workers read the ports).
         fn wait(&self) {
-            let Some(s) = &self.slow else {
+            let mut fds: Vec<BorrowedFd<'_>> = self.ports.values().flat_map(|o| o.port.fds()).collect();
+            if let Some(s) = &self.slow {
+                fds.push(s.fd());
+            }
+            if fds.is_empty() {
                 std::thread::sleep(WAIT);
                 return;
-            };
-            let mut polls = [PollFd::new(s.fd(), PollFlags::POLLIN)];
+            }
+            let mut polls: Vec<PollFd<'_>> = fds.into_iter().map(|f| PollFd::new(f, PollFlags::POLLIN)).collect();
             let t = PollTimeout::try_from(WAIT).unwrap_or(PollTimeout::ZERO);
             let _ = poll(&mut polls, t);
         }
 
-        /// The slow path's packets to the worker holding the address.
-        fn receive_slow(&mut self, routes: &super::super::pppoe_bng::Routes) {
+        /// Every frame waiting, to the worker of its client's MAC; the slow
+        /// path's packets to the worker holding the address.
+        fn receive(&mut self, routes: &super::super::pppoe_bng::Routes) {
+            let lanes = u16::try_from(self.workers.len()).unwrap_or(1).max(1);
             let workers = &self.workers;
             let mut dropped = 0u64;
+            let mut deliver = |lane: u16, m: Msg| {
+                if let Some(w) = workers.get(usize::from(lane))
+                    && let Err(TrySendError::Full(_)) = w.try_send(m)
+                {
+                    dropped += 1;
+                }
+            };
+            for o in self.ports.values_mut() {
+                let ifindex = o.port.ifindex();
+                if let Err(e) = o
+                    .port
+                    .recv(|f| deliver(Bng::lane_of(f, lanes), Msg::Frame(ifindex, f.to_vec())))
+                {
+                    self.errors.push(format!("{}: {e}", o.port.name()));
+                }
+            }
             if let Some(s) = self.slow.as_mut()
                 && let Err(e) = s.recv(|p| {
                     let dst = p.get(16..20).and_then(|d| <[u8; 4]>::try_from(d).ok());
-                    if let Some(lane) = dst.and_then(|d| Bng::route_lane_in(routes, std::net::Ipv4Addr::from(d)))
-                        && let Some(w) = workers.get(usize::from(lane))
-                        && !w.send(Msg::Down(p.to_vec()))
-                    {
-                        dropped += 1;
+                    if let Some(lane) = dst.and_then(|d| Bng::route_lane_in(routes, std::net::Ipv4Addr::from(d))) {
+                        deliver(lane, Msg::Down(p.to_vec()));
                     }
                 })
             {
