@@ -1291,13 +1291,16 @@ impl Bng {
         routes.read().ok().and_then(|r| r.get(&ip).copied())
     }
 
-    /// The worker of a frame from a client (its source MAC; RSS-like).
+    /// The worker of a frame from a client (its source MAC; RSS-like):
+    /// the same as `hal_linux::pppoe_io::lane_of`, which the kernel runs in
+    /// each worker's socket filter (a test keeps the two equal).
+    // The service lets the kernel do it; the tests and the bench hand frames
+    // out the same way.
+    #[allow(dead_code)]
     pub(crate) fn lane_of(frame: &[u8], lanes: u16) -> u16 {
-        let mac = frame.get(6..12).unwrap_or(&[]);
-        let h = mac.iter().fold(0x811c_9dc5u32, |h, b| {
-            (h ^ u32::from(*b)).wrapping_mul(0x0100_0193)
-        });
-        (h % u32::from(lanes.max(1))) as u16
+        let b = |i: usize| frame.get(i).copied().unwrap_or(0);
+        let k = u32::from_be_bytes([b(8), b(9), b(10), b(11)]);
+        ((k.wrapping_mul(0x9E37_79B1) >> 16) % u32::from(lanes.max(1))) as u16
     }
 
     fn log(&mut self, error: bool, text: String) {

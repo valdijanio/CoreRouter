@@ -882,6 +882,47 @@ ganho medido. O processo roda sem shell, com teto, prazo e grupo próprio (morto
 imagem de produção (sem systemd) só há kmsg, lido em Rust puro. Rever com o G4.8ba se o custo do
 processo aparecer nos números de um roteador de verdade.
 
+### Plano de controle PPPoE em vários núcleos (G4.3g)
+
+**Divisão entre workers:**
+
+- Cada worker tem um `Bng` próprio: servidores, sessões, timers e perguntas ao RADIUS.
+- A tabela ativa, o histórico e os pools ficam compartilhados.
+- Num servidor, o SESSION_ID é repartido por faixa (`sid_lane`), sem lock.
+
+**Recepção: o kernel entrega cada quadro direto ao worker dono.** Cada worker abre os próprios
+sockets AF_PACKET em cada porta, com um filtro BPF clássico que guarda só os clientes dele:
+
+- o filtro faz um hash multiplicativo dos bytes 2..6 do MAC de origem (`ld [8]`,
+  `mul #0x9E3779B1`, `rsh #16`, `mod #N`, `jeq #faixa`);
+- é instalado com `SO_ATTACH_FILTER`, pela API segura do socket2;
+- o MAC fica antes de qualquer tag VLAN, então o offset é o mesmo com ou sem VLAN.
+
+**O que foi comparado:**
+
+- **PACKET_FANOUT por MAC:** precisa do modo CBPF com `PACKET_FANOUT_DATA` (a `sock_fprog`
+  por setsockopt). O modo HASH usa o hash de fluxo L3/L4, que a descoberta PPPoE não tem.
+  - Nem o socket2 nem o nix 0.30 expõem essas opções. A macro `sockopt_impl!` do nix
+    expandiria `unsafe` no nosso crate, contra a regra.
+  - O crate `netring` (0.32, um autor) e o `afpacket` (licença MirOS) não passaram no
+    critério de dependência madura.
+- **Um leitor que distribui por canal** (a primeira versão) contra **um socket filtrado por
+  worker** (a atual): `tests/netns_pppoe_lanes.rs`, 200 mil PADIs num veth, CPU da thread
+  receptora mais ocupada por quadro (**medido**, release):
+
+  | workers | leitor + canal | socket próprio por worker |
+  |---|---:|---:|
+  | 1 | 600 ns | 550 ns |
+  | 2 | 550–650 ns | 350 ns |
+  | 4 | 800–1050 ns | 350 ns |
+  | 6 | 550–750 ns | 150 ns |
+
+  O leitor é um gargalo serial que não melhora com os workers. Na VM, ele ficou a 56% de um
+  núcleo com 54 mil sessões/s. O custo do filtro é N programas de ~8 instruções por quadro,
+  no softirq e antes da cópia.
+
+**Fica no leitor:** o caminho lento (`bng0`), distribuído pelo endereço do assinante.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

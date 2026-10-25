@@ -1052,3 +1052,17 @@ fn mass_reconnect_against_a_slow_radius() {
     assert!(timeouts * 20 < off.1.max(1), "auto spares the server: {timeouts} timeouts against {} with no limit", off.1);
     assert!(fixed.0.is_some_and(|f| f > t), "a fixed limit under the capacity is slower: {fixed:?}");
 }
+
+/// The kernel's filter (`hal_linux::pppoe_io::lane_of`, in each worker's
+/// socket) and the BNG's own count agree on every MAC.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_kernel_and_the_bng_agree_on_the_worker() {
+    for lanes in [1u16, 2, 3, 4, 6, 8] {
+        for i in 0..5000u32 {
+            let mut f = [0u8; 14];
+            f[6..12].copy_from_slice(&[0x02, (i >> 24) as u8, (i >> 16) as u8, (i >> 8) as u8, i as u8, (i * 7) as u8]);
+            assert_eq!(Bng::lane_of(&f, lanes), corerouter_hal_linux::pppoe_io::lane_of(&f, lanes));
+        }
+    }
+}
