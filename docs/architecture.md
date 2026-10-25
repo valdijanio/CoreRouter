@@ -867,6 +867,21 @@ drops) e dele mesmo (CPU, memória, conntrack), estilo RRDtool, em resolução d
   +168 KB por interface — gap G4.5b) ou milhares de interfaces (aí o anel de 1 h pode ficar só
   no disco e ser lido sob demanda).
 
+### Log do sistema operacional (G4.8b)
+
+O serviço `os-log` do daemon lê `/dev/kmsg` e o journal fora do lock da sessão e entrega as
+linhas em lote ao `OsLogBook` (ext do `Session`); `log.os.print` só lê o livro. `Hal::os_log`
+serve o laboratório (linhas inventadas, nunca bloqueia, roda sob o lock). Detalhes e pesquisa em
+`docs/os-log.md`.
+
+**Decisão: `journalctl` externo agora, leitor Rust depois (G4.8ba).** Comparado: o `journalctl
+-o json --after-cursor` custa ≤ 10 ms por chamada a cada 2 s num journal de 2,0 GB (**medido**),
+dá JSON estruturado com cursor, e o formato dos arquivos do journal é extenso (hash tables,
+compressão xz/lz4/zstd, arquivos em rotação) — escrever o leitor agora seria risco de bug sem
+ganho medido. O processo roda sem shell, com teto, prazo e grupo próprio (morto e colhido). Na
+imagem de produção (sem systemd) só há kmsg, lido em Rust puro. Rever com o G4.8ba se o custo do
+processo aparecer nos números de um roteador de verdade.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).

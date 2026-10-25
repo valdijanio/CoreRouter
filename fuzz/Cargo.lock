@@ -259,6 +259,7 @@ version = "0.0.0"
 dependencies = [
  "corerouter-control",
  "corerouter-engine",
+ "corerouter-hal",
  "corerouter-mcp",
  "corerouter-proto-radius",
  "libfuzzer-sys",
@@ -272,6 +273,7 @@ dependencies = [
  "corerouter-model",
  "ipnet",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

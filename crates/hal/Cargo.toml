@@ -13,6 +13,8 @@ corerouter-model.workspace = true
 corerouter-firewall.workspace = true
 ipnet.workspace = true
 serde.workspace = true
+# G4.8b (oslog.rs): `journalctl -o json` lines.
+serde_json.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
