@@ -112,7 +112,7 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
     let proto = Protocol::from(i32::from(protocol.to_be()));
     let sock = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
     sock.set_nonblocking(true)?;
-    let _ = sock.set_recv_buffer_size(RCVBUF);
+    crate::l2::rcvbuf(&sock, RCVBUF);
     sock.attach_filter(&filter(prog))?;
     bind(sock.as_raw_fd(), link).map_err(io_err)?;
     Ok(sock)
@@ -181,6 +181,20 @@ impl PppoePort {
 
     pub fn name(&self) -> &IfName {
         &self.name
+    }
+
+    /// The smallest receive buffer the kernel gave this port's sockets, and
+    /// the size asked for (`system.health.check` warns when short).
+    pub fn rcvbuf(&self) -> (usize, usize) {
+        use nix::sys::socket::{getsockopt, sockopt};
+        let got = self
+            .sides
+            .iter()
+            .filter_map(|s| getsockopt(&s.sock, sockopt::RcvBuf).ok())
+            .map(|v| v / 2)
+            .min()
+            .unwrap_or(0);
+        (got, RCVBUF)
     }
 
     pub fn ifindex(&self) -> u32 {
@@ -277,7 +291,7 @@ impl SlowPath {
         let proto = Protocol::from(i32::from(ETH_P_ALL.to_be()));
         let tap = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
         tap.set_nonblocking(true)?;
-        let _ = tap.set_recv_buffer_size(RCVBUF);
+        crate::l2::rcvbuf(&tap, RCVBUF);
         tap.attach_filter(&filter(&outgoing_only()))?;
         bind(tap.as_raw_fd(), &info.link).map_err(io_err)?;
         Ok(Self {

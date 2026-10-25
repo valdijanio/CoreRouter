@@ -11,7 +11,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cow::CowArc;
+use crate::ppp_secrets::Secrets;
 use crate::types::{IfName, ItemId, MacAddr, ParseError};
 
 /// Spread of the interim updates, % of the interval (RFC 5080 §2.2.1 asks
@@ -76,7 +76,7 @@ pub struct Ppp {
     /// Copy-on-write: a config of 100 k subscribers is not copied by every
     /// command that clones the config.
     #[serde(skip_serializing_if = "no_secrets")]
-    pub secrets: CowArc<Vec<PppSecret>>,
+    pub secrets: Secrets,
     /// `/interface pppoe-server server`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pppoe_servers: Vec<PppoeServer>,
@@ -85,7 +85,7 @@ pub struct Ppp {
     pub next_id: u32,
 }
 
-fn no_secrets(v: &CowArc<Vec<PppSecret>>) -> bool {
+fn no_secrets(v: &Secrets) -> bool {
     v.is_empty()
 }
 
@@ -547,6 +547,11 @@ pub struct PppoeServer {
     /// pool instead of a burst; 0 = no limit (Cisco `pppoe throttle`).
     #[serde(default = "rate_default")]
     pub new_session_rate: u32,
+    /// `new_session_rate=auto` (G4.3g): the rate follows the RADIUS
+    /// server's health (AIMD on its answer time and timeouts), from 1000/s
+    /// up to 20 000/s; `new_session_rate` is not used then. Not in RouterOS.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new_session_rate_auto: bool,
     /// `pado-delay` by load: from this many sessions, wait this long before
     /// the PADO (accel-ppp `pado-delay=0,100:100,200:5000`), so a loaded BNG
     /// lets a lighter one answer first. Added to `pado_delay`.
@@ -674,8 +679,9 @@ impl Ppp {
         out
     }
 
+    /// O(1): the list's name index (`crate::ppp_secrets`).
     pub fn secret(&self, name: &str) -> Option<&PppSecret> {
-        self.secrets.iter().find(|s| s.name == name)
+        self.secrets.by_name(name)
     }
 
     /// `profile` over `fallback` (the server's default profile) over the
@@ -875,6 +881,11 @@ pub struct ServiceStats {
     pub auth_reject: u64,
     pub throttled: u64,
     pub dataplane: bool,
+    /// `new_session_rate=auto`: the rate now (0: no server uses it) and why.
+    #[serde(default)]
+    pub admission_rate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }

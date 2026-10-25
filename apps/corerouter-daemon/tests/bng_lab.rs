@@ -790,7 +790,10 @@ struct Radius {
 }
 
 impl Radius {
-    fn start(users: usize, rate: &str) -> Self {
+    /// `capacity`: requests answered per second at most (0: as fast as it
+    /// can), the rest queued: a saturated MK-Auth/IXC-class server, whose
+    /// answer time grows with its queue.
+    fn start(users: usize, rate: &str, capacity: u32) -> Self {
         let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         let acct = UdpSocket::bind("127.0.0.1:0").unwrap();
         let auth = sock.local_addr().unwrap().port();
@@ -812,14 +815,32 @@ impl Radius {
                 .unwrap();
             let mut buf = [0u8; 4096];
             let t0 = Instant::now();
+            let mut queue: std::collections::VecDeque<(usize, std::net::SocketAddr, Vec<u8>)> =
+                std::collections::VecDeque::new();
+            let mut tokens = f64::from(capacity);
+            let mut at = Instant::now();
             while !stop2.load(Ordering::Relaxed) {
-                for s in [&sock, &acct] {
+                for (k, s) in [&sock, &acct].into_iter().enumerate() {
                     while let Ok((n, from)) = s.recv_from(&mut buf) {
-                        if let Some(r) =
-                            srv.handle(from, &buf[..n], t0.elapsed().as_millis() as u64)
-                        {
-                            let _ = s.send_to(&r.bytes, r.to);
+                        queue.push_back((k, from, buf[..n].to_vec()));
+                    }
+                }
+                if capacity > 0 {
+                    let dt = at.elapsed().as_secs_f64();
+                    at = Instant::now();
+                    tokens = (tokens + dt * f64::from(capacity)).min(f64::from(capacity) / 10.0);
+                }
+                while let Some((k, from, data)) = queue.front().cloned() {
+                    if capacity > 0 {
+                        if tokens < 1.0 {
+                            break;
                         }
+                        tokens -= 1.0;
+                    }
+                    queue.pop_front();
+                    let s = if k == 0 { &sock } else { &acct };
+                    if let Some(r) = srv.handle(from, &data, t0.elapsed().as_millis() as u64) {
+                        let _ = s.send_to(&r.bytes, r.to);
                     }
                 }
                 *stats2.lock().unwrap() = (srv.stats.accepts, srv.stats.accounting);
@@ -940,7 +961,7 @@ fn radius_policer(lab: &Lab, k: usize, s: &mut Summary) {
     let sc = |x: &str| format!("RADIUS {k} {x}");
     // RouterOS rate-limit, rx/tx from the router: upload 1M, download 2M.
     let (up, down) = (1_000_000.0, 2_000_000.0);
-    let rad = Radius::start(k, "1M/2M");
+    let rad = Radius::start(k, "1M/2M", 0);
     ok(
         "radius.add",
         json!({"address": "127.0.0.1", "authentication_port": rad.auth, "accounting_port": rad.acct, "service": "ppp", "secret": SECRET}),
@@ -1174,6 +1195,119 @@ fn radius_policer(lab: &Lab, k: usize, s: &mut Summary) {
     );
     wait_long("radius teardown", 60, || active() == 0);
     ok("ppp.aaa.set", json!({"use_radius": false}));
+    for r in ok("radius.list", json!({}))
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        ok("radius.remove", json!({"id": r["id"]}));
+    }
+}
+
+/// RADIUS timeouts and resends of the configured servers so far.
+fn radius_counts() -> (u64, u64) {
+    ok("radius.monitor", json!({}))
+        .as_array()
+        .into_iter()
+        .flatten()
+        .fold((0, 0), |(t, r), m| {
+            (
+                t + m["timeouts"].as_u64().unwrap_or(0),
+                r + m["resends"].as_u64().unwrap_or(0),
+            )
+        })
+}
+
+/// The mass reconnect against a RADIUS server that answers at most
+/// `capacity` requests a second (G4.3g): every CPE at once, with
+/// `new_session_rate` off, fixed at 2000 and `auto`. Off buries the
+/// server in retransmissions; fixed above its capacity fills its queue
+/// past the timeout; auto should follow it.
+fn radius_wave(lab: &Lab, n: usize, capacity: u32, s: &mut Summary) {
+    let rad = Radius::start(n, "10M/20M", capacity);
+    ok(
+        "radius.add",
+        json!({"address": "127.0.0.1", "authentication_port": rad.auth, "accounting_port": rad.acct, "service": "ppp", "secret": SECRET}),
+    );
+    ok(
+        "ppp.aaa.set",
+        json!({"use_radius": true, "interim_update": 0}),
+    );
+    let sc = format!("onda {}k RADIUS {capacity}/s", n / 1000);
+    for (mode, rate) in [
+        ("desligado", json!(0)),
+        ("fixo 2000", json!(2000)),
+        ("auto", json!("auto")),
+    ] {
+        for name in (0..lab.ports).map(|i| format!("pppoe-acc{i}")) {
+            ok(
+                "interface.pppoe-server.server.set",
+                json!({"id": name, "new_session_rate": rate, "padi_limit": 0, "mac_padi_limit": 0}),
+            );
+        }
+        // The service reads the config once a second.
+        std::thread::sleep(Duration::from_millis(1500));
+        let (t0, r0) = radius_counts();
+        let mut cfg = blaster_config(n, "rad", 0.0, None);
+        // Every CPE at once, as after a power cut: BNG Blaster's own pacing
+        // out of the way.
+        cfg["sessions"]["max-outstanding"] = json!(n.min(60_000));
+        cfg["sessions"]["start-rate"] = json!(50_000);
+        cfg["session-traffic"] = json!({"autostart": false, "ipv4-pps": 0});
+        let tag = mode.replace(' ', "-");
+        let bl = Blaster::start(lab, &format!("wave-{tag}"), &cfg, &[]);
+        let limit = 120 + n as u64 / 200;
+        let mut peak = 0u64;
+        let t = Instant::now();
+        let took = wait_long("the wave", limit, || {
+            let m = ok("interface.pppoe-server.monitor", json!({}));
+            peak = peak.max(m["admission_rate"].as_u64().unwrap_or(0));
+            bl.established() as usize >= n
+        });
+        let (t1, r1) = radius_counts();
+        let note = format!(
+            "timeouts do RADIUS {}, retransmissões {}{}",
+            t1 - t0,
+            r1 - r0,
+            if mode == "auto" {
+                format!(", pico do limite {peak}/s")
+            } else {
+                String::new()
+            }
+        );
+        match took {
+            Some(secs) => s.put(
+                &sc,
+                &format!("{mode}: todas no ar"),
+                secs,
+                "s",
+                &format!("{:.0} sessões/s; {note}", n as f64 / secs),
+            ),
+            None => s.put(
+                &sc,
+                &format!("{mode}: no ar (incompleto)"),
+                bl.established() as f64,
+                "sessões",
+                &format!("de {n} em {limit} s; {note}"),
+            ),
+        }
+        s.check(
+            &format!("{sc} {mode} completa"),
+            took.is_some(),
+            format!("{:.0} s", t.elapsed().as_secs_f64()),
+        );
+        let _ = bl.stop(120 + n as u64 / 500);
+        wait_long("wave teardown", 180, || active() == 0);
+    }
+    ok("ppp.aaa.set", json!({"use_radius": false}));
+    for r in ok("radius.list", json!({}))
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        ok("radius.remove", json!({"id": r["id"]}));
+    }
+    drop(rad);
 }
 
 /// A short run of one subscriber with BNG Blaster's capture, for the
@@ -1464,6 +1598,10 @@ fn bng_lab() {
     }
     if want("radius") {
         radius_policer(&lab, k, &mut s);
+    }
+    if want("wave") {
+        let n = env_or("BNG_LAB_WAVE", 100_000usize).min(max);
+        radius_wave(&lab, n, env_or("BNG_LAB_RADIUS_CAP", 3000u32), &mut s);
     }
     if root && want("pppd") {
         pppd(&lab, &mut s);

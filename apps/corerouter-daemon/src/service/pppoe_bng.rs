@@ -23,11 +23,10 @@ use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
 use corerouter_model::MacAddr;
-use corerouter_model::cow::CowArc;
 use corerouter_model::ip_pool::IpPools;
 use corerouter_model::ppp::{
-    ActiveSession, AddrOrPool, Effective, HistoryEntry, Ppp, PppAuth, PppHook, PppSecret,
-    PppService, PppoeServer, ServiceStats, Stage, Why,
+    ActiveSession, AddrOrPool, Effective, HistoryEntry, Ppp, PppAuth, PppHook, PppService,
+    PppoeServer, ServiceStats, Stage, Why,
 };
 use corerouter_model::radius::{
     AaaService, AcctCounters, AcctRequest, AcctStatus, Attribute, AuthOutcome, AuthReply,
@@ -49,8 +48,11 @@ use corerouter_proto_radius::rate_limit::RateLimit;
 /// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
 /// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
 pub(crate) const HISTORY: usize = 50_000;
-/// Users and MACs `ppp.why` remembers.
-pub(crate) const WHY_KEYS: usize = 100_000;
+/// Users and MACs `ppp.why` remembers: two per session the data plane
+/// holds. Past it the oldest goes (a flood of MACs pushes out only what
+/// nobody used since; G4.3g: clearing everything at 100 000 forgot every
+/// subscriber each 50 000 logins).
+pub(crate) const WHY_KEYS: usize = 2 * XDP_SLOTS as usize;
 /// Slots of the XDP session map (`dataplane-ebpf-common::pppoe::SESSIONS_MAX`).
 pub(crate) const XDP_SLOTS: u32 = 1 << 17;
 /// A subscriber's address-list entry is made again this often (dynamic
@@ -101,6 +103,8 @@ const STAGES: [Stage; 6] = [
 /// subscriber that is up is in the active table).
 #[derive(Debug, Clone, Default)]
 struct Track {
+    /// When it was last used ([`Shared::why_seq`]): what eviction looks at.
+    seq: u64,
     attempts: [u32; 6],
     last_stage: Option<Stage>,
     last: Option<Box<HistoryEntry>>,
@@ -116,6 +120,12 @@ pub(crate) struct Shared {
     pub active: BTreeMap<String, ActiveSession>,
     pub history: VecDeque<HistoryEntry>,
     why: HashMap<String, Track>,
+    /// Keys in the order they were used (a key used again is pushed again;
+    /// the old place is skipped when popped): the oldest is evicted first.
+    why_order: VecDeque<(String, u64)>,
+    why_seq: u64,
+    /// [`WHY_KEYS`] unless a test sets it.
+    why_cap: usize,
     pub stats: ServiceStats,
     /// `ppp.active.remove` and Disconnect-Requests, for the next round.
     pub terminate: Vec<String>,
@@ -130,11 +140,33 @@ pub(crate) struct Shared {
 
 impl Shared {
     fn track(&mut self, key: &str) -> Option<&mut Track> {
-        if !self.why.contains_key(key) && self.why.len() >= WHY_KEYS {
-            // Full: forget the lot rather than grow (a flood of MACs).
-            self.why.clear();
+        let cap = if self.why_cap == 0 {
+            WHY_KEYS
+        } else {
+            self.why_cap
+        };
+        self.why_seq += 1;
+        let seq = self.why_seq;
+        if !self.why.contains_key(key) {
+            while self.why.len() >= cap {
+                let Some((old, at)) = self.why_order.pop_front() else {
+                    break;
+                };
+                if self.why.get(&old).is_some_and(|t| t.seq == at) {
+                    self.why.remove(&old);
+                }
+            }
         }
-        Some(self.why.entry(key.to_owned()).or_default())
+        self.why_order.push_back((key.to_owned(), seq));
+        if self.why_order.len() > 2 * cap + 1024 {
+            // Mostly places of keys used again since: drop them.
+            let why = &self.why;
+            self.why_order
+                .retain(|(k, at)| why.get(k).is_some_and(|t| t.seq == *at));
+        }
+        let t = self.why.entry(key.to_owned()).or_default();
+        t.seq = seq;
+        Some(t)
     }
 
     fn reach(&mut self, keys: &[&str], stage: Stage) {
@@ -172,6 +204,40 @@ pub(crate) struct Backend(pub Arc<Mutex<Shared>>);
 impl PppBackend for Backend {
     fn active(&self) -> Vec<ActiveSession> {
         guard(&self.0).active.values().cloned().collect()
+    }
+
+    fn active_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let sh = guard(&self.0);
+        let mut hits: Vec<&ActiveSession> = sh.active.values().filter(|a| keep(a)).collect();
+        let total = hits.len();
+        let order =
+            |a: &&ActiveSession, b: &&ActiveSession| a.name.cmp(&b.name).then(a.id.cmp(&b.id));
+        // The first `limit` without sorting the rest: O(n).
+        if limit > 0 && limit < hits.len() {
+            hits.select_nth_unstable_by(limit - 1, order);
+            hits.truncate(limit);
+        }
+        hits.truncate(limit);
+        hits.sort_by(order);
+        (total, hits.into_iter().cloned().collect())
+    }
+
+    fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
+        let sh = guard(&self.0);
+        let mut m = std::collections::BTreeMap::new();
+        for a in sh.active.values() {
+            match m.get_mut(&a.server) {
+                Some(n) => *n += 1,
+                None => {
+                    m.insert(a.server.clone(), 1);
+                }
+            }
+        }
+        m
     }
 
     fn terminate(&self, ids: &[String]) -> usize {
@@ -472,6 +538,92 @@ impl Bucket {
     }
 }
 
+impl Bucket {
+    /// A new rate for the same bucket (`new_session_rate=auto`): the
+    /// tokens saved so far stay, capped at the new size.
+    fn set_rate(&mut self, rate: u32) {
+        self.rate = rate;
+        self.tokens = self.tokens.min(f64::from(rate.max(1)));
+    }
+}
+
+/// `new_session_rate=auto` (G4.3g): the session rate follows the RADIUS
+/// server's health, AIMD like TCP's window. It grows while answers come
+/// fast and the limit is what holds the wave back, and halves when they
+/// slow down or time out. A MK-Auth/IXC-class server is the usual
+/// bottleneck of a mass reconnect: a fixed number either buries it or
+/// keeps the CPEs waiting for nothing.
+pub(crate) const AUTO_START: f64 = 1000.0;
+pub(crate) const AUTO_MIN: f64 = 50.0;
+/// The ceiling: what one BNG thread sets up (lab: ~10 000/s), doubled.
+pub(crate) const AUTO_MAX: f64 = 20_000.0;
+/// The second's p90 answer slower than this halves the rate…
+const AUTO_SLOW_MS: u64 = 300;
+/// …and faster than this lets it grow, by this much a second.
+const AUTO_FAST_MS: u64 = 100;
+const AUTO_STEP: f64 = 500.0;
+/// Answers kept for the second's percentile.
+const AUTO_SAMPLES: usize = 4096;
+
+pub(crate) struct Admission {
+    pub rate: f64,
+    pub reason: String,
+    latencies: Vec<u64>,
+    timeouts: u32,
+    held_before: u64,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            rate: AUTO_START,
+            reason: "início".into(),
+            latencies: Vec::new(),
+            timeouts: 0,
+            held_before: 0,
+        }
+    }
+}
+
+impl Admission {
+    /// One RADIUS answer: its round trip, or that it never came.
+    fn answer(&mut self, ms: u64, timeout: bool) {
+        if timeout {
+            self.timeouts = self.timeouts.saturating_add(1);
+        } else if self.latencies.len() < AUTO_SAMPLES {
+            self.latencies.push(ms);
+        }
+    }
+
+    /// Once a second. `held`: sessions the limit has held back so far.
+    fn second(&mut self, held: u64) {
+        let waiting = held > self.held_before;
+        self.held_before = held;
+        self.latencies.sort_unstable();
+        let p90 = self
+            .latencies
+            .get(self.latencies.len().saturating_mul(9) / 10)
+            .copied();
+        if self.timeouts > 0 {
+            self.rate = (self.rate / 2.0).max(AUTO_MIN);
+            self.reason = format!("RADIUS sem resposta: {} timeouts", self.timeouts);
+        } else if let Some(ms) = p90.filter(|ms| *ms > AUTO_SLOW_MS) {
+            self.rate = (self.rate / 2.0).max(AUTO_MIN);
+            self.reason = format!("RADIUS lento: {ms} ms");
+        } else if waiting && p90.is_none_or(|ms| ms <= AUTO_FAST_MS) {
+            self.rate = (self.rate + AUTO_STEP).min(AUTO_MAX);
+            self.reason = match p90 {
+                Some(ms) => format!("subindo: RADIUS em {ms} ms"),
+                None => "subindo: sem RADIUS no caminho".into(),
+            };
+        } else if !waiting {
+            self.reason = "sem fila".into();
+        }
+        self.latencies.clear();
+        self.timeouts = 0;
+    }
+}
+
 /// A port the driver opened for a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PortInfo {
@@ -601,10 +753,6 @@ pub(crate) struct Bng {
     subs: HashMap<(usize, u16), Sub>,
     /// Kept with `subs` (every insert, remove and Up goes through it).
     index: SubIndex,
-    /// `/ppp secret` by name, for the list it was built from
-    /// (`Ppp::secret` walks the list: 100 000 secrets made a login cost
-    /// ~100 µs more for the last ones, G4.3g).
-    secrets: (CowArc<Vec<PppSecret>>, HashMap<String, usize>),
     pools: Pools,
     xdp_free: Vec<u32>,
     xdp_next: u32,
@@ -626,6 +774,8 @@ pub(crate) struct Bng {
     pub xdp: bool,
     /// PADIs held back by `new_session_rate`.
     padr_throttled: u64,
+    /// The rate of the servers with `new_session_rate=auto`.
+    pub admission: Admission,
 }
 
 /// One discovery or session frame's code and source, read before the
@@ -796,7 +946,6 @@ impl Bng {
             slots: Vec::new(),
             subs: HashMap::new(),
             index: SubIndex::default(),
-            secrets: (CowArc::default(), HashMap::new()),
             pools: Pools::default(),
             xdp_free: Vec::new(),
             xdp_next: 0,
@@ -814,6 +963,7 @@ impl Bng {
             out: ServerOutput::new(),
             xdp: false,
             padr_throttled: 0,
+            admission: Admission::default(),
         }
     }
 
@@ -841,15 +991,6 @@ impl Bng {
         ports: &HashMap<String, PortInfo>,
     ) {
         let wanted = Self::wanted(&snap.ppp);
-        if !CowArc::ptr_eq(&self.secrets.0, &snap.ppp.secrets) {
-            let mut by_name = HashMap::with_capacity(snap.ppp.secrets.len());
-            for (k, sec) in snap.ppp.secrets.iter().enumerate() {
-                // The first of a name wins, as `Ppp::secret` (the engine
-                // refuses duplicates anyway).
-                by_name.entry(sec.name.clone()).or_insert(k);
-            }
-            self.secrets = (snap.ppp.secrets.clone(), by_name);
-        }
         self.cfg = snap;
         // Servers gone or restarted: end their sessions.
         let mut keep: Vec<bool> = Vec::with_capacity(self.slots.len());
@@ -888,7 +1029,11 @@ impl Bng {
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
-                    if s.bucket.rate != w.new_session_rate {
+                    if w.new_session_rate_auto {
+                        // The tick moves it; switching to auto keeps the
+                        // tokens.
+                        s.bucket.set_rate(self.admission.rate as u32);
+                    } else if s.bucket.rate != w.new_session_rate || s.cfg.new_session_rate_auto {
                         s.bucket = Bucket::new(w.new_session_rate, now);
                     }
                     s.cfg = w;
@@ -900,8 +1045,13 @@ impl Bng {
                     }
                     let name = w.name.clone();
                     let interface = w.interface.to_string();
+                    let rate = if w.new_session_rate_auto {
+                        self.admission.rate as u32
+                    } else {
+                        w.new_session_rate
+                    };
                     self.slots.push(Slot {
-                        bucket: Bucket::new(w.new_session_rate, now),
+                        bucket: Bucket::new(rate, now),
                         server: Server::new(sc, seed, now),
                         port,
                         cfg: w,
@@ -1275,13 +1425,8 @@ impl Bng {
             self.index.remove((i, sref.sid), &old);
         }
         guard(&self.shared).reach(&[&user, &mac_text(mac)], Stage::Auth);
-        let secret = self
-            .secrets
-            .1
-            .get(&user)
-            .and_then(|&k| self.secrets.0.get(k))
-            .cloned();
-        match secret {
+        // O(1): the list's name index (`corerouter_model::ppp_secrets`).
+        match self.cfg.ppp.secret(&user).cloned() {
             Some(sec) if sec.disabled => self.reject(i, sref, "secret disabled"),
             Some(sec) => self.local(i, sref, req, &sec, &default_profile),
             None => match self.cfg.aaa.clone().filter(|_| self.cfg.ppp.aaa.use_radius) {
@@ -1488,6 +1633,11 @@ impl Bng {
     pub(crate) fn radius(&mut self, now: Millis) {
         while let Ok(done) = self.auth_rx.try_recv() {
             self.pending_auth = self.pending_auth.saturating_sub(1);
+            let late = now.saturating_sub(done.asked);
+            self.admission.answer(
+                late,
+                matches!(done.reply.outcome, AuthOutcome::Timeout) || late > RADIUS_GRACE_MS,
+            );
             let key = (done.slot, done.sref.sid);
             if self.subs.get(&key).is_none_or(|s| s.sref != done.sref)
                 || now.saturating_sub(done.asked) > RADIUS_GRACE_MS
@@ -1937,6 +2087,23 @@ impl Bng {
             .map(|s| s.server.stats().padi_limited)
             .sum();
         guard(&self.shared).stats.throttled = self.padr_throttled + limited;
+        // new_session_rate=auto: one AIMD step a second.
+        self.admission.second(self.padr_throttled);
+        let rate = self.admission.rate as u32;
+        let mut auto = false;
+        for s in self
+            .slots
+            .iter_mut()
+            .filter(|s| s.cfg.new_session_rate_auto)
+        {
+            s.bucket.set_rate(rate);
+            auto = true;
+        }
+        {
+            let mut sh = guard(&self.shared);
+            sh.stats.admission_rate = if auto { rate } else { 0 };
+            sh.stats.admission_reason = auto.then(|| self.admission.reason.clone());
+        }
         let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
         {
             let mut sh = guard(&self.shared);
@@ -2210,5 +2377,81 @@ fn xdp_session(
         down: r.as_ref().map(|r| rate_dir(r, false)).unwrap_or_default(),
         fast_up: false,
         fast_down: true,
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    // The bench includes this file with cfg(test) and no test harness.
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn why_evicts_the_least_recently_used_not_everything() {
+        let mut sh = Shared {
+            why_cap: 3,
+            ..Shared::default()
+        };
+        for k in ["a", "b", "c"] {
+            sh.reach(&[k], Stage::Padi);
+        }
+        sh.reach(&["a"], Stage::Auth);
+        sh.reach(&["d"], Stage::Padi);
+        let mut keys: Vec<&str> = sh.why.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["a", "c", "d"], "b was the oldest unused");
+        // A flood of new keys keeps the table at its size.
+        for i in 0..10_000 {
+            sh.reach(&[&format!("m{i}")], Stage::Padi);
+        }
+        assert_eq!(sh.why.len(), 3);
+        assert!(sh.why_order.len() <= 2 * 3 + 1024 + 1);
+        assert!(sh.why.contains_key("m9999"));
+    }
+
+    #[test]
+    fn auto_rate_follows_the_radius_server() {
+        let mut a = Admission::default();
+        let mut held = 0;
+        let mut second = |a: &mut Admission, ms: Option<u64>, timeout: bool, waiting: bool| {
+            if let Some(ms) = ms {
+                for _ in 0..100 {
+                    a.answer(ms, false);
+                }
+            }
+            if timeout {
+                a.answer(1100, true);
+            }
+            if waiting {
+                held += 10;
+            }
+            a.second(held);
+        };
+        // Fast answers and a queue: additive increase, up to the ceiling.
+        second(&mut a, Some(20), false, true);
+        assert_eq!(a.rate, AUTO_START + AUTO_STEP);
+        assert!(a.reason.contains("20 ms"), "{}", a.reason);
+        for _ in 0..100 {
+            second(&mut a, Some(20), false, true);
+        }
+        assert_eq!(a.rate, AUTO_MAX);
+        // Slow answers halve it, with the reason.
+        second(&mut a, Some(380), false, true);
+        assert_eq!(a.rate, AUTO_MAX / 2.0);
+        assert_eq!(a.reason, "RADIUS lento: 380 ms");
+        // A timeout halves it too; never below the floor.
+        for _ in 0..20 {
+            second(&mut a, None, true, true);
+        }
+        assert_eq!(a.rate, AUTO_MIN);
+        assert!(a.reason.starts_with("RADIUS sem resposta"), "{}", a.reason);
+        // No queue: it holds (no growth while nobody waits).
+        let r = a.rate;
+        second(&mut a, Some(20), false, false);
+        assert_eq!(a.rate, r);
+        assert_eq!(a.reason, "sem fila");
+        // Local secrets (no RADIUS answers) and a queue: it grows.
+        second(&mut a, None, false, true);
+        assert!(a.rate > r);
     }
 }

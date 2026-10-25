@@ -22,10 +22,10 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("interface.pppoe-server.server.add", "Add PPPoE Server", [], None,
-        "{interface: string, name?: string (default pppoe-<interface>), service_name?: string (empty: any), max_mtu?: int 64..1492 (default 1480), max_mru?: int 64..1492 (default 1480), mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string (default all four), keepalive_timeout?: int 1..3600 (s; disabled: no LCP echo) , one_session_per_host?: bool (default yes), max_sessions?: int 0..65534 (0: no limit), pado_delay?: int 0..30000 (ms), default_profile?: string (default default), pppoe_over_vlan_range?: string (100-115,120) | [string], accept_untagged?: bool (default yes), ac_cookie?: bool (default yes, RFC 2516 §9), padi_limit?: int (PADIs answered per second, default 2000; 0: none), mac_padi_limit?: int (per MAC per second, default 1; 0: none), new_session_rate?: int (sessions accepted per second, default 2000; 0: none), pado_delay_by_load?: string (sessions:ms,… as 5000:100,20000:300) | [string], disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{interface: string, name?: string (default pppoe-<interface>), service_name?: string (empty: any), max_mtu?: int 64..1492 (default 1480), max_mru?: int 64..1492 (default 1480), mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string (default all four), keepalive_timeout?: int 1..3600 (s; disabled: no LCP echo) , one_session_per_host?: bool (default yes), max_sessions?: int 0..65534 (0: no limit), pado_delay?: int 0..30000 (ms), default_profile?: string (default default), pppoe_over_vlan_range?: string (100-115,120) | [string], accept_untagged?: bool (default yes), ac_cookie?: bool (default yes, RFC 2516 §9), padi_limit?: int (PADIs answered per second, default 2000; 0: none), mac_padi_limit?: int (per MAC per second, default 1; 0: none), new_session_rate?: int | auto (sessions accepted per second, default 2000; 0: none; auto: follows the RADIUS server's health, 1000 up to 20000), pado_delay_by_load?: string (sessions:ms,… as 5000:100,20000:300) | [string], disabled?: bool, comment?: string} → {id, name, warnings}",
         always, add),
     cmd!("interface.pppoe-server.server.set", "Set PPPoE Server", [], None,
-        "{id: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: int 64..1492, max_mru?: int 64..1492, mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string, keepalive_timeout?: int 1..3600 | disabled, one_session_per_host?: bool, max_sessions?: int 0..65534, pado_delay?: int 0..30000, default_profile?: string, pppoe_over_vlan_range?: string | [string], accept_untagged?: bool, ac_cookie?: bool, padi_limit?: int, mac_padi_limit?: int, new_session_rate?: int, pado_delay_by_load?: string | [string], disabled?: bool, comment?: string, force?: bool (apply even if it drops active sessions)} → {id, name, warnings, dropped}",
+        "{id: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: int 64..1492, max_mru?: int 64..1492, mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string, keepalive_timeout?: int 1..3600 | disabled, one_session_per_host?: bool, max_sessions?: int 0..65534, pado_delay?: int 0..30000, default_profile?: string, pppoe_over_vlan_range?: string | [string], accept_untagged?: bool, ac_cookie?: bool, padi_limit?: int, mac_padi_limit?: int, new_session_rate?: int | auto, pado_delay_by_load?: string | [string], disabled?: bool, comment?: string, force?: bool (apply even if it drops active sessions)} → {id, name, warnings, dropped}",
         has_servers, set),
     cmd!("interface.pppoe-server.server.remove", "Remove PPPoE Server", [], None,
         "{id: *hex | name, force?: bool (remove even with sessions up)} → {id, name, dropped}",
@@ -36,13 +36,13 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{id: *hex | name, force?: bool (disable even with sessions up)} → {id, name, dropped}",
         has_servers, disable),
     cmd!(query "interface.pppoe-server.server.list", "PPPoE Servers", [], None,
-        "{} → [{id, name, interface, service_name?, max_mtu, max_mru, mrru, authentication, keepalive_timeout, one_session_per_host, max_sessions, pado_delay, default_profile, pppoe_over_vlan_range, accept_untagged, ac_cookie, padi_limit, mac_padi_limit, new_session_rate, pado_delay_by_load, disabled, comment?, flags (X disabled), sessions (up now), warnings}]",
+        "{} → [{id, name, interface, service_name?, max_mtu, max_mru, mrru, authentication, keepalive_timeout, one_session_per_host, max_sessions, pado_delay, default_profile, pppoe_over_vlan_range, accept_untagged, ac_cookie, padi_limit, mac_padi_limit, new_session_rate, pado_delay_by_load, disabled, comment?, flags (X disabled), sessions (up now), admission_rate? (new_session_rate=auto: the rate now), admission_reason?, warnings}]",
         always, list),
     cmd!(query "interface.pppoe-server.server.preview", "PPPoE Server Preview", [], None,
         "{id?: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: string, max_mru?: string, mrru?: string, authentication?: string, keepalive_timeout?: string, one_session_per_host?: bool, max_sessions?: string, pado_delay?: string, default_profile?: string, pppoe_over_vlan_range?: string, accept_untagged?: bool, ac_cookie?: bool, padi_limit?: string, mac_padi_limit?: string, new_session_rate?: string, pado_delay_by_load?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?}",
         always, preview),
     cmd!(query "interface.pppoe-server.monitor", "PPPoE Server Monitor", [], None,
-        "{} → {running, sessions, padi, pado, padr, pads, padt_rx, padt_tx, auth_accept, auth_reject, throttled, dataplane, last_error?}",
+        "{} → {running, sessions, padi, pado, padr, pads, padt_rx, padt_tx, auth_accept, auth_reject, throttled, dataplane, admission_rate (new_session_rate=auto now; 0: no server uses it), admission_reason?, last_error?}",
         always, monitor),
 ];
 
@@ -194,11 +194,21 @@ fn apply(s: &Session, v: &mut PppoeServer, p: &Value) -> Result<()> {
         }
         v.pado_delay = n;
     }
+    // `auto`: the rate follows the RADIUS server's health (G4.3g).
+    if p.get("new_session_rate").and_then(Value::as_str).is_some_and(|t| t.trim() == "auto") {
+        v.new_session_rate_auto = true;
+    } else if p.get("new_session_rate").is_some_and(|x| !x.is_null()) {
+        v.new_session_rate_auto = false;
+    }
+    let fixed_rate = (!v.new_session_rate_auto)
+        .then_some(("new_session_rate", &mut v.new_session_rate));
     for (key, slot) in [
         ("padi_limit", &mut v.padi_limit),
         ("mac_padi_limit", &mut v.mac_padi_limit),
-        ("new_session_rate", &mut v.new_session_rate),
-    ] {
+    ]
+    .into_iter()
+    .chain(fixed_rate)
+    {
         if let Some(n) = opt_u32(p, key)? {
             if n > 1_000_000 {
                 return Err(EngineError::bad(key, "0..=1000000 per second"));
@@ -367,7 +377,9 @@ fn disable(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
-    let active = s.ppp_active();
+    let backend = s.ppp_backend();
+    let counts = backend.as_ref().map(|b| b.sessions_by_server()).unwrap_or_default();
+    let stats = backend.as_ref().map(|b| b.stats());
     let servers = s.store().candidate().ppp.pppoe_servers.clone();
     let rows: Vec<Value> = servers
         .iter()
@@ -390,11 +402,11 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 "ac_cookie": v.ac_cookie,
                 "padi_limit": v.padi_limit,
                 "mac_padi_limit": v.mac_padi_limit,
-                "new_session_rate": v.new_session_rate,
+                "new_session_rate": if v.new_session_rate_auto { json!("auto") } else { json!(v.new_session_rate) },
                 "pado_delay_by_load": v.pado_delay_by_load.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
                 "disabled": v.disabled,
                 "flags": if v.disabled { "X" } else { "" },
-                "sessions": active.iter().filter(|a| a.server == v.name).count(),
+                "sessions": counts.get(&v.name).copied().unwrap_or(0),
                 "warnings": check(s, v).unwrap_or_default(),
             });
             if let Some(o) = row.as_object_mut() {
@@ -403,6 +415,15 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 }
                 if !v.comment.is_empty() {
                     o.insert("comment".into(), json!(v.comment));
+                }
+                // new_session_rate=auto: the rate now and why.
+                if v.new_session_rate_auto
+                    && let Some(st) = stats.as_ref().filter(|st| st.admission_rate > 0)
+                {
+                    o.insert("admission_rate".into(), json!(st.admission_rate));
+                    if let Some(r) = &st.admission_reason {
+                        o.insert("admission_reason".into(), json!(r));
+                    }
                 }
             }
             row
@@ -459,7 +480,7 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
 fn monitor(s: &mut Session, _: &Value) -> Result<Value> {
     let Some(b) = s.ppp_backend() else {
         return Ok(json!({"running": false, "sessions": 0, "padi": 0, "pado": 0, "padr": 0, "pads": 0,
-            "padt_rx": 0, "padt_tx": 0, "auth_accept": 0, "auth_reject": 0, "throttled": 0, "dataplane": false}));
+            "padt_rx": 0, "padt_tx": 0, "auth_accept": 0, "auth_reject": 0, "throttled": 0, "dataplane": false, "admission_rate": 0}));
     };
     let st = b.stats();
     let mut v = serde_json::to_value(&st).map_err(|e| EngineError::bad("stats", e.to_string()))?;
@@ -526,6 +547,28 @@ mod tests {
         assert!(s.store().running().ppp.pppoe_servers[0].disabled);
         s.execute("interface.pppoe-server.server.remove", &json!({"id": "pppoe-ether2"})).unwrap();
         assert!(s.store().running().ppp.pppoe_servers.is_empty());
+    }
+
+    #[test]
+    fn new_session_rate_auto_and_back() {
+        let mut s = Session::virtual_lab();
+        s.execute("interface.pppoe-server.server.add", &json!({"interface": "ether2", "new_session_rate": "auto"})).unwrap();
+        let row = &s.execute("interface.pppoe-server.server.list", &json!({})).unwrap()[0];
+        assert_eq!(row["new_session_rate"], "auto");
+        assert!(s.store().running().ppp.pppoe_servers[0].new_session_rate_auto);
+        // Other changes keep it.
+        s.execute("interface.pppoe-server.server.set", &json!({"id": "pppoe-ether2", "padi_limit": 500})).unwrap();
+        assert!(s.store().running().ppp.pppoe_servers[0].new_session_rate_auto);
+        // A number turns it off.
+        s.execute("interface.pppoe-server.server.set", &json!({"id": "pppoe-ether2", "new_session_rate": 300})).unwrap();
+        let v = &s.store().running().ppp.pppoe_servers[0];
+        assert_eq!((v.new_session_rate_auto, v.new_session_rate), (false, 300));
+        // Anything else is refused.
+        let e = s.execute("interface.pppoe-server.server.set", &json!({"id": "pppoe-ether2", "new_session_rate": "fast"})).unwrap_err();
+        assert!(e.to_string().contains("new_session_rate"), "{e}");
+        // The saved config keeps "auto" out when it is off.
+        let j = serde_json::to_value(&s.store().running().ppp.pppoe_servers[0]).unwrap();
+        assert!(j.get("new_session_rate_auto").is_none(), "{j}");
     }
 
     #[test]

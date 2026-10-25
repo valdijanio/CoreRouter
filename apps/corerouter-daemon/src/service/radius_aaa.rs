@@ -859,6 +859,28 @@ fn reader(
 }
 
 /// A UDP socket from `src` (or any address of `family`), in `vrf`.
+/// The smallest receive buffer a RADIUS socket got (bytes; 0: none opened).
+static RCVBUF_GOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(target_os = "linux")]
+fn note_rcvbuf(got: usize) {
+    use std::sync::atomic::Ordering;
+    if got > 0
+        && RCVBUF_GOT
+            .compare_exchange(0, got, Ordering::Relaxed, Ordering::Relaxed)
+            .is_err()
+    {
+        RCVBUF_GOT.fetch_min(got, Ordering::Relaxed);
+    }
+}
+
+/// (bytes the kernel gave, bytes asked for) of the RADIUS sockets, once
+/// one is open: `system.health.check` › Socket buffers.
+pub fn rcvbuf() -> Option<(usize, usize)> {
+    let got = RCVBUF_GOT.load(std::sync::atomic::Ordering::Relaxed);
+    (got > 0).then_some((got, RECV_BUFFER))
+}
+
 fn bind_udp(src: Option<IpAddr>, v4: bool, vrf: &str, port: u16) -> std::io::Result<UdpSocket> {
     let ip = src.unwrap_or(if v4 {
         IpAddr::V4(Ipv4Addr::UNSPECIFIED)
@@ -883,8 +905,12 @@ fn bind_udp(src: Option<IpAddr>, v4: bool, vrf: &str, port: u16) -> std::io::Res
         s.set_reuse_address(true)?;
     }
     // A burst of replies (thousands of logins after an outage) must not
-    // overflow the default ~200 KiB buffer: the kernel caps this at
-    // net.core.rmem_max (system.tuning raises it).
+    // overflow the default ~200 KiB buffer: forced past net.core.rmem_max
+    // with CAP_NET_ADMIN, else capped there (system.health.check warns,
+    // system.tuning raises it).
+    #[cfg(target_os = "linux")]
+    note_rcvbuf(corerouter_hal_linux::l2::rcvbuf(&s, RECV_BUFFER));
+    #[cfg(not(target_os = "linux"))]
     let _ = s.set_recv_buffer_size(RECV_BUFFER);
     s.bind(&addr.into())?;
     Ok(s.into())

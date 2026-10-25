@@ -28,6 +28,29 @@ pub trait PppBackend: Send + Sync {
     /// Where the logins of `name` (or of `mac`) get to.
     fn why(&self, name: Option<&str>, mac: Option<MacAddr>) -> Why;
     fn stats(&self) -> ServiceStats;
+    /// The sessions up that `keep` accepts, in (name, id) order: how many,
+    /// and the first `limit`. The backend walks its table in place and
+    /// copies only the page: with 100 000 up, a copy of all of them per GUI
+    /// refresh held the engine lock for ~50 ms (G4.3g).
+    fn active_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let mut all: Vec<ActiveSession> = self.active().into_iter().filter(|a| keep(a)).collect();
+        let total = all.len();
+        all.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        all.truncate(limit);
+        (total, all)
+    }
+    /// Sessions up per server name.
+    fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut m = std::collections::BTreeMap::new();
+        for a in self.active() {
+            *m.entry(a.server).or_insert(0) += 1;
+        }
+        m
+    }
     /// The login of the session holding `ip` now (the identity chip).
     fn who(&self, ip: std::net::Ipv4Addr) -> Option<String> {
         let _ = ip;

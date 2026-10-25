@@ -17,9 +17,9 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 use corerouter_model::ItemId;
-use corerouter_model::cow::CowArc;
 use corerouter_model::ip_pool::{IpPool, IpPools, PoolRange};
 use corerouter_model::ppp::{AddrOrPool, Ppp, PppProfile, PppSecret, PppoeServer};
+use corerouter_model::ppp_secrets::Secrets;
 use corerouter_proto_pppoe::client::{Client, ClientConfig, ClientEvent, ClientOutput};
 use corerouter_proto_pppoe::wire::Mac;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -36,7 +36,7 @@ fn snapshot(users: usize) -> Snapshot {
         rate_limit: Some("10M/50M".into()),
         ..PppProfile::default()
     });
-    ppp.secrets = CowArc::new(
+    ppp.secrets = Secrets::new(
         (0..users)
             .map(|i| PppSecret {
                 id: ItemId(2 + i as u32),

@@ -156,6 +156,17 @@ mod linux {
                 }
                 d.errors.clear();
                 let infos = d.open_ports(&wanted);
+                // system.health.check › Socket buffers: a PADI burst after
+                // an outage must fit.
+                {
+                    let mut s = lock(session);
+                    if let Some(t) = s.ext_mut::<corerouter_engine::health_check::SocketBuffers>() {
+                        t.sockets.retain(|k, _| !k.starts_with("pppoe "));
+                        for o in d.ports.values() {
+                            t.sockets.insert(format!("pppoe {}", o.port.name()), o.port.rcvbuf());
+                        }
+                    }
+                }
                 if !wanted.is_empty() {
                     let mut ifaces: Vec<_> = wanted.iter().map(|w| w.interface.clone()).collect();
                     ifaces.sort();

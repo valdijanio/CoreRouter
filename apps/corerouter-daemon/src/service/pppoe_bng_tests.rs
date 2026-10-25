@@ -71,7 +71,7 @@ fn ppp(users: usize, srv: PppoeServer) -> Ppp {
             ..PppSecret::default()
         })
         .collect();
-    p.secrets = corerouter_model::cow::CowArc::new(secrets);
+    p.secrets = corerouter_model::ppp_secrets::Secrets::new(secrets);
     p.pppoe_servers.push(srv);
     p
 }
@@ -390,7 +390,7 @@ fn only_one_caller_id_and_disabled_are_enforced() {
     let mut secrets: Vec<PppSecret> = s.ppp.secrets.to_vec();
     secrets[1].caller_id = Some(corerouter_model::MacAddr([9; 6]));
     secrets[2].disabled = true;
-    s.ppp.secrets = corerouter_model::cow::CowArc::new(secrets);
+    s.ppp.secrets = corerouter_model::ppp_secrets::Secrets::new(secrets);
     // Clients 0 and 3 are both u0.
     let mut lab = Lab::new(4, s, |i| if i == 3 { ("u0".into(), "p0".into()) } else { (format!("u{i}"), format!("p{i}")) });
     lab.start(0..1);

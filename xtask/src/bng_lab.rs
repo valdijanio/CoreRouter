@@ -9,7 +9,7 @@
 //!   outside the namespace is touched; it is deleted at the end.
 //!
 //! Options: `--root`, `--scales 1000,10000,100000`, `--radius <n>`,
-//! `--only capture,scale,radius,pppd`, `--out <dir>` (default
+//! `--only capture,scale,radius,wave,pppd`, `--wave <n>`, `--radius-cap <n/s>`, `--out <dir>` (default
 //! `<target>/bng-lab`). BNG Blaster comes from `$BNGBLASTER` or the PATH.
 
 use std::path::{Path, PathBuf};
@@ -46,6 +46,8 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
             "--radius" => value("BNG_LAB_RADIUS"),
             "--only" => value("BNG_LAB_ONLY"),
             "--hold" => value("BNG_LAB_HOLD"),
+            "--wave" => value("BNG_LAB_WAVE"),
+            "--radius-cap" => value("BNG_LAB_RADIUS_CAP"),
             "--blaster" => match it.next() {
                 Some(v) => {
                     blaster_arg = Some(PathBuf::from(v));
@@ -69,7 +71,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
             },
             other => Err(format!(
                 "unknown option {other}; cargo xtask bng-lab [--root] [--scales 1000,10000] \
-                 [--radius 100] [--only capture,scale,radius,pppd] [--hold 30] [--out dir] [--blaster path] [--target-dir dir]"
+                 [--radius 100] [--only capture,scale,radius,wave,pppd] [--hold 30] [--wave 100000] [--radius-cap 3000] [--out dir] [--blaster path] [--target-dir dir]"
             )),
         };
         if let Err(e) = r {

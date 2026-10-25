@@ -26,12 +26,54 @@ fn steps(n: usize) -> Value {
     Value::Array(steps)
 }
 
+/// G4.3g: a `/ppp secret` import (migrating subscribers from a RouterOS).
+fn secrets(n: usize) -> Value {
+    secrets_from(0, n)
+}
+
+fn secrets_from(base: usize, n: usize) -> Value {
+    let steps: Vec<Value> = (base..base + n)
+        .map(|i| {
+            json!({"command": "ppp.secret.add", "params": {
+                "name": format!("cliente{i}@isp"),
+                "password": format!("senha{i}"),
+            }})
+        })
+        .collect();
+    Value::Array(steps)
+}
+
 fn bench(c: &mut Criterion) {
+    // G4.3g: 100 000 secrets in batches of 10 000 (the batch limit) on one
+    // session. The steps cost the same; the commit at the end of each batch
+    // grows with the whole config.
+    let mut s = Session::virtual_lab();
+    let mut line = String::new();
+    for k in 0..10 {
+        let batch = secrets_from(k * 10_000, 10_000);
+        let t = std::time::Instant::now();
+        s.batch(&batch, true).unwrap();
+        line.push_str(&format!(" {:.1}", t.elapsed().as_secs_f64() * 100.0));
+    }
+    eprintln!("batch_import: ppp.secret.add µs per secret by batch of 10 000 (0 → 100 000):{line}");
     let mut g = c.benchmark_group("batch_import");
     g.sample_size(10).measurement_time(Duration::from_secs(5));
     for n in [1000usize, 4000] {
         let batch = steps(n);
         g.bench_with_input(BenchmarkId::new("address_list", n), &batch, |b, batch| {
+            b.iter_batched(
+                Session::virtual_lab,
+                |mut s| {
+                    s.batch(batch, true).unwrap();
+                    s
+                },
+                criterion::BatchSize::LargeInput,
+            );
+        });
+    }
+    for n in [1000usize, 10_000] {
+        let batch = secrets(n);
+        g.bench_with_input(BenchmarkId::new("ppp_secret", n), &batch, |b, batch| {
             b.iter_batched(
                 Session::virtual_lab,
                 |mut s| {
