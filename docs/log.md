@@ -3620,3 +3620,168 @@ continuação indentadas).
   100 mil linhas no anel e na tabela, e2e do daemon (lab e host), headless da GUI. Pesquisa em
   `docs/os-log.md`. Como testar: `cargo run -p corerouter-cli -- run log.os.print '{"level":"warning"}'`;
   `corerouter-daemon --control 7979 --os-log host` e na GUI System › OS Log.
+
+- 2026-10-25 — G0.26: Laboratório em VM com root para agentes: `cargo xtask vm-lab <create|up|down|status|ssh|sync|put|run|snapshot|reset|destroy>` (`xtask/src/vm_lab.rs`, `docs/vm-lab.md`). A VM `corerouter-lab` (libvirt `qemu:///system`, sem `sudo` no host) sobe de uma imagem Ubuntu 24.04 cloud baixada uma vez e conferida com o `SHA256SUMS` publicado, com overlay qcow2 fino de 20 GiB, 8 vCPUs e 16 GiB, CPU `host-model` (o `host-passthrough` expunha o CET do host e, depois de ~45 min, todo processo da VM caía por shadow stack, **medido**), `spec_rstack_overflow=off` no convidado (sem ele o SRSO "Safe RET" deixava a VM 3× mais lenta, **medido**), kernel HWE 7.0, pacotes de teste (clang, llvm, tcpdump, ppp, pppoe, ethtool, nftables…) e rustup em `/opt/rust`. Gerência na rede `default` NAT que já existia; enlaces de teste são pares de NICs virtio ligados por UDP no loopback do host (`wire0a` ↔ `wire0b`), sem bridge nem iptables novos. `run -- <cmd>` copia a worktree (rsync, sem `target*`/`.git`) e roda como root com cache de build por worktree, uma rodada por vez (trava na VM; `--shared` para só compilar), depois de um health-check que faz `reset` sozinho se a VM estiver quebrada. Testar: `cargo xtask vm-lab create`, depois `cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root`. Validado: os 13 testes do `xdp-root` passam na VM; `auto` vira `native` no `virtio_net` (`ip.firewall.xdp.interface.list` com `active: native`, `ip link` mostra `xdp`). Achado: o kernel 6.8 (Ubuntu 24.04 GA) recusa o programa XDP no verificador ("combined stack size of 3 calls is 544. Too large", **medido**); a VM usa o HWE 7.0.
+
+- 2026-10-25 — G4.3d: BNG, parte 2 (o serviço `pppoe` do daemon). O núcleo `service/pppoe_bng.rs` não faz E/S: recebe os
+  quadros e devolve quadros e efeitos. Ele faz quatro coisas:
+
+  - dirige um `proto_pppoe::Server` por `/interface pppoe-server server`;
+  - autentica pelo `/ppp secret` (caller-id, service, disabled, only-one, limit-bytes) ou pelo
+    RADIUS da G4.3j (Framed-IP-Address, Framed-Pool, Mikrotik-Rate-Limit, Mikrotik-Group,
+    Session-Timeout, Acct-Interim-Interval, MS-CHAP2-Success, Reply-Message);
+  - dá o endereço por um alocador próprio sobre o `/ip pool`, com `next_pool`;
+  - mantém o que `ppp.active`, `ppp.why` e `ppp.history` leem.
+
+  O driver `service/pppoe.rs` abre as portas de acesso por AF_PACKET (`hal-linux::pppoe_io`): um
+  socket por VLAN do `pppoe-over-vlan-range`, cada um com um filtro BPF clássico. Assim a tag que o
+  kernel tira volta sem `PACKET_AUXDATA` e sem `unsafe`. O driver nunca segura o lock da sessão na
+  rede.
+
+  **Plano de dados:**
+
+  - **Com XDP** nas portas (`ip.firewall.xdp`): cada sessão vai para o mapa da G4.3c pelos métodos
+    novos do `Hal` (`pppoe_dataplane`, `pppoe_apply`, `pppoe_counters`). O rate-limit vai em
+    termos do RouterOS para o policer, a descida com `F_FAST_DOWN` e os contadores alimentam os
+    interims.
+  - **Sem XDP:** o caminho lento carrega o IPv4: subida por socket raw com anti-spoofing, descida
+    por rotas /32 num dummy `bng0`.
+
+  **O resto do serviço:**
+
+  - Contabilização Start/Interim/Stop com Acct-Terminate-Cause (RFC 2866 §5.10).
+  - Dono de CoA/DM (RFC 5176): rate-limit ao vivo, Disconnect, Framed-IP = reconectar; atributo
+    não suportado dá NAK 401, valor ruim NAK 407.
+  - `idle_timeout` e `limit_bytes_*` pelos contadores; `address_list` como entrada dinâmica;
+    `on_up`/`on_down` como comandos.
+  - `new_session_rate` gasto no PADI: no PADR o AC-Cookie venceria durante o recuo do CPE.
+  - Logs em português (tópico novo `ppp`).
+  - `ppp.active.remove` aceita `server=` e listas grandes.
+  - **Sem O(n) por sessão**, achado e corrigido pela G4.3g no laboratório: um índice dos secrets
+    por nome (refeito quando a lista muda) e o `SubIndex` (por MAC, por endereço e por id, conferido
+    em `Bng::check()`). De 19 → 181 µs para 12–16 µs por sessão. O CI do lote chegava a 45
+    sessões/s com a busca linear.
+  - **O teste em namespace usa 2 mil sessões no CI** e 10 mil+ no laboratório
+    (`COREROUTER_PPPOE_E2E_SESSIONS`). Os prazos crescem com o tamanho, o limite da reconexão é
+    `n/10` por segundo e as verificações são as mesmas.
+  - **Os 226 s fixos da reconexão em massa** (achado pela G4.3e e pela fila) vinham do CPE simulado.
+    O cliente do `proto-pppoe` retransmitia o PADI com recuo determinístico (1, 2, 4, 8 s), então
+    10 mil CPEs reiniciados juntos tentavam em ondas sincronizadas a cada 8 s. O balde do
+    `new_session_rate` guarda 1 s de fichas: só passava `rate` por onda, e o keepalive de 60 s
+    derrubava parte das sessões velhas antes da troca. O cliente ganhou `discovery_jitter_pct`
+    (0 por padrão, como o pppd; ±25% no gerador de carga). Medido com 2 mil (200/s) e com 10 mil
+    (1000/s): 21 s nos dois casos, todas as sessões velhas trocadas (**medido**, debug, veth).
+
+  - `proto-pppoe`: `Server::reconfigure`, para mudanças que valem para sessões novas sem derrubar
+    as que existem.
+
+  **Como testar:**
+
+  ```sh
+  cargo test -p corerouter-daemon pppoe_bng
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- \
+      cargo test -p corerouter-daemon --test netns_pppoe -- --test-threads 1 --nocapture
+  ```
+
+  - `pppoe_bng`: 1, 100 e 10 mil sessões em memória, senha errada explicada pelo Why, pool
+    cheio, CoA, reconexão em massa de 2000 CPEs, only-one/caller-id/disabled, caminho lento,
+    RADIUS com Accounting.
+  - `netns_pppoe`: daemon real, veth, 1/100/10 mil sessões, ping ida e volta, terminate,
+    reconexão em massa de 10 mil, usuário RADIUS no servidor de teste.
+  - O mapa XDP fica no `xdp_root.rs` (`pppoe_bng_ops_reach_the_maps`, rodada com root).
+
+- 2026-10-25 — G4.3d: BNG, parte 3 (a janela PPP, `crates/ui/src/ppp.rs`). O grupo PPP fica no menu logo depois de
+  Interfaces, como no RouterOS, e a janela tem as abas do WinBox:
+
+  - **Interface:** o serviço de relance (rodando, plano de dados XDP ou caminho lento, sessões,
+    contadores do Discovery, segurados pelos limites).
+  - **PPPoE Servers**, **Secrets** e **Profiles**, no padrão de lista G0.24. O modal é alimentado
+    pelos comandos novos `interface.pppoe-server.server.preview`, `ppp.secret.preview` e
+    `ppp.profile.preview` (o `add`/`set` tentado no candidato e desfeito, com o que o login ou o
+    perfil recebe).
+  - **Active Connections:** selo de identidade, `R` do RADIUS, rate-limit em selo colorido por
+    chave, Rx/Tx, VLAN e Circuit ID; ações Disconnect, Torch (na porta de acesso, filtrando o
+    endereço) e Why?.
+  - **AAA** (`/ppp aaa`), **RADIUS** (abre a janela RADIUS) e **History** (filtros up/failed/ended).
+
+  O que mais a janela traz:
+
+  - **Why?** mostra as etapas PADI > PADR > LCP > Auth > NCP > Up com as tentativas, o motivo da
+    última queda em português e a Reply-Message do RADIUS.
+  - **Mudança que derruba sessões:** pela barra, o recusado "drops N active session(s)" vira uma
+    pergunta com "Aplicar mesmo assim" e "Entrar em Safe Mode"; no modal, é o `risk` da
+    pré-visualização.
+  - **ⓘ em toda aba, coluna e campo**, explicações em português (`i18n/auto/ppp_*.rs`, 95 chaves
+    conferidas por teste).
+
+  O serviço passa a contar as recusas locais em `auth_reject`. Testar:
+  `cargo test -p corerouter-ui tests::ppp`. As capturas foram feitas com o daemon e 43 CPEs reais
+  num namespace, a GUI em Xvfb.
+
+- 2026-10-25 — G4.3d: BNG, parte 4 (os extras aprovados):
+
+  - **Identidade e "Quem era?" do CGNAT com o login.** A fonte `pppoe` do `ip.identity.lookup`
+    (G0.25) responde pelo serviço: agora, pelas sessões ativas; num instante passado, pelo
+    histórico do serviço. Então CGNAT › Quem era? diz o login de quem tinha o endereço. Clicar no
+    selo abre PPP › Active Connections com a sessão selecionada.
+  - **Gráfico por assinante:** o serviço mede rx/tx em bits/s a cada segundo (`rx_bps`, `tx_bps`
+    no `ppp.active.list`). A tabela Active Connections ganha a coluna Traffic, um gráfico de linha
+    por sessão desde que a janela abriu. O histórico longo por assinante é a G4.3o.
+  - **Aviso de inadimplência por address-list.** O sistema de cobrança manda um CoA com
+    `Mikrotik-Address-List=inadimplentes`, e o endereço do assinante entra na lista na hora, sem
+    derrubar a sessão; um valor inválido responde NAK 407. A regra de dstnat para a página de aviso
+    é a receita de `docs/pppoe.md` §8.6. No login, o `Mikrotik-Address-List` do Access-Accept e o
+    `address_list` do perfil fazem o mesmo.
+  - **Address-list em massa sem travar:** cada `ip.firewall.address-list.add` dinâmico copiava
+    todas as entradas e rodava a checagem de perda de acesso, num processo `nft` por entrada, e cada
+    remoção reconstruía o índice. Com o `address_list` no perfil, 10 mil logins chegavam a só 300 em
+    5 min. Agora o serviço aplica as entradas de cada rodada de uma vez: `Session::ppp_address_lists`,
+    com `Hal::address_list_dynamic_many` (método novo com padrão; no Linux, um `nft` só) e
+    `DynamicLists::remove_many` (um reindex só). Resultado: 10 mil sessões em 6,9 s e reconexão em
+    massa de 10 mil em 18 s, em debug, com a address-list (**medido**).
+  - **Falha antes do login entra no Why? pelo MAC:** LCP que não fecha, tempo de setup, o CPE
+    recusando todos os métodos de autenticação (`auth-protocol`, com a dica certa).
+  - **Teste em namespace:** a entrada da address-list aparece com a sessão e sai com ela, e o selo
+    de identidade dá `pppoe`/`u0`.
+
+- 2026-10-25 — G4.3d: BNG: o teste de root `pppoe_bng_ops_reach_the_maps` (xdp_root.rs) passa a rodar no
+  `cargo xtask xdp-root`; antes ficava fora da lista e não rodava em lugar nenhum. Ele confere o
+  caminho do serviço `pppoe` até o mapa XDP: `pppoe_ready` recusa porta sem XDP, o `Upsert` com o
+  rate-limit do RouterOS no policer, os contadores e a remoção. Rodado com root na VM do G0.26 (XDP
+  nativo, 2026-10-25): passa sozinho em 0,6 s.
+
+  Achado na rodada completa da VM: o `pppoe_policer_accuracy` (G4.3c) às vezes deixa o namespace
+  `crxsub` inválido ("setting the network namespace failed: Invalid argument") na etapa de 10 mil
+  assinantes, e os testes seguintes que usam o `crxsub` caem em cascata. Isolado, ele passa (erro
+  máximo de −2,78% com 10 mil assinantes, **medido**).
+
+- 2026-10-25 — G4.3e: BNG dual-stack, parte a (codecs, sem mudança de comportamento no serviço). `proto-pppoe::nd`: o
+  IPv6 de um enlace PPP do lado do concentrador — link-local do IPv6CP (RFC 5072 §5), identificador
+  estável e opaco (RFC 8064 com o algoritmo da RFC 7217, fora dos reservados da RFC 5453), leitura
+  de RS/NS/Echo e DHCPv6 com as validações da RFC 4861 §6.1.1/§7.1.1 e o checksum da RFC 8200 §8.1,
+  o RA da sessão com PIO, MTU, RDNSS e DNSSL (RFC 8106) e os tempos do RA (RFC 4861 §6.2.4/§6.2.6).
+  O servidor do PPPoE ganha `ServerConfig::ipv6_iid_key`: com ela o IPv6CP usa e sugere
+  identificadores estáveis por linha (porta, VLANs, MAC), e `Server::set_ipv6` dá o `use-ipv6` do
+  perfil por sessão (`Off`: o IPv6CP do CPE recebe Protocol-Reject; `Require`: a falha do IPv6CP
+  derruba a sessão). A simulação de 100 mil sessões passa a ser dual-stack (IPv6CP em todas, com o
+  identificador sugerido pelo BNG, um por assinante). `proto-dhcp::sub6`: o DHCPv6 de uma sessão
+  (RFC 9915 §16 e §18.3: Solicit/Advertise, Rapid Commit, Request, Renew/Rebind com o que não é da
+  sessão zerado, Release, Decline, Confirm, Information-request; T1/T2 de §21.4), sem tabela nem
+  diário — o prefixo é da sessão. Pesquisa (MikroTik v7, accel-ppp, Junos, IOS-XE, TR-187, RFCs) em
+  `docs/pppoe.md` §9.
+
+  Testar: `cargo test -p corerouter-proto-pppoe nd` e `rfc8064`, `cargo test -p corerouter-proto-dhcp sub6`
+  (proptest de bytes hostis e mensagens mutadas), `cargo test -p corerouter-proto-pppoe --test fuzz`
+  (`nd_*`, `ra_built_from_any_config_reads_back`); alvo libFuzzer `nd` em `crates/proto-pppoe/fuzz`.
+
+- 2026-10-25 — processo: `AGENTS.md`: análise de desempenho e paralelismo passa a ser **obrigatória** em toda feature,
+  correção e revisão (pedido do usuário, 2026-10-25). O PR responde onde está o trabalho por item,
+  se ele cresce com o total, se várias threads ou núcleos ajudam e por quê, e mede quando houver
+  dúvida. Ganho mensurável em caminho quente entra no mesmo trabalho, e não como gap. A revisão
+  procura sempre:
+  - custo O(n) escondido;
+  - trabalho preso num núcleo;
+  - lock disputado;
+  - fila sem limite.
+
+  Origem: o laboratório do BNG (G4.3g) mostrou o plano de controle PPPoE num núcleo a 98%.

@@ -428,7 +428,16 @@ fn conntrack_flows_with_nat_reach_both_collectors() {
         .filter(|c| (7000..7010).contains(&c.orig.src_port))
         .collect();
     let t1 = Instant::now();
-    corerouter_hal_linux::ctnl::delete(&mine).unwrap();
+    // In blocks the collector keeps up with: the kernel sends a destroy
+    // event per connection, and 20 000 at once (0.2–0.3 s) overran the
+    // event socket on a busy CI runner. An unprivileged namespace cannot
+    // force its buffer past the host's `rmem_max` (~208 KiB), so 12% of the
+    // deletes were lost (`kernel_overruns`). What the test checks is that
+    // every connection is reported, not the kernel's burst rate.
+    for block in mine.chunks(1000) {
+        corerouter_hal_linux::ctnl::delete(block).unwrap();
+        std::thread::sleep(Duration::from_millis(40));
+    }
     let deleted = t1.elapsed();
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline

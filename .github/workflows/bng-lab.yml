@@ -1,0 +1,99 @@
+# G4.3g: the mass PPPoE lab (`cargo xtask bng-lab --root`) on the runner's
+# throwaway VM, by hand on a branch (Actions → bng-lab → Run workflow). BNG
+# Blaster is the official rtbrick 1.0.1 release for Ubuntu 24.04, checked by
+# its SHA-256 and unpacked with `dpkg-deb -x` (not installed). The runner has
+# 4 vCPUs: its numbers are "runner do CI", not the router's.
+# Actions pinned by SHA; the comment says the version.
+
+name: bng-lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      scales:
+        description: "Escalas (sessões, vírgulas)"
+        required: false
+        default: "1000,10000,100000"
+      only:
+        description: "Etapas (capture,scale,radius,workers,wave,pppd; vazio = todas)"
+        required: false
+        default: ""
+      wave:
+        description: "Sessões da onda contra o RADIUS lento"
+        required: false
+        default: "100000"
+      radius_cap:
+        description: "Respostas por segundo do RADIUS da onda"
+        required: false
+        default: "3000"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bng-lab-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  BNGBLASTER_DEB: bngblaster-1.0.1-ubuntu-24.04_amd64.deb
+  BNGBLASTER_URL: https://github.com/rtbrick/bngblaster/releases/download/1.0.1/bngblaster-1.0.1-ubuntu-24.04_amd64.deb
+  BNGBLASTER_SHA256: c51461c288db093e7112cb2c2a67755efe007822c99138701bb1f11c4f5a0faa
+
+jobs:
+  bng-lab:
+    name: bng-lab
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Dependências de sistema (pppd, tcpdump, bibliotecas do BNG Blaster)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ppp tcpdump libjansson4 libncurses6 libssl3
+
+      - name: BNG Blaster (release oficial, SHA-256 conferido)
+        run: |
+          mkdir -p "$RUNNER_TEMP/bngdl" "$RUNNER_TEMP/bngblaster"
+          curl -fsSL -o "$RUNNER_TEMP/bngdl/$BNGBLASTER_DEB" "$BNGBLASTER_URL"
+          echo "$BNGBLASTER_SHA256  $RUNNER_TEMP/bngdl/$BNGBLASTER_DEB" | sha256sum -c -
+          dpkg-deb -x "$RUNNER_TEMP/bngdl/$BNGBLASTER_DEB" "$RUNNER_TEMP/bngblaster"
+
+      - name: Toolchain (rust-toolchain.toml)
+        run: |
+          rustup toolchain install --no-self-update
+          rustup show
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: false
+
+      - name: cargo xtask bng-lab --root
+        env:
+          SCALES: ${{ inputs.scales }}
+          ONLY: ${{ inputs.only }}
+          WAVE: ${{ inputs.wave }}
+          RADIUS_CAP: ${{ inputs.radius_cap }}
+        run: |
+          sudo modprobe veth
+          only=()
+          if [ -n "$ONLY" ]; then only=(--only "$ONLY"); fi
+          cargo xtask bng-lab --root \
+            --blaster "$RUNNER_TEMP/bngblaster/usr/bin/bngblaster" \
+            --out "$RUNNER_TEMP/bng-lab" \
+            --scales "$SCALES" --radius 100 --wave "$WAVE" --radius-cap "$RADIUS_CAP" \
+            "${only[@]}"
+
+      - name: Resultado
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bng-lab
+          path: |
+            ${{ runner.temp }}/bng-lab/*.md
+            ${{ runner.temp }}/bng-lab/*.json
+            ${{ runner.temp }}/bng-lab/*.log
+            ${{ runner.temp }}/bng-lab/*.pcap
+          if-no-files-found: warn

@@ -4,7 +4,7 @@
 
 use super::{
     AuthMethod, AuthRequest, AuthVerdict, DownReason, Env, Event, HostKey, Ipv4Assignment,
-    ServerConfig, SessionKey, SessionRef,
+    Ipv6Mode, ServerConfig, SessionKey, SessionRef,
 };
 use crate::auth::{self, AUTH_STRING_LEN, ChapValue, MsChapResponse, PapRequest, code as ac};
 use crate::descriptor::{SessionDescriptor, vlan_field};
@@ -15,6 +15,7 @@ use crate::guard::Rng;
 use crate::layers::{Ipcp, Ipv6cp, Lcp, Role};
 use crate::lcp::{self, AuthProto, code as lc};
 use crate::ncp::NCP_MAX_CODE;
+use crate::nd::{IidRole, stable_iid};
 use crate::output::Output;
 use crate::ppp::{self, Link, SessionWriter, proto};
 use crate::timer::Millis;
@@ -99,6 +100,9 @@ pub(crate) struct Session {
     pub up: bool,
     v4_up: bool,
     v6_up: bool,
+    /// IPv6CP for this session (the profile's `use-ipv6`, set before the
+    /// Network phase).
+    pub v6_mode: Ipv6Mode,
     close_reason: Option<DownReason>,
     pub dead: Option<DownReason>,
     circuit_id: Option<Box<[u8]>>,
@@ -153,6 +157,19 @@ impl Session {
         if iid == [0; 8] {
             iid[7] = 1;
         }
+        let mut suggest = None;
+        if let Some(key) = &cfg.ipv6_iid_key {
+            iid = stable_iid(key, i.ifindex, i.vlans, i.client_mac, IidRole::Local);
+            suggest = Some(stable_iid(
+                key,
+                i.ifindex,
+                i.vlans,
+                i.client_mac,
+                IidRole::Peer,
+            ));
+        }
+        let mut v6_l = Ipv6cp::new(iid, rng.nonzero_u32());
+        v6_l.suggest = suggest;
         let link = Link {
             dst: i.client_mac,
             src: cfg.ac_mac,
@@ -173,7 +190,7 @@ impl Session {
             ipcp: Fsm::new(1),
             ipcp_l: Ipcp::server(cfg.local_ipv4),
             v6: Fsm::new(1),
-            v6_l: Ipv6cp::new(iid, rng.nonzero_u32()),
+            v6_l,
             auth: AuthState::default(),
             heard: false,
             echo_at: 0,
@@ -191,11 +208,20 @@ impl Session {
             up: false,
             v4_up: false,
             v6_up: false,
+            v6_mode: if cfg.ipv6 {
+                Ipv6Mode::On
+            } else {
+                Ipv6Mode::Off
+            },
             close_reason: None,
             dead: None,
             circuit_id: i.circuit_id,
             remote_id: i.remote_id,
         }
+    }
+
+    fn v6_on(&self) -> bool {
+        self.v6_mode != Ipv6Mode::Off
     }
 
     pub fn reference(&self) -> SessionRef {
@@ -408,7 +434,7 @@ impl Session {
                 }
             }
             proto::IPCP => self.ipcp_packet(env, info),
-            proto::IPV6CP if env.cfg.ipv6 => self.v6_packet(env, info),
+            proto::IPV6CP if self.v6_on() => self.v6_packet(env, info),
             // Data is the XDP path's; here it is only seen before Up.
             proto::IPV4 | proto::IPV6 => env.stats.ignored += 1,
             _ => {
@@ -738,7 +764,7 @@ impl Session {
             f.up(&mut c, l)
         });
         self.ncp_signals(env, false, s);
-        if env.cfg.ipv6 {
+        if self.v6_on() {
             let s = fsm!(self, env, v6, v6_l, |f, c, l| {
                 f.open(&mut c, l);
                 f.up(&mut c, l)
@@ -765,7 +791,7 @@ impl Session {
                 self.ipcp_stash = None;
                 let s = fsm!(self, env, ipcp, ipcp_l, |f, c, _l| f.close::<Ipcp>(&mut c));
                 self.ncp_signals(env, false, s);
-                if !env.cfg.ipv6 {
+                if !self.v6_on() {
                     self.close(env, DownReason::NcpFailed);
                 }
             }
@@ -860,7 +886,7 @@ impl Session {
                         | crate::fsm::State::Opened
                 )
             } else {
-                env.cfg.ipv6
+                self.v6_on()
                     && matches!(
                         self.v6.state(),
                         crate::fsm::State::ReqSent
@@ -869,7 +895,10 @@ impl Session {
                             | crate::fsm::State::Opened
                     )
             };
-            if !other_alive && self.phase == Phase::Network {
+            // `use-ipv6=require`: IPv6CP failing ends the session even with
+            // IPCP up.
+            let required = v6 && self.v6_mode == Ipv6Mode::Require;
+            if (!other_alive || required) && self.phase == Phase::Network {
                 self.close(env, DownReason::NcpFailed);
             }
         }

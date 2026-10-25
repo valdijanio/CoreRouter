@@ -4,6 +4,10 @@
 //! ends) in the in-memory lab. Under `cargo bench` it also prints the memory
 //! a session costs (RSS growth over 50 000 sessions, Linux).
 //!
+//! G4.3e adds the IPv6 control path of a session: sorting a Router
+//! Solicitation, building the session's RA (PIO, MTU, RDNSS, DNSSL) and the
+//! stable IPv6CP identifier (RFC 8064).
+//!
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-proto-pppoe --bench pppoe`.
 
 // A benchmark is test code: fixtures may unwrap (clippy.toml only covers #[test]).
@@ -89,6 +93,48 @@ fn codecs(c: &mut Criterion) {
             }
             n
         })
+    });
+    g.finish();
+}
+
+fn ipv6(c: &mut Criterion) {
+    use corerouter_proto_pppoe::nd;
+    use std::net::Ipv6Addr;
+    let mut g = c.benchmark_group("pppoe_ipv6");
+    g.throughput(Throughput::Elements(1));
+    let ours = nd::link_local([0x02, 0, 0, 0, 0, 0, 0, 1]);
+    let peer: Ipv6Addr = "fe80::1234:5678:9abc:def0".parse().unwrap();
+    let mut rs = Vec::new();
+    nd::router_solicit(&mut rs, peer);
+    g.bench_function("classify_rs", |b| b.iter(|| nd::classify(black_box(&rs))));
+    let cfg = nd::RaConfig {
+        other: true,
+        mtu: Some(1492),
+        prefixes: vec![nd::PrefixInfo {
+            prefix: "2001:db8:0:7::".parse().unwrap(),
+            len: 64,
+            on_link: true,
+            autonomous: true,
+            valid: 86_400,
+            preferred: 57_600,
+        }],
+        rdnss: vec![
+            "2001:db8::53".parse().unwrap(),
+            "2001:db8::54".parse().unwrap(),
+        ],
+        dnssl: vec!["isp.example".into()],
+        ..nd::RaConfig::default()
+    };
+    let mut out = Vec::with_capacity(256);
+    g.bench_function("build_ra", |b| {
+        b.iter(|| {
+            out.clear();
+            nd::router_advert(&mut out, ours, peer, black_box(&cfg));
+            out.len()
+        })
+    });
+    g.bench_function("stable_iid", |b| {
+        b.iter(|| nd::stable_iid(black_box(&[7; 32]), 3, Vlans::NONE, HOST, nd::IidRole::Peer))
     });
     g.finish();
 }
@@ -216,7 +262,7 @@ fn memory() {
     );
 }
 
-criterion_group!(benches, codecs, server, setup);
+criterion_group!(benches, codecs, ipv6, server, setup);
 
 fn main() {
     benches();
