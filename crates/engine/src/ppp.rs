@@ -100,30 +100,20 @@ impl PppBackend for Merged {
             .unwrap_or_default()
     }
 
+    /// The PPPoE service's own stats, whole (its discovery, IPv6, workers
+    /// and admission counters: new fields stay right without a change
+    /// here), plus what the IPoE half adds: its sessions, authorizations,
+    /// data plane and error.
     fn stats(&self) -> ServiceStats {
-        let mut t = ServiceStats::default();
-        for b in &self.0 {
-            let s = b.stats();
+        let mut parts = self.0.iter().map(|b| b.stats());
+        let mut t = parts.next().unwrap_or_default();
+        for s in parts {
             t.sessions += s.sessions;
-            t.padi += s.padi;
-            t.pado += s.pado;
-            t.padr += s.padr;
-            t.pads += s.pads;
-            t.padt_rx += s.padt_rx;
-            t.padt_tx += s.padt_tx;
             t.auth_accept += s.auth_accept;
             t.auth_reject += s.auth_reject;
-            t.throttled += s.throttled;
             t.dataplane |= s.dataplane;
             if t.last_error.is_none() {
                 t.last_error = s.last_error;
-            }
-            // Workers and admission are the PPPoE service's (the first
-            // backend; IPoE runs on the DHCP server's thread).
-            if t.workers == 0 {
-                t.workers = s.workers;
-                t.admission_rate = s.admission_rate;
-                t.admission_reason = s.admission_reason;
             }
         }
         t
@@ -386,7 +376,7 @@ mod merged_tests {
             Why::default()
         }
         fn stats(&self) -> ServiceStats {
-            ServiceStats { sessions: self.1.len() as u64, workers: self.2, ..ServiceStats::default() }
+            ServiceStats { sessions: self.1.len() as u64, workers: self.2, delegated: u64::from(self.2), ..ServiceStats::default() }
         }
     }
 
@@ -409,5 +399,7 @@ mod merged_tests {
         assert_eq!(by.get("dhcp1"), Some(&2));
         let st = m.stats();
         assert_eq!((st.sessions, st.workers), (5, 4));
+        // PPPoE's own counters (here `delegated`) come through whole.
+        assert_eq!(st.delegated, 4);
     }
 }
