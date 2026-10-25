@@ -34,9 +34,17 @@ pub struct ClientConfig {
     pub max_payload: Option<u16>,
     pub want_dns: bool,
     pub ipv6: bool,
+    /// Our IPv6CP identifier; `Some([0; 8])` asks the BNG for one (RFC 5072
+    /// §4.1), `None` = random.
+    pub ipv6_iid: Option<[u8; 8]>,
     /// First PADI/PADR retransmission (doubles up to 8×).
     pub discovery_timeout_ms: u64,
     pub discovery_attempts: u8,
+    /// Spread of each PADI/PADR retransmission, ± this % of the wait.
+    /// 0 (pppd, rp-pppoe) retransmits on the exact back-off; CPEs that
+    /// rebooted together then retry together, in waves. The load generator
+    /// uses some, as real CPEs differ in boot time and clock.
+    pub discovery_jitter_pct: u8,
     pub fsm: FsmConfig,
     /// LCP echo period once up (pppd `lcp-echo-interval`); 0 = off.
     pub keepalive_interval_ms: u64,
@@ -62,8 +70,10 @@ impl Default for ClientConfig {
             max_payload: None,
             want_dns: true,
             ipv6: false,
+            ipv6_iid: None,
             discovery_timeout_ms: 1000,
             discovery_attempts: 5,
+            discovery_jitter_pct: 0,
             fsm: FsmConfig::default(),
             keepalive_interval_ms: 10_000,
             keepalive_misses: 3,
@@ -209,6 +219,9 @@ impl Client {
         if iid == [0; 8] {
             iid[7] = 2;
         }
+        if let Some(i) = cfg.ipv6_iid {
+            iid = i;
+        }
         let v6seed = rng.nonzero_u32();
         Client {
             lcp: Fsm::new(rng.u32() as u8),
@@ -252,6 +265,15 @@ impl Client {
 
     pub fn ipv4(&self) -> Option<Ipv4Addr> {
         self.ipcp_l.local.filter(|a| !a.is_unspecified())
+    }
+
+    /// (our, the BNG's) IPv6CP interface identifiers once IPv6CP is
+    /// Opened: the link-local addresses of the session (RFC 5072 §5).
+    pub fn ipv6_iids(&self) -> Option<([u8; 8], [u8; 8])> {
+        if !self.v6.is_opened() {
+            return None;
+        }
+        Some((self.v6_l.local_iid, self.v6_l.peer_iid?))
     }
 
     pub fn config(&self) -> &ClientConfig {
@@ -321,7 +343,14 @@ impl Client {
 
     fn arm_discovery(&mut self, now: Millis) {
         self.attempts += 1;
-        self.disc_deadline = now + self.disc_timeout;
+        let pct = u64::from(self.cfg.discovery_jitter_pct.min(50));
+        let wait = if pct == 0 {
+            self.disc_timeout
+        } else {
+            let spread = u64::from(self.rng.u32()) % (2 * pct + 1);
+            self.disc_timeout * (100 - pct + spread) / 100
+        };
+        self.disc_deadline = now + wait.max(1);
         self.disc_timeout = (self.disc_timeout * 2).min(self.cfg.discovery_timeout_ms * 8);
     }
 
