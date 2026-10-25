@@ -78,5 +78,9 @@ harness = false
 name = "torch"
 harness = false
 
+[[bench]]
+name = "health"
+harness = false
+
 [lints]
 workspace = true
