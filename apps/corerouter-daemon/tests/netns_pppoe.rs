@@ -132,6 +132,9 @@ impl Cpes {
                 },
                 discovery_timeout_ms: 1000,
                 discovery_attempts: 30,
+                // CPEs that rebooted together still differ by a few hundred ms;
+                // without it every retry lands in the same 8 s wave.
+                discovery_jitter_pct: 25,
                 keepalive_interval_ms: 0,
                 ..ClientConfig::default()
             };
