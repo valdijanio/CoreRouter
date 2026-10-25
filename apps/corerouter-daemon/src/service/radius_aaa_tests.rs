@@ -544,3 +544,43 @@ fn a_reload_keeps_pending_requests() {
     assert_eq!(monitor(&r.aaa).servers[0].accepts, 1);
     let _: IpAddr = srv.auth.ip();
 }
+
+/// G4.3e: the IPv6 accounting attributes of the BNG go out as RFC 3162
+/// §2.2/§2.3 say and read back as the same text.
+#[test]
+fn rfc3162_prefix_and_interface_id_round_trip() {
+    let dict = corerouter_proto_radius::dict::Dictionary::builtin();
+    let mut l = AttrList::new();
+    for (name, value) in [
+        ("Delegated-IPv6-Prefix", "2001:db8:8800::/56"),
+        ("Framed-IPv6-Prefix", "2001:db8:0:5::/64"),
+        ("Framed-Interface-Id", "0x0211223344556677"),
+    ] {
+        radius_aaa::encode_attr(&dict, &mut l, &corerouter_model::radius::Attribute::new(name, value)).unwrap();
+    }
+    // /56 → 7 significant octets after reserved and length.
+    let first = l.iter().next().unwrap();
+    assert_eq!(first.value.len(), 2 + 7);
+    assert_eq!(&first.value[..2], &[0, 56]);
+    let back = radius_aaa::decode_list(&dict, &l);
+    let text: Vec<(String, String)> = back.into_iter().map(|a| (a.name, a.value)).collect();
+    assert!(
+        text.contains(&("Delegated-IPv6-Prefix".into(), "2001:db8:8800::/56".into())),
+        "{text:?}"
+    );
+    assert!(text.contains(&("Framed-IPv6-Prefix".into(), "2001:db8:0:5::/64".into())));
+    assert!(
+        text.contains(&("Framed-Interface-Id".into(), "0x0211223344556677".into())),
+        "{text:?}"
+    );
+    for bad in [
+        ("Framed-IPv6-Prefix", "2001:db8::"),
+        ("Framed-IPv6-Prefix", "2001:db8::/129"),
+        ("Framed-Interface-Id", "0x12"),
+    ] {
+        assert!(
+            radius_aaa::encode_attr(&dict, &mut l, &corerouter_model::radius::Attribute::new(bad.0, bad.1)).is_err(),
+            "{bad:?}"
+        );
+    }
+}

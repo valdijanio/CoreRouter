@@ -12,6 +12,9 @@
 #[path = "../src/service/pppoe_bng.rs"]
 #[allow(dead_code)]
 mod pppoe_bng;
+#[path = "../src/service/pppoe_bng6.rs"]
+#[allow(dead_code)]
+mod pppoe_bng6;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -70,6 +73,7 @@ fn snapshot(users: usize) -> Snapshot {
         pools,
         aaa: None,
         unix_base: 0,
+        ..Snapshot::default()
     }
 }
 

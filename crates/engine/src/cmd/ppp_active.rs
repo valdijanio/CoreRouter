@@ -14,7 +14,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ppp.active.list", "PPP Active Connections", [], None,
-        "{find?: string (in name, caller id, address or circuit id), server?: string, limit?: int 1..100000 (default 10000)} → {total, running (the pppoe service is up), rows: [{id, name, service, caller_id, address?, uptime, uptime_secs, session_id, server, interface, vlan?, circuit_id?, remote_id?, rate_limit?, profile, encoding, radius, rx_bytes, tx_bytes, rx_packets, tx_packets, mtu, limit_bytes_in?, limit_bytes_out?}]}",
+        "{find?: string (in name, caller id, address, IPv6 prefixes or circuit id), server?: string, limit?: int 1..100000 (default 10000)} → {total, running (the pppoe service is up), rows: [{id, name, service, caller_id, address?, uptime, uptime_secs, session_id, server, interface, vlan?, circuit_id?, remote_id?, rate_limit?, profile, encoding, radius, rx_bytes, tx_bytes, rx_packets, tx_packets, mtu, limit_bytes_in?, limit_bytes_out?, ipv6_prefix? (the link's /64, RA), delegated_prefix? (DHCPv6-PD), delegated_bound (held by the CPE's DHCPv6), link_local? (IPv6CP)}]}",
         always, list),
     cmd!("ppp.active.remove", "Disconnect PPP Session", [], None,
         "{id?: string | [string] (the session ids of ppp.active.list; at most 100000), name?: string (every session of this user), server?: string (every session of this PPPoE server)} → {removed}",
@@ -82,6 +82,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     || a.caller_id.to_lowercase().contains(n)
                     || a.address.is_some_and(|ip| ip.to_string().contains(n))
                     || a.circuit_id.as_deref().is_some_and(|c| c.to_lowercase().contains(n))
+                    || [a.ipv6_prefix, a.delegated_prefix].iter().flatten().any(|p| p.to_string().contains(n))
             })
     };
     let (total, page) = b.active_page(&keep, limit as usize);

@@ -322,6 +322,13 @@ pub fn session_of(p: &corerouter_hal::pppoe::PppoeSession) -> Session {
     if p.fast_down {
         flags |= pppoe::F_FAST_DOWN;
     }
+    if p.ipv6_prefix.is_some() {
+        flags |= F_IPV6;
+    }
+    if p.delegated.is_some() {
+        flags |= F_PD;
+    }
+    let (pd_prefix, pd_len) = p.delegated.unwrap_or(([0; 8], 0));
     Session {
         flags,
         ifindex: p.ifindex,
@@ -333,9 +340,11 @@ pub fn session_of(p: &corerouter_hal::pppoe::PppoeSession) -> Session {
         client_mac: p.client_mac,
         server_mac: p.server_mac,
         ipv4: p.ipv4.map_or([0; 4], |ip| ip.octets()),
+        ipv6_prefix: p.ipv6_prefix.unwrap_or([0; 8]),
+        pd_prefix,
+        pd_len,
         up: rate(&p.up),
         down: rate(&p.down),
-        ..Session::default()
     }
 }
 
@@ -443,6 +452,33 @@ mod tests {
         let keys = v6_keys(&sess());
         assert_eq!(keys.len(), 2);
         assert_eq!(keys[1].prefix_len(), 56);
+    }
+
+    /// G4.3e: the HAL's /64 and delegated prefix become the flags and the
+    /// LPM keys of the session.
+    #[test]
+    fn hal_ipv6_prefixes_reach_the_session_words() {
+        let h = corerouter_hal::pppoe::PppoeSession {
+            ifindex: 3,
+            sid: 9,
+            ipv6_prefix: Some([0x20, 1, 0xd, 0xb8, 0, 0, 0, 9]),
+            delegated: Some(([0x20, 1, 0xd, 0xb8, 0x80, 0, 9, 0], 56)),
+            ..corerouter_hal::pppoe::PppoeSession::default()
+        };
+        let s = session_of(&h);
+        assert_eq!(s.flags & (F_IPV4 | F_IPV6 | F_PD), F_IPV6 | F_PD);
+        assert_eq!(s.pd_len, 56);
+        let keys = v6_keys(&s);
+        assert_eq!(
+            keys.iter().map(|k| k.prefix_len()).collect::<Vec<_>>(),
+            vec![64, 56]
+        );
+        let none = session_of(&corerouter_hal::pppoe::PppoeSession {
+            ifindex: 3,
+            ..Default::default()
+        });
+        assert_eq!(none.flags & (F_IPV6 | F_PD), 0);
+        assert!(v6_keys(&none).is_empty());
     }
 
     /// The object has the PPPoE maps the loader drives.

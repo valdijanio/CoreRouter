@@ -50,7 +50,7 @@ fn only_keepalive_deaths(l: &Lab) {
 }
 
 #[test]
-fn hundred_thousand_sessions_reach_opened_on_a_lossy_network() {
+fn hundred_thousand_dual_stack_sessions_reach_opened_on_a_lossy_network() {
     let t = Instant::now();
     let n: usize = std::env::var("SIM_N")
         .ok()
@@ -66,6 +66,14 @@ fn hundred_thousand_sessions_reach_opened_on_a_lossy_network() {
             start_spread_ms: 20_000,
             auth_cycle: vec![AuthProto::Pap, AuthProto::ChapMd5],
             seed: 100_000,
+            // G4.3e: IPv6CP on every session, each asking the BNG for its
+            // identifier (stable and opaque, RFC 8064).
+            ipv6: true,
+            ipv6_zero_iid: true,
+            server: ServerConfig {
+                ipv6_iid_key: Some([0x43; 32]),
+                ..ServerConfig::default()
+            },
             trace: std::env::var("SIM_TRACE")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
@@ -97,6 +105,13 @@ fn hundred_thousand_sessions_reach_opened_on_a_lossy_network() {
     assert_eq!(l.server_sessions(), n);
     assert_eq!(l.up.len(), n);
     assert_eq!(l.leases(), n);
+    // Every session is dual-stack, and no two subscribers share a
+    // link-local identifier.
+    let iids: std::collections::HashSet<[u8; 8]> =
+        l.up.keys()
+            .filter_map(|k| l.servers[k.0].session(k.1)?.ipv6_iid)
+            .collect();
+    assert_eq!(iids.len(), n, "one IPv6CP identifier per session");
     only_keepalive_deaths(&l);
     l.check().unwrap();
     teardown(&mut l);
