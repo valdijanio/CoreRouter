@@ -57,3 +57,11 @@ path = "fuzz_targets/conversation.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "nd"
+path = "fuzz_targets/nd.rs"
+test = false
+doc = false
+bench = false
+

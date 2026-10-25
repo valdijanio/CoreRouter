@@ -48,6 +48,85 @@ fn ipv6cp_comes_up_with_ipcp() {
     let sid = *l.up.keys().next().unwrap();
     let d = l.servers[0].session(sid.1).unwrap();
     assert!(d.ipv6_iid.is_some() && d.ipv4.is_some(), "{d:?}");
+    // Both ends agree on the identifiers.
+    let c = l.clients.iter().find(|c| c.session_id() == sid.1).unwrap();
+    assert_eq!(
+        c.ipv6_iids(),
+        Some((d.ipv6_iid.unwrap(), d.local_iid.unwrap()))
+    );
+}
+
+#[test]
+fn rfc8064_ipv6cp_identifiers_are_stable_across_reconnects() {
+    // Two runs with other random seeds: the same lines get the same
+    // identifiers on both ends (the client asks with zero and takes the
+    // BNG's suggestion, RFC 5072 §4.1).
+    let run = |seed: u64| {
+        let mut l = lab(3, |c| {
+            c.ipv6 = true;
+            c.ipv6_zero_iid = true;
+            c.seed = seed;
+            c.server.ipv6_iid_key = Some([5; 32]);
+        });
+        l.run_until(10_000);
+        assert_eq!(l.clients_up(), 3);
+        let mut ids: Vec<_> =
+            l.up.keys()
+                .map(|k| {
+                    let d = l.servers[k.0].session(k.1).unwrap();
+                    (d.client_mac, d.ipv6_iid.unwrap(), d.local_iid.unwrap())
+                })
+                .collect();
+        ids.sort();
+        ids
+    };
+    let a = run(1);
+    assert_eq!(a, run(99));
+    for (_, peer, local) in &a {
+        assert_ne!(peer, local);
+        assert!(!crate::nd::is_reserved_iid(*peer));
+    }
+}
+
+#[test]
+fn use_ipv6_no_rejects_ipv6cp_and_keeps_ipv4() {
+    let mut l = lab(2, |c| {
+        c.ipv6 = true;
+        c.ipv6_mode = crate::server::Ipv6Mode::Off;
+        c.reconnect = false;
+    });
+    l.run_until(15_000);
+    assert_eq!(l.clients_up(), 2);
+    for k in l.up.keys() {
+        let d = l.servers[k.0].session(k.1).unwrap();
+        assert!(d.ipv4.is_some() && d.ipv6_iid.is_none(), "{d:?}");
+    }
+}
+
+#[test]
+fn use_ipv6_require_ends_a_session_without_ipv6cp() {
+    // The CPE does not speak IPv6CP (this client stays silent): our
+    // Configure-Requests run out (RFC 1661 §4.6 Max-Configure) and the
+    // session goes down although IPCP opened.
+    let mut l = lab(2, |c| {
+        c.server.ipv6 = true;
+        c.ipv6_mode = crate::server::Ipv6Mode::Require;
+        c.reconnect = false;
+    });
+    l.run_until(5_000);
+    assert_eq!(l.clients_up(), 2, "up on IPv4 while IPv6CP retries");
+    l.run_until(90_000);
+    assert_eq!(l.up.len(), 0);
+    assert!(
+        l.stats
+            .server_reasons
+            .get("NcpFailed")
+            .copied()
+            .unwrap_or(0)
+            >= 2,
+        "{:?}",
+        l.stats.server_reasons
+    );
 }
 
 #[test]
