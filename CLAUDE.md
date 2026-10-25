@@ -106,6 +106,29 @@ Decisões de desempenho se tomam com números, não com preferência.
     na aplicação em lote via netlink.
 - **Registre a decisão** em `docs/architecture.md`: o que foi comparado, os números e o porquê,
   para poder ser revista com dados depois.
+- **Paralelismo e desempenho são verificação obrigatória (pedido do usuário, 2026-10-25).**
+  Toda feature, correção ou revisão responde, no PR (seção `## Desempenho e paralelismo`):
+  - **onde está o trabalho por item** (pacote, sessão, regra, rota, linha de log) e se ele
+    cresce com o total (custo O(n) por item escondido);
+  - **se várias threads ou núcleos ajudam:**
+    - o que dá para dividir (por porta, fila, hash de MAC ou de fluxo, servidor, tabela);
+    - o que fica compartilhado e com que lock;
+    - se `SO_REUSEPORT`/`PACKET_FANOUT`, lotes ou estado por thread evitam o lock;
+  - **se não ajuda, por quê:** custo pequeno medido, ordem obrigatória, gargalo em outro lugar.
+
+  Na dúvida, **meça**: implemente as duas formas num benchmark ou no laboratório e fique com
+  a melhor, sem decidir por opinião. Ganho mensurável em caminho quente entra **no mesmo
+  trabalho**, não vira gap. Gap só para o que depende de hardware ou de outra feature, com o
+  motivo e o número.
+
+  Thread nova segue as regras de sempre:
+  - `thread::Builder` com nome;
+  - nunca segurar o lock do `Session` em E/S;
+  - callback entre threads só põe na fila;
+  - limites de fila com resposta "ocupado".
+
+  Exemplo de 2026-10-25: o laboratório do BNG mostrou o plano de controle PPPoE preso num
+  núcleo a 98% com os outros livres. Isso tinha que ter saído na implementação.
 
 ## Inegociáveis (cada um com o motivo e o que o impõe)
 
@@ -190,6 +213,13 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.
+- **Revisão** (de PR, `/code-review` ou auditoria): além de correção, a revisão procura **sempre**:
+  - custo que cresce com o total por item;
+  - trabalho serializado num núcleo que poderia ser dividido;
+  - lock disputado e alocação no caminho quente;
+  - fila sem limite.
+
+  Achado com ganho mensurável vira correção, com o número antes e depois.
 
 ## Integração: sempre por Pull Request, pela fila de entrada
 
