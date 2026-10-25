@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cow::CowArc;
+use crate::ppp_secrets::Secrets;
 use crate::types::{IfName, ItemId, MacAddr, ParseError};
 
 /// Spread of the interim updates, % of the interval (RFC 5080 §2.2.1 asks
@@ -120,16 +120,34 @@ pub struct Ppp {
     /// Copy-on-write: a config of 100 k subscribers is not copied by every
     /// command that clones the config.
     #[serde(skip_serializing_if = "no_secrets")]
-    pub secrets: CowArc<Vec<PppSecret>>,
+    pub secrets: Secrets,
     /// `/interface pppoe-server server`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pppoe_servers: Vec<PppoeServer>,
     /// Next id of the three tables (never reused).
     #[serde(skip_serializing_if = "is_zero")]
     pub next_id: u32,
+    /// Control-plane workers of the PPPoE service (G4.3g), one per core:
+    /// 0 = auto ([`pppoe_workers_auto`]). Read when the service starts.
+    #[serde(default, skip_serializing_if = "is_zero16")]
+    pub pppoe_workers: u16,
 }
 
-fn no_secrets(v: &CowArc<Vec<PppSecret>>) -> bool {
+fn is_zero16(v: &u16) -> bool {
+    *v == 0
+}
+
+/// Most workers the PPPoE service runs.
+pub const PPPOE_WORKERS_MAX: u16 = 64;
+
+/// `workers=auto` on a machine of `cpus` CPUs: all but two (the reader
+/// thread and the rest of the router, including the data plane's softirqs),
+/// at most 8 (past that the reader is the limit, measured in G4.3g).
+pub fn pppoe_workers_auto(cpus: usize) -> u16 {
+    u16::try_from(cpus.saturating_sub(2).clamp(1, 8)).unwrap_or(1)
+}
+
+fn no_secrets(v: &Secrets) -> bool {
     v.is_empty()
 }
 
@@ -613,6 +631,11 @@ pub struct PppoeServer {
     /// pool instead of a burst; 0 = no limit (Cisco `pppoe throttle`).
     #[serde(default = "rate_default")]
     pub new_session_rate: u32,
+    /// `new_session_rate=auto` (G4.3g): the rate follows the RADIUS
+    /// server's health (AIMD on its answer time and timeouts), from 1000/s
+    /// up to 20 000/s; `new_session_rate` is not used then. Not in RouterOS.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new_session_rate_auto: bool,
     /// `pado-delay` by load: from this many sessions, wait this long before
     /// the PADO (accel-ppp `pado-delay=0,100:100,200:5000`), so a loaded BNG
     /// lets a lighter one answer first. Added to `pado_delay`.
@@ -746,8 +769,9 @@ impl Ppp {
         out
     }
 
+    /// O(1): the list's name index (`crate::ppp_secrets`).
     pub fn secret(&self, name: &str) -> Option<&PppSecret> {
-        self.secrets.iter().find(|s| s.name == name)
+        self.secrets.by_name(name)
     }
 
     /// `profile` over `fallback` (the server's default profile) over the
@@ -970,6 +994,14 @@ pub struct ServiceStats {
     pub auth_reject: u64,
     pub throttled: u64,
     pub dataplane: bool,
+    /// Control-plane workers of the service (G4.3g; 1 = one thread).
+    #[serde(default)]
+    pub workers: u32,
+    /// `new_session_rate=auto`: the rate now (0: no server uses it) and why.
+    #[serde(default)]
+    pub admission_rate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
     /// G4.3e: sessions with IPv6CP up, delegated prefixes held by a
@@ -978,6 +1010,11 @@ pub struct ServiceStats {
     pub ipv6_sessions: u64,
     pub delegated: u64,
     pub ipv6_dropped: u64,
+    /// G4.3g: discovery and session frames lost before the BNG read them
+    /// (a socket's or a worker's queue full: a PADI burst bigger than the
+    /// service holds).
+    #[serde(default)]
+    pub rx_dropped: u64,
 }
 
 #[cfg(test)]

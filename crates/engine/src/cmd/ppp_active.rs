@@ -72,21 +72,22 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     if !(1..=100_000).contains(&limit) {
         return Err(EngineError::bad("limit", "1..=100000"));
     }
-    let running = s.ppp_backend().is_some();
-    let mut all = s.ppp_active();
-    all.retain(|a| server.as_deref().is_none_or(|v| a.server == v));
-    if let Some(n) = &needle {
-        all.retain(|a| {
-            a.name.to_lowercase().contains(n)
-                || a.caller_id.to_lowercase().contains(n)
-                || a.address.is_some_and(|ip| ip.to_string().contains(n))
-                || a.circuit_id.as_deref().is_some_and(|c| c.to_lowercase().contains(n))
-                || [a.ipv6_prefix, a.delegated_prefix].iter().flatten().any(|p| p.to_string().contains(n))
-        });
-    }
-    all.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
-    let rows: Vec<Value> = all.iter().take(limit as usize).map(row).collect();
-    Ok(json!({"total": all.len(), "running": running, "rows": rows}))
+    let Some(b) = s.ppp_backend() else {
+        return Ok(json!({"total": 0, "running": false, "rows": []}));
+    };
+    let keep = |a: &ActiveSession| {
+        server.as_deref().is_none_or(|v| a.server == v)
+            && needle.as_ref().is_none_or(|n| {
+                a.name.to_lowercase().contains(n)
+                    || a.caller_id.to_lowercase().contains(n)
+                    || a.address.is_some_and(|ip| ip.to_string().contains(n))
+                    || a.circuit_id.as_deref().is_some_and(|c| c.to_lowercase().contains(n))
+                    || [a.ipv6_prefix, a.delegated_prefix].iter().flatten().any(|p| p.to_string().contains(n))
+            })
+    };
+    let (total, page) = b.active_page(&keep, limit as usize);
+    let rows: Vec<Value> = page.iter().map(row).collect();
+    Ok(json!({"total": total, "running": true, "rows": rows}))
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {

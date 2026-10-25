@@ -326,6 +326,7 @@ fn every_explanation_exists_in_both_languages() {
         "ppp.secrets",
         "ppp.server.ac_cookie",
         "ppp.server.accept_untagged",
+        "ppp.server.admission",
         "ppp.server.authentication",
         "ppp.server.default_profile",
         "ppp.server.disabled",

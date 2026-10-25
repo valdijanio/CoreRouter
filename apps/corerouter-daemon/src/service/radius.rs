@@ -78,6 +78,12 @@ fn run(session: &Shared, aaa: &Aaa, inbox: &Arc<Inbox>, health: &super::Health) 
                 );
             }
         }
+        if let Some(b) = radius_aaa::rcvbuf() {
+            let mut s = lock(session);
+            if let Some(t) = s.ext_mut::<corerouter_engine::health_check::SocketBuffers>() {
+                t.sockets.insert("radius".into(), b);
+            }
+        }
         let st = corerouter_engine::radius::AaaBackend::status(aaa);
         match &st.incoming.last_error {
             Some(e) => health.error(e),

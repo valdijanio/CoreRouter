@@ -104,6 +104,15 @@ pub const CPU_POINTS: usize = 60;
 /// At least this many points before the CPU check judges (1 min).
 pub const CPU_MIN_POINTS: usize = 12;
 
+/// Receive buffers of the daemon's burst-prone sockets (RADIUS, the PPPoE
+/// access ports), as the services opened them: name → (bytes the kernel
+/// gave, bytes asked for). Short = `net.core.rmem_max` capped it and the
+/// daemon has no CAP_NET_ADMIN to pass it (G4.3g).
+#[derive(Debug, Default)]
+pub struct SocketBuffers {
+    pub sockets: BTreeMap<String, (usize, usize)>,
+}
+
 /// What the rules look at, gathered from the session.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Inputs {
@@ -133,6 +142,9 @@ pub struct Inputs {
     pub services: Option<Vec<(String, ServiceState)>>,
     /// (busiest CPU, its share of NET_RX %, CPUs, NET_RX/s).
     pub rss: Option<(usize, f64, usize, f64)>,
+    /// (socket, bytes given, bytes asked) of [`SocketBuffers`] (`None`:
+    /// no service reported one).
+    pub sockbuf: Option<Vec<(String, usize, usize)>>,
     /// Whether any reading exists at all.
     pub readings: bool,
 }
@@ -364,6 +376,27 @@ pub fn evaluate(i: &Inputs) -> Vec<Check> {
         Some(_) => push("rss", "RSS balance", Severity::Ok, None, "pouco tráfego ou poucas CPUs para julgar".into(), None),
         None => push("rss", "RSS balance", Severity::Unknown, None, no_data(), None),
     }
+
+    // Receive buffers of the sockets that take bursts.
+    match &i.sockbuf {
+        None => push("sockbuf", "Socket buffers", Severity::Unknown, None,
+            "nenhum serviço com rajada aberto (RADIUS, PPPoE)".into(), None),
+        Some(v) => {
+            let short: Vec<String> = v
+                .iter()
+                .filter(|(_, got, want)| got < want)
+                .map(|(n, got, want)| format!("{n} {} de {} KiB", got / 1024, want / 1024))
+                .collect();
+            if short.is_empty() {
+                push("sockbuf", "Socket buffers", Severity::Ok, None,
+                    format!("{} socket(s) com o buffer de recepção pedido", v.len()), None);
+            } else {
+                push("sockbuf", "Socket buffers", Severity::Warning, Some(short.join(", ")),
+                    format!("buffer de recepção menor que o pedido: {}", short.join(", ")),
+                    Some("Suba net.core.rmem_max (System › Tuning, recomendação sockbuf) ou rode o daemon com CAP_NET_ADMIN. Uma rajada depois de uma queda (respostas do RADIUS, PADIs de milhares de CPEs) transborda o buffer e vira retransmissão."));
+            }
+        }
+    }
     out
 }
 
@@ -462,6 +495,10 @@ impl Session {
         let ntp = &self.store().running().system.ntp_client;
         let enabled = ntp.enabled;
         i.ntp = Some((enabled, self.ext::<NtpStatus>().map(|s| s.status).unwrap_or_default()));
+        i.sockbuf = self
+            .ext::<SocketBuffers>()
+            .filter(|b| !b.sockets.is_empty())
+            .map(|b| b.sockets.iter().map(|(n, (g, w))| (n.clone(), *g, *w)).collect());
         i.services = self
             .ext::<ServiceTable>()
             .filter(|t| t.supervised)
@@ -539,13 +576,14 @@ mod tests {
             ntp: Some((true, NtpState::Synchronized)),
             services: Some(vec![("dns-resolver".into(), ServiceState::Running)]),
             rss: Some((0, 20.0, 8, 50_000.0)),
+            sockbuf: Some(vec![("radius".into(), 4 << 20, 4 << 20)]),
         }
     }
 
     #[test]
     fn healthy_is_all_ok() {
         let checks = evaluate(&healthy());
-        assert_eq!(checks.len(), 12);
+        assert_eq!(checks.len(), 13);
         for c in &checks {
             assert_eq!(c.severity, Severity::Ok, "{c:?}");
             assert!(c.action.is_none());
@@ -557,6 +595,8 @@ mod tests {
     fn every_rule_by_table() {
         let cases: &[Case] = &[
             ("cpu 85", |i| i.cpu_avg = Some((85.0, 60)), "cpu", Severity::Warning),
+            ("rmem_max caps the RADIUS socket", |i| i.sockbuf = Some(vec![("radius".into(), 212_992, 4 << 20)]), "sockbuf", Severity::Warning),
+            ("no burst socket open", |i| i.sockbuf = None, "sockbuf", Severity::Unknown),
             ("cpu 97", |i| i.cpu_avg = Some((97.0, 60)), "cpu", Severity::Error),
             ("cpu too little history", |i| i.cpu_avg = Some((99.0, 3)), "cpu", Severity::Unknown),
             ("psi some 15", |i| i.psi_some60 = Some(15.0), "memory.pressure", Severity::Warning),

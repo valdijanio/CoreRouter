@@ -584,3 +584,67 @@ fn rfc3162_prefix_and_interface_id_round_trip() {
         );
     }
 }
+
+/// G4.3g: a login called off (its session ended) leaves the client: no
+/// more retransmissions to a server that does not answer, and the caller
+/// hears of it at once instead of after every timeout.
+#[test]
+fn a_called_off_login_stops_being_retransmitted() {
+    let srv = TestRadius::start(3);
+    srv.srv.lock().unwrap().script.offline = true;
+    let mut e = srv.entry(1);
+    e.timeout = 1000;
+    let r = start(vec![e]);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let t = Instant::now();
+    r.aaa.authenticate_until(
+        AuthRequest::pap(AaaService::Ppp, "ana", "segredo"),
+        Box::new(move |x| tx.send(x).unwrap()),
+        cancel.clone(),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let x = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(x.outcome, AuthOutcome::Error, "{x:?}");
+    assert!(x.message.as_deref().unwrap_or("").contains("cancelled"), "{x:?}");
+    assert!(t.elapsed() < Duration::from_millis(1000), "before the first retransmission: {:?}", t.elapsed());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(monitor(&r.aaa).servers[0].resends, 0, "nothing sent again");
+    // Called off before it is even taken: never sent.
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, rx) = mpsc::channel();
+    r.aaa.authenticate_until(AuthRequest::pap(AaaService::Ppp, "bia", "x"), Box::new(move |x| tx.send(x).unwrap()), gone);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().outcome, AuthOutcome::Error);
+}
+
+/// G4.3g: while many logins wait for the server, an Accounting-Start
+/// waits behind them, and goes once they are answered, with the time it
+/// waited in Acct-Delay-Time (RFC 2866 §5.2).
+#[test]
+fn accounting_waits_behind_a_wave_of_logins() {
+    let srv = TestRadius::start(9);
+    srv.srv.lock().unwrap().script.delay_ms = 1500;
+    let r = start(vec![srv.entry(1)]);
+    let (tx, rx) = mpsc::channel();
+    for _ in 0..100 {
+        let tx = tx.clone();
+        r.aaa.authenticate(AuthRequest::pap(AaaService::Ppp, "ana", "segredo"), Box::new(move |x| tx.send(x).unwrap()));
+    }
+    // The next sweep sees the wave.
+    thread::sleep(Duration::from_millis(400));
+    r.aaa.account(acct(AcctStatus::Start, "S-W"), None).unwrap();
+    thread::sleep(Duration::from_millis(600));
+    assert!(srv.srv.lock().unwrap().accounting.is_empty(), "held while the logins wait");
+    for _ in 0..100 {
+        assert_eq!(rx.recv_timeout(Duration::from_secs(10)).unwrap().outcome, AuthOutcome::Accept);
+    }
+    let t = Instant::now();
+    while srv.srv.lock().unwrap().accounting.is_empty() {
+        assert!(t.elapsed() < Duration::from_secs(10), "released after the wave");
+        thread::sleep(Duration::from_millis(20));
+    }
+    let a = srv.srv.lock().unwrap().accounting[0].clone();
+    assert_eq!(a.session_id, "S-W");
+    assert!(a.delay_time >= 1, "Acct-Delay-Time counts the wait: {}", a.delay_time);
+}

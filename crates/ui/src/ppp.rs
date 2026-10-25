@@ -85,7 +85,7 @@ const SERVER_CMDS: Cmds = Cmds {
 const SECRET_CMDS: Cmds = Cmds { add: "ppp.secret.add", remove: "ppp.secret.remove", set: Some("ppp.secret.set"), what: "secrets" };
 const PROFILE_CMDS: Cmds = Cmds { add: "ppp.profile.add", remove: "ppp.profile.remove", set: Some("ppp.profile.set"), what: "profiles" };
 
-const SERVER_COLUMNS: [table::Column; 10] = [
+const SERVER_COLUMNS: [table::Column; 11] = [
     col("Name").help("ppp.server.name"),
     col("Interface").help("ppp.server.interface"),
     col("Service").help("ppp.server.service_name"),
@@ -94,6 +94,7 @@ const SERVER_COLUMNS: [table::Column; 10] = [
     num("Keepalive").help("ppp.server.keepalive_timeout"),
     col("VLANs").help("ppp.server.pppoe_over_vlan_range"),
     col("Profile").help("ppp.server.default_profile"),
+    col("New Sessions").help("ppp.server.admission"),
     num("Sessions").help("ppp.server.sessions"),
     comment(),
 ];
@@ -479,12 +480,33 @@ impl PppPanel {
                 text(r, "keepalive_timeout"),
                 if vlans.is_empty() { "untagged".into() } else { vlans },
                 text(r, "default_profile"),
+                Self::admission_cell(r),
                 n(r, "sessions").to_string(),
                 text(r, "comment"),
             ],
             dimmed: disabled,
             section: false,
             tint: None,
+        }
+    }
+
+    /// `new_session_rate`: the fixed rate, off, or `auto` with the rate now
+    /// and why (amber when the RADIUS server is what holds it down).
+    fn admission_cell(r: &Value) -> String {
+        match text(r, "new_session_rate").as_str() {
+            "auto" => {
+                let reason = text(r, "admission_reason");
+                let now = n(r, "admission_rate");
+                let label = if now > 0 { format!("auto {now}/s") } else { "auto".into() };
+                let kind = if reason.starts_with("RADIUS") { Kind::Amber } else { Kind::Neutral };
+                if reason.is_empty() {
+                    label
+                } else {
+                    chip::cell(&label, &[(reason.as_str(), kind)])
+                }
+            }
+            "0" => "off".into(),
+            rate => format!("{rate}/s"),
         }
     }
 
