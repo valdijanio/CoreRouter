@@ -98,8 +98,12 @@ pub struct ServerConfig {
     /// Our IPCP address (RouterOS profile `local-address`); `None` =
     /// unnumbered.
     pub local_ipv4: Option<Ipv4Addr>,
-    /// Run IPv6CP (interface ids only; prefixes are G4.3e).
+    /// Run IPv6CP (interface ids; the prefixes come from the service, G4.3e).
     pub ipv6: bool,
+    /// RFC 8064 / RFC 7217 secret: our IPv6CP identifier and the one we
+    /// suggest to a subscriber are stable per (port, VLANs, MAC) and opaque
+    /// (`nd::stable_iid`). `None` = random per session.
+    pub ipv6_iid_key: Option<[u8; 32]>,
     /// How long an authentication or address answer may take (RADIUS
     /// timeouts × retries fit under it).
     pub answer_timeout_ms: u64,
@@ -107,6 +111,19 @@ pub struct ServerConfig {
     pub setup_timeout_ms: u64,
     /// Delayed PADOs held at most.
     pub pado_queue: usize,
+    /// `(lane, lanes)`: this server hands out only the SESSION_IDs with
+    /// `sid % lanes == lane`. Several servers on one port (the service's
+    /// workers, one per core) then share its SESSION_ID space without a
+    /// lock (RFC 2516 §4: unique per port). `(0, 1)`: all of them.
+    pub sid_lane: (u16, u16),
+}
+
+impl ServerConfig {
+    /// The SESSION_IDs this server may use, in order.
+    fn sids(&self) -> impl Iterator<Item = u16> + use<> {
+        let (lane, lanes) = (self.sid_lane.0, self.sid_lane.1.max(1));
+        (1..=self.max_sessions).filter(move |s| s % lanes == lane % lanes)
+    }
 }
 
 impl Default for ServerConfig {
@@ -133,9 +150,11 @@ impl Default for ServerConfig {
             vlans: VlanFilter::Any,
             local_ipv4: None,
             ipv6: false,
+            ipv6_iid_key: None,
             answer_timeout_ms: 30_000,
             setup_timeout_ms: 60_000,
             pado_queue: 4096,
+            sid_lane: (0, 1),
         }
     }
 }
@@ -234,6 +253,19 @@ pub struct Authorization {
     pub rate_limit: Option<RateLimit>,
     /// Seconds until the session is closed.
     pub session_timeout: Option<u32>,
+}
+
+/// IPv6 of one session (RouterOS `/ppp profile use-ipv6`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ipv6Mode {
+    /// No IPv6CP: a Configure-Request from the peer gets a Protocol-Reject
+    /// (RFC 1661 §5.7).
+    Off,
+    /// IPv6CP runs; its failure leaves the session on IPv4.
+    #[default]
+    On,
+    /// IPv6CP must open: its failure ends the session.
+    Require,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,7 +425,7 @@ impl Server {
         let n = usize::from(cfg.max_sessions);
         Server {
             sessions: (0..=n).map(|_| None).collect(),
-            free: (1..=cfg.max_sessions).collect(),
+            free: cfg.sids().collect(),
             active: 0,
             generation: 0,
             wheel: Wheel::new(now),
@@ -423,6 +455,7 @@ impl Server {
     pub fn reconfigure(&mut self, mut cfg: ServerConfig) {
         cfg.ac_mac = self.cfg.ac_mac;
         cfg.max_sessions = self.cfg.max_sessions;
+        cfg.sid_lane = self.cfg.sid_lane;
         let limits = (cfg.padi_limit, cfg.mac_padi_limit, cfg.mac_padi_burst);
         if limits
             != (
@@ -928,6 +961,23 @@ impl Server {
         })
     }
 
+    /// IPv6 for one session, from its profile. Call before
+    /// [`Server::auth_reply`] (the NCPs open with the verdict); later it
+    /// only changes how a failure of IPv6CP is taken. `On` needs
+    /// [`ServerConfig::ipv6`].
+    pub fn set_ipv6(
+        &mut self,
+        now: Millis,
+        session: SessionRef,
+        mode: Ipv6Mode,
+        out: &mut ServerOutput,
+    ) -> bool {
+        let allowed = self.cfg.ipv6;
+        self.with_session(now, session.sid, Some(session.gen_), out, |s, _env| {
+            s.v6_mode = if allowed { mode } else { Ipv6Mode::Off };
+        })
+    }
+
     /// The answer to [`Event::NeedAddress`]; `None` = no address available.
     pub fn address_reply(
         &mut self,
@@ -956,11 +1006,12 @@ impl Server {
         if live != self.active {
             return Err(format!("active {} != live {live}", self.active));
         }
-        if live + self.free.len() != usize::from(self.cfg.max_sessions) {
+        let own = self.cfg.sids().count();
+        if live + self.free.len() != own {
             return Err(format!(
-                "live {live} + free {} != max {}",
+                "live {live} + free {} != {own} SESSION_IDs of lane {:?}",
                 self.free.len(),
-                self.cfg.max_sessions
+                self.cfg.sid_lane
             ));
         }
         let mut seen = vec![false; usize::from(MAX_SID) + 1];

@@ -38,18 +38,23 @@ use corerouter_proto_pppoe::layers::AuthSet;
 use corerouter_proto_pppoe::lcp::AuthProto;
 use corerouter_proto_pppoe::ppp::{self as wire_ppp, proto};
 use corerouter_proto_pppoe::server::{
-    AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Server,
+    AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Ipv6Mode, Server,
     ServerConfig, ServerOutput, SessionRef, VlanFilter,
 };
 use corerouter_proto_pppoe::timer::Millis;
 use corerouter_proto_pppoe::wire::Mac;
 use corerouter_proto_radius::rate_limit::RateLimit;
 
+use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
+
 /// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
 /// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
 pub(crate) const HISTORY: usize = 50_000;
-/// Users and MACs `ppp.why` remembers.
-pub(crate) const WHY_KEYS: usize = 100_000;
+/// Users and MACs `ppp.why` remembers: two per session the data plane
+/// holds. Past it the oldest goes (a flood of MACs pushes out only what
+/// nobody used since; G4.3g: clearing everything at 100 000 forgot every
+/// subscriber each 50 000 logins).
+pub(crate) const WHY_KEYS: usize = 2 * XDP_SLOTS as usize;
 /// Slots of the XDP session map the PPPoE service may use: the lower half
 /// of `dataplane-ebpf-common::pppoe::SESSIONS_MAX` (1 << 17). The upper half
 /// is the IPoE service's (G4.3f, `ipoe_bng::SLOT_TOP` downward).
@@ -60,7 +65,7 @@ const LIST_REFRESH_MS: u64 = 30 * 86_400_000;
 /// RADIUS answers older than this are dropped (the server gave up first).
 const RADIUS_GRACE_MS: u64 = 35_000;
 
-fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+pub(crate) fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
@@ -102,6 +107,8 @@ const STAGES: [Stage; 6] = [
 /// subscriber that is up is in the active table).
 #[derive(Debug, Clone, Default)]
 struct Track {
+    /// When it was last used ([`Shared::why_seq`]): what eviction looks at.
+    seq: u64,
     attempts: [u32; 6],
     last_stage: Option<Stage>,
     last: Option<Box<HistoryEntry>>,
@@ -116,7 +123,11 @@ fn stage_index(s: Stage) -> usize {
 pub(crate) struct Shared {
     pub active: BTreeMap<String, ActiveSession>,
     pub history: VecDeque<HistoryEntry>,
-    why: HashMap<String, Track>,
+    /// Each worker's "Why?" table (its own lock: a MAC always comes to
+    /// the same worker, and the workers do not wait on each other for it).
+    whys: Vec<Arc<Mutex<WhyTable>>>,
+    /// Sessions up by address (the identity chip, CGNAT's "Who was?").
+    by_ip: HashMap<Ipv4Addr, String>,
     pub stats: ServiceStats,
     /// `ppp.active.remove` and Disconnect-Requests, for the next round.
     pub terminate: Vec<String>,
@@ -127,15 +138,80 @@ pub(crate) struct Shared {
     pub lists: Vec<(String, String)>,
     /// Acct-Session-Id → session id.
     by_acct: HashMap<String, String>,
+    /// What each worker counts on its own (summed by [`Backend::stats`]).
+    lanes: Vec<LaneStats>,
 }
 
-impl Shared {
+/// One worker's share of the service counters.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LaneStats {
+    throttled: u64,
+    admission_rate: u32,
+    admission_reason: Option<String>,
+    counts: Counts,
+}
+
+/// Discovery and login counters a worker keeps without the shared lock
+/// (published once a second).
+#[derive(Debug, Clone, Copy, Default)]
+struct Counts {
+    padi: u64,
+    pado: u64,
+    padr: u64,
+    pads: u64,
+    padt_rx: u64,
+    padt_tx: u64,
+    auth_accept: u64,
+    auth_reject: u64,
+}
+
+/// `ppp.why`'s memory of one worker: per user and per MAC.
+#[derive(Default)]
+pub(crate) struct WhyTable {
+    /// The key is kept once, shared with `why_order`.
+    why: HashMap<Arc<str>, Track>,
+    /// Keys in the order they were used (a key used again is pushed again;
+    /// the old place is skipped when popped): the oldest is evicted first.
+    why_order: VecDeque<(Arc<str>, u64)>,
+    why_seq: u64,
+    /// [`WHY_KEYS`] (shared by the workers) unless a test sets it.
+    why_cap: usize,
+    lanes: usize,
+}
+
+impl WhyTable {
     fn track(&mut self, key: &str) -> Option<&mut Track> {
-        if !self.why.contains_key(key) && self.why.len() >= WHY_KEYS {
-            // Full: forget the lot rather than grow (a flood of MACs).
-            self.why.clear();
+        let cap = if self.why_cap == 0 {
+            WHY_KEYS / self.lanes.max(1)
+        } else {
+            self.why_cap
+        };
+        self.why_seq += 1;
+        let seq = self.why_seq;
+        let k: Arc<str> = match self.why.get_key_value(key) {
+            Some((k, _)) => k.clone(),
+            None => {
+                while self.why.len() >= cap {
+                    let Some((old, at)) = self.why_order.pop_front() else {
+                        break;
+                    };
+                    if self.why.get(&old).is_some_and(|t| t.seq == at) {
+                        self.why.remove(&old);
+                    }
+                }
+                Arc::from(key)
+            }
+        };
+        self.why_order.push_back((k.clone(), seq));
+        if self.why_order.len() > 2 * cap + 1024 {
+            // Mostly places of keys used again since: drop them.
+            let why = &self.why;
+            self.why_order
+                .retain(|(k, at)| why.get(k).is_some_and(|t| t.seq == *at));
         }
-        Some(self.why.entry(key.to_owned()).or_default())
+        let t = self.why.entry(k).or_default();
+        t.seq = seq;
+        Some(t)
     }
 
     fn reach(&mut self, keys: &[&str], stage: Stage) {
@@ -149,7 +225,7 @@ impl Shared {
         }
     }
 
-    fn record(&mut self, keys: &[&str], h: HistoryEntry) {
+    fn record(&mut self, keys: &[&str], h: &HistoryEntry) {
         for k in keys {
             if let Some(t) = self.track(k) {
                 if let Some(st) = h.stage {
@@ -160,6 +236,11 @@ impl Shared {
                 }
             }
         }
+    }
+}
+
+impl Shared {
+    fn record(&mut self, h: HistoryEntry) {
         if self.history.len() >= HISTORY {
             self.history.pop_front();
         }
@@ -173,6 +254,40 @@ pub(crate) struct Backend(pub Arc<Mutex<Shared>>);
 impl PppBackend for Backend {
     fn active(&self) -> Vec<ActiveSession> {
         guard(&self.0).active.values().cloned().collect()
+    }
+
+    fn active_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let sh = guard(&self.0);
+        let mut hits: Vec<&ActiveSession> = sh.active.values().filter(|a| keep(a)).collect();
+        let total = hits.len();
+        let order =
+            |a: &&ActiveSession, b: &&ActiveSession| a.name.cmp(&b.name).then(a.id.cmp(&b.id));
+        // The first `limit` without sorting the rest: O(n).
+        if limit > 0 && limit < hits.len() {
+            hits.select_nth_unstable_by(limit - 1, order);
+            hits.truncate(limit);
+        }
+        hits.truncate(limit);
+        hits.sort_by(order);
+        (total, hits.into_iter().cloned().collect())
+    }
+
+    fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
+        let sh = guard(&self.0);
+        let mut m = std::collections::BTreeMap::new();
+        for a in sh.active.values() {
+            match m.get_mut(&a.server) {
+                Some(n) => *n += 1,
+                None => {
+                    m.insert(a.server.clone(), 1);
+                }
+            }
+        }
+        m
     }
 
     fn terminate(&self, ids: &[String]) -> usize {
@@ -192,25 +307,53 @@ impl PppBackend for Backend {
     }
 
     fn why(&self, name: Option<&str>, mac: Option<MacAddr>) -> Why {
-        let sh = guard(&self.0);
+        let (active, whys) = {
+            let sh = guard(&self.0);
+            let active = sh
+                .active
+                .values()
+                .find(|a| {
+                    name.is_some_and(|n| a.name == n)
+                        || mac.is_some_and(|m| a.caller_id == m.to_string())
+                })
+                .map(|a| a.id.clone());
+            (active, sh.whys.clone())
+        };
         let key = name
             .map(str::to_owned)
             .or_else(|| mac.map(|m| m.to_string()))
             .unwrap_or_default();
-        let active = sh
-            .active
-            .values()
-            .find(|a| {
-                name.is_some_and(|n| a.name == n)
-                    || mac.is_some_and(|m| a.caller_id == m.to_string())
-            })
-            .map(|a| a.id.clone());
-        let mut t = sh.why.get(&key).cloned().unwrap_or_default();
+        // A key may be in several workers' tables (a user from MACs that
+        // hash apart): attempts add up, the newest end is the one shown.
+        let lookup = |key: &str| -> Option<Track> {
+            let mut out: Option<Track> = None;
+            for w in &whys {
+                let Some(t) = guard(w).why.get(key).cloned() else {
+                    continue;
+                };
+                out = Some(match out {
+                    None => t,
+                    Some(mut o) => {
+                        for (a, b) in o.attempts.iter_mut().zip(t.attempts) {
+                            *a = a.saturating_add(b);
+                        }
+                        let newer = |x: &Track| x.last.as_ref().map_or(0, |l| l.at);
+                        if newer(&t) > newer(&o) {
+                            o.last = t.last;
+                            o.last_stage = t.last_stage;
+                        }
+                        o
+                    }
+                });
+            }
+            out
+        };
+        let mut t = lookup(&key).unwrap_or_default();
         // Before authentication the user is not known: the discovery
         // stages of a user are those of the MAC it last came from.
         if name.is_some()
             && let Some(m) = t.last.as_ref().map(|l| l.caller_id.clone())
-            && let Some(by_mac) = sh.why.get(&m)
+            && let Some(by_mac) = lookup(&m)
         {
             for st in [Stage::Padi, Stage::Padr, Stage::Lcp] {
                 let i = stage_index(st);
@@ -237,15 +380,34 @@ impl PppBackend for Backend {
         let sh = guard(&self.0);
         let mut st = sh.stats.clone();
         st.sessions = sh.active.len() as u64;
+        // The workers' own counters (G4.3g): the limits are per worker, the
+        // service's rate is their sum.
+        st.throttled = sh.lanes.iter().map(|l| l.throttled).sum();
+        let sum = |f: fn(&Counts) -> u64| sh.lanes.iter().map(|l| f(&l.counts)).sum::<u64>();
+        st.padi = sum(|c| c.padi);
+        st.pado = sum(|c| c.pado);
+        st.padr = sum(|c| c.padr);
+        st.pads = sum(|c| c.pads);
+        st.padt_rx = sum(|c| c.padt_rx);
+        st.padt_tx = sum(|c| c.padt_tx);
+        st.auth_accept = sum(|c| c.auth_accept);
+        st.auth_reject = sum(|c| c.auth_reject);
+        st.admission_rate = sh.lanes.iter().map(|l| l.admission_rate).sum();
+        st.admission_reason = sh.lanes.iter().find_map(|l| l.admission_reason.clone());
+        st.workers = sh.lanes.len().max(1) as u32;
+        st.ipv6_sessions = sh
+            .active
+            .values()
+            .filter(|a| a.link_local.is_some())
+            .count() as u64;
+        st.delegated = sh.active.values().filter(|a| a.delegated_bound).count() as u64;
         st
     }
 
     fn who(&self, ip: Ipv4Addr) -> Option<String> {
-        guard(&self.0)
-            .active
-            .values()
-            .find(|a| a.address == Some(ip))
-            .map(|a| a.name.clone())
+        let sh = guard(&self.0);
+        let id = sh.by_ip.get(&ip)?;
+        sh.active.get(id).map(|a| a.name.clone())
     }
 
     fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {
@@ -473,6 +635,249 @@ impl Bucket {
     }
 }
 
+impl Bucket {
+    /// A new rate for the same bucket (`new_session_rate=auto`): the
+    /// tokens saved so far stay, capped at the new size.
+    fn set_rate(&mut self, rate: u32) {
+        self.rate = rate;
+        self.tokens = self.tokens.min(f64::from(rate.max(1)));
+    }
+}
+
+/// `new_session_rate=auto` (G4.3g): the session rate follows the RADIUS
+/// server's health, AIMD like TCP's window. It grows while answers come
+/// fast and the limit is what holds the wave back, and halves when they
+/// slow down or time out. A MK-Auth/IXC-class server is the usual
+/// bottleneck of a mass reconnect: a fixed number either buries it or
+/// keeps the CPEs waiting for nothing.
+pub(crate) const AUTO_START: f64 = 1000.0;
+pub(crate) const AUTO_MIN: f64 = 50.0;
+/// The ceiling: what one BNG thread sets up (lab: ~10 000/s), doubled.
+pub(crate) const AUTO_MAX: f64 = 20_000.0;
+/// The second's p90 answer slower than this halves the rate…
+const AUTO_SLOW_MS: u64 = 300;
+/// …and faster than this lets it grow, by this much a second.
+const AUTO_FAST_MS: u64 = 100;
+const AUTO_STEP: f64 = 500.0;
+/// Answers kept for the second's percentile.
+const AUTO_SAMPLES: usize = 4096;
+/// RADIUS questions in flight at most: the rate times this much time
+/// (Little's law). The window holds a wave back while the server is
+/// already busy, before its answers slow down (G4.3g: without it the
+/// queue of a 3000/s server filled with questions nobody waited for any
+/// more, and the latency the rate followed was the queue's).
+const AUTO_WINDOW_MS: f64 = 300.0;
+const AUTO_WINDOW_MIN: usize = 8;
+/// The window before the server's capacity is measured.
+const AUTO_WINDOW_START: usize = 64;
+
+pub(crate) struct Admission {
+    pub rate: f64,
+    pub reason: String,
+    /// Workers sharing the service's rate (each measures its own share).
+    pub lanes: u16,
+    latencies: Vec<u64>,
+    timeouts: u32,
+    held_before: u64,
+    /// Logins answered per second, last seconds (the whole service's,
+    /// estimated from this worker's share): the server's measured capacity.
+    delivered: VecDeque<f64>,
+    /// Fastest answer of each of the last seconds: the server's time with
+    /// no queue in front of it.
+    fastest: VecDeque<u64>,
+    /// Still finding the server's capacity (rate doubling each second).
+    startup: bool,
+    best: f64,
+    flat: u8,
+    cycle: u8,
+}
+
+impl Default for Admission {
+    fn default() -> Self {
+        Self {
+            rate: AUTO_START,
+            reason: "início".into(),
+            lanes: 1,
+            latencies: Vec::new(),
+            timeouts: 0,
+            held_before: 0,
+            delivered: VecDeque::new(),
+            fastest: VecDeque::new(),
+            startup: true,
+            best: 0.0,
+            flat: 0,
+            cycle: 0,
+        }
+    }
+}
+
+/// Seconds of the RADIUS server's measured capacity that may wait in the
+/// BNG (in the Authenticate phase) before PADIs are held back: well under
+/// the 30 s a login may take (`answer_timeout_ms`).
+const AUTO_BACKLOG_S: f64 = 10.0;
+/// Seconds of history the capacity and the base latency look back over.
+const AUTO_HISTORY: usize = 10;
+/// BBR's gain cycle (1.25 to probe for more, 0.9 to drain what the probe
+/// queued, then cruise), one step a second.
+const AUTO_GAINS: [f64; 8] = [1.25, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
+
+impl Admission {
+    /// One RADIUS answer: its round trip, or that it never came.
+    fn answer(&mut self, ms: u64, timeout: bool) {
+        if timeout {
+            self.timeouts = self.timeouts.saturating_add(1);
+        } else if self.latencies.len() < AUTO_SAMPLES {
+            self.latencies.push(ms);
+        }
+    }
+
+    /// The server's capacity in logins a second, as measured (0: unknown).
+    fn capacity(&self) -> f64 {
+        self.delivered.iter().copied().fold(0.0, f64::max)
+    }
+
+    fn base_ms(&self) -> Option<u64> {
+        self.fastest.iter().copied().min()
+    }
+
+    /// RADIUS questions this worker may have in flight (`lanes` workers
+    /// share it): the bandwidth-delay product, the measured capacity times
+    /// the base answer time (at least [`AUTO_WINDOW_MS`]), twice that while
+    /// still probing, as BBR's cwnd gain; [`AUTO_WINDOW_START`] before any
+    /// answer. Following the rate instead let the startup's
+    /// doubling put 3.6× the server's capacity in flight (G4.3g, VM round
+    /// 3: a 5503/s limit against ~1500 logins/s).
+    fn window(&self, lanes: u16) -> usize {
+        let cap = self.capacity();
+        if cap == 0.0 {
+            // Nothing measured yet: a small first window, as TCP's and
+            // BBR's, that the first answers open. The starting rate's
+            // (1000/s × 0.6 s) queued 2 s at a 300/s server, past the
+            // client's 1.1 s timeout: a copy of every login.
+            return (AUTO_WINDOW_START / usize::from(lanes.max(1))).max(AUTO_WINDOW_MIN);
+        }
+        let bw = cap;
+        let gain = if self.startup { 2.0 } else { 1.0 };
+        let base = self.base_ms().map_or(0.0, |b| b as f64).max(AUTO_WINDOW_MS);
+        let share = bw / f64::from(lanes.max(1));
+        ((share * gain * base / 1000.0) as usize).max(AUTO_WINDOW_MIN)
+    }
+
+    /// Logins this worker lets queue (sent or waiting for the window)
+    /// before it holds PADIs back: [`AUTO_BACKLOG_S`] of the measured
+    /// capacity, never under the window.
+    fn backlog(&self, lanes: u16) -> usize {
+        let share = self.capacity().max(self.rate) / f64::from(lanes.max(1));
+        ((share * AUTO_BACKLOG_S) as usize).max(self.window(lanes))
+    }
+
+    /// Once a second. `held`: sessions the limit has held back so far;
+    /// `pending`: questions still unanswered.
+    ///
+    /// Like BBR (Cardwell et al., 2016): the rate follows the measured
+    /// capacity (answers per second, the best of the last
+    /// [`AUTO_HISTORY`] s) with a gain, doubling while that capacity still
+    /// grows; a standing queue (answers much slower than the base) drains
+    /// it to 0.9×, a timeout cuts it to 0.75×. A plain AIMD on the latency
+    /// alone halved itself into a slow crawl (G4.3g: 100 000 in 517 s
+    /// against a 3000/s server).
+    fn second(&mut self, held: u64, pending: usize) {
+        let waiting = held > self.held_before;
+        self.held_before = held;
+        self.latencies.sort_unstable();
+        let p90 = self
+            .latencies
+            .get(self.latencies.len().saturating_mul(9) / 10)
+            .copied();
+        let lanes = f64::from(self.lanes.max(1));
+        let answered = self.latencies.len() as f64 * lanes;
+        self.delivered.push_back(answered);
+        if let Some(f) = self.latencies.first() {
+            self.fastest.push_back(*f);
+        }
+        while self.delivered.len() > AUTO_HISTORY {
+            self.delivered.pop_front();
+        }
+        while self.fastest.len() > AUTO_HISTORY {
+            self.fastest.pop_front();
+        }
+        let cap = self.capacity();
+        let base = self.base_ms();
+        // A standing queue: the p90 well above what the server takes with
+        // nothing in front (and above what anyone would call fast).
+        let queued = match (p90, base) {
+            (Some(p), Some(b)) => p > (2 * b + 50).max(AUTO_FAST_MS) || p > AUTO_SLOW_MS,
+            (Some(p), None) => p > AUTO_SLOW_MS,
+            _ => false,
+        };
+        if self.timeouts > 0 {
+            self.startup = false;
+            self.rate = (cap * 0.75).max(self.rate / 2.0).max(AUTO_MIN);
+            self.reason = format!("RADIUS sem resposta: {} timeouts", self.timeouts);
+        } else if p90.is_none() && pending > 0 {
+            // A whole second with questions out and no answer at all.
+            self.startup = false;
+            self.rate = (self.rate / 2.0).max(AUTO_MIN);
+            self.reason = format!("RADIUS parado: {pending} pedidos sem resposta");
+        } else if queued {
+            self.startup = false;
+            let p = p90.unwrap_or(0);
+            self.rate = if cap > 0.0 {
+                cap * 0.9
+            } else {
+                self.rate / 2.0
+            }
+            .max(AUTO_MIN);
+            self.reason = match base {
+                Some(b) => format!("RADIUS lento: {p} ms (sem fila: {b} ms)"),
+                None => format!("RADIUS lento: {p} ms"),
+            };
+        } else if !waiting {
+            self.reason = "sem fila".into();
+        } else if cap == 0.0 {
+            // Local secrets, no RADIUS answers to measure: grow as before.
+            self.rate = (self.rate + AUTO_STEP).min(AUTO_MAX);
+            self.reason = "subindo: sem RADIUS no caminho".into();
+        } else if self.startup {
+            // Still finding the ceiling: twice what was answered, while that
+            // keeps growing.
+            if cap > self.best * 1.25 {
+                self.best = cap;
+                self.flat = 0;
+            } else {
+                self.flat += 1;
+            }
+            if self.flat >= 3 {
+                self.startup = false;
+            }
+            self.rate = (cap * 2.0).clamp(AUTO_MIN, AUTO_MAX);
+            self.reason = format!("subindo: RADIUS responde {cap:.0}/s");
+        } else {
+            let gain = AUTO_GAINS
+                .get(usize::from(self.cycle))
+                .copied()
+                .unwrap_or(1.0);
+            self.cycle = (self.cycle + 1) % AUTO_GAINS.len() as u8;
+            self.rate = (cap * gain).clamp(AUTO_MIN, AUTO_MAX);
+            self.reason = format!("na capacidade do RADIUS: {cap:.0}/s");
+        }
+        self.latencies.clear();
+        self.timeouts = 0;
+    }
+}
+
+/// Slow path: subscriber address → the worker holding it.
+pub(crate) type Routes = Arc<std::sync::RwLock<HashMap<Ipv4Addr, u16>>>;
+
+/// A worker's share of a per-second rate (0 = no limit stays 0).
+fn share(rate: u32, lanes: u16) -> u32 {
+    if rate == 0 {
+        0
+    } else {
+        rate.div_ceil(u32::from(lanes.max(1))).max(1)
+    }
+}
+
 /// A port the driver opened for a server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PortInfo {
@@ -518,9 +923,63 @@ struct Sub {
     list_at: Millis,
     idle_since: Millis,
     descriptor_vlan: Option<u16>,
+    /// The RADIUS question in flight, to call off if the session ends.
+    auth_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     circuit_id: Option<String>,
     remote_id: Option<String>,
     mtu: u16,
+    /// G4.3e: what RADIUS said about IPv6, and the session's IPv6 once
+    /// IPv6CP is up.
+    radius6: RadiusV6,
+    v6: Option<Box<V6>>,
+}
+
+/// What the hot paths look up in [`Bng::subs`] without walking it
+/// (G4.3g: a walk per PADI, per login and per slow-path packet made a
+/// session cost grow with the sessions up: 19 → 181 µs from 0 to 60 000).
+#[derive(Default)]
+struct SubIndex {
+    /// Sessions up, by address: the slow path's downstream lookup.
+    by_ip: HashMap<Ipv4Addr, (usize, u16)>,
+    /// Sessions up per login: `only-one`.
+    users_up: HashMap<String, u32>,
+    /// Sessions between authentication and Up, per (slot, MAC): the PADI's
+    /// `new_session_rate`.
+    pending: HashMap<(usize, [u8; 6]), u32>,
+}
+
+impl SubIndex {
+    fn add(&mut self, key: (usize, u16), sub: &Sub) {
+        if sub.up_at.is_some() {
+            *self.users_up.entry(sub.user.clone()).or_default() += 1;
+            if let Some(ip) = sub.ip {
+                self.by_ip.insert(ip, key);
+            }
+        } else {
+            *self.pending.entry((sub.slot, sub.mac.0)).or_default() += 1;
+        }
+    }
+
+    fn remove(&mut self, key: (usize, u16), sub: &Sub) {
+        fn dec<K: std::hash::Hash + Eq>(m: &mut HashMap<K, u32>, k: &K) {
+            if let Some(n) = m.get_mut(k) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    m.remove(k);
+                }
+            }
+        }
+        if sub.up_at.is_some() {
+            dec(&mut self.users_up, &sub.user);
+            if let Some(ip) = sub.ip
+                && self.by_ip.get(&ip) == Some(&key)
+            {
+                self.by_ip.remove(&ip);
+            }
+        } else {
+            dec(&mut self.pending, &(sub.slot, sub.mac.0));
+        }
+    }
 }
 
 /// An answer for the server, queued while its events are handled.
@@ -528,6 +987,7 @@ enum Reply {
     Auth(AuthVerdict),
     Address(Option<Ipv4Assignment>),
     Terminate,
+    Ipv6(Ipv6Mode),
 }
 
 /// A RADIUS answer on its way back to the BNG thread.
@@ -547,12 +1007,32 @@ pub(crate) struct Snapshot {
     pub aaa: Option<Arc<dyn AaaBackend>>,
     /// Unix time of `now` = 0 (the history's clock).
     pub unix_base: u64,
+    /// G4.3e: `/ipv6 pool` (the profiles' IPv6 pools).
+    pub pools6: Vec<corerouter_model::dhcp6_server::Ipv6Pool>,
+    /// RFC 8064 secret of the IPv6CP identifiers (kept on disk by the
+    /// driver, so a line keeps its link-local across restarts); `None`:
+    /// one drawn from the seed, for this run.
+    pub iid_key: Option<[u8; 32]>,
 }
 
 pub(crate) struct Bng {
     slots: Vec<Slot>,
     subs: HashMap<(usize, u16), Sub>,
-    pools: Pools,
+    /// Kept with `subs` (every insert, remove and Up goes through it).
+    index: SubIndex,
+    /// Shared by the workers: an address is lent once in the whole BNG.
+    pools: Arc<Mutex<Pools>>,
+    /// This worker's "Why?" table (also in `Shared::whys` for the reads).
+    why: Arc<Mutex<WhyTable>>,
+    /// Counters published in `tick` (no shared lock per frame).
+    counts: Counts,
+    /// This worker and how many there are (G4.3g): SESSION_IDs and XDP
+    /// slots are split by `lane`, frames come by the client's MAC.
+    lane: u16,
+    lanes: u16,
+    /// Slow path: which worker holds each subscriber address (the driver
+    /// hands it the packets the kernel routes to `bng0`).
+    routes: Routes,
     xdp_free: Vec<u32>,
     xdp_next: u32,
     pub shared: Arc<Mutex<Shared>>,
@@ -573,6 +1053,15 @@ pub(crate) struct Bng {
     pub xdp: bool,
     /// PADIs held back by `new_session_rate`.
     padr_throttled: u64,
+    /// The rate of the servers with `new_session_rate=auto`.
+    pub admission: Admission,
+    /// auto: Access-Requests waiting for room in the window.
+    auth_queue: VecDeque<(usize, SessionRef, RadiusRequest)>,
+    queued_total: u64,
+    /// G4.3e: the /64s and delegated prefixes the sessions hold.
+    pools6: Arc<Mutex<Pools6>>,
+    /// IPv6 packets refused before reaching a session's control plane.
+    v6_dropped: u64,
 }
 
 /// One discovery or session frame's code and source, read before the
@@ -739,13 +1228,25 @@ pub(crate) fn explain(r: DownReason) -> (&'static str, &'static str, Stage, u32)
 impl Bng {
     pub(crate) fn new(seed: [u8; 32]) -> Self {
         let (auth_tx, auth_rx) = channel();
+        let why = Arc::new(Mutex::new(WhyTable {
+            lanes: 1,
+            ..WhyTable::default()
+        }));
+        let shared = Arc::new(Mutex::new(Shared::default()));
+        guard(&shared).whys.push(why.clone());
         Self {
             slots: Vec::new(),
             subs: HashMap::new(),
-            pools: Pools::default(),
+            index: SubIndex::default(),
+            pools: Arc::new(Mutex::new(Pools::default())),
+            lane: 0,
+            lanes: 1,
+            routes: Arc::new(std::sync::RwLock::new(HashMap::new())),
             xdp_free: Vec::new(),
             xdp_next: 0,
-            shared: Arc::new(Mutex::new(Shared::default())),
+            shared,
+            why,
+            counts: Counts::default(),
             effects: Vec::new(),
             frames: Vec::new(),
             upstream: Vec::new(),
@@ -759,7 +1260,60 @@ impl Bng {
             out: ServerOutput::new(),
             xdp: false,
             padr_throttled: 0,
+            admission: Admission::default(),
+            auth_queue: VecDeque::new(),
+            queued_total: 0,
+            pools6: Arc::new(Mutex::new(Pools6::default())),
+            v6_dropped: 0,
         }
+    }
+
+    /// Worker `lane` of `lanes`, sharing this one's tables: the active
+    /// table and history (`Shared`), the address pools and the slow path's
+    /// routes. Its own servers, sessions and timers (G4.3g).
+    pub(crate) fn sibling(&self, seed: [u8; 32], lane: u16, lanes: u16) -> Self {
+        let mut b = Self::new(seed);
+        b.shared = self.shared.clone();
+        guard(&b.why).lanes = usize::from(lanes.max(1));
+        guard(&b.shared).whys.push(b.why.clone());
+        b.pools = self.pools.clone();
+        b.pools6 = self.pools6.clone();
+        b.routes = self.routes.clone();
+        b.lane = lane;
+        b.lanes = lanes.max(1);
+        b.admission.lanes = b.lanes;
+        b
+    }
+
+    /// The first of `lanes` workers.
+    pub(crate) fn first_of(seed: [u8; 32], lanes: u16) -> Self {
+        let mut b = Self::new(seed);
+        b.lanes = lanes.max(1);
+        b.admission.lanes = b.lanes;
+        let n = usize::from(b.lanes);
+        guard(&b.shared).lanes = vec![LaneStats::default(); n];
+        guard(&b.why).lanes = n;
+        b
+    }
+
+    /// The slow path's address → worker table, for the reader.
+    pub(crate) fn clone_routes(&self) -> Routes {
+        self.routes.clone()
+    }
+
+    /// The worker of slow-path address `ip`, if a session holds it.
+    pub(crate) fn route_lane_in(routes: &Routes, ip: Ipv4Addr) -> Option<u16> {
+        routes.read().ok().and_then(|r| r.get(&ip).copied())
+    }
+
+    /// The worker of a frame from a client (its source MAC; RSS-like): a
+    /// multiplicative hash of the last four bytes of the MAC (frame bytes
+    /// 8..12), so a vendor's shared OUI and a power-of-two `lanes` still
+    /// spread.
+    pub(crate) fn lane_of(frame: &[u8], lanes: u16) -> u16 {
+        let b = |i: usize| frame.get(i).copied().unwrap_or(0);
+        let k = u32::from_be_bytes([b(8), b(9), b(10), b(11)]);
+        ((k.wrapping_mul(0x9E37_79B1) >> 16) % u32::from(lanes.max(1))) as u16
     }
 
     fn log(&mut self, error: bool, text: String) {
@@ -820,12 +1374,34 @@ impl Bng {
                 Some(AddrOrPool::Address(ip)) => Some(ip),
                 _ => None,
             };
-            let sc = server_config(&w, port.mac, local);
+            let mut sc = server_config(&w, port.mac, local);
+            // G4.3g: this worker's share of the port's SESSION_IDs, of the
+            // PADI limit and of the load the PADO delay looks at (a MAC
+            // always comes to the same worker: its own limit stays).
+            sc.sid_lane = (self.lane, self.lanes);
+            let lanes = u32::from(self.lanes);
+            if sc.padi_limit > 0 {
+                sc.padi_limit = sc.padi_limit.div_ceil(lanes);
+            }
+            for t in &mut sc.pado_delay {
+                t.0 = t.0.div_ceil(lanes);
+            }
+            // G4.3e: IPv6CP everywhere, each session as its profile says
+            // (`Reply::Ipv6` before the verdict); identifiers stable per line.
+            sc.ipv6 = true;
+            sc.ipv6_iid_key = Some(self.cfg.iid_key.unwrap_or(self.seed));
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
-                    if s.bucket.rate != w.new_session_rate {
-                        s.bucket = Bucket::new(w.new_session_rate, now);
+                    if w.new_session_rate_auto {
+                        // The tick moves it; switching to auto keeps the
+                        // tokens.
+                        s.bucket
+                            .set_rate(share(self.admission.rate as u32, self.lanes));
+                    } else if s.bucket.rate != share(w.new_session_rate, self.lanes)
+                        || s.cfg.new_session_rate_auto
+                    {
+                        s.bucket = Bucket::new(share(w.new_session_rate, self.lanes), now);
                     }
                     s.cfg = w;
                 }
@@ -836,16 +1412,26 @@ impl Bng {
                     }
                     let name = w.name.clone();
                     let interface = w.interface.to_string();
+                    let rate = share(
+                        if w.new_session_rate_auto {
+                            self.admission.rate as u32
+                        } else {
+                            w.new_session_rate
+                        },
+                        self.lanes,
+                    );
                     self.slots.push(Slot {
-                        bucket: Bucket::new(w.new_session_rate, now),
+                        bucket: Bucket::new(rate, now),
                         server: Server::new(sc, seed, now),
                         port,
                         cfg: w,
                     });
-                    self.log(
-                        false,
-                        format!("PPPoE: servidor {name} atendendo em {interface}"),
-                    );
+                    if self.lane == 0 {
+                        self.log(
+                            false,
+                            format!("PPPoE: servidor {name} atendendo em {interface}"),
+                        );
+                    }
                 }
             }
         }
@@ -857,13 +1443,15 @@ impl Bng {
     fn drop_slot(&mut self, now: Millis, i: usize) {
         let keys: Vec<(usize, u16)> = self.subs.keys().filter(|k| k.0 == i).copied().collect();
         for k in keys {
-            if let Some(sub) = self.subs.remove(&k) {
+            if let Some(sub) = self.take_sub(k) {
                 self.ended(now, sub, DownReason::Admin, true);
             }
         }
         if i < self.slots.len() {
             let s = self.slots.remove(i);
-            self.log(false, format!("PPPoE: servidor {} parado", s.cfg.name));
+            if self.lane == 0 {
+                self.log(false, format!("PPPoE: servidor {} parado", s.cfg.name));
+            }
         }
         // Slots after `i` moved down one.
         let moved: Vec<((usize, u16), Sub)> = self
@@ -876,6 +1464,28 @@ impl Bng {
             })
             .collect();
         self.subs.extend(moved);
+        // The slots were renumbered: index again (a server removed, rare).
+        self.index = SubIndex::default();
+        for (k, sub) in &self.subs {
+            self.index.add(*k, sub);
+        }
+    }
+
+    /// Remove a session, keeping the index.
+    fn take_sub(&mut self, key: (usize, u16)) -> Option<Sub> {
+        let sub = self.subs.remove(&key)?;
+        if let Some(c) = &sub.auth_cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.index.remove(key, &sub);
+        if sub.up_at.is_some()
+            && let Some(ip) = sub.ip
+            && let Ok(mut r) = self.routes.write()
+            && r.get(&ip) == Some(&self.lane)
+        {
+            r.remove(&ip);
+        }
+        Some(sub)
     }
 
     /// The earliest time [`Bng::timers`] has work.
@@ -905,8 +1515,8 @@ impl Bng {
                 slot.cfg.max_sessions > 0 && slot.server.active() >= slot.cfg.max_sessions as usize;
             match code {
                 Code::Padi => {
-                    guard(&self.shared).stats.padi += 1;
-                    guard(&self.shared).reach(&[&key], Stage::Padi);
+                    self.counts.padi += 1;
+                    guard(&self.why).reach(&[&key], Stage::Padi);
                     if full {
                         return;
                     }
@@ -914,31 +1524,44 @@ impl Bng {
                     // CPE asks again (RFC 2516 §5.1: PADI retransmitted with
                     // back-off). At the PADR it would be worse: the CPE
                     // repeats the PADR with an AC-Cookie that expires.
-                    let setting_up = self
-                        .subs
-                        .values()
-                        .any(|s| s.mac == src && s.slot == i && s.up_at.is_none());
-                    if !setting_up && !slot.bucket.allow(now) {
+                    let setting_up = self.index.pending.contains_key(&(i, src.0));
+                    // auto: the limit is the RADIUS server's, applied to the
+                    // logins queued here (about AUTO_BACKLOG_S of what it
+                    // answers), not to the PADIs: a CPE told "no" backs off
+                    // (RFC 2516 §5) and comes back late, idling the server.
+                    let held = if slot.cfg.new_session_rate_auto {
+                        let backlog = self.admission.backlog(self.lanes);
+                        self.pending_auth + self.auth_queue.len() >= backlog
+                    } else {
+                        !slot.bucket.allow(now)
+                    };
+                    if !setting_up && held {
                         self.padr_throttled += 1;
                         return;
                     }
                 }
                 Code::Padr => {
-                    guard(&self.shared).stats.padr += 1;
+                    self.counts.padr += 1;
                     if full {
                         return;
                     }
-                    guard(&self.shared).reach(&[&key], Stage::Padr);
+                    guard(&self.why).reach(&[&key], Stage::Padr);
                 }
-                Code::Padt => guard(&self.shared).stats.padt_rx += 1,
+                Code::Padt => self.counts.padt_rx += 1,
                 _ => {}
             }
             let _ = sessions;
         } else if let Ok(f) = wire_ppp::parse_session(frame)
-            && matches!(f.protocol, proto::IPV4)
+            && matches!(f.protocol, proto::IPV4 | proto::IPV6)
         {
-            // Slow path upstream: the XDP would have taken it.
-            self.data_up(i, &f);
+            if f.protocol == proto::IPV6 {
+                // ND, DHCPv6 and Echo to our link-local (the XDP passes
+                // link-local and multicast up, `Stat::Ipv6Control`).
+                self.data6(now, i, &f);
+            } else {
+                // Slow path upstream: the XDP would have taken it.
+                self.data_up(i, &f);
+            }
             return;
         }
         self.run(now, i, |srv, out| {
@@ -976,6 +1599,212 @@ impl Bng {
         self.upstream.push(f.info.to_vec());
     }
 
+    /// A pseudo-random 32-bit value (RA spread; no security role).
+    fn next_rand(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1);
+        let mut x = self.seq.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from_le_bytes(self.seed.first_chunk::<8>().copied().unwrap_or([7; 8]));
+        x ^= x >> 29;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        (x >> 32) as u32
+    }
+
+    /// G4.3e: IPv6CP opened on a session: take its /64 and delegated
+    /// prefix (RADIUS over the profile, RFC 3162/4818/6911), start its RA
+    /// and DHCPv6, and, if it was already up on IPv4, show and account
+    /// the change (Interim-Update with the prefixes).
+    fn start_v6(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
+    ) {
+        let (Some(peer), Some(local)) = (d.ipv6_iid, d.local_iid) else {
+            return;
+        };
+        let Some(port) = self.slots.get(i).map(|s| s.port) else {
+            return;
+        };
+        let rand = self.next_rand();
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        if sub.v6.is_some() {
+            return;
+        }
+        let mut problems: Vec<String> = Vec::new();
+        let mut alloc = |fixed: Option<ipnet::Ipv6Net>, pool: Option<&str>, what: &str| {
+            if let Some(n) = fixed {
+                if guard(&self.pools6).hold(n) {
+                    return Some((n, Source::Radius));
+                }
+                problems.push(format!("{what} {n} do RADIUS já está em uso"));
+                return None;
+            }
+            let name = pool?;
+            match guard(&self.pools6).take(&self.cfg.pools6, name) {
+                Some(n) => Some((n, Source::Pool(name.to_owned()))),
+                None => {
+                    problems.push(format!("/ipv6 pool '{name}' sem {what} livre"));
+                    None
+                }
+            }
+        };
+        let r = &sub.radius6;
+        let e = &sub.effective;
+        let link = alloc(
+            r.framed_prefix,
+            r.framed_pool
+                .as_deref()
+                .or(e.remote_ipv6_prefix_pool.as_deref()),
+            "/64",
+        );
+        let delegated = alloc(
+            r.delegated,
+            r.delegated_pool.as_deref().or(e.dhcpv6_pd_pool.as_deref()),
+            "prefixo delegado",
+        );
+        let dns = if r.dns.is_empty() {
+            e.dns_server_ipv6.clone()
+        } else {
+            r.dns.clone()
+        };
+        let mut x = V6::new(
+            now,
+            local,
+            peer,
+            link,
+            delegated,
+            dns,
+            e.dhcpv6_lease_time,
+            d.mtu,
+            port.mac,
+        );
+        // RFC 4861 §6.2.4: the first RA right away (the link just came up).
+        if let Some(p) = x.due(now, rand) {
+            self.frames.push((
+                port.ifindex,
+                v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, sref.sid, &p),
+            ));
+        }
+        let user = sub.user.clone();
+        let text = format!(
+            "PPP: {user} com IPv6 (link-local {}{}{}{})",
+            x.peer(),
+            x.global()
+                .map(|a| format!(", endereço {a}"))
+                .unwrap_or_default(),
+            x.link
+                .as_ref()
+                .map(|(n, _)| format!(", /64 {n}"))
+                .unwrap_or_default(),
+            x.delegated
+                .as_ref()
+                .map(|(n, _)| format!(", PD {n}"))
+                .unwrap_or_default()
+        );
+        let was_up = sub.up_at.is_some();
+        let attrs = x.acct_attributes();
+        let acct = (sub.radius || self.cfg.ppp.aaa.use_radius) && self.cfg.ppp.aaa.accounting;
+        let acct_id = sub.acct_id.clone();
+        let interim = sub.interim;
+        sub.v6 = Some(Box::new(x));
+        let fields = sub.v6.as_deref().map(active_v6);
+        let id = session_id(i, &self.slots, sref.sid);
+        for p in problems {
+            self.log(true, format!("PPP: {user}: {p}"));
+        }
+        self.log(false, text);
+        if !was_up {
+            // `up` puts the row and the Accounting-Start with these.
+            return;
+        }
+        if let (Some(f), Some(a)) = (fields, guard(&self.shared).active.get_mut(&id)) {
+            f.apply(a);
+        }
+        if acct && let Some(aaa) = &self.cfg.aaa {
+            let req = AcctRequest {
+                service: AaaService::Ppp,
+                status: AcctStatus::InterimUpdate,
+                session_id: acct_id,
+                user: user.clone(),
+                counters: None,
+                terminate_cause: None,
+                interim_secs: interim,
+                attributes: attrs,
+            };
+            if let Err(e) = aaa.account(req, None) {
+                self.log(
+                    true,
+                    format!("PPP: Accounting-Interim (IPv6) de {user} não enviado: {e}"),
+                );
+            }
+        }
+    }
+
+    /// G4.3e: an IPv6 packet from a subscriber that reached the control
+    /// plane (link-local or multicast with XDP; everything without it):
+    /// RS, NS, Echo to our link-local and DHCPv6 are answered. Forwarded
+    /// IPv6 on the slow path is G4.3l.
+    fn data6(&mut self, now: Millis, i: usize, f: &wire_ppp::SessionFrame<'_>) {
+        let Some(port) = self.slots.get(i).map(|s| s.port) else {
+            return;
+        };
+        let rand = self.next_rand();
+        let id = session_id(i, &self.slots, f.session_id);
+        let Some(sub) = self.subs.get_mut(&(i, f.session_id)) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        let Some(x) = sub.v6.as_deref_mut().filter(|_| sub.mac == f.link.src) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        let before = x.dropped;
+        let Some(out) = x.handle(now, f.info, rand) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        self.v6_dropped += x.dropped - before;
+        let changed = v6::pd_changed(&out.events);
+        let bound = x.pd_bound();
+        for p in &out.packets {
+            self.frames.push((
+                port.ifindex,
+                v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, f.session_id, p),
+            ));
+        }
+        let mut sh = guard(&self.shared);
+        sh.stats.ipv6_dropped = self.v6_dropped;
+        if changed && let Some(a) = sh.active.get_mut(&id) {
+            a.delegated_bound = bound;
+        }
+    }
+
+    /// G4.3e: the unsolicited RAs that are due (RFC 4861 §6.2.4), once a
+    /// second.
+    fn ra_tick(&mut self, now: Millis) {
+        let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut rand = self.next_rand();
+        for ((slot, sid), sub) in self.subs.iter_mut() {
+            let Some(x) = sub.v6.as_deref_mut() else {
+                continue;
+            };
+            let Some(port) = self.slots.get(*slot).map(|s| s.port) else {
+                continue;
+            };
+            rand = rand.rotate_left(7) ^ u32::from(*sid).wrapping_mul(0x9e37_79b9);
+            if let Some(p) = x.due(now, rand) {
+                due.push((
+                    port.ifindex,
+                    v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, *sid, &p),
+                ));
+            }
+        }
+        self.frames.extend(due);
+    }
+
     /// Downstream IPv4 to a subscriber (slow path): encapsulated for its
     /// session, or dropped when nobody has the address.
     pub(crate) fn data_down(&mut self, packet: &[u8]) {
@@ -989,9 +1818,10 @@ impl Bng {
             dst.get(3).copied().unwrap_or(0),
         );
         let Some(((slot, sid), sub)) = self
-            .subs
-            .iter()
-            .find(|(_, s)| s.ip == Some(dst) && s.up_at.is_some())
+            .index
+            .by_ip
+            .get(&dst)
+            .and_then(|k| self.subs.get_key_value(k))
         else {
             return;
         };
@@ -1044,6 +1874,9 @@ impl Bng {
                     Reply::Terminate => {
                         srv.terminate(now, sref, &mut out);
                     }
+                    Reply::Ipv6(m) => {
+                        srv.set_ipv6(now, sref, m, &mut out);
+                    }
                 }
             }
             self.absorb(now, j, &mut out);
@@ -1054,14 +1887,13 @@ impl Bng {
     fn absorb(&mut self, now: Millis, i: usize, out: &mut ServerOutput) {
         for (ifindex, f) in out.frames() {
             if let Ok(d) = discovery::parse(f) {
-                let mut sh = guard(&self.shared);
                 match d.code {
-                    Code::Pado => sh.stats.pado += 1,
+                    Code::Pado => self.counts.pado += 1,
                     Code::Pads if d.session_id != 0 => {
-                        sh.stats.pads += 1;
-                        sh.reach(&[&mac_text(d.dst)], Stage::Lcp);
+                        self.counts.pads += 1;
+                        guard(&self.why).reach(&[&mac_text(d.dst)], Stage::Lcp);
                     }
-                    Code::Padt => sh.stats.padt_tx += 1,
+                    Code::Padt => self.counts.padt_tx += 1,
                     _ => {}
                 }
             }
@@ -1088,7 +1920,7 @@ impl Bng {
                                 Some(AddrOrPool::Pool(p)) => Some(p.clone()),
                                 _ => None,
                             })?;
-                    let (ip, from) = self.pools.take(&self.cfg.pools, &pool)?;
+                    let (ip, from) = guard(&self.pools).take(&self.cfg.pools, &pool)?;
                     sub.ip = Some(ip);
                     sub.pool = Some(from);
                     Some(assignment(ip, &sub.effective.dns_server))
@@ -1098,15 +1930,20 @@ impl Bng {
             Event::Up {
                 session,
                 descriptor,
-            } => self.up(now, i, session, &descriptor),
+            } => {
+                // IPv6 first, so the Accounting-Start names the prefixes.
+                self.start_v6(now, i, session, &descriptor);
+                self.up(now, i, session, &descriptor);
+            }
             Event::Changed {
                 session,
                 descriptor,
             } => {
+                self.start_v6(now, i, session, &descriptor);
                 if let Some(sub) = self.subs.get(&(i, session.sid))
                     && let Some(idx) = sub.xdp
                 {
-                    let s = xdp_session(&descriptor, sub.rate.as_deref());
+                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref());
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(idx, s)));
                 }
             }
@@ -1117,7 +1954,7 @@ impl Bng {
                 was_up,
                 ..
             } => {
-                if let Some(sub) = self.subs.remove(&(i, session.sid)) {
+                if let Some(sub) = self.take_sub((i, session.sid)) {
                     self.ended(now, sub, reason, was_up);
                 } else {
                     // Before authentication (LCP failed, setup timeout): no
@@ -1129,7 +1966,7 @@ impl Bng {
     }
 
     fn reject(&mut self, i: usize, sref: SessionRef, why: &str) {
-        guard(&self.shared).stats.auth_reject += 1;
+        self.counts.auth_reject += 1;
         if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
             sub.reply_message = Some(why.to_owned());
         }
@@ -1156,48 +1993,55 @@ impl Bng {
         };
         let default_profile = slot.cfg.default_profile.clone();
         let vlan = (req.vlans.outer != 0).then_some(req.vlans.outer);
-        self.subs.insert(
-            (i, sref.sid),
-            Sub {
-                slot: i,
-                sref,
-                user: user.clone(),
-                mac,
-                stage: Stage::Auth,
-                effective: self
-                    .cfg
-                    .ppp
-                    .effective(None, &default_profile, &default_profile),
-                radius: false,
-                ip: None,
-                pool: None,
-                rate: None,
-                acct_id: String::new(),
-                interim: None,
-                xdp: None,
-                up_at: None,
-                limit_in: 0,
-                limit_out: 0,
-                session_timeout: None,
-                reply_message: None,
-                cause: None,
-                last_bytes: (0, 0),
-                prev: (0, 0, now),
-                list_at: now,
-                idle_since: now,
-                descriptor_vlan: vlan,
-                circuit_id: req
-                    .circuit_id
-                    .as_ref()
-                    .map(|c| String::from_utf8_lossy(c).into_owned()),
-                remote_id: req
-                    .remote_id
-                    .as_ref()
-                    .map(|c| String::from_utf8_lossy(c).into_owned()),
-                mtu: 1480,
-            },
-        );
-        guard(&self.shared).reach(&[&user, &mac_text(mac)], Stage::Auth);
+        let fresh = Sub {
+            slot: i,
+            sref,
+            user: user.clone(),
+            mac,
+            stage: Stage::Auth,
+            effective: self
+                .cfg
+                .ppp
+                .effective(None, &default_profile, &default_profile),
+            radius: false,
+            ip: None,
+            pool: None,
+            rate: None,
+            acct_id: String::new(),
+            interim: None,
+            xdp: None,
+            up_at: None,
+            limit_in: 0,
+            limit_out: 0,
+            session_timeout: None,
+            reply_message: None,
+            cause: None,
+            last_bytes: (0, 0),
+            prev: (0, 0, now),
+            list_at: now,
+            idle_since: now,
+            descriptor_vlan: vlan,
+            auth_cancel: None,
+            circuit_id: req
+                .circuit_id
+                .as_ref()
+                .map(|c| String::from_utf8_lossy(c).into_owned()),
+            remote_id: req
+                .remote_id
+                .as_ref()
+                .map(|c| String::from_utf8_lossy(c).into_owned()),
+            mtu: 1480,
+            radius6: RadiusV6::default(),
+            v6: None,
+        };
+        self.index.add((i, sref.sid), &fresh);
+        if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
+            // Authenticated again (LCP renegotiated): the old entry's
+            // place in the index goes.
+            self.index.remove((i, sref.sid), &old);
+        }
+        guard(&self.why).reach(&[&user, &mac_text(mac)], Stage::Auth);
+        // O(1): the list's name index (`corerouter_model::ppp_secrets`).
         match self.cfg.ppp.secret(&user).cloned() {
             Some(sec) if sec.disabled => self.reject(i, sref, "secret disabled"),
             Some(sec) => self.local(i, sref, req, &sec, &default_profile),
@@ -1226,12 +2070,7 @@ impl Bng {
             .cfg
             .ppp
             .effective(Some(sec), &sec.profile, default_profile);
-        if e.only_one
-            && self
-                .subs
-                .values()
-                .any(|s| s.user == sec.name && s.up_at.is_some())
-        {
+        if e.only_one && self.index.users_up.contains_key(&sec.name) {
             return self.reject(i, sref, "only-one: the user is already connected");
         }
         let Some(mschap2) = req.verify_local(&sec.password) else {
@@ -1275,7 +2114,7 @@ impl Bng {
         // A fixed address held by another session: refuse rather than
         // hand one address to two subscribers.
         let ipv4 = match fixed {
-            Some(ip) if !self.pools.hold(ip) => {
+            Some(ip) if !guard(&self.pools).hold(ip) => {
                 sub.reply_message = Some(format!("address {ip} is in use"));
                 self.replies.push_back((
                     i,
@@ -1292,7 +2131,7 @@ impl Bng {
             }
             None => match pool
                 .as_deref()
-                .and_then(|p| self.pools.take(&self.cfg.pools, p))
+                .and_then(|p| guard(&self.pools).take(&self.cfg.pools, p))
             {
                 Some((ip, from)) => {
                     sub.ip = Some(ip);
@@ -1310,7 +2149,13 @@ impl Bng {
         sub.radius = radius;
         sub.interim = interim;
         sub.session_timeout = timeout;
-        guard(&self.shared).stats.auth_accept += 1;
+        self.counts.auth_accept += 1;
+        let mode = match sub.effective.use_ipv6 {
+            corerouter_model::ppp::UseIpv6::No => Ipv6Mode::Off,
+            corerouter_model::ppp::UseIpv6::Require => Ipv6Mode::Require,
+            _ => Ipv6Mode::On,
+        };
+        self.replies.push_back((i, sref, Reply::Ipv6(mode)));
         let auth = Authorization {
             mschap2_success: mschap2,
             message: Box::default(),
@@ -1390,9 +2235,40 @@ impl Bng {
                 Attribute::new("NAS-Port-Type", "5"),
             ],
         };
+        // auto: no more questions out than the window; the rest wait here,
+        // their CPEs in the Authenticate phase (repeats ignored while one
+        // is pending), and go as answers come back.
+        if self
+            .slots
+            .get(i)
+            .is_some_and(|s| s.cfg.new_session_rate_auto)
+            && self.pending_auth >= self.admission.window(self.lanes)
+        {
+            self.auth_queue.push_back((i, sref, r));
+            self.queued_total += 1;
+            return;
+        }
+        self.send_radius(now, i, sref, r, aaa);
+    }
+
+    /// One Access-Request out, called off if the session ends first.
+    fn send_radius(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        r: RadiusRequest,
+        aaa: &Arc<dyn AaaBackend>,
+    ) {
         let tx = self.auth_tx.clone();
         self.pending_auth += 1;
-        aaa.authenticate(
+        // Called off if the session ends first (the CPE gave up, LCP or the
+        // setup timed out): the server is not spent on it (G4.3g).
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
+            sub.auth_cancel = Some(cancel.clone());
+        }
+        aaa.authenticate_until(
             r,
             Box::new(move |reply| {
                 // The BNG's thread reads it; nothing else happens here.
@@ -1403,13 +2279,45 @@ impl Bng {
                     reply,
                 });
             }),
+            cancel,
         );
     }
 
-    /// RADIUS answers that arrived.
+    /// Queued Access-Requests out while the window has room; those of
+    /// sessions that ended meanwhile are dropped.
+    fn drain_auth_queue(&mut self, now: Millis) {
+        let Some(aaa) = self.cfg.aaa.clone() else {
+            self.auth_queue.clear();
+            return;
+        };
+        while self.pending_auth < self.admission.window(self.lanes) {
+            let Some((i, sref, r)) = self.auth_queue.pop_front() else {
+                break;
+            };
+            if self
+                .subs
+                .get(&(i, sref.sid))
+                .is_some_and(|s| s.sref == sref && s.up_at.is_none())
+            {
+                self.send_radius(now, i, sref, r, &aaa);
+            }
+        }
+    }
+
+    /// RADIUS answers that arrived, then what the window lets out.
     pub(crate) fn radius(&mut self, now: Millis) {
+        self.radius_answers(now);
+        self.drain_auth_queue(now);
+    }
+
+    fn radius_answers(&mut self, now: Millis) {
         while let Ok(done) = self.auth_rx.try_recv() {
             self.pending_auth = self.pending_auth.saturating_sub(1);
+            let late = now.saturating_sub(done.asked);
+            self.admission.answer(
+                late,
+                matches!(done.reply.outcome, AuthOutcome::Timeout) || late > RADIUS_GRACE_MS,
+            );
             let key = (done.slot, done.sref.sid);
             if self.subs.get(&key).is_none_or(|s| s.sref != done.sref)
                 || now.saturating_sub(done.asked) > RADIUS_GRACE_MS
@@ -1459,7 +2367,14 @@ impl Bng {
                     let interim = attr("Acct-Interim-Interval").and_then(|v| v.parse::<u32>().ok());
                     let mschap2 = attr("MS-CHAP2-Success").and_then(|v| success_string(&v));
                     let list = attr("Mikrotik-Address-List");
+                    let r6 = RadiusV6::of(
+                        done.reply
+                            .attributes
+                            .iter()
+                            .map(|a| (a.name.as_str(), a.value.as_str())),
+                    );
                     if let Some(sub) = self.subs.get_mut(&key) {
+                        sub.radius6 = r6;
                         sub.effective = e;
                         if list.is_some() {
                             sub.effective.address_list = list;
@@ -1500,6 +2415,7 @@ impl Bng {
         let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
             return;
         };
+        self.index.remove((i, sref.sid), sub);
         sub.up_at = Some(now);
         sub.list_at = now;
         sub.stage = Stage::Up;
@@ -1510,13 +2426,20 @@ impl Bng {
         if sub.ip.is_none() {
             sub.ip = d.ipv4;
         }
+        self.index.add((i, sref.sid), sub);
+        if xdp.is_none()
+            && let Some(ip) = sub.ip
+            && let Ok(mut r) = self.routes.write()
+        {
+            r.insert(ip, self.lane);
+        }
         let ip = sub.ip;
         let user = sub.user.clone();
         let mac = mac_text(sub.mac);
         match xdp {
             Some(idx) => self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                 idx,
-                xdp_session(d, sub.rate.as_deref()),
+                xdp_session(d, sub.rate.as_deref(), sub.v6.as_deref()),
             ))),
             None => {
                 if let Some(ip) = ip {
@@ -1554,28 +2477,42 @@ impl Bng {
             limit_bytes_out: (sub.limit_out > 0).then_some(sub.limit_out),
             ..ActiveSession::default()
         };
+        let mut a = a;
+        if let Some(f) = sub.v6.as_deref().map(active_v6) {
+            f.apply(&mut a);
+        }
+        let v6_attrs = sub
+            .v6
+            .as_deref()
+            .map(V6::acct_attributes)
+            .unwrap_or_default();
         let radius_acct = sub.radius || self.cfg.ppp.aaa.use_radius;
         let interim = sub.interim;
         let list = sub.effective.address_list.clone();
         let hooks = sub.effective.on_up.clone();
         {
+            let h = HistoryEntry {
+                at: unix,
+                name: user.clone(),
+                caller_id: mac.clone(),
+                server: server.clone(),
+                event: "up".into(),
+                stage: Some(Stage::Up),
+                address: ip,
+                ..HistoryEntry::default()
+            };
+            {
+                let mut w = guard(&self.why);
+                w.reach(&[&user, &mac], Stage::Up);
+                w.record(&[&user, &mac], &h);
+            }
             let mut sh = guard(&self.shared);
             sh.active.insert(id.clone(), a);
             sh.by_acct.insert(acct_id.clone(), id.clone());
-            sh.reach(&[&user, &mac], Stage::Up);
-            sh.record(
-                &[&user, &mac],
-                HistoryEntry {
-                    at: unix,
-                    name: user.clone(),
-                    caller_id: mac.clone(),
-                    server: server.clone(),
-                    event: "up".into(),
-                    stage: Some(Stage::Up),
-                    address: ip,
-                    ..HistoryEntry::default()
-                },
-            );
+            if let Some(ip) = ip {
+                sh.by_ip.insert(ip, id.clone());
+            }
+            sh.record(h);
         }
         if radius_acct
             && self.cfg.ppp.aaa.accounting
@@ -1593,7 +2530,11 @@ impl Bng {
                 counters: None,
                 terminate_cause: None,
                 interim_secs: interim,
-                attributes: acct_attributes(ip, &mac, &interface),
+                attributes: {
+                    let mut a = acct_attributes(ip, &mac, &interface);
+                    a.extend(v6_attrs);
+                    a
+                },
             };
             if let Err(e) = aaa.account(req, Some(src)) {
                 self.log(
@@ -1656,13 +2597,19 @@ impl Bng {
         }
     }
 
+    /// A free XDP slot of this worker's lane (slots `lane`, `lane +
+    /// lanes`, …: no lock between workers).
     fn slot_index(&mut self) -> Option<u32> {
         if let Some(i) = self.xdp_free.pop() {
             return Some(i);
         }
-        (self.xdp_next < XDP_SLOTS).then(|| {
+        let idx = self
+            .xdp_next
+            .checked_mul(u32::from(self.lanes))?
+            .checked_add(u32::from(self.lane))?;
+        (idx < XDP_SLOTS).then(|| {
             self.xdp_next += 1;
-            self.xdp_next - 1
+            idx
         })
     }
 
@@ -1686,7 +2633,16 @@ impl Bng {
             self.effects.push(Effect::Route { ip, add: false });
         }
         if let Some(ip) = sub.ip {
-            self.pools.give_back(ip);
+            guard(&self.pools).give_back(ip);
+        }
+        if let Some(x) = &sub.v6 {
+            for (n, src) in [&x.link, &x.delegated].into_iter().flatten() {
+                let pool = match src {
+                    Source::Pool(p) => Some(p.as_str()),
+                    Source::Radius => None,
+                };
+                guard(&self.pools6).give_back(*n, pool);
+            }
         }
         let mac = mac_text(sub.mac);
         let server = self
@@ -1704,6 +2660,11 @@ impl Bng {
             let mut sh = guard(&self.shared);
             let gone = sh.active.remove(&id);
             sh.by_acct.remove(&sub.acct_id);
+            if let Some(ip) = sub.ip
+                && sh.by_ip.get(&ip) == Some(&id)
+            {
+                sh.by_ip.remove(&ip);
+            }
             gone
         };
         let uptime = sub.up_at.map_or(0, |t| now.saturating_sub(t) / 1000);
@@ -1722,7 +2683,13 @@ impl Bng {
                     counters: Some(counters),
                     terminate_cause: Some(cause),
                     interim_secs: None,
-                    attributes: acct_attributes(sub.ip, &mac, &interface),
+                    attributes: {
+                        let mut a = acct_attributes(sub.ip, &mac, &interface);
+                        if let Some(x) = &sub.v6 {
+                            a.extend(x.acct_attributes());
+                        }
+                        a
+                    },
                 };
                 if let Err(e) = aaa.account(req, None) {
                     self.log(
@@ -1768,7 +2735,8 @@ impl Bng {
             rx_bytes: gone.as_ref().map_or(0, |a| a.rx_bytes),
             tx_bytes: gone.as_ref().map_or(0, |a| a.tx_bytes),
         };
-        guard(&self.shared).record(&[&sub.user, &mac], h);
+        guard(&self.why).record(&[&sub.user, &mac], &h);
+        guard(&self.shared).record(h);
         if was_up {
             self.log(
                 false,
@@ -1824,7 +2792,8 @@ impl Bng {
             hint: hint.into(),
             ..HistoryEntry::default()
         };
-        guard(&self.shared).record(&[&mac], h);
+        guard(&self.why).record(&[&mac], &h);
+        guard(&self.shared).record(h);
         self.log(
             false,
             format!("PPP: sessão de {mac} caiu antes do login ({key}): {hint}"),
@@ -1849,6 +2818,7 @@ impl Bng {
     /// uptime, idle and byte limits, and what the commands and the RADIUS
     /// service asked for.
     pub(crate) fn tick(&mut self, now: Millis, xdp: &[(u32, PppoeCounters)]) {
+        self.ra_tick(now);
         let by_idx: HashMap<u32, PppoeCounters> = xdp.iter().copied().collect();
         // PADIs the servers' limiters held back count as throttled too.
         let limited: u64 = self
@@ -1856,7 +2826,35 @@ impl Bng {
             .iter()
             .map(|s| s.server.stats().padi_limited)
             .sum();
-        guard(&self.shared).stats.throttled = self.padr_throttled + limited;
+        let throttled = self.padr_throttled + limited;
+        // new_session_rate=auto: one AIMD step a second.
+        self.admission
+            .second(self.padr_throttled + self.queued_total, self.pending_auth);
+        let rate = share(self.admission.rate as u32, self.lanes);
+        let mut auto = false;
+        for s in self
+            .slots
+            .iter_mut()
+            .filter(|s| s.cfg.new_session_rate_auto)
+        {
+            s.bucket.set_rate(rate);
+            auto = true;
+        }
+        {
+            let mut sh = guard(&self.shared);
+            let lane = usize::from(self.lane);
+            if sh.lanes.len() <= lane {
+                sh.lanes.resize(lane + 1, LaneStats::default());
+            }
+            if let Some(l) = sh.lanes.get_mut(lane) {
+                *l = LaneStats {
+                    throttled,
+                    admission_rate: if auto { rate } else { 0 },
+                    admission_reason: auto.then(|| self.admission.reason.clone()),
+                    counts: self.counts,
+                };
+            }
+        }
         let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
         {
             let mut sh = guard(&self.shared);
@@ -1929,13 +2927,28 @@ impl Bng {
 
     /// `ppp.active.remove`, Disconnect and CoA rate changes.
     pub(crate) fn requests(&mut self, now: Millis) {
+        // Each worker takes the requests for its own SESSION_IDs and leaves
+        // the rest for the others (the id says which: `*server-sid`).
+        let (lane, lanes) = (self.lane, self.lanes);
+        let mine = |id: &str| parse_session_id(id).is_none_or(|(_, sid)| sid % lanes == lane);
         let (ids, rates, lists) = {
             let mut sh = guard(&self.shared);
-            (
-                std::mem::take(&mut sh.terminate),
-                std::mem::take(&mut sh.rates),
-                std::mem::take(&mut sh.lists),
-            )
+            if sh.terminate.is_empty() && sh.rates.is_empty() && sh.lists.is_empty() {
+                return;
+            }
+            let (ids, rest): (Vec<String>, Vec<String>) = std::mem::take(&mut sh.terminate)
+                .into_iter()
+                .partition(|id| mine(id));
+            sh.terminate = rest;
+            let (rates, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.rates)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.rates = rest;
+            let (lists, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.lists)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.lists = rest;
+            (ids, rates, lists)
         };
         for (id, list) in lists {
             let Some((i, sref)) = self.find(&id) else {
@@ -1987,7 +3000,7 @@ impl Bng {
                 if let Some(idx) = sub.xdp {
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                         idx,
-                        xdp_session(&d, Some(&rate)),
+                        xdp_session(&d, Some(&rate), sub.v6.as_deref()),
                     )));
                 }
                 let user = sub.user.clone();
@@ -2002,11 +3015,12 @@ impl Bng {
         }
     }
 
+    /// The session of an id from `ppp.active` (`*server-sid`), in O(1)
+    /// (a walk of every session per id made removing N sessions O(N²)).
     fn find(&self, id: &str) -> Option<(usize, SessionRef)> {
-        self.subs
-            .iter()
-            .find(|((slot, sid), _)| session_id(*slot, &self.slots, *sid) == id)
-            .map(|(_, s)| (s.slot, s.sref))
+        let (server, sid) = parse_session_id(id)?;
+        let slot = self.slots.iter().position(|s| s.cfg.id.0 == server)?;
+        self.subs.get(&(slot, sid)).map(|s| (s.slot, s.sref))
     }
 
     /// End every session (service stopping): Terminate and PADT to each.
@@ -2039,13 +3053,74 @@ impl Bng {
         if unique.len() != ips.len() {
             return Err("an address is held by two sessions".into());
         }
+        let mut again = SubIndex::default();
+        for (k, sub) in &self.subs {
+            again.add(*k, sub);
+        }
+        if again.by_ip != self.index.by_ip
+            || again.users_up != self.index.users_up
+            || again.pending != self.index.pending
+        {
+            return Err("the session index disagrees with the sessions".into());
+        }
+        // G4.3e: every prefix taken is a live session's, once.
+        let v6: Vec<ipnet::Ipv6Net> = self
+            .subs
+            .values()
+            .filter_map(|s| s.v6.as_deref())
+            .flat_map(|x| [x.link.as_ref(), x.delegated.as_ref()])
+            .flatten()
+            .map(|p| p.0)
+            .collect();
+        let unique6: HashSet<_> = v6.iter().copied().collect();
+        // The pools are shared by the workers: their count is everyone's.
+        let taken = guard(&self.pools6).taken();
+        if unique6.len() != v6.len() || (self.lanes == 1 && v6.len() != taken) {
+            return Err(format!(
+                "IPv6 prefixes: {} held, {} distinct, {taken} taken",
+                v6.len(),
+                unique6.len(),
+            ));
+        }
         Ok(())
+    }
+}
+
+/// The IPv6 columns of a session's `ppp.active` row.
+struct ActiveV6 {
+    prefix: Option<ipnet::Ipv6Net>,
+    delegated: Option<ipnet::Ipv6Net>,
+    bound: bool,
+    link_local: std::net::Ipv6Addr,
+}
+
+impl ActiveV6 {
+    fn apply(self, a: &mut ActiveSession) {
+        a.ipv6_prefix = self.prefix;
+        a.delegated_prefix = self.delegated;
+        a.delegated_bound = self.bound;
+        a.link_local = Some(self.link_local);
+    }
+}
+
+fn active_v6(x: &V6) -> ActiveV6 {
+    ActiveV6 {
+        prefix: x.link.as_ref().map(|l| l.0),
+        delegated: x.delegated.as_ref().map(|d| d.0),
+        bound: x.pd_bound(),
+        link_local: x.peer(),
     }
 }
 
 fn session_id(slot: usize, slots: &[Slot], sid: u16) -> String {
     let server = slots.get(slot).map_or(0, |s| s.cfg.id.0);
     format!("*{server:X}-{sid}")
+}
+
+/// [`session_id`] read back: (server id, SESSION_ID).
+fn parse_session_id(id: &str) -> Option<(u32, u16)> {
+    let (server, sid) = id.strip_prefix('*')?.split_once('-')?;
+    Some((u32::from_str_radix(server, 16).ok()?, sid.parse().ok()?))
 }
 
 fn assignment(ip: Ipv4Addr, dns: &[Ipv4Addr]) -> Ipv4Assignment {
@@ -2102,6 +3177,7 @@ fn rate_dir(r: &RateLimit, up: bool) -> Rate {
 fn xdp_session(
     d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
     rate: Option<&str>,
+    v6: Option<&V6>,
 ) -> PppoeSession {
     let r = rate
         .and_then(|t| t.parse::<RateLimit>().ok())
@@ -2121,5 +3197,116 @@ fn xdp_session(
         fast_up: false,
         fast_down: true,
         ipoe: false,
+        ipv6_prefix: v6
+            .and_then(|x| x.link.as_ref())
+            .map(|(n, _)| v6::high64(*n)),
+        delegated: v6
+            .and_then(|x| x.delegated.as_ref())
+            .map(|(n, _)| (v6::high64(*n), n.prefix_len())),
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    // The bench includes this file with cfg(test) and no test harness.
+    #[allow(unused_imports)]
+    use super::*;
+
+    #[test]
+    fn why_evicts_the_least_recently_used_not_everything() {
+        let mut sh = WhyTable {
+            why_cap: 3,
+            ..WhyTable::default()
+        };
+        for k in ["a", "b", "c"] {
+            sh.reach(&[k], Stage::Padi);
+        }
+        sh.reach(&["a"], Stage::Auth);
+        sh.reach(&["d"], Stage::Padi);
+        let mut keys: Vec<&str> = sh.why.keys().map(|k| &**k).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["a", "c", "d"], "b was the oldest unused");
+        // A flood of new keys keeps the table at its size.
+        for i in 0..10_000 {
+            sh.reach(&[&format!("m{i}")], Stage::Padi);
+        }
+        assert_eq!(sh.why.len(), 3);
+        assert!(sh.why_order.len() <= 2 * 3 + 1024 + 1);
+        assert!(sh.why.contains_key("m9999"));
+    }
+
+    #[test]
+    fn auto_rate_follows_the_radius_server() {
+        let mut held = 0;
+        // One second: `n` answers in `ms`, a timeout or not, CPEs waiting
+        // or not.
+        let mut second = |a: &mut Admission, n: usize, ms: u64, timeout: bool, waiting: bool| {
+            for _ in 0..n {
+                a.answer(ms, false);
+            }
+            if timeout {
+                a.answer(1100, true);
+            }
+            if waiting {
+                held += 10;
+            }
+            a.second(held, 0);
+        };
+        let mut a = Admission::default();
+        // Startup: twice what the server answered, while that keeps growing
+        // (not twice the last rate: that ran to 3.6× the capacity).
+        second(&mut a, 100, 20, false, true);
+        assert_eq!(a.rate, 200.0);
+        assert!(a.reason.contains("100/s"), "{}", a.reason);
+        // The answers stop growing (the server's capacity: 100/s): after
+        // three such seconds the rate is that capacity times BBR's gains.
+        for _ in 0..4 {
+            second(&mut a, 100, 20, false, true);
+        }
+        assert!(!a.startup);
+        assert!((90.0..=125.0).contains(&a.rate), "{}", a.rate);
+        assert!(
+            a.reason.contains("capacidade do RADIUS: 100/s"),
+            "{}",
+            a.reason
+        );
+        // A standing queue (380 ms against 20 ms with none): 0.9× the capacity.
+        second(&mut a, 100, 380, false, true);
+        assert_eq!(a.rate, 90.0);
+        assert_eq!(a.reason, "RADIUS lento: 380 ms (sem fila: 20 ms)");
+        // A timeout: 0.75× the capacity, never the floor while it answers.
+        second(&mut a, 100, 20, true, true);
+        assert_eq!(a.rate, 75.0);
+        assert!(a.reason.starts_with("RADIUS sem resposta"), "{}", a.reason);
+        // No queue: it holds.
+        let r = a.rate;
+        second(&mut a, 100, 20, false, false);
+        assert_eq!(a.rate, r);
+        assert_eq!(a.reason, "sem fila");
+        // Questions out and a whole second without an answer: halved.
+        a.second(1 << 40, 40);
+        assert_eq!(a.rate, (r / 2.0).max(AUTO_MIN));
+        assert!(a.reason.starts_with("RADIUS parado"), "{}", a.reason);
+        // Local secrets (no RADIUS answers ever) and CPEs waiting: it grows.
+        let mut b = Admission::default();
+        second(&mut b, 0, 0, false, true);
+        assert_eq!(b.rate, AUTO_START + AUTO_STEP);
+        // The window: a small one before any answer; then the capacity
+        // times the base answer time (at least 300 ms), twice while
+        // probing, shared by the workers; the backlog: 10 s of capacity.
+        b.rate = 2000.0;
+        assert_eq!(b.window(1), AUTO_WINDOW_START);
+        assert_eq!(b.window(4), AUTO_WINDOW_START / 4);
+        b.delivered.push_back(2000.0);
+        b.startup = false;
+        assert_eq!(b.window(1), 600);
+        assert_eq!(b.window(4), 150);
+        b.startup = true;
+        assert_eq!(b.window(1), 1200);
+        b.startup = false;
+        b.delivered.clear();
+        assert_eq!(b.backlog(1), 20_000);
+        b.rate = AUTO_MIN;
+        assert_eq!(b.window(8), AUTO_WINDOW_MIN);
     }
 }

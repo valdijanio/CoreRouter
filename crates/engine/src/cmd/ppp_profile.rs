@@ -4,7 +4,7 @@
 //! cannot be removed. Changes apply to new sessions.
 
 use corerouter_model::ItemId;
-use corerouter_model::ppp::{AddrOrPool, MAX_PROFILES, PppProfile, Tri};
+use corerouter_model::ppp::{AddrOrPool, MAX_PROFILES, PppProfile, Tri, UseIpv6};
 use serde_json::{Value, json};
 
 use super::args::{opt_str, opt_text};
@@ -15,18 +15,18 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.profile.add", "Add PPP Profile", [], None,
-        "{name: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string} → {id, name, warnings}",
+        "{name: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4)} → {id, name, warnings}",
         always, add),
     cmd!("ppp.profile.set", "Set PPP Profile", [], None,
-        "{id: *hex | name, name?: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string} → {id, name, warnings}",
+        "{id: *hex | name, name?: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4)} → {id, name, warnings}",
         always, set),
     cmd!("ppp.profile.remove", "Remove PPP Profile", [], None,
         "{id: *hex | name} → {id, name}", always, remove),
     cmd!(query "ppp.profile.preview", "PPP Profile Preview", [], None,
-        "{id?: *hex | name, name?: string, local_address?: string, remote_address?: string, dns_server?: string, rate_limit?: string, address_list?: string, only_one?: string, change_tcp_mss?: string, idle_timeout?: string, session_timeout?: string, on_up?: string, on_down?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        "{id?: *hex | name, name?: string, local_address?: string, remote_address?: string, dns_server?: string, rate_limit?: string, address_list?: string, only_one?: string, change_tcp_mss?: string, idle_timeout?: string, session_timeout?: string, on_up?: string, on_down?: string, comment?: string, use_ipv6?: string, remote_ipv6_prefix_pool?: string, dhcpv6_pd_pool?: string, dhcpv6_lease_time?: string, dns_server_ipv6?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
         always, preview),
     cmd!(query "ppp.profile.list", "PPP Profiles", [], None,
-        "{} → [{id, name, builtin, default (built in), local_address?, remote_address?, dns_server, rate_limit?, address_list?, only_one, change_tcp_mss, idle_timeout?, session_timeout?, on_up (JSON text), on_down, comment?, secrets (that use it), active (sessions up with it)}]",
+        "{} → [{id, name, builtin, default (built in), local_address?, remote_address?, dns_server, rate_limit?, address_list?, only_one, change_tcp_mss, idle_timeout?, session_timeout?, on_up (JSON text), on_down, comment?, use_ipv6, remote_ipv6_prefix_pool?, dhcpv6_pd_pool?, dhcpv6_lease_time?, dns_server_ipv6, secrets (that use it), active (sessions up with it)}]",
         always, list),
 ];
 
@@ -51,6 +51,63 @@ fn addr(s: &Session, p: &Value, key: &str) -> Result<Option<Option<AddrOrPool>>>
         return Err(EngineError::bad(key, format!("no /ip pool '{shown}' (ip.pool.add)")));
     }
     Ok(Some(Some(a)))
+}
+
+/// A `/ipv6 pool` name whose pieces are `lens` long (empty clears).
+fn pool6(s: &Session, p: &Value, key: &str, lens: std::ops::RangeInclusive<u8>) -> Result<Option<Option<String>>> {
+    let Some(t) = opt_str(p, key)? else {
+        return Ok(None);
+    };
+    let t = t.trim();
+    if t.is_empty() || t == "none" {
+        return Ok(Some(None));
+    }
+    let shown: String = t.chars().take(64).collect();
+    let pool = s
+        .store()
+        .candidate()
+        .ipv6
+        .dhcp_server
+        .pool(t)
+        .ok_or_else(|| EngineError::bad(key, format!("no /ipv6 pool '{shown}' (ipv6.pool.add)")))?;
+    if !lens.contains(&pool.prefix_length) {
+        return Err(EngineError::bad(
+            key,
+            format!(
+                "/ipv6 pool '{shown}' hands out /{}; this needs {}..={}",
+                pool.prefix_length,
+                lens.start(),
+                lens.end()
+            ),
+        ));
+    }
+    Ok(Some(Some(t.to_owned())))
+}
+
+fn ips6(p: &Value, key: &str) -> Result<Option<Vec<std::net::Ipv6Addr>>> {
+    let items: Vec<String> = match p.get(key) {
+        None => return Ok(None),
+        Some(Value::String(t)) => t.split(',').map(str::trim).filter(|x| !x.is_empty()).map(String::from).collect(),
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(String::from).ok_or_else(|| EngineError::bad(key, "a list of IPv6 addresses"))).collect::<Result<_>>()?,
+        Some(_) => return Err(EngineError::bad(key, "a list of IPv6 addresses")),
+    };
+    if items.len() > corerouter_model::ppp::MAX_DNS6 {
+        return Err(EngineError::bad(key, format!("at most {}", corerouter_model::ppp::MAX_DNS6)));
+    }
+    items
+        .iter()
+        .map(|t| {
+            let a: std::net::Ipv6Addr = t.parse().map_err(|_| {
+                let shown: String = t.chars().take(48).collect();
+                EngineError::bad(key, format!("'{shown}' is not an IPv6 address"))
+            })?;
+            if a.is_unspecified() || a.is_multicast() {
+                return Err(EngineError::bad(key, format!("{a} cannot be a DNS server")));
+            }
+            Ok(a)
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(Some)
 }
 
 fn timeout(p: &Value, key: &str) -> Result<Option<Option<u32>>> {
@@ -103,6 +160,26 @@ fn apply(s: &Session, pr: &mut PppProfile, p: &Value) -> Result<()> {
     if let Some(c) = opt_text(p, "comment", 256)? {
         pr.comment = c;
     }
+    if let Some(t) = opt_str(p, "use_ipv6")? {
+        pr.use_ipv6 = UseIpv6::parse(t).ok_or_else(|| EngineError::bad("use_ipv6", "default, yes, no or require"))?;
+    }
+    if let Some(v) = pool6(s, p, "remote_ipv6_prefix_pool", 64..=64)? {
+        pr.remote_ipv6_prefix_pool = v;
+    }
+    if let Some(v) = pool6(s, p, "dhcpv6_pd_pool", 48..=64)? {
+        pr.dhcpv6_pd_pool = v;
+    }
+    if let Some(t) = timeout(p, "dhcpv6_lease_time")? {
+        // RFC 4861 §6.2.1 / RFC 9915 §21.4: below a few minutes the CPE
+        // renews all the time.
+        if t.is_some_and(|v| v < 300) {
+            return Err(EngineError::bad("dhcpv6_lease_time", "at least 5m"));
+        }
+        pr.dhcpv6_lease_time = t;
+    }
+    if let Some(d) = ips6(p, "dns_server_ipv6")? {
+        pr.dns_server_ipv6 = d;
+    }
     Ok(())
 }
 
@@ -110,6 +187,12 @@ fn warnings(pr: &PppProfile) -> Vec<String> {
     let mut w = Vec::new();
     if pr.remote_address.is_none() && pr.name != corerouter_model::ppp::DEFAULT_ENCRYPTION {
         w.push("no remote_address: subscribers get an address only from their secret or RADIUS (Framed-IP-Address / Framed-Pool)".into());
+    }
+    if pr.use_ipv6 == UseIpv6::No && (pr.remote_ipv6_prefix_pool.is_some() || pr.dhcpv6_pd_pool.is_some()) {
+        w.push("use_ipv6=no: the IPv6 pools of this profile are not used".into());
+    }
+    if pr.use_ipv6 == UseIpv6::Require && pr.remote_ipv6_prefix_pool.is_none() && pr.dhcpv6_pd_pool.is_none() {
+        w.push("use_ipv6=require without IPv6 pools: the session needs IPv6CP but gets only a link-local address unless RADIUS sends a prefix".into());
     }
     if pr.change_tcp_mss == Tri::Yes {
         w.push("change_tcp_mss=yes clamps the MSS per session; with many subscribers one mangle rule (change-mss) is lighter".into());
@@ -212,6 +295,10 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
             json!({"label": "Rate limit", "value": opt(e.rate_limit)}),
             json!({"label": "Only one", "value": if e.only_one { "yes" } else { "no" }}),
             json!({"label": "Change TCP MSS", "value": if e.change_tcp_mss { "yes" } else { "no" }}),
+            json!({"label": "Use IPv6", "value": e.use_ipv6.as_str()}),
+            json!({"label": "IPv6 prefix pool", "value": opt(e.remote_ipv6_prefix_pool)}),
+            json!({"label": "DHCPv6 PD pool", "value": opt(e.dhcpv6_pd_pool)}),
+            json!({"label": "DHCPv6 lease time", "value": super::dhcp_server::secs_text(e.dhcpv6_lease_time)}),
         ]
     })
 }
@@ -245,6 +332,8 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 "change_tcp_mss": pr.change_tcp_mss.as_str(),
                 "on_up": hooks_text(&pr.on_up),
                 "on_down": hooks_text(&pr.on_down),
+                "use_ipv6": pr.use_ipv6.as_str(),
+                "dns_server_ipv6": pr.dns_server_ipv6,
                 "secrets": secrets,
                 "active": up,
             });
@@ -257,6 +346,9 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                     ("idle_timeout", pr.idle_timeout.map(super::dhcp_server::secs_text)),
                     ("session_timeout", pr.session_timeout.map(super::dhcp_server::secs_text)),
                     ("comment", Some(pr.comment.clone()).filter(|c| !c.is_empty())),
+                    ("remote_ipv6_prefix_pool", pr.remote_ipv6_prefix_pool.clone()),
+                    ("dhcpv6_pd_pool", pr.dhcpv6_pd_pool.clone()),
+                    ("dhcpv6_lease_time", pr.dhcpv6_lease_time.map(super::dhcp_server::secs_text)),
                 ] {
                     if let Some(val) = val {
                         o.insert(k.into(), json!(val));
@@ -334,6 +426,46 @@ mod tests {
             assert!(matches!(err, EngineError::BadParam { .. }), "{p}: {err}");
         }
         assert!(s.store().candidate().ppp.profiles.is_empty());
+    }
+
+    #[test]
+    fn ipv6_fields_and_their_pools() {
+        let mut s = lab();
+        s.execute("ipv6.pool.add", &json!({"name": "wan6", "prefix": "2001:db8:100::/44", "prefix_length": 64})).unwrap();
+        s.execute("ipv6.pool.add", &json!({"name": "pd6", "prefix": "2001:db8:8000::/36", "prefix_length": 56})).unwrap();
+        s.execute("ppp.profile.add", &json!({
+            "name": "dual", "use_ipv6": "require", "remote_ipv6_prefix_pool": "wan6", "dhcpv6_pd_pool": "pd6",
+            "dhcpv6_lease_time": "12h", "dns_server_ipv6": "2001:db8::53, 2001:db8::54"
+        }))
+        .unwrap();
+        let pr = s.store().running().ppp.profile("dual").unwrap();
+        assert_eq!(pr.use_ipv6, UseIpv6::Require);
+        assert_eq!(pr.dhcpv6_lease_time, Some(43_200));
+        assert_eq!(pr.dns_server_ipv6.len(), 2);
+        let row = s.execute("ppp.profile.list", &json!({})).unwrap()[2].clone();
+        assert_eq!(row["dhcpv6_pd_pool"], "pd6");
+        assert_eq!(row["dhcpv6_lease_time"], "12h");
+        let e = s.store().running().ppp.effective(None, "dual", "default");
+        assert_eq!(e.remote_ipv6_prefix_pool.as_deref(), Some("wan6"));
+        // The built-in resolves to yes and one day.
+        let d = s.store().running().ppp.effective(None, "default", "default");
+        assert_eq!((d.use_ipv6, d.dhcpv6_lease_time), (UseIpv6::Yes, 86_400));
+        // Wrong piece sizes, unknown pools, bad DNS, short lease.
+        for p in [
+            json!({"id": "dual", "remote_ipv6_prefix_pool": "pd6"}),
+            json!({"id": "dual", "dhcpv6_pd_pool": "nope"}),
+            json!({"id": "dual", "dns_server_ipv6": "ff02::1"}),
+            json!({"id": "dual", "dns_server_ipv6": "1.1.1.1"}),
+            json!({"id": "dual", "dhcpv6_lease_time": "1m"}),
+            json!({"id": "dual", "use_ipv6": "maybe"}),
+        ] {
+            assert!(matches!(s.execute("ppp.profile.set", &p), Err(EngineError::BadParam { .. })), "{p}");
+        }
+        // A pool a profile uses cannot be removed.
+        let err = s.execute("ipv6.pool.remove", &json!({"id": "pd6"})).unwrap_err();
+        assert!(err.to_string().contains("ppp profile dual"), "{err}");
+        s.execute("ppp.profile.set", &json!({"id": "dual", "dhcpv6_pd_pool": ""})).unwrap();
+        s.execute("ipv6.pool.remove", &json!({"id": "pd6"})).unwrap();
     }
 
     #[test]

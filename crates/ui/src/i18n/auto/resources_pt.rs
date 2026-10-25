@@ -83,6 +83,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.check.oom", "## OOM kills\n\nProcessos que o kernel matou por falta de memória na última hora."),
     ("resources.check.rss", "## RSS balance\n\nUma CPU recebendo mais da metade dos softirqs de rede (com 4 CPUs ou mais e tráfego): a placa não espalha os fluxos."),
     ("resources.check.services", "## Services\n\nServiços do daemon em falha (erro) ou parados/reiniciando (aviso)."),
+    ("resources.check.sockbuf", "## Socket buffers\n\nOs sockets do RADIUS e das portas PPPoE receberam um buffer de recepção menor que o pedido: o `net.core.rmem_max` cortou e o daemon não tem CAP_NET_ADMIN para passar dele. Numa queda geral, milhares de CPEs voltam juntos: as respostas do RADIUS e os PADIs transbordam o buffer e viram retransmissão (no laboratório, 1000 respostas levaram 6,6 s com o buffer padrão e 5 ms com 4 MiB). Suba o `net.core.rmem_max` em System › Tuning."),
     ("resources.check.swap", "## Swap\n\nSwap em uso (aviso 50 %, erro 90 %) ou leitura do swap acima de 100 páginas/s, sinal de que a memória não basta."),
     ("resources.check.temperature", "## Temperature\n\nO sensor mais quente contra o limite crítico: aviso a 10 °C dele (ou acima do max), erro a 3 °C."),
     ("resources.checks", "## Verificações de saúde\n\nO que o roteador confere sobre si mesmo, cada item com severidade, motivo e (passe o mouse) o que fazer. Uma mudança de estado mantida por duas leituras vai para o log uma vez."),

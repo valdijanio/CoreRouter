@@ -6,12 +6,14 @@
 //! shape `ppp.active.list`, `ppp.why` and `ppp.history` return.
 
 use std::fmt;
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
+
+use ipnet::Ipv6Net;
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 
-use crate::cow::CowArc;
+use crate::ppp_secrets::Secrets;
 use crate::types::{IfName, ItemId, MacAddr, ParseError};
 
 /// Spread of the interim updates, % of the interval (RFC 5080 §2.2.1 asks
@@ -27,6 +29,48 @@ fn yes() -> bool {
 fn jitter() -> u8 {
     DEFAULT_INTERIM_JITTER
 }
+
+/// RouterOS `/ppp profile use-ipv6` (G4.3e): `default` follows the
+/// fallback profiles and ends as `yes` (RouterOS: on when the IPv6 package
+/// is installed, and IPv6 is always built in here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UseIpv6 {
+    #[default]
+    Default,
+    Yes,
+    No,
+    /// IPv6CP must open, or the session ends.
+    Require,
+}
+
+impl UseIpv6 {
+    pub const ALL: [Self; 4] = [Self::Default, Self::Yes, Self::No, Self::Require];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Require => "require",
+        }
+    }
+
+    pub fn parse(t: &str) -> Option<Self> {
+        match t.trim() {
+            "default" => Some(Self::Default),
+            "yes" | "true" => Some(Self::Yes),
+            "no" | "false" => Some(Self::No),
+            "require" => Some(Self::Require),
+            _ => None,
+        }
+    }
+}
+
+/// RouterOS `dhcpv6-lease-time` default: one day.
+pub const DEFAULT_DHCPV6_LEASE: u32 = 86_400;
+/// IPv6 DNS servers a profile lists at most (RDNSS and DHCPv6 option 23).
+pub const MAX_DNS6: usize = 4;
 
 /// RouterOS `/ppp aaa`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,16 +120,34 @@ pub struct Ppp {
     /// Copy-on-write: a config of 100 k subscribers is not copied by every
     /// command that clones the config.
     #[serde(skip_serializing_if = "no_secrets")]
-    pub secrets: CowArc<Vec<PppSecret>>,
+    pub secrets: Secrets,
     /// `/interface pppoe-server server`.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pppoe_servers: Vec<PppoeServer>,
     /// Next id of the three tables (never reused).
     #[serde(skip_serializing_if = "is_zero")]
     pub next_id: u32,
+    /// Control-plane workers of the PPPoE service (G4.3g), one per core:
+    /// 0 = auto ([`pppoe_workers_auto`]). Read when the service starts.
+    #[serde(default, skip_serializing_if = "is_zero16")]
+    pub pppoe_workers: u16,
 }
 
-fn no_secrets(v: &CowArc<Vec<PppSecret>>) -> bool {
+fn is_zero16(v: &u16) -> bool {
+    *v == 0
+}
+
+/// Most workers the PPPoE service runs.
+pub const PPPOE_WORKERS_MAX: u16 = 64;
+
+/// `workers=auto` on a machine of `cpus` CPUs: all but two (the reader
+/// thread and the rest of the router, including the data plane's softirqs),
+/// at most 8 (past that the reader is the limit, measured in G4.3g).
+pub fn pppoe_workers_auto(cpus: usize) -> u16 {
+    u16::try_from(cpus.saturating_sub(2).clamp(1, 8)).unwrap_or(1)
+}
+
+fn no_secrets(v: &Secrets) -> bool {
     v.is_empty()
 }
 
@@ -277,6 +339,28 @@ pub struct PppProfile {
     pub on_down: Vec<PppHook>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub comment: String,
+    /// IPv6CP for the session (G4.3e).
+    #[serde(skip_serializing_if = "is_default_v6")]
+    pub use_ipv6: UseIpv6,
+    /// `/ipv6 pool` (prefix-length 64) of the link's /64, advertised in the
+    /// session's RA (SLAAC).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remote_ipv6_prefix_pool: Option<String>,
+    /// `/ipv6 pool` (prefix-length 48–64) of the prefix delegated by the
+    /// session's DHCPv6 (IA_PD).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcpv6_pd_pool: Option<String>,
+    /// Valid lifetime of the /64 and the delegated prefix, seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dhcpv6_lease_time: Option<u32>,
+    /// IPv6 DNS servers (RA RDNSS and DHCPv6), CoreRouter's addition: the
+    /// RouterOS profile has IPv4 ones only.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub dns_server_ipv6: Vec<Ipv6Addr>,
+}
+
+fn is_default_v6(v: &UseIpv6) -> bool {
+    *v == UseIpv6::Default
 }
 
 impl PppProfile {
@@ -554,6 +638,11 @@ pub struct PppoeServer {
     /// pool instead of a burst; 0 = no limit (Cisco `pppoe throttle`).
     #[serde(default = "rate_default")]
     pub new_session_rate: u32,
+    /// `new_session_rate=auto` (G4.3g): the rate follows the RADIUS
+    /// server's health (AIMD on its answer time and timeouts), from 1000/s
+    /// up to 20 000/s; `new_session_rate` is not used then. Not in RouterOS.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub new_session_rate_auto: bool,
     /// `pado-delay` by load: from this many sessions, wait this long before
     /// the PADO (accel-ppp `pado-delay=0,100:100,200:5000`), so a loaded BNG
     /// lets a lighter one answer first. Added to `pado_delay`.
@@ -649,6 +738,12 @@ pub struct Effective {
     pub session_timeout: Option<u32>,
     pub on_up: Vec<PppHook>,
     pub on_down: Vec<PppHook>,
+    /// Resolved: never `Default` (that ends as `Yes`).
+    pub use_ipv6: UseIpv6,
+    pub remote_ipv6_prefix_pool: Option<String>,
+    pub dhcpv6_pd_pool: Option<String>,
+    pub dhcpv6_lease_time: u32,
+    pub dns_server_ipv6: Vec<Ipv6Addr>,
 }
 
 impl Ppp {
@@ -681,8 +776,9 @@ impl Ppp {
         out
     }
 
+    /// O(1): the list's name index (`crate::ppp_secrets`).
     pub fn secret(&self, name: &str) -> Option<&PppSecret> {
-        self.secrets.iter().find(|s| s.name == name)
+        self.secrets.by_name(name)
     }
 
     /// `profile` over `fallback` (the server's default profile) over the
@@ -715,6 +811,19 @@ impl Ppp {
             session_timeout: pick(&chain, |p| p.session_timeout),
             on_up: chain.first().map(|p| p.on_up.clone()).unwrap_or_default(),
             on_down: chain.first().map(|p| p.on_down.clone()).unwrap_or_default(),
+            use_ipv6: chain
+                .iter()
+                .map(|p| p.use_ipv6)
+                .find(|u| *u != UseIpv6::Default)
+                .unwrap_or(UseIpv6::Yes),
+            remote_ipv6_prefix_pool: pick(&chain, |p| p.remote_ipv6_prefix_pool.clone()),
+            dhcpv6_pd_pool: pick(&chain, |p| p.dhcpv6_pd_pool.clone()),
+            dhcpv6_lease_time: pick(&chain, |p| p.dhcpv6_lease_time).unwrap_or(DEFAULT_DHCPV6_LEASE),
+            dns_server_ipv6: chain
+                .iter()
+                .map(|p| p.dns_server_ipv6.clone())
+                .find(|d| !d.is_empty())
+                .unwrap_or_default(),
         };
         if let Some(s) = secret {
             if let Some(ip) = s.local_address {
@@ -821,6 +930,16 @@ pub struct ActiveSession {
     pub limit_bytes_in: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit_bytes_out: Option<u64>,
+    /// G4.3e: the link's /64 (RA), the delegated prefix (DHCPv6 IA_PD) and
+    /// the subscriber's link-local (IPv6CP).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ipv6_prefix: Option<Ipv6Net>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delegated_prefix: Option<Ipv6Net>,
+    /// The DHCPv6 client holds the delegated prefix (else it is reserved).
+    pub delegated_bound: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub link_local: Option<Ipv6Addr>,
 }
 
 /// One line of `ppp.history`: a login that came up, failed or ended.
@@ -886,8 +1005,27 @@ pub struct ServiceStats {
     pub auth_reject: u64,
     pub throttled: u64,
     pub dataplane: bool,
+    /// Control-plane workers of the service (G4.3g; 1 = one thread).
+    #[serde(default)]
+    pub workers: u32,
+    /// `new_session_rate=auto`: the rate now (0: no server uses it) and why.
+    #[serde(default)]
+    pub admission_rate: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
+    /// G4.3e: sessions with IPv6CP up, delegated prefixes held by a
+    /// DHCPv6 client, and IPv6 control packets refused (bad ND, DHCPv6
+    /// for another server, RS too often).
+    pub ipv6_sessions: u64,
+    pub delegated: u64,
+    pub ipv6_dropped: u64,
+    /// G4.3g: discovery and session frames lost before the BNG read them
+    /// (a socket's or a worker's queue full: a PADI burst bigger than the
+    /// service holds).
+    #[serde(default)]
+    pub rx_dropped: u64,
 }
 
 #[cfg(test)]

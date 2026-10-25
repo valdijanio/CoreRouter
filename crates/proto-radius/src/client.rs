@@ -274,6 +274,8 @@ pub struct ServerStats {
     pub bad_replies: u64,
     pub unsolicited: u64,
     pub last_rtt_ms: u64,
+    /// The first timeout new requests get now (adaptive, RFC 6298).
+    pub rto_ms: u64,
     pub in_flight: u64,
     pub sockets: u64,
 }
@@ -378,6 +380,51 @@ struct ServerState {
     sockets: Vec<IdTable>,
     queue: VecDeque<(u32, u32)>,
     stats: ServerStats,
+    /// Smoothed answer time and its variation (RFC 6298 §2), from answers
+    /// to requests sent once (Karn: after a retransmission the answer may be
+    /// to either copy). It follows a server that slows down gradually, as a
+    /// queue does in a wave; one always slower than the IRT keeps the IRT
+    /// (raise `timeout`, as on RouterOS). Measuring retransmitted requests
+    /// from the first copy was tried: under 3 % loss it pinned the timeout
+    /// at MRT and slowed failover.
+    srtt_ms: Option<f64>,
+    rttvar_ms: f64,
+}
+
+impl ServerState {
+    /// The first timeout of a new request: the configured IRT, or more when
+    /// this server is answering slower than that (SRTT + 4·RTTVAR, RFC
+    /// 6298 §2.3), at most MRT. A loaded server is not sent copies of what
+    /// it is still working on (G4.3g: at a 1.4 s answer time a fixed 1.1 s
+    /// sent every request twice).
+    fn first_rt(&self) -> u64 {
+        let irt = self.cfg.retry.irt_ms;
+        let est = self
+            .srtt_ms
+            .map_or(0.0, |srtt| srtt + 4.0 * self.rttvar_ms)
+            .ceil() as u64;
+        let rt = irt.max(est);
+        match self.cfg.retry.mrt_ms {
+            0 => rt,
+            mrt => rt.min(mrt),
+        }
+    }
+
+    /// RFC 6298 §2.2/§2.3 with α = 1/8, β = 1/4.
+    fn sample(&mut self, rtt_ms: u64) {
+        let r = rtt_ms as f64;
+        match self.srtt_ms {
+            None => {
+                self.srtt_ms = Some(r);
+                self.rttvar_ms = r / 2.0;
+            }
+            Some(srtt) => {
+                self.rttvar_ms = 0.75 * self.rttvar_ms + 0.25 * (srtt - r).abs();
+                self.srtt_ms = Some(0.875 * srtt + 0.125 * r);
+            }
+        }
+        self.stats.rto_ms = self.first_rt();
+    }
 }
 
 /// Maximum servers (the tried-set is a 64-bit mask).
@@ -389,6 +436,13 @@ pub struct Client {
     slots: Vec<Option<Pending>>,
     free_slots: Vec<u32>,
     next_gen: u32,
+    /// Stamps every (re)transmission, client-wide: a timer or a queued
+    /// transmission names (slot, seq), and a slot is reused by the next
+    /// request. A per-slot count restarted at 0 and let a finished
+    /// request's timer fire on the next one in its slot: logins resent
+    /// after 0–250 ms instead of ~1.1 s (G4.3g, one copy of almost every
+    /// login in a wave).
+    next_seq: u32,
     timers: BinaryHeap<Reverse<(u64, u32, u32)>>,
     transmits: VecDeque<(u32, u32)>,
     events: VecDeque<Event>,
@@ -435,11 +489,14 @@ impl Client {
                     sockets: Vec::new(),
                     queue: VecDeque::new(),
                     stats: ServerStats::default(),
+                    srtt_ms: None,
+                    rttvar_ms: 0.0,
                 })
                 .collect(),
             slots: Vec::new(),
             free_slots: Vec::new(),
             next_gen: 1,
+            next_seq: 1,
             timers: BinaryHeap::new(),
             transmits: VecDeque::new(),
             events: VecDeque::new(),
@@ -518,6 +575,19 @@ impl Client {
         supersede: Option<u64>,
         now_ms: u64,
     ) -> Result<RequestId, SubmitError> {
+        self.accounting_at(attrs, supersede, now_ms, now_ms)
+    }
+
+    /// [`Client::accounting`] of an event that happened at `event_ms`
+    /// (held back by the caller): Acct-Delay-Time counts from it (RFC 2866
+    /// §5.2), so the server dates the session right.
+    pub fn accounting_at(
+        &mut self,
+        attrs: AttrList,
+        supersede: Option<u64>,
+        event_ms: u64,
+        now_ms: u64,
+    ) -> Result<RequestId, SubmitError> {
         // Header, Acct-Delay-Time.
         if HEADER_LEN + 6 + attrs.len() > MAX_PACKET_LEN {
             return Err(crate::EncodeError::PacketTooLong.into());
@@ -525,7 +595,14 @@ impl Client {
         if let Some(old) = supersede.and_then(|k| self.supersede.get(&k).copied()) {
             self.finish(old, Some(Failure::Superseded));
         }
-        let id = self.submit(Kind::Accounting, attrs, None, supersede, now_ms);
+        let id = self.submit_at(
+            Kind::Accounting,
+            attrs,
+            None,
+            supersede,
+            event_ms.min(now_ms),
+            now_ms,
+        );
         self.flush_drains(now_ms);
         let id = id?;
         if let Some(k) = supersede {
@@ -561,6 +638,18 @@ impl Client {
         supersede: Option<u64>,
         now_ms: u64,
     ) -> Result<RequestId, SubmitError> {
+        self.submit_at(kind, attrs, password, supersede, now_ms, now_ms)
+    }
+
+    fn submit_at(
+        &mut self,
+        kind: Kind,
+        attrs: AttrList,
+        password: Option<Vec<u8>>,
+        supersede: Option<u64>,
+        created_ms: u64,
+        now_ms: u64,
+    ) -> Result<RequestId, SubmitError> {
         self.last_now_ms = self.last_now_ms.max(now_ms);
         let service = Self::service_of(kind);
         let server = self
@@ -575,7 +664,7 @@ impl Client {
             attrs,
             password,
             supersede,
-            created_ms: now_ms,
+            created_ms,
             server,
             tried: 1 << server,
             flight: None,
@@ -729,7 +818,7 @@ impl Client {
         if let Some(a) = wire.get(4..HEADER_LEN) {
             authenticator.copy_from_slice(a);
         }
-        let irt = server.cfg.retry.irt_ms;
+        let (irt, learnt) = (server.cfg.retry.irt_ms, server.first_rt());
         let server_idx = p.server;
         if !ok {
             // The identifier is not attached to a flight yet: free it here.
@@ -743,7 +832,9 @@ impl Client {
             self.finish(r, Some(Failure::Timeout));
             return;
         }
-        let rt = irt.saturating_add_signed(self.jitter(irt));
+        // RFC 5080 §2.2.1's ±10 % on the IRT; never below what the server
+        // is known to take.
+        let rt = irt.saturating_add_signed(self.jitter(irt)).max(learnt);
         if let Some(p) = self.get_mut(r) {
             p.flight = Some(Flight {
                 socket,
@@ -760,7 +851,14 @@ impl Client {
     }
 
     /// Queue a (re)transmission and arm its timer.
+    fn bump_seq(&mut self) -> u32 {
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1).max(1);
+        seq
+    }
+
     fn schedule_tx(&mut self, r: RequestId, now_ms: u64) {
+        let seq = self.bump_seq();
         let Some(p) = self.get_mut(r) else {
             return;
         };
@@ -769,8 +867,7 @@ impl Client {
         };
         f.tx += 1;
         f.last_tx_ms = now_ms;
-        p.seq = p.seq.wrapping_add(1);
-        let seq = p.seq;
+        p.seq = seq;
         let deadline = now_ms.saturating_add(f.rt_ms);
         self.timers.push(Reverse((deadline, r.slot(), seq)));
         self.transmits.push_back((r.slot(), seq));
@@ -1000,6 +1097,7 @@ impl Client {
     /// take it.
     fn release_id(&mut self, r: RequestId) {
         let slot = r.slot();
+        let seq = self.bump_seq();
         let Some(p) = self.get_mut(r) else {
             return;
         };
@@ -1009,7 +1107,7 @@ impl Client {
             // entries whose request is gone or already flying).
             return;
         };
-        p.seq = p.seq.wrapping_add(1);
+        p.seq = seq;
         if let Some(s) = self.servers.get_mut(server) {
             if let Some(t) = s.sockets.get_mut(usize::from(f.socket)) {
                 t.release(f.id, slot);
@@ -1141,11 +1239,15 @@ impl Client {
             _ => {}
         }
         let rtt = now_ms.saturating_sub(f.last_tx_ms);
+        let once = f.tx == 1;
         let (kind, authenticator) = (pend.kind, f.authenticator);
         let server = local.server;
         if let Some(s) = self.servers.get_mut(server) {
             s.failures = 0;
             s.stats.last_rtt_ms = rtt;
+            if once && kind != Kind::Status {
+                s.sample(rtt);
+            }
             match p.code() {
                 Code::AccessAccept if kind == Kind::Access => s.stats.accepts += 1,
                 Code::AccessReject => s.stats.rejects += 1,

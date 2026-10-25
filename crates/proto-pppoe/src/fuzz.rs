@@ -280,3 +280,67 @@ pub fn client(data: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// IPv6 from a subscriber (G4.3e): `nd::classify` and `nd::parse_ra` never
+/// panic; an RA that parses re-encodes to the same prefixes, MTU, flags and
+/// DNS servers.
+pub fn nd(data: &[u8]) -> Result<(), String> {
+    use crate::nd;
+    let _ = nd::classify(data);
+    let Ok(ra) = nd::parse_ra(data) else {
+        return Ok(());
+    };
+    let cfg = nd::RaConfig {
+        hop_limit: ra.hop_limit,
+        managed: ra.managed,
+        other: ra.other,
+        router_lifetime: ra.router_lifetime,
+        mtu: ra.mtu,
+        prefixes: ra.prefixes.clone(),
+        rdnss: ra.rdnss.clone(),
+        dns_lifetime: ra.dns_lifetime.unwrap_or(0),
+        ..nd::RaConfig::default()
+    };
+    ra_round_trip(&cfg, ra.src)
+}
+
+/// An RA built from `cfg` reads back as `cfg` (prefixes truncated to their
+/// length, preferred ≤ valid, at most `MAX_DNS` of each) and fits 1280.
+pub fn ra_round_trip(cfg: &crate::nd::RaConfig, src: std::net::Ipv6Addr) -> Result<(), String> {
+    use crate::nd;
+    let mut p = Vec::new();
+    nd::router_advert(&mut p, src, nd::ALL_NODES, cfg);
+    if p.len() > nd::MAX_BUILT {
+        return Err(format!("RA of {} bytes", p.len()));
+    }
+    let back = nd::parse_ra(&p).map_err(|e| format!("own RA refused: {e}"))?;
+    let want: Vec<nd::PrefixInfo> = cfg
+        .prefixes
+        .iter()
+        .take(nd::MAX_DNS)
+        .map(|x| {
+            let len = x.len.min(128);
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            nd::PrefixInfo {
+                prefix: std::net::Ipv6Addr::from_bits(x.prefix.to_bits() & mask),
+                len,
+                preferred: x.preferred.min(x.valid),
+                ..*x
+            }
+        })
+        .collect();
+    let dns: Vec<_> = cfg.rdnss.iter().take(nd::MAX_DNS).copied().collect();
+    if back.prefixes != want
+        || back.rdnss != dns
+        || back.mtu != cfg.mtu
+        || (
+            back.managed,
+            back.other,
+            back.router_lifetime,
+            back.hop_limit,
+        ) != (cfg.managed, cfg.other, cfg.router_lifetime, cfg.hop_limit)
+    {
+        return Err(format!("RA changed: {cfg:?} → {back:?}"));
+    }
+    Ok(())
+}

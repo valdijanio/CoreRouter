@@ -36,7 +36,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use corerouter_model::IfName;
 use nix::errno::Errno;
-use nix::sys::socket::{LinkAddr, MsgFlags, bind, recvmsg, send};
+use nix::sys::socket::{ControlMessageOwned, LinkAddr, MsgFlags, bind, recvmsg, send};
 use socket2::{Domain, Protocol, SockFilter, Socket, Type};
 
 use crate::l2::{if_info, io_err};
@@ -71,8 +71,21 @@ const ACCEPT: u32 = 0x0004_0000;
 type Ins = (u16, u8, u8, u32);
 
 /// The filter of one socket: `vlan` = `None` keeps untagged frames only,
-/// `Some(vid)` keeps frames whose stripped tag has that VLAN id.
+/// `Some(vid)` keeps frames whose stripped tag has that VLAN id. The copies
+/// of what this host sends (`PACKET_OUTGOING`) never reach the BNG: on an
+/// access port they are its own PADOs, PADSs and session frames, and with
+/// the workers' filters they would all land on the worker of the BNG's MAC.
 fn program(vlan: Option<u16>) -> Vec<Ins> {
+    let mut p = vec![
+        (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_PKTTYPE),
+        (JEQ_K, 0, 1, u32::from(PACKET_OUTGOING)),
+        (RET_K, 0, 0, 0),
+    ];
+    p.extend(by_vlan(vlan));
+    p
+}
+
+fn by_vlan(vlan: Option<u16>) -> Vec<Ins> {
     match vlan {
         None => vec![
             (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT),
@@ -112,8 +125,11 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
     let proto = Protocol::from(i32::from(protocol.to_be()));
     let sock = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
     sock.set_nonblocking(true)?;
-    let _ = sock.set_recv_buffer_size(RCVBUF);
+    crate::l2::rcvbuf(&sock, RCVBUF);
     sock.attach_filter(&filter(prog))?;
+    // The kernel's count of frames it dropped on this socket (buffer full),
+    // with each frame read: `PppoePort::dropped`.
+    let _ = nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::RxqOvfl, &1);
     bind(sock.as_raw_fd(), link).map_err(io_err)?;
     Ok(sock)
 }
@@ -121,6 +137,8 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
 struct Side {
     sock: Socket,
     vlan: Option<u16>,
+    /// Frames the kernel dropped on this socket so far (`SO_RXQ_OVFL`).
+    dropped: u32,
 }
 
 /// The index and MAC of access port `name` (the IPoE service's XDP
@@ -170,6 +188,7 @@ impl PppoePort {
                 sides.push(Side {
                     sock: bound(&info.link, proto, &program(vlan))?,
                     vlan,
+                    dropped: 0,
                 });
             }
         }
@@ -190,6 +209,26 @@ impl PppoePort {
 
     pub fn name(&self) -> &IfName {
         &self.name
+    }
+
+    /// Frames the kernel dropped on this port's sockets because their
+    /// buffers were full (as of the last frame read from each).
+    pub fn dropped(&self) -> u64 {
+        self.sides.iter().map(|s| u64::from(s.dropped)).sum()
+    }
+
+    /// The smallest receive buffer the kernel gave this port's sockets, and
+    /// the size asked for (`system.health.check` warns when short).
+    pub fn rcvbuf(&self) -> (usize, usize) {
+        use nix::sys::socket::{getsockopt, sockopt};
+        let got = self
+            .sides
+            .iter()
+            .filter_map(|s| getsockopt(&s.sock, sockopt::RcvBuf).ok())
+            .map(|v| v / 2)
+            .min()
+            .unwrap_or(0);
+        (got, RCVBUF)
     }
 
     pub fn ifindex(&self) -> u32 {
@@ -214,21 +253,29 @@ impl PppoePort {
         let mut total = 0;
         let mut framed = Vec::with_capacity(FRAME_MAX + 4);
         for k in 0..n {
-            let Some(side) = self.sides.get((first + k) % n) else {
+            let Some(side) = self.sides.get_mut((first + k) % n) else {
                 continue;
             };
             for _ in 0..BUDGET {
                 let mut iov = [IoSliceMut::new(&mut self.buf)];
+                let mut cmsg = nix::cmsg_space!(u32);
                 let msg = match recvmsg::<LinkAddr>(
                     side.sock.as_raw_fd(),
                     &mut iov,
-                    None,
+                    Some(&mut cmsg),
                     MsgFlags::MSG_DONTWAIT,
                 ) {
                     Ok(m) => m,
                     Err(Errno::EAGAIN | Errno::EINTR) => break,
                     Err(e) => return Err(io_err(e)),
                 };
+                if let Ok(cmsgs) = msg.cmsgs() {
+                    for c in cmsgs {
+                        if let ControlMessageOwned::RxqOvfl(d) = c {
+                            side.dropped = d;
+                        }
+                    }
+                }
                 let len = msg.bytes;
                 let Some(frame) = self.buf.get(..len) else {
                     continue;
@@ -260,6 +307,33 @@ impl PppoePort {
             .map(|_| ())
             .map_err(io_err)
     }
+
+    /// A sender of its own for another thread (the service's workers send
+    /// while this one receives; G4.3g).
+    pub fn sender(&self) -> io::Result<PortSender> {
+        Ok(PortSender {
+            ifindex: self.ifindex,
+            tx: self.tx.try_clone()?,
+        })
+    }
+}
+
+/// The send side of a [`PppoePort`], for a worker thread.
+pub struct PortSender {
+    ifindex: u32,
+    tx: Socket,
+}
+
+impl PortSender {
+    pub fn ifindex(&self) -> u32 {
+        self.ifindex
+    }
+
+    pub fn send(&self, frame: &[u8]) -> io::Result<()> {
+        send(self.tx.as_raw_fd(), frame, MsgFlags::empty())
+            .map(|_| ())
+            .map_err(io_err)
+    }
 }
 
 /// Name of the slow path's device.
@@ -286,7 +360,7 @@ impl SlowPath {
         let proto = Protocol::from(i32::from(ETH_P_ALL.to_be()));
         let tap = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
         tap.set_nonblocking(true)?;
-        let _ = tap.set_recv_buffer_size(RCVBUF);
+        crate::l2::rcvbuf(&tap, RCVBUF);
         tap.attach_filter(&filter(&outgoing_only()))?;
         bind(tap.as_raw_fd(), &info.link).map_err(io_err)?;
         Ok(Self {
@@ -303,20 +377,7 @@ impl SlowPath {
 
     /// Send a subscriber's IPv4 packet (header included) into the stack.
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        let Some(dst) = packet.get(16..20) else {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "short IPv4 packet",
-            ));
-        };
-        let dst = Ipv4Addr::new(
-            dst.first().copied().unwrap_or(0),
-            dst.get(1).copied().unwrap_or(0),
-            dst.get(2).copied().unwrap_or(0),
-            dst.get(3).copied().unwrap_or(0),
-        );
-        let to = SocketAddr::V4(SocketAddrV4::new(dst, 0));
-        self.raw.send_to(packet, &to.into()).map(|_| ())
+        inject(&self.raw, packet)
     }
 
     /// IPv4 packets the kernel routed to a subscriber (`bng0`), without
@@ -358,6 +419,94 @@ impl SlowPath {
     pub fn remove_route(&self, ip: Ipv4Addr) -> io::Result<()> {
         route(self.ifindex, ip, false)
     }
+
+    /// The send side for a worker thread: its own raw socket and its own
+    /// netlink connection, kept open (one connection per route cost a
+    /// runtime and a socket each; G4.3g).
+    pub fn sender(&self) -> io::Result<SlowTx> {
+        let rt = runtime()?;
+        let handle = rt.block_on(async {
+            let (conn, handle, _) = rtnetlink::new_connection()?;
+            tokio::spawn(conn);
+            Ok::<_, io::Error>(handle)
+        })?;
+        Ok(SlowTx {
+            raw: self.raw.try_clone()?,
+            ifindex: self.ifindex,
+            rt,
+            handle,
+        })
+    }
+}
+
+/// The send side of a [`SlowPath`]: inject upstream packets and keep the
+/// `/32` routes to `bng0`.
+pub struct SlowTx {
+    raw: Socket,
+    ifindex: u32,
+    rt: tokio::runtime::Runtime,
+    handle: rtnetlink::Handle,
+}
+
+impl SlowTx {
+    pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
+        inject(&self.raw, packet)
+    }
+
+    /// Add (`true`) or remove these `/32` routes, all in one round on the
+    /// open connection. The first error is returned; the rest still run.
+    pub fn routes(&self, ops: &[(Ipv4Addr, bool)]) -> io::Result<()> {
+        use rtnetlink::RouteMessageBuilder;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let ifindex = self.ifindex;
+        self.rt.block_on(async {
+            let calls = ops.iter().map(|&(ip, add)| {
+                let h = self.handle.clone();
+                async move {
+                    let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+                        .destination_prefix(ip, 32)
+                        .output_interface(ifindex)
+                        .build();
+                    let out = if add {
+                        h.route().add(msg).replace().execute().await
+                    } else {
+                        h.route().del(msg).execute().await
+                    };
+                    match out {
+                        Ok(()) => Ok(()),
+                        Err(rtnetlink::Error::NetlinkError(e)) if !add && e.raw_code() == -3 => {
+                            Ok(())
+                        }
+                        Err(e) => Err(io::Error::other(format!(
+                            "route {ip}/32 via {SLOW_DEVICE}: {e}"
+                        ))),
+                    }
+                }
+            });
+            let results = futures_util::future::join_all(calls).await;
+            results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        })
+    }
+}
+
+/// A subscriber's IPv4 packet (header included) into the stack.
+fn inject(raw: &Socket, packet: &[u8]) -> io::Result<()> {
+    let Some(dst) = packet.get(16..20) else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "short IPv4 packet",
+        ));
+    };
+    let dst = Ipv4Addr::new(
+        dst.first().copied().unwrap_or(0),
+        dst.get(1).copied().unwrap_or(0),
+        dst.get(2).copied().unwrap_or(0),
+        dst.get(3).copied().unwrap_or(0),
+    );
+    let to = SocketAddr::V4(SocketAddrV4::new(dst, 0));
+    raw.send_to(packet, &to.into()).map(|_| ())
 }
 
 fn runtime() -> io::Result<tokio::runtime::Runtime> {
@@ -442,6 +591,10 @@ mod tests {
     /// The kernel's interpreter for the few opcodes used, with the
     /// ancillary values given.
     fn run(p: &[Ins], tag: Option<u16>, pkttype: u8) -> u32 {
+        run_frame(p, tag, pkttype, &[])
+    }
+
+    fn run_frame(p: &[Ins], tag: Option<u16>, pkttype: u8, frame: &[u8]) -> u32 {
         let mut a = 0u32;
         let mut pc = 0usize;
         while let Some(&(code, jt, jf, k)) = p.get(pc) {
@@ -454,6 +607,10 @@ mod tests {
                     a = u32::from(tag.unwrap_or(0)) | 0x2000
                 }
                 LD_W_ABS if k == SKF_AD_OFF + SKF_AD_PKTTYPE => a = u32::from(pkttype),
+                LD_W_ABS if k < SKF_AD_OFF => {
+                    let i = k as usize;
+                    a = u32::from_be_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]);
+                }
                 ALU_AND_K => a &= k,
                 JEQ_K => pc += usize::from(if a == k { jt } else { jf }),
                 RET_K => return k,
@@ -463,6 +620,8 @@ mod tests {
         panic!("fell off the end")
     }
 
+    /// G4.3g: every frame passes the filter of exactly one worker, the one
+    /// [`lane_of`] names, and the VLAN test still applies behind it.
     #[test]
     fn each_socket_keeps_only_its_vlan() {
         let untagged = program(None);
@@ -476,6 +635,17 @@ mod tests {
         );
         assert_eq!(run(&v100, Some(101), 0), 0);
         assert_eq!(run(&v100, None, 0), 0);
+    }
+
+    #[test]
+    fn the_ports_never_read_back_what_the_bng_sent() {
+        for vlan in [None, Some(100)] {
+            assert_eq!(
+                run_frame(&program(vlan), vlan, PACKET_OUTGOING, &[0u8; 60]),
+                0
+            );
+            assert_eq!(run_frame(&program(vlan), vlan, 0, &[0u8; 60]), ACCEPT);
+        }
     }
 
     #[test]
