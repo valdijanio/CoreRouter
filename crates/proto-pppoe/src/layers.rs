@@ -478,6 +478,10 @@ impl Layer for Ipcp {
 pub struct Ipv6cp {
     pub local_iid: [u8; 8],
     pub peer_iid: Option<[u8; 8]>,
+    /// What to Nak a zero or colliding peer identifier with first: the
+    /// stable one of RFC 8064 (`nd::stable_iid`), so the line keeps its
+    /// link-local across reconnects.
+    pub suggest: Option<[u8; 8]>,
     send_iid: bool,
     rng: Xorshift,
 }
@@ -487,12 +491,16 @@ impl Ipv6cp {
         Ipv6cp {
             local_iid,
             peer_iid: None,
+            suggest: None,
             send_iid: true,
             rng: Xorshift(seed),
         }
     }
 
     fn fresh(&mut self, not: [u8; 8]) -> [u8; 8] {
+        if let Some(s) = self.suggest.filter(|s| *s != not && *s != [0; 8]) {
+            return s;
+        }
         loop {
             let a = self.rng.next_nonzero().to_be_bytes();
             let b = self.rng.next_nonzero().to_be_bytes();

@@ -1129,6 +1129,47 @@ impl PppBackend for Sessions {
             .collect()
     }
 
+    /// Only the page is copied (100 000 sessions up: the whole table per
+    /// GUI refresh held the engine lock for ~50 ms, G4.3g).
+    fn active_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let st = guard(&self.0.st);
+        let now = unix_now();
+        let mut hits: Vec<&ActiveSession> = st.active.values().filter(|a| keep(a)).collect();
+        let total = hits.len();
+        let by = |a: &&ActiveSession, b: &&ActiveSession| a.name.cmp(&b.name).then(a.id.cmp(&b.id));
+        if hits.len() > limit && limit > 0 {
+            hits.select_nth_unstable_by(limit - 1, by);
+            hits.truncate(limit);
+        } else {
+            hits.truncate(limit);
+        }
+        hits.sort_by(by);
+        let page = hits
+            .into_iter()
+            .map(|a| {
+                let mut a = a.clone();
+                if let Some(s) = st.by_id.get(&a.id).and_then(|k| st.subs.get(k)) {
+                    a.uptime_secs = now.saturating_sub(s.up_at);
+                }
+                a
+            })
+            .collect();
+        (total, page)
+    }
+
+    fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
+        let st = guard(&self.0.st);
+        let mut m = std::collections::BTreeMap::new();
+        for a in st.active.values() {
+            *m.entry(a.server.clone()).or_insert(0) += 1;
+        }
+        m
+    }
+
     fn terminate(&self, ids: &[String]) -> usize {
         self.0.revoke(
             ids,

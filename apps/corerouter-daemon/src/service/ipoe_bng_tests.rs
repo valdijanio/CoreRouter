@@ -260,3 +260,22 @@ fn ipoe_and_pppoe_slots_are_disjoint() {
     assert!(XDP_SLOTS <= ipoe_lowest, "PPPoE below {XDP_SLOTS}, IPoE from {ipoe_lowest}");
     assert_eq!(SLOT_TOP, (1 << 17) - 1, "the top of SESSIONS_MAX");
 }
+
+/// `ppp.active.list` pages the IPoE half in place: sorted by name, the
+/// total of all, only `limit` copied.
+#[test]
+fn the_ipoe_half_pages_in_place() {
+    use corerouter_engine::ppp::PppBackend;
+    let mut lab = Lab::new(json!({"ipoe": true}));
+    lab.run(20);
+    let s = Sessions(lab.core.clone());
+    let all = s.active().len();
+    assert!(all >= 3, "{all}");
+    let (total, page) = s.active_page(&|_| true, 2);
+    assert_eq!((total, page.len()), (all, 2));
+    assert!(page[0].name <= page[1].name);
+    let mut names: Vec<_> = s.active().into_iter().map(|a| a.name).collect();
+    names.sort();
+    assert_eq!(page[0].name, names[0]);
+    assert_eq!(s.sessions_by_server().get("dhcp1"), Some(&all));
+}

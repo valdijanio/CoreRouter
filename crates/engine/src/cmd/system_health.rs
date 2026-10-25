@@ -97,7 +97,7 @@ mod tests {
         let mut s = Session::virtual_lab();
         let v = s.execute("system.health.check", &json!({})).unwrap();
         let checks = v["checks"].as_array().unwrap();
-        assert_eq!(checks.len(), 12);
+        assert_eq!(checks.len(), 13);
         let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
         assert_eq!(by("nic.errors")["severity"], "warning", "ether4's bad cable");
         assert!(by("nic.errors")["reason"].as_str().unwrap().contains("ether4"));

@@ -17,9 +17,9 @@ use std::hint::black_box;
 use std::net::Ipv4Addr;
 
 use corerouter_engine::ipoe::{IpoeBackend, IpoeIndex, IpoeView};
-use corerouter_model::cow::CowArc;
 use corerouter_model::dhcp_server::DhcpServer;
 use corerouter_model::ppp::{PppProfile, PppSecret, PppService};
+use corerouter_model::ppp_secrets::Secrets;
 use corerouter_model::{Config, ItemId, MacAddr};
 use corerouter_proto_dhcp::server::Binding;
 use corerouter_proto_dhcp::server::authorize::AuthAsk;
@@ -44,7 +44,7 @@ fn config(n: usize) -> Config {
         rate_limit: Some("10M/50M".into()),
         ..PppProfile::default()
     });
-    c.ppp.secrets = CowArc::new(
+    c.ppp.secrets = Secrets::new(
         (0..n)
             .map(|i| PppSecret {
                 id: ItemId(u32::try_from(i).unwrap() + 10),
