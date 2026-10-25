@@ -12,14 +12,17 @@
 #[path = "../src/service/pppoe_bng.rs"]
 #[allow(dead_code)]
 mod pppoe_bng;
+#[path = "../src/service/pppoe_bng6.rs"]
+#[allow(dead_code)]
+mod pppoe_bng6;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 
 use corerouter_model::ItemId;
-use corerouter_model::cow::CowArc;
 use corerouter_model::ip_pool::{IpPool, IpPools, PoolRange};
 use corerouter_model::ppp::{AddrOrPool, Ppp, PppProfile, PppSecret, PppoeServer};
+use corerouter_model::ppp_secrets::Secrets;
 use corerouter_proto_pppoe::client::{Client, ClientConfig, ClientEvent, ClientOutput};
 use corerouter_proto_pppoe::wire::Mac;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
@@ -36,7 +39,7 @@ fn snapshot(users: usize) -> Snapshot {
         rate_limit: Some("10M/50M".into()),
         ..PppProfile::default()
     });
-    ppp.secrets = CowArc::new(
+    ppp.secrets = Secrets::new(
         (0..users)
             .map(|i| PppSecret {
                 id: ItemId(2 + i as u32),
@@ -70,6 +73,7 @@ fn snapshot(users: usize) -> Snapshot {
         pools,
         aaa: None,
         unix_base: 0,
+        ..Snapshot::default()
     }
 }
 
@@ -91,9 +95,21 @@ fn sessions(n: usize, snap: &Snapshot) -> Bng {
 
 /// Bring subscribers `base..base + n` up on `bng`.
 fn up(bng: &mut Bng, base: usize, n: usize) {
-    let mut clients: Vec<Client> = (base..base + n)
-        .map(|i| {
-            let mac = [0x02, 0x10, (i >> 16) as u8, (i >> 8) as u8, i as u8, 1];
+    let ids: Vec<usize> = (base..base + n).collect();
+    up_ids(bng, &ids);
+}
+
+fn mac_of(i: usize) -> [u8; 6] {
+    [0x02, 0x10, (i >> 16) as u8, (i >> 8) as u8, i as u8, 1]
+}
+
+/// Bring subscribers `ids` up on `bng`.
+fn up_ids(bng: &mut Bng, ids: &[usize]) {
+    let n = ids.len();
+    let mut clients: Vec<Client> = ids
+        .iter()
+        .map(|&i| {
+            let mac = mac_of(i);
             let cfg = ClientConfig {
                 mac: Mac(mac),
                 ifindex: IFINDEX,
@@ -179,6 +195,52 @@ fn bench(c: &mut Criterion) {
     }
     eprintln!("pppoe_bng: µs per session by batch of 10 000 (0 → 60 000 up):{line}");
     drop(bng);
+    // G4.3g: the workers, each on its own thread with the subscribers whose
+    // MAC hashes to it (as the driver hands them out), sharing the active
+    // table, the history and the pools: sessions a second, all together.
+    let n = 40_000;
+    let mut line = String::new();
+    for lanes in [1u16, 2, 4, 8] {
+        let first = Bng::first_of([1; 32], lanes);
+        let mut bngs = vec![];
+        for l in 1..lanes {
+            bngs.push(first.sibling([1 + l as u8; 32], l, lanes));
+        }
+        bngs.insert(0, first);
+        let ports = HashMap::from([(
+            "s".to_owned(),
+            PortInfo {
+                ifindex: IFINDEX,
+                mac: [2, 0xbb, 0, 0, 0, 1],
+            },
+        )]);
+        for b in &mut bngs {
+            b.xdp = true;
+            b.configure(0, snap100.clone(), &ports);
+        }
+        let mut ids: Vec<Vec<usize>> = vec![Vec::new(); usize::from(lanes)];
+        for i in 0..n {
+            let mut f = [0u8; 12];
+            f[6..12].copy_from_slice(&mac_of(i));
+            ids[usize::from(Bng::lane_of(&f, lanes))].push(i);
+        }
+        let t = std::time::Instant::now();
+        let handles: Vec<_> = bngs
+            .into_iter()
+            .zip(ids)
+            .map(|(mut b, ids)| {
+                std::thread::spawn(move || {
+                    up_ids(&mut b, &ids);
+                    b
+                })
+            })
+            .collect();
+        let done: Vec<Bng> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let secs = t.elapsed().as_secs_f64();
+        line.push_str(&format!(" {lanes}: {:.0}/s", n as f64 / secs));
+        drop(done);
+    }
+    eprintln!("pppoe_bng: {n} sessions by workers (sessions/s, release):{line}");
     let mut g = c.benchmark_group("pppoe_bng");
     g.sample_size(10);
     g.throughput(Throughput::Elements(1000));

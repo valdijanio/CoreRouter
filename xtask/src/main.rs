@@ -2,6 +2,7 @@
 //! every commit; it stops at the first FAIL and prints an ok/FAIL/skip summary.
 
 mod bench;
+mod bng_lab;
 mod changes;
 mod ebpf;
 mod layers;
@@ -11,7 +12,7 @@ mod vm_tools;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|ebpf|docs fold|vm-lab [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -88,6 +89,22 @@ fn main() -> ExitCode {
                 }
                 Outcome::Fail(why) => {
                     eprintln!("FAIL bench: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // G4.3g: BNG Blaster against the daemon (by hand; `--root` asks
+        // for sudo).
+        "bng-lab" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match bng_lab::main(&root, &rest) {
+                Outcome::Ok => ExitCode::SUCCESS,
+                Outcome::Skip(why) => {
+                    eprintln!("skip: {why}");
+                    ExitCode::SUCCESS
+                }
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL bng-lab: {why}");
                     ExitCode::FAILURE
                 }
             };
