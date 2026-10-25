@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use crate::Outcome;
+use crate::vm_tools::{self, Source, TOOLS};
 
 const NAME: &str = "corerouter-lab";
 const URI: &str = "qemu:///system";
@@ -38,6 +39,11 @@ const GRUB_CFG: &str = "/etc/default/grub.d/90-corerouter-lab.cfg";
 const GUEST_CMDLINE: &str = "spec_rstack_overflow=off";
 /// Held (flock) by each exclusive `run` inside the VM.
 const LOCK: &str = "/run/corerouter-lab.lock";
+/// Held on the host by a round the user runs by hand
+/// (`flock vm/root.lock cargo xtask vm-lab run …`): no snapshot or reset then.
+const HOST_LOCK: &str = "root.lock";
+/// Snapshot with the third-party tools in (`tools`); `reset` prefers it.
+const TOOLS_SNAPSHOT: &str = "tools";
 const PACKAGES: &[&str] = &[
     "build-essential",
     "clang",
@@ -75,8 +81,15 @@ const HELP: &str = "usage: cargo xtask vm-lab <subcommand>
                     <cmd> as root in /srv/lab/<worktree>/src with
                     CARGO_TARGET_DIR=/srv/lab/<worktree>/target (kept: incremental);
                     one run at a time unless --shared (builds only, no namespaces)
-  snapshot [name]   save the disk (default `clean`; the VM is shut down for it)
-  reset [name]      throw the disk back to a snapshot (default `clean`) and boot
+  tools [--check]   install the third-party tools declared in xtask/src/vm_tools.rs
+                    (official URL + SHA-256), then snapshot `tools`; --check only
+                    says what is missing. Installing is the user's, once per tool
+  snapshot [name] [--force]
+                    save the disk (default `tools`, else `clean`; the VM is shut down
+                    for it); refused while a round holds a lock, unless --force
+  reset [name] [--force]
+                    throw the disk back to a snapshot (default `tools`, else `clean`)
+                    and boot; same lock rule
   destroy           delete the VM and its overlay (the cached image stays)";
 
 /// Entry point: `args` are what follows `vm-lab`.
@@ -98,8 +111,26 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "sync" => lab.up().and_then(|()| lab.sync()),
         "put" => lab.put(rest),
         "run" => lab.run(rest),
-        "snapshot" => lab.snapshot(rest.first().map_or("clean", String::as_str)),
-        "reset" => lab.reset(rest.first().map_or("clean", String::as_str)),
+        "tools" => lab.tools(rest),
+        "snapshot" | "reset" => {
+            let force = rest.iter().any(|a| a == "--force");
+            let named = rest.iter().find(|a| !a.starts_with("--")).cloned();
+            let name = match named {
+                Some(n) => Ok(n),
+                None if sub == "reset" => lab.base_snapshot().map(str::to_owned),
+                None => Ok(TOOLS_SNAPSHOT.to_owned()),
+            };
+            name.and_then(|n| {
+                if !force {
+                    lab.idle()?;
+                }
+                if sub == "reset" {
+                    lab.reset(&n)
+                } else {
+                    lab.snapshot(&n)
+                }
+            })
+        }
         "destroy" => lab.destroy(),
         "" | "-h" | "--help" | "help" => {
             eprintln!("{HELP}");
@@ -587,6 +618,48 @@ impl Lab {
         Ok(())
     }
 
+    /// `tools` when it exists, else `clean`.
+    fn base_snapshot(&self) -> Result<&'static str, String> {
+        let list = virsh(&["snapshot-list", NAME, "--name"])?;
+        Ok(if list.lines().any(|l| l.trim() == TOOLS_SNAPSHOT) {
+            TOOLS_SNAPSHOT
+        } else {
+            "clean"
+        })
+    }
+
+    /// Nobody in a round: neither the user's host lock nor `run`'s lock in
+    /// the VM is held. A snapshot or reset would cut that round off.
+    fn idle(&self) -> Result<(), String> {
+        let host = self.path(HOST_LOCK);
+        let free = Command::new("flock")
+            .args(["-n", "-E", "75"])
+            .arg(&host)
+            .arg("true")
+            .status()
+            .map_err(|e| format!("flock: {e}"))?;
+        if free.code() == Some(75) {
+            return Err(format!(
+                "{} is held (a round the user runs by hand); try again when it ends, or --force",
+                host.display()
+            ));
+        }
+        if self.state()?.as_deref() == Some("running") && self.address()?.is_some() {
+            let out = self.ssh_output(&format!(
+                "sudo -n flock -n -E 75 {LOCK} true && echo free || cat {LOCK}.owner"
+            ));
+            if let Ok(out) = out
+                && !out.contains("free")
+            {
+                return Err(format!(
+                    "a `vm-lab run` holds the VM ({}); try again when it ends, or --force",
+                    out.trim()
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Before each `run`: root works, a handful of processes start, and
     /// there is room on the disk and in memory. Two tries, a few seconds
     /// apart, so one busy moment does not trigger a reset.
@@ -847,6 +920,114 @@ impl Lab {
         Ok(())
     }
 
+    /// The third-party tools of `vm_tools::TOOLS`: `--check` reports, the
+    /// default installs what is missing and snapshots `tools`.
+    fn tools(&self, args: &[String]) -> Result<(), String> {
+        let check = match args {
+            [] => false,
+            [a] if a == "--check" => true,
+            _ => return Err(format!("usage: cargo xtask vm-lab tools [--check]\n{HELP}")),
+        };
+        self.up()?;
+        let missing = vm_tools::missing(TOOLS, &self.ssh_output(&vm_tools::query(TOOLS))?);
+        let describe = |list: &[(&vm_tools::Tool, Option<String>)]| -> String {
+            list.iter()
+                .map(|(t, have)| match (t.version, have) {
+                    ("", _) => t.package.to_owned(),
+                    (v, Some(h)) => format!("{} {v} (has {h})", t.package),
+                    (v, None) => format!("{} {v}", t.package),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        if check {
+            if missing.is_empty() {
+                eprintln!("vm-lab: all {} tools present", TOOLS.len());
+                return Ok(());
+            }
+            return Err(format!(
+                "missing in {NAME}: {}. Installing third-party code is the user's call, once: \
+                 ask them to run `cargo xtask vm-lab tools`",
+                describe(&missing)
+            ));
+        }
+        if !missing.is_empty() {
+            eprintln!("vm-lab: installing {}", describe(&missing));
+            self.install(&missing)?;
+            let left = vm_tools::missing(TOOLS, &self.ssh_output(&vm_tools::query(TOOLS))?);
+            if !left.is_empty() {
+                return Err(format!("still missing after install: {}", describe(&left)));
+            }
+        }
+        let installed = self.ssh_output(&vm_tools::query(TOOLS))?;
+        for t in TOOLS {
+            let version = installed
+                .lines()
+                .find_map(|l| l.strip_prefix(t.package)?.strip_prefix(" installed "))
+                .unwrap_or("?");
+            println!("{:<12} {:<28} {}", t.package, version, t.why);
+        }
+        if missing.is_empty() && self.base_snapshot()? == TOOLS_SNAPSHOT {
+            eprintln!("vm-lab: nothing to do; snapshot `{TOOLS_SNAPSHOT}` exists");
+            return Ok(());
+        }
+        match self.idle() {
+            Ok(()) => self.snapshot(TOOLS_SNAPSHOT),
+            Err(why) => Err(format!(
+                "tools installed, but no snapshot yet: {why}. Then: cargo xtask vm-lab snapshot {TOOLS_SNAPSHOT}"
+            )),
+        }
+    }
+
+    /// Downloads each `.deb` once into `vm/tools/` (checked against its
+    /// SHA-256 here and again in the VM), then one `apt-get install` for
+    /// everything, so apt resolves the `.deb`s' dependencies.
+    fn install(&self, list: &[(&vm_tools::Tool, Option<String>)]) -> Result<(), String> {
+        let cache = self.path("tools");
+        std::fs::create_dir_all(&cache).map_err(|e| format!("{}: {e}", cache.display()))?;
+        let remote = format!("{LAB_ROOT}/tools/");
+        let mut debs = Vec::new();
+        let mut targets = Vec::new();
+        let mut verify = String::new();
+        for (t, _) in list {
+            match (&t.source, t.file()) {
+                (Source::Deb { url, sha256 }, Some(file)) => {
+                    let local = cache.join(file);
+                    if !local.exists() || sha256_file(&local)? != *sha256 {
+                        let part = cache.join(format!("{file}.part"));
+                        eprintln!("vm-lab: downloading {url}");
+                        download(url, &part)?;
+                        let have = sha256_file(&part)?;
+                        if have != *sha256 {
+                            let _ = std::fs::remove_file(&part);
+                            return Err(format!(
+                                "checksum mismatch for {file}: got {have}, xtask/src/vm_tools.rs says {sha256}; file removed"
+                            ));
+                        }
+                        std::fs::rename(&part, &local)
+                            .map_err(|e| format!("{}: {e}", local.display()))?;
+                    }
+                    eprintln!("vm-lab: {file} sha256 {sha256} ok");
+                    debs.push(local.to_string_lossy().into_owned());
+                    verify.push_str(&format!("{sha256}  {remote}{file}\n"));
+                    targets.push(format!("{remote}{file}"));
+                }
+                _ => targets.push(t.package.to_owned()),
+            }
+        }
+        if !debs.is_empty() {
+            let (mut rsync, to) = self.rsync(&remote)?;
+            run_ok(rsync.arg("-t").args(&debs).arg(to))?;
+        }
+        self.ssh_root_script(&format!(
+            "set -e\nexport DEBIAN_FRONTEND=noninteractive\n\
+             printf '{verify}' | sha256sum -c --quiet -\n\
+             apt-get update -q >/dev/null\n\
+             apt-get install -y -q --no-install-recommends {}\n",
+            targets.join(" ")
+        ))
+    }
+
     /// Files from the host (a `.deb`, a capture) into `/srv/lab/inbox/`.
     fn put(&self, files: &[String]) -> Result<(), String> {
         if files.is_empty() {
@@ -882,8 +1063,9 @@ impl Lab {
         let started = Instant::now();
         // Unreachable counts as unhealthy too (sshd was among the victims).
         if let Err(why) = self.up().and_then(|()| self.healthy()) {
-            eprintln!("vm-lab: {NAME} is unhealthy ({why}); `reset` to `clean`");
-            self.reset("clean")?;
+            let base = self.base_snapshot()?;
+            eprintln!("vm-lab: {NAME} is unhealthy ({why}); `reset` to `{base}`");
+            self.reset(base)?;
             self.healthy()
                 .map_err(|e| format!("{NAME} still unhealthy after reset: {e}"))?;
         }
