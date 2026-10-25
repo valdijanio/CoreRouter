@@ -18,13 +18,13 @@ cargo xtask vm-lab reset           # volta o disco ao snapshot `clean` e liga
 
 | Subcomando | O que faz |
 |---|---|
-| `create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]` | Baixa a imagem Ubuntu 24.04 cloud uma vez e confere com o `SHA256SUMS` publicado (recusa e apaga se não bate), cria um overlay qcow2 fino, o seed do cloud-init, define e liga a VM, espera o cloud-init, instala o Rust e tira o snapshot `clean`. Padrão: 8 vCPUs, 8192 MiB, 20 GiB, 1 fio. |
+| `create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]` | Baixa a imagem Ubuntu 24.04 cloud uma vez e confere com o `SHA256SUMS` publicado (recusa e apaga se não bate), cria um overlay qcow2 fino, o seed do cloud-init, define e liga a VM, espera o cloud-init, instala o Rust e tira o snapshot `clean`. Padrão: 8 vCPUs, 16384 MiB, 20 GiB, 1 fio. |
 | `up` / `down` | Liga e espera o SSH / desliga (ACPI; força depois de 90 s). |
 | `ssh [cmd…]` | Shell ou um comando como `lab`. |
 | `sync` | `rsync` da worktree para `/srv/lab/<worktree>/src` (sem `target*`, `.git`, `vm/`, `plan/`). |
 | `put <arquivo…>` | Copia arquivos do host para `/srv/lab/inbox/` na VM (o `.deb` do BNG Blaster, uma captura). |
-| `run [--no-sync] -- <cmd…>` | `sync` e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. |
-| `snapshot [nome]` / `reset [nome]` | Snapshot interno do disco (com a VM desligada; sem imagem de RAM) / volta a ele e liga. Padrão `clean`. |
+| `run [--no-sync] [--shared] -- <cmd…>` | Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; se falhar duas vezes, `reset` para `clean` sozinho), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. |
+| `snapshot [nome]` / `reset [nome]` | Snapshot interno do disco (com a VM desligada; sem imagem de RAM) / volta o disco a ele e liga, mantendo a definição atual da VM (CPU, memória). Padrão `clean`. |
 | `destroy` | Apaga a VM, o overlay e o seed; a imagem baixada e a chave ficam. |
 
 ## Como é montada
@@ -48,6 +48,17 @@ cargo xtask vm-lab reset           # volta o disco ao snapshot `clean` e liga
 - **Pacotes** pelo cloud-init: build-essential, clang, llvm, pkg-config, iproute2, tcpdump, ppp,
   pppoe (rp-pppoe), ethtool, nftables, rsync, git, curl, jq, qemu-guest-agent. `unattended-upgrades`
   e os timers do apt ficam desligados (não disputam o lock nem mudam a VM entre rodadas).
+- **CPU `host-model`, não `host-passthrough`.** Com passthrough o convidado recebia o CET
+  (shadow stack) do host, que o KVM do kernel 7.0 oferece e o QEMU 8.2 não administra. Depois de
+  ~45 min de uso, todo processo novo (sudo, bash, sshd) caía no mesmo endereço com erro de
+  página 0x44/0x46 (acesso de shadow stack), **medido** em 2026-10-25. Com `host-model` (EPYC-Genoa
+  + extras) o convidado não vê `user_shstk`.
+- **`spec_rstack_overflow=off` no convidado** (`/etc/default/grub.d/90-corerouter-lab.cfg`,
+  reaplicado pelo `up` se faltar). O `host-model` não diz ao convidado que a CPU é imune ao SRSO
+  vindo do espaço de usuário (o libvirt 10.0 não tem nome para esses bits). O convidado escolhia
+  então "Safe RET" em todo retorno do kernel e ficava 3× mais lento (veth 558 contra 1811 kpps,
+  **medido**). O kernel do host também não usa Safe RET nesta CPU ("IBPB on VMEXIT only"):
+  o convidado fica igual ao metal.
 - **Kernel HWE 7.0** (`linux-generic-hwe-24.04`; o `create` reinicia nele): o 6.8 do 24.04 GA
   recusa o nosso programa XDP no verificador ("combined stack size of 3 calls is 544. Too
   large", **medido**; gap G2.5g).
@@ -59,14 +70,17 @@ cargo xtask vm-lab reset           # volta o disco ao snapshot `clean` e liga
 - Cache de build persistente por worktree (`/srv/lab/<worktree>/target`): o `rsync -a` preserva
   as datas, então a rodada seguinte é incremental. Worktrees diferentes não se atropelam (pasta
   e alvo próprios) e podem rodar ao mesmo tempo; 8 vCPUs dão paralelismo ao `cargo`.
-- Números (**medidos**, 2026-10-25, 8 vCPUs): `create` 156 s com a imagem em cache; `xdp-root`
+- Números (**medidos**, 2026-10-25, 8 vCPUs, 8 GiB; com 16 GiB e `host-model` o `xdp-root` quente
+  levou 74,5 s e os PERF ficaram iguais): `create` 156 s com a imagem em cache; `xdp-root`
   completo 103 s com cache frio e 76 s quente (0,1 s de compilação; o resto são os testes); um
   teste só 4,9 s; `sync` sem mudança 0,2 s; `reset` 8,6 s. Detalhes no `docs/perf.md`.
 
 ## Limites
 
-- Uma VM para todas as sessões: dois testes que criem o mesmo namespace (`crxdp`) ao mesmo tempo
-  colidem. Rode um `xdp-root` por vez (o próprio teste apaga e recria o namespace).
+- Uma VM para todas as sessões: os testes usam nomes fixos de namespace (`crxdp`, `crxsub`) e um
+  apaga o do outro; os números de pps também dividem CPU. Por isso o `run` é exclusivo (trava
+  `flock` dentro da VM; quem chega espera e vê quem segura). Uma worktree com um `vm_lab.rs` antigo,
+  sem a trava, ainda colide: faça `git merge origin/main`.
 - `reset` volta o disco inteiro, inclusive o cache de build: tire um `snapshot` depois de uma
   compilação longa se quiser voltar a ele quente.
 - O snapshot é interno ao qcow2 e só com a VM desligada (`snapshot` desliga e religa).

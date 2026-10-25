@@ -33,6 +33,11 @@ const USER: &str = "lab";
 /// Toolchains, sources and build caches inside the VM.
 const RUST_ENV: &str = "/etc/profile.d/corerouter-rust.sh";
 const LAB_ROOT: &str = "/srv/lab";
+/// Extra kernel command line in the guest (see `guest_settings`).
+const GRUB_CFG: &str = "/etc/default/grub.d/90-corerouter-lab.cfg";
+const GUEST_CMDLINE: &str = "spec_rstack_overflow=off";
+/// Held (flock) by each exclusive `run` inside the VM.
+const LOCK: &str = "/run/corerouter-lab.lock";
 const PACKAGES: &[&str] = &[
     "build-essential",
     "clang",
@@ -59,15 +64,17 @@ const HELP: &str = "usage: cargo xtask vm-lab <subcommand>
   create [--cpus N] [--memory MiB] [--disk GiB] [--wires N]
                     download + verify the Ubuntu 24.04 image, make the VM, provision
                     it (packages, rustup) and take the `clean` snapshot
-                    (defaults: 8 vCPUs, 8192 MiB, 20 GiB thin, 1 wire = 2 test NICs)
+                    (defaults: 8 vCPUs, 16384 MiB, 20 GiB thin, 1 wire = 2 test NICs)
   up | down         start (and wait for SSH) | shut down
   status            state, address, snapshots, disk use
   ssh [cmd...]      shell (or one command) as user `lab`; `sudo` works inside
   sync              rsync this worktree to /srv/lab/<worktree>/src (no target*, .git)
   put <file...>     copy host files into /srv/lab/inbox/ (a .deb, a capture)
-  run [--no-sync] -- <cmd...>
-                    sync, then run <cmd> as root in /srv/lab/<worktree>/src with
-                    CARGO_TARGET_DIR=/srv/lab/<worktree>/target (kept: incremental)
+  run [--no-sync] [--shared] -- <cmd...>
+                    health check (reset to `clean` if the VM is broken), sync, then run
+                    <cmd> as root in /srv/lab/<worktree>/src with
+                    CARGO_TARGET_DIR=/srv/lab/<worktree>/target (kept: incremental);
+                    one run at a time unless --shared (builds only, no namespaces)
   snapshot [name]   save the disk (default `clean`; the VM is shut down for it)
   reset [name]      throw the disk back to a snapshot (default `clean`) and boot
   destroy           delete the VM and its overlay (the cached image stays)";
@@ -212,10 +219,13 @@ impl Lab {
         if !status.contains("status: done") {
             return Err(format!("cloud-init did not finish:\n{status}"));
         }
-        // Boot into the kernel cloud-init installed.
-        if self
-            .ssh_output("test -e /var/run/reboot-required && echo yes; true")?
-            .contains("yes")
+        // Boot into the kernel cloud-init installed, with the lab's
+        // command line.
+        let settings = self.guest_settings()?;
+        if settings
+            || self
+                .ssh_output("test -e /var/run/reboot-required && echo yes; true")?
+                .contains("yes")
         {
             eprintln!("vm-lab: rebooting into the new kernel…");
             self.down()?;
@@ -390,13 +400,18 @@ impl Lab {
                  <model type='virtio'/>\n    </interface>\n"
             ));
         }
+        // `host-model`, not `host-passthrough`: passthrough hands the guest
+        // the host's CET shadow stack (KVM on kernel 7.0 offers it), which
+        // QEMU 8.2 does not manage; after a while every process in the VM
+        // segfaulted at the same shadow-stack address (**measured**,
+        // 2026-10-25).
         format!(
             "<domain type='kvm'>\n  <name>{NAME}</name>\n  \
              <description>CoreRouter VM lab (cargo xtask vm-lab, docs/vm-lab.md)</description>\n  \
              <memory unit='MiB'>{mem}</memory>\n  <vcpu>{cpus}</vcpu>\n  \
              <os><type arch='x86_64' machine='q35'>hvm</type><boot dev='hd'/></os>\n  \
              <features><acpi/><apic/></features>\n  \
-             <cpu mode='host-passthrough' check='none' migratable='off'/>\n  \
+             <cpu mode='host-model' check='partial'/>\n  \
              <clock offset='utc'/>\n  <on_poweroff>destroy</on_poweroff>\n  \
              <on_reboot>restart</on_reboot>\n  <on_crash>destroy</on_crash>\n  <devices>\n    \
              <disk type='file' device='disk'>\n      \
@@ -460,7 +475,40 @@ impl Lab {
         if self.require()? != "running" {
             virsh(&["start", NAME])?;
         }
-        self.wait_ssh(Duration::from_secs(180))
+        self.wait_ssh(Duration::from_secs(180))?;
+        // A `reset` to an older snapshot may predate a guest setting.
+        if self.guest_settings()? {
+            eprintln!("vm-lab: guest boot settings applied; rebooting");
+            self.down()?;
+            virsh(&["start", NAME])?;
+            self.wait_ssh(Duration::from_secs(180))?;
+        }
+        Ok(())
+    }
+
+    /// Kernel command line the lab needs, written once; `true` when it was
+    /// just written (takes effect on the next boot).
+    ///
+    /// `spec_rstack_overflow=off`: `host-model` cannot tell the guest that
+    /// the CPU is immune to SRSO from user space (libvirt 10.0 has no name
+    /// for those CPUID bits), so the guest picked "Safe RET" on every
+    /// kernel return and ran 3× slower (veth 558 against 1811 kpps,
+    /// **measured**). The host kernel does not use Safe RET on this CPU
+    /// either ("IBPB on VMEXIT only"), so this matches bare metal.
+    fn guest_settings(&self) -> Result<bool, String> {
+        let out = self.ssh_output(&format!(
+            "if [ -f {GRUB_CFG} ]; then echo present; else \
+             printf '%s\\n' '# cargo xtask vm-lab (docs/vm-lab.md)' \
+             'GRUB_CMDLINE_LINUX_DEFAULT=\"$GRUB_CMDLINE_LINUX_DEFAULT {GUEST_CMDLINE}\"' \
+             | sudo tee {GRUB_CFG} >/dev/null && sudo update-grub 2>/dev/null && echo written; fi"
+        ))?;
+        if out.contains("present") {
+            Ok(false)
+        } else if out.contains("written") {
+            Ok(true)
+        } else {
+            Err(format!("could not write {GRUB_CFG}: {}", out.trim()))
+        }
     }
 
     fn down(&self) -> Result<(), String> {
@@ -471,7 +519,9 @@ impl Lab {
         virsh(&["shutdown", NAME])?;
         let deadline = Instant::now() + Duration::from_secs(90);
         while Instant::now() < deadline {
-            if self.state()?.as_deref() != Some("running") {
+            // "in shutdown" is not done yet: a snapshot taken then races
+            // QEMU on its way out (**measured**).
+            if self.state()?.as_deref() == Some("shut off") {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_millis(500));
@@ -522,13 +572,43 @@ impl Lab {
             self.close_master();
             virsh(&["destroy", NAME])?;
         }
+        // A revert also brings back the definition saved with the snapshot
+        // (CPU, memory): keep the current one.
+        let current = virsh(&["dumpxml", "--inactive", "--security-info", NAME])?;
         virsh(&["snapshot-revert", NAME, name])?;
+        let xml = self.path(&format!("{NAME}.xml"));
+        write(&xml, &current)?;
+        virsh(&["define", &xml.to_string_lossy()])?;
         self.up()?;
         eprintln!(
             "vm-lab: back to `{name}` and booted in {:.1} s",
             started.elapsed().as_secs_f64()
         );
         Ok(())
+    }
+
+    /// Before each `run`: root works, a handful of processes start, and
+    /// there is room on the disk and in memory. Two tries, a few seconds
+    /// apart, so one busy moment does not trigger a reset.
+    fn healthy(&self) -> Result<(), String> {
+        let check = format!(
+            "sudo -n bash -c 'for i in 1 2 3 4 5; do /bin/true || exit 11; done; \
+             disk=$(df --output=avail -k {LAB_ROOT} | tail -1); \
+             mem=$(awk \"/MemAvailable/{{print \\$2}}\" /proc/meminfo); \
+             [ \"$disk\" -gt 2097152 ] || {{ echo \"disk: $((disk / 1024)) MiB free\" >&2; exit 12; }}; \
+             [ \"$mem\" -gt 1048576 ] || {{ echo \"memory: $((mem / 1024)) MiB available\" >&2; exit 13; }}'"
+        );
+        let mut last = String::new();
+        for attempt in 0..2 {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+            match self.ssh_output(&check) {
+                Ok(_) => return Ok(()),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 
     fn status(&self) -> Result<(), String> {
@@ -782,10 +862,12 @@ impl Lab {
 
     fn run(&self, args: &[String]) -> Result<(), String> {
         let mut sync = true;
+        let mut exclusive = true;
         let mut rest = args;
         while let Some((first, tail)) = rest.split_first() {
             match first.as_str() {
                 "--no-sync" => sync = false,
+                "--shared" => exclusive = false,
                 "--" => {
                     rest = tail;
                     break;
@@ -798,7 +880,13 @@ impl Lab {
             return Err(format!("nothing to run\n{HELP}"));
         }
         let started = Instant::now();
-        self.up()?;
+        // Unreachable counts as unhealthy too (sshd was among the victims).
+        if let Err(why) = self.up().and_then(|()| self.healthy()) {
+            eprintln!("vm-lab: {NAME} is unhealthy ({why}); `reset` to `clean`");
+            self.reset("clean")?;
+            self.healthy()
+                .map_err(|e| format!("{NAME} still unhealthy after reset: {e}"))?;
+        }
         if sync {
             self.sync()?;
         }
@@ -807,8 +895,21 @@ impl Lab {
             "if [ ! -r {RUST_ENV} ]; then echo 'vm-lab: no Rust toolchain in the VM; run `cargo xtask vm-lab create`' >&2; exit 1; fi\n\
              . {RUST_ENV}\n\
              export CARGO_TARGET_DIR={dir}/target CARGO_TERM_COLOR=${{CARGO_TERM_COLOR:-always}}\n\
+             {lock}\
              cd {dir}/src && {cmd}\n",
-            cmd = remote_command(rest)
+            cmd = remote_command(rest),
+            // One root round at a time: the tests share fixed namespace
+            // names (`crxdp`, `crxsub`) and one tears down the other's
+            // (**measured**, 2026-10-25), and their pps numbers share CPUs.
+            lock = if exclusive {
+                format!(
+                    "exec 9>>{LOCK}\n\
+                     if ! flock -n 9; then echo \"vm-lab: waiting for $(cat {LOCK}.owner 2>/dev/null)\" >&2; flock 9; fi\n\
+                     echo \"{dir} since $(date -u +%H:%M:%SZ)\" > {LOCK}.owner\n"
+                )
+            } else {
+                String::new()
+            }
         );
         // `bash -c` (not a heredoc on stdin), so the command keeps a
         // terminal-less stdin of its own and `-t` is not needed.
@@ -830,7 +931,7 @@ impl Lab {
 fn parse_spec(args: &[String]) -> Result<Spec, String> {
     let mut spec = Spec {
         cpus: 8,
-        memory_mib: 8192,
+        memory_mib: 16_384,
         disk_gib: 20,
         wires: 1,
     };
@@ -1060,7 +1161,7 @@ mod tests {
     #[test]
     fn spec_flags_are_checked() {
         let s = parse_spec(&["--cpus".into(), "16".into(), "--wires".into(), "2".into()]).unwrap();
-        assert_eq!((s.cpus, s.wires, s.memory_mib), (16, 2, 8192));
+        assert_eq!((s.cpus, s.wires, s.memory_mib), (16, 2, 16_384));
         assert!(parse_spec(&["--wires".into(), "9".into()]).is_err());
         assert!(parse_spec(&["--cpus".into()]).is_err());
         assert!(parse_spec(&["--bogus".into(), "1".into()]).is_err());
