@@ -16,12 +16,13 @@
 //! wait on the network (RADIUS answers come back through
 //! [`IpoeBackend::verdicts`]).
 
+use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use corerouter_model::dhcp_server::DhcpServer;
 use corerouter_model::ipoe::{IpoeUnknown, UseRadius};
-use corerouter_model::ppp::{AddrOrPool, DEFAULT_PROFILE, PppService};
+use corerouter_model::ppp::{AddrOrPool, DEFAULT_PROFILE, PppSecret, PppService};
 use corerouter_model::{Config, IfName, MacAddr};
 use corerouter_proto_dhcp::server::Binding;
 use corerouter_proto_dhcp::server::agent;
@@ -53,11 +54,11 @@ pub trait IpoeBackend: Send + Sync {
     /// A client to authorize. `Some`: decided now (a local secret, or the
     /// server only accounts); `None`: asked of RADIUS, the verdict comes
     /// back through [`IpoeBackend::verdicts`].
-    fn authorize(&self, ask: &AuthAsk, cfg: &Config) -> Option<Verdict>;
+    fn authorize(&self, ask: &AuthAsk, view: &IpoeView<'_>) -> Option<Verdict>;
     /// The verdicts that arrived: (server, client key, verdict).
     fn verdicts(&self) -> Vec<(String, Vec<u8>, Verdict)>;
     /// A lease of a session server was bound or renewed.
-    fn bound(&self, b: &Binding, cfg: &Config);
+    fn bound(&self, b: &Binding, view: &IpoeView<'_>);
     /// A lease of a session server ended (released, expired, revoked).
     fn gone(&self, lease: &Lease, why: &str);
     /// Disconnects the service wants carried out (CoA Disconnect,
@@ -73,9 +74,68 @@ pub trait IpoeBackend: Send + Sync {
     }
 }
 
+/// What the IPoE decisions look up per lease, indexed once per config
+/// revision: a lookup is O(1) with 100 000 secrets or static leases (a
+/// scan of `/ppp secret` per DISCOVER was O(secrets) per client).
+#[derive(Debug, Default, Clone)]
+pub struct IpoeIndex {
+    revision: Option<u32>,
+    /// `/ppp secret` with `service=ipoe` by name → its position (the first
+    /// of a name, as a scan would find).
+    secrets: HashMap<String, usize>,
+    /// Static leases with a `rate_limit`, by address (enabled ones).
+    lease_rates: HashMap<Ipv4Addr, String>,
+}
+
+impl IpoeIndex {
+    pub fn of(cfg: &Config) -> Self {
+        let mut secrets = HashMap::new();
+        for (i, s) in cfg.ppp.secrets.iter().enumerate() {
+            if s.service == PppService::Ipoe {
+                secrets.entry(s.name.clone()).or_insert(i);
+            }
+        }
+        let lease_rates = cfg
+            .ip
+            .dhcp_server
+            .leases
+            .iter()
+            .filter(|l| !l.disabled && !l.rate_limit.is_empty())
+            .map(|l| (l.address, l.rate_limit.clone()))
+            .collect();
+        IpoeIndex { revision: None, secrets, lease_rates }
+    }
+}
+
+/// The running config as the IPoE decisions read it, with its index.
+#[derive(Clone, Copy)]
+pub struct IpoeView<'a> {
+    pub cfg: &'a Config,
+    index: &'a IpoeIndex,
+}
+
+impl<'a> IpoeView<'a> {
+    /// `index` must be [`IpoeIndex::of`] this `cfg`.
+    pub fn new(cfg: &'a Config, index: &'a IpoeIndex) -> Self {
+        IpoeView { cfg, index }
+    }
+
+    /// The `/ppp secret` (service `ipoe`) named `user`, enabled or not.
+    pub fn secret(&self, user: &str) -> Option<&'a PppSecret> {
+        let i = *self.index.secrets.get(user)?;
+        self.cfg.ppp.secrets.get(i)
+    }
+
+    /// The `rate_limit` of the static lease of `ip`.
+    pub fn lease_rate(&self, ip: Ipv4Addr) -> Option<&'a str> {
+        self.index.lease_rates.get(&ip).map(String::as_str)
+    }
+}
+
 #[derive(Default)]
 struct IpoeRuntime {
     backend: Option<Arc<dyn IpoeBackend>>,
+    index: IpoeIndex,
 }
 
 impl Session {
@@ -88,6 +148,25 @@ impl Session {
     /// The daemon's IPoE service, if it runs one.
     pub fn ipoe_backend(&self) -> Option<Arc<dyn IpoeBackend>> {
         self.ext::<IpoeRuntime>()?.backend.clone()
+    }
+
+    /// Index the running config again if it changed (once a DHCP round).
+    pub(crate) fn ipoe_refresh(&mut self) {
+        let rev = self.store().current_revision();
+        if self.ext::<IpoeRuntime>().is_some_and(|r| r.index.revision == Some(rev)) {
+            return;
+        }
+        let mut index = IpoeIndex::of(self.store().running());
+        index.revision = Some(rev);
+        if let Some(rt) = self.ext_mut::<IpoeRuntime>() {
+            rt.index = index;
+        }
+    }
+
+    /// The running config and its index (fresh after [`Session::ipoe_refresh`]).
+    pub(crate) fn ipoe_view(&self) -> Option<IpoeView<'_>> {
+        let rt = self.ext::<IpoeRuntime>()?;
+        Some(IpoeView::new(self.store().running(), &rt.index))
     }
 }
 
@@ -102,7 +181,8 @@ pub fn user_of(srv: &DhcpServer, mac: [u8; 6], circuit: Option<&[u8]>, remote: O
 /// The local decision about `ask` on `cfg`: its `/ppp secret`
 /// (`service=ipoe`, enabled, named as `ipoe_username` says), else RADIUS
 /// when `use_radius=yes`, else `ipoe_unknown`.
-pub fn local_verdict(ask: &AuthAsk, cfg: &Config) -> Local {
+pub fn local_verdict(ask: &AuthAsk, view: &IpoeView<'_>) -> Local {
+    let cfg = view.cfg;
     let Some(srv) = cfg.ip.dhcp_server.server(&ask.server) else {
         return Local::Done(Verdict::Reject("server gone".into()));
     };
@@ -116,12 +196,7 @@ pub fn local_verdict(ask: &AuthAsk, cfg: &Config) -> Local {
             srv.ipoe_username
         )));
     };
-    let secret = cfg
-        .ppp
-        .secrets
-        .iter()
-        .find(|s| s.service == PppService::Ipoe && s.name == user);
-    if let Some(sec) = secret {
+    if let Some(sec) = view.secret(&user) {
         if sec.disabled {
             return Local::Done(Verdict::Reject(format!("secret {user} is disabled")));
         }
@@ -154,11 +229,11 @@ impl Session {
     /// An [`AuthAsk`] of the DHCP server: the service's answer, or the
     /// local one without a service (RADIUS cannot be asked then).
     pub(crate) fn ipoe_authorize(&self, ask: &AuthAsk) -> Option<Verdict> {
-        let cfg = self.store().running();
+        let view = self.ipoe_view()?;
         if let Some(b) = self.ipoe_backend() {
-            return b.authorize(ask, cfg);
+            return b.authorize(ask, &view);
         }
-        Some(match local_verdict(ask, cfg) {
+        Some(match local_verdict(ask, &view) {
             Local::Done(v) => v,
             Local::AskRadius { user } => Verdict::Reject(format!(
                 "{user}: RADIUS needed but the daemon's ipoe service is not running"
@@ -199,6 +274,11 @@ mod tests {
         }
     }
 
+    fn lv(a: &AuthAsk, cfg: &corerouter_model::Config) -> Local {
+        let idx = IpoeIndex::of(cfg);
+        local_verdict(a, &IpoeView::new(cfg, &idx))
+    }
+
     fn lab() -> Session {
         let mut s = Session::virtual_lab();
         for (id, p) in [
@@ -220,7 +300,7 @@ mod tests {
     fn secrets_unknowns_and_radius() {
         let mut s = lab();
         let cfg = s.store().running().clone();
-        let Local::Done(Verdict::Accept(g)) = local_verdict(&ask([2, 0, 0, 0, 0, 1], None), &cfg) else {
+        let Local::Done(Verdict::Accept(g)) = lv(&ask([2, 0, 0, 0, 0, 1], None), &cfg) else {
             panic!("the secret's client is accepted");
         };
         assert_eq!(g.pool.as_deref(), Some("vip"));
@@ -228,29 +308,30 @@ mod tests {
         // A PPPoE secret named like the MAC is not an IPoE grant: unknown,
         // accepted with the server's own settings (ipoe_unknown=accept).
         assert_eq!(
-            local_verdict(&ask([2, 0, 0, 0, 0, 3], None), &cfg),
+            lv(&ask([2, 0, 0, 0, 0, 3], None), &cfg),
             Local::Done(Verdict::Accept(Grant::default()))
         );
         s.execute("ip.dhcp-server.set", &json!({"id": "dhcp1", "ipoe_unknown": "reject"})).unwrap();
         let cfg = s.store().running().clone();
-        assert!(matches!(local_verdict(&ask([2, 0, 0, 0, 0, 3], None), &cfg), Local::Done(Verdict::Reject(_))));
+        assert!(matches!(lv(&ask([2, 0, 0, 0, 0, 3], None), &cfg), Local::Done(Verdict::Reject(_))));
         // By circuit id: the line's secret, its fixed address.
         s.execute("ip.dhcp-server.set", &json!({"id": "dhcp1", "ipoe_username": "circuit-id"})).unwrap();
         let cfg = s.store().running().clone();
-        let Local::Done(Verdict::Accept(g)) = local_verdict(&ask([2, 0, 0, 0, 0, 7], Some("olt1/3")), &cfg) else {
+        let Local::Done(Verdict::Accept(g)) = lv(&ask([2, 0, 0, 0, 0, 7], Some("olt1/3")), &cfg) else {
             panic!("the line's secret");
         };
         assert_eq!(g.address, Some(Ipv4Addr::new(10, 9, 0, 99)));
         // No option 82: no name, not served.
-        assert!(matches!(local_verdict(&ask([2, 0, 0, 0, 0, 7], None), &cfg), Local::Done(Verdict::Reject(_))));
+        assert!(matches!(lv(&ask([2, 0, 0, 0, 0, 7], None), &cfg), Local::Done(Verdict::Reject(_))));
         // RADIUS when the secret list does not know the client.
         s.execute("ip.dhcp-server.set", &json!({"id": "dhcp1", "use_radius": "yes", "ipoe_username": "mac"})).unwrap();
         let cfg = s.store().running().clone();
         assert_eq!(
-            local_verdict(&ask([2, 0, 0, 0, 0, 9], None), &cfg),
+            lv(&ask([2, 0, 0, 0, 0, 9], None), &cfg),
             Local::AskRadius { user: "02:00:00:00:00:09".into() }
         );
         // Without the daemon's service the engine cannot ask: refused.
+        s.ipoe_refresh();
         assert!(matches!(s.ipoe_authorize(&ask([2, 0, 0, 0, 0, 9], None)), Some(Verdict::Reject(_))));
     }
 }
