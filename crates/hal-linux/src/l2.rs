@@ -66,6 +66,19 @@ pub struct LldpFrame {
     pub lldpdu: Vec<u8>,
 }
 
+/// A receive buffer of `want` bytes: `SO_RCVBUFFORCE` first (with
+/// CAP_NET_ADMIN it passes `net.core.rmem_max`), else `SO_RCVBUF` (capped
+/// there). Returns what the kernel gave: it reports twice the size (the
+/// other half is its bookkeeping), halved here. A burst after an outage
+/// (PADIs, RADIUS answers) overflows a small buffer into retransmissions.
+pub fn rcvbuf(fd: &impl std::os::fd::AsFd, want: usize) -> usize {
+    use nix::sys::socket::{getsockopt, setsockopt, sockopt};
+    if setsockopt(fd, sockopt::RcvBufForce, &want).is_err() {
+        let _ = setsockopt(fd, sockopt::RcvBuf, &want);
+    }
+    getsockopt(fd, sockopt::RcvBuf).map_or(0, |v| v / 2)
+}
+
 pub(crate) fn io_err(e: nix::Error) -> io::Error {
     io::Error::from_raw_os_error(e as i32)
 }

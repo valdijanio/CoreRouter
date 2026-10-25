@@ -498,3 +498,48 @@ fn unsolicited_and_spoofed_replies_are_ignored() {
     assert!(c.handle_input(t.from, a, &reject, 3).is_err());
     let _ = Retry::ACCESS;
 }
+
+/// G4.3g: a server slowing down as a queue grows, from 0.8 s to 1.6 s
+/// (past the 1.1 s IRT). The adaptive first timeout (SRTT + 4·RTTVAR, RFC
+/// 6298, from answers to single transmissions) keeps ahead of it: no copies
+/// of what the server is still working on.
+#[test]
+fn slowing_server_gets_an_adaptive_first_timeout() {
+    let (a, sa) = auth_server("10.0.0.10:1812");
+    let mut net = Net::new(vec![(a, sa)], 1);
+    let mut c = client(vec![ServerConfig::auth(a, SECRET)]);
+    let mut log = Log::default();
+    for delay in (800..=1600).step_by(50) {
+        net.server(a).script.delay_ms = delay;
+        for _ in 0..8 {
+            let r = c.access(user("ana"), Some(b"segredo"), net.now).unwrap();
+            log.run(&mut net, &mut c, 10_000);
+            assert_eq!(log.response(r).unwrap().0, Code::AccessAccept);
+        }
+    }
+    let st = c.stats(0).unwrap();
+    assert_eq!(st.resends, 0, "the timeout kept ahead of the server");
+    assert!(
+        (1600..=4400).contains(&st.rto_ms),
+        "SRTT + 4·RTTVAR within MRT: {}",
+        st.rto_ms
+    );
+}
+
+/// G4.3g: the timer of an answered request must not fire on the next
+/// request that takes its slot. Logins one after another, each answered in
+/// 100 ms, far inside the 1.1 s timeout: not one is sent twice.
+#[test]
+fn an_answered_request_leaves_no_timer_behind() {
+    let (a, sa) = auth_server("10.0.0.10:1812");
+    let mut net = Net::new(vec![(a, sa)], 1);
+    net.server(a).script.delay_ms = 100;
+    let mut c = client(vec![ServerConfig::auth(a, SECRET)]);
+    let mut log = Log::default();
+    for _ in 0..40 {
+        let r = c.access(user("ana"), Some(b"segredo"), net.now).unwrap();
+        log.run(&mut net, &mut c, 150);
+        assert_eq!(log.response(r).unwrap().0, Code::AccessAccept);
+    }
+    assert_eq!(c.stats(0).unwrap().resends, 0, "a copy before its timeout");
+}

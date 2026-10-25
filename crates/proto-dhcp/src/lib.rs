@@ -25,6 +25,7 @@ pub mod optval;
 pub mod relay;
 pub mod server;
 pub mod server6;
+pub mod sub6;
 pub mod v4;
 pub mod v6;
 

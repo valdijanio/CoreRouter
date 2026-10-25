@@ -16,6 +16,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("resources.check.oom", "## OOM kills\n\nProcesses killed for lack of memory in the last hour."),
     ("resources.check.rss", "## RSS balance\n\nOne CPU taking most of the receive softirqs."),
     ("resources.check.services", "## Services\n\nSupervised services failed or down."),
+    ("resources.check.sockbuf", "## Socket buffers\n\nThe RADIUS and PPPoE sockets got a smaller receive buffer than they asked for (net.core.rmem_max)."),
     ("resources.check.swap", "## Swap\n\nSwap in use (50/90 %) or swap-ins per second."),
     ("resources.check.temperature", "## Temperature\n\nHottest sensor against its critical limit."),
     ("resources.checks", "## Health checks\n\nWhat the router checks about itself, with the reason and what to do."),

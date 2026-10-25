@@ -51,11 +51,18 @@ struct Track {
     twice: u64,
     down: Vec<usize>,
     up: Vec<usize>,
+    /// Status-Server probes sent to the primary.
+    probes: u64,
 }
 
 impl Track {
     fn on_send(&mut self, s: &Sent) {
         self.transmissions += 1;
+        if s.t.from.server == 0
+            && Packet::parse(&s.bytes).is_ok_and(|p| p.code() == Code::StatusServer)
+        {
+            self.probes += 1;
+        }
         let key = (s.t.from.server, s.t.from.socket, s.t.identifier);
         if s.t.retransmission {
             self.retransmissions += 1;
@@ -292,10 +299,11 @@ fn hundred_thousand_requests_with_loss_and_failover() {
         "every session's newest interim arrived"
     );
 
-    // The primary was declared dead and came back via Status-Server.
+    // The primary was declared dead, probed with Status-Server while down,
+    // and came back (by a probe or a late answer, whichever came first).
     assert!(track.down.contains(&0));
+    assert!(track.probes > 0);
     assert!(track.up.contains(&0));
-    assert!(net.server(addrs[0]).stats.status > 0);
     // Retransmissions met the duplicate cache.
     let dups: u64 = addrs.iter().map(|a| net.server(*a).stats.duplicates).sum();
     assert!(dups > 0);

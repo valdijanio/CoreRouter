@@ -265,6 +265,12 @@ fn pool_remove(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(x) = d.servers.iter().find(|x| x.address_pool.as_deref() == Some(&pl.name) || x.prefix_pool.as_deref() == Some(&pl.name)) {
         return Err(EngineError::bad("id", format!("in use by server {}", x.name)));
     }
+    let ppp = &s.store().candidate().ppp;
+    if let Some(pr) = ppp.profiles.iter().find(|pr| {
+        pr.remote_ipv6_prefix_pool.as_deref() == Some(&pl.name) || pr.dhcpv6_pd_pool.as_deref() == Some(&pl.name)
+    }) {
+        return Err(EngineError::bad("id", format!("in use by ppp profile {}", pr.name)));
+    }
     Ok(json!({"id": pl.id, "name": pl.name}))
 }
 
