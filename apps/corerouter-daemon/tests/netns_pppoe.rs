@@ -406,6 +406,9 @@ fn pppoe_server_end_to_end() {
         json!({"id": "pppoe-acc0", "new_session_rate": 1000, "padi_limit": 2000, "mac_padi_limit": 1}),
     );
     let mut again = Cpes::new(n, 0, |i| (format!("u{i}"), format!("p{i}")), false);
+    // The service reads the config once a second: until then the old rate
+    // (none) still holds, and the BNG sets up thousands in that second.
+    std::thread::sleep(Duration::from_millis(1500));
     drop(many);
     let t = Instant::now();
     again.start_all();

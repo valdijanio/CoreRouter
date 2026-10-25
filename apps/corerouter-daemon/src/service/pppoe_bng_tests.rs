@@ -364,7 +364,18 @@ fn mass_reconnect_after_cpe_reboots_is_spread_by_the_rate() {
         lab.clients[c].start(lab.now, &mut out);
         lab.feed(&mut out);
     }
-    lab.run(1500, 50);
+    // The rate paces the wave: a token per PADI, 500 in the bucket, so the
+    // last of 2000 cannot be in before (2000 − 500) / 500 = 3 s.
+    let t0 = lab.now;
+    let mut rounds = 0;
+    while lab.ups() < n && rounds < 1500 {
+        lab.run(1, 50);
+        rounds += 1;
+    }
+    let took = lab.now - t0;
+    eprintln!("reconnect of {n} at 500/s: {took} ms");
+    assert!(took >= 3000, "the rate paced the reconnect: {took} ms");
+    lab.run(100, 50);
     assert_eq!(lab.ups(), n, "all back");
     assert_eq!(lab.backend().active().len(), n, "nothing duplicated");
     lab.bng.check().unwrap();
