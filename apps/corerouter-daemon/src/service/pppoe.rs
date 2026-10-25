@@ -42,7 +42,7 @@ fn run(session: &corerouter_engine::Shared, health: &super::Health) -> Result<()
 #[cfg(target_os = "linux")]
 mod linux {
     use std::collections::HashMap;
-    use std::net::Ipv4Addr;
+
     use std::os::fd::BorrowedFd;
     use std::sync::Arc;
     use std::sync::OnceLock;
@@ -53,7 +53,7 @@ mod linux {
     use corerouter_hal_linux::pppoe_io::{PppoePort, SlowPath};
     use corerouter_model::ppp::PppoeServer;
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     use super::super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot, vlan_ids};
 
@@ -108,8 +108,6 @@ mod linux {
         /// sessions; each session keeps the plane it started on).
         plane: Option<bool>,
         plane_for: Vec<corerouter_model::IfName>,
-        /// Address-list entries we added: (list, ip) → id.
-        lists: HashMap<(String, Ipv4Addr), String>,
         errors: Vec<String>,
     }
 
@@ -123,7 +121,6 @@ mod linux {
             slow: None,
             plane: None,
             plane_for: Vec::new(),
-            lists: HashMap::new(),
             errors: Vec::new(),
         };
         let owner = Arc::new(Owner(d.bng.shared.clone()));
@@ -331,6 +328,7 @@ mod linux {
                     other => locked.push(other),
                 }
             }
+            let mut lists = Vec::new();
             let mut s = lock(session);
             if !ops.is_empty()
                 && let Err(e) = s.pppoe_apply(&ops)
@@ -344,26 +342,10 @@ mod linux {
                             s.log_event(&["ppp", "warning"], "pppoe", format!("PPP: hook {command}: {err}"), json!({}));
                         }
                     }
-                    Effect::AddressList { list, ip, add: true, comment } => {
-                        let p = json!({"list": list, "address": ip.to_string(), "timeout": "52w", "comment": comment});
-                        match s.execute("ip.firewall.address-list.add", &p) {
-                            Ok(v) => {
-                                if let Some(id) = v.get("id").and_then(Value::as_str) {
-                                    self.lists.insert((list, ip), id.to_owned());
-                                }
-                            }
-                            Err(err) => s.log_event(
-                                &["ppp", "warning"],
-                                "pppoe",
-                                format!("PPP: address-list {list} {ip}: {err}"),
-                                json!({}),
-                            ),
-                        }
-                    }
-                    Effect::AddressList { list, ip, add: false, .. } => {
-                        if let Some(id) = self.lists.remove(&(list, ip)) {
-                            let _ = s.execute("ip.firewall.address-list.remove", &json!({"id": id}));
-                        }
+                    Effect::AddressList { list, ip, add, comment } => {
+                        // 35 days: the longest dynamic entry (the BNG makes
+                        // it again before).
+                        lists.push(corerouter_engine::ppp::PppListOp { list, ip, add, timeout_secs: 35 * 86_400, comment });
                     }
                     Effect::Log { error, text } => {
                         let level = if error { "error" } else { "info" };
@@ -371,6 +353,9 @@ mod linux {
                     }
                     Effect::Xdp(_) | Effect::Route { .. } => {}
                 }
+            }
+            for err in s.ppp_address_lists(&lists) {
+                s.log_event(&["ppp", "warning"], "pppoe", format!("PPP: {err}"), json!({}));
             }
         }
     }

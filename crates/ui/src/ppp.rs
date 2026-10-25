@@ -118,7 +118,7 @@ const PROFILE_COLUMNS: [table::Column; 9] = [
     num("Secrets").help("ppp.profile.secrets"),
     comment(),
 ];
-const ACTIVE_COLUMNS: [table::Column; 10] = [
+const ACTIVE_COLUMNS: [table::Column; 11] = [
     col("Name").help("ppp.active.name"),
     col("Service").help("ppp.active.service"),
     col("Caller ID").help("ppp.active.caller_id"),
@@ -127,6 +127,7 @@ const ACTIVE_COLUMNS: [table::Column; 10] = [
     col("Rate Limit").help("ppp.active.rate_limit"),
     num("Rx").help("ppp.active.rx"),
     num("Tx").help("ppp.active.tx"),
+    col("Traffic").help("ppp.active.traffic"),
     col("VLAN").help("ppp.active.vlan"),
     col("Circuit ID").help("ppp.active.circuit_id"),
 ];
@@ -328,7 +329,16 @@ pub(crate) struct PppPanel {
     pub(crate) why: Option<WhyDialog>,
     pub(crate) drops: Option<Drops>,
     pub(crate) help: Option<HelpView>,
+    /// Rx/Tx bits per second of each session since the window opened (the
+    /// sparkline of Active Connections), at most [`TRAFFIC_POINTS`].
+    pub(crate) traffic: BTreeMap<String, std::collections::VecDeque<(f64, f64)>>,
+    /// A login to select once Active Connections has it (the identity chip
+    /// of another window was clicked).
+    pub(crate) reveal: Option<String>,
 }
+
+/// Points of the per-session sparkline (one per refresh, ~2 minutes).
+const TRAFFIC_POINTS: usize = 120;
 
 fn showing(app: &CoreRouterUi) -> bool {
     app.open.contains(&Win::Panel(WIN))
@@ -504,7 +514,7 @@ impl PppPanel {
         }
     }
 
-    pub(crate) fn active_row(r: &Value) -> Row {
+    pub(crate) fn active_row(r: &Value, traffic: Option<&std::collections::VecDeque<(f64, f64)>>) -> Row {
         let name = text(r, "name");
         let badge = format!("{} {name}", icons::IDENTIFICATION_BADGE);
         let mut name_chips = vec![(badge.as_str(), Kind::Blue)];
@@ -523,6 +533,11 @@ impl PppPanel {
                 rate_chip(&text(r, "rate_limit")),
                 bytes(n(r, "rx_bytes")),
                 bytes(n(r, "tx_bytes")),
+                traffic.map_or_else(String::new, |t| {
+                    let rx: Vec<Option<f64>> = t.iter().map(|p| Some(p.0)).collect();
+                    let tx: Vec<Option<f64>> = t.iter().map(|p| Some(p.1)).collect();
+                    crate::spark::cell(&rx, &tx)
+                }),
                 if vlan.is_empty() { String::new() } else { chip::cell("", &[(vlan.as_str(), Kind::Hashed(chip::name_hue(&vlan)))]) },
                 text(r, "circuit_id"),
             ],
@@ -825,7 +840,13 @@ impl PppPanel {
 
     fn active_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         let data = rows_of(&self.active);
-        let rows: Vec<Row> = data.iter().map(Self::active_row).collect();
+        let rows: Vec<Row> = data.iter().map(|r| Self::active_row(r, self.traffic.get(&text(r, "id")))).collect();
+        if let Some(login) = self.reveal.clone()
+            && let Some(r) = data.iter().find(|r| text(r, "name") == login)
+        {
+            self.active_table.reveal(&text(r, "id"));
+            self.reveal = None;
+        }
         let sel = self.active_table.selection(&rows);
         let picked: Vec<Value> = sel.as_slice().iter().filter_map(|k| data.iter().find(|r| text(r, "id") == *k).cloned()).collect();
         let can = app.can();
@@ -1007,6 +1028,12 @@ impl PppPanel {
         if table::action(ui, tr_in(SCOPE, l, "Open RADIUS"), Ok(())) && !app.open.insert(Win::Panel(crate::radius::WIN)) {
             app.floats.raise(crate::win_id(Win::Panel(crate::radius::WIN)));
         }
+    }
+
+    /// Show Active Connections with `login` selected (the identity chip).
+    pub(crate) fn reveal_login(&mut self, login: &str) {
+        self.tab = Tab::Active;
+        self.reveal = Some(login.to_owned());
     }
 
     pub(crate) fn open_why(&mut self, app: &mut CoreRouterUi, name: String, mac: String) {
@@ -1269,7 +1296,18 @@ impl PanelState for PppPanel {
             ("profiles", Value::Array(a)) => self.profiles = a,
             ("history", Value::Array(a)) => self.history = a,
             ("secret-count", v) => self.secret_count = v,
-            ("active", v) if v.is_object() => self.active = v,
+            ("active", v) if v.is_object() => {
+                let rows = rows_of(&v);
+                self.traffic.retain(|id, _| rows.iter().any(|r| text(r, "id") == *id));
+                for r in &rows {
+                    let t = self.traffic.entry(text(r, "id")).or_default();
+                    t.push_back((n(r, "rx_bps") as f64, n(r, "tx_bps") as f64));
+                    while t.len() > TRAFFIC_POINTS {
+                        t.pop_front();
+                    }
+                }
+                self.active = v;
+            }
             ("monitor", v) if v.is_object() => self.monitor = v,
             ("aaa", v) if v.is_object() => {
                 let now = AaaForm::of(&v);

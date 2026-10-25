@@ -123,7 +123,7 @@ fn active_connections_show_the_login_rate_and_counters() {
     assert!(h.has_text("Active Connections"));
     assert!(h.has_text_containing("100.64.0.2"));
     let p = h.app.panel_mut::<PppPanel>().unwrap();
-    let rows: Vec<_> = p.active["rows"].as_array().unwrap().iter().map(PppPanel::active_row).collect();
+    let rows: Vec<_> = p.active["rows"].as_array().unwrap().iter().map(|r| PppPanel::active_row(r, None)).collect();
     assert_eq!(rows.len(), 3);
     let name = crate::chip::split(&rows[0].cells[0]).1;
     assert!(name[0].1.contains("ana"), "sorted by name, the identity chip: {name:?}");
@@ -257,6 +257,7 @@ fn every_explanation_exists_in_both_languages() {
         "ppp.active.rate_limit",
         "ppp.active.rx",
         "ppp.active.service",
+        "ppp.active.traffic",
         "ppp.active.tx",
         "ppp.active.uptime",
         "ppp.active.vlan",

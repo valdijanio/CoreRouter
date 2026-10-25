@@ -242,7 +242,7 @@ fn setup(users: usize) -> (Kill, std::path::PathBuf) {
     );
     ok(
         "ppp.profile.set",
-        json!({"id": "default", "remote_address": "clientes", "dns_server": "1.1.1.1", "rate_limit": "10M/50M"}),
+        json!({"id": "default", "remote_address": "clientes", "dns_server": "1.1.1.1", "rate_limit": "10M/50M", "address_list": "online"}),
     );
     let steps: Vec<Value> = (0..users)
         .map(|i| json!({"command": "ppp.secret.add", "params": {"name": format!("u{i}"), "password": format!("p{i}")}}))
@@ -329,11 +329,29 @@ fn pppoe_server_end_to_end() {
         r["rx_packets"].as_u64().unwrap_or(0) >= 1 && r["tx_packets"].as_u64().unwrap_or(0) >= 1
     });
 
+    // The profile's address list holds the subscriber while up, and the
+    // identity chip (and CGNAT › Who was?) names the login.
+    let in_list = |ip: &str| {
+        ok("ip.firewall.address-list.list", json!({}))
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| {
+                e["list"] == "online" && e["address"].as_str().is_some_and(|a| a.starts_with(ip))
+            })
+    };
+    let ip_text = ip.to_string();
+    wait_for("the address list entry", || in_list(&ip_text));
+    let who = ok("ip.identity.lookup", json!({"addresses": ip_text}));
+    assert_eq!(who[0]["primary"]["source"], "pppoe", "{who}");
+    assert_eq!(who[0]["primary"]["name"], "u0", "{who}");
+
     // Terminate it.
     let id = row["id"].as_str().unwrap().to_owned();
     ok("ppp.active.remove", json!({"id": id}));
     assert!(one.run_until(10, |c| c.ups() == 0), "terminated");
     wait_for("gone", || active() == 0);
+    wait_for("out of the address list", || !in_list(&ip_text));
     let h = ok("ppp.history", json!({"name": "u0", "limit": 1}));
     assert_eq!(h[0]["reason"], "admin");
     drop(one);

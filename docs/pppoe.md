@@ -1,6 +1,6 @@
 # PPPoE / BNG em Rust puro (`proto-pppoe`, G4.3)
 
-Status: **G4.3a** feito; **G4.3d** em andamento (modelo e comandos; serviço, janela e extras em PRs empilhados, §8) — o crate L2 `crates/proto-pppoe`: codecs de PPPoE e PPP e as máquinas
+Status: **G4.3a** feito; **G4.3d** feito (comandos, serviço `pppoe`, janela PPP e extras, §8) — o crate L2 `crates/proto-pppoe`: codecs de PPPoE e PPP e as máquinas
 sans-IO do concentrador (servidor BNG) e do assinante (cliente, gerador de carga). Sem I/O, sem
 `unsafe`, compila para `wasm32-unknown-unknown`. O serviço do daemon, os comandos `ppp.*` e a
 janela PPP vêm na G4.3d; o plano de dados XDP por assinante é a G4.3c; o RADIUS é a G4.3b
@@ -411,13 +411,42 @@ desenho dos quatro; cada PR atualiza o que mudou.
 - Ponta a ponta por veth, debug: 10 mil CPEs em 6,5 s; reconexão em massa de 10 mil em 34 s com
   `new_session_rate=1000`.
 
-### 8.6 Riscos e como evitamos
+### 8.6 Extras (PR d)
+
+- **Selo de identidade e "Quem era?" com o login PPPoE.** `ip.identity.lookup` pergunta ao
+  serviço (`PppBackend::who`/`who_at`): o login de quem tem o endereço agora e, num instante
+  passado, quem tinha, pelo histórico do serviço. O CGNAT › Quem era? (porta pública → endereço
+  interno, G2.3) chega ao login. Clicar no selo abre PPP › Active Connections com a sessão.
+- **Gráfico por assinante.** O serviço mede `rx_bps`/`tx_bps` a cada segundo pelos contadores da
+  sessão (XDP ou caminho lento); a coluna Traffic desenha os últimos ~2 min. O histórico longo
+  por login, no armazenamento do G4.5, é a G4.3o.
+- **Aviso de inadimplência por address-list** (o que os provedores fazem com o MikroTik):
+  1. o sistema de cobrança manda um CoA com `Mikrotik-Address-List=inadimplentes`. O endereço
+     entra na lista na hora (entrada dinâmica), sem derrubar a sessão; o valor vazio tira o
+     assinante da lista. No login vale o mesmo atributo no Access-Accept, ou o `address_list` do
+     perfil;
+  2. uma regra de dstnat leva o HTTP de quem está na lista para a página de aviso:
+
+     ```sh
+     corerouter-cli run ip.firewall.nat.add '{"chain":"dstnat","src_address_list":"inadimplentes","protocol":"tcp","dst_port":"80","action":"dst-nat","to_addresses":"10.0.0.2","to_ports":"80","comment":"aviso de inadimplência"}'
+     ```
+
+     e uma regra de filtro deixa só DNS e a página para essa lista, se o provedor bloqueia.
+- **Comandos para o MCP:** tudo é comando com `params` documentado. Por exemplo, um agente
+  responde "por que o João não conecta?" com `ppp.why {name}` e derruba um assinante com
+  `ppp.active.remove {name}`.
+
+### 8.7 Riscos e como evitamos
 
 - **Travar o plano de controle:** nunca segurar o lock da sessão no laço de pacotes; hooks com
   limite (8 por perfil) e fora do laço; um panic numa thread do serviço é reiniciado pelo
   supervisor (G0.10) e as sessões caem — por isso nada de `unwrap`.
 - **Reconexão em massa** derrubando RADIUS e pool: `new_session_rate`, `pado_delay_by_load`,
   `padi_limit`.
+- **Address-list com muitos assinantes:** as entradas dinâmicas são no máximo 65 536 no
+  roteador inteiro (`MAX_DYNAMIC`) e duram até 35 dias (o serviço as refaz a cada 30). Um perfil
+  com `address_list` para 100 mil assinantes passa do teto: use a lista para os casos (os
+  inadimplentes), não para todos.
 - **Assinante preso no XDP depois da queda:** toda `Down` remove a entrada; o serviço, ao
   reiniciar, limpa o mapa inteiro antes de aceitar sessões (o PADT ao SID desconhecido faz o CPE
   reconectar).

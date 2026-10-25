@@ -19,6 +19,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp.active.rate_limit", "The rate limit in force (RADIUS or profile); a CoA changes it live."),
     ("ppp.active.rx", "Bytes from the subscriber (upload)."),
     ("ppp.active.service", "The PPP service (pppoe)."),
+    ("ppp.active.traffic", "Rx (blue) and Tx (red) of the session since the window opened, from the rates the service measures each second."),
     ("ppp.active.tx", "Bytes to the subscriber (download)."),
     ("ppp.active.uptime", "How long the session has been up."),
     ("ppp.active.vlan", "The VLAN the session came on (pppoe-over-vlan-range)."),

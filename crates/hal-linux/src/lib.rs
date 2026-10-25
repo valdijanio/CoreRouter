@@ -884,6 +884,22 @@ mod linux {
             }
         }
 
+        fn address_list_dynamic_many(
+            &mut self,
+            changes: &[DynamicChange<'_>],
+        ) -> Result<(), HalError> {
+            let mut ops = Vec::with_capacity(changes.len());
+            for c in changes {
+                self.xdp.dynamic(*c);
+                match c {
+                    DynamicChange::Add(d) => ops.push((true, *d)),
+                    DynamicChange::Remove(d) => ops.push((false, *d)),
+                    DynamicChange::Expired(_) => {}
+                }
+            }
+            crate::nft::apply_dynamic(&ops)
+        }
+
         fn dhcp_port(
             &mut self,
             name: &IfName,

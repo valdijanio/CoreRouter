@@ -52,6 +52,9 @@ pub(crate) const HISTORY: usize = 50_000;
 pub(crate) const WHY_KEYS: usize = 100_000;
 /// Slots of the XDP session map (`dataplane-ebpf-common::pppoe::SESSIONS_MAX`).
 pub(crate) const XDP_SLOTS: u32 = 1 << 17;
+/// A subscriber's address-list entry is made again this often (dynamic
+/// entries last at most 35 days; the driver adds them for 35).
+const LIST_REFRESH_MS: u64 = 30 * 86_400_000;
 /// RADIUS answers older than this are dropped (the server gave up first).
 const RADIUS_GRACE_MS: u64 = 35_000;
 
@@ -117,6 +120,9 @@ pub(crate) struct Shared {
     pub terminate: Vec<String>,
     /// CoA rate changes: session id, RouterOS rate-limit text.
     pub rates: Vec<(String, String)>,
+    /// CoA address-list changes (`Mikrotik-Address-List`, the arrears
+    /// notice): session id, list (empty: none).
+    pub lists: Vec<(String, String)>,
     /// Acct-Session-Id → session id.
     by_acct: HashMap<String, String>,
 }
@@ -242,6 +248,9 @@ impl PppBackend for Backend {
 
     fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {
         let sh = guard(&self.0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         // A session that ended after `at` and began before it.
         sh.history
             .iter()
@@ -256,7 +265,7 @@ impl PppBackend for Backend {
             .or_else(|| {
                 sh.active
                     .values()
-                    .find(|a| a.address == Some(ip))
+                    .find(|a| a.address == Some(ip) && now.saturating_sub(a.uptime_secs) <= at)
                     .map(|a| a.name.clone())
             })
     }
@@ -312,17 +321,34 @@ impl SessionOwner for Owner {
                     .iter()
                     .find(|a| a.name == "Mikrotik-Rate-Limit")
                     .map(|a| a.value.clone());
+                let list = req
+                    .changes
+                    .iter()
+                    .find(|a| a.name == "Mikrotik-Address-List")
+                    .map(|a| a.value.clone());
                 let new_ip = req.changes.iter().any(|a| a.name == "Framed-IP-Address");
                 if new_ip {
                     // PPP cannot move an open IPCP to a new address: the
                     // subscriber reconnects and gets it.
                     sh.terminate.extend(hits);
-                } else if let Some(r) = rate {
-                    if r.parse::<RateLimit>().is_err() {
+                } else if rate.is_some() || list.is_some() {
+                    let bad_list = list.as_deref().is_some_and(|l| {
+                        !l.is_empty() && l.parse::<corerouter_model::firewall::Name>().is_err()
+                    });
+                    if rate
+                        .as_deref()
+                        .is_some_and(|r| r.parse::<RateLimit>().is_err())
+                        || bad_list
+                    {
                         return CoaOutcome::Nak(407); // Invalid Attribute Value
                     }
                     for h in hits {
-                        sh.rates.push((h, r.clone()));
+                        if let Some(r) = &rate {
+                            sh.rates.push((h.clone(), r.clone()));
+                        }
+                        if let Some(l) = &list {
+                            sh.lists.push((h, l.clone()));
+                        }
                     }
                 } else if !req.authorize_only {
                     return CoaOutcome::Nak(401); // Unsupported Attribute
@@ -483,6 +509,11 @@ struct Sub {
     /// Why it was ended here, when the reason is ours (idle, limit).
     cause: Option<(u32, &'static str)>,
     last_bytes: (u64, u64),
+    /// Bytes and time of the last tick, for the rates.
+    prev: (u64, u64, Millis),
+    /// When its address-list entry was (re)made: dynamic entries last at
+    /// most 35 days, so a longer session gets it made again.
+    list_at: Millis,
     idle_since: Millis,
     descriptor_vlan: Option<u16>,
     circuit_id: Option<String>,
@@ -1079,12 +1110,17 @@ impl Bng {
             }
             Event::Down {
                 session,
+                key,
                 reason,
                 was_up,
                 ..
             } => {
                 if let Some(sub) = self.subs.remove(&(i, session.sid)) {
                     self.ended(now, sub, reason, was_up);
+                } else {
+                    // Before authentication (LCP failed, setup timeout): no
+                    // login yet, the MAC tells who.
+                    self.failed_early(now, i, key.client_mac, reason);
                 }
             }
         }
@@ -1144,6 +1180,8 @@ impl Bng {
                 reply_message: None,
                 cause: None,
                 last_bytes: (0, 0),
+                prev: (0, 0, now),
+                list_at: now,
                 idle_since: now,
                 descriptor_vlan: vlan,
                 circuit_id: req
@@ -1461,6 +1499,7 @@ impl Bng {
             return;
         };
         sub.up_at = Some(now);
+        sub.list_at = now;
         sub.stage = Stage::Up;
         sub.idle_since = now;
         sub.acct_id = acct_id.clone();
@@ -1750,6 +1789,46 @@ impl Bng {
         }
     }
 
+    /// A session that ended before authentication: the history line and
+    /// the "Why?" of its MAC.
+    fn failed_early(&mut self, now: Millis, i: usize, mac: Mac, reason: DownReason) {
+        let (mut key, mut hint, stage, _) = explain(reason);
+        let mut stage = if stage == Stage::Up {
+            Stage::Lcp
+        } else {
+            stage
+        };
+        if reason == DownReason::AuthFailed {
+            // No credentials ever came: the CPE refused every method the
+            // server offered in LCP (RFC 1661 §6.2, Authentication-Protocol).
+            key = "auth-protocol";
+            hint = "O CPE recusou todos os métodos de autenticação do servidor no LCP: habilite no servidor (authentication) um que o CPE aceite, como chap ou pap.";
+            stage = Stage::Lcp;
+        }
+        let mac = mac_text(mac);
+        let server = self
+            .slots
+            .get(i)
+            .map(|s| s.cfg.name.clone())
+            .unwrap_or_default();
+        let h = HistoryEntry {
+            at: self.cfg.unix_base + now / 1000,
+            name: String::new(),
+            caller_id: mac.clone(),
+            server,
+            event: "failed".into(),
+            stage: Some(stage),
+            reason: key.into(),
+            hint: hint.into(),
+            ..HistoryEntry::default()
+        };
+        guard(&self.shared).record(&[&mac], h);
+        self.log(
+            false,
+            format!("PPP: sessão de {mac} caiu antes do login ({key}): {hint}"),
+        );
+    }
+
     /// The servers' timers.
     pub(crate) fn timers(&mut self, now: Millis) {
         for i in 0..self.slots.len() {
@@ -1792,6 +1871,31 @@ impl Bng {
                     a.tx_packets = c.down_packets;
                 }
                 a.uptime_secs = now.saturating_sub(up) / 1000;
+                let dt = now.saturating_sub(sub.prev.2);
+                if dt > 0 {
+                    let bps =
+                        |now: u64, was: u64| now.saturating_sub(was).saturating_mul(8_000) / dt;
+                    a.rx_bps = bps(a.rx_bytes, sub.prev.0);
+                    a.tx_bps = bps(a.tx_bytes, sub.prev.1);
+                }
+                sub.prev = (a.rx_bytes, a.tx_bytes, now);
+                if let (Some(l), Some(ip)) = (&sub.effective.address_list, sub.ip)
+                    && now.saturating_sub(sub.list_at) >= LIST_REFRESH_MS
+                {
+                    sub.list_at = now;
+                    self.effects.push(Effect::AddressList {
+                        list: l.clone(),
+                        ip,
+                        add: false,
+                        comment: String::new(),
+                    });
+                    self.effects.push(Effect::AddressList {
+                        list: l.clone(),
+                        ip,
+                        add: true,
+                        comment: format!("ppp {}", sub.user),
+                    });
+                }
                 let bytes = (a.rx_bytes, a.tx_bytes);
                 if bytes != sub.last_bytes {
                     sub.last_bytes = bytes;
@@ -1823,13 +1927,43 @@ impl Bng {
 
     /// `ppp.active.remove`, Disconnect and CoA rate changes.
     pub(crate) fn requests(&mut self, now: Millis) {
-        let (ids, rates) = {
+        let (ids, rates, lists) = {
             let mut sh = guard(&self.shared);
             (
                 std::mem::take(&mut sh.terminate),
                 std::mem::take(&mut sh.rates),
+                std::mem::take(&mut sh.lists),
             )
         };
+        for (id, list) in lists {
+            let Some((i, sref)) = self.find(&id) else {
+                continue;
+            };
+            let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+                continue;
+            };
+            let Some(ip) = sub.ip else { continue };
+            let user = sub.user.clone();
+            let new = (!list.is_empty()).then(|| list.clone());
+            let old = std::mem::replace(&mut sub.effective.address_list, new);
+            if let Some(o) = old {
+                self.effects.push(Effect::AddressList {
+                    list: o,
+                    ip,
+                    add: false,
+                    comment: String::new(),
+                });
+            }
+            if !list.is_empty() {
+                self.effects.push(Effect::AddressList {
+                    list: list.clone(),
+                    ip,
+                    add: true,
+                    comment: format!("ppp {user}"),
+                });
+            }
+            self.log(false, format!("PPP: {user} na address-list '{list}' (CoA)"));
+        }
         for id in ids {
             if let Some((i, sref)) = self.find(&id) {
                 self.replies.push_back((i, sref, Reply::Terminate));

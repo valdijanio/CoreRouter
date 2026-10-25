@@ -323,6 +323,16 @@ fn coa_changes_the_rate_live_and_disconnect_ends() {
     let u0 = lab.backend().active().into_iter().find(|a| a.name == "u0").unwrap();
     assert_eq!(u0.rate_limit.as_deref(), Some("20M/100M"));
     assert_eq!(lab.ups(), 3, "a CoA does not reconnect");
+    // The arrears notice: the billing moves u2 into a list, live.
+    lab.bng.effects.clear();
+    assert_eq!(owner.handle(&coa(CoaKind::Coa, "u2", vec![Attribute::new("Mikrotik-Address-List", "inadimplentes")])), CoaOutcome::Ack);
+    assert_eq!(owner.handle(&coa(CoaKind::Coa, "u2", vec![Attribute::new("Mikrotik-Address-List", "not a list")])), CoaOutcome::Nak(407));
+    lab.bng.requests(lab.now);
+    assert!(
+        lab.bng.effects.iter().any(|e| matches!(e, Effect::AddressList { list, add: true, .. } if list == "inadimplentes")),
+        "{:?}",
+        lab.bng.effects
+    );
     assert_eq!(owner.handle(&coa(CoaKind::Disconnect, "u1", vec![])), CoaOutcome::Ack);
     lab.bng.requests(lab.now);
     lab.run(100, 50);
@@ -420,9 +430,11 @@ fn slow_path_carries_ipv4_both_ways() {
     assert_eq!(&frame[..6], &[0x02, 0x10, 0, 0, 0, 1]);
     assert_eq!(&frame[12..14], &[0x88, 0x64]);
     assert_eq!(&frame[22..], &back[..]);
+    lab.now += 1000;
     lab.bng.tick(lab.now, &[]);
     let a = lab.backend().active().pop().unwrap();
     assert_eq!((a.rx_packets, a.tx_packets), (1, 1));
+    assert!(a.rx_bps > 0 && a.tx_bps > 0, "the rates of the last second: {a:?}");
     assert_eq!(lab.backend().who(ip).as_deref(), Some("u0"));
 }
 
@@ -496,4 +508,25 @@ fn radius_users_get_framed_ip_rate_and_accounting() {
     assert_eq!(accts[1].terminate_cause, Some(6), "Admin-Reset (RFC 2866 §5.10)");
     assert_eq!(accts[0].session_id, accts[1].session_id);
     let _ = ClientPhase::Idle;
+}
+
+#[test]
+fn a_session_that_fails_before_login_is_explained_by_its_mac() {
+    // The server offers only MS-CHAPv2; the CPE speaks only PAP: LCP never
+    // agrees (RFC 1661 §4.6 Max-Failure), no login is ever seen.
+    let mut lab = Lab::new(1, snap(1, server(serde_json::json!({"authentication": ["mschap2"]})), 10), |_| ("u0".into(), "p0".into()));
+    lab.clients[0] = {
+        let mut cfg = lab.clients[0].config().clone();
+        cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
+        Client::new(cfg, [8; 32])
+    };
+    lab.start(0..1);
+    lab.run(1500, 50);
+    assert_eq!(lab.ups(), 0);
+    let w = lab.backend().why(None, Some(corerouter_model::MacAddr([0x02, 0x10, 0, 0, 0, 1])));
+    let last = w.last.expect("the MAC has a last failure");
+    assert_eq!(last.event, "failed");
+    assert_eq!(last.stage, Some(Stage::Lcp), "{last:?}");
+    assert_eq!(last.reason, "auth-protocol");
+    assert!(last.hint.contains("métodos de autenticação"), "{last:?}");
 }

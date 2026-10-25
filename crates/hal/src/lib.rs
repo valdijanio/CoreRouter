@@ -206,6 +206,16 @@ pub trait Hal: Send {
         Ok(())
     }
 
+    /// Many [`Hal::address_list_dynamic`] changes in one go (the PPP
+    /// service adds one per subscriber that logs in: one `nft` run per
+    /// round, not per entry). Applied in order; the first error stops.
+    fn address_list_dynamic_many(&mut self, changes: &[DynamicChange<'_>]) -> Result<(), HalError> {
+        for c in changes {
+            self.address_list_dynamic(*c)?;
+        }
+        Ok(())
+    }
+
     /// ICMP prober for the diagnostic tools (ping, MTU, MTR), or why there
     /// is none. Cheap: backends build it once and hand out clones.
     fn prober(&self) -> Result<SharedProber, String> {
