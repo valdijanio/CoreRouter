@@ -98,8 +98,12 @@ pub struct ServerConfig {
     /// Our IPCP address (RouterOS profile `local-address`); `None` =
     /// unnumbered.
     pub local_ipv4: Option<Ipv4Addr>,
-    /// Run IPv6CP (interface ids only; prefixes are G4.3e).
+    /// Run IPv6CP (interface ids; the prefixes come from the service, G4.3e).
     pub ipv6: bool,
+    /// RFC 8064 / RFC 7217 secret: our IPv6CP identifier and the one we
+    /// suggest to a subscriber are stable per (port, VLANs, MAC) and opaque
+    /// (`nd::stable_iid`). `None` = random per session.
+    pub ipv6_iid_key: Option<[u8; 32]>,
     /// How long an authentication or address answer may take (RADIUS
     /// timeouts × retries fit under it).
     pub answer_timeout_ms: u64,
@@ -133,6 +137,7 @@ impl Default for ServerConfig {
             vlans: VlanFilter::Any,
             local_ipv4: None,
             ipv6: false,
+            ipv6_iid_key: None,
             answer_timeout_ms: 30_000,
             setup_timeout_ms: 60_000,
             pado_queue: 4096,

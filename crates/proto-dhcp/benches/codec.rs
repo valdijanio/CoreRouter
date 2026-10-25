@@ -2,6 +2,9 @@
 //! (with options 1, 3, 6, 15, 42, 51, 54 and 121), and the raw option walk
 //! behind `ip.dhcp-client.options`.
 //!
+//! G4.3e: the DHCPv6 server of one PPP session (`sub6`) answering a
+//! Solicit with Rapid Commit (IA_NA + IA_PD + DNS).
+//!
 //! `cargo xtask bench` runs it; alone: `cargo bench -p corerouter-proto-dhcp --bench codec`.
 
 // A benchmark is test code: fixtures may unwrap (clippy.toml only covers #[test]).
@@ -74,5 +77,44 @@ fn codec(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, codec);
+fn sub6(c: &mut Criterion) {
+    use corerouter_proto_dhcp::sub6::{Grant6, Sub6, duid_ll};
+    use corerouter_proto_dhcp::v6::{self, IaReq, msg, opt};
+    let mut g = c.benchmark_group("dhcp6_session");
+    g.throughput(Throughput::Elements(1));
+    let solicit = v6::Outgoing {
+        kind: msg::SOLICIT,
+        xid: 7,
+        client_id: &[0, 3, 0, 1, 2, 0, 0, 0, 0, 9],
+        server_id: None,
+        elapsed_cs: 0,
+        rapid_commit: true,
+        ia_na: Some(IaReq {
+            iaid: 1,
+            ..IaReq::default()
+        }),
+        ia_pd: Some(IaReq {
+            iaid: 2,
+            ..IaReq::default()
+        }),
+        oro: &[opt::DNS_SERVERS],
+    }
+    .encode();
+    let mut s = Sub6::new(Grant6 {
+        server_duid: duid_ll(MAC),
+        address: Some("2001:db8:0:5::1234".parse().unwrap()),
+        link: Some("2001:db8:0:5::/64".parse().unwrap()),
+        prefix: Some("2001:db8:100:500::/56".parse().unwrap()),
+        dns: vec!["2001:db8::53".parse().unwrap()],
+        domains: Vec::new(),
+        lease_time: 86_400,
+        rapid_commit: true,
+    });
+    g.bench_function("solicit_rapid_commit", |b| {
+        b.iter(|| s.handle(black_box(&solicit)).reply.map(|r| r.len()))
+    });
+    g.finish();
+}
+
+criterion_group!(benches, codec, sub6);
 criterion_main!(benches);

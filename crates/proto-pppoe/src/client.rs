@@ -34,6 +34,9 @@ pub struct ClientConfig {
     pub max_payload: Option<u16>,
     pub want_dns: bool,
     pub ipv6: bool,
+    /// Our IPv6CP identifier; `Some([0; 8])` asks the BNG for one (RFC 5072
+    /// §4.1), `None` = random.
+    pub ipv6_iid: Option<[u8; 8]>,
     /// First PADI/PADR retransmission (doubles up to 8×).
     pub discovery_timeout_ms: u64,
     pub discovery_attempts: u8,
@@ -62,6 +65,7 @@ impl Default for ClientConfig {
             max_payload: None,
             want_dns: true,
             ipv6: false,
+            ipv6_iid: None,
             discovery_timeout_ms: 1000,
             discovery_attempts: 5,
             fsm: FsmConfig::default(),
@@ -208,6 +212,9 @@ impl Client {
         let mut iid = rng.array::<8>();
         if iid == [0; 8] {
             iid[7] = 2;
+        }
+        if let Some(i) = cfg.ipv6_iid {
+            iid = i;
         }
         let v6seed = rng.nonzero_u32();
         Client {

@@ -15,6 +15,7 @@ use crate::guard::Rng;
 use crate::layers::{Ipcp, Ipv6cp, Lcp, Role};
 use crate::lcp::{self, AuthProto, code as lc};
 use crate::ncp::NCP_MAX_CODE;
+use crate::nd::{IidRole, stable_iid};
 use crate::output::Output;
 use crate::ppp::{self, Link, SessionWriter, proto};
 use crate::timer::Millis;
@@ -153,6 +154,19 @@ impl Session {
         if iid == [0; 8] {
             iid[7] = 1;
         }
+        let mut suggest = None;
+        if let Some(key) = &cfg.ipv6_iid_key {
+            iid = stable_iid(key, i.ifindex, i.vlans, i.client_mac, IidRole::Local);
+            suggest = Some(stable_iid(
+                key,
+                i.ifindex,
+                i.vlans,
+                i.client_mac,
+                IidRole::Peer,
+            ));
+        }
+        let mut v6_l = Ipv6cp::new(iid, rng.nonzero_u32());
+        v6_l.suggest = suggest;
         let link = Link {
             dst: i.client_mac,
             src: cfg.ac_mac,
@@ -173,7 +187,7 @@ impl Session {
             ipcp: Fsm::new(1),
             ipcp_l: Ipcp::server(cfg.local_ipv4),
             v6: Fsm::new(1),
-            v6_l: Ipv6cp::new(iid, rng.nonzero_u32()),
+            v6_l,
             auth: AuthState::default(),
             heard: false,
             echo_at: 0,

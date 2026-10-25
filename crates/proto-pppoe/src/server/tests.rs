@@ -51,6 +51,38 @@ fn ipv6cp_comes_up_with_ipcp() {
 }
 
 #[test]
+fn rfc8064_ipv6cp_identifiers_are_stable_across_reconnects() {
+    // Two runs with other random seeds: the same lines get the same
+    // identifiers on both ends (the client asks with zero and takes the
+    // BNG's suggestion, RFC 5072 §4.1).
+    let run = |seed: u64| {
+        let mut l = lab(3, |c| {
+            c.ipv6 = true;
+            c.ipv6_zero_iid = true;
+            c.seed = seed;
+            c.server.ipv6_iid_key = Some([5; 32]);
+        });
+        l.run_until(10_000);
+        assert_eq!(l.clients_up(), 3);
+        let mut ids: Vec<_> =
+            l.up.keys()
+                .map(|k| {
+                    let d = l.servers[k.0].session(k.1).unwrap();
+                    (d.client_mac, d.ipv6_iid.unwrap(), d.local_iid.unwrap())
+                })
+                .collect();
+        ids.sort();
+        ids
+    };
+    let a = run(1);
+    assert_eq!(a, run(99));
+    for (_, peer, local) in &a {
+        assert_ne!(peer, local);
+        assert!(!crate::nd::is_reserved_iid(*peer));
+    }
+}
+
+#[test]
 fn wrong_password_is_refused_and_cleaned_up() {
     let mut l = lab(4, |c| {
         c.bad_password_every = 2;
