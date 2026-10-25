@@ -76,6 +76,9 @@ pub const MAX_PARKED: usize = 4096;
 pub const FULL_LOG_SECS: u64 = 60;
 /// Clients the rate limiter remembers (random-MAC floods are bounded).
 pub const MAX_CLIENTS_TRACKED: usize = 65_536;
+/// A full rate-limit table is swept for clients that are full again at
+/// most this often.
+pub const SWEEP_MS: u64 = 250;
 /// An address whose probe came back clean is offered again without a
 /// probe within this time (a client retrying its DISCOVER).
 const PROBED_OK_MS: u64 = 60_000;
@@ -234,6 +237,8 @@ pub struct Server {
     /// Conflicts being checked again (`check-status`): address → deadline.
     checking: HashMap<Ipv4Addr, (IfName, u64)>,
     limiter: HashMap<[u8; 6], Bucket>,
+    /// When the full limiter was last swept.
+    limiter_swept_ms: u64,
     stats: Stats,
     seen: BTreeMap<(IfName, [u8; 6]), Seen>,
     /// Next offset to try per pool.
@@ -295,6 +300,7 @@ impl Server {
             probed_ok: HashMap::new(),
             checking: HashMap::new(),
             limiter: HashMap::new(),
+            limiter_swept_ms: 0,
             stats: Stats::new(now_unix),
             seen: BTreeMap::new(),
             cursor: HashMap::new(),
@@ -495,14 +501,26 @@ impl Server {
         }
         let cap = rate.saturating_mul(2).max(4).saturating_mul(1000);
         if self.limiter.len() >= MAX_CLIENTS_TRACKED && !self.limiter.contains_key(&mac) {
-            // Make room: forget the clients that are full again.
-            self.limiter.retain(|_, b| {
-                b.tokens
-                    .saturating_add(now_ms.saturating_sub(b.at_ms).saturating_mul(rate))
-                    < cap
-            });
+            // Make room: forget the clients that are full again. At most
+            // every SWEEP_MS: a sweep per new client was O(table) per
+            // message once full (G4.3f, measured: 100 000 clients after a
+            // power cut ran 8× slower per lease than 10 000).
+            if now_ms >= self.limiter_swept_ms.saturating_add(SWEEP_MS) {
+                self.limiter_swept_ms = now_ms;
+                self.limiter.retain(|_, b| {
+                    b.tokens
+                        .saturating_add(now_ms.saturating_sub(b.at_ms).saturating_mul(rate))
+                        < cap
+                });
+            }
             if self.limiter.len() >= MAX_CLIENTS_TRACKED {
-                return false;
+                // Full of clients still counting: this one is served without
+                // a bucket. The table stays bounded; refusing here turned a
+                // storm of 100 000 legitimate clients into 34 000 refusals,
+                // and a per-MAC limit does not slow a flood of random MACs
+                // anyway (each is new).
+                self.stats.untracked = self.stats.untracked.saturating_add(1);
+                return true;
             }
         }
         let b = self.limiter.entry(mac).or_insert(Bucket {

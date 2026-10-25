@@ -1641,3 +1641,27 @@ fn a_revoke_ends_the_lease_and_the_grant() {
     let mut plain = Lab::new(&cfg());
     assert!(asks(&plain.discover(mac(1))).is_empty());
 }
+
+/// A storm bigger than the rate limiter's table (a BNG with 70 000
+/// subscribers after a power cut): every client is served, the table
+/// stays bounded and is not swept once per new client (G4.3f).
+#[test]
+fn a_storm_past_the_limiter_table_is_still_served() {
+    let mut c = cfg();
+    c.ip.addresses[0].address = "10.0.0.1/14".parse().unwrap();
+    c.ip.pools.pools[0].ranges = vec!["10.0.1.0-10.3.255.254".parse().unwrap()];
+    c.ip.dhcp_server.networks.clear();
+    c.ip.dhcp_server.servers[0].conflict_detection = false;
+    c.ip.dhcp_server.servers[0].client_rate_limit = 10;
+    let mut lab = Lab::new(&c);
+    let n = MAX_CLIENTS_TRACKED + 4_000;
+    let mut offers = 0;
+    for i in 0..n {
+        let b = u32::try_from(i).unwrap().to_be_bytes();
+        let fx = lab.discover([6, 0, b[0], b[1], b[2], b[3]]);
+        offers += usize::from(sent(&fx, Kind::Offer).is_some());
+    }
+    assert_eq!(offers, n);
+    assert_eq!(lab.srv.stats().dropped_of(Drop::RateLimited), 0);
+    assert!(lab.srv.stats().untracked >= 4_000);
+}

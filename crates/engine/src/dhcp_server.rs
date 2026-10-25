@@ -213,6 +213,7 @@ impl Session {
         let mut heard = self.dhcp_relay_poll(now, &mut relayed);
         // G4.2c: the DHCPv6 server and relays, on the same round.
         heard |= self.dhcp6_server_poll(now);
+        self.ipoe_refresh();
         let ipoe = self.ipoe_backend();
         let Some(rt) = self.ext_mut::<DhcpServerRuntime>() else {
             return heard;
@@ -521,8 +522,9 @@ impl Session {
                     self.dhcp_history_bound(&b.lease, b.new, now);
                     if self.ipoe_server(&b.lease.server)
                         && let Some(ipoe) = self.ipoe_backend()
+                        && let Some(view) = self.ipoe_view()
                     {
-                        ipoe.bound(&b, self.store().running());
+                        ipoe.bound(&b, &view);
                     }
                 }
                 Effect::Gone(l) => {

@@ -17,14 +17,14 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
-use corerouter_engine::ipoe::{IpoeBackend, Local, Revoke, local_verdict, user_of};
+use corerouter_engine::ipoe::{IpoeBackend, IpoeView, Local, Revoke, local_verdict, user_of};
 use corerouter_engine::ppp::PppBackend;
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeSession, Rate};
 use corerouter_model::dhcp_server::DhcpServer;
 use corerouter_model::ipoe::UseRadius;
 use corerouter_model::ppp::{
-    ActiveSession, DEFAULT_PROFILE, HistoryEntry, PppService, ServiceStats, Stage, Why,
+    ActiveSession, DEFAULT_PROFILE, HistoryEntry, ServiceStats, Stage, Why,
 };
 use corerouter_model::radius::{
     AaaService, AcctCounters, AcctRequest, AcctStatus, Attribute, AuthOutcome, AuthReply,
@@ -153,6 +153,8 @@ struct State {
     /// by the thread.
     servers: HashMap<String, DhcpServer>,
     interim_default: u32,
+    /// `/ppp profile` rate limits by name (Mikrotik-Group), per refresh.
+    profile_rates: HashMap<String, String>,
     aaa: Option<Arc<dyn AaaBackend>>,
     asked: HashMap<Key, Asked>,
     inbox: Vec<(String, Vec<u8>, Verdict)>,
@@ -248,12 +250,10 @@ fn mac_text(m: [u8; 6]) -> String {
     MacAddr(m).to_string()
 }
 
-/// The `/ppp secret` (service `ipoe`) of `user`.
-fn secret<'a>(cfg: &'a Config, user: &str) -> Option<&'a corerouter_model::ppp::PppSecret> {
-    cfg.ppp
-        .secrets
-        .iter()
-        .find(|s| s.service == PppService::Ipoe && s.name == user && !s.disabled)
+/// The enabled `/ppp secret` (service `ipoe`) of `user` (O(1): the
+/// engine's index).
+fn secret<'a>(view: &IpoeView<'a>, user: &str) -> Option<&'a corerouter_model::ppp::PppSecret> {
+    view.secret(user).filter(|s| !s.disabled)
 }
 
 /// RouterOS rate-limit text → the XDP policer's two directions (rx = from
@@ -279,7 +279,11 @@ pub(crate) fn rates(text: Option<&str>) -> (Rate, Rate) {
 /// Framed-Pool, Session-Timeout as the lease time, Mikrotik-Rate-Limit or
 /// Ascend-Data-Rate/Ascend-Xmit-Rate, Mikrotik-Address-List,
 /// Mikrotik-Group, Acct-Interim-Interval, Class).
-fn accept(reply: &AuthReply, user: &str, cfg_profile: impl Fn(&str) -> Option<String>) -> (Grant, Authz) {
+fn accept(
+    reply: &AuthReply,
+    user: &str,
+    cfg_profile: impl Fn(&str) -> Option<String>,
+) -> (Grant, Authz) {
     let attr = |name: &str| {
         reply
             .attributes
@@ -304,7 +308,9 @@ fn accept(reply: &AuthReply, user: &str, cfg_profile: impl Fn(&str) -> Option<St
         lease_time: attr("Session-Timeout").and_then(|v| v.parse().ok()),
         address_lists: Vec::new(),
     };
-    if let Some(l) = attr("Mikrotik-Address-List").filter(|l| l.parse::<corerouter_model::firewall::Name>().is_ok()) {
+    if let Some(l) = attr("Mikrotik-Address-List")
+        .filter(|l| l.parse::<corerouter_model::firewall::Name>().is_ok())
+    {
         g.address_lists.push(l);
     }
     let a = Authz {
@@ -348,7 +354,9 @@ fn explain(state: &str) -> (&'static str, &'static str, u32) {
 impl Core {
     pub(crate) fn new() -> Arc<Self> {
         let t0 = Instant::now();
-        Self::with_clock(Box::new(move || u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)))
+        Self::with_clock(Box::new(move || {
+            u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX)
+        }))
     }
 
     /// With another clock (the tests' simulated one).
@@ -379,6 +387,12 @@ impl Core {
             .map(|s| (s.name.clone(), s.clone()))
             .collect();
         st.interim_default = cfg.ppp.aaa.interim_update;
+        st.profile_rates = cfg
+            .ppp
+            .profiles
+            .iter()
+            .filter_map(|p| p.rate_limit.clone().map(|r| (p.name.clone(), r)))
+            .collect();
         st.aaa = aaa;
     }
 
@@ -410,7 +424,14 @@ impl Core {
             };
             if let Some(slot) = slot {
                 let (up, down) = rates(s.rate.as_deref());
-                st.ops.push(XdpOp::Upsert { slot, interface: s.interface.clone(), client_mac: s.mac, ip: s.ip, up, down });
+                st.ops.push(XdpOp::Upsert {
+                    slot,
+                    interface: s.interface.clone(),
+                    client_mac: s.mac,
+                    ip: s.ip,
+                    up,
+                    down,
+                });
                 if let Some(x) = st.subs.get_mut(&s.key) {
                     x.slot = Some(slot);
                 }
@@ -424,7 +445,11 @@ impl Core {
 
     /// The XDP slots in use, for the counters.
     pub(crate) fn slots(&self) -> Vec<u32> {
-        guard(&self.st).subs.values().filter_map(|s| s.slot).collect()
+        guard(&self.st)
+            .subs
+            .values()
+            .filter_map(|s| s.slot)
+            .collect()
     }
 
     /// The XDP counters of the last second (`secs` since the last call).
@@ -436,7 +461,9 @@ impl Core {
             .filter_map(|s| s.slot.map(|x| (x, s.id.clone())))
             .collect();
         for (slot, n) in c {
-            let Some(id) = by_slot.get(slot) else { continue };
+            let Some(id) = by_slot.get(slot) else {
+                continue;
+            };
             if let Some(a) = st.active.get_mut(id) {
                 let d = secs.max(1);
                 a.rx_bps = n.up_bytes.saturating_sub(a.rx_bytes).saturating_mul(8) / d;
@@ -457,7 +484,11 @@ impl Core {
         let mut st = guard(&self.st);
         let mut dead = Vec::new();
         let mut pings = Vec::new();
-        let rx: HashMap<String, u64> = st.active.iter().map(|(id, a)| (id.clone(), a.rx_bytes)).collect();
+        let rx: HashMap<String, u64> = st
+            .active
+            .iter()
+            .map(|(id, a)| (id.clone(), a.rx_bytes))
+            .collect();
         for s in st.subs.values_mut() {
             let Some(k) = s.keepalive else { continue };
             let seen = rx.get(&s.id).copied().unwrap_or(0);
@@ -486,14 +517,22 @@ impl Core {
             }
             st.revoked.insert(
                 k.clone(),
-                ("keepalive", "o CPE não respondeu a 3 pings ARP: está desligado, sem link ou travado", cause::LOST_CARRIER),
+                (
+                    "keepalive",
+                    "o CPE não respondeu a 3 pings ARP: está desligado, sem link ou travado",
+                    cause::LOST_CARRIER,
+                ),
             );
-            st.revokes.push(Revoke { server: k.0.clone(), client_key: k.1.clone(), why: "keepalive: no ARP reply".into() });
+            st.revokes.push(Revoke {
+                server: k.0.clone(),
+                client_key: k.1.clone(),
+                why: "keepalive: no ARP reply".into(),
+            });
         }
     }
 
     /// The answer of a RADIUS ask (the AAA driver's thread).
-    fn answered(&self, key: Key, reply: AuthReply, cfg_rate: HashMap<String, String>) {
+    fn answered(&self, key: Key, reply: AuthReply) {
         let now = self.ms();
         let mut st = guard(&self.st);
         let Some(asked) = st.asked.remove(&key) else {
@@ -504,7 +543,7 @@ impl Core {
         }
         let verdict = match reply.outcome {
             AuthOutcome::Accept => {
-                let (g, a) = accept(&reply, &asked.user, |p| cfg_rate.get(p).cloned());
+                let (g, a) = accept(&reply, &asked.user, |p| st.profile_rates.get(p).cloned());
                 st.stats.auth_accept += 1;
                 st.authz.insert(key.clone(), a);
                 Verdict::Accept(g)
@@ -524,10 +563,19 @@ impl Core {
                     _ => "RADIUS did not answer".into(),
                 });
                 let mac = asked.mac.clone();
-                let (reason, hint) = if matches!(other, AuthOutcome::Reject | AuthOutcome::Challenge) {
-                    ("rejected", "o RADIUS recusou este cliente: confira o cadastro do MAC ou do circuito (User-Name)")
+                let (reason, hint) = if matches!(
+                    other,
+                    AuthOutcome::Reject | AuthOutcome::Challenge
+                ) {
+                    (
+                        "rejected",
+                        "o RADIUS recusou este cliente: confira o cadastro do MAC ou do circuito (User-Name)",
+                    )
                 } else {
-                    ("radius-timeout", "o RADIUS não respondeu: veja /radius monitor (servidor, segredo, firewall)")
+                    (
+                        "radius-timeout",
+                        "o RADIUS não respondeu: veja /radius monitor (servidor, segredo, firewall)",
+                    )
                 };
                 let h = HistoryEntry {
                     at: unix_now(),
@@ -549,7 +597,7 @@ impl Core {
     }
 
     /// A lease of a session server was bound or renewed.
-    fn bound(self: &Arc<Self>, b: &Binding, cfg: &Config) -> Option<AcctOut> {
+    fn bound(self: &Arc<Self>, b: &Binding, view: &IpoeView<'_>) -> Option<AcctOut> {
         let l = &b.lease;
         let key: Key = (l.server.clone(), l.client_key());
         let now = self.ms();
@@ -566,29 +614,55 @@ impl Core {
         // A new address for a client that had one: the old session ends.
         let mut out = None;
         if st.subs.contains_key(&key) {
-            out = self.end_locked(&mut st, &key, ("replaced", "o CPE recebeu outro endereço no mesmo servidor", cause::LOST_SERVICE));
+            out = self.end_locked(
+                &mut st,
+                &key,
+                (
+                    "replaced",
+                    "o CPE recebeu outro endereço no mesmo servidor",
+                    cause::LOST_SERVICE,
+                ),
+            );
         }
-        let circuit = l.relay_info.as_deref().and_then(|r| agent::get(r, agent::CIRCUIT_ID)).map(agent::text);
-        let remote = l.relay_info.as_deref().and_then(|r| agent::get(r, agent::REMOTE_ID)).map(agent::text);
+        let circuit = l
+            .relay_info
+            .as_deref()
+            .and_then(|r| agent::get(r, agent::CIRCUIT_ID))
+            .map(agent::text);
+        let remote = l
+            .relay_info
+            .as_deref()
+            .and_then(|r| agent::get(r, agent::REMOTE_ID))
+            .map(agent::text);
         let authz = st.authz.remove(&key);
         let user = authz
             .as_ref()
             .map(|a| a.user.clone())
-            .or_else(|| user_of(&srv, l.mac, circuit.as_deref().map(str::as_bytes), remote.as_deref().map(str::as_bytes)))
+            .or_else(|| {
+                user_of(
+                    &srv,
+                    l.mac,
+                    circuit.as_deref().map(str::as_bytes),
+                    remote.as_deref().map(str::as_bytes),
+                )
+            })
             .unwrap_or_else(|| mac_text(l.mac));
         // The rate: RADIUS, then the static lease's, then the secret's
         // profile.
-        let lease_rate = cfg
-            .ip
-            .dhcp_server
-            .leases
-            .iter()
-            .find(|x| !x.disabled && x.address == l.address && !x.rate_limit.is_empty())
-            .map(|x| x.rate_limit.clone());
-        let sec = secret(cfg, &user);
+        let cfg = view.cfg;
+        let lease_rate = view.lease_rate(l.address).map(str::to_owned);
+        let sec = secret(view, &user);
         let profile = sec.map(|s| s.profile.clone()).filter(|p| !p.is_empty());
-        let secret_rate = sec.and_then(|s| cfg.ppp.effective(Some(s), &s.profile, DEFAULT_PROFILE).rate_limit);
-        let rate = authz.as_ref().and_then(|a| a.rate.clone()).or(lease_rate).or(secret_rate);
+        let secret_rate = sec.and_then(|s| {
+            cfg.ppp
+                .effective(Some(s), &s.profile, DEFAULT_PROFILE)
+                .rate_limit
+        });
+        let rate = authz
+            .as_ref()
+            .and_then(|a| a.rate.clone())
+            .or(lease_rate)
+            .or(secret_rate);
         st.seq = st.seq.wrapping_add(1);
         let unix = unix_now();
         let id = format!("*i{:x}", st.seq);
@@ -639,7 +713,14 @@ impl Core {
         };
         if let Some(slot) = slot {
             let (up, down) = rates(rate.as_deref());
-            st.ops.push(XdpOp::Upsert { slot, interface: srv.interface.clone(), client_mac: l.mac, ip: l.address, up, down });
+            st.ops.push(XdpOp::Upsert {
+                slot,
+                interface: srv.interface.clone(),
+                client_mac: l.mac,
+                ip: l.address,
+                up,
+                down,
+            });
         }
         let mac = mac_text(l.mac);
         st.reach(&[&user, &mac], Stage::Up);
@@ -660,7 +741,9 @@ impl Core {
         st.by_acct.insert(acct_id.clone(), id.clone());
         st.by_id.insert(id.clone(), key.clone());
         let acct = sub.acct;
-        let interim = sub.interim.or((st.interim_default > 0).then_some(st.interim_default));
+        let interim = sub
+            .interim
+            .or((st.interim_default > 0).then_some(st.interim_default));
         let class = sub.class.clone();
         st.subs.insert(key, sub);
         let aaa = st.aaa.clone();
@@ -668,7 +751,10 @@ impl Core {
         if !acct || aaa.is_none() {
             return out;
         }
-        let src: Arc<dyn AcctSource> = Arc::new(Counters { core: self.clone(), id: id.clone() });
+        let src: Arc<dyn AcctSource> = Arc::new(Counters {
+            core: self.clone(),
+            id: id.clone(),
+        });
         let req = AcctRequest {
             service: AaaService::Dhcp,
             status: AcctStatus::Start,
@@ -677,7 +763,14 @@ impl Core {
             counters: None,
             terminate_cause: None,
             interim_secs: interim,
-            attributes: acct_attributes(l.address, &mac, &srv.interface, circuit.as_deref(), remote.as_deref(), class.as_deref()),
+            attributes: acct_attributes(
+                l.address,
+                &mac,
+                &srv.interface,
+                circuit.as_deref(),
+                remote.as_deref(),
+                class.as_deref(),
+            ),
         };
         // An old session's Stop first (it went out of the lock already, as `out`).
         if let Some(o) = out
@@ -685,12 +778,20 @@ impl Core {
         {
             let _ = a.account(o.req, o.source);
         }
-        Some(AcctOut { req, source: Some(src) })
+        Some(AcctOut {
+            req,
+            source: Some(src),
+        })
     }
 
     /// End the session of `key` (under the lock): the XDP slot, the active
     /// row, history and why; returns the Accounting-Stop to send.
-    fn end_locked(&self, st: &mut State, key: &Key, why: (&'static str, &'static str, u32)) -> Option<AcctOut> {
+    fn end_locked(
+        &self,
+        st: &mut State,
+        key: &Key,
+        why: (&'static str, &'static str, u32),
+    ) -> Option<AcctOut> {
         let s = st.subs.remove(key)?;
         if let Some(slot) = s.slot {
             st.ops.push(XdpOp::Remove(slot));
@@ -741,7 +842,14 @@ impl Core {
                 counters,
                 terminate_cause: Some(cause),
                 interim_secs: None,
-                attributes: acct_attributes(s.ip, &mac, &s.interface, None, None, s.class.as_deref()),
+                attributes: acct_attributes(
+                    s.ip,
+                    &mac,
+                    &s.interface,
+                    None,
+                    None,
+                    s.class.as_deref(),
+                ),
             },
             source: None,
         })
@@ -763,22 +871,29 @@ impl Core {
         let mut st = guard(&self.st);
         let mut n = 0;
         for id in ids {
-            let Some(k) = st.by_id.get(id).cloned() else { continue };
+            let Some(k) = st.by_id.get(id).cloned() else {
+                continue;
+            };
             n += 1;
             if st.revoked.contains_key(&k) {
                 continue;
             }
             st.revoked.insert(k.clone(), why);
-            st.revokes.push(Revoke { server: k.0, client_key: k.1, why: text.into() });
+            st.revokes.push(Revoke {
+                server: k.0,
+                client_key: k.1,
+                why: text.into(),
+            });
         }
         n
     }
 
     /// The local verdict, or the RADIUS ask (sent once the lock is let go).
-    fn authorize(self: &Arc<Self>, ask: &AuthAsk, cfg: &Config) -> Option<Verdict> {
+    fn authorize(self: &Arc<Self>, ask: &AuthAsk, view: &IpoeView<'_>) -> Option<Verdict> {
+        let cfg = view.cfg;
         let key: Key = (ask.server.clone(), ask.client_key.clone());
         let mac = mac_text(ask.mac);
-        let local = local_verdict(ask, cfg);
+        let local = local_verdict(ask, view);
         let mut st = guard(&self.st);
         st.reach(&[&mac], Stage::Dhcp);
         let user = match local {
@@ -787,13 +902,29 @@ impl Core {
                     .ip
                     .dhcp_server
                     .server(&ask.server)
-                    .and_then(|s| user_of(s, ask.mac, ask.circuit_id.as_deref(), ask.remote_id.as_deref()))
+                    .and_then(|s| {
+                        user_of(
+                            s,
+                            ask.mac,
+                            ask.circuit_id.as_deref(),
+                            ask.remote_id.as_deref(),
+                        )
+                    })
                     .unwrap_or_else(|| mac.clone());
                 match &v {
                     Verdict::Accept(_) => {
                         st.stats.auth_accept += 1;
-                        let profile = secret(cfg, &user).map(|s| s.profile.clone()).unwrap_or_else(|| DEFAULT_PROFILE.into());
-                        st.authz.insert(key, Authz { user, profile, ..Authz::default() });
+                        let profile = secret(view, &user)
+                            .map(|s| s.profile.clone())
+                            .unwrap_or_else(|| DEFAULT_PROFILE.into());
+                        st.authz.insert(
+                            key,
+                            Authz {
+                                user,
+                                profile,
+                                ..Authz::default()
+                            },
+                        );
                     }
                     Verdict::Reject(why) => {
                         st.stats.auth_reject += 1;
@@ -825,13 +956,21 @@ impl Core {
         }
         if st.asked.len() >= MAX_ASKED {
             let now = self.ms();
-            st.asked.retain(|_, a| now.saturating_sub(a.at_ms) <= ASK_GRACE_MS);
+            st.asked
+                .retain(|_, a| now.saturating_sub(a.at_ms) <= ASK_GRACE_MS);
             if st.asked.len() >= MAX_ASKED {
                 return None;
             }
         }
         st.reach(&[&user, &mac], Stage::Auth);
-        st.asked.insert(key.clone(), Asked { at_ms: self.ms(), user: user.clone(), mac: mac.clone() });
+        st.asked.insert(
+            key.clone(),
+            Asked {
+                at_ms: self.ms(),
+                user: user.clone(),
+                mac: mac.clone(),
+            },
+        );
         drop(st);
         let srv = cfg.ip.dhcp_server.server(&ask.server);
         let nas_port_id = match (&ask.circuit_id, cfg.ppp.aaa.use_circuit_id_in_nas_port_id) {
@@ -850,21 +989,19 @@ impl Core {
             service: AaaService::Dhcp,
             user,
             // RouterOS: an empty password.
-            credentials: Credentials::Pap { password: String::new() },
+            credentials: Credentials::Pap {
+                password: String::new(),
+            },
             nas_port_id: Some(nas_port_id),
             nas_port: None,
             calling_station_id: Some(mac),
             called_station_id: Some(ask.server.clone()),
             attributes,
         };
-        let rates: HashMap<String, String> = cfg
-            .ppp
-            .profiles
-            .iter()
-            .filter_map(|p| p.rate_limit.clone().map(|r| (p.name.clone(), r)))
-            .collect();
         let me = self.clone();
-        aaa.authenticate(req, Box::new(move |reply| me.answered(key, reply, rates)));
+        // The callback runs on the RADIUS driver's thread: it only parses
+        // the reply and queues the verdict (`answered`).
+        aaa.authenticate(req, Box::new(move |reply| me.answered(key, reply)));
         None
     }
 }
@@ -933,16 +1070,16 @@ impl Backend {
 }
 
 impl IpoeBackend for Backend {
-    fn authorize(&self, ask: &AuthAsk, cfg: &Config) -> Option<Verdict> {
-        self.0.authorize(ask, cfg)
+    fn authorize(&self, ask: &AuthAsk, view: &IpoeView<'_>) -> Option<Verdict> {
+        self.0.authorize(ask, view)
     }
 
     fn verdicts(&self) -> Vec<(String, Vec<u8>, Verdict)> {
         std::mem::take(&mut guard(&self.0.st).inbox)
     }
 
-    fn bound(&self, b: &Binding, cfg: &Config) {
-        let out = self.0.bound(b, cfg);
+    fn bound(&self, b: &Binding, view: &IpoeView<'_>) {
+        let out = self.0.bound(b, view);
         self.send(out);
     }
 
@@ -995,7 +1132,11 @@ impl PppBackend for Sessions {
     fn terminate(&self, ids: &[String]) -> usize {
         self.0.revoke(
             ids,
-            ("admin-reset", "derrubado pelo operador (ppp.active.remove): o CPE pede DHCP de novo e volta", cause::ADMIN_RESET),
+            (
+                "admin-reset",
+                "derrubado pelo operador (ppp.active.remove): o CPE pede DHCP de novo e volta",
+                cause::ADMIN_RESET,
+            ),
             "disconnected by the operator",
         )
     }
@@ -1006,11 +1147,17 @@ impl PppBackend for Sessions {
 
     fn why(&self, name: Option<&str>, mac: Option<MacAddr>) -> Why {
         let st = guard(&self.0.st);
-        let key = name.map(str::to_owned).or_else(|| mac.map(|m| m.to_string())).unwrap_or_default();
+        let key = name
+            .map(str::to_owned)
+            .or_else(|| mac.map(|m| m.to_string()))
+            .unwrap_or_default();
         let active = st
             .active
             .values()
-            .find(|a| name.is_some_and(|n| a.name == n) || mac.is_some_and(|m| a.caller_id == m.to_string()))
+            .find(|a| {
+                name.is_some_and(|n| a.name == n)
+                    || mac.is_some_and(|m| a.caller_id == m.to_string())
+            })
             .map(|a| a.id.clone());
         let mut t = st.why.get(&key).cloned().unwrap_or_default();
         // The DHCP stage is the MAC's (the name is known only after it).
@@ -1024,7 +1171,12 @@ impl PppBackend for Sessions {
         Why {
             query: key,
             active,
-            attempts: STAGES.iter().copied().zip(t.attempts).filter(|(_, n)| *n > 0).collect(),
+            attempts: STAGES
+                .iter()
+                .copied()
+                .zip(t.attempts)
+                .filter(|(_, n)| *n > 0)
+                .collect(),
             last_stage: t.last_stage,
             last: t.last.map(|b| *b),
         }
@@ -1038,7 +1190,11 @@ impl PppBackend for Sessions {
     }
 
     fn who(&self, ip: Ipv4Addr) -> Option<String> {
-        guard(&self.0.st).active.values().find(|a| a.address == Some(ip)).map(|a| a.name.clone())
+        guard(&self.0.st)
+            .active
+            .values()
+            .find(|a| a.address == Some(ip))
+            .map(|a| a.name.clone())
     }
 
     fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {
@@ -1046,7 +1202,12 @@ impl PppBackend for Sessions {
         st.history
             .iter()
             .rev()
-            .find(|h| h.address == Some(ip) && h.event == "down" && h.at >= at && h.at.saturating_sub(h.uptime_secs) <= at)
+            .find(|h| {
+                h.address == Some(ip)
+                    && h.event == "down"
+                    && h.at >= at
+                    && h.at.saturating_sub(h.uptime_secs) <= at
+            })
             .map(|h| h.name.clone())
             .or_else(|| {
                 let up = st.subs.values().find(|s| s.ip == ip && s.up_at <= at)?;
@@ -1073,26 +1234,28 @@ impl SessionOwner for Owner {
         if empty {
             return CoaOutcome::NotMine;
         }
-        let hits: Vec<String> = {
-            let st = guard(&self.0.st);
-            st.active
-                .values()
-                .filter(|a| {
-                    sel.user_name.as_deref().is_none_or(|u| a.name == u)
-                        && sel.framed_ip.is_none_or(|ip| a.address == Some(ip))
-                        && sel
-                            .calling_station_id
-                            .as_deref()
-                            .is_none_or(|c| a.caller_id.eq_ignore_ascii_case(&c.replace('-', ":")))
-                        && sel
-                            .nas_port_id
-                            .as_deref()
-                            .is_none_or(|n| a.interface == n || a.circuit_id.as_deref() == Some(n))
-                        && sel.acct_session_id.as_deref().is_none_or(|s| st.by_acct.get(s) == Some(&a.id))
-                })
-                .map(|a| a.id.clone())
-                .collect()
-        };
+        let hits: Vec<String> =
+            {
+                let st = guard(&self.0.st);
+                st.active
+                    .values()
+                    .filter(|a| {
+                        sel.user_name.as_deref().is_none_or(|u| a.name == u)
+                            && sel.framed_ip.is_none_or(|ip| a.address == Some(ip))
+                            && sel.calling_station_id.as_deref().is_none_or(|c| {
+                                a.caller_id.eq_ignore_ascii_case(&c.replace('-', ":"))
+                            })
+                            && sel.nas_port_id.as_deref().is_none_or(|n| {
+                                a.interface == n || a.circuit_id.as_deref() == Some(n)
+                            })
+                            && sel
+                                .acct_session_id
+                                .as_deref()
+                                .is_none_or(|s| st.by_acct.get(s) == Some(&a.id))
+                    })
+                    .map(|a| a.id.clone())
+                    .collect()
+            };
         if hits.is_empty() {
             return CoaOutcome::NotMine;
         }
@@ -1100,24 +1263,40 @@ impl SessionOwner for Owner {
             CoaKind::Disconnect => {
                 self.0.revoke(
                     &hits,
-                    ("radius-disconnect", "o RADIUS mandou desconectar (Disconnect-Request): o CPE pede DHCP de novo", cause::ADMIN_RESET),
+                    (
+                        "radius-disconnect",
+                        "o RADIUS mandou desconectar (Disconnect-Request): o CPE pede DHCP de novo",
+                        cause::ADMIN_RESET,
+                    ),
                     "disconnected by RADIUS",
                 );
                 CoaOutcome::Ack
             }
             CoaKind::Coa => {
-                let rate = req.changes.iter().find(|a| a.name == "Mikrotik-Rate-Limit").map(|a| a.value.clone());
+                let rate = req
+                    .changes
+                    .iter()
+                    .find(|a| a.name == "Mikrotik-Rate-Limit")
+                    .map(|a| a.value.clone());
                 if req.changes.iter().any(|a| a.name == "Framed-IP-Address") {
                     // A new address: the client gets it on its next DISCOVER.
                     self.0.revoke(
                         &hits,
-                        ("radius-new-address", "o RADIUS deu outro endereço (CoA): o CPE pede DHCP de novo e o recebe", cause::ADMIN_RESET),
+                        (
+                            "radius-new-address",
+                            "o RADIUS deu outro endereço (CoA): o CPE pede DHCP de novo e o recebe",
+                            cause::ADMIN_RESET,
+                        ),
                         "new address from RADIUS",
                     );
                     return CoaOutcome::Ack;
                 }
                 let Some(rate) = rate else {
-                    return if req.authorize_only { CoaOutcome::Ack } else { CoaOutcome::Nak(401) };
+                    return if req.authorize_only {
+                        CoaOutcome::Ack
+                    } else {
+                        CoaOutcome::Nak(401)
+                    };
                 };
                 // RFC 5176 §2.3: all or nothing.
                 if rate.parse::<RateLimit>().is_err() {
@@ -1125,12 +1304,23 @@ impl SessionOwner for Owner {
                 }
                 let mut st = guard(&self.0.st);
                 for id in &hits {
-                    let Some(k) = st.by_id.get(id).cloned() else { continue };
-                    let Some(s) = st.subs.get_mut(&k) else { continue };
+                    let Some(k) = st.by_id.get(id).cloned() else {
+                        continue;
+                    };
+                    let Some(s) = st.subs.get_mut(&k) else {
+                        continue;
+                    };
                     s.rate = Some(rate.clone());
                     let op = s.slot.map(|slot| {
                         let (up, down) = rates(Some(&rate));
-                        XdpOp::Upsert { slot, interface: s.interface.clone(), client_mac: s.mac, ip: s.ip, up, down }
+                        XdpOp::Upsert {
+                            slot,
+                            interface: s.interface.clone(),
+                            client_mac: s.mac,
+                            ip: s.ip,
+                            up,
+                            down,
+                        }
                     });
                     if let Some(op) = op {
                         st.ops.push(op);
@@ -1146,7 +1336,14 @@ impl SessionOwner for Owner {
 }
 
 /// The XDP entry of a session on a port with this index and MAC.
-pub(crate) fn xdp_session(ifindex: u32, server_mac: [u8; 6], client_mac: [u8; 6], ip: Ipv4Addr, up: Rate, down: Rate) -> PppoeSession {
+pub(crate) fn xdp_session(
+    ifindex: u32,
+    server_mac: [u8; 6],
+    client_mac: [u8; 6],
+    ip: Ipv4Addr,
+    up: Rate,
+    down: Rate,
+) -> PppoeSession {
     PppoeSession {
         ifindex,
         sid: 0,
