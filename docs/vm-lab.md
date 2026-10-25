@@ -13,7 +13,9 @@ cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root
 cargo xtask vm-lab run -- cargo test -p corerouter-hal-linux --test xdp_root --no-run
 cargo xtask vm-lab ssh             # shell como `lab` (sudo sem senha lá dentro)
 cargo xtask vm-lab status          # estado, endereço, snapshots, disco, NICs
-cargo xtask vm-lab reset           # volta o disco ao snapshot `clean` e liga
+cargo xtask vm-lab tools --check   # as ferramentas de terceiros estão lá? (o agente roda)
+cargo xtask vm-lab tools           # instala as que faltam e tira o snapshot `tools` (o usuário roda)
+cargo xtask vm-lab reset           # volta o disco ao snapshot `tools` (ou `clean`) e liga
 ```
 
 | Subcomando | O que faz |
@@ -22,10 +24,35 @@ cargo xtask vm-lab reset           # volta o disco ao snapshot `clean` e liga
 | `up` / `down` | Liga e espera o SSH / desliga (ACPI; força depois de 90 s). |
 | `ssh [cmd…]` | Shell ou um comando como `lab`. |
 | `sync` | `rsync` da worktree para `/srv/lab/<worktree>/src` (sem `target*`, `.git`, `vm/`, `plan/`). |
-| `put <arquivo…>` | Copia arquivos do host para `/srv/lab/inbox/` na VM (o `.deb` do BNG Blaster, uma captura). |
+| `put <arquivo…>` | Copia arquivos do host para `/srv/lab/inbox/` na VM (uma captura, um arquivo de config). |
+| `tools [--check]` | Instala as ferramentas de terceiros declaradas em `xtask/src/vm_tools.rs` que faltam, imprime o que está instalado e tira o snapshot `tools`; `--check` só confere e diz o que falta. Idempotente. Veja "Ferramentas de terceiros". |
 | `run [--no-sync] [--shared] -- <cmd…>` | Confere a saúde da VM (root, processos novos, disco > 2 GiB e memória > 1 GiB livres; se falhar duas vezes, `reset` para `clean` sozinho), `sync`, pega a trava `/run/corerouter-lab.lock` (uma rodada por vez; `--shared` pula, só para compilar) e roda o comando **como root** em `/srv/lab/<worktree>/src`, com `CARGO_TARGET_DIR=/srv/lab/<worktree>/target`; saída ao vivo, código de saída repassado, tempo da rodada no fim. Um argumento só é uma linha de shell (`run -- 'a && b'`); vários são citados um a um. |
-| `snapshot [nome]` / `reset [nome]` | Snapshot interno do disco (com a VM desligada; sem imagem de RAM) / volta o disco a ele e liga, mantendo a definição atual da VM (CPU, memória). Padrão `clean`. |
+| `snapshot [nome] [--force]` / `reset [nome] [--force]` | Snapshot interno do disco (com a VM desligada; sem imagem de RAM) / volta o disco a ele e liga, mantendo a definição atual da VM (CPU, memória). Padrão `tools` (ou `clean`, se não houver `tools`). Recusa enquanto alguém está numa rodada: a trava do `run` na VM ou `vm/root.lock` no host (rodada à mão do usuário, `flock vm/root.lock cargo xtask vm-lab run …`); `--force` passa por cima. |
 | `destroy` | Apaga a VM, o overlay e o seed; a imagem baixada e a chave ficam. |
+
+## Ferramentas de terceiros
+
+O nosso código (a worktree, compilada dentro da VM) roda pelo `vm-lab run` sem perguntar nada.
+Programas de terceiros baixados, como o `.deb` do BNG Blaster, são outra história: o classificador
+do modo automático do app bloqueia o agente de instalá-los ou executá-los ("Code from External"),
+mesmo com o `cargo xtask vm-lab` liberado. Isso é proposital: código de fora entra por decisão
+humana. Por isso a instalação é do usuário, **uma vez por ferramenta nova**, e fica:
+
+1. A ferramenta é declarada em `xtask/src/vm_tools.rs` (`TOOLS`), revisada como código: pacote,
+   versão, URL oficial (`https://`) e SHA-256 do `.deb`, ou só o nome, para pacote do arquivo
+   assinado do Ubuntu. Confira o hash contra o publicado pelo projeto (no GitHub, o `digest` do
+   asset do release).
+2. O usuário roda `cargo xtask vm-lab tools`. O comando baixa cada `.deb` uma vez para
+   `vm/tools/`, confere o hash no host e de novo na VM, instala tudo num `apt-get install` só (o
+   apt resolve as dependências do `.deb`), imprime as versões e tira o snapshot `tools`. Se o
+   hash não bate, o arquivo é apagado e nada é instalado.
+3. A partir daí `reset` (e o reset automático do health-check) volta para `tools`, com as
+   ferramentas dentro. Os agentes rodam `cargo xtask vm-lab tools --check` antes do lab: se
+   faltar algo, a mensagem diz exatamente o que pedir ao usuário.
+
+Acrescentar uma ferramenta: uma entrada em `TOOLS` num PR (com o link do hash publicado no corpo),
+e depois do merge o usuário roda `cargo xtask vm-lab tools`. Hoje: BNG Blaster 1.0.1 (`.deb` do
+release da rtbrick), `ppp`, `pppoe`, `tcpdump`, `iperf3` e `ethtool`.
 
 ## Como é montada
 
@@ -81,7 +108,7 @@ cargo xtask vm-lab reset           # volta o disco ao snapshot `clean` e liga
   apaga o do outro; os números de pps também dividem CPU. Por isso o `run` é exclusivo (trava
   `flock` dentro da VM; quem chega espera e vê quem segura). Uma worktree com um `vm_lab.rs` antigo,
   sem a trava, ainda colide: faça `git merge origin/main`.
-- `reset` volta o disco inteiro, inclusive o cache de build: tire um `snapshot` depois de uma
+- `reset` volta o disco inteiro, inclusive o cache de build (o snapshot `tools` não tem cache): tire um `snapshot` depois de uma
   compilação longa se quiser voltar a ele quente.
 - O snapshot é interno ao qcow2 e só com a VM desligada (`snapshot` desliga e religa).
 - Desempenho medido na VM é de virtio, não de placa física: serve para comparar antes/depois,

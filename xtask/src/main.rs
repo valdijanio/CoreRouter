@@ -6,6 +6,7 @@ mod changes;
 mod ebpf;
 mod layers;
 mod vm_lab;
+mod vm_tools;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
