@@ -584,3 +584,36 @@ fn rfc3162_prefix_and_interface_id_round_trip() {
         );
     }
 }
+
+/// G4.3g: a login called off (its session ended) leaves the client: no
+/// more retransmissions to a server that does not answer, and the caller
+/// hears of it at once instead of after every timeout.
+#[test]
+fn a_called_off_login_stops_being_retransmitted() {
+    let srv = TestRadius::start(3);
+    srv.srv.lock().unwrap().script.offline = true;
+    let mut e = srv.entry(1);
+    e.timeout = 1000;
+    let r = start(vec![e]);
+    let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (tx, rx) = mpsc::channel();
+    let t = Instant::now();
+    r.aaa.authenticate_until(
+        AuthRequest::pap(AaaService::Ppp, "ana", "segredo"),
+        Box::new(move |x| tx.send(x).unwrap()),
+        cancel.clone(),
+    );
+    std::thread::sleep(Duration::from_millis(300));
+    cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    let x = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(x.outcome, AuthOutcome::Error, "{x:?}");
+    assert!(x.message.as_deref().unwrap_or("").contains("cancelled"), "{x:?}");
+    assert!(t.elapsed() < Duration::from_millis(1000), "before the first retransmission: {:?}", t.elapsed());
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(monitor(&r.aaa).servers[0].resends, 0, "nothing sent again");
+    // Called off before it is even taken: never sent.
+    let gone = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let (tx, rx) = mpsc::channel();
+    r.aaa.authenticate_until(AuthRequest::pap(AaaService::Ppp, "bia", "x"), Box::new(move |x| tx.send(x).unwrap()), gone);
+    assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap().outcome, AuthOutcome::Error);
+}

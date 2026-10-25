@@ -274,6 +274,8 @@ pub struct ServerStats {
     pub bad_replies: u64,
     pub unsolicited: u64,
     pub last_rtt_ms: u64,
+    /// The first timeout new requests get now (adaptive, RFC 6298).
+    pub rto_ms: u64,
     pub in_flight: u64,
     pub sockets: u64,
 }
@@ -378,6 +380,51 @@ struct ServerState {
     sockets: Vec<IdTable>,
     queue: VecDeque<(u32, u32)>,
     stats: ServerStats,
+    /// Smoothed answer time and its variation (RFC 6298 §2), from answers
+    /// to requests sent once (Karn: after a retransmission the answer may be
+    /// to either copy). It follows a server that slows down gradually, as a
+    /// queue does in a wave; one always slower than the IRT keeps the IRT
+    /// (raise `timeout`, as on RouterOS). Measuring retransmitted requests
+    /// from the first copy was tried: under 3 % loss it pinned the timeout
+    /// at MRT and slowed failover.
+    srtt_ms: Option<f64>,
+    rttvar_ms: f64,
+}
+
+impl ServerState {
+    /// The first timeout of a new request: the configured IRT, or more when
+    /// this server is answering slower than that (SRTT + 4·RTTVAR, RFC
+    /// 6298 §2.3), at most MRT. A loaded server is not sent copies of what
+    /// it is still working on (G4.3g: at a 1.4 s answer time a fixed 1.1 s
+    /// sent every request twice).
+    fn first_rt(&self) -> u64 {
+        let irt = self.cfg.retry.irt_ms;
+        let est = self
+            .srtt_ms
+            .map_or(0.0, |srtt| srtt + 4.0 * self.rttvar_ms)
+            .ceil() as u64;
+        let rt = irt.max(est);
+        match self.cfg.retry.mrt_ms {
+            0 => rt,
+            mrt => rt.min(mrt),
+        }
+    }
+
+    /// RFC 6298 §2.2/§2.3 with α = 1/8, β = 1/4.
+    fn sample(&mut self, rtt_ms: u64) {
+        let r = rtt_ms as f64;
+        match self.srtt_ms {
+            None => {
+                self.srtt_ms = Some(r);
+                self.rttvar_ms = r / 2.0;
+            }
+            Some(srtt) => {
+                self.rttvar_ms = 0.75 * self.rttvar_ms + 0.25 * (srtt - r).abs();
+                self.srtt_ms = Some(0.875 * srtt + 0.125 * r);
+            }
+        }
+        self.stats.rto_ms = self.first_rt();
+    }
 }
 
 /// Maximum servers (the tried-set is a 64-bit mask).
@@ -435,6 +482,8 @@ impl Client {
                     sockets: Vec::new(),
                     queue: VecDeque::new(),
                     stats: ServerStats::default(),
+                    srtt_ms: None,
+                    rttvar_ms: 0.0,
                 })
                 .collect(),
             slots: Vec::new(),
@@ -729,7 +778,7 @@ impl Client {
         if let Some(a) = wire.get(4..HEADER_LEN) {
             authenticator.copy_from_slice(a);
         }
-        let irt = server.cfg.retry.irt_ms;
+        let (irt, learnt) = (server.cfg.retry.irt_ms, server.first_rt());
         let server_idx = p.server;
         if !ok {
             // The identifier is not attached to a flight yet: free it here.
@@ -743,7 +792,9 @@ impl Client {
             self.finish(r, Some(Failure::Timeout));
             return;
         }
-        let rt = irt.saturating_add_signed(self.jitter(irt));
+        // RFC 5080 §2.2.1's ±10 % on the IRT; never below what the server
+        // is known to take.
+        let rt = irt.saturating_add_signed(self.jitter(irt)).max(learnt);
         if let Some(p) = self.get_mut(r) {
             p.flight = Some(Flight {
                 socket,
@@ -1141,11 +1192,15 @@ impl Client {
             _ => {}
         }
         let rtt = now_ms.saturating_sub(f.last_tx_ms);
+        let once = f.tx == 1;
         let (kind, authenticator) = (pend.kind, f.authenticator);
         let server = local.server;
         if let Some(s) = self.servers.get_mut(server) {
             s.failures = 0;
             s.stats.last_rtt_ms = rtt;
+            if once && kind != Kind::Status {
+                s.sample(rtt);
+            }
             match p.code() {
                 Code::AccessAccept if kind == Kind::Access => s.stats.accepts += 1,
                 Code::AccessReject => s.stats.rejects += 1,

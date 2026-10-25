@@ -670,9 +670,22 @@ const AUTO_WINDOW_MIN: usize = 8;
 pub(crate) struct Admission {
     pub rate: f64,
     pub reason: String,
+    /// Workers sharing the service's rate (each measures its own share).
+    pub lanes: u16,
     latencies: Vec<u64>,
     timeouts: u32,
     held_before: u64,
+    /// Logins answered per second, last seconds (the whole service's,
+    /// estimated from this worker's share): the server's measured capacity.
+    delivered: VecDeque<f64>,
+    /// Fastest answer of each of the last seconds: the server's time with
+    /// no queue in front of it.
+    fastest: VecDeque<u64>,
+    /// Still finding the server's capacity (rate doubling each second).
+    startup: bool,
+    best: f64,
+    flat: u8,
+    cycle: u8,
 }
 
 impl Default for Admission {
@@ -680,12 +693,29 @@ impl Default for Admission {
         Self {
             rate: AUTO_START,
             reason: "início".into(),
+            lanes: 1,
             latencies: Vec::new(),
             timeouts: 0,
             held_before: 0,
+            delivered: VecDeque::new(),
+            fastest: VecDeque::new(),
+            startup: true,
+            best: 0.0,
+            flat: 0,
+            cycle: 0,
         }
     }
 }
+
+/// Seconds of the RADIUS server's measured capacity that may wait in the
+/// BNG (in the Authenticate phase) before PADIs are held back: well under
+/// the 30 s a login may take (`answer_timeout_ms`).
+const AUTO_BACKLOG_S: f64 = 10.0;
+/// Seconds of history the capacity and the base latency look back over.
+const AUTO_HISTORY: usize = 10;
+/// BBR's gain cycle (1.25 to probe for more, 0.9 to drain what the probe
+/// queued, then cruise), one step a second.
+const AUTO_GAINS: [f64; 8] = [1.25, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0];
 
 impl Admission {
     /// One RADIUS answer: its round trip, or that it never came.
@@ -697,15 +727,46 @@ impl Admission {
         }
     }
 
+    /// The server's capacity in logins a second, as measured (0: unknown).
+    fn capacity(&self) -> f64 {
+        self.delivered.iter().copied().fold(0.0, f64::max)
+    }
+
+    fn base_ms(&self) -> Option<u64> {
+        self.fastest.iter().copied().min()
+    }
+
     /// RADIUS questions this worker may have in flight (`lanes` workers
-    /// share the rate).
+    /// share the rate): its rate times twice the base answer time (at least
+    /// [`AUTO_WINDOW_MS`]/2), as BBR keeps about two bandwidth-delay
+    /// products in flight.
     fn window(&self, lanes: u16) -> usize {
         let share = self.rate / f64::from(lanes.max(1));
-        ((share * AUTO_WINDOW_MS / 1000.0) as usize).max(AUTO_WINDOW_MIN)
+        let base = self
+            .base_ms()
+            .map_or(0.0, |b| b as f64)
+            .max(AUTO_WINDOW_MS / 2.0);
+        ((share * 2.0 * base / 1000.0) as usize).max(AUTO_WINDOW_MIN)
+    }
+
+    /// Logins this worker lets queue (sent or waiting for the window)
+    /// before it holds PADIs back: [`AUTO_BACKLOG_S`] of the measured
+    /// capacity, never under the window.
+    fn backlog(&self, lanes: u16) -> usize {
+        let share = self.capacity().max(self.rate) / f64::from(lanes.max(1));
+        ((share * AUTO_BACKLOG_S) as usize).max(self.window(lanes))
     }
 
     /// Once a second. `held`: sessions the limit has held back so far;
     /// `pending`: questions still unanswered.
+    ///
+    /// Like BBR (Cardwell et al., 2016): the rate follows the measured
+    /// capacity (answers per second, the best of the last
+    /// [`AUTO_HISTORY`] s) with a gain, doubling while that capacity still
+    /// grows; a standing queue (answers much slower than the base) drains
+    /// it to 0.9×, a timeout cuts it to 0.75×. A plain AIMD on the latency
+    /// alone halved itself into a slow crawl (G4.3g: 100 000 in 517 s
+    /// against a 3000/s server).
     fn second(&mut self, held: u64, pending: usize) {
         let waiting = held > self.held_before;
         self.held_before = held;
@@ -714,24 +775,76 @@ impl Admission {
             .latencies
             .get(self.latencies.len().saturating_mul(9) / 10)
             .copied();
+        let lanes = f64::from(self.lanes.max(1));
+        let answered = self.latencies.len() as f64 * lanes;
+        self.delivered.push_back(answered);
+        if let Some(f) = self.latencies.first() {
+            self.fastest.push_back(*f);
+        }
+        while self.delivered.len() > AUTO_HISTORY {
+            self.delivered.pop_front();
+        }
+        while self.fastest.len() > AUTO_HISTORY {
+            self.fastest.pop_front();
+        }
+        let cap = self.capacity();
+        let base = self.base_ms();
+        // A standing queue: the p90 well above what the server takes with
+        // nothing in front (and above what anyone would call fast).
+        let queued = match (p90, base) {
+            (Some(p), Some(b)) => p > (2 * b + 50).max(AUTO_FAST_MS) || p > AUTO_SLOW_MS,
+            (Some(p), None) => p > AUTO_SLOW_MS,
+            _ => false,
+        };
         if self.timeouts > 0 {
-            self.rate = (self.rate / 2.0).max(AUTO_MIN);
+            self.startup = false;
+            self.rate = (cap * 0.75).max(self.rate / 2.0).max(AUTO_MIN);
             self.reason = format!("RADIUS sem resposta: {} timeouts", self.timeouts);
         } else if p90.is_none() && pending > 0 {
             // A whole second with questions out and no answer at all.
+            self.startup = false;
             self.rate = (self.rate / 2.0).max(AUTO_MIN);
             self.reason = format!("RADIUS parado: {pending} pedidos sem resposta");
-        } else if let Some(ms) = p90.filter(|ms| *ms > AUTO_SLOW_MS) {
-            self.rate = (self.rate / 2.0).max(AUTO_MIN);
-            self.reason = format!("RADIUS lento: {ms} ms");
-        } else if waiting && p90.is_none_or(|ms| ms <= AUTO_FAST_MS) {
-            self.rate = (self.rate + AUTO_STEP).min(AUTO_MAX);
-            self.reason = match p90 {
-                Some(ms) => format!("subindo: RADIUS em {ms} ms"),
-                None => "subindo: sem RADIUS no caminho".into(),
+        } else if queued {
+            self.startup = false;
+            let p = p90.unwrap_or(0);
+            self.rate = if cap > 0.0 {
+                cap * 0.9
+            } else {
+                self.rate / 2.0
+            }
+            .max(AUTO_MIN);
+            self.reason = match base {
+                Some(b) => format!("RADIUS lento: {p} ms (sem fila: {b} ms)"),
+                None => format!("RADIUS lento: {p} ms"),
             };
         } else if !waiting {
             self.reason = "sem fila".into();
+        } else if cap == 0.0 {
+            // Local secrets, no RADIUS answers to measure: grow as before.
+            self.rate = (self.rate + AUTO_STEP).min(AUTO_MAX);
+            self.reason = "subindo: sem RADIUS no caminho".into();
+        } else if self.startup {
+            // Still finding the ceiling: double while the answers keep up.
+            if cap > self.best * 1.25 {
+                self.best = cap;
+                self.flat = 0;
+            } else {
+                self.flat += 1;
+            }
+            if self.flat >= 3 {
+                self.startup = false;
+            }
+            self.rate = (self.rate * 2.0).max(cap * 2.0).min(AUTO_MAX);
+            self.reason = format!("subindo: RADIUS responde {cap:.0}/s");
+        } else {
+            let gain = AUTO_GAINS
+                .get(usize::from(self.cycle))
+                .copied()
+                .unwrap_or(1.0);
+            self.cycle = (self.cycle + 1) % AUTO_GAINS.len() as u8;
+            self.rate = (cap * gain).clamp(AUTO_MIN, AUTO_MAX);
+            self.reason = format!("na capacidade do RADIUS: {cap:.0}/s");
         }
         self.latencies.clear();
         self.timeouts = 0;
@@ -795,6 +908,8 @@ struct Sub {
     list_at: Millis,
     idle_since: Millis,
     descriptor_vlan: Option<u16>,
+    /// The RADIUS question in flight, to call off if the session ends.
+    auth_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     circuit_id: Option<String>,
     remote_id: Option<String>,
     mtu: u16,
@@ -925,6 +1040,9 @@ pub(crate) struct Bng {
     padr_throttled: u64,
     /// The rate of the servers with `new_session_rate=auto`.
     pub admission: Admission,
+    /// auto: Access-Requests waiting for room in the window.
+    auth_queue: VecDeque<(usize, SessionRef, RadiusRequest)>,
+    queued_total: u64,
     /// G4.3e: the /64s and delegated prefixes the sessions hold.
     pools6: Arc<Mutex<Pools6>>,
     /// IPv6 packets refused before reaching a session's control plane.
@@ -1128,6 +1246,8 @@ impl Bng {
             xdp: false,
             padr_throttled: 0,
             admission: Admission::default(),
+            auth_queue: VecDeque::new(),
+            queued_total: 0,
             pools6: Arc::new(Mutex::new(Pools6::default())),
             v6_dropped: 0,
         }
@@ -1146,6 +1266,7 @@ impl Bng {
         b.routes = self.routes.clone();
         b.lane = lane;
         b.lanes = lanes.max(1);
+        b.admission.lanes = b.lanes;
         b
     }
 
@@ -1153,6 +1274,7 @@ impl Bng {
     pub(crate) fn first_of(seed: [u8; 32], lanes: u16) -> Self {
         let mut b = Self::new(seed);
         b.lanes = lanes.max(1);
+        b.admission.lanes = b.lanes;
         let n = usize::from(b.lanes);
         guard(&b.shared).lanes = vec![LaneStats::default(); n];
         guard(&b.why).lanes = n;
@@ -1336,6 +1458,9 @@ impl Bng {
     /// Remove a session, keeping the index.
     fn take_sub(&mut self, key: (usize, u16)) -> Option<Sub> {
         let sub = self.subs.remove(&key)?;
+        if let Some(c) = &sub.auth_cancel {
+            c.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         self.index.remove(key, &sub);
         if sub.up_at.is_some()
             && let Some(ip) = sub.ip
@@ -1384,11 +1509,17 @@ impl Bng {
                     // back-off). At the PADR it would be worse: the CPE
                     // repeats the PADR with an AC-Cookie that expires.
                     let setting_up = self.index.pending.contains_key(&(i, src.0));
-                    // auto: also no more questions in flight than the
-                    // server is answering (the window).
-                    let full_window = slot.cfg.new_session_rate_auto
-                        && self.pending_auth >= self.admission.window(self.lanes);
-                    if !setting_up && (full_window || !slot.bucket.allow(now)) {
+                    // auto: the limit is the RADIUS server's, applied to the
+                    // logins queued here (about AUTO_BACKLOG_S of what it
+                    // answers), not to the PADIs: a CPE told "no" backs off
+                    // (RFC 2516 §5) and comes back late, idling the server.
+                    let held = if slot.cfg.new_session_rate_auto {
+                        let backlog = self.admission.backlog(self.lanes);
+                        self.pending_auth + self.auth_queue.len() >= backlog
+                    } else {
+                        !slot.bucket.allow(now)
+                    };
+                    if !setting_up && held {
                         self.padr_throttled += 1;
                         return;
                     }
@@ -1874,6 +2005,7 @@ impl Bng {
             list_at: now,
             idle_since: now,
             descriptor_vlan: vlan,
+            auth_cancel: None,
             circuit_id: req
                 .circuit_id
                 .as_ref()
@@ -2087,9 +2219,40 @@ impl Bng {
                 Attribute::new("NAS-Port-Type", "5"),
             ],
         };
+        // auto: no more questions out than the window; the rest wait here,
+        // their CPEs in the Authenticate phase (repeats ignored while one
+        // is pending), and go as answers come back.
+        if self
+            .slots
+            .get(i)
+            .is_some_and(|s| s.cfg.new_session_rate_auto)
+            && self.pending_auth >= self.admission.window(self.lanes)
+        {
+            self.auth_queue.push_back((i, sref, r));
+            self.queued_total += 1;
+            return;
+        }
+        self.send_radius(now, i, sref, r, aaa);
+    }
+
+    /// One Access-Request out, called off if the session ends first.
+    fn send_radius(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        r: RadiusRequest,
+        aaa: &Arc<dyn AaaBackend>,
+    ) {
         let tx = self.auth_tx.clone();
         self.pending_auth += 1;
-        aaa.authenticate(
+        // Called off if the session ends first (the CPE gave up, LCP or the
+        // setup timed out): the server is not spent on it (G4.3g).
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
+            sub.auth_cancel = Some(cancel.clone());
+        }
+        aaa.authenticate_until(
             r,
             Box::new(move |reply| {
                 // The BNG's thread reads it; nothing else happens here.
@@ -2100,11 +2263,38 @@ impl Bng {
                     reply,
                 });
             }),
+            cancel,
         );
     }
 
-    /// RADIUS answers that arrived.
+    /// Queued Access-Requests out while the window has room; those of
+    /// sessions that ended meanwhile are dropped.
+    fn drain_auth_queue(&mut self, now: Millis) {
+        let Some(aaa) = self.cfg.aaa.clone() else {
+            self.auth_queue.clear();
+            return;
+        };
+        while self.pending_auth < self.admission.window(self.lanes) {
+            let Some((i, sref, r)) = self.auth_queue.pop_front() else {
+                break;
+            };
+            if self
+                .subs
+                .get(&(i, sref.sid))
+                .is_some_and(|s| s.sref == sref && s.up_at.is_none())
+            {
+                self.send_radius(now, i, sref, r, &aaa);
+            }
+        }
+    }
+
+    /// RADIUS answers that arrived, then what the window lets out.
     pub(crate) fn radius(&mut self, now: Millis) {
+        self.radius_answers(now);
+        self.drain_auth_queue(now);
+    }
+
+    fn radius_answers(&mut self, now: Millis) {
         while let Ok(done) = self.auth_rx.try_recv() {
             self.pending_auth = self.pending_auth.saturating_sub(1);
             let late = now.saturating_sub(done.asked);
@@ -2623,7 +2813,7 @@ impl Bng {
         let throttled = self.padr_throttled + limited;
         // new_session_rate=auto: one AIMD step a second.
         self.admission
-            .second(self.padr_throttled, self.pending_auth);
+            .second(self.padr_throttled + self.queued_total, self.pending_auth);
         let rate = share(self.admission.rate as u32, self.lanes);
         let mut auto = false;
         for s in self
@@ -3030,13 +3220,12 @@ mod admission_tests {
 
     #[test]
     fn auto_rate_follows_the_radius_server() {
-        let mut a = Admission::default();
         let mut held = 0;
-        let mut second = |a: &mut Admission, ms: Option<u64>, timeout: bool, waiting: bool| {
-            if let Some(ms) = ms {
-                for _ in 0..100 {
-                    a.answer(ms, false);
-                }
+        // One second: `n` answers in `ms`, a timeout or not, CPEs waiting
+        // or not.
+        let mut second = |a: &mut Admission, n: usize, ms: u64, timeout: bool, waiting: bool| {
+            for _ in 0..n {
+                a.answer(ms, false);
             }
             if timeout {
                 a.answer(1100, true);
@@ -3046,42 +3235,51 @@ mod admission_tests {
             }
             a.second(held, 0);
         };
-        // Fast answers and a queue: additive increase, up to the ceiling.
-        second(&mut a, Some(20), false, true);
-        assert_eq!(a.rate, AUTO_START + AUTO_STEP);
-        assert!(a.reason.contains("20 ms"), "{}", a.reason);
-        for _ in 0..100 {
-            second(&mut a, Some(20), false, true);
+        let mut a = Admission::default();
+        // Startup: the rate doubles while the answers keep up.
+        second(&mut a, 100, 20, false, true);
+        assert_eq!(a.rate, 2.0 * AUTO_START);
+        assert!(a.reason.contains("100/s"), "{}", a.reason);
+        // The answers stop growing (the server's capacity: 100/s): after
+        // three such seconds the rate is that capacity times BBR's gains.
+        for _ in 0..4 {
+            second(&mut a, 100, 20, false, true);
         }
-        assert_eq!(a.rate, AUTO_MAX);
-        // Slow answers halve it, with the reason.
-        second(&mut a, Some(380), false, true);
-        assert_eq!(a.rate, AUTO_MAX / 2.0);
-        assert_eq!(a.reason, "RADIUS lento: 380 ms");
-        // A timeout halves it too; never below the floor.
-        for _ in 0..20 {
-            second(&mut a, None, true, true);
-        }
-        assert_eq!(a.rate, AUTO_MIN);
+        assert!(!a.startup);
+        assert!((90.0..=125.0).contains(&a.rate), "{}", a.rate);
+        assert!(
+            a.reason.contains("capacidade do RADIUS: 100/s"),
+            "{}",
+            a.reason
+        );
+        // A standing queue (380 ms against 20 ms with none): 0.9× the capacity.
+        second(&mut a, 100, 380, false, true);
+        assert_eq!(a.rate, 90.0);
+        assert_eq!(a.reason, "RADIUS lento: 380 ms (sem fila: 20 ms)");
+        // A timeout: 0.75× the capacity, never the floor while it answers.
+        second(&mut a, 100, 20, true, true);
+        assert_eq!(a.rate, 75.0);
         assert!(a.reason.starts_with("RADIUS sem resposta"), "{}", a.reason);
-        // No queue: it holds (no growth while nobody waits).
+        // No queue: it holds.
         let r = a.rate;
-        second(&mut a, Some(20), false, false);
+        second(&mut a, 100, 20, false, false);
         assert_eq!(a.rate, r);
         assert_eq!(a.reason, "sem fila");
-        // Local secrets (no RADIUS answers) and a queue: it grows.
-        second(&mut a, None, false, true);
-        assert!(a.rate > r);
         // Questions out and a whole second without an answer: halved.
-        let r = a.rate;
-        a.second(held + 10, 40);
+        a.second(1 << 40, 40);
         assert_eq!(a.rate, (r / 2.0).max(AUTO_MIN));
         assert!(a.reason.starts_with("RADIUS parado"), "{}", a.reason);
-        // The window: the rate times 300 ms, shared by the workers.
-        a.rate = 2000.0;
-        assert_eq!(a.window(1), 600);
-        assert_eq!(a.window(4), 150);
-        a.rate = AUTO_MIN;
-        assert_eq!(a.window(8), AUTO_WINDOW_MIN);
+        // Local secrets (no RADIUS answers ever) and CPEs waiting: it grows.
+        let mut b = Admission::default();
+        second(&mut b, 0, 0, false, true);
+        assert_eq!(b.rate, AUTO_START + AUTO_STEP);
+        // The window: twice the rate times the base answer time (at least
+        // 150 ms), shared by the workers; the backlog: 10 s of capacity.
+        b.rate = 2000.0;
+        assert_eq!(b.window(1), 600);
+        assert_eq!(b.window(4), 150);
+        assert_eq!(b.backlog(1), 20_000);
+        b.rate = AUTO_MIN;
+        assert_eq!(b.window(8), AUTO_WINDOW_MIN);
     }
 }

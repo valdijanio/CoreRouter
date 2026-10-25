@@ -42,6 +42,16 @@ pub trait AaaBackend: Send + Sync {
     /// Queue an Access-Request; `done` runs once with the answer.
     fn authenticate(&self, req: AuthRequest, done: AuthDone);
 
+    /// [`AaaBackend::authenticate`] that the caller may call off: when
+    /// `cancel` turns true (the session ended, the CPE gave up) the request
+    /// leaves the queue and stops being retransmitted, and `done` gets an
+    /// error. A wave of reconnects then does not spend the server on logins
+    /// nobody waits for (G4.3g).
+    fn authenticate_until(&self, req: AuthRequest, done: AuthDone, cancel: Arc<std::sync::atomic::AtomicBool>) {
+        let _ = cancel;
+        self.authenticate(req, done);
+    }
+
     /// Queue an Accounting-Request (retried until a server confirms it,
     /// RFC 5080 §2.2.1). A Start with `source` schedules the session's
     /// Interim-Updates (interval from the request or `ppp.aaa`, spread by

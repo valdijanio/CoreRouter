@@ -873,3 +873,182 @@ fn workers_split_one_port_without_collisions() {
     let frames: usize = bngs.iter().map(|b| b.frames.len()).sum();
     assert!(frames >= 1, "the owner sent the Terminate-Request");
 }
+
+/// A RADIUS server of fixed capacity on the lab's clock (G4.3g): one FIFO
+/// for authentication and accounting, `cap` requests a second, at most
+/// two seconds of work queued (the rest is lost), and the client gives up
+/// on a login after 8 s (`Retry::ACCESS` MRD) while the server may still
+/// work on it. The shape of a MK-Auth/IXC in a mass reconnect.
+struct SlowAaa {
+    cap: f64,
+    st: Mutex<SlowState>,
+}
+
+#[derive(Default)]
+struct SlowState {
+    queue: std::collections::VecDeque<(Option<AuthDone>, u64)>,
+    lost: Vec<(AuthDone, u64)>,
+    tokens: f64,
+    at: u64,
+    now: u64,
+    timeouts: u64,
+    served: u64,
+}
+
+const GIVE_UP_MS: u64 = 8000;
+
+impl SlowAaa {
+    fn new(cap: f64) -> Self {
+        Self { cap, st: Mutex::new(SlowState::default()) }
+    }
+
+    fn push(&self, done: Option<AuthDone>) {
+        let mut st = self.st.lock().unwrap();
+        let now = st.now;
+        if st.queue.len() as f64 >= 2.0 * self.cap {
+            if let Some(d) = done {
+                st.lost.push((d, now));
+            }
+            return;
+        }
+        st.queue.push_back((done, now));
+    }
+
+    /// Advance the server to `now`, answering what it can.
+    fn pump(&self, now: u64) {
+        let mut answers: Vec<(AuthDone, AuthReply)> = Vec::new();
+        {
+            let mut st = self.st.lock().unwrap();
+            let dt = now.saturating_sub(st.at) as f64 / 1000.0;
+            st.at = now;
+            st.now = now;
+            st.tokens = (st.tokens + dt * self.cap).min(self.cap / 10.0);
+            // The client gives up on what waited too long (queued or lost).
+            for (d, enq) in st.queue.iter_mut() {
+                if now.saturating_sub(*enq) >= GIVE_UP_MS
+                    && let Some(done) = d.take()
+                {
+                    answers.push((done, AuthReply::failed(AuthOutcome::Timeout, "no answer")));
+                }
+            }
+            let lost = std::mem::take(&mut st.lost);
+            for (d, enq) in lost {
+                if now.saturating_sub(enq) >= GIVE_UP_MS {
+                    answers.push((d, AuthReply::failed(AuthOutcome::Timeout, "no answer")));
+                } else {
+                    st.lost.push((d, enq));
+                }
+            }
+            st.timeouts += answers.len() as u64;
+            while st.tokens >= 1.0 {
+                let Some((d, _)) = st.queue.pop_front() else { break };
+                st.tokens -= 1.0;
+                st.served += 1;
+                if let Some(d) = d {
+                    let mut r = AuthReply::failed(AuthOutcome::Accept, "");
+                    r.message = None;
+                    answers.push((d, r));
+                }
+            }
+        }
+        for (d, r) in answers {
+            d(r);
+        }
+    }
+}
+
+impl AaaBackend for SlowAaa {
+    fn authenticate(&self, _: AuthRequest, done: AuthDone) {
+        self.push(Some(done));
+    }
+
+    fn account(&self, _: AcctRequest, _: Option<Arc<dyn AcctSource>>) -> Result<(), String> {
+        self.push(None);
+        Ok(())
+    }
+
+    fn register_owner(&self, _: Arc<dyn SessionOwner>) {}
+
+    fn status(&self) -> RadiusStatus {
+        RadiusStatus::default()
+    }
+}
+
+/// `n` CPEs at once against a `cap`/s RADIUS with `rate` (a number or
+/// "auto"): seconds until all are up (None: not in `limit_s`) and the
+/// logins the client gave up on.
+fn wave(n: usize, cap: f64, rate: serde_json::Value, limit_s: u64) -> (Option<f64>, u64) {
+    let aaa = Arc::new(SlowAaa::new(cap));
+    let mut srv = server(serde_json::json!({}));
+    match rate.as_str() {
+        Some("auto") => srv.new_session_rate_auto = true,
+        _ => srv.new_session_rate = rate.as_u64().unwrap_or(0) as u32,
+    }
+    let mut s = snap(0, srv, 65_000);
+    s.ppp.aaa.use_radius = true;
+    s.aaa = Some(aaa.clone());
+    let mut lab = Lab::new(n, s, |i| (format!("r{i}"), "x".into()));
+    let fresh = |lab: &Lab, c: usize, k: u64| {
+        let mut cfg = lab.clients[c].config().clone();
+        cfg.discovery_attempts = u8::MAX;
+        // CHAP, as BNG Blaster (an Accept with no MS-CHAP2-Success cannot
+        // finish an MS-CHAPv2 login).
+        cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::ChapMd5]);
+        let mut seed = [8u8; 32];
+        seed[..8].copy_from_slice(&(c as u64).to_le_bytes());
+        seed[8..16].copy_from_slice(&k.to_le_bytes());
+        Client::new(cfg, seed)
+    };
+    for c in 0..n {
+        lab.clients[c] = fresh(&lab, c, 0);
+    }
+    // A power cut: the CPEs boot within 5 s of each other; one whose login
+    // failed tries again 1–3 s later, as a real one (and BNG Blaster) does.
+    let hash = |c: usize, k: u64| (c as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15).wrapping_add(k.wrapping_mul(0xbf58_476d_1ce4_e5b9)) >> 33;
+    let mut next: Vec<Option<u64>> = (0..n).map(|c| Some(hash(c, 0) % 5000)).collect();
+    let mut tries = vec![0u64; n];
+    let t0 = lab.now;
+    while lab.now - t0 < limit_s * 1000 {
+        let now = lab.now;
+        let mut out = ClientOutput::new();
+        for c in 0..n {
+            if next[c].is_some_and(|t| t0 + t <= now) {
+                next[c] = None;
+                tries[c] += 1;
+                lab.clients[c] = fresh(&lab, c, tries[c]);
+                lab.clients[c].start(now, &mut out);
+                lab.feed(&mut out);
+            } else if next[c].is_none() && matches!(lab.clients[c].phase(), ClientPhase::Closed(_)) {
+                next[c] = Some(now - t0 + 1000 + hash(c, tries[c]) % 2000);
+            }
+        }
+        lab.run(1, 50);
+        aaa.pump(lab.now);
+        if lab.ups() == n {
+            let st = aaa.st.lock().unwrap();
+            return (Some((lab.now - t0) as f64 / 1000.0), st.timeouts);
+        }
+    }
+    let st = aaa.st.lock().unwrap();
+    eprintln!("wave {rate}: {} of {n} up; stats {:?}", lab.ups(), lab.backend().stats());
+    (None, st.timeouts)
+}
+
+#[test]
+fn mass_reconnect_against_a_slow_radius() {
+    // 6000 CPEs after a power cut, a 300/s RADIUS (authentication and
+    // accounting share it: at most 150 logins a second, ~40 s for all).
+    let (n, cap) = (6000, 300.0);
+    let ideal = n as f64 / (cap / 2.0);
+    let off = wave(n, cap, serde_json::json!(0), 300);
+    let over = wave(n, cap, serde_json::json!(200), 300);
+    let fixed = wave(n, cap, serde_json::json!(100), 300);
+    let auto = wave(n, cap, serde_json::json!("auto"), 300);
+    eprintln!(
+        "wave of {n} against {cap}/s (ideal {ideal:.0} s): off {off:?}, fixed 200 {over:?}, fixed 100 {fixed:?}, auto {auto:?}"
+    );
+    let (t, timeouts) = (auto.0.expect("auto brings every CPE back"), auto.1);
+    assert!(t <= ideal * 1.35, "auto close to the server's capacity: {t} s for an ideal {ideal} s");
+    assert!(timeouts * 20 < off.1.max(1), "auto spares the server: {timeouts} timeouts against {} with no limit", off.1);
+    assert!(fixed.0.is_some_and(|f| f > t), "a fixed limit under the capacity is slower: {fixed:?}");
+}
