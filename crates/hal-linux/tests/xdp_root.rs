@@ -1677,6 +1677,35 @@ fn perf_pppoe_forward() {
 /// G4.3d: what the BNG service does to the maps, through the HAL's terms
 /// (`hal::pppoe`): `pppoe_ready` refuses a port without XDP, an `Upsert`
 /// makes the session known (upstream decapsulated to the kernel, counted),
+/// An IPv6 UDP packet (checksum over the pseudo-header, RFC 8200 §8.1).
+fn udp6_frame(src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr) -> Vec<u8> {
+    let mut udp = vec![0x13, 0x88, 0, 7, 0, 18, 0, 0];
+    udp.extend_from_slice(b"corerouter");
+    let mut sum: u32 = 0;
+    let mut add = |b: &[u8]| {
+        for c in b.chunks(2) {
+            sum += u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]));
+        }
+    };
+    add(&src.octets());
+    add(&dst.octets());
+    add(&(udp.len() as u32).to_be_bytes());
+    add(&[0, 0, 0, 17]);
+    add(&udp);
+    while sum > 0xffff {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    let c = !(sum as u16);
+    udp[6..8].copy_from_slice(&c.to_be_bytes());
+    let mut ip = vec![0x60, 0, 0, 0];
+    ip.extend_from_slice(&(udp.len() as u16).to_be_bytes());
+    ip.extend_from_slice(&[17, 64]);
+    ip.extend_from_slice(&src.octets());
+    ip.extend_from_slice(&dst.octets());
+    ip.extend_from_slice(&udp);
+    ip
+}
+
 /// a rate in RouterOS terms reaches the policer, a `Remove` makes the next
 /// frame unknown.
 #[test]
@@ -1708,6 +1737,9 @@ fn pppoe_bng_ops_reach_the_maps() {
         },
         fast_up: false,
         fast_down: true,
+        // G4.3e: the /64 of the link and a /56 delegated by DHCPv6.
+        ipv6_prefix: Some([0x20, 0x01, 0x0d, 0xb8, 0, 0x51, 0, 0]),
+        delegated: Some(([0x20, 0x01, 0x0d, 0xb8, 0x80, 0x51, 0, 0], 56)),
         ..PppoeSession::default()
     };
     x.pppoe_apply(&[PppoeOp::Upsert(7, s)]).unwrap();
@@ -1721,6 +1753,20 @@ fn pppoe_bng_ops_reach_the_maps() {
     let c = x.pppoe_counters_of(&[7]);
     assert_eq!(c.len(), 1);
     assert!(c[0].1.up_packets >= 1 && c[0].1.to_kernel >= 1, "{c:?}");
+    // IPv6 from the /64 and from inside the delegated /56 is the
+    // subscriber's; from elsewhere it is spoofed (dropped, counted).
+    for (src, want) in [
+        ("2001:db8:0:51::1234", XDP_PASS),
+        ("2001:db8:8000:5177::1", XDP_PASS),
+        ("2001:db8:0:52::1", XDP_DROP),
+    ] {
+        let ip = udp6_frame(src.parse().unwrap(), "2001:db8:ffff::1".parse().unwrap());
+        let f = pppoe_frame(&words, &ip, PPP_IPV6);
+        let (act, _, _) = x.test_run_out(&f, 1, Some(ifindex("la"))).unwrap();
+        assert_eq!(act, want, "from {src}");
+    }
+    let c = x.pppoe_counters_of(&[7]);
+    assert!(c[0].1.spoofed >= 1 && c[0].1.up_packets >= 3, "{c:?}");
     x.pppoe_apply(&[PppoeOp::Remove(7)]).unwrap();
     let (act, _, _) = x.test_run_out(&f, 1, Some(ifindex("la"))).unwrap();
     assert_eq!(act, XDP_DROP, "unknown session after the removal");

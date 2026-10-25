@@ -84,6 +84,8 @@ struct Lab {
     now: u64,
     up: Vec<bool>,
     downs: Vec<usize>,
+    /// IPv6 packets (PPP protocol 0x0057) each client received (G4.3e).
+    v6: Vec<Vec<Vec<u8>>>,
 }
 
 impl Lab {
@@ -113,7 +115,8 @@ impl Lab {
         }
         let up = vec![false; n];
         let downs = vec![0; n];
-        Self { bng, clients, by_mac, now: 0, up, downs }
+        let v6 = vec![Vec::new(); n];
+        Self { bng, clients, by_mac, now: 0, up, downs, v6 }
     }
 
     fn start(&mut self, range: std::ops::Range<usize>) {
@@ -151,6 +154,10 @@ impl Lab {
                         self.by_mac.get(&dst).copied().into_iter().collect()
                     };
                     for c in targets {
+                        if f.len() > 22 && f[12..14] == [0x88, 0x64] && f[20..22] == [0x00, 0x57] {
+                            self.v6[c].push(f[22..].to_vec());
+                            continue;
+                        }
                         self.clients[c].handle_frame(self.now, &f, &mut out);
                         self.events(c, &mut out);
                         self.feed(&mut out);
@@ -194,7 +201,7 @@ impl Lab {
 }
 
 fn snap(users: usize, srv: PppoeServer, pool: u32) -> Snapshot {
-    Snapshot { ppp: ppp(users, srv), pools: pools(pool), aaa: None, unix_base: 1_700_000_000 }
+    Snapshot { ppp: ppp(users, srv), pools: pools(pool), aaa: None, unix_base: 1_700_000_000, ..Snapshot::default() }
 }
 
 fn mass(n: usize) {
@@ -287,7 +294,11 @@ fn wrong_password_is_explained_by_why() {
 fn pool_exhaustion_fails_at_ncp() {
     let mut lab = Lab::new(5, snap(5, server(serde_json::json!({})), 3), |i| (format!("u{i}"), format!("p{i}")));
     lab.start(0..5);
-    lab.run(400, 50);
+    // Without an IPv4 address the session still waits for IPv6CP (an
+    // IPv6-only subscriber is fine, G4.3e); this CPE never answers it, so
+    // the session fails when IPv6CP gives up (RFC 1661 §4.6 Max-Configure,
+    // 10 × 3 s).
+    lab.run(800, 50);
     assert_eq!(lab.ups(), 3, "three addresses, three subscribers");
     let failed: Vec<_> = lab.backend().history().into_iter().filter(|h| h.event == "failed").collect();
     assert!(!failed.is_empty());
@@ -529,4 +540,255 @@ fn a_session_that_fails_before_login_is_explained_by_its_mac() {
     assert_eq!(last.stage, Some(Stage::Lcp), "{last:?}");
     assert_eq!(last.reason, "auth-protocol");
     assert!(last.hint.contains("métodos de autenticação"), "{last:?}");
+}
+
+// ---- G4.3e: dual stack ------------------------------------------------------
+
+fn pools6() -> Vec<corerouter_model::dhcp6_server::Ipv6Pool> {
+    let p = |name: &str, prefix: &str, len: u8| corerouter_model::dhcp6_server::Ipv6Pool {
+        id: ItemId(1),
+        name: name.into(),
+        prefix: prefix.parse().unwrap(),
+        prefix_length: len,
+        comment: String::new(),
+    };
+    vec![p("wan6", "2001:db8:100::/48", 64), p("pd6", "2001:db8:8000::/40", 56)]
+}
+
+fn dual(n: usize) -> Snapshot {
+    let mut s = snap(n, server(serde_json::json!({})), 65_000);
+    s.pools6 = pools6();
+    s.iid_key = Some([0x43; 32]);
+    let pr = &mut s.ppp.profiles[0];
+    pr.remote_ipv6_prefix_pool = Some("wan6".into());
+    pr.dhcpv6_pd_pool = Some("pd6".into());
+    pr.dns_server_ipv6 = vec!["2001:db8::53".parse().unwrap()];
+    s
+}
+
+fn v6_clients(lab: &mut Lab) {
+    for i in 0..lab.clients.len() {
+        let mut cfg = lab.clients[i].config().clone();
+        cfg.ipv6 = true;
+        let mut seed = [4u8; 32];
+        seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
+        lab.clients[i] = Client::new(cfg, seed);
+    }
+}
+
+/// A PPPoE session frame with an IPv6 packet from client `c`.
+fn v6_frame(lab: &Lab, c: usize, packet: &[u8]) -> Vec<u8> {
+    let cl = &lab.clients[c];
+    let mut f = Vec::new();
+    f.extend_from_slice(&BNG_MAC);
+    f.extend_from_slice(&cl.config().mac.0);
+    f.extend_from_slice(&[0x88, 0x64, 0x11, 0x00]);
+    f.extend_from_slice(&cl.session_id().to_be_bytes());
+    f.extend_from_slice(&((packet.len() + 2) as u16).to_be_bytes());
+    f.extend_from_slice(&[0x00, 0x57]);
+    f.extend_from_slice(packet);
+    f
+}
+
+fn solicit(c: usize) -> Vec<u8> {
+    use corerouter_proto_dhcp::v6::{IaReq, Outgoing, msg};
+    let duid = [0, 3, 0, 1, 2, 0x10, (c >> 16) as u8, (c >> 8) as u8, c as u8, 1];
+    Outgoing {
+        kind: msg::SOLICIT,
+        xid: c as u32 & 0xff_ffff,
+        client_id: &duid,
+        server_id: None,
+        elapsed_cs: 0,
+        rapid_commit: true,
+        ia_na: Some(IaReq { iaid: 1, ..IaReq::default() }),
+        ia_pd: Some(IaReq { iaid: 2, ..IaReq::default() }),
+        oro: &[23],
+    }
+    .encode()
+}
+
+#[test]
+fn dual_stack_sessions_get_a_64_a_delegated_prefix_and_dns() {
+    use corerouter_proto_pppoe::nd;
+    let n = 1000;
+    let mut lab = Lab::new(n, dual(n), |i| (format!("u{i}"), format!("p{i}")));
+    lab.bng.xdp = true;
+    v6_clients(&mut lab);
+    lab.start(0..n);
+    lab.run(400, 50);
+    assert_eq!(lab.ups(), n);
+    lab.bng.check().unwrap();
+    let active = lab.backend().active();
+    let by_name: HashMap<String, _> = active.iter().map(|a| (a.name.clone(), a.clone())).collect();
+    let p64: std::collections::HashSet<_> = active.iter().filter_map(|a| a.ipv6_prefix).collect();
+    let pds: std::collections::HashSet<_> = active.iter().filter_map(|a| a.delegated_prefix).collect();
+    assert_eq!((p64.len(), pds.len()), (n, n), "one /64 and one /56 each");
+    assert!(pds.iter().all(|p| p.prefix_len() == 56));
+    // XDP knows both prefixes of every session.
+    let mut v6_slots = 0;
+    for e in &lab.bng.effects {
+        if let Effect::Xdp(PppoeOp::Upsert(_, s)) = e
+            && s.ipv6_prefix.is_some()
+            && s.delegated.is_some_and(|d| d.1 == 56)
+        {
+            v6_slots += 1;
+        }
+    }
+    assert!(v6_slots >= n, "{v6_slots}");
+    // Each client got an RA (RFC 4861 §6.2.4: at once) with its /64 and the RDNSS.
+    for c in 0..n {
+        let a = &by_name[&format!("u{c}")];
+        let ra = lab.v6[c].iter().find_map(|p| nd::parse_ra(p).ok()).expect("an RA");
+        let (_, peer) = lab.clients[c].ipv6_iids().unwrap();
+        assert_eq!(ra.src, nd::link_local(peer), "from the BNG's IPv6CP identifier");
+        assert_eq!(ra.prefixes[0].prefix, a.ipv6_prefix.unwrap().network());
+        assert!(ra.prefixes[0].autonomous && ra.prefixes[0].on_link);
+        assert_eq!(ra.rdnss, vec!["2001:db8::53".parse::<std::net::Ipv6Addr>().unwrap()]);
+        assert!(ra.other, "O: DHCPv6 has a prefix");
+        assert_eq!(a.link_local, Some(nd::link_local(lab.clients[c].ipv6_iids().unwrap().0)));
+    }
+    // DHCPv6-PD: a Solicit with Rapid Commit binds the session's /56.
+    for v in lab.v6.iter_mut() {
+        v.clear();
+    }
+    for c in 0..n {
+        let (ours, _) = lab.clients[c].ipv6_iids().unwrap();
+        let mut p = Vec::new();
+        nd::udp6(&mut p, nd::link_local(ours), nd::ALL_DHCP, 546, 547, &solicit(c));
+        let f = v6_frame(&lab, c, &p);
+        lab.bng.frame(lab.now, IFINDEX, &f);
+    }
+    lab.run(2, 50);
+    for c in 0..n {
+        let a = lab.backend().active().into_iter().find(|a| a.name == format!("u{c}")).unwrap();
+        assert!(a.delegated_bound);
+        let reply = lab.v6[c].iter().find_map(|p| {
+            let h = nd::parse_ipv6(p).ok()?;
+            corerouter_proto_dhcp::v6::decode(h.payload.get(8..)?).ok()
+        });
+        let r = reply.expect("a DHCPv6 Reply");
+        assert!(r.rapid_commit);
+        assert_eq!(r.ia_pd[0].prefixes[0].prefix, a.delegated_prefix.unwrap());
+        // IA_NA: the /64 + the subscriber's identifier (what SLAAC gives).
+        let (ours, _) = lab.clients[c].ipv6_iids().unwrap();
+        assert_eq!(r.ia_na[0].addrs[0].addr, nd::with_iid(a.ipv6_prefix.unwrap().network(), ours));
+    }
+    let st = lab.backend().stats();
+    assert_eq!((st.ipv6_sessions, st.delegated), (n as u64, n as u64));
+    // An RS gets a unicast RA, but only one in 3 s.
+    lab.v6[0].clear();
+    let (ours, _) = lab.clients[0].ipv6_iids().unwrap();
+    let mut rs = Vec::new();
+    nd::router_solicit(&mut rs, nd::link_local(ours));
+    let f = v6_frame(&lab, 0, &rs);
+    lab.now += 5000;
+    lab.bng.frame(lab.now, IFINDEX, &f);
+    lab.bng.frame(lab.now, IFINDEX, &f);
+    lab.run(1, 10);
+    let ras: Vec<_> = lab.v6[0].iter().filter_map(|p| nd::parse_ra(p).ok()).collect();
+    assert_eq!(ras.len(), 1);
+    assert_eq!(lab.backend().stats().ipv6_dropped, 1);
+    // Everyone leaves: every prefix goes back.
+    let ids: Vec<String> = lab.backend().active().into_iter().map(|a| a.id).collect();
+    lab.backend().terminate(&ids);
+    lab.bng.requests(lab.now);
+    lab.run(100, 50);
+    assert!(lab.backend().active().is_empty());
+    lab.bng.check().unwrap();
+}
+
+#[test]
+fn periodic_ras_are_spread_between_min_and_max() {
+    use corerouter_proto_pppoe::nd;
+    let n = 200;
+    let mut lab = Lab::new(n, dual(n), |i| (format!("u{i}"), format!("p{i}")));
+    v6_clients(&mut lab);
+    lab.start(0..n);
+    lab.run(200, 50);
+    assert_eq!(lab.ups(), n);
+    for v in lab.v6.iter_mut() {
+        v.clear();
+    }
+    // 20 minutes later every session has had its 3 initial RAs (≤ 16 s
+    // apart, RFC 4861 §6.2.4) and one or two more (200–600 s).
+    lab.run(1200, 1000);
+    for c in 0..n {
+        let ras = lab.v6[c].iter().filter(|p| nd::parse_ra(p).is_ok()).count();
+        assert!((3..=8).contains(&ras), "client {c}: {ras} RAs");
+    }
+}
+
+#[test]
+fn use_ipv6_no_leaves_the_session_on_ipv4() {
+    let n = 5;
+    let mut s = dual(n);
+    s.ppp.profiles[0].use_ipv6 = corerouter_model::ppp::UseIpv6::No;
+    let mut lab = Lab::new(n, s, |i| (format!("u{i}"), format!("p{i}")));
+    v6_clients(&mut lab);
+    lab.start(0..n);
+    lab.run(200, 50);
+    assert_eq!(lab.ups(), n);
+    for a in lab.backend().active() {
+        assert!(a.address.is_some() && a.link_local.is_none() && a.ipv6_prefix.is_none(), "{a:?}");
+    }
+    assert!(lab.v6.iter().all(Vec::is_empty));
+    lab.bng.check().unwrap();
+}
+
+/// RADIUS gives the prefixes (RFC 3162/4818): they win over the profile,
+/// and the accounting names them from the Start (RouterOS does not).
+#[test]
+fn radius_prefixes_win_and_reach_the_accounting() {
+    struct V6Aaa(FakeAaa);
+    impl AaaBackend for V6Aaa {
+        fn authenticate(&self, req: AuthRequest, done: AuthDone) {
+            let mut reply = AuthReply::failed(AuthOutcome::Accept, "");
+            reply.message = None;
+            reply.attributes = vec![
+                Attribute::new("Framed-IPv6-Prefix", "2001:db8:aaaa:1::/64"),
+                Attribute::new("Delegated-IPv6-Prefix", "2001:db8:bbbb::/48"),
+                Attribute::new("DNS-Server-IPv6-Address", "2001:db8::99"),
+            ];
+            let _ = req;
+            done(reply);
+        }
+        fn account(&self, req: AcctRequest, s: Option<Arc<dyn AcctSource>>) -> Result<(), String> {
+            self.0.account(req, s)
+        }
+        fn register_owner(&self, _: Arc<dyn SessionOwner>) {}
+        fn status(&self) -> RadiusStatus {
+            RadiusStatus::default()
+        }
+    }
+    let aaa = Arc::new(V6Aaa(FakeAaa::default()));
+    let mut s = dual(0);
+    s.ppp.aaa.use_radius = true;
+    s.aaa = Some(aaa.clone());
+    let mut lab = Lab::new(2, s, |i| (format!("r{i}"), "x".into()));
+    v6_clients(&mut lab);
+    for i in 0..2 {
+        let mut cfg = lab.clients[i].config().clone();
+        cfg.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
+        lab.clients[i] = Client::new(cfg, [9 + i as u8; 32]);
+    }
+    lab.start(0..2);
+    lab.run(200, 50);
+    assert_eq!(lab.ups(), 2);
+    let active = lab.backend().active();
+    // The same fixed prefixes for two sessions: the second one cannot have
+    // them (one owner per prefix) and says so in the log.
+    let with: Vec<_> = active.iter().filter(|a| a.ipv6_prefix == Some("2001:db8:aaaa:1::/64".parse().unwrap())).collect();
+    assert_eq!(with.len(), 1);
+    assert_eq!(with[0].delegated_prefix, Some("2001:db8:bbbb::/48".parse().unwrap()));
+    let logs: Vec<String> = lab.bng.effects.iter().filter_map(|e| match e {
+        Effect::Log { error: true, text } => Some(text.clone()),
+        _ => None,
+    }).collect();
+    assert!(logs.iter().any(|t| t.contains("já está em uso")), "{logs:?}");
+    let ra = lab.v6.iter().flatten().find_map(|p| corerouter_proto_pppoe::nd::parse_ra(p).ok()).unwrap();
+    assert!(ra.rdnss.contains(&"2001:db8::99".parse().unwrap()));
+    let accts = aaa.0.accts.lock().unwrap();
+    let start = accts.iter().find(|r| r.status == AcctStatus::Start && r.attributes.iter().any(|a| a.value == "2001:db8:aaaa:1::/64")).expect("a Start with the /64");
+    assert!(start.attributes.iter().any(|a| a.name == "Delegated-IPv6-Prefix" && a.value == "2001:db8:bbbb::/48"));
+    assert!(start.attributes.iter().any(|a| a.name == "Framed-Interface-Id"));
 }

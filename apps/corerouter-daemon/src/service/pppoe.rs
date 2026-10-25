@@ -21,7 +21,31 @@ pub(crate) const SERVICE: super::Service = super::Service {
 
 fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let session = ctx.session.clone();
-    Ok(Box::new(move |health: &super::Health| run(&session, health)))
+    let key = ctx.config_dir.as_deref().and_then(iid_key);
+    Ok(Box::new(move |health: &super::Health| run(&session, health, key)))
+}
+
+/// G4.3e: the RFC 8064 secret of the IPv6CP identifiers, in
+/// `<config-dir>/pppoe-ipv6cp.key` (32 bytes, only this user reads it), so
+/// a subscriber line keeps its link-local across restarts. Made on first
+/// use; `None` (unreadable, no randomness) = one per run.
+fn iid_key(dir: &std::path::Path) -> Option<[u8; 32]> {
+    let path = dir.join("pppoe-ipv6cp.key");
+    if let Ok(b) = std::fs::read(&path) {
+        return <[u8; 32]>::try_from(b.as_slice()).ok();
+    }
+    let mut k = [0u8; 32];
+    getrandom::fill(&mut k).ok()?;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        o.mode(0o600);
+    }
+    let mut f = o.open(&path).ok()?;
+    std::io::Write::write_all(&mut f, &k).ok()?;
+    Some(k)
 }
 
 #[cfg(target_os = "linux")]
@@ -29,8 +53,12 @@ use linux::run;
 
 /// Without Linux there are no access ports (`AF_PACKET`): the row says why.
 #[cfg(not(target_os = "linux"))]
-fn run(session: &corerouter_engine::Shared, health: &super::Health) -> Result<(), String> {
-    let _ = session;
+fn run(
+    session: &corerouter_engine::Shared,
+    health: &super::Health,
+    key: Option<[u8; 32]>,
+) -> Result<(), String> {
+    let _ = (session, key);
     health.disabled(Some("PPPoE needs Linux (AF_PACKET access ports)"));
     while health.sleep(std::time::Duration::from_secs(1)) {
         health.beat();
@@ -111,7 +139,11 @@ mod linux {
         errors: Vec<String>,
     }
 
-    pub(super) fn run(session: &Shared, health: &super::super::Health) -> Result<(), String> {
+    pub(super) fn run(
+        session: &Shared,
+        health: &super::super::Health,
+        iid_key: Option<[u8; 32]>,
+    ) -> Result<(), String> {
         let base = origin();
         let ms = move || u64::try_from(base.elapsed().as_millis()).unwrap_or(u64::MAX);
         let unix_base = unix_now().saturating_sub(ms() / 1000);
@@ -135,10 +167,15 @@ mod linux {
             let now = ms();
             if last_second.is_none_or(|t| t.elapsed() >= SECOND) {
                 last_second = Some(Instant::now());
-                let (ppp, pools, aaa) = {
+                let (ppp, pools, pools6, aaa) = {
                     let s = lock(session);
                     let c = s.store().running();
-                    (c.ppp.clone(), c.ip.pools.clone(), s.aaa_backend())
+                    (
+                        c.ppp.clone(),
+                        c.ip.pools.clone(),
+                        c.ipv6.dhcp_server.pools.clone(),
+                        s.aaa_backend(),
+                    )
                 };
                 // CoA/Disconnect: one registration per RADIUS service.
                 if let Some(a) = &aaa {
@@ -161,7 +198,18 @@ mod linux {
                     ifaces.sort();
                     d.choose_plane(session, ifaces);
                 }
-                d.bng.configure(now, Snapshot { ppp, pools, aaa, unix_base }, &infos);
+                d.bng.configure(
+                    now,
+                    Snapshot {
+                        ppp,
+                        pools,
+                        aaa,
+                        unix_base,
+                        pools6,
+                        iid_key,
+                    },
+                    &infos,
+                );
                 let counters = if d.plane == Some(true) {
                     lock(session).pppoe_counters(&d.bng.xdp_slots())
                 } else {

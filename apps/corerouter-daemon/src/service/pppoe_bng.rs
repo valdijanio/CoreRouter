@@ -38,12 +38,14 @@ use corerouter_proto_pppoe::layers::AuthSet;
 use corerouter_proto_pppoe::lcp::AuthProto;
 use corerouter_proto_pppoe::ppp::{self as wire_ppp, proto};
 use corerouter_proto_pppoe::server::{
-    AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Server,
+    AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Ipv6Mode, Server,
     ServerConfig, ServerOutput, SessionRef, VlanFilter,
 };
 use corerouter_proto_pppoe::timer::Millis;
 use corerouter_proto_pppoe::wire::Mac;
 use corerouter_proto_radius::rate_limit::RateLimit;
+
+use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
 
 /// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
 /// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
@@ -235,6 +237,12 @@ impl PppBackend for Backend {
         let sh = guard(&self.0);
         let mut st = sh.stats.clone();
         st.sessions = sh.active.len() as u64;
+        st.ipv6_sessions = sh
+            .active
+            .values()
+            .filter(|a| a.link_local.is_some())
+            .count() as u64;
+        st.delegated = sh.active.values().filter(|a| a.delegated_bound).count() as u64;
         st
     }
 
@@ -519,6 +527,10 @@ struct Sub {
     circuit_id: Option<String>,
     remote_id: Option<String>,
     mtu: u16,
+    /// G4.3e: what RADIUS said about IPv6, and the session's IPv6 once
+    /// IPv6CP is up.
+    radius6: RadiusV6,
+    v6: Option<Box<V6>>,
 }
 
 /// An answer for the server, queued while its events are handled.
@@ -526,6 +538,7 @@ enum Reply {
     Auth(AuthVerdict),
     Address(Option<Ipv4Assignment>),
     Terminate,
+    Ipv6(Ipv6Mode),
 }
 
 /// A RADIUS answer on its way back to the BNG thread.
@@ -545,6 +558,12 @@ pub(crate) struct Snapshot {
     pub aaa: Option<Arc<dyn AaaBackend>>,
     /// Unix time of `now` = 0 (the history's clock).
     pub unix_base: u64,
+    /// G4.3e: `/ipv6 pool` (the profiles' IPv6 pools).
+    pub pools6: Vec<corerouter_model::dhcp6_server::Ipv6Pool>,
+    /// RFC 8064 secret of the IPv6CP identifiers (kept on disk by the
+    /// driver, so a line keeps its link-local across restarts); `None`:
+    /// one drawn from the seed, for this run.
+    pub iid_key: Option<[u8; 32]>,
 }
 
 pub(crate) struct Bng {
@@ -571,6 +590,10 @@ pub(crate) struct Bng {
     pub xdp: bool,
     /// PADIs held back by `new_session_rate`.
     padr_throttled: u64,
+    /// G4.3e: the /64s and delegated prefixes the sessions hold.
+    pools6: Pools6,
+    /// IPv6 packets refused before reaching a session's control plane.
+    v6_dropped: u64,
 }
 
 /// One discovery or session frame's code and source, read before the
@@ -757,6 +780,8 @@ impl Bng {
             out: ServerOutput::new(),
             xdp: false,
             padr_throttled: 0,
+            pools6: Pools6::default(),
+            v6_dropped: 0,
         }
     }
 
@@ -818,7 +843,11 @@ impl Bng {
                 Some(AddrOrPool::Address(ip)) => Some(ip),
                 _ => None,
             };
-            let sc = server_config(&w, port.mac, local);
+            let mut sc = server_config(&w, port.mac, local);
+            // G4.3e: IPv6CP everywhere, each session as its profile says
+            // (`Reply::Ipv6` before the verdict); identifiers stable per line.
+            sc.ipv6 = true;
+            sc.ipv6_iid_key = Some(self.cfg.iid_key.unwrap_or(self.seed));
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
@@ -933,10 +962,16 @@ impl Bng {
             }
             let _ = sessions;
         } else if let Ok(f) = wire_ppp::parse_session(frame)
-            && matches!(f.protocol, proto::IPV4)
+            && matches!(f.protocol, proto::IPV4 | proto::IPV6)
         {
-            // Slow path upstream: the XDP would have taken it.
-            self.data_up(i, &f);
+            if f.protocol == proto::IPV6 {
+                // ND, DHCPv6 and Echo to our link-local (the XDP passes
+                // link-local and multicast up, `Stat::Ipv6Control`).
+                self.data6(now, i, &f);
+            } else {
+                // Slow path upstream: the XDP would have taken it.
+                self.data_up(i, &f);
+            }
             return;
         }
         self.run(now, i, |srv, out| {
@@ -972,6 +1007,212 @@ impl Bng {
             a.rx_packets += 1;
         }
         self.upstream.push(f.info.to_vec());
+    }
+
+    /// A pseudo-random 32-bit value (RA spread; no security role).
+    fn next_rand(&mut self) -> u32 {
+        self.seq = self.seq.wrapping_add(1);
+        let mut x = self.seq.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+            ^ u64::from_le_bytes(self.seed.first_chunk::<8>().copied().unwrap_or([7; 8]));
+        x ^= x >> 29;
+        x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        (x >> 32) as u32
+    }
+
+    /// G4.3e: IPv6CP opened on a session: take its /64 and delegated
+    /// prefix (RADIUS over the profile, RFC 3162/4818/6911), start its RA
+    /// and DHCPv6, and, if it was already up on IPv4, show and account
+    /// the change (Interim-Update with the prefixes).
+    fn start_v6(
+        &mut self,
+        now: Millis,
+        i: usize,
+        sref: SessionRef,
+        d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
+    ) {
+        let (Some(peer), Some(local)) = (d.ipv6_iid, d.local_iid) else {
+            return;
+        };
+        let Some(port) = self.slots.get(i).map(|s| s.port) else {
+            return;
+        };
+        let rand = self.next_rand();
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        if sub.v6.is_some() {
+            return;
+        }
+        let mut problems: Vec<String> = Vec::new();
+        let mut alloc = |fixed: Option<ipnet::Ipv6Net>, pool: Option<&str>, what: &str| {
+            if let Some(n) = fixed {
+                if self.pools6.hold(n) {
+                    return Some((n, Source::Radius));
+                }
+                problems.push(format!("{what} {n} do RADIUS já está em uso"));
+                return None;
+            }
+            let name = pool?;
+            match self.pools6.take(&self.cfg.pools6, name) {
+                Some(n) => Some((n, Source::Pool(name.to_owned()))),
+                None => {
+                    problems.push(format!("/ipv6 pool '{name}' sem {what} livre"));
+                    None
+                }
+            }
+        };
+        let r = &sub.radius6;
+        let e = &sub.effective;
+        let link = alloc(
+            r.framed_prefix,
+            r.framed_pool
+                .as_deref()
+                .or(e.remote_ipv6_prefix_pool.as_deref()),
+            "/64",
+        );
+        let delegated = alloc(
+            r.delegated,
+            r.delegated_pool.as_deref().or(e.dhcpv6_pd_pool.as_deref()),
+            "prefixo delegado",
+        );
+        let dns = if r.dns.is_empty() {
+            e.dns_server_ipv6.clone()
+        } else {
+            r.dns.clone()
+        };
+        let mut x = V6::new(
+            now,
+            local,
+            peer,
+            link,
+            delegated,
+            dns,
+            e.dhcpv6_lease_time,
+            d.mtu,
+            port.mac,
+        );
+        // RFC 4861 §6.2.4: the first RA right away (the link just came up).
+        if let Some(p) = x.due(now, rand) {
+            self.frames.push((
+                port.ifindex,
+                v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, sref.sid, &p),
+            ));
+        }
+        let user = sub.user.clone();
+        let text = format!(
+            "PPP: {user} com IPv6 (link-local {}{}{}{})",
+            x.peer(),
+            x.global()
+                .map(|a| format!(", endereço {a}"))
+                .unwrap_or_default(),
+            x.link
+                .as_ref()
+                .map(|(n, _)| format!(", /64 {n}"))
+                .unwrap_or_default(),
+            x.delegated
+                .as_ref()
+                .map(|(n, _)| format!(", PD {n}"))
+                .unwrap_or_default()
+        );
+        let was_up = sub.up_at.is_some();
+        let attrs = x.acct_attributes();
+        let acct = (sub.radius || self.cfg.ppp.aaa.use_radius) && self.cfg.ppp.aaa.accounting;
+        let acct_id = sub.acct_id.clone();
+        let interim = sub.interim;
+        sub.v6 = Some(Box::new(x));
+        let fields = sub.v6.as_deref().map(active_v6);
+        let id = session_id(i, &self.slots, sref.sid);
+        for p in problems {
+            self.log(true, format!("PPP: {user}: {p}"));
+        }
+        self.log(false, text);
+        if !was_up {
+            // `up` puts the row and the Accounting-Start with these.
+            return;
+        }
+        if let (Some(f), Some(a)) = (fields, guard(&self.shared).active.get_mut(&id)) {
+            f.apply(a);
+        }
+        if acct && let Some(aaa) = &self.cfg.aaa {
+            let req = AcctRequest {
+                service: AaaService::Ppp,
+                status: AcctStatus::InterimUpdate,
+                session_id: acct_id,
+                user: user.clone(),
+                counters: None,
+                terminate_cause: None,
+                interim_secs: interim,
+                attributes: attrs,
+            };
+            if let Err(e) = aaa.account(req, None) {
+                self.log(
+                    true,
+                    format!("PPP: Accounting-Interim (IPv6) de {user} não enviado: {e}"),
+                );
+            }
+        }
+    }
+
+    /// G4.3e: an IPv6 packet from a subscriber that reached the control
+    /// plane (link-local or multicast with XDP; everything without it):
+    /// RS, NS, Echo to our link-local and DHCPv6 are answered. Forwarded
+    /// IPv6 on the slow path is G4.3l.
+    fn data6(&mut self, now: Millis, i: usize, f: &wire_ppp::SessionFrame<'_>) {
+        let Some(port) = self.slots.get(i).map(|s| s.port) else {
+            return;
+        };
+        let rand = self.next_rand();
+        let id = session_id(i, &self.slots, f.session_id);
+        let Some(sub) = self.subs.get_mut(&(i, f.session_id)) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        let Some(x) = sub.v6.as_deref_mut().filter(|_| sub.mac == f.link.src) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        let before = x.dropped;
+        let Some(out) = x.handle(now, f.info, rand) else {
+            self.v6_dropped += 1;
+            return;
+        };
+        self.v6_dropped += x.dropped - before;
+        let changed = v6::pd_changed(&out.events);
+        let bound = x.pd_bound();
+        for p in &out.packets {
+            self.frames.push((
+                port.ifindex,
+                v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, f.session_id, p),
+            ));
+        }
+        let mut sh = guard(&self.shared);
+        sh.stats.ipv6_dropped = self.v6_dropped;
+        if changed && let Some(a) = sh.active.get_mut(&id) {
+            a.delegated_bound = bound;
+        }
+    }
+
+    /// G4.3e: the unsolicited RAs that are due (RFC 4861 §6.2.4), once a
+    /// second.
+    fn ra_tick(&mut self, now: Millis) {
+        let mut due: Vec<(u32, Vec<u8>)> = Vec::new();
+        let mut rand = self.next_rand();
+        for ((slot, sid), sub) in self.subs.iter_mut() {
+            let Some(x) = sub.v6.as_deref_mut() else {
+                continue;
+            };
+            let Some(port) = self.slots.get(*slot).map(|s| s.port) else {
+                continue;
+            };
+            rand = rand.rotate_left(7) ^ u32::from(*sid).wrapping_mul(0x9e37_79b9);
+            if let Some(p) = x.due(now, rand) {
+                due.push((
+                    port.ifindex,
+                    v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, *sid, &p),
+                ));
+            }
+        }
+        self.frames.extend(due);
     }
 
     /// Downstream IPv4 to a subscriber (slow path): encapsulated for its
@@ -1042,6 +1283,9 @@ impl Bng {
                     Reply::Terminate => {
                         srv.terminate(now, sref, &mut out);
                     }
+                    Reply::Ipv6(m) => {
+                        srv.set_ipv6(now, sref, m, &mut out);
+                    }
                 }
             }
             self.absorb(now, j, &mut out);
@@ -1096,15 +1340,20 @@ impl Bng {
             Event::Up {
                 session,
                 descriptor,
-            } => self.up(now, i, session, &descriptor),
+            } => {
+                // IPv6 first, so the Accounting-Start names the prefixes.
+                self.start_v6(now, i, session, &descriptor);
+                self.up(now, i, session, &descriptor);
+            }
             Event::Changed {
                 session,
                 descriptor,
             } => {
+                self.start_v6(now, i, session, &descriptor);
                 if let Some(sub) = self.subs.get(&(i, session.sid))
                     && let Some(idx) = sub.xdp
                 {
-                    let s = xdp_session(&descriptor, sub.rate.as_deref());
+                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref());
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(idx, s)));
                 }
             }
@@ -1193,6 +1442,8 @@ impl Bng {
                     .as_ref()
                     .map(|c| String::from_utf8_lossy(c).into_owned()),
                 mtu: 1480,
+                radius6: RadiusV6::default(),
+                v6: None,
             },
         );
         guard(&self.shared).reach(&[&user, &mac_text(mac)], Stage::Auth);
@@ -1309,6 +1560,12 @@ impl Bng {
         sub.interim = interim;
         sub.session_timeout = timeout;
         guard(&self.shared).stats.auth_accept += 1;
+        let mode = match sub.effective.use_ipv6 {
+            corerouter_model::ppp::UseIpv6::No => Ipv6Mode::Off,
+            corerouter_model::ppp::UseIpv6::Require => Ipv6Mode::Require,
+            _ => Ipv6Mode::On,
+        };
+        self.replies.push_back((i, sref, Reply::Ipv6(mode)));
         let auth = Authorization {
             mschap2_success: mschap2,
             message: Box::default(),
@@ -1457,7 +1714,14 @@ impl Bng {
                     let interim = attr("Acct-Interim-Interval").and_then(|v| v.parse::<u32>().ok());
                     let mschap2 = attr("MS-CHAP2-Success").and_then(|v| success_string(&v));
                     let list = attr("Mikrotik-Address-List");
+                    let r6 = RadiusV6::of(
+                        done.reply
+                            .attributes
+                            .iter()
+                            .map(|a| (a.name.as_str(), a.value.as_str())),
+                    );
                     if let Some(sub) = self.subs.get_mut(&key) {
+                        sub.radius6 = r6;
                         sub.effective = e;
                         if list.is_some() {
                             sub.effective.address_list = list;
@@ -1514,7 +1778,7 @@ impl Bng {
         match xdp {
             Some(idx) => self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                 idx,
-                xdp_session(d, sub.rate.as_deref()),
+                xdp_session(d, sub.rate.as_deref(), sub.v6.as_deref()),
             ))),
             None => {
                 if let Some(ip) = ip {
@@ -1552,6 +1816,15 @@ impl Bng {
             limit_bytes_out: (sub.limit_out > 0).then_some(sub.limit_out),
             ..ActiveSession::default()
         };
+        let mut a = a;
+        if let Some(f) = sub.v6.as_deref().map(active_v6) {
+            f.apply(&mut a);
+        }
+        let v6_attrs = sub
+            .v6
+            .as_deref()
+            .map(V6::acct_attributes)
+            .unwrap_or_default();
         let radius_acct = sub.radius || self.cfg.ppp.aaa.use_radius;
         let interim = sub.interim;
         let list = sub.effective.address_list.clone();
@@ -1591,7 +1864,11 @@ impl Bng {
                 counters: None,
                 terminate_cause: None,
                 interim_secs: interim,
-                attributes: acct_attributes(ip, &mac, &interface),
+                attributes: {
+                    let mut a = acct_attributes(ip, &mac, &interface);
+                    a.extend(v6_attrs);
+                    a
+                },
             };
             if let Err(e) = aaa.account(req, Some(src)) {
                 self.log(
@@ -1686,6 +1963,15 @@ impl Bng {
         if let Some(ip) = sub.ip {
             self.pools.give_back(ip);
         }
+        if let Some(x) = &sub.v6 {
+            for (n, src) in [&x.link, &x.delegated].into_iter().flatten() {
+                let pool = match src {
+                    Source::Pool(p) => Some(p.as_str()),
+                    Source::Radius => None,
+                };
+                self.pools6.give_back(*n, pool);
+            }
+        }
         let mac = mac_text(sub.mac);
         let server = self
             .slots
@@ -1720,7 +2006,13 @@ impl Bng {
                     counters: Some(counters),
                     terminate_cause: Some(cause),
                     interim_secs: None,
-                    attributes: acct_attributes(sub.ip, &mac, &interface),
+                    attributes: {
+                        let mut a = acct_attributes(sub.ip, &mac, &interface);
+                        if let Some(x) = &sub.v6 {
+                            a.extend(x.acct_attributes());
+                        }
+                        a
+                    },
                 };
                 if let Err(e) = aaa.account(req, None) {
                     self.log(
@@ -1847,6 +2139,7 @@ impl Bng {
     /// uptime, idle and byte limits, and what the commands and the RADIUS
     /// service asked for.
     pub(crate) fn tick(&mut self, now: Millis, xdp: &[(u32, PppoeCounters)]) {
+        self.ra_tick(now);
         let by_idx: HashMap<u32, PppoeCounters> = xdp.iter().copied().collect();
         // PADIs the servers' limiters held back count as throttled too.
         let limited: u64 = self
@@ -1985,7 +2278,7 @@ impl Bng {
                 if let Some(idx) = sub.xdp {
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                         idx,
-                        xdp_session(&d, Some(&rate)),
+                        xdp_session(&d, Some(&rate), sub.v6.as_deref()),
                     )));
                 }
                 let user = sub.user.clone();
@@ -2037,7 +2330,51 @@ impl Bng {
         if unique.len() != ips.len() {
             return Err("an address is held by two sessions".into());
         }
+        // G4.3e: every prefix taken is a live session's, once.
+        let v6: Vec<ipnet::Ipv6Net> = self
+            .subs
+            .values()
+            .filter_map(|s| s.v6.as_deref())
+            .flat_map(|x| [x.link.as_ref(), x.delegated.as_ref()])
+            .flatten()
+            .map(|p| p.0)
+            .collect();
+        let unique6: HashSet<_> = v6.iter().copied().collect();
+        if unique6.len() != v6.len() || v6.len() != self.pools6.taken() {
+            return Err(format!(
+                "IPv6 prefixes: {} held, {} distinct, {} taken",
+                v6.len(),
+                unique6.len(),
+                self.pools6.taken()
+            ));
+        }
         Ok(())
+    }
+}
+
+/// The IPv6 columns of a session's `ppp.active` row.
+struct ActiveV6 {
+    prefix: Option<ipnet::Ipv6Net>,
+    delegated: Option<ipnet::Ipv6Net>,
+    bound: bool,
+    link_local: std::net::Ipv6Addr,
+}
+
+impl ActiveV6 {
+    fn apply(self, a: &mut ActiveSession) {
+        a.ipv6_prefix = self.prefix;
+        a.delegated_prefix = self.delegated;
+        a.delegated_bound = self.bound;
+        a.link_local = Some(self.link_local);
+    }
+}
+
+fn active_v6(x: &V6) -> ActiveV6 {
+    ActiveV6 {
+        prefix: x.link.as_ref().map(|l| l.0),
+        delegated: x.delegated.as_ref().map(|d| d.0),
+        bound: x.pd_bound(),
+        link_local: x.peer(),
     }
 }
 
@@ -2100,6 +2437,7 @@ fn rate_dir(r: &RateLimit, up: bool) -> Rate {
 fn xdp_session(
     d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
     rate: Option<&str>,
+    v6: Option<&V6>,
 ) -> PppoeSession {
     let r = rate
         .and_then(|t| t.parse::<RateLimit>().ok())
@@ -2118,5 +2456,11 @@ fn xdp_session(
         down: r.as_ref().map(|r| rate_dir(r, false)).unwrap_or_default(),
         fast_up: false,
         fast_down: true,
+        ipv6_prefix: v6
+            .and_then(|x| x.link.as_ref())
+            .map(|(n, _)| v6::high64(*n)),
+        delegated: v6
+            .and_then(|x| x.delegated.as_ref())
+            .map(|(n, _)| (v6::high64(*n), n.prefix_len())),
     }
 }

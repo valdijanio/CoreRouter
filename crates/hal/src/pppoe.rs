@@ -39,6 +39,10 @@ pub struct PppoeSession {
     /// Upstream may be forwarded in XDP (nothing in `forward` needs it).
     pub fast_up: bool,
     pub fast_down: bool,
+    /// G4.3e: the high 64 bits of the link's /64 (the RA prefix).
+    pub ipv6_prefix: Option<[u8; 8]>,
+    /// G4.3e: the delegated prefix (high 64 bits) and its length, 1..=64.
+    pub delegated: Option<([u8; 8], u8)>,
 }
 
 /// What the data plane counted for a session.

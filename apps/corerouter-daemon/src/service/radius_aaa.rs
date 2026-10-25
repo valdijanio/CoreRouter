@@ -401,7 +401,11 @@ fn service_type(s: AaaService) -> u32 {
 }
 
 /// `value` of attribute `name` as the dictionary types it.
-fn encode_attr(dict: &Dictionary, l: &mut AttrList, a: &Attribute) -> Result<(), String> {
+pub(crate) fn encode_attr(
+    dict: &Dictionary,
+    l: &mut AttrList,
+    a: &Attribute,
+) -> Result<(), String> {
     let shown: String = a.name.chars().take(48).collect();
     let def = dict
         .by_name(&a.name)
@@ -442,6 +446,28 @@ fn encode_attr(dict: &Dictionary, l: &mut AttrList, a: &Attribute) -> Result<(),
             .map_err(|_| bad())?
             .octets()
             .to_vec(),
+        // RFC 3162 §2.3 / RFC 8044 §3.10: reserved, length, then the
+        // prefix's significant octets (`2001:db8::/56`). G4.3e accounting.
+        DataType::Ipv6Prefix => {
+            let (addr, len) = a.value.trim().split_once('/').ok_or_else(bad)?;
+            let addr: Ipv6Addr = addr.parse().map_err(|_| bad())?;
+            let len: u8 = len.parse().ok().filter(|l| *l <= 128).ok_or_else(bad)?;
+            let mask = u128::MAX.checked_shl(128 - u32::from(len)).unwrap_or(0);
+            let octets = (addr.to_bits() & mask).to_be_bytes();
+            let mut v = vec![0, len];
+            v.extend_from_slice(octets.get(..usize::from(len).div_ceil(8)).unwrap_or(&[]));
+            v
+        }
+        // RFC 3162 §2.2: 8 octets, written as hex (`0x0211…`, as decoded).
+        DataType::Ifid => {
+            let t = a.value.trim();
+            let h = t.strip_prefix("0x").unwrap_or(t);
+            let n = u64::from_str_radix(h, 16)
+                .ok()
+                .filter(|_| h.len() == 16)
+                .ok_or_else(bad)?;
+            n.to_be_bytes().to_vec()
+        }
         _ => return Err(format!("{shown}: this type cannot be sent this way")),
     };
     if let (true, Some(t)) = (def.tagged, a.tag) {
@@ -667,7 +693,7 @@ fn decode_all(dict: &Dictionary, p: &Packet<'_>) -> Vec<Attribute> {
     dict.decode_packet(p).iter().filter_map(decoded).collect()
 }
 
-fn decode_list(dict: &Dictionary, l: &AttrList) -> Vec<Attribute> {
+pub(crate) fn decode_list(dict: &Dictionary, l: &AttrList) -> Vec<Attribute> {
     let mut out = Vec::new();
     for a in l.iter() {
         if a.typ == attr::VENDOR_SPECIFIC {

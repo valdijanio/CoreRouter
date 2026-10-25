@@ -558,15 +558,62 @@ Fontes:
 - **Relay de DHCPv6 para um servidor externo:** não é o modelo do BNG (o prefixo é da sessão);
   fica para pedido explícito.
 
-### 9.5 Desempenho
+### 9.5 O serviço (PR b)
+
+- **Perfil** (`ppp.profile.add/set`): `use_ipv6` (`default|yes|no|require`), `remote_ipv6_prefix_pool`
+  (um `/ipv6 pool` de `prefix_length` 64), `dhcpv6_pd_pool` (48–64), `dhcpv6_lease_time` (padrão 1d,
+  mínimo 5m) e `dns_server_ipv6` (até 4; o perfil do RouterOS só tem DNS IPv4). O
+  `ipv6.pool.remove` recusa um pool que um perfil usa.
+- **Por sessão:** o servidor roda o IPv6CP em todas as portas e o `use_ipv6` do perfil vai por
+  sessão antes do veredito (`Server::set_ipv6`). Quando o IPv6CP abre:
+  - o serviço toma o /64 e o PD, nesta ordem de prioridade:
+    1. `Framed-IPv6-Prefix` / `Delegated-IPv6-Prefix` do RADIUS (fixos; um prefixo já em uso por
+       outra sessão não é dado, e o log diz);
+    2. `Framed-IPv6-Pool` / `Delegated-IPv6-Prefix-Pool` ou `Mikrotik-Delegated-IPv6-Pool`;
+    3. os pools do perfil;
+  - o primeiro RA sai na hora.
+
+  O alocador (`service/pppoe_bng6.rs`) é do serviço, sobre os `/ipv6 pool`. Ele percorre o pool
+  sem materializá-lo, pula a primeira fatia e reusa as devolvidas.
+- **Plano de controle IPv6 da sessão:**
+  - RS → RA unicast;
+  - NS ao nosso link-local → NA;
+  - Echo ao nosso link-local → Echo Reply;
+  - DHCPv6 → `sub6`, respondido do nosso link-local para o do CPE;
+  - RA periódico conferido uma vez por segundo.
+
+  O XDP já passa link-local e multicast para o AF_PACKET (`Stat::Ipv6Control`); o resto do IPv6 é
+  o XDP que leva (o caminho lento de IPv6 é a G4.3l).
+- **XDP:** o `PppoeSession` do HAL ganha `ipv6_prefix` e `delegated`; o `hal-linux` liga `F_IPV6`/
+  `F_PD` e escreve as duas chaves LPM do `PPPOE_V6` (estruturas da G4.3c, sem mudança de layout). O
+  CoA de rate-limit preserva os prefixos.
+- **RADIUS:** `Framed-IPv6-Prefix`, `Delegated-IPv6-Prefix` e `Framed-Interface-Id` vão no
+  Accounting-Start (o IPv6CP abre antes do Start quando vem junto) ou num Interim-Update, quando o
+  IPv6 sobe depois do IPv4; também vão no Stop. O serviço RADIUS passa a codificar `ipv6prefix` e
+  `ifid` (RFC 3162 §2.2/§2.3).
+- **Comandos:** `ppp.active.list` ganha `ipv6_prefix`, `delegated_prefix`, `delegated_bound` e
+  `link_local` (e o `find` procura nos prefixos); `interface.pppoe-server.monitor` ganha
+  `ipv6_sessions`, `delegated` e `ipv6_dropped`.
+- **Segredo do identificador estável:** `<config-dir>/pppoe-ipv6cp.key` (32 bytes, 0600, criado no
+  primeiro uso); sem `--config-dir`, um por execução.
+- **Testes:**
+  - `pppoe_bng_tests` (1000 sessões dual-stack em memória: /64 e /56 distintos, RA com o prefixo e
+    o RDNSS, Solicit com Rapid Commit que liga o PD, RS limitado a um por 3 s, prefixos devolvidos;
+    RA periódico entre Min e Max; `use_ipv6=no`; prefixos do RADIUS e contabilização);
+  - `netns_pppoe6` (10 mil CPEs dual-stack por veth, sem root);
+  - `xdp_root` › `pppoe_bng_ops_reach_the_maps` (IPv6 do /64 e do /56 passa, de outro prefixo é
+    falsificado), na rodada com root do CI.
+
+### 9.6 Desempenho
 
 `cargo bench` (**medido**, Ryzen AI Max+ 395, release, 2026-10-25): classificar um RS 8,7 ns,
 montar o RA da sessão (PIO, MTU, RDNSS com 2 servidores, DNSSL) 72 ns, o identificador estável
 (SHA-256) 70 ns, o DHCPv6 da sessão responder um Solicit com Rapid Commit (IA_NA + IA_PD + DNS)
-444 ns. Uma reconexão de 100 mil assinantes dual-stack custa ≈ 60 ms de CPU nesses passos
+444 ns. De ponta a ponta (`netns_pppoe6`, **medido**, mesma máquina, build de debug, veth): 10 mil
+CPEs com IPv4, /64 pelo RA e /56 pelo DHCPv6-PD em 17,6 s (569 sessões/s). Uma reconexão de 100 mil assinantes dual-stack custa ≈ 60 ms de CPU nesses passos
 (**estimado**: 100 mil × (RS + 3 RAs + Solicit)).
 
-### 9.6 Riscos e como evitamos
+### 9.7 Riscos e como evitamos
 
 - **Tempestade de RS/Solicit** numa reconexão em massa: a resposta é O(1) por sessão, sem
   alocação na tabela; o RA solicitado respeita o mínimo de 3 s; o DHCPv6 da sessão não consulta

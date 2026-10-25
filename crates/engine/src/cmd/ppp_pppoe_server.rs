@@ -42,7 +42,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{id?: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: string, max_mru?: string, mrru?: string, authentication?: string, keepalive_timeout?: string, one_session_per_host?: bool, max_sessions?: string, pado_delay?: string, default_profile?: string, pppoe_over_vlan_range?: string, accept_untagged?: bool, ac_cookie?: bool, padi_limit?: string, mac_padi_limit?: string, new_session_rate?: string, pado_delay_by_load?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?}",
         always, preview),
     cmd!(query "interface.pppoe-server.monitor", "PPPoE Server Monitor", [], None,
-        "{} → {running, sessions, padi, pado, padr, pads, padt_rx, padt_tx, auth_accept, auth_reject, throttled, dataplane, last_error?}",
+        "{} → {running, sessions, padi, pado, padr, pads, padt_rx, padt_tx, auth_accept, auth_reject, throttled, dataplane, last_error?, ipv6_sessions (IPv6CP up), delegated (DHCPv6-PD held), ipv6_dropped (ND/DHCPv6 refused)}",
         always, monitor),
 ];
 
@@ -459,7 +459,8 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
 fn monitor(s: &mut Session, _: &Value) -> Result<Value> {
     let Some(b) = s.ppp_backend() else {
         return Ok(json!({"running": false, "sessions": 0, "padi": 0, "pado": 0, "padr": 0, "pads": 0,
-            "padt_rx": 0, "padt_tx": 0, "auth_accept": 0, "auth_reject": 0, "throttled": 0, "dataplane": false}));
+            "padt_rx": 0, "padt_tx": 0, "auth_accept": 0, "auth_reject": 0, "throttled": 0, "dataplane": false,
+            "ipv6_sessions": 0, "delegated": 0, "ipv6_dropped": 0}));
     };
     let st = b.stats();
     let mut v = serde_json::to_value(&st).map_err(|e| EngineError::bad("stats", e.to_string()))?;
