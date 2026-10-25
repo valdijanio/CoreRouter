@@ -144,6 +144,12 @@ fn users(s: &Session, name: &str) -> Vec<String> {
                 .filter(|q| q.next_pool.as_deref() == Some(name))
                 .map(|q| format!("pool {} (next_pool)", q.name)),
         )
+        .chain(c.ppp.profiles.iter().filter(|pr| {
+            [&pr.local_address, &pr.remote_address].into_iter().any(|a| {
+                matches!(a, Some(corerouter_model::ppp::AddrOrPool::Pool(n)) if n == name)
+            })
+        })
+        .map(|pr| format!("ppp profile {}", pr.name)))
         .collect()
 }
 
