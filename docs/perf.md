@@ -962,3 +962,32 @@ Com o buffer de recepção padrão (~200 KiB) a rajada de 1000 respostas transbo
 | GUI, 100 000 linhas em respostas de 2000 (20 000 guardadas), debug | 2,6 ms por quadro (tabela virtualizada); refiltrar 20 000: 14 ms, só quando filtro ou linhas mudam |
 | libFuzzer, alvo `oslog` (nightly, 1 núcleo) | 5,2 milhões de execuções em 121 s, nenhuma falha |
 | `journalctl --after-cursor` num journal de 2,0 GB | ≤ 10 ms por chamada (a cada 2 s); backfill de 500 linhas: 60 ms; pico de RSS 46 MB |
+
+### G0.26: rodadas na VM do laboratório (**medido**, 2026-10-25)
+
+Host AMD Ryzen AI Max+ 395 (32 threads, 64 GB), VM `corerouter-lab` 8 vCPUs / 8 GiB, kernel 7.0.0-38, build dev.
+
+| Etapa | Tempo |
+|---|---|
+| `create` com a imagem já baixada (cloud-init + pacotes + reboot no HWE + rustup + snapshot) | 156 s |
+| download da imagem (~600 MB) | 28 s |
+| `run -- env COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root`, cache frio (compila xtask + teste: 17,8 s) | 102,8 s |
+| a mesma rodada, cache quente (compilação 0,09 s; o resto são os 13 testes) | 76,3 s |
+| só `COREROUTER_XDP_TESTS=loads_attaches_and_counts`, quente | 4,9 s |
+| `sync` sem mudanças | 0,1–0,2 s |
+| `reset` (volta ao snapshot `clean` e espera o SSH) | 8,6 s |
+| `xdp-root` quente com `host-model`, 16 GiB e `spec_rstack_overflow=off` | 74,5 s (PERF iguais) |
+| o mesmo com `host-model` sem `spec_rstack_overflow=off` (SRSO Safe RET) | 108,4 s; veth sem filtro 558 kpps, LPM 1M pass 156 ns |
+
+PERF do `xdp-root` na VM (virtio/veth, não placa física): LPM com 1 000 000 prefixos carrega em 1 283 ms, passa a 51 ns/pkt e bloqueia a 142 ns/pkt; veth blast: sem filtro 1 783 kpps, nftables raw drop 1 837 kpps, XDP generic drop 1 613 kpps, XDP native drop 1 583 kpps; fast-nat redirect 113 ns/pkt; forward kernel NAT 500 kpps × XDP fast path (generic, veth) 450 kpps; PPPoE 100k sessões: insere em 921 ms (9,2 µs/sessão), encap 145–151 ns, decap 170–183 ns, remove em 540 ms; policer 10 000 assinantes com erro pior de −1,50 %; forward PPPoE: kernel sem PPPoE 1 159 kpps, XDP decap + FIB redirect 714 kpps, XDP decap + forward do kernel 658 kpps.
+
+### G4.3d — BNG: sessões por segundo e memória por sessão (**medido**, AMD Ryzen AI Max+ 395, 2026-10-24)
+
+| Medida | Build | Resultado |
+|---|---|---|
+| `cargo bench -p corerouter-daemon --bench pppoe_bng`: 1000 sessões do PADI ao IPCP Opened (BNG + clientes `proto-pppoe` em memória, MS-CHAPv2 local, pool, mapa XDP, histórico) | release | 10,5 ms = **≈ 94 mil sessões/s** num núcleo |
+| Memória do BNG com 50 mil sessões ativas (RSS; inclui o servidor `proto-pppoe`, a tabela ativa, o histórico e o "Why?") | release | **≈ 3,9 KB/sessão** (eram 4,9 KB antes de enxugar o "Why?") |
+| `netns_pppoe`: 10 mil CPEs reais por veth até Opened, daemon com caminho lento | debug | 6,5 s = 1531 sessões/s |
+| `netns_pppoe`: reconexão em massa de 10 mil CPEs com `new_session_rate=1000` | debug | 34 s (o limite e o recuo dos CPEs, RFC 2516 §5) |
+
+- 2026-10-25 — G4.3e (**medido**, Ryzen AI Max+ 395, release, `cargo bench -p corerouter-proto-pppoe --bench pppoe -- pppoe_ipv6` e `cargo bench -p corerouter-proto-dhcp --bench codec -- dhcp6_session`): classificar um RS 8,7 ns; montar o RA da sessão (PIO, MTU, RDNSS ×2, DNSSL) 72 ns; identificador estável do IPv6CP 70 ns; DHCPv6 da sessão responder Solicit com Rapid Commit (IA_NA + IA_PD + DNS) 444 ns.

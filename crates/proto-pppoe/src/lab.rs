@@ -71,6 +71,11 @@ pub struct LabConfig {
     /// Spread of the clients' start times.
     pub start_spread_ms: u64,
     pub ipv6: bool,
+    /// Clients propose a zero IPv6CP identifier (the BNG suggests one).
+    pub ipv6_zero_iid: bool,
+    /// What the BNG sets per session before answering the authentication
+    /// (the profile's `use-ipv6`).
+    pub ipv6_mode: crate::server::Ipv6Mode,
     /// Clients start over 1–3 s after their session ends, as a CPE does.
     pub reconnect: bool,
     /// Prints every frame to or from this MAC (debugging a simulation).
@@ -97,6 +102,8 @@ impl Default for LabConfig {
             bad_password_every: 0,
             start_spread_ms: 1000,
             ipv6: false,
+            ipv6_zero_iid: false,
+            ipv6_mode: crate::server::Ipv6Mode::On,
             reconnect: true,
             trace: None,
             tap: None,
@@ -229,6 +236,7 @@ impl Lab {
                         password: Self::password(&cfg, i),
                         auth: AuthSet::new(&[proto]),
                         ipv6: cfg.ipv6,
+                        ipv6_iid: cfg.ipv6_zero_iid.then_some([0; 8]),
                         ..ClientConfig::default()
                     },
                     seed32(cfg.seed, i as u64),
@@ -495,7 +503,9 @@ impl Lab {
                     }
                 };
                 let now = self.now;
+                let mode = self.cfg.ipv6_mode;
                 if let Some(s) = self.servers.get_mut(shard) {
+                    s.set_ipv6(now, r, mode, &mut self.sout);
                     s.auth_reply(now, r, verdict, &mut self.sout);
                 }
                 self.flush_server(shard);
