@@ -241,6 +241,19 @@ pub struct Authorization {
     pub session_timeout: Option<u32>,
 }
 
+/// IPv6 of one session (RouterOS `/ppp profile use-ipv6`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Ipv6Mode {
+    /// No IPv6CP: a Configure-Request from the peer gets a Protocol-Reject
+    /// (RFC 1661 §5.7).
+    Off,
+    /// IPv6CP runs; its failure leaves the session on IPv4.
+    #[default]
+    On,
+    /// IPv6CP must open: its failure ends the session.
+    Require,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthVerdict {
     Accept(Authorization),
@@ -910,6 +923,23 @@ impl Server {
     ) -> bool {
         self.with_session(now, session.sid, Some(session.gen_), out, |s, env| {
             s.auth_verdict(env, verdict)
+        })
+    }
+
+    /// IPv6 for one session, from its profile. Call before
+    /// [`Server::auth_reply`] (the NCPs open with the verdict); later it
+    /// only changes how a failure of IPv6CP is taken. `On` needs
+    /// [`ServerConfig::ipv6`].
+    pub fn set_ipv6(
+        &mut self,
+        now: Millis,
+        session: SessionRef,
+        mode: Ipv6Mode,
+        out: &mut ServerOutput,
+    ) -> bool {
+        let allowed = self.cfg.ipv6;
+        self.with_session(now, session.sid, Some(session.gen_), out, |s, _env| {
+            s.v6_mode = if allowed { mode } else { Ipv6Mode::Off };
         })
     }
 

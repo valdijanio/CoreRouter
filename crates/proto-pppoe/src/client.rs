@@ -261,6 +261,15 @@ impl Client {
         self.ipcp_l.local.filter(|a| !a.is_unspecified())
     }
 
+    /// (our, the BNG's) IPv6CP interface identifiers once IPv6CP is
+    /// Opened: the link-local addresses of the session (RFC 5072 §5).
+    pub fn ipv6_iids(&self) -> Option<([u8; 8], [u8; 8])> {
+        if !self.v6.is_opened() {
+            return None;
+        }
+        Some((self.v6_l.local_iid, self.v6_l.peer_iid?))
+    }
+
     pub fn config(&self) -> &ClientConfig {
         &self.cfg
     }

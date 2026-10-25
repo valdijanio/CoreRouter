@@ -409,7 +409,7 @@ duas entradas por sessão e o `owns_v6` já confere a origem). PRs empilhados:
 
 | PR | Parte |
 |---|---|
-| a | codecs: `proto-pppoe::nd` (RS/RA/NS/NA/Echo, RDNSS/DNSSL, identificador estável), `proto-dhcp::sub6` (DHCPv6 da sessão), IPv6CP com identificador estável |
+| a | codecs: `proto-pppoe::nd` (RS/RA/NS/NA/Echo, RDNSS/DNSSL, identificador estável), `proto-dhcp::sub6` (DHCPv6 da sessão), IPv6CP com identificador estável e `use-ipv6` por sessão (`Server::set_ipv6`), simulação de 100 mil sessões dual-stack |
 | b | serviço: perfil (`use_ipv6`, pools, `dhcpv6_lease_time`), RADIUS, contabilização, mapas XDP, e2e de 10 mil sessões dual-stack |
 | c | janela PPP: colunas e ⓘ |
 
