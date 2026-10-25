@@ -125,3 +125,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-24 — G4.8, G4.8a, G4.8b criados (System › Resources e saúde; log do sistema operacional); G4.8c–G4.8e registrados
 - 2026-10-24 — G4.8a feito (System › Resources e saúde do roteador)
 - 2026-10-24 — G4.8b feito (log do sistema operacional); G4.8ba–G4.8bd registrados
+- 2026-10-25 — G0.26 criado e feito (laboratório em VM com root para agentes)
+- 2026-10-25 — G4.3d: serviço `pppoe` no daemon (BNG em Rust puro, XDP ou caminho lento, RADIUS, CoA/DM)
+- 2026-10-25 — G4.3d: janela PPP (abas do WinBox, Why?, "derruba N sessões")
+- 2026-10-25 — G4.3d feito (BNG: comandos, serviço pppoe, janela PPP e extras)
