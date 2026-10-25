@@ -1,17 +1,24 @@
 //! `/system health` (G4.8a, RouterOS `/system health`): every sensor the
 //! machine has — temperatures with the driver's `max` and `crit`, fans,
-//! voltages, power — and how each reads against its limits.
+//! voltages, power — and how each reads against its limits; and the health
+//! checks (`crate::health_check`), Juniper `show system alarms` style.
 
 use serde_json::{Value, json};
 
-use super::system_resource::{monitor, r1};
+use super::system_resource::{monitor, r1, watched};
 use super::{CommandSpec, always};
 use crate::{Result, Session};
+use crate::health_check::{Severity, evaluate, overall};
 use crate::system_resource::sensor_level;
 
-pub(super) const COMMANDS: &[CommandSpec] = &[cmd!(query "system.health.print", "Health", [], None,
-    "{} → [{name, chip, label, type: temperature|fan|voltage|power, value, unit, max, crit, state: ok|warning|error}]",
-    always, print)];
+pub(super) const COMMANDS: &[CommandSpec] = &[
+    cmd!(query "system.health.print", "Health", [], None,
+        "{} → [{name, chip, label, type: temperature|fan|voltage|power, value, unit, max, crit, state: ok|warning|error}]",
+        always, print),
+    cmd!(query "system.health.check", "Health Checks", [], None,
+        "{} → {status: ok|warning|error, warnings, errors, checks: [{key, name, severity: ok|warning|error|unknown, value, reason, action}]}",
+        always, check),
+];
 
 /// `k10temp Tctl` → `k10temp-tctl`, like RouterOS's `cpu-temperature`.
 fn name(chip: &str, label: &str) -> String {
@@ -50,6 +57,22 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
     ))
 }
 
+/// The checks now. Does not mark the readings as watched (the top bar's
+/// chip asks every 5 s) and never logs: the alerts are the service's.
+fn check(s: &mut Session, _: &Value) -> Result<Value> {
+    // No readings (a backend without a sampler) still answers: the checks
+    // that need them say `unknown`.
+    let _ = watched(s, false, false);
+    let checks = evaluate(&s.health_inputs());
+    let count = |sev| checks.iter().filter(|c| c.severity == sev).count();
+    Ok(json!({
+        "status": overall(&checks).as_str(),
+        "warnings": count(Severity::Warning),
+        "errors": count(Severity::Error),
+        "checks": checks,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,6 +90,25 @@ mod tests {
         assert!(rows.iter().any(|r| r["type"] == "fan" && r["unit"] == "rpm"));
         assert_eq!(name("nvme", "Sensor 1"), "nvme-sensor-1");
         assert!(s.execute("system.health.print", &json!({"x": 1})).is_err());
+    }
+
+    #[test]
+    fn checks_on_the_lab() {
+        let mut s = Session::virtual_lab();
+        let v = s.execute("system.health.check", &json!({})).unwrap();
+        let checks = v["checks"].as_array().unwrap();
+        assert_eq!(checks.len(), 12);
+        let by = |k: &str| checks.iter().find(|c| c["key"] == k).unwrap().clone();
+        assert_eq!(by("nic.errors")["severity"], "warning", "ether4's bad cable");
+        assert!(by("nic.errors")["reason"].as_str().unwrap().contains("ether4"));
+        assert_eq!(by("ntp")["severity"], "warning", "NTP off by default");
+        assert_eq!(by("services")["severity"], "unknown", "no supervisor in the lab");
+        assert_eq!(by("temperature")["severity"], "ok");
+        assert_eq!(v["status"], "warning");
+        assert_eq!(v["errors"], 0);
+        assert!(by("nic.errors")["action"].is_string());
+        assert!(by("temperature")["action"].is_null(), "no action when ok");
+        assert!(s.execute("system.health.check", &json!({"all": true})).is_err());
     }
 
     #[test]

@@ -42,7 +42,13 @@ fn r1f(v: f32) -> f64 {
 
 /// Fresh readings, or the reason there are none.
 pub(crate) fn monitor(s: &mut Session, processes: bool) -> Result<&ResourceMonitor> {
-    s.resource_refresh(processes)
+    watched(s, processes, true)
+}
+
+/// [`monitor`], saying whether someone watches (see
+/// `Session::resource_refresh`).
+pub(crate) fn watched(s: &mut Session, processes: bool, looking: bool) -> Result<&ResourceMonitor> {
+    s.resource_refresh(processes, looking)
         .map_err(EngineError::Hal)?;
     s.ext::<ResourceMonitor>()
         .ok_or_else(|| EngineError::Internal("system.resource".into()))
