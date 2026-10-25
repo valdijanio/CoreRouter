@@ -40,6 +40,7 @@ const TOPICS: &[&str] = &[
     "firewall",
     "interface",
     "ntp",
+    "ppp",
     "radius",
     "route",
     "system",
