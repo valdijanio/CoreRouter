@@ -744,8 +744,9 @@ impl ZoneBackend for Backend {
     }
 }
 
-/// Starts the service on `srv` and registers it with the engine.
-/// The service and its backend, registered with the engine.
+/// The service and its backend, registered with the engine, and the
+/// UPDATE handler with the forwarder. The DNS server calls this before it
+/// opens a socket ([`attach`]): an UPDATE in between used to get NOTIMP.
 fn prepare(session: &Shared, srv: Arc<Server>, port: u16, shutdown: Shutdown) -> Arc<Zones> {
     let z = Zones::new(session.clone(), srv, port, shutdown);
     let weak = Arc::downgrade(&z);
@@ -779,22 +780,29 @@ pub(crate) const SERVICE: super::Service = super::Service {
     start,
 };
 
+/// The daemon's zone service, made with its DNS server
+/// (`dns_server::make`).
+static ZONES: OnceLock<Arc<Zones>> = OnceLock::new();
+
+/// Makes the zone service on `srv`. The DNS server calls it before it
+/// opens a socket, so an UPDATE is answered from the first packet: it got
+/// NOTIMP until the supervisor had started "dns-zones", while the zone
+/// already answered (an `nsupdate` in that window failed, 2026-10-25).
+/// The "dns-zones" thread only does the timed work.
+pub(crate) fn attach(session: &Shared, srv: &Arc<Server>, shutdown: &Shutdown) -> Arc<Zones> {
+    prepare(session, srv.clone(), DNS_PORT, shutdown.clone())
+}
+
+/// Hands the daemon's zone service to the "dns-zones" thread (once).
+pub(crate) fn publish(z: Arc<Zones>) {
+    let _ = ZONES.set(z);
+}
+
 /// One zone service for the daemon's life (a restart keeps the
 /// secondaries' copies and the journal, which live in the forwarder).
-fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
-    let session = ctx.session.clone();
-    let shutdown = ctx.shutdown.clone();
-    let zones: Arc<OnceLock<Arc<Zones>>> = Arc::new(OnceLock::new());
+fn start(_ctx: &super::Ctx) -> Result<super::Run, String> {
     Ok(Box::new(move |health: &super::Health| {
-        let z = match zones.get() {
-            Some(z) => z.clone(),
-            None => {
-                let srv = super::dns_server::server().ok_or("the DNS server is not running")?;
-                zones
-                    .get_or_init(|| prepare(&session, srv, DNS_PORT, shutdown.clone()))
-                    .clone()
-            }
-        };
+        let z = ZONES.get().ok_or("the DNS server is not running")?.clone();
         z.run(health);
         Ok(())
     }))

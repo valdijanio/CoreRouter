@@ -554,6 +554,19 @@ pub(crate) fn spawn(
     Ok(srv)
 }
 
+/// The daemon's server: [`prepare`] with the zone service attached before
+/// any socket opens, so the zones it answers for take UPDATE from the
+/// first packet (`dns_zones::attach`).
+fn make(
+    session: &Shared,
+    dns: Arc<RouterDns>,
+    shutdown: &Shutdown,
+) -> std::io::Result<(Arc<Server>, Arc<super::dns_zones::Zones>)> {
+    let srv = prepare(session, dns, shutdown.clone())?;
+    let zones = super::dns_zones::attach(session, &srv, shutdown);
+    Ok((srv, zones))
+}
+
 /// The forwarder and its effects thread, registered in the session. One
 /// for the daemon's life: a restart of the service keeps its lists and
 /// counters (only the sockets and the follow loop are per run).
@@ -701,8 +714,9 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
             Some(srv) => srv.clone(),
             None => {
                 let dns = super::dns::router().ok_or("the DNS resolver is not running")?;
-                let srv = prepare(&session, dns, shutdown.clone())
+                let (srv, zones) = make(&session, dns, &shutdown)
                     .map_err(|e| format!("cannot start its threads: {e}"))?;
+                super::dns_zones::publish(zones);
                 SERVER.get_or_init(|| srv).clone()
             }
         };
@@ -772,11 +786,6 @@ impl Server {
 /// The block lists the forwarder matches (G4.1d), once it started.
 pub(crate) fn adlists() -> Option<Arc<corerouter_proto_dns::adlist::Adlists>> {
     SERVER.get().map(|s| s.fwd.state())
-}
-
-/// The DNS server, once it started (G4.1c: `dns_zones`).
-pub(crate) fn server() -> Option<Arc<Server>> {
-    SERVER.get().cloned()
 }
 
 /// Linux: the destination address of each query (IP_PKTINFO /
@@ -1240,6 +1249,56 @@ mod tests {
         let dropped = srv.effects_dropped.load(Ordering::Relaxed);
         assert!(dropped >= 100_000 - EFFECTS_QUEUE as u64 - 1, "{dropped} dropped");
         drop(held);
+        shutdown.close();
+    }
+
+    /// The server the daemon starts takes a zone's UPDATE before any
+    /// "dns-zones" thread ran: it got NOTIMP in that window while the zone
+    /// already answered, and `nsupdate` failed under load (netns_dns_ddns,
+    /// 2026-10-25). RFC 2136 §2.2: NOTIMP is for a server without UPDATE.
+    #[test]
+    fn the_daemons_server_takes_updates_before_the_zone_thread() {
+        use hickory_proto::op::OpCode;
+        use hickory_proto::rr::rdata::A;
+        use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
+        use hickory_proto::rr::{RData, Record, TSigner};
+        let session = shared(Session::virtual_lab());
+        let key = lock(&session).execute("ip.dns.tsig-key.add", &json!({"name": "ddns"})).unwrap();
+        let secret = corerouter_model::dns_tsig::base64_decode(key["secret"].as_str().unwrap()).unwrap();
+        lock(&session)
+            .execute("ip.dns.zone.add", &json!({"name": "lan.example", "update_keys": "ddns"}))
+            .unwrap();
+        let shutdown = Shutdown::default();
+        // What `start` builds before `follow` opens the sockets; no zone thread.
+        let (srv, _zones) = make(&session, Arc::new(RouterDns::new()), &shutdown).unwrap();
+        srv.fwd.configure(Arc::new(lock(&session).store().running().clone()), Vec::new());
+
+        let mut m = Message::query();
+        m.metadata.op_code = OpCode::Update;
+        m.add_query(Query::query(Name::from_ascii("lan.example.").unwrap(), RecordType::SOA));
+        m.add_authority(Record::from_rdata(
+            Name::from_ascii("pc.lan.example.").unwrap(),
+            300,
+            RData::A(A::new(192, 168, 88, 50)),
+        ));
+        let signer =
+            TSigner::new(secret, TsigAlgorithm::HmacSha256, Name::from_ascii("ddns.").unwrap(), 300)
+                .unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let (tsig, _) = signer.sign_message(&m, now).unwrap();
+        m.set_signature(tsig);
+        let client = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let replies = zone::xfr::intercept(&srv.fwd, &m.to_vec().unwrap(), client, false).unwrap();
+        let r = Message::from_vec(replies.first().unwrap()).unwrap();
+        assert_eq!(r.metadata.response_code, ResponseCode::NoError);
+        assert!(r.signature().is_some(), "RFC 8945 §5.3: signed answer");
+        let rows = lock(&session)
+            .execute("ip.dns.zone.record.print", &json!({"zone": "lan.example"}))
+            .unwrap();
+        assert_eq!(rows[0]["flags"], "D", "{rows}");
         shutdown.close();
     }
 }
