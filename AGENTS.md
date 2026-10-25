@@ -293,7 +293,12 @@ outra tarefa. Não acumule PRs em cima de uma `main` quebrada.
 - Precisa de root de verdade (FRR instalado no host, XDP numa NIC física, imagem Buildroot,
   `setcap`)? Pare e entregue ao usuário o comando exato e o motivo; ele roda no terminal dele.
   Nunca proponha `sudo` sem senha (NOPASSWD) amplo.
-- **Teste que precisa de root (XDP, `BPF_PROG_LOAD`): rodada local pelo usuário.** É o caminho
+- **Teste que precisa de root roda na VM do laboratório** (G0.26, `docs/vm-lab.md`):
+  `cargo xtask vm-lab run -- <comando>` copia a worktree para a VM `corerouter-lab` e roda o
+  comando como root lá dentro (ex.: `cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1
+  cargo xtask xdp-root`). O root fica dentro da VM: o agente continua sem `sudo` no host. A
+  rodada pelo usuário (abaixo) e o runner do CI ficam como alternativas.
+- **Sem a VM: rodada local pelo usuário.** É o caminho
   rápido (segundos, contra ~15 min de um `workflow_dispatch` no runner do CI, **medido** em
   2026-10-24). A sessão entrega ao usuário, pela sessão principal, o comando completo na pasta
   dela, com saída em arquivo:

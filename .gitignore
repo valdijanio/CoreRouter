@@ -5,3 +5,4 @@
 /apps/corerouter-gui/dist
 *.png
 !docs/**/*.png
+/vm/
