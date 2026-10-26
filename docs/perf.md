@@ -991,3 +991,221 @@ PERF do `xdp-root` na VM (virtio/veth, não placa física): LPM com 1 000 000 pr
 | `netns_pppoe`: reconexão em massa de 10 mil CPEs com `new_session_rate=1000` | debug | 34 s (o limite e o recuo dos CPEs, RFC 2516 §5) |
 
 - 2026-10-25 — G4.3e (**medido**, Ryzen AI Max+ 395, release, `cargo bench -p corerouter-proto-pppoe --bench pppoe -- pppoe_ipv6` e `cargo bench -p corerouter-proto-dhcp --bench codec -- dhcp6_session`): classificar um RS 8,7 ns; montar o RA da sessão (PIO, MTU, RDNSS ×2, DNSSL) 72 ns; identificador estável do IPv6CP 70 ns; DHCPv6 da sessão responder Solicit com Rapid Commit (IA_NA + IA_PD + DNS) 444 ns.
+
+- 2026-10-25 — G4.3e (**medido**, Ryzen AI Max+ 395, build de debug, veth em namespace sem root, `netns_pppoe6`): 10 000 CPEs dual-stack (IPv4 + /64 pelo RA + /56 pelo DHCPv6-PD com Rapid Commit) de PADI a PD ligado em 17,6 s = 569 sessões/s.
+
+- 2026-10-25, G4.3f, **medido** (32 CPUs, release, `cargo bench -p corerouter-proto-dhcp --bench server_storm -- dhcp_server_ipoe`): DORA pelo servidor DHCP puro, por lease: 10 000 clientes 7,0 µs (sem autorização) e 8,3 µs (IPoE, veredito na hora); 100 000 clientes 8,8 µs e 11,8 µs. Antes da correção do limitador, 100 000 clientes: 62 µs/lease e só 65 536 ACKs.
+
+- 2026-10-25, G4.3f, **medido** na VM `corerouter-lab` (kernel 7.0, 8 vCPUs, XDP genérico em veth, `xdp-root`): IPoE `BPF_PROG_TEST_RUN` com 300 sessões, subida 94 ns/pacote e descida 85 ns/pacote. O caminho do PPPoE antes × depois (duas rodadas cada): XDP decap + FIB 732/746 × 743/729 kpps, CGNAT rápido redirect 116/115 × 119/117 ns/pacote: dentro do ruído.
+
+- 2026-10-25, G4.3f, **medido** (32 CPUs, build debug, veth sem XDP, `apps/corerouter-daemon/tests/netns_ipoe.rs`): 10 000 assinantes IPoE autorizados pelo RADIUS de teste (Access-Request + Accounting-Start cada) com endereço em 3,0 s = 3 300 sessões/s; o daemon cresce ~4,3 kB/sessão.
+- 2026-10-25, G4.3f, **medido** (32 CPUs, release, `cargo bench -p corerouter-daemon --bench ipoe_bng`): decisão local + sessão (linha ativa, histórico, mapa XDP) + fim, por assinante: 6,6–9,9 µs com 10 000 já conectados e 6,6 µs com 100 000 (1000 por iteração).
+
+### G4.3g-a — custo por sessão com muitas no ar (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-25)
+
+`cargo bench -p corerouter-daemon --bench pppoe_bng`: 60 mil sessões (um servidor: SESSION_ID
+de 16 bits) em lotes de 10 mil sobre o mesmo BNG, CHAP, 100 mil secrets, µs por sessão em cada
+lote:
+
+| Lote (sessões já no ar) | 0 | 10 mil | 20 mil | 30 mil | 40 mil | 50 mil |
+|---|---:|---:|---:|---:|---:|---:|
+| Antes (`Ppp::secret` linear, varreduras de `subs`) | 19,0 | 38,5 | 75,8 | 110,4 | 143,5 | 180,9 |
+| Depois (índice de secrets + `SubIndex`) | 12,1 | 13,9 | 16,0 | 14,9 | 15,2 | 23,9 |
+
+O último lote cruza as 100 mil chaves do "Why?" (duas por assinante), que hoje apaga tudo e
+recomeça: corrigido no PR seguinte da G4.3g.
+
+### G4.3g — BNG Blaster contra o daemon, primeira rodada (**medido**, AMD Ryzen AI Max+ 395, 32 CPUs, kernel 7.0.0-38, daemon release, BNG Blaster 1.0.1, 2026-10-25, root com XDP)
+
+Antes da correção do O(n) (G4.3g-a); os números depois dela vêm na rodada final e no
+`docs/pppoe-relatorio.md`.
+
+| Medida | 1 mil | 10 mil | 100 mil |
+|---|---:|---:|---:|
+| Setup, proteções desligadas | 9210/s | 9838/s | 3243/s (30,8 s) |
+| CPU do daemon por sessão no setup | 50 µs | 39 µs | 267 µs |
+| Memória por sessão | — | 1995 B | 3023 B |
+| CPU em regime (LCP echo a cada 10 s) | 0,7 % | 1,5 % | 12,9 % de um núcleo |
+| Reconexão em massa com as proteções padrão | 0,10 s | 6,8 s | 57,2 s (new-session-rate 2000) |
+| Encerramento (PADT de todas) | 0,30 s | 1,30 s | 10,3 s |
+
+- RADIUS (100 assinantes): 981 sessões/s.
+- Policer a 2× a taxa: 1,000–1,010 do limite nos dois sentidos.
+- CoA: 10/10 ACK, ida e volta média 0,04 ms; só os 10 mudaram de taxa (1,000×), os outros
+  ficaram em 1,002×.
+- Disconnect: 10/10 ACK em 1 ms, de volta em 1,02 s; os outros seguiram em 1,008×.
+- `pppd`: sessão em 3,06 s, CHAP, MTU 1480, ping pelo BNG, derrubada pelo BNG em 0,11 s,
+  PADT do cliente visto.
+
+### G4.3g-c — `ppp.secret.add` em lote (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-25)
+
+`cargo bench -p corerouter-engine --bench batch_import -- ppp_secret`: um `engine.batch` atômico
+num laboratório novo.
+
+| Lote | Antes | Depois |
+|---|---:|---:|
+| 1 000 secrets | 9,8 ms | 3,9 ms |
+| 10 000 secrets | 165 ms | 55 ms |
+
+Com 100 mil em lotes de 10 mil na mesma sessão, cada passo custa o mesmo (~6 µs, dos quais ~4
+são o journal). O que cresce é o commit no fim de cada lote, que trata o config inteiro: de 6 µs
+para 33 µs por secret no décimo lote, ≈ 1,5 s no total para importar 100 mil.
+
+### G4.3g-d — workers do BNG (**medido**, AMD Ryzen AI Max+ 395, 32 CPUs, release, 2026-10-25)
+
+`cargo bench -p corerouter-daemon --bench pppoe_bng`. São 40 mil sessões do PADI ao IPCP
+Opened, CHAP e mapa XDP, divididas pelo MAC entre os workers, cada um numa thread com os seus
+clientes (`proto-pppoe`). Compartilham a tabela ativa, o histórico e os pools.
+
+| Workers | 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| Sessões/s | 58 066 | 114 725 | 201 878 | 303 161 |
+
+Com o "Why?" e os contadores ainda no lock compartilhado, 8 workers davam 135 103/s (sete locks
+por sessão); separá-los dobrou o ganho. Memória com 50 mil sessões no ar: ≈ 5,0 KB/sessão, com
+os campos IPv6 da G4.3e.
+
+### G4.3g-d — onda de reconexão contra um RADIUS de capacidade fixa, simulada (**medido**, release, 2026-10-25)
+
+`mass_reconnect_against_a_slow_radius` (relógio do laboratório): 6000 CPEs ligando em até 5 s
+após uma queda, um RADIUS de 300 pedidos/s com autenticação e accounting na mesma fila (no
+máximo 150 logins/s: ideal ≈ 40 s), CPEs que tentam de novo 1–3 s depois de falhar.
+
+| `new_session_rate` | Todas no ar em | Logins abandonados pelo cliente (8 s) |
+|---|---:|---:|
+| desligado | 56,3 s | 11 220 |
+| fixo 200 (acima da capacidade) | 44,1 s | 389 |
+| fixo 100 (abaixo) | 92,1 s | 0 |
+| auto, AIMD pela latência (antes) | 76,4 s | 0 |
+| auto, BBR + fila de logins (depois) | 46,4 s | 106 |
+
+Depois, com a autenticação na frente do accounting e a janela pelo BDP (o ideal passa a
+6000/300 = 20 s, porque os logins têm o servidor inteiro):
+
+| `new_session_rate` | Todas no ar em | Logins abandonados pelo cliente (8 s) |
+|---|---:|---:|
+| desligado | 27,1 s | 5547 |
+| fixo 200 | 44,7 s | 386 |
+| fixo 100 | 92,1 s | 0 |
+| auto | **20,2 s** | **0** |
+
+Com os parâmetros da terceira rodada da VM (`wave_of_the_vm_round`, RADIUS de 3000/s): são 60 mil
+CPEs, porque uma porta do modelo tem no máximo 65 mil SESSION_IDs e endereços.
+
+| Variante | desligado | fixo 2000 | auto |
+|---|---:|---:|---:|
+| prioridade + janela pelo BDP | 27,1 s / 55 011 | 44,5 s / 3488 | **20,1 s / 0** |
+| prioridade + janela antiga (2 × ritmo × base) | 27,1 s / 55 011 | 44,5 s / 3488 | 20,1 s / 0 |
+| janela pelo BDP, sem prioridade | 56,1 s / 111 561 | 44,1 s / 3900 | 39,9 s / 0 |
+
+(tempo até todas no ar / logins abandonados). No modelo, quem resolve é a prioridade. A janela
+pelo BDP não muda o resultado aqui: o modelo não tem as retransmissões do cliente RADIUS nem as
+do CPE, que na VM multiplicam o que um excesso de pedidos em voo custa.
+
+### G4.3g-d — onda com o cliente RADIUS de verdade, simulada (**medido**, release, 2026-10-25)
+
+`wave_with_the_real_client`: 60 mil CPEs contra 3000/s, com o `proto_radius::Client` (RTO
+adaptativo, retransmissão, MRD) e o `TestServer` atrás de uma fila de capacidade fixa (2 s de
+trabalho no máximo, cópia de pedido já na fila descartada). O modelo simples não tinha
+retransmissões e não mostrava o auto pior da VM; este mostra.
+
+| `new_session_rate` | Antes da correção dos timers | Depois (e janela inicial de 64) |
+|---|---:|---:|
+| desligado | 20,1 s / 0 / 55 808 | 20,1 s / 0 / 55 550 |
+| fixo 2000 | 44,1 s / 24 / 46 844 | 44,1 s / 0 / 19 008 |
+| auto | 25,3 s / 429 / 66 205 | **20,6 s / 0 / 0** |
+
+(todas no ar / timeouts / retransmissões). O `load_sim` do proto-radius (100 mil pedidos com 3%
+de perda e failover) foi de 24 810 para 22 823 retransmissões, e de 10 190 para 6223 cópias que
+caíram no cache de duplicatas do servidor.
+
+### G4.3g-d — onda de 100 mil com o BNG Blaster, quarta rodada (**medido**, VM corerouter-lab, 8 vCPUs, 16 GiB, kernel 7.0, release, 2026-10-25)
+
+Com a prioridade da autenticação e a janela pelo BDP; antes da fila por worker, da correção dos
+timers do cliente e da janela inicial.
+
+| `new_session_rate` | Todas no ar em | Timeouts | Retransmissões | Pico do limite |
+|---|---:|---:|---:|---:|
+| desligado | 42,1 s | 1 | 59 354 | — |
+| fixo 2000 | 36,5 s | 1 | 93 555 | — |
+| auto | 62,4 s | 5741 | 91 524 | 3693/s |
+
+Workers na mesma rodada (socket por worker sem fila): 1 worker 10,5 mil/s, 6 workers 22,4 mil/s,
+com o BNG Blaster a 90% de um núcleo.
+
+### G4.3g-d — onda de 100 mil com o BNG Blaster, terceira rodada (**medido**, VM corerouter-lab, 8 vCPUs, 16 GiB, kernel 7.0, release, 2026-10-25)
+
+`cargo xtask bng-lab --root --only wave --wave 100000 --radius-cap 3000`, antes da prioridade
+da autenticação e da janela pelo BDP. O teto era de ~1500 logins/s, porque o accounting dividia
+o servidor (ideal ≈ 67 s).
+
+| `new_session_rate` | Todas no ar em | Sessões/s | Timeouts | Retransmissões | Pico do limite |
+|---|---:|---:|---:|---:|---:|
+| desligado | 69,4 s | 1440 | 2607 | 170 043 | — |
+| fixo 2000 | 94,6 s | 1057 | 3923 | 236 473 | — |
+| auto | 106,7 s | 937 | 4428 | 204 502 | 5503/s |
+
+Workers na mesma VM, 100 mil sessões: 1 worker deu 15,2 mil/s e 6 deram 57,9 mil/s, ainda
+com o leitor único (`svc-pppoe` a 51%). O socket por worker, testado nas rodadas 4 e 5, foi descartado.
+
+### G4.3g-d — recepção por socket de cada worker, descartada (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-25)
+
+`tests/netns_pppoe_lanes.rs` (commit 8c3859f; saiu com o código descartado): 200 mil PADIs de MACs diferentes num veth, CPU por quadro da thread
+receptora mais ocupada (a parte serial, que limita a taxa), duas rodadas.
+
+| Workers | Leitor + canal (fica) | Socket próprio por worker (descartado) |
+|---|---:|---:|
+| 1 | 600 ns | 550 ns |
+| 2 | 550–650 ns | 350 ns |
+| 4 | 800–1050 ns | 350 ns |
+| 6 | 550–750 ns | 150 ns |
+
+Cada quadro chegou a exatamente um worker, o que o `lane_of` indica. A parte serial cai, mas
+na VM o conjunto ficou abaixo do leitor (rodadas 4 e 5).
+
+### G4.3g-d — workers e onda, quinta rodada (**medido**, VM corerouter-lab, 8 vCPUs, 16 GiB, kernel 7.0, release, 2026-10-25)
+
+Com o cliente RADIUS corrigido, a janela inicial e o socket por worker com fila (depois
+descartado). São 100 mil sessões; a onda é contra um RADIUS de 3000/s.
+
+| `new_session_rate` | Todas no ar em | Sessões/s | Timeouts | Retransmissões |
+|---|---:|---:|---:|---:|
+| **auto** | **33,6 s** | **2978** | **0** | **0** (pico do limite 2990/s) |
+| desligado | 36,1 s | 2774 | 2 | 90 161 |
+| fixo 2000 | 39,8 s | 2510 | 5 | 64 574 |
+
+Workers com socket próprio e fila: 1 worker 14,3 mil/s (46 234 quadros perdidos antes do BNG), 6
+workers 24,0 mil/s (0 perdidos, BNG Blaster a 91%). Com o leitor único, na rodada 3, eram 15,2
+mil/s e 57,9 mil/s: o leitor voltou.
+
+### G4.3g-d — workers, sexta rodada (**medido**, VM corerouter-lab, 8 vCPUs, 16 GiB, kernel 7.0, release, 2026-10-25)
+
+O leitor único de volta, com o filtro das cópias de saída e o `rx_dropped`. São 100 mil sessões,
+com o BNG Blaster a 65 535/s.
+
+| Workers | Sessões/s | Tempo | CPU | Quadros perdidos antes do BNG |
+|---|---:|---:|---|---:|
+| 1 | 14 530 | 6,9 s | worker 43%, leitor 11% | 30 967 |
+| 6 (`auto`) | **57 733** | 1,7 s | workers 216%, leitor 49%, BNG Blaster 67% | 0 |
+
+Contra os 57 889 da rodada 3, a diferença é ruído: o filtro e o contador não custam nada que se
+meça.
+
+Com 1 worker, a rajada de 100 mil PADIs em 1,5 s enche o canal (65 536) e o socket. O que sobra
+se perde, e o CPE repete o PADI (RFC 2516 §5): todas sobem. O operador deve deixar
+`workers=auto`; um `rx_dropped` crescendo fora de uma volta de energia quer dizer workers
+de menos.
+
+### G4.3g-d — rajada contra workers ocupados (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-25)
+
+`a_burst_against_busy_workers` (`tests/netns_pppoe_lanes.rs`, commit 8c3859f): 100 mil PADIs escritos na
+velocidade máxima num veth, 5 µs de trabalho por quadro, quadros que os workers receberam. Um
+socket de 4 MiB guarda 8739 PADIs (`a_busy_worker_socket_holds_a_burst`).
+
+| Workers | Leitor + canal | Socket lido entre quadros (rodada 4) | Socket + fila do worker |
+|---|---:|---:|---:|
+| 1 | 77 169 (0,66 s) | 18 756 (kernel: 81 236 perdidos) | **100 000** (0,67 s) |
+| 4 | 100 000 (0,36 s) | 95 285 (4714 perdidos) | **100 000** (0,37 s) |
+
+No netns o socket com fila empata com o leitor; na VM, com o BNG Blaster, ficou abaixo (rodada
+5). Vale o número da VM.
