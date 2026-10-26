@@ -61,121 +61,131 @@ jobs:
           echo "docs_only=$docs_only" >> "$GITHUB_OUTPUT"
           echo "só documentação: $docs_only"
 
-  xtask-ci:
-    name: xtask ci (linux)
+  # O portão completo em jobs paralelos (processo, 2026-10-26): um job serial levava 21 min no
+  # lote, 10 deles no bench-check. Cada job roda um grupo de passos do `cargo xtask ci --only`
+  # e tem o próprio cache. O PR (`--fast`) roda só `lint` e `test`; `bench-check`, `netns` e
+  # `xdp-root` rodam no lote da fila (workflow_dispatch) e na main. O check exigido pela
+  # proteção da main continua sendo `xtask ci (linux)`: o job final que confere todos.
+  lint:
+    name: lint
     needs: changes
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     env:
       DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      # Cabeçalhos que eframe/winit/wgpu (x11, wayland, GL) pedem para compilar, e o nftables dos
-      # testes em namespace. Em cache: o `apt-get update` variava de 14 s a 114 s conforme o espelho.
-      - name: Dependências de sistema
+      - uses: ./.github/actions/setup
+        with:
+          apt: ${{ env.DOCS_ONLY != 'true' }}
+          cache: ${{ env.DOCS_ONLY != 'true' }}
+      - name: cargo xtask ci (fmt, clippy, docs, ebpf-check, layers, agents-sync, wasm)
         if: env.DOCS_ONLY != 'true'
-        uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
-        with:
-          packages: >-
-            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
-            libx11-dev libxcursor-dev libxrandr-dev libxi-dev
-            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
-            libgl1-mesa-dev nftables
-          version: "1"
-
-      - name: Toolchain (rust-toolchain.toml)
-        run: |
-          rustup toolchain install --no-self-update
-          rustup show
-          # Sem o alvo, o passo wasm do xtask vira "skip" em vez de falhar.
-          rustup target list --installed | grep -qx wasm32-unknown-unknown
-
-      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
-      # O `cargo xtask ci` usa o nextest quando existe: os binários de teste rodam em paralelo.
-      - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
-        if: env.DOCS_ONLY != 'true'
-        with:
-          tool: cargo-nextest
-
-      # G1.2: `cargo xtask netns` testa o hal-linux num network namespace sem root.
-      # O Ubuntu 24.04 bloqueia user namespaces sem privilégio (AppArmor); isto só
-      # muda a VM descartável do runner. Se não pegar, o passo netns vira "skip".
-      # Portão em duas camadas: no PR, `cargo xtask ci --fast` (determinístico, sem os testes
-      # contra o kernel); no lote da fila de entrada (workflow_dispatch) e na main, o completo.
-      # Teste que falha e passa ao repetir é marcado como instável e não reprova (docs/perf.md).
-      - name: Liberar user namespaces sem root
-        if: env.DOCS_ONLY != 'true' && github.event_name != 'pull_request'
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
-
-      # G1.14: um user namespace não carrega módulos; carregamos o `vrf` aqui, na
-      # VM descartável do runner (o sudo dos agentes, localmente, continua proibido).
-      # Imagens do Azure às vezes trazem o vrf.ko só em linux-modules-extra (51 MB), e o espelho
-      # chegou a 82 kB/s: 10 min só para baixar (bateria da fila, docs/perf.md). O vrf.ko fica no
-      # cache do Actions por versão do kernel; sem cache, o download tem teto de 2 min, e se
-      # estourar o CI segue sem o teste de VRF, com aviso, em vez de travar a fila.
-      - name: Versão do kernel
-        if: env.DOCS_ONLY != 'true' && github.event_name != 'pull_request'
-        id: kernel
-        run: echo "release=$(uname -r)" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: env.DOCS_ONLY != 'true' && github.event_name != 'pull_request'
-        with:
-          path: ~/vrf-ko
-          key: vrf-ko-${{ steps.kernel.outputs.release }}
-
-      - name: Carregar o módulo vrf
-        if: env.DOCS_ONLY != 'true' && github.event_name != 'pull_request'
-        run: |
-          # G1.14: com o módulo carregado, o teste de VRF em netns falha em vez de pular (e o
-          # passo netns do xtask também).
-          if sudo modprobe vrf; then
-            echo "COREROUTER_REQUIRE_VRF=1" >> "$GITHUB_ENV"
-            exit 0
-          fi
-          ko=$(find ~/vrf-ko -name 'vrf.ko*' -print -quit 2>/dev/null || true)
-          if [ -z "$ko" ]; then
-            pkg="linux-modules-extra-$(uname -r)"
-            mkdir -p ~/vrf-ko && cd "$RUNNER_TEMP"
-            sudo apt-get update -qq   # o cache de pacotes acima pula o update
-            if timeout 120 apt-get download "$pkg"; then
-              dpkg-deb --fsys-tarfile "$pkg"_*.deb | tar -x --wildcards '*/vrf.ko*'
-              find . -name 'vrf.ko*' -exec cp {} ~/vrf-ko/ \;
-              ko=$(find ~/vrf-ko -name 'vrf.ko*' -print -quit)
-            fi
-          fi
-          if [ -n "$ko" ] && sudo insmod "$ko"; then
-            lsmod | grep -w '^vrf'
-            echo "COREROUTER_REQUIRE_VRF=1" >> "$GITHUB_ENV"
-          else
-            echo "::warning::módulo vrf indisponível (sem cache e download lento); o teste de VRF em netns fica de fora deste run"
-            echo "COREROUTER_REQUIRE_VRF=0" >> "$GITHUB_ENV"
-          fi
-
-      # G1.8: o `bonding` vem no linux-modules base; um user namespace também não o carrega.
-      # Módulos simples (só `modprobe`): um arquivo por módulo em ci/kernel-modules/.
-      - name: Carregar os módulos do kernel
-        if: env.DOCS_ONLY != 'true' && github.event_name != 'pull_request'
-        run: |
-          for f in ci/kernel-modules/*; do
-            mod=$(basename "$f")
-            [ "$mod" = README.md ] && continue
-            sudo modprobe "$mod"
-            lsmod | grep -w "^$mod"
-            echo "$(head -n1 "$f")=1" >> "$GITHUB_ENV"
-          done
-
-      - name: cargo xtask ci
-        if: env.DOCS_ONLY != 'true'
-        run: cargo xtask ci ${{ github.event_name == 'pull_request' && '--fast' || '' }}
-
+        run: cargo xtask ci --only fmt,clippy,docs,ebpf-check,layers,agents-sync,wasm
       - name: cargo xtask docs (só documentação)
         if: env.DOCS_ONLY == 'true'
         run: cargo xtask docs
+
+  # Os testes em partes, cada uma num runner de 4 vCPU (o nextest usa todos os núcleos de cada
+  # um): `COREROUTER_CI_PARTITION=i/n` vira `--partition hash:i/n`. Cada parte compila o
+  # workspace do próprio cache (~1,5 min); mais partes que isso só somam compilação.
+  test:
+    name: test (${{ matrix.part }}/${{ strategy.job-total }})
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
+    env:
+      COREROUTER_CI_PARTITION: ${{ matrix.part }}/${{ strategy.job-total }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          nextest: "true"
+      - run: cargo xtask ci --only test
+
+  bench-check:
+    name: bench-check
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+      - run: cargo xtask ci --only bench-check
+
+  # Portão em duas camadas: no PR, `cargo xtask ci --fast` (determinístico, sem os testes
+  # contra o kernel); no lote da fila de entrada (workflow_dispatch) e na main, o completo.
+  # Teste que falha e passa ao repetir é marcado como instável e não reprova (docs/perf.md).
+  netns:
+    name: netns
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          kernel: "true"
+      - run: cargo xtask ci --only netns
+
+  # G2.5: o objeto XDP carregado de verdade, como root (o veth de ci/kernel-modules liga o
+  # COREROUTER_REQUIRE_XDP).
+  # Os testes de root medem vazão e precisão: um por vez em cada runner, as partes em runners
+  # diferentes (`COREROUTER_CI_PARTITION`, divididas pelo tempo medido de cada teste).
+  xdp-root:
+    name: xdp-root (${{ matrix.part }}/${{ strategy.job-total }})
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
+    env:
+      COREROUTER_CI_PARTITION: ${{ matrix.part }}/${{ strategy.job-total }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: ./.github/actions/setup
+        with:
+          kernel: "true"
+      - run: cargo xtask ci --only xdp-root
+
+  # O check exigido pela proteção da main. `if: always()`: um job pulado conta como verde na
+  # proteção, então este roda sempre e falha se algum job falhou ou foi cancelado. Pulado só
+  # vale para quem pula de propósito (PR e só documentação).
+  xtask-ci:
+    name: xtask ci (linux)
+    needs: [changes, lint, test, bench-check, netns, xdp-root]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resultado dos jobs
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          echo "$RESULTS" | jq -r 'to_entries[] | "\(.key) \(.value.result)"' | tee results
+          bad=0
+          while read -r job result; do
+            case "$job:$result" in
+              *:success) ;;
+              test:skipped) [ "$DOCS_ONLY" = true ] || bad=1 ;;
+              bench-check:skipped | netns:skipped | xdp-root:skipped)
+                [ "$DOCS_ONLY" = true ] || [ "$EVENT" = pull_request ] || bad=1 ;;
+              *) bad=1 ;;
+            esac
+            [ "$bad" = 0 ] || { echo "::error::job $job: $result"; exit 1; }
+          done < results
 
   build:
     name: build (${{ matrix.os }})

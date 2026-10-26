@@ -20,10 +20,11 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 
-use corerouter_model::dhcp_server::DhcpServer;
+use corerouter_model::cow_list::CowList;
+use corerouter_model::dhcp_server::{DhcpServer, StaticLease};
 use corerouter_model::ipoe::{IpoeUnknown, UseRadius};
 use corerouter_model::ppp::{AddrOrPool, DEFAULT_PROFILE, PppSecret, PppService};
-use corerouter_model::{Config, IfName, MacAddr};
+use corerouter_model::{Config, IfName, ItemId, MacAddr};
 use corerouter_proto_dhcp::server::Binding;
 use corerouter_proto_dhcp::server::agent;
 use corerouter_proto_dhcp::server::authorize::{AuthAsk, Grant, Verdict};
@@ -74,36 +75,90 @@ pub trait IpoeBackend: Send + Sync {
     }
 }
 
-/// What the IPoE decisions look up per lease, indexed once per config
+/// What the IPoE decisions look up per lease, followed once per config
 /// revision: a lookup is O(1) with 100 000 secrets or static leases (a
 /// scan of `/ppp secret` per DISCOVER was O(secrets) per client).
+///
+/// The secrets need nothing here: the config keeps their name index
+/// itself ([`Secrets::first_named`], incremental since G4.3gb). The static
+/// leases' rates are followed block by block ([`IpoeIndex::refresh`]): a
+/// revision that changed one lease reads its block of 128, not the list
+/// (rebuilding both on every revision cost 22 ms with 100 000, **medido**,
+/// `config_store/ipoe_index/*`).
+///
+/// [`Secrets::first_named`]: corerouter_model::ppp_secrets::Secrets::first_named
 #[derive(Debug, Default, Clone)]
 pub struct IpoeIndex {
     revision: Option<u32>,
-    /// `/ppp secret` with `service=ipoe` by name → its position (the first
-    /// of a name, as a scan would find).
-    secrets: HashMap<String, usize>,
-    /// Static leases with a `rate_limit`, by address (enabled ones).
-    lease_rates: HashMap<Ipv4Addr, String>,
+    /// The static leases `lease_rates` follows (shares their blocks).
+    leases: CowList<StaticLease>,
+    /// Static leases with a `rate_limit`, by address (enabled ones), with
+    /// the lease's id.
+    lease_rates: HashMap<Ipv4Addr, (ItemId, String)>,
+    /// Two leases hold one address (a config edited by hand): every change
+    /// rebuilds, so the last one wins as before.
+    dup: bool,
+}
+
+fn rated(l: &StaticLease) -> bool {
+    !l.disabled && !l.rate_limit.is_empty()
 }
 
 impl IpoeIndex {
     pub fn of(cfg: &Config) -> Self {
-        let mut secrets = HashMap::new();
-        for (i, s) in cfg.ppp.secrets.iter().enumerate() {
-            if s.service == PppService::Ipoe {
-                secrets.entry(s.name.clone()).or_insert(i);
+        let mut index = Self::default();
+        index.refresh(cfg);
+        index
+    }
+
+    /// Follow `cfg`: only the blocks of static leases that are not shared
+    /// with the last config seen are read.
+    pub fn refresh(&mut self, cfg: &Config) {
+        let new = &cfg.ip.dhcp_server.leases;
+        if CowList::ptr_eq(&self.leases, new) {
+            return;
+        }
+        if self.dup {
+            self.rebuild(new);
+            return;
+        }
+        let old = std::mem::replace(&mut self.leases, new.clone());
+        for (block, (_, shared)) in old.blocks().zip(old.shared_blocks(new)) {
+            if shared.is_some() {
+                continue;
+            }
+            for l in block.iter().filter(|l| rated(l)) {
+                if self.lease_rates.get(&l.address).is_some_and(|(id, _)| *id == l.id) {
+                    self.lease_rates.remove(&l.address);
+                }
             }
         }
-        let lease_rates = cfg
-            .ip
-            .dhcp_server
-            .leases
-            .iter()
-            .filter(|l| !l.disabled && !l.rate_limit.is_empty())
-            .map(|l| (l.address, l.rate_limit.clone()))
-            .collect();
-        IpoeIndex { revision: None, secrets, lease_rates }
+        for (block, (_, shared)) in new.blocks().zip(new.shared_blocks(&old)) {
+            if shared.is_some() {
+                continue;
+            }
+            for l in block.iter().filter(|l| rated(l)) {
+                if let Some((id, _)) = self.lease_rates.insert(l.address, (l.id, l.rate_limit.clone()))
+                    && id != l.id
+                {
+                    self.dup = true;
+                }
+            }
+        }
+        if self.dup {
+            self.rebuild(new);
+        }
+    }
+
+    fn rebuild(&mut self, leases: &CowList<StaticLease>) {
+        self.lease_rates.clear();
+        self.dup = false;
+        for l in leases.iter().filter(|l| rated(l)) {
+            if let Some((id, _)) = self.lease_rates.insert(l.address, (l.id, l.rate_limit.clone())) {
+                self.dup |= id != l.id;
+            }
+        }
+        self.leases = leases.clone();
     }
 }
 
@@ -115,20 +170,19 @@ pub struct IpoeView<'a> {
 }
 
 impl<'a> IpoeView<'a> {
-    /// `index` must be [`IpoeIndex::of`] this `cfg`.
+    /// `index` must be [`IpoeIndex::of`] this `cfg`, or refreshed to it.
     pub fn new(cfg: &'a Config, index: &'a IpoeIndex) -> Self {
         IpoeView { cfg, index }
     }
 
     /// The `/ppp secret` (service `ipoe`) named `user`, enabled or not.
     pub fn secret(&self, user: &str) -> Option<&'a PppSecret> {
-        let i = *self.index.secrets.get(user)?;
-        self.cfg.ppp.secrets.get(i)
+        self.cfg.ppp.secrets.first_named(user, |s| s.service == PppService::Ipoe)
     }
 
     /// The `rate_limit` of the static lease of `ip`.
     pub fn lease_rate(&self, ip: Ipv4Addr) -> Option<&'a str> {
-        self.index.lease_rates.get(&ip).map(String::as_str)
+        self.index.lease_rates.get(&ip).map(|(_, r)| r.as_str())
     }
 }
 
@@ -156,7 +210,10 @@ impl Session {
         if self.ext::<IpoeRuntime>().is_some_and(|r| r.index.revision == Some(rev)) {
             return;
         }
-        let mut index = IpoeIndex::of(self.store().running());
+        let Some(mut index) = self.ext_mut::<IpoeRuntime>().map(|r| std::mem::take(&mut r.index)) else {
+            return;
+        };
+        index.refresh(self.store().running());
         index.revision = Some(rev);
         if let Some(rt) = self.ext_mut::<IpoeRuntime>() {
             rt.index = index;
@@ -340,5 +397,64 @@ mod tests {
         // Without the daemon's service the engine cannot ask: refused.
         s.ipoe_refresh();
         assert!(matches!(s.ipoe_authorize(&ask([2, 0, 0, 0, 0, 9], None)), Some(Verdict::Reject(_))));
+    }
+
+    fn rates(idx: &IpoeIndex) -> Vec<(Ipv4Addr, String)> {
+        let mut v: Vec<_> = idx.lease_rates.iter().map(|(a, (_, r))| (*a, r.clone())).collect();
+        v.sort();
+        v
+    }
+
+    fn lease(id: u32, last: u8, rate: &str) -> StaticLease {
+        let mut l = StaticLease::new(ItemId(id), Ipv4Addr::new(10, 0, 0, last));
+        l.rate_limit = rate.into();
+        l
+    }
+
+    proptest::proptest! {
+        /// The index followed block by block equals one built from scratch
+        /// after any series of writes (adds, edits, removals, a duplicated
+        /// address edited by hand).
+        #[test]
+        fn refresh_equals_a_rebuild(ops in proptest::collection::vec((0u8..5, 0u16..600, 0u8..40), 1..60)) {
+            let mut cfg = Config::default();
+            for i in 0..400u32 {
+                cfg.ip.dhcp_server.leases.push(lease(i + 1, (i % 250) as u8, if i % 3 == 0 { "1M/1M" } else { "" }));
+            }
+            let mut idx = IpoeIndex::of(&cfg);
+            let mut next = 1000u32;
+            for (op, at, v) in ops {
+                let mut c = cfg.clone();
+                let leases = &mut c.ip.dhcp_server.leases;
+                let at = usize::from(at) % leases.len().max(1);
+                match op {
+                    0 => {
+                        next += 1;
+                        leases.push(lease(next, 100 + v, "5M/5M"));
+                    }
+                    1 => {
+                        leases.remove(at);
+                    }
+                    2 => {
+                        if let Some(l) = leases.get_mut(at) {
+                            l.rate_limit = format!("{v}M/{v}M");
+                        }
+                    }
+                    3 => {
+                        if let Some(l) = leases.get_mut(at) {
+                            l.disabled = !l.disabled;
+                        }
+                    }
+                    _ => {
+                        if let Some(l) = leases.get_mut(at) {
+                            l.address = Ipv4Addr::new(10, 0, 0, v);
+                        }
+                    }
+                }
+                idx.refresh(&c);
+                proptest::prop_assert_eq!(rates(&idx), rates(&IpoeIndex::of(&c)));
+                cfg = c;
+            }
+        }
     }
 }

@@ -4414,3 +4414,370 @@ continuação indentadas).
 
   Testar: `cargo test -p corerouter-dataplane-ebpf-common`; com root (VM):
   `cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root`.
+
+- 2026-10-26 — G0.21: Config grande, parte a: os benchmarks que faltavam para a G4.3gb (`ppp.secret.add` com 100 mil
+  secrets), a G0.21 (add numa address-list de 60 mil) e a G0.22 (commit com 10 mil rotas e uma
+  mudança fora delas), com a linha de base da `main`. Nada muda no comportamento.
+
+  - `cargo bench -p corerouter-engine --bench config_store` (novo): `ppp.secret.add` sozinho, em lote
+    não atômico (cada passo faz commit) e em lote atômico, e `ppp.secret.set`, com 1 mil, 10 mil e
+    100 mil secrets.
+  - `engine_txn/single/address_list_add/60000`: só o add (o par add + remove já existia).
+  - `storage_fs/commit/ppp_secret_add/{10000,100000}`: o add com o arquivo de verdade (fsync).
+
+  Onde vão os 219 ms de um add com 100 mil secrets (**medido**, instrumentação temporária no
+  `commit_counted`): `validate_all` 22 µs, `persist::encode_config` 10,8 ms, `hal.apply` e
+  `store.commit` < 0,1 ms, o `save` 195 ms. No `save`, o delta da revisão (`config_delta::diff`)
+  serializa a seção `ppp` inteira das duas configs para JSON e compara as árvores: os secrets não
+  são uma seção copy-on-write separada. Depois vêm o texto do slot (a config inteira de novo) e a
+  gravação.
+
+- 2026-10-26 — G0.21: Config grande, parte b: dois tipos novos no `corerouter-model`, ainda sem uso nas seções.
+
+  - `cow_list::CowList<T>`: lista em blocos de até 128 itens, cada bloco compartilhado entre as
+    cópias da config até um lado escrever nele. Clonar custa uma contagem de referência; a primeira
+    escrita depois do clone copia o "espinho" (um ponteiro por bloco) e o bloco tocado. Lê como um
+    `Vec` (`len`, `get`, `iter` de duas pontas, `push`, `insert`, `remove`, `retain`, `get_mut`,
+    `find_mut`, `find_by_key` com busca binária pelo id), serializa igual a um `Vec` (os arquivos
+    salvos não mudam), compara pulando os blocos compartilhados e diz quais blocos duas versões ainda
+    compartilham (`shared_blocks`, para o delta da revisão).
+  - `cow_map::CowMap<K, V>`: mapa de hash em árvore fixa de 64 × 64 folhas, cada nó compartilhado até
+    ser escrito; uma escrita copia dois nós de 64 ponteiros e uma folha (~25 entradas com 100 mil).
+    Chaves de hash aleatórias por mapa (um nome escolhido para colidir não empilha uma folha).
+
+  Testes: proptest contra `Vec` e `HashMap` com cópias tiradas no meio (cada cópia guarda o que
+  tinha), serialização igual à do `Vec`, tamanho dos blocos limitado depois de remoções.
+  `cargo test -p corerouter-model cow_`; `cargo bench -p corerouter-model --bench cow_list`.
+
+- 2026-10-26 — G0.21: Config grande, parte c: as listas grandes da config passam a ser `CowList` (blocos de 128 itens
+  copy-on-write, parte b): `ip.addresses`, `ip.routes`, as tabelas `filter`/`nat`/`mangle`,
+  `ip.firewall.address_lists`, `ppp.secrets`, `ip.dhcp_server.leases` e `ip.dns_static.entries`.
+  Uma escrita depois de um commit copia um bloco e o espinho, não a lista.
+
+  - **Índices incrementais.** `Secrets` (nome → id em `CowMap`, rotas → id) e o novo `AddressLists`
+    (quantas entradas põem um endereço numa lista) são mantidos por `push`, `update` e `remove` em
+    vez de refeitos; os valores são ids, não posições (remover não desloca o índice). O id acha a
+    posição por busca binária (`find_by_key`: a lista está em ordem de id). `ppp.secret.set/remove/
+    enable/disable` e `ip.firewall.address-list.add/set/remove` usam isso: o add não varre mais a
+    address-list para achar duplicata.
+  - **Delta da revisão por bloco.** `config_delta::diff` copia os blocos que as duas versões
+    compartilham e só serializa e compara os itens entre eles; `ppp.secrets`, os leases estáticos e o
+    DNS estático viraram seções próprias do delta (antes a seção `ppp` inteira ia para JSON duas
+    vezes por commit: 195 dos 219 ms de um `ppp.secret.add` com 100 mil secrets).
+  - **Formato em disco igual.** `CowList` serializa como o `Vec`; os arquivos de revisão continuam
+    no formato do `json_delta` (o delta por bloco é um `{"a": [...]}` como os outros). Testes:
+    proptest de edições aleatórias nos secrets (o delta entre quaisquer duas versões reconstrói a
+    mais velha, tipado e pela árvore), delta de um secret, um lease e um nome DNS em milhares
+    (< 400 bytes), os testes de ida e volta do histórico.
+
+  Para quem acrescenta seção: lista grande nova = `CowList<T>` (ou um invólucro com índice, como
+  `Secrets`/`AddressLists`) e uma linha em `config_delta` (`p.list` no diff, `list()` no apply).
+  Sem slice: `&CowList<T>` ou um iterador no lugar de `&[T]`; `get_mut`/`find_mut` copiam um bloco,
+  `iter_mut` copia todos.
+
+  Fica para depois (anotado em G0.22): o serviço IPoE ainda refaz o seu índice de secrets
+  (`IpoeIndex::of`, O(n)) a cada revisão, na thread dele; pode passar a usar `Secrets::by_name`.
+
+- 2026-10-26 — G0.21: Config grande, parte d: `queue.simple` (G4.9) entra nas listas em blocos (`CowList`), com
+  delta próprio no `config_delta` (a seção `queue` como a `ppp`, a lista `simple` por bloco) e
+  na lista de seções grandes da validação (nenhum validador lê as filas; o teste de dependências
+  confere). Com 10 mil filas qualquer commit comparava a lista inteira por valor (detecção de
+  mudança, data plane) e a serializava duas vezes por revisão.
+
+  Como testar: `cargo test -p corerouter-model config_delta` (`one_queue_of_many_is_one_small_delta`),
+  `cargo bench -p corerouter-engine --bench config_store -- identity_set`.
+
+- 2026-10-26 — G0.22: Commit incremental, parte a: um commit valida e planeja só o que mudou.
+
+  - `corerouter_model::sections`: `Sections` (conjunto das seções da config, 22 bits), `changed(a, b)`
+    (por ponteiro primeiro, por valor só nas seções pequenas; os comentários das interfaces são
+    uma seção à parte, `IFACE_COMMENTS`; campo novo sem seção cai em `OTHER`/`IP_REST`/`PPP_REST`/
+    `FIREWALL_REST` sozinho) e `restrict(cfg, s)` (a config só com as seções de `s`).
+  - `validate::UNITS`: a validação virou uma tabela de unidades (núcleo: interfaces, endereços,
+    rotas, NTP; e cada `proto-*`), cada uma com as seções que lê. O commit roda só as que leem
+    uma seção alterada, quando a config em execução é a última que passou na validação inteira
+    (`ValidRunning` na extensão da sessão); config restaurada, importada ou trocada de outro jeito
+    valida tudo. `validate_all` continua igual (todas as unidades, mesma ordem).
+  - **Dependência esquecida não passa:** `tests/incremental_validate.rs` (1) confere, num corpus
+    (uma config rica montada por comandos e ela quebrada de cada jeito: interface, endereço,
+    rota, regra, pool, perfil, lista a menos, endereço numa interface qualquer, MTU, NTP), que cada
+    unidade responde igual na config restrita ao que declara; (2) proptest: mudanças aleatórias
+    validadas pelo caminho incremental e pelo inteiro dão as mesmas issues. E todo build de debug
+    (todos os testes do workspace) confere cada commit incremental contra a validação inteira e
+    falha o comando se divergirem. O teste (1) pegou na primeira versão que as interfaces leem os
+    endereços (escravo de bond sem endereço); o corpus agora tem esse caso.
+  - Data plane: o `VirtualHal` e o plano do `hal-linux` ignoram mudança só de comentário de
+    interface e o plano não refaz endereços e rotas do kernel quando interfaces, endereços e
+    rotas são os mesmos (`sections::links_and_routes_same`).
+  - `proto-dhcp`: a checagem de IPoE só passeia pelos secrets quando há servidor que precisa.
+
+  Para quem acrescenta validador: uma linha em `UNITS` com as seções lidas; os testes acima dizem
+  se faltou alguma.
+
+- 2026-10-26 — G0.22: Commit incremental, parte b: o commit não serializa nem grava mais a config inteira.
+
+  - **Journal da config** (`history_files`, num backend com `config_journal()`: `FileStorage` e
+    `MemoryStorage`): o commit grava uma linha em `journal-config.log` com a diferença para a frente
+    da revisão anterior (`persist::encode_journal_line`, mesmo formato dos arquivos de revisão). O
+    slot só é reescrito num checkpoint: mais de 1024 linhas ou de ¼ da config (mínimo 1 MiB) em
+    linhas, usuários mudados, store que não é o registrado (Safe Mode, restore), ou enquanto os
+    dois slots não existem. O checkpoint anota a revisão nova no journal, grava o slot e deixa no
+    journal só as linhas depois da revisão que virou o slot `previous`: o `previous` + o journal
+    sempre dão a revisão mais nova (antes, perder o slot corrente perdia o último commit; os testes
+    `corrupt_current_*` e `missing_current_uses_previous` agora recuperam tudo).
+  - **Boot**: as linhas que encadeiam a partir do slot carregado são reaplicadas por bloco (um
+    trecho copiado reaproveita os blocos da `CowList`, `CowList::extend_from`); linha ruim encerra o
+    replay e vai para `storage.boot_errors`; última linha cortada (queda no meio do append) é só
+    descartada, e o próximo save faz checkpoint em vez de anexar depois dela. Os arquivos de revisão
+    das revisões refeitas pelo journal são conferidos (delta aplicado = revisão em memória) e não
+    são regravados.
+  - **Limite de tamanho sem serializar**: teto = config do slot + bytes das linhas desde ele (uma
+    linha só cresce a config com o que carrega); a config só é medida de verdade quando o teto passa
+    de `MAX_CONFIG_BYTES`.
+  - **Delta de bloco mais barato**: os itens iguais nas pontas de um bloco alterado viram cópia por
+    comparação tipada; só o que mudou é serializado (o custo deixou de depender do tamanho do bloco).
+    `CowList::range` virou um iterador limitado de duas pontas.
+  - **Formato**: o slot continua o mesmo (versões anteriores o leem); o journal é um arquivo novo.
+    Risco anotado em `docs/architecture.md`: um build anterior ao G0.22 lê só o slot e perde as
+    linhas desde o último checkpoint (G0.27: checkpoint no desligamento).
+
+  Testes: `tests/config_journal.rs` (reboot igual, checkpoint depois do limite, linha cortada, linha
+  ruim no meio, queda de energia em cada passo do save — revisão, append, slot, reescrita do
+  journal, remoção — com 5, 1023, 1024 e 1025 commits, `previous` + journal depois de 1 a 2100
+  commits, usuário mudado, Safe Mode com `exit` e `cancel`, e um proptest de sequências aleatórias de
+  comandos com reboots no meio: o journal salva o mesmo store que o slot salvaria); `storage-fs`
+  com arquivos de verdade (`commits_go_to_the_config_journal_file`). `MemoryStorage::slots_only()`
+  mantém os testes do encadeamento de arquivos de revisão sem journal.
+
+- 2026-10-26 — G4.3cd: Rotas por assinante, parte 3 (janela PPP). O diálogo do secret ganha o campo **Routes** (texto do
+  RouterOS; a recusa do engine aparece embaixo do campo e trava o OK), a aba Secrets a coluna Routes,
+  e Active Connections a coluna **Routes**: um selo por bloco e um selo da origem (secret,
+  Framed-Route, Framed-IPv6-Route, Framed-IPv6-Prefix), mais um selo vermelho com quantas foram
+  recusadas. O **Why?** lista as rotas da sessão conectada com a origem e cada recusada com o motivo
+  em português. ⓘ em português (e inglês) nos três lugares.
+
+  Duas correções que as capturas acharam no diálogo do secret (existiam antes):
+  - editar um secret sem limites dava "bytes, a non-negative integer" e travava o OK (o diálogo manda
+    o campo vazio como texto; o `ppp.secret.set` agora aceita `""` e números em texto);
+  - editar um secret mandava `password: ""` e **apagava a senha** a cada edição, embora o campo diga
+    "vazio mantém"; um campo só de escrita vazio não vai mais no comando (`list_modal`).
+
+  Testes: `tests/ppp_routes.rs` (selos da coluna, coluna do secret, Why? com recusa, a senha mantida),
+  `ppp_secret::limits_as_text_like_the_modal_sends_them`. Capturas (olhadas) no laboratório em
+  namespace com 6 CPEs.
+
+- 2026-10-26 — G4.3cd: Rotas por assinante, parte 4 (IPoE). O serviço `ipoe` instala os blocos do secret `service=ipoe`
+  ou do Access-Accept (`Framed-Route`, `Framed-IPv6-Route`, o segundo `Framed-IPv6-Prefix`) quando o
+  lease vira sessão, com a mesma tabela de donos do PPPoE e as mesmas recusas. O kernel entrega o
+  IPoE ao assinante, então cada bloco IPv4 vira uma rota `bloco via <assinante>`
+  (`pppoe_io::gateway_routes`, com ou sem XDP); com XDP, também a entrada no LPM (policer e
+  contadores). Na queda as rotas saem antes da sessão; CoA com `Framed-Route` troca sem derrubar o
+  lease (inválido = NAK 407). IPv6 IPoE é recusado com o motivo (G4.3s). Log das rotas e recusas no
+  tópico `ppp`; Accounting com as rotas.
+
+  A lógica do CoA de rotas (`RouteChange`, `route_change`, `check_change`) foi para
+  `corerouter_engine::framed`, usada pelos dois serviços.
+
+  Testes: `ipoe_bng_tests` (`routed_blocks_follow_the_ipoe_session`, `coa_changes_ipoe_routes`),
+  `netns_gateway_routes` (a rota de verdade num namespace, sem root).
+
+  Também: a exportação dos secrets com `routes` (e senha) segue no G4.3n.
+
+  Desempenho (**medido**, 2026-10-26, Ryzen AI Max+ 395, release):
+  - `ppp.secret.add` com rota sobre 100 000 secrets com endereço fixo: a conferência "o bloco tem o
+    endereço fixo de outro secret" passeava por todos os secrets (O(n) por secret com rota). Com um
+    índice dos endereços fixos em `Secrets` (como os de nome e de rotas), 1000 secrets com rota num
+    lote: 634 → 354 ms; o que sobra é o custo de qualquer `add` nesse tamanho (278 ms para 1000
+    secrets sem rota, abaixo).
+  - Rotas do kernel do IPoE (`netns_gateway_routes`): 1000 blocos numa rodada de netlink 4,0 ms
+    (remover 2,3 ms), uma rodada por bloco 9,8 ms; o serviço manda uma rodada por volta da thread.
+  - Achado fora da G4.3cd: com 100 mil secrets, um `ppp.secret.add` sozinho custa 232 ms (1,5 ms com
+    mil) e, num lote, 1,2 ms por passo (14 µs com mil): cada passo do lote faz commit, e a escrita
+    seguinte copia a lista inteira de secrets (copy-on-write da seção). Vira a G4.3gb.
+
+- 2026-10-26 — G4.3gb: `ppp.secret.add/set` em O(1) com 100 mil secrets: o fim da série G0.21 (listas em blocos e
+  índices incrementais), G0.22 parte a (validação e plano só do que mudou) e G0.22 parte b (journal
+  da config, neste PR). Números na seção `## perf` da G0.22 parte b.
+
+- 2026-10-26 — G4.3h: BNG em alta disponibilidade, fases 1 e 2 no serviço `pppoe`.
+
+  Fase 1:
+  - só o nó ativo do par fala com os assinantes: o standby não responde nem manda o PADT a sessão
+    desconhecida, que derrubaria o CPE no ativo;
+  - o AC MAC é o MAC virtual, e as portas de acesso ficam em modo promíscuo;
+  - o AC-Cookie usa a chave do par sem amarrar a porta (`ServerConfig::cookie_secret`).
+
+  Fase 2 (hot standby):
+  - cada worker publica as suas sessões ao `ppp-ha` (`pppoe_bng/ha.rs`);
+  - na tomada, os workers adotam as sessões antes de responder: Opened no `proto-pppoe`, endereço,
+    XDP ou rota, rotas, tabela ativa com os contadores herdados;
+  - a contabilização continua: o mesmo Acct-Session-Id e um Interim-Update; o serviço RADIUS agenda
+    os próximos Interims a partir dele;
+  - o nó que entrega o papel não manda Acct-Stop;
+  - o número de workers entra na divergência de config.
+
+  Correção: o Acct-Session-Id se repetia entre workers no mesmo segundo (RFC 2866 §5.5); agora
+  leva a lane do worker.
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-daemon --test netns_ha_pppoe -- --test-threads 1 --nocapture`.
+
+  **Medido**, debug, com dois daemons reais e 200 CPEs:
+
+  | Modo | Depois da morte do ativo |
+  |---|---|
+  | Stateless | os CPEs voltam no outro nó em 4,9 s |
+  | Hot standby | sessões no outro nó em 1,22 s, nenhum CPE cai |
+
+  Teste de unidade: `cargo test -p corerouter-daemon --bin corerouter-daemon pppoe_ha_tests`.
+
+  Desempenho: o worker nunca espera o lock do par. Se o lock está ocupado (a thread do sync
+  codificando um snapshot), as mudanças voltam para a fila do worker e saem na rodada seguinte. Os
+  contadores para o standby saem na passada do `tick` de 1 s, sem varredura própria. Os números
+  estão em `docs/bng-ha.md` §4.
+
+- 2026-10-26 — G4.3h: Laboratório da G4.3h: `cargo xtask bng-lab --only ha` (`tests/bng_lab_ha.rs`, `docs/bng-ha.md`
+  §2.10).
+
+  O teste monta três namespaces: o nó A, o nó C e o BNG Blaster. Tem uma bridge de acesso por porta,
+  o uplink, o link de sync, a testemunha e um servidor RADIUS de teste. Com todas as sessões em A e a
+  réplica de C completa, A perde a energia: todas as portas caem juntas.
+
+  O teste confere:
+  - a tomada;
+  - a volta do tráfego de subida;
+  - as sessões perdidas (flaps no BNG Blaster);
+  - os Starts com ids únicos;
+  - nenhum Stop;
+  - um Interim do nó novo para cada sessão.
+
+  Com `--root` (na VM), o XDP genérico roda nos dois nós, e as sessões adotadas são programadas nos
+  mapas do nó novo.
+
+  Como testar: `flock vm/root.lock cargo xtask vm-lab run -- cargo xtask bng-lab --only ha --scales
+  1000,10000,100000` (com `--root` para o XDP).
+
+  **Medido** na VM `corerouter-lab` (8 vCPUs, release, BNG Blaster 1.0.1, 2026-10-26). Em todas as
+  escalas, nos dois planos: 0 sessões perdidas, 0 Stops, todos os Starts com ids distintos e um
+  Interim do nó novo por sessão.
+
+  | Sessões | Tomada, caminho lento | Tomada, XDP | Tráfego de subida de volta |
+  |---:|---:|---:|---:|
+  | 1 000 | 1,13 s | 1,23 s | 1,14–1,25 s |
+  | 10 000 | 1,12 s | 1,24 s | 1,14–1,27 s |
+  | 100 000 | 1,15 s | 0,99 s | 1,12–1,29 s |
+
+  A tomada é quase toda a espera pela morte do par: 4 hellos de 300 ms.
+
+- 2026-10-26 — G4.3l: PPPoE em QinQ e VLANs no caminho lento, parte 1 (`docs/pppoe.md` §13). O servidor ganha
+  `vlan_mode=stacked` com `outer_vlan_range`, `inner_vlan_range` (`any`), `outer_tpid`
+  (0x88a8/0x8100), `max_sessions_per_vlan` (1 = TR-101 1:1) e `max_payload` (RFC 4638, até a MTU −
+  8). O caminho lento abre um socket `ETH_P_ALL` por S-tag com filtro BPF de VID, TPID e EtherType
+  (`hal-linux::pppoe_io::Listen`). Isso conserta a VLAN simples sem XDP: o socket preso ao
+  protocolo recebia o quadro com a tag já apagada. Um quadro QinQ vai ao worker pelo par de tags. O
+  RADIUS recebe ADSL-Agent-Circuit-Id/Remote-Id e NAS-Port-Id `<porta>:<s>-<c>`, e o Active traz
+  `vlan` e `inner_vlan`.
+
+  Como testar: `cargo xtask netns` (`netns_pppoe_io`: cada combinação de tags chega a um socket só;
+  `netns_pppoe_qinq`: 400 linhas QinQ com 1 sessão cada, ping pelo caminho lento dentro das duas
+  tags, VLAN simples e CPE sem tag recusado), `cargo test -p corerouter-proto-pppoe` e
+  `cargo test -p corerouter-daemon qinq_lines`.
+
+- 2026-10-26 — G4.3l: PPPoE sem XDP, parte 2: o IPv6 dos assinantes é encaminhado no caminho lento (`docs/pppoe.md`
+  §12.5). Na subida, só da fonte no /64 ou no prefixo delegado da sessão, no MAC e nas tags dela,
+  por um socket IPv6 cru. Na descida, há rotas de cada /64 e prefixo delegado para o `bng0`, e o
+  pacote volta ao worker dono pelo maior prefixo (`Net6Index`, ~16 ns com 200 mil prefixos,
+  **medido**), encapsulado nas tags da linha. O IPv4 do caminho lento passa a conferir também as tags
+  da sessão.
+
+  Como testar: `cargo xtask netns` (`netns_pppoe_qinq`: ping IPv6 de um assinante QinQ dual-stack
+  até o `wan0` e de volta, e a fonte falsificada é recusada) e
+  `cargo test -p corerouter-daemon ipv6_on_the_slow_path`.
+
+- 2026-10-26 — G4.9b: Filas (G4.9b), correção: com XDP ligado, a descida dos assinantes PPPoE/IPoE no modo padrão
+  (`download_mode=shaper`) saía **sem limite** (2× o plano no laboratório BNG Blaster, **medido**).
+  Duas causas no carregador (`hal-linux`):
+
+  - o bit `ON_SESSIONS` do `SETTINGS`, que liga a busca de sessão no `shape_egress`, só era escrito
+    quando o plano da fila entrava, e o daemon aplica o plano antes de qualquer sessão subir: o XDP
+    largava a descida para o kernel e ninguém moldava. Agora a primeira sessão moldada liga o bit e
+    a última o desliga;
+  - uma sessão que pede shaper só larga o policer do XDP depois que o shaper está preso nas portas
+    de acesso (e no `bng0`); antes disso, ou se o shaper cair, ela fica policiada no XDP (nunca sem
+    limite) e troca sozinha quando ele volta.
+
+  Como testar: `cargo test -p corerouter-hal-linux shaped_sessions` (sem root); na VM,
+  `xdp_root::pppoe_kernel_delivery_through_bng0` agora aplica o plano antes da sessão, como o
+  daemon; e `cargo xtask bng-lab --root --only radius` volta a medir a descida dentro de 5%.
+  Laboratório (VM, 8 vCPUs, kernel 7.0, BNG Blaster, 100 sessões RADIUS a 1M/2M com 2× oferecido,
+  **medido** 2026-10-26): descida 1,004× o limite (mín 1,000, máx 1,009), antes 2,015× na `main`;
+  com CoA 1,002×. `xdp_root` 18 de 18.
+
+- 2026-10-26 — G4.9c: Filas (G4.9), parte 3: a interface.
+
+  - **Janela Queues** (grupo próprio no menu, `crates/ui/src/queues.rs`): abas Simple Queues, Per-IP
+    (PCQ) e Queue Types, barra + − ✓ ✗ 💬, filtros por origem (fixa, PPPoE, IPoE, lease e rede do
+    DHCP), selo da origem, colunas Name, Target, Max Limit, Rate, Queue (ms), Drops, Queue Type. A
+    fila selecionada mostra os avisos inteiros (alvo encoberto por uma fila acima, sobreposição com
+    dinâmica). Sem plano de dados que molde (laboratório virtual), a janela diz por quê.
+  - **Prévia no modal:** `queue.simple.preview`, `queue.per-ip.preview` e `queue.type.preview`
+    checam como o `add`/`set` e mostram o que a fila faz (descida moldada a X, subida policiada a Y,
+    alvos em vigor) e o comando RouterOS equivalente, sem mudar nada.
+  - **PPP:** o perfil ganha Download Mode (shaper/policer) e Queue Type (lista de `queue.type.list`);
+    Active Connections ganha Queue (espera da fila da sessão) e Drops; `ppp.active.list` documenta
+    `queue_us` e `drops`.
+  - **Correção:** um limite por IP (PCQ com taxa) não recebe mais o aviso "max-limit 0/0: a fila só
+    conta".
+  - Explicação ⓘ de cada aba, coluna e campo em português e inglês (testes conferem todas as
+    chaves).
+
+  Como testar: `cargo test -p corerouter-ui queues ppp`, `cargo test -p corerouter-engine --test
+  queue`; na GUI, menu Queues (capturas no PR).
+
+- 2026-10-26 — G4.9d: Filas (G4.9), parte 4: o laboratório em massa.
+
+  - `cargo xtask bng-lab --root --only shaping --shaping <n>`: `n` sessões pelo perfil, fluxos a 2× o
+    plano nos dois sentidos; a descida segurada pelo policer do XDP e depois pelo shaper (EDT); mede
+    descida e subida contra o limite (média, mín, máx), a fila que as sessões mostram, a CPU e se o
+    shaper está ativo. Falha se a descida moldada sair de ±5%.
+  - Acima de 100 sessões o plano encolhe para o BNG Blaster oferecer ~75 mil pacotes/s (um gerador
+    só não dá os 750 mil de 1000 sessões a 1M/2M, **medido**).
+  - O laboratório achou o defeito corrigido em #260 (descida moldada sem limite no modo padrão).
+
+  Como testar: `cargo xtask vm-lab run -- cargo xtask bng-lab --root --only shaping --shaping 1000
+  --scales 1000`.
+
+- 2026-10-26 — processo: CI completo do lote em jobs paralelos: de ~23 min para ~6,5 min por lote (**medido**), sem
+  tirar nenhum passo.
+
+  - `.github/workflows/ci.yml`: o job serial `xtask ci (linux)` virou cinco jobs paralelos, cada
+    um com `cargo xtask ci --only <passos>`: `lint` (fmt, clippy, docs, ebpf-check, layers,
+    agents-sync, wasm), `test`, `bench-check`, `netns` e `xdp-root`. O PR (`--fast`) roda só
+    `lint` e `test`; os três lentos rodam no lote da fila (workflow_dispatch) e na `main`. O
+    check exigido pela proteção da `main` continua com o nome `xtask ci (linux)`: agora é o job
+    final (`if: always()`) que confere o resultado de todos e só aceita "pulado" onde é de
+    propósito (PR, PR só de documentação). Os outros dois checks exigidos não mudaram. O
+    `scripts/land.sh` lê a conclusão do run inteiro, que já espera todos os jobs; o `main-red`
+    também.
+  - `.github/actions/setup`: a preparação comum (pacotes apt, toolchain, rust-cache, nextest,
+    módulos do kernel) numa action local. O cache do cargo é por job (cada um guarda só o que
+    compila: 0,2–0,5 GB cada, 1,6 GB os cinco, contra 1,1 GB do job único).
+  - `cargo xtask ci --only a,b` roda só esses passos, na ordem do `ci` (`--fast` junto tira os
+    lentos). `cargo xtask ci` sem opção continua igual.
+  - `bench-check`: compila no perfil novo `bench-check` (`opt-level = 1` com as debug assertions e
+    a checagem de overflow de um build de teste) e roda os binários em paralelo, um por CPU, os
+    mais lentos primeiro. Continua provando que todo benchmark compila e roda uma vez no modo de
+    teste do criterion. Em debug e um depois do outro, eram 9 min 55 s no CI, quase tudo
+    rodando montagens grandes (1M de rotas, 100 mil sessões); o maior, `ui frames`, levava 177 s.
+  - `scripts/land.sh`: os testes instáveis (FLAKY do nextest, "flaky netns test") do CI de cada
+    lote vão para o log da fila (`instável (run …): …`), para serem corrigidos antes de causarem
+    uma bisseção.
+
+  Como testar: `cargo xtask ci --only fmt,wasm`; `cargo xtask ci --only bench-check`;
+  `cargo xtask ci` (completo, como antes). No GitHub, Actions → ci → Run workflow numa branch.
+
+  Atenção: depois do merge, o primeiro CI de PR roda com o cache frio (as chaves novas só são
+  salvas pela `main`): ~7 min no lote, **medido**; o push na `main` que segue o merge salva os
+  cinco caches.
+
+- 2026-10-26 — processo: O teste `the_daemon_authenticates_through_its_radius_service` era instável e reprovou o lote do #262 e do #264 em 2026-10-26. Ele lia o log logo depois da resposta do RADIUS, mas o serviço só esvazia a fila de log do driver no tick dele, então a linha "recusado" às vezes ainda não tinha chegado. Agora o teste espera a linha aparecer, com prazo de 5 s.
