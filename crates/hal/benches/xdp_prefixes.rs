@@ -32,7 +32,9 @@ fn entry(i: u32) -> AddressListEntry {
     AddressListEntry {
         id: ItemId(i + 1),
         list: "bad".parse().unwrap(),
-        address: AddrMatch::Net(IpNet::from(std::net::IpAddr::from(std::net::Ipv4Addr::from(0x0a00_0000 + i)))),
+        address: AddrMatch::Net(IpNet::from(std::net::IpAddr::from(
+            std::net::Ipv4Addr::from(0x0a00_0000 + i),
+        ))),
         disabled: false,
         comment: String::new(),
     }
@@ -42,8 +44,10 @@ fn entry(i: u32) -> AddressListEntry {
 fn config(n: u32) -> Config {
     let mut cfg = Config::default();
     let e1: IfName = "ether1".parse().unwrap();
-    cfg.interfaces
-        .insert(e1.clone(), Interface::new(e1.clone(), InterfaceKind::Ethernet));
+    cfg.interfaces.insert(
+        e1.clone(),
+        Interface::new(e1.clone(), InterfaceKind::Ethernet),
+    );
     cfg.ip.xdp.interfaces.push(XdpInterface {
         interface: e1,
         mode: XdpMode::Auto,

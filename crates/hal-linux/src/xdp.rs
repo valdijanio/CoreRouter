@@ -29,7 +29,9 @@ use corerouter_dataplane_ebpf_common::maps as m;
 use corerouter_dataplane_ebpf_common::nat::Endpoint;
 use corerouter_dataplane_ebpf_common::parse::Addr;
 use corerouter_hal::HalError;
-use corerouter_hal::xdp::{PrefixChanges, REASONS, XdpPlan, XdpPort, XdpPrefixes, XdpStatus, XdpTop};
+use corerouter_hal::xdp::{
+    PrefixChanges, REASONS, XdpPlan, XdpPort, XdpPrefixes, XdpStatus, XdpTop,
+};
 use corerouter_model::firewall::{AddrMatch, DynamicAddress, Name};
 use corerouter_model::xdp::XdpMode;
 use corerouter_model::{Config, IfName};
@@ -146,7 +148,10 @@ impl XdpState {
 
     /// The settings and ports of the last config synced.
     fn settings(&self) -> XdpPlan {
-        self.cfg.as_ref().map(XdpPlan::settings_of).unwrap_or_default()
+        self.cfg
+            .as_ref()
+            .map(XdpPlan::settings_of)
+            .unwrap_or_default()
     }
 
     /// A dynamic address-list entry came or went: the tries follow, if the
@@ -354,10 +359,18 @@ impl XdpState {
             } else {
                 read_top(&mut l.ebpf, top, &lists)
             },
-            block_prefixes: if self.tries_on { self.prefixes.len().0 } else { 0 },
+            block_prefixes: if self.tries_on {
+                self.prefixes.len().0
+            } else {
+                0
+            },
             fast_nat_flows: lock_nat(&self.nat).count(),
             fast_nat_misses: misses,
-            allow_prefixes: if self.tries_on { self.prefixes.len().1 } else { 0 },
+            allow_prefixes: if self.tries_on {
+                self.prefixes.len().1
+            } else {
+                0
+            },
         }
     }
 

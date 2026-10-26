@@ -172,11 +172,18 @@ impl XdpPrefixes {
     /// last call) and its list names. `dynamic` is every dynamic entry the
     /// backend holds, read only when the list names changed (everything
     /// is counted again then).
-    pub fn follow<'a>(&mut self, cfg: &Config, dynamic: impl IntoIterator<Item = &'a DynamicAddress>) {
+    pub fn follow<'a>(
+        &mut self,
+        cfg: &Config,
+        dynamic: impl IntoIterator<Item = &'a DynamicAddress>,
+    ) {
         let f = &cfg.ip.xdp.filter;
         let lists = cfg.ip.firewall.address_lists.list();
         if f.block_lists != self.block.lists || f.allow_lists != self.allow.lists {
-            for (side, names) in [(&mut self.block, &f.block_lists), (&mut self.allow, &f.allow_lists)] {
+            for (side, names) in [
+                (&mut self.block, &f.block_lists),
+                (&mut self.allow, &f.allow_lists),
+            ] {
                 let old = std::mem::take(&mut side.held);
                 side.dirty.extend(old.into_keys());
                 side.lists = names.clone();
@@ -255,7 +262,15 @@ impl XdpPrefixes {
     /// The prefixes a map may hold: every one counted and every one
     /// pending (removing them all empties it).
     pub fn every_key(&self) -> (Vec<IpNet>, Vec<IpNet>) {
-        let keys = |s: &Side| s.held.keys().chain(s.dirty.iter()).copied().collect::<BTreeSet<_>>().into_iter().collect();
+        let keys = |s: &Side| {
+            s.held
+                .keys()
+                .chain(s.dirty.iter())
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
         (keys(&self.block), keys(&self.allow))
     }
 
