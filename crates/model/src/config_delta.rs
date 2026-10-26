@@ -31,6 +31,7 @@ use crate::firewall::Firewall;
 use crate::ppp::Ppp;
 use crate::queue::Queues;
 use crate::ppp_secrets::Secrets;
+use crate::simple_queues::SimpleQueues;
 use crate::json_delta;
 use crate::persist::PersistError;
 
@@ -202,12 +203,16 @@ fn apply_queue(base: &Queues, delta: &Value) -> Result<Queues, PersistError> {
         &["simple"],
         |q| {
             let mut light = q.clone();
-            light.simple = CowList::default();
+            light.simple = SimpleQueues::default();
             light
         },
         |out, base, key, op| {
             if key == "simple" {
-                out.simple = list(&base.simple, op)?;
+                out.simple = match op {
+                    Op::Keep => base.simple.clone(),
+                    Op::Remove => SimpleQueues::default(),
+                    Op::Patch(_) => SimpleQueues::from_list(list(base.simple.list(), op)?),
+                };
             }
             Ok(())
         },
@@ -283,12 +288,12 @@ fn diff_config(a: &Config, b: &Config) -> Result<Option<Value>, PersistError> {
             (false, false) => {
                 let light = |x: &Queues| {
                     let mut l = x.clone();
-                    l.simple = CowList::default();
+                    l.simple = SimpleQueues::default();
                     l
                 };
                 let d = match Parts::small(&a.queue, &b.queue, light)? {
                     Some(mut q) => {
-                        q.list("simple", &a.queue.simple, &b.queue.simple)?;
+                        q.list("simple", a.queue.simple.list(), b.queue.simple.list())?;
                         q.finish()
                     }
                     None => whole(&a.queue, &b.queue)?,
