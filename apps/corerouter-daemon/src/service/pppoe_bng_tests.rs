@@ -476,17 +476,23 @@ fn slow_path_carries_ipv4_both_ways() {
 #[derive(Default)]
 struct FakeAaa {
     accts: Mutex<Vec<AcctRequest>>,
+    asked: Mutex<Vec<AuthRequest>>,
 }
 
 impl AaaBackend for FakeAaa {
     fn authenticate(&self, req: AuthRequest, done: AuthDone) {
+        self.asked.lock().unwrap().push(req.clone());
         let ok = matches!(&req.credentials, corerouter_model::radius::Credentials::Chap { .. } | corerouter_model::radius::Credentials::MsChapV2 { .. } | corerouter_model::radius::Credentials::Pap { .. })
             && req.user.starts_with("r");
         let mut reply = AuthReply::failed(if ok { AuthOutcome::Accept } else { AuthOutcome::Reject }, "");
         reply.message = None;
         if ok {
             reply.attributes = vec![
-                Attribute::new("Framed-IP-Address", "100.65.0.9"),
+                // One address per login: `r3` gets .12, `radius-user` .9.
+                Attribute::new(
+                    "Framed-IP-Address",
+                    format!("100.65.0.{}", 9 + req.user.trim_start_matches(|c: char| !c.is_ascii_digit()).parse::<u8>().unwrap_or(0)),
+                ),
                 Attribute::new("Mikrotik-Rate-Limit", "5M/25M"),
             ];
         } else {
@@ -1414,4 +1420,66 @@ fn service_names_choose_the_profile_and_drop_rows_get_nothing() {
         let (profile, rate) = if want == "iptv" { ("tv", "5M/20M") } else { ("default", "10M/50M") };
         assert_eq!((a.profile.as_str(), a.rate_limit.as_deref()), (profile, Some(rate)), "{a:?}");
     }
+}
+
+/// G4.3l: QinQ (802.1ad 100-101 outside, any C-tag inside), one session
+/// per line (TR-101 1:1): the second CPE on a line gets nothing; RADIUS
+/// gets the line in NAS-Port-Id (`ether2:<s>-<c>`) and the TR-101 ids;
+/// the slow path answers inside both tags.
+#[test]
+fn qinq_lines_one_session_each_with_tr101_to_radius() {
+    use corerouter_proto_pppoe::eth::Vlans;
+    let aaa = Arc::new(FakeAaa::default());
+    let srv = server(serde_json::json!({
+        "authentication": ["pap"], "vlan_mode": "stacked", "outer_vlan_range": ["100-101"],
+        "accept_untagged": false, "max_sessions_per_vlan": 1
+    }));
+    let mut s = snap(0, srv, 10);
+    s.ppp.aaa.use_radius = true;
+    s.ppp.aaa.accounting = true;
+    s.aaa = Some(aaa.clone());
+    // Clients 0..3 on lines (100,10) (101,11) (100,12); client 3 on line (100,10) too.
+    let line = |i: usize| match i {
+        3 => Vlans::qinq(100, 10),
+        i => Vlans::qinq(100 + (i % 2) as u16, 10 + i as u16),
+    };
+    let mut lab = Lab::with(4, s, |i| (format!("r{i}"), "x".into()), |i, c| {
+        c.vlans = line(i);
+        c.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
+        c.circuit_id = Some(format!("olt1 pon 0/1/{i}").into_bytes());
+        c.remote_id = Some(format!("cliente-{i}").into_bytes());
+        c.discovery_attempts = 3;
+    });
+    lab.start(0..4);
+    lab.run(400, 50);
+    assert_eq!(lab.ups(), 3, "one session per line");
+    assert!(lab.up[0] ^ lab.up[3], "line (100,10) has one of its two CPEs");
+    let active = lab.backend().active();
+    for a in &active {
+        let i: usize = a.name[1..].parse().unwrap();
+        let v = line(i);
+        assert_eq!((a.vlan, a.inner_vlan), (Some(v.outer), Some(v.inner)), "{a:?}");
+        assert_eq!(a.circuit_id.as_deref(), Some(format!("olt1 pon 0/1/{i}").as_str()));
+    }
+    let asked = aaa.asked.lock().unwrap().clone();
+    let a0 = asked.iter().find(|r| r.user == "r1").unwrap();
+    assert_eq!(a0.nas_port_id.as_deref(), Some("ether2:101-11"));
+    let has = |attrs: &[Attribute], k: &str, v: &str| attrs.iter().any(|a| a.name == k && a.value == v);
+    assert!(has(&a0.attributes, "ADSL-Agent-Circuit-Id", "olt1 pon 0/1/1"), "{:?}", a0.attributes);
+    assert!(has(&a0.attributes, "ADSL-Agent-Remote-Id", "cliente-1"));
+    let accts = aaa.accts.lock().unwrap().clone();
+    let start = accts.iter().find(|r| r.user == "r1").unwrap();
+    assert!(has(&start.attributes, "NAS-Port-Id", "ether2:101-11"), "{:?}", start.attributes);
+    assert!(has(&start.attributes, "ADSL-Agent-Circuit-Id", "olt1 pon 0/1/1"));
+    // Downstream on the slow path: back inside 802.1ad 101 + 802.1Q 11.
+    let r1 = active.iter().find(|a| a.name == "r1").unwrap();
+    let ip = r1.address.unwrap();
+    let mut back = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 8, 8, 8, 8];
+    back.extend_from_slice(&ip.octets());
+    lab.bng.frames.clear();
+    lab.bng.data_down(&back);
+    let (_, f) = lab.bng.frames.pop().unwrap();
+    assert_eq!(&f[12..22], &[0x88, 0xa8, 0, 101, 0x81, 0x00, 0, 11, 0x88, 0x64]);
+    assert_eq!(&f[30..], &back[..]);
+    lab.bng.check().unwrap();
 }

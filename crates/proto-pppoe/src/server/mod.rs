@@ -36,13 +36,23 @@ pub use services::{ServiceAction, ServiceRule, ServiceSlot, ServiceTable};
 /// RFC 2516 §4: SESSION_ID 0xffff is reserved, 0 means "no session".
 pub const MAX_SID: u16 = 0xfffe;
 
-/// Which outer VLANs the server answers (RouterOS v7 `pppoe-over-vlan-range`).
+/// Which VLANs the server answers (RouterOS v7 `pppoe-over-vlan-range`;
+/// G4.3l: Junos `stacked-vlan-ranges`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum VlanFilter {
     #[default]
     Any,
     Untagged,
+    /// One tag in these ranges (0..=0 = untagged too).
     Ranges(Vec<RangeInclusive<u16>>),
+    /// Two tags: the outer in `outer` with this TPID, the inner in `inner`
+    /// (empty: any); `untagged` serves untagged frames too.
+    Stacked {
+        outer: Vec<RangeInclusive<u16>>,
+        inner: Vec<RangeInclusive<u16>>,
+        tpid: u16,
+        untagged: bool,
+    },
 }
 
 impl VlanFilter {
@@ -50,7 +60,21 @@ impl VlanFilter {
         match self {
             VlanFilter::Any => true,
             VlanFilter::Untagged => !v.is_tagged(),
-            VlanFilter::Ranges(r) => r.iter().any(|r| r.contains(&v.outer)),
+            VlanFilter::Ranges(r) => v.inner == 0 && r.iter().any(|r| r.contains(&v.outer)),
+            VlanFilter::Stacked {
+                outer,
+                inner,
+                tpid,
+                untagged,
+            } => {
+                if !v.is_tagged() {
+                    return *untagged;
+                }
+                v.inner != 0
+                    && v.outer_tpid == *tpid
+                    && outer.iter().any(|r| r.contains(&v.outer))
+                    && (inner.is_empty() || inner.iter().any(|r| r.contains(&v.inner)))
+            }
         }
     }
 }
@@ -114,6 +138,9 @@ pub struct ServerConfig {
     pub setup_timeout_ms: u64,
     /// Delayed PADOs held at most.
     pub pado_queue: usize,
+    /// Sessions per (port, VLAN stack); 0 = no limit (G4.3l: 1 is TR-101's
+    /// 1:1 model, a line per VLAN).
+    pub max_per_vlan: u32,
     /// `(lane, lanes)`: this server hands out only the SESSION_IDs with
     /// `sid % lanes == lane`. Several servers on one port (the service's
     /// workers, one per core) then share its SESSION_ID space without a
@@ -157,6 +184,7 @@ impl Default for ServerConfig {
             answer_timeout_ms: 30_000,
             setup_timeout_ms: 60_000,
             pado_queue: 4096,
+            max_per_vlan: 0,
             sid_lane: (0, 1),
         }
     }
@@ -344,6 +372,9 @@ pub struct Stats {
     /// PADIs and PADRs refused by the Service-Name table (drop rows, a
     /// row's max sessions or PADI limit).
     pub service_refused: u64,
+    /// PADIs and PADRs refused because their VLAN holds `max_per_vlan`
+    /// sessions (G4.3l).
+    pub vlan_refused: u64,
     pub pado_tx: u64,
     pub pado_delayed: u64,
     pub padr_rx: u64,
@@ -415,6 +446,8 @@ pub struct Server {
     stats: Stats,
     /// Sessions and PADI limiters per row of `cfg.services`.
     svc: services::ServiceState,
+    /// Sessions per (port, VLANs), kept only with `max_per_vlan`.
+    per_vlan: HashMap<(u32, Vlans), u32>,
 }
 
 /// Identifies the PADR that created a session: Host-Uniq and AC-Cookie.
@@ -451,6 +484,7 @@ impl Server {
             scratch: Scratch::default(),
             stats: Stats::default(),
             svc: services::ServiceState::new(&cfg.services),
+            per_vlan: HashMap::new(),
             cfg,
         }
     }
@@ -478,7 +512,16 @@ impl Server {
             self.limiter = PadiLimiter::new(limits.0, limits.1, limits.2);
         }
         let table = cfg.services != self.cfg.services;
+        let per_vlan = (cfg.max_per_vlan > 0) != (self.cfg.max_per_vlan > 0);
         self.cfg = cfg;
+        if per_vlan {
+            self.per_vlan.clear();
+            if self.cfg.max_per_vlan > 0 {
+                for s in self.sessions.iter().flatten() {
+                    *self.per_vlan.entry((s.ifindex, s.vlans)).or_default() += 1;
+                }
+            }
+        }
         if table {
             // Rows moved: each session counts again under the row its name
             // lands on now (O(sessions), once per change of the table).
@@ -618,6 +661,14 @@ impl Server {
         self.active -= 1;
         self.free.push_back(sid);
         self.svc.remove(s.svc);
+        if self.cfg.max_per_vlan > 0
+            && let Some(n) = self.per_vlan.get_mut(&(s.ifindex, s.vlans))
+        {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.per_vlan.remove(&(s.ifindex, s.vlans));
+            }
+        }
         let hk = s.host_key();
         if self.by_host.get(&hk) == Some(&sid) {
             self.by_host.remove(&hk);
@@ -749,13 +800,33 @@ impl Server {
         if !self.svc.full(&self.cfg.services, slot) {
             return false;
         }
-        let own = self.cfg.one_session_per_host
+        !self.replaces(host, |s| s.svc == slot)
+    }
+
+    /// The VLAN stack of `host` holds `max_per_vlan` sessions, none of
+    /// them `host`'s own (which one-session-per-host would replace).
+    fn vlan_full(&self, host: HostKey) -> bool {
+        let max = self.cfg.max_per_vlan;
+        if max == 0
+            || self
+                .per_vlan
+                .get(&(host.ifindex, host.vlans))
+                .is_none_or(|n| *n < max)
+        {
+            return false;
+        }
+        !self.replaces(host, |_| true)
+    }
+
+    /// `host` has a session that one-session-per-host would replace, and
+    /// it passes `f`.
+    fn replaces(&self, host: HostKey, f: impl Fn(&Session) -> bool) -> bool {
+        self.cfg.one_session_per_host
             && self
                 .by_host
                 .get(&host)
                 .and_then(|sid| self.slot(*sid))
-                .is_some_and(|s| s.svc == slot);
-        !own
+                .is_some_and(f)
     }
 
     /// The server's load delay (accel-ppp `pado-delay`).
@@ -795,6 +866,12 @@ impl Server {
         if rule.action == ServiceAction::Drop || self.row_full(host, slot) {
             self.stats.padi_refused += 1;
             self.stats.service_refused += 1;
+            return;
+        }
+        // G4.3l: the VLAN holds its sessions already (§5.2: cannot serve).
+        if self.vlan_full(host) {
+            self.stats.padi_refused += 1;
+            self.stats.vlan_refused += 1;
             return;
         }
         if !self.limiter.allow(now, d.src) {
@@ -958,6 +1035,11 @@ impl Server {
             );
             return;
         }
+        if self.vlan_full(host) {
+            self.stats.vlan_refused += 1;
+            self.pads_error(ifindex, d, tag::AC_SYSTEM_ERROR, b"VLAN session limit", out);
+            return;
+        }
         if self.cfg.one_session_per_host
             && let Some(&old) = self.by_host.get(&host)
         {
@@ -993,6 +1075,9 @@ impl Server {
         }
         self.active += 1;
         self.svc.add(slot);
+        if self.cfg.max_per_vlan > 0 {
+            *self.per_vlan.entry((ifindex, d.vlans)).or_default() += 1;
+        }
         self.stats.sessions_created += 1;
         self.by_host.insert(host, sid);
         self.by_uniq.insert((host, uniq), sid);
@@ -1144,6 +1229,15 @@ impl Server {
         for s in self.sessions.iter().flatten() {
             if let Some(n) = rows.get_mut(usize::from(s.svc)) {
                 *n += 1;
+            }
+        }
+        if self.cfg.max_per_vlan > 0 {
+            let mut v: HashMap<(u32, Vlans), u32> = HashMap::new();
+            for s in self.sessions.iter().flatten() {
+                *v.entry((s.ifindex, s.vlans)).or_default() += 1;
+            }
+            if v != self.per_vlan {
+                return Err("sessions per VLAN out of step".into());
             }
         }
         if rows != self.svc.active {

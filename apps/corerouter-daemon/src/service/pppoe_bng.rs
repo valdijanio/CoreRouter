@@ -29,12 +29,15 @@ use corerouter_model::ppp::{
     PppService, PppoeServer, ServiceStats, Stage, Why,
 };
 use corerouter_model::pppoe_services::{PppoeService, ServiceAction, ServiceName};
+use corerouter_model::pppoe_vlans::VlanMode;
 use corerouter_model::radius::{
     AaaService, AcctCounters, AcctRequest, AcctStatus, Attribute, AuthOutcome, AuthReply,
     AuthRequest as RadiusRequest, CoaKind, CoaOutcome, CoaRequest, Credentials,
 };
+use corerouter_proto_dhcp::server::agent;
 use corerouter_proto_pppoe::auth::AUTH_STRING_LEN;
 use corerouter_proto_pppoe::discovery::{self, Code};
+use corerouter_proto_pppoe::eth::Vlans;
 use corerouter_proto_pppoe::layers::AuthSet;
 use corerouter_proto_pppoe::lcp::AuthProto;
 use corerouter_proto_pppoe::ppp::{self as wire_ppp, proto};
@@ -941,7 +944,12 @@ struct Sub {
     /// most 35 days, so a longer session gets it made again.
     list_at: Millis,
     idle_since: Millis,
-    descriptor_vlan: Option<u16>,
+    /// The tags of the line (G4.3l: two in QinQ).
+    vlans: Vlans,
+    /// NAS-Port-Id for RADIUS: the circuit id (with
+    /// `use_circuit_id_in_nas_port_id`), else the port, with
+    /// `:<outer>-<inner>` for a QinQ line (Junos' form).
+    nas_port_id: String,
     /// The RADIUS question in flight, to call off if the session ends.
     auth_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     circuit_id: Option<String>,
@@ -1147,6 +1155,21 @@ pub(crate) fn server_config(
     );
     tiers.retain(|t| t.1 > 0);
     c.pado_delay = tiers;
+    // G4.3l: RFC 4638 and sessions per VLAN.
+    c.max_payload = v.max_payload;
+    c.max_per_vlan = v.max_sessions_per_vlan;
+    let ranges = |r: &[corerouter_model::ppp::VlanRange]| -> Vec<std::ops::RangeInclusive<u16>> {
+        r.iter().map(|x| x.first..=x.last).collect()
+    };
+    if v.vlan_mode == VlanMode::Stacked {
+        c.vlans = VlanFilter::Stacked {
+            outer: ranges(&v.outer_vlan_range),
+            inner: ranges(&v.inner_vlan_range),
+            tpid: v.outer_tpid.value(),
+            untagged: v.accept_untagged,
+        };
+        return c;
+    }
     c.vlans = if v.pppoe_over_vlan_range.is_empty() {
         VlanFilter::Untagged
     } else {
@@ -1189,14 +1212,6 @@ pub(crate) fn service_table(rows: &[PppoeService]) -> ServiceTable {
         find(&ServiceName::Empty),
         find(&ServiceName::Any),
     )
-}
-
-/// The VLAN ids a server listens on (for the driver's sockets).
-pub(crate) fn vlan_ids(v: &PppoeServer) -> Vec<u16> {
-    v.pppoe_over_vlan_range
-        .iter()
-        .flat_map(|r| r.first..=r.last)
-        .collect()
 }
 
 /// What a session ending means, for the log, the history and RADIUS.
@@ -1359,7 +1374,16 @@ impl Bng {
     /// spread.
     pub(crate) fn lane_of(frame: &[u8], lanes: u16) -> u16 {
         let b = |i: usize| frame.get(i).copied().unwrap_or(0);
-        let k = u32::from_be_bytes([b(8), b(9), b(10), b(11)]);
+        let tpid =
+            |i: usize| matches!([b(i), b(i + 1)], [0x81, 0x00] | [0x88, 0xa8] | [0x91, 0x00]);
+        // G4.3l: a QinQ line (two tags) goes by its tags, so all of a
+        // line's CPEs meet on one worker and `max_sessions_per_vlan` holds
+        // exactly; everything else by the client's MAC.
+        let k = if tpid(12) && tpid(16) {
+            u32::from_be_bytes([b(14), b(15), b(18), b(19)]) & 0x0FFF_0FFF
+        } else {
+            u32::from_be_bytes([b(8), b(9), b(10), b(11)])
+        };
         ((k.wrapping_mul(0x9E37_79B1) >> 16) % u32::from(lanes.max(1))) as u16
     }
 
@@ -1750,7 +1774,7 @@ impl Bng {
         if let Some(p) = x.due(now, rand) {
             self.frames.push((
                 port.ifindex,
-                v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, sref.sid, &p),
+                v6::frame(sub.mac.0, port.mac, sub.vlans, sref.sid, &p),
             ));
         }
         let user = sub.user.clone();
@@ -1837,7 +1861,7 @@ impl Bng {
         for p in &out.packets {
             self.frames.push((
                 port.ifindex,
-                v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, f.session_id, p),
+                v6::frame(sub.mac.0, port.mac, sub.vlans, f.session_id, p),
             ));
         }
         let mut sh = guard(&self.shared);
@@ -1863,7 +1887,7 @@ impl Bng {
             if let Some(p) = x.due(now, rand) {
                 due.push((
                     port.ifindex,
-                    v6::frame(sub.mac.0, port.mac, sub.descriptor_vlan, *sid, &p),
+                    v6::frame(sub.mac.0, port.mac, sub.vlans, *sid, &p),
                 ));
             }
         }
@@ -1896,20 +1920,7 @@ impl Bng {
         if packet.len() > usize::from(sub.mtu.max(576)) {
             return;
         }
-        let mut f = Vec::with_capacity(packet.len() + 26);
-        f.extend_from_slice(&sub.mac.0);
-        f.extend_from_slice(&port.mac);
-        if let Some(v) = sub.descriptor_vlan {
-            f.extend_from_slice(&0x8100u16.to_be_bytes());
-            f.extend_from_slice(&(v & 0x0FFF).to_be_bytes());
-        }
-        f.extend_from_slice(&0x8864u16.to_be_bytes());
-        let len = u16::try_from(packet.len() + 2).unwrap_or(u16::MAX);
-        f.extend_from_slice(&[0x11, 0x00]);
-        f.extend_from_slice(&sid.to_be_bytes());
-        f.extend_from_slice(&len.to_be_bytes());
-        f.extend_from_slice(&proto::IPV4.to_be_bytes());
-        f.extend_from_slice(packet);
+        let f = v6::session_frame(sub.mac.0, port.mac, sub.vlans, *sid, proto::IPV4, packet);
         let id = session_id(*slot, &self.slots, *sid);
         if let Some(a) = guard(&self.shared).active.get_mut(&id) {
             a.tx_bytes += packet.len() as u64;
@@ -2063,7 +2074,11 @@ impl Bng {
             .clone()
             .unwrap_or_else(|| slot.cfg.default_profile.clone());
         let service_name = String::from_utf8_lossy(&req.service).into_owned();
-        let vlan = (req.vlans.outer != 0).then_some(req.vlans.outer);
+        let circuit_text = req.circuit_id.as_deref().map(agent::text);
+        let nas_port_id = match &circuit_text {
+            Some(c) if self.cfg.ppp.aaa.use_circuit_id_in_nas_port_id => c.clone(),
+            _ => nas_port(&slot.cfg.interface.to_string(), req.vlans),
+        };
         let fresh = Sub {
             slot: i,
             sref,
@@ -2091,16 +2106,11 @@ impl Bng {
             prev: (0, 0, now),
             list_at: now,
             idle_since: now,
-            descriptor_vlan: vlan,
+            vlans: req.vlans,
+            nas_port_id,
             auth_cancel: None,
-            circuit_id: req
-                .circuit_id
-                .as_ref()
-                .map(|c| String::from_utf8_lossy(c).into_owned()),
-            remote_id: req
-                .remote_id
-                .as_ref()
-                .map(|c| String::from_utf8_lossy(c).into_owned()),
+            circuit_id: circuit_text,
+            remote_id: req.remote_id.as_deref().map(agent::text),
             service_name,
             fallback_profile: default_profile.clone(),
             mtu: 1480,
@@ -2284,17 +2294,18 @@ impl Bng {
                 );
             }
         };
-        let Some(slot) = self.slots.get(i) else {
+        let Some(sub) = self.subs.get(&(i, sref.sid)) else {
             return;
         };
-        let circuit = req
-            .circuit_id
-            .as_ref()
-            .map(|c| String::from_utf8_lossy(c).into_owned());
-        let nas_port_id = match circuit {
-            Some(c) if self.cfg.ppp.aaa.use_circuit_id_in_nas_port_id => c,
-            _ => slot.cfg.interface.to_string(),
-        };
+        let nas_port_id = sub.nas_port_id.clone();
+        let mut attributes = vec![
+            Attribute::new("Service-Type", "2"),
+            Attribute::new("Framed-Protocol", "1"),
+            Attribute::new("NAS-Port-Type", "5"),
+        ];
+        // G4.3l, RFC 4679 §3 (TR-101): the access line as the access node
+        // named it, in its own attributes.
+        attributes.extend(line_attributes(sub));
         let r = RadiusRequest {
             service: AaaService::Ppp,
             user: user.to_owned(),
@@ -2307,11 +2318,7 @@ impl Bng {
                 .then(|| String::from_utf8_lossy(&req.service).into_owned()),
             // RFC 2865 §5.6 Framed (2), §5.7 PPP (1), §5.41 Virtual (5):
             // what a PPPoE NAS sends (RFC 4679 §4 for the DSL ones).
-            attributes: vec![
-                Attribute::new("Service-Type", "2"),
-                Attribute::new("Framed-Protocol", "1"),
-                Attribute::new("NAS-Port-Type", "5"),
-            ],
+            attributes,
         };
         // auto: no more questions out than the window; the rest wait here,
         // their CPEs in the Authenticate phase (repeats ignored while one
@@ -2535,7 +2542,8 @@ impl Bng {
             session_id: sref.sid,
             server: server.clone(),
             interface: interface.clone(),
-            vlan: sub.descriptor_vlan,
+            vlan: (sub.vlans.outer != 0).then_some(sub.vlans.outer),
+            inner_vlan: (sub.vlans.inner != 0).then_some(sub.vlans.inner),
             circuit_id: sub.circuit_id.clone(),
             remote_id: sub.remote_id.clone(),
             rate_limit: sub.rate.clone(),
@@ -2610,7 +2618,7 @@ impl Bng {
                 terminate_cause: None,
                 interim_secs: interim,
                 attributes: {
-                    let mut a = acct_attributes(ip, &mac, &interface);
+                    let mut a = acct_attributes(ip, &mac, sub);
                     a.extend(v6_attrs);
                     a
                 },
@@ -2763,7 +2771,7 @@ impl Bng {
                     terminate_cause: Some(cause),
                     interim_secs: None,
                     attributes: {
-                        let mut a = acct_attributes(sub.ip, &mac, &interface);
+                        let mut a = acct_attributes(sub.ip, &mac, &sub);
                         if let Some(x) = &sub.v6 {
                             a.extend(x.acct_attributes());
                         }
@@ -3212,16 +3220,41 @@ fn assignment(ip: Ipv4Addr, dns: &[Ipv4Addr]) -> Ipv4Assignment {
     }
 }
 
-fn acct_attributes(ip: Option<Ipv4Addr>, mac: &str, interface: &str) -> Vec<Attribute> {
+fn acct_attributes(ip: Option<Ipv4Addr>, mac: &str, sub: &Sub) -> Vec<Attribute> {
     let mut v = vec![
         Attribute::new("Calling-Station-Id", mac),
-        Attribute::new("NAS-Port-Id", interface),
+        Attribute::new("NAS-Port-Id", sub.nas_port_id.as_str()),
         Attribute::new("Framed-Protocol", "1"),
     ];
     if let Some(ip) = ip {
         v.push(Attribute::new("Framed-IP-Address", ip.to_string()));
     }
+    v.extend(line_attributes(sub));
     v
+}
+
+/// RFC 4679 §3 (TR-101): Agent-Circuit-Id and Agent-Remote-Id of the line,
+/// as the access node put them in the PADI (G4.3l).
+fn line_attributes(sub: &Sub) -> Vec<Attribute> {
+    let mut v = Vec::new();
+    if let Some(c) = &sub.circuit_id {
+        v.push(Attribute::new("ADSL-Agent-Circuit-Id", c.as_str()));
+    }
+    if let Some(r) = &sub.remote_id {
+        v.push(Attribute::new("ADSL-Agent-Remote-Id", r.as_str()));
+    }
+    v
+}
+
+/// NAS-Port-Id of a line without a circuit id: the port, and for a QinQ
+/// line `:<outer>-<inner>` (Junos' `ge-1/0/0:120-3044`), so RADIUS tells
+/// the lines apart (G4.3l). A single tag keeps the port alone, as before.
+fn nas_port(interface: &str, v: Vlans) -> String {
+    if v.inner != 0 {
+        format!("{interface}:{}-{}", v.outer, v.inner)
+    } else {
+        interface.to_owned()
+    }
 }
 
 /// The `S=…` string of an MS-CHAP2-Success attribute (RFC 2548 §2.3.3:

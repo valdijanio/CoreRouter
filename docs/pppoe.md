@@ -857,3 +857,80 @@ tabela que não atende ninguém.
 O trabalho é por PADI/PADR (nunca por pacote de dados): uma busca por hash e um contador por
 linha. Um `reconfigure` com a tabela mudada reconta as sessões por linha (O(sessões), uma vez
 por mudança).
+
+## 12. QinQ e VLANs no caminho lento (G4.3l)
+
+O servidor PPPoE atende dentro de duas tags (QinQ: a S-tag da OLT, PON ou DSLAM e a C-tag da
+linha, o modelo 1:1 da TR-101), sem uma interface VLAN do kernel por assinante, no XDP e no
+caminho lento. A sessão é a chave (porta, S-tag, C-tag, MAC, SESSION_ID); a do XDP
+(`dataplane-ebpf-common::pppoe::SessionKey`) já tinha as duas tags desde a G4.3c.
+
+### 12.1 Pesquisa
+
+Fontes lidas em 2026-10-26:
+
+- **MikroTik RouterOS v7** ([PPPoE](https://help.mikrotik.com/docs/spaces/ROS/pages/2031625/PPPoE)):
+  `pppoe-over-vlan-range` é uma tag 802.1Q só, e `accept-untagged` também atende sem tag. Para
+  QinQ, o servidor fica numa interface VLAN (a S-tag), com a C-tag no range: uma interface do
+  kernel por S-tag.
+- **Juniper Junos**, `auto-configure stacked-vlan-ranges`: faixas `externa,interna` (`any,any`,
+  `100-200,1-4094`), TPID da externa configurável, interfaces dinâmicas por linha; o NAS-Port-Id
+  vai como `ge-1/0/0.<unit>:<s>-<c>`.
+- **accel-ppp**, `vlan-mon`: cria uma interface VLAN do kernel por VLAN que aparece, inclusive
+  em duas camadas para QinQ; um socket por interface.
+- **BBF TR-101**: N:1 (muitas linhas numa VLAN, a linha no Agent-Circuit-Id) e 1:1 (uma VLAN por
+  linha, em geral S-tag + C-tag); o nó de acesso insere Agent-Circuit-Id/Remote-Id no PADI
+  (RFC 4679 §3, Vendor-Specific 3561), que vão ao RADIUS.
+- **RFC 4638**: PPP-Max-Payload ecoado no PADO/PADS só se o AC aceita mais que 1492 (§4); o MRU
+  passa de 1492 só com os dois lados de acordo, e nunca acima de "MTU da interface − 8" (§5.1);
+  sem a tag, vale o 1492.
+- **Kernel Linux** (medido em veth, 2026-10-26): o kernel tira a tag externa antes de um socket
+  `AF_PACKET` ver o quadro e a guarda ao lado (`skb_vlan_untag`); a interna fica no quadro. Um
+  socket preso a 0x8863 só recebe o quadro depois que a tag foi **apagada**: o quadro da VLAN
+  100 chegava ao socket "sem tag" como se não tivesse tag, e o socket da VLAN 100 não recebia
+  nada. Um socket `ETH_P_ALL` vê a tag (`SKF_AD_VLAN_TAG`, `SKF_AD_VLAN_TPID`) no filtro.
+
+### 12.2 O que adotamos
+
+- `vlan_mode=single` (padrão, o `pppoe-over-vlan-range` do RouterOS) ou `vlan_mode=stacked`
+  com `outer_vlan_range` (S-tags, no máximo 512), `inner_vlan_range` (C-tags, `any` por padrão),
+  `outer_tpid` (0x88a8 ou 0x8100) e `accept_untagged`. Os dois modos não se misturam num servidor.
+- **Caminho lento sem interface por assinante:** um socket `ETH_P_ALL` por S-tag (ou VLAN
+  simples), com um filtro BPF clássico que confere VID, TPID e o EtherType PPPoE (atrás da C-tag
+  no QinQ); a tag externa volta para dentro do quadro antes do `proto-pppoe`. Isto **corrige** a
+  VLAN simples sem XDP, que nunca funcionou (ver 12.1).
+- **Worker por linha:** um quadro QinQ vai ao worker pelo par de tags (os outros, pelo MAC),
+  então todos os CPEs de uma linha se encontram no mesmo worker.
+- `max_sessions_per_vlan` (1 = TR-101 1:1): o AC não manda PADO a um segundo CPE da linha
+  (RFC 2516 §5.2) e responde AC-System-Error a um PADR atrasado (§5.4); o CPE da própria linha
+  que volta toma o lugar da sessão antiga. No QinQ o limite é exato; numa VLAN simples (N:1), é
+  por worker.
+- **RADIUS:** ADSL-Agent-Circuit-Id e ADSL-Agent-Remote-Id (RFC 4679) no Access-Request e na
+  contabilização; NAS-Port-Id = o circuit id (com `use_circuit_id_in_nas_port_id`), senão
+  `<porta>:<s>-<c>` numa linha QinQ (a forma do Junos) ou a porta.
+- **RFC 4638:** `max_payload=1493..1500` (padrão: nenhum, 1492); recusado se a MTU da porta
+  for menor que o valor + 8.
+- **Active Connections:** `vlan` e `inner_vlan` por sessão (o selo `120/3044` na janela).
+
+### 12.3 Melhorias propostas
+
+Entram agora: o conserto da VLAN simples, o limite 1:1, os atributos TR-101 em toda requisição,
+a checagem do MTU da RFC 4638 e o worker por linha.
+
+Viram gap (G4.3la): separar as VLANs em O(1) no caminho lento, porque o custo por socket é medido
+(abaixo) e a separação pede `PACKET_FANOUT` com programa ou `PACKET_AUXDATA`, que não têm
+binding seguro (o `unsafe` é proibido fora do `dataplane-ebpf`).
+
+### 12.4 Desempenho (**medido**, 2026-10-26, Ryzen AI Max+ 395, kernel 7.0, veth)
+
+| Medida | Valor |
+|---|---|
+| Custo de cada socket da porta por quadro que passa (filtro que recusa) | 35–58 ns |
+| Quadro enviado e recebido num veth com 0 / 1 / 64 / 512 sockets | 0,60 / 0,65 / 2,8 / 30,5 µs |
+| e2e em namespace: 400 linhas QinQ abertas (debug, caminho lento) | 0,03 s |
+| Simulação em memória: 20 000 assinantes em 5000 VLANs QinQ | 0,67 s |
+
+Com o XDP (produção) os quadros de dados nunca viram skb e não passam pelos sockets: só a
+descoberta e o controle pagam o custo por socket. No caminho lento, cada quadro da porta paga
+N × ~45 ns. O desenho anterior pagava o mesmo para cada quadro de sessão (N sockets presos a
+0x8864); agora pagam também os quadros que não são PPPoE, que numa porta de acesso são raros.

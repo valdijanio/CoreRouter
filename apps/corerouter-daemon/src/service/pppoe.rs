@@ -91,12 +91,13 @@ mod linux {
 
     use corerouter_engine::{Shared, lock};
     use corerouter_hal::pppoe::PppoeOp;
-    use corerouter_hal_linux::pppoe_io::{PortSender, PppoePort, SlowPath, SlowTx};
+    use corerouter_hal_linux::pppoe_io::{Listen, PortSender, PppoePort, SlowPath, SlowTx};
     use corerouter_model::ppp::{PppoeServer, pppoe_workers_auto};
+    use corerouter_model::pppoe_vlans::VlanMode;
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use serde_json::json;
 
-    use super::super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot, guard, vlan_ids};
+    use super::super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot, guard};
 
     /// Longest wait for a frame; timers and RADIUS answers are looked at
     /// least this often.
@@ -143,9 +144,34 @@ mod linux {
     /// An open access port and what it was opened for.
     struct Open {
         port: PppoePort,
-        vlans: Vec<u16>,
-        untagged: bool,
+        listen: Vec<Listen>,
     }
+    /// The sockets a server's port needs (G4.3l): untagged, one per 802.1Q
+    /// VLAN id, or one per S-tag in stacked mode (the C-tag stays in the frame
+    /// and `proto-pppoe` checks it).
+    fn listens(v: &PppoeServer) -> Vec<Listen> {
+        let ids = |r: &[corerouter_model::ppp::VlanRange]| -> Vec<u16> {
+            r.iter().flat_map(|x| x.first..=x.last).collect()
+        };
+        let mut out = Vec::new();
+        match v.vlan_mode {
+            VlanMode::Stacked => {
+                if v.accept_untagged {
+                    out.push(Listen::Untagged);
+                }
+                let tpid = v.outer_tpid.value();
+                out.extend(ids(&v.outer_vlan_range).into_iter().map(|outer| Listen::Stacked { outer, tpid }));
+            }
+            VlanMode::Single => {
+                if v.pppoe_over_vlan_range.is_empty() || v.accept_untagged {
+                    out.push(Listen::Untagged);
+                }
+                out.extend(ids(&v.pppoe_over_vlan_range).into_iter().map(Listen::Vlan));
+            }
+        }
+        out
+    }
+
 
     /// What the reader hands a worker.
     enum Msg {
@@ -477,18 +503,17 @@ mod linux {
             let mut changed = before != self.ports.len();
             let mut infos = HashMap::new();
             for w in wanted {
-                let vlans = vlan_ids(w);
-                let untagged = w.pppoe_over_vlan_range.is_empty() || w.accept_untagged;
+                let listen = listens(w);
                 let same = self
                     .ports
                     .get(&w.name)
-                    .is_some_and(|o| o.vlans == vlans && o.untagged == untagged && o.port.name() == &w.interface);
+                    .is_some_and(|o| o.listen == listen && o.port.name() == &w.interface);
                 if !same {
                     self.ports.remove(&w.name);
                     changed = true;
-                    match PppoePort::open(&w.interface, &vlans, untagged) {
+                    match PppoePort::open_for(&w.interface, &listen) {
                         Ok(port) => {
-                            self.ports.insert(w.name.clone(), Open { port, vlans, untagged });
+                            self.ports.insert(w.name.clone(), Open { port, listen });
                         }
                         Err(e) => {
                             self.errors.push(format!("{}: {e}", w.interface));
