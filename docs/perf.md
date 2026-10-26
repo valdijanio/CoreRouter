@@ -1262,3 +1262,229 @@ build de teste, veth.
   36–39%, 7,4–9,2 s; HTB por CPU não terminou de montar em 23 min.
 - Subida PPPoE (`BPF_PROG_TEST_RUN`, um pacote por chamada): 164–169 ns na `main`, 172–176 ns com
   o GCRA atômico.
+
+### G4.3gb / G0.21 / G0.22 — linha de base (**medido**, AMD Ryzen AI Max+ 395, 32 CPUs, release, 2026-10-26, `main` 626c0c25, máquina compartilhada, load ~10)
+
+`cargo bench -p corerouter-engine --bench config_store -- --save-baseline antes` (e `transactional`,
+`scale`, `storage-fs commit`). Lote = 100 `ppp.secret.add`; o tempo é do lote inteiro.
+
+| Benchmark | 1 mil | 10 mil | 100 mil |
+|---|---:|---:|---:|
+| `config_store/ppp_secret_add/single` | 1,51 ms | 17,3 ms | 219 ms |
+| `config_store/ppp_secret_set/single` | 1,54 ms | 17,6 ms | 220 ms |
+| `config_store/ppp_secret_add/batch_step` (100 passos, commit por passo) | 157 ms | 1,69 s | 20,9 s |
+| `config_store/ppp_secret_add/atomic_step` (100 passos, um commit) | 2,38 ms | 24,0 ms | 219 ms |
+| `storage_fs/commit/ppp_secret_add` (disco, fsync) | — | 20,0 ms | 219 ms |
+
+| Benchmark | Antes |
+|---|---:|
+| `engine_txn/single/address_list_add/60000` | 717 µs |
+| `engine_txn/single/address_list_add_remove/60000` | 1,40 ms |
+| `engine_txn/single/interface.set/routes_10000` | 4,3 µs |
+| `engine_txn/build/2000` | 21,7 ms |
+| `engine_txn/build/8000` | 244 ms |
+| `engine_scale/validate_all/routes/10000` | 1,31 ms |
+| `engine_scale/commit/routes/10000` | 6,01 ms |
+| `engine_scale/commit/filter_rules/3000` | 1,15 ms |
+| `engine_scale/commit/addresses/10000` | 3,19 ms |
+| `engine_scale/commit/address_lists/20000` | 3,97 ms |
+| `storage_fs/commit/routes_history64/10000` | 11,2 ms |
+
+### G0.21 — `CowList` × `CowArc<Vec>` (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26, `cargo bench -p corerouter-model --bench cow_list`)
+
+100 000 `PppSecret`, a lista compartilhada com outra cópia (o ponto de rollback, a config em
+execução), uma escrita. Tamanho do bloco escolhido pela medição:
+
+| Benchmark | `CowArc<Vec>` | blocos de 32 | 64 | **128** | 256 |
+|---|---:|---:|---:|---:|---:|
+| `set_shared` (um item no meio) | 5,84 ms | 27,1 µs | 16,2 µs | **13,3 µs** | 17,6 µs |
+| `push_shared` | — | 26,2 µs | 14,7 µs | **8,5 µs** | 12,8 µs |
+| `remove_shared` (no meio) | — | 28,2 µs | 17,2 µs | **13,8 µs** | 18,2 µs |
+| `walk` (filtro nos 100 mil) | 66–73 µs | 97 µs | 78 µs | **74 µs** | 81 µs |
+| `get` (posição) | — | 10 ns | 9,6 ns | **7,9 ns** | 7,0 ns |
+
+`CowMap` com 100 mil nomes: inserir numa cópia compartilhada 1,6 µs; consultar 9,9 ns.
+Memória: o espinho custa 16 bytes por bloco (0,13 byte por item com blocos de 128); cada revisão
+do histórico que mudou a lista guarda o seu espinho (12,5 KB com 100 mil itens) e os blocos que
+mudou.
+
+### G0.21 — listas em blocos nas seções (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26, contra a linha de base `antes` da parte a)
+
+| Benchmark | Antes | Depois |
+|---|---:|---:|
+| `engine_txn/single/address_list_add/60000` | 717 µs | **10,9 µs** |
+| `engine_txn/single/address_list_add_remove/60000` | 1,40 ms | 21,1 µs |
+| `engine_txn/build/2000` (por comando) | 21,7 ms (10,8 µs) | 12,1 ms (6,0 µs) |
+| `engine_txn/build/8000` (por comando) | 244 ms (30,5 µs) | 60,8 ms (7,6 µs) |
+| `config_store/ppp_secret_add/single/1000` | 1,51 ms | 290 µs |
+| `config_store/ppp_secret_add/single/10000` | 17,3 ms | 1,14 ms |
+| `config_store/ppp_secret_add/single/100000` | 219 ms | 16,2 ms |
+| `config_store/ppp_secret_set/single/100000` | 220 ms | 13,1 ms |
+| `config_store/ppp_secret_add/batch_step/100000` (100 passos) | 20,9 s | 1,59 s |
+| `config_store/ppp_secret_add/atomic_step/100000` (100 passos) | 219 ms | 19,5 ms |
+| `storage_fs/commit/ppp_secret_add/100000` (disco, fsync) | 219 ms | 24,8 ms |
+| `storage_fs/commit/ppp_secret_add/10000` | 20,0 ms | 5,5 ms |
+| `engine_scale/commit/address_lists/20000` | 3,97 ms | 3,26 ms |
+| `engine_scale/commit/routes/10000` | 6,01 ms | 5,80 ms |
+
+O que sobra no `ppp.secret.add` com 100 mil (instrumentação temporária): o comando ~70 µs,
+`persist::encode_config` da config inteira 9,8 ms (o limite de tamanho e o texto do slot) e o
+`save` 2,2 ms (o slot com a config inteira). Isso é a G0.22 (commit incremental), o PR seguinte.
+
+### G0.21 parte d — 10 mil filas (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26)
+
+`config_store/identity_set/queues/10000` (novo): `system.identity.set` com 10 mil `queue.simple`
+(criadas por `queue.simple.add` num lote atômico), um commit que não toca nas filas. Antes = esta
+branch com `queue.simple` ainda em `Vec` (já com a G0.22); a sessão da G4.9 mediu ~41 ms na
+`main` em outra rodada.
+
+| Benchmark | Antes | Depois | Meta |
+|---|---:|---:|---|
+| `config_store/identity_set/queues/10000` | 71,3 ms | **71,8 µs** | < 1 ms |
+
+De onde vinham os 71 ms (instrumentação temporária): detectar seções alteradas e validar 6–7 ms
+(as filas comparadas por valor), o delta da revisão 28 ms e a gravação 34 ms (a seção `queue`
+inteira em JSON duas vezes), o `apply` do laboratório 3,6 ms.
+
+### G0.22 — validação e plano incrementais (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26, contra a linha de base `antes` da parte a da G0.21)
+
+| Benchmark | Antes | Depois |
+|---|---:|---:|
+| `engine_scale/commit/routes/10000` (comentário numa interface) | 6,01 ms | 2,63 ms |
+| `engine_scale/commit/routes/1000` | 0,66 ms | 0,33 ms |
+| `engine_scale/commit/filter_rules/3000` | 1,15 ms | 0,76 ms |
+| `engine_scale/commit/addresses/10000` | 3,19 ms | 1,64 ms |
+| `storage_fs/commit/routes_history64/10000` (disco) | 11,2 ms | 6,7 ms |
+| `config_store/ppp_secret_add/single/100000` | 219 ms | 14,3 ms |
+
+Com 10 mil rotas, um `interface.set comment` gastava 1,12 ms validando e 1,47 ms no `apply`
+do laboratório (as rotas do kernel recalculadas porque a interface "mudou"); agora as duas
+partes somam ~10 µs (instrumentação temporária). Os 2,2 ms que sobram são a serialização da
+config inteira (`persist::encode_config`), assunto da parte b.
+
+Paralelismo (**medido**, `engine_scale/validate_unit/*/routes/10000`, novo): com 10 mil rotas a
+unidade de rotas leva 1,39 ms e cada uma das outras 11 menos de 0,1 µs. Dividir as unidades entre
+threads não ganharia nada; só dividir a própria unidade de rotas (por tabela e destino, que ela já
+agrupa) ajudaria, e só na validação inteira (boot, config restaurada), não no commit. O engine
+compila para WASM, sem threads; fica anotado, sem gap (custo pequeno e fora do caminho do commit).
+
+### G4.3gb / G0.21 / G0.22 — depois (**medido**, AMD Ryzen AI Max+ 395, 32 CPUs, release, 2026-10-26, contra a linha de base `antes` da parte a; máquina compartilhada)
+
+| Benchmark | Antes | Depois |
+|---|---:|---:|
+| `config_store/ppp_secret_add/single/1000` | 1,51 ms | 102 µs |
+| `config_store/ppp_secret_add/single/10000` | 17,3 ms | 83 µs |
+| `config_store/ppp_secret_add/single/100000` | **219 ms** | **134 µs** |
+| `config_store/ppp_secret_set/single/100000` | 220 ms | 209 µs |
+| `config_store/ppp_secret_add/batch_step` 1 mil / 10 mil / 100 mil (por passo, commit por passo) | 1,57 / 16,9 / 209 ms | **90 / 101 / 153 µs** |
+| `config_store/ppp_secret_add/atomic_step` 1 mil / 10 mil / 100 mil (lote de 100) | 2,38 / 24,0 / 219 ms | 0,89 / 0,91 / 1,36 ms |
+| `engine_txn/single/address_list_add/60000` | 717 µs | **9,8 µs** |
+| `engine_txn/build/2000` / `8000` (por comando) | 10,8 / 30,5 µs | 5,1 / 6,3 µs |
+| `engine_scale/commit/routes/10000` (comentário numa interface) | **6,01 ms** | **0,16 ms** |
+| `engine_scale/commit/filter_rules/3000` | 1,15 ms | 0,20 ms |
+| `engine_scale/commit/addresses/10000` | 3,19 ms | 0,13 ms |
+| `engine_scale/commit/address_lists/20000` | 3,97 ms | 0,11 ms |
+| `storage_fs/commit/ppp_secret_add/100000` (disco, fsync) | 219 ms | 2,7 ms |
+| `storage_fs/commit/routes_history64/10000` (disco) | 11,2 ms | 2,9 ms |
+| `storage_fs/history64/commit/10mib` (disco) | 44,8 ms | 3,0 ms |
+
+Em disco o que sobra (~2,5 ms) é o `fdatasync` do append do journal e do arquivo de revisão;
+sem disco, o commit de um secret com 100 mil custa ~0,1 ms. O checkpoint (a cada até 1024
+commits) custa o que um commit custava antes: 4 ms com 1 mil secrets, 19 ms com 100 mil
+(**medido**, sonda temporária, máximo de 2000 adds).
+
+Boot com journal (`storage_fs/history64/boot`): 5 MiB 164 ms e 10 MiB 262 ms, contra 149 e 208 ms
+medidos na `main` antes do G0.22 (`docs/perf.md`, G0.20; rodadas diferentes, máquina carregada): o
+replay de até 1024 linhas. A G0.27 (checkpoint no desligamento) zera esse custo no boot normal.
+
+Memória (**medido**, RSS, 1 milhão de `PppSecret`): 256 B por item em `Vec` e em `CowList` (o
+espinho é 0,13 B por item); o índice de nomes, 82 B por secret. Cada revisão do histórico que
+mudou uma lista guarda o seu espinho (12,5 KB com 100 mil itens) e os blocos que mudou.
+
+Paralelismo: o commit é sequencial por desenho (uma transação por vez, sob o lock da sessão). O
+que era O(n) por commit saiu do caminho (validação, plano, serialização, gravação); o que sobra é
+O(seções pequenas + blocos alterados) e o fsync, que não se divide. As cópias da config continuam
+lidas sem lock pelas threads dos serviços (PPPoE, IPoE).
+
+### G4.3h: hot standby no serviço `pppoe` (2026-10-26)
+
+**Medido** com `cargo bench -p corerouter-daemon --bench pppoe_bng`: release, Ryzen AI Max+ 395,
+load 14–19 de outras sessões, mediana de 3 execuções.
+
+40 mil logins em rodadas de 256, com o lock do par preso 8 ms a cada 10 ms:
+
+| | 1 worker | 8 workers |
+|---|---:|---:|
+| sem HA | 67 570/s | 331 743/s |
+| hot standby, o worker espera o lock | 23 854/s | 179 141/s |
+| hot standby, `try_lock` + fila do worker | 63 469/s | 302 470/s |
+
+Os contadores para o standby, a cada 10 s:
+
+| | 50 mil sessões, um worker |
+|---|---:|
+| varredura própria debaixo do lock compartilhado (antes) | 22 ms |
+| na passada do `tick` (agora) | ≈ 1 ms a mais |
+
+Montar 1000 sessões custa 15–18 ms com e sem hot standby (dentro do ruído).
+
+- 2026-10-26, G4.3l (**medido**, Ryzen AI Max+ 395, kernel 7.0, veth em namespace): cada socket
+  `AF_PACKET` de VLAN custa 35–58 ns por quadro da porta (quadro enviado e recebido em 0,60 /
+  0,65 / 2,8 / 30,5 µs com 0 / 1 / 64 / 512 sockets). e2e: 400 linhas QinQ abertas em 0,03 s
+  (debug, caminho lento).
+
+- 2026-10-26, G4.3l (**medido**, Ryzen AI Max+ 395, release, criterion): consulta IPv6 do caminho
+  lento do PPPoE por maior prefixo, ~16 ns com 200 000 prefixos (100 000 sessões com /64 e /56);
+  `cargo bench -p corerouter-daemon --bench pppoe_bng -- pppoe_slow6`.
+
+### Filas com 10 000 entradas fixas (G4.9c) — **medido**, release, 1 CPU, 2026-10-26
+
+| operação | antes | depois |
+|---|---:|---:|
+| lote de 10 000 `queue.simple.add` | 297 s | 26 s |
+| um `queue.simple.add` | 133 ms | 44 ms (o `system.identity.set` custa 41 ms) |
+| `queue.simple.preview` | 113 ms | 19 ms |
+
+`free_name` deixou de ser O(n²) e o `add`/`set` deixou de montar o plano inteiro para ler os
+avisos de uma fila (`queue::fixed_warnings`). O resto (~41 ms por escrita) é o commit genérico da
+config, que a sessão do `CowList` está trocando.
+
+### Filas no BNG Blaster (G4.9d) — **medido**, VM 8 vCPUs, kernel 7.0, release, 2026-10-26
+
+| sessões | plano | shaper: descida/limite (mín–máx) | fila média | policer: descida/limite | CPU shaper / policer |
+|---:|---|---|---:|---|---|
+| 100 | 1M/2M | 1,002 (0,994–1,011) | 50 ms | 1,000 | 3,4% / 2,3% |
+| 1 000 | 100k/200k | 1,015 (0,970–1,041) | 120 ms | 0,987 | 6,5% / 3,2% |
+| 10 000 | 10k/20k | 1,023 (0,961–1,058) | 808 ms | 1,077 | 8,3% / 4,6% |
+
+### CI do lote em jobs paralelos (processo, 2026-10-26)
+
+**Medido** no GitHub Actions (`ubuntu-latest`, 4 vCPU), lote da fila (`workflow_dispatch`).
+
+Antes: um job, passos em série. Os últimos 8 lotes verdes levaram de 18,2 a 26 min no job
+`xtask ci (linux)` (mediana ~23 min). Um deles por passo (run 40395078035, 21,8 min): fmt 2 s,
+clippy 35 s, test 4 min 49 s (compilação 91 s, execução 198 s), bench-check 9 min 55 s
+(compilação 21 s, execução ~9,5 min), netns 1 min 42 s, xdp-root 3 min 25 s,
+docs/layers/agents-sync/wasm ~20 s, preparação ~1 min.
+
+Depois (runs 40406439545, cache frio, e 40407532159, cache quente):
+
+| Job | Frio | Quente | Onde vai o tempo (quente) |
+|---|---|---|---|
+| `lint` | 3 min 8 s | 86 s | clippy 34 s, wasm 17 s |
+| `test` | 7 min 9 s | 6 min 6 s | compilação 96 s, execução 235 s |
+| `bench-check` | 5 min 33 s | 4 min 51 s | compilação (opt-level 1) 2 min 40 s, execução 104 s |
+| `netns` | 2 min 54 s | 2 min 55 s | compilação 24 s, execução 70 s |
+| `xdp-root` | 4 min 27 s | 4 min 33 s | compilação 16 s, execução ~3 min 54 s |
+| build macOS / Windows | 1 min 54 s / 2 min 18 s | 90 s / 187 s | (não mudou) |
+| **run inteiro** | **7 min 29 s** | **6 min 25 s** | o caminho crítico é o `test` |
+
+`bench-check` local (AMD Ryzen AI MAX+ 395, 32 CPUs), só a execução: debug em série 353 s
+(`ui frames` 126 s); perfil `bench-check` em série 108 s (`frames` 57 s); perfil
+`bench-check` em paralelo ~61 s (limitado pelo `frames`). A montagem de 1M de rotas do
+`ui_frame/routes_1m` é o que sobra: ~100 s no CI mesmo otimizado.
+
+Paralelismo: os passos não dependem um do outro, então cada job compila o que precisa no
+próprio runner (4 vCPU cada) em vez de dividir um runner. O que fica em série é o `test`
+(compilação + 2613 testes no nextest); próximo passo, se precisar: dividir o `test` em duas
+partições do nextest (`--partition count:i/2`), ~1,5 min a menos **estimado**.

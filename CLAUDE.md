@@ -209,7 +209,10 @@ MCP: `claude mcp add corerouter -- corerouter-cli mcp` (detalhes em `docs/mcp.md
   tempo, **medido**). Teste que falha e passa ao repetir sai como FLAKY/"flaky netns test" e não
   reprova: corrija-o depois (teste instável trava a fila; foram quatro em 2026-10-22).
 - **Portão em duas camadas:** `cargo xtask ci --fast` (sem `netns` e `bench-check`) é o do PR;
-  o completo roda localmente, no lote da fila de entrada e na `main`.
+  o completo roda localmente, no lote da fila de entrada e na `main`. No GitHub os passos
+  rodam em jobs paralelos (`lint`, `test`, `bench-check`, `netns`, `xdp-root`, cada um com
+  `cargo xtask ci --only <passos>`), e o check exigido `xtask ci (linux)` confere todos. Para
+  repetir só um passo localmente: `cargo xtask ci --only netns` (ou `cargo xtask netns`).
 - Comando novo: teste de sucesso, de erro de validação e de rollback; o `command_sweep` cobre
   params lixo automaticamente.
 - Um id de tarefa por commit: `G1.2: hal-linux aplica endereços via rtnetlink`.
