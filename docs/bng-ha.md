@@ -12,11 +12,11 @@ empilhados:
 |---|---|---|
 | a | crate `proto-ha` (sans-IO): codec do sync, registro da sessão, máquina de papéis com cerca, hello de acesso, laboratório de dois nós, fuzz, benchmark; este documento | #241 |
 | b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | #242 |
-| c | serviço `ppp-ha` no daemon: link de sync TLS com autenticação mútua, hello de acesso (AF_PACKET), testemunha (ICMP), track, monitor; `proto_ha::node` (o mesmo código no daemon e no laboratório) | este PR |
+| c | serviço `ppp-ha` no daemon: link de sync TLS com autenticação mútua, hello de acesso (AF_PACKET), testemunha (ICMP), track, monitor; `proto_ha::node` (o mesmo código no daemon e no laboratório) | #248 |
 | d | fase 1 no serviço `pppoe`: só o ativo responde, MAC virtual, segredo do AC-Cookie compartilhado | depois da sessão B (G4.3k+l) entrar |
 | e1 | `proto-pppoe`: `Server::export`/`import` (a sessão em Opened no outro servidor, sem renegociar) | este PR |
 | e2 | fase 2 no serviço: exportar/importar sessão por worker, mapas XDP na tomada, contabilização contínua | depois do d |
-| f | aba PPP › Redundancy na GUI | depois do b |
+| f | aba PPP › Redundancy na GUI | #251 |
 | g | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do e |
 
 ## 1. Pesquisa
@@ -188,6 +188,24 @@ sequência.
   - failover depois de matar o ativo em 1,16 s (morte 1,2 s);
   - o nó isolado (os dois links e a testemunha perdidos) se cerca e o outro assume.
 
+## 2.6 A aba PPP › Redundancy (PR f)
+
+À esquerda, a configuração (`ppp.redundancy.get/set`): par (TLS), modo, segredo (só de escrita:
+o campo vazio não muda nada), prioridade, preempção, MAC virtual, grupo, portas de acesso, cerca,
+testemunha, track e temporizadores; Apply manda só o que mudou. À direita, o par agora
+(`ppp.redundancy.monitor`):
+
+- o papel deste nó em selo colorido (active verde, standby azul, fenced vermelho, init/yielding
+  âmbar) e a época;
+- o par: papel, TLS, e os caminhos em que é ouvido (link de sync, acesso);
+- a testemunha;
+- o sync: sessões N/N, pendentes, atraso e o snapshot em andamento;
+- a divergência de config, uma seção por selo;
+- as últimas trocas de papel, com o motivo e "sessions kept".
+
+**Switchover** e **Simulate Failure** pedem confirmação. Todo rótulo tem ⓘ com a explicação em
+português. Conferido com dois daemons reais num namespace (switchover, falha simulada de 30 s e
+volta como standby), nos temas escuro e claro.
 ## 2.7 A sessão PPPoE de um servidor para outro (PR e1)
 
 `proto_pppoe::server::ha`: `Server::export_all(now)` dá o `SessionState` de cada sessão
