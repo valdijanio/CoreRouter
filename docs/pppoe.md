@@ -1018,7 +1018,7 @@ descoberta e o controle pagam o custo por socket. No caminho lento, cada quadro 
 N × ~45 ns. O desenho anterior pagava o mesmo para cada quadro de sessão (N sockets presos a
 0x8864); agora pagam também os quadros que não são PPPoE, que numa porta de acesso são raros.
 
-### 12.5 IPv6 encaminhado no caminho lento (parte 2)
+### 13.5 IPv6 encaminhado no caminho lento (parte 2)
 
 Sem XDP, o BNG encaminha também o IPv6 dos assinantes, como já fazia com o IPv4:
 
@@ -1035,7 +1035,7 @@ Sem XDP, o BNG encaminha também o IPv6 dos assinantes, como já fazia com o IPv
   (100 000 sessões, um /64 e um /56 cada). Em namespace, um assinante QinQ dual-stack pinga o IPv6
   do `wan0` pelo caminho lento, e a resposta volta dentro das duas tags.
 
-### 12.6 Root e laboratório (parte 3)
+### 13.6 Root e laboratório (parte 3)
 
 - **`xdp-root` na VM** (`cargo xtask vm-lab run`, kernel 7.0, 2026-10-26): os 15 testes passam. O
   diferencial kernel × host do PPPoE (`pppoe_kernel_and_host_agree`) agora tem linhas QinQ com
