@@ -77,6 +77,13 @@ pub(super) struct ShaperState {
     routes: BTreeMap<u32, Vec<(IpNet, u16)>>,
     /// The download queue words of each shaped session.
     pub shapes: BTreeMap<u32, [u64; shaper::SESSION_WORDS]>,
+    /// The session words (policed form) of each session that asked for a
+    /// shaped download: they go in shaped only while [`Self::ready`].
+    pub asked: BTreeMap<u32, corerouter_dataplane_ebpf_common::pppoe::Session>,
+    /// The programs that shape sessions are attached (access ports, and
+    /// `bng0` with PPPoE): until then a shaped session stays policed in XDP,
+    /// never unlimited.
+    ready: bool,
     /// Bytes per queue at the last status, for the rates.
     last: BTreeMap<String, (u64, [u64; 2])>,
     /// PCQ sub-streams per queue slot, counted at most every 10 s (one
@@ -106,6 +113,19 @@ impl ShaperState {
 
     pub fn set_error(&mut self, e: Option<String>) {
         self.error = e;
+        if self.error.is_some() {
+            self.ready = false;
+        }
+    }
+
+    /// Sessions may leave their download to the shaper.
+    pub fn ready(&self) -> bool {
+        self.ready
+    }
+
+    #[cfg(test)]
+    pub(super) fn set_ready(&mut self, ready: bool) {
+        self.ready = ready;
     }
 
     /// Nothing of the shaper is left in the kernel (no `fq` of ours).
@@ -539,6 +559,8 @@ impl ShaperState {
         sessions_on: bool,
     ) -> Result<(), HalError> {
         let plan = self.plan.clone();
+        let sessions = plan.sessions;
+        self.ready = false;
         // bng0 first (its program goes on below).
         if pppoe && self.bng.is_none() {
             let idx = crate::pppoe_io::ensure_dummy(crate::pppoe_io::SLOW_DEVICE)
@@ -595,7 +617,9 @@ impl ShaperState {
             self.applied = plan;
         }
         write_word(&mut l.ebpf, self.word(sessions_on))?;
-        attach(l, &want)
+        attach(l, &want)?;
+        self.ready = sessions && sessions_on;
+        Ok(())
     }
 
     /// The object was reloaded: maps are empty, links gone.
@@ -612,6 +636,7 @@ impl ShaperState {
         shape: Option<[u64; shaper::SESSION_WORDS]>,
         routes: Vec<(IpNet, u16)>,
     ) -> Result<(), HalError> {
+        let none_before = self.shapes.is_empty();
         match shape {
             Some(w) => {
                 self.shapes.insert(idx, w);
@@ -620,8 +645,15 @@ impl ShaperState {
                 self.shapes.remove(&idx);
             }
         }
-        if let (Some(ebpf), Some(w)) = (ebpf, shape) {
-            put_session(ebpf, idx, w)?;
+        if let Some(ebpf) = ebpf {
+            if let Some(w) = shape {
+                put_session(ebpf, idx, w)?;
+            }
+            // The first shaped session turns the egress lookup on (the
+            // plan usually went in before any session), the last one off.
+            if none_before != self.shapes.is_empty() {
+                write_word(ebpf, self.word(true))?;
+            }
         }
         self.set_routes(idx, routes)
     }
@@ -667,11 +699,6 @@ impl ShaperState {
         self.netlink()?
             .route(bng, dst, mtu, add)
             .map_err(|e| HalError::Rejected(format!("bng0: {e}")))
-    }
-
-    pub(super) fn session_gone(&mut self, idx: u32) -> Result<(), HalError> {
-        self.shapes.remove(&idx);
-        self.set_routes(idx, Vec::new())
     }
 
     /// Counters by queue key, the backlog, the rates since the last call.
@@ -822,6 +849,19 @@ fn write_word(ebpf: &mut Ebpf, w: u64) -> Result<(), HalError> {
     let mut arr =
         Array::<_, u64>::try_from(map(ebpf, m::SETTINGS)?).map_err(err("SETTINGS map"))?;
     arr.set(q::SETTINGS_SLOT, w, 0).map_err(err("SETTINGS set"))
+}
+
+/// Session words `s` (policed form) as XDP holds them while its download is
+/// shaped: no fast-down flag and a zero download rate, so XDP neither
+/// redirects nor polices it (the kernel takes it to the egress queue).
+pub(super) fn shaped_form(
+    s: &corerouter_dataplane_ebpf_common::pppoe::Session,
+) -> corerouter_dataplane_ebpf_common::pppoe::Session {
+    use corerouter_dataplane_ebpf_common::pppoe as p;
+    let mut v = *s;
+    v.flags = (v.flags | p::F_SHAPE_DOWN) & !p::F_FAST_DOWN;
+    v.down = corerouter_dataplane_ebpf_common::policer::Rate::default();
+    v
 }
 
 /// The routes a PPPoE session needs through `bng0`: its /32, /64 and

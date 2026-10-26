@@ -2041,13 +2041,15 @@ fn pppoe_kernel_delivery_through_bng0() {
         shape: Some(Kind::default()),
         ..sub
     };
-    x.pppoe_apply(&[PppoeOp::Upsert(3, shaped)]).unwrap();
+    // The daemon's order: the plan (access ports) first, sessions as they
+    // come up; the first shaped session must turn the egress lookup on.
     x.shaper_apply(&ShaperPlan {
         sessions: true,
         access_ports: vec!["la".parse().unwrap()],
         ..ShaperPlan::default()
     })
     .unwrap();
+    x.pppoe_apply(&[PppoeOp::Upsert(3, shaped)]).unwrap();
     let rx = listen(3);
     std::thread::sleep(Duration::from_millis(200));
     Triangle::spawn_in(INET_NS, move || {
