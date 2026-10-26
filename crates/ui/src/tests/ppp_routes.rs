@@ -99,7 +99,7 @@ fn active_connections_show_each_block_with_its_origin() {
     assert!(matches!(chips[6].0, crate::chip::Kind::Red));
     // No routes, no chips.
     assert_eq!(PppPanel::active_row(&json!({"id": "*1-2", "name": "casa"}), None).cells[6], "");
-    let mut h = open();
+    let h = open();
     assert!(h.has_text_containing("Framed-IPv6-Route"));
 }
 
