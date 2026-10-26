@@ -14,8 +14,9 @@ empilhados:
 | b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | #242 |
 | c | serviço `ppp-ha` no daemon: link de sync TLS com autenticação mútua, hello de acesso (AF_PACKET), testemunha (ICMP), track, monitor; `proto_ha::node` (o mesmo código no daemon e no laboratório) | #248 |
 | d | fase 1 no serviço `pppoe`: só o ativo responde, MAC virtual, segredo do AC-Cookie compartilhado | depois da sessão B (G4.3k+l) entrar |
-| e | fase 2: exportar/importar sessão por worker, mapas XDP na tomada, contabilização contínua | depois do d |
-| f | aba PPP › Redundancy na GUI | este PR (empilhado sobre o c) |
+| e1 | `proto-pppoe`: `Server::export`/`import` (a sessão em Opened no outro servidor, sem renegociar) | este PR |
+| e2 | fase 2 no serviço: exportar/importar sessão por worker, mapas XDP na tomada, contabilização contínua | depois do d |
+| f | aba PPP › Redundancy na GUI | #251 |
 | g | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do e |
 
 ## 1. Pesquisa
@@ -205,6 +206,23 @@ testemunha, track e temporizadores; Apply manda só o que mudou. À direita, o p
 **Switchover** e **Simulate Failure** pedem confirmação. Todo rótulo tem ⓘ com a explicação em
 português. Conferido com dois daemons reais num namespace (switchover, falha simulada de 30 s e
 volta como standby), nos temas escuro e claro.
+## 2.7 A sessão PPPoE de um servidor para outro (PR e1)
+
+`proto_pppoe::server::ha`: `Server::export_all(now)` dá o `SessionState` de cada sessão
+estabelecida, e `Server::import(now, states)` as recria no outro servidor já em **Opened** no LCP,
+no IPCP e no IPv6CP, sem mandar nada. Ficam o SID, o par de MACs, os dois Magic-Numbers, o MRU dos
+dois lados, o protocolo de autenticação, o endereço, o DNS, os identificadores IPv6CP, o
+rate-limit e o que falta do Session-Timeout. O keepalive recomeça da tomada; uma renegociação
+pedida pelo CPE segue normal. A lista de SIDs livres é refeita uma vez por lote (O(n)).
+
+- **Teste** (`tests/ha.rs`):
+  - 1000 assinantes (MS-CHAPv2, PAP e CHAP, IPv4 e IPv6, dois shards) passam para servidores novos
+    e ficam 2 minutos de keepalive de pé, sem relogar e sem queda;
+  - o export do servidor novo é idêntico ao do antigo (a mutação de um magic reprova);
+  - com 5 % de perda depois da tomada, as sessões aguentam;
+  - SID ocupado ou de outra lane é recusado.
+- **Medido** (release): export de 74 ns e import de 242 ns por sessão (20 mil em 1,5 ms e 4,8
+  ms): 100 mil num núcleo ≈ 25 ms; por worker, em paralelo.
 
 ## 3. Testes
 
