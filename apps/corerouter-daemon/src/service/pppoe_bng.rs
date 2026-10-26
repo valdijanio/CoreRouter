@@ -1086,6 +1086,11 @@ pub(crate) struct Snapshot {
     pub forbidden: Arc<Forbidden>,
 }
 
+/// G4.3h: this node is the active one of its redundant pair (set by the
+/// daemon's `ppp-ha` service; false until it says so: a node that boots
+/// keeps quiet until the pair decides).
+pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) struct Bng {
     slots: Vec<Slot>,
     subs: HashMap<(usize, u16), Sub>,
@@ -1506,6 +1511,10 @@ impl Bng {
             // (`Reply::Ipv6` before the verdict); identifiers stable per line.
             sc.ipv6 = true;
             sc.ipv6_iid_key = Some(self.cfg.iid_key.unwrap_or(self.seed));
+            // G4.3h: both nodes of a pair accept each other's AC-Cookie.
+            let ha = &self.cfg.ppp.redundancy;
+            sc.cookie_secret = (ha.enabled && !ha.secret.is_empty())
+                .then(|| corerouter_proto_ha::hello::derive("ac-cookie", ha.secret.as_bytes()));
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
@@ -3324,6 +3333,25 @@ impl Bng {
         let (server, sid) = parse_session_id(id)?;
         let slot = self.slots.iter().position(|s| s.cfg.id.0 == server)?;
         self.subs.get(&(slot, sid)).map(|s| (s.slot, s.sref))
+    }
+
+    /// G4.3h: answer subscribers now — redundancy is off, or this node is
+    /// the active one of its pair ([`HA_ACTIVE`]).
+    pub(crate) fn serving(&self) -> bool {
+        !self.cfg.ppp.redundancy.enabled || HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// G4.3h: the pair's role went to the peer. Every session ends here
+    /// without a frame (the address back, the data plane cleaned, the
+    /// accounting Stop); the servers come back at the next configure, to
+    /// answer if the role returns.
+    pub(crate) fn abandon(&mut self, now: Millis) {
+        let mut i = self.slots.len();
+        while i > 0 {
+            i -= 1;
+            self.drop_slot(now, i);
+        }
+        self.log(false, "PPPoE: o par assumiu; as sessões deste nó foram encerradas sem aviso ao CPE".into());
     }
 
     /// End every session (service stopping): Terminate and PADT to each.

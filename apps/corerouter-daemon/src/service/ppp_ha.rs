@@ -380,6 +380,7 @@ mod linux {
                     sh.enabled.store(false, Ordering::Release);
                     sh.answering.store(false, Ordering::Release);
                     health.listen(Vec::new());
+                super::super::pppoe_bng::HA_ACTIVE.store(false, Ordering::Release);
                     health.disabled(Some("ppp.redundancy.set enabled=no"));
                     if !health.sleep(Duration::from_millis(200)) {
                         return Ok(());
@@ -511,6 +512,7 @@ mod linux {
                         }
                     }
                     shared().answering.store(p.node.answering(), Ordering::Release);
+                    super::super::pppoe_bng::HA_ACTIVE.store(p.node.answering(), Ordering::Release);
                 }
             }
             for (body, from_vmac) in access_out.drain(..) {
@@ -548,6 +550,7 @@ mod linux {
                 *rt.pair() = None;
                 shared().enabled.store(false, Ordering::Release);
                 shared().answering.store(false, Ordering::Release);
+                super::super::pppoe_bng::HA_ACTIVE.store(false, Ordering::Release);
                 return Ok(());
             }
         }

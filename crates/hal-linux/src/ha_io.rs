@@ -4,9 +4,12 @@
 //!
 //! The group address 03:43:52:48:41:00 is not in a NIC's multicast filter
 //! and `PACKET_ADD_MEMBERSHIP` has no safe binding, so a port turns
-//! `allmulticast` on while open (only if it was off), as LLDP does. Our own
-//! transmissions come back as `PACKET_OUTGOING` and are dropped. No
-//! `unsafe` (socket2, nix).
+//! `allmulticast` on while open (only if it was off), as LLDP does. And the
+//! subscribers send to the pair's **virtual MAC**, which is not the card's:
+//! a port is also put in `promiscuous` mode while open (only if it was not;
+//! a BNG's access port usually is). Our own transmissions come back as
+//! `PACKET_OUTGOING` and are dropped. No `unsafe` (socket2, nix,
+//! rtnetlink).
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -33,6 +36,7 @@ pub struct HaPort {
     ifindex: u32,
     mac: [u8; 6],
     allmulti_by_us: bool,
+    promisc_by_us: bool,
 }
 
 impl HaPort {
@@ -48,12 +52,17 @@ impl HaPort {
         if allmulti_by_us {
             set_allmulti(ifindex, true)?;
         }
+        let promisc_by_us = !flags(name).contains(InterfaceFlags::IFF_PROMISC);
+        if promisc_by_us {
+            set_promisc(ifindex, true)?;
+        }
         Ok(Self {
             name: name.clone(),
             sock,
             ifindex,
             mac: info.mac,
             allmulti_by_us,
+            promisc_by_us,
         })
     }
 
@@ -113,6 +122,11 @@ impl HaPort {
 
 impl Drop for HaPort {
     fn drop(&mut self) {
+        if self.promisc_by_us
+            && let Err(e) = set_promisc(self.ifindex, false)
+        {
+            log::warn!("ppp-ha: could not restore promiscuous off on {}: {e}", self.name);
+        }
         if self.allmulti_by_us
             && let Err(e) = set_allmulti(self.ifindex, false)
         {
@@ -122,6 +136,32 @@ impl Drop for HaPort {
             );
         }
     }
+}
+
+fn flags(name: &IfName) -> InterfaceFlags {
+    getifaddrs()
+        .ok()
+        .and_then(|mut it| it.find(|a| a.interface_name == name.as_str()).map(|a| a.flags))
+        .unwrap_or(InterfaceFlags::empty())
+}
+
+/// Turns `promiscuous` on or off on one interface over rtnetlink.
+fn set_promisc(ifindex: u32, on: bool) -> io::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()?;
+    rt.block_on(async {
+        let (conn, handle, _) = rtnetlink::new_connection()?;
+        let task = tokio::spawn(conn);
+        let out = handle
+            .link()
+            .set(rtnetlink::LinkUnspec::new_with_index(ifindex).promiscuous(on).build())
+            .execute()
+            .await
+            .map_err(|e| io::Error::other(format!("promiscuous {on} on ifindex {ifindex}: {e}")));
+        task.abort();
+        out
+    })
 }
 
 /// The interface is up and has carrier (`IFF_RUNNING`): the `track` list.
