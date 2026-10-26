@@ -301,8 +301,9 @@ RADIUS de teste, keepalive do BNG Blaster de 5 s × 3):
 | 10 000 | 1,12 s | 1,14 s | 0 | 10 000 | 10 000 (10 000) | 0 | 10 000 |
 | 100 000 | 1,15 s | 1,29 s | 0 | 100 000 | 100 000 (100 000) | 0 | 100 000 |
 
-A tomada é a morte declarada (1,2 s, 4 hellos de 300 ms) mais a adoção. Com 100 mil sessões em
-oito workers, a adoção leva cerca de 0,1 s. Nenhum assinante percebeu a troca (0 flaps no BNG
+A tomada é quase toda a espera pela morte do par (1,2 s, 4 hellos de 300 ms). Adotar 100 mil
+sessões quase não aparece no tempo: 1,15 s contra 1,13 s com mil. O import do `proto-pppoe` custa
+242 ns por sessão (#253), dividido entre os workers. Nenhum assinante percebeu a troca (0 flaps no BNG
 Blaster), e a contabilização seguiu com os mesmos ids, sem Stop. No A/B da mesma VM, um nó sozinho
 sobe as mesmas 100 mil em 33 s.
 
