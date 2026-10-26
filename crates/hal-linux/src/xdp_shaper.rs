@@ -98,9 +98,14 @@ impl std::fmt::Debug for ShaperState {
 }
 
 impl ShaperState {
-    /// The object must be loaded for the shaper alone.
+    /// The object must be loaded for the shaper alone: queues. Sessions are
+    /// shaped only where the XDP program already runs (their maps).
     pub fn wanted(&self) -> bool {
-        !self.plan.is_empty()
+        !self.plan.queues.is_empty()
+    }
+
+    pub fn set_error(&mut self, e: Option<String>) {
+        self.error = e;
     }
 
     /// Nothing of the shaper is left in the kernel (no `fq` of ours).
@@ -663,7 +668,8 @@ impl ShaperState {
         let Some(l) = loaded else {
             return ShaperStatus {
                 unavailable: self.error.clone().or_else(|| {
-                    (!self.plan.is_empty()).then(|| "the eBPF object is not loaded".to_owned())
+                    (!self.plan.queues.is_empty())
+                        .then(|| "the eBPF object is not loaded".to_owned())
                 }),
                 ..ShaperStatus::default()
             };

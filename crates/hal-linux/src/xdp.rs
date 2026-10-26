@@ -165,7 +165,14 @@ impl XdpState {
     }
 
     fn reach(&mut self, plan: XdpPlan) -> Result<(), HalError> {
-        let shaping = self.shaper.wanted() || self.pppoe.on;
+        self.reach_with(plan, false)
+    }
+
+    /// `strict`: a shaper failure is the caller's error (`shaper_apply`);
+    /// otherwise it is only recorded (the shaper never fails a config
+    /// apply, an XDP filter change or a PPPoE session).
+    fn reach_with(&mut self, plan: XdpPlan, strict: bool) -> Result<(), HalError> {
+        let shaping = self.shaper.wanted();
         let sized = |l: &Loaded, st: &Self| {
             l.fast_nat == plan.fast_nat
                 && l.pppoe == st.pppoe.maps()
@@ -218,6 +225,12 @@ impl XdpState {
                     self.shaper.reloaded();
                 }
                 Err(e) => {
+                    // Only the queues wanted it: that is the shaper's
+                    // failure, not the filter's.
+                    if plan.is_empty() && !strict {
+                        self.shaper.set_error(Some(e.to_string()));
+                        return Ok(());
+                    }
                     self.error = Some(e.to_string());
                     return Err(e);
                 }
@@ -248,7 +261,18 @@ impl XdpState {
         attach_all(l, &plan.interfaces)?;
         self.applied = plan;
         let on = self.pppoe.maps();
-        self.shaper.reach(self.loaded.as_mut(), self.pppoe.on, on)
+        match self.shaper.reach(self.loaded.as_mut(), self.pppoe.on, on) {
+            Err(e) if !strict => {
+                log::warn!("shaper: {e}");
+                self.shaper.set_error(Some(e.to_string()));
+                Ok(())
+            }
+            Ok(()) => {
+                self.shaper.set_error(None);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Queues (G4.9b): hold `plan`. The object loads for it alone when no
@@ -264,7 +288,7 @@ impl XdpState {
         let cfg = self.cfg.clone().unwrap_or_default();
         let xdp = XdpPlan::of(&cfg, &self.dynamic);
         self.applied = XdpPlan::default();
-        self.reach(xdp)
+        self.reach_with(xdp, true)
     }
 
     pub fn shaper_status(&mut self) -> corerouter_hal::queue::ShaperStatus {
