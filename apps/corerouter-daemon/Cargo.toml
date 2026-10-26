@@ -31,6 +31,8 @@ corerouter-proto-flow.workspace = true
 corerouter-proto-radius.workspace = true
 # service/pppoe.rs (G4.3d): the BNG drives the PPPoE server.
 corerouter-proto-pppoe.workspace = true
+# service/ppp_ha.rs (G4.3h): the pair's role machine and session sync.
+corerouter-proto-ha.workspace = true
 # service/pppoe_bng6.rs (G4.3e): the DHCPv6 server of each PPP session;
 # service/ipoe_bng.rs (G4.3f): the DHCP server's grants and leases.
 corerouter-proto-dhcp.workspace = true
