@@ -360,6 +360,14 @@ pub struct PppProfile {
     /// RouterOS profile has IPv4 ones only.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dns_server_ipv6: Vec<Ipv6Addr>,
+    /// `/queue type` of the session's download queue (RouterOS
+    /// `queue-type`; G4.9). Unset: `fq-codel-default`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_type: Option<String>,
+    /// How the download rate is held (G4.9): `shaper` queues the excess
+    /// (TCP sees delay), `policer` drops it in XDP. Unset: shaper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_mode: Option<crate::queue::DownloadMode>,
 }
 
 fn is_default_v6(v: &UseIpv6) -> bool {
@@ -593,9 +601,15 @@ pub struct PppoeServer {
     #[serde(default)]
     pub name: String,
     pub interface: IfName,
-    /// Empty: any Service-Name (and the empty one) is served.
+    /// RouterOS' single name (empty: any Service-Name, and the empty one,
+    /// is served). Read only while `services` is empty (a config from
+    /// before G4.3k); commands write `services` and clear it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service_name: String,
+    /// G4.3k: the Service-Name table (`crate::pppoe_services`). Empty: the
+    /// table `service_name` means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::pppoe_services::PppoeService>,
     #[serde(default = "mtu_default")]
     pub max_mtu: u16,
     #[serde(default = "mtu_default")]
@@ -720,6 +734,16 @@ impl PppoeServer {
         self.pado_delay.saturating_add(tier).min(MAX_PADO_DELAY)
     }
 
+    /// The Service-Name table in force: `services`, or the one RouterOS'
+    /// `service_name` means (G4.3k), with its `empty` and `any` rows last.
+    pub fn service_table(&self) -> Vec<crate::pppoe_services::PppoeService> {
+        if self.services.is_empty() {
+            crate::pppoe_services::from_service_name(&self.service_name)
+        } else {
+            self.services.clone()
+        }
+    }
+
     pub fn vlan_allowed(&self, vid: Option<u16>) -> bool {
         match vid {
             None => self.pppoe_over_vlan_range.is_empty() || self.accept_untagged,
@@ -751,6 +775,9 @@ pub struct Effective {
     pub dhcpv6_pd_pool: Option<String>,
     pub dhcpv6_lease_time: u32,
     pub dns_server_ipv6: Vec<Ipv6Addr>,
+    /// G4.9: the download queue's type and how the rate is held.
+    pub queue_type: String,
+    pub download_mode: crate::queue::DownloadMode,
 }
 
 impl Ppp {
@@ -831,6 +858,9 @@ impl Ppp {
                 .map(|p| p.dns_server_ipv6.clone())
                 .find(|d| !d.is_empty())
                 .unwrap_or_default(),
+            queue_type: pick(&chain, |p| p.queue_type.clone())
+                .unwrap_or_else(|| crate::queue::DEFAULT_DYNAMIC_TYPE.into()),
+            download_mode: pick(&chain, |p| p.download_mode).unwrap_or_default(),
         };
         if let Some(s) = secret {
             if let Some(ip) = s.local_address {
@@ -903,6 +933,10 @@ pub struct ActiveSession {
     pub id: String,
     pub name: String,
     pub service: String,
+    /// G4.3k: the Service-Name the subscriber asked for (`""`: the empty
+    /// one); `None` outside PPPoE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     /// The subscriber's MAC.
     pub caller_id: String,
     pub address: Option<Ipv4Addr>,

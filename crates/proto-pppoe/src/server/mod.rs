@@ -9,6 +9,7 @@
 //! [`Output`]. One `Server` is one SESSION_ID space (≤ 65 534 sessions,
 //! RFC 2516 §4); the BNG service runs one per access port group.
 
+mod services;
 mod session;
 
 use crate::auth::{self, AUTH_STRING_LEN, MsChapResponse};
@@ -30,6 +31,7 @@ use std::net::Ipv4Addr;
 use std::ops::RangeInclusive;
 
 pub use crate::descriptor::{SessionDescriptor, SessionKey};
+pub use services::{ServiceAction, ServiceRule, ServiceSlot, ServiceTable};
 
 /// RFC 2516 §4: SESSION_ID 0xffff is reserved, 0 means "no session".
 pub const MAX_SID: u16 = 0xfffe;
@@ -61,8 +63,9 @@ pub struct ServerConfig {
     pub ac_mac: Mac,
     /// AC-Name tag (RFC 2516 §5.2: MUST be in every PADO).
     pub ac_name: Vec<u8>,
-    /// Services offered; empty = any (RouterOS `service-name` unset).
-    pub service_names: Vec<Vec<u8>>,
+    /// The Service-Name table (G4.3k): what each name a subscriber asks
+    /// for gets. Default: every name served (RouterOS `service-name=""`).
+    pub services: ServiceTable,
     /// Upper bound on sessions (RouterOS `max-sessions`; ≤ 65 534).
     pub max_sessions: u16,
     /// A new PADR from a MAC drops its old session (RouterOS
@@ -131,7 +134,7 @@ impl Default for ServerConfig {
         ServerConfig {
             ac_mac: Mac([0x02, 0, 0, 0, 0, 1]),
             ac_name: b"CoreRouter".to_vec(),
-            service_names: Vec::new(),
+            services: ServiceTable::default(),
             max_sessions: MAX_SID,
             one_session_per_host: true,
             auth: AuthSet::routeros_default(),
@@ -202,6 +205,8 @@ pub struct AuthRequest {
     pub vlans: Vlans,
     pub circuit_id: Option<Box<[u8]>>,
     pub remote_id: Option<Box<[u8]>>,
+    /// The Service-Name of the PADR (G4.3k: the profile is chosen by it).
+    pub service: Box<[u8]>,
 }
 
 impl AuthRequest {
@@ -336,6 +341,9 @@ pub struct Stats {
     pub padi_rx: u64,
     pub padi_limited: u64,
     pub padi_refused: u64,
+    /// PADIs and PADRs refused by the Service-Name table (drop rows, a
+    /// row's max sessions or PADI limit).
+    pub service_refused: u64,
     pub pado_tx: u64,
     pub pado_delayed: u64,
     pub padr_rx: u64,
@@ -405,6 +413,8 @@ pub struct Server {
     delayed_seq: u64,
     scratch: Scratch,
     stats: Stats,
+    /// Sessions and PADI limiters per row of `cfg.services`.
+    svc: services::ServiceState,
 }
 
 /// Identifies the PADR that created a session: Host-Uniq and AC-Cookie.
@@ -440,6 +450,7 @@ impl Server {
             delayed_seq: 0,
             scratch: Scratch::default(),
             stats: Stats::default(),
+            svc: services::ServiceState::new(&cfg.services),
             cfg,
         }
     }
@@ -466,7 +477,37 @@ impl Server {
         {
             self.limiter = PadiLimiter::new(limits.0, limits.1, limits.2);
         }
+        let table = cfg.services != self.cfg.services;
         self.cfg = cfg;
+        if table {
+            // Rows moved: each session counts again under the row its name
+            // lands on now (O(sessions), once per change of the table).
+            self.svc = services::ServiceState::new(&self.cfg.services);
+            for s in self.sessions.iter_mut().flatten() {
+                let (slot, _) = self.cfg.services.lookup(&s.service);
+                s.svc = slot;
+                self.svc.add(slot);
+            }
+        }
+    }
+
+    /// Sessions held per row of the Service-Name table: `(name, sessions)`,
+    /// the named rows in order, then `""` (empty) and `"*"` (any).
+    pub fn service_sessions(&self) -> Vec<(Vec<u8>, u32)> {
+        let n = |slot: ServiceSlot| self.svc.active.get(usize::from(slot)).copied().unwrap_or(0);
+        let mut out: Vec<(Vec<u8>, u32)> = self
+            .cfg
+            .services
+            .named()
+            .enumerate()
+            .map(|(i, (name, _))| {
+                let slot = u16::try_from(i).map_or(services::ANY, |i| services::NAMED + i);
+                (name.to_vec(), n(slot))
+            })
+            .collect();
+        out.push((Vec::new(), n(services::EMPTY)));
+        out.push((b"*".to_vec(), n(services::ANY)));
+        out
     }
 
     pub fn stats(&self) -> &Stats {
@@ -576,6 +617,7 @@ impl Server {
         };
         self.active -= 1;
         self.free.push_back(sid);
+        self.svc.remove(s.svc);
         let hk = s.host_key();
         if self.by_host.get(&hk) == Some(&sid) {
             self.by_host.remove(&hk);
@@ -680,12 +722,6 @@ impl Server {
         }
     }
 
-    fn service_ok(&self, name: &[u8]) -> bool {
-        name.is_empty()
-            || self.cfg.service_names.is_empty()
-            || self.cfg.service_names.iter().any(|s| s == name)
-    }
-
     /// The PADO/PADS tags every reply echoes (RFC 2516 §5.2: Host-Uniq and
     /// Relay-Session-Id unmodified; RFC 4638 §5: PPP-Max-Payload only when
     /// supported).
@@ -707,6 +743,22 @@ impl Server {
         (v > DEFAULT_MRU && v <= cap).then_some(v)
     }
 
+    /// The row has no room, unless `host` holds a session on it that
+    /// one-session-per-host would replace.
+    fn row_full(&self, host: HostKey, slot: ServiceSlot) -> bool {
+        if !self.svc.full(&self.cfg.services, slot) {
+            return false;
+        }
+        let own = self.cfg.one_session_per_host
+            && self
+                .by_host
+                .get(&host)
+                .and_then(|sid| self.slot(*sid))
+                .is_some_and(|s| s.svc == slot);
+        !own
+    }
+
+    /// The server's load delay (accel-ppp `pado-delay`).
     fn pado_delay(&self) -> u32 {
         let n = self.active as u32;
         self.cfg
@@ -727,21 +779,39 @@ impl Server {
             return;
         };
         // RFC 2516 §5.2: answer only if we can serve the request.
-        if !addressed
-            || d.session_id != 0
-            || d.tags.service_names != 1
-            || !self.service_ok(service)
-            || self.free.is_empty()
-        {
+        if !addressed || d.session_id != 0 || d.tags.service_names != 1 || self.free.is_empty() {
             self.stats.padi_refused += 1;
+            return;
+        }
+        // G4.3k: the row of the name decides; drop, a full row and a row's
+        // PADI limit all mean "cannot serve" (§5.2: no PADO).
+        let (slot, rule) = self.cfg.services.lookup(service);
+        let rule = *rule;
+        let host = HostKey {
+            ifindex,
+            vlans: d.vlans,
+            mac: d.src,
+        };
+        if rule.action == ServiceAction::Drop || self.row_full(host, slot) {
+            self.stats.padi_refused += 1;
+            self.stats.service_refused += 1;
             return;
         }
         if !self.limiter.allow(now, d.src) {
             self.stats.padi_limited += 1;
             return;
         }
+        if !self.svc.allow(now, slot, d.src) {
+            self.stats.padi_limited += 1;
+            self.stats.service_refused += 1;
+            return;
+        }
         let cookie = self.cookies.issue(now, d.src, ifindex, d.vlans);
-        let delay = self.pado_delay();
+        let row_delay = match rule.action {
+            ServiceAction::Delay => rule.delay_ms,
+            _ => 0,
+        };
+        let delay = self.pado_delay().saturating_add(row_delay);
         let start = out.buf.len();
         let mut w =
             DiscoveryWriter::begin(&mut out.buf, d.src, self.cfg.ac_mac, d.vlans, Code::Pado, 0);
@@ -853,10 +923,17 @@ impl Server {
             return;
         }
         // RFC 2516 §5.3: exactly one Service-Name; §5.4: one we do not
-        // offer gets Service-Name-Error.
-        let service = match (d.tags.service_name, d.tags.service_names) {
-            (Some(s), 1) if self.service_ok(s) => s,
+        // offer (a drop row) gets Service-Name-Error. Erratum 5634: the
+        // error text is not NUL-terminated.
+        let lookup = d
+            .tags
+            .service_name
+            .filter(|_| d.tags.service_names == 1)
+            .map(|s| (s, self.cfg.services.lookup(s)));
+        let (service, slot) = match lookup {
+            Some((s, (slot, r))) if r.action != ServiceAction::Drop => (s, slot),
             _ => {
+                self.stats.service_refused += u64::from(lookup.is_some());
                 self.pads_error(
                     ifindex,
                     d,
@@ -867,6 +944,20 @@ impl Server {
                 return;
             }
         };
+        // The row's max sessions: §5.4 AC-System-Error ("insufficient
+        // resources"), as for the server's. A host coming back on its own
+        // row takes its old session's place.
+        if self.row_full(host, slot) {
+            self.stats.service_refused += 1;
+            self.pads_error(
+                ifindex,
+                d,
+                tag::AC_SYSTEM_ERROR,
+                b"service session limit",
+                out,
+            );
+            return;
+        }
         if self.cfg.one_session_per_host
             && let Some(&old) = self.by_host.get(&host)
         {
@@ -891,6 +982,7 @@ impl Server {
                 uniq,
                 mru_cap,
                 service: service.into(),
+                svc: slot,
                 circuit_id: d.tags.circuit_id.map(Into::into),
                 remote_id: d.tags.remote_id.map(Into::into),
             },
@@ -900,6 +992,7 @@ impl Server {
             *slot = Some(Box::new(s));
         }
         self.active += 1;
+        self.svc.add(slot);
         self.stats.sessions_created += 1;
         self.by_host.insert(host, sid);
         self.by_uniq.insert((host, uniq), sid);
@@ -1046,6 +1139,18 @@ impl Server {
             {
                 return Err(format!("by_uniq points at a dead SID {sid}"));
             }
+        }
+        let mut rows = vec![0u32; self.cfg.services.slots()];
+        for s in self.sessions.iter().flatten() {
+            if let Some(n) = rows.get_mut(usize::from(s.svc)) {
+                *n += 1;
+            }
+        }
+        if rows != self.svc.active {
+            return Err(format!(
+                "sessions per service {:?} != counted {rows:?}",
+                self.svc.active
+            ));
         }
         if self.cfg.one_session_per_host {
             let mut hosts = std::collections::HashSet::new();

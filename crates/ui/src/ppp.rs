@@ -38,6 +38,9 @@ pub(crate) const NAME: &str = "ppp";
 pub(crate) const WIN: &str = "ppp";
 const SCOPE: &str = "ppp";
 const SERVERS: &str = "ppp-servers";
+const SERVICES: &str = "ppp-services";
+/// Height of the Service Names table under the servers (G4.3k).
+const SERVICES_H: f32 = 210.0;
 const SECRETS: &str = "ppp-secrets";
 const PROFILES: &str = "ppp-profiles";
 const ACTIVE: &str = "ppp-active";
@@ -82,6 +85,12 @@ const SERVER_CMDS: Cmds = Cmds {
     set: Some("interface.pppoe-server.server.set"),
     what: "servers",
 };
+const SERVICE_CMDS: Cmds = Cmds {
+    add: "interface.pppoe-server.server.service.add",
+    remove: "interface.pppoe-server.server.service.remove",
+    set: Some("interface.pppoe-server.server.service.set"),
+    what: "service names",
+};
 const SECRET_CMDS: Cmds = Cmds { add: "ppp.secret.add", remove: "ppp.secret.remove", set: Some("ppp.secret.set"), what: "secrets" };
 const PROFILE_CMDS: Cmds = Cmds { add: "ppp.profile.add", remove: "ppp.profile.remove", set: Some("ppp.profile.set"), what: "profiles" };
 
@@ -97,6 +106,15 @@ const SERVER_COLUMNS: [table::Column; 11] = [
     col("New Sessions").help("ppp.server.admission"),
     num("Sessions").help("ppp.server.sessions"),
     comment(),
+];
+const SERVICE_COLUMNS: [table::Column; 7] = [
+    col("Service Name").help("ppp.service.name"),
+    col("Profile").help("ppp.service.profile"),
+    col("Action").help("ppp.service.action"),
+    num("PADO Delay").help("ppp.service.pado_delay"),
+    num("Max Sessions").help("ppp.service.max_sessions"),
+    num("PADI Limit").help("ppp.service.padi_limit"),
+    num("Sessions").help("ppp.service.sessions"),
 ];
 const SECRET_COLUMNS: [table::Column; 8] = [
     col("Name").help("ppp.secret.name"),
@@ -149,7 +167,6 @@ const HISTORY_COLUMNS: [table::Column; 8] = [
 const SERVER_FIELDS: &[Field] = &[
     Field { param: "interface", label: "Interface", help: "ppp.server.interface", input: Input::Choice, edit: true },
     Field { param: "name", label: "Name", help: "ppp.server.name", input: Input::Text("pppoe-<interface>"), edit: true },
-    Field { param: "service_name", label: "Service Name", help: "ppp.server.service_name", input: Input::Text("(any)"), edit: true },
     Field { param: "max_mtu", label: "Max MTU", help: "ppp.server.max_mtu", input: Input::Text("1480"), edit: true },
     Field { param: "max_mru", label: "Max MRU", help: "ppp.server.max_mru", input: Input::Text("1480"), edit: true },
     Field { param: "mrru", label: "MRRU", help: "ppp.server.mrru", input: Input::Text("disabled"), edit: true },
@@ -177,6 +194,26 @@ const SERVER_SPEC: Spec = Spec {
     help: "ppp.servers",
     fields: SERVER_FIELDS,
     preview: "interface.pppoe-server.server.preview",
+};
+
+/// A row of the Service-Name table (G4.3k).
+const SERVICE_FIELDS: &[Field] = &[
+    Field { param: "server", label: "Server", help: "ppp.service.server", input: Input::Choice, edit: false },
+    Field { param: "name", label: "Service Name", help: "ppp.service.name", input: Input::Text("internet, empty or any"), edit: true },
+    Field { param: "profile", label: "Profile", help: "ppp.service.profile", input: Input::Choice, edit: true },
+    Field { param: "action", label: "Action", help: "ppp.service.action", input: Input::Choice, edit: true },
+    Field { param: "pado_delay", label: "PADO Delay (ms)", help: "ppp.service.pado_delay", input: Input::Text("0"), edit: true },
+    Field { param: "max_sessions", label: "Max Sessions", help: "ppp.service.max_sessions", input: Input::Text("0 (no limit)"), edit: true },
+    Field { param: "padi_limit", label: "PADI Limit (/s)", help: "ppp.service.padi_limit", input: Input::Text("0 (no limit)"), edit: true },
+];
+const SERVICE_SPEC: Spec = Spec {
+    panel: NAME,
+    parent: Win::Panel(WIN),
+    new_title: "New Service Name",
+    edit_title: "Service Name",
+    help: "ppp.services",
+    fields: SERVICE_FIELDS,
+    preview: "interface.pppoe-server.server.service.preview",
 };
 
 const SECRET_FIELDS: &[Field] = &[
@@ -328,6 +365,12 @@ pub(crate) struct PppPanel {
     waiting: usize,
     pub(crate) error: Option<String>,
     servers_table: TableState,
+    /// G4.3k: the Service-Name table of `svc_server` (a server's id: the
+    /// one selected, else the first).
+    pub(crate) services: Vec<Value>,
+    pub(crate) svc_server: Option<String>,
+    services_table: TableState,
+    pub(crate) svc_modal: Option<Modal>,
     secrets_table: TableState,
     profiles_table: TableState,
     active_table: TableState,
@@ -490,6 +533,161 @@ impl PppPanel {
         }
     }
 
+    /// A row of the Service-Name table: `empty` and `any` as selos, the
+    /// action as a coloured selo (drop red: those CPEs get no answer).
+    pub(crate) fn service_row(r: &Value) -> Row {
+        let name = text(r, "name");
+        let name_cell = match (flag(r, "special"), name.as_str()) {
+            (true, "empty") => chip::cell("", &[("empty name", Kind::Neutral)]),
+            (true, _) => chip::cell("", &[("other names", Kind::Neutral)]),
+            _ => name,
+        };
+        let profile = text(r, "profile");
+        let action = text(r, "action");
+        let delay = n(r, "pado_delay");
+        let delay_text = format!("delay {delay} ms");
+        let action_chip = match action.as_str() {
+            "drop" => ("drop", Kind::Red),
+            "delay" => (delay_text.as_str(), Kind::Amber),
+            _ => ("terminate", Kind::Green),
+        };
+        let dash = |k: &str| match n(r, k) {
+            0 => "–".to_owned(),
+            v => v.to_string(),
+        };
+        Row {
+            key: text(r, "id"),
+            cells: vec![
+                name_cell,
+                if profile.is_empty() { "–".into() } else { chip::cell("", &[(profile.as_str(), Kind::Hashed(chip::name_hue(&profile)))]) },
+                chip::cell("", &[action_chip]),
+                dash("pado_delay"),
+                dash("max_sessions"),
+                dash("padi_limit"),
+                n(r, "sessions").to_string(),
+            ],
+            dimmed: action == "drop",
+            section: false,
+            tint: None,
+        }
+    }
+
+    /// The Service Name modal: a new row of `server`, or `row` edited.
+    pub(crate) fn open_service(&mut self, app: &mut CoreRouterUi, server: &str, row: Option<&Value>) {
+        if self.modal.is_some() {
+            return;
+        }
+        if let Some(m) = &mut self.svc_modal {
+            m.status.bring_to_front();
+            return;
+        }
+        let m = match row {
+            None => {
+                let mut v = BTreeMap::new();
+                v.insert("server", server.to_owned());
+                v.insert("action", "terminate".to_owned());
+                Modal::open(app, None, v)
+            }
+            Some(r) => {
+                let mut v = Self::values(SERVICE_FIELDS, r);
+                // Zero is "none": an empty field reads better.
+                for f in ["pado_delay", "max_sessions", "padi_limit"] {
+                    if v.get(f).is_some_and(|x| x == "0") {
+                        v.insert(f, String::new());
+                    }
+                }
+                Modal::open(app, Some((text(r, "id"), text(r, "name"))), v)
+            }
+        };
+        self.svc_modal = Some(m);
+    }
+
+    /// The Service-Name table of the server picked above (G4.3k): the list
+    /// pattern, its own modal.
+    fn services_section(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
+        let Some(server) = self.svc_server.as_ref().and_then(|id| self.servers.iter().find(|r| text(r, "id") == *id)).cloned() else {
+            return;
+        };
+        let data = self.services.clone();
+        let rows: Vec<Row> = data.iter().map(Self::service_row).collect();
+        let sel = self.services_table.selection(&rows);
+        let picked: Vec<Item> = sel
+            .as_slice()
+            .iter()
+            .filter_map(|k| data.iter().find(|t| text(t, "id") == *k))
+            .map(|t| {
+                let mut i = Item::of(t, "id", "");
+                if flag(t, "special") {
+                    i.fixed = Some(tr_in(SCOPE, l, "the empty and other-names rows always exist: change their action").to_owned());
+                }
+                i
+            })
+            .collect();
+        let mut tools = Tools::new(&app.can(), &SERVICE_CMDS, &picked);
+        // A row is not switched on or off: its action (drop) says it.
+        let no = || Err(tr_in(SCOPE, l, "a row has an action instead (drop)").to_owned());
+        tools.enable = no();
+        tools.disable = no();
+        tools.comment = no();
+        let mut act = None;
+        let mut help = self.help.take();
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.strong(tr_in(SCOPE, l, "Service Names"));
+            info(ui, &mut help, l, "ppp.services", "Service Names");
+            let srv = text(&server, "name");
+            let v = ui.visuals().clone();
+            chip::chip(ui, &srv, chip::palette_tone(&v, chip::name_hue(&srv)));
+            act = list::toolbar(ui, SERVICES, &tools, &sel, l);
+        });
+        let new_label = tr_in(SCOPE, l, SERVICE_SPEC.new_title);
+        let out = table::show(ui, SERVICES, 4.0, &mut self.services_table, &SERVICE_COLUMNS, &rows, |ui, menu| match menu {
+            Menu::Rows(sel) => {
+                if let Some(a) = list::row_menu(ui, &tools, sel, false, l) {
+                    act = Some(a);
+                }
+            }
+            Menu::Empty => {
+                if table::action(ui, &format!("{new_label}…"), tools.add.clone()) {
+                    act = Some(Act::Add);
+                }
+            }
+        });
+        if let Some(key) = out.help {
+            let title = SERVICE_COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            help = Some(HelpView::new(key, tr_in(SCOPE, l, title)));
+        }
+        self.help = help;
+        if act.is_none() {
+            act = list::from_shortcut(out.shortcut, &tools, &sel);
+        }
+        if let Some(k) = out.opened {
+            act = Some(Act::Edit(k));
+        }
+        let step = |command: &str, params: Value| json!({"command": command, "params": params});
+        let steps: Vec<Value> = match act {
+            Some(Act::Add) => {
+                self.open_service(app, &text(&server, "name"), None);
+                return;
+            }
+            Some(Act::Edit(k)) => {
+                let r = data.iter().find(|t| text(t, "id") == k).cloned();
+                self.open_service(app, &text(&server, "name"), r.as_ref());
+                return;
+            }
+            Some(Act::Remove(ids)) => ids.iter().map(|id| step(SERVICE_CMDS.remove, json!({"id": id}))).collect(),
+            Some(Act::Copy(ids)) => {
+                let picked: Vec<&Row> = rows.iter().filter(|r| ids.contains(&r.key)).collect();
+                ui.ctx().copy_text(list::copy_rows(&picked));
+                return;
+            }
+            _ => Vec::new(),
+        };
+        if !steps.is_empty() {
+            app.run_steps(steps.clone(), crate::panel::then(NAME, Done(steps)));
+        }
+    }
+
     /// `new_session_rate`: the fixed rate, off, or `auto` with the rate now
     /// and why (amber when the RADIUS server is what holds it down).
     fn admission_cell(r: &Value) -> String {
@@ -589,7 +787,8 @@ impl PppPanel {
             cells: vec![
                 chip::cell("", &name_chips),
                 // PPPoE and IPoE (G4.3f) side by side: a chip per service.
-                chip::cell("", &[(service.as_str(), Kind::Hashed(chip::name_hue(&service)))]),
+                // G4.3k: the Service-Name asked for, next to the service.
+                chip::cell(&text(r, "service_name"), &[(service.as_str(), Kind::Hashed(chip::name_hue(&service)))]),
                 text(r, "caller_id"),
                 text(r, "address"),
                 text(r, "ipv6_prefix"),
@@ -716,7 +915,25 @@ impl PppPanel {
             }
             table::find_field(ui, salt, state);
         });
-        let footer_h = ui.spacing().interact_size.y + 6.0;
+        let mut footer_h = ui.spacing().interact_size.y + 6.0;
+        if tab == Tab::Servers {
+            // G4.3k: the Service-Name table of the selected server (else the
+            // first one) goes under the list.
+            let pick = sel.as_slice().first().cloned().or_else(|| data.first().map(|r| text(r, "id")));
+            if pick != self.svc_server {
+                self.services.clear();
+                app.cache.refreshed_at = None;
+            }
+            self.svc_server = pick;
+            if self.svc_server.is_some() {
+                footer_h += SERVICES_H;
+            }
+        }
+        let state = match tab {
+            Tab::Secrets => &mut self.secrets_table,
+            Tab::Profiles => &mut self.profiles_table,
+            _ => &mut self.servers_table,
+        };
         let new_label = tr_in(SCOPE, l, spec.new_title);
         let out = table::show(ui, salt, footer_h, state, columns, &rows, |ui, menu| match menu {
             Menu::Rows(sel) => {
@@ -765,6 +982,9 @@ impl PppPanel {
         }
         if let Some(a) = act {
             self.act(app, tab, a, &rows, ui);
+        }
+        if tab == Tab::Servers {
+            self.services_section(app, ui, l);
         }
     }
 
@@ -1336,6 +1556,12 @@ impl PanelState for PppPanel {
         match self.tab {
             Tab::Interface | Tab::Servers => {
                 q.push(Query { key: "servers", command: "interface.pppoe-server.server.list", params: json!({}) });
+                if self.tab == Tab::Servers
+                    && let Some(id) = &self.svc_server
+                    && app.has_command("interface.pppoe-server.server.service.list")
+                {
+                    q.push(Query { key: "services", command: "interface.pppoe-server.server.service.list", params: json!({"server": id}) });
+                }
             }
             Tab::Secrets => {
                 q.push(Query { key: "secrets", command: "ppp.secret.list", params: json!({"limit": PAGE}) });
@@ -1357,7 +1583,7 @@ impl PanelState for PppPanel {
             Tab::Radius => {}
         }
         // The modal's choices.
-        if self.modal.as_ref().is_some_and(|(t, _)| *t == Tab::Servers) {
+        if self.modal.as_ref().is_some_and(|(t, _)| *t == Tab::Servers) || self.svc_modal.is_some() {
             q.push(Query { key: "profiles", command: "ppp.profile.list", params: json!({}) });
         }
         q
@@ -1366,6 +1592,7 @@ impl PanelState for PppPanel {
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
         match (key, value) {
             ("servers", Value::Array(a)) => self.servers = a,
+            ("services", Value::Array(a)) => self.services = a,
             ("secrets", Value::Array(a)) => self.secrets = a,
             ("profiles", Value::Array(a)) => self.profiles = a,
             ("history", Value::Array(a)) => self.history = a,
@@ -1397,7 +1624,9 @@ impl PanelState for PppPanel {
                 }
             }
             (list_modal::PREVIEW, v) => {
-                if let Some((_, m)) = self.modal.as_mut() {
+                if let Some(m) = self.svc_modal.as_mut() {
+                    m.arrived(v);
+                } else if let Some((_, m)) = self.modal.as_mut() {
                     m.arrived(v);
                 }
             }
@@ -1433,6 +1662,7 @@ impl PanelState for PppPanel {
     fn dialogs(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
         let interfaces = app.interface_names(None);
         let profiles: Vec<String> = self.profiles.iter().map(|p| text(p, "name")).collect();
+        let servers: Vec<String> = self.servers.iter().map(|p| text(p, "name")).collect();
         let options = |p: &str| -> Vec<String> {
             match p {
                 "interface" => interfaces.clone(),
@@ -1442,6 +1672,8 @@ impl PanelState for PppPanel {
                 "service" => ["pppoe", "ipoe", "any", "l2tp", "pptp", "sstp", "ovpn"].iter().map(|s| (*s).to_owned()).collect(),
                 "only_one" | "change_tcp_mss" => ["default", "yes", "no"].iter().map(|s| (*s).to_owned()).collect(),
                 "use_ipv6" => ["default", "yes", "no", "require"].iter().map(|s| (*s).to_owned()).collect(),
+                "server" => servers.clone(),
+                "action" => ["terminate", "delay", "drop"].iter().map(|s| (*s).to_owned()).collect(),
                 _ => Vec::new(),
             }
         };
@@ -1454,6 +1686,11 @@ impl PanelState for PppPanel {
             if !m.show(app, ctx, area, spec, &options) {
                 self.modal = None;
             }
+        }
+        if let Some(m) = self.svc_modal.as_mut()
+            && !m.show(app, ctx, area, &SERVICE_SPEC, &options)
+        {
+            self.svc_modal = None;
         }
         self.why_dialog(app, ctx, area);
         self.drops_dialog(app, ctx, area);
@@ -1491,18 +1728,25 @@ impl PanelState for PppPanel {
             }
             Err(t) => t,
         };
-        if let Ok(a) = then.downcast::<Applied>()
-            && let Some((_, m)) = self.modal.as_mut().filter(|(_, m)| m.id == a.0)
-            && m.replied(app, result)
-        {
-            self.modal = None;
+        if let Ok(a) = then.downcast::<Applied>() {
+            if let Some((_, m)) = self.modal.as_mut().filter(|(_, m)| m.id == a.0)
+                && m.replied(app, result)
+            {
+                self.modal = None;
+            }
+            if let Some(m) = self.svc_modal.as_mut().filter(|m| m.id == a.0)
+                && m.replied(app, result)
+            {
+                self.svc_modal = None;
+            }
         }
         app.cache.refreshed_at = None;
     }
 
     fn escape(&mut self, _win: &'static str) -> bool {
         match self.tab {
-            Tab::Servers | Tab::Interface => self.servers_table.escape(),
+            Tab::Servers => self.services_table.escape() || self.servers_table.escape(),
+            Tab::Interface => self.servers_table.escape(),
             Tab::Secrets => self.secrets_table.escape(),
             Tab::Profiles => self.profiles_table.escape(),
             Tab::Active => self.active_table.escape(),
@@ -1514,6 +1758,7 @@ impl PanelState for PppPanel {
     fn tables(&self) -> Vec<(&'static str, &TableState)> {
         vec![
             (SERVERS, &self.servers_table),
+            (SERVICES, &self.services_table),
             (SECRETS, &self.secrets_table),
             (PROFILES, &self.profiles_table),
             (ACTIVE, &self.active_table),
@@ -1524,6 +1769,7 @@ impl PanelState for PppPanel {
     fn tables_mut(&mut self) -> Vec<(&'static str, &mut TableState)> {
         vec![
             (SERVERS, &mut self.servers_table),
+            (SERVICES, &mut self.services_table),
             (SECRETS, &mut self.secrets_table),
             (PROFILES, &mut self.profiles_table),
             (ACTIVE, &mut self.active_table),
