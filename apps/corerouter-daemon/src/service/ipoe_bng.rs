@@ -117,6 +117,8 @@ struct Sub {
     unanswered: u32,
     pinged_ms: u64,
     rx_seen: u64,
+    /// G4.9b: the download queue (its profile's), `None`: policed in XDP.
+    shape: Option<corerouter_hal::queue::Kind>,
 }
 
 /// An XDP map change, for the thread (it knows the ports' index and MAC).
@@ -129,6 +131,7 @@ pub(crate) enum XdpOp {
         ip: Ipv4Addr,
         up: Rate,
         down: Rate,
+        shape: Option<corerouter_hal::queue::Kind>,
     },
     Remove(u32),
 }
@@ -155,6 +158,8 @@ struct State {
     interim_default: u32,
     /// `/ppp profile` rate limits by name (Mikrotik-Group), per refresh.
     profile_rates: HashMap<String, String>,
+    /// G4.9b: each profile's download queue (`None`: the XDP policer).
+    profile_shapes: HashMap<String, Option<corerouter_hal::queue::Kind>>,
     aaa: Option<Arc<dyn AaaBackend>>,
     asked: HashMap<Key, Asked>,
     inbox: Vec<(String, Vec<u8>, Verdict)>,
@@ -393,6 +398,15 @@ impl Core {
             .iter()
             .filter_map(|p| p.rate_limit.clone().map(|r| (p.name.clone(), r)))
             .collect();
+        st.profile_shapes = cfg
+            .ppp
+            .all_profiles()
+            .into_iter()
+            .map(|p| {
+                let e = cfg.ppp.effective(None, &p.name, DEFAULT_PROFILE);
+                (p.name, corerouter_engine::queue::shape_of(&cfg.queue, &e))
+            })
+            .collect();
         st.aaa = aaa;
     }
 
@@ -431,6 +445,7 @@ impl Core {
                     ip: s.ip,
                     up,
                     down,
+                    shape: s.shape,
                 });
                 if let Some(x) = st.subs.get_mut(&s.key) {
                     x.slot = Some(slot);
@@ -472,6 +487,8 @@ impl Core {
                 a.tx_bytes = n.down_bytes;
                 a.rx_packets = n.up_packets;
                 a.tx_packets = n.down_packets;
+                a.queue_us = n.down_queue_us;
+                a.drops = n.up_policed + n.down_policed;
             }
         }
     }
@@ -710,6 +727,11 @@ impl Core {
             unanswered: 0,
             pinged_ms: 0,
             rx_seen: 0,
+            shape: st
+                .profile_shapes
+                .get(&a.profile)
+                .copied()
+                .unwrap_or_else(|| st.profile_shapes.get(DEFAULT_PROFILE).copied().flatten()),
         };
         if let Some(slot) = slot {
             let (up, down) = rates(rate.as_deref());
@@ -720,6 +742,7 @@ impl Core {
                 ip: l.address,
                 up,
                 down,
+                shape: sub.shape,
             });
         }
         let mac = mac_text(l.mac);
@@ -1361,6 +1384,7 @@ impl SessionOwner for Owner {
                             ip: s.ip,
                             up,
                             down,
+                            shape: s.shape,
                         }
                     });
                     if let Some(op) = op {
@@ -1384,6 +1408,7 @@ pub(crate) fn xdp_session(
     ip: Ipv4Addr,
     up: Rate,
     down: Rate,
+    shape: Option<corerouter_hal::queue::Kind>,
 ) -> PppoeSession {
     PppoeSession {
         ifindex,
@@ -1398,6 +1423,7 @@ pub(crate) fn xdp_session(
         fast_up: false,
         fast_down: false,
         ipoe: true,
+        shape,
         ..PppoeSession::default()
     }
 }

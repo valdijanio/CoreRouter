@@ -129,9 +129,9 @@ fn active_connections_show_the_login_rate_and_counters() {
     assert!(name[0].1.contains("ana"), "sorted by name, the identity chip: {name:?}");
     let maria = rows.iter().find(|r| r.cells[0].contains("maria")).unwrap();
     assert!(crate::chip::split(&maria.cells[0]).1.iter().any(|(_, t)| *t == "R"), "RADIUS mark");
-    assert!(crate::chip::split(&rows[0].cells[7]).1.iter().any(|(_, t)| *t == "50M/100M"));
-    assert_eq!(rows[0].cells[6], "1h2m3s");
-    assert_eq!(rows[0].cells[8], "1.4 MiB");
+    assert!(crate::chip::split(&rows[0].cells[8]).1.iter().any(|(_, t)| *t == "50M/100M"));
+    assert_eq!(rows[0].cells[7], "1h2m3s");
+    assert_eq!(rows[0].cells[9], "1.4 MiB");
 }
 
 /// G4.3e: the /64 and the delegated prefix of a session, the selo saying
@@ -419,6 +419,9 @@ fn every_explanation_exists_in_both_languages() {
         "ppp.monitor.ipv6_sessions",
         "ppp.monitor.delegated",
         "ppp.monitor.ipv6_dropped",
+        "ppp.secret.routes",
+        "ppp.active.routes",
+        "ppp.why.routes",
     ];
     for key in keys {
         for l in [Lang::En, Lang::Pt] {

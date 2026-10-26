@@ -177,8 +177,10 @@ impl Modal {
                     p.insert(f.param.into(), json!(v == "yes"));
                 }
                 // A new item leaves empty fields out; an edit sends them
-                // (an emptied comment is cleared).
-                _ if v.trim().is_empty() && self.item.is_none() => {}
+                // (an emptied comment is cleared). A write-only field
+                // (a password) left empty keeps what the router has: sent
+                // empty, it cleared the secret's password on every edit.
+                _ if v.trim().is_empty() && (self.item.is_none() || matches!(f.input, Input::Secret(_))) => {}
                 _ => {
                     p.insert(f.param.into(), json!(v.trim()));
                 }

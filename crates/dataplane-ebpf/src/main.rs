@@ -14,6 +14,9 @@
 //!    its access port (`pppoe::downstream`, `pppoe::encap`); one from a
 //!    subscriber goes out where the FIB says, or to the kernel.
 //!
+//! The same object holds the tc programs of the shaper (G4.9b) and of
+//! `bng0` (G4.3ca), at the end of this file: they share the session maps.
+//!
 //! The decisions are the common crate's functions, the same the host tests
 //! run; this file only backs them with maps and counts the outcome.
 //!
@@ -29,17 +32,21 @@
 #![allow(internal_features)]
 
 use aya_ebpf::bindings::{
-    BPF_ANY, BPF_FIB_LKUP_RET_SUCCESS, BPF_NOEXIST, bpf_fib_lookup as FibParams,
+    BPF_ANY, BPF_FIB_LKUP_RET_SUCCESS, BPF_NOEXIST, TC_ACT_OK, TC_ACT_SHOT, bpf_fib_lookup as FibParams,
     bpf_fib_lookup__bindgen_ty_1, bpf_fib_lookup__bindgen_ty_2, bpf_fib_lookup__bindgen_ty_3,
     bpf_fib_lookup__bindgen_ty_4, bpf_fib_lookup__bindgen_ty_5, xdp_action,
 };
-use aya_ebpf::helpers::{bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_xdp_adjust_head};
-use aya_ebpf::macros::{map, xdp};
+use aya_ebpf::helpers::{
+    bpf_fib_lookup, bpf_ktime_get_ns, bpf_redirect, bpf_skb_change_head, bpf_skb_set_tstamp,
+    bpf_xdp_adjust_head,
+};
+use aya_ebpf::macros::{classifier, map, xdp};
 use aya_ebpf::maps::lpm_trie::Key;
 use aya_ebpf::maps::{
     Array, HashMap, LpmTrie, LruHashMap, LruPerCpuHashMap, PerCpuArray, PerCpuHashMap,
 };
-use aya_ebpf::programs::XdpContext;
+use aya_ebpf::programs::{TcContext, XdpContext};
+use core::intrinsics::AtomicOrdering;
 use corerouter_dataplane_ebpf_common::bucket::Bucket;
 use corerouter_dataplane_ebpf_common::fastnat::{self, FlowKey, FlowValue};
 use corerouter_dataplane_ebpf_common::nat::PacketMut;
@@ -49,8 +56,11 @@ use corerouter_dataplane_ebpf_common::packet::Packet;
 use corerouter_dataplane_ebpf_common::parse::{Addr, ETH_HLEN, IpInfo};
 use corerouter_dataplane_ebpf_common::ipoe;
 use corerouter_dataplane_ebpf_common::policer;
+use corerouter_dataplane_ebpf_common::queue;
+use corerouter_dataplane_ebpf_common::shaper;
+use corerouter_dataplane_ebpf_common::words::Words;
 use corerouter_dataplane_ebpf_common::pppoe::{
-    self, Counters, Down, DownSession, KEY_LEN, PacketHead, SessionWords, Sessions, Stat, Up,
+    self, Counters, DownKind, DownSession, KEY_LEN, PacketHead, SessionWords, Sessions, Stat, Up,
 };
 
 #[map(name = "SETTINGS")]
@@ -182,6 +192,20 @@ impl Sessions for Subs {
         PPPOE_V6.get(Key::new(128, dst)).copied()
     }
 
+    type Policer<'a> = Atomic<{ policer::STATE_WORDS }>;
+
+    /// The element's words through BPF atomics (G4.3cc): every CPU may
+    /// police one subscriber at once and the rate stays exact.
+    #[inline(always)]
+    fn policer(&mut self, idx: u32, dir: u32) -> Atomic<{ policer::STATE_WORDS }> {
+        // The pointer is null when there is no element (`present()`).
+        Atomic(
+            PPPOE_POLICER
+                .get_ptr_mut(idx.wrapping_mul(2).wrapping_add(dir & 1))
+                .unwrap_or(core::ptr::null_mut()),
+        )
+    }
+
     #[inline(always)]
     fn by_route_v4(&self, dst: [u8; 4]) -> Option<u32> {
         PPPOE_RT4.get(Key::new(32, dst)).copied()
@@ -190,16 +214,6 @@ impl Sessions for Subs {
     #[inline(always)]
     fn by_route_v6(&self, dst: [u8; 16]) -> Option<u32> {
         PPPOE_RT6.get(Key::new(128, dst)).copied()
-    }
-
-    #[inline(always)]
-    fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State> {
-        let p = PPPOE_POLICER.get_ptr_mut(idx.checked_mul(2)? + (dir & 1))?;
-        // SAFETY: the kernel's pointer to this array element, valid and
-        // aligned for `policer::State` for the run (array elements are
-        // never freed). CPUs may update one subscriber's state at once:
-        // plain integers, so a race only makes the rate approximate.
-        Some(unsafe { &mut *p })
     }
 
     #[inline(always)]
@@ -261,23 +275,23 @@ fn sent(d: &DownSession) -> u32 {
 
 /// Counted a downstream verdict that does not encapsulate; the action.
 #[inline(always)]
-fn down_other(d: Down) -> Option<u32> {
-    match d {
-        Down::NotSub | Down::Encap(_) => None,
-        Down::Counted(st, idx, len) => {
-            stat(st);
-            sess_add(idx, pppoe::C_DOWN_PACKETS, 1);
-            sess_add(idx, pppoe::C_DOWN_BYTES, u64::from(len));
+fn down_other(d: &pppoe::Verdict) -> Option<u32> {
+    match d.kind {
+        DownKind::NotSub | DownKind::Encap => None,
+        DownKind::Counted => {
+            stat(d.stat);
+            sess_add(d.idx, pppoe::C_DOWN_PACKETS, 1);
+            sess_add(d.idx, pppoe::C_DOWN_BYTES, u64::from(d.ip_len));
             Some(xdp_action::XDP_PASS)
         }
-        Down::Kernel(st, idx) => {
-            stat(st);
-            sess_add(idx, pppoe::C_KERNEL, 1);
+        DownKind::Kernel => {
+            stat(d.stat);
+            sess_add(d.idx, pppoe::C_KERNEL, 1);
             Some(xdp_action::XDP_PASS)
         }
-        Down::Drop(st, idx) => {
-            stat(st);
-            sess_add(idx, pppoe::C_DOWN_POLICED, 1);
+        DownKind::Drop => {
+            stat(d.stat);
+            sess_add(d.idx, pppoe::C_DOWN_POLICED, 1);
             Some(xdp_action::XDP_DROP)
         }
     }
@@ -293,18 +307,19 @@ fn to_subscriber(frame: &mut Frame, now: u64) -> Option<u32> {
     if d.routed {
         stat(Stat::DownRouted);
     }
-    match d.down {
-        Down::Encap(s) => {
+    let v = &d.verdict;
+    match v.kind {
+        DownKind::Encap => {
             if d.tagged {
                 stat(Stat::DownTagged);
             }
-            Some(sent(&s))
+            Some(sent(&v.session))
         }
-        Down::Drop(Stat::Malformed, _) => {
+        DownKind::Drop if v.stat == Stat::Malformed => {
             stat(Stat::Malformed);
             Some(xdp_action::XDP_DROP)
         }
-        other => down_other(other),
+        _ => down_other(v),
     }
 }
 
@@ -524,9 +539,18 @@ fn nat_sub(frame: &mut Frame, now: u64) -> Option<u32> {
     let [_, new_dst, ..] = v;
     let new_dst = fastnat::decode(new_dst);
     let idx = Subs.by_v4(new_dst.addr)?;
+    // Shaped (G4.9b): the kernel translates it and the egress queue holds
+    // it (nothing written yet). Here, not in `fast_nat`: there it made LLVM
+    // spill an undefined register in `filter_stage` ("R2 !read_ok").
+    if pppoe::shaped(&Subs, idx) {
+        stat(Stat::DownShaped);
+        return None;
+    }
     let (ip_len, ttl) = pppoe::ip_meta(frame, false)?;
-    match pppoe::downstream(&mut Subs, idx, false, ip_len, ttl, now, true) {
-        Down::Encap(d) => {
+    let verdict = pppoe::verdict(&mut Subs, idx, false, ip_len, ttl, now, true);
+    match verdict.kind {
+        DownKind::Encap => {
+            let d = verdict.session;
             let info = IpInfo {
                 ip_off: ETH_HLEN,
                 src: Addr::V4(src),
@@ -551,7 +575,7 @@ fn nat_sub(frame: &mut Frame, now: u64) -> Option<u32> {
             }
             Some(encap_out(frame, &d))
         }
-        other => down_other(other),
+        _ => down_other(&verdict),
     }
 }
 
@@ -789,6 +813,511 @@ pub fn corerouter_xdp(ctx: XdpContext) -> u32 {
         return xdp_action::XDP_PASS;
     }
     down_stage(&ctx, f & CLEAN != 0, up, now)
+}
+
+// --- G4.9b / G4.3ca: the tc programs ---------------------------------------
+//
+// Three classifiers in the same object as the XDP program, so they share
+// its session maps (a subscriber's address → its session, its rates):
+//
+// - `shape_egress` (clsact egress of every port with a target behind it):
+//   the download shaper. A session's address (shaped sessions only), else a
+//   queue's prefix, else the port's interface queue: the departure time goes
+//   in `skb->tstamp` and `fq` holds the packet until then (EDT);
+// - `shape_ingress` (clsact ingress of the same ports): the upload policer
+//   of the queues (sessions are policed by the XDP program);
+// - `bng_egress` (clsact egress of `bng0`, G4.3ca): what the kernel routes
+//   to a PPPoE subscriber (slow path, ICMP, shaped download) gets the
+//   access-side header and goes to the session's port.
+
+#[map(name = "SUB_SHAPE")]
+static SUB_SHAPE: Array<[u64; shaper::SESSION_WORDS]> =
+    Array::with_max_entries(pppoe::SESSIONS_MAX, 0);
+#[map(name = "SUB_EDT")]
+static SUB_EDT: Array<shaper::State> = Array::with_max_entries(pppoe::SESSIONS_MAX, 0);
+#[map(name = "Q_V4")]
+static Q_V4: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(queue::Q_PREFIXES, 0);
+#[map(name = "Q_V6")]
+static Q_V6: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(queue::Q_PREFIXES, 0);
+#[map(name = "Q_IFACE")]
+static Q_IFACE: HashMap<u32, u32> = HashMap::with_max_entries(queue::Q_IFACES, 0);
+#[map(name = "Q_CONF")]
+static Q_CONF: Array<queue::ConfWords> = Array::with_max_entries(queue::Q_MAX, 0);
+#[map(name = "Q_STATE")]
+static Q_STATE: Array<shaper::State> = Array::with_max_entries(queue::Q_MAX * 2, 0);
+#[map(name = "Q_COUNT")]
+static Q_COUNT: Array<queue::Counts> = Array::with_max_entries(queue::Q_MAX * 2, 0);
+#[map(name = "Q_PCQ")]
+static Q_PCQ: LruHashMap<[u8; queue::PCQ_KEY_LEN], shaper::SubState> =
+    LruHashMap::with_max_entries(queue::PCQ_MAX, 0);
+#[map(name = "SHAPE_STATS")]
+static SHAPE_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(queue::Stat::SLOTS, 0);
+
+/// The words of a map element every CPU updates, through BPF atomic
+/// instructions (G4.3cc).
+/// tc verdicts (`TC_ACT_OK`, `TC_ACT_SHOT`) and `BPF_SKB_TSTAMP_DELIVERY_MONO`
+/// (a bindgen-numbered module in aya's bindings).
+const TC_OK: i32 = TC_ACT_OK as i32;
+const TC_SHOT: i32 = TC_ACT_SHOT as i32;
+const TSTAMP_DELIVERY_MONO: u32 = 1;
+
+struct Atomic<const N: usize>(*mut [u64; N]);
+
+impl<const N: usize> Words for Atomic<N> {
+    #[inline(always)]
+    fn get(&self, i: usize) -> u64 {
+        if i >= N || self.0.is_null() {
+            return 0;
+        }
+        // SAFETY: `self.0` is the kernel's pointer to an array or LRU map
+        // element of `N` words (valid and aligned for the run; null was
+        // checked above); `i < N`. A
+        // volatile 64-bit load (BPF has no atomic-load instruction before
+        // v4; an aligned 64-bit load does not tear): another CPU stores the
+        // word whole.
+        unsafe { core::ptr::read_volatile((self.0 as *const u64).add(i)) }
+    }
+
+    #[inline(always)]
+    fn set(&mut self, i: usize, v: u64) {
+        if i >= N || self.0.is_null() {
+            return;
+        }
+        // SAFETY: as in `get`; a whole-word volatile store.
+        unsafe { core::ptr::write_volatile((self.0 as *mut u64).add(i), v) }
+    }
+
+    #[inline(always)]
+    fn cas(&mut self, i: usize, old: u64, new: u64) -> bool {
+        if i >= N || self.0.is_null() {
+            return false;
+        }
+        // SAFETY: as in `get`; BPF_CMPXCHG (kernel 5.12+, `-C
+        // target-cpu=v3`) on one word of the element.
+        unsafe {
+            core::intrinsics::atomic_cxchg::<u64, { AtomicOrdering::SeqCst }, { AtomicOrdering::SeqCst }>(
+                (self.0 as *mut u64).add(i),
+                old,
+                new,
+            )
+            .1
+        }
+    }
+
+    #[inline(always)]
+    fn present(&self) -> bool {
+        !self.0.is_null()
+    }
+
+    #[inline(always)]
+    fn add(&mut self, i: usize, v: u64) {
+        if i >= N || self.0.is_null() {
+            return;
+        }
+        // SAFETY: as in `get`; BPF atomic add (no fetch).
+        unsafe {
+            core::intrinsics::atomic_xadd::<u64, u64, { AtomicOrdering::Relaxed }>(
+                (self.0 as *mut u64).add(i),
+                v,
+            );
+        }
+    }
+}
+
+/// The skb's linear data as a frame (direct packet access, as in XDP).
+struct Skb<'a>(&'a TcContext);
+
+impl Packet for Skb<'_> {
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.0.data_end() - self.0.data()
+    }
+
+    #[inline(always)]
+    fn bytes<const N: usize>(&self, off: usize) -> Option<[u8; N]> {
+        let start = self.0.data();
+        let end = self.0.data_end();
+        if start + off + N > end {
+            return None;
+        }
+        // SAFETY: inside `data..data_end` (checked just above, the check the
+        // verifier needs for direct packet access in tc); any bit pattern
+        // is a valid `[u8; N]`; unaligned read.
+        Some(unsafe { core::ptr::read_unaligned((start + off) as *const [u8; N]) })
+    }
+}
+
+impl PacketMut for Skb<'_> {
+    #[inline(always)]
+    fn store<const N: usize>(&mut self, off: usize, bytes: [u8; N]) -> Option<()> {
+        let start = self.0.data();
+        let end = self.0.data_end();
+        if start + off + N > end {
+            return None;
+        }
+        // SAFETY: inside the linear data (checked above); the helpers that
+        // could make it shared (clone) are not called by these programs,
+        // and `bpf_skb_pull_data` made the head writable.
+        unsafe { core::ptr::write_unaligned((start + off) as *mut [u8; N], bytes) };
+        Some(())
+    }
+}
+
+impl PacketHead for Skb<'_> {
+    /// Only growing the head: `bpf_skb_change_head` pushes `-delta`
+    /// bytes in front of the MAC header.
+    #[inline(always)]
+    fn adjust_head(&mut self, delta: i32) -> Option<()> {
+        if delta >= 0 {
+            return None;
+        }
+        // SAFETY: a BPF helper on this program's own skb; it reallocates
+        // the head or fails without change. Every later access re-reads
+        // `data`/`data_end` (`Skb::bytes`).
+        let rc = unsafe { bpf_skb_change_head(self.0.skb.skb, (-delta) as u32, 0) };
+        (rc == 0).then_some(())
+    }
+}
+
+/// One more `what` in the tc programs' statistics (this CPU's copy).
+#[inline(always)]
+fn shape_stat(what: queue::Stat) {
+    if let Some(c) = SHAPE_STATS.get_ptr_mut(what as u32) {
+        // SAFETY: this CPU's copy of a per-CPU array element; tc programs
+        // run with preemption (migration) off, so no other writer.
+        unsafe { *c += 1 };
+    }
+}
+
+/// Add to counter `field` of queue `idx`, direction `dir`.
+#[inline(always)]
+fn q_add(idx: u32, dir: u32, field: usize, n: u64) {
+    if let Some(p) = Q_COUNT.get_ptr_mut(idx.wrapping_mul(2) | (dir & 1)) {
+        Atomic(p).add(field, n);
+    }
+}
+
+/// The linear head holds at least the headers the parse reads (two tags,
+/// PPPoE, an IPv6 header).
+#[inline(always)]
+fn pull(ctx: &TcContext) {
+    const HEAD: usize = 14 + 8 + 8 + 40;
+    if ctx.data_end() - ctx.data() < HEAD {
+        let _ = ctx.pull_data(HEAD.min(ctx.len() as usize) as u32);
+    }
+}
+
+/// Set CE on the packet at `l3` if it is ECN-capable; `false`: it is not
+/// (the caller drops it instead, RFC 3168 §6.1.1).
+#[inline(always)]
+fn mark_ce(ctx: &TcContext, l3: &queue::L3) -> bool {
+    let frame = Skb(ctx);
+    match queue::ecn(&frame, l3) {
+        Some(1 | 2) => {}
+        Some(3) => return true,
+        _ => return false,
+    }
+    if l3.v6 {
+        let Some(b) = frame.u8_at(l3.off + 1) else {
+            return false;
+        };
+        let _ = ctx.store(l3.off + 1, &(b | 0x30), 0);
+    } else {
+        let Some(tos) = frame.u8_at(l3.off + 1) else {
+            return false;
+        };
+        let Some(ver) = frame.u8_at(l3.off) else {
+            return false;
+        };
+        let old = u16::from_be_bytes([ver, tos]);
+        let new = u16::from_be_bytes([ver, tos | 3]);
+        let _ = ctx.l3_csum_replace(
+            l3.off + 10,
+            u64::from(old.to_be()),
+            u64::from(new.to_be()),
+            2,
+        );
+        let _ = ctx.store(l3.off + 1, &(tos | 3), 0);
+    }
+    true
+}
+
+/// Whether the packet at `l3` is ECN-capable (ECT(0), ECT(1) or already
+/// CE): only then may CoDel mark instead of dropping. A mark on a packet
+/// that is not would be a drop after the clock already counted it (the
+/// target loses that capacity: 43% of the rate delivered, **medido**).
+#[inline(always)]
+fn ect(ctx: &TcContext, l3: &queue::L3) -> bool {
+    matches!(queue::ecn(&Skb(ctx), l3), Some(1..=3))
+}
+
+/// `q` as this packet may use it: no marking unless it is ECN-capable.
+#[inline(always)]
+fn for_packet(mut q: shaper::Queue, ctx: &TcContext, l3: &queue::L3) -> shaper::Queue {
+    q.ecn = q.ecn && ect(ctx, l3);
+    q
+}
+
+/// Apply verdict `v` of a packet at `l3`: the departure time, a mark, or
+/// the drop. `(action, counted as sent, marked)`.
+#[inline(always)]
+fn finish(ctx: &TcContext, l3: &queue::L3, v: shaper::Verdict, now: u64) -> (i32, bool, bool) {
+    let (t, marked) = match v {
+        shaper::Verdict::Drop => {
+            shape_stat(queue::Stat::Dropped);
+            return (TC_SHOT, false, false);
+        }
+        shaper::Verdict::Busy => {
+            shape_stat(queue::Stat::Contended);
+            return (TC_SHOT, false, false);
+        }
+        shaper::Verdict::Mark(t) => {
+            if !mark_ce(ctx, l3) {
+                shape_stat(queue::Stat::Dropped);
+                return (TC_SHOT, false, false);
+            }
+            shape_stat(queue::Stat::Marked);
+            (t, true)
+        }
+        shaper::Verdict::Send(t) => (t, false),
+    };
+    if t > now {
+        // SAFETY: a BPF helper on this program's skb: the departure time as
+        // CLOCK_MONOTONIC (`fq` compares it with `ktime_get_ns`); marked
+        // mono so a redirect keeps it.
+        unsafe {
+            bpf_skb_set_tstamp(ctx.skb.skb, t, TSTAMP_DELIVERY_MONO);
+        }
+        shape_stat(queue::Stat::Held);
+    } else {
+        shape_stat(queue::Stat::Sent);
+    }
+    (TC_OK, true, marked)
+}
+
+/// A shaped session's download: the session's own clock.
+#[inline(always)]
+fn shape_session(ctx: &TcContext, l3: &queue::L3, idx: u32, now: u64) -> Option<i32> {
+    let w = PPPOE_SESSIONS.get(idx)?;
+    let v = pppoe::View::of(w);
+    if !v.has(pppoe::F_ACTIVE) || !v.has(pppoe::F_SHAPE_DOWN) {
+        return None;
+    }
+    let (r, q) = shaper::of_session_words(SUB_SHAPE.get(idx)?);
+    let q = for_packet(q, ctx, l3);
+    let st = SUB_EDT.get_ptr_mut(idx)?;
+    let verdict = shaper::depart(&mut Atomic(st), shaper::FULL, &r, &q, now, u64::from(l3.ip_len), 0);
+    let (action, sent, _) = finish(ctx, l3, verdict, now);
+    shape_stat(queue::Stat::SessionShaped);
+    // IPoE: the XDP program counted it already (on its way to the kernel).
+    if sent && !v.has(corerouter_dataplane_ebpf_common::ipoe::F_IPOE) {
+        sess_add(idx, pppoe::C_DOWN_PACKETS, 1);
+        sess_add(idx, pppoe::C_DOWN_BYTES, u64::from(l3.ip_len));
+    } else if !sent {
+        sess_add(idx, pppoe::C_DOWN_POLICED, 1);
+    }
+    Some(action)
+}
+
+/// The session holding the destination of `l3` (its /32, /64, delegated
+/// prefix, or a block routed to it, G4.3cd).
+#[inline(always)]
+fn session_of(l3: &queue::L3) -> Option<u32> {
+    if l3.v6 {
+        Subs.by_v6(l3.dst).or_else(|| Subs.by_route_v6(l3.dst))
+    } else {
+        let a = queue::L3::v4(&l3.dst);
+        Subs.by_v4(a).or_else(|| Subs.by_route_v4(a))
+    }
+}
+
+/// The queue of address `a` (prefix tries), else of the port.
+#[inline(always)]
+fn queue_of(v6: bool, a: &[u8; 16], ifindex: u32) -> Option<u32> {
+    let by_prefix = if v6 {
+        Q_V6.get(Key::new(128, *a)).copied()
+    } else {
+        Q_V4.get(Key::new(32, queue::L3::v4(a))).copied()
+    };
+    by_prefix.or_else(|| Q_IFACE.get_ptr(&ifindex).map(|p| {
+        // SAFETY: the kernel's pointer to a `u32` value (replaced whole).
+        unsafe { *p }
+    }))
+}
+
+/// A PCQ sub-stream's departure (`not_before` for the queue's own clock).
+#[inline(always)]
+fn pcq_time(idx: u32, dir: u32, p: &queue::Pcq, q: &shaper::Queue, v6: bool, addr: &[u8; 16], now: u64, bytes: u64) -> Option<shaper::Verdict> {
+    let key = queue::pcq_key(idx, dir as u8, v6, addr, p.mask4, p.mask6);
+    let st = match Q_PCQ.get_ptr_mut(&key) {
+        Some(st) => st,
+        None => {
+            let _ = Q_PCQ.insert(&key, &[0u64; shaper::SUB_WORDS], u64::from(BPF_NOEXIST));
+            Q_PCQ.get_ptr_mut(&key)?
+        }
+    };
+    Some(shaper::depart(&mut Atomic(st), shaper::SUB, &p.rate, q, now, bytes, 0))
+}
+
+/// Shape (download) or police (upload) one packet of queue `idx`.
+#[inline(always)]
+fn shape_queue(ctx: &TcContext, l3: &queue::L3, idx: u32, dir: u32, now: u64) -> i32 {
+    let Some(conf) = Q_CONF.get(idx) else {
+        return TC_OK;
+    };
+    if !queue::active(conf) {
+        shape_stat(queue::Stat::NoTarget);
+        return TC_OK;
+    }
+    let d = queue::Dir::of(conf, dir as usize);
+    let bytes = u64::from(l3.ip_len);
+    let Some(st) = Q_STATE.get_ptr_mut(idx.wrapping_mul(2) | (dir & 1)) else {
+        return TC_OK;
+    };
+    if dir == 0 {
+        // Upload: police (the sub-stream first, then the queue).
+        let ok = match &d.pcq {
+            p if p.on => {
+                let a = if p.by_src { &l3.src } else { &l3.dst };
+                let key = queue::pcq_key(idx, 0, l3.v6, a, p.mask4, p.mask6);
+                match Q_PCQ.get_ptr_mut(&key) {
+                    Some(s) => policer::admit(&mut Atomic(s), &p.rate, now, bytes),
+                    None => {
+                        let _ = Q_PCQ.insert(&key, &[0u64; shaper::SUB_WORDS], u64::from(BPF_NOEXIST));
+                        true
+                    }
+                }
+            }
+            _ => true,
+        } && policer::admit(&mut Atomic(st), &d.rate, now, bytes);
+        if ok {
+            q_add(idx, 0, queue::C_PACKETS, 1);
+            q_add(idx, 0, queue::C_BYTES, bytes);
+            return TC_OK;
+        }
+        q_add(idx, 0, queue::C_DROPPED, 1);
+        shape_stat(queue::Stat::Policed);
+        return TC_SHOT;
+    }
+    let not_before = match &d.pcq {
+        p if p.on => {
+            let a = if p.by_src { &l3.src } else { &l3.dst };
+            match pcq_time(idx, 1, p, &for_packet(p.queue, ctx, l3), l3.v6, a, now, bytes) {
+                Some(shaper::Verdict::Drop | shaper::Verdict::Busy) => {
+                    q_add(idx, 1, queue::C_DROPPED, 1);
+                    shape_stat(queue::Stat::Dropped);
+                    return TC_SHOT;
+                }
+                Some(v) => v.time().unwrap_or(0),
+                None => 0,
+            }
+        }
+        _ => 0,
+    };
+    let q = for_packet(d.queue, ctx, l3);
+    let v = shaper::depart(&mut Atomic(st), shaper::FULL, &d.rate, &q, now, bytes, not_before);
+    let (action, sent, marked) = finish(ctx, l3, v, now);
+    if sent {
+        q_add(idx, 1, queue::C_PACKETS, 1);
+        q_add(idx, 1, queue::C_BYTES, bytes);
+    } else {
+        q_add(idx, 1, queue::C_DROPPED, 1);
+    }
+    if marked {
+        q_add(idx, 1, queue::C_MARKED, 1);
+    }
+    action
+}
+
+#[inline(always)]
+fn shaper_on() -> u64 {
+    SETTINGS.get(queue::SETTINGS_SLOT).copied().unwrap_or(0)
+}
+
+/// Download shaper (clsact egress).
+#[classifier]
+pub fn shape_egress(ctx: TcContext) -> i32 {
+    let on = shaper_on();
+    if on == 0 {
+        return TC_OK;
+    }
+    pull(&ctx);
+    let Some(l3) = queue::l3(&Skb(&ctx)) else {
+        shape_stat(queue::Stat::NotIp);
+        return TC_OK;
+    };
+    // SAFETY: a BPF helper with no arguments (CLOCK_MONOTONIC, ns).
+    let now = unsafe { bpf_ktime_get_ns() };
+    if on & queue::ON_SESSIONS != 0
+        && let Some(idx) = session_of(&l3)
+        && let Some(action) = shape_session(&ctx, &l3, idx, now)
+    {
+        return action;
+    }
+    if on & queue::ON_QUEUES == 0 {
+        shape_stat(queue::Stat::NoTarget);
+        return TC_OK;
+    }
+    // SAFETY: reading `ifindex` of this program's own `__sk_buff`.
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    match queue_of(l3.v6, &l3.dst, ifindex) {
+        Some(idx) => shape_queue(&ctx, &l3, idx, 1, now),
+        None => {
+            shape_stat(queue::Stat::NoTarget);
+            TC_OK
+        }
+    }
+}
+
+/// Upload policer of the queues (clsact ingress).
+#[classifier]
+pub fn shape_ingress(ctx: TcContext) -> i32 {
+    if shaper_on() & queue::ON_QUEUES == 0 {
+        return TC_OK;
+    }
+    pull(&ctx);
+    let Some(l3) = queue::l3(&Skb(&ctx)) else {
+        return TC_OK;
+    };
+    // SAFETY: as in `shape_egress`.
+    let now = unsafe { bpf_ktime_get_ns() };
+    // SAFETY: as in `shape_egress`.
+    let ifindex = unsafe { (*ctx.skb.skb).ifindex };
+    match queue_of(l3.v6, &l3.src, ifindex) {
+        Some(idx) => shape_queue(&ctx, &l3, idx, 0, now),
+        None => TC_OK,
+    }
+}
+
+/// `bng0` (G4.3ca): a packet the kernel routed to a PPPoE subscriber gets
+/// the access-side header (tags, PPPoE, PPP) and goes out of the session's
+/// port, where `shape_egress` sees it. The kernel already did the TTL,
+/// the firewall and the MTU of the subscriber's route (ICMP "too big" from
+/// the route's `mtu`).
+#[classifier]
+pub fn bng_egress(ctx: TcContext) -> i32 {
+    pull(&ctx);
+    let mut frame = Skb(&ctx);
+    let Some(l3) = queue::l3(&frame) else {
+        shape_stat(queue::Stat::BngNoSession);
+        return TC_SHOT;
+    };
+    let Some(idx) = session_of(&l3) else {
+        shape_stat(queue::Stat::BngNoSession);
+        return TC_SHOT;
+    };
+    let Some(d) = pppoe::session_down(&Subs, idx, l3.ip_len, l3.v6) else {
+        shape_stat(queue::Stat::BngNoSession);
+        return TC_SHOT;
+    };
+    if pppoe::encap(&mut frame, &d).is_none() {
+        shape_stat(queue::Stat::BngFailed);
+        return TC_SHOT;
+    }
+    shape_stat(queue::Stat::BngEncap);
+    // SAFETY: a BPF helper taking the access port from the session map and
+    // no flags (to its egress, where the shaper runs).
+    unsafe { bpf_redirect(d.ifindex, 0) as i32 }
 }
 
 /// Kernel-side license string. This crate is GPL-2.0-or-later (the rest of

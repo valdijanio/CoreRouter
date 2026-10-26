@@ -674,6 +674,17 @@ mod linux {
             self.xdp.pppoe_apply(ops)
         }
 
+        fn shaper_apply(
+            &mut self,
+            plan: &corerouter_hal::queue::ShaperPlan,
+        ) -> Result<(), HalError> {
+            self.xdp.shaper_apply(plan)
+        }
+
+        fn shaper_status(&mut self) -> corerouter_hal::queue::ShaperStatus {
+            self.xdp.shaper_status()
+        }
+
         fn pppoe_counters(
             &mut self,
             slots: &[u32],
