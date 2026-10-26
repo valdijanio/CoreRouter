@@ -18,7 +18,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Add DHCP Network",
         ["IP", "DHCP Server"],
         None,
-        "{address: ipv4/prefix, gateway?: [ipv4] | string (option 3), netmask?: u32 (option 1 when it differs from the prefix; 0: the prefix's), dns_server?: [ipv4] | string (option 6; empty: the router itself when its DNS serves the LAN, else its own servers), dns_none?: bool (send no DNS server), domain?: string (option 15), ntp_server?: [ipv4] | string (option 42), wins_server?: [ipv4] | string (option 44), next_server?: ipv4 (siaddr, PXE), boot_file_name?: string (file, PXE; ≤127 bytes), dhcp_option?: [string] | string (option names), dhcp_option_set?: string, dns_zone?: string (a primary zone of ip.dns.zone: each lease gets <host>.<zone> and its PTR; empty: none), comment?: string} → {id, warnings}",
+        "{address: ipv4/prefix, gateway?: [ipv4] | string (option 3), netmask?: u32 (option 1 when it differs from the prefix; 0: the prefix's), dns_server?: [ipv4] | string (option 6; empty: the router itself when its DNS serves the LAN, else its own servers), dns_none?: bool (send no DNS server), domain?: string (option 15), ntp_server?: [ipv4] | string (option 42), wins_server?: [ipv4] | string (option 44), next_server?: ipv4 (siaddr, PXE), boot_file_name?: string (file, PXE; ≤127 bytes), dhcp_option?: [string] | string (option names), dhcp_option_set?: string, dns_zone?: string (a primary zone of ip.dns.zone: each lease gets <host>.<zone> and its PTR; empty: none), rate_limit?: string (rate-limit of each client, rx/tx from the router, 10M/50M [burst …]: a dynamic queue per bound lease, G4.9; empty clears), comment?: string} → {id, warnings}",
         always,
         add
     ),
@@ -27,7 +27,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Set DHCP Network",
         [],
         None,
-        "{id: *hex | address, address?: ipv4/prefix, gateway?: [ipv4] | string, netmask?: u32, dns_server?: [ipv4] | string, dns_none?: bool, domain?: string, ntp_server?: [ipv4] | string, wins_server?: [ipv4] | string, next_server?: ipv4, boot_file_name?: string, dhcp_option?: [string] | string, dhcp_option_set?: string, dns_zone?: string, comment?: string} → {id, warnings}",
+        "{id: *hex | address, address?: ipv4/prefix, gateway?: [ipv4] | string, netmask?: u32, dns_server?: [ipv4] | string, dns_none?: bool, domain?: string, ntp_server?: [ipv4] | string, wins_server?: [ipv4] | string, next_server?: ipv4, boot_file_name?: string, dhcp_option?: [string] | string, dhcp_option_set?: string, dns_zone?: string, rate_limit?: string, comment?: string} → {id, warnings}",
         has_networks,
         set
     ),
@@ -41,7 +41,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.dhcp-server.network.print", "DHCP Networks", [], None,
-        "{} → [{id, address, gateway, netmask?, dns_server, dns_none, domain?, ntp_server, wins_server, next_server?, boot_file_name?, dhcp_option, dhcp_option_set?, dns_zone?, comment?, checks: [{label, level (ok | warn | error), text}]}]",
+        "{} → [{id, address, gateway, netmask?, dns_server, dns_none, domain?, ntp_server, wins_server, next_server?, boot_file_name?, dhcp_option, dhcp_option_set?, dns_zone?, rate_limit?, comment?, checks: [{label, level (ok | warn | error), text}]}]",
         always, print),
 ];
 
@@ -96,6 +96,9 @@ fn apply(n: &mut DhcpNetwork, p: &Value) -> Result<()> {
     }
     if let Some(z) = opt_ref(p, "dns_zone", &["none"])? {
         n.dns_zone = z.map(|z| corerouter_model::dns_zone::normalize_host(&z));
+    }
+    if let Some(r) = super::ppp_common::opt_rate_limit(p)? {
+        n.rate_limit = r.unwrap_or_default();
     }
     if let Some(c) = opt_text(p, "comment", 256)? {
         n.comment = c;
@@ -188,6 +191,7 @@ fn print(s: &mut Session, _: &Value) -> Result<Value> {
                 put("boot_file_name", (!n.boot_file_name.is_empty()).then(|| json!(n.boot_file_name)));
                 put("dhcp_option_set", n.dhcp_option_set.as_ref().map(|a| json!(a)));
                 put("dns_zone", n.dns_zone.as_ref().map(|a| json!(a)));
+                put("rate_limit", (!n.rate_limit.is_empty()).then(|| json!(n.rate_limit)));
                 put("comment", (!n.comment.is_empty()).then(|| json!(n.comment)));
             }
             v

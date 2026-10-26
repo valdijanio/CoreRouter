@@ -357,6 +357,14 @@ pub struct PppProfile {
     /// RouterOS profile has IPv4 ones only.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dns_server_ipv6: Vec<Ipv6Addr>,
+    /// `/queue type` of the session's download queue (RouterOS
+    /// `queue-type`; G4.9). Unset: `fq-codel-default`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queue_type: Option<String>,
+    /// How the download rate is held (G4.9): `shaper` queues the excess
+    /// (TCP sees delay), `policer` drops it in XDP. Unset: shaper.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_mode: Option<crate::queue::DownloadMode>,
 }
 
 fn is_default_v6(v: &UseIpv6) -> bool {
@@ -744,6 +752,9 @@ pub struct Effective {
     pub dhcpv6_pd_pool: Option<String>,
     pub dhcpv6_lease_time: u32,
     pub dns_server_ipv6: Vec<Ipv6Addr>,
+    /// G4.9: the download queue's type and how the rate is held.
+    pub queue_type: String,
+    pub download_mode: crate::queue::DownloadMode,
 }
 
 impl Ppp {
@@ -824,6 +835,9 @@ impl Ppp {
                 .map(|p| p.dns_server_ipv6.clone())
                 .find(|d| !d.is_empty())
                 .unwrap_or_default(),
+            queue_type: pick(&chain, |p| p.queue_type.clone())
+                .unwrap_or_else(|| crate::queue::DEFAULT_DYNAMIC_TYPE.into()),
+            download_mode: pick(&chain, |p| p.download_mode).unwrap_or_default(),
         };
         if let Some(s) = secret {
             if let Some(ip) = s.local_address {
