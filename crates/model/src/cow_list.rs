@@ -155,6 +155,27 @@ impl<T> CowList<T> {
         }
     }
 
+    /// The items `start..start + len` (fewer past the end), without
+    /// walking the ones before.
+    pub fn range(&self, start: usize, len: usize) -> std::iter::Take<Iter<'_, T>> {
+        let blocks = &self.spine.blocks;
+        let it = match self.spine.locate(start) {
+            Some((k, o)) => Iter {
+                blocks: blocks.get(k + 1..).unwrap_or_default().iter(),
+                front: blocks.get(k).and_then(|b| b.get(o..)).unwrap_or_default().iter(),
+                back: Default::default(),
+                left: self.len() - start,
+            },
+            None => Iter {
+                blocks: Default::default(),
+                front: Default::default(),
+                back: Default::default(),
+                left: 0,
+            },
+        };
+        it.take(len)
+    }
+
     /// The blocks in order, as slices.
     pub fn blocks(&self) -> impl ExactSizeIterator<Item = &[T]> + '_ {
         self.spine.blocks.iter().map(|b| b.as_slice())

@@ -703,7 +703,9 @@ fn move_rule(s: &mut Session, table: Table, p: &Value) -> Result<Value> {
         position(cfg, table, d, "destination")?;
     }
     let rules = cfg.ip.firewall.rules_mut(table);
-    let rule = rules.remove(from);
+    let Some(rule) = rules.remove(from) else {
+        return Err(EngineError::bad("id", "no such rule"));
+    };
     let to = match dest {
         Some(d) => rules.iter().position(|r| r.id == d).unwrap_or(rules.len()),
         None => rules.len(),
@@ -870,10 +872,9 @@ pub(super) fn al_add(s: &mut Session, p: &Value) -> Result<Value> {
         .ip
         .firewall
         .address_lists
-        .iter()
-        // The address first: compared in place, the list name is behind a
-        // pointer (G0.16).
-        .any(|e| e.address == address && e.list == list)
+        // O(1) in the index of what each list holds (G0.21).
+        .holders(&list, &address)
+        > 0
         || s.dynamic_addresses.find(&list, &address).is_some();
     if duplicate {
         return Err(EngineError::bad(
@@ -939,8 +940,7 @@ fn static_entry(cfg: &Config, id: ItemId) -> Result<usize> {
     cfg.ip
         .firewall
         .address_lists
-        .iter()
-        .position(|e| e.id == id)
+        .position(id)
         .ok_or_else(|| {
             EngineError::bad(
                 "id",
@@ -977,12 +977,9 @@ fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(c) = comment {
         e.comment = c;
     }
-    if cfg
-        .ip
-        .firewall
-        .address_lists
-        .iter()
-        .any(|o| o.id != id && o.address == e.address && o.list == e.list)
+    let lists = &cfg.ip.firewall.address_lists;
+    let unchanged = lists.get(pos).is_some_and(|o| o.address == e.address && o.list == e.list);
+    if lists.holders(&e.list, &e.address) > u32::from(unchanged)
         || s.dynamic_addresses.find(&e.list, &e.address).is_some()
     {
         return Err(EngineError::bad(
@@ -991,9 +988,7 @@ fn al_set(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let cfg = s.store_mut().candidate_mut();
-    if let Some(slot) = cfg.ip.firewall.address_lists.get_mut(pos) {
-        *slot = e;
-    }
+    cfg.ip.firewall.address_lists.update(pos, |slot| *slot = e);
     Ok(json!({ "id": id }))
 }
 

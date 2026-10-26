@@ -282,8 +282,8 @@ pub(super) fn regenerate(cfg: &mut Config) -> Result<Vec<ItemId>> {
         }
     }
     let fw = &mut cfg.ip.firewall;
-    let tail = fw.filter.split_off(at);
-    fw.filter.extend(new);
-    fw.filter.extend(tail);
+    for (k, r) in new.into_iter().enumerate() {
+        fw.filter.insert(at + k, r);
+    }
     Ok(ids)
 }

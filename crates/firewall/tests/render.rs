@@ -266,7 +266,7 @@ fn validator_refuses_what_the_kernel_or_routeros_would() {
 #[test]
 fn jump_loops_are_refused() {
     let mut cfg = Config::default();
-    *cfg.ip.firewall.filter = vec![
+    cfg.ip.firewall.filter = corerouter_model::cow_list::CowList::from(vec![
         rule(
             1,
             "input",
@@ -275,7 +275,7 @@ fn jump_loops_are_refused() {
         ),
         rule(2, "a", m(&[]), act(r#"{"type":"jump","jump_target":"b"}"#)),
         rule(3, "b", m(&[]), act(r#"{"type":"jump","jump_target":"a"}"#)),
-    ];
+    ]);
     let issues = validate(&cfg);
     assert!(
         issues.iter().any(|i| i.message.contains("loop")),
