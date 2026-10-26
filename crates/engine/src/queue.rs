@@ -444,6 +444,193 @@ pub fn pair_of<T: Copy>(q: &Queue, f: impl Fn(&Limit) -> T) -> Pair<T> {
     }
 }
 
+
+// --- To the data plane (G4.9b) ---------------------------------------------
+
+/// What a queue type does, as the shaper runs it.
+pub fn kind_of(t: &QueueType) -> corerouter_hal::queue::Kind {
+    use corerouter_hal::queue::Kind as K;
+    use corerouter_model::queue::Kind;
+    match t.kind {
+        Kind::Pfifo => K::Fifo {
+            limit_bytes: u64::from(t.pfifo_limit) * 1514,
+        },
+        Kind::Bfifo => K::Fifo {
+            limit_bytes: u64::from(t.bfifo_limit),
+        },
+        // The queue's own clock caps all the sub-streams together.
+        Kind::Pcq => K::Fifo {
+            limit_bytes: u64::from(t.pcq_total_limit) * 1024,
+        },
+        Kind::FqCodel => K::Codel {
+            target_us: t.fq_codel_target.saturating_mul(1000),
+            interval_us: t.fq_codel_interval.saturating_mul(1000),
+            ecn: t.fq_codel_ecn,
+            limit_packets: t.fq_codel_limit,
+        },
+        // CAKE's CoDel follows its RTT: target = rtt/20 (5 ms at 100 ms),
+        // interval = rtt; it always marks ECN.
+        Kind::Cake => K::Codel {
+            target_us: (t.cake_rtt.saturating_mul(1000) / 20).max(500),
+            interval_us: t.cake_rtt.saturating_mul(1000),
+            ecn: true,
+            limit_packets: corerouter_model::queue::FQ_CODEL_LIMIT,
+        },
+    }
+}
+
+fn pcq_of(t: &QueueType) -> Option<corerouter_hal::queue::PcqSpec> {
+    use corerouter_model::queue::{Classifier, Kind};
+    if t.kind != Kind::Pcq {
+        return None;
+    }
+    let by_src = t.pcq_classifier == Classifier::SrcAddress;
+    Some(corerouter_hal::queue::PcqSpec {
+        rate_bps: t.pcq_rate,
+        by_src,
+        mask4: if by_src { t.pcq_src_address_mask } else { t.pcq_dst_address_mask },
+        mask6: if by_src { t.pcq_src_address6_mask } else { t.pcq_dst_address6_mask },
+        kind: corerouter_hal::queue::Kind::Fifo {
+            limit_bytes: u64::from(t.pcq_limit) * 1024,
+        },
+    })
+}
+
+fn dir_of(l: &Limit) -> corerouter_hal::queue::DirSpec {
+    corerouter_hal::queue::DirSpec {
+        rate_bps: l.max_limit,
+        burst_bps: l.burst_limit,
+        threshold_bps: l.burst_threshold,
+        burst_time_ms: l.burst_time_ms,
+        bucket_milli: l.bucket_milli,
+        kind: kind_of(&l.queue),
+        pcq: pcq_of(&l.queue),
+    }
+}
+
+/// The interfaces whose connected networks hold `n` (`None`: none does,
+/// the target is somewhere behind a route).
+fn ports_of(cfg: &Config, n: &IpNet) -> Option<Vec<IfName>> {
+    let v: Vec<IfName> = cfg
+        .ip
+        .addresses
+        .iter()
+        .filter(|a| !a.disabled)
+        .filter(|a| {
+            let net = a.address.trunc();
+            net.contains(&n.network()) || n.contains(&net.network())
+        })
+        .map(|a| a.interface.clone())
+        .collect();
+    (!v.is_empty()).then_some(v)
+}
+
+/// `plan` as the shaper holds it: the queues that are not sessions (those
+/// ride on their session entries), their targets, and the ports to shape
+/// on. A target no connected network holds is reached through some route:
+/// every port gets the programs then (a lookup per packet, ~30 ns,
+/// **estimado**), rather than a target left unshaped.
+pub fn shaper_plan(cfg: &Config, plan: &Plan) -> corerouter_hal::queue::ShaperPlan {
+    use corerouter_hal::queue::{QueueSpec, ShaperPlan};
+    let mut slot_of: HashMap<usize, u32> = HashMap::new();
+    let mut out = ShaperPlan::default();
+    let used: std::collections::BTreeSet<usize> = plan.prefixes.values().chain(plan.interfaces.values()).copied().collect();
+    for i in used {
+        let Some(q) = plan.queues.get(i) else {
+            continue;
+        };
+        if q.origin.session() || q.disabled {
+            continue;
+        }
+        let Ok(slot) = u32::try_from(out.queues.len()) else {
+            break;
+        };
+        slot_of.insert(i, slot);
+        out.queues.push(QueueSpec {
+            key: q.key.clone(),
+            upload: dir_of(&q.upload),
+            download: dir_of(&q.download),
+        });
+    }
+    let mut ports: std::collections::BTreeSet<IfName> = std::collections::BTreeSet::new();
+    let mut everywhere = false;
+    for (n, i) in &plan.prefixes {
+        if let Some(slot) = slot_of.get(i) {
+            out.prefixes.push((*n, *slot));
+            match ports_of(cfg, n) {
+                Some(v) => ports.extend(v),
+                None => everywhere = true,
+            }
+        }
+    }
+    for (name, i) in &plan.interfaces {
+        if let Some(slot) = slot_of.get(i) {
+            out.interfaces.push((name.clone(), *slot));
+            ports.insert(name.clone());
+        }
+    }
+    let d = &cfg.ip.dhcp_server;
+    let ipoe: Vec<IfName> = d.servers.iter().filter(|v| !v.disabled && v.sessions()).map(|v| v.interface.clone()).collect();
+    let pppoe: Vec<IfName> = cfg.ppp.pppoe_servers.iter().filter(|v| !v.disabled).map(|v| v.interface.clone()).collect();
+    out.access_ports = pppoe.into_iter().chain(ipoe).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    out.sessions = !out.access_ports.is_empty();
+    if everywhere && !out.queues.is_empty() {
+        ports.extend(
+            cfg.interfaces
+                .iter()
+                .filter(|(_, i)| !i.disabled && !matches!(i.kind, corerouter_model::InterfaceKind::Loopback))
+                .map(|(n, _)| n.clone()),
+        );
+    }
+    out.ports = ports.into_iter().collect();
+    out
+}
+
+/// The download queue a session gets from its profile: `None` when the
+/// profile polices (`download_mode=policer`), else its queue type's kind
+/// (an unknown type: the recommended fq-codel).
+pub fn shape_of(queues: &Queues, e: &corerouter_model::ppp::Effective) -> Option<corerouter_hal::queue::Kind> {
+    if e.download_mode != DownloadMode::Shaper {
+        return None;
+    }
+    Some(queues.queue_type(&e.queue_type).map(|t| kind_of(&t)).unwrap_or_default())
+}
+
+/// What the daemon's `queue` service last handed to the HAL.
+#[derive(Debug, Default)]
+pub struct ShaperRuntime {
+    pub applied: Option<corerouter_hal::queue::ShaperPlan>,
+    pub error: Option<String>,
+}
+
+impl Session {
+    /// One round of the `queue` service: the plan of the running config
+    /// and the DHCP leases to the data plane (only when it changed), then
+    /// the counters back into [`QueueStats`]. Returns whether the plan was
+    /// (re)applied.
+    pub fn queue_sync(&mut self) -> bool {
+        let plan = self.queue_plan();
+        let want = shaper_plan(self.store().running(), &plan);
+        let rt = self.ext::<ShaperRuntime>();
+        let changed = rt.is_none_or(|r| r.applied.as_ref() != Some(&want));
+        if changed {
+            let res = self.hal_mut().shaper_apply(&want);
+            if let Some(rt) = self.ext_mut::<ShaperRuntime>() {
+                rt.error = res.err().map(|e| e.to_string());
+                rt.applied = Some(want);
+            }
+        }
+        let status = self.hal_mut().shaper_status();
+        let error = self.ext::<ShaperRuntime>().and_then(|r| r.error.clone());
+        if let Some(st) = self.ext_mut::<QueueStats>() {
+            st.by_key = status.queues.into_iter().collect();
+            st.running = status.unavailable.is_none() && error.is_none();
+            st.note = error.or(status.unavailable);
+        }
+        changed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,6 +730,38 @@ mod tests {
         let q = Queue::dynamic("k".into(), "n".into(), Origin::Pppoe, vec![], "1M", &Queues::default(), "nope", DownloadMode::Shaper).unwrap();
         assert_eq!(q.download.queue.name, DEFAULT_DYNAMIC_TYPE);
         assert!(Queue::dynamic("k".into(), "n".into(), Origin::Pppoe, vec![], "fast", &Queues::default(), "x", DownloadMode::Shaper).is_none());
+    }
+
+    #[test]
+    fn shaper_plan_ports_and_kinds() {
+        let mut c = Session::virtual_lab().store().running().clone();
+        c.queue = cfg(&[("lan", "192.168.88.0/24"), ("far", "203.0.113.0/24"), ("off", "10.9.9.9")]).queue;
+        c.queue.simple[2].disabled = true;
+        c.ip.addresses = corerouter_model::cow_list::CowList::from(vec![corerouter_model::AddressEntry {
+            id: ItemId(1),
+            address: "192.168.88.1/24".parse().unwrap(),
+            interface: "ether2".parse().unwrap(),
+            disabled: false,
+            comment: String::new(),
+            from_pool: None,
+        }]);
+        let p = plan(&c, vec![]);
+        let s = shaper_plan(&c, &p);
+        assert_eq!(s.queues.len(), 2, "the disabled one installs nothing");
+        // "far" is behind a route: every port gets the programs.
+        assert!(s.ports.len() > 1 && s.ports.iter().any(|p| p.as_str() == "ether2"));
+        assert!(!s.sessions);
+        let lan = s.queues.iter().find(|q| q.key == "*1").unwrap();
+        assert_eq!(lan.download.rate_bps, 20_000_000);
+        assert_eq!(lan.download.kind, corerouter_hal::queue::Kind::Fifo { limit_bytes: 10 * 1514 });
+        let cake = kind_of(&QueueType::builtin("cake-default").unwrap());
+        assert_eq!(cake, corerouter_hal::queue::Kind::Codel { target_us: 5_000, interval_us: 100_000, ecn: true, limit_packets: 10_240 });
+        let pcq = pcq_of(&QueueType::builtin("pcq-upload-default").unwrap()).unwrap();
+        assert!(pcq.by_src);
+        // Only the connected one: just its port.
+        c.queue.simple.remove(1);
+        let s = shaper_plan(&c, &plan(&c, vec![]));
+        assert_eq!(s.ports.iter().map(|p| p.as_str()).collect::<Vec<_>>(), ["ether2"]);
     }
 
     /// 100 000 sessions against 1 000 fixed queues: linear, not a product.

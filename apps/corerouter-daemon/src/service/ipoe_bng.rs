@@ -17,11 +17,13 @@ use std::net::Ipv4Addr;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
+use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder};
 use corerouter_engine::ipoe::{IpoeBackend, IpoeView, Local, Revoke, local_verdict, user_of};
 use corerouter_engine::ppp::PppBackend;
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeSession, Rate};
 use corerouter_model::dhcp_server::DhcpServer;
+use corerouter_model::framed_route::{FramedRoute, RouteOrigin};
 use corerouter_model::ipoe::UseRadius;
 use corerouter_model::ppp::{
     ActiveSession, DEFAULT_PROFILE, HistoryEntry, ServiceStats, Stage, Why,
@@ -36,6 +38,7 @@ use corerouter_proto_dhcp::server::agent;
 use corerouter_proto_dhcp::server::authorize::{AuthAsk, Grant, Verdict};
 use corerouter_proto_dhcp::server::leases::Lease;
 use corerouter_proto_radius::rate_limit::RateLimit;
+use ipnet::{IpNet, Ipv4Net};
 
 /// Lines `ppp.history` keeps of IPoE (as the PPPoE service).
 pub(crate) const HISTORY: usize = 50_000;
@@ -54,6 +57,9 @@ pub(crate) const PING_EVERY_MS: u64 = 10_000;
 pub(crate) const PING_TRIES: u32 = 3;
 /// RFC 2865 §5.41 NAS-Port-Type Ethernet.
 const NAS_PORT_ETHERNET: &str = "15";
+
+/// IPv6 routes cannot reach an IPoE subscriber yet (IPoE is IPv4, G4.3s).
+const NO_V6: &str = "o IPoE ainda não tem IPv6 (G4.3s)";
 
 /// RFC 2866 §5.10 Acct-Terminate-Cause.
 mod cause {
@@ -84,6 +90,9 @@ struct Authz {
     interim: Option<u32>,
     class: Option<String>,
     profile: String,
+    /// G4.3cd: the routes of the Accept and the texts refused already.
+    routes: Vec<(FramedRoute, RouteOrigin)>,
+    refused: Vec<String>,
 }
 
 /// A RADIUS ask in flight.
@@ -117,6 +126,10 @@ struct Sub {
     unanswered: u32,
     pinged_ms: u64,
     rx_seen: u64,
+    /// G4.3cd: the blocks routed to the subscriber now.
+    routes: Vec<(FramedRoute, RouteOrigin)>,
+    /// G4.9b: the download queue (its profile's), `None`: policed in XDP.
+    shape: Option<corerouter_hal::queue::Kind>,
 }
 
 /// An XDP map change, for the thread (it knows the ports' index and MAC).
@@ -129,8 +142,24 @@ pub(crate) enum XdpOp {
         ip: Ipv4Addr,
         up: Rate,
         down: Rate,
+        shape: Option<corerouter_hal::queue::Kind>,
     },
     Remove(u32),
+    /// G4.3cd: a block routed to the session at `slot`.
+    Route {
+        dst: IpNet,
+        slot: u32,
+        add: bool,
+    },
+}
+
+/// G4.3cd: a kernel route of a block to an IPoE subscriber (the kernel
+/// forwards IPoE downstream: `dst via ip`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KernelRoute {
+    pub dst: Ipv4Net,
+    pub via: Ipv4Addr,
+    pub add: bool,
 }
 
 /// Per-stage attempts of a user or a MAC (`ppp.why`).
@@ -155,6 +184,8 @@ struct State {
     interim_default: u32,
     /// `/ppp profile` rate limits by name (Mikrotik-Group), per refresh.
     profile_rates: HashMap<String, String>,
+    /// G4.9b: each profile's download queue (`None`: the XDP policer).
+    profile_shapes: HashMap<String, Option<corerouter_hal::queue::Kind>>,
     aaa: Option<Arc<dyn AaaBackend>>,
     asked: HashMap<Key, Asked>,
     inbox: Vec<(String, Vec<u8>, Verdict)>,
@@ -176,6 +207,13 @@ struct State {
     stats: ServiceStats,
     /// The XDP data plane takes the sessions (else: no policer).
     xdp: bool,
+    /// G4.3cd: who holds each routed block (the router's table), the space
+    /// no route may take, the kernel routes to make and log lines
+    /// (Portuguese; error or not) for the thread.
+    framed: FramedTable,
+    forbidden: Arc<Forbidden>,
+    kroutes: Vec<KernelRoute>,
+    logs: Vec<(bool, String)>,
 }
 
 impl State {
@@ -313,6 +351,12 @@ fn accept(
     {
         g.address_lists.push(l);
     }
+    let (routes, refused) = framed::from_radius(
+        reply
+            .attributes
+            .iter()
+            .map(|a| (a.name.as_str(), a.value.as_str())),
+    );
     let a = Authz {
         user: user.to_owned(),
         radius: true,
@@ -320,6 +364,8 @@ fn accept(
         interim: attr("Acct-Interim-Interval").and_then(|v| v.parse().ok()),
         class: attr("Class"),
         profile,
+        routes,
+        refused,
     };
     (g, a)
 }
@@ -393,7 +439,34 @@ impl Core {
             .iter()
             .filter_map(|p| p.rate_limit.clone().map(|r| (p.name.clone(), r)))
             .collect();
+        st.profile_shapes = cfg
+            .ppp
+            .all_profiles()
+            .into_iter()
+            .map(|p| {
+                let e = cfg.ppp.effective(None, &p.name, DEFAULT_PROFILE);
+                (p.name, corerouter_engine::queue::shape_of(&cfg.queue, &e))
+            })
+            .collect();
         st.aaa = aaa;
+        st.forbidden = Arc::new(Forbidden::of(cfg));
+    }
+
+    /// G4.3cd: the router's table of routed blocks (shared with PPPoE and
+    /// the commands); what a previous run of the service held is gone.
+    pub(crate) fn set_framed(&self, table: FramedTable) {
+        table.forget("ipoe");
+        guard(&self.st).framed = table;
+    }
+
+    /// Kernel routes of routed blocks to make (`dst via subscriber`).
+    pub(crate) fn take_kernel_routes(&self) -> Vec<KernelRoute> {
+        std::mem::take(&mut guard(&self.st).kroutes)
+    }
+
+    /// Log lines for the router's log: (error, Portuguese text).
+    pub(crate) fn take_logs(&self) -> Vec<(bool, String)> {
+        std::mem::take(&mut guard(&self.st).logs)
     }
 
     /// The interfaces of the session servers (the XDP access ports).
@@ -431,9 +504,17 @@ impl Core {
                     ip: s.ip,
                     up,
                     down,
+                    shape: s.shape,
                 });
                 if let Some(x) = st.subs.get_mut(&s.key) {
                     x.slot = Some(slot);
+                }
+                for (r, _) in &s.routes {
+                    st.ops.push(XdpOp::Route {
+                        dst: r.dst,
+                        slot,
+                        add: true,
+                    });
                 }
             }
         }
@@ -472,6 +553,8 @@ impl Core {
                 a.tx_bytes = n.down_bytes;
                 a.rx_packets = n.up_packets;
                 a.tx_packets = n.down_packets;
+                a.queue_us = n.down_queue_us;
+                a.drops = n.up_policed + n.down_policed;
             }
         }
     }
@@ -669,6 +752,32 @@ impl Core {
         let acct_id = format!("{:08X}{:04X}", unix as u32, st.seq as u16);
         let radius = authz.as_ref().is_some_and(|a| a.radius);
         let slot = if st.xdp { st.slot() } else { None };
+        // G4.3cd: the routed blocks, from RADIUS or the secret.
+        let (want, mut refused) = match authz.as_ref() {
+            Some(a) if a.radius => (a.routes.clone(), a.refused.clone()),
+            _ => (
+                sec.map(|s| s.routes.iter().map(|r| (*r, RouteOrigin::Secret)).collect())
+                    .unwrap_or_default(),
+                Vec::new(),
+            ),
+        };
+        let holder = Holder {
+            session: id.clone(),
+            user: user.clone(),
+            origin: RouteOrigin::Secret,
+            lane: 0,
+            service: "ipoe",
+        };
+        let adm = framed::admit(
+            &st.framed,
+            &st.forbidden,
+            &want,
+            &holder,
+            Some(l.address),
+            Some(NO_V6),
+        );
+        refused.extend(adm.refused.iter().cloned());
+        let route_rows = adm.rows();
         let a = ActiveSession {
             id: id.clone(),
             name: user.clone(),
@@ -688,6 +797,8 @@ impl Core {
             encoding: "dhcp".into(),
             radius,
             mtu: 1500,
+            routes: route_rows.clone(),
+            refused_routes: refused.clone(),
             ..ActiveSession::default()
         };
         let sub = Sub {
@@ -710,6 +821,12 @@ impl Core {
             unanswered: 0,
             pinged_ms: 0,
             rx_seen: 0,
+            routes: adm.routes.clone(),
+            shape: st
+                .profile_shapes
+                .get(&a.profile)
+                .copied()
+                .unwrap_or_else(|| st.profile_shapes.get(DEFAULT_PROFILE).copied().flatten()),
         };
         if let Some(slot) = slot {
             let (up, down) = rates(rate.as_deref());
@@ -720,7 +837,36 @@ impl Core {
                 ip: l.address,
                 up,
                 down,
+                shape: sub.shape,
             });
+        }
+        // After the session's entry: the LPM (with XDP) and, always, the
+        // kernel route (the kernel forwards IPoE downstream).
+        for (r, _) in &adm.routes {
+            if let Some(slot) = slot {
+                st.ops.push(XdpOp::Route {
+                    dst: r.dst,
+                    slot,
+                    add: true,
+                });
+            }
+            if let IpNet::V4(dst) = r.dst {
+                st.kroutes.push(KernelRoute {
+                    dst,
+                    via: l.address,
+                    add: true,
+                });
+            }
+        }
+        for row in &route_rows {
+            st.logs.push((
+                false,
+                format!("IPoE: {user}: rota {} ({})", row.route, row.origin.label()),
+            ));
+        }
+        for why in &refused {
+            st.logs
+                .push((true, format!("IPoE: {user}: rota recusada: {why}")));
         }
         let mac = mac_text(l.mac);
         st.reach(&[&user, &mac], Stage::Up);
@@ -734,6 +880,8 @@ impl Core {
                 event: "up".into(),
                 stage: Some(Stage::Up),
                 address: Some(l.address),
+                routes: route_rows,
+                refused_routes: refused,
                 ..HistoryEntry::default()
             },
         );
@@ -763,14 +911,18 @@ impl Core {
             counters: None,
             terminate_cause: None,
             interim_secs: interim,
-            attributes: acct_attributes(
-                l.address,
-                &mac,
-                &srv.interface,
-                circuit.as_deref(),
-                remote.as_deref(),
-                class.as_deref(),
-            ),
+            attributes: {
+                let mut v = acct_attributes(
+                    l.address,
+                    &mac,
+                    &srv.interface,
+                    circuit.as_deref(),
+                    remote.as_deref(),
+                    class.as_deref(),
+                );
+                v.extend(route_attributes(&adm.routes));
+                v
+            },
         };
         // An old session's Stop first (it went out of the lock already, as `out`).
         if let Some(o) = out
@@ -793,6 +945,31 @@ impl Core {
         why: (&'static str, &'static str, u32),
     ) -> Option<AcctOut> {
         let s = st.subs.remove(key)?;
+        // G4.3cd: the blocks go before the session (a block left behind
+        // is a blackhole).
+        for (r, _) in &s.routes {
+            if let Some(slot) = s.slot {
+                st.ops.push(XdpOp::Route {
+                    dst: r.dst,
+                    slot,
+                    add: false,
+                });
+            }
+            if let IpNet::V4(dst) = r.dst {
+                st.kroutes.push(KernelRoute {
+                    dst,
+                    via: s.ip,
+                    add: false,
+                });
+            }
+        }
+        framed::release_all(&st.framed, &s.routes, &s.id);
+        if !s.routes.is_empty() {
+            st.logs.push((
+                false,
+                format!("IPoE: {}: {} rota(s) removida(s)", s.user, s.routes.len()),
+            ));
+        }
         if let Some(slot) = s.slot {
             st.ops.push(XdpOp::Remove(slot));
             st.free_slots.push(slot);
@@ -819,6 +996,7 @@ impl Core {
                 uptime_secs: uptime,
                 rx_bytes: a.as_ref().map_or(0, |a| a.rx_bytes),
                 tx_bytes: a.as_ref().map_or(0, |a| a.tx_bytes),
+                routes: a.as_ref().map(|a| a.routes.clone()).unwrap_or_default(),
                 ..HistoryEntry::default()
             },
         );
@@ -842,14 +1020,12 @@ impl Core {
                 counters,
                 terminate_cause: Some(cause),
                 interim_secs: None,
-                attributes: acct_attributes(
-                    s.ip,
-                    &mac,
-                    &s.interface,
-                    None,
-                    None,
-                    s.class.as_deref(),
-                ),
+                attributes: {
+                    let mut v =
+                        acct_attributes(s.ip, &mac, &s.interface, None, None, s.class.as_deref());
+                    v.extend(route_attributes(&s.routes));
+                    v
+                },
             },
             source: None,
         })
@@ -1332,18 +1508,38 @@ impl SessionOwner for Owner {
                     );
                     return CoaOutcome::Ack;
                 }
-                let Some(rate) = rate else {
+                let change = framed::route_change(&req.changes);
+                if rate.is_none() && change.is_none() {
                     return if req.authorize_only {
                         CoaOutcome::Ack
                     } else {
                         CoaOutcome::Nak(401)
                     };
-                };
+                }
                 // RFC 5176 §2.3: all or nothing.
-                if rate.parse::<RateLimit>().is_err() {
+                if rate
+                    .as_deref()
+                    .is_some_and(|r| r.parse::<RateLimit>().is_err())
+                {
                     return CoaOutcome::Nak(407);
                 }
                 let mut st = guard(&self.0.st);
+                if let Some(c) = &change {
+                    for id in &hits {
+                        let ip = st.active.get(id).and_then(|a| a.address);
+                        if let Err(why) = framed::check_change(&st.framed, &st.forbidden, id, ip, c)
+                        {
+                            log::info!("ipoe: CoA de rotas recusado: {why}");
+                            return CoaOutcome::Nak(407);
+                        }
+                    }
+                    for id in &hits {
+                        change_routes(&mut st, id, c);
+                    }
+                }
+                let Some(rate) = rate else {
+                    return CoaOutcome::Ack;
+                };
                 for id in &hits {
                     let Some(k) = st.by_id.get(id).cloned() else {
                         continue;
@@ -1361,6 +1557,7 @@ impl SessionOwner for Owner {
                             ip: s.ip,
                             up,
                             down,
+                            shape: s.shape,
                         }
                     });
                     if let Some(op) = op {
@@ -1376,6 +1573,106 @@ impl SessionOwner for Owner {
     }
 }
 
+/// G4.3cd: a CoA's routes for session `id` (under the lock, checked
+/// already): the new blocks first, then the old ones of the families the
+/// CoA names go.
+fn change_routes(st: &mut State, id: &str, c: &framed::RouteChange) {
+    let Some(k) = st.by_id.get(id).cloned() else {
+        return;
+    };
+    let Some(s) = st.subs.get(&k) else {
+        return;
+    };
+    let (slot, ip, user) = (s.slot, s.ip, s.user.clone());
+    let (old, kept): (Vec<_>, Vec<_>) = s.routes.iter().copied().partition(|(r, _)| c.replaces(r));
+    let stays = |o: &(FramedRoute, RouteOrigin)| c.routes.iter().any(|n| n.0.dst == o.0.dst);
+    let fresh: Vec<_> = c
+        .routes
+        .iter()
+        .copied()
+        .filter(|n| !old.iter().any(|o| o.0.dst == n.0.dst))
+        .collect();
+    let holder = Holder {
+        session: id.to_owned(),
+        user: user.clone(),
+        origin: RouteOrigin::FramedRoute,
+        lane: 0,
+        service: "ipoe",
+    };
+    let adm = framed::admit(
+        &st.framed,
+        &st.forbidden,
+        &fresh,
+        &holder,
+        Some(ip),
+        Some(NO_V6),
+    );
+    let gone: Vec<_> = old.iter().copied().filter(|o| !stays(o)).collect();
+    let mut now_routes = kept;
+    now_routes.extend(old.iter().copied().filter(|o| stays(o)));
+    now_routes.extend(adm.routes.iter().copied());
+    for (r, add) in adm
+        .routes
+        .iter()
+        .map(|x| (x.0, true))
+        .chain(gone.iter().map(|x| (x.0, false)))
+    {
+        if let Some(slot) = slot {
+            st.ops.push(XdpOp::Route {
+                dst: r.dst,
+                slot,
+                add,
+            });
+        }
+        if let IpNet::V4(dst) = r.dst {
+            st.kroutes.push(KernelRoute { dst, via: ip, add });
+        }
+    }
+    framed::release_all(&st.framed, &gone, id);
+    let rows = framed::rows(&now_routes);
+    if let Some(s) = st.subs.get_mut(&k) {
+        s.routes = now_routes;
+    }
+    if let Some(a) = st.active.get_mut(id) {
+        a.routes = rows.clone();
+        a.refused_routes = adm.refused.clone();
+    }
+    let text = if rows.is_empty() {
+        "nenhuma".to_owned()
+    } else {
+        rows.iter()
+            .map(|r| r.route.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    st.logs.push((
+        false,
+        format!("IPoE: {user}: rotas trocadas por CoA: {text}"),
+    ));
+    for why in adm.refused {
+        st.logs
+            .push((true, format!("IPoE: {user}: rota recusada (CoA): {why}")));
+    }
+}
+
+/// G4.3cd: the routes of a session in the Accounting-Request (RFC 2866
+/// §5.13).
+fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
+    routes
+        .iter()
+        .map(|(r, _)| {
+            Attribute::new(
+                if r.is_v6() {
+                    "Framed-IPv6-Route"
+                } else {
+                    "Framed-Route"
+                },
+                r.to_string(),
+            )
+        })
+        .collect()
+}
+
 /// The XDP entry of a session on a port with this index and MAC.
 pub(crate) fn xdp_session(
     ifindex: u32,
@@ -1384,6 +1681,7 @@ pub(crate) fn xdp_session(
     ip: Ipv4Addr,
     up: Rate,
     down: Rate,
+    shape: Option<corerouter_hal::queue::Kind>,
 ) -> PppoeSession {
     PppoeSession {
         ifindex,
@@ -1398,6 +1696,7 @@ pub(crate) fn xdp_session(
         fast_up: false,
         fast_down: false,
         ipoe: true,
+        shape,
         ..PppoeSession::default()
     }
 }

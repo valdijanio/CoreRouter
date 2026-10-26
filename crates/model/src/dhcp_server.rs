@@ -532,7 +532,8 @@ fn default_alert_timeout() -> u32 {
 pub struct DhcpServers {
     pub servers: Vec<DhcpServer>,
     pub networks: Vec<DhcpNetwork>,
-    pub leases: Vec<StaticLease>,
+    /// Static leases: a block list (G0.21), one per subscriber on a big base.
+    pub leases: crate::cow_list::CowList<StaticLease>,
     pub options: Vec<OptionDef>,
     pub option_sets: Vec<OptionSet>,
     pub matchers: Vec<Matcher>,

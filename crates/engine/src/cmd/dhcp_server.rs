@@ -67,8 +67,8 @@ fn has_servers(s: &Session) -> std::result::Result<(), String> {
 // ---- helpers shared by the dhcp_server_* areas ---------------------------
 
 /// The index of the item `p["id"]` names: `*hex` or its name.
-pub(super) fn find<T>(
-    items: &[T],
+pub(super) fn find<'a, T: 'a>(
+    items: impl IntoIterator<Item = &'a T>,
     p: &Value,
     id_of: impl Fn(&T) -> ItemId,
     name_of: impl Fn(&T) -> Option<&str>,
@@ -81,7 +81,7 @@ pub(super) fn find<T>(
         .then(|| raw.parse::<ItemId>().ok())
         .flatten();
     items
-        .iter()
+        .into_iter()
         .position(|it| match by_id {
             Some(id) => id_of(it) == id,
             None => name_of(it) == Some(raw),

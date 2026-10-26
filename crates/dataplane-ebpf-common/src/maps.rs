@@ -20,6 +20,17 @@
 //! | `PPPOE_COUNTERS` | array | session index | [`crate::pppoe::Counters`] |
 //! | `PPPOE_STATS` | per-CPU array | [`crate::pppoe::Stat`] | packets `u64` |
 //! | `IPOE_PORTS` | hash | access port ifindex | flags `u32` (G4.3f) |
+//! | `SUB_SHAPE` | array | session index | [`crate::shaper::Queue`] words of its download (G4.9b) |
+//! | `SUB_EDT` | array | session index | [`crate::shaper::State`] |
+//! | `Q_V4` / `Q_V6` | LPM trie | target prefix | queue index `u32` |
+//! | `Q_IFACE` | hash | ifindex of an interface target | queue index |
+//! | `Q_CONF` | array | queue index | [`crate::queue::ConfWords`] |
+//! | `Q_STATE` | array | queue index × 2 + direction | [`crate::shaper::State`] (download) / [`crate::policer::State`] prefix (upload) |
+//! | `Q_COUNT` | array | queue index × 2 + direction | [`crate::queue::Counts`] |
+//! | `Q_PCQ` | LRU hash | [`crate::queue::pcq_key`] | [`crate::shaper::SubState`] |
+//! | `SHAPE_STATS` | per-CPU array | [`crate::queue::Stat`] | packets `u64` |
+//! | `PPPOE_RT4` | LPM trie | IPv4 block routed to a subscriber | session index (G4.3cd) |
+//! | `PPPOE_RT6` | LPM trie | IPv6 block routed to a subscriber | session index (G4.3cd) |
 
 use crate::filter::Reason;
 
@@ -41,6 +52,26 @@ pub const PPPOE_POLICER: &str = "PPPOE_POLICER";
 pub const PPPOE_COUNTERS: &str = "PPPOE_COUNTERS";
 pub const PPPOE_STATS: &str = "PPPOE_STATS";
 pub const IPOE_PORTS: &str = "IPOE_PORTS";
+pub const SUB_SHAPE: &str = "SUB_SHAPE";
+pub const SUB_EDT: &str = "SUB_EDT";
+pub const Q_V4: &str = "Q_V4";
+pub const Q_V6: &str = "Q_V6";
+pub const Q_IFACE: &str = "Q_IFACE";
+pub const Q_CONF: &str = "Q_CONF";
+pub const Q_STATE: &str = "Q_STATE";
+pub const Q_COUNT: &str = "Q_COUNT";
+pub const Q_PCQ: &str = "Q_PCQ";
+pub const SHAPE_STATS: &str = "SHAPE_STATS";
+/// The session shaper maps, sized with the PPPoE maps.
+pub const SUB_SIZED: [&str; 2] = [SUB_SHAPE, SUB_EDT];
+/// The queue maps sized by the queue count (1 entry without queues).
+pub const Q_SIZED: [&str; 3] = [Q_CONF, Q_STATE, Q_COUNT];
+/// The tc programs (G4.9b, G4.3ca).
+pub const SHAPE_EGRESS: &str = "shape_egress";
+pub const SHAPE_INGRESS: &str = "shape_ingress";
+pub const BNG_EGRESS: &str = "bng_egress";
+pub const PPPOE_RT4: &str = "PPPOE_RT4";
+pub const PPPOE_RT6: &str = "PPPOE_RT6";
 /// The PPPoE maps sized by the session count (1 entry while PPPoE is off).
 pub const PPPOE_SIZED: [&str; 4] = [PPPOE_KEYS, PPPOE_SESSIONS, PPPOE_V4, PPPOE_COUNTERS];
 /// The XDP program's name in the object.

@@ -23,10 +23,10 @@ use corerouter_proto_pppoe::wire::Mac;
 
 use super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot};
 
-const IFINDEX: u32 = 7;
-const BNG_MAC: [u8; 6] = [0x02, 0xBB, 0, 0, 0, 1];
+pub(super) const IFINDEX: u32 = 7;
+pub(super) const BNG_MAC: [u8; 6] = [0x02, 0xBB, 0, 0, 0, 1];
 
-fn server(json: serde_json::Value) -> PppoeServer {
+pub(super) fn server(json: serde_json::Value) -> PppoeServer {
     let mut base = serde_json::json!({"id": "*1", "name": "pppoe-ether2", "interface": "ether2", "padi_limit": 0, "mac_padi_limit": 0, "new_session_rate": 0});
     if let (Some(b), Some(extra)) = (base.as_object_mut(), json.as_object()) {
         for (k, v) in extra {
@@ -52,7 +52,7 @@ fn pools(size: u32) -> IpPools {
     }
 }
 
-fn ppp(users: usize, srv: PppoeServer) -> Ppp {
+pub(super) fn ppp(users: usize, srv: PppoeServer) -> Ppp {
     let mut p = Ppp::default();
     p.profiles.push(PppProfile {
         id: ItemId(2),
@@ -77,19 +77,19 @@ fn ppp(users: usize, srv: PppoeServer) -> Ppp {
 }
 
 /// N clients and the BNG, a fake clock and a perfect wire.
-struct Lab {
-    bng: Bng,
-    clients: Vec<Client>,
+pub(super) struct Lab {
+    pub(super) bng: Bng,
+    pub(super) clients: Vec<Client>,
     by_mac: HashMap<[u8; 6], usize>,
-    now: u64,
-    up: Vec<bool>,
+    pub(super) now: u64,
+    pub(super) up: Vec<bool>,
     downs: Vec<usize>,
     /// IPv6 packets (PPP protocol 0x0057) each client received (G4.3e).
     v6: Vec<Vec<Vec<u8>>>,
 }
 
 impl Lab {
-    fn new(n: usize, snap: Snapshot, auth: impl Fn(usize) -> (String, String)) -> Self {
+    pub(super) fn new(n: usize, snap: Snapshot, auth: impl Fn(usize) -> (String, String)) -> Self {
         Self::with(n, snap, auth, |_, _| {})
     }
 
@@ -131,7 +131,7 @@ impl Lab {
         Self { bng, clients, by_mac, now: 0, up, downs, v6 }
     }
 
-    fn start(&mut self, range: std::ops::Range<usize>) {
+    pub(super) fn start(&mut self, range: std::ops::Range<usize>) {
         let mut out = ClientOutput::new();
         for i in range {
             self.clients[i].start(self.now, &mut out);
@@ -148,7 +148,7 @@ impl Lab {
     }
 
     /// Deliver until quiet, then advance the clock by `step` ms, `rounds` times.
-    fn run(&mut self, rounds: usize, step: u64) {
+    pub(super) fn run(&mut self, rounds: usize, step: u64) {
         let mut out = ClientOutput::new();
         for _ in 0..rounds {
             for _ in 0..50 {
@@ -206,16 +206,16 @@ impl Lab {
         }
     }
 
-    fn ups(&self) -> usize {
+    pub(super) fn ups(&self) -> usize {
         self.up.iter().filter(|u| **u).count()
     }
 
-    fn backend(&self) -> Backend {
+    pub(super) fn backend(&self) -> Backend {
         Backend(self.bng.shared.clone())
     }
 }
 
-fn snap(users: usize, srv: PppoeServer, pool: u32) -> Snapshot {
+pub(super) fn snap(users: usize, srv: PppoeServer, pool: u32) -> Snapshot {
     Snapshot { ppp: ppp(users, srv), pools: pools(pool), aaa: None, unix_base: 1_700_000_000, ..Snapshot::default() }
 }
 

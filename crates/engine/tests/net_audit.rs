@@ -441,7 +441,7 @@ fn duplicate_routes_are_found_across_the_list() {
     }
     ok(&mut s, "config.mode.set", json!({"mode": "transactional"}));
     let mut cfg = s.store().candidate().clone();
-    let mut dup = cfg.ip.routes[0].clone();
+    let mut dup = cfg.ip.routes.get(0).unwrap().clone();
     dup.id = corerouter_model::ItemId(999);
     cfg.ip.routes.push(dup);
     let issues = corerouter_engine::validate::validate_all(&cfg);

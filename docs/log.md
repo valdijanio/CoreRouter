@@ -4187,3 +4187,230 @@ continuação indentadas).
 
   - **`corerouter-control` `deadline_bounds_the_total_not_each_read`.** Era um bug de verdade. No Unix, um `SO_RCVTIMEO` vencido volta como `WouldBlock` (EAGAIN), e não como `TimedOut`. O `Sock::read` do canal de controle devolvia um ou outro, conforme quem vencia antes: o prazo verificado por nós ou o do socket. Agora os dois casos saem como `TimedOut`.
   - **`service::dns::tests` (`a_silent_server_is_skipped` e os outros).** O servidor DNS de teste pegava uma porta UDP livre e tentava a mesma porta em TCP, que um teste paralelo podia estar usando (`AddrInUse`). Agora ele tenta de novo até achar uma porta livre nos dois.
+
+- 2026-10-26 — G4.3cd: Rotas por assinante, parte 1 (modelo e comandos). Cliente empresarial com bloco roteado (/29,
+  /28, /48 IPv6): o `/ppp secret` ganha `routes` com o texto do RouterOS (`dst-address gateway
+  metric`, várias separadas por vírgula), em IPv4 e IPv6, e vale também para os secrets IPoE
+  (`service=ipoe`). O tipo `corerouter_model::framed_route::FramedRoute` lê o mesmo texto do
+  `Framed-Route` (RFC 2865 §5.22) e do `Framed-IPv6-Route` (RFC 3162 §2.5): gateway `0.0.0.0`, `::`
+  ou ausente é o próprio assinante; vários métricas como no exemplo da RFC (vale a primeira);
+  prefixo sem tamanho é um host (/32, /128); prefixo com bits de host (`10.0.0.1/24`) é recusado
+  em vez de adivinhado.
+
+  Recusas (`ppp.secret.add/set`), com o motivo: bloco especial (padrão, loopback, link-local,
+  multicast, reservado, mais largo que /8 ou /16), sobreposição com a rota de outro secret, com um
+  `/ip pool` ou `/ipv6 pool`, um bloco que contém um endereço do roteador ou o endereço fixo de outro
+  secret, e gateway IPv4 diferente do endereço fixo do assinante. Avisos: gateway IPv4 sem endereço
+  fixo, bloco dentro de uma rede conectada, bloco que uma sessão ativa (RADIUS) segura agora. No
+  sentido contrário, `ip.pool.add/set`, `ipv6.pool.add/set` e o `remote_address` de um secret recusam
+  o que cai num bloco roteado. `ppp.secret.list` mostra e procura nas rotas; `ppp.active.list` e
+  `ppp.why` ganham `routes` (com a origem: secret, Framed-Route, Framed-IPv6-Route,
+  Framed-IPv6-Prefix) e `refused_routes`, preenchidos pelo serviço na parte 2.
+
+  Custo: um índice das rotas dos secrets (como o índice por nome da G4.3g) deixa a conferência em
+  O(log n) por rota; `RouteSet` guarda blocos disjuntos num `BTreeMap`, e a busca do bloco que
+  contém um endereço é o casamento de prefixo mais longo. 10 mil secrets com rota num lote atômico:
+  o teste inteiro do `ppp_secret` roda em 0,84 s em debug (**medido**, 2026-10-26, 32 CPUs).
+
+  Testes: `framed_route` (textos das RFCs e do RouterOS, especiais, proptest de ida e volta e do
+  `RouteSet` contra uma busca linear), `ppp_secrets` (índice segue as escritas), `ppp_secret`
+  (recusas, avisos, rollback, 10 mil num lote).
+
+- 2026-10-26 — G4.3cd: Rotas por assinante, parte 2 (serviço e XDP). O BNG PPPoE pega as rotas do `routes` do secret ou
+  do Access-Accept (`Framed-Route` e `Framed-IPv6-Route` repetidos, RFC 2865 §5.22 e RFC 3162 §2.5;
+  o segundo `Framed-IPv6-Prefix` em diante, RFC 3162 §2.3) e as instala na subida da sessão: com XDP
+  num LPM novo de descida (`PPPOE_RT4`/`PPPOE_RT6` → índice da sessão), sem XDP como rota
+  `bloco dev bng0` com o caminho lento entregando ao worker certo. Um bloco tem um dono só
+  (`corerouter_engine::framed::FramedTable`, compartilhada pelos workers, pelo IPoE e pelos
+  comandos): bloco de outro assinante, especial, de pool ou do roteador é recusado com o motivo em
+  português no log, em `ppp.active` (`refused_routes`) e no histórico. Na queda as rotas saem antes
+  da sessão (sem blackhole). CoA com `Framed-Route`/`Framed-IPv6-Route` troca as rotas sem derrubar
+  (o novo entra antes de o velho sair; inválido = CoA-NAK 407, nada muda). O anti-spoofing aceita
+  origem dentro de um bloco da própria sessão (XDP, IPoE no XDP e caminho lento). Accounting
+  Start/Stop com as rotas.
+
+  XDP: descida rápida num uplink com uma ou duas tags (antes `down-tagged` ia ao kernel); a decisão
+  virou `pppoe::to_subscriber`, a mesma função no programa e no modelo de teste; contadores novos
+  `down-tagged` (agora encapsulado no XDP) e `down-routed`.
+
+  Testes: `framed` (engine), `pppoe_routes_tests` (BNG em memória: secret no caminho lento, RADIUS no
+  LPM com dois assinantes disputando um bloco, CoA trocando e recusando), `radius_aaa_tests` (Accept
+  com `Framed-Route` repetido pelo `proto_radius::testserver` real em UDP, CoA com rotas e NAK 407),
+  `pppoe_routes` (proptest do programa inteiro: bloco, uplink com tags, anti-spoofing),
+  `netns_pppoe_routes` (e2e sem root: um host do /29 pinga pelo assinante certo, o outro não vê, e
+  depois do logout a rota some do kernel), `xdp_root` › `pppoe_routes_kernel_and_host_agree` e
+  `perf_pppoe_routes_10k` (na VM, com root).
+
+- 2026-10-26 — G4.3h: BNG em alta disponibilidade, parte a: o crate L2 `corerouter-proto-ha`, sans-IO e compilável para
+  WASM. Máquina de papéis (init, standby, active, fenced, yielding) com cerca por maioria de três
+  (este nó, o par e uma testemunha), dois caminhos para ouvir o par (o stream de sync e um hello
+  autenticado no L2 de acesso, que também é o MAC update gratuito do MAC virtual) e eleição que não
+  cruza visões (encarnação, `hears`, `view_seq`/`acked`); sync hot-standby da tabela de sessões
+  (snapshot, deltas com sequência, ack em lote, resync depois de um buraco, log limitado); registro
+  da sessão em TLV (SID, MACs, os dois Magic-Numbers, MRU, IPCP/IPv6CP, prefixos, RADIUS, Class,
+  Acct-Session-Id, contadores) compatível entre versões; switchover e "simular falha". Pesquisa
+  (Cisco SRG, Nokia MC-Sync/SRRP, Juniper, MikroTik, accel-ppp, RFC 2516/1661/2866/2865/5798) e
+  desenho em `docs/bng-ha.md`.
+
+  Como testar: `cargo test -p corerouter-proto-ha` (27 de unidade, 11 simulações, 4 proptests);
+  `HA_SIM_SEEDS=2000 cargo test --release -p corerouter-proto-ha --test sim` (2000 sementes de falhas
+  aleatórias, nunca dois ativos que se ouvem; **medido** 34 s); `cargo bench -p corerouter-proto-ha
+  --bench ha`. Na simulação com 100 mil sessões, a morte do ativo vira troca em 1175 ms (morte 1200
+  ms) com 0 sessões perdidas (**medido**, relógio simulado).
+
+- 2026-10-26 — G4.3h: BNG em alta disponibilidade, parte b: o modelo `ppp.redundancy` (`crates/model/src/ppp_redundancy.rs`)
+  e os comandos `ppp.redundancy.set/get/monitor/switchover/simulate-failure`. O `set` recusa par
+  inseguro com o parâmetro culpado: habilitar sem `peer`, sem `secret` de 16+ caracteres ou, com
+  `fencing` que usa testemunha, sem `witness`; `dead_interval` menor que 3 × `hello_interval`;
+  MAC virtual multicast; testemunha que não é IP; interface inexistente. Avisa quando: não há
+  servidor PPPoE, o MAC virtual não é administrado localmente, `fencing=witness` está sozinho,
+  o modo é stateless ou o `dead_interval` é curto. O `secret` só se escreve: `get` mostra `***`
+  e o journal o mascara. `monitor`, `switchover` e `simulate-failure` falam com o serviço por
+  `HaBackend` (`crates/engine/src/ppp_redundancy.rs`); sem o serviço, o monitor diz
+  `running: false` e as ações explicam por que não rodam.
+
+  Como testar: `cargo test -p corerouter-engine ppp_redundancy`;
+  `corerouter-cli run ppp.redundancy.set '{"peer":"10.0.0.2:8730","secret":"segredo-do-par-123","witness":["10.0.0.254"],"enabled":true}'`.
+
+- 2026-10-26 — G4.3h: BNG em alta disponibilidade, parte c: o serviço `ppp-ha` do daemon. Ele leva o link de sync em
+  TLS na `listen_port` (o certificado do roteador, fixado no primeiro uso, e só um link por par: o
+  nó de id menor disca) e o hello de acesso por `AF_PACKET` (0x88b5, do MAC virtual enquanto ativo),
+  via `hal-linux::ha_io`. Sonda a testemunha por ICMP e confere as portas do `track`.
+  `ppp.redundancy.monitor`, `switchover` e `simulate-failure` funcionam no daemon. O
+  `proto_ha::node::Node` junta papéis, sync, hellos e a autenticação mútua do link (desafio e
+  prova HMAC com o segredo do par); o laboratório em memória roda o mesmo código. O
+  `pppoe` ainda não consulta o papel: vem no PR d.
+
+  Como testar: `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-daemon --test netns_ha -- --test-threads 1 --nocapture` (dois daemons, sem root):
+  par formado em 762 ms, switchover em 53 ms, failover após matar o ativo em 1,16 s, nó isolado
+  cercado (**medido**, debug).
+
+- 2026-10-26 — G4.3k: PPPoE com vários Service-Names numa porta, parte 1: a tabela de Service-Names do servidor, como
+  os `service-name-tables` do Junos (`docs/pppoe.md` §11). Cada linha tem nome, perfil, ação
+  (`terminate`, `delay`, `drop`), `pado_delay`, `max_sessions` e `padi_limit`, mais as linhas fixas
+  `empty` e `any`. Os comandos são `interface.pppoe-server.server.add/set services=[…]` e
+  `interface.pppoe-server.server.service.add/set/remove/list`. Uma config só com `service_name`
+  (RouterOS) vale como a tabela que quer dizer e é gravada como tabela na primeira mudança. O AC do
+  `proto-pppoe` segue a RFC 2516: o PADO ecoa o nome (§5.2), `drop` não responde (§5.2), o PADR
+  recebe Service-Name-Error com SID 0 (§5.4) e AC-System-Error quando a linha está cheia. O perfil
+  da linha vale no PADR. O nome fica por sessão (`ppp.active.list` › `service_name`) e vai ao
+  RADIUS como Called-Station-Id.
+
+  Como testar: `cargo test -p corerouter-proto-pppoe` (regras da RFC, proptest da tabela,
+  simulação de 20 mil assinantes com 40 nomes sobre 5000 VLANs QinQ) e `cargo test -p
+  corerouter-engine ppp_pppoe`. Pela CLI:
+  `interface.pppoe-server.server.service.add {"server":"pppoe-ether2","name":"iptv","profile":"tv"}`.
+
+- 2026-10-26 — G4.3k: PPPoE com vários Service-Names numa porta, parte 2: a tabela de Service-Names na aba PPPoE
+  Servers da janela PPP, embaixo da lista de servidores (a do servidor selecionado, senão a do
+  primeiro). Uma linha por nome, mais `empty name` e `other names` em selos. Selos coloridos por
+  ação (`terminate` verde, `delay 300 ms` âmbar, `drop` vermelho, linha apagada) e o perfil num selo
+  com cor por hash. O modal de adicionar e editar passa pela prévia do engine
+  (`interface.pppoe-server.server.service.preview`: nomes atendidos e descartados, o que recebem o
+  nome vazio e os outros, e os avisos). As linhas aceitam `id` = `<servidor>/<nome>`. A coluna
+  Service de Active Connections mostra o nome pedido ao lado do selo `pppoe`. O ⓘ de cada coluna e
+  campo está em português.
+
+  Como testar: `cargo test -p corerouter-ui ppp` (`the_service_name_table_under_the_servers`) ou
+  PPP › PPPoE Servers na GUI.
+
+- 2026-10-26 — G4.9a: Filas (G4.9), parte 1: modelo e comandos. Controle de banda genérico por alvo (endereço, prefixo ou
+  interface), não só PPPoE: decisão do usuário em 2026-10-26.
+
+  - `queue.simple.add/set/remove/enable/disable/move/list` com `target`, `max-limit`, `limit-at`,
+    `burst-limit/threshold/time`, `bucket-size`, `priority`, `queue` e `comment`, em pares
+    `upload/download` do ponto de vista do alvo, como o RouterOS. Primeira-que-casa: um alvo dentro do
+    alvo de uma fila acima não é instalado e a fila é avisada.
+  - `queue.type.add/set/remove/list`: `pfifo`, `bfifo`, `pcq` (taxa, classificador, máscaras v4/v6,
+    limites, burst), `fq-codel`, `cake`; os tipos do RouterOS existem sem entrada, mais
+    `fq-codel-default` (padrão das filas dinâmicas) e `cake-default`.
+  - `queue.per-ip.add/list`: "cada IP de 10.0.0.0/16 com 10M/20M" vira dois tipos `pcq` (reaproveitados
+    entre regras de mesma taxa) e uma simple queue, o mesmo que uma importação do MikroTik produz.
+  - Filas dinâmicas (selo D e origem): sessões PPPoE/IPoE com `rate-limit`, leases estáticos com
+    `rate_limit` e, novidade, `rate_limit` na rede do DHCP (`ip.dhcp-server.network.*`) para todo
+    cliente dela. Dinâmica vence fixa no próprio endereço, com aviso nos dois lados.
+  - Perfil PPP: `queue_type` (tipo da fila de descida) e `download_mode` (`shaper`, o padrão, ou
+    `policer`, com aviso).
+  - O plano de dados (shaper EDT, policer sem corrida) é a G4.9b; a janela, a G4.9c.
+
+  Testar: `cargo test -p corerouter-engine queue` (comandos, rollback, plano com 100 mil sessões) e
+  `cargo test -p corerouter-engine --test queue` (leases reais do servidor DHCP viram filas dinâmicas).
+
+- 2026-10-26 — G4.3ca: PPPoE: entrega pelo kernel ao assinante. Com o PPPoE no XDP ligado, o carregador cria `bng0` e põe
+  nele o programa `bng_egress`; cada sessão PPPoE ganha rotas (/32, /64, prefixo delegado) por
+  `bng0` com o MTU da sessão. O que o XDP manda ao kernel no sentido de descida (sessão sem fast down,
+  TTL, MTU, descida moldada) chega ao assinante encapsulado; o ICMP do roteador também ("fragmentation
+  needed" com o MTU da rota, RFC 1191; time exceeded). Teste com root
+  `pppoe_kernel_delivery_through_bng0` (datagrama, ICMP 11, PMTU 1400, sessão moldada a 5 Mbit/s:
+  200 de 200 entregues espalhados em 227 ms). O shaping é o EDT da G4.9b.
+
+- 2026-10-26 — G4.3cc: PPPoE: policer sem corrida entre CPUs. O balde virou GCRA (ITU-T I.371): o estado exato é o tempo
+  teórico de chegada, uma palavra de 64 bits em ticks de 1/64 ns, trocada com `cmpxchg`; as 16 fatias
+  da janela de burst do RouterOS somam com adição atômica e só a CPU que ganha a troca do início da
+  janela limpa as fatias velhas. Quatro trocas perdidas seguidas descartam o pacote. `bpf_spin_lock`
+  foi descartado (nenhum helper com ele preso, mapa com BTF, um lock por assinante serializando as
+  CPUs), e prender o assinante numa CPU (cpumap) não foi preciso: o erro já é zero. Medido com o mesmo
+  teste antes (`main`) e depois: 4 CPUs +4,87% → −0,22%; 8 CPUs +14,87% → −0,42%; 16 remetentes em
+  8 CPUs +14,97% → −0,35%. Proptest `policer_exact_under_races` simula até 16 CPUs intercaladas.
+
+- 2026-10-26 — G4.3h: BNG em alta disponibilidade, parte e1: `proto_pppoe::server::ha`. `Server::export_all` e
+  `Server::import` levam uma sessão estabelecida de um servidor para outro já em Opened no LCP, no
+  IPCP e no IPv6CP, sem renegociar e sem mandar nada. Ficam o SID, o par de MACs, os dois
+  Magic-Numbers (RFC 1661 §6.4), o MRU, o endereço, o DNS, os identificadores IPv6CP, o
+  rate-limit e o resto do Session-Timeout. `Fsm::opened` é o autômato já aberto. A lista de SIDs
+  livres é refeita uma vez por lote (O(n)).
+
+  Como testar: `cargo test -p corerouter-proto-pppoe --test ha`. 1000 assinantes passam para
+  servidores novos e ficam 2 min de keepalive de pé, sem relogar; o export do novo é idêntico ao
+  do antigo; com 5 % de perda depois da tomada, as sessões aguentam.
+
+- 2026-10-26 — G4.3h: BNG em alta disponibilidade: o `SessionRecord` do `proto-ha` agora leva tudo o que o outro nó
+  precisa para reconstruir a sessão. Campos novos: pools do /64 e do prefixo delegado, DNS IPv6,
+  NBNS, rotas (G4.3cd), `limit-bytes-in/out` e o perfil da linha de Service-Name. A chave de
+  replicação usa o nome do servidor PPPoE no lugar do índice da porta, que muda entre as duas
+  máquinas. Os tipos novos (26 a 32) são TLV: um nó antigo os guarda e reescreve.
+
+  Como testar: `cargo test -p corerouter-proto-ha` e `HA_FUZZ_CASES=30000 cargo test --release
+  -p corerouter-proto-ha --test fuzz`.
+
+- 2026-10-26 — G4.3h: BNG em alta disponibilidade, parte f: a aba **PPP › Redundancy**. À esquerda fica
+  `ppp.redundancy.set/get`, com o segredo só de escrita; o Apply manda só o que mudou. À direita, o
+  par ao vivo pelo `ppp.redundancy.monitor`:
+  - o papel em selo colorido e a época;
+  - o par e os dois caminhos (sync e acesso);
+  - a testemunha;
+  - o sync N/N com pendentes e atraso;
+  - a divergência de config;
+  - as trocas de papel com o motivo.
+
+  Os botões Switchover e Simulate Failure pedem confirmação. Todo rótulo leva ⓘ em português
+  (`i18n/auto/ppp_ha_*.rs`). A aba é o módulo `crates/ui/src/ppp_redundancy.rs`; no `ppp.rs`
+  entraram só a aba e o roteamento.
+
+  Como testar: `cargo test -p corerouter-ui ppp_redundancy`; na GUI, PPP › Redundancy com dois
+  daemons em par (o script do teste `netns_ha`). As capturas, com daemons reais (switchover, falha
+  simulada e volta como standby), estão nos temas escuro e claro.
+
+- 2026-10-26 — G4.9b: Filas (G4.9), parte 2: o plano de dados.
+
+  - **Descida moldada (EDT):** o programa tc `shape_egress` dá a cada pacote para um alvo (sessão
+    moldada, fila por prefixo ou por interface) o horário de saída, e o `fq` (`mq` + um por fila de
+    transmissão, instalado pelo carregador) o segura. O que esperaria demais é descartado antes de
+    entrar: `pfifo`/`bfifo` pelo limite, `fq-codel`/`cake` pelo CoDel (RFC 8289) na espera prevista,
+    com ECN só em pacote ECN-capaz.
+  - **Subida policiada:** `shape_ingress` (filas) e o policer do XDP (sessões) com balde de
+    `bucket-size × taxa` (0,1 = 100 ms, antes 50 ms) e a rajada do RouterOS.
+  - **Relógios sem corrida** (G4.3cc): GCRA e EDT numa palavra com `cmpxchg` (ISA v3 do BPF).
+  - **PCQ:** sub-fluxo por endereço mascarado (LRU), limitado também pelo relógio da fila.
+  - **Sessões:** `download_mode=shaper` (padrão) liga `F_SHAPE_DOWN`; a descida vai pelo kernel e
+    por `bng0` (G4.3ca) até a fila da porta de acesso. Active Connections ganha `queue_us` e `drops`.
+  - **Daemon:** serviço `queue` (um plano por segundo quando muda, contadores de volta para
+    `queue.simple.list`); `hal::queue::ShaperPlan` e `Hal::shaper_apply/shaper_status`.
+  - Testes: proptests do shaper e do policer (limites, corrida de 1 a 16 "CPUs", média de longo prazo
+    da rajada do RouterOS), `shaper_root.rs` (carga, precisão a 1/100/10 mil alvos, TCP com shaper ×
+    policer, EDT × HTB a 1 mil e 10 mil), `policer_race_root.rs` e `xdp_root.rs`
+    (`pppoe_kernel_delivery_through_bng0`), rodados como root na VM do laboratório.
+
+  Testar: `cargo test -p corerouter-dataplane-ebpf-common`; com root (VM):
+  `cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root`.
