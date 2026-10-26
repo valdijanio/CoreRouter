@@ -189,6 +189,10 @@ mod linux {
             let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
             if w == 0 { pppoe_workers_auto(cpus) } else { w }
         };
+        // G4.3n: the key of the sealed passwords.
+        let seal = corerouter_engine::sealing::key(&mut lock(session))
+            .map_err(|e| log::error!("PPPoE: local secrets' passwords cannot be opened: {e}"))
+            .ok();
         let first = Bng::first_of(seed(), lanes);
         let shared = first.shared.clone();
         let routes = first.clone_routes();
@@ -276,7 +280,7 @@ mod linux {
                     ifaces.sort();
                     d.choose_plane(session, &shared, ifaces);
                 }
-                let snap = Snapshot { ppp, pools, aaa, unix_base, pools6, iid_key };
+                let snap = Snapshot { ppp, pools, aaa, unix_base, pools6, iid_key, seal: seal.clone() };
                 let xdp = d.plane == Some(true);
                 for w in &d.workers {
                     let _ = w.send(Msg::Config(Box::new(snap.clone()), infos.clone(), xdp));

@@ -212,7 +212,7 @@ impl Session {
             }
             None => ConfigStore::new(discovered(hal.as_mut())),
         };
-        Self {
+        let mut s = Self {
             store,
             hal,
             storage,
@@ -236,7 +236,10 @@ impl Session {
             ntp: Default::default(),
             counters: EngineCounters::default(),
             ext,
-        }
+        };
+        // G4.3n: passwords kept in clear by older versions get sealed.
+        crate::sealing::seal_legacy(&mut s);
+        s
     }
 
     /// Simulator / lab session on the virtual backend (8 ports).
@@ -630,7 +633,7 @@ impl Session {
     fn record(&mut self, id: &str, params: &Value, result: &Result<Value>, revision: Option<u32>) {
         self.seq = self.seq.saturating_add(1);
         // Passwords and tokens never reach the journal nor the log (G0.3).
-        let params = auth::mask_secrets(params);
+        let params = auth::mask_params(id, params);
         // Bounded like the log detail: a 16 MiB parameter must not be kept
         // 1024 times (audit #4).
         self.journal.push(JournalEntry {

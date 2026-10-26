@@ -200,7 +200,7 @@ fn warnings(pr: &PppProfile) -> Vec<String> {
     w
 }
 
-fn add(s: &mut Session, p: &Value) -> Result<Value> {
+pub(super) fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let name = opt_name(p, "name")?.ok_or_else(|| EngineError::bad("name", "is required"))?;
     let ppp = &s.store().candidate().ppp;
     if ppp.profile(&name).is_some() {

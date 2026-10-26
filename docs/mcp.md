@@ -22,6 +22,11 @@ novo precisa estar em `known_hosts` (conecte uma vez com `corerouter-cli --conne
 num terminal, que pergunta) ou ser dado com `--fingerprint`. O que o agente pode fazer é o que o
 grupo do usuário permite: `list_commands` mostra `enabled: false` com o motivo.
 
+**Segredos (G4.3n).** O agente nunca lê um segredo: toda resposta de tool e de resource passa
+por `auth::mask_secrets` (`password`, `secret`, `token`… viram `***`), mesmo quando o comando os
+devolveria ao token local (grupo `full`), como `ppp.secret.list show_sensitive=yes`. O agente
+pode importar secrets (`ppp.secret.import`); o relatório não traz senhas.
+
 **Reconexão (audit-e2e).** O MCP vive mais que o processo do roteador: se o daemon reiniciou (ou a
 sessão de login expirou), a próxima chamada reconecta sozinha — relê o token local, loga de novo
 com `--user`, e no TLS só aceita o mesmo certificado da primeira conexão. Pedido que chegou ao

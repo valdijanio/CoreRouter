@@ -67,3 +67,9 @@ path = "fuzz_targets/oslog.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "routeros_export"
+path = "fuzz_targets/routeros_export.rs"
+test = false
+doc = false

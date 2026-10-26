@@ -1013,6 +1013,9 @@ pub(crate) struct Snapshot {
     /// driver, so a line keeps its link-local across restarts); `None`:
     /// one drawn from the seed, for this run.
     pub iid_key: Option<[u8; 32]>,
+    /// G4.3n: opens the secrets' sealed passwords (`None`: only the ones
+    /// kept in clear open).
+    pub seal: Option<Arc<corerouter_engine::sealing::SealKey>>,
 }
 
 pub(crate) struct Bng {
@@ -2073,7 +2076,17 @@ impl Bng {
         if e.only_one && self.index.users_up.contains_key(&sec.name) {
             return self.reject(i, sref, "only-one: the user is already connected");
         }
-        let Some(mschap2) = req.verify_local(&sec.password) else {
+        // G4.3n: sealed in the config; opened per login (1.7 µs, measured).
+        let Some(password) =
+            corerouter_engine::sealing::open_with(self.cfg.seal.as_deref(), &sec.password)
+        else {
+            return self.reject(
+                i,
+                sref,
+                "password cannot be opened (secret-key of another router?)",
+            );
+        };
+        let Some(mschap2) = req.verify_local(&password) else {
             return self.reject(i, sref, "wrong password");
         };
         let (limit_in, limit_out) = (sec.limit_bytes_in, sec.limit_bytes_out);

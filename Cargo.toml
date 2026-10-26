@@ -83,6 +83,9 @@ hmac = "0.13.0"
 md4 = { version = "0.11.0", default-features = false }
 sha1 = { version = "0.11.0", default-features = false }
 des = "0.9.0"
+# G4.3n: PPP secret passwords sealed at rest (XChaCha20-Poly1305, RustCrypto, pure Rust,
+# wasm too); nonces come from getrandom, so no `getrandom` feature here.
+chacha20poly1305 = { version = "0.11.0", default-features = false, features = ["alloc"] }
 # G0.3: "Remember password" in the OS store (Keychain, Credential Manager, Secret
 # Service over zbus: pure Rust, no libdbus headers on CI).
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }

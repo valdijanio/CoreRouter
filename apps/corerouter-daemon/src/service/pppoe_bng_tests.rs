@@ -66,7 +66,7 @@ fn ppp(users: usize, srv: PppoeServer) -> Ppp {
         .map(|i| PppSecret {
             id: ItemId(10 + i as u32),
             name: format!("u{i}"),
-            password: format!("p{i}"),
+            password: format!("p{i}").into(),
             profile: "default".into(),
             ..PppSecret::default()
         })
@@ -289,6 +289,29 @@ fn wrong_password_is_explained_by_why() {
     // By MAC too.
     let by_mac = lab.backend().why(None, Some(corerouter_model::MacAddr([0x02, 0x10, 0, 0, 1, 1])));
     assert_eq!(by_mac.last_stage, Some(Stage::Auth));
+}
+
+/// G4.3n: the passwords are sealed in the config; the BNG opens them with
+/// the session's key, and a box of another key is a refused login.
+#[test]
+fn sealed_passwords_log_in_with_the_key_only() {
+    let key = std::sync::Arc::new(corerouter_engine::sealing::SealKey::from_bytes(&[3; 32]));
+    let mut sn = snap(2, server(serde_json::json!({})), 100);
+    for x in sn.ppp.secrets.iter_mut() {
+        x.password = key.seal(x.password.stored()).unwrap();
+    }
+    sn.seal = Some(key);
+    let mut lab = Lab::new(2, sn.clone(), |i| (format!("u{i}"), format!("p{i}")));
+    lab.start(0..2);
+    lab.run(200, 50);
+    assert_eq!(lab.ups(), 2, "sealed passwords open");
+    sn.seal = Some(std::sync::Arc::new(corerouter_engine::sealing::SealKey::from_bytes(&[4; 32])));
+    let mut lab = Lab::new(1, sn, |i| (format!("u{i}"), format!("p{i}")));
+    lab.start(0..1);
+    lab.run(200, 50);
+    assert_eq!(lab.ups(), 0);
+    let last = lab.backend().why(Some("u0"), None).last.unwrap();
+    assert!(last.reply_message.unwrap_or_default().contains("cannot be opened"));
 }
 
 #[test]

@@ -155,7 +155,7 @@ mod tests {
     }
 
     fn pw<'a>(v: &'a Secrets, name: &str) -> Option<&'a str> {
-        v.by_name(name).map(|x| x.password.as_str())
+        v.by_name(name).map(|x| x.password.stored())
     }
 
     #[test]

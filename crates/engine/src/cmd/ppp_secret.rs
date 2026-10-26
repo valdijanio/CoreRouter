@@ -1,7 +1,9 @@
 //! `/ppp secret` (G4.3d, RouterOS v7): local subscribers. The password is
 //! write-only (`***` in the list; `password` is masked in the journal,
-//! `auth::SECRET_KEYS`). Changes apply to the next login; an active
-//! session is ended with `ppp.active.remove`.
+//! `auth::SECRET_KEYS`) and sealed in the config (`crate::sealing`,
+//! G4.3n): only `list show_sensitive=yes`, for group full (`/export
+//! show-sensitive`), reads it back. Changes apply to the next login; an
+//! active session is ended with `ppp.active.remove`.
 
 use corerouter_model::MacAddr;
 use corerouter_model::ppp::{MAX_PASSWORD, MAX_SECRETS, PppSecret, PppService};
@@ -28,7 +30,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.secret.disable", "Disable PPP Secret", [], None,
         "{id: *hex | name} → {id, name, active}", has_secrets, disable),
     cmd!(query "ppp.secret.list", "PPP Secrets", [], None,
-        "{find?: string (in name, comment, caller id or address), profile?: string, limit?: int (default all), offset?: int} → [{id, name, password: \"***\", service, profile, local_address?, remote_address?, caller_id?, limit_bytes_in?, limit_bytes_out?, comment?, disabled, active (up now), flags (X disabled)}]",
+        "{find?: string (in name, comment, caller id or address), profile?: string, limit?: int (default all), offset?: int, show_sensitive?: bool (the passwords in clear, for /export show-sensitive; group full only)} → [{id, name, password: \"***\" (in clear with show_sensitive), service, profile, local_address?, remote_address?, caller_id?, limit_bytes_in?, limit_bytes_out?, comment?, disabled, active (up now), flags (X disabled)}]",
         always, list),
     cmd!(query "ppp.secret.preview", "PPP Secret Preview", [], None,
         "{id?: *hex | name, name?: string, password?: string, service?: string, profile?: string, local_address?: ipv4, remote_address?: ipv4, caller_id?: mac, limit_bytes_in?: int, limit_bytes_out?: int, comment?: string, disabled?: bool} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
@@ -56,18 +58,34 @@ fn u64_of(p: &Value, key: &str) -> Result<Option<u64>> {
     }
 }
 
-fn apply(s: &Session, x: &mut PppSecret, p: &Value) -> Result<()> {
+/// `password` checked (never echoed): at most `MAX_PASSWORD` bytes, no
+/// control characters.
+pub(super) fn password_of(p: &Value) -> Result<Option<&str>> {
+    let Some(pw) = opt_str(p, "password")? else {
+        return Ok(None);
+    };
+    if pw.len() > MAX_PASSWORD || pw.chars().any(char::is_control) {
+        return Err(EngineError::bad(
+            "password",
+            format!("at most {MAX_PASSWORD} bytes without control characters"),
+        ));
+    }
+    Ok(Some(pw))
+}
+
+/// `password` of `p` sealed into `x` (`crate::sealing`).
+fn seal_password(s: &mut Session, x: &mut PppSecret, p: &Value) -> Result<()> {
+    if let Some(pw) = password_of(p)? {
+        let key = crate::sealing::key(s).map_err(EngineError::Internal)?;
+        x.password = key.seal(pw).map_err(EngineError::Internal)?;
+    }
+    Ok(())
+}
+
+/// Every field of `p` but the password ([`seal_password`]).
+pub(super) fn apply(s: &Session, x: &mut PppSecret, p: &Value) -> Result<()> {
     if let Some(n) = opt_name(p, "name")? {
         x.name = n;
-    }
-    if let Some(pw) = opt_str(p, "password")? {
-        if pw.len() > MAX_PASSWORD || pw.chars().any(char::is_control) {
-            return Err(EngineError::bad(
-                "password",
-                format!("at most {MAX_PASSWORD} bytes without control characters"),
-            ));
-        }
-        x.password = pw.to_owned();
     }
     if let Some(t) = opt_str(p, "service")? {
         x.service = PppService::parse(t).ok_or_else(|| {
@@ -113,7 +131,7 @@ fn apply(s: &Session, x: &mut PppSecret, p: &Value) -> Result<()> {
 }
 
 /// Addresses that two secrets (or a secret and a pool) would both hand out.
-fn warnings(s: &Session, x: &PppSecret) -> Vec<String> {
+pub(super) fn warnings(s: &Session, x: &PppSecret) -> Vec<String> {
     let mut w = Vec::new();
     let c = s.store().candidate();
     // IPoE subscribers have no password (a DHCP client is its MAC or line).
@@ -131,7 +149,7 @@ fn warnings(s: &Session, x: &PppSecret) -> Vec<String> {
     w
 }
 
-fn index(s: &Session, p: &Value) -> Result<usize> {
+pub(super) fn index(s: &Session, p: &Value) -> Result<usize> {
     find(&s.store().candidate().ppp.secrets, p, |x| x.id, |x| Some(x.name.as_str()), "secret")
 }
 
@@ -154,6 +172,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         ..PppSecret::default()
     };
     apply(s, &mut x, p)?;
+    seal_password(s, &mut x, p)?;
     x.id = s.store_mut().candidate_mut().ppp.next_id();
     let w = warnings(s, &x);
     let out = json!({"id": x.id, "name": x.name, "warnings": w});
@@ -168,6 +187,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let old = x.name.clone();
     apply(s, &mut x, p)?;
+    seal_password(s, &mut x, p)?;
     if x.name != old && s.store().candidate().ppp.secret(&x.name).is_some() {
         return Err(EngineError::bad("name", format!("secret '{}' exists", x.name)));
     }
@@ -272,6 +292,18 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let profile = opt_str(p, "profile")?.map(str::to_owned);
     let limit = super::args::opt_u32(p, "limit")?.unwrap_or(u32::MAX);
     let offset = super::args::opt_u32(p, "offset")?.unwrap_or(0) as usize;
+    // Whoever reads them logs in as any subscriber: like RouterOS's
+    // `sensitive` policy, only group full.
+    let key = if opt_bool(p, "show_sensitive")?.unwrap_or(false) {
+        s.permit(crate::auth::Group::Full)
+            .map_err(|reason| EngineError::Denied {
+                id: "ppp.secret.list".into(),
+                reason: format!("show_sensitive: {reason}"),
+            })?;
+        Some(crate::sealing::key(s).map_err(EngineError::Internal)?)
+    } else {
+        None
+    };
     let active = s.ppp_active();
     let up: std::collections::HashSet<&str> = active.iter().map(|a| a.name.as_str()).collect();
     let secrets = &s.store().candidate().ppp.secrets;
@@ -284,7 +316,10 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             let mut v = json!({
                 "id": x.id,
                 "name": x.name,
-                "password": "***",
+                "password": match &key {
+                    Some(k) => Value::from(k.open(&x.password).unwrap_or_default()),
+                    None => Value::from("***"),
+                },
                 "service": x.service.as_str(),
                 "profile": x.profile,
                 "disabled": x.disabled,
@@ -339,7 +374,12 @@ mod tests {
         assert_eq!(row["caller_id"], "AA:BB:CC:00:00:01");
         assert_eq!(row["profile"], "default");
         assert!(!l.to_string().contains("s3nh4"));
-        assert_eq!(s.store().running().ppp.secret("joao@isp").unwrap().password, "s3nh4");
+        let stored = &s.store().running().ppp.secret("joao@isp").unwrap().password;
+        assert!(stored.is_sealed() && !stored.stored().contains("s3nh4"), "sealed at rest");
+        let k = crate::sealing::key(&mut s).unwrap();
+        assert_eq!(k.open(&s.store().running().ppp.secrets[0].password).as_deref(), Some("s3nh4"));
+        let shown = s.execute("ppp.secret.list", &json!({"show_sensitive": true})).unwrap();
+        assert_eq!(shown[0]["password"], "s3nh4");
         let j = serde_json::to_string(&s.journal()).unwrap();
         assert!(!j.contains("s3nh4"), "journal leaks the password: {j}");
         s.execute("ppp.secret.disable", &json!({"id": "joao@isp"})).unwrap();

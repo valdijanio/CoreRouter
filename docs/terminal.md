@@ -179,8 +179,12 @@ registro:
   `file=` sai sempre em 80 colunas, para o arquivo não depender da janela;
 - **`/export terse`**: uma linha por item com o menu na frente
   (`/ip address add address=… interface=…`), sem quebra — para script e grep. `compact` (o
-  padrão do RouterOS desde a v6) é aceito e não muda nada; `verbose` e `show-sensitive` são
-  recusados com o motivo (não viram nome de arquivo).
+  padrão do RouterOS desde a v6) é aceito e não muda nada; `verbose` é recusado com o motivo
+  (não vira nome de arquivo);
+- **`/export show-sensitive`** (G4.3n): uma bandeira, como no RouterOS v7 (`show-sensitive=yes`
+  é recusado). Os `print` que declaram `show_sensitive` devolvem os segredos em claro (as senhas
+  do `/ppp secret`), só para o grupo `full`; abaixo dele o export falha com "needs group full".
+  Detalhes em `docs/ppp-secret-import.md`.
 
 `/import file=nome` lê o arquivo do lado do cliente e **colar várias linhas** no terminal faz o
 mesmo: o script inteiro é traduzido antes (erro de sintaxe → "line N: …", nada aplicado) e vai

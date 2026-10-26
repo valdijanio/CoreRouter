@@ -44,7 +44,7 @@ fn snapshot(users: usize) -> Snapshot {
             .map(|i| PppSecret {
                 id: ItemId(2 + i as u32),
                 name: format!("u{i}"),
-                password: format!("p{i}"),
+                password: format!("p{i}").into(),
                 profile: "default".into(),
                 ..PppSecret::default()
             })
@@ -114,7 +114,7 @@ fn up_ids(bng: &mut Bng, ids: &[usize]) {
                 mac: Mac(mac),
                 ifindex: IFINDEX,
                 username: format!("u{i}").into_bytes(),
-                password: format!("p{i}"),
+                password: format!("p{i}").into(),
                 keepalive_interval_ms: 0,
                 ..ClientConfig::default()
             };

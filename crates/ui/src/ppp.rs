@@ -337,6 +337,8 @@ pub(crate) struct PppPanel {
     pub(crate) modal: Option<(Tab, Modal)>,
     pub(crate) why: Option<WhyDialog>,
     pub(crate) drops: Option<Drops>,
+    /// Secrets › Import from MikroTik (G4.3n).
+    pub(crate) import: Option<crate::ppp_import::ImportDialog>,
     pub(crate) help: Option<HelpView>,
     /// Rx/Tx bits per second of each session since the window opened (the
     /// sparkline of Active Connections), at most [`TRAFFIC_POINTS`].
@@ -705,6 +707,15 @@ impl PppPanel {
             act = list::toolbar(ui, salt, &tools, &sel, l);
             info(ui, &mut help, l, spec.help, spec.edit_title);
             if tab == Tab::Secrets {
+                if table::action(ui, &format!("{}…", tr_in("ppp_import", l, "Import from MikroTik")), app.can().check("ppp.secret.import")) {
+                    match &mut self.import {
+                        Some(d) => d.status.bring_to_front(),
+                        None => {
+                            app.next_dialog = app.next_dialog.wrapping_add(1);
+                            self.import = Some(crate::ppp_import::ImportDialog::new(app.next_dialog));
+                        }
+                    }
+                }
                 let c = &self.secret_count;
                 ui.weak(format!(
                     "{} {} · {} {}",
@@ -1457,6 +1468,13 @@ impl PanelState for PppPanel {
         }
         self.why_dialog(app, ctx, area);
         self.drops_dialog(app, ctx, area);
+        if let Some(d) = self.import.as_mut() {
+            let mut help = self.help.take();
+            if !crate::ppp_import::show(d, app, ctx, area, WIN, &profiles, &mut help) {
+                self.import = None;
+            }
+            self.help = help;
+        }
         help::modal(ctx, app.lang, &mut self.help);
     }
 
@@ -1485,6 +1503,16 @@ impl PanelState for PppPanel {
                     app.next_dialog = app.next_dialog.wrapping_add(1);
                     let message = e.split(": repeat with").next().unwrap_or(e).to_owned();
                     self.drops = Some(Drops { id: app.next_dialog, steps: d.0, message, status: Status::default() });
+                }
+                app.cache.refreshed_at = None;
+                return;
+            }
+            Err(t) => t,
+        };
+        let then = match then.downcast::<crate::ppp_import::Reply>() {
+            Ok(r) => {
+                if let Some(d) = self.import.as_mut() {
+                    crate::ppp_import::replied(d, &r, result);
                 }
                 app.cache.refreshed_at = None;
                 return;
