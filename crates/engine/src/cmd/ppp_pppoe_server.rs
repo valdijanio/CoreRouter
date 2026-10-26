@@ -17,15 +17,16 @@ use super::args::{opt_bool, opt_parse, opt_str, opt_text, opt_u32};
 use super::dhcp_client::opt_list;
 use super::dhcp_server::find;
 use super::ppp_common::{guard_drops, opt_name};
+use corerouter_model::pppoe_services::{from_service_name, normalize};
 use super::{CommandSpec, always};
 use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("interface.pppoe-server.server.add", "Add PPPoE Server", [], None,
-        "{interface: string, name?: string (default pppoe-<interface>), service_name?: string (empty: any), max_mtu?: int 64..1492 (default 1480), max_mru?: int 64..1492 (default 1480), mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string (default all four), keepalive_timeout?: int 1..3600 (s; disabled: no LCP echo) , one_session_per_host?: bool (default yes), max_sessions?: int 0..65534 (0: no limit), pado_delay?: int 0..30000 (ms), default_profile?: string (default default), pppoe_over_vlan_range?: string (100-115,120) | [string], accept_untagged?: bool (default yes), ac_cookie?: bool (default yes, RFC 2516 §9), padi_limit?: int (PADIs answered per second, default 2000; 0: none), mac_padi_limit?: int (per MAC per second, default 1; 0: none), new_session_rate?: int | auto (sessions accepted per second, default 2000; 0: none; auto: follows the RADIUS server's health, 1000 up to 20000), pado_delay_by_load?: string (sessions:ms,… as 5000:100,20000:300) | [string], disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{interface: string, name?: string (default pppoe-<interface>), service_name?: string (RouterOS: this name and the empty one; empty: any), services?: [{name, profile?, action?, pado_delay?, max_sessions?, padi_limit?}] | string (the Service-Name table, G4.3k: name is a Service-Name, empty or any; action terminate|delay|drop; the same list as JSON text), max_mtu?: int 64..1492 (default 1480), max_mru?: int 64..1492 (default 1480), mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string (default all four), keepalive_timeout?: int 1..3600 (s; disabled: no LCP echo) , one_session_per_host?: bool (default yes), max_sessions?: int 0..65534 (0: no limit), pado_delay?: int 0..30000 (ms), default_profile?: string (default default), pppoe_over_vlan_range?: string (100-115,120) | [string], accept_untagged?: bool (default yes), ac_cookie?: bool (default yes, RFC 2516 §9), padi_limit?: int (PADIs answered per second, default 2000; 0: none), mac_padi_limit?: int (per MAC per second, default 1; 0: none), new_session_rate?: int | auto (sessions accepted per second, default 2000; 0: none; auto: follows the RADIUS server's health, 1000 up to 20000), pado_delay_by_load?: string (sessions:ms,… as 5000:100,20000:300) | [string], disabled?: bool, comment?: string} → {id, name, warnings}",
         always, add),
     cmd!("interface.pppoe-server.server.set", "Set PPPoE Server", [], None,
-        "{id: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: int 64..1492, max_mru?: int 64..1492, mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string, keepalive_timeout?: int 1..3600 | disabled, one_session_per_host?: bool, max_sessions?: int 0..65534, pado_delay?: int 0..30000, default_profile?: string, pppoe_over_vlan_range?: string | [string], accept_untagged?: bool, ac_cookie?: bool, padi_limit?: int, mac_padi_limit?: int, new_session_rate?: int | auto, pado_delay_by_load?: string | [string], disabled?: bool, comment?: string, force?: bool (apply even if it drops active sessions)} → {id, name, warnings, dropped}",
+        "{id: *hex | name, interface?: string, name?: string, service_name?: string, services?: [{name, profile?, action?, pado_delay?, max_sessions?, padi_limit?}] | string, max_mtu?: int 64..1492, max_mru?: int 64..1492, mrru?: int 512..65535 | disabled, authentication?: [mschap2|mschap1|chap|pap] | string, keepalive_timeout?: int 1..3600 | disabled, one_session_per_host?: bool, max_sessions?: int 0..65534, pado_delay?: int 0..30000, default_profile?: string, pppoe_over_vlan_range?: string | [string], accept_untagged?: bool, ac_cookie?: bool, padi_limit?: int, mac_padi_limit?: int, new_session_rate?: int | auto, pado_delay_by_load?: string | [string], disabled?: bool, comment?: string, force?: bool (apply even if it drops active sessions)} → {id, name, warnings, dropped}",
         has_servers, set),
     cmd!("interface.pppoe-server.server.remove", "Remove PPPoE Server", [], None,
         "{id: *hex | name, force?: bool (remove even with sessions up)} → {id, name, dropped}",
@@ -36,7 +37,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{id: *hex | name, force?: bool (disable even with sessions up)} → {id, name, dropped}",
         has_servers, disable),
     cmd!(query "interface.pppoe-server.server.list", "PPPoE Servers", [], None,
-        "{} → [{id, name, interface, service_name?, max_mtu, max_mru, mrru, authentication, keepalive_timeout, one_session_per_host, max_sessions, pado_delay, default_profile, pppoe_over_vlan_range, accept_untagged, ac_cookie, padi_limit, mac_padi_limit, new_session_rate, pado_delay_by_load, disabled, comment?, flags (X disabled), sessions (up now), admission_rate? (new_session_rate=auto: the rate now), admission_reason?, warnings}]",
+        "{} → [{id, name, interface, service_name? (the names served, comma-separated), services (the Service-Name table as JSON text, as services= takes it; per row with sessions: interface.pppoe-server.server.service.list), max_mtu, max_mru, mrru, authentication, keepalive_timeout, one_session_per_host, max_sessions, pado_delay, default_profile, pppoe_over_vlan_range, accept_untagged, ac_cookie, padi_limit, mac_padi_limit, new_session_rate, pado_delay_by_load, disabled, comment?, flags (X disabled), sessions (up now), admission_rate? (new_session_rate=auto: the rate now), admission_reason?, warnings}]",
         always, list),
     cmd!(query "interface.pppoe-server.server.preview", "PPPoE Server Preview", [], None,
         "{id?: *hex | name, interface?: string, name?: string, service_name?: string, max_mtu?: string, max_mru?: string, mrru?: string, authentication?: string, keepalive_timeout?: string, one_session_per_host?: bool, max_sessions?: string, pado_delay?: string, default_profile?: string, pppoe_over_vlan_range?: string, accept_untagged?: bool, ac_cookie?: bool, padi_limit?: string, mac_padi_limit?: string, new_session_rate?: string, pado_delay_by_load?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk?}",
@@ -154,9 +155,16 @@ fn apply(s: &Session, v: &mut PppoeServer, p: &Value) -> Result<()> {
     if let Some(n) = opt_name(p, "name")? {
         v.name = n;
     }
-    if let Some(t) = opt_text(p, "service_name", 64)? {
-        v.service_name = t.trim().to_owned();
+    // G4.3k: the table, or RouterOS' one name (which means a table). Any
+    // change writes the table: a config from before it migrates here.
+    if let Some(rows) = super::ppp_pppoe_service::opt_services(p)? {
+        v.services = normalize(rows).map_err(|e| EngineError::bad("services", e))?;
+    } else if let Some(t) = opt_text(p, "service_name", 64)? {
+        v.services = from_service_name(&t);
+    } else if v.services.is_empty() {
+        v.services = v.service_table();
     }
+    v.service_name.clear();
     if let Some(m) = mtu(p, "max_mtu")? {
         v.max_mtu = m;
     }
@@ -258,7 +266,7 @@ fn check(s: &Session, v: &PppoeServer) -> Result<Vec<String>> {
             ));
         }
     }
-    let mut w = Vec::new();
+    let mut w = super::ppp_pppoe_service::check_rows(s, &v.service_table())?;
     if cfg.ip.addresses.iter().any(|a| a.interface == v.interface && !a.disabled) {
         w.push(format!("{} has an IP address: PPPoE does not need one there, and the subscribers' LAN sees the router (RouterOS advises against it)", v.interface));
     }
@@ -322,7 +330,6 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     // applies to new sessions.
     let restarts = v.interface != old.interface
         || (v.disabled && !old.disabled)
-        || v.service_name != old.service_name
         || v.pppoe_over_vlan_range != old.pppoe_over_vlan_range
         || v.accept_untagged != old.accept_untagged;
     let dropped = if restarts {
@@ -384,10 +391,18 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
     let rows: Vec<Value> = servers
         .iter()
         .map(|v| {
+            let table = v.service_table();
+            let served: Vec<String> = table
+                .iter()
+                .filter(|r| !r.name.is_special() && r.accepts())
+                .map(|r| r.name.to_string())
+                .collect();
             let mut row = json!({
                 "id": v.id,
                 "name": v.name,
                 "interface": v.interface,
+                // As `services=` takes it (and `/export` writes it).
+                "services": serde_json::to_string(&table).unwrap_or_default(),
                 "max_mtu": v.max_mtu,
                 "max_mru": v.max_mru,
                 "mrru": v.mrru.map_or_else(|| json!("disabled"), |m| json!(m)),
@@ -410,8 +425,8 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                 "warnings": check(s, v).unwrap_or_default(),
             });
             if let Some(o) = row.as_object_mut() {
-                if !v.service_name.is_empty() {
-                    o.insert("service_name".into(), json!(v.service_name));
+                if !served.is_empty() {
+                    o.insert("service_name".into(), json!(served.join(",")));
                 }
                 if !v.comment.is_empty() {
                     o.insert("comment".into(), json!(v.comment));
@@ -492,7 +507,7 @@ fn monitor(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use corerouter_model::MacAddr;

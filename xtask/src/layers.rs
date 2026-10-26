@@ -41,6 +41,8 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-pppoe", 2),
     // G4.3b: RADIUS codec, client and CoA/DM server (sans-IO).
     ("corerouter-proto-radius", 2),
+    // G4.3h: BNG high availability: sync protocol, role machine, fencing (sans-IO).
+    ("corerouter-proto-ha", 2),
     ("corerouter-engine", 3),
     ("corerouter-control", 4),
     ("corerouter-mcp", 4),

@@ -6,7 +6,7 @@
 #![doc(hidden)]
 
 use crate::client::{Client, ClientConfig, ClientEvent, ClientOutput, ClientPhase};
-use crate::eth;
+use crate::eth::{self, Vlans};
 use crate::layers::AuthSet;
 use crate::lcp::AuthProto;
 use crate::server::{
@@ -83,6 +83,11 @@ pub struct LabConfig {
     /// Frames toward the servers for which this returns true are copied
     /// into [`Lab::tapped`] (to replay them later).
     pub tap: Option<fn(&[u8]) -> bool>,
+    /// Service-Names the clients ask for, cycled (empty list: the empty
+    /// name for all; G4.3k).
+    pub service_names: Vec<Vec<u8>>,
+    /// VLAN stacks of the clients, cycled (empty list: untagged; G4.3l).
+    pub vlans: Vec<Vlans>,
     pub seed: u64,
 }
 
@@ -107,6 +112,8 @@ impl Default for LabConfig {
             reconnect: true,
             trace: None,
             tap: None,
+            service_names: Vec::new(),
+            vlans: Vec::new(),
             seed: 1,
         }
     }
@@ -160,6 +167,8 @@ pub struct Lab {
     /// Clients whose session is up, by (shard, SID).
     pub up: HashMap<(usize, u16), usize>,
     pub tapped: Vec<Vec<u8>>,
+    /// The Service-Name of every authentication asked (G4.3k).
+    pub auth_services: Vec<Vec<u8>>,
     /// Edits frames in flight (`true` = toward a server): the fuzzer's hook.
     pub mutate: Option<Mutator>,
     queue: BinaryHeap<Reverse<InFlight>>,
@@ -176,6 +185,10 @@ pub struct Lab {
     dice: Dice,
     sout: ServerOutput,
     cout: ClientOutput,
+}
+
+fn nth_cycled<T: Clone>(v: &[T], i: usize) -> Option<T> {
+    v.get(i.checked_rem(v.len())?).cloned()
 }
 
 pub fn client_mac(i: usize) -> Mac {
@@ -237,6 +250,8 @@ impl Lab {
                         auth: AuthSet::new(&[proto]),
                         ipv6: cfg.ipv6,
                         ipv6_iid: cfg.ipv6_zero_iid.then_some([0; 8]),
+                        service_name: nth_cycled(&cfg.service_names, i).unwrap_or_default(),
+                        vlans: nth_cycled(&cfg.vlans, i).unwrap_or(Vlans::NONE),
                         ..ClientConfig::default()
                     },
                     seed32(cfg.seed, i as u64),
@@ -252,6 +267,7 @@ impl Lab {
             stats: LabStats::default(),
             up: HashMap::new(),
             tapped: Vec::new(),
+            auth_services: Vec::new(),
             mutate: None,
             queue: BinaryHeap::new(),
             answers: BinaryHeap::new(),
@@ -417,6 +433,7 @@ impl Lab {
     fn server_event(&mut self, shard: usize, ev: &Event) {
         match ev {
             Event::Authenticate { session, request } => {
+                self.auth_services.push(request.service.to_vec());
                 let i = self
                     .by_mac
                     .get(&request.client_mac)
