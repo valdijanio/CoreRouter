@@ -278,10 +278,15 @@ impl XdpState {
         let Some(l) = self.loaded.as_mut() else {
             return Ok(());
         };
-        write_settings(&mut l.ebpf, &plan, self.pppoe.word())?;
-        pppoe::sync_ports(&mut l.ebpf, &self.pppoe)?;
         // The maps are right whatever happens to the links below.
         sync_tries(l, &mut self.prefixes, &mut self.tries_on, !plan.is_empty())?;
+        let held = if self.tries_on {
+            self.prefixes.len()
+        } else {
+            (0, 0)
+        };
+        write_settings(&mut l.ebpf, &plan, held, self.pppoe.word())?;
+        pppoe::sync_ports(&mut l.ebpf, &self.pppoe)?;
         attach_all(l, &plan.interfaces)?;
         self.applied = plan;
         let on = self.pppoe.maps();
@@ -657,12 +662,19 @@ fn load(fast_nat: bool, pppoe: bool, queues: bool, pcq: bool) -> Result<Loaded, 
 }
 
 /// `subscribers`: the PPPoE/IPoE switches (`PppoeState::word`).
-fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan, subscribers: u64) -> Result<(), HalError> {
+/// `held`: the tries hold (block, allow) prefixes (the program skips an
+/// empty trie's lookup).
+fn write_settings(
+    ebpf: &mut Ebpf,
+    plan: &XdpPlan,
+    held: (usize, usize),
+    subscribers: u64,
+) -> Result<(), HalError> {
     let s = Settings {
         drop_malformed: plan.drop_malformed,
         drop_bad_tcp_flags: plan.drop_invalid_tcp_flags,
-        block: !plan.block.is_empty(),
-        allow: !plan.allow.is_empty(),
+        block: held.0 > 0,
+        allow: held.1 > 0,
         rate_pps: plan.rate_limit,
         burst: plan.rate_burst,
         fast_nat: plan.fast_nat,
@@ -683,8 +695,6 @@ fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan, subscribers: u64) -> Result<(
     .map_err(|e| rejected("writing the settings", &e))
 }
 
-/// Make tries `v4`/`v6` go from `from` to `to`: removals, then inserts
-/// and changed list indexes.
 /// Bring the block and allow tries to `prefixes` (`on`: the filter has
 /// ports; otherwise they are emptied). Tries that hold what was written
 /// last (`tries_on`) get only the changes; empty ones get every prefix.
