@@ -1,7 +1,8 @@
 id: processo
 
-CI completo do lote em jobs paralelos: de ~23 min para ~6,5 min por lote (**medido**), sem
-tirar nenhum passo.
+CI completo do lote em jobs paralelos: de ~23 min para 5 min 24 s a 7 min 28 s por lote
+(**medido**), sem tirar nenhum passo. O lote mais lento é o do `bench-check`, depois que o #268
+deixou o benchmark `config_store` lento.
 
 - `.github/workflows/ci.yml`: o job serial `xtask ci (linux)` virou cinco jobs paralelos, cada
   um com `cargo xtask ci --only <passos>`: `lint` (fmt, clippy, docs, ebpf-check, layers,
@@ -12,6 +13,16 @@ tirar nenhum passo.
   propósito (PR, PR só de documentação). Os outros dois checks exigidos não mudaram. O
   `scripts/land.sh` lê a conclusão do run inteiro, que já espera todos os jobs; o `main-red`
   também.
+- **8 núcleos nos testes, somando runners:** o `test` e o `xdp-root` rodam em duas partes,
+  cada uma num runner de 4 vCPU (`COREROUTER_CI_PARTITION=i/2`). O `test` passa
+  `--partition hash:i/2` ao nextest (um teste fica na mesma parte quando outros entram; os
+  doctests só na parte 1); `.config/nextest.toml` começa primeiro os três testes de mais de
+  60 s, que antes, começando por último, seguravam sozinhos o fim de uma parte. O `xdp-root`
+  divide os testes de root pelo tempo medido de cada um (o mais longo para a parte mais leve),
+  e cada parte continua rodando um por vez, porque eles medem vazão e precisão. Dentro de cada
+  job, o nextest e o cargo já usam todos os núcleos (o padrão é o número de CPUs). Runner maior
+  é pago e runner próprio na máquina do usuário rodaria código de PR de fork (repositório
+  público): nenhum dos dois.
 - `.github/actions/setup`: a preparação comum (pacotes apt, toolchain, rust-cache, nextest,
   módulos do kernel) numa action local. O cache do cargo é por job (cada um guarda só o que
   compila: 0,2–0,5 GB cada, 1,6 GB os cinco, contra 1,1 GB do job único).
@@ -62,7 +73,32 @@ Depois (runs 40406439545, cache frio, e 40407532159, cache quente):
 `bench-check` em paralelo ~61 s (limitado pelo `frames`). A montagem de 1M de rotas do
 `ui_frame/routes_1m` é o que sobra: ~100 s no CI mesmo otimizado.
 
+Depois, com as partes (runs 40410630612, 40411738352 e 40413648189, cache quente):
+
+| Configuração | `test` (maior parte) | `xdp-root` (maior parte) | `bench-check` | Run inteiro |
+|---|---|---|---|---|
+| test 1 job, xdp-root 1 job | 366 s | 273 s | 291 s | 6 min 25 s |
+| test 2 partes `count`, xdp-root 2 | 304 s (outra: 161 s) | 134 s | 249 s ¹ | **5 min 24 s** |
+| test 2 partes `hash` + lentos primeiro | 267 s (outra: 174 s) | 142 s | 429 s ¹ | 7 min 28 s ¹ |
+| test 3 partes `hash` | 237 s (outras: 231, 188 s) | 164 s | 397 s ¹ | 6 min 53 s ¹ |
+
+¹ Desde o #268 (mesclado da `main` antes das três medições com partes), o `config_store` do
+`bench-check` leva de 104 s a 211 s no CI, contra 12 s antes: montar 10 mil filas
+`queue.simple` numa transação leva 117 s localmente, mesmo otimizado. A variação entre runners
+(104 s contra ~210 s) decide se o caminho crítico é o `test` ou o `bench-check`. Corrigida
+essa montagem, o `bench-check` volta a ~4,3 min e o lote fica em ~5 min 30 s (**estimado**).
+
+Escolha: 2 partes. Com a contagem (`count`), os três testes longos (97, 64 e 62 s) caíram
+todos na mesma parte, e o de 97 s começou por último (parte 1 em 174 s de execução, parte 2 em
+55 s). Por hash, com os lentos primeiro, a execução das partes ficou em 141 s e 66 s: o limite é
+o teste de ~100 s do `proto-pppoe::sim`. Uma terceira parte tirou só 30 s do maior job (237 s
+contra 267 s), num job que já não é o caminho crítico, e custa mais uma compilação inteira
+(~100 s de runner). Compilar uma vez e distribuir os binários (`cargo nextest archive` +
+artifact) não ganha tempo de relógio: o job de build ainda compila 96 s, e soma compactar,
+enviar e baixar os binários de teste, antes de as partes começarem (**estimado** ≥ 5 min, contra
+~4,5 min compilando em cada parte).
+
 Paralelismo: os passos não dependem um do outro, então cada job compila o que precisa no
-próprio runner (4 vCPU cada) em vez de dividir um runner. O que fica em série é o `test`
-(compilação + 2613 testes no nextest); próximo passo, se precisar: dividir o `test` em duas
-partições do nextest (`--partition count:i/2`), ~1,5 min a menos **estimado**.
+próprio runner (4 vCPU cada) em vez de dividir um runner. O `bench-check` ficou em série num
+runner só, de propósito: cada parte compilaria de novo quase todo o workspace em `opt-level 1`
+(2 min 40 s), e a execução já é limitada por um binário só (`config_store`, depois `ui frames`).
