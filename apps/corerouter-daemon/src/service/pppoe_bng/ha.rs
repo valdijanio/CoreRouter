@@ -56,6 +56,10 @@ pub(crate) struct HaState {
     counters_at: Millis,
     /// The last takeover this worker adopted.
     pub(crate) gen_done: u64,
+    /// The key each published session went out with: its end and its
+    /// counters reuse it (no export, no copy, at 100 000 sessions every
+    /// 10 s; and at its end the `proto-pppoe` session is already gone).
+    keys: HashMap<(usize, u16), Key>,
     /// Ending sessions because the peer took them (no Acct-Stop).
     pub(crate) handed_over: bool,
 }
@@ -91,25 +95,20 @@ fn origin_of(t: &str) -> RouteOrigin {
     .unwrap_or(RouteOrigin::Secret)
 }
 
+fn counters_of(a: &ActiveSession) -> HaCounters {
+    HaCounters {
+        rx_bytes: a.rx_bytes,
+        tx_bytes: a.tx_bytes,
+        rx_packets: a.rx_packets,
+        tx_packets: a.tx_packets,
+    }
+}
+
 /// The worker a CPE's frames reach (`Bng::lane_of` on its MAC).
 fn mac_lane(mac: [u8; 6], lanes: u16) -> u16 {
     let [_, _, a, b, c, d] = mac;
     let k = u32::from_be_bytes([a, b, c, d]);
     ((k.wrapping_mul(0x9E37_79B1) >> 16) % u32::from(lanes.max(1))) as u16
-}
-
-/// The replication key of a session (`SessionRecord::key`).
-fn key_of(server: &str, vlans: Vlans, sid: u16, mac: Mac) -> Key {
-    SessionRecord {
-        kind: Kind::Pppoe,
-        vlan: vlan_field(vlans.outer),
-        inner_vlan: vlan_field(vlans.inner),
-        sid,
-        client_mac: mac.0,
-        server: server.into(),
-        ..SessionRecord::default()
-    }
-    .key()
 }
 
 impl Bng {
@@ -128,47 +127,22 @@ impl Bng {
 
     /// The session ended here.
     pub(super) fn ha_gone(&mut self, sub: &Sub) {
-        if !self.ha_hot() || sub.up_at.is_none() {
-            return;
+        let k = (sub.slot, sub.sref.sid);
+        self.ha.dirty.remove(&k);
+        if let Some(key) = self.ha.keys.remove(&k)
+            && self.ha_hot()
+        {
+            self.ha.out.push(HaChange::Gone(key));
         }
-        self.ha.dirty.remove(&(sub.slot, sub.sref.sid));
-        let Some((name, st)) = self
-            .slots
-            .get(sub.slot)
-            .map(|s| (s.cfg.name.clone(), s.server.export(0, sub.sref.sid)))
-        else {
-            return;
-        };
-        let vlans = st.map_or(
-            Vlans {
-                outer: sub.descriptor_vlan.unwrap_or(0),
-                ..Vlans::NONE
-            },
-            |s| s.vlans,
-        );
-        self.ha
-            .out
-            .push(HaChange::Gone(key_of(&name, vlans, sub.sref.sid, sub.mac)));
     }
 
     /// The record of an established session, or `None`.
-    fn ha_record(&self, now: Millis, key: (usize, u16)) -> Option<SessionRecord> {
+    fn ha_record(&self, now: Millis, key: (usize, u16), counters: HaCounters) -> Option<SessionRecord> {
         let sub = self.subs.get(&key)?;
         let up = sub.up_at?;
         let slot = self.slots.get(key.0)?;
         let st = slot.server.export(now, key.1)?;
         let (auth_proto, auth_algo) = auth_codes(st.auth);
-        let id = session_id(key.0, &self.slots, key.1);
-        let counters = guard(&self.shared)
-            .active
-            .get(&id)
-            .map(|a| HaCounters {
-                rx_bytes: a.rx_bytes,
-                tx_bytes: a.tx_bytes,
-                rx_packets: a.rx_packets,
-                tx_packets: a.tx_packets,
-            })
-            .unwrap_or_default();
         let v6 = sub.v6.as_deref();
         let pool_of = |s: &v6::Source| match s {
             v6::Source::Pool(n) => Some(n.as_str().into()),
@@ -255,39 +229,37 @@ impl Bng {
             return Vec::new();
         }
         let dirty: Vec<(usize, u16)> = self.ha.dirty.drain().collect();
-        for k in dirty {
-            if let Some(r) = self.ha_record(now, k)
-                && let Ok(b) = r.to_bytes()
-            {
-                self.ha.out.push(HaChange::Up(r.key(), Arc::from(b)));
+        if !dirty.is_empty() {
+            // One lock of the shared table for the whole batch.
+            let counters: Vec<HaCounters> = {
+                let sh = guard(&self.shared);
+                dirty
+                    .iter()
+                    .map(|k| {
+                        sh.active
+                            .get(&session_id(k.0, &self.slots, k.1))
+                            .map(counters_of)
+                            .unwrap_or_default()
+                    })
+                    .collect()
+            };
+            for (k, c) in dirty.into_iter().zip(counters) {
+                if let Some(r) = self.ha_record(now, k, c)
+                    && let Ok(b) = r.to_bytes()
+                {
+                    let key = r.key();
+                    self.ha.keys.insert(k, key);
+                    self.ha.out.push(HaChange::Up(key, Arc::from(b)));
+                }
             }
         }
         if now.saturating_sub(self.ha.counters_at) >= COUNTERS_MS {
             self.ha.counters_at = now;
             let sh = guard(&self.shared);
-            for ((slot, sid), sub) in &self.subs {
-                if sub.up_at.is_none() {
-                    continue;
+            for (k, key) in &self.ha.keys {
+                if let Some(a) = sh.active.get(&session_id(k.0, &self.slots, k.1)) {
+                    self.ha.out.push(HaChange::Counters(*key, counters_of(a)));
                 }
-                let Some(s) = self.slots.get(*slot) else {
-                    continue;
-                };
-                let Some(a) = sh.active.get(&session_id(*slot, &self.slots, *sid)) else {
-                    continue;
-                };
-                let vlans = s
-                    .server
-                    .export(now, *sid)
-                    .map_or(Vlans::NONE, |st| st.vlans);
-                self.ha.out.push(HaChange::Counters(
-                    key_of(&s.cfg.name, vlans, *sid, sub.mac),
-                    HaCounters {
-                        rx_bytes: a.rx_bytes,
-                        tx_bytes: a.tx_bytes,
-                        rx_packets: a.rx_packets,
-                        tx_packets: a.tx_packets,
-                    },
-                ));
             }
         }
         std::mem::take(&mut self.ha.out)

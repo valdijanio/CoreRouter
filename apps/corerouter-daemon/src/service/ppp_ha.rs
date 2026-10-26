@@ -222,13 +222,51 @@ fn id_of(fingerprint: &str) -> u64 {
     section("id", fingerprint.as_bytes()).hash | 1
 }
 
-fn log(session: &Shared, level: &str, message: String, data: serde_json::Value) {
-    lock(session).log_event(
-        &["ppp", level],
-        corerouter_engine::logging::DAEMON,
-        message,
-        data,
-    );
+/// Log lines waiting for the engine's lock (the role machine never waits
+/// on it: a mass login holds it often, and a node that stops its hellos
+/// for 1.2 s gets its role taken). At most [`LOG_QUEUE`] wait.
+static LOGS: Mutex<VecDeque<(&'static str, String, serde_json::Value)>> = Mutex::new(VecDeque::new());
+const LOG_QUEUE: usize = 256;
+
+fn log(_session: &Shared, level: &'static str, message: String, data: serde_json::Value) {
+    let mut q = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+    if q.len() < LOG_QUEUE {
+        q.push_back((level, message, data));
+    }
+}
+
+/// The engine's lock if it is free now.
+fn try_session(session: &Shared) -> Option<std::sync::MutexGuard<'_, corerouter_engine::Session>> {
+    match session.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Writes the queued log lines, if the engine's lock is free.
+fn flush_logs(session: &Shared) {
+    let lines: Vec<_> = {
+        let mut q = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.is_empty() {
+            return;
+        }
+        q.drain(..).collect()
+    };
+    match try_session(session) {
+        Some(mut s) => {
+            for (level, message, data) in lines {
+                s.log_event(&["ppp", level], corerouter_engine::logging::DAEMON, message, data);
+            }
+        }
+        None => {
+            let mut q = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+            for l in lines.into_iter().rev() {
+                q.push_front(l);
+            }
+            q.truncate(LOG_QUEUE);
+        }
+    }
 }
 
 /// The config sections the two nodes must agree on, hashed.
@@ -406,10 +444,13 @@ mod linux {
         let mut events = Vec::new();
         loop {
             health.beat();
-            if Instant::now() >= next_cfg {
+            flush_logs(session);
+            // The config once a second, when the engine's lock is free (a
+            // busy engine delays it, never the hellos below).
+            let guard_now = if Instant::now() >= next_cfg { try_session(session) } else { None };
+            if let Some(s) = guard_now {
                 next_cfg = Instant::now() + Duration::from_secs(1);
                 let (r, secs, pppoe_ifs) = {
-                    let s = lock(session);
                     let cfg = s.store().running();
                     let ifs: Vec<IfName> = cfg
                         .ppp
@@ -420,6 +461,7 @@ mod linux {
                         .collect();
                     (cfg.ppp.redundancy.clone(), sections(cfg), ifs)
                 };
+                drop(s);
                 let sh = shared();
                 if !r.enabled {
                     if rt.pair().take().is_some() {

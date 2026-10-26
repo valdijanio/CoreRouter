@@ -13,11 +13,11 @@ empilhados:
 | a | crate `proto-ha` (sans-IO): codec do sync, registro da sessão, máquina de papéis com cerca, hello de acesso, laboratório de dois nós, fuzz, benchmark; este documento | #241 |
 | b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | #242 |
 | c | serviço `ppp-ha` no daemon: link de sync TLS com autenticação mútua, hello de acesso (AF_PACKET), testemunha (ICMP), track, monitor; `proto_ha::node` (o mesmo código no daemon e no laboratório) | #248 |
-| d | fase 1 no serviço `pppoe`: só o ativo responde, MAC virtual, segredo do AC-Cookie compartilhado | depois da sessão B (G4.3k+l) entrar |
-| e1 | `proto-pppoe`: `Server::export`/`import` (a sessão em Opened no outro servidor, sem renegociar) | este PR |
-| e2 | fase 2 no serviço: exportar/importar sessão por worker, mapas XDP na tomada, contabilização contínua | depois do d |
+| d+e2 | fases 1 e 2 no serviço `pppoe`: só o ativo responde (nem PADT), MAC virtual e portas promíscuas, AC-Cookie do par; hot standby: cada worker publica as suas sessões, a tomada as adota em Opened, contabilização contínua (o mesmo Acct-Session-Id, um Interim, nenhum Stop) | este PR |
+| e1 | `proto-pppoe`: `Server::export`/`import` (a sessão em Opened no outro servidor, sem renegociar) | #253 |
+| e2a | registro da sessão completo para a tomada | #255 |
 | f | aba PPP › Redundancy na GUI | #251 |
-| g | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do e |
+| g | laboratório com dois daemons e BNG Blaster (`cargo xtask bng-lab --only ha`) | empilhado sobre o d+e2 |
 
 ## 1. Pesquisa
 
@@ -224,6 +224,78 @@ pedida pelo CPE segue normal. A lista de SIDs livres é refeita uma vez por lote
 - **Medido** (release): export de 74 ns e import de 242 ns por sessão (20 mil em 1,5 ms e 4,8
   ms): 100 mil num núcleo ≈ 25 ms; por worker, em paralelo.
 
+## 2.8 Fase 1 no serviço `pppoe` (stateless)
+
+- **Só o ativo fala.** Fora do papel ativo, o worker não entrega quadro nenhum ao BNG e descarta o
+  que ele quisesse mandar. Isso inclui o PADT que o `proto-pppoe` manda a quadro de sessão
+  desconhecida: no standby, esse PADT derrubaria o CPE que está no ativo. Um nó que acaba de ligar
+  fica mudo até o par decidir (`HA_ACTIVE` começa falso).
+- **MAC virtual.** Com a redundância ligada, o AC MAC de todos os servidores é o MAC virtual
+  (PADO, PADS e sessões). O `ppp-ha` põe as portas de acesso em modo promíscuo enquanto as tem
+  abertas, para receber os quadros endereçados a ele. O hello do ativo, mandado do MAC virtual,
+  ensina a porta aos switches.
+- **AC-Cookie do par.** A chave vem do segredo do par, e o cookie deixa de amarrar o índice da
+  porta, que muda entre as máquinas. Assim, um PADR em voo numa troca entra no novo ativo
+  (`ServerConfig::cookie_secret`).
+- **Ao perder o papel**, o nó encerra as sessões sem mandar nada ao CPE. No modo stateless manda
+  Acct-Stop; no hot standby, não (abaixo).
+- **Medido** (debug, `tests/netns_ha_pppoe.rs`, dois daemons reais e 200 CPEs `proto-pppoe` com
+  keepalive de 1 s × 3): o standby não atende ninguém e não derruba ninguém em regime; morto o
+  ativo, as 200 voltam no outro nó em 4,9 s (morte em 1,2 s, mais o keepalive do CPE de 3 s, mais o
+  login).
+
+## 2.9 Fase 2 no serviço `pppoe` (hot standby)
+
+- **Publicar.** Cada worker marca a sessão que mudou: subida, CoA de rate-limit, IPv6, rotas. A
+  cada volta do laço ele monta o `SessionRecord` (proto-pppoe `export` mais o estado do BNG) e o
+  entrega ao publicador do `ppp-ha`. A remoção vai no fim da sessão; os contadores, a cada 10 s.
+  O custo é O(1) por mudança, e nada se refaz por sessão a cada tick.
+- **Tomar.** Ao virar ativo com a réplica completa, o `ppp-ha` entrega os registros aos workers
+  **antes** de liberar o "responder". Um quadro de sessão ainda não adotada levaria PADT, por isso
+  cada worker só responde depois de adotar a sua parte (`ha_pending`). A adoção, por worker e em
+  paralelo, faz:
+  - `Server::import` (Opened, sem quadro);
+  - o endereço reservado no pool;
+  - a entrada no XDP ou a rota do caminho lento;
+  - as rotas da G4.3cd;
+  - a tabela ativa, com os contadores herdados como base;
+  - a address-list;
+  - uma linha `up`/`takeover` no histórico;
+  - um **Interim-Update** com o mesmo Acct-Session-Id e os contadores.
+  
+  O serviço RADIUS agenda os Interims seguintes a partir desse (antes, só a partir do Start).
+  Os ganchos `on_up` não rodam de novo.
+- **Entregar.** O nó que perde o papel em hot standby encerra as suas cópias sem Acct-Stop e sem
+  `on_down`: a sessão continua no par.
+- **Mesmo número de workers nos dois nós.** Os quadros de um CPE chegam ao worker do hash do MAC, e
+  o SESSION_ID dele é desse worker. Por isso o número de workers entra na divergência
+  (`pppoe.workers`), e uma sessão que não cabe é contada e registrada no log.
+- **Medido** (debug, `tests/netns_ha_pppoe.rs`): morto o ativo, as 200 sessões estavam no outro nó
+  em 1,22 s, e **nenhum** CPE caiu em 10 s de keepalive. Unidade (`pppoe_ha_tests.rs`): 200
+  sessões adotadas por outro `Bng`, 2 minutos de keepalive dele, 0 PADT, os mesmos logins,
+  endereços, SIDs e Acct-Session-Id.
+
+### Achado: Acct-Session-Id repetido entre workers
+
+O laboratório achou um defeito anterior à G4.3h. O Acct-Session-Id era `hora + contador`, e
+cada worker do `pppoe` (G4.3g) tem o seu contador: dois workers davam o mesmo id no mesmo
+segundo. Em 1000 logins houve 213 ids distintos. Isso viola a RFC 2866 §5.5, que pede o id único,
+e quebra também o CoA por Acct-Session-Id. Agora o id leva a lane do worker; o laboratório
+confere que todos os Starts têm ids distintos.
+
+## 2.10 Laboratório (`cargo xtask bng-lab --only ha`, PR g)
+
+Três namespaces: o nó A, o nó C e o BNG Blaster. Duas bridges (acesso e uplink), o link de sync, a
+testemunha e um servidor RADIUS de teste num link que continua de pé. Com todas as sessões em A e a
+réplica de C completa, **A perde a energia**: todas as portas caem ao mesmo tempo. Sem root, na VM
+(caminho lento; o tráfego de 1 pps vai em todas as sessões até 2000, e acima disso numa amostra de
+500).
+
+RESULTADOS_LAB
+
+O tráfego de descida depende do protocolo de roteamento que anuncia o pool pelo nó ativo, fora do
+laboratório (gap G4.3hf).
+
 ## 3. Testes
 
 - Unidade (27): cada regra da máquina de papéis, codec, registro, hello, sync.
@@ -280,6 +352,14 @@ pedida pelo CPE segue normal. A lista de SIDs livres é refeita uma vez por lote
   (decisão global, custo desprezível).
 
 ## 5. Riscos e como evitamos
+
+- **CoA/DM depois da tomada:** o servidor de cobrança manda o CoA ao endereço de NAS do nó antigo.
+  É preciso um endereço de NAS do par ou o encaminhamento pelo par (gap G4.3hb).
+- **Class (RFC 2865 §5.25):** o PPP ainda não ecoa o Class na contabilização. O registro já tem
+  o campo (gap G4.3ha).
+- **DHCPv6-PD:** o prefixo delegado é reservado e anunciado no nó novo, e o Renew do CPE é
+  atendido a partir da concessão refeita. O estado fino do DHCPv6 (T1/T2 em curso) não é copiado.
+
 
 - **Dois ativos (o pior):** maioria de três, dois caminhos, eleição confirmada, época. O caso que
   sobra: o link de sync **e** o hello de acesso cortados com os dois nós alcançando a testemunha —

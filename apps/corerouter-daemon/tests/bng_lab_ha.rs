@@ -264,6 +264,12 @@ fn ok(ns: Option<u32>, command: &str, params: Value) -> Value {
     call(ns, command, params).unwrap_or_else(|e| panic!("{command} in {ns:?}: {e}"))
 }
 
+/// `BNG_LAB_HA_SINGLE=1`: node A alone, no redundancy (the A/B of what
+/// the pair costs on the same machine).
+fn single() -> bool {
+    std::env::var_os("BNG_LAB_HA_SINGLE").is_some()
+}
+
 fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: usize, r: &Radius) {
     ok(
         ns,
@@ -296,6 +302,9 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
             "interface.pppoe-server.server.add",
             json!({"interface": format!("acc{i}"), "authentication": "chap,pap", "padi_limit": 0, "mac_padi_limit": 0, "new_session_rate": 0, "keepalive_timeout": 30}),
         );
+    }
+    if single() {
+        return;
     }
     let ifs: Vec<String> = (0..ports).map(|i| format!("acc{i}")).collect();
     ok(
@@ -465,6 +474,13 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     );
     configure(None, "198.51.100.1/24", "10.9.0.2", 200, ports, &radius);
     configure(Some(cp), "198.51.100.3/24", "10.9.0.1", 100, ports, &radius);
+    if single() {
+        let b = Blaster::start(bp, blaster, out, n);
+        let setup = wait_secs(120 + n as u64 / 100, || b.counters().0 as usize >= n);
+        std::thread::sleep(Duration::from_secs(20));
+        eprintln!("ha {n} single: setup {setup:?}, counters {:?}", b.counters());
+        return format!("| {n} (nó sozinho) | — | — | — | — | — | — | — | — |");
+    }
     wait_secs(60, || {
         monitor(None)["role"] == "active" && monitor(Some(cp))["role"] == "standby"
     })
