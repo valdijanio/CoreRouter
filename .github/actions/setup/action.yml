@@ -47,7 +47,7 @@ runs:
     - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       if: inputs.cache == 'true'
       with:
-        save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/stream/processo-ci-speedup' }}
+        save-if: ${{ github.ref == 'refs/heads/main' }}
 
     # O `cargo xtask ci` usa o nextest quando existe: os binários de teste rodam em paralelo.
     - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
