@@ -91,12 +91,13 @@ mod linux {
 
     use corerouter_engine::{Shared, lock};
     use corerouter_hal::pppoe::PppoeOp;
-    use corerouter_hal_linux::pppoe_io::{PortSender, PppoePort, SlowPath, SlowTx};
+    use corerouter_hal_linux::pppoe_io::{Listen, PortSender, PppoePort, SlowPath, SlowTx};
     use corerouter_model::ppp::{PppoeServer, pppoe_workers_auto};
+    use corerouter_model::pppoe_vlans::VlanMode;
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
     use serde_json::json;
 
-    use super::super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot, guard, vlan_ids};
+    use super::super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot, guard};
 
     /// Longest wait for a frame; timers and RADIUS answers are looked at
     /// least this often.
@@ -143,9 +144,34 @@ mod linux {
     /// An open access port and what it was opened for.
     struct Open {
         port: PppoePort,
-        vlans: Vec<u16>,
-        untagged: bool,
+        listen: Vec<Listen>,
     }
+    /// The sockets a server's port needs (G4.3l): untagged, one per 802.1Q
+    /// VLAN id, or one per S-tag in stacked mode (the C-tag stays in the frame
+    /// and `proto-pppoe` checks it).
+    fn listens(v: &PppoeServer) -> Vec<Listen> {
+        let ids = |r: &[corerouter_model::ppp::VlanRange]| -> Vec<u16> {
+            r.iter().flat_map(|x| x.first..=x.last).collect()
+        };
+        let mut out = Vec::new();
+        match v.vlan_mode {
+            VlanMode::Stacked => {
+                if v.accept_untagged {
+                    out.push(Listen::Untagged);
+                }
+                let tpid = v.outer_tpid.value();
+                out.extend(ids(&v.outer_vlan_range).into_iter().map(|outer| Listen::Stacked { outer, tpid }));
+            }
+            VlanMode::Single => {
+                if v.pppoe_over_vlan_range.is_empty() || v.accept_untagged {
+                    out.push(Listen::Untagged);
+                }
+                out.extend(ids(&v.pppoe_over_vlan_range).into_iter().map(Listen::Vlan));
+            }
+        }
+        out
+    }
+
 
     /// What the reader hands a worker.
     enum Msg {
@@ -192,7 +218,7 @@ mod linux {
         super::super::pppoe_bng::ha::LANES.store(lanes, std::sync::atomic::Ordering::Release);
         let first = Bng::first_of(seed(), lanes);
         let shared = first.shared.clone();
-        let routes = first.clone_routes();
+        let routes = (first.clone_routes(), first.clone_routes6());
         // G4.3cd: the router's table of routed blocks; what a previous run
         // of this service held is gone with its sessions.
         let framed = corerouter_engine::framed::FramedTable::of(&mut lock(session));
@@ -468,22 +494,27 @@ mod linux {
         }
         let mut ops: Vec<PppoeOp> = Vec::new();
         let mut routes: Vec<(std::net::Ipv4Addr, u8, bool)> = Vec::new();
+        let mut routes6: Vec<(std::net::Ipv6Addr, u8, bool)> = Vec::new();
         let mut locked: Vec<Effect> = Vec::new();
         for e in effects {
             match e {
                 Effect::Xdp(op) => ops.push(op),
                 Effect::Route { ip, add } => routes.push((ip, 32, add)),
                 Effect::Block { dst, add } => routes.push((dst.network(), dst.prefix_len(), add)),
+                Effect::Route6 { net, add } => routes6.push((net.network(), net.prefix_len(), add)),
                 other => locked.push(other),
             }
         }
-        // The round's routes (/32 and routed blocks) in one go on the
-        // worker's own connection.
-        if let Some(s) = slow
-            && let Err(e) = s.prefixes(&routes)
-            && errors.len() < 100
-        {
-            errors.push(e.to_string());
+        // The round's routes (/32, routed blocks and IPv6 prefixes) in one
+        // go on the worker's own connection.
+        if let Some(s) = slow {
+            for r in [s.prefixes(&routes), s.routes6(&routes6)] {
+                if let Err(e) = r
+                    && errors.len() < 100
+                {
+                    errors.push(e.to_string());
+                }
+            }
         }
         if ops.is_empty() && locked.is_empty() {
             return;
@@ -511,7 +542,7 @@ mod linux {
                     let level = if error { "error" } else { "info" };
                     s.log_event(&["ppp", level], "pppoe", text, json!({}));
                 }
-                Effect::Xdp(_) | Effect::Route { .. } | Effect::Block { .. } => {}
+                Effect::Xdp(_) | Effect::Route { .. } | Effect::Block { .. } | Effect::Route6 { .. } => {}
             }
         }
         for err in s.ppp_address_lists(&lists) {
@@ -528,18 +559,17 @@ mod linux {
             let mut changed = before != self.ports.len();
             let mut infos = HashMap::new();
             for w in wanted {
-                let vlans = vlan_ids(w);
-                let untagged = w.pppoe_over_vlan_range.is_empty() || w.accept_untagged;
+                let listen = listens(w);
                 let same = self
                     .ports
                     .get(&w.name)
-                    .is_some_and(|o| o.vlans == vlans && o.untagged == untagged && o.port.name() == &w.interface);
+                    .is_some_and(|o| o.listen == listen && o.port.name() == &w.interface);
                 if !same {
                     self.ports.remove(&w.name);
                     changed = true;
-                    match PppoePort::open(&w.interface, &vlans, untagged) {
+                    match PppoePort::open_for(&w.interface, &listen) {
                         Ok(port) => {
-                            self.ports.insert(w.name.clone(), Open { port, vlans, untagged });
+                            self.ports.insert(w.name.clone(), Open { port, listen });
                         }
                         Err(e) => {
                             self.errors.push(format!("{}: {e}", w.interface));
@@ -622,7 +652,11 @@ mod linux {
 
         /// Every frame waiting, to the worker of its client's MAC; the slow
         /// path's packets to the worker holding the address.
-        fn receive(&mut self, routes: &super::super::pppoe_bng::Routes, framed: &corerouter_engine::framed::FramedTable) {
+        fn receive(
+            &mut self,
+            routes: &(super::super::pppoe_bng::Routes, super::super::pppoe_bng::Routes6),
+            framed: &corerouter_engine::framed::FramedTable,
+        ) {
             let lanes = u16::try_from(self.workers.len()).unwrap_or(1).max(1);
             let workers = &self.workers;
             let mut dropped = 0u64;
@@ -644,13 +678,19 @@ mod linux {
             }
             if let Some(s) = self.slow.as_mut()
                 && let Err(e) = s.recv(|p| {
-                    let dst = p.get(16..20).and_then(|d| <[u8; 4]>::try_from(d).ok());
-                    // The subscriber's /32, else a block routed to it.
-                    let lane = dst.and_then(|d| {
-                        let ip = std::net::Ipv4Addr::from(d);
-                        Bng::route_lane_in(routes, ip)
-                            .or_else(|| framed.holder_of(std::net::IpAddr::V4(ip)).map(|(_, h)| h.lane))
-                    });
+                    // IPv4 by its /32 (else a block routed to it), IPv6 by
+                    // the longest prefix (G4.3l).
+                    let lane = if p.first().is_some_and(|b| b >> 4 == 6) {
+                        let dst = p.get(24..40).and_then(|d| <[u8; 16]>::try_from(d).ok());
+                        dst.and_then(|d| Bng::route6_lane_in(&routes.1, std::net::Ipv6Addr::from(d)))
+                    } else {
+                        let dst = p.get(16..20).and_then(|d| <[u8; 4]>::try_from(d).ok());
+                        dst.and_then(|d| {
+                            let ip = std::net::Ipv4Addr::from(d);
+                            Bng::route_lane_in(&routes.0, ip)
+                                .or_else(|| framed.holder_of(std::net::IpAddr::V4(ip)).map(|(_, h)| h.lane))
+                        })
+                    };
                     if let Some(lane) = lane {
                         deliver(lane, Msg::Down(p.to_vec()));
                     }

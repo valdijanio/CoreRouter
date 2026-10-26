@@ -18,8 +18,10 @@ use corerouter_model::dhcp6_server::Ipv6Pool;
 use corerouter_model::radius::Attribute;
 use corerouter_proto_dhcp::server6::IaKind;
 use corerouter_proto_dhcp::sub6::{Event6, Grant6, Sub6, duid_ll};
+use corerouter_proto_pppoe::eth::Vlans;
 use corerouter_proto_pppoe::nd::{self, Inbound, PrefixInfo, RaConfig, RaTimer};
 use corerouter_proto_pppoe::timer::Millis;
+use corerouter_proto_pppoe::wire::Mac;
 use ipnet::Ipv6Net;
 
 /// RFC 4861 §6.2.1 defaults, shortened: MaxRtrAdvInterval 600 s (the
@@ -438,23 +440,43 @@ pub(crate) fn grant(
 pub(crate) fn frame(
     client: [u8; 6],
     server: [u8; 6],
-    vlan: Option<u16>,
+    vlans: Vlans,
     sid: u16,
     packet: &[u8],
 ) -> Vec<u8> {
-    let mut f = Vec::with_capacity(packet.len() + 26);
-    f.extend_from_slice(&client);
-    f.extend_from_slice(&server);
-    if let Some(v) = vlan {
-        f.extend_from_slice(&0x8100u16.to_be_bytes());
-        f.extend_from_slice(&(v & 0x0FFF).to_be_bytes());
-    }
-    f.extend_from_slice(&0x8864u16.to_be_bytes());
+    session_frame(
+        client,
+        server,
+        vlans,
+        sid,
+        corerouter_proto_pppoe::ppp::proto::IPV6,
+        packet,
+    )
+}
+
+/// A PPPoE session frame (RFC 2516 §4) to `client` carrying `packet` of
+/// PPP protocol `protocol`, inside the line's tags (G4.3l: two in QinQ).
+pub(crate) fn session_frame(
+    client: [u8; 6],
+    server: [u8; 6],
+    vlans: Vlans,
+    sid: u16,
+    protocol: u16,
+    packet: &[u8],
+) -> Vec<u8> {
+    let mut f = Vec::with_capacity(packet.len() + 30);
+    corerouter_proto_pppoe::eth::put_header(
+        &mut f,
+        Mac(client),
+        Mac(server),
+        vlans,
+        corerouter_proto_pppoe::eth::ETHERTYPE_SESSION,
+    );
     f.extend_from_slice(&[0x11, 0x00]);
     f.extend_from_slice(&sid.to_be_bytes());
     let len = u16::try_from(packet.len() + 2).unwrap_or(u16::MAX);
     f.extend_from_slice(&len.to_be_bytes());
-    f.extend_from_slice(&corerouter_proto_pppoe::ppp::proto::IPV6.to_be_bytes());
+    f.extend_from_slice(&protocol.to_be_bytes());
     f.extend_from_slice(packet);
     f
 }
@@ -681,7 +703,7 @@ mod tests {
         let f = frame(
             [2, 0, 0, 0, 0, 2],
             [2, 0, 0, 0, 0, 1],
-            Some(100),
+            Vlans::single(100),
             0x51,
             &[0x60; 40],
         );
@@ -694,5 +716,19 @@ mod tests {
             high64("2001:db8:1:2::/64".parse().unwrap()),
             [0x20, 1, 0xd, 0xb8, 0, 1, 0, 2]
         );
+        // G4.3l: QinQ, 802.1ad outside, 802.1Q inside.
+        let f = session_frame(
+            [2; 6],
+            [4; 6],
+            Vlans::qinq(120, 3044),
+            7,
+            0x0021,
+            &[0x45; 20],
+        );
+        assert_eq!(
+            &f[12..22],
+            &[0x88, 0xa8, 0, 120, 0x81, 0x00, 0x0b, 0xe4, 0x88, 0x64]
+        );
+        assert_eq!(&f[26..30], &[0, 22, 0x00, 0x21]);
     }
 }

@@ -15,6 +15,9 @@ mod pppoe_bng;
 #[path = "../src/service/pppoe_bng6.rs"]
 #[allow(dead_code)]
 mod pppoe_bng6;
+#[path = "../src/service/pppoe_slow6.rs"]
+#[allow(dead_code)]
+mod pppoe_slow6;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -245,6 +248,32 @@ fn bench(c: &mut Criterion) {
     g.sample_size(10);
     g.throughput(Throughput::Elements(1000));
     g.bench_function("setup_1000_sessions", |b| b.iter(|| sessions(1000, &snap)));
+    g.finish();
+    // G4.3l: the slow path's IPv6 lookup per packet down, with 100 000
+    // sessions (a /64 and a delegated /56 each): one hash probe per prefix
+    // length in use.
+    let mut ix = pppoe_slow6::Net6Index::default();
+    for i in 0..100_000u128 {
+        let p64 = std::net::Ipv6Addr::from((0x2001_0db8_0100u128 << 80) | (i << 64));
+        let pd = std::net::Ipv6Addr::from((0x2001_0db8_8000u128 << 80) | (i << 72));
+        ix.insert(ipnet::Ipv6Net::new(p64, 64).unwrap(), (0usize, i as u16));
+        ix.insert(ipnet::Ipv6Net::new(pd, 56).unwrap(), (0usize, i as u16));
+    }
+    let probes: Vec<std::net::Ipv6Addr> = (0..1024u128)
+        .map(|k| {
+            let i = (k * 7919) % 100_000;
+            if k % 2 == 0 {
+                std::net::Ipv6Addr::from((0x2001_0db8_0100u128 << 80) | (i << 64) | 0x77)
+            } else {
+                std::net::Ipv6Addr::from((0x2001_0db8_8000u128 << 80) | (i << 72) | (5 << 64) | 1)
+            }
+        })
+        .collect();
+    let mut g = c.benchmark_group("pppoe_slow6");
+    g.throughput(Throughput::Elements(probes.len() as u64));
+    g.bench_function("lookup_200k_prefixes", |b| {
+        b.iter(|| probes.iter().filter(|a| ix.get(**a).is_some()).count())
+    });
     g.finish();
 }
 

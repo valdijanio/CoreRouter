@@ -8,30 +8,37 @@
 //! No `unsafe`: sockets come from `socket2`, the address to bind from
 //! `getifaddrs` (`l2::if_info`).
 //!
-//! **VLANs without `PACKET_AUXDATA`.** The kernel strips an 802.1Q tag
-//! before a packet socket sees the frame (`skb_vlan_untag`, or the NIC),
-//! and the tag is only readable through `PACKET_AUXDATA`, a socket option
-//! with no safe binding. So `pppoe-over-vlan-range` opens one socket per
-//! VLAN id and protocol, each with a classic BPF filter that keeps only
-//! its VLAN (`SKF_AD_VLAN_TAG`); the socket a frame came from says its
-//! VLAN, and the tag goes back in-band before `proto-pppoe` reads it.
-//! Sockets bound to a protocol run their filter only on PPPoE frames, and
-//! they never see what the host sends. QinQ (two tags) is not read here:
-//! the XDP data plane handles it, the slow path does not (G4.3d gap).
+//! **VLANs without `PACKET_AUXDATA`.** The kernel takes the outer tag off
+//! a frame before a packet socket sees it (`skb_vlan_untag`, or the NIC)
+//! and keeps it next to the frame; the tag is only readable through
+//! `PACKET_AUXDATA`, a socket option with no safe binding. So a port opens
+//! one socket per outer VLAN id ([`Listen`]), each with a classic BPF
+//! filter that keeps only its VLAN and TPID (`SKF_AD_VLAN_TAG`,
+//! `SKF_AD_VLAN_TPID`); the socket a frame came from says its outer tag,
+//! which goes back in-band before `proto-pppoe` reads it. A second tag
+//! (QinQ, G4.3l) is never taken off: it stays in the frame.
 //!
-//! **Slow path.** Upstream, a subscriber's IPv4 packet (already
-//! decapsulated and checked by the service) is sent through a raw IPv4
-//! socket (`IPPROTO_RAW`: the kernel routes it as the host's own, so
+//! The sockets are bound to every protocol (`ETH_P_ALL`): one bound to
+//! 0x8863 gets its frames only after the kernel has cleared the tag (a
+//! frame of VLAN 100 reached the untagged socket as untagged, and the VLAN
+//! socket nothing — measured on veth, 2026-10-26, G4.3l), and a QinQ
+//! frame is 0x8100 there, not 0x8863. The filter keeps the two PPPoE
+//! EtherTypes and drops what the host sends.
+//!
+//! **Slow path.** Upstream, a subscriber's IPv4 or IPv6 packet (already
+//! decapsulated and checked by the service) is sent through a raw socket
+//! of its family (`IPPROTO_RAW`: the kernel routes it as the host's own, so
 //! `forward` rules do not see it; the output and postrouting chains,
 //! CGNAT included, do). Downstream, every subscriber address gets a /32
-//! route through a `dummy` device (`bng0`, created if missing); the
+//! route (and every /64 and delegated IPv6 prefix, G4.3l) through a
+//! `dummy` device (`bng0`, created if missing); the
 //! service reads what the kernel sends there with a packet socket (the
 //! dummy drops the frame, the tap sees it first) and encapsulates it to
 //! the subscriber. The production path is XDP plus G4.3ca (a tc program
 //! on `bng0`); this one is correct, not fast.
 
 use std::io::{self, IoSliceMut};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use corerouter_model::IfName;
@@ -44,7 +51,7 @@ use crate::l2::{if_info, io_err};
 pub const ETH_P_PPP_DISC: u16 = 0x8863;
 pub const ETH_P_PPP_SES: u16 = 0x8864;
 const ETH_P_ALL: u16 = 0x0003;
-/// Sockets one port may open (two per VLAN id): a range of 1-4094 would be
+/// Sockets one port may open (one per outer VLAN id): a range of 1-4094 would be
 /// 8188 descriptors; the XDP path is the answer for that.
 pub const MAX_VLAN_IDS: usize = 512;
 /// Largest frame read (jumbo PPPoE is RFC 4638: 1508 + tags).
@@ -58,6 +65,7 @@ const PACKET_OUTGOING: u8 = 4;
 
 // Classic BPF (linux/filter.h).
 const LD_W_ABS: u16 = 0x20;
+const LD_H_ABS: u16 = 0x28;
 const ALU_AND_K: u16 = 0x54;
 const JEQ_K: u16 = 0x15;
 const RET_K: u16 = 0x06;
@@ -65,44 +73,92 @@ const SKF_AD_OFF: u32 = 0xFFFF_F000;
 const SKF_AD_VLAN_TAG: u32 = 44;
 const SKF_AD_VLAN_TAG_PRESENT: u32 = 48;
 const SKF_AD_PKTTYPE: u32 = 4;
+const SKF_AD_VLAN_TPID: u32 = 60;
+const TPID_8021Q: u16 = 0x8100;
 const ACCEPT: u32 = 0x0004_0000;
 
 /// One classic BPF instruction: code, jt, jf, k.
 type Ins = (u16, u8, u8, u32);
 
-/// The filter of one socket: `vlan` = `None` keeps untagged frames only,
-/// `Some(vid)` keeps frames whose stripped tag has that VLAN id. The copies
-/// of what this host sends (`PACKET_OUTGOING`) never reach the BNG: on an
-/// access port they are its own PADOs, PADSs and session frames, and with
-/// the workers' filters they would all land on the worker of the BNG's MAC.
-fn program(vlan: Option<u16>) -> Vec<Ins> {
-    let mut p = vec![
-        (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_PKTTYPE),
-        (JEQ_K, 0, 1, u32::from(PACKET_OUTGOING)),
-        (RET_K, 0, 0, 0),
-    ];
-    p.extend(by_vlan(vlan));
-    p
+/// What one socket of a port keeps (G4.3l): untagged PPPoE, PPPoE in one
+/// 802.1Q VLAN, or PPPoE inside two tags whose outer one (the S-tag, this
+/// TPID) is `outer` and whose inner one (802.1Q) stays in the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Listen {
+    Untagged,
+    Vlan(u16),
+    Stacked { outer: u16, tpid: u16 },
 }
 
-fn by_vlan(vlan: Option<u16>) -> Vec<Ins> {
-    match vlan {
-        None => vec![
-            (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT),
-            (JEQ_K, 0, 1, 0),
-            (RET_K, 0, 0, ACCEPT),
-            (RET_K, 0, 0, 0),
-        ],
-        Some(vid) => vec![
-            (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT),
-            (JEQ_K, 0, 4, 1),
-            (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TAG),
-            (ALU_AND_K, 0, 0, 0x0FFF),
-            (JEQ_K, 0, 1, u32::from(vid)),
-            (RET_K, 0, 0, ACCEPT),
-            (RET_K, 0, 0, 0),
-        ],
+/// The filter of one socket. The kernel takes the outer tag off before a
+/// packet socket sees the frame (`skb_vlan_untag`) and keeps it next to the
+/// frame, where the filter reads it (`SKF_AD_VLAN_TAG*`); a second tag
+/// stays in the frame. The copies of what this host sends
+/// (`PACKET_OUTGOING`) never reach the BNG: on an access port they are its
+/// own PADOs, PADSs and session frames.
+fn program(listen: Listen) -> Vec<Ins> {
+    // Accept and drop are the last two instructions; jumps count to them.
+    let mut p: Vec<Ins> = vec![
+        (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_PKTTYPE),
+        (JEQ_K, DROP, 0, u32::from(PACKET_OUTGOING)),
+        (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT),
+    ];
+    match listen {
+        Listen::Untagged => p.push((JEQ_K, 0, DROP, 0)),
+        Listen::Vlan(vid) | Listen::Stacked { outer: vid, .. } => {
+            let tpid = match listen {
+                Listen::Stacked { tpid, .. } => tpid,
+                _ => TPID_8021Q,
+            };
+            p.extend([
+                (JEQ_K, 0, DROP, 1),
+                (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TAG),
+                (ALU_AND_K, 0, 0, 0x0FFF),
+                (JEQ_K, 0, DROP, u32::from(vid)),
+                (LD_W_ABS, 0, 0, SKF_AD_OFF + SKF_AD_VLAN_TPID),
+                (JEQ_K, 0, DROP, u32::from(tpid)),
+            ]);
+        }
     }
+    // The EtherType: at 12, or at 16 behind the inner 802.1Q tag.
+    if matches!(listen, Listen::Stacked { .. }) {
+        p.extend([
+            (LD_H_ABS, 0, 0, 12),
+            (JEQ_K, 0, DROP, u32::from(TPID_8021Q)),
+            (LD_H_ABS, 0, 0, 16),
+        ]);
+    } else {
+        p.push((LD_H_ABS, 0, 0, 12));
+    }
+    p.extend([
+        (JEQ_K, TO_ACCEPT, 0, u32::from(ETH_P_PPP_DISC)),
+        (JEQ_K, 0, DROP, u32::from(ETH_P_PPP_SES)),
+        (RET_K, 0, 0, ACCEPT),
+        (RET_K, 0, 0, 0),
+    ]);
+    resolve(p)
+}
+
+/// Jump placeholders of [`program`]: to the drop (last) and to the accept
+/// (the one before), turned into offsets by [`resolve`].
+const DROP: u8 = 0xFF;
+const TO_ACCEPT: u8 = 0xFE;
+
+fn resolve(mut p: Vec<Ins>) -> Vec<Ins> {
+    let n = p.len();
+    for (i, ins) in p.iter_mut().enumerate() {
+        let to = |j: u8| -> u8 {
+            let target = match j {
+                DROP => n.saturating_sub(1),
+                TO_ACCEPT => n.saturating_sub(2),
+                j => return j,
+            };
+            u8::try_from(target.saturating_sub(i + 1)).unwrap_or(0)
+        };
+        ins.1 = to(ins.1);
+        ins.2 = to(ins.2);
+    }
+    p
 }
 
 /// The filter of the slow path's tap on `bng0`: only what the host sends.
@@ -136,7 +192,7 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
 
 struct Side {
     sock: Socket,
-    vlan: Option<u16>,
+    listen: Listen,
     /// Frames the kernel dropped on this socket so far (`SO_RXQ_OVFL`).
     dropped: u32,
 }
@@ -166,12 +222,23 @@ impl PppoePort {
     /// Open `name` for PPPoE: untagged frames when `untagged`, and those of
     /// every VLAN id in `vlans` (at most [`MAX_VLAN_IDS`]).
     pub fn open(name: &IfName, vlans: &[u16], untagged: bool) -> io::Result<Self> {
-        if vlans.len() > MAX_VLAN_IDS {
+        let listen: Vec<Listen> = untagged
+            .then_some(Listen::Untagged)
+            .into_iter()
+            .chain(vlans.iter().map(|v| Listen::Vlan(*v)))
+            .collect();
+        Self::open_for(name, &listen)
+    }
+
+    /// Open `name` for PPPoE with one socket per [`Listen`] (at most
+    /// [`MAX_VLAN_IDS`]).
+    pub fn open_for(name: &IfName, listen: &[Listen]) -> io::Result<Self> {
+        if listen.len() > MAX_VLAN_IDS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "{} VLAN ids on {name}: at most {MAX_VLAN_IDS} without the XDP data plane",
-                    vlans.len()
+                    "{} VLAN ids on {name}: at most {MAX_VLAN_IDS} (one socket each)",
+                    listen.len()
                 ),
             ));
         }
@@ -179,18 +246,12 @@ impl PppoePort {
         let ifindex = u32::try_from(info.link.ifindex())
             .map_err(|_| io::Error::other(format!("{name}: interface index out of range")))?;
         let mut sides = Vec::new();
-        let wanted = untagged
-            .then_some(None)
-            .into_iter()
-            .chain(vlans.iter().map(|v| Some(*v)));
-        for vlan in wanted {
-            for proto in [ETH_P_PPP_DISC, ETH_P_PPP_SES] {
-                sides.push(Side {
-                    sock: bound(&info.link, proto, &program(vlan))?,
-                    vlan,
-                    dropped: 0,
-                });
-            }
+        for &l in listen {
+            sides.push(Side {
+                sock: bound(&info.link, ETH_P_ALL, &program(l))?,
+                listen: l,
+                dropped: 0,
+            });
         }
         // Sending needs no filter; a socket that reads nothing (protocol 0).
         let tx = Socket::new(Domain::PACKET, Type::RAW, None)?;
@@ -281,21 +342,25 @@ impl PppoePort {
                     continue;
                 };
                 total += 1;
-                match side.vlan {
-                    None => f(frame),
-                    Some(vid) => {
-                        // dst, src, 0x8100, TCI, then the rest.
-                        let (Some(macs), Some(rest)) = (frame.get(..12), frame.get(12..)) else {
-                            continue;
-                        };
-                        framed.clear();
-                        framed.extend_from_slice(macs);
-                        framed.extend_from_slice(&0x8100u16.to_be_bytes());
-                        framed.extend_from_slice(&(vid & 0x0FFF).to_be_bytes());
-                        framed.extend_from_slice(rest);
-                        f(&framed);
+                let (tpid, vid) = match side.listen {
+                    Listen::Untagged => {
+                        f(frame);
+                        continue;
                     }
-                }
+                    Listen::Vlan(vid) => (TPID_8021Q, vid),
+                    Listen::Stacked { outer, tpid } => (tpid, outer),
+                };
+                // dst, src, the outer tag back, then the rest (a QinQ
+                // frame's inner tag is still there).
+                let (Some(macs), Some(rest)) = (frame.get(..12), frame.get(12..)) else {
+                    continue;
+                };
+                framed.clear();
+                framed.extend_from_slice(macs);
+                framed.extend_from_slice(&tpid.to_be_bytes());
+                framed.extend_from_slice(&(vid & 0x0FFF).to_be_bytes());
+                framed.extend_from_slice(rest);
+                f(&framed);
             }
         }
         Ok(total)
@@ -342,6 +407,7 @@ pub const SLOW_DEVICE: &str = "bng0";
 /// The slow path (see the module docs).
 pub struct SlowPath {
     raw: Socket,
+    raw6: Socket,
     tap: Socket,
     ifindex: u32,
     buf: Vec<u8>,
@@ -357,6 +423,9 @@ impl SlowPath {
         let info = if_info(&name)?;
         let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(255)))?;
         raw.set_nonblocking(true)?;
+        // IPPROTO_RAW on IPv6 sends the header as given (IPV6_HDRINCL).
+        let raw6 = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::from(255)))?;
+        raw6.set_nonblocking(true)?;
         let proto = Protocol::from(i32::from(ETH_P_ALL.to_be()));
         let tap = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
         tap.set_nonblocking(true)?;
@@ -365,6 +434,7 @@ impl SlowPath {
         bind(tap.as_raw_fd(), &info.link).map_err(io_err)?;
         Ok(Self {
             raw,
+            raw6,
             tap,
             ifindex,
             buf: vec![0u8; FRAME_MAX],
@@ -375,13 +445,14 @@ impl SlowPath {
         self.tap.as_fd()
     }
 
-    /// Send a subscriber's IPv4 packet (header included) into the stack.
+    /// Send a subscriber's IPv4 or IPv6 packet (header included) into the
+    /// stack.
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        inject(&self.raw, packet)
+        inject(&self.raw, &self.raw6, packet)
     }
 
-    /// IPv4 packets the kernel routed to a subscriber (`bng0`), without
-    /// their Ethernet header; `f` gets each.
+    /// IPv4 and IPv6 packets the kernel routed to a subscriber (`bng0`),
+    /// without their Ethernet header; `f` gets each.
     pub fn recv(&mut self, mut f: impl FnMut(&[u8])) -> io::Result<usize> {
         let mut total = 0;
         for _ in 0..BUDGET {
@@ -400,8 +471,8 @@ impl SlowPath {
             let Some(frame) = self.buf.get(..len) else {
                 continue;
             };
-            // Ethernet II, IPv4 only (IPv6 per subscriber is G4.3e).
-            if frame.get(12..14) == Some(&[0x08, 0x00])
+            // Ethernet II, IPv4 or IPv6 (G4.3l).
+            if matches!(frame.get(12..14), Some([0x08, 0x00] | [0x86, 0xdd]))
                 && let Some(ip) = frame.get(14..)
             {
                 total += 1;
@@ -432,6 +503,7 @@ impl SlowPath {
         })?;
         Ok(SlowTx {
             raw: self.raw.try_clone()?,
+            raw6: self.raw6.try_clone()?,
             ifindex: self.ifindex,
             rt,
             handle,
@@ -443,6 +515,7 @@ impl SlowPath {
 /// `/32` routes to `bng0`.
 pub struct SlowTx {
     raw: Socket,
+    raw6: Socket,
     ifindex: u32,
     rt: tokio::runtime::Runtime,
     handle: rtnetlink::Handle,
@@ -450,7 +523,45 @@ pub struct SlowTx {
 
 impl SlowTx {
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        inject(&self.raw, packet)
+        inject(&self.raw, &self.raw6, packet)
+    }
+
+    /// Add (`true`) or remove these IPv6 routes to `bng0` (a session's /64
+    /// and delegated prefix, G4.3l), all in one round. The first error is
+    /// returned; the rest still run.
+    pub fn routes6(&self, ops: &[(Ipv6Addr, u8, bool)]) -> io::Result<()> {
+        use rtnetlink::RouteMessageBuilder;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let ifindex = self.ifindex;
+        self.rt.block_on(async {
+            let calls = ops.iter().map(|&(net, len, add)| {
+                let h = self.handle.clone();
+                async move {
+                    let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+                        .destination_prefix(net, len)
+                        .output_interface(ifindex)
+                        .build();
+                    let out = if add {
+                        h.route().add(msg).replace().execute().await
+                    } else {
+                        h.route().del(msg).execute().await
+                    };
+                    match out {
+                        Ok(()) => Ok(()),
+                        Err(rtnetlink::Error::NetlinkError(e)) if !add && e.raw_code() == -3 => {
+                            Ok(())
+                        }
+                        Err(e) => Err(io::Error::other(format!(
+                            "route {net}/{len} via {SLOW_DEVICE}: {e}"
+                        ))),
+                    }
+                }
+            });
+            let results = futures_util::future::join_all(calls).await;
+            results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        })
     }
 
     /// Add (`true`) or remove these `/32` routes, all in one round on the
@@ -498,8 +609,16 @@ impl SlowTx {
     }
 }
 
-/// A subscriber's IPv4 packet (header included) into the stack.
-fn inject(raw: &Socket, packet: &[u8]) -> io::Result<()> {
+/// A subscriber's IPv4 or IPv6 packet (header included) into the stack.
+fn inject(raw: &Socket, raw6: &Socket, packet: &[u8]) -> io::Result<()> {
+    if packet.first().is_some_and(|b| b >> 4 == 6) {
+        let dst = packet
+            .get(24..40)
+            .and_then(|d| <[u8; 16]>::try_from(d).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "short IPv6 packet"))?;
+        let to = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(dst), 0, 0, 0));
+        return raw6.send_to(packet, &to.into()).map(|_| ());
+    }
     let Some(dst) = packet.get(16..20) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -595,28 +714,39 @@ fn route(ifindex: u32, ip: Ipv4Addr, add: bool) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// The kernel's interpreter for the few opcodes used, with the
-    /// ancillary values given.
-    fn run(p: &[Ins], tag: Option<u16>, pkttype: u8) -> u32 {
-        run_frame(p, tag, pkttype, &[])
+    /// A frame as the socket sees it: the outer tag (TPID, VID) off the
+    /// frame, the rest in it.
+    struct Seen<'a> {
+        tag: Option<(u16, u16)>,
+        pkttype: u8,
+        frame: &'a [u8],
     }
 
-    fn run_frame(p: &[Ins], tag: Option<u16>, pkttype: u8, frame: &[u8]) -> u32 {
+    /// The kernel's interpreter for the few opcodes used.
+    fn run(p: &[Ins], s: &Seen<'_>) -> u32 {
         let mut a = 0u32;
         let mut pc = 0usize;
         while let Some(&(code, jt, jf, k)) = p.get(pc) {
             pc += 1;
             match code {
                 LD_W_ABS if k == SKF_AD_OFF + SKF_AD_VLAN_TAG_PRESENT => {
-                    a = u32::from(tag.is_some())
+                    a = u32::from(s.tag.is_some())
                 }
+                // The PCP bits come along: the filter must mask them off.
                 LD_W_ABS if k == SKF_AD_OFF + SKF_AD_VLAN_TAG => {
-                    a = u32::from(tag.unwrap_or(0)) | 0x2000
+                    a = s.tag.map_or(0, |t| u32::from(t.1) | 0x2000)
                 }
-                LD_W_ABS if k == SKF_AD_OFF + SKF_AD_PKTTYPE => a = u32::from(pkttype),
-                LD_W_ABS if k < SKF_AD_OFF => {
+                LD_W_ABS if k == SKF_AD_OFF + SKF_AD_VLAN_TPID => {
+                    a = s.tag.map_or(0, |t| u32::from(t.0))
+                }
+                LD_W_ABS if k == SKF_AD_OFF + SKF_AD_PKTTYPE => a = u32::from(s.pkttype),
+                LD_H_ABS => {
                     let i = k as usize;
-                    a = u32::from_be_bytes([frame[i], frame[i + 1], frame[i + 2], frame[i + 3]]);
+                    // A load past the end ends the program with 0 (drop).
+                    let (Some(x), Some(y)) = (s.frame.get(i), s.frame.get(i + 1)) else {
+                        return 0;
+                    };
+                    a = u32::from(u16::from_be_bytes([*x, *y]));
                 }
                 ALU_AND_K => a &= k,
                 JEQ_K => pc += usize::from(if a == k { jt } else { jf }),
@@ -627,38 +757,171 @@ mod tests {
         panic!("fell off the end")
     }
 
-    /// G4.3g: every frame passes the filter of exactly one worker, the one
-    /// [`lane_of`] names, and the VLAN test still applies behind it.
+    /// dst, src, then `rest` (the EtherType, maybe after an inner tag).
+    fn frame(rest: &[u8]) -> Vec<u8> {
+        let mut f = vec![0xff; 6];
+        f.extend_from_slice(&[2, 0, 0, 0, 0, 9]);
+        f.extend_from_slice(rest);
+        f.resize(60, 0);
+        f
+    }
+
+    const DISC: [u8; 2] = [0x88, 0x63];
+    const SES: [u8; 2] = [0x88, 0x64];
+    const IPV4: [u8; 2] = [0x08, 0x00];
+
+    fn inner(vid: u16, et: [u8; 2]) -> Vec<u8> {
+        let mut v = vec![0x81, 0x00];
+        v.extend_from_slice(&vid.to_be_bytes());
+        v.extend_from_slice(&et);
+        v
+    }
+
+    fn keeps(l: Listen, tag: Option<(u16, u16)>, rest: &[u8]) -> bool {
+        let f = frame(rest);
+        run(
+            &program(l),
+            &Seen {
+                tag,
+                pkttype: 0,
+                frame: &f,
+            },
+        ) == ACCEPT
+    }
+
     #[test]
-    fn each_socket_keeps_only_its_vlan() {
-        let untagged = program(None);
-        assert_eq!(run(&untagged, None, 0), ACCEPT);
-        assert_eq!(run(&untagged, Some(100), 0), 0);
-        let v100 = program(Some(100));
-        assert_eq!(
-            run(&v100, Some(100), 0),
-            ACCEPT,
-            "priority bits are masked off"
+    fn each_socket_keeps_only_pppoe_of_its_tags() {
+        let q100 = Some((TPID_8021Q, 100));
+        let s200 = Some((0x88a8, 200));
+        // Untagged: no tag, PPPoE only.
+        assert!(keeps(Listen::Untagged, None, &DISC));
+        assert!(keeps(Listen::Untagged, None, &SES));
+        assert!(!keeps(Listen::Untagged, None, &IPV4));
+        assert!(
+            !keeps(Listen::Untagged, q100, &DISC),
+            "a tagged frame is not untagged"
         );
-        assert_eq!(run(&v100, Some(101), 0), 0);
-        assert_eq!(run(&v100, None, 0), 0);
+        // One 802.1Q tag.
+        assert!(keeps(Listen::Vlan(100), q100, &DISC));
+        assert!(keeps(Listen::Vlan(100), q100, &SES));
+        assert!(!keeps(Listen::Vlan(100), Some((TPID_8021Q, 101)), &DISC));
+        assert!(!keeps(Listen::Vlan(100), None, &DISC));
+        assert!(
+            !keeps(Listen::Vlan(100), Some((0x88a8, 100)), &DISC),
+            "802.1Q only"
+        );
+        assert!(
+            !keeps(Listen::Vlan(100), q100, &inner(7, DISC)),
+            "QinQ is not single-tagged PPPoE"
+        );
+        // Two tags: the S-tag's VID and TPID, then an 802.1Q tag in the
+        // frame and PPPoE behind it.
+        let st = Listen::Stacked {
+            outer: 200,
+            tpid: 0x88a8,
+        };
+        assert!(keeps(st, s200, &inner(3044, DISC)));
+        assert!(keeps(st, s200, &inner(1, SES)));
+        assert!(!keeps(st, s200, &inner(3044, IPV4)));
+        assert!(!keeps(st, s200, &DISC), "one tag only");
+        assert!(
+            !keeps(st, Some((TPID_8021Q, 200)), &inner(3044, DISC)),
+            "wrong TPID"
+        );
+        assert!(!keeps(st, Some((0x88a8, 201)), &inner(3044, DISC)));
+        let q_in_q = Listen::Stacked {
+            outer: 200,
+            tpid: TPID_8021Q,
+        };
+        assert!(keeps(q_in_q, Some((TPID_8021Q, 200)), &inner(3044, DISC)));
     }
 
     #[test]
     fn the_ports_never_read_back_what_the_bng_sent() {
-        for vlan in [None, Some(100)] {
+        for (l, tag, rest) in [
+            (Listen::Untagged, None, DISC.to_vec()),
+            (Listen::Vlan(100), Some((TPID_8021Q, 100)), SES.to_vec()),
+            (
+                Listen::Stacked {
+                    outer: 9,
+                    tpid: 0x88a8,
+                },
+                Some((0x88a8, 9)),
+                inner(5, DISC),
+            ),
+        ] {
+            let f = frame(&rest);
             assert_eq!(
-                run_frame(&program(vlan), vlan, PACKET_OUTGOING, &[0u8; 60]),
+                run(
+                    &program(l),
+                    &Seen {
+                        tag,
+                        pkttype: PACKET_OUTGOING,
+                        frame: &f
+                    }
+                ),
                 0
             );
-            assert_eq!(run_frame(&program(vlan), vlan, 0, &[0u8; 60]), ACCEPT);
+            assert_eq!(
+                run(
+                    &program(l),
+                    &Seen {
+                        tag,
+                        pkttype: 0,
+                        frame: &f
+                    }
+                ),
+                ACCEPT
+            );
         }
+    }
+
+    /// A short frame (the load at 16 past the end) is dropped, as the
+    /// kernel does.
+    #[test]
+    fn a_short_frame_is_dropped() {
+        let p = program(Listen::Stacked {
+            outer: 9,
+            tpid: 0x88a8,
+        });
+        let f = [0u8; 14];
+        assert_eq!(
+            run(
+                &p,
+                &Seen {
+                    tag: Some((0x88a8, 9)),
+                    pkttype: 0,
+                    frame: &f
+                }
+            ),
+            0
+        );
     }
 
     #[test]
     fn the_tap_keeps_only_outgoing_frames() {
         let p = outgoing_only();
-        assert_eq!(run(&p, None, PACKET_OUTGOING), ACCEPT);
-        assert_eq!(run(&p, None, 0), 0);
+        assert_eq!(
+            run(
+                &p,
+                &Seen {
+                    tag: None,
+                    pkttype: PACKET_OUTGOING,
+                    frame: &[]
+                }
+            ),
+            ACCEPT
+        );
+        assert_eq!(
+            run(
+                &p,
+                &Seen {
+                    tag: None,
+                    pkttype: 0,
+                    frame: &[]
+                }
+            ),
+            0
+        );
     }
 }

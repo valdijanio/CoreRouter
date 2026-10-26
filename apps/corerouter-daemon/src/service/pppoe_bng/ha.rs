@@ -442,6 +442,17 @@ impl Bng {
                 Some((route.parse::<FramedRoute>().ok()?, origin_of(origin)))
             })
             .collect();
+        let vlans = Vlans {
+            outer: r.vlan & 0x0fff,
+            inner: r.inner_vlan & 0x0fff,
+            outer_tpid: r.outer_tpid,
+        };
+        let circuit_id = r.circuit_id.as_deref().map(|c| String::from_utf8_lossy(c).into_owned());
+        // The same NAS-Port-Id as the node that opened it (`up` in pppoe_bng.rs).
+        let nas_port_id = match &circuit_id {
+            Some(c) if self.cfg.ppp.aaa.use_circuit_id_in_nas_port_id => c.clone(),
+            _ => nas_port(&interface, vlans),
+        };
         let sub = Sub {
             slot: i,
             sref,
@@ -466,12 +477,10 @@ impl Bng {
             prev: (r.counters.rx_bytes, r.counters.tx_bytes, now),
             list_at: now,
             idle_since: now,
-            descriptor_vlan: (d.vlan != 0).then_some(d.vlan & 0x0fff),
+            vlans,
+            nas_port_id,
             auth_cancel: None,
-            circuit_id: r
-                .circuit_id
-                .as_deref()
-                .map(|c| String::from_utf8_lossy(c).into_owned()),
+            circuit_id,
             remote_id: r
                 .remote_id
                 .as_deref()
@@ -545,7 +554,8 @@ impl Bng {
             session_id: sref.sid,
             server: server.clone(),
             interface: interface.clone(),
-            vlan: sub.descriptor_vlan,
+            vlan: (sub.vlans.outer != 0).then_some(sub.vlans.outer),
+            inner_vlan: (sub.vlans.inner != 0).then_some(sub.vlans.inner),
             circuit_id: sub.circuit_id.clone(),
             remote_id: sub.remote_id.clone(),
             rate_limit: sub.rate.clone(),
@@ -623,7 +633,7 @@ impl Bng {
                 terminate_cause: None,
                 interim_secs: interim,
                 attributes: {
-                    let mut at = acct_attributes(ip, &mac, &interface);
+                    let mut at = acct_attributes(ip, &mac, sub);
                     at.extend(v6_attrs);
                     at.extend(route_attributes(&adm.routes));
                     at

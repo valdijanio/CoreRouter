@@ -166,8 +166,11 @@ impl Lab {
                         self.by_mac.get(&dst).copied().into_iter().collect()
                     };
                     for c in targets {
-                        if f.len() > 22 && f[12..14] == [0x88, 0x64] && f[20..22] == [0x00, 0x57] {
-                            self.v6[c].push(f[22..].to_vec());
+                        // IPv6 to the client (any tags): kept for the test.
+                        if let Ok(sf) = corerouter_proto_pppoe::ppp::parse_session(&f)
+                            && sf.protocol == 0x0057
+                        {
+                            self.v6[c].push(sf.info.to_vec());
                             continue;
                         }
                         self.clients[c].handle_frame(self.now, &f, &mut out);
@@ -476,17 +479,23 @@ fn slow_path_carries_ipv4_both_ways() {
 #[derive(Default)]
 struct FakeAaa {
     accts: Mutex<Vec<AcctRequest>>,
+    asked: Mutex<Vec<AuthRequest>>,
 }
 
 impl AaaBackend for FakeAaa {
     fn authenticate(&self, req: AuthRequest, done: AuthDone) {
+        self.asked.lock().unwrap().push(req.clone());
         let ok = matches!(&req.credentials, corerouter_model::radius::Credentials::Chap { .. } | corerouter_model::radius::Credentials::MsChapV2 { .. } | corerouter_model::radius::Credentials::Pap { .. })
             && req.user.starts_with("r");
         let mut reply = AuthReply::failed(if ok { AuthOutcome::Accept } else { AuthOutcome::Reject }, "");
         reply.message = None;
         if ok {
             reply.attributes = vec![
-                Attribute::new("Framed-IP-Address", "100.65.0.9"),
+                // One address per login: `r3` gets .12, `radius-user` .9.
+                Attribute::new(
+                    "Framed-IP-Address",
+                    format!("100.65.0.{}", 9 + req.user.trim_start_matches(|c: char| !c.is_ascii_digit()).parse::<u8>().unwrap_or(0)),
+                ),
                 Attribute::new("Mikrotik-Rate-Limit", "5M/25M"),
             ];
         } else {
@@ -1414,4 +1423,152 @@ fn service_names_choose_the_profile_and_drop_rows_get_nothing() {
         let (profile, rate) = if want == "iptv" { ("tv", "5M/20M") } else { ("default", "10M/50M") };
         assert_eq!((a.profile.as_str(), a.rate_limit.as_deref()), (profile, Some(rate)), "{a:?}");
     }
+}
+
+/// G4.3l: QinQ (802.1ad 100-101 outside, any C-tag inside), one session
+/// per line (TR-101 1:1): the second CPE on a line gets nothing; RADIUS
+/// gets the line in NAS-Port-Id (`ether2:<s>-<c>`) and the TR-101 ids;
+/// the slow path answers inside both tags.
+#[test]
+fn qinq_lines_one_session_each_with_tr101_to_radius() {
+    use corerouter_proto_pppoe::eth::Vlans;
+    let aaa = Arc::new(FakeAaa::default());
+    let srv = server(serde_json::json!({
+        "authentication": ["pap"], "vlan_mode": "stacked", "outer_vlan_range": ["100-101"],
+        "accept_untagged": false, "max_sessions_per_vlan": 1
+    }));
+    let mut s = snap(0, srv, 10);
+    s.ppp.aaa.use_radius = true;
+    s.ppp.aaa.accounting = true;
+    s.aaa = Some(aaa.clone());
+    // Clients 0..3 on lines (100,10) (101,11) (100,12); client 3 on line (100,10) too.
+    let line = |i: usize| match i {
+        3 => Vlans::qinq(100, 10),
+        i => Vlans::qinq(100 + (i % 2) as u16, 10 + i as u16),
+    };
+    let mut lab = Lab::with(4, s, |i| (format!("r{i}"), "x".into()), |i, c| {
+        c.vlans = line(i);
+        c.auth = corerouter_proto_pppoe::layers::AuthSet::new(&[corerouter_proto_pppoe::lcp::AuthProto::Pap]);
+        c.circuit_id = Some(format!("olt1 pon 0/1/{i}").into_bytes());
+        c.remote_id = Some(format!("cliente-{i}").into_bytes());
+        c.discovery_attempts = 3;
+    });
+    lab.start(0..4);
+    lab.run(400, 50);
+    assert_eq!(lab.ups(), 3, "one session per line");
+    assert!(lab.up[0] ^ lab.up[3], "line (100,10) has one of its two CPEs");
+    let active = lab.backend().active();
+    for a in &active {
+        let i: usize = a.name[1..].parse().unwrap();
+        let v = line(i);
+        assert_eq!((a.vlan, a.inner_vlan), (Some(v.outer), Some(v.inner)), "{a:?}");
+        assert_eq!(a.circuit_id.as_deref(), Some(format!("olt1 pon 0/1/{i}").as_str()));
+    }
+    let asked = aaa.asked.lock().unwrap().clone();
+    let a0 = asked.iter().find(|r| r.user == "r1").unwrap();
+    assert_eq!(a0.nas_port_id.as_deref(), Some("ether2:101-11"));
+    let has = |attrs: &[Attribute], k: &str, v: &str| attrs.iter().any(|a| a.name == k && a.value == v);
+    assert!(has(&a0.attributes, "ADSL-Agent-Circuit-Id", "olt1 pon 0/1/1"), "{:?}", a0.attributes);
+    assert!(has(&a0.attributes, "ADSL-Agent-Remote-Id", "cliente-1"));
+    let accts = aaa.accts.lock().unwrap().clone();
+    let start = accts.iter().find(|r| r.user == "r1").unwrap();
+    assert!(has(&start.attributes, "NAS-Port-Id", "ether2:101-11"), "{:?}", start.attributes);
+    assert!(has(&start.attributes, "ADSL-Agent-Circuit-Id", "olt1 pon 0/1/1"));
+    // Downstream on the slow path: back inside 802.1ad 101 + 802.1Q 11.
+    let r1 = active.iter().find(|a| a.name == "r1").unwrap();
+    let ip = r1.address.unwrap();
+    let mut back = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 8, 8, 8, 8];
+    back.extend_from_slice(&ip.octets());
+    lab.bng.frames.clear();
+    lab.bng.data_down(&back);
+    let (_, f) = lab.bng.frames.pop().unwrap();
+    assert_eq!(&f[12..22], &[0x88, 0xa8, 0, 101, 0x81, 0x00, 0, 11, 0x88, 0x64]);
+    assert_eq!(&f[30..], &back[..]);
+    lab.bng.check().unwrap();
+}
+
+/// G4.3l: IPv6 on the slow path, inside two tags. A packet from the
+/// session's /64 or delegated prefix goes up to the stack; a spoofed one
+/// does not; a link-local one stays with the control plane; the kernel's
+/// packet to the prefix comes back inside the line's tags. The prefixes'
+/// routes to `bng0` come and go with the session.
+#[test]
+fn ipv6_on_the_slow_path_inside_qinq() {
+    use corerouter_proto_pppoe::eth::Vlans;
+    let mut s = dual(1);
+    s.ppp.pppoe_servers[0] = server(serde_json::json!({"vlan_mode": "stacked", "outer_vlan_range": ["300"], "accept_untagged": false}));
+    let mut lab = Lab::with(1, s, |i| (format!("u{i}"), format!("p{i}")), |_, c| {
+        c.vlans = Vlans::qinq(300, 42);
+        c.ipv6 = true;
+    });
+    lab.start(0..1);
+    lab.run(200, 50);
+    assert_eq!(lab.ups(), 1);
+    let a = lab.backend().active().pop().unwrap();
+    let (p64, pd) = (a.ipv6_prefix.unwrap(), a.delegated_prefix.unwrap());
+    let route6 = |lab: &Lab, add: bool| -> Vec<ipnet::Ipv6Net> {
+        lab.bng.effects.iter().filter_map(|e| match e { Effect::Route6 { net, add: a } if *a == add => Some(*net), _ => None }).collect()
+    };
+    let mut added = route6(&lab, true);
+    added.sort();
+    let mut want = vec![p64, pd];
+    want.sort();
+    assert_eq!(added, want, "the /64 and the delegated prefix to bng0");
+    let pkt = |src: std::net::Ipv6Addr, dst: std::net::Ipv6Addr| {
+        let mut p = vec![0x60, 0, 0, 0, 0, 8, 58, 64];
+        p.extend_from_slice(&src.octets());
+        p.extend_from_slice(&dst.octets());
+        p.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
+        p
+    };
+    let host = |n: ipnet::Ipv6Net, last: u8| {
+        let mut o = n.network().octets();
+        o[15] = last;
+        std::net::Ipv6Addr::from(o)
+    };
+    let frame = |lab: &Lab, p: &[u8]| {
+        let mut f = Vec::new();
+        corerouter_proto_pppoe::eth::put_header(&mut f, Mac(BNG_MAC), lab.clients[0].config().mac, Vlans::qinq(300, 42), 0x8864);
+        f.extend_from_slice(&[0x11, 0x00]);
+        f.extend_from_slice(&lab.clients[0].session_id().to_be_bytes());
+        f.extend_from_slice(&((p.len() + 2) as u16).to_be_bytes());
+        f.extend_from_slice(&[0x00, 0x57]);
+        f.extend_from_slice(p);
+        f
+    };
+    let far: std::net::Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    lab.bng.upstream.clear();
+    // From the /64 and from the delegated prefix: up.
+    for src in [host(p64, 1), host(pd, 9)] {
+        let p = pkt(src, far);
+        lab.bng.frame(lab.now, IFINDEX, &frame(&lab, &p));
+        assert_eq!(lab.bng.upstream.pop(), Some(p));
+    }
+    // Spoofed source, and the right source on another line's tags: dropped.
+    lab.bng.frame(lab.now, IFINDEX, &frame(&lab, &pkt("2001:db8:9999::1".parse().unwrap(), far)));
+    let mut other = frame(&lab, &pkt(host(p64, 1), far));
+    other[19] = 43;
+    lab.bng.frame(lab.now, IFINDEX, &other);
+    assert!(lab.bng.upstream.is_empty());
+    // Downstream to the delegated prefix: inside both tags, PPP 0x0057.
+    let back = pkt(far, host(pd, 0x77));
+    lab.bng.frames.clear();
+    lab.bng.data_down(&back);
+    let (_, f) = lab.bng.frames.pop().expect("encapsulated");
+    assert_eq!(&f[12..22], &[0x88, 0xa8, 0x01, 0x2c, 0x81, 0x00, 0, 42, 0x88, 0x64]);
+    assert_eq!(&f[28..30], &[0x00, 0x57]);
+    assert_eq!(&f[30..], &back[..]);
+    // Not a subscriber's: nothing.
+    lab.bng.data_down(&pkt(far, "2001:db8:7777::1".parse().unwrap()));
+    assert!(lab.bng.frames.is_empty());
+    // The session ends: its routes go.
+    lab.bng.effects.clear();
+    lab.backend().terminate(std::slice::from_ref(&a.id));
+    lab.bng.requests(lab.now);
+    lab.run(100, 50);
+    let mut gone = route6(&lab, false);
+    gone.sort();
+    assert_eq!(gone, want);
+    lab.bng.data_down(&back);
+    assert!(lab.bng.frames.iter().all(|(_, f)| f.get(28..30) != Some(&[0x00, 0x57])), "no session, no frame");
 }
