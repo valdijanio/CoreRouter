@@ -351,6 +351,38 @@ pub fn decode_revision_file(text: &str, number: u32) -> Result<RevisionFile, Per
     }
 }
 
+/// A line of the config journal (G0.22): how to build revision `rev` from
+/// revision `base`, the one before it, as a delta of their configs (the
+/// opposite direction of a revision file). Same fields as
+/// [`encode_revision_delta`], one line.
+pub fn encode_journal_line(rev: &Revision, base: u32, delta: &serde_json::Value) -> Result<String, PersistError> {
+    encode_revision_delta(rev, base, delta)
+}
+
+/// A journal line parsed: the revision (config left default until the
+/// delta is applied to `base`'s), `base`, and the delta. Hostile input like
+/// any saved file.
+pub fn decode_journal_line(text: &str) -> Result<(Revision, u32, serde_json::Value), PersistError> {
+    check_version(text)?;
+    let line: RevisionFileIn = serde_json::from_str(text).map_err(malformed)?;
+    let (None, Some(base), Some(delta)) = (line.config, line.base, line.delta) else {
+        return Err(PersistError::Malformed("a journal line holds base + delta".into()));
+    };
+    if base >= line.number {
+        return Err(PersistError::Inconsistent(format!(
+            "journal line for revision {} builds on {base}, which is not older",
+            line.number
+        )));
+    }
+    let rev = Revision {
+        number: line.number,
+        comment: line.comment.chars().take(256).collect(),
+        timestamp: line.timestamp,
+        config: Config::default(),
+    };
+    Ok((rev, base, delta))
+}
+
 /// Parse a full revision file (see [`decode_revision_file`]).
 pub fn decode_revision(text: &str, number: u32) -> Result<Revision, PersistError> {
     match decode_revision_file(text, number)? {

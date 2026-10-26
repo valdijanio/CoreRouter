@@ -162,7 +162,8 @@ fn corrupt_current_is_quarantined_and_previous_loaded() {
 
     let mut s = boot(&dir);
     assert_eq!(s.storage_status().loaded_from, Some("previous"));
-    assert_eq!(addresses(&s), ["10.0.0.1/24"]);
+    // The previous slot plus the config journal: nothing lost (G0.22).
+    assert_eq!(addresses(&s), ["10.0.0.1/24", "10.0.1.1/24"]);
     let quarantined = dir.0.join(format!("{CURRENT}{CORRUPT_SUFFIX}"));
     assert_eq!(fs::read(&quarantined).unwrap(), bad);
     assert!(!dir.0.join(CURRENT).exists());
@@ -172,7 +173,10 @@ fn corrupt_current_is_quarantined_and_previous_loaded() {
     let prev = fs::read_to_string(dir.0.join(PREVIOUS)).unwrap();
     assert!(prev.contains("\"revision\":1"));
     drop(s);
-    assert_eq!(addresses(&boot(&dir)), ["10.0.0.1/24", "10.0.2.1/24"]);
+    assert_eq!(
+        addresses(&boot(&dir)),
+        ["10.0.0.1/24", "10.0.1.1/24", "10.0.2.1/24"]
+    );
 }
 
 #[cfg(unix)]
@@ -351,4 +355,34 @@ fn revisions_are_files_of_their_own() {
     s.execute("config.rollback", &json!({"revision": 1}))
         .unwrap();
     assert_eq!(addresses(&s), ["10.0.0.1/24"]);
+}
+
+/// G0.22: past the first two commits the slots stay as they are and each
+/// commit is a line of `journal-config.log`; a reboot replays them, and
+/// with the current slot lost the previous one plus the journal still give
+/// every commit.
+#[test]
+fn commits_go_to_the_config_journal_file() {
+    let dir = TempDir::new();
+    let mut s = boot(&dir);
+    add(&mut s, "10.0.0.1/24");
+    add(&mut s, "10.0.1.1/24");
+    let slot = fs::read(dir.0.join(CURRENT)).unwrap();
+    for i in 2..40 {
+        add(&mut s, &format!("10.0.{i}.1/24"));
+    }
+    assert_eq!(fs::read(dir.0.join(CURRENT)).unwrap(), slot);
+    let journal = fs::read_to_string(dir.0.join("journal-config.log")).unwrap();
+    assert!(journal.lines().count() >= 38, "{}", journal.lines().count());
+    let want = addresses(&s);
+    assert_eq!(want.len(), 40);
+    drop(s);
+    let s = boot(&dir);
+    assert!(s.storage_status().boot_errors.is_empty());
+    assert_eq!(addresses(&s), want);
+    drop(s);
+    fs::remove_file(dir.0.join(CURRENT)).unwrap();
+    let s = boot(&dir);
+    assert_eq!(s.storage_status().loaded_from, Some("previous"));
+    assert_eq!(addresses(&s), want);
 }
