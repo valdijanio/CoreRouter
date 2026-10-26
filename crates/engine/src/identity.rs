@@ -19,6 +19,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use corerouter_model::config::{AddressEntry, Config};
 use corerouter_model::cow::CowArc;
+use corerouter_model::cow_list::CowList;
 use corerouter_model::dhcp_server::DhcpServers;
 use corerouter_model::dns_zone::{DnsZones, RecordType};
 use corerouter_model::firewall::{AddrMatch, AddressListEntry};
@@ -141,8 +142,8 @@ fn block((v6, n): Key) -> Key {
 /// Names from the config, by address.
 #[derive(Default)]
 struct Index {
-    addresses: Option<CowArc<Vec<AddressEntry>>>,
-    lists: Option<CowArc<Vec<AddressListEntry>>>,
+    addresses: Option<CowList<AddressEntry>>,
+    lists: Option<CowList<AddressListEntry>>,
     dhcp: Option<CowArc<DhcpServers>>,
     zones: Option<CowArc<DnsZones>>,
     /// One address.
@@ -154,8 +155,8 @@ struct Index {
 
 impl Index {
     fn current(&self, c: &Config) -> bool {
-        self.addresses.as_ref().is_some_and(|a| CowArc::ptr_eq(a, &c.ip.addresses))
-            && self.lists.as_ref().is_some_and(|a| CowArc::ptr_eq(a, &c.ip.firewall.address_lists))
+        self.addresses.as_ref().is_some_and(|a| CowList::ptr_eq(a, &c.ip.addresses))
+            && self.lists.as_ref().is_some_and(|a| CowList::ptr_eq(a, c.ip.firewall.address_lists.list()))
             && self.dhcp.as_ref().is_some_and(|a| CowArc::ptr_eq(a, &c.ip.dhcp_server))
             && self.zones.as_ref().is_some_and(|a| CowArc::ptr_eq(a, &c.ip.dns_zones))
     }
@@ -163,7 +164,7 @@ impl Index {
     fn build(c: &Config, builds: u64) -> Self {
         let mut ix = Index {
             addresses: Some(c.ip.addresses.clone()),
-            lists: Some(c.ip.firewall.address_lists.clone()),
+            lists: Some(c.ip.firewall.address_lists.list().clone()),
             dhcp: Some(c.ip.dhcp_server.clone()),
             zones: Some(c.ip.dns_zones.clone()),
             builds: builds.saturating_add(1),

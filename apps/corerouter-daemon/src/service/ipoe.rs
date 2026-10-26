@@ -20,7 +20,7 @@ use corerouter_engine::{Shared, lock};
 use corerouter_hal::pppoe::PppoeOp;
 use corerouter_model::IfName;
 
-use super::ipoe_bng::{Backend, Core, Owner, Sessions, XdpOp, xdp_session};
+use super::ipoe_bng::{Backend, Core, KernelRoute, Owner, Sessions, XdpOp, xdp_session};
 
 const TICK: Duration = Duration::from_millis(100);
 const SECOND: Duration = Duration::from_secs(1);
@@ -41,6 +41,7 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
         let mut s = lock(&session);
         s.set_ipoe_backend(Arc::new(Backend(core.clone())));
         s.set_ipoe_sessions(Arc::new(Sessions(core.clone())));
+        core.set_framed(corerouter_engine::framed::FramedTable::of(&mut s));
     }
     Ok(Box::new(move |health: &super::Health| run(&session, &core, health)))
 }
@@ -54,6 +55,19 @@ fn port_info(name: &IfName) -> Result<(u32, [u8; 6]), String> {
 #[cfg(not(target_os = "linux"))]
 fn port_info(name: &IfName) -> Result<(u32, [u8; 6]), String> {
     Err(format!("{name}: no access port outside Linux"))
+}
+
+/// G4.3cd: the kernel routes of blocks routed to subscribers (`dst via
+/// subscriber`): the kernel forwards IPoE downstream itself.
+#[cfg(target_os = "linux")]
+fn kernel_routes(ops: &[KernelRoute]) -> Result<(), String> {
+    let ops: Vec<_> = ops.iter().map(|k| (k.dst.network(), k.dst.prefix_len(), k.via, k.add)).collect();
+    corerouter_hal_linux::pppoe_io::gateway_routes(&ops).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn kernel_routes(ops: &[KernelRoute]) -> Result<(), String> {
+    if ops.is_empty() { Ok(()) } else { Err("routed blocks need Linux".into()) }
 }
 
 struct Driver {
@@ -140,6 +154,19 @@ impl Driver {
 
     /// The core's XDP map changes, with the ports' index and MAC.
     fn apply(&mut self, session: &Shared, core: &Arc<Core>) {
+        // G4.3cd: kernel routes of routed blocks (with or without XDP) and
+        // the core's log lines, before the map changes.
+        let mut logs = core.take_logs();
+        if let Err(e) = kernel_routes(&core.take_kernel_routes()) {
+            logs.push((true, format!("IPoE: rota de bloco roteado: {e}")));
+        }
+        if !logs.is_empty() {
+            let mut s = lock(session);
+            for (error, text) in logs {
+                let level = if error { "error" } else { "info" };
+                s.log_event(&["ppp", level], "ipoe", text, serde_json::json!({}));
+            }
+        }
         let ops = core.take_ops();
         if ops.is_empty() || !matches!(self.plane, Some(Ok(()))) {
             return;
@@ -148,9 +175,10 @@ impl Driver {
             .into_iter()
             .filter_map(|op| match op {
                 XdpOp::Remove(slot) => Some(PppoeOp::Remove(slot)),
-                XdpOp::Upsert { slot, interface, client_mac, ip, up, down } => {
+                XdpOp::Route { dst, slot, add } => Some(PppoeOp::Route { dst, idx: slot, add }),
+                XdpOp::Upsert { slot, interface, client_mac, ip, up, down, shape } => {
                     let (ifindex, mac) = *self.info.get(&interface)?;
-                    Some(PppoeOp::Upsert(slot, xdp_session(ifindex, mac, client_mac, ip, up, down)))
+                    Some(PppoeOp::Upsert(slot, xdp_session(ifindex, mac, client_mac, ip, up, down, shape)))
                 }
             })
             .collect();

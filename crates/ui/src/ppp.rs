@@ -7,7 +7,8 @@
 //!   with the add/edit modal fed by the engine's `*.preview` (a change that
 //!   ends sessions asks first: "drops N sessions", Safe Mode offered);
 //! - **Active Connections:** one row per subscriber with its identity chip,
-//!   rate-limit chip and counters; Disconnect, Torch and **Why?**;
+//!   rate-limit chip and counters, and the blocks routed to it with the
+//!   chip of where each came from (G4.3cd); Disconnect, Torch and **Why?**;
 //! - **AAA:** `/ppp aaa`; **RADIUS:** a way to the RADIUS window;
 //! - **History:** the last logins, failures and ends, with the reason.
 //!
@@ -64,17 +65,20 @@ pub(crate) enum Tab {
     #[default]
     Active,
     Aaa,
+    /// G4.3h: the active/standby pair (`ppp_redundancy.rs`).
+    Redundancy,
     Radius,
     History,
 }
 
-const TABS: [(Tab, &str, &str); 8] = [
+const TABS: [(Tab, &str, &str); 9] = [
     (Tab::Interface, "Interface", "interface"),
     (Tab::Servers, "PPPoE Servers", "servers"),
     (Tab::Secrets, "Secrets", "secrets"),
     (Tab::Profiles, "Profiles", "profiles"),
     (Tab::Active, "Active Connections", "active"),
     (Tab::Aaa, "AAA", "aaa"),
+    (Tab::Redundancy, "Redundancy", "redundancy"),
     (Tab::Radius, "RADIUS", "radius"),
     (Tab::History, "History", "history"),
 ];
@@ -116,11 +120,12 @@ const SERVICE_COLUMNS: [table::Column; 7] = [
     num("PADI Limit").help("ppp.service.padi_limit"),
     num("Sessions").help("ppp.service.sessions"),
 ];
-const SECRET_COLUMNS: [table::Column; 8] = [
+const SECRET_COLUMNS: [table::Column; 9] = [
     col("Name").help("ppp.secret.name"),
     col("Service").help("ppp.secret.service"),
     col("Profile").help("ppp.secret.profile"),
     col("Remote Address").help("ppp.secret.remote_address"),
+    col("Routes").help("ppp.secret.routes"),
     col("Caller ID").help("ppp.secret.caller_id"),
     col("Limits").help("ppp.secret.limit_bytes"),
     col("State").help("ppp.secret.state"),
@@ -138,13 +143,14 @@ const PROFILE_COLUMNS: [table::Column; 10] = [
     num("Secrets").help("ppp.profile.secrets"),
     comment(),
 ];
-const ACTIVE_COLUMNS: [table::Column; 13] = [
+pub(crate) const ACTIVE_COLUMNS: [table::Column; 14] = [
     col("Name").help("ppp.active.name"),
     col("Service").help("ppp.active.service"),
     col("Caller ID").help("ppp.active.caller_id"),
     col("Address").help("ppp.active.address"),
     col("IPv6 Prefix").help("ppp.active.ipv6_prefix"),
     col("Delegated Prefix").help("ppp.active.delegated_prefix"),
+    col("Routes").help("ppp.active.routes"),
     num("Uptime").help("ppp.active.uptime"),
     col("Rate Limit").help("ppp.active.rate_limit"),
     num("Rx").help("ppp.active.rx"),
@@ -229,6 +235,7 @@ const SECRET_FIELDS: &[Field] = &[
     Field { param: "profile", label: "Profile", help: "ppp.secret.profile", input: Input::Choice, edit: true },
     Field { param: "remote_address", label: "Remote Address", help: "ppp.secret.remote_address", input: Input::Text("(from the profile's pool)"), edit: true },
     Field { param: "local_address", label: "Local Address", help: "ppp.secret.local_address", input: Input::Text("(from the profile)"), edit: true },
+    Field { param: "routes", label: "Routes", help: "ppp.secret.routes", input: Input::Text("203.0.113.8/29, 2001:db8:100::/48"), edit: true },
     Field { param: "caller_id", label: "Caller ID", help: "ppp.secret.caller_id", input: Input::Text("AA:BB:CC:DD:EE:FF"), edit: true },
     Field { param: "limit_bytes_in", label: "Limit Bytes In", help: "ppp.secret.limit_bytes", input: Input::Text("0"), edit: true },
     Field { param: "limit_bytes_out", label: "Limit Bytes Out", help: "ppp.secret.limit_bytes", input: Input::Text("0"), edit: true },
@@ -393,6 +400,7 @@ pub(crate) struct PppPanel {
     /// A login to select once Active Connections has it (the identity chip
     /// of another window was clicked).
     pub(crate) reveal: Option<String>,
+    pub(crate) redundancy: crate::ppp_redundancy::RedundancyTab,
 }
 
 /// Points of the per-session sparkline (one per refresh, ~2 minutes).
@@ -447,6 +455,56 @@ fn delegated_cell(r: &Value) -> String {
     }
     let chips: &[(&str, Kind)] = if flag(r, "delegated_bound") { &[("bound", Kind::Green)] } else { &[("reserved", Kind::Neutral)] };
     chip::cell(&pd, chips)
+}
+
+/// G4.3cd: the colour of a route's origin chip (the same in the table and
+/// in Why?): RADIUS attributes in blue shades, the secret neutral.
+pub(crate) fn origin_kind(origin: &str) -> Kind {
+    match origin {
+        "secret" => Kind::Neutral,
+        "framed-route" => Kind::Blue,
+        other => Kind::Hashed(chip::name_hue(other)),
+    }
+}
+
+/// The RADIUS attribute (or the menu) a route came from, as the operator
+/// knows it.
+pub(crate) fn origin_label(origin: &str) -> &str {
+    match origin {
+        "framed-route" => "Framed-Route",
+        "framed-ipv6-route" => "Framed-IPv6-Route",
+        "framed-ipv6-prefix" => "Framed-IPv6-Prefix",
+        "secret" => "secret",
+        other => other,
+    }
+}
+
+/// G4.3cd: the blocks routed to a session, each a chip of its block and a
+/// chip of where it came from; routes refused add a red count (Why? says
+/// why).
+fn routes_cell(r: &Value) -> String {
+    let routes: Vec<(String, String)> = r
+        .get("routes")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|x| {
+            let route = text(x, "route");
+            let block = route.split_whitespace().next().unwrap_or_default().to_owned();
+            (block, text(x, "origin"))
+        })
+        .collect();
+    let refused = r.get("refused_routes").and_then(Value::as_array).map_or(0, Vec::len);
+    let refused_text = format!("{refused} refused");
+    let mut chips: Vec<(&str, Kind)> = Vec::new();
+    for (block, origin) in &routes {
+        chips.push((block.as_str(), Kind::Neutral));
+        chips.push((origin_label(origin), origin_kind(origin)));
+    }
+    if refused > 0 {
+        chips.push((refused_text.as_str(), Kind::Red));
+    }
+    if chips.is_empty() { String::new() } else { chip::cell("", &chips) }
 }
 
 fn rate_chip(rate: &str) -> String {
@@ -748,6 +806,7 @@ impl PppPanel {
                 text(r, "service"),
                 chip::cell("", &[(profile.as_str(), Kind::Hashed(chip::name_hue(&profile)))]),
                 text(r, "remote_address"),
+                text(r, "routes").replace(',', ", "),
                 text(r, "caller_id"),
                 limits,
                 state,
@@ -816,6 +875,7 @@ impl PppPanel {
                 text(r, "address"),
                 text(r, "ipv6_prefix"),
                 delegated_cell(r),
+                routes_cell(r),
                 text(r, "uptime"),
                 rate_chip(&text(r, "rate_limit")),
                 bytes(n(r, "rx_bytes")),
@@ -1520,6 +1580,7 @@ fn why_answer(ui: &mut Ui, l: Lang, a: &Value, help: &mut Option<HelpView>) {
             ui.monospace(active);
         });
     }
+    why_routes(ui, l, a, help);
     if last.is_null() {
         if attempts.is_empty() {
             ui.weak(tr_in(SCOPE, l, "Nothing seen from this user or MAC yet: is the CPE on this access network and dialing PPPoE (or asking DHCP, for IPoE)?"));
@@ -1547,6 +1608,32 @@ fn why_answer(ui: &mut Ui, l: Lang, a: &Value, help: &mut Option<HelpView>) {
         ui.horizontal(|ui| {
             label(ui, help, l, "why.reply_message", "Reply-Message");
             ui.monospace(reply);
+        });
+    }
+}
+
+/// G4.3cd: the routes of the session up (block, origin chip) and the ones
+/// refused, each with the reason in Portuguese (from the service).
+fn why_routes(ui: &mut Ui, l: Lang, a: &Value, help: &mut Option<HelpView>) {
+    let routes = a.get("routes").and_then(Value::as_array).cloned().unwrap_or_default();
+    let refused = a.get("refused_routes").and_then(Value::as_array).cloned().unwrap_or_default();
+    if routes.is_empty() && refused.is_empty() {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        label(ui, help, l, "why.routes", "Routes");
+        let v = ui.visuals().clone();
+        for x in &routes {
+            let route = text(x, "route");
+            let origin = text(x, "origin");
+            chip::chip(ui, &route, chip::neutral_tone(&v));
+            chip::chip(ui, origin_label(&origin), origin_kind(&origin).tone(&v));
+        }
+    });
+    for why in refused.iter().filter_map(Value::as_str) {
+        ui.horizontal_wrapped(|ui| {
+            chip::chip(ui, tr_in(SCOPE, l, "refused"), chip::RED.tone(ui.visuals()));
+            ui.label(why);
         });
     }
 }
@@ -1596,6 +1683,11 @@ impl PanelState for PppPanel {
             Tab::Profiles => q.push(Query { key: "profiles", command: "ppp.profile.list", params: json!({}) }),
             Tab::Active => q.push(Query { key: "active", command: "ppp.active.list", params: json!({"limit": PAGE}) }),
             Tab::Aaa => q.push(Query { key: "aaa", command: "ppp.aaa.get", params: json!({}) }),
+            Tab::Redundancy => {
+                if app.has_command("ppp.redundancy.get") {
+                    self.redundancy.queries(&mut q);
+                }
+            }
             Tab::History => {
                 let mut p = json!({"limit": 1000});
                 if !self.event.is_empty()
@@ -1615,6 +1707,10 @@ impl PanelState for PppPanel {
     }
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
+        if key.starts_with("redundancy") {
+            self.redundancy.arrived(key, value);
+            return;
+        }
         match (key, value) {
             ("servers", Value::Array(a)) => self.servers = a,
             ("services", Value::Array(a)) => self.services = a,
@@ -1679,6 +1775,7 @@ impl PanelState for PppPanel {
             t @ (Tab::Servers | Tab::Secrets | Tab::Profiles) => self.list_tab(app, ui, l, t),
             Tab::Active => self.active_tab(app, ui, l),
             Tab::Aaa => self.aaa_tab(app, ui, l),
+            Tab::Redundancy => self.redundancy.ui(app, ui, l),
             Tab::Radius => self.radius_tab(app, ui, l),
             Tab::History => self.history_tab(app, ui, l),
         }
@@ -1721,10 +1818,14 @@ impl PanelState for PppPanel {
         }
         self.why_dialog(app, ctx, area);
         self.drops_dialog(app, ctx, area);
+        self.redundancy.dialogs(app, ctx, area);
         help::modal(ctx, app.lang, &mut self.help);
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let Err(then) = self.redundancy.reply(app, then, result) else {
+            return;
+        };
         let then = match then.downcast::<Saved>() {
             Ok(s) => {
                 self.waiting = self.waiting.saturating_sub(1);
@@ -1778,7 +1879,7 @@ impl PanelState for PppPanel {
             Tab::Profiles => self.profiles_table.escape(),
             Tab::Active => self.active_table.escape(),
             Tab::History => self.history_table.escape(),
-            Tab::Aaa | Tab::Radius => false,
+            Tab::Aaa | Tab::Redundancy | Tab::Radius => false,
         }
     }
 

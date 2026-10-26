@@ -3,6 +3,7 @@
 //! Built from string literals known to parse; if one ever does not,
 //! [`sample`] is empty instead of panicking (the golden test would show it).
 
+use corerouter_model::cow_list::CowList;
 use corerouter_model::firewall::{Action, AddressListEntry, FirewallRule, Matchers};
 use corerouter_model::interface_list::InterfaceListMember;
 use corerouter_model::{Config, ItemId};
@@ -76,7 +77,7 @@ fn build() -> Option<Config> {
     section.comment = "Router protection".into();
     let mut disabled = rule(9, "input", Matchers::default(), Action::Drop)?;
     disabled.disabled = true;
-    *fw.filter = vec![
+    fw.filter = CowList::from(vec![
         section,
         rule(
             2,
@@ -175,8 +176,8 @@ fn build() -> Option<Config> {
             Action::Passthrough,
         )?,
         rule(13, "output", m(&[("protocol", "icmpv6")])?, Action::Accept)?,
-    ];
-    *fw.nat = vec![
+    ]);
+    fw.nat = CowList::from(vec![
         rule(
             14,
             "srcnat",
@@ -211,8 +212,8 @@ fn build() -> Option<Config> {
             m(&[("protocol", "tcp"), ("dst_port", "443")])?,
             act(r#"{"type": "dst-nat", "to_addresses": "2001:db8::20", "to_ports": "8443"}"#)?,
         )?,
-    ];
-    *fw.mangle = vec![
+    ]);
+    fw.mangle = CowList::from(vec![
         rule(
             18,
             "prerouting",
@@ -231,7 +232,7 @@ fn build() -> Option<Config> {
             m(&[("packet_mark", "!bulk"), ("routing_mark", "isp2")])?,
             act(r#"{"type": "mark-packet", "new_packet_mark": "bulk"}"#)?,
         )?,
-    ];
+    ]);
     fw.next_rule_id = 22;
     fw.next_address_list_id = 4;
     Some(cfg)

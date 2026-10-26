@@ -178,7 +178,7 @@ fn make_static_block_release_and_check_status() {
         (row["dynamic"].clone(), row["status"].clone()),
         (json!(false), json!("bound"))
     );
-    let cfg = &s.store().running().ip.dhcp_server.leases[0];
+    let cfg = &s.store().running().ip.dhcp_server.leases.get(0).unwrap();
     assert_eq!(cfg.host_name, "lab-printer");
     assert_eq!(cfg.client_id, "1:2:1a:b0:2:0:3");
     assert!(

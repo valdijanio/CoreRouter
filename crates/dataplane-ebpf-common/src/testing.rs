@@ -312,6 +312,9 @@ pub struct Subs {
     pub policers: BTreeMap<(u32, u32), policer::State>,
     /// `IPOE_PORTS` (G4.3f).
     pub ipoe_ports: std::collections::BTreeSet<u32>,
+    /// `PPPOE_RT4` / `PPPOE_RT6` (G4.3cd): `(prefix, length, index)`.
+    pub routes4: Vec<([u8; 4], u32, u32)>,
+    pub routes6: Vec<([u8; 16], u32, u32)>,
 }
 
 impl Subs {
@@ -356,11 +359,29 @@ impl Sessions for Subs {
             .max_by_key(|(_, l, _)| *l)
             .map(|(_, _, i)| *i)
     }
+    type Policer<'a> = Option<&'a mut policer::State>;
+
     fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State> {
         self.policers.get_mut(&(idx, dir))
     }
     fn ipoe_port(&self, ifindex: u32) -> bool {
         self.ipoe_ports.contains(&ifindex)
+    }
+    fn by_route_v4(&self, dst: [u8; 4]) -> Option<u32> {
+        let d = Addr::V4(dst);
+        self.routes4
+            .iter()
+            .filter(|(p, l, _)| covers(&Addr::V4(*p), *l, &d))
+            .max_by_key(|(_, l, _)| *l)
+            .map(|(_, _, i)| *i)
+    }
+    fn by_route_v6(&self, dst: [u8; 16]) -> Option<u32> {
+        let d = Addr::V6(dst);
+        self.routes6
+            .iter()
+            .filter(|(p, l, _)| covers(&Addr::V6(*p), *l, &d))
+            .max_by_key(|(_, l, _)| *l)
+            .map(|(_, _, i)| *i)
     }
 }
 
@@ -449,35 +470,19 @@ pub fn program_model(
 }
 
 fn to_subscriber_model(buf: &mut Buf, subs: &mut Subs, now: u64) -> Option<Outcome> {
-    let v6 = match buf.be16(12)? {
-        0x0800 => false,
-        0x86dd => true,
-        _ => return None,
-    };
-    let idx = if v6 {
-        subs.by_v6(buf.bytes::<16>(14 + 24)?)?
-    } else {
-        subs.by_v4(buf.bytes::<4>(14 + 16)?)?
-    };
-    let (ip_len, ttl) = pppoe::ip_meta(buf, v6)?;
-    match pppoe::downstream(subs, idx, v6, ip_len, ttl, now, false) {
+    let d = pppoe::to_subscriber(buf, subs, now)?;
+    match d.verdict.down() {
         Down::NotSub => None,
         Down::Kernel(st, _) | Down::Counted(st, _, _) => {
             Some((XDP_PASS, buf.frame().to_vec(), None, Some(st)))
         }
         Down::Drop(st, _) => Some((XDP_DROP, buf.frame().to_vec(), None, Some(st))),
-        Down::Encap(d) => {
-            pppoe::ttl_dec(buf, v6)?;
-            if pppoe::encap(buf, &d).is_none() {
-                return Some((XDP_DROP, buf.frame().to_vec(), None, Some(Stat::Malformed)));
-            }
-            Some((
-                XDP_REDIRECT,
-                buf.frame().to_vec(),
-                Some(d.ifindex),
-                Some(Stat::DownFast),
-            ))
-        }
+        Down::Encap(e) => Some((
+            XDP_REDIRECT,
+            buf.frame().to_vec(),
+            Some(e.ifindex),
+            Some(Stat::DownFast),
+        )),
     }
 }
 

@@ -1138,6 +1138,7 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
+ "corerouter-proto-ha",
  "corerouter-proto-iperf",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",
@@ -1299,6 +1300,7 @@ name = "corerouter-model"
 version = "0.1.0"
 dependencies = [
  "corerouter-cgnat-map",
+ "criterion",
  "ipnet",
  "proptest",
  "serde",
