@@ -102,6 +102,21 @@ wait_checks() {
   return 2
 }
 
+# Testes instáveis (falharam e passaram ao repetir) no CI completo do commit `sha`: o nextest
+# marca FLAKY e o passo netns avisa "flaky netns test"; nenhum dos dois reprova. Vão para o log do
+# lote, para a sessão principal corrigir antes que um deles falhe duas vezes e cause uma bisseção.
+report_flaky() {
+  local sha=$1 id lines
+  for id in $(gh api "repos/$repo/actions/runs?head_sha=$sha&event=workflow_dispatch&per_page=10" \
+    --jq '.workflow_runs[] | select(.name == "ci" and .status == "completed") | .id' 2>/dev/null); do
+    lines=$(gh run view "$id" -R "$repo" --log 2>/dev/null |
+      sed 's/\x1b\[[0-9;]*m//g' |
+      grep -oE '(FLAKY .*|flaky netns test .*)$' | sort -u) || true
+    [ -n "$lines" ] || continue
+    printf '%s\n' "$lines" | while IFS= read -r l; do say "  instável (run $id): $l"; done
+  done
+}
+
 checks_or_stop() {
   local n=$1 sha=$2 r=0
   wait_checks "$sha" || r=$?
@@ -332,6 +347,7 @@ test_combo() {
   local r=0
   build_combo "origin/$base" batch "$@" || return $?
   wait_checks "$combo_sha" || r=$?
+  report_flaky "$combo_sha"
   drop_branch "$combo_branch"
   return $r
 }
@@ -494,6 +510,7 @@ watch() {
     if [ -n "$run_sha" ]; then
       r=0
       check_once "$run_sha" || r=$?
+      [ "$r" = 3 ] || report_flaky "$run_sha"
       case $r in
         0)
           members=("${run[@]}")

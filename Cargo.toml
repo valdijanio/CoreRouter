@@ -126,3 +126,12 @@ opt-level = 3
 panic = "unwind"
 lto = "thin"
 codegen-units = 1
+
+# processo: the `bench-check` step of `cargo xtask ci` (every benchmark run
+# once in criterion's test mode). Optimized, but with the debug assertions
+# and overflow checks of a test build: in debug, the setups of 1M routes or
+# 100k sessions made the step take 10 min in CI (docs/perf.md).
+[profile.bench-check]
+inherits = "test"
+opt-level = 1
+debug = false

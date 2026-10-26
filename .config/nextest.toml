@@ -1,0 +1,12 @@
+# cargo-nextest (o passo `test` do `cargo xtask ci`).
+#
+# processo: os testes mais longos começam primeiro. Começando por último, um teste de 97 s
+# segurava sozinho o fim da parte dele no CI (`--partition`, 2026-10-26: uma parte em 174 s, a
+# outra em 55 s). Entram aqui os que levam mais de ~30 s no runner do CI (linha SLOW do resumo).
+[[profile.default.overrides]]
+filter = """
+test(=hundred_thousand_dual_stack_sessions_reach_opened_on_a_lossy_network)
+| test(=a_power_cut_at_any_step_loses_at_most_the_commit_in_flight)
+| test(=server_survives_mutated_conversations)
+"""
+priority = 100

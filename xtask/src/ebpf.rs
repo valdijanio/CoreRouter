@@ -281,10 +281,20 @@ pub fn root_test(root: &Path) -> Outcome {
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty())
         .collect();
+    // `COREROUTER_CI_PARTITION=i/n`: the CI splits these tests over n
+    // runners (each its own machine, so the timing tests do not share CPUs).
+    let mine = match crate::partition() {
+        Ok(Some((i, n))) => Some(root_share(i, n)),
+        Ok(None) => None,
+        Err(e) => return Outcome::Fail(e),
+    };
     for (bin, exe, tests) in &exes {
         let exe_s = exe.to_string_lossy().into_owned();
         for (test, secs) in *tests {
             if !only.is_empty() && !only.iter().any(|o| o == test) {
+                continue;
+            }
+            if mine.as_ref().is_some_and(|m| !m.contains(test)) {
                 continue;
             }
             eprintln!("--- {bin} {test}");
@@ -325,6 +335,54 @@ pub fn root_test(root: &Path) -> Outcome {
         Outcome::Fail(failed.join("; "))
     }
 }
+
+/// The root tests of part `i` of `n`: longest first, each to the part with
+/// the least time so far (by [`ROOT_COST`]), so the parts end together.
+fn root_share(i: usize, n: usize) -> Vec<&'static str> {
+    let mut all: Vec<(&'static str, u32)> = ROOT_BINARIES
+        .iter()
+        .flat_map(|(_, tests)| tests.iter())
+        .map(|(t, _)| {
+            let cost = ROOT_COST
+                .iter()
+                .find(|(c, _)| c == t)
+                .map_or(DEFAULT_COST, |(_, s)| *s);
+            (*t, cost)
+        })
+        .collect();
+    all.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    let mut load = vec![0u32; n.max(1)];
+    let mut mine = Vec::new();
+    for (test, cost) in all {
+        let part = load
+            .iter()
+            .enumerate()
+            .min_by_key(|(k, l)| (**l, *k))
+            .map_or(0, |(k, _)| k);
+        if let Some(l) = load.get_mut(part) {
+            *l += cost;
+        }
+        if part + 1 == i {
+            mine.push(test);
+        }
+    }
+    mine
+}
+
+/// What the slow root tests take on the CI runner, in seconds (**medido**,
+/// 2026-10-26); the others count [`DEFAULT_COST`]. Only balances the parts
+/// of `COREROUTER_CI_PARTITION`.
+const ROOT_COST: [(&str, u32); 8] = [
+    ("pppoe_policer_accuracy", 60),
+    ("shaper_accuracy", 50),
+    ("perf_edt_vs_htb", 22),
+    ("perf_lpm_cost", 19),
+    ("policer_with_many_cpus_on_one_subscriber", 14),
+    ("perf_veth_blast", 10),
+    ("pppoe_kernel_delivery_through_bng0", 9),
+    ("perf_pppoe_forward", 8),
+];
+const DEFAULT_COST: u32 = 4;
 
 /// The root test binaries of hal-linux and their tests.
 const ROOT_BINARIES: [(&str, &[(&str, u32)]); 3] = [
@@ -394,6 +452,27 @@ fn test_binary(root: &Path, bin: &str) -> Result<PathBuf, String> {
 
 #[cfg(test)]
 mod xdp_list_tests {
+    /// Every root test lands in exactly one part, for any split.
+    #[test]
+    fn root_parts_cover_every_test_once() {
+        let mut all: Vec<&str> = super::ROOT_BINARIES
+            .iter()
+            .flat_map(|(_, t)| t.iter().map(|(n, _)| *n))
+            .collect();
+        all.sort_unstable();
+        for n in 1..=4 {
+            let mut got: Vec<&str> = (1..=n).flat_map(|i| super::root_share(i, n)).collect();
+            got.sort_unstable();
+            assert_eq!(got, all, "n = {n}");
+        }
+        // The two longest go to different parts.
+        let one = super::root_share(1, 2);
+        assert_ne!(
+            one.contains(&"pppoe_policer_accuracy"),
+            one.contains(&"shaper_accuracy")
+        );
+    }
+
     /// Every `#[test]` of `tests/xdp_root.rs` is in [`super::XDP_TESTS`]:
     /// one left out never runs as root (G4.3d's `pppoe_bng_ops_reach_the_maps`
     /// was missing until G4.3e).
