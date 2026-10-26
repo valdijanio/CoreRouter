@@ -293,13 +293,16 @@ fn read(storage: &mut dyn ConfigStorage, number: u32) -> Result<(RevisionFile, u
 /// Save `store` as revision files + the slot: only the revisions without a
 /// file (the previous newest, after a commit) are written. Keeps the
 /// newest revisions whose files fit in `budget` bytes and returns how many
-/// older ones were left out, like [`persist::encode_bounded`].
+/// older ones were left out, like [`persist::encode_bounded`]. `slot`: the
+/// newest revision goes to the slot even when the journal could take it
+/// (G0.27, the checkpoint of a clean shutdown).
 pub(crate) fn save(
     storage: &mut dyn ConfigStorage,
     files: &mut RevisionFiles,
     store: &ConfigStore,
     users: &Users,
     budget: usize,
+    slot: bool,
 ) -> Result<usize, String> {
     let history = store.history();
     let Some(newest) = history.last() else {
@@ -350,7 +353,7 @@ pub(crate) fn save(
             },
         );
     }
-    if !(storage.config_journal() && journal_append(storage, files, store, users)?) {
+    if slot || !(storage.config_journal() && journal_append(storage, files, store, users)?) {
         checkpoint(storage, files, newest, users)?;
     }
     // Past the history now, or the newest (whole in the slot or built by
@@ -366,6 +369,14 @@ pub(crate) fn save(
         }
     }
     Ok(skipped)
+}
+
+/// Whether the slot already holds the newest revision of `store` (no
+/// journal line is past it): a shutdown checkpoint has nothing to write
+/// (G0.27).
+pub(crate) fn slot_is_newest(storage: &dyn ConfigStorage, files: &RevisionFiles, store: &ConfigStore) -> bool {
+    let newest = store.history().last().map(|r| r.number);
+    !storage.config_journal() || (newest.is_some() && files.journal.current == newest)
 }
 
 /// The newest revision as one more journal line, when the storage holds

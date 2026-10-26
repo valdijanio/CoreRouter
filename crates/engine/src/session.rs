@@ -652,6 +652,44 @@ impl Session {
     /// failure does not undo the commit (the data plane already runs it):
     /// it is logged and shown by `state.inspect`.
     pub(crate) fn save(&mut self) {
+        self.save_to(false);
+    }
+
+    /// G0.27: write the newest saved revision to the slot (a clean
+    /// shutdown, before the process ends). Commits normally go to the
+    /// config journal (G0.22) and the slot is rewritten only now and then:
+    /// after this, the next boot replays no journal line, and a build from
+    /// before the journal that boots the same directory finds every commit
+    /// in the slot. The journal keeps its format (the lines the previous
+    /// slot still needs stay, and the boot skips them). `Ok(false)`: nothing
+    /// to write (no journal, or the slot already holds the newest revision).
+    /// In Safe Mode the saved store is the one from before it, as for
+    /// every save. `Err`: the write failed (the journal still holds the
+    /// commits; the next boot replays them).
+    pub fn checkpoint(&mut self) -> std::result::Result<bool, String> {
+        if !self.storage.revision_files() {
+            return Ok(false);
+        }
+        let entry_store = self.safe_mode_entry_store();
+        let store = entry_store.as_ref().unwrap_or(&self.store);
+        let files = self.ext.get::<crate::history_files::RevisionFiles>();
+        let newest = match files {
+            Some(f) => crate::history_files::slot_is_newest(self.storage.as_ref(), f, store),
+            None => true,
+        };
+        if newest {
+            return Ok(false);
+        }
+        self.save_to(true);
+        match &self.storage_status.last_error {
+            None => Ok(true),
+            Some(e) => Err(e.clone()),
+        }
+    }
+
+    /// [`Self::save`]; `slot`: the newest revision to the slot, not to the
+    /// journal ([`Self::checkpoint`]).
+    fn save_to(&mut self, slot: bool) {
         let entry_store = self.safe_mode_entry_store();
         let store = entry_store.as_ref().unwrap_or(&self.store);
         let saved = if self.storage.revision_files() {
@@ -667,6 +705,7 @@ impl Session {
                 store,
                 &self.users,
                 persist::SAVE_BUDGET_BYTES,
+                slot,
             );
             self.ext.set(files);
             saved
