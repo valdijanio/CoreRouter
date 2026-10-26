@@ -9,7 +9,9 @@
 //!   (each step commits); the time is per batch of 100;
 //! - `ppp_secret_add/atomic_step/N`: the same 100 adds in one atomic batch
 //!   (one commit at the end);
-//! - `ppp_secret_set/single/N`: a comment on the secret in the middle.
+//! - `ppp_secret_set/single/N`: a comment on the secret in the middle;
+//! - `identity_set/queues/N` (G4.9 × G0.22): `system.identity.set` with N
+//!   simple queues in place, a commit that touches none of them.
 //!
 //! The adds are removed again outside the timing, so N stays put.
 //!
@@ -121,6 +123,30 @@ fn bench(c: &mut Criterion) {
             });
         }
         g.throughput(Throughput::Elements(1));
+    }
+    {
+        let n = 10_000usize;
+        let mut s = Session::virtual_lab();
+        let steps: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"command": "queue.simple.add", "params": {
+                    "name": format!("q{i}"),
+                    "target": format!("10.{}.{}.{}/32", i >> 16, (i >> 8) & 255, i & 255),
+                    "max_limit": "10M/50M",
+                }})
+            })
+            .collect();
+        s.batch(&Value::Array(steps), true).unwrap();
+        assert_eq!(s.store().running().queue.simple.len(), n);
+        let mut flip = false;
+        g.bench_function(BenchmarkId::new("identity_set/queues", n), |b| {
+            b.iter(|| {
+                flip = !flip;
+                let name = if flip { "a" } else { "b" };
+                s.execute("system.identity.set", &json!({"name": name}))
+                    .unwrap()
+            });
+        });
     }
     g.finish();
 }

@@ -786,8 +786,9 @@ impl QueueType {
 #[serde(default, deny_unknown_fields)]
 pub struct Queues {
     /// In order: the first queue whose target holds an address wins.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub simple: Vec<SimpleQueue>,
+    /// A block list (G0.21): 10 000 queues and more on a big BNG.
+    #[serde(skip_serializing_if = "crate::cow_list::CowList::is_empty")]
+    pub simple: crate::cow_list::CowList<SimpleQueue>,
     /// Types the operator added or changed (built-ins exist without an
     /// entry; an entry with a built-in's name is the edited copy).
     #[serde(skip_serializing_if = "Vec::is_empty")]

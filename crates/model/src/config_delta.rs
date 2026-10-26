@@ -29,6 +29,7 @@ use crate::dhcp_server::DhcpServers;
 use crate::dns_static::DnsStatic;
 use crate::firewall::Firewall;
 use crate::ppp::Ppp;
+use crate::queue::Queues;
 use crate::ppp_secrets::Secrets;
 use crate::json_delta;
 use crate::persist::PersistError;
@@ -47,12 +48,13 @@ pub fn apply(base: &Config, delta: &Value) -> Result<Config, PersistError> {
     level(
         base,
         delta,
-        &["interfaces", "ip", "ppp"],
+        &["interfaces", "ip", "ppp", "queue"],
         |c| {
             let mut light = c.clone();
             light.interfaces = CowArc::default();
             light.ip = CowArc::default();
             light.ppp = Ppp::default();
+            light.queue = Queues::default();
             light
         },
         |out, base, key, op| {
@@ -70,6 +72,13 @@ pub fn apply(base: &Config, delta: &Value) -> Result<Config, PersistError> {
                         Op::Keep => base.ppp.clone(),
                         Op::Remove => Ppp::default(),
                         Op::Patch(d) => apply_ppp(&base.ppp, d)?,
+                    }
+                }
+                "queue" => {
+                    out.queue = match op {
+                        Op::Keep => base.queue.clone(),
+                        Op::Remove => Queues::default(),
+                        Op::Patch(d) => apply_queue(&base.queue, d)?,
                     }
                 }
                 _ => {}
@@ -186,6 +195,25 @@ fn apply_dns_static(base: &DnsStatic, delta: &Value) -> Result<DnsStatic, Persis
     )
 }
 
+fn apply_queue(base: &Queues, delta: &Value) -> Result<Queues, PersistError> {
+    level(
+        base,
+        delta,
+        &["simple"],
+        |q| {
+            let mut light = q.clone();
+            light.simple = CowList::default();
+            light
+        },
+        |out, base, key, op| {
+            if key == "simple" {
+                out.simple = list(&base.simple, op)?;
+            }
+            Ok(())
+        },
+    )
+}
+
 fn apply_ppp(base: &Ppp, delta: &Value) -> Result<Ppp, PersistError> {
     level(
         base,
@@ -223,6 +251,7 @@ fn diff_config(a: &Config, b: &Config) -> Result<Option<Value>, PersistError> {
         l.interfaces = CowArc::default();
         l.ip = CowArc::default();
         l.ppp = Ppp::default();
+        l.queue = Queues::default();
         l
     };
     let Some(mut p) = Parts::small(a, b, light)? else {
@@ -241,6 +270,31 @@ fn diff_config(a: &Config, b: &Config) -> Result<Option<Value>, PersistError> {
                 p.changed.insert("ppp".into(), obj("=", v));
             }
             (false, false) => p.nested("ppp", diff_ppp(&a.ppp, &b.ppp)?),
+        }
+    }
+    if a.queue != b.queue {
+        match (a.queue.is_default(), b.queue.is_default()) {
+            (true, true) => {}
+            (false, true) => p.gone.push("queue".into()),
+            (true, false) => {
+                let v = serde_json::to_value(&b.queue).map_err(malformed)?;
+                p.changed.insert("queue".into(), obj("=", v));
+            }
+            (false, false) => {
+                let light = |x: &Queues| {
+                    let mut l = x.clone();
+                    l.simple = CowList::default();
+                    l
+                };
+                let d = match Parts::small(&a.queue, &b.queue, light)? {
+                    Some(mut q) => {
+                        q.list("simple", &a.queue.simple, &b.queue.simple)?;
+                        q.finish()
+                    }
+                    None => whole(&a.queue, &b.queue)?,
+                };
+                p.nested("queue", d);
+            }
         }
     }
     Ok(p.finish())
@@ -460,7 +514,7 @@ impl Parts {
 /// blocks `new` still shares with `old` are copy runs, and only the items
 /// between them are serialized and diffed. A commit that wrote one secret
 /// of 100 000 serializes one block of each side, not the lists.
-fn list_delta<T: Serialize>(old: &CowList<T>, new: &CowList<T>) -> Result<Option<Value>, PersistError> {
+fn list_delta<T: Serialize + PartialEq>(old: &CowList<T>, new: &CowList<T>) -> Result<Option<Value>, PersistError> {
     let shared = new.shared_blocks(old);
     let mut ops = ListOps::default();
     // Old items before `cursor` are accounted for; new items from
@@ -480,9 +534,27 @@ fn list_delta<T: Serialize>(old: &CowList<T>, new: &CowList<T>) -> Result<Option
             return Ok(d.as_object().is_some_and(|m| !m.is_empty()).then_some(d));
         }
         if start > cursor || at > pending {
-            let a = to_tree(old.range(cursor, start - cursor))?;
-            let b = to_tree(new.range(pending, at - pending))?;
-            ops.region(cursor, &a, &b)?;
+            // The items equal at both ends of the region (a block that
+            // changed one item) are copies too: only the rest is serialized.
+            let (n_old, n_new) = (start - cursor, at - pending);
+            let head = old
+                .range(cursor, n_old)
+                .zip(new.range(pending, n_new))
+                .take_while(|(x, y)| x == y)
+                .count();
+            let room = n_old.min(n_new) - head;
+            let tail = old
+                .range(cursor + head, n_old - head)
+                .rev()
+                .zip(new.range(pending + head, n_new - head).rev())
+                .take(room)
+                .take_while(|(x, y)| x == y)
+                .count();
+            ops.copy(cursor, head);
+            let a = to_tree(old.range(cursor + head, n_old - head - tail))?;
+            let b = to_tree(new.range(pending + head, n_new - head - tail))?;
+            ops.region(cursor + head, &a, &b)?;
+            ops.copy(start - tail, tail);
         }
         ops.copy(start, len);
         cursor = start + len;
@@ -649,17 +721,66 @@ where
 /// One big list: kept (shared), emptied, or rebuilt from its delta.
 fn list<T>(base: &CowList<T>, op: Op<'_>) -> Result<CowList<T>, PersistError>
 where
-    T: Serialize + DeserializeOwned,
+    T: Clone + Serialize + DeserializeOwned,
 {
     match op {
         Op::Keep => Ok(base.clone()),
         Op::Remove => Ok(CowList::default()),
-        Op::Patch(d) => {
-            let tree = serde_json::to_value(base).map_err(malformed)?;
-            let tree = json_delta::apply_owned(tree, d).map_err(inconsistent)?;
-            <CowList<T> as serde::Deserialize>::deserialize(&tree).map_err(malformed)
+        Op::Patch(d) => match d.get("a") {
+            Some(Value::Array(ops)) if d.as_object().is_some_and(|m| m.len() == 1) => list_ops(base, ops),
+            _ => {
+                let tree = serde_json::to_value(base).map_err(malformed)?;
+                let tree = json_delta::apply_owned(tree, d).map_err(inconsistent)?;
+                <CowList<T> as serde::Deserialize>::deserialize(&tree).map_err(malformed)
+            }
+        },
+    }
+}
+
+/// An array delta (`{"a": [...]}`) applied to a block list: copy runs
+/// share `base`'s blocks ([`CowList::extend_from`]), only the new items are
+/// parsed. The same checks as [`json_delta::apply`]: every run inside
+/// `base`, every item of `base` taken at most once.
+fn list_ops<T>(base: &CowList<T>, ops: &[Value]) -> Result<CowList<T>, PersistError>
+where
+    T: Clone + DeserializeOwned,
+{
+    let mut out = CowList::new();
+    let mut taken = vec![false; base.len()];
+    for op in ops {
+        match op {
+            Value::Array(run) => {
+                let at = |i: usize| {
+                    run.get(i)
+                        .and_then(Value::as_u64)
+                        .and_then(|n| usize::try_from(n).ok())
+                };
+                let (Some(start), Some(len), 2) = (at(0), at(1), run.len()) else {
+                    return Err(inconsistent("copy run is not [start, len]"));
+                };
+                let Some(slots) = start.checked_add(len).and_then(|end| taken.get_mut(start..end)) else {
+                    return Err(inconsistent(format!("copy run {start}+{len} past {}", base.len())));
+                };
+                if slots.iter().any(|t| *t) {
+                    return Err(inconsistent("copy runs overlap"));
+                }
+                slots.fill(true);
+                if !out.extend_from(base, start, len) {
+                    return Err(inconsistent("copy run out of range"));
+                }
+            }
+            Value::Object(m) => match (m.get("i"), m.len()) {
+                (Some(Value::Array(items)), 1) => {
+                    for item in items {
+                        out.push(T::deserialize(item).map_err(malformed)?);
+                    }
+                }
+                _ => return Err(inconsistent("unknown array op")),
+            },
+            _ => return Err(inconsistent("unknown array op")),
         }
     }
+    Ok(out)
 }
 
 /// One level (a struct with big sections named `cows`): the small fields
@@ -877,6 +998,30 @@ mod tests {
         let got = check(&old, &new);
         assert!(CowArc::ptr_eq(&got.ip.firewall, &new.ip.firewall));
         check(&new, &old);
+    }
+
+    #[test]
+    fn one_queue_of_many_is_one_small_delta() {
+        let mut new = big();
+        for i in 0..3000u32 {
+            let q = serde_json::from_value(serde_json::json!({
+                "id": format!("*{:X}", i + 1), "name": format!("q{i}"),
+                "target": [format!("10.0.{}.{}/32", i >> 8, i & 255)],
+            }))
+            .unwrap();
+            new.queue.simple.push(q);
+        }
+        let mut old = new.clone();
+        old.queue.simple.get_mut(1500).unwrap().comment = "x".into();
+        old.queue.simple.remove(7);
+        let d = diff(&new, &old).unwrap();
+        assert!(d.to_string().len() < 500, "{d}");
+        check(&old, &new);
+        check(&new, &old);
+        let mut gone = new.clone();
+        gone.queue = Queues::default();
+        check(&gone, &new);
+        check(&new, &gone);
     }
 
     #[derive(Debug, Clone)]

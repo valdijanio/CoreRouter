@@ -15,6 +15,9 @@ mod pppoe_bng;
 #[path = "../src/service/pppoe_bng6.rs"]
 #[allow(dead_code)]
 mod pppoe_bng6;
+#[path = "../src/service/pppoe_slow6.rs"]
+#[allow(dead_code)]
+mod pppoe_slow6;
 
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
@@ -246,6 +249,203 @@ fn bench(c: &mut Criterion) {
     g.throughput(Throughput::Elements(1000));
     g.bench_function("setup_1000_sessions", |b| b.iter(|| sessions(1000, &snap)));
     g.finish();
+    ha(c, &snap, &snap100);
+    // G4.3l: the slow path's IPv6 lookup per packet down, with 100 000
+    // sessions (a /64 and a delegated /56 each): one hash probe per prefix
+    // length in use.
+    let mut ix = pppoe_slow6::Net6Index::default();
+    for i in 0..100_000u128 {
+        let p64 = std::net::Ipv6Addr::from((0x2001_0db8_0100u128 << 80) | (i << 64));
+        let pd = std::net::Ipv6Addr::from((0x2001_0db8_8000u128 << 80) | (i << 72));
+        ix.insert(ipnet::Ipv6Net::new(p64, 64).unwrap(), (0usize, i as u16));
+        ix.insert(ipnet::Ipv6Net::new(pd, 56).unwrap(), (0usize, i as u16));
+    }
+    let probes: Vec<std::net::Ipv6Addr> = (0..1024u128)
+        .map(|k| {
+            let i = (k * 7919) % 100_000;
+            if k % 2 == 0 {
+                std::net::Ipv6Addr::from((0x2001_0db8_0100u128 << 80) | (i << 64) | 0x77)
+            } else {
+                std::net::Ipv6Addr::from((0x2001_0db8_8000u128 << 80) | (i << 72) | (5 << 64) | 1)
+            }
+        })
+        .collect();
+    let mut g = c.benchmark_group("pppoe_slow6");
+    g.throughput(Throughput::Elements(probes.len() as u64));
+    g.bench_function("lookup_200k_prefixes", |b| {
+        b.iter(|| probes.iter().filter(|a| ix.get(**a).is_some()).count())
+    });
+    g.finish();
+}
+
+/// G4.3h hot standby: what publishing the sessions to the standby costs
+/// the BNG. Setup with and without it, the record of each new session
+/// (`ha_take`), the counters sweep every 10 s, and the workers together
+/// with every change into one shared publisher (the daemon's pair lock).
+fn ha(c: &mut Criterion, snap: &Snapshot, snap100: &Snapshot) {
+    use corerouter_proto_ha::sync::{Publisher, SyncConfig};
+    use pppoe_bng::ha::HaChange;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex};
+    let hot = |s: &Snapshot| {
+        let mut s = s.clone();
+        s.ppp.redundancy.enabled = true;
+        s.ppp.redundancy.mode = corerouter_model::ppp_redundancy::HaMode::HotStandby;
+        s.ppp.redundancy.secret = "segredo-do-par-123".into();
+        s
+    };
+    pppoe_bng::HA_ACTIVE.store(true, Ordering::Release);
+    let hsnap = hot(snap);
+    let publish = |p: &mut Publisher, v: Vec<HaChange>| {
+        for ch in v {
+            match ch {
+                HaChange::Up(k, v) => p.upsert(0, k, v),
+                HaChange::Gone(k) => p.remove(0, k),
+                HaChange::Counters(k, c) => p.counters(0, k, c),
+            }
+        }
+    };
+    // The 1 s tick of one worker with 50 000 sessions (the worst case: one
+    // lane), with and without the counters for the standby (every 10 s, in
+    // the same pass).
+    let mut bng = sessions(50_000, &hsnap);
+    let _ = bng.ha_take(0);
+    let t_tick = |bng: &mut Bng, at: u64| {
+        let t = std::time::Instant::now();
+        bng.tick(at, &[]);
+        t.elapsed().as_secs_f64() * 1e3
+    };
+    let plain = t_tick(&mut bng, 1_000);
+    let with = t_tick(&mut bng, pppoe_bng::ha::COUNTERS_MS + 2_000);
+    let n = bng.ha_take(0).len();
+    eprintln!(
+        "pppoe_bng/ha: tick of 50000 sessions: {plain:.2} ms; with the {n} counters for the standby: {with:.2} ms (one worker)"
+    );
+    drop(bng);
+    // The workers, 40 000 logins in rounds of 256 each, then the round's
+    // publish into one shared publisher (the daemon's pair lock), while a
+    // sync thread holds that lock 8 ms of every 10 (a snapshot being
+    // encoded, the worst case). `wait`: the worker blocks on the lock;
+    // else `try_lock`, and a busy lock leaves the changes for the next
+    // round (`publish` in `ppp_ha.rs`). Sessions/s and the longest round.
+    let n = 40_000;
+    let hsnap100 = hot(snap100);
+    let mut line = String::new();
+    for (name, ha, wait) in [
+        ("off", false, false),
+        ("hot+wait", true, true),
+        ("hot+try", true, false),
+    ] {
+        for lanes in [1u16, 8] {
+            let publisher = Arc::new(Mutex::new(Publisher::new(1, SyncConfig::default())));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let holder = {
+                let (publisher, stop) = (publisher.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let g = publisher.lock().unwrap();
+                        std::thread::sleep(std::time::Duration::from_millis(8));
+                        drop(g);
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                })
+            };
+            let first = Bng::first_of([1; 32], lanes);
+            let mut bngs = vec![];
+            for l in 1..lanes {
+                bngs.push(first.sibling([1 + l as u8; 32], l, lanes));
+            }
+            bngs.insert(0, first);
+            let ports = HashMap::from([(
+                "s".to_owned(),
+                PortInfo {
+                    ifindex: IFINDEX,
+                    mac: [2, 0xbb, 0, 0, 0, 1],
+                },
+            )]);
+            for b in &mut bngs {
+                b.xdp = true;
+                b.configure(
+                    0,
+                    if ha {
+                        hsnap100.clone()
+                    } else {
+                        snap100.clone()
+                    },
+                    &ports,
+                );
+            }
+            let mut ids: Vec<Vec<usize>> = vec![Vec::new(); usize::from(lanes)];
+            for i in 0..n {
+                let mut f = [0u8; 12];
+                f[6..12].copy_from_slice(&mac_of(i));
+                ids[usize::from(Bng::lane_of(&f, lanes))].push(i);
+            }
+            let t = std::time::Instant::now();
+            let handles: Vec<_> = bngs
+                .into_iter()
+                .zip(ids)
+                .map(|(mut b, ids)| {
+                    let publisher = publisher.clone();
+                    std::thread::spawn(move || {
+                        let mut worst = 0f64;
+                        let mut round = |b: &mut Bng, chunk: &[usize]| {
+                            let t = std::time::Instant::now();
+                            up_ids(b, chunk);
+                            let v = b.ha_take(0);
+                            if !v.is_empty() {
+                                if wait {
+                                    publish(&mut publisher.lock().unwrap(), v);
+                                } else if let Ok(mut p) = publisher.try_lock() {
+                                    publish(&mut p, v);
+                                } else {
+                                    b.ha_requeue(v);
+                                }
+                            }
+                            worst = worst.max(t.elapsed().as_secs_f64() * 1e3);
+                        };
+                        for chunk in ids.chunks(256) {
+                            round(&mut b, chunk);
+                        }
+                        // What is left goes once the lock frees.
+                        let v = b.ha_take(0);
+                        publish(&mut publisher.lock().unwrap(), v);
+                        (b, worst)
+                    })
+                })
+                .collect();
+            let done: Vec<(Bng, f64)> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+            let secs = t.elapsed().as_secs_f64();
+            stop.store(true, Ordering::Relaxed);
+            holder.join().unwrap();
+            if ha {
+                assert_eq!(publisher.lock().unwrap().len(), n);
+            }
+            let worst = done.iter().map(|d| d.1).fold(0f64, f64::max);
+            line.push_str(&format!(
+                "\n  {name} {lanes} workers: {:.0}/s, longest round {worst:.1} ms",
+                n as f64 / secs
+            ));
+            drop(done);
+        }
+    }
+    eprintln!(
+        "pppoe_bng/ha: {n} sessions by workers, rounds of 256, the lock held 8 of every 10 ms (release):{line}"
+    );
+    let mut g = c.benchmark_group("pppoe_bng_ha");
+    g.sample_size(10);
+    g.throughput(Throughput::Elements(1000));
+    g.bench_function("setup_1000_sessions_hot_standby", |b| {
+        b.iter(|| {
+            let mut bng = sessions(1000, &hsnap);
+            let mut p = Publisher::new(1, SyncConfig::default());
+            let v = bng.ha_take(0);
+            publish(&mut p, v);
+            (bng, p)
+        })
+    });
+    g.finish();
+    pppoe_bng::HA_ACTIVE.store(false, Ordering::Release);
 }
 
 criterion_group!(benches, bench);
