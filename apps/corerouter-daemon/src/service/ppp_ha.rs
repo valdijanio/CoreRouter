@@ -346,9 +346,7 @@ pub(crate) fn publish(
             Err(std::sync::TryLockError::WouldBlock) => return Some(changes),
         }
     };
-    let Some(p) = g.as_mut() else {
-        return None;
-    };
+    let p = g.as_mut()?;
     for c in changes {
         match c {
             HaChange::Up(k, v) => p.node.upsert(now, k, v),
