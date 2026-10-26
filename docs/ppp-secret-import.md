@@ -68,11 +68,11 @@ senhas). Testes: proptest no próprio módulo e no `tests/fuzz.rs` do engine, e 
 
 O CHAP e o MS-CHAP precisam da senha em si (RFC 1994 §2.2: o segredo entra no hash com o
 desafio), então um hash como o dos usuários (Argon2id) não serve. A config guarda a senha
-**selada**: `$cr1$` + base64 de XChaCha20-Poly1305 (nonce aleatório de 24 bytes, texto associado
+**selada**: `$cr1$` + base64 de AES-256-GCM (nonce aleatório de 96 bits, texto associado
 fixo), com uma chave de 32 bytes **fora da config**, no estado `secret-key` do armazenamento:
 `<config-dir>/state-secret-key.json`, modo 0600, criado no primeiro uso. RFC 1994 §6 pede que o
 segredo seja legível só por quem precisa dele: aqui, só o engine abre a caixa (o login PPPoE, por
-sessão, 1,7 µs **medido**; e o `export show-sensitive` do grupo `full`).
+sessão, 0,5 µs **medido**; e o `export show-sensitive` do grupo `full`).
 
 - Toda cópia da config leva a caixa, não a senha: revisões, os arquivos `rev-*.json`, o
   `running.json`, o `config.diff`, o `state.inspect`, o undo. Senhas iguais dão caixas
@@ -134,9 +134,19 @@ cifrada em repouso; lembrete de apagar o arquivo; `show-sensitive` só para `ful
 importado quando o `ppp.secret.add` o declarar (G4.3cd, sessão C: o leitor repassa o campo; até
 lá ele aparece em `unsupported`).
 
-Ficou de fora (gaps novas): a capacidade de 100 mil secrets numa config salva (G4.3na), import
-acima de 16 MiB pelo canal de controle (G4.3nb) e selar os outros segredos (TSIG, RADIUS)
-com o mesmo `show-sensitive` (G4.3nc).
+Entrou também, porque o selo a teria piorado: o teto de uma config salva subiu de 15 para 31 MiB
+(`persist::SAVE_BUDGET_BYTES` de 32 para 64 MiB). Com 15 MiB, 100 mil secrets completos não
+cabiam nem em claro (21,8 MB), e o `bench-check` mostrou que nem 100 mil secrets mínimos cabiam
+depois de selados.
+
+Ficou de fora (gaps novas): import acima de 16 MiB pelo canal de controle (G4.3na) e selar os
+outros segredos (TSIG, RADIUS) com o mesmo `show-sensitive` (G4.3nb).
+
+**Cifra:** começamos com XChaCha20-Poly1305 e trocamos por AES-256-GCM depois de medir o login:
+abrir uma senha de 12 bytes custava 1,33 µs com XChaCha20-Poly1305, 0,98 µs com
+ChaCha20-Poly1305 e 0,094 µs com AES-256-GCM (**medido**, release, RustCrypto com AES-NI escolhido
+em tempo de execução). Nonce aleatório de 96 bits: o limite do NIST SP 800-38D §8.3 é 2³² caixas
+por chave, e um roteador sela no máximo alguns milhões na vida.
 
 ## Desempenho
 
@@ -146,16 +156,22 @@ comentário e endereço fixo, 17,0 MB de export:
 
 | etapa | tempo |
 |---|---|
-| leitura (`rsc::parse`) | 125 ms (795 mil linhas/s, 135 MB/s) |
-| `dry_run` (lê, valida, sela, desfaz) | 536 ms |
-| importação (sem commit) | 566 ms (~5,7 µs por secret) |
-| 40 mil importados + commit (uma revisão) | 300 ms |
+| leitura (`rsc::parse`) | 125–133 ms (750–800 mil linhas/s, ~130 MB/s) |
+| `dry_run` (lê, valida, sela, desfaz) | 0,44–0,58 s |
+| importação (sem commit) | 0,47–0,64 s (~5 µs por secret) |
+| commit dos 100 mil (uma revisão) | 214 ms |
+| 40 mil importados no modo imediato (com commit) | 0,27–0,37 s |
+| abrir uma senha (base64 + AES-256-GCM + `String`) | 0,5 µs |
 
-Pico de memória do processo de teste: 269 MB (VmHWM, com as duas cópias do texto e a config).
-A config de 100 mil secrets fica com 28,1 MB selada e 21,8 MB em claro (+29 %, ~63 bytes por
-senha): as duas passam do teto de 15 MiB que um commit pode salvar hoje, então 100 mil
-assinantes locais com esses campos não cabem numa config, com ou sem selo (G4.3na). Abrir a
-senha no login custa 1,7 µs (**medido**, base64 + XChaCha20-Poly1305), dentro do que o PPPoE já gasta por autenticação.
+(Faixas: rodadas diferentes no mesmo laptop, com outras sessões compilando.) Pico de memória do
+processo de teste: 372 MB (VmHWM, com o texto, a config, a cópia em claro do teste e o commit).
+A config de 100 mil secrets fica com 26,5 MB selada e 21,8 MB em claro (+22 %, ~47 bytes por
+senha), dentro do novo teto de 31 MiB.
+
+**Login do BNG, antes e depois** (`cargo bench -p corerouter-daemon --bench pppoe_bng --
+setup_1000`, release, do PADI ao IPCP Opened com MS-CHAPv2 local): 1000 sessões com senha em
+claro em 12,23 ms, e seladas em 12,51 ms (+2 %, +0,28 µs por sessão). Com XChaCha20-Poly1305 eram
+11,77 contra 13,28 ms (+13 %): foi isso que motivou a troca.
 
 Paralelismo: a leitura e a selagem são por item e independentes, mas o engine não usa threads
 (compila para wasm) e a importação é rara (uma vez por migração): 0,6 s para 100 mil não pede

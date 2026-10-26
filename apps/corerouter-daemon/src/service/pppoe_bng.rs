@@ -2076,7 +2076,7 @@ impl Bng {
         if e.only_one && self.index.users_up.contains_key(&sec.name) {
             return self.reject(i, sref, "only-one: the user is already connected");
         }
-        // G4.3n: sealed in the config; opened per login (1.7 µs, measured).
+        // G4.3n: sealed in the config; opened per login (0.5 µs, measured).
         let Some(password) =
             corerouter_engine::sealing::open_with(self.cfg.seal.as_deref(), &sec.password)
         else {

@@ -289,8 +289,8 @@ fn export_of(n: usize) -> String {
 
 /// 100 000 subscribers (`cargo test --release -p corerouter-engine --test
 /// ppp_import -- --ignored --nocapture`): parse rate, dry run and import
-/// times, the config's size sealed and in clear, peak memory; then a
-/// commit of the 40 000 that fit in what a commit may save.
+/// times, the config's size sealed and in clear, the commit, peak memory;
+/// then 40 000 imported and committed in immediate mode.
 #[test]
 #[ignore]
 fn hundred_thousand_secrets() {
@@ -339,10 +339,13 @@ fn hundred_thousand_secrets() {
         x.password = key.open(&x.password).unwrap().into();
     }
     let open = t.elapsed() / n as u32;
-    let refused = s.execute("config.commit", &json!({})).is_err();
+    let t = Instant::now();
+    let committed = s.execute("config.commit", &json!({}));
+    let commit = t.elapsed();
+    assert!(committed.is_ok(), "{committed:?}");
     println!(
         "{n} secrets, {mb:.1} MB of export: parse {parse:?} ({:.0} lines/s, {:.0} MB/s), dry run {dry:?}, import {apply:?}, \
-         config {sealed:.1} MB sealed / {:.1} MB in clear (commit refused over the save budget: {refused}), open one password {open:?}; {}",
+         config {sealed:.1} MB sealed / {:.1} MB in clear commit {commit:?}, open one password {open:?}; {}",
         n as f64 / parse.as_secs_f64(),
         mb / parse.as_secs_f64(),
         size(&clear),

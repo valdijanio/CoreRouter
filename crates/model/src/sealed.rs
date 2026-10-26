@@ -16,7 +16,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-/// What a sealed value starts with (version 1: XChaCha20-Poly1305).
+/// What a sealed value starts with (version 1: AES-256-GCM).
 pub const PREFIX: &str = "$cr1$";
 
 #[derive(Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

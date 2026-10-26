@@ -24,12 +24,15 @@ pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 
 /// What a save may write: [`encode_bounded`] leaves the oldest revisions
 /// out until the file fits (audit: 64 full copies of a big config made a
-/// file the next boot refused, and the router came up blank).
-pub const SAVE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// file the next boot refused, and the router came up blank). 64 MiB
+/// (G4.3n): 100 000 local PPP secrets with caller id, comment, fixed
+/// address and the sealed password are 28.1 MB (**medido**); at 32 MiB
+/// even 100 000 bare ones no longer fit once sealed.
+pub const SAVE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
 /// Largest running config a commit may produce: it is written twice (as
 /// `running` and as the newest revision) and must leave room for the
-/// accounts. About 50 000 firewall rules (**estimado**).
+/// accounts. About 100 000 firewall rules or PPP secrets (**estimado**).
 pub const MAX_CONFIG_BYTES: usize = SAVE_BUDGET_BYTES / 2 - 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]

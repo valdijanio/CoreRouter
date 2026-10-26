@@ -3,8 +3,8 @@
 //! CHAP needs the password in clear (RFC 1994 §2.2), and RFC 1994 §6 asks
 //! that secrets be readable only by the process that needs them. The config
 //! (and every revision, history file and diff made from it) holds a
-//! [`Sealed`] box instead: XChaCha20-Poly1305 with a random 24-byte nonce
-//! and a fixed associated text, under a 32-byte key kept **outside** the
+//! [`Sealed`] box instead: AES-256-GCM with a random 96-bit nonce and a
+//! fixed associated text, under a 32-byte key kept **outside** the
 //! config, in the storage's state `secret-key` (`state-secret-key.json` in
 //! the config dir, mode 0600, made on first use). A copy of `running.json`
 //! or of a `rev-*.json` alone does not give the passwords away; the key
@@ -17,13 +17,19 @@
 //!
 //! The browser lab (wasm) has no random source: it seals with a key and
 //! nonces made for that run only (nothing is stored there).
+//!
+//! AES-256-GCM, not XChaCha20-Poly1305: opening a password is on the
+//! PPPoE login path, and it takes 94 ns against 1.3 µs (**medido**,
+//! release, 12-byte passwords; AES-NI picked at run time). Random 96-bit
+//! nonces stay far below the 2^32 boxes per key of NIST SP 800-38D §8.3
+//! (a router seals at most a few million in its life).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
-use chacha20poly1305::aead::{Aead, KeyInit, Payload};
-use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::{Aes256Gcm, Nonce};
 use corerouter_model::sealed::{PREFIX, Sealed};
 
 use crate::Session;
@@ -32,12 +38,12 @@ use crate::Session;
 pub const KEY_STATE: &str = "secret-key";
 /// Bound to every box: a box cannot be passed off as another kind of data.
 const AAD: &[u8] = b"corerouter/ppp-secret/v1";
-const NONCE: usize = 24;
+const NONCE: usize = 12;
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD_NO_PAD;
 
 /// The key, shared by the session and the PPPoE workers.
 pub struct SealKey {
-    cipher: XChaCha20Poly1305,
+    cipher: Aes256Gcm,
     /// Made for this run (no random source): nonces from a counter.
     ephemeral: bool,
     counter: AtomicU64,
@@ -52,7 +58,7 @@ impl std::fmt::Debug for SealKey {
 impl SealKey {
     pub fn from_bytes(key: &[u8; 32]) -> Self {
         Self {
-            cipher: XChaCha20Poly1305::new(&(*key).into()),
+            cipher: Aes256Gcm::new(&(*key).into()),
             ephemeral: false,
             counter: AtomicU64::new(0),
         }
@@ -79,7 +85,7 @@ impl SealKey {
         let nonce = self.nonce()?;
         let ct = self
             .cipher
-            .encrypt(&XNonce::from(nonce), Payload { msg: plain.as_bytes(), aad: AAD })
+            .encrypt(&Nonce::from(nonce), Payload { msg: plain.as_bytes(), aad: AAD })
             .map_err(|_| "sealing failed".to_owned())?;
         let mut raw = Vec::with_capacity(NONCE + ct.len());
         raw.extend_from_slice(&nonce);
@@ -105,7 +111,7 @@ pub fn open_with(key: Option<&SealKey>, s: &Sealed) -> Option<String> {
     let nonce: [u8; NONCE] = nonce.try_into().ok()?;
     let pt = key
         .cipher
-        .decrypt(&XNonce::from(nonce), Payload { msg: ct, aad: AAD })
+        .decrypt(&Nonce::from(nonce), Payload { msg: ct, aad: AAD })
         .ok()?;
     String::from_utf8(pt).ok()
 }
@@ -244,3 +250,4 @@ mod tests {
         assert_eq!(key(&mut again).unwrap().open(&boxed).as_deref(), Some("x"));
     }
 }
+
