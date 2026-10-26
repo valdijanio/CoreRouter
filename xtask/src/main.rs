@@ -280,8 +280,20 @@ fn clippy(root: &Path) -> Outcome {
 /// `cargo nextest` when installed (test binaries run in parallel, not one
 /// after the other; doctests still go through `cargo test --doc`), else
 /// `cargo test`. `COREROUTER_NEXTEST=0` forces `cargo test`.
+///
+/// With `COREROUTER_CI_PARTITION=i/n` (the CI's test shards), nextest runs
+/// part i of the tests (`--partition count:i/n`) and only part 1 the
+/// doctests; `cargo test` cannot split, so part 1 runs everything.
 fn test(root: &Path) -> Outcome {
+    let part = match partition() {
+        Ok(p) => p,
+        Err(e) => return Outcome::Fail(e),
+    };
+    let first = part.is_none_or(|(i, _)| i == 1);
     if !nextest_available(root) {
+        if !first {
+            return Outcome::Skip("no cargo-nextest to split the tests: part 1 runs them".into());
+        }
         let mut c = cargo();
         c.args(["test", "--workspace", "--quiet"]);
         return run(c, root);
@@ -301,16 +313,44 @@ fn test(root: &Path) -> Outcome {
         "--retries",
         "1",
     ]);
+    if let Some((i, n)) = part {
+        c.args(["--partition", &format!("count:{i}/{n}")]);
+    }
     match run(c, root) {
         // `cargo test --doc` costs ~17 s even with no doctest (one rustdoc
         // per crate), so it runs only when some doc comment has Rust code.
-        Outcome::Ok if has_doctests(root) => {
+        Outcome::Ok if first && has_doctests(root) => {
             let mut d = cargo();
             d.args(["test", "--workspace", "--doc", "--quiet"]);
             run(d, root)
         }
         other => other,
     }
+}
+
+/// `COREROUTER_CI_PARTITION=i/n` (1 ≤ i ≤ n ≤ 16): this CI job runs part i
+/// of n of the steps that split (`test`, `xdp-root`); unset, all of it.
+fn partition() -> Result<Option<(usize, usize)>, String> {
+    match std::env::var("COREROUTER_CI_PARTITION") {
+        Ok(v) if !v.trim().is_empty() => parse_partition(v.trim()).map(Some),
+        _ => Ok(None),
+    }
+}
+
+fn parse_partition(v: &str) -> Result<(usize, usize), String> {
+    let bad = || {
+        let shown: String = v.chars().take(20).collect();
+        format!("COREROUTER_CI_PARTITION: expected i/n with 1 <= i <= n <= 16, got '{shown}'")
+    };
+    let (i, n) = v.split_once('/').ok_or_else(bad)?;
+    let (i, n) = (
+        i.parse::<usize>().map_err(|_| bad())?,
+        n.parse::<usize>().map_err(|_| bad())?,
+    );
+    if i == 0 || i > n || n > 16 {
+        return Err(bad());
+    }
+    Ok((i, n))
 }
 
 /// Does any `crates/*/src` or `apps/*/src` doc comment open a fenced block
@@ -717,6 +757,15 @@ mod tests {
         assert!(names(&["--only"]).is_err());
         assert!(names(&["--only", ","]).is_err());
         assert!(names(&["--quick"]).is_err());
+    }
+
+    #[test]
+    fn partition_parses_i_of_n() {
+        assert_eq!(parse_partition("1/2"), Ok((1, 2)));
+        assert_eq!(parse_partition("3/3"), Ok((3, 3)));
+        for bad in ["0/2", "3/2", "1/17", "1", "a/b", "1/2/3", ""] {
+            assert!(parse_partition(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

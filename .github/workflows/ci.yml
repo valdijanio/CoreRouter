@@ -86,12 +86,21 @@ jobs:
         if: env.DOCS_ONLY == 'true'
         run: cargo xtask docs
 
+  # Os testes em partes, cada uma num runner de 4 vCPU (o nextest usa todos os núcleos de cada
+  # um): `COREROUTER_CI_PARTITION=i/n` vira `--partition count:i/n`. Cada parte compila o
+  # workspace do próprio cache (~1,5 min); mais partes que isso só somam compilação.
   test:
-    name: test
+    name: test (${{ matrix.part }}/${{ strategy.job-total }})
     needs: changes
     if: needs.changes.outputs.docs_only != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
+    env:
+      COREROUTER_CI_PARTITION: ${{ matrix.part }}/${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
@@ -128,12 +137,20 @@ jobs:
 
   # G2.5: o objeto XDP carregado de verdade, como root (o veth de ci/kernel-modules liga o
   # COREROUTER_REQUIRE_XDP).
+  # Os testes de root medem vazão e precisão: um por vez em cada runner, as partes em runners
+  # diferentes (`COREROUTER_CI_PARTITION`, divididas pelo tempo medido de cada teste).
   xdp-root:
-    name: xdp-root
+    name: xdp-root (${{ matrix.part }}/${{ strategy.job-total }})
     needs: changes
     if: needs.changes.outputs.docs_only != 'true' && github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2]
+    env:
+      COREROUTER_CI_PARTITION: ${{ matrix.part }}/${{ strategy.job-total }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: ./.github/actions/setup
