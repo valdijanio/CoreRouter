@@ -26,12 +26,15 @@ use crate::ppp::PppSecret;
 
 type Index = Arc<HashMap<String, usize>>;
 type RouteIndex = Arc<RouteSet<usize>>;
+/// Fixed `remote_address` → secrets (by position), sorted by address.
+type FixedIndex = Arc<std::collections::BTreeMap<u32, Vec<usize>>>;
 
 #[derive(Default)]
 pub struct Secrets {
     list: CowArc<Vec<PppSecret>>,
     index: OnceLock<Index>,
     routes: OnceLock<RouteIndex>,
+    fixed: OnceLock<FixedIndex>,
 }
 
 impl Secrets {
@@ -40,7 +43,33 @@ impl Secrets {
             list: CowArc::new(list),
             index: OnceLock::new(),
             routes: OnceLock::new(),
+            fixed: OnceLock::new(),
         }
+    }
+
+    fn fixed_index(&self) -> &FixedIndex {
+        self.fixed.get_or_init(|| {
+            let mut m: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
+            for (k, s) in self.list.iter().enumerate() {
+                if let Some(ip) = s.remote_address {
+                    m.entry(u32::from(ip)).or_default().push(k);
+                }
+            }
+            Arc::new(m)
+        })
+    }
+
+    /// The secrets whose fixed `remote_address` is inside `net`, in
+    /// O(log n + hits) (G4.3cd: a routed block must not take another
+    /// subscriber's fixed address; a walk of every secret per block made an
+    /// import of business secrets O(n²): 634 µs each over 100 000, **medido**).
+    pub fn fixed_in(&self, net: &ipnet::Ipv4Net) -> Vec<&PppSecret> {
+        let (a, b) = (u32::from(net.network()), u32::from(net.broadcast()));
+        self.fixed_index()
+            .range(a..=b)
+            .flat_map(|(_, v)| v.iter())
+            .filter_map(|&k| self.list.get(k))
+            .collect()
     }
 
     fn route_index(&self) -> &RouteIndex {
@@ -98,6 +127,11 @@ impl Secrets {
         if let Some(ix) = self.index.get_mut() {
             Arc::make_mut(ix).entry(s.name.clone()).or_insert(k);
         }
+        if let Some(fx) = self.fixed.get_mut()
+            && let Some(ip) = s.remote_address
+        {
+            Arc::make_mut(fx).entry(u32::from(ip)).or_default().push(k);
+        }
         if let Some(rx) = self.routes.get_mut()
             && !s.routes.is_empty()
         {
@@ -125,10 +159,15 @@ impl Clone for Secrets {
         if let Some(rx) = self.routes.get() {
             let _ = routes.set(Arc::clone(rx));
         }
+        let fixed = OnceLock::new();
+        if let Some(fx) = self.fixed.get() {
+            let _ = fixed.set(Arc::clone(fx));
+        }
         Self {
             list: self.list.clone(),
             index,
             routes,
+            fixed,
         }
     }
 }
@@ -145,6 +184,7 @@ impl DerefMut for Secrets {
     fn deref_mut(&mut self) -> &mut Vec<PppSecret> {
         self.index = OnceLock::new();
         self.routes = OnceLock::new();
+        self.fixed = OnceLock::new();
         &mut self.list
     }
 }
@@ -260,6 +300,24 @@ mod tests {
         assert_eq!(hit(&v, "203.0.113.0/24"), ["c"]);
         assert_eq!(hit(&copy, "203.0.113.0/24"), ["a", "c"]);
         assert!(hit(&v, "198.51.100.0/24").is_empty());
+    }
+
+    #[test]
+    fn fixed_addresses_by_range_follow_writes() {
+        let fixed = |name: &str, ip: &str| PppSecret {
+            name: name.into(),
+            remote_address: Some(ip.parse().unwrap()),
+            ..PppSecret::default()
+        };
+        let net = |t: &str| t.parse::<ipnet::Ipv4Net>().unwrap();
+        let names = |v: &Secrets, t: &str| -> Vec<String> { v.fixed_in(&net(t)).iter().map(|s| s.name.clone()).collect() };
+        let mut v = Secrets::new(vec![fixed("a", "203.0.113.9"), s("b", "x")]);
+        assert_eq!(names(&v, "203.0.113.8/29"), ["a"]);
+        v.push(fixed("c", "203.0.113.10"));
+        assert_eq!(names(&v, "203.0.113.8/29"), ["a", "c"]);
+        assert!(names(&v, "203.0.113.16/29").is_empty());
+        v.remove(0);
+        assert_eq!(names(&v, "203.0.113.0/24"), ["c"]);
     }
 
     #[test]

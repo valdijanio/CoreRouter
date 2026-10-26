@@ -44,7 +44,7 @@ fn filled(n: u32) -> FramedTable {
     let t = FramedTable::default();
     let f = Forbidden::default();
     for i in 0..n {
-        let a = framed::admit(&t, &f, &routes_of(i), &holder(i), None, true);
+        let a = framed::admit(&t, &f, &routes_of(i), &holder(i), None, None);
         assert!(a.refused.is_empty(), "{:?}", a.refused);
     }
     t
@@ -60,7 +60,7 @@ fn bench(c: &mut Criterion) {
         let want = routes_of(i + 3);
         g.bench_function("login_4_routes_and_logout", |b| {
             b.iter(|| {
-                let a = framed::admit(&t, &f, black_box(&want), &holder(i), None, true);
+                let a = framed::admit(&t, &f, black_box(&want), &holder(i), None, None);
                 framed::release_all(&t, &a.routes, "*1-60000");
                 a.routes.len()
             })

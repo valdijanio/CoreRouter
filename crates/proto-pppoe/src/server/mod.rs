@@ -9,6 +9,7 @@
 //! [`Output`]. One `Server` is one SESSION_ID space (≤ 65 534 sessions,
 //! RFC 2516 §4); the BNG service runs one per access port group.
 
+pub mod ha;
 mod services;
 mod session;
 

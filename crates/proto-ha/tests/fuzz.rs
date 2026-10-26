@@ -132,6 +132,12 @@ fn arb_record() -> impl Strategy<Value = SessionRecord> {
         proptest::collection::vec(proptest::collection::vec(any::<u8>(), 0..30), 0..4),
         "[a-z0-9/]{0,20}",
         any::<(u64, u64, u64)>(),
+        (
+            proptest::collection::vec(any::<[u8; 16]>(), 0..4),
+            proptest::collection::vec("[0-9a-f:./| -]{1,40}", 0..6),
+            any::<(u64, u64, Option<u32>)>(),
+            "[a-z0-9-]{0,16}",
+        ),
     )
         .prop_map(
             |(
@@ -145,6 +151,7 @@ fn arb_record() -> impl Strategy<Value = SessionRecord> {
                 class,
                 text,
                 (a, b, c),
+                (dns6, routes, (li, lo, nb), fb),
             )| {
                 let mut r = record(n, 0);
                 r.vlan = vlan;
@@ -170,6 +177,12 @@ fn arb_record() -> impl Strategy<Value = SessionRecord> {
                     rx_packets: c,
                     tx_packets: a ^ b,
                 };
+                r.dns6 = dns6.into_iter().map(Into::into).collect();
+                r.routes = routes.into_iter().map(Into::into).collect();
+                r.limit_in = li;
+                r.limit_out = lo;
+                r.nbns = [None, nb.map(Ipv4Addr::from)];
+                r.fallback_profile = fb.into();
                 r
             },
         )

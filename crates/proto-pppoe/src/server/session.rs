@@ -979,3 +979,110 @@ impl Session {
         }
     }
 }
+
+// --- G4.3h hot standby: the state another node needs, and the session
+// rebuilt from it in Opened state (`server::ha`). ---
+
+impl Session {
+    pub(crate) fn export(&self, now: Millis) -> Option<super::ha::SessionState> {
+        if !self.up || self.dead.is_some() {
+            return None;
+        }
+        Some(super::ha::SessionState {
+            sid: self.sid,
+            ifindex: self.ifindex,
+            vlans: self.vlans,
+            client_mac: self.client_mac,
+            our_magic: self.lcp_l.our_magic,
+            peer_magic: self.lcp_l.peer_magic,
+            our_mru: self.lcp_l.our_mru,
+            peer_mru: self.lcp_l.peer_mru,
+            auth: self.auth.proto,
+            username: self.username.clone(),
+            service: self.service.clone(),
+            ipv4: if self.v4_up { self.ipcp_l.peer } else { None },
+            local_ipv4: self.ipcp_l.local,
+            dns: self.ipcp_l.dns,
+            nbns: self.ipcp_l.nbns,
+            ipv6: if self.v6_up {
+                self.v6_l.peer_iid.map(|p| (self.v6_l.local_iid, p))
+            } else {
+                None
+            },
+            v6_mode: self.v6_mode,
+            rate_limit: self.rate_limit,
+            session_timeout: self.session_timeout,
+            timeout_left_ms: (self.session_deadline > 0)
+                .then(|| self.session_deadline.saturating_sub(now).max(1)),
+            circuit_id: self.circuit_id.clone(),
+            remote_id: self.remote_id.clone(),
+        })
+    }
+
+    pub(crate) fn import(
+        cfg: &ServerConfig,
+        rng: &mut Rng,
+        st: &super::ha::SessionState,
+        gen_: u32,
+        svc: super::services::ServiceSlot,
+        now: Millis,
+    ) -> Session {
+        let mut s = Session::new(
+            cfg,
+            rng,
+            Init {
+                gen_,
+                sid: st.sid,
+                ifindex: st.ifindex,
+                vlans: st.vlans,
+                client_mac: st.client_mac,
+                uniq: 0,
+                mru_cap: None,
+                service: st.service.clone(),
+                svc,
+                circuit_id: st.circuit_id.clone(),
+                remote_id: st.remote_id.clone(),
+            },
+            now,
+        );
+        s.lcp = Fsm::opened(rng.u32() as u8);
+        s.lcp_l.our_magic = st.our_magic;
+        s.lcp_l.peer_magic = st.peer_magic;
+        s.lcp_l.our_mru = st.our_mru;
+        s.lcp_l.peer_mru = st.peer_mru;
+        s.lcp_l.auth_agreed = st.auth;
+        s.auth.proto = st.auth;
+        s.auth.done = true;
+        s.phase = Phase::Network;
+        s.heard = true;
+        s.username = st.username.clone();
+        s.rate_limit = st.rate_limit;
+        s.session_timeout = st.session_timeout;
+        if let Some(left) = st.timeout_left_ms {
+            s.session_deadline = now + left.max(1);
+        }
+        if st.local_ipv4.is_some() {
+            s.ipcp_l.local = st.local_ipv4;
+        }
+        s.ipcp_l.dns = st.dns;
+        s.ipcp_l.nbns = st.nbns;
+        if let Some(ip) = st.ipv4 {
+            s.ipcp = Fsm::opened(1);
+            s.ipcp_l.peer = Some(ip);
+            s.address_asked = true;
+            s.v4_up = true;
+        }
+        s.v6_mode = st.v6_mode;
+        if let Some((local, peer)) = st.ipv6 {
+            s.v6 = Fsm::opened(1);
+            s.v6_l.local_iid = local;
+            s.v6_l.peer_iid = Some(peer);
+            s.v6_up = true;
+        }
+        s.up = s.v4_up || s.v6_up;
+        if cfg.keepalive_interval_ms > 0 {
+            s.echo_at = now + cfg.keepalive_interval_ms;
+        }
+        s
+    }
+}

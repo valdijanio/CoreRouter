@@ -279,3 +279,67 @@ fn the_ipoe_half_pages_in_place() {
     assert_eq!(page[0].name, names[0]);
     assert_eq!(s.sessions_by_server().get("dhcp1"), Some(&all));
 }
+
+/// G4.3cd: a business IPoE subscriber's routed block (`routes` of its
+/// secret): the LPM entry after the session's, a kernel route via the
+/// subscriber (the kernel forwards IPoE downstream), IPv6 refused (IPoE is
+/// IPv4), and all of it gone, before the session, when it ends.
+#[test]
+fn routed_blocks_follow_the_ipoe_session() {
+    let mut lab = Lab::new(json!({"ipoe": true, "ipoe_unknown": "reject"}));
+    ok(&mut lab.s, "ppp.secret.add", json!({"name": "02:1A:B0:02:00:01", "service": "ipoe", "routes": "203.0.113.8/29,2001:db8:100::/48"}));
+    lab.configure();
+    lab.core.set_xdp(true);
+    lab.run(20);
+    let rows = lab.active();
+    let r = rows.iter().find(|r| r["caller_id"] == "02:1A:B0:02:00:01").unwrap().clone();
+    assert_eq!(r["routes"][0]["route"], "203.0.113.8/29", "{r}");
+    assert_eq!(r["routes"][0]["origin"], "secret");
+    assert!(r["refused_routes"][0].as_str().unwrap().contains("G4.3s"), "{r}");
+    let ip: std::net::Ipv4Addr = r["address"].as_str().unwrap().parse().unwrap();
+    let ops = lab.core.take_ops();
+    let up = ops.iter().position(|o| matches!(o, XdpOp::Upsert { ip: a, .. } if *a == ip)).unwrap();
+    let route = ops.iter().position(|o| matches!(o, XdpOp::Route { add: true, .. })).unwrap();
+    assert!(up < route, "{ops:?}");
+    let k = lab.core.take_kernel_routes();
+    assert_eq!(k.len(), 1);
+    assert_eq!((k[0].dst.to_string(), k[0].via, k[0].add), ("203.0.113.8/29".to_owned(), ip, true));
+    assert!(lab.core.take_logs().iter().any(|(e, t)| *e && t.contains("rota recusada")));
+    ok(&mut lab.s, "ppp.active.remove", json!({"id": r["id"]}));
+    lab.run(2);
+    let ops = lab.core.take_ops();
+    let gone = ops.iter().position(|o| matches!(o, XdpOp::Route { add: false, .. })).unwrap();
+    let removed = ops.iter().position(|o| matches!(o, XdpOp::Remove(_))).unwrap();
+    assert!(gone < removed, "{ops:?}");
+    let k = lab.core.take_kernel_routes();
+    assert!(k.iter().any(|x| !x.add && x.dst.to_string() == "203.0.113.8/29"), "{k:?}");
+}
+
+/// G4.3cd: a CoA with `Framed-Route` changes an IPoE subscriber's blocks
+/// without ending the lease; an invalid one is refused whole (NAK 407).
+#[test]
+fn coa_changes_ipoe_routes() {
+    let mut lab = Lab::new(json!({"use_radius": "yes"}));
+    lab.run(20);
+    let _ = lab.core.take_kernel_routes();
+    let owner = Owner(lab.core.clone());
+    let coa = |routes: &[&str]| CoaRequest {
+        kind: CoaKind::Coa,
+        from: "127.0.0.1:3799".parse().unwrap(),
+        selector: CoaSelector { user_name: Some("02:1A:B0:02:00:01".into()), ..CoaSelector::default() },
+        changes: routes.iter().map(|r| Attribute::new("Framed-Route", *r)).collect(),
+        authorize_only: false,
+        packet: Vec::new(),
+    };
+    assert_eq!(owner.handle(&coa(&["127.0.0.0/8"])), CoaOutcome::Nak(407));
+    assert_eq!(owner.handle(&coa(&["192.168.88.0/29"])), CoaOutcome::Nak(407), "holds the router's 192.168.88.1");
+    assert!(lab.core.take_kernel_routes().is_empty());
+    assert_eq!(owner.handle(&coa(&["203.0.113.8/29"])), CoaOutcome::Ack);
+    assert_eq!(owner.handle(&coa(&["203.0.113.64/29"])), CoaOutcome::Ack);
+    let k: Vec<String> = lab.core.take_kernel_routes().iter().map(|k| format!("{}{}", if k.add { "+" } else { "-" }, k.dst)).collect();
+    assert_eq!(k, ["+203.0.113.8/29", "+203.0.113.64/29", "-203.0.113.8/29"]);
+    let row = lab.active().into_iter().find(|r| r["caller_id"] == "02:1A:B0:02:00:01").unwrap();
+    assert_eq!(row["routes"][0]["route"], "203.0.113.64/29");
+    lab.run(2);
+    assert_eq!(lab.active().len(), 2, "no lease ended");
+}
