@@ -249,7 +249,22 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 /// (shadowed targets, overlaps with dynamic queues).
 fn with_plan_warnings(s: &Session, mut out: Value, mut w: Vec<String>) -> Result<Value> {
     let id = out.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let plan = crate::queue::plan(s.store().candidate(), crate::queue::dhcp_dynamic(s));
+    let dynamic = crate::queue::dhcp_dynamic(s);
+    if dynamic.is_empty() {
+        let cfg = s.store().candidate();
+        if let Some(i) = cfg.queue.simple.iter().position(|q| q.id.to_string() == id) {
+            for x in crate::queue::fixed_warnings(cfg, i) {
+                if !w.contains(&x) {
+                    w.push(x);
+                }
+            }
+        }
+        if let Some(o) = out.as_object_mut() {
+            o.insert("warnings".into(), json!(w));
+        }
+        return Ok(out);
+    }
+    let plan = crate::queue::plan(s.store().candidate(), dynamic);
     if let Some(i) = plan.queues.iter().position(|q| q.key == id) {
         w.extend(plan.warnings_of(i).iter().cloned());
     }
