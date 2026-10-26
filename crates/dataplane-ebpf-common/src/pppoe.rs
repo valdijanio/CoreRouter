@@ -60,6 +60,11 @@ pub const F_FAST_UP: u16 = 1 << 4;
 /// Downstream packets may be encapsulated in XDP without the kernel.
 /// Flows conntrack already accepted (the CGNAT fast path) always may.
 pub const F_FAST_DOWN: u16 = 1 << 5;
+/// G4.9b: the download is shaped (EDT on the access port's egress, the
+/// `shape_egress` tc program) instead of policed here: downstream packets
+/// go to the kernel, which routes them to `bng0` (PPPoE) or straight to
+/// the port (IPoE). Bit 6 is `ipoe::F_IPOE`.
+pub const F_SHAPE_DOWN: u16 = 1 << 7;
 
 /// `SETTINGS` slot of the PPPoE switch (bit 0: on). Off, the program
 /// never looks at PPPoE frames (they pass as before).
@@ -404,10 +409,13 @@ pub enum Stat {
     IpoeDhcp = 18,
     /// IPoE downstream, policed and counted, then forwarded by the kernel.
     IpoeDownKernel = 19,
+    /// Downstream of a shaped session (G4.9b): to the kernel, which routes
+    /// it to `bng0` or the IPoE port, where the shaper holds it.
+    DownShaped = 20,
 }
 
 impl Stat {
-    pub const ALL: [Stat; 20] = [
+    pub const ALL: [Stat; 21] = [
         Stat::UpFast,
         Stat::UpKernel,
         Stat::Discovery,
@@ -428,8 +436,9 @@ impl Stat {
         Stat::DownTagged,
         Stat::IpoeDhcp,
         Stat::IpoeDownKernel,
+        Stat::DownShaped,
     ];
-    pub const SLOTS: u32 = 20;
+    pub const SLOTS: u32 = 21;
 
     pub fn name(self) -> &'static str {
         match self {
@@ -453,6 +462,7 @@ impl Stat {
             Stat::DownTagged => "down-tagged",
             Stat::IpoeDhcp => "ipoe-dhcp",
             Stat::IpoeDownKernel => "ipoe-down-kernel",
+            Stat::DownShaped => "down-shaped",
         }
     }
 }
@@ -470,8 +480,12 @@ pub trait Sessions {
     /// Session index whose /64 or delegated prefix holds IPv6 `dst`
     /// (longest prefix).
     fn by_v6(&self, dst: [u8; 16]) -> Option<u32>;
+    /// The policer state's words (BPF atomics in the kernel, G4.3cc).
+    type Policer<'a>: crate::words::Words
+    where
+        Self: 'a;
     /// Policer state of session `idx`, direction `dir` (0 up, 1 down).
-    fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State>;
+    fn policer(&mut self, idx: u32, dir: u32) -> Option<Self::Policer<'_>>;
     /// Whether `ifindex` has IPoE subscribers (`IPOE_PORTS`, G4.3f).
     fn ipoe_port(&self, ifindex: u32) -> bool {
         let _ = ifindex;
@@ -496,7 +510,7 @@ fn police<L: Sessions>(l: &mut L, idx: u32, dir: u32, now: u64, bytes: u64) -> b
         return true;
     }
     match l.policer(idx, dir) {
-        Some(st) => policer::admit(st, &r, now, bytes),
+        Some(mut st) => policer::admit(&mut st, &r, now, bytes),
         None => true,
     }
 }
@@ -818,6 +832,11 @@ pub fn downstream<L: Sessions>(
     if !s.has(F_ACTIVE) {
         return Down::NotSub;
     }
+    // Shaped: the queue is on the egress (an skb path), so the kernel
+    // takes it, uncounted here (the shaper counts what it sends).
+    if s.has(F_SHAPE_DOWN) {
+        return Down::Kernel(Stat::DownShaped, idx);
+    }
     if !accepted && !s.has(F_FAST_DOWN) {
         // IPoE: the kernel reaches the subscriber itself (no header to
         // push), so the policer and the counters act here and the packet
@@ -839,7 +858,25 @@ pub fn downstream<L: Sessions>(
     if !police(l, idx, 1, now, u64::from(ip_len)) {
         return Down::Drop(Stat::DownPoliced, idx);
     }
-    Down::Encap(DownSession {
+    Down::Encap(down_of(&s, idx, ip_len, v6))
+}
+
+/// Where a packet of `ip_len` to session `idx` goes, without the policer
+/// nor the fast-path rules: `bng0`'s encapsulation (G4.3ca), for what the
+/// kernel already routed, filtered and fitted to the session's MTU.
+/// `None`: no active PPPoE session there.
+#[inline(always)]
+pub fn session_down<L: Sessions>(l: &L, idx: u32, ip_len: u16, v6: bool) -> Option<DownSession> {
+    let s = l.session(idx).map(View::of)?;
+    if !s.has(F_ACTIVE) || s.has(crate::ipoe::F_IPOE) {
+        return None;
+    }
+    Some(down_of(&s, idx, ip_len, v6))
+}
+
+#[inline(always)]
+fn down_of(s: &View, idx: u32, ip_len: u16, v6: bool) -> DownSession {
+    DownSession {
         idx,
         ifindex: s.ifindex,
         tags: s.tags(),
@@ -856,7 +893,7 @@ pub fn downstream<L: Sessions>(
         ip_len,
         v6,
         ipoe: s.has(crate::ipoe::F_IPOE),
-    })
+    }
 }
 
 /// Push the access-side header on an untagged frame whose IP packet `d`

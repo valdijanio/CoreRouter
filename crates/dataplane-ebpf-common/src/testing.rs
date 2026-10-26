@@ -356,6 +356,8 @@ impl Sessions for Subs {
             .max_by_key(|(_, l, _)| *l)
             .map(|(_, _, i)| *i)
     }
+    type Policer<'a> = &'a mut policer::State;
+
     fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State> {
         self.policers.get_mut(&(idx, dir))
     }

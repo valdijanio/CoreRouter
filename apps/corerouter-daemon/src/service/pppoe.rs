@@ -231,7 +231,7 @@ mod linux {
             let now = ms();
             if last_second.is_none_or(|t| t.elapsed() >= SECOND) {
                 last_second = Some(Instant::now());
-                let (ppp, pools, pools6, aaa) = {
+                let (ppp, pools, pools6, aaa, queues) = {
                     let s = lock(session);
                     let c = s.store().running();
                     (
@@ -239,6 +239,7 @@ mod linux {
                         c.ip.pools.clone(),
                         c.ipv6.dhcp_server.pools.clone(),
                         s.aaa_backend(),
+                        c.queue.clone(),
                     )
                 };
                 // CoA/Disconnect: one registration per RADIUS service.
@@ -276,7 +277,7 @@ mod linux {
                     ifaces.sort();
                     d.choose_plane(session, &shared, ifaces);
                 }
-                let snap = Snapshot { ppp, pools, aaa, unix_base, pools6, iid_key };
+                let snap = Snapshot { ppp, pools, aaa, unix_base, pools6, iid_key, queues };
                 let xdp = d.plane == Some(true);
                 for w in &d.workers {
                     let _ = w.send(Msg::Config(Box::new(snap.clone()), infos.clone(), xdp));

@@ -1013,6 +1013,8 @@ pub(crate) struct Snapshot {
     /// driver, so a line keeps its link-local across restarts); `None`:
     /// one drawn from the seed, for this run.
     pub iid_key: Option<[u8; 32]>,
+    /// G4.9b: `/queue type`s, for the profiles' download queue.
+    pub queues: corerouter_model::queue::Queues,
 }
 
 pub(crate) struct Bng {
@@ -1943,7 +1945,8 @@ impl Bng {
                 if let Some(sub) = self.subs.get(&(i, session.sid))
                     && let Some(idx) = sub.xdp
                 {
-                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref());
+                    let shape = corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
+                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref(), shape);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(idx, s)));
                 }
             }
@@ -2439,7 +2442,12 @@ impl Bng {
         match xdp {
             Some(idx) => self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                 idx,
-                xdp_session(d, sub.rate.as_deref(), sub.v6.as_deref()),
+                xdp_session(
+                    d,
+                    sub.rate.as_deref(),
+                    sub.v6.as_deref(),
+                    corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective),
+                ),
             ))),
             None => {
                 if let Some(ip) = ip {
@@ -2998,9 +3006,11 @@ impl Bng {
             if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
                 sub.rate = Some(rate.clone());
                 if let Some(idx) = sub.xdp {
+                    // CoA: the rate changes, the queue (its clock) stays.
+                    let shape = corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                         idx,
-                        xdp_session(&d, Some(&rate), sub.v6.as_deref()),
+                        xdp_session(&d, Some(&rate), sub.v6.as_deref(), shape),
                     )));
                 }
                 let user = sub.user.clone();
@@ -3171,13 +3181,14 @@ fn rate_dir(r: &RateLimit, up: bool) -> Rate {
     }
 }
 
-/// The XDP map entry of a session (G4.3c): downstream always in XDP
-/// (the kernel path to the subscriber is G4.3ca), upstream through the
-/// kernel so `forward` and the queues see it.
+/// The XDP map entry of a session (G4.3c): downstream in XDP, or, shaped
+/// (G4.9b), through the kernel and `bng0` to the shaper on the access port;
+/// upstream through the kernel so `forward` and the queues see it.
 fn xdp_session(
     d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
     rate: Option<&str>,
     v6: Option<&V6>,
+    shape: Option<corerouter_hal::queue::Kind>,
 ) -> PppoeSession {
     let r = rate
         .and_then(|t| t.parse::<RateLimit>().ok())
@@ -3203,6 +3214,7 @@ fn xdp_session(
         delegated: v6
             .and_then(|x| x.delegated.as_ref())
             .map(|(n, _)| (v6::high64(*n), n.prefix_len())),
+        shape,
     }
 }
 
