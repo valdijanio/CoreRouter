@@ -934,3 +934,20 @@ Com o XDP (produção) os quadros de dados nunca viram skb e não passam pelos s
 descoberta e o controle pagam o custo por socket. No caminho lento, cada quadro da porta paga
 N × ~45 ns. O desenho anterior pagava o mesmo para cada quadro de sessão (N sockets presos a
 0x8864); agora pagam também os quadros que não são PPPoE, que numa porta de acesso são raros.
+
+### 12.5 IPv6 encaminhado no caminho lento (parte 2)
+
+Sem XDP, o BNG encaminha também o IPv6 dos assinantes, como já fazia com o IPv4:
+
+- **Subida:** um pacote para fora do enlace (nem link-local, nem multicast) vale só se a fonte
+  estiver no /64 ou no prefixo delegado da sessão, e chegar no MAC e nas tags da sessão: é o
+  antispoofing do XDP (G4.3e). Ele entra na pilha por um socket IPv6 cru (`IPPROTO_RAW`, cabeçalho
+  como veio). O link-local e o multicast continuam com o plano de controle da sessão (RS, NS,
+  DHCPv6, eco ao nosso link-local).
+- **Descida:** cada /64 e cada prefixo delegado ganham uma rota para o `bng0`, que some com a
+  sessão. O que o kernel manda ali volta ao worker dono pelo maior prefixo
+  (`pppoe_slow6::Net6Index`: uma consulta de hash por comprimento de prefixo em uso), e o worker
+  encapsula na sessão, dentro das tags da linha.
+- **Medido** (2026-10-26, Ryzen AI Max+ 395, release): ~16 ns por consulta com 200 000 prefixos
+  (100 000 sessões, um /64 e um /56 cada). Em namespace, um assinante QinQ dual-stack pinga o IPv6
+  do `wan0` pelo caminho lento, e a resposta volta dentro das duas tags.

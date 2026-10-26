@@ -19,6 +19,8 @@ use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use ipnet::Ipv6Net;
+
 use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
@@ -51,6 +53,7 @@ use corerouter_proto_pppoe::wire::Mac;
 use corerouter_proto_radius::rate_limit::RateLimit;
 
 use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
+use super::pppoe_slow6::{self as slow6, Net6Index};
 
 /// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
 /// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
@@ -81,6 +84,9 @@ pub(crate) enum Effect {
     Xdp(PppoeOp),
     /// The slow path's /32 route to `bng0` (no XDP).
     Route { ip: Ipv4Addr, add: bool },
+    /// The slow path's IPv6 route of a session's /64 or delegated prefix
+    /// to `bng0` (G4.3l).
+    Route6 { net: Ipv6Net, add: bool },
     /// Engine commands (hooks, address lists), run under the session lock.
     Run {
         command: String,
@@ -873,6 +879,8 @@ impl Admission {
 
 /// Slow path: subscriber address → the worker holding it.
 pub(crate) type Routes = Arc<std::sync::RwLock<HashMap<Ipv4Addr, u16>>>;
+/// Slow path, IPv6 (G4.3l): which worker holds each subscriber prefix.
+pub(crate) type Routes6 = Arc<std::sync::RwLock<Net6Index<u16>>>;
 
 /// A worker's share of a per-second rate (0 = no limit stays 0).
 fn share(rate: u32, lanes: u16) -> u32 {
@@ -1064,6 +1072,9 @@ pub(crate) struct Bng {
     /// Slow path: which worker holds each subscriber address (the driver
     /// hands it the packets the kernel routes to `bng0`).
     routes: Routes,
+    routes6: Routes6,
+    /// Slow path, IPv6: the session of each /64 and delegated prefix.
+    net6: Net6Index<(usize, u16)>,
     xdp_free: Vec<u32>,
     xdp_next: u32,
     pub shared: Arc<Mutex<Shared>>,
@@ -1304,6 +1315,8 @@ impl Bng {
             lane: 0,
             lanes: 1,
             routes: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            routes6: Arc::new(std::sync::RwLock::new(Net6Index::default())),
+            net6: Net6Index::default(),
             xdp_free: Vec::new(),
             xdp_next: 0,
             shared,
@@ -1341,6 +1354,7 @@ impl Bng {
         b.pools = self.pools.clone();
         b.pools6 = self.pools6.clone();
         b.routes = self.routes.clone();
+        b.routes6 = self.routes6.clone();
         b.lane = lane;
         b.lanes = lanes.max(1);
         b.admission.lanes = b.lanes;
@@ -1366,6 +1380,15 @@ impl Bng {
     /// The worker of slow-path address `ip`, if a session holds it.
     pub(crate) fn route_lane_in(routes: &Routes, ip: Ipv4Addr) -> Option<u16> {
         routes.read().ok().and_then(|r| r.get(&ip).copied())
+    }
+
+    pub(crate) fn clone_routes6(&self) -> Routes6 {
+        self.routes6.clone()
+    }
+
+    /// The worker of slow-path IPv6 address `ip` (longest prefix).
+    pub(crate) fn route6_lane_in(routes: &Routes6, ip: std::net::Ipv6Addr) -> Option<u16> {
+        routes.read().ok().and_then(|r| r.get(ip))
     }
 
     /// The worker of a frame from a client (its source MAC; RSS-like): a
@@ -1665,7 +1688,9 @@ impl Bng {
         let Some(sub) = self.subs.get(&(slot, f.session_id)) else {
             return;
         };
-        if sub.mac != f.link.src || sub.up_at.is_none() {
+        // The session's MAC on the session's line (G4.3l: a frame with
+        // another line's tags is not this session's).
+        if sub.mac != f.link.src || sub.vlans != f.link.vlans || sub.up_at.is_none() {
             return;
         }
         let src = f.info.get(12..16).map(|b| {
@@ -1798,9 +1823,15 @@ impl Bng {
         let acct = (sub.radius || self.cfg.ppp.aaa.use_radius) && self.cfg.ppp.aaa.accounting;
         let acct_id = sub.acct_id.clone();
         let interim = sub.interim;
+        let nets: Vec<Ipv6Net> = [&x.link, &x.delegated]
+            .into_iter()
+            .flatten()
+            .map(|(n, _)| *n)
+            .collect();
         sub.v6 = Some(Box::new(x));
         let fields = sub.v6.as_deref().map(active_v6);
         let id = session_id(i, &self.slots, sref.sid);
+        self.slow_routes6((i, sref.sid), &nets, true);
         for p in problems {
             self.log(true, format!("PPP: {user}: {p}"));
         }
@@ -1846,10 +1877,37 @@ impl Bng {
             self.v6_dropped += 1;
             return;
         };
-        let Some(x) = sub.v6.as_deref_mut().filter(|_| sub.mac == f.link.src) else {
+        let Some(x) = sub
+            .v6
+            .as_deref_mut()
+            .filter(|_| sub.mac == f.link.src && sub.vlans == f.link.vlans)
+        else {
             self.v6_dropped += 1;
             return;
         };
+        // G4.3l: without XDP, IPv6 to anything but the link is forwarded
+        // here, from the session's own prefixes only (the XDP's
+        // anti-spoofing, G4.3e).
+        if !self.xdp
+            && let Some((src, dst)) = slow6::addrs(f.info)
+            && !slow6::for_the_link(dst)
+        {
+            let own = [&x.link, &x.delegated]
+                .into_iter()
+                .flatten()
+                .any(|(n, _)| n.contains(&src));
+            if !own || sub.up_at.is_none() {
+                self.v6_dropped += 1;
+                return;
+            }
+            let len = f.info.len() as u64;
+            if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+                a.rx_bytes += len;
+                a.rx_packets += 1;
+            }
+            self.upstream.push(f.info.to_vec());
+            return;
+        }
         let before = x.dropped;
         let Some(out) = x.handle(now, f.info, rand) else {
             self.v6_dropped += 1;
@@ -1897,6 +1955,10 @@ impl Bng {
     /// Downstream IPv4 to a subscriber (slow path): encapsulated for its
     /// session, or dropped when nobody has the address.
     pub(crate) fn data_down(&mut self, packet: &[u8]) {
+        if packet.first().is_some_and(|b| b >> 4 == 6) {
+            self.data_down6(packet);
+            return;
+        }
         let Some(dst) = packet.get(16..20) else {
             return;
         };
@@ -1927,6 +1989,58 @@ impl Bng {
             a.tx_packets += 1;
         }
         self.frames.push((port.ifindex, f));
+    }
+
+    /// Slow path, IPv6 (G4.3l): a packet the kernel routed to a
+    /// subscriber's prefix, into its session.
+    fn data_down6(&mut self, packet: &[u8]) {
+        let Some((_, dst)) = slow6::addrs(packet) else {
+            return;
+        };
+        let Some(key) = self.net6.get(dst) else {
+            return;
+        };
+        let Some(sub) = self.subs.get(&key) else {
+            return;
+        };
+        let Some(port) = self.slots.get(key.0).map(|s| s.port) else {
+            return;
+        };
+        if packet.len() > usize::from(sub.mtu.max(1280)) {
+            return;
+        }
+        let f = v6::frame(sub.mac.0, port.mac, sub.vlans, key.1, packet);
+        let id = session_id(key.0, &self.slots, key.1);
+        if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+            a.tx_bytes += packet.len() as u64;
+            a.tx_packets += 1;
+        }
+        self.frames.push((port.ifindex, f));
+    }
+
+    /// Slow path, IPv6: route a session's prefixes to `bng0` (`add`) or
+    /// take them away, and index them for the packets coming back.
+    fn slow_routes6(&mut self, key: (usize, u16), nets: &[Ipv6Net], add: bool) {
+        if self.xdp {
+            return;
+        }
+        for &net in nets {
+            if add {
+                self.net6.insert(net, key);
+            } else if self.net6.get(net.network()) == Some(key) {
+                self.net6.remove(net);
+            } else {
+                continue;
+            }
+            if let Ok(mut r) = self.routes6.write() {
+                if add {
+                    r.insert(net, self.lane);
+                } else {
+                    r.remove(net);
+                }
+            }
+            self.effects.push(Effect::Route6 { net, add });
+        }
     }
 
     /// Call server `i`, handle what it says, then the answers that
@@ -2718,6 +2832,14 @@ impl Bng {
             self.xdp_free.push(idx);
         } else if let (Some(ip), true) = (sub.ip, was_up) {
             self.effects.push(Effect::Route { ip, add: false });
+        }
+        if let Some(x) = &sub.v6 {
+            let nets: Vec<Ipv6Net> = [&x.link, &x.delegated]
+                .into_iter()
+                .flatten()
+                .map(|(n, _)| *n)
+                .collect();
+            self.slow_routes6((sub.slot, sub.sref.sid), &nets, false);
         }
         if let Some(ip) = sub.ip {
             guard(&self.pools).give_back(ip);

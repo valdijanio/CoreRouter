@@ -217,7 +217,7 @@ mod linux {
         };
         let first = Bng::first_of(seed(), lanes);
         let shared = first.shared.clone();
-        let routes = first.clone_routes();
+        let routes = (first.clone_routes(), first.clone_routes6());
         let owner = Arc::new(Owner(shared.clone()));
         let mut owner_of: Option<usize> = None;
         lock(session).set_ppp_backend(Arc::new(Backend(shared.clone())));
@@ -445,20 +445,25 @@ mod linux {
         }
         let mut ops: Vec<PppoeOp> = Vec::new();
         let mut routes: Vec<(std::net::Ipv4Addr, bool)> = Vec::new();
+        let mut routes6: Vec<(std::net::Ipv6Addr, u8, bool)> = Vec::new();
         let mut locked: Vec<Effect> = Vec::new();
         for e in effects {
             match e {
                 Effect::Xdp(op) => ops.push(op),
                 Effect::Route { ip, add } => routes.push((ip, add)),
+                Effect::Route6 { net, add } => routes6.push((net.network(), net.prefix_len(), add)),
                 other => locked.push(other),
             }
         }
-        // The round's /32 routes in one go on the worker's own connection.
-        if let Some(s) = slow
-            && let Err(e) = s.routes(&routes)
-            && errors.len() < 100
-        {
-            errors.push(e.to_string());
+        // The round's routes in one go on the worker's own connection.
+        if let Some(s) = slow {
+            for r in [s.routes(&routes), s.routes6(&routes6)] {
+                if let Err(e) = r
+                    && errors.len() < 100
+                {
+                    errors.push(e.to_string());
+                }
+            }
         }
         if ops.is_empty() && locked.is_empty() {
             return;
@@ -486,7 +491,7 @@ mod linux {
                     let level = if error { "error" } else { "info" };
                     s.log_event(&["ppp", level], "pppoe", text, json!({}));
                 }
-                Effect::Xdp(_) | Effect::Route { .. } => {}
+                Effect::Xdp(_) | Effect::Route { .. } | Effect::Route6 { .. } => {}
             }
         }
         for err in s.ppp_address_lists(&lists) {
@@ -596,7 +601,7 @@ mod linux {
 
         /// Every frame waiting, to the worker of its client's MAC; the slow
         /// path's packets to the worker holding the address.
-        fn receive(&mut self, routes: &super::super::pppoe_bng::Routes) {
+        fn receive(&mut self, routes: &(super::super::pppoe_bng::Routes, super::super::pppoe_bng::Routes6)) {
             let lanes = u16::try_from(self.workers.len()).unwrap_or(1).max(1);
             let workers = &self.workers;
             let mut dropped = 0u64;
@@ -618,8 +623,15 @@ mod linux {
             }
             if let Some(s) = self.slow.as_mut()
                 && let Err(e) = s.recv(|p| {
-                    let dst = p.get(16..20).and_then(|d| <[u8; 4]>::try_from(d).ok());
-                    if let Some(lane) = dst.and_then(|d| Bng::route_lane_in(routes, std::net::Ipv4Addr::from(d))) {
+                    // IPv4 by its /32, IPv6 by the longest prefix (G4.3l).
+                    let lane = if p.first().is_some_and(|b| b >> 4 == 6) {
+                        let dst = p.get(24..40).and_then(|d| <[u8; 16]>::try_from(d).ok());
+                        dst.and_then(|d| Bng::route6_lane_in(&routes.1, std::net::Ipv6Addr::from(d)))
+                    } else {
+                        let dst = p.get(16..20).and_then(|d| <[u8; 4]>::try_from(d).ok());
+                        dst.and_then(|d| Bng::route_lane_in(&routes.0, std::net::Ipv4Addr::from(d)))
+                    };
+                    if let Some(lane) = lane {
                         deliver(lane, Msg::Down(p.to_vec()));
                     }
                 })
