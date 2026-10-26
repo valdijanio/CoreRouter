@@ -5,7 +5,9 @@
 //!
 //! 1. PPPoE subscribers (G4.3c), when on: session frames are checked,
 //!    policed and decapsulated (`pppoe::upstream`, `pppoe::decap`); control
-//!    frames pass to the daemon untouched;
+//!    frames pass to the daemon untouched. IPoE subscribers (G4.3f), when
+//!    on: the IP↔MAC binding and the policer (`ipoe::upstream`), nothing
+//!    to strip;
 //! 2. the filter (G2.5a, `filter::decide`);
 //! 3. the CGNAT fast path (G2.5b, `fastnat`);
 //! 4. PPPoE again: a packet to a subscriber is encapsulated and sent out of
@@ -45,6 +47,7 @@ use corerouter_dataplane_ebpf_common::filter::{self, Lookups, SETTINGS_WORDS, Se
 use corerouter_dataplane_ebpf_common::maps::{self as m, Counter, Top};
 use corerouter_dataplane_ebpf_common::packet::Packet;
 use corerouter_dataplane_ebpf_common::parse::{Addr, ETH_HLEN, IpInfo};
+use corerouter_dataplane_ebpf_common::ipoe;
 use corerouter_dataplane_ebpf_common::policer;
 use corerouter_dataplane_ebpf_common::pppoe::{
     self, Counters, Down, DownSession, KEY_LEN, PacketHead, SessionWords, Sessions, Stat, Up,
@@ -89,6 +92,8 @@ static PPPOE_POLICER: Array<policer::State> =
 static PPPOE_COUNTERS: Array<Counters> = Array::with_max_entries(pppoe::SESSIONS_MAX, 0);
 #[map(name = "PPPOE_STATS")]
 static PPPOE_STATS: PerCpuArray<u64> = PerCpuArray::with_max_entries(Stat::SLOTS, 0);
+#[map(name = "IPOE_PORTS")]
+static IPOE_PORTS: HashMap<u32, u32> = HashMap::with_max_entries(ipoe::PORTS_MAX, 0);
 
 /// The frame between `data` and `data_end`.
 struct Frame<'a>(&'a XdpContext);
@@ -182,6 +187,11 @@ impl Sessions for Subs {
         // plain integers, so a race only makes the rate approximate.
         Some(unsafe { &mut *p })
     }
+
+    #[inline(always)]
+    fn ipoe_port(&self, ifindex: u32) -> bool {
+        IPOE_PORTS.get_ptr(&ifindex).is_some()
+    }
 }
 
 /// One more `what` in the global PPPoE statistics (this CPU's copy).
@@ -234,6 +244,12 @@ fn encap_out(frame: &mut Frame, d: &DownSession) -> u32 {
 fn down_other(d: Down) -> Option<u32> {
     match d {
         Down::NotSub | Down::Encap(_) => None,
+        Down::Counted(st, idx, len) => {
+            stat(st);
+            sess_add(idx, pppoe::C_DOWN_PACKETS, 1);
+            sess_add(idx, pppoe::C_DOWN_BYTES, u64::from(len));
+            Some(xdp_action::XDP_PASS)
+        }
         Down::Kernel(st, idx) => {
             stat(st);
             sess_add(idx, pppoe::C_KERNEL, 1);
@@ -601,11 +617,10 @@ fn fast_nat(
     Some(unsafe { bpf_redirect(fib.ifindex, 0) } as u32)
 }
 
+/// The subscriber switches: bit 0 PPPoE, [`ipoe::SETTINGS_BIT`] IPoE.
 #[inline(always)]
-fn pppoe_on() -> bool {
-    SETTINGS
-        .get(pppoe::SETTINGS_SLOT)
-        .is_some_and(|w| *w & 1 != 0)
+fn subscribers() -> u64 {
+    SETTINGS.get(pppoe::SETTINGS_SLOT).map_or(0, |w| *w & (1 | ipoe::SETTINGS_BIT))
 }
 
 /// What [`up_stage`] says: go on as a plain frame, stop with an XDP
@@ -621,10 +636,18 @@ const UP_FAST: u64 = 1 << 34;
 /// chain), so it returns one word: [`UP_NONE`], [`UP_DONE`] | action, or
 /// [`UP_SESSION`] | flags | session index (decapsulated by then).
 #[inline(never)]
-fn up_stage(ctx: &XdpContext, now: u64) -> u64 {
+fn up_stage(ctx: &XdpContext, now: u64, on: u64) -> u64 {
     let mut frame = Frame(ctx);
     let ifindex = ctx.ingress_ifindex() as u32;
-    match pppoe::upstream(&frame, ifindex, &mut Subs, now) {
+    let mut up = if on & 1 != 0 {
+        pppoe::upstream(&frame, ifindex, &mut Subs, now)
+    } else {
+        Up::NotPppoe
+    };
+    if up == Up::NotPppoe && on & ipoe::SETTINGS_BIT != 0 {
+        up = ipoe::upstream(&frame, ifindex, &mut Subs, now);
+    }
+    match up {
         Up::NotPppoe => UP_NONE,
         Up::User(st) => {
             stat(st);
@@ -640,7 +663,7 @@ fn up_stage(ctx: &XdpContext, now: u64) -> u64 {
             UP_DONE | u64::from(xdp_action::XDP_DROP)
         }
         Up::Session(u) => {
-            if pppoe::decap(&mut frame, u.tags, u.v6).is_none() {
+            if !u.ipoe && pppoe::decap(&mut frame, u.tags, u.v6).is_none() {
                 stat(Stat::Malformed);
                 return UP_DONE | u64::from(xdp_action::XDP_DROP);
             }
@@ -729,8 +752,9 @@ pub fn corerouter_xdp(ctx: XdpContext) -> u32 {
     // SAFETY: a BPF helper with no arguments and no preconditions
     // (CLOCK_MONOTONIC in nanoseconds).
     let now = unsafe { bpf_ktime_get_ns() };
-    let pppoe_on = pppoe_on();
-    let up = if pppoe_on { up_stage(&ctx, now) } else { UP_NONE };
+    let subs = subscribers();
+    let pppoe_on = subs != 0;
+    let up = if pppoe_on { up_stage(&ctx, now, subs) } else { UP_NONE };
     if up & UP_DONE != 0 {
         return up as u32;
     }

@@ -32,10 +32,15 @@ pub enum Drop {
     Probing,
     /// A message type a server never acts on (OFFER, ACK…, as a request).
     Unexpected,
+    /// A retransmission while the client's authorization is asked (IPoE,
+    /// G4.3f), or too many waiting.
+    Authorizing,
+    /// The client was refused (RADIUS reject, no secret) a moment ago.
+    Rejected,
 }
 
 impl Drop {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 13] = [
         Self::Malformed,
         Self::Bootp,
         Self::NoServer,
@@ -47,6 +52,8 @@ impl Drop {
         Self::OtherServer,
         Self::Probing,
         Self::Unexpected,
+        Self::Authorizing,
+        Self::Rejected,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -62,13 +69,15 @@ impl Drop {
             Self::OtherServer => "other-server",
             Self::Probing => "probing",
             Self::Unexpected => "unexpected",
+            Self::Authorizing => "authorizing",
+            Self::Rejected => "rejected",
         }
     }
 
     /// Whether the drop points at a problem (and not at normal life: a
     /// client picking another server, a retransmission while probing).
     pub fn is_problem(self) -> bool {
-        !matches!(self, Self::OtherServer | Self::Probing)
+        !matches!(self, Self::OtherServer | Self::Probing | Self::Authorizing)
     }
 
     fn index(self) -> usize {
@@ -111,6 +120,15 @@ pub struct Stats {
     pub conflicts: u64,
     /// Replies from other servers heard where an alert watches.
     pub rogue_replies: u64,
+    /// Authorizations (IPoE, G4.3f): asked, accepted, rejected, and asked
+    /// without an answer in time.
+    pub auth_asked: u64,
+    pub auth_accepted: u64,
+    pub auth_rejected: u64,
+    pub auth_timeouts: u64,
+    /// Messages served without a rate-limit bucket (the table was full of
+    /// clients still counting: a storm larger than `MAX_CLIENTS_TRACKED`).
+    pub untracked: u64,
     /// ACKs per second: `acks[s % 60]` for second `s`.
     acks: [u32; ACK_WINDOW],
     acks_at: [u64; ACK_WINDOW],
@@ -135,6 +153,11 @@ impl Stats {
             probes: 0,
             conflicts: 0,
             rogue_replies: 0,
+            auth_asked: 0,
+            auth_accepted: 0,
+            auth_rejected: 0,
+            auth_timeouts: 0,
+            untracked: 0,
             acks: [0; ACK_WINDOW],
             acks_at: [0; ACK_WINDOW],
             peak_acks: 0,

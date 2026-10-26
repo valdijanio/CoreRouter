@@ -473,6 +473,17 @@ pub trait Hal: Send {
         )))
     }
 
+    /// IPoE subscribers in the XDP data plane (G4.3f): the access ports
+    /// whose subscribers' sessions go in the same maps as PPPoE's. Off
+    /// (or `Err`): the sessions exist without the policer.
+    fn ipoe_dataplane(&mut self, on: bool, ports: &[IfName]) -> Result<(), HalError> {
+        let _ = (on, ports);
+        Err(HalError::Unsupported(format!(
+            "{} has no XDP data plane",
+            self.describe()
+        )))
+    }
+
     /// Change the XDP session map, in order.
     fn pppoe_apply(&mut self, ops: &[pppoe::PppoeOp]) -> Result<(), HalError> {
         let _ = ops;

@@ -180,6 +180,26 @@ const SERVER: ItemKind = ItemKind {
         text_field("client_mac_limit", "Client MAC Limit", "unlimited"),
         text_field("client_rate_limit", "Client Rate Limit", "10 messages/s"),
         bool_field("relay_info_trusted", "Trust Option 82 Without Relay"),
+        Field {
+            key: "use_radius",
+            label: "Use RADIUS",
+            kind: FieldKind::Choice(&["no", "yes", "accounting"]),
+            hint: "",
+        },
+        bool_field("ipoe", "IPoE Sessions"),
+        Field {
+            key: "ipoe_username",
+            label: "IPoE Username",
+            kind: FieldKind::Choice(&["mac", "circuit-id", "remote-id", "circuit-remote"]),
+            hint: "",
+        },
+        Field {
+            key: "ipoe_unknown",
+            label: "IPoE Unknown Clients",
+            kind: FieldKind::Choice(&["accept", "reject"]),
+            hint: "",
+        },
+        text_field("ipoe_keepalive", "IPoE Keepalive", "off (ARP ping after silence)"),
         bool_field("disabled", "Disabled"),
         text_field("comment", "Comment", ""),
     ],
@@ -225,6 +245,7 @@ const LEASE: ItemKind = ItemKind {
         text_field("lease_time", "Lease Time", "the server's"),
         text_field("host_name", "Host Name (DNS)", "the client's"),
         bool_field("block_access", "Block Access"),
+        text_field("rate_limit", "Rate Limit", "10M/50M (IPoE: XDP policer)"),
         text_field("address_lists", "Address Lists", ""),
         text_field("dhcp_option", "DHCP Options", ""),
         text_field("dhcp_option_set", "DHCP Option Set", "none"),
@@ -543,6 +564,11 @@ pub(crate) fn row(tab: Tab, r: &Value) -> Row {
                 _ => Kind::Red,
             };
             let mut chips = vec![(status.as_str(), kind)];
+            // G4.3f: its leases are subscriber sessions (PPP › Active
+            // Connections), authorized by RADIUS or the local list.
+            if r.get("sessions").and_then(Value::as_bool) == Some(true) {
+                chips.push(if text(r, "use_radius") == "yes" { ("ipoe radius", Kind::Blue) } else { ("ipoe", Kind::Blue) });
+            }
             let warns: Vec<String> = r
                 .get("checks")
                 .and_then(Value::as_array)

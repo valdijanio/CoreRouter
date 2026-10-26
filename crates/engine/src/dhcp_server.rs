@@ -213,6 +213,8 @@ impl Session {
         let mut heard = self.dhcp_relay_poll(now, &mut relayed);
         // G4.2c: the DHCPv6 server and relays, on the same round.
         heard |= self.dhcp6_server_poll(now);
+        self.ipoe_refresh();
+        let ipoe = self.ipoe_backend();
         let Some(rt) = self.ext_mut::<DhcpServerRuntime>() else {
             return heard;
         };
@@ -220,6 +222,26 @@ impl Session {
         let Some(core) = rt.core.as_mut() else {
             return heard;
         };
+        // G4.3f: what the IPoE service decided since the last round.
+        if let Some(b) = &ipoe {
+            for (server, key, v) in b.verdicts() {
+                fx.extend(core.authorized(now, &server, &key, v).into_iter().map(|e| (e, None)));
+            }
+            for r in b.revokes() {
+                fx.extend(core.revoke(now, &r.server, &r.client_key, &r.why).into_iter().map(|e| (e, None)));
+            }
+            for (iface, ip) in b.pings() {
+                let src = core
+                    .plan()
+                    .servers
+                    .iter()
+                    .find(|s| s.interface == iface)
+                    .and_then(|s| s.source_for(ip));
+                if let (Some(src), Some(port)) = (src, rt.slots.get_mut(&iface).and_then(|s| s.port.as_mut())) {
+                    let _ = port.probe(ip, src);
+                }
+            }
+        }
         for (iface, h) in relayed {
             let t0 = clock_us();
             fx.extend(core.handle(now, &iface, &h).into_iter().map(|e| (e, Some(t0))));
@@ -250,6 +272,9 @@ impl Session {
             match port.probe_replies() {
                 Ok(replies) => {
                     for (ip, mac) in replies {
+                        if let Some(b) = &ipoe {
+                            b.arp_reply(iface, ip, mac);
+                        }
                         fx.extend(core.probe_reply(now, iface, ip, mac).into_iter().map(|e| (e, None)));
                     }
                 }
@@ -257,6 +282,7 @@ impl Session {
             }
         }
         fx.extend(core.tick(now).into_iter().map(|e| (e, None)));
+        self.ipoe_resolve(now, &mut fx);
         self.dhcp_server_apply(now, fx, clock_us);
         self.dhcp_server_compact(now, false);
         self.dhcp_history_compact(now);
@@ -494,10 +520,19 @@ impl Session {
                 Effect::Bound(b) => {
                     self.dhcp_bound(&b, now);
                     self.dhcp_history_bound(&b.lease, b.new, now);
+                    if self.ipoe_server(&b.lease.server)
+                        && let Some(ipoe) = self.ipoe_backend()
+                        && let Some(view) = self.ipoe_view()
+                    {
+                        ipoe.bound(&b, &view);
+                    }
                 }
                 Effect::Gone(l) => {
                     self.dhcp_gone(l.address, now);
                     self.dhcp_history_gone(l.address, now);
+                    if let Some(ipoe) = self.ipoe_backend() {
+                        ipoe.gone(&l, l.state.as_str());
+                    }
                 }
                 Effect::Log { level, text } => {
                     let topics: &[&str] = match level {
@@ -512,6 +547,37 @@ impl Session {
         }
         self.dhcp_lists_flush(now);
         self.dhcp_history_flush();
+    }
+
+    /// G4.3f: the round's [`Effect::Authorize`]s get their verdict — at
+    /// once when it is local (the answer goes out this round), else when
+    /// the IPoE service brings RADIUS's (a later round).
+    fn ipoe_resolve(&mut self, now: Now, fx: &mut Vec<(Effect, Option<u64>)>) {
+        // A verdict's effects may hold more asks only in theory (it answers
+        // the client it was about); a few passes bound it anyway.
+        for _ in 0..4 {
+            let asks: Vec<_> = fx
+                .iter()
+                .filter_map(|(e, t)| match e {
+                    Effect::Authorize(a) => Some((a.clone(), *t)),
+                    _ => None,
+                })
+                .collect();
+            if asks.is_empty() {
+                return;
+            }
+            fx.retain(|(e, _)| !matches!(e, Effect::Authorize(_)));
+            let decided: Vec<_> = asks
+                .into_iter()
+                .filter_map(|(a, t)| self.ipoe_authorize(&a).map(|v| (a, v, t)))
+                .collect();
+            let Some(core) = self.ext_mut::<DhcpServerRuntime>().and_then(|r| r.core.as_mut()) else {
+                return;
+            };
+            for (a, v, t) in decided {
+                fx.extend(core.authorized(now, &a.server, &a.client_key, v).into_iter().map(|e| (e, t)));
+            }
+        }
     }
 
     fn dhcp_bound(&mut self, b: &Binding, now: Now) {

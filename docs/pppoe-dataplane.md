@@ -102,7 +102,8 @@ impl Pod`.
 | `PPPOE_V6` | LPM trie | /64 ou prefixo delegado → índice | 262 144 |
 | `PPPOE_POLICER` | array | índice × 2 + sentido → estado (13 palavras) | 262 144 |
 | `PPPOE_COUNTERS` | array | índice → 8 contadores | 131 072 |
-| `PPPOE_STATS` | per-CPU array | `pppoe::Stat` → pacotes | 18 |
+| `PPPOE_STATS` | per-CPU array | `pppoe::Stat` → pacotes | 20 |
+| `IPOE_PORTS` | hash | ifindex da porta de acesso IPoE → flags (G4.3f) | 256 |
 
 - Os arrays são pré-alocados: ~64 MiB com PPPoE ligado (**estimado**). Desligado, o carregador
   os cria com 1 entrada; ligar ou desligar recarrega o objeto e as sessões conhecidas voltam
@@ -115,6 +116,29 @@ impl Pod`.
 - Contadores por sessão (`PppoeCounters`): pacotes e bytes IP em cada sentido, descartes pelo
   policer em cada sentido, spoofing, enviados ao kernel. Somados com adição atômica BPF (exatos
   com várias CPUs), para os interims de accounting (RADIUS) e gráficos.
+
+## IPoE nos mesmos mapas (G4.3f)
+
+Um assinante IPoE (um lease DHCP que o serviço `ipoe` do daemon fez sessão) é mais uma entrada de
+`PPPOE_SESSIONS`, com a flag `F_IPOE`, chaveada em `PPPOE_KEYS` pela porta e pelo MAC com
+SESSION_ID 0 (a RFC 2516 §5 nunca dá id 0 a uma sessão PPPoE: as chaves não colidem) e em
+`PPPOE_V4` pelo endereço. O carregador recusa IPoE com SID ≠ 0 ou com tag, e PPPoE com SID 0. O
+`SETTINGS` da posição `pppoe::SETTINGS_SLOT` ganha o bit 1 (`ipoe::SETTINGS_BIT`), ligado quando há
+porta em `IPOE_PORTS`; os mapas de sessão são dimensionados quando PPPoE **ou** IPoE está ligado.
+O serviço IPoE aloca os índices do topo para baixo (`SESSIONS_MAX - 1`, …) e o PPPoE de baixo para
+cima.
+
+- **Subida**, numa porta de `IPOE_PORTS`, quadro IPv4 sem tag: DHCP para a porta 67 passa ao daemon
+  (`ipoe-dhcp`); o MAC que o mapa não conhece segue como sem IPoE (o kernel decide); do MAC de uma
+  sessão para o MAC do BNG, a origem tem de ser o endereço da sessão (amarração IP↔MAC, TR-146
+  R-38; senão `spoofed` e descarte), depois o policer e os contadores, e o quadro segue **intacto**
+  (não há cabeçalho a tirar) para o filtro, o CGNAT rápido e o kernel.
+- **Descida**: o mesmo policer e os contadores, e o kernel encaminha como sempre
+  (`ipoe-down-kernel`): o firewall `forward` e o ARP do kernel continuam vendo o tráfego, e o caminho
+  do kernel até o assinante existe (não há encapsulamento). Só o fluxo que o conntrack já aceitou
+  (CGNAT rápido) sai pelo XDP, com os MACs reescritos (`ipoe::rewrite`).
+- **Só quadros sem tag**: com VLAN por assinante ou por serviço, o programa vai na interface VLAN
+  (o XDP genérico a vê sem a tag). IPv6 IPoE fica para depois (gap).
 
 ## Policer (taxa por assinante)
 

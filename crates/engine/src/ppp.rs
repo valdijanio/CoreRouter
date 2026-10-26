@@ -67,6 +67,94 @@ pub trait PppBackend: Send + Sync {
 #[derive(Default)]
 struct PppRuntime {
     backend: Option<Arc<dyn PppBackend>>,
+    /// The IPoE service's sessions (G4.3f), shown with the PPP ones.
+    ipoe: Option<Arc<dyn PppBackend>>,
+}
+
+/// The PPPoE and the IPoE services as one: `ppp.active` lists both,
+/// `ppp.why` asks both.
+struct Merged(Vec<Arc<dyn PppBackend>>);
+
+impl PppBackend for Merged {
+    fn active(&self) -> Vec<ActiveSession> {
+        self.0.iter().flat_map(|b| b.active()).collect()
+    }
+
+    fn terminate(&self, ids: &[String]) -> usize {
+        self.0.iter().map(|b| b.terminate(ids)).sum()
+    }
+
+    fn history(&self) -> Vec<HistoryEntry> {
+        let mut all: Vec<HistoryEntry> = self.0.iter().flat_map(|b| b.history()).collect();
+        all.sort_by_key(|h| h.at);
+        all
+    }
+
+    fn why(&self, name: Option<&str>, mac: Option<MacAddr>) -> Why {
+        // The one that knows most: up now, else the most attempts seen.
+        let answers: Vec<Why> = self.0.iter().map(|b| b.why(name, mac)).collect();
+        let score = |w: &Why| (w.active.is_some(), w.attempts.iter().map(|(_, n)| u64::from(*n)).sum::<u64>());
+        answers
+            .into_iter()
+            .max_by_key(score)
+            .unwrap_or_default()
+    }
+
+    /// The PPPoE service's own stats, whole (its discovery, IPv6, workers
+    /// and admission counters: new fields stay right without a change
+    /// here), plus what the IPoE half adds: its sessions, authorizations,
+    /// data plane and error.
+    fn stats(&self) -> ServiceStats {
+        let mut parts = self.0.iter().map(|b| b.stats());
+        let mut t = parts.next().unwrap_or_default();
+        for s in parts {
+            t.sessions += s.sessions;
+            t.auth_accept += s.auth_accept;
+            t.auth_reject += s.auth_reject;
+            t.dataplane |= s.dataplane;
+            if t.last_error.is_none() {
+                t.last_error = s.last_error;
+            }
+        }
+        t
+    }
+
+    /// Each half's page, then the union sorted by (name, id) and cut to
+    /// `limit`: no backend copies more than `limit` rows.
+    fn active_page(
+        &self,
+        keep: &dyn Fn(&ActiveSession) -> bool,
+        limit: usize,
+    ) -> (usize, Vec<ActiveSession>) {
+        let mut total = 0;
+        let mut rows = Vec::new();
+        for b in &self.0 {
+            let (n, page) = b.active_page(keep, limit);
+            total += n;
+            rows.extend(page);
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name).then(a.id.cmp(&b.id)));
+        rows.truncate(limit);
+        (total, rows)
+    }
+
+    fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
+        let mut m = std::collections::BTreeMap::new();
+        for b in &self.0 {
+            for (server, n) in b.sessions_by_server() {
+                *m.entry(server).or_insert(0) += n;
+            }
+        }
+        m
+    }
+
+    fn who(&self, ip: std::net::Ipv4Addr) -> Option<String> {
+        self.0.iter().find_map(|b| b.who(ip))
+    }
+
+    fn who_at(&self, ip: std::net::Ipv4Addr, at: u64) -> Option<String> {
+        self.0.iter().find_map(|b| b.who_at(ip, at))
+    }
 }
 
 impl Session {
@@ -76,9 +164,22 @@ impl Session {
         }
     }
 
-    /// The daemon's PPP service, if it runs one.
+    /// The IPoE service's view of its sessions (G4.3f), merged into
+    /// [`Session::ppp_backend`].
+    pub fn set_ipoe_sessions(&mut self, backend: Arc<dyn PppBackend>) {
+        if let Some(rt) = self.ext_mut::<PppRuntime>() {
+            rt.ipoe = Some(backend);
+        }
+    }
+
+    /// The daemon's PPP service and IPoE sessions, if it runs them.
     pub fn ppp_backend(&self) -> Option<Arc<dyn PppBackend>> {
-        self.ext::<PppRuntime>()?.backend.clone()
+        let rt = self.ext::<PppRuntime>()?;
+        match (&rt.backend, &rt.ipoe) {
+            (Some(a), Some(b)) => Some(Arc::new(Merged(vec![a.clone(), b.clone()]))),
+            (Some(a), None) | (None, Some(a)) => Some(a.clone()),
+            (None, None) => None,
+        }
     }
 
     /// Active sessions now (empty without the service).
@@ -243,5 +344,62 @@ mod tests {
             s.ppp_address_list("online", std::net::Ipv4Addr::from(0x6440_0000 + i), true, 3600, "").unwrap();
         }
         assert!(t.elapsed() < std::time::Duration::from_secs(20), "{:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod merged_tests {
+    use std::sync::Arc;
+
+    use corerouter_model::MacAddr;
+    use corerouter_model::ppp::{ActiveSession, HistoryEntry, ServiceStats, Why};
+
+    use super::{Merged, PppBackend};
+
+    struct Half(&'static str, Vec<&'static str>, u32);
+
+    impl PppBackend for Half {
+        fn active(&self) -> Vec<ActiveSession> {
+            self.1
+                .iter()
+                .enumerate()
+                .map(|(i, n)| ActiveSession { id: format!("{}{i}", self.0), name: (*n).into(), server: self.0.into(), ..ActiveSession::default() })
+                .collect()
+        }
+        fn terminate(&self, _: &[String]) -> usize {
+            0
+        }
+        fn history(&self) -> Vec<HistoryEntry> {
+            Vec::new()
+        }
+        fn why(&self, _: Option<&str>, _: Option<MacAddr>) -> Why {
+            Why::default()
+        }
+        fn stats(&self) -> ServiceStats {
+            ServiceStats { sessions: self.1.len() as u64, workers: self.2, delegated: u64::from(self.2), ..ServiceStats::default() }
+        }
+    }
+
+    /// PPPoE and IPoE as one: the page is sorted over both halves and cut,
+    /// the total and the per-server counts add up, workers are PPPoE's.
+    #[test]
+    fn the_union_pages_counts_and_keeps_pppoe_workers() {
+        let m = Merged(vec![
+            Arc::new(Half("pppoe-ether2", vec!["carla", "ana", "edu"], 4)),
+            Arc::new(Half("dhcp1", vec!["bia", "dani"], 0)),
+        ]);
+        let (total, page) = m.active_page(&|_| true, 3);
+        assert_eq!(total, 5);
+        let names: Vec<_> = page.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, ["ana", "bia", "carla"]);
+        let (total, page) = m.active_page(&|a| a.server == "dhcp1", 10);
+        assert_eq!((total, page.len()), (2, 2));
+        let by = m.sessions_by_server();
+        assert_eq!(by.get("pppoe-ether2"), Some(&3));
+        assert_eq!(by.get("dhcp1"), Some(&2));
+        let st = m.stats();
+        assert_eq!((st.sessions, st.workers), (5, 4));
+        // PPPoE's own counters (here `delegated`) come through whole.
+        assert_eq!(st.delegated, 4);
     }
 }

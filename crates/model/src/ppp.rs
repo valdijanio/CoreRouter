@@ -403,10 +403,15 @@ pub enum PppService {
     Sstp,
     Ovpn,
     Async,
+    /// An IPoE subscriber (G4.3f): a DHCP client named by its MAC or
+    /// option 82 (`ip.dhcp-server ipoe_username`); no password. Only this
+    /// value matches IPoE (`any` does not: a PPP login named like a MAC
+    /// must not become an IPoE grant).
+    Ipoe,
 }
 
 impl PppService {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Any,
         Self::Pppoe,
         Self::L2tp,
@@ -414,6 +419,7 @@ impl PppService {
         Self::Sstp,
         Self::Ovpn,
         Self::Async,
+        Self::Ipoe,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -425,6 +431,7 @@ impl PppService {
             Self::Sstp => "sstp",
             Self::Ovpn => "ovpn",
             Self::Async => "async",
+            Self::Ipoe => "ipoe",
         }
     }
 
@@ -433,7 +440,7 @@ impl PppService {
     }
 
     pub fn allows(self, service: Self) -> bool {
-        self == Self::Any || self == service
+        (self == Self::Any && service != Self::Ipoe) || self == service
     }
 }
 
@@ -862,6 +869,9 @@ pub enum Stage {
     Ncp,
     /// Opened, traffic flowing.
     Up,
+    /// IPoE (G4.3f): the DHCP DISCOVER/REQUEST was heard (the PADI of an
+    /// IPoE subscriber); then `auth` and `up`.
+    Dhcp,
 }
 
 impl Stage {
@@ -873,6 +883,7 @@ impl Stage {
             Self::Auth => "auth",
             Self::Ncp => "ncp",
             Self::Up => "up",
+            Self::Dhcp => "dhcp",
         }
     }
 }

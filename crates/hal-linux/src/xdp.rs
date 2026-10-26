@@ -168,7 +168,7 @@ impl XdpState {
         // The flow map is preallocated: sized only while the fast path is
         // on, so turning it on or off reloads the object (links come back
         // in this same call).
-        let pppoe = self.pppoe.on;
+        let pppoe = self.pppoe.maps();
         if self
             .loaded
             .as_ref()
@@ -201,7 +201,8 @@ impl XdpState {
         let Some(l) = self.loaded.as_mut() else {
             return Ok(());
         };
-        write_settings(&mut l.ebpf, &plan, pppoe)?;
+        write_settings(&mut l.ebpf, &plan, self.pppoe.word())?;
+        pppoe::sync_ports(&mut l.ebpf, &self.pppoe)?;
         sync_trie(
             &mut l.ebpf,
             m::BLOCK_V4,
@@ -537,7 +538,8 @@ fn load(fast_nat: bool, pppoe: bool) -> Result<Loaded, HalError> {
     })
 }
 
-fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan, pppoe: bool) -> Result<(), HalError> {
+/// `subscribers`: the PPPoE/IPoE switches (`PppoeState::word`).
+fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan, subscribers: u64) -> Result<(), HalError> {
     let s = Settings {
         drop_malformed: plan.drop_malformed,
         drop_bad_tcp_flags: plan.drop_invalid_tcp_flags,
@@ -557,7 +559,7 @@ fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan, pppoe: bool) -> Result<(), Ha
     }
     arr.set(
         corerouter_dataplane_ebpf_common::pppoe::SETTINGS_SLOT,
-        u64::from(pppoe),
+        subscribers,
         0,
     )
     .map_err(|e| rejected("writing the settings", &e))

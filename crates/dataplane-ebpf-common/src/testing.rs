@@ -310,6 +310,8 @@ pub struct Subs {
     /// `(prefix (16 bytes), length, index)`.
     pub v6: Vec<([u8; 16], u32, u32)>,
     pub policers: BTreeMap<(u32, u32), policer::State>,
+    /// `IPOE_PORTS` (G4.3f).
+    pub ipoe_ports: std::collections::BTreeSet<u32>,
 }
 
 impl Subs {
@@ -356,6 +358,9 @@ impl Sessions for Subs {
     }
     fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State> {
         self.policers.get_mut(&(idx, dir))
+    }
+    fn ipoe_port(&self, ifindex: u32) -> bool {
+        self.ipoe_ports.contains(&ifindex)
     }
 }
 
@@ -415,12 +420,16 @@ pub fn program_model(
 ) -> Outcome {
     let mut buf = Buf::new(frame);
     let mut from = None;
-    match pppoe::upstream(&buf, ifindex, subs, now) {
+    let mut up = pppoe::upstream(&buf, ifindex, subs, now);
+    if up == Up::NotPppoe {
+        up = crate::ipoe::upstream(&buf, ifindex, subs, now);
+    }
+    match up {
         Up::NotPppoe => {}
         Up::User(st) => return (XDP_PASS, frame.to_vec(), None, Some(st)),
         Up::Drop(st, _) => return (XDP_DROP, frame.to_vec(), None, Some(st)),
         Up::Session(u) => {
-            if pppoe::decap(&mut buf, u.tags, u.v6).is_none() {
+            if !u.ipoe && pppoe::decap(&mut buf, u.tags, u.v6).is_none() {
                 return (XDP_DROP, frame.to_vec(), None, Some(Stat::Malformed));
             }
             from = Some(u);
@@ -453,7 +462,9 @@ fn to_subscriber_model(buf: &mut Buf, subs: &mut Subs, now: u64) -> Option<Outco
     let (ip_len, ttl) = pppoe::ip_meta(buf, v6)?;
     match pppoe::downstream(subs, idx, v6, ip_len, ttl, now, false) {
         Down::NotSub => None,
-        Down::Kernel(st, _) => Some((XDP_PASS, buf.frame().to_vec(), None, Some(st))),
+        Down::Kernel(st, _) | Down::Counted(st, _, _) => {
+            Some((XDP_PASS, buf.frame().to_vec(), None, Some(st)))
+        }
         Down::Drop(st, _) => Some((XDP_DROP, buf.frame().to_vec(), None, Some(st))),
         Down::Encap(d) => {
             pppoe::ttl_dec(buf, v6)?;

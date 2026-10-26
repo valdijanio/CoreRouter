@@ -15,10 +15,10 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.secret.add", "Add PPP Secret", [], None,
-        "{name: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async (default any), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, comment?: string, disabled?: bool} → {id, name, warnings}",
+        "{name: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async|ipoe (default any; ipoe: a DHCP subscriber named by MAC or option 82, no password), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, comment?: string, disabled?: bool} → {id, name, warnings}",
         always, add),
     cmd!("ppp.secret.set", "Set PPP Secret", [], None,
-        "{id: *hex | name, name?: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async (default any), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, comment?: string, disabled?: bool} → {id, name, warnings}",
+        "{id: *hex | name, name?: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async|ipoe (default any; ipoe: a DHCP subscriber named by MAC or option 82, no password), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, comment?: string, disabled?: bool} → {id, name, warnings}",
         has_secrets, set),
     cmd!("ppp.secret.remove", "Remove PPP Secret", [], None,
         "{id: *hex | name} → {id, name, active (sessions of this user still up: ppp.active.remove ends them)}",
@@ -71,7 +71,7 @@ fn apply(s: &Session, x: &mut PppSecret, p: &Value) -> Result<()> {
     }
     if let Some(t) = opt_str(p, "service")? {
         x.service = PppService::parse(t).ok_or_else(|| {
-            EngineError::bad("service", "one of any, pppoe, l2tp, pptp, sstp, ovpn, async")
+            EngineError::bad("service", "one of any, pppoe, l2tp, pptp, sstp, ovpn, async, ipoe")
         })?;
     }
     if let Some(t) = opt_str(p, "profile")? {
@@ -116,7 +116,8 @@ fn apply(s: &Session, x: &mut PppSecret, p: &Value) -> Result<()> {
 fn warnings(s: &Session, x: &PppSecret) -> Vec<String> {
     let mut w = Vec::new();
     let c = s.store().candidate();
-    if x.password.is_empty() {
+    // IPoE subscribers have no password (a DHCP client is its MAC or line).
+    if x.password.is_empty() && x.service != PppService::Ipoe {
         w.push("empty password: anyone who knows the name logs in".into());
     }
     if let Some(ip) = x.remote_address {
