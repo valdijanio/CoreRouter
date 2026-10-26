@@ -10,12 +10,13 @@ empilhados:
 
 | PR | Parte | Estado |
 |---|---|---|
-| a | crate `proto-ha` (sans-IO): codec do sync, registro da sessão, máquina de papéis com cerca, hello de acesso, laboratório de dois nós, fuzz, benchmark; este documento | este PR |
-| b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | próximo |
-| c | fase 1 no serviço `pppoe`: MAC virtual, só o ativo responde, segredo do AC-Cookie compartilhado | depois das sessões B (G4.3k+l) e C (G4.3cd) entrarem |
-| d | fase 2: exportar/importar sessão por worker, mapas XDP na tomada, MAC update gratuito, contabilização contínua | depois do c |
-| e | aba PPP › Redundancy na GUI | depois do b |
-| f | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do d |
+| a | crate `proto-ha` (sans-IO): codec do sync, registro da sessão, máquina de papéis com cerca, hello de acesso, laboratório de dois nós, fuzz, benchmark; este documento | #241 |
+| b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | #242 |
+| c | serviço `ppp-ha` no daemon: link de sync TLS com autenticação mútua, hello de acesso (AF_PACKET), testemunha (ICMP), track, monitor; `proto_ha::node` (o mesmo código no daemon e no laboratório) | este PR |
+| d | fase 1 no serviço `pppoe`: só o ativo responde, MAC virtual, segredo do AC-Cookie compartilhado | depois da sessão B (G4.3k+l) entrar |
+| e | fase 2: exportar/importar sessão por worker, mapas XDP na tomada, contabilização contínua | depois do d |
+| f | aba PPP › Redundancy na GUI | depois do b |
+| g | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do e |
 
 ## 1. Pesquisa
 
@@ -165,6 +166,26 @@ sequência, `hears`, `view_seq`, `acked`, época, papel, prioridade, flags (test
 elegível) e HMAC-SHA-256/128 com chave derivada do segredo do par. O ativo manda do **MAC
 virtual**: todo hello é também o MAC update gratuito. Repetição recusada por encarnação e
 sequência.
+
+## 2.5 O serviço `ppp-ha` do daemon (PR c)
+
+- **Link de sync:** TLS na `listen_port` (o certificado do próprio roteador, o mesmo do canal de
+  controle) e um discador para `peer`. Fica só a conexão discada pelo nó de **id menor** (o id é
+  um hash do certificado de cada roteador, que o discador vê no handshake), então o par tem um
+  link só. O certificado do par é fixado no primeiro uso (`ppp-ha-peer.fingerprint` na pasta de
+  config). Sobre o TLS, o `Node` autentica as duas pontas com o segredo (desafio e prova HMAC).
+- **Hello de acesso:** um socket `AF_PACKET` (0x88b5) por porta de acesso, com allmulticast como o
+  LLDP; do MAC virtual enquanto ativo.
+- **Testemunha:** um eco ICMP por endereço por segundo; cai depois de 3 faltas seguidas, volta na
+  primeira resposta. **Track:** as portas da lista precisam estar com portadora.
+- **Locks:** o `Node` fica atrás de um mutex que cada thread pega rápido e nunca durante E/S (o
+  laço principal a cada 10 ms, a thread da conexão, os comandos). O serviço `pppoe` lê só
+  atômicos (`ppp_ha::shared`: responder ou não, MAC virtual, chave do cookie).
+- **Teste em namespace** (`tests/netns_ha.rs`, dois daemons, sem root), **medido** em debug:
+  - par formado em 762 ms;
+  - switchover em 53 ms;
+  - failover depois de matar o ativo em 1,16 s (morte 1,2 s);
+  - o nó isolado (os dois links e a testemunha perdidos) se cerca e o outro assume.
 
 ## 3. Testes
 

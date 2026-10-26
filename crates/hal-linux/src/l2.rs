@@ -87,7 +87,7 @@ pub(crate) fn io_err(e: nix::Error) -> io::Error {
 pub(crate) struct IfInfo {
     pub(crate) link: LinkAddr,
     pub(crate) mac: [u8; 6],
-    allmulti: bool,
+    pub(crate) allmulti: bool,
 }
 
 pub(crate) fn if_info(name: &IfName) -> io::Result<IfInfo> {
@@ -111,7 +111,7 @@ pub(crate) fn if_info(name: &IfName) -> io::Result<IfInfo> {
 }
 
 /// Turn `allmulticast` on/off on one interface over rtnetlink.
-fn set_allmulti(ifindex: u32, on: bool) -> io::Result<()> {
+pub(crate) fn set_allmulti(ifindex: u32, on: bool) -> io::Result<()> {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_io()
         .build()?;

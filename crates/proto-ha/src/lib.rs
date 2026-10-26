@@ -22,6 +22,7 @@ pub mod fuzz;
 pub mod hello;
 pub mod lab;
 pub mod msg;
+pub mod node;
 pub mod record;
 pub mod role;
 pub mod sync;
