@@ -464,7 +464,10 @@ impl Bng {
             inner: r.inner_vlan & 0x0fff,
             outer_tpid: r.outer_tpid,
         };
-        let circuit_id = r.circuit_id.as_deref().map(|c| String::from_utf8_lossy(c).into_owned());
+        let circuit_id = r
+            .circuit_id
+            .as_deref()
+            .map(|c| String::from_utf8_lossy(c).into_owned());
         // The same NAS-Port-Id as the node that opened it (`up` in pppoe_bng.rs).
         let nas_port_id = match &circuit_id {
             Some(c) if self.cfg.ppp.aaa.use_circuit_id_in_nas_port_id => c.clone(),

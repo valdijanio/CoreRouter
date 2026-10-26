@@ -20,7 +20,6 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder, RouteChange};
-use ipnet::Ipv6Net;
 use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
@@ -52,6 +51,7 @@ use corerouter_proto_pppoe::server::{
 use corerouter_proto_pppoe::timer::Millis;
 use corerouter_proto_pppoe::wire::Mac;
 use corerouter_proto_radius::rate_limit::RateLimit;
+use ipnet::Ipv6Net;
 
 use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
 use super::pppoe_slow6::{self as slow6, Net6Index};

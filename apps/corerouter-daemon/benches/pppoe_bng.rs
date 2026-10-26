@@ -331,7 +331,11 @@ fn ha(c: &mut Criterion, snap: &Snapshot, snap100: &Snapshot) {
     let n = 40_000;
     let hsnap100 = hot(snap100);
     let mut line = String::new();
-    for (name, ha, wait) in [("off", false, false), ("hot+wait", true, true), ("hot+try", true, false)] {
+    for (name, ha, wait) in [
+        ("off", false, false),
+        ("hot+wait", true, true),
+        ("hot+try", true, false),
+    ] {
         for lanes in [1u16, 8] {
             let publisher = Arc::new(Mutex::new(Publisher::new(1, SyncConfig::default())));
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -361,7 +365,15 @@ fn ha(c: &mut Criterion, snap: &Snapshot, snap100: &Snapshot) {
             )]);
             for b in &mut bngs {
                 b.xdp = true;
-                b.configure(0, if ha { hsnap100.clone() } else { snap100.clone() }, &ports);
+                b.configure(
+                    0,
+                    if ha {
+                        hsnap100.clone()
+                    } else {
+                        snap100.clone()
+                    },
+                    &ports,
+                );
             }
             let mut ids: Vec<Vec<usize>> = vec![Vec::new(); usize::from(lanes)];
             for i in 0..n {
@@ -417,7 +429,9 @@ fn ha(c: &mut Criterion, snap: &Snapshot, snap100: &Snapshot) {
             drop(done);
         }
     }
-    eprintln!("pppoe_bng/ha: {n} sessions by workers, rounds of 256, the lock held 8 of every 10 ms (release):{line}");
+    eprintln!(
+        "pppoe_bng/ha: {n} sessions by workers, rounds of 256, the lock held 8 of every 10 ms (release):{line}"
+    );
     let mut g = c.benchmark_group("pppoe_bng_ha");
     g.sample_size(10);
     g.throughput(Throughput::Elements(1000));

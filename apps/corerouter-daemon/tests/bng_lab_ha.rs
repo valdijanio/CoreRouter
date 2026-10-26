@@ -71,7 +71,13 @@ fn holder(name: &str) -> Kill {
     let root = std::env::var_os("BNG_LAB_ROOT").is_some();
     let k = if root {
         let _ = Command::new("ip").args(["netns", "del", name]).status();
-        assert!(Command::new("ip").args(["netns", "add", name]).status().unwrap().success());
+        assert!(
+            Command::new("ip")
+                .args(["netns", "add", name])
+                .status()
+                .unwrap()
+                .success()
+        );
         Kill(
             Command::new("ip")
                 .args(["netns", "exec", name, "sleep", "86400"])
@@ -304,8 +310,15 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
     if std::env::var_os("BNG_LAB_ROOT").is_some() {
         // `--root`: the XDP data plane on both nodes (generic: veth); the
         // takeover then programs the adopted sessions into C's maps.
-        for i in (0..ports).map(|i| format!("acc{i}")).chain(["wan0".to_owned()]) {
-            ok(ns, "ip.firewall.xdp.interface.add", json!({"interface": i, "mode": "generic"}));
+        for i in (0..ports)
+            .map(|i| format!("acc{i}"))
+            .chain(["wan0".to_owned()])
+        {
+            ok(
+                ns,
+                "ip.firewall.xdp.interface.add",
+                json!({"interface": i, "mode": "generic"}),
+            );
         }
     }
     ok(
