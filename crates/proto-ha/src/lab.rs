@@ -1,7 +1,7 @@
-//! Two BNGs of a pair in memory: the role machines, the sync stream
-//! (through the real codec, with latency, cuts and reconnects), the access
-//! hellos (authenticated, droppable) and a witness each node may or may
-//! not reach. A fake clock drives everything; the tests in `tests/sim.rs`
+//! Two BNGs of a pair in memory: two [`Node`]s (the code the daemon runs),
+//! the sync stream between them (bytes, with latency, cuts, reconnects and
+//! the handshake), the access hellos (authenticated, droppable) and a
+//! witness each node may or may not reach. A fake clock drives everything; the tests in `tests/sim.rs`
 //! run failovers, split-brain attempts, link flaps and resyncs with up to
 //! 100 000 sessions, and check after every step that two nodes never
 //! answer the same subscribers.
@@ -11,11 +11,12 @@ use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use crate::Millis;
-use crate::hello::{self, HelloFrame, ReplayGuard};
-use crate::msg::{Counters, FrameReader, Heartbeat, Hello, Key, Msg, Role, VERSION};
+use crate::hello;
+use crate::msg::{Counters, Key, Role};
+use crate::node::{Event, Node, NodeConfig};
 use crate::record::{Kind, SessionRecord};
-use crate::role::{Action, Ha, Path, PeerView, RoleConfig, Transition};
-use crate::sync::{Publisher, Replica, SyncConfig};
+use crate::role::{Refused, RoleConfig, Transition};
+use crate::sync::SyncConfig;
 
 /// A small deterministic generator (xorshift64*).
 #[derive(Debug, Clone)]
@@ -80,97 +81,34 @@ pub fn record(n: u32, variant: u32) -> SessionRecord {
     }
 }
 
-pub struct Node {
-    pub ha: Ha,
-    pub publisher: Option<Publisher>,
-    pub replica: Replica,
+pub struct LabNode {
+    pub node: Node,
     pub alive: bool,
     pub witness: bool,
     pub track: bool,
-    cfg: RoleConfig,
-    sync_cfg: SyncConfig,
-    hello_seq: u64,
-    guard: ReplayGuard,
-    next_hello: Millis,
-    peer_hello: Option<Hello>,
-    peer_stream: u64,
-    last_view: Option<PeerView>,
-    /// When a hello last said the peer is active.
-    seen_peer_active: Millis,
-    reader: FrameReader,
     pub transitions: Vec<Transition>,
 }
 
-impl Node {
-    fn new(mut cfg: RoleConfig, sync_cfg: SyncConfig, now: Millis, boot: u64) -> Node {
-        cfg.incarnation = boot;
-        Node {
-            ha: Ha::new(cfg.clone(), now),
-            publisher: None,
-            replica: Replica::new(sync_cfg.clone()),
+impl LabNode {
+    fn new(cfg: &LabConfig, i: usize, now: Millis, incarnation: u64) -> LabNode {
+        let mut role = cfg.role.get(i).cloned().unwrap_or_default();
+        role.incarnation = incarnation;
+        LabNode {
+            node: Node::new(
+                NodeConfig {
+                    role,
+                    sync: cfg.sync.clone(),
+                    hello_key: hello::derive("hello", b"lab secret"),
+                    link_key: hello::derive("link", b"lab secret"),
+                    sections: Vec::new(),
+                },
+                now,
+            ),
             alive: true,
             witness: true,
             track: true,
-            cfg,
-            sync_cfg,
-            hello_seq: 0,
-            guard: ReplayGuard::default(),
-            next_hello: now,
-            peer_hello: None,
-            peer_stream: 0,
-            last_view: None,
-            seen_peer_active: 0,
-            reader: FrameReader::new(),
             transitions: Vec::new(),
         }
-    }
-
-    fn hello_msg(&self) -> Hello {
-        let (stream, applied) = match &self.publisher {
-            Some(p) => (p.stream(), p.seq()),
-            None => self.replica.position(),
-        };
-        Hello {
-            version: VERSION,
-            node_id: self.cfg.node_id,
-            epoch: self.ha.epoch(),
-            role: self.ha.role(),
-            priority: self.cfg.priority,
-            hot_standby: self.cfg.hot_standby,
-            stream,
-            applied,
-            sessions: 0,
-            sections: vec![],
-        }
-    }
-
-    fn heartbeat(&self) -> Heartbeat {
-        let v = self.ha.view();
-        let (stream, seq) = match &self.publisher {
-            Some(p) => (p.stream(), p.seq()),
-            None => self.replica.position(),
-        };
-        Heartbeat {
-            node_id: v.node_id,
-            incarnation: v.incarnation,
-            hears: v.hears,
-            view_seq: v.view_seq,
-            acked: v.acked,
-            epoch: v.epoch,
-            role: v.role,
-            priority: v.priority,
-            witness: v.witness,
-            in_sync: v.in_sync,
-            eligible: v.eligible,
-            stream,
-            seq,
-            sessions: 0,
-        }
-    }
-
-    /// The table this node would serve with, if it answers.
-    pub fn sessions(&self) -> usize {
-        self.publisher.as_ref().map_or(0, Publisher::len)
     }
 }
 
@@ -233,16 +171,14 @@ pub struct Watch {
 pub struct Lab {
     pub now: Millis,
     pub cfg: LabConfig,
-    pub nodes: [Node; 2],
+    pub nodes: [LabNode; 2],
     pub sync_up: bool,
     pub access_up: bool,
     connected: bool,
     /// (deliver at, to, bytes).
     sync_q: VecDeque<(Millis, usize, Vec<u8>)>,
     access_q: VecDeque<(Millis, usize, Vec<u8>)>,
-    key: [u8; 32],
     pub rng: Rng,
-    streams: u64,
     pub watch: Watch,
     /// Bytes sent on the sync link (both ways).
     pub sync_bytes: u64,
@@ -253,8 +189,8 @@ pub struct Lab {
 impl Lab {
     pub fn new(cfg: LabConfig) -> Lab {
         let mut rng = Rng::new(cfg.seed);
-        let a = Node::new(cfg.role[0].clone(), cfg.sync.clone(), 0, rng.next_u64());
-        let b = Node::new(cfg.role[1].clone(), cfg.sync.clone(), 0, rng.next_u64());
+        let a = LabNode::new(&cfg, 0, 0, rng.next_u64());
+        let b = LabNode::new(&cfg, 1, 0, rng.next_u64());
         Lab {
             now: 0,
             nodes: [a, b],
@@ -263,9 +199,7 @@ impl Lab {
             connected: false,
             sync_q: VecDeque::new(),
             access_q: VecDeque::new(),
-            key: hello::derive("hello", b"lab secret"),
             rng,
-            streams: 0,
             watch: Watch::default(),
             sync_bytes: 0,
             log: Vec::new(),
@@ -281,7 +215,7 @@ impl Lab {
     }
 
     pub fn node(&self, i: usize) -> Option<&Node> {
-        self.nodes.get(i)
+        self.nodes.get(i).map(|n| &n.node)
     }
 
     /// The node answering subscribers now, if exactly one does.
@@ -290,7 +224,7 @@ impl Lab {
             .filter(|&i| {
                 self.nodes
                     .get(i)
-                    .is_some_and(|n| n.alive && n.ha.answering())
+                    .is_some_and(|n| n.alive && n.node.answering())
             })
             .collect();
         match a.as_slice() {
@@ -300,43 +234,36 @@ impl Lab {
     }
 
     pub fn roles(&self) -> [Role; 2] {
-        self.nodes.each_ref().map(|n| n.ha.role())
-    }
-
-    fn send_sync(&mut self, from: usize, msg: &Msg) {
-        if !self.connected {
-            return;
-        }
-        let mut b = Vec::new();
-        if msg.encode(&mut b).is_ok() {
-            self.sync_bytes += b.len() as u64;
-            let at = self.now + self.cfg.latency_ms;
-            self.sync_q.push_back((at, 1 - from, b));
-        }
+        self.nodes.each_ref().map(|n| n.node.role())
     }
 
     fn connect(&mut self) {
         self.connected = true;
-        for n in &mut self.nodes {
-            n.next_hello = self.now;
-        }
         for i in 0..2 {
-            if let Some(h) = self.nodes.get(i).map(Node::hello_msg) {
-                self.send_sync(i, &Msg::Hello(h));
+            let nonce = self.nonce();
+            let now = self.now;
+            if let Some(n) = self.nodes.get_mut(i) {
+                n.node.connected(now, nonce);
+            }
+            self.drain(i);
+        }
+    }
+
+    fn nonce(&mut self) -> [u8; 32] {
+        let mut n = [0u8; 32];
+        for c in n.chunks_mut(8) {
+            for (d, s) in c.iter_mut().zip(self.rng.next_u64().to_le_bytes()) {
+                *d = s;
             }
         }
+        n
     }
 
     fn disconnect(&mut self) {
         self.connected = false;
         self.sync_q.clear();
         for n in &mut self.nodes {
-            n.reader = FrameReader::new();
-            n.replica.disconnect();
-            n.peer_hello = None;
-            if let Some(p) = &mut n.publisher {
-                p.disconnect();
-            }
+            n.node.disconnected();
         }
     }
 
@@ -371,14 +298,11 @@ impl Lab {
         self.disconnect();
     }
 
-    /// The process starts again with nothing (a new boot id).
+    /// The process starts again with nothing (a new incarnation).
     pub fn restart(&mut self, i: usize) {
         self.note(|| format!("restart node{i}"));
-        let boot = self.rng.next_u64();
-        let Some(cfg) = self.cfg.role.get(i).cloned() else {
-            return;
-        };
-        let n = Node::new(cfg, self.cfg.sync.clone(), self.now, boot);
+        let inc = self.rng.next_u64();
+        let n = LabNode::new(&self.cfg, i, self.now, inc);
         if let Some(slot) = self.nodes.get_mut(i) {
             *slot = n;
         }
@@ -386,30 +310,25 @@ impl Lab {
     }
 
     /// `ppp.redundancy.switchover` on node `i`.
-    pub fn switchover(&mut self, i: usize, force: bool) -> Result<(), crate::role::Refused> {
+    pub fn switchover(&mut self, i: usize, force: bool) -> Result<(), Refused> {
         self.note(|| format!("switchover node{i} force={force}"));
         let now = self.now;
         let r = self
             .nodes
             .get_mut(i)
-            .map_or(Err(crate::role::Refused::NotActive), |n| {
-                n.ha.switchover(now, force)
-            });
-        self.after_actions(i);
+            .map_or(Err(Refused::NotActive), |n| n.node.switchover(now, force));
+        self.drain(i);
         r
     }
 
     /// `ppp.redundancy.simulate-failure` on node `i`.
-    pub fn simulate_failure(&mut self, i: usize, ms: u64) -> Result<(), crate::role::Refused> {
+    pub fn simulate_failure(&mut self, i: usize, ms: u64) -> Result<(), Refused> {
         self.note(|| format!("simulate failure node{i} {ms} ms"));
         let now = self.now;
-        let r = self
-            .nodes
-            .get_mut(i)
-            .map_or(Err(crate::role::Refused::NotActive), |n| {
-                n.ha.simulate_failure(now, ms)
-            });
-        self.after_actions(i);
+        let r = self.nodes.get_mut(i).map_or(Err(Refused::NotActive), |n| {
+            n.node.simulate_failure(now, ms)
+        });
+        self.drain(i);
         r
     }
 
@@ -439,24 +358,24 @@ impl Lab {
             picks.push(u32::try_from(self.rng.below(u64::from(pool))).unwrap_or(0));
         }
         let variant = u32::try_from(self.rng.below(1000)).unwrap_or(0);
-        let Some(p) = self.nodes.get_mut(i).and_then(|n| n.publisher.as_mut()) else {
+        let Some(n) = self.nodes.get_mut(i) else {
             return;
         };
-        for (j, n) in picks.into_iter().enumerate() {
-            let rec = record(n, variant);
+        for (j, s) in picks.into_iter().enumerate() {
+            let rec = record(s, variant);
             let key = rec.key();
             if j < up as usize {
                 if let Ok(b) = rec.to_bytes() {
-                    p.upsert(now, key, Arc::from(b));
+                    n.node.upsert(now, key, Arc::from(b));
                 }
             } else if j < (up + down) as usize {
-                p.remove(now, key);
+                n.node.remove(now, key);
             } else {
-                p.counters(
+                n.node.counters(
                     now,
                     key,
                     Counters {
-                        rx_bytes: now * 1000 + u64::from(n),
+                        rx_bytes: now * 1000 + u64::from(s),
                         tx_bytes: now * 4000,
                         rx_packets: now,
                         tx_packets: now * 3,
@@ -467,164 +386,65 @@ impl Lab {
     }
 
     /// Loads `n` sessions on the active node at once.
-    pub fn load(&mut self, n: u32) {
+    pub fn load(&mut self, count: u32) {
         let Some(i) = self.active() else {
             return;
         };
         let now = self.now;
-        let Some(p) = self.nodes.get_mut(i).and_then(|x| x.publisher.as_mut()) else {
+        let Some(n) = self.nodes.get_mut(i) else {
             return;
         };
-        for s in 0..n {
+        for s in 0..count {
             let rec = record(s, 0);
             if let Ok(b) = rec.to_bytes() {
-                p.upsert(now, rec.key(), Arc::from(b));
+                n.node.upsert(now, rec.key(), Arc::from(b));
             }
         }
     }
 
-    fn deliver_sync(&mut self, to: usize, bytes: &[u8]) {
-        let Some(n) = self.nodes.get_mut(to) else {
+    /// Node `i`'s output: sync bytes onto the link, hellos onto the access
+    /// network, events into the log.
+    fn drain(&mut self, i: usize) {
+        let now = self.now;
+        let mut bytes = Vec::new();
+        let mut hellos = Vec::new();
+        let mut events = Vec::new();
+        let Some(n) = self.nodes.get_mut(i) else {
             return;
         };
-        n.reader.push(bytes);
-        let mut msgs = Vec::new();
-        loop {
-            match n.reader.next_msg() {
-                Ok(Some(m)) => msgs.push(m),
-                Ok(None) => break,
-                Err(_) => {
-                    self.disconnect();
-                    return;
-                }
+        n.node.take_output(&mut bytes);
+        n.node.take_access(&mut hellos);
+        n.node.take_events(&mut events);
+        let roles: Vec<Transition> = events
+            .into_iter()
+            .filter_map(|e| match e {
+                Event::Role(t) => Some(t),
+                Event::PeerUp { .. } => None,
+            })
+            .collect();
+        n.transitions.extend(roles.iter().copied());
+        for t in roles {
+            {
+                self.note(|| {
+                    format!(
+                        "node{i} {:?} -> {:?} ({}, epoch {})",
+                        t.from,
+                        t.to,
+                        t.reason.as_str(),
+                        t.epoch
+                    )
+                });
             }
         }
-        for m in msgs {
-            self.on_sync(to, m);
+        if self.connected && !bytes.is_empty() {
+            self.sync_bytes += bytes.len() as u64;
+            self.sync_q
+                .push_back((now + self.cfg.latency_ms, 1 - i, bytes));
         }
-    }
-
-    fn on_sync(&mut self, to: usize, m: Msg) {
-        let now = self.now;
-        let mut replies = Vec::new();
-        {
-            let Some(n) = self.nodes.get_mut(to) else {
-                return;
-            };
-            match &m {
-                Msg::Hello(h) => {
-                    n.peer_hello = Some(h.clone());
-                    if matches!(h.role, Role::Active | Role::Yielding) {
-                        n.peer_stream = h.stream;
-                    }
-                    if let Some(p) = &mut n.publisher {
-                        p.connect(h);
-                    }
-                }
-                Msg::Heartbeat(hb) => {
-                    n.peer_stream = hb.stream;
-                    if hb.role == Role::Active {
-                        n.seen_peer_active = now;
-                    }
-                    n.ha.peer_heard(
-                        now,
-                        Path::Sync,
-                        PeerView {
-                            node_id: hb.node_id,
-                            incarnation: hb.incarnation,
-                            hears: hb.hears,
-                            view_seq: hb.view_seq,
-                            acked: hb.acked,
-                            epoch: hb.epoch,
-                            role: hb.role,
-                            priority: hb.priority,
-                            witness: hb.witness,
-                            in_sync: hb.in_sync,
-                            eligible: hb.eligible,
-                        },
-                    );
-                }
-                Msg::Handover { epoch } => n.ha.handover(now, *epoch),
-                Msg::HandoverRequest { epoch } => n.ha.handover_request(now, *epoch),
-                Msg::Ack { .. } | Msg::Resync { .. } => {
-                    if let Some(p) = &mut n.publisher {
-                        p.handle(now, &m);
-                    }
-                }
-                Msg::SnapshotBegin { .. }
-                | Msg::SnapshotChunk { .. }
-                | Msg::SnapshotEnd { .. }
-                | Msg::Delta { .. } => {
-                    if n.publisher.is_none() {
-                        n.replica.handle(now, &m, &mut replies);
-                    }
-                }
-            }
-        }
-        for r in replies {
-            self.send_sync(to, &r);
-        }
-        self.after_actions(to);
-    }
-
-    /// Applies the role machine's actions of node `i`.
-    fn after_actions(&mut self, i: usize) {
-        let mut acts = Vec::new();
-        if let Some(n) = self.nodes.get_mut(i) {
-            n.ha.take_actions(&mut acts);
-        }
-        for a in acts {
-            match a {
-                Action::Role(t) => {
-                    self.note(|| {
-                        format!(
-                            "node{i} {:?} -> {:?} ({}, epoch {})",
-                            t.from,
-                            t.to,
-                            t.reason.as_str(),
-                            t.epoch
-                        )
-                    });
-                    self.streams += 1;
-                    let stream = (self.streams << 8) | (i as u64 + 1);
-                    let Some(n) = self.nodes.get_mut(i) else {
-                        continue;
-                    };
-                    n.transitions.push(t);
-                    // Tell the peer at once (heartbeat and access hello in
-                    // this step; the new active's hello is also the
-                    // gratuitous MAC update).
-                    n.next_hello = self.now;
-                    match t.to {
-                        Role::Active => {
-                            if n.publisher.is_none() {
-                                let mut p = if t.stateful {
-                                    Publisher::from_replica(stream, n.sync_cfg.clone(), &n.replica)
-                                } else {
-                                    Publisher::new(stream, n.sync_cfg.clone())
-                                };
-                                if let Some(h) = &n.peer_hello {
-                                    p.connect(h);
-                                }
-                                n.publisher = Some(p);
-                                n.replica.clear();
-                            }
-                        }
-                        Role::Yielding => {}
-                        _ => {
-                            if n.publisher.take().is_some() {
-                                n.replica.clear();
-                            }
-                        }
-                    }
-                    if let Some(h) = self.nodes.get(i).map(Node::hello_msg) {
-                        self.send_sync(i, &Msg::Hello(h));
-                    }
-                }
-                Action::Handover { epoch } => self.send_sync(i, &Msg::Handover { epoch }),
-                Action::HandoverRequest { epoch } => {
-                    self.send_sync(i, &Msg::HandoverRequest { epoch });
-                }
+        for (body, _from_vmac) in hellos {
+            if self.access_up && !self.rng.chance(self.cfg.access_loss) {
+                self.access_q
+                    .push_back((now + self.cfg.latency_ms, 1 - i, body));
             }
         }
     }
@@ -637,7 +457,6 @@ impl Lab {
         if self.sync_up && both_alive && !self.connected {
             self.connect();
         }
-        // Deliver what is due.
         while let Some((at, _, _)) = self.sync_q.front() {
             if *at > now {
                 break;
@@ -645,99 +464,59 @@ impl Lab {
             let Some((_, to, b)) = self.sync_q.pop_front() else {
                 break;
             };
-            if self.connected {
-                self.deliver_sync(to, &b);
+            if !self.connected {
+                continue;
+            }
+            let failed = self
+                .nodes
+                .get_mut(to)
+                .is_some_and(|n| n.alive && n.node.input(now, &b).is_err());
+            if failed {
+                self.disconnect();
+            } else {
+                self.drain(to);
             }
         }
         while let Some((at, _, _)) = self.access_q.front() {
             if *at > now {
                 break;
             }
-            let Some((_, to, f)) = self.access_q.pop_front() else {
+            let Some((_, to, body)) = self.access_q.pop_front() else {
                 break;
             };
-            let key = self.key;
             if let Some(n) = self.nodes.get_mut(to)
                 && n.alive
-                && let Some(body) = f.get(14..)
-                && let Ok(h) = HelloFrame::decode(&key, body)
-                && n.guard.check(&h).is_ok()
             {
-                if h.view.role == Role::Active {
-                    n.seen_peer_active = now;
-                }
-                n.ha.peer_heard(now, Path::Access, h.view);
+                n.node.access_input(now, &body);
             }
-            self.after_actions(to);
+            self.drain(to);
         }
+        let budget = self.cfg.bytes_per_ms * self.cfg.step_ms as usize;
         for i in 0..2 {
-            if !self.nodes.get(i).is_some_and(|n| n.alive) {
-                continue;
-            }
-            if let Some(n) = self.nodes.get_mut(i) {
-                n.ha.witness(now, n.witness);
-                n.ha.track(now, n.track);
-                let in_sync = n.publisher.is_none()
-                    && n.replica.complete()
-                    && n.replica.status().stream == n.peer_stream;
-                n.ha.synced(now, in_sync);
-                n.ha.tick(now);
-            }
-            self.after_actions(i);
-            // Hellos on both paths.
-            let Some(n) = self.nodes.get_mut(i) else {
-                continue;
-            };
-            // Every hello interval, and at once when what it says changes.
-            let view = n.ha.view();
-            if (now >= n.next_hello || n.last_view != Some(view)) && !n.ha.silent() {
-                n.next_hello = now + n.cfg.hello_ms;
-                n.last_view = Some(view);
-                n.hello_seq += 1;
-                let hb = n.heartbeat();
-                let f = HelloFrame {
-                    view: n.ha.view(),
-                    seq: n.hello_seq,
-                };
-                let src = if n.ha.answering() {
-                    [0, 0, 0x5e, 0, 1, 1]
-                } else {
-                    [2, 0, 0, 0, 0, u8::try_from(i).unwrap_or(0)]
-                };
-                let frame = f.frame(&self.key, src);
-                self.send_sync(i, &Msg::Heartbeat(hb));
-                if self.access_up && !self.rng.chance(self.cfg.access_loss) {
-                    self.access_q
-                        .push_back((now + self.cfg.latency_ms, 1 - i, frame));
-                }
-            }
-            // The sync stream, within the link's budget.
-            let budget = self.cfg.bytes_per_ms * self.cfg.step_ms as usize;
-            let mut out = Vec::new();
             if let Some(n) = self.nodes.get_mut(i)
-                && self.connected
+                && n.alive
             {
-                if let Some(p) = &mut n.publisher {
-                    p.poll(budget, &mut out);
-                } else {
-                    n.replica.poll(now, &mut out);
-                }
+                n.node.witness(now, n.witness);
+                n.node.track(now, n.track);
+                n.node.tick(now);
+                n.node.poll(now, budget);
+            } else {
+                continue;
             }
-            for m in out {
-                self.send_sync(i, &m);
-            }
+            self.drain(i);
         }
         // The safety watch.
         let ans: Vec<bool> = self
             .nodes
             .iter()
-            .map(|n| n.alive && n.ha.answering())
+            .map(|n| n.alive && n.node.answering())
             .collect();
         let any_alive = self.nodes.iter().any(|n| n.alive);
         if ans.iter().all(|a| *a) {
             let [a, b] = &self.nodes;
-            let knew = a.seen_peer_active >= b.ha.since().max(a.ha.since())
-                && b.seen_peer_active >= a.ha.since().max(b.ha.since());
+            let (sa, sb) = (a.node.ha().since(), b.node.ha().since());
+            let knew =
+                a.node.seen_peer_active() >= sb.max(sa) && b.node.seen_peer_active() >= sa.max(sb);
             if knew {
                 self.watch.split_brain_ms += self.cfg.step_ms;
             } else {
@@ -775,12 +554,12 @@ impl Lab {
         let (Some(act), Some(stb)) = (self.nodes.get(a), self.nodes.get(1 - a)) else {
             return false;
         };
-        match &act.publisher {
+        match act.node.publisher() {
             Some(p) => {
                 stb.alive
-                    && stb.ha.role() == Role::Standby
-                    && stb.replica.complete()
-                    && stb.replica.same_as(p)
+                    && stb.node.role() == Role::Standby
+                    && stb.node.replica().complete()
+                    && stb.node.replica().same_as(p)
             }
             None => false,
         }
@@ -788,7 +567,7 @@ impl Lab {
 
     /// Keys of `before` missing or different in node `i`'s table.
     pub fn lost(&self, before: &[(Key, Vec<u8>, Counters)], i: usize) -> usize {
-        let Some(p) = self.nodes.get(i).and_then(|n| n.publisher.as_ref()) else {
+        let Some(p) = self.node(i).and_then(Node::publisher) else {
             return before.len();
         };
         before
@@ -799,9 +578,8 @@ impl Lab {
 
     /// A copy of node `i`'s published table.
     pub fn table(&self, i: usize) -> Vec<(Key, Vec<u8>, Counters)> {
-        self.nodes
-            .get(i)
-            .and_then(|n| n.publisher.as_ref())
+        self.node(i)
+            .and_then(Node::publisher)
             .map(|p| p.iter().map(|(k, v, c)| (*k, v.to_vec(), c)).collect())
             .unwrap_or_default()
     }

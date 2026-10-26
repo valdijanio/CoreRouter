@@ -1138,6 +1138,7 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
+ "corerouter-proto-ha",
  "corerouter-proto-iperf",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",

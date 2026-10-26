@@ -272,6 +272,16 @@ pub enum Msg {
     HandoverRequest {
         epoch: u64,
     },
+    /// First message both ways: a fresh random nonce (`node::Node`
+    /// authenticates the peer before anything else is accepted).
+    Challenge {
+        nonce: [u8; 32],
+    },
+    /// The answer to the peer's challenge: HMAC under the pair's link key.
+    Proof {
+        node_id: u64,
+        mac: [u8; 32],
+    },
 }
 
 mod kind {
@@ -285,6 +295,8 @@ mod kind {
     pub const RESYNC: u8 = 8;
     pub const HANDOVER: u8 = 9;
     pub const HANDOVER_REQUEST: u8 = 10;
+    pub const CHALLENGE: u8 = 11;
+    pub const PROOF: u8 = 12;
 }
 
 mod op {
@@ -359,6 +371,8 @@ impl Msg {
             Msg::Resync { .. } => kind::RESYNC,
             Msg::Handover { .. } => kind::HANDOVER,
             Msg::HandoverRequest { .. } => kind::HANDOVER_REQUEST,
+            Msg::Challenge { .. } => kind::CHALLENGE,
+            Msg::Proof { .. } => kind::PROOF,
         }
     }
 
@@ -491,6 +505,11 @@ impl Msg {
                 put_u64(out, *from);
             }
             Msg::Handover { epoch } | Msg::HandoverRequest { epoch } => put_u64(out, *epoch),
+            Msg::Challenge { nonce } => out.extend_from_slice(nonce),
+            Msg::Proof { node_id, mac } => {
+                put_u64(out, *node_id);
+                out.extend_from_slice(mac);
+            }
         }
         Ok(())
     }
@@ -619,6 +638,11 @@ impl Msg {
             },
             kind::HANDOVER => Msg::Handover { epoch: r.u64()? },
             kind::HANDOVER_REQUEST => Msg::HandoverRequest { epoch: r.u64()? },
+            kind::CHALLENGE => Msg::Challenge { nonce: r.array()? },
+            kind::PROOF => Msg::Proof {
+                node_id: r.u64()?,
+                mac: r.array()?,
+            },
             k => return Err(Error::UnknownKind(k)),
         };
         r.end()?;
@@ -778,6 +802,11 @@ mod tests {
             Msg::Resync { stream: 1, from: 5 },
             Msg::Handover { epoch: 4 },
             Msg::HandoverRequest { epoch: 4 },
+            Msg::Challenge { nonce: [7; 32] },
+            Msg::Proof {
+                node_id: 9,
+                mac: [3; 32],
+            },
         ]
     }
 
