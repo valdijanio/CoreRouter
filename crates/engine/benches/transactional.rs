@@ -5,6 +5,8 @@
 //!
 //! - `single/address_list_add_remove/60000`: one address-list entry added
 //!   and removed again (two commands) with a 60 000-entry list in place;
+//! - `single/address_list_add/60000`: the add alone (G0.21: < 20 µs), the
+//!   entry removed again outside the timing;
 //! - `single/interface.set/routes_10000`: a comment on a port with 10 000
 //!   routes in place (touches nothing of the routes);
 //! - `build/N`: a fresh lab built with N commands (65 % address-list
@@ -127,6 +129,28 @@ fn transactional(c: &mut Criterion) {
             });
         },
     );
+
+    g.bench_function(BenchmarkId::new("single/address_list_add", 60_000), |b| {
+        b.iter_custom(|iters| {
+            let mut spent = Duration::ZERO;
+            for _ in 0..iters {
+                let t = std::time::Instant::now();
+                let added = s
+                    .execute(
+                        "ip.firewall.address-list.add",
+                        &json!({"list": "bench", "address": "198.51.100.7"}),
+                    )
+                    .unwrap();
+                spent += t.elapsed();
+                s.execute(
+                    "ip.firewall.address-list.remove",
+                    &json!({"id": added["id"]}),
+                )
+                .unwrap();
+            }
+            spent
+        });
+    });
 
     let mut s = big_session(0, 10_000);
     let mut flip = false;
