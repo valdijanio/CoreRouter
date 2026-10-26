@@ -256,6 +256,53 @@ fn disabling_a_server_with_sessions_asks_first() {
     assert!(lock(&h.session).store().running().ppp.pppoe_servers[0].disabled, "{:?}", h.app.log());
 }
 
+/// G4.3k: the Service-Name table under the servers, and a row added
+/// through its modal and the engine's preview.
+#[test]
+fn the_service_name_table_under_the_servers() {
+    let (mut s, _) = lab();
+    s.execute("interface.pppoe-server.server.service.add", &json!({"server": "pppoe-ether2", "name": "iptv", "profile": "plano", "pado_delay": 300})).unwrap();
+    s.execute("interface.pppoe-server.server.service.set", &json!({"server": "pppoe-ether2", "name": "any", "action": "drop"})).unwrap();
+    let mut h = open(s);
+    tab(&mut h, Tab::Servers);
+    refresh(&mut h);
+    assert!(h.has_text("Service Names"));
+    let rows: Vec<_> = h.app.panel_mut::<PppPanel>().unwrap().services.iter().map(PppPanel::service_row).collect();
+    assert_eq!(rows.len(), 3, "iptv, empty and any");
+    let chips = |c: &str| crate::chip::split(c).1.iter().map(|(_, t)| (*t).to_owned()).collect::<Vec<_>>();
+    assert_eq!(rows[0].cells[0], "iptv");
+    assert_eq!(chips(&rows[0].cells[2]), ["delay 300 ms"]);
+    assert_eq!(chips(&rows[1].cells[0]), ["empty name"]);
+    assert_eq!(chips(&rows[2].cells[2]), ["drop"]);
+    assert!(rows[2].dimmed);
+    assert!(h.has_text_containing("delay 300 ms"));
+    h.app.with_panel_as::<PppPanel, _>(|p, app| p.open_service(app, "pppoe-ether2", None)).unwrap();
+    h.idle();
+    {
+        let p = h.app.panel_mut::<PppPanel>().unwrap();
+        let m = p.svc_modal.as_mut().expect("the modal is open");
+        m.values.insert("name", "voip".into());
+        m.values.insert("max_sessions", "10".into());
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while h.app.panel_mut::<PppPanel>().unwrap().svc_modal.as_ref().and_then(|m| m.preview.clone()).is_none_or(|p| p["commands"].as_array().is_none_or(Vec::is_empty)) {
+        assert!(Instant::now() < deadline);
+        h.time += 0.5;
+        h.idle();
+    }
+    assert!(h.has_text_containing("New Service Name"));
+    for _ in 0..30 {
+        h.idle();
+    }
+    h.click(h.text("OK"));
+    for _ in 0..30 {
+        h.idle();
+    }
+    let s = lock(&h.session);
+    let t = s.store().running().ppp.pppoe_servers[0].service_table();
+    assert!(t.iter().any(|r| r.name.to_string() == "voip" && r.max_sessions == 10), "{t:?} {:?}", h.app.log());
+}
+
 #[test]
 fn every_explanation_exists_in_both_languages() {
     use crate::i18n::{Lang, Langs, explain};
@@ -347,6 +394,15 @@ fn every_explanation_exists_in_both_languages() {
         "ppp.server.service_name",
         "ppp.server.sessions",
         "ppp.servers",
+        "ppp.services",
+        "ppp.service.server",
+        "ppp.service.name",
+        "ppp.service.profile",
+        "ppp.service.action",
+        "ppp.service.pado_delay",
+        "ppp.service.max_sessions",
+        "ppp.service.padi_limit",
+        "ppp.service.sessions",
         "ppp.why",
         "ppp.why.mac",
         "ppp.why.name",
