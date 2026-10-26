@@ -19,7 +19,9 @@
 //! - `queue_simple_add/single/N` (G4.9 × G0.21): one named `queue.simple.add`
 //!   (its own commit) with N simple queues in place; `…/unnamed/N` the same
 //!   without a name (it gets the first free `queue<k>`); `…/batch_step/N`
-//!   and `…/atomic_step/N` 100 adds per batch, as for the secrets.
+//!   and `…/atomic_step/N` 100 adds per batch, as for the secrets;
+//!   `queue_sync/idle/N`: one round of the daemon's `queue` service (once
+//!   a second, under the session lock) when nothing changed.
 //!
 //! The adds are removed again outside the timing, so N stays put.
 //!
@@ -186,6 +188,10 @@ fn bench(c: &mut Criterion) {
                 });
             });
         }
+        s.queue_sync();
+        g.bench_function(BenchmarkId::new("queue_sync/idle", n), |b| {
+            b.iter(|| s.queue_sync());
+        });
         g.throughput(Throughput::Elements(STEPS as u64));
         for (kind, atomic) in [("batch_step", false), ("atomic_step", true)] {
             g.bench_function(BenchmarkId::new(format!("queue_simple_add/{kind}"), n), |b| {
