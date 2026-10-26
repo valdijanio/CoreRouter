@@ -533,7 +533,12 @@ impl Bng {
         match xdp {
             Some(idx) => self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                 idx,
-                xdp_session(&d, sub.rate.as_deref(), sub.v6.as_deref()),
+                xdp_session(
+                    &d,
+                    sub.rate.as_deref(),
+                    sub.v6.as_deref(),
+                    corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective),
+                ),
             ))),
             None => {
                 if let Some(ip) = ip {
@@ -554,7 +559,7 @@ impl Bng {
             &want,
             &holder,
             ip,
-            xdp.is_some(),
+            v6_refusal(xdp.is_some()),
         );
         sub.routes = adm.routes.clone();
         for (rt, _) in &adm.routes {

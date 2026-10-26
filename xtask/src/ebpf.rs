@@ -243,10 +243,13 @@ pub fn root_test(root: &Path) -> Outcome {
             "loading XDP needs root; only the CI runner does it (COREROUTER_REQUIRE_XDP=1). By hand: {cmd}"
         ));
     }
-    let exe = match test_binary(root) {
-        Ok(e) => e,
-        Err(e) => return Outcome::Fail(e),
-    };
+    let mut exes = Vec::new();
+    for (bin, tests) in ROOT_BINARIES {
+        match test_binary(root, bin) {
+            Ok(e) => exes.push((bin, e, tests)),
+            Err(e) => return Outcome::Fail(e),
+        }
+    }
     let ns = "crxdp";
     let sudo = |args: &[&str]| -> Result<std::process::Output, String> {
         Command::new("sudo")
@@ -267,7 +270,6 @@ pub fn root_test(root: &Path) -> Outcome {
         }
         Err(e) => return Outcome::Fail(e),
     }
-    let exe_s = exe.to_string_lossy().into_owned();
     // One test at a time, each with a deadline, output straight to the log:
     // a hang shows which test, and never holds the CI job.
     let mut failed = Vec::new();
@@ -279,38 +281,41 @@ pub fn root_test(root: &Path) -> Outcome {
         .map(|t| t.trim().to_owned())
         .filter(|t| !t.is_empty())
         .collect();
-    for (test, secs) in XDP_TESTS {
-        if !only.is_empty() && !only.iter().any(|o| o == test) {
-            continue;
-        }
-        eprintln!("--- xdp_root {test}");
-        let status = Command::new("timeout")
-            .args([
-                "--kill-after=10",
-                &secs.to_string(),
-                "sudo",
-                "-n",
-                "ip",
-                "netns",
-                "exec",
-                ns,
-                "env",
-                "COREROUTER_XDP_ROOT=1",
-                &exe_s,
-                test,
-                "--exact",
-                "--test-threads=1",
-                "--nocapture",
-            ])
-            .current_dir(root)
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) if s.code() == Some(124) => {
-                failed.push(format!("{test}: timed out after {secs} s"))
+    for (bin, exe, tests) in &exes {
+        let exe_s = exe.to_string_lossy().into_owned();
+        for (test, secs) in *tests {
+            if !only.is_empty() && !only.iter().any(|o| o == test) {
+                continue;
             }
-            Ok(s) => failed.push(format!("{test}: {s}")),
-            Err(e) => failed.push(format!("{test}: {e}")),
+            eprintln!("--- {bin} {test}");
+            let status = Command::new("timeout")
+                .args([
+                    "--kill-after=10",
+                    &secs.to_string(),
+                    "sudo",
+                    "-n",
+                    "ip",
+                    "netns",
+                    "exec",
+                    ns,
+                    "env",
+                    "COREROUTER_XDP_ROOT=1",
+                    &exe_s,
+                    test,
+                    "--exact",
+                    "--test-threads=1",
+                    "--nocapture",
+                ])
+                .current_dir(root)
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) if s.code() == Some(124) => {
+                    failed.push(format!("{test}: timed out after {secs} s"))
+                }
+                Ok(s) => failed.push(format!("{test}: {s}")),
+                Err(e) => failed.push(format!("{test}: {e}")),
+            }
         }
     }
     let _ = sudo(&["ip", "netns", "del", ns]);
@@ -321,9 +326,27 @@ pub fn root_test(root: &Path) -> Outcome {
     }
 }
 
+/// The root test binaries of hal-linux and their tests.
+const ROOT_BINARIES: [(&str, &[(&str, u32)]); 3] = [
+    ("xdp_root", &XDP_TESTS),
+    ("shaper_root", &SHAPER_TESTS),
+    ("policer_race_root", &RACE_TESTS),
+];
+
+/// `tests/shaper_root.rs` (G4.9b).
+const SHAPER_TESTS: [(&str, u32); 4] = [
+    ("shaper_programs_load_and_attach", 60),
+    ("shaper_accuracy", 400),
+    ("tcp_shaper_vs_policer", 180),
+    ("perf_edt_vs_htb", 900),
+];
+
+/// `tests/policer_race_root.rs` (G4.3cc).
+const RACE_TESTS: [(&str, u32); 1] = [("policer_with_many_cpus_on_one_subscriber", 120)];
+
 /// The root tests and how long each may take (seconds; a few times what
 /// they take on the CI runner).
-const XDP_TESTS: [(&str, u32); 17] = [
+const XDP_TESTS: [(&str, u32); 18] = [
     ("loads_attaches_and_counts", 60),
     ("kernel_and_host_agree", 60),
     ("perf_lpm_cost", 180),
@@ -339,18 +362,19 @@ const XDP_TESTS: [(&str, u32); 17] = [
     ("perf_pppoe_forward", 60),
     ("ipoe_kernel_and_host_agree", 120),
     ("pppoe_bng_ops_reach_the_maps", 60),
+    ("pppoe_kernel_delivery_through_bng0", 60),
     ("pppoe_routes_kernel_and_host_agree", 120),
     ("perf_pppoe_routes_10k", 300),
 ];
 
-fn test_binary(root: &Path) -> Result<PathBuf, String> {
+fn test_binary(root: &Path, bin: &str) -> Result<PathBuf, String> {
     let out = crate::cargo()
         .args([
             "test",
             "-p",
             "corerouter-hal-linux",
             "--test",
-            "xdp_root",
+            bin,
             "--no-run",
             "--message-format=json-render-diagnostics",
         ])
@@ -365,7 +389,7 @@ fn test_binary(root: &Path) -> Result<PathBuf, String> {
         .lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
         .find_map(|m| m.get("executable")?.as_str().map(PathBuf::from))
-        .ok_or_else(|| "xdp_root test binary not found".into())
+        .ok_or_else(|| format!("{bin} test binary not found"))
 }
 
 #[cfg(test)]
@@ -375,7 +399,25 @@ mod xdp_list_tests {
     /// was missing until G4.3e).
     #[test]
     fn every_root_test_is_listed() {
-        let src = include_str!("../../crates/hal-linux/tests/xdp_root.rs");
+        for (src, list) in [
+            (
+                include_str!("../../crates/hal-linux/tests/xdp_root.rs"),
+                &super::XDP_TESTS[..],
+            ),
+            (
+                include_str!("../../crates/hal-linux/tests/shaper_root.rs"),
+                &super::SHAPER_TESTS[..],
+            ),
+            (
+                include_str!("../../crates/hal-linux/tests/policer_race_root.rs"),
+                &super::RACE_TESTS[..],
+            ),
+        ] {
+            check(src, list);
+        }
+    }
+
+    fn check(src: &str, list: &[(&str, u32)]) {
         let mut found = Vec::new();
         let mut after_test = false;
         for line in src.lines() {
@@ -394,8 +436,8 @@ mod xdp_list_tests {
         assert!(!found.is_empty());
         for f in &found {
             assert!(
-                super::XDP_TESTS.iter().any(|(n, _)| n == f),
-                "xdp_root.rs › {f} is not in XDP_TESTS: it would never run as root"
+                list.iter().any(|(n, _)| n == f),
+                "{f} is not in its root test list: it would never run as root"
             );
         }
     }

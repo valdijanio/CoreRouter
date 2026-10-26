@@ -72,6 +72,10 @@ name = "transactional"
 harness = false
 
 [[bench]]
+name = "config_store"
+harness = false
+
+[[bench]]
 name = "cgnat_who_was"
 harness = false
 

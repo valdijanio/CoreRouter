@@ -19,6 +19,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp.active.ipv6_prefix", "The link's /64, advertised in the session's RA (SLAAC): from RADIUS Framed-IPv6-Prefix or the profile's IPv6 pool."),
     ("ppp.active.name", "The login of the session."),
     ("ppp.active.rate_limit", "The rate limit in force (RADIUS or profile); a CoA changes it live."),
+    ("ppp.active.routes", "Blocks routed to this session (G4.3cd), each with where it came from: secret (Routes), Framed-Route (RFC 2865 §5.22), Framed-IPv6-Route (RFC 3162 §2.5) or a second Framed-IPv6-Prefix. Refused ones are counted in red; Why? says why. They go away with the session."),
     ("ppp.active.rx", "Bytes from the subscriber (upload)."),
     ("ppp.active.service", "The PPP service (pppoe)."),
     ("ppp.active.traffic", "Rx (blue) and Tx (red) of the session since the window opened, from the rates the service measures each second."),
@@ -74,6 +75,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp.secret.password", "Write-only. CHAP and MS-CHAP need it in clear."),
     ("ppp.secret.profile", "The profile of this login."),
     ("ppp.secret.remote_address", "A fixed address for this subscriber; wins over the profile's pool."),
+    ("ppp.secret.routes", "Blocks routed to the subscriber while connected, RouterOS style: dst-address gateway metric, comma-separated, IPv4 or IPv6. Gateway 0.0.0.0, :: or none = the subscriber. Overlaps with another secret, a pool or the router's own addresses are refused."),
     ("ppp.secret.service", "Which PPP services this login may use (pppoe, any…)."),
     ("ppp.secret.state", "online: a session of this login is up now."),
     ("ppp.secrets", "## PPP Secrets\n\n`/ppp secret`: local subscribers (login and password). Users not here go to RADIUS when PPP › AAA › Use RADIUS is on."),
@@ -119,6 +121,7 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("ppp.why.mac", "The CPE's MAC (Caller ID): useful when the login never got that far."),
     ("ppp.why.name", "The PPP login (as in Secrets or RADIUS)."),
     ("ppp.why.reply_message", "The RADIUS Reply-Message (RFC 2865 §5.18) of the last answer."),
+    ("ppp.why.routes", "The routes of the connected session with their origin, and the refused ones with the reason."),
     ("ppp.why.stage", "The stage of a login: PADI, PADR (PPPoE Discovery, RFC 2516 §5), LCP (RFC 1661), Auth (PAP/CHAP/MS-CHAP), NCP (IPCP/IPv6CP), up."),
 ];
 

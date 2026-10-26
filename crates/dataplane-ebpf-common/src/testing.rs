@@ -359,6 +359,8 @@ impl Sessions for Subs {
             .max_by_key(|(_, l, _)| *l)
             .map(|(_, _, i)| *i)
     }
+    type Policer<'a> = Option<&'a mut policer::State>;
+
     fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State> {
         self.policers.get_mut(&(idx, dir))
     }
@@ -469,7 +471,7 @@ pub fn program_model(
 
 fn to_subscriber_model(buf: &mut Buf, subs: &mut Subs, now: u64) -> Option<Outcome> {
     let d = pppoe::to_subscriber(buf, subs, now)?;
-    match d.down {
+    match d.verdict.down() {
         Down::NotSub => None,
         Down::Kernel(st, _) | Down::Counted(st, _, _) => {
             Some((XDP_PASS, buf.frame().to_vec(), None, Some(st)))

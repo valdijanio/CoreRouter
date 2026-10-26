@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder};
+use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder, RouteChange};
 use ipnet::Ipv6Net;
 use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
@@ -165,17 +165,6 @@ pub(crate) struct Shared {
     /// subscriber may take (set by the workers with the config).
     pub framed: FramedTable,
     pub forbidden: Arc<Forbidden>,
-}
-
-/// The routes a CoA gives a session: each family present replaces all the
-/// session's routes of that family (`Framed-Route ""`: none).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct RouteChange {
-    pub v4: bool,
-    pub v6: bool,
-    pub routes: Vec<(FramedRoute, RouteOrigin)>,
-    /// Texts that did not parse: the whole change is refused.
-    pub invalid: Vec<String>,
 }
 
 /// One worker's share of the service counters.
@@ -527,7 +516,7 @@ impl SessionOwner for Owner {
                     .find(|a| a.name == "Mikrotik-Address-List")
                     .map(|a| a.value.clone());
                 let new_ip = req.changes.iter().any(|a| a.name == "Framed-IP-Address");
-                let change = route_change(&req.changes);
+                let change = framed::route_change(&req.changes);
                 if let Some(c) = &change
                     && !new_ip
                 {
@@ -535,7 +524,8 @@ impl SessionOwner for Owner {
                     // routes are checked here, before the ACK.
                     for h in &hits {
                         let ip = sh.active.get(h).and_then(|a| a.address);
-                        if let Err(why) = check_change(&sh, h, ip, c) {
+                        if let Err(why) = framed::check_change(&sh.framed, &sh.forbidden, h, ip, c)
+                        {
                             log::info!("ppp: CoA de rotas recusado: {why}");
                             return CoaOutcome::Nak(407); // Invalid Attribute Value
                         }
@@ -1102,6 +1092,8 @@ pub(crate) struct Snapshot {
     /// driver, so a line keeps its link-local across restarts); `None`:
     /// one drawn from the seed, for this run.
     pub iid_key: Option<[u8; 32]>,
+    /// G4.9b: `/queue type`s, for the profiles' download queue.
+    pub queues: corerouter_model::queue::Queues,
     /// G4.3cd: who holds each routed block (the router's, shared with
     /// IPoE and the commands) and the space no route may take.
     pub framed: FramedTable,
@@ -2212,7 +2204,9 @@ impl Bng {
                 if let Some(sub) = self.subs.get(&(i, session.sid))
                     && let Some(idx) = sub.xdp
                 {
-                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref());
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
+                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref(), shape);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(idx, s)));
                 }
             }
@@ -2740,7 +2734,12 @@ impl Bng {
         match xdp {
             Some(idx) => self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                 idx,
-                xdp_session(d, sub.rate.as_deref(), sub.v6.as_deref()),
+                xdp_session(
+                    d,
+                    sub.rate.as_deref(),
+                    sub.v6.as_deref(),
+                    corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective),
+                ),
             ))),
             None => {
                 if let Some(ip) = ip {
@@ -2765,7 +2764,7 @@ impl Bng {
             &want,
             &holder,
             ip,
-            xdp.is_some(),
+            v6_refusal(xdp.is_some()),
         );
         refused.extend(adm.refused.iter().cloned());
         sub.routes = adm.routes.clone();
@@ -3245,11 +3244,15 @@ impl Bng {
                     continue;
                 };
                 if let Some(c) = sub.xdp.and_then(|i| by_idx.get(&i)) {
+                    // G4.3h: plus what the session had on the node that
+                    // opened it (a takeover).
                     let [rx, tx, rxp, txp] = sub.base;
                     a.rx_bytes = rx + c.up_bytes;
                     a.rx_packets = rxp + c.up_packets;
                     a.tx_bytes = tx + c.down_bytes;
                     a.tx_packets = txp + c.down_packets;
+                    a.queue_us = c.down_queue_us;
+                    a.drops = c.up_policed + c.down_policed;
                 }
                 a.uptime_secs = now.saturating_sub(up) / 1000;
                 let dt = now.saturating_sub(sub.prev.2);
@@ -3394,9 +3397,12 @@ impl Bng {
                 sub.rate = Some(rate.clone());
                 self.ha.dirty.insert((i, sref.sid));
                 if let Some(idx) = sub.xdp {
+                    // CoA: the rate changes, the queue (its clock) stays.
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                         idx,
-                        xdp_session(&d, Some(&rate), sub.v6.as_deref()),
+                        xdp_session(&d, Some(&rate), sub.v6.as_deref(), shape),
                     )));
                 }
                 let user = sub.user.clone();
@@ -3448,7 +3454,7 @@ impl Bng {
             &fresh,
             &holder,
             sub.ip,
-            sub.xdp.is_some(),
+            v6_refusal(sub.xdp.is_some()),
         );
         let xdp = sub.xdp;
         let mut now_routes = kept;
@@ -3666,6 +3672,12 @@ fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
         .collect()
 }
 
+/// Why an IPv6 route cannot be had: without XDP there is no IPv6 slow
+/// path (G4.3l).
+fn v6_refusal(xdp: bool) -> Option<&'static str> {
+    (!xdp).then_some("IPv6 só com o plano de dados XDP (sem XDP, G4.3l)")
+}
+
 /// Where a route goes: the XDP LPM of session `xdp`, or (IPv4, no XDP) a
 /// kernel route through `bng0`.
 fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
@@ -3678,67 +3690,6 @@ fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
             text: format!("PPP: rota {r}: IPv6 sem XDP"),
         },
     }
-}
-
-/// The route attributes of a CoA, if it has any: every `Framed-Route`
-/// and `Framed-IPv6-Route` (RFC 2865 §5.22, RFC 3162 §2.5), repeated. A
-/// family present replaces that family's routes; a value of `""` alone
-/// clears it.
-pub(crate) fn route_change(changes: &[Attribute]) -> Option<RouteChange> {
-    let v4 = changes.iter().any(|a| a.name == "Framed-Route");
-    let v6 = changes.iter().any(|a| a.name == "Framed-IPv6-Route");
-    if !v4 && !v6 {
-        return None;
-    }
-    let (routes, refused) = framed::from_radius(
-        changes
-            .iter()
-            .filter(|a| a.name != "Framed-IPv6-Prefix" && !a.value.trim().is_empty())
-            .map(|a| (a.name.as_str(), a.value.as_str())),
-    );
-    Some(RouteChange {
-        v4,
-        v6,
-        routes,
-        invalid: refused,
-    })
-}
-
-/// Whether session `id` (IPv4 `ip`) may take the routes of `c`: each is
-/// valid and no other session holds an overlapping block. `Err`: why.
-fn check_change(
-    sh: &Shared,
-    id: &str,
-    ip: Option<Ipv4Addr>,
-    c: &RouteChange,
-) -> Result<(), String> {
-    if let Some(why) = c.invalid.first() {
-        return Err(why.clone());
-    }
-    if c.routes.len() > corerouter_model::framed_route::MAX_ROUTES {
-        return Err(format!(
-            "mais de {} rotas",
-            corerouter_model::framed_route::MAX_ROUTES
-        ));
-    }
-    for (k, (r, _)) in c.routes.iter().enumerate() {
-        framed::check(r, ip, &sh.forbidden)?;
-        if let Some((n, h)) = sh.framed.conflict(&r.dst, id) {
-            return Err(format!(
-                "{}: sobrepõe {n}, já roteado para {}",
-                r.dst, h.user
-            ));
-        }
-        if let Some((o, _)) = c
-            .routes
-            .iter()
-            .take(k)
-            .find(|(o, _)| corerouter_model::framed_route::overlaps(&o.dst, &r.dst))
-        {
-            return Err(format!("{}: sobrepõe {} do mesmo pedido", r.dst, o.dst));
-        }
-    }
-    Ok(())
 }
 
 /// RFC 4679 §3 (TR-101): Agent-Circuit-Id and Agent-Remote-Id of the line,
@@ -3793,13 +3744,14 @@ fn rate_dir(r: &RateLimit, up: bool) -> Rate {
     }
 }
 
-/// The XDP map entry of a session (G4.3c): downstream always in XDP
-/// (the kernel path to the subscriber is G4.3ca), upstream through the
-/// kernel so `forward` and the queues see it.
+/// The XDP map entry of a session (G4.3c): downstream in XDP, or, shaped
+/// (G4.9b), through the kernel and `bng0` to the shaper on the access port;
+/// upstream through the kernel so `forward` and the queues see it.
 fn xdp_session(
     d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
     rate: Option<&str>,
     v6: Option<&V6>,
+    shape: Option<corerouter_hal::queue::Kind>,
 ) -> PppoeSession {
     let r = rate
         .and_then(|t| t.parse::<RateLimit>().ok())
@@ -3825,6 +3777,7 @@ fn xdp_session(
         delegated: v6
             .and_then(|x| x.delegated.as_ref())
             .map(|(n, _)| (v6::high64(*n), n.prefix_len())),
+        shape,
     }
 }
 

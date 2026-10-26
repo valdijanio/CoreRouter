@@ -368,12 +368,40 @@ laboratório (gap G4.3hf).
 - **Banda:** uma mudança custa ≈ 182 B (upsert) ou 50 B (contadores). Um BNG de 100 mil assinantes
   com 2000 logins/logouts por segundo e contadores a cada 10 s gasta ≈ 0,4 MB/s + 0,5 MB/s: menos de
   1 % de 1 Gbit/s (**estimado**). O snapshot inteiro passa em 0,2 s a 1 Gbit/s.
-- **Threads:** a sincronização cabe num núcleo com folga (1 milhão de mudanças/s contra ≈ 94 mil
-  sessões/s que o BNG monta, G4.3d). Dividir por worker do `pppoe` (cada worker já tem a sua faixa
-  de SESSION_ID) daria um stream por worker sem lock compartilhado — é o plano da fase 2 (PR d):
-  cada worker publica as suas mudanças numa fila limitada para a thread do sync, e a tomada
-  importa as sessões em paralelo, uma thread por worker. A máquina de papéis é uma só por nó
-  (decisão global, custo desprezível).
+- **Threads:** a sincronização cabe num núcleo com folga: 1 milhão de mudanças/s, contra
+  ≈ 94 mil sessões/s que o BNG monta (G4.3d). Um stream por worker evitaria o lock do par, mas
+  não precisou: o worker não espera por ele (abaixo).
+- **A tomada** importa em paralelo: cada worker adota as sessões da sua lane.
+- **A máquina de papéis** é uma só por nó: decisão global, custo desprezível.
+
+### No serviço `pppoe` (fase 2)
+
+**Medido** com `cargo bench -p corerouter-daemon --bench pppoe_bng` (release, Ryzen AI Max+ 395,
+2026-10-26, com outras sessões na máquina: load 14–19, mediana de 3 execuções):
+
+- **Cada worker publica as suas mudanças a cada rodada.** Por sessão, um registro de ≈ 200 B.
+  Montar 1000 sessões custa 15–18 ms com e sem hot standby: a diferença fica dentro do ruído.
+- **O lock do par pode ficar ocupado por milissegundos**: a thread do sync codifica até 4 MiB por
+  volta num snapshot. O worker que esperasse por ele pararia de atender os assinantes. Por isso o
+  `publish` usa `try_lock`. Lock ocupado: as mudanças voltam para a fila do worker
+  (`ha_requeue`) e saem na rodada seguinte, na mesma ordem. O worker só espera passadas 65 536
+  mudanças na fila, o limite de memória. 40 mil logins em rodadas de 256, com o lock preso 8 ms a
+  cada 10 ms (o pior caso):
+
+  | | 1 worker | 8 workers |
+  |---|---:|---:|
+  | sem HA | 67 570/s | 331 743/s |
+  | hot standby, worker espera o lock | 23 854/s | 179 141/s |
+  | hot standby, `try_lock` + fila (este PR) | 63 469/s | 302 470/s |
+
+- **Os contadores para o standby** (a cada 10 s) saem na mesma passada do `tick` de 1 s, que já
+  percorre a tabela ativa. A primeira versão fazia uma varredura própria, debaixo do lock
+  compartilhado: 22 ms para 50 mil sessões num worker, 442 ns por sessão. Agora o `tick` de 50 mil
+  sessões leva 21,7 ms sem os contadores e 22,7 ms com eles: ≈ 1 ms a mais a cada 10 s.
+- **O `tick` de 1 s em si** (G4.3g, anterior a este PR) custa ≈ 440 ns por sessão debaixo do lock
+  compartilhado. Reusar um buffer para o id da sessão, no lugar do `format!`, não mudou nada
+  (21,6 contra 22,2 ms). O custo é a busca no mapa de 50 mil chaves, não a alocação. Dividido
+  entre 8 workers, dá ≈ 3 ms por worker a cada segundo.
 
 ## 5. Riscos e como evitamos
 

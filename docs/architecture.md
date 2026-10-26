@@ -937,6 +937,34 @@ de PADIs de uma volta de energia.
   - as perdas do kernel por socket (`SO_RXQ_OVFL`) e as do canal saem no
     `interface.pppoe-server.monitor` (`rx_dropped`).
 
+### Filas: EDT × HTB (G4.9b)
+
+Decisão (2026-10-26, **medida**): a descida das filas é moldada com **EDT** — um programa tc na
+saída da porta dá a cada pacote o horário de saída (`skb->tstamp`) pelo relógio do alvo (uma
+palavra, `cmpxchg`) e o `fq` (sob `mq`, um por fila de transmissão) o segura —, não com uma árvore
+HTB por alvo. Comparado no laboratório em VM (8 vCPUs, veth com 4 filas, RPS/XPS, 1,5× da taxa
+total oferecida em pacotes de 128 B, `shaper_root::perf_edt_vs_htb`):
+
+| alvos | caso | montar | entregue × taxa | CPU ocupada |
+|---:|---|---:|---:|---:|
+| 1 000 | EDT | 1,0 s | +0,0% | 28,7–31,6% |
+| 1 000 | HTB uma raiz + fq_codel | 0,06 s | −9,9% | 30,2–32,4% |
+| 1 000 | HTB por CPU (mq, RPS/XPS: o cpumap do LibreQoS no kernel) | 0,4 s | +13,8…+15,7% | 34,9–37,1% |
+| 10 000 | EDT | 0,9 s | +7,1% (sobra da fila no começo da janela) | 28,5% |
+| 10 000 | HTB uma raiz | 7,4–9,2 s | −10,3% | 35,6–39,0% |
+| 10 000 | HTB por CPU | não terminou em 23 min (40 000 classes) | — | — |
+
+- **Por que EDT:** exato na taxa, a menor CPU, montagem que não cresce com o número de alvos (o
+  EDT escreve mapas; o HTB cria classes e filtros, ~1 ms por alvo numa raiz e muito mais com uma
+  árvore por CPU), nenhum lock de qdisc por alvo (o `fq` de cada fila de transmissão é da CPU que a
+  usa), e a mesma peça molda PPPoE, IPoE, DHCP e redes fixas. O HTB por CPU entregou acima da taxa:
+  com mais de um fluxo por alvo o RPS espalha o alvo por filas, e cada árvore tem a sua classe.
+- **O que o EDT não faz:** intercalar os fluxos **dentro** de um alvo (saem na ordem de chegada). O
+  CoDel na espera prevista mantém a fila curta (TCP a 50 Mbit/s com 20 ms de RTT: 35 retransmissões
+  contra 1663 do policer, ping +15 ms sem GSO). Se um operador precisar de justiça por fluxo dentro
+  do assinante, o caminho é a qdisc em BPF (`struct_ops`, kernel 6.16+), não o HTB.
+- **Revisar** com placa real (G4.3cb) e quando a qdisc BPF estiver nos kernels das distribuições.
+
 ## Histórico de revisão
 
 - 2026-10-21 — versão inicial (esqueleto v0.1.0).
