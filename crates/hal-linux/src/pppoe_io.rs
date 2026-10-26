@@ -456,17 +456,24 @@ impl SlowTx {
     /// Add (`true`) or remove these `/32` routes, all in one round on the
     /// open connection. The first error is returned; the rest still run.
     pub fn routes(&self, ops: &[(Ipv4Addr, bool)]) -> io::Result<()> {
+        let ops: Vec<(Ipv4Addr, u8, bool)> = ops.iter().map(|&(ip, add)| (ip, 32, add)).collect();
+        self.prefixes(&ops)
+    }
+
+    /// Add (`true`) or remove routes `prefix/len` to `bng0` (a subscriber's
+    /// /32, or a block routed to it, G4.3cd), in one round.
+    pub fn prefixes(&self, ops: &[(Ipv4Addr, u8, bool)]) -> io::Result<()> {
         use rtnetlink::RouteMessageBuilder;
         if ops.is_empty() {
             return Ok(());
         }
         let ifindex = self.ifindex;
         self.rt.block_on(async {
-            let calls = ops.iter().map(|&(ip, add)| {
+            let calls = ops.iter().map(|&(ip, len, add)| {
                 let h = self.handle.clone();
                 async move {
                     let msg = RouteMessageBuilder::<Ipv4Addr>::new()
-                        .destination_prefix(ip, 32)
+                        .destination_prefix(ip, len)
                         .output_interface(ifindex)
                         .build();
                     let out = if add {
@@ -480,7 +487,7 @@ impl SlowTx {
                             Ok(())
                         }
                         Err(e) => Err(io::Error::other(format!(
-                            "route {ip}/32 via {SLOW_DEVICE}: {e}"
+                            "route {ip}/{len} via {SLOW_DEVICE}: {e}"
                         ))),
                     }
                 }

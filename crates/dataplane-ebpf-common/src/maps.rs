@@ -20,6 +20,8 @@
 //! | `PPPOE_COUNTERS` | array | session index | [`crate::pppoe::Counters`] |
 //! | `PPPOE_STATS` | per-CPU array | [`crate::pppoe::Stat`] | packets `u64` |
 //! | `IPOE_PORTS` | hash | access port ifindex | flags `u32` (G4.3f) |
+//! | `PPPOE_RT4` | LPM trie | IPv4 block routed to a subscriber | session index (G4.3cd) |
+//! | `PPPOE_RT6` | LPM trie | IPv6 block routed to a subscriber | session index (G4.3cd) |
 
 use crate::filter::Reason;
 
@@ -41,6 +43,8 @@ pub const PPPOE_POLICER: &str = "PPPOE_POLICER";
 pub const PPPOE_COUNTERS: &str = "PPPOE_COUNTERS";
 pub const PPPOE_STATS: &str = "PPPOE_STATS";
 pub const IPOE_PORTS: &str = "IPOE_PORTS";
+pub const PPPOE_RT4: &str = "PPPOE_RT4";
+pub const PPPOE_RT6: &str = "PPPOE_RT6";
 /// The PPPoE maps sized by the session count (1 entry while PPPoE is off).
 pub const PPPOE_SIZED: [&str; 4] = [PPPOE_KEYS, PPPOE_SESSIONS, PPPOE_V4, PPPOE_COUNTERS];
 /// The XDP program's name in the object.
