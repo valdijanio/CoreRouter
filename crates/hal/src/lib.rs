@@ -20,6 +20,7 @@ pub mod nic;
 pub mod oslog;
 pub mod pppoe;
 pub mod probe;
+pub mod queue;
 pub mod resources;
 pub mod route_get;
 pub mod sff;
