@@ -644,6 +644,28 @@ pub struct PppoeServer {
     /// With a VLAN range: still serve untagged PPPoE.
     #[serde(default = "yes")]
     pub accept_untagged: bool,
+    /// G4.3l: one tag (`pppoe_over_vlan_range`, RouterOS) or two
+    /// (`outer_vlan_range` + `inner_vlan_range`, QinQ;
+    /// `crate::pppoe_vlans`).
+    #[serde(default, skip_serializing_if = "crate::pppoe_vlans::VlanMode::is_default")]
+    pub vlan_mode: crate::pppoe_vlans::VlanMode,
+    /// Stacked: the S-tags served.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outer_vlan_range: Vec<VlanRange>,
+    /// Stacked: the C-tags served (empty: any).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inner_vlan_range: Vec<VlanRange>,
+    /// Stacked: the S-tag's TPID (default 0x88a8).
+    #[serde(default, skip_serializing_if = "crate::pppoe_vlans::Tpid::is_default")]
+    pub outer_tpid: crate::pppoe_vlans::Tpid,
+    /// Sessions per VLAN (the pair of tags in stacked mode); 0 = no limit.
+    /// 1 is TR-101's 1:1 model (a line per VLAN).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub max_sessions_per_vlan: u32,
+    /// RFC 4638: the largest PPP-Max-Payload accepted (1493..=1500); `None`
+    /// keeps the RFC 2516 1492 (a CPE that asks for more gets 1492).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_payload: Option<u16>,
     /// PADR only with the AC-Cookie of our PADO (RFC 2516 §9: no state per
     /// PADI, forged PADRs create nothing). Not in RouterOS.
     #[serde(default = "yes")]
@@ -947,6 +969,9 @@ pub struct ActiveSession {
     pub interface: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vlan: Option<u16>,
+    /// G4.3l: the inner (C-) tag of a QinQ session; `vlan` is the outer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inner_vlan: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub circuit_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

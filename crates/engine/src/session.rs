@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use corerouter_hal::{Hal, VirtualHal};
+use corerouter_model::sections::{self, Sections};
 use corerouter_model::{Config, ConfigStore, Interface, InterfaceKind, User, Users, persist};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -19,7 +20,7 @@ use crate::neighbors::NeighborTable;
 use crate::safe_mode::{Caller, SafeMode};
 use crate::storage::{ConfigStorage, MemoryStorage, Slot};
 use crate::tasks::Tasks;
-use crate::validate::validate_all;
+use crate::validate::{validate_all, validate_changed};
 use crate::{EngineError, Result, guard};
 
 /// How config commands reach the running config.
@@ -457,7 +458,28 @@ impl Session {
     }
 
     fn commit_counted(&mut self, comment: &str, lockout: bool) -> Result<u32> {
-        let issues = validate_all(self.store.candidate());
+        // G0.22: with the running config known valid, only the validators
+        // that read a section this commit changed run (the others give the
+        // running config's answer: none).
+        let scope = match self.ext::<ValidRunning>() {
+            Some(v) if sections::changed(&v.0, self.store.running()).is_empty() => {
+                sections::changed(self.store.running(), self.store.candidate())
+            }
+            _ => Sections::ALL,
+        };
+        let issues = validate_changed(self.store.candidate(), scope);
+        // Debug builds (every test) check the table of what each validator
+        // reads against the full validation on each commit: a dependency
+        // left out fails the command that found it.
+        #[cfg(debug_assertions)]
+        if scope != Sections::ALL {
+            let full = validate_all(self.store.candidate());
+            if full != issues {
+                return Err(EngineError::Internal(format!(
+                    "incremental validation of {scope:?} missed: {full:?}, got {issues:?}"
+                )));
+            }
+        }
         if !issues.is_empty() {
             return Err(EngineError::Validation(issues));
         }
@@ -517,6 +539,7 @@ impl Session {
             (true, false) => format!("{comment} [safe mode]"),
         };
         let revision = self.store.commit(&comment, self.now())?;
+        self.ext.set(ValidRunning(self.store.running().clone()));
         // G2.3: the CGNAT mapping history ("who was") follows every commit.
         self.cgnat_note();
         if let Some(files) = self.ext_mut::<crate::history_files::RevisionFiles>() {
@@ -996,6 +1019,12 @@ fn resolve_refs(v: &Value, results: &[Value]) -> Result<Value> {
 }
 
 /// The value of a `Cow` that had to be built, `None` for a borrowed one.
+/// The running config as of the last commit, which passed every validator
+/// (G0.22): while it is still the running one, a commit validates only what
+/// it changed. A config restored, imported or edited another way is not
+/// this one, and gets the full validation.
+struct ValidRunning(Config);
+
 fn owned<T: Clone>(c: std::borrow::Cow<'_, T>) -> Option<T> {
     match c {
         std::borrow::Cow::Owned(v) => Some(v),
