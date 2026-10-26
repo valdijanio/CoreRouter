@@ -491,10 +491,20 @@ impl XdpState {
         let Some(old) = self.pppoe.sessions.remove(&idx) else {
             return Ok(());
         };
-        if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.maps()) {
-            clear(&mut l.ebpf, idx, &old)?;
-        }
-        self.shaper.session_gone(idx)
+        let ebpf = self
+            .loaded
+            .as_mut()
+            .filter(|_| self.pppoe.maps())
+            .map(|l| &mut l.ebpf);
+        let ebpf = match ebpf {
+            Some(e) => {
+                clear(e, idx, &old)?;
+                Some(e)
+            }
+            None => None,
+        };
+        self.shaper.asked.remove(&idx);
+        self.shaper.session(ebpf, idx, None, Vec::new())
     }
 
     /// [`XdpState::pppoe_upsert`] of a session the BNG service describes,
@@ -506,22 +516,28 @@ impl XdpState {
         p: &corerouter_hal::pppoe::PppoeSession,
     ) -> Result<(), HalError> {
         let mut s = session_of(p);
-        // Shaped: XDP must neither redirect nor police its download (the
-        // kernel takes it to the egress queue), so the session words carry
-        // no fast-down flag and a zero rate; the real rate goes with the
-        // queue (`SUB_SHAPE`).
+        // A shaped download goes to the kernel and the egress queue; while
+        // the shaper is not attached for sessions (no root, a failed
+        // attach), the session stays policed here instead (never
+        // unlimited) and switches when it is (`XdpState::reshape`).
         let shape = p
             .shape
             .filter(|_| s.flags & pppoe::F_SHAPE_DOWN != 0)
             .map(|k| {
-                let down = s.down;
-                s.down = policer::Rate::default();
-                s.flags &= !pppoe::F_FAST_DOWN;
                 corerouter_dataplane_ebpf_common::shaper::session_words(
-                    &down,
-                    &super::shaper::queue_of(&k, down.rate),
+                    &s.down,
+                    &super::shaper::queue_of(&k, s.down.rate),
                 )
             });
+        s.flags &= !pppoe::F_SHAPE_DOWN;
+        if shape.is_some() {
+            self.shaper.asked.insert(idx, s);
+            if self.shaper.ready() {
+                s = super::shaper::shaped_form(&s);
+            }
+        } else {
+            self.shaper.asked.remove(&idx);
+        }
         self.pppoe_upsert(idx, &s)?;
         let routes = if self.pppoe.on {
             super::shaper::routes_of(p)
@@ -534,6 +550,25 @@ impl XdpState {
             .filter(|_| self.pppoe.maps())
             .map(|l| &mut l.ebpf);
         self.shaper.session(ebpf, idx, shape, routes)
+    }
+
+    /// The sessions that asked for a shaped download, in the form the
+    /// shaper's state allows: shaped while it is attached, policed in XDP
+    /// otherwise (after every reach of the loader).
+    pub(super) fn reshape(&mut self) -> Result<(), HalError> {
+        let ready = self.shaper.ready();
+        let asked: Vec<(u32, Session)> = self.shaper.asked.iter().map(|(i, s)| (*i, *s)).collect();
+        for (idx, s) in asked {
+            let want = if ready {
+                super::shaper::shaped_form(&s)
+            } else {
+                s
+            };
+            if self.pppoe.sessions.get(&idx) != Some(&want) {
+                self.pppoe_upsert(idx, &want)?;
+            }
+        }
+        Ok(())
     }
 
     /// Counters of session `idx` (accounting interims, graphs).
@@ -791,6 +826,58 @@ mod tests {
         });
         assert_eq!(none.flags & (F_IPV6 | F_PD), 0);
         assert!(v6_keys(&none).is_empty());
+    }
+
+    /// G4.9b: a session asking for a shaped download stays policed in XDP
+    /// (fast-down, its download rate) until the shaper is attached for
+    /// sessions, then goes shaped, and back if the shaper goes away.
+    #[test]
+    fn shaped_sessions_stay_policed_until_the_shaper_is_attached() {
+        let mut x = XdpState::default();
+        let h = corerouter_hal::pppoe::PppoeSession {
+            ifindex: 3,
+            sid: 9,
+            ipv4: Some(std::net::Ipv4Addr::new(100, 64, 0, 9)),
+            down: corerouter_hal::pppoe::Rate {
+                rate_bps: 20_000_000,
+                ..Default::default()
+            },
+            fast_down: true,
+            shape: Some(corerouter_hal::queue::Kind::default()),
+            ..Default::default()
+        };
+        x.pppoe_upsert_hal(4, &h).unwrap();
+        let s = x.pppoe.sessions[&4];
+        assert_ne!(
+            s.flags & pppoe::F_FAST_DOWN,
+            0,
+            "policed while not attached"
+        );
+        assert_eq!(s.flags & pppoe::F_SHAPE_DOWN, 0);
+        assert_ne!(s.down.rate, 0);
+        x.shaper.set_ready(true);
+        x.reshape().unwrap();
+        let s = x.pppoe.sessions[&4];
+        assert_eq!(
+            s.flags & pppoe::F_FAST_DOWN,
+            0,
+            "shaped: the kernel takes it"
+        );
+        assert_ne!(s.flags & pppoe::F_SHAPE_DOWN, 0);
+        assert_eq!(s.down.rate, 0);
+        // A new session while attached goes in shaped at once.
+        x.pppoe_upsert_hal(5, &corerouter_hal::pppoe::PppoeSession { sid: 10, ..h })
+            .unwrap();
+        assert_eq!(x.pppoe.sessions[&5].down.rate, 0);
+        x.shaper.set_ready(false);
+        x.reshape().unwrap();
+        assert_ne!(
+            x.pppoe.sessions[&5].flags & pppoe::F_FAST_DOWN,
+            0,
+            "back to the policer"
+        );
+        x.pppoe_remove(5).unwrap();
+        assert!(!x.shaper.asked.contains_key(&5));
     }
 
     /// The object has the PPPoE maps the loader drives.

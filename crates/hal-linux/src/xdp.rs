@@ -261,7 +261,7 @@ impl XdpState {
         attach_all(l, &plan.interfaces)?;
         self.applied = plan;
         let on = self.pppoe.maps();
-        match self.shaper.reach(self.loaded.as_mut(), self.pppoe.on, on) {
+        let reached = match self.shaper.reach(self.loaded.as_mut(), self.pppoe.on, on) {
             Err(e) if !strict => {
                 log::warn!("shaper: {e}");
                 self.shaper.set_error(Some(e.to_string()));
@@ -272,7 +272,11 @@ impl XdpState {
                 Ok(())
             }
             Err(e) => Err(e),
-        }
+        };
+        // Shaped sessions follow the shaper: policed in XDP while it is not
+        // attached.
+        self.reshape()?;
+        reached
     }
 
     /// Queues (G4.9b): hold `plan`. The object loads for it alone when no
