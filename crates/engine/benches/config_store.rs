@@ -162,9 +162,9 @@ fn bench(c: &mut Criterion) {
             });
         });
     }
-    // 90 000, not 100 000: 100 000 queues (~168 bytes each saved) pass the
+    // 80 000, not 100 000: ~90 000 queues (~170 bytes each saved) reach the
     // 15 MiB the config may take on disk, so a commit is refused.
-    for n in [1_000_usize, 10_000, 90_000] {
+    for n in [1_000_usize, 10_000, 80_000] {
         let mut s = with_queues(n);
         let mut tag = 0_u64;
         g.throughput(Throughput::Elements(1));
