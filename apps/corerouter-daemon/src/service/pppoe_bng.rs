@@ -2734,6 +2734,8 @@ impl Bng {
             uptime_secs: uptime,
             rx_bytes: gone.as_ref().map_or(0, |a| a.rx_bytes),
             tx_bytes: gone.as_ref().map_or(0, |a| a.tx_bytes),
+            routes: gone.as_ref().map(|a| a.routes.clone()).unwrap_or_default(),
+            refused_routes: Vec::new(),
         };
         guard(&self.why).record(&[&sub.user, &mac], &h);
         guard(&self.shared).record(h);
