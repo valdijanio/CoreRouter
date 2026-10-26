@@ -430,3 +430,76 @@ fn cpe_reboot_storm_replaces_sessions_one_per_host() {
     );
     l.check().unwrap();
 }
+
+/// G4.3k + G4.3l: 20 000 subscribers asking for 40 Service-Names (and the
+/// empty one, and names the table drops) over 100 × 50 QinQ VLANs, on a
+/// lossy network: those of terminating rows come up with their own name
+/// and tags, those of drop rows never get a session.
+#[test]
+fn many_service_names_over_qinq_vlans() {
+    use corerouter_proto_pppoe::eth::Vlans;
+    use corerouter_proto_pppoe::server::{ServiceAction, ServiceRule, ServiceTable};
+    let t = Instant::now();
+    let n = 20_000;
+    let names: Vec<Vec<u8>> = (0..40).map(|i| format!("plano-{i}").into_bytes()).collect();
+    let mut asked = names.clone();
+    asked.push(Vec::new());
+    asked.push(b"desconhecido".to_vec());
+    asked.push(b"bloqueado".to_vec());
+    let drop = ServiceRule {
+        action: ServiceAction::Drop,
+        ..ServiceRule::default()
+    };
+    let table = ServiceTable::new(
+        names
+            .iter()
+            .map(|n| (n.clone(), ServiceRule::default()))
+            .chain([(b"bloqueado".to_vec(), drop)]),
+        ServiceRule::default(),
+        drop,
+    );
+    let vlans: Vec<Vlans> = (0..5000u16)
+        .map(|i| Vlans::qinq(100 + i / 50, 1 + i % 50))
+        .collect();
+    let mut cfg = LabConfig {
+        clients: n,
+        loss_ppm: 2000,
+        start_spread_ms: 10_000,
+        service_names: asked.clone(),
+        vlans,
+        reconnect: false,
+        ..LabConfig::default()
+    };
+    cfg.server.services = table.clone();
+    let mut l = run(cfg, 120);
+    let dropped = |i: usize| {
+        let a = &asked[i % asked.len()];
+        a.as_slice() == b"desconhecido" || a.as_slice() == b"bloqueado"
+    };
+    let want = (0..n).filter(|i| !dropped(*i)).count();
+    assert_eq!(l.clients_up(), want, "{:?}", l.stats);
+    for (i, c) in l.clients.iter().enumerate() {
+        assert_eq!(c.phase() == ClientPhase::Up, !dropped(i), "client {i}");
+    }
+    // Every session sits on the tags its client used.
+    for (&(shard, sid), &i) in &l.up {
+        let d = l.servers[shard].session(sid).unwrap();
+        let v = Vlans::qinq(100 + (i % 5000) as u16 / 50, 1 + (i % 5000) as u16 % 50);
+        assert_eq!(d.vlans(), v, "client {i}");
+    }
+    assert!(
+        l.auth_services
+            .iter()
+            .all(|s| !s.starts_with(b"bloq") && !s.starts_with(b"desc"))
+    );
+    let rows = l.servers[0].service_sessions();
+    let total: u32 = rows.iter().map(|r| r.1).sum();
+    assert_eq!(total as usize, want);
+    assert!(l.servers[0].stats().service_refused > 0);
+    l.check().unwrap();
+    eprintln!(
+        "sim: {n} clients, 40 names, 5000 QinQ VLANs in {:?}",
+        t.elapsed()
+    );
+    teardown(&mut l);
+}

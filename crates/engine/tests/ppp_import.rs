@@ -134,6 +134,53 @@ fn conflicts_skip_replace_rename() {
     assert_eq!(open(&mut rename, "maria"), "old");
 }
 
+/// G4.3cd: routes come in, checked as `ppp.secret.add` checks them, and
+/// the file against itself.
+#[test]
+fn routes_are_imported_and_checked() {
+    let mut s = Session::virtual_lab();
+    let ok = "/ppp secret\nadd name=empresa password=x routes=\"203.0.113.8/29 0.0.0.0 1\"\n";
+    let r = s
+        .execute("ppp.secret.import", &json!({"text": ok}))
+        .unwrap();
+    assert_eq!(r["added"], 1, "{r}");
+    assert_eq!(
+        s.store()
+            .running()
+            .ppp
+            .secret("empresa")
+            .unwrap()
+            .routes
+            .len(),
+        1
+    );
+    for bad in [
+        // Over the block a secret here already gets.
+        "/ppp secret\nadd name=outra password=x routes=203.0.113.12/30\n",
+        // Two secrets of the file on one block.
+        "/ppp secret\nadd name=a password=x routes=198.51.100.0/24\nadd name=b password=x routes=198.51.100.128/25\n",
+        // A fixed address inside another's block of the file.
+        "/ppp secret\nadd name=a password=x routes=198.51.100.0/24\nadd name=b password=x remote-address=198.51.100.7\n",
+    ] {
+        let r = s
+            .execute("ppp.secret.import", &json!({"text": bad, "dry_run": true}))
+            .unwrap();
+        assert!(r["errors_total"].as_u64().unwrap() >= 1, "{bad}: {r}");
+        assert!(
+            r["errors"].to_string().contains("routed to secret"),
+            "{bad}: {r}"
+        );
+    }
+    // Replacing a secret with its own routes is no clash.
+    let r = s
+        .execute(
+            "ppp.secret.import",
+            &json!({"text": ok, "on_conflict": "replace"}),
+        )
+        .unwrap();
+    assert_eq!(r["replaced"], 1, "{r}");
+}
+
 #[test]
 fn one_transaction_rolled_back_and_safe_mode() {
     let mut s = Session::virtual_lab();

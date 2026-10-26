@@ -192,7 +192,8 @@ set *0 dns-server=9.9.9.9
 add caller-id=AA:BB:CC:00:00:01 comment="Jo\C3\A3o da Silva \"apto 12\"" \
     limit-bytes-out=1000000 name=joao@isp password="s3n h4\$!" profile=\
     plano-100M remote-address=100.64.9.9 service=pppoe
-add disabled=yes name=maria password=M4r1a profile=plano-100M service=pppoe
+add disabled=yes name=maria password=M4r1a profile=plano-100M routes=\
+    "203.0.113.8/29 0.0.0.0 1,2001:db8:100::/48" service=pppoe
 add name=semsenha profile=default
 set [ find name=maria ] comment="cancelado em 10/2026"
 "#;
@@ -212,6 +213,11 @@ fn routeros_export_import_export_import_is_identical() {
     assert_eq!(first[0]["comment"], "João da Silva \"apto 12\"");
     assert_eq!(first[0]["password"], "s3n h4$!");
     assert_eq!(first[1]["comment"], "cancelado em 10/2026");
+    assert_eq!(
+        first[1]["routes"],
+        json!(["203.0.113.8/29", "2001:db8:100::/48"]),
+        "G4.3cd routes come along"
+    );
     // Without show-sensitive, never a password.
     a.ok("/export file=plain.rsc");
     assert!(!a.files["plain.rsc"].contains("M4r1a"));

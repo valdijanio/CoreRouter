@@ -304,6 +304,12 @@ pub struct DhcpNetwork {
     /// no DNS. Must be a primary zone of `/ip dns zone`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_zone: Option<String>,
+    /// Rate limit of each client of this network (RouterOS `rate-limit`
+    /// text, rx/tx from the router; G4.9): a dynamic queue per bound
+    /// lease, as a static lease's `rate_limit` gives one. Not in RouterOS,
+    /// where only a static lease has it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub rate_limit: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
 }
@@ -325,6 +331,7 @@ impl DhcpNetwork {
             dhcp_option: Vec::new(),
             dhcp_option_set: None,
             dns_zone: None,
+            rate_limit: String::new(),
             comment: String::new(),
         }
     }

@@ -25,7 +25,9 @@ use corerouter_proto_pppoe::eth::Vlans;
 use corerouter_proto_pppoe::lab::{Lab, LabConfig, ac_mac, client_mac};
 use corerouter_proto_pppoe::lcp::{self, AuthProto};
 use corerouter_proto_pppoe::ppp::{self, Link, SessionWriter, proto};
-use corerouter_proto_pppoe::server::{Server, ServerConfig, ServerOutput};
+use corerouter_proto_pppoe::server::{
+    Server, ServerConfig, ServerOutput, ServiceRule, ServiceTable,
+};
 use corerouter_proto_pppoe::wire::Mac;
 use criterion::{Criterion, Throughput, criterion_group};
 
@@ -44,6 +46,22 @@ fn padi() -> Vec<u8> {
     w.tag(tag::SERVICE_NAME, b"");
     w.tag(tag::HOST_UNIQ, &[1, 2, 3, 4, 5, 6, 7, 8]);
     w.tag_bbf(Some(b"olt-1 pon 0/1/3:12"), Some(b"cust-0042"));
+    w.finish().unwrap();
+    b
+}
+
+fn padi_named(name: &[u8]) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut w = DiscoveryWriter::begin(
+        &mut b,
+        Mac::BROADCAST,
+        HOST,
+        Vlans::single(100),
+        Code::Padi,
+        0,
+    );
+    w.tag(tag::SERVICE_NAME, name);
+    w.tag(tag::HOST_UNIQ, &[1, 2, 3, 4, 5, 6, 7, 8]);
     w.finish().unwrap();
     b
 }
@@ -161,6 +179,30 @@ fn server(c: &mut Criterion) {
     let mut out = ServerOutput::new();
     let f = padi();
     g.bench_function("server_padi_to_pado", |b| {
+        b.iter(|| {
+            out.clear();
+            s.handle_frame(1000, 1, black_box(&f), &mut out);
+            out.frames.len()
+        })
+    });
+    // G4.3k: the same with a full Service-Name table (512 names, Junos'
+    // router-wide maximum) and the PADI asking for the last one: the
+    // worst case of the linear lookup.
+    let table = ServiceTable::new(
+        (0..512).map(|i| (format!("plano-{i:03}").into_bytes(), ServiceRule::default())),
+        ServiceRule::default(),
+        ServiceRule::default(),
+    );
+    let mut s = Server::new(
+        ServerConfig {
+            services: table,
+            ..ServerConfig::default()
+        },
+        [7; 32],
+        0,
+    );
+    let f = padi_named(b"plano-511");
+    g.bench_function("server_padi_to_pado_512_names", |b| {
         b.iter(|| {
             out.clear();
             s.handle_frame(1000, 1, black_box(&f), &mut out);

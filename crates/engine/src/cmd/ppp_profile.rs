@@ -5,6 +5,7 @@
 
 use corerouter_model::ItemId;
 use corerouter_model::ppp::{AddrOrPool, MAX_PROFILES, PppProfile, Tri, UseIpv6};
+use corerouter_model::queue::DownloadMode;
 use serde_json::{Value, json};
 
 use super::args::{opt_str, opt_text};
@@ -15,18 +16,18 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.profile.add", "Add PPP Profile", [], None,
-        "{name: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4)} → {id, name, warnings}",
+        "{name: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4), queue_type?: string (/queue type of the download queue; empty: fq-codel-default), download_mode?: shaper|policer (download held in a queue, the default and recommended, or dropped in XDP)} → {id, name, warnings}",
         always, add),
     cmd!("ppp.profile.set", "Set PPP Profile", [], None,
-        "{id: *hex | name, name?: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4)} → {id, name, warnings}",
+        "{id: *hex | name, name?: string, local_address?: ipv4 | pool (our side; empty: unnumbered), remote_address?: ipv4 | pool (the subscriber's), dns_server?: [ipv4] | string (at most 2), rate_limit?: string (RouterOS rate-limit, rx/tx from the router: 10M/50M [burst [threshold [time [priority [min]]]]]; empty clears), address_list?: string (firewall list the subscriber's address joins while up), only_one?: default|yes|no, change_tcp_mss?: default|yes|no, idle_timeout?: duration (empty: none), session_timeout?: duration (empty: none), on_up?: [{command, params?}] | string (the same list as JSON text; $user, $remote-address, $local-address, $caller-id, $interface, $service in string values), on_down?: [{command, params?}], comment?: string, use_ipv6?: default|yes|no|require (IPv6CP; require: no IPv6 = no session), remote_ipv6_prefix_pool?: string (/ipv6 pool of prefix-length 64: the link's /64 in the RA; empty clears), dhcpv6_pd_pool?: string (/ipv6 pool of prefix-length 48..64: the delegated prefix; empty clears), dhcpv6_lease_time?: duration (valid lifetime of both, default 1d; empty: default), dns_server_ipv6?: [ipv6] | string (RA RDNSS and DHCPv6, at most 4), queue_type?: string (/queue type of the download queue; empty: fq-codel-default), download_mode?: shaper|policer (download held in a queue, the default and recommended, or dropped in XDP)} → {id, name, warnings}",
         always, set),
     cmd!("ppp.profile.remove", "Remove PPP Profile", [], None,
         "{id: *hex | name} → {id, name}", always, remove),
     cmd!(query "ppp.profile.preview", "PPP Profile Preview", [], None,
-        "{id?: *hex | name, name?: string, local_address?: string, remote_address?: string, dns_server?: string, rate_limit?: string, address_list?: string, only_one?: string, change_tcp_mss?: string, idle_timeout?: string, session_timeout?: string, on_up?: string, on_down?: string, comment?: string, use_ipv6?: string, remote_ipv6_prefix_pool?: string, dhcpv6_pd_pool?: string, dhcpv6_lease_time?: string, dns_server_ipv6?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        "{id?: *hex | name, name?: string, local_address?: string, remote_address?: string, dns_server?: string, rate_limit?: string, address_list?: string, only_one?: string, change_tcp_mss?: string, idle_timeout?: string, session_timeout?: string, on_up?: string, on_down?: string, comment?: string, use_ipv6?: string, remote_ipv6_prefix_pool?: string, dhcpv6_pd_pool?: string, dhcpv6_lease_time?: string, dns_server_ipv6?: string, queue_type?: string, download_mode?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
         always, preview),
     cmd!(query "ppp.profile.list", "PPP Profiles", [], None,
-        "{} → [{id, name, builtin, default (built in), local_address?, remote_address?, dns_server, rate_limit?, address_list?, only_one, change_tcp_mss, idle_timeout?, session_timeout?, on_up (JSON text), on_down, comment?, use_ipv6, remote_ipv6_prefix_pool?, dhcpv6_pd_pool?, dhcpv6_lease_time?, dns_server_ipv6, secrets (that use it), active (sessions up with it)}]",
+        "{} → [{id, name, builtin, default (built in), local_address?, remote_address?, dns_server, rate_limit?, address_list?, only_one, change_tcp_mss, idle_timeout?, session_timeout?, on_up (JSON text), on_down, comment?, use_ipv6, remote_ipv6_prefix_pool?, dhcpv6_pd_pool?, dhcpv6_lease_time?, dns_server_ipv6, queue_type?, download_mode?, secrets (that use it), active (sessions up with it)}]",
         always, list),
 ];
 
@@ -180,6 +181,23 @@ fn apply(s: &Session, pr: &mut PppProfile, p: &Value) -> Result<()> {
     if let Some(d) = ips6(p, "dns_server_ipv6")? {
         pr.dns_server_ipv6 = d;
     }
+    if let Some(t) = opt_str(p, "queue_type")? {
+        let t = t.trim();
+        pr.queue_type = if t.is_empty() || t == "none" {
+            None
+        } else if s.store().candidate().queue.queue_type(t).is_some() {
+            Some(t.to_owned())
+        } else {
+            let shown: String = t.chars().take(64).collect();
+            return Err(EngineError::bad("queue_type", format!("no /queue type '{shown}' (queue.type.add)")));
+        };
+    }
+    if let Some(t) = opt_str(p, "download_mode")? {
+        pr.download_mode = match t.trim() {
+            "" | "default" => None,
+            t => Some(DownloadMode::parse(t).ok_or_else(|| EngineError::bad("download_mode", "shaper or policer"))?),
+        };
+    }
     Ok(())
 }
 
@@ -193,6 +211,9 @@ fn warnings(pr: &PppProfile) -> Vec<String> {
     }
     if pr.use_ipv6 == UseIpv6::Require && pr.remote_ipv6_prefix_pool.is_none() && pr.dhcpv6_pd_pool.is_none() {
         w.push("use_ipv6=require without IPv6 pools: the session needs IPv6CP but gets only a link-local address unless RADIUS sends a prefix".into());
+    }
+    if pr.download_mode == Some(DownloadMode::Policer) {
+        w.push("download_mode=policer drops what exceeds the rate: TCP loses packets instead of waiting (about 6× the loss of a shaper, Google 2016); shaper is recommended".into());
     }
     if pr.change_tcp_mss == Tri::Yes {
         w.push("change_tcp_mss=yes clamps the MSS per session; with many subscribers one mangle rule (change-mss) is lighter".into());
@@ -299,6 +320,8 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
             json!({"label": "IPv6 prefix pool", "value": opt(e.remote_ipv6_prefix_pool)}),
             json!({"label": "DHCPv6 PD pool", "value": opt(e.dhcpv6_pd_pool)}),
             json!({"label": "DHCPv6 lease time", "value": super::dhcp_server::secs_text(e.dhcpv6_lease_time)}),
+            json!({"label": "Queue type", "value": e.queue_type}),
+            json!({"label": "Download mode", "value": e.download_mode.as_str()}),
         ]
     })
 }
@@ -349,6 +372,8 @@ fn list(s: &mut Session, _: &Value) -> Result<Value> {
                     ("remote_ipv6_prefix_pool", pr.remote_ipv6_prefix_pool.clone()),
                     ("dhcpv6_pd_pool", pr.dhcpv6_pd_pool.clone()),
                     ("dhcpv6_lease_time", pr.dhcpv6_lease_time.map(super::dhcp_server::secs_text)),
+                    ("queue_type", pr.queue_type.clone()),
+                    ("download_mode", pr.download_mode.map(|m| m.as_str().to_owned())),
                 ] {
                     if let Some(val) = val {
                         o.insert(k.into(), json!(val));
@@ -462,6 +487,16 @@ mod tests {
             assert!(matches!(s.execute("ppp.profile.set", &p), Err(EngineError::BadParam { .. })), "{p}");
         }
         // A pool a profile uses cannot be removed.
+        // G4.9: the download queue.
+        s.execute("ppp.profile.set", &json!({"id": "dual", "queue_type": "cake-default", "download_mode": "policer"})).unwrap();
+        let row = s.execute("ppp.profile.list", &json!({})).unwrap()[2].clone();
+        assert_eq!((row["queue_type"].as_str(), row["download_mode"].as_str()), (Some("cake-default"), Some("policer")));
+        let e = s.store().running().ppp.effective(None, "dual", "default");
+        assert_eq!((e.queue_type.as_str(), e.download_mode), ("cake-default", DownloadMode::Policer));
+        let d = s.store().running().ppp.effective(None, "default", "default");
+        assert_eq!((d.queue_type.as_str(), d.download_mode), ("fq-codel-default", DownloadMode::Shaper));
+        assert!(s.execute("ppp.profile.set", &json!({"id": "dual", "queue_type": "nope"})).is_err());
+        assert!(s.execute("ppp.profile.set", &json!({"id": "dual", "download_mode": "drop"})).is_err());
         let err = s.execute("ipv6.pool.remove", &json!({"id": "pd6"})).unwrap_err();
         assert!(err.to_string().contains("ppp profile dual"), "{err}");
         s.execute("ppp.profile.set", &json!({"id": "dual", "dhcpv6_pd_pool": ""})).unwrap();

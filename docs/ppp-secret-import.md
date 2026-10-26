@@ -131,8 +131,9 @@ repetidos e uma transação só.
 
 Melhorias propostas e aprovadas (entraram): senha fora de journal, log, MCP, diff e undo; senha
 cifrada em repouso; lembrete de apagar o arquivo; `show-sensitive` só para `full`; `routes=`
-importado quando o `ppp.secret.add` o declarar (G4.3cd, sessão C: o leitor repassa o campo; até
-lá ele aparece em `unsupported`).
+importado (G4.3cd) com as mesmas recusas do `ppp.secret.add` (bloco de outro secret, pool,
+endereço do roteador) e o arquivo conferido contra si mesmo (dois secrets no mesmo bloco, IP fixo
+dentro do bloco de outro). Um campo que o `ppp.secret.add` não declara vai para `unsupported`.
 
 Entrou também, porque o selo a teria piorado: o teto de uma config salva subiu de 15 para 31 MiB
 (`persist::SAVE_BUDGET_BYTES` de 32 para 64 MiB). Com 15 MiB, 100 mil secrets completos não

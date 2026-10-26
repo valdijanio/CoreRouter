@@ -21,6 +21,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use corerouter_model::MacAddr;
+use corerouter_model::framed_route::{FramedRoute, overlaps};
 use corerouter_model::ppp::{DEFAULT_PROFILE, MAX_NAME, MAX_SECRETS, PppSecret};
 use serde_json::{Map, Value, json};
 
@@ -216,6 +217,46 @@ fn secret_params(e: &Entry, profile: &str, routes: bool, report: &mut Report) ->
     Value::Object(o)
 }
 
+/// G4.3cd's checks of `ppp.secret.add` for an imported secret: its routes
+/// against the config (`check_routes`) and against the other secrets of
+/// the file, and its fixed address outside anyone else's routed block.
+/// `file_name`: its name in the file (before a rename).
+fn routes_ok(
+    s: &Session,
+    x: &PppSecret,
+    file_name: &str,
+    file_routes: &[(ipnet::IpNet, &str)],
+    report: &mut Report,
+) -> Result<()> {
+    if !x.routes.is_empty() {
+        for w in super::ppp_secret::check_routes(s, x)? {
+            report.warn(format!("secret {}: {w}", clip(&x.name)));
+        }
+        for r in &x.routes {
+            if let Some((n, other)) = file_routes.iter().find(|(n, o)| *o != file_name && overlaps(n, &r.dst)) {
+                return Err(EngineError::bad(
+                    "routes",
+                    format!("{} overlaps {n}, routed to secret {} in the file", r.dst, clip(other)),
+                ));
+            }
+        }
+    }
+    if let Some(ip) = x.remote_address {
+        let host = ipnet::IpNet::from(std::net::IpAddr::V4(ip));
+        let cand = s.store().candidate();
+        if let Some((n, o)) = cand.ppp.secrets.route_owners(&host).into_iter().find(|(_, o)| o.id != x.id) {
+            return Err(EngineError::bad("remote_address", format!("{ip} is inside {n}, routed to secret {}", clip(&o.name))));
+        }
+        if let Some((n, other)) = file_routes.iter().find(|(n, o)| *o != file_name && n.contains(&host)) {
+            return Err(EngineError::bad(
+                "remote_address",
+                format!("{ip} is inside {n}, routed to secret {} in the file", clip(other)),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// A free name: `name-2`, `name-3`…
 fn renamed(name: &str, taken: &dyn Fn(&str) -> bool) -> Option<String> {
     (2..10_000).map(|i| format!("{name}-{i}")).find(|n| n.len() <= MAX_NAME && !taken(n))
@@ -367,6 +408,19 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
         .iter()
         .filter_map(|x| x.remote_address.map(|ip| (ip, x.name.clone())))
         .collect();
+    // G4.3cd: the blocks the file routes, each with its secret, to check
+    // the file against itself (`add` checks against the config only). A
+    // few per thousand subscribers: the walk per secret stays short.
+    let file_routes: Vec<(ipnet::IpNet, &str)> = if routes {
+        entries
+            .iter()
+            .filter_map(|e| Some((e.item.get("name")?, e.item.get("routes")?)))
+            .filter_map(|(n, r)| Some((n, FramedRoute::parse_list(r).ok()?)))
+            .flat_map(|(n, rs)| rs.into_iter().map(move |r| (r.dst, n)))
+            .collect()
+    } else {
+        Vec::new()
+    };
     for e in &entries {
         let name = e.item.get("name").unwrap_or_default();
         let profile = target_of(e.item.get("profile").filter(|p| !p.is_empty()).unwrap_or(DEFAULT_PROFILE));
@@ -421,6 +475,14 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
                     x.name = n;
                 }
             }
+        }
+        if exists && on_conflict == OnConflict::Replace {
+            // Checked as the secret it replaces (its own routes are no clash).
+            x.id = s.store().candidate().ppp.secret(&x.name).map_or(x.id, |o| o.id);
+        }
+        if let Err(err) = routes_ok(s, &x, name, &file_routes, &mut report) {
+            report.error(e.line, Some(name), &err);
+            continue;
         }
         if let Some(ip) = x.remote_address {
             match fixed.get(&ip) {

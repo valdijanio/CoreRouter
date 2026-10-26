@@ -25,9 +25,10 @@ use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
 use corerouter_model::MacAddr;
 use corerouter_model::ip_pool::IpPools;
 use corerouter_model::ppp::{
-    ActiveSession, AddrOrPool, Effective, HistoryEntry, Ppp, PppAuth, PppHook, PppService,
-    PppoeServer, ServiceStats, Stage, Why,
+    ActiveSession, AddrOrPool, DEFAULT_PROFILE, Effective, HistoryEntry, Ppp, PppAuth, PppHook,
+    PppService, PppoeServer, ServiceStats, Stage, Why,
 };
+use corerouter_model::pppoe_services::{PppoeService, ServiceAction, ServiceName};
 use corerouter_model::radius::{
     AaaService, AcctCounters, AcctRequest, AcctStatus, Attribute, AuthOutcome, AuthReply,
     AuthRequest as RadiusRequest, CoaKind, CoaOutcome, CoaRequest, Credentials,
@@ -39,7 +40,8 @@ use corerouter_proto_pppoe::lcp::AuthProto;
 use corerouter_proto_pppoe::ppp::{self as wire_ppp, proto};
 use corerouter_proto_pppoe::server::{
     AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Ipv6Mode, Server,
-    ServerConfig, ServerOutput, SessionRef, VlanFilter,
+    ServerConfig, ServerOutput, ServiceAction as ProtoAction, ServiceRule, ServiceTable,
+    SessionRef, VlanFilter,
 };
 use corerouter_proto_pppoe::timer::Millis;
 use corerouter_proto_pppoe::wire::Mac;
@@ -890,6 +892,23 @@ struct Slot {
     port: PortInfo,
     server: Server,
     bucket: Bucket,
+    /// `cfg.service_table()`, kept (looked up at every login, G4.3k).
+    services: Vec<PppoeService>,
+}
+
+impl Slot {
+    /// The profile of the row a session asking for `name` lands on, if the
+    /// row names one (G4.3k).
+    fn profile_for(&self, name: &[u8]) -> Option<String> {
+        let row = |want: &ServiceName| self.services.iter().find(|r| r.name == *want);
+        let named = std::str::from_utf8(name).ok().filter(|n| !n.is_empty());
+        let hit = match named {
+            Some(n) => row(&ServiceName::Name(n.to_owned())).or_else(|| row(&ServiceName::Any)),
+            None if name.is_empty() => row(&ServiceName::Empty),
+            None => row(&ServiceName::Any),
+        };
+        hit.and_then(|r| r.profile.clone())
+    }
 }
 
 /// A session the BNG knows (from PADR to its Down).
@@ -927,6 +946,10 @@ struct Sub {
     auth_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     circuit_id: Option<String>,
     remote_id: Option<String>,
+    /// G4.3k: the Service-Name asked for and the profile its row gives
+    /// (in `default_profile`'s place).
+    service_name: String,
+    fallback_profile: String,
     mtu: u16,
     /// G4.3e: what RADIUS said about IPv6, and the session's IPv6 once
     /// IPv6CP is up.
@@ -1100,11 +1123,7 @@ pub(crate) fn server_config(
     let mut c = ServerConfig {
         ac_mac: Mac(mac),
         ac_name: b"CoreRouter".to_vec(),
-        service_names: if v.service_name.is_empty() {
-            Vec::new()
-        } else {
-            vec![v.service_name.as_bytes().to_vec()]
-        },
+        services: service_table(&v.service_table()),
         one_session_per_host: v.one_session_per_host,
         auth: auth_set(&v.authentication),
         max_mru: v.max_mru,
@@ -1145,6 +1164,34 @@ pub(crate) fn server_config(
         VlanFilter::Ranges(r)
     };
     c
+}
+
+/// `proto-pppoe`'s Service-Name table of a server's rows (G4.3k).
+pub(crate) fn service_table(rows: &[PppoeService]) -> ServiceTable {
+    let rule = |r: &PppoeService| ServiceRule {
+        action: match r.action {
+            ServiceAction::Terminate => ProtoAction::Terminate,
+            ServiceAction::Delay => ProtoAction::Delay,
+            ServiceAction::Drop => ProtoAction::Drop,
+        },
+        delay_ms: r.pado_delay,
+        max_sessions: r.max_sessions,
+        padi_limit: r.padi_limit,
+    };
+    let find = |n: &ServiceName| {
+        rows.iter()
+            .find(|r| r.name == *n)
+            .map(rule)
+            .unwrap_or_default()
+    };
+    ServiceTable::new(
+        rows.iter().filter_map(|r| match &r.name {
+            ServiceName::Name(n) => Some((n.as_bytes().to_vec(), rule(r))),
+            _ => None,
+        }),
+        find(&ServiceName::Empty),
+        find(&ServiceName::Any),
+    )
 }
 
 /// The VLAN ids a server listens on (for the driver's sockets).
@@ -1349,7 +1396,6 @@ impl Bng {
         for s in &self.slots {
             let same = wanted.iter().find(|w| w.id == s.cfg.id).is_some_and(|w| {
                 w.interface == s.cfg.interface
-                    && w.service_name == s.cfg.service_name
                     && w.pppoe_over_vlan_range == s.cfg.pppoe_over_vlan_range
                     && w.accept_untagged == s.cfg.accept_untagged
                     && ports.get(&w.name) == Some(&s.port)
@@ -1386,6 +1432,23 @@ impl Bng {
             if sc.padi_limit > 0 {
                 sc.padi_limit = sc.padi_limit.div_ceil(lanes);
             }
+            // The Service-Name rows' limits too (G4.3k): the MACs spread
+            // evenly over the workers.
+            let rows = w.service_table();
+            let mut named: Vec<(Vec<u8>, ServiceRule)> =
+                sc.services.named().map(|(n, r)| (n.to_vec(), *r)).collect();
+            let split = |r: &mut ServiceRule| {
+                for v in [&mut r.max_sessions, &mut r.padi_limit] {
+                    if *v > 0 {
+                        *v = v.div_ceil(lanes);
+                    }
+                }
+            };
+            named.iter_mut().for_each(|(_, r)| split(r));
+            let (mut empty, mut any) = (sc.services.empty, sc.services.any);
+            split(&mut empty);
+            split(&mut any);
+            sc.services = ServiceTable::new(named, empty, any);
             for t in &mut sc.pado_delay {
                 t.0 = t.0.div_ceil(lanes);
             }
@@ -1396,6 +1459,7 @@ impl Bng {
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
+                    s.services = rows;
                     if w.new_session_rate_auto {
                         // The tick moves it; switching to auto keeps the
                         // tokens.
@@ -1428,6 +1492,7 @@ impl Bng {
                         server: Server::new(sc, seed, now),
                         port,
                         cfg: w,
+                        services: rows,
                     });
                     if self.lane == 0 {
                         self.log(
@@ -1994,7 +2059,13 @@ impl Bng {
         let Some(slot) = self.slots.get(i) else {
             return;
         };
-        let default_profile = slot.cfg.default_profile.clone();
+        // G4.3k: the row's profile takes `default_profile`'s place, and
+        // that of a secret left on the built-in `default`.
+        let row_profile = slot.profile_for(&req.service);
+        let default_profile = row_profile
+            .clone()
+            .unwrap_or_else(|| slot.cfg.default_profile.clone());
+        let service_name = String::from_utf8_lossy(&req.service).into_owned();
         let vlan = (req.vlans.outer != 0).then_some(req.vlans.outer);
         let fresh = Sub {
             slot: i,
@@ -2033,6 +2104,8 @@ impl Bng {
                 .remote_id
                 .as_ref()
                 .map(|c| String::from_utf8_lossy(c).into_owned()),
+            service_name,
+            fallback_profile: default_profile.clone(),
             mtu: 1480,
             radius6: RadiusV6::default(),
             v6: None,
@@ -2047,7 +2120,13 @@ impl Bng {
         // O(1): the list's name index (`corerouter_model::ppp_secrets`).
         match self.cfg.ppp.secret(&user).cloned() {
             Some(sec) if sec.disabled => self.reject(i, sref, "secret disabled"),
-            Some(sec) => self.local(i, sref, req, &sec, &default_profile),
+            Some(sec) => {
+                let first = match &row_profile {
+                    Some(p) if sec.profile == DEFAULT_PROFILE => p.clone(),
+                    _ => sec.profile.clone(),
+                };
+                self.local(i, sref, req, &sec, &first, &default_profile)
+            }
             None => match self.cfg.aaa.clone().filter(|_| self.cfg.ppp.aaa.use_radius) {
                 Some(aaa) => self.ask_radius(now, i, sref, req, &user, &aaa),
                 None => self.reject(i, sref, "no such user"),
@@ -2061,6 +2140,7 @@ impl Bng {
         sref: SessionRef,
         req: &corerouter_proto_pppoe::server::AuthRequest,
         sec: &corerouter_model::ppp::PppSecret,
+        profile: &str,
         default_profile: &str,
     ) {
         if !sec.service.allows(PppService::Pppoe) {
@@ -2069,10 +2149,7 @@ impl Bng {
         if sec.caller_id.is_some_and(|m| m.0 != req.client_mac.0) {
             return self.reject(i, sref, "caller-id mismatch");
         }
-        let e = self
-            .cfg
-            .ppp
-            .effective(Some(sec), &sec.profile, default_profile);
+        let e = self.cfg.ppp.effective(Some(sec), profile, default_profile);
         if e.only_one && self.index.users_up.contains_key(&sec.name) {
             return self.reject(i, sref, "only-one: the user is already connected");
         }
@@ -2238,8 +2315,9 @@ impl Bng {
             nas_port_id: Some(nas_port_id),
             nas_port: Some(u32::from(sref.sid)),
             calling_station_id: Some(mac_text(req.client_mac)),
-            called_station_id: (!slot.cfg.service_name.is_empty())
-                .then(|| slot.cfg.service_name.clone()),
+            // RouterOS: the Service-Name the subscriber asked for.
+            called_station_id: (!req.service.is_empty())
+                .then(|| String::from_utf8_lossy(&req.service).into_owned()),
             // RFC 2865 §5.6 Framed (2), §5.7 PPP (1), §5.41 Virtual (5):
             // what a PPPoE NAS sends (RFC 4679 §4 for the DSL ones).
             attributes: vec![
@@ -2353,9 +2431,9 @@ impl Bng {
                 AuthOutcome::Accept => {
                     let profile = attr("Mikrotik-Group");
                     let default_profile = self
-                        .slots
-                        .get(i)
-                        .map(|s| s.cfg.default_profile.clone())
+                        .subs
+                        .get(&key)
+                        .map(|s| s.fallback_profile.clone())
                         .unwrap_or_default();
                     let e = self.cfg.ppp.effective(
                         None,
@@ -2464,6 +2542,7 @@ impl Bng {
             id: id.clone(),
             name: user.clone(),
             service: "pppoe".into(),
+            service_name: Some(sub.service_name.clone()),
             caller_id: mac.clone(),
             address: ip,
             session_id: sref.sid,
@@ -2747,6 +2826,8 @@ impl Bng {
             uptime_secs: uptime,
             rx_bytes: gone.as_ref().map_or(0, |a| a.rx_bytes),
             tx_bytes: gone.as_ref().map_or(0, |a| a.tx_bytes),
+            routes: gone.as_ref().map(|a| a.routes.clone()).unwrap_or_default(),
+            refused_routes: Vec::new(),
         };
         guard(&self.why).record(&[&sub.user, &mac], &h);
         guard(&self.shared).record(h);
