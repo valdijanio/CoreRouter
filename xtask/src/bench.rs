@@ -308,12 +308,12 @@ pub fn check(root: &Path) -> Outcome {
 /// 2026-10-26): started first, so none of them begins last and holds the
 /// step alone.
 const SLOW_FIRST: &[&str] = &[
+    "config_store",
     "frames",
     "commit",
     "server_storm",
     "pppoe_bng",
     "routes_full",
-    "config_store",
     "graph",
     "batch_import",
     "cgnat_who_was",
