@@ -64,17 +64,20 @@ pub(crate) enum Tab {
     #[default]
     Active,
     Aaa,
+    /// G4.3h: the active/standby pair (`ppp_redundancy.rs`).
+    Redundancy,
     Radius,
     History,
 }
 
-const TABS: [(Tab, &str, &str); 8] = [
+const TABS: [(Tab, &str, &str); 9] = [
     (Tab::Interface, "Interface", "interface"),
     (Tab::Servers, "PPPoE Servers", "servers"),
     (Tab::Secrets, "Secrets", "secrets"),
     (Tab::Profiles, "Profiles", "profiles"),
     (Tab::Active, "Active Connections", "active"),
     (Tab::Aaa, "AAA", "aaa"),
+    (Tab::Redundancy, "Redundancy", "redundancy"),
     (Tab::Radius, "RADIUS", "radius"),
     (Tab::History, "History", "history"),
 ];
@@ -387,6 +390,7 @@ pub(crate) struct PppPanel {
     /// A login to select once Active Connections has it (the identity chip
     /// of another window was clicked).
     pub(crate) reveal: Option<String>,
+    pub(crate) redundancy: crate::ppp_redundancy::RedundancyTab,
 }
 
 /// Points of the per-session sparkline (one per refresh, ~2 minutes).
@@ -1571,6 +1575,11 @@ impl PanelState for PppPanel {
             Tab::Profiles => q.push(Query { key: "profiles", command: "ppp.profile.list", params: json!({}) }),
             Tab::Active => q.push(Query { key: "active", command: "ppp.active.list", params: json!({"limit": PAGE}) }),
             Tab::Aaa => q.push(Query { key: "aaa", command: "ppp.aaa.get", params: json!({}) }),
+            Tab::Redundancy => {
+                if app.has_command("ppp.redundancy.get") {
+                    self.redundancy.queries(&mut q);
+                }
+            }
             Tab::History => {
                 let mut p = json!({"limit": 1000});
                 if !self.event.is_empty()
@@ -1590,6 +1599,10 @@ impl PanelState for PppPanel {
     }
 
     fn arrived(&mut self, _app: &mut CoreRouterUi, key: &'static str, _: RequestId, value: Value) {
+        if key.starts_with("redundancy") {
+            self.redundancy.arrived(key, value);
+            return;
+        }
         match (key, value) {
             ("servers", Value::Array(a)) => self.servers = a,
             ("services", Value::Array(a)) => self.services = a,
@@ -1654,6 +1667,7 @@ impl PanelState for PppPanel {
             t @ (Tab::Servers | Tab::Secrets | Tab::Profiles) => self.list_tab(app, ui, l, t),
             Tab::Active => self.active_tab(app, ui, l),
             Tab::Aaa => self.aaa_tab(app, ui, l),
+            Tab::Redundancy => self.redundancy.ui(app, ui, l),
             Tab::Radius => self.radius_tab(app, ui, l),
             Tab::History => self.history_tab(app, ui, l),
         }
@@ -1694,10 +1708,14 @@ impl PanelState for PppPanel {
         }
         self.why_dialog(app, ctx, area);
         self.drops_dialog(app, ctx, area);
+        self.redundancy.dialogs(app, ctx, area);
         help::modal(ctx, app.lang, &mut self.help);
     }
 
     fn reply(&mut self, app: &mut CoreRouterUi, then: PanelThen, result: &Result<Value, String>) {
+        let Err(then) = self.redundancy.reply(app, then, result) else {
+            return;
+        };
         let then = match then.downcast::<Saved>() {
             Ok(s) => {
                 self.waiting = self.waiting.saturating_sub(1);
@@ -1751,7 +1769,7 @@ impl PanelState for PppPanel {
             Tab::Profiles => self.profiles_table.escape(),
             Tab::Active => self.active_table.escape(),
             Tab::History => self.history_table.escape(),
-            Tab::Aaa | Tab::Radius => false,
+            Tab::Aaa | Tab::Redundancy | Tab::Radius => false,
         }
     }
 
