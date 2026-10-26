@@ -53,6 +53,11 @@ use corerouter_proto_radius::testserver::TestServer;
 use serde_json::{Value, json};
 
 const PER_PORT: usize = 50_000;
+/// Up to this many sessions every one carries traffic (1 pps each way);
+/// above, only the sample measured: the slow path (no XDP without root) is
+/// one thread, and 200 000 pps through it would drown the LCP echoes, which
+/// is not what this lab measures (`bng_lab.rs` samples the same way).
+const SAMPLE_ALL: usize = 2000;
 const SECRET: &str = "lab-segredo";
 const PAIR_SECRET: &str = "segredo-do-par-do-laboratorio";
 
@@ -174,7 +179,7 @@ impl Blaster {
                 "ip6cp": {"enable": false},
             },
             "dhcpv6": {"enable": false},
-            "session-traffic": {"autostart": true, "ipv4-pps": 1},
+            "session-traffic": {"autostart": n <= SAMPLE_ALL, "ipv4-pps": 1},
         });
         let path = out.join(format!("ha-{n}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
@@ -199,19 +204,19 @@ impl Blaster {
         Self { child, sock }
     }
 
-    fn counters(&self) -> (u64, u64) {
+    fn cmd(&self, req: Value) -> Value {
         let Ok(mut s) = UnixStream::connect(&self.sock) else {
-            return (0, 0);
+            return Value::Null;
         };
         let _ = s.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = s.write_all(
-            json!({"command": "session-counters"})
-                .to_string()
-                .as_bytes(),
-        );
+        let _ = s.write_all(req.to_string().as_bytes());
         let mut buf = String::new();
         let _ = s.read_to_string(&mut buf);
-        let v: Value = serde_json::from_str(&buf).unwrap_or(Value::Null);
+        serde_json::from_str(&buf).unwrap_or(Value::Null)
+    }
+
+    fn counters(&self) -> (u64, u64) {
+        let v = self.cmd(json!({"command": "session-counters"}));
         let c = &v["session-counters"];
         (
             c["sessions-established"].as_u64().unwrap_or(0),
@@ -357,7 +362,7 @@ fn bng_lab_ha() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000]);
     let mut md = String::from(
-        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts | Stops na tomada | Interims do novo | Sessões sem Interim do novo |\n|---|---|---|---|---|---|---|---|---|\n",
+        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo |\n|---|---|---|---|---|---|---|---|---|\n",
     );
     for n in scales {
         let row = run(n, &blaster, &out);
@@ -473,6 +478,21 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         m["sync"]["synced"].as_u64() == Some(n as u64) && m["in_sync"] == true
     })
     .expect("C's replica complete");
+    if n > SAMPLE_ALL {
+        // Traffic on the sessions `rx_sample` reads (the first rows of
+        // `ppp.active.list`, by name: `rad{session id}`).
+        let rows = call(Some(cp), "ppp.active.list", json!({"limit": 500})).unwrap_or(Value::Null);
+        let ids: Vec<u64> = rows["rows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["name"].as_str()?.strip_prefix("rad")?.parse().ok())
+            .collect();
+        for id in &ids {
+            b.cmd(json!({"command": "session-traffic-start", "arguments": {"session-id": id}}));
+        }
+        eprintln!("ha {n}: traffic on {} sampled sessions", ids.len());
+    }
     std::thread::sleep(Duration::from_secs(10));
     let (_, flapped0) = b.counters();
     let rx0 = rx_sample(Some(cp));
@@ -503,6 +523,8 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     let after = radius.records();
     let new: Vec<&(u32, String, String)> = after.iter().skip(before.len()).collect();
     let starts = after.iter().filter(|r| r.0 == 1).count();
+    let unique: std::collections::HashSet<&str> =
+        after.iter().filter(|r| r.0 == 1).map(|r| r.1.as_str()).collect();
     let stops = new.iter().filter(|r| r.0 == 2).count();
     let interims_c: HashMap<&str, usize> = new
         .iter()
@@ -515,6 +537,22 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         .iter()
         .filter(|s| !interims_c.contains_key(s.as_str()))
         .count();
+    let tally = |v: &[&(u32, String, String)]| {
+        let mut m: std::collections::BTreeMap<(u32, String), (usize, std::collections::HashSet<String>)> =
+            std::collections::BTreeMap::new();
+        for r in v {
+            let e = m.entry((r.0, r.2.clone())).or_default();
+            e.0 += 1;
+            e.1.insert(r.1.clone());
+        }
+        m.into_iter()
+            .map(|((st, from), (c, ids))| format!("status {st} from {from}: {c} ({} sessions)", ids.len()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let before_refs: Vec<&(u32, String, String)> = before.iter().collect();
+    eprintln!("ha {n}: accounting before the cut: {}", tally(&before_refs));
+    eprintln!("ha {n}: accounting after the cut: {}", tally(&new));
     eprintln!(
         "ha {n}: takeover {takeover:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}",
         interims_c.len()
@@ -522,16 +560,24 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     drop(b);
     drop(a);
     drop(radius);
-    for l in ["br0", "br1", "sync0", "rad0", "gw0", "wan0"] {
+    drop(_cd);
+    drop(c);
+    drop(bl);
+    // Every name on this side (the other namespaces' ends go with them,
+    // but asynchronously: the next scale must not find a leftover).
+    let mut names: Vec<String> = ["br0", "br1", "sync0", "rad0", "gw0", "wan0", "wan0-p", "wanc-p", "blnet-p"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    for i in 0..ports {
+        names.extend([format!("acc{i}"), format!("acc{i}-p"), format!("accc{i}-p"), format!("cpe{i}-p")]);
+    }
+    for l in &names {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();
     }
-    for i in 0..ports {
-        let _ = in_ns(None, "ip")
-            .args(["link", "del", &format!("acc{i}")])
-            .output();
-    }
     format!(
-        "| {n} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} | {stops} | {} | {without} |",
+        "| {n} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} |",
+        unique.len(),
         interims_c.len()
     )
 }
