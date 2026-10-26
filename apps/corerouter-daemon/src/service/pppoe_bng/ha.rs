@@ -137,7 +137,12 @@ impl Bng {
     }
 
     /// The record of an established session, or `None`.
-    fn ha_record(&self, now: Millis, key: (usize, u16), counters: HaCounters) -> Option<SessionRecord> {
+    fn ha_record(
+        &self,
+        now: Millis,
+        key: (usize, u16),
+        counters: HaCounters,
+    ) -> Option<SessionRecord> {
         let sub = self.subs.get(&key)?;
         let up = sub.up_at?;
         let slot = self.slots.get(key.0)?;

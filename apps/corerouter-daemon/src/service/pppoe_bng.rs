@@ -2588,7 +2588,10 @@ impl Bng {
         // RFC 2866 §5.5: unique per session. Each worker counts its own
         // `seq`: the worker goes in the id too (before G4.3h two workers
         // gave the same id in the same second, found by the HA lab).
-        let acct_id = format!("{:08X}{:02X}{:04X}", unix as u32, self.lane as u8, self.seq as u16);
+        let acct_id = format!(
+            "{:08X}{:02X}{:04X}",
+            unix as u32, self.lane as u8, self.seq as u16
+        );
         let xdp = if self.xdp { self.slot_index() } else { None };
         let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
             return;

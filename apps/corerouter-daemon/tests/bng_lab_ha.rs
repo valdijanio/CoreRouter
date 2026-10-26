@@ -407,12 +407,32 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     for i in 0..ports {
         let br = format!("bra{i}");
         legs.push((format!("acc{i}"), format!("acc{i}-p"), None, br.clone()));
-        legs.push((format!("acc{i}"), format!("accc{i}-p"), Some(cs.as_str()), br.clone()));
-        legs.push((format!("cpe{i}"), format!("cpe{i}-p"), Some(bs.as_str()), br));
+        legs.push((
+            format!("acc{i}"),
+            format!("accc{i}-p"),
+            Some(cs.as_str()),
+            br.clone(),
+        ));
+        legs.push((
+            format!("cpe{i}"),
+            format!("cpe{i}-p"),
+            Some(bs.as_str()),
+            br,
+        ));
     }
     legs.push(("wan0".into(), "wan0-p".into(), None, "br1".into()));
-    legs.push(("wan0".into(), "wanc-p".into(), Some(cs.as_str()), "br1".into()));
-    legs.push(("blnet".into(), "blnet-p".into(), Some(bs.as_str()), "br1".into()));
+    legs.push((
+        "wan0".into(),
+        "wanc-p".into(),
+        Some(cs.as_str()),
+        "br1".into(),
+    ));
+    legs.push((
+        "blnet".into(),
+        "blnet-p".into(),
+        Some(bs.as_str()),
+        "br1".into(),
+    ));
     for (end, peer, ns, br) in &legs {
         match ns {
             None => ip(
@@ -476,7 +496,10 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let b = Blaster::start(bp, blaster, out, n);
         let setup = wait_secs(120 + n as u64 / 100, || b.counters().0 as usize >= n);
         std::thread::sleep(Duration::from_secs(20));
-        eprintln!("ha {n} single: setup {setup:?}, counters {:?}", b.counters());
+        eprintln!(
+            "ha {n} single: setup {setup:?}, counters {:?}",
+            b.counters()
+        );
         return format!("| {n} (nó sozinho) | — | — | — | — | — | — | — | — |");
     }
     wait_secs(60, || {
@@ -485,7 +508,10 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     .expect("A active, C standby");
 
     let b = Blaster::start(bp, blaster, out, n);
-    let limit = std::env::var("BNG_LAB_HA_SETUP_S").ok().and_then(|v| v.parse().ok()).unwrap_or(120 + n as u64 / 100);
+    let limit = std::env::var("BNG_LAB_HA_SETUP_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(120 + n as u64 / 100);
     let setup = wait_secs(limit, || b.counters().0 as usize >= n);
     if setup.is_none() {
         eprintln!("A: {}", monitor(None));
@@ -543,8 +569,11 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     let after = radius.records();
     let new: Vec<&(u32, String, String)> = after.iter().skip(before.len()).collect();
     let starts = after.iter().filter(|r| r.0 == 1).count();
-    let unique: std::collections::HashSet<&str> =
-        after.iter().filter(|r| r.0 == 1).map(|r| r.1.as_str()).collect();
+    let unique: std::collections::HashSet<&str> = after
+        .iter()
+        .filter(|r| r.0 == 1)
+        .map(|r| r.1.as_str())
+        .collect();
     let stops = new.iter().filter(|r| r.0 == 2).count();
     let interims_c: HashMap<&str, usize> = new
         .iter()
@@ -558,15 +587,19 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         .filter(|s| !interims_c.contains_key(s.as_str()))
         .count();
     let tally = |v: &[&(u32, String, String)]| {
-        let mut m: std::collections::BTreeMap<(u32, String), (usize, std::collections::HashSet<String>)> =
-            std::collections::BTreeMap::new();
+        let mut m: std::collections::BTreeMap<
+            (u32, String),
+            (usize, std::collections::HashSet<String>),
+        > = std::collections::BTreeMap::new();
         for r in v {
             let e = m.entry((r.0, r.2.clone())).or_default();
             e.0 += 1;
             e.1.insert(r.1.clone());
         }
         m.into_iter()
-            .map(|((st, from), (c, ids))| format!("status {st} from {from}: {c} ({} sessions)", ids.len()))
+            .map(|((st, from), (c, ids))| {
+                format!("status {st} from {from}: {c} ({} sessions)", ids.len())
+            })
             .collect::<Vec<_>>()
             .join("; ")
     };
@@ -585,13 +618,20 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     drop(bl);
     // Every name on this side (the other namespaces' ends go with them,
     // but asynchronously: the next scale must not find a leftover).
-    let mut names: Vec<String> = ["br1", "sync0", "rad0", "gw0", "wan0", "wan0-p", "wanc-p", "blnet-p"]
-        .iter()
-        .map(|s| (*s).to_owned())
-        .collect();
+    let mut names: Vec<String> = [
+        "br1", "sync0", "rad0", "gw0", "wan0", "wan0-p", "wanc-p", "blnet-p",
+    ]
+    .iter()
+    .map(|s| (*s).to_owned())
+    .collect();
     for i in 0..ports {
         names.push(format!("bra{i}"));
-        names.extend([format!("acc{i}"), format!("acc{i}-p"), format!("accc{i}-p"), format!("cpe{i}-p")]);
+        names.extend([
+            format!("acc{i}"),
+            format!("acc{i}-p"),
+            format!("accc{i}-p"),
+            format!("cpe{i}-p"),
+        ]);
     }
     for l in &names {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();

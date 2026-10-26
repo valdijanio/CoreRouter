@@ -1,7 +1,7 @@
 //! G4.3h: the two BNGs of a redundant pair accept each other's AC-Cookie
 //! (a PADR in flight at a switchover still lands on the new active), and
 //! only with the pair's key: a server of its own still refuses it.
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use corerouter_proto_pppoe::discovery::{self, Code, DiscoveryWriter, tag};
 use corerouter_proto_pppoe::eth::Vlans;
