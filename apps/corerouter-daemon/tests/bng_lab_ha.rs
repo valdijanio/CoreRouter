@@ -26,6 +26,9 @@
 //! - **accounting**: one Start per session, no Stop, and C's Interim with
 //!   the same Acct-Session-Id after the takeover.
 //!
+//! With `--root` (`BNG_LAB_ROOT=1`) both nodes run the XDP data plane on
+//! their ports (generic mode).
+//!
 //! Results: `$BNG_LAB_OUT/ha-summary.md`. Helpers may unwrap/panic.
 #![cfg(target_os = "linux")]
 #![allow(
@@ -61,13 +64,28 @@ const SAMPLE_ALL: usize = 2000;
 const SECRET: &str = "lab-segredo";
 const PAIR_SECRET: &str = "segredo-do-par-do-laboratorio";
 
-fn holder() -> Kill {
-    let k = Kill(
-        Command::new("unshare")
-            .args(["--net", "--", "sleep", "86400"])
-            .spawn()
-            .unwrap(),
-    );
+/// A namespace held by a sleeper. With root, a named one (`ip netns
+/// add`): `ip netns exec` also mounts its own `/sys`, which the XDP loader
+/// reads (an `nsenter --net` daemon would see this namespace's ports).
+fn holder(name: &str) -> Kill {
+    let root = std::env::var_os("BNG_LAB_ROOT").is_some();
+    let k = if root {
+        let _ = Command::new("ip").args(["netns", "del", name]).status();
+        assert!(Command::new("ip").args(["netns", "add", name]).status().unwrap().success());
+        Kill(
+            Command::new("ip")
+                .args(["netns", "exec", name, "sleep", "86400"])
+                .spawn()
+                .unwrap(),
+        )
+    } else {
+        Kill(
+            Command::new("unshare")
+                .args(["--net", "--", "sleep", "86400"])
+                .spawn()
+                .unwrap(),
+        )
+    };
     let here = netns_of(std::process::id());
     wait_for("a namespace", || {
         netns_of(k.0.id()).is_some_and(|ns| Some(ns) != here)
@@ -233,10 +251,17 @@ impl Drop for Blaster {
     }
 }
 
-fn daemon(ns: Option<u32>, dir: &Path, log: &Path) -> Kill {
+fn daemon(ns: Option<u32>, named: Option<&str>, dir: &Path, log: &Path) -> Kill {
     let _ = std::fs::remove_dir_all(dir);
     std::fs::create_dir_all(dir).unwrap();
-    let mut c = in_ns(ns, DAEMON);
+    let mut c = match named.filter(|_| std::env::var_os("BNG_LAB_ROOT").is_some()) {
+        Some(n) => {
+            let mut c = Command::new("ip");
+            c.args(["netns", "exec", n, DAEMON]);
+            c
+        }
+        None => in_ns(ns, DAEMON),
+    };
     c.args([
         "--backend",
         "linux",
@@ -276,6 +301,13 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
         "ip.address.add",
         json!({"address": uplink, "interface": "wan0"}),
     );
+    if std::env::var_os("BNG_LAB_ROOT").is_some() {
+        // `--root`: the XDP data plane on both nodes (generic: veth); the
+        // takeover then programs the adopted sessions into C's maps.
+        for i in (0..ports).map(|i| format!("acc{i}")).chain(["wan0".to_owned()]) {
+            ok(ns, "ip.firewall.xdp.interface.add", json!({"interface": i, "mode": "generic"}));
+        }
+    }
     ok(
         ns,
         "ip.pool.add",
@@ -371,7 +403,7 @@ fn bng_lab_ha() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000]);
     let mut md = String::from(
-        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo |\n|---|---|---|---|---|---|---|---|---|\n",
+        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo |\n|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for n in scales {
         let row = run(n, &blaster, &out);
@@ -385,8 +417,8 @@ fn bng_lab_ha() {
 fn run(n: usize, blaster: &Path, out: &Path) -> String {
     let ports = n.div_ceil(PER_PORT).max(1);
     ip(None, &["link", "set", "lo", "up"]);
-    let c = holder();
-    let bl = holder();
+    let c = holder("crha-c");
+    let bl = holder("crha-b");
     let (cp, bp) = (c.0.id(), bl.0.id());
     let (cs, bs) = (cp.to_string(), bp.to_string());
     for ns in [Some(cp), Some(bp)] {
@@ -482,11 +514,13 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     let radius = Radius::start(n);
     let a = daemon(
         None,
+        None,
         &out.join(format!("ha-{n}-a")),
         &out.join(format!("ha-{n}-a.log")),
     );
     let _cd = daemon(
         Some(cp),
+        Some("crha-c"),
         &out.join(format!("ha-{n}-c")),
         &out.join(format!("ha-{n}-c.log")),
     );
@@ -500,7 +534,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
             "ha {n} single: setup {setup:?}, counters {:?}",
             b.counters()
         );
-        return format!("| {n} (nó sozinho) | — | — | — | — | — | — | — | — |");
+        return format!("| {n} (nó sozinho) | — | — | — | — | — | — | — | — | — |");
     }
     wait_secs(60, || {
         monitor(None)["role"] == "active" && monitor(Some(cp))["role"] == "standby"
@@ -566,6 +600,14 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     let (est, flapped1) = b.counters();
     let lost = flapped1.saturating_sub(flapped0);
     let held = active(Some(cp));
+    let plane = match call(Some(cp), "interface.pppoe-server.monitor", json!({}))
+        .ok()
+        .and_then(|m| m["dataplane"].as_bool())
+    {
+        Some(true) => "XDP",
+        Some(false) => "caminho lento",
+        None => "?",
+    };
     let after = radius.records();
     let new: Vec<&(u32, String, String)> = after.iter().skip(before.len()).collect();
     let starts = after.iter().filter(|r| r.0 == 1).count();
@@ -616,6 +658,9 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     drop(_cd);
     drop(c);
     drop(bl);
+    for n in ["crha-c", "crha-b"] {
+        let _ = Command::new("ip").args(["netns", "del", n]).output();
+    }
     // Every name on this side (the other namespaces' ends go with them,
     // but asynchronously: the next scale must not find a leftover).
     let mut names: Vec<String> = [
@@ -637,7 +682,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();
     }
     format!(
-        "| {n} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} |",
+        "| {n} | {plane} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} |",
         unique.len(),
         interims_c.len()
     )
