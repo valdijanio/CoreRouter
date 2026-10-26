@@ -119,9 +119,21 @@ fn sigterm_puts_the_journaled_commits_in_the_slot() {
         .unwrap();
     }
     let journal = std::fs::read_to_string(dir.join("journal-config.log")).unwrap_or_default();
-    assert!(journal.lines().count() > 0, "the commits went to the journal");
+    assert!(
+        journal.lines().count() > 0,
+        "the commits went to the journal"
+    );
     // Before the stop, the slot alone is behind.
-    assert!(boot(&dir, false).store().running().ip.firewall.address_lists.len() < 20);
+    assert!(
+        boot(&dir, false)
+            .store()
+            .running()
+            .ip
+            .firewall
+            .address_lists
+            .len()
+            < 20
+    );
 
     let status = Command::new("kill")
         .args(["-TERM", &d.child.id().to_string()])
@@ -141,7 +153,11 @@ fn sigterm_puts_the_journaled_commits_in_the_slot() {
     let restarted = boot(&dir, true);
     let old_build = boot(&dir, false);
     for s in [&restarted, &old_build] {
-        assert!(s.storage_status().boot_errors.is_empty(), "{:?}", s.storage_status());
+        assert!(
+            s.storage_status().boot_errors.is_empty(),
+            "{:?}",
+            s.storage_status()
+        );
         assert_eq!(s.store().running().ip.firewall.address_lists.len(), 20);
         assert_eq!(s.store().running().system.identity, "ckpt");
     }
