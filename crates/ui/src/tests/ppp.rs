@@ -307,11 +307,12 @@ fn the_service_name_table_under_the_servers() {
 /// stacked server's VLANs.
 #[test]
 fn qinq_vlans_in_the_rows() {
+    let vlan = crate::ppp::ACTIVE_COLUMNS.iter().position(|c| c.title == "VLAN").unwrap();
     let r = json!({"id": "*1-1", "name": "ana", "vlan": 120, "inner_vlan": 3044});
     let row = PppPanel::active_row(&r, None);
-    assert_eq!(crate::chip::split(&row.cells[12]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["120/3044"]);
+    assert_eq!(crate::chip::split(&row.cells[vlan]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["120/3044"]);
     let r = json!({"id": "*1-2", "name": "bia", "vlan": 110});
-    assert_eq!(crate::chip::split(&PppPanel::active_row(&r, None).cells[12]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["110"]);
+    assert_eq!(crate::chip::split(&PppPanel::active_row(&r, None).cells[vlan]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["110"]);
     let srv = json!({"id": "*3", "name": "pppoe-ether2", "interface": "ether2", "vlan_mode": "stacked", "outer_vlan_range": "100-103", "inner_vlan_range": "any", "outer_tpid": "0x88a8"});
     let row = PppPanel::server_row(&srv);
     let (text, chips) = crate::chip::split(&row.cells[6]);
