@@ -55,6 +55,8 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     // at the top of the menu too.
     ("RADIUS", &[]),
     ("System", &[Win::Identity, Win::History]),
+    // The Queues window is a panel (`queues.rs`, G4.9c).
+    ("Queues", &[]),
     ("Tools", &[Win::Ping, Win::Mtr]),
     // The Log window is a panel (`system_log.rs`, G4.6d).
     ("Log", &[]),

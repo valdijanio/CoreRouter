@@ -23,6 +23,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         always, set),
     cmd!("queue.type.remove", "Remove Queue Type", [], None,
         "{id: *hex | name} → {id, name}", always, remove),
+    cmd!(query "queue.type.preview", "Queue Type Preview", [], None,
+        "{id?: *hex | name, name?: string, kind?: string, pfifo_limit?: string, bfifo_limit?: string, pcq_rate?: string, pcq_classifier?: string, pcq_dst_address6_mask?: string, fq_codel_target?: string, fq_codel_interval?: string, fq_codel_ecn?: bool, cake_rtt?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
     cmd!(query "queue.type.list", "Queue Types", [], None,
         "{} → [{id, name, kind, builtin, default (built in), pfifo_limit?, bfifo_limit?, pcq_rate?, pcq_classifier?, pcq_limit?, pcq_total_limit?, pcq_src_address_mask?, pcq_dst_address_mask?, pcq_src_address6_mask?, pcq_dst_address6_mask?, pcq_burst_rate?, pcq_burst_threshold?, pcq_burst_time?, fq_codel_target?, fq_codel_interval?, fq_codel_limit?, fq_codel_ecn?, cake_rtt?, comment?, used_by (simple queues and PPP profiles)}]",
         always, list),
@@ -286,6 +289,36 @@ pub(super) fn kind_fields(t: &QueueType) -> Vec<(&'static str, Value)> {
         ],
         Kind::Cake => vec![("cake_rtt", json!(time_text(t.cake_rtt)))],
     }
+}
+
+/// The modal's preview: numbers typed as text become numbers, emptied
+/// fields are left out (the kind's defaults stay).
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        let empty: Vec<String> = o
+            .iter()
+            .filter(|(k, v)| *k != "comment" && v.as_str().is_some_and(|t| t.trim().is_empty()))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in empty {
+            o.remove(&k);
+        }
+        for k in ["pfifo_limit", "bfifo_limit", "pcq_limit", "pcq_total_limit", "fq_codel_limit", "pcq_src_address_mask", "pcq_dst_address_mask", "pcq_src_address6_mask", "pcq_dst_address6_mask"] {
+            if let Some(n) = o.get(k).and_then(Value::as_str).and_then(|t| t.trim().parse::<u64>().ok()) {
+                o.insert(k.into(), json!(n));
+            }
+        }
+    }
+    super::ppp_common::preview(s, &q, ("queue.type.add", "queue.type.set"), (add, set), |s, v| {
+        let name = v.get("name").and_then(Value::as_str).unwrap_or_default();
+        s.store()
+            .candidate()
+            .queue
+            .queue_type(name)
+            .map(|t| kind_fields(&t).into_iter().map(|(k, v)| json!({"label": k, "value": v.as_str().map(str::to_owned).unwrap_or_else(|| v.to_string())})).collect())
+            .unwrap_or_default()
+    })
 }
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
