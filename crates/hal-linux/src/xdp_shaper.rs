@@ -76,7 +76,7 @@ pub(super) struct ShaperState {
     /// Routes through `bng0` per session index (kernel state).
     routes: BTreeMap<u32, Vec<(IpNet, u16)>>,
     /// The download queue words of each shaped session.
-    pub shapes: BTreeMap<u32, [u64; shaper::QUEUE_WORDS]>,
+    pub shapes: BTreeMap<u32, [u64; shaper::SESSION_WORDS]>,
     /// Bytes per queue at the last status, for the rates.
     last: BTreeMap<String, (u64, [u64; 2])>,
     /// PCQ sub-streams per queue slot, counted at most every 10 s (one
@@ -609,8 +609,7 @@ impl ShaperState {
         &mut self,
         ebpf: Option<&mut Ebpf>,
         idx: u32,
-        s: &corerouter_dataplane_ebpf_common::pppoe::Session,
-        shape: Option<[u64; shaper::QUEUE_WORDS]>,
+        shape: Option<[u64; shaper::SESSION_WORDS]>,
         routes: Vec<(IpNet, u16)>,
     ) -> Result<(), HalError> {
         match shape {
@@ -622,7 +621,7 @@ impl ShaperState {
             }
         }
         if let (Some(ebpf), Some(w)) = (ebpf, shape) {
-            put_session(ebpf, idx, &s.down, w)?;
+            put_session(ebpf, idx, w)?;
         }
         self.set_routes(idx, routes)
     }
@@ -792,14 +791,11 @@ impl ShaperState {
     }
 }
 
-/// Session `idx`'s download queue words and a fresh clock.
-fn put_session(
-    ebpf: &mut Ebpf,
-    idx: u32,
-    down: &Rate,
-    w: [u64; shaper::QUEUE_WORDS],
-) -> Result<(), HalError> {
-    let mut shape = Array::<_, [u64; shaper::QUEUE_WORDS]>::try_from(map(ebpf, m::SUB_SHAPE)?)
+/// Session `idx`'s download (rate and queue) and a fresh clock.
+fn put_session(ebpf: &mut Ebpf, idx: u32, w: [u64; shaper::SESSION_WORDS]) -> Result<(), HalError> {
+    let (down, _) = shaper::of_session_words(&w);
+    let down = &down;
+    let mut shape = Array::<_, [u64; shaper::SESSION_WORDS]>::try_from(map(ebpf, m::SUB_SHAPE)?)
         .map_err(err("SUB_SHAPE map"))?;
     shape.set(idx, w, 0).map_err(err("SUB_SHAPE set"))?;
     let mut st =
@@ -815,8 +811,8 @@ pub(super) fn refill_sessions(
     sessions: &BTreeMap<u32, corerouter_dataplane_ebpf_common::pppoe::Session>,
 ) -> Result<(), HalError> {
     for (idx, w) in &st.shapes {
-        if let Some(s) = sessions.get(idx) {
-            put_session(ebpf, *idx, &s.down, *w)?;
+        if sessions.contains_key(idx) {
+            put_session(ebpf, *idx, *w)?;
         }
     }
     Ok(())

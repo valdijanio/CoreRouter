@@ -101,6 +101,35 @@ pub fn fifo_limit_ns(bytes: u64, rate: u64) -> u64 {
     u64::try_from(ns).unwrap_or(MAX_WAIT_NS)
 }
 
+/// A shaped session's download (`SUB_SHAPE`): its rate (the session words
+/// carry 0, so XDP neither polices nor redirects it) and its queue.
+pub const SESSION_WORDS: usize = crate::policer::RATE_WORDS + QUEUE_WORDS;
+
+pub fn session_words(r: &Rate, q: &Queue) -> [u64; SESSION_WORDS] {
+    let mut w = [0u64; SESSION_WORDS];
+    for (d, v) in w
+        .iter_mut()
+        .zip(r.to_words().into_iter().chain(q.to_words()))
+    {
+        *d = v;
+    }
+    w
+}
+
+#[inline(always)]
+pub fn of_session_words(w: &[u64; SESSION_WORDS]) -> (Rate, Queue) {
+    let g = |i: usize| w.as_slice().get(i).copied().unwrap_or(0);
+    let mut r = [0u64; crate::policer::RATE_WORDS];
+    for (i, slot) in r.iter_mut().enumerate() {
+        *slot = g(i);
+    }
+    let b = crate::policer::RATE_WORDS;
+    (
+        Rate::from_words(r),
+        Queue::from_words([g(b), g(b + 1), g(b + 2), g(b + 3)]),
+    )
+}
+
 /// Where the CoDel words are in a state value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Layout {

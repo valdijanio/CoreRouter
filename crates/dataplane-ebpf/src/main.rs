@@ -60,7 +60,7 @@ use corerouter_dataplane_ebpf_common::queue;
 use corerouter_dataplane_ebpf_common::shaper;
 use corerouter_dataplane_ebpf_common::words::Words;
 use corerouter_dataplane_ebpf_common::pppoe::{
-    self, Counters, Down, DownSession, KEY_LEN, PacketHead, SessionWords, Sessions, Stat, Up,
+    self, Counters, DownKind, DownSession, KEY_LEN, PacketHead, SessionWords, Sessions, Stat, Up,
 };
 
 #[map(name = "SETTINGS")]
@@ -197,10 +197,13 @@ impl Sessions for Subs {
     /// The element's words through BPF atomics (G4.3cc): every CPU may
     /// police one subscriber at once and the rate stays exact.
     #[inline(always)]
-    fn policer(&mut self, idx: u32, dir: u32) -> Option<Atomic<{ policer::STATE_WORDS }>> {
-        PPPOE_POLICER
-            .get_ptr_mut(idx.checked_mul(2)? + (dir & 1))
-            .map(Atomic)
+    fn policer(&mut self, idx: u32, dir: u32) -> Atomic<{ policer::STATE_WORDS }> {
+        // The pointer is null when there is no element (`present()`).
+        Atomic(
+            PPPOE_POLICER
+                .get_ptr_mut(idx.wrapping_mul(2).wrapping_add(dir & 1))
+                .unwrap_or(core::ptr::null_mut()),
+        )
     }
 
     #[inline(always)]
@@ -272,23 +275,23 @@ fn sent(d: &DownSession) -> u32 {
 
 /// Counted a downstream verdict that does not encapsulate; the action.
 #[inline(always)]
-fn down_other(d: Down) -> Option<u32> {
-    match d {
-        Down::NotSub | Down::Encap(_) => None,
-        Down::Counted(st, idx, len) => {
-            stat(st);
-            sess_add(idx, pppoe::C_DOWN_PACKETS, 1);
-            sess_add(idx, pppoe::C_DOWN_BYTES, u64::from(len));
+fn down_other(d: &pppoe::Verdict) -> Option<u32> {
+    match d.kind {
+        DownKind::NotSub | DownKind::Encap => None,
+        DownKind::Counted => {
+            stat(d.stat);
+            sess_add(d.idx, pppoe::C_DOWN_PACKETS, 1);
+            sess_add(d.idx, pppoe::C_DOWN_BYTES, u64::from(d.ip_len));
             Some(xdp_action::XDP_PASS)
         }
-        Down::Kernel(st, idx) => {
-            stat(st);
-            sess_add(idx, pppoe::C_KERNEL, 1);
+        DownKind::Kernel => {
+            stat(d.stat);
+            sess_add(d.idx, pppoe::C_KERNEL, 1);
             Some(xdp_action::XDP_PASS)
         }
-        Down::Drop(st, idx) => {
-            stat(st);
-            sess_add(idx, pppoe::C_DOWN_POLICED, 1);
+        DownKind::Drop => {
+            stat(d.stat);
+            sess_add(d.idx, pppoe::C_DOWN_POLICED, 1);
             Some(xdp_action::XDP_DROP)
         }
     }
@@ -304,18 +307,19 @@ fn to_subscriber(frame: &mut Frame, now: u64) -> Option<u32> {
     if d.routed {
         stat(Stat::DownRouted);
     }
-    match d.down {
-        Down::Encap(s) => {
+    let v = &d.verdict;
+    match v.kind {
+        DownKind::Encap => {
             if d.tagged {
                 stat(Stat::DownTagged);
             }
-            Some(sent(&s))
+            Some(sent(&v.session))
         }
-        Down::Drop(Stat::Malformed, _) => {
+        DownKind::Drop if v.stat == Stat::Malformed => {
             stat(Stat::Malformed);
             Some(xdp_action::XDP_DROP)
         }
-        other => down_other(other),
+        _ => down_other(v),
     }
 }
 
@@ -535,9 +539,18 @@ fn nat_sub(frame: &mut Frame, now: u64) -> Option<u32> {
     let [_, new_dst, ..] = v;
     let new_dst = fastnat::decode(new_dst);
     let idx = Subs.by_v4(new_dst.addr)?;
+    // Shaped (G4.9b): the kernel translates it and the egress queue holds
+    // it (nothing written yet). Here, not in `fast_nat`: there it made LLVM
+    // spill an undefined register in `filter_stage` ("R2 !read_ok").
+    if pppoe::shaped(&Subs, idx) {
+        stat(Stat::DownShaped);
+        return None;
+    }
     let (ip_len, ttl) = pppoe::ip_meta(frame, false)?;
-    match pppoe::downstream(&mut Subs, idx, false, ip_len, ttl, now, true) {
-        Down::Encap(d) => {
+    let verdict = pppoe::verdict(&mut Subs, idx, false, ip_len, ttl, now, true);
+    match verdict.kind {
+        DownKind::Encap => {
+            let d = verdict.session;
             let info = IpInfo {
                 ip_off: ETH_HLEN,
                 src: Addr::V4(src),
@@ -562,7 +575,7 @@ fn nat_sub(frame: &mut Frame, now: u64) -> Option<u32> {
             }
             Some(encap_out(frame, &d))
         }
-        other => down_other(other),
+        _ => down_other(&verdict),
     }
 }
 
@@ -818,7 +831,7 @@ pub fn corerouter_xdp(ctx: XdpContext) -> u32 {
 //   access-side header and goes to the session's port.
 
 #[map(name = "SUB_SHAPE")]
-static SUB_SHAPE: Array<[u64; shaper::QUEUE_WORDS]> =
+static SUB_SHAPE: Array<[u64; shaper::SESSION_WORDS]> =
     Array::with_max_entries(pppoe::SESSIONS_MAX, 0);
 #[map(name = "SUB_EDT")]
 static SUB_EDT: Array<shaper::State> = Array::with_max_entries(pppoe::SESSIONS_MAX, 0);
@@ -853,11 +866,12 @@ struct Atomic<const N: usize>(*mut [u64; N]);
 impl<const N: usize> Words for Atomic<N> {
     #[inline(always)]
     fn get(&self, i: usize) -> u64 {
-        if i >= N {
+        if i >= N || self.0.is_null() {
             return 0;
         }
         // SAFETY: `self.0` is the kernel's pointer to an array or LRU map
-        // element of `N` words (valid and aligned for the run); `i < N`. A
+        // element of `N` words (valid and aligned for the run; null was
+        // checked above); `i < N`. A
         // volatile 64-bit load (BPF has no atomic-load instruction before
         // v4; an aligned 64-bit load does not tear): another CPU stores the
         // word whole.
@@ -866,7 +880,7 @@ impl<const N: usize> Words for Atomic<N> {
 
     #[inline(always)]
     fn set(&mut self, i: usize, v: u64) {
-        if i >= N {
+        if i >= N || self.0.is_null() {
             return;
         }
         // SAFETY: as in `get`; a whole-word volatile store.
@@ -875,7 +889,7 @@ impl<const N: usize> Words for Atomic<N> {
 
     #[inline(always)]
     fn cas(&mut self, i: usize, old: u64, new: u64) -> bool {
-        if i >= N {
+        if i >= N || self.0.is_null() {
             return false;
         }
         // SAFETY: as in `get`; BPF_CMPXCHG (kernel 5.12+, `-C
@@ -891,8 +905,13 @@ impl<const N: usize> Words for Atomic<N> {
     }
 
     #[inline(always)]
+    fn present(&self) -> bool {
+        !self.0.is_null()
+    }
+
+    #[inline(always)]
     fn add(&mut self, i: usize, v: u64) {
-        if i >= N {
+        if i >= N || self.0.is_null() {
             return;
         }
         // SAFETY: as in `get`; BPF atomic add (no fetch).
@@ -1084,16 +1103,17 @@ fn shape_session(ctx: &TcContext, l3: &queue::L3, idx: u32, now: u64) -> Option<
     if !v.has(pppoe::F_ACTIVE) || !v.has(pppoe::F_SHAPE_DOWN) {
         return None;
     }
-    let r = pppoe::rate_of(w, 1);
-    let q = for_packet(shaper::Queue::from_words(*SUB_SHAPE.get(idx)?), ctx, l3);
+    let (r, q) = shaper::of_session_words(SUB_SHAPE.get(idx)?);
+    let q = for_packet(q, ctx, l3);
     let st = SUB_EDT.get_ptr_mut(idx)?;
     let verdict = shaper::depart(&mut Atomic(st), shaper::FULL, &r, &q, now, u64::from(l3.ip_len), 0);
     let (action, sent, _) = finish(ctx, l3, verdict, now);
     shape_stat(queue::Stat::SessionShaped);
-    if sent {
+    // IPoE: the XDP program counted it already (on its way to the kernel).
+    if sent && !v.has(corerouter_dataplane_ebpf_common::ipoe::F_IPOE) {
         sess_add(idx, pppoe::C_DOWN_PACKETS, 1);
         sess_add(idx, pppoe::C_DOWN_BYTES, u64::from(l3.ip_len));
-    } else {
+    } else if !sent {
         sess_add(idx, pppoe::C_DOWN_POLICED, 1);
     }
     Some(action)

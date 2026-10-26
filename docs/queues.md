@@ -101,7 +101,7 @@ Precisão (`shaper_accuracy`, cada alvo oferecido a ≥ 11× a taxa, contado no 
 |---:|---:|---:|
 | 1 | 344 Mbit/s | +0,66% |
 | 100 | 6,6 Mbit/s | +0,67% |
-| 10 000 | 10 kbit/s | +0,69% |
+| 10 000 | 10 kbit/s | +0,69% a +1,33% |
 
 TCP a 50 Mbit/s com 20 ms de RTT (`tcp_shaper_vs_policer`, iperf3, 10 s; ping no mesmo alvo):
 

@@ -433,7 +433,12 @@ impl XdpState {
             route(&mut l.ebpf, &dst, add.then_some(idx))?;
         }
         // The kernel's path to the block (G4.3ca): through bng0, PPPoE only.
-        if let Some(s) = self.pppoe.sessions.get(&idx).filter(|s| s.flags & F_IPOE == 0) {
+        if let Some(s) = self
+            .pppoe
+            .sessions
+            .get(&idx)
+            .filter(|s| s.flags & F_IPOE == 0)
+        {
             let mtu = s.mtu;
             if let Err(e) = self.shaper.block(dst, mtu, add) {
                 log::warn!("PPPoE: {e}");
@@ -500,12 +505,24 @@ impl XdpState {
         idx: u32,
         p: &corerouter_hal::pppoe::PppoeSession,
     ) -> Result<(), HalError> {
-        let s = session_of(p);
-        self.pppoe_upsert(idx, &s)?;
+        let mut s = session_of(p);
+        // Shaped: XDP must neither redirect nor police its download (the
+        // kernel takes it to the egress queue), so the session words carry
+        // no fast-down flag and a zero rate; the real rate goes with the
+        // queue (`SUB_SHAPE`).
         let shape = p
             .shape
             .filter(|_| s.flags & pppoe::F_SHAPE_DOWN != 0)
-            .map(|k| super::shaper::queue_of(&k, s.down.rate).to_words());
+            .map(|k| {
+                let down = s.down;
+                s.down = policer::Rate::default();
+                s.flags &= !pppoe::F_FAST_DOWN;
+                corerouter_dataplane_ebpf_common::shaper::session_words(
+                    &down,
+                    &super::shaper::queue_of(&k, down.rate),
+                )
+            });
+        self.pppoe_upsert(idx, &s)?;
         let routes = if self.pppoe.on {
             super::shaper::routes_of(p)
         } else {
@@ -516,7 +533,7 @@ impl XdpState {
             .as_mut()
             .filter(|_| self.pppoe.maps())
             .map(|l| &mut l.ebpf);
-        self.shaper.session(ebpf, idx, &s, shape, routes)
+        self.shaper.session(ebpf, idx, shape, routes)
     }
 
     /// Counters of session `idx` (accounting interims, graphs).

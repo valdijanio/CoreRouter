@@ -19,6 +19,10 @@ pub trait Words {
     fn cas(&mut self, i: usize, old: u64, new: u64) -> bool;
     /// Atomic add (no fetch).
     fn add(&mut self, i: usize, v: u64);
+    /// There is a state behind (a map element was found).
+    fn present(&self) -> bool {
+        true
+    }
 }
 
 impl<const N: usize> Words for [u64; N] {
@@ -72,6 +76,43 @@ impl<W: Words + ?Sized> Words for &mut W {
     #[inline(always)]
     fn add(&mut self, i: usize, v: u64) {
         (**self).add(i, v)
+    }
+
+    #[inline(always)]
+    fn present(&self) -> bool {
+        (**self).present()
+    }
+}
+
+/// Words that may be missing (no map element): every access a no-op.
+impl<W: Words> Words for Option<W> {
+    #[inline(always)]
+    fn get(&self, i: usize) -> u64 {
+        self.as_ref().map_or(0, |w| w.get(i))
+    }
+
+    #[inline(always)]
+    fn set(&mut self, i: usize, v: u64) {
+        if let Some(w) = self {
+            w.set(i, v)
+        }
+    }
+
+    #[inline(always)]
+    fn cas(&mut self, i: usize, old: u64, new: u64) -> bool {
+        self.as_mut().is_some_and(|w| w.cas(i, old, new))
+    }
+
+    #[inline(always)]
+    fn add(&mut self, i: usize, v: u64) {
+        if let Some(w) = self {
+            w.add(i, v)
+        }
+    }
+
+    #[inline(always)]
+    fn present(&self) -> bool {
+        self.is_some()
     }
 }
 

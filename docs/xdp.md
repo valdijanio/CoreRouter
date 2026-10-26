@@ -226,6 +226,13 @@ Fontes (abertas em 2026-10-23):
   pacote conferido contra `data_end`, tail calls até 33. LPM trie: chave big-endian,
   `BPF_F_NO_PREALLOC` obrigatório (docs.kernel.org/bpf/map_lpm_trie.html). LRU hash
   (docs.kernel.org/bpf/map_hash.html).
+  **Registrador indefinido ("Rn !read_ok"):** um `enum` com variantes de payload diferente
+  (`Option` de ponteiro cru, `Addr::V4`/`V6`, o antigo `pppoe::Down`) faz o LLVM guardar na pilha
+  um registrador que nunca recebeu valor, e o verificador recusa. A pilha não escrita é aceita
+  (carregador com privilégio), o registrador não. Por isso o caminho de dados usa structs com
+  todos os campos escritos (`pppoe::Verdict`, `queue::Pcq { on }`, endereços `[u8; 16]`); o
+  `Down` fica para os testes e modelos do host (G4.9b, **medido**: a soma de G4.3cc e G4.3cd
+  disparou o erro em `down_stage` e em `filter_stage`).
 - **Drivers com XDP nativo** (bcc docs/kernel-versions.md): mlx4 4.8, mlx5 4.9, virtio_net 4.10,
   bnxt 4.11, ixgbe 4.12, i40e 4.13, veth 4.14, ice 5.5, ena 5.6, igb 5.10, igc 5.13; generic
   desde o 4.12. Números de terceiros: mlx5, 1 núcleo, XDP_DROP native 19,8 Mpps contra 8,4 no
