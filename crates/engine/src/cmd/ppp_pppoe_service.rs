@@ -23,14 +23,17 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{server: *hex | name, name: string (a Service-Name, or empty | any), profile?: string (empty: the server's default_profile), action?: terminate|delay|drop (default terminate), pado_delay?: int 0..30000 (ms, with delay), max_sessions?: int (0: no limit), padi_limit?: int (PADIs per second, 0: no limit)} → {server, name, warnings}",
         has_servers, add),
     cmd!("interface.pppoe-server.server.service.set", "Set PPPoE Service Name", [], None,
-        "{server: *hex | name, name: string (the row: a Service-Name, empty or any), new_name?: string (rename a named row), profile?: string (empty: the server's default_profile), action?: terminate|delay|drop, pado_delay?: int 0..30000, max_sessions?: int, padi_limit?: int} → {server, name, warnings}",
+        "{server?: *hex | name, name?: string (the row: a Service-Name, empty or any; with id: its new name), id?: string (<server id>/<row name>, as list gives it, in place of server and name), new_name?: string (rename a named row), profile?: string (empty: the server's default_profile), action?: terminate|delay|drop, pado_delay?: int 0..30000, max_sessions?: int, padi_limit?: int} → {server, name, warnings}",
         has_servers, set),
     cmd!("interface.pppoe-server.server.service.remove", "Remove PPPoE Service Name", [], None,
-        "{server: *hex | name, name: string (a named row; empty and any always exist: set their action)} → {server, name}",
+        "{server?: *hex | name, name?: string (a named row; empty and any always exist: set their action), id?: string (<server id>/<row name>, in place of server and name)} → {server, name}",
         has_servers, remove),
     cmd!(query "interface.pppoe-server.server.service.list", "PPPoE Service Names", [], None,
-        "{server: *hex | name (the table travels in the server's services; /export writes it there)} → [{server, name, special (empty or any row), profile?, action, pado_delay, max_sessions, padi_limit, sessions (up now)}]",
+        "{server: *hex | name (the table travels in the server's services; /export writes it there)} → [{id (<server id>/<row name>), server, name, special (empty or any row), profile?, action, pado_delay, max_sessions, padi_limit, sessions (up now)}]",
         always, list),
+    cmd!(query "interface.pppoe-server.server.service.preview", "PPPoE Service Name Preview", [], None,
+        "{id?: string (<server id>/<row name>: editing it), server?: string, name?: string, profile?: string, action?: string, pado_delay?: string, max_sessions?: string, padi_limit?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
 ];
 
 fn has_servers(s: &Session) -> std::result::Result<(), String> {
@@ -146,9 +149,10 @@ pub(super) fn check_rows(s: &Session, rows: &[PppoeService]) -> Result<Vec<Strin
 }
 
 /// The JSON of one row (`list`, the servers' list).
-fn row_json(server: &str, r: &PppoeService, sessions: usize) -> Value {
+fn row_json(v: &PppoeServer, r: &PppoeService, sessions: usize) -> Value {
     let mut m = Map::new();
-    m.insert("server".into(), json!(server));
+    m.insert("id".into(), json!(format!("{}/{}", v.id, r.name)));
+    m.insert("server".into(), json!(v.name));
     m.insert("name".into(), json!(r.name.to_string()));
     m.insert("special".into(), json!(r.name.is_special()));
     if let Some(p) = &r.profile {
@@ -194,6 +198,28 @@ fn edit(
     Ok(out)
 }
 
+/// `id` (`<server id>/<row name>`, the list's) in place of `server` and
+/// `name`; a `name` next to it is the row's new name.
+fn by_id(p: &Value) -> Result<Value> {
+    let Some(id) = opt_str(p, "id")? else {
+        return Ok(p.clone());
+    };
+    let Some((server, row)) = id.split_once('/') else {
+        return Err(EngineError::bad("id", "<server id>/<row name>, as service.list gives it"));
+    };
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        o.remove("id");
+        let renamed = o.remove("name").and_then(|n| n.as_str().map(str::to_owned)).filter(|n| n.trim() != row);
+        if let Some(n) = renamed {
+            o.insert("new_name".into(), json!(n));
+        }
+        o.insert("server".into(), json!(server));
+        o.insert("name".into(), json!(row));
+    }
+    Ok(q)
+}
+
 fn named(p: &Value) -> Result<ServiceName> {
     req_str(p, "name")?.parse().map_err(|e| EngineError::bad("name", format!("{e}")))
 }
@@ -215,6 +241,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
+    let p = &by_id(p)?;
     let name = named(p)?;
     let new_name = opt_str(p, "new_name")?
         .map(|t| t.parse::<ServiceName>().map_err(|e| EngineError::bad("new_name", format!("{e}"))))
@@ -226,6 +253,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         let mut q = p.clone();
         if let Some(o) = q.as_object_mut() {
             o.remove("name");
+            o.remove("server");
+            o.remove("new_name");
         }
         let mut r = row(&q, rows.get(at), "name")?;
         if let Some(n) = new_name {
@@ -243,6 +272,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
+    let p = &by_id(p)?;
     let name = named(p)?;
     if name.is_special() {
         return Err(EngineError::bad("name", "the empty and any rows always exist: set their action (drop) instead"));
@@ -256,6 +286,55 @@ fn remove(s: &mut Session, p: &Value) -> Result<Value> {
         Ok(name.to_string())
     })?;
     Ok(json!({"server": out.get("server"), "name": out.get("name")}))
+}
+
+/// The list modal's preview: `add` (or `set` with `id`) tried on the
+/// candidate and undone. The modal sends numbers as text.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        for k in ["pado_delay", "max_sessions", "padi_limit"] {
+            match o.get(k).and_then(Value::as_str).map(str::trim) {
+                Some("") => {
+                    o.insert(k.into(), json!(0));
+                }
+                Some(t) => {
+                    if let Ok(n) = t.parse::<u64>() {
+                        o.insert(k.into(), json!(n));
+                    }
+                }
+                None => {}
+            }
+        }
+    }
+    super::ppp_common::preview(
+        s,
+        &q,
+        ("interface.pppoe-server.server.service.add", "interface.pppoe-server.server.service.set"),
+        (add, set),
+        |s, v| {
+            let server = v.get("server").and_then(Value::as_str).unwrap_or_default();
+            let Some(srv) = s.store().candidate().ppp.pppoe_servers.iter().find(|x| x.name == server).cloned() else {
+                return Vec::new();
+            };
+            let rows = srv.service_table();
+            let names = |drop: bool| -> String {
+                let n: Vec<String> = rows
+                    .iter()
+                    .filter(|r| !r.name.is_special() && r.accepts() != drop)
+                    .map(|r| r.name.to_string())
+                    .collect();
+                if n.is_empty() { "none".to_owned() } else { n.join(", ") }
+            };
+            let fallback = |n: &ServiceName| rows.iter().find(|r| r.name == *n).map_or("terminate", |r| r.action.as_str());
+            vec![
+                json!({"label": "Names served", "value": names(false)}),
+                json!({"label": "Names dropped", "value": names(true)}),
+                json!({"label": "Empty name", "value": fallback(&ServiceName::Empty)}),
+                json!({"label": "Other names", "value": fallback(&ServiceName::Any)}),
+            ]
+        },
+    )
 }
 
 /// Sessions up per (server, Service-Name).
@@ -295,7 +374,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let c = counts(s);
     let rows = v.service_table();
-    Ok(Value::Array(rows.iter().map(|r| row_json(&v.name, r, row_sessions(&c, &v, &rows, r))).collect()))
+    Ok(Value::Array(rows.iter().map(|r| row_json(&v, r, row_sessions(&c, &v, &rows, r))).collect()))
 }
 
 #[cfg(test)]
@@ -426,5 +505,32 @@ mod tests {
         // `service_name` still works (RouterOS, the importer).
         s.execute("interface.pppoe-server.server.set", &json!({"id": "pppoe-ether2", "service_name": ""})).unwrap();
         assert!(s.store().candidate().ppp.pppoe_servers[0].service_table().iter().all(PppoeService::accepts));
+    }
+
+    #[test]
+    fn the_modal_edits_a_row_by_id_through_the_preview() {
+        let mut s = lab();
+        s.execute("interface.pppoe-server.server.service.add", &json!({"server": "pppoe-ether2", "name": "tv"})).unwrap();
+        let l = s.execute("interface.pppoe-server.server.service.list", &json!({"server": "pppoe-ether2"})).unwrap();
+        let id = l[0]["id"].as_str().unwrap().to_owned();
+        assert!(id.ends_with("/tv"), "{id}");
+        // New row: numbers as text, as the modal sends them.
+        let p = s.execute("interface.pppoe-server.server.service.preview", &json!({"server": "pppoe-ether2", "name": "voip", "pado_delay": "200"})).unwrap();
+        assert_eq!(p["checks"][0]["level"], "ok", "{p}");
+        assert_eq!(p["commands"][0]["command"], "interface.pppoe-server.server.service.add");
+        // Edit by id: rename and change the profile.
+        let p = s.execute("interface.pppoe-server.server.service.preview", &json!({"id": id, "name": "iptv", "profile": "iptv", "max_sessions": "50"})).unwrap();
+        assert_eq!(p["checks"][0]["level"], "ok", "{p}");
+        let step = &p["commands"][0];
+        s.execute(step["command"].as_str().unwrap(), &step["params"]).unwrap();
+        let t = table(&s);
+        assert_eq!((t[0].name.to_string(), t[0].profile.as_deref(), t[0].max_sessions), ("iptv".into(), Some("iptv"), 50));
+        // A bad entry is an error check, not a failure.
+        let p = s.execute("interface.pppoe-server.server.service.preview", &json!({"server": "pppoe-ether2", "name": "x", "profile": "nope"})).unwrap();
+        assert_eq!(p["checks"][0]["level"], "error");
+        let id = format!("{}/iptv", s.store().running().ppp.pppoe_servers[0].id);
+        s.execute("interface.pppoe-server.server.service.remove", &json!({"id": id})).unwrap();
+        assert_eq!(table(&s).len(), 2);
+        assert!(s.execute("interface.pppoe-server.server.service.remove", &json!({"id": "nope"})).is_err());
     }
 }

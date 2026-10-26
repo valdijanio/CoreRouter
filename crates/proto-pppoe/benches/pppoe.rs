@@ -304,7 +304,41 @@ fn memory() {
     );
 }
 
-criterion_group!(benches, codecs, ipv6, server, setup);
+/// G4.3h hot standby: the takeover's cost per session — export the
+/// established sessions of a server, and import them into another (the
+/// standby becoming active), 20 000 at a time.
+fn takeover(c: &mut Criterion) {
+    let mut l = Lab::new(LabConfig {
+        clients: 20_000,
+        start_spread_ms: 2_000,
+        auth_cycle: vec![AuthProto::ChapMd5],
+        ..LabConfig::default()
+    });
+    l.start_all();
+    l.run_until(20_000);
+    assert_eq!(l.clients_up(), 20_000);
+    let now = l.now;
+    let states = l.servers[0].export_all(now);
+    let cfg = l.servers[0].config().clone();
+    let mut g = c.benchmark_group("pppoe_ha");
+    g.throughput(Throughput::Elements(states.len() as u64));
+    g.sample_size(10);
+    g.bench_function("export_20k", |b| {
+        b.iter(|| black_box(l.servers[0].export_all(now)).len())
+    });
+    g.bench_function("import_20k", |b| {
+        b.iter(|| {
+            let mut s = Server::new(cfg.clone(), [9; 32], now);
+            let mut out = ServerOutput::new();
+            let r = s.import(now, &states, &mut out);
+            assert!(r.iter().all(Result::is_ok));
+            s
+        })
+    });
+    g.finish();
+}
+
+criterion_group!(benches, codecs, ipv6, server, setup, takeover);
 
 fn main() {
     benches();

@@ -10,12 +10,14 @@ empilhados:
 
 | PR | Parte | Estado |
 |---|---|---|
-| a | crate `proto-ha` (sans-IO): codec do sync, registro da sessão, máquina de papéis com cerca, hello de acesso, laboratório de dois nós, fuzz, benchmark; este documento | este PR |
-| b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | próximo |
-| c | fase 1 no serviço `pppoe`: MAC virtual, só o ativo responde, segredo do AC-Cookie compartilhado | depois das sessões B (G4.3k+l) e C (G4.3cd) entrarem |
-| d | fase 2: exportar/importar sessão por worker, mapas XDP na tomada, MAC update gratuito, contabilização contínua | depois do c |
-| e | aba PPP › Redundancy na GUI | depois do b |
-| f | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do d |
+| a | crate `proto-ha` (sans-IO): codec do sync, registro da sessão, máquina de papéis com cerca, hello de acesso, laboratório de dois nós, fuzz, benchmark; este documento | #241 |
+| b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | #242 |
+| c | serviço `ppp-ha` no daemon: link de sync TLS com autenticação mútua, hello de acesso (AF_PACKET), testemunha (ICMP), track, monitor; `proto_ha::node` (o mesmo código no daemon e no laboratório) | #248 |
+| d | fase 1 no serviço `pppoe`: só o ativo responde, MAC virtual, segredo do AC-Cookie compartilhado | depois da sessão B (G4.3k+l) entrar |
+| e1 | `proto-pppoe`: `Server::export`/`import` (a sessão em Opened no outro servidor, sem renegociar) | este PR |
+| e2 | fase 2 no serviço: exportar/importar sessão por worker, mapas XDP na tomada, contabilização contínua | depois do d |
+| f | aba PPP › Redundancy na GUI | #251 |
+| g | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do e |
 
 ## 1. Pesquisa
 
@@ -165,6 +167,62 @@ sequência, `hears`, `view_seq`, `acked`, época, papel, prioridade, flags (test
 elegível) e HMAC-SHA-256/128 com chave derivada do segredo do par. O ativo manda do **MAC
 virtual**: todo hello é também o MAC update gratuito. Repetição recusada por encarnação e
 sequência.
+
+## 2.5 O serviço `ppp-ha` do daemon (PR c)
+
+- **Link de sync:** TLS na `listen_port` (o certificado do próprio roteador, o mesmo do canal de
+  controle) e um discador para `peer`. Fica só a conexão discada pelo nó de **id menor** (o id é
+  um hash do certificado de cada roteador, que o discador vê no handshake), então o par tem um
+  link só. O certificado do par é fixado no primeiro uso (`ppp-ha-peer.fingerprint` na pasta de
+  config). Sobre o TLS, o `Node` autentica as duas pontas com o segredo (desafio e prova HMAC).
+- **Hello de acesso:** um socket `AF_PACKET` (0x88b5) por porta de acesso, com allmulticast como o
+  LLDP; do MAC virtual enquanto ativo.
+- **Testemunha:** um eco ICMP por endereço por segundo; cai depois de 3 faltas seguidas, volta na
+  primeira resposta. **Track:** as portas da lista precisam estar com portadora.
+- **Locks:** o `Node` fica atrás de um mutex que cada thread pega rápido e nunca durante E/S (o
+  laço principal a cada 10 ms, a thread da conexão, os comandos). O serviço `pppoe` lê só
+  atômicos (`ppp_ha::shared`: responder ou não, MAC virtual, chave do cookie).
+- **Teste em namespace** (`tests/netns_ha.rs`, dois daemons, sem root), **medido** em debug:
+  - par formado em 762 ms;
+  - switchover em 53 ms;
+  - failover depois de matar o ativo em 1,16 s (morte 1,2 s);
+  - o nó isolado (os dois links e a testemunha perdidos) se cerca e o outro assume.
+
+## 2.6 A aba PPP › Redundancy (PR f)
+
+À esquerda, a configuração (`ppp.redundancy.get/set`): par (TLS), modo, segredo (só de escrita:
+o campo vazio não muda nada), prioridade, preempção, MAC virtual, grupo, portas de acesso, cerca,
+testemunha, track e temporizadores; Apply manda só o que mudou. À direita, o par agora
+(`ppp.redundancy.monitor`):
+
+- o papel deste nó em selo colorido (active verde, standby azul, fenced vermelho, init/yielding
+  âmbar) e a época;
+- o par: papel, TLS, e os caminhos em que é ouvido (link de sync, acesso);
+- a testemunha;
+- o sync: sessões N/N, pendentes, atraso e o snapshot em andamento;
+- a divergência de config, uma seção por selo;
+- as últimas trocas de papel, com o motivo e "sessions kept".
+
+**Switchover** e **Simulate Failure** pedem confirmação. Todo rótulo tem ⓘ com a explicação em
+português. Conferido com dois daemons reais num namespace (switchover, falha simulada de 30 s e
+volta como standby), nos temas escuro e claro.
+## 2.7 A sessão PPPoE de um servidor para outro (PR e1)
+
+`proto_pppoe::server::ha`: `Server::export_all(now)` dá o `SessionState` de cada sessão
+estabelecida, e `Server::import(now, states)` as recria no outro servidor já em **Opened** no LCP,
+no IPCP e no IPv6CP, sem mandar nada. Ficam o SID, o par de MACs, os dois Magic-Numbers, o MRU dos
+dois lados, o protocolo de autenticação, o endereço, o DNS, os identificadores IPv6CP, o
+rate-limit e o que falta do Session-Timeout. O keepalive recomeça da tomada; uma renegociação
+pedida pelo CPE segue normal. A lista de SIDs livres é refeita uma vez por lote (O(n)).
+
+- **Teste** (`tests/ha.rs`):
+  - 1000 assinantes (MS-CHAPv2, PAP e CHAP, IPv4 e IPv6, dois shards) passam para servidores novos
+    e ficam 2 minutos de keepalive de pé, sem relogar e sem queda;
+  - o export do servidor novo é idêntico ao do antigo (a mutação de um magic reprova);
+  - com 5 % de perda depois da tomada, as sessões aguentam;
+  - SID ocupado ou de outra lane é recusado.
+- **Medido** (release): export de 74 ns e import de 242 ns por sessão (20 mil em 1,5 ms e 4,8
+  ms): 100 mil num núcleo ≈ 25 ms; por worker, em paralelo.
 
 ## 3. Testes
 
