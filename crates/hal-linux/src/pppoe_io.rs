@@ -523,7 +523,7 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
 }
 
 /// The index of dummy device `name`, created and set up if missing.
-fn ensure_dummy(name: &str) -> io::Result<u32> {
+pub(crate) fn ensure_dummy(name: &str) -> io::Result<u32> {
     use futures_util::TryStreamExt;
     use rtnetlink::{LinkDummy, LinkMessageBuilder, LinkUnspec};
     let rt = runtime()?;

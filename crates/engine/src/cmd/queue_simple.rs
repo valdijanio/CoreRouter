@@ -367,6 +367,8 @@ fn session_counters(row: &mut Value, a: &corerouter_model::ppp::ActiveSession) {
         o.insert("bytes".into(), json!([a.rx_bytes, a.tx_bytes]));
         o.insert("packets".into(), json!([a.rx_packets, a.tx_packets]));
         o.insert("rate_bps".into(), json!([a.rx_bps, a.tx_bps]));
+        o.insert("queued_us".into(), json!([0, a.queue_us]));
+        o.insert("dropped".into(), json!([0, a.drops]));
     }
 }
 
@@ -544,6 +546,23 @@ mod tests {
         ok(&mut s, "queue.simple.remove", json!({"id": "t"}));
         s.execute("config.rollback", &json!({"revision": rev})).unwrap();
         assert_eq!(s.store().running().queue.simple.len(), 1);
+    }
+
+    /// The `queue` service's round on a HAL without a shaper (the virtual
+    /// lab): applied once, then the list says why nothing shapes.
+    #[test]
+    fn sync_without_a_shaper_says_why() {
+        let mut s = lab();
+        assert!(s.queue_sync(), "the first round applies (an empty plan)");
+        assert!(!s.queue_sync(), "nothing changed");
+        ok(&mut s, "queue.simple.add", json!({"name": "q", "target": "10.0.0.0/24", "max_limit": "1M/1M"}));
+        assert!(s.queue_sync());
+        let l = ok(&mut s, "queue.simple.list", json!({}));
+        assert_eq!(l["running"], false);
+        assert!(l["note"].as_str().unwrap().contains("shaper"), "{l}");
+        let plan = s.ext::<crate::queue::ShaperRuntime>().unwrap().applied.clone().unwrap();
+        assert_eq!(plan.queues.len(), 1);
+        assert_eq!(plan.queues[0].download.rate_bps, 1_000_000);
     }
 
     #[test]

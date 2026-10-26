@@ -45,6 +45,10 @@ pub(super) struct PppoeState {
 }
 
 impl PppoeState {
+    pub fn sessions(&self) -> &BTreeMap<u32, Session> {
+        &self.sessions
+    }
+
     /// The session maps are needed (sized for sessions).
     pub fn maps(&self) -> bool {
         self.on || !self.ipoe_ports.is_empty()
@@ -428,6 +432,18 @@ impl XdpState {
         if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.maps()) {
             route(&mut l.ebpf, &dst, add.then_some(idx))?;
         }
+        // The kernel's path to the block (G4.3ca): through bng0, PPPoE only.
+        if let Some(s) = self
+            .pppoe
+            .sessions
+            .get(&idx)
+            .filter(|s| s.flags & F_IPOE == 0)
+        {
+            let mtu = s.mtu;
+            if let Err(e) = self.shaper.block(dst, mtu, add) {
+                log::warn!("PPPoE: {e}");
+            }
+        }
         let changed = if add {
             let old = self.pppoe.routes.insert(dst, idx);
             if let Some(o) = old.filter(|o| *o != idx) {
@@ -468,8 +484,8 @@ impl XdpState {
         Ok(())
     }
 
-    /// Remove session `idx` (nothing if unknown) and the blocks routed to
-    /// it.
+    /// Remove session `idx` (nothing if unknown), the blocks routed to it
+    /// and its routes through `bng0`.
     pub fn pppoe_remove(&mut self, idx: u32) -> Result<(), HalError> {
         self.pppoe_unroute(idx)?;
         let Some(old) = self.pppoe.sessions.remove(&idx) else {
@@ -478,7 +494,46 @@ impl XdpState {
         if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.maps()) {
             clear(&mut l.ebpf, idx, &old)?;
         }
-        Ok(())
+        self.shaper.session_gone(idx)
+    }
+
+    /// [`XdpState::pppoe_upsert`] of a session the BNG service describes,
+    /// with its download queue (G4.9b) and its routes through `bng0`
+    /// (G4.3ca, PPPoE with XDP on).
+    pub fn pppoe_upsert_hal(
+        &mut self,
+        idx: u32,
+        p: &corerouter_hal::pppoe::PppoeSession,
+    ) -> Result<(), HalError> {
+        let mut s = session_of(p);
+        // Shaped: XDP must neither redirect nor police its download (the
+        // kernel takes it to the egress queue), so the session words carry
+        // no fast-down flag and a zero rate; the real rate goes with the
+        // queue (`SUB_SHAPE`).
+        let shape = p
+            .shape
+            .filter(|_| s.flags & pppoe::F_SHAPE_DOWN != 0)
+            .map(|k| {
+                let down = s.down;
+                s.down = policer::Rate::default();
+                s.flags &= !pppoe::F_FAST_DOWN;
+                corerouter_dataplane_ebpf_common::shaper::session_words(
+                    &down,
+                    &super::shaper::queue_of(&k, down.rate),
+                )
+            });
+        self.pppoe_upsert(idx, &s)?;
+        let routes = if self.pppoe.on {
+            super::shaper::routes_of(p)
+        } else {
+            Vec::new()
+        };
+        let ebpf = self
+            .loaded
+            .as_mut()
+            .filter(|_| self.pppoe.maps())
+            .map(|l| &mut l.ebpf);
+        self.shaper.session(ebpf, idx, shape, routes)
     }
 
     /// Counters of session `idx` (accounting interims, graphs).
@@ -541,6 +596,11 @@ pub fn session_of(p: &corerouter_hal::pppoe::PppoeSession) -> Session {
     if p.delegated.is_some() {
         flags |= F_PD;
     }
+    // G4.9b: shaped on the egress instead of policed here (only with a
+    // download rate to shape at).
+    if p.shape.is_some() && p.down.rate_bps > 0 {
+        flags |= pppoe::F_SHAPE_DOWN;
+    }
     let (pd_prefix, pd_len) = p.delegated.unwrap_or(([0; 8], 0));
     Session {
         flags,
@@ -582,9 +642,7 @@ impl XdpState {
     pub fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), HalError> {
         for op in ops {
             match op {
-                corerouter_hal::pppoe::PppoeOp::Upsert(idx, s) => {
-                    self.pppoe_upsert(*idx, &session_of(s))?
-                }
+                corerouter_hal::pppoe::PppoeOp::Upsert(idx, s) => self.pppoe_upsert_hal(*idx, s)?,
                 corerouter_hal::pppoe::PppoeOp::Remove(idx) => self.pppoe_remove(*idx)?,
                 corerouter_hal::pppoe::PppoeOp::Route { dst, idx, add } => {
                     self.pppoe_route(*dst, *idx, *add)?
@@ -592,6 +650,30 @@ impl XdpState {
             }
         }
         Ok(())
+    }
+
+    /// How long a download packet of shaped session `idx` would wait now,
+    /// microseconds (0: not shaped or not loaded).
+    fn session_backlog_us(&mut self, idx: u32) -> u64 {
+        if !self.shaper.shapes.contains_key(&idx) {
+            return 0;
+        }
+        let Some(map) = self
+            .loaded
+            .as_mut()
+            .and_then(|l| l.ebpf.map_mut(m::SUB_EDT))
+        else {
+            return 0;
+        };
+        let Ok(arr) = Array::<_, corerouter_dataplane_ebpf_common::shaper::State>::try_from(map)
+        else {
+            return 0;
+        };
+        arr.get(&idx, 0)
+            .map(|st| {
+                corerouter_dataplane_ebpf_common::shaper::backlog_ns(&st, monotonic_ns()) / 1000
+            })
+            .unwrap_or(0)
     }
 
     /// Counters of `slots`, in the HAL's terms.
@@ -614,6 +696,7 @@ impl XdpState {
                         down_policed: c.down_policed,
                         spoofed: c.spoofed,
                         to_kernel: c.to_kernel,
+                        down_queue_us: self.session_backlog_us(*i),
                     },
                 ))
             })

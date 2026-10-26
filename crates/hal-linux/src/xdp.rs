@@ -35,6 +35,8 @@ use ipnet::IpNet;
 
 #[path = "xdp_pppoe.rs"]
 mod pppoe;
+#[path = "xdp_shaper.rs"]
+mod shaper;
 pub use pppoe::{PppoeCounters, session_of as pppoe_session_of};
 
 /// The XDP object, built by `cargo xtask ebpf` (crates/dataplane-ebpf).
@@ -86,6 +88,12 @@ struct Loaded {
     fast_nat: bool,
     /// The PPPoE maps were sized for sessions (G4.3c); a change reloads.
     pppoe: bool,
+    /// The queue maps were sized for queues (G4.9b), and the PCQ map for
+    /// PCQ queues; a change reloads.
+    queues: bool,
+    pcq: bool,
+    /// The tc programs' links (G4.9b, G4.3ca).
+    tc: shaper::TcLinks,
 }
 
 /// The XDP part of [`crate::LinuxHal`] (public for the root tests and
@@ -104,6 +112,8 @@ pub struct XdpState {
     /// PPPoE subscribers (G4.3c, `xdp_pppoe.rs`): on, and the sessions
     /// the maps hold (written again after a reload).
     pppoe: pppoe::PppoeState,
+    /// Queues and `bng0` (G4.9b, G4.3ca, `xdp_shaper.rs`).
+    shaper: shaper::ShaperState,
 }
 
 impl std::fmt::Debug for XdpState {
@@ -155,32 +165,53 @@ impl XdpState {
     }
 
     fn reach(&mut self, plan: XdpPlan) -> Result<(), HalError> {
-        if plan == self.applied && (plan.is_empty() || self.loaded.is_some()) {
+        self.reach_with(plan, false)
+    }
+
+    /// `strict`: a shaper failure is the caller's error (`shaper_apply`);
+    /// otherwise it is only recorded (the shaper never fails a config
+    /// apply, an XDP filter change or a PPPoE session).
+    fn reach_with(&mut self, plan: XdpPlan, strict: bool) -> Result<(), HalError> {
+        let shaping = self.shaper.wanted();
+        let sized = |l: &Loaded, st: &Self| {
+            l.fast_nat == plan.fast_nat
+                && l.pppoe == st.pppoe.maps()
+                && l.queues == st.shaper.queues()
+                && l.pcq == st.shaper.pcq()
+        };
+        if plan == self.applied
+            && !shaping
+            && self.shaper.idle()
+            && (plan.is_empty() || self.loaded.as_ref().is_some_and(|l| sized(l, self)))
+        {
             return Ok(());
         }
-        if plan.is_empty() {
+        if plan.is_empty() && !shaping {
             // Dropping the object detaches every link and frees the maps.
             self.loaded = None;
             self.set_nat(None);
             self.applied = plan;
-            return Ok(());
+            self.shaper.reloaded();
+            return self.shaper.reach(None, false, false);
         }
-        // The flow map is preallocated: sized only while the fast path is
-        // on, so turning it on or off reloads the object (links come back
-        // in this same call).
+        // The flow map, the session maps and the queue maps are
+        // preallocated: sized only while in use, so a change reloads the
+        // object (links come back in this same call).
         let pppoe = self.pppoe.maps();
-        if self
-            .loaded
-            .as_ref()
-            .is_some_and(|l| l.fast_nat != plan.fast_nat || l.pppoe != pppoe)
-        {
+        if self.loaded.as_ref().is_some_and(|l| !sized(l, self)) {
             self.loaded = None;
             self.set_nat(None);
         }
         if self.loaded.is_none() {
-            match load(plan.fast_nat, pppoe) {
+            match load(
+                plan.fast_nat,
+                pppoe,
+                self.shaper.queues(),
+                self.shaper.pcq(),
+            ) {
                 Ok(mut l) => {
                     pppoe::refill(&mut l.ebpf, &self.pppoe)?;
+                    shaper::refill_sessions(&mut l.ebpf, &self.shaper, self.pppoe.sessions())?;
                     let map = if l.fast_nat {
                         take_nat(&mut l.ebpf)?
                     } else {
@@ -191,8 +222,15 @@ impl XdpState {
                     self.error = None;
                     // Fresh maps: everything goes in.
                     self.applied = XdpPlan::default();
+                    self.shaper.reloaded();
                 }
                 Err(e) => {
+                    // Only the queues wanted it: that is the shaper's
+                    // failure, not the filter's.
+                    if plan.is_empty() && !strict {
+                        self.shaper.set_error(Some(e.to_string()));
+                        return Ok(());
+                    }
                     self.error = Some(e.to_string());
                     return Err(e);
                 }
@@ -222,7 +260,39 @@ impl XdpState {
         self.applied.allow = plan.allow.clone();
         attach_all(l, &plan.interfaces)?;
         self.applied = plan;
-        Ok(())
+        let on = self.pppoe.maps();
+        match self.shaper.reach(self.loaded.as_mut(), self.pppoe.on, on) {
+            Err(e) if !strict => {
+                log::warn!("shaper: {e}");
+                self.shaper.set_error(Some(e.to_string()));
+                Ok(())
+            }
+            Ok(()) => {
+                self.shaper.set_error(None);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Queues (G4.9b): hold `plan`. The object loads for it alone when no
+    /// XDP port is configured.
+    pub fn shaper_apply(
+        &mut self,
+        plan: &corerouter_hal::queue::ShaperPlan,
+    ) -> Result<(), HalError> {
+        if self.shaper.plan == *plan && (plan.is_empty() || self.loaded.is_some()) {
+            return Ok(());
+        }
+        self.shaper.plan = plan.clone();
+        let cfg = self.cfg.clone().unwrap_or_default();
+        let xdp = XdpPlan::of(&cfg, &self.dynamic);
+        self.applied = XdpPlan::default();
+        self.reach_with(xdp, true)
+    }
+
+    pub fn shaper_status(&mut self) -> corerouter_hal::queue::ShaperStatus {
+        self.shaper.status(self.loaded.as_mut())
     }
 
     pub fn status(&mut self, top: usize) -> XdpStatus {
@@ -509,18 +579,26 @@ impl XdpState {
     }
 }
 
-fn load(fast_nat: bool, pppoe: bool) -> Result<Loaded, HalError> {
+fn load(fast_nat: bool, pppoe: bool, queues: bool, pcq: bool) -> Result<Loaded, HalError> {
     let flows = if fast_nat { m::NAT_FLOWS_MAX } else { 1 };
     let mut loader = aya::EbpfLoader::new();
     loader.map_max_entries(m::NAT_FLOWS, flows);
     if !pppoe {
-        for name in m::PPPOE_SIZED {
+        for name in m::PPPOE_SIZED.into_iter().chain(m::SUB_SIZED) {
             loader.map_max_entries(name, 1);
         }
         loader.map_max_entries(m::PPPOE_V6, 1);
         loader.map_max_entries(m::PPPOE_RT4, 1);
         loader.map_max_entries(m::PPPOE_RT6, 1);
         loader.map_max_entries(m::PPPOE_POLICER, 2);
+    }
+    if !queues {
+        loader.map_max_entries(m::Q_CONF, 1);
+        loader.map_max_entries(m::Q_STATE, 2);
+        loader.map_max_entries(m::Q_COUNT, 2);
+    }
+    if !pcq {
+        loader.map_max_entries(m::Q_PCQ, 1);
     }
     let mut ebpf = loader
         .load(OBJECT)
@@ -537,6 +615,9 @@ fn load(fast_nat: bool, pppoe: bool) -> Result<Loaded, HalError> {
         links: BTreeMap::new(),
         fast_nat,
         pppoe,
+        queues,
+        pcq,
+        tc: shaper::TcLinks::default(),
     })
 }
 
