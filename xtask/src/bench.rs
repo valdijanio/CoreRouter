@@ -8,7 +8,7 @@
 //! cargo xtask bench --save-baseline before  keep this run as "before"
 //! cargo xtask bench --baseline before       compare with "before", keep it as it is
 //! cargo xtask bench --markdown              also print rows for docs/perf.md
-//! cargo xtask bench --check                 build and run each benchmark once (debug)
+//! cargo xtask bench --check                 build and run each benchmark once (no measurement)
 //! ```
 //!
 //! Results live in `<target>/criterion` (criterion's own layout); the
@@ -256,13 +256,120 @@ fn parse_artifacts(stdout: &str, meta: &Meta) -> Vec<Bench> {
         .collect()
 }
 
-/// Every benchmark built in the test profile and run once in criterion's
-/// test mode (no measurement): they compile and do not panic. The netns one
-/// only prints "skipped" without its namespace.
+/// Every benchmark built and run once in criterion's test mode (no
+/// measurement): they compile and do not panic. The netns one only prints
+/// "skipped" without its namespace.
+///
+/// One `cargo test --no-run` builds them all in the `bench-check` profile
+/// (`opt-level = 1` with the debug assertions of a test build), then the
+/// binaries run side by side, as many at a time as there are CPUs. In debug
+/// and one after the other (`cargo test --bench '*'`) it took 9 min 55 s in
+/// CI, almost all of it running big setups (1M routes, 100k sessions)
+/// (docs/perf.md).
 pub fn check(root: &Path) -> Outcome {
-    let mut c = cargo();
-    c.args(["test", "--workspace", "--quiet", "--bench", "*"]);
-    run(c, root)
+    let meta = match metadata(root) {
+        Ok(m) => m,
+        Err(e) => return Outcome::Fail(e),
+    };
+    let out = cargo()
+        .args([
+            "test",
+            "--workspace",
+            "--bench",
+            "*",
+            "--no-run",
+            "--profile",
+            "bench-check",
+            "--message-format=json-render-diagnostics",
+        ])
+        .current_dir(root)
+        .stderr(std::process::Stdio::inherit())
+        .output();
+    let out = match out {
+        Ok(o) if o.status.success() => o,
+        Ok(o) => return Outcome::Fail(format!("cargo test --no-run: exit status {}", o.status)),
+        Err(e) => return Outcome::Fail(format!("cargo test --no-run: {e}")),
+    };
+    let mut benches = parse_artifacts(&String::from_utf8_lossy(&out.stdout), &meta);
+    benches.sort_by_key(|b| (slow_rank(&b.target), b.package.clone(), b.target.clone()));
+    let workers = std::thread::available_parallelism()
+        .map_or(1, usize::from)
+        .min(benches.len())
+        .max(1);
+    let failed = run_parallel(&benches, workers);
+    if failed.is_empty() {
+        Outcome::Ok
+    } else {
+        Outcome::Fail(failed.join("; "))
+    }
+}
+
+/// The slowest bench binaries in check mode, slowest first (**medido**,
+/// 2026-10-26): started first, so none of them begins last and holds the
+/// step alone.
+const SLOW_FIRST: &[&str] = &[
+    "frames",
+    "commit",
+    "server_storm",
+    "pppoe_bng",
+    "routes_full",
+    "config_store",
+    "graph",
+    "batch_import",
+    "cgnat_who_was",
+];
+
+fn slow_rank(target: &str) -> usize {
+    SLOW_FIRST
+        .iter()
+        .position(|s| *s == target)
+        .unwrap_or(SLOW_FIRST.len())
+}
+
+/// Run every binary in criterion's test mode, `workers` at a time; each
+/// one's output is printed whole when it ends. The failures, by name.
+fn run_parallel(benches: &[Bench], workers: usize) -> Vec<String> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let failed = Mutex::new(Vec::new());
+    std::thread::scope(|scope| {
+        for i in 0..workers {
+            let (next, failed) = (&next, &failed);
+            let spawned = std::thread::Builder::new()
+                .name(format!("bench-check-{i}"))
+                .spawn_scoped(scope, move || {
+                    while let Some(b) = benches.get(next.fetch_add(1, Ordering::Relaxed)) {
+                        let label = format!("{} {}", b.package, b.target);
+                        let started = std::time::Instant::now();
+                        let out = Command::new(&b.exe).current_dir(&b.dir).output();
+                        let secs = started.elapsed().as_secs_f64();
+                        let why = match out {
+                            Ok(o) => {
+                                eprintln!(
+                                    "--- {label} ({secs:.1} s)\n{}{}",
+                                    String::from_utf8_lossy(&o.stdout),
+                                    String::from_utf8_lossy(&o.stderr)
+                                );
+                                (!o.status.success()).then(|| format!("{label}: {}", o.status))
+                            }
+                            Err(e) => Some(format!("{label}: could not start: {e}")),
+                        };
+                        if let Some(why) = why
+                            && let Ok(mut f) = failed.lock()
+                        {
+                            f.push(why);
+                        }
+                    }
+                });
+            if let Err(e) = spawned
+                && let Ok(mut f) = failed.lock()
+            {
+                f.push(format!("could not start a worker thread: {e}"));
+            }
+        }
+    });
+    failed.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
 /// One benchmark of this run.

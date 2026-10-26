@@ -12,7 +12,7 @@ mod vm_tools;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci [--fast] [--only <step>,...]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -66,10 +66,18 @@ fn main() -> ExitCode {
         // `--fast`: the PR gate (deterministic, ~2 min in CI). The steps
         // against a real kernel (`netns`) and `bench-check` run in the full
         // `ci`: locally, on the merge queue's batch and on the main.
-        "ci" if std::env::args().nth(2).is_some_and(|a| a == "--fast") => {
-            CI.iter().filter(|(name, _)| !SLOW.contains(name)).collect()
+        // `--only a,b`: those steps, in `CI` order (the GitHub workflow runs
+        // the full gate as parallel jobs, one group of steps each).
+        "ci" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            match ci_steps(&rest) {
+                Ok(steps) => steps,
+                Err(why) => {
+                    eprintln!("{why}\nusage: cargo xtask ci [--fast] [--only <step>[,<step>...]]");
+                    return ExitCode::from(2);
+                }
+            }
         }
-        "ci" => CI.iter().collect(),
         "ebpf" => {
             return match ebpf::refresh(&root) {
                 Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
@@ -168,6 +176,49 @@ fn main() -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// The steps `cargo xtask ci <args>` runs: all, `--fast` (without `SLOW`)
+/// or `--only <step>[,<step>...]` (in `CI` order; `--fast` then drops the
+/// slow ones).
+fn ci_steps(args: &[String]) -> Result<Vec<&'static Step>, String> {
+    let mut fast = false;
+    let mut only: Option<Vec<String>> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let list = match a.as_str() {
+            "--fast" => {
+                fast = true;
+                continue;
+            }
+            "--only" => it.next().ok_or("--only needs a list of steps")?.as_str(),
+            other => match other.strip_prefix("--only=") {
+                Some(list) => list,
+                None => return Err(format!("unknown argument '{other}'")),
+            },
+        };
+        let names: Vec<String> = list
+            .split(',')
+            .map(|n| n.trim().to_owned())
+            .filter(|n| !n.is_empty())
+            .collect();
+        if let Some(bad) = names.iter().find(|n| !CI.iter().any(|(c, _)| c == n)) {
+            let known: Vec<&str> = CI.iter().map(|(c, _)| *c).collect();
+            return Err(format!(
+                "unknown step '{bad}' (steps: {})",
+                known.join(", ")
+            ));
+        }
+        if names.is_empty() {
+            return Err("--only needs a list of steps".into());
+        }
+        only.get_or_insert_with(Vec::new).extend(names);
+    }
+    Ok(CI
+        .iter()
+        .filter(|(name, _)| only.as_ref().is_none_or(|o| o.iter().any(|n| n == name)))
+        .filter(|(name, _)| !fast || !SLOW.contains(name))
+        .collect())
 }
 
 /// The workspace this run is for: the nearest directory, from the current
@@ -635,6 +686,38 @@ fn wasm(root: &Path) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn names(args: &[&str]) -> Result<Vec<&'static str>, String> {
+        let args: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+        ci_steps(&args).map(|s| s.iter().map(|(n, _)| *n).collect())
+    }
+
+    #[test]
+    fn ci_steps_all_fast_and_only() {
+        assert_eq!(names(&[]).unwrap().len(), CI.len());
+        let fast = names(&["--fast"]).unwrap();
+        assert!(SLOW.iter().all(|s| !fast.contains(s)));
+        assert_eq!(fast.len(), CI.len() - SLOW.len());
+        // `CI` order, whatever the order asked.
+        assert_eq!(names(&["--only", "wasm,fmt"]).unwrap(), vec!["fmt", "wasm"]);
+        assert_eq!(names(&["--only=netns"]).unwrap(), vec!["netns"]);
+        assert_eq!(
+            names(&["--only", "test", "--only", "bench-check"]).unwrap(),
+            vec!["test", "bench-check"]
+        );
+        assert_eq!(
+            names(&["--fast", "--only", "test,netns"]).unwrap(),
+            vec!["test"]
+        );
+        assert!(
+            names(&["--only", "tset"])
+                .unwrap_err()
+                .contains("unknown step 'tset'")
+        );
+        assert!(names(&["--only"]).is_err());
+        assert!(names(&["--only", ","]).is_err());
+        assert!(names(&["--quick"]).is_err());
+    }
 
     #[test]
     fn netns_tests_are_found_not_listed() {

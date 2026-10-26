@@ -1,0 +1,125 @@
+# Preparação comum dos jobs Linux do `ci` (processo: o portão completo virou jobs paralelos).
+# Cada job chama esta action com o que precisa; o cache do rust-cache é por job (a chave padrão
+# inclui o id do job), então cada um guarda só o que compila.
+# Actions fixadas por SHA; o comentário diz a versão.
+
+name: setup
+description: Dependências de sistema, toolchain, cache do cargo e, se pedido, nextest e módulos do kernel
+
+inputs:
+  apt:
+    description: Instalar os pacotes de sistema (cabeçalhos da GUI e nftables)
+    default: "true"
+  cache:
+    description: Restaurar (e, na main, salvar) o cache do cargo
+    default: "true"
+  nextest:
+    description: Instalar o cargo-nextest
+    default: "false"
+  kernel:
+    description: Liberar user namespaces sem root e carregar os módulos do kernel (vrf e ci/kernel-modules)
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    # Cabeçalhos que eframe/winit/wgpu (x11, wayland, GL) pedem para compilar, e o nftables dos
+    # testes em namespace. Em cache: o `apt-get update` variava de 14 s a 114 s conforme o espelho.
+    - name: Dependências de sistema
+      if: inputs.apt == 'true'
+      uses: awalsh128/cache-apt-pkgs-action@553a35bb8ebd9fcabcb1c9451aa4c98e1b4ca8a9 # v1.6.3
+      with:
+        packages: >-
+          libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev
+          libx11-dev libxcursor-dev libxrandr-dev libxi-dev
+          libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev
+          libgl1-mesa-dev nftables
+        version: "1"
+
+    - name: Toolchain (rust-toolchain.toml)
+      shell: bash
+      run: |
+        rustup toolchain install --no-self-update
+        rustup show
+        # Sem o alvo, o passo wasm do xtask vira "skip" em vez de falhar.
+        rustup target list --installed | grep -qx wasm32-unknown-unknown
+
+    - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      if: inputs.cache == 'true'
+      with:
+        save-if: ${{ github.ref == 'refs/heads/main' }}
+
+    # O `cargo xtask ci` usa o nextest quando existe: os binários de teste rodam em paralelo.
+    - uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2.87.30
+      if: inputs.nextest == 'true'
+      with:
+        tool: cargo-nextest
+
+    # G1.2: `cargo xtask netns` testa o hal-linux num network namespace sem root.
+    # O Ubuntu 24.04 bloqueia user namespaces sem privilégio (AppArmor); isto só
+    # muda a VM descartável do runner. Se não pegar, o passo netns vira "skip".
+    - name: Liberar user namespaces sem root
+      if: inputs.kernel == 'true'
+      shell: bash
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+    # G1.14: um user namespace não carrega módulos; carregamos o `vrf` aqui, na
+    # VM descartável do runner (o sudo dos agentes, localmente, continua proibido).
+    # Imagens do Azure às vezes trazem o vrf.ko só em linux-modules-extra (51 MB), e o espelho
+    # chegou a 82 kB/s: 10 min só para baixar (bateria da fila, docs/perf.md). O vrf.ko fica no
+    # cache do Actions por versão do kernel; sem cache, o download tem teto de 2 min, e se
+    # estourar o CI segue sem o teste de VRF, com aviso, em vez de travar a fila.
+    - name: Versão do kernel
+      if: inputs.kernel == 'true'
+      id: kernel
+      shell: bash
+      run: echo "release=$(uname -r)" >> "$GITHUB_OUTPUT"
+
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      if: inputs.kernel == 'true'
+      with:
+        path: ~/vrf-ko
+        key: vrf-ko-${{ steps.kernel.outputs.release }}
+
+    - name: Carregar o módulo vrf
+      if: inputs.kernel == 'true'
+      shell: bash
+      run: |
+        # G1.14: com o módulo carregado, o teste de VRF em netns falha em vez de pular (e o
+        # passo netns do xtask também).
+        if sudo modprobe vrf; then
+          echo "COREROUTER_REQUIRE_VRF=1" >> "$GITHUB_ENV"
+          exit 0
+        fi
+        ko=$(find ~/vrf-ko -name 'vrf.ko*' -print -quit 2>/dev/null || true)
+        if [ -z "$ko" ]; then
+          pkg="linux-modules-extra-$(uname -r)"
+          mkdir -p ~/vrf-ko && cd "$RUNNER_TEMP"
+          sudo apt-get update -qq   # o cache de pacotes acima pula o update
+          if timeout 120 apt-get download "$pkg"; then
+            dpkg-deb --fsys-tarfile "$pkg"_*.deb | tar -x --wildcards '*/vrf.ko*'
+            find . -name 'vrf.ko*' -exec cp {} ~/vrf-ko/ \;
+            ko=$(find ~/vrf-ko -name 'vrf.ko*' -print -quit)
+          fi
+        fi
+        if [ -n "$ko" ] && sudo insmod "$ko"; then
+          lsmod | grep -w '^vrf'
+          echo "COREROUTER_REQUIRE_VRF=1" >> "$GITHUB_ENV"
+        else
+          echo "::warning::módulo vrf indisponível (sem cache e download lento); o teste de VRF em netns fica de fora deste run"
+          echo "COREROUTER_REQUIRE_VRF=0" >> "$GITHUB_ENV"
+        fi
+
+    # G1.8: o `bonding` vem no linux-modules base; um user namespace também não o carrega.
+    # Módulos simples (só `modprobe`): um arquivo por módulo em ci/kernel-modules/.
+    - name: Carregar os módulos do kernel
+      if: inputs.kernel == 'true'
+      shell: bash
+      run: |
+        for f in ci/kernel-modules/*; do
+          mod=$(basename "$f")
+          [ "$mod" = README.md ] && continue
+          sudo modprobe "$mod"
+          lsmod | grep -w "^$mod"
+          echo "$(head -n1 "$f")=1" >> "$GITHUB_ENV"
+        done
