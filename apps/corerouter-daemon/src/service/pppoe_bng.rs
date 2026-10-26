@@ -56,6 +56,10 @@ use ipnet::Ipv6Net;
 use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
 use super::pppoe_slow6::{self as slow6, Net6Index};
 
+/// G4.3h hot standby: publishing sessions, adopting them at a takeover.
+#[path = "pppoe_bng/ha.rs"]
+pub(crate) mod ha;
+
 /// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
 /// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
 pub(crate) const HISTORY: usize = 50_000;
@@ -1004,6 +1008,9 @@ struct Sub {
     want_routes: Vec<(FramedRoute, RouteOrigin)>,
     want_refused: Vec<String>,
     routes: Vec<(FramedRoute, RouteOrigin)>,
+    /// G4.3h: counters carried over from the other node of the pair
+    /// (rx bytes, tx bytes, rx packets, tx packets), under the data plane's.
+    base: [u64; 4],
 }
 
 /// What the hot paths look up in [`Bng::subs`] without walking it
@@ -1093,6 +1100,12 @@ pub(crate) struct Snapshot {
     pub forbidden: Arc<Forbidden>,
 }
 
+/// G4.3h: this node is the active one of its redundant pair (set by the
+/// daemon's `ppp-ha` service; false until it says so: a node that boots
+/// keeps quiet until the pair decides).
+pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) struct Bng {
     slots: Vec<Slot>,
     subs: HashMap<(usize, u16), Sub>,
@@ -1143,6 +1156,8 @@ pub(crate) struct Bng {
     pools6: Arc<Mutex<Pools6>>,
     /// IPv6 packets refused before reaching a session's control plane.
     v6_dropped: u64,
+    /// G4.3h: what this worker publishes to the pair, and its takeovers.
+    pub(crate) ha: ha::HaState,
 }
 
 /// One discovery or session frame's code and source, read before the
@@ -1379,6 +1394,7 @@ impl Bng {
             queued_total: 0,
             pools6: Arc::new(Mutex::new(Pools6::default())),
             v6_dropped: 0,
+            ha: ha::HaState::default(),
         }
     }
 
@@ -1544,6 +1560,10 @@ impl Bng {
             // (`Reply::Ipv6` before the verdict); identifiers stable per line.
             sc.ipv6 = true;
             sc.ipv6_iid_key = Some(self.cfg.iid_key.unwrap_or(self.seed));
+            // G4.3h: both nodes of a pair accept each other's AC-Cookie.
+            let ha = &self.cfg.ppp.redundancy;
+            sc.cookie_secret = (ha.enabled && !ha.secret.is_empty())
+                .then(|| corerouter_proto_ha::hello::derive("ac-cookie", ha.secret.as_bytes()));
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
@@ -1879,6 +1899,7 @@ impl Bng {
             .map(|(n, _)| *n)
             .collect();
         sub.v6 = Some(Box::new(x));
+        self.ha.dirty.insert((i, sref.sid));
         let fields = sub.v6.as_deref().map(active_v6);
         let id = session_id(i, &self.slots, sref.sid);
         self.slow_routes6((i, sref.sid), &nets, true);
@@ -2285,6 +2306,7 @@ impl Bng {
             want_routes: Vec::new(),
             want_refused: Vec::new(),
             routes: Vec::new(),
+            base: [0; 4],
         };
         self.index.add((i, sref.sid), &fresh);
         if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
@@ -2677,7 +2699,13 @@ impl Bng {
         let interface = slot.cfg.interface.to_string();
         let unix = self.cfg.unix_base + now / 1000;
         self.seq += 1;
-        let acct_id = format!("{:08X}{:04X}", unix as u32, self.seq as u16);
+        // RFC 2866 §5.5: unique per session. Each worker counts its own
+        // `seq`: the worker goes in the id too (before G4.3h two workers
+        // gave the same id in the same second, found by the HA lab).
+        let acct_id = format!(
+            "{:08X}{:02X}{:04X}",
+            unix as u32, self.lane as u8, self.seq as u16
+        );
         let xdp = if self.xdp { self.slot_index() } else { None };
         let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
             return;
@@ -2856,6 +2884,7 @@ impl Bng {
             });
         }
         self.hooks(&hooks, &user, ip, &mac, &interface);
+        self.ha_dirty((i, sref.sid));
         self.log(
             false,
             format!(
@@ -2928,6 +2957,11 @@ impl Bng {
 
     /// A session is gone: undo everything [`Bng::up`] did.
     fn ended(&mut self, now: Millis, sub: Sub, reason: DownReason, was_up: bool) {
+        self.ha_gone(&sub);
+        // G4.3h: handed to the pair's other node, the session goes on
+        // there: no Accounting-Stop (it would end it in the RADIUS server)
+        // and no on-down hooks.
+        let handed_over = self.ha.handed_over;
         let (mut key, mut hint, stage, mut cause) = explain(reason);
         if let Some((c, k)) = sub.cause {
             cause = c;
@@ -3006,7 +3040,8 @@ impl Bng {
         };
         let uptime = sub.up_at.map_or(0, |t| now.saturating_sub(t) / 1000);
         if was_up {
-            if (sub.radius || self.cfg.ppp.aaa.use_radius)
+            if !handed_over
+                && (sub.radius || self.cfg.ppp.aaa.use_radius)
                 && self.cfg.ppp.aaa.accounting
                 && let Some(aaa) = &self.cfg.aaa
             {
@@ -3044,8 +3079,10 @@ impl Bng {
                     comment: String::new(),
                 });
             }
-            let hooks = sub.effective.on_down.clone();
-            self.hooks(&hooks, &sub.user, sub.ip, &mac, &interface);
+            if !handed_over {
+                let hooks = sub.effective.on_down.clone();
+                self.hooks(&hooks, &sub.user, sub.ip, &mac, &interface);
+            }
         }
         let failed_stage = if was_up {
             Stage::Up
@@ -3196,6 +3233,8 @@ impl Bng {
             }
         }
         let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
+        // G4.3h: the counters for the pair's standby, in this same pass.
+        let ha_counters = self.ha_counters_due(now);
         {
             let mut sh = guard(&self.shared);
             for ((slot, sid), sub) in self.subs.iter_mut() {
@@ -3205,10 +3244,13 @@ impl Bng {
                     continue;
                 };
                 if let Some(c) = sub.xdp.and_then(|i| by_idx.get(&i)) {
-                    a.rx_bytes = c.up_bytes;
-                    a.rx_packets = c.up_packets;
-                    a.tx_bytes = c.down_bytes;
-                    a.tx_packets = c.down_packets;
+                    // G4.3h: plus what the session had on the node that
+                    // opened it (a takeover).
+                    let [rx, tx, rxp, txp] = sub.base;
+                    a.rx_bytes = rx + c.up_bytes;
+                    a.rx_packets = rxp + c.up_packets;
+                    a.tx_bytes = tx + c.down_bytes;
+                    a.tx_packets = txp + c.down_packets;
                     a.queue_us = c.down_queue_us;
                     a.drops = c.up_policed + c.down_policed;
                 }
@@ -3221,6 +3263,9 @@ impl Bng {
                     a.tx_bps = bps(a.tx_bytes, sub.prev.1);
                 }
                 sub.prev = (a.rx_bytes, a.tx_bytes, now);
+                if ha_counters {
+                    self.ha.counters((*slot, *sid), a);
+                }
                 if let (Some(l), Some(ip)) = (&sub.effective.address_list, sub.ip)
                     && now.saturating_sub(sub.list_at) >= LIST_REFRESH_MS
                 {
@@ -3350,6 +3395,7 @@ impl Bng {
             };
             if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
                 sub.rate = Some(rate.clone());
+                self.ha.dirty.insert((i, sref.sid));
                 if let Some(idx) = sub.xdp {
                     // CoA: the rate changes, the queue (its clock) stays.
                     let shape =
@@ -3376,6 +3422,9 @@ impl Bng {
     /// the families the CoA names are removed (traffic to a block kept by
     /// both never stops).
     fn change_routes(&mut self, id: &str, c: &RouteChange) {
+        if let Some((slot, sref)) = self.find(id) {
+            self.ha.dirty.insert((slot, sref.sid));
+        }
         let Some((i, sref)) = self.find(id) else {
             return;
         };
@@ -3457,6 +3506,33 @@ impl Bng {
         let (server, sid) = parse_session_id(id)?;
         let slot = self.slots.iter().position(|s| s.cfg.id.0 == server)?;
         self.subs.get(&(slot, sid)).map(|s| (s.slot, s.sref))
+    }
+
+    /// G4.3h: answer subscribers now — redundancy is off, or this node is
+    /// the active one of its pair ([`HA_ACTIVE`]).
+    pub(crate) fn serving(&self) -> bool {
+        !self.cfg.ppp.redundancy.enabled
+            || (HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && !self.ha_pending())
+    }
+
+    /// G4.3h: the pair's role went to the peer. Every session ends here
+    /// without a frame (the address back, the data plane cleaned, the
+    /// accounting Stop); the servers come back at the next configure, to
+    /// answer if the role returns.
+    pub(crate) fn abandon(&mut self, now: Millis) {
+        // Hot standby: the peer goes on with them (no Acct-Stop).
+        self.ha.handed_over = self.cfg.ppp.redundancy.enabled
+            && self.cfg.ppp.redundancy.mode == corerouter_model::ppp_redundancy::HaMode::HotStandby;
+        let mut i = self.slots.len();
+        while i > 0 {
+            i -= 1;
+            self.drop_slot(now, i);
+        }
+        self.ha.handed_over = false;
+        self.log(
+            false,
+            "PPPoE: o par assumiu; as sessões deste nó foram encerradas sem aviso ao CPE".into(),
+        );
     }
 
     /// End every session (service stopping): Terminate and PADT to each.
@@ -3580,30 +3656,6 @@ fn acct_attributes(ip: Option<Ipv4Addr>, mac: &str, sub: &Sub) -> Vec<Attribute>
     v
 }
 
-/// RFC 4679 §3 (TR-101): Agent-Circuit-Id and Agent-Remote-Id of the line,
-/// as the access node put them in the PADI (G4.3l).
-fn line_attributes(sub: &Sub) -> Vec<Attribute> {
-    let mut v = Vec::new();
-    if let Some(c) = &sub.circuit_id {
-        v.push(Attribute::new("ADSL-Agent-Circuit-Id", c.as_str()));
-    }
-    if let Some(r) = &sub.remote_id {
-        v.push(Attribute::new("ADSL-Agent-Remote-Id", r.as_str()));
-    }
-    v
-}
-
-/// NAS-Port-Id of a line without a circuit id: the port, and for a QinQ
-/// line `:<outer>-<inner>` (Junos' `ge-1/0/0:120-3044`), so RADIUS tells
-/// the lines apart (G4.3l). A single tag keeps the port alone, as before.
-fn nas_port(interface: &str, v: Vlans) -> String {
-    if v.inner != 0 {
-        format!("{interface}:{}-{}", v.outer, v.inner)
-    } else {
-        interface.to_owned()
-    }
-}
-
 /// G4.3cd: the routes of a session in the Accounting-Request (RFC 2866
 /// §5.13: the attributes of the Access-Accept may go along).
 fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
@@ -3637,6 +3689,30 @@ fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
             error: true,
             text: format!("PPP: rota {r}: IPv6 sem XDP"),
         },
+    }
+}
+
+/// RFC 4679 §3 (TR-101): Agent-Circuit-Id and Agent-Remote-Id of the line,
+/// as the access node put them in the PADI (G4.3l).
+fn line_attributes(sub: &Sub) -> Vec<Attribute> {
+    let mut v = Vec::new();
+    if let Some(c) = &sub.circuit_id {
+        v.push(Attribute::new("ADSL-Agent-Circuit-Id", c.as_str()));
+    }
+    if let Some(r) = &sub.remote_id {
+        v.push(Attribute::new("ADSL-Agent-Remote-Id", r.as_str()));
+    }
+    v
+}
+
+/// NAS-Port-Id of a line without a circuit id: the port, and for a QinQ
+/// line `:<outer>-<inner>` (Junos' `ge-1/0/0:120-3044`), so RADIUS tells
+/// the lines apart (G4.3l). A single tag keeps the port alone, as before.
+fn nas_port(interface: &str, v: Vlans) -> String {
+    if v.inner != 0 {
+        format!("{interface}:{}-{}", v.outer, v.inner)
+    } else {
+        interface.to_owned()
     }
 }
 

@@ -184,7 +184,9 @@ impl VirtualHal {
     /// resolved (the expected state of both whole configs was computed on
     /// every apply: 1000 routes cost ~120 µs per commit, **medido**).
     fn carry(&self, from: &Config, to: &Config) {
-        let ifaces = from.interfaces != to.interfaces;
+        // A comment never reaches the kernel (G0.22: `interface.set
+        // comment` with 10 000 routes recomputed them all).
+        let ifaces = corerouter_model::sections::interfaces_changed(from, to);
         let addrs = ifaces || from.ip.addresses != to.ip.addresses;
         let routes = from.ip.routes != to.ip.routes;
         if !addrs && !routes {
