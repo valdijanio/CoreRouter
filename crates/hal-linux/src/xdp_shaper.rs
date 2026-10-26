@@ -658,6 +658,18 @@ impl ShaperState {
         }
     }
 
+    /// G4.3cd's routed block `dst` of a session (MTU `mtu`) through `bng0`
+    /// too, so the kernel's path (shaped download, ICMP) reaches it.
+    pub(super) fn block(&mut self, dst: IpNet, mtu: u16, add: bool) -> Result<(), HalError> {
+        let Some(bng) = self.bng else {
+            return Ok(());
+        };
+        let mtu = if mtu == 0 { 1492 } else { mtu };
+        self.netlink()?
+            .route(bng, dst, mtu, add)
+            .map_err(|e| HalError::Rejected(format!("bng0: {e}")))
+    }
+
     pub(super) fn session_gone(&mut self, idx: u32) -> Result<(), HalError> {
         self.shapes.remove(&idx);
         self.set_routes(idx, Vec::new())

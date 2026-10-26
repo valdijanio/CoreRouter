@@ -1,0 +1,45 @@
+# G4.3h: long fuzzing runs of the HA sync codec, session record and access
+# hello with libFuzzer (`cargo +nightly fuzz run -s none <target>`). Outside
+# the workspace like proto-pppoe's: `cargo xtask ci` runs the same oracles
+# (`src/fuzz.rs`) as proptests in `tests/fuzz.rs`.
+[package]
+name = "corerouter-proto-ha-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+corerouter-proto-ha = { path = ".." }
+
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+panic = "unwind"
+
+[[bin]]
+name = "stream"
+path = "fuzz_targets/stream.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "record"
+path = "fuzz_targets/record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hello"
+path = "fuzz_targets/hello.rs"
+test = false
+doc = false
+bench = false

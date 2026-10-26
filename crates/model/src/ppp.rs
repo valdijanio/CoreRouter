@@ -131,6 +131,9 @@ pub struct Ppp {
     /// 0 = auto ([`pppoe_workers_auto`]). Read when the service starts.
     #[serde(default, skip_serializing_if = "is_zero16")]
     pub pppoe_workers: u16,
+    /// `/ppp redundancy` (G4.3h): the active/standby pair.
+    #[serde(default, skip_serializing_if = "crate::ppp_redundancy::Redundancy::is_default")]
+    pub redundancy: crate::ppp_redundancy::Redundancy,
 }
 
 fn is_zero16(v: &u16) -> bool {
@@ -477,6 +480,10 @@ pub struct PppSecret {
     pub limit_bytes_in: u64,
     #[serde(skip_serializing_if = "is_zero64")]
     pub limit_bytes_out: u64,
+    /// G4.3cd: blocks routed to the subscriber while it is up (RouterOS
+    /// `routes`, `dst-address gateway metric`; IPv4 and IPv6).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<crate::framed_route::FramedRoute>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub comment: String,
     pub disabled: bool,
@@ -594,9 +601,15 @@ pub struct PppoeServer {
     #[serde(default)]
     pub name: String,
     pub interface: IfName,
-    /// Empty: any Service-Name (and the empty one) is served.
+    /// RouterOS' single name (empty: any Service-Name, and the empty one,
+    /// is served). Read only while `services` is empty (a config from
+    /// before G4.3k); commands write `services` and clear it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service_name: String,
+    /// G4.3k: the Service-Name table (`crate::pppoe_services`). Empty: the
+    /// table `service_name` means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::pppoe_services::PppoeService>,
     #[serde(default = "mtu_default")]
     pub max_mtu: u16,
     #[serde(default = "mtu_default")]
@@ -719,6 +732,16 @@ impl PppoeServer {
             .max()
             .unwrap_or(0);
         self.pado_delay.saturating_add(tier).min(MAX_PADO_DELAY)
+    }
+
+    /// The Service-Name table in force: `services`, or the one RouterOS'
+    /// `service_name` means (G4.3k), with its `empty` and `any` rows last.
+    pub fn service_table(&self) -> Vec<crate::pppoe_services::PppoeService> {
+        if self.services.is_empty() {
+            crate::pppoe_services::from_service_name(&self.service_name)
+        } else {
+            self.services.clone()
+        }
     }
 
     pub fn vlan_allowed(&self, vid: Option<u16>) -> bool {
@@ -910,6 +933,10 @@ pub struct ActiveSession {
     pub id: String,
     pub name: String,
     pub service: String,
+    /// G4.3k: the Service-Name the subscriber asked for (`""`: the empty
+    /// one); `None` outside PPPoE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     /// The subscriber's MAC.
     pub caller_id: String,
     pub address: Option<Ipv4Addr>,
@@ -960,6 +987,13 @@ pub struct ActiveSession {
     /// Download packets dropped (shaper or policer) and upload ones over the
     /// policer.
     pub drops: u64,
+    /// G4.3cd: the blocks routed to this session and where each came from…
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<crate::framed_route::SessionRoute>,
+    /// …and the ones refused at login or by CoA, each with why
+    /// (Portuguese, for "Why?").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused_routes: Vec<String>,
 }
 
 /// One line of `ppp.history`: a login that came up, failed or ended.
@@ -989,6 +1023,12 @@ pub struct HistoryEntry {
     pub uptime_secs: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// G4.3cd, on `up`: the routes installed for the session…
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<crate::framed_route::SessionRoute>,
+    /// …and the ones refused, each with why (Portuguese, for "Why?").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused_routes: Vec<String>,
 }
 
 /// `ppp.why`: where the logins of a user or MAC get to, and why the last

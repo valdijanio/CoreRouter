@@ -230,7 +230,10 @@ fn pool_add(s: &mut Session, p: &Value) -> Result<Value> {
     let mut pl = Ipv6Pool { id: d.next_id(), name, prefix: prefix.trunc(), prefix_length: len, comment: String::new() };
     pool_apply(&mut pl, p)?;
     let id = pl.id;
-    d.pools.push(pl);
+    if let Some(why) = super::ppp_secret::routed_in(s, pl.prefix.network().into(), pl.prefix.broadcast().into()) {
+        return Err(EngineError::bad("prefix", why));
+    }
+    s.store_mut().candidate_mut().ipv6.dhcp_server.pools.push(pl);
     let warnings = verdict(s, "pools", id)?;
     Ok(json!({"id": id, "warnings": warnings}))
 }
@@ -251,7 +254,10 @@ fn pool_set(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::bad("name", "a server uses it by name"));
     }
     let id = pl.id;
-    if let Some(slot) = d.pools.get_mut(i) {
+    if let Some(why) = super::ppp_secret::routed_in(s, pl.prefix.network().into(), pl.prefix.broadcast().into()) {
+        return Err(EngineError::bad("prefix", why));
+    }
+    if let Some(slot) = s.store_mut().candidate_mut().ipv6.dhcp_server.pools.get_mut(i) {
         *slot = pl;
     }
     let warnings = verdict(s, "pools", id)?;

@@ -94,7 +94,11 @@ pub fn upstream<P: Packet + ?Sized, L: Sessions>(p: &P, ifindex: u32, l: &mut L,
     if dst != s.server_mac {
         return Up::NotPppoe;
     }
-    if !s.has(F_IPV4) || [s0, s1, s2, s3] != s.ipv4 {
+    // A host of a block routed to the subscriber (G4.3cd) sends through
+    // its router: same MAC, a source inside the block.
+    if (!s.has(F_IPV4) || [s0, s1, s2, s3] != s.ipv4)
+        && l.by_route_v4([s0, s1, s2, s3]) != Some(idx)
+    {
         return Up::Drop(Stat::Spoofed, Some(idx));
     }
     let len = u16::from_be_bytes([l0, l1]);

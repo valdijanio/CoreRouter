@@ -2086,3 +2086,307 @@ fn pppoe_kernel_delivery_through_bng0() {
     let route = sh(&["ip", "route", "show", "100.64.9.20"]);
     assert!(route.trim().is_empty(), "{route}");
 }
+
+// --- G4.3cd: blocks routed to subscribers, tagged uplink ----------------------
+
+/// G4.3cd: the IPv4 block and IPv6 block of session `i` (a /29 and a /56
+/// for i < 64 k: unique, outside the test sessions' own addresses).
+fn blocks_of(i: u32) -> (ipnet::IpNet, ipnet::IpNet) {
+    let v4 = ipnet::Ipv4Net::new(
+        std::net::Ipv4Addr::new(20, (i >> 5) as u8, ((i & 31) << 3) as u8, 0),
+        29,
+    )
+    .unwrap();
+    let v4 = ipnet::Ipv4Net::new(
+        std::net::Ipv4Addr::from(u32::from(v4.network()) + ((i >> 13) << 24)),
+        29,
+    )
+    .unwrap();
+    let v6 = ipnet::Ipv6Net::new(
+        std::net::Ipv6Addr::new(
+            0x2001,
+            0xdb8,
+            0xf000 | (i >> 8) as u16,
+            ((i & 0xff) << 8) as u16,
+            0,
+            0,
+            0,
+            0,
+        ),
+        56,
+    )
+    .unwrap();
+    (ipnet::IpNet::V4(v4.trunc()), ipnet::IpNet::V6(v6.trunc()))
+}
+
+fn host_frame(dst: Addr, uplink_tags: usize) -> Vec<u8> {
+    let src = match dst {
+        Addr::V4(_) => Addr::V4([198, 51, 100, 2]),
+        Addr::V6(_) => Addr::V6([0x2a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+    };
+    let f = with_checksums(build(&Spec {
+        vlans: vec![],
+        src,
+        dst,
+        proto: IPPROTO_UDP,
+        sport: 7,
+        dport: 5000,
+        flags: 0,
+        payload: 18,
+    }));
+    let mut g = f[..12].to_vec();
+    for t in 0..uplink_tags {
+        let tpid: u16 = if t == 0 && uplink_tags == 2 {
+            0x88a8
+        } else {
+            0x8100
+        };
+        g.extend(tpid.to_be_bytes());
+        g.extend((100 + t as u16).to_be_bytes());
+    }
+    g.extend(&f[12..]);
+    g
+}
+
+fn in_block(n: &ipnet::IpNet, host: u8) -> Addr {
+    match n {
+        ipnet::IpNet::V4(n) => {
+            Addr::V4((u32::from(n.network()) + u32::from(host % 8)).to_be_bytes())
+        }
+        ipnet::IpNet::V6(n) => {
+            let mut a = n.network().octets();
+            a[15] = host;
+            a[9] = host.wrapping_mul(7);
+            Addr::V6(a)
+        }
+    }
+}
+
+fn model_routes(subs: &mut Subs, i: u32) {
+    let (v4, v6) = blocks_of(i);
+    if let ipnet::IpNet::V4(n) = v4 {
+        subs.routes4
+            .push((n.network().octets(), u32::from(n.prefix_len()), i));
+    }
+    if let ipnet::IpNet::V6(n) = v6 {
+        subs.routes6
+            .push((n.network().octets(), u32::from(n.prefix_len()), i));
+    }
+}
+
+/// G4.3cd differential: frames to hosts of routed blocks (0–2 uplink tags,
+/// IPv4/IPv6, cut and corrupted), from hosts of the blocks (own and
+/// another subscriber's), through the kernel and the host model: the same
+/// action and the same bytes out.
+#[test]
+fn pppoe_routes_kernel_and_host_agree() {
+    if !enabled() {
+        return;
+    }
+    let _pair = Pair::new();
+    let mut x = XdpState::default();
+    x.set_pppoe(true).unwrap();
+    x.sync(&config(XdpMode::Generic, &[], &[])).unwrap();
+    let port = ifindex("xa");
+    let mut subs = Subs::default();
+    let n = 200u32;
+    let mut all = Vec::new();
+    for i in 0..n {
+        let mut flags = F_IPV4 | F_IPV6;
+        if i % 4 < 3 {
+            flags |= F_FAST_DOWN;
+        }
+        let s = test_session(i, port, (i % 3) as u8, flags);
+        x.pppoe_upsert(i, &s).unwrap();
+        subs.insert(i, &s, 0);
+        let (v4, v6) = blocks_of(i);
+        x.pppoe_route(v4, i, true).unwrap();
+        x.pppoe_route(v6, i, true).unwrap();
+        model_routes(&mut subs, i);
+        all.push(s);
+    }
+    let mut model = Model::default();
+    let (mut checked, mut by_action) = (0, std::collections::BTreeMap::<u32, u32>::new());
+    for k in 0..6000u32 {
+        let i = (k * 7) % n;
+        let s = &all[i as usize];
+        let (v4, v6) = blocks_of(i);
+        let block = if k % 2 == 0 { v4 } else { v6 };
+        let mut f = if k % 3 == 0 {
+            // Upstream from a host of a block: its own, or another's.
+            let owner = if k % 9 == 0 { (i + 1) % n } else { i };
+            let (o4, o6) = blocks_of(owner);
+            let src = in_block(if k % 2 == 0 { &o4 } else { &o6 }, (k % 250) as u8 + 1);
+            let dst = match src {
+                Addr::V4(_) => Addr::V4([198, 51, 100, 2]),
+                Addr::V6(_) => Addr::V6([0x2a, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2]),
+            };
+            let ip = with_checksums(build(&Spec {
+                vlans: vec![],
+                src,
+                dst,
+                proto: IPPROTO_UDP,
+                sport: 5000,
+                dport: 7,
+                flags: 0,
+                payload: 18,
+            }));
+            pppoe_frame(s, &ip, if k % 2 == 0 { PPP_IPV4 } else { PPP_IPV6 })
+        } else {
+            host_frame(in_block(&block, (k % 250) as u8 + 1), (k % 3) as usize)
+        };
+        match k % 13 {
+            1 => f.truncate(14 + (k as usize * 7) % f.len().max(15)),
+            2 => {
+                let at = 12 + (k as usize * 13) % (f.len() - 12);
+                f[at] ^= 1 << (k % 8);
+            }
+            3 => {
+                // TTL / hop limit 1 (after the tags): the kernel's.
+                let ip = 14 + 4 * (k % 3) as usize;
+                if f.len() > ip + 8 && f[12..14] != [0x88, 0x64] {
+                    if f[ip] >> 4 == 4 {
+                        f[ip + 8] = 1
+                    } else {
+                        f[ip + 7] = 1
+                    }
+                }
+            }
+            _ => {}
+        }
+        if f.len() < 14 {
+            continue;
+        }
+        let (act, _, out) = x.test_run_out(&f, 1, Some(port)).unwrap();
+        let (want, want_out, _, st) =
+            program_model(&f, port, &PPPOE_FILTER, &mut subs, &mut model, 0);
+        assert_eq!(
+            (act, &out),
+            (want, &want_out),
+            "frame {k} ({st:?}) {f:02x?}"
+        );
+        checked += 1;
+        *by_action.entry(act).or_default() += 1;
+    }
+    let stats = x.pppoe_stats();
+    println!(
+        "PPPoE routes: kernel and host agree on {checked} frames, by action {by_action:?}; stats {stats:?}"
+    );
+    assert!(checked > 5000);
+    assert!(
+        by_action.get(&XDP_REDIRECT).copied().unwrap_or(0) > 1000,
+        "{by_action:?}"
+    );
+    for st in ["down-routed", "down-tagged", "spoofed"] {
+        assert!(
+            stats.iter().any(|(n, c)| *n == st && *c > 0),
+            "{st}: {stats:?}"
+        );
+    }
+    // Removing a session takes its blocks out of the LPM.
+    x.pppoe_remove(0).unwrap();
+    let f = host_frame(in_block(&blocks_of(0).0, 3), 0);
+    assert_eq!(x.test_run_on(&f, 1, Some(port)).unwrap().0, XDP_PASS);
+    assert!(x.pppoe_routes().iter().all(|(_, i)| *i != 0));
+}
+
+/// G4.3cd, measured: 10 000 sessions with 1–4 routed blocks each (a /29,
+/// then a /56, a /30, a /48): time to install and remove the blocks, and
+/// ns per packet in the kernel to the subscriber's own address, to a host
+/// of its block, from a tagged uplink, and to nobody (the floor).
+#[test]
+fn perf_pppoe_routes_10k() {
+    if !enabled() {
+        return;
+    }
+    let _pair = Pair::new();
+    let mut x = XdpState::default();
+    x.set_pppoe(true).unwrap();
+    x.sync(&config(XdpMode::Generic, &[], &[])).unwrap();
+    let port = ifindex("xa");
+    let n = 10_000u32;
+    let session = |i: u32| {
+        let mut s = test_session(i, port, 1, F_IPV4 | F_IPV6 | F_FAST_DOWN);
+        s.ipv4 = [100, 64 + (i >> 16) as u8, (i >> 8) as u8, i as u8];
+        s
+    };
+    for i in 0..n {
+        x.pppoe_upsert(i, &session(i)).unwrap();
+    }
+    let extra = |i: u32, k: u32| -> ipnet::IpNet {
+        match k {
+            2 => format!("21.{}.{}.0/30", i >> 8, i & 0xff).parse().unwrap(),
+            _ => format!("2001:db8:e{:03x}:{:x}00::/48", i >> 8, i & 0xff)
+                .parse::<ipnet::IpNet>()
+                .map(|n| n.trunc())
+                .unwrap(),
+        }
+    };
+    let mut routes = Vec::new();
+    for i in 0..n {
+        let (v4, v6) = blocks_of(i);
+        let k = 1 + i % 4;
+        routes.push((v4, i));
+        if k >= 2 {
+            routes.push((v6, i));
+        }
+        if k >= 3 {
+            routes.push((extra(i, 2), i));
+        }
+        if k >= 4 {
+            routes.push((extra(i, 3), i));
+        }
+    }
+    let t = Instant::now();
+    for (d, i) in &routes {
+        x.pppoe_route(*d, *i, true).unwrap();
+    }
+    let add = t.elapsed();
+    println!(
+        "PERF | pppoe routes | install | {} blocks for {n} sessions | {} ms | {:.2} µs/block",
+        routes.len(),
+        add.as_millis(),
+        add.as_secs_f64() * 1e6 / routes.len() as f64
+    );
+    let mean_ns = |x: &mut XdpState, f: &[u8], want: u32| -> u128 {
+        let runs = 20_000u32;
+        let mut total = 0u128;
+        for _ in 0..runs {
+            let (act, d) = x.test_run_on(f, 1, Some(port)).unwrap();
+            assert_eq!(act, want, "{f:02x?}");
+            total += d.as_nanos();
+        }
+        total / u128::from(runs)
+    };
+    for i in [7u32, 4_242, n - 1] {
+        let s = session(i);
+        let (v4, v6) = blocks_of(i);
+        let floor = mean_ns(&mut x, &host_frame(Addr::V4([203, 0, 113, 9]), 0), XDP_PASS);
+        let own = mean_ns(&mut x, &host_frame(Addr::V4(s.ipv4), 0), XDP_REDIRECT);
+        let routed = mean_ns(&mut x, &host_frame(in_block(&v4, 3), 0), XDP_REDIRECT);
+        let routed6 = mean_ns(&mut x, &host_frame(in_block(&v6, 3), 0), XDP_REDIRECT);
+        let tagged = mean_ns(&mut x, &host_frame(in_block(&v4, 3), 1), XDP_REDIRECT);
+        let qinq = mean_ns(&mut x, &host_frame(in_block(&v4, 3), 2), XDP_REDIRECT);
+        println!(
+            "PERF | pppoe routes | session {i} | {} blocks | single runs: pass (floor) {floor} ns | own /32 {own} ns | routed /29 {routed} ns | routed /56 {routed6} ns | routed, 1 uplink tag {tagged} ns | 2 tags {qinq} ns",
+            routes.len()
+        );
+    }
+    let t = Instant::now();
+    for (d, i) in &routes {
+        x.pppoe_route(*d, *i, false).unwrap();
+    }
+    println!(
+        "PERF | pppoe routes | remove | {} blocks | {} ms",
+        routes.len(),
+        t.elapsed().as_millis()
+    );
+    assert!(x.pppoe_routes().is_empty());
+    assert_eq!(
+        x.test_run_on(&host_frame(in_block(&blocks_of(7).0, 3), 0), 1, Some(port))
+            .unwrap()
+            .0,
+        XDP_PASS,
+        "no blackhole: the block is gone"
+    );
+}

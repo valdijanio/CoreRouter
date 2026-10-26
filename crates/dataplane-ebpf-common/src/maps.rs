@@ -29,6 +29,8 @@
 //! | `Q_COUNT` | array | queue index × 2 + direction | [`crate::queue::Counts`] |
 //! | `Q_PCQ` | LRU hash | [`crate::queue::pcq_key`] | [`crate::shaper::SubState`] |
 //! | `SHAPE_STATS` | per-CPU array | [`crate::queue::Stat`] | packets `u64` |
+//! | `PPPOE_RT4` | LPM trie | IPv4 block routed to a subscriber | session index (G4.3cd) |
+//! | `PPPOE_RT6` | LPM trie | IPv6 block routed to a subscriber | session index (G4.3cd) |
 
 use crate::filter::Reason;
 
@@ -68,6 +70,8 @@ pub const Q_SIZED: [&str; 3] = [Q_CONF, Q_STATE, Q_COUNT];
 pub const SHAPE_EGRESS: &str = "shape_egress";
 pub const SHAPE_INGRESS: &str = "shape_ingress";
 pub const BNG_EGRESS: &str = "bng_egress";
+pub const PPPOE_RT4: &str = "PPPOE_RT4";
+pub const PPPOE_RT6: &str = "PPPOE_RT6";
 /// The PPPoE maps sized by the session count (1 entry while PPPoE is off).
 pub const PPPOE_SIZED: [&str; 4] = [PPPOE_KEYS, PPPOE_SESSIONS, PPPOE_V4, PPPOE_COUNTERS];
 /// The XDP program's name in the object.

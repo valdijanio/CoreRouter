@@ -23,6 +23,7 @@ use corerouter_dataplane_ebpf_common::pppoe::{
     SessionWords, Stat,
 };
 use corerouter_hal::HalError;
+use ipnet::IpNet;
 
 use super::{XdpState, monotonic_ns, rejected};
 
@@ -31,6 +32,14 @@ use super::{XdpState, monotonic_ns, rejected};
 pub(super) struct PppoeState {
     pub on: bool,
     sessions: BTreeMap<u32, Session>,
+    /// G4.3cd: blocks routed to sessions (`PPPOE_RT4`/`PPPOE_RT6`), and
+    /// how many are IPv4 (the ceiling is per family; counting them at
+    /// each add made 25 000 adds take 11 s, **medido**).
+    routes: BTreeMap<IpNet, u32>,
+    routes_v4: usize,
+    /// The blocks of each session index (a session's remove or a new
+    /// subscriber at its index drops them without a walk of every block).
+    routes_of: BTreeMap<u32, Vec<IpNet>>,
     /// IPoE access ports (G4.3f, `IPOE_PORTS`): IPoE is on when any.
     pub ipoe_ports: std::collections::BTreeSet<u32>,
 }
@@ -234,7 +243,8 @@ fn clear(ebpf: &mut Ebpf, idx: u32, old: &Session) -> Result<(), HalError> {
         .map_err(map_err("PPPOE_SESSIONS clear"))
 }
 
-/// After a load: every known session back into the fresh maps.
+/// After a load: every known session back into the fresh maps, then the
+/// blocks routed to them.
 pub(super) fn refill(ebpf: &mut Ebpf, st: &PppoeState) -> Result<(), HalError> {
     if !st.maps() {
         return Ok(());
@@ -242,7 +252,56 @@ pub(super) fn refill(ebpf: &mut Ebpf, st: &PppoeState) -> Result<(), HalError> {
     for (idx, s) in &st.sessions {
         put(ebpf, *idx, s, true)?;
     }
+    for (dst, idx) in &st.routes {
+        route(ebpf, dst, Some(*idx))?;
+    }
     Ok(())
+}
+
+/// Forget `dst` among the blocks of session `idx`.
+fn drop_owned(of: &mut BTreeMap<u32, Vec<IpNet>>, idx: u32, dst: &IpNet) {
+    if let Some(v) = of.get_mut(&idx) {
+        v.retain(|d| d != dst);
+        if v.is_empty() {
+            of.remove(&idx);
+        }
+    }
+}
+
+/// Point block `dst` at session `idx` (`None`: remove it) in
+/// `PPPOE_RT4`/`PPPOE_RT6`.
+fn route(ebpf: &mut Ebpf, dst: &IpNet, idx: Option<u32>) -> Result<(), HalError> {
+    let len = u32::from(dst.prefix_len());
+    match (dst, idx) {
+        (IpNet::V4(n), Some(i)) => {
+            LpmTrie::<_, [u8; 4], u32>::try_from(the_map(ebpf, m::PPPOE_RT4)?)
+                .map_err(map_err("PPPOE_RT4 map"))?
+                .insert(&Key::new(len, n.network().octets()), i, 0)
+                .map_err(map_err("PPPOE_RT4 insert"))
+        }
+        (IpNet::V4(n), None) => {
+            let mut t = LpmTrie::<_, [u8; 4], u32>::try_from(the_map(ebpf, m::PPPOE_RT4)?)
+                .map_err(map_err("PPPOE_RT4 map"))?;
+            match t.remove(&Key::new(len, n.network().octets())) {
+                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+                Err(e) => Err(map_err("PPPOE_RT4 remove")(e)),
+            }
+        }
+        (IpNet::V6(n), Some(i)) => {
+            LpmTrie::<_, [u8; 16], u32>::try_from(the_map(ebpf, m::PPPOE_RT6)?)
+                .map_err(map_err("PPPOE_RT6 map"))?
+                .insert(&Key::new(len, n.network().octets()), i, 0)
+                .map_err(map_err("PPPOE_RT6 insert"))
+        }
+        (IpNet::V6(n), None) => {
+            let mut t = LpmTrie::<_, [u8; 16], u32>::try_from(the_map(ebpf, m::PPPOE_RT6)?)
+                .map_err(map_err("PPPOE_RT6 map"))?;
+            match t.remove(&Key::new(len, n.network().octets())) {
+                Ok(()) | Err(aya::maps::MapError::KeyNotFound) => Ok(()),
+                Err(e) => Err(map_err("PPPOE_RT6 remove")(e)),
+            }
+        }
+    }
 }
 
 /// `IPOE_PORTS` as `st` says (≤ `ipoe::PORTS_MAX` entries).
@@ -325,6 +384,11 @@ impl XdpState {
         }
         let old = self.pppoe.sessions.get(&idx).copied();
         let fresh = old.is_none_or(|o| o.key() != s.key());
+        if fresh {
+            // Another subscriber at this index: blocks left for the old one
+            // must not reach the new one.
+            self.pppoe_unroute(idx)?;
+        }
         if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.maps()) {
             if let Some(o) = &old {
                 drop_keys(&mut l.ebpf, idx, o)?;
@@ -335,9 +399,90 @@ impl XdpState {
         Ok(())
     }
 
-    /// Remove session `idx` (nothing if unknown): its keys, its words, its
-    /// routes through `bng0`.
+    /// G4.3cd: route block `dst` to session `idx` (it must be known), or
+    /// stop routing it (`add` false; nothing if unknown). An LPM entry per
+    /// block; blocks never overlap (the daemon's `FramedTable`).
+    pub fn pppoe_route(&mut self, dst: IpNet, idx: u32, add: bool) -> Result<(), HalError> {
+        let dst = dst.trunc();
+        if add {
+            if !self.pppoe.sessions.contains_key(&idx) {
+                return Err(HalError::Rejected(format!(
+                    "PPPoE: route {dst}: no session {idx}"
+                )));
+            }
+            let v4 = dst.addr().is_ipv4();
+            let cap = if v4 {
+                pppoe::ROUTES_V4
+            } else {
+                pppoe::ROUTES_V6
+            };
+            let same_family = if v4 {
+                self.pppoe.routes_v4
+            } else {
+                self.pppoe.routes.len() - self.pppoe.routes_v4
+            };
+            if !self.pppoe.routes.contains_key(&dst) && same_family >= cap as usize {
+                return Err(HalError::Rejected(format!(
+                    "PPPoE: route {dst}: at most {cap} routed blocks"
+                )));
+            }
+        } else if self.pppoe.routes.get(&dst) != Some(&idx) {
+            return Ok(());
+        }
+        if let Some(l) = self.loaded.as_mut().filter(|_| self.pppoe.maps()) {
+            route(&mut l.ebpf, &dst, add.then_some(idx))?;
+        }
+        // The kernel's path to the block (G4.3ca): through bng0, PPPoE only.
+        if let Some(s) = self.pppoe.sessions.get(&idx).filter(|s| s.flags & F_IPOE == 0) {
+            let mtu = s.mtu;
+            if let Err(e) = self.shaper.block(dst, mtu, add) {
+                log::warn!("PPPoE: {e}");
+            }
+        }
+        let changed = if add {
+            let old = self.pppoe.routes.insert(dst, idx);
+            if let Some(o) = old.filter(|o| *o != idx) {
+                drop_owned(&mut self.pppoe.routes_of, o, &dst);
+            }
+            if old != Some(idx) {
+                self.pppoe.routes_of.entry(idx).or_default().push(dst);
+            }
+            old.is_none()
+        } else {
+            let gone = self.pppoe.routes.remove(&dst).is_some();
+            if gone {
+                drop_owned(&mut self.pppoe.routes_of, idx, &dst);
+            }
+            gone
+        };
+        if changed && dst.addr().is_ipv4() {
+            if add {
+                self.pppoe.routes_v4 += 1;
+            } else {
+                self.pppoe.routes_v4 = self.pppoe.routes_v4.saturating_sub(1);
+            }
+        }
+        Ok(())
+    }
+
+    /// Blocks routed now (`dst`, session index).
+    pub fn pppoe_routes(&self) -> Vec<(IpNet, u32)> {
+        self.pppoe.routes.iter().map(|(d, i)| (*d, *i)).collect()
+    }
+
+    /// Every block routed to session `idx` goes.
+    fn pppoe_unroute(&mut self, idx: u32) -> Result<(), HalError> {
+        let mine = self.pppoe.routes_of.get(&idx).cloned().unwrap_or_default();
+        for d in mine {
+            self.pppoe_route(d, idx, false)?;
+        }
+        Ok(())
+    }
+
+    /// Remove session `idx` (nothing if unknown), the blocks routed to it
+    /// and its routes through `bng0`.
     pub fn pppoe_remove(&mut self, idx: u32) -> Result<(), HalError> {
+        self.pppoe_unroute(idx)?;
         let Some(old) = self.pppoe.sessions.remove(&idx) else {
             return Ok(());
         };
@@ -482,6 +627,9 @@ impl XdpState {
             match op {
                 corerouter_hal::pppoe::PppoeOp::Upsert(idx, s) => self.pppoe_upsert_hal(*idx, s)?,
                 corerouter_hal::pppoe::PppoeOp::Remove(idx) => self.pppoe_remove(*idx)?,
+                corerouter_hal::pppoe::PppoeOp::Route { dst, idx, add } => {
+                    self.pppoe_route(*dst, *idx, *add)?
+                }
             }
         }
         Ok(())
@@ -580,6 +728,19 @@ mod tests {
             assert!(x.pppoe_upsert(6, &bad).is_err(), "{bad:?}");
         }
         assert!(x.pppoe_upsert(SESSIONS_MAX, &sess()).is_err());
+        // G4.3cd: blocks follow their session (offline bookkeeping).
+        let n: IpNet = "203.0.113.8/29".parse().unwrap();
+        assert!(x.pppoe_route(n, 9, true).is_err(), "no session 9");
+        x.pppoe_route(n, 5, true).unwrap();
+        x.pppoe_route("2001:db8:100::/48".parse().unwrap(), 5, true)
+            .unwrap();
+        assert_eq!(x.pppoe_routes().len(), 2);
+        // Another subscriber at index 5: the blocks do not follow.
+        x.pppoe_upsert(5, &Session { sid: 77, ..sess() }).unwrap();
+        assert!(x.pppoe_routes().is_empty());
+        x.pppoe_route(n, 5, true).unwrap();
+        x.pppoe_route(n, 6, false).unwrap();
+        assert_eq!(x.pppoe_routes(), vec![(n, 5)]);
         x.pppoe_remove(5).unwrap();
         x.pppoe_remove(5).unwrap();
         assert_eq!(x.pppoe_sessions(), 0);
@@ -628,6 +789,8 @@ mod tests {
             m::PPPOE_COUNTERS,
             m::PPPOE_STATS,
             m::IPOE_PORTS,
+            m::PPPOE_RT4,
+            m::PPPOE_RT6,
         ] {
             assert!(obj.maps.contains_key(name), "map {name}");
         }

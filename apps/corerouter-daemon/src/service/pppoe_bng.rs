@@ -19,15 +19,18 @@ use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder};
 use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
 use corerouter_model::MacAddr;
+use corerouter_model::framed_route::{FramedRoute, RouteOrigin};
 use corerouter_model::ip_pool::IpPools;
 use corerouter_model::ppp::{
-    ActiveSession, AddrOrPool, Effective, HistoryEntry, Ppp, PppAuth, PppHook, PppService,
-    PppoeServer, ServiceStats, Stage, Why,
+    ActiveSession, AddrOrPool, DEFAULT_PROFILE, Effective, HistoryEntry, Ppp, PppAuth, PppHook,
+    PppService, PppoeServer, ServiceStats, Stage, Why,
 };
+use corerouter_model::pppoe_services::{PppoeService, ServiceAction, ServiceName};
 use corerouter_model::radius::{
     AaaService, AcctCounters, AcctRequest, AcctStatus, Attribute, AuthOutcome, AuthReply,
     AuthRequest as RadiusRequest, CoaKind, CoaOutcome, CoaRequest, Credentials,
@@ -39,7 +42,8 @@ use corerouter_proto_pppoe::lcp::AuthProto;
 use corerouter_proto_pppoe::ppp::{self as wire_ppp, proto};
 use corerouter_proto_pppoe::server::{
     AuthMethod, AuthVerdict, Authorization, DownReason, Event, Ipv4Assignment, Ipv6Mode, Server,
-    ServerConfig, ServerOutput, SessionRef, VlanFilter,
+    ServerConfig, ServerOutput, ServiceAction as ProtoAction, ServiceRule, ServiceTable,
+    SessionRef, VlanFilter,
 };
 use corerouter_proto_pppoe::timer::Millis;
 use corerouter_proto_pppoe::wire::Mac;
@@ -76,6 +80,8 @@ pub(crate) enum Effect {
     Xdp(PppoeOp),
     /// The slow path's /32 route to `bng0` (no XDP).
     Route { ip: Ipv4Addr, add: bool },
+    /// G4.3cd: a block routed to a subscriber through `bng0` (no XDP).
+    Block { dst: ipnet::Ipv4Net, add: bool },
     /// Engine commands (hooks, address lists), run under the session lock.
     Run {
         command: String,
@@ -140,6 +146,24 @@ pub(crate) struct Shared {
     by_acct: HashMap<String, String>,
     /// What each worker counts on its own (summed by [`Backend::stats`]).
     lanes: Vec<LaneStats>,
+    /// G4.3cd: CoA route changes (session id, the new routes), checked
+    /// already by [`Owner::handle`].
+    pub route_changes: Vec<(String, RouteChange)>,
+    /// What the CoA check needs: who holds which block, and the space no
+    /// subscriber may take (set by the workers with the config).
+    pub framed: FramedTable,
+    pub forbidden: Arc<Forbidden>,
+}
+
+/// The routes a CoA gives a session: each family present replaces all the
+/// session's routes of that family (`Framed-Route ""`: none).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) struct RouteChange {
+    pub v4: bool,
+    pub v6: bool,
+    pub routes: Vec<(FramedRoute, RouteOrigin)>,
+    /// Texts that did not parse: the whole change is refused.
+    pub invalid: Vec<String>,
 }
 
 /// One worker's share of the service counters.
@@ -491,11 +515,25 @@ impl SessionOwner for Owner {
                     .find(|a| a.name == "Mikrotik-Address-List")
                     .map(|a| a.value.clone());
                 let new_ip = req.changes.iter().any(|a| a.name == "Framed-IP-Address");
+                let change = route_change(&req.changes);
+                if let Some(c) = &change
+                    && !new_ip
+                {
+                    // RFC 5176 §3.5: the whole request or nothing, so the
+                    // routes are checked here, before the ACK.
+                    for h in &hits {
+                        let ip = sh.active.get(h).and_then(|a| a.address);
+                        if let Err(why) = check_change(&sh, h, ip, c) {
+                            log::info!("ppp: CoA de rotas recusado: {why}");
+                            return CoaOutcome::Nak(407); // Invalid Attribute Value
+                        }
+                    }
+                }
                 if new_ip {
                     // PPP cannot move an open IPCP to a new address: the
                     // subscriber reconnects and gets it.
                     sh.terminate.extend(hits);
-                } else if rate.is_some() || list.is_some() {
+                } else if rate.is_some() || list.is_some() || change.is_some() {
                     let bad_list = list.as_deref().is_some_and(|l| {
                         !l.is_empty() && l.parse::<corerouter_model::firewall::Name>().is_err()
                     });
@@ -507,6 +545,9 @@ impl SessionOwner for Owner {
                         return CoaOutcome::Nak(407); // Invalid Attribute Value
                     }
                     for h in hits {
+                        if let Some(c) = &change {
+                            sh.route_changes.push((h.clone(), c.clone()));
+                        }
                         if let Some(r) = &rate {
                             sh.rates.push((h.clone(), r.clone()));
                         }
@@ -890,6 +931,23 @@ struct Slot {
     port: PortInfo,
     server: Server,
     bucket: Bucket,
+    /// `cfg.service_table()`, kept (looked up at every login, G4.3k).
+    services: Vec<PppoeService>,
+}
+
+impl Slot {
+    /// The profile of the row a session asking for `name` lands on, if the
+    /// row names one (G4.3k).
+    fn profile_for(&self, name: &[u8]) -> Option<String> {
+        let row = |want: &ServiceName| self.services.iter().find(|r| r.name == *want);
+        let named = std::str::from_utf8(name).ok().filter(|n| !n.is_empty());
+        let hit = match named {
+            Some(n) => row(&ServiceName::Name(n.to_owned())).or_else(|| row(&ServiceName::Any)),
+            None if name.is_empty() => row(&ServiceName::Empty),
+            None => row(&ServiceName::Any),
+        };
+        hit.and_then(|r| r.profile.clone())
+    }
 }
 
 /// A session the BNG knows (from PADR to its Down).
@@ -927,11 +985,20 @@ struct Sub {
     auth_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     circuit_id: Option<String>,
     remote_id: Option<String>,
+    /// G4.3k: the Service-Name asked for and the profile its row gives
+    /// (in `default_profile`'s place).
+    service_name: String,
+    fallback_profile: String,
     mtu: u16,
     /// G4.3e: what RADIUS said about IPv6, and the session's IPv6 once
     /// IPv6CP is up.
     radius6: RadiusV6,
     v6: Option<Box<V6>>,
+    /// G4.3cd: the routes the secret or RADIUS gave (installed at Up), the
+    /// RADIUS texts already refused, and the routes installed.
+    want_routes: Vec<(FramedRoute, RouteOrigin)>,
+    want_refused: Vec<String>,
+    routes: Vec<(FramedRoute, RouteOrigin)>,
 }
 
 /// What the hot paths look up in [`Bng::subs`] without walking it
@@ -1015,6 +1082,10 @@ pub(crate) struct Snapshot {
     pub iid_key: Option<[u8; 32]>,
     /// G4.9b: `/queue type`s, for the profiles' download queue.
     pub queues: corerouter_model::queue::Queues,
+    /// G4.3cd: who holds each routed block (the router's, shared with
+    /// IPoE and the commands) and the space no route may take.
+    pub framed: FramedTable,
+    pub forbidden: Arc<Forbidden>,
 }
 
 pub(crate) struct Bng {
@@ -1099,11 +1170,7 @@ pub(crate) fn server_config(
     let mut c = ServerConfig {
         ac_mac: Mac(mac),
         ac_name: b"CoreRouter".to_vec(),
-        service_names: if v.service_name.is_empty() {
-            Vec::new()
-        } else {
-            vec![v.service_name.as_bytes().to_vec()]
-        },
+        services: service_table(&v.service_table()),
         one_session_per_host: v.one_session_per_host,
         auth: auth_set(&v.authentication),
         max_mru: v.max_mru,
@@ -1144,6 +1211,34 @@ pub(crate) fn server_config(
         VlanFilter::Ranges(r)
     };
     c
+}
+
+/// `proto-pppoe`'s Service-Name table of a server's rows (G4.3k).
+pub(crate) fn service_table(rows: &[PppoeService]) -> ServiceTable {
+    let rule = |r: &PppoeService| ServiceRule {
+        action: match r.action {
+            ServiceAction::Terminate => ProtoAction::Terminate,
+            ServiceAction::Delay => ProtoAction::Delay,
+            ServiceAction::Drop => ProtoAction::Drop,
+        },
+        delay_ms: r.pado_delay,
+        max_sessions: r.max_sessions,
+        padi_limit: r.padi_limit,
+    };
+    let find = |n: &ServiceName| {
+        rows.iter()
+            .find(|r| r.name == *n)
+            .map(rule)
+            .unwrap_or_default()
+    };
+    ServiceTable::new(
+        rows.iter().filter_map(|r| match &r.name {
+            ServiceName::Name(n) => Some((n.as_bytes().to_vec(), rule(r))),
+            _ => None,
+        }),
+        find(&ServiceName::Empty),
+        find(&ServiceName::Any),
+    )
 }
 
 /// The VLAN ids a server listens on (for the driver's sockets).
@@ -1342,13 +1437,17 @@ impl Bng {
         ports: &HashMap<String, PortInfo>,
     ) {
         let wanted = Self::wanted(&snap.ppp);
+        {
+            let mut sh = guard(&self.shared);
+            sh.framed = snap.framed.clone();
+            sh.forbidden = snap.forbidden.clone();
+        }
         self.cfg = snap;
         // Servers gone or restarted: end their sessions.
         let mut keep: Vec<bool> = Vec::with_capacity(self.slots.len());
         for s in &self.slots {
             let same = wanted.iter().find(|w| w.id == s.cfg.id).is_some_and(|w| {
                 w.interface == s.cfg.interface
-                    && w.service_name == s.cfg.service_name
                     && w.pppoe_over_vlan_range == s.cfg.pppoe_over_vlan_range
                     && w.accept_untagged == s.cfg.accept_untagged
                     && ports.get(&w.name) == Some(&s.port)
@@ -1385,6 +1484,23 @@ impl Bng {
             if sc.padi_limit > 0 {
                 sc.padi_limit = sc.padi_limit.div_ceil(lanes);
             }
+            // The Service-Name rows' limits too (G4.3k): the MACs spread
+            // evenly over the workers.
+            let rows = w.service_table();
+            let mut named: Vec<(Vec<u8>, ServiceRule)> =
+                sc.services.named().map(|(n, r)| (n.to_vec(), *r)).collect();
+            let split = |r: &mut ServiceRule| {
+                for v in [&mut r.max_sessions, &mut r.padi_limit] {
+                    if *v > 0 {
+                        *v = v.div_ceil(lanes);
+                    }
+                }
+            };
+            named.iter_mut().for_each(|(_, r)| split(r));
+            let (mut empty, mut any) = (sc.services.empty, sc.services.any);
+            split(&mut empty);
+            split(&mut any);
+            sc.services = ServiceTable::new(named, empty, any);
             for t in &mut sc.pado_delay {
                 t.0 = t.0.div_ceil(lanes);
             }
@@ -1395,6 +1511,7 @@ impl Bng {
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
+                    s.services = rows;
                     if w.new_session_rate_auto {
                         // The tick moves it; switching to auto keeps the
                         // tokens.
@@ -1427,6 +1544,7 @@ impl Bng {
                         server: Server::new(sc, seed, now),
                         port,
                         cfg: w,
+                        services: rows,
                     });
                     if self.lane == 0 {
                         self.log(
@@ -1589,10 +1707,16 @@ impl Bng {
                 b.get(3).copied().unwrap_or(0),
             )
         });
-        if src.is_none() || src != sub.ip {
+        let id = session_id(slot, &self.slots, f.session_id);
+        // A host of a block routed to the subscriber (G4.3cd) may send.
+        if src.is_none()
+            || (src != sub.ip
+                && src
+                    .and_then(|s| self.cfg.framed.holder_of(std::net::IpAddr::V4(s)))
+                    .is_none_or(|(_, h)| h.session != id))
+        {
             return;
         }
-        let id = session_id(slot, &self.slots, f.session_id);
         let len = f.info.len() as u64;
         if let Some(a) = guard(&self.shared).active.get_mut(&id) {
             a.rx_bytes += len;
@@ -1819,12 +1943,12 @@ impl Bng {
             dst.get(2).copied().unwrap_or(0),
             dst.get(3).copied().unwrap_or(0),
         );
-        let Some(((slot, sid), sub)) = self
-            .index
-            .by_ip
-            .get(&dst)
-            .and_then(|k| self.subs.get_key_value(k))
-        else {
+        // The subscriber's address, else a block routed to it (G4.3cd).
+        let key = self.index.by_ip.get(&dst).copied().or_else(|| {
+            let (_, h) = self.cfg.framed.holder_of(std::net::IpAddr::V4(dst))?;
+            self.find(&h.session).map(|(i, sref)| (i, sref.sid))
+        });
+        let Some(((slot, sid), sub)) = key.and_then(|k| self.subs.get_key_value(&k)) else {
             return;
         };
         let Some(port) = self.slots.get(*slot).map(|s| s.port) else {
@@ -1995,7 +2119,13 @@ impl Bng {
         let Some(slot) = self.slots.get(i) else {
             return;
         };
-        let default_profile = slot.cfg.default_profile.clone();
+        // G4.3k: the row's profile takes `default_profile`'s place, and
+        // that of a secret left on the built-in `default`.
+        let row_profile = slot.profile_for(&req.service);
+        let default_profile = row_profile
+            .clone()
+            .unwrap_or_else(|| slot.cfg.default_profile.clone());
+        let service_name = String::from_utf8_lossy(&req.service).into_owned();
         let vlan = (req.vlans.outer != 0).then_some(req.vlans.outer);
         let fresh = Sub {
             slot: i,
@@ -2034,9 +2164,14 @@ impl Bng {
                 .remote_id
                 .as_ref()
                 .map(|c| String::from_utf8_lossy(c).into_owned()),
+            service_name,
+            fallback_profile: default_profile.clone(),
             mtu: 1480,
             radius6: RadiusV6::default(),
             v6: None,
+            want_routes: Vec::new(),
+            want_refused: Vec::new(),
+            routes: Vec::new(),
         };
         self.index.add((i, sref.sid), &fresh);
         if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
@@ -2048,7 +2183,13 @@ impl Bng {
         // O(1): the list's name index (`corerouter_model::ppp_secrets`).
         match self.cfg.ppp.secret(&user).cloned() {
             Some(sec) if sec.disabled => self.reject(i, sref, "secret disabled"),
-            Some(sec) => self.local(i, sref, req, &sec, &default_profile),
+            Some(sec) => {
+                let first = match &row_profile {
+                    Some(p) if sec.profile == DEFAULT_PROFILE => p.clone(),
+                    _ => sec.profile.clone(),
+                };
+                self.local(i, sref, req, &sec, &first, &default_profile)
+            }
             None => match self.cfg.aaa.clone().filter(|_| self.cfg.ppp.aaa.use_radius) {
                 Some(aaa) => self.ask_radius(now, i, sref, req, &user, &aaa),
                 None => self.reject(i, sref, "no such user"),
@@ -2062,6 +2203,7 @@ impl Bng {
         sref: SessionRef,
         req: &corerouter_proto_pppoe::server::AuthRequest,
         sec: &corerouter_model::ppp::PppSecret,
+        profile: &str,
         default_profile: &str,
     ) {
         if !sec.service.allows(PppService::Pppoe) {
@@ -2070,10 +2212,7 @@ impl Bng {
         if sec.caller_id.is_some_and(|m| m.0 != req.client_mac.0) {
             return self.reject(i, sref, "caller-id mismatch");
         }
-        let e = self
-            .cfg
-            .ppp
-            .effective(Some(sec), &sec.profile, default_profile);
+        let e = self.cfg.ppp.effective(Some(sec), profile, default_profile);
         if e.only_one && self.index.users_up.contains_key(&sec.name) {
             return self.reject(i, sref, "only-one: the user is already connected");
         }
@@ -2095,6 +2234,11 @@ impl Bng {
             sub.effective = e;
             sub.limit_in = limit_in;
             sub.limit_out = limit_out;
+            sub.want_routes = sec
+                .routes
+                .iter()
+                .map(|r| (*r, RouteOrigin::Secret))
+                .collect();
         }
         self.accept(i, sref, mschap2, fixed, pool, rate, timeout, false, None);
     }
@@ -2229,8 +2373,9 @@ impl Bng {
             nas_port_id: Some(nas_port_id),
             nas_port: Some(u32::from(sref.sid)),
             calling_station_id: Some(mac_text(req.client_mac)),
-            called_station_id: (!slot.cfg.service_name.is_empty())
-                .then(|| slot.cfg.service_name.clone()),
+            // RouterOS: the Service-Name the subscriber asked for.
+            called_station_id: (!req.service.is_empty())
+                .then(|| String::from_utf8_lossy(&req.service).into_owned()),
             // RFC 2865 §5.6 Framed (2), §5.7 PPP (1), §5.41 Virtual (5):
             // what a PPPoE NAS sends (RFC 4679 §4 for the DSL ones).
             attributes: vec![
@@ -2344,9 +2489,9 @@ impl Bng {
                 AuthOutcome::Accept => {
                     let profile = attr("Mikrotik-Group");
                     let default_profile = self
-                        .slots
-                        .get(i)
-                        .map(|s| s.cfg.default_profile.clone())
+                        .subs
+                        .get(&key)
+                        .map(|s| s.fallback_profile.clone())
                         .unwrap_or_default();
                     let e = self.cfg.ppp.effective(
                         None,
@@ -2377,7 +2522,15 @@ impl Bng {
                             .iter()
                             .map(|a| (a.name.as_str(), a.value.as_str())),
                     );
+                    let (want, refused) = framed::from_radius(
+                        done.reply
+                            .attributes
+                            .iter()
+                            .map(|a| (a.name.as_str(), a.value.as_str())),
+                    );
                     if let Some(sub) = self.subs.get_mut(&key) {
+                        sub.want_routes = want;
+                        sub.want_refused = refused;
                         sub.radius6 = r6;
                         sub.effective = e;
                         if list.is_some() {
@@ -2456,10 +2609,36 @@ impl Bng {
                 }
             }
         }
+        // G4.3cd: the blocks routed to the subscriber, after its session
+        // (the XDP index or the /32 exists first).
+        let holder = Holder {
+            session: id.clone(),
+            user: user.clone(),
+            origin: RouteOrigin::Secret,
+            lane: self.lane,
+            service: "pppoe",
+        };
+        let want = std::mem::take(&mut sub.want_routes);
+        let mut refused = std::mem::take(&mut sub.want_refused);
+        let adm = framed::admit(
+            &self.cfg.framed,
+            &self.cfg.forbidden,
+            &want,
+            &holder,
+            ip,
+            xdp.is_some(),
+        );
+        refused.extend(adm.refused.iter().cloned());
+        sub.routes = adm.routes.clone();
+        let route_rows = adm.rows();
+        for (r, _) in &adm.routes {
+            self.effects.push(route_effect(xdp, r, true));
+        }
         let a = ActiveSession {
             id: id.clone(),
             name: user.clone(),
             service: "pppoe".into(),
+            service_name: Some(sub.service_name.clone()),
             caller_id: mac.clone(),
             address: ip,
             session_id: sref.sid,
@@ -2484,6 +2663,8 @@ impl Bng {
             mtu: d.mtu,
             limit_bytes_in: (sub.limit_in > 0).then_some(sub.limit_in),
             limit_bytes_out: (sub.limit_out > 0).then_some(sub.limit_out),
+            routes: route_rows.clone(),
+            refused_routes: refused.clone(),
             ..ActiveSession::default()
         };
         let mut a = a;
@@ -2508,6 +2689,8 @@ impl Bng {
                 event: "up".into(),
                 stage: Some(Stage::Up),
                 address: ip,
+                routes: route_rows.clone(),
+                refused_routes: refused.clone(),
                 ..HistoryEntry::default()
             };
             {
@@ -2542,6 +2725,7 @@ impl Bng {
                 attributes: {
                     let mut a = acct_attributes(ip, &mac, &interface);
                     a.extend(v6_attrs);
+                    a.extend(route_attributes(&adm.routes));
                     a
                 },
             };
@@ -2568,6 +2752,15 @@ impl Bng {
                 ip.map_or_else(|| "sem IPv4".into(), |i| i.to_string())
             ),
         );
+        for row in &route_rows {
+            self.log(
+                false,
+                format!("PPP: {user}: rota {} ({})", row.route, row.origin.label()),
+            );
+        }
+        for why in refused {
+            self.log(true, format!("PPP: {user}: rota recusada: {why}"));
+        }
     }
 
     fn hooks(
@@ -2635,6 +2828,22 @@ impl Bng {
             };
         }
         let id = session_id(sub.slot, &self.slots, sub.sref.sid);
+        // G4.3cd: the routed blocks go first (a block left behind would
+        // send its traffic to a session that is no more: a blackhole).
+        for (r, _) in &sub.routes {
+            self.effects.push(route_effect(sub.xdp, r, false));
+        }
+        framed::release_all(&self.cfg.framed, &sub.routes, &id);
+        if !sub.routes.is_empty() {
+            self.log(
+                false,
+                format!(
+                    "PPP: {}: {} rota(s) removida(s)",
+                    sub.user,
+                    sub.routes.len()
+                ),
+            );
+        }
         if let Some(idx) = sub.xdp {
             self.effects.push(Effect::Xdp(PppoeOp::Remove(idx)));
             self.xdp_free.push(idx);
@@ -2697,6 +2906,7 @@ impl Bng {
                         if let Some(x) = &sub.v6 {
                             a.extend(x.acct_attributes());
                         }
+                        a.extend(route_attributes(&sub.routes));
                         a
                     },
                 };
@@ -2743,6 +2953,8 @@ impl Bng {
             uptime_secs: uptime,
             rx_bytes: gone.as_ref().map_or(0, |a| a.rx_bytes),
             tx_bytes: gone.as_ref().map_or(0, |a| a.tx_bytes),
+            routes: gone.as_ref().map(|a| a.routes.clone()).unwrap_or_default(),
+            refused_routes: Vec::new(),
         };
         guard(&self.why).record(&[&sub.user, &mac], &h);
         guard(&self.shared).record(h);
@@ -2942,11 +3154,19 @@ impl Bng {
         // the rest for the others (the id says which: `*server-sid`).
         let (lane, lanes) = (self.lane, self.lanes);
         let mine = |id: &str| parse_session_id(id).is_none_or(|(_, sid)| sid % lanes == lane);
-        let (ids, rates, lists) = {
+        let (ids, rates, lists, changes) = {
             let mut sh = guard(&self.shared);
-            if sh.terminate.is_empty() && sh.rates.is_empty() && sh.lists.is_empty() {
+            if sh.terminate.is_empty()
+                && sh.rates.is_empty()
+                && sh.lists.is_empty()
+                && sh.route_changes.is_empty()
+            {
                 return;
             }
+            let (changes, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.route_changes)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.route_changes = rest;
             let (ids, rest): (Vec<String>, Vec<String>) = std::mem::take(&mut sh.terminate)
                 .into_iter()
                 .partition(|id| mine(id));
@@ -2959,8 +3179,11 @@ impl Bng {
                 .into_iter()
                 .partition(|(id, _)| mine(id));
             sh.lists = rest;
-            (ids, rates, lists)
+            (ids, rates, lists, changes)
         };
+        for (id, change) in changes {
+            self.change_routes(&id, &change);
+        }
         for (id, list) in lists {
             let Some((i, sref)) = self.find(&id) else {
                 continue;
@@ -3026,6 +3249,86 @@ impl Bng {
                     format!("PPP: {user} com rate-limit novo {rate} (CoA)"),
                 );
             }
+        }
+    }
+
+    /// G4.3cd: a CoA's routes for session `id`, without dropping it: the
+    /// new blocks are claimed and installed first, then the old ones of
+    /// the families the CoA names are removed (traffic to a block kept by
+    /// both never stops).
+    fn change_routes(&mut self, id: &str, c: &RouteChange) {
+        let Some((i, sref)) = self.find(id) else {
+            return;
+        };
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        let replaced = |r: &FramedRoute| if r.is_v6() { c.v6 } else { c.v4 };
+        let (old, kept): (Vec<_>, Vec<_>) =
+            sub.routes.iter().copied().partition(|(r, _)| replaced(r));
+        let holder = Holder {
+            session: id.to_owned(),
+            user: sub.user.clone(),
+            origin: RouteOrigin::FramedRoute,
+            lane: self.lane,
+            service: "pppoe",
+        };
+        // Blocks kept by both stay claimed; the rest is claimed anew.
+        let fresh: Vec<_> = c
+            .routes
+            .iter()
+            .copied()
+            .filter(|n| !old.iter().any(|o| o.0.dst == n.0.dst))
+            .collect();
+        let adm = framed::admit(
+            &self.cfg.framed,
+            &self.cfg.forbidden,
+            &fresh,
+            &holder,
+            sub.ip,
+            sub.xdp.is_some(),
+        );
+        let xdp = sub.xdp;
+        let mut now_routes = kept;
+        now_routes.extend(
+            old.iter()
+                .copied()
+                .filter(|o| c.routes.iter().any(|n| n.0.dst == o.0.dst)),
+        );
+        now_routes.extend(adm.routes.iter().copied());
+        let gone: Vec<_> = old
+            .iter()
+            .copied()
+            .filter(|o| !c.routes.iter().any(|n| n.0.dst == o.0.dst))
+            .collect();
+        sub.routes = now_routes;
+        let user = sub.user.clone();
+        let rows = framed::rows(&sub.routes);
+        for (r, _) in &adm.routes {
+            self.effects.push(route_effect(xdp, r, true));
+        }
+        for (r, _) in &gone {
+            self.effects.push(route_effect(xdp, r, false));
+        }
+        framed::release_all(&self.cfg.framed, &gone, id);
+        if let Some(a) = guard(&self.shared).active.get_mut(id) {
+            a.routes = rows.clone();
+            a.refused_routes = adm.refused.clone();
+        }
+        let text = if rows.is_empty() {
+            "nenhuma".to_owned()
+        } else {
+            rows.iter()
+                .map(|r| r.route.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        self.log(
+            false,
+            format!("PPP: {user}: rotas trocadas por CoA: {text}"),
+        );
+        for why in adm.refused {
+            self.log(true, format!("PPP: {user}: rota recusada (CoA): {why}"));
         }
     }
 
@@ -3155,6 +3458,97 @@ fn acct_attributes(ip: Option<Ipv4Addr>, mac: &str, interface: &str) -> Vec<Attr
         v.push(Attribute::new("Framed-IP-Address", ip.to_string()));
     }
     v
+}
+
+/// G4.3cd: the routes of a session in the Accounting-Request (RFC 2866
+/// §5.13: the attributes of the Access-Accept may go along).
+fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
+    routes
+        .iter()
+        .map(|(r, _)| {
+            let name = if r.is_v6() {
+                "Framed-IPv6-Route"
+            } else {
+                "Framed-Route"
+            };
+            Attribute::new(name, r.to_string())
+        })
+        .collect()
+}
+
+/// Where a route goes: the XDP LPM of session `xdp`, or (IPv4, no XDP) a
+/// kernel route through `bng0`.
+fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
+    match (xdp, r.dst) {
+        (Some(idx), dst) => Effect::Xdp(PppoeOp::Route { dst, idx, add }),
+        (None, ipnet::IpNet::V4(dst)) => Effect::Block { dst, add },
+        // Never admitted without XDP (`framed::admit` refuses IPv6 there).
+        (None, ipnet::IpNet::V6(_)) => Effect::Log {
+            error: true,
+            text: format!("PPP: rota {r}: IPv6 sem XDP"),
+        },
+    }
+}
+
+/// The route attributes of a CoA, if it has any: every `Framed-Route`
+/// and `Framed-IPv6-Route` (RFC 2865 §5.22, RFC 3162 §2.5), repeated. A
+/// family present replaces that family's routes; a value of `""` alone
+/// clears it.
+pub(crate) fn route_change(changes: &[Attribute]) -> Option<RouteChange> {
+    let v4 = changes.iter().any(|a| a.name == "Framed-Route");
+    let v6 = changes.iter().any(|a| a.name == "Framed-IPv6-Route");
+    if !v4 && !v6 {
+        return None;
+    }
+    let (routes, refused) = framed::from_radius(
+        changes
+            .iter()
+            .filter(|a| a.name != "Framed-IPv6-Prefix" && !a.value.trim().is_empty())
+            .map(|a| (a.name.as_str(), a.value.as_str())),
+    );
+    Some(RouteChange {
+        v4,
+        v6,
+        routes,
+        invalid: refused,
+    })
+}
+
+/// Whether session `id` (IPv4 `ip`) may take the routes of `c`: each is
+/// valid and no other session holds an overlapping block. `Err`: why.
+fn check_change(
+    sh: &Shared,
+    id: &str,
+    ip: Option<Ipv4Addr>,
+    c: &RouteChange,
+) -> Result<(), String> {
+    if let Some(why) = c.invalid.first() {
+        return Err(why.clone());
+    }
+    if c.routes.len() > corerouter_model::framed_route::MAX_ROUTES {
+        return Err(format!(
+            "mais de {} rotas",
+            corerouter_model::framed_route::MAX_ROUTES
+        ));
+    }
+    for (k, (r, _)) in c.routes.iter().enumerate() {
+        framed::check(r, ip, &sh.forbidden)?;
+        if let Some((n, h)) = sh.framed.conflict(&r.dst, id) {
+            return Err(format!(
+                "{}: sobrepõe {n}, já roteado para {}",
+                r.dst, h.user
+            ));
+        }
+        if let Some((o, _)) = c
+            .routes
+            .iter()
+            .take(k)
+            .find(|(o, _)| corerouter_model::framed_route::overlaps(&o.dst, &r.dst))
+        {
+            return Err(format!("{}: sobrepõe {} do mesmo pedido", r.dst, o.dst));
+        }
+    }
+    Ok(())
 }
 
 /// The `S=…` string of an MS-CHAP2-Success attribute (RFC 2548 §2.3.3:

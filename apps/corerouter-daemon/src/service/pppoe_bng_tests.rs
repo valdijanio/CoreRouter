@@ -23,10 +23,10 @@ use corerouter_proto_pppoe::wire::Mac;
 
 use super::pppoe_bng::{Backend, Bng, Effect, Owner, PortInfo, Snapshot};
 
-const IFINDEX: u32 = 7;
-const BNG_MAC: [u8; 6] = [0x02, 0xBB, 0, 0, 0, 1];
+pub(super) const IFINDEX: u32 = 7;
+pub(super) const BNG_MAC: [u8; 6] = [0x02, 0xBB, 0, 0, 0, 1];
 
-fn server(json: serde_json::Value) -> PppoeServer {
+pub(super) fn server(json: serde_json::Value) -> PppoeServer {
     let mut base = serde_json::json!({"id": "*1", "name": "pppoe-ether2", "interface": "ether2", "padi_limit": 0, "mac_padi_limit": 0, "new_session_rate": 0});
     if let (Some(b), Some(extra)) = (base.as_object_mut(), json.as_object()) {
         for (k, v) in extra {
@@ -52,7 +52,7 @@ fn pools(size: u32) -> IpPools {
     }
 }
 
-fn ppp(users: usize, srv: PppoeServer) -> Ppp {
+pub(super) fn ppp(users: usize, srv: PppoeServer) -> Ppp {
     let mut p = Ppp::default();
     p.profiles.push(PppProfile {
         id: ItemId(2),
@@ -77,19 +77,29 @@ fn ppp(users: usize, srv: PppoeServer) -> Ppp {
 }
 
 /// N clients and the BNG, a fake clock and a perfect wire.
-struct Lab {
-    bng: Bng,
-    clients: Vec<Client>,
+pub(super) struct Lab {
+    pub(super) bng: Bng,
+    pub(super) clients: Vec<Client>,
     by_mac: HashMap<[u8; 6], usize>,
-    now: u64,
-    up: Vec<bool>,
+    pub(super) now: u64,
+    pub(super) up: Vec<bool>,
     downs: Vec<usize>,
     /// IPv6 packets (PPP protocol 0x0057) each client received (G4.3e).
     v6: Vec<Vec<Vec<u8>>>,
 }
 
 impl Lab {
-    fn new(n: usize, snap: Snapshot, auth: impl Fn(usize) -> (String, String)) -> Self {
+    pub(super) fn new(n: usize, snap: Snapshot, auth: impl Fn(usize) -> (String, String)) -> Self {
+        Self::with(n, snap, auth, |_, _| {})
+    }
+
+    /// [`Lab::new`] with each client's config edited by `tweak`.
+    fn with(
+        n: usize,
+        snap: Snapshot,
+        auth: impl Fn(usize) -> (String, String),
+        tweak: impl Fn(usize, &mut ClientConfig),
+    ) -> Self {
         let mut bng = Bng::new([7; 32]);
         let ports = HashMap::from([("pppoe-ether2".to_owned(), PortInfo { ifindex: IFINDEX, mac: BNG_MAC })]);
         bng.configure(0, snap, &ports);
@@ -98,7 +108,7 @@ impl Lab {
         for i in 0..n {
             let (user, password) = auth(i);
             let mac = [0x02, 0x10, (i >> 16) as u8, (i >> 8) as u8, i as u8, 0x01];
-            let cfg = ClientConfig {
+            let mut cfg = ClientConfig {
                 mac: Mac(mac),
                 ifindex: IFINDEX,
                 username: user.into_bytes(),
@@ -109,6 +119,7 @@ impl Lab {
                 keepalive_interval_ms: 0,
                 ..ClientConfig::default()
             };
+            tweak(i, &mut cfg);
             let mut seed = [3u8; 32];
             seed[..8].copy_from_slice(&(i as u64).to_le_bytes());
             clients.push(Client::new(cfg, seed));
@@ -120,7 +131,7 @@ impl Lab {
         Self { bng, clients, by_mac, now: 0, up, downs, v6 }
     }
 
-    fn start(&mut self, range: std::ops::Range<usize>) {
+    pub(super) fn start(&mut self, range: std::ops::Range<usize>) {
         let mut out = ClientOutput::new();
         for i in range {
             self.clients[i].start(self.now, &mut out);
@@ -137,7 +148,7 @@ impl Lab {
     }
 
     /// Deliver until quiet, then advance the clock by `step` ms, `rounds` times.
-    fn run(&mut self, rounds: usize, step: u64) {
+    pub(super) fn run(&mut self, rounds: usize, step: u64) {
         let mut out = ClientOutput::new();
         for _ in 0..rounds {
             for _ in 0..50 {
@@ -192,16 +203,16 @@ impl Lab {
         }
     }
 
-    fn ups(&self) -> usize {
+    pub(super) fn ups(&self) -> usize {
         self.up.iter().filter(|u| **u).count()
     }
 
-    fn backend(&self) -> Backend {
+    pub(super) fn backend(&self) -> Backend {
         Backend(self.bng.shared.clone())
     }
 }
 
-fn snap(users: usize, srv: PppoeServer, pool: u32) -> Snapshot {
+pub(super) fn snap(users: usize, srv: PppoeServer, pool: u32) -> Snapshot {
     Snapshot { ppp: ppp(users, srv), pools: pools(pool), aaa: None, unix_base: 1_700_000_000, ..Snapshot::default() }
 }
 
@@ -1366,4 +1377,41 @@ fn auto_keeps_the_real_client_from_resending() {
     assert!(t <= n as f64 / cap * 1.35, "{t} s for an ideal {} s", n as f64 / cap);
     assert_eq!(timeouts, 0);
     assert!(resends <= n as u64 / 100, "{resends} copies for {n} logins");
+}
+
+/// G4.3k: one port, three Service-Names: each session gets its row's
+/// profile (a secret left on `default` too), the name shows in Active and
+/// goes to RADIUS as Called-Station-Id; a drop row gets no session.
+#[test]
+fn service_names_choose_the_profile_and_drop_rows_get_nothing() {
+    let srv = server(serde_json::json!({"services": [
+        {"name": "internet"},
+        {"name": "iptv", "profile": "tv"},
+        {"name": "bloqueado", "action": "drop"},
+        {"name": "any", "action": "drop"},
+    ]}));
+    let mut s = snap(30, srv, 1000);
+    s.ppp.profiles.push(PppProfile {
+        id: ItemId(3),
+        name: "tv".into(),
+        remote_address: Some(AddrOrPool::Pool("clientes".into())),
+        rate_limit: Some("5M/20M".into()),
+        ..PppProfile::default()
+    });
+    let names = ["internet", "iptv", "", "bloqueado", "outro"];
+    let mut lab = Lab::with(30, s, |i| (format!("u{i}"), format!("p{i}")), |i, c| {
+        c.service_name = names[i % names.len()].as_bytes().to_vec();
+        c.discovery_attempts = 3;
+    });
+    lab.start(0..30);
+    lab.run(600, 50);
+    assert_eq!(lab.ups(), 18, "internet, iptv and the empty name");
+    lab.bng.check().unwrap();
+    for a in lab.backend().active() {
+        let i: usize = a.name[1..].parse().unwrap();
+        let want = names[i % names.len()];
+        assert_eq!(a.service_name.as_deref(), Some(want), "{a:?}");
+        let (profile, rate) = if want == "iptv" { ("tv", "5M/20M") } else { ("default", "10M/50M") };
+        assert_eq!((a.profile.as_str(), a.rate_limit.as_deref()), (profile, Some(rate)), "{a:?}");
+    }
 }

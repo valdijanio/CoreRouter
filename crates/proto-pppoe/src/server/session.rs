@@ -2,6 +2,7 @@
 //! RFC 1661 §3.2 (Establish → Authenticate → Network → Terminate) over the
 //! PPPoE link, with the caller answering authentication and addressing.
 
+use super::services::ServiceSlot;
 use super::{
     AuthMethod, AuthRequest, AuthVerdict, DownReason, Env, Event, HostKey, Ipv4Assignment,
     Ipv6Mode, ServerConfig, SessionKey, SessionRef,
@@ -62,6 +63,8 @@ pub(crate) struct Init {
     /// RFC 4638: agreed PPP-Max-Payload, raising the MRU limits.
     pub mru_cap: Option<u16>,
     pub service: Box<[u8]>,
+    /// The row of the Service-Name table it landed on (G4.3k).
+    pub svc: ServiceSlot,
     pub circuit_id: Option<Box<[u8]>>,
     pub remote_id: Option<Box<[u8]>>,
 }
@@ -73,6 +76,9 @@ pub(crate) struct Session {
     pub vlans: Vlans,
     pub client_mac: Mac,
     pub uniq: u64,
+    /// The PADR's Service-Name and its row (G4.3k).
+    pub service: Box<[u8]>,
+    pub svc: ServiceSlot,
     link: Link,
     phase: Phase,
     lcp: Fsm,
@@ -175,7 +181,6 @@ impl Session {
             src: cfg.ac_mac,
             vlans: i.vlans,
         };
-        let _ = i.service;
         Session {
             gen_: i.gen_,
             sid: i.sid,
@@ -183,6 +188,8 @@ impl Session {
             vlans: i.vlans,
             client_mac: i.client_mac,
             uniq: i.uniq,
+            service: i.service,
+            svc: i.svc,
             link,
             phase: Phase::Establish,
             lcp: Fsm::new(rng.u32() as u8),
@@ -640,6 +647,7 @@ impl Session {
                 vlans: self.vlans,
                 circuit_id: self.circuit_id.clone(),
                 remote_id: self.remote_id.clone(),
+                service: self.service.clone(),
             }),
         });
     }

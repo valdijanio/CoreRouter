@@ -588,6 +588,8 @@ fn load(fast_nat: bool, pppoe: bool, queues: bool, pcq: bool) -> Result<Loaded, 
             loader.map_max_entries(name, 1);
         }
         loader.map_max_entries(m::PPPOE_V6, 1);
+        loader.map_max_entries(m::PPPOE_RT4, 1);
+        loader.map_max_entries(m::PPPOE_RT6, 1);
         loader.map_max_entries(m::PPPOE_POLICER, 2);
     }
     if !queues {

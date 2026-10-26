@@ -1209,3 +1209,30 @@ socket de 4 MiB guarda 8739 PADIs (`a_busy_worker_socket_holds_a_burst`).
 
 No netns o socket com fila empata com o leitor; na VM, com o BNG Blaster, ficou abaixo (rodada
 5). Vale o número da VM.
+
+G4.3cd, **medido** na VM `corerouter-lab` (virtio/veth, XDP generic, objeto release, 2026-10-26):
+10 000 sessões com 1–4 blocos (25 000): incluir 92 ms (3,7 µs/bloco; a primeira versão contava os
+blocos a cada inclusão e levava 11,2 s), remover 41 ms; por pacote, piso 120–133 ns, próprio /32
+150–168 ns, host de /29 roteado 182–232 ns, de /56 191–241 ns, com uma tag no uplink 193–240 ns,
+duas 200–246 ns. A/B com o objeto da `main` (100 mil sessões, mesmo teste alternado): descida ao
+próprio endereço 156–168 → 165–190 ns, subida e piso iguais no ruído. Userspace
+(`--bench framed_routes`, Ryzen AI Max+ 395, release): login com 4 rotas + logout 0,64 µs (vazia) e
+1,64 µs (10 000 sessões, 25 000 blocos), busca do caminho lento 11 → 33 ns, encher com 10 000
+sessões 12,1 ms.
+
+### G4.3h — sync do BNG em alta disponibilidade (`proto-ha`), **medido** 2026-10-26, Ryzen AI Max+ 395, release
+
+| Benchmark | Mediana | Observação |
+|---|---|---|
+| `ha_record/encode` | 48 ns | registro de 161 B |
+| `ha_record/decode` | 99 ns | |
+| `ha_delta/2048_changes_through_the_codec` | 2,06 ms | ≈ 1 µs por mudança (montagem do registro incluída) |
+| `ha_snapshot/100k_sessions` | 55 ms | 216 B por sessão no fio (21 MiB) |
+| `ha_access_hello/encode+decode` | 372 ns | HMAC-SHA-256 |
+
+Memória: réplica 400 B por sessão, publicador (tabela + log) 389 B por sessão (RSS, 100 mil).
+
+- 2026-10-26, G4.3k (**medido**, Ryzen AI Max+ 395, release, criterion): PADI → PADO sem nomes
+  191 → 196–198 ns, +1 % (no ruído). Com 512 nomes, pedindo o último: 1,04 µs com a busca
+  linear e **209 ns** com o índice por hash (−80 %). Simulação em memória: 20 000 assinantes, 40
+  nomes e 5000 VLANs QinQ em 0,67 s.

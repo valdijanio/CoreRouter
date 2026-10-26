@@ -95,6 +95,10 @@ static PPPOE_SESSIONS: Array<SessionWords> = Array::with_max_entries(pppoe::SESS
 static PPPOE_V4: HashMap<[u8; 4], u32> = HashMap::with_max_entries(pppoe::SESSIONS_MAX, 0);
 #[map(name = "PPPOE_V6")]
 static PPPOE_V6: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(pppoe::PREFIXES_V6, 0);
+#[map(name = "PPPOE_RT4")]
+static PPPOE_RT4: LpmTrie<[u8; 4], u32> = LpmTrie::with_max_entries(pppoe::ROUTES_V4, 0);
+#[map(name = "PPPOE_RT6")]
+static PPPOE_RT6: LpmTrie<[u8; 16], u32> = LpmTrie::with_max_entries(pppoe::ROUTES_V6, 0);
 #[map(name = "PPPOE_POLICER")]
 static PPPOE_POLICER: Array<policer::State> =
     Array::with_max_entries(pppoe::SESSIONS_MAX * 2, 0);
@@ -200,6 +204,16 @@ impl Sessions for Subs {
     }
 
     #[inline(always)]
+    fn by_route_v4(&self, dst: [u8; 4]) -> Option<u32> {
+        PPPOE_RT4.get(Key::new(32, dst)).copied()
+    }
+
+    #[inline(always)]
+    fn by_route_v6(&self, dst: [u8; 16]) -> Option<u32> {
+        PPPOE_RT6.get(Key::new(128, dst)).copied()
+    }
+
+    #[inline(always)]
     fn ipoe_port(&self, ifindex: u32) -> bool {
         IPOE_PORTS.get_ptr(&ifindex).is_some()
     }
@@ -242,6 +256,12 @@ fn encap_out(frame: &mut Frame, d: &DownSession) -> u32 {
         stat(Stat::Malformed);
         return xdp_action::XDP_DROP;
     }
+    sent(d)
+}
+
+/// An encapsulated packet out of the access port, counted.
+#[inline(always)]
+fn sent(d: &DownSession) -> u32 {
     stat(Stat::DownFast);
     sess_add(d.idx, pppoe::C_DOWN_PACKETS, 1);
     sess_add(d.idx, pppoe::C_DOWN_BYTES, u64::from(d.ip_len));
@@ -274,26 +294,26 @@ fn down_other(d: Down) -> Option<u32> {
     }
 }
 
-/// A clean IP packet to a subscriber: encapsulated and redirected, or to
-/// the kernel. `None`: not to a subscriber. Only untagged frames (IP at
-/// 14, constant offsets); a tagged uplink is the kernel's (G4.3ca).
+/// A clean IP packet to a subscriber (its address, its prefixes or a block
+/// routed to it; untagged or from an uplink with one or two VLAN tags):
+/// encapsulated and redirected, or to the kernel. `None`: not to a
+/// subscriber.
 #[inline(always)]
 fn to_subscriber(frame: &mut Frame, now: u64) -> Option<u32> {
-    let v6 = match frame.be16(12)? {
-        0x0800 => false,
-        0x86dd => true,
-        _ => return None,
-    };
-    let idx = if v6 {
-        Subs.by_v6(frame.bytes::<16>(ETH_HLEN + 24)?)?
-    } else {
-        Subs.by_v4(frame.bytes::<4>(ETH_HLEN + 16)?)?
-    };
-    let (ip_len, ttl) = pppoe::ip_meta(frame, v6)?;
-    match pppoe::downstream(&mut Subs, idx, v6, ip_len, ttl, now, false) {
-        Down::Encap(d) => {
-            pppoe::ttl_dec(frame, v6)?;
-            Some(encap_out(frame, &d))
+    let d = pppoe::to_subscriber(frame, &mut Subs, now)?;
+    if d.routed {
+        stat(Stat::DownRouted);
+    }
+    match d.down {
+        Down::Encap(s) => {
+            if d.tagged {
+                stat(Stat::DownTagged);
+            }
+            Some(sent(&s))
+        }
+        Down::Drop(Stat::Malformed, _) => {
+            stat(Stat::Malformed);
+            Some(xdp_action::XDP_DROP)
         }
         other => down_other(other),
     }
@@ -1079,14 +1099,15 @@ fn shape_session(ctx: &TcContext, l3: &queue::L3, idx: u32, now: u64) -> Option<
     Some(action)
 }
 
-/// The session holding the destination of `l3` (its /32, /64 or
-/// delegated prefix).
+/// The session holding the destination of `l3` (its /32, /64, delegated
+/// prefix, or a block routed to it, G4.3cd).
 #[inline(always)]
 fn session_of(l3: &queue::L3) -> Option<u32> {
     if l3.v6 {
-        Subs.by_v6(l3.dst)
+        Subs.by_v6(l3.dst).or_else(|| Subs.by_route_v6(l3.dst))
     } else {
-        Subs.by_v4(queue::L3::v4(&l3.dst))
+        let a = queue::L3::v4(&l3.dst);
+        Subs.by_v4(a).or_else(|| Subs.by_route_v4(a))
     }
 }
 

@@ -121,6 +121,10 @@ pub mod capture;
 #[cfg(target_os = "linux")]
 pub mod pppoe_io;
 
+/// BNG redundancy (G4.3h): the access-side hello (`AF_PACKET`, 0x88b5).
+#[cfg(target_os = "linux")]
+pub mod ha_io;
+
 /// System › Tuning (G1.26): kernel parameters, the machine, counters.
 // System › Resources and health (G4.8a): /proc and /sys readings.
 #[cfg(target_os = "linux")]

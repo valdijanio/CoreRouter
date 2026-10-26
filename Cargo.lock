@@ -1138,6 +1138,7 @@ dependencies = [
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
+ "corerouter-proto-ha",
  "corerouter-proto-iperf",
  "corerouter-proto-lldp",
  "corerouter-proto-mndp",
@@ -1372,6 +1373,17 @@ dependencies = [
  "criterion",
  "proptest",
  "serde",
+]
+
+[[package]]
+name = "corerouter-proto-ha"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "hmac 0.13.0",
+ "proptest",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

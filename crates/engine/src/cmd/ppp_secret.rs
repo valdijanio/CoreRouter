@@ -3,7 +3,10 @@
 //! `auth::SECRET_KEYS`). Changes apply to the next login; an active
 //! session is ended with `ppp.active.remove`.
 
+use std::net::IpAddr;
+
 use corerouter_model::MacAddr;
+use corerouter_model::framed_route::{FramedRoute, overlaps};
 use corerouter_model::ppp::{MAX_PASSWORD, MAX_SECRETS, PppSecret, PppService};
 use serde_json::{Value, json};
 
@@ -15,10 +18,10 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.secret.add", "Add PPP Secret", [], None,
-        "{name: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async|ipoe (default any; ipoe: a DHCP subscriber named by MAC or option 82, no password), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, comment?: string, disabled?: bool} → {id, name, warnings}",
+        "{name: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async|ipoe (default any; ipoe: a DHCP subscriber named by MAC or option 82, no password), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, routes?: string (blocks routed to the subscriber while up, RouterOS dst-address [gateway] [metric], comma-separated, IPv4 or IPv6; gateway 0.0.0.0, :: or none = the subscriber; empty: none), comment?: string, disabled?: bool} → {id, name, warnings}",
         always, add),
     cmd!("ppp.secret.set", "Set PPP Secret", [], None,
-        "{id: *hex | name, name?: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async|ipoe (default any; ipoe: a DHCP subscriber named by MAC or option 82, no password), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, comment?: string, disabled?: bool} → {id, name, warnings}",
+        "{id: *hex | name, name?: string, password?: string (write-only; CHAP and MS-CHAP need it in clear), service?: any|pppoe|l2tp|pptp|sstp|ovpn|async|ipoe (default any; ipoe: a DHCP subscriber named by MAC or option 82, no password), profile?: string (default default), local_address?: ipv4, remote_address?: ipv4 (a fixed address; wins over the profile's pool), caller_id?: mac (PPPoE: only from this MAC; empty: any), limit_bytes_in?: int (bytes per session the subscriber sends; 0: none), limit_bytes_out?: int, routes?: string (blocks routed to the subscriber while up, RouterOS dst-address [gateway] [metric], comma-separated, IPv4 or IPv6; gateway 0.0.0.0, :: or none = the subscriber; empty: none), comment?: string, disabled?: bool} → {id, name, warnings}",
         has_secrets, set),
     cmd!("ppp.secret.remove", "Remove PPP Secret", [], None,
         "{id: *hex | name} → {id, name, active (sessions of this user still up: ppp.active.remove ends them)}",
@@ -28,10 +31,10 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("ppp.secret.disable", "Disable PPP Secret", [], None,
         "{id: *hex | name} → {id, name, active}", has_secrets, disable),
     cmd!(query "ppp.secret.list", "PPP Secrets", [], None,
-        "{find?: string (in name, comment, caller id or address), profile?: string, limit?: int (default all), offset?: int} → [{id, name, password: \"***\", service, profile, local_address?, remote_address?, caller_id?, limit_bytes_in?, limit_bytes_out?, comment?, disabled, active (up now), flags (X disabled)}]",
+        "{find?: string (in name, comment, caller id, address or routes), profile?: string, limit?: int (default all), offset?: int} → [{id, name, password: \"***\", service, profile, local_address?, remote_address?, caller_id?, limit_bytes_in?, limit_bytes_out?, routes?: string (RouterOS text, comma-separated), comment?, disabled, active (up now), flags (X disabled)}]",
         always, list),
     cmd!(query "ppp.secret.preview", "PPP Secret Preview", [], None,
-        "{id?: *hex | name, name?: string, password?: string, service?: string, profile?: string, local_address?: ipv4, remote_address?: ipv4, caller_id?: mac, limit_bytes_in?: int, limit_bytes_out?: int, comment?: string, disabled?: bool} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        "{id?: *hex | name, name?: string, password?: string, service?: string, profile?: string, local_address?: ipv4, remote_address?: ipv4, caller_id?: mac, limit_bytes_in?: int, limit_bytes_out?: int, routes?: string, comment?: string, disabled?: bool} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
         always, preview),
     cmd!(query "ppp.secret.count", "PPP Secret Count", [], None,
         "{find?: string, profile?: string} → {total, disabled, active}",
@@ -103,6 +106,10 @@ fn apply(s: &Session, x: &mut PppSecret, p: &Value) -> Result<()> {
     if let Some(v) = u64_of(p, "limit_bytes_out")? {
         x.limit_bytes_out = v;
     }
+    if let Some(items) = super::dhcp_client::opt_list(p, "routes")? {
+        x.routes = FramedRoute::parse_list(&items.join(","))
+            .map_err(|e| EngineError::bad("routes", e.to_string()))?;
+    }
     if let Some(c) = opt_text(p, "comment", 256)? {
         x.comment = c;
     }
@@ -112,9 +119,99 @@ fn apply(s: &Session, x: &mut PppSecret, p: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Addresses that two secrets (or a secret and a pool) would both hand out.
-fn warnings(s: &Session, x: &PppSecret) -> Vec<String> {
+/// G4.3cd: what makes a secret's `routes` unusable, refused with the
+/// reason (a block routed to two places, or over the router's own or a
+/// pool's addresses, blackholes someone). The rest comes back as warnings.
+/// Cost per route: O(log n) in the secrets' route index, O(pools) and
+/// O(addresses); the walk of fixed addresses runs only for a secret with
+/// routes (business customers, a few per thousand).
+fn check_routes(s: &Session, x: &PppSecret) -> Result<Vec<String>> {
     let mut w = Vec::new();
+    if x.routes.is_empty() {
+        return Ok(w);
+    }
+    let c = s.store().candidate();
+    let bad = |why: String| Err(EngineError::bad("routes", why));
+    for r in &x.routes {
+        let dst = r.dst;
+        if let Some(why) = r.martian() {
+            return bad(format!("{dst}: {why}"));
+        }
+        if let Some((n, o)) = c.ppp.secrets.route_owners(&dst).into_iter().find(|(_, o)| o.id != x.id) {
+            return bad(format!("{dst} overlaps {n}, routed to secret {}", o.name));
+        }
+        for pool in &c.ip.pools.pools {
+            if let Some(range) = pool.ranges.iter().find(|g| {
+                overlaps_range(&dst, IpAddr::V4(g.start), IpAddr::V4(g.end))
+            }) {
+                return bad(format!("{dst} overlaps {range} of pool {}: the pool lends those addresses to other subscribers", pool.name));
+            }
+        }
+        if let Some(pool) = c.ipv6.dhcp_server.pools.iter().find(|q| overlaps(&dst, &ipnet::IpNet::V6(q.prefix))) {
+            return bad(format!("{dst} overlaps IPv6 pool {} ({})", pool.name, pool.prefix));
+        }
+        for a in c.ip.addresses.iter().filter(|a| !a.disabled && a.from_pool.is_none()) {
+            if dst.contains(&a.address.addr()) {
+                return bad(format!("{dst} holds {}, the router's own address on {}", a.address.addr(), a.interface));
+            }
+            if a.address.prefix_len() < a.address.max_prefix_len() && a.address.trunc().contains(&dst) {
+                w.push(format!("{dst} is inside {} of {}: hosts of that network in the block stop being reachable there", a.address.trunc(), a.interface));
+            }
+        }
+        if let Some(o) = c.ppp.secrets.iter().find(|o| {
+            o.id != x.id && o.remote_address.is_some_and(|ip| dst.contains(&IpAddr::V4(ip)))
+        }) {
+            return bad(format!("{dst} holds {}, the fixed address of secret {}", o.remote_address.map_or_else(String::new, |ip| ip.to_string()), o.name));
+        }
+        match (r.gateway, x.remote_address) {
+            (Some(IpAddr::V4(g)), Some(ip)) if g != ip => {
+                return bad(format!("{dst}: gateway {g} is not the subscriber ({ip}); use 0.0.0.0 or {ip}"));
+            }
+            (Some(IpAddr::V4(g)), None) => w.push(format!(
+                "{dst}: gateway {g} must be the address the subscriber gets, else the route is refused at login (0.0.0.0 = always the subscriber)"
+            )),
+            _ => {}
+        }
+        if let Some((n, h)) = s
+            .ext::<crate::framed::FramedTable>()
+            .and_then(|t| t.conflict(&dst, ""))
+            .filter(|(_, h)| h.user != x.name)
+        {
+            w.push(format!("{dst} overlaps {n} held now by {} ({}): refused at login while that session is up", h.user, h.origin.label()));
+        }
+    }
+    Ok(w)
+}
+
+/// A pool range that overlaps a secret's routed block: the reason to
+/// refuse it (`ip.pool`, `ipv6.pool`).
+pub(super) fn routed_in(s: &Session, first: IpAddr, last: IpAddr) -> Option<String> {
+    s.store()
+        .candidate()
+        .ppp
+        .secrets
+        .route_owners_in(first, last)
+        .first()
+        .map(|(n, o)| format!("overlaps {n}, routed to secret {} (ppp.secret routes)", o.name))
+}
+
+/// Whether block `n` shares an address with `first..=last`.
+fn overlaps_range(n: &ipnet::IpNet, first: IpAddr, last: IpAddr) -> bool {
+    match (n, first, last) {
+        (ipnet::IpNet::V4(n), IpAddr::V4(a), IpAddr::V4(b)) => {
+            u32::from(n.network()) <= u32::from(b) && u32::from(a) <= u32::from(n.broadcast())
+        }
+        (ipnet::IpNet::V6(n), IpAddr::V6(a), IpAddr::V6(b)) => {
+            u128::from(n.network()) <= u128::from(b) && u128::from(a) <= u128::from(n.broadcast())
+        }
+        _ => false,
+    }
+}
+
+/// Addresses that two secrets (or a secret and a pool) would both hand out;
+/// `routes` that cannot be used are refused here.
+fn warnings(s: &Session, x: &PppSecret) -> Result<Vec<String>> {
+    let mut w = check_routes(s, x)?;
     let c = s.store().candidate();
     // IPoE subscribers have no password (a DHCP client is its MAC or line).
     if x.password.is_empty() && x.service != PppService::Ipoe {
@@ -127,8 +224,11 @@ fn warnings(s: &Session, x: &PppSecret) -> Vec<String> {
         if let Some(pool) = c.ip.pools.pools.iter().find(|p| p.contains(ip)) {
             w.push(format!("remote_address {ip} is inside pool {}: the pool may lend it to another subscriber", pool.name));
         }
+        if let Some((n, o)) = c.ppp.secrets.route_owners(&ipnet::IpNet::from(IpAddr::V4(ip))).into_iter().find(|(_, o)| o.id != x.id) {
+            return Err(EngineError::bad("remote_address", format!("{ip} is inside {n}, routed to secret {}", o.name)));
+        }
     }
-    w
+    Ok(w)
 }
 
 fn index(s: &Session, p: &Value) -> Result<usize> {
@@ -155,7 +255,7 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     };
     apply(s, &mut x, p)?;
     x.id = s.store_mut().candidate_mut().ppp.next_id();
-    let w = warnings(s, &x);
+    let w = warnings(s, &x)?;
     let out = json!({"id": x.id, "name": x.name, "warnings": w});
     s.store_mut().candidate_mut().ppp.secrets.push(x);
     Ok(out)
@@ -171,7 +271,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if x.name != old && s.store().candidate().ppp.secret(&x.name).is_some() {
         return Err(EngineError::bad("name", format!("secret '{}' exists", x.name)));
     }
-    let w = warnings(s, &x);
+    let w = warnings(s, &x)?;
     let out = json!({"id": x.id, "name": x.name, "warnings": w});
     if let Some(slot) = s.store_mut().candidate_mut().ppp.secrets.get_mut(i) {
         *slot = x;
@@ -234,6 +334,7 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
             json!({"label": "Address", "value": addr}),
             json!({"label": "Rate limit", "value": e.rate_limit.unwrap_or_else(|| "none".into())}),
             json!({"label": "Only one", "value": if e.only_one { "yes" } else { "no" }}),
+            json!({"label": "Routes", "value": if sec.routes.is_empty() { "none".to_owned() } else { FramedRoute::list_text(&sec.routes) }}),
         ]
     })
 }
@@ -249,6 +350,7 @@ fn matching<'a>(secrets: &'a [PppSecret], needle: Option<&str>, profile: Option<
                     || x.comment.to_lowercase().contains(n)
                     || x.caller_id.is_some_and(|m| m.to_string().to_lowercase().contains(n))
                     || x.remote_address.is_some_and(|ip| ip.to_string().contains(n))
+                    || x.routes.iter().any(|r| r.dst.to_string().contains(n))
             })
         })
         .collect()
@@ -306,6 +408,9 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                 }
                 if x.limit_bytes_out > 0 {
                     o.insert("limit_bytes_out".into(), json!(x.limit_bytes_out));
+                }
+                if !x.routes.is_empty() {
+                    o.insert("routes".into(), json!(FramedRoute::list_text(&x.routes)));
                 }
                 if !x.comment.is_empty() {
                     o.insert("comment".into(), json!(x.comment));
@@ -400,5 +505,101 @@ mod tests {
         assert_eq!(s.execute("ppp.secret.count", &json!({})).unwrap()["total"], 10_000);
         assert_eq!(l.as_array().unwrap().len(), 50);
         assert_eq!(l[0]["name"], "u100");
+    }
+
+    #[test]
+    fn routes_parse_list_and_round_trip() {
+        let mut s = Session::virtual_lab();
+        let r = s
+            .execute("ppp.secret.add", &json!({
+                "name": "empresa", "password": "x", "remote_address": "100.64.9.1",
+                "routes": "203.0.113.8/29 0.0.0.0 1, 2001:db8:100::/48 :: 5,198.51.100.0/30 100.64.9.1"
+            }))
+            .unwrap();
+        assert!(r["warnings"].as_array().unwrap().is_empty(), "{r}");
+        let l = s.execute("ppp.secret.list", &json!({"find": "203.0.113"})).unwrap();
+        assert_eq!(l[0]["routes"], "203.0.113.8/29,2001:db8:100::/48 :: 5,198.51.100.0/30 100.64.9.1 1");
+        // A JSON list works too; "" clears.
+        s.execute("ppp.secret.set", &json!({"id": "empresa", "routes": ["203.0.113.8/29", "203.0.113.16/28"]})).unwrap();
+        assert_eq!(s.store().running().ppp.secrets[0].routes.len(), 2);
+        s.execute("ppp.secret.set", &json!({"id": "empresa", "routes": ""})).unwrap();
+        assert!(s.store().running().ppp.secrets[0].routes.is_empty());
+        // Saved as text (and read back by the persisted config).
+        s.execute("ppp.secret.set", &json!({"id": "empresa", "routes": "203.0.113.8/29"})).unwrap();
+        let j = serde_json::to_value(&s.store().running().ppp.secrets).unwrap();
+        assert_eq!(j[0]["routes"][0], "203.0.113.8/29");
+        let preview = s.execute("ppp.secret.preview", &json!({"id": "empresa", "comment": "x"})).unwrap();
+        assert!(preview["computed"].to_string().contains("203.0.113.8/29"), "{preview}");
+    }
+
+    #[test]
+    fn routes_that_would_blackhole_someone_are_refused() {
+        let mut s = Session::virtual_lab();
+        s.execute("ip.pool.add", &json!({"name": "cgnat", "ranges": "100.64.0.0/22"})).unwrap();
+        s.execute("ipv6.pool.add", &json!({"name": "pd", "prefix": "2001:db8:200::/40", "prefix_length": 56})).unwrap();
+        s.execute("ip.address.add", &json!({"address": "198.51.100.1/24", "interface": "ether1"})).unwrap();
+        s.execute("ppp.secret.add", &json!({"name": "a", "password": "x", "routes": "203.0.113.8/29"})).unwrap();
+        s.execute("ppp.secret.add", &json!({"name": "fixo", "password": "x", "remote_address": "192.0.2.77"})).unwrap();
+        for (routes, why) in [
+            ("203.0.113.0/24", "secret a"),
+            ("203.0.113.12/30", "secret a"),
+            ("100.64.1.0/29", "pool cgnat"),
+            ("2001:db8:200::/48", "IPv6 pool pd"),
+            ("198.51.100.0/29", "router's own address"),
+            ("192.0.2.72/29", "secret fixo"),
+            ("0.0.0.0/0", "wider"),
+            ("127.0.0.0/30", "loopback"),
+            ("fe80::/64", "link-local"),
+            ("10.0.0.1/24", "host bits"),
+            ("10.1.0.0/24,10.1.0.0/25", "same list"),
+        ] {
+            let err = s.execute("ppp.secret.add", &json!({"name": "b", "password": "x", "routes": routes})).unwrap_err();
+            assert!(err.to_string().contains(why), "{routes}: {err}");
+        }
+        // A gateway that is not the subscriber's fixed address is a typo.
+        let err = s
+            .execute("ppp.secret.add", &json!({"name": "b", "password": "x", "remote_address": "192.0.2.9", "routes": "203.0.114.0/29 203.0.114.1"}))
+            .unwrap_err();
+        assert!(err.to_string().contains("not the subscriber"), "{err}");
+        // Without a fixed address it is only a warning.
+        let r = s.execute("ppp.secret.add", &json!({"name": "c", "password": "x", "routes": "203.0.114.0/29 203.0.114.1"})).unwrap();
+        assert!(r["warnings"].to_string().contains("refused at login"), "{r}");
+        // A block inside a connected network warns.
+        let r = s.execute("ppp.secret.add", &json!({"name": "d", "password": "x", "routes": "198.51.100.64/29"})).unwrap();
+        assert!(r["warnings"].to_string().contains("inside 198.51.100.0/24"), "{r}");
+        // The other way round: pools and fixed addresses over a routed block.
+        let e = s.execute("ip.pool.add", &json!({"name": "p2", "ranges": "203.0.113.10-203.0.113.20"})).unwrap_err();
+        assert!(e.to_string().contains("secret a"), "{e}");
+        s.execute("ppp.secret.set", &json!({"id": "c", "routes": "2001:db8:300::/48"})).unwrap();
+        let e = s.execute("ipv6.pool.add", &json!({"name": "p6", "prefix": "2001:db8:300::/44", "prefix_length": 64})).unwrap_err();
+        assert!(e.to_string().contains("secret c"), "{e}");
+        let e = s.execute("ppp.secret.set", &json!({"id": "fixo", "remote_address": "203.0.113.9"})).unwrap_err();
+        assert!(e.to_string().contains("secret a"), "{e}");
+        // Its own routes do not conflict with themselves on set.
+        s.execute("ppp.secret.set", &json!({"id": "a", "routes": "203.0.113.8/29,203.0.113.16/29"})).unwrap();
+        // Rollback restores the routes and the index.
+        s.execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
+        s.execute("ppp.secret.remove", &json!({"id": "a"})).unwrap();
+        s.execute("ppp.secret.add", &json!({"name": "e", "password": "x", "routes": "203.0.113.8/29"})).unwrap();
+        s.execute("config.discard", &json!({})).unwrap();
+        let e = s.execute("ppp.secret.add", &json!({"name": "e", "password": "x", "routes": "203.0.113.8/29"})).unwrap_err();
+        assert!(e.to_string().contains("secret a"), "{e}");
+    }
+
+    #[test]
+    fn ten_thousand_secrets_with_routes_import_in_one_batch() {
+        let mut s = Session::virtual_lab();
+        let steps: Vec<Value> = (0..10_000u32)
+            .map(|i| {
+                let net = format!("{}.{}.{}.0/29", 20 + i / 65536, (i / 256) % 256, i % 256);
+                json!({"command": "ppp.secret.add", "params": {"name": format!("u{i}"), "password": "x", "routes": net}})
+            })
+            .collect();
+        let t = std::time::Instant::now();
+        s.batch(&Value::Array(steps), true).unwrap();
+        // O(log n) per route: a walk of every secret would be 50 M checks.
+        assert!(t.elapsed() < std::time::Duration::from_secs(60), "{:?}", t.elapsed());
+        let e = s.execute("ppp.secret.add", &json!({"name": "x", "password": "x", "routes": "20.0.7.0/24"})).unwrap_err();
+        assert!(e.to_string().contains("secret u7"), "{e}");
     }
 }

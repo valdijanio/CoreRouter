@@ -14,13 +14,13 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ppp.active.list", "PPP Active Connections", [], None,
-        "{find?: string (in name, caller id, address, IPv6 prefixes or circuit id), server?: string, limit?: int 1..100000 (default 10000)} → {total, running (the pppoe service is up), rows: [{id, name, service, caller_id, address?, uptime, uptime_secs, session_id, server, interface, vlan?, circuit_id?, remote_id?, rate_limit?, profile, encoding, radius, rx_bytes, tx_bytes, rx_packets, tx_packets, mtu, limit_bytes_in?, limit_bytes_out?, ipv6_prefix? (the link's /64, RA), delegated_prefix? (DHCPv6-PD), delegated_bound (held by the CPE's DHCPv6), link_local? (IPv6CP)}]}",
+        "{find?: string (in name, caller id, address, IPv6 prefixes, routes or circuit id), server?: string, limit?: int 1..100000 (default 10000)} → {total, running (the pppoe service is up), rows: [{id, name, service, caller_id, address?, uptime, uptime_secs, session_id, server, interface, vlan?, circuit_id?, remote_id?, rate_limit?, profile, encoding, radius, rx_bytes, tx_bytes, rx_packets, tx_packets, mtu, limit_bytes_in?, limit_bytes_out?, ipv6_prefix? (the link's /64, RA), delegated_prefix? (DHCPv6-PD), delegated_bound (held by the CPE's DHCPv6), link_local? (IPv6CP), routes?: [{route (dst gateway metric), origin: secret|framed-route|framed-ipv6-route|framed-ipv6-prefix}] (blocks routed to the session, G4.3cd), refused_routes?: [string] (why each other route was not installed)}]}",
         always, list),
     cmd!("ppp.active.remove", "Disconnect PPP Session", [], None,
         "{id?: string | [string] (the session ids of ppp.active.list; at most 100000), name?: string (every session of this user), server?: string (every session of this PPPoE server)} → {removed}",
         has_service, remove),
     cmd!(query "ppp.why", "Why PPP?", [], None,
-        "{name?: string (the user), mac?: mac (the CPE)} → {query, active?, attempts: [{stage, count}], last_stage?, last?: {at, event, stage?, reason, hint, reply_message?, address?, uptime_secs}}",
+        "{name?: string (the user), mac?: mac (the CPE)} → {query, active?, routes?: [{route, origin}], refused_routes?: [string] (of the active session: installed, and refused with why), attempts: [{stage, count}], last_stage?, last?: {at, event, stage?, reason, hint, reply_message?, address?, uptime_secs, routes?: [{route, origin}], refused_routes?: [string] (why each was not installed)}}",
         always, why),
     cmd!(query "ppp.history", "PPP History", [], None,
         "{name?: string, mac?: mac, event?: up|down|failed, limit?: int 1..10000 (default 500, newest first)} → [{at, name, caller_id, server, event, stage?, reason?, hint?, reply_message?, address?, uptime_secs, rx_bytes, tx_bytes}]",
@@ -83,6 +83,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
                     || a.address.is_some_and(|ip| ip.to_string().contains(n))
                     || a.circuit_id.as_deref().is_some_and(|c| c.to_lowercase().contains(n))
                     || [a.ipv6_prefix, a.delegated_prefix].iter().flatten().any(|p| p.to_string().contains(n))
+                    || a.routes.iter().any(|r| r.route.contains(n.as_str()))
             })
     };
     let (total, page) = b.active_page(&keep, limit as usize);
@@ -151,6 +152,15 @@ fn why(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(o) = v.as_object_mut() {
         if let Some(a) = &w.active {
             o.insert("active".into(), json!(a));
+            let (_, rows) = b.active_page(&|x: &ActiveSession| &x.id == a, 1);
+            if let Some(x) = rows.first() {
+                if !x.routes.is_empty() {
+                    o.insert("routes".into(), json!(x.routes));
+                }
+                if !x.refused_routes.is_empty() {
+                    o.insert("refused_routes".into(), json!(x.refused_routes));
+                }
+            }
         }
         if let Some(st) = w.last_stage {
             o.insert("last_stage".into(), json!(st.as_str()));
