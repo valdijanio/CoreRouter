@@ -357,6 +357,12 @@ fn doomed(from: &Config, to: &Config) -> Result<BTreeSet<IfName>, HalError> {
 
 /// The ordered operations that take the kernel from `from` to `to`.
 pub fn plan(from: &Config, to: &Config) -> Result<Vec<Op>, HalError> {
+    // The plan reads the interfaces (not their comments), the addresses
+    // and the routes: with those the same, nothing to do (G0.22: a commit
+    // elsewhere did not walk 10 000 routes twice).
+    if corerouter_model::sections::links_and_routes_same(from, to) {
+        return Ok(Vec::new());
+    }
     let doomed = doomed(from, to)?;
     // Links of `to` created by this plan: new virtual links and recreated ones.
     let fresh: BTreeSet<&IfName> = to
