@@ -469,6 +469,10 @@ pub struct PppSecret {
     pub limit_bytes_in: u64,
     #[serde(skip_serializing_if = "is_zero64")]
     pub limit_bytes_out: u64,
+    /// G4.3cd: blocks routed to the subscriber while it is up (RouterOS
+    /// `routes`, `dst-address gateway metric`; IPv4 and IPv6).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<crate::framed_route::FramedRoute>,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub comment: String,
     pub disabled: bool,
@@ -940,6 +944,9 @@ pub struct ActiveSession {
     pub delegated_bound: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_local: Option<Ipv6Addr>,
+    /// G4.3cd: the blocks routed to this session and where each came from.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<crate::framed_route::SessionRoute>,
 }
 
 /// One line of `ppp.history`: a login that came up, failed or ended.
@@ -969,6 +976,12 @@ pub struct HistoryEntry {
     pub uptime_secs: u64,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// G4.3cd, on `up`: the routes installed for the session…
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<crate::framed_route::SessionRoute>,
+    /// …and the ones refused, each with why (Portuguese, for "Why?").
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub refused_routes: Vec<String>,
 }
 
 /// `ppp.why`: where the logins of a user or MAC get to, and why the last
