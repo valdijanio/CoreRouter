@@ -148,9 +148,9 @@ impl Driver {
             .into_iter()
             .filter_map(|op| match op {
                 XdpOp::Remove(slot) => Some(PppoeOp::Remove(slot)),
-                XdpOp::Upsert { slot, interface, client_mac, ip, up, down } => {
+                XdpOp::Upsert { slot, interface, client_mac, ip, up, down, shape } => {
                     let (ifindex, mac) = *self.info.get(&interface)?;
-                    Some(PppoeOp::Upsert(slot, xdp_session(ifindex, mac, client_mac, ip, up, down)))
+                    Some(PppoeOp::Upsert(slot, xdp_session(ifindex, mac, client_mac, ip, up, down, shape)))
                 }
             })
             .collect();
