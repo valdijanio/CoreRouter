@@ -119,6 +119,12 @@ pub struct ServerConfig {
     /// workers, one per core) then share its SESSION_ID space without a
     /// lock (RFC 2516 §4: unique per port). `(0, 1)`: all of them.
     pub sid_lane: (u16, u16),
+    /// G4.3h: the AC-Cookie key of a redundant pair. Both nodes accept
+    /// each other's cookies (a PADR in flight at a switchover still
+    /// lands): the key is shared and the cookie does not bind the port
+    /// (its index differs between the two machines). `None`: a key of
+    /// this server's own, bound to the port.
+    pub cookie_secret: Option<[u8; 32]>,
 }
 
 impl ServerConfig {
@@ -158,6 +164,7 @@ impl Default for ServerConfig {
             setup_timeout_ms: 60_000,
             pado_queue: 4096,
             sid_lane: (0, 1),
+            cookie_secret: None,
         }
     }
 }
@@ -431,7 +438,8 @@ impl Server {
     pub fn new(mut cfg: ServerConfig, seed: [u8; 32], now: Millis) -> Server {
         cfg.max_sessions = cfg.max_sessions.clamp(1, MAX_SID);
         let mut rng = Rng::new(seed);
-        let cookie_key = rng.array::<32>();
+        let own_key = rng.array::<32>();
+        let cookie_key = cfg.cookie_secret.unwrap_or(own_key);
         let n = usize::from(cfg.max_sessions);
         Server {
             sessions: (0..=n).map(|_| None).collect(),
@@ -477,6 +485,11 @@ impl Server {
         {
             self.limiter = PadiLimiter::new(limits.0, limits.1, limits.2);
         }
+        if cfg.cookie_secret != self.cfg.cookie_secret
+            && let Some(k) = cfg.cookie_secret
+        {
+            self.cookies.rotate(k);
+        }
         let table = cfg.services != self.cfg.services;
         self.cfg = cfg;
         if table {
@@ -517,6 +530,11 @@ impl Server {
     /// Sessions that hold a SESSION_ID (any phase).
     pub fn active(&self) -> usize {
         self.active
+    }
+
+    /// The port a cookie binds: none in a redundant pair (G4.3h).
+    fn cookie_port(&self, ifindex: u32) -> u32 {
+        if self.cfg.cookie_secret.is_some() { 0 } else { ifindex }
     }
 
     /// Installs a new AC-Cookie secret; cookies under the old one stay valid
@@ -806,7 +824,7 @@ impl Server {
             self.stats.service_refused += 1;
             return;
         }
-        let cookie = self.cookies.issue(now, d.src, ifindex, d.vlans);
+        let cookie = self.cookies.issue(now, d.src, self.cookie_port(ifindex), d.vlans);
         let row_delay = match rule.action {
             ServiceAction::Delay => rule.delay_ms,
             _ => 0,
@@ -917,7 +935,7 @@ impl Server {
         let cookie_ok = d
             .tags
             .ac_cookie
-            .is_some_and(|c| self.cookies.verify(now, c, d.src, ifindex, d.vlans));
+            .is_some_and(|c| self.cookies.verify(now, c, d.src, self.cookie_port(ifindex), d.vlans));
         if self.cfg.require_cookie && !cookie_ok {
             self.stats.padr_bad_cookie += 1;
             return;
