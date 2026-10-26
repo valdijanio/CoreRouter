@@ -247,7 +247,7 @@ fn rfc2516_5_2_pado_carries_ac_name_same_service_and_echoes() {
 
 #[test]
 fn rfc2516_5_2_unserved_service_or_bad_padi_gets_no_answer() {
-    let (mut s, mut out) = server(|c| c.service_names = vec![b"internet".to_vec()]);
+    let (mut s, mut out) = server(|c| c.services = ServiceTable::only(&["internet"]));
     for f in [
         padi(HOST, |w| {
             w.tag(tag::SERVICE_NAME, b"iptv");
@@ -366,7 +366,7 @@ fn rfc2516_5_4_duplicate_padr_gets_the_same_session() {
 
 #[test]
 fn rfc2516_5_4_bad_service_in_padr_is_service_name_error_with_sid_zero() {
-    let (mut s, mut out) = server(|c| c.service_names = vec![b"internet".to_vec()]);
+    let (mut s, mut out) = server(|c| c.services = ServiceTable::only(&["internet"]));
     out.clear();
     let f = padi(HOST, |w| {
         w.tag(tag::SERVICE_NAME, b"internet");
@@ -770,4 +770,263 @@ fn sid_lanes_split_the_space_without_overlap() {
         seen[1..].iter().all(|n| *n == 1),
         "each SID in exactly one lane"
     );
+}
+
+// --- G4.3k: the Service-Name table ---
+
+fn rule(action: ServiceAction) -> ServiceRule {
+    ServiceRule {
+        action,
+        ..ServiceRule::default()
+    }
+}
+
+fn table() -> ServiceTable {
+    ServiceTable::new(
+        [
+            (b"internet".to_vec(), rule(ServiceAction::Terminate)),
+            (
+                b"backup".to_vec(),
+                ServiceRule {
+                    action: ServiceAction::Delay,
+                    delay_ms: 400,
+                    ..ServiceRule::default()
+                },
+            ),
+            (b"blocked".to_vec(), rule(ServiceAction::Drop)),
+        ],
+        rule(ServiceAction::Terminate),
+        rule(ServiceAction::Drop),
+    )
+}
+
+fn padi_named(src: Mac, name: &[u8]) -> Vec<u8> {
+    padi(src, |w| {
+        w.tag(tag::SERVICE_NAME, name);
+        w.tag(tag::HOST_UNIQ, b"hu");
+    })
+}
+
+fn pado_count(out: &ServerOutput) -> usize {
+    replies(out).iter().filter(|d| d.code == Code::Pado).count()
+}
+
+#[test]
+fn rfc2516_5_2_each_terminating_row_gets_a_pado_with_the_same_name() {
+    let (mut s, mut out) = server(|c| c.services = table());
+    for name in [&b"internet"[..], b""] {
+        out.clear();
+        s.handle_frame(0, 1, &padi_named(HOST, name), &mut out);
+        let r = replies(&out);
+        assert_eq!(r.len(), 1, "{name:?}");
+        // §5.2: "a Service-Name TAG identical to the one in the PADI".
+        assert_eq!(r[0].tags.service_name, Some(name));
+    }
+}
+
+#[test]
+fn rfc2516_5_2_drop_rows_and_unlisted_names_get_no_pado() {
+    let (mut s, mut out) = server(|c| c.services = table());
+    for name in [&b"blocked"[..], b"voip", b"INTERNET"] {
+        s.handle_frame(0, 1, &padi_named(HOST, name), &mut out);
+    }
+    // §5.2: "If the Access Concentrator can not serve the PADI it MUST
+    // NOT respond with a PADO."
+    assert!(out.frames.is_empty());
+    assert_eq!(s.stats().service_refused, 3);
+    assert_eq!(s.stats().padi_refused, 3);
+}
+
+#[test]
+fn rfc2516_5_4_padr_for_a_drop_row_is_service_name_error_with_sid_zero() {
+    let (mut s, mut out) = server(|c| c.services = table());
+    s.handle_frame(0, 1, &padi_named(HOST, b"internet"), &mut out);
+    // A valid AC-Cookie (it binds the host, not the name) with a name the
+    // table drops.
+    let padr = padr_from(&replies(&out)[0], HOST, |_| {});
+    let padr = {
+        let mut b = Vec::new();
+        let d = discovery::parse(&padr).unwrap();
+        let mut w = DiscoveryWriter::begin(&mut b, AC, HOST, Vlans::NONE, Code::Padr, 0);
+        w.tag(tag::SERVICE_NAME, b"blocked");
+        w.tag(tag::AC_COOKIE, d.tags.ac_cookie.unwrap());
+        w.finish().unwrap();
+        b
+    };
+    out.clear();
+    s.handle_frame(0, 1, &padr, &mut out);
+    let p = pads(&out).unwrap();
+    // §5.4: Service-Name-Error, SESSION_ID 0x0000.
+    assert_eq!(p.session_id, 0);
+    let err = p.tags.service_name_error.unwrap();
+    // Erratum 5634: the UTF-8 text MUST NOT be NULL-terminated.
+    assert!(!err.is_empty() && !err.ends_with(&[0]));
+    assert_eq!(p.tags.service_name, Some(&b"blocked"[..]));
+    assert_eq!(s.active(), 0);
+    s.check_invariants().unwrap();
+}
+
+#[test]
+fn delay_row_answers_after_its_delay_plus_the_load_delay() {
+    let (mut s, mut out) = server(|c| {
+        c.services = table();
+        c.pado_delay = vec![(0, 100)];
+    });
+    s.handle_frame(1000, 1, &padi_named(HOST, b"backup"), &mut out);
+    assert!(out.frames.is_empty());
+    s.handle_timers(1499, &mut out);
+    assert_eq!(pado_count(&out), 0);
+    s.handle_timers(1500, &mut out);
+    assert_eq!(pado_count(&out), 1, "400 ms of the row + 100 ms of load");
+    out.clear();
+    // A terminating row waits only the load delay.
+    s.handle_frame(2000, 1, &padi_named(HOST2, b"internet"), &mut out);
+    s.handle_timers(2100, &mut out);
+    assert_eq!(pado_count(&out), 1);
+}
+
+#[test]
+fn a_rows_max_sessions_and_padi_limit() {
+    let limited = ServiceTable::new(
+        [(
+            b"iptv".to_vec(),
+            ServiceRule {
+                max_sessions: 1,
+                ..ServiceRule::default()
+            },
+        )],
+        ServiceRule {
+            padi_limit: 1,
+            ..ServiceRule::default()
+        },
+        ServiceRule::default(),
+    );
+    let (mut s, mut out) = server(|c| c.services = limited);
+    let go = |s: &mut Server, out: &mut ServerOutput, now, mac, name: &[u8]| {
+        out.clear();
+        s.handle_frame(now, 1, &padi_named(mac, name), out);
+        let r = replies(out);
+        let pado = r.first()?;
+        let padr = padr_from(pado, mac, |_| {});
+        out.clear();
+        s.handle_frame(now, 1, &padr, out);
+        pads(out).map(|p| p.session_id)
+    };
+    assert!(go(&mut s, &mut out, 0, HOST, b"iptv").is_some_and(|sid| sid != 0));
+    // The row is full: another host gets no PADO, the server still serves
+    // other rows.
+    assert_eq!(go(&mut s, &mut out, 0, HOST2, b"iptv"), None);
+    assert!(go(&mut s, &mut out, 0, HOST2, b"other").is_some());
+    // The host of the row's session comes back (CPE reboot): it takes the
+    // old session's place (one-session-per-host).
+    assert!(go(&mut s, &mut out, 10, HOST, b"iptv").is_some_and(|sid| sid != 0));
+    assert_eq!(s.active(), 2);
+    // The empty row's 1 PADI/s.
+    let m = |i| Mac([2, 0x33, 0, 0, 0, i]);
+    out.clear();
+    s.handle_frame(20, 1, &padi_named(m(1), b""), &mut out);
+    s.handle_frame(21, 1, &padi_named(m(2), b""), &mut out);
+    assert_eq!(pado_count(&out), 1);
+    s.handle_frame(1100, 1, &padi_named(m(3), b""), &mut out);
+    assert_eq!(pado_count(&out), 2);
+    s.check_invariants().unwrap();
+    let rows = s.service_sessions();
+    assert_eq!(rows[0], (b"iptv".to_vec(), 1));
+    assert_eq!(rows.last(), Some(&(b"*".to_vec(), 1)));
+}
+
+#[test]
+fn the_profile_name_reaches_the_authentication() {
+    let mut l = lab(4, |c| {
+        c.server.services = table();
+        c.service_names = vec![b"internet".to_vec(), Vec::new()];
+    });
+    l.run_until(10_000);
+    assert_eq!(l.clients_up(), 4);
+    l.check().unwrap();
+    let names = l.auth_services.clone();
+    assert_eq!(
+        names.iter().filter(|n| n.as_slice() == b"internet").count(),
+        2,
+        "{names:?}"
+    );
+    assert_eq!(names.iter().filter(|n| n.is_empty()).count(), 2);
+}
+
+#[test]
+fn reconfiguring_the_table_recounts_the_rows() {
+    let (mut s, mut out) = server(|c| c.services = ServiceTable::default());
+    discover(&mut s, &mut out, 0, HOST);
+    discover(&mut s, &mut out, 0, HOST2);
+    let mut c = s.config().clone();
+    c.services = table();
+    s.reconfigure(c);
+    s.check_invariants().unwrap();
+    assert_eq!(
+        s.service_sessions()
+            .iter()
+            .find(|r| r.0.is_empty())
+            .map(|r| r.1),
+        Some(2)
+    );
+    // Back to "everything": still consistent.
+    let mut c = s.config().clone();
+    c.services = ServiceTable::only(&["x"]);
+    s.reconfigure(c);
+    s.check_invariants().unwrap();
+}
+
+proptest::proptest! {
+    /// Any table, any name: a PADO comes iff the name's row does not drop,
+    /// it echoes the name byte for byte, and a PADR then creates a session
+    /// or gets Service-Name-Error with SESSION_ID 0 — nothing else.
+    #[test]
+    fn prop_rfc2516_service_table(
+        rows in proptest::collection::vec(
+            (proptest::collection::vec(proptest::prelude::any::<u8>(), 0..6), 0u8..3, 0u32..3),
+            0..12,
+        ),
+        empty in 0u8..3,
+        any in 0u8..3,
+        asked in proptest::collection::vec(proptest::collection::vec(proptest::prelude::any::<u8>(), 0..6), 1..20),
+    ) {
+        let act = |a: u8| match a {
+            0 => ServiceAction::Terminate,
+            1 => ServiceAction::Delay,
+            _ => ServiceAction::Drop,
+        };
+        let t = ServiceTable::new(
+            rows.iter().map(|(n, a, m)| (n.clone(), ServiceRule { action: act(*a), delay_ms: 10, max_sessions: *m, padi_limit: 0 })),
+            rule(act(empty)),
+            rule(act(any)),
+        );
+        let (mut s, mut out) = server(|c| { c.services = t.clone(); c.one_session_per_host = false; });
+        for (i, name) in asked.iter().enumerate() {
+            let mac = Mac([2, 0x44, 0, 0, 0, i as u8]);
+            let now = i as u64 * 1000;
+            out.clear();
+            s.handle_frame(now, 1, &padi_named(mac, name), &mut out);
+            s.handle_timers(now + 50, &mut out);
+            let (slot, r) = t.lookup(name);
+            let offered = replies(&out).into_iter().find(|d| d.code == Code::Pado).map(|d| (d.tags.service_name.map(<[u8]>::to_vec), padr_from(&d, mac, |_| {})));
+            let full_before = s.service_sessions();
+            if r.action == ServiceAction::Drop {
+                proptest::prop_assert!(offered.is_none());
+                continue;
+            }
+            let Some((echo, padr)) = offered else {
+                // Only a full row may stay silent.
+                proptest::prop_assert!(r.max_sessions > 0, "slot {slot} silent");
+                continue;
+            };
+            proptest::prop_assert_eq!(echo.as_deref(), Some(name.as_slice()));
+            out.clear();
+            s.handle_frame(now + 60, 1, &padr, &mut out);
+            let p = pads(&out);
+            proptest::prop_assert!(p.is_some());
+            let p = p.unwrap();
+            proptest::prop_assert!(p.session_id != 0 || p.tags.ac_system_error.is_some(), "{full_before:?}");
+            s.check_invariants().map_err(proptest::test_runner::TestCaseError::fail)?;
+        }
+    }
 }
