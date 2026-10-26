@@ -196,30 +196,34 @@ fn bench(c: &mut Criterion) {
         });
         g.throughput(Throughput::Elements(STEPS as u64));
         for (kind, atomic) in [("batch_step", false), ("atomic_step", true)] {
-            g.bench_function(BenchmarkId::new(format!("queue_simple_add/{kind}"), n), |b| {
-                b.iter_custom(|iters| {
-                    let mut spent = Duration::ZERO;
-                    for _ in 0..iters {
-                        tag += 1;
-                        let steps: Vec<Value> = (0..STEPS)
-                            .map(|i| {
-                                json!({"command": "queue.simple.add", "params": {
-                                    "name": format!("b{tag}-{i}"),
-                                    "target": format!("172.16.{}.{}/32", i >> 8, i & 255),
-                                    "max_limit": "10M/50M",
-                                }})
-                            })
-                            .collect();
-                        let t = Instant::now();
-                        s.batch(&Value::Array(steps), atomic).unwrap();
-                        spent += t.elapsed();
-                        let ids: Vec<String> = (0..STEPS).map(|i| format!("b{tag}-{i}")).collect();
-                        s.execute("queue.simple.remove", &json!({"id": ids}))
-                            .unwrap();
-                    }
-                    spent
-                });
-            });
+            g.bench_function(
+                BenchmarkId::new(format!("queue_simple_add/{kind}"), n),
+                |b| {
+                    b.iter_custom(|iters| {
+                        let mut spent = Duration::ZERO;
+                        for _ in 0..iters {
+                            tag += 1;
+                            let steps: Vec<Value> = (0..STEPS)
+                                .map(|i| {
+                                    json!({"command": "queue.simple.add", "params": {
+                                        "name": format!("b{tag}-{i}"),
+                                        "target": format!("172.16.{}.{}/32", i >> 8, i & 255),
+                                        "max_limit": "10M/50M",
+                                    }})
+                                })
+                                .collect();
+                            let t = Instant::now();
+                            s.batch(&Value::Array(steps), atomic).unwrap();
+                            spent += t.elapsed();
+                            let ids: Vec<String> =
+                                (0..STEPS).map(|i| format!("b{tag}-{i}")).collect();
+                            s.execute("queue.simple.remove", &json!({"id": ids}))
+                                .unwrap();
+                        }
+                        spent
+                    });
+                },
+            );
         }
         g.throughput(Throughput::Elements(1));
     }
