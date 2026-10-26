@@ -157,23 +157,42 @@ impl<T> CowList<T> {
 
     /// The items `start..start + len` (fewer past the end), without
     /// walking the ones before.
-    pub fn range(&self, start: usize, len: usize) -> std::iter::Take<Iter<'_, T>> {
+    pub fn range(&self, start: usize, len: usize) -> Iter<'_, T> {
         let blocks = &self.spine.blocks;
-        let it = match self.spine.locate(start) {
-            Some((k, o)) => Iter {
-                blocks: blocks.get(k + 1..).unwrap_or_default().iter(),
-                front: blocks.get(k).and_then(|b| b.get(o..)).unwrap_or_default().iter(),
-                back: Default::default(),
-                left: self.len() - start,
-            },
-            None => Iter {
-                blocks: Default::default(),
-                front: Default::default(),
-                back: Default::default(),
-                left: 0,
-            },
+        let len = len.min(self.len().saturating_sub(start));
+        let empty = Iter {
+            blocks: Default::default(),
+            front: Default::default(),
+            back: Default::default(),
+            left: 0,
         };
-        it.take(len)
+        let Some(last) = (start + len).checked_sub(1).filter(|_| len > 0) else {
+            return empty;
+        };
+        let (Some((ka, oa)), Some((kb, ob))) = (self.spine.locate(start), self.spine.locate(last)) else {
+            return empty;
+        };
+        let slice = |k: usize, from: usize, to: usize| -> std::slice::Iter<'_, T> {
+            blocks
+                .get(k)
+                .and_then(|b| b.get(from..to))
+                .unwrap_or_default()
+                .iter()
+        };
+        if ka == kb {
+            return Iter {
+                blocks: Default::default(),
+                front: slice(ka, oa, ob + 1),
+                back: Default::default(),
+                left: len,
+            };
+        }
+        Iter {
+            blocks: blocks.get(ka + 1..kb).unwrap_or_default().iter(),
+            front: slice(ka, oa, blocks.get(ka).map_or(0, |b| b.len())),
+            back: slice(kb, 0, ob + 1),
+            left: len,
+        }
     }
 
     /// The blocks in order, as slices.
@@ -258,6 +277,37 @@ impl<T: Clone> CowList<T> {
                 spine.ends.push(n + 1);
             }
         }
+    }
+
+    /// Append items `start..start + len` of `src` (`false` past its end).
+    /// Whole blocks of `src` are shared, not copied: a list rebuilt from a
+    /// delta's copy runs costs the blocks that changed.
+    pub fn extend_from(&mut self, src: &Self, start: usize, len: usize) -> bool {
+        let Some(end) = start.checked_add(len).filter(|&e| e <= src.len()) else {
+            return false;
+        };
+        let mut at = start;
+        while at < end {
+            let Some((k, o)) = src.spine.locate(at) else {
+                return false;
+            };
+            let Some(b) = src.spine.blocks.get(k) else {
+                return false;
+            };
+            let take = (b.len() - o).min(end - at);
+            if o == 0 && take == b.len() {
+                let spine = self.spine_mut();
+                let n = spine.len();
+                spine.blocks.push(Arc::clone(b));
+                spine.ends.push(n + take);
+            } else {
+                for x in b.iter().skip(o).take(take) {
+                    self.push(x.clone());
+                }
+            }
+            at += take;
+        }
+        true
     }
 
     pub fn pop(&mut self) -> Option<T> {
@@ -713,6 +763,34 @@ mod tests {
             let back: CowList<u32> = serde_json::from_str(&json).unwrap();
             prop_assert_eq!(back, l);
         }
+    }
+
+    #[test]
+    fn range_walks_both_ways() {
+        let a: CowList<u32> = (0..1000).collect();
+        for (s, n) in [(0, 0), (0, 1000), (5, 10), (100, 300), (127, 2), (999, 5), (1000, 3), (2000, 1)] {
+            let want: Vec<u32> = (0..1000u32).skip(s).take(n).collect();
+            let got: Vec<u32> = a.range(s, n).copied().collect();
+            assert_eq!(got, want, "{s}+{n}");
+            let back: Vec<u32> = a.range(s, n).rev().copied().collect();
+            assert_eq!(back, want.iter().rev().copied().collect::<Vec<_>>(), "{s}+{n}");
+            assert_eq!(a.range(s, n).len(), want.len());
+        }
+    }
+
+    #[test]
+    fn extend_from_shares_whole_blocks() {
+        let a: CowList<u32> = (0..1000).collect();
+        let mut b = CowList::new();
+        assert!(b.extend_from(&a, 0, 300));
+        b.push(7);
+        assert!(b.extend_from(&a, 300, 700));
+        assert!(!b.extend_from(&a, 999, 2));
+        let want: Vec<u32> = (0..300).chain([7]).chain(300..1000).collect();
+        assert_eq!(b, want);
+        let shared = b.shared_blocks(&a);
+        assert!(shared.iter().filter(|(_, at)| at.is_some()).count() >= 5, "{shared:?}");
+        assert!(b.blocks().all(|x| !x.is_empty() && x.len() <= BLOCK));
     }
 
     #[test]

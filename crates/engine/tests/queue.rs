@@ -106,3 +106,50 @@ fn bound_leases_become_dynamic_queues() {
         "{l}"
     );
 }
+
+/// G4.9c: the modals' previews say what `add`/`set` would do and refuse
+/// what they would refuse, without changing anything.
+#[test]
+fn previews_check_without_changing() {
+    let mut s = Session::virtual_lab();
+    let p = ok(
+        &mut s,
+        "queue.simple.preview",
+        json!({"name": "ana", "target": "10.0.0.5", "max_limit": "10M/50M"}),
+    );
+    assert!(p["commands"][0]["command"] == "queue.simple.add", "{p}");
+    assert!(p["checks"].as_array().is_some(), "{p}");
+    let bad = ok(
+        &mut s,
+        "queue.simple.preview",
+        json!({"target": "10.0.0.5", "max_limit": "lots"}),
+    );
+    assert!(
+        bad["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["level"] == "error"),
+        "{bad}"
+    );
+    let t = ok(
+        &mut s,
+        "queue.type.preview",
+        json!({"name": "pcq-x", "kind": "pcq", "pcq_rate": "5M"}),
+    );
+    assert!(t["commands"][0]["command"] == "queue.type.add", "{t}");
+    let pip = ok(
+        &mut s,
+        "queue.per-ip.preview",
+        json!({"target": "10.0.0.0/24", "rate": "5M"}),
+    );
+    assert!(pip["commands"].as_array().is_some(), "{pip}");
+    assert!(
+        s.store().running().queue.simple.is_empty(),
+        "nothing applied"
+    );
+    assert!(
+        s.execute("queue.simple.preview", &json!({"nope": 1}))
+            .is_err()
+    );
+}
