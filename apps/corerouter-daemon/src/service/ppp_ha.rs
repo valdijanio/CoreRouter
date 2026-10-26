@@ -222,13 +222,51 @@ fn id_of(fingerprint: &str) -> u64 {
     section("id", fingerprint.as_bytes()).hash | 1
 }
 
-fn log(session: &Shared, level: &str, message: String, data: serde_json::Value) {
-    lock(session).log_event(
-        &["ppp", level],
-        corerouter_engine::logging::DAEMON,
-        message,
-        data,
-    );
+/// Log lines waiting for the engine's lock (the role machine never waits
+/// on it: a mass login holds it often, and a node that stops its hellos
+/// for 1.2 s gets its role taken). At most [`LOG_QUEUE`] wait.
+static LOGS: Mutex<VecDeque<(&'static str, String, serde_json::Value)>> = Mutex::new(VecDeque::new());
+const LOG_QUEUE: usize = 256;
+
+fn log(_session: &Shared, level: &'static str, message: String, data: serde_json::Value) {
+    let mut q = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+    if q.len() < LOG_QUEUE {
+        q.push_back((level, message, data));
+    }
+}
+
+/// The engine's lock if it is free now.
+fn try_session(session: &Shared) -> Option<std::sync::MutexGuard<'_, corerouter_engine::Session>> {
+    match session.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
+/// Writes the queued log lines, if the engine's lock is free.
+fn flush_logs(session: &Shared) {
+    let lines: Vec<_> = {
+        let mut q = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+        if q.is_empty() {
+            return;
+        }
+        q.drain(..).collect()
+    };
+    match try_session(session) {
+        Some(mut s) => {
+            for (level, message, data) in lines {
+                s.log_event(&["ppp", level], corerouter_engine::logging::DAEMON, message, data);
+            }
+        }
+        None => {
+            let mut q = LOGS.lock().unwrap_or_else(PoisonError::into_inner);
+            for l in lines.into_iter().rev() {
+                q.push_front(l);
+            }
+            q.truncate(LOG_QUEUE);
+        }
+    }
 }
 
 /// The config sections the two nodes must agree on, hashed.
@@ -247,6 +285,13 @@ fn sections(cfg: &corerouter_model::Config) -> Vec<corerouter_proto_ha::msg::Sec
         }).collect::<Vec<_>>()))),
         section("ppp.aaa", &j(json!(cfg.ppp.aaa))),
         section("ip.pool", &j(json!(cfg.ip.pools.pools))),
+        // Both must run as many workers (`pppoe_bng::ha::LANES`).
+        section(
+            "pppoe.workers",
+            &super::pppoe_bng::ha::LANES
+                .load(Ordering::Acquire)
+                .to_le_bytes(),
+        ),
     ]
 }
 
@@ -274,6 +319,66 @@ fn node_config(r: &Redundancy, id: u64, sections: Vec<corerouter_proto_ha::msg::
         link_key: hello::derive("link", r.secret.as_bytes()),
         sections,
     }
+}
+
+/// A worker waits for the pair's lock only past this many changes
+/// queued (memory bound); below, a busy lock leaves them for its next
+/// round.
+pub(crate) const PUBLISH_WAIT: usize = 65_536;
+
+/// The `pppoe` workers' changes (hot standby): into the publisher, while
+/// this node is the active one (elsewhere `Node` ignores them). The pair's
+/// lock may be busy for milliseconds (the sync thread encoding a snapshot
+/// into the link): then the changes come back, and the worker goes on
+/// serving its subscribers and hands them again next round.
+pub(crate) fn publish(
+    changes: Vec<super::pppoe_bng::ha::HaChange>,
+) -> Option<Vec<super::pppoe_bng::ha::HaChange>> {
+    use super::pppoe_bng::ha::HaChange;
+    let rt = runtime();
+    let now = rt.now();
+    let mut g = if changes.len() >= PUBLISH_WAIT {
+        rt.pair()
+    } else {
+        match rt.pair.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Some(changes),
+        }
+    };
+    let p = g.as_mut()?;
+    for c in changes {
+        match c {
+            HaChange::Up(k, v) => p.node.upsert(now, k, v),
+            HaChange::Gone(k) => p.node.remove(now, k),
+            HaChange::Counters(k, c) => p.node.counters(now, k, c),
+        }
+    }
+    None
+}
+
+/// This node takes the role: the replica's sessions for the `pppoe`
+/// workers to adopt (stateful), or none (they redial). Before the workers
+/// may answer: a frame of a session not adopted yet would get a PADT.
+fn hand_takeover(p: &Pair, t: &Transition) {
+    use super::pppoe_bng::ha::{TAKEOVER, TAKEOVER_GEN};
+    let records = t.stateful.then(|| {
+        p.node
+            .publisher()
+            .map(|pb| {
+                pb.iter()
+                    .filter_map(|(_, v, c)| {
+                        corerouter_proto_ha::record::SessionRecord::decode(v).ok().map(|mut r| {
+                            r.counters = c;
+                            r
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    *TAKEOVER.lock().unwrap_or_else(PoisonError::into_inner) = records.map(Arc::new);
+    TAKEOVER_GEN.fetch_add(1, Ordering::AcqRel);
 }
 
 fn record(p: &mut Pair, t: &Transition) {
@@ -356,10 +461,13 @@ mod linux {
         let mut events = Vec::new();
         loop {
             health.beat();
-            if Instant::now() >= next_cfg {
+            flush_logs(session);
+            // The config once a second, when the engine's lock is free (a
+            // busy engine delays it, never the hellos below).
+            let guard_now = if Instant::now() >= next_cfg { try_session(session) } else { None };
+            if let Some(s) = guard_now {
                 next_cfg = Instant::now() + Duration::from_secs(1);
                 let (r, secs, pppoe_ifs) = {
-                    let s = lock(session);
                     let cfg = s.store().running();
                     let ifs: Vec<IfName> = cfg
                         .ppp
@@ -370,6 +478,7 @@ mod linux {
                         .collect();
                     (cfg.ppp.redundancy.clone(), sections(cfg), ifs)
                 };
+                drop(s);
                 let sh = shared();
                 if !r.enabled {
                     if rt.pair().take().is_some() {
@@ -380,6 +489,7 @@ mod linux {
                     sh.enabled.store(false, Ordering::Release);
                     sh.answering.store(false, Ordering::Release);
                     health.listen(Vec::new());
+                super::super::pppoe_bng::HA_ACTIVE.store(false, Ordering::Release);
                     health.disabled(Some("ppp.redundancy.set enabled=no"));
                     if !health.sleep(Duration::from_millis(200)) {
                         return Ok(());
@@ -508,9 +618,13 @@ mod linux {
                     for e in &events {
                         if let Event::Role(t) = e {
                             record(p, t);
+                            if t.to == Role::Active {
+                                hand_takeover(p, t);
+                            }
                         }
                     }
                     shared().answering.store(p.node.answering(), Ordering::Release);
+                    super::super::pppoe_bng::HA_ACTIVE.store(p.node.answering(), Ordering::Release);
                 }
             }
             for (body, from_vmac) in access_out.drain(..) {
@@ -548,6 +662,7 @@ mod linux {
                 *rt.pair() = None;
                 shared().enabled.store(false, Ordering::Release);
                 shared().answering.store(false, Ordering::Release);
+                super::super::pppoe_bng::HA_ACTIVE.store(false, Ordering::Release);
                 return Ok(());
             }
         }

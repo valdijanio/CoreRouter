@@ -811,6 +811,11 @@ impl Interims {
         Some(due)
     }
 
+    /// A session already has its interims scheduled.
+    pub fn has(&self, session: &str) -> bool {
+        self.by_session.contains_key(session)
+    }
+
     pub fn remove(&mut self, session: &str) {
         if let Some(k) = self.by_session.remove(session) {
             self.entries.remove(&k);
@@ -1179,28 +1184,33 @@ impl<'a> Driver<'a> {
         if req.service == AaaService::Ppp && !self.cfg.ppp.accounting {
             return;
         }
-        match req.status {
-            AcctStatus::Start => {
-                let interval = req.interim_secs.unwrap_or(match req.service {
-                    AaaService::Ppp => self.cfg.ppp.interim_update,
-                    _ => 0,
-                });
-                if let (Some(src), true) = (source, interval > 0) {
-                    let jitter = self.cfg.ppp.interim_jitter;
-                    if self
-                        .interims
-                        .add(req.clone(), src, interval, jitter, now)
-                        .is_none()
-                    {
-                        self.log(
-                            "warning",
-                            "RADIUS: limite de sessões com interim atingido".into(),
-                        );
-                    }
+        // G4.3h: the first Interim of a session taken over from the other
+        // BNG of a redundant pair (its Start went from there) also
+        // schedules the next ones, under the same Acct-Session-Id.
+        let schedule = req.status == AcctStatus::Start
+            || (req.status == AcctStatus::InterimUpdate
+                && source.is_some()
+                && !self.interims.has(&req.session_id));
+        if schedule {
+            let interval = req.interim_secs.unwrap_or(match req.service {
+                AaaService::Ppp => self.cfg.ppp.interim_update,
+                _ => 0,
+            });
+            if let (Some(src), true) = (source, interval > 0) {
+                let jitter = self.cfg.ppp.interim_jitter;
+                if self
+                    .interims
+                    .add(req.clone(), src, interval, jitter, now)
+                    .is_none()
+                {
+                    self.log(
+                        "warning",
+                        "RADIUS: limite de sessões com interim atingido".into(),
+                    );
                 }
             }
-            AcctStatus::Stop => self.interims.remove(&req.session_id),
-            AcctStatus::InterimUpdate => {}
+        } else if req.status == AcctStatus::Stop {
+            self.interims.remove(&req.session_id);
         }
         self.send_acct(req, now);
     }

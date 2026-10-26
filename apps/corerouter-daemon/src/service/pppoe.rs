@@ -215,6 +215,7 @@ mod linux {
             let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
             if w == 0 { pppoe_workers_auto(cpus) } else { w }
         };
+        super::super::pppoe_bng::ha::LANES.store(lanes, std::sync::atomic::Ordering::Release);
         let first = Bng::first_of(seed(), lanes);
         let shared = first.shared.clone();
         let routes = (first.clone_routes(), first.clone_routes6());
@@ -288,7 +289,12 @@ mod linux {
                     health.disabled(None);
                 }
                 d.errors.clear();
-                let (infos, changed) = d.open_ports(&wanted);
+                let (mut infos, changed) = d.open_ports(&wanted);
+                // G4.3h: a redundant pair answers from its virtual MAC.
+                if ppp.redundancy.enabled {
+                    let vmac = ppp.redundancy.mac().0;
+                    infos.values_mut().for_each(|p| p.mac = vmac);
+                }
                 if changed {
                     d.send_senders();
                 }
@@ -364,8 +370,13 @@ mod linux {
         let mut configured = false;
         let mut last_tick = Instant::now();
         let mut errors: Vec<String> = Vec::new();
+        let mut was_serving = true;
         loop {
             let now = ms();
+            // G4.3h: a takeover first (its sessions before any frame).
+            if bng.ha_pending() {
+                let _ = bng.ha_adopt_pending(now);
+            }
             let mut wait = WAIT;
             if let Some(d) = bng.next_deadline() {
                 wait = wait.min(Duration::from_millis(d.saturating_sub(now)));
@@ -387,7 +398,13 @@ mod linux {
                     Ok(m) => {
                         let now = ms();
                         match m {
-                            Msg::Frame(ifindex, f) => bng.frame(now, ifindex, &f),
+                            // G4.3h: only the active node of a pair hears
+                            // its subscribers.
+                            Msg::Frame(ifindex, f) => {
+                                if bng.serving() {
+                                    bng.frame(now, ifindex, &f);
+                                }
+                            }
                             Msg::Down(p) => bng.data_down(&p),
                             Msg::Config(snap, infos, xdp) => {
                                 bng.xdp = xdp;
@@ -406,6 +423,13 @@ mod linux {
                 }
             }
             let now = ms();
+            // G4.3h: the role went to the peer; stateless, the sessions end
+            // here without a frame (the subscribers redial on the new active).
+            let serving = bng.serving();
+            if was_serving && !serving {
+                bng.abandon(now);
+            }
+            was_serving = serving;
             bng.radius(now);
             bng.timers(now);
             bng.requests(now);
@@ -441,6 +465,19 @@ mod linux {
         session: &Shared,
         errors: &mut Vec<String>,
     ) {
+        // G4.3h: hot standby, what changed goes to the pair's other node.
+        let changes = bng.ha_take(ms());
+        if !changes.is_empty()
+            && let Some(back) = super::super::ppp_ha::publish(changes)
+        {
+            bng.ha_requeue(back);
+        }
+        // G4.3h: a node that is not the active one of its pair sends
+        // nothing, not even the PADT to a session it does not know (it
+        // would end the subscriber's session on the active node).
+        if !bng.serving() {
+            bng.frames.clear();
+        }
         for (ifindex, f) in bng.frames.drain(..) {
             if let Some(p) = ports.get(&ifindex)
                 && let Err(e) = p.send(&f)
@@ -472,8 +509,8 @@ mod linux {
                 other => locked.push(other),
             }
         }
-        // The round's routes (/32, routed blocks, G4.3l's IPv6 prefixes) in
-        // one go on the worker's own connection.
+        // The round's routes (/32, routed blocks and IPv6 prefixes) in one
+        // go on the worker's own connection.
         if let Some(s) = slow {
             for r in [s.prefixes(&routes), s.routes6(&routes6)] {
                 if let Err(e) = r
@@ -645,7 +682,7 @@ mod linux {
             }
             if let Some(s) = self.slow.as_mut()
                 && let Err(e) = s.recv(|p| {
-                    // IPv4 by its /32, else a block routed to it; IPv6 by
+                    // IPv4 by its /32 (else a block routed to it), IPv6 by
                     // the longest prefix (G4.3l).
                     let lane = if p.first().is_some_and(|b| b >> 4 == 6) {
                         let dst = p.get(24..40).and_then(|d| <[u8; 16]>::try_from(d).ok());

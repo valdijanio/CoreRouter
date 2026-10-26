@@ -165,6 +165,16 @@ fn scale(c: &mut Criterion) {
                     b.iter(|| validate_all(black_box(cfg)));
                 },
             );
+            // G0.22: each validator on its own (what threads could split).
+            if n == 10_000 && kind == "routes" {
+                for u in corerouter_engine::validate::UNITS {
+                    g.bench_with_input(
+                        BenchmarkId::new(format!("validate_unit/{}/{kind}", u.name), n),
+                        &cfg,
+                        |b, cfg| b.iter(|| (u.run)(black_box(cfg))),
+                    );
+                }
+            }
             // One more commit that touches nothing of the big list.
             let mut s = session_with(&cfg);
             let mut flip = false;
