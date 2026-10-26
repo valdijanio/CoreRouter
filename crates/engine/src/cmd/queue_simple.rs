@@ -35,6 +35,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("queue.simple.move", "Move Simple Queue", [], None,
         "{id: *hex | name, destination?: *hex | name (it goes above this one; none: to the end)} → {id, position}",
         always, move_to),
+    cmd!(query "queue.simple.preview", "Simple Queue Preview", [], None,
+        "{id?: *hex | name, name?: string, target?: string, max_limit?: string, limit_at?: string, burst_limit?: string, burst_threshold?: string, burst_time?: string, bucket_size?: string, priority?: string, queue?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
     cmd!(query "queue.simple.list", "Simple Queues", [], None,
         "{find?: string (in name, target or comment), origin?: fixed|dynamic|pppoe|ipoe|dhcp-lease|dhcp-network, limit?: int 1..100000 (default 10000)} → {total, running (a data plane shapes), note?, rows: [{id, name, dynamic, disabled, origin, target, max_limit, limit_at, burst_limit, burst_threshold, burst_time, bucket_size, priority, queue, download_mode, comment?, warnings: [string], rate_bps: [up, down], bytes: [up, down], packets: [up, down], dropped: [up, down], queued_us: [up, down] (wait of a packet entering now), pcq_queues}]}",
         always, list),
@@ -156,7 +159,13 @@ fn check(q: &SimpleQueue) -> Result<()> {
 
 pub(super) fn warnings(s: &Session, q: &SimpleQueue) -> Vec<String> {
     let mut w = Vec::new();
-    if q.max_limit == Rates::default() {
+    // A PCQ type with a rate limits each address by itself (per-IP): the
+    // queue's own max-limit may stay 0/0.
+    let types = &s.store().candidate().queue;
+    let pcq_rate = [&q.queue.upload, &q.queue.download]
+        .into_iter()
+        .any(|n| types.queue_type(n).is_some_and(|t| t.kind == corerouter_model::queue::Kind::Pcq && t.pcq_rate != 0));
+    if q.max_limit == Rates::default() && !pcq_rate {
         w.push("max-limit 0/0: the queue only counts, it limits nothing".into());
     }
     if q.limit_at != Rates::default() || q.priority != Pair::both(corerouter_model::queue::DEFAULT_PRIORITY) {
@@ -230,7 +239,9 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     q.id = queues.next_id();
     let out = json!({"id": q.id, "name": q.name});
     match before {
-        Some(i) if i <= queues.simple.len() => queues.simple.insert(i, q),
+        Some(i) if i <= queues.simple.len() => {
+            queues.simple.insert(i, q);
+        }
         _ => queues.simple.push(q),
     }
     with_plan_warnings(s, out, w)
@@ -240,7 +251,22 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
 /// (shadowed targets, overlaps with dynamic queues).
 fn with_plan_warnings(s: &Session, mut out: Value, mut w: Vec<String>) -> Result<Value> {
     let id = out.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
-    let plan = crate::queue::plan(s.store().candidate(), crate::queue::dhcp_dynamic(s));
+    let dynamic = crate::queue::dhcp_dynamic(s);
+    if dynamic.is_empty() {
+        let cfg = s.store().candidate();
+        if let Some(i) = cfg.queue.simple.iter().position(|q| q.id.to_string() == id) {
+            for x in crate::queue::fixed_warnings(cfg, i) {
+                if !w.contains(&x) {
+                    w.push(x);
+                }
+            }
+        }
+        if let Some(o) = out.as_object_mut() {
+            o.insert("warnings".into(), json!(w));
+        }
+        return Ok(out);
+    }
+    let plan = crate::queue::plan(s.store().candidate(), dynamic);
     if let Some(i) = plan.queues.iter().position(|q| q.key == id) {
         w.extend(plan.warnings_of(i).iter().cloned());
     }
@@ -308,10 +334,9 @@ fn move_to(s: &mut Session, p: &Value) -> Result<Value> {
     let from = index_of(s, raw)?;
     let to = opt_str(p, "destination")?.map(|d| index_of(s, d)).transpose()?;
     let simple = &mut s.store_mut().candidate_mut().queue.simple;
-    if from >= simple.len() {
+    let Some(q) = simple.remove(from) else {
         return Err(EngineError::bad("id", "gone"));
-    }
-    let q = simple.remove(from);
+    };
     let id = q.id;
     let at = match to {
         // The destination moved up by one when the queue left above it.
@@ -322,6 +347,49 @@ fn move_to(s: &mut Session, p: &Value) -> Result<Value> {
     .min(simple.len());
     simple.insert(at, q);
     Ok(json!({"id": id, "position": at}))
+}
+
+/// The modal's preview: `add`/`set`'s checks and warnings (shadowed
+/// targets, overlaps with dynamic queues), and what the queue does. An
+/// emptied field of an edit goes back to its default.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        for (k, default) in [
+            ("max_limit", "0"),
+            ("limit_at", "0"),
+            ("burst_limit", "0"),
+            ("burst_threshold", "0"),
+            ("burst_time", "0"),
+            ("bucket_size", "0.1"),
+            ("priority", "8"),
+            ("queue", corerouter_model::queue::DEFAULT_SIMPLE_TYPE),
+        ] {
+            if o.get(k).and_then(Value::as_str).is_some_and(|t| t.trim().is_empty()) {
+                o.insert(k.into(), json!(default));
+            }
+        }
+        if o.get("name").and_then(Value::as_str).is_some_and(|t| t.trim().is_empty()) {
+            o.remove("name");
+        }
+    }
+    super::ppp_common::preview(s, &q, ("queue.simple.add", "queue.simple.set"), (add, set), |s, v| {
+        let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+        let plan = crate::queue::plan(s.store().candidate(), crate::queue::dhcp_dynamic(s));
+        let Some(q) = plan.queues.iter().find(|q| q.key == id) else {
+            return Vec::new();
+        };
+        let mode = |l: &crate::queue::Limit| match l.max_limit {
+            0 => "no limit".to_owned(),
+            r => format!("{} ({})", rate_text(r), l.queue.name),
+        };
+        let installed = plan.prefixes.values().filter(|i| plan.queues.get(**i).is_some_and(|x| x.key == q.key)).count();
+        vec![
+            json!({"label": "Download", "value": format!("shaped at {}", mode(&q.download))}),
+            json!({"label": "Upload", "value": format!("policed at {}", mode(&q.upload))}),
+            json!({"label": "Targets in force", "value": format!("{installed} of {}", q.targets.len())}),
+        ]
+    })
 }
 
 /// One list row.

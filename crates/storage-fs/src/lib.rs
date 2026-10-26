@@ -304,6 +304,10 @@ impl ConfigStorage for FileStorage {
         true
     }
 
+    fn config_journal(&self) -> bool {
+        true
+    }
+
     fn list_revisions(&mut self) -> Result<Vec<u32>, StorageError> {
         let entries = fs::read_dir(&self.dir).map_err(|e| self.err("list", &e))?;
         let mut found = Vec::new();

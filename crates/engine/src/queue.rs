@@ -249,6 +249,55 @@ fn covering(set: &HashMap<IpNet, usize>, n: &IpNet) -> Option<(IpNet, usize)> {
     })
 }
 
+/// The plan's warnings of fixed queue `idx` alone, without dynamic queues:
+/// the same first-match walk as [`plan`] over the queues up to it, reading
+/// only their targets. `add`/`set` call it per command; the whole plan per
+/// command made a batch of 10 000 adds spend ~45 s in it (**medido**, G4.9c).
+pub fn fixed_warnings(cfg: &Config, idx: usize) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut fixed_at: HashMap<IpNet, usize> = HashMap::new();
+    let mut fixed_if: HashMap<&IfName, usize> = HashMap::new();
+    let simple = &cfg.queue.simple;
+    for (i, q) in simple.iter().enumerate().take(idx.saturating_add(1)) {
+        if q.disabled {
+            continue;
+        }
+        for t in &q.target {
+            match t {
+                Target::Prefix(n) => {
+                    if let Some((wider, j)) = covering(&fixed_at, n) {
+                        if i == idx {
+                            let other = simple.get(j).map(|o| o.name.as_str()).unwrap_or_default();
+                            let what = if wider == *n { "the same target as" } else { "inside the target of" };
+                            push_once(&mut out, format!("{n} is {what} queue '{other}' above it: it never matches here (move this queue above '{other}')"));
+                        }
+                        continue;
+                    }
+                    fixed_at.insert(*n, i);
+                }
+                Target::Interface(name) => {
+                    if let Some(j) = fixed_if.get(name) {
+                        if i == idx {
+                            let other = simple.get(*j).map(|o| o.name.as_str()).unwrap_or_default();
+                            push_once(&mut out, format!("interface {name} is already the target of queue '{other}' above it"));
+                        }
+                        continue;
+                    }
+                    fixed_if.insert(name, i);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// [`Plan::warn`]'s rule: at most 8, no repeats.
+fn push_once(v: &mut Vec<String>, w: String) {
+    if v.len() < 8 && !v.contains(&w) {
+        v.push(w);
+    }
+}
+
 /// Resolve `cfg`'s fixed queues and `dynamic` into a plan.
 pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
     dynamic.sort_by_key(|q| q.origin);
@@ -260,10 +309,13 @@ pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
     p.queues.extend(fixed(cfg));
     // Fixed first (first match), so the dynamic ones can be checked
     // against what the fixed queues would hold.
+    // Warnings wait here: the loops read the queues by reference (cloning
+    // each one made the plan of 10 000 queues ~60 ms, G4.9c).
+    let mut pending: Vec<(usize, String)> = Vec::new();
     let mut fixed_at: HashMap<IpNet, usize> = HashMap::new();
     let mut fixed_if: HashMap<IfName, usize> = HashMap::new();
     for i in n_dyn..p.queues.len() {
-        let Some(q) = p.queues.get(i).cloned() else {
+        let Some(q) = p.queues.get(i) else {
             continue;
         };
         if q.disabled {
@@ -275,7 +327,7 @@ pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
                     if let Some((wider, j)) = covering(&fixed_at, n) {
                         let other = p.queues.get(j).map(|o| o.name.clone()).unwrap_or_default();
                         let what = if wider == *n { "the same target as" } else { "inside the target of" };
-                        p.warn(i, format!("{n} is {what} queue '{other}' above it: it never matches here (move this queue above '{other}')"));
+                        pending.push((i, format!("{n} is {what} queue '{other}' above it: it never matches here (move this queue above '{other}')")));
                         continue;
                     }
                     fixed_at.insert(*n, i);
@@ -283,7 +335,7 @@ pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
                 Target::Interface(name) => {
                     if let Some(j) = fixed_if.get(name) {
                         let other = p.queues.get(*j).map(|o| o.name.clone()).unwrap_or_default();
-                        p.warn(i, format!("interface {name} is already the target of queue '{other}' above it"));
+                        pending.push((i, format!("interface {name} is already the target of queue '{other}' above it")));
                         continue;
                     }
                     fixed_if.insert(name.clone(), i);
@@ -295,7 +347,7 @@ pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
     let mut dyn_at: HashMap<IpNet, usize> = HashMap::new();
     let mut overlapped: HashSet<(usize, usize)> = HashSet::new();
     for i in 0..n_dyn {
-        let Some(q) = p.queues.get(i).cloned() else {
+        let Some(q) = p.queues.get(i) else {
             continue;
         };
         for t in &q.targets {
@@ -304,7 +356,7 @@ pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
             };
             if let Some(j) = dyn_at.get(n) {
                 let other = p.queues.get(*j).map(|o| (o.name.clone(), o.origin)).unwrap_or((String::new(), Origin::Fixed));
-                p.warn(i, format!("{n} is held by {} queue '{}': this one does not apply", other.1.as_str(), other.0));
+                pending.push((i, format!("{n} is held by {} queue '{}': this one does not apply", other.1.as_str(), other.0)));
                 continue;
             }
             dyn_at.insert(*n, i);
@@ -312,10 +364,13 @@ pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
                 && overlapped.insert((i, j))
             {
                 let fixed_name = p.queues.get(j).map(|o| o.name.clone()).unwrap_or_default();
-                p.warn(i, format!("takes {n} from fixed queue '{fixed_name}' (a {} queue wins on its own address)", q.origin.as_str()));
-                p.warn(j, format!("{} queue '{}' takes {n} (dynamic queues win on their addresses)", q.origin.as_str(), q.name));
+                pending.push((i, format!("takes {n} from fixed queue '{fixed_name}' (a {} queue wins on its own address)", q.origin.as_str())));
+                pending.push((j, format!("{} queue '{}' takes {n} (dynamic queues win on their addresses)", q.origin.as_str(), q.name)));
             }
         }
+    }
+    for (i, w) in pending {
+        p.warn(i, w);
     }
     // A fixed target equal to a dynamic one is taken by the dynamic queue.
     for (n, i) in &dyn_at {
@@ -700,7 +755,7 @@ mod tests {
     #[test]
     fn disabled_and_interfaces() {
         let mut c = cfg(&[("off", "10.0.0.0/8"), ("a", "ether2"), ("b", "ether2,10.1.0.0/16")]);
-        c.queue.simple[0].disabled = true;
+        c.queue.simple.get_mut(0).unwrap().disabled = true;
         let p = plan(&c, vec![]);
         assert_eq!(at(&p, "10.1.0.0/16").as_deref(), Some("b"), "a disabled queue hides nothing");
         assert_eq!(p.interfaces.len(), 1);
@@ -732,11 +787,39 @@ mod tests {
         assert!(Queue::dynamic("k".into(), "n".into(), Origin::Pppoe, vec![], "fast", &Queues::default(), "x", DownloadMode::Shaper).is_none());
     }
 
+    /// `fixed_warnings` (one queue, per command) says what the whole plan
+    /// says of that queue, over many orderings of overlapping targets.
+    #[test]
+    fn fixed_warnings_match_the_plan() {
+        let pool = ["10.0.0.0/8", "10.1.0.0/16", "10.1.2.0/24", "10.1.2.3", "10.2.0.0/16", "ether2", "ether3", "2001:db8::/32", "2001:db8:1::/48"];
+        let mut seed = 7u64;
+        let mut next = || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        for _ in 0..300 {
+            let n = 1 + next() % 8;
+            let mut c = Config::default();
+            for i in 0..n {
+                let k = 1 + next() % 2;
+                let t: Vec<&str> = (0..k).map(|_| pool[next() % pool.len()]).collect();
+                let Ok(targets) = parse_targets(&t.join(",")) else { continue };
+                let mut q = SimpleQueue::new(ItemId(i as u32 + 1), format!("q{i}"), targets);
+                q.disabled = next() % 7 == 0;
+                c.queue.simple.push(q);
+            }
+            let p = plan(&c, Vec::new());
+            for i in 0..c.queue.simple.len() {
+                assert_eq!(fixed_warnings(&c, i), p.warnings_of(i), "queue {i} of {:?}", c.queue.simple.iter().map(|q| (&q.target, q.disabled)).collect::<Vec<_>>());
+            }
+        }
+    }
+
     #[test]
     fn shaper_plan_ports_and_kinds() {
         let mut c = Session::virtual_lab().store().running().clone();
         c.queue = cfg(&[("lan", "192.168.88.0/24"), ("far", "203.0.113.0/24"), ("off", "10.9.9.9")]).queue;
-        c.queue.simple[2].disabled = true;
+        c.queue.simple.get_mut(2).unwrap().disabled = true;
         c.ip.addresses = corerouter_model::cow_list::CowList::from(vec![corerouter_model::AddressEntry {
             id: ItemId(1),
             address: "192.168.88.1/24".parse().unwrap(),

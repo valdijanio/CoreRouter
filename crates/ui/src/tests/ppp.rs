@@ -131,7 +131,7 @@ fn active_connections_show_the_login_rate_and_counters() {
     assert!(crate::chip::split(&maria.cells[0]).1.iter().any(|(_, t)| *t == "R"), "RADIUS mark");
     assert!(crate::chip::split(&rows[0].cells[8]).1.iter().any(|(_, t)| *t == "50M/100M"));
     assert_eq!(rows[0].cells[7], "1h2m3s");
-    assert_eq!(rows[0].cells[9], "1.4 MiB");
+    assert_eq!(rows[0].cells[11], "1.4 MiB");
 }
 
 /// G4.3e: the /64 and the delegated prefix of a session, the selo saying
@@ -308,11 +308,12 @@ fn the_service_name_table_under_the_servers() {
 /// stacked server's VLANs.
 #[test]
 fn qinq_vlans_in_the_rows() {
+    let vlan = crate::ppp::ACTIVE_COLUMNS.iter().position(|c| c.title == "VLAN").unwrap();
     let r = json!({"id": "*1-1", "name": "ana", "vlan": 120, "inner_vlan": 3044});
     let row = PppPanel::active_row(&r, None);
-    assert_eq!(crate::chip::split(&row.cells[12]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["120/3044"]);
+    assert_eq!(crate::chip::split(&row.cells[vlan]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["120/3044"]);
     let r = json!({"id": "*1-2", "name": "bia", "vlan": 110});
-    assert_eq!(crate::chip::split(&PppPanel::active_row(&r, None).cells[12]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["110"]);
+    assert_eq!(crate::chip::split(&PppPanel::active_row(&r, None).cells[vlan]).1.iter().map(|(_, t)| *t).collect::<Vec<_>>(), ["110"]);
     let srv = json!({"id": "*3", "name": "pppoe-ether2", "interface": "ether2", "vlan_mode": "stacked", "outer_vlan_range": "100-103", "inner_vlan_range": "any", "outer_tpid": "0x88a8"});
     let row = PppPanel::server_row(&srv);
     let (text, chips) = crate::chip::split(&row.cells[6]);
@@ -442,6 +443,10 @@ fn every_explanation_exists_in_both_languages() {
         "ppp.monitor.ipv6_sessions",
         "ppp.monitor.delegated",
         "ppp.monitor.ipv6_dropped",
+        "ppp.profile.download_mode",
+        "ppp.profile.queue_type",
+        "ppp.active.queue",
+        "ppp.active.drops",
         "ppp.secret.routes",
         "ppp.active.routes",
         "ppp.why.routes",

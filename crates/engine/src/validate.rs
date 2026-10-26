@@ -40,7 +40,8 @@ const BIG: Sections = Sections::ADDRESSES
     .union(Sections::DNS_STATIC)
     .union(Sections::DNS_ZONES)
     .union(Sections::DHCP_SERVER)
-    .union(Sections::PPP_SECRETS);
+    .union(Sections::PPP_SECRETS)
+    .union(Sections::QUEUE);
 
 /// Every section but the big ones and the interfaces' comments (which no
 /// validator reads), plus `extra`: what a `proto-*` validator declares,

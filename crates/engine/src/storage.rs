@@ -98,6 +98,16 @@ pub trait ConfigStorage: Send {
         false
     }
 
+    /// Whether the config journal is kept (G0.22): a commit appends its
+    /// delta to journal [`CONFIG_JOURNAL`] instead of rewriting the slot
+    /// with the whole config, and the slot is rewritten now and then (a
+    /// checkpoint, `crate::history_files`). Needs [`Self::revision_files`]
+    /// and journals that outlive the process. `false` (the default): every
+    /// save rewrites the slot.
+    fn config_journal(&self) -> bool {
+        false
+    }
+
     /// Numbers of the revision files present (any order).
     fn list_revisions(&mut self) -> Result<Vec<u32>, StorageError> {
         Ok(Vec::new())
@@ -123,6 +133,9 @@ pub trait ConfigStorage: Send {
     }
 }
 
+/// The journal of commits since the slot was last written (G0.22).
+pub const CONFIG_JOURNAL: &str = "config";
+
 /// Largest journal read back (**estimado**: a /12 of leases at ~200 bytes
 /// a line, with room for the lines since the last compaction).
 pub const MAX_JOURNAL_BYTES: usize = 512 << 20;
@@ -143,6 +156,8 @@ pub fn state_name_ok(name: &str) -> bool {
 
 #[derive(Debug, Default)]
 struct Slots {
+    /// The config journal is off ([`MemoryStorage::slots_only`]).
+    no_journal: bool,
     current: Option<String>,
     previous: Option<String>,
     quarantined: Vec<String>,
@@ -159,6 +174,14 @@ pub struct MemoryStorage(Arc<Mutex<Slots>>);
 impl MemoryStorage {
     fn with<T>(&self, f: impl FnOnce(&mut Slots) -> T) -> T {
         f(&mut self.0.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// A storage without the config journal (G0.22): every save writes the
+    /// slot, as a storage that does not keep journals does.
+    pub fn slots_only() -> Self {
+        let s = Self::default();
+        s.with(|x| x.no_journal = true);
+        s
     }
 
     /// Overwrite a slot directly (tests: simulate corruption).
@@ -183,6 +206,23 @@ impl MemoryStorage {
     /// Revision file `number` (tests: inspect or corrupt it).
     pub fn revision(&self, number: u32) -> Option<String> {
         self.with(|s| s.revisions.get(&number).cloned())
+    }
+
+    /// Journal `name` (tests: inspect or corrupt it).
+    pub fn journal(&self, name: &str) -> Option<String> {
+        self.with(|s| s.journals.get(name).cloned())
+    }
+
+    /// Overwrite or delete journal `name` (tests).
+    pub fn put_journal(&self, name: &str, data: Option<String>) {
+        self.with(|s| match data {
+            Some(d) => {
+                s.journals.insert(name.to_owned(), d);
+            }
+            None => {
+                s.journals.remove(name);
+            }
+        });
     }
 
     /// Overwrite or delete revision file `number` (tests).
@@ -274,6 +314,10 @@ impl ConfigStorage for MemoryStorage {
 
     fn revision_files(&self) -> bool {
         true
+    }
+
+    fn config_journal(&self) -> bool {
+        !self.with(|s| s.no_journal)
     }
 
     fn list_revisions(&mut self) -> Result<Vec<u32>, StorageError> {

@@ -186,7 +186,7 @@ fn all_64_revisions_of_a_big_config_survive_a_reboot() {
 
 #[test]
 fn a_broken_revision_file_costs_it_and_the_older_ones_only() {
-    let storage = MemoryStorage::default();
+    let storage = MemoryStorage::slots_only();
     let mut s = boot(&storage);
     for i in 0..8 {
         rename(&mut s, &format!("r{i}"));
@@ -219,7 +219,7 @@ fn a_broken_revision_file_costs_it_and_the_older_ones_only() {
 
 #[test]
 fn a_difference_that_does_not_fit_its_base_is_refused() {
-    let storage = MemoryStorage::default();
+    let storage = MemoryStorage::slots_only();
     let mut s = boot(&storage);
     for i in 0..5 {
         rename(&mut s, &format!("r{i}"));
@@ -245,7 +245,7 @@ fn a_difference_that_does_not_fit_its_base_is_refused() {
             r#"{"format_version":1,"number":3,"comment":"x","timestamp":null,"base":4,"delta":{"o":{"system":{"=":7}}}}"#,
         ),
     ] {
-        let copy = MemoryStorage::default();
+        let copy = MemoryStorage::slots_only();
         copy.put(Slot::Current, storage.get(Slot::Current));
         for k in 0..5 {
             copy.put_revision(k, storage.revision(k));
@@ -332,7 +332,7 @@ fn full_copy_revision_files_from_g1_23_load_and_become_differences() {
 
 #[test]
 fn a_revision_file_newer_than_the_slot_is_replaced() {
-    let storage = MemoryStorage::default();
+    let storage = MemoryStorage::slots_only();
     let mut s = boot(&storage);
     rename(&mut s, "one");
     rename(&mut s, "two");

@@ -9,7 +9,13 @@
 //!   (each step commits); the time is per batch of 100;
 //! - `ppp_secret_add/atomic_step/N`: the same 100 adds in one atomic batch
 //!   (one commit at the end);
-//! - `ppp_secret_set/single/N`: a comment on the secret in the middle.
+//! - `ppp_secret_set/single/N`: a comment on the secret in the middle;
+//! - `identity_set/queues/N` (G4.9 × G0.22): `system.identity.set` with N
+//!   simple queues in place, a commit that touches none of them;
+//! - `ipoe_index/secret_add/N` (G0.21 × G4.3f): what the DHCP round pays to
+//!   follow a config with N IPoE secrets and N static leases with a rate
+//!   after one `ppp.secret.add`; `ipoe_index/lease_set/N`: after one lease's
+//!   `rate_limit` changed.
 //!
 //! The adds are removed again outside the timing, so N stays put.
 //!
@@ -18,11 +24,14 @@
 // A benchmark is test code: fixtures may unwrap (clippy.toml only covers #[test]).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
+use corerouter_engine::ipoe::{IpoeIndex, IpoeView};
 use corerouter_engine::{MemoryStorage, Session, Slot};
-use corerouter_model::ppp::PppSecret;
-use corerouter_model::{ConfigStore, ItemId, persist};
+use corerouter_model::dhcp_server::StaticLease;
+use corerouter_model::ppp::{PppSecret, PppService};
+use corerouter_model::{Config, ConfigStore, ItemId, persist};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use serde_json::{Value, json};
 
@@ -122,7 +131,99 @@ fn bench(c: &mut Criterion) {
         }
         g.throughput(Throughput::Elements(1));
     }
+    {
+        let n = 10_000usize;
+        let mut s = Session::virtual_lab();
+        let steps: Vec<Value> = (0..n)
+            .map(|i| {
+                json!({"command": "queue.simple.add", "params": {
+                    "name": format!("q{i}"),
+                    "target": format!("10.{}.{}.{}/32", i >> 16, (i >> 8) & 255, i & 255),
+                    "max_limit": "10M/50M",
+                }})
+            })
+            .collect();
+        s.batch(&Value::Array(steps), true).unwrap();
+        assert_eq!(s.store().running().queue.simple.len(), n);
+        let mut flip = false;
+        g.bench_function(BenchmarkId::new("identity_set/queues", n), |b| {
+            b.iter(|| {
+                flip = !flip;
+                let name = if flip { "a" } else { "b" };
+                s.execute("system.identity.set", &json!({"name": name}))
+                    .unwrap()
+            });
+        });
+    }
+    for n in [1_000_u32, 10_000, 100_000] {
+        let base = ipoe_config(n);
+        let mut idx = IpoeIndex::of(&base);
+        let mut tag = 0_u32;
+        g.bench_function(BenchmarkId::new("ipoe_index/secret_add", n), |b| {
+            b.iter_custom(|iters| {
+                let mut spent = Duration::ZERO;
+                for _ in 0..iters {
+                    tag += 1;
+                    let mut cfg = base.clone();
+                    cfg.ppp.secrets.push(PppSecret {
+                        id: ItemId(n + tag),
+                        name: format!("novo{tag}"),
+                        service: PppService::Ipoe,
+                        ..PppSecret::default()
+                    });
+                    let t = Instant::now();
+                    idx.refresh(&cfg);
+                    spent += t.elapsed();
+                    assert!(
+                        IpoeView::new(&cfg, &idx)
+                            .secret(&format!("novo{tag}"))
+                            .is_some()
+                    );
+                }
+                spent
+            });
+        });
+        g.bench_function(BenchmarkId::new("ipoe_index/lease_set", n), |b| {
+            b.iter_custom(|iters| {
+                let mut spent = Duration::ZERO;
+                for _ in 0..iters {
+                    tag += 1;
+                    let mut cfg = base.clone();
+                    let leases = &mut cfg.ip.dhcp_server.leases;
+                    if let Some(l) = leases.get_mut(n as usize / 2) {
+                        l.rate_limit = format!("{tag}M/{tag}M");
+                    }
+                    let t = Instant::now();
+                    idx.refresh(&cfg);
+                    spent += t.elapsed();
+                }
+                spent
+            });
+        });
+    }
     g.finish();
+}
+
+/// `n` IPoE secrets and `n` static leases with a rate, the indexes of the
+/// secrets already built (as a running config that served lookups).
+fn ipoe_config(n: u32) -> Config {
+    let mut cfg = Config::default();
+    for i in 0..n {
+        cfg.ppp.secrets.push(PppSecret {
+            id: ItemId(i + 1),
+            name: format!("olt1/{i}"),
+            service: PppService::Ipoe,
+            ..PppSecret::default()
+        });
+    }
+    let leases = &mut cfg.ip.dhcp_server.leases;
+    for i in 0..n {
+        let mut l = StaticLease::new(ItemId(i + 1), Ipv4Addr::from(0x6440_0000 + i));
+        l.rate_limit = "10M/50M".into();
+        leases.push(l);
+    }
+    let _ = cfg.ppp.secrets.by_name("olt1/0");
+    cfg
 }
 
 criterion_group!(benches, bench);
