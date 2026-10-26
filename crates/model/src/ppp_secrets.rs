@@ -1,17 +1,21 @@
 //! `/ppp secret` as a list with a name index (G4.3g).
 //!
-//! The list is a [`CowArc`] like every big section. The index by name is
-//! built on the first lookup and shared by the copies of the config (the
-//! PPPoE service clones the config every second). [`Secrets::push`] keeps
-//! it up to date (an import of 100 000 subscribers stays O(n)); any other
-//! write through `DerefMut` drops it, and the next lookup rebuilds it.
+//! The list is a [`CowList`] (G4.3gb): a write copies one block, not the
+//! 100 000 secrets of a big base. The index by name is built on the first
+//! lookup and shared by the copies of the config (the PPPoE service clones
+//! the config every second); it is a [`CowMap`] from the name to the
+//! secret's id, kept up to date by [`Secrets::push`], [`Secrets::update`]
+//! and [`Secrets::remove`] (a write copies one leaf of it). Any other write
+//! through `DerefMut` drops it, and the next lookup rebuilds it. A config
+//! with a name twice (edited by hand) keeps the old rule: the first wins,
+//! and a write that touches such a name rebuilds.
 //!
 //! G4.3cd: an index of the secrets' `routes` the same way, so the overlap
-//! check of an add is O(log n) instead of a walk of every secret.
+//! check of an add is O(log n) instead of a walk of every secret. It maps
+//! to ids too: removing a secret moves the ones after it.
 //!
 //! Serialized exactly like the list.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, OnceLock};
@@ -20,27 +24,64 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use ipnet::IpNet;
 
-use crate::cow::CowArc;
+use crate::cow_list::CowList;
+use crate::cow_map::CowMap;
 use crate::framed_route::RouteSet;
 use crate::ppp::PppSecret;
+use crate::types::ItemId;
 
-type Index = Arc<HashMap<String, usize>>;
-type RouteIndex = Arc<RouteSet<usize>>;
-/// Fixed `remote_address` → secrets (by position), sorted by address.
-type FixedIndex = Arc<std::collections::BTreeMap<u32, Vec<usize>>>;
+/// Name → id; `dup`: some name is there twice (the index then gives up
+/// on incremental updates of that name).
+#[derive(Clone, Default)]
+struct Index {
+    by_name: CowMap<String, ItemId>,
+    dup: bool,
+}
+
+/// Block → id; `.1`: two secrets claim one block (a config edited by
+/// hand): a removal rebuilds, so the next claimant takes it over.
+type RouteIndex = Arc<(RouteSet<ItemId>, bool)>;
+
+/// Fixed `remote_address` → secrets, bucketed by /24 (the high 24 bits),
+/// so a range of a few blocks reads a few buckets (G4.3cd).
+type FixedIndex = CowMap<u32, Vec<(u32, ItemId)>>;
 
 #[derive(Default)]
 pub struct Secrets {
-    list: CowArc<Vec<PppSecret>>,
+    list: CowList<PppSecret>,
     index: OnceLock<Index>,
     routes: OnceLock<RouteIndex>,
     fixed: OnceLock<FixedIndex>,
 }
 
+fn fixed_add(m: &mut FixedIndex, ip: std::net::Ipv4Addr, id: ItemId) {
+    let ip = u32::from(ip);
+    let mut v = m.get(&(ip >> 8)).cloned().unwrap_or_default();
+    v.push((ip, id));
+    m.insert(ip >> 8, v);
+}
+
+fn fixed_drop(m: &mut FixedIndex, ip: std::net::Ipv4Addr, id: ItemId) {
+    let ip = u32::from(ip);
+    let Some(mut v) = m.get(&(ip >> 8)).cloned() else {
+        return;
+    };
+    v.retain(|&x| x != (ip, id));
+    if v.is_empty() {
+        m.remove(&(ip >> 8));
+    } else {
+        m.insert(ip >> 8, v);
+    }
+}
+
 impl Secrets {
     pub fn new(list: Vec<PppSecret>) -> Self {
+        Self::from_list(CowList::from(list))
+    }
+
+    pub fn from_list(list: CowList<PppSecret>) -> Self {
         Self {
-            list: CowArc::new(list),
+            list,
             index: OnceLock::new(),
             routes: OnceLock::new(),
             fixed: OnceLock::new(),
@@ -49,103 +90,220 @@ impl Secrets {
 
     fn fixed_index(&self) -> &FixedIndex {
         self.fixed.get_or_init(|| {
-            let mut m: std::collections::BTreeMap<u32, Vec<usize>> = std::collections::BTreeMap::new();
-            for (k, s) in self.list.iter().enumerate() {
+            let mut m = FixedIndex::new();
+            for s in &self.list {
                 if let Some(ip) = s.remote_address {
-                    m.entry(u32::from(ip)).or_default().push(k);
+                    fixed_add(&mut m, ip, s.id);
                 }
             }
-            Arc::new(m)
+            m
         })
     }
 
-    /// The secrets whose fixed `remote_address` is inside `net`, in
-    /// O(log n + hits) (G4.3cd: a routed block must not take another
-    /// subscriber's fixed address; a walk of every secret per block made an
-    /// import of business secrets O(n²): 634 µs each over 100 000, **medido**).
+    /// The secrets whose fixed `remote_address` is inside `net`, in list
+    /// order (G4.3cd: a routed block must not take another subscriber's
+    /// fixed address; a walk of every secret per block made an import of
+    /// business secrets O(n²): 634 µs each over 100 000, **medido**). Reads
+    /// one bucket per /24 of `net`, or every bucket when there are fewer.
     pub fn fixed_in(&self, net: &ipnet::Ipv4Net) -> Vec<&PppSecret> {
         let (a, b) = (u32::from(net.network()), u32::from(net.broadcast()));
-        self.fixed_index()
-            .range(a..=b)
-            .flat_map(|(_, v)| v.iter())
-            .filter_map(|&k| self.list.get(k))
-            .collect()
+        let m = self.fixed_index();
+        let inside = |&(ip, _): &(u32, ItemId)| (a..=b).contains(&ip);
+        let mut ids: Vec<ItemId> = if u64::from((b >> 8) - (a >> 8)) < m.len() as u64 {
+            (a >> 8..=b >> 8)
+                .filter_map(|k| m.get(&k))
+                .flat_map(|v| v.iter().copied().filter(inside))
+                .map(|(_, id)| id)
+                .collect()
+        } else {
+            m.iter()
+                .flat_map(|(_, v)| v.iter().copied().filter(inside))
+                .map(|(_, id)| id)
+                .collect()
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        let mut out: Vec<(usize, &PppSecret)> = ids
+            .into_iter()
+            .filter_map(|id| self.position(id).and_then(|i| self.list.get(i).map(|s| (i, s))))
+            .collect();
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter().map(|(_, s)| s).collect()
     }
 
     fn route_index(&self) -> &RouteIndex {
         self.routes.get_or_init(|| {
             let mut set = RouteSet::new();
-            for (k, s) in self.list.iter().enumerate() {
+            let mut clash = false;
+            for s in &self.list {
                 for r in &s.routes {
                     // An overlap the commands would have refused (a config
                     // edited by hand): the first secret keeps the block.
-                    let _ = set.insert(r.dst, k);
+                    clash |= set.insert(r.dst, s.id).is_err();
                 }
             }
-            Arc::new(set)
+            Arc::new((set, clash))
         })
+    }
+
+    /// The secret with id `id`, in O(log n) (the list is in id order:
+    /// a new secret gets the next id).
+    pub fn by_id(&self, id: ItemId) -> Option<&PppSecret> {
+        self.position(id).and_then(|i| self.list.get(i))
+    }
+
+    /// Position of the secret with id `id`.
+    pub fn position(&self, id: ItemId) -> Option<usize> {
+        self.list.find_by_key(|s| s.id, &id)
+    }
+
+    fn owners<'a>(&'a self, hits: impl Iterator<Item = (&'a IpNet, &'a ItemId)>) -> Vec<(&'a IpNet, &'a PppSecret)> {
+        hits.filter_map(|(n, &id)| self.by_id(id).map(|s| (n, s))).collect()
     }
 
     /// The secrets whose `routes` share an address with `dst`.
     pub fn route_owners(&self, dst: &IpNet) -> Vec<(&IpNet, &PppSecret)> {
-        self.route_index()
-            .overlapping(dst)
-            .filter_map(|(n, &k)| self.list.get(k).map(|s| (n, s)))
-            .collect()
+        self.owners(self.route_index().0.overlapping(dst))
     }
 
     /// The secrets whose `routes` share an address with `first..=last`.
     pub fn route_owners_in(&self, first: std::net::IpAddr, last: std::net::IpAddr) -> Vec<(&IpNet, &PppSecret)> {
-        self.route_index()
-            .overlapping_range(first, last)
-            .filter_map(|(n, &k)| self.list.get(k).map(|s| (n, s)))
-            .collect()
+        self.owners(self.route_index().0.overlapping_range(first, last))
     }
 
     fn index(&self) -> &Index {
         self.index.get_or_init(|| {
-            let mut m = HashMap::with_capacity(self.list.len());
-            for (k, s) in self.list.iter().enumerate() {
+            let mut ix = Index::default();
+            for s in &self.list {
                 // The first of a name wins, as a walk of the list would.
-                m.entry(s.name.clone()).or_insert(k);
+                if ix.by_name.contains_key(s.name.as_str()) {
+                    ix.dup = true;
+                } else {
+                    ix.by_name.insert(s.name.clone(), s.id);
+                }
             }
-            Arc::new(m)
+            ix
         })
     }
 
-    /// The secret named `name`, in O(1).
+    /// The secret named `name`, in O(1) plus the O(log n) id lookup.
     pub fn by_name(&self, name: &str) -> Option<&PppSecret> {
-        self.index()
-            .get(name)
-            .and_then(|&k| self.list.get(k))
-            .filter(|s| s.name == name)
+        let &id = self.index().by_name.get(name)?;
+        match self.by_id(id) {
+            Some(s) if s.name == name => Some(s),
+            // Two secrets with one id (never from the commands; a config
+            // is repaired on load): the walk.
+            _ => self.list.iter().find(|s| s.name == name),
+        }
     }
 
-    /// Append, keeping the index (copied once if another config shares it).
-    pub fn push(&mut self, s: PppSecret) {
-        let k = self.list.len();
-        if let Some(ix) = self.index.get_mut() {
-            Arc::make_mut(ix).entry(s.name.clone()).or_insert(k);
-        }
+    /// The indexes learn that `s` is in the list.
+    fn index_add(&mut self, s: &PppSecret) {
         if let Some(fx) = self.fixed.get_mut()
             && let Some(ip) = s.remote_address
         {
-            Arc::make_mut(fx).entry(u32::from(ip)).or_default().push(k);
+            fixed_add(fx, ip, s.id);
+        }
+        if let Some(ix) = self.index.get_mut() {
+            if ix.by_name.contains_key(s.name.as_str()) {
+                // A name twice (the commands refuse it): which one is
+                // first is the walk's to say.
+                self.index = OnceLock::new();
+            } else {
+                ix.by_name.insert(s.name.clone(), s.id);
+            }
         }
         if let Some(rx) = self.routes.get_mut()
             && !s.routes.is_empty()
         {
             let rx = Arc::make_mut(rx);
-            for r in &s.routes {
-                let _ = rx.insert(r.dst, k);
+            if s.routes.iter().any(|r| rx.0.insert(r.dst, s.id).is_err()) {
+                self.routes = OnceLock::new();
             }
         }
+    }
+
+    /// The indexes forget `s` (already out of the list, or about to be
+    /// replaced). A duplicated name or route makes them rebuild instead.
+    fn index_drop(&mut self, s: &PppSecret) {
+        if let Some(fx) = self.fixed.get_mut()
+            && let Some(ip) = s.remote_address
+        {
+            fixed_drop(fx, ip, s.id);
+        }
+        if let Some(ix) = self.index.get_mut() {
+            if ix.dup {
+                self.index = OnceLock::new();
+            } else if ix.by_name.get(s.name.as_str()) == Some(&s.id) {
+                ix.by_name.remove(s.name.as_str());
+            }
+        }
+        if let Some(rx) = self.routes.get_mut()
+            && !s.routes.is_empty()
+        {
+            let rx = Arc::make_mut(rx);
+            if rx.1 {
+                self.routes = OnceLock::new();
+                return;
+            }
+            for r in &s.routes {
+                match rx.0.remove(&r.dst) {
+                    Some(id) if id == s.id => {}
+                    _ => {
+                        // Held by another secret (a config edited by
+                        // hand): the walk decides who keeps it.
+                        self.routes = OnceLock::new();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Append, keeping the indexes.
+    pub fn push(&mut self, s: PppSecret) {
+        self.index_add(&s);
         self.list.push(s);
+    }
+
+    /// Change the secret at `i` with `f`, keeping the indexes. Only its
+    /// block of the list is copied.
+    pub fn update<R>(&mut self, i: usize, f: impl FnOnce(&mut PppSecret) -> R) -> Option<R> {
+        let old = self.list.get(i)?;
+        let (name, routes, id, fixed) = (old.name.clone(), old.routes.clone(), old.id, old.remote_address);
+        let x = self.list.get_mut(i)?;
+        let r = f(x);
+        let keys_moved = x.name != name || x.routes != routes || x.id != id || x.remote_address != fixed;
+        if keys_moved {
+            let now = x.clone();
+            let before = PppSecret {
+                id,
+                name,
+                routes,
+                remote_address: fixed,
+                ..PppSecret::default()
+            };
+            self.index_drop(&before);
+            self.index_add(&now);
+        }
+        Some(r)
+    }
+
+    /// Remove the secret at `i`, keeping the indexes.
+    pub fn remove(&mut self, i: usize) -> Option<PppSecret> {
+        let s = self.list.remove(i)?;
+        self.index_drop(&s);
+        Some(s)
     }
 
     /// Both share the same list (nothing was copied between them).
     pub fn ptr_eq(a: &Self, b: &Self) -> bool {
-        CowArc::ptr_eq(&a.list, &b.list)
+        CowList::ptr_eq(&a.list, &b.list)
+    }
+
+    /// The list itself (for a revision delta).
+    pub fn list(&self) -> &CowList<PppSecret> {
+        &self.list
     }
 }
 
@@ -153,7 +311,7 @@ impl Clone for Secrets {
     fn clone(&self) -> Self {
         let index = OnceLock::new();
         if let Some(ix) = self.index.get() {
-            let _ = index.set(Arc::clone(ix));
+            let _ = index.set(ix.clone());
         }
         let routes = OnceLock::new();
         if let Some(rx) = self.routes.get() {
@@ -161,7 +319,7 @@ impl Clone for Secrets {
         }
         let fixed = OnceLock::new();
         if let Some(fx) = self.fixed.get() {
-            let _ = fixed.set(Arc::clone(fx));
+            let _ = fixed.set(fx.clone());
         }
         Self {
             list: self.list.clone(),
@@ -173,15 +331,16 @@ impl Clone for Secrets {
 }
 
 impl Deref for Secrets {
-    type Target = Vec<PppSecret>;
-    fn deref(&self) -> &Vec<PppSecret> {
+    type Target = CowList<PppSecret>;
+    fn deref(&self) -> &CowList<PppSecret> {
         &self.list
     }
 }
 
-/// Any write but [`Secrets::push`]: the index is dropped.
+/// Any write but [`Secrets::push`], [`Secrets::update`] and
+/// [`Secrets::remove`]: the indexes are dropped.
 impl DerefMut for Secrets {
-    fn deref_mut(&mut self) -> &mut Vec<PppSecret> {
+    fn deref_mut(&mut self) -> &mut CowList<PppSecret> {
         self.index = OnceLock::new();
         self.routes = OnceLock::new();
         self.fixed = OnceLock::new();
@@ -203,7 +362,7 @@ impl FromIterator<PppSecret> for Secrets {
 
 impl<'a> IntoIterator for &'a Secrets {
     type Item = &'a PppSecret;
-    type IntoIter = std::slice::Iter<'a, PppSecret>;
+    type IntoIter = crate::cow_list::Iter<'a, PppSecret>;
     fn into_iter(self) -> Self::IntoIter {
         self.list.iter()
     }
@@ -231,7 +390,7 @@ impl Serialize for Secrets {
 
 impl<'de> Deserialize<'de> for Secrets {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        Vec::<PppSecret>::deserialize(d).map(Self::new)
+        CowList::<PppSecret>::deserialize(d).map(Self::from_list)
     }
 }
 
@@ -239,8 +398,15 @@ impl<'de> Deserialize<'de> for Secrets {
 mod tests {
     use super::*;
 
+    /// Ids in add order, as `ppp.secret.add` gives them.
+    fn next_id() -> ItemId {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+        ItemId(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn s(name: &str, password: &str) -> PppSecret {
         PppSecret {
+            id: next_id(),
             name: name.into(),
             password: password.into(),
             ..PppSecret::default()
@@ -282,6 +448,7 @@ mod tests {
     #[test]
     fn route_owners_follow_writes() {
         let with = |name: &str, routes: &str| PppSecret {
+            id: next_id(),
             name: name.into(),
             routes: crate::framed_route::FramedRoute::parse_list(routes).unwrap(),
             ..PppSecret::default()
@@ -305,6 +472,7 @@ mod tests {
     #[test]
     fn fixed_addresses_by_range_follow_writes() {
         let fixed = |name: &str, ip: &str| PppSecret {
+            id: next_id(),
             name: name.into(),
             remote_address: Some(ip.parse().unwrap()),
             ..PppSecret::default()
@@ -316,8 +484,13 @@ mod tests {
         v.push(fixed("c", "203.0.113.10"));
         assert_eq!(names(&v, "203.0.113.8/29"), ["a", "c"]);
         assert!(names(&v, "203.0.113.16/29").is_empty());
+        let copy = v.clone();
         v.remove(0);
         assert_eq!(names(&v, "203.0.113.0/24"), ["c"]);
+        assert_eq!(names(&copy, "203.0.113.0/16"), ["a", "c"]);
+        v.update(1, |x| x.remote_address = Some("198.51.100.1".parse().unwrap()));
+        assert!(names(&v, "203.0.113.0/24").is_empty());
+        assert_eq!(names(&v, "0.0.0.0/0"), ["c"]);
     }
 
     #[test]
@@ -327,5 +500,61 @@ mod tests {
         assert!(j.is_array());
         let back: Secrets = serde_json::from_value(j).unwrap();
         assert_eq!(back, v);
+    }
+
+    proptest::proptest! {
+        /// The kept indexes answer what a walk of the list answers, after
+        /// any run of adds, renames, route changes and removals, with
+        /// copies taken on the way.
+        #[test]
+        fn kept_indexes_match_a_walk(ops in proptest::collection::vec((0u8..4, 0u16..40, 0u8..8), 1..120)) {
+            let net = |k: u8| format!("203.0.{k}.0/29");
+            let mut v = Secrets::default();
+            let mut copies = Vec::new();
+            for (op, a, b) in ops {
+                let n = v.len();
+                match op {
+                    0 => {
+                        let mut x = s(&format!("u{a}"), "p");
+                        if b > 4 {
+                            x.routes = crate::framed_route::FramedRoute::parse_list(&net(b)).unwrap();
+                        }
+                        let _ = v.by_name("warm");
+                        let _ = v.route_owners(&net(b).parse().unwrap());
+                        v.push(x);
+                    }
+                    1 if n > 0 => { v.update(usize::from(a) % n, |x| x.name = format!("u{b}")); }
+                    2 if n > 0 => {
+                        let _ = v.fixed_in(&"10.0.0.0/24".parse().unwrap());
+                        v.update(usize::from(a) % n, |x| {
+                            x.routes = crate::framed_route::FramedRoute::parse_list(&net(b)).unwrap();
+                            x.remote_address = (b > 2).then(|| std::net::Ipv4Addr::new(10, 0, 0, b));
+                        });
+                    }
+                    3 if n > 0 => { v.remove(usize::from(a) % n); }
+                    _ => {}
+                }
+                if b == 0 { copies.push(v.clone()); }
+                copies.push(v.clone());
+            }
+            for c in &copies {
+                let fixed: Vec<ItemId> = c.fixed_in(&"10.0.0.0/29".parse().unwrap()).iter().map(|x| x.id).collect();
+                let walk: Vec<ItemId> = c.iter().filter(|x| x.remote_address.is_some_and(|ip| ip.octets()[3] < 8 && ip.octets()[..3] == [10, 0, 0])).map(|x| x.id).collect();
+                proptest::prop_assert_eq!(fixed, walk);
+                for k in 0..40 {
+                    let name = format!("u{k}");
+                    let walk = c.iter().find(|x| x.name == name).map(|x| x.id);
+                    proptest::prop_assert_eq!(c.by_name(&name).map(|x| x.id), walk);
+                }
+                for k in 0..8u8 {
+                    let dst: IpNet = net(k).parse().unwrap();
+                    let mut got: Vec<ItemId> = c.route_owners(&dst).iter().map(|(_, x)| x.id).collect();
+                    // The first secret holding the block keeps it.
+                    let walk: Vec<ItemId> = c.iter().filter(|x| x.routes.iter().any(|r| r.dst == dst)).map(|x| x.id).take(1).collect();
+                    got.truncate(1);
+                    proptest::prop_assert_eq!(got, walk);
+                }
+            }
+        }
     }
 }

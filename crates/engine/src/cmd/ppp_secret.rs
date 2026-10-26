@@ -5,13 +5,14 @@
 
 use std::net::IpAddr;
 
+use corerouter_model::cow_list::CowList;
 use corerouter_model::MacAddr;
 use corerouter_model::framed_route::{FramedRoute, overlaps};
 use corerouter_model::ppp::{MAX_PASSWORD, MAX_SECRETS, PppSecret, PppService};
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_str, opt_text};
-use super::dhcp_server::{find, opt_ip};
+use super::dhcp_server::opt_ip;
 use super::ppp_common::opt_name;
 use super::{CommandSpec, always};
 use crate::{EngineError, Result, Session};
@@ -229,7 +230,7 @@ fn warnings(s: &Session, x: &PppSecret) -> Result<Vec<String>> {
         w.push("empty password: anyone who knows the name logs in".into());
     }
     if let Some(ip) = x.remote_address {
-        if let Some(other) = c.ppp.secrets.iter().find(|o| o.id != x.id && o.remote_address == Some(ip)) {
+        if let Some(other) = c.ppp.secrets.fixed_in(&ipnet::Ipv4Net::from(ip)).into_iter().find(|o| o.id != x.id) {
             w.push(format!("remote_address {ip} is also the address of secret {}", other.name));
         }
         if let Some(pool) = c.ip.pools.pools.iter().find(|p| p.contains(ip)) {
@@ -242,8 +243,20 @@ fn warnings(s: &Session, x: &PppSecret) -> Result<Vec<String>> {
     Ok(w)
 }
 
+/// Position of the secret `id` names (`*hex` or the name): O(log n) by id,
+/// O(1) by name through the index (G4.3gb).
 fn index(s: &Session, p: &Value) -> Result<usize> {
-    find(&s.store().candidate().ppp.secrets, p, |x| x.id, |x| Some(x.name.as_str()), "secret")
+    let raw = opt_str(p, "id")?.ok_or_else(|| EngineError::bad("id", "is required"))?;
+    let raw = raw.trim();
+    let secrets = &s.store().candidate().ppp.secrets;
+    let id = match raw.strip_prefix('*').and_then(|_| raw.parse::<corerouter_model::ItemId>().ok()) {
+        Some(id) => Some(id),
+        None => secrets.by_name(raw).map(|x| x.id),
+    };
+    id.and_then(|id| secrets.position(id)).ok_or_else(|| {
+        let shown: String = raw.chars().take(64).collect();
+        EngineError::bad("id", format!("no secret '{shown}'"))
+    })
 }
 
 fn active_of(s: &Session, name: &str) -> usize {
@@ -284,30 +297,27 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let w = warnings(s, &x)?;
     let out = json!({"id": x.id, "name": x.name, "warnings": w});
-    if let Some(slot) = s.store_mut().candidate_mut().ppp.secrets.get_mut(i) {
-        *slot = x;
-    }
+    s.store_mut().candidate_mut().ppp.secrets.update(i, |slot| *slot = x);
     Ok(out)
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
     let i = index(s, p)?;
-    let secrets = &mut s.store_mut().candidate_mut().ppp.secrets;
-    if i >= secrets.len() {
+    let Some(x) = s.store_mut().candidate_mut().ppp.secrets.remove(i) else {
         return Err(EngineError::bad("id", "no such secret"));
-    }
-    let x = secrets.remove(i);
+    };
     let active = active_of(s, &x.name);
     Ok(json!({"id": x.id, "name": x.name, "active": active}))
 }
 
 fn toggle(s: &mut Session, p: &Value, disabled: bool) -> Result<Value> {
     let i = index(s, p)?;
-    let Some(x) = s.store_mut().candidate_mut().ppp.secrets.get_mut(i) else {
+    let Some((id, name)) = s.store_mut().candidate_mut().ppp.secrets.update(i, |x| {
+        x.disabled = disabled;
+        (x.id, x.name.clone())
+    }) else {
         return Err(EngineError::bad("id", "no such secret"));
     };
-    x.disabled = disabled;
-    let (id, name) = (x.id, x.name.clone());
     let active = active_of(s, &name);
     Ok(json!({"id": id, "name": name, "active": active}))
 }
@@ -351,7 +361,7 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 /// The secrets `find` and `profile` select.
-fn matching<'a>(secrets: &'a [PppSecret], needle: Option<&str>, profile: Option<&str>) -> Vec<&'a PppSecret> {
+fn matching<'a>(secrets: &'a CowList<PppSecret>, needle: Option<&str>, profile: Option<&str>) -> Vec<&'a PppSecret> {
     secrets
         .iter()
         .filter(|x| profile.is_none_or(|pr| x.profile == pr))
@@ -459,9 +469,9 @@ mod tests {
         let j = serde_json::to_string(&s.journal()).unwrap();
         assert!(!j.contains("s3nh4"), "journal leaks the password: {j}");
         s.execute("ppp.secret.disable", &json!({"id": "joao@isp"})).unwrap();
-        assert!(s.store().running().ppp.secrets[0].disabled);
+        assert!(s.store().running().ppp.secrets.get(0).unwrap().disabled);
         s.execute("ppp.secret.set", &json!({"id": "joao@isp", "caller_id": ""})).unwrap();
-        assert!(s.store().running().ppp.secrets[0].caller_id.is_none());
+        assert!(s.store().running().ppp.secrets.get(0).unwrap().caller_id.is_none());
         let l = s.execute("ppp.secret.list", &json!({"find": "silva"})).unwrap();
         assert_eq!(l.as_array().unwrap().len(), 1);
         s.execute("ppp.secret.remove", &json!({"id": "joao@isp"})).unwrap();
@@ -492,7 +502,7 @@ mod tests {
     fn limits_as_text_like_the_modal_sends_them() {
         let mut s = Session::virtual_lab();
         s.execute("ppp.secret.add", &json!({"name": "a", "password": "x", "limit_bytes_in": "", "limit_bytes_out": "1000"})).unwrap();
-        let x = &s.store().running().ppp.secrets[0];
+        let x = &s.store().running().ppp.secrets.get(0).unwrap();
         assert_eq!((x.limit_bytes_in, x.limit_bytes_out), (0, 1000));
         s.execute("ppp.secret.set", &json!({"id": "a", "limit_bytes_in": " ", "comment": "c"})).unwrap();
         assert!(s.execute("ppp.secret.set", &json!({"id": "a", "limit_bytes_in": "-1"})).is_err());
@@ -542,9 +552,9 @@ mod tests {
         assert_eq!(l[0]["routes"], "203.0.113.8/29,2001:db8:100::/48 :: 5,198.51.100.0/30 100.64.9.1 1");
         // A JSON list works too; "" clears.
         s.execute("ppp.secret.set", &json!({"id": "empresa", "routes": ["203.0.113.8/29", "203.0.113.16/28"]})).unwrap();
-        assert_eq!(s.store().running().ppp.secrets[0].routes.len(), 2);
+        assert_eq!(s.store().running().ppp.secrets.get(0).unwrap().routes.len(), 2);
         s.execute("ppp.secret.set", &json!({"id": "empresa", "routes": ""})).unwrap();
-        assert!(s.store().running().ppp.secrets[0].routes.is_empty());
+        assert!(s.store().running().ppp.secrets.get(0).unwrap().routes.is_empty());
         // Saved as text (and read back by the persisted config).
         s.execute("ppp.secret.set", &json!({"id": "empresa", "routes": "203.0.113.8/29"})).unwrap();
         let j = serde_json::to_value(&s.store().running().ppp.secrets).unwrap();

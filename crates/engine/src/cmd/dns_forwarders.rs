@@ -267,10 +267,10 @@ mod tests {
         let err = s.execute("ip.dns.forwarders.remove", &json!({"id": g["id"]})).unwrap_err();
         assert!(err.to_string().contains("corp.example") || err.to_string().contains("forwards"), "{err}");
         s.execute("ip.dns.forwarders.set", &json!({"id": g["id"], "name": "office"})).unwrap();
-        assert_eq!(s.store().candidate().ip.dns_static.entries[0].forwarder, "office");
+        assert_eq!(s.store().candidate().ip.dns_static.entries.get(0).unwrap().forwarder, "office");
         // Back to plain servers; then the group can go.
         s.execute("ip.dns.static.set", &json!({"id": "*1", "forward_to": "10.9.9.9"})).unwrap();
-        assert!(s.store().candidate().ip.dns_static.entries[0].forwarder.is_empty());
+        assert!(s.store().candidate().ip.dns_static.entries.get(0).unwrap().forwarder.is_empty());
         s.execute("ip.dns.forwarders.remove", &json!({"id": g["id"]})).unwrap();
         assert!(s.store().candidate().ip.dns_forwarders.entries.is_empty());
     }

@@ -1310,7 +1310,7 @@ fn option_overload_is_honoured() {
 fn many_static_leases_are_found_by_index() {
     let mut c = cfg();
     c.ip.dhcp_server.servers[0].conflict_detection = false;
-    c.ip.addresses[0].address = "192.168.0.1/16".parse().unwrap();
+    c.ip.addresses.get_mut(0).unwrap().address = "192.168.0.1/16".parse().unwrap();
     c.ip.dhcp_server.networks[0].address = "192.168.0.0/16".parse().unwrap();
     for i in 0..3000u32 {
         let [_, _, a, b] = i.to_be_bytes();
@@ -1648,7 +1648,7 @@ fn a_revoke_ends_the_lease_and_the_grant() {
 #[test]
 fn a_storm_past_the_limiter_table_is_still_served() {
     let mut c = cfg();
-    c.ip.addresses[0].address = "10.0.0.1/14".parse().unwrap();
+    c.ip.addresses.get_mut(0).unwrap().address = "10.0.0.1/14".parse().unwrap();
     c.ip.pools.pools[0].ranges = vec!["10.0.1.0-10.3.255.254".parse().unwrap()];
     c.ip.dhcp_server.networks.clear();
     c.ip.dhcp_server.servers[0].conflict_detection = false;

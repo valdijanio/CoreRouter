@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::bonding::{BondMode, HashPolicy, LacpRate, default_mii_interval};
 use crate::cow::CowArc;
+use crate::cow_list::CowList;
 use crate::dhcp_client::DhcpClient;
 use crate::dns::Dns;
 use crate::firewall::Firewall;
@@ -251,12 +252,12 @@ impl InterfaceKind {
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Ip {
-    pub addresses: CowArc<Vec<AddressEntry>>,
+    pub addresses: CowList<AddressEntry>,
     /// Next id handed out by `next_address_id` (never reused, like RouterOS).
     pub next_id: u32,
     /// Static routes (`/ip route`), IPv4 and IPv6 together. Connected routes
     /// are not stored: they are derived from `addresses` (see `route`).
-    pub routes: CowArc<Vec<RouteEntry>>,
+    pub routes: CowList<RouteEntry>,
     /// Next id handed out by `next_route_id`.
     pub next_route_id: u32,
     /// Where neighbor discovery listens and announces (`ip.neighbor.discovery.set`).
