@@ -700,7 +700,7 @@ mod tests {
     #[test]
     fn disabled_and_interfaces() {
         let mut c = cfg(&[("off", "10.0.0.0/8"), ("a", "ether2"), ("b", "ether2,10.1.0.0/16")]);
-        c.queue.simple[0].disabled = true;
+        c.queue.simple.get_mut(0).unwrap().disabled = true;
         let p = plan(&c, vec![]);
         assert_eq!(at(&p, "10.1.0.0/16").as_deref(), Some("b"), "a disabled queue hides nothing");
         assert_eq!(p.interfaces.len(), 1);
@@ -736,7 +736,7 @@ mod tests {
     fn shaper_plan_ports_and_kinds() {
         let mut c = Session::virtual_lab().store().running().clone();
         c.queue = cfg(&[("lan", "192.168.88.0/24"), ("far", "203.0.113.0/24"), ("off", "10.9.9.9")]).queue;
-        c.queue.simple[2].disabled = true;
+        c.queue.simple.get_mut(2).unwrap().disabled = true;
         c.ip.addresses = corerouter_model::cow_list::CowList::from(vec![corerouter_model::AddressEntry {
             id: ItemId(1),
             address: "192.168.88.1/24".parse().unwrap(),
