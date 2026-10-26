@@ -9,9 +9,11 @@
 
 use std::sync::{Arc, Mutex};
 
+use corerouter_engine::sealing::{self, SealKey};
 use corerouter_engine::storage::CONFIG_JOURNAL;
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, Slot, StorageError};
 use corerouter_hal::VirtualHal;
+use corerouter_model::config::Config;
 use serde_json::json;
 
 fn boot(storage: &MemoryStorage) -> Session {
@@ -35,14 +37,35 @@ fn numbers(s: &Session) -> Vec<u32> {
     s.store().history().iter().map(|r| r.number).collect()
 }
 
+/// `config` with the PPP passwords opened (G4.3n): each session seals with
+/// its own key and a random nonce, so the same password is a different box.
+fn opened(key: &SealKey, config: &Config) -> Config {
+    let mut c = config.clone();
+    for i in 0..c.ppp.secrets.len() {
+        c.ppp.secrets.update(i, |x| {
+            x.password = key.open(&x.password).unwrap_or_default().into();
+        });
+    }
+    c
+}
+
 /// The store `s` holds, compared revision by revision with `t`'s.
-fn same_store(s: &Session, t: &Session) {
+fn same_store(s: &mut Session, t: &mut Session) {
     assert_eq!(numbers(s), numbers(t));
+    let (ks, kt) = (sealing::key(s).unwrap(), sealing::key(t).unwrap());
     for (a, b) in s.store().history().iter().zip(t.store().history()) {
-        assert_eq!(a.config, b.config, "revision {}", a.number);
+        assert_eq!(
+            opened(&ks, &a.config),
+            opened(&kt, &b.config),
+            "revision {}",
+            a.number
+        );
         assert_eq!(a.comment, b.comment);
     }
-    assert_eq!(s.store().running(), t.store().running());
+    assert_eq!(
+        opened(&ks, s.store().running()),
+        opened(&kt, t.store().running())
+    );
 }
 
 fn lines(storage: &MemoryStorage) -> usize {
@@ -64,20 +87,20 @@ fn commits_go_to_the_journal_and_a_reboot_gives_the_same_store() {
     }
     assert_eq!(storage.get(Slot::Current), slot);
     assert!(lines(&storage) >= 50, "{}", lines(&storage));
-    let t = boot(&storage);
+    let mut t = boot(&storage);
     assert!(
         t.storage_status().boot_errors.is_empty(),
         "{:?}",
         t.storage_status().boot_errors
     );
-    same_store(&s, &t);
+    same_store(&mut s, &mut t);
     // A rollback to a revision of before the slot still works after it.
     let mut t = t;
     let old = numbers(&t)[3];
     t.execute("config.rollback", &json!({"revision": old}))
         .unwrap();
-    let u = boot(&storage);
-    same_store(&t, &u);
+    let mut u = boot(&storage);
+    same_store(&mut t, &mut u);
 }
 
 #[test]
@@ -90,9 +113,9 @@ fn a_long_journal_is_checkpointed_into_the_slot() {
     // The slot was written again past MAX_JOURNAL_LINES lines; the journal
     // keeps the lines past the previous slot only.
     assert!(lines(&storage) < 1200, "{}", lines(&storage));
-    let t = boot(&storage);
+    let mut t = boot(&storage);
     assert!(t.storage_status().boot_errors.is_empty());
-    same_store(&s, &t);
+    same_store(&mut s, &mut t);
     // The previous slot plus the journal give the newest too.
     let copy = MemoryStorage::default();
     copy.put(Slot::Previous, storage.get(Slot::Previous));
@@ -128,9 +151,9 @@ fn a_torn_last_line_costs_that_commit_only() {
     // carries on.
     add(&mut t, 500);
     add(&mut t, 501);
-    let u = boot(&storage);
+    let mut u = boot(&storage);
     assert!(u.storage_status().boot_errors.is_empty());
-    same_store(&t, &u);
+    same_store(&mut t, &mut u);
 }
 
 #[test]
@@ -253,12 +276,12 @@ fn a_power_cut_at_any_step_loses_at_most_the_commit_in_flight() {
             assert!(got == before || got == in_flight, "{commits} {step}");
             rename(&mut t, "after");
             add(&mut t, 60_000);
-            let u = boot_flaky(&storage);
+            let mut u = boot_flaky(&storage);
             assert!(
                 u.storage_status().boot_errors.is_empty(),
                 "{commits} {step}"
             );
-            same_store(&t, &u);
+            same_store(&mut t, &mut u);
         }
     }
 }
@@ -306,9 +329,9 @@ fn a_user_change_is_saved_with_the_slot() {
     )
     .unwrap();
     add(&mut s, 99);
-    let t = boot(&storage);
+    let mut t = boot(&storage);
     assert!(t.users().get("ops").is_some());
-    same_store(&s, &t);
+    same_store(&mut s, &mut t);
 }
 
 #[test]
@@ -332,9 +355,9 @@ fn safe_mode_saves_through_the_journal_like_any_commit() {
         );
         s.execute(end, &json!({})).unwrap();
         add(&mut s, 200);
-        let u = boot(&storage);
+        let mut u = boot(&storage);
         assert!(u.storage_status().boot_errors.is_empty(), "{end}");
-        same_store(&s, &u);
+        same_store(&mut s, &mut u);
     }
 }
 
@@ -426,8 +449,8 @@ proptest::proptest! {
             run(&mut a, st);
             run(&mut b, st);
         }
-        same_store(&a, &b);
-        let c = boot(&journal);
-        same_store(&a, &c);
+        same_store(&mut a, &mut b);
+        let mut c = boot(&journal);
+        same_store(&mut a, &mut c);
     }
 }
