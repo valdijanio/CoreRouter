@@ -598,9 +598,15 @@ pub struct PppoeServer {
     #[serde(default)]
     pub name: String,
     pub interface: IfName,
-    /// Empty: any Service-Name (and the empty one) is served.
+    /// RouterOS' single name (empty: any Service-Name, and the empty one,
+    /// is served). Read only while `services` is empty (a config from
+    /// before G4.3k); commands write `services` and clear it.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub service_name: String,
+    /// G4.3k: the Service-Name table (`crate::pppoe_services`). Empty: the
+    /// table `service_name` means.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub services: Vec<crate::pppoe_services::PppoeService>,
     #[serde(default = "mtu_default")]
     pub max_mtu: u16,
     #[serde(default = "mtu_default")]
@@ -723,6 +729,16 @@ impl PppoeServer {
             .max()
             .unwrap_or(0);
         self.pado_delay.saturating_add(tier).min(MAX_PADO_DELAY)
+    }
+
+    /// The Service-Name table in force: `services`, or the one RouterOS'
+    /// `service_name` means (G4.3k), with its `empty` and `any` rows last.
+    pub fn service_table(&self) -> Vec<crate::pppoe_services::PppoeService> {
+        if self.services.is_empty() {
+            crate::pppoe_services::from_service_name(&self.service_name)
+        } else {
+            self.services.clone()
+        }
     }
 
     pub fn vlan_allowed(&self, vid: Option<u16>) -> bool {
@@ -914,6 +930,10 @@ pub struct ActiveSession {
     pub id: String,
     pub name: String,
     pub service: String,
+    /// G4.3k: the Service-Name the subscriber asked for (`""`: the empty
+    /// one); `None` outside PPPoE.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
     /// The subscriber's MAC.
     pub caller_id: String,
     pub address: Option<Ipv4Addr>,
