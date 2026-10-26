@@ -20,6 +20,9 @@
 //!   in the BNG's own tests.
 //! - An ICMP echo from a QinQ subscriber to wan0 comes back inside both
 //!   tags (the slow path).
+//! - IPv6 on the slow path (G4.3l part 2): a dual-stack QinQ subscriber
+//!   pings wan0's IPv6 from its /64 and the reply comes back inside both
+//!   tags; one from a spoofed source gets nothing.
 //! - One tag: subscribers in VLANs 200 and 201 come up, and an untagged
 //!   CPE on that port does not (before G4.3l the VLAN sockets saw nothing
 //!   and the untagged one took tagged frames as untagged).
@@ -111,6 +114,18 @@ impl Cpes {
         base: usize,
         line: impl Fn(usize) -> Vlans,
     ) -> Self {
+        Self::with(port, listen, n, base, line, false)
+    }
+
+    /// [`Cpes::new`], dual-stack when `ipv6`.
+    fn with(
+        port: &str,
+        listen: &[Listen],
+        n: usize,
+        base: usize,
+        line: impl Fn(usize) -> Vlans,
+        ipv6: bool,
+    ) -> Self {
         let port = PppoePort::open_for(&port.parse::<IfName>().unwrap(), listen).unwrap();
         let mut clients = Vec::new();
         let mut by_mac = HashMap::new();
@@ -129,6 +144,7 @@ impl Cpes {
                 discovery_jitter_pct: 25,
                 keepalive_interval_ms: 0,
                 circuit_id: Some(format!("olt1 eth 1/1/1/{k}").into_bytes()),
+                ipv6,
                 ..ClientConfig::default()
             };
             let mut seed = [0x6bu8; 32];
@@ -264,6 +280,10 @@ fn qinq_and_single_tag_on_the_slow_path() {
     }
     ip(None, &["link", "add", "wan0", "type", "dummy"]);
     ip(None, &["addr", "add", "198.51.100.1/24", "dev", "wan0"]);
+    ip(
+        None,
+        &["addr", "add", "2001:db8:ffff::1/64", "dev", "wan0", "nodad"],
+    );
     ip(None, &["link", "set", "wan0", "up"]);
     let dir = std::env::temp_dir().join(format!("g43l-netns-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
@@ -274,8 +294,16 @@ fn qinq_and_single_tag_on_the_slow_path() {
         json!({"name": "clientes", "ranges": "100.64.0.0/20"}),
     );
     ok(
+        "ipv6.pool.add",
+        json!({"name": "wan6", "prefix": "2001:db8:100::/48", "prefix_length": 64}),
+    );
+    ok(
+        "ipv6.pool.add",
+        json!({"name": "pd6", "prefix": "2001:db8:8000::/40", "prefix_length": 56}),
+    );
+    ok(
         "ppp.profile.set",
-        json!({"id": "default", "remote_address": "clientes", "dns_server": "1.1.1.1"}),
+        json!({"id": "default", "remote_address": "clientes", "dns_server": "1.1.1.1", "remote_ipv6_prefix_pool": "wan6", "dhcpv6_pd_pool": "pd6"}),
     );
     batch((0..600).map(|i| json!({"command": "ppp.secret.add", "params": {"name": format!("u{i}"), "password": format!("p{i}")}})).collect());
     ok(
@@ -388,6 +416,50 @@ fn qinq_and_single_tag_on_the_slow_path() {
     assert_eq!(&reply[18..20], &v.inner.to_be_bytes());
     drop(q);
 
+    // The CPEs vanished without PADT: end their sessions by hand (the
+    // lines are 1:1).
+    ok("ppp.active.remove", json!({"server": "pppoe-acc0"}));
+    wait_for("the QinQ lines gone", || rows().is_empty());
+
+    // IPv6 on the slow path: a dual-stack QinQ line pings wan0's IPv6.
+    let mut d = Cpes::with(
+        "cpe0",
+        &[Listen::Stacked {
+            outer: 103,
+            tpid: 0x88a8,
+        }],
+        1,
+        450,
+        |_| Vlans::qinq(103, 99),
+        true,
+    );
+    d.start_all();
+    assert!(d.run_until(30, |c| c.ups() == 1), "the dual-stack line");
+    let mut p64 = None;
+    wait_for("its /64", || {
+        p64 = rows()
+            .into_iter()
+            .find(|r| r["name"] == "u450")
+            .and_then(|r| r["ipv6_prefix"].as_str().map(str::to_owned));
+        p64.is_some()
+    });
+    let p64: ipnet::Ipv6Net = p64.unwrap().parse().unwrap();
+    let mut src = p64.network().octets();
+    src[15] = 1;
+    let (sid6, _) = d.up[0].unwrap();
+    let cpe_mac = d.clients[0].config().mac.0;
+    let reply = ping6(&mut d, cpe_mac, sid6, src, 20)
+        .expect("the ICMPv6 echo reply came back through bng0, inside both tags");
+    assert_eq!(&reply[14..20], &[0, 103, 0x81, 0x00, 0, 99]);
+    assert_eq!(&reply[54..70], &src, "to the subscriber's address");
+    let mut spoof = src;
+    spoof[2] ^= 0x40;
+    assert!(
+        ping6(&mut d, cpe_mac, sid6, spoof, 3).is_none(),
+        "a spoofed source gets nothing"
+    );
+    drop(d);
+
     // One tag: VLANs 200 and 201 on acc1, and an untagged CPE that must not
     // come up there.
     let single = [Listen::Vlan(200), Listen::Vlan(201), Listen::Untagged];
@@ -415,4 +487,60 @@ fn qinq_and_single_tag_on_the_slow_path() {
         (Some(201), None),
         "{r}"
     );
+}
+
+/// An ICMPv6 echo from `src` to wan0's 2001:db8:ffff::1, in a PPPoE session
+/// frame of line (103, 99); the reply, if one comes in `tries` × 250 ms.
+fn ping6(d: &mut Cpes, cpe: [u8; 6], sid: u16, src: [u8; 16], tries: usize) -> Option<Vec<u8>> {
+    let dst: std::net::Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut icmp = vec![128, 0, 0, 0, 0x12, 0x34, 0, 1];
+    icmp.extend_from_slice(b"corerouter-qinq-v6");
+    // RFC 8200 §8.1: the pseudo-header in the checksum.
+    let mut ph = src.to_vec();
+    ph.extend_from_slice(&dst.octets());
+    ph.extend_from_slice(&(icmp.len() as u32).to_be_bytes());
+    ph.extend_from_slice(&[0, 0, 0, 58]);
+    ph.extend_from_slice(&icmp);
+    let c = csum(&ph);
+    icmp[2..4].copy_from_slice(&c.to_be_bytes());
+    let mut p = vec![0x60, 0, 0, 0];
+    p.extend_from_slice(&(icmp.len() as u16).to_be_bytes());
+    p.extend_from_slice(&[58, 64]);
+    p.extend_from_slice(&src);
+    p.extend_from_slice(&dst.octets());
+    p.extend_from_slice(&icmp);
+    let mut f = mac_of("acc0").to_vec();
+    f.extend_from_slice(&cpe);
+    f.extend_from_slice(&[
+        0x88, 0xa8, 0, 103, 0x81, 0x00, 0, 99, 0x88, 0x64, 0x11, 0x00,
+    ]);
+    f.extend_from_slice(&sid.to_be_bytes());
+    f.extend_from_slice(&((p.len() + 2) as u16).to_be_bytes());
+    f.extend_from_slice(&[0x00, 0x57]);
+    f.extend_from_slice(&p);
+    for _ in 0..tries {
+        d.port.send(&f).unwrap();
+        let t = Instant::now();
+        let mut got = None;
+        while t.elapsed() < Duration::from_millis(250) && got.is_none() {
+            d.port
+                .recv(|fr| {
+                    // QinQ, PPPoE session, IPv6, ICMPv6 echo reply (129).
+                    if fr.len() > 70
+                        && fr[12..14] == [0x88, 0xa8]
+                        && fr[28..30] == [0x00, 0x57]
+                        && fr[36] == 58
+                        && fr[70] == 129
+                    {
+                        got = Some(fr.to_vec());
+                    }
+                })
+                .unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if got.is_some() {
+            return got;
+        }
+    }
+    None
 }

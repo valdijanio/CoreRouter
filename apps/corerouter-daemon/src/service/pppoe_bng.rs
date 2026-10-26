@@ -51,8 +51,14 @@ use corerouter_proto_pppoe::server::{
 use corerouter_proto_pppoe::timer::Millis;
 use corerouter_proto_pppoe::wire::Mac;
 use corerouter_proto_radius::rate_limit::RateLimit;
+use ipnet::Ipv6Net;
 
 use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
+use super::pppoe_slow6::{self as slow6, Net6Index};
+
+/// G4.3h hot standby: publishing sessions, adopting them at a takeover.
+#[path = "pppoe_bng/ha.rs"]
+pub(crate) mod ha;
 
 /// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
 /// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
@@ -85,6 +91,9 @@ pub(crate) enum Effect {
     Route { ip: Ipv4Addr, add: bool },
     /// G4.3cd: a block routed to a subscriber through `bng0` (no XDP).
     Block { dst: ipnet::Ipv4Net, add: bool },
+    /// The slow path's IPv6 route of a session's /64 or delegated prefix
+    /// to `bng0` (G4.3l).
+    Route6 { net: Ipv6Net, add: bool },
     /// Engine commands (hooks, address lists), run under the session lock.
     Run {
         command: String,
@@ -902,6 +911,8 @@ impl Admission {
 
 /// Slow path: subscriber address → the worker holding it.
 pub(crate) type Routes = Arc<std::sync::RwLock<HashMap<Ipv4Addr, u16>>>;
+/// Slow path, IPv6 (G4.3l): which worker holds each subscriber prefix.
+pub(crate) type Routes6 = Arc<std::sync::RwLock<Net6Index<u16>>>;
 
 /// A worker's share of a per-second rate (0 = no limit stays 0).
 fn share(rate: u32, lanes: u16) -> u32 {
@@ -997,6 +1008,9 @@ struct Sub {
     want_routes: Vec<(FramedRoute, RouteOrigin)>,
     want_refused: Vec<String>,
     routes: Vec<(FramedRoute, RouteOrigin)>,
+    /// G4.3h: counters carried over from the other node of the pair
+    /// (rx bytes, tx bytes, rx packets, tx packets), under the data plane's.
+    base: [u64; 4],
 }
 
 /// What the hot paths look up in [`Bng::subs`] without walking it
@@ -1086,6 +1100,12 @@ pub(crate) struct Snapshot {
     pub forbidden: Arc<Forbidden>,
 }
 
+/// G4.3h: this node is the active one of its redundant pair (set by the
+/// daemon's `ppp-ha` service; false until it says so: a node that boots
+/// keeps quiet until the pair decides).
+pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub(crate) struct Bng {
     slots: Vec<Slot>,
     subs: HashMap<(usize, u16), Sub>,
@@ -1104,6 +1124,9 @@ pub(crate) struct Bng {
     /// Slow path: which worker holds each subscriber address (the driver
     /// hands it the packets the kernel routes to `bng0`).
     routes: Routes,
+    routes6: Routes6,
+    /// Slow path, IPv6: the session of each /64 and delegated prefix.
+    net6: Net6Index<(usize, u16)>,
     xdp_free: Vec<u32>,
     xdp_next: u32,
     pub shared: Arc<Mutex<Shared>>,
@@ -1133,6 +1156,8 @@ pub(crate) struct Bng {
     pools6: Arc<Mutex<Pools6>>,
     /// IPv6 packets refused before reaching a session's control plane.
     v6_dropped: u64,
+    /// G4.3h: what this worker publishes to the pair, and its takeovers.
+    pub(crate) ha: ha::HaState,
 }
 
 /// One discovery or session frame's code and source, read before the
@@ -1344,6 +1369,8 @@ impl Bng {
             lane: 0,
             lanes: 1,
             routes: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            routes6: Arc::new(std::sync::RwLock::new(Net6Index::default())),
+            net6: Net6Index::default(),
             xdp_free: Vec::new(),
             xdp_next: 0,
             shared,
@@ -1367,6 +1394,7 @@ impl Bng {
             queued_total: 0,
             pools6: Arc::new(Mutex::new(Pools6::default())),
             v6_dropped: 0,
+            ha: ha::HaState::default(),
         }
     }
 
@@ -1381,6 +1409,7 @@ impl Bng {
         b.pools = self.pools.clone();
         b.pools6 = self.pools6.clone();
         b.routes = self.routes.clone();
+        b.routes6 = self.routes6.clone();
         b.lane = lane;
         b.lanes = lanes.max(1);
         b.admission.lanes = b.lanes;
@@ -1406,6 +1435,15 @@ impl Bng {
     /// The worker of slow-path address `ip`, if a session holds it.
     pub(crate) fn route_lane_in(routes: &Routes, ip: Ipv4Addr) -> Option<u16> {
         routes.read().ok().and_then(|r| r.get(&ip).copied())
+    }
+
+    pub(crate) fn clone_routes6(&self) -> Routes6 {
+        self.routes6.clone()
+    }
+
+    /// The worker of slow-path IPv6 address `ip` (longest prefix).
+    pub(crate) fn route6_lane_in(routes: &Routes6, ip: std::net::Ipv6Addr) -> Option<u16> {
+        routes.read().ok().and_then(|r| r.get(ip))
     }
 
     /// The worker of a frame from a client (its source MAC; RSS-like): a
@@ -1522,6 +1560,10 @@ impl Bng {
             // (`Reply::Ipv6` before the verdict); identifiers stable per line.
             sc.ipv6 = true;
             sc.ipv6_iid_key = Some(self.cfg.iid_key.unwrap_or(self.seed));
+            // G4.3h: both nodes of a pair accept each other's AC-Cookie.
+            let ha = &self.cfg.ppp.redundancy;
+            sc.cookie_secret = (ha.enabled && !ha.secret.is_empty())
+                .then(|| corerouter_proto_ha::hello::derive("ac-cookie", ha.secret.as_bytes()));
             match self.slots.iter_mut().find(|s| s.cfg.id == w.id) {
                 Some(s) => {
                     s.server.reconfigure(sc);
@@ -1710,7 +1752,9 @@ impl Bng {
         let Some(sub) = self.subs.get(&(slot, f.session_id)) else {
             return;
         };
-        if sub.mac != f.link.src || sub.up_at.is_none() {
+        // The session's MAC on the session's line (G4.3l: a frame with
+        // another line's tags is not this session's).
+        if sub.mac != f.link.src || sub.vlans != f.link.vlans || sub.up_at.is_none() {
             return;
         }
         let src = f.info.get(12..16).map(|b| {
@@ -1849,9 +1893,16 @@ impl Bng {
         let acct = (sub.radius || self.cfg.ppp.aaa.use_radius) && self.cfg.ppp.aaa.accounting;
         let acct_id = sub.acct_id.clone();
         let interim = sub.interim;
+        let nets: Vec<Ipv6Net> = [&x.link, &x.delegated]
+            .into_iter()
+            .flatten()
+            .map(|(n, _)| *n)
+            .collect();
         sub.v6 = Some(Box::new(x));
+        self.ha.dirty.insert((i, sref.sid));
         let fields = sub.v6.as_deref().map(active_v6);
         let id = session_id(i, &self.slots, sref.sid);
+        self.slow_routes6((i, sref.sid), &nets, true);
         for p in problems {
             self.log(true, format!("PPP: {user}: {p}"));
         }
@@ -1897,10 +1948,37 @@ impl Bng {
             self.v6_dropped += 1;
             return;
         };
-        let Some(x) = sub.v6.as_deref_mut().filter(|_| sub.mac == f.link.src) else {
+        let Some(x) = sub
+            .v6
+            .as_deref_mut()
+            .filter(|_| sub.mac == f.link.src && sub.vlans == f.link.vlans)
+        else {
             self.v6_dropped += 1;
             return;
         };
+        // G4.3l: without XDP, IPv6 to anything but the link is forwarded
+        // here, from the session's own prefixes only (the XDP's
+        // anti-spoofing, G4.3e).
+        if !self.xdp
+            && let Some((src, dst)) = slow6::addrs(f.info)
+            && !slow6::for_the_link(dst)
+        {
+            let own = [&x.link, &x.delegated]
+                .into_iter()
+                .flatten()
+                .any(|(n, _)| n.contains(&src));
+            if !own || sub.up_at.is_none() {
+                self.v6_dropped += 1;
+                return;
+            }
+            let len = f.info.len() as u64;
+            if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+                a.rx_bytes += len;
+                a.rx_packets += 1;
+            }
+            self.upstream.push(f.info.to_vec());
+            return;
+        }
         let before = x.dropped;
         let Some(out) = x.handle(now, f.info, rand) else {
             self.v6_dropped += 1;
@@ -1948,6 +2026,10 @@ impl Bng {
     /// Downstream IPv4 to a subscriber (slow path): encapsulated for its
     /// session, or dropped when nobody has the address.
     pub(crate) fn data_down(&mut self, packet: &[u8]) {
+        if packet.first().is_some_and(|b| b >> 4 == 6) {
+            self.data_down6(packet);
+            return;
+        }
         let Some(dst) = packet.get(16..20) else {
             return;
         };
@@ -1978,6 +2060,58 @@ impl Bng {
             a.tx_packets += 1;
         }
         self.frames.push((port.ifindex, f));
+    }
+
+    /// Slow path, IPv6 (G4.3l): a packet the kernel routed to a
+    /// subscriber's prefix, into its session.
+    fn data_down6(&mut self, packet: &[u8]) {
+        let Some((_, dst)) = slow6::addrs(packet) else {
+            return;
+        };
+        let Some(key) = self.net6.get(dst) else {
+            return;
+        };
+        let Some(sub) = self.subs.get(&key) else {
+            return;
+        };
+        let Some(port) = self.slots.get(key.0).map(|s| s.port) else {
+            return;
+        };
+        if packet.len() > usize::from(sub.mtu.max(1280)) {
+            return;
+        }
+        let f = v6::frame(sub.mac.0, port.mac, sub.vlans, key.1, packet);
+        let id = session_id(key.0, &self.slots, key.1);
+        if let Some(a) = guard(&self.shared).active.get_mut(&id) {
+            a.tx_bytes += packet.len() as u64;
+            a.tx_packets += 1;
+        }
+        self.frames.push((port.ifindex, f));
+    }
+
+    /// Slow path, IPv6: route a session's prefixes to `bng0` (`add`) or
+    /// take them away, and index them for the packets coming back.
+    fn slow_routes6(&mut self, key: (usize, u16), nets: &[Ipv6Net], add: bool) {
+        if self.xdp {
+            return;
+        }
+        for &net in nets {
+            if add {
+                self.net6.insert(net, key);
+            } else if self.net6.get(net.network()) == Some(key) {
+                self.net6.remove(net);
+            } else {
+                continue;
+            }
+            if let Ok(mut r) = self.routes6.write() {
+                if add {
+                    r.insert(net, self.lane);
+                } else {
+                    r.remove(net);
+                }
+            }
+            self.effects.push(Effect::Route6 { net, add });
+        }
     }
 
     /// Call server `i`, handle what it says, then the answers that
@@ -2172,6 +2306,7 @@ impl Bng {
             want_routes: Vec::new(),
             want_refused: Vec::new(),
             routes: Vec::new(),
+            base: [0; 4],
         };
         self.index.add((i, sref.sid), &fresh);
         if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
@@ -2564,7 +2699,13 @@ impl Bng {
         let interface = slot.cfg.interface.to_string();
         let unix = self.cfg.unix_base + now / 1000;
         self.seq += 1;
-        let acct_id = format!("{:08X}{:04X}", unix as u32, self.seq as u16);
+        // RFC 2866 §5.5: unique per session. Each worker counts its own
+        // `seq`: the worker goes in the id too (before G4.3h two workers
+        // gave the same id in the same second, found by the HA lab).
+        let acct_id = format!(
+            "{:08X}{:02X}{:04X}",
+            unix as u32, self.lane as u8, self.seq as u16
+        );
         let xdp = if self.xdp { self.slot_index() } else { None };
         let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
             return;
@@ -2743,6 +2884,7 @@ impl Bng {
             });
         }
         self.hooks(&hooks, &user, ip, &mac, &interface);
+        self.ha_dirty((i, sref.sid));
         self.log(
             false,
             format!(
@@ -2815,6 +2957,11 @@ impl Bng {
 
     /// A session is gone: undo everything [`Bng::up`] did.
     fn ended(&mut self, now: Millis, sub: Sub, reason: DownReason, was_up: bool) {
+        self.ha_gone(&sub);
+        // G4.3h: handed to the pair's other node, the session goes on
+        // there: no Accounting-Stop (it would end it in the RADIUS server)
+        // and no on-down hooks.
+        let handed_over = self.ha.handed_over;
         let (mut key, mut hint, stage, mut cause) = explain(reason);
         if let Some((c, k)) = sub.cause {
             cause = c;
@@ -2847,6 +2994,14 @@ impl Bng {
             self.xdp_free.push(idx);
         } else if let (Some(ip), true) = (sub.ip, was_up) {
             self.effects.push(Effect::Route { ip, add: false });
+        }
+        if let Some(x) = &sub.v6 {
+            let nets: Vec<Ipv6Net> = [&x.link, &x.delegated]
+                .into_iter()
+                .flatten()
+                .map(|(n, _)| *n)
+                .collect();
+            self.slow_routes6((sub.slot, sub.sref.sid), &nets, false);
         }
         if let Some(ip) = sub.ip {
             guard(&self.pools).give_back(ip);
@@ -2885,7 +3040,8 @@ impl Bng {
         };
         let uptime = sub.up_at.map_or(0, |t| now.saturating_sub(t) / 1000);
         if was_up {
-            if (sub.radius || self.cfg.ppp.aaa.use_radius)
+            if !handed_over
+                && (sub.radius || self.cfg.ppp.aaa.use_radius)
                 && self.cfg.ppp.aaa.accounting
                 && let Some(aaa) = &self.cfg.aaa
             {
@@ -2923,8 +3079,10 @@ impl Bng {
                     comment: String::new(),
                 });
             }
-            let hooks = sub.effective.on_down.clone();
-            self.hooks(&hooks, &sub.user, sub.ip, &mac, &interface);
+            if !handed_over {
+                let hooks = sub.effective.on_down.clone();
+                self.hooks(&hooks, &sub.user, sub.ip, &mac, &interface);
+            }
         }
         let failed_stage = if was_up {
             Stage::Up
@@ -3075,6 +3233,8 @@ impl Bng {
             }
         }
         let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
+        // G4.3h: the counters for the pair's standby, in this same pass.
+        let ha_counters = self.ha_counters_due(now);
         {
             let mut sh = guard(&self.shared);
             for ((slot, sid), sub) in self.subs.iter_mut() {
@@ -3084,10 +3244,13 @@ impl Bng {
                     continue;
                 };
                 if let Some(c) = sub.xdp.and_then(|i| by_idx.get(&i)) {
-                    a.rx_bytes = c.up_bytes;
-                    a.rx_packets = c.up_packets;
-                    a.tx_bytes = c.down_bytes;
-                    a.tx_packets = c.down_packets;
+                    // G4.3h: plus what the session had on the node that
+                    // opened it (a takeover).
+                    let [rx, tx, rxp, txp] = sub.base;
+                    a.rx_bytes = rx + c.up_bytes;
+                    a.rx_packets = rxp + c.up_packets;
+                    a.tx_bytes = tx + c.down_bytes;
+                    a.tx_packets = txp + c.down_packets;
                     a.queue_us = c.down_queue_us;
                     a.drops = c.up_policed + c.down_policed;
                 }
@@ -3100,6 +3263,9 @@ impl Bng {
                     a.tx_bps = bps(a.tx_bytes, sub.prev.1);
                 }
                 sub.prev = (a.rx_bytes, a.tx_bytes, now);
+                if ha_counters {
+                    self.ha.counters((*slot, *sid), a);
+                }
                 if let (Some(l), Some(ip)) = (&sub.effective.address_list, sub.ip)
                     && now.saturating_sub(sub.list_at) >= LIST_REFRESH_MS
                 {
@@ -3229,6 +3395,7 @@ impl Bng {
             };
             if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
                 sub.rate = Some(rate.clone());
+                self.ha.dirty.insert((i, sref.sid));
                 if let Some(idx) = sub.xdp {
                     // CoA: the rate changes, the queue (its clock) stays.
                     let shape =
@@ -3255,6 +3422,9 @@ impl Bng {
     /// the families the CoA names are removed (traffic to a block kept by
     /// both never stops).
     fn change_routes(&mut self, id: &str, c: &RouteChange) {
+        if let Some((slot, sref)) = self.find(id) {
+            self.ha.dirty.insert((slot, sref.sid));
+        }
         let Some((i, sref)) = self.find(id) else {
             return;
         };
@@ -3336,6 +3506,33 @@ impl Bng {
         let (server, sid) = parse_session_id(id)?;
         let slot = self.slots.iter().position(|s| s.cfg.id.0 == server)?;
         self.subs.get(&(slot, sid)).map(|s| (s.slot, s.sref))
+    }
+
+    /// G4.3h: answer subscribers now — redundancy is off, or this node is
+    /// the active one of its pair ([`HA_ACTIVE`]).
+    pub(crate) fn serving(&self) -> bool {
+        !self.cfg.ppp.redundancy.enabled
+            || (HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && !self.ha_pending())
+    }
+
+    /// G4.3h: the pair's role went to the peer. Every session ends here
+    /// without a frame (the address back, the data plane cleaned, the
+    /// accounting Stop); the servers come back at the next configure, to
+    /// answer if the role returns.
+    pub(crate) fn abandon(&mut self, now: Millis) {
+        // Hot standby: the peer goes on with them (no Acct-Stop).
+        self.ha.handed_over = self.cfg.ppp.redundancy.enabled
+            && self.cfg.ppp.redundancy.mode == corerouter_model::ppp_redundancy::HaMode::HotStandby;
+        let mut i = self.slots.len();
+        while i > 0 {
+            i -= 1;
+            self.drop_slot(now, i);
+        }
+        self.ha.handed_over = false;
+        self.log(
+            false,
+            "PPPoE: o par assumiu; as sessões deste nó foram encerradas sem aviso ao CPE".into(),
+        );
     }
 
     /// End every session (service stopping): Terminate and PADT to each.
@@ -3459,30 +3656,6 @@ fn acct_attributes(ip: Option<Ipv4Addr>, mac: &str, sub: &Sub) -> Vec<Attribute>
     v
 }
 
-/// RFC 4679 §3 (TR-101): Agent-Circuit-Id and Agent-Remote-Id of the line,
-/// as the access node put them in the PADI (G4.3l).
-fn line_attributes(sub: &Sub) -> Vec<Attribute> {
-    let mut v = Vec::new();
-    if let Some(c) = &sub.circuit_id {
-        v.push(Attribute::new("ADSL-Agent-Circuit-Id", c.as_str()));
-    }
-    if let Some(r) = &sub.remote_id {
-        v.push(Attribute::new("ADSL-Agent-Remote-Id", r.as_str()));
-    }
-    v
-}
-
-/// NAS-Port-Id of a line without a circuit id: the port, and for a QinQ
-/// line `:<outer>-<inner>` (Junos' `ge-1/0/0:120-3044`), so RADIUS tells
-/// the lines apart (G4.3l). A single tag keeps the port alone, as before.
-fn nas_port(interface: &str, v: Vlans) -> String {
-    if v.inner != 0 {
-        format!("{interface}:{}-{}", v.outer, v.inner)
-    } else {
-        interface.to_owned()
-    }
-}
-
 /// G4.3cd: the routes of a session in the Accounting-Request (RFC 2866
 /// §5.13: the attributes of the Access-Accept may go along).
 fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
@@ -3516,6 +3689,30 @@ fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
             error: true,
             text: format!("PPP: rota {r}: IPv6 sem XDP"),
         },
+    }
+}
+
+/// RFC 4679 §3 (TR-101): Agent-Circuit-Id and Agent-Remote-Id of the line,
+/// as the access node put them in the PADI (G4.3l).
+fn line_attributes(sub: &Sub) -> Vec<Attribute> {
+    let mut v = Vec::new();
+    if let Some(c) = &sub.circuit_id {
+        v.push(Attribute::new("ADSL-Agent-Circuit-Id", c.as_str()));
+    }
+    if let Some(r) = &sub.remote_id {
+        v.push(Attribute::new("ADSL-Agent-Remote-Id", r.as_str()));
+    }
+    v
+}
+
+/// NAS-Port-Id of a line without a circuit id: the port, and for a QinQ
+/// line `:<outer>-<inner>` (Junos' `ge-1/0/0:120-3044`), so RADIUS tells
+/// the lines apart (G4.3l). A single tag keeps the port alone, as before.
+fn nas_port(interface: &str, v: Vlans) -> String {
+    if v.inner != 0 {
+        format!("{interface}:{}-{}", v.outer, v.inner)
+    } else {
+        interface.to_owned()
     }
 }
 

@@ -25,19 +25,20 @@
 //! frame is 0x8100 there, not 0x8863. The filter keeps the two PPPoE
 //! EtherTypes and drops what the host sends.
 //!
-//! **Slow path.** Upstream, a subscriber's IPv4 packet (already
-//! decapsulated and checked by the service) is sent through a raw IPv4
-//! socket (`IPPROTO_RAW`: the kernel routes it as the host's own, so
+//! **Slow path.** Upstream, a subscriber's IPv4 or IPv6 packet (already
+//! decapsulated and checked by the service) is sent through a raw socket
+//! of its family (`IPPROTO_RAW`: the kernel routes it as the host's own, so
 //! `forward` rules do not see it; the output and postrouting chains,
 //! CGNAT included, do). Downstream, every subscriber address gets a /32
-//! route through a `dummy` device (`bng0`, created if missing); the
+//! route (and every /64 and delegated IPv6 prefix, G4.3l) through a
+//! `dummy` device (`bng0`, created if missing); the
 //! service reads what the kernel sends there with a packet socket (the
 //! dummy drops the frame, the tap sees it first) and encapsulates it to
 //! the subscriber. The production path is XDP plus G4.3ca (a tc program
 //! on `bng0`); this one is correct, not fast.
 
 use std::io::{self, IoSliceMut};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd};
 
 use corerouter_model::IfName;
@@ -406,6 +407,7 @@ pub const SLOW_DEVICE: &str = "bng0";
 /// The slow path (see the module docs).
 pub struct SlowPath {
     raw: Socket,
+    raw6: Socket,
     tap: Socket,
     ifindex: u32,
     buf: Vec<u8>,
@@ -421,6 +423,9 @@ impl SlowPath {
         let info = if_info(&name)?;
         let raw = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(255)))?;
         raw.set_nonblocking(true)?;
+        // IPPROTO_RAW on IPv6 sends the header as given (IPV6_HDRINCL).
+        let raw6 = Socket::new(Domain::IPV6, Type::RAW, Some(Protocol::from(255)))?;
+        raw6.set_nonblocking(true)?;
         let proto = Protocol::from(i32::from(ETH_P_ALL.to_be()));
         let tap = Socket::new(Domain::PACKET, Type::RAW, Some(proto))?;
         tap.set_nonblocking(true)?;
@@ -429,6 +434,7 @@ impl SlowPath {
         bind(tap.as_raw_fd(), &info.link).map_err(io_err)?;
         Ok(Self {
             raw,
+            raw6,
             tap,
             ifindex,
             buf: vec![0u8; FRAME_MAX],
@@ -439,13 +445,14 @@ impl SlowPath {
         self.tap.as_fd()
     }
 
-    /// Send a subscriber's IPv4 packet (header included) into the stack.
+    /// Send a subscriber's IPv4 or IPv6 packet (header included) into the
+    /// stack.
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        inject(&self.raw, packet)
+        inject(&self.raw, &self.raw6, packet)
     }
 
-    /// IPv4 packets the kernel routed to a subscriber (`bng0`), without
-    /// their Ethernet header; `f` gets each.
+    /// IPv4 and IPv6 packets the kernel routed to a subscriber (`bng0`),
+    /// without their Ethernet header; `f` gets each.
     pub fn recv(&mut self, mut f: impl FnMut(&[u8])) -> io::Result<usize> {
         let mut total = 0;
         for _ in 0..BUDGET {
@@ -464,8 +471,8 @@ impl SlowPath {
             let Some(frame) = self.buf.get(..len) else {
                 continue;
             };
-            // Ethernet II, IPv4 only (IPv6 per subscriber is G4.3e).
-            if frame.get(12..14) == Some(&[0x08, 0x00])
+            // Ethernet II, IPv4 or IPv6 (G4.3l).
+            if matches!(frame.get(12..14), Some([0x08, 0x00] | [0x86, 0xdd]))
                 && let Some(ip) = frame.get(14..)
             {
                 total += 1;
@@ -496,6 +503,7 @@ impl SlowPath {
         })?;
         Ok(SlowTx {
             raw: self.raw.try_clone()?,
+            raw6: self.raw6.try_clone()?,
             ifindex: self.ifindex,
             rt,
             handle,
@@ -507,6 +515,7 @@ impl SlowPath {
 /// `/32` routes to `bng0`.
 pub struct SlowTx {
     raw: Socket,
+    raw6: Socket,
     ifindex: u32,
     rt: tokio::runtime::Runtime,
     handle: rtnetlink::Handle,
@@ -514,7 +523,45 @@ pub struct SlowTx {
 
 impl SlowTx {
     pub fn inject(&self, packet: &[u8]) -> io::Result<()> {
-        inject(&self.raw, packet)
+        inject(&self.raw, &self.raw6, packet)
+    }
+
+    /// Add (`true`) or remove these IPv6 routes to `bng0` (a session's /64
+    /// and delegated prefix, G4.3l), all in one round. The first error is
+    /// returned; the rest still run.
+    pub fn routes6(&self, ops: &[(Ipv6Addr, u8, bool)]) -> io::Result<()> {
+        use rtnetlink::RouteMessageBuilder;
+        if ops.is_empty() {
+            return Ok(());
+        }
+        let ifindex = self.ifindex;
+        self.rt.block_on(async {
+            let calls = ops.iter().map(|&(net, len, add)| {
+                let h = self.handle.clone();
+                async move {
+                    let msg = RouteMessageBuilder::<Ipv6Addr>::new()
+                        .destination_prefix(net, len)
+                        .output_interface(ifindex)
+                        .build();
+                    let out = if add {
+                        h.route().add(msg).replace().execute().await
+                    } else {
+                        h.route().del(msg).execute().await
+                    };
+                    match out {
+                        Ok(()) => Ok(()),
+                        Err(rtnetlink::Error::NetlinkError(e)) if !add && e.raw_code() == -3 => {
+                            Ok(())
+                        }
+                        Err(e) => Err(io::Error::other(format!(
+                            "route {net}/{len} via {SLOW_DEVICE}: {e}"
+                        ))),
+                    }
+                }
+            });
+            let results = futures_util::future::join_all(calls).await;
+            results.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+        })
     }
 
     /// Add (`true`) or remove these `/32` routes, all in one round on the
@@ -562,8 +609,16 @@ impl SlowTx {
     }
 }
 
-/// A subscriber's IPv4 packet (header included) into the stack.
-fn inject(raw: &Socket, packet: &[u8]) -> io::Result<()> {
+/// A subscriber's IPv4 or IPv6 packet (header included) into the stack.
+fn inject(raw: &Socket, raw6: &Socket, packet: &[u8]) -> io::Result<()> {
+    if packet.first().is_some_and(|b| b >> 4 == 6) {
+        let dst = packet
+            .get(24..40)
+            .and_then(|d| <[u8; 16]>::try_from(d).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "short IPv6 packet"))?;
+        let to = SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(dst), 0, 0, 0));
+        return raw6.send_to(packet, &to.into()).map(|_| ());
+    }
     let Some(dst) = packet.get(16..20) else {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
