@@ -4781,3 +4781,18 @@ continuação indentadas).
   cinco caches.
 
 - 2026-10-26 — processo: O teste `the_daemon_authenticates_through_its_radius_service` era instável e reprovou o lote do #262 e do #264 em 2026-10-26. Ele lia o log logo depois da resposta do RADIUS, mas o serviço só esvazia a fila de log do driver no tick dele, então a linha "recusado" às vezes ainda não tinha chegado. Agora o teste espera a linha aparecer, com prazo de 5 s.
+
+- 2026-10-26 — G0.21: Config grande, parte e: o índice que o servidor DHCP usa para decidir o IPoE (`IpoeIndex`,
+  G4.3f) era refeito do zero a cada revisão da config, num laço sobre todos os `/ppp secret` e
+  todas as concessões fixas: 22 ms com 100 mil de cada a cada commit, dentro da rodada do DHCP e
+  com o lock do `Session`. Agora o nome do secret é procurado no índice que a própria lista já
+  mantém (`Secrets::first_named`, incremental desde a G4.3gb; anda a lista só numa config editada
+  à mão com um nome repetido e quando o primeiro não é IPoE), e as velocidades das concessões
+  fixas seguem a lista bloco a bloco (`CowList::shared_blocks`): uma revisão que mudou uma
+  concessão lê o bloco dela (128), não a lista. Duas concessões no mesmo endereço (só à mão)
+  fazem o índice ser refeito, e a última vale, como antes.
+
+  Como testar: `cargo test -p corerouter-engine --lib ipoe` (`refresh_equals_a_rebuild`: proptest,
+  o índice seguido é igual a um refeito do zero depois de qualquer série de escritas),
+  `cargo test -p corerouter-model --lib ppp_secrets`,
+  `cargo bench -p corerouter-engine --bench config_store -- ipoe_index`.

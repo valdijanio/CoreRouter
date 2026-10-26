@@ -1488,3 +1488,22 @@ Paralelismo: os passos não dependem um do outro, então cada job compila o que 
 próprio runner (4 vCPU cada) em vez de dividir um runner. O que fica em série é o `test`
 (compilação + 2613 testes no nextest); próximo passo, se precisar: dividir o `test` em duas
 partições do nextest (`--partition count:i/2`), ~1,5 min a menos **estimado**.
+
+### G0.21 parte e — índice do IPoE (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26)
+
+`config_store/ipoe_index/*` (novo): o que a rodada do DHCP paga para seguir uma config com N
+secrets IPoE e N concessões fixas com `rate_limit`, depois de um `ppp.secret.add`
+(`secret_add`) ou da troca do `rate_limit` de uma concessão (`lease_set`). Antes =
+`IpoeIndex::of` (refeito do zero); depois = `IpoeIndex::refresh`.
+
+| Benchmark | Antes | Depois |
+|---|---:|---:|
+| `config_store/ipoe_index/secret_add/1000` | 104 µs | 22 ns |
+| `config_store/ipoe_index/secret_add/10000` | 1,01 ms | 20 ns |
+| `config_store/ipoe_index/secret_add/100000` | **22,5 ms** | **20 ns** |
+| `config_store/ipoe_index/lease_set/1000` | 104 µs | 4,7 µs |
+| `config_store/ipoe_index/lease_set/10000` | 995 µs | 9,2 µs |
+| `config_store/ipoe_index/lease_set/100000` | **22,5 ms** | **35 µs** |
+
+O que sobra no `lease_set` cresce com N/128: o `shared_blocks` monta um mapa dos blocos da
+lista antiga (782 com 100 mil) para achar os que mudaram.

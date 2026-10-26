@@ -159,3 +159,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-26 — G4.9b corrigido (descida de sessão moldada sem limite no BNG com XDP)
 - 2026-10-26 — G4.9c feito (janela Queues e campos PPP)
 - 2026-10-26 — G4.9d feito (laboratório em massa das filas)
+- 2026-10-26 — G0.21: índice do IPoE segue a config por bloco (sobra da G4.3gb)
