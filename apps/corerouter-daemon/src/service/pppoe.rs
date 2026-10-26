@@ -465,8 +465,10 @@ mod linux {
     ) {
         // G4.3h: hot standby, what changed goes to the pair's other node.
         let changes = bng.ha_take(ms());
-        if !changes.is_empty() {
-            super::super::ppp_ha::publish(changes);
+        if !changes.is_empty()
+            && let Some(back) = super::super::ppp_ha::publish(changes)
+        {
+            bng.ha_requeue(back);
         }
         // G4.3h: a node that is not the active one of its pair sends
         // nothing, not even the PADT to a session it does not know (it

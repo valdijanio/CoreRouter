@@ -321,15 +321,33 @@ fn node_config(r: &Redundancy, id: u64, sections: Vec<corerouter_proto_ha::msg::
     }
 }
 
+/// A worker waits for the pair's lock only past this many changes
+/// queued (memory bound); below, a busy lock leaves them for its next
+/// round.
+pub(crate) const PUBLISH_WAIT: usize = 65_536;
+
 /// The `pppoe` workers' changes (hot standby): into the publisher, while
-/// this node is the active one (elsewhere `Node` ignores them).
-pub(crate) fn publish(changes: Vec<super::pppoe_bng::ha::HaChange>) {
+/// this node is the active one (elsewhere `Node` ignores them). The pair's
+/// lock may be busy for milliseconds (the sync thread encoding a snapshot
+/// into the link): then the changes come back, and the worker goes on
+/// serving its subscribers and hands them again next round.
+pub(crate) fn publish(
+    changes: Vec<super::pppoe_bng::ha::HaChange>,
+) -> Option<Vec<super::pppoe_bng::ha::HaChange>> {
     use super::pppoe_bng::ha::HaChange;
     let rt = runtime();
     let now = rt.now();
-    let mut g = rt.pair();
+    let mut g = if changes.len() >= PUBLISH_WAIT {
+        rt.pair()
+    } else {
+        match rt.pair.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return Some(changes),
+        }
+    };
     let Some(p) = g.as_mut() else {
-        return;
+        return None;
     };
     for c in changes {
         match c {
@@ -338,6 +356,7 @@ pub(crate) fn publish(changes: Vec<super::pppoe_bng::ha::HaChange>) {
             HaChange::Counters(k, c) => p.node.counters(now, k, c),
         }
     }
+    None
 }
 
 /// This node takes the role: the replica's sessions for the `pppoe`

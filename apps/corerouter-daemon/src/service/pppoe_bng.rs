@@ -3234,6 +3234,8 @@ impl Bng {
             }
         }
         let mut ending: Vec<(usize, SessionRef, (u32, &'static str))> = Vec::new();
+        // G4.3h: the counters for the pair's standby, in this same pass.
+        let ha_counters = self.ha_counters_due(now);
         {
             let mut sh = guard(&self.shared);
             for ((slot, sid), sub) in self.subs.iter_mut() {
@@ -3258,6 +3260,9 @@ impl Bng {
                     a.tx_bps = bps(a.tx_bytes, sub.prev.1);
                 }
                 sub.prev = (a.rx_bytes, a.tx_bytes, now);
+                if ha_counters {
+                    self.ha.counters((*slot, *sid), a);
+                }
                 if let (Some(l), Some(ip)) = (&sub.effective.address_list, sub.ip)
                     && now.saturating_sub(sub.list_at) >= LIST_REFRESH_MS
                 {

@@ -64,6 +64,16 @@ pub(crate) struct HaState {
     pub(crate) handed_over: bool,
 }
 
+impl HaState {
+    /// The counters of published session `k`, read in `tick`'s pass over
+    /// the active table (no lock or lookup of its own).
+    pub(super) fn counters(&mut self, k: (usize, u16), a: &ActiveSession) {
+        if let Some(key) = self.keys.get(&k) {
+            self.out.push(HaChange::Counters(*key, counters_of(a)));
+        }
+    }
+}
+
 fn auth_codes(a: Option<AuthProto>) -> (u16, u8) {
     match a {
         Some(AuthProto::Pap) => (0xc023, 0),
@@ -226,7 +236,7 @@ impl Bng {
     }
 
     /// What to send to the standby now: records of the sessions that
-    /// changed, ends, and every [`COUNTERS_MS`] the counters.
+    /// changed, ends, and the counters `tick` gathered.
     pub(crate) fn ha_take(&mut self, now: Millis) -> Vec<HaChange> {
         if !self.ha_hot() {
             self.ha.dirty.clear();
@@ -258,16 +268,23 @@ impl Bng {
                 }
             }
         }
-        if now.saturating_sub(self.ha.counters_at) >= COUNTERS_MS {
-            self.ha.counters_at = now;
-            let sh = guard(&self.shared);
-            for (k, key) in &self.ha.keys {
-                if let Some(a) = sh.active.get(&session_id(k.0, &self.slots, k.1)) {
-                    self.ha.out.push(HaChange::Counters(*key, counters_of(a)));
-                }
-            }
-        }
         std::mem::take(&mut self.ha.out)
+    }
+
+    /// Changes the pair's publisher could not take now (its lock busy):
+    /// back in front of the next round's, in order.
+    pub(crate) fn ha_requeue(&mut self, mut changes: Vec<HaChange>) {
+        changes.append(&mut self.ha.out);
+        self.ha.out = changes;
+    }
+
+    /// Whether this tick sends the counters (every [`COUNTERS_MS`]).
+    pub(super) fn ha_counters_due(&mut self, now: Millis) -> bool {
+        if !self.ha_hot() || now.saturating_sub(self.ha.counters_at) < COUNTERS_MS {
+            return false;
+        }
+        self.ha.counters_at = now;
+        true
     }
 
     /// A takeover waits for this worker (adopt it before answering).
