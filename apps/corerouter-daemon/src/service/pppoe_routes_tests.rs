@@ -110,7 +110,7 @@ fn from_client(sid: u16, pkt: &[u8]) -> Vec<u8> {
 #[test]
 fn secret_routes_ride_the_slow_path_and_leave_with_the_session() {
     let mut s = snap(1, server(serde_json::json!({})), 10);
-    s.ppp.secrets[0].routes = FramedRoute::parse_list("203.0.113.8/29,2001:db8:100::/48").unwrap();
+    s.ppp.secrets.get_mut(0).unwrap().routes = FramedRoute::parse_list("203.0.113.8/29,2001:db8:100::/48").unwrap();
     let mut lab = Lab::new(1, s, |_| ("u0".into(), "p0".into()));
     lab.start(0..1);
     lab.run(100, 50);

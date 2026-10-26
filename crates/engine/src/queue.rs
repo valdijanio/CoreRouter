@@ -820,7 +820,7 @@ mod tests {
         let mut c = Session::virtual_lab().store().running().clone();
         c.queue = cfg(&[("lan", "192.168.88.0/24"), ("far", "203.0.113.0/24"), ("off", "10.9.9.9")]).queue;
         c.queue.simple[2].disabled = true;
-        c.ip.addresses = corerouter_model::cow::CowArc::new(vec![corerouter_model::AddressEntry {
+        c.ip.addresses = corerouter_model::cow_list::CowList::from(vec![corerouter_model::AddressEntry {
             id: ItemId(1),
             address: "192.168.88.1/24".parse().unwrap(),
             interface: "ether2".parse().unwrap(),

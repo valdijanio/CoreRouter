@@ -7,6 +7,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
+use corerouter_model::cow_list::CowList;
 use corerouter_model::route;
 use corerouter_model::{AddressEntry, Config, IfName, ItemId};
 use ipnet::IpNet;
@@ -62,7 +63,7 @@ pub(super) fn dynamic_error(id: ItemId) -> EngineError {
 
 /// The address `entry` would clash with among `others` on the same
 /// interface: the same prefix, or (IPv6) the same address from the same pool.
-fn clash(entry: &AddressEntry, others: &[AddressEntry]) -> Option<String> {
+fn clash(entry: &AddressEntry, others: &CowList<AddressEntry>) -> Option<String> {
     for a in others.iter().filter(|a| a.id != entry.id && a.interface == entry.interface) {
         if a.address == entry.address {
             return Some(format!("{} already exists on {}", entry.address, entry.interface));

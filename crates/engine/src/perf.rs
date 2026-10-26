@@ -68,7 +68,7 @@ pub fn full_table(n: usize) -> Config {
             comment: String::new(),
         });
     }
-    *cfg.ip.routes = routes;
+    cfg.ip.routes = routes.into();
     cfg.ip.next_route_id = u32::try_from(n).unwrap_or(u32::MAX).wrapping_add(1);
     cfg
 }

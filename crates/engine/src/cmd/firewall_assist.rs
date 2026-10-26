@@ -5,6 +5,7 @@
 //! the operator edits, moves or removes. One command = one commit, so the
 //! lockout check sees the whole template at once.
 
+use corerouter_model::cow_list::CowList;
 use corerouter_model::firewall::{Action, FirewallRule, Limit, Name, PortSet, Table, Timeout};
 use corerouter_model::{Config, IfName, ItemId};
 use serde_json::{Map, Value, json};
@@ -125,7 +126,7 @@ fn insert(
 /// The rule to insert above for position `idx`: above the section headers
 /// right over it, and never inside the zone matrix's block (above its
 /// header instead). `None` = the end.
-fn anchor_at(rules: &[FirewallRule], mut idx: usize) -> Option<ItemId> {
+fn anchor_at(rules: &CowList<FirewallRule>, mut idx: usize) -> Option<ItemId> {
     while idx > 0 && rules.get(idx - 1).is_some_and(|r| r.section && !r.zone) {
         idx -= 1;
     }

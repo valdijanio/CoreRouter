@@ -128,9 +128,9 @@ fn rollback_points_survive_writes_to_the_shared_sections() {
     st.candidate_mut().ip.routes.push(route(1));
     let point = st.candidate().clone();
     st.candidate_mut().ip.routes.push(route(2));
-    st.candidate_mut().ip.routes[0].comment = "changed".into();
+    st.candidate_mut().ip.routes.get_mut(0).unwrap().comment = "changed".into();
     assert_eq!(point.ip.routes.len(), 1);
-    assert_eq!(point.ip.routes[0].comment, "");
+    assert_eq!(point.ip.routes.get(0).unwrap().comment, "");
     st.set_candidate(point.clone());
     assert_eq!(*st.candidate(), point);
 }
