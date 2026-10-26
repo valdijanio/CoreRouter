@@ -1030,3 +1030,111 @@ proptest::proptest! {
         }
     }
 }
+
+// --- G4.3l: stacked VLANs and sessions per VLAN ---
+
+fn padi_on(src: Mac, vlans: Vlans) -> Vec<u8> {
+    let mut b = Vec::new();
+    let mut w = DiscoveryWriter::begin(&mut b, Mac::BROADCAST, src, vlans, Code::Padi, 0);
+    w.tag(tag::SERVICE_NAME, b"");
+    w.finish().unwrap();
+    b
+}
+
+fn stacked(c: &mut ServerConfig) {
+    c.vlans = VlanFilter::Stacked {
+        outer: vec![100..=104, 105..=109],
+        inner: vec![1..=1000, 1001..=2000],
+        tpid: eth::TPID_8021AD,
+        untagged: false,
+    };
+}
+
+#[test]
+fn stacked_filter_takes_both_tags_and_the_tpid() {
+    let (mut s, mut out) = server(stacked);
+    let q = |o, i| Vlans::qinq(o, i);
+    let q8100 = Vlans {
+        outer_tpid: eth::TPID_8021Q,
+        ..Vlans::qinq(100, 7)
+    };
+    for v in [
+        Vlans::NONE,
+        Vlans::single(100),
+        q(110, 7),
+        q(100, 2001),
+        q8100,
+    ] {
+        s.handle_frame(0, 1, &padi_on(HOST, v), &mut out);
+    }
+    assert!(
+        out.frames.is_empty(),
+        "untagged, one tag, outer or inner out of range, wrong TPID"
+    );
+    s.handle_frame(0, 1, &padi_on(HOST, q(105, 2000)), &mut out);
+    let r = replies(&out);
+    assert_eq!(r.len(), 1);
+    // The PADO goes back inside the same two tags (802.1ad outside).
+    assert_eq!(r[0].vlans, q(105, 2000));
+    let f = &out.frames().next().unwrap().1;
+    assert_eq!(&f[12..14], &[0x88, 0xa8]);
+    assert_eq!(&f[16..18], &[0x81, 0x00]);
+    // A single-tag server does not take a QinQ frame.
+    let (mut s, mut out) = server(|c| c.vlans = VlanFilter::Ranges(vec![100..=104, 105..=109]));
+    s.handle_frame(0, 1, &padi_on(HOST, q(105, 5)), &mut out);
+    assert!(out.frames.is_empty());
+}
+
+/// TR-101 1:1: one session per VLAN. A second CPE on the line gets no
+/// PADO (§5.2) and, with an older offer, AC-System-Error (§5.4); the line's
+/// own CPE coming back takes its old session's place; another line is
+/// unaffected.
+#[test]
+fn one_session_per_vlan_in_the_1_to_1_model() {
+    let (mut s, mut out) = server(|c| {
+        stacked(c);
+        c.max_per_vlan = 1;
+    });
+    let line = Vlans::qinq(100, 7);
+    let go = |s: &mut Server, out: &mut ServerOutput, now, mac, v: Vlans| -> (bool, Option<u16>) {
+        out.clear();
+        s.handle_frame(now, 1, &padi_on(mac, v), out);
+        let r = replies(out);
+        let Some(pado) = r.first() else {
+            return (false, None);
+        };
+        let mut b = Vec::new();
+        let mut w = DiscoveryWriter::begin(&mut b, AC, mac, v, Code::Padr, 0);
+        w.tag(tag::SERVICE_NAME, b"");
+        w.tag(tag::AC_COOKIE, pado.tags.ac_cookie.unwrap());
+        w.finish().unwrap();
+        out.clear();
+        s.handle_frame(now, 1, &b, out);
+        (true, pads(out).map(|p| p.session_id))
+    };
+    let (_, sid) = go(&mut s, &mut out, 0, HOST, line);
+    assert!(sid.is_some_and(|x| x != 0));
+    // A second CPE on the same line: no PADO.
+    assert_eq!(go(&mut s, &mut out, 0, HOST2, line), (false, None));
+    assert_eq!(s.stats().vlan_refused, 1);
+    // The line's own CPE after a reboot (a new AC-Cookie): its session,
+    // not a refusal.
+    let (_, again) = go(&mut s, &mut out, 6000, HOST, line);
+    assert!(again.is_some_and(|x| x != 0), "{:?}", s.stats());
+    assert_eq!(s.active(), 1);
+    // Another line.
+    assert!(
+        go(&mut s, &mut out, 10, HOST2, Vlans::qinq(100, 8))
+            .1
+            .is_some_and(|x| x != 0)
+    );
+    assert_eq!(s.active(), 2);
+    s.check_invariants().unwrap();
+    // Turning the limit off and on keeps the count right.
+    let mut c = s.config().clone();
+    c.max_per_vlan = 0;
+    s.reconfigure(c.clone());
+    c.max_per_vlan = 1;
+    s.reconfigure(c);
+    s.check_invariants().unwrap();
+}

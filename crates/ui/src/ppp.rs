@@ -183,6 +183,12 @@ const SERVER_FIELDS: &[Field] = &[
     Field { param: "default_profile", label: "Default Profile", help: "ppp.server.default_profile", input: Input::Choice, edit: true },
     Field { param: "pppoe_over_vlan_range", label: "PPPoE over VLAN Range", help: "ppp.server.pppoe_over_vlan_range", input: Input::Text("100-115,120"), edit: true },
     Field { param: "accept_untagged", label: "Accept Untagged", help: "ppp.server.accept_untagged", input: Input::Check, edit: true },
+    Field { param: "vlan_mode", label: "VLAN Mode", help: "ppp.server.vlan_mode", input: Input::Choice, edit: true },
+    Field { param: "outer_vlan_range", label: "Outer VLAN Range", help: "ppp.server.outer_vlan_range", input: Input::Text("100-199 (stacked)"), edit: true },
+    Field { param: "inner_vlan_range", label: "Inner VLAN Range", help: "ppp.server.inner_vlan_range", input: Input::Text("any"), edit: true },
+    Field { param: "outer_tpid", label: "Outer TPID", help: "ppp.server.outer_tpid", input: Input::Choice, edit: true },
+    Field { param: "max_sessions_per_vlan", label: "Max Sessions per VLAN", help: "ppp.server.max_sessions_per_vlan", input: Input::Text("0 (no limit; 1 = 1:1)"), edit: true },
+    Field { param: "max_payload", label: "Max Payload (RFC 4638)", help: "ppp.server.max_payload", input: Input::Text("none (1492)"), edit: true },
     Field { param: "pado_delay", label: "PADO Delay (ms)", help: "ppp.server.pado_delay", input: Input::Text("0"), edit: true },
     Field { param: "pado_delay_by_load", label: "PADO Delay by Load", help: "ppp.server.pado_delay_by_load", input: Input::Text("5000:100,20000:300"), edit: true },
     Field { param: "ac_cookie", label: "AC-Cookie", help: "ppp.server.ac_cookie", input: Input::Check, edit: true },
@@ -579,7 +585,7 @@ impl PppPanel {
                 format!("{}/{}", text(r, "max_mtu"), text(r, "max_mru")),
                 chip::cell("", &auth_chips),
                 text(r, "keepalive_timeout"),
-                if vlans.is_empty() { "untagged".into() } else { vlans },
+                Self::vlans_cell(r, vlans),
                 text(r, "default_profile"),
                 Self::admission_cell(r),
                 n(r, "sessions").to_string(),
@@ -746,6 +752,18 @@ impl PppPanel {
         }
     }
 
+    /// The VLANs a server serves: `untagged`, the 802.1Q range, or QinQ
+    /// `S 100-103 × C any` with a selo (G4.3l).
+    fn vlans_cell(r: &Value, single: String) -> String {
+        if text(r, "vlan_mode") == "stacked" {
+            let tpid = text(r, "outer_tpid");
+            let label = format!("S {} × C {}", text(r, "outer_vlan_range"), text(r, "inner_vlan_range"));
+            let chips: Vec<(&str, Kind)> = if tpid == "0x8100" { vec![("QinQ 0x8100", Kind::Amber)] } else { vec![("QinQ", Kind::Blue)] };
+            return chip::cell(&label, &chips);
+        }
+        if single.is_empty() { "untagged".into() } else { single }
+    }
+
     /// `new_session_rate`: the fixed rate, off, or `auto` with the rate now
     /// and why (amber when the RADIUS server is what holds it down).
     fn admission_cell(r: &Value) -> String {
@@ -839,7 +857,12 @@ impl PppPanel {
         if flag(r, "radius") {
             name_chips.push(("R", Kind::Neutral));
         }
-        let vlan = r.get("vlan").and_then(Value::as_u64).map(|v| v.to_string()).unwrap_or_default();
+        // G4.3l: a QinQ line as `outer/inner` (`120/3044`), coloured by the pair.
+        let vlan = match (r.get("vlan").and_then(Value::as_u64), r.get("inner_vlan").and_then(Value::as_u64)) {
+            (Some(o), Some(i)) => format!("{o}/{i}"),
+            (Some(o), None) => o.to_string(),
+            _ => String::new(),
+        };
         let service = text(r, "service");
         Row {
             key: text(r, "id"),
@@ -1070,6 +1093,8 @@ impl PppPanel {
                         for k in ["one_session_per_host", "accept_untagged", "ac_cookie"] {
                             v.insert(k, "yes".to_owned());
                         }
+                        v.insert("vlan_mode", "single".to_owned());
+                        v.insert("outer_tpid", "0x88a8".to_owned());
                         v.insert("default_profile", "default".to_owned());
                     }
                 }
@@ -1770,6 +1795,8 @@ impl PanelState for PppPanel {
                 "only_one" | "change_tcp_mss" => ["default", "yes", "no"].iter().map(|s| (*s).to_owned()).collect(),
                 "use_ipv6" => ["default", "yes", "no", "require"].iter().map(|s| (*s).to_owned()).collect(),
                 "server" => servers.clone(),
+                "vlan_mode" => ["single", "stacked"].iter().map(|s| (*s).to_owned()).collect(),
+                "outer_tpid" => ["0x88a8", "0x8100"].iter().map(|s| (*s).to_owned()).collect(),
                 "action" => ["terminate", "delay", "drop"].iter().map(|s| (*s).to_owned()).collect(),
                 _ => Vec::new(),
             }

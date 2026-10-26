@@ -13,11 +13,11 @@ empilhados:
 | a | crate `proto-ha` (sans-IO): codec do sync, registro da sessão, máquina de papéis com cerca, hello de acesso, laboratório de dois nós, fuzz, benchmark; este documento | #241 |
 | b | modelo `ppp.redundancy` e comandos `ppp.redundancy.{set,get,monitor,switchover,simulate-failure}` | #242 |
 | c | serviço `ppp-ha` no daemon: link de sync TLS com autenticação mútua, hello de acesso (AF_PACKET), testemunha (ICMP), track, monitor; `proto_ha::node` (o mesmo código no daemon e no laboratório) | #248 |
-| d | fase 1 no serviço `pppoe`: só o ativo responde, MAC virtual, segredo do AC-Cookie compartilhado | depois da sessão B (G4.3k+l) entrar |
-| e1 | `proto-pppoe`: `Server::export`/`import` (a sessão em Opened no outro servidor, sem renegociar) | este PR |
-| e2 | fase 2 no serviço: exportar/importar sessão por worker, mapas XDP na tomada, contabilização contínua | depois do d |
+| d+e2 | fases 1 e 2 no serviço `pppoe`: só o ativo responde (nem PADT), MAC virtual e portas promíscuas, AC-Cookie do par; hot standby: cada worker publica as suas sessões, a tomada as adota em Opened, contabilização contínua (o mesmo Acct-Session-Id, um Interim, nenhum Stop) | #263 |
+| e1 | `proto-pppoe`: `Server::export`/`import` (a sessão em Opened no outro servidor, sem renegociar) | #253 |
+| e2a | registro da sessão completo para a tomada | #255 |
 | f | aba PPP › Redundancy na GUI | #251 |
-| g | laboratório com dois daemons, MAC virtual e BNG Blaster (`cargo xtask bng-lab` estágio `ha`) | depois do e |
+| g | laboratório com dois daemons e BNG Blaster (`cargo xtask bng-lab --only ha`) | este PR (empilhado sobre o #263) |
 
 ## 1. Pesquisa
 
@@ -224,6 +224,102 @@ pedida pelo CPE segue normal. A lista de SIDs livres é refeita uma vez por lote
 - **Medido** (release): export de 74 ns e import de 242 ns por sessão (20 mil em 1,5 ms e 4,8
   ms): 100 mil num núcleo ≈ 25 ms; por worker, em paralelo.
 
+## 2.8 Fase 1 no serviço `pppoe` (stateless)
+
+- **Só o ativo fala.** Fora do papel ativo, o worker não entrega quadro nenhum ao BNG e descarta o
+  que ele quisesse mandar. Isso inclui o PADT que o `proto-pppoe` manda a quadro de sessão
+  desconhecida: no standby, esse PADT derrubaria o CPE que está no ativo. Um nó que acaba de ligar
+  fica mudo até o par decidir (`HA_ACTIVE` começa falso).
+- **MAC virtual.** Com a redundância ligada, o AC MAC de todos os servidores é o MAC virtual
+  (PADO, PADS e sessões). O `ppp-ha` põe as portas de acesso em modo promíscuo enquanto as tem
+  abertas, para receber os quadros endereçados a ele. O hello do ativo, mandado do MAC virtual,
+  ensina a porta aos switches.
+- **AC-Cookie do par.** A chave vem do segredo do par, e o cookie deixa de amarrar o índice da
+  porta, que muda entre as máquinas. Assim, um PADR em voo numa troca entra no novo ativo
+  (`ServerConfig::cookie_secret`).
+- **Ao perder o papel**, o nó encerra as sessões sem mandar nada ao CPE. No modo stateless manda
+  Acct-Stop; no hot standby, não (abaixo).
+- **Medido** (debug, `tests/netns_ha_pppoe.rs`, dois daemons reais e 200 CPEs `proto-pppoe` com
+  keepalive de 1 s × 3): o standby não atende ninguém e não derruba ninguém em regime; morto o
+  ativo, as 200 voltam no outro nó em 4,9 s (morte em 1,2 s, mais o keepalive do CPE de 3 s, mais o
+  login).
+
+## 2.9 Fase 2 no serviço `pppoe` (hot standby)
+
+- **Publicar.** Cada worker marca a sessão que mudou: subida, CoA de rate-limit, IPv6, rotas. A
+  cada volta do laço ele monta o `SessionRecord` (proto-pppoe `export` mais o estado do BNG) e o
+  entrega ao publicador do `ppp-ha`. A remoção vai no fim da sessão; os contadores, a cada 10 s.
+  O custo é O(1) por mudança, e nada se refaz por sessão a cada tick.
+- **Tomar.** Ao virar ativo com a réplica completa, o `ppp-ha` entrega os registros aos workers
+  **antes** de liberar o "responder". Um quadro de sessão ainda não adotada levaria PADT, por isso
+  cada worker só responde depois de adotar a sua parte (`ha_pending`). A adoção, por worker e em
+  paralelo, faz:
+  - `Server::import` (Opened, sem quadro);
+  - o endereço reservado no pool;
+  - a entrada no XDP ou a rota do caminho lento;
+  - as rotas da G4.3cd;
+  - a tabela ativa, com os contadores herdados como base;
+  - a address-list;
+  - uma linha `up`/`takeover` no histórico;
+  - um **Interim-Update** com o mesmo Acct-Session-Id e os contadores.
+  
+  O serviço RADIUS agenda os Interims seguintes a partir desse (antes, só a partir do Start).
+  Os ganchos `on_up` não rodam de novo.
+- **Entregar.** O nó que perde o papel em hot standby encerra as suas cópias sem Acct-Stop e sem
+  `on_down`: a sessão continua no par.
+- **Mesmo número de workers nos dois nós.** Os quadros de um CPE chegam ao worker do hash do MAC, e
+  o SESSION_ID dele é desse worker. Por isso o número de workers entra na divergência
+  (`pppoe.workers`), e uma sessão que não cabe é contada e registrada no log.
+- **Medido** (debug, `tests/netns_ha_pppoe.rs`): morto o ativo, as 200 sessões estavam no outro nó
+  em 1,22 s, e **nenhum** CPE caiu em 10 s de keepalive. Unidade (`pppoe_ha_tests.rs`): 200
+  sessões adotadas por outro `Bng`, 2 minutos de keepalive dele, 0 PADT, os mesmos logins,
+  endereços, SIDs e Acct-Session-Id.
+
+### Achado: Acct-Session-Id repetido entre workers
+
+O laboratório achou um defeito anterior à G4.3h. O Acct-Session-Id era `hora + contador`, e
+cada worker do `pppoe` (G4.3g) tem o seu contador: dois workers davam o mesmo id no mesmo
+segundo. Em 1000 logins houve 213 ids distintos. Isso viola a RFC 2866 §5.5, que pede o id único,
+e quebra também o CoA por Acct-Session-Id. Agora o id leva a lane do worker; o laboratório
+confere que todos os Starts têm ids distintos.
+
+## 2.10 Laboratório (`cargo xtask bng-lab --only ha`, PR g)
+
+Três namespaces: o nó A, o nó C e o BNG Blaster (com `--root`, nomeados por `ip netns`: o
+carregador XDP lê o `/sys` do namespace). Duas bridges (acesso e uplink), o link de sync, a
+testemunha e um servidor RADIUS de teste num link que continua de pé. Com todas as sessões em A e a
+réplica de C completa, **A perde a energia**: todas as portas caem ao mesmo tempo. Sem root, na VM
+(caminho lento; o tráfego de 1 pps vai em todas as sessões até 2000, e acima disso numa amostra de
+500).
+
+**Medido** (VM `corerouter-lab`, 8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1, 2026-10-26,
+`cargo xtask vm-lab run -- cargo xtask bng-lab --only ha --scales 1000,10000,100000`; CHAP pelo
+RADIUS de teste, keepalive do BNG Blaster de 5 s × 3):
+
+| Sessões | Tomada | Tráfego de subida de volta | Sessões perdidas | No nó novo | Starts (ids únicos) | Stops na tomada | Com Interim do nó novo |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | 1,13 s | 1,14 s | 0 | 1 000 | 1 000 (1 000) | 0 | 1 000 |
+| 10 000 | 1,12 s | 1,14 s | 0 | 10 000 | 10 000 (10 000) | 0 | 10 000 |
+| 100 000 | 1,15 s | 1,29 s | 0 | 100 000 | 100 000 (100 000) | 0 | 100 000 |
+
+Com root (`--root`: XDP genérico nas portas dos dois nós, e as sessões adotadas programadas nos
+mapas do nó novo), **medido** na mesma VM:
+
+| Sessões | Plano | Tomada | Tráfego de subida de volta | Sessões perdidas | Starts (ids únicos) | Stops | Com Interim do nó novo |
+|---:|---|---:|---:|---:|---:|---:|---:|
+| 1 000 | XDP | 1,23 s | 1,25 s | 0 | 1 000 (1 000) | 0 | 1 000 |
+| 10 000 | XDP | 1,24 s | 1,27 s | 0 | 10 000 (10 000) | 0 | 10 000 |
+| 100 000 | XDP | 0,99 s | 1,12 s | 0 | 100 000 (100 000) | 0 | 100 000 |
+
+A tomada é quase toda a espera pela morte do par (1,2 s, 4 hellos de 300 ms). Adotar 100 mil
+sessões quase não aparece no tempo: 1,15 s contra 1,13 s com mil. O import do `proto-pppoe` custa
+242 ns por sessão (#253), dividido entre os workers. Nenhum assinante percebeu a troca (0 flaps no BNG
+Blaster), e a contabilização seguiu com os mesmos ids, sem Stop. No A/B da mesma VM, um nó sozinho
+sobe as mesmas 100 mil em 33 s.
+
+O tráfego de descida depende do protocolo de roteamento que anuncia o pool pelo nó ativo, fora do
+laboratório (gap G4.3hf).
+
 ## 3. Testes
 
 - Unidade (27): cada regra da máquina de papéis, codec, registro, hello, sync.
@@ -272,14 +368,54 @@ pedida pelo CPE segue normal. A lista de SIDs livres é refeita uma vez por lote
 - **Banda:** uma mudança custa ≈ 182 B (upsert) ou 50 B (contadores). Um BNG de 100 mil assinantes
   com 2000 logins/logouts por segundo e contadores a cada 10 s gasta ≈ 0,4 MB/s + 0,5 MB/s: menos de
   1 % de 1 Gbit/s (**estimado**). O snapshot inteiro passa em 0,2 s a 1 Gbit/s.
-- **Threads:** a sincronização cabe num núcleo com folga (1 milhão de mudanças/s contra ≈ 94 mil
-  sessões/s que o BNG monta, G4.3d). Dividir por worker do `pppoe` (cada worker já tem a sua faixa
-  de SESSION_ID) daria um stream por worker sem lock compartilhado — é o plano da fase 2 (PR d):
-  cada worker publica as suas mudanças numa fila limitada para a thread do sync, e a tomada
-  importa as sessões em paralelo, uma thread por worker. A máquina de papéis é uma só por nó
-  (decisão global, custo desprezível).
+- **Threads:** a sincronização cabe num núcleo com folga: 1 milhão de mudanças/s, contra
+  ≈ 94 mil sessões/s que o BNG monta (G4.3d). Um stream por worker evitaria o lock do par, mas
+  não precisou: o worker não espera por ele (abaixo).
+- **A tomada** importa em paralelo: cada worker adota as sessões da sua lane.
+- **A máquina de papéis** é uma só por nó: decisão global, custo desprezível.
+
+### No serviço `pppoe` (fase 2)
+
+**Medido** com `cargo bench -p corerouter-daemon --bench pppoe_bng` (release, Ryzen AI Max+ 395,
+2026-10-26, com outras sessões na máquina: load 14–19, mediana de 3 execuções):
+
+- **Cada worker publica as suas mudanças a cada rodada.** Por sessão, um registro de ≈ 200 B.
+  Montar 1000 sessões custa 15–18 ms com e sem hot standby: a diferença fica dentro do ruído.
+- **O lock do par pode ficar ocupado por milissegundos**: a thread do sync codifica até 4 MiB por
+  volta num snapshot. O worker que esperasse por ele pararia de atender os assinantes. Por isso o
+  `publish` usa `try_lock`. Lock ocupado: as mudanças voltam para a fila do worker
+  (`ha_requeue`) e saem na rodada seguinte, na mesma ordem. O worker só espera passadas 65 536
+  mudanças na fila, o limite de memória. 40 mil logins em rodadas de 256, com o lock preso 8 ms a
+  cada 10 ms (o pior caso):
+
+  | | 1 worker | 8 workers |
+  |---|---:|---:|
+  | sem HA | 67 570/s | 331 743/s |
+  | hot standby, worker espera o lock | 23 854/s | 179 141/s |
+  | hot standby, `try_lock` + fila (este PR) | 63 469/s | 302 470/s |
+
+- **Os contadores para o standby** (a cada 10 s) saem na mesma passada do `tick` de 1 s, que já
+  percorre a tabela ativa. A primeira versão fazia uma varredura própria, debaixo do lock
+  compartilhado: 22 ms para 50 mil sessões num worker, 442 ns por sessão. Agora o `tick` de 50 mil
+  sessões leva 21,7 ms sem os contadores e 22,7 ms com eles: ≈ 1 ms a mais a cada 10 s.
+- **O `tick` de 1 s em si** (G4.3g, anterior a este PR) custa ≈ 440 ns por sessão debaixo do lock
+  compartilhado. Reusar um buffer para o id da sessão, no lugar do `format!`, não mudou nada
+  (21,6 contra 22,2 ms). O custo é a busca no mapa de 50 mil chaves, não a alocação. Dividido
+  entre 8 workers, dá ≈ 3 ms por worker a cada segundo.
 
 ## 5. Riscos e como evitamos
+
+- **Uma porta de acesso por L2:** o ativo põe o mesmo MAC virtual em todas as portas de acesso.
+  Duas portas no mesmo L2 fazem o switch mover o MAC de uma para a outra, e os quadros chegam pela
+  porta errada (o laboratório achou isso com duas portas numa bridge só). Num ISP cada porta vai a
+  uma OLT ou a um switch; MAC virtual por porta fica para uma gap, se alguém precisar.
+- **CoA/DM depois da tomada:** o servidor de cobrança manda o CoA ao endereço de NAS do nó antigo.
+  É preciso um endereço de NAS do par ou o encaminhamento pelo par (gap G4.3hb).
+- **Class (RFC 2865 §5.25):** o PPP ainda não ecoa o Class na contabilização. O registro já tem
+  o campo (gap G4.3ha).
+- **DHCPv6-PD:** o prefixo delegado é reservado e anunciado no nó novo, e o Renew do CPE é
+  atendido a partir da concessão refeita. O estado fino do DHCPv6 (T1/T2 em curso) não é copiado.
+
 
 - **Dois ativos (o pior):** maioria de três, dois caminhos, eleição confirmada, época. O caso que
   sobra: o link de sync **e** o hello de acesso cortados com os dois nós alcançando a testemunha —
