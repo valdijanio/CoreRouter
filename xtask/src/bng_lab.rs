@@ -77,7 +77,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
             },
             other => Err(format!(
                 "unknown option {other}; cargo xtask bng-lab [--root] [--scales 1000,10000] \
-                 [--radius 100] [--only capture,scale,radius,shaping,workers,wave,pppd] [--hold 30] [--shaping 1000] [--wave 100000] [--radius-cap 3000] [--out dir] [--blaster path] [--target-dir dir]"
+                 [--radius 100] [--only capture,scale,radius,shaping,workers,wave,qinq,pppd] [--hold 30] [--shaping 1000] [--qinq 4000] [--wave 100000] [--radius-cap 3000] [--out dir] [--blaster path] [--target-dir dir]"
             )),
         };
         if let Err(e) = r {
