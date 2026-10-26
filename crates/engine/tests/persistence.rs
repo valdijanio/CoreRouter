@@ -105,8 +105,10 @@ fn corrupt_current_falls_back_to_previous() {
     storage.put(Slot::Current, good.get(..good.len() / 2).map(str::to_owned));
 
     let mut s = boot(&storage);
-    assert_eq!(addresses(&s), ["10.0.0.1/24"]);
-    assert_eq!(s.store().current_revision(), 1);
+    // G0.22: the previous slot plus the config journal give the newest
+    // revision; before the journal the last commit was lost.
+    assert_eq!(addresses(&s), ["10.0.0.1/24", "10.0.1.1/24"]);
+    assert_eq!(s.store().current_revision(), 2);
     let status = s.storage_status();
     assert_eq!(status.loaded_from, Some("previous"));
     assert_eq!(status.boot_errors.len(), 1);
@@ -118,7 +120,10 @@ fn corrupt_current_falls_back_to_previous() {
     add(&mut s, "10.0.2.1/24");
     assert!(storage.get(Slot::Previous).unwrap().contains("10.0.0.1/24"));
     drop(s);
-    assert_eq!(addresses(&boot(&storage)), ["10.0.0.1/24", "10.0.2.1/24"]);
+    assert_eq!(
+        addresses(&boot(&storage)),
+        ["10.0.0.1/24", "10.0.1.1/24", "10.0.2.1/24"]
+    );
 }
 
 #[test]
@@ -164,7 +169,8 @@ fn missing_current_uses_previous() {
     let s = boot(&storage);
     assert_eq!(s.storage_status().loaded_from, Some("previous"));
     assert!(s.storage_status().boot_errors.is_empty());
-    assert_eq!(addresses(&s), ["10.0.0.1/24"]);
+    // The config journal still has the second commit (G0.22).
+    assert_eq!(addresses(&s), ["10.0.0.1/24", "10.0.1.1/24"]);
 }
 
 /// Audit #1: a big config (thousands of address-list entries) with a full history

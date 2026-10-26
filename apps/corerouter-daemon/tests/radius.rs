@@ -179,9 +179,18 @@ fn the_daemon_authenticates_through_its_radius_service() {
         thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(srv.lock().unwrap().stats.accepts, 1);
-    // The log says it in Portuguese, topic radius.
-    let log = call(&d, "log.print", json!({})).unwrap().to_string();
-    assert!(log.contains("recusado"), "{log}");
+    // The log says it in Portuguese, topic radius. The service drains the
+    // driver's log queue on its own tick, so the line can trail the reply
+    // (flaked in CI, 2026-10-26).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let log = call(&d, "log.print", json!({})).unwrap().to_string();
+        if log.contains("recusado") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{log}");
+        thread::sleep(Duration::from_millis(50));
+    }
     stop.store(true, Ordering::Relaxed);
 }
 

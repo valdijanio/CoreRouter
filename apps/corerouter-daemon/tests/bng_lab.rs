@@ -23,7 +23,9 @@
 //! subscribers authenticated by `proto_radius::testserver` with a
 //! `Mikrotik-Rate-Limit`: streams both ways at twice the rate (policer
 //! accuracy, XDP only), a CoA that lifts the rate of a tenth of them, and a
-//! Disconnect-Request for another tenth under load. With root
+//! Disconnect-Request for another tenth under load. The shaping stage
+//! (G4.9d, `BNG_LAB_SHAPING` subscribers, default 1000) holds the download
+//! at the profile's rate with the shaper and then with the policer. With root
 //! (`BNG_LAB_ROOT=1`): XDP on the ports and the Linux client (`pppd`).
 //!
 //! What it measured goes to `$BNG_LAB_OUT/summary.json` and `summary.md`;
@@ -1253,6 +1255,150 @@ fn radius_policer(lab: &Lab, k: usize, s: &mut Summary) {
     }
 }
 
+/// Busy CPU ticks (user, system, softirq) of the whole machine.
+fn busy_ticks() -> u64 {
+    let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
+    let f: Vec<u64> = stat
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|x| x.parse().ok())
+        .collect();
+    f.first().copied().unwrap_or(0)
+        + f.get(1).copied().unwrap_or(0)
+        + f.get(2).copied().unwrap_or(0)
+        + f.get(5).copied().unwrap_or(0)
+        + f.get(6).copied().unwrap_or(0)
+}
+
+/// G4.9d: `k` subscribers with the default profile, streams at twice the
+/// rate both ways, the download held by the shaper (EDT, the default
+/// `download_mode`) and then by the XDP policer: download / limit, the
+/// queue the sessions show and the machine's CPU. The plan is `1M/2M` up to
+/// 100 sessions and shrinks past them so BNG Blaster offers the same
+/// ~75 000 packets/s as the RADIUS stage (one generator: at 1000 sessions ×
+/// `1M/2M` it sent ~40% of what it was asked, **medido**, and both modes
+/// read as under the limit).
+fn shaping(lab: &Lab, k: usize, s: &mut Summary) {
+    let scale = (100.0 / k.max(1) as f64).min(1.0);
+    let (up, down) = (1_000_000.0 * scale, 2_000_000.0 * scale);
+    let plan = format!("{}k/{}k", (up / 1000.0).round(), (down / 1000.0).round());
+    let length = 1000.0;
+    for mode in ["policer", "shaper"] {
+        let sc = format!("shaping {k} {mode}");
+        ok(
+            "ppp.profile.set",
+            json!({"id": "default", "rate_limit": plan, "download_mode": mode, "queue_type": "fq-codel-default"}),
+        );
+        // The BNG service takes the new profile with its next snapshot
+        // (once a second): sessions logging in before it get the old mode.
+        std::thread::sleep(Duration::from_secs(2));
+        let streams = json!([{
+            "name": "shaping",
+            "stream-group-id": 1,
+            "type": "ipv4",
+            "direction": "both",
+            "length": 1000,
+            "pps": 2.0 * down / (length * 8.0),
+            "pps-upstream": 2.0 * up / (length * 8.0),
+        }]);
+        let cfg = blaster_config(k, "user", 0.0, Some(streams));
+        let bl = Blaster::start(lab, &format!("shaping-{mode}"), &cfg, &["-j", "streams"]);
+        let took = wait_long("shaping setup", 120, || bl.established() as usize >= k);
+        s.check(
+            &format!("{sc} sessões"),
+            took.is_some(),
+            format!("{} de {k}", bl.established()),
+        );
+        // The queue service applies once a second.
+        std::thread::sleep(Duration::from_secs(4));
+        let ids: Vec<usize> = (1..=k).collect();
+        let window = env_or("BNG_LAB_WINDOW", 10u64);
+        let c0 = busy_ticks();
+        let t0 = Instant::now();
+        let rates = stream_rates(&bl, &ids, length, window);
+        let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+        let busy = (busy_ticks() - c0) as f64 / (t0.elapsed().as_secs_f64() * 100.0 * cpus) * 100.0;
+        let (md, mind, maxd) = stats(&rates.iter().map(|r| r.1 / down).collect::<Vec<_>>());
+        let (mu, _, _) = stats(&rates.iter().map(|r| r.0 / up).collect::<Vec<_>>());
+        let note = format!(
+            "{k} sessões a {plan}, oferecido 2× o limite, janela {window} s, plano de dados {}",
+            lab.dataplane()
+        );
+        s.put(&sc, "descida medida / limite (média)", md, "×", &note);
+        s.put(
+            &sc,
+            "descida medida / limite (mín–máx)",
+            mind,
+            "×",
+            &format!("máx {maxd:.3}"),
+        );
+        s.put(
+            &sc,
+            "subida medida / limite (média)",
+            mu,
+            "×",
+            "policer do XDP nos dois modos",
+        );
+        s.put(
+            &sc,
+            "CPU ocupada da máquina",
+            busy,
+            "%",
+            &format!("{cpus} CPUs, BNG Blaster incluso"),
+        );
+        let list = ok(
+            "queue.simple.list",
+            json!({"origin": "pppoe", "limit": 1000}),
+        );
+        s.put(
+            &sc,
+            "shaper ativo",
+            if list["running"] == true { 1.0 } else { 0.0 },
+            "",
+            list["note"].as_str().unwrap_or("queue.simple.list running"),
+        );
+        let rows = list["rows"].clone();
+        let queued: Vec<f64> = rows
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r["queued_us"][1].as_f64())
+            .map(|us| us / 1000.0)
+            .collect();
+        let (qm, _, qmax) = stats(&queued);
+        s.put(
+            &sc,
+            "fila das sessões (média)",
+            qm,
+            "ms",
+            &format!("máx {qmax:.1} ms, de queue.simple.list"),
+        );
+        // The shaper (the default) must hold the plan; the policer is
+        // measured only: at a few hundred kbit/s its bucket (0.1 s of the
+        // rate) is a couple of 1000-byte packets and it passes less.
+        if lab.xdp && mode == "shaper" {
+            s.check(
+                &format!("{sc} descida dentro de 5%"),
+                (md - 1.0).abs() <= 0.05,
+                format!("{md:.3} (mín {mind:.3}, máx {maxd:.3})"),
+            );
+        }
+        let report = bl.stop(60);
+        let _ = std::fs::write(
+            lab.out.join(format!("shaping-{mode}-streams.json")),
+            serde_json::to_string_pretty(&report["streams"]).unwrap_or_default(),
+        );
+        wait_long("shaping teardown", 60, || active() == 0);
+    }
+    ok(
+        "ppp.profile.set",
+        json!({"id": "default", "rate_limit": "", "download_mode": "", "queue_type": ""}),
+    );
+}
+
 /// The control plane on one core and on several (G4.3g): `n` sessions set
 /// up with `workers=1` and with `auto`, the rate and each thread's CPU.
 fn workers_compare(lab: &Lab, n: usize, s: &mut Summary) {
@@ -1760,6 +1906,9 @@ fn bng_lab() {
     }
     if want("radius") {
         radius_policer(&lab, k, &mut s);
+    }
+    if want("shaping") {
+        shaping(&lab, env_or("BNG_LAB_SHAPING", 1000usize).min(max), &mut s);
     }
     if want("workers") {
         workers_compare(

@@ -24,6 +24,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("queue.per-ip.add", "Add Per-IP Limit", [], None,
         "{target: string | [string] (prefixes whose every address is limited: 10.0.0.0/16, 2001:db8::/48), rate: rates (each address, upload/download: 10M/20M), max_limit?: rates (all addresses together; default 0 = no cap), ipv6_mask?: int 32..128 (IPv6 addresses that share a sub-stream: 64 = one per /64, the default), name?: string, comment?: string} → {id, name, queue (the types used), warnings}",
         always, add),
+    cmd!(query "queue.per-ip.preview", "Per-IP Limit Preview", [], None,
+        "{target?: string, rate?: string, max_limit?: string, ipv6_mask?: string, name?: string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, preview),
     cmd!(query "queue.per-ip.list", "Per-IP Limits", [], None,
         "{} → [{id, name, target, rate (each address, upload/download), max_limit, queue, classifier (upload/download), ipv6_mask, disabled, comment?, pcq_queues (addresses seen lately)}]",
         always, list),
@@ -83,8 +86,10 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         .unwrap_or_default();
     let mask6 = match p.get("ipv6_mask") {
         None | Some(Value::Null) => 64,
+        Some(Value::String(t)) if t.trim().is_empty() => 64,
         Some(v) => v
             .as_u64()
+            .or_else(|| v.as_str().and_then(|t| t.trim().parse().ok()))
             .and_then(|m| u8::try_from(m).ok())
             .filter(|m| (32..=128).contains(m))
             .ok_or_else(|| EngineError::bad("ipv6_mask", "32..=128"))?,
@@ -114,6 +119,24 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let out = json!({"id": q.id, "name": q.name, "queue": types, "warnings": w});
     queues.simple.push(q);
     Ok(out)
+}
+
+/// The modal's preview: `add`'s checks and the types it would make or
+/// reuse.
+fn preview(s: &mut Session, p: &Value) -> Result<Value> {
+    super::ppp_common::preview(s, p, ("queue.per-ip.add", "queue.per-ip.add"), (add, add), |s, v| {
+        let id = v.get("id").and_then(Value::as_str).unwrap_or_default();
+        let queues = &s.store().candidate().queue;
+        let Some(q) = queues.simple.iter().find(|q| q.id.to_string() == id) else {
+            return Vec::new();
+        };
+        let each = |n: &str| queues.queue_type(n).map(|t| rate_text(t.pcq_rate)).unwrap_or_default();
+        vec![
+            json!({"label": "Each address", "value": format!("{}/{}", each(&q.queue.upload), each(&q.queue.download))}),
+            json!({"label": "Queue types", "value": q.queue.to_string()}),
+            json!({"label": "Simple queue", "value": q.name}),
+        ]
+    })
 }
 
 fn list(s: &mut Session, _: &Value) -> Result<Value> {
