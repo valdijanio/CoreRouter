@@ -41,7 +41,9 @@ pub const KIND_CODEL: u64 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Queue {
     pub kind: u64,
-    /// Mark ECN-capable packets instead of dropping (CoDel only).
+    /// Mark instead of dropping (CoDel only). The caller clears it for a
+    /// packet that is not ECN-capable: a `Mark` it then dropped would
+    /// already have moved the clock.
     pub ecn: bool,
     /// Longest wait, ns: past it the packet is dropped (0 = no limit
     /// besides [`MAX_WAIT_NS`]).
@@ -136,32 +138,48 @@ pub enum Verdict {
     /// ECN-capable).
     Mark(u64),
     Drop,
+    /// Four other CPUs moved the clock in the same instant: dropped (as
+    /// `Drop`), counted apart so contention shows.
+    Busy,
 }
 
 impl Verdict {
     pub fn time(&self) -> Option<u64> {
         match *self {
             Self::Send(t) | Self::Mark(t) => Some(t),
-            Self::Drop => None,
+            Self::Drop | Self::Busy => None,
         }
     }
 }
 
 /// RFC 8289 §5 on the delay a packet entering now will see: `true` =
-/// drop (or mark) it.
+/// drop (or mark) it. Several CPUs may decide for one target at once (RSS,
+/// RPS): each drop is claimed with a compare-and-swap (of the next drop
+/// time, or of the switch into dropping), so one scheduled drop is one
+/// drop, not one per CPU (four CPUs dropped four times the rate and left
+/// the queue empty: 43% of the rate delivered, **medido**).
 #[inline(always)]
-fn codel<W: Words + ?Sized>(st: &mut W, at: usize, q: &Queue, now: u64, sojourn: u64, mtu_ns: u64) -> bool {
+fn codel<W: Words + ?Sized>(
+    st: &mut W,
+    at: usize,
+    q: &Queue,
+    now: u64,
+    sojourn: u64,
+    mtu_ns: u64,
+) -> bool {
     let (first, next, count) = (at, at + 1, at + 2);
     let interval = q.interval_ns.max(1);
     // Under target, or less than one packet queued (the RFC's "backlog <=
     // MTU" for slow links): fine.
     let ok_to_drop = if sojourn < q.target_ns || sojourn <= mtu_ns {
-        st.set(first, 0);
+        if st.get(first) != 0 {
+            st.set(first, 0);
+        }
         false
     } else {
         let f = st.get(first);
         if f == 0 {
-            st.set(first, now.saturating_add(interval));
+            st.cas(first, 0, now.saturating_add(interval));
             false
         } else {
             now >= f
@@ -171,17 +189,24 @@ fn codel<W: Words + ?Sized>(st: &mut W, at: usize, q: &Queue, now: u64, sojourn:
     let n = c & 0xffff_ffff;
     if c & DROPPING != 0 {
         if !ok_to_drop {
-            st.set(count, n);
+            st.cas(count, c, n);
             return false;
         }
         let nx = st.get(next);
-        if now >= nx {
-            let n = (n + 1).min(0xffff_ffff);
-            st.set(next, nx.saturating_add(interval.checked_div(isqrt(n)).unwrap_or(interval)));
-            st.set(count, DROPPING | n);
-            return true;
+        if now < nx {
+            return false;
         }
-        return false;
+        let n = (n + 1).min(0xffff_ffff);
+        // The CPU that moves the schedule drops; the others pass.
+        if !st.cas(
+            next,
+            nx,
+            nx.saturating_add(interval.checked_div(isqrt(n)).unwrap_or(interval)),
+        ) {
+            return false;
+        }
+        st.add(count, 1);
+        return true;
     }
     if !ok_to_drop {
         return false;
@@ -194,8 +219,13 @@ fn codel<W: Words + ?Sized>(st: &mut W, at: usize, q: &Queue, now: u64, sojourn:
     } else {
         1
     };
-    st.set(next, now.saturating_add(interval.checked_div(isqrt(n)).unwrap_or(interval)));
-    st.set(count, DROPPING | n);
+    if !st.cas(count, c, DROPPING | n) {
+        return false;
+    }
+    st.set(
+        next,
+        now.saturating_add(interval.checked_div(isqrt(n)).unwrap_or(interval)),
+    );
     true
 }
 
@@ -236,7 +266,11 @@ pub fn depart<W: Words + ?Sized>(
         q.limit_ns
     };
     let not_before = ticks(not_before);
-    let lower = if not_before > floor { not_before } else { floor };
+    let lower = if not_before > floor {
+        not_before
+    } else {
+        floor
+    };
     let old = st.get(T_NEXT);
     let start = if old > lower { old } else { lower };
     let wait = start.saturating_sub(now_t) >> TICK_SHIFT;
@@ -258,8 +292,16 @@ pub fn depart<W: Words + ?Sized>(
             if bursts {
                 policer::record(st, r.slot_ns, now, bytes);
             }
-            let t = if start > now_t { start >> TICK_SHIFT } else { 0 };
-            return if mark { Verdict::Mark(t) } else { Verdict::Send(t) };
+            let t = if start > now_t {
+                start >> TICK_SHIFT
+            } else {
+                0
+            };
+            return if mark {
+                Verdict::Mark(t)
+            } else {
+                Verdict::Send(t)
+            };
         }
         old = st.get(T_NEXT);
         i += 1;
@@ -267,7 +309,7 @@ pub fn depart<W: Words + ?Sized>(
     // Lost every race (four other CPUs moved this clock in the same
     // instant): drop rather than spin or send outside the clock, so the
     // rate stays exact.
-    Verdict::Drop
+    Verdict::Busy
 }
 
 /// How long a packet entering now would wait (the "Queue" column), ns.
@@ -300,7 +342,7 @@ mod tests {
         let mut t = 1;
         while t < secs * NANOS {
             match depart(&mut st, FULL, r, q, t, bytes, 0) {
-                Verdict::Drop => drops += 1,
+                Verdict::Drop | Verdict::Busy => drops += 1,
                 v => {
                     let at = v.time().filter(|x| *x > 0).unwrap_or(t);
                     max_wait = max_wait.max(at - t);
@@ -364,6 +406,23 @@ mod tests {
         assert!(fifo_wait > 5 * wait, "fifo {fifo_wait} codel {wait}");
     }
 
+    /// Small packets at a slow rate (128 B at 200 kbit/s: one packet is a
+    /// CoDel target long) 1.5× over: CoDel must still deliver the rate.
+    #[test]
+    fn codel_at_a_slow_rate_holds_it() {
+        let r = Rate::mikrotik(200_000, 0, 0, 0);
+        let q = Queue {
+            ecn: false,
+            ..Queue::codel(r.rate)
+        };
+        let (s, drops, wait) = run(&r, &q, 20, 3_413_333, 128);
+        let tail: u64 = s[5..].iter().sum::<u64>() / 15;
+        assert!(
+            tail.abs_diff(25_000) <= 500,
+            "{tail} {s:?} drops {drops} wait {wait}"
+        );
+    }
+
     #[test]
     fn ecn_marks_instead() {
         let r = Rate::mikrotik(1_000_000, 0, 0, 0);
@@ -374,7 +433,7 @@ mod tests {
         while t < 5 * NANOS {
             match depart(&mut st, FULL, &r, &q, t, 1500, 0) {
                 Verdict::Mark(_) => marks += 1,
-                Verdict::Drop => drops += 1,
+                Verdict::Drop | Verdict::Busy => drops += 1,
                 Verdict::Send(_) => {}
             }
             t += 6_000_000;
@@ -416,7 +475,13 @@ mod tests {
         let v = depart(&mut sub, SUB, &r, &q, 1000, 1000, 5_000_000);
         assert_eq!(v, Verdict::Send(5_000_000));
         // No rate: only `not_before` holds it.
-        assert_eq!(depart(&mut sub, SUB, &Rate::default(), &q, 10, 1, 99), Verdict::Send(99));
-        assert_eq!(Queue::from_words(Queue::codel(1).to_words()), Queue::codel(1));
+        assert_eq!(
+            depart(&mut sub, SUB, &Rate::default(), &q, 10, 1, 99),
+            Verdict::Send(99)
+        );
+        assert_eq!(
+            Queue::from_words(Queue::codel(1).to_words()),
+            Queue::codel(1)
+        );
     }
 }

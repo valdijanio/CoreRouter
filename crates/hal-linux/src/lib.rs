@@ -670,7 +670,10 @@ mod linux {
             self.xdp.pppoe_apply(ops)
         }
 
-        fn shaper_apply(&mut self, plan: &corerouter_hal::queue::ShaperPlan) -> Result<(), HalError> {
+        fn shaper_apply(
+            &mut self,
+            plan: &corerouter_hal::queue::ShaperPlan,
+        ) -> Result<(), HalError> {
             self.xdp.shaper_apply(plan)
         }
 

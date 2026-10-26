@@ -196,7 +196,12 @@ impl XdpState {
             self.set_nat(None);
         }
         if self.loaded.is_none() {
-            match load(plan.fast_nat, pppoe, self.shaper.queues(), self.shaper.pcq()) {
+            match load(
+                plan.fast_nat,
+                pppoe,
+                self.shaper.queues(),
+                self.shaper.pcq(),
+            ) {
                 Ok(mut l) => {
                     pppoe::refill(&mut l.ebpf, &self.pppoe)?;
                     shaper::refill_sessions(&mut l.ebpf, &self.shaper, self.pppoe.sessions())?;
@@ -248,7 +253,10 @@ impl XdpState {
 
     /// Queues (G4.9b): hold `plan`. The object loads for it alone when no
     /// XDP port is configured.
-    pub fn shaper_apply(&mut self, plan: &corerouter_hal::queue::ShaperPlan) -> Result<(), HalError> {
+    pub fn shaper_apply(
+        &mut self,
+        plan: &corerouter_hal::queue::ShaperPlan,
+    ) -> Result<(), HalError> {
         if self.shaper.plan == *plan && (plan.is_empty() || self.loaded.is_some()) {
             return Ok(());
         }

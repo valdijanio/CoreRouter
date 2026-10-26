@@ -20,6 +20,9 @@ struct Racy<const N: usize> {
     rate: Rate,
     now: u64,
     nested: bool,
+    /// Races lost by the current packet: at most three (four in a row is
+    /// the documented drop, not a race to survive).
+    lost: usize,
 }
 
 impl<const N: usize> Words for Racy<N> {
@@ -31,8 +34,10 @@ impl<const N: usize> Words for Racy<N> {
     }
     fn cas(&mut self, i: usize, old: u64, new: u64) -> bool {
         if !self.nested
+            && self.lost < 3
             && let Some(b) = self.others.pop()
         {
+            self.lost += 1;
             // Another CPU's whole packet, in this instant.
             self.nested = true;
             let r = self.rate;
@@ -75,12 +80,14 @@ proptest! {
             rate: r,
             now: 0,
             nested: false,
+            lost: 0,
         };
         // Three times the rate offered, `cpus` packets per instant.
         let step = (NANOS * size * cpus as u64 / (3 * r.rate)).max(1);
         let (mut t, mut passed) = (0u64, 0u64);
         while t < secs * NANOS {
             racy.now = t;
+            racy.lost = 0;
             racy.others = vec![size; cpus - 1];
             if policer::admit(&mut racy, &r, t, size) {
                 passed += size;

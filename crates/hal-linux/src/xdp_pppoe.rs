@@ -350,7 +350,11 @@ impl XdpState {
     /// [`XdpState::pppoe_upsert`] of a session the BNG service describes,
     /// with its download queue (G4.9b) and its routes through `bng0`
     /// (G4.3ca, PPPoE with XDP on).
-    pub fn pppoe_upsert_hal(&mut self, idx: u32, p: &corerouter_hal::pppoe::PppoeSession) -> Result<(), HalError> {
+    pub fn pppoe_upsert_hal(
+        &mut self,
+        idx: u32,
+        p: &corerouter_hal::pppoe::PppoeSession,
+    ) -> Result<(), HalError> {
         let s = session_of(p);
         self.pppoe_upsert(idx, &s)?;
         let shape = p
@@ -483,6 +487,30 @@ impl XdpState {
         Ok(())
     }
 
+    /// How long a download packet of shaped session `idx` would wait now,
+    /// microseconds (0: not shaped or not loaded).
+    fn session_backlog_us(&mut self, idx: u32) -> u64 {
+        if !self.shaper.shapes.contains_key(&idx) {
+            return 0;
+        }
+        let Some(map) = self
+            .loaded
+            .as_mut()
+            .and_then(|l| l.ebpf.map_mut(m::SUB_EDT))
+        else {
+            return 0;
+        };
+        let Ok(arr) = Array::<_, corerouter_dataplane_ebpf_common::shaper::State>::try_from(map)
+        else {
+            return 0;
+        };
+        arr.get(&idx, 0)
+            .map(|st| {
+                corerouter_dataplane_ebpf_common::shaper::backlog_ns(&st, monotonic_ns()) / 1000
+            })
+            .unwrap_or(0)
+    }
+
     /// Counters of `slots`, in the HAL's terms.
     pub fn pppoe_counters_of(
         &mut self,
@@ -503,6 +531,7 @@ impl XdpState {
                         down_policed: c.down_policed,
                         spoofed: c.spoofed,
                         to_kernel: c.to_kernel,
+                        down_queue_us: self.session_backlog_us(*i),
                     },
                 ))
             })

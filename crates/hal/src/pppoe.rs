@@ -63,6 +63,9 @@ pub struct PppoeCounters {
     pub down_policed: u64,
     pub spoofed: u64,
     pub to_kernel: u64,
+    /// G4.9b: how long a download packet entering now waits in the
+    /// session's queue, microseconds (0: not shaped).
+    pub down_queue_us: u64,
 }
 
 /// One change of the session maps (applied in order, in one call).

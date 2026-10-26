@@ -1003,6 +1003,22 @@ fn mark_ce(ctx: &TcContext, l3: &queue::L3) -> bool {
     true
 }
 
+/// Whether the packet at `l3` is ECN-capable (ECT(0), ECT(1) or already
+/// CE): only then may CoDel mark instead of dropping. A mark on a packet
+/// that is not would be a drop after the clock already counted it (the
+/// target loses that capacity: 43% of the rate delivered, **medido**).
+#[inline(always)]
+fn ect(ctx: &TcContext, l3: &queue::L3) -> bool {
+    matches!(queue::ecn(&Skb(ctx), l3), Some(1..=3))
+}
+
+/// `q` as this packet may use it: no marking unless it is ECN-capable.
+#[inline(always)]
+fn for_packet(mut q: shaper::Queue, ctx: &TcContext, l3: &queue::L3) -> shaper::Queue {
+    q.ecn = q.ecn && ect(ctx, l3);
+    q
+}
+
 /// Apply verdict `v` of a packet at `l3`: the departure time, a mark, or
 /// the drop. `(action, counted as sent, marked)`.
 #[inline(always)]
@@ -1010,6 +1026,10 @@ fn finish(ctx: &TcContext, l3: &queue::L3, v: shaper::Verdict, now: u64) -> (i32
     let (t, marked) = match v {
         shaper::Verdict::Drop => {
             shape_stat(queue::Stat::Dropped);
+            return (TC_SHOT, false, false);
+        }
+        shaper::Verdict::Busy => {
+            shape_stat(queue::Stat::Contended);
             return (TC_SHOT, false, false);
         }
         shaper::Verdict::Mark(t) => {
@@ -1045,7 +1065,7 @@ fn shape_session(ctx: &TcContext, l3: &queue::L3, idx: u32, now: u64) -> Option<
         return None;
     }
     let r = pppoe::rate_of(w, 1);
-    let q = shaper::Queue::from_words(*SUB_SHAPE.get(idx)?);
+    let q = for_packet(shaper::Queue::from_words(*SUB_SHAPE.get(idx)?), ctx, l3);
     let st = SUB_EDT.get_ptr_mut(idx)?;
     let verdict = shaper::depart(&mut Atomic(st), shaper::FULL, &r, &q, now, u64::from(l3.ip_len), 0);
     let (action, sent, _) = finish(ctx, l3, verdict, now);
@@ -1086,7 +1106,7 @@ fn queue_of(v6: bool, a: &[u8; 16], ifindex: u32) -> Option<u32> {
 
 /// A PCQ sub-stream's departure (`not_before` for the queue's own clock).
 #[inline(always)]
-fn pcq_time(idx: u32, dir: u32, p: &queue::Pcq, v6: bool, addr: &[u8; 16], now: u64, bytes: u64) -> Option<shaper::Verdict> {
+fn pcq_time(idx: u32, dir: u32, p: &queue::Pcq, q: &shaper::Queue, v6: bool, addr: &[u8; 16], now: u64, bytes: u64) -> Option<shaper::Verdict> {
     let key = queue::pcq_key(idx, dir as u8, v6, addr, p.mask4, p.mask6);
     let st = match Q_PCQ.get_ptr_mut(&key) {
         Some(st) => st,
@@ -1095,7 +1115,7 @@ fn pcq_time(idx: u32, dir: u32, p: &queue::Pcq, v6: bool, addr: &[u8; 16], now: 
             Q_PCQ.get_ptr_mut(&key)?
         }
     };
-    Some(shaper::depart(&mut Atomic(st), shaper::SUB, &p.rate, &p.queue, now, bytes, 0))
+    Some(shaper::depart(&mut Atomic(st), shaper::SUB, &p.rate, q, now, bytes, 0))
 }
 
 /// Shape (download) or police (upload) one packet of queue `idx`.
@@ -1141,8 +1161,8 @@ fn shape_queue(ctx: &TcContext, l3: &queue::L3, idx: u32, dir: u32, now: u64) ->
     let not_before = match &d.pcq {
         p if p.on => {
             let a = if p.by_src { &l3.src } else { &l3.dst };
-            match pcq_time(idx, 1, p, l3.v6, a, now, bytes) {
-                Some(shaper::Verdict::Drop) => {
+            match pcq_time(idx, 1, p, &for_packet(p.queue, ctx, l3), l3.v6, a, now, bytes) {
+                Some(shaper::Verdict::Drop | shaper::Verdict::Busy) => {
                     q_add(idx, 1, queue::C_DROPPED, 1);
                     shape_stat(queue::Stat::Dropped);
                     return TC_SHOT;
@@ -1153,7 +1173,8 @@ fn shape_queue(ctx: &TcContext, l3: &queue::L3, idx: u32, dir: u32, now: u64) ->
         }
         _ => 0,
     };
-    let v = shaper::depart(&mut Atomic(st), shaper::FULL, &d.rate, &d.queue, now, bytes, not_before);
+    let q = for_packet(d.queue, ctx, l3);
+    let v = shaper::depart(&mut Atomic(st), shaper::FULL, &d.rate, &q, now, bytes, not_before);
     let (action, sent, marked) = finish(ctx, l3, v, now);
     if sent {
         q_add(idx, 1, queue::C_PACKETS, 1);

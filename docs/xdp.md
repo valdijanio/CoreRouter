@@ -16,6 +16,7 @@ da G2.3).
 | Comandos `ip.firewall.xdp.*`, pps, lockout | `crates/engine/src/cmd/firewall_xdp.rs`, `engine/src/xdp.rs` | L3 |
 | Janela IP › Firewall XDP | `crates/ui/src/xdp.rs` | L5 |
 | Assinantes PPPoE (G4.3c): sessões, policer, encapsulamento | `dataplane-ebpf-common/src/pppoe.rs`, `policer.rs`, `hal-linux/src/xdp_pppoe.rs` | L1 plataforma |
+| Filas (G4.9b): shaper EDT, policer de subida, PCQ, `bng0` (G4.3ca), programas tc no mesmo objeto | `dataplane-ebpf-common/src/shaper.rs`, `queue.rs`, `words.rs`, `hal-linux/src/xdp_shaper.rs` | L1 plataforma |
 
 ## Como usar
 
@@ -83,7 +84,8 @@ O programa só compila com nightly (`-Z build-std=core`), o alvo `bpfel-unknown-
 `bpf-linker`. O workspace estável nunca precisa disso:
 
 - `crates/dataplane-ebpf/rust-toolchain.toml` fixa o nightly (`nightly-2026-10-22`) e
-  `.cargo/config.toml` o alvo e o linker; o crate tem `[workspace]` próprio e está em `exclude`
+  `.cargo/config.toml` o alvo, o linker e a ISA v3 do BPF (`-C target-cpu=v3`: o `cmpxchg` dos
+  relógios do policer e do shaper, kernel 5.12+); o crate tem `[workspace]` próprio e está em `exclude`
   no workspace.
 - `cargo xtask ebpf` compila e grava `prebuilt/corerouter-xdp.o` (o que o `hal-linux` embute com
   `include_bytes_aligned!`) e `prebuilt/corerouter-xdp.sources` (SHA-256 das fontes e do objeto).
@@ -155,8 +157,8 @@ PPPoE (G4.3c, `docs/pppoe-dataplane.md`):
 14. `Subs::by_key`: leitura do `u32` que o kernel devolveu do hash `PPPOE_KEYS` (o daemon troca o
     valor inteiro; uma palavra não rasga).
 15. `Subs::by_v4`: o mesmo para `PPPOE_V4`.
-16. `Subs::policer`: `&mut *p` do elemento de `PPPOE_POLICER` (array: nunca liberado); CPUs no
-    mesmo assinante ao mesmo tempo só tornam a taxa aproximada.
+16. `Subs::policer`: desde a G4.3cc devolve o elemento de `PPPOE_POLICER` como `Atomic` (veja 24–27):
+    sem `unsafe` próprio.
 17. `stat`: incremento do contador por CPU de `PPPOE_STATS`.
 18. `sess_add`: `atomic_xadd` (adição atômica BPF, sem fetch) numa palavra de `PPPOE_COUNTERS`,
     com o campo mascarado para dentro do elemento: contadores exatos com várias CPUs. Pede
@@ -166,6 +168,31 @@ PPPoE (G4.3c, `docs/pppoe-dataplane.md`):
 21. `forward`: `bpf_redirect` para a interface que a FIB devolveu.
 22. `nat_sub`: leitura (`*flow`) do valor de `NAT_FLOWS` (como o 8).
 23. `nat_sub`: gravação do último uso e da contagem do fluxo (como o 10).
+
+Filas e `bng0` (G4.9b, G4.3ca, G4.3cc; `docs/queues.md`):
+
+24. `Atomic::get`: leitura volátil de 64 bits da palavra `i < N` de um elemento de array ou de LRU
+    hash que o kernel devolveu (válido e alinhado durante a execução; uma palavra alinhada de 64 bits
+    não rasga). Sem instrução de load atômico no BPF antes da v4.
+25. `Atomic::set`: gravação volátil de 64 bits da palavra `i < N`, inteira.
+26. `Atomic::cas`: `atomic_cxchg` (BPF_CMPXCHG, ISA v3, kernel 5.12+) na palavra `i < N`: o relógio
+    do GCRA e do EDT, exato com todas as CPUs no mesmo alvo.
+27. `Atomic::add`: `atomic_xadd` (adição atômica sem fetch) na palavra `i < N`: fatias da janela de
+    burst e contadores por fila.
+28. `Skb::bytes`: `read_unaligned` de `[u8; N]` em `data + off` depois de conferir contra
+    `data_end` (acesso direto ao pacote no tc, a mesma checagem que o verificador exige).
+29. `Skb::store`: `write_unaligned` com a mesma checagem; a cabeça é gravável (`bpf_skb_pull_data`
+    antes, nenhum clone nestes programas).
+30. `Skb::adjust_head`: `bpf_skb_change_head` no próprio skb (só para crescer); falha sem mudar
+    nada e toda leitura seguinte relê `data`/`data_end`.
+31. `shape_stat`: incremento da cópia desta CPU de `SHAPE_STATS` (tc roda sem migração).
+32. `finish`: `bpf_skb_set_tstamp` com o horário de saída em CLOCK_MONOTONIC marcado
+    `DELIVERY_MONO` (o `fq` compara com `ktime_get_ns`; um redirect mantém).
+33. `queue_of`: leitura do `u32` que o kernel devolveu de `Q_IFACE` (trocado inteiro pelo loader).
+34. `shape_egress`/`shape_ingress`: `bpf_ktime_get_ns` (sem argumentos) e a leitura de `ifindex`
+    do próprio `__sk_buff`.
+35. `bng_egress`: `bpf_redirect` para a porta de acesso da sessão, sem flags (para a saída dela,
+    onde o shaper roda).
 
 ## Pesquisa
 

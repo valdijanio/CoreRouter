@@ -1917,3 +1917,172 @@ fn ipoe_kernel_and_host_agree() {
     x.set_ipoe(Default::default()).unwrap();
     assert!(x.ipoe_ports().is_empty());
 }
+
+/// G4.3ca: the kernel reaches a PPPoE subscriber through `bng0`. A session
+/// not marked fast down gets its datagrams from the internet routed by the
+/// kernel to `bng0` (its /32 with the session's MTU) and encapsulated by
+/// `bng_egress`; the kernel's ICMP reaches it the same way (time exceeded
+/// for its own TTL-1 packet); a DF packet larger than its MTU gets
+/// "fragmentation needed" back (RFC 1191); shaped (G4.9b), its download
+/// waits in the access port's `fq` instead of being dropped.
+#[test]
+fn pppoe_kernel_delivery_through_bng0() {
+    use corerouter_hal::pppoe::{PppoeOp, PppoeSession, Rate as HalRate};
+    use corerouter_hal::queue::{Kind, ShaperPlan};
+    if !enabled() {
+        return;
+    }
+    let _t = Triangle::new();
+    let mut x = pppoe_router();
+    let ip: std::net::Ipv4Addr = "100.64.9.20".parse().unwrap();
+    let client = mac_of(Some(SUB_NS), "lb");
+    let sub = PppoeSession {
+        ifindex: ifindex("la"),
+        sid: 0x51,
+        client_mac: client,
+        server_mac: mac_of(None, "la"),
+        ipv4: Some(ip),
+        mtu: 1400,
+        ..PppoeSession::default()
+    };
+    x.pppoe_apply(&[PppoeOp::Upsert(3, sub)]).unwrap();
+    let route = sh(&["ip", "route", "show", "100.64.9.20"]);
+    assert!(
+        route.contains("dev bng0") && route.contains("mtu 1400"),
+        "{route}"
+    );
+    // Collect what reaches the subscriber for `secs`.
+    let listen = |secs: u64| {
+        Triangle::spawn_in(SUB_NS, move || {
+            let rx = packet_socket("lb", pppoe::ETH_P_PPP_SES);
+            rx.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut got = Vec::new();
+            let mut buf = [0u8; 2048];
+            let t = Instant::now();
+            while t.elapsed() < Duration::from_secs(secs) {
+                if let Ok(n) = std::io::Read::read(&mut &rx, &mut buf) {
+                    got.push((t.elapsed(), buf[..n].to_vec()));
+                }
+            }
+            got
+        })
+    };
+    // 1. From the internet, through the kernel and bng0.
+    let rx = listen(2);
+    std::thread::sleep(Duration::from_millis(200));
+    Triangle::spawn_in(INET_NS, move || {
+        let s = std::net::UdpSocket::bind("198.51.100.2:0").unwrap();
+        s.send_to(&[7u8; 18], (ip, 7)).unwrap();
+    })
+    .join()
+    .unwrap();
+    let got = rx.join().unwrap();
+    let f = &got
+        .iter()
+        .find(|(_, f)| f.len() > 22 + 20 && f[22 + 9] == 17)
+        .expect("the datagram, encapsulated")
+        .1;
+    assert_eq!(f[..6], client);
+    assert_eq!(f[12..16], [0x88, 0x64, 0x11, 0x00]);
+    assert_eq!(u16::from_be_bytes([f[16], f[17]]), 0x51);
+    assert_eq!(f[22 + 16..22 + 20], [100, 64, 9, 20]);
+    assert_eq!(f[22 + 8], 63, "the kernel took one off the TTL");
+    // 2. The subscriber's own TTL-1 packet: time exceeded comes back.
+    let rx = listen(2);
+    std::thread::sleep(Duration::from_millis(200));
+    let s = lb_session(0x51, [100, 64, 9, 20], 0);
+    Triangle::spawn_in(SUB_NS, move || {
+        let tx = packet_socket("lb", 0x0003);
+        let mut ipf = udp_frame([100, 64, 9, 20], 5000, [198, 51, 100, 2], 9, 18);
+        ipf[14 + 8] = 1;
+        let ipf = corerouter_dataplane_ebpf_common::testing::with_checksums(ipf);
+        send_raw(&tx, &pppoe_frame(&s, &ipf, PPP_IPV4));
+    })
+    .join()
+    .unwrap();
+    let got = rx.join().unwrap();
+    assert!(
+        got.iter()
+            .any(|(_, f)| f.len() > 22 + 21 && f[22 + 9] == 1 && f[22 + 20] == 11),
+        "time exceeded, encapsulated: {:?}",
+        got.iter().map(|(_, f)| f.len()).collect::<Vec<_>>()
+    );
+    // 3. PMTU: DF and larger than the session's MTU.
+    let out = Command::new("ip")
+        .args([
+            "netns",
+            "exec",
+            INET_NS,
+            "ping",
+            "-n",
+            "-M",
+            "do",
+            "-s",
+            "1450",
+            "-c",
+            "1",
+            "-W",
+            "2",
+            "100.64.9.20",
+        ])
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).into_owned() + &String::from_utf8_lossy(&out.stderr);
+    assert!(text.contains("mtu = 1400"), "{text}");
+    // 4. Shaped at 5 Mbit/s: 200 datagrams of 1000 bytes all arrive, spread
+    // over ~0.3 s, none dropped.
+    let shaped = PppoeSession {
+        down: HalRate {
+            rate_bps: 5_000_000,
+            ..HalRate::default()
+        },
+        shape: Some(Kind::default()),
+        ..sub
+    };
+    x.pppoe_apply(&[PppoeOp::Upsert(3, shaped)]).unwrap();
+    x.shaper_apply(&ShaperPlan {
+        sessions: true,
+        access_ports: vec!["la".parse().unwrap()],
+        ..ShaperPlan::default()
+    })
+    .unwrap();
+    let rx = listen(3);
+    std::thread::sleep(Duration::from_millis(200));
+    Triangle::spawn_in(INET_NS, move || {
+        let s = std::net::UdpSocket::bind("198.51.100.2:0").unwrap();
+        for _ in 0..200 {
+            s.send_to(&[1u8; 1000], (ip, 9)).unwrap();
+        }
+    })
+    .join()
+    .unwrap();
+    let got: Vec<_> = rx
+        .join()
+        .unwrap()
+        .into_iter()
+        .filter(|(_, f)| f.len() > 1000)
+        .collect();
+    let spread = got.last().unwrap().0 - got.first().unwrap().0;
+    let st = x.shaper_status();
+    println!(
+        "PERF | bng0 shaped session | {} of 200 delivered over {:?} | {:?}",
+        got.len(),
+        spread,
+        st.stats
+    );
+    assert!(got.len() >= 195, "{}", got.len());
+    // 200 × 1028 B at 5 Mbit/s ≈ 330 ms, less the first bucket (0.1 s).
+    assert!(spread >= Duration::from_millis(150), "{spread:?}");
+    assert!(
+        st.stats
+            .iter()
+            .any(|(k, v)| *k == "session-shaped" && *v >= 195),
+        "{:?}",
+        st.stats
+    );
+    x.pppoe_apply(&[PppoeOp::Remove(3)]).unwrap();
+    let route = sh(&["ip", "route", "show", "100.64.9.20"]);
+    assert!(route.trim().is_empty(), "{route}");
+}

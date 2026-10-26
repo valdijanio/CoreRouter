@@ -61,6 +61,78 @@ $C queue.simple.list '{"origin":"dynamic"}'
   subida e por destino na descida, com `pcq-rate`) e uma simple queue sobre o prefixo. Tipos de mesma
   taxa são reaproveitados. IPv6: um sub-fluxo por /64 por padrão (`ipv6_mask`).
 
+## Plano de dados (G4.9b, G4.3ca, G4.3cc)
+
+Três programas tc no mesmo objeto do XDP (`crates/dataplane-ebpf`), que compartilham os mapas das
+sessões:
+
+| Programa | Onde | O que faz |
+|---|---|---|
+| `shape_egress` | saída de cada porta com alvo atrás (as das redes conectadas que têm alvos; todas, se um alvo só é alcançável por rota) e das portas de acesso PPPoE/IPoE | **Descida**: acha a sessão do destino (moldada) ou a fila (LPM por família, depois a interface), calcula o horário de saída (EDT) e grava `skb->tstamp`; o `fq` segura o pacote |
+| `shape_ingress` | entrada das mesmas portas | **Subida** das filas: policer GCRA com burst do RouterOS (as sessões continuam no policer do XDP) |
+| `bng_egress` | saída de `bng0` | **G4.3ca**: põe o cabeçalho PPPoE no que o kernel roteou para um assinante e redireciona para a porta de acesso |
+
+- **Relógios sem corrida (G4.3cc).** O estado exato de um alvo é uma palavra de 64 bits — o
+  "tempo teórico de chegada" do policer (GCRA, ITU-T I.371) ou o horário da próxima saída do EDT —,
+  em ticks de 1/64 ns, movida por `cmpxchg` (BPF ISA v3). As fatias da janela de burst somam com
+  adição atômica; o CoDel reivindica cada descarte com `cmpxchg` no horário do próximo. Quatro
+  trocas perdidas seguidas descartam o pacote (contadas como `contended`), nunca um laço sem fim.
+  Fixar o assinante numa CPU (cpumap) não foi preciso: com o `cmpxchg` o erro já é zero (abaixo).
+- **Descarte antes de enfileirar.** O shaper sabe a espera exata que um pacote terá; `pfifo`/`bfifo`
+  descartam acima do limite convertido em tempo, `fq-codel`/`cake` aplicam o CoDel (RFC 8289) nessa
+  espera e marcam ECN (RFC 3168) só num pacote ECN-capaz (marcar um que não é viraria descarte com o
+  relógio já cobrado: 43% da taxa entregue, **medido** e corrigido).
+- **`fq` nas portas:** `mq` + um `fq` por fila de transmissão (ou `fq` na raiz), com limite por fluxo
+  de 20 000 pacotes (o padrão de 100 cortaria a fila de um alvo rápido). Tirar o plano devolve a
+  qdisc padrão da porta.
+- **PCQ:** sub-fluxo por endereço mascarado num LRU (`Q_PCQ`); o relógio do sub-fluxo dá o "não
+  antes de" do relógio da fila (o `max-limit` de todos juntos).
+- **Sessões:** `download_mode=shaper` (padrão) liga `F_SHAPE_DOWN` na sessão: o XDP manda a descida
+  ao kernel, que a roteia por `bng0` (PPPoE) ou direto para a porta (IPoE); a fila da sessão fica em
+  `SUB_SHAPE`/`SUB_EDT`. O CoA troca a taxa e mantém o relógio.
+- **Serviço `queue` do daemon:** a cada segundo, o plano do config e dos leases vai ao HAL quando
+  muda, e os contadores voltam para `queue.simple.list` (taxa, fila em ms, descartes).
+
+### Medido (VM do laboratório, 8 vCPUs, kernel 7.0, build de teste, 2026-10-26)
+
+Precisão (`shaper_accuracy`, cada alvo oferecido a ≥ 11× a taxa, contado no receptor):
+
+| alvos | taxa de cada | pior erro |
+|---:|---:|---:|
+| 1 | 344 Mbit/s | +0,66% |
+| 100 | 6,6 Mbit/s | +0,67% |
+| 10 000 | 10 kbit/s | +0,69% |
+
+TCP a 50 Mbit/s com 20 ms de RTT (`tcp_shaper_vs_policer`, iperf3, 10 s; ping no mesmo alvo):
+
+| caso | goodput | retransmissões | ping sob carga |
+|---|---:|---:|---:|
+| sem limite | 1585 Mbit/s | 0 | 20,1 ms |
+| shaper fq-codel | 49,7 (sem GSO: 47,9) | 536 (sem GSO: **35**) | 62,0 ms (sem GSO: 35,1) |
+| shaper pfifo 10 (`default-small`) | 49,4 | 1783 | 20,1 ms |
+| policer, balde 0,1 s (G4.9) | 49,3 | 852 (sem GSO: 1663) | 20,1 ms |
+| policer, balde 0,05 s (G4.3c) | 47,5 | 715 | 20,1 ms |
+
+- O shaper com CoDel tem o goodput do policer com uma fração das retransmissões (47× menos sem
+  GSO); o balde de 0,1 s devolve ao policer os ~4% que o de 0,05 s perdia.
+- Com GSO/GRO ligados (o padrão do kernel) o roteador recebe super-pacotes de até 64 KB (10 ms a
+  50 Mbit/s cada): o CoDel decide em pedaços grandes e a espera no alvo fica maior. CAKE separa o
+  GSO por isso; aqui é a gap G4.9f.
+
+Policer de um assinante com 1/4/8/16 remetentes, cada um preso a uma CPU (`policer_race_root`,
+200 Mbit/s, o mesmo teste na `main` antes):
+
+| remetentes | antes (G4.3c) | depois (GCRA + `cmpxchg`) |
+|---:|---:|---:|
+| 1 | −0,56% | −0,32% |
+| 4 | **+4,87%** | −0,22% |
+| 8 | **+14,87%** | −0,42% |
+| 16 (em 8 CPUs) | **+14,97%** | −0,35% |
+
+Custo por pacote da subida PPPoE (`pppoe_scale_100k_sessions`, `BPF_PROG_TEST_RUN`): 164–169 ns na
+`main`, 172–176 ns agora (dentro da variação da rodada). EDT × HTB: `docs/architecture.md`, "Filas:
+EDT × HTB".
+
 ## Pesquisa
 
 Fontes abertas em 2026-10-26.
@@ -141,5 +213,11 @@ Fica de fora (gaps): a hierarquia `parent`/`limit-at`/`priority` (G4.9e), `packe
   `big_plans_stay_linear` (build de teste, Ryzen AI Max+ 395, 2026-10-26): 100 000 sessões contra
   1000 filas fixas em < 1 s em debug.
 - **Threads:** o plano roda sob o lock da sessão, no comando ou no serviço `queue` (uma vez por
-  mudança); não há trabalho por pacote no userspace. O caminho quente é o plano de dados (G4.9b), que
-  é por CPU e sem lock.
+  mudança); não há trabalho por pacote no userspace.
+- **Plano de dados (G4.9b):** O(1) por pacote (hash ou LPM, um `cmpxchg`), plano de 1 a 10 mil
+  alvos. Escala com núcleos sem lock: cada CPU faz o seu pacote e só disputa a palavra do alvo; o
+  `fq` é um por fila de transmissão (XPS). Medido com 16 remetentes num assinante: erro −0,35% e
+  zero `contended` nos testes de vazão. O HTB por CPU foi medido e descartado (tabela em
+  `docs/architecture.md`).
+- **Aplicar:** 10 000 filas em ~0,9 s (escritas em mapa, **medido**) contra 7–9 s de HTB numa raiz
+  e mais de 23 min com uma árvore HTB por CPU.

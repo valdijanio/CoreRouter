@@ -75,13 +75,21 @@ Um programa por porta (o XDP só aceita um), em estágios que são funções BPF
 | Descida com TTL ≤ 1 | kernel: ICMP time exceeded | `down-ttl` |
 | Descida maior que o MTU da sessão | kernel: fragmenta ou manda ICMP "fragmentation needed"/"packet too big" (RFC 1191, RFC 8201) com o MTU da rota do assinante | `down-mtu` |
 | Descida para sessão sem `F_FAST_DOWN` | kernel | `down-kernel` |
-| Descida num uplink com VLAN | kernel (G4.3ca) | `down-tagged` |
+| Descida num uplink com VLAN | kernel (G4.3cd) | `down-tagged` |
+| Descida de sessão moldada (G4.9b) | kernel → `bng0` → fila da porta de acesso | `down-shaped` |
 | Fragmentos IPv4, ICMP de erro, IP com opções no CGNAT | kernel (regras da G2.5b) | `NAT_MISS` |
 
-A entrega pelo kernel ao assinante (rota do assinante → encapsulamento num programa tc de saída,
-uma interface `bng0` para todas as sessões, sem uma por sessão) e o shaping EDT são a parte
-seguinte (G4.3ca). Até lá, o sentido de descida do caminho lento depende dela: o que a tabela
-acima manda ao kernel no sentido de descida só chega ao assinante com a G4.3ca.
+**Entrega pelo kernel ao assinante (G4.3ca).** Com o PPPoE no XDP ligado, o carregador cria
+`bng0` (um `dummy`, a mesma interface do caminho lento sem XDP) e cada sessão PPPoE ganha rotas
+para o seu /32, o seu /64 e o prefixo delegado por ela, com o **MTU da sessão** (`mtu` da rota).
+O programa tc `bng_egress` na saída de `bng0` acha a sessão pelo destino, põe o cabeçalho do lado
+de acesso (MACs, tags, PPPoE, PPP; `bpf_skb_change_head`) e redireciona para a porta de acesso.
+Assim o que a tabela acima manda ao kernel no sentido de descida chega ao assinante: o TTL e o
+`forward` do kernel valem, o ICMP do roteador (time exceeded, "fragmentation needed"/"packet too
+big" com o MTU da rota, RFC 1191/8201) volta encapsulado, e a descida moldada (G4.9b,
+`F_SHAPE_DOWN`) passa por aqui até a fila `fq` da porta. Teste com root:
+`pppoe_kernel_delivery_through_bng0`. Uma interface para todas as sessões: nenhuma netdev nem
+fila por sessão. IPoE não precisa: o assinante está no enlace da porta.
 
 Por que as flags `F_FAST_UP`/`F_FAST_DOWN` existem: encaminhar no XDP pula o `forward` do
 nftables e as filas. O daemon (G4.3d) as liga quando nada no caminho precisa ver o pacote (como o
@@ -100,7 +108,8 @@ impl Pod`.
 | `PPPOE_SESSIONS` | array | índice → `Session` (19 palavras) | 131 072 |
 | `PPPOE_V4` | hash | IPv4 → índice | 131 072 |
 | `PPPOE_V6` | LPM trie | /64 ou prefixo delegado → índice | 262 144 |
-| `PPPOE_POLICER` | array | índice × 2 + sentido → estado (13 palavras) | 262 144 |
+| `PPPOE_POLICER` | array | índice × 2 + sentido → estado (19 palavras: relógio GCRA, início da janela, 16 fatias) | 262 144 |
+| `SUB_SHAPE`, `SUB_EDT` | array | índice → fila de descida (4 palavras) e relógio EDT (22 palavras), G4.9b | 131 072 |
 | `PPPOE_COUNTERS` | array | índice → 8 contadores | 131 072 |
 | `PPPOE_STATS` | per-CPU array | `pppoe::Stat` → pacotes | 20 |
 | `IPOE_PORTS` | hash | ifindex da porta de acesso IPoE → flags (G4.3f) | 256 |
@@ -146,7 +155,9 @@ Semântica do `rate-limit` do RouterOS (`/ppp profile` e atributo `Mikrotik-Rate
 `rx-rate[/tx-rate] [rx-burst-rate[/tx-burst-rate] [rx-burst-threshold[/tx-burst-threshold]
 [rx-burst-time[/tx-burst-time]]]]`, rx = upload do cliente, tx = download, bits por segundo.
 
-- Token bucket em bytes com profundidade de 50 ms da taxa (mínimo 3200 bytes, dois quadros).
+- Balde de `bucket-size × taxa` (RouterOS v7; 0,1 = 100 ms da taxa, mínimo 3200 bytes, dois
+  quadros): o "burst ≈ RTT × taxa" que evita o policer derrubar TCP (Google 2016). Até a G4.9b era
+  50 ms; medido com TCP a 50 Mbit/s e 20 ms de RTT: 47,2 → 49,2 Mbit/s (`docs/queues.md`).
 - **Burst**: a média dos últimos `burst-time` fica em 16 fatias de `burst-time/16`. Enquanto a
   média está abaixo do `burst-threshold`, o balde enche na `burst-rate`; ao alcançá-lo, volta à
   taxa normal. Exemplo do próprio RouterOS (1M, burst 2M, limiar 1,5M, 8 s): 6 s a 2M, depois 1M;
@@ -154,14 +165,17 @@ Semântica do `rate-limit` do RouterOS (`/ppp profile` e atributo `Mikrotik-Rate
   (teste `routeros_burst_example`).
 - Sem burst informado, sem limite de burst; limiar ausente = a taxa; tempo ausente = 1 s (como no
   RouterOS).
-- O estado é compartilhado entre CPUs, sem lock: duas CPUs no mesmo assinante ao mesmo tempo podem
-  perder ou ganhar uma ficha (taxa aproximada nessa corrida, nunca memória inválida). O
-  `bpf_spin_lock` (mapa com BTF) fica para a G4.3cc se a medição numa placa real mostrar erro.
+- **Sem corrida entre CPUs (G4.3cc).** O balde é um GCRA (ITU-T I.371): o estado exato é um só
+  relógio de 64 bits (o "tempo teórico de chegada"), movido por `cmpxchg` (BPF ISA v3); as fatias
+  da janela de burst somam com adição atômica. Várias CPUs no mesmo assinante (RSS, RPS) não perdem
+  nem ganham fichas; quatro trocas perdidas seguidas descartam o pacote (nunca um laço sem fim). O
+  `bpf_spin_lock` foi descartado: nenhum helper com ele preso, mapa com BTF e um lock por
+  assinante serializando as CPUs. Medido em `docs/queues.md` (1/4/8/16 CPUs).
 
-O policer é o primeiro passo. O shaping de descida com **EDT** (programa tc que grava
-`skb->tstamp` por assinante, `fq` nas filas da porta de acesso, sem HTB por sessão, como o
-bandwidth manager do Cilium) e a comparação EDT × HTB a 1k e 10k assinantes são a G4.3ca: o
-`XDP_REDIRECT` não passa por qdisc, então o EDT só vale no caminho com `skb`.
+A descida pode ser **moldada** em vez de policiada (G4.9b, `download_mode=shaper` no perfil, o
+padrão): a sessão ganha `F_SHAPE_DOWN`, o XDP manda a descida ao kernel (`down-shaped`), que a
+roteia para `bng0` e a porta de acesso, onde o programa `shape_egress` dá a cada pacote o horário de
+saída (EDT) e o `fq` o segura. Detalhes e medições em `docs/queues.md`.
 
 ## Pesquisa
 

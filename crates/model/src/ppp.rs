@@ -954,6 +954,12 @@ pub struct ActiveSession {
     pub delegated_bound: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub link_local: Option<Ipv6Addr>,
+    /// G4.9b: how long a download packet entering now waits in the
+    /// session's queue, microseconds (0: not shaped).
+    pub queue_us: u64,
+    /// Download packets dropped (shaper or policer) and upload ones over the
+    /// policer.
+    pub drops: u64,
 }
 
 /// One line of `ppp.history`: a login that came up, failed or ended.

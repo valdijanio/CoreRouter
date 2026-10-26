@@ -1945,7 +1945,8 @@ impl Bng {
                 if let Some(sub) = self.subs.get(&(i, session.sid))
                     && let Some(idx) = sub.xdp
                 {
-                    let shape = corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
                     let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref(), shape);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(idx, s)));
                 }
@@ -2877,6 +2878,8 @@ impl Bng {
                     a.rx_packets = c.up_packets;
                     a.tx_bytes = c.down_bytes;
                     a.tx_packets = c.down_packets;
+                    a.queue_us = c.down_queue_us;
+                    a.drops = c.up_policed + c.down_policed;
                 }
                 a.uptime_secs = now.saturating_sub(up) / 1000;
                 let dt = now.saturating_sub(sub.prev.2);
@@ -3007,7 +3010,8 @@ impl Bng {
                 sub.rate = Some(rate.clone());
                 if let Some(idx) = sub.xdp {
                     // CoA: the rate changes, the queue (its clock) stays.
-                    let shape = corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                         idx,
                         xdp_session(&d, Some(&rate), sub.v6.as_deref(), shape),

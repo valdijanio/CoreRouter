@@ -487,6 +487,8 @@ impl Core {
                 a.tx_bytes = n.down_bytes;
                 a.rx_packets = n.up_packets;
                 a.tx_packets = n.down_packets;
+                a.queue_us = n.down_queue_us;
+                a.drops = n.up_policed + n.down_policed;
             }
         }
     }

@@ -188,11 +188,19 @@ impl L3 {
     }
 
     pub fn src_addr(&self) -> Addr {
-        if self.v6 { Addr::V6(self.src) } else { Addr::V4(Self::v4(&self.src)) }
+        if self.v6 {
+            Addr::V6(self.src)
+        } else {
+            Addr::V4(Self::v4(&self.src))
+        }
     }
 
     pub fn dst_addr(&self) -> Addr {
-        if self.v6 { Addr::V6(self.dst) } else { Addr::V4(Self::v4(&self.dst)) }
+        if self.v6 {
+            Addr::V6(self.dst)
+        } else {
+            Addr::V4(Self::v4(&self.dst))
+        }
     }
 }
 
@@ -295,12 +303,37 @@ pub const PCQ_KEY_LEN: usize = 24;
 /// The sub-stream of queue `idx`, direction `dir`, for address `a`:
 /// `[idx (LE) | dir | family | 0 0 | masked address]`.
 #[inline(always)]
-pub fn pcq_key(idx: u32, dir: u8, v6: bool, a: &[u8; 16], mask4: u8, mask6: u8) -> [u8; PCQ_KEY_LEN] {
+pub fn pcq_key(
+    idx: u32,
+    dir: u8,
+    v6: bool,
+    a: &[u8; 16],
+    mask4: u8,
+    mask6: u8,
+) -> [u8; PCQ_KEY_LEN] {
     let [i0, i1, i2, i3] = idx.to_le_bytes();
     let fam = if v6 { 6 } else { 4 };
-    let [a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15] = masked(v6, a, mask4, mask6);
+    let [
+        a0,
+        a1,
+        a2,
+        a3,
+        a4,
+        a5,
+        a6,
+        a7,
+        a8,
+        a9,
+        a10,
+        a11,
+        a12,
+        a13,
+        a14,
+        a15,
+    ] = masked(v6, a, mask4, mask6);
     [
-        i0, i1, i2, i3, dir, fam, 0, 0, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15,
+        i0, i1, i2, i3, dir, fam, 0, 0, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13,
+        a14, a15,
     ]
 }
 
@@ -340,11 +373,14 @@ pub enum Stat {
     BngFailed = 9,
     /// A session's download shaped.
     SessionShaped = 10,
+    /// Dropped after four lost compare-and-swaps on one clock (CPUs
+    /// contending for the same target).
+    Contended = 11,
 }
 
 impl Stat {
-    pub const SLOTS: u32 = 11;
-    pub const ALL: [Stat; 11] = [
+    pub const SLOTS: u32 = 12;
+    pub const ALL: [Stat; 12] = [
         Stat::NoTarget,
         Stat::Sent,
         Stat::Held,
@@ -356,6 +392,7 @@ impl Stat {
         Stat::BngNoSession,
         Stat::BngFailed,
         Stat::SessionShaped,
+        Stat::Contended,
     ];
 
     pub fn name(self) -> &'static str {
@@ -371,6 +408,7 @@ impl Stat {
             Stat::BngNoSession => "bng-no-session",
             Stat::BngFailed => "bng-failed",
             Stat::SessionShaped => "session-shaped",
+            Stat::Contended => "contended",
         }
     }
 }
@@ -410,20 +448,32 @@ mod tests {
         assert_eq!(back.up.queue, c.up.queue);
         assert_eq!(back.up.rate, c.up.rate);
         let p = back.up.pcq;
-        assert_eq!((p.on, p.by_src, p.mask4, p.mask6, p.rate.rate, p.rate.depth), (true, true, 32, 64, 125_000, c.up.pcq.rate.depth));
+        assert_eq!(
+            (p.on, p.by_src, p.mask4, p.mask6, p.rate.rate, p.rate.depth),
+            (true, true, 32, 64, 125_000, c.up.pcq.rate.depth)
+        );
         assert!(!back.down.pcq.on);
     }
 
     #[test]
     fn masks() {
         let a = [0x20, 1, 0xd, 0xb8, 0, 1, 0x12, 0x34, 1, 2, 3, 4, 5, 6, 7, 8];
-        assert_eq!(masked(true, &a, 32, 64), [0x20, 1, 0xd, 0xb8, 0, 1, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            masked(true, &a, 32, 64),
+            [0x20, 1, 0xd, 0xb8, 0, 1, 0x12, 0x34, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
         assert_eq!(masked(true, &a, 32, 60)[7], 0x30);
         let v4 = wide([10, 1, 2, 3]);
         assert_eq!(&masked(false, &v4, 24, 128)[..4], &[10, 1, 2, 0]);
         assert_eq!(&masked(false, &v4, 0, 128)[..4], &[0, 0, 0, 0]);
-        assert_ne!(pcq_key(1, 1, false, &v4, 32, 128), pcq_key(1, 0, false, &v4, 32, 128));
-        assert_ne!(pcq_key(1, 1, false, &v4, 32, 128), pcq_key(1, 1, true, &v4, 32, 128));
+        assert_ne!(
+            pcq_key(1, 1, false, &v4, 32, 128),
+            pcq_key(1, 0, false, &v4, 32, 128)
+        );
+        assert_ne!(
+            pcq_key(1, 1, false, &v4, 32, 128),
+            pcq_key(1, 1, true, &v4, 32, 128)
+        );
     }
 
     #[test]
@@ -438,7 +488,9 @@ mod tests {
                 self.0.get(off..off + N)?.try_into().ok()
             }
         }
-        let ip = [0x45, 0, 0, 40, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 100, 64, 0, 9];
+        let ip = [
+            0x45, 0, 0, 40, 0, 0, 0, 0, 64, 17, 0, 0, 10, 0, 0, 1, 100, 64, 0, 9,
+        ];
         let mut f = vec![0u8; 12];
         f.extend([0x81, 0, 0, 7, 0x88, 0x64, 0x11, 0, 0, 5, 0, 42, 0, 0x21]);
         f.extend(ip);

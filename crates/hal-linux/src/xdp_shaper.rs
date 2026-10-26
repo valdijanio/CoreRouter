@@ -25,8 +25,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use aya::Ebpf;
 use aya::maps::{Array, HashMap, PerCpuArray};
-use aya::programs::tc::{SchedClassifierLinkId, TcAttachType};
 use aya::programs::SchedClassifier;
+use aya::programs::tc::{SchedClassifierLinkId, TcAttachType};
 use corerouter_dataplane_ebpf_common::maps as m;
 use corerouter_dataplane_ebpf_common::policer::Rate;
 use corerouter_dataplane_ebpf_common::queue::{self as q, Conf, Dir, Pcq};
@@ -155,7 +155,12 @@ impl Netlink {
     }
 
     /// Send one qdisc message; `Ok` on the kernel's ACK.
-    fn qdisc(&self, msg: rtnetlink::packet_route::tc::TcMessage, flags: u16, new: bool) -> Result<(), String> {
+    fn qdisc(
+        &self,
+        msg: rtnetlink::packet_route::tc::TcMessage,
+        flags: u16,
+        new: bool,
+    ) -> Result<(), String> {
         use futures_util::StreamExt;
         use rtnetlink::packet_core::{NLM_F_ACK, NLM_F_REQUEST, NetlinkMessage, NetlinkPayload};
         use rtnetlink::packet_route::RouteNetlinkMessage;
@@ -196,7 +201,9 @@ impl Netlink {
         };
         if add && mtu != 0 {
             msg.attributes
-                .push(RouteAttribute::Metrics(vec![RouteMetric::Mtu(u32::from(mtu))]));
+                .push(RouteAttribute::Metrics(vec![RouteMetric::Mtu(u32::from(
+                    mtu,
+                ))]));
         }
         let h = self.handle.clone();
         self.rt.block_on(async move {
@@ -229,15 +236,24 @@ fn tx_queues(name: &IfName) -> u16 {
         .max(1)
 }
 
-fn fq_message(ifindex: u32, parent: rtnetlink::packet_route::tc::TcHandle) -> rtnetlink::packet_route::tc::TcMessage {
+fn fq_message(
+    ifindex: u32,
+    parent: rtnetlink::packet_route::tc::TcHandle,
+) -> rtnetlink::packet_route::tc::TcMessage {
     use rtnetlink::packet_core::DefaultNla;
     use rtnetlink::packet_route::tc::{TcAttribute, TcMessage, TcOption};
     let mut msg = TcMessage::with_index(i32::try_from(ifindex).unwrap_or(0));
     msg.header.parent = parent;
     msg.attributes.push(TcAttribute::Kind("fq".into()));
     msg.attributes.push(TcAttribute::Options(vec![
-        TcOption::Other(DefaultNla::new(TCA_FQ_PLIMIT, FQ_PLIMIT.to_ne_bytes().to_vec())),
-        TcOption::Other(DefaultNla::new(TCA_FQ_FLOW_PLIMIT, FQ_FLOW_PLIMIT.to_ne_bytes().to_vec())),
+        TcOption::Other(DefaultNla::new(
+            TCA_FQ_PLIMIT,
+            FQ_PLIMIT.to_ne_bytes().to_vec(),
+        )),
+        TcOption::Other(DefaultNla::new(
+            TCA_FQ_FLOW_PLIMIT,
+            FQ_FLOW_PLIMIT.to_ne_bytes().to_vec(),
+        )),
     ]));
     msg
 }
@@ -258,7 +274,11 @@ fn ensure_fq(nl: &Netlink, name: &IfName, ifindex: u32) -> Result<(), String> {
     mq.attributes.push(TcAttribute::Kind("mq".into()));
     nl.qdisc(mq, flags, true)?;
     for i in 1..=n {
-        nl.qdisc(fq_message(ifindex, TcHandle { major: 1, minor: i }), flags, true)?;
+        nl.qdisc(
+            fq_message(ifindex, TcHandle { major: 1, minor: i }),
+            flags,
+            true,
+        )?;
     }
     Ok(())
 }
@@ -316,21 +336,24 @@ fn dir_of(d: &DirSpec) -> Dir {
         // PCQ with no rate of its own only splits the queue's limit
         // equally in RouterOS; here the queue's clock does it (no
         // per-address split).
-        pcq: d.pcq.filter(|p| p.rate_bps > 0).map_or(Pcq::default(), |p| {
-            let r = Rate::routeros(p.rate_bps, 0, 0, 0, u64::from(d.bucket_milli));
-            Pcq {
-                on: true,
-                rate: Rate {
-                    rate: r.rate,
-                    depth: r.depth,
-                    ..Rate::default()
-                },
-                queue: queue_of(&p.kind, r.rate),
-                by_src: p.by_src,
-                mask4: p.mask4,
-                mask6: p.mask6,
-            }
-        }),
+        pcq: d
+            .pcq
+            .filter(|p| p.rate_bps > 0)
+            .map_or(Pcq::default(), |p| {
+                let r = Rate::routeros(p.rate_bps, 0, 0, 0, u64::from(d.bucket_milli));
+                Pcq {
+                    on: true,
+                    rate: Rate {
+                        rate: r.rate,
+                        depth: r.depth,
+                        ..Rate::default()
+                    },
+                    queue: queue_of(&p.kind, r.rate),
+                    by_src: p.by_src,
+                    mask4: p.mask4,
+                    mask6: p.mask6,
+                }
+            }),
     }
 }
 
@@ -353,22 +376,31 @@ fn err(what: &'static str) -> impl Fn(aya::maps::MapError) -> HalError {
 /// Write queue `slot` (config, fresh states, counters at zero).
 fn put_queue(ebpf: &mut Ebpf, slot: u32, c: &Conf, fresh_counts: bool) -> Result<(), HalError> {
     let now = monotonic_ns();
-    let mut conf = Array::<_, q::ConfWords>::try_from(map(ebpf, m::Q_CONF)?).map_err(err("Q_CONF map"))?;
+    let mut conf =
+        Array::<_, q::ConfWords>::try_from(map(ebpf, m::Q_CONF)?).map_err(err("Q_CONF map"))?;
     conf.set(slot, c.to_words(), 0).map_err(err("Q_CONF set"))?;
-    let mut st = Array::<_, shaper::State>::try_from(map(ebpf, m::Q_STATE)?).map_err(err("Q_STATE map"))?;
-    st.set(slot * 2, shaper::fresh(&c.up.rate, now), 0).map_err(err("Q_STATE set"))?;
-    st.set(slot * 2 + 1, shaper::fresh(&c.down.rate, now), 0).map_err(err("Q_STATE set"))?;
+    let mut st =
+        Array::<_, shaper::State>::try_from(map(ebpf, m::Q_STATE)?).map_err(err("Q_STATE map"))?;
+    st.set(slot * 2, shaper::fresh(&c.up.rate, now), 0)
+        .map_err(err("Q_STATE set"))?;
+    st.set(slot * 2 + 1, shaper::fresh(&c.down.rate, now), 0)
+        .map_err(err("Q_STATE set"))?;
     if fresh_counts {
-        let mut cnt = Array::<_, q::Counts>::try_from(map(ebpf, m::Q_COUNT)?).map_err(err("Q_COUNT map"))?;
-        cnt.set(slot * 2, [0; q::COUNT_WORDS], 0).map_err(err("Q_COUNT set"))?;
-        cnt.set(slot * 2 + 1, [0; q::COUNT_WORDS], 0).map_err(err("Q_COUNT set"))?;
+        let mut cnt =
+            Array::<_, q::Counts>::try_from(map(ebpf, m::Q_COUNT)?).map_err(err("Q_COUNT map"))?;
+        cnt.set(slot * 2, [0; q::COUNT_WORDS], 0)
+            .map_err(err("Q_COUNT set"))?;
+        cnt.set(slot * 2 + 1, [0; q::COUNT_WORDS], 0)
+            .map_err(err("Q_COUNT set"))?;
     }
     Ok(())
 }
 
 fn clear_queue(ebpf: &mut Ebpf, slot: u32) -> Result<(), HalError> {
-    let mut conf = Array::<_, q::ConfWords>::try_from(map(ebpf, m::Q_CONF)?).map_err(err("Q_CONF map"))?;
-    conf.set(slot, [0; q::CONF_WORDS], 0).map_err(err("Q_CONF clear"))
+    let mut conf =
+        Array::<_, q::ConfWords>::try_from(map(ebpf, m::Q_CONF)?).map_err(err("Q_CONF map"))?;
+    conf.set(slot, [0; q::CONF_WORDS], 0)
+        .map_err(err("Q_CONF clear"))
 }
 
 /// Make the queue maps go from `from` to `to`. Order: a queue's config
@@ -376,7 +408,10 @@ fn clear_queue(ebpf: &mut Ebpf, slot: u32) -> Result<(), HalError> {
 /// is cleared.
 fn sync_maps(ebpf: &mut Ebpf, from: &ShaperPlan, to: &ShaperPlan) -> Result<(), HalError> {
     if to.queues.len() > q::Q_MAX as usize {
-        return Err(HalError::Rejected(format!("shaper: at most {} queues", q::Q_MAX)));
+        return Err(HalError::Rejected(format!(
+            "shaper: at most {} queues",
+            q::Q_MAX
+        )));
     }
     for (i, spec) in to.queues.iter().enumerate() {
         let old = from.queues.get(i);
@@ -389,7 +424,8 @@ fn sync_maps(ebpf: &mut Ebpf, from: &ShaperPlan, to: &ShaperPlan) -> Result<(), 
         put_queue(ebpf, slot, &conf_of(spec), fresh)?;
     }
     super::sync_trie(ebpf, m::Q_V4, m::Q_V6, &from.prefixes, &to.prefixes)?;
-    let mut ifaces = HashMap::<_, u32, u32>::try_from(map(ebpf, m::Q_IFACE)?).map_err(err("Q_IFACE map"))?;
+    let mut ifaces =
+        HashMap::<_, u32, u32>::try_from(map(ebpf, m::Q_IFACE)?).map_err(err("Q_IFACE map"))?;
     let old: Vec<u32> = ifaces.keys().filter_map(Result::ok).collect();
     let mut want = BTreeMap::new();
     for (name, slot) in &to.interfaces {
@@ -438,7 +474,12 @@ fn program_of(hook: Hook) -> (&'static str, TcAttachType) {
 
 /// Attach to `want`, detach from the rest.
 fn attach(l: &mut Loaded, want: &BTreeSet<(IfName, Hook)>) -> Result<(), HalError> {
-    let stale: Vec<(IfName, Hook)> = l.tc.links.keys().filter(|k| !want.contains(*k)).cloned().collect();
+    let stale: Vec<(IfName, Hook)> =
+        l.tc.links
+            .keys()
+            .filter(|k| !want.contains(*k))
+            .cloned()
+            .collect();
     for k in stale {
         if let Some(id) = l.tc.links.remove(&k) {
             let (name, _) = program_of(k.1);
@@ -486,7 +527,12 @@ impl ShaperState {
     /// Bring the loaded object (or none) to `self.plan` and the session
     /// switches: maps, `fq`, links, `bng0`. `pppoe`: the PPPoE data plane
     /// is on (bng0 and the session routes).
-    pub(super) fn reach(&mut self, loaded: Option<&mut Loaded>, pppoe: bool, sessions_on: bool) -> Result<(), HalError> {
+    pub(super) fn reach(
+        &mut self,
+        loaded: Option<&mut Loaded>,
+        pppoe: bool,
+        sessions_on: bool,
+    ) -> Result<(), HalError> {
         let plan = self.plan.clone();
         // bng0 first (its program goes on below).
         if pppoe && self.bng.is_none() {
@@ -525,7 +571,8 @@ impl ShaperState {
             let mut put = Vec::new();
             for name in &new {
                 let i = super::ifindex(name)?;
-                ensure_fq(nl, name, i).map_err(|e| HalError::Rejected(format!("shaper: fq on {name}: {e}")))?;
+                ensure_fq(nl, name, i)
+                    .map_err(|e| HalError::Rejected(format!("shaper: fq on {name}: {e}")))?;
                 put.push(name.clone());
             }
             for n in gone {
@@ -622,7 +669,14 @@ impl ShaperState {
             };
         };
         let mut out = ShaperStatus {
-            ports: l.tc.links.keys().map(|(n, _)| n.clone()).collect::<BTreeSet<_>>().into_iter().collect(),
+            ports: l
+                .tc
+                .links
+                .keys()
+                .map(|(n, _)| n.clone())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect(),
             ..ShaperStatus::default()
         };
         if let Some(mp) = l.ebpf.map_mut(m::SHAPE_STATS)
@@ -643,13 +697,21 @@ impl ShaperState {
         if l.pcq && now.saturating_sub(self.pcq.0) > 10_000_000_000 {
             self.pcq = (now, pcq_counts(&mut l.ebpf));
         }
-        let counts: Vec<Option<q::Counts>> = match l.ebpf.map_mut(m::Q_COUNT).map(Array::<_, q::Counts>::try_from) {
+        let counts: Vec<Option<q::Counts>> = match l
+            .ebpf
+            .map_mut(m::Q_COUNT)
+            .map(Array::<_, q::Counts>::try_from)
+        {
             Some(Ok(a)) => (0..self.plan.queues.len() * 2)
                 .map(|i| a.get(&u32::try_from(i).unwrap_or(u32::MAX), 0).ok())
                 .collect(),
             _ => Vec::new(),
         };
-        let backlog: Vec<u64> = match l.ebpf.map_mut(m::Q_STATE).map(Array::<_, shaper::State>::try_from) {
+        let backlog: Vec<u64> = match l
+            .ebpf
+            .map_mut(m::Q_STATE)
+            .map(Array::<_, shaper::State>::try_from)
+        {
             Some(Ok(a)) => (0..self.plan.queues.len() * 2)
                 .map(|i| {
                     a.get(&u32::try_from(i).unwrap_or(u32::MAX), 0)
@@ -661,7 +723,12 @@ impl ShaperState {
         };
         for (i, spec) in self.plan.queues.iter().enumerate() {
             let mut c = QueueCounters {
-                pcq_queues: self.pcq.1.get(&u32::try_from(i).unwrap_or(u32::MAX)).copied().unwrap_or(0),
+                pcq_queues: self
+                    .pcq
+                    .1
+                    .get(&u32::try_from(i).unwrap_or(u32::MAX))
+                    .copied()
+                    .unwrap_or(0),
                 ..QueueCounters::default()
             };
             for dir in 0..2 {
@@ -669,7 +736,11 @@ impl ShaperState {
                     continue;
                 };
                 let [packets, bytes, dropped, _marked] = *w;
-                if let (Some(p), Some(b), Some(d)) = (c.packets.get_mut(dir), c.bytes.get_mut(dir), c.dropped.get_mut(dir)) {
+                if let (Some(p), Some(b), Some(d)) = (
+                    c.packets.get_mut(dir),
+                    c.bytes.get_mut(dir),
+                    c.dropped.get_mut(dir),
+                ) {
                     *p = packets;
                     *b = bytes;
                     *d = dropped;
@@ -683,25 +754,40 @@ impl ShaperState {
             if let Some((at, prev)) = self.last.get(&spec.key) {
                 let dt = now.saturating_sub(*at).max(1);
                 for dir in 0..2 {
-                    if let (Some(r), Some(b), Some(p)) = (c.rate_bps.get_mut(dir), c.bytes.get(dir), prev.get(dir)) {
-                        *r = b.saturating_sub(*p).saturating_mul(8).saturating_mul(1_000_000_000) / dt;
+                    if let (Some(r), Some(b), Some(p)) =
+                        (c.rate_bps.get_mut(dir), c.bytes.get(dir), prev.get(dir))
+                    {
+                        *r = b
+                            .saturating_sub(*p)
+                            .saturating_mul(8)
+                            .saturating_mul(1_000_000_000)
+                            / dt;
                     }
                 }
             }
             self.last.insert(spec.key.clone(), (now, c.bytes));
             out.queues.push((spec.key.clone(), c));
         }
-        self.last.retain(|k, _| self.plan.queues.iter().any(|q| &q.key == k));
+        self.last
+            .retain(|k, _| self.plan.queues.iter().any(|q| &q.key == k));
         out
     }
 }
 
 /// Session `idx`'s download queue words and a fresh clock.
-fn put_session(ebpf: &mut Ebpf, idx: u32, down: &Rate, w: [u64; shaper::QUEUE_WORDS]) -> Result<(), HalError> {
-    let mut shape = Array::<_, [u64; shaper::QUEUE_WORDS]>::try_from(map(ebpf, m::SUB_SHAPE)?).map_err(err("SUB_SHAPE map"))?;
+fn put_session(
+    ebpf: &mut Ebpf,
+    idx: u32,
+    down: &Rate,
+    w: [u64; shaper::QUEUE_WORDS],
+) -> Result<(), HalError> {
+    let mut shape = Array::<_, [u64; shaper::QUEUE_WORDS]>::try_from(map(ebpf, m::SUB_SHAPE)?)
+        .map_err(err("SUB_SHAPE map"))?;
     shape.set(idx, w, 0).map_err(err("SUB_SHAPE set"))?;
-    let mut st = Array::<_, shaper::State>::try_from(map(ebpf, m::SUB_EDT)?).map_err(err("SUB_EDT map"))?;
-    st.set(idx, shaper::fresh(down, monotonic_ns()), 0).map_err(err("SUB_EDT set"))
+    let mut st =
+        Array::<_, shaper::State>::try_from(map(ebpf, m::SUB_EDT)?).map_err(err("SUB_EDT map"))?;
+    st.set(idx, shaper::fresh(down, monotonic_ns()), 0)
+        .map_err(err("SUB_EDT set"))
 }
 
 /// After a reload: every shaped session's queue back.
@@ -719,7 +805,8 @@ pub(super) fn refill_sessions(
 }
 
 fn write_word(ebpf: &mut Ebpf, w: u64) -> Result<(), HalError> {
-    let mut arr = Array::<_, u64>::try_from(map(ebpf, m::SETTINGS)?).map_err(err("SETTINGS map"))?;
+    let mut arr =
+        Array::<_, u64>::try_from(map(ebpf, m::SETTINGS)?).map_err(err("SETTINGS map"))?;
     arr.set(q::SETTINGS_SLOT, w, 0).map_err(err("SETTINGS set"))
 }
 
@@ -785,7 +872,9 @@ mod tests {
                 by_src: false,
                 mask4: 32,
                 mask6: 64,
-                kind: Kind::Fifo { limit_bytes: 51_200 },
+                kind: Kind::Fifo {
+                    limit_bytes: 51_200,
+                },
             }),
         };
         let dir = dir_of(&d);
@@ -793,12 +882,22 @@ mod tests {
         assert_eq!(dir.rate.depth, 125_000, "bucket-size 0.1");
         assert!(dir.rate.bursts());
         assert_eq!(dir.queue.kind, KIND_CODEL);
-        assert_eq!((dir.queue.target_ns, dir.queue.interval_ns), (5_000_000, 100_000_000));
+        assert_eq!(
+            (dir.queue.target_ns, dir.queue.interval_ns),
+            (5_000_000, 100_000_000)
+        );
         let p = dir.pcq;
         assert!(p.on);
-        assert_eq!((p.rate.rate, p.mask6, p.queue.kind), (250_000, 64, KIND_FIFO));
+        assert_eq!(
+            (p.rate.rate, p.mask6, p.queue.kind),
+            (250_000, 64, KIND_FIFO)
+        );
         // 50 KiB at 2 Mbit/s ≈ 205 ms of queue.
-        assert!((200_000_000..=210_000_000).contains(&p.queue.limit_ns), "{}", p.queue.limit_ns);
+        assert!(
+            (200_000_000..=210_000_000).contains(&p.queue.limit_ns),
+            "{}",
+            p.queue.limit_ns
+        );
         let spec = corerouter_hal::queue::QueueSpec {
             key: "*1".into(),
             upload: d,
@@ -806,6 +905,37 @@ mod tests {
         };
         let back = Conf::from_words(&conf_of(&spec).to_words());
         assert_eq!(back.down.rate, dir.rate);
+    }
+
+    /// The object has the shaper's maps and three tc programs, and no
+    /// panic path (a division LLVM cannot prove safe links Rust's panic
+    /// and the verifier refuses the program: "last insn is not an exit").
+    #[test]
+    fn the_object_has_the_shaper() {
+        let obj = aya_obj::Object::parse(super::super::OBJECT).unwrap();
+        for name in [
+            m::SUB_SHAPE,
+            m::SUB_EDT,
+            m::Q_V4,
+            m::Q_V6,
+            m::Q_IFACE,
+            m::Q_CONF,
+            m::Q_STATE,
+            m::Q_COUNT,
+            m::Q_PCQ,
+            m::SHAPE_STATS,
+        ] {
+            assert!(obj.maps.contains_key(name), "map {name}");
+        }
+        for p in [m::SHAPE_EGRESS, m::SHAPE_INGRESS, m::BNG_EGRESS] {
+            assert!(
+                obj.programs.contains_key(p),
+                "program {p}: {:?}",
+                obj.programs.keys()
+            );
+        }
+        let text = String::from_utf8_lossy(super::super::OBJECT);
+        assert!(!text.contains("panic_const"), "a panic path in the object");
     }
 
     #[test]
@@ -819,8 +949,14 @@ mod tests {
         };
         let r = routes_of(&p);
         assert_eq!(
-            r.iter().map(|(n, m)| format!("{n} {m}")).collect::<Vec<_>>(),
-            ["100.64.0.9/32 1480", "2001:db8:0:9::/64 1480", "2001:db8:8000:900::/56 1480"]
+            r.iter()
+                .map(|(n, m)| format!("{n} {m}"))
+                .collect::<Vec<_>>(),
+            [
+                "100.64.0.9/32 1480",
+                "2001:db8:0:9::/64 1480",
+                "2001:db8:8000:900::/56 1480"
+            ]
         );
         p.ipoe = true;
         assert!(routes_of(&p).is_empty(), "IPoE subscribers are on-link");
