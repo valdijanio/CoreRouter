@@ -141,7 +141,7 @@ const PROFILE_COLUMNS: [table::Column; 10] = [
     num("Secrets").help("ppp.profile.secrets"),
     comment(),
 ];
-const ACTIVE_COLUMNS: [table::Column; 13] = [
+const ACTIVE_COLUMNS: [table::Column; 15] = [
     col("Name").help("ppp.active.name"),
     col("Service").help("ppp.active.service"),
     col("Caller ID").help("ppp.active.caller_id"),
@@ -150,6 +150,8 @@ const ACTIVE_COLUMNS: [table::Column; 13] = [
     col("Delegated Prefix").help("ppp.active.delegated_prefix"),
     num("Uptime").help("ppp.active.uptime"),
     col("Rate Limit").help("ppp.active.rate_limit"),
+    num("Queue").help("ppp.active.queue"),
+    num("Drops").help("ppp.active.drops"),
     num("Rx").help("ppp.active.rx"),
     num("Tx").help("ppp.active.tx"),
     col("Traffic").help("ppp.active.traffic"),
@@ -248,6 +250,8 @@ const PROFILE_FIELDS: &[Field] = &[
     Field { param: "remote_address", label: "Remote Address", help: "ppp.profile.remote_address", input: Input::Text("a pool (ip.pool)"), edit: true },
     Field { param: "dns_server", label: "DNS Server", help: "ppp.profile.dns_server", input: Input::Text("1.1.1.1,8.8.8.8"), edit: true },
     Field { param: "rate_limit", label: "Rate Limit (rx/tx)", help: "ppp.profile.rate_limit", input: Input::Text("50M/100M"), edit: true },
+    Field { param: "download_mode", label: "Download Mode", help: "ppp.profile.download_mode", input: Input::Choice, edit: true },
+    Field { param: "queue_type", label: "Queue Type", help: "ppp.profile.queue_type", input: Input::Choice, edit: true },
     Field { param: "address_list", label: "Address List", help: "ppp.profile.address_list", input: Input::Text("assinantes"), edit: true },
     Field { param: "only_one", label: "Only One", help: "ppp.profile.only_one", input: Input::Choice, edit: true },
     Field { param: "change_tcp_mss", label: "Change TCP MSS", help: "ppp.profile.change_tcp_mss", input: Input::Choice, edit: true },
@@ -359,6 +363,8 @@ pub(crate) struct PppPanel {
     pub(crate) secrets: Vec<Value>,
     pub(crate) secret_count: Value,
     pub(crate) profiles: Vec<Value>,
+    /// `queue.type.list`, for the profile modal's Queue Type (G4.9c).
+    queue_types: Vec<Value>,
     pub(crate) active: Value,
     pub(crate) monitor: Value,
     pub(crate) history: Vec<Value>,
@@ -799,6 +805,11 @@ impl PppPanel {
                 delegated_cell(r),
                 text(r, "uptime"),
                 rate_chip(&text(r, "rate_limit")),
+                crate::queues::wait_text(n(r, "queue_us")),
+                match n(r, "drops") {
+                    0 => String::new(),
+                    d => d.to_string(),
+                },
                 bytes(n(r, "rx_bytes")),
                 bytes(n(r, "tx_bytes")),
                 traffic.map_or_else(String::new, |t| {
@@ -1009,6 +1020,7 @@ impl PppPanel {
                         v.insert("only_one", "default".to_owned());
                         v.insert("change_tcp_mss", "default".to_owned());
                         v.insert("use_ipv6", "default".to_owned());
+                        v.insert("download_mode", "shaper".to_owned());
                     }
                     _ => {
                         for k in ["one_session_per_host", "accept_untagged", "ac_cookie"] {
@@ -1595,6 +1607,9 @@ impl PanelState for PppPanel {
         if self.modal.as_ref().is_some_and(|(t, _)| *t == Tab::Servers) || self.svc_modal.is_some() {
             q.push(Query { key: "profiles", command: "ppp.profile.list", params: json!({}) });
         }
+        if self.modal.as_ref().is_some_and(|(t, _)| *t == Tab::Profiles) {
+            q.push(Query { key: "queue-types", command: "queue.type.list", params: json!({}) });
+        }
         q
     }
 
@@ -1608,6 +1623,7 @@ impl PanelState for PppPanel {
             ("services", Value::Array(a)) => self.services = a,
             ("secrets", Value::Array(a)) => self.secrets = a,
             ("profiles", Value::Array(a)) => self.profiles = a,
+            ("queue-types", Value::Array(a)) => self.queue_types = a,
             ("history", Value::Array(a)) => self.history = a,
             ("secret-count", v) => self.secret_count = v,
             ("active", v) if v.is_object() => {
@@ -1677,6 +1693,7 @@ impl PanelState for PppPanel {
         let interfaces = app.interface_names(None);
         let profiles: Vec<String> = self.profiles.iter().map(|p| text(p, "name")).collect();
         let servers: Vec<String> = self.servers.iter().map(|p| text(p, "name")).collect();
+        let queue_types: Vec<String> = self.queue_types.iter().map(|p| text(p, "name")).collect();
         let options = |p: &str| -> Vec<String> {
             match p {
                 "interface" => interfaces.clone(),
@@ -1686,6 +1703,8 @@ impl PanelState for PppPanel {
                 "service" => ["pppoe", "ipoe", "any", "l2tp", "pptp", "sstp", "ovpn"].iter().map(|s| (*s).to_owned()).collect(),
                 "only_one" | "change_tcp_mss" => ["default", "yes", "no"].iter().map(|s| (*s).to_owned()).collect(),
                 "use_ipv6" => ["default", "yes", "no", "require"].iter().map(|s| (*s).to_owned()).collect(),
+                "download_mode" => ["shaper", "policer"].iter().map(|s| (*s).to_owned()).collect(),
+                "queue_type" => queue_types.clone(),
                 "server" => servers.clone(),
                 "action" => ["terminate", "delay", "drop"].iter().map(|s| (*s).to_owned()).collect(),
                 _ => Vec::new(),
