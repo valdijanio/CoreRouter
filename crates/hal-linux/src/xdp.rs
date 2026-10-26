@@ -11,7 +11,9 @@
 //!   kernel detaches the filter and traffic flows unfiltered (fail-open),
 //!   never through stale maps.
 //! - Tries are synced by difference: a block-list edit costs one map call
-//!   per changed prefix, not a reload.
+//!   per changed prefix, not a reload. The prefixes are followed change
+//!   by change ([`XdpPrefixes`], G0.22): a commit or a dynamic entry reads
+//!   only the address-list entries it changed, not every one.
 
 use std::collections::BTreeMap;
 use std::net::IpAddr;
@@ -27,8 +29,8 @@ use corerouter_dataplane_ebpf_common::maps as m;
 use corerouter_dataplane_ebpf_common::nat::Endpoint;
 use corerouter_dataplane_ebpf_common::parse::Addr;
 use corerouter_hal::HalError;
-use corerouter_hal::xdp::{REASONS, XdpPlan, XdpPort, XdpStatus, XdpTop};
-use corerouter_model::firewall::DynamicAddress;
+use corerouter_hal::xdp::{PrefixChanges, REASONS, XdpPlan, XdpPort, XdpPrefixes, XdpStatus, XdpTop};
+use corerouter_model::firewall::{AddrMatch, DynamicAddress, Name};
 use corerouter_model::xdp::XdpMode;
 use corerouter_model::{Config, IfName};
 use ipnet::IpNet;
@@ -101,10 +103,18 @@ struct Loaded {
 #[derive(Default)]
 pub struct XdpState {
     loaded: Option<Loaded>,
+    /// The settings and ports held (its `block` and `allow` stay empty:
+    /// the prefixes are in `prefixes`).
     applied: XdpPlan,
     /// The config of the last sync, for dynamic address-list changes.
     cfg: Option<Config>,
-    dynamic: Vec<DynamicAddress>,
+    /// Dynamic entries by (list, address): one each, as the kernel set.
+    dynamic: std::collections::HashMap<(Name, AddrMatch), DynamicAddress>,
+    /// The block and allow prefixes, followed change by change.
+    prefixes: XdpPrefixes,
+    /// The tries hold `prefixes` (as of the last write): the filter has
+    /// ports and the object is loaded.
+    tries_on: bool,
     /// The last load failure, for the status.
     error: Option<String>,
     /// The CGNAT fast path's flow map, shared with the daemon's link.
@@ -129,38 +139,53 @@ impl std::fmt::Debug for XdpState {
 impl XdpState {
     /// Make the data plane hold what `cfg` asks for.
     pub fn sync(&mut self, cfg: &Config) -> Result<(), HalError> {
-        let plan = XdpPlan::of(cfg, &self.dynamic);
+        self.prefixes.follow(cfg, self.dynamic.values());
         self.cfg = Some(cfg.clone());
-        self.reach(plan)
+        self.reach(XdpPlan::settings_of(cfg))
+    }
+
+    /// The settings and ports of the last config synced.
+    fn settings(&self) -> XdpPlan {
+        self.cfg.as_ref().map(XdpPlan::settings_of).unwrap_or_default()
     }
 
     /// A dynamic address-list entry came or went: the tries follow, if the
     /// filter is on.
     pub fn dynamic(&mut self, change: corerouter_hal::DynamicChange<'_>) {
+        self.dynamic_many(&[change]);
+    }
+
+    /// Several dynamic changes (the PPP sessions of one round): counted,
+    /// then one write of the prefixes they changed.
+    pub fn dynamic_many(&mut self, changes: &[corerouter_hal::DynamicChange<'_>]) {
         use corerouter_hal::DynamicChange;
-        match change {
-            DynamicChange::Add(d) => {
-                self.dynamic
-                    .retain(|x| x.list != d.list || x.address != d.address);
-                self.dynamic.push(d.clone());
-            }
-            DynamicChange::Remove(d) => {
-                self.dynamic
-                    .retain(|x| x.list != d.list || x.address != d.address);
-            }
-            DynamicChange::Expired(gone) => {
-                self.dynamic.retain(|x| {
-                    !gone
-                        .iter()
-                        .any(|g| g.list == x.list && g.address == x.address)
-                });
+        for change in changes {
+            match change {
+                DynamicChange::Add(d) => {
+                    // Added again (a new timeout): still one entry.
+                    if self
+                        .dynamic
+                        .insert((d.list.clone(), d.address), (*d).clone())
+                        .is_none()
+                    {
+                        self.prefixes.dynamic(d, true);
+                    }
+                }
+                DynamicChange::Remove(d) => self.forget(d),
+                DynamicChange::Expired(gone) => gone.iter().for_each(|d| self.forget(d)),
             }
         }
-        let Some(cfg) = self.cfg.clone() else {
+        if self.cfg.is_none() {
             return;
-        };
-        if let Err(e) = self.reach(XdpPlan::of(&cfg, &self.dynamic)) {
+        }
+        if let Err(e) = self.reach(self.settings()) {
             log::error!("XDP: dynamic address list: {e}");
+        }
+    }
+
+    fn forget(&mut self, d: &DynamicAddress) {
+        if let Some(d) = self.dynamic.remove(&(d.list.clone(), d.address)) {
+            self.prefixes.dynamic(&d, false);
         }
     }
 
@@ -173,6 +198,11 @@ impl XdpState {
     /// apply, an XDP filter change or a PPPoE session).
     fn reach_with(&mut self, plan: XdpPlan, strict: bool) -> Result<(), HalError> {
         let shaping = self.shaper.wanted();
+        if plan.is_empty() && !self.tries_on {
+            // No filter port: the tries stay empty (the object may be
+            // loaded for the queues alone); a later load writes them whole.
+            self.prefixes.clear_changes();
+        }
         let sized = |l: &Loaded, st: &Self| {
             l.fast_nat == plan.fast_nat
                 && l.pppoe == st.pppoe.maps()
@@ -180,6 +210,7 @@ impl XdpState {
                 && l.pcq == st.shaper.pcq()
         };
         if plan == self.applied
+            && !self.prefixes.pending()
             && !shaping
             && self.shaper.idle()
             && (plan.is_empty() || self.loaded.as_ref().is_some_and(|l| sized(l, self)))
@@ -189,6 +220,7 @@ impl XdpState {
         if plan.is_empty() && !shaping {
             // Dropping the object detaches every link and frees the maps.
             self.loaded = None;
+            self.tries_on = false;
             self.set_nat(None);
             self.applied = plan;
             self.shaper.reloaded();
@@ -200,6 +232,7 @@ impl XdpState {
         let pppoe = self.pppoe.maps();
         if self.loaded.as_ref().is_some_and(|l| !sized(l, self)) {
             self.loaded = None;
+            self.tries_on = false;
             self.set_nat(None);
         }
         if self.loaded.is_none() {
@@ -222,6 +255,7 @@ impl XdpState {
                     self.error = None;
                     // Fresh maps: everything goes in.
                     self.applied = XdpPlan::default();
+                    self.tries_on = false;
                     self.shaper.reloaded();
                 }
                 Err(e) => {
@@ -241,23 +275,8 @@ impl XdpState {
         };
         write_settings(&mut l.ebpf, &plan, self.pppoe.word())?;
         pppoe::sync_ports(&mut l.ebpf, &self.pppoe)?;
-        sync_trie(
-            &mut l.ebpf,
-            m::BLOCK_V4,
-            m::BLOCK_V6,
-            &self.applied.block,
-            &plan.block,
-        )?;
-        sync_trie(
-            &mut l.ebpf,
-            m::ALLOW_V4,
-            m::ALLOW_V6,
-            &self.applied.allow,
-            &plan.allow,
-        )?;
         // The maps are right whatever happens to the links below.
-        self.applied.block = plan.block.clone();
-        self.applied.allow = plan.allow.clone();
+        sync_tries(l, &mut self.prefixes, &mut self.tries_on, !plan.is_empty())?;
         attach_all(l, &plan.interfaces)?;
         self.applied = plan;
         let on = self.pppoe.maps();
@@ -289,8 +308,7 @@ impl XdpState {
             return Ok(());
         }
         self.shaper.plan = plan.clone();
-        let cfg = self.cfg.clone().unwrap_or_default();
-        let xdp = XdpPlan::of(&cfg, &self.dynamic);
+        let xdp = self.settings();
         self.applied = XdpPlan::default();
         self.reach_with(xdp, true)
     }
@@ -336,10 +354,10 @@ impl XdpState {
             } else {
                 read_top(&mut l.ebpf, top, &lists)
             },
-            block_prefixes: self.applied.block.len(),
+            block_prefixes: if self.tries_on { self.prefixes.len().0 } else { 0 },
             fast_nat_flows: lock_nat(&self.nat).count(),
             fast_nat_misses: misses,
-            allow_prefixes: self.applied.allow.len(),
+            allow_prefixes: if self.tries_on { self.prefixes.len().1 } else { 0 },
         }
     }
 
@@ -654,6 +672,53 @@ fn write_settings(ebpf: &mut Ebpf, plan: &XdpPlan, subscribers: u64) -> Result<(
 
 /// Make tries `v4`/`v6` go from `from` to `to`: removals, then inserts
 /// and changed list indexes.
+/// Bring the block and allow tries to `prefixes` (`on`: the filter has
+/// ports; otherwise they are emptied). Tries that hold what was written
+/// last (`tries_on`) get only the changes; empty ones get every prefix.
+/// A refused write leaves its changes pending for the next call.
+fn sync_tries(
+    l: &mut Loaded,
+    prefixes: &mut XdpPrefixes,
+    tries_on: &mut bool,
+    on: bool,
+) -> Result<(), HalError> {
+    let (block, allow): (PrefixChanges, PrefixChanges) = match (*tries_on, on) {
+        (true, true) => prefixes.take_changes(),
+        (false, true) => {
+            prefixes.clear_changes();
+            let (b, a) = prefixes.all();
+            let put = |v: Vec<(IpNet, u32)>| v.into_iter().map(|(n, i)| (n, Some(i))).collect();
+            (put(b), put(a))
+        }
+        (true, false) => {
+            prefixes.clear_changes();
+            let (b, a) = prefixes.every_key();
+            let gone = |v: Vec<IpNet>| v.into_iter().map(|n| (n, None)).collect();
+            (gone(b), gone(a))
+        }
+        (false, false) => {
+            prefixes.clear_changes();
+            return Ok(());
+        }
+    };
+    let wrote = write_trie(&mut l.ebpf, m::BLOCK_V4, m::BLOCK_V6, &block)
+        .and_then(|()| write_trie(&mut l.ebpf, m::ALLOW_V4, m::ALLOW_V6, &allow));
+    match wrote {
+        Ok(()) => {
+            *tries_on = on;
+            Ok(())
+        }
+        Err(e) => {
+            if *tries_on && on {
+                prefixes.retake(&block, &allow);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Bring a pair of tries from `from` to `to` by difference (the queues'
+/// prefixes, `xdp_shaper.rs`).
 fn sync_trie(
     ebpf: &mut Ebpf,
     v4: &str,
@@ -663,50 +728,69 @@ fn sync_trie(
 ) -> Result<(), HalError> {
     let old: BTreeMap<IpNet, u32> = from.iter().copied().collect();
     let new: BTreeMap<IpNet, u32> = to.iter().copied().collect();
-    let gone = old.keys().filter(|k| !new.contains_key(k));
-    let put = new.iter().filter(|(k, v)| old.get(k) != Some(v));
+    let mut changes: PrefixChanges = old
+        .keys()
+        .filter(|k| !new.contains_key(k))
+        .map(|k| (*k, None))
+        .collect();
+    changes.extend(
+        new.iter()
+            .filter(|(k, v)| old.get(k) != Some(v))
+            .map(|(k, v)| (*k, Some(*v))),
+    );
+    write_trie(ebpf, v4, v6, &changes)
+}
+
+/// Write `changes` to a pair of tries: `Some(list)` inserts (or replaces),
+/// `None` removes (a missing key is fine).
+fn write_trie(
+    ebpf: &mut Ebpf,
+    v4: &str,
+    v6: &str,
+    changes: &[(IpNet, Option<u32>)],
+) -> Result<(), HalError> {
+    if changes.is_empty() {
+        return Ok(());
+    }
     let mut t4 = LpmTrie::<_, [u8; 4], u32>::try_from(
         ebpf.map_mut(v4)
             .ok_or_else(|| HalError::Rejected(format!("XDP: no {v4} map")))?,
     )
     .map_err(|e| rejected(v4, &e))?;
-    let mut removed6 = Vec::new();
-    for n in gone {
-        match n {
-            IpNet::V4(n) => {
+    let mut six = Vec::new();
+    for (n, list) in changes {
+        match (n, list) {
+            (IpNet::V4(n), None) => {
                 let _ = t4.remove(&Key::new(u32::from(n.prefix_len()), n.network().octets()));
             }
-            IpNet::V6(n) => removed6.push(*n),
-        }
-    }
-    let mut put6 = Vec::new();
-    for (n, list) in put {
-        match n {
-            IpNet::V4(n) => t4
+            (IpNet::V4(n), Some(list)) => t4
                 .insert(
                     &Key::new(u32::from(n.prefix_len()), n.network().octets()),
                     list,
                     0,
                 )
                 .map_err(|e| rejected(&format!("{v4} insert {n}"), &e))?,
-            IpNet::V6(n) => put6.push((*n, *list)),
+            (IpNet::V6(n), list) => six.push((*n, *list)),
         }
+    }
+    if six.is_empty() {
+        return Ok(());
     }
     let mut t6 = LpmTrie::<_, [u8; 16], u32>::try_from(
         ebpf.map_mut(v6)
             .ok_or_else(|| HalError::Rejected(format!("XDP: no {v6} map")))?,
     )
     .map_err(|e| rejected(v6, &e))?;
-    for n in removed6 {
-        let _ = t6.remove(&Key::new(u32::from(n.prefix_len()), n.network().octets()));
-    }
-    for (n, list) in put6 {
-        t6.insert(
-            &Key::new(u32::from(n.prefix_len()), n.network().octets()),
-            list,
-            0,
-        )
-        .map_err(|e| rejected(&format!("{v6} insert {n}"), &e))?;
+    for (n, list) in six {
+        let key = Key::new(u32::from(n.prefix_len()), n.network().octets());
+        match list {
+            None => {
+                let _ = t6.remove(&key);
+            }
+            Some(list) => t6
+                .insert(&key, list, 0)
+                .map_err(|e| rejected(&format!("{v6} insert {n}"), &e))?,
+        }
     }
     Ok(())
 }
