@@ -162,8 +162,9 @@ fn bench(c: &mut Criterion) {
             });
         });
     }
-    // 99 900, not 100 000: `MAX_SIMPLE` is 100 000 and a batch adds 100.
-    for n in [1_000_usize, 10_000, 99_900] {
+    // 90 000, not 100 000: 100 000 queues (~168 bytes each saved) pass the
+    // 15 MiB the config may take on disk, so a commit is refused.
+    for n in [1_000_usize, 10_000, 90_000] {
         let mut s = with_queues(n);
         let mut tag = 0_u64;
         g.throughput(Throughput::Elements(1));
