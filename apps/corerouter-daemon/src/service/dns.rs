@@ -544,9 +544,16 @@ pub(crate) mod tests {
     /// `ip` (TTL 300) and AAAA with NODATA; with `truncate`, UDP answers
     /// only carry TC. Returns the port and the query counter.
     pub(crate) fn server(ip: Ipv4Addr, truncate: bool) -> (u16, Arc<AtomicUsize>) {
-        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let port = udp.local_addr().unwrap().port();
-        let tcp = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+        // A free UDP port may be taken for TCP by a parallel test (flaked
+        // with AddrInUse in CI, 2026-10-25): retry until one is free on both.
+        let (udp, port, tcp) = (0..64)
+            .find_map(|_| {
+                let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
+                let port = udp.local_addr().ok()?.port();
+                let tcp = std::net::TcpListener::bind(("127.0.0.1", port)).ok()?;
+                Some((udp, port, tcp))
+            })
+            .expect("no port free for both UDP and TCP on 127.0.0.1");
         let count = Arc::new(AtomicUsize::new(0));
         let answer = move |q: &[u8], tc: bool| {
             let q = Message::from_vec(q).unwrap();
