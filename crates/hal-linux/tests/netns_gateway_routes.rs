@@ -92,4 +92,41 @@ fn routed_blocks_go_via_the_subscriber_and_leave() {
     ]);
     assert!(e.is_err());
     assert!(ip(&["-4", "route", "show", "198.51.100.4/30"]).contains("via 192.168.88.20"));
+    measure_rounds_of_blocks();
+}
+
+/// Measured: 1000 routed blocks to subscribers in one round, then out
+/// (one netlink connection per round; a round per thread tick of the
+/// `ipoe` service), against one round per block.
+fn measure_rounds_of_blocks() {
+    ip(&["link", "add", "acc8", "type", "dummy"]);
+    ip(&["addr", "add", "10.88.0.1/16", "dev", "acc8"]);
+    ip(&["link", "set", "acc8", "up"]);
+    let ops = |add: bool| -> Vec<(Ipv4Addr, u8, Ipv4Addr, bool)> {
+        (0..1000u32)
+            .map(|i| {
+                (
+                    Ipv4Addr::new(21, (i >> 5) as u8, ((i & 31) << 3) as u8, 0),
+                    29,
+                    Ipv4Addr::new(10, 88, (i >> 8) as u8, i as u8 | 1),
+                    add,
+                )
+            })
+            .collect()
+    };
+    let t = std::time::Instant::now();
+    gateway_routes(&ops(true)).unwrap();
+    let batch_add = t.elapsed();
+    let t = std::time::Instant::now();
+    gateway_routes(&ops(false)).unwrap();
+    let batch_del = t.elapsed();
+    let t = std::time::Instant::now();
+    for op in ops(true) {
+        gateway_routes(&[op]).unwrap();
+    }
+    let one_by_one = t.elapsed();
+    gateway_routes(&ops(false)).unwrap();
+    println!(
+        "MEASURED gateway_routes: 1000 blocks in one round add {batch_add:?} / remove {batch_del:?}; one round per block {one_by_one:?}"
+    );
 }
