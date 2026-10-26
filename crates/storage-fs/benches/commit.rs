@@ -260,6 +260,21 @@ fn history64(c: &mut Criterion) {
                 .unwrap()
             });
         });
+        // The journal near its longest (a checkpoint every 1024 lines): the
+        // boot below replays what a crash, or a stop before G0.27, left.
+        let journal = |dir: &Path| {
+            std::fs::read_to_string(dir.join("journal-config.log")).map_or(0, |j| j.lines().count())
+        };
+        let mut i = 0;
+        while journal(&dir) < 1000 && i < 1100 {
+            flip = !flip;
+            s.execute(
+                "interface.set",
+                &json!({"name": "ether2", "comment": format!("j{i}")}),
+            )
+            .unwrap();
+            i += 1;
+        }
         assert!(s.storage_status().last_error.is_none());
         let memory: Vec<u32> = s.store().history().iter().map(|r| r.number).collect();
         drop(s);
@@ -289,10 +304,7 @@ fn history64(c: &mut Criterion) {
             "history64/{name}: {}",
             String::from_utf8_lossy(&child.stdout)
         );
-        let journal = |dir: &Path| {
-            std::fs::read_to_string(dir.join("journal-config.log"))
-                .map_or(0, |j| j.lines().count())
-        };
+
         eprintln!(
             "history64/{name}: {} journal line(s) before the checkpoint",
             journal(&dir)
