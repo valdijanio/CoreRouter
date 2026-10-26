@@ -934,10 +934,10 @@ pub fn to_subscriber<P: PacketHead + ?Sized, L: Sessions>(
     let (idx, routed) = owner(l, &dst_after(p, tags, v6)?)?;
     let (ip_len, ttl) = ip_meta_after(p, tags, v6)?;
     let mut down = downstream(l, idx, v6, ip_len, ttl, now, false);
-    if let Down::Encap(d) = &down {
-        if untag(p, tags).is_none() || ttl_dec(p, v6).is_none() || encap(p, d).is_none() {
-            down = Down::Drop(Stat::Malformed, idx);
-        }
+    if let Down::Encap(d) = &down
+        && (untag(p, tags).is_none() || ttl_dec(p, v6).is_none() || encap(p, d).is_none())
+    {
+        down = Down::Drop(Stat::Malformed, idx);
     }
     Some(Delivery {
         down,
