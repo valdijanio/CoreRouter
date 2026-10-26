@@ -112,10 +112,21 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         comment: String::new(),
     };
     apply(&mut pool, p)?;
+    routed(s, &pool)?;
     let (id, name, size) = (pool.id, pool.name.clone(), pool.size());
-    pools.pools.push(pool);
+    s.store_mut().candidate_mut().ip.pools.pools.push(pool);
     let warnings = verdict(s, "pools", id)?;
     Ok(json!({"id": id, "name": name, "size": size, "warnings": warnings}))
+}
+
+/// G4.3cd: a pool must not lend addresses of a block routed to a secret.
+fn routed(s: &Session, pool: &IpPool) -> Result<()> {
+    for g in &pool.ranges {
+        if let Some(why) = super::ppp_secret::routed_in(s, g.start.into(), g.end.into()) {
+            return Err(EngineError::bad("ranges", format!("{g} {why}")));
+        }
+    }
+    Ok(())
 }
 
 fn index(s: &Session, p: &Value) -> Result<usize> {
@@ -169,6 +180,7 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
             ));
         }
     }
+    routed(s, &pool)?;
     let (id, name, size) = (pool.id, pool.name.clone(), pool.size());
     if let Some(slot) = s.store_mut().candidate_mut().ip.pools.pools.get_mut(i) {
         *slot = pool;

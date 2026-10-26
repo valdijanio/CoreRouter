@@ -39,6 +39,9 @@ pub struct Config {
     /// `/ppp` (G4.3): `/ppp aaa` for now.
     #[serde(skip_serializing_if = "crate::ppp::Ppp::is_default")]
     pub ppp: crate::ppp::Ppp,
+    /// `/queue` (G4.9): simple queues and queue types.
+    #[serde(skip_serializing_if = "crate::queue::Queues::is_default")]
+    pub queue: crate::queue::Queues,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

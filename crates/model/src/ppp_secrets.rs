@@ -6,6 +6,9 @@
 //! it up to date (an import of 100 000 subscribers stays O(n)); any other
 //! write through `DerefMut` drops it, and the next lookup rebuilds it.
 //!
+//! G4.3cd: an index of the secrets' `routes` the same way, so the overlap
+//! check of an add is O(log n) instead of a walk of every secret.
+//!
 //! Serialized exactly like the list.
 
 use std::collections::HashMap;
@@ -15,15 +18,20 @@ use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use ipnet::IpNet;
+
 use crate::cow::CowArc;
+use crate::framed_route::RouteSet;
 use crate::ppp::PppSecret;
 
 type Index = Arc<HashMap<String, usize>>;
+type RouteIndex = Arc<RouteSet<usize>>;
 
 #[derive(Default)]
 pub struct Secrets {
     list: CowArc<Vec<PppSecret>>,
     index: OnceLock<Index>,
+    routes: OnceLock<RouteIndex>,
 }
 
 impl Secrets {
@@ -31,7 +39,38 @@ impl Secrets {
         Self {
             list: CowArc::new(list),
             index: OnceLock::new(),
+            routes: OnceLock::new(),
         }
+    }
+
+    fn route_index(&self) -> &RouteIndex {
+        self.routes.get_or_init(|| {
+            let mut set = RouteSet::new();
+            for (k, s) in self.list.iter().enumerate() {
+                for r in &s.routes {
+                    // An overlap the commands would have refused (a config
+                    // edited by hand): the first secret keeps the block.
+                    let _ = set.insert(r.dst, k);
+                }
+            }
+            Arc::new(set)
+        })
+    }
+
+    /// The secrets whose `routes` share an address with `dst`.
+    pub fn route_owners(&self, dst: &IpNet) -> Vec<(&IpNet, &PppSecret)> {
+        self.route_index()
+            .overlapping(dst)
+            .filter_map(|(n, &k)| self.list.get(k).map(|s| (n, s)))
+            .collect()
+    }
+
+    /// The secrets whose `routes` share an address with `first..=last`.
+    pub fn route_owners_in(&self, first: std::net::IpAddr, last: std::net::IpAddr) -> Vec<(&IpNet, &PppSecret)> {
+        self.route_index()
+            .overlapping_range(first, last)
+            .filter_map(|(n, &k)| self.list.get(k).map(|s| (n, s)))
+            .collect()
     }
 
     fn index(&self) -> &Index {
@@ -59,6 +98,14 @@ impl Secrets {
         if let Some(ix) = self.index.get_mut() {
             Arc::make_mut(ix).entry(s.name.clone()).or_insert(k);
         }
+        if let Some(rx) = self.routes.get_mut()
+            && !s.routes.is_empty()
+        {
+            let rx = Arc::make_mut(rx);
+            for r in &s.routes {
+                let _ = rx.insert(r.dst, k);
+            }
+        }
         self.list.push(s);
     }
 
@@ -74,9 +121,14 @@ impl Clone for Secrets {
         if let Some(ix) = self.index.get() {
             let _ = index.set(Arc::clone(ix));
         }
+        let routes = OnceLock::new();
+        if let Some(rx) = self.routes.get() {
+            let _ = routes.set(Arc::clone(rx));
+        }
         Self {
             list: self.list.clone(),
             index,
+            routes,
         }
     }
 }
@@ -92,6 +144,7 @@ impl Deref for Secrets {
 impl DerefMut for Secrets {
     fn deref_mut(&mut self) -> &mut Vec<PppSecret> {
         self.index = OnceLock::new();
+        self.routes = OnceLock::new();
         &mut self.list
     }
 }
@@ -184,6 +237,29 @@ mod tests {
         e.push(s("y", "9"));
         assert_eq!(pw(&e, "y"), Some("9"));
         assert_eq!(pw(&d, "y"), None);
+    }
+
+    #[test]
+    fn route_owners_follow_writes() {
+        let with = |name: &str, routes: &str| PppSecret {
+            name: name.into(),
+            routes: crate::framed_route::FramedRoute::parse_list(routes).unwrap(),
+            ..PppSecret::default()
+        };
+        let net = |t: &str| t.parse::<IpNet>().unwrap();
+        let mut v = Secrets::new(vec![with("a", "203.0.113.8/29"), s("b", "x")]);
+        let hit = |v: &Secrets, t: &str| -> Vec<String> {
+            v.route_owners(&net(t)).iter().map(|(_, s)| s.name.clone()).collect()
+        };
+        assert_eq!(hit(&v, "203.0.113.0/24"), ["a"]);
+        v.push(with("c", "2001:db8:100::/48,203.0.113.16/28"));
+        assert_eq!(hit(&v, "203.0.113.0/24"), ["a", "c"]);
+        assert_eq!(hit(&v, "2001:db8:100:1::/64"), ["c"]);
+        let copy = v.clone();
+        v.remove(0);
+        assert_eq!(hit(&v, "203.0.113.0/24"), ["c"]);
+        assert_eq!(hit(&copy, "203.0.113.0/24"), ["a", "c"]);
+        assert!(hit(&v, "198.51.100.0/24").is_empty());
     }
 
     #[test]
