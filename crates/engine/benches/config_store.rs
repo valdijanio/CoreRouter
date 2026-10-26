@@ -162,7 +162,8 @@ fn bench(c: &mut Criterion) {
             });
         });
     }
-    for n in [1_000_usize, 10_000, 100_000] {
+    // 99 900, not 100 000: `MAX_SIMPLE` is 100 000 and a batch adds 100.
+    for n in [1_000_usize, 10_000, 99_900] {
         let mut s = with_queues(n);
         let mut tag = 0_u64;
         g.throughput(Throughput::Elements(1));
