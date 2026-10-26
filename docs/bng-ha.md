@@ -291,7 +291,20 @@ réplica de C completa, **A perde a energia**: todas as portas caem ao mesmo tem
 (caminho lento; o tráfego de 1 pps vai em todas as sessões até 2000, e acima disso numa amostra de
 500).
 
-RESULTADOS_LAB
+**Medido** (VM `corerouter-lab`, 8 vCPUs, kernel 7.0, release, BNG Blaster 1.0.1, 2026-10-26,
+`cargo xtask vm-lab run -- cargo xtask bng-lab --only ha --scales 1000,10000,100000`; CHAP pelo
+RADIUS de teste, keepalive do BNG Blaster de 5 s × 3):
+
+| Sessões | Tomada | Tráfego de subida de volta | Sessões perdidas | No nó novo | Starts (ids únicos) | Stops na tomada | Com Interim do nó novo |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 000 | 1,13 s | 1,14 s | 0 | 1 000 | 1 000 (1 000) | 0 | 1 000 |
+| 10 000 | 1,12 s | 1,14 s | 0 | 10 000 | 10 000 (10 000) | 0 | 10 000 |
+| 100 000 | 1,15 s | 1,29 s | 0 | 100 000 | 100 000 (100 000) | 0 | 100 000 |
+
+A tomada é a morte declarada (1,2 s, 4 hellos de 300 ms) mais a adoção. Com 100 mil sessões em
+oito workers, a adoção leva cerca de 0,1 s. Nenhum assinante percebeu a troca (0 flaps no BNG
+Blaster), e a contabilização seguiu com os mesmos ids, sem Stop. No A/B da mesma VM, um nó sozinho
+sobe as mesmas 100 mil em 33 s.
 
 O tráfego de descida depende do protocolo de roteamento que anuncia o pool pelo nó ativo, fora do
 laboratório (gap G4.3hf).
@@ -353,6 +366,10 @@ laboratório (gap G4.3hf).
 
 ## 5. Riscos e como evitamos
 
+- **Uma porta de acesso por L2:** o ativo põe o mesmo MAC virtual em todas as portas de acesso.
+  Duas portas no mesmo L2 fazem o switch mover o MAC de uma para a outra, e os quadros chegam pela
+  porta errada (o laboratório achou isso com duas portas numa bridge só). Num ISP cada porta vai a
+  uma OLT ou a um switch; MAC virtual por porta fica para uma gap, se alguém precisar.
 - **CoA/DM depois da tomada:** o servidor de cobrança manda o CoA ao endereço de NAS do nó antigo.
   É preciso um endereço de NAS do par ou o encaminhamento pelo par (gap G4.3hb).
 - **Class (RFC 2865 §5.25):** o PPP ainda não ecoa o Class na contabilização. O registro já tem

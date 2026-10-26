@@ -5,7 +5,7 @@
 //! measures what the subscribers and the RADIUS server saw.
 //!
 //! ```text
-//!   A (here)                     br0 (access L2)            Bl (BNG Blaster)
+//!   A (here)                     bra0 (access L2, one per port)  Bl (BNG Blaster)
 //!   acc0 ── acc0-p ──────────────┤├──── cpe0-p ── cpe0
 //!                                ┤├──── accc-p ── acc0      C (the standby)
 //!   wan0 .1 ── wan0-p ───── br1 (uplink) ─ blnet-p ── blnet .2 (Bl)
@@ -392,29 +392,27 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     for ns in [Some(cp), Some(bp)] {
         ip(ns, &["link", "set", "lo", "up"]);
     }
-    for br in ["br0", "br1"] {
+    // One access L2 per port (an OLT or a switch each, as in an ISP): the
+    // active's virtual MAC is on every port, and two ports on one L2 would
+    // make the switch move it back and forth.
+    let bridges: Vec<String> = (0..ports)
+        .map(|i| format!("bra{i}"))
+        .chain(["br1".to_owned()])
+        .collect();
+    for br in &bridges {
         ip(None, &["link", "add", br, "type", "bridge"]);
         ip(None, &["link", "set", br, "up"]);
     }
-    let mut legs: Vec<(String, String, Option<&str>, &str)> = Vec::new();
+    let mut legs: Vec<(String, String, Option<&str>, String)> = Vec::new();
     for i in 0..ports {
-        legs.push((format!("acc{i}"), format!("acc{i}-p"), None, "br0"));
-        legs.push((
-            format!("acc{i}"),
-            format!("accc{i}-p"),
-            Some(cs.as_str()),
-            "br0",
-        ));
-        legs.push((
-            format!("cpe{i}"),
-            format!("cpe{i}-p"),
-            Some(bs.as_str()),
-            "br0",
-        ));
+        let br = format!("bra{i}");
+        legs.push((format!("acc{i}"), format!("acc{i}-p"), None, br.clone()));
+        legs.push((format!("acc{i}"), format!("accc{i}-p"), Some(cs.as_str()), br.clone()));
+        legs.push((format!("cpe{i}"), format!("cpe{i}-p"), Some(bs.as_str()), br));
     }
-    legs.push(("wan0".into(), "wan0-p".into(), None, "br1"));
-    legs.push(("wan0".into(), "wanc-p".into(), Some(cs.as_str()), "br1"));
-    legs.push(("blnet".into(), "blnet-p".into(), Some(bs.as_str()), "br1"));
+    legs.push(("wan0".into(), "wan0-p".into(), None, "br1".into()));
+    legs.push(("wan0".into(), "wanc-p".into(), Some(cs.as_str()), "br1".into()));
+    legs.push(("blnet".into(), "blnet-p".into(), Some(bs.as_str()), "br1".into()));
     for (end, peer, ns, br) in &legs {
         match ns {
             None => ip(
@@ -487,7 +485,12 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     .expect("A active, C standby");
 
     let b = Blaster::start(bp, blaster, out, n);
-    let setup = wait_secs(120 + n as u64 / 100, || b.counters().0 as usize >= n);
+    let limit = std::env::var("BNG_LAB_HA_SETUP_S").ok().and_then(|v| v.parse().ok()).unwrap_or(120 + n as u64 / 100);
+    let setup = wait_secs(limit, || b.counters().0 as usize >= n);
+    if setup.is_none() {
+        eprintln!("A: {}", monitor(None));
+        eprintln!("C: {}", monitor(Some(cp)));
+    }
     assert!(setup.is_some(), "{n} sessions on A: {:?}", b.counters());
     wait_secs(120, || {
         let m = monitor(Some(cp));
@@ -495,9 +498,10 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     })
     .expect("C's replica complete");
     if n > SAMPLE_ALL {
-        // Traffic on the sessions `rx_sample` reads (the first rows of
-        // `ppp.active.list`, by name: `rad{session id}`).
-        let rows = call(Some(cp), "ppp.active.list", json!({"limit": 500})).unwrap_or(Value::Null);
+        // Traffic on the sessions `rx_sample` reads on C after the
+        // takeover (the first rows of `ppp.active.list` by name, the same
+        // on both nodes: `rad{session id}`), picked on A, the active now.
+        let rows = call(None, "ppp.active.list", json!({"limit": 500})).unwrap_or(Value::Null);
         let ids: Vec<u64> = rows["rows"]
             .as_array()
             .into_iter()
@@ -581,11 +585,12 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     drop(bl);
     // Every name on this side (the other namespaces' ends go with them,
     // but asynchronously: the next scale must not find a leftover).
-    let mut names: Vec<String> = ["br0", "br1", "sync0", "rad0", "gw0", "wan0", "wan0-p", "wanc-p", "blnet-p"]
+    let mut names: Vec<String> = ["br1", "sync0", "rad0", "gw0", "wan0", "wan0-p", "wanc-p", "blnet-p"]
         .iter()
         .map(|s| (*s).to_owned())
         .collect();
     for i in 0..ports {
+        names.push(format!("bra{i}"));
         names.extend([format!("acc{i}"), format!("acc{i}-p"), format!("accc{i}-p"), format!("cpe{i}-p")]);
     }
     for l in &names {
