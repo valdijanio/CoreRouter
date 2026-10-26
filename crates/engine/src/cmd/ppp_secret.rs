@@ -172,16 +172,12 @@ fn check_routes(s: &Session, x: &PppSecret) -> Result<Vec<String>> {
             )),
             _ => {}
         }
-        for a in s.ppp_active().iter().filter(|a| a.name != x.name) {
-            if let Some(held) = a.routes.iter().find(|h| {
-                h.route
-                    .split_whitespace()
-                    .next()
-                    .and_then(|t| t.parse::<ipnet::IpNet>().ok())
-                    .is_some_and(|n| overlaps(&n, &dst))
-            }) {
-                w.push(format!("{dst} overlaps {} held now by {} ({}): refused at login while that session is up", held.route, a.name, held.origin.label()));
-            }
+        if let Some((n, h)) = s
+            .ext::<crate::framed::FramedTable>()
+            .and_then(|t| t.conflict(&dst, ""))
+            .filter(|(_, h)| h.user != x.name)
+        {
+            w.push(format!("{dst} overlaps {n} held now by {} ({}): refused at login while that session is up", h.user, h.origin.label()));
         }
     }
     Ok(w)

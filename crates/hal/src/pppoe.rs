@@ -66,4 +66,12 @@ pub struct PppoeCounters {
 pub enum PppoeOp {
     Upsert(u32, PppoeSession),
     Remove(u32),
+    /// G4.3cd: a block routed to the session at the index (`Framed-Route`,
+    /// `Framed-IPv6-Route`, `routes` of the secret), added or removed. Add
+    /// it after the session's `Upsert`, remove it before its `Remove`.
+    Route {
+        dst: ipnet::IpNet,
+        idx: u32,
+        add: bool,
+    },
 }

@@ -323,7 +323,7 @@ pub fn root_test(root: &Path) -> Outcome {
 
 /// The root tests and how long each may take (seconds; a few times what
 /// they take on the CI runner).
-const XDP_TESTS: [(&str, u32); 15] = [
+const XDP_TESTS: [(&str, u32); 17] = [
     ("loads_attaches_and_counts", 60),
     ("kernel_and_host_agree", 60),
     ("perf_lpm_cost", 180),
@@ -339,6 +339,8 @@ const XDP_TESTS: [(&str, u32); 15] = [
     ("perf_pppoe_forward", 60),
     ("ipoe_kernel_and_host_agree", 120),
     ("pppoe_bng_ops_reach_the_maps", 60),
+    ("pppoe_routes_kernel_and_host_agree", 120),
+    ("perf_pppoe_routes_10k", 300),
 ];
 
 fn test_binary(root: &Path) -> Result<PathBuf, String> {
