@@ -9,7 +9,7 @@
 //!   outside the namespace is touched; it is deleted at the end.
 //!
 //! Options: `--root`, `--scales 1000,10000,100000`, `--radius <n>`,
-//! `--only capture,scale,radius,workers,wave,pppd`, `--wave <n>`, `--radius-cap <n/s>`, `--out <dir>` (default
+//! `--only capture,scale,radius,workers,wave,qinq,pppd`, `--wave <n>`, `--qinq <n>` (QinQ lines), `--radius-cap <n/s>`, `--out <dir>` (default
 //! `<target>/bng-lab`). BNG Blaster comes from `$BNGBLASTER` or the PATH.
 
 use std::path::{Path, PathBuf};
@@ -47,6 +47,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
             "--only" => value("BNG_LAB_ONLY"),
             "--hold" => value("BNG_LAB_HOLD"),
             "--wave" => value("BNG_LAB_WAVE"),
+            "--qinq" => value("BNG_LAB_QINQ"),
             "--radius-cap" => value("BNG_LAB_RADIUS_CAP"),
             "--blaster" => match it.next() {
                 Some(v) => {
