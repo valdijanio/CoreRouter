@@ -147,8 +147,8 @@ cima.
 
 - **Subida**, numa porta de `IPOE_PORTS`, quadro IPv4 sem tag: DHCP para a porta 67 passa ao daemon
   (`ipoe-dhcp`); o MAC que o mapa não conhece segue como sem IPoE (o kernel decide); do MAC de uma
-  sessão para o MAC do BNG, a origem tem de ser o endereço da sessão (amarração IP↔MAC, TR-146
-  R-38; senão `spoofed` e descarte), depois o policer e os contadores, e o quadro segue **intacto**
+  sessão para o MAC do BNG, a origem tem de ser o endereço da sessão ou estar num bloco roteado a
+  ela (G4.3cd) (amarração IP↔MAC, TR-146 R-38; senão `spoofed` e descarte), depois o policer e os contadores, e o quadro segue **intacto**
   (não há cabeçalho a tirar) para o filtro, o CGNAT rápido e o kernel.
 - **Descida**: o mesmo policer e os contadores, e o kernel encaminha como sempre
   (`ipoe-down-kernel`): o firewall `forward` e o ARP do kernel continuam vendo o tráfego, e o caminho

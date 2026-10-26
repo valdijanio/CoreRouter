@@ -12,6 +12,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, PoisonError, RwLock};
 
 use corerouter_model::Config;
+use corerouter_model::radius::Attribute;
 use corerouter_model::framed_route::{FramedRoute, RouteOrigin, RouteSet, SessionRoute, overlaps};
 use ipnet::IpNet;
 
@@ -246,15 +247,16 @@ pub fn check(r: &FramedRoute, ipv4: Option<Ipv4Addr>, forbidden: &Forbidden) -> 
 }
 
 /// Install what can be installed of `want` for session `holder` (at most
-/// [`MAX_ROUTES`](corerouter_model::framed_route::MAX_ROUTES); IPv6 only
-/// with `v6`): each route is checked, then claimed in `table`.
+/// [`MAX_ROUTES`](corerouter_model::framed_route::MAX_ROUTES); IPv6 refused
+/// with `v6_refusal` when the service cannot carry it): each route is
+/// checked, then claimed in `table`.
 pub fn admit(
     table: &FramedTable,
     forbidden: &Forbidden,
     want: &[(FramedRoute, RouteOrigin)],
     holder: &Holder,
     ipv4: Option<Ipv4Addr>,
-    v6: bool,
+    v6_refusal: Option<&str>,
 ) -> Admitted {
     let mut out = Admitted::default();
     for (r, origin) in want {
@@ -262,8 +264,8 @@ pub fn admit(
             out.refused.push(format!("{}: mais de {} rotas", r.dst, corerouter_model::framed_route::MAX_ROUTES));
             continue;
         }
-        if r.is_v6() && !v6 {
-            out.refused.push(format!("{}: IPv6 só com o plano de dados XDP (sem XDP, G4.3l)", r.dst));
+        if let (true, Some(why)) = (r.is_v6(), v6_refusal) {
+            out.refused.push(format!("{}: {why}", r.dst));
             continue;
         }
         if let Some((o, _)) = out.routes.iter().find(|(o, _)| overlaps(&o.dst, &r.dst)) {
@@ -297,6 +299,73 @@ pub fn admit(
         }
     }
     out
+}
+
+/// The routes a CoA gives a session: each family present replaces all the
+/// session's routes of that family (`Framed-Route ""`: none).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RouteChange {
+    pub v4: bool,
+    pub v6: bool,
+    pub routes: Vec<(FramedRoute, RouteOrigin)>,
+    /// Texts that did not parse: the whole change is refused.
+    pub invalid: Vec<String>,
+}
+
+impl RouteChange {
+    /// Whether this change replaces the session's routes of `r`'s family.
+    pub fn replaces(&self, r: &FramedRoute) -> bool {
+        if r.is_v6() { self.v6 } else { self.v4 }
+    }
+}
+
+/// The route attributes of a CoA, if it has any: every `Framed-Route`
+/// and `Framed-IPv6-Route` (RFC 2865 §5.22, RFC 3162 §2.5), repeated. A
+/// family present replaces that family's routes; a value of `""` alone
+/// clears it.
+pub fn route_change(changes: &[Attribute]) -> Option<RouteChange> {
+    let v4 = changes.iter().any(|a| a.name == "Framed-Route");
+    let v6 = changes.iter().any(|a| a.name == "Framed-IPv6-Route");
+    if !v4 && !v6 {
+        return None;
+    }
+    let (routes, invalid) = from_radius(
+        changes
+            .iter()
+            .filter(|a| a.name != "Framed-IPv6-Prefix")
+            .map(|a| (a.name.as_str(), a.value.as_str())),
+    );
+    Some(RouteChange { v4, v6, routes, invalid })
+}
+
+/// Whether session `id` (IPv4 `ip`) may take the routes of `c`: each is
+/// valid and no other session holds an overlapping block (RFC 5176 §3.5:
+/// checked before the ACK, the whole request or nothing). `Err`: why, in
+/// Portuguese.
+pub fn check_change(
+    table: &FramedTable,
+    forbidden: &Forbidden,
+    id: &str,
+    ip: Option<Ipv4Addr>,
+    c: &RouteChange,
+) -> Result<(), String> {
+    if let Some(why) = c.invalid.first() {
+        return Err(why.clone());
+    }
+    let max = corerouter_model::framed_route::MAX_ROUTES;
+    if c.routes.len() > max {
+        return Err(format!("mais de {max} rotas"));
+    }
+    for (k, (r, _)) in c.routes.iter().enumerate() {
+        check(r, ip, forbidden)?;
+        if let Some((n, h)) = table.conflict(&r.dst, id) {
+            return Err(format!("{}: sobrepõe {n}, já roteado para {}", r.dst, h.user));
+        }
+        if let Some((o, _)) = c.routes.iter().take(k).find(|(o, _)| overlaps(&o.dst, &r.dst)) {
+            return Err(format!("{}: sobrepõe {} do mesmo pedido", r.dst, o.dst));
+        }
+    }
+    Ok(())
 }
 
 /// Give back every route of a session.
@@ -347,17 +416,17 @@ mod tests {
         let t = FramedTable::default();
         let f = Forbidden::default();
         let want = vec![(r("203.0.113.8/29"), RouteOrigin::FramedRoute), (r("2001:db8:100::/48"), RouteOrigin::FramedIpv6Route)];
-        let a = admit(&t, &f, &want, &h("*1-1", "a"), Some("100.64.0.1".parse().unwrap()), true);
+        let a = admit(&t, &f, &want, &h("*1-1", "a"), Some("100.64.0.1".parse().unwrap()), None);
         assert_eq!(a.routes.len(), 2);
         // Same session again (a CoA with the same block): no conflict.
         assert_eq!(t.claim(r("203.0.113.8/29").dst, h("*1-1", "a")), Ok(false));
-        let b = admit(&t, &f, &[(r("203.0.113.0/28"), RouteOrigin::Secret)], &h("*1-2", "b"), None, true);
+        let b = admit(&t, &f, &[(r("203.0.113.0/28"), RouteOrigin::Secret)], &h("*1-2", "b"), None, None);
         assert!(b.routes.is_empty() && b.refused[0].contains("já roteado para a"), "{b:?}");
         assert_eq!(t.holder_of("203.0.113.9".parse().unwrap()).map(|x| x.1.user), Some("a".into()));
         release_all(&t, &a.routes, "*1-1");
         assert!(t.is_empty());
         // Another session's release does not take what it does not hold.
-        let _ = admit(&t, &f, &want, &h("*1-1", "a"), None, true);
+        let _ = admit(&t, &f, &want, &h("*1-1", "a"), None, None);
         release_all(&t, &a.routes, "*9-9");
         assert_eq!(t.len(), 2);
         t.forget("ipoe");
@@ -387,7 +456,7 @@ mod tests {
             (r("203.0.113.20/30"), RouteOrigin::FramedRoute),
             (r("2001:db8::/48"), RouteOrigin::FramedIpv6Route),
         ];
-        let a = admit(&t, &f, &want, &h("*1-1", "a"), ip, false);
+        let a = admit(&t, &f, &want, &h("*1-1", "a"), ip, Some("IPv6 sem XDP"));
         assert_eq!(a.rows().iter().map(|x| x.route.as_str()).collect::<Vec<_>>(), ["203.0.113.16/29 192.0.2.1 1"]);
         let text = a.refused.join("\n");
         for part in ["pool cgnat", "bloco especial", "não é o assinante", "mesma sessão", "sem XDP"] {

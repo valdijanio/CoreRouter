@@ -168,9 +168,11 @@ fn check_routes(s: &Session, x: &PppSecret) -> Result<Vec<String>> {
                 w.push(format!("{dst} is inside {} of {}: hosts of that network in the block stop being reachable there", a.address.trunc(), a.interface));
             }
         }
-        if let Some(o) = c.ppp.secrets.iter().find(|o| {
-            o.id != x.id && o.remote_address.is_some_and(|ip| dst.contains(&IpAddr::V4(ip)))
-        }) {
+        let fixed = match dst {
+            ipnet::IpNet::V4(n) => c.ppp.secrets.fixed_in(&n),
+            ipnet::IpNet::V6(_) => Vec::new(),
+        };
+        if let Some(o) = fixed.into_iter().find(|o| o.id != x.id) {
             return bad(format!("{dst} holds {}, the fixed address of secret {}", o.remote_address.map_or_else(String::new, |ip| ip.to_string()), o.name));
         }
         match (r.gateway, x.remote_address) {
@@ -228,7 +230,7 @@ fn warnings(s: &Session, x: &PppSecret) -> Result<Vec<String>> {
         w.push("empty password: anyone who knows the name logs in".into());
     }
     if let Some(ip) = x.remote_address {
-        if let Some(other) = c.ppp.secrets.iter().find(|o| o.id != x.id && o.remote_address == Some(ip)) {
+        if let Some(other) = c.ppp.secrets.fixed_in(&ipnet::Ipv4Net::from(ip)).into_iter().find(|o| o.id != x.id) {
             w.push(format!("remote_address {ip} is also the address of secret {}", other.name));
         }
         if let Some(pool) = c.ip.pools.pools.iter().find(|p| p.contains(ip)) {
@@ -613,6 +615,76 @@ mod tests {
         s.execute("config.discard", &json!({})).unwrap();
         let e = s.execute("ppp.secret.add", &json!({"name": "e", "password": "x", "routes": "203.0.113.8/29"})).unwrap_err();
         assert!(e.to_string().contains("secret a"), "{e}");
+    }
+
+    /// Measured (`--ignored --nocapture`, release): 100 000 secrets with a
+    /// fixed address, then 1000 business secrets with a routed block each.
+    #[test]
+    #[ignore]
+    fn measure_plain_adds_by_size() {
+        for n in [1_000u32, 20_000, 100_000] {
+            let mut s = Session::virtual_lab();
+            let steps: Vec<Value> = (0..n)
+                .map(|i| json!({"command": "ppp.secret.add", "params": {"name": format!("c{i}"), "password": "x"}}))
+                .collect();
+            for chunk in steps.chunks(20_000) {
+                s.batch(&Value::Array(chunk.to_vec()), true).unwrap();
+            }
+            let t = std::time::Instant::now();
+            for i in 0..200 {
+                s.execute("ppp.secret.add", &json!({"name": format!("p{i}"), "password": "x"})).unwrap();
+            }
+            let one = t.elapsed() / 200;
+            let steps: Vec<Value> = (0..200).map(|i| json!({"command": "ppp.secret.add", "params": {"name": format!("q{i}"), "password": "x"}})).collect();
+            let t = std::time::Instant::now();
+            s.batch(&Value::Array(steps), true).unwrap();
+            println!("MEASURED: {n} secrets: one add alone {one:?}, in a batch {:?}", t.elapsed() / 200);
+            let t = std::time::Instant::now();
+            for i in 0..200 {
+                let x = PppSecret { name: format!("r{i}"), ..PppSecret::default() };
+                s.store_mut().candidate_mut().ppp.secrets.push(x);
+            }
+            let push = t.elapsed() / 200;
+            let t = std::time::Instant::now();
+            for i in 0..200 {
+                let _ = s.store().candidate().ppp.secret(&format!("c{i}"));
+            }
+            let find = t.elapsed() / 200;
+            let t = std::time::Instant::now();
+            for _ in 0..20 {
+                let _ = s.store().candidate().clone();
+            }
+            let snap = t.elapsed() / 20;
+            let t = std::time::Instant::now();
+            for i in 0..20 {
+                let _ = super::super::check_params(super::super::find("ppp.secret.add").unwrap(), &json!({"name": format!("z{i}")}));
+            }
+            println!("  push {push:?}, lookup {find:?}, candidate clone {snap:?}, check_params {:?}", t.elapsed() / 20);
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn measure_routes_against_a_hundred_thousand_secrets() {
+        let mut s = Session::virtual_lab();
+        let steps: Vec<Value> = (0..100_000u32)
+            .map(|i| json!({"command": "ppp.secret.add", "params": {"name": format!("c{i}"), "password": "x", "remote_address": format!("100.{}.{}.{}", 64 + (i >> 16), (i >> 8) & 255, i & 255)}}))
+            .collect();
+        for chunk in steps.chunks(20_000) {
+            s.batch(&Value::Array(chunk.to_vec()), true).unwrap();
+        }
+        let steps: Vec<Value> = (0..1000u32)
+            .map(|i| json!({"command": "ppp.secret.add", "params": {"name": format!("e{i}"), "password": "x", "routes": format!("20.{}.{}.0/29", i >> 8, i & 255)}}))
+            .collect();
+        let t = std::time::Instant::now();
+        s.batch(&Value::Array(steps), true).unwrap();
+        println!("MEASURED: 1000 secrets with routes over 100 000 secrets: {:?}", t.elapsed());
+        let steps: Vec<Value> = (0..1000u32)
+            .map(|i| json!({"command": "ppp.secret.add", "params": {"name": format!("p{i}"), "password": "x"}}))
+            .collect();
+        let t = std::time::Instant::now();
+        s.batch(&Value::Array(steps), true).unwrap();
+        println!("MEASURED: 1000 plain secrets over 101 000 secrets: {:?}", t.elapsed());
     }
 
     #[test]

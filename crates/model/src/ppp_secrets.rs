@@ -42,11 +42,36 @@ struct Index {
 /// hand): a removal rebuilds, so the next claimant takes it over.
 type RouteIndex = Arc<(RouteSet<ItemId>, bool)>;
 
+/// Fixed `remote_address` → secrets, bucketed by /24 (the high 24 bits),
+/// so a range of a few blocks reads a few buckets (G4.3cd).
+type FixedIndex = CowMap<u32, Vec<(u32, ItemId)>>;
+
 #[derive(Default)]
 pub struct Secrets {
     list: CowList<PppSecret>,
     index: OnceLock<Index>,
     routes: OnceLock<RouteIndex>,
+    fixed: OnceLock<FixedIndex>,
+}
+
+fn fixed_add(m: &mut FixedIndex, ip: std::net::Ipv4Addr, id: ItemId) {
+    let ip = u32::from(ip);
+    let mut v = m.get(&(ip >> 8)).cloned().unwrap_or_default();
+    v.push((ip, id));
+    m.insert(ip >> 8, v);
+}
+
+fn fixed_drop(m: &mut FixedIndex, ip: std::net::Ipv4Addr, id: ItemId) {
+    let ip = u32::from(ip);
+    let Some(mut v) = m.get(&(ip >> 8)).cloned() else {
+        return;
+    };
+    v.retain(|&x| x != (ip, id));
+    if v.is_empty() {
+        m.remove(&(ip >> 8));
+    } else {
+        m.insert(ip >> 8, v);
+    }
 }
 
 impl Secrets {
@@ -59,7 +84,51 @@ impl Secrets {
             list,
             index: OnceLock::new(),
             routes: OnceLock::new(),
+            fixed: OnceLock::new(),
         }
+    }
+
+    fn fixed_index(&self) -> &FixedIndex {
+        self.fixed.get_or_init(|| {
+            let mut m = FixedIndex::new();
+            for s in &self.list {
+                if let Some(ip) = s.remote_address {
+                    fixed_add(&mut m, ip, s.id);
+                }
+            }
+            m
+        })
+    }
+
+    /// The secrets whose fixed `remote_address` is inside `net`, in list
+    /// order (G4.3cd: a routed block must not take another subscriber's
+    /// fixed address; a walk of every secret per block made an import of
+    /// business secrets O(n²): 634 µs each over 100 000, **medido**). Reads
+    /// one bucket per /24 of `net`, or every bucket when there are fewer.
+    pub fn fixed_in(&self, net: &ipnet::Ipv4Net) -> Vec<&PppSecret> {
+        let (a, b) = (u32::from(net.network()), u32::from(net.broadcast()));
+        let m = self.fixed_index();
+        let inside = |&(ip, _): &(u32, ItemId)| (a..=b).contains(&ip);
+        let mut ids: Vec<ItemId> = if u64::from((b >> 8) - (a >> 8)) < m.len() as u64 {
+            (a >> 8..=b >> 8)
+                .filter_map(|k| m.get(&k))
+                .flat_map(|v| v.iter().copied().filter(inside))
+                .map(|(_, id)| id)
+                .collect()
+        } else {
+            m.iter()
+                .flat_map(|(_, v)| v.iter().copied().filter(inside))
+                .map(|(_, id)| id)
+                .collect()
+        };
+        ids.sort_unstable();
+        ids.dedup();
+        let mut out: Vec<(usize, &PppSecret)> = ids
+            .into_iter()
+            .filter_map(|id| self.position(id).and_then(|i| self.list.get(i).map(|s| (i, s))))
+            .collect();
+        out.sort_by_key(|(i, _)| *i);
+        out.into_iter().map(|(_, s)| s).collect()
     }
 
     fn route_index(&self) -> &RouteIndex {
@@ -130,6 +199,11 @@ impl Secrets {
 
     /// The indexes learn that `s` is in the list.
     fn index_add(&mut self, s: &PppSecret) {
+        if let Some(fx) = self.fixed.get_mut()
+            && let Some(ip) = s.remote_address
+        {
+            fixed_add(fx, ip, s.id);
+        }
         if let Some(ix) = self.index.get_mut() {
             if ix.by_name.contains_key(s.name.as_str()) {
                 // A name twice (the commands refuse it): which one is
@@ -152,6 +226,11 @@ impl Secrets {
     /// The indexes forget `s` (already out of the list, or about to be
     /// replaced). A duplicated name or route makes them rebuild instead.
     fn index_drop(&mut self, s: &PppSecret) {
+        if let Some(fx) = self.fixed.get_mut()
+            && let Some(ip) = s.remote_address
+        {
+            fixed_drop(fx, ip, s.id);
+        }
         if let Some(ix) = self.index.get_mut() {
             if ix.dup {
                 self.index = OnceLock::new();
@@ -191,16 +270,17 @@ impl Secrets {
     /// block of the list is copied.
     pub fn update<R>(&mut self, i: usize, f: impl FnOnce(&mut PppSecret) -> R) -> Option<R> {
         let old = self.list.get(i)?;
-        let (name, routes, id) = (old.name.clone(), old.routes.clone(), old.id);
+        let (name, routes, id, fixed) = (old.name.clone(), old.routes.clone(), old.id, old.remote_address);
         let x = self.list.get_mut(i)?;
         let r = f(x);
-        let keys_moved = x.name != name || x.routes != routes || x.id != id;
+        let keys_moved = x.name != name || x.routes != routes || x.id != id || x.remote_address != fixed;
         if keys_moved {
             let now = x.clone();
             let before = PppSecret {
                 id,
                 name,
                 routes,
+                remote_address: fixed,
                 ..PppSecret::default()
             };
             self.index_drop(&before);
@@ -237,10 +317,15 @@ impl Clone for Secrets {
         if let Some(rx) = self.routes.get() {
             let _ = routes.set(Arc::clone(rx));
         }
+        let fixed = OnceLock::new();
+        if let Some(fx) = self.fixed.get() {
+            let _ = fixed.set(fx.clone());
+        }
         Self {
             list: self.list.clone(),
             index,
             routes,
+            fixed,
         }
     }
 }
@@ -258,6 +343,7 @@ impl DerefMut for Secrets {
     fn deref_mut(&mut self) -> &mut CowList<PppSecret> {
         self.index = OnceLock::new();
         self.routes = OnceLock::new();
+        self.fixed = OnceLock::new();
         &mut self.list
     }
 }
@@ -304,11 +390,7 @@ impl Serialize for Secrets {
 
 impl<'de> Deserialize<'de> for Secrets {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        CowList::<PppSecret>::deserialize(d).map(|list| Self {
-            list,
-            index: OnceLock::new(),
-            routes: OnceLock::new(),
-        })
+        CowList::<PppSecret>::deserialize(d).map(Self::from_list)
     }
 }
 
@@ -388,6 +470,30 @@ mod tests {
     }
 
     #[test]
+    fn fixed_addresses_by_range_follow_writes() {
+        let fixed = |name: &str, ip: &str| PppSecret {
+            id: next_id(),
+            name: name.into(),
+            remote_address: Some(ip.parse().unwrap()),
+            ..PppSecret::default()
+        };
+        let net = |t: &str| t.parse::<ipnet::Ipv4Net>().unwrap();
+        let names = |v: &Secrets, t: &str| -> Vec<String> { v.fixed_in(&net(t)).iter().map(|s| s.name.clone()).collect() };
+        let mut v = Secrets::new(vec![fixed("a", "203.0.113.9"), s("b", "x")]);
+        assert_eq!(names(&v, "203.0.113.8/29"), ["a"]);
+        v.push(fixed("c", "203.0.113.10"));
+        assert_eq!(names(&v, "203.0.113.8/29"), ["a", "c"]);
+        assert!(names(&v, "203.0.113.16/29").is_empty());
+        let copy = v.clone();
+        v.remove(0);
+        assert_eq!(names(&v, "203.0.113.0/24"), ["c"]);
+        assert_eq!(names(&copy, "203.0.113.0/16"), ["a", "c"]);
+        v.update(1, |x| x.remote_address = Some("198.51.100.1".parse().unwrap()));
+        assert!(names(&v, "203.0.113.0/24").is_empty());
+        assert_eq!(names(&v, "0.0.0.0/0"), ["c"]);
+    }
+
+    #[test]
     fn serialized_like_the_list() {
         let v = Secrets::new(vec![s("a", "1")]);
         let j = serde_json::to_value(&v).unwrap();
@@ -418,7 +524,13 @@ mod tests {
                         v.push(x);
                     }
                     1 if n > 0 => { v.update(usize::from(a) % n, |x| x.name = format!("u{b}")); }
-                    2 if n > 0 => { v.update(usize::from(a) % n, |x| x.routes = crate::framed_route::FramedRoute::parse_list(&net(b)).unwrap()); }
+                    2 if n > 0 => {
+                        let _ = v.fixed_in(&"10.0.0.0/24".parse().unwrap());
+                        v.update(usize::from(a) % n, |x| {
+                            x.routes = crate::framed_route::FramedRoute::parse_list(&net(b)).unwrap();
+                            x.remote_address = (b > 2).then(|| std::net::Ipv4Addr::new(10, 0, 0, b));
+                        });
+                    }
                     3 if n > 0 => { v.remove(usize::from(a) % n); }
                     _ => {}
                 }
@@ -426,6 +538,9 @@ mod tests {
                 copies.push(v.clone());
             }
             for c in &copies {
+                let fixed: Vec<ItemId> = c.fixed_in(&"10.0.0.0/29".parse().unwrap()).iter().map(|x| x.id).collect();
+                let walk: Vec<ItemId> = c.iter().filter(|x| x.remote_address.is_some_and(|ip| ip.octets()[3] < 8 && ip.octets()[..3] == [10, 0, 0])).map(|x| x.id).collect();
+                proptest::prop_assert_eq!(fixed, walk);
                 for k in 0..40 {
                     let name = format!("u{k}");
                     let walk = c.iter().find(|x| x.name == name).map(|x| x.id);
