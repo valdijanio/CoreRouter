@@ -172,7 +172,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L3 | `crates/engine` | `Session::execute`, `CommandSpec`/`cmd!`, checagem de params, **permissão por grupo** (`auth`: `Principal` do `Caller`, Argon2id), guard de panic, commit/rollback, batch, journal (sem segredos), tabela de vizinhos (estado operacional), tarefas das ferramentas (`tasks`, `tools/`: ping, MTU, MTR; G6.1–G6.3), clientes DHCP em execução (`dhcp_client`: `Session::dhcp_service`, concessões como entradas dinâmicas vistas pelo HAL em `Session::effective`; G4.7; DHCPv6 em `dhcp6_client`, com os endereços `from_pool` resolvidos no mesmo `effective`, G4.7b) | L0–L2 (nunca plataforma) |
 | L4 | `crates/control` | Canal JSON-por-linha (TCP em loopback ou TLS em qualquer endereço), WebSocket com lista de `Origin` (+ arquivos da GUI web), `dispatch`, `Host`, `Client`; G0.3: `auth::Gate` (login, tokens, limite de força bruta), `local_token`, `tls` (rustls, pinagem), `known_hosts` (TOFU), `dial`; `ThreadRunner` das tarefas (G6.1) | L0–L3 |
 | L4 | `crates/discovery` | Runtime do CRDP (sockets UDP + threads std, `socket2`): `Agent` do daemon (anuncia, escuta, alimenta `Session::record_neighbor`) e `Listener` passivo da GUI nativa; não compila para wasm | L0–L3 |
-| L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev` e um `rev-<n>.json` por revisão, escrita atômica | L0–L3 |
+| L4 | `crates/storage-fs` | `ConfigStorage` em diretório (`/config`): `running.json` + `.prev`, um `rev-<n>.json` por revisão e o journal de commits `journal-config.log` (G0.22), escrita atômica | L0–L3 |
 | L4 | `crates/shell` | Terminal estilo RouterOS gerado do `engine.list`: parser, Tab, cores, `print`, `/export`/`/import`. Puro (sem I/O, wasm): pede chamadas do canal de controle ao front end (janela da GUI, `corerouter-cli shell`, SSH). Veja `docs/terminal.md` | `serde_json` (nada do workspace; testes usam o engine) |
 | L4 | `crates/mcp` | Servidor MCP stdio; backends `Headless`/`Remote` | L0–L3, `control` (lateral permitido) |
 | L5 | `crates/ui` | Painéis WinBox em egui puro (sem eframe); trait `Backend` assíncrono + `Local`; janelas novas são **painéis** (`panel.rs`: `pub(crate) const PANEL` num arquivo, descoberto pelo `build.rs` com os módulos e os testes de `src/tests/`) | L0–L4 + egui |
@@ -322,6 +322,27 @@ A diferença (`model::json_delta`) é estrutural, sobre o JSON da config. Objeto
 copiados `[início, tamanho]` e itens novos `{"i": […]}`. Listas sem id, por prefixo e sufixo
 comuns. Trocar uma entrada numa address-list de 65 536 grava essa entrada e dois trechos (menos de
 200 bytes); trocar a seção inteira gravaria a lista toda (~4 MiB).
+
+Journal da config (G0.22): com o histórico em arquivos o commit ainda reescrevia o slot com a
+config inteira (e a serializava para medir o tamanho): 219 ms por `ppp.secret.add` com 100 mil
+secrets, 6 ms por commit com 10 mil rotas (**medido**). Num backend com `config_journal()` (os dois
+de baixo) o commit grava só uma linha no journal `config` (`journal-config.log`): a diferença
+para a frente da revisão anterior para a nova, no formato dos arquivos de revisão
+(`persist::encode_journal_line`). O slot só é reescrito num *checkpoint*: com mais de 1024 linhas
+ou mais de ¼ da config (no mínimo 1 MiB) em linhas, com usuários mudados, ou enquanto não existem
+os dois slots. No boot as linhas que encadeiam a partir do slot carregado são reaplicadas (por
+bloco: um trecho copiado reaproveita os blocos da `CowList`); linha que não encadeia ou ilegível
+encerra o replay (`storage.boot_errors`), última linha cortada (queda no meio do append) só é
+descartada, e o próximo save faz checkpoint em vez de anexar depois dela. No checkpoint o journal
+fica só com as linhas posteriores à revisão que virou o slot `previous`, então `previous` + journal
+sempre dão a revisão mais nova: perder o slot corrente não perde mais o último commit (antes
+perdia). O limite de tamanho por commit usa um teto (config do slot + bytes das linhas desde ele;
+uma linha só pode crescer a config com o que carrega) e mede a config de verdade só quando o teto
+passa do limite. Comparado com só gravar o slot sem fsync, ou um banco embutido: o journal mantém
+o formato que versões anteriores leem no slot, um fsync pequeno por commit e nenhuma dependência.
+Risco aceito: um build anterior ao G0.22 que bootar este diretório lê só o slot e perde as linhas
+desde o último checkpoint; até a G0.27 (checkpoint no desligamento do daemon), voltar de versão
+pede um checkpoint antes (mudar um usuário força um).
 
 As seções grandes são `CowArc` (G0.16), e `model::config_delta` trabalha seção por seção nos dois
 sentidos:

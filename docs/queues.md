@@ -133,6 +133,32 @@ Custo por pacote da subida PPPoE (`pppoe_scale_100k_sessions`, `BPF_PROG_TEST_RU
 `main`, 172–176 ns agora (dentro da variação da rodada). EDT × HTB: `docs/architecture.md`, "Filas:
 EDT × HTB".
 
+## Laboratório em massa (G4.9d)
+
+`cargo xtask bng-lab --root --only shaping --shaping <n>` sobe `n` sessões PPPoE pelo BNG Blaster
+com o perfil `default`, manda fluxos a 2× o plano nos dois sentidos e mede a descida segurada
+primeiro pelo policer do XDP (`download_mode=policer`) e depois pelo shaper (`shaper`, o padrão).
+Acima de 100 sessões o plano encolhe (100/n de `1M/2M`) para o BNG Blaster oferecer os mesmos
+~75 mil pacotes/s: um gerador só não manda os 750 mil de 1000 sessões a `1M/2M` (**medido**: saía
+~40% do pedido). A etapa falha se a descida moldada sair de ±5% do plano; a do policer só é
+medida.
+
+**Medido** (VM, 8 vCPUs, kernel 7.0, BNG Blaster 1.0.1, release, pacotes de 1000 B, janela de
+10 s, 2026-10-26):
+
+| sessões | plano | shaper: descida/limite (mín–máx) | fila média (máx) | policer: descida/limite (mín–máx) | CPU shaper / policer |
+|---:|---|---|---|---|---|
+| 100 | 1M/2M | 1,002 (0,994–1,011) | 50 ms (109) | 1,000 (0,998–1,004) | 3,4% / 2,3% |
+| 1 000 | 100k/200k | 1,015 (0,970–1,041) | 120 ms (212) | 0,987 (0,921–1,044) | 6,5% / 3,2% |
+| 10 000 | 10k/20k | 1,023 (0,961–1,058) | 808 ms (1117) | 1,077 (0,997–1,145) | 8,3% / 4,6% |
+
+A fila longa a 10k/20k não é defeito: um pacote de 1000 B leva 0,4 s a 20 kbit/s, e o alvo de
+5 ms do CoDel não cabe abaixo de um pacote. O policer erra mais nas taxas baixas porque o balde
+(0,1 s da taxa) tem dois ou três pacotes.
+
+O laboratório achou a correção de #260: no modo padrão a descida saía sem limite (2× o plano),
+porque o bit `ON_SESSIONS` só era escrito com o plano, antes das sessões.
+
 ## Pesquisa
 
 Fontes abertas em 2026-10-26.

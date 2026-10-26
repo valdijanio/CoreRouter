@@ -786,8 +786,9 @@ impl QueueType {
 #[serde(default, deny_unknown_fields)]
 pub struct Queues {
     /// In order: the first queue whose target holds an address wins.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub simple: Vec<SimpleQueue>,
+    /// A block list (G0.21): 10 000 queues and more on a big BNG.
+    #[serde(skip_serializing_if = "crate::cow_list::CowList::is_empty")]
+    pub simple: crate::cow_list::CowList<SimpleQueue>,
     /// Types the operator added or changed (built-ins exist without an
     /// entry; an entry with a built-in's name is the edited copy).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -860,10 +861,16 @@ impl Queues {
 
     /// A free `queue<N>` name (RouterOS names new queues so).
     pub fn free_name(&self) -> String {
+        // One pass over the names (a lookup per candidate made adding
+        // 10 000 auto-named queues quadratic, G4.9c).
+        let used: std::collections::HashSet<u64> = self
+            .simple
+            .iter()
+            .filter_map(|q| q.name.strip_prefix("queue")?.parse().ok())
+            .collect();
         (1..)
-            .map(|i| format!("queue{i}"))
-            .find(|n| self.simple_by_name(n).is_none())
-            .unwrap_or_else(|| "queue".into())
+            .find(|i| !used.contains(i))
+            .map_or_else(|| "queue".into(), |i| format!("queue{i}"))
     }
 }
 
