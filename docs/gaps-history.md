@@ -133,3 +133,15 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-25 — G4.3f: IPoE parte 1 (servidor DHCP que autoriza cada cliente, `use_radius`, `ipoe`, `/ppp secret service=ipoe`)
 - 2026-10-25 — G4.3f feito (IPoE: DHCP + opção 82 como sessão, RADIUS, XDP, janela PPP)
 - 2026-10-25 — G4.3g feito em parte (laboratório em massa, BNG em vários núcleos, onda pela capacidade do RADIUS, relatório docs/pppoe-relatorio.md)
+- 2026-10-26 — G4.3h em andamento (crate proto-ha, desenho e pesquisa)
+- 2026-10-26 — G4.3h: modelo e comandos ppp.redundancy
+- 2026-10-26 — G4.3h: serviço ppp-ha no daemon
+- 2026-10-26 — G4.3k parte 1 (tabela de Service-Names: modelo, comandos, AC, perfil por nome)
+- 2026-10-26 — G4.3k feito (vários Service-Names por porta)
+- 2026-10-26 — G4.9 criado (filas genéricas por alvo, decisão do usuário em 2026-10-26) com G4.9a–e; G4.9a feito (modelo e comandos)
+- 2026-10-26 — G4.3ca feito (entrega pelo kernel ao assinante PPPoE por `bng0`, shaping EDT)
+- 2026-10-26 — G4.3cc feito (policer sem corrida entre CPUs: GCRA + cmpxchg)
+- 2026-10-26 — G4.3h: proto-pppoe exporta e importa sessões (hot standby)
+- 2026-10-26 — G4.3h: registro da sessão para a tomada
+- 2026-10-26 — G4.3h: aba PPP › Redundancy
+- 2026-10-26 — G4.9b feito (plano de dados das filas: EDT, policer GCRA, PCQ); G4.9f criado (GSO no shaper)

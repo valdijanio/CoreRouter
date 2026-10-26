@@ -15,7 +15,7 @@ use std::str::FromStr;
 use ipnet::IpNet;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
-use crate::cow::CowArc;
+use crate::cow_list::CowList;
 use crate::types::{IfName, ItemId, ParseError};
 
 /// Implements Serialize/Deserialize through `Display` + `FromStr`.
@@ -1257,10 +1257,11 @@ pub struct DynamicAddress {
 #[serde(default, deny_unknown_fields)]
 pub struct Firewall {
     // Each table is shared between copies of the config until written (G0.16).
-    pub filter: CowArc<Vec<FirewallRule>>,
-    pub nat: CowArc<Vec<FirewallRule>>,
-    pub mangle: CowArc<Vec<FirewallRule>>,
-    pub address_lists: CowArc<Vec<AddressListEntry>>,
+    pub filter: CowList<FirewallRule>,
+    pub nat: CowList<FirewallRule>,
+    pub mangle: CowList<FirewallRule>,
+    /// Static entries, with an index of what each list holds (G0.21).
+    pub address_lists: crate::address_lists::AddressLists,
     /// Next rule id (shared by the three tables; never reused).
     pub next_rule_id: u32,
     pub next_address_list_id: u32,
@@ -1271,7 +1272,7 @@ pub struct Firewall {
 }
 
 impl Firewall {
-    pub fn rules(&self, table: Table) -> &Vec<FirewallRule> {
+    pub fn rules(&self, table: Table) -> &CowList<FirewallRule> {
         match table {
             Table::Filter => &self.filter,
             Table::Nat => &self.nat,
@@ -1279,7 +1280,7 @@ impl Firewall {
         }
     }
 
-    pub fn rules_mut(&mut self, table: Table) -> &mut Vec<FirewallRule> {
+    pub fn rules_mut(&mut self, table: Table) -> &mut CowList<FirewallRule> {
         match table {
             Table::Filter => &mut self.filter,
             Table::Nat => &mut self.nat,

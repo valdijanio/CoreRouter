@@ -19,10 +19,12 @@ use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder, RouteChange};
 use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
 use corerouter_model::MacAddr;
+use corerouter_model::framed_route::{FramedRoute, RouteOrigin};
 use corerouter_model::ip_pool::IpPools;
 use corerouter_model::ppp::{
     ActiveSession, AddrOrPool, DEFAULT_PROFILE, Effective, HistoryEntry, Ppp, PppAuth, PppHook,
@@ -81,6 +83,8 @@ pub(crate) enum Effect {
     Xdp(PppoeOp),
     /// The slow path's /32 route to `bng0` (no XDP).
     Route { ip: Ipv4Addr, add: bool },
+    /// G4.3cd: a block routed to a subscriber through `bng0` (no XDP).
+    Block { dst: ipnet::Ipv4Net, add: bool },
     /// Engine commands (hooks, address lists), run under the session lock.
     Run {
         command: String,
@@ -145,6 +149,13 @@ pub(crate) struct Shared {
     by_acct: HashMap<String, String>,
     /// What each worker counts on its own (summed by [`Backend::stats`]).
     lanes: Vec<LaneStats>,
+    /// G4.3cd: CoA route changes (session id, the new routes), checked
+    /// already by [`Owner::handle`].
+    pub route_changes: Vec<(String, RouteChange)>,
+    /// What the CoA check needs: who holds which block, and the space no
+    /// subscriber may take (set by the workers with the config).
+    pub framed: FramedTable,
+    pub forbidden: Arc<Forbidden>,
 }
 
 /// One worker's share of the service counters.
@@ -496,11 +507,26 @@ impl SessionOwner for Owner {
                     .find(|a| a.name == "Mikrotik-Address-List")
                     .map(|a| a.value.clone());
                 let new_ip = req.changes.iter().any(|a| a.name == "Framed-IP-Address");
+                let change = framed::route_change(&req.changes);
+                if let Some(c) = &change
+                    && !new_ip
+                {
+                    // RFC 5176 §3.5: the whole request or nothing, so the
+                    // routes are checked here, before the ACK.
+                    for h in &hits {
+                        let ip = sh.active.get(h).and_then(|a| a.address);
+                        if let Err(why) = framed::check_change(&sh.framed, &sh.forbidden, h, ip, c)
+                        {
+                            log::info!("ppp: CoA de rotas recusado: {why}");
+                            return CoaOutcome::Nak(407); // Invalid Attribute Value
+                        }
+                    }
+                }
                 if new_ip {
                     // PPP cannot move an open IPCP to a new address: the
                     // subscriber reconnects and gets it.
                     sh.terminate.extend(hits);
-                } else if rate.is_some() || list.is_some() {
+                } else if rate.is_some() || list.is_some() || change.is_some() {
                     let bad_list = list.as_deref().is_some_and(|l| {
                         !l.is_empty() && l.parse::<corerouter_model::firewall::Name>().is_err()
                     });
@@ -512,6 +538,9 @@ impl SessionOwner for Owner {
                         return CoaOutcome::Nak(407); // Invalid Attribute Value
                     }
                     for h in hits {
+                        if let Some(c) = &change {
+                            sh.route_changes.push((h.clone(), c.clone()));
+                        }
                         if let Some(r) = &rate {
                             sh.rates.push((h.clone(), r.clone()));
                         }
@@ -963,6 +992,11 @@ struct Sub {
     /// IPv6CP is up.
     radius6: RadiusV6,
     v6: Option<Box<V6>>,
+    /// G4.3cd: the routes the secret or RADIUS gave (installed at Up), the
+    /// RADIUS texts already refused, and the routes installed.
+    want_routes: Vec<(FramedRoute, RouteOrigin)>,
+    want_refused: Vec<String>,
+    routes: Vec<(FramedRoute, RouteOrigin)>,
 }
 
 /// What the hot paths look up in [`Bng::subs`] without walking it
@@ -1044,6 +1078,12 @@ pub(crate) struct Snapshot {
     /// driver, so a line keeps its link-local across restarts); `None`:
     /// one drawn from the seed, for this run.
     pub iid_key: Option<[u8; 32]>,
+    /// G4.9b: `/queue type`s, for the profiles' download queue.
+    pub queues: corerouter_model::queue::Queues,
+    /// G4.3cd: who holds each routed block (the router's, shared with
+    /// IPoE and the commands) and the space no route may take.
+    pub framed: FramedTable,
+    pub forbidden: Arc<Forbidden>,
 }
 
 pub(crate) struct Bng {
@@ -1411,6 +1451,11 @@ impl Bng {
         ports: &HashMap<String, PortInfo>,
     ) {
         let wanted = Self::wanted(&snap.ppp);
+        {
+            let mut sh = guard(&self.shared);
+            sh.framed = snap.framed.clone();
+            sh.forbidden = snap.forbidden.clone();
+        }
         self.cfg = snap;
         // Servers gone or restarted: end their sessions.
         let mut keep: Vec<bool> = Vec::with_capacity(self.slots.len());
@@ -1676,10 +1721,16 @@ impl Bng {
                 b.get(3).copied().unwrap_or(0),
             )
         });
-        if src.is_none() || src != sub.ip {
+        let id = session_id(slot, &self.slots, f.session_id);
+        // A host of a block routed to the subscriber (G4.3cd) may send.
+        if src.is_none()
+            || (src != sub.ip
+                && src
+                    .and_then(|s| self.cfg.framed.holder_of(std::net::IpAddr::V4(s)))
+                    .is_none_or(|(_, h)| h.session != id))
+        {
             return;
         }
-        let id = session_id(slot, &self.slots, f.session_id);
         let len = f.info.len() as u64;
         if let Some(a) = guard(&self.shared).active.get_mut(&id) {
             a.rx_bytes += len;
@@ -1906,12 +1957,12 @@ impl Bng {
             dst.get(2).copied().unwrap_or(0),
             dst.get(3).copied().unwrap_or(0),
         );
-        let Some(((slot, sid), sub)) = self
-            .index
-            .by_ip
-            .get(&dst)
-            .and_then(|k| self.subs.get_key_value(k))
-        else {
+        // The subscriber's address, else a block routed to it (G4.3cd).
+        let key = self.index.by_ip.get(&dst).copied().or_else(|| {
+            let (_, h) = self.cfg.framed.holder_of(std::net::IpAddr::V4(dst))?;
+            self.find(&h.session).map(|(i, sref)| (i, sref.sid))
+        });
+        let Some(((slot, sid), sub)) = key.and_then(|k| self.subs.get_key_value(&k)) else {
             return;
         };
         let Some(port) = self.slots.get(*slot).map(|s| s.port) else {
@@ -2019,7 +2070,9 @@ impl Bng {
                 if let Some(sub) = self.subs.get(&(i, session.sid))
                     && let Some(idx) = sub.xdp
                 {
-                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref());
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
+                    let s = xdp_session(&descriptor, sub.rate.as_deref(), sub.v6.as_deref(), shape);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(idx, s)));
                 }
             }
@@ -2116,6 +2169,9 @@ impl Bng {
             mtu: 1480,
             radius6: RadiusV6::default(),
             v6: None,
+            want_routes: Vec::new(),
+            want_refused: Vec::new(),
+            routes: Vec::new(),
         };
         self.index.add((i, sref.sid), &fresh);
         if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
@@ -2178,6 +2234,11 @@ impl Bng {
             sub.effective = e;
             sub.limit_in = limit_in;
             sub.limit_out = limit_out;
+            sub.want_routes = sec
+                .routes
+                .iter()
+                .map(|r| (*r, RouteOrigin::Secret))
+                .collect();
         }
         self.accept(i, sref, mschap2, fixed, pool, rate, timeout, false, None);
     }
@@ -2458,7 +2519,15 @@ impl Bng {
                             .iter()
                             .map(|a| (a.name.as_str(), a.value.as_str())),
                     );
+                    let (want, refused) = framed::from_radius(
+                        done.reply
+                            .attributes
+                            .iter()
+                            .map(|a| (a.name.as_str(), a.value.as_str())),
+                    );
                     if let Some(sub) = self.subs.get_mut(&key) {
+                        sub.want_routes = want;
+                        sub.want_refused = refused;
                         sub.radius6 = r6;
                         sub.effective = e;
                         if list.is_some() {
@@ -2524,13 +2593,43 @@ impl Bng {
         match xdp {
             Some(idx) => self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                 idx,
-                xdp_session(d, sub.rate.as_deref(), sub.v6.as_deref()),
+                xdp_session(
+                    d,
+                    sub.rate.as_deref(),
+                    sub.v6.as_deref(),
+                    corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective),
+                ),
             ))),
             None => {
                 if let Some(ip) = ip {
                     self.effects.push(Effect::Route { ip, add: true });
                 }
             }
+        }
+        // G4.3cd: the blocks routed to the subscriber, after its session
+        // (the XDP index or the /32 exists first).
+        let holder = Holder {
+            session: id.clone(),
+            user: user.clone(),
+            origin: RouteOrigin::Secret,
+            lane: self.lane,
+            service: "pppoe",
+        };
+        let want = std::mem::take(&mut sub.want_routes);
+        let mut refused = std::mem::take(&mut sub.want_refused);
+        let adm = framed::admit(
+            &self.cfg.framed,
+            &self.cfg.forbidden,
+            &want,
+            &holder,
+            ip,
+            v6_refusal(xdp.is_some()),
+        );
+        refused.extend(adm.refused.iter().cloned());
+        sub.routes = adm.routes.clone();
+        let route_rows = adm.rows();
+        for (r, _) in &adm.routes {
+            self.effects.push(route_effect(xdp, r, true));
         }
         let a = ActiveSession {
             id: id.clone(),
@@ -2562,6 +2661,8 @@ impl Bng {
             mtu: d.mtu,
             limit_bytes_in: (sub.limit_in > 0).then_some(sub.limit_in),
             limit_bytes_out: (sub.limit_out > 0).then_some(sub.limit_out),
+            routes: route_rows.clone(),
+            refused_routes: refused.clone(),
             ..ActiveSession::default()
         };
         let mut a = a;
@@ -2586,6 +2687,8 @@ impl Bng {
                 event: "up".into(),
                 stage: Some(Stage::Up),
                 address: ip,
+                routes: route_rows.clone(),
+                refused_routes: refused.clone(),
                 ..HistoryEntry::default()
             };
             {
@@ -2620,6 +2723,7 @@ impl Bng {
                 attributes: {
                     let mut a = acct_attributes(ip, &mac, sub);
                     a.extend(v6_attrs);
+                    a.extend(route_attributes(&adm.routes));
                     a
                 },
             };
@@ -2646,6 +2750,15 @@ impl Bng {
                 ip.map_or_else(|| "sem IPv4".into(), |i| i.to_string())
             ),
         );
+        for row in &route_rows {
+            self.log(
+                false,
+                format!("PPP: {user}: rota {} ({})", row.route, row.origin.label()),
+            );
+        }
+        for why in refused {
+            self.log(true, format!("PPP: {user}: rota recusada: {why}"));
+        }
     }
 
     fn hooks(
@@ -2713,6 +2826,22 @@ impl Bng {
             };
         }
         let id = session_id(sub.slot, &self.slots, sub.sref.sid);
+        // G4.3cd: the routed blocks go first (a block left behind would
+        // send its traffic to a session that is no more: a blackhole).
+        for (r, _) in &sub.routes {
+            self.effects.push(route_effect(sub.xdp, r, false));
+        }
+        framed::release_all(&self.cfg.framed, &sub.routes, &id);
+        if !sub.routes.is_empty() {
+            self.log(
+                false,
+                format!(
+                    "PPP: {}: {} rota(s) removida(s)",
+                    sub.user,
+                    sub.routes.len()
+                ),
+            );
+        }
         if let Some(idx) = sub.xdp {
             self.effects.push(Effect::Xdp(PppoeOp::Remove(idx)));
             self.xdp_free.push(idx);
@@ -2775,6 +2904,7 @@ impl Bng {
                         if let Some(x) = &sub.v6 {
                             a.extend(x.acct_attributes());
                         }
+                        a.extend(route_attributes(&sub.routes));
                         a
                     },
                 };
@@ -2958,6 +3088,8 @@ impl Bng {
                     a.rx_packets = c.up_packets;
                     a.tx_bytes = c.down_bytes;
                     a.tx_packets = c.down_packets;
+                    a.queue_us = c.down_queue_us;
+                    a.drops = c.up_policed + c.down_policed;
                 }
                 a.uptime_secs = now.saturating_sub(up) / 1000;
                 let dt = now.saturating_sub(sub.prev.2);
@@ -3020,11 +3152,19 @@ impl Bng {
         // the rest for the others (the id says which: `*server-sid`).
         let (lane, lanes) = (self.lane, self.lanes);
         let mine = |id: &str| parse_session_id(id).is_none_or(|(_, sid)| sid % lanes == lane);
-        let (ids, rates, lists) = {
+        let (ids, rates, lists, changes) = {
             let mut sh = guard(&self.shared);
-            if sh.terminate.is_empty() && sh.rates.is_empty() && sh.lists.is_empty() {
+            if sh.terminate.is_empty()
+                && sh.rates.is_empty()
+                && sh.lists.is_empty()
+                && sh.route_changes.is_empty()
+            {
                 return;
             }
+            let (changes, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut sh.route_changes)
+                .into_iter()
+                .partition(|(id, _)| mine(id));
+            sh.route_changes = rest;
             let (ids, rest): (Vec<String>, Vec<String>) = std::mem::take(&mut sh.terminate)
                 .into_iter()
                 .partition(|id| mine(id));
@@ -3037,8 +3177,11 @@ impl Bng {
                 .into_iter()
                 .partition(|(id, _)| mine(id));
             sh.lists = rest;
-            (ids, rates, lists)
+            (ids, rates, lists, changes)
         };
+        for (id, change) in changes {
+            self.change_routes(&id, &change);
+        }
         for (id, list) in lists {
             let Some((i, sref)) = self.find(&id) else {
                 continue;
@@ -3087,9 +3230,12 @@ impl Bng {
             if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
                 sub.rate = Some(rate.clone());
                 if let Some(idx) = sub.xdp {
+                    // CoA: the rate changes, the queue (its clock) stays.
+                    let shape =
+                        corerouter_engine::queue::shape_of(&self.cfg.queues, &sub.effective);
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                         idx,
-                        xdp_session(&d, Some(&rate), sub.v6.as_deref()),
+                        xdp_session(&d, Some(&rate), sub.v6.as_deref(), shape),
                     )));
                 }
                 let user = sub.user.clone();
@@ -3101,6 +3247,86 @@ impl Bng {
                     format!("PPP: {user} com rate-limit novo {rate} (CoA)"),
                 );
             }
+        }
+    }
+
+    /// G4.3cd: a CoA's routes for session `id`, without dropping it: the
+    /// new blocks are claimed and installed first, then the old ones of
+    /// the families the CoA names are removed (traffic to a block kept by
+    /// both never stops).
+    fn change_routes(&mut self, id: &str, c: &RouteChange) {
+        let Some((i, sref)) = self.find(id) else {
+            return;
+        };
+        let Some(sub) = self.subs.get_mut(&(i, sref.sid)) else {
+            return;
+        };
+        let replaced = |r: &FramedRoute| if r.is_v6() { c.v6 } else { c.v4 };
+        let (old, kept): (Vec<_>, Vec<_>) =
+            sub.routes.iter().copied().partition(|(r, _)| replaced(r));
+        let holder = Holder {
+            session: id.to_owned(),
+            user: sub.user.clone(),
+            origin: RouteOrigin::FramedRoute,
+            lane: self.lane,
+            service: "pppoe",
+        };
+        // Blocks kept by both stay claimed; the rest is claimed anew.
+        let fresh: Vec<_> = c
+            .routes
+            .iter()
+            .copied()
+            .filter(|n| !old.iter().any(|o| o.0.dst == n.0.dst))
+            .collect();
+        let adm = framed::admit(
+            &self.cfg.framed,
+            &self.cfg.forbidden,
+            &fresh,
+            &holder,
+            sub.ip,
+            v6_refusal(sub.xdp.is_some()),
+        );
+        let xdp = sub.xdp;
+        let mut now_routes = kept;
+        now_routes.extend(
+            old.iter()
+                .copied()
+                .filter(|o| c.routes.iter().any(|n| n.0.dst == o.0.dst)),
+        );
+        now_routes.extend(adm.routes.iter().copied());
+        let gone: Vec<_> = old
+            .iter()
+            .copied()
+            .filter(|o| !c.routes.iter().any(|n| n.0.dst == o.0.dst))
+            .collect();
+        sub.routes = now_routes;
+        let user = sub.user.clone();
+        let rows = framed::rows(&sub.routes);
+        for (r, _) in &adm.routes {
+            self.effects.push(route_effect(xdp, r, true));
+        }
+        for (r, _) in &gone {
+            self.effects.push(route_effect(xdp, r, false));
+        }
+        framed::release_all(&self.cfg.framed, &gone, id);
+        if let Some(a) = guard(&self.shared).active.get_mut(id) {
+            a.routes = rows.clone();
+            a.refused_routes = adm.refused.clone();
+        }
+        let text = if rows.is_empty() {
+            "nenhuma".to_owned()
+        } else {
+            rows.iter()
+                .map(|r| r.route.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        self.log(
+            false,
+            format!("PPP: {user}: rotas trocadas por CoA: {text}"),
+        );
+        for why in adm.refused {
+            self.log(true, format!("PPP: {user}: rota recusada (CoA): {why}"));
         }
     }
 
@@ -3257,6 +3483,42 @@ fn nas_port(interface: &str, v: Vlans) -> String {
     }
 }
 
+/// G4.3cd: the routes of a session in the Accounting-Request (RFC 2866
+/// §5.13: the attributes of the Access-Accept may go along).
+fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
+    routes
+        .iter()
+        .map(|(r, _)| {
+            let name = if r.is_v6() {
+                "Framed-IPv6-Route"
+            } else {
+                "Framed-Route"
+            };
+            Attribute::new(name, r.to_string())
+        })
+        .collect()
+}
+
+/// Why an IPv6 route cannot be had: without XDP there is no IPv6 slow
+/// path (G4.3l).
+fn v6_refusal(xdp: bool) -> Option<&'static str> {
+    (!xdp).then_some("IPv6 só com o plano de dados XDP (sem XDP, G4.3l)")
+}
+
+/// Where a route goes: the XDP LPM of session `xdp`, or (IPv4, no XDP) a
+/// kernel route through `bng0`.
+fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
+    match (xdp, r.dst) {
+        (Some(idx), dst) => Effect::Xdp(PppoeOp::Route { dst, idx, add }),
+        (None, ipnet::IpNet::V4(dst)) => Effect::Block { dst, add },
+        // Never admitted without XDP (`framed::admit` refuses IPv6 there).
+        (None, ipnet::IpNet::V6(_)) => Effect::Log {
+            error: true,
+            text: format!("PPP: rota {r}: IPv6 sem XDP"),
+        },
+    }
+}
+
 /// The `S=…` string of an MS-CHAP2-Success attribute (RFC 2548 §2.3.3:
 /// Ident, then 42 octets), shown as text or as hex.
 fn success_string(v: &str) -> Option<[u8; AUTH_STRING_LEN]> {
@@ -3285,13 +3547,14 @@ fn rate_dir(r: &RateLimit, up: bool) -> Rate {
     }
 }
 
-/// The XDP map entry of a session (G4.3c): downstream always in XDP
-/// (the kernel path to the subscriber is G4.3ca), upstream through the
-/// kernel so `forward` and the queues see it.
+/// The XDP map entry of a session (G4.3c): downstream in XDP, or, shaped
+/// (G4.9b), through the kernel and `bng0` to the shaper on the access port;
+/// upstream through the kernel so `forward` and the queues see it.
 fn xdp_session(
     d: &corerouter_proto_pppoe::descriptor::SessionDescriptor,
     rate: Option<&str>,
     v6: Option<&V6>,
+    shape: Option<corerouter_hal::queue::Kind>,
 ) -> PppoeSession {
     let r = rate
         .and_then(|t| t.parse::<RateLimit>().ok())
@@ -3317,6 +3580,7 @@ fn xdp_session(
         delegated: v6
             .and_then(|x| x.delegated.as_ref())
             .map(|(n, _)| (v6::high64(*n), n.prefix_len())),
+        shape,
     }
 }
 

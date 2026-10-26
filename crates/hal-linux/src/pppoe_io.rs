@@ -520,17 +520,24 @@ impl SlowTx {
     /// Add (`true`) or remove these `/32` routes, all in one round on the
     /// open connection. The first error is returned; the rest still run.
     pub fn routes(&self, ops: &[(Ipv4Addr, bool)]) -> io::Result<()> {
+        let ops: Vec<(Ipv4Addr, u8, bool)> = ops.iter().map(|&(ip, add)| (ip, 32, add)).collect();
+        self.prefixes(&ops)
+    }
+
+    /// Add (`true`) or remove routes `prefix/len` to `bng0` (a subscriber's
+    /// /32, or a block routed to it, G4.3cd), in one round.
+    pub fn prefixes(&self, ops: &[(Ipv4Addr, u8, bool)]) -> io::Result<()> {
         use rtnetlink::RouteMessageBuilder;
         if ops.is_empty() {
             return Ok(());
         }
         let ifindex = self.ifindex;
         self.rt.block_on(async {
-            let calls = ops.iter().map(|&(ip, add)| {
+            let calls = ops.iter().map(|&(ip, len, add)| {
                 let h = self.handle.clone();
                 async move {
                     let msg = RouteMessageBuilder::<Ipv4Addr>::new()
-                        .destination_prefix(ip, 32)
+                        .destination_prefix(ip, len)
                         .output_interface(ifindex)
                         .build();
                     let out = if add {
@@ -544,7 +551,7 @@ impl SlowTx {
                             Ok(())
                         }
                         Err(e) => Err(io::Error::other(format!(
-                            "route {ip}/32 via {SLOW_DEVICE}: {e}"
+                            "route {ip}/{len} via {SLOW_DEVICE}: {e}"
                         ))),
                     }
                 }
@@ -580,7 +587,7 @@ fn runtime() -> io::Result<tokio::runtime::Runtime> {
 }
 
 /// The index of dummy device `name`, created and set up if missing.
-fn ensure_dummy(name: &str) -> io::Result<u32> {
+pub(crate) fn ensure_dummy(name: &str) -> io::Result<u32> {
     use futures_util::TryStreamExt;
     use rtnetlink::{LinkDummy, LinkMessageBuilder, LinkUnspec};
     let rt = runtime()?;
@@ -645,6 +652,48 @@ fn route(ifindex: u32, ip: Ipv4Addr, add: bool) -> io::Result<()> {
                 "route {ip}/32 via {SLOW_DEVICE}: {e}"
             ))),
         }
+    })
+}
+
+/// G4.3cd: routes of blocks to IPoE subscribers (`prefix/len via
+/// subscriber`, the subscriber on a connected network), added (`true`) or
+/// removed, in one round on one connection. The kernel forwards IPoE
+/// downstream itself (no encapsulation), so a routed block needs this
+/// route whether XDP polices the session or not. The first error is
+/// returned; the rest still run. A route already gone is fine.
+pub fn gateway_routes(ops: &[(Ipv4Addr, u8, Ipv4Addr, bool)]) -> io::Result<()> {
+    use rtnetlink::RouteMessageBuilder;
+    if ops.is_empty() {
+        return Ok(());
+    }
+    let rt = runtime()?;
+    rt.block_on(async {
+        let (conn, handle, _) = rtnetlink::new_connection()?;
+        let task = tokio::spawn(conn);
+        let mut first = Ok(());
+        for &(dst, len, via, add) in ops {
+            let msg = RouteMessageBuilder::<Ipv4Addr>::new()
+                .destination_prefix(dst, len)
+                .gateway(via)
+                .build();
+            let out = if add {
+                handle.route().add(msg).replace().execute().await
+            } else {
+                handle.route().del(msg).execute().await
+            };
+            let r = match out {
+                Ok(()) => Ok(()),
+                Err(rtnetlink::Error::NetlinkError(e)) if !add && e.raw_code() == -3 => Ok(()),
+                Err(e) => Err(io::Error::other(format!(
+                    "route {dst}/{len} via {via}: {e}"
+                ))),
+            };
+            if first.is_ok() {
+                first = r;
+            }
+        }
+        task.abort();
+        first
     })
 }
 

@@ -42,5 +42,8 @@ pub mod packet;
 pub mod parse;
 pub mod policer;
 pub mod pppoe;
+pub mod queue;
+pub mod shaper;
 #[cfg(feature = "testing")]
 pub mod testing;
+pub mod words;
