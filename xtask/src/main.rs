@@ -282,7 +282,9 @@ fn clippy(root: &Path) -> Outcome {
 /// `cargo test`. `COREROUTER_NEXTEST=0` forces `cargo test`.
 ///
 /// With `COREROUTER_CI_PARTITION=i/n` (the CI's test shards), nextest runs
-/// part i of the tests (`--partition count:i/n`) and only part 1 the
+/// part i of the tests (`--partition hash:i/n`: a test stays in its part
+/// when others are added; `.config/nextest.toml` starts the slow ones
+/// first) and only part 1 the
 /// doctests; `cargo test` cannot split, so part 1 runs everything.
 fn test(root: &Path) -> Outcome {
     let part = match partition() {
@@ -314,7 +316,7 @@ fn test(root: &Path) -> Outcome {
         "1",
     ]);
     if let Some((i, n)) = part {
-        c.args(["--partition", &format!("count:{i}/{n}")]);
+        c.args(["--partition", &format!("hash:{i}/{n}")]);
     }
     match run(c, root) {
         // `cargo test --doc` costs ~17 s even with no doctest (one rustdoc

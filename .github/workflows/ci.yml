@@ -87,7 +87,7 @@ jobs:
         run: cargo xtask docs
 
   # Os testes em partes, cada uma num runner de 4 vCPU (o nextest usa todos os núcleos de cada
-  # um): `COREROUTER_CI_PARTITION=i/n` vira `--partition count:i/n`. Cada parte compila o
+  # um): `COREROUTER_CI_PARTITION=i/n` vira `--partition hash:i/n`. Cada parte compila o
   # workspace do próprio cache (~1,5 min); mais partes que isso só somam compilação.
   test:
     name: test (${{ matrix.part }}/${{ strategy.job-total }})
