@@ -1,0 +1,27 @@
+//! English explanations of PPP › Redundancy (G4.3h), scope `ppp_ha`, sorted by key.
+
+pub(super) const HELP: &[(&str, &str)] = &[
+    ("ppp.redundancy", "## BNG redundancy (active/standby pair)\n\nTwo CoreRouters serve the same subscribers: the **active** one answers, the **standby** keeps a copy of every session and takes over with the same virtual MAC, SESSION_IDs and LCP Magic-Numbers. The subscriber does not notice."),
+    ("ppp_ha.actions", "**Switchover** hands the role to the standby peer (sessions kept). **Simulate Failure** makes this node behave as dead for N seconds so the peer takes over for real."),
+    ("ppp_ha.drift", "Config sections that differ from the peer's."),
+    ("ppp_ha.enabled", "Join the pair. The node starts in init and listens for Init Hold seconds before claiming the role."),
+    ("ppp_ha.fencing", "How a node proves it is not isolated before it takes over: witness-and-access (recommended), witness, or access."),
+    ("ppp_ha.group", "The same on both nodes; gives the default virtual MAC 02:43:52:48:41:<group>."),
+    ("ppp_ha.history", "The last role changes of this node, with the reason."),
+    ("ppp_ha.holds", "Init Hold: seconds a starting node listens. Recover Hold: seconds a fenced node waits, stable, before it may take over."),
+    ("ppp_ha.interfaces", "Access ports for the pair's hello and the virtual MAC; empty = every PPPoE server port."),
+    ("ppp_ha.mode", "hot-standby copies every session (invisible takeover); stateless copies nothing (subscribers redial)."),
+    ("ppp_ha.paths", "Where the peer is heard now: the sync link and the access network."),
+    ("ppp_ha.peer", "The other node's sync address, host:port (TLS, certificate pinned, shared secret)."),
+    ("ppp_ha.peer_state", "The role the peer announces and whether the TLS link is up."),
+    ("ppp_ha.preempt", "A higher-priority standby in sync takes the role back after the delay. Off by default."),
+    ("ppp_ha.priority", "1..254 (default 100). Elections: complete replica, then priority, then node id."),
+    ("ppp_ha.role", "active, standby, init, fenced (cannot prove it is not isolated) or yielding (switchover)."),
+    ("ppp_ha.secret", "The same on both nodes, at least 16 characters. Write-only."),
+    ("ppp_ha.sync", "N/N sessions held by the active and copied by the standby; lag (unacknowledged changes) and delay (ms)."),
+    ("ppp_ha.timers", "Hello interval and dead interval in ms (dead ≥ 3 × hello)."),
+    ("ppp_ha.track", "Ports whose loss of carrier fences this node."),
+    ("ppp_ha.virtual_mac", "The AC MAC the subscribers see, the same on both nodes; empty = 02:43:52:48:41:<group>."),
+    ("ppp_ha.witness", "Addresses both nodes should reach (the gateway); ICMP once a second, down after 3 misses."),
+    ("ppp_ha.witness_state", "Whether the witness answers this node now."),
+];
