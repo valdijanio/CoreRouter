@@ -189,6 +189,7 @@ mod linux {
             let cpus = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
             if w == 0 { pppoe_workers_auto(cpus) } else { w }
         };
+        super::super::pppoe_bng::ha::LANES.store(lanes, std::sync::atomic::Ordering::Release);
         let first = Bng::first_of(seed(), lanes);
         let shared = first.shared.clone();
         let routes = first.clone_routes();
@@ -344,6 +345,10 @@ mod linux {
         let mut was_serving = true;
         loop {
             let now = ms();
+            // G4.3h: a takeover first (its sessions before any frame).
+            if bng.ha_pending() {
+                let _ = bng.ha_adopt_pending(now);
+            }
             let mut wait = WAIT;
             if let Some(d) = bng.next_deadline() {
                 wait = wait.min(Duration::from_millis(d.saturating_sub(now)));
@@ -432,6 +437,11 @@ mod linux {
         session: &Shared,
         errors: &mut Vec<String>,
     ) {
+        // G4.3h: hot standby, what changed goes to the pair's other node.
+        let changes = bng.ha_take(ms());
+        if !changes.is_empty() {
+            super::super::ppp_ha::publish(changes);
+        }
         // G4.3h: a node that is not the active one of its pair sends
         // nothing, not even the PADT to a session it does not know (it
         // would end the subscriber's session on the active node).

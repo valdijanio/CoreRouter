@@ -51,6 +51,10 @@ use corerouter_proto_radius::rate_limit::RateLimit;
 
 use super::pppoe_bng6::{self as v6, Pools6, RadiusV6, Source, V6};
 
+/// G4.3h hot standby: publishing sessions, adopting them at a takeover.
+#[path = "pppoe_bng/ha.rs"]
+pub(crate) mod ha;
+
 /// Lines kept by `ppp.history`: a mass reconnect of 20 k subscribers is
 /// 40 k lines (**estimado**: 50 k × ~250 B = 12 MB).
 pub(crate) const HISTORY: usize = 50_000;
@@ -999,6 +1003,9 @@ struct Sub {
     want_routes: Vec<(FramedRoute, RouteOrigin)>,
     want_refused: Vec<String>,
     routes: Vec<(FramedRoute, RouteOrigin)>,
+    /// G4.3h: counters carried over from the other node of the pair
+    /// (rx bytes, tx bytes, rx packets, tx packets), under the data plane's.
+    base: [u64; 4],
 }
 
 /// What the hot paths look up in [`Bng::subs`] without walking it
@@ -1138,6 +1145,8 @@ pub(crate) struct Bng {
     pools6: Arc<Mutex<Pools6>>,
     /// IPv6 packets refused before reaching a session's control plane.
     v6_dropped: u64,
+    /// G4.3h: what this worker publishes to the pair, and its takeovers.
+    pub(crate) ha: ha::HaState,
 }
 
 /// One discovery or session frame's code and source, read before the
@@ -1365,6 +1374,7 @@ impl Bng {
             queued_total: 0,
             pools6: Arc::new(Mutex::new(Pools6::default())),
             v6_dropped: 0,
+            ha: ha::HaState::default(),
         }
     }
 
@@ -1843,6 +1853,7 @@ impl Bng {
         let acct_id = sub.acct_id.clone();
         let interim = sub.interim;
         sub.v6 = Some(Box::new(x));
+        self.ha.dirty.insert((i, sref.sid));
         let fields = sub.v6.as_deref().map(active_v6);
         let id = session_id(i, &self.slots, sref.sid);
         for p in problems {
@@ -2177,6 +2188,7 @@ impl Bng {
             want_routes: Vec::new(),
             want_refused: Vec::new(),
             routes: Vec::new(),
+            base: [0; 4],
         };
         self.index.add((i, sref.sid), &fresh);
         if let Some(old) = self.subs.insert((i, sref.sid), fresh) {
@@ -2745,6 +2757,7 @@ impl Bng {
             });
         }
         self.hooks(&hooks, &user, ip, &mac, &interface);
+        self.ha_dirty((i, sref.sid));
         self.log(
             false,
             format!(
@@ -2817,6 +2830,11 @@ impl Bng {
 
     /// A session is gone: undo everything [`Bng::up`] did.
     fn ended(&mut self, now: Millis, sub: Sub, reason: DownReason, was_up: bool) {
+        self.ha_gone(&sub);
+        // G4.3h: handed to the pair's other node, the session goes on
+        // there: no Accounting-Stop (it would end it in the RADIUS server)
+        // and no on-down hooks.
+        let handed_over = self.ha.handed_over;
         let (mut key, mut hint, stage, mut cause) = explain(reason);
         if let Some((c, k)) = sub.cause {
             cause = c;
@@ -2887,7 +2905,8 @@ impl Bng {
         };
         let uptime = sub.up_at.map_or(0, |t| now.saturating_sub(t) / 1000);
         if was_up {
-            if (sub.radius || self.cfg.ppp.aaa.use_radius)
+            if !handed_over
+                && (sub.radius || self.cfg.ppp.aaa.use_radius)
                 && self.cfg.ppp.aaa.accounting
                 && let Some(aaa) = &self.cfg.aaa
             {
@@ -2925,8 +2944,10 @@ impl Bng {
                     comment: String::new(),
                 });
             }
-            let hooks = sub.effective.on_down.clone();
-            self.hooks(&hooks, &sub.user, sub.ip, &mac, &interface);
+            if !handed_over {
+                let hooks = sub.effective.on_down.clone();
+                self.hooks(&hooks, &sub.user, sub.ip, &mac, &interface);
+            }
         }
         let failed_stage = if was_up {
             Stage::Up
@@ -3086,10 +3107,11 @@ impl Bng {
                     continue;
                 };
                 if let Some(c) = sub.xdp.and_then(|i| by_idx.get(&i)) {
-                    a.rx_bytes = c.up_bytes;
-                    a.rx_packets = c.up_packets;
-                    a.tx_bytes = c.down_bytes;
-                    a.tx_packets = c.down_packets;
+                    let [rx, tx, rxp, txp] = sub.base;
+                    a.rx_bytes = rx + c.up_bytes;
+                    a.rx_packets = rxp + c.up_packets;
+                    a.tx_bytes = tx + c.down_bytes;
+                    a.tx_packets = txp + c.down_packets;
                 }
                 a.uptime_secs = now.saturating_sub(up) / 1000;
                 let dt = now.saturating_sub(sub.prev.2);
@@ -3229,6 +3251,7 @@ impl Bng {
             };
             if let Some(sub) = self.subs.get_mut(&(i, sref.sid)) {
                 sub.rate = Some(rate.clone());
+                self.ha.dirty.insert((i, sref.sid));
                 if let Some(idx) = sub.xdp {
                     self.effects.push(Effect::Xdp(PppoeOp::Upsert(
                         idx,
@@ -3252,6 +3275,9 @@ impl Bng {
     /// the families the CoA names are removed (traffic to a block kept by
     /// both never stops).
     fn change_routes(&mut self, id: &str, c: &RouteChange) {
+        if let Some((slot, sref)) = self.find(id) {
+            self.ha.dirty.insert((slot, sref.sid));
+        }
         let Some((i, sref)) = self.find(id) else {
             return;
         };
@@ -3338,7 +3364,8 @@ impl Bng {
     /// G4.3h: answer subscribers now — redundancy is off, or this node is
     /// the active one of its pair ([`HA_ACTIVE`]).
     pub(crate) fn serving(&self) -> bool {
-        !self.cfg.ppp.redundancy.enabled || HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire)
+        !self.cfg.ppp.redundancy.enabled
+            || (HA_ACTIVE.load(std::sync::atomic::Ordering::Acquire) && !self.ha_pending())
     }
 
     /// G4.3h: the pair's role went to the peer. Every session ends here
@@ -3346,11 +3373,15 @@ impl Bng {
     /// accounting Stop); the servers come back at the next configure, to
     /// answer if the role returns.
     pub(crate) fn abandon(&mut self, now: Millis) {
+        // Hot standby: the peer goes on with them (no Acct-Stop).
+        self.ha.handed_over = self.cfg.ppp.redundancy.enabled
+            && self.cfg.ppp.redundancy.mode == corerouter_model::ppp_redundancy::HaMode::HotStandby;
         let mut i = self.slots.len();
         while i > 0 {
             i -= 1;
             self.drop_slot(now, i);
         }
+        self.ha.handed_over = false;
         self.log(false, "PPPoE: o par assumiu; as sessões deste nó foram encerradas sem aviso ao CPE".into());
     }
 

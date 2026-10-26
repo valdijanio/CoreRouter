@@ -247,6 +247,13 @@ fn sections(cfg: &corerouter_model::Config) -> Vec<corerouter_proto_ha::msg::Sec
         }).collect::<Vec<_>>()))),
         section("ppp.aaa", &j(json!(cfg.ppp.aaa))),
         section("ip.pool", &j(json!(cfg.ip.pools.pools))),
+        // Both must run as many workers (`pppoe_bng::ha::LANES`).
+        section(
+            "pppoe.workers",
+            &super::pppoe_bng::ha::LANES
+                .load(Ordering::Acquire)
+                .to_le_bytes(),
+        ),
     ]
 }
 
@@ -274,6 +281,49 @@ fn node_config(r: &Redundancy, id: u64, sections: Vec<corerouter_proto_ha::msg::
         link_key: hello::derive("link", r.secret.as_bytes()),
         sections,
     }
+}
+
+/// The `pppoe` workers' changes (hot standby): into the publisher, while
+/// this node is the active one (elsewhere `Node` ignores them).
+pub(crate) fn publish(changes: Vec<super::pppoe_bng::ha::HaChange>) {
+    use super::pppoe_bng::ha::HaChange;
+    let rt = runtime();
+    let now = rt.now();
+    let mut g = rt.pair();
+    let Some(p) = g.as_mut() else {
+        return;
+    };
+    for c in changes {
+        match c {
+            HaChange::Up(k, v) => p.node.upsert(now, k, v),
+            HaChange::Gone(k) => p.node.remove(now, k),
+            HaChange::Counters(k, c) => p.node.counters(now, k, c),
+        }
+    }
+}
+
+/// This node takes the role: the replica's sessions for the `pppoe`
+/// workers to adopt (stateful), or none (they redial). Before the workers
+/// may answer: a frame of a session not adopted yet would get a PADT.
+fn hand_takeover(p: &Pair, t: &Transition) {
+    use super::pppoe_bng::ha::{TAKEOVER, TAKEOVER_GEN};
+    let records = t.stateful.then(|| {
+        p.node
+            .publisher()
+            .map(|pb| {
+                pb.iter()
+                    .filter_map(|(_, v, c)| {
+                        corerouter_proto_ha::record::SessionRecord::decode(v).ok().map(|mut r| {
+                            r.counters = c;
+                            r
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    });
+    *TAKEOVER.lock().unwrap_or_else(PoisonError::into_inner) = records.map(Arc::new);
+    TAKEOVER_GEN.fetch_add(1, Ordering::AcqRel);
 }
 
 fn record(p: &mut Pair, t: &Transition) {
@@ -509,6 +559,9 @@ mod linux {
                     for e in &events {
                         if let Event::Role(t) = e {
                             record(p, t);
+                            if t.to == Role::Active {
+                                hand_takeover(p, t);
+                            }
                         }
                     }
                     shared().answering.store(p.node.answering(), Ordering::Release);
