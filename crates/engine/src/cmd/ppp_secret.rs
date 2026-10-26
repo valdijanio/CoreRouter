@@ -52,6 +52,15 @@ fn has_secrets(s: &Session) -> std::result::Result<(), String> {
 fn u64_of(p: &Value, key: &str) -> Result<Option<u64>> {
     match p.get(key) {
         None | Some(Value::Null) => Ok(None),
+        // The secret modal (and the terminal) send the field as text; an
+        // empty one is "not given" (it made every edit of a secret without
+        // limits fail).
+        Some(Value::String(t)) if t.trim().is_empty() => Ok(None),
+        Some(Value::String(t)) => t
+            .trim()
+            .parse::<u64>()
+            .map(Some)
+            .map_err(|_| EngineError::bad(key, "bytes, a non-negative integer")),
         Some(v) => v
             .as_u64()
             .map(Some)
@@ -475,6 +484,16 @@ mod tests {
             assert!(matches!(err, EngineError::BadParam { .. }), "{p}: {err}");
         }
         assert_eq!(s.store().candidate().ppp.secrets.len(), 1);
+    }
+
+    #[test]
+    fn limits_as_text_like_the_modal_sends_them() {
+        let mut s = Session::virtual_lab();
+        s.execute("ppp.secret.add", &json!({"name": "a", "password": "x", "limit_bytes_in": "", "limit_bytes_out": "1000"})).unwrap();
+        let x = &s.store().running().ppp.secrets[0];
+        assert_eq!((x.limit_bytes_in, x.limit_bytes_out), (0, 1000));
+        s.execute("ppp.secret.set", &json!({"id": "a", "limit_bytes_in": " ", "comment": "c"})).unwrap();
+        assert!(s.execute("ppp.secret.set", &json!({"id": "a", "limit_bytes_in": "-1"})).is_err());
     }
 
     #[test]
