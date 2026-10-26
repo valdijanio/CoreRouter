@@ -21,6 +21,10 @@ use crate::wire::{Error, Reader, Result, put_bytes16, put_u16, put_u32, put_u64}
 pub const MAX_CLASS: usize = 4;
 /// Text and opaque fields (usernames, circuit ids, names).
 pub const MAX_FIELD: usize = 253;
+/// IPv6 DNS servers (a profile lists at most 4).
+pub const MAX_DNS6: usize = 4;
+/// Routed blocks per session.
+pub const MAX_ROUTES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Kind {
@@ -91,6 +95,22 @@ pub struct SessionRecord {
     /// The pool the address came from (returned to it at the end).
     pub pool: Option<Box<str>>,
     pub address_list: Option<Box<str>>,
+    /// The `/ipv6 pool`s the /64 and the delegated prefix came from (back
+    /// to them at the end); `None`: fixed or from RADIUS.
+    pub pool6: Option<Box<str>>,
+    pub pd_pool: Option<Box<str>>,
+    /// IPv6 DNS given (RA RDNSS, DHCPv6), at most [`MAX_DNS6`].
+    pub dns6: Vec<Ipv6Addr>,
+    pub nbns: [Option<Ipv4Addr>; 2],
+    /// Routed blocks (G4.3cd), as text (`10.0.0.0/24 [gw] [metric]` and
+    /// where it came from), at most [`MAX_ROUTES`].
+    pub routes: Vec<Box<str>>,
+    /// `limit-bytes-in/out` of the secret (0: none).
+    pub limit_in: u64,
+    pub limit_out: u64,
+    /// The profile the session's Service-Name row gave (G4.3k), in the
+    /// server's `default_profile` place.
+    pub fallback_profile: Box<str>,
     /// Unix seconds.
     pub started_at: u64,
     /// The counters when the record was written; [`crate::msg::Op::Counters`]
@@ -126,8 +146,17 @@ mod t {
     pub const POOL: u8 = 23;
     pub const ADDRESS_LIST: u8 = 24;
     pub const COUNTERS: u8 = 25;
+    pub const POOL6: u8 = 26;
+    pub const PD_POOL: u8 = 27;
+    pub const DNS6: u8 = 28;
+    pub const NBNS: u8 = 29;
+    pub const ROUTE: u8 = 30;
+    pub const LIMITS: u8 = 31;
+    pub const FALLBACK: u8 = 32;
     /// Types up to this one are known to version 1 (a newer one is kept).
-    pub const LAST_KNOWN: u8 = 25;
+    pub const LAST_KNOWN: u8 = 32;
+    // The decoder's bitmask of seen types is a u64.
+    const _: () = assert!(LAST_KNOWN < 64);
 }
 
 fn tlv(out: &mut Vec<u8>, ty: u8, v: &[u8]) -> Result<()> {
@@ -192,9 +221,11 @@ fn u32_of(v: &[u8]) -> Result<u32> {
 }
 
 impl SessionRecord {
-    /// The replication key: kind, port, tags, SESSION_ID and client MAC
+    /// The replication key: kind, server, tags, SESSION_ID and client MAC
     /// (RFC 2516 §4 identifies the session by the SID and the MAC pair;
-    /// the port and tags make it unique across access networks).
+    /// the server and tags make it unique across access networks). The
+    /// server by name, not the port index: the index differs between the
+    /// two machines, and the new active must remove what the old one put.
     pub fn key(&self) -> Key {
         let kind = [match self.kind {
             Kind::Pppoe => 1,
@@ -202,7 +233,7 @@ impl SessionRecord {
         }];
         let parts: [&[u8]; 6] = [
             &kind,
-            &self.ifindex.to_le_bytes(),
+            &fnv32(self.server.as_bytes()).to_le_bytes(),
             &self.vlan.to_le_bytes(),
             &self.inner_vlan.to_le_bytes(),
             &self.sid.to_le_bytes(),
@@ -340,6 +371,52 @@ impl SessionRecord {
         if let Some(p) = &self.address_list {
             tlv(out, t::ADDRESS_LIST, p.as_bytes())?;
         }
+        if let Some(p) = &self.pool6 {
+            tlv(out, t::POOL6, p.as_bytes())?;
+        }
+        if let Some(p) = &self.pd_pool {
+            tlv(out, t::PD_POOL, p.as_bytes())?;
+        }
+        if !self.dns6.is_empty() {
+            if self.dns6.len() > MAX_DNS6 {
+                return Err(Error::TooLong {
+                    what: "dns6",
+                    len: self.dns6.len(),
+                    max: MAX_DNS6,
+                });
+            }
+            tlv_with(out, t::DNS6, |o| {
+                for d in &self.dns6 {
+                    o.extend_from_slice(&d.octets());
+                }
+            });
+        }
+        if self.nbns.iter().any(Option::is_some) {
+            tlv_with(out, t::NBNS, |o| {
+                for d in self.nbns {
+                    o.extend_from_slice(&d.unwrap_or(Ipv4Addr::UNSPECIFIED).octets());
+                }
+            });
+        }
+        if self.routes.len() > MAX_ROUTES {
+            return Err(Error::TooLong {
+                what: "routes",
+                len: self.routes.len(),
+                max: MAX_ROUTES,
+            });
+        }
+        for r in &self.routes {
+            tlv(out, t::ROUTE, r.as_bytes())?;
+        }
+        if self.limit_in != 0 || self.limit_out != 0 {
+            tlv_with(out, t::LIMITS, |o| {
+                put_u64(o, self.limit_in);
+                put_u64(o, self.limit_out);
+            });
+        }
+        if !self.fallback_profile.is_empty() {
+            tlv(out, t::FALLBACK, self.fallback_profile.as_bytes())?;
+        }
         if self.counters != Counters::default() {
             tlv_with(out, t::COUNTERS, |o| {
                 put_u64(o, self.counters.rx_bytes);
@@ -368,12 +445,12 @@ impl SessionRecord {
         let mut r = Reader::new(buf);
         let mut s = SessionRecord::default();
         // Bit per known type: a duplicate is refused (except Class).
-        let mut seen: u32 = 0;
+        let mut seen: u64 = 0;
         while r.remaining() > 0 {
             let ty = r.u8()?;
             let v = r.bytes16("field", MAX_FIELD.max(64))?;
-            if ty <= t::LAST_KNOWN && ty != t::CLASS {
-                let bit = 1u32 << ty;
+            if ty <= t::LAST_KNOWN && ty != t::CLASS && ty != t::ROUTE {
+                let bit = 1u64 << ty;
                 if seen & bit != 0 {
                     return Err(Error::Duplicate(ty));
                 }
@@ -449,6 +526,42 @@ impl SessionRecord {
                 t::SERVER => s.server = text(v, "server")?,
                 t::POOL => s.pool = Some(text(v, "pool")?),
                 t::ADDRESS_LIST => s.address_list = Some(text(v, "address list")?),
+                t::POOL6 => s.pool6 = Some(text(v, "ipv6 pool")?),
+                t::PD_POOL => s.pd_pool = Some(text(v, "pd pool")?),
+                t::DNS6 => {
+                    if v.len() % 16 != 0 || v.len() / 16 > MAX_DNS6 {
+                        return Err(Error::BadValue("dns6"));
+                    }
+                    let mut c = Reader::new(v);
+                    while c.remaining() > 0 {
+                        s.dns6.push(Ipv6Addr::from(c.array::<16>()?));
+                    }
+                }
+                t::NBNS => {
+                    let mut c = Reader::new(v);
+                    for d in &mut s.nbns {
+                        let a = Ipv4Addr::from(c.array::<4>()?);
+                        *d = (!a.is_unspecified()).then_some(a);
+                    }
+                    c.end()?;
+                }
+                t::ROUTE => {
+                    if s.routes.len() >= MAX_ROUTES {
+                        return Err(Error::TooLong {
+                            what: "routes",
+                            len: s.routes.len() + 1,
+                            max: MAX_ROUTES,
+                        });
+                    }
+                    s.routes.push(text(v, "route")?);
+                }
+                t::LIMITS => {
+                    let mut c = Reader::new(v);
+                    s.limit_in = c.u64()?;
+                    s.limit_out = c.u64()?;
+                    c.end()?;
+                }
+                t::FALLBACK => s.fallback_profile = text(v, "fallback profile")?,
                 t::COUNTERS => {
                     let mut c = Reader::new(v);
                     s.counters = Counters {
@@ -478,6 +591,13 @@ impl SessionRecord {
         }
         Ok(s)
     }
+}
+
+/// FNV-1a, 32 bits: a stable hash of a name for the key.
+fn fnv32(b: &[u8]) -> u32 {
+    b.iter().fold(0x811c_9dc5u32, |h, x| {
+        (h ^ u32::from(*x)).wrapping_mul(0x0100_0193)
+    })
 }
 
 #[cfg(test)]
@@ -525,6 +645,17 @@ mod tests {
             server: "pppoe1".into(),
             pool: Some("clientes".into()),
             address_list: None,
+            pool6: Some("v6".into()),
+            pd_pool: Some("pd".into()),
+            dns6: vec!["2001:db8::53".parse().unwrap()],
+            nbns: [None, Some(Ipv4Addr::new(10, 0, 0, 9))],
+            routes: vec![
+                "10.10.0.0/24|secret".into(),
+                "2001:db8:99::/48|framed-ipv6-route".into(),
+            ],
+            limit_in: 1_000_000,
+            limit_out: 0,
+            fallback_profile: "voip".into(),
             started_at: 1_790_000_000,
             counters: Counters {
                 rx_bytes: 10,
@@ -541,7 +672,7 @@ mod tests {
         let s = sample();
         let b = s.to_bytes().unwrap();
         assert_eq!(SessionRecord::decode(&b).unwrap(), s);
-        assert!(b.len() < 260, "{} bytes", b.len());
+        assert!(b.len() < 380, "{} bytes", b.len());
     }
 
     #[test]
@@ -551,6 +682,16 @@ mod tests {
         let s = SessionRecord::decode(&b).unwrap();
         assert_eq!(s.extra, vec![(200, (*b"\x07\x07").into())]);
         assert_eq!(s.to_bytes().unwrap(), b, "written back as it came");
+    }
+
+    #[test]
+    fn every_known_type_twice_is_an_error_not_a_panic() {
+        let core = sample().to_bytes().unwrap();
+        for ty in 1..=t::LAST_KNOWN {
+            let mut b = core.clone();
+            b.extend_from_slice(&[ty, 1, 0, 0, ty, 1, 0, 0]);
+            let _ = SessionRecord::decode(&b);
+        }
     }
 
     #[test]
@@ -577,10 +718,15 @@ mod tests {
     }
 
     #[test]
-    fn the_key_names_port_tags_sid_and_mac() {
+    fn the_key_names_server_tags_sid_and_mac_not_the_port_index() {
         let a = sample();
         let mut b = sample();
         assert_eq!(a.key(), b.key());
+        b.ifindex = 99;
+        assert_eq!(a.key(), b.key(), "the other machine's port index");
+        b.server = "pppoe2".into();
+        assert_ne!(a.key(), b.key());
+        let mut b = sample();
         b.sid += 1;
         assert_ne!(a.key(), b.key());
         let mut c = sample();

@@ -131,6 +131,9 @@ pub struct Ppp {
     /// 0 = auto ([`pppoe_workers_auto`]). Read when the service starts.
     #[serde(default, skip_serializing_if = "is_zero16")]
     pub pppoe_workers: u16,
+    /// `/ppp redundancy` (G4.3h): the active/standby pair.
+    #[serde(default, skip_serializing_if = "crate::ppp_redundancy::Redundancy::is_default")]
+    pub redundancy: crate::ppp_redundancy::Redundancy,
 }
 
 fn is_zero16(v: &u16) -> bool {
