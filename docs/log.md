@@ -3785,3 +3785,405 @@ continuação indentadas).
   - fila sem limite.
 
   Origem: o laboratório do BNG (G4.3g) mostrou o plano de controle PPPoE num núcleo a 98%.
+
+- 2026-10-25 — G0.26: Correção do `cargo xtask vm-lab tools`. Quando só faltavam pacotes apt (o `iperf3`), o script mandava uma lista de hashes vazia ao `sha256sum -c`, que falha ("no properly formatted checksum lines found", **medido**). Agora o script é montado por `vm_tools::install_script` (com testes): o `sha256sum` só entra quando há `.deb`, e os hashes vão por heredoc. `snapshot`, `reset` e `tools` também aceitam rodar dentro do `flock vm/root.lock` do próprio usuário: a trava de um processo ancestral conta como dele. O `status` mostra se a VM está ociosa ("rounds"). Testar: `cargo xtask vm-lab status` e `cargo xtask vm-lab tools --check`.
+
+- 2026-10-25 — G0.26: Laboratório em VM, ferramentas de terceiros: `cargo xtask vm-lab tools` instala na VM as ferramentas declaradas em `xtask/src/vm_tools.rs` (hoje: BNG Blaster 1.0.1, o `.deb` do release oficial da rtbrick com SHA-256 fixado e igual ao `digest` do GitHub, e `ppp`, `pppoe`, `tcpdump`, `iperf3` e `ethtool` do arquivo do Ubuntu). O comando baixa uma vez para `vm/tools/`, confere o hash no host e na VM, instala num `apt-get install` só, imprime as versões e tira o snapshot `tools`, para o qual `reset` passa a voltar por padrão. `tools --check` só confere e diz ao agente o que pedir ao usuário. Instalar código de terceiros é do usuário, uma vez por ferramenta (o classificador do app bloqueia o agente; o nosso código roda sem perguntar). `snapshot` e `reset` recusam enquanto há rodada (trava do `run` na VM ou `vm/root.lock` do usuário no host); `--force` passa por cima. Testar: `cargo xtask vm-lab tools --check`.
+
+- 2026-10-25 — G4.1c: Teste instável `nsupdate_changes_the_zone` (`netns_dns_ddns`) corrigido no servidor: um UPDATE
+  (RFC 2136) que chegava entre o `dns-server` abrir a porta 53 e o supervisor iniciar o serviço
+  `dns-zones` levava NOTIMP sem TSIG ("expected a TSIG or SIG(0)"), enquanto a zona já respondia
+  com AA; um `nsupdate` ou o DDNS de um servidor DHCP nessa janela falhava de vez (NOTIMP é "não
+  implementado", RFC 2136 §2.2). Agora o servidor do daemon nasce com o serviço de zonas acoplado
+  (`dns_server::make` → `dns_zones::attach`), antes de qualquer socket: o UPDATE é atendido desde o
+  primeiro pacote, e a thread `dns-zones` só faz o trabalho periódico (NOTIFY, secundárias, DNSSEC).
+  Teste de regressão `the_daemons_server_takes_updates_before_the_zone_thread` (UPDATE assinado pelo
+  servidor recém-montado, sem a thread de zonas: NOERROR assinado; com a montagem antiga, NOTIMP).
+  Reproduzido antes (**medido**, 2026-10-25): 2 falhas em 30 execuções, 10 em paralelo, cada uma
+  no seu namespace, com os 32 núcleos ocupados; depois: 0 em 60 nas mesmas condições.
+
+- 2026-10-25 — G4.3e: BNG dual-stack, parte b (o serviço `pppoe`, empilhada sobre a parte a e o #216). O perfil PPP ganha
+  `use_ipv6`, `remote_ipv6_prefix_pool`, `dhcpv6_pd_pool`, `dhcpv6_lease_time` e `dns_server_ipv6`
+  (nomes do RouterOS; o último é nosso). Quando o IPv6CP abre, a sessão recebe o /64 e o prefixo
+  delegado. A origem é, em ordem: `Framed-IPv6-Prefix`/`Delegated-IPv6-Prefix` do RADIUS, os pools
+  do RADIUS (`Framed-IPv6-Pool`, `Delegated-IPv6-Prefix-Pool`, `Mikrotik-Delegated-IPv6-Pool`), os
+  pools do perfil. A sessão também recebe o RA (PIO, MTU, RDNSS), a resposta a RS/NS/Echo e o DHCPv6
+  da sessão (IA_PD e IA_NA = /64 + identificador do IPv6CP).
+
+  O XDP recebe o /64 e o PD (`PppoeSession::{ipv6_prefix, delegated}` no HAL; as estruturas da G4.3c
+  já tinham as chaves). O Accounting-Start/Interim/Stop leva `Framed-IPv6-Prefix`,
+  `Delegated-IPv6-Prefix` e `Framed-Interface-Id`; o serviço RADIUS passa a codificar `ipv6prefix` e
+  `ifid`. `ppp.active.list` ganha `ipv6_prefix`, `delegated_prefix`, `delegated_bound` e
+  `link_local`; `interface.pppoe-server.monitor` ganha `ipv6_sessions`, `delegated` e `ipv6_dropped`.
+  O segredo do identificador estável (RFC 8064) fica em `<config-dir>/pppoe-ipv6cp.key`. Uma sessão
+  sem IPv4 agora espera o IPv6CP (assinante só IPv6) antes de cair.
+
+  Testar:
+
+  - `cargo test -p corerouter-daemon --bin corerouter-daemon pppoe_bng`: 1000 sessões dual-stack em
+    memória, RA periódico, `use_ipv6=no`, prefixos do RADIUS na contabilização.
+  - `cargo test -p corerouter-engine ppp_profile`.
+  - `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_pppoe6 -- --test-threads 1`:
+    10 mil CPEs dual-stack por veth.
+  - `xdp_root` › `pppoe_bng_ops_reach_the_maps`: IPv6 do /64 e do PD passa, de outro prefixo é
+    falsificado; roda no runner com root.
+
+- 2026-10-25 — G4.3e: BNG dual-stack, parte c: a janela PPP.
+
+  - **Active Connections:** colunas `IPv6 Prefix` (o /64 do RA) e `Delegated Prefix` (o PD), com o
+    selo `bound` (o DHCPv6 do CPE pegou) ou `reserved` (guardado para a sessão).
+  - **Profiles:** a coluna `IPv6` resume o `use_ipv6` e os pools (`/64 wan6 · PD pd6`). O modal ganha
+    `Use IPv6`, `Remote IPv6 Prefix Pool`, `DHCPv6 PD Pool`, `DHCPv6 Lease Time` e `IPv6 DNS Server`.
+  - **Interface:** o monitor ganha a linha IPv6 (sessões, delegados, recusados).
+  - Todos os rótulos novos têm ⓘ em português e inglês.
+  - O teste `cpe_lab6` (`#[ignore]`, em `netns_pppoe6`) monta um laboratório dual-stack para capturas.
+
+  Testar:
+
+  - `cargo test -p corerouter-ui ppp`;
+  - para olhar: `cpe_lab6` num namespace, e a GUI com `--connect 127.0.0.1:7979` e
+    `COREROUTER_RUNTIME_DIR` apontando para a pasta do laboratório.
+
+- 2026-10-25 — G4.3f: IPoE, parte 1 (modelo, comandos e a autorização no servidor DHCP). O servidor DHCPv4 puro
+  (`proto-dhcp`) ganha um portão: num servidor com `ipoe=yes` ou `use_radius=yes`, o DISCOVER (ou o
+  REQUEST de quem não tem concessão) de cada cliente vira `Effect::Authorize` com o MAC, o client id
+  e a opção 82 (circuit e remote id, RFC 3046), e a mensagem espera o veredito
+  (`Server::authorized`). O Accept escolhe o endereço (Framed-IP-Address, nunca o de outro
+  cliente), o pool (Framed-Pool), o tempo do lease (Session-Timeout, como o RouterOS) e address
+  lists; o Reject não oferece nada (o REQUEST recebe NAK) e o cliente fica 30 s sem ser perguntado
+  de novo; sem resposta em 15 s o pedido é esquecido; no máximo 8192 esperando. `Server::revoke`
+  encerra os leases e tira a concessão (o Disconnect da parte 2).
+
+  Comandos: `ip.dhcp-server.add/set` com `use_radius=no|yes|accounting` (RouterOS),
+  `ipoe=yes`, `ipoe_username=mac|circuit-id|remote-id|circuit-remote` e `ipoe_unknown=accept|reject`;
+  `ip.dhcp-server.lease.add/set rate_limit=10M/50M` (sintaxe do RouterOS); `ppp.secret` com
+  `service=ipoe` (sem senha; `service=any` não casa IPoE). Avisos: `use_radius` sem `/radius
+  service=dhcp`, `ipoe_unknown=reject` sem nenhum secret IPoE, `ipoe_username` por opção 82 num
+  link sem `relay_info_trusted`, `rate_limit` fora de um servidor IPoE. O engine
+  (`engine/src/ipoe.rs`) decide pela lista local quando não há o serviço do daemon (o laboratório
+  virtual serve IPoE sozinho) e junta as sessões IPoE às do PPP em `ppp.active`/`ppp.why`/`ppp.history`
+  (`Session::set_ipoe_sessions`). Pesquisa em `docs/pppoe.md` §10.
+
+  Como testar: `cargo test -p corerouter-proto-dhcp --lib server::tests` (portão: espera, concessão,
+  reject lembrado, tempo esgotado, opção 82, revoke) e `cargo test -p corerouter-engine --test ipoe`
+  (os hosts do laboratório: só o do secret recebe endereço, o endereço fixo do secret; depois
+  `ipoe_unknown=accept` serve todos).
+
+  Desempenho: as decisões IPoE leem `/ppp secret service=ipoe` e os `rate_limit` dos leases estáticos
+  por um índice refeito a cada revisão da config (`IpoeIndex`, O(1) por lease; antes, uma varredura
+  dos secrets por DISCOVER). E o limitador por cliente do servidor DHCP (G4.2a), com a tabela cheia
+  (65 536 clientes), varria a tabela inteira a cada cliente novo e recusava os que não cabiam: numa
+  tempestade de 100 000 CPEs depois de uma queda de energia, 34 464 ficavam sem endereço e cada um
+  custava O(65 536). Agora a varredura é no máximo a cada 250 ms e o cliente que não cabe é servido
+  sem balde (`untracked`, contado): a tabela continua limitada, e um limite por MAC não freia mesmo
+  uma enxurrada de MACs aleatórios.
+
+- 2026-10-25 — G4.3f: IPoE, parte 2 (plano de dados XDP). Os assinantes IPoE entram nos mesmos mapas do PPPoE (G4.3c),
+  de forma aditiva: flag `F_IPOE`, chave porta + MAC com SESSION_ID 0 (nunca o de uma sessão PPPoE,
+  RFC 2516 §5), mapa novo `IPOE_PORTS` e o bit 1 do `SETTINGS` dos assinantes. Subida: DHCP passa ao
+  daemon, MAC desconhecido segue como sem IPoE, a origem tem de ser o endereço da sessão (TR-146
+  R-38, senão `spoofed`), policer e contadores, quadro intacto. Descida: policer e contadores e o
+  kernel encaminha (o firewall continua vendo); o CGNAT rápido sai pelo XDP com os MACs reescritos.
+  HAL: `Hal::ipoe_dataplane(on, ports)`, `PppoeSession.ipoe`, `pppoe_io::port_info`; o carregador
+  recusa IPoE com SID ≠ 0 ou tag e PPPoE com SID 0. Detalhes em `docs/pppoe-dataplane.md` (IPoE).
+
+  Como testar: `cargo test -p corerouter-dataplane-ebpf-common --all-features --test ipoe_props`
+  (amarração, DHCP, estranhos, outra porta, policer nos dois sentidos, CGNAT, ruído em proptest) e,
+  com root, `cargo xtask xdp-root` › `ipoe_kernel_and_host_agree` (agora na lista do `xdp-root`):
+  os quadros IPoE no programa do kernel (`BPF_PROG_TEST_RUN`) e no modelo do host, ação e bytes
+  iguais, e o ns/pacote de subida e descida. Rodado na VM `corerouter-lab` (G0.26, kernel 7.0): o
+  verificador aceita, 1944 quadros iguais (263 spoofed descartados).
+
+- 2026-10-25 — G4.3f: IPoE, parte 3 (o serviço `ipoe` do daemon). O dono das sessões que os leases DHCP viram
+  (`service/ipoe.rs` e o núcleo sem E/S `service/ipoe_bng.rs`): autoriza pela lista local ou pelo
+  RADIUS `service=dhcp` (User-Name = `ipoe_username`, senha vazia como o RouterOS, NAS-Port-Type
+  Ethernet, a opção 82 em ADSL-Agent-Circuit-Id/Remote-Id da RFC 4679); a sessão nasce no ACK com a
+  taxa do RADIUS, do lease estático ou do perfil; contabilização Start/Interim/Stop com Class e
+  Acct-Terminate-Cause; `ppp.active.remove` e o Disconnect-Request encerram o lease (o CPE recomeça
+  autorizado); CoA muda a taxa do policer na hora; o XDP da parte 2 ligado nas portas IPoE (sem
+  XDP, a sessão existe sem policer e a linha do serviço diz por quê); keepalive por ARP opcional
+  (`ipoe_keepalive`, TR-146 R-92); "Why?" com os estágios `dhcp`/`auth`/`up` e o motivo. As sessões
+  aparecem em `ppp.active`, `ppp.why` e `ppp.history` com `service=ipoe`.
+
+  Como testar: `cargo test -p corerouter-daemon --bin corerouter-daemon ipoe` (RADIUS, accounting,
+  remover, CoA/DM, secrets e taxa do lease, keepalive, contra o servidor DHCP do engine e os hosts do
+  laboratório) e
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_ipoe`
+  (10 000 clientes DHCP simulados num veth, RADIUS de teste).
+
+
+  Mapa XDP de sessões dividido entre os serviços: o PPPoE fica com a metade de baixo (`XDP_SLOTS`
+  = 65 536 sessões no XDP; antes, o mapa inteiro) e o IPoE com a de cima, do topo para baixo; um
+  teste garante que as faixas não se encontram (a G4.3g distribui os índices do PPPoE entre os
+  workers abaixo de `XDP_SLOTS`).
+
+  Desempenho: por lease, o núcleo faz a decisão local e cria a sessão em ~7–10 µs, igual com 10 000
+  e 100 000 assinantes (`benches/ipoe_bng.rs`): os secrets e o `rate_limit` do lease vêm do índice
+  do engine, os perfis por nome (Mikrotik-Group) são refeitos uma vez por segundo, e o callback do
+  RADIUS só interpreta a resposta e põe o veredito na fila.
+
+- 2026-10-25 — G4.3f: IPoE, parte 4 (janela). Em PPP › Active Connections as sessões IPoE ficam com as PPPoE, com um
+  selo por serviço (`ipoe`, `pppoe`), a marca R, a taxa, o circuito da opção 82 e o selo de
+  identidade (o `who` das duas metades). O "Why?" de um assinante IPoE mostra DHCP › Auth › Up e o
+  motivo; em Secrets, `ipoe` entra nos serviços (sem senha). Na janela DHCP Server, o formulário do
+  servidor ganha Use RADIUS, IPoE Sessions, IPoE Username, IPoE Unknown Clients e IPoE Keepalive, o
+  do lease ganha Rate Limit, e a lista mostra o selo `ipoe`/`ipoe radius`. Explicações ⓘ em
+  português.
+
+  Como testar: `cargo test -p corerouter-ui --lib tests::ipoe`; na GUI com o laboratório do
+  `netns_ipoe` › `ipoe_lab` (40 assinantes, 2 recusados pelo RADIUS): PPP › Active Connections,
+  Why? com `02:30:00:00:07:01`, IP › DHCP › Server.
+
+- 2026-10-25 — G4.3g: BNG sem custo O(n) por sessão (achado pelo laboratório da G4.3g): na rodada de 100 mil
+  sessões com o BNG Blaster o setup caía de ~9,8 mil para ~3,2 mil sessões/s e a CPU por sessão
+  subia de 39 para 267 µs. Medido no `benches/pppoe_bng.rs`, por lote de 10 mil sessões sobre o
+  mesmo BNG, a autenticação (CHAP Response) levava 106 dos 118 µs: o `/ppp secret` era procurado
+  com `Ppp::secret`, que percorre a lista, e o usuário `userN` estava na posição N.
+
+  - `/ppp secret` por nome num índice do BNG, refeito só quando a lista muda (`CowArc::ptr_eq`).
+  - `SubIndex` ao lado das sessões: sessões no ar por endereço (a descida do caminho lento
+    percorria todas as sessões **por pacote**), por login (`only-one`) e as em autenticação por
+    (porta, MAC) (o `new_session_rate` no PADI). `Bng::check` confere o índice contra as sessões.
+  - `interface.pppoe-server.monitor` › `dataplane` passa a dizer se as sessões estão no XDP (o
+    campo existia e nunca era preenchido).
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-daemon pppoe_bng
+  cargo bench -p corerouter-daemon --bench pppoe_bng -- --test   # imprime µs por lote
+  ```
+
+- 2026-10-25 — G4.3g: Laboratório em massa do BNG com o BNG Blaster (rtbrick, BSD-3): `cargo xtask bng-lab`.
+
+  - **Topologia:** o daemon real (`--backend linux`, build release) num namespace descartável;
+    num segundo namespace, o BNG Blaster nas pontas dos veth das portas de acesso e da rede.
+    Uma porta de acesso a cada 50 mil sessões (o SESSION_ID tem 16 bits).
+  - **Sem root** (`unshare --user --map-root-user --net`): caminho lento, sem policer.
+  - **Com `--root`** (`sudo ip netns add crbng`, apagado no fim): XDP nas portas e o cliente
+    Linux `pppd` 2.4.9 com o plugin `pppoe.so` (rp-pppoe) e `tcpdump`. Nada toca as placas do
+    host.
+
+  **Etapas por escala** (`--scales 1000,10000,100000`):
+
+  - setup com as proteções desligadas;
+  - keepalive e tráfego de sessão mantidos por 30 s, sem queda (uma amostra de 10 mil sessões
+    acima de 10 mil);
+  - queda total (BNG Blaster morto, sem PADT) e reconexão em massa com as proteções padrão e
+    depois sem elas;
+  - encerramento por PADT.
+
+  **Etapa RADIUS** (`--radius 100`, `proto_radius::testserver`):
+
+  - `Mikrotik-Rate-Limit` 1M/2M e fluxos nos dois sentidos a 2× a taxa: precisão do policer;
+  - CoA que sobe a taxa de um décimo dos assinantes;
+  - Disconnect-Request de outro décimo com o tráfego correndo.
+
+  **Saídas:**
+
+  - `summary.json` (máquina) e `summary.md` (tabela);
+  - relatórios e logs do BNG Blaster;
+  - capturas. As capturas reais viram goldens em `crates/proto-pppoe/tests/fixtures`
+    (`tests/goldens.rs`: todo quadro dos dois lados decodifica, volta aos mesmos bytes pelos
+    oráculos de fuzz e cada captura tem a conversa inteira):
+    - BNG Blaster 1.0.1 com CHAP: 27 quadros;
+    - `pppd` 2.4.9: 73 quadros, com IPv4, LCP echo e IPv6CP recusado.
+
+  **Como testar:**
+
+  ```sh
+  cargo test -p corerouter-proto-pppoe --test goldens
+  cargo xtask bng-lab --blaster <bngblaster> --scales 1000 --only capture,scale   # sem root
+  cargo xtask bng-lab --root --blaster <bngblaster>                               # tudo, pede sudo
+  ```
+
+  O BNG Blaster vem do `.deb` do release oficial (`dpkg-deb -x` basta, sem instalar).
+
+  **Achados da primeira rodada** (corrigidos no PR anterior): setup O(n) por sessão (o secret era
+  procurado na lista) e o `dataplane` do monitor nunca era preenchido.
+
+- 2026-10-25 — G4.3g: BNG em escala, parte c (achados do laboratório):
+
+  - **`/ppp secret` com índice por nome** (`corerouter_model::ppp_secrets::Secrets`, no lugar do
+    `CowArc<Vec<PppSecret>>`):
+    - `Ppp::secret` passa a ser O(1), e com isso o `ppp.secret.add` (a checagem de nome
+      repetido) e o login do BNG, que agora usa o índice do modelo em vez do seu próprio.
+    - O índice nasce na primeira consulta e é compartilhado pelas cópias do config; o `push` o
+      mantém e qualquer outra escrita o descarta.
+    - Migrar 100 mil assinantes de um RouterOS deixa de ser O(n²).
+  - **"Why?" sem apagar tudo:** ao encher (agora 2 × as vagas do XDP = 262 144 chaves, duas por
+    assinante), sai a chave usada há mais tempo. Antes, a tabela se apagava inteira a cada 100
+    mil chaves, isto é, a cada 50 mil logins.
+  - **Buffer de recepção dos sockets com rajada** (RADIUS e portas PPPoE):
+    - `SO_RCVBUFFORCE` com CAP_NET_ADMIN (passa do `net.core.rmem_max`); sem ela, `SO_RCVBUF`;
+    - o tamanho obtido vai para a verificação nova **Socket buffers** do
+      `system.health.check` (13 verificações), que avisa quando ficou menor que o pedido e diz
+      como subir.
+  - **`new_session_rate=auto`:** o limite de sessões novas segue a saúde do RADIUS, como a
+    janela do TCP (AIMD), medida pelo próprio BNG em cada resposta:
+    - sobe 500/s a cada segundo enquanto o p90 fica em até 100 ms e há CPEs esperando, até
+      20 000/s;
+    - cai pela metade quando o p90 passa de 300 ms ou há timeout, até 50/s.
+
+    `interface.pppoe-server.monitor` (`admission_rate`, `admission_reason`) e a coluna nova **New
+    Sessions** da aba PPPoE Servers mostram o limite atual e o motivo ("RADIUS lento: 380 ms").
+    Um número volta ao modo fixo.
+  - **`ppp.active.list` sem copiar a tabela:** `PppBackend::active_page` filtra no lugar e copia só
+    a página (seleção parcial, O(n)); `server.list` conta as sessões por servidor sem copiá-las.
+    Com 100 mil no ar, cada atualização da GUI copiava e ordenava as 100 mil com o lock do engine.
+  - **Laboratório:** etapa `wave`, a onda de 100 mil contra um RADIUS de capacidade limitada
+    (`--radius-cap`, padrão 3000/s: a fila faz a latência crescer como num servidor saturado), com
+    `new_session_rate` desligado, fixo em 2000 e `auto`.
+  - **Callbacks do RADIUS:** conferido que o do BNG só põe a resposta na fila do BNG (canal); a
+    thread do RADIUS não faz trabalho do PPPoE.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-model ppp_secrets
+  cargo test -p corerouter-daemon admission_tests
+  cargo test -p corerouter-engine new_session_rate_auto
+  cargo test -p corerouter-engine health
+  cargo bench -p corerouter-engine --bench batch_import -- ppp_secret   # imprime µs por lote de 10 mil
+  ```
+
+- 2026-10-25 — G4.3g: O plano de controle do PPPoE em vários núcleos (o laboratório mostrou uma thread a 98% e as
+  outras livres).
+
+  **Como fica:**
+
+  - **Leitura e workers:** a thread do serviço lê as portas de acesso (e o `bng0` do caminho
+    lento) e entrega cada quadro a um worker pelo MAC do cliente, como o RSS. O PADI, o PADR e a
+    sessão de um CPE caem sempre no mesmo worker.
+  - **Cada worker tem um `Bng`:** servidores com uma faixa (`sid_lane`) do SESSION_ID de cada
+    porta, sem lock entre eles (RFC 2516 §4: único por porta); sessões, timers, perguntas ao
+    RADIUS; os próprios sockets de envio (`PortSender`, `SlowTx`).
+  - **Compartilhado:**
+    - a tabela ativa, o histórico e os pools IPv4/IPv6, com um endereço emprestado uma vez só;
+    - as vagas do XDP, intercaladas por worker.
+  - **Sem lock compartilhado por quadro:** o "Why?" fica numa tabela por worker (`ppp.why` olha
+    todas) e os contadores do monitor são locais, publicados uma vez por segundo.
+  - **Limites repartidos:** `new_session_rate` (fixo ou auto), `padi_limit` e as faixas do
+    `pado_delay_by_load` são divididos entre os workers; o `mac_padi_limit` fica, porque um MAC
+    vai sempre ao mesmo worker.
+  - **Pedidos por SESSION_ID:** `ppp.active.remove`, CoA e Disconnect vão ao worker dono pelo id
+    (`*server-sid`), em O(1). Antes, cada id percorria todas as sessões, e derrubar N sessões
+    era O(N²).
+  - **Configuração:** `interface.pppoe-server.settings.set workers=auto|N`, lida quando o
+    serviço começa. `auto` = CPUs − 2, no máximo 8. O monitor e o `settings.get` mostram quantos
+    rodam.
+  - **Caminho lento:** as rotas /32 de uma rodada saem juntas por uma conexão netlink que fica
+    aberta; antes era um runtime e um socket por rota. `who(ip)` usa um índice por endereço em
+    vez de percorrer a tabela ativa.
+  - **Laboratório:** etapa `workers`, 100 mil com `workers=1` e com `auto`, com a CPU de cada
+    thread e os quadros perdidos antes do BNG.
+
+  **Recepção: fica o leitor único** (decisão por números, `docs/architecture.md`). O socket
+  filtrado por worker (cBPF pelo hash do MAC, `SO_ATTACH_FILTER` sem
+  `unsafe`) foi medido e descartado. O código e o teste dele saíram da árvore (estão no commit
+  8c3859f): o teste contava também os quadros que o próprio namespace gera no veth (IPv6 ND/MLD)
+  e falhou no CI do lote.
+
+  - Num netns, ele baixou a parte serial: a thread mais ocupada passou de 550–1050 ns para
+    150–350 ns por quadro.
+  - Com o BNG Blaster na VM, ficou abaixo do leitor:
+    - **Sem fila (rodada 4):** 22,4 mil sessões/s com 6 workers, contra 57,9 mil do leitor. Um
+      socket de 4 MiB guarda 8739 PADIs, e a rajada de 100 mil chegava em 1,5 s.
+    - **Com uma fila de 65 536 no worker (rodada 5):** 24,0 mil/s, sem perda, com o BNG Blaster
+      a 91% de um núcleo.
+    - A hipótese é retransmissão do CPE por latência, porque o worker esvazia a rajada inteira
+      antes de responder. Ela está registrada, não confirmada.
+  - O PACKET_FANOUT por MAC exigiria `unsafe`, e o `recvmmsg` no leitor não entrou: o leitor
+    ficou a 51% de um núcleo, e não é o gargalo.
+
+  Do trabalho do socket por worker ficou:
+
+  - o filtro das portas descarta as cópias do que o BNG envia (`PACKET_OUTGOING`);
+  - as perdas do kernel por socket (`SO_RXQ_OVFL`, API segura do nix) e as do canal saem no
+    `interface.pppoe-server.monitor` (`rx_dropped`) e no laboratório.
+
+  **Bug no cliente RADIUS:** o timer de um pedido respondido disparava no pedido seguinte do
+  mesmo slot. O `seq` de cada slot recomeçava em 0 e o timer era identificado por (slot, seq).
+  Com muitos logins por segundo, quase todo login saía duas vezes, 0–250 ms depois do
+  original. Isso bate com as 59–93 mil retransmissões das rodadas 3 e 4. Agora o `seq` é único no
+  cliente inteiro (`an_answered_request_leaves_no_timer_behind`: sem a correção, 30 de 40 logins
+  iam em dobro).
+
+  **A onda de reconexão contra um RADIUS lento** (a primeira rodada na VM, com 100 mil sessões
+  contra 3000 respostas/s, deu: desligado 6039 no ar, fixo 2000 com 11 686 e auto com todas em
+  517 s):
+
+  - **O laboratório:** o servidor RADIUS de teste era um só para os três modos, com fila FIFO
+    sem limite que guardava as cópias. Agora é um por modo, com fila de no máximo 2 s de trabalho
+    que descarta a cópia de um pedido que já tem (RFC 5080 §2.2.2, como o FreeRADIUS).
+  - **`auto` à moda do BBR:**
+    - a capacidade é medida em logins respondidos por segundo (o melhor dos últimos 10 s);
+    - o ritmo dobra enquanto ela cresce, depois segue o ciclo 1,25/0,9/1;
+    - uma fila parada (p90 bem acima do tempo sem fila) baixa para 0,9× e um timeout para 0,75×;
+    - **o limite fica nos logins, não nos PADIs:** até ~10 s de capacidade esperam no BNG (o CPE
+      fica no Authenticate, onde as repetições são ignoradas) e saem conforme as respostas
+      voltam, numa janela de pedidos em voo. Um PADI recusado faz o CPE recuar (RFC 2516 §5) e
+      voltar tarde, e o servidor fica ocioso; era o que deixava o auto lento.
+  - **Cliente RADIUS:**
+    - o primeiro timeout de um pedido segue o servidor (SRTT + 4·RTTVAR, RFC 6298 §2, com as
+      amostras de Karn), sem descer do IRT e no máximo MRT. Um servidor que fica lento devagar,
+      como numa onda, não recebe cópias do que ainda está fazendo;
+    - medir também os pedidos retransmitidos (desde a primeira cópia) foi testado e descartado:
+      com 3% de perda prendia o timeout em MRT e atrasava o failover.
+  - **Autenticação na frente do accounting:** com 64 ou mais logins esperando resposta numa
+    lane do serviço RADIUS, os Accounting (Start, Interim, Stop) esperam, no máximo 60 s, e
+    saem quando os logins diminuem. O Acct-Delay-Time conta a espera (RFC 2866 §5.2,
+    `Client::accounting_at`).
+    - Na segunda rodada da VM, 100 mil logins dividiam um servidor de 3000/s meio a meio com os
+      próprios Starts: desligado 69 s, fixo 2000 95 s, auto 107 s, contra um teto de ~67 s.
+    - Na onda, o login vem primeiro e a contabilização logo depois.
+  - **Pedidos em voo pelo BDP:** a janela é a capacidade medida (só os logins respondidos, o
+    máximo dos últimos 10 s) vezes o tempo de resposta sem fila (pelo menos 300 ms), 2× só na
+    partida. A partida passa a 2× o que o servidor respondeu, não 2× o ritmo anterior.
+    - Na terceira rodada da VM, o limite foi a 5503/s com ~1500 logins/s possíveis. A janela
+      seguia esse ritmo e não a capacidade.
+    - O cruzeiro já era 1,0× a capacidade (o ciclo de ganhos 1,25/0,9/1… do BBR).
+  - **Janela inicial:** 64 pedidos em voo até o primeiro segundo com respostas, como a janela
+    inicial do TCP e do BBR. A do ritmo inicial (1000/s × 0,6 s) fazia 2 s de fila num servidor de
+    300/s, acima do timeout de 1,1 s do cliente.
+  - **Login cancelado:** `AaaBackend::authenticate_until`. Quando a sessão acaba (o CPE desistiu),
+    o pedido sai do cliente RADIUS e para de ser retransmitido.
+
+  Como testar:
+
+  ```sh
+  cargo test -p corerouter-proto-pppoe sid_lanes
+  cargo test -p corerouter-daemon workers_split_one_port
+  cargo test -p corerouter-engine pppoe_settings
+  cargo test -p corerouter-daemon --release mass_reconnect_against_a_slow_radius -- --nocapture
+  cargo test -p corerouter-daemon --release --bin corerouter-daemon wave_of_the_vm_round -- --ignored --nocapture
+  cargo test -p corerouter-daemon --release --bin corerouter-daemon wave_with_the_real_client -- --ignored --nocapture
+  cargo test -p corerouter-daemon auto_keeps_the_real_client_from_resending
+  cargo test -p corerouter-proto-radius --test client an_answered_request
+  cargo test -p corerouter-daemon a_called_off_login
+  cargo test -p corerouter-daemon accounting_waits_behind
+  cargo test -p corerouter-proto-radius --test client slowing_server
+  cargo bench -p corerouter-daemon --bench pppoe_bng -- --test     # sessões/s por número de workers
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_pppoe -- --test-threads 1
+  ```
+
+- 2026-10-25 — G4.3g: O relatório do PPPoE para o operador: `docs/pppoe-relatorio.md`.
+
+  - **Conteúdo:**
+    - as capacidades e cada camada de teste com os números **medidos**;
+    - o laboratório com o BNG Blaster na VM corerouter-lab (8 vCPUs, 16 GiB, kernel 7.0), com o
+      histórico das seis rodadas e o que cada correção mudou;
+    - a comparação com o MikroTik v7, o accel-ppp/VyOS e os BNGs Juniper MX, Cisco ASR 9000 e
+      Nokia 7750, com as fontes: onde estamos à frente, onde empatamos e o que falta (HA G4.3h,
+      L2TP G4.3i, shaping G4.3ca, placa real G4.3cb).
+  - **A rodada no hardware do usuário** fica como verificação extra.
+
+  Também entra o workflow `.github/workflows/bng-lab.yml`, só `workflow_dispatch`, que roda
+  `cargo xtask bng-lab --root` no runner do GitHub. Ele baixa o BNG Blaster 1.0.1 do release
+  oficial, confere o SHA-256 e desempacota com `dpkg-deb -x`. Os números do runner (4 vCPUs) saem
+  marcados como "runner do CI".
+
+- 2026-10-25 — processo: Dois testes instáveis travavam a fila (o #227 ficou fora seis vezes):
+
+  - **`corerouter-control` `deadline_bounds_the_total_not_each_read`.** Era um bug de verdade. No Unix, um `SO_RCVTIMEO` vencido volta como `WouldBlock` (EAGAIN), e não como `TimedOut`. O `Sock::read` do canal de controle devolvia um ou outro, conforme quem vencia antes: o prazo verificado por nós ou o do socket. Agora os dois casos saem como `TimedOut`.
+  - **`service::dns::tests` (`a_silent_server_is_skipped` e os outros).** O servidor DNS de teste pegava uma porta UDP livre e tentava a mesma porta em TCP, que um teste paralelo podia estar usando (`AddrInUse`). Agora ele tenta de novo até achar uma porta livre nos dois.

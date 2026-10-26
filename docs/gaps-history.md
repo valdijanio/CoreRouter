@@ -129,3 +129,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-25 — G4.3d: serviço `pppoe` no daemon (BNG em Rust puro, XDP ou caminho lento, RADIUS, CoA/DM)
 - 2026-10-25 — G4.3d: janela PPP (abas do WinBox, Why?, "derruba N sessões")
 - 2026-10-25 — G4.3d feito (BNG: comandos, serviço pppoe, janela PPP e extras)
+- 2026-10-25 — G4.3e feito (BNG dual-stack: IPv6CP, RA, DHCPv6-PD, RADIUS e XDP)
+- 2026-10-25 — G4.3f: IPoE parte 1 (servidor DHCP que autoriza cada cliente, `use_radius`, `ipoe`, `/ppp secret service=ipoe`)
+- 2026-10-25 — G4.3f feito (IPoE: DHCP + opção 82 como sessão, RADIUS, XDP, janela PPP)
+- 2026-10-25 — G4.3g feito em parte (laboratório em massa, BNG em vários núcleos, onda pela capacidade do RADIUS, relatório docs/pppoe-relatorio.md)
