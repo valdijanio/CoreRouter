@@ -171,15 +171,53 @@ impl Session {
         hal.offer_dhcp_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts::LabHosts::default()));
         hal.offer_dhcp6_lab_clients(Arc::new(corerouter_proto_dhcp::lab_hosts6::LabHosts6::default()));
         let (restored, mut boot_errors) = restore(storage.as_mut());
-        let (restored, users) = match restored {
-            Some((store, users, slot)) => (Some((store, slot)), users),
-            None => (None, Users::default()),
+        let (restored, users, slot_bytes) = match restored {
+            Some((store, users, slot, bytes)) => (Some((store, slot)), users, bytes),
+            None => (None, Users::default(), 0),
         };
+        // The commits since the slot was written (G0.22).
+        let mut journal = None;
+        let slot_rev = restored.as_ref().map_or(0, |(store, _)| store.current_revision());
+        let restored = restored.map(|(store, slot)| {
+            let (store, size) =
+                crate::history_files::replay_journal(storage.as_mut(), store, &mut boot_errors);
+            journal = size;
+            (store, slot)
+        });
         // The older revisions kept in files of their own (G1.23).
         let (slot, store) = restored.map_or((None, None), |(store, slot)| (Some(slot), Some(store)));
         let (store, files) =
             crate::history_files::restore_history(storage.as_mut(), store, &mut boot_errors);
         let restored = store.zip(slot);
+        let mut files = files;
+        if let Some((store, slot)) = &restored
+            && let Some(newest) = store.history().last()
+            && let Some(journal) = journal
+            && storage.config_journal()
+        {
+            // Which revisions the two slots hold: a commit is journaled
+            // only with both there (crate::history_files).
+            let slots = match slot {
+                Slot::Current => (
+                    Some(slot_rev),
+                    storage
+                        .load(Slot::Previous)
+                        .ok()
+                        .flatten()
+                        .and_then(|t| crate::history_files::slot_revision(&t)),
+                ),
+                Slot::Previous => (None, Some(slot_rev)),
+            };
+            files.note_boot(
+                (newest.number, newest.config.clone()),
+                // The slot holds the config twice (`running`, the newest
+                // revision): half the file bounds it.
+                slot_bytes / 2,
+                journal,
+                users.clone(),
+                slots,
+            );
+        }
         let mut ext = crate::ext::Extensions::default();
         ext.set(files);
         let mut status = StorageStatus {
@@ -481,16 +519,36 @@ impl Session {
             return Err(EngineError::Validation(issues));
         }
         // It must fit in the saved file with its copy in the history, or
-        // the next boot could not load it (audit #1).
-        // Serialized once: the save after the commit reuses the text (G1.23).
-        let encoded = persist::encode_config(self.store.candidate())
-            .map_err(|e| {
-                EngineError::Validation(vec![corerouter_model::validate::Issue::new(
-                    "config",
-                    format!("cannot be encoded: {e}"),
-                )])
-            })?;
-        let size = encoded.len();
+        // the next boot could not load it (audit #1). With the config
+        // journal (G0.22) the commit serializes only what it changed, and
+        // the size is bounded by the slot plus every line since; only when
+        // that bound passes the limit is the config measured.
+        let unencodable = |e: persist::PersistError| {
+            EngineError::Validation(vec![corerouter_model::validate::Issue::new(
+                "config",
+                format!("cannot be encoded: {e}"),
+            )])
+        };
+        let delta = match self.ext::<crate::history_files::RevisionFiles>() {
+            Some(files) if self.storage.config_journal() && files.size_bound(0).is_some() => {
+                let d = persist::revision_delta(self.store.running(), self.store.candidate())
+                    .map_err(unencodable)?;
+                let text = serde_json::to_string(&d).unwrap_or_default();
+                files
+                    .size_bound(text.len())
+                    .filter(|&bound| bound <= persist::MAX_CONFIG_BYTES)
+                    .map(|_| d)
+            }
+            _ => None,
+        };
+        let (encoded, size) = if delta.is_some() {
+            (None, 0)
+        } else {
+            // Serialized once: the save after the commit reuses the text (G1.23).
+            let text = persist::encode_config(self.store.candidate()).map_err(unencodable)?;
+            let size = text.len();
+            (Some(text), size)
+        };
         if size > persist::MAX_CONFIG_BYTES {
             return Err(EngineError::Validation(vec![corerouter_model::validate::Issue::new(
                 "config",
@@ -535,12 +593,22 @@ impl Session {
             (true, true) => "[safe mode]".to_owned(),
             (true, false) => format!("{comment} [safe mode]"),
         };
+        let base = self.store.current_revision();
         let revision = self.store.commit(&comment, self.now())?;
         self.ext.set(ValidRunning(self.store.running().clone()));
         // G2.3: the CGNAT mapping history ("who was") follows every commit.
         self.cgnat_note();
+        let line = match (&delta, self.store.history().last()) {
+            (Some(d), Some(rev)) => persist::encode_journal_line(rev, base, d).ok(),
+            _ => None,
+        };
         if let Some(files) = self.ext_mut::<crate::history_files::RevisionFiles>() {
-            files.note_encoded(revision, encoded);
+            if let Some(text) = encoded {
+                files.note_encoded(revision, text);
+            }
+            if let Some(line) = line {
+                files.note_line(revision, base, line);
+            }
         }
         if !pending {
             self.save();
@@ -951,7 +1019,7 @@ fn discovered(hal: &mut dyn Hal) -> Config {
 
 /// Newest readable slot, quarantining the unreadable ones on the way.
 #[allow(clippy::type_complexity)]
-fn restore(storage: &mut dyn ConfigStorage) -> (Option<(ConfigStore, Users, Slot)>, Vec<String>) {
+fn restore(storage: &mut dyn ConfigStorage) -> (Option<(ConfigStore, Users, Slot, usize)>, Vec<String>) {
     let mut errors = Vec::new();
     for slot in [Slot::Current, Slot::Previous] {
         let text = match storage.load(slot) {
@@ -964,7 +1032,7 @@ fn restore(storage: &mut dyn ConfigStorage) -> (Option<(ConfigStore, Users, Slot
             }
         };
         match persist::decode_with_users(&text) {
-            Ok((store, users)) => return (Some((store, users, slot)), errors),
+            Ok((store, users)) => return (Some((store, users, slot, text.len())), errors),
             Err(e) => {
                 log::error!("{} config is unreadable, quarantined: {e}", slot.name());
                 errors.push(format!("{}: {e}", slot.name()));

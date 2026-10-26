@@ -230,7 +230,9 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     q.id = queues.next_id();
     let out = json!({"id": q.id, "name": q.name});
     match before {
-        Some(i) if i <= queues.simple.len() => queues.simple.insert(i, q),
+        Some(i) if i <= queues.simple.len() => {
+            queues.simple.insert(i, q);
+        }
         _ => queues.simple.push(q),
     }
     with_plan_warnings(s, out, w)
@@ -308,10 +310,9 @@ fn move_to(s: &mut Session, p: &Value) -> Result<Value> {
     let from = index_of(s, raw)?;
     let to = opt_str(p, "destination")?.map(|d| index_of(s, d)).transpose()?;
     let simple = &mut s.store_mut().candidate_mut().queue.simple;
-    if from >= simple.len() {
+    let Some(q) = simple.remove(from) else {
         return Err(EngineError::bad("id", "gone"));
-    }
-    let q = simple.remove(from);
+    };
     let id = q.id;
     let at = match to {
         // The destination moved up by one when the queue left above it.
