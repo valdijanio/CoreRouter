@@ -143,7 +143,7 @@ const PROFILE_COLUMNS: [table::Column; 10] = [
     num("Secrets").help("ppp.profile.secrets"),
     comment(),
 ];
-const ACTIVE_COLUMNS: [table::Column; 14] = [
+pub(crate) const ACTIVE_COLUMNS: [table::Column; 14] = [
     col("Name").help("ppp.active.name"),
     col("Service").help("ppp.active.service"),
     col("Caller ID").help("ppp.active.caller_id"),
