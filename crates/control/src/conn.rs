@@ -301,7 +301,12 @@ impl Read for Sock {
             self.tcp.set_read_timeout(t)?;
             self.applied = Some(t);
         }
-        self.tcp.read(buf)
+        // On Unix an expired SO_RCVTIMEO comes back as EAGAIN (WouldBlock):
+        // callers see one kind for "the time ran out".
+        self.tcp.read(buf).map_err(|e| match e.kind() {
+            io::ErrorKind::WouldBlock => io::Error::new(io::ErrorKind::TimedOut, e),
+            _ => e,
+        })
     }
 }
 
