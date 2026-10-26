@@ -443,7 +443,7 @@ impl RedundancyTab {
                 ui.weak(crate::system_log::short_time(n(r, "at"), 0));
                 ui.horizontal(|ui| {
                     chip::chip(ui, &text(r, "from"), role_tone(&text(r, "from"), &v));
-                    ui.label("→");
+                    ui.label("»");
                     chip::chip(ui, &text(r, "to"), role_tone(&text(r, "to"), &v));
                 });
                 ui.label(text(r, "reason"));
