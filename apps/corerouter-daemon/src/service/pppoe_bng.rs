@@ -19,7 +19,7 @@ use std::net::Ipv4Addr;
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder};
+use corerouter_engine::framed::{self, Forbidden, FramedTable, Holder, RouteChange};
 use corerouter_engine::ppp::{PppBackend, expand_hook};
 use corerouter_engine::radius::{AaaBackend, AcctSource, SessionOwner};
 use corerouter_hal::pppoe::{PppoeCounters, PppoeOp, PppoeSession, Rate};
@@ -151,17 +151,6 @@ pub(crate) struct Shared {
     /// subscriber may take (set by the workers with the config).
     pub framed: FramedTable,
     pub forbidden: Arc<Forbidden>,
-}
-
-/// The routes a CoA gives a session: each family present replaces all the
-/// session's routes of that family (`Framed-Route ""`: none).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) struct RouteChange {
-    pub v4: bool,
-    pub v6: bool,
-    pub routes: Vec<(FramedRoute, RouteOrigin)>,
-    /// Texts that did not parse: the whole change is refused.
-    pub invalid: Vec<String>,
 }
 
 /// One worker's share of the service counters.
@@ -513,7 +502,7 @@ impl SessionOwner for Owner {
                     .find(|a| a.name == "Mikrotik-Address-List")
                     .map(|a| a.value.clone());
                 let new_ip = req.changes.iter().any(|a| a.name == "Framed-IP-Address");
-                let change = route_change(&req.changes);
+                let change = framed::route_change(&req.changes);
                 if let Some(c) = &change
                     && !new_ip
                 {
@@ -521,7 +510,8 @@ impl SessionOwner for Owner {
                     // routes are checked here, before the ACK.
                     for h in &hits {
                         let ip = sh.active.get(h).and_then(|a| a.address);
-                        if let Err(why) = check_change(&sh, h, ip, c) {
+                        if let Err(why) = framed::check_change(&sh.framed, &sh.forbidden, h, ip, c)
+                        {
                             log::info!("ppp: CoA de rotas recusado: {why}");
                             return CoaOutcome::Nak(407); // Invalid Attribute Value
                         }
@@ -2539,7 +2529,7 @@ impl Bng {
             &want,
             &holder,
             ip,
-            xdp.is_some(),
+            v6_refusal(xdp.is_some()),
         );
         refused.extend(adm.refused.iter().cloned());
         sub.routes = adm.routes.clone();
@@ -3193,7 +3183,7 @@ impl Bng {
             &fresh,
             &holder,
             sub.ip,
-            sub.xdp.is_some(),
+            v6_refusal(sub.xdp.is_some()),
         );
         let xdp = sub.xdp;
         let mut now_routes = kept;
@@ -3383,6 +3373,12 @@ fn route_attributes(routes: &[(FramedRoute, RouteOrigin)]) -> Vec<Attribute> {
         .collect()
 }
 
+/// Why an IPv6 route cannot be had: without XDP there is no IPv6 slow
+/// path (G4.3l).
+fn v6_refusal(xdp: bool) -> Option<&'static str> {
+    (!xdp).then_some("IPv6 só com o plano de dados XDP (sem XDP, G4.3l)")
+}
+
 /// Where a route goes: the XDP LPM of session `xdp`, or (IPv4, no XDP) a
 /// kernel route through `bng0`.
 fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
@@ -3395,67 +3391,6 @@ fn route_effect(xdp: Option<u32>, r: &FramedRoute, add: bool) -> Effect {
             text: format!("PPP: rota {r}: IPv6 sem XDP"),
         },
     }
-}
-
-/// The route attributes of a CoA, if it has any: every `Framed-Route`
-/// and `Framed-IPv6-Route` (RFC 2865 §5.22, RFC 3162 §2.5), repeated. A
-/// family present replaces that family's routes; a value of `""` alone
-/// clears it.
-pub(crate) fn route_change(changes: &[Attribute]) -> Option<RouteChange> {
-    let v4 = changes.iter().any(|a| a.name == "Framed-Route");
-    let v6 = changes.iter().any(|a| a.name == "Framed-IPv6-Route");
-    if !v4 && !v6 {
-        return None;
-    }
-    let (routes, refused) = framed::from_radius(
-        changes
-            .iter()
-            .filter(|a| a.name != "Framed-IPv6-Prefix" && !a.value.trim().is_empty())
-            .map(|a| (a.name.as_str(), a.value.as_str())),
-    );
-    Some(RouteChange {
-        v4,
-        v6,
-        routes,
-        invalid: refused,
-    })
-}
-
-/// Whether session `id` (IPv4 `ip`) may take the routes of `c`: each is
-/// valid and no other session holds an overlapping block. `Err`: why.
-fn check_change(
-    sh: &Shared,
-    id: &str,
-    ip: Option<Ipv4Addr>,
-    c: &RouteChange,
-) -> Result<(), String> {
-    if let Some(why) = c.invalid.first() {
-        return Err(why.clone());
-    }
-    if c.routes.len() > corerouter_model::framed_route::MAX_ROUTES {
-        return Err(format!(
-            "mais de {} rotas",
-            corerouter_model::framed_route::MAX_ROUTES
-        ));
-    }
-    for (k, (r, _)) in c.routes.iter().enumerate() {
-        framed::check(r, ip, &sh.forbidden)?;
-        if let Some((n, h)) = sh.framed.conflict(&r.dst, id) {
-            return Err(format!(
-                "{}: sobrepõe {n}, já roteado para {}",
-                r.dst, h.user
-            ));
-        }
-        if let Some((o, _)) = c
-            .routes
-            .iter()
-            .take(k)
-            .find(|(o, _)| corerouter_model::framed_route::overlaps(&o.dst, &r.dst))
-        {
-            return Err(format!("{}: sobrepõe {} do mesmo pedido", r.dst, o.dst));
-        }
-    }
-    Ok(())
 }
 
 /// The `S=…` string of an MS-CHAP2-Success attribute (RFC 2548 §2.3.3:

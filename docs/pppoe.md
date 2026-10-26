@@ -826,12 +826,18 @@ Aprovado pelo usuário em 2026-10-26 com todos os extras.
   (`routes` com `origin`, `refused_routes`, `find` procura nas rotas), `ppp.why` (as rotas da sessão
   ativa) e `ppp.history`.
 
+- **IPoE** (serviço `ipoe`): as mesmas origens (o secret `service=ipoe`, o Access-Accept, o CoA), a
+  mesma tabela de donos e as mesmas recusas. Como o kernel entrega o IPoE ao assinante (não há
+  encapsulamento), cada bloco vira também uma rota do kernel `bloco via <endereço do assinante>`
+  (`pppoe_io::gateway_routes`), com ou sem XDP; com XDP o bloco entra no LPM para o policer e os
+  contadores, e a origem dentro do bloco passa no anti-spoofing do IPoE.
+
 ### 11.3 O que ficou de fora e por quê
 
-- **Rotas IPoE no serviço `ipoe`**: o campo vale no secret IPoE, mas instalar exige rota do kernel
-  via o assinante (o IPoE não encapsula); vem na parte seguinte da G4.3cd.
+- **IPv6 por IPoE**: o IPoE ainda é só IPv4 (G4.3s); a rota IPv6 de um assinante IPoE é recusada
+  com esse motivo.
 - **Redistribuir os blocos em OSPF/BGP**: o operador anuncia o agregado; a redistribuição por
-  sessão vira gap quando o roteamento dinâmico pedir.
+  sessão é a G4.3ce.
 - **Exportar `routes` no `/export`**: o secret ainda sai comentado (G4.3n).
 
 ### 11.4 Desempenho (**medido**, VM `corerouter-lab`, virtio/veth, XDP generic, 2026-10-26)
