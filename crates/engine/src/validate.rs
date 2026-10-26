@@ -1,5 +1,14 @@
 //! Whole-config validation run before every commit: cross-reference checks
 //! owned by the engine plus each `proto-*` subsystem validator.
+//!
+//! G0.22: the validation is a table of [`Unit`]s, each with the sections of
+//! the config it reads. A commit runs only the units that read a section
+//! the commit changed ([`validate_changed`]); the running config passed all
+//! of them, and a unit whose sections are the same gives the same answer.
+//! The table is checked by tests, not trusted: on a corpus of configs each
+//! unit must answer the same on the config restricted to its sections
+//! (`corerouter_model::sections::restrict`), and random changes validated
+//! both ways must agree (`tests/incremental_validate.rs`).
 
 use std::collections::BTreeMap;
 use std::net::Ipv6Addr;
@@ -7,24 +16,136 @@ use std::net::Ipv6Addr;
 use ipnet::IpNet;
 
 use corerouter_model::route::{self, FIRST_VRF_TABLE, LAST_VRF_TABLE, Reach};
+use corerouter_model::sections::Sections;
 use corerouter_model::{
     BondMode, Config, IfName, Interface, InterfaceKind, Issue, RouteEntry, RoutingTable, VlanId,
 };
 
-pub fn validate_all(cfg: &Config) -> Vec<Issue> {
-    let mut out = core_checks(cfg);
-    out.extend(corerouter_firewall::validate(cfg));
-    out.extend(corerouter_proto_bgp::validate(cfg));
-    out.extend(corerouter_proto_ospf::validate(cfg));
-    out.extend(corerouter_proto_mpls::validate(cfg));
-    out.extend(corerouter_proto_cgnat::validate(cfg));
-    out.extend(corerouter_proto_dns::validate(cfg));
-    out.extend(corerouter_proto_dhcp::validate(cfg));
-    out.extend(corerouter_proto_discovery::validate(cfg));
-    out
+/// One validator and the sections of the config it reads.
+pub struct Unit {
+    pub name: &'static str,
+    pub reads: Sections,
+    pub run: fn(&Config) -> Vec<Issue>,
 }
 
-fn core_checks(cfg: &Config) -> Vec<Issue> {
+/// The big sections: a unit that does not name one of them is not run
+/// by a commit that writes only it (a secret, a route, an address-list
+/// entry), and those are the commits that come by the thousand.
+const BIG: Sections = Sections::ADDRESSES
+    .union(Sections::ROUTES)
+    .union(Sections::FILTER)
+    .union(Sections::NAT)
+    .union(Sections::MANGLE)
+    .union(Sections::ADDRESS_LISTS)
+    .union(Sections::DNS_STATIC)
+    .union(Sections::DNS_ZONES)
+    .union(Sections::DHCP_SERVER)
+    .union(Sections::PPP_SECRETS);
+
+/// Every section but the big ones and the interfaces' comments (which no
+/// validator reads), plus `extra`: what a `proto-*` validator declares,
+/// from a review of what its code (and the model helpers it calls) reads.
+const fn small_and(extra: Sections) -> Sections {
+    Sections::ALL.without(BIG).without(Sections::IFACE_COMMENTS).union(extra)
+}
+
+/// Every validator, in the order their issues are reported.
+pub const UNITS: &[Unit] = &[
+    Unit {
+        name: "interfaces",
+        // A bond slave carries no address nor DHCP client of its own.
+        reads: Sections::INTERFACES
+            .union(Sections::ADDRESSES)
+            .union(Sections::IP_REST)
+            .union(Sections::IPV6),
+        run: interface_checks,
+    },
+    Unit {
+        name: "addresses",
+        reads: Sections::ADDRESSES.union(Sections::INTERFACES),
+        run: address_checks,
+    },
+    Unit {
+        name: "routes",
+        reads: Sections::ROUTES.union(Sections::ADDRESSES).union(Sections::INTERFACES),
+        run: route_checks,
+    },
+    Unit {
+        name: "ntp",
+        reads: Sections::SYSTEM,
+        run: |cfg| {
+            let mut out = Vec::new();
+            ntp_checks(cfg, &mut out);
+            out
+        },
+    },
+    Unit {
+        name: "firewall",
+        reads: small_and(Sections::FIREWALL),
+        run: corerouter_firewall::validate,
+    },
+    Unit {
+        name: "bgp",
+        reads: small_and(Sections::NONE),
+        run: corerouter_proto_bgp::validate,
+    },
+    Unit {
+        name: "ospf",
+        reads: small_and(Sections::NONE),
+        run: corerouter_proto_ospf::validate,
+    },
+    Unit {
+        name: "mpls",
+        reads: small_and(Sections::NONE),
+        run: corerouter_proto_mpls::validate,
+    },
+    Unit {
+        name: "cgnat",
+        reads: small_and(Sections::ADDRESSES),
+        run: corerouter_proto_cgnat::validate,
+    },
+    Unit {
+        name: "dns",
+        reads: small_and(Sections::ADDRESSES.union(Sections::DNS_STATIC).union(Sections::DNS_ZONES)),
+        run: corerouter_proto_dns::validate,
+    },
+    Unit {
+        name: "dhcp",
+        reads: small_and(
+            Sections::ADDRESSES
+                .union(Sections::ROUTES)
+                .union(Sections::ADDRESS_LISTS)
+                .union(Sections::DNS_ZONES)
+                .union(Sections::DHCP_SERVER)
+                .union(Sections::PPP_SECRETS),
+        ),
+        run: corerouter_proto_dhcp::validate,
+    },
+    Unit {
+        name: "discovery",
+        reads: small_and(Sections::NONE),
+        run: corerouter_proto_discovery::validate,
+    },
+];
+
+pub fn validate_all(cfg: &Config) -> Vec<Issue> {
+    validate_changed(cfg, Sections::ALL)
+}
+
+/// The issues of the units that read a section in `changed` (a section
+/// no table names, [`Sections::OTHER`], runs them all). With the running
+/// config valid, `changed` = what the candidate changed gives the same
+/// issues as [`validate_all`].
+pub fn validate_changed(cfg: &Config, changed: Sections) -> Vec<Issue> {
+    let all = changed.contains(Sections::OTHER);
+    UNITS
+        .iter()
+        .filter(|u| all || u.reads.intersects(changed))
+        .flat_map(|u| (u.run)(cfg))
+        .collect()
+}
+
+fn interface_checks(cfg: &Config) -> Vec<Issue> {
     let mut out = Vec::new();
     let mut vlans: BTreeMap<(&IfName, VlanId), &IfName> = BTreeMap::new();
     let mut vrf_tables: BTreeMap<u32, &IfName> = BTreeMap::new();
@@ -92,6 +213,11 @@ fn core_checks(cfg: &Config) -> Vec<Issue> {
             ));
         }
     }
+    out
+}
+
+fn address_checks(cfg: &Config) -> Vec<Issue> {
+    let mut out = Vec::new();
     if cfg.ip.addresses.len() > MAX_ADDRESSES {
         out.push(Issue::new(
             "ip.addresses",
@@ -120,6 +246,11 @@ fn core_checks(cfg: &Config) -> Vec<Issue> {
             ));
         }
     }
+    out
+}
+
+fn route_checks(cfg: &Config) -> Vec<Issue> {
+    let mut out = Vec::new();
     // Duplicates can only be among routes to the same destination in the
     // same table: compare inside those groups (O(R log R); comparing every
     // pair was O(R²) on each commit, with up to MAX_ROUTES routes).
@@ -135,7 +266,6 @@ fn core_checks(cfg: &Config) -> Vec<Issue> {
         );
         group.push(r);
     }
-    ntp_checks(cfg, &mut out);
     out
 }
 

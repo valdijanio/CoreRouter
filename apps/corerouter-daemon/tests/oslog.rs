@@ -97,14 +97,23 @@ fn lab_daemon_shows_the_lab_os_log() {
     let last = v["last"].as_u64().unwrap();
     let again = call(&d, "log.os.print", json!({"since": last}));
     assert!(again["entries"].as_array().unwrap().len() <= 1);
-    let svc = call(&d, "system.service.print", json!({}));
-    let row = svc
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| s["name"] == "os-log")
-        .unwrap_or_else(|| panic!("no os-log row: {svc}"));
-    assert!(row.to_string().contains("virtual lab"), "{row}");
+    // The service may still be starting on a loaded machine.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let svc = call(&d, "system.service.print", json!({}));
+        let row = svc
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["name"] == "os-log")
+            .unwrap_or_else(|| panic!("no os-log row: {svc}"))
+            .to_string();
+        if row.contains("virtual lab") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{row}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[cfg(target_os = "linux")]

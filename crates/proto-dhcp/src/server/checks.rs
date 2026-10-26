@@ -1030,11 +1030,14 @@ fn ipoe_checks(cfg: &Config, out: &mut Out) {
         .servers
         .iter()
         .any(|r| !r.disabled && r.service.contains(&AaaService::Dhcp));
-    let secrets = cfg
-        .ppp
-        .secrets
-        .iter()
-        .any(|x| !x.disabled && x.service == PppService::Ipoe);
+    // A walk of every secret: only when a server needs the answer (100 000
+    // PPPoE secrets and no IPoE server cost it on every commit, G0.22).
+    let secrets = || {
+        cfg.ppp
+            .secrets
+            .iter()
+            .any(|x| !x.disabled && x.service == PppService::Ipoe)
+    };
     for s in &cfg.ip.dhcp_server.servers {
         let at = |f: &str| format!("ip.dhcp_server.servers[{}].{f}", s.id);
         if s.use_radius != UseRadius::No && !radius_dhcp {
@@ -1048,7 +1051,7 @@ fn ipoe_checks(cfg: &Config, out: &mut Out) {
         if s.authorizes()
             && s.use_radius != UseRadius::Yes
             && s.ipoe_unknown == IpoeUnknown::Reject
-            && !secrets
+            && !secrets()
         {
             out.warn(
                 at("ipoe_unknown"),
