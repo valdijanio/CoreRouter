@@ -1096,7 +1096,8 @@ pub(crate) struct Snapshot {
 /// G4.3h: this node is the active one of its redundant pair (set by the
 /// daemon's `ppp-ha` service; false until it says so: a node that boots
 /// keeps quiet until the pair decides).
-pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+pub(crate) static HA_ACTIVE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub(crate) struct Bng {
     slots: Vec<Slot>,
@@ -3382,7 +3383,10 @@ impl Bng {
             self.drop_slot(now, i);
         }
         self.ha.handed_over = false;
-        self.log(false, "PPPoE: o par assumiu; as sessões deste nó foram encerradas sem aviso ao CPE".into());
+        self.log(
+            false,
+            "PPPoE: o par assumiu; as sessões deste nó foram encerradas sem aviso ao CPE".into(),
+        );
     }
 
     /// End every session (service stopping): Terminate and PADT to each.

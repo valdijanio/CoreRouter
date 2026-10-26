@@ -179,7 +179,11 @@ impl Bng {
             ifindex: st.ifindex,
             vlan: vlan_field(st.vlans.outer),
             inner_vlan: vlan_field(st.vlans.inner),
-            outer_tpid: if st.vlans.inner != 0 { st.vlans.outer_tpid } else { 0 },
+            outer_tpid: if st.vlans.inner != 0 {
+                st.vlans.outer_tpid
+            } else {
+                0
+            },
             sid: st.sid,
             client_mac: st.client_mac.0,
             server_mac: slot.port.mac,
@@ -205,9 +209,15 @@ impl Bng {
                 addr: n.network(),
                 len: n.prefix_len(),
             }),
-            pool6: v6.and_then(|x| x.link.as_ref()).and_then(|(_, s)| pool_of(s)),
-            pd_pool: v6.and_then(|x| x.delegated.as_ref()).and_then(|(_, s)| pool_of(s)),
-            dns6: v6.map(|x| x.dns.iter().take(4).copied().collect()).unwrap_or_default(),
+            pool6: v6
+                .and_then(|x| x.link.as_ref())
+                .and_then(|(_, s)| pool_of(s)),
+            pd_pool: v6
+                .and_then(|x| x.delegated.as_ref())
+                .and_then(|(_, s)| pool_of(s)),
+            dns6: v6
+                .map(|x| x.dns.iter().take(4).copied().collect())
+                .unwrap_or_default(),
             rate_limit: sub.rate.as_deref().map(Into::into),
             session_timeout: sub.session_timeout,
             idle_timeout: sub.effective.idle_timeout,
@@ -265,7 +275,10 @@ impl Bng {
                 let Some(a) = sh.active.get(&session_id(*slot, &self.slots, *sid)) else {
                     continue;
                 };
-                let vlans = s.server.export(now, *sid).map_or(Vlans::NONE, |st| st.vlans);
+                let vlans = s
+                    .server
+                    .export(now, *sid)
+                    .map_or(Vlans::NONE, |st| st.vlans);
                 self.ha.out.push(HaChange::Counters(
                     key_of(&s.cfg.name, vlans, *sid, sub.mac),
                     HaCounters {
@@ -309,7 +322,10 @@ impl Bng {
                     "PPPoE: o par caiu; {} sessões assumidas sem o assinante perceber{}",
                     done.sessions,
                     if done.skipped > 0 {
-                        format!(", {} não couberam (servidor ou número de workers diferente no par)", done.skipped)
+                        format!(
+                            ", {} não couberam (servidor ou número de workers diferente no par)",
+                            done.skipped
+                        )
                     } else {
                         String::new()
                     }
@@ -358,10 +374,16 @@ impl Bng {
                     nbns: r.nbns,
                     ipv6: r.local_iid.zip(r.ipv6_iid),
                     v6_mode: Ipv6Mode::On,
-                    rate_limit: r.rate_limit.as_deref().and_then(|t| t.parse::<RateLimit>().ok()),
+                    rate_limit: r
+                        .rate_limit
+                        .as_deref()
+                        .and_then(|t| t.parse::<RateLimit>().ok()),
                     session_timeout: r.session_timeout,
                     timeout_left_ms: r.session_timeout.map(|t| {
-                        (r.started_at + u64::from(t)).saturating_sub(unix_now).max(1) * 1000
+                        (r.started_at + u64::from(t))
+                            .saturating_sub(unix_now)
+                            .max(1)
+                            * 1000
                     }),
                     circuit_id: r.circuit_id.clone(),
                     remote_id: r.remote_id.clone(),
@@ -408,15 +430,17 @@ impl Bng {
             guard(&self.pools).hold(ip);
         }
         let xdp = if self.xdp { self.slot_index() } else { None };
-        let hold6 = |p: Option<Prefix6>, pool: &Option<Box<str>>| -> Option<(ipnet::Ipv6Net, v6::Source)> {
-            let p = p?;
-            let n = ipnet::Ipv6Net::new(p.addr, p.len).ok()?;
-            guard(&self.pools6).hold(n);
-            Some((
-                n,
-                pool.as_deref().map_or(v6::Source::Radius, |name| v6::Source::Pool(name.to_owned())),
-            ))
-        };
+        let hold6 =
+            |p: Option<Prefix6>, pool: &Option<Box<str>>| -> Option<(ipnet::Ipv6Net, v6::Source)> {
+                let p = p?;
+                let n = ipnet::Ipv6Net::new(p.addr, p.len).ok()?;
+                guard(&self.pools6).hold(n);
+                Some((
+                    n,
+                    pool.as_deref()
+                        .map_or(v6::Source::Radius, |name| v6::Source::Pool(name.to_owned())),
+                ))
+            };
         let link = hold6(r.ipv6_prefix, &r.pool6);
         let delegated = hold6(r.delegated, &r.pd_pool);
         let v6 = match (r.local_iid, r.ipv6_iid) {
@@ -467,8 +491,14 @@ impl Bng {
             idle_since: now,
             descriptor_vlan: (d.vlan != 0).then_some(d.vlan & 0x0fff),
             auth_cancel: None,
-            circuit_id: r.circuit_id.as_deref().map(|c| String::from_utf8_lossy(c).into_owned()),
-            remote_id: r.remote_id.as_deref().map(|c| String::from_utf8_lossy(c).into_owned()),
+            circuit_id: r
+                .circuit_id
+                .as_deref()
+                .map(|c| String::from_utf8_lossy(c).into_owned()),
+            remote_id: r
+                .remote_id
+                .as_deref()
+                .map(|c| String::from_utf8_lossy(c).into_owned()),
             service_name: String::from_utf8_lossy(&r.service_name).into_owned(),
             fallback_profile: r.fallback_profile.to_string(),
             mtu: d.mtu,
@@ -515,7 +545,14 @@ impl Bng {
             lane: self.lane,
             service: "pppoe",
         };
-        let adm = framed::admit(&self.cfg.framed, &self.cfg.forbidden, &want, &holder, ip, xdp.is_some());
+        let adm = framed::admit(
+            &self.cfg.framed,
+            &self.cfg.forbidden,
+            &want,
+            &holder,
+            ip,
+            xdp.is_some(),
+        );
         sub.routes = adm.routes.clone();
         for (rt, _) in &adm.routes {
             self.effects.push(route_effect(xdp, rt, true));
@@ -559,7 +596,11 @@ impl Bng {
         if let Some(f) = sub.v6.as_deref().map(active_v6) {
             f.apply(&mut a);
         }
-        let v6_attrs = sub.v6.as_deref().map(V6::acct_attributes).unwrap_or_default();
+        let v6_attrs = sub
+            .v6
+            .as_deref()
+            .map(V6::acct_attributes)
+            .unwrap_or_default();
         let list = sub.effective.address_list.clone();
         let interim = sub.interim;
         let acct_id = sub.acct_id.clone();
@@ -612,7 +653,10 @@ impl Bng {
                 },
             };
             if let Err(e) = aaa.account(req, Some(src)) {
-                self.log(true, format!("PPP: Accounting-Interim de {user} (tomada) não enviado: {e}"));
+                self.log(
+                    true,
+                    format!("PPP: Accounting-Interim de {user} (tomada) não enviado: {e}"),
+                );
             }
         }
         if let (Some(l), Some(ip)) = (list, ip) {

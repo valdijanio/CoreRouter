@@ -125,7 +125,10 @@ impl Drop for HaPort {
         if self.promisc_by_us
             && let Err(e) = set_promisc(self.ifindex, false)
         {
-            log::warn!("ppp-ha: could not restore promiscuous off on {}: {e}", self.name);
+            log::warn!(
+                "ppp-ha: could not restore promiscuous off on {}: {e}",
+                self.name
+            );
         }
         if self.allmulti_by_us
             && let Err(e) = set_allmulti(self.ifindex, false)
@@ -141,7 +144,10 @@ impl Drop for HaPort {
 fn flags(name: &IfName) -> InterfaceFlags {
     getifaddrs()
         .ok()
-        .and_then(|mut it| it.find(|a| a.interface_name == name.as_str()).map(|a| a.flags))
+        .and_then(|mut it| {
+            it.find(|a| a.interface_name == name.as_str())
+                .map(|a| a.flags)
+        })
         .unwrap_or(InterfaceFlags::empty())
 }
 
@@ -155,7 +161,11 @@ fn set_promisc(ifindex: u32, on: bool) -> io::Result<()> {
         let task = tokio::spawn(conn);
         let out = handle
             .link()
-            .set(rtnetlink::LinkUnspec::new_with_index(ifindex).promiscuous(on).build())
+            .set(
+                rtnetlink::LinkUnspec::new_with_index(ifindex)
+                    .promiscuous(on)
+                    .build(),
+            )
             .execute()
             .await
             .map_err(|e| io::Error::other(format!("promiscuous {on} on ifindex {ifindex}: {e}")));

@@ -87,9 +87,21 @@ fn ok(netns: Option<u32>, command: &str, params: Value) -> Value {
 /// The same config on both nodes (one login for every CPE: the default
 /// profile has only-one=no).
 fn configure(netns: Option<u32>, peer: &str, priority: u32, mode: &str) {
-    ok(netns, "ip.pool.add", json!({"name": "clientes", "ranges": "100.64.0.0/16"}));
-    ok(netns, "ppp.profile.set", json!({"id": "default", "remote_address": "clientes"}));
-    ok(netns, "ppp.secret.add", json!({"name": "cpe", "password": "senha"}));
+    ok(
+        netns,
+        "ip.pool.add",
+        json!({"name": "clientes", "ranges": "100.64.0.0/16"}),
+    );
+    ok(
+        netns,
+        "ppp.profile.set",
+        json!({"id": "default", "remote_address": "clientes"}),
+    );
+    ok(
+        netns,
+        "ppp.secret.add",
+        json!({"name": "cpe", "password": "senha"}),
+    );
     ok(
         netns,
         "interface.pppoe-server.server.add",
@@ -247,7 +259,10 @@ fn query_helper() {
 
 /// The pair, the CPEs up on A; returns what the takeover test needs.
 fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
-    let n: usize = std::env::var("COREROUTER_HA_CPES").ok().and_then(|v| v.parse().ok()).unwrap_or(200);
+    let n: usize = std::env::var("COREROUTER_HA_CPES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
     ip(None, &["link", "set", "lo", "up"]);
     let holder = namespace_b();
     let b = holder.0.id();
@@ -255,9 +270,24 @@ fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
     ip(Some(b), &["link", "set", "lo", "up"]);
     ip(None, &["link", "add", "br0", "type", "bridge"]);
     ip(None, &["link", "set", "br0", "up"]);
-    ip(None, &["link", "add", "acc0", "type", "veth", "peer", "name", "acc0-p"]);
-    ip(None, &["link", "add", "cpe0", "type", "veth", "peer", "name", "cpe0-p"]);
-    ip(None, &["link", "add", "accb-p", "type", "veth", "peer", "name", "acc0", "netns", &pid]);
+    ip(
+        None,
+        &[
+            "link", "add", "acc0", "type", "veth", "peer", "name", "acc0-p",
+        ],
+    );
+    ip(
+        None,
+        &[
+            "link", "add", "cpe0", "type", "veth", "peer", "name", "cpe0-p",
+        ],
+    );
+    ip(
+        None,
+        &[
+            "link", "add", "accb-p", "type", "veth", "peer", "name", "acc0", "netns", &pid,
+        ],
+    );
     for p in ["acc0-p", "cpe0-p", "accb-p"] {
         ip(None, &["link", "set", p, "master", "br0"]);
         ip(None, &["link", "set", p, "up"]);
@@ -265,7 +295,12 @@ fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
     ip(None, &["link", "set", "acc0", "up"]);
     ip(None, &["link", "set", "cpe0", "up"]);
     ip(Some(b), &["link", "set", "acc0", "up"]);
-    ip(None, &["link", "add", "sync0", "type", "veth", "peer", "name", "sync0", "netns", &pid]);
+    ip(
+        None,
+        &[
+            "link", "add", "sync0", "type", "veth", "peer", "name", "sync0", "netns", &pid,
+        ],
+    );
     ip(None, &["link", "set", "sync0", "up"]);
     ip(Some(b), &["link", "set", "sync0", "up"]);
     ip(None, &["addr", "add", "10.9.0.1/24", "dev", "sync0"]);
@@ -281,13 +316,20 @@ fn pair(mode: &str) -> (Kill, Kill, Kill, Cpes, u32, usize) {
     let b_daemon = daemon(Some(b), &dir_b, "g43h-pppoe-b.log");
     configure(None, "10.9.0.2", 200, mode);
     configure(Some(b), "10.9.0.1", 100, mode);
-    wait_for("A active, B standby", || role(None) == "active" && role(Some(b)) == "standby");
+    wait_for("A active, B standby", || {
+        role(None) == "active" && role(Some(b)) == "standby"
+    });
 
     let mut cpes = Cpes::new(n);
     cpes.start_all();
-    let t = cpes.run_until(120, |c| c.ups() == n).expect("every CPE up on A");
+    let t = cpes
+        .run_until(120, |c| c.ups() == n)
+        .expect("every CPE up on A");
     eprintln!("{n} CPEs up on A in {t:?}");
-    assert!(cpes.up.iter().all(|u| *u == Some(VMAC)), "every session on the virtual MAC");
+    assert!(
+        cpes.up.iter().all(|u| *u == Some(VMAC)),
+        "every session on the virtual MAC"
+    );
     assert_eq!(active(None), n);
     assert_eq!(active(Some(b)), 0, "the standby answered nobody");
     // Steady state: the standby sends nothing (a PADT of its own to these
@@ -323,10 +365,16 @@ fn stateless_the_cpes_redial_on_the_new_active() {
     let t = cpes
         .run_until(180, |c| c.ups() == n && c.downs >= n)
         .expect("every CPE back, on B");
-    eprintln!("{n} CPEs back on B {t:?} after A died ({} downs)", cpes.downs);
+    eprintln!(
+        "{n} CPEs back on B {t:?} after A died ({} downs)",
+        cpes.downs
+    );
     assert_eq!(role(Some(b)), "active");
     assert_eq!(active(Some(b)), n);
-    assert!(cpes.up.iter().all(|u| *u == Some(VMAC)), "the same AC MAC on B");
+    assert!(
+        cpes.up.iter().all(|u| *u == Some(VMAC)),
+        "the same AC MAC on B"
+    );
 }
 
 fn hot_standby_keeps_every_session_when_the_active_dies() {
@@ -342,7 +390,10 @@ fn hot_standby_keeps_every_session_when_the_active_dies() {
     let took = killed.elapsed();
     // Ten seconds of keepalive (1 s × 3 on the CPEs) on B: nobody falls.
     cpes.run_until(10, |_| false);
-    eprintln!("{n} sessions on B {took:?} after A died; {} CPEs went down", cpes.downs);
+    eprintln!(
+        "{n} sessions on B {took:?} after A died; {} CPEs went down",
+        cpes.downs
+    );
     assert_eq!(cpes.downs, 0, "no CPE noticed");
     assert_eq!(cpes.ups(), n);
     assert_eq!(active(Some(b)), n, "B holds every session");

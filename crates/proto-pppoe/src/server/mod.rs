@@ -535,7 +535,11 @@ impl Server {
 
     /// The port a cookie binds: none in a redundant pair (G4.3h).
     fn cookie_port(&self, ifindex: u32) -> u32 {
-        if self.cfg.cookie_secret.is_some() { 0 } else { ifindex }
+        if self.cfg.cookie_secret.is_some() {
+            0
+        } else {
+            ifindex
+        }
     }
 
     /// Installs a new AC-Cookie secret; cookies under the old one stay valid
@@ -825,7 +829,9 @@ impl Server {
             self.stats.service_refused += 1;
             return;
         }
-        let cookie = self.cookies.issue(now, d.src, self.cookie_port(ifindex), d.vlans);
+        let cookie = self
+            .cookies
+            .issue(now, d.src, self.cookie_port(ifindex), d.vlans);
         let row_delay = match rule.action {
             ServiceAction::Delay => rule.delay_ms,
             _ => 0,
@@ -933,10 +939,10 @@ impl Server {
             return;
         }
         // RFC 2516 §9: no valid cookie, no state.
-        let cookie_ok = d
-            .tags
-            .ac_cookie
-            .is_some_and(|c| self.cookies.verify(now, c, d.src, self.cookie_port(ifindex), d.vlans));
+        let cookie_ok = d.tags.ac_cookie.is_some_and(|c| {
+            self.cookies
+                .verify(now, c, d.src, self.cookie_port(ifindex), d.vlans)
+        });
         if self.cfg.require_cookie && !cookie_ok {
             self.stats.padr_bad_cookie += 1;
             return;
