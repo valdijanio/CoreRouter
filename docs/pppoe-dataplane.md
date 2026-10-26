@@ -43,7 +43,7 @@ Um programa por porta (o XDP só aceita um), em estágios que são funções BPF
      não batem com o quadro): idem.
    - MAC de destino diferente do MAC do BNG na sessão: não é nosso, segue para o kernel.
    - **Anti-spoofing**: IPv4 de origem tem de ser o do IPCP; IPv6 de origem dentro do /64 do RA ou
-     do prefixo delegado. Link-local (fe80::/10), `::` ou destino multicast (RS, NS, DAD, MLD) vai
+     do prefixo delegado; ou, nos dois, dentro de um bloco roteado à própria sessão (G4.3cd). Link-local (fe80::/10), `::` ou destino multicast (RS, NS, DAD, MLD) vai
      para o userspace, que é o "host" do enlace. Fora disso: descarta (`spoofed`).
    - **Policer de upload** (abaixo). Acima da taxa: descarta (`up-policed`).
    - **Decapsulação**: `bpf_xdp_adjust_head` tira as tags e o cabeçalho PPPoE; o quadro vira
@@ -57,11 +57,14 @@ Um programa por porta (o XDP só aceita um), em estágios que são funções BPF
    assinante, `nat_to_subscriber` traduz e encapsula direto para a porta de acesso (a conexão foi
    aceita pelo kernel, então dispensa `F_FAST_DOWN`).
 4. **`down_stage`**:
-   - Pacote limpo (sem VLAN no uplink) para um endereço de assinante (`PPPOE_V4` exato,
-     `PPPOE_V6` LPM no /64 ou no prefixo delegado): com `F_FAST_DOWN`, TTL > 1, tamanho ≤ MTU da
+   - Pacote limpo (sem tag, ou com uma ou duas tags no uplink, G4.3cd) para um endereço de
+     assinante (`PPPOE_V4` exato, `PPPOE_V6` LPM no /64 ou no prefixo delegado) ou para um bloco
+     roteado a ele (`PPPOE_RT4`/`PPPOE_RT6`, LPM, só quando o primeiro falha): com `F_FAST_DOWN`, TTL > 1, tamanho ≤ MTU da
      sessão e dentro da taxa de download, desconta o TTL (checksum incremental, RFC 1624),
      `bpf_xdp_adjust_head` negativo, grava MACs, tags, PPPoE e protocolo e `bpf_redirect` para a
-     porta de acesso. Vale também entre dois assinantes (hairpin).
+     porta de acesso. Vale também entre dois assinantes (hairpin). As tags do uplink saem só
+     quando o pacote vai pelo XDP (`pppoe::untag`); o que vai ao kernel segue com elas.
+     A decisão inteira é `pppoe::to_subscriber`, a mesma função no programa e no modelo de teste.
    - Pacote de um assinante com `F_FAST_UP`: `bpf_fib_lookup` (IPv4 ou IPv6), TTL − 1, MACs,
      `bpf_redirect`. Sem `F_FAST_UP` ou se a FIB não resolve: o kernel.
 
@@ -75,8 +78,11 @@ Um programa por porta (o XDP só aceita um), em estágios que são funções BPF
 | Descida com TTL ≤ 1 | kernel: ICMP time exceeded | `down-ttl` |
 | Descida maior que o MTU da sessão | kernel: fragmenta ou manda ICMP "fragmentation needed"/"packet too big" (RFC 1191, RFC 8201) com o MTU da rota do assinante | `down-mtu` |
 | Descida para sessão sem `F_FAST_DOWN` | kernel | `down-kernel` |
-| Descida num uplink com VLAN | kernel (G4.3ca) | `down-tagged` |
 | Fragmentos IPv4, ICMP de erro, IP com opções no CGNAT | kernel (regras da G2.5b) | `NAT_MISS` |
+
+Contadores da G4.3cd em `PPPOE_STATS`: `down-tagged` (descida vinda de um uplink com tag,
+encapsulada no XDP; também conta em `down-fast`) e `down-routed` (descida para um bloco roteado,
+qualquer que tenha sido o destino depois).
 
 A entrega pelo kernel ao assinante (rota do assinante → encapsulamento num programa tc de saída,
 uma interface `bng0` para todas as sessões, sem uma por sessão) e o shaping EDT são a parte
@@ -104,6 +110,8 @@ impl Pod`.
 | `PPPOE_COUNTERS` | array | índice → 8 contadores | 131 072 |
 | `PPPOE_STATS` | per-CPU array | `pppoe::Stat` → pacotes | 20 |
 | `IPOE_PORTS` | hash | ifindex da porta de acesso IPoE → flags (G4.3f) | 256 |
+| `PPPOE_RT4` | LPM trie | bloco IPv4 roteado a um assinante → índice (G4.3cd) | 65 536 |
+| `PPPOE_RT6` | LPM trie | bloco IPv6 roteado a um assinante → índice (G4.3cd) | 65 536 |
 
 - Os arrays são pré-alocados: ~64 MiB com PPPoE ligado (**estimado**). Desligado, o carregador
   os cria com 1 entrada; ligar ou desligar recarrega o objeto e as sessões conhecidas voltam

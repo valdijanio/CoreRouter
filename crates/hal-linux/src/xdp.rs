@@ -518,6 +518,8 @@ fn load(fast_nat: bool, pppoe: bool) -> Result<Loaded, HalError> {
             loader.map_max_entries(name, 1);
         }
         loader.map_max_entries(m::PPPOE_V6, 1);
+        loader.map_max_entries(m::PPPOE_RT4, 1);
+        loader.map_max_entries(m::PPPOE_RT6, 1);
         loader.map_max_entries(m::PPPOE_POLICER, 2);
     }
     let mut ebpf = loader
