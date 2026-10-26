@@ -843,7 +843,7 @@ mod tests {
         let mut st = big(1, 3);
         let mut cfg = st.running().clone();
         cfg.ip.firewall.next_rule_id = 1;
-        cfg.ip.firewall.filter[2].id = crate::ItemId(2); // *1 *2 *2
+        cfg.ip.firewall.filter.get_mut(2).unwrap().id = crate::ItemId(2); // *1 *2 *2
         let fixed = repair_ids(cfg);
         let ids: Vec<u32> = fixed.ip.firewall.filter.iter().map(|r| r.id.0).collect();
         assert_eq!(ids, [1, 2, 3]);

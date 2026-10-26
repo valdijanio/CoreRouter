@@ -6,3 +6,6 @@ build-std = ["core"]
 
 [target.bpfel-unknown-none]
 linker = "bpf-linker"
+# BPF ISA v3 (kernel 5.12+): BPF_CMPXCHG for the policer and shaper clocks
+# (G4.3cc) and 32-bit jumps. rustc hands it to bpf-linker as `--cpu`.
+rustflags = ["-C", "target-cpu=v3"]

@@ -648,3 +648,89 @@ fn accounting_waits_behind_a_wave_of_logins() {
     assert_eq!(a.session_id, "S-W");
     assert!(a.delay_time >= 1, "Acct-Delay-Time counts the wait: {}", a.delay_time);
 }
+
+/// G4.3cd: an Access-Accept with repeated `Framed-Route` (RFC 2865 §5.22),
+/// `Framed-IPv6-Route` (RFC 3162 §2.5) and a second `Framed-IPv6-Prefix`
+/// (§2.3) comes out of the service with every repeat, in order, and the
+/// BNG's reader turns them into the session's routes.
+#[test]
+fn repeated_framed_routes_reach_the_bng() {
+    let srv = TestRadius::start(9);
+    {
+        let mut reply = AttrList::new();
+        reply.push_text(attr::FRAMED_ROUTE, "203.0.113.8/29 0.0.0.0 1").unwrap();
+        reply.push_text(attr::FRAMED_ROUTE, "198.51.100.0/30").unwrap();
+        reply.push_text(99, "2001:db8:100::/48 :: 1").unwrap();
+        reply.push_ipv6_prefix(attr::FRAMED_IPV6_PREFIX, "2001:db8:1:1::".parse().unwrap(), 64).unwrap();
+        reply.push_ipv6_prefix(attr::FRAMED_IPV6_PREFIX, "2001:db8:9::".parse().unwrap(), 56).unwrap();
+        reply.push_text(attr::FRAMED_ROUTE, "10.0.0.1/24").unwrap();
+        srv.srv.lock().unwrap().add_user("empresa", "segredo", reply);
+    }
+    let r = start(vec![srv.entry(1)]);
+    let ok = auth(&r.aaa, "empresa", "segredo");
+    assert_eq!(ok.outcome, AuthOutcome::Accept, "{ok:?}");
+    let routes: Vec<&str> = ok.attributes.iter().filter(|a| a.name == "Framed-Route").map(|a| a.value.as_str()).collect();
+    assert_eq!(routes, ["203.0.113.8/29 0.0.0.0 1", "198.51.100.0/30", "10.0.0.1/24"]);
+    let (want, refused) = corerouter_engine::framed::from_radius(ok.attributes.iter().map(|a| (a.name.as_str(), a.value.as_str())));
+    let got: Vec<String> = want.iter().map(|(r, o)| format!("{r} {}", o.as_str())).collect();
+    assert_eq!(
+        got,
+        [
+            "203.0.113.8/29 framed-route",
+            "198.51.100.0/30 framed-route",
+            "2001:db8:100::/48 framed-ipv6-route",
+            "2001:db8:9::/56 framed-ipv6-prefix",
+        ]
+    );
+    assert_eq!(refused.len(), 1, "the host-bits typo: {refused:?}");
+}
+
+/// G4.3cd: a CoA-Request carrying routes reaches the session's owner with
+/// every `Framed-Route` decoded, and the owner's NAK goes back with its
+/// Error-Cause.
+#[test]
+fn coa_with_routes_reaches_the_owner_and_its_nak_goes_back() {
+    #[derive(Default)]
+    struct Routes {
+        calls: Mutex<Vec<CoaRequest>>,
+    }
+    impl SessionOwner for Routes {
+        fn name(&self) -> &str {
+            "ppp"
+        }
+        fn handle(&self, req: &CoaRequest) -> CoaOutcome {
+            self.calls.lock().unwrap().push(req.clone());
+            if req.changes.iter().any(|a| a.value.starts_with("127.")) {
+                CoaOutcome::Nak(407)
+            } else {
+                CoaOutcome::Ack
+            }
+        }
+    }
+    let port = free_port();
+    let r = start_with(incoming(port));
+    let owner = Arc::new(Routes::default());
+    r.aaa.register_owner(owner.clone());
+    wait_listening(&r.aaa);
+    let dac = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let req = |id: u8, routes: &[&str]| {
+        let mut l = AttrList::new();
+        l.push_text(attr::ACCT_SESSION_ID, "PPP-1").unwrap();
+        l.push_u32(attr::EVENT_TIMESTAMP, unix_now()).unwrap();
+        for t in routes {
+            l.push_text(attr::FRAMED_ROUTE, t).unwrap();
+        }
+        dynauth::build_request(RequestKind::Coa, id, &l, SECRET.as_bytes(), true)
+    };
+    let ack = send(&dac, port, &req(1, &["203.0.113.8/29", "203.0.113.16/29"])).unwrap();
+    assert_eq!(Packet::parse(&ack).unwrap().code(), Code::CoaAck);
+    {
+        let calls = owner.calls.lock().unwrap();
+        let v: Vec<&str> = calls[0].changes.iter().filter(|a| a.name == "Framed-Route").map(|a| a.value.as_str()).collect();
+        assert_eq!(v, ["203.0.113.8/29", "203.0.113.16/29"]);
+    }
+    let nak = send(&dac, port, &req(2, &["127.0.0.0/8"])).unwrap();
+    let p = Packet::parse(&nak).unwrap();
+    assert_eq!(p.code(), Code::CoaNak);
+    assert_eq!(p.attr_u32(attr::ERROR_CAUSE), Some(407));
+}

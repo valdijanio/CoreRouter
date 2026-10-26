@@ -578,13 +578,15 @@ fn import(s: &mut Session, p: &Value) -> Result<Value> {
         ));
     }
     let ppp = &mut s.store_mut().candidate_mut().ppp;
-    if !replacements.is_empty() {
-        // One pass (each write through the list drops its name index).
-        for x in ppp.secrets.iter_mut() {
-            if let Some(mut new) = replacements.remove(&x.name) {
-                new.id = x.id;
-                *x = new;
-            }
+    // In place, keeping the indexes (G4.3gb): only the touched blocks of
+    // the list are copied.
+    for (name, mut new) in replacements {
+        let Some(old) = ppp.secrets.by_name(&name).map(|o| o.id) else {
+            continue;
+        };
+        if let Some(i) = ppp.secrets.position(old) {
+            new.id = old;
+            ppp.secrets.update(i, |x| *x = new);
         }
     }
     for mut x in fresh {

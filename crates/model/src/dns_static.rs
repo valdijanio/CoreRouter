@@ -286,7 +286,8 @@ pub fn host_name_ok(name: &str) -> bool {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DnsStatic {
-    pub entries: Vec<StaticEntry>,
+    /// A block list (G0.21).
+    pub entries: crate::cow_list::CowList<StaticEntry>,
     pub next_id: u32,
 }
 

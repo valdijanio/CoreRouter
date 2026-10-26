@@ -46,6 +46,10 @@ pub struct PppoeSession {
     pub ipv6_prefix: Option<[u8; 8]>,
     /// G4.3e: the delegated prefix (high 64 bits) and its length, 1..=64.
     pub delegated: Option<([u8; 8], u8)>,
+    /// G4.9b: the download is shaped (a queue on the access port's
+    /// egress, PPPoE reached through `bng0`) with this queue, instead of
+    /// policed in XDP. `None`: the XDP policer of G4.3c.
+    pub shape: Option<crate::queue::Kind>,
 }
 
 /// What the data plane counted for a session.
@@ -59,6 +63,9 @@ pub struct PppoeCounters {
     pub down_policed: u64,
     pub spoofed: u64,
     pub to_kernel: u64,
+    /// G4.9b: how long a download packet entering now waits in the
+    /// session's queue, microseconds (0: not shaped).
+    pub down_queue_us: u64,
 }
 
 /// One change of the session maps (applied in order, in one call).
@@ -66,4 +73,12 @@ pub struct PppoeCounters {
 pub enum PppoeOp {
     Upsert(u32, PppoeSession),
     Remove(u32),
+    /// G4.3cd: a block routed to the session at the index (`Framed-Route`,
+    /// `Framed-IPv6-Route`, `routes` of the secret), added or removed. Add
+    /// it after the session's `Upsert`, remove it before its `Remove`.
+    Route {
+        dst: ipnet::IpNet,
+        idx: u32,
+        add: bool,
+    },
 }

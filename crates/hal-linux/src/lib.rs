@@ -121,6 +121,10 @@ pub mod capture;
 #[cfg(target_os = "linux")]
 pub mod pppoe_io;
 
+/// BNG redundancy (G4.3h): the access-side hello (`AF_PACKET`, 0x88b5).
+#[cfg(target_os = "linux")]
+pub mod ha_io;
+
 /// System › Tuning (G1.26): kernel parameters, the machine, counters.
 // System › Resources and health (G4.8a): /proc and /sys readings.
 #[cfg(target_os = "linux")]
@@ -668,6 +672,17 @@ mod linux {
 
         fn pppoe_apply(&mut self, ops: &[corerouter_hal::pppoe::PppoeOp]) -> Result<(), HalError> {
             self.xdp.pppoe_apply(ops)
+        }
+
+        fn shaper_apply(
+            &mut self,
+            plan: &corerouter_hal::queue::ShaperPlan,
+        ) -> Result<(), HalError> {
+            self.xdp.shaper_apply(plan)
+        }
+
+        fn shaper_status(&mut self) -> corerouter_hal::queue::ShaperStatus {
+            self.xdp.shaper_status()
         }
 
         fn pppoe_counters(

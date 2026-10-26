@@ -60,7 +60,7 @@ pub fn roots_in<'a>(table: Table, edges: &Edges<'a>, chain: &'a str) -> BTreeSet
 }
 
 /// A chain that can jump back to itself, if any (as `a → b → a`).
-pub fn find_loop(rules: &[FirewallRule]) -> Option<Vec<String>> {
+pub fn find_loop<'a>(rules: impl IntoIterator<Item = &'a FirewallRule>) -> Option<Vec<String>> {
     let edges = edges(rules);
     let next = |c: &str| -> Vec<&str> {
         edges
@@ -103,9 +103,12 @@ pub fn find_loop(rules: &[FirewallRule]) -> Option<Vec<String>> {
 }
 
 /// Custom chains of a table: named by a rule or a jump.
-pub fn custom_chains(table: Table, rules: &[FirewallRule]) -> BTreeSet<&Name> {
+pub fn custom_chains<'a>(
+    table: Table,
+    rules: impl IntoIterator<Item = &'a FirewallRule>,
+) -> BTreeSet<&'a Name> {
     let mut out = BTreeSet::new();
-    for r in rules.iter().filter(|r| !r.section) {
+    for r in rules.into_iter().filter(|r| !r.section) {
         if !is_builtin(table, r.chain.as_str()) {
             out.insert(&r.chain);
         }

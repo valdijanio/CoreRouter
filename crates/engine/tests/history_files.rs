@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use corerouter_engine::{ConfigStorage, MemoryStorage, Session, Slot, StorageError};
 use corerouter_hal::VirtualHal;
 use corerouter_model::cow::CowArc;
+use corerouter_model::cow_list::CowList;
 use corerouter_model::store::Revision;
 use corerouter_model::{ConfigStore, Users, persist};
 use serde_json::json;
@@ -162,15 +163,15 @@ fn all_64_revisions_of_a_big_config_survive_a_reboot() {
         let (a, b) = (&old.ip.firewall, &new.ip.firewall);
         assert_eq!(**a == **b, CowArc::ptr_eq(a, b), "firewall of {n}");
         let (a, b) = (&a.address_lists, &b.address_lists);
-        assert_eq!(**a == **b, CowArc::ptr_eq(a, b), "address lists of {n}");
+        assert_eq!(*a == *b, CowList::ptr_eq(a, b), "address lists of {n}");
     }
     let newest = &back[63].config;
     for rev in back {
         let c = &rev.config;
         assert!(CowArc::ptr_eq(&c.interfaces, &newest.interfaces));
-        assert!(CowArc::ptr_eq(&c.ip.routes, &newest.ip.routes));
-        assert!(CowArc::ptr_eq(&c.ip.addresses, &newest.ip.addresses));
-        assert!(CowArc::ptr_eq(
+        assert!(CowList::ptr_eq(&c.ip.routes, &newest.ip.routes));
+        assert!(CowList::ptr_eq(&c.ip.addresses, &newest.ip.addresses));
+        assert!(CowList::ptr_eq(
             &c.ip.firewall.filter,
             &newest.ip.firewall.filter
         ));

@@ -74,7 +74,7 @@ fn killing_the_active_mid_churn_loses_only_the_changes_in_flight() {
     // No pause: the last changes may not be acked yet.
     let before = l.table(0);
     let acked_behind = {
-        let s = l.nodes[0].publisher.as_ref().unwrap().status();
+        let s = l.nodes[0].node.publisher().unwrap().status();
         s.seq - s.acked
     };
     l.kill(0);
@@ -182,7 +182,7 @@ fn without_the_witness_the_standby_never_takes_over() {
 #[test]
 fn link_flaps_resume_from_the_log_without_snapshots() {
     let mut l = booted(10_000);
-    let at_boot = l.nodes[0].publisher.as_ref().unwrap().status().snapshots;
+    let at_boot = l.nodes[0].node.publisher().unwrap().status().snapshots;
     for flap in 0..20 {
         l.cut_sync();
         for _ in 0..(20 + flap * 3) {
@@ -196,15 +196,21 @@ fn link_flaps_resume_from_the_log_without_snapshots() {
         }
     }
     l.run_until(5_000, Lab::in_sync).unwrap();
-    let s = l.nodes[0].publisher.as_ref().unwrap().status();
+    let s = l.nodes[0].node.publisher().unwrap().status();
     assert_eq!(s.snapshots, at_boot, "every reconnect resumed from the log");
     assert_eq!(l.roles(), [Role::Active, Role::Standby]);
-    assert_eq!(l.nodes[1].replica.status().gaps, 0);
+    assert_eq!(l.nodes[1].node.replica().status().gaps, 0);
 }
 
 #[test]
 fn switchover_moves_every_session_with_no_overlap() {
     let mut l = booted(50_000);
+    // Refused while the last changes are unacked (the replica may miss them).
+    assert_eq!(
+        l.switchover(0, false),
+        Err(corerouter_proto_ha::role::Refused::PeerNotInSync)
+    );
+    l.run(50);
     let before = l.table(0);
     l.switchover(0, false).unwrap();
     let t = l.run_until(2_000, |l| l.active() == Some(1)).unwrap();

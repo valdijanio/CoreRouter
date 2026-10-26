@@ -214,8 +214,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
-    if let Ok(i) = static_index(s, p) {
-        let l = s.store_mut().candidate_mut().ip.dhcp_server.leases.remove(i);
+    if let Ok(i) = static_index(s, p)
+        && let Some(l) = s.store_mut().candidate_mut().ip.dhcp_server.leases.remove(i)
+    {
         return Ok(json!({"address": l.address, "static": true}));
     }
     let ip = address(p)?;

@@ -500,6 +500,27 @@ pub trait Hal: Send {
         Vec::new()
     }
 
+    /// Queues (G4.9b): make the shaper hold `plan` — the tc programs on its
+    /// ports, `fq` on their transmit queues, the queue maps. An empty plan
+    /// takes it all away. `Err`: nothing is shaped (the commit stays).
+    fn shaper_apply(&mut self, plan: &queue::ShaperPlan) -> Result<(), HalError> {
+        if plan.is_empty() {
+            return Ok(());
+        }
+        Err(HalError::Unsupported(format!(
+            "{} has no shaper (tc and eBPF)",
+            self.describe()
+        )))
+    }
+
+    /// What the shaper counted (by queue key) and why it is not there.
+    fn shaper_status(&mut self) -> queue::ShaperStatus {
+        queue::ShaperStatus {
+            unavailable: Some(format!("{} has no shaper", self.describe())),
+            ..queue::ShaperStatus::default()
+        }
+    }
+
     /// Zero the XDP counters and forget the dropped sources.
     fn xdp_reset(&mut self) -> Result<(), HalError> {
         Err(HalError::Unsupported(format!(

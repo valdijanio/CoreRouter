@@ -4,6 +4,10 @@
 //! G1.23 every commit rewrote the whole history; now it writes the running
 //! config and its own revision.
 //!
+//! `commit/ppp_secret_add/N` (G4.3gb): one `ppp.secret.add` (its own
+//! commit, with fsync) with N secrets in place, removed again outside the
+//! timing: what provisioning a subscriber by API costs on a big base.
+//!
 //! `history64/*` (audit-history): the same with a 5 MiB and a 10 MiB config
 //! (what an ISP edge carries: thousands of rules, tens of thousands of
 //! address-list entries, routes and static leases) — a small commit, the
@@ -159,6 +163,47 @@ fn commit(c: &mut Criterion) {
                     &json!({"name": "ether2", "comment": comment}),
                 )
                 .unwrap()
+            });
+        });
+        assert!(s.storage_status().last_error.is_none());
+        drop(s);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    for n in [10_000u32, 100_000] {
+        let mut cfg = Session::virtual_lab().store().running().clone();
+        for i in 0..n {
+            cfg.ppp.secrets.push(corerouter_model::ppp::PppSecret {
+                id: ItemId(i + 1),
+                name: format!("cliente{i}@isp"),
+                password: format!("senha{i}").into(),
+                profile: "default".into(),
+                ..Default::default()
+            });
+        }
+        cfg.ppp.next_id = n;
+        let dir = directory(&format!("bench-secrets-{n}"), cfg, 1);
+        let mut s = boot(&dir);
+        assert_eq!(
+            s.store().running().ppp.secrets.len(),
+            n as usize,
+            "{:?}",
+            s.storage_status()
+        );
+        let mut tag = 0u64;
+        g.bench_function(BenchmarkId::new("commit/ppp_secret_add", n), |b| {
+            b.iter_custom(|iters| {
+                let mut spent = Duration::ZERO;
+                for _ in 0..iters {
+                    tag += 1;
+                    let name = format!("bench{tag}");
+                    let t = std::time::Instant::now();
+                    s.execute("ppp.secret.add", &json!({"name": name, "password": "x"}))
+                        .unwrap();
+                    spent += t.elapsed();
+                    s.execute("ppp.secret.remove", &json!({"id": name}))
+                        .unwrap();
+                }
+                spent
             });
         });
         assert!(s.storage_status().last_error.is_none());

@@ -60,6 +60,11 @@ pub const F_FAST_UP: u16 = 1 << 4;
 /// Downstream packets may be encapsulated in XDP without the kernel.
 /// Flows conntrack already accepted (the CGNAT fast path) always may.
 pub const F_FAST_DOWN: u16 = 1 << 5;
+/// G4.9b: the download is shaped (EDT on the access port's egress, the
+/// `shape_egress` tc program) instead of policed here: downstream packets
+/// go to the kernel, which routes them to `bng0` (PPPoE) or straight to
+/// the port (IPoE). Bit 6 is `ipoe::F_IPOE`.
+pub const F_SHAPE_DOWN: u16 = 1 << 7;
 
 /// `SETTINGS` slot of the PPPoE switch (bit 0: on). Off, the program
 /// never looks at PPPoE frames (they pass as before).
@@ -72,6 +77,11 @@ pub const SETTINGS_SLOT: u32 = 3;
 pub const SESSIONS_MAX: u32 = 1 << 17;
 /// IPv6 prefixes (a /64 and a delegated prefix per session).
 pub const PREFIXES_V6: u32 = SESSIONS_MAX * 2;
+/// Blocks routed to subscribers (G4.3cd: `Framed-Route`, `routes` of the
+/// secret), per family: `PPPOE_RT4`/`PPPOE_RT6`, LPM tries (allocated per
+/// entry, so the size is only a ceiling).
+pub const ROUTES_V4: u32 = 1 << 16;
+pub const ROUTES_V6: u32 = 1 << 16;
 
 /// A VLAN field of [`SessionKey`]/[`Session`]: 0 = no tag, else
 /// `TAGGED | VID`.
@@ -397,17 +407,24 @@ pub enum Stat {
     /// Upstream, the FIB did not resolve (no route, no neighbor, MTU):
     /// to the kernel.
     UpFib = 16,
-    /// Downstream on a tagged uplink (not handled in XDP yet): to the
-    /// kernel.
+    /// Downstream from an uplink with one or two VLAN tags, sent to the
+    /// subscriber in XDP (G4.3cd; before, the kernel's). Also counted as
+    /// [`Stat::DownFast`].
     DownTagged = 17,
     /// IPoE (G4.3f): a subscriber's DHCP, to the daemon untouched.
     IpoeDhcp = 18,
     /// IPoE downstream, policed and counted, then forwarded by the kernel.
     IpoeDownKernel = 19,
+    /// Downstream to a block routed to a subscriber (G4.3cd, `PPPOE_RT4`/
+    /// `PPPOE_RT6`), whatever happened next.
+    DownRouted = 20,
+    /// Downstream of a shaped session (G4.9b): to the kernel, which routes
+    /// it to `bng0` or the IPoE port, where the shaper holds it.
+    DownShaped = 21,
 }
 
 impl Stat {
-    pub const ALL: [Stat; 20] = [
+    pub const ALL: [Stat; 22] = [
         Stat::UpFast,
         Stat::UpKernel,
         Stat::Discovery,
@@ -428,8 +445,10 @@ impl Stat {
         Stat::DownTagged,
         Stat::IpoeDhcp,
         Stat::IpoeDownKernel,
+        Stat::DownRouted,
+        Stat::DownShaped,
     ];
-    pub const SLOTS: u32 = 20;
+    pub const SLOTS: u32 = 22;
 
     pub fn name(self) -> &'static str {
         match self {
@@ -453,6 +472,8 @@ impl Stat {
             Stat::DownTagged => "down-tagged",
             Stat::IpoeDhcp => "ipoe-dhcp",
             Stat::IpoeDownKernel => "ipoe-down-kernel",
+            Stat::DownRouted => "down-routed",
+            Stat::DownShaped => "down-shaped",
         }
     }
 }
@@ -470,8 +491,26 @@ pub trait Sessions {
     /// Session index whose /64 or delegated prefix holds IPv6 `dst`
     /// (longest prefix).
     fn by_v6(&self, dst: [u8; 16]) -> Option<u32>;
-    /// Policer state of session `idx`, direction `dir` (0 up, 1 down).
-    fn policer(&mut self, idx: u32, dir: u32) -> Option<&mut policer::State>;
+    /// The policer state's words (BPF atomics in the kernel, G4.3cc).
+    type Policer<'a>: crate::words::Words
+    where
+        Self: 'a;
+    /// Policer state of session `idx`, direction `dir` (0 up, 1 down);
+    /// absent: `present()` false. Not an `Option` of a pointer wrapper: a
+    /// raw pointer has no niche, so `None` would carry undefined bytes, and
+    /// the verifier refuses their spill.
+    fn policer(&mut self, idx: u32, dir: u32) -> Self::Policer<'_>;
+    /// Session index of the block routed to a subscriber that holds IPv4
+    /// `dst` (`PPPOE_RT4`, G4.3cd; longest prefix).
+    fn by_route_v4(&self, dst: [u8; 4]) -> Option<u32> {
+        let _ = dst;
+        None
+    }
+    /// Same for IPv6 (`PPPOE_RT6`).
+    fn by_route_v6(&self, dst: [u8; 16]) -> Option<u32> {
+        let _ = dst;
+        None
+    }
     /// Whether `ifindex` has IPoE subscribers (`IPOE_PORTS`, G4.3f).
     fn ipoe_port(&self, ifindex: u32) -> bool {
         let _ = ifindex;
@@ -487,6 +526,7 @@ pub(crate) fn police_up<L: Sessions>(l: &mut L, idx: u32, now: u64, bytes: u64) 
 
 /// Police `bytes` of session `idx` in direction `dir`. A missing state
 /// (should not happen: the daemon creates it with the session) passes.
+///
 #[inline(always)]
 fn police<L: Sessions>(l: &mut L, idx: u32, dir: u32, now: u64, bytes: u64) -> bool {
     let Some(r) = l.session(idx).map(|w| rate_of(w, dir as usize)) else {
@@ -495,10 +535,11 @@ fn police<L: Sessions>(l: &mut L, idx: u32, dir: u32, now: u64, bytes: u64) -> b
     if r.rate == 0 {
         return true;
     }
-    match l.policer(idx, dir) {
-        Some(st) => policer::admit(st, &r, now, bytes),
-        None => true,
+    let mut st = l.policer(idx, dir);
+    if !crate::words::Words::present(&st) {
+        return true;
     }
+    policer::admit(&mut st, &r, now, bytes)
 }
 
 // --- Upstream -------------------------------------------------------------
@@ -674,7 +715,9 @@ pub fn upstream<P: Packet + ?Sized, L: Sessions>(p: &P, ifindex: u32, l: &mut L,
         if (s0 == 0xfe && s1 & 0xc0 == 0x80) || d0 == 0xff || src == [0; 16] {
             return Up::User(Stat::Ipv6Control);
         }
-        if !s.owns_v6(&src) {
+        // A host of a block routed to this subscriber (G4.3cd) may send
+        // too: the source is the subscriber's when its block holds it.
+        if !s.owns_v6(&src) && l.by_route_v6(src) != Some(idx) {
             return Up::Drop(Stat::Spoofed, Some(idx));
         }
         len
@@ -686,7 +729,7 @@ pub fn upstream<P: Packet + ?Sized, L: Sessions>(p: &P, ifindex: u32, l: &mut L,
         if vi >> 4 != 4 || vi & 0x0f < 5 || len < 20 || len > usize::from(h.payload) {
             return Up::Drop(Stat::Malformed, Some(idx));
         }
-        if !s.has(F_IPV4) || [a, b, c, d] != s.ipv4 {
+        if (!s.has(F_IPV4) || [a, b, c, d] != s.ipv4) && l.by_route_v4([a, b, c, d]) != Some(idx) {
             return Up::Drop(Stat::Spoofed, Some(idx));
         }
         len
@@ -776,6 +819,88 @@ pub struct DownSession {
     pub ipoe: bool,
 }
 
+impl DownSession {
+    /// No session (the payload of a [`Verdict`] that does not encapsulate).
+    pub const EMPTY: DownSession = DownSession {
+        idx: 0,
+        ifindex: 0,
+        tags: 0,
+        outer_tpid: 0,
+        vlan: 0,
+        inner_vlan: 0,
+        sid: 0,
+        client_mac: [0; 6],
+        server_mac: [0; 6],
+        ip_len: 0,
+        v6: false,
+        ipoe: false,
+    };
+}
+
+/// What a [`Verdict`] says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DownKind {
+    NotSub,
+    Kernel,
+    Drop,
+    Encap,
+    Counted,
+}
+
+/// [`Down`] as the BPF program carries it: a struct whose fields are all
+/// written on every path. With the enum, LLVM kept the variants in
+/// registers and spilled the bytes a variant leaves undefined, which the
+/// verifier refuses ("R4 !read_ok", seen once G4.3cc's compare-and-swap
+/// policer and G4.3cd's routed blocks met in the same function).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Verdict {
+    pub kind: DownKind,
+    /// The reason to count ([`Stat::DownFast`] with [`DownKind::Encap`]).
+    pub stat: Stat,
+    pub idx: u32,
+    /// IP bytes ([`DownKind::Counted`]).
+    pub ip_len: u16,
+    /// [`DownKind::Encap`] only; [`DownSession::EMPTY`] otherwise.
+    pub session: DownSession,
+}
+
+impl Verdict {
+    pub const NOT_SUB: Verdict = Verdict::new(DownKind::NotSub, Stat::DownKernel, 0, 0);
+
+    #[inline(always)]
+    pub const fn new(kind: DownKind, stat: Stat, idx: u32, ip_len: u16) -> Verdict {
+        Verdict {
+            kind,
+            stat,
+            idx,
+            ip_len,
+            session: DownSession::EMPTY,
+        }
+    }
+
+    #[inline(always)]
+    pub const fn encap(d: DownSession) -> Verdict {
+        Verdict {
+            kind: DownKind::Encap,
+            stat: Stat::DownFast,
+            idx: d.idx,
+            ip_len: d.ip_len,
+            session: d,
+        }
+    }
+
+    /// The same verdict as a [`Down`] (host side: tests and models).
+    pub fn down(&self) -> Down {
+        match self.kind {
+            DownKind::NotSub => Down::NotSub,
+            DownKind::Kernel => Down::Kernel(self.stat, self.idx),
+            DownKind::Drop => Down::Drop(self.stat, self.idx),
+            DownKind::Encap => Down::Encap(self.session),
+            DownKind::Counted => Down::Counted(self.stat, self.idx, self.ip_len),
+        }
+    }
+}
+
 /// The downstream verdict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Down {
@@ -790,19 +915,153 @@ pub enum Down {
     Counted(Stat, u32, u16),
 }
 
-/// The session owning `dst`.
+/// The session owning `dst`: its own address or prefixes first, then a
+/// block routed to it (G4.3cd). `true`: through a routed block.
 #[inline(always)]
-pub fn owner<L: Sessions>(l: &L, dst: &Addr) -> Option<u32> {
+pub fn owner<L: Sessions>(l: &L, dst: &Addr) -> Option<(u32, bool)> {
     match *dst {
-        Addr::V4(a) => l.by_v4(a),
-        Addr::V6(a) => l.by_v6(a),
+        Addr::V4(a) => match l.by_v4(a) {
+            Some(i) => Some((i, false)),
+            None => l.by_route_v4(a).map(|i| (i, true)),
+        },
+        Addr::V6(a) => match l.by_v6(a) {
+            Some(i) => Some((i, false)),
+            None => l.by_route_v6(a).map(|i| (i, true)),
+        },
     }
 }
 
-/// Decide a packet of `ip_len` bytes with `ttl` to session `idx`.
-/// `accepted`: conntrack already accepted the flow (the CGNAT fast path),
-/// so [`F_FAST_DOWN`] is not needed.
+/// VLAN tags of an uplink frame (0, 1 or 2: 802.1Q, or 802.1ad/Q-in-Q
+/// outside) and whether the IP inside is IPv6. `None`: not IP.
 #[inline(always)]
+pub fn uplink<P: Packet + ?Sized>(p: &P) -> Option<(u8, bool)> {
+    let t0 = p.be16(12)?;
+    let (tags, ethertype) = if t0 == ETH_P_8021Q || t0 == ETH_P_8021AD {
+        let t1 = p.be16(16)?;
+        if t1 == ETH_P_8021Q || t1 == ETH_P_8021AD {
+            (2, p.be16(20)?)
+        } else {
+            (1, t1)
+        }
+    } else {
+        (0, t0)
+    };
+    match ethertype {
+        ETH_P_IP => Some((tags, false)),
+        ETH_P_IPV6 => Some((tags, true)),
+        _ => None,
+    }
+}
+
+/// The destination of the IP packet after `tags` VLAN tags (constant
+/// offsets per tag count).
+#[inline(always)]
+fn dst_after<P: Packet + ?Sized>(p: &P, tags: u8, v6: bool) -> Option<Addr> {
+    let ip = match tags {
+        0 => ETH_HLEN,
+        1 => ETH_HLEN + 4,
+        2 => ETH_HLEN + 8,
+        _ => return None,
+    };
+    if v6 {
+        p.bytes::<16>(ip + 24).map(Addr::V6)
+    } else {
+        p.bytes::<4>(ip + 16).map(Addr::V4)
+    }
+}
+
+/// [`ip_meta`] after `tags` VLAN tags.
+#[inline(always)]
+fn ip_meta_after<P: Packet + ?Sized>(p: &P, tags: u8, v6: bool) -> Option<(u16, u8)> {
+    let ip = match tags {
+        0 => ETH_HLEN,
+        1 => ETH_HLEN + 4,
+        2 => ETH_HLEN + 8,
+        _ => return None,
+    };
+    if v6 {
+        let [_, _, _, _, l0, l1, _, hop] = p.bytes::<8>(ip)?;
+        Some((u16::from_be_bytes([l0, l1]).checked_add(40)?, hop))
+    } else {
+        let [_, _, l0, l1, _, _, _, _, ttl] = p.bytes::<9>(ip)?;
+        Some((u16::from_be_bytes([l0, l1]), ttl))
+    }
+}
+
+/// Strip `tags` uplink VLAN tags: the MACs move up, the frame becomes an
+/// untagged one of the same protocol (constant offsets per count).
+#[inline(always)]
+pub fn untag<P: PacketHead + ?Sized>(p: &mut P, tags: u8) -> Option<()> {
+    match tags {
+        0 => Some(()),
+        1 => untag_n::<P, 4>(p),
+        2 => untag_n::<P, 8>(p),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn untag_n<P: PacketHead + ?Sized, const SHIFT: usize>(p: &mut P) -> Option<()> {
+    let macs = p.bytes::<12>(0)?;
+    p.store(SHIFT, macs)?;
+    p.adjust_head(SHIFT as i32)
+}
+
+/// What [`to_subscriber`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Delivery {
+    /// The verdict; with [`DownKind::Encap`], the frame is already
+    /// encapsulated for the access port.
+    pub verdict: Verdict,
+    /// Came from a tagged uplink.
+    pub tagged: bool,
+    /// Went to a block routed to the subscriber (G4.3cd).
+    pub routed: bool,
+}
+
+/// A clean IP frame (untagged, or with one or two uplink tags) toward a
+/// subscriber: decided and, when it may go in XDP, the tags stripped, the
+/// TTL taken one from and the access header pushed. `None`: not to a
+/// subscriber (the frame is untouched). A frame left to the kernel keeps
+/// its tags. Encapsulation that fails (no room) comes back as
+/// a [`DownKind::Drop`] of [`Stat::Malformed`].
+#[inline(always)]
+pub fn to_subscriber<P: PacketHead + ?Sized, L: Sessions>(
+    p: &mut P,
+    l: &mut L,
+    now: u64,
+) -> Option<Delivery> {
+    let (tags, v6) = uplink(p)?;
+    let (idx, routed) = owner(l, &dst_after(p, tags, v6)?)?;
+    let (ip_len, ttl) = ip_meta_after(p, tags, v6)?;
+    let mut verdict = verdict(l, idx, v6, ip_len, ttl, now, false);
+    if verdict.kind == DownKind::Encap
+        && (untag(p, tags).is_none()
+            || ttl_dec(p, v6).is_none()
+            || encap(p, &verdict.session).is_none())
+    {
+        verdict = Verdict::new(DownKind::Drop, Stat::Malformed, idx, 0);
+    }
+    Some(Delivery {
+        verdict,
+        tagged: tags > 0,
+        routed,
+    })
+}
+
+/// Whether session `idx`'s download is shaped (G4.9b, [`F_SHAPE_DOWN`]).
+/// The loader writes a shaped session without [`F_FAST_DOWN`] and with a
+/// zero download rate, so [`downstream`] already leaves it to the kernel
+/// unpoliced; only the CGNAT fast path (which ignores `F_FAST_DOWN`) asks.
+#[inline(always)]
+pub fn shaped<L: Sessions>(l: &L, idx: u32) -> bool {
+    l.session(idx)
+        .map(View::of)
+        .is_some_and(|s| s.has(F_ACTIVE) && s.has(F_SHAPE_DOWN))
+}
+
+/// Decide a packet of `ip_len` bytes with `ttl` to session `idx`, as a
+/// [`Down`] (host side; the BPF program uses [`verdict`]).
 pub fn downstream<L: Sessions>(
     l: &mut L,
     idx: u32,
@@ -812,11 +1071,27 @@ pub fn downstream<L: Sessions>(
     now: u64,
     accepted: bool,
 ) -> Down {
+    verdict(l, idx, v6, ip_len, ttl, now, accepted).down()
+}
+
+/// Decide a packet of `ip_len` bytes with `ttl` to session `idx`.
+/// `accepted`: conntrack already accepted the flow (the CGNAT fast path),
+/// so [`F_FAST_DOWN`] is not needed.
+#[inline(always)]
+pub fn verdict<L: Sessions>(
+    l: &mut L,
+    idx: u32,
+    v6: bool,
+    ip_len: u16,
+    ttl: u8,
+    now: u64,
+    accepted: bool,
+) -> Verdict {
     let Some(s) = l.session(idx).map(View::of) else {
-        return Down::NotSub;
+        return Verdict::NOT_SUB;
     };
     if !s.has(F_ACTIVE) {
-        return Down::NotSub;
+        return Verdict::NOT_SUB;
     }
     if !accepted && !s.has(F_FAST_DOWN) {
         // IPoE: the kernel reaches the subscriber itself (no header to
@@ -824,22 +1099,40 @@ pub fn downstream<L: Sessions>(
         // goes on through the kernel's firewall.
         if s.has(crate::ipoe::F_IPOE) {
             if !police(l, idx, 1, now, u64::from(ip_len)) {
-                return Down::Drop(Stat::DownPoliced, idx);
+                return Verdict::new(DownKind::Drop, Stat::DownPoliced, idx, 0);
             }
-            return Down::Counted(Stat::IpoeDownKernel, idx, ip_len);
+            return Verdict::new(DownKind::Counted, Stat::IpoeDownKernel, idx, ip_len);
         }
-        return Down::Kernel(Stat::DownKernel, idx);
+        return Verdict::new(DownKind::Kernel, Stat::DownKernel, idx, 0);
     }
     if ttl <= 1 {
-        return Down::Kernel(Stat::DownTtl, idx);
+        return Verdict::new(DownKind::Kernel, Stat::DownTtl, idx, 0);
     }
     if ip_len > s.mtu() {
-        return Down::Kernel(Stat::DownMtu, idx);
+        return Verdict::new(DownKind::Kernel, Stat::DownMtu, idx, 0);
     }
     if !police(l, idx, 1, now, u64::from(ip_len)) {
-        return Down::Drop(Stat::DownPoliced, idx);
+        return Verdict::new(DownKind::Drop, Stat::DownPoliced, idx, 0);
     }
-    Down::Encap(DownSession {
+    Verdict::encap(down_of(&s, idx, ip_len, v6))
+}
+
+/// Where a packet of `ip_len` to session `idx` goes, without the policer
+/// nor the fast-path rules: `bng0`'s encapsulation (G4.3ca), for what the
+/// kernel already routed, filtered and fitted to the session's MTU.
+/// `None`: no active PPPoE session there.
+#[inline(always)]
+pub fn session_down<L: Sessions>(l: &L, idx: u32, ip_len: u16, v6: bool) -> Option<DownSession> {
+    let s = l.session(idx).map(View::of)?;
+    if !s.has(F_ACTIVE) || s.has(crate::ipoe::F_IPOE) {
+        return None;
+    }
+    Some(down_of(&s, idx, ip_len, v6))
+}
+
+#[inline(always)]
+fn down_of(s: &View, idx: u32, ip_len: u16, v6: bool) -> DownSession {
+    DownSession {
         idx,
         ifindex: s.ifindex,
         tags: s.tags(),
@@ -856,7 +1149,7 @@ pub fn downstream<L: Sessions>(
         ip_len,
         v6,
         ipoe: s.has(crate::ipoe::F_IPOE),
-    })
+    }
 }
 
 /// Push the access-side header on an untagged frame whose IP packet `d`

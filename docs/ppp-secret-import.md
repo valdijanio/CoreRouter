@@ -160,8 +160,8 @@ comentário e endereço fixo, 17,0 MB de export:
 | leitura (`rsc::parse`) | 125–133 ms (750–800 mil linhas/s, ~130 MB/s) |
 | `dry_run` (lê, valida, sela, desfaz) | 0,44–0,58 s |
 | importação (sem commit) | 0,47–0,64 s (~5 µs por secret) |
-| commit dos 100 mil (uma revisão) | 214 ms |
-| 40 mil importados no modo imediato (com commit) | 0,27–0,37 s |
+| commit dos 100 mil (uma revisão) | 63–65 ms (214 ms antes do CowList da G4.3gb) |
+| 40 mil importados no modo imediato (com commit) | 0,19–0,20 s (0,27–0,37 s antes do CowList) |
 | abrir uma senha (base64 + AES-256-GCM + `String`) | 0,5 µs |
 
 (Faixas: rodadas diferentes no mesmo laptop, com outras sessões compilando.) Pico de memória do
@@ -171,7 +171,7 @@ senha), dentro do novo teto de 31 MiB.
 
 **Login do BNG, antes e depois** (`cargo bench -p corerouter-daemon --bench pppoe_bng --
 setup_1000`, release, do PADI ao IPCP Opened com MS-CHAPv2 local): 1000 sessões com senha em
-claro em 12,23 ms, e seladas em 12,51 ms (+2 %, +0,28 µs por sessão). Com XChaCha20-Poly1305 eram
+claro em 12,23–15,19 ms e seladas em 12,51–15,39 ms (+1 a +5 %, +0,2 a +0,7 µs por sessão; três rodadas, a última com a máquina carregada). Com XChaCha20-Poly1305 eram
 11,77 contra 13,28 ms (+13 %): foi isso que motivou a troca.
 
 Paralelismo: a leitura e a selagem são por item e independentes, mas o engine não usa threads

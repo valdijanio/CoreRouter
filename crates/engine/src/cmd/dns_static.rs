@@ -276,7 +276,9 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     e.id = st.next_id();
     let id = e.id;
     match at {
-        Some(i) => st.entries.insert(i, e),
+        Some(i) => {
+            st.entries.insert(i, e);
+        }
         None => st.entries.push(e),
     }
     Ok(json!({ "id": id }))
@@ -310,7 +312,9 @@ fn move_entry(s: &mut Session, p: &Value) -> Result<Value> {
         position(s, b, "place_before")?;
     }
     let entries = &mut s.store_mut().candidate_mut().ip.dns_static.entries;
-    let e = entries.remove(from);
+    let Some(e) = entries.remove(from) else {
+        return Err(EngineError::bad("id", format!("no static DNS entry {id}")));
+    };
     let to = before
         .and_then(|b| entries.iter().position(|x| x.id == b))
         .unwrap_or(entries.len());

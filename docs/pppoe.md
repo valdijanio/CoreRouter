@@ -857,3 +857,86 @@ tabela que não atende ninguém.
 O trabalho é por PADI/PADR (nunca por pacote de dados): uma busca por hash e um contador por
 linha. Um `reconfigure` com a tabela mudada reconta as sessões por linha (O(sessões), uma vez
 por mudança).
+
+## 12. Rotas por assinante: `Framed-Route`, `Framed-IPv6-Route` e `routes` (G4.3cd)
+
+Cliente empresarial com bloco roteado (um /29 ou /28 IPv4, um /48 IPv6) atrás da sessão PPPoE.
+Aprovado pelo usuário em 2026-10-26 com todos os extras.
+
+### 12.1 Pesquisa
+
+- **RFC 2865 §5.22 `Framed-Route`**: texto "prefixo[/tamanho] gateway métrica…" (exemplo da RFC:
+  `192.168.1.0/24 192.168.1.1 1 2 -1 3 400`); gateway `0.0.0.0` = o endereço do usuário.
+  **RFC 3162 §2.5 `Framed-IPv6-Route`**: o mesmo em IPv6, gateway `::`. **RFC 3162 §2.3**:
+  `Framed-IPv6-Prefix` MAY repetir. **RFC 2866 §5.13**: o Accounting pode levar os atributos do
+  Accept. **RFC 5176 §3.5**: o CoA é tudo ou nada (NAK com Error-Cause 407 para valor inválido).
+- **MikroTik RouterOS v7**: `/ppp secret routes` = "dst-address gateway metric", vários separados
+  por vírgula; `Framed-Route` do RADIUS sim, `Framed-IPv6-Route` não; CoA não muda rotas; aceita
+  bloco sobreposto ou de pool sem avisar.
+- **accel-ppp**: os dois atributos, rota pela interface ppp quando o gateway é 0. **Juniper Junos**
+  e **Cisco IOS-XE**: os dois atributos como rotas de acesso por assinante, removidas na queda.
+- **Adotamos**: o texto das RFCs e do RouterOS num só parser; IPv4 e IPv6; prefixo sem tamanho =
+  host; prefixo com bits de host recusado (o palpite errado é um blackhole); o primeiro
+  `Framed-IPv6-Prefix` é o /64 do enlace (G4.3e) e os seguintes viram rotas da sessão.
+
+### 12.2 Como funciona
+
+- **Origens**: `routes` do `/ppp secret` (login local; também nos secrets IPoE), ou os
+  `Framed-Route`/`Framed-IPv6-Route`/`Framed-IPv6-Prefix` repetidos do Access-Accept. Cada rota
+  guarda a origem (o selo da janela).
+- **Dono único**: `corerouter_engine::framed::FramedTable` (uma por roteador, extensão do `Session`,
+  compartilhada pelos workers do PPPoE, pelo IPoE e pelos comandos) diz quem segura cada bloco.
+  Blocos nunca se sobrepõem, então a busca do bloco que contém um endereço é o casamento de prefixo
+  mais longo, em O(log n) (`RouteSet`).
+- **Na subida** (`Up`), depois da sessão no plano de dados, cada rota é conferida (bloco especial,
+  pool, endereço do roteador, gateway IPv4 que não é o assinante) e reivindicada. A que não passa
+  é recusada com o motivo em português no log (`PPP: <user>: rota recusada: …`), em `ppp.active`
+  (`refused_routes`) e no histórico; as outras sobem.
+- **Onde**: com XDP, `PppoeOp::Route` põe o bloco no LPM `PPPOE_RT4`/`PPPOE_RT6` apontando para o
+  índice da sessão (descida rápida, `docs/pppoe-dataplane.md`); sem XDP, rota `bloco dev bng0` no
+  kernel, e o caminho lento entrega ao worker da sessão. IPv6 só com XDP (o caminho lento IPv6 é a
+  G4.3l): sem ele a rota IPv6 é recusada com esse motivo.
+- **Anti-spoofing**: um host do bloco manda pelo roteador do cliente; a origem dentro de um bloco
+  da própria sessão vale (XDP e caminho lento); dentro do bloco de outro, descarte.
+- **Na queda** (qualquer motivo), as rotas saem **antes** da sessão e o bloco volta a ser livre: um
+  bloco deixado para trás apontaria para uma sessão que não existe (blackhole). O serviço que
+  reinicia esquece o que segurava (`FramedTable::forget`), e o carregador do XDP tira os blocos de
+  um índice quando outro assinante o ocupa.
+- **CoA**: `Framed-Route`/`Framed-IPv6-Route` num CoA-Request troca as rotas da família sem
+  derrubar a sessão: o bloco novo entra antes de o velho sair (o que fica nos dois não pisca).
+  `Framed-Route ""` limpa a família. Inválida em qualquer ponto (texto, especial, pool, de outro,
+  sobreposta no próprio pedido): CoA-NAK com Error-Cause 407 e nada muda.
+- **Contabilização**: o Accounting-Start e o Stop levam `Framed-Route`/`Framed-IPv6-Route` das rotas
+  instaladas.
+- **Comandos**: `ppp.secret.add/set … routes="203.0.113.8/29,2001:db8:100::/48"`; `ppp.active.list`
+  (`routes` com `origin`, `refused_routes`, `find` procura nas rotas), `ppp.why` (as rotas da sessão
+  ativa) e `ppp.history`.
+
+- **IPoE** (serviço `ipoe`): as mesmas origens (o secret `service=ipoe`, o Access-Accept, o CoA), a
+  mesma tabela de donos e as mesmas recusas. Como o kernel entrega o IPoE ao assinante (não há
+  encapsulamento), cada bloco vira também uma rota do kernel `bloco via <endereço do assinante>`
+  (`pppoe_io::gateway_routes`), com ou sem XDP; com XDP o bloco entra no LPM para o policer e os
+  contadores, e a origem dentro do bloco passa no anti-spoofing do IPoE.
+
+### 12.3 O que ficou de fora e por quê
+
+- **IPv6 por IPoE**: o IPoE ainda é só IPv4 (G4.3s); a rota IPv6 de um assinante IPoE é recusada
+  com esse motivo.
+- **Redistribuir os blocos em OSPF/BGP**: o operador anuncia o agregado; a redistribuição por
+  sessão é a G4.3ce.
+- **Exportar `routes` no `/export`**: o secret ainda sai comentado (G4.3n).
+
+### 12.4 Desempenho (**medido**, VM `corerouter-lab`, virtio/veth, XDP generic, 2026-10-26)
+
+- Kernel, 10 000 sessões com 1–4 blocos cada (25 000 blocos), uma execução por chamada: piso
+  120–133 ns; ao próprio endereço 150–168 ns; a um host do /29 roteado 182–232 ns; do /56 191–241
+  ns; com uma tag no uplink 193–240 ns; com duas 200–246 ns. O bloco roteado custa um LPM a mais
+  que o /32 (+30–60 ns).
+- A/B do mesmo teste de 100 mil sessões, objeto da `main` × este: descida ao próprio endereço
+  156–168 → 165–190 ns (o caminho com tags e rotas), subida e piso iguais dentro do ruído; incluir
+  e remover 100 mil sessões iguais (≈ 0,9 s e 0,55 s).
+- Incluir 25 000 blocos no LPM: 92 ms (3,7 µs/bloco); remover: 41 ms. (A primeira versão contava os
+  blocos a cada inclusão: 11,2 s; corrigido com contadores e um índice por sessão.)
+- Userspace (`cargo bench -p corerouter-engine --bench framed_routes`): login com 4 rotas e logout
+  0,64 µs com a tabela vazia e 1,64 µs com 10 000 sessões (25 000 blocos); a busca do caminho
+  lento 11 → 33 ns (O(log n)); encher a tabela com as 10 000 sessões, 12,1 ms.

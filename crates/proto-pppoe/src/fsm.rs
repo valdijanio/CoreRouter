@@ -165,6 +165,16 @@ impl Fsm {
         }
     }
 
+    /// An automaton already Opened: a session another node negotiated
+    /// and this one takes over (G4.3h hot standby). Nothing is sent; a
+    /// later Configure-Request from the peer renegotiates as usual.
+    pub fn opened(first_id: u8) -> Fsm {
+        Fsm {
+            state: State::Opened,
+            ..Fsm::new(first_id)
+        }
+    }
+
     pub fn state(&self) -> State {
         self.state
     }

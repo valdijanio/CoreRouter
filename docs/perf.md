@@ -1209,3 +1209,56 @@ socket de 4 MiB guarda 8739 PADIs (`a_busy_worker_socket_holds_a_burst`).
 
 No netns o socket com fila empata com o leitor; na VM, com o BNG Blaster, ficou abaixo (rodada
 5). Vale o número da VM.
+
+G4.3cd, **medido** na VM `corerouter-lab` (virtio/veth, XDP generic, objeto release, 2026-10-26):
+10 000 sessões com 1–4 blocos (25 000): incluir 92 ms (3,7 µs/bloco; a primeira versão contava os
+blocos a cada inclusão e levava 11,2 s), remover 41 ms; por pacote, piso 120–133 ns, próprio /32
+150–168 ns, host de /29 roteado 182–232 ns, de /56 191–241 ns, com uma tag no uplink 193–240 ns,
+duas 200–246 ns. A/B com o objeto da `main` (100 mil sessões, mesmo teste alternado): descida ao
+próprio endereço 156–168 → 165–190 ns, subida e piso iguais no ruído. Userspace
+(`--bench framed_routes`, Ryzen AI Max+ 395, release): login com 4 rotas + logout 0,64 µs (vazia) e
+1,64 µs (10 000 sessões, 25 000 blocos), busca do caminho lento 11 → 33 ns, encher com 10 000
+sessões 12,1 ms.
+
+### G4.3h — sync do BNG em alta disponibilidade (`proto-ha`), **medido** 2026-10-26, Ryzen AI Max+ 395, release
+
+| Benchmark | Mediana | Observação |
+|---|---|---|
+| `ha_record/encode` | 48 ns | registro de 161 B |
+| `ha_record/decode` | 99 ns | |
+| `ha_delta/2048_changes_through_the_codec` | 2,06 ms | ≈ 1 µs por mudança (montagem do registro incluída) |
+| `ha_snapshot/100k_sessions` | 55 ms | 216 B por sessão no fio (21 MiB) |
+| `ha_access_hello/encode+decode` | 372 ns | HMAC-SHA-256 |
+
+Memória: réplica 400 B por sessão, publicador (tabela + log) 389 B por sessão (RSS, 100 mil).
+
+- 2026-10-26, G4.3k (**medido**, Ryzen AI Max+ 395, release, criterion): PADI → PADO sem nomes
+  191 → 196–198 ns, +1 % (no ruído). Com 512 nomes, pedindo o último: 1,04 µs com a busca
+  linear e **209 ns** com o índice por hash (−80 %). Simulação em memória: 20 000 assinantes, 40
+  nomes e 5000 VLANs QinQ em 0,67 s.
+
+### G4.3h — sessão PPPoE de um servidor para outro, **medido** 2026-10-26, Ryzen AI Max+ 395, release
+
+| Benchmark | Mediana | Por sessão |
+|---|---|---|
+| `pppoe_ha/export_20k` | 1,48 ms | 74 ns |
+| `pppoe_ha/import_20k` | 4,84 ms | 242 ns (com o `Server::new`) |
+
+### Filas: shaper EDT, policer GCRA, EDT × HTB (G4.9b, 2026-10-26, **medido**)
+
+VM do laboratório (8 vCPUs EPYC-Genoa host-model, 16 GiB, kernel 7.0), objeto release, testes em
+build de teste, veth.
+
+- Precisão do shaper (cada alvo a ≥ 11× a taxa): 1 alvo a 344 Mbit/s +0,66%; 100 a 6,6 Mbit/s
+  +0,67%; 10 000 a 10 kbit/s +0,69% a +1,33% (duas rodadas).
+- TCP 50 Mbit/s, 20 ms de RTT, 10 s: shaper fq-codel 49,7 Mbit/s e 536 retransmissões (sem GSO:
+  47,9 e 35); policer balde 0,1 s 49,3 e 852 (sem GSO: 1663); policer balde 0,05 s (o antigo) 47,5
+  e 715; pfifo 10 49,4 e 1783.
+- Policer de um assinante, 1/4/8/16 remetentes presos a CPUs, 200 Mbit/s: antes +4,87% (4),
+  +14,87% (8), +14,97% (16); depois −0,22% a −0,42%.
+- EDT × HTB, 1,5× da taxa total em pacotes de 128 B, 4 filas de transmissão, RPS/XPS: 1 000 alvos
+  EDT +0,0% com 28,7–31,6% de CPU e 1,0 s para montar; HTB uma raiz −9,9%, 30–32%, 0,06 s; HTB
+  por CPU +14–16%, 35–37%, 0,4 s. 10 000 alvos: EDT +7,1%, 28,5%, 0,9 s; HTB uma raiz −10,3%,
+  36–39%, 7,4–9,2 s; HTB por CPU não terminou de montar em 23 min.
+- Subida PPPoE (`BPF_PROG_TEST_RUN`, um pacote por chamada): 164–169 ns na `main`, 172–176 ns com
+  o GCRA atômico.
