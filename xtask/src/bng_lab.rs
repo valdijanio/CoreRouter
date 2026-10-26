@@ -8,10 +8,6 @@
 //!   and `pppd` with the kernel PPPoE plugin as a second client. Nothing
 //!   outside the namespace is touched; it is deleted at the end.
 //!
-//! `--only ha` (G4.3h) runs the redundant pair instead
-//! (`apps/corerouter-daemon/tests/bng_lab_ha.rs`; `--scales` then sets its
-//! sizes).
-//!
 //! Options: `--root`, `--scales 1000,10000,100000`, `--radius <n>`,
 //! `--only capture,scale,radius,workers,wave,pppd`, `--wave <n>`, `--radius-cap <n/s>`, `--out <dir>` (default
 //! `<target>/bng-lab`). BNG Blaster comes from `$BNGBLASTER` or the PATH.
@@ -88,17 +84,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
     let Some(blaster) = blaster_arg.filter(|p| p.exists()).or_else(blaster) else {
         return Outcome::Fail(INSTALL.into());
     };
-    // G4.3h: the pair is its own binary (two daemons, another topology).
-    let ha = env.iter().any(|(k, v)| *k == "BNG_LAB_ONLY" && v == "ha");
-    if ha {
-        for (k, _) in env.iter_mut() {
-            if *k == "BNG_LAB_SCALES" {
-                *k = "BNG_LAB_HA_SCALES";
-            }
-        }
-    }
-    let name = if ha { "bng_lab_ha" } else { "bng_lab" };
-    let exe = match lab_binary(root, &target, name) {
+    let exe = match lab_binary(root, &target) {
         Ok(e) => e,
         Err(e) => return Outcome::Fail(e),
     };
@@ -121,7 +107,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
     vars.extend(env.iter().map(|(k, v)| format!("{k}={v}")));
     let test = [
         exe.to_string_lossy().into_owned(),
-        name.into(),
+        "bng_lab".into(),
         "--exact".into(),
         "--nocapture".into(),
         "--test-threads=1".into(),
@@ -203,7 +189,7 @@ fn target_dir(root: &Path) -> PathBuf {
 }
 
 /// The lab's test binary, built in release (the daemon it starts too).
-fn lab_binary(root: &Path, target: &Path, name: &str) -> Result<PathBuf, String> {
+fn lab_binary(root: &Path, target: &Path) -> Result<PathBuf, String> {
     let out = crate::cargo()
         .env("CARGO_TARGET_DIR", target)
         .args([
@@ -212,7 +198,7 @@ fn lab_binary(root: &Path, target: &Path, name: &str) -> Result<PathBuf, String>
             "-p",
             "corerouter-daemon",
             "--test",
-            name,
+            "bng_lab",
             "--no-run",
             "--message-format=json-render-diagnostics",
         ])
@@ -229,8 +215,8 @@ fn lab_binary(root: &Path, target: &Path, name: &str) -> Result<PathBuf, String>
         .filter(|m| {
             m.pointer("/target/name")
                 .and_then(serde_json::Value::as_str)
-                == Some(name)
+                == Some("bng_lab")
         })
         .find_map(|m| m.get("executable")?.as_str().map(PathBuf::from))
-        .ok_or_else(|| format!("{name} test binary not found"))
+        .ok_or_else(|| "bng_lab test binary not found".into())
 }
