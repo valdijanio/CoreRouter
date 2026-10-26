@@ -1507,3 +1507,31 @@ secrets IPoE e N concessões fixas com `rate_limit`, depois de um `ppp.secret.ad
 
 O que sobra no `lease_set` cresce com N/128: o `shared_blocks` monta um mapa dos blocos da
 lista antiga (782 com 100 mil) para achar os que mudaram.
+
+### CI do lote: partes do `test` e do `xdp-root` (processo, 2026-10-26)
+
+**Medido** no GitHub Actions (`ubuntu-latest`, 4 vCPU por runner), lote via `workflow_dispatch`.
+Runs 40410630612, 40411738352 e 40413648189, cache quente:
+
+| Configuração | `test` (maior parte) | `xdp-root` (maior parte) | `bench-check` | Run inteiro |
+|---|---|---|---|---|
+| test 1 job, xdp-root 1 job | 366 s | 273 s | 291 s | 6 min 25 s |
+| test 2 partes `count`, xdp-root 2 | 304 s (outra: 161 s) | 134 s | 249 s ¹ | **5 min 24 s** |
+| test 2 partes `hash` + lentos primeiro | 267 s (outra: 174 s) | 142 s | 429 s ¹ | 7 min 28 s ¹ |
+| test 3 partes `hash` | 237 s (outras: 231, 188 s) | 164 s | 397 s ¹ | 6 min 53 s ¹ |
+
+¹ Desde o #268 (mesclado da `main` antes das três medições com partes), o `config_store` do
+`bench-check` leva de 104 s a 211 s no CI, contra 12 s antes: montar 10 mil filas
+`queue.simple` numa transação leva 117 s localmente, mesmo otimizado. A variação entre runners
+(104 s contra ~210 s) decide se o caminho crítico é o `test` ou o `bench-check`. Corrigida
+essa montagem, o `bench-check` volta a ~4,3 min e o lote fica em ~5 min 30 s (**estimado**).
+
+Escolha: 2 partes. Com a contagem (`count`), os três testes longos (97, 64 e 62 s) caíram
+todos na mesma parte, e o de 97 s começou por último (parte 1 em 174 s de execução, parte 2 em
+55 s). Por hash, com os lentos primeiro, a execução das partes ficou em 141 s e 66 s: o limite é
+o teste de ~100 s do `proto-pppoe::sim`. Uma terceira parte tirou só 30 s do maior job (237 s
+contra 267 s), num job que já não é o caminho crítico, e custa mais uma compilação inteira
+(~100 s de runner). Compilar uma vez e distribuir os binários (`cargo nextest archive` +
+artifact) não ganha tempo de relógio: o job de build ainda compila 96 s, e soma compactar,
+enviar e baixar os binários de teste, antes de as partes começarem (**estimado** ≥ 5 min, contra
+~4,5 min compilando em cada parte).

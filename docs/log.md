@@ -4796,3 +4796,18 @@ continuação indentadas).
   o índice seguido é igual a um refeito do zero depois de qualquer série de escritas),
   `cargo test -p corerouter-model --lib ppp_secrets`,
   `cargo bench -p corerouter-engine --bench config_store -- ipoe_index`.
+
+- 2026-10-26 — processo: Partes do CI (8 núcleos nos testes somando runners), complemento do #269. O #269 entrou com
+  dois commits temporários das medições, que este PR desfaz: o `test` volta a 2 partes (eram 3)
+  e o cache do cargo volta a ser salvo só pela `main` (salvava também a branch do #269).
+
+  - **8 núcleos nos testes, somando runners:** o `test` e o `xdp-root` rodam em duas partes,
+    cada uma num runner de 4 vCPU (`COREROUTER_CI_PARTITION=i/2`). O `test` passa
+    `--partition hash:i/2` ao nextest (um teste fica na mesma parte quando outros entram; os
+    doctests só na parte 1); `.config/nextest.toml` começa primeiro os três testes de mais de
+    60 s, que antes, começando por último, seguravam sozinhos o fim de uma parte. O `xdp-root`
+    divide os testes de root pelo tempo medido de cada um (o mais longo para a parte mais leve),
+    e cada parte continua rodando um por vez, porque eles medem vazão e precisão. Dentro de cada
+    job, o nextest e o cargo já usam todos os núcleos (o padrão é o número de CPUs). Runner maior
+    é pago e runner próprio na máquina do usuário rodaria código de PR de fork (repositório
+    público): nenhum dos dois.
