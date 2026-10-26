@@ -771,3 +771,89 @@ para CoA/Disconnect.
 Números (**medido**, 2026-10-25, 32 CPUs, build debug, veth sem XDP, `tests/netns_ipoe.rs`): 10 000
 assinantes autorizados pelo RADIUS de teste (um Access-Request e um Accounting-Start cada) com
 endereço em 3,0 s = 3 300 sessões/s; o daemon cresce ~4,3 kB por sessão (lease, sessão, histórico).
+
+## 11. Vários Service-Names numa porta (G4.3k)
+
+Um servidor PPPoE por porta de acesso com uma **tabela de Service-Names**: cada linha diz o nome,
+o perfil das sessões que pedem esse nome e o que um PADI recebe (`terminate`, `delay`, `drop`),
+mais as linhas fixas `empty` (o nome vazio, "qualquer serviço" pela RFC 2516) e `any` (todo nome
+fora da tabela). Um espaço de SESSION_ID só, o perfil escolhido no PADR.
+
+### 11.1 Pesquisa
+
+Fontes lidas em 2026-10-26:
+
+- **MikroTik RouterOS v7**, [`/interface pppoe-server server`](https://help.mikrotik.com/docs/spaces/ROS/pages/2031625/PPPoE):
+  um `service-name` por servidor (vazio: atende qualquer nome e o vazio; com nome: aquele e o
+  vazio); para vários nomes, vários servidores na mesma interface, e o operador não controla qual
+  responde ao PADI vazio. `pado-delay` por servidor. Perfil por servidor (`default-profile`).
+- **Juniper Junos**, [service-name-tables](https://www.juniper.net/documentation/us/en/software/junos/subscriber-mgmt-vlan/topics/example/subscriber-management-pppoe-service-name-table.html):
+  uma tabela por interface, linhas por nome mais `empty` e `any`; ação `terminate`, `delay
+  <s>` ou `drop`; `empty` começa em `terminate` e `any` em `drop`; perfil dinâmico,
+  routing-instance e `max-sessions` por linha; até 512 nomes no roteador.
+- **accel-ppp** (`accel-ppp.conf(5)`, seção `[pppoe]`): `service-name` (lista),
+  `accept-any-service`, `accept-blank-service`, `pado-delay=d[,d1:n1,…]` crescendo com a carga
+  (`-1` para de responder), `padi-limit` por interface e global.
+- **RFC 2516** (sem errata sobre Service-Name; a 5634, verificada, pede que o texto de um
+  `*-Error` não termine em NUL):
+  - §5.1: o PADI tem exatamente um Service-Name; Apêndice A: comprimento zero = "qualquer
+    serviço";
+  - §5.2: o PADO leva um Service-Name **idêntico** ao do PADI, e o AC que não pode servir o PADI
+    "MUST NOT respond with a PADO";
+  - §5.4: PADR com nome que o AC não aceita → PADS com Service-Name-Error e SESSION_ID 0;
+  - §9: o AC que não quer revelar seus serviços "SHOULD never refuse a request based on the
+    Service-Name TAG" (RECOMMENDED).
+
+### 11.2 O que adotamos
+
+- **Tabela no servidor, como o Junos** (`services` em `interface.pppoe-server.server.add/set`,
+  ou linha a linha em `interface.pppoe-server.server.service.add/set/remove/list`). As linhas
+  `empty` e `any` sempre existem (não se removem; mudam de ação). Um nome repetido, duas linhas
+  `empty` ou `delay` sem atraso são recusados.
+- **Padrões do RouterOS e da RFC §9, não do Junos**: um servidor novo atende tudo
+  (`empty` e `any` em `terminate`). O `any=drop` do Junos é escolha do operador, com aviso.
+- **Migração sem passo:** uma config com só `service_name` (RouterOS, antes da G4.3k) vale como a
+  tabela que ele quer dizer (`PppoeServer::service_table`): vazio = tudo; `isp` = `isp` e o
+  vazio em `terminate`, `any` em `drop`. A primeira mudança por comando grava a tabela e limpa o
+  `service_name`. `service_name=` continua aceito (o importador do MikroTik, G4.3n).
+- **AC (`proto-pppoe::server::services`)**: o nome cai em exatamente uma linha (busca por hash);
+  `drop`, linha cheia (`max_sessions`) ou acima do `padi_limit` da linha = sem PADO (§5.2);
+  `delay` soma o atraso da linha ao atraso por carga do servidor; o PADO ecoa o nome byte a
+  byte; no PADR, `drop` → Service-Name-Error com SID 0 (§5.4) e linha cheia → AC-System-Error. Um
+  CPE que volta na mesma linha toma o lugar da sessão antiga (one-session-per-host) mesmo com a
+  linha cheia.
+- **Perfil no PADR:** o perfil da linha toma o lugar do `default_profile` do servidor e do
+  `default` de um secret que não escolheu outro; um secret com perfil próprio continua vencendo,
+  e o `Mikrotik-Group` do RADIUS também.
+- **Por sessão:** o nome pedido fica na sessão, aparece em `ppp.active.list` (`service_name`) e
+  vai ao RADIUS como Called-Station-Id (o que o RouterOS manda).
+- **Workers (G4.3g):** `max_sessions` e `padi_limit` da linha são divididos entre os workers, como
+  o `padi_limit` do servidor (os MACs se espalham por igual); o limite é aproximado em ±1 por
+  worker.
+
+### 11.3 Melhorias propostas
+
+Entram agora (aprovadas em 2026-10-26): nome por sessão no Active, `max_sessions` e `padi_limit`
+por linha, atraso por carga somado ao da linha, recusa de duas linhas para o nome vazio (que
+deixaria a escolha do AC ao acaso, o problema do MikroTik com dois servidores na mesma porta) e os
+avisos: `empty=drop` (a maioria dos CPEs não pede nome), `any=drop` com nomes na tabela (§9) e
+tabela que não atende ninguém.
+
+### 11.4 O que ficou de fora e por quê
+
+- **routing-instance (VRF) por linha** (Junos): o plano de dados PPPoE ainda não tem VRF por
+  sessão.
+- **Linha por ACI/ARI** (Junos casa também Agent-Circuit-Id/Remote-Id): pede uma tabela de linhas
+  própria; o RADIUS já recebe as duas e pode escolher o perfil (`Mikrotik-Group`).
+
+### 11.5 Desempenho (**medido**, 2026-10-26, Ryzen AI Max+ 395, release)
+
+| Medida | Antes | Depois |
+|---|---|---|
+| PADI → PADO, sem nomes (`server_padi_to_pado`) | 191 ns | 196–198 ns (+1 %, no ruído) |
+| PADI → PADO, 512 nomes, o último (`server_padi_to_pado_512_names`) | — | 1,04 µs com busca linear → **209 ns** com o índice por hash |
+| Simulação: 20 000 assinantes, 40 nomes + vazio + 2 recusados, 5000 VLANs QinQ, 0,2 % de perda | — | 0,67 s |
+
+O trabalho é por PADI/PADR (nunca por pacote de dados): uma busca por hash e um contador por
+linha. Um `reconfigure` com a tabela mudada reconta as sessões por linha (O(sessões), uma vez
+por mudança).
