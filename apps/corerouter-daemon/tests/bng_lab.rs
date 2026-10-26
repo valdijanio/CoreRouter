@@ -1292,6 +1292,9 @@ fn shaping(lab: &Lab, k: usize, s: &mut Summary) {
             "ppp.profile.set",
             json!({"id": "default", "rate_limit": plan, "download_mode": mode, "queue_type": "fq-codel-default"}),
         );
+        // The BNG service takes the new profile with its next snapshot
+        // (once a second): sessions logging in before it get the old mode.
+        std::thread::sleep(Duration::from_secs(2));
         let streams = json!([{
             "name": "shaping",
             "stream-group-id": 1,
@@ -1373,7 +1376,10 @@ fn shaping(lab: &Lab, k: usize, s: &mut Summary) {
             "ms",
             &format!("máx {qmax:.1} ms, de queue.simple.list"),
         );
-        if lab.xdp {
+        // The shaper (the default) must hold the plan; the policer is
+        // measured only: at a few hundred kbit/s its bucket (0.1 s of the
+        // rate) is a couple of 1000-byte packets and it passes less.
+        if lab.xdp && mode == "shaper" {
             s.check(
                 &format!("{sc} descida dentro de 5%"),
                 (md - 1.0).abs() <= 0.05,
