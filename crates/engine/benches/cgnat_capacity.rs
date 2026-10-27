@@ -6,7 +6,7 @@
 //!   (ours) against the sets per subscriber and protocol (what the scan did
 //!   before, as a reference);
 //! - handing it over (`cgnat_scan_feed`): the time the lock is held;
-//! - `ip.firewall.cgnat.capacity` on the 64 Ki pool;
+//! - `ip.firewall.cgnat.capacity.get` on the 64 Ki pool;
 //! - the memory of the 7-day peaks (printed).
 //!
 //! `cargo xtask bench` runs it; alone:
@@ -129,10 +129,10 @@ fn capacity(c: &mut Criterion) {
             criterion::BatchSize::LargeInput,
         )
     });
-    g.bench_function("ip.firewall.cgnat.capacity, 64Ki subscribers", |b| {
+    g.bench_function("ip.firewall.cgnat.capacity.get, 64Ki subscribers", |b| {
         b.iter(|| {
             s.execute(
-                "ip.firewall.cgnat.capacity",
+                "ip.firewall.cgnat.capacity.get",
                 black_box(&json!({"pool": "c1"})),
             )
             .unwrap()

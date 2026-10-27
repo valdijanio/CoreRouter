@@ -34,7 +34,7 @@ pub const MIN_PORTS: u64 = 320;
 pub const REFUSED_PER_MILLE: u64 = 10;
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
-    cmd!(query "ip.firewall.cgnat.capacity", "CGNAT Capacity", [], None,
+    cmd!(query "ip.firewall.cgnat.capacity.get", "CGNAT Capacity", [], None,
         "{pool: string (name or *id)} → {pool, mode, ports (each subscriber's limit: ports_per_subscriber, × max_blocks in blocks mode), ports_per_subscriber, subscribers, seen (subscribers with readings in 7 days), days, per_address, public_addresses, p99 (ports at the 99th percentile of the 7-day peaks), p99_percent, max, hit_24h (subscribers refused for lack of a port in 24 h), refused_24h, icmp_24h, bands: [{band, count}], suggestion?: {ports_per_subscriber, per_address, gain_per_address (subscribers per public address, + more), public_needed, fits, reason}}",
         always, capacity),
     cmd!(query "ip.firewall.cgnat.capacity.preview", "Preview CGNAT Capacity Change", [], None,

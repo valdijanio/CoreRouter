@@ -366,7 +366,7 @@ Quantas portas os assinantes usam de verdade, e quantas portas por assinante iss
 
 **Comandos:**
 
-- `ip.firewall.cgnat.capacity {pool}`:
+- `ip.firewall.cgnat.capacity.get {pool}`:
   - os cartões: limite e assinantes por IP, pico p99 dos 7 dias e seu %, quem bateu no limite em
     24 h com recusas e ICMP;
   - a distribuição do pico por faixa: 0–25, 25–50, 50–75, 75–90, 90–100 e 100 %;
@@ -402,7 +402,7 @@ O "Quem era?" guarda a mudança com a hora (seção 1.5).
 | `ip.firewall.cgnat.block.list {pool?, subscriber?}` | blocos ativos (modo blocos), o atual de cada assinante e há quanto tempo está ocioso |
 | `ip.firewall.cgnat.block.history {subscriber?, public?, port?, from?, to?}` | o log de blocos (alocação e liberação) |
 | `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel; recusados e ICMP enviados (G2.7) |
-| `ip.firewall.cgnat.capacity {pool}` / `capacity.preview {pool, ports_per_subscriber}` | uso real (pico p99 de 7 dias, distribuição, quem bateu no limite em 24 h), sugestão de portas por assinante e a prévia do que mudar derruba (G2.7b) |
+| `ip.firewall.cgnat.capacity.get {pool}` / `capacity.preview {pool, ports_per_subscriber}` | uso real (pico p99 de 7 dias, distribuição, quem bateu no limite em 24 h), sugestão de portas por assinante e a prévia do que mudar derruba (G2.7b) |
 | `ip.firewall.cgnat.set {history_days?, icmp_unreachable?, icmp_rate?}` | retenção do histórico; ICMP quando as portas acabam e o limite por assinante (G2.7) |
 | `tool.ip-calc.cgnat.plan {inside, outside, ports_per_subscriber?, port_range?, mode?, preview?}` | o planner (Tools › IP Calculator): números, checagens, sugestões, prévia e os parâmetros do `pool.add`; aceita quantidades (`"4096"`) |
 | `tool.ip-calc.cgnat.export {…, format: csv \| text \| routeros \| nft}` | a tabela do plano em CSV, texto imprimível, script RouterOS ou o nftables |
@@ -758,7 +758,7 @@ cada, 1,3 milhão de conexões.
 | montar o uso (vetor ordenado de 12 bytes) | 51 ms | fora do lock |
 | o mesmo com um conjunto por assinante e protocolo (o método antes do G2.7b) | 75 ms | antes, **dentro** do lock, depois de ler a tabela inteira |
 | entregar ao engine (blocos, alertas, `full`, picos) | 5,6 ms | com o lock |
-| `ip.firewall.cgnat.capacity` do pool de 64 Ki | 4,1 ms | consulta |
+| `ip.firewall.cgnat.capacity.get` do pool de 64 Ki | 4,1 ms | consulta |
 
 **Memória:**
 

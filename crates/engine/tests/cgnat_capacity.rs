@@ -32,7 +32,7 @@ fn lab(storage: MemoryStorage) -> Session {
 #[test]
 fn capacity_reads_the_peaks_and_suggests_ports() {
     let mut s = lab(MemoryStorage::default());
-    let c = ok(&mut s, "ip.firewall.cgnat.capacity", json!({"pool": "c1"}));
+    let c = ok(&mut s, "ip.firewall.cgnat.capacity.get", json!({"pool": "c1"}));
     // The lab gives connections to 300 of the 1024 subscribers; every 17th
     // is heavy (95 % of its 1000 ports), the rest light.
     assert_eq!(c["subscribers"], 1024);
@@ -88,7 +88,7 @@ fn capacity_reads_the_peaks_and_suggests_ports() {
     );
     // Bad input is a parameter error.
     assert!(
-        s.execute("ip.firewall.cgnat.capacity", &json!({"pool": "nope"}))
+        s.execute("ip.firewall.cgnat.capacity.get", &json!({"pool": "nope"}))
             .is_err()
     );
     assert!(
@@ -107,13 +107,13 @@ fn the_peaks_survive_a_restart() {
         let mut s = lab(storage.clone());
         // The store is written every 10 min (at a scan).
         s.tick(T0 + corerouter_engine::cgnat_capacity::SAVE_SECS + 20);
-        ok(&mut s, "ip.firewall.cgnat.capacity", json!({"pool": "c1"}))
+        ok(&mut s, "ip.firewall.cgnat.capacity.get", json!({"pool": "c1"}))
     };
     let mut s = Session::with_storage(Box::new(VirtualHal::new(8)), Box::new(storage));
     // One tick for the clock; the lab's refusals only come every 10th, so
     // the 24 h counts are the journal's.
     s.tick(T0 + corerouter_engine::cgnat_capacity::SAVE_SECS + 21);
-    let after = ok(&mut s, "ip.firewall.cgnat.capacity", json!({"pool": "c1"}));
+    let after = ok(&mut s, "ip.firewall.cgnat.capacity.get", json!({"pool": "c1"}));
     assert_eq!(after["seen"], before["seen"]);
     assert_eq!(after["p99"], before["p99"]);
     assert_eq!(after["hit_24h"], before["hit_24h"]);

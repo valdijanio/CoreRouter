@@ -1088,7 +1088,7 @@ impl PanelState for Cgnat {
             Tab::Capacity => {
                 let pool = self.capacity_pool();
                 if !pool.is_empty() {
-                    out.push(q("capacity", "ip.firewall.cgnat.capacity", json!({"pool": pool})));
+                    out.push(q("capacity", "ip.firewall.cgnat.capacity.get", json!({"pool": pool})));
                 }
             }
             Tab::History => out.push(q("history", "ip.firewall.cgnat.history.list", json!({}))),
