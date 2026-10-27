@@ -1,0 +1,27 @@
+[package]
+name = "corerouter-hal-frr"
+description = "Platform: FRRouting driver — renders the proto-* crates, applies the diff over the daemons' vty sockets, reads state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-model.workspace = true
+corerouter-hal.workspace = true
+corerouter-proto-bgp.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "frr_conf"
+harness = false
+
+[lints]
+workspace = true

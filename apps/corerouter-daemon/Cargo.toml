@@ -12,6 +12,8 @@ repository.workspace = true
 corerouter-engine.workspace = true
 corerouter-hal.workspace = true
 corerouter-hal-linux.workspace = true
+# service/frr.rs (G3.1): routing commits and state through FRR.
+corerouter-hal-frr.workspace = true
 corerouter-control.workspace = true
 corerouter-storage-fs.workspace = true
 corerouter-discovery.workspace = true

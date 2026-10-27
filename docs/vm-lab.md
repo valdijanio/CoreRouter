@@ -53,7 +53,8 @@ humana. Por isso a instalação é do usuário, **uma vez por ferramenta nova**,
 
 Acrescentar uma ferramenta: uma entrada em `TOOLS` num PR (com o link do hash publicado no corpo),
 e depois do merge o usuário roda `cargo xtask vm-lab tools`. Hoje: BNG Blaster 1.0.1 (`.deb` do
-release da rtbrick), `ppp`, `pppoe`, `tcpdump`, `iperf3` e `ethtool`.
+release da rtbrick), `ppp`, `pppoe`, `tcpdump`, `iperf3`, `ethtool` e o FRR 10.7.1 com
+`frr-pythontools` e `libyang3` (`.deb` de deb.frrouting.org, G3.1).
 
 ## Como é montada
 

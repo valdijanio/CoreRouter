@@ -1,9 +1,9 @@
 //! L1 — Hardware/OS abstraction.
 //!
-//! The engine only talks to `dyn Hal`. Real backends (`hal-linux` netlink,
-//! future `hal-frr`, `dataplane-ebpf`) live in platform crates that only the
-//! apps (L6) may depend on; `VirtualHal` runs everywhere, including wasm, CI,
-//! Windows, macOS and iOS, without root.
+//! The engine only talks to `dyn Hal` (and `dyn routing::RoutingDaemon`).
+//! Real backends (`hal-linux` netlink, `hal-frr`, `dataplane-ebpf`) live in
+//! platform crates that only the apps (L6) may depend on; `VirtualHal` runs
+//! everywhere, including wasm, CI, Windows, macOS and iOS, without root.
 
 pub mod address_state;
 pub mod capture;
@@ -23,6 +23,7 @@ pub mod probe;
 pub mod queue;
 pub mod resources;
 pub mod route_get;
+pub mod routing;
 pub mod sff;
 pub mod sim;
 pub mod system_resource;
