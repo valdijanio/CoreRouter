@@ -88,6 +88,7 @@ O programa (if/else, `&&`, `||`, `not`, `jump`) vira entradas com saltos só par
 - ação = `permit` + `set …` + `on-match next`; `accept` = `permit` que encerra; `reject` = `deny`;
 - `jump` é **expandido** no lugar: o `call` do FRR não distingue "a chain chamada aceitou" de
   "caiu no fim dela", e o RouterOS distingue;
+- as entradas começam na sequência 10 (1–9 ficam para o prelúdio do RPKI da G3.2c, `frr::render_with`);
 - fim da chain = `deny 65535` (sequência fixa: acrescentar uma regra não renumera o fim).
 
 Depois, reescritas encolhem o mapa: um teste cujo destino sempre termina igual vira essa entrada

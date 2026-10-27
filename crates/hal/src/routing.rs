@@ -70,7 +70,7 @@ pub trait RoutingReader: Send {
     /// The routes of BGP neighbor `neighbor` of instance `instance` for the
     /// policy preview (G3.2b): `received` those it sent, before the input
     /// chain; otherwise this router's best routes, before the output chain.
-    fn bgp_routes(
+    fn bgp_filter_routes(
         &mut self,
         cfg: &Config,
         instance: &str,

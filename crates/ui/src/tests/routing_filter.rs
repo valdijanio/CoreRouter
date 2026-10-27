@@ -127,7 +127,9 @@ fn the_preview_tab_counts_what_passes_and_the_banner_the_commit_impact() {
     lock(&h.session).execute("config.mode.set", &json!({"mode": "transactional"})).unwrap();
     let id = lock(&h.session).execute("routing.filter.rule.list", &json!({"chain": "upstream-out"})).unwrap()[0]["id"].clone();
     lock(&h.session).execute("routing.filter.rule.set", &json!({"id": id, "rule": "reject"})).unwrap();
-    lock(&h.session).execute("routing.filter.rule.add", &json!({"chain": "upstream-in", "rule": "reject", "place_before": lock(&h.session).execute("routing.filter.rule.list", &json!({})).unwrap()[0]["id"].clone()})).unwrap();
+    // One lock at a time (the session is not reentrant).
+    let first = lock(&h.session).execute("routing.filter.rule.list", &json!({})).unwrap()[0]["id"].clone();
+    lock(&h.session).execute("routing.filter.rule.add", &json!({"chain": "upstream-in", "rule": "reject", "place_before": first})).unwrap();
     refresh(&mut h);
     assert!(h.has_text("Commit impact"));
     assert!(panel(&mut h).impact.iter().any(|r| r["message"].as_str().is_some_and(|m| m.contains("rejects") && m.contains("received from AS 65100"))), "{:?}", panel(&mut h).impact);

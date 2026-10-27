@@ -1086,6 +1086,16 @@ fn rule_check(s: &mut Session, raw: &Value) -> Result<Value> {
             computed.push(json!({"label": "Matches", "value": m.join(", ")}));
         }
         computed.push(json!({"label": "Actions", "value": a.join(", ")}));
+        // A rule after one that always ends the chain never runs.
+        let before = cfg.routing.filter.rules.iter().take_while(|x| x.id != r.id).filter(|x| x.chain == r.chain && !x.disabled);
+        if let Some(blocker) = before.filter(|x| parse::parse(&x.rule).is_ok_and(|st| st.iter().any(|s| matches!(s, Stmt::Accept | Stmt::Reject)))).last() {
+            checks.push(check(
+                "warning",
+                "unreachable",
+                format!("rule {} before it always accepts or rejects: this rule never runs (move it up, or use place_before)", blocker.id),
+                "rule",
+            ));
+        }
         if v == "none" {
             checks.push(check(
                 "info",
@@ -1244,6 +1254,8 @@ mod tests {
         // The modal's check counts what the chain would pass.
         let chk = s.execute("routing.filter.rule.check", &json!({"chain": "out", "rule": "reject"})).unwrap();
         assert!(chk["commands"][0]["command"] == "routing.filter.rule.add", "{chk}");
+        let chk2 = s.execute("routing.filter.rule.check", &json!({"chain": "out", "rule": "reject"})).unwrap();
+        assert!(chk2["checks"].to_string().contains("never runs"), "{chk2}");
         let chk = s.execute("routing.filter.rule.check", &json!({"chain": "out", "rule": "acept"})).unwrap();
         assert!(chk["checks"][0]["message"].as_str().unwrap().contains("did you mean"), "{chk}");
         assert_eq!(chk["commands"], json!([]));

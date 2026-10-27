@@ -42,8 +42,12 @@ use super::{CommunityValue, Large, Protocol, community_text, fnv};
 
 /// The sequence of the final `deny` of every map.
 pub const END_SEQ: u32 = 65_535;
-/// Most entries of one route-map (sequence numbers 1..65535).
-pub const MAX_ENTRIES: usize = 65_534;
+/// The first sequence of a chain's entries: 1..=9 are left to the
+/// prelude ([`render_with`]: the RPKI checks of G3.2c, `deny` before any
+/// rule of the operator).
+pub const FIRST_SEQ: usize = 10;
+/// Most entries of one route-map (sequence numbers 10..65535).
+pub const MAX_ENTRIES: usize = 65_525;
 
 /// The route-map of chain `chain`.
 pub fn route_map(chain: &str) -> String {
@@ -671,7 +675,7 @@ pub fn compile(
 
 /// The sequence number of entry `i` of `n`.
 pub fn seq(i: usize, n: usize) -> u32 {
-    if i + 1 == n { END_SEQ } else { u32::try_from(i + 1).unwrap_or(END_SEQ) }
+    if i + 1 == n { END_SEQ } else { u32::try_from(i + FIRST_SEQ).unwrap_or(END_SEQ) }
 }
 
 fn set_line(s: &Set) -> Option<String> {
@@ -804,6 +808,18 @@ fn render_parts<T: Send>(roots: &[&str], part: &(dyn Fn(&[&str]) -> T + Sync)) -
 /// connections name) and the chains no other chain jumps to, each with
 /// the AS `asn_of` gives it; the problems (with the chain's name).
 pub fn render(filter: &RoutingFilter, used: &BTreeSet<String>, asn_of: &dyn Fn(&str) -> Option<u32>) -> (String, Vec<Problem>) {
+    render_with(filter, used, asn_of, &|_| String::new())
+}
+
+/// [`render`] with a prelude per chain: FRR text of entries with sequence
+/// 1..=9 of `route-map CR-<chain>` (G3.2c puts its RPKI `deny` there),
+/// typed before the chain's own entries.
+pub fn render_with(
+    filter: &RoutingFilter,
+    used: &BTreeSet<String>,
+    asn_of: &dyn Fn(&str) -> Option<u32>,
+    prelude: &dyn Fn(&str) -> String,
+) -> (String, Vec<Problem>) {
     let (parsed, _) = parsed_chains(filter);
     let chains: HashMap<&str, &[Stmt]> = parsed.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
     let mut jumped: BTreeSet<String> = BTreeSet::new();
@@ -820,12 +836,16 @@ pub fn render(filter: &RoutingFilter, used: &BTreeSet<String>, asn_of: &dyn Fn(&
     // Each chain compiles alone (the lists are named by content, so the
     // parts merge): many chains go on threads.
     let asns: HashMap<&str, Option<u32>> = roots.iter().map(|n| (*n, asn_of(n))).collect();
+    let preludes: HashMap<&str, String> = roots.iter().map(|n| (*n, prelude(n))).collect();
     let part = |names: &[&str]| -> (Lists, String, Vec<Problem>) {
         let (mut lists, mut maps, mut problems) = (Lists::default(), String::new(), Vec::new());
         for name in names {
             let asn = asns.get(name).copied().flatten();
             let (entries, probs) = compile(filter, &chains, name, asn, &mut lists);
             problems.extend(probs.into_iter().map(|message| Problem { item: format!("chain {name}"), message }));
+            if let Some(p) = preludes.get(name) {
+                maps.push_str(p);
+            }
             map_text(name, &entries, &mut maps);
         }
         (lists, maps, problems)
@@ -977,8 +997,8 @@ pub(crate) mod tests {
         assert_eq!(
             text,
             format!(
-                "route-map CR-in deny 1\n description dst in 10.0.0.0/8\n match ip address prefix-list {name}\nexit\n\
-                 route-map CR-in permit 2\nexit\nroute-map CR-in deny 65535\nexit\n"
+                "route-map CR-in deny 10\n description dst in 10.0.0.0/8\n match ip address prefix-list {name}\nexit\n\
+                 route-map CR-in permit 11\nexit\nroute-map CR-in deny 65535\nexit\n"
             )
         );
         assert_eq!(lists.prefix4.get(&name).unwrap()[0].to_string(), "10.0.0.0/8 le 32");

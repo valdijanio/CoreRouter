@@ -414,7 +414,7 @@ impl Frr {
     /// The routes of `neighbor` (instance `instance`) for the policy
     /// preview: `received`, what it sent before the input chain (needs
     /// `keep_received`); otherwise our best routes, before the output chain.
-    pub fn bgp_routes(&self, instance: &str, neighbor: &str, received: bool) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
+    pub fn bgp_filter_routes(&self, instance: &str, neighbor: &str, received: bool) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
         if neighbor.parse::<std::net::IpAddr>().is_err() {
             return Err(HalError::Rejected(format!("{neighbor:?} is not a neighbor address")));
         }
@@ -589,14 +589,14 @@ impl RoutingReader for FrrReader {
         self.0.incarnation()
     }
 
-    fn bgp_routes(
+    fn bgp_filter_routes(
         &mut self,
         _cfg: &Config,
         instance: &str,
         neighbor: &str,
         received: bool,
     ) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
-        self.0.bgp_routes(instance, neighbor, received)
+        self.0.bgp_filter_routes(instance, neighbor, received)
     }
 }
 

@@ -127,13 +127,13 @@ fn live_bgp_policy() {
     frr.apply(&Config::default(), &cfg).unwrap();
     wait_for("pol established", || frr.bgp_sessions(&cfg).unwrap().iter().any(|s| s.connection.as_deref() == Some("pol") && s.established));
     wait_for("pol2's 5 routes in", || routes(false).iter().filter(|r| r.starts_with("10.30.")).count() == 5);
-    let received = frr.bgp_routes("default", "198.51.100.34", true).unwrap();
+    let received = frr.bgp_filter_routes("default", "198.51.100.34", true).unwrap();
     if received.len() != 4 {
         let raw = Command::new("vtysh").args(["-c", "show bgp ipv4 unicast neighbors 198.51.100.34 received-routes detail"]).output().unwrap();
         let run = Command::new("vtysh").args(["-c", "show running-config"]).output().unwrap();
         eprintln!("received {}:\n{}\nrunning:\n{}", received.len(), String::from_utf8_lossy(&raw.stdout), String::from_utf8_lossy(&run.stdout));
     }
-    wait_for("4 routes kept from pol", || frr.bgp_routes("default", "198.51.100.34", true).unwrap().len() == 4);
+    wait_for("4 routes kept from pol", || frr.bgp_filter_routes("default", "198.51.100.34", true).unwrap().len() == 4);
     std::thread::sleep(Duration::from_secs(3));
     let ours = routes(false);
     assert!(!ours.iter().any(|r| r == "203.0.113.0/24"), "RFC 8212: eBGP routes accepted without a policy: {ours:?}");
@@ -168,7 +168,7 @@ fn live_bgp_policy() {
     let (policy, problems) = Policy::build(&cfg2.routing.filter);
     assert!(problems.is_empty(), "{problems:?}");
     let got: Vec<Route> = frr
-        .bgp_routes("default", "198.51.100.34", true)
+        .bgp_filter_routes("default", "198.51.100.34", true)
         .unwrap()
         .into_iter()
         // The peer sends our 10.30.x back (its path has our AS: bgpd drops
