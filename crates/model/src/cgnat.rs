@@ -349,12 +349,39 @@ pub struct Settings {
     /// (Lei 12.965/2014, art. 13) asks a year of connection records.
     #[serde(default = "default_retention")]
     pub history_days: u32,
+    /// RFC 6888 REQ-11b (G2.7): a subscriber whose new connection finds no
+    /// free port gets an ICMP destination unreachable, code 1 (host
+    /// unreachable: a soft error, RFC 1122 §4.2.3.9, so TCP keeps trying)
+    /// instead of silence.
+    #[serde(default = "yes")]
+    pub icmp_unreachable: bool,
+    /// Those ICMP messages per second and subscriber at most (also the
+    /// burst), so a full subscriber's storm of SYNs is never amplified.
+    #[serde(default = "default_icmp_rate")]
+    pub icmp_rate: u16,
 }
+
+fn yes() -> bool {
+    true
+}
+
+fn default_icmp_rate() -> u16 {
+    DEFAULT_ICMP_RATE
+}
+
+/// Default of [`Settings::icmp_rate`]: per subscriber and second, what the
+/// kernel's own ICMP limiter allows a destination (one per
+/// `icmp_ratelimit`, 1 s, with a small burst).
+pub const DEFAULT_ICMP_RATE: u16 = 2;
+/// Upper bound of [`Settings::icmp_rate`].
+pub const MAX_ICMP_RATE: u16 = 100;
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             history_days: default_retention(),
+            icmp_unreachable: true,
+            icmp_rate: DEFAULT_ICMP_RATE,
         }
     }
 }

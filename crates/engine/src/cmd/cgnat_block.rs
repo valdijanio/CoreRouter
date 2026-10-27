@@ -22,7 +22,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{subscriber?: ipv4, public?: ipv4, port?: u16, from?: string (unix or RFC 3339), to?: string, count?: u32 (1..5000; default 200)} → [{subscriber, pool, public, first_port, last_port, from (UTC), until? (UTC)}] (newest first; RFC 6888 §4: one record per block)",
         always, history),
     cmd!(query "ip.firewall.cgnat.alert.list", "CGNAT Port Alerts", [], None,
-        "{} → {insert_failed (new connections the kernel could not translate since the start: no free port), rows: [{subscriber, pool, used, ports, percent, peak, crossings, first (UTC), last (UTC), above}]}",
+        "{} → {insert_failed (new connections the kernel could not translate since the start: no free port), refused (of them, the ones of nearly full subscribers the exhaustion queues dropped: RFC 6888 REQ-11a), icmp_sent (ICMP host unreachable sent about them: REQ-11b), icmp_limited (held back by the rate limit), full (subscribers now checked for a free port), rows: [{subscriber, pool, used, ports, percent, peak, crossings, first (UTC), last (UTC), above, refused, icmp, last_refused? (UTC)}]}",
         always, alerts),
     cmd!(
         "ip.firewall.cgnat.alert.clear",
@@ -127,21 +127,30 @@ fn history(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn alerts(s: &mut Session, _: &Value) -> Result<Value> {
     let Some(rt) = s.cgnat_blocks() else {
-        return Ok(json!({"insert_failed": 0, "rows": []}));
+        return Ok(json!({"insert_failed": 0, "refused": 0, "icmp_sent": 0, "icmp_limited": 0, "full": 0, "rows": []}));
     };
     let mut rows: Vec<&crate::cgnat_blocks::Alert> = rt.alerts().values().collect();
     rows.sort_by(|a, b| b.above.cmp(&a.above).then(b.percent.cmp(&a.percent)).then(b.last.cmp(&a.last)));
     let rows: Vec<Value> = rows
         .into_iter()
         .map(|a| {
-            json!({
+            let mut v = json!({
                 "subscriber": a.subscriber, "pool": a.pool, "used": a.used, "ports": a.ports,
                 "percent": a.percent, "peak": a.peak, "crossings": a.crossings,
                 "first": utc(a.first), "last": utc(a.last), "above": a.above,
-            })
+                "refused": a.refused, "icmp": a.icmp,
+            });
+            if let (Some(t), Some(o)) = (a.last_refused, v.as_object_mut()) {
+                o.insert("last_refused".into(), json!(utc(t)));
+            }
+            v
         })
         .collect();
-    Ok(json!({"insert_failed": rt.insert_failed(), "rows": rows}))
+    let x = rt.exhaustion();
+    Ok(json!({
+        "insert_failed": rt.insert_failed(), "refused": x.refused, "icmp_sent": x.icmp,
+        "icmp_limited": x.limited, "full": rt.full().len(), "rows": rows,
+    }))
 }
 
 fn alerts_clear(s: &mut Session, p: &Value) -> Result<Value> {

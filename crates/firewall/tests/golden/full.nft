@@ -90,4 +90,16 @@ table inet corerouter {
 		type filter hook forward priority mangle; policy accept;
 		meta mark & 0x0000ffff != 0x00008514 meta mark & 0xffff0000 == 0x57e50000 counter meta mark set meta mark & 0xffff0000 | 0x00008514 comment "cr:*14"
 	}
+	chain raw_prerouting {
+		type filter hook prerouting priority raw; policy accept;
+		meta nfproto ipv4 iifname @il_WAN ip saddr @al4_blocked counter drop comment "cr:*16"
+		meta nfproto ipv4 iifname @il_WAN ip saddr @ad4_blocked ip saddr != @al4_blocked counter drop comment "cr:*16"
+		meta nfproto ipv6 iifname @il_WAN ip6 saddr @al6_blocked counter drop comment "cr:*16"
+		meta nfproto ipv6 iifname @il_WAN ip6 saddr @ad6_blocked ip6 saddr != @al6_blocked counter drop comment "cr:*16"
+		meta l4proto udp th dport 53 counter notrack accept comment "cr:*17"
+	}
+	chain raw_output {
+		type filter hook output priority raw; policy accept;
+		meta l4proto udp th sport 53 counter notrack accept comment "cr:*18"
+	}
 }

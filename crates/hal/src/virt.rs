@@ -67,6 +67,10 @@ pub struct VirtualHal {
     killed: std::collections::BTreeSet<u32>,
     /// CGNAT blocks the engine installed (G2.3c), by (pool, subscriber).
     blocks: BTreeMap<(corerouter_model::ItemId, std::net::Ipv4Addr), corerouter_model::cgnat::Slot>,
+    /// The CGNAT set `full` the engine keeps (G2.7) and the polls of the
+    /// refusals the lab makes up for it.
+    cgnat_full: Vec<std::net::Ipv4Addr>,
+    exhausted_polls: u64,
     /// The lab's "kernel" (G1.3): what each apply left, which a test (or
     /// a lab script) can change behind CoreRouter's back to make drift.
     kernel: LabKernel,
@@ -167,6 +171,8 @@ impl VirtualHal {
             reenabled: BTreeMap::new(),
             killed: std::collections::BTreeSet::new(),
             blocks: BTreeMap::new(),
+            cgnat_full: Vec::new(),
+            exhausted_polls: 0,
             kernel: Arc::new(Mutex::new(kernel)),
             oslog: crate::oslog::LabOsLog::default(),
             shaper: crate::queue::lab::LabShaper::default(),
@@ -500,6 +506,52 @@ impl Hal for VirtualHal {
             }),
             devices,
         }
+    }
+
+    fn cgnat_full(&mut self, subscribers: &[std::net::Ipv4Addr]) -> Result<(), HalError> {
+        self.cgnat_full = subscribers.to_vec();
+        Ok(())
+    }
+
+    /// The lab's exhaustion: every 10th poll, one in three of the nearly
+    /// full subscribers (the same ones each time) had 4 new connections
+    /// refused and got 2 ICMP (the rate limit held back the rest).
+    fn cgnat_exhausted(
+        &mut self,
+    ) -> (
+        Vec<(std::net::Ipv4Addr, crate::cgnat::Hit)>,
+        crate::cgnat::ExhaustionStats,
+    ) {
+        self.exhausted_polls = self.exhausted_polls.wrapping_add(1);
+        if !self.exhausted_polls.is_multiple_of(10) {
+            return (Vec::new(), crate::cgnat::ExhaustionStats::default());
+        }
+        let hits: Vec<_> = self
+            .cgnat_full
+            .iter()
+            .filter(|a| u32::from(**a).is_multiple_of(3))
+            .map(|a| {
+                (
+                    *a,
+                    crate::cgnat::Hit {
+                        refused: 4,
+                        icmp: 2,
+                    },
+                )
+            })
+            .collect();
+        let n = hits.len() as u64;
+        (
+            hits,
+            crate::cgnat::ExhaustionStats {
+                seen: n * 6,
+                refused: n * 4,
+                icmp: n * 2,
+                limited: n * 2,
+                untracked: 0,
+                overrun: 0,
+            },
+        )
     }
 
     fn cgnat_waiting(&mut self) -> Vec<crate::cgnat::Waiting> {
