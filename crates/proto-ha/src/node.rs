@@ -19,7 +19,9 @@ use sha2::Sha256;
 
 use crate::Millis;
 use crate::hello::{HelloFrame, ReplayGuard};
-use crate::msg::{Counters, FrameReader, Heartbeat, Hello, Key, Msg, Role, Section, VERSION};
+use crate::msg::{
+    Counters, FEATURE_FORWARD, FrameReader, Heartbeat, Hello, Key, Msg, Role, Section, VERSION,
+};
 use crate::role::{Action, Ha, Path, PeerView, Refused, RoleConfig, RoleStatus, Transition};
 use crate::sync::{Publisher, PublisherStatus, Replica, ReplicaStatus, SyncConfig};
 use crate::wire::Error;
@@ -48,6 +50,11 @@ pub enum Event {
     Role(Transition),
     /// The link authenticated: the peer is `node_id`.
     PeerUp { node_id: u64 },
+    /// The peer asks for a service (G4.3hb, a CoA/DM): answer with
+    /// [`Node::forward_reply`] and the same `id`.
+    Forward { id: u64, body: Vec<u8> },
+    /// The answer to our [`Node::forward`] `id`.
+    ForwardReply { id: u64, body: Vec<u8> },
 }
 
 /// Why the caller must close the sync connection.
@@ -255,6 +262,35 @@ impl Node {
             applied,
             sessions: self.sessions(),
             sections: self.cfg.sections.clone(),
+            features: FEATURE_FORWARD,
+        }
+    }
+
+    /// The link is up and the peer takes [`Msg::Forward`].
+    pub fn can_forward(&self) -> bool {
+        self.link_up()
+            && self
+                .peer_hello
+                .as_ref()
+                .is_some_and(|h| h.features & FEATURE_FORWARD != 0)
+    }
+
+    /// Hands `body` to the peer (its answer comes as
+    /// [`Event::ForwardReply`] with `id`). `false`: not sent (no link, a
+    /// peer without the feature, or a body over the limit).
+    pub fn forward(&mut self, id: u64, body: Vec<u8>) -> bool {
+        if !self.can_forward() {
+            return false;
+        }
+        let before = self.out.len();
+        self.send(&Msg::Forward { id, body });
+        self.out.len() > before
+    }
+
+    /// The answer to the peer's [`Event::Forward`] `id`.
+    pub fn forward_reply(&mut self, id: u64, body: Vec<u8>) {
+        if self.link_up() {
+            self.send(&Msg::ForwardReply { id, body });
         }
     }
 
@@ -414,6 +450,14 @@ impl Node {
             }
             Msg::Handover { epoch } => self.ha.handover(now, *epoch),
             Msg::HandoverRequest { epoch } => self.ha.handover_request(now, *epoch),
+            Msg::Forward { id, body } => self.events.push(Event::Forward {
+                id: *id,
+                body: body.clone(),
+            }),
+            Msg::ForwardReply { id, body } => self.events.push(Event::ForwardReply {
+                id: *id,
+                body: body.clone(),
+            }),
             Msg::Ack { .. } | Msg::Resync { .. } => {
                 if let Some(p) = &mut self.publisher {
                     p.handle(now, &m);
@@ -734,6 +778,51 @@ mod tests {
         a.take_events(&mut ev);
         assert_eq!(ev, vec![Event::PeerUp { node_id: 2 }]);
         assert_eq!(a.status(0).drift, ["ppp.profile"]);
+    }
+
+    /// G4.3hb: a request and its answer cross the link; nothing goes to a
+    /// peer before its Hello says it takes them, nor without a link.
+    #[test]
+    fn a_forwarded_request_and_its_answer_cross_the_link() {
+        let mut a = Node::new(cfg(1, b"segredo"), 0);
+        let mut b = Node::new(cfg(2, b"segredo"), 0);
+        assert!(!a.forward(1, b"x".to_vec()), "no link");
+        a.connected(0, [1; 32]);
+        b.connected(0, [2; 32]);
+        pump(&mut a, &mut b, 0).unwrap();
+        let mut ev = Vec::new();
+        a.take_events(&mut ev);
+        b.take_events(&mut ev);
+        ev.clear();
+        assert!(a.can_forward());
+        assert!(a.forward(7, b"coa".to_vec()));
+        pump(&mut a, &mut b, 1).unwrap();
+        b.take_events(&mut ev);
+        assert_eq!(
+            ev,
+            vec![Event::Forward {
+                id: 7,
+                body: b"coa".to_vec()
+            }]
+        );
+        b.forward_reply(7, b"ack".to_vec());
+        pump(&mut a, &mut b, 2).unwrap();
+        ev.clear();
+        a.take_events(&mut ev);
+        assert_eq!(
+            ev,
+            vec![Event::ForwardReply {
+                id: 7,
+                body: b"ack".to_vec()
+            }]
+        );
+        // A peer whose Hello has no features (an older version): not sent.
+        let old = Hello {
+            features: 0,
+            ..a.peer_hello.clone().unwrap()
+        };
+        a.peer_hello = Some(old);
+        assert!(!a.can_forward() && !a.forward(8, b"coa".to_vec()));
     }
 
     #[test]

@@ -38,6 +38,7 @@ fn fresh_hello() -> Hello {
         applied: 0,
         sessions: 0,
         sections: vec![],
+        features: 0,
     }
 }
 

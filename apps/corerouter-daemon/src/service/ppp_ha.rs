@@ -13,18 +13,24 @@
 //!   down after 3 misses in a row, up on the first answer.
 //! - **Track:** the `track` ports must be running (carrier up).
 //!
+//! - **CoA/DM of the peer's sessions** (G4.3hb): a request no session
+//!   here claims, while this node is not the one answering, goes to the
+//!   peer over the sync link ([`PeerForward`]); its owners apply it and
+//!   this node answers the RADIUS server with what they said.
+//!
 //! The node sits behind a mutex that every thread takes briefly and never
 //! across I/O: the main loop (hellos, timers, every 10 ms), the connection
 //! thread (bytes in and out) and the commands (`HaBackend`). What the
 //! `pppoe` service reads to answer or keep quiet is [`shared`] (atomics).
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use corerouter_engine::ppp_redundancy::HaBackend;
 use corerouter_engine::{Shared, lock};
+use corerouter_model::radius::{CoaOutcome, CoaRequest};
 use corerouter_model::ppp_redundancy::{
     PeerStatus, Redundancy, RedundancyStatus, RoleChange, SyncStatus,
 };
@@ -65,6 +71,123 @@ pub(crate) fn shared() -> &'static HaShared {
         mac: Mutex::new([0; 6]),
         cookie_key: Mutex::new(None),
     })
+}
+
+// ---- G4.3hb: CoA/Disconnect through the pair ----------------------------------
+
+/// Requests handed to the peer: when, and who waits for the answer.
+struct Forwards {
+    next: u64,
+    waiting: BTreeMap<u64, (u64, super::radius_aaa::CoaDone)>,
+}
+
+static FORWARDS: Mutex<Forwards> = Mutex::new(Forwards {
+    next: 0,
+    waiting: BTreeMap::new(),
+});
+/// Answers to the peer's requests (posted by the RADIUS driver's thread),
+/// for the main loop to send.
+static PEER_REPLIES: Mutex<Vec<(u64, CoaOutcome)>> = Mutex::new(Vec::new());
+/// The RADIUS service's handle: its owners apply the peer's requests.
+static AAA: Mutex<Option<super::radius_aaa::Aaa>> = Mutex::new(None);
+/// Bounds the forwarded requests in flight (the RADIUS driver's too).
+const MAX_FORWARDS: usize = 1024;
+/// An answer older than this is not waited for (the driver answered
+/// 505 at 2 s already).
+const FORWARD_FORGET_MS: u64 = 5000;
+
+fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The RADIUS service registers itself (G4.3hb).
+pub(crate) fn set_aaa(aaa: Option<super::radius_aaa::Aaa>) {
+    *locked(&AAA) = aaa;
+}
+
+/// `radius_aaa`'s way to the peer: only while this node is not the one
+/// answering subscribers (the active holds every session; a standby
+/// asking it is the case of a server that still targets the old active).
+pub(crate) struct PeerForward;
+
+impl super::radius_aaa::CoaForward for PeerForward {
+    fn forward(&self, req: &CoaRequest, done: super::radius_aaa::CoaDone) -> bool {
+        let Ok(body) = serde_json::to_vec(req) else {
+            return false;
+        };
+        let rt = runtime();
+        let now = rt.now();
+        // In the table before it is sent: the answer cannot overtake it.
+        let id = {
+            let mut f = locked(&FORWARDS);
+            if f.waiting.len() >= MAX_FORWARDS {
+                return false;
+            }
+            f.next += 1;
+            let id = f.next;
+            f.waiting.insert(id, (now, done));
+            id
+        };
+        let sent = match rt.pair().as_mut() {
+            Some(p) if !p.node.answering() => p.node.forward(id, body),
+            _ => false,
+        };
+        if !sent {
+            // Dropped unanswered: the caller answers itself.
+            drop(locked(&FORWARDS).waiting.remove(&id));
+        }
+        sent
+    }
+}
+
+/// The peer asks: its request to our owners, the answer back later.
+fn peer_asks(id: u64, body: &[u8]) {
+    let reply = move |o: CoaOutcome| locked(&PEER_REPLIES).push((id, o));
+    match serde_json::from_slice::<CoaRequest>(body) {
+        Ok(req) => match locked(&AAA).clone() {
+            Some(aaa) => aaa.peer_coa(req, Box::new(reply)),
+            None => reply(CoaOutcome::NotMine),
+        },
+        // RFC 5176 §3.5 404 Invalid Request.
+        Err(_) => reply(CoaOutcome::Nak(404)),
+    }
+}
+
+/// The peer answered our request `id`.
+fn peer_answers(id: u64, body: &[u8]) {
+    let done = locked(&FORWARDS).waiting.remove(&id);
+    if let Some((_, done)) = done {
+        done(serde_json::from_slice::<CoaOutcome>(body).ok());
+    }
+}
+
+/// Answers for the peer onto the link, and forwards never answered out
+/// of the table.
+fn forward_turn(rt: &Runtime) {
+    let replies = std::mem::take(&mut *locked(&PEER_REPLIES));
+    if !replies.is_empty()
+        && let Some(p) = rt.pair().as_mut()
+    {
+        for (id, o) in replies {
+            if let Ok(b) = serde_json::to_vec(&o) {
+                p.node.forward_reply(id, b);
+            }
+        }
+    }
+    let now = rt.now();
+    let old: Vec<super::radius_aaa::CoaDone> = {
+        let mut f = locked(&FORWARDS);
+        let ids: Vec<u64> = f
+            .waiting
+            .iter()
+            .filter(|(_, (at, _))| now.saturating_sub(*at) > FORWARD_FORGET_MS)
+            .map(|(id, _)| *id)
+            .collect();
+        ids.iter().filter_map(|id| f.waiting.remove(id)).map(|(_, d)| d).collect()
+    };
+    for d in old {
+        d(None);
+    }
 }
 
 /// The node and what the monitor shows about it.
@@ -656,8 +779,11 @@ mod linux {
                         format!("ppp redundancy: peer {node_id:016x} connected"),
                         json!({"peer": format!("{node_id:016x}")}),
                     ),
+                    Event::Forward { id, body } => super::peer_asks(id, &body),
+                    Event::ForwardReply { id, body } => super::peer_answers(id, &body),
                 }
             }
+            super::forward_turn(rt);
             if !health.sleep(TICK) {
                 *rt.pair() = None;
                 shared().enabled.store(false, Ordering::Release);
