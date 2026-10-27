@@ -5527,3 +5527,69 @@ continuação indentadas).
   comandos), todas removidas em 197 ms, leitura de 1 000 sessões em 135 ms fora do lock. No
   engine (release, criterion), mudar uma conexão entre 1 000 passou de 8,1 ms para 1,5 ms por
   commit com a seção `routing` em `CowArc` e o delta do histórico por conexão.
+
+- 2026-10-27 — G1.27d: Vizinhos ARP/ND, parte a. O `hal-linux` lê a tabela de vizinhos por um socket rtnetlink
+  síncrono (sem o crate `rtnetlink`/tokio): dump `RTM_GETNEIGH` das duas famílias e eventos do
+  grupo `RTNLGRP_NEIGH`. O serviço `neighbors` do daemon (thread própria, sob o supervisor) aplica
+  cada evento na tabela do motor, que tem trava própria (O(1) por mudança, nunca o lock do
+  `Session`); `ENOBUFS` dispara um dump novo. Comandos: `ip.arp.list` e `ipv6.neighbor.list`
+  (página no motor, busca por IP, CIDR, prefixo de MAC ou texto, filtros por interface, estado e
+  origem, contagens da tabela inteira, uso × `gc_thresh3`), `ip.arp.add/set/remove` (journal e
+  rollback), `ip.arp.make-static`, `ip.arp.flush`/`ipv6.neighbor.flush` (nunca o gateway de rota
+  ativa nem o vizinho da gerência), `ip.arp.ping` (tarefa), `ip.arp.settings.print/set` (modos
+  `enabled`, `disabled` = `IFF_NOARP`, `reply-only`, `proxy-arp`, `local-proxy-arp`, e
+  `arp_timeout`; os arriscados pedem `confirm`, e cortar a gerência é recusado como lockout).
+  `ip.route.list`/`page`/`detail` dizem `gateway_status = incomplete` quando o gateway não resolve
+  (o kernel só avisa quando desiste, ~3 s: 3 solicitações × 1 s, RFC 4861 §10). Log com o tópico
+  novo `arp`: "changed MAC" e "flip-flop" (arpwatch), e o aviso de 80 % do `gc_thresh3` com
+  sugestão. Laboratório virtual coerente (`hal::lab_neigh`). Pesquisa em `docs/arp.md`.
+
+  Como testar: `cargo test -p corerouter-engine --test arp`; em namespace,
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p
+  corerouter-hal-linux --test netns_neigh` (5000 vizinhos, eventos, `apply` real de estáticos e
+  modos, ARP ping contra um host noutro namespace). No laboratório real (`plan/lab-real.sh`,
+  daemon `--backend linux`): o cliente aparece `stale`/`reachable` pelo feed, a rota por um
+  gateway inexistente vira `incomplete`, trocar o MAC do cliente gera "changed MAC" no log,
+  `reply-only` com o cliente estático continua pingando, ARP ping responde em ~0,05 ms (**medido**).
+
+- 2026-10-27 — G4.4j: Log de NAT do CGNAT em IPFIX e transporte confiável do Traffic Flow:
+
+  - **RFC 8158 do CGNAT:** blocos alocados e liberados (`natEvent` 16/17) com `natPoolId`, `vlanId`
+    e `userName` (login PPPoE/IPoE pelo índice por endereço, fora do lock da sessão); pool sem bloco
+    (3), assinante sem portas (13, cota por usuário, junto do ICMP do G2.7) e assinante acima do
+    alerta (18, limiar por usuário), um por minuto por pool ou assinante (§5.2). Os templates seguem
+    as Tabelas 5, 9, 13, 18 e 21, que viraram testes; o registro de bloco é conferido byte a byte.
+  - **Fila própria no engine** (`nat_log.rs`, 262 144 eventos, descarte contado): antes os blocos
+    vinham do log do roteador, cuja janela recente tem 1024 linhas.
+  - **Comandos:** `ip.traffic-flow.set` ganhou `flows`, `nat_port_blocks`, `nat_limits` (e
+    `nat_events` passou a vir desligado, como no RouterOS); `ip.traffic-flow.target.*` ganhou
+    `transport` sctp/tls, `content` all/nat/flows, `nat_events_legacy`, `certificate`,
+    `private_key` (secreta), `ca_certificate`, `server_name`; `records` aceita `type: nat-limit`; o
+    CSV ganhou `user,vlan,pool,limit`. PEM colado numa linha só é reconstruído (RFC 7468 §2).
+  - **Daemon:** cada coletor TCP/SCTP/TLS tem a thread `tf-send-<id>` com fila de 8 MiB; templates
+    primeiro em toda conexão nova, com a sequência da mensagem seguinte; `src_address` também no
+    TCP/SCTP/TLS (bind pelo `socket2`); sem fluxos nem sessões o conntrack nem é lido. O serviço
+    `cgnat` serve os primeiros pacotes em lote: um lock e um `fdatasync` do journal por lote, e as
+    filas do nfqueue pedem 4096 pacotes (a 7422 ficava no padrão de 1024).
+  - **Janela:** IP › Firewall › CGNAT › Logging (interruptores com o `natEvent` de cada um, os
+    coletores de NAT com transporte, conteúdo e códigos, aviso quando algum não é TLS, "Add
+    Collector" abre o destino já em TLS/NAT/4740); IP › Traffic Flow com os campos novos. ⓘ em
+    português e inglês.
+
+  Como testar:
+
+  ```sh
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_nat_ipfix -- --nocapture
+  cargo test -p corerouter-proto-flow --test tshark_interop
+  cargo bench -p corerouter-engine --bench cgnat_pba_storm
+  ```
+
+  O teste netns liga um CGNAT em blocos, três coletores (SCTP; TLS com certificados de uma CA de
+  teste e autenticação mútua; UDP legado só NAT) e confere blocos, pool esgotado com limite de taxa,
+  sessões 4 e 1, sequência sem buraco e uma tempestade de 20 mil assinantes. Precisa dos módulos
+  `sctp` e `nfnetlink_queue` no host (`ci/kernel-modules/`).
+
+  Desempenho e paralelismo (**medido**, release, AMD Ryzen AI MAX+ 395, kernel 7.0, 2026-10-27):
+  100 mil eventos de criação NAT saíram pelo TCP 0,38 s após a rajada (~260 mil eventos/s), 1,6 µs de
+  CPU por registro, sem descarte; tempestade de 20 mil blocos com 24 µs de CPU do daemon por bloco;
+  alocação no engine 11 → 4,4 µs por bloco; group commit 632 → 3 411 blocos/s no build de teste.
