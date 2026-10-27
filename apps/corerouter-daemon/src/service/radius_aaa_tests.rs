@@ -773,3 +773,147 @@ fn coa_with_routes_reaches_the_owner_and_its_nak_goes_back() {
     assert_eq!(p.code(), Code::CoaNak);
     assert_eq!(p.attr_u32(attr::ERROR_CAUSE), Some(407));
 }
+
+// ---- G4.3hb: CoA/DM through the other BNG of a pair -------------------------
+
+/// The pair's peer, in memory: what it was asked and how it answers.
+#[derive(Default)]
+struct Peer {
+    asked: Mutex<Vec<CoaRequest>>,
+    /// `None`: nobody to ask (`forward` refuses).
+    answer: Mutex<Option<Option<CoaOutcome>>>,
+    /// Answers held back (the test lets them go).
+    held: Mutex<Vec<radius_aaa::CoaDone>>,
+}
+
+impl radius_aaa::CoaForward for Peer {
+    fn forward(&self, req: &CoaRequest, done: radius_aaa::CoaDone) -> bool {
+        let Some(a) = *self.answer.lock().unwrap() else {
+            return false;
+        };
+        self.asked.lock().unwrap().push(req.clone());
+        match a {
+            // From another thread, as the pair's main loop does.
+            Some(o) => {
+                thread::spawn(move || done(Some(o)));
+            }
+            None => self.held.lock().unwrap().push(done),
+        }
+        true
+    }
+}
+
+fn reply(p: &[u8]) -> (Code, Option<u32>) {
+    let p = Packet::parse(p).unwrap();
+    (p.code(), p.attr_u32(attr::ERROR_CAUSE))
+}
+
+#[test]
+fn a_coa_for_the_peers_session_is_answered_with_what_the_peer_did() {
+    let port = free_port();
+    let r = start_with(incoming(port));
+    let owner = Arc::new(Owner::default());
+    r.aaa.register_owner(owner.clone());
+    let peer = Arc::new(Peer::default());
+    r.aaa.set_forward(Some(peer.clone()));
+    wait_listening(&r.aaa);
+    let dac = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Ours: applied here, the peer is not asked.
+    *peer.answer.lock().unwrap() = Some(Some(CoaOutcome::Ack));
+    let ack = send(&dac, port, &coa(RequestKind::Coa, 1, "PPP-1", unix_now())).unwrap();
+    assert_eq!(reply(&ack), (Code::CoaAck, None));
+    assert!(peer.asked.lock().unwrap().is_empty());
+    // The peer's: CoA-ACK from here with the peer's word, the change as decoded.
+    let t = Instant::now();
+    let ack = send(&dac, port, &coa(RequestKind::Coa, 2, "PPP-PAR", unix_now())).unwrap();
+    eprintln!("CoA through the peer (in memory): {:?}", t.elapsed());
+    assert_eq!(reply(&ack), (Code::CoaAck, None));
+    {
+        let asked = peer.asked.lock().unwrap();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].selector.acct_session_id.as_deref(), Some("PPP-PAR"));
+        assert_eq!(asked[0].changes[0].name, "Mikrotik-Rate-Limit");
+    }
+    // The peer does not have it either: NAK 503, as without a pair.
+    *peer.answer.lock().unwrap() = Some(Some(CoaOutcome::NotMine));
+    let nak = send(&dac, port, &coa(RequestKind::Disconnect, 3, "PPP-X", unix_now())).unwrap();
+    assert_eq!(reply(&nak), (Code::DisconnectNak, Some(503)));
+    // The peer's own NAK goes as it said.
+    *peer.answer.lock().unwrap() = Some(Some(CoaOutcome::Nak(504)));
+    let nak = send(&dac, port, &coa(RequestKind::Disconnect, 4, "PPP-Y", unix_now())).unwrap();
+    assert_eq!(reply(&nak), (Code::DisconnectNak, Some(504)));
+    // No peer to ask: NAK 503 at once.
+    *peer.answer.lock().unwrap() = None;
+    let nak = send(&dac, port, &coa(RequestKind::Coa, 5, "PPP-Z", unix_now())).unwrap();
+    assert_eq!(reply(&nak), (Code::CoaNak, Some(503)));
+    let m = monitor(&r.aaa).incoming;
+    assert_eq!((m.forwarded, m.forward_answered), (3, 3), "{m:?}");
+}
+
+#[test]
+fn a_silent_peer_gets_nak_505_and_a_retransmission_is_not_forwarded_twice() {
+    let port = free_port();
+    let r = start_with(incoming(port));
+    let peer = Arc::new(Peer::default());
+    *peer.answer.lock().unwrap() = Some(None);
+    r.aaa.set_forward(Some(peer.clone()));
+    wait_listening(&r.aaa);
+    let dac = UdpSocket::bind("127.0.0.1:0").unwrap();
+    // Held: no answer yet; the server's retransmission is not asked again.
+    let req = coa(RequestKind::Disconnect, 7, "PPP-PAR", unix_now());
+    assert_eq!(send(&dac, port, &req), None);
+    assert_eq!(send(&dac, port, &req), None);
+    assert_eq!(peer.asked.lock().unwrap().len(), 1);
+    // The peer answers: the reply goes to the server, and a later
+    // retransmission gets it from the cache.
+    let done = peer.held.lock().unwrap().pop().unwrap();
+    done(Some(CoaOutcome::Ack));
+    dac.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let mut buf = [0u8; 4096];
+    let (n, _) = dac.recv_from(&mut buf).unwrap();
+    assert_eq!(reply(&buf[..n]), (Code::DisconnectAck, None));
+    assert_eq!(send(&dac, port, &req).as_deref(), Some(&buf[..n]));
+    // Never answered: NAK 505 (Other Proxy Processing Error) after 2 s.
+    let t = Instant::now();
+    dac.send_to(&coa(RequestKind::Coa, 8, "PPP-MUDO", unix_now()), ("127.0.0.1", port)).unwrap();
+    dac.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let (n, _) = dac.recv_from(&mut buf).unwrap();
+    assert_eq!(reply(&buf[..n]), (Code::CoaNak, Some(505)));
+    assert!(t.elapsed() >= Duration::from_millis(1900), "{:?}", t.elapsed());
+    // Its late answer changes nothing.
+    peer.held.lock().unwrap().pop().unwrap()(Some(CoaOutcome::Ack));
+    thread::sleep(Duration::from_millis(100));
+    dac.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    assert!(dac.recv_from(&mut buf).is_err(), "nothing more");
+}
+
+#[test]
+fn a_request_from_the_peer_goes_only_to_our_owners() {
+    let r = start(vec![]);
+    let owner = Arc::new(Owner::default());
+    r.aaa.register_owner(owner.clone());
+    // Never forwarded again (the peer asked because it does not have it).
+    let peer = Arc::new(Peer::default());
+    *peer.answer.lock().unwrap() = Some(Some(CoaOutcome::Ack));
+    r.aaa.set_forward(Some(peer.clone()));
+    let ask = |session: &str| {
+        let req = CoaRequest {
+            kind: CoaKind::Disconnect,
+            from: "10.8.0.1:3799".parse().unwrap(),
+            selector: corerouter_model::radius::CoaSelector {
+                acct_session_id: Some(session.into()),
+                ..Default::default()
+            },
+            changes: Vec::new(),
+            authorize_only: false,
+            packet: Vec::new(),
+        };
+        let (tx, rx) = mpsc::channel();
+        r.aaa.peer_coa(req, Box::new(move |o| tx.send(o).unwrap()));
+        rx.recv_timeout(Duration::from_secs(5)).unwrap()
+    };
+    assert_eq!(ask("PPP-1"), CoaOutcome::Ack);
+    assert_eq!(ask("PPP-9"), CoaOutcome::NotMine);
+    assert_eq!(owner.calls.lock().unwrap().len(), 2);
+    assert!(peer.asked.lock().unwrap().is_empty());
+}

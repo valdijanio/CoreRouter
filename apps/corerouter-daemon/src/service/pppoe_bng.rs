@@ -476,28 +476,47 @@ impl SessionOwner for Owner {
     fn handle(&self, req: &CoaRequest) -> CoaOutcome {
         let mut sh = guard(&self.0);
         let sel = &req.selector;
-        let hits: Vec<String> = sh
-            .active
-            .values()
-            .filter(|a| {
-                sel.user_name.as_deref().is_none_or(|u| a.name == u)
-                    && sel.framed_ip.is_none_or(|ip| a.address == Some(ip))
-                    && sel
-                        .calling_station_id
-                        .as_deref()
-                        .is_none_or(|c| a.caller_id.eq_ignore_ascii_case(&c.replace('-', ":")))
-                    && sel
-                        .nas_port_id
-                        .as_deref()
-                        .is_none_or(|n| a.interface == n || a.circuit_id.as_deref() == Some(n))
-            })
-            .filter(|a| {
-                sel.acct_session_id
+        let caller = sel
+            .calling_station_id
+            .as_deref()
+            .map(|c| c.replace('-', ":"));
+        let matches = |a: &ActiveSession| {
+            sel.user_name.as_deref().is_none_or(|u| a.name == u)
+                && sel.framed_ip.is_none_or(|ip| a.address == Some(ip))
+                && caller
+                    .as_deref()
+                    .is_none_or(|c| a.caller_id.eq_ignore_ascii_case(c))
+                && sel
+                    .nas_port_id
+                    .as_deref()
+                    .is_none_or(|n| a.interface == n || a.circuit_id.as_deref() == Some(n))
+                && sel
+                    .acct_session_id
                     .as_deref()
                     .is_none_or(|s| sh.by_acct.get(s) == Some(&a.id))
-            })
-            .map(|a| a.id.clone())
-            .collect();
+        };
+        // G4.3hb: by address or Acct-Session-Id (what billing systems
+        // send) from the indexes; a pass over every session held this
+        // lock 16 ms at 100 000 (debug, **medido**).
+        let indexed = match (sel.framed_ip, sel.acct_session_id.as_deref()) {
+            (Some(ip), _) => Some(sh.by_ip.get(&ip)),
+            (None, Some(s)) => Some(sh.by_acct.get(s)),
+            (None, None) => None,
+        };
+        let hits: Vec<String> = match indexed {
+            Some(id) => id
+                .and_then(|id| sh.active.get(id))
+                .filter(|a| matches(a))
+                .map(|a| a.id.clone())
+                .into_iter()
+                .collect(),
+            None => sh
+                .active
+                .values()
+                .filter(|a| matches(a))
+                .map(|a| a.id.clone())
+                .collect(),
+        };
         let empty = sel.user_name.is_none()
             && sel.framed_ip.is_none()
             && sel.calling_station_id.is_none()
@@ -3909,5 +3928,79 @@ mod admission_tests {
         assert_eq!(b.backlog(1), 20_000);
         b.rate = AUTO_MIN;
         assert_eq!(b.window(8), AUTO_WINDOW_MIN);
+    }
+
+    /// G4.3hb: a CoA naming a session by Framed-IP-Address or
+    /// Acct-Session-Id finds it in the indexes, not by a pass over every
+    /// session (100 000 here); the other selectors still match as before.
+    #[test]
+    fn a_coa_by_address_or_session_id_does_not_scan_the_table() {
+        use corerouter_model::radius::CoaSelector;
+        let mut sh = Shared::default();
+        let n = 100_000u32;
+        for i in 0..n {
+            let id = format!("s{i}");
+            let ip = Ipv4Addr::from(0x6440_0000 + i);
+            sh.active.insert(
+                id.clone(),
+                ActiveSession {
+                    id: id.clone(),
+                    name: format!("u{i}"),
+                    address: Some(ip),
+                    caller_id: format!("02:00:00:00:{:02X}:{:02X}", i >> 8 & 0xff, i & 0xff),
+                    interface: "ether2".into(),
+                    ..ActiveSession::default()
+                },
+            );
+            sh.by_ip.insert(ip, id.clone());
+            sh.by_acct.insert(format!("A{i}"), id);
+        }
+        let owner = Owner(Arc::new(Mutex::new(sh)));
+        let coa = |sel: CoaSelector| CoaRequest {
+            kind: CoaKind::Coa,
+            from: "127.0.0.1:1".parse().unwrap(),
+            selector: sel,
+            changes: vec![Attribute::new("Mikrotik-Rate-Limit", "1M/1M")],
+            authorize_only: false,
+            packet: Vec::new(),
+        };
+        let by_ip = coa(CoaSelector {
+            framed_ip: Some(Ipv4Addr::from(0x6440_0000 + 777)),
+            ..CoaSelector::default()
+        });
+        let t = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(owner.handle(&by_ip), CoaOutcome::Ack);
+        }
+        let per = t.elapsed() / 100;
+        eprintln!("CoA by Framed-IP-Address, 100 000 sessions: {per:?} each");
+        let by_acct = coa(CoaSelector {
+            acct_session_id: Some("A99999".into()),
+            user_name: Some("u99999".into()),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&by_acct), CoaOutcome::Ack);
+        // The index finds it; the other attributes must still match.
+        let wrong_user = coa(CoaSelector {
+            acct_session_id: Some("A5".into()),
+            user_name: Some("u6".into()),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&wrong_user), CoaOutcome::NotMine);
+        let nobody = coa(CoaSelector {
+            framed_ip: Some(Ipv4Addr::new(198, 18, 0, 1)),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&nobody), CoaOutcome::NotMine);
+        // By user name: still the pass over the table.
+        let by_user = coa(CoaSelector {
+            user_name: Some("u42".into()),
+            ..CoaSelector::default()
+        });
+        assert_eq!(owner.handle(&by_user), CoaOutcome::Ack);
+        let sh = guard(&owner.0);
+        assert_eq!(sh.rates.len(), 102);
+        assert_eq!(sh.rates.last().map(|r| r.0.as_str()), Some("s42"));
+        assert!(per < std::time::Duration::from_millis(1), "{per:?}");
     }
 }

@@ -680,6 +680,7 @@ mod tests {
             applied,
             sessions: 0,
             sections: vec![],
+            features: 0,
         }
     }
 
