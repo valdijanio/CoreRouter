@@ -121,33 +121,46 @@ backend.**
   diferença e, se o FRR recusar uma linha, desfaz o que digitou; o engine então desfaz o
   `Hal::apply` e o commit falha. Nunca reinicia o FRR nem derruba sessão que o commit não muda.
 - **Como falar com o FRR (G3.1, medido).** Comparamos três formas no FRR 10.7.1 da VM do
-  laboratório (8 vCPUs, build release, 2026-10-27; `scripts/frr-compare.sh`). As tabelas
-  completas estão em `docs/perf.md`.
+  laboratório (8 vCPUs, build release, 2026-10-27, duas rodadas; `scripts/frr-compare.sh`). As
+  tabelas completas estão em `docs/perf.md`.
   - **(a) `frr-reload.py` + `vtysh -c '… json'`.** É Python, abre um `vtysh` por passo e diffa
-    o texto inteiro. Uma mudança pequena levou 0,2–3,9 s.
+    o texto inteiro.
   - **(b) o socket vty de cada daemon, falado em Rust** (`/var/run/frr/<daemon>.vty`, o mesmo
     protocolo do `vtysh`: comando terminado em NUL, resposta + `\0\0\0<código>`,
-    `lib/vty.c`). O diff é feito em Rust. Uma mudança pequena levou 1–13 ms, e a leitura de 100
-    sessões, 2,4–3,6 ms (contra 11–15 ms do `vtysh -c`). O processo usa 4–11 MiB, contra
-    18–32 MiB do `frr-reload.py`.
-  - **(c) misto: diff em Rust + `vtysh -f`.** Fica no meio: 18–45 ms numa mudança pequena e
-    um processo a mais a cada apply.
-  - **10 mil entradas de prefix-list.** O tempo é do próprio bgpd, em qualquer forma:
-    1,7–2,8 s em (b), 1,6–2,5 s em (c). O `frr-reload.py` terminou em 1,0–1,4 s **sem aplicar
-    nada** (as 10 mil linhas continuaram faltando, nas três rodadas). Tirar 5 mil levou
-    2,4–2,7 s em (b) e 3,8–5,8 s em (a).
-  - **1 M de rotas.** O `show ip route json` leva ~17 s pelos dois caminhos e gera 537 MiB: o
+    `lib/vty.c`). O diff é feito em Rust, e os daemons são configurados em paralelo, um thread
+    nomeado por daemon.
+  - **(c) misto: diff em Rust + `vtysh -f`.** Um processo a mais a cada apply.
+
+  | Medida | (b) | (c) | (a) |
+  |---|---|---|---|
+  | mudança pequena | 1,1–7,2 ms | 13–22 ms | 0,14–0,98 s |
+  | +10 mil entradas de prefix-list | 1,65–1,77 s | 1,6–2,9 s | 3,7–4,1 s |
+  | −5 mil entradas | 2,5–2,7 s | 2,6–2,8 s | 3,7–4,0 s |
+  | ler 100 sessões | 2,3–2,6 ms | — | 10–12 ms (`vtysh -c`) |
+  | memória do processo | 4–16 MiB | 23 MiB | 18–36 MiB |
+
+  - **Paralelismo.** Um prefix-list é digitado no mgmtd (que o repassa ao zebra) e no bgpd. Em
+    série, o (b) levava 3,3–5,2 s (+10 mil) e 4,9–5,5 s (−5 mil). Com um thread por daemon, o
+    commit leva o tempo do mais lento, não a soma. O tempo restante é do FRR: o `vtysh -f` gasta
+    o mesmo, e o parse e o diff em Rust de 10 mil linhas levam ~1 ms (criterion).
+  - **1 M de rotas.** O `show ip route json` leva ~13 s pelos dois caminhos e gera 537 MiB: o
     custo é do zebra. Interpretar isso como `serde_json::Value` passou de 5 GiB. Estado de rota
-    vem do resumo (`… summary json`, 0,2 s) ou de consultas por prefixo, nunca da tabela
+    vem do resumo (`… summary json`, 0,13 s) ou de consultas por prefixo, nunca da tabela
     inteira.
   - **mgmtd e gRPC (b original) não servem ao BGP hoje.** O mgmtd do FRR 10.x só cobre zebra,
     staticd, ripd e ripngd; bgpd e ospfd ainda não foram convertidos. O gRPC northbound é
-    experimental e não vem nos pacotes do deb.frrouting.org. O mesmo trait recebe um backend
-    mgmtd quando o bgpd for convertido, ou o holo (G3.8).
-  - **Decisão: (b).** Nenhum processo externo nem Python, é a forma mais rápida e não perde
-    linhas. O lote vai entre `XFRR_start_configuration` e `XFRR_end_configuration`, como o
-    `vtysh -f` faz: prefix-lists e route-maps do northbound viram um commit só, e o bgpd segura
-    os vizinhos novos até o fim, de modo que a sessão não sobe antes da política digitada junto.
+    experimental e não vem nos pacotes do deb.frrouting.org. Para o que já é dele (os filtros
+    do zebra), o driver fala com o mgmtd pelo mesmo socket vty, com `configure terminal
+    file-lock`. O mesmo trait recebe um backend mgmtd nativo quando o bgpd for convertido, ou o
+    holo (G3.8).
+  - **Decisão: (b).** Nenhum processo externo nem Python, e é a forma mais rápida ou empatada
+    em todas as medidas. O lote vai entre `XFRR_start_configuration` e
+    `XFRR_end_configuration`, como o `vtysh -f` faz: prefix-lists e route-maps do northbound
+    viram um commit só, e o bgpd segura os vizinhos novos até o fim, de modo que a sessão não
+    sobe antes da política digitada junto.
+  - **Armadilha medida.** Um filtro compartilhado precisa ir a todo daemon que o guarda. O
+    `vtysh` mostra as cópias somadas, então um daemon esquecido esconde a diferença: o
+    `frr-reload.py` chegou a pular 10 mil linhas que só a cópia do zebra tinha.
 - **Contextos do CoreRouter.** O driver só toca nos contextos da tabela `hal_frr::render::OWNED`
   (hoje `router bgp`). O resto da config do FRR (`hostname`, `log`, interfaces) fica como está.
   O diff é por contexto e trata o conteúdo como conjunto; uma configuração de valor único
@@ -156,10 +169,9 @@ backend.**
 - **Estado fora do lock.** O serviço `frr` do daemon (`--frr <dir>`) lê as sessões a cada 2 s
   numa conexão própria e só pega o lock do `Session` para copiar a parte `routing` e guardar a
   amostra. Quando o FRR volta depois de cair, a config em execução é reinstalada
-  (`Session::routing_resync`), sob o lock, para não intercalar com um commit. Paralelismo: o
-  bgpd atende um comando de cada vez por conexão, e o custo dominante é dele, então dividir
-  o envio em várias threads não acelera o apply. A leitura já roda numa thread separada do
-  commit.
+  (`Session::routing_resync`), sob o lock, para não intercalar com um commit. Um restart
+  mais rápido que a leitura é visto pelos PIDs dos daemons (`<daemon>.pid`). Dentro de um
+  daemon o envio é sequencial: ele atende um comando por vez por conexão, e o custo é dele.
 - **RFC 8212.** O perfil `traditional` do FRR liga `bgp ebgp-requires-policy` e o render não
   desliga. Uma sessão eBGP sem política não aceita nem anuncia rota (no teste com FRR real,
   `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2.

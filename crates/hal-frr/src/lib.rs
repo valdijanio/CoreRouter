@@ -205,55 +205,73 @@ impl Frr {
     /// Make FRR run `desired` (the owned contexts), typing only the
     /// difference. On a refused command every daemon already changed is
     /// put back to what it ran before, and the error says which command.
+    ///
+    /// Each daemon is its own process with its own vty, so they are
+    /// changed at the same time, one named thread each (a shared
+    /// prefix-list goes to mgmtd and bgpd: the commit takes the slower of
+    /// the two, not their sum; docs/architecture.md has the numbers).
     pub fn sync(&self, desired: &Conf) -> Result<Synced, HalError> {
         let wanted = render::by_daemon(self.owned, desired);
-        let mut done: Vec<(Daemon, Vty, Conf)> = Vec::new();
-        let mut synced = Synced::default();
-        let daemons = Daemon::ALL
+        let jobs: Vec<(Daemon, Conf)> = Daemon::ALL
             .into_iter()
-            .filter(|d| self.owned.iter().any(|(_, ds)| ds.contains(d)));
-        for d in daemons {
-            let target = wanted
-                .iter()
-                .find(|(w, _)| *w == d)
-                .map(|(_, c)| c.clone())
-                .unwrap_or_default();
-            let mut vty = match self.connect(d) {
-                Ok(v) => v,
-                // A daemon that is not running only matters when it has
-                // something to run.
-                Err(_) if target.nodes.is_empty() => continue,
-                Err(e) => {
-                    rollback(self, done);
-                    return Err(e);
+            .filter(|d| self.owned.iter().any(|(_, ds)| ds.contains(d)))
+            .map(|d| {
+                let target = wanted
+                    .iter()
+                    .find(|(w, _)| *w == d)
+                    .map(|(_, c)| c.clone())
+                    .unwrap_or_default();
+                (d, target)
+            })
+            .collect();
+        let outcomes: Vec<Outcome> = if jobs.len() < 2 {
+            jobs.iter().map(|(d, t)| self.sync_one(*d, t)).collect()
+        } else {
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .iter()
+                    .map(|(d, t)| {
+                        let d = *d;
+                        std::thread::Builder::new()
+                            .name(format!("frr-{}", d.name()))
+                            .spawn_scoped(scope, move || self.sync_one(d, t))
+                            .map_err(|e| (d, e))
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| match h {
+                        Ok(h) => h.join().unwrap_or_else(|_| {
+                            Outcome::Failed(None, HalError::Io("FRR apply thread panicked".into()))
+                        }),
+                        Err((d, e)) => Outcome::Failed(
+                            None,
+                            HalError::Io(format!("FRR {}: cannot start a thread: {e}", d.name())),
+                        ),
+                    })
+                    .collect()
+            })
+        };
+        let mut synced = Synced::default();
+        let mut done = Vec::new();
+        let mut error = None;
+        for o in outcomes {
+            match o {
+                Outcome::Unchanged => {}
+                Outcome::Applied(d, vty, before, n, leftover) => {
+                    synced.commands.push((d, n));
+                    synced.leftover.extend(leftover);
+                    done.push((d, vty, before));
                 }
-            };
-            let before = match self.running(&mut vty, d) {
-                Ok(b) => b,
-                Err(e) => {
-                    rollback(self, done);
-                    return Err(e);
+                Outcome::Failed(undo, e) => {
+                    done.extend(undo);
+                    error.get_or_insert(e);
                 }
-            };
-            let script = conf::diff(&before, &target);
-            if script.is_empty() {
-                continue;
             }
-            if let Err(e) = self.push(&mut vty, d, &script) {
-                done.push((d, vty, before));
-                rollback(self, done);
-                return Err(e);
-            }
-            synced.commands.push((d, script.len()));
-            // What FRR made of it: a canonical render diffs to nothing.
-            if let Ok(after) = self.running(&mut vty, d) {
-                synced.leftover.extend(
-                    conf::diff(&after, &target)
-                        .into_iter()
-                        .map(|l| format!("{}: {l}", d.name())),
-                );
-            }
-            done.push((d, vty, before));
+        }
+        if let Some(e) = error {
+            rollback(self, done);
+            return Err(e);
         }
         if !synced.leftover.is_empty() {
             log::warn!(
@@ -264,6 +282,37 @@ impl Frr {
             );
         }
         Ok(synced)
+    }
+
+    /// One daemon's part of [`Frr::sync`].
+    fn sync_one(&self, d: Daemon, target: &Conf) -> Outcome {
+        let mut vty = match self.connect(d) {
+            Ok(v) => v,
+            // A daemon that is not running only matters when it has
+            // something to run.
+            Err(_) if target.nodes.is_empty() => return Outcome::Unchanged,
+            Err(e) => return Outcome::Failed(None, e),
+        };
+        let before = match self.running(&mut vty, d) {
+            Ok(b) => b,
+            Err(e) => return Outcome::Failed(None, e),
+        };
+        let script = conf::diff(&before, target);
+        if script.is_empty() {
+            return Outcome::Unchanged;
+        }
+        if let Err(e) = self.push(&mut vty, d, &script) {
+            return Outcome::Failed(Some((d, vty, before)), e);
+        }
+        // What FRR made of it: a canonical render diffs to nothing.
+        let leftover = match self.running(&mut vty, d) {
+            Ok(after) => conf::diff(&after, target)
+                .into_iter()
+                .map(|l| format!("{}: {l}", d.name()))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        Outcome::Applied(d, vty, before, script.len(), leftover)
     }
 
     /// The version line of `show version` on zebra (or bgpd): "frr 10.7.1".
@@ -348,6 +397,17 @@ fn depth_after(script: &[String], i: usize) -> usize {
         Some(next) if indent(next) > here => here + 1,
         _ => here,
     }
+}
+
+/// What one daemon's sync did.
+enum Outcome {
+    Unchanged,
+    /// Changed: its connection, what it ran before, commands typed, lines
+    /// FRR prints differently.
+    Applied(Daemon, Vty, Conf, usize, Vec<String>),
+    /// Refused or unreachable; with the connection and the config before
+    /// when something may have been typed (to undo).
+    Failed(Option<(Daemon, Vty, Conf)>, HalError),
 }
 
 /// Undo `done` (last first): back to the config each daemon ran before.
