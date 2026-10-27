@@ -1693,3 +1693,77 @@ AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0.0, build release, namespace sem r
 
 `notice_profile_of` com não membro só roda em comando (`test`, `seen`); o portal lê o retrato
 da G4.10c.
+
+G2.1c — tabela raw, `crates/hal-linux/benches/netns_raw.rs` (**medido**): AMD Ryzen AI MAX+ 395
+(32 threads), kernel 7.0.0, nft 1.0.9, build release, netns sem root, 2026-10-27,
+`COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p
+corerouter-hal-linux --bench netns_raw`. UDP de 64 bytes por `AF_PACKET` → veth → `ip_forward` →
+dummy, 4096 fluxos (256 destinos × 16 portas de origem), 20 000 quadros por amostra, regras
+aplicadas por `LinuxHal::apply`; um núcleo faz tudo (o veth entrega no backlog da CPU que envia).
+
+| Caso | Tempo por 20 000 | Taxa |
+|---|---|---|
+| `udp64/conntrack` (filter forward `ct state new,established,untracked accept`) | 17,0 ms | 1,17 Mpps |
+| `udp64/raw notrack` (o mesmo + raw prerouting `notrack` UDP) | 16,2 ms | 1,24 Mpps (+5 %) |
+| `udp64/filter drop (after conntrack)` | 17,0 ms | 1,17 Mpps |
+| `udp64/raw drop (before conntrack)` | 12,9 ms | 1,55 Mpps (+32 %) |
+
+Os casos de drop medem até o contador da regra parar de subir (lido por `nft -j` a cada 0,5 ms,
+igual nos dois). O ganho do drop na raw é a entrada de conntrack que nunca é criada (no filter
+ela é criada e jogada fora a cada pacote, porque nunca é confirmada).
+
+### G2.7 — CGNAT sem portas (2026-10-27, **medido**)
+
+Ryzen AI MAX+ 395, kernel 7.0, build release, netns sem root, carga 15–40 de outras sessões. Bench
+`netns_cgnat_pps` (`COREROUTER_NETNS_BENCH=1 unshare --user --map-root-user --net -- cargo bench -p
+corerouter-hal-linux --bench netns_cgnat_pps`).
+
+| Medida | Valor |
+|---|---|
+| conexões novas/s sem a chain × chain vazia × 4096 outros no conjunto (alternado, mediana de 9) | 280 557 × 285 774 × 261 922 |
+| pps estabelecidos, idem | 746 648 × 756 634 × 759 061 |
+| frame recusado → ICMP de volta | 125 µs |
+| tempestade de recusas atendida (uma fila) | 188 mil/s, sem perda |
+| ICMP em 20 mil recusas de um assinante em 0,39 s | 14 |
+
+### G3.1 — FRR: socket vty em Rust × frr-reload.py × vtysh -f (**medido**, 2026-10-27)
+
+Máquina: VM `corerouter-lab` (8 vCPUs host-model EPYC, 16 GiB, kernel 7.0), FRR 10.7.1 do
+deb.frrouting.org, `frr_compare` em release (`scripts/frr-compare.sh`).
+- Cada mudança parte da mesma config; o resultado é conferido no bgpd, no zebra e no mgmtd.
+- Os prefix-lists são digitados no mgmtd e no bgpd.
+- A memória é o pico de RSS do processo que aplica: o nosso, ou o `python3`/`vtysh` filho,
+  amostrado em /proc.
+- Os dois valores de cada célula são duas rodadas.
+- O `frr.conf` volta ao do pacote antes de cada rodada (o `frr-reload.py` grava o dele), e as
+  rotas são carregadas só depois das medidas de apply.
+
+| Medida | (b) vty Rust, daemons em paralelo | (b) em série (antes) | (c) diff Rust + `vtysh -f` | (a) `frr-reload.py` |
+|---|---|---|---|---|
+| mudança pequena (router-id) | 1,4 / 1,1 ms; 4,4 MiB | 1,5 / 2,0 ms | 13,4 / 13,7 ms; 22,6 MiB | 144 / 152 ms; 18,5 MiB |
+| mudança pequena (100 descrições) | 7,2 / 6,7 ms; 4,7 MiB | 8,3 / 35,8 ms | 21,6 / 19,8 ms; 22,6 MiB | 940 / 980 ms; 18,5 MiB |
+| +10 mil entradas de prefix-list | 1766 / 1653 ms; 15,5 MiB | 5229 / 3324 ms | 1626 / 2946 ms; 22,7 MiB | 3693 / 4058 ms; 36,1 MiB |
+| −5 mil entradas de prefix-list | 2494 / 2729 ms; 15,6 MiB | 5507 / 4930 ms | 2555 / 2754 ms; 22,7 MiB | 3652 / 3984 ms; 31,9 MiB |
+| ler 100 sessões (`neighbors json` + parse) | 2,3 / 2,6 ms | 3,1 / 3,1 ms | — | 10,2 / 12,0 ms (`vtysh -c`); 22,8 MiB |
+
+1 M de rotas no zebra (rotas do kernel importadas; `ip -batch` levou 6–23 s):
+
+| Medida | (b) vty Rust | (a) `vtysh -c` |
+|---|---|---|
+| `show ip route json` (537 MiB de JSON) | 13,2 / 13,2 s; 540 MiB (guarda tudo) | 13,4 / 13,2 s; 22,7 MiB (vai para o pipe) |
+| interpretar como `serde_json::Value` | 5,7 / 5,7 s; pico de 5,2 GiB | — |
+| `show ip route summary json` | 122 / 130 ms | 138 / 138 ms |
+
+Parse e diff do `frr.conf` sem FRR (criterion, `cargo bench -p corerouter-hal-frr`; desktop do
+usuário, release):
+
+| Medida | Tempo |
+|---|---|
+| parse de 10 mil entradas + 100 vizinhos | 345 µs |
+| diff com 1 linha mudada | 1,09 ms |
+| diff removendo 5 mil de 10 mil | 1,01 ms |
+| diff de tudo, a partir do vazio | 444 µs |
+| render de volta para texto | 40 µs |
+
+O tempo que sobra no apply é do FRR (~170–270 µs por linha em cada daemon). O parse e o diff em
+Rust são menos de 0,1 % disso.

@@ -174,3 +174,6 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G4.10d feito (janela Subscriber Notices)
 - 2026-10-27 — G4.10e feito (laboratório dos avisos ao assinante); G4.10 em partes (faltam G4.10f–h)
 - 2026-10-27 — G4.3hd feito (IPoE no par em hot standby); G4.3fb criada (IPoE em escala com o BNG Blaster)
+- 2026-10-27 — G2.1c redefinido: inclui a tabela `/ip firewall raw` (aprovado pelo usuário), em dois PRs
+- 2026-10-27 — G2.7 feito (CGNAT avisa o assinante quando as portas acabam)
+- 2026-10-27 — G3.1 feito (hal-frr: FRR pelo socket vty, só a diferença, rollback)
