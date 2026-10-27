@@ -5006,3 +5006,76 @@ continuação indentadas).
 
   Carga: 12 a 16 cópias em paralelo, com 32 núcleos ocupados. `netns_pppoe_io` foi de 1 falha em
   160 a 0 em 160; `netns` e `netns_dns_zones` deram 0 em 60 cada (**medido**).
+
+- 2026-10-26 — G4.10a: Avisos ao assinante, parte 1 (modelo e comandos): `/ip subscriber-notice` com perfis (`block`,
+  `notice`, `throttle`) ligados a uma address list do firewall, walled garden por domínio ou
+  prefixo, páginas editáveis com variáveis (`{login}` `{plano}` `{valor}` `{vencimento}`
+  `{link_pix}`), a tabela de sondas de detecção de portal de 21 hosts (Android, Chrome OS,
+  Samsung/Xiaomi/Huawei, Apple, Windows, Firefox, NetworkManager), quem está sob um perfil agora
+  (`active.list`, desde quando, se viu), visto/fim do aviso por tempo, log de visualizações,
+  eventos para o webhook, "Testar como cliente" (`ip.subscriber-notice.test`, inclusive a regra de
+  `input` que derrubaria o portal) e as ações "Block (com página)" do lease
+  (`ip.dhcp-server.lease.notice`) e do secret (`ppp.secret.notice`, vale também para login do
+  RADIUS). Pesquisa em `docs/subscriber-notices.md`. Testar:
+  `cargo test -p corerouter-engine --test subscriber_notice` e
+  `corerouter-cli run ip.subscriber-notice.profile.add '{"name":"atraso","mode":"block","address_list":"bloqueados"}'`.
+
+- 2026-10-26 — G4.3hb: CoA e Disconnect-Request (RFC 5176) depois de uma tomada do par de BNGs (`docs/bng-ha.md` §2.11).
+  O servidor RADIUS continua mandando ao nó que conhece. Quando nenhuma sessão desse nó bate com o
+  pedido e ele não é o que atende (espera, cercado, cedendo), o pedido vai ao par pelo link de sync:
+  - `proto-ha`: `Msg::Forward`/`ForwardReply`, até 64 KiB;
+  - o recurso vai anunciado no Hello, nos bytes reservados do cabeçalho, que a versão anterior
+    ignora.
+
+  O par aplica o pedido nas sessões dele, sem encaminhar de novo. O nó antigo responde ao servidor
+  com o que o par disse (a RFC 5176 §3.3 pede a resposta do endereço para onde o servidor mandou):
+  - par sem a sessão: NAK 503;
+  - par mudo por 2 s: NAK 505 (Other Proxy Processing Error);
+  - sem link: NAK 503 na hora;
+  - retransmissão do servidor enquanto o par responde: não é encaminhada de novo;
+  - até 1024 pedidos em voo.
+
+  `radius.incoming.get` ganha `forwarded` e `forward_answered`.
+
+  Achado no caminho: o dono das sessões PPP varria a tabela inteira a cada CoA, debaixo do lock que
+  os workers dividem: 16 ms por CoA com 100 mil sessões (debug, **medido**). Agora o CoA por
+  Framed-IP-Address ou por Acct-Session-Id (o que os sistemas de cobrança mandam) vai pelos índices
+  que já existiam: 2,2 µs (debug, **medido**). Os outros seletores (usuário, MAC, porta) continuam
+  na varredura.
+
+  Testes:
+  - `proto-ha`:
+    - o Forward e a resposta atravessam o link;
+    - nada vai a um par sem o recurso ou sem link;
+    - o Hello com recursos é lido igual pela versão antiga.
+  - `radius_aaa_tests`, com um par em memória:
+    - a sessão do par recebe ACK com a palavra dele;
+    - o NAK do par vai como ele disse;
+    - sem par: 503;
+    - par mudo: 505 depois de 2 s, e a resposta atrasada não muda nada;
+    - a retransmissão não é encaminhada duas vezes;
+    - o pedido do par vai só aos donos locais.
+  - `pppoe_bng::a_coa_by_address_or_session_id_does_not_scan_the_table`: 100 mil sessões, CoA pelos
+    índices, e os outros atributos do seletor ainda conferidos.
+  - `tests/netns_ha_pppoe.rs`, dois daemons reais e 200 CPEs: depois de um switchover, 20 CoAs de
+    taxa mandados ao nó antigo são aplicados no novo. Um endereço que ninguém tem dá 503, e um
+    Disconnect pelo nó antigo encerra a sessão no novo.
+  - Laboratório `cargo xtask bng-lab --only ha`: depois da queda, o sync e a testemunha de A voltam
+    (o acesso e o uplink não). A volta como espera, e o servidor manda a ele uma rajada de 1000
+    CoAs. A mesma rajada vai direto a C, para comparar.
+
+  **Medido**:
+  - Debug, `netns_ha_pppoe`: CoA no ativo, 0,19 ms. Pelo nó antigo, mediana de 40 ms e máximo de
+    50 ms. São as esperas dos laços (o read de 20 ms da conexão de sync, a volta de 10 ms do laço
+    principal), não trabalho. Com o par em memória, 0,25 ms.
+  - VM `corerouter-lab` (8 vCPUs, release, sem root, caminho lento, 2026-10-26), rajada de 1000
+    CoAs de taxa:
+
+  | Sessões | Ao nó antigo (ACK, aplicados em C, mediana, p99, total) | Direto em C |
+  |---:|---|---|
+  | 1 000 | 1000/1000, 1000, 247 ms, 406 ms, 0,46 s | — |
+  | 10 000 | 1000/1000, 1000, 247 ms, 410 ms, 0,46 s | 1000/1000, 1000, 208 ms, 366 ms, 0,42 s |
+  | 100 000 | 1000/1000, 1000, 256 ms, 419 ms, 0,47 s | — |
+
+  O par soma ≈ 40 ms à rajada. O limite da rajada (≈ 2200 CoAs/s) é o caminho de CoA de C, que já
+  existia, e não cresce com o número de sessões depois da correção dos índices.
