@@ -58,6 +58,18 @@ impl Daemon {
 /// skipped lines the zebra copy still had).
 pub const OWNED: Owned = &[
     ("router bgp ", &[Daemon::Bgpd]),
+    // G3.4: OSPF. `router ospf6` before `router ospf`, which is a prefix
+    // of it; the OSPF filters (`CR-O2-…` IPv4, `CR-O3-…` IPv6) before the
+    // BGP ones (`CR-`), whose prefix they share. An interface context holds
+    // only the lines [`CHILDREN`] gives each daemon.
+    ("router ospf6", &[Daemon::Ospf6d]),
+    ("router ospf", &[Daemon::Ospfd]),
+    ("interface ", &[Daemon::Ospfd, Daemon::Ospf6d]),
+    ("key chain CR-", &[Daemon::Ospfd, Daemon::Ospf6d]),
+    ("ip prefix-list CR-O2-", &[Daemon::Ospfd]),
+    ("ipv6 prefix-list CR-O3-", &[Daemon::Ospf6d]),
+    ("route-map CR-O2-", &[Daemon::Ospfd]),
+    ("route-map CR-O3-", &[Daemon::Ospf6d]),
     // G3.2b: the `/routing filter` render, all named `CR-` (the operator's
     // own lists and maps are left alone). Only bgpd filters with them.
     ("ip prefix-list CR-", &[Daemon::Bgpd]),
@@ -74,6 +86,40 @@ pub const OWNED: Owned = &[
 
 /// A table of owned contexts: header prefix → daemons that take it.
 pub type Owned = &'static [(&'static str, &'static [Daemon])];
+
+/// Contexts a daemon owns only part of: under a header with this prefix,
+/// the daemon takes (and reads back) only the lines starting with one of
+/// these. Every daemon prints `interface X` with its own lines and the
+/// interface's `description` (zebra's): `ospfd` keeps `ip ospf …`,
+/// `ospf6d` `ipv6 ospf6 …`, and an interface left empty is not ours.
+pub const CHILDREN: &[(&str, Daemon, &[&str])] = &[
+    ("interface ", Daemon::Ospfd, &["ip ospf ", "no ip ospf "]),
+    ("interface ", Daemon::Ospf6d, &["ipv6 ospf6 "]),
+];
+
+/// `n` as daemon `d` owns it: the children [`CHILDREN`] gives `d` (all of
+/// them for a context not listed); `None` when a partly owned context is
+/// left with nothing.
+pub fn part_of(d: Daemon, n: &crate::conf::Node) -> Option<crate::conf::Node> {
+    let rule = CHILDREN
+        .iter()
+        .find(|(h, dd, _)| *dd == d && n.line.starts_with(h));
+    match rule {
+        None => Some(n.clone()),
+        Some((_, _, keep)) => {
+            let children: Vec<_> = n
+                .children
+                .iter()
+                .filter(|c| keep.iter().any(|k| c.line.starts_with(k)))
+                .cloned()
+                .collect();
+            (!children.is_empty()).then(|| crate::conf::Node {
+                line: n.line.clone(),
+                children,
+            })
+        }
+    }
+}
 
 /// Whether CoreRouter owns the top-level context `line`.
 pub fn owned(line: &str) -> bool {
@@ -104,7 +150,10 @@ pub enum RenderError {
 /// What FRR should run for `cfg` (the owned part only); `open` opens the
 /// sealed TCP MD5 keys.
 pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Conf, RenderError> {
-    let text = corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
+    let mut text =
+        corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
+    // G3.4: the same key opener (both seal with the engine's key).
+    text.push_str(&corerouter_proto_ospf::frr::render(cfg, open).map_err(RenderError::Proto)?);
     Ok(Conf::parse(&text)?)
 }
 
@@ -117,7 +166,7 @@ pub fn by_daemon(table: Owned, conf: &Conf) -> Vec<(Daemon, Conf)> {
             .nodes
             .iter()
             .filter(|n| daemons_of(table, &n.line).contains(&d))
-            .cloned()
+            .filter_map(|n| part_of(d, n))
             .collect();
         if !nodes.is_empty() {
             out.push((d, Conf { nodes }));
@@ -158,5 +207,33 @@ mod tests {
         assert_eq!(parts[0].0, Daemon::Bgpd);
         assert!(owned("router bgp 65000 view x"));
         assert!(!owned("hostname r1"));
+    }
+
+    #[test]
+    fn ospf_interfaces_split_by_daemon() {
+        let conf = Conf::parse(
+            "interface ether1\n ip ospf area 0.0.0.0\n ipv6 ospf6 area 0.0.0.0\n description uplink\nexit\n\
+             interface ether9\n description zebra's\nexit\n\
+             router ospf6\nexit\nrouter ospf\nexit\n\
+             route-map CR-O2-a-connected permit 1\nexit\nroute-map CR-x permit 10\nexit\n",
+        )
+        .unwrap();
+        let parts = by_daemon(OWNED, &conf);
+        let get = |d: Daemon| {
+            parts
+                .iter()
+                .find(|(x, _)| *x == d)
+                .map(|(_, c)| c.render())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            get(Daemon::Ospfd),
+            "interface ether1\n ip ospf area 0.0.0.0\nexit\nrouter ospf\nroute-map CR-O2-a-connected permit 1\n"
+        );
+        assert_eq!(
+            get(Daemon::Ospf6d),
+            "interface ether1\n ipv6 ospf6 area 0.0.0.0\nexit\nrouter ospf6\n"
+        );
+        assert_eq!(get(Daemon::Bgpd), "route-map CR-x permit 10\n");
     }
 }
