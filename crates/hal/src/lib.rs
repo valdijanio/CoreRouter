@@ -16,6 +16,8 @@ pub mod fastpath;
 pub mod icmp_ext;
 pub mod lab_conntrack;
 pub mod lab_flow;
+pub mod lab_neigh;
+pub mod neigh;
 pub mod nic;
 pub mod oslog;
 pub mod pppoe;
@@ -670,6 +672,41 @@ pub trait Hal: Send {
             "{} has no system resource readings",
             self.describe()
         ))
+    }
+
+    /// The neighbor tables now (G1.27d, [`neigh`]): ARP and IPv6 ND.
+    fn neighbors(&mut self) -> Result<Vec<neigh::Neighbor>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no neighbor table",
+            self.describe()
+        )))
+    }
+
+    /// A live feed of the neighbor tables, for a thread of the app.
+    fn neighbor_feed(&mut self) -> Result<Box<dyn neigh::NeighborFeed>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no neighbor events",
+            self.describe()
+        )))
+    }
+
+    /// Remove learned entries (`ip.arp.flush`, `ipv6.neighbor.flush`);
+    /// how many were there. One already gone is not an error.
+    fn neighbor_remove(&mut self, items: &[(IfName, std::net::IpAddr)]) -> Result<usize, HalError> {
+        let _ = items;
+        Err(HalError::Unsupported(format!(
+            "{} cannot flush neighbors",
+            self.describe()
+        )))
+    }
+
+    /// An ARP pinger on `name` (`ip.arp.ping`), used outside the session
+    /// lock.
+    fn arp_pinger(&mut self, name: &IfName) -> Result<Box<dyn neigh::ArpPinger>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} cannot send ARP on {name}",
+            self.describe()
+        )))
     }
 
     /// A live feed of conntrack events for the flow exporter (G4.4b).

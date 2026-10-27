@@ -311,6 +311,9 @@ pub struct Ip {
     /// `/ip subscriber-notice` (G4.10): block and notice pages.
     #[serde(skip_serializing_if = "crate::subscriber_notice::SubscriberNotices::is_empty")]
     pub subscriber_notice: crate::subscriber_notice::SubscriberNotices,
+    /// `/ip arp` (G1.27d): static entries, ARP mode per interface, table sizes.
+    #[serde(skip_serializing_if = "crate::arp::Arp::is_empty")]
+    pub arp: crate::arp::Arp,
 }
 
 impl Ip {

@@ -49,6 +49,10 @@ name = "neighbors"
 harness = false
 
 [[bench]]
+name = "neigh_table"
+harness = false
+
+[[bench]]
 name = "scale"
 harness = false
 

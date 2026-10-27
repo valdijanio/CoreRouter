@@ -288,11 +288,17 @@ fn page(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(done) = open.take() {
         push(Entry::Bucket(done), &mut total, &mut kept);
     }
+    let neigh = s.neigh_fresh();
+    let neigh = neigh.lock();
     let watch = s.ext::<RouteWatch>();
     let rows: Vec<Value> = kept
         .iter()
         .filter_map(|e| match e {
-            Entry::Line(i) => lines.get(*i).map(|l| super::route::row(l, watch, now)),
+            Entry::Line(i) => lines.get(*i).map(|l| {
+                let mut r = super::route::row(l, watch, now);
+                super::route::layer2(&mut r, l, &neigh);
+                r
+            }),
             Entry::Bucket(b) => Some(b.json()),
         })
         .collect();

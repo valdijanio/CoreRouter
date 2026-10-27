@@ -221,9 +221,11 @@ impl Session {
         };
         let watching = self.ext::<RouteWatch>().and_then(|w| w.since);
         let kernel = self.route_kernel(&me);
+        let mut route = crate::cmd::route::row(&me, self.ext::<RouteWatch>(), now);
+        crate::cmd::route::layer2(&mut route, &me, &self.neigh_fresh().lock());
         Some(json!({
             "key": me.key,
-            "route": crate::cmd::route::row(&me, self.ext::<RouteWatch>(), now),
+            "route": route,
             "source": source,
             "chosen": chosen.text,
             "chosen_id": format!("{chosen_kind}.{}", chosen.id),

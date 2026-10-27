@@ -47,7 +47,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         remove
     ),
     cmd!(query "ip.route.list", "Routes", ["IP", "Routes"], None,
-        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable; null if connected), check_gateway (null | {method, interval_secs, misses, state (up | down)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
+        "{routing_table?: string, family?: string (ipv4 | ipv6), state?: string (active | standby | inactive), origin?: string (connected | static | dhcp | ra)} → [{key (stable row key), id (null if connected), dst_address, family, gateway (as configured), gateway_address, gateway_interface, gateway_status (reachable | unreachable | incomplete: the gateway does not answer ARP/ND; null if connected), check_gateway (null | {method, interval_secs, misses, state (up | down)}), distance, routing_table, flags (X disabled, A active, D dynamic, C connected, S static, + ECMP), state (active | standby: a lower distance wins | inactive), active, static, connected, dynamic (from a DHCP lease, a Router Advertisement or connected), origin (connected | static | dhcp | ra), disabled, immediate_gw, interface, ecmp (paths of its ECMP group), reason (why standby or inactive), reason_id, reason_args, changed_at (Unix s it took its state; null: before watching), changed_secs, comment}]",
         always, list),
 ];
 
@@ -212,6 +212,25 @@ fn opt_choice<'a>(p: &'a Value, key: &str, choices: &[&str]) -> Result<Option<&'
     }
 }
 
+/// G1.27d: a gateway whose neighbor entry did not resolve (RFC 4861
+/// §7.3.2 INCOMPLETE, or FAILED: nothing answered the ARP request or the
+/// Neighbor Solicitation) is `incomplete`: routed, but the packets go
+/// nowhere. No entry: not asked yet, so still `reachable`.
+pub(crate) fn layer2(row: &mut Value, l: &Line, t: &crate::neigh_table::NeighTable) {
+    let Some(crate::route_table::Via {
+        link,
+        gateway: Some(gw),
+    }) = &l.via
+    else {
+        return;
+    };
+    if t.get(link, *gw).is_some_and(|r| !r.state.resolved())
+        && let Some(o) = row.as_object_mut()
+    {
+        o.insert("gateway_status".into(), json!("incomplete"));
+    }
+}
+
 /// `ip.route.list`'s view of one route.
 pub(crate) fn row(l: &Line, watch: Option<&RouteWatch>, now: Option<u64>) -> Value {
     let (reason, reason_id, reason_args) = match &l.why {
@@ -279,6 +298,8 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
     let state = opt_choice(p, "state", &["active", "standby", "inactive"])?;
     let origin = opt_choice(p, "origin", &["connected", "static", "dhcp", "ra"])?;
     let (lines, now) = s.watched_route_lines();
+    let neigh = s.neigh_fresh();
+    let neigh = neigh.lock();
     let watch = s.ext::<RouteWatch>();
     let rows = lines
         .iter()
@@ -286,7 +307,11 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
         .filter(|l| family.is_none_or(|f| (f == "ipv4") == l.dst.addr().is_ipv4()))
         .filter(|l| state.is_none_or(|st| st == l.state.as_str()))
         .filter(|l| origin.is_none_or(|o| o == l.origin.as_str()))
-        .map(|l| row(l, watch, now))
+        .map(|l| {
+            let mut r = row(l, watch, now);
+            layer2(&mut r, l, &neigh);
+            r
+        })
         .collect();
     Ok(Value::Array(rows))
 }
