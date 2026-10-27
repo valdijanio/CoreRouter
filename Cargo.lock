@@ -1173,6 +1173,7 @@ dependencies = [
  "corerouter-hal-frr",
  "corerouter-hal-linux",
  "corerouter-model",
+ "corerouter-proto-bgp",
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
