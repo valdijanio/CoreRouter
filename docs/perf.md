@@ -1488,3 +1488,137 @@ Paralelismo: os passos não dependem um do outro, então cada job compila o que 
 próprio runner (4 vCPU cada) em vez de dividir um runner. O que fica em série é o `test`
 (compilação + 2613 testes no nextest); próximo passo, se precisar: dividir o `test` em duas
 partições do nextest (`--partition count:i/2`), ~1,5 min a menos **estimado**.
+
+### G0.21 parte e — índice do IPoE (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26)
+
+`config_store/ipoe_index/*` (novo): o que a rodada do DHCP paga para seguir uma config com N
+secrets IPoE e N concessões fixas com `rate_limit`, depois de um `ppp.secret.add`
+(`secret_add`) ou da troca do `rate_limit` de uma concessão (`lease_set`). Antes =
+`IpoeIndex::of` (refeito do zero); depois = `IpoeIndex::refresh`.
+
+| Benchmark | Antes | Depois |
+|---|---:|---:|
+| `config_store/ipoe_index/secret_add/1000` | 104 µs | 22 ns |
+| `config_store/ipoe_index/secret_add/10000` | 1,01 ms | 20 ns |
+| `config_store/ipoe_index/secret_add/100000` | **22,5 ms** | **20 ns** |
+| `config_store/ipoe_index/lease_set/1000` | 104 µs | 4,7 µs |
+| `config_store/ipoe_index/lease_set/10000` | 995 µs | 9,2 µs |
+| `config_store/ipoe_index/lease_set/100000` | **22,5 ms** | **35 µs** |
+
+O que sobra no `lease_set` cresce com N/128: o `shared_blocks` monta um mapa dos blocos da
+lista antiga (782 com 100 mil) para achar os que mudaram.
+
+### G0.21 parte f — filas simples (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26)
+
+`config_store/queue_simple_add/*` e `config_store/queue_sync/idle/*` (novos). Antes = `main` em
+`ee8b1b05` (com a G4.9c); depois = esta branch. `batch_step`/`atomic_step`: lote de 100 adds.
+
+| Benchmark | Antes | Depois |
+|---|---:|---:|
+| `queue_simple_add/single/1000` | 593 µs | 108 µs |
+| `queue_simple_add/single/10000` | 4,81 ms | 87 µs |
+| `queue_simple_add/single/80000` | **39,5 ms** | **142 µs** |
+| `queue_simple_add/unnamed/80000` | 41,3 ms | 140 µs |
+| `queue_simple_add/batch_step/10000` | 483 ms | 11,0 ms |
+| `queue_simple_add/batch_step/80000` | **5,34 s** | **16,5 ms** |
+| `queue_simple_add/atomic_step/80000` | 4,64 s | 2,48 ms |
+| `queue_sync/idle/1000` | 917 µs | 82 ns |
+| `queue_sync/idle/10000` | 8,67 ms | 80 ns |
+| `queue_sync/idle/80000` | **99,1 ms** | **83 ns** |
+
+Numa transação (pedido da sessão do CI: o `config_store` levava 104–211 s no `bench-check` desde
+o #268, quase tudo montando as 10 mil filas do `identity_set/queues`), medido com um teste
+temporário em release, 10 mil `queue.simple.add`:
+
+| Caso | `main` | Depois |
+|---|---:|---:|
+| lote atômico de 1 000 | 237 ms | 9,2 ms |
+| lote atômico de 10 000 | **22,2 s** | **92 ms** |
+| modo transacional, 10 000 adds + `config.commit` | 22,2 s | 192 ms |
+| modo transacional, 50 000 adds + `config.commit` | — | 1,12 s |
+
+`cargo bench -p corerouter-engine --bench config_store -- --test` (o modo do `bench-check`) roda
+inteiro em 1,1 s nesta branch. O caso não foi encolhido: ele é o que um provisionamento faz.
+
+O que sobra num add (~0,1 ms) é o commit (journal, validação incremental, aplicar). O `queue_sync`
+ainda lê as concessões do DHCP com `rate_limit` a cada rodada (`dhcp_dynamic`, O(concessões));
+sem concessões com velocidade isso é nada.
+
+### G0.22 parte c — prefixos do XDP (**medido**, AMD Ryzen AI Max+ 395, release, 2026-10-26)
+
+`xdp_prefixes/*` (novo): N entradas numa block list. `plan_of` = o caminho antigo
+(`XdpPlan::of` + diferença por `BTreeMap`); `follow` = `XdpPrefixes`. Só a parte em espaço de
+usuário; as escritas nos mapas são uma chamada por prefixo mudado nos dois.
+
+| Mudança | N | Antes (`plan_of`) | Depois (`follow`) |
+|---|---:|---:|---:|
+| commit sem relação | 1 000 | 63 µs | 47 ns |
+| commit sem relação | 10 000 | 928 µs | 76 ns |
+| commit sem relação | 100 000 | **11,5 ms** | **0,30 µs** |
+| um `address-list.add` | 1 000 | 64 µs | 15,8 µs |
+| um `address-list.add` | 10 000 | 954 µs | 5,6 µs |
+| um `address-list.add` | 100 000 | **11,2 ms** | **43 µs** |
+| uma entrada dinâmica | 1 000 | 62 µs | 118 ns |
+| uma entrada dinâmica | 10 000 | 949 µs | 168 ns |
+| uma entrada dinâmica | 100 000 | **11,4 ms** | **0,82 µs** |
+
+O `address-list.add` cresce com N/128 (o mapa de blocos do `shared_blocks`).
+
+### G0.27 — boot depois do checkpoint de desligamento (**medido**, AMD Ryzen AI Max+ 395, release, disco, 2026-10-26)
+
+`storage_fs/history64/boot` com o journal perto do máximo (1 000 linhas pequenas, um
+`interface.set` cada) e `…/boot_after_checkpoint` (novo): o mesmo diretório depois de
+`Session::checkpoint()`.
+
+| Config | Boot com 1 000 linhas | Checkpoint | Boot depois |
+|---|---:|---:|---:|
+| 5 MiB | 144 ms | 20–24 ms | 134 ms |
+| 10 MiB | 213 ms | 35,6 ms | 204 ms |
+
+O ganho no boot é pequeno com linhas pequenas (o replay de 1 000 deltas de uma interface custa
+~10 ms; quase todo o boot é ler o slot). Ler a revisão pela cabeça da linha para pular sem
+analisar as que o slot já tem foi medido e não mudou nada (135 e 204 ms): ficou de fora. O valor
+da G0.27 é a volta de versão sem perda; o custo é um checkpoint (20–36 ms) por parada limpa.
+
+- 2026-10-26, G4.3l (**medido**, VM `corerouter-lab`, 8 vCPUs, kernel 7.0, release, BNG Blaster
+  1.0.1): 4000 linhas QinQ 1:1 (4 S-tags × 1000 C-tags) com Service-Name e TR-101 sobem a 7843–7894
+  sessões/s com XDP e 7794 sessões/s no caminho lento; 8000 de 8000 fluxos verificados nos dois.
+
+### G4.3n: importação de secrets do RouterOS (2026-10-26)
+
+**Medido** (build release, laptop de desenvolvimento compartilhado, 2026-10-26; `cargo test --release
+-p corerouter-engine --test ppp_import -- --ignored --nocapture`), 100 mil secrets com caller-id,
+comentário e endereço fixo (17,0 MB de export): leitura 125–133 ms (750–800 mil linhas/s), `dry_run`
+0,44–0,58 s, importação 0,47–0,64 s (~5 µs/secret, com a selagem), commit dos 100 mil 63–65 ms (214 ms antes do CowList), 40 mil
+no modo imediato 0,19–0,20 s; pico 367–372 MB (VmHWM). Config: 21,8 MB em claro, 26,5 MB selada (+22 %).
+Abrir uma senha: XChaCha20-Poly1305 1,33 µs, ChaCha20-Poly1305 0,98 µs, AES-256-GCM 0,094 µs (só a
+cifra); 0,5 µs de ponta a ponta. `pppoe_bng/setup_1000_sessions`: em claro 12,23–15,19 ms, selado 12,51–15,39 ms
+(+1 a +5 %; com XChaCha20-Poly1305 era +13 %).
+
+### CI do lote: partes do `test` e do `xdp-root` (processo, 2026-10-26)
+
+**Medido** no GitHub Actions (`ubuntu-latest`, 4 vCPU por runner), lote via `workflow_dispatch`.
+Runs 40410630612, 40411738352 e 40413648189, cache quente:
+
+| Configuração | `test` (maior parte) | `xdp-root` (maior parte) | `bench-check` | Run inteiro |
+|---|---|---|---|---|
+| test 1 job, xdp-root 1 job | 366 s | 273 s | 291 s | 6 min 25 s |
+| test 2 partes `count`, xdp-root 2 | 304 s (outra: 161 s) | 134 s | 249 s ¹ | **5 min 24 s** |
+| test 2 partes `hash` + lentos primeiro | 267 s (outra: 174 s) | 142 s | 429 s ¹ | 7 min 28 s ¹ |
+| test 3 partes `hash` | 237 s (outras: 231, 188 s) | 164 s | 397 s ¹ | 6 min 53 s ¹ |
+
+¹ Desde o #268 (mesclado da `main` antes das três medições com partes), o `config_store` do
+`bench-check` leva de 104 s a 211 s no CI, contra 12 s antes: montar 10 mil filas
+`queue.simple` numa transação leva 117 s localmente, mesmo otimizado. A variação entre runners
+(104 s contra ~210 s) decide se o caminho crítico é o `test` ou o `bench-check`. Corrigida
+essa montagem, o `bench-check` volta a ~4,3 min e o lote fica em ~5 min 30 s (**estimado**).
+
+Escolha: 2 partes. Com a contagem (`count`), os três testes longos (97, 64 e 62 s) caíram
+todos na mesma parte, e o de 97 s começou por último (parte 1 em 174 s de execução, parte 2 em
+55 s). Por hash, com os lentos primeiro, a execução das partes ficou em 141 s e 66 s: o limite é
+o teste de ~100 s do `proto-pppoe::sim`. Uma terceira parte tirou só 30 s do maior job (237 s
+contra 267 s), num job que já não é o caminho crítico, e custa mais uma compilação inteira
+(~100 s de runner). Compilar uma vez e distribuir os binários (`cargo nextest archive` +
+artifact) não ganha tempo de relógio: o job de build ainda compila 96 s, e soma compactar,
+enviar e baixar os binários de teste, antes de as partes começarem (**estimado** ≥ 5 min, contra
+~4,5 min compilando em cada parte).

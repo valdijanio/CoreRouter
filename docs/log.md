@@ -4781,3 +4781,138 @@ continuação indentadas).
   cinco caches.
 
 - 2026-10-26 — processo: O teste `the_daemon_authenticates_through_its_radius_service` era instável e reprovou o lote do #262 e do #264 em 2026-10-26. Ele lia o log logo depois da resposta do RADIUS, mas o serviço só esvazia a fila de log do driver no tick dele, então a linha "recusado" às vezes ainda não tinha chegado. Agora o teste espera a linha aparecer, com prazo de 5 s.
+
+- 2026-10-26 — G0.21: Config grande, parte e: o índice que o servidor DHCP usa para decidir o IPoE (`IpoeIndex`,
+  G4.3f) era refeito do zero a cada revisão da config, num laço sobre todos os `/ppp secret` e
+  todas as concessões fixas: 22 ms com 100 mil de cada a cada commit, dentro da rodada do DHCP e
+  com o lock do `Session`. Agora o nome do secret é procurado no índice que a própria lista já
+  mantém (`Secrets::first_named`, incremental desde a G4.3gb; anda a lista só numa config editada
+  à mão com um nome repetido e quando o primeiro não é IPoE), e as velocidades das concessões
+  fixas seguem a lista bloco a bloco (`CowList::shared_blocks`): uma revisão que mudou uma
+  concessão lê o bloco dela (128), não a lista. Duas concessões no mesmo endereço (só à mão)
+  fazem o índice ser refeito, e a última vale, como antes.
+
+  Como testar: `cargo test -p corerouter-engine --lib ipoe` (`refresh_equals_a_rebuild`: proptest,
+  o índice seguido é igual a um refeito do zero depois de qualquer série de escritas),
+  `cargo test -p corerouter-model --lib ppp_secrets`,
+  `cargo bench -p corerouter-engine --bench config_store -- ipoe_index`.
+
+- 2026-10-26 — G0.21: Config grande, parte f: `queue.simple.add` com milhares de filas. Medido na `main` (já com a G4.9c,
+  que tirou o O(n²) do nome padrão): 39,5 ms por add com 80 mil filas, um lote de 100 em 5,3 s, e o
+  serviço `queue` do daemon resolvendo o plano inteiro uma vez por segundo, com o lock do `Session`,
+  mesmo sem nada mudar (99 ms por rodada com 80 mil: o plano de controle parado 10% do tempo).
+
+  - `queue.simple` vira `SimpleQueues` (`model/simple_queues.rs`, como `Secrets` e `AddressLists`):
+    `CowList` com um índice copy-on-write de nome → id, alvo → quantas filas ativas o têm e o menor
+    `queue<k>` livre, mantido por `push`/`insert`/`update`/`remove` (qualquer outra escrita por
+    `DerefMut` derruba o índice). Disco igual (serializa como a lista).
+  - `add`/`set`/`remove`/`enable`/`disable`/`move` por nome ou id usam o índice; o nome padrão só é
+    calculado quando o nome não veio.
+  - Os avisos do `add`/`set` (alvo sombreado por outra fila, sobreposição com fila dinâmica) só andam
+    as filas quando o índice diz que alguém toca nos alvos da fila (`may_warn`: O(alvos × tamanho
+    do prefixo) consultas); sem sobreposição a resposta já é "sem aviso", provado pelo índice.
+  - `Session::queue_sync` só resolve o plano quando a revisão da config ou as filas dinâmicas do DHCP
+    mudaram.
+
+  Achado: 100 mil filas (o `MAX_SIMPLE`) não cabem nos 15 MiB que a config pode ocupar no disco
+  (~170 bytes por fila salva; o commit é recusado perto de 90 mil, **medido**); o bench usa 80 mil.
+
+  Como testar: `cargo test -p corerouter-model --lib simple_queues` (`index_equals_a_walk`: proptest,
+  o índice mantido responde o mesmo que andar a lista), `cargo test -p corerouter-engine queue`,
+  `cargo bench -p corerouter-engine --bench config_store -- queue_s`.
+
+- 2026-10-26 — G0.22: Commit incremental, parte c: o filtro XDP (G2.5a) refazia o plano inteiro a cada commit e a cada
+  entrada dinâmica de address-list (`XdpPlan::of`: cobrir cada entrada em prefixos, ordenar,
+  deduplicar) e comparava com o plano aplicado por dois `BTreeMap`: 11 ms com 100 mil entradas, por
+  commit sem relação e por sessão PPP que subia com address list, com o lock do `Session`. As
+  entradas dinâmicas ainda eram um `Vec` com `retain` (O(n) por mudança).
+
+  - `corerouter_hal::xdp::XdpPrefixes` (puro, compila em WASM): segue as entradas estáticas por
+    bloco (`CowList::shared_blocks`: só os blocos que o commit mudou) e as dinâmicas uma a uma;
+    cada prefixo conta as entradas de cada lista que o cobrem (entrada repetida ou em duas listas
+    entra e sai exata) e devolve só os prefixos que mudaram (`take_changes`). Troca de nomes em
+    `block_lists`/`allow_lists` recontam tudo (raro).
+  - `hal-linux::XdpState`: `sync` usa `XdpPlan::settings_of` (sem prefixos) + `XdpPrefixes`; as
+    tries recebem só as mudanças; objeto recarregado recebe tudo; filtro sem portas esvazia as
+    tries (como antes). Escrita recusada deixa as mudanças pendentes para a próxima. Dinâmicas
+    num `HashMap` por (lista, endereço); `address_list_dynamic_many` conta todas e escreve uma vez.
+  - `XdpPlan::of` continua (laboratório virtual, `ip.firewall.xdp` "bloqueado?").
+
+  Como testar: `cargo test -p corerouter-hal --lib xdp` (`followed_prefixes_equal_the_plan`:
+  proptest, as mudanças aplicadas a um espelho das tries dão exatamente o `XdpPlan::of`, depois de
+  qualquer série de escritas estáticas, dinâmicas e troca de listas),
+  `cargo bench -p corerouter-hal --bench xdp_prefixes`, e com root (VM do G0.26):
+  `cargo xtask vm-lab run -- env COREROUTER_REQUIRE_XDP=1 cargo xtask xdp-root` (passa na VM; a
+  primeira rodada pegou que o `SETTINGS` do programa liga a busca de block/allow pelo número de
+  prefixos, que agora vem do `XdpPrefixes`).
+
+- 2026-10-26 — G0.27: Checkpoint da config no desligamento: com o journal da config (G0.22) os commits vão para
+  `journal-config.log` e o slot só é regravado de tempos em tempos. Um build anterior ao G0.22 que
+  bootasse o diretório leria só o slot e perderia os commits desde o último checkpoint.
+
+  - `Session::checkpoint()` (novo): grava a revisão salva mais nova no slot quando ele ainda não a
+    tem (`Ok(false)` sem nada a fazer; em Safe Mode grava o store da entrada, como todo save).
+    `history_files::save` ganhou o modo "slot" (o mesmo caminho do checkpoint por tamanho).
+  - O daemon chama depois de pegar o lock final do desligamento limpo (G5.5) e registra o tempo.
+  - O formato do journal não muda: o checkpoint deixa nele as linhas que o slot `previous` ainda
+    precisa (perder o slot corrente continua sem perder commit), e o boot seguinte as pula.
+
+  Testes: `crates/engine/tests/config_journal.rs` (`the_shutdown_checkpoint_loses_no_journal_line`,
+  com 3, 40 e 1 100 commits: reinício igual, a visão de um build sem journal tem todos os commits,
+  o journal ainda fecha com o slot `previous`, segundo checkpoint não grava;
+  `the_shutdown_checkpoint_in_safe_mode_saves_the_entry`) e
+  `apps/corerouter-daemon/tests/shutdown_checkpoint.rs` (daemon de verdade com `--config-dir`, 20
+  commits, `kill -TERM`, sai com 0; o diretório inteiro e o diretório sem o journal bootam a mesma
+  revisão com os 20 commits).
+
+- 2026-10-26 — G4.3l: PPPoE QinQ, parte 3: o QinQ no laboratório (`docs/pppoe.md` §13.6). O `xdp-root` na VM cobre linhas
+  com TPID externo 0x8100 no diferencial kernel × host do PPPoE. O BNG Blaster ganha a etapa `qinq`
+  (`cargo xtask bng-lab --only qinq [--qinq N]`): 4000 linhas 802.1ad 1:1 com Service-Name e
+  TR-101 sobem a ~7800 sessões/s no XDP e no caminho lento, com 8000 de 8000 fluxos de tráfego
+  verificados (**medido** na VM). Um nome descartado não sobe nenhuma sessão.
+
+- 2026-10-26 — G4.3n: Migrar os secrets PPP do MikroTik com as senhas (`docs/ppp-secret-import.md`).
+
+  - **`ppp.secret.import {text, profile_map?, on_conflict?, create_profiles?, dry_run?}`**: lê um
+    `/ppp secret export show-sensitive` (ou `/export show-sensitive`) do RouterOS v7 ou o nosso;
+    relatório com quantos têm senha, os sem senha, perfis (mapeados, criados do arquivo ou
+    faltando), nomes que já existem (`skip`, `replace` ou `rename`), erros por linha, campos sem
+    equivalente; aplica numa mudança só (uma revisão; Safe Mode desfaz). `routes=` (G4.3cd) entra com
+    as mesmas recusas do `ppp.secret.add`, e o arquivo é conferido contra si mesmo (dois secrets
+    no mesmo bloco, IP fixo dentro do bloco de outro).
+  - **Leitor do export** (`engine::rsc`): continuações (também dentro de aspas), escapes do
+    RouterOS (`\XX` em hexa, `\_`, `\$`…), UTF-8 ou Latin-1, `set [ find … ]` e `set *0`;
+    limites de tamanho; erro com linha e coluna, nunca o texto. Proptests e alvo de fuzz
+    `routeros_export`.
+  - **Senhas seladas** (`engine::sealing`, `model::sealed`): a config, as revisões, os arquivos,
+    o diff e o undo levam a caixa `$cr1$…`; a chave fica fora (`state-secret-key.json`, 0600). O
+    BNG abre por login (0,5 µs; +1 a +5 % no setup de sessão, **medido**). Configs antigas são seladas na partida (revisão automática).
+  - **Teto da config salva** de 15 para 31 MiB (`persist::SAVE_BUDGET_BYTES` de 32 para 64 MiB): 100
+    mil secrets completos (26,5 MB selados) salvam e dão boot; antes nem em claro cabiam.
+  - **Fora de tudo:** journal (o `text` vira `*** (N bytes)`), log, `config.diff`, histórico,
+    `state.inspect`, saída do MCP (toda chave de segredo mascarada) e a GUI; testes procuram as
+    senhas em cada saída.
+  - **`/export show-sensitive`**: bandeira como no RouterOS v7; senhas só para `full`; ida e volta
+    RouterOS → import → nosso export → import idêntica (`crates/shell/tests/ppp_export.rs`).
+  - **GUI:** PPP › Secrets › Import from MikroTik: caminho, arrastar ou colar; selos da
+    pré-visualização; mapa de perfis que refaz a pré-visualização; Safe Mode; aviso e lembrete de
+    apagar o arquivo; ⓘ em português.
+
+  Testar: `cargo test -p corerouter-engine --test ppp_import`, `cargo test -p corerouter-shell
+  --test ppp_export`, `cargo test -p corerouter-ui ppp_import`, `cargo test -p corerouter-mcp
+  --test protocol ppp`; na GUI, PPP › Secrets › Import from MikroTik com um `.rsc`.
+
+- 2026-10-26 — processo: Partes do CI (8 núcleos nos testes somando runners), complemento do #269. O #269 entrou com
+  dois commits temporários das medições, que este PR desfaz: o `test` volta a 2 partes (eram 3)
+  e o cache do cargo volta a ser salvo só pela `main` (salvava também a branch do #269).
+
+  - **8 núcleos nos testes, somando runners:** o `test` e o `xdp-root` rodam em duas partes,
+    cada uma num runner de 4 vCPU (`COREROUTER_CI_PARTITION=i/2`). O `test` passa
+    `--partition hash:i/2` ao nextest (um teste fica na mesma parte quando outros entram; os
+    doctests só na parte 1); `.config/nextest.toml` começa primeiro os três testes de mais de
+    60 s, que antes, começando por último, seguravam sozinhos o fim de uma parte. O `xdp-root`
+    divide os testes de root pelo tempo medido de cada um (o mais longo para a parte mais leve),
+    e cada parte continua rodando um por vez, porque eles medem vazão e precisão. Dentro de cada
+    job, o nextest e o cargo já usam todos os núcleos (o padrão é o número de CPUs). Runner maior
+    é pago e runner próprio na máquina do usuário rodaria código de PR de fork (repositório
+    público): nenhum dos dois.
