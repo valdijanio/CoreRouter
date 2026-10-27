@@ -488,9 +488,11 @@ impl LdpPanel {
         let mut helps: Vec<(&'static str, &'static str)> = Vec::new();
         let form = self.form().clone();
         let mut edited = form.clone();
-        for (title, rows, grid) in [("LDP", SETTINGS, "mpls-ldp-settings"), ("MPLS", MPLS_SETTINGS, "mpls-settings")] {
-            ui.strong(title);
-            Grid::new(grid).num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+        // One grid for both sections, so their columns line up.
+        Grid::new("mpls-settings").num_columns(3).spacing([8.0, 4.0]).show(ui, |ui| {
+            for (title, rows) in [("LDP", SETTINGS), ("MPLS", MPLS_SETTINGS)] {
+                ui.strong(title);
+                ui.end_row();
                 for (p, label, key, hint) in rows {
                     ui.label(tr_in(SCOPE, l, label));
                     if help::info_button(ui, Id::unique(("mpls-set", *p)), tr_in(SCOPE, l, label)).clicked() {
@@ -510,9 +512,9 @@ impl LdpPanel {
                     }
                     ui.end_row();
                 }
-            });
-            ui.add_space(6.0);
-        }
+            }
+        });
+        ui.add_space(6.0);
         if let Some((key, label)) = helps.pop() {
             self.help = Some(HelpView::new(key, tr_in(SCOPE, l, label)));
         }

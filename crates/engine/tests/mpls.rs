@@ -205,3 +205,22 @@ fn without_kernel_mpls_the_adds_say_why() {
     assert_eq!(page["available"], false);
     assert!(page["why"].as_str().unwrap().contains("mpls_router"));
 }
+
+#[test]
+fn ip_routes_show_their_ldp_labels() {
+    let mut s = Session::virtual_lab();
+    ok(&mut s, "ip.address.add", json!({"address": "10.0.12.1/24", "interface": "ether1"}));
+    ok(&mut s, "ip.route.add", json!({"dst_address": "10.255.0.3/32", "gateway": "10.0.12.2"}));
+    let mut st = status();
+    st.bindings.push(LdpBinding {
+        prefix: "10.255.0.3/32".parse().unwrap(),
+        local_label: Some(18),
+        remote: vec![RemoteLabel { neighbor: Ipv4Addr::new(10, 255, 0, 2), label: 20, in_use: true }],
+    });
+    corerouter_engine::mpls::set_ldp(&mut s, Ok(Some(st)));
+    for (id, rows) in [("ip.route.list", ok(&mut s, "ip.route.list", json!({}))), ("ip.route.page", ok(&mut s, "ip.route.page", json!({}))["rows"].clone())] {
+        let r = rows.as_array().unwrap().iter().find(|r| r["dst_address"] == "10.255.0.3/32").unwrap_or_else(|| panic!("{id}: {rows}"));
+        assert_eq!(r["mpls_out"], "20", "{id}");
+        assert_eq!(r["mpls_in"], 18, "{id}");
+    }
+}

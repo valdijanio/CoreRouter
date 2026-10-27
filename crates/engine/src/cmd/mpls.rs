@@ -505,7 +505,7 @@ fn forwarding_page(s: &mut Session, p: &Value) -> Result<Value> {
         let n: IfName = name.parse().ok()?;
         cfg.interfaces.get(&n).map(|i| u32::from(i.mtu))
     };
-    let rows = corerouter_proto_mpls::forwarding_rows(mpls, ldp.state.as_ref(), &kernel, &mtu_of);
+    let rows = corerouter_proto_mpls::forwarding_rows(mpls, ldp.state.as_deref(), &kernel, &mtu_of);
     let summary = json!({
         "rows": rows.len(),
         "fecs": rows.iter().filter(|r| r.fec.is_some()).count(),

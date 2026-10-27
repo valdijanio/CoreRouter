@@ -36,8 +36,9 @@ pub struct KernelLabels {
 /// LDP as the routing service last read it.
 #[derive(Debug, Default, Clone)]
 pub struct LdpStatus {
-    /// `None`: no routing daemon reported (the lab, no `--frr`).
-    pub state: Option<LdpState>,
+    /// `None`: no routing daemon reported (the lab, no `--frr`). Shared:
+    /// a list copies the pointer, not 10⁴ bindings.
+    pub state: Option<Arc<LdpState>>,
     pub updated: Option<u64>,
     pub error: Option<String>,
 }
@@ -78,7 +79,7 @@ pub fn set_ldp(s: &mut Session, read: Result<Option<LdpState>, String>) {
     if let Some(l) = s.ext_mut::<LdpStatus>() {
         match read {
             Ok(st) => {
-                l.state = st;
+                l.state = st.map(Arc::new);
                 l.error = None;
             }
             Err(e) => l.error = Some(e),
@@ -112,4 +113,38 @@ pub fn labels(s: &mut Session) -> (Arc<Vec<MplsRoute>>, Option<String>) {
 /// LDP's state now (a copy of what the routing service stored).
 pub fn ldp(s: &Session) -> LdpStatus {
     s.ext::<LdpStatus>().cloned().unwrap_or_default()
+}
+
+/// G3.5: the LDP labels of route rows (`ip.route.list`/`page`): a row
+/// whose `dst_address` is a FEC with labels gets `mpls_in` (the label this
+/// router gave it) and `mpls_out` (the next hop's, RouterOS text). One
+/// pass over the bindings per call, then a lookup per row.
+pub fn annotate_routes(s: &Session, rows: &mut [serde_json::Value]) {
+    let Some(st) = s.ext::<LdpStatus>().and_then(|l| l.state.as_ref()) else {
+        return;
+    };
+    if st.bindings.is_empty() {
+        return;
+    }
+    let by: std::collections::HashMap<ipnet::IpNet, &corerouter_model::mpls_state::LdpBinding> =
+        st.bindings.iter().map(|b| (b.prefix, b)).collect();
+    for r in rows.iter_mut() {
+        let Some(dst) = r.get("dst_address").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let Some(b) = dst.parse::<ipnet::IpNet>().ok().and_then(|d| by.get(&d)) else {
+            continue;
+        };
+        let out = b.in_use().map(|x| {
+            if x.label == corerouter_model::mpls::IMPLICIT_NULL {
+                "implicit-null (pop)".to_owned()
+            } else {
+                corerouter_model::mpls::label_text(x.label)
+            }
+        });
+        if let Some(o) = r.as_object_mut() {
+            o.insert("mpls_in".into(), serde_json::json!(b.local_label));
+            o.insert("mpls_out".into(), serde_json::json!(out));
+        }
+    }
 }

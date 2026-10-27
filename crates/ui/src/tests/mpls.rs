@@ -99,3 +99,11 @@ fn every_label_explains_itself_in_both_languages() {
         }
     }
 }
+
+#[test]
+fn a_route_with_an_ldp_label_shows_it_as_a_chip() {
+    let r = crate::routes::Route::from_row(&json!({"dst_address": "10.255.0.3/32", "gateway": "10.0.12.2", "gateway_address": "10.0.12.2", "mpls_out": "20"}));
+    assert!(r.gateway_cell().contains("MPLS 20"), "{}", r.gateway_cell());
+    let pop = crate::routes::Route::from_row(&json!({"dst_address": "10.255.0.2/32", "gateway": "10.0.12.2", "mpls_out": "implicit-null (pop)"}));
+    assert!(pop.gateway_cell().contains("MPLS implicit-null"));
+}

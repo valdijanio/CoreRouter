@@ -302,6 +302,10 @@ fn page(s: &mut Session, p: &Value) -> Result<Value> {
             Entry::Bucket(b) => Some(b.json()),
         })
         .collect();
+    drop(neigh);
+    let mut rows = rows;
+    // G3.5: the LDP labels of the page's routes.
+    crate::mpls::annotate_routes(s, &mut rows);
     Ok(json!({
         "total": total,
         "offset": offset,
