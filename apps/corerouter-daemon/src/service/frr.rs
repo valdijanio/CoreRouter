@@ -126,6 +126,12 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
                 health.error(e.to_string());
             }
         }
+        // G3.5: LDP's state, when the running config has LDP.
+        let ldp = match reader.ldp_state(&routing_only(session)) {
+            Ok(st) => Ok(st),
+            Err(e) => Err(e.to_string()),
+        };
+        corerouter_engine::mpls::set_ldp(&mut lock(session), ldp);
         // Copied before the lock is taken (126 µs for 1 000 sessions,
         // **medido**): under it only the move.
         let sample = status.clone();
