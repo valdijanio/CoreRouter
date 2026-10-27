@@ -5593,3 +5593,46 @@ continuação indentadas).
   100 mil eventos de criação NAT saíram pelo TCP 0,38 s após a rajada (~260 mil eventos/s), 1,6 µs de
   CPU por registro, sem descarte; tempestade de 20 mil blocos com 24 µs de CPU do daemon por bloco;
   alocação no engine 11 → 4,4 µs por bloco; group commit 632 → 3 411 blocos/s no build de teste.
+
+- 2026-10-27 — G1.27d: Vizinhos ARP/ND, parte b: a janela IP › ARP (item próprio no menu, como no MikroTik; "IP ›
+  Neighbors" segue sendo a descoberta LLDP/MNDP, decisão do usuário), com as abas ARP (IPv4), ND
+  (IPv6) e Settings; IPv6 › Neighbors abre a lista ND. Barra + − ✓ ✗ 💬 para as estáticas e Make
+  Static, ARP Ping e Flush (com confirmação); selos de estado e de interface com as contagens da
+  tabela inteira que filtram com um clique; busca por IP, CIDR, prefixo de MAC ou texto feita no
+  motor; página de 500 com ◀ ▶. Selo de identidade (G0.25, lugar `arp`) mostra o nome pela concessão
+  DHCP ou pelo PTR das zonas locais. Clique numa linha abre o detalhe (`ip.arp.detail`: histórico
+  de MACs, rotas que usam o vizinho, endereço do roteador na rede) com Make Static, Add to Address
+  List, ARP Ping, Ping e Torch. Rodapé: vizinhos, estáticas/dinâmicas e "tabela do kernel X /
+  gc_thresh3 Y", âmbar com sugestão a partir de 80 %. Aba Settings: modo `arp` e `arp_timeout` por
+  interface (os arriscados confirmam) e os `gc_thresh` com atalho para System › Tuning. Modal de
+  adicionar/editar com pré-visualização `ip.arp.check` (MAC de grupo, endereço do roteador, fora da
+  rede da interface, host respondendo hoje com outro MAC). ⓘ em português em colunas, abas, campos
+  e botões. Correções do laboratório: o serviço girava sem dormir com o feed do lab (CPU alta) e o
+  "Last Seen" usava o relógio errado.
+
+  Como testar: `cargo test -p corerouter-ui -- tests::arp`; GUI com o daemon do lab, IP › ARP.
+  Screenshots claro/escuro na pasta de notas (`G1.27d-screenshots`).
+
+- 2026-10-27 — G1.27d: Vizinhos ARP/ND, parte c: `ip.dhcp-server.add/set add_arp` (RouterOS `add-arp`, padrão não).
+  Cada concessão vinculada por um servidor com `add_arp` vira uma entrada ARP permanente na
+  interface do servidor, por uma operação O(1) no data plane (`Hal::neighbor_static`: um
+  `RTM_NEWNEIGH` por concessão, nunca um apply inteiro), e sai quando a concessão termina (expira,
+  é liberada ou removida) ou quando o servidor deixa de pedir (`add_arp` desligado, servidor
+  removido, rollback). `ip.arp.list` mostra a origem `dhcp` (RouterOS flag H) e o filtro
+  `source=dhcp`; a janela IP › ARP pinta o selo de verde e conta no rodapé. Com `arp=reply-only` na
+  interface, é o antispoofing do RouterOS: só quem pegou concessão alcança o roteador (como o
+  Dynamic ARP Inspection do Cisco com DHCP snooping). A opção "Add ARP For Leases" entrou no
+  diálogo do servidor DHCP.
+
+  Como testar: `cargo test -p corerouter-engine --test dhcp_server add_arp`.
+
+  Corrigido também o teste `netns_neigh` (instável: 1000 entradas aprendidas perto do `gc_thresh3`
+  de 1024 faziam o kernel recusar a entrada `incomplete` que o teste espera; agora são 200 e o teste
+  espera a entrada com novas tentativas, 5 de 5 rodadas verdes, **medido**).
+
+- 2026-10-27 — interfaces-lista: Interfaces: lista com ícones de tipo, estado em selo, resumo da seleção e
+  colunas escolhidas pelo operador e guardadas nas preferências locais. Os
+  contadores, gráficos e comentários em faixa continuam disponíveis. Para testar,
+  abra Interfaces, escolha Columns, oculte MTU e reabra a GUI; teste também Inline
+  Comments e os temas claro e escuro. O resumo usa consultas existentes da interface
+  selecionada; disponibilidade depende da plataforma.
