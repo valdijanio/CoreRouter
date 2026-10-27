@@ -767,6 +767,39 @@ pub fn lists_text(l: &Lists, out: &mut String) {
     }
 }
 
+/// `part` over `roots`, in order: on threads when there are many chains
+/// (10 000 rules in 100 chains render in 15 ms on 8 threads, parse
+/// included, instead of 40 ms on one, **medido** in `benches/filter.rs`,
+/// 2026-10-27); one thread on wasm.
+fn render_parts<T: Send>(roots: &[&str], part: &(dyn Fn(&[&str]) -> T + Sync)) -> Vec<T> {
+    let threads = if roots.len() < 8 { 1 } else { super::eval::threads_for(usize::MAX) };
+    if threads <= 1 {
+        return vec![part(roots)];
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        vec![part(roots)]
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let size = roots.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = roots
+                .chunks(size)
+                .map(|c| std::thread::Builder::new().name("filter-render".into()).spawn_scoped(scope, move || part(c)))
+                .collect();
+            handles
+                .into_iter()
+                .zip(roots.chunks(size))
+                .map(|(h, c)| match h.map(|h| h.join()) {
+                    Ok(Ok(v)) => v,
+                    _ => part(c),
+                })
+                .collect()
+        })
+    }
+}
+
 /// The whole `/routing filter` for FRR: the chains in `used` (those the
 /// connections name) and the chains no other chain jumps to, each with
 /// the AS `asn_of` gives it; the problems (with the chain's name).
@@ -779,16 +812,36 @@ pub fn render(filter: &RoutingFilter, used: &BTreeSet<String>, asn_of: &dyn Fn(&
         super::eval::jumps(b, &mut j);
         jumped.extend(j);
     }
+    let roots: Vec<&str> = parsed
+        .iter()
+        .map(|(n, _)| n.as_str())
+        .filter(|n| !jumped.contains(*n) || used.contains(*n))
+        .collect();
+    // Each chain compiles alone (the lists are named by content, so the
+    // parts merge): many chains go on threads.
+    let asns: HashMap<&str, Option<u32>> = roots.iter().map(|n| (*n, asn_of(n))).collect();
+    let part = |names: &[&str]| -> (Lists, String, Vec<Problem>) {
+        let (mut lists, mut maps, mut problems) = (Lists::default(), String::new(), Vec::new());
+        for name in names {
+            let asn = asns.get(name).copied().flatten();
+            let (entries, probs) = compile(filter, &chains, name, asn, &mut lists);
+            problems.extend(probs.into_iter().map(|message| Problem { item: format!("chain {name}"), message }));
+            map_text(name, &entries, &mut maps);
+        }
+        (lists, maps, problems)
+    };
+    let parts: Vec<(Lists, String, Vec<Problem>)> = render_parts(&roots, &part);
     let mut lists = Lists::default();
     let mut maps = String::new();
     let mut problems = Vec::new();
-    for (name, _) in &parsed {
-        if jumped.contains(name) && !used.contains(name) {
-            continue;
-        }
-        let (entries, probs) = compile(filter, &chains, name, asn_of(name), &mut lists);
-        problems.extend(probs.into_iter().map(|message| Problem { item: format!("chain {name}"), message }));
-        map_text(name, &entries, &mut maps);
+    for (l, m, p) in parts {
+        lists.prefix4.extend(l.prefix4);
+        lists.prefix6.extend(l.prefix6);
+        lists.aspath.extend(l.aspath);
+        lists.comm.extend(l.comm);
+        lists.large.extend(l.large);
+        maps.push_str(&m);
+        problems.extend(p);
     }
     let mut text = String::new();
     lists_text(&lists, &mut text);

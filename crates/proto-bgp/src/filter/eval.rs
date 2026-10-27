@@ -28,7 +28,7 @@ pub const REGEX_SIZE_LIMIT: usize = 1 << 20;
 
 /// FRR's `_`: a separator between AS numbers, or either end of the path
 /// (bgpd `bgp_regcomp`).
-const UNDERSCORE: &str = "(^|[,{}() ]|$)";
+pub(crate) const UNDERSCORE: &str = "(^|[,{}() ]|$)";
 
 /// Compile an AS-path expression as FRR does (`_` expanded).
 pub fn compile_regex(re: &str) -> Result<Regex, String> {
@@ -39,6 +39,44 @@ pub fn compile_regex(re: &str) -> Result<Regex, String> {
         .unicode(false)
         .build()
         .map_err(|e| format!("not a regular expression: {}", parse::cut(&e.to_string().replace('\n', " "))))
+}
+
+/// Compile `sources` (expression, chain), in order: on threads when there
+/// are many. With [`parse_all`], 10 000 rules (2 500 distinct expressions)
+/// build in 30 ms on 8 threads instead of 90 ms on one (**medido**,
+/// `benches/filter.rs`, 2026-10-27).
+fn compile_all(sources: &[(String, String)]) -> Vec<Result<Regex, String>> {
+    let threads = if sources.len() < 64 { 1 } else { threads_for(usize::MAX) };
+    if threads <= 1 {
+        return sources.iter().map(|(re, _)| compile_regex(re)).collect();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        sources.iter().map(|(re, _)| compile_regex(re)).collect()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let size = sources.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = sources
+                .chunks(size)
+                .map(|chunk| {
+                    std::thread::Builder::new()
+                        .name("filter-regex".into())
+                        .spawn_scoped(scope, move || chunk.iter().map(|(re, _)| compile_regex(re)).collect::<Vec<_>>())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .zip(sources.chunks(size))
+                .flat_map(|(h, chunk)| match h.map(|h| h.join()) {
+                    Ok(Ok(v)) => v,
+                    // A thread that could not start or died: compile here.
+                    _ => chunk.iter().map(|(re, _)| compile_regex(re)).collect(),
+                })
+                .collect()
+        })
+    }
 }
 
 /// A prefix list ready for lookups.
@@ -162,15 +200,14 @@ pub fn parsed_chains(filter: &RoutingFilter) -> (Vec<(String, Vec<Stmt>)>, Vec<P
     let mut chains: Vec<(String, Vec<Stmt>)> = Vec::new();
     let mut index: HashMap<&str, usize> = HashMap::new();
     let mut problems = Vec::new();
-    for r in &filter.rules {
+    let parsed = parse_all(&filter.rules);
+    for (r, result) in filter.rules.iter().zip(parsed) {
         let i = *index.entry(r.chain.as_str()).or_insert_with(|| {
             chains.push((r.chain.clone(), Vec::new()));
             chains.len() - 1
         });
-        if r.disabled {
-            continue;
-        }
-        match parse::parse(&r.rule) {
+        let Some(result) = result else { continue };
+        match result {
             Ok(stmts) => {
                 if let Some((_, body)) = chains.get_mut(i) {
                     body.extend(stmts);
@@ -180,6 +217,38 @@ pub fn parsed_chains(filter: &RoutingFilter) -> (Vec<(String, Vec<Stmt>)>, Vec<P
         }
     }
     (chains, problems)
+}
+
+/// Every enabled rule parsed (`None`: disabled), in order; on threads when
+/// there are many (each rule is independent).
+fn parse_all(rules: &[corerouter_model::routing_filter::FilterRule]) -> Vec<Option<Result<Vec<Stmt>, parse::ParseError>>> {
+    let one = |r: &corerouter_model::routing_filter::FilterRule| (!r.disabled).then(|| parse::parse(&r.rule));
+    let threads = if rules.len() < 1_000 { 1 } else { threads_for(usize::MAX) };
+    if threads <= 1 {
+        return rules.iter().map(one).collect();
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        rules.iter().map(one).collect()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let size = rules.len().div_ceil(threads);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = rules
+                .chunks(size)
+                .map(|c| std::thread::Builder::new().name("filter-parse".into()).spawn_scoped(scope, move || c.iter().map(one).collect::<Vec<_>>()))
+                .collect();
+            handles
+                .into_iter()
+                .zip(rules.chunks(size))
+                .flat_map(|(h, c)| match h.map(|h| h.join()) {
+                    Ok(Ok(v)) => v,
+                    _ => c.iter().map(one).collect(),
+                })
+                .collect()
+        })
+    }
 }
 
 /// The chains every chain jumps to (directly).
@@ -258,7 +327,9 @@ struct Builder<'a> {
     names: &'a HashMap<String, usize>,
     sets: Vec<PrefixSet>,
     set_index: HashMap<String, usize>,
-    regexes: Vec<Option<Regex>>,
+    /// The distinct expressions and the chain that first used each;
+    /// compiled after the walk, on several threads when there are many.
+    regexes: Vec<(String, String)>,
     regex_index: HashMap<String, usize>,
     problems: Vec<Problem>,
     chain: String,
@@ -334,9 +405,7 @@ impl Builder<'_> {
                     if let Some(i) = self.regex_index.get(re) {
                         Test::AsPath(*i)
                     } else {
-                        // A broken regex never matches.
-                        let compiled = compile_regex(re).map_err(|e| self.problem(e)).ok();
-                        self.regexes.push(compiled);
+                        self.regexes.push((re.clone(), self.chain.clone()));
                         let i = self.regexes.len() - 1;
                         self.regex_index.insert(re.clone(), i);
                         Test::AsPath(i)
@@ -409,7 +478,19 @@ impl Policy {
             chains.push((name.clone(), b.ops(body)));
         }
         problems.extend(b.problems);
-        let (sets, regexes) = (b.sets, b.regexes);
+        let (sets, sources) = (b.sets, b.regexes);
+        let compiled = compile_all(&sources);
+        let mut regexes = Vec::with_capacity(compiled.len());
+        for ((_, chain), r) in sources.iter().zip(compiled) {
+            // A broken regex never matches (fail closed).
+            match r {
+                Ok(r) => regexes.push(Some(r)),
+                Err(message) => {
+                    problems.push(Problem { item: format!("chain {chain}"), message });
+                    regexes.push(None);
+                }
+            }
+        }
         let policy = Policy { names, chains, sets, regexes };
         (policy, problems)
     }

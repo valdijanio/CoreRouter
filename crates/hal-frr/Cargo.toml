@@ -25,5 +25,9 @@ corerouter-proto-bgp.workspace = true
 name = "frr_conf"
 harness = false
 
+[[bench]]
+name = "filter_diff"
+harness = false
+
 [lints]
 workspace = true

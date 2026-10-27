@@ -859,7 +859,15 @@ pub fn check_regex(re: &str) -> Result<(), String> {
     if let Some(c) = re.chars().find(|c| !(c.is_ascii_graphic() || *c == ' ') || *c == '\\' || *c == '"') {
         return Err(format!("{c:?} is not allowed in an AS-path expression (digits, spaces and . * + ? ^ $ _ | ( ) [ ] {{ }} , -)"));
     }
-    super::eval::compile_regex(re).map(|_| ())
+    let expanded = re.replace('_', super::eval::UNDERSCORE);
+    regex_syntax::ParserBuilder::new()
+        .unicode(false)
+        .utf8(false)
+        .nest_limit(64)
+        .build()
+        .parse(&expanded)
+        .map(|_| ())
+        .map_err(|e| format!("not a regular expression: {}", cut(&e.to_string().replace('\n', " "))))
 }
 
 /// Parse one rule.
