@@ -439,6 +439,12 @@ impl PppBackend for Backend {
         sh.active.get(id).map(|a| a.name.clone())
     }
 
+    fn who_vlan(&self, ip: Ipv4Addr) -> Option<(String, u16)> {
+        let sh = guard(&self.0);
+        let id = sh.by_ip.get(&ip)?;
+        sh.active.get(id).map(|a| (a.name.clone(), a.vlan.unwrap_or(0)))
+    }
+
     fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {
         let sh = guard(&self.0);
         let now = std::time::SystemTime::now()

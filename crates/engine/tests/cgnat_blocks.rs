@@ -381,3 +381,53 @@ fn subscribers_near_their_limit_raise_one_alert_per_crossing() {
         json!([])
     );
 }
+
+/// G4.4j: with the flow exporter taking them, every block allocation and
+/// release becomes an RFC 8158 §4.6.10 record (natEvent 16/17, the range,
+/// the pool's id), and an exhausted pool a §4.6.5 record (natEvent 3),
+/// once per minute however many subscribers it refuses (§5.2).
+#[test]
+fn blocks_and_an_exhausted_pool_reach_the_ipfix_queue() {
+    use corerouter_proto_flow::{NatEventType, Record};
+    let mut s = Session::virtual_lab();
+    s.tick(T0);
+    s.nat_log_want(true, true);
+    ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.add",
+        json!({"name": "tiny", "mode": "blocks", "inside": "100.64.0.0/24", "outside": "203.0.113.9", "ports_per_subscriber": 32256}),
+    );
+    s.tick(T0 + 1);
+    s.nat_log_want(true, true);
+    for i in 0..50u8 {
+        let _ = s.cgnat_block_for(std::net::Ipv4Addr::new(100, 64, 0, 100 + i), T0 + 2);
+    }
+    let mut out = Vec::new();
+    s.nat_log_take(1000, &mut out);
+    let pool_id = ok(&mut s, "ip.firewall.cgnat.pool.list", json!({}))[0]["id"]
+        .as_str()
+        .unwrap()
+        .trim_start_matches('*')
+        .parse::<u32>()
+        .unwrap_or(0);
+    let allocs: Vec<_> = out
+        .iter()
+        .filter_map(|r| match r {
+            Record::PortBlock(b) if b.event == NatEventType::PortBlockAllocation => Some(b),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(allocs.len(), 2, "{out:?}");
+    for b in &allocs {
+        assert_eq!((b.ports, b.step, b.pool), (32256, 1, pool_id));
+        assert_eq!(b.port_end - b.port_start + 1, 32256);
+        assert_eq!(b.post_src, std::net::Ipv4Addr::new(203, 0, 113, 9));
+        assert_eq!(b.time_ms, (T0 + 1) * 1000);
+    }
+    let exhausted: Vec<_> = out
+        .iter()
+        .filter(|r| matches!(r, Record::NatLimit(l) if l.event == NatEventType::AddressesExhausted && l.pool == pool_id))
+        .collect();
+    assert_eq!(exhausted.len(), 1, "rate-limited: {out:?}");
+    assert!(s.nat_log().unwrap().suppressed >= 49);
+}

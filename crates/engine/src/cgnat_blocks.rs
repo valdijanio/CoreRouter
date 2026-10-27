@@ -31,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::Session;
+use crate::nat_log::Limit;
 
 /// The journal's name (`journal-cgnat-blocks.log`).
 pub const JOURNAL: &str = "cgnat-blocks";
@@ -514,6 +515,28 @@ impl Session {
             message,
             json!({"event": e.e, "subscriber": e.sub, "public": e.public, "first_port": e.first, "last_port": e.last, "pool": e.pool}),
         );
+        // G4.4j: the same event for the IPFIX exporter (RFC 8158 §4.6.10).
+        let pool = self.store().running().ip.cgnat.pools.iter().find(|p| p.name == e.pool).map_or(0, |p| p.id.0);
+        self.nat_log_block(
+            corerouter_proto_flow::PortBlock {
+                time_ms: 0,
+                event: if e.e == "alloc" {
+                    corerouter_proto_flow::NatEventType::PortBlockAllocation
+                } else {
+                    corerouter_proto_flow::NatEventType::PortBlockDeallocation
+                },
+                src: e.sub,
+                post_src: e.public,
+                port_start: e.first,
+                port_end: e.last,
+                step: 1,
+                ports: e.last.saturating_sub(e.first).saturating_add(1),
+                user: String::new(),
+                vlan: 0,
+                pool,
+            },
+            e.t,
+        );
         if let Err(err) = self.storage_mut().append_journal(JOURNAL, &format!("{line}\n")) {
             log::error!("cgnat block journal not saved: {err}");
             if let Some(rt) = self.ext_mut::<CgnatRuntime>() {
@@ -568,9 +591,13 @@ impl Session {
         rt.hold_prune(now);
         let mine: Vec<Block> = rt.active.get(&subscriber).cloned().unwrap_or_default();
         if mine.len() >= usize::from(pool.max_blocks) {
+            let ports = u32::from(pool.ports_per_subscriber).saturating_mul(u32::from(pool.max_blocks));
+            self.nat_limit(Limit::PerUser { subscriber, pool: pool.id.0, ports }, now);
             return Err(format!("{subscriber} holds {} blocks, the most allowed", mine.len()));
         }
         let Some((address, block)) = rt.free_block(&pool, &layout, mine.last().map(|b| b.address), now) else {
+            // RFC 8158 §4.6.5: the pool is out of what it hands out.
+            self.nat_limit(Limit::PoolExhausted { pool: pool.id.0 }, now);
             return Err(format!("pool '{}' has no free block", pool.name));
         };
         let Some(slot) = layout.block(address, block) else {
@@ -914,6 +941,13 @@ impl Session {
                 Some((base, grew)) => (stats.insert_failed, grew.saturating_add(stats.insert_failed.saturating_sub(base))),
             });
         }
+        for a in &crossed {
+            // RFC 8158 §4.6.8.3: the per-user threshold, as IPFIX too.
+            if let Some(p) = cgnat.pools.iter().find(|p| p.name == a.pool) {
+                let percent = u32::from(p.alert_percent);
+                self.nat_limit(Limit::Threshold { subscriber: a.subscriber, pool: p.id.0, percent }, now);
+            }
+        }
         for a in crossed {
             self.log_event(
                 &["cgnat", "warning"],
@@ -992,6 +1026,18 @@ impl Session {
                 a.icmp = a.icmp.saturating_add(hit.icmp);
                 a.last_refused = Some(now);
                 a.last = now;
+            }
+        }
+        // RFC 8158 §4.6.7.3: refused for having every port it may have
+        // (`nat_limit` keeps it to one per subscriber a minute, §5.2).
+        for (sub, hit) in &counted {
+            if hit.refused == 0 {
+                continue;
+            }
+            if let Some(p) = cgnat.pool_of(*sub) {
+                let blocks = if p.mode == Mode::Blocks { u32::from(p.max_blocks) } else { 1 };
+                let ports = u32::from(p.ports_per_subscriber).saturating_mul(blocks);
+                self.nat_limit(Limit::PerUser { subscriber: *sub, pool: p.id.0, ports }, now);
             }
         }
         if let Some(store) = self.cgnat_capacity() {

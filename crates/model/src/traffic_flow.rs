@@ -14,6 +14,13 @@ use crate::types::{IfName, ItemId};
 /// The NetFlow port most collectors listen on (RouterOS `port` default;
 /// IPFIX's own, RFC 7011 §10.3.1, is 4739).
 pub const DEFAULT_PORT: u16 = 2055;
+/// IPFIX over TLS (RFC 7011 §11.2: 4740 for TLS and DTLS).
+pub const TLS_PORT: u16 = 4740;
+/// Longest PEM text of a target's certificate, key or CA (a chain of 3–4
+/// certificates).
+pub const MAX_PEM: usize = 16 * 1024;
+/// Longest TLS server name (a DNS name, RFC 1035).
+pub const MAX_SERVER_NAME: usize = 253;
 pub const MAX_TARGETS: usize = 16;
 pub const MAX_INTERFACES: usize = 256;
 /// Connections followed for the active/inactive timeouts (about 150 bytes
@@ -52,8 +59,21 @@ pub struct TrafficFlow {
     /// Flow records for one connection in N (1: every one). NAT events are
     /// never sampled.
     pub sampling_interval: u32,
-    /// RFC 8158 NAT44 session events (create/delete).
+    /// Flow records (one per connection and direction). Off for a router
+    /// that only logs NAT (G4.4j): the CGNAT's blocks and limits then need
+    /// no conntrack reading at all.
+    pub flows: bool,
+    /// RFC 8158 NAT44 session events (create/delete), one per connection:
+    /// off by default (RouterOS `nat-events=no`); the port blocks of the
+    /// CGNAT in blocks mode are the compact log.
     pub nat_events: bool,
+    /// CGNAT port block allocation and release (RFC 8158 §4.6.10, `natEvent`
+    /// 16/17), with the pool, the VLAN and the PPPoE login.
+    pub nat_port_blocks: bool,
+    /// CGNAT limits (RFC 8158 §4.6.5, §4.6.7.3, §4.6.8.3): pool out of
+    /// blocks, a subscriber refused for lack of ports, a subscriber above
+    /// the alert percentage. Rate-limited (§5.2).
+    pub nat_limits: bool,
     /// The destination in NAT events too. Off by default: the source before
     /// and after NAT with the times is the connection log (Marco Civil art.
     /// 13); the destination is application access, which a connection
@@ -75,7 +95,10 @@ impl Default for TrafficFlow {
             active_flow_timeout: DEFAULT_ACTIVE,
             inactive_flow_timeout: DEFAULT_INACTIVE,
             sampling_interval: 1,
-            nat_events: true,
+            flows: true,
+            nat_events: false,
+            nat_port_blocks: true,
+            nat_limits: true,
             nat_events_destination: false,
             retention_hours: DEFAULT_RETENTION_HOURS,
             retention_records: DEFAULT_RETENTION_RECORDS,
@@ -140,6 +163,14 @@ pub enum FlowTransport {
     /// IPFIX over TCP (RFC 7011 §10.4): nothing lost while the collector
     /// is up, a queue while it is not.
     Tcp,
+    /// IPFIX over SCTP (RFC 7011 §10.2, the protocol's mandatory
+    /// transport): one IPFIX message per SCTP message, congestion control
+    /// and reliability like TCP without a byte stream to reframe.
+    Sctp,
+    /// IPFIX over TLS on TCP (RFC 7011 §11): encrypted and both sides
+    /// authenticated by certificate (§11.3), what RFC 8158 §7 asks of NAT
+    /// logs.
+    Tls,
 }
 
 impl FlowTransport {
@@ -147,7 +178,15 @@ impl FlowTransport {
         match self {
             Self::Udp => "udp",
             Self::Tcp => "tcp",
+            Self::Sctp => "sctp",
+            Self::Tls => "tls",
         }
+    }
+
+    /// A connection that carries a byte or message stream (templates once
+    /// per connection, RFC 7011 §8.1).
+    pub fn is_stream(self) -> bool {
+        !matches!(self, Self::Udp)
     }
 }
 
@@ -157,8 +196,52 @@ impl std::str::FromStr for FlowTransport {
         match s.trim().to_ascii_lowercase().as_str() {
             "udp" => Ok(Self::Udp),
             "tcp" => Ok(Self::Tcp),
-            "sctp" => Err("SCTP is not supported yet: use udp or tcp".into()),
-            _ => Err("must be udp or tcp".into()),
+            "sctp" => Ok(Self::Sctp),
+            "tls" => Ok(Self::Tls),
+            "dtls" => Err("DTLS is not supported: use tls (IPFIX over TLS on TCP)".into()),
+            _ => Err("must be udp, tcp, sctp or tls".into()),
+        }
+    }
+}
+
+/// What a collector receives (G4.4j): a NAT log server needs no traffic
+/// flows, a traffic analyzer no NAT events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TargetRecords {
+    #[default]
+    All,
+    /// NAT events only: sessions, port blocks, limits.
+    Nat,
+    Flows,
+}
+
+impl TargetRecords {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Nat => "nat",
+            Self::Flows => "flows",
+        }
+    }
+
+    pub fn wants_flows(self) -> bool {
+        self != Self::Nat
+    }
+
+    pub fn wants_nat(self) -> bool {
+        self != Self::Flows
+    }
+}
+
+impl std::str::FromStr for TargetRecords {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "all" => Ok(Self::All),
+            "nat" => Ok(Self::Nat),
+            "flows" => Ok(Self::Flows),
+            _ => Err("must be all, nat or flows".into()),
         }
     }
 }
@@ -184,10 +267,41 @@ pub struct FlowTarget {
     /// … and after this many seconds (UDP; 0: never by time).
     #[serde(default = "default_timeout")]
     pub template_timeout: u32,
+    /// What this collector receives (`records` is the status's count).
+    #[serde(default, skip_serializing_if = "is_all")]
+    pub content: TargetRecords,
+    /// `natEvent` 1/2 (Historic, RFC 8158 §4.3) instead of 4/5 for the
+    /// NAT44 session events: collectors made for ipt-netflow and older
+    /// Juniper and F5 boxes.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub nat_events_legacy: bool,
+    /// TLS (RFC 7011 §11.3): this router's certificate chain and key (PEM),
+    /// which the collector checks (mutual authentication).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub certificate: String,
+    /// Secret (`auth::SECRET_KEYS`): never in the journal or the log.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub private_key: String,
+    /// The CA that signed the collector's certificate (PEM); empty: the
+    /// public roots compiled in.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub ca_certificate: String,
+    /// The name the collector's certificate must carry (RFC 7011 §11.3
+    /// "reference identifier"); empty: its address (an IP SAN).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub server_name: String,
     #[serde(default)]
     pub disabled: bool,
     #[serde(default)]
     pub comment: String,
+}
+
+fn is_all(r: &TargetRecords) -> bool {
+    *r == TargetRecords::All
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 fn default_port() -> u16 {
@@ -213,6 +327,12 @@ impl FlowTarget {
             transport: FlowTransport::default(),
             template_refresh: DEFAULT_TEMPLATE_REFRESH,
             template_timeout: DEFAULT_TEMPLATE_TIMEOUT,
+            content: TargetRecords::All,
+            nat_events_legacy: false,
+            certificate: String::new(),
+            private_key: String::new(),
+            ca_certificate: String::new(),
+            server_name: String::new(),
             disabled: false,
             comment: String::new(),
         }
@@ -244,6 +364,12 @@ pub struct TrafficFlowStatus {
     pub vanished: u64,
     pub flows: u64,
     pub nat_events: u64,
+    /// CGNAT block and limit events taken from the engine's queue, and
+    /// those it dropped for a full queue (G4.4j).
+    #[serde(default)]
+    pub nat_log: u64,
+    #[serde(default)]
+    pub nat_log_dropped: u64,
     /// Records in the last minute.
     pub records_per_min: u64,
     /// Whether the kernel counts bytes (`nf_conntrack_acct`) and stamps
@@ -277,7 +403,8 @@ pub struct TargetStatus {
     /// Times the templates went out, and the last one (Unix seconds).
     pub template_sends: u64,
     pub last_template: Option<u64>,
-    /// Messages waiting (TCP), and those dropped (full queue, send errors).
+    /// Messages waiting (TCP, SCTP, TLS), and those dropped (full queue,
+    /// send errors).
     pub queue: u64,
     pub dropped: u64,
     pub send_errors: u64,
@@ -290,7 +417,7 @@ pub enum TargetState {
     #[default]
     Disabled,
     Sending,
-    /// TCP: not connected (the queue holds what it can).
+    /// TCP, SCTP, TLS: not connected (the queue holds what it can).
     Connecting,
     /// The last send failed (`last_error`).
     Error,

@@ -42,6 +42,9 @@ pub struct Config {
     /// NAT events with the destination (template `NAT44`) or without
     /// (`NAT44_SRC`, the default of `/ip traffic-flow`).
     pub nat_destination: bool,
+    /// `natEvent` 1/2 instead of 4/5 for the NAT44 session events
+    /// ([`crate::NatEventType::legacy_code`]).
+    pub legacy_nat: bool,
 }
 
 /// What an exporter sent, for the statistics.
@@ -166,6 +169,37 @@ impl Exporter {
 
     /// Template and options template sets, then the options records.
     fn put_templates(&mut self, m: &mut Msg, now_ms: u64, out: &mut Vec<Vec<u8>>) {
+        self.put_template_sets(m);
+        self.last_templates = Some(now_ms);
+        self.since_templates = 0;
+        self.counters.template_sends += 1;
+        let meta = std::mem::take(&mut self.meta);
+        let interval = meta.sampling_interval.max(1);
+        self.add(
+            m,
+            Row::Sampling {
+                domain: self.cfg.domain,
+                interval,
+            },
+            now_ms,
+            out,
+        );
+        for (index, name) in &meta.interfaces {
+            self.add(
+                m,
+                Row::Interface {
+                    index: *index,
+                    name,
+                },
+                now_ms,
+                out,
+            );
+        }
+        self.meta = meta;
+    }
+
+    /// The template and options template sets.
+    fn put_template_sets(&self, m: &mut Msg) {
         let v9 = self.cfg.version == Version::V9;
         let (data_set, opt_set) = if v9 { (0, 1) } else { (2, 3) };
         self.open_set(m, data_set);
@@ -195,32 +229,6 @@ impl Exporter {
             m.records = m.records.saturating_add(1);
         }
         self.close_set(m);
-        self.last_templates = Some(now_ms);
-        self.since_templates = 0;
-        self.counters.template_sends += 1;
-        let meta = std::mem::take(&mut self.meta);
-        let interval = meta.sampling_interval.max(1);
-        self.add(
-            m,
-            Row::Sampling {
-                domain: self.cfg.domain,
-                interval,
-            },
-            now_ms,
-            out,
-        );
-        for (index, name) in &meta.interfaces {
-            self.add(
-                m,
-                Row::Interface {
-                    index: *index,
-                    name,
-                },
-                now_ms,
-                out,
-            );
-        }
-        self.meta = meta;
     }
 
     fn template(&self, id: u16) -> Option<&Template> {
@@ -235,7 +243,7 @@ impl Exporter {
             _ => row.template(),
         };
         let Some(t) = self.template(tid) else { return };
-        let len = t.record_len();
+        let len = t.row_len(row);
         let same = matches!(m.set, Some((_, id)) if id == tid);
         let need = len + if same { 0 } else { 4 } + 3;
         if m.buf.len() + need > self.cfg.max_size && m.records > 0 {
@@ -248,10 +256,13 @@ impl Exporter {
         if !matches!(m.set, Some((_, id)) if id == tid) {
             self.open_set(m, tid);
         }
-        let boot = self.cfg.boot_ms;
+        let how = template::Put {
+            boot_ms: self.cfg.boot_ms,
+            legacy_nat: self.cfg.legacy_nat,
+        };
         if let Some(t) = self.template(tid) {
             for field in &t.fields {
-                template::put(&mut m.buf, *field, row, boot);
+                template::put(&mut m.buf, *field, row, how);
             }
         }
         m.records = m.records.saturating_add(1);
@@ -296,6 +307,17 @@ impl Exporter {
     /// it still sends the templates when they are due (a quiet exporter
     /// keeps its collector's templates fresh).
     pub fn encode(&mut self, now_ms: u64, records: &[Record], out: &mut Vec<Vec<u8>>) {
+        self.encode_iter(now_ms, records, out);
+    }
+
+    /// [`Self::encode`] over any records (a collector's share of a batch,
+    /// without copying it).
+    pub fn encode_iter<'a>(
+        &mut self,
+        now_ms: u64,
+        records: impl IntoIterator<Item = &'a Record>,
+        out: &mut Vec<Vec<u8>>,
+    ) {
         let mut m = self.open();
         if self.templates_due(now_ms) {
             self.put_templates(&mut m, now_ms, out);
@@ -305,6 +327,7 @@ impl Exporter {
                 Record::Flow(f) => Row::Flow(f),
                 Record::Nat(n) => Row::Nat(n),
                 Record::PortBlock(b) => Row::Block(b),
+                Record::NatLimit(l) => Row::Limit(l),
             };
             self.add(&mut m, row, now_ms, out);
         }
@@ -312,6 +335,40 @@ impl Exporter {
             out.push(self.finish(m, now_ms));
         }
     }
+}
+
+impl Exporter {
+    /// A message with the template and options template sets only, no
+    /// data records (IPFIX): what a stream sender puts first on a new
+    /// connection, before the messages that waited for it (RFC 7011 §8.1:
+    /// templates before the data that uses them). Its sequence number is
+    /// left for the sender to set ([`set_sequence`]): with no data records
+    /// it takes the one of the message after it, so the collector sees no
+    /// gap. Changes nothing in the exporter.
+    pub fn templates_only(&self, now_ms: u64) -> Vec<u8> {
+        let mut e = self.clone();
+        e.meta = Meta::default();
+        let mut m = e.open();
+        e.put_template_sets(&mut m);
+        let mut msg = e.finish(m, now_ms);
+        // The options records of `put_templates` are not here: the header
+        // counts no data.
+        set_sequence(&mut msg, 0);
+        msg
+    }
+}
+
+/// Overwrite the sequence number of an IPFIX message (RFC 7011 §3.1,
+/// bytes 8–11).
+pub fn set_sequence(msg: &mut [u8], seq: u32) {
+    if let Some(slot) = msg.get_mut(8..12) {
+        slot.copy_from_slice(&seq.to_be_bytes());
+    }
+}
+
+/// The sequence number of an IPFIX message.
+pub fn sequence(msg: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(msg.get(8..12)?.try_into().ok()?))
 }
 
 fn put_fields(buf: &mut Vec<u8>, fields: &[crate::ie::Field]) {

@@ -10,9 +10,9 @@ use std::net::IpAddr;
 
 use corerouter_model::ItemId;
 use corerouter_model::traffic_flow::{
-    FlowTarget, FlowTransport, FlowVersion, MAX_CACHE, MAX_INTERFACES, MAX_RETENTION_HOURS,
-    MAX_RETENTION_RECORDS, MAX_SAMPLING, MAX_TARGETS, MAX_TIMEOUT, MIN_CACHE, TrafficFlow,
-    TrafficFlowStatus,
+    FlowTarget, FlowTransport, FlowVersion, MAX_CACHE, MAX_INTERFACES, MAX_PEM,
+    MAX_RETENTION_HOURS, MAX_RETENTION_RECORDS, MAX_SAMPLING, MAX_SERVER_NAME, MAX_TARGETS,
+    MAX_TIMEOUT, MIN_CACHE, TargetRecords, TrafficFlow, TrafficFlowStatus,
 };
 use corerouter_proto_flow::Record;
 use serde_json::{Value, json};
@@ -32,19 +32,19 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Traffic Flow Settings",
         ["IP", "Traffic Flow"],
         None,
-        "{enabled?: bool, interfaces?: [ifname], cache_entries?: int 1024..4194304, active_flow_timeout?: int 1..604800, inactive_flow_timeout?: int 1..604800, sampling_interval?: int 1..65535, nat_events?: bool, nat_events_destination?: bool, retention_hours?: int 0..72, retention_records?: int 0..5000000} → {enabled, interfaces, cache_entries, active_flow_timeout, inactive_flow_timeout, sampling_interval, nat_events, nat_events_destination, retention_hours, retention_records, warning?}",
+        "{enabled?: bool, interfaces?: [ifname], cache_entries?: int 1024..4194304, active_flow_timeout?: int 1..604800, inactive_flow_timeout?: int 1..604800, sampling_interval?: int 1..65535, flows?: bool, nat_events?: bool, nat_events_destination?: bool, nat_port_blocks?: bool, nat_limits?: bool, retention_hours?: int 0..72, retention_records?: int 0..5000000} → {enabled, interfaces, cache_entries, active_flow_timeout, inactive_flow_timeout, sampling_interval, flows, nat_events, nat_events_destination, nat_port_blocks, nat_limits, retention_hours, retention_records, warning?}",
         always,
         set
     ),
     cmd!(query "ip.traffic-flow.get", "Traffic Flow", [], None,
-        "{} → {enabled, interfaces, cache_entries, active_flow_timeout, inactive_flow_timeout, sampling_interval, nat_events, nat_events_destination, retention_hours, retention_records, targets, state: stopped|running|error, source, last_error, records_per_min}",
+        "{} → {enabled, interfaces, cache_entries, active_flow_timeout, inactive_flow_timeout, sampling_interval, flows, nat_events, nat_events_destination, nat_port_blocks, nat_limits, retention_hours, retention_records, targets, state: stopped|running|error, source, last_error, records_per_min}",
         always, get),
     cmd!(
         "ip.traffic-flow.target.add",
         "Add Traffic Flow Target",
         ["IP", "Traffic Flow"],
         None,
-        "{dst_address: ip, port?: int 1..65535, src_address?: ip, version?: 9|ipfix, transport?: udp|tcp, template_refresh?: int 0..1000000, template_timeout?: int 0..86400, disabled?: bool, comment?: string} → {id}",
+        "{dst_address: ip, port?: int 1..65535, src_address?: ip, version?: 9|ipfix, transport?: udp|tcp|sctp|tls, template_refresh?: int 0..1000000, template_timeout?: int 0..86400, content?: all|nat|flows, nat_events_legacy?: bool, certificate?: string, private_key?: string, ca_certificate?: string, server_name?: string, disabled?: bool, comment?: string} → {id}",
         always,
         target_add
     ),
@@ -53,7 +53,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Edit Traffic Flow Target",
         [],
         None,
-        "{id: string, dst_address?: ip, port?: int 1..65535, src_address?: ip|\"\", version?: 9|ipfix, transport?: udp|tcp, template_refresh?: int 0..1000000, template_timeout?: int 0..86400, disabled?: bool, comment?: string} → {id}",
+        "{id: string, dst_address?: ip, port?: int 1..65535, src_address?: ip|\"\", version?: 9|ipfix, transport?: udp|tcp|sctp|tls, template_refresh?: int 0..1000000, template_timeout?: int 0..86400, content?: all|nat|flows, nat_events_legacy?: bool, certificate?: string, private_key?: string, ca_certificate?: string, server_name?: string, disabled?: bool, comment?: string} → {id}",
         always,
         target_set
     ),
@@ -67,19 +67,19 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         target_remove
     ),
     cmd!(query "ip.traffic-flow.target.preview", "Traffic Flow Target Preview", [], None,
-        "{id?: string, dst_address?: ip, port?: int 1..65535, src_address?: ip|\"\", version?: 9|ipfix, transport?: udp|tcp, template_refresh?: int 0..1000000, template_timeout?: int 0..86400, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        "{id?: string, dst_address?: ip, port?: int 1..65535, src_address?: ip|\"\", version?: 9|ipfix, transport?: udp|tcp|sctp|tls, template_refresh?: int 0..1000000, template_timeout?: int 0..86400, content?: all|nat|flows, nat_events_legacy?: bool, certificate?: string, private_key?: string, ca_certificate?: string, server_name?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
         always, target_preview),
     cmd!(query "ip.traffic-flow.target.list", "Traffic Flow Targets", [], None,
-        "{} → [{id, dst_address, port, src_address, version, transport, template_refresh, template_timeout, disabled, comment, state: disabled|sending|connecting|error, records, messages, bytes, records_per_min, template_sends, last_template, queue, dropped, send_errors, last_error}]",
+        "{} → [{id, dst_address, port, src_address, version, transport, template_refresh, template_timeout, content, nat_events_legacy, certificate, private_key, ca_certificate, server_name, disabled, comment, state: disabled|sending|connecting|error, records, messages, bytes, records_per_min, template_sends, last_template, queue, dropped, send_errors, last_error}]",
         always, target_list),
     cmd!(query "ip.traffic-flow.stats", "Traffic Flow Statistics", [], None,
-        "{} → {state, source, last_error, events, kernel_overruns, queue, queue_size, queue_dropped, cache_used, cache_full, sampled_out, vanished, flows, nat_events, records_per_min, accounting, timestamps, kept, evicted, oldest_seq, newest_seq}",
+        "{} → {state, source, last_error, events, kernel_overruns, queue, queue_size, queue_dropped, cache_used, cache_full, sampled_out, vanished, flows, nat_events, nat_log, nat_log_dropped, records_per_min, accounting, timestamps, kept, evicted, oldest_seq, newest_seq}",
         always, stats),
     cmd!(query "ip.traffic-flow.top", "Traffic Flow Top Talkers", [], None,
         "{minutes?: int 1..60, by?: bytes|packets|flows, limit?: int 1..100} → [{address, bytes, packets, flows, up_bytes, down_bytes}]",
         always, top_talkers),
     cmd!(query "ip.traffic-flow.records", "Traffic Flow Records", [], None,
-        "{since?: int, limit?: int 1..10000, address?: ip, type?: flow|nat|port-block} → {records: [{seq, type}], next, oldest_seq, newest_seq}",
+        "{since?: int, limit?: int 1..10000, address?: ip, type?: flow|nat|port-block|nat-limit} → {records: [{seq, type}], next, oldest_seq, newest_seq}",
         always, records),
     cmd!(query "ip.traffic-flow.export", "Export Traffic Flow Records", [], None,
         "{minutes?: int 1..4320, address?: ip, limit?: int 1..100000} → {csv, rows, truncated}",
@@ -98,8 +98,11 @@ fn settings_json(c: &TrafficFlow) -> Value {
         "active_flow_timeout": c.active_flow_timeout,
         "inactive_flow_timeout": c.inactive_flow_timeout,
         "sampling_interval": c.sampling_interval,
+        "flows": c.flows,
         "nat_events": c.nat_events,
         "nat_events_destination": c.nat_events_destination,
+        "nat_port_blocks": c.nat_port_blocks,
+        "nat_limits": c.nat_limits,
         "retention_hours": c.retention_hours,
         "retention_records": c.retention_records,
     })
@@ -154,11 +157,16 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(v) = ranged(p, "sampling_interval", 1, MAX_SAMPLING, " (1: every connection)")? {
         c.sampling_interval = v;
     }
-    if let Some(v) = opt_bool(p, "nat_events")? {
-        c.nat_events = v;
-    }
-    if let Some(v) = opt_bool(p, "nat_events_destination")? {
-        c.nat_events_destination = v;
+    for (key, slot) in [
+        ("flows", &mut c.flows),
+        ("nat_events", &mut c.nat_events),
+        ("nat_events_destination", &mut c.nat_events_destination),
+        ("nat_port_blocks", &mut c.nat_port_blocks),
+        ("nat_limits", &mut c.nat_limits),
+    ] {
+        if let Some(v) = opt_bool(p, key)? {
+            *slot = v;
+        }
     }
     if let Some(v) = ranged(p, "retention_hours", 0, MAX_RETENTION_HOURS, " (0: keep nothing)")? {
         c.retention_hours = v;
@@ -173,6 +181,12 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if c.enabled && !c.targets.iter().any(|t| !t.disabled) {
         warnings.push("no enabled target: flows are only kept on the router (ip.traffic-flow.target.add)");
+    }
+    if c.enabled && !c.flows && !c.nat_events && !c.nat_port_blocks && !c.nat_limits {
+        warnings.push("flows and every NAT event are off: nothing is exported");
+    }
+    if c.nat_events_destination && !c.nat_events {
+        warnings.push("nat_events_destination has no effect while nat_events is off");
     }
     if c.sampling_interval > 1 && c.nat_events {
         warnings.push("sampling applies to flow records only: NAT events stay complete (the connection log)");
@@ -271,6 +285,31 @@ fn apply_target(s: &Session, t: &mut FlowTarget, p: &Value) -> Result<()> {
         }
         t.template_timeout = n;
     }
+    if let Some(r) = opt_parse::<TargetRecords>(p, "content")? {
+        t.content = r;
+    }
+    if let Some(v) = opt_bool(p, "nat_events_legacy")? {
+        t.nat_events_legacy = v;
+    }
+    if let Some(v) = pem(p, "certificate", &["CERTIFICATE"])? {
+        t.certificate = v;
+    }
+    if let Some(v) = pem(p, "private_key", &["PRIVATE KEY", "RSA PRIVATE KEY", "EC PRIVATE KEY"])? {
+        t.private_key = v;
+    }
+    if let Some(v) = pem(p, "ca_certificate", &["CERTIFICATE"])? {
+        t.ca_certificate = v;
+    }
+    if let Some(v) = opt_text(p, "server_name", MAX_SERVER_NAME)? {
+        let v = v.trim().to_ascii_lowercase();
+        let ok = v.split('.').all(|l| {
+            !l.is_empty() && l.len() <= 63 && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        });
+        if !v.is_empty() && !ok {
+            return Err(EngineError::bad("server_name", "a DNS name (collector.example.net), or empty for the address"));
+        }
+        t.server_name = v;
+    }
     if let Some(d) = opt_bool(p, "disabled")? {
         t.disabled = d;
     }
@@ -293,10 +332,20 @@ fn apply_target(s: &Session, t: &mut FlowTarget, p: &Value) -> Result<()> {
             format!("{src} and dst_address {d} are of different families"),
         ));
     }
-    if t.transport == FlowTransport::Tcp && t.version == FlowVersion::V9 {
+    if t.transport != FlowTransport::Udp && t.version == FlowVersion::V9 {
         return Err(EngineError::bad(
             "transport",
-            "NetFlow v9 is UDP only (RFC 3954 §2); use version=ipfix for TCP",
+            format!("NetFlow v9 is UDP only (RFC 3954 §2); use version=ipfix for {}", t.transport.as_str()),
+        ));
+    }
+    if t.certificate.is_empty() != t.private_key.is_empty() {
+        let missing = if t.certificate.is_empty() { "certificate" } else { "private_key" };
+        return Err(EngineError::bad(missing, "certificate and private_key go together"));
+    }
+    if t.transport == FlowTransport::Tls && t.certificate.is_empty() {
+        return Err(EngineError::bad(
+            "certificate",
+            "IPFIX over TLS authenticates both sides (RFC 7011 §11.3): give this router's certificate and private_key",
         ));
     }
     if t.transport == FlowTransport::Udp && t.template_refresh == 0 && t.template_timeout == 0 {
@@ -306,6 +355,30 @@ fn apply_target(s: &Session, t: &mut FlowTarget, p: &Value) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+/// A PEM text of one of `kinds` (`""` clears it).
+fn pem(p: &Value, key: &str, kinds: &[&str]) -> Result<Option<String>> {
+    let Some(v) = opt_str(p, key)? else {
+        return Ok(None);
+    };
+    let v = v.trim();
+    if v.is_empty() {
+        return Ok(Some(String::new()));
+    }
+    if v.len() > MAX_PEM {
+        return Err(EngineError::bad(key, format!("at most {MAX_PEM} bytes")));
+    }
+    let ok = kinds
+        .iter()
+        .any(|k| v.contains(&format!("-----BEGIN {k}-----")) && v.contains(&format!("-----END {k}-----")));
+    if !ok || v.chars().any(|c| c.is_control() && c != '\n' && c != '\r') {
+        return Err(EngineError::bad(
+            key,
+            format!("must be PEM text (-----BEGIN {}-----)", kinds.first().copied().unwrap_or("")),
+        ));
+    }
+    Ok(Some(format!("{v}\n")))
 }
 
 /// The modal's numbers come as text: as numbers for the commands.
@@ -364,11 +437,11 @@ fn target_preview(s: &mut Session, p: &Value) -> Result<Value> {
                 let from = t.src_address.map_or_else(|| "the route's address".to_owned(), |a| a.to_string());
                 computed.push(json!({"label": "Sends", "value": format!("{version} over {transport} to {}:{} from {from}", t.dst_address, t.port)}));
                 let templates = match t.transport {
-                    FlowTransport::Tcp => "once per connection (and on every reconnect)".to_owned(),
                     FlowTransport::Udp => format!(
                         "every {} packets and every {} s",
                         t.template_refresh, t.template_timeout
                     ),
+                    _ => "once per connection (and on every reconnect)".to_owned(),
                 };
                 computed.push(json!({"label": "Templates", "value": templates}));
                 checks.push(check("ok", "valid", "ready to send".into(), None));
@@ -376,8 +449,26 @@ fn target_preview(s: &mut Session, p: &Value) -> Result<Value> {
                 if !tf.enabled {
                     checks.push(check("warning", "off", "traffic flow is off: nothing is sent until it is enabled (General)".into(), None));
                 }
+                computed.push(json!({"label": "Records", "value": match t.content {
+                    TargetRecords::All => "flows and NAT events",
+                    TargetRecords::Nat => "NAT events only",
+                    TargetRecords::Flows => "flows only",
+                }}));
                 if t.transport == FlowTransport::Udp {
-                    checks.push(check("info", "udp", "over UDP a collector that is down loses what is sent; TCP queues it".into(), Some("transport")));
+                    checks.push(check("info", "udp", "over UDP a collector that is down loses what is sent; TCP, SCTP and TLS queue it".into(), Some("transport")));
+                }
+                if t.transport == FlowTransport::Tls {
+                    let name = if t.server_name.is_empty() { t.dst_address.to_string() } else { t.server_name.clone() };
+                    computed.push(json!({"label": "TLS", "value": format!("the collector's certificate must name {name}; this router shows its own (mutual, RFC 7011 §11.3)")}));
+                    if t.port == corerouter_model::traffic_flow::DEFAULT_PORT || t.port == 4739 {
+                        checks.push(check("info", "port", "IPFIX over TLS listens on 4740 (RFC 7011 §11.2)".into(), Some("port")));
+                    }
+                }
+                if t.content.wants_nat() && t.transport != FlowTransport::Tls {
+                    checks.push(check("info", "plain", "NAT logs say who used which address: RFC 8158 §7 asks for them encrypted (transport=tls)".into(), Some("transport")));
+                }
+                if t.nat_events_legacy {
+                    checks.push(check("info", "legacy", "NAT44 sessions go out as natEvent 1/2 (Historic); blocks and limits keep their RFC 8158 values".into(), Some("nat_events_legacy")));
                 }
                 if t.version == FlowVersion::Ipfix && t.port == corerouter_model::traffic_flow::DEFAULT_PORT {
                     checks.push(check("info", "port", "2055 is the NetFlow port most collectors use; IPFIX's own is 4739".into(), Some("port")));
@@ -475,6 +566,12 @@ fn target_list(s: &mut Session, _: &Value) -> Result<Value> {
                     "transport": t.transport.as_str(),
                     "template_refresh": t.template_refresh,
                     "template_timeout": t.template_timeout,
+                    "content": t.content.as_str(),
+                    "nat_events_legacy": t.nat_events_legacy,
+                    "certificate": t.certificate,
+                    "private_key": if t.private_key.is_empty() { "" } else { "***" },
+                    "ca_certificate": t.ca_certificate,
+                    "server_name": t.server_name,
                     "disabled": t.disabled,
                     "comment": t.comment,
                     "state": "disabled",
@@ -540,6 +637,7 @@ fn kind_of(r: &Record) -> &'static str {
         Record::Flow(_) => "flow",
         Record::Nat(_) => "nat",
         Record::PortBlock(_) => "port-block",
+        Record::NatLimit(_) => "nat-limit",
     }
 }
 
@@ -550,6 +648,7 @@ fn touches(r: &Record, a: IpAddr) -> bool {
             .iter()
             .any(|x| IpAddr::V4(*x) == a),
         Record::PortBlock(b) => IpAddr::V4(b.src) == a || IpAddr::V4(b.post_src) == a,
+        Record::NatLimit(l) => IpAddr::V4(l.src) == a,
     }
 }
 
@@ -561,8 +660,8 @@ fn records(s: &mut Session, p: &Value) -> Result<Value> {
     let address = opt_parse::<IpAddr>(p, "address")?;
     let kind = match opt_str(p, "type")? {
         None => None,
-        Some(k @ ("flow" | "nat" | "port-block")) => Some(k),
-        Some(_) => return Err(EngineError::bad("type", "must be flow, nat or port-block")),
+        Some(k @ ("flow" | "nat" | "port-block" | "nat-limit")) => Some(k),
+        Some(_) => return Err(EngineError::bad("type", "must be flow, nat, port-block or nat-limit")),
     };
     let Some(store) = s.ext::<FlowStore>() else {
         return Ok(json!({"records": [], "next": since, "oldest_seq": null, "newest_seq": null}));
@@ -594,7 +693,16 @@ fn time(ms: u64) -> String {
     format!("{}.{:03}", crate::safe_mode::utc(ms / 1000).trim_end_matches(" UTC"), ms % 1000)
 }
 
-const CSV_HEADER: &str = "seq,type,time_utc,start_utc,end_utc,event,protocol,src,src_port,dst,dst_port,post_src,post_src_port,post_dst,post_dst_port,octets,packets,ingress,egress,end_reason,direction";
+const CSV_HEADER: &str = "seq,type,time_utc,start_utc,end_utc,event,protocol,src,src_port,dst,dst_port,post_src,post_src_port,post_dst,post_dst_port,octets,packets,ingress,egress,end_reason,direction,user,vlan,pool,limit";
+
+/// A CSV field: quoted when it holds a comma, a quote or a line break.
+fn csv_text(v: &str) -> String {
+    if v.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", v.replace('"', "\"\""))
+    } else {
+        v.to_owned()
+    }
+}
 
 fn csv_row(out: &mut String, st: &Stored) {
     let r = &st.record;
@@ -602,7 +710,7 @@ fn csv_row(out: &mut String, st: &Stored) {
     let _ = match r {
         Record::Flow(f) => writeln!(
             out,
-            "{},flow,{t},{},{},,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{}",
+            "{},flow,{t},{},{},,{},{},{},{},{},{},{},{},{},{},{},{},{},{},{},,,,",
             st.seq,
             time(f.start_ms),
             time(f.end_ms),
@@ -627,7 +735,7 @@ fn csv_row(out: &mut String, st: &Stored) {
         ),
         Record::Nat(n) => writeln!(
             out,
-            "{},nat,{t},{},,{},{},{},{},{},{},{},{},{},{},,,,,,",
+            "{},nat,{t},{},,{},{},{},{},{},{},{},{},{},{},,,,,,,,,,",
             st.seq,
             if n.start_ms > 0 { time(n.start_ms) } else { String::new() },
             n.event.code(),
@@ -643,13 +751,26 @@ fn csv_row(out: &mut String, st: &Stored) {
         ),
         Record::PortBlock(b) => writeln!(
             out,
-            "{},port-block,{t},,,{},,{},,,,{},{}-{},,,,,,,,",
+            "{},port-block,{t},,,{},,{},,,,{},{}-{},,,,,,,,,{},{},{},",
             st.seq,
             b.event.code(),
             b.src,
             b.post_src,
             b.port_start,
             b.port_end,
+            csv_text(&b.user),
+            b.vlan,
+            b.pool,
+        ),
+        Record::NatLimit(l) => writeln!(
+            out,
+            "{},nat-limit,{t},,,{},,{},,,,,,,,,,,,{},,,,{},{}",
+            st.seq,
+            l.event.code(),
+            if l.src.is_unspecified() { String::new() } else { l.src.to_string() },
+            l.kind,
+            l.pool,
+            l.limit,
         ),
     };
 }
@@ -753,6 +874,44 @@ mod tests {
         let p = ok(&mut s, "ip.traffic-flow.target.preview", json!({"id": id, "port": "2055"}));
         assert_eq!(p["commands"][0]["command"], "ip.traffic-flow.target.set");
         assert_eq!(p["checks"][0]["level"], "ok");
+    }
+
+    const CERT: &str = "-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----";
+    const KEY: &str = "-----BEGIN PRIVATE KEY-----\nAA\n-----END PRIVATE KEY-----";
+
+    /// G4.4j: SCTP, TLS with both certificates, a NAT-only target with the
+    /// legacy natEvent codes.
+    #[test]
+    fn sctp_and_tls_targets_and_what_each_receives() {
+        let mut s = session();
+        let a = ok(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.20", "port": 4739, "transport": "sctp", "content": "nat", "nat_events_legacy": true}));
+        let sctp = a["id"].as_str().unwrap().to_owned();
+        assert!(err(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "transport": "tls"})).contains("RFC 7011 §11.3"));
+        assert!(err(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "transport": "dtls"})).contains("DTLS is not supported"));
+        assert!(err(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "transport": "sctp", "version": 9})).contains("UDP only"));
+        assert!(err(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "transport": "tls", "certificate": CERT})).contains("go together"));
+        assert!(err(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "certificate": "hello"})).contains("PEM"));
+        assert!(err(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "server_name": "bad name!"})).contains("DNS name"));
+        assert!(err(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "content": "some"})).contains("all, nat or flows"));
+        let t = ok(&mut s, "ip.traffic-flow.target.add", json!({"dst_address": "192.0.2.21", "port": 4740, "transport": "tls", "certificate": CERT, "private_key": KEY, "ca_certificate": CERT, "server_name": "Collector.Example.net"}));
+        let list = ok(&mut s, "ip.traffic-flow.target.list", json!({}));
+        assert_eq!(list[0]["transport"], "sctp");
+        assert_eq!(list[0]["content"], "nat");
+        assert_eq!(list[0]["nat_events_legacy"], true);
+        assert_eq!(list[1]["transport"], "tls");
+        assert_eq!(list[1]["private_key"], "***", "the key never comes back");
+        assert_eq!(list[1]["server_name"], "collector.example.net");
+        let p = ok(&mut s, "ip.traffic-flow.target.preview", json!({"id": t["id"]}));
+        assert!(p["computed"].as_array().unwrap().iter().any(|c| c["label"] == "TLS"), "{p}");
+        let p = ok(&mut s, "ip.traffic-flow.target.preview", json!({"id": sctp}));
+        assert!(p["checks"].as_array().unwrap().iter().any(|c| c["check"] == "plain"), "{p}");
+        assert!(p["checks"].as_array().unwrap().iter().any(|c| c["check"] == "legacy"), "{p}");
+        // The NAT switches.
+        let out = ok(&mut s, "ip.traffic-flow.set", json!({"enabled": true, "flows": false, "nat_events": false, "nat_port_blocks": false, "nat_limits": false}));
+        assert!(out["warning"].as_str().unwrap().contains("nothing is exported"));
+        let g = ok(&mut s, "ip.traffic-flow.get", json!({}));
+        assert_eq!((g["flows"].as_bool(), g["nat_port_blocks"].as_bool()), (Some(false), Some(false)));
+        assert!(!TrafficFlow::default().nat_events, "RouterOS nat-events=no");
     }
 
     #[test]

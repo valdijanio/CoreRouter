@@ -253,7 +253,7 @@ fn conntrack_flows_with_nat_reach_both_collectors() {
         json!({"dst_address": "127.0.0.1", "port": 4739, "version": "ipfix", "transport": "tcp"}),
     )
     .unwrap();
-    run("ip.traffic-flow.set", json!({"enabled": true})).unwrap();
+    run("ip.traffic-flow.set", json!({"enabled": true, "nat_events": true})).unwrap();
     wait("the exporter", 15, || {
         run("ip.traffic-flow.get", json!({})).unwrap()["state"] == "running"
     });
@@ -384,7 +384,7 @@ fn conntrack_flows_with_nat_reach_both_collectors() {
     let burst = |r: &Record| match r {
         Record::Flow(f) => (7000..7010).contains(&f.src_port) && f.protocol == 17,
         Record::Nat(x) => (7000..7010).contains(&x.src_port),
-        Record::PortBlock(_) => false,
+        Record::PortBlock(_) | Record::NatLimit(_) => false,
     };
     let is_create = |r: &Record| matches!(r, Record::Nat(x) if (7000..7010).contains(&x.src_port) && x.event == NatEventType::Nat44SessionCreate);
     let is_delete = |r: &Record| matches!(r, Record::Nat(x) if (7000..7010).contains(&x.src_port) && x.event == NatEventType::Nat44SessionDelete && x.start_ms > 0);
