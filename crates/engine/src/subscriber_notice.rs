@@ -78,6 +78,10 @@ pub struct NoticeRuntime {
     /// Logins whose session address the tick put in a list: login →
     /// (list, address).
     logins: HashMap<String, (Name, std::net::Ipv4Addr)>,
+    /// Notices waiting to be seen: (profile, address) → when they end.
+    pending: HashMap<(Name, IpAddr), u64>,
+    /// The config revision and dynamic lists the members were compared at.
+    stamp: Option<(u32, (usize, u32))>,
     /// Events dropped because the daemon did not take them in time.
     pub events_dropped: u64,
 }
@@ -187,6 +191,7 @@ impl Session {
         let login = self.notice_var(ip, "login").unwrap_or_default();
         let rt = self.notice_mut()?;
         rt.seen.insert((p.name.clone(), ip), now);
+        rt.pending.remove(&(p.name.clone(), ip));
         if rt.log.len() >= MAX_LOG {
             rt.log.pop_front();
         }
@@ -257,6 +262,25 @@ impl Session {
         rt.events.drain(..n).collect()
     }
 
+    /// The (profile, address) of every single-address member: what the
+    /// round compares (no strings built per member).
+    fn notice_member_keys(&self) -> HashSet<(Name, IpAddr)> {
+        let cfg = self.store().running();
+        let by_list: HashMap<&Name, &Name> = cfg.ip.subscriber_notice.active().map(|p| (&p.address_list, &p.name)).collect();
+        let mut out = HashSet::new();
+        if by_list.is_empty() {
+            return out;
+        }
+        let statics = cfg.ip.firewall.address_lists.iter().filter(|e| !e.disabled).map(|e| (&e.list, &e.address));
+        let dynamics = self.dynamic_addresses.entries().iter().map(|e| (&e.list, &e.address));
+        for (list, addr) in statics.chain(dynamics) {
+            if let (Some(p), Some(ip)) = (by_list.get(list), single(addr)) {
+                out.insert(((*p).clone(), ip));
+            }
+        }
+        out
+    }
+
     /// One round (the daemon's notice service, every few seconds):
     /// - the sessions of the logins sent to a profile join its list;
     /// - members new to a list get a "since" and a webhook event, members
@@ -264,38 +288,24 @@ impl Session {
     /// - a notice not seen within the profile's timeout ends by itself;
     /// - a block member's open connections are ended once.
     ///
-    /// O(members): one pass over the lists (**medido** in G4.10b).
+    /// The members are compared only when the config or the dynamic lists
+    /// changed (100 000 members: ~50 ms a round before, under the session
+    /// lock; now nothing when nothing changed, **medido** in
+    /// `benches/notice.rs`); the timeouts walk only the notices waiting.
     pub fn notice_tick(&mut self) {
         self.notice_logins();
         let now = self.now().unwrap_or(0);
+        let stamp = (self.store().current_revision(), self.dynamic_addresses.stamp());
+        let _ = self.notice_mut();
+        let changed = self.notice().is_none_or(|r| r.stamp != Some(stamp));
         let cfg = self.store().running().clone();
         let sn = &cfg.ip.subscriber_notice;
-        let members = self.notice_members();
-        let mut here: HashSet<(Name, IpAddr)> = HashSet::with_capacity(members.len());
-        let mut new: Vec<(Profile, IpAddr)> = Vec::new();
-        let mut ran_out: Vec<(Profile, IpAddr)> = Vec::new();
-        let _ = self.notice_mut();
-        {
-            let Some(rt) = self.ext::<NoticeRuntime>() else { return };
-            for m in &members {
-                let Some(ip) = single(&m.address) else { continue };
-                let Some(p) = sn.profile(&m.profile) else { continue };
-                let key = (p.name.clone(), ip);
-                match rt.since.get(&key) {
-                    None => new.push((p.clone(), ip)),
-                    Some(at) => {
-                        let seen = rt.seen.get(&key).is_some_and(|s| *s >= *at);
-                        if p.mode != Mode::Block
-                            && p.timeout_secs > 0
-                            && !seen
-                            && now.saturating_sub(*at) >= p.timeout_secs
-                        {
-                            ran_out.push((p.clone(), ip));
-                        }
-                    }
-                }
-                here.insert(key);
-            }
+        let (mut new, mut gone) = (Vec::new(), Vec::new());
+        if changed {
+            let here = self.notice_member_keys();
+            let Some(rt) = self.notice() else { return };
+            new = here.iter().filter(|k| !rt.since.contains_key(*k)).cloned().collect();
+            gone = rt.since.keys().filter(|k| !here.contains(*k)).cloned().collect();
         }
         let logins: HashMap<std::net::Ipv4Addr, String> = self
             .notice()
@@ -306,30 +316,39 @@ impl Session {
             IpAddr::V6(_) => String::new(),
         };
         let mut kill: Vec<IpAddr> = Vec::new();
-        if let Some(rt) = self.notice_mut() {
-            let gone: Vec<(Name, IpAddr)> = rt.since.keys().filter(|k| !here.contains(*k)).cloned().collect();
-            for k in gone {
-                rt.since.remove(&k);
-                rt.seen.remove(&k);
-                let mode = sn.profile(k.0.as_str()).map(|p| p.mode.as_str()).unwrap_or("block");
-                push_event(rt, Event { at: now, event: "left", address: k.1, profile: k.0.to_string(), mode, login: login_of(&k.1) });
+        let mut ran_out: Vec<(Profile, IpAddr)> = Vec::new();
+        let Some(rt) = self.notice_mut() else { return };
+        rt.stamp = Some(stamp);
+        for k in gone {
+            rt.since.remove(&k);
+            rt.seen.remove(&k);
+            rt.pending.remove(&k);
+            let mode = sn.profile(k.0.as_str()).map(|p| p.mode.as_str()).unwrap_or("block");
+            push_event(rt, Event { at: now, event: "left", address: k.1, profile: k.0.to_string(), mode, login: login_of(&k.1) });
+        }
+        for k in new {
+            let Some(p) = sn.profile(k.0.as_str()) else { continue };
+            rt.since.insert(k.clone(), now);
+            if p.mode != Mode::Block && p.timeout_secs > 0 {
+                rt.pending.insert(k.clone(), now.saturating_add(p.timeout_secs));
             }
-            for (p, ip) in &new {
-                rt.since.insert((p.name.clone(), *ip), now);
-                if p.webhook {
-                    push_event(rt, Event { at: now, event: "entered", address: *ip, profile: p.name.to_string(), mode: p.mode.as_str(), login: login_of(ip) });
-                }
-                if p.mode == Mode::Block && p.kill_connections {
-                    kill.push(*ip);
-                }
+            if p.webhook {
+                push_event(rt, Event { at: now, event: "entered", address: k.1, profile: p.name.to_string(), mode: p.mode.as_str(), login: login_of(&k.1) });
             }
-            for (p, ip) in &ran_out {
-                rt.seen.insert((p.name.clone(), *ip), now);
-                if rt.log.len() >= MAX_LOG {
-                    rt.log.pop_front();
-                }
-                rt.log.push_back(View { at: now, address: *ip, profile: p.name.to_string(), via: "timeout".into(), login: login_of(ip), user_agent: String::new() });
+            if p.mode == Mode::Block && p.kill_connections {
+                kill.push(k.1);
             }
+        }
+        let due: Vec<(Name, IpAddr)> = rt.pending.iter().filter(|(_, at)| now >= **at).map(|(k, _)| k.clone()).collect();
+        for k in due {
+            rt.pending.remove(&k);
+            let Some(p) = sn.profile(k.0.as_str()) else { continue };
+            rt.seen.insert(k.clone(), now);
+            if rt.log.len() >= MAX_LOG {
+                rt.log.pop_front();
+            }
+            rt.log.push_back(View { at: now, address: k.1, profile: p.name.to_string(), via: "timeout".into(), login: login_of(&k.1), user_agent: String::new() });
+            ran_out.push((p.clone(), k.1));
         }
         for (p, ip) in ran_out {
             self.notice_pass(&p, ip);
@@ -422,4 +441,49 @@ fn push_event(rt: &mut NoticeRuntime, e: Event) {
         rt.events_dropped = rt.events_dropped.saturating_add(1);
     }
     rt.events.push_back(e);
+}
+
+/// The throttle profiles' queues: one dynamic queue per member (an address
+/// or a prefix) at the profile's rate, in the queue maps of G4.9. Origin
+/// `notice` sorts first, so it holds the address over the subscriber's own
+/// DHCP queue while it is in the list, and lets go when it leaves.
+pub fn throttle_queues(s: &Session) -> Vec<crate::queue::Queue> {
+    use crate::queue::{Origin, Queue};
+    use corerouter_model::queue::DEFAULT_DYNAMIC_TYPE;
+    let cfg = s.store().running();
+    let sn = &cfg.ip.subscriber_notice;
+    if !sn.active().any(|p| p.mode == Mode::Throttle) {
+        return Vec::new();
+    }
+    // One queue per profile, copied per member: resolving the rate and the
+    // type for each of 100 000 members was ~97 ms a second (**medido**).
+    let by_list: HashMap<&Name, Queue> = sn
+        .active()
+        .filter(|p| p.mode == Mode::Throttle)
+        .filter_map(|p| {
+            let q = Queue::dynamic(
+                String::new(),
+                format!("notice<{}>", p.name),
+                Origin::Notice,
+                Vec::new(),
+                &p.rate_limit,
+                &cfg.queue,
+                DEFAULT_DYNAMIC_TYPE,
+                corerouter_model::queue::DownloadMode::Shaper,
+            )?;
+            Some((&p.address_list, q))
+        })
+        .collect();
+    let statics = cfg.ip.firewall.address_lists.iter().filter(|e| !e.disabled).map(|e| (&e.list, &e.address));
+    let dynamics = s.dynamic_addresses.entries().iter().map(|e| (&e.list, &e.address));
+    statics
+        .chain(dynamics)
+        .filter_map(|(list, addr)| {
+            let AddrMatch::Net(net) = addr else { return None };
+            let mut q = by_list.get(list)?.clone();
+            q.key = format!("notice:{net}");
+            q.targets = vec![corerouter_model::queue::Target::Prefix(*net)];
+            Some(q)
+        })
+        .collect()
 }

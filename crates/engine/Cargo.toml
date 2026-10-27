@@ -81,6 +81,10 @@ name = "cgnat_who_was"
 harness = false
 
 [[bench]]
+name = "notice"
+harness = false
+
+[[bench]]
 name = "queue_live"
 harness = false
 

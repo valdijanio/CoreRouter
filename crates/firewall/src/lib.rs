@@ -13,6 +13,7 @@
 //!   [`program::Table`]: the nftables objects as data, which `hal-linux`
 //!   sends over nfnetlink and the GUI prints.
 //! - [`fastpath`]: the flowtable as table `inet corerouter_fastpath` (G2.4).
+//! - [`notice`]: the subscriber notices' chains (G4.10), in `inet corerouter`.
 //!
 //! It sits in L1 instead of L2 (`proto-*`) because `hal-linux` (L1) must
 //! render too and may not depend upward; it compiles everywhere (wasm too).
@@ -23,6 +24,7 @@ pub mod eval;
 pub mod fastpath;
 pub mod graph;
 pub mod nft;
+pub mod notice;
 pub mod program;
 pub mod sample;
 pub mod shadow;

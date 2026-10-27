@@ -11,6 +11,7 @@
 //! | list `x` filled by `add-*-to-address-list` | also `ad4_x`/`ad6_x` (`dynamic, timeout`, at most 65 536) |
 //! | interface list `x` | set `il_x` of `ifname` |
 //! | rule `*N` | rule(s) with `comment "cr:*N"`, always with a `counter` |
+//! | subscriber-notice profiles (G4.10) | chains `notice_dstnat` / `notice_forward` ([`crate::notice`]) |
 //!
 //! The kernel cannot add to an interval set from the packet path, so a list
 //! that a rule fills gets a second, plain set (`ad*`); a rule matching that
@@ -520,7 +521,7 @@ fn elements(items: &[String]) -> String {
 /// then the table should not exist.
 pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
     let fw = &cfg.ip.firewall;
-    if fw.is_empty() && dynamic.iter().all(|d| d.added_by_rule) {
+    if fw.is_empty() && dynamic.iter().all(|d| d.added_by_rule) && !crate::notice::on(cfg) {
         return None;
     }
     let mut out = String::new();
@@ -539,7 +540,10 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
     let none_s: Vec<&AddressListEntry> = Vec::new();
     let none_d: Vec<&DynamicAddress> = Vec::new();
 
-    for list in address_lists(cfg, dynamic) {
+    let notice_lists = crate::notice::lists(cfg);
+    let mut lists = address_lists(cfg, dynamic);
+    lists.extend(notice_lists.iter());
+    for list in lists {
         let list_statics = statics.get(list).unwrap_or(&none_s);
         let list_dynamic = dynamics.get(list).unwrap_or(&none_d);
         for (fam, name, ty) in [
@@ -651,16 +655,19 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
             let _ = writeln!(out, "\t}}");
         }
     }
+    crate::notice::render(cfg, &mut out);
     let _ = writeln!(out, "}}");
     Some(out)
 }
 
 /// Whether going from `from` to `to` changes the ruleset. `render` reads
-/// only the firewall and the interface lists, so a commit that touches
+/// only the firewall, the interface lists and the subscriber notices, so a commit that touches
 /// neither does not render at all (both configs were rendered on every
 /// commit, ~1 ms per 1000 rules).
 pub fn changed(from: &Config, to: &Config) -> bool {
-    (from.ip.firewall != to.ip.firewall || from.interface_lists != to.interface_lists)
+    (from.ip.firewall != to.ip.firewall
+        || from.interface_lists != to.interface_lists
+        || from.ip.subscriber_notice != to.ip.subscriber_notice)
         && render(from, &[]) != render(to, &[])
 }
 
