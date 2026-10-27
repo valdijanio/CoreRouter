@@ -5203,3 +5203,51 @@ continuação indentadas).
   | uma entrada dinâmica entrar e sair | 31 ms |
 
   O roteiro manual com celular está em `plan/hw-lab.sh notice` (só imprime) e no doc.
+
+- 2026-10-27 — G4.3hd: IPoE (G4.3f) no par de BNGs em hot standby (`docs/bng-ha.md` §2.12).
+
+  O que entrou:
+  - **Publicar.** O ativo publica cada sessão IPoE com a concessão DHCP dela (`SessionRecord` de
+    `Kind::Ipoe`). Os TLVs novos `LEASE*` levam o fim, a duração, a opção 61, a opção 82, `hw` e o
+    nome. O registro vai na subida e a cada renovação, e os contadores a cada 10 s.
+  - **Calar o standby.** O DHCP do standby fica mudo nas portas dos servidores com sessões
+    (`IpoeBackend::answering`, no engine). As portas IPoE do standby ganham `arp_ignore=8`
+    (`hal-linux::ha_io::arp_quiet`): os dois nós têm o endereço do gateway.
+  - **Tomar.** O nó que assume adota as sessões antes de responder. Elas ficam com o mesmo
+    Acct-Session-Id, o Class, a taxa e as rotas, a entrada no XDP e um Interim com os contadores,
+    sem Start. As concessões entram no servidor DHCP: `proto-dhcp` `Server::adopt`, aditivo, com
+    journal. As concessões que só o nó tinha terminam. Um ARP ping a cada assinante, do endereço do
+    gateway, aponta o ARP do CPE para o nó novo (RFC 826).
+  - **Entregar.** Quem perde o papel encerra sem Stop (no modo stateless, com Stop).
+
+  Achados no caminho:
+  - `arp_reply` do IPoE procurava a sessão varrendo todas: O(n) por resposta, e a tomada pinga
+    todos. Agora vai pelo endereço.
+  - O CoA do IPoE por endereço ou Acct-Session-Id vai pelos índices, como o do PPPoE (G4.3hb).
+  - Os workers do PPPoE ignoram os registros IPoE da tomada (antes contariam como "não couberam").
+
+  Testes:
+  - `proto-ha`: o registro IPoE com a concessão e um client id de 255 B, e o limite.
+  - `ipoe_bng_tests::the_standby_is_silent_and_adopts_the_ipoe_sessions_with_their_leases`:
+    - o standby não dá concessão nem pergunta ao RADIUS;
+    - a adoção (uma vez só) faz as duas sessões, as concessões no DHCP e um ping a cada uma;
+    - 700 s depois, as mesmas sessões, nenhum Start nem Stop, um Interim de cada com o mesmo id e o
+      Class;
+    - o nó antigo encerra sem Stop.
+  - Laboratório `env BNG_LAB_HA_IPOE=1 cargo xtask bng-lab --only ha` (novo modo, uma porta, lease
+    de 2 min), com a coluna nova "Todas no nó novo". As variáveis `BNG_LAB_HA_START_RATE`,
+    `BNG_LAB_HA_OUTSTANDING` e `BNG_LAB_HA_ARP_S` ajustam o BNG Blaster.
+
+  **Medido**:
+  - Release, `cargo bench -p corerouter-daemon --bench ipoe_bng -- ipoe_ha`, Ryzen AI Max+ 395,
+    2026-10-27:
+    - adoção de 10 mil em 29,7 ms (3,0 µs/sessão) e de 100 mil em 623 ms (6,2 µs);
+    - concessões no DHCP: 2,6 ms e 74 ms;
+    - registro de 123 B.
+  - O lock do núcleo IPoE vai em lotes de 1024 (≈ 8 ms). A primeira versão o segurava 774 ms com
+    100 mil. Reservar as tabelas antes deu −8 %.
+  - Laboratório na VM `corerouter-lab` (release, sem root, 2026-10-27), A perde a energia:
+    - 1 000 sessões IPoE: tomada em 1,03 s, todas no nó novo em 1,14 s, 0 perdidas, 1 000 Starts,
+      0 Stops, 1 000 com Interim do novo, todas renovaram no novo;
+    - 3 000: 1,23 s e 1,35 s, 0 perdidas, 3 000 Interims;
+    - o CoA mandado ao nó antigo, que voltou como espera, chega às sessões IPoE em C (1000/1000).
