@@ -97,6 +97,24 @@ pub const TOOLS: &[Tool] = &[
         },
         why: "frr-reload.py, the baseline hal-frr is measured against (G3.1)",
     },
+    // G3.2c: bgpd's RPKI module (`bgpd -M rpki`), with rtrlib from Ubuntu's
+    // archive. Hash from the same `Packages` (its SHA-256 matches the
+    // signed `InRelease`).
+    Tool {
+        package: "librtr0t64",
+        version: "",
+        source: Source::Apt,
+        why: "rtrlib, the RPKI-to-Router client bgpd's rpki module links against (G3.2c)",
+    },
+    Tool {
+        package: "frr-rpki-rtrlib",
+        version: "10.7.1",
+        source: Source::Deb {
+            url: "https://deb.frrouting.org/frr/pool/frr-stable/f/frr/frr-rpki-rtrlib_10.7.1-0~ubuntu24.04.1_amd64.deb",
+            sha256: "126a1cda9bed1a6f6a7dfca5826dc20ad809326bb372364d7482d9b1ed7cc568",
+        },
+        why: "bgpd_rpki: origin validation in FRR (G3.2c)",
+    },
 ];
 
 impl Tool {
@@ -222,7 +240,7 @@ mod tests {
             .iter()
             .map(|(t, _)| t.package)
             .collect();
-        assert_eq!(names, ["pppoe", "iperf3", "frr-pythontools"]);
+        assert_eq!(names, ["pppoe", "iperf3", "frr-pythontools", "librtr0t64", "frr-rpki-rtrlib"]);
         let old = missing(TOOLS, "bngblaster installed 0.9.30\n");
         let (t, have) = old.first().unwrap();
         assert_eq!((t.package, have.as_deref()), ("bngblaster", Some("0.9.30")));
