@@ -73,6 +73,19 @@ pub trait IpoeBackend: Send + Sync {
     fn arp_reply(&self, interface: &IfName, ip: Ipv4Addr, mac: [u8; 6]) {
         let _ = (interface, ip, mac);
     }
+    /// G4.3hd: the DHCP server answers on the session servers' ports only
+    /// while this is true (the standby of a redundant BNG pair is silent:
+    /// the active one holds the clients).
+    fn answering(&self) -> bool {
+        true
+    }
+    /// G4.3hd: bindings a takeover hands over (taken once): the servers
+    /// they belong to and the leases ([`Server::adopt`]).
+    ///
+    /// [`Server::adopt`]: corerouter_proto_dhcp::server::Server::adopt
+    fn takeover(&self) -> Option<(Vec<String>, Vec<Lease>)> {
+        None
+    }
 }
 
 /// What the IPoE decisions look up per lease, followed once per config

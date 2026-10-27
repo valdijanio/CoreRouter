@@ -1803,6 +1803,38 @@ impl Server {
         out
     }
 
+    /// G4.3hd: the bindings of server `servers`' clients as the other BNG
+    /// of a redundant pair had them, at its takeover: each one in (journal
+    /// included); this node's own bound leases of those servers that the
+    /// pair does not know end (they are older than the pair's table).
+    /// RFC 2131 §4.3.2: the renewal of an adopted client then finds its
+    /// binding, as on the node that granted it.
+    pub fn adopt(&mut self, servers: &[String], leases: Vec<Lease>) -> Vec<Effect> {
+        let keep: std::collections::HashSet<Ipv4Addr> = leases.iter().map(|l| l.address).collect();
+        let stale: Vec<Ipv4Addr> = self
+            .leases
+            .iter()
+            .filter(|l| {
+                l.state == State::Bound && servers.contains(&l.server) && !keep.contains(&l.address)
+            })
+            .map(|l| l.address)
+            .collect();
+        let mut out = Vec::new();
+        for ip in stale {
+            out.extend(self.forget(ip));
+        }
+        for mut l in leases {
+            if !servers.contains(&l.server) {
+                continue;
+            }
+            l.state = State::Bound;
+            out.push(Effect::Journal(Record::Lease(l.clone())));
+            self.leases.put(l);
+        }
+        self.generation += 1;
+        out
+    }
+
     /// `ip.dhcp-server.lease.check-status` (RouterOS): probe a conflicted
     /// or declined address again; free it if nobody answers.
     pub fn check_status(&mut self, ip: Ipv4Addr, now: Now) -> Result<Vec<Effect>, String> {

@@ -62,6 +62,10 @@ const NAS_PORT_ETHERNET: &str = "15";
 const NO_V6: &str = "o IPoE ainda não tem IPv6 (G4.3s)";
 
 /// RFC 2866 §5.10 Acct-Terminate-Cause.
+// The bench includes this file by path: its submodule says where it is.
+#[path = "ipoe_bng/ha.rs"]
+pub(crate) mod ha;
+
 mod cause {
     pub const USER_REQUEST: u32 = 1;
     pub const LOST_CARRIER: u32 = 2;
@@ -132,6 +136,9 @@ struct Sub {
     routes: Vec<(FramedRoute, RouteOrigin)>,
     /// G4.9b: the download queue (its profile's), `None`: policed in XDP.
     shape: Option<corerouter_hal::queue::Kind>,
+    /// G4.3hd: the DHCP binding as last bound or renewed (the pair's
+    /// record carries it).
+    lease: Option<Lease>,
 }
 
 /// An XDP map change, for the thread (it knows the ports' index and MAC).
@@ -216,6 +223,11 @@ struct State {
     forbidden: Arc<Forbidden>,
     kroutes: Vec<KernelRoute>,
     logs: Vec<(bool, String)>,
+    /// Sessions by address (an ARP answer finds its session in O(1): the
+    /// takeover pings every adopted one, G4.3hd).
+    by_ip: HashMap<Ipv4Addr, Key>,
+    /// G4.3hd: the redundant pair (hot standby).
+    ha: ha::IpoeHa,
 }
 
 impl State {
@@ -412,6 +424,9 @@ impl Core {
         Arc::new(Core {
             st: Mutex::new(State {
                 next_slot: SLOT_TOP,
+                // Silent until the config says whether a pair runs
+                // (G4.3hd: a standby must not answer its first second).
+                ha: ha::IpoeHa::silent(),
                 ..State::default()
             }),
             clock,
@@ -452,6 +467,9 @@ impl Core {
             .collect();
         st.aaa = aaa;
         st.forbidden = Arc::new(Forbidden::of(cfg));
+        let r = &cfg.ppp.redundancy;
+        st.ha.enabled = r.enabled;
+        st.ha.hot = r.enabled && r.mode == corerouter_model::ppp_redundancy::HaMode::HotStandby;
     }
 
     /// G4.3cd: the router's table of routed blocks (shared with PPPoE and
@@ -559,6 +577,8 @@ impl Core {
                 a.drops = n.up_policed + n.down_policed;
             }
         }
+        let now = self.ms();
+        st.ha_counters(now);
     }
 
     /// Keepalive (TR-146 R-92): ping the silent, end the ones that never
@@ -691,9 +711,11 @@ impl Core {
         if let Some(s) = st.subs.get_mut(&key)
             && s.ip == l.address
         {
-            // A renewal: proof of life.
+            // A renewal: proof of life (and the pair's copy of the lease).
             s.alive_ms = now;
             s.unanswered = 0;
+            s.lease = Some(l.clone());
+            st.ha_dirty(&key);
             return None;
         }
         // A new address for a client that had one: the old session ends.
@@ -829,6 +851,7 @@ impl Core {
                 .get(&a.profile)
                 .copied()
                 .unwrap_or_else(|| st.profile_shapes.get(DEFAULT_PROFILE).copied().flatten()),
+            lease: Some(l.clone()),
         };
         if let Some(slot) = slot {
             let (up, down) = rates(rate.as_deref());
@@ -895,6 +918,8 @@ impl Core {
             .interim
             .or((st.interim_default > 0).then_some(st.interim_default));
         let class = sub.class.clone();
+        st.by_ip.insert(l.address, key.clone());
+        st.ha_dirty(&key);
         st.subs.insert(key, sub);
         let aaa = st.aaa.clone();
         drop(st);
@@ -947,6 +972,10 @@ impl Core {
         why: (&'static str, &'static str, u32),
     ) -> Option<AcctOut> {
         let s = st.subs.remove(key)?;
+        if st.by_ip.get(&s.ip) == Some(key) {
+            st.by_ip.remove(&s.ip);
+        }
+        st.ha_gone(key);
         // G4.3cd: the blocks go before the session (a block left behind
         // is a blackhole).
         for (r, _) in &s.routes {
@@ -1272,14 +1301,26 @@ impl IpoeBackend for Backend {
     fn arp_reply(&self, interface: &IfName, ip: Ipv4Addr, mac: [u8; 6]) {
         let now = self.0.ms();
         let mut st = guard(&self.0.st);
+        let Some(key) = st.by_ip.get(&ip).cloned() else {
+            return;
+        };
         if let Some(s) = st
             .subs
-            .values_mut()
-            .find(|s| s.ip == ip && s.mac == mac && s.interface == *interface)
+            .get_mut(&key)
+            .filter(|s| s.mac == mac && s.interface == *interface)
         {
             s.alive_ms = now;
             s.unanswered = 0;
         }
+    }
+
+    fn answering(&self) -> bool {
+        let st = guard(&self.0.st);
+        !st.ha.enabled || st.ha.answering
+    }
+
+    fn takeover(&self) -> Option<(Vec<String>, Vec<Lease>)> {
+        guard(&self.0.st).ha.leases.take()
     }
 }
 
@@ -1457,28 +1498,55 @@ impl SessionOwner for Owner {
         if empty {
             return CoaOutcome::NotMine;
         }
-        let hits: Vec<String> =
-            {
-                let st = guard(&self.0.st);
-                st.active
-                    .values()
-                    .filter(|a| {
-                        sel.user_name.as_deref().is_none_or(|u| a.name == u)
-                            && sel.framed_ip.is_none_or(|ip| a.address == Some(ip))
-                            && sel.calling_station_id.as_deref().is_none_or(|c| {
-                                a.caller_id.eq_ignore_ascii_case(&c.replace('-', ":"))
-                            })
-                            && sel.nas_port_id.as_deref().is_none_or(|n| {
-                                a.interface == n || a.circuit_id.as_deref() == Some(n)
-                            })
-                            && sel
-                                .acct_session_id
-                                .as_deref()
-                                .is_none_or(|s| st.by_acct.get(s) == Some(&a.id))
-                    })
-                    .map(|a| a.id.clone())
-                    .collect()
+        let hits: Vec<String> = {
+            let st = guard(&self.0.st);
+            let caller = sel
+                .calling_station_id
+                .as_deref()
+                .map(|c| c.replace('-', ":"));
+            let matches = |a: &ActiveSession| {
+                sel.user_name.as_deref().is_none_or(|u| a.name == u)
+                    && sel.framed_ip.is_none_or(|ip| a.address == Some(ip))
+                    && caller
+                        .as_deref()
+                        .is_none_or(|c| a.caller_id.eq_ignore_ascii_case(c))
+                    && sel
+                        .nas_port_id
+                        .as_deref()
+                        .is_none_or(|n| a.interface == n || a.circuit_id.as_deref() == Some(n))
+                    && sel
+                        .acct_session_id
+                        .as_deref()
+                        .is_none_or(|s| st.by_acct.get(s) == Some(&a.id))
             };
+            // By address or Acct-Session-Id from the indexes (G4.3hb's
+            // PPPoE fix: no pass over every session per CoA).
+            let indexed: Option<Option<&String>> =
+                match (sel.framed_ip, sel.acct_session_id.as_deref()) {
+                    (Some(ip), _) => Some(
+                        st.by_ip
+                            .get(&ip)
+                            .and_then(|k| st.subs.get(k))
+                            .map(|s| &s.id),
+                    ),
+                    (None, Some(a)) => Some(st.by_acct.get(a)),
+                    (None, None) => None,
+                };
+            match indexed {
+                Some(id) => id
+                    .and_then(|id| st.active.get(id))
+                    .filter(|a| matches(a))
+                    .map(|a| a.id.clone())
+                    .into_iter()
+                    .collect(),
+                None => st
+                    .active
+                    .values()
+                    .filter(|a| matches(a))
+                    .map(|a| a.id.clone())
+                    .collect(),
+            }
+        };
         if hits.is_empty() {
             return CoaOutcome::NotMine;
         }

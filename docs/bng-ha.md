@@ -358,6 +358,78 @@ O trabalho em si custa 0,25 ms ponta a ponta, medido com o par em memória
 (`radius_aaa_tests`). Os pedidos andam em paralelo: uma rajada não espera um pelo outro (veja o
 laboratório).
 
+## 2.12 IPoE no par (G4.3hd)
+
+As sessões IPoE (G4.3f) entram no hot standby como as PPPoE:
+
+- **Publicar.** O ativo publica cada sessão IPoE com a concessão DHCP dela: um `SessionRecord` de
+  `Kind::Ipoe`, com os TLVs novos `LEASE*` (fim, duração, última mensagem, client id da opção 61,
+  opção 82, `hw`, nome). Ele vai quando a sessão sobe e a cada renovação; os contadores vão a cada
+  10 s. A versão anterior guarda esses TLVs como desconhecidos. Um registro tem ≈ 123 B.
+- **Calar o standby.** O servidor DHCP do standby fica mudo nas portas dos servidores com sessões
+  (`IpoeBackend::answering`): descarta o que ouve, não pergunta ao RADIUS e não oferece nada. Um
+  nó que acaba de ligar começa mudo até a configuração dizer se há par. As portas IPoE do
+  standby ganham `arp_ignore=8`: os dois nós têm o endereço do gateway, e só o ativo responde ARP.
+  Um roteador sem par não tem o `arp_ignore` tocado.
+- **Tomar.** Ao virar ativo, o serviço `ipoe` adota as sessões da tomada **antes** de liberar o
+  DHCP:
+  - a sessão volta com o mesmo Acct-Session-Id, o mesmo Class, a taxa e as rotas;
+  - a entrada no XDP;
+  - uma linha `up`/`takeover` no histórico;
+  - um Interim-Update com os contadores herdados, sem Start.
+  
+  As concessões entram no servidor DHCP (`Server::adopt`, no journal também). As concessões
+  ligadas deste nó que o par não conhece terminam: a tabela do par é a mais nova. Assim a renovação
+  do cliente (RFC 2131 §4.3.2) encontra a concessão como no nó que a deu.
+- **Apontar o ARP do CPE.** O nó novo manda um ARP ping a cada assinante adotado, com o endereço do
+  gateway como remetente. Pela RFC 826, quem já tem o remetente na tabela atualiza o MAC dele.
+- **Entregar.** O nó que perde o papel encerra as cópias sem Acct-Stop. No modo stateless manda
+  o Stop: o cliente refaz o DHCP no outro.
+
+### Pesquisa
+
+- **DHCP failover** ([draft-ietf-dhc-failover-12](https://datatracker.ietf.org/doc/html/draft-ietf-dhc-failover-12),
+  ISC Kea HA [hot-standby](https://kb.isc.org/docs/kea-ha-quickstart-guide)):
+  - o par copia cada concessão (o *binding update*) antes ou logo depois do ACK;
+  - o standby não responde ao cliente enquanto o primário vive;
+  - na tomada, o parceiro atende as renovações das concessões que recebeu;
+  - o MCLT limita quanto um servidor estende uma concessão que o outro ainda não sabe.
+  
+  Aqui o par copia a concessão a cada renovação. O que se perde numa queda são só as mudanças sem
+  ack (milissegundos): um cliente que renovou nesse intervalo tem, no nó novo, a concessão com o
+  fim de antes da renovação, ainda válida por pelo menos meio lease (T1). Por isso não precisamos
+  do MCLT.
+- **Cisco ASR 9000, IPoE L2 com geo redundancy**
+  ([artigo](https://community.cisco.com/t5/service-providers-knowledge-base/bng-geo-redundancy-for-l2-connected-ipoe-subscriber-sessions/ta-p/3686641)):
+  a sessão IPoE e a concessão vão ao escravo pelo SRG, o gateway é um endereço e um MAC virtuais do
+  grupo, e o escravo não responde DHCP nem ARP. Juniper M:N cobre DHCP/IPoE do mesmo jeito.
+- **MikroTik RouterOS v7:** sem redundância de servidor DHCP nem de sessão IPoE (VRRP para o
+  gateway e o cliente refaz o DHCP).
+
+**Medido:**
+- Release, `cargo bench -p corerouter-daemon --bench ipoe_bng -- ipoe_ha`, Ryzen AI Max+ 395,
+  2026-10-27, máquina com outras sessões:
+
+  | | 10 000 | 100 000 |
+  |---|---:|---:|
+  | adoção no serviço `ipoe` (sessões, XDP, Interims) | 29,7 ms (3,0 µs/sessão) | 623 ms (6,2 µs/sessão) |
+  | concessões no servidor DHCP (`Server::adopt`) | 2,6 ms | 74 ms |
+  | publicar (renovar todas e montar os registros) | 20 ms | 300 ms |
+
+- O lock do núcleo IPoE é pego em lotes de 1024 (≈ 8 ms cada), não pelos 0,6 s inteiros. A
+  primeira versão segurava o lock 774 ms com 100 mil.
+- Laboratório (VM `corerouter-lab`, release, sem root, BNG Blaster 1.0.1, 2026-10-27,
+  `env BNG_LAB_HA_IPOE=1 cargo xtask bng-lab --only ha`), A perde a energia:
+
+  | Sessões IPoE | Tomada | Todas no nó novo | Perdidas | Starts | Stops | Com Interim do novo | Renovaram no novo |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 1 000 | 1,03 s | 1,14 s | 0 | 1 000 | 0 | 1 000 | todas (lease de 2 min, 75 s depois) |
+  | 3 000 | 1,23 s | 1,35 s | 0 | 3 000 | 0 | 3 000 | todas |
+
+  Acima de ≈ 5 mil, o BNG Blaster não completa a subida do IPoE nem num nó sozinho, sem par. Ele
+  repete cada DHCP a cada 5 s, ≈ 19 mensagens por cliente, enquanto o servidor responde até 3100
+  ACKs/s. Por isso a adoção de 10 mil e 100 mil vem do benchmark (gap G4.3fb).
+
 ## 3. Testes
 
 - Unidade (27): cada regra da máquina de papéis, codec, registro, hello, sync.
