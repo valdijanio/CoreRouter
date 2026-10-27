@@ -2,7 +2,7 @@
 //! subscribers refused in 24 h, the distribution and the suggested
 //! `ports_per_subscriber`, its preview (who moves, what is killed) and the
 //! store across a restart.
-#![allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
 
 use corerouter_engine::{MemoryStorage, Session};
 use corerouter_hal::VirtualHal;
