@@ -709,7 +709,12 @@ impl Shell {
             Parsed::Help { path, id } => Next::Done(Output::lines(self.help(&path, id.as_deref()))),
             Parsed::Print { path, id, opts } => self.print(path, &id, opts),
             Parsed::Command { path, id, args } => self.run_command(&path, &id, &args),
-            Parsed::Export { path, file, terse } => self.export(path, file, terse),
+            Parsed::Export {
+                path,
+                file,
+                terse,
+                sensitive,
+            } => self.export(path, file, terse, sensitive),
             Parsed::Import { file: None } => Next::Done(Output::error(
                 "import needs file=<name> (a file on this computer), or paste the script",
             )),
@@ -935,11 +940,31 @@ impl Shell {
         )
     }
 
-    fn export(&mut self, path: Vec<String>, file: Option<String>, terse: bool) -> Next {
+    fn export(
+        &mut self,
+        path: Vec<String>,
+        file: Option<String>,
+        terse: bool,
+        sensitive: bool,
+    ) -> Next {
         let ids = export::reads(&self.reg);
+        // `show-sensitive`: the prints that can, asked for their secrets
+        // (the router refuses below group full).
         let reqs = ids
             .iter()
-            .map(|id| Request::execute(id, json!({})))
+            .map(|id| {
+                let shows = sensitive
+                    && self
+                        .reg
+                        .by_id(id)
+                        .is_some_and(|(_, c)| c.param(export::SHOW_SENSITIVE).is_some());
+                let params = if shows {
+                    json!({ export::SHOW_SENSITIVE: true })
+                } else {
+                    json!({})
+                };
+                Request::execute(id, params)
+            })
             .collect();
         Next::Send(
             reqs,
@@ -953,7 +978,7 @@ impl Shell {
                         Err(e) => return Next::Done(Output::error(format!("{id}: {e}"))),
                     }
                 }
-                let script = export::script(&sh.reg, &path, &results, &sh.version);
+                let script = export::script(&sh.reg, &path, &results, &sh.version, sensitive);
                 // RouterOS's layout: wrapped at the terminal's width (a file
                 // at 80, so it does not depend on the window), or `terse`.
                 let script = match (terse, &file) {

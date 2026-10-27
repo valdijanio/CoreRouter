@@ -213,9 +213,15 @@ pub fn definitions() -> Value {
     Value::Array(out)
 }
 
+/// A tool's answer. Secrets (`password`, `secret`, `token`…) never reach
+/// the agent, whatever the command returned (G4.3n: `ppp.secret.list
+/// show_sensitive` gives the local token's group full the passwords).
 fn text(v: Result<Value, String>) -> Value {
     match v {
-        Ok(v) => json!({"content": [{"type": "text", "text": v.to_string()}], "isError": false}),
+        Ok(v) => {
+            let v = corerouter_engine::auth::mask_secrets(&v);
+            json!({"content": [{"type": "text", "text": v.to_string()}], "isError": false})
+        }
         Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
     }
 }

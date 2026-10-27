@@ -513,3 +513,38 @@ proptest! {
         }
     }
 }
+
+/// G4.3n: an agent never reads a subscriber's password, not even through
+/// `show_sensitive` (the local token is group full), the import's report or
+/// the state.
+#[test]
+fn ppp_passwords_never_reach_the_agent() {
+    let call = |id: u32, name: &str, arguments: Value| json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":name,"arguments":arguments}});
+    let out = run(&[
+        call(
+            1,
+            "run_command",
+            json!({"command": "ppp.secret.import", "params": {
+            "text": "/ppp secret\nadd name=joao password=Pw-mcp-42x\n"}}),
+        ),
+        call(
+            2,
+            "run_command",
+            json!({"command": "ppp.secret.list", "params": {"show_sensitive": true}}),
+        ),
+        call(3, "inspect_state", json!({"path": "ppp"})),
+        call(4, "inspect_state", json!({"path": "journal"})),
+        call(
+            5,
+            "run_command",
+            json!({"command": "config.history", "params": {}}),
+        ),
+        json!({"jsonrpc":"2.0","id":6,"method":"resources/read","params":{"uri":"corerouter://state/ppp"}}),
+    ]);
+    assert_eq!(out[0]["result"]["isError"], false, "{}", out[0]);
+    assert!(out[1].to_string().contains("joao"), "{}", out[1]);
+    for o in &out {
+        let t = o.to_string();
+        assert!(!t.contains("Pw-mcp-42x") && !t.contains("$cr1$"), "{t}");
+    }
+}

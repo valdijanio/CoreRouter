@@ -143,6 +143,11 @@ impl Shell {
                     let mut opts = vec![("file=", "a file on this computer", Style::Key)];
                     if matches!(verb, Verb::Export) {
                         opts.push(("terse", "one line per item, menu in front", Style::Item));
+                        opts.push((
+                            "show-sensitive",
+                            "passwords in clear (group full)",
+                            Style::Item,
+                        ));
                     }
                     Completion {
                         start,

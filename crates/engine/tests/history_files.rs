@@ -106,11 +106,12 @@ fn the_history_survives_a_reboot_and_old_files_are_deleted() {
 /// Fail-first for audit-history: with full copies a ~750 KB config kept
 /// 42 of its 64 revisions in the 32 MiB budget (6 of a 5 MiB config,
 /// **medido** in `storage_fs/history64`); as differences all of them fit.
+/// The budget is 64 MiB since G4.3n: the config is twice as big here.
 #[test]
 fn all_64_revisions_of_a_big_config_survive_a_reboot() {
     let storage = MemoryStorage::default();
     let mut s = boot(&storage);
-    big(&mut s, 6000);
+    big(&mut s, 12_000);
     for i in 0..63 {
         // Small changes, anywhere in the config.
         if i % 2 == 0 {

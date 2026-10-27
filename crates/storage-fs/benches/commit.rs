@@ -175,7 +175,7 @@ fn commit(c: &mut Criterion) {
             cfg.ppp.secrets.push(corerouter_model::ppp::PppSecret {
                 id: ItemId(i + 1),
                 name: format!("cliente{i}@isp"),
-                password: format!("senha{i}"),
+                password: format!("senha{i}").into(),
                 profile: "default".into(),
                 ..Default::default()
             });
