@@ -1983,3 +1983,22 @@ frr_rib`). Dados sintéticos com a forma da tabela real: 1 M de rotas (90 % IPv4
   ~200 MiB do texto; tirar as alocações de endereços e origem ganhou 5 % (1,88 → 1,78 s).
 - Memória: 24 B por rota (teste `a_route_is_small`) mais os atributos internados; até 4 tabelas
   guardadas no engine, ~100 MiB com quatro tabelas completas (**estimado**).
+
+### G3.2b — `/routing filter` (**medido**, 2026-10-27, 32 núcleos, `cargo bench` release)
+
+| Medida | 1 thread | 2 | 4 | 8 | 16 |
+|---|---|---|---|---|---|
+| Prévia de 1 M rotas, política de trânsito (bogons, tamanho, AS privado, blackhole, preferência) | 311 ms | 176 ms | 90 ms | 48 ms | 30 ms |
+| Prévia comparada com a política em vigor (cada rota duas vezes) | 605 ms | | | 98 ms | |
+
+Escala quase linear até 8 threads (6,5×): cada rota é independente, a política é compartilhada
+só para leitura, sem lock; o padrão usa até 8 (abaixo de 20 000 rotas, uma).
+
+| 10 000 regras em 100 chains | antes | depois |
+|---|---|---|
+| Compilar (validação de todo commit) | 146 ms | 30 ms (regex só checada na sintaxe pelo parser e compilada uma vez; parse e regex em 8 threads) |
+| Render para o FRR | 98 ms | 15 ms (uma chain por thread; listas com nome pelo conteúdo se juntam sem conflito) |
+| Parse do running-config do FRR (hal-frr) | | 6,5 ms |
+| Diff com uma regra mudada (hal-frr) | | 14,6 ms (serial: custo pequeno) |
+
+FRR 10.7.1 real (VM do laboratório, debug): mudar uma regra digita 14 linhas em 2,7 ms.
