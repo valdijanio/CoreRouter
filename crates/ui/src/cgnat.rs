@@ -69,12 +69,13 @@ const EXCEPTION_COLUMNS: [table::Column; 4] = [col("Subscriber"), col("Public"),
 const MAPPING_COLUMNS: [table::Column; 4] = [num("#"), col("Subscriber"), col("Public"), col("Ports")];
 const BLOCK_COLUMNS: [table::Column; 5] = [col("Subscriber"), col("Pool"), col("Public"), col("Ports"), col("Since")];
 const LOG_COLUMNS: [table::Column; 5] = [col("Subscriber"), col("Pool"), col("Public"), col("Ports"), col("Period")];
-const ALERT_COLUMNS: [table::Column; 6] = [
+const ALERT_COLUMNS: [table::Column; 7] = [
     col("Subscriber"),
     col("Pool"),
     col("Used"),
     num("Peak"),
     num("Times"),
+    col("Refused"),
     col("Last"),
 ];
 const HISTORY_COLUMNS: [table::Column; 4] = [col("Since"), col("Until"), col("Pools"), num("Exceptions")];
@@ -697,10 +698,31 @@ impl Cgnat {
 
     fn alerts_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
         let failed = self.alerts.get("insert_failed").and_then(Value::as_u64).unwrap_or(0);
+        let num = |k: &str| self.alerts.get(k).and_then(Value::as_u64).unwrap_or(0);
+        let (refused, icmp, full) = (num("refused"), num("icmp_sent"), num("full"));
+        let icmp_on = self.settings.get("icmp_unreachable").and_then(Value::as_bool) != Some(false);
+        let rate = text(&self.settings, "icmp_rate");
         ui.horizontal(|ui| {
             if failed > 0 {
                 chip::chip(ui, &format!("insert failed {failed}"), chip::RED.tone(ui.visuals()))
                     .on_hover_text(tr(l, "New connections the kernel could not translate: no free port"));
+            }
+            if refused > 0 {
+                chip::chip(ui, &format!("refused {refused}"), chip::RED.tone(ui.visuals()))
+                    .on_hover_text(tr(l, "New connections dropped for lack of a port (RFC 6888 REQ-11)"));
+            }
+            let (label, tone) = if icmp_on {
+                (format!("ICMP unreachable · {rate}/s · sent {icmp}"), chip::GREEN.tone(ui.visuals()))
+            } else {
+                ("ICMP unreachable off".to_owned(), chip::neutral_tone(ui.visuals()))
+            };
+            chip::chip(ui, &label, tone);
+            if help::info_button(ui, Id::unique("cgnat-help-icmp"), tr(l, "ICMP Unreachable")).clicked() {
+                self.help = Some(HelpView::new("cgnat.icmp_unreachable", tr(l, "ICMP Unreachable")));
+            }
+            if full > 0 {
+                chip::chip(ui, &format!("checked {full}"), chip::AMBER.tone(ui.visuals()))
+                    .on_hover_text(tr(l, "Subscribers near the end of their ports: their new connections are checked for a free port"));
             }
             if ui
                 .add_enabled(app.can().check("ip.firewall.cgnat.alert.clear").is_ok(), egui::Button::new(tr(l, "Clear")))
@@ -730,6 +752,10 @@ impl Cgnat {
                                 chip::cell(&format!("{}/{}", text(r, "used"), text(r, "ports")), &[(format!("{pct} %").as_str(), kind)]),
                                 text(r, "peak"),
                                 text(r, "crossings"),
+                                match r.get("refused").and_then(Value::as_u64).unwrap_or(0) {
+                                    0 => String::new(),
+                                    n => chip::cell(&n.to_string(), &[(format!("ICMP {}", text(r, "icmp")).as_str(), Kind::Red)]),
+                                },
                                 text(r, "last"),
                             ],
                             dimmed: !above,

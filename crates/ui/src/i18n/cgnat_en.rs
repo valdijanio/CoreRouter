@@ -12,7 +12,7 @@ A subscriber using this share of its ports raises an alert (one per crossing). D
         "cgnat.alerts",
         "## Alerts
 
-Subscribers near their port limit, with peak and count.",
+Subscribers near their port limit, with peak and count; refused: new connections dropped for lack of a port, and the ICMP sent about them (RFC 6888 REQ-11).",
     ),
     (
         "cgnat.block_timeout",
@@ -85,6 +85,12 @@ Subscribers reach each other through their public address and port (RFC 4787 REQ
         "## History kept
 
 Days the mapping history and block log are kept (Marco Civil asks a year).",
+    ),
+    (
+        "cgnat.icmp_unreachable",
+        "## ICMP Unreachable
+
+A new connection that finds no free port is dropped and its subscriber gets an ICMP host unreachable (code 1, a soft error) quoting it (RFC 6888 REQ-11). At most `icmp_rate` per second and subscriber (default 2), 1000 per second in all.",
     ),
     (
         "cgnat.inside",

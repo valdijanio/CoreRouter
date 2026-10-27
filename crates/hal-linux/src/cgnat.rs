@@ -13,10 +13,10 @@
 //! (`cgnat::remapped`): they still carry the old translation, and "who
 //! was" must find the subscriber the formula of the moment names.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 
-use corerouter_firewall::cgnat::{TABLE, remapped, table};
+use corerouter_firewall::cgnat::{FULL, TABLE, remapped, table};
 use corerouter_firewall::program::{Element, Set, Type, Value};
 use corerouter_hal::HalError;
 use corerouter_hal::cgnat::BlockChange;
@@ -105,6 +105,56 @@ pub fn set_blocks(changes: &[BlockChange], blocks: &mut Blocks) -> Result<(), Ha
     Ok(())
 }
 
+/// The subscribers near the end of their ports in set `full` (G2.7).
+pub type Full = BTreeSet<Ipv4Addr>;
+
+fn full_set() -> Set {
+    Set {
+        name: FULL.into(),
+        key: Type::Addr,
+        data: None,
+        interval: false,
+        dynamic_timeout: None,
+        size: None,
+        elements: Vec::new(),
+    }
+}
+
+fn addr_element(a: Ipv4Addr) -> Element {
+    Element {
+        key: Value::Addr(a),
+        key_last: None,
+        data: None,
+    }
+}
+
+/// Make set `full` hold exactly `want`, by difference (a handful of
+/// elements each tick).
+pub fn set_full(want: &Full, full: &mut Full) -> Result<(), HalError> {
+    let gone: Vec<Element> = full.difference(want).copied().map(addr_element).collect();
+    let came: Vec<Element> = want.difference(full).copied().map(addr_element).collect();
+    if gone.is_empty() && came.is_empty() {
+        return Ok(());
+    }
+    let mut b = nfnl::Batch::new(1);
+    let set = full_set();
+    if !gone.is_empty() {
+        b.elements(TABLE, &set, &gone, false);
+    }
+    if !came.is_empty() {
+        b.elements(TABLE, &set, &came, true);
+    }
+    nfnl::apply(b, "changing the CGNAT full set")?;
+    full.clone_from(want);
+    Ok(())
+}
+
+/// After the table was rebuilt: set `full` is empty again; the engine's
+/// next tick fills it (forgetting ours makes it send them all).
+fn reinstall_full(full: &mut Full) {
+    full.clear();
+}
+
 /// After the table was rebuilt: the blocks still valid go back in.
 fn reinstall(to: &Cgnat, blocks: &mut Blocks) {
     blocks.retain(|(pool, _), slot| still_valid(to, *pool, *slot));
@@ -126,7 +176,12 @@ fn reinstall(to: &Cgnat, blocks: &mut Blocks) {
 }
 
 /// Bring the kernel from `from` to `to`.
-pub fn apply(from: &Cgnat, to: &Cgnat, blocks: &mut Blocks) -> Result<(), HalError> {
+pub fn apply(
+    from: &Cgnat,
+    to: &Cgnat,
+    blocks: &mut Blocks,
+    full: &mut Full,
+) -> Result<(), HalError> {
     let (old, new) = (table(from), table(to));
     match (&old, &new) {
         (_, None) => {
@@ -135,6 +190,7 @@ pub fn apply(from: &Cgnat, to: &Cgnat, blocks: &mut Blocks) -> Result<(), HalErr
             b.del_table(TABLE);
             nfnl::apply(b, "removing the CGNAT table")?;
             blocks.clear();
+            full.clear();
         }
         (Some(a), Some(b)) => match nfnl::update(a, b, 1) {
             Some(batch) => {
@@ -142,16 +198,19 @@ pub fn apply(from: &Cgnat, to: &Cgnat, blocks: &mut Blocks) -> Result<(), HalErr
                     log::warn!("{e}; replacing the CGNAT table instead");
                     nfnl::apply(nfnl::replace(b, 1), "loading the CGNAT table")?;
                     reinstall(to, blocks);
+                    reinstall_full(full);
                 }
             }
             None => {
                 nfnl::apply(nfnl::replace(b, 1), "loading the CGNAT table")?;
                 reinstall(to, blocks);
+                reinstall_full(full);
             }
         },
         (None, Some(b)) => {
             nfnl::apply(nfnl::replace(b, 1), "loading the CGNAT table")?;
             reinstall(to, blocks);
+            reinstall_full(full);
         }
     }
     let moved = remapped(from, to);

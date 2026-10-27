@@ -80,6 +80,7 @@ fn verb(a: &Action) -> String {
                 .map(|t| format!(" por {t}"))
                 .unwrap_or_default()
         ),
+        Action::Notrack => "Não rastreia (sem conntrack)".into(),
     }
 }
 
@@ -91,6 +92,8 @@ fn direction(table: Table, chain: &str) -> String {
         (Table::Nat, "dstnat") | (Table::Mangle, "prerouting") => {
             "que chegam (antes do roteamento)".into()
         }
+        (Table::Raw, "prerouting") => "que chegam (antes do conntrack)".into(),
+        (Table::Raw, "output") => "que o roteador envia (antes do conntrack)".into(),
         (Table::Nat, "srcnat") | (Table::Mangle, "postrouting") => {
             "que saem (depois do roteamento)".into()
         }

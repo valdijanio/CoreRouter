@@ -591,6 +591,41 @@ pub trait Hal: Send {
         )))
     }
 
+    /// The subscribers near the end of their ports (G2.7): only their new
+    /// connections go through the exhaustion queues, so everyone else's
+    /// packets never leave the kernel. Replaces the whole set.
+    fn cgnat_full(&mut self, subscribers: &[std::net::Ipv4Addr]) -> Result<(), HalError> {
+        let _ = subscribers;
+        Err(HalError::Unsupported(format!(
+            "{} has no CGNAT data plane",
+            self.describe()
+        )))
+    }
+
+    /// Exhaustion queue `index` (0..[`cgnat::EXHAUSTED_QUEUES`]) (G2.7),
+    /// for a daemon thread to serve outside the session lock.
+    fn cgnat_exhaustion_queue(
+        &mut self,
+        index: u16,
+    ) -> Result<Box<dyn cgnat::ExhaustionQueue>, HalError> {
+        let _ = index;
+        Err(HalError::Unsupported(format!(
+            "{} has no packet queue",
+            self.describe()
+        )))
+    }
+
+    /// Connections refused for lack of ports, and the ICMP sent about
+    /// them, since the last call (G2.7).
+    fn cgnat_exhausted(
+        &mut self,
+    ) -> (
+        Vec<(std::net::Ipv4Addr, cgnat::Hit)>,
+        cgnat::ExhaustionStats,
+    ) {
+        (Vec::new(), cgnat::ExhaustionStats::default())
+    }
+
     /// Remove these connections; how many went (G2.2).
     fn connections_kill(&mut self, conns: &[conntrack::Conn]) -> Result<usize, HalError> {
         let _ = conns;
