@@ -49,6 +49,8 @@ struct Inner {
     feeding: bool,
     lost: u64,
     reads: u64,
+    /// Entries added outside the config ([`LabNeigh::statics`]).
+    extra: BTreeMap<Key, Neighbor>,
 }
 
 impl Inner {
@@ -75,8 +77,9 @@ impl LabNeigh {
 
     /// Bring the tables to what `cfg` makes, as changes.
     pub fn sync(&self, cfg: &Config) {
-        let want = table(cfg);
+        let mut want = table(cfg);
         self.with(|i| {
+            want.extend(i.extra.iter().map(|(k, n)| (k.clone(), n.clone())));
             let gone: Vec<Key> = i
                 .table
                 .keys()
@@ -119,6 +122,41 @@ impl LabNeigh {
             }
             n
         })
+    }
+
+    /// Static entries outside the config (DHCP `add-arp`): kept across
+    /// syncs, as the kernel keeps them across applies.
+    pub fn statics(&self, ops: &[crate::neigh::StaticNeigh]) {
+        self.with(|i| {
+            for op in ops {
+                let key = (op.interface.clone(), IpAddr::V4(op.address));
+                match op.mac {
+                    Some(mac) => {
+                        let n = Neighbor {
+                            interface: op.interface.clone(),
+                            address: IpAddr::V4(op.address),
+                            mac: Some(mac),
+                            state: NeighState::Permanent,
+                            router: false,
+                            confirmed_secs: None,
+                            updated_secs: Some(0),
+                        };
+                        i.extra.insert(key.clone(), n.clone());
+                        i.table.insert(key, n.clone());
+                        i.push(NeighEvent::Upsert(n));
+                    }
+                    None => {
+                        i.extra.remove(&key);
+                        if i.table.remove(&key).is_some() {
+                            i.push(NeighEvent::Remove {
+                                interface: key.0,
+                                address: key.1,
+                            });
+                        }
+                    }
+                }
+            }
+        });
     }
 
     pub fn feed(&self) -> Box<dyn NeighborFeed> {

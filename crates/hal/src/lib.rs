@@ -700,6 +700,16 @@ pub trait Hal: Send {
         )))
     }
 
+    /// Static ARP entries outside the config (DHCP `add-arp`, G1.27d):
+    /// `mac: None` removes. One already gone is not an error.
+    fn neighbor_static(&mut self, ops: &[neigh::StaticNeigh]) -> Result<(), HalError> {
+        let _ = ops;
+        Err(HalError::Unsupported(format!(
+            "{} cannot add static neighbors",
+            self.describe()
+        )))
+    }
+
     /// An ARP pinger on `name` (`ip.arp.ping`), used outside the session
     /// lock.
     fn arp_pinger(&mut self, name: &IfName) -> Result<Box<dyn neigh::ArpPinger>, HalError> {

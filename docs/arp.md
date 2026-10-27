@@ -112,8 +112,14 @@ sendo a descoberta LLDP/MNDP), com as abas ARP (IPv4), ND (IPv6) e Settings; IPv
 abre a lista ND. O nome do host vem do selo de identidade (G0.25: concessão DHCP, depois PTR das
 zonas locais), como OPNsense e pfSense fazem.
 
-**O que ficou para depois:** o fabricante pelo OUI (aguarda decisão de licença do usuário) e o
-`add-arp` do DHCP (parte c).
+**DHCP `add-arp` (parte c):** um servidor com `add_arp` põe uma entrada permanente por concessão
+(`Hal::neighbor_static`, O(1) por concessão), com origem `dhcp` (flag H), e a tira quando a
+concessão termina ou o servidor deixa de pedir. Com `arp=reply-only` na interface só clientes
+DHCP alcançam o roteador (o Dynamic ARP Inspection do Cisco faz o mesmo com o DHCP snooping).
+
+**O que ficou para depois:** o fabricante pelo OUI, que aguarda a decisão do usuário sobre a
+licença da lista pública do IEEE (o site não traz termos; a permissão citada pelo Debian é de
+terceiros).
 
 ## Desempenho e paralelismo
 

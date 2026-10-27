@@ -173,6 +173,7 @@ const SERVER: ItemKind = ItemKind {
         },
         bool_field("conflict_detection", "Conflict Detection"),
         bool_field("always_broadcast", "Always Broadcast"),
+        bool_field("add_arp", "Add ARP For Leases"),
         text_field("server_address", "Server Address", "the interface's"),
         text_field("relay", "Relay", "clients on the link"),
         text_field("dhcp_option_set", "DHCP Option Set", "none"),

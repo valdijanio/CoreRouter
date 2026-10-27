@@ -459,3 +459,58 @@ fn a_removed_server_ends_its_leases() {
     let (_, dynamic) = s.dns_dynamic();
     assert!(dynamic.records.is_empty(), "names gone with the leases");
 }
+
+/// G1.27d — `add_arp`: each bound lease becomes a static ARP entry
+/// (source `dhcp`, RouterOS flag H) and goes with it; turning it off
+/// takes them away; with `arp=reply-only` they are what reaches hosts.
+#[test]
+fn add_arp_turns_leases_into_arp_entries() {
+    let mut s = Session::virtual_lab();
+    lan(&mut s);
+    let before = s.store().current_revision();
+    ok(
+        &mut s,
+        "ip.dhcp-server.set",
+        json!({"id": "dhcp1", "add_arp": true}),
+    );
+    assert_eq!(
+        ok(&mut s, "ip.dhcp-server.print", json!({}))[0]["add_arp"],
+        true
+    );
+    let ms = run(&mut s, 0, 5);
+    let bound: Vec<String> = status(&leases(&mut s), "bound")
+        .iter()
+        .map(|r| r["address"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(bound.len(), 4);
+    let arp = ok(&mut s, "ip.arp.list", json!({"source": "dhcp"}));
+    assert_eq!(arp["matched"], 4, "{arp}");
+    let row = &arp["rows"][0];
+    assert_eq!(
+        (&row["state"], &row["flags"]),
+        (&json!("permanent"), &json!("HDC")),
+        "{row}"
+    );
+    assert!(bound.contains(&row["address"].as_str().unwrap().to_owned()));
+    // reply-only on the LAN: allowed, the DHCP entries keep the hosts.
+    ok(
+        &mut s,
+        "ip.arp.settings.set",
+        json!({"interface": "ether2", "arp": "reply-only", "confirm": true}),
+    );
+    let arp = ok(&mut s, "ip.arp.list", json!({"interface": "ether2"}));
+    assert_eq!(arp["counts"]["sources"]["dhcp"], 4, "{arp}");
+    // Off again (rollback to before add_arp): the entries go.
+    ok(&mut s, "config.rollback", json!({"revision": before}));
+    run(&mut s, ms, 1);
+    let arp = ok(&mut s, "ip.arp.list", json!({"source": "dhcp"}));
+    assert_eq!(arp["matched"], 0, "{arp}");
+    assert!(
+        err(
+            &mut s,
+            "ip.dhcp-server.set",
+            json!({"id": "dhcp1", "add_arp": "maybe"})
+        )
+        .contains("add_arp")
+    );
+}

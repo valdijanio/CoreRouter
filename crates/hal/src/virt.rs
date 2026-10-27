@@ -658,6 +658,11 @@ impl Hal for VirtualHal {
         Ok(self.neigh.remove(items))
     }
 
+    fn neighbor_static(&mut self, ops: &[crate::neigh::StaticNeigh]) -> Result<(), HalError> {
+        self.neigh.statics(ops);
+        Ok(())
+    }
+
     fn arp_pinger(&mut self, name: &IfName) -> Result<Box<dyn crate::neigh::ArpPinger>, HalError> {
         if !self.applied.interfaces.contains_key(name) {
             return Err(self.missing(name));
