@@ -138,4 +138,6 @@ Listas de prefixos com nome, para `dst in NOME`. Cada entrada é um prefixo com 
 Quais rotas uma chain deixa passar, nas rotas de uma conexão: no laboratório virtual, uma amostra reproduzível (formato de tabela completa, mais bogons, rota padrão e prefixos longos demais); com o FRR, as rotas que o vizinho mandou de verdade (entrada) ou as melhores rotas deste roteador (saída). As mudanças pendentes são comparadas com a política em vigor."##),
     (r##"filter.tab.rules"##, r##"## O que é
 As regras do `/routing filter` (RouterOS v7), em ordem. Cada regra pertence a uma chain; uma conexão BGP passa as rotas recebidas pela chain do Filtro de entrada e as enviadas pela do Filtro de saída. As regras rodam de cima para baixo; `accept` e `reject` encerram a chain, e a rota que nenhuma regra aceita é rejeitada."##),
+    (r##"menu.routing-filters"##, r##"## O que faz
+Política de rotas (`/routing filter` do RouterOS v7): regras em chains, listas de prefixos e de communities, e a prévia de quais rotas passam. Uma conexão BGP aponta as chains de entrada e de saída; eBGP sem elas não aceita nem envia nada (RFC 8212)."##),
 ];

@@ -70,4 +70,6 @@ Named prefix lists for `dst in NAME`. Each entry is a prefix with an optional le
 Which routes a chain lets through, on the routes of a connection: in the virtual lab a reproducible sample (a full-table shape plus bogons, a default route and too-long prefixes); with FRR the routes the neighbor really sent (in) or this router's best routes (out). The pending changes are compared with the policy in force."##),
     (r##"filter.tab.rules"##, r##"## What it is
 The rules of `/routing filter` (RouterOS v7), in order. A rule belongs to a chain; a BGP connection runs its received routes through its Input Filter chain and its sent routes through its Output Filter chain. Rules run top to bottom; `accept` and `reject` end the chain, and a route no rule accepts is rejected."##),
+    (r##"menu.routing-filters"##, r##"## What it does
+Route policy (RouterOS v7 `/routing filter`): rules in chains, prefix and community lists, and the preview of which routes pass. A BGP connection names its input and output chains; eBGP without them accepts and sends nothing (RFC 8212)."##),
 ];
