@@ -99,6 +99,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{address: ipv4, interface?: string (default: the one whose subnet holds the address), count?: int 1..1000 (default 4), interval_ms?: int 100..10000 (default 1000), timeout_ms?: int 10..5000 (default 1000)} → {id, task_id, interface, src_address, columns}",
         can_start, ping)
     .task(),
+    cmd!(query "ip.arp.check", "Check Static ARP", [], None,
+        "{address?: string, mac_address?: string, interface?: string, published?: bool, disabled?: bool, comment?: string, id?: string (the entry being edited)} → {computed: [{label, value}], checks: [{level (ok | warning | error | info), check, message, param}], commands: [{command, params}], risk}",
+        always, check),
+    cmd!(query "ip.arp.detail", "Neighbor Detail", [], None,
+        "{address: ip, interface?: string} → {row (as ip.arp.list), history: [{mac_address, since}], routes: [{dst_address, routing_table, state}], subnet (the router's address whose network holds it, or null)}",
+        always, detail),
     cmd!(query "ip.arp.settings.print", "ARP Settings", [], None,
         "{} → {interfaces: [{interface, arp (enabled | disabled | reply-only | proxy-arp | local-proxy-arp), arp_timeout (auto | seconds), entries, reachable, stale, unresolved, static}], kernel: {ipv4: {gc_thresh1, gc_thresh2, gc_thresh3, entries, configured}, ipv6: {…}}, near_full, suggest}",
         always, settings_print),
@@ -276,6 +282,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
     let neigh = s.neigh_fresh();
     let cfg = s.store().candidate().clone();
     let t = neigh.lock();
+    let now = now.max(t.clock);
 
     // Static entries by (interface, address): they name kernel rows.
     let statics: HashMap<(&IfName, IpAddr), &ArpEntry> = if v4 {
@@ -961,6 +968,191 @@ fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
         "arp": new.mode.as_str(),
         "arp_timeout": timeout_text(new.timeout_secs),
         "without_static": if cuts { without.len() } else { 0 },
+    }))
+}
+
+/// One check of the add/edit modal's preview (G0.24).
+fn chk(level: &str, check: &str, message: impl Into<String>, param: &str) -> Value {
+    json!({"level": level, "check": check, "message": message.into(), "param": param})
+}
+
+/// The add/edit modal's preview: never fails on bad input, says what is
+/// wrong as a check, and the command OK sends.
+fn check(s: &mut Session, p: &Value) -> Result<Value> {
+    let text = |k: &str| p.get(k).and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty());
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let cfg = s.store().candidate().clone();
+    let editing: Option<ArpEntry> = text("id")
+        .and_then(|i| i.parse::<ItemId>().ok())
+        .and_then(|id| cfg.ip.arp.entries.iter().find(|e| e.id == id).cloned());
+    let address = match text("address").or(editing.as_ref().map(|_| "")) {
+        Some("") => editing.as_ref().map(|e| e.address),
+        Some(t) => match t.parse::<Ipv4Addr>() {
+            Ok(a) => Some(a),
+            Err(_) => {
+                checks.push(chk("error", "address", "an IPv4 address, as 192.168.88.10", "address"));
+                None
+            }
+        },
+        None => {
+            checks.push(chk("error", "address", "type the neighbor's IPv4 address", "address"));
+            None
+        }
+    };
+    let mac = match text("mac_address") {
+        Some(t) => match t.parse::<MacAddr>() {
+            Ok(m) => Some(m),
+            Err(_) => {
+                checks.push(chk("error", "mac", "a MAC as 00:11:22:33:44:55", "mac_address"));
+                None
+            }
+        },
+        None => editing.as_ref().map(|e| e.mac).or_else(|| {
+            checks.push(chk("error", "mac", "type the neighbor's MAC address", "mac_address"));
+            None
+        }),
+    };
+    let interface = match text("interface") {
+        Some(t) => t.parse::<IfName>().ok().or_else(|| {
+            checks.push(chk("error", "interface", "not an interface name", "interface"));
+            None
+        }),
+        None => editing.as_ref().map(|e| e.interface.clone()).or_else(|| {
+            checks.push(chk("error", "interface", "pick an interface", "interface"));
+            None
+        }),
+    };
+    let flag = |k: &str| p.get(k).and_then(Value::as_bool);
+    let mut commands = Vec::new();
+    if let (Some(address), Some(mac), Some(interface)) = (address, mac, interface) {
+        let e = ArpEntry {
+            id: editing.as_ref().map_or(ItemId(0), |e| e.id),
+            address,
+            mac,
+            interface: interface.clone(),
+            published: flag("published").unwrap_or(editing.as_ref().is_some_and(|e| e.published)),
+            disabled: flag("disabled").unwrap_or(editing.as_ref().is_some_and(|e| e.disabled)),
+            comment: text("comment").map(str::to_owned).or(editing.as_ref().map(|e| e.comment.clone())).unwrap_or_default(),
+        };
+        match check_entry(&cfg, &e, editing.as_ref().map(|e| e.id)) {
+            Err(EngineError::BadParam { param, reason }) => {
+                let param = if param == "mac_address" || param == "interface" { param } else { "address".into() };
+                checks.push(chk("error", "entry", reason, &param));
+            }
+            Err(other) => checks.push(chk("error", "entry", other.to_string(), "address")),
+            Ok(()) => {}
+        }
+        // Not in a subnet of the interface: ARP never asks for it there.
+        match source_for(&cfg, address, Some(&interface)) {
+            Some((_, own)) => {
+                computed.push(json!({"label": "Router address", "value": own.to_string()}));
+                checks.push(chk("ok", "subnet", format!("{address} is in a network of {interface}"), "address"));
+            }
+            None => checks.push(chk(
+                "warning",
+                "subnet",
+                format!("{address} is in no network of {interface}: the router never sends to it there unless a route says so"),
+                "address",
+            )),
+        }
+        // What the network says about it now.
+        let neigh = s.neigh_fresh();
+        let seen = neigh.lock().get(&interface, IpAddr::V4(address)).copied();
+        match seen {
+            Some(r) if r.has_mac && r.mac != mac.0 && r.state != NeighState::Permanent => checks.push(chk(
+                "warning",
+                "learned",
+                format!("{address} answers from {} now: a static entry with another MAC cuts it off", mac_text(r.mac)),
+                "mac_address",
+            )),
+            Some(r) if r.has_mac && r.mac == mac.0 => {
+                checks.push(chk("ok", "learned", format!("{address} answers from this MAC now"), "mac_address"));
+            }
+            _ => checks.push(chk("info", "learned", format!("{address} is not in the table now"), "address")),
+        }
+        if e.published {
+            checks.push(chk(
+                "info",
+                "published",
+                "the router answers ARP for this address with its own MAC when it has a route to it elsewhere (proxy for one host)",
+                "published",
+            ));
+        }
+        let mut params = Map::new();
+        if let Some(ed) = &editing {
+            params.insert("id".into(), json!(ed.id));
+        }
+        params.insert("address".into(), json!(address.to_string()));
+        params.insert("mac_address".into(), json!(mac.to_string()));
+        params.insert("interface".into(), json!(interface.as_str()));
+        params.insert("published".into(), json!(e.published));
+        params.insert("disabled".into(), json!(e.disabled));
+        if !e.comment.is_empty() {
+            params.insert("comment".into(), json!(e.comment));
+        }
+        let cmd = if editing.is_some() { "ip.arp.set" } else { "ip.arp.add" };
+        commands.push(json!({"command": cmd, "params": params}));
+    }
+    let ok = !checks.iter().any(|c| c.get("level") == Some(&json!("error")));
+    Ok(json!({
+        "computed": computed,
+        "checks": checks,
+        "commands": if ok { commands } else { Vec::new() },
+        "risk": Value::Null,
+    }))
+}
+
+/// The detail panel under the table: the MACs the address had, the
+/// routes through it, and the row itself.
+fn detail(s: &mut Session, p: &Value) -> Result<Value> {
+    let address: IpAddr = req_parse(p, "address")?;
+    let iface: Option<IfName> = opt_parse(p, "interface")?;
+    let now = s.now().unwrap_or(0);
+    let lines = s.route_lines();
+    let neigh = s.neigh_fresh();
+    let cfg = s.store().candidate().clone();
+    let t = neigh.lock();
+    let now = now.max(t.clock);
+    let found = t
+        .rows()
+        .iter()
+        .filter(|r| r.address == address)
+        .filter_map(|r| Some((t.name(r.iface)?, r)))
+        .find(|(n, _)| iface.as_ref().is_none_or(|i| i == *n));
+    let entry = cfg.ip.arp.entries.iter().find(|e| {
+        IpAddr::V4(e.address) == address && iface.as_ref().is_none_or(|i| *i == e.interface)
+    });
+    let Some(name) = found.map(|(n, _)| n).or(entry.map(|e| &e.interface)) else {
+        return Err(EngineError::bad("address", format!("{address} is not in the neighbor table")));
+    };
+    let view = View {
+        address,
+        iface: name,
+        row: found.map(|(_, r)| r),
+        entry,
+    };
+    let history: Vec<Value> = t
+        .history(address)
+        .into_iter()
+        .filter(|c| c.interface == *name)
+        .map(|c| json!({"mac_address": mac_text(c.mac), "since": c.since, "ago_secs": now.saturating_sub(c.since)}))
+        .collect();
+    let routes: Vec<Value> = lines
+        .iter()
+        .filter(|l| matches!(&l.via, Some(crate::route_table::Via { gateway: Some(g), link }) if *g == address && link == name))
+        .take(100)
+        .map(|l| json!({"dst_address": l.dst.to_string(), "routing_table": l.table.to_string(), "state": l.state.as_str()}))
+        .collect();
+    let subnet = match address {
+        IpAddr::V4(a) => source_for(&cfg, a, Some(name)).map(|(_, own)| own.to_string()),
+        IpAddr::V6(_) => None,
+    };
+    Ok(json!({
+        "row": row(&view, &cfg, now),
+        "history": history,
+        "routes": routes,
+        "subnet": subnet,
     }))
 }
 

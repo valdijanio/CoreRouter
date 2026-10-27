@@ -46,8 +46,9 @@ pub(crate) const PANEL: Panel = Panel {
 };
 
 /// The windows that can show the chip: (preference key, label).
-pub(crate) const PLACES: [(&str, &str); 6] = [
+pub(crate) const PLACES: [(&str, &str); 7] = [
     ("torch", "Torch"),
+    ("arp", "ARP"),
     ("connections", "Connections"),
     ("traffic-flow", "Traffic Flow"),
     ("cgnat", "CGNAT › Who Was"),

@@ -35,8 +35,9 @@ const HOSTS_V4: [u32; 13] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 254];
 const HOSTS_V6: [u16; 3] = [1, 2, 3];
 /// Changes the feed holds for a slow reader before it counts them lost.
 const MAX_PENDING: usize = 16_384;
-/// Feed reads between two aging steps of one entry.
-const AGE_EVERY: u64 = 8;
+/// Feed reads between two aging steps of one entry (the daemon reads
+/// every 250 ms: a step every ~10 s).
+const AGE_EVERY: u64 = 40;
 
 type Key = (IfName, IpAddr);
 
@@ -207,9 +208,9 @@ fn age(i: &mut Inner) {
         };
         n.state = next;
         n.updated_secs = Some(0);
-        if next == NeighState::Reachable {
-            n.confirmed_secs = Some(0);
-        }
+        // Only a confirmation moves "last seen"; the other steps say
+        // nothing of it (the table keeps the time it had).
+        n.confirmed_secs = (next == NeighState::Reachable).then_some(0);
         changed.push(n.clone());
     }
     for n in changed {

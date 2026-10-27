@@ -57,6 +57,15 @@ fn unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+/// The session's clock (the platform's; the lab has its own) as an
+/// offset from this machine's, read once a second with the settings:
+/// the table's times must be the ones `ip.arp.list` subtracts from.
+fn clock_offset(s: &corerouter_engine::Session) -> i64 {
+    let theirs = s.neigh_clock().map_or(0, |t| i64::try_from(t).unwrap_or(0));
+    let ours = i64::try_from(unix()).unwrap_or(0);
+    if theirs == 0 { 0 } else { theirs - ours }
+}
+
 fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let session = ctx.session.clone();
     Ok(Box::new(move |health: &super::Health| run(&session, health)))
@@ -85,7 +94,9 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
         statics: BTreeSet::new(),
         lab,
         warned_full: [false; 2],
+        offset: 0,
     };
+    state.offset = clock_offset(&lock(session));
     state.dump(feed.as_mut())?;
     health.event(format!("{} neighbors from {}", state.shared.lock().len(), feed.name()));
     let mut lost = feed.lost();
@@ -101,8 +112,9 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
         if let Err(e) = feed.recv(WAIT_MS, BATCH, &mut ev) {
             break Err(e.to_string());
         }
-        // The lab answers at once; the kernel waits for events.
-        if lab && ev.is_empty() && !health.sleep(Duration::from_millis(u64::from(WAIT_MS))) {
+        // The lab answers at once (it would spin); the kernel waits for
+        // events itself.
+        if lab && !health.sleep(Duration::from_millis(u64::from(WAIT_MS))) {
             break Ok(());
         }
         if settings_at.elapsed() >= SETTINGS_EVERY {
@@ -112,7 +124,7 @@ fn run(session: &Shared, health: &super::Health) -> Result<(), String> {
         }
         if !ev.is_empty() {
             state.enforce(&ev);
-            state.shared.lock().apply(&ev, unix());
+            state.shared.lock().apply(&ev, state.now());
         }
         if feed.lost() != lost {
             lost = feed.lost();
@@ -138,6 +150,8 @@ struct State {
     statics: BTreeSet<(IfName, IpAddr)>,
     lab: bool,
     warned_full: [bool; 2],
+    /// The session clock minus this machine's ([`clock_offset`]).
+    offset: i64,
 }
 
 impl State {
@@ -149,14 +163,19 @@ impl State {
             log::warn!("neighbors: the table holds more than the engine keeps");
         }
         let mut t = self.shared.lock();
-        t.load(all, unix());
+        t.load(all, self.now());
         t.fed = true;
         t.source = feed.name();
         Ok(())
     }
 
+    fn now(&self) -> u64 {
+        u64::try_from(i64::try_from(unix()).unwrap_or(0).saturating_add(self.offset)).unwrap_or(0)
+    }
+
     fn settings(&mut self, session: &Shared) {
         let s = lock(session);
+        self.offset = clock_offset(&s);
         let arp = &s.store().running().ip.arp;
         self.reply_only = arp
             .interfaces
