@@ -46,6 +46,8 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-radius", 2),
     // G4.3h: BNG high availability: sync protocol, role machine, fencing (sans-IO).
     ("corerouter-proto-ha", 2),
+    // G3.6: BFD (RFC 5880/5881/5883) codec, session machine, timer wheel (sans-IO).
+    ("corerouter-proto-bfd", 2),
     // G3.1: the FRR driver renders with the proto-* crates (L2), so it sits
     // beside them; as a platform crate only the apps use it.
     ("corerouter-hal-frr", 2),
