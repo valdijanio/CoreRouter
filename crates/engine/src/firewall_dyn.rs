@@ -15,8 +15,10 @@ use crate::Session;
 /// Dynamic ids live apart from the config's (`*D0000001`…), so a static
 /// entry and a dynamic one never share an id.
 pub const ID_BASE: u32 = 0xD000_0000;
-/// Hostile-input bound (**estimado**).
-pub const MAX_DYNAMIC: usize = 65_536;
+/// Hostile-input bound. G4.10b: 262 144, so RADIUS / PPP can put every
+/// subscriber of a big ISP in a notice list (100 000 in one kernel set cost
+/// one lookup per packet, **medido** in `hal-linux/benches/netns_notice.rs`).
+pub const MAX_DYNAMIC: usize = 262_144;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicEntry {
@@ -65,6 +67,12 @@ impl DynamicLists {
     pub fn find(&self, list: &Name, address: &AddrMatch) -> Option<&DynamicEntry> {
         let pos = self.index.get(&(list.clone(), *address))?;
         self.entries.get(*pos)
+    }
+
+    /// Changes when an entry comes or goes (the count and the last id
+    /// handed out): a reader can skip a walk when it did not change.
+    pub fn stamp(&self) -> (usize, u32) {
+        (self.entries.len(), self.next)
     }
 
     pub fn next_id(&mut self) -> ItemId {

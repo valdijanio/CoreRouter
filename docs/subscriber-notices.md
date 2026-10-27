@@ -151,18 +151,21 @@ Decisões que saem dessa tabela:
 - **Conexões já abertas no fast path** (XDP, flowtable): ao entrar em `block`, as conexões do
   assinante são encerradas (`connections_kill`), senão um download em andamento continuaria pelo
   caminho rápido (G4.10b).
-- **Limite de entradas dinâmicas** (`MAX_DYNAMIC` = 65 536): o RADIUS e o PPP usam listas
-  dinâmicas; acima disso, o sistema do provedor deve usar entradas estáticas (sem limite próprio;
-  100 mil medidos na G4.10b).
+- **Limite de entradas**: 262 144 estáticas e 262 144 dinâmicas (eram 65 536; subiu na G4.10b,
+  com 100 mil medidos: 0,24 s para carregar a tabela, um lookup por pacote).
 - **TV e IoT** não mostram portal: por isso o webhook.
 - **Falso positivo de sonda**: intercepta só a porta 80 dos IPs das sondas; HTTPS para os mesmos
   IPs (Google, Apple) segue intocado no modo `notice`.
 
 ## Desempenho e paralelismo
 
-- **Trabalho por pacote**: uma consulta de conjunto (hash/intervalo do nftables) por cadeia, nada
-  por assinante; 100 mil assinantes listados = um conjunto de 100 mil elementos, sem regra por
-  assinante (medido na G4.10b).
+- **Trabalho por pacote**: para quem não é membro, um lookup de conjunto por perfil e gancho, e
+  um salto para a cadeia do perfil só para os membros. Nada é feito por assinante: 100 mil
+  assinantes listados são um conjunto de 100 mil elementos. Medido na G4.10b: −11% de pps num
+  núcleo contra uma base com conntrack (1,40 → 1,24 Mpps, UDP de 64 B).
+- **Paralelismo**: o nftables roda no softirq de cada CPU e lê os conjuntos sob RCU, sem lock
+  entre núcleos. Com RSS/RPS espalhando as filas, o custo escala com os núcleos. O laboratório
+  mede um núcleo.
 - **Trabalho por assinante**: a entrada ou saída de uma lista é um elemento de conjunto
   (`address_list_dynamic`), O(1).
 - **Portal**: servidor com número de conexões e de bytes por requisição limitados, threads

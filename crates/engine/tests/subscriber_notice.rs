@@ -651,3 +651,58 @@ fn lease_and_secret_block_with_page() {
         Err(EngineError::Disabled { .. })
     ));
 }
+
+#[test]
+fn throttle_members_get_a_dynamic_queue_and_lose_it_on_leaving() {
+    let mut s = lab();
+    ok(
+        &mut s,
+        "ip.subscriber-notice.profile.add",
+        json!({"name": "lento", "mode": "throttle", "address_list": "reduzidos", "rate_limit": "1M/1M"}),
+    );
+    let id = ok(
+        &mut s,
+        "ip.firewall.address-list.add",
+        json!({"list": "reduzidos", "address": "100.64.0.30"}),
+    )["id"]
+        .clone();
+    let q = ok(&mut s, "queue.simple.list", json!({"origin": "notice"}));
+    assert_eq!(q["total"], 1, "{q}");
+    assert_eq!(q["rows"][0]["name"], "notice<lento>");
+    assert_eq!(q["rows"][0]["target"], "100.64.0.30");
+    ok(&mut s, "ip.firewall.address-list.remove", json!({"id": id}));
+    assert_eq!(
+        ok(&mut s, "queue.simple.list", json!({"origin": "notice"}))["total"],
+        0
+    );
+}
+
+#[test]
+fn the_generated_ruleset_has_the_notice_chains() {
+    let mut s = lab();
+    ok(
+        &mut s,
+        "ip.subscriber-notice.profile.add",
+        json!({"name": "atraso", "mode": "block", "address_list": "bloqueados"}),
+    );
+    let script = corerouter_firewall::script(s.store().running(), &[]);
+    assert!(script.contains("chain notice_dstnat"), "{script}");
+    assert!(
+        script.contains("set al4_bloqueados"),
+        "the profile's list has its set even when empty: {script}"
+    );
+    assert!(script.contains("set al4_sn-garden"), "{script}");
+    ok(
+        &mut s,
+        "ip.subscriber-notice.settings.set",
+        json!({"portal_address": "100.64.0.1"}),
+    );
+    let script = corerouter_firewall::script(s.store().running(), &[]);
+    assert!(script.contains("dnat ip to 100.64.0.1:8880"), "{script}");
+    fails(
+        &mut s,
+        "ip.subscriber-notice.settings.set",
+        json!({"portal_address": "x"}),
+        "address",
+    );
+}

@@ -355,6 +355,12 @@ pub struct Settings {
     /// the router's address on the subscriber's side.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub portal_host: String,
+    /// Where the redirect sends port 80 (`dnat` to this address of the
+    /// router); `None`: the address of the interface it came in by
+    /// (`redirect`). Set it when subscribers arrive on an interface with no
+    /// address of that family (PPPoE through the XDP data plane).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub portal_address: Option<std::net::IpAddr>,
     /// RFC 8908 API URI, `https://` with a valid certificate for its name;
     /// when set, DHCP option 114 and RA option 37 announce it (RFC 8910).
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -369,6 +375,7 @@ impl Default for Settings {
         Self {
             port: DEFAULT_PORT,
             portal_host: String::new(),
+            portal_address: None,
             capport_url: String::new(),
             webhook_url: String::new(),
         }

@@ -65,7 +65,7 @@ apontar o parâmetro):
 - `jump` para chain nativa ou para a própria chain, laços de `jump` (`a → b → a`): erro;
 - nomes (listas, chains, marcas): letras, dígitos, `-`, `_`, `.`, até 63; `log_prefix` ASCII
   imprimível sem `"`/`\`, até 64; limites contra entrada hostil: 4096 regras por tabela,
-  65 536 entradas de address-list, 256 listas, 4096 membros (**estimados**).
+  262 144 entradas de address-list (G4.10b; eram 65 536), 256 listas, 4096 membros (**estimados**).
 
 ## 3. Render nftables
 

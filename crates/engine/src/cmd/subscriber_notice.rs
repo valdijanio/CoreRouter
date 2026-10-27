@@ -23,10 +23,10 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.subscriber-notice.settings.get", "Subscriber Notice Settings", [], None,
-        "{} → {port, portal_host, capport_url, webhook_url, probes: int (OS probe hosts known)}",
+        "{} → {port, portal_host, portal_address?, capport_url, webhook_url, probes: int (OS probe hosts known)}",
         always, settings_print),
     cmd!("ip.subscriber-notice.settings.set", "Set Subscriber Notice Settings", [], None,
-        "{port?: int 1..65535 (the portal on the router; default 8880), portal_host?: string (name in the redirect, aviso.provedor.com.br; empty: the router's address on the subscriber's side), capport_url?: string (RFC 8908 API, https:// with a valid certificate; announced by DHCP option 114 and RA option 37; empty: not announced), webhook_url?: string (http(s):// POSTed a JSON event when a subscriber enters or leaves a profile's list; empty: off)} → {port}",
+        "{port?: int 1..65535 (the portal on the router; default 8880), portal_host?: string (name in the redirect, aviso.provedor.com.br; empty: the router's address on the subscriber's side), portal_address?: ip | \"\" (port 80 goes to this address of the router; empty: the address of the interface it came in by. Set it for PPPoE through the XDP data plane), capport_url?: string (RFC 8908 API, https:// with a valid certificate; announced by DHCP option 114 and RA option 37; empty: not announced), webhook_url?: string (http(s):// POSTed a JSON event when a subscriber enters or leaves a profile's list; empty: off)} → {port}",
         always, settings_set),
     cmd!("ip.subscriber-notice.profile.add", "Add Notice Profile", ["IP", "Subscriber Notices"], None,
         "{name: string, mode: block|notice|throttle, address_list: string (the firewall list whose members get it; RADIUS Mikrotik-Address-List, PPP profiles and DHCP leases fill it), page?: string (a page's name; empty: the built-in one), intercept?: probes|http (what port 80 goes to the page; default http for block, probes for notice and throttle), interval?: duration (notice/throttle: page again after; default 1d), timeout?: duration (notice/throttle: stop if not seen within; 0 never; default 1h), rate_limit?: string (throttle: rx/tx, 1M/1M), kill_connections?: bool (block: end open connections on entry; default yes), webhook?: bool (default yes), disabled?: bool, comment?: string} → {id}",
@@ -154,7 +154,7 @@ fn ip_param(p: &Value) -> Result<IpAddr> {
 fn settings_print(s: &mut Session, _: &Value) -> Result<Value> {
     let st = &cfg(s).settings;
     Ok(json!({
-        "port": st.port, "portal_host": st.portal_host, "capport_url": st.capport_url,
+        "port": st.port, "portal_host": st.portal_host, "portal_address": st.portal_address, "capport_url": st.capport_url,
         "webhook_url": st.webhook_url, "probes": probes::hosts().len(),
     }))
 }
@@ -179,6 +179,13 @@ fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
             return Err(EngineError::bad("portal_host", "a domain name or an address"));
         }
         h.clone_into(&mut st.portal_host);
+    }
+    match opt_str(p, "portal_address")? {
+        Some(t) if t.trim().is_empty() => st.portal_address = None,
+        Some(t) => {
+            st.portal_address = Some(t.trim().parse::<IpAddr>().map_err(|_| EngineError::bad("portal_address", "an IPv4 or IPv6 address of the router"))?);
+        }
+        None => {}
     }
     if let Some(u) = opt_text(p, "capport_url", 255)? {
         let u = u.trim();

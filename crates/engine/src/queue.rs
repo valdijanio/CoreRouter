@@ -34,6 +34,9 @@ use crate::Session;
 /// Where a queue comes from (the Origin chip of the Queues window).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Origin {
+    /// A throttle profile of the subscriber notices (G4.10): first, so it
+    /// wins over the subscriber's own queue while it is in the list.
+    Notice,
     Pppoe,
     Ipoe,
     DhcpLease,
@@ -42,8 +45,9 @@ pub enum Origin {
 }
 
 impl Origin {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Fixed,
+        Self::Notice,
         Self::Pppoe,
         Self::Ipoe,
         Self::DhcpLease,
@@ -52,6 +56,7 @@ impl Origin {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Notice => "notice",
             Self::Pppoe => "pppoe",
             Self::Ipoe => "ipoe",
             Self::DhcpLease => "dhcp-lease",
@@ -387,6 +392,14 @@ pub fn plan(cfg: &Config, mut dynamic: Vec<Queue>) -> Plan {
     p
 }
 
+/// The dynamic queues outside the sessions: the subscriber notices'
+/// throttle profiles (G4.10), then the DHCP leases'.
+pub fn dynamic_of(s: &Session) -> Vec<Queue> {
+    let mut v = crate::subscriber_notice::throttle_queues(s);
+    v.extend(dhcp_dynamic(s));
+    v
+}
+
 /// The DHCP leases that make a queue (RouterOS: a static lease with
 /// `rate-limit`; here also a network's `rate_limit`): bound leases of
 /// servers whose leases are not subscriber sessions (those are PPP
@@ -479,7 +492,7 @@ impl Session {
     /// sessions' queues live in the subscriber maps; [`plan_with_sessions`]
     /// adds them for the list and its warnings).
     pub fn queue_plan(&self) -> Plan {
-        plan(self.store().running(), dhcp_dynamic(self))
+        plan(self.store().running(), dynamic_of(self))
     }
 
     pub fn queue_counters(&self, key: &str) -> Option<QueueCounters> {
@@ -492,7 +505,7 @@ impl Session {
 pub fn plan_with_sessions(s: &Session, sessions: &[corerouter_model::ppp::ActiveSession]) -> Plan {
     let cfg = s.store().running();
     let mut dynamic: Vec<Queue> = sessions.iter().filter_map(|a| session_queue(cfg, a)).collect();
-    dynamic.extend(dhcp_dynamic(s));
+    dynamic.extend(dynamic_of(s));
     plan(cfg, dynamic)
 }
 
@@ -661,15 +674,16 @@ pub fn shape_of(queues: &Queues, e: &corerouter_model::ppp::Effective) -> Option
 pub struct ShaperRuntime {
     pub applied: Option<corerouter_hal::queue::ShaperPlan>,
     pub error: Option<String>,
-    /// What `applied` was made from: the running revision and the DHCP
+    /// What `applied` was made from: the running revision, the dynamic
+    /// address lists (the throttle profiles' members, G4.10) and the DHCP
     /// leases' queues. The same again: the plan is the same, not resolved.
-    from: Option<(u32, Vec<Queue>)>,
+    from: Option<(u32, (usize, u32), Vec<Queue>)>,
 }
 
 impl ShaperRuntime {
     /// The DHCP queues of the last round.
     pub(crate) fn dhcp_queues(&self) -> &[Queue] {
-        self.from.as_ref().map_or(&[], |f| f.1.as_slice())
+        self.from.as_ref().map_or(&[], |f| f.2.as_slice())
     }
 }
 
@@ -683,12 +697,15 @@ impl Session {
     /// under the session lock once a second: it is resolved only when the
     /// running config (its revision) or the DHCP leases' queues changed.
     pub fn queue_sync(&mut self) -> bool {
-        let dynamic = dhcp_dynamic(self);
-        let from = (self.store().current_revision(), dynamic);
+        // The throttle profiles' queues are built only when the plan is
+        // (100 000 members: ~90 ms, **medido**, which ran every second).
+        let from = (self.store().current_revision(), self.dynamic_addresses.stamp(), dhcp_dynamic(self));
         let rt = self.ext::<ShaperRuntime>();
         let mut changed = rt.is_none_or(|r| r.applied.is_none());
         if rt.is_none_or(|r| r.from.as_ref() != Some(&from)) {
-            let plan = plan(self.store().running(), from.1.clone());
+            let mut dynamic = crate::subscriber_notice::throttle_queues(self);
+            dynamic.extend(from.2.iter().cloned());
+            let plan = plan(self.store().running(), dynamic);
             let want = shaper_plan(self.store().running(), &plan);
             changed |= rt.is_none_or(|r| r.applied.as_ref() != Some(&want));
             if changed {
