@@ -157,6 +157,12 @@ mesmo servidor (endereço, porta, VRF) duas vezes para o mesmo serviço, RadSec.
   com dispersão fixa por sessão dentro de `interim_jitter` % do intervalo, nunca depois do
   intervalo); um interim novo substitui o pendente da mesma sessão. O callback roda na thread do
   serviço, que nunca trava a sessão: os logs vão por uma fila que o serviço descarrega.
+- **Class (RFC 2865 §5.25, G4.3ha):** o NAS devolve o Class do Access-Accept **sem
+  modificar** em todo Accounting-Request da sessão (Start, Interim, Stop). O PPPoE e o IPoE os
+  leem do pacote recebido (`corerouter_engine::radius::reply_classes`), byte a byte e na ordem, até 4
+  (`AcctRequest::class`): um Class binário (o Windows NPS manda um assim) não sobrevive como
+  texto, que o monitor mostra em hex. O registro do par em alta disponibilidade os carrega, e o
+  nó que assume a sessão segue ecoando o mesmo Class (`docs/bng-ha.md`).
 - **CoA e Disconnect** (`/radius incoming`): as origens aceitas são as entradas ativas do
   `/radius`, cada uma com o seu segredo; origem desconhecida é descartada sem resposta (RFC 5176
   §5), Event-Timestamp fora da janela também; a retransmissão recebe a mesma resposta do cache,
@@ -195,7 +201,8 @@ rótulo, coluna e aba (`i18n/auto/radius_*.rs`):
   atributos da resposta; retransmissão (primeira perdida) e timeout (três envios: 100 + 200 +
   400 ms); failover com o primário caído (marcado `probing`, o próximo pedido vai direto ao
   segundo); 10 000 autenticações de uma vez sem colisão de identificador; contabilização (Start,
-  Stop, Gigawords) e `accounting=no`; dispersão de 10 000 interims; CoA aceito, retransmitido
+  Stop, Gigawords) e `accounting=no`; o Class binário (NUL, 0xff) e um de texto que parece hex
+  ecoados byte a byte no Start, no Interim e no Stop; dispersão de 10 000 interims; CoA aceito, retransmitido
   (cache), com Event-Timestamp velho (descartado), de origem desconhecida (descartado) e sem dono
   (NAK 503); recarga com pedido pendente.
 - Ponta a ponta no daemon (`apps/corerouter-daemon/tests/radius.rs`): `radius.add` e

@@ -969,6 +969,9 @@ struct Sub {
     rate: Option<String>,
     acct_id: String,
     interim: Option<u32>,
+    /// RFC 2865 §5.25: the Accept's Class attributes, echoed byte for byte
+    /// in every Accounting-Request (and carried to the pair, G4.3ha).
+    class: Vec<Vec<u8>>,
     xdp: Option<u32>,
     up_at: Option<Millis>,
     limit_in: u64,
@@ -1895,6 +1898,7 @@ impl Bng {
         let attrs = x.acct_attributes();
         let acct = (sub.radius || self.cfg.ppp.aaa.use_radius) && self.cfg.ppp.aaa.accounting;
         let acct_id = sub.acct_id.clone();
+        let class = sub.class.clone();
         let interim = sub.interim;
         let nets: Vec<Ipv6Net> = [&x.link, &x.delegated]
             .into_iter()
@@ -1927,6 +1931,7 @@ impl Bng {
                 terminate_cause: None,
                 interim_secs: interim,
                 attributes: attrs,
+                class,
             };
             if let Err(e) = aaa.account(req, None) {
                 self.log(
@@ -2285,6 +2290,7 @@ impl Bng {
             rate: None,
             acct_id: String::new(),
             interim: None,
+            class: Vec::new(),
             xdp: None,
             up_at: None,
             limit_in: 0,
@@ -2678,6 +2684,7 @@ impl Bng {
                         sub.want_refused = refused;
                         sub.radius6 = r6;
                         sub.effective = e;
+                        sub.class = corerouter_engine::radius::reply_classes(&done.reply);
                         if list.is_some() {
                             sub.effective.address_list = list;
                         }
@@ -2880,6 +2887,7 @@ impl Bng {
                     a.extend(route_attributes(&adm.routes));
                     a
                 },
+                class: sub.class.clone(),
             };
             if let Err(e) = aaa.account(req, Some(src)) {
                 self.log(
@@ -3076,6 +3084,7 @@ impl Bng {
                         a.extend(route_attributes(&sub.routes));
                         a
                     },
+                    class: sub.class.clone(),
                 };
                 if let Err(e) = aaa.account(req, None) {
                     self.log(

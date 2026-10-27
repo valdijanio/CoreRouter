@@ -55,6 +55,12 @@ impl TestRadius {
         for i in 0..10 {
             s.add_user(&format!("u{i}"), "pw", AttrList::new());
         }
+        // G4.3ha: two Class attributes, one binary (NUL, 0xff) and one
+        // text that looks like the hex the monitor shows.
+        let mut reply = AttrList::new();
+        reply.push(attr::CLASS, &CLASS_BIN).unwrap();
+        reply.push(attr::CLASS, b"0xab").unwrap();
+        s.add_user("cls", "pw", reply);
         let srv = Arc::new(Mutex::new(s));
         let stop = Arc::new(AtomicBool::new(false));
         let mut threads = Vec::new();
@@ -314,6 +320,7 @@ fn acct(status: AcctStatus, session: &str) -> AcctRequest {
         terminate_cause: (status == AcctStatus::Stop).then_some(1),
         interim_secs: None,
         attributes: Vec::new(),
+        class: Vec::new(),
     }
 }
 
@@ -345,6 +352,38 @@ fn accounting_reaches_the_server_and_can_be_off() {
     r.aaa.account(acct(AcctStatus::Start, "S-2"), None).unwrap();
     thread::sleep(Duration::from_millis(500));
     assert_eq!(srv.srv.lock().unwrap().accounting.len(), 2);
+}
+
+const CLASS_BIN: [u8; 6] = [0x00, 0xff, 0x01, b'P', 0x00, 0x7f];
+
+/// G4.3ha, RFC 2865 §5.25: every Class of the Accept, byte for byte and in
+/// order, in the Start, the Interim and the Stop.
+#[test]
+fn class_is_echoed_byte_for_byte_in_every_accounting_request() {
+    let srv = TestRadius::start(8);
+    let r = start(vec![srv.entry(1)]);
+    let ok = auth(&r.aaa, "cls", "pw");
+    assert_eq!(ok.outcome, AuthOutcome::Accept, "{ok:?}");
+    let class = corerouter_engine::radius::reply_classes(&ok);
+    assert_eq!(class, vec![CLASS_BIN.to_vec(), b"0xab".to_vec()]);
+    for status in [AcctStatus::Start, AcctStatus::InterimUpdate, AcctStatus::Stop] {
+        let mut req = acct(status, "S-CLS");
+        req.class = class.clone();
+        r.aaa.account(req, None).unwrap();
+    }
+    let t = Instant::now();
+    while srv.srv.lock().unwrap().accounting.len() < 3 {
+        assert!(t.elapsed() < Duration::from_secs(10), "accounting not received");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let log = srv.srv.lock().unwrap().accounting.clone();
+    assert_eq!(log.iter().map(|l| l.status).collect::<Vec<_>>(), [1, 3, 2]);
+    for l in &log {
+        assert_eq!(l.class, class, "{:?}", l.status);
+    }
+    // A user without Class sends none.
+    let plain = auth(&r.aaa, "u1", "pw");
+    assert!(corerouter_engine::radius::reply_classes(&plain).is_empty());
 }
 
 #[test]
