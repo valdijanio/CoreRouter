@@ -142,6 +142,28 @@ impl Vty {
         self.read_reply()
     }
 
+    /// Run one command and read its answer as a stream (G3.2c: a full
+    /// table's routes are hundreds of MiB of JSON; they are parsed as they
+    /// arrive instead of held). Read the [`Stream`] to its end before the
+    /// next command; a stream dropped early leaves the connection unusable.
+    pub fn run_stream(&mut self, command: &str, max: u64) -> io::Result<Stream<'_>> {
+        if command.len() > MAX_COMMAND || command.bytes().any(|b| b == 0 || b == b'\n') {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "command refused"));
+        }
+        let mut msg = Vec::with_capacity(command.len() + 1);
+        msg.extend_from_slice(command.as_bytes());
+        msg.push(0);
+        self.stream.write_all(&msg)?;
+        self.buf.clear();
+        Ok(Stream {
+            vty: self,
+            start: 0,
+            code: None,
+            total: 0,
+            max,
+        })
+    }
+
     fn read_reply(&mut self) -> io::Result<Reply> {
         self.buf.clear();
         let mut scanned = 0usize;
@@ -176,6 +198,80 @@ impl Vty {
             }
             self.buf
                 .extend_from_slice(self.chunk.get(..n).unwrap_or_default());
+        }
+    }
+}
+
+/// The answer of [`Vty::run_stream`]: the output bytes, then `code`.
+pub struct Stream<'a> {
+    vty: &'a mut Vty,
+    /// Bytes of `vty.buf` before `start` were handed out.
+    start: usize,
+    code: Option<u8>,
+    total: u64,
+    max: u64,
+}
+
+impl Stream<'_> {
+    /// The command's code, once the stream reached its end.
+    pub fn code(&self) -> Option<u8> {
+        self.code
+    }
+
+    /// Read what is left (a parser that stopped early) and give the code.
+    pub fn finish(mut self) -> io::Result<u8> {
+        let mut sink = [0u8; 64 * 1024];
+        while self.code.is_none() {
+            if self.read(&mut sink)? == 0 && self.code.is_none() {
+                break;
+            }
+        }
+        self.code
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no end marker"))
+    }
+}
+
+impl Read for Stream<'_> {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if self.code.is_some() {
+                return Ok(0);
+            }
+            let pending = self.vty.buf.get(self.start..).unwrap_or_default();
+            // Text never holds a NUL: the first one starts the marker
+            // (three NULs and the code).
+            let nul = pending.iter().position(|&b| b == 0);
+            let avail = nul.unwrap_or(pending.len());
+            if avail > 0 {
+                let n = avail.min(out.len());
+                if let (Some(dst), Some(src)) = (out.get_mut(..n), pending.get(..n)) {
+                    dst.copy_from_slice(src);
+                }
+                self.start += n;
+                return Ok(n);
+            }
+            if nul.is_some() && pending.len() >= 4 {
+                self.code = pending.get(3).copied();
+                self.vty.buf.clear();
+                self.start = 0;
+                return Ok(0);
+            }
+            // Keep only what is not handed out yet, then read more.
+            self.vty.buf.drain(..self.start);
+            self.start = 0;
+            if self.total > self.max {
+                return Err(io::Error::other(format!("answer longer than {} bytes", self.max)));
+            }
+            let n = self.vty.stream.read(&mut self.vty.chunk)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the daemon closed the vty connection",
+                ));
+            }
+            self.total += n as u64;
+            let chunk = self.vty.chunk.get(..n).unwrap_or_default();
+            self.vty.buf.extend_from_slice(chunk);
         }
     }
 }
@@ -265,5 +361,27 @@ mod tests {
         assert!(v.run(&"x".repeat(MAX_COMMAND + 1)).is_err());
         let e = v.run("show").unwrap_err();
         assert!(e.to_string().contains("longer than 4096"));
+    }
+
+    #[test]
+    fn answers_stream_in_pieces() {
+        let (_d, path) = fake(|cmd| match cmd {
+            "big" => ((0..50_000u32).map(|i| b'a' + (i % 26) as u8).collect(), 0),
+            _ => (b"done".to_vec(), 1),
+        });
+        let mut v = Vty::connect(&path, Duration::from_secs(5), 1024).unwrap();
+        let mut got = Vec::new();
+        let mut s = v.run_stream("big", 1 << 20).unwrap();
+        s.read_to_end(&mut got).unwrap();
+        assert_eq!(s.code(), Some(0));
+        assert_eq!(got.len(), 50_000);
+        assert_eq!(got.get(27), Some(&b'b'));
+        // The connection is usable after the stream.
+        let s = v.run_stream("x", 1 << 20).unwrap();
+        assert_eq!(s.finish().unwrap(), 1);
+        assert_eq!(v.run("y").unwrap().output, b"done");
+        // Bounded.
+        let mut s = v.run_stream("big", 1_000).unwrap();
+        assert!(s.read_to_end(&mut Vec::new()).is_err());
     }
 }

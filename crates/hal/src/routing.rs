@@ -10,6 +10,7 @@
 use std::sync::Arc;
 
 use corerouter_model::Config;
+use corerouter_model::bgp_rib::{BgpPrefix, BgpRib, Direction};
 use corerouter_model::routing_state::BgpSession;
 use corerouter_model::sealed::Sealed;
 
@@ -74,6 +75,32 @@ pub trait RoutingReader: Send {
     /// a restart quicker than one poll is still seen and the config put
     /// back. `None`: the backend cannot tell.
     fn incarnation(&mut self) -> Option<String> {
+        None
+    }
+
+    /// G3.2c: the routes of neighbor `neighbor` of instance `instance`,
+    /// one way, both families. A full table is ~1 M routes: read it
+    /// streaming, never as one buffer.
+    fn bgp_routes(
+        &mut self,
+        instance: &str,
+        neighbor: &str,
+        direction: Direction,
+    ) -> Result<BgpRib, HalError> {
+        let _ = (instance, neighbor, direction);
+        Err(HalError::Unsupported("BGP route lists".into()))
+    }
+
+    /// G3.2c: every path the daemon holds for `prefix` (an address: the
+    /// longest match), for "Why this route?".
+    fn bgp_prefix(&mut self, instance: &str, prefix: &str) -> Result<BgpPrefix, HalError> {
+        let _ = (instance, prefix);
+        Err(HalError::Unsupported("BGP prefix detail".into()))
+    }
+
+    /// G3.2c: the daemon's own view of its RTR validators, one line
+    /// (`None`: it does not validate).
+    fn rpki_state(&mut self) -> Option<String> {
         None
     }
 }
