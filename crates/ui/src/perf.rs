@@ -171,15 +171,30 @@ impl Frames {
         if let Some(traffic) = traffic
             && let Some(p) = me.app.panel_mut::<crate::queues::QueuesPanel>()
         {
-            let row = p.simple.get("rows").and_then(|r| r.get(0)).cloned().unwrap_or_default();
+            let row = p
+                .simple
+                .get("rows")
+                .and_then(|r| r.get(0))
+                .cloned()
+                .unwrap_or_default();
             let mut panel = std::mem::take(p);
             panel.open_view(&mut me.app, &row);
             if let Some(v) = panel.view.as_mut() {
-                v.page = if traffic { Page::Traffic } else { Page::Statistics };
+                v.page = if traffic {
+                    Page::Traffic
+                } else {
+                    Page::Statistics
+                };
                 v.live.window = 900;
                 for t in 0..900u64 {
                     let wave = (t % 120) as f64 / 120.0;
-                    v.live.ring.push_back(Point { t: 1_800_000_000 + t, up: 8e6 * wave, down: 45e6 * wave, delay: 3.0, drops: 1.0 });
+                    v.live.ring.push_back(Point {
+                        t: 1_800_000_000 + t,
+                        up: 8e6 * wave,
+                        down: 45e6 * wave,
+                        delay: 3.0,
+                        drops: 1.0,
+                    });
                 }
             }
             if let Some(p) = me.app.panel_mut::<crate::queues::QueuesPanel>() {

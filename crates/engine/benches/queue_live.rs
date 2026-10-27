@@ -36,15 +36,25 @@ fn with_queues(n: usize, mib: u32) -> Session {
     let mut cfg = Session::virtual_lab().store().running().clone();
     for i in 0..n {
         let target = format!("10.{}.{}.{}/32", i >> 16, (i >> 8) & 255, i & 255);
-        let mut q = SimpleQueue::new(ItemId(i as u32 + 1), format!("queue{}", i + 1), vec![target.parse().unwrap()]);
+        let mut q = SimpleQueue::new(
+            ItemId(i as u32 + 1),
+            format!("queue{}", i + 1),
+            vec![target.parse().unwrap()],
+        );
         q.max_limit = "10M/50M".parse().unwrap();
         cfg.queue.simple.push(q);
     }
     cfg.queue.next_id = n as u32;
     cfg.system.graphing.max_memory_mib = mib;
     let storage = MemoryStorage::default();
-    storage.put(Slot::Current, Some(persist::encode(&ConfigStore::new(cfg)).unwrap()));
-    let mut s = Session::with_storage(Box::new(corerouter_hal::virt::VirtualHal::default()), Box::new(storage));
+    storage.put(
+        Slot::Current,
+        Some(persist::encode(&ConfigStore::new(cfg)).unwrap()),
+    );
+    let mut s = Session::with_storage(
+        Box::new(corerouter_hal::virt::VirtualHal::default()),
+        Box::new(storage),
+    );
     s.tick(T0);
     // The lab's shaper counts every queue once.
     s.queue_sync();
@@ -56,23 +66,33 @@ fn stats(c: &mut Criterion) {
     for n in [10_000usize, 100_000] {
         let mut s = with_queues(n, 64);
         let name = format!("queue{}", n / 2);
-        s.execute("queue.simple.stats", &json!({"id": name})).unwrap();
+        s.execute("queue.simple.stats", &json!({"id": name}))
+            .unwrap();
         g.bench_function(BenchmarkId::new("cached", n), |b| {
-            b.iter(|| s.execute("queue.simple.stats", &json!({"id": name})).unwrap());
+            b.iter(|| {
+                s.execute("queue.simple.stats", &json!({"id": name}))
+                    .unwrap()
+            });
         });
         g.bench_function(BenchmarkId::new("first", n), |b| {
             b.iter(|| {
                 *s.ext_mut::<QueueWatch>().unwrap() = QueueWatch::default();
-                s.execute("queue.simple.stats", &json!({"id": name})).unwrap()
+                s.execute("queue.simple.stats", &json!({"id": name}))
+                    .unwrap()
             });
         });
         // The last queue to the top: ids out of order from here on.
-        s.execute("queue.simple.move", &json!({"id": format!("queue{n}"), "destination": "queue1"})).unwrap();
+        s.execute(
+            "queue.simple.move",
+            &json!({"id": format!("queue{n}"), "destination": "queue1"}),
+        )
+        .unwrap();
         s.queue_sync();
         g.bench_function(BenchmarkId::new("first_moved", n), |b| {
             b.iter(|| {
                 *s.ext_mut::<QueueWatch>().unwrap() = QueueWatch::default();
-                s.execute("queue.simple.stats", &json!({"id": name})).unwrap()
+                s.execute("queue.simple.stats", &json!({"id": name}))
+                    .unwrap()
             });
         });
     }
@@ -89,7 +109,12 @@ fn history(c: &mut Criterion) {
     );
     let mut g = c.benchmark_group("queue_graph");
     g.sample_size(20);
-    for (n, mib, kind) in [(1_000usize, 4096u32, "second"), (4_000, 4096, "second"), (10_000, 64, "capped"), (10_000, 4096, "capped")] {
+    for (n, mib, kind) in [
+        (1_000usize, 4096u32, "second"),
+        (4_000, 4096, "second"),
+        (10_000, 64, "capped"),
+        (10_000, 4096, "capped"),
+    ] {
         let mut s = with_queues(n, mib);
         s.queue_graph_sample();
         let db = s.ext::<GraphDb>().unwrap();
@@ -99,8 +124,14 @@ fn history(c: &mut Criterion) {
             db.refused_queues(),
             db.memory_bytes() as f64 / (1u64 << 20) as f64
         );
-        let id = if kind == "capped" { format!("{n}@{mib}MiB") } else { n.to_string() };
-        g.bench_function(BenchmarkId::new(kind, id), |b| b.iter(|| s.queue_graph_sample()));
+        let id = if kind == "capped" {
+            format!("{n}@{mib}MiB")
+        } else {
+            n.to_string()
+        };
+        g.bench_function(BenchmarkId::new(kind, id), |b| {
+            b.iter(|| s.queue_graph_sample())
+        });
     }
     g.finish();
 }

@@ -28,13 +28,19 @@ pub struct LabShaper {
 }
 
 fn phase(key: &str) -> u64 {
-    key.bytes().fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
+    key.bytes()
+        .fold(7u64, |h, b| h.wrapping_mul(31).wrapping_add(u64::from(b)))
 }
 
 impl LabShaper {
     pub fn apply(&mut self, plan: &ShaperPlan) {
-        self.queues = plan.queues.iter().map(|q| (q.key.clone(), q.upload, q.download)).collect();
-        self.counters.retain(|k, _| plan.queues.iter().any(|q| q.key == *k));
+        self.queues = plan
+            .queues
+            .iter()
+            .map(|q| (q.key.clone(), q.upload, q.download))
+            .collect();
+        self.counters
+            .retain(|k, _| plan.queues.iter().any(|q| q.key == *k));
     }
 
     /// One more second of counting.
@@ -45,7 +51,11 @@ impl LabShaper {
             let p = phase(key);
             let c = self.counters.entry(key.clone()).or_default();
             for (i, d) in [up, down].into_iter().enumerate() {
-                let limit = if d.rate_bps == 0 { UNLIMITED } else { d.rate_bps };
+                let limit = if d.rate_bps == 0 {
+                    UNLIMITED
+                } else {
+                    d.rate_bps
+                };
                 let x = (t + p / (i as u64 + 1)) % CYCLE;
                 let tri = if x < CYCLE / 2 { x } else { CYCLE - x };
                 // Demand, thousandths of the limit: 400..=1100.
@@ -72,9 +82,17 @@ impl LabShaper {
                 if demand > 1000 {
                     *dr = dr.wrapping_add(pkts * (demand - 1000) / 1000);
                 }
-                *q = if i == 1 && demand > 900 { (demand - 900) * 200 } else { 0 };
+                *q = if i == 1 && demand > 900 {
+                    (demand - 900) * 200
+                } else {
+                    0
+                };
             }
-            c.pcq_queues = if up.pcq.is_some() || down.pcq.is_some() { 3 + (p % 20) as u32 } else { 0 };
+            c.pcq_queues = if up.pcq.is_some() || down.pcq.is_some() {
+                3 + (p % 20) as u32
+            } else {
+                0
+            };
         }
         ShaperStatus {
             queues: self.counters.iter().map(|(k, c)| (k.clone(), *c)).collect(),
@@ -92,9 +110,16 @@ mod tests {
     #[test]
     fn counts_a_cycle_at_and_below_the_limit() {
         let mut lab = LabShaper::default();
-        let spec = DirSpec { rate_bps: 2_000_000, ..DirSpec::default() };
+        let spec = DirSpec {
+            rate_bps: 2_000_000,
+            ..DirSpec::default()
+        };
         lab.apply(&ShaperPlan {
-            queues: vec![QueueSpec { key: "*1".into(), upload: spec, download: spec }],
+            queues: vec![QueueSpec {
+                key: "*1".into(),
+                upload: spec,
+                download: spec,
+            }],
             ..ShaperPlan::default()
         });
         let mut max = 0;

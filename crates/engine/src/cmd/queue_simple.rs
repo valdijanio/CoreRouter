@@ -484,7 +484,7 @@ fn graph_of(s: &Session, q: &Queue) -> bool {
     let g = &s.store().running().system.graphing;
     match q.origin {
         Origin::Fixed => q.graph,
-        _ => g.dynamic_queues || g.queue_include.iter().any(|n| *n == q.name),
+        _ => g.dynamic_queues || g.queue_include.contains(&q.name),
     }
 }
 

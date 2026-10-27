@@ -64,7 +64,7 @@ fn graph(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::bad("id", "the name is too long for a series (64 bytes with 'queue:')"));
     }
     let g = &mut s.store_mut().candidate_mut().system.graphing;
-    let had = g.queue_include.iter().any(|n| *n == name);
+    let had = g.queue_include.contains(&name);
     if on && !had {
         if g.queue_include.len() >= MAX_NAMES {
             return Err(EngineError::bad("graph", format!("at most {MAX_NAMES} marked queues (system.graph.set dynamic_queues keeps them all)")));

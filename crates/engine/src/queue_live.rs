@@ -309,7 +309,7 @@ impl Session {
             match w.last {
                 Some((t, p)) if now > t => {
                     let dt = now - t;
-                    let per = |a: [u64; 2], b: [u64; 2]| [0, 1].map(|i| a[i].saturating_sub(b[i]) / dt);
+                    let per = |[a0, a1]: [u64; 2], [b0, b1]: [u64; 2]| [a0.saturating_sub(b0) / dt, a1.saturating_sub(b1) / dt];
                     w.samples.push_back(Sample {
                         t: now,
                         rate: c.rate_bps,
@@ -337,11 +337,12 @@ impl Session {
         let fresh = w.samples.back().is_some_and(|x| now.saturating_sub(x.t) <= 2);
         let per_s = |v: [u64; 2]| if fresh { json!(v) } else { Value::Null };
         let limits = pair(&|l| l.max_limit);
-        let at = [0, 1].map(|d| at_limit(&w.samples, d, limits[d]));
+        let [lim_up, lim_down] = limits;
+        let at = [at_limit(&w.samples, 0, lim_up), at_limit(&w.samples, 1, lim_down)];
         let graphing = &self.store().running().system.graphing;
         let marked = match q.origin {
             crate::queue::Origin::Fixed => q.graph,
-            _ => graphing.dynamic_queues || graphing.queue_include.iter().any(|n| *n == q.name),
+            _ => graphing.dynamic_queues || graphing.queue_include.contains(&q.name),
         };
         let series = queue_key(&q.name);
         let db = self.ext::<GraphDb>();
