@@ -63,6 +63,8 @@ pub struct AcctLog {
     pub input_octets: u64,
     pub output_octets: u64,
     pub at_ms: u64,
+    /// Every Class, as it came (RFC 2865 §5.25: echoed from the Accept).
+    pub class: Vec<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -357,6 +359,11 @@ impl TestServer {
             input_octets,
             output_octets,
             at_ms: now_ms,
+            class: p
+                .attributes()
+                .filter(|a| a.typ == attr::CLASS)
+                .map(|a| a.value.to_vec())
+                .collect(),
         });
         let mut b = Builder::new(Code::AccountingResponse, p.identifier());
         Self::echo_proxy_state(&mut b, p);

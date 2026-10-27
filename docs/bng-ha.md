@@ -411,8 +411,10 @@ laboratório (gap G4.3hf).
   uma OLT ou a um switch; MAC virtual por porta fica para uma gap, se alguém precisar.
 - **CoA/DM depois da tomada:** o servidor de cobrança manda o CoA ao endereço de NAS do nó antigo.
   É preciso um endereço de NAS do par ou o encaminhamento pelo par (gap G4.3hb).
-- **Class (RFC 2865 §5.25):** o PPP ainda não ecoa o Class na contabilização. O registro já tem
-  o campo (gap G4.3ha).
+- **Class (RFC 2865 §5.25, G4.3ha):** o PPPoE e o IPoE ecoam o Class do Accept, byte a byte, em
+  todo Accounting-Request; o registro o carrega (um TLV: 3 B + o tamanho), e o nó que assume
+  manda o Interim e o Stop com o mesmo Class. O laboratório `ha` dá a cada usuário um Class
+  binário próprio e conta os registros sem ele (coluna "Registros sem o Class do usuário").
 - **DHCPv6-PD:** o prefixo delegado é reservado e anunciado no nó novo, e o Renew do CPE é
   atendido a partir da concessão refeita. O estado fino do DHCPv6 (T1/T2 em curso) não é copiado.
 

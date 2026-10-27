@@ -88,7 +88,8 @@ struct Authz {
     radius: bool,
     rate: Option<String>,
     interim: Option<u32>,
-    class: Option<String>,
+    /// RFC 2865 §5.25: the Accept's Class attributes, byte for byte.
+    class: Vec<Vec<u8>>,
     profile: String,
     /// G4.3cd: the routes of the Accept and the texts refused already.
     routes: Vec<(FramedRoute, RouteOrigin)>,
@@ -117,7 +118,8 @@ struct Sub {
     acct: bool,
     acct_id: String,
     interim: Option<u32>,
-    class: Option<String>,
+    /// RFC 2865 §5.25: the Accept's Class attributes, byte for byte.
+    class: Vec<Vec<u8>>,
     up_at: u64,
     keepalive: Option<u32>,
     /// Keepalive: when it last showed life (ms), pings sent unanswered,
@@ -362,7 +364,7 @@ fn accept(
         radius: true,
         rate,
         interim: attr("Acct-Interim-Interval").and_then(|v| v.parse().ok()),
-        class: attr("Class"),
+        class: corerouter_engine::radius::reply_classes(reply),
         profile,
         routes,
         refused,
@@ -814,7 +816,7 @@ impl Core {
             acct: srv.use_radius != UseRadius::No,
             acct_id: acct_id.clone(),
             interim: authz.as_ref().and_then(|a| a.interim),
-            class: authz.as_ref().and_then(|a| a.class.clone()),
+            class: authz.as_ref().map(|a| a.class.clone()).unwrap_or_default(),
             up_at: unix,
             keepalive: srv.ipoe_keepalive,
             alive_ms: now,
@@ -918,11 +920,11 @@ impl Core {
                     &srv.interface,
                     circuit.as_deref(),
                     remote.as_deref(),
-                    class.as_deref(),
                 );
                 v.extend(route_attributes(&adm.routes));
                 v
             },
+            class,
         };
         // An old session's Stop first (it went out of the lock already, as `out`).
         if let Some(o) = out
@@ -1021,11 +1023,11 @@ impl Core {
                 terminate_cause: Some(cause),
                 interim_secs: None,
                 attributes: {
-                    let mut v =
-                        acct_attributes(s.ip, &mac, &s.interface, None, None, s.class.as_deref());
+                    let mut v = acct_attributes(s.ip, &mac, &s.interface, None, None);
                     v.extend(route_attributes(&s.routes));
                     v
                 },
+                class: s.class,
             },
             source: None,
         })
@@ -1188,7 +1190,6 @@ fn acct_attributes(
     interface: &IfName,
     circuit: Option<&str>,
     remote: Option<&str>,
-    class: Option<&str>,
 ) -> Vec<Attribute> {
     let mut v = vec![
         Attribute::new("Framed-IP-Address", ip.to_string()),
@@ -1201,10 +1202,6 @@ fn acct_attributes(
     }
     if let Some(r) = remote {
         v.push(Attribute::new("ADSL-Agent-Remote-Id", r));
-    }
-    // RFC 2865 §5.25: Class back as it came.
-    if let Some(c) = class {
-        v.push(Attribute::new("Class", c));
     }
     v
 }
