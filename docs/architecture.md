@@ -340,9 +340,12 @@ perdia). O limite de tamanho por commit usa um teto (config do slot + bytes das 
 uma linha só pode crescer a config com o que carrega) e mede a config de verdade só quando o teto
 passa do limite. Comparado com só gravar o slot sem fsync, ou um banco embutido: o journal mantém
 o formato que versões anteriores leem no slot, um fsync pequeno por commit e nenhuma dependência.
-Risco aceito: um build anterior ao G0.22 que bootar este diretório lê só o slot e perde as linhas
-desde o último checkpoint; até a G0.27 (checkpoint no desligamento do daemon), voltar de versão
-pede um checkpoint antes (mudar um usuário força um).
+Um build anterior ao G0.22 que bootar este diretório lê só o slot e perderia as linhas desde o
+último checkpoint: por isso o daemon faz um checkpoint no desligamento limpo (G0.27,
+`Session::checkpoint`, depois do lock final do `SIGTERM`/`SIGINT`). O journal não muda de
+formato: ele guarda as linhas que o slot `previous` ainda precisa, e o boot seguinte as pula
+(revisão já no slot), sem replay. Risco que sobra: uma queda (sem desligamento limpo) seguida de
+uma volta de versão perde as linhas desde o último checkpoint.
 
 As seções grandes são `CowArc` (G0.16), e `model::config_delta` trabalha seção por seção nos dois
 sentidos:

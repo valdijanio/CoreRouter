@@ -59,7 +59,9 @@
 //! discovery goodbye (CRDP hold 0, and with the linux backend LLDP TTL 0)
 //! on every interface it announced on, waiting at most [`GOODBYE_WAIT`],
 //! then takes the session lock for good (a commit in progress finishes, no
-//! new one starts, so no save is cut short) and exits with code 0. A second
+//! new one starts, so no save is cut short), writes the config checkpoint
+//! (G0.27: the commits the config journal holds go to the slot) and exits
+//! with code 0. A second
 //! signal during the shutdown exits at once (code 130). Safe Mode active at
 //! that moment is not undone here: its changes were never saved, so the
 //! next start comes up on the config from before it, as G1.4 defines.
@@ -685,7 +687,20 @@ fn run_until_signal(
     service::graphing::final_store(session);
     // Held until the process ends: a commit in progress finishes first and
     // no new one (no new save) starts.
-    let s = corerouter_engine::lock(session);
+    let mut s = corerouter_engine::lock(session);
+    // G0.27: the commits of the config journal go to the slot, so the next
+    // start replays nothing and an older build reads them all.
+    let started = Instant::now();
+    match s.checkpoint() {
+        Ok(true) => log::info!(
+            "shutting down: config checkpoint written in {} ms",
+            started.elapsed().as_millis()
+        ),
+        Ok(false) => {}
+        Err(e) => log::error!(
+            "shutting down: config checkpoint failed ({e}); the next start replays the journal"
+        ),
+    }
     if s.in_safe_mode() {
         log::warn!(
             "shutting down in Safe Mode: its changes were not saved; the next start \

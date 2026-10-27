@@ -361,6 +361,94 @@ fn safe_mode_saves_through_the_journal_like_any_commit() {
     }
 }
 
+/// What a build from before the journal (G0.22) sees of `storage`: the
+/// slots and the revision files, no journal.
+fn without_journal(storage: &MemoryStorage) -> MemoryStorage {
+    let old = MemoryStorage::slots_only();
+    old.put(Slot::Current, storage.get(Slot::Current));
+    old.put(Slot::Previous, storage.get(Slot::Previous));
+    for n in storage.clone().list_revisions().unwrap() {
+        old.put_revision(n, storage.revision(n));
+    }
+    old
+}
+
+/// G0.27: the checkpoint of a clean shutdown puts every journaled commit
+/// in the slot: a restart replays nothing and gives the same store, a
+/// build that ignores the journal (a downgrade) loses no commit, the
+/// journal keeps its format (the previous slot plus the journal still
+/// give the newest), and a second checkpoint has nothing to write.
+#[test]
+fn the_shutdown_checkpoint_loses_no_journal_line() {
+    for commits in [3u32, 40, 1100] {
+        let storage = MemoryStorage::default();
+        let mut s = boot(&storage);
+        rename(&mut s, "a");
+        for i in 0..commits {
+            add(&mut s, i);
+        }
+        assert!(lines(&storage) > 0, "{commits}");
+        // Before it, an old build would boot an older revision.
+        let stale = boot(&without_journal(&storage));
+        assert_ne!(stale.store().running(), s.store().running(), "{commits}");
+
+        assert_eq!(s.checkpoint(), Ok(true), "{commits}");
+        assert_eq!(s.checkpoint(), Ok(false), "{commits}");
+        let newest = *numbers(&s).last().unwrap();
+        let slot = storage.get(Slot::Current).unwrap();
+        assert!(
+            slot.contains(&format!("\"revision\":{newest}")),
+            "{commits}: the slot holds revision {newest}"
+        );
+
+        let old = boot(&without_journal(&storage));
+        assert!(old.storage_status().boot_errors.is_empty(), "{commits}");
+        assert_eq!(old.store().running(), s.store().running(), "{commits}");
+        assert_eq!(old.store().current_revision(), newest, "{commits}");
+
+        let mut t = boot(&storage);
+        assert!(
+            t.storage_status().boot_errors.is_empty(),
+            "{commits}: {:?}",
+            t.storage_status().boot_errors
+        );
+        same_store(&mut s, &mut t);
+        // The restarted session journals again, and nothing was lost.
+        add(&mut t, 5000);
+        same_store(&mut t, &mut boot(&storage));
+
+        // The journal still pairs with the previous slot.
+        let lost = MemoryStorage::default();
+        lost.put(Slot::Previous, storage.get(Slot::Previous));
+        lost.put_journal(CONFIG_JOURNAL, storage.journal(CONFIG_JOURNAL));
+        for n in storage.clone().list_revisions().unwrap() {
+            lost.put_revision(n, storage.revision(n));
+        }
+        let u = boot(&lost);
+        assert_eq!(u.store().running(), t.store().running(), "{commits}");
+    }
+}
+
+/// G0.27 in Safe Mode: the checkpoint writes the store of the entry, never
+/// the unconfirmed changes.
+#[test]
+fn the_shutdown_checkpoint_in_safe_mode_saves_the_entry() {
+    let storage = MemoryStorage::default();
+    let mut s = boot(&storage);
+    for i in 0..5 {
+        add(&mut s, i);
+    }
+    s.execute("config.safe-mode.enter", &json!({})).unwrap();
+    for i in 100..103 {
+        add(&mut s, i);
+    }
+    assert_eq!(s.checkpoint(), Ok(true));
+    let old = boot(&without_journal(&storage));
+    assert_eq!(old.store().running().ip.firewall.address_lists.len(), 5);
+    let t = boot(&storage);
+    assert_eq!(t.store().running().ip.firewall.address_lists.len(), 5);
+}
+
 /// One step of a random session.
 #[derive(Debug, Clone)]
 enum Step {

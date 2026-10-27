@@ -12,7 +12,9 @@
 //! (what an ISP edge carries: thousands of rules, tens of thousands of
 //! address-list entries, routes and static leases) — a small commit, the
 //! boot (`Session::with_storage`), and, printed, how many of the 64
-//! revisions a reboot restores and the bytes on disk.
+//! revisions a reboot restores and the bytes on disk. `boot_after_checkpoint`
+//! (G0.27): the boot after the checkpoint of a clean shutdown, with nothing
+//! left to replay.
 //!
 //! `cargo xtask bench commit_fs`; alone: `cargo bench -p corerouter-storage-fs --bench commit`.
 //! The directory is under the build's tmp dir (a real disk, not tmpfs).
@@ -258,6 +260,21 @@ fn history64(c: &mut Criterion) {
                 .unwrap()
             });
         });
+        // The journal near its longest (a checkpoint every 1024 lines): the
+        // boot below replays what a crash, or a stop before G0.27, left.
+        let journal = |dir: &Path| {
+            std::fs::read_to_string(dir.join("journal-config.log")).map_or(0, |j| j.lines().count())
+        };
+        let mut i = 0;
+        while journal(&dir) < 1000 && i < 1100 {
+            flip = !flip;
+            s.execute(
+                "interface.set",
+                &json!({"name": "ether2", "comment": format!("j{i}")}),
+            )
+            .unwrap();
+            i += 1;
+        }
         assert!(s.storage_status().last_error.is_none());
         let memory: Vec<u32> = s.store().history().iter().map(|r| r.number).collect();
         drop(s);
@@ -287,7 +304,25 @@ fn history64(c: &mut Criterion) {
             "history64/{name}: {}",
             String::from_utf8_lossy(&child.stdout)
         );
+
+        eprintln!(
+            "history64/{name}: {} journal line(s) before the checkpoint",
+            journal(&dir)
+        );
         g.bench_function(BenchmarkId::new("boot", name), |b| {
+            b.iter(|| boot(&dir).store().history().len());
+        });
+        // G0.27: the checkpoint of a clean shutdown, then the boot after it.
+        let mut s = boot(&dir);
+        let t = std::time::Instant::now();
+        assert_eq!(s.checkpoint(), Ok(true));
+        eprintln!(
+            "history64/{name}: shutdown checkpoint {:.1} ms, {} journal line(s) kept for the previous slot",
+            t.elapsed().as_secs_f64() * 1e3,
+            journal(&dir)
+        );
+        drop(s);
+        g.bench_function(BenchmarkId::new("boot_after_checkpoint", name), |b| {
             b.iter(|| boot(&dir).store().history().len());
         });
         let _ = std::fs::remove_dir_all(&dir);
