@@ -1018,7 +1018,7 @@ descoberta e o controle pagam o custo por socket. No caminho lento, cada quadro 
 N × ~45 ns. O desenho anterior pagava o mesmo para cada quadro de sessão (N sockets presos a
 0x8864); agora pagam também os quadros que não são PPPoE, que numa porta de acesso são raros.
 
-### 12.5 IPv6 encaminhado no caminho lento (parte 2)
+### 13.5 IPv6 encaminhado no caminho lento (parte 2)
 
 Sem XDP, o BNG encaminha também o IPv6 dos assinantes, como já fazia com o IPv4:
 
@@ -1034,3 +1034,20 @@ Sem XDP, o BNG encaminha também o IPv6 dos assinantes, como já fazia com o IPv
 - **Medido** (2026-10-26, Ryzen AI Max+ 395, release): ~16 ns por consulta com 200 000 prefixos
   (100 000 sessões, um /64 e um /56 cada). Em namespace, um assinante QinQ dual-stack pinga o IPv6
   do `wan0` pelo caminho lento, e a resposta volta dentro das duas tags.
+
+### 13.6 Root e laboratório (parte 3)
+
+- **`xdp-root` na VM** (`cargo xtask vm-lab run`, kernel 7.0, 2026-10-26): os 15 testes passam. O
+  diferencial kernel × host do PPPoE (`pppoe_kernel_and_host_agree`) agora tem linhas QinQ com
+  TPID externo 0x8100 ao lado das 802.1ad; 6000 quadros concordam.
+- **BNG Blaster** (`cargo xtask bng-lab --only qinq`, etapa nova): 4000 linhas QinQ (S-tags 802.1ad
+  100–103 × C-tags 1–1000, `vlan-mode 1:1`), Service-Name `internet` numa tabela com
+  `any=drop`, Agent-Circuit-Id/Remote-Id do BNG Blaster, `max_sessions_per_vlan=1`.
+
+| Plano (VM, 8 vCPUs, release, **medido** 2026-10-26) | Sessões | Taxa | Tráfego (1 pps por sessão e sentido) |
+|---|---|---|---|
+| XDP (`--root`) | 4000 de 4000 | 7843–7894 sessões/s | 8000 de 8000 fluxos |
+| Caminho lento | 4000 de 4000 | 7794 sessões/s | 8000 de 8000 fluxos |
+
+Em todos os casos, `ppp.active` mostra as duas tags, o Service-Name e o circuit id, e um BNG
+Blaster que pede um nome descartado (`bloqueado`) não sobe nenhuma sessão.

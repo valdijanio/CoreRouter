@@ -1921,6 +1921,9 @@ fn bng_lab() {
         let n = env_or("BNG_LAB_WAVE", 100_000usize).min(max);
         radius_wave(&lab, n, env_or("BNG_LAB_RADIUS_CAP", 3000u32), &mut s);
     }
+    if want("qinq") {
+        qinq(&lab, env_or("BNG_LAB_QINQ", 4000usize).min(max), &mut s);
+    }
     if root && want("pppd") {
         pppd(&lab, &mut s);
     }
@@ -1959,6 +1962,133 @@ fn bng_lab() {
     assert!(failed.is_empty(), "lab checks failed: {failed:?}");
 }
 
+/// BNG Blaster's config of the QinQ stage (G4.3k/G4.3l): `n` subscribers
+/// on lines S-tag 802.1ad 100-103 × C-tag 1..=n/4 (1:1), asking for
+/// Service-Name `service`, with TR-101 line ids.
+fn qinq_config(n: usize, user: &str, service: &str) -> Value {
+    let mut cfg = blaster_config(n, user, 1.0, None);
+    let per = n.div_ceil(4).max(1);
+    cfg["interfaces"]["access"] = json!([{
+        "interface": "cpe0",
+        "type": "pppoe",
+        "qinq": true,
+        "vlan-mode": "1:1",
+        "outer-vlan-min": 100,
+        "outer-vlan-max": 103,
+        "inner-vlan-min": 1,
+        "inner-vlan-max": per,
+        "stream-group-id": 1,
+    }]);
+    cfg["pppoe"]["service-name"] = json!(service);
+    cfg["access-line"] = json!({"agent-circuit-id": "olt1 pon 0/1/{session-global}", "agent-remote-id": "cpe-{session-global}"});
+    cfg
+}
+
+/// G4.3k + G4.3l: QinQ lines (1:1, one session per pair of tags) with a
+/// Service-Name table, through the plane in use (XDP with root, else the
+/// slow path): setup rate, the tags, the name and the line ids in
+/// `ppp.active`, session traffic both ways, and a name the table drops
+/// getting no session.
+fn qinq(lab: &Lab, n: usize, s: &mut Summary) {
+    let tag = format!("qinq {}k", n / 1000);
+    let sc = |x: &str| format!("{tag} {x}");
+    lab.servers(false);
+    let per = n.div_ceil(4).max(1);
+    ok(
+        "interface.pppoe-server.server.set",
+        json!({"id": "pppoe-acc0", "vlan_mode": "stacked", "outer_vlan_range": "100-103",
+               "inner_vlan_range": format!("1-{per}"), "accept_untagged": false, "max_sessions_per_vlan": 1,
+               "services": [{"name": "internet"}, {"name": "any", "action": "drop"}], "force": true}),
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    let plane = lab.dataplane();
+    let t = Instant::now();
+    let bl = Blaster::start(lab, "qinq", &qinq_config(n, "user", "internet"), &[]);
+    let took = wait_long("qinq setup", 60 + (n as u64) / 200, || {
+        bl.established() as usize >= n
+    });
+    let daemon_up = wait_long("ppp.active", 30, || active() >= n).is_some();
+    let secs = took.unwrap_or_else(|| t.elapsed().as_secs_f64());
+    s.put(
+        &sc("setup"),
+        "sessões estabelecidas",
+        bl.established() as f64,
+        "sessões",
+        &format!("de {n}: 4 S-tags (802.1ad) × {per} C-tags, 1:1, Service-Name internet"),
+    );
+    s.put(
+        &sc("setup"),
+        "taxa de estabelecimento",
+        bl.established() as f64 / secs,
+        "sessões/s",
+        &format!("plano {plane}"),
+    );
+    s.check(
+        &sc("setup completo"),
+        took.is_some() && daemon_up,
+        format!("{} de {n}", active()),
+    );
+    let rows = ok("ppp.active.list", json!({"limit": 50}))["rows"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let tagged = rows.iter().all(|r| {
+        r["vlan"].as_u64().is_some_and(|v| (100..=103).contains(&v))
+            && r["inner_vlan"]
+                .as_u64()
+                .is_some_and(|v| v >= 1 && v as usize <= per)
+            && r["service_name"] == "internet"
+            && r["circuit_id"]
+                .as_str()
+                .is_some_and(|c| c.starts_with("olt1 pon 0/1/"))
+    });
+    s.check(
+        &sc("tags, Service-Name e TR-101 no ppp.active"),
+        !rows.is_empty() && tagged,
+        format!("{} linhas olhadas", rows.len()),
+    );
+    std::thread::sleep(Duration::from_secs(env_or("BNG_LAB_HOLD", 30u64).min(30)));
+    let st = bl
+        .cmd("session-traffic", Value::Null)
+        .unwrap_or(Value::Null);
+    let st = &st["session-traffic"];
+    let (total, verified) = (
+        st["total-flows"].as_f64().unwrap_or(0.0),
+        st["verified-flows"].as_f64().unwrap_or(0.0),
+    );
+    s.put(
+        &sc("tráfego"),
+        "fluxos verificados",
+        verified,
+        "fluxos",
+        &format!("de {total} (1 pps por sessão e sentido)"),
+    );
+    s.check(
+        &sc("tráfego nas duas tags"),
+        total > 0.0 && verified >= total * 0.99,
+        format!("{verified} de {total}"),
+    );
+    // BNG Blaster sends PADT as it stops; whatever is left goes by hand.
+    let _ = bl.stop(30);
+    let _ = call(None, "ppp.active.remove", json!({"server": "pppoe-acc0"}));
+    wait_long("qinq teardown", 120, || active() == 0);
+    // A name the table drops: no PADO, no session (RFC 2516 §5.2).
+    let bl = Blaster::start(lab, "qinq-drop", &qinq_config(20, "user", "bloqueado"), &[]);
+    std::thread::sleep(Duration::from_secs(15));
+    let est = bl.established();
+    s.check(
+        &sc("Service-Name descartado não sobe"),
+        est == 0 && active() == 0,
+        format!("{est} estabelecidas"),
+    );
+    bl.kill();
+    ok(
+        "interface.pppoe-server.server.set",
+        json!({"id": "pppoe-acc0", "vlan_mode": "single", "outer_vlan_range": "", "inner_vlan_range": "",
+               "accept_untagged": true, "max_sessions_per_vlan": 0, "services": [], "force": true}),
+    );
+}
+
 /// Not a test: BNG Blaster's configs of every stage into
 /// `$BNG_LAB_DUMP`, to check them against the JSON schema it ships
 /// (`/usr/share/bngblaster/bngblaster-config.json`).
@@ -1971,6 +2101,7 @@ fn dump_configs() {
     for (name, cfg) in [
         ("scale-100k", blaster_config(100_000, "user", 0.2, None)),
         ("radius", blaster_config(100, "rad", 0.0, Some(streams))),
+        ("qinq", qinq_config(4000, "user", "internet")),
     ] {
         std::fs::write(
             dir.join(format!("{name}.json")),

@@ -1055,6 +1055,11 @@ fn pppoe_kernel_and_host_agree() {
         if i % 7 == 0 {
             s.mtu = 1480;
         }
+        // G4.3l: QinQ lines with an 802.1Q outer tag too (older access
+        // gear), next to the 802.1ad ones.
+        if i % 3 == 2 && i % 4 == 1 {
+            s.outer_tpid = 0x8100;
+        }
         x.pppoe_upsert(i, &s).unwrap();
         subs.insert(i, &s, 0);
         all.push(s);

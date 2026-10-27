@@ -772,7 +772,11 @@ pub(crate) mod tests {
             let e = s.execute("interface.pppoe-server.server.set", &p).unwrap_err();
             assert!(matches!(e, EngineError::BadParam { .. }), "{bad}: {e}");
         }
-        // A single-tag server cannot take the stacked ranges.
+        // Back to one tag, emptying the stacked ranges (the BNG lab does).
+        s.execute("interface.pppoe-server.server.set", &json!({"id": "pppoe-ether2", "vlan_mode": "single", "outer_vlan_range": "", "inner_vlan_range": "", "max_sessions_per_vlan": 0, "services": [], "force": true})).unwrap();
+        let v = &s.store().running().ppp.pppoe_servers[0];
+        assert!(v.outer_vlan_range.is_empty() && v.vlan_mode == VlanMode::Single);
+                // A single-tag server cannot take the stacked ranges.
         let e = s.execute("interface.pppoe-server.server.add", &json!({"interface": "ether3", "inner_vlan_range": "5"})).unwrap_err();
         assert!(e.to_string().contains("vlan_mode=stacked"), "{e}");
     }
