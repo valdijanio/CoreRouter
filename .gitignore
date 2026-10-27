@@ -1,5 +1,7 @@
 /target
 /target-*
+# A relative CARGO_TARGET_DIR makes criterion write under the crate too.
+target-*/
 /plan/
 /dist
 /apps/corerouter-gui/dist
