@@ -14,8 +14,10 @@ COREROUTER_SRC_DIR = $(realpath $(BR2_EXTERNAL_COREROUTER_PATH)/..)
 COREROUTER_LICENSE = AGPL-3.0-or-later
 COREROUTER_LICENSE_FILES = LICENSE
 COREROUTER_CARGO ?= cargo
-# Outside $(@D): `corerouter-rebuild` stays incremental (warm: seconds).
-COREROUTER_CARGO_TARGET_DIR ?= $(BASE_DIR)/cargo-target
+# Outside $(@D) and outside O=: the `corerouter-dirclean` of every build and
+# a clean Buildroot build both keep the Rust cache (cold: 154 s of a 447 s
+# clean build, measured; warm: seconds).
+COREROUTER_CARGO_TARGET_DIR ?= $(BR2_EXTERNAL_COREROUTER_PATH)/out/cargo-target
 COREROUTER_TRIPLE = x86_64-unknown-linux-gnu
 COREROUTER_OUT = $(COREROUTER_CARGO_TARGET_DIR)/$(COREROUTER_TRIPLE)/release
 

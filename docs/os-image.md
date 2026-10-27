@@ -8,6 +8,7 @@ pelo Buildroot a partir de `os/` (uma árvore `BR2_EXTERNAL`), testada no QEMU s
 cargo xtask os check                 # confere a configuração (sem rede; também roda no `cargo xtask ci`)
 cargo xtask os build                 # baixa e confere o Buildroot fixado, compila e grava os/out/build/images/disk.img
 cargo xtask os boot-test             # boota no QEMU (KVM do usuário ou TCG) e faz ping no canal de controle TLS
+cargo xtask os boot-test --tcg       # sem KVM (emulação; ~3× mais lento)
 cargo xtask os boot-test --efi       # o mesmo, pelo firmware UEFI (OVMF) e o disco inteiro
 cargo xtask os boot-test --append corerouter.shell=ttyS0 --timeout 600   # com shell de manutenção na serial
 ```
@@ -176,7 +177,16 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
   `CC_x86_64_unknown_linux_gnu`). Como o alvo tem o mesmo nome do host, os build scripts também
   são ligados por esse gcc: a glibc da toolchain (2.39) não pode ser mais nova que a do host
   (hoje 2.39 nos dois).
-- Medição de reprodutibilidade: veja "Números".
+- Duas fontes de diferença apareceram na medição e foram corrigidas:
+  - **BTF do kernel.** O `pahole -j` do kbuild do 6.18 gera o BTF em paralelo sem a opção
+    `reproducible_build`, e a ordem dos tipos dependia do escalonamento das threads.
+    `os/patches/linux/0001-kbuild-btf-reproducible-build.patch` liga a opção (pahole ≥ 1.26;
+    o do Buildroot é o 1.27).
+  - **ext4 do `/config`.** O `mke2fs` e o `e2fsck` que o genimage roda gravavam a hora real no
+    superbloco. O `post-image.sh` exporta `E2FSPROGS_FAKE_TIME` e `E2FSCK_TIME` com o
+    `SOURCE_DATE_EPOCH`.
+- O commit entra no daemon (`corerouter-buildinfo`, mostrado em `server.info`): commits diferentes
+  dão binários diferentes, como deve ser. Do mesmo commit, o binário sai igual.
 
 ## Desempenho e paralelismo
 
@@ -188,8 +198,9 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
   (`cargo xtask os build --top-jobs N`), com pacotes independentes compilando ao mesmo tempo.
 - **Cache de download**: `os/dl/` fica entre builds; nada é baixado de novo.
 - **Cache de compilação**: `BR2_CCACHE` em `os/out/ccache` (C/C++ do Buildroot e do kernel).
-  O Rust tem o próprio cache incremental em `os/out/build/cargo-target`, fora da pasta do
-  pacote, para o `corerouter-dirclean` de cada build não jogar fora as dependências.
+  O Rust tem o próprio cache incremental em `os/out/cargo-target`, fora da pasta do pacote
+  e do `O=` do Buildroot: nem o `corerouter-dirclean` de cada build nem um build limpo jogam
+  fora as dependências (frio, o Rust era 154 s de um build limpo de 447 s, **medido**).
 
 ### Boot
 
@@ -202,4 +213,59 @@ precisar de streaming delta, o RAUC volta a ser a opção (o formato de bundle v
 - squashfs zstd com `SQUASHFS_COMPILE_DECOMP_MULTI_PERCPU` (descompressão em paralelo, um
   descompressor por CPU) e `SQUASHFS_FILE_DIRECT`.
 
+### Endereço de rede no teste
+
+A imagem sobe sem endereço em nenhuma porta: nada roda DHCP sem configuração. Com `-kernel`, o
+boot-test acrescenta à linha de comando o `ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off` do
+próprio kernel (`CONFIG_IP_PNP`), o endereço da rede de usuário do QEMU. Assim o
+encaminhamento de porta chega ao `0.0.0.0:8729` do daemon. Com `--efi` vale a linha de
+comando gravada no kernel: o teste confere a prontidão pelo loopback e pula o ping TLS. A
+configuração padrão de primeiro boot (cliente DHCP na primeira porta, como o CHR do RouterOS)
+é a gap G1.6d. Com ela, o `--efi` também passa a fazer o ping.
+
 ## Números
+
+Todos **medidos** em 2026-10-27, AMD Ryzen AI Max+ 395 (32 threads), 62 GiB, NVMe, Linux Mint
+22.3, com outras sessões de agente usando a máquina ao mesmo tempo (os tempos variam por isso).
+
+### Build
+
+| Situação | Tempo de parede | Observação |
+|---|---|---|
+| Primeiro build, tudo frio (downloads de ~360 MB, ccache vazio, sem `-j` de topo) | 15 min 02 s | CPU somada 85 min (paralelismo médio ~5,7×) |
+| Build limpo (`os/out/build` apagado), ccache quente, **sem** `-j` de topo | 447 s | Rust frio 154 s (38%), kernel 64 s, ferramentas de host o resto |
+| Build limpo, ccache quente, **`--top-jobs 33`** | 207–219 s (3 rodadas) | **2,1×** do paralelismo entre pacotes (`BR2_PER_PACKAGE_DIRECTORIES`) |
+| Mudou o fragmento do kernel (`linux-reconfigure`) | 169 s | |
+| Sem mudança (quente) | 24–26 s | cargo sem trabalho, rootfs e disco regravados |
+
+Desde a medição do build limpo, o cache do Rust fica em `os/out/cargo-target`, fora do `O=`: um
+build limpo do Buildroot não recompila mais o Rust (o build seguinte levou 165 s sem `-j` de
+topo, com o cargo frio numa pasta nova).
+
+**Reprodutível:** dois builds limpos do mesmo commit, um terceiro com outro nível de `-j` e um
+quarto com o cache do cargo em outra pasta deram o **mesmo** `bzImage` (`40e26533…`), o mesmo
+`rootfs.squashfs` (`f8580cbe…`), a mesma ESP e o mesmo daemon. O `disk.img` ficou igual entre
+builds depois da correção do ext4.
+
+### Tamanho
+
+| Peça | Tamanho |
+|---|---|
+| `rootfs.squashfs` (zstd) | **14,4 MiB** (38 MiB descomprimido) |
+| └ `corerouter-daemon` (sem símbolos) | 27 MiB |
+| └ glibc e bibliotecas (`/lib`, `/usr/lib`) | 9,2 MiB |
+| └ busybox / `corerouter-init` / `nft` | 0,7 MiB / 0,5 MiB / 24 KiB (+ libnftables) |
+| `bzImage` (com BTF, tudo `=y`) | 19,1 MiB |
+| `disk.img` | 609 MiB, quase todo partições vazias (rootfs-b e folga); 33 MiB com `zstd` |
+
+### Boot (QEMU, 2 vCPUs, 1 GiB, virtio)
+
+| Modo | Kernel → daemon responde `ping` | Partida do QEMU → `ready` | Memória ociosa |
+|---|---|---|---|
+| KVM, `-kernel` (10 rodadas) | 0,69–1,20 s (mediana 0,74 s) | 0,98–1,87 s | 47–58 MiB |
+| KVM, UEFI (OVMF → EFI stub, disco inteiro) | 0,73 s | 3,74 s (o firmware leva ~3 s) | 49 MiB |
+| TCG (sem KVM) | 2,89 s | 3,78 s | 48 MiB |
+
+Dentro desse tempo: o init leva 7–23 ms (montagens, `lo`, `/config`), e o daemon, 52–126 ms
+da partida até o primeiro `pong`. O resto é o kernel até o PID 1 (~0,6 s, probe das placas e
+dos discos). O ping TLS do host, pelo encaminhamento de porta do QEMU, respondeu em 14–17 ms.
