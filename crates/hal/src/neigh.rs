@@ -158,6 +158,15 @@ pub trait NeighborFeed: Send {
     fn name(&self) -> &'static str;
 }
 
+/// One static entry outside the config (DHCP `add-arp`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaticNeigh {
+    pub interface: IfName,
+    pub address: Ipv4Addr,
+    /// `None`: remove it.
+    pub mac: Option<[u8; 6]>,
+}
+
 /// A host that answered an ARP request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArpReply {

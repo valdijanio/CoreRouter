@@ -48,10 +48,10 @@ const GC: [&str; 6] = [
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.arp.list", "ARP", ["IP", "ARP"], None,
-        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static), flags (X disabled, I invalid, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
+        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static | dhcp), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static | dhcp: DHCP add-arp), flags (X disabled, I invalid, H dhcp, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
         always, list_v4),
     cmd!(query "ipv6.neighbor.list", "IPv6 Neighbors", ["IPv6", "Neighbors"], None,
-        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static), flags (X disabled, I invalid, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
+        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static | dhcp), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static | dhcp: DHCP add-arp), flags (X disabled, I invalid, H dhcp, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
         always, list_v6),
     cmd!(
         "ip.arp.add",
@@ -180,6 +180,8 @@ struct View<'a> {
     iface: &'a IfName,
     row: Option<&'a Row>,
     entry: Option<&'a ArpEntry>,
+    /// Put in by a DHCP server's `add-arp` (RouterOS flag H).
+    dhcp: bool,
 }
 
 impl View<'_> {
@@ -188,7 +190,13 @@ impl View<'_> {
     }
 
     fn source(&self) -> &'static str {
-        if self.entry.is_some() { "static" } else { "dynamic" }
+        if self.entry.is_some() {
+            "static"
+        } else if self.dhcp {
+            "dhcp"
+        } else {
+            "dynamic"
+        }
     }
 
     fn mac(&self) -> Option<[u8; 6]> {
@@ -269,8 +277,8 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
     let want_states = states(p)?;
     let source = match opt_str(p, "source")? {
         None => None,
-        Some(x @ ("dynamic" | "static")) => Some(x),
-        Some(_) => return Err(EngineError::bad("source", "must be dynamic or static")),
+        Some(x @ ("dynamic" | "static" | "dhcp")) => Some(x),
+        Some(_) => return Err(EngineError::bad("source", "must be dynamic, static or dhcp")),
     };
     let offset = opt_u32(p, "offset")?.unwrap_or(0);
     let limit = opt_u32(p, "limit")?.unwrap_or(DEFAULT_LIMIT);
@@ -306,11 +314,16 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
         if entry.is_some() {
             seen.insert((name, r.address));
         }
+        let dhcp = match r.address {
+            IpAddr::V4(a) => entry.is_none() && s.dhcp_arp_of(name, a),
+            IpAddr::V6(_) => false,
+        };
         views.push(View {
             address: r.address,
             iface: name,
             row: Some(r),
             entry,
+            dhcp,
         });
     }
     for ((name, addr), e) in &statics {
@@ -320,6 +333,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
                 iface: name,
                 row: None,
                 entry: Some(e),
+                dhcp: false,
             });
         }
     }
@@ -330,6 +344,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
     let mut states_n = [0u64; NeighState::ALL.len() + 1];
     let mut iface_n: HashMap<*const IfName, (&str, u64)> = HashMap::new();
     let mut static_n = 0u64;
+    let mut dhcp_n = 0u64;
     for v in &views {
         let at = v
             .state()
@@ -343,6 +358,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
             .or_insert((v.iface.as_str(), 0))
             .1 += 1;
         static_n += u64::from(v.entry.is_some());
+        dhcp_n += u64::from(v.dhcp);
     }
     let by_state: BTreeMap<&str, u64> = NeighState::ALL
         .iter()
@@ -355,8 +371,8 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
     for (name, n) in iface_n.into_values() {
         *by_iface.entry(name).or_default() += n;
     }
-    let dynamic_n = u64::try_from(views.len()).unwrap_or(u64::MAX) - static_n;
-    let by_source: BTreeMap<&str, u64> = [("dynamic", dynamic_n), ("static", static_n)]
+    let dynamic_n = u64::try_from(views.len()).unwrap_or(u64::MAX) - static_n - dhcp_n;
+    let by_source: BTreeMap<&str, u64> = [("dhcp", dhcp_n), ("dynamic", dynamic_n), ("static", static_n)]
         .into_iter()
         .filter(|(_, n)| *n > 0)
         .collect();
@@ -433,6 +449,9 @@ fn row(v: &View<'_>, cfg: &Config, now: u64) -> Value {
     }
     if invalid {
         flags.push('I');
+    }
+    if v.dhcp {
+        flags.push('H');
     }
     if e.is_none() {
         flags.push('D');
@@ -1126,11 +1145,16 @@ fn detail(s: &mut Session, p: &Value) -> Result<Value> {
     let Some(name) = found.map(|(n, _)| n).or(entry.map(|e| &e.interface)) else {
         return Err(EngineError::bad("address", format!("{address} is not in the neighbor table")));
     };
+    let dhcp = match address {
+        IpAddr::V4(a) => entry.is_none() && s.dhcp_arp_of(name, a),
+        IpAddr::V6(_) => false,
+    };
     let view = View {
         address,
         iface: name,
         row: found.map(|(_, r)| r),
         entry,
+        dhcp,
     };
     let history: Vec<Value> = t
         .history(address)

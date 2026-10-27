@@ -698,6 +698,22 @@ mod linux {
             crate::neigh::remove(items)
         }
 
+        fn neighbor_static(
+            &mut self,
+            ops: &[corerouter_hal::neigh::StaticNeigh],
+        ) -> Result<(), HalError> {
+            let ops: Vec<crate::neigh::StaticOp> = ops
+                .iter()
+                .map(|o| crate::neigh::StaticOp {
+                    interface: o.interface.clone(),
+                    ip: std::net::IpAddr::V4(o.address),
+                    mac: o.mac,
+                    proxy: false,
+                })
+                .collect();
+            crate::neigh::statics(&ops)
+        }
+
         fn arp_pinger(
             &mut self,
             name: &IfName,
