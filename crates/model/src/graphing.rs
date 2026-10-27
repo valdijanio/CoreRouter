@@ -96,6 +96,16 @@ pub struct Graphing {
     /// Memory for the history, MiB; the same bytes go to disk. Interfaces
     /// past it are not kept (and `system.graph.print` says which).
     pub max_memory_mib: u32,
+    /// Queue histories (G4.9g): fixed queues with `graph` on, plus the
+    /// dynamic ones below. Off: no queue is kept.
+    pub queues: bool,
+    /// Every dynamic queue (sessions, DHCP): off by default, 10 000
+    /// subscribers would take GBs (each series is ~440 KiB).
+    pub dynamic_queues: bool,
+    /// Dynamic queues kept by name (`<pppoe-ana>`, `dhcp-ds<pc1>`): the
+    /// ones the operator marked.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub queue_include: Vec<String>,
     /// Bandwidth alerts (`system.graph.alert.*`).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub alerts: Vec<BandwidthAlert>,
@@ -121,6 +131,9 @@ impl Default for Graphing {
             include: Vec::new(),
             exclude: Vec::new(),
             max_memory_mib: DEFAULT_MAX_MEMORY_MIB,
+            queues: true,
+            dynamic_queues: false,
+            queue_include: Vec::new(),
             alerts: Vec::new(),
             next_alert_id: 0,
         }
@@ -186,6 +199,18 @@ impl Graphing {
     pub fn next_alert_id(&mut self) -> ItemId {
         self.next_alert_id = self.next_alert_id.saturating_add(1);
         ItemId(self.next_alert_id)
+    }
+
+    /// Whether the queue named `name` is kept: `fixed` with its own
+    /// `graph`, a dynamic one when all are or it was marked.
+    pub fn keeps_queue(&self, name: &str, fixed: Option<bool>) -> bool {
+        if !self.enabled || !self.queues {
+            return false;
+        }
+        match fixed {
+            Some(graph) => graph,
+            None => self.dynamic_queues || self.queue_include.iter().any(|n| n == name),
+        }
     }
 
     pub fn max_memory_bytes(&self) -> u64 {

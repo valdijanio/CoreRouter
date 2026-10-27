@@ -18,6 +18,7 @@ use crate::interfaces::{cascade, dialog_id};
 use crate::list::{self, Act, Cmds, Filters, Item, Tools};
 use crate::list_modal::{self, Applied, Field, Input, Modal, Spec};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
+use crate::queue_view::{self, QueueView};
 use crate::table::{self, Menu, Row, TableState, col, comment, num};
 use crate::{CoreRouterUi, Win};
 
@@ -93,6 +94,7 @@ const SIMPLE_FIELDS: &[Field] = &[
     Field { param: "queue", label: "Queue Type", help: "queues.simple.queue", input: Input::Text("default-small/default-small"), edit: true },
     Field { param: "comment", label: "Comment", help: "", input: Input::Text(""), edit: true },
     Field { param: "disabled", label: "Disabled", help: "queues.simple.disabled", input: Input::Check, edit: true },
+    Field { param: "graph", label: "Keep History", help: "queues.view.keep", input: Input::Check, edit: true },
 ];
 
 const SIMPLE_SPEC: Spec = Spec {
@@ -103,6 +105,14 @@ const SIMPLE_SPEC: Spec = Spec {
     help: "queues.simple",
     fields: SIMPLE_FIELDS,
     preview: "queue.simple.preview",
+};
+
+/// The "Queue <name>" modal's form (G4.9g): the same fields, split in
+/// General and Advanced.
+const VIEW_SPEC: Spec = Spec {
+    edit_title: "Queue",
+    help: "queues.view",
+    ..SIMPLE_SPEC
 };
 
 const PCQ_FIELDS: &[Field] = &[
@@ -190,6 +200,8 @@ pub(crate) struct QueuesPanel {
     pcq_table: TableState,
     types_table: TableState,
     pub(crate) modal: Option<(Tab, Modal)>,
+    /// The "Queue <name>" modal (G4.9g).
+    pub(crate) view: Option<QueueView>,
     note: Option<NoteDialog>,
     pub(crate) help: Option<HelpView>,
 }
@@ -264,7 +276,10 @@ pub(crate) fn simple_row(r: &Value) -> Row {
             as_cell(&s(r, "name"), &name_chips),
             s(r, "target"),
             s(r, "max_limit"),
-            format!("{}/{}", bps(up), bps(down)),
+            {
+                let rate = format!("{}/{}", bps(up), bps(down));
+                if near_limit(r) { cell(&rate, &[(NEAR_CHIP, Kind::Amber)]) } else { rate }
+            },
             wait_text(q_us),
             (d_up + d_down).to_string(),
             s(r, "queue"),
@@ -274,6 +289,14 @@ pub(crate) fn simple_row(r: &Value) -> Row {
         section: false,
         tint: None,
     }
+}
+
+/// The chip of a row near its limit (G4.9g): a gauge, the icon font's.
+pub(crate) const NEAR_CHIP: &str = "\u{E628} near limit";
+
+/// The rate is at 90 % of max-limit or above in some direction.
+pub(crate) fn near_limit(r: &Value) -> bool {
+    r.get("near_limit").and_then(Value::as_array).is_some_and(|a| a.iter().any(|b| b.as_bool() == Some(true)))
 }
 
 /// A queue's wait (microseconds) as the Queue (ms) column shows it; empty
@@ -343,24 +366,6 @@ pub(crate) fn type_row(r: &Value) -> Row {
     }
 }
 
-fn simple_values(r: &Value) -> BTreeMap<&'static str, String> {
-    let yes = |b: bool| if b { "yes" } else { "no" }.to_owned();
-    BTreeMap::from([
-        ("name", s(r, "name")),
-        ("target", s(r, "target")),
-        ("max_limit", s(r, "max_limit")),
-        ("limit_at", s(r, "limit_at")),
-        ("burst_limit", s(r, "burst_limit")),
-        ("burst_threshold", s(r, "burst_threshold")),
-        ("burst_time", s(r, "burst_time")),
-        ("bucket_size", s(r, "bucket_size")),
-        ("priority", s(r, "priority")),
-        ("queue", s(r, "queue")),
-        ("comment", s(r, "comment")),
-        ("disabled", yes(r.get("disabled").and_then(Value::as_bool).unwrap_or(false))),
-    ])
-}
-
 fn type_values(r: &Value) -> BTreeMap<&'static str, String> {
     let mut v = BTreeMap::from([("name", s(r, "name")), ("kind", s(r, "kind")), ("comment", s(r, "comment"))]);
     for k in [
@@ -409,10 +414,17 @@ impl QueuesPanel {
         };
         match act {
             Act::Add => {
-                if self.modal.is_none() {
+                if let Some(v) = &mut self.view {
+                    // One modal with a preview at a time (they share its
+                    // replies).
+                    if let Some(f) = &mut v.form {
+                        f.status.bring_to_front();
+                    }
+                } else if self.modal.is_none() {
                     let values = match tab {
                         Tab::Types => BTreeMap::from([("kind", "fq-codel".to_owned())]),
-                        _ => BTreeMap::new(),
+                        Tab::Simple => BTreeMap::from([("graph", "yes".to_owned())]),
+                        Tab::PerIp => BTreeMap::new(),
                     };
                     self.modal = Some((tab, Modal::open(app, None, values)));
                 }
@@ -420,22 +432,18 @@ impl QueuesPanel {
             Act::Edit(k) => {
                 if let Some((_, m)) = &mut self.modal {
                     m.status.bring_to_front();
-                } else if let Some(r) = self.row_of(tab, &k) {
-                    match tab {
-                        Tab::Simple if !r.get("dynamic").and_then(Value::as_bool).unwrap_or(false) => {
-                            self.modal = Some((Tab::Simple, Modal::open(app, Some((k, s(&r, "name"))), simple_values(&r))));
-                        }
-                        // A per-IP rule is a simple queue: edit it there.
-                        Tab::PerIp => {
-                            if let Some(sr) = self.row_of(Tab::Simple, &k) {
-                                self.modal = Some((Tab::Simple, Modal::open(app, Some((k, s(&sr, "name"))), simple_values(&sr))));
-                            }
-                        }
-                        Tab::Types => {
-                            self.modal = Some((Tab::Types, Modal::open(app, Some((k, s(&r, "name"))), type_values(&r))));
-                        }
-                        _ => {}
+                } else if self.view.as_ref().is_some_and(|v| v.key == k) {
+                    if let Some(f) = self.view.as_mut().and_then(|v| v.form.as_mut()) {
+                        f.status.bring_to_front();
                     }
+                } else if tab == Tab::Types {
+                    if let Some(r) = self.row_of(tab, &k) {
+                        self.modal = Some((Tab::Types, Modal::open(app, Some((k, s(&r, "name"))), type_values(&r))));
+                    }
+                } else if let Some(r) = self.row_of(Tab::Simple, &k) {
+                    // Any queue, fixed or dynamic (a per-IP rule is a simple
+                    // queue): the "Queue <name>" modal (G4.9g).
+                    self.open_view(app, &r);
                 }
             }
             Act::Remove(keys) => {
@@ -471,6 +479,16 @@ impl QueuesPanel {
                 ui.ctx().copy_text(list::copy_commands(app, add, &refs, syntax));
             }
         }
+    }
+
+    /// The "Queue <name>" modal of row `r` (another one closes).
+    pub(crate) fn open_view(&mut self, app: &mut CoreRouterUi, r: &Value) {
+        if let Some(old) = self.view.take() {
+            app.floats.forget(dialog_id(old.form.as_ref().map_or(old.id, |f| f.id)));
+        }
+        let dynamic = r.get("dynamic").and_then(Value::as_bool).unwrap_or(false);
+        let form = (!dynamic).then(|| Modal::open(app, Some((s(r, "id"), s(r, "name"))), queue_view::form_values(r)));
+        self.view = Some(QueueView::open(app, r, form));
     }
 
     fn tabs(&mut self, app: &mut CoreRouterUi, ui: &mut Ui) {
@@ -553,6 +571,7 @@ impl QueuesPanel {
                 (all.len() - list::count(&all, "origin", "fixed"), "dynamic", chip::BLUE.tone(&v)),
                 (list::count(&all, "disabled", "true"), "disabled", chip::neutral_tone(&v)),
                 (all.iter().filter(|r| r.get("warnings").and_then(Value::as_array).is_some_and(|w| !w.is_empty())).count(), "with warnings", chip::AMBER.tone(&v)),
+                (all.iter().filter(|r| near_limit(r)).count(), "near limit", chip::AMBER.tone(&v)),
             ],
             l,
         );
@@ -718,6 +737,14 @@ impl PanelState for QueuesPanel {
         if self.tab == Tab::PerIp && app.has_command("queue.per-ip.list") {
             out.push(q("pcq", "queue.per-ip.list"));
         }
+        if let Some(v) = &self.view
+            && app.has_command(queue_view::STATS)
+        {
+            out.push(Query { key: "qstats", command: queue_view::STATS, params: v.stats_params() });
+            if let Some(p) = v.history_params().filter(|_| app.has_command(queue_view::HISTORY)) {
+                out.push(Query { key: "qhistory", command: queue_view::HISTORY, params: p });
+            }
+        }
         // The modal's Queue Type field and the types tab both want them.
         if app.has_command("queue.type.list") {
             out.push(q("types", "queue.type.list"));
@@ -730,6 +757,18 @@ impl PanelState for QueuesPanel {
             list_modal::PREVIEW => {
                 if let Some((_, m)) = &mut self.modal {
                     m.arrived(value);
+                } else if let Some(f) = self.view.as_mut().and_then(|v| v.form.as_mut()) {
+                    f.arrived(value);
+                }
+            }
+            "qstats" => {
+                if let Some(v) = &mut self.view {
+                    v.arrived(value);
+                }
+            }
+            "qhistory" => {
+                if let Some(v) = &mut self.view {
+                    v.live.history = Some(value);
                 }
             }
             "simple" => self.simple = value,
@@ -765,6 +804,11 @@ impl PanelState for QueuesPanel {
                 self.modal = None;
             }
         }
+        if let Some(v) = &mut self.view
+            && !v.show(app, ctx, area, &VIEW_SPEC)
+        {
+            self.view = None;
+        }
         self.note_dialog(app, ctx, area);
         crate::help::modal(ctx, app.lang, &mut self.help);
     }
@@ -775,6 +819,12 @@ impl PanelState for QueuesPanel {
             && m.replied(app, result)
         {
             self.modal = None;
+        }
+        if let Some(a) = then.downcast_ref::<Applied>()
+            && let Some(f) = self.view.as_mut().and_then(|v| v.form.as_mut()).filter(|f| f.id == a.0)
+            && f.replied(app, result)
+        {
+            self.view = None;
         }
         if let Some(r) = then.downcast_ref::<NoteReply>()
             && let Some(d) = self.note.as_mut().filter(|d| d.id == r.0)

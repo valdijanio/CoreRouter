@@ -1337,6 +1337,15 @@ impl PppBackend for Sessions {
         (total, page)
     }
 
+    fn session(&self, id: &str) -> Option<ActiveSession> {
+        let st = guard(&self.0.st);
+        let mut a = st.active.get(id)?.clone();
+        if let Some(s) = st.by_id.get(id).and_then(|k| st.subs.get(k)) {
+            a.uptime_secs = unix_now().saturating_sub(s.up_at);
+        }
+        Some(a)
+    }
+
     fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
         let st = guard(&self.0.st);
         let mut m = std::collections::BTreeMap::new();

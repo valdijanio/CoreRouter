@@ -116,6 +116,10 @@ pub(crate) struct Modal {
     pub help: Option<HelpView>,
     /// The operator accepted the access risk.
     pub accept_risk: bool,
+    /// A page of the caller's is shown ([`Modal::show_paged`]): the
+    /// commands' text is not built (the registry walk is ~2 ms a frame,
+    /// **medido**, G4.9g).
+    pub other_page: bool,
 }
 
 /// How a check level is drawn.
@@ -158,6 +162,7 @@ impl Modal {
             edited_at: f64::NEG_INFINITY,
             help: None,
             accept_risk: false,
+            other_page: false,
         }
     }
 
@@ -293,6 +298,22 @@ impl Modal {
         spec: &Spec,
         options: &dyn Fn(&str) -> Vec<String>,
     ) -> bool {
+        self.show_paged(app, ctx, area, spec, options, &mut |_| Some(&[]))
+    }
+
+    /// [`Modal::show`] with pages (the "Queue <name>" modal, G4.9g):
+    /// `page` draws the tabs at the top and says what goes under them —
+    /// `Some(params)`: the form with those fields only (empty: all of
+    /// them); `None`: a page of the caller's, already drawn.
+    pub(crate) fn show_paged(
+        &mut self,
+        app: &mut CoreRouterUi,
+        ctx: &egui::Context,
+        area: egui::Rect,
+        spec: &Spec,
+        options: &dyn Fn(&str) -> Vec<String>,
+        page: &mut dyn FnMut(&mut Ui) -> Option<&'static [&'static str]>,
+    ) -> bool {
         let now = ctx.input(|i| i.time);
         self.ask(app, spec, now);
         if self.pending() {
@@ -309,7 +330,11 @@ impl Modal {
         let ok = self
             .blocking(spec)
             .and_then(|()| first.map_or(Ok(()), |c| can.check(&c)));
-        let steps_text = crate::list::steps_text(app, list(self.current(spec), "commands"));
+        let steps_text = if self.other_page {
+            Vec::new()
+        } else {
+            crate::list::steps_text(app, list(self.current(spec), "commands"))
+        };
         let safe_mode_can = can.check("config.safe-mode.enter");
         let head = dialog::Head {
             id: wid,
@@ -327,6 +352,10 @@ impl Modal {
         let error = self.status.error.clone();
         let pressed = dialog::show(&mut app.floats, ctx, area, head, &mut self.status, |ui, form| {
             ui.set_min_width(420.0);
+            let Some(only) = page(ui) else {
+                return Footer::<()>::edit(true, ok.clone());
+            };
+            let fields: Vec<&&'static Field> = fields.iter().filter(|f| only.is_empty() || only.contains(&f.param)).collect();
             ui.horizontal(|ui| {
                 if help::info_button(ui, form.window().with("title-help"), tr(app.lang.help, "What is this?")).clicked() {
                     help = Some(HelpView::new(spec.help, title.clone()));

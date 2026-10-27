@@ -301,6 +301,10 @@ impl PppBackend for Backend {
         (total, hits.into_iter().cloned().collect())
     }
 
+    fn session(&self, id: &str) -> Option<ActiveSession> {
+        guard(&self.0).active.get(id).cloned()
+    }
+
     fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
         let sh = guard(&self.0);
         let mut m = std::collections::BTreeMap::new();

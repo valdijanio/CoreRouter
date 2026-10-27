@@ -7,6 +7,8 @@
 use corerouter_model::IfName;
 use ipnet::IpNet;
 
+pub mod lab;
+
 /// What the queue of one direction does with what waits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {

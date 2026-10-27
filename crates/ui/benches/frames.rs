@@ -26,6 +26,14 @@ fn frames(c: &mut Criterion) {
     // G4.8a: System › Resources (Overview) open.
     let mut f = Frames::panel("resources");
     g.bench_function("resources_overview", |b| b.iter(|| f.frame()));
+    // G4.9g: the "Queue <name>" modal over Queues, Traffic with 900 points
+    // and Statistics.
+    let mut f = Frames::queue_view(None);
+    g.bench_function("queues_window", |b| b.iter(|| f.frame()));
+    let mut f = Frames::queue_view(Some(true));
+    g.bench_function("queue_view_traffic_900", |b| b.iter(|| f.frame()));
+    let mut f = Frames::queue_view(Some(false));
+    g.bench_function("queue_view_statistics", |b| b.iter(|| f.frame()));
     g.finish();
 }
 

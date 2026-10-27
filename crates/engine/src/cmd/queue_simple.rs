@@ -19,14 +19,14 @@ use crate::queue::{Origin, Plan, Queue, plan_with_sessions};
 use crate::{EngineError, Result, Session};
 
 #[cfg(test)]
-const FIELDS: &str = "max_limit?: rates (upload/download from the target, bits/s: 10M/50M; 0 = no limit), limit_at?: rates (guaranteed rate, kept for the queue tree), burst_limit?: rates (rate while bursting; above max_limit), burst_threshold?: rates (bursting is allowed while the average over burst_time is under it; 0 = max_limit), burst_time?: times (window of the average: 8s/8s), bucket_size?: ratios (bucket as a share of the rate: 0.1 = 100 ms, the default), priority?: string (1..8/1..8, 8 lowest), queue?: string (/queue type names, upload/download; default default-small/default-small), disabled?: bool, comment?: string";
+const FIELDS: &str = "max_limit?: rates (upload/download from the target, bits/s: 10M/50M; 0 = no limit), limit_at?: rates (guaranteed rate, kept for the queue tree), burst_limit?: rates (rate while bursting; above max_limit), burst_threshold?: rates (bursting is allowed while the average over burst_time is under it; 0 = max_limit), burst_time?: times (window of the average: 8s/8s), bucket_size?: ratios (bucket as a share of the rate: 0.1 = 100 ms, the default), priority?: string (1..8/1..8, 8 lowest), queue?: string (/queue type names, upload/download; default default-small/default-small), disabled?: bool, comment?: string, graph?: bool (keep a traffic history, /tool graphing; default yes)";
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("queue.simple.add", "Add Simple Queue", [], None,
-        "{name?: string (default queue<N>), target: string | [string] (addresses, prefixes or one interface: 10.0.0.5,10.0.1.0/24, 2001:db8::/56, ether2), max_limit?: rates (upload/download from the target, bits/s: 10M/50M; 0 = no limit), limit_at?: rates (guaranteed rate, kept for the queue tree), burst_limit?: rates (rate while bursting; above max_limit), burst_threshold?: rates (bursting is allowed while the average over burst_time is under it; 0 = max_limit), burst_time?: times (window of the average: 8s/8s), bucket_size?: ratios (bucket as a share of the rate: 0.1 = 100 ms, the default), priority?: string (1..8/1..8, 8 lowest), queue?: string (/queue type names, upload/download; default default-small/default-small), disabled?: bool, comment?: string, place_before?: *hex | name (a fixed queue: the new one goes above it; default: the end)} → {id, name, warnings}",
+        "{name?: string (default queue<N>), target: string | [string] (addresses, prefixes or one interface: 10.0.0.5,10.0.1.0/24, 2001:db8::/56, ether2), max_limit?: rates (upload/download from the target, bits/s: 10M/50M; 0 = no limit), limit_at?: rates (guaranteed rate, kept for the queue tree), burst_limit?: rates (rate while bursting; above max_limit), burst_threshold?: rates (bursting is allowed while the average over burst_time is under it; 0 = max_limit), burst_time?: times (window of the average: 8s/8s), bucket_size?: ratios (bucket as a share of the rate: 0.1 = 100 ms, the default), priority?: string (1..8/1..8, 8 lowest), queue?: string (/queue type names, upload/download; default default-small/default-small), disabled?: bool, comment?: string, graph?: bool (keep a traffic history, /tool graphing; default yes), place_before?: *hex | name (a fixed queue: the new one goes above it; default: the end)} → {id, name, warnings}",
         always, add),
     cmd!("queue.simple.set", "Set Simple Queue", [], None,
-        "{id: *hex | name, name?: string, target?: string | [string], max_limit?: rates (upload/download from the target, bits/s: 10M/50M; 0 = no limit), limit_at?: rates (guaranteed rate, kept for the queue tree), burst_limit?: rates (rate while bursting; above max_limit), burst_threshold?: rates (bursting is allowed while the average over burst_time is under it; 0 = max_limit), burst_time?: times (window of the average: 8s/8s), bucket_size?: ratios (bucket as a share of the rate: 0.1 = 100 ms, the default), priority?: string (1..8/1..8, 8 lowest), queue?: string (/queue type names, upload/download; default default-small/default-small), disabled?: bool, comment?: string} → {id, name, warnings}",
+        "{id: *hex | name, name?: string, target?: string | [string], max_limit?: rates (upload/download from the target, bits/s: 10M/50M; 0 = no limit), limit_at?: rates (guaranteed rate, kept for the queue tree), burst_limit?: rates (rate while bursting; above max_limit), burst_threshold?: rates (bursting is allowed while the average over burst_time is under it; 0 = max_limit), burst_time?: times (window of the average: 8s/8s), bucket_size?: ratios (bucket as a share of the rate: 0.1 = 100 ms, the default), priority?: string (1..8/1..8, 8 lowest), queue?: string (/queue type names, upload/download; default default-small/default-small), disabled?: bool, comment?: string, graph?: bool (keep a traffic history, /tool graphing; default yes)} → {id, name, warnings}",
         always, set),
     cmd!("queue.simple.remove", "Remove Simple Queue", [], None,
         "{id: *hex | name | [*hex | name]} → {removed}", always, remove),
@@ -38,10 +38,10 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{id: *hex | name, destination?: *hex | name (it goes above this one; none: to the end)} → {id, position}",
         always, move_to),
     cmd!(query "queue.simple.preview", "Simple Queue Preview", [], None,
-        "{id?: *hex | name, name?: string, target?: string, max_limit?: string, limit_at?: string, burst_limit?: string, burst_threshold?: string, burst_time?: string, bucket_size?: string, priority?: string, queue?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        "{id?: *hex | name, name?: string, target?: string, max_limit?: string, limit_at?: string, burst_limit?: string, burst_threshold?: string, burst_time?: string, bucket_size?: string, priority?: string, queue?: string, disabled?: bool, comment?: string, graph?: bool} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
         always, preview),
     cmd!(query "queue.simple.list", "Simple Queues", [], None,
-        "{find?: string (in name, target or comment), origin?: fixed|dynamic|pppoe|ipoe|dhcp-lease|dhcp-network, limit?: int 1..100000 (default 10000)} → {total, running (a data plane shapes), note?, rows: [{id, name, dynamic, disabled, origin, target, max_limit, limit_at, burst_limit, burst_threshold, burst_time, bucket_size, priority, queue, download_mode, comment?, warnings: [string], rate_bps: [up, down], bytes: [up, down], packets: [up, down], dropped: [up, down], queued_us: [up, down] (wait of a packet entering now), pcq_queues}]}",
+        "{find?: string (in name, target or comment), origin?: fixed|dynamic|pppoe|ipoe|dhcp-lease|dhcp-network, limit?: int 1..100000 (default 10000)} → {total, running (a data plane shapes), note?, rows: [{id, name, dynamic, disabled, origin, target, max_limit, limit_at, burst_limit, burst_threshold, burst_time, bucket_size, priority, queue, download_mode, comment?, graph, warnings: [string], rate_bps: [up, down], bytes: [up, down], packets: [up, down], dropped: [up, down], queued_us: [up, down] (wait of a packet entering now), near_limit: [up, down] (rate at 90 % of max-limit or above), pcq_queues}]}",
         always, list),
 ];
 
@@ -138,6 +138,9 @@ fn apply(s: &Session, q: &mut SimpleQueue, p: &Value) -> Result<()> {
     }
     if let Some(c) = opt_text(p, "comment", MAX_COMMENT)? {
         q.comment = c;
+    }
+    if let Some(g) = opt_bool(p, "graph")? {
+        q.graph = g;
     }
     check(q)
 }
@@ -465,6 +468,7 @@ pub(super) fn row(s: &Session, plan: &Plan, i: usize, q: &Queue) -> Value {
         "dropped": c.dropped,
         "queued_us": c.queued_us,
         "pcq_queues": c.pcq_queues,
+        "graph": graph_of(s, q),
     });
     if !q.comment.is_empty()
         && let Some(o) = v.as_object_mut()
@@ -472,6 +476,31 @@ pub(super) fn row(s: &Session, plan: &Plan, i: usize, q: &Queue) -> Value {
         o.insert("comment".into(), json!(q.comment));
     }
     v
+}
+
+/// Whether graphing keeps a history of `q` (G4.9g): a fixed queue's own
+/// `graph`, a dynamic one marked (or all dynamic ones kept).
+fn graph_of(s: &Session, q: &Queue) -> bool {
+    let g = &s.store().running().system.graphing;
+    match q.origin {
+        Origin::Fixed => q.graph,
+        _ => g.dynamic_queues || g.queue_include.iter().any(|n| *n == q.name),
+    }
+}
+
+/// Share of max-limit from which a row is "near its limit" (the list's
+/// icon, G4.9g), percent.
+pub const NEAR_LIMIT_PCT: u64 = 90;
+
+/// `near_limit: [up, down]`: the rate now at [`NEAR_LIMIT_PCT`] of the
+/// max-limit or above (the modal's "at limit" also needs it for 10 s).
+fn near_limit(row: &mut Value, q: &Queue) {
+    let rate = |i: usize| row.get("rate_bps").and_then(|r| r.get(i)).and_then(Value::as_u64).unwrap_or(0);
+    let near = |i: usize, max: u64| max > 0 && rate(i).saturating_mul(100) >= max.saturating_mul(NEAR_LIMIT_PCT);
+    let v = json!([near(0, q.upload.max_limit), near(1, q.download.max_limit)]);
+    if let Some(o) = row.as_object_mut() {
+        o.insert("near_limit".into(), v);
+    }
 }
 
 /// A PPP session's row takes its byte counters and rates from the session
@@ -536,6 +565,7 @@ fn list(s: &mut Session, p: &Value) -> Result<Value> {
             if let Some(a) = q.key.strip_prefix("ppp:").and_then(|id| sessions.iter().find(|a| a.id == id)) {
                 session_counters(&mut r, a);
             }
+            near_limit(&mut r, q);
             r
         })
         .collect();

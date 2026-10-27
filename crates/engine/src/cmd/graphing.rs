@@ -23,12 +23,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "Graphing",
         [],
         None,
-        "{enabled?: bool, store_every?: int 60..86400, physical?: bool, bridges?: bool, vlans?: bool, tunnels?: bool, resources?: bool, include?: [ifname], exclude?: [ifname], max_memory_mib?: int 1..4096} → {enabled, store_every, physical, bridges, vlans, tunnels, resources, include, exclude, max_memory_mib}",
+        "{enabled?: bool, store_every?: int 60..86400, physical?: bool, bridges?: bool, vlans?: bool, tunnels?: bool, resources?: bool, include?: [ifname], exclude?: [ifname], max_memory_mib?: int 1..4096, queues?: bool (queue histories at all; fixed queues by their own graph), dynamic_queues?: bool (every session and DHCP queue), queue_include?: [string] (dynamic queues kept by name: <pppoe-ana>)} → {enabled, store_every, physical, bridges, vlans, tunnels, resources, include, exclude, max_memory_mib, queues, dynamic_queues, queue_include}",
         always,
         set
     ),
     cmd!(query "system.graph.print", "Graphing", [], None,
-        "{} → {enabled, store_every, physical, bridges, vlans, tunnels, resources, include, exclude, max_memory_mib, series: [{series, bytes, last, kept}], refused: [ifname], memory_bytes, max_memory_bytes, series_bytes, tiers: [{step, rows, window}], disk: {dir, files, last_store, last_store_bytes, last_store_ms, stores, bytes_written, last_error, loaded, load_errors}}",
+        "{} → {enabled, store_every, physical, bridges, vlans, tunnels, resources, include, exclude, max_memory_mib, queues, dynamic_queues, queue_include, series: [{series, bytes, last, kept}], refused: [ifname], refused_queues (how many queues do not fit), memory_bytes, max_memory_bytes, series_bytes, queue_series_bytes, tiers: [{step, rows, window}], disk: {dir, files, last_store, last_store_bytes, last_store_ms, stores, bytes_written, last_error, loaded, load_errors}}",
         always, print),
     cmd!(query "system.graph.query", "Graph Query", [], None,
         "{series: string | [string], range: hour|day|week|month|year|int, step?: int, end?: int, fields?: [string], stats?: bool, max?: bool} → {start, end, step, resolution, points, series: [{series, units, data: {<field>: [number|null], <field>_max}, stats: {<field>: {current, avg, max, p95}}, totals, coverage, p95_step, p95_approximate, p95_billing, p95_sum}]}",
@@ -50,6 +50,9 @@ fn settings_json(g: &Graphing) -> Value {
         "include": g.include,
         "exclude": g.exclude,
         "max_memory_mib": g.max_memory_mib,
+        "queues": g.queues,
+        "dynamic_queues": g.dynamic_queues,
+        "queue_include": g.queue_include,
     })
 }
 
@@ -74,6 +77,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         ("vlans", &mut g.vlans),
         ("tunnels", &mut g.tunnels),
         ("resources", &mut g.resources),
+        ("queues", &mut g.queues),
+        ("dynamic_queues", &mut g.dynamic_queues),
     ] {
         if let Some(v) = opt_bool(p, key)? {
             *field = v;
@@ -102,6 +107,11 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(v) = opt_names(p, "exclude", MAX_NAMES)? {
         g.exclude = v;
+    }
+    if let Some(v) = strings(p, "queue_include", MAX_NAMES)? {
+        let mut v: Vec<String> = v.into_iter().filter(|n| !n.is_empty()).collect();
+        v.dedup();
+        g.queue_include = v;
     }
     if let Some(both) = g.include.iter().find(|n| g.exclude.contains(n)) {
         return Err(EngineError::bad(
