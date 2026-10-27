@@ -198,9 +198,10 @@ pub fn overwrite_key(line: &str) -> Option<String> {
         if PEER.contains(&attr) {
             // `route-map NAME in|out` and friends are per direction.
             let dir = match attr {
-                "route-map" | "prefix-list" | "filter-list" => {
-                    line.rsplit(' ').next().filter(|d| *d == "in" || *d == "out")?
-                }
+                "route-map" | "prefix-list" | "filter-list" => line
+                    .rsplit(' ')
+                    .next()
+                    .filter(|d| *d == "in" || *d == "out")?,
                 _ => "",
             };
             return Some(format!("neighbor {peer} {attr} {dir}"));
@@ -346,7 +347,10 @@ end
         let bgp = &c.nodes[5];
         assert_eq!(bgp.children.len(), 4);
         assert_eq!(bgp.children[3].line, "address-family ipv4 unicast");
-        assert_eq!(bgp.children[3].children[0].line, "neighbor 192.0.2.2 activate");
+        assert_eq!(
+            bgp.children[3].children[0].line,
+            "neighbor 192.0.2.2 activate"
+        );
     }
 
     #[test]
@@ -372,8 +376,12 @@ end
 
     #[test]
     fn a_changed_setting_is_entered_over_the_old_value() {
-        let a = conf("router bgp 65000\n bgp router-id 10.0.0.1\n neighbor 192.0.2.2 remote-as 65001\n");
-        let b = conf("router bgp 65000\n bgp router-id 10.0.0.9\n neighbor 192.0.2.2 remote-as 65002\n");
+        let a = conf(
+            "router bgp 65000\n bgp router-id 10.0.0.1\n neighbor 192.0.2.2 remote-as 65001\n",
+        );
+        let b = conf(
+            "router bgp 65000\n bgp router-id 10.0.0.9\n neighbor 192.0.2.2 remote-as 65002\n",
+        );
         assert_eq!(
             diff(&a, &b),
             [
@@ -449,7 +457,9 @@ end
     fn hostile_text_is_refused_not_panicked_on() {
         let long = "x".repeat(MAX_LINE + 1);
         assert_eq!(Conf::parse(&long), Err(ParseError::LongLine(1)));
-        let deep: String = (0..20).map(|i| format!("{}a{i}\n", " ".repeat(i))).collect();
+        let deep: String = (0..20)
+            .map(|i| format!("{}a{i}\n", " ".repeat(i)))
+            .collect();
         assert_eq!(Conf::parse(&deep), Err(ParseError::TooDeep(9)));
         // Dedent past the root, tabs, lone markers: still a tree.
         assert!(Conf::parse("   a\n b\nexit\n\t c\n!\n").is_ok());
@@ -457,7 +467,10 @@ end
 
     #[test]
     fn overwrite_keys() {
-        assert_eq!(overwrite_key("bgp router-id 1.1.1.1").as_deref(), Some("bgp router-id"));
+        assert_eq!(
+            overwrite_key("bgp router-id 1.1.1.1").as_deref(),
+            Some("bgp router-id")
+        );
         assert_eq!(
             overwrite_key("neighbor 1.1.1.1 route-map X in").as_deref(),
             Some("neighbor 1.1.1.1 route-map in")

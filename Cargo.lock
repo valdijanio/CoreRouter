@@ -1169,6 +1169,7 @@ dependencies = [
  "corerouter-discovery",
  "corerouter-engine",
  "corerouter-hal",
+ "corerouter-hal-frr",
  "corerouter-hal-linux",
  "corerouter-model",
  "corerouter-proto-dhcp",

@@ -115,9 +115,54 @@ backend.**
 - Reescrever BGP/OSPF/LDP/BFD com interoperabilidade de produção custa anos (estimado); FRR é
   maduro, usado por operadores e testado contra os grandes fabricantes.
 - O engine continua dono da verdade: o candidate é validado pelos `proto-*` (L2), que
-  **renderizam** a config FRR (`proto-bgp::render_frr` já existe). O driver L1 `hal-frr` (G3.1)
-  aplica como transação (`frr-reload`/mgmtd), faz rollback se falhar e lê estado via
-  `vtysh -c '… json'`.
+  **renderizam** a config FRR (`proto-bgp::render_frr`). O driver `hal-frr` (G3.1, plataforma,
+  só as apps o usam) implementa o trait `hal::routing::RoutingDaemon`: a cada commit que muda
+  `routing`, depois do `Hal::apply`, ele lê a config que cada daemon roda, aplica só a
+  diferença e, se o FRR recusar uma linha, desfaz o que digitou; o engine então desfaz o
+  `Hal::apply` e o commit falha. Nunca reinicia o FRR nem derruba sessão que o commit não muda.
+- **Como falar com o FRR (G3.1, medido).** Comparamos três formas no FRR 10.7.1 da VM do
+  laboratório (8 vCPUs, build release, 2026-10-27; `scripts/frr-compare.sh`). As tabelas
+  completas estão em `docs/perf.md`.
+  - **(a) `frr-reload.py` + `vtysh -c '… json'`.** É Python, abre um `vtysh` por passo e diffa
+    o texto inteiro. Uma mudança pequena levou 0,2–3,9 s.
+  - **(b) o socket vty de cada daemon, falado em Rust** (`/var/run/frr/<daemon>.vty`, o mesmo
+    protocolo do `vtysh`: comando terminado em NUL, resposta + `\0\0\0<código>`,
+    `lib/vty.c`). O diff é feito em Rust. Uma mudança pequena levou 1–13 ms, e a leitura de 100
+    sessões, 2,4–3,6 ms (contra 11–15 ms do `vtysh -c`). O processo usa 4–11 MiB, contra
+    18–32 MiB do `frr-reload.py`.
+  - **(c) misto: diff em Rust + `vtysh -f`.** Fica no meio: 18–45 ms numa mudança pequena e
+    um processo a mais a cada apply.
+  - **10 mil entradas de prefix-list.** O tempo é do próprio bgpd, em qualquer forma:
+    1,7–2,8 s em (b), 1,6–2,5 s em (c). O `frr-reload.py` terminou em 1,0–1,4 s **sem aplicar
+    nada** (as 10 mil linhas continuaram faltando, nas três rodadas). Tirar 5 mil levou
+    2,4–2,7 s em (b) e 3,8–5,8 s em (a).
+  - **1 M de rotas.** O `show ip route json` leva ~17 s pelos dois caminhos e gera 537 MiB: o
+    custo é do zebra. Interpretar isso como `serde_json::Value` passou de 5 GiB. Estado de rota
+    vem do resumo (`… summary json`, 0,2 s) ou de consultas por prefixo, nunca da tabela
+    inteira.
+  - **mgmtd e gRPC (b original) não servem ao BGP hoje.** O mgmtd do FRR 10.x só cobre zebra,
+    staticd, ripd e ripngd; bgpd e ospfd ainda não foram convertidos. O gRPC northbound é
+    experimental e não vem nos pacotes do deb.frrouting.org. O mesmo trait recebe um backend
+    mgmtd quando o bgpd for convertido, ou o holo (G3.8).
+  - **Decisão: (b).** Nenhum processo externo nem Python, é a forma mais rápida e não perde
+    linhas. O lote vai entre `XFRR_start_configuration` e `XFRR_end_configuration`, como o
+    `vtysh -f` faz: prefix-lists e route-maps do northbound viram um commit só, e o bgpd segura
+    os vizinhos novos até o fim, de modo que a sessão não sobe antes da política digitada junto.
+- **Contextos do CoreRouter.** O driver só toca nos contextos da tabela `hal_frr::render::OWNED`
+  (hoje `router bgp`). O resto da config do FRR (`hostname`, `log`, interfaces) fica como está.
+  O diff é por contexto e trata o conteúdo como conjunto; uma configuração de valor único
+  (`bgp router-id`, `neighbor X remote-as`) é reescrita por cima, e não apagada antes, porque
+  `no neighbor X remote-as` remove o vizinho inteiro.
+- **Estado fora do lock.** O serviço `frr` do daemon (`--frr <dir>`) lê as sessões a cada 2 s
+  numa conexão própria e só pega o lock do `Session` para copiar a parte `routing` e guardar a
+  amostra. Quando o FRR volta depois de cair, a config em execução é reinstalada
+  (`Session::routing_resync`), sob o lock, para não intercalar com um commit. Paralelismo: o
+  bgpd atende um comando de cada vez por conexão, e o custo dominante é dele, então dividir
+  o envio em várias threads não acelera o apply. A leitura já roda numa thread separada do
+  commit.
+- **RFC 8212.** O perfil `traditional` do FRR liga `bgp ebgp-requires-policy` e o render não
+  desliga. Uma sessão eBGP sem política não aceita nem anuncia rota (no teste com FRR real,
+  `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2.
 - **holo** (suíte de roteamento em Rust, modelo YANG) é o candidato a backend Rust-nativo do
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)
@@ -166,6 +211,7 @@ Imposta por `cargo xtask layers` (`xtask/src/layers.rs`, com testes).
 | L1 | `crates/firewall` | Firewall puro (G2.1): validação, grafo de jumps e render nftables da tabela `inet corerouter`; a tabela `ip corerouter_cgnat` do CGNAT (`cgnat`, G2.3); o flowtable `inet corerouter_fastpath` (`fastpath`, G2.4); sem I/O, compila para wasm. L1 (e não `proto-*`) porque o `hal-linux` também renderiza. Veja `docs/firewall.md` | L0 |
 | L1 | `crates/hal-linux` | Backend Linux: `apply` via rtnetlink (links, VLAN, bridge, dummy, VRF, endereços, rotas estáticas; G1.2/G1.5), descoberta/contadores via rtnetlink (`RTM_GETLINK`, G1.18) com política de posse (`owner`); I/O de descoberta de vizinhos (`l2`: LLDP por `AF_PACKET`, escuta MNDP em UDP 5678; G5.2, só bytes); ICMP das ferramentas (`icmp`: ping socket ou raw, G6.2); firewall por `nft -f -` (módulo `nft`, G2.1); CGNAT e fast path por nfnetlink (`nfnl`, `cgnat`, G2.3b; `fastpath`, flowtable e eSwitch por devlink, G2.4) e conntrack por ctnetlink (`ctnl`, G2.2; eventos `NEW`/`DESTROY` para o Traffic Flow, `ctnl::Events`, G4.4b); estado/hardware/contadores das portas por ethtool e devlink netlink (`genl`, `ethtool`, `nic`, `pci_ids`; G1.19, sem ioctl — veja `docs/interfaces.md`); cliente DHCP (`dhcp`: `AF_PACKET` com filtro BPF, UDP 68, sonda ARP; G4.7); cliente DHCPv6 (`dhcp6`: UDP 546 → `ff02::1:2`) e RA (`ra`: `accept_ra` por interface a cada apply, limpeza do aprendido; G4.7b); configuração Ethernet, EEPROM do módulo e teste de cabo por ethtool netlink (`ether`, G1.20). **Plataforma** | L0, `hal`, `firewall` (laterais permitidos) |
 | L2 | `crates/proto-{bgp,ospf,mpls,cgnat,dns,dhcp}` | `validate(&Config) -> Vec<Issue>` + render para o backend (FRR, nftables…); `proto-dhcp` também tem o codec DHCPv4 (`dhcproto` atrás de um saneador), a máquina de estados pura do cliente e o servidor simulado do lab (G4.7, `docs/dhcp-client.md`); o mesmo para DHCPv6 com codec próprio (`v6`, `client6`, `lab6`; G4.7b) | L0, L1 |
+| L2 | `crates/hal-frr` | Driver do FRR (G3.1): `conf` (árvore do `frr.conf`, diff por contexto), `render` (render dos `proto-*` por daemon, contextos do CoreRouter), `vty` (socket vty dos daemons, sem `vtysh`), `state` (sessões BGP do JSON do bgpd); implementa `hal::routing::RoutingDaemon`. **Plataforma** | L0, `hal`, `proto-bgp` (lateral permitido) |
 | L2 | `crates/proto-discovery` | CRDP, protocolo de descoberta próprio: codec puro (`Announcement::encode`/`decode`) + `validate` das configurações de descoberta. Veja `docs/discovery.md` | L0 |
 | L2 | `crates/proto-flow` | Exportação de fluxos (G4.4b): IPFIX (RFC 7011) e NetFlow v9 (RFC 3954), codificador e decodificador; eventos de NAT (RFC 8158); o medidor que transforma eventos do conntrack em registros (timeouts, amostragem, cache limitado). Puro, compila em wasm. Veja `docs/traffic-flow.md` | L0, L1 |
 | L2 | `crates/proto-{lldp,mndp}` | Codecs puros de descoberta: LLDPDU (`decode`/`encode`) e anúncio MNDP (só `decode`; nunca anunciamos MNDP). Veja `docs/lldp-mndp.md` | nada do workspace |
@@ -213,7 +259,8 @@ CoreRouter/
 └── xtask/                # L7
 ```
 
-Planejado (gap): `crates/hal-frr` (L1 plataforma, G3.1). `crates/dataplane-ebpf` (programas XDP,
+`crates/hal-frr` (G3.1) é a plataforma do FRR, classificada na L2 ao lado dos `proto-*`, cujo
+render ela usa. `crates/dataplane-ebpf` (programas XDP,
 fora do workspace, `cargo xtask ebpf`) e `crates/dataplane-ebpf-common` (L1 plataforma, usado só
 pelo programa e pelo `hal-linux`) existem desde a G2.5a.
 

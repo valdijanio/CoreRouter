@@ -51,6 +51,7 @@ pub struct Frr {
     dir: PathBuf,
     timeout: Duration,
     max_reply: usize,
+    owned: render::Owned,
 }
 
 /// What one sync did, for the log and the benchmarks.
@@ -73,6 +74,7 @@ impl Frr {
             dir: dir.into(),
             timeout: TIMEOUT,
             max_reply: MAX_REPLY,
+            owned: render::OWNED,
         }
     }
 
@@ -86,19 +88,29 @@ impl Frr {
         self
     }
 
+    /// Own other contexts than [`render::OWNED`] (the benchmarks own
+    /// prefix-lists before a `proto-*` renders them).
+    pub fn with_owned(mut self, owned: render::Owned) -> Self {
+        self.owned = owned;
+        self
+    }
+
     pub fn socket(&self, d: Daemon) -> PathBuf {
         self.dir.join(format!("{}.vty", d.name()))
     }
 
-    /// A connection to `d`.
+    /// A connection to `d`, in the enable node (`show running-config`
+    /// lives there; a vty connection starts in the view node).
     pub fn connect(&self, d: Daemon) -> Result<Vty, HalError> {
-        Vty::connect(&self.socket(d), self.timeout, self.max_reply).map_err(|e| {
+        let mut vty = Vty::connect(&self.socket(d), self.timeout, self.max_reply).map_err(|e| {
             HalError::Io(format!(
                 "FRR {} is not reachable at {}: {e}",
                 d.name(),
                 self.socket(d).display()
             ))
-        })
+        })?;
+        vty.run("enable").map_err(|e| io_err(d, e))?;
+        Ok(vty)
     }
 
     /// The part of `d`'s running config CoreRouter owns.
@@ -113,7 +125,7 @@ impl Frr {
         }
         let text = String::from_utf8_lossy(&r.output);
         Conf::parse(&text)
-            .map(|c| c.owned(|line| render::daemons_of(line).contains(&d)))
+            .map(|c| c.owned(|line| render::daemons_of(self.owned, line).contains(&d)))
             .map_err(|e| HalError::Rejected(format!("FRR {} running config: {e}", d.name())))
     }
 
@@ -128,9 +140,7 @@ impl Frr {
     /// comes up before the policy typed with it. The end marker is sent on
     /// every path: without it bgpd waits 600 s (`BGP_PRE_CONFIG_MAX_WAIT`).
     pub fn push(&self, vty: &mut Vty, d: Daemon, script: &[String]) -> Result<(), HalError> {
-        let enter = vty
-            .run("enable")
-            .and_then(|_| vty.run("configure terminal"));
+        let enter = vty.run("configure terminal");
         match enter {
             Ok(r) if r.ok() => {}
             Ok(r) => {
@@ -169,7 +179,9 @@ impl Frr {
         for _ in 0..depth {
             vty.run("exit").map_err(|e| io_err(d, e))?;
         }
-        let end = vty.run("XFRR_end_configuration").map_err(|e| io_err(d, e))?;
+        let end = vty
+            .run("XFRR_end_configuration")
+            .map_err(|e| io_err(d, e))?;
         if failed.is_none() && !end.ok() {
             failed = Some(format!(
                 "FRR {} refused the change at commit: {} ({})",
@@ -188,10 +200,13 @@ impl Frr {
     /// difference. On a refused command every daemon already changed is
     /// put back to what it ran before, and the error says which command.
     pub fn sync(&self, desired: &Conf) -> Result<Synced, HalError> {
-        let wanted = render::by_daemon(desired);
+        let wanted = render::by_daemon(self.owned, desired);
         let mut done: Vec<(Daemon, Vty, Conf)> = Vec::new();
         let mut synced = Synced::default();
-        for d in Daemon::ALL {
+        let daemons = Daemon::ALL
+            .into_iter()
+            .filter(|d| self.owned.iter().any(|(_, ds)| ds.contains(d)));
+        for d in daemons {
             let target = wanted
                 .iter()
                 .find(|(w, _)| *w == d)
@@ -226,9 +241,11 @@ impl Frr {
             synced.commands.push((d, script.len()));
             // What FRR made of it: a canonical render diffs to nothing.
             if let Ok(after) = self.running(&mut vty, d) {
-                synced
-                    .leftover
-                    .extend(conf::diff(&after, &target).into_iter().map(|l| format!("{}: {l}", d.name())));
+                synced.leftover.extend(
+                    conf::diff(&after, &target)
+                        .into_iter()
+                        .map(|l| format!("{}: {l}", d.name())),
+                );
             }
             done.push((d, vty, before));
         }
@@ -247,9 +264,10 @@ impl Frr {
     pub fn version(&self) -> Result<String, HalError> {
         let mut last = HalError::Io("no FRR daemon answers".into());
         for d in [Daemon::Zebra, Daemon::Bgpd] {
-            match self.connect(d).and_then(|mut v| {
-                v.run("show version").map_err(|e| io_err(d, e))
-            }) {
+            match self
+                .connect(d)
+                .and_then(|mut v| v.run("show version").map_err(|e| io_err(d, e)))
+            {
                 Ok(r) => return Ok(version_line(&String::from_utf8_lossy(&r.output))),
                 Err(e) => last = e,
             }

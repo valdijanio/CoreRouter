@@ -45,17 +45,21 @@ impl Daemon {
 /// removed on the next sync). Every other context of FRR's config (`frr
 /// version`, `hostname`, `log`, interfaces, `line vty`) is left alone.
 /// A `proto-*` render that adds a context kind adds it here.
-pub const OWNED: &[(&str, &[Daemon])] = &[("router bgp ", &[Daemon::Bgpd])];
+pub const OWNED: Owned = &[("router bgp ", &[Daemon::Bgpd])];
+
+/// A table of owned contexts: header prefix → daemons that take it.
+pub type Owned = &'static [(&'static str, &'static [Daemon])];
 
 /// Whether CoreRouter owns the top-level context `line`.
 pub fn owned(line: &str) -> bool {
     OWNED.iter().any(|(p, _)| line.starts_with(p))
 }
 
-/// The daemons a top-level context goes to (shared contexts such as
-/// `route-map` go to every daemon that filters with it, as vtysh does).
-pub fn daemons_of(line: &str) -> &'static [Daemon] {
-    OWNED
+/// The daemons a top-level context goes to under `table` (shared contexts
+/// such as `route-map` go to every daemon that filters with it, as vtysh
+/// does).
+pub fn daemons_of(table: Owned, line: &str) -> &'static [Daemon] {
+    table
         .iter()
         .find(|(p, _)| line.starts_with(p))
         .map(|(_, d)| *d)
@@ -73,13 +77,13 @@ pub fn render(cfg: &Config) -> Result<Conf, ParseError> {
 
 /// `conf` split by daemon: each daemon's part, in [`Daemon::ALL`] order,
 /// with the daemons that get nothing left out.
-pub fn by_daemon(conf: &Conf) -> Vec<(Daemon, Conf)> {
+pub fn by_daemon(table: Owned, conf: &Conf) -> Vec<(Daemon, Conf)> {
     let mut out: Vec<(Daemon, Conf)> = Vec::new();
     for d in Daemon::ALL {
         let nodes: Vec<_> = conf
             .nodes
             .iter()
-            .filter(|n| daemons_of(&n.line).contains(&d))
+            .filter(|n| daemons_of(table, &n.line).contains(&d))
             .cloned()
             .collect();
         if !nodes.is_empty() {
@@ -110,8 +114,13 @@ mod tests {
         let conf = render(&cfg).unwrap();
         assert_eq!(conf.nodes.len(), 1);
         assert_eq!(conf.nodes[0].line, "router bgp 65000");
-        assert!(conf.nodes[0].children.iter().any(|c| c.line == "bgp shutdown"));
-        let parts = by_daemon(&conf);
+        assert!(
+            conf.nodes[0]
+                .children
+                .iter()
+                .any(|c| c.line == "bgp shutdown")
+        );
+        let parts = by_daemon(OWNED, &conf);
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].0, Daemon::Bgpd);
         assert!(owned("router bgp 65000 view x"));

@@ -16,7 +16,8 @@ pub fn bgp_sessions(
     vrf: Option<&str>,
     vrf_instance: &dyn Fn(&str) -> String,
 ) -> Result<Vec<BgpSession>, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("bgpd answered bad JSON: {e}"))?;
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| format!("bgpd answered bad JSON: {e}"))?;
     let Value::Object(top) = v else {
         return Err("bgpd answered JSON that is not an object".into());
     };
@@ -113,7 +114,8 @@ fn session(
         reason: if established {
             None
         } else {
-            str_of(n, "lastResetDueTo").or_else(|| str_of(n, "adminShutDown").map(|_| "Admin. shutdown".into()))
+            str_of(n, "lastResetDueTo")
+                .or_else(|| str_of(n, "adminShutDown").map(|_| "Admin. shutdown".into()))
         },
         description: str_of(n, "nbrDesc"),
     }
