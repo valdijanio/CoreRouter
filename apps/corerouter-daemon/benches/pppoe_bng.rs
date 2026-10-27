@@ -47,7 +47,7 @@ fn snapshot(users: usize) -> Snapshot {
             .map(|i| PppSecret {
                 id: ItemId(2 + i as u32),
                 name: format!("u{i}"),
-                password: format!("p{i}"),
+                password: format!("p{i}").into(),
                 profile: "default".into(),
                 ..PppSecret::default()
             })
@@ -247,7 +247,22 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("pppoe_bng");
     g.sample_size(10);
     g.throughput(Throughput::Elements(1000));
+    // The name index built once and shared by the copies, as the
+    // service's snapshot is.
+    let _ = snap.ppp.secret("u0");
     g.bench_function("setup_1000_sessions", |b| b.iter(|| sessions(1000, &snap)));
+    // G4.3n: the passwords sealed, as the engine keeps them now (one open
+    // per login).
+    let mut sealed = snap.clone();
+    let key = std::sync::Arc::new(corerouter_engine::sealing::SealKey::from_bytes(&[7; 32]));
+    for x in sealed.ppp.secrets.iter_mut() {
+        x.password = key.seal(x.password.stored()).unwrap();
+    }
+    sealed.seal = Some(key);
+    let _ = sealed.ppp.secret("u0");
+    g.bench_function("setup_1000_sessions_sealed", |b| {
+        b.iter(|| sessions(1000, &sealed))
+    });
     g.finish();
     ha(c, &snap, &snap100);
     // G4.3l: the slow path's IPv6 lookup per packet down, with 100 000

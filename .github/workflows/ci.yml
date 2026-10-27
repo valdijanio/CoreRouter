@@ -98,7 +98,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [1, 2, 3]
+        part: [1, 2]
     env:
       COREROUTER_CI_PARTITION: ${{ matrix.part }}/${{ strategy.job-total }}
     steps:

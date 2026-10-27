@@ -156,3 +156,117 @@ fn ppp_round_trips() {
     };
     assert_eq!(strip(&b.session), strip(&a.session), "{script}");
 }
+
+/// What the PPP secrets of `s` are, passwords opened, ids left out: two
+/// routers with the same subscribers compare equal.
+fn subscribers(s: &mut Session) -> Vec<Value> {
+    let key = corerouter_engine::sealing::key(s).unwrap();
+    let mut out: Vec<Value> = s
+        .store()
+        .running()
+        .ppp
+        .secrets
+        .iter()
+        .map(|x| {
+            let mut v = serde_json::to_value(x).unwrap();
+            v["id"] = json!(null);
+            v["password"] = json!(key.open(&x.password).unwrap());
+            v
+        })
+        .collect();
+    out.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+    out
+}
+
+/// G4.3n: a RouterOS v7 `/ppp secret export show-sensitive`, as RouterOS
+/// writes it (wrapped lines, `\XX` bytes, `set [ find … ]`).
+const ROUTEROS: &str = r#"# 2026-10-26 12:00:01 by RouterOS 7.20.2
+# software id = ABCD-EFGH
+#
+# model = CCR2004-1G-12S+2XS
+/ppp profile
+add change-tcp-mss=yes local-address=100.64.255.254 name=plano-100M \
+    only-one=yes rate-limit=50M/100M
+set *0 dns-server=9.9.9.9
+/ppp secret
+add caller-id=AA:BB:CC:00:00:01 comment="Jo\C3\A3o da Silva \"apto 12\"" \
+    limit-bytes-out=1000000 name=joao@isp password="s3n h4\$!" profile=\
+    plano-100M remote-address=100.64.9.9 service=pppoe
+add disabled=yes name=maria password=M4r1a profile=plano-100M routes=\
+    "203.0.113.8/29 0.0.0.0 1,2001:db8:100::/48" service=pppoe
+add name=semsenha profile=default
+set [ find name=maria ] comment="cancelado em 10/2026"
+"#;
+
+#[test]
+fn routeros_export_import_export_import_is_identical() {
+    // RouterOS → us.
+    let mut a = Term::new();
+    let r = a
+        .session
+        .execute("ppp.secret.import", &json!({"text": ROUTEROS}))
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(r["added"], 3, "{r}");
+    assert_eq!(r["without_password"]["count"], 1, "{r}");
+    assert_eq!(r["profiles_created"], json!(["plano-100M"]), "{r}");
+    let first = subscribers(&mut a.session);
+    assert_eq!(first[0]["comment"], "João da Silva \"apto 12\"");
+    assert_eq!(first[0]["password"], "s3n h4$!");
+    assert_eq!(first[1]["comment"], "cancelado em 10/2026");
+    assert_eq!(
+        first[1]["routes"],
+        json!(["203.0.113.8/29", "2001:db8:100::/48"]),
+        "G4.3cd routes come along"
+    );
+    // Without show-sensitive, never a password.
+    a.ok("/export file=plain.rsc");
+    assert!(!a.files["plain.rsc"].contains("M4r1a"));
+    // Us → us, with the passwords.
+    a.ok("/ppp secret export show-sensitive file=ours.rsc");
+    let ours = a.files["ours.rsc"].clone();
+    assert!(
+        ours.contains("password=M4r1a") && ours.contains("show-sensitive"),
+        "{ours}"
+    );
+    // Back in by the import command…
+    let mut b = Term::new();
+    b.session
+        .execute("ppp.profile.add", &json!({"name": "plano-100M"}))
+        .unwrap();
+    let r = b
+        .session
+        .execute("ppp.secret.import", &json!({"text": ours}))
+        .unwrap_or_else(|e| panic!("{e}\n{ours}"));
+    assert_eq!(r["errors_total"], 0, "{r}");
+    assert_eq!(subscribers(&mut b.session), first, "{ours}");
+    // …and by /import.
+    let mut c = Term::new();
+    c.session
+        .execute("ppp.profile.add", &json!({"name": "plano-100M"}))
+        .unwrap();
+    c.files.insert("ours.rsc".into(), ours.clone());
+    c.ok("/import file=ours.rsc");
+    assert_eq!(subscribers(&mut c.session), first, "{ours}");
+}
+
+#[test]
+fn show_sensitive_is_for_group_full_only() {
+    let mut t = Term::new();
+    t.session
+        .execute(
+            "ppp.secret.add",
+            &json!({"name": "joao", "password": "s3nh4"}),
+        )
+        .unwrap();
+    t.session
+        .execute(
+            "user.add",
+            &json!({"name": "noc", "group": "write", "password": "correct horse"}),
+        )
+        .unwrap();
+    t.caller = Caller::new(8, "test 10.0.0.2:1").with_principal(Principal::User("noc".into()));
+    let job = t.shell.submit("/export show-sensitive file=x");
+    let (failed, text) = t.drive(job);
+    assert!(failed && text.contains("group full"), "{text}");
+    assert!(!t.files.contains_key("x"));
+}

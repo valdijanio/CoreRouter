@@ -41,6 +41,30 @@ pub(crate) fn save(ctx: &Context, name: &str, export: Export) -> Result<String, 
     }
 }
 
+/// Read a file the operator names (G4.3n: PPP › Secrets › Import from
+/// MikroTik); the app's way, as [`SaveFile`] for saving.
+pub type OpenFile = Arc<dyn Fn(&str) -> Result<Vec<u8>, String> + Send + Sync>;
+
+fn open_key() -> Id {
+    Id::unique("corerouter-export-open-file")
+}
+
+/// The app's way of reading files (native: the local disk).
+pub fn install_open(ctx: &Context, open: OpenFile) {
+    ctx.data_mut(|d| d.insert_temp(open_key(), open));
+}
+
+/// The bytes of `path`, or why not (no reader here: the browser, tests).
+pub(crate) fn open(ctx: &Context, path: &str) -> Result<Vec<u8>, String> {
+    if path.trim().is_empty() {
+        return Err("type the file's path, drop the file on the window or paste it".into());
+    }
+    match ctx.data(|d| d.get_temp::<OpenFile>(open_key())) {
+        Some(f) => f(path),
+        None => Err("files cannot be read here: drop the file on the window or paste it".into()),
+    }
+}
+
 /// The saver of `ctx`, to call from a screenshot callback (another thread).
 pub(crate) fn saver(ctx: &Context) -> Option<SaveFile> {
     ctx.data(|d| d.get_temp::<SaveFile>(key()))

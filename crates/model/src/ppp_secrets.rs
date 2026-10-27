@@ -429,7 +429,7 @@ mod tests {
     }
 
     fn pw<'a>(v: &'a Secrets, name: &str) -> Option<&'a str> {
-        v.by_name(name).map(|x| x.password.as_str())
+        v.by_name(name).map(|x| x.password.stored())
     }
 
     #[test]
@@ -468,12 +468,12 @@ mod tests {
         };
         let is_ipoe = |x: &PppSecret| x.service == crate::ppp::PppService::Ipoe;
         let mut v = Secrets::new(vec![s("m", "pppoe"), ipoe("n", "1")]);
-        assert_eq!(v.first_named("n", is_ipoe).map(|x| x.password.as_str()), Some("1"));
+        assert_eq!(v.first_named("n", is_ipoe).map(|x| x.password.stored()), Some("1"));
         assert!(v.first_named("m", is_ipoe).is_none());
         assert!(v.first_named("absent", is_ipoe).is_none());
         // A config edited by hand: the IPoE one of a name held twice.
         v.push(ipoe("m", "2"));
-        assert_eq!(v.first_named("m", is_ipoe).map(|x| x.password.as_str()), Some("2"));
+        assert_eq!(v.first_named("m", is_ipoe).map(|x| x.password.stored()), Some("2"));
         assert_eq!(pw(&v, "m"), Some("pppoe"));
     }
 

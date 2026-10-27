@@ -787,8 +787,9 @@ impl QueueType {
 pub struct Queues {
     /// In order: the first queue whose target holds an address wins.
     /// A block list (G0.21): 10 000 queues and more on a big BNG.
-    #[serde(skip_serializing_if = "crate::cow_list::CowList::is_empty")]
-    pub simple: crate::cow_list::CowList<SimpleQueue>,
+    /// With an index of names and targets (`simple_queues.rs`).
+    #[serde(skip_serializing_if = "crate::simple_queues::SimpleQueues::is_empty")]
+    pub simple: crate::simple_queues::SimpleQueues,
     /// Types the operator added or changed (built-ins exist without an
     /// entry; an entry with a built-in's name is the edited copy).
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -855,22 +856,15 @@ impl Queues {
             .collect()
     }
 
+    /// The queue named `name`, through the index.
     pub fn simple_by_name(&self, name: &str) -> Option<&SimpleQueue> {
-        self.simple.iter().find(|q| q.name == name)
+        self.simple.by_name(name)
     }
 
-    /// A free `queue<N>` name (RouterOS names new queues so).
+    /// The lowest free `queue<N>` name (RouterOS names new queues so),
+    /// through the index.
     pub fn free_name(&self) -> String {
-        // One pass over the names (a lookup per candidate made adding
-        // 10 000 auto-named queues quadratic, G4.9c).
-        let used: std::collections::HashSet<u64> = self
-            .simple
-            .iter()
-            .filter_map(|q| q.name.strip_prefix("queue")?.parse().ok())
-            .collect();
-        (1..)
-            .find(|i| !used.contains(i))
-            .map_or_else(|| "queue".into(), |i| format!("queue{i}"))
+        self.simple.free_name()
     }
 }
 

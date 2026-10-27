@@ -226,9 +226,10 @@ fn the_secret_modal_adds_through_the_preview() {
     for _ in 0..30 {
         h.idle();
     }
-    let s = lock(&h.session);
+    let mut s = lock(&h.session);
     let sec = s.store().running().ppp.secret("carla").cloned();
-    assert_eq!(sec.map(|x| x.password).as_deref(), Some("s3nh4"), "{:?}", h.app.log());
+    let key = corerouter_engine::sealing::key(&mut s).unwrap();
+    assert_eq!(sec.and_then(|x| key.open(&x.password)).as_deref(), Some("s3nh4"), "{:?}", h.app.log());
 }
 
 #[test]
