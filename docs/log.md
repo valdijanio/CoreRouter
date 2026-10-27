@@ -5730,3 +5730,16 @@ continuação indentadas).
   bgp_routes`, `cargo test -p corerouter-daemon rpki` (RTR por TCP com o servidor de teste); com
   FRR real, `cargo xtask vm-lab run -- scripts/frr-rpki-live.sh`. Na GUI: Routing › RPKI e
   Routing › BGP Routes.
+
+- 2026-10-27 — G3.2c: RPKI e rotas BGP na GUI, no mockup aprovado (continuação do #315): as janelas Routing › RPKI e
+  Routing › BGP Routes viraram as abas RPKI e Routes da janela Routing › BGP. O detalhe da sessão
+  tem três colunas: erro e timers; "RPKI In" com os selos `valid`/`unknown`/`invalid` em
+  porcentagem (verde, amarelo e vermelho) e as políticas; quedas e os links "received routes ·
+  advertised · history · why this route?". Sem a tabela lida, "RPKI In" oferece "read the
+  routes". O modal "Why this route?" aceita digitar o prefixo (o link do detalhe abre vazio).
+  `unknown` passou de neutro a amarelo em todos os selos. Como testar: `cargo test -p
+  corerouter-ui bgp_routes`; na GUI, Routing › BGP, selecionar uma sessão e as abas RPKI e Routes.
+
+- 2026-10-27 — G3.3: Estado BGP: fechado pelas partes que já entraram. `routing.bgp.session.list` e a aba Sessions
+  vieram na G3.2a; `routing.bgp.route.list` (recebidas e anunciadas, paginadas, com busca) e
+  `routing.bgp.session.history` (quedas por sessão), na G3.2c.
