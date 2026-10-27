@@ -5636,3 +5636,29 @@ continuação indentadas).
   abra Interfaces, escolha Columns, oculte MTU e reabra a GUI; teste também Inline
   Comments e os temas claro e escuro. O resumo usa consultas existentes da interface
   selecionada; disponibilidade depende da plataforma.
+
+- 2026-10-27 — G1.27d: Vizinhos ARP/ND, parte d: o fabricante de cada MAC. A lista pública MA-L do IEEE (`oui.csv`,
+  baixada em 2026-10-27, SHA-256 `e1a07d9a…5f24`, 3,9 MB) vira uma tabela compacta embutida
+  (`crates/model/data/oui.bin`, 709 079 bytes, 40 410 atribuições, **medido**): registros de 6
+  bytes ordenados (prefixo + deslocamento do nome) e nomes sem repetição, procurados por busca
+  binária direto nos bytes. `cargo xtask oui <oui.csv> --date …` a gera. O usuário decidiu embutir
+  com base na declaração do IEEE citada pelo Debian (`docs/third-party.md`). `ip.arp.vendors.update`
+  pede ao serviço `oui` do daemon que baixe a lista atual (TLS conferido, até 16 MB, parser com
+  proptest, troca atômica: arquivo temporário + rename em `<config-dir>/oui.bin`); a baixada vale
+  mais que a embutida e é recarregada no início. `ip.arp.vendors.print` diz qual está em uso, a
+  data e o SHA-256; a aba Settings de IP › ARP mostra isso e o botão "Update vendors". A coluna
+  Vendor de IP › ARP passa a ter o nome, e a busca por texto acha pelo fabricante. Endereços
+  localmente administrados ou de grupo não têm fabricante (bits U/L e I/G).
+
+  Como testar: `cargo test -p corerouter-model oui`, `cargo test -p corerouter-engine --test arp
+  vendors`; daemon com `--config-dir` e um DNS (`ip.dns.set servers=1.1.1.1`), depois
+  `ip.arp.vendors.update` e `ip.arp.vendors.print`. Conferido assim: 40 414 atribuições baixadas,
+  `oui.bin` gravado e ainda em uso depois de reiniciar o daemon (**medido**).
+
+- 2026-10-27 — interfaces-refino: Interfaces: gráficos de tráfego mais largos usam a largura disponível a partir da
+  primeira amostra conhecida, sem ligar as lacunas internas; ponto único aparece e
+  sem dados não se inventa linha. A legenda informa Rx/Tx e até cinco minutos.
+  Cabeçalhos ganham espaço para ⓘ; resumo da interface selecionada separa estado,
+  enlace, duplex, MTU e taxas quando informadas. Comentários mantêm a faixa e as
+  interações existentes. Testar: abrir Interfaces no lab, selecionar uma porta,
+  comentar e ativar Inline Comments; verificar temas claro/escuro e ocultar Traffic.
