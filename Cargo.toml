@@ -45,6 +45,7 @@ corerouter-discovery = { path = "crates/discovery" }
 corerouter-ui = { path = "crates/ui" }
 corerouter-shell = { path = "crates/shell" }
 corerouter-dataplane-ebpf-common = { path = "crates/dataplane-ebpf-common" }
+corerouter-sysupdate = { path = "crates/sysupdate" }
 
 # External: heavy crates enter with default-features = false.
 serde = { version = "1.0.229", features = ["derive"] }

@@ -17,6 +17,9 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-cgnat-map", 0),
     ("corerouter-hal", 1),
     ("corerouter-hal-linux", 1),
+    // G1.6b: the A/B image (package, dm-verity, UEFI boot entries); file I/O
+    // only, used by the image's init and the daemon, never by the engine.
+    ("corerouter-sysupdate", 1),
     // Pure (no I/O, wasm-safe): firewall validation + nftables render, needed by
     // hal-linux (L1) and the engine, so it cannot be an L2 proto-* crate.
     ("corerouter-firewall", 1),
@@ -56,6 +59,7 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-daemon", 6),
     // G1.6a: PID 1 of the OS image (mounts, /config, supervises the daemon).
     ("corerouter-init", 6),
+    ("corerouter-image", 6),
     ("corerouter-gui", 6),
     ("corerouter-cli", 6),
     ("xtask", 7),
@@ -101,6 +105,7 @@ pub const PLATFORM_CRATES: &[&str] = &[
     "corerouter-hal-frr",
     "corerouter-dataplane-ebpf",
     "corerouter-dataplane-ebpf-common",
+    "corerouter-sysupdate",
 ];
 
 /// Platform crates a platform crate below the apps may use: the loader and
