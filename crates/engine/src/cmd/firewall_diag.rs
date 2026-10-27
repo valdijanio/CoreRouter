@@ -129,6 +129,7 @@ fn test_packet(s: &Session, p: &Value) -> Result<Packet> {
         in_interface: in_interface.map(|i| i.as_str().to_owned()),
         out_interface: None,
         state: parse_state(p)?,
+        nat: None,
     })
 }
 
@@ -299,6 +300,11 @@ fn trace_start(s: &mut Session, p: &Value) -> Result<Value> {
         port: port(p, "port")?,
         in_interface: opt_parse::<IfName>(p, "in_interface")?.map(|i| i.as_str().to_owned()),
     };
+    for (key, a) in [("src", &filter.src), ("dst", &filter.dst)] {
+        if matches!(a, Some(AddrMatch::Range(..))) {
+            return Err(EngineError::bad(key, "an address or a prefix (a range cannot be traced)"));
+        }
+    }
     if filter.is_empty() {
         return Err(EngineError::bad(
             "src",

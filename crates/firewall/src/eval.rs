@@ -6,7 +6,8 @@
 //! What a config alone cannot know is assumed, always the same way:
 //!
 //! - the packet carries no connection, packet or routing mark;
-//! - the connection was not NATed (`connection_nat_state` sees none);
+//! - the connection was not NATed (`connection_nat_state` sees none),
+//!   unless the packet says so (`Packet::nat`, the tester after a dst-nat);
 //! - a `limit` is not exceeded (the rule matches);
 //! - address lists hold their static entries plus the dynamic ones the
 //!   caller passes; entries that rules added inside the kernel are unknown
@@ -15,8 +16,8 @@
 use std::net::IpAddr;
 
 use corerouter_model::firewall::{
-    Action, AddrMatch, ConnState, DynamicAddress, Family, FirewallRule, Flag, Flags, Name, Neg,
-    Protocol, Table,
+    Action, AddrMatch, ConnState, DynamicAddress, Family, FirewallRule, Flag, Flags, Name,
+    NatState, Neg, Protocol, Table,
 };
 use corerouter_model::{Config, ItemId};
 
@@ -35,6 +36,9 @@ pub struct Packet {
     pub in_interface: Option<String>,
     pub out_interface: Option<String>,
     pub state: ConnState,
+    /// What NAT did to the connection so far (the packet tester sets it
+    /// after a `dst-nat`; everyone else: none).
+    pub nat: Option<NatState>,
 }
 
 impl Packet {
@@ -147,7 +151,7 @@ pub fn matches(cfg: &Config, dynamic: &[DynamicAddress], r: &FirewallRule, p: &P
         && iface_list(&m.in_interface_list, p.in_interface.as_deref())
         && iface_list(&m.out_interface_list, p.out_interface.as_deref())
         && flags(&m.connection_state, Some(p.state))
-        && flags(&m.connection_nat_state, None)
+        && flags(&m.connection_nat_state, p.nat)
         && icmp
         && unmarked(&m.connection_mark)
         && unmarked(&m.packet_mark)
@@ -276,6 +280,7 @@ mod tests {
             in_interface: Some(iface.into()),
             out_interface: None,
             state,
+            nat: None,
         }
     }
 

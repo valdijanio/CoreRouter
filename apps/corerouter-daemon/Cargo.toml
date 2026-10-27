@@ -12,6 +12,8 @@ repository.workspace = true
 corerouter-engine.workspace = true
 corerouter-hal.workspace = true
 corerouter-hal-linux.workspace = true
+# Firewall diagnosis (G2.1c): kernel rules back to ours (`nft::rule_of`).
+corerouter-firewall.workspace = true
 corerouter-control.workspace = true
 corerouter-storage-fs.workspace = true
 corerouter-discovery.workspace = true

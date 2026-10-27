@@ -24,7 +24,7 @@
 
 use std::net::IpAddr;
 
-use corerouter_model::firewall::{Action, ConnState, DynamicAddress, NatTarget, Table};
+use corerouter_model::firewall::{Action, ConnState, DynamicAddress, NatState, NatTarget, Table};
 use corerouter_model::{Config, ItemId};
 
 use crate::eval::{Hit, Outcome, Packet, Verdict, walk_traced};
@@ -180,7 +180,10 @@ impl Walker<'_> {
                     Some(Action::DstNat {
                         to_addresses,
                         to_ports,
-                    }) => nat_to(&mut self.p, to_addresses, *to_ports, true),
+                    }) => {
+                        nat_to(&mut self.p, to_addresses, *to_ports, true);
+                        self.p.nat = Some(NatState::Dstnat);
+                    }
                     Some(Action::SrcNat {
                         to_addresses,
                         to_ports,
@@ -317,6 +320,7 @@ mod tests {
             in_interface: iface.map(Into::into),
             out_interface: None,
             state,
+            nat: None,
         }
     }
 

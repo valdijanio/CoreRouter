@@ -758,6 +758,7 @@ fn test(s: &mut Session, p: &Value) -> Result<Value> {
         in_interface: None,
         out_interface: None,
         state: ConnState::New,
+        nat: None,
     };
     let out = eval::walk(cfg, &dynamic, Table::Filter, "input", &syn);
     if out.verdict.blocks() {

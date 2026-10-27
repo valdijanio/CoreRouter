@@ -338,7 +338,7 @@ pub fn parse_event(kind: u16, body: &[u8]) -> Option<Event> {
 }
 
 #[cfg(target_os = "linux")]
-pub use io::Listener;
+pub use io::{Listener, ifname};
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -353,6 +353,14 @@ mod io {
 
     fn io(e: impl std::fmt::Display) -> HalError {
         HalError::Io(format!("nftables trace: {e}"))
+    }
+
+    /// The name of interface `index` (trace events carry indexes).
+    pub fn ifname(index: u32) -> Option<String> {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0")
+            .or_else(|_| std::net::UdpSocket::bind("[::1]:0"))
+            .ok()?;
+        rustix::net::netdevice::index_to_name(&sock, index).ok()
     }
 
     /// Subscribed to the kernel's trace events.

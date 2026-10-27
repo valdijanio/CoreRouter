@@ -188,6 +188,7 @@ fn probes(cfg: &Config, dynamic: &[DynamicAddress], link: &Link) -> Vec<Probe> {
         in_interface: iface.clone(),
         out_interface: None,
         state,
+        nat: None,
     };
     // A raw `notrack` makes the filter see the packets as untracked (an
     // `accept established` no longer takes them).
@@ -212,6 +213,7 @@ fn probes(cfg: &Config, dynamic: &[DynamicAddress], link: &Link) -> Vec<Probe> {
         in_interface: None,
         out_interface: iface.clone(),
         state: ConnState::Established,
+        nat: None,
     };
     vec![
         Probe {
