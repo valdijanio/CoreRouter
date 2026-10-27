@@ -343,6 +343,62 @@ pub fn delete_request(c: &Conn, seq: u32) -> Vec<u8> {
     r.finish()
 }
 
+/// Look a tuple up (G2.7): the kernel finds a connection whose original
+/// *or* reply tuple is `t` (`nf_conntrack_find_get` hashes both). Asked
+/// with the reply tuple the NAT chose for a new connection, an answer means
+/// that tuple is taken and conntrack will refuse the new one.
+pub fn get_request(t: &Tuple, protocol: u8, seq: u32) -> Vec<u8> {
+    let family = if t.src.is_ipv4() { AF_INET } else { AF_INET6 };
+    let mut r = Req::new(IPCTNL_MSG_CT_GET, 0, family, seq);
+    r.tuple(CTA_TUPLE_ORIG, t, protocol);
+    r.finish()
+}
+
+/// What the kernel answered a [`get_request`] with sequence `seq`: `Some(true)`
+/// found, `Some(false)` no such connection, `None` not this answer yet.
+/// `Err` carries any other refusal's errno.
+pub fn get_answer(buf: &[u8], seq: u32) -> Option<Result<bool, i32>> {
+    let mut rest = buf;
+    while let Some(hdr) = rest.get(..16) {
+        let word = |at: usize| {
+            hdr.get(at..at + 4)
+                .and_then(|b| b.try_into().ok())
+                .map(u32::from_ne_bytes)
+        };
+        let (Some(len), Some(mseq)) = (word(0), word(8)) else {
+            return None;
+        };
+        let kind = hdr
+            .get(4..6)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u16::from_ne_bytes);
+        let len = usize::try_from(len).unwrap_or(0);
+        if len < 16 {
+            return None;
+        }
+        let msg = rest.get(..len).unwrap_or(rest);
+        rest = rest.get(len.div_ceil(4) * 4..).unwrap_or(&[]);
+        if mseq != seq {
+            continue;
+        }
+        if kind == 2 {
+            let code = msg
+                .get(16..20)
+                .and_then(|b| b.try_into().ok())
+                .map_or(0, i32::from_ne_bytes);
+            // ENOENT: nobody holds the tuple.
+            return Some(match code {
+                0 | -2 => Ok(false),
+                c => Err(c.saturating_neg()),
+            });
+        }
+        if kind == (NFNL_SUBSYS_CTNETLINK << 8) | IPCTNL_MSG_CT_NEW {
+            return Some(Ok(true));
+        }
+    }
+    None
+}
+
 /// Renew the timeout of the connection with this original tuple (and id)
 /// to `secs` (G2.5b: the XDP fast path carries its packets, which
 /// conntrack never sees). `IPCTNL_MSG_CT_NEW` without `NLM_F_CREATE`
@@ -418,6 +474,38 @@ mod tests {
         r.end();
         r.end();
         r.finish()
+    }
+
+    #[test]
+    fn a_lookup_answer_says_found_or_not() {
+        let t = Tuple {
+            src: "192.0.2.2".parse().unwrap(),
+            dst: "203.0.113.1".parse().unwrap(),
+            src_port: 53,
+            dst_port: 2100,
+        };
+        let req = get_request(&t, 17, 7);
+        assert_eq!(
+            u16::from_ne_bytes([req[4], req[5]]),
+            (1 << 8) | IPCTNL_MSG_CT_GET
+        );
+        assert_eq!(req[16], AF_INET);
+        let answer = |kind: u16, code: Option<i32>| {
+            let mut m = 0u32.to_ne_bytes().to_vec();
+            m.extend_from_slice(&kind.to_ne_bytes());
+            m.extend_from_slice(&0u16.to_ne_bytes());
+            m.extend_from_slice(&7u32.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(&code.unwrap_or(0).to_ne_bytes());
+            let len = u32::try_from(m.len()).unwrap();
+            m[..4].copy_from_slice(&len.to_ne_bytes());
+            m
+        };
+        assert_eq!(get_answer(&answer(2, Some(-2)), 7), Some(Ok(false)));
+        assert_eq!(get_answer(&answer(256, None), 7), Some(Ok(true)));
+        assert_eq!(get_answer(&answer(2, Some(-1)), 7), Some(Err(1)));
+        assert_eq!(get_answer(&answer(256, None), 8), None, "not ours");
+        assert_eq!(get_answer(&[1, 2, 3], 7), None);
     }
 
     #[test]
@@ -500,7 +588,7 @@ mod tests {
 #[cfg(target_os = "linux")]
 pub use events::Events;
 #[cfg(target_os = "linux")]
-pub use io::{delete, dump, renew, stats};
+pub use io::{Lookup, delete, dump, renew, stats};
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -599,6 +687,59 @@ mod io {
                     }
                 }
             }
+        }
+    }
+
+    /// One socket kept open for tuple lookups ([`super::get_request`]):
+    /// the exhaustion queues ask once per new connection of a nearly full
+    /// subscriber, so neither a socket nor a buffer is made per question.
+    pub struct Lookup {
+        sock: Socket,
+        seq: u32,
+        buf: Vec<u8>,
+    }
+
+    impl Lookup {
+        pub fn open() -> Result<Self, HalError> {
+            let mut sock = Socket::new(NETLINK_NETFILTER).map_err(io)?;
+            sock.bind_auto().map_err(io)?;
+            Ok(Self {
+                sock,
+                seq: 0,
+                buf: vec![0u8; 8192],
+            })
+        }
+
+        /// Whether a connection holds tuple `t` (either direction).
+        pub fn taken(
+            &mut self,
+            t: &corerouter_hal::conntrack::Tuple,
+            protocol: u8,
+        ) -> Result<bool, HalError> {
+            self.seq = self.seq.wrapping_add(1);
+            let seq = self.seq;
+            self.sock
+                .send(&super::get_request(t, protocol, seq), 0)
+                .map_err(io)?;
+            for _ in 0..8 {
+                let mut fds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
+                if poll(&mut fds, PollTimeout::from(200u16)).map_err(io)? == 0 {
+                    return Err(HalError::Io("conntrack: no answer to a lookup".into()));
+                }
+                let n = self.sock.recv(&mut &mut self.buf[..], 0).map_err(io)?;
+                match super::get_answer(self.buf.get(..n).unwrap_or(&[]), seq) {
+                    Some(Ok(found)) => return Ok(found),
+                    Some(Err(code)) => {
+                        return Err(HalError::Rejected(format!(
+                            "conntrack lookup: {}",
+                            std::io::Error::from_raw_os_error(code)
+                        )));
+                    }
+                    // An answer to an older question that timed out.
+                    None => {}
+                }
+            }
+            Err(HalError::Io("conntrack: no answer to a lookup".into()))
         }
     }
 

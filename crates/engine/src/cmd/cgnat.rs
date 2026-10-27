@@ -95,12 +95,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "CGNAT Settings",
         [],
         None,
-        "{history_days?: u32 (1..3650: days the mapping history and block log are kept; Marco Civil asks 365)} → {history_days}",
+        "{history_days?: u32 (1..3650: days the mapping history and block log are kept; Marco Civil asks 365), icmp_unreachable?: bool (RFC 6888 REQ-11b: a new connection without a free port gets an ICMP host unreachable; default yes), icmp_rate?: u32 (1..100: those ICMP per second and subscriber, also the burst; default 2)} → {history_days, icmp_unreachable, icmp_rate}",
         always,
         settings_set
     ),
     cmd!(query "ip.firewall.cgnat.get", "CGNAT Settings", [], None,
-        "{} → {history_days, pools, exceptions, subscribers, history: {epochs, since?, error?}}",
+        "{} → {history_days, icmp_unreachable, icmp_rate, pools, exceptions, subscribers, history: {epochs, since?, error?}}",
         always, settings_get),
     cmd!(query "ip.firewall.cgnat.lookup", "CGNAT Lookup", [], None,
         "{subscriber: ipv4} → {subscriber, via (pool name or exception), mode, public, first_port, last_port, ports} (the running config)",
@@ -672,11 +672,19 @@ fn exception_list(s: &mut Session, _: &Value) -> Result<Value> {
 
 fn settings_set(s: &mut Session, p: &Value) -> Result<Value> {
     let days = opt_small(p, "history_days", 1, 3650)?;
+    let icmp = opt_bool(p, "icmp_unreachable")?;
+    let rate = opt_small(p, "icmp_rate", 1, u32::from(corerouter_model::cgnat::MAX_ICMP_RATE))?;
     let set = &mut s.store_mut().candidate_mut().ip.cgnat.settings;
     if let Some(d) = days {
         set.history_days = d;
     }
-    Ok(json!({"history_days": set.history_days}))
+    if let Some(on) = icmp {
+        set.icmp_unreachable = on;
+    }
+    if let Some(r) = rate.and_then(|r| u16::try_from(r).ok()) {
+        set.icmp_rate = r;
+    }
+    Ok(json!({"history_days": set.history_days, "icmp_unreachable": set.icmp_unreachable, "icmp_rate": set.icmp_rate}))
 }
 
 fn settings_get(s: &mut Session, _: &Value) -> Result<Value> {
@@ -696,6 +704,8 @@ fn settings_get(s: &mut Session, _: &Value) -> Result<Value> {
     }
     Ok(json!({
         "history_days": c.settings.history_days,
+        "icmp_unreachable": c.settings.icmp_unreachable,
+        "icmp_rate": c.settings.icmp_rate,
         "pools": c.pools.len(),
         "exceptions": c.exceptions.len(),
         "subscribers": subscribers,

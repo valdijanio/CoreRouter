@@ -82,6 +82,10 @@ mod fastpath;
 /// (G2.3c): codec pure, socket Linux.
 pub mod nfqueue;
 
+/// The ICMP answer when a CGNAT subscriber's ports run out and the queues
+/// that decide it (G2.7): codec pure, sockets Linux.
+pub mod cgnat_icmp;
+
 #[cfg(target_os = "linux")]
 pub mod l2;
 
@@ -197,6 +201,11 @@ mod linux {
         cpu: crate::cpu_tuning::Cpu,
         /// CGNAT blocks installed in the kernel (G2.3c).
         cgnat_blocks: crate::cgnat::Blocks,
+        /// The subscribers in the CGNAT set `full` (G2.7).
+        cgnat_full: crate::cgnat::Full,
+        /// Counters and ICMP limiter of the exhaustion queues (G2.7),
+        /// shared with their threads.
+        cgnat_exhaustion: std::sync::Arc<corerouter_hal::cgnat::Exhaustion>,
         /// What the last apply installed of the fast path (G2.4).
         fastpath: corerouter_hal::fastpath::FastPathState,
         /// The XDP filter (G2.5a); nothing loaded until configured.
@@ -447,9 +456,16 @@ mod linux {
             }
             // CGNAT (G2.3): its own table, replaced whole in one batch.
             let cgnat = corerouter_firewall::cgnat::changed(&from.ip.cgnat, &to.ip.cgnat);
+            let set = &to.ip.cgnat.settings;
+            self.cgnat_exhaustion
+                .configure(set.icmp_unreachable, u32::from(set.icmp_rate));
             if cgnat
-                && let Err(e) =
-                    crate::cgnat::apply(&from.ip.cgnat, &to.ip.cgnat, &mut self.cgnat_blocks)
+                && let Err(e) = crate::cgnat::apply(
+                    &from.ip.cgnat,
+                    &to.ip.cgnat,
+                    &mut self.cgnat_blocks,
+                    &mut self.cgnat_full,
+                )
             {
                 if firewall {
                     let dynamic = crate::nft::dynamic();
@@ -466,8 +482,12 @@ mod linux {
                 || (firewall && self.fastpath.active);
             if fast && let Err(e) = crate::fastpath::apply(to, &mut self.fastpath) {
                 if cgnat
-                    && let Err(back) =
-                        crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat, &mut self.cgnat_blocks)
+                    && let Err(back) = crate::cgnat::apply(
+                        &to.ip.cgnat,
+                        &from.ip.cgnat,
+                        &mut self.cgnat_blocks,
+                        &mut self.cgnat_full,
+                    )
                 {
                     log::error!("restoring the previous CGNAT table: {back}");
                 }
@@ -482,8 +502,12 @@ mod linux {
             }
             let undo_cgnat = |me: &mut Self| {
                 if cgnat
-                    && let Err(back) =
-                        crate::cgnat::apply(&to.ip.cgnat, &from.ip.cgnat, &mut me.cgnat_blocks)
+                    && let Err(back) = crate::cgnat::apply(
+                        &to.ip.cgnat,
+                        &from.ip.cgnat,
+                        &mut me.cgnat_blocks,
+                        &mut me.cgnat_full,
+                    )
                 {
                     log::error!("restoring the previous CGNAT table: {back}");
                 }
@@ -723,8 +747,44 @@ mod linux {
         }
 
         fn cgnat_queue(&mut self) -> Result<Box<dyn corerouter_hal::cgnat::CgnatQueue>, HalError> {
-            crate::nfqueue::Queue::open(corerouter_hal::cgnat::QUEUE_NUM)
-                .map(|q| Box::new(q) as Box<dyn corerouter_hal::cgnat::CgnatQueue>)
+            let shared = self.cgnat_exhaustion.clone();
+            crate::nfqueue::Queue::open(corerouter_hal::cgnat::QUEUE_NUM).map(|q| {
+                Box::new(q.with_icmp(shared)) as Box<dyn corerouter_hal::cgnat::CgnatQueue>
+            })
+        }
+
+        fn cgnat_full(&mut self, subscribers: &[std::net::Ipv4Addr]) -> Result<(), HalError> {
+            let want: crate::cgnat::Full = subscribers.iter().copied().collect();
+            if self.cgnat_full == want {
+                return Ok(());
+            }
+            crate::cgnat::set_full(&want, &mut self.cgnat_full)
+        }
+
+        fn cgnat_exhaustion_queue(
+            &mut self,
+            index: u16,
+        ) -> Result<Box<dyn corerouter_hal::cgnat::ExhaustionQueue>, HalError> {
+            use corerouter_hal::cgnat::{EXHAUSTED_QUEUE, EXHAUSTED_QUEUES};
+            if index >= EXHAUSTED_QUEUES {
+                return Err(HalError::Rejected(format!(
+                    "exhaustion queue {index}: there are {EXHAUSTED_QUEUES}"
+                )));
+            }
+            crate::cgnat_icmp::ExhaustQueue::open(
+                EXHAUSTED_QUEUE + index,
+                self.cgnat_exhaustion.clone(),
+            )
+            .map(|q| Box::new(q) as Box<dyn corerouter_hal::cgnat::ExhaustionQueue>)
+        }
+
+        fn cgnat_exhausted(
+            &mut self,
+        ) -> (
+            Vec<(std::net::Ipv4Addr, corerouter_hal::cgnat::Hit)>,
+            corerouter_hal::cgnat::ExhaustionStats,
+        ) {
+            self.cgnat_exhaustion.take()
         }
 
         fn connections(&mut self) -> Result<Vec<corerouter_hal::conntrack::Conn>, HalError> {

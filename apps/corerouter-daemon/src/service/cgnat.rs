@@ -76,15 +76,18 @@ fn run(session: &Shared, health: &super::Health) {
             Ok(None) => {}
             Ok(Some(p)) => {
                 let got = lock(session).cgnat_block_for(p.subscriber, unix_now());
-                // A 1:1 subscriber is translated by its exception rule.
-                let accept = match &got {
-                    Ok(_) => true,
+                // A 1:1 subscriber is translated by its exception rule; one
+                // without a block left is refused, with the ICMP of RFC 6888
+                // REQ-11b (G2.7).
+                let done = match &got {
+                    Ok(_) => q.verdict(p.id, true),
+                    Err(e) if e.contains("1:1 exception") => q.verdict(p.id, true),
                     Err(e) => {
                         log::debug!("cgnat: {}: {e}", p.subscriber);
-                        e.contains("1:1 exception")
+                        q.refuse(p.id).map(|_| ())
                     }
                 };
-                if let Err(e) = q.verdict(p.id, accept) {
+                if let Err(e) = done {
                     health.error(format!("queue verdict: {e}"));
                     queue = None;
                 }

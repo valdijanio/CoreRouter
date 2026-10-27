@@ -114,6 +114,8 @@ const NFTA_LOOKUP_DREG: u16 = 3;
 const NFTA_LOOKUP_FLAGS: u16 = 5;
 const NFT_LOOKUP_F_INV: u32 = 1;
 const NFTA_QUEUE_NUM: u16 = 1;
+/// `NFT_QUEUE_FLAG_BYPASS`: no listener, the packet goes on.
+const NFT_QUEUE_FLAG_BYPASS: u16 = 0x01;
 const NFTA_QUEUE_TOTAL: u16 = 2;
 const NFTA_QUEUE_FLAGS: u16 = 3;
 const NFTA_NAT_TYPE: u16 = 1;
@@ -461,11 +463,12 @@ impl Batch {
                     self.be32(NFTA_LOOKUP_FLAGS, NFT_LOOKUP_F_INV);
                 }
             }
-            Expr::Queue { num } => {
+            Expr::Queue { num, total, bypass } => {
                 // u16 attributes go as 2 big-endian bytes, padded.
                 self.put(NFTA_QUEUE_NUM, &num.to_be_bytes());
-                self.put(NFTA_QUEUE_TOTAL, &1u16.to_be_bytes());
-                self.put(NFTA_QUEUE_FLAGS, &0u16.to_be_bytes());
+                self.put(NFTA_QUEUE_TOTAL, &(*total).max(1).to_be_bytes());
+                let flags = if *bypass { NFT_QUEUE_FLAG_BYPASS } else { 0 };
+                self.put(NFTA_QUEUE_FLAGS, &flags.to_be_bytes());
             }
             Expr::Nat {
                 kind,
