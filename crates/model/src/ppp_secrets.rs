@@ -197,6 +197,21 @@ impl Secrets {
         }
     }
 
+    /// The first secret named `name` that `keep` accepts (the IPoE lookup:
+    /// `service=ipoe` only), in O(1) through the name index. A walk only
+    /// when the indexed one is refused and some name is in the list twice
+    /// (a config edited by hand: another one of that name may come later).
+    pub fn first_named(&self, name: &str, keep: impl Fn(&PppSecret) -> bool) -> Option<&PppSecret> {
+        let s = self.by_name(name)?;
+        if keep(s) {
+            return Some(s);
+        }
+        if !self.index().dup {
+            return None;
+        }
+        self.list.iter().find(|s| s.name == name && keep(s))
+    }
+
     /// The indexes learn that `s` is in the list.
     fn index_add(&mut self, s: &PppSecret) {
         if let Some(fx) = self.fixed.get_mut()
@@ -414,7 +429,7 @@ mod tests {
     }
 
     fn pw<'a>(v: &'a Secrets, name: &str) -> Option<&'a str> {
-        v.by_name(name).map(|x| x.password.as_str())
+        v.by_name(name).map(|x| x.password.stored())
     }
 
     #[test]
@@ -443,6 +458,23 @@ mod tests {
         e.push(s("y", "9"));
         assert_eq!(pw(&e, "y"), Some("9"));
         assert_eq!(pw(&d, "y"), None);
+    }
+
+    #[test]
+    fn first_named_skips_the_refused_only_with_a_name_twice() {
+        let ipoe = |name: &str, pw: &str| PppSecret {
+            service: crate::ppp::PppService::Ipoe,
+            ..s(name, pw)
+        };
+        let is_ipoe = |x: &PppSecret| x.service == crate::ppp::PppService::Ipoe;
+        let mut v = Secrets::new(vec![s("m", "pppoe"), ipoe("n", "1")]);
+        assert_eq!(v.first_named("n", is_ipoe).map(|x| x.password.stored()), Some("1"));
+        assert!(v.first_named("m", is_ipoe).is_none());
+        assert!(v.first_named("absent", is_ipoe).is_none());
+        // A config edited by hand: the IPoE one of a name held twice.
+        v.push(ipoe("m", "2"));
+        assert_eq!(v.first_named("m", is_ipoe).map(|x| x.password.stored()), Some("2"));
+        assert_eq!(pw(&v, "m"), Some("pppoe"));
     }
 
     #[test]

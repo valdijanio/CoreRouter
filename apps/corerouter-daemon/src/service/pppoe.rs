@@ -216,6 +216,10 @@ mod linux {
             if w == 0 { pppoe_workers_auto(cpus) } else { w }
         };
         super::super::pppoe_bng::ha::LANES.store(lanes, std::sync::atomic::Ordering::Release);
+        // G4.3n: the key of the sealed passwords.
+        let seal = corerouter_engine::sealing::key(&mut lock(session))
+            .map_err(|e| log::error!("PPPoE: local secrets' passwords cannot be opened: {e}"))
+            .ok();
         let first = Bng::first_of(seed(), lanes);
         let shared = first.shared.clone();
         let routes = (first.clone_routes(), first.clone_routes6());
@@ -324,6 +328,7 @@ mod linux {
                     framed: framed.clone(),
                     forbidden,
                     queues,
+                    seal: seal.clone(),
                 };
                 let xdp = d.plane == Some(true);
                 for w in &d.workers {

@@ -145,3 +145,17 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-26 — G4.3h: registro da sessão para a tomada
 - 2026-10-26 — G4.3h: aba PPP › Redundancy
 - 2026-10-26 — G4.9b feito (plano de dados das filas: EDT, policer GCRA, PCQ); G4.9f criado (GSO no shaper)
+- 2026-10-26 — G0.21, G0.22 e G4.3gb em andamento (benchmarks antes da lista em blocos e do commit incremental)
+- 2026-10-26 — G0.21 feito (listas grandes da config em blocos copy-on-write, índices incrementais)
+- 2026-10-26 — G0.21: `queue.simple` também em blocos copy-on-write (pedido da G4.9)
+- 2026-10-26 — G0.22 em andamento (validação incremental com tabela de dependências verificada)
+- 2026-10-26 — G0.22 feito (commit incremental: validação por tabela de dependências, plano do data plane e journal da config)
+- 2026-10-26 — G4.3cd feito (rotas por assinante e uplink com VLAN)
+- 2026-10-26 — G4.3gb feito (secrets em blocos copy-on-write, índices incrementais, commit incremental e journal da config)
+- 2026-10-26 — G4.3h: fases 1 e 2 no serviço pppoe (stateless e hot standby)
+- 2026-10-26 — G4.3h: feito — laboratório ha com dois daemons e BNG Blaster (1000, 10 000 e 100 000 sessões, caminho lento e XDP)
+- 2026-10-26 — G4.3l parte 1 (QinQ e VLAN simples no caminho lento, limite por VLAN, TR-101 ao RADIUS, RFC 4638)
+- 2026-10-26 — G4.3l parte 2 (IPv6 encaminhado no caminho lento do PPPoE)
+- 2026-10-26 — G4.9b corrigido (descida de sessão moldada sem limite no BNG com XDP)
+- 2026-10-26 — G4.9c feito (janela Queues e campos PPP)
+- 2026-10-26 — G4.9d feito (laboratório em massa das filas)

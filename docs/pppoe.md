@@ -948,7 +948,7 @@ linha, o modelo 1:1 da TR-101), sem uma interface VLAN do kernel por assinante, 
 caminho lento. A sessão é a chave (porta, S-tag, C-tag, MAC, SESSION_ID); a do XDP
 (`dataplane-ebpf-common::pppoe::SessionKey`) já tinha as duas tags desde a G4.3c.
 
-### 12.1 Pesquisa
+### 13.1 Pesquisa
 
 Fontes lidas em 2026-10-26:
 
@@ -973,7 +973,7 @@ Fontes lidas em 2026-10-26:
   100 chegava ao socket "sem tag" como se não tivesse tag, e o socket da VLAN 100 não recebia
   nada. Um socket `ETH_P_ALL` vê a tag (`SKF_AD_VLAN_TAG`, `SKF_AD_VLAN_TPID`) no filtro.
 
-### 12.2 O que adotamos
+### 13.2 O que adotamos
 
 - `vlan_mode=single` (padrão, o `pppoe-over-vlan-range` do RouterOS) ou `vlan_mode=stacked`
   com `outer_vlan_range` (S-tags, no máximo 512), `inner_vlan_range` (C-tags, `any` por padrão),
@@ -981,7 +981,7 @@ Fontes lidas em 2026-10-26:
 - **Caminho lento sem interface por assinante:** um socket `ETH_P_ALL` por S-tag (ou VLAN
   simples), com um filtro BPF clássico que confere VID, TPID e o EtherType PPPoE (atrás da C-tag
   no QinQ); a tag externa volta para dentro do quadro antes do `proto-pppoe`. Isto **corrige** a
-  VLAN simples sem XDP, que nunca funcionou (ver 12.1).
+  VLAN simples sem XDP, que nunca funcionou (ver 13.1).
 - **Worker por linha:** um quadro QinQ vai ao worker pelo par de tags (os outros, pelo MAC),
   então todos os CPEs de uma linha se encontram no mesmo worker.
 - `max_sessions_per_vlan` (1 = TR-101 1:1): o AC não manda PADO a um segundo CPE da linha
@@ -995,7 +995,7 @@ Fontes lidas em 2026-10-26:
   for menor que o valor + 8.
 - **Active Connections:** `vlan` e `inner_vlan` por sessão (o selo `120/3044` na janela).
 
-### 12.3 Melhorias propostas
+### 13.3 Melhorias propostas
 
 Entram agora: o conserto da VLAN simples, o limite 1:1, os atributos TR-101 em toda requisição,
 a checagem do MTU da RFC 4638 e o worker por linha.
@@ -1004,7 +1004,7 @@ Viram gap (G4.3la): separar as VLANs em O(1) no caminho lento, porque o custo po
 (abaixo) e a separação pede `PACKET_FANOUT` com programa ou `PACKET_AUXDATA`, que não têm
 binding seguro (o `unsafe` é proibido fora do `dataplane-ebpf`).
 
-### 12.4 Desempenho (**medido**, 2026-10-26, Ryzen AI Max+ 395, kernel 7.0, veth)
+### 13.4 Desempenho (**medido**, 2026-10-26, Ryzen AI Max+ 395, kernel 7.0, veth)
 
 | Medida | Valor |
 |---|---|

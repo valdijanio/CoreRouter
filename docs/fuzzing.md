@@ -21,6 +21,7 @@ oráculo roda de dois jeitos:
 | `mcp_messages` | `corerouter_mcp::fuzz::messages` | várias linhas no servidor MCP (`serve`) num lab novo: cada resposta é um objeto JSON-RPC 2.0 (ou lote) com exatamente um de `result`/`error`, nenhum pânico |
 | `radius` | `corerouter_proto_radius::fuzz::{packet, text}` | um datagrama por todos os caminhos de recepção do RADIUS (G4.3b): codec e iteradores, dicionário, autenticadores, cliente com pedidos pendentes, servidor CoA/DM e servidor de teste; um pacote que decodifica volta igual ao ser recodificado; os mesmos bytes como texto no `Mikrotik-Rate-Limit` (formata e lê de volta igual), no serviço Juniper e no carregador de dicionário FreeRADIUS. Testes de CI em `crates/proto-radius/tests/fuzz.rs` |
 | `oslog` | `corerouter_hal::oslog::fuzz_check` | os mesmos bytes como um registro de `/dev/kmsg` e como uma linha de `journalctl -o json` (G4.8b): nenhum pânico; o que é aceito fica nos limites (severidade 0..=7, mensagem cortada sem caracteres de controle nem bidi, cursor seguro para devolver ao journalctl ou nenhum). Testes de CI: proptests em `crates/hal/src/oslog.rs` e as fixtures reais |
+| `routeros_export` | `corerouter_engine::fuzz::routeros_export` | um export do RouterOS como o `ppp.secret.import` o lê (G4.3n): o leitor (`engine::rsc`) não entra em pânico e o que guarda fica nos limites; um `dry_run` e uma importação de verdade num lab novo respondem sem pânico; uma senha marcada no texto nunca volta numa mensagem de erro. Testes de CI: proptests em `crates/engine/src/rsc.rs` e `crates/engine/tests/fuzz.rs`, que reexecuta `fuzz/seeds/routeros_export` |
 
 **Pânico capturado também é falha.** O guarda do motor (`engine::guard`) transforma um pânico em
 `Internal` e a resposta parece normal; por isso `corerouter_engine::fuzz::panics` instala um
@@ -49,7 +50,7 @@ cargo +nightly fuzz run -s none config_file corpus/config_file seeds/config_file
     -dict=json.dict -max_total_time=600 -timeout=10
 ```
 
-Troque `config_file` por `wire`, `control_line`, `mcp_messages` ou `radius`. O primeiro diretório
+Troque `config_file` por `wire`, `control_line`, `mcp_messages`, `radius` ou `routeros_export`. O primeiro diretório
 (`corpus/<alvo>`, fora do git) cresce com as entradas novas; `seeds/<alvo>` (no git) só é lido.
 `json.dict` traz os tokens JSON e os nomes de chaves, métodos e comandos.
 

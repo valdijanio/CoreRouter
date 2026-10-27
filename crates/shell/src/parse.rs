@@ -114,6 +114,8 @@ pub enum Parsed {
         file: Option<String>,
         /// `terse`: one line per item, menu in front, never wrapped.
         terse: bool,
+        /// `show-sensitive`: passwords in clear (group full, G4.3n).
+        sensitive: bool,
     },
     Import {
         file: Option<String>,
@@ -417,8 +419,13 @@ pub fn parse(reg: &Registry, cwd: &[String], line: &str) -> Result<Parsed, Parse
             match verb {
                 Verb::Quit => no_args(line, args).map(|()| Parsed::Quit),
                 Verb::Export => {
-                    let (file, terse) = export_args(line, args)?;
-                    Ok(Parsed::Export { path, file, terse })
+                    let (file, terse, sensitive) = export_args(line, args)?;
+                    Ok(Parsed::Export {
+                        path,
+                        file,
+                        terse,
+                        sensitive,
+                    })
                 }
                 Verb::Import => {
                     let file = file_arg(line, args)?;
@@ -485,31 +492,47 @@ fn file_arg(line: &str, args: &[Word]) -> Result<Option<String>, ParseError> {
     Ok(file.filter(|f| !f.is_empty()))
 }
 
-/// `/export [file=…] [terse] [compact]` (`compact`, RouterOS's default
-/// since v6, changes nothing).
-fn export_args(line: &str, args: &[Word]) -> Result<(Option<String>, bool), ParseError> {
+/// `/export [file=…] [terse] [compact] [show-sensitive]` (`compact`,
+/// RouterOS's default since v6, changes nothing). `show-sensitive` is a
+/// bare flag, as in RouterOS v7 (`show-sensitive=yes` is refused there
+/// too).
+fn export_args(line: &str, args: &[Word]) -> Result<(Option<String>, bool, bool), ParseError> {
     let mut terse = false;
+    let mut sensitive = false;
     let mut rest = Vec::new();
     for w in args {
         match (w.key.as_deref(), w.text.as_str()) {
             (None, "terse") => terse = true,
             (None, "compact") => {}
-            // Not file names: RouterOS options this export does not have.
-            (None, "verbose" | "show-sensitive") => {
+            (None, "show-sensitive") => sensitive = true,
+            (Some("show-sensitive"), _) => {
                 return Err(ParseError::at(
                     line,
                     w.start,
-                    format!("{} is not supported (file=…, terse, compact)", w.text),
+                    "show-sensitive takes no value (a bare flag)".to_owned(),
+                ));
+            }
+            // Not a file name: a RouterOS option this export does not have.
+            (None, "verbose") => {
+                return Err(ParseError::at(
+                    line,
+                    w.start,
+                    format!(
+                        "{} is not supported (file=…, terse, compact, show-sensitive)",
+                        w.text
+                    ),
                 ));
             }
             _ => rest.push(w.clone()),
         }
     }
     let file = file_arg(line, &rest).map_err(|mut e| {
-        e.message = e.message.replace("(only file=…)", "(file=…, terse)");
+        e.message = e
+            .message
+            .replace("(only file=…)", "(file=…, terse, show-sensitive)");
         e
     })?;
-    Ok((file, terse))
+    Ok((file, terse, sensitive))
 }
 
 fn print_opts(line: &str, cmd: &Command, args: &[Word]) -> Result<PrintOpts, ParseError> {
@@ -784,7 +807,8 @@ mod tests {
             Parsed::Export {
                 path: vec!["ip".into()],
                 file: None,
-                terse: false
+                terse: false,
+                sensitive: false
             }
         );
         assert_eq!(
@@ -792,9 +816,20 @@ mod tests {
             Parsed::Export {
                 path: vec![],
                 file: Some("a.rsc".into()),
-                terse: true
+                terse: true,
+                sensitive: false
             }
         );
+        assert_eq!(
+            p(&[], "/export show-sensitive").unwrap(),
+            Parsed::Export {
+                path: vec![],
+                file: None,
+                terse: false,
+                sensitive: true
+            }
+        );
+        assert!(p(&[], "/export show-sensitive=yes").is_err());
         assert!(p(&[], "/export verbose").is_err());
         // `import` and `quit` are root verbs only.
         assert!(p(&["ip"], "import").is_err());

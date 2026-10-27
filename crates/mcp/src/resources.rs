@@ -122,6 +122,8 @@ pub fn read(backend: &mut dyn Backend, params: &Value) -> Result<Value, ReadErro
             ));
         }
     };
+    // Secrets never reach the agent (as in `tools::text`).
+    let value = corerouter_engine::auth::mask_secrets(&value);
     let text = serde_json::to_string_pretty(&value).map_err(|e| internal(e.to_string()))?;
     Ok(json!({"contents": [{"uri": uri, "mimeType": JSON, "text": text}]}))
 }
