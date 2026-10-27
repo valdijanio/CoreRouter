@@ -1,0 +1,7 @@
+# Buildroot pinned for the image (G1.6a). `cargo xtask os build` downloads
+# this tarball once into os/dl/, checks the SHA-256 below (the one in the
+# release's PGP-signed .sign file) and extracts it into os/out/.
+# LTS branch 2025.02.x: security fixes until March 2028 (buildroot.org).
+version = 2025.02.19
+url = https://buildroot.org/downloads/buildroot-2025.02.19.tar.xz
+sha256 = e5e58bff1da91f022f60cefdfe280140c08023cd0aeec1e5f6f9da0ea866d69c

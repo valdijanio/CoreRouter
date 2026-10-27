@@ -27,6 +27,17 @@ Layout da imagem:
 - Perfil de desenvolvimento: VM QEMU/Alpine ou Debian com o daemon em `--backend linux` dentro
   de network namespaces (gap G1.6).
 
+#### 1.1.1 A imagem do G1.6a
+
+Buildroot **2025.02 LTS** em `os/` (`BR2_EXTERNAL`), kernel **6.18 LTS** com tudo `=y`, EFI
+stub sem bootloader, squashfs + `/config` ext4 e o slot `rootfs-b` reservado para o A/B do
+G1.6b. O PID 1 é **`corerouter-init` em Rust** (não o busybox init): faz só montagem,
+`/config`, supervisão do daemon com backoff, prontidão medida e desligamento limpo; o
+busybox fica só como shell de manutenção atrás de `corerouter.shell=<tty>`. Para o G1.6b, a
+recomendação é um atualizador próprio em Rust em vez do RAUC (a atualização tem de ser um
+comando com journal e Safe Mode; boot por EFI stub). Comparação, fontes e números em
+`docs/os-image.md`.
+
 ### 1.2 Data plane, firewall e CGNAT
 
 | Critério | Kernel nativo (Netlink + nftables) | **eBPF/XDP com `aya`** | DPDK / VPP |

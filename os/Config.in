@@ -1,0 +1,1 @@
+source "$BR2_EXTERNAL_COREROUTER_PATH/package/corerouter/Config.in"

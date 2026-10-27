@@ -6,13 +6,14 @@ mod bng_lab;
 mod changes;
 mod ebpf;
 mod layers;
+mod os;
 mod vm_lab;
 mod vm_tools;
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
-const USAGE: &str = "usage: cargo xtask <ci [--fast] [--only <step>,...]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab [--help]>";
+const USAGE: &str = "usage: cargo xtask <ci [--fast] [--only <step>,...]|fmt|clippy|test|bench-check|netns|xdp-root|docs|ebpf-check|layers|agents-sync|wasm|bench|bng-lab|ebpf|docs fold|vm-lab|os [--help]>";
 
 /// Crates that must keep compiling for the browser.
 const WASM_PACKAGES: &[&str] = &[
@@ -124,6 +125,17 @@ fn main() -> ExitCode {
                 Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
                 Outcome::Fail(why) => {
                     eprintln!("FAIL vm-lab: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // G1.6a: the OS image (docs/os-image.md).
+        "os" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match os::main(&root, &rest) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL os: {why}");
                     ExitCode::FAILURE
                 }
             };
