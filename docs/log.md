@@ -5662,3 +5662,71 @@ continuação indentadas).
   enlace, duplex, MTU e taxas quando informadas. Comentários mantêm a faixa e as
   interações existentes. Testar: abrir Interfaces no lab, selecionar uma porta,
   comentar e ativar Inline Comments; verificar temas claro/escuro e ocultar Traffic.
+
+- 2026-10-27 — G1.6c: Instalador e imagens de VM (G1.6c). `cargo xtask os build` agora grava também
+  `corerouter-install.iso` (ISO 9660 + El Torito UEFI + GPT híbrida, escrita em Rust por
+  `corerouter-image installer`: serve de CD e de pendrive), `corerouter.qcow2` e `corerouter.ova`.
+  A ISO boota um segundo kernel (`os/package/corerouter-installer`: o mesmo kernel e `.config`,
+  outra linha de comando, initramfs embutido com o `corerouter-init`, sem BTF); o instalador acha a
+  mídia, confere o índice e o pacote (Ed25519), lista os discos (nunca oferece a mídia, o drive
+  óptico, disco pequeno ou só de leitura), exige o nome do disco digitado, grava ESP, slot A e
+  `/config` em fluxo, relê tudo (SHA-256 e árvore do dm-verity), escreve a GPT por último e cria a
+  entrada `Boot####` "CoreRouter A" primeiro no `BootOrder`. Opções: manter a configuração de um
+  CoreRouter instalado e um endereço de gerência para o primeiro boot (`corerouter.mgmt=`, aplicado
+  uma vez por comandos). Sem endereço em nenhuma porta, o console oferece o assistente de primeiro
+  boot (porta, endereço, gateway, senha do admin). FRR 10.3 do Buildroot entra na imagem; o init
+  sobe os 8 daemons que o hal-frr usa e o daemon recebe `--frr /var/run/frr`; vtysh, bash, readline e
+  ncurses ficam fora (sem GPL-3.0 na imagem). Núcleo em `crates/sysupdate/src/{gpt,iso,install}.rs`
+  (testado sobre arquivos), docs em `docs/os-image.md` ("Instalador, imagens de VM e FRR").
+
+  Como testar: `cargo xtask os build && cargo xtask os install-test` (instala de CD e de USB num
+  disco virtual de 2 GiB, boota pelo disco: dm-verity, ping TLS no endereço de gerência, 8 sockets
+  do FRR, BGP aplicado e lido do bgpd; reinstala mantendo a config; instalação interativa pela serial
+  recusando a mídia e um nome errado; qcow2 com o assistente de console e ping TLS; OVA).
+
+  Números (**medidos**, KVM, 2026-10-27): instalar 0,1–0,3 s (104 MiB gravados em 70–130 ms, relidos
+  em 30–38 ms), QEMU ligado → desligado 2,1–3,3 s; ISO 96,2 MiB, qcow2 38,9 MiB, OVA 38,8 MiB;
+  squashfs 19,3 MiB (+4,5 MiB do FRR), memória ociosa 93–98 MiB (era 48–58); kernel → daemon
+  0,76–0,82 s e → FRR 0,77–0,78 s; `install-test` 33 s.
+
+- 2026-10-27 — G3.2c: BGP, parte 3 (`docs/rpki.md`), mais o que faltava do G3.3.
+
+  - **RPKI.** `routing.rpki.add/set/remove/list/preview` no modelo `/routing rpki` do RouterOS v7
+    (endereço, porta 323, grupo, refresh/retry/expire com os limites da RFC 8210 §6, preferência).
+    O render põe o nó `rpki` do FRR e o route-map `CR-RPKI-IN` (`match rpki invalid` → deny) com
+    `soft-reconfiguration inbound` nos vizinhos iBGP; em eBGP só junto da política da G3.2b, para
+    não furar o RFC 8212. Inválidas descartadas por padrão assim que existe um validador, com aviso
+    no `add`, na prévia e na janela, e interruptor por conexão ou template
+    (`routing.rpki.invalid.set`). Cliente RTR próprio (`proto_bgp::rtr`, sans-IO; serviço `rpki`
+    do daemon, uma thread por validador): versão 1 com volta para a 0, Reset/Serial Query, Serial
+    Notify, Cache Reset, troca de Session ID, timers e expiração; `routing.rpki.session.list`
+    mostra estado, versão, Session ID, serial, VRPs por família e o estado do próprio bgpd.
+    `routing.rpki.check` é o `rpki-check` do RouterOS. Validação RFC 6811 (com RFC 8481, RFC 6483
+    §4/RFC 7607 para AS 0) numa árvore Patricia por família.
+  - **Rotas por conexão.** `routing.bgp.route.list {connection, direction}`: o `hal-frr` lê
+    `received-routes`/`advertised-routes`/`routes json` do bgpd em streaming para uma tabela
+    compacta (24 B por rota, atributos internados), num job do runner fora do lock; o engine guarda
+    até 4 tabelas ordenadas e validadas, e pagina e busca por prefixo (exact, longer, orlonger,
+    covering), AS path (`^`/`$`), community, estado RPKI e recusadas (`filtered`).
+    `routing.bgp.route.summary` dá a porcentagem de cada estado por sessão.
+  - **"Por que essa rota?"** `routing.bgp.route.explain {prefix}`: todos os caminhos, o escolhido e
+    o passo da decisão (ordem do `bgp_path_info_cmp` do FRR 10.x, com a seção da RFC 4271 §9.1 /
+    RFC 4456 §9 em cada passo) que deixou cada um para trás, com os dois valores; avisa quando a
+    escolha do daemon não se reproduz passo a passo.
+  - **Histórico de quedas** (`routing.bgp.session.history`): down/up/flap das amostras de 2 s, com
+    o motivo e quanto tempo esteve de pé; anel de 64 por sessão.
+  - **GUI.** Routing › RPKI (lista G0.24 com modal e prévia, política, `RPKI Check`) e Routing ›
+    BGP Routes (Received, Advertised, History; selos RPKI por linha, barra com a porcentagem de
+    cada estado, páginas de 500, busca; modal "Why this route?" com o passo de cada caminho e a
+    ordem dos passos, cada um com ⓘ em português). Botões Routes/History no detalhe da sessão
+    (Routing › BGP) e "Why this route? (BGP)" no detalhe de IP › Routes.
+  - **VM.** `xtask/src/vm_tools.rs` declara `frr-rpki-rtrlib` 10.7.1 (hash do `Packages` assinado)
+    e `librtr0t64`; `scripts/frr-rpki-live.sh` é o teste com FRR real (validador local
+    `rtr_server`, dois vizinhos iBGP: inválida descartada, explain por local-pref, interruptor,
+    histórico).
+
+  Como testar: `cargo test -p corerouter-proto-bgp -p corerouter-hal-frr`, `cargo test -p
+  corerouter-engine routing_rpki routing_bgp_route bgp_history`, `cargo test -p corerouter-ui
+  bgp_routes`, `cargo test -p corerouter-daemon rpki` (RTR por TCP com o servidor de teste); com
+  FRR real, `cargo xtask vm-lab run -- scripts/frr-rpki-live.sh`. Na GUI: Routing › RPKI e
+  Routing › BGP Routes.
