@@ -6,6 +6,12 @@
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "run inside the lab VM (cargo xtask vm-lab run)"; exit 1; }
 sed -i "s/^bgpd=no/bgpd=yes/" /etc/frr/daemons
+# Start from the package's frr.conf (frr-compare.sh's frr-reload.py rounds
+# save theirs; an earlier round may have saved its test lines into the copy).
+[ -f /etc/frr/frr.conf.crorig ] || cp -p /etc/frr/frr.conf /etc/frr/frr.conf.crorig
+sed -i '/^ip prefix-list \(BIG\|L\|T\) /d; /^router bgp /,/^exit/d' /etc/frr/frr.conf.crorig
+cp -p /etc/frr/frr.conf.crorig /etc/frr/frr.conf
+systemctl reset-failed frr 2>/dev/null || true  # many rounds in a row hit start-limit
 systemctl restart frr
 # The peer: zebra + bgpd of FRR instance `crpeer` in its own namespace.
 pkill -f -- "-N crpeer" 2>/dev/null || true
@@ -53,6 +59,7 @@ if [ "$status" = 0 ]; then
     cli routing.bgp.instance.set '{"asn":65000,"router_id":"198.51.100.1"}'
     vtysh -c "show running-config" | grep -q "^router bgp 65000" || { echo "FAIL: commit did not reach bgpd"; return 1; }
     echo "OK: commit reached bgpd"
+    systemctl reset-failed frr 2>/dev/null || true
     systemctl restart frr
     for _ in $(seq 40); do vtysh -c "show running-config" 2>/dev/null | grep -q "^router bgp 65000" && break; sleep 0.25; done
     vtysh -c "show running-config" | grep -q "^router bgp 65000" || { echo "FAIL: no resync after FRR restart"; return 1; }

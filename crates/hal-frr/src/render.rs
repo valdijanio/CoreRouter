@@ -11,6 +11,9 @@ use crate::conf::{Conf, ParseError};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Daemon {
     Zebra,
+    /// The management daemon (FRR 9+): holds the config of the converted
+    /// daemons and the shared filters (prefix-lists) for them.
+    Mgmtd,
     Bgpd,
     Ospfd,
     Ospf6d,
@@ -19,8 +22,9 @@ pub enum Daemon {
 }
 
 impl Daemon {
-    pub const ALL: [Daemon; 6] = [
+    pub const ALL: [Daemon; 7] = [
         Daemon::Zebra,
+        Daemon::Mgmtd,
         Daemon::Bgpd,
         Daemon::Ospfd,
         Daemon::Ospf6d,
@@ -31,6 +35,7 @@ impl Daemon {
     pub fn name(self) -> &'static str {
         match self {
             Daemon::Zebra => "zebra",
+            Daemon::Mgmtd => "mgmtd",
             Daemon::Bgpd => "bgpd",
             Daemon::Ospfd => "ospfd",
             Daemon::Ospf6d => "ospf6d",
@@ -44,7 +49,13 @@ impl Daemon {
 /// hold exactly what the render says (anything else typed there by hand is
 /// removed on the next sync). Every other context of FRR's config (`frr
 /// version`, `hostname`, `log`, interfaces, `line vty`) is left alone.
-/// A `proto-*` render that adds a context kind adds it here.
+/// A `proto-*` render that adds a context kind adds it here, with every
+/// daemon that takes it: a shared filter (`ip prefix-list`, `route-map`)
+/// is typed in mgmtd (FRR 10 hands it to zebra and staticd, which refuse
+/// it on their own vty) and in each unconverted routing daemon (bgpd,
+/// ospfd). A daemon left out keeps a stale copy, and `vtysh`, which shows
+/// the copies merged, then hides the difference (measured: `frr-reload.py`
+/// skipped lines the zebra copy still had).
 pub const OWNED: Owned = &[("router bgp ", &[Daemon::Bgpd])];
 
 /// A table of owned contexts: header prefix → daemons that take it.

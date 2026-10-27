@@ -35,4 +35,11 @@ pub trait RoutingReader: Send {
 
     /// The backend's version line, e.g. "frr 10.7.1"; `Err` while it is down.
     fn version(&mut self) -> Result<String, HalError>;
+
+    /// A value that changes whenever the daemons restart (their PIDs), so
+    /// a restart quicker than one poll is still seen and the config put
+    /// back. `None`: the backend cannot tell.
+    fn incarnation(&mut self) -> Option<String> {
+        None
+    }
 }

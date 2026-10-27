@@ -140,7 +140,13 @@ impl Frr {
     /// comes up before the policy typed with it. The end marker is sent on
     /// every path: without it bgpd waits 600 s (`BGP_PRE_CONFIG_MAX_WAIT`).
     pub fn push(&self, vty: &mut Vty, d: Daemon, script: &[String]) -> Result<(), HalError> {
-        let enter = vty.run("configure terminal");
+        // mgmtd (FRR 9+) takes changes only with its datastores locked, as
+        // vtysh does for a file.
+        let enter = vty.run(if d == Daemon::Mgmtd {
+            "configure terminal file-lock"
+        } else {
+            "configure terminal"
+        });
         match enter {
             Ok(r) if r.ok() => {}
             Ok(r) => {
@@ -275,6 +281,20 @@ impl Frr {
         Err(last)
     }
 
+    /// The PIDs of the daemons CoreRouter configures, from the `.pid`
+    /// files FRR writes beside the sockets: a restart changes them.
+    pub fn incarnation(&self) -> Option<String> {
+        let mut out = String::new();
+        for d in Daemon::ALL {
+            if self.owned.iter().any(|(_, ds)| ds.contains(&d)) {
+                let pid =
+                    std::fs::read_to_string(self.dir.join(format!("{}.pid", d.name()))).ok()?;
+                out.push_str(&format!("{}={} ", d.name(), pid.trim()));
+            }
+        }
+        Some(out)
+    }
+
     /// The BGP sessions of `cfg`'s instances, read from bgpd.
     pub fn bgp_sessions(&self, cfg: &Config) -> Result<Vec<BgpSession>, HalError> {
         let instance_of = |vrf: &str| {
@@ -385,6 +405,10 @@ impl RoutingReader for FrrReader {
 
     fn version(&mut self) -> Result<String, HalError> {
         self.0.version()
+    }
+
+    fn incarnation(&mut self) -> Option<String> {
+        self.0.incarnation()
     }
 }
 

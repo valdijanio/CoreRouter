@@ -17,15 +17,25 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use corerouter_hal_frr::conf::{self, Conf};
-use corerouter_hal_frr::render::{Daemon, Owned};
+use corerouter_hal_frr::render::{self, Daemon, Owned};
 use corerouter_hal_frr::{Frr, MAX_REPLY};
 
 type Res<T> = Result<T, Box<dyn Error>>;
 
-/// What the benchmark owns: BGP and prefix-lists, in bgpd.
+/// What the benchmark owns: BGP, and prefix-lists where they are typed:
+/// mgmtd (which hands them to zebra, a converted daemon) and bgpd (not
+/// converted).
 const OWNED: Owned = &[
     ("router bgp ", &[Daemon::Bgpd]),
-    ("ip prefix-list ", &[Daemon::Bgpd]),
+    ("ip prefix-list ", &[Daemon::Mgmtd, Daemon::Bgpd]),
+];
+/// Where the result is checked: zebra too.
+const CHECK: Owned = &[
+    ("router bgp ", &[Daemon::Bgpd]),
+    (
+        "ip prefix-list ",
+        &[Daemon::Zebra, Daemon::Mgmtd, Daemon::Bgpd],
+    ),
 ];
 const RELOAD: &str = "/usr/lib/frr/frr-reload.py";
 const PEERS: u32 = 100;
@@ -173,11 +183,23 @@ fn apply_vtysh_f(frr: &Frr, text: &str) -> Res<(Duration, u64)> {
     Ok((t0.elapsed(), mem))
 }
 
-/// "" when FRR runs `text`, else how far it is.
+/// "" when every daemon runs its part of `text`, else how far it is.
 fn check(frr: &Frr, text: &str) -> Res<String> {
-    let mut vty = frr.connect(Daemon::Bgpd)?;
-    let now = frr.running(&mut vty, Daemon::Bgpd)?;
-    let left = conf::diff(&now, &Conf::parse(text)?);
+    let frr = Frr::new(frr.dir()).with_owned(CHECK);
+    let want = Conf::parse(text)?;
+    let mut left = Vec::new();
+    for d in [Daemon::Bgpd, Daemon::Zebra, Daemon::Mgmtd] {
+        let mut vty = frr.connect(d)?;
+        let now = frr.running(&mut vty, d)?;
+        let part = want
+            .clone()
+            .owned(|l| render::daemons_of(CHECK, l).contains(&d));
+        left.extend(
+            conf::diff(&now, &part)
+                .into_iter()
+                .map(|l| format!("{}: {l}", d.name())),
+        );
+    }
     Ok(match left.first() {
         None => "resultado conferido".into(),
         Some(first) => format!("DIFERENTE: faltam {} comando(s), ex. `{first}`", left.len()),
@@ -188,102 +210,107 @@ fn main() -> Res<()> {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(1).map_or("/var/run/frr", String::as_str);
     let routes: u32 = args.get(2).map_or(Ok(1_000_000), |s| s.parse())?;
+    // `routes-only`: skip the applies (the script loads the routes between
+    // two runs, so zebra's import does not slow the applies down).
+    let routes_only = args.get(3).is_some_and(|a| a == "routes-only");
     let frr = Frr::new(dir).with_owned(OWNED);
     let big = Frr::new(dir).with_owned(OWNED).with_max_reply(4 << 30);
     println!("{}", frr.version()?);
     let mut rep = Report(String::new());
     println!("| Medida | Forma | Tempo | Memória (pico) | Nota |\n|---|---|---|---|---|");
 
-    let base = bgp("10.0.0.1", "peer");
-    let small = bgp("10.0.0.2", "peer");
-    let small2 = bgp("10.0.0.2", "edge");
-    let with_big = format!("{small2}{}", prefix_lists(ENTRIES));
-    let with_big2 = format!("{small2}{}", prefix_lists(ENTRIES / 2));
+    if !routes_only {
+        let base = bgp("10.0.0.1", "peer");
+        let small = bgp("10.0.0.2", "peer");
+        let small2 = bgp("10.0.0.2", "edge");
+        let with_big = format!("{small2}{}", prefix_lists(ENTRIES));
+        let with_big2 = format!("{small2}{}", prefix_lists(ENTRIES / 2));
 
-    // Start from nothing owned.
-    apply_rust(&frr, "")?;
-    let t = apply_rust(&frr, &base)?;
-    rep.row(
-        "carga inicial (BGP com 100 vizinhos, 201 linhas)",
-        "(b) vty Rust",
-        t,
-        None,
-        "",
-    );
-
-    for (label, from, to) in [
-        ("mudança pequena (router-id)", &base, &small),
-        ("mudança pequena (100 descrições)", &small, &small2),
-        ("mudança grande (+10 mil prefix-list)", &small2, &with_big),
-        ("mudança grande (−5 mil prefix-list)", &with_big, &with_big2),
-    ] {
-        for how in [
+        // Start from nothing owned.
+        apply_rust(&frr, "")?;
+        let t = apply_rust(&frr, &base)?;
+        rep.row(
+            "carga inicial (BGP com 100 vizinhos, 201 linhas)",
             "(b) vty Rust",
-            "(c) diff Rust + vtysh -f",
-            "(a) frr-reload.py",
-        ] {
-            // Each run starts from `from`.
-            apply_rust(&frr, from)?;
-            let (t, mem) = match how {
-                "(b) vty Rust" => {
-                    let before = hwm_kib();
-                    let t = apply_rust(&frr, to)?;
-                    (t, Some(hwm_kib().max(before)))
-                }
-                "(c) diff Rust + vtysh -f" => {
-                    let (t, m) = apply_vtysh_f(&frr, to)?;
-                    (t, Some(m))
-                }
-                _ => {
-                    let (t, m) = apply_reload(&frr, to)?;
-                    (t, Some(m))
-                }
-            };
-            let ok = check(&frr, to)?;
-            rep.row(label, how, t, mem, &ok);
-        }
-    }
+            t,
+            None,
+            "",
+        );
 
-    // State: 100 sessions (configured; they stay Active, the JSON per
-    // neighbor is the same size as an established one's minus the
-    // address-family block).
-    apply_rust(&frr, &small2)?;
-    let cfg = corerouter_model::Config::default();
-    let n = 20;
-    let t = Instant::now();
-    let mut count = 0;
-    for _ in 0..n {
-        let mut vty = frr.connect(Daemon::Bgpd)?;
-        let r = vty.run("show bgp vrf all neighbors json")?;
-        let text = String::from_utf8_lossy(&r.output);
-        count = corerouter_hal_frr::state::bgp_sessions(&text, None, &|v| v.to_owned())?.len();
-    }
-    rep.row(
-        "ler 100 sessões (neighbors json + parse)",
-        "(b) vty Rust",
-        t.elapsed() / n,
-        Some(hwm_kib()),
-        &format!("{count} sessões, média de {n}"),
-    );
-    let _ = cfg;
-    let mut tv = Duration::ZERO;
-    let mut mv = 0;
-    for _ in 0..n {
+        for (label, from, to) in [
+            ("mudança pequena (router-id)", &base, &small),
+            ("mudança pequena (100 descrições)", &small, &small2),
+            ("mudança grande (+10 mil prefix-list)", &small2, &with_big),
+            ("mudança grande (−5 mil prefix-list)", &with_big, &with_big2),
+        ] {
+            for how in [
+                "(b) vty Rust",
+                "(c) diff Rust + vtysh -f",
+                "(a) frr-reload.py",
+            ] {
+                // Each run starts from `from`.
+                apply_rust(&frr, from)?;
+                let (t, mem) = match how {
+                    "(b) vty Rust" => {
+                        let before = hwm_kib();
+                        let t = apply_rust(&frr, to)?;
+                        (t, Some(hwm_kib().max(before)))
+                    }
+                    "(c) diff Rust + vtysh -f" => {
+                        let (t, m) = apply_vtysh_f(&frr, to)?;
+                        (t, Some(m))
+                    }
+                    _ => {
+                        let (t, m) = apply_reload(&frr, to)?;
+                        (t, Some(m))
+                    }
+                };
+                let ok = check(&frr, to)?;
+                rep.row(label, how, t, mem, &ok);
+            }
+        }
+
+        // State: 100 sessions (configured; they stay Active, the JSON per
+        // neighbor is the same size as an established one's minus the
+        // address-family block).
+        apply_rust(&frr, &small2)?;
+        let cfg = corerouter_model::Config::default();
+        let n = 20;
         let t = Instant::now();
-        let (_, m, out) =
-            timed(Command::new("vtysh").args(["-c", "show bgp vrf all neighbors json"]))?;
-        let text = String::from_utf8_lossy(&out);
-        count = corerouter_hal_frr::state::bgp_sessions(&text, None, &|v| v.to_owned())?.len();
-        tv += t.elapsed();
-        mv = mv.max(m);
+        let mut count = 0;
+        for _ in 0..n {
+            let mut vty = frr.connect(Daemon::Bgpd)?;
+            let r = vty.run("show bgp vrf all neighbors json")?;
+            let text = String::from_utf8_lossy(&r.output);
+            count = corerouter_hal_frr::state::bgp_sessions(&text, None, &|v| v.to_owned())?.len();
+        }
+        rep.row(
+            "ler 100 sessões (neighbors json + parse)",
+            "(b) vty Rust",
+            t.elapsed() / n,
+            Some(hwm_kib()),
+            &format!("{count} sessões, média de {n}"),
+        );
+        let _ = cfg;
+        let mut tv = Duration::ZERO;
+        let mut mv = 0;
+        for _ in 0..n {
+            let t = Instant::now();
+            let (_, m, out) =
+                timed(Command::new("vtysh").args(["-c", "show bgp vrf all neighbors json"]))?;
+            let text = String::from_utf8_lossy(&out);
+            count = corerouter_hal_frr::state::bgp_sessions(&text, None, &|v| v.to_owned())?.len();
+            tv += t.elapsed();
+            mv = mv.max(m);
+        }
+        rep.row(
+            "ler 100 sessões (neighbors json + parse)",
+            "(a) vtysh -c",
+            tv / n,
+            Some(mv),
+            &format!("{count} sessões, média de {n}"),
+        );
     }
-    rep.row(
-        "ler 100 sessões (neighbors json + parse)",
-        "(a) vtysh -c",
-        tv / n,
-        Some(mv),
-        &format!("{count} sessões, média de {n}"),
-    );
 
     // 1 M routes in zebra (kernel routes it imported).
     if routes > 0 {

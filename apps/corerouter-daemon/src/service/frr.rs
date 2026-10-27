@@ -75,10 +75,20 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
     // Whether the running config is known to be on FRR.
     let mut in_sync = synced;
     let mut status = RoutingStatus::default();
+    let mut seen = reader.incarnation();
     loop {
         health.beat();
         match reader.version() {
             Ok(v) => {
+                // Restarted between two polls: up both times, other PIDs.
+                let now = reader.incarnation();
+                if now != seen {
+                    if seen.is_some() && in_sync {
+                        log::warn!("FRR restarted ({now:?}); installing the running config again");
+                    }
+                    in_sync = false;
+                    seen = now;
+                }
                 if !in_sync {
                     match lock(session).routing_resync() {
                         Ok(()) => {
