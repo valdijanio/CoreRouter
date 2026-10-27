@@ -123,7 +123,7 @@ fn interfaces_show_a_mini_graph() {
     let cells = h.app.panel_mut::<Spark>().unwrap().cells.clone();
     let e1 = cells.get("ether1").expect("ether1 has a sparkline");
     assert!(e1.starts_with(crate::spark::SEP));
-    assert!(crate::spark::tip(e1).unwrap().starts_with("5 min: Rx "));
+    assert!(crate::spark::tip(e1).unwrap().starts_with("Up to 5 min: Rx "));
     assert!(h.has_text("Traffic"), "the column");
 }
 

@@ -133,6 +133,8 @@ pub(crate) struct NicView {
     opened: Option<f64>,
     /// Last counters seen (time, rx/tx bytes, rx/tx packets), for rates.
     last: Option<(f64, [u64; 4])>,
+    last_errors: Option<(u64, u64)>,
+    recent_errors: Option<(u64, u64)>,
     rates: VecDeque<Rate>,
     /// "Zero view": the value of each (group, counter) when pressed.
     zero: BTreeMap<(String, String), u64>,
@@ -146,6 +148,13 @@ pub(crate) struct NicView {
 }
 
 impl NicView {
+    pub(crate) fn live_rates(&self) -> Option<(f64, f64)> {
+        self.rates.back().map(|r| (r.rx_bps, r.tx_bps))
+    }
+
+    pub(crate) fn recent_errors(&self) -> Option<(u64, u64)> {
+        self.recent_errors
+    }
     pub(crate) fn monitor_value(&self) -> Option<&Value> {
         match &self.monitor {
             Some(Ok(v)) => Some(v),
@@ -180,6 +189,11 @@ impl NicView {
     /// A new `interface.stats` at UI time `now`: one traffic sample.
     fn sample(&mut self, now: f64, stats: &Value) {
         let get = |n: &str| counter(stats, "interface", n);
+        let errors = get("rx_errors").zip(get("tx_errors"));
+        self.recent_errors = errors.zip(self.last_errors).and_then(|((rx, tx), (old_rx, old_tx))| {
+            Some((rx.checked_sub(old_rx)?, tx.checked_sub(old_tx)?))
+        });
+        self.last_errors = errors;
         let (Some(rb), Some(tb), Some(rp), Some(tp)) = (
             get("rx_bytes"),
             get("tx_bytes"),
@@ -273,7 +287,15 @@ impl CoreRouterUi {
 
     /// Ask what the open interface windows show, when due.
     pub(crate) fn nic_tick(&mut self, now: f64) {
-        let open = self.props_open();
+        let mut open = self.props_open();
+        if self.open.contains(&crate::Win::Interfaces) {
+            let selected: Vec<_> = self.ifaces().into_iter()
+                .filter(|i| self.tables.interfaces.is_selected(&i.name))
+                .map(|i| i.name).collect();
+            if let [name] = selected.as_slice() && !open.contains(name) {
+                open.push(name.clone());
+            }
+        }
         self.nic.retain(|name, _| open.contains(name));
         for name in open {
             let view = self.nic.entry(name.clone()).or_default();
@@ -901,6 +923,22 @@ mod tests {
             v.sample(15.0 + f64::from(i), &stats(200 + u64::from(i), 10));
         }
         assert_eq!(v.rates.len(), HISTORY);
+    }
+
+    #[test]
+    fn error_deltas_require_two_samples_and_do_not_survive_a_reset() {
+        let sample = |rx, tx| json!({"groups":[{"name":"interface", "counters":[
+            {"name":"rx_errors", "value":rx}, {"name":"tx_errors", "value":tx}
+        ]}]});
+        let mut v = NicView::default();
+        v.sample(1.0, &sample(10, 20));
+        assert_eq!(v.recent_errors(), None);
+        v.sample(2.0, &sample(12, 21));
+        assert_eq!(v.recent_errors(), Some((2, 1)));
+        v.sample(3.0, &sample(0, 0));
+        assert_eq!(v.recent_errors(), None);
+        v.sample(4.0, &stats(0, 0));
+        assert_eq!(v.recent_errors(), None);
     }
 
     #[test]
