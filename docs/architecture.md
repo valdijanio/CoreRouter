@@ -253,6 +253,14 @@ backend.**
   (`Session::routing_resync`), sob o lock, para não intercalar com um commit. Um restart
   mais rápido que a leitura é visto pelos PIDs dos daemons (`<daemon>.pid`). Dentro de um
   daemon o envio é sequencial: ele atende um comando por vez por conexão, e o custo é dele.
+- **RPKI e tabelas BGP (G3.2c, `docs/rpki.md`).** Quem descarta inválidas é o FRR
+  (`bgpd_rpki`, route-map `CR-RPKI-IN` com `soft-reconfiguration inbound`, que a revalidação do
+  FRR exige). O CoreRouter tem o seu próprio cliente RTR em Rust (`proto_bgp::rtr`, uma thread por
+  validador no serviço `rpki`) e uma árvore de VRPs para os selos e o `rpki-check`: consultar o
+  FRR rota a rota ou ler a `prefix-table` inteira a cada mudança custaria mais e não daria versão,
+  serial nem expiração. Listas de rotas e "Por que essa rota?" leem o bgpd num job do runner,
+  nunca sob o lock, com o JSON lido em streaming direto do socket para uma tabela compacta (24 B
+  por rota); as páginas saem da memória. Números em `docs/perf.md` (G3.2c).
 - **RFC 8212.** O perfil `traditional` do FRR liga `bgp ebgp-requires-policy` e o render não
   desliga. Uma sessão eBGP sem política não aceita nem anuncia rota (no teste com FRR real,
   `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2b.

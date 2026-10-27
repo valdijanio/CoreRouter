@@ -56,7 +56,13 @@ impl Daemon {
 /// ospfd). A daemon left out keeps a stale copy, and `vtysh`, which shows
 /// the copies merged, then hides the difference (measured: `frr-reload.py`
 /// skipped lines the zebra copy still had).
-pub const OWNED: Owned = &[("router bgp ", &[Daemon::Bgpd])];
+pub const OWNED: Owned = &[
+    ("router bgp ", &[Daemon::Bgpd]),
+    // G3.2c: RPKI validators and the route-map that drops invalid routes;
+    // `match rpki` exists only in bgpd (its rpki module).
+    ("rpki", &[Daemon::Bgpd]),
+    ("route-map CR-RPKI-", &[Daemon::Bgpd]),
+];
 
 /// A table of owned contexts: header prefix → daemons that take it.
 pub type Owned = &'static [(&'static str, &'static [Daemon])];

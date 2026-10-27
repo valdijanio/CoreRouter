@@ -16,6 +16,11 @@
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
+pub mod decision;
+pub mod rib;
+pub mod rpki;
+pub mod rtr;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::net::IpAddr;
@@ -58,6 +63,7 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
         }
     }
     validate_neighbors(cfg, &mut out);
+    out.extend(rpki::validate(&cfg.routing));
     out
 }
 
@@ -213,8 +219,10 @@ pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String>
                 .map_err(|e| format!("connection {}: {e}", c.name))?;
             eff.push((*c, p));
         }
-        render_instance(&mut s, inst, &eff, open)?;
+        render_instance(&mut s, inst, &eff, open, !rpki::enabled(routing).is_empty())?;
     }
+    // G3.2c: the `rpki` node and its route-map, after the instances.
+    s.push_str(&rpki::render_frr(routing));
     Ok(s)
 }
 
@@ -223,7 +231,7 @@ pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String>
 pub fn render_frr(inst: &BgpInstance) -> String {
     let mut s = String::new();
     // No neighbors: no key to open.
-    let _ = render_instance(&mut s, inst, &[], &|_| None);
+    let _ = render_instance(&mut s, inst, &[], &|_| None, false);
     s
 }
 
@@ -238,6 +246,7 @@ fn render_instance(
     inst: &BgpInstance,
     neighbors: &[(&BgpConnection, BgpParams)],
     open: Opener<'_>,
+    rpki: bool,
 ) -> Result<(), String> {
     // Writing to a String cannot fail; ignore the fmt::Result.
     let _ = writeln!(s, "{}", frr_header(inst));
@@ -256,6 +265,14 @@ fn render_instance(
                 Afi::Ipv6 => &mut v6,
             };
             neighbor_af(af, c, p, afi);
+            // G3.2c: drop RPKI-invalid routes; the Adj-RIB-In is kept so
+            // FRR revalidates when the VRPs change (its rpki module needs
+            // it) and the received list shows what was dropped.
+            if rpki && rpki::drops_invalid_ibgp(role_of(inst, p).is_ibgp(), p) {
+                let a = c.remote_address;
+                let _ = writeln!(af, "  neighbor {a} soft-reconfiguration inbound");
+                let _ = writeln!(af, "  neighbor {a} route-map {} in", rpki::ROUTE_MAP_IN);
+            }
         }
     }
     for (name, body) in [("ipv4", v4), ("ipv6", v6)] {

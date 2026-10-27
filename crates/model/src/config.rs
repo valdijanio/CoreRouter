@@ -388,6 +388,9 @@ pub struct Routing {
     /// `/routing bgp connection`: the neighbors, by name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub bgp_connections: BTreeMap<String, crate::bgp::BgpConnection>,
+    /// `/routing rpki` (G3.2c, `crate::rpki`): the RTR validators, by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub rpki: BTreeMap<String, crate::rpki::RpkiCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -374,6 +374,12 @@ impl Session {
         self.tasks.runner = Some(runner);
     }
 
+    /// The runner, for jobs that are not tasks (G3.2c: a BGP table read
+    /// into a cache the commands page through).
+    pub(crate) fn runner(&self) -> Option<Arc<dyn Runner>> {
+        self.tasks.runner.clone()
+    }
+
     pub(crate) fn expire_tasks(&mut self) {
         self.log_finished_tasks();
         if let Some(now) = self.now() {

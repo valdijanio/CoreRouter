@@ -152,7 +152,7 @@ Estimativas em horas de agente, todas **estimadas** (nada medido ainda).
 | G3.2b | Políticas BGP (G3.2, parte 2) | model, proto-bgp, hal-frr, engine, ui | prefix-list, community normal e large, AS-path, `routing.filter.rule` (chains in/out por conexão) com prévia de "quais rotas passam"; RFC 8212 por padrão (eBGP sem política não aceita nem envia) com aviso na janela | 12 h | aberto |
 | G3.2c | RPKI e "Por que essa rota?" (G3.2, parte 3) | proto-bgp, hal-frr, engine, ui | RPKI (RFC 6811/8210, RTR para validador) ligado por padrão com inválidos descartados; "Por que essa rota?": caminho escolhido, os candidatos e o passo da decisão (RFC 4271 §9.1) que os eliminou | 8 h | aberto |
 | G3.2d | BGP: BFD, TTL security e Send Hold Timer por conexão | proto-bgp, hal-frr, engine, ui | `use_bfd` (com o G3.6), `ttl_security` (GTSM, RFC 5082) e `send_hold_time` (RFC 9687) nos templates e conexões, com a coluna BFD já lida do FRR | 4 h | aberto |
-| G3.3 | Estado BGP | hal-frr, engine, ui | `routing.bgp.session.list` via `vtysh … json`; janela com sessões ao vivo | 6 h | aberto |
+| G3.3 | Estado BGP | hal-frr, engine, ui | `routing.bgp.session.list` ao vivo e a aba Sessions (coberto pela G3.2a); rotas recebidas e anunciadas por conexão, paginadas e com busca (`routing.bgp.route.list`), e o histórico de quedas por sessão (`routing.bgp.session.history`) (cobertos pela G3.2c) | 6 h | aberto |
 | G3.4 | OSPFv2/v3 | proto-ospf, engine, ui | Áreas, interfaces, custo, stub/NSSA, auth; estado de vizinhos | 16 h | aberto |
 | G3.5 | MPLS + LDP | proto-mpls, hal-linux, hal-frr | Rotas MPLS no kernel, LDP via ldpd, labels na UI | 16 h | aberto |
 | G3.6 | BFD | proto-bgp/ospf, hal-frr | BFD por peer/interface | 5 h | aberto |

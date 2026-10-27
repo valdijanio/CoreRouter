@@ -214,6 +214,10 @@ pub struct BgpParams {
     pub update_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nexthop_choice: Option<NexthopChoice>,
+    /// G3.2c: what to do with RPKI-invalid routes (unset: reject, once a
+    /// validator is configured; `crate::rpki`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpki_invalid: Option<crate::rpki::RpkiInvalid>,
 }
 
 impl BgpParams {
@@ -237,6 +241,7 @@ impl BgpParams {
         take(&mut self.max_prefix_restart, &parent.max_prefix_restart);
         take(&mut self.update_source, &parent.update_source);
         take(&mut self.nexthop_choice, &parent.nexthop_choice);
+        take(&mut self.rpki_invalid, &parent.rpki_invalid);
     }
 
     /// The families in force: unset is IPv4 only, as in RouterOS.
