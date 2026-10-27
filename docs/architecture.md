@@ -202,7 +202,27 @@ backend.**
   daemon o envio é sequencial: ele atende um comando por vez por conexão, e o custo é dele.
 - **RFC 8212.** O perfil `traditional` do FRR liga `bgp ebgp-requires-policy` e o render não
   desliga. Uma sessão eBGP sem política não aceita nem anuncia rota (no teste com FRR real,
-  `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2.
+  `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2b.
+- **Vizinhos BGP no modelo RouterOS v7 (G3.2a, `docs/bgp.md`).** `routing.bgp_templates` e
+  `routing.bgp_connections` (`corerouter_model::bgp`). Os templates são **achatados** no render:
+  cada vizinho vai ao FRR com os valores em vigor, sem `peer-group`. Um template do RouterOS
+  tem vários pais e qualquer valor é sobrescrito na conexão; um peer-group tem um pai só, e
+  alguns parâmetros não se sobrescrevem por membro. Mudar um template digita as linhas que
+  mudaram em cada vizinho que herda o valor, e nada mais. Medido com FRR 10.7.1 real (VM do
+  laboratório, debug do nosso lado, 2026-10-27): 1 000 conexões aplicadas em 329 ms (5 006
+  comandos), uma mudada entre 1 000 em 28 ms (3 comandos), todas removidas em 197 ms.
+  - **Ordem do diff.** Um vizinho existe da linha `neighbor X remote-as` até `no neighbor X
+    remote-as`, que leva junto todas as outras linhas dele, nas famílias também. O diff define
+    os vizinhos novos antes das mudanças dentro das famílias (o `activate`) e remove os
+    vizinhos apagados por último, com um comando só.
+  - **Chave TCP MD5.** Fica selada (`sealing`, a mesma AES-256-GCM das senhas PPP). O backend
+    recebe do engine um `SecretOpener` ao ser ligado e abre a chave só no render. O
+    `hal-frr` mascara `password` em erro e log.
+  - **`routing` é uma seção `CowArc`, e o delta do histórico é por conexão.** Antes, a seção
+    era serializada inteira duas vezes em todo commit (o delta do histórico e o arquivo da
+    revisão anterior), até nos commits de firewall. Medido com 1 000 conexões, release:
+    mudar uma passou de 8,1 ms para 1,5 ms por commit (criterion, `engine/benches/bgp.rs`), e
+    um commit que não toca `routing` não copia nem serializa a seção.
 - **holo** (suíte de roteamento em Rust, modelo YANG) é o candidato a backend Rust-nativo do
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)

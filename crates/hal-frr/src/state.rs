@@ -72,8 +72,9 @@ fn session(
 ) -> BgpSession {
     let established = state == "Established";
     let (mut rcvd, mut sent, mut any) = (0u64, 0u64, false);
+    let (mut afi, mut policy_in, mut policy_out) = (Vec::new(), None, None);
     if let Some(Value::Object(afs)) = n.get("addressFamilyInfo") {
-        for af in afs.values() {
+        for (name, af) in afs {
             if let Value::Object(af) = af {
                 if let Some(r) = u64_of(af, "acceptedPrefixCounter") {
                     rcvd = rcvd.saturating_add(r);
@@ -83,12 +84,17 @@ fn session(
                     sent = sent.saturating_add(s);
                     any = true;
                 }
+                afi.push(family(name));
+                policy_in = policy_in.or_else(|| str_of(af, "routeMapForIncomingAdvertisements"));
+                policy_out = policy_out.or_else(|| str_of(af, "routeMapForOutgoingAdvertisements"));
             }
         }
     }
     let stats = n.get("messageStats").and_then(Value::as_object);
     let stat = |k: &str| stats.and_then(|s| u64_of(s, k));
     let remote_id = str_of(n, "remoteRouterId").filter(|id| id != "0.0.0.0");
+    let secs = |k: &str| u64_of(n, k).map(|ms| ms / 1000);
+    let description = str_of(n, "nbrDesc");
     BgpSession {
         instance,
         vrf: vrf.to_owned(),
@@ -103,7 +109,7 @@ fn session(
         state: state.to_ascii_lowercase(),
         established,
         uptime_secs: if established {
-            u64_of(n, "bgpTimerUpMsec").map(|ms| ms / 1000)
+            secs("bgpTimerUpMsec")
         } else {
             None
         },
@@ -117,8 +123,34 @@ fn session(
             str_of(n, "lastResetDueTo")
                 .or_else(|| str_of(n, "adminShutDown").map(|_| "Admin. shutdown".into()))
         },
-        description: str_of(n, "nbrDesc"),
+        connection: description.clone(),
+        description,
+        hold_time: secs("bgpTimerHoldTimeMsecs"),
+        keepalive_time: secs("bgpTimerKeepAliveIntervalMsecs"),
+        // FRR keeps a reset reason before the first reset too ("No path
+        // to specified Neighbor"): shown only once the session went down.
+        last_error: str_of(n, "lastNotificationReason")
+            .or_else(|| str_of(n, "lastErrorCodeSubcode").map(|c| format!("code {c}")))
+            .or_else(|| {
+                (!established || u64_of(n, "connectionsDropped").unwrap_or(0) > 0)
+                    .then(|| str_of(n, "lastResetDueTo"))
+                    .flatten()
+            }),
+        flaps: u64_of(n, "connectionsDropped"),
+        bfd: n
+            .get("peerBfdInfo")
+            .and_then(Value::as_object)
+            .and_then(|b| str_of(b, "status"))
+            .map(|s| s.to_ascii_lowercase()),
+        afi,
+        policy_in,
+        policy_out,
     }
+}
+
+/// `ipv4Unicast` → `ipv4`.
+fn family(key: &str) -> String {
+    key.strip_suffix("Unicast").unwrap_or(key).to_owned()
 }
 
 #[cfg(test)]

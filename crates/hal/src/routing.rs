@@ -7,10 +7,31 @@
 //! for holo), so a second backend needs no change in the engine, the
 //! commands, the UI or MCP.
 
+use std::sync::Arc;
+
 use corerouter_model::Config;
 use corerouter_model::routing_state::BgpSession;
+use corerouter_model::sealed::Sealed;
 
 use crate::HalError;
+
+/// Opens a sealed secret (a BGP TCP MD5 key, G3.2a) for the render; the
+/// engine holds the key and hands this to the backend. `None`: it cannot
+/// be opened (no key file, another router's box).
+pub type SecretOpener = Arc<dyn Fn(&Sealed) -> Option<String> + Send + Sync>;
+
+/// What `routing.bgp.session.clear`/`refresh`/`resend` ask of a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BgpClear {
+    /// Close it and open it again (NOTIFICATION Cease, RFC 4486
+    /// subcode 4, administrative reset).
+    Hard,
+    /// Ask the neighbor to send its routes again (ROUTE-REFRESH, RFC 2918):
+    /// new inbound policy without a reset.
+    SoftIn,
+    /// Send ours again: new outbound policy without a reset.
+    SoftOut,
+}
 
 pub trait RoutingDaemon: Send {
     /// "frr 10.7.1 (vty)".
@@ -26,6 +47,19 @@ pub trait RoutingDaemon: Send {
     /// A handle that reads state on another thread, without this backend
     /// (and the session lock around it).
     fn reader(&self) -> Box<dyn RoutingReader>;
+
+    /// How the backend opens sealed secrets for its render (set once when
+    /// the engine attaches it). Without it only clear values open.
+    fn set_secrets(&mut self, open: SecretOpener) {
+        let _ = open;
+    }
+
+    /// Reset or refresh the session with `neighbor` of BGP instance
+    /// `instance` (a running-state action, not configuration).
+    fn bgp_clear(&mut self, instance: &str, neighbor: &str, how: BgpClear) -> Result<(), HalError> {
+        let _ = (instance, neighbor, how);
+        Err(HalError::Unsupported("BGP session actions".into()))
+    }
 }
 
 /// Reads the routing daemons' state; owned by a thread of its own.

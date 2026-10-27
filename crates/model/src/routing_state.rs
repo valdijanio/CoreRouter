@@ -32,6 +32,32 @@ pub struct BgpSession {
     /// `(Policy)`: RFC 8212 without a filter).
     pub reason: Option<String>,
     pub description: Option<String>,
+    /// The `routing.bgp_connections` entry (G3.2a: CoreRouter renders the
+    /// connection's name as the neighbor's description).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection: Option<String>,
+    /// Negotiated timers, seconds (RFC 4271 §4.2: the smaller hold time).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_time: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_time: Option<u64>,
+    /// The last NOTIFICATION (sent or received), or why it last went down.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    /// Times the session went down after being established.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flaps: Option<u64>,
+    /// BFD state of the neighbor (`up`, `down`), when BFD watches it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bfd: Option<String>,
+    /// Families the session carries (`ipv4`, `ipv6`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub afi: Vec<String>,
+    /// Inbound and outbound policy (route-maps) in force, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_in: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy_out: Option<String>,
 }
 
 /// What the routing backend is doing, for the session list and the log.
