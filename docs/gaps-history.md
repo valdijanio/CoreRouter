@@ -165,3 +165,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-26 — G0.27 feito (checkpoint da config no desligamento do daemon)
 - 2026-10-26 — G4.3l feito (QinQ e IPv6 sem XDP)
 - 2026-10-26 — G4.3n feito (migrar secrets PPP com senha do MikroTik; senhas cifradas em repouso)
+- 2026-10-26 — G4.3ha feito (Class do RADIUS na contabilização e na tomada do par)
+- 2026-10-26 — G4.9g criado e feito (janela "Queue <nome>": Traffic, Statistics, History; queue.simple.stats; histórico por fila opt-in)

@@ -1622,3 +1622,40 @@ contra 267 s), num job que já não é o caminho crítico, e custa mais uma comp
 artifact) não ganha tempo de relógio: o job de build ainda compila 96 s, e soma compactar,
 enviar e baixar os binários de teste, antes de as partes começarem (**estimado** ≥ 5 min, contra
 ~4,5 min compilando em cada parte).
+
+### G4.9g — uma fila ao vivo e o histórico por fila (medido, notebook de desenvolvimento, build `bench`, 2026-10-26)
+
+`cargo bench -p corerouter-engine --bench queue_live`:
+
+| | 10 000 filas | 100 000 filas |
+|---|---:|---:|
+| `queue.simple.stats`, fila já resolvida (o 1 Hz da janela) | 2,2 µs | 2,2 µs |
+| primeira chamada (índice de nomes + id) | 3,6 µs | 3,7 µs |
+| primeira chamada com ids fora de ordem (depois de um `move`) | 3,8 µs | 3,8 µs |
+
+Histórico: 448 728 bytes (438 KiB) por fila; 10 000 marcadas = 4,18 GiB.
+
+Um segundo de histórico das filas (`queue_graph`, serviço `queue`, sob o lock da sessão):
+
+| filas fixas (guardadas) | teto | antes | depois |
+|---|---|---:|---:|
+| 1 000 (1 000) | 4096 MiB | 387 µs | 105 µs |
+| 4 000 (4 000) | 4096 MiB | 2,29 ms | 0,75 ms |
+| 10 000 (136, 9 864 recusadas) | 64 MiB (padrão) | 1,83 ms | 0,41 ms |
+| 10 000 (4 087, 5 913 recusadas) | 4096 MiB | 4,16 ms | 1,25 ms |
+
+"Antes" é a primeira versão desta mesma parte, que alocava por fila a cada segundo (o conjunto
+de nomes recusados, as chaves clonadas, um mapa de descartes); "depois", sem alocar por fila
+(−68% a −77%).
+
+Um quadro da UI (1400×900, `cargo bench -p corerouter-ui --bench frames`):
+
+| | antes | depois |
+|---|---:|---:|
+| janela Queues sozinha | — | 0,10 ms |
+| + "Queue <nome>" em Traffic (900 pontos, 15 min) | 2,21 ms | 0,20 ms |
+| + "Queue <nome>" em Statistics | 2,17 ms | 0,18 ms |
+
+O "antes" era o modal de lista montando o texto dos comandos (o registro inteiro) a cada quadro,
+mesmo numa aba que não o mostra; nas abas ao vivo ele não é mais montado (−91%). As abas de
+formulário (General/Advanced) continuam pagando ~2 ms por quadro, como todo modal de edição hoje.

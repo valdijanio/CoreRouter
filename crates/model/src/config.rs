@@ -308,6 +308,9 @@ pub struct Ip {
     /// `/ip traffic-flow` (G4.4b): IPFIX / NetFlow v9 export.
     #[serde(skip_serializing_if = "crate::traffic_flow::TrafficFlow::is_default")]
     pub traffic_flow: crate::traffic_flow::TrafficFlow,
+    /// `/ip subscriber-notice` (G4.10): block and notice pages.
+    #[serde(skip_serializing_if = "crate::subscriber_notice::SubscriberNotices::is_empty")]
+    pub subscriber_notice: crate::subscriber_notice::SubscriberNotices,
 }
 
 impl Ip {
