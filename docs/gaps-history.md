@@ -171,3 +171,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-26 — G4.3hb feito (CoA/DM depois de uma tomada do par); G4.3hg criada (endereço de CoA flutuante)
 - 2026-10-27 — G4.10b feito (plano de dados dos avisos ao assinante)
 - 2026-10-27 — G4.10c feito (serviço do portal dos avisos ao assinante)
+- 2026-10-27 — G4.10d feito (janela Subscriber Notices)
+- 2026-10-27 — G4.10e feito (laboratório dos avisos ao assinante); G4.10 em partes (faltam G4.10f–h)

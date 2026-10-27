@@ -5151,3 +5151,55 @@ continuação indentadas).
   - `cargo test -p corerouter-daemon --bin corerouter-daemon notice`: as 21 sondas, a página e
     o log, a resposta de quem não é membro, a API e as requisições hostis;
   - `cargo test -p corerouter-proto-dhcp capport`.
+
+- 2026-10-27 — G4.10d: Avisos ao assinante, parte 4: a janela IP › Subscriber Notices (`crates/ui/src/subscriber_notice.rs`).
+  Ela segue o padrão de lista com modal (G0.24). As abas são:
+
+  - **Profiles:** nome, selo do modo (block vermelho, notice âmbar, throttle azul), selo da
+    address list colorido pela chave, Behaviour e membros.
+  - **Walled Garden.**
+  - **Pages:** editor do modelo com a prévia ao lado, desenhada a partir do preenchimento do
+    próprio motor (`page.preview` devolve título, parágrafos e botão já preenchidos). A página
+    embutida é só de leitura e vira página nova com um nome.
+  - **Active:** quem está sob um perfil, a origem, desde quando e se viu a página, com
+    **Testar como cliente**.
+  - **Log:** cada visualização, com o sistema que trouxe o assinante.
+
+  Os modais de perfil e de walled garden ganham pré-visualização no motor
+  (`profile.preview`, `walled-garden.preview`).
+
+  O menu "Block (com página)" aparece nos leases do DHCP e nos secrets do PPP, com a lista de
+  perfis e "Desbloquear".
+
+  Testar: `cargo test -p corerouter-ui subscriber_notice`, `cargo test -p corerouter-engine --test
+  subscriber_notice`; capturas da GUI real (Xvfb) olhadas.
+
+- 2026-10-27 — G4.10e: Avisos ao assinante, parte 5: `apps/corerouter-daemon/tests/netns_notice.rs`, o teste de ponta a
+  ponta (detalhes em `docs/subscriber-notices.md`, "Laboratório"). Ele cobre:
+
+  - as 21 sondas, para o assinante direto e para o celular atrás do NAT da CPE;
+  - o HTTPS recusado na hora;
+  - o DNS liberado;
+  - o 511 para outro site HTTP;
+  - a página e o Log;
+  - a liberação;
+  - o aviso e a redução;
+  - 100 mil assinantes na lista.
+
+  Testar:
+
+  ```sh
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-daemon --test netns_notice -- --test-threads 1 --nocapture
+  ```
+
+  Medidas (build de depuração, namespace):
+
+  | Medida | Tempo |
+  |---|---|
+  | liberação, do comando ao próximo pedido sair | 39 ms |
+  | carga de 100 mil (10 lotes de 10 000, commit e kernel) | 7,9 s |
+  | sonda de um membro respondida pelo portal, com 100 mil | 10 ms |
+  | HTTPS recusado | 34 µs |
+  | uma entrada dinâmica entrar e sair | 31 ms |
+
+  O roteiro manual com celular está em `plan/hw-lab.sh notice` (só imprime) e no doc.
