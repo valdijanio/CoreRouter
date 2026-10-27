@@ -48,10 +48,10 @@ const GC: [&str; 6] = [
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.arp.list", "ARP", ["IP", "ARP"], None,
-        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static | dhcp), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static | dhcp: DHCP add-arp), flags (X disabled, I invalid, H dhcp, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
+        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment, vendor), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static | dhcp), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static | dhcp: DHCP add-arp), flags (X disabled, I invalid, H dhcp, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
         always, list_v4),
     cmd!(query "ipv6.neighbor.list", "IPv6 Neighbors", ["IPv6", "Neighbors"], None,
-        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static | dhcp), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static | dhcp: DHCP add-arp), flags (X disabled, I invalid, H dhcp, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
+        "{search?: string (an IP, a CIDR, a MAC prefix as 00:50:56, or text in interface, state, comment, vendor), interface?: string, state?: string (reachable | stale | delay | probe | incomplete | failed | permanent | noarp; several comma-separated), source?: string (dynamic | static | dhcp), offset?: u32, limit?: u32 (1..=5000, default 500)} → {rows: [{id (static entry, else null), address, mac_address, interface, state, source (dynamic | static | dhcp: DHCP add-arp), flags (X disabled, I invalid, H dhcp, D dynamic, P published, C complete), router, published, disabled, invalid, comment, last_seen_secs, mac_since, vendor, host}], total, matched, offset, counts: {states: {state: n}, interfaces: {name: n}, sources: {source: n}}, table: {ipv4, ipv6, gc_thresh3, near_full, suggest, source, fed, lost}, generation}",
         always, list_v6),
     cmd!(
         "ip.arp.add",
@@ -105,6 +105,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.arp.detail", "Neighbor Detail", [], None,
         "{address: ip, interface?: string} → {row (as ip.arp.list), history: [{mac_address, since}], routes: [{dst_address, routing_table, state}], subnet (the router's address whose network holds it, or null)}",
         always, detail),
+    cmd!(query "ip.arp.vendors.print", "ARP Vendors", [], None,
+        "{} → {source (built-in | downloaded), date, entries, sha256 (of the IEEE oui.csv it came from), source_size, url, updater (this router can download), update: {requested, running, error, at}}",
+        always, vendors_print),
+    cmd!(query "ip.arp.vendors.update", "Update Vendors", [], None,
+        "{} → {requested} (the daemon downloads the IEEE MA-L listing, checks it and swaps the table in; ip.arp.vendors.print says how it went)",
+        can_update, vendors_update),
     cmd!(query "ip.arp.settings.print", "ARP Settings", [], None,
         "{} → {interfaces: [{interface, arp (enabled | disabled | reply-only | proxy-arp | local-proxy-arp), arp_timeout (auto | seconds), entries, reachable, stale, unresolved, static}], kernel: {ipv4: {gc_thresh1, gc_thresh2, gc_thresh3, entries, configured}, ipv6: {…}}, near_full, suggest}",
         always, settings_print),
@@ -118,6 +124,30 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         settings_set
     ),
 ];
+
+fn can_update(s: &Session) -> std::result::Result<(), String> {
+    if s.ext::<crate::vendors::Vendors>().is_some_and(|v| v.updater) {
+        Ok(())
+    } else {
+        Err("only the daemon downloads (this build has no network: the in-browser lab, corerouter-cli run)".into())
+    }
+}
+
+fn vendors_print(s: &mut Session, _p: &Value) -> Result<Value> {
+    Ok(s.ext_mut::<crate::vendors::Vendors>()
+        .map_or(Value::Null, |v| v.status()))
+}
+
+fn vendors_update(s: &mut Session, _p: &Value) -> Result<Value> {
+    let v = s
+        .ext_mut::<crate::vendors::Vendors>()
+        .ok_or_else(|| EngineError::Hal("no room for the vendor table".into()))?;
+    if v.update.running {
+        return Err(EngineError::bad("update", "an update is already running"));
+    }
+    v.update.requested = true;
+    Ok(json!({"requested": true}))
+}
 
 fn has_static(s: &Session) -> std::result::Result<(), String> {
     if s.store().candidate().ip.arp.entries.is_empty() {
@@ -203,7 +233,7 @@ impl View<'_> {
         self.entry.map(|e| e.mac.0).or_else(|| self.row.and_then(Row::mac))
     }
 
-    fn matches(&self, q: &Search) -> bool {
+    fn matches(&self, q: &Search, vendors: Option<&crate::vendors::Vendors>) -> bool {
         match q {
             Search::Any => true,
             Search::Address(a) => self.address == *a,
@@ -222,6 +252,12 @@ impl View<'_> {
                     || (addr_like && self.address.to_string().contains(t.as_str()))
                     || (addr_like
                         && self.mac().is_some_and(|m| contains_ci(&mac_text(m), t)))
+                    || (!addr_like
+                        && t.len() >= 3
+                        && self
+                            .mac()
+                            .and_then(|m| crate::vendors::vendor_of(vendors, m))
+                            .is_some_and(|name| contains_ci(&name, t)))
             }
         }
     }
@@ -386,7 +422,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
                 .is_none_or(|w| v.state().is_some_and(|st| w.contains(&st)))
         })
         .filter(|v| source.is_none_or(|x| x == v.source()))
-        .filter(|v| v.matches(&q))
+        .filter(|v| v.matches(&q, s.ext::<crate::vendors::Vendors>()))
         .collect();
     let matched = hits.len();
     let start = usize::try_from(offset).unwrap_or(usize::MAX).min(matched);
@@ -404,7 +440,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
         .get(start..)
         .unwrap_or_default()
         .iter()
-        .map(|v| row(v, &cfg, now))
+        .map(|v| row(v, &cfg, now, s.ext::<crate::vendors::Vendors>()))
         .collect();
 
     let (n4, n6) = t.rows().iter().fold((0u64, 0u64), |(a, b), r| {
@@ -438,7 +474,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
     }))
 }
 
-fn row(v: &View<'_>, cfg: &Config, now: u64) -> Value {
+fn row(v: &View<'_>, cfg: &Config, now: u64, vendors: Option<&crate::vendors::Vendors>) -> Value {
     let e = v.entry;
     let invalid = e.is_some_and(|e| !cfg.interfaces.contains_key(&e.interface));
     let disabled = e.is_some_and(|e| e.disabled);
@@ -478,7 +514,7 @@ fn row(v: &View<'_>, cfg: &Config, now: u64) -> Value {
         "comment": e.map(|e| e.comment.as_str()).unwrap_or_default(),
         "last_seen_secs": seen.map(|s| now.saturating_sub(s)),
         "mac_since": v.row.map(|r| r.mac_since).filter(|s| *s > 0),
-        "vendor": Value::Null,
+        "vendor": v.mac().and_then(|m| crate::vendors::vendor_of(vendors, m)),
         "host": Value::Null,
     })
 }
@@ -1173,7 +1209,7 @@ fn detail(s: &mut Session, p: &Value) -> Result<Value> {
         IpAddr::V6(_) => None,
     };
     Ok(json!({
-        "row": row(&view, &cfg, now),
+        "row": row(&view, &cfg, now, s.ext::<crate::vendors::Vendors>()),
         "history": history,
         "routes": routes,
         "subnet": subnet,

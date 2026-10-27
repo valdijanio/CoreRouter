@@ -533,3 +533,69 @@ fn the_detail_shows_routes_through_the_neighbor() {
             .contains("not in the neighbor table")
     );
 }
+
+#[test]
+fn vendors_come_from_the_ieee_table_and_a_download_wins() {
+    let mut s = lab();
+    // Lab hosts on a VMware OUI (00:50:56) show the vendor; locally
+    // administered ones (02:…) have none.
+    let all = list(&mut s, json!({}));
+    let rows = all["rows"].as_array().unwrap();
+    let vm = rows
+        .iter()
+        .find(|r| r["mac_address"].as_str().unwrap().starts_with("00:50:56"))
+        .unwrap();
+    assert_eq!(vm["vendor"], "VMware, Inc.", "{vm}");
+    let local = rows
+        .iter()
+        .find(|r| {
+            r["mac_address"]
+                .as_str()
+                .is_some_and(|m| m.starts_with("02:"))
+        })
+        .unwrap();
+    assert_eq!(local["vendor"], Value::Null);
+    // Search by vendor name.
+    let found = list(&mut s, json!({"search": "vmware"}));
+    assert!(found["matched"].as_u64().unwrap() > 0);
+    assert!(
+        found["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["vendor"] == "VMware, Inc.")
+    );
+    // The built-in table, and no download without the daemon.
+    let st = run(&mut s, "ip.arp.vendors.print", json!({}));
+    assert_eq!(
+        (&st["source"], &st["date"]),
+        (&json!("built-in"), &json!("2026-10-27")),
+        "{st}"
+    );
+    assert!(st["entries"].as_u64().unwrap() > 40_000);
+    assert!(fails(&mut s, "ip.arp.vendors.update", json!({})).contains("only the daemon"));
+    // With an updater: asked, taken, installed; the new table wins.
+    s.vendors_updater(true);
+    run(&mut s, "ip.arp.vendors.update", json!({}));
+    assert!(s.vendors_take_request(), "the daemon takes the request");
+    assert!(!s.vendors_take_request(), "once");
+    assert!(fails(&mut s, "ip.arp.vendors.update", json!({})).contains("already running"));
+    let entries = vec![(0x00_5056, "Renamed VMware".to_owned())];
+    let table = corerouter_model::oui::build(&entries, "2027-01-01", [1; 32], 99);
+    s.vendors_install(table).unwrap();
+    let st = run(&mut s, "ip.arp.vendors.print", json!({}));
+    assert_eq!(
+        (&st["source"], &st["date"], &st["entries"]),
+        (&json!("downloaded"), &json!("2027-01-01"), &json!(1))
+    );
+    let vm = list(&mut s, json!({"search": "00:50:56"}))["rows"][0].clone();
+    assert_eq!(vm["vendor"], "Renamed VMware");
+    // A broken table is refused and the one in use stays.
+    assert!(s.vendors_install(b"junk".to_vec()).is_err());
+    s.vendors_failed("timeout".into());
+    let st = run(&mut s, "ip.arp.vendors.print", json!({}));
+    assert_eq!(
+        (&st["source"], &st["update"]["error"]),
+        (&json!("downloaded"), &json!("timeout"))
+    );
+}

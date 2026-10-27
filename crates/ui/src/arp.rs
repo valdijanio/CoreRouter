@@ -234,6 +234,8 @@ pub(crate) struct ArpPanel {
     /// The window being drawn now.
     cur: &'static str,
     pub(crate) settings: Option<Value>,
+    /// `ip.arp.vendors.print`: the vendor table in use.
+    pub(crate) vendors: Option<Value>,
     settings_table: TableState,
     /// The settings being edited, by interface: (arp, timeout).
     pub(crate) edits: BTreeMap<String, (String, String)>,
@@ -940,6 +942,48 @@ impl ArpPanel {
                 open_window(app, Win::Panel("tuning"));
             }
         });
+        self.vendors_row(app, ui, l);
+    }
+
+    /// The vendor table in use (built-in or downloaded, its date) and the
+    /// button that asks the router to download the IEEE listing again.
+    fn vendors_row(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
+        let Some(v) = self.vendors.clone() else { return };
+        ui.separator();
+        let vis = ui.visuals().clone();
+        ui.horizontal_wrapped(|ui| {
+            ui.strong(tr_in(SCOPE, l, "Vendors"));
+            self.info(ui, "arp.vendors", tr_in(SCOPE, l, "Vendors"));
+            let source = s(&v, "source");
+            let tone = if source == "downloaded" { chip::GREEN.tone(&vis) } else { chip::neutral_tone(&vis) };
+            chip::chip(ui, &source, tone);
+            ui.label(format!(
+                "{} {}  ·  {} OUI",
+                tr_in(SCOPE, l, "table of"),
+                s(&v, "date"),
+                s(&v, "entries")
+            ))
+            .on_hover_text(format!("IEEE MA-L, oui.csv sha256 {}", s(&v, "sha256")));
+            let up = v.get("update").cloned().unwrap_or(Value::Null);
+            let busy = s(&up, "running") == "true" || s(&up, "requested") == "true";
+            let can = app.can().check("ip.arp.vendors.update");
+            let why = can.clone().err().unwrap_or_default();
+            if ui
+                .add_enabled(can.is_ok() && !busy, egui::Button::new(tr_in(SCOPE, l, "Update vendors")))
+                .on_hover_text(tr_in(SCOPE, l, "Download the IEEE listing now (standards-oui.ieee.org); the downloaded table wins over the built-in one"))
+                .on_disabled_hover_text(why)
+                .clicked()
+            {
+                app.run("ip.arp.vendors.update", json!({}));
+            }
+            if busy {
+                ui.spinner();
+                ui.weak(tr_in(SCOPE, l, "downloading…"));
+            }
+            if let Some(e) = up.get("error").and_then(Value::as_str) {
+                chip::chip(ui, tr_in(SCOPE, l, "update failed"), chip::RED.tone(&vis)).on_hover_text(e);
+            }
+        });
     }
 
     fn confirm_dialog(&mut self, app: &mut CoreRouterUi, ctx: &egui::Context, area: egui::Rect) {
@@ -1040,6 +1084,9 @@ impl PanelState for ArpPanel {
                 Tab::Nd => Query { key: "v6", command: "ipv6.neighbor.list", params: self.v6.params() },
                 Tab::Settings => Query { key: "settings", command: "ip.arp.settings.print", params: json!({}) },
             });
+            if self.tab == Tab::Settings && app.has_command("ip.arp.vendors.print") {
+                out.push(Query { key: "vendors", command: "ip.arp.vendors.print", params: json!({}) });
+            }
         }
         if open6 {
             out.push(Query { key: "v6w", command: "ipv6.neighbor.list", params: self.v6w.params() });
@@ -1059,6 +1106,7 @@ impl PanelState for ArpPanel {
             "v6" => self.v6.page = Some(value),
             "v6w" => self.v6w.page = Some(value),
             "settings" => self.settings = Some(value),
+            "vendors" => self.vendors = Some(value),
             "detail" => self.detail = value.is_object().then_some(value),
             "ping" => {
                 if value.get("done").and_then(Value::as_bool).unwrap_or(false) {

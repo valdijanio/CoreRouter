@@ -1200,6 +1200,7 @@ dependencies = [
  "rustix 1.1.5",
  "rustls",
  "serde_json",
+ "sha2 0.11.1",
  "signal-hook",
  "socket2",
  "webpki-roots",
@@ -1379,6 +1380,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "thiserror 2.0.21",
 ]
 

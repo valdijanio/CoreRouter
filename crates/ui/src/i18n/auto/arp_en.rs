@@ -126,6 +126,10 @@ Neighbors of the interface incomplete or failed: nobody answered.",
         "arp.vendor",
         "## Vendor
 
-The card's maker from the MAC's first three bytes (IEEE OUI). Empty until the IEEE table's licence is decided.",
+The card's maker from the MAC's first three bytes (IEEE OUI). Built in; Settings › Update vendors downloads a newer one.",
+    ),
+    (
+        "arp.vendors",
+        "## Vendors\n\nThe table naming the maker from a MAC's first three bytes: the IEEE MA-L public listing. One is built in (with its date); Update vendors downloads the current one, which wins and survives a restart. Source and terms: `docs/third-party.md`.",
     ),
 ];

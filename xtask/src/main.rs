@@ -7,6 +7,7 @@ mod changes;
 mod ebpf;
 mod layers;
 mod os;
+mod oui;
 mod vm_lab;
 mod vm_tools;
 
@@ -125,6 +126,17 @@ fn main() -> ExitCode {
                 Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
                 Outcome::Fail(why) => {
                     eprintln!("FAIL vm-lab: {why}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        // G1.27d: the built-in vendor table from the IEEE listing.
+        "oui" => {
+            let rest: Vec<String> = std::env::args().skip(2).collect();
+            return match oui::main(&root, &rest) {
+                Outcome::Ok | Outcome::Skip(_) => ExitCode::SUCCESS,
+                Outcome::Fail(why) => {
+                    eprintln!("FAIL oui: {why}");
                     ExitCode::FAILURE
                 }
             };

@@ -18,6 +18,8 @@ corerouter-cgnat-map.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+# G1.27d: the example that builds the vendor table hashes its source.
+sha2 = { version = "0.11.0", default-features = false }
 criterion.workspace = true
 
 [[bench]]

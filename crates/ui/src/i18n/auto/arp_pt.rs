@@ -10,6 +10,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Addresses", "Endereços"),
     ("Apply", "Aplicar"),
     ("Confirm", "Confirmar"),
+    ("Download the IEEE listing now (standards-oui.ieee.org); the downloaded table wins over the built-in one", "Baixar a lista do IEEE agora (standards-oui.ieee.org); a tabela baixada vale mais que a embutida"),
     ("Entries", "Entradas"),
     ("Entries the kernel holds and its ceiling", "Entradas que o kernel guarda e o teto"),
     ("Flush", "Flush"),
@@ -43,8 +44,11 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("The router answers ARP for addresses it routes elsewhere (RFC 1027), which can pull traffic of the whole segment.", "O roteador responde ARP por endereços que roteia para outro lado (RFC 1027), o que pode puxar tráfego do segmento inteiro."),
     ("Torch", "Torch"),
     ("Unresolved", "Sem resposta"),
+    ("Update vendors", "Atualizar fabricantes"),
     ("Vendor", "Fabricante"),
+    ("Vendors", "Fabricantes"),
     ("ago", "atrás"),
+    ("downloading…", "baixando…"),
     ("dynamic", "dinâmicas"),
     ("events lost: read again", "eventos perdidos: lido de novo"),
     ("kernel table", "tabela do kernel"),
@@ -54,6 +58,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("none", "nenhuma"),
     ("same MAC since the router started watching", "mesmo MAC desde que o roteador começou a observar"),
     ("static", "estáticas"),
+    ("table of", "tabela de"),
+    ("update failed", "falha ao atualizar"),
 ];
 
 /// Explanations: (key, Markdown).
@@ -218,6 +224,10 @@ Quantos vizinhos da interface estão `incomplete` ou `failed`: o roteador pergun
         "arp.vendor",
         "## Vendor
 
-O fabricante da placa, pelos três primeiros bytes do MAC (OUI do IEEE). Aguarda a decisão sobre a licença da tabela do IEEE; até lá fica vazio. MACs aleatórios (privacidade em Wi-Fi, VMs) não têm fabricante.",
+O fabricante da placa, pelos três primeiros bytes do MAC (OUI do IEEE). A tabela vem embutida e pode ser atualizada em Settings › Update vendors. MACs aleatórios (privacidade em Wi-Fi, VMs) não têm fabricante.",
+    ),
+    (
+        "arp.vendors",
+        "## Vendors (fabricantes)\n\nA tabela que dá o fabricante pelos três primeiros bytes do MAC: a lista pública MA-L do IEEE (`oui.csv`). Vem uma embutida no programa, com a data em que foi lida; **Update vendors** pede ao roteador que baixe a lista atual de standards-oui.ieee.org (TLS conferido, tamanho limitado), confira e troque a tabela de uma vez. A baixada vale mais que a embutida e sobrevive a um reinício.\n\nMACs aleatórios (privacidade em Wi-Fi, VMs) e blocos que o dono pagou para esconder não têm fabricante. Fonte e termos: `docs/third-party.md`.",
     ),
 ];
