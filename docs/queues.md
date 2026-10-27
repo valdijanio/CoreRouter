@@ -14,6 +14,7 @@ genérico de filas.
 | Shaper de descida (EDT) e policer de subida sem corrida entre CPUs | `dataplane-ebpf(-common)`, `hal-linux` | G4.9b, G4.3cc |
 | Entrega pelo kernel ao assinante (`bng0`) | `dataplane-ebpf`, `hal-linux`, daemon | G4.3ca |
 | Janela Queues, campos do perfil PPP, colunas em Active Connections | `crates/ui` | G4.9c |
+| Janela "Queue <nome>" (Traffic, Statistics, History), `queue.simple.stats`, histórico por fila | `engine/src/queue_live.rs`, `ui/src/queue_view.rs` | G4.9g |
 
 ## Como usar
 
@@ -159,6 +160,93 @@ A fila longa a 10k/20k não é defeito: um pacote de 1000 B leva 0,4 s a 20 kbit
 O laboratório achou a correção de #260: no modo padrão a descida saía sem limite (2× o plano),
 porque o bit `ON_SESSIONS` só era escrito com o plano, antes das sessões.
 
+## Uma fila ao vivo e o seu histórico (G4.9g)
+
+Duplo clique numa fila da janela Queues (fixa, PPPoE, IPoE, lease ou rede do DHCP, PCQ) abre
+**"Queue <nome>"** com as abas do WinBox:
+
+- **General / Advanced**: o formulário de edição de uma fila fixa (os campos de sempre, em duas
+  abas; **Keep History** em Advanced); numa fila dinâmica, os valores só para leitura.
+- **Traffic**: download e upload a cada 1 s nos últimos 1, 5 ou 15 min, com o max-limit de cada
+  lado tracejado; cartões com a taxa (% do limite), o atraso na fila (agora e p95 de 5 min) e
+  descartes/s, com o selo **at limit** depois de 10 s seguidos acima de 95% do max-limit; pausa,
+  CSV da janela e atalhos para o Torch e o Sniffer com o endereço do alvo.
+- **Statistics**: por sentido, taxa, pacotes/s, bytes, pacotes, descartes (com a fração), espera
+  agora e p95, tempo no limite, estado da rajada (pronta, em rajada com o tempo restante,
+  esgotada) e a média contra o limiar; numa fila PCQ, os endereços ativos.
+- **History**: hora, dia e semana do histórico (`system.graph.query` de `queue:<nome>`), com o p95.
+
+Na lista, a coluna Rate ganha o selo **near limit** (ícone de medidor) quando um sentido está a 90%
+do max-limit ou mais (`near_limit` em `queue.simple.list`), e o rodapé conta quantas.
+
+```sh
+C="corerouter-cli --connect 127.0.0.1:7979 run"
+$C queue.simple.stats '{"id":"camera"}'            # uma fila: contadores, rajada, p95, no limite
+$C queue.simple.graph '{"id":"<pppoe-ana>","graph":true}'   # guardar o histórico de uma dinâmica
+$C system.graph.set '{"dynamic_queues":true}'      # ou de todas as dinâmicas (custa memória)
+$C system.graph.query '{"series":"queue:camera","range":"day"}'
+```
+
+- **`queue.simple.stats`** acha uma fila e os seus contadores sem resolver o plano: o índice de
+  nomes da lista (ou o id), o mapa de contadores por chave que o serviço `queue` enche a cada
+  segundo e, numa sessão, o backend pelo id (`PppBackend::session`, O(1) no daemon). O que pede
+  duas leituras (pacotes e descartes por segundo, média da rajada, tempo no limite, p95 da espera)
+  vem de um anel de até 15 min **só das filas que alguém olha** (`QueueWatch`): cada chamada é uma
+  amostra (no máximo uma por segundo), e uma fila sem chamada há 30 s sai; no máximo 64 ao mesmo
+  tempo (a 65ª recebe "busy").
+- **Rajada**: como no RouterOS, liberada enquanto a média no `burst-time` estiver abaixo do
+  `burst-threshold` (0 = o max-limit). A média e o tempo restante — (limiar − média) × janela /
+  (taxa − média) — são **estimados** das leituras de 1 s; o relógio exato fica no plano de dados
+  (G4.9h).
+- **Histórico**: uma série `queue:<nome>` (upload e download em bits/s, descartes/s, atraso da
+  descida em ms) no `/tool graphing`, com as mesmas resoluções das interfaces. Guardam histórico
+  as filas fixas com `graph` (padrão sim), as dinâmicas marcadas por nome (`queue_include`; o
+  assinante que reconecta continua na mesma série) e todas as dinâmicas com `dynamic_queues`;
+  `queues: false` desliga todas. O teto de memória dos gráficos vale para tudo: o que não cabe
+  fica de fora, com uma linha no log e a contagem em `system.graph.print` (`refused_queues`).
+- **No laboratório virtual** o shaper é simulado (`hal::queue::lab`): conta como se cada fila
+  levasse tráfego (40–110% do max-limit, um ciclo de 2 min, rajada no começo de cada ciclo),
+  para a janela e o histórico se mexerem; nada é moldado e a lista diz isso.
+
+### Medido (G4.9g)
+
+Notebook de desenvolvimento, build `bench` (release), 2026-10-26 (`cargo bench -p corerouter-engine
+--bench queue_live`, `cargo bench -p corerouter-ui --bench frames`):
+
+| | 10 000 filas | 100 000 filas |
+|---|---:|---:|
+| `queue.simple.stats` (a cada segundo, fila já resolvida) | 2,2 µs | 2,2 µs |
+| primeira chamada (acha a fila) | 3,6 µs | 3,7 µs |
+| primeira chamada depois de um `move` (ids fora de ordem) | 3,8 µs | 3,8 µs |
+
+Histórico: **438 KiB por fila** (448 728 bytes, um ano de 4 valores); 10 000 filas marcadas
+seriam **4,18 GiB**, acima do teto máximo (4 GiB) e do limite de 4096 séries: cabem 4087. Com o
+teto padrão (64 MiB) cabem 136 filas. Um segundo de histórico (serviço `queue`, sob o lock da
+sessão): 
+
+| filas fixas (guardadas) | teto | antes | depois |
+|---|---|---:|---:|
+| 1 000 (1 000) | 4096 MiB | 387 µs | 105 µs |
+| 4 000 (4 000) | 4096 MiB | 2,29 ms | 0,75 ms |
+| 10 000 (136, 9 864 recusadas) | 64 MiB (padrão) | 1,83 ms | 0,41 ms |
+| 10 000 (4 087, 5 913 recusadas) | 4096 MiB | 4,16 ms | 1,25 ms |
+
+"Antes" é a primeira versão desta mesma parte, que alocava por fila a cada segundo (o conjunto
+de nomes recusados, as chaves clonadas, um mapa de descartes); "depois", sem alocar por fila
+(−68% a −77%).
+
+Um quadro da UI (1400×900, `cargo bench -p corerouter-ui --bench frames`):
+
+| | antes | depois |
+|---|---:|---:|
+| janela Queues sozinha | — | 0,10 ms |
+| + "Queue <nome>" em Traffic (900 pontos, 15 min) | 2,21 ms | 0,20 ms |
+| + "Queue <nome>" em Statistics | 2,17 ms | 0,18 ms |
+
+O "antes" era o modal de lista montando o texto dos comandos (o registro inteiro) a cada quadro,
+mesmo numa aba que não o mostra; nas abas ao vivo ele não é mais montado (−91%). As abas de
+formulário (General/Advanced) continuam pagando ~2 ms por quadro, como todo modal de edição hoje.
+
 ## Pesquisa
 
 Fontes abertas em 2026-10-26.
@@ -220,6 +308,28 @@ Melhorias sobre o MikroTik:
 
 Fica de fora (gaps): a hierarquia `parent`/`limit-at`/`priority` (G4.9e), `packet-marks` e `time`
 (dependem do mangle e do agendador), `dst` (fila só para um destino), tipos `red`/`sfq`/`codel`.
+
+### Uma fila ao vivo (G4.9g)
+
+- **RouterOS v7** ([Queues](https://help.mikrotik.com/docs/spaces/ROS/pages/328088/Queues),
+  [Graphing](https://help.mikrotik.com/docs/spaces/ROS/pages/22773810/Graphing)): a janela de uma
+  simple queue tem General, Advanced, Statistics (rate, packet rate, bytes, packets, dropped,
+  queued bytes/packets por sentido) e Traffic (gráfico ao vivo); o histórico é do
+  `/tool graphing queue add simple-queue=… store-on-disk=…`, uma regra por fila. A rajada:
+  liberada enquanto a média no `burst-time` (medida em 16 fatias) estiver abaixo do
+  `burst-threshold`. O WinBox não mostra o estado da rajada nem a espera na fila.
+- **Outros:** pfSense/OPNsense (Status › Queues: pps, banda, descartes, tamanho da fila por fila
+  ALTQ, ao vivo, sem histórico); Juniper (`show class-of-service interface … queue` com
+  tail-drops e taxas por fila); Linux `tc -s qdisc` e o CAKE (backlog, drops e atraso de pico,
+  médio e "sparse" por tin); UniFi (gráfico de tráfego por cliente). Ninguém junta o ao vivo de
+  uma fila, a rajada e o histórico de assinante numa tela, nem trata o custo do histórico de
+  10 mil filas.
+- **Normas:** RFC 2697/2698 (balde de fichas, base do policer e da rajada), RFC 8289 (CoDel: o
+  alvo de 5 ms que torna a espera na fila o número a olhar).
+- **Adotado:** as abas e os contadores do WinBox; histórico opt-in por fila (fixas sim,
+  dinâmicas não, marcação por nome); a consulta de uma fila só a 1 Hz com a janela aberta.
+  **Melhorias:** estado e tempo restante da rajada, espera e p95, "no limite" sustentado, selo
+  "near limit" na lista, atalhos Torch/Sniffer, CSV.
 
 ## Extras e riscos
 

@@ -149,6 +149,65 @@ impl Frames {
         me
     }
 
+    /// The "Queue <name>" modal (G4.9g) open on Traffic (`traffic`, the
+    /// 15-minute window full: 900 points) or Statistics, over the Queues
+    /// window, with the lab's simulated counters; `None`: the window alone.
+    pub fn queue_view(traffic: Option<bool>) -> Self {
+        use crate::queue_view::{Page, Point};
+        let mut s = Session::virtual_lab();
+        let _ = s.execute(
+            "queue.simple.add",
+            &json!({"name": "cliente", "target": "10.0.0.5", "max_limit": "10M/50M", "burst_limit": "20M/80M"}),
+        );
+        for t in 0..3 {
+            s.tick(1_800_000_000 + t);
+            s.queue_sync();
+        }
+        let mut me = Self::with(s, Some(Win::Panel(crate::queues::WIN)));
+        me.app.cache.refreshed_at = None;
+        me.time += 2.0;
+        me.frame();
+        me.frame();
+        if let Some(traffic) = traffic
+            && let Some(p) = me.app.panel_mut::<crate::queues::QueuesPanel>()
+        {
+            let row = p
+                .simple
+                .get("rows")
+                .and_then(|r| r.get(0))
+                .cloned()
+                .unwrap_or_default();
+            let mut panel = std::mem::take(p);
+            panel.open_view(&mut me.app, &row);
+            if let Some(v) = panel.view.as_mut() {
+                v.page = if traffic {
+                    Page::Traffic
+                } else {
+                    Page::Statistics
+                };
+                v.live.window = 900;
+                for t in 0..900u64 {
+                    let wave = (t % 120) as f64 / 120.0;
+                    v.live.ring.push_back(Point {
+                        t: 1_800_000_000 + t,
+                        up: 8e6 * wave,
+                        down: 45e6 * wave,
+                        delay: 3.0,
+                        drops: 1.0,
+                    });
+                }
+            }
+            if let Some(p) = me.app.panel_mut::<crate::queues::QueuesPanel>() {
+                *p = panel;
+            }
+        }
+        me.app.cache.refreshed_at = None;
+        me.time += 2.0;
+        me.frame();
+        me.frame();
+        me
+    }
+
     /// Draw one frame of a 1400×900 screen.
     pub fn frame(&mut self) {
         let raw = egui::RawInput {

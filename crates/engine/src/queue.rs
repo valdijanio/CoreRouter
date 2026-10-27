@@ -145,6 +145,9 @@ pub struct Queue {
     pub comment: String,
     /// Type names as written (the row shows them).
     pub queue_names: TypeNames,
+    /// A fixed queue's own `graph` (G4.9g); `false` for a dynamic one
+    /// (graphing's `queue_include` marks those).
+    pub graph: bool,
 }
 
 impl Queue {
@@ -152,7 +155,7 @@ impl Queue {
         if download { &self.download } else { &self.upload }
     }
 
-    fn fixed(q: &SimpleQueue, types: &Queues) -> Self {
+    pub(crate) fn fixed(q: &SimpleQueue, types: &Queues) -> Self {
         Self {
             key: q.id.to_string(),
             name: q.name.clone(),
@@ -164,6 +167,7 @@ impl Queue {
             download_mode: DownloadMode::Shaper,
             comment: q.comment.clone(),
             queue_names: q.queue.clone(),
+            graph: q.graph,
         }
     }
 
@@ -197,6 +201,7 @@ impl Queue {
             download_mode,
             comment: String::new(),
             queue_names: TypeNames::both(&qt.name),
+            graph: false,
         })
     }
 }
@@ -661,6 +666,13 @@ pub struct ShaperRuntime {
     from: Option<(u32, Vec<Queue>)>,
 }
 
+impl ShaperRuntime {
+    /// The DHCP queues of the last round.
+    pub(crate) fn dhcp_queues(&self) -> &[Queue] {
+        self.from.as_ref().map_or(&[], |f| f.1.as_slice())
+    }
+}
+
 impl Session {
     /// One round of the `queue` service: the plan of the running config
     /// and the DHCP leases to the data plane (only when it changed), then
@@ -697,6 +709,8 @@ impl Session {
             st.running = status.unavailable.is_none() && error.is_none();
             st.note = error.or(status.unavailable);
         }
+        // The queues' history from the counters just read (G4.9g).
+        self.queue_graph_sample();
         changed
     }
 }
