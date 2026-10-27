@@ -86,6 +86,10 @@ name = "netns_capture"
 harness = false
 
 [[bench]]
+name = "netns_neigh"
+harness = false
+
+[[bench]]
 name = "resource"
 harness = false
 

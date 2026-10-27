@@ -164,6 +164,9 @@ mod cpu_tuning;
 #[cfg(target_os = "linux")]
 pub mod oslog;
 
+/// Neighbor tables over rtnetlink (G1.27d): dump, events, static entries.
+pub mod neigh;
+
 /// IP › Firewall › XDP (G2.5a): the XDP filter's loader, maps and counters.
 #[cfg(target_os = "linux")]
 pub mod xdp;
@@ -223,6 +226,8 @@ mod linux {
         fastpath: corerouter_hal::fastpath::FastPathState,
         /// The XDP filter (G2.5a); nothing loaded until configured.
         xdp: crate::xdp::XdpState,
+        /// Static ARP entries and ARP modes applied (G1.27d).
+        neigh: crate::neigh::Applied,
     }
 
     impl LinuxHal {
@@ -656,7 +661,48 @@ mod linux {
                 }
                 return Err(e);
             }
+            if from.ip.arp != to.ip.arp || from.interfaces != to.interfaces {
+                let managed: std::collections::BTreeSet<IfName> = self
+                    .managed_indexes()
+                    .map(|m| m.into_values().collect())
+                    .unwrap_or_default();
+                if let Err(e) = self.neigh.sync(to, &|n| managed.contains(n)) {
+                    if let Err(back) = self.xdp.sync(from) {
+                        log::error!("restoring the previous XDP filter: {back}");
+                    }
+                    if let Err(back) = self.apply_links(to, from) {
+                        log::error!(
+                            "restoring the rest after the ARP entries were refused: {back}"
+                        );
+                    }
+                    return Err(e);
+                }
+            }
             Ok(())
+        }
+
+        fn neighbors(&mut self) -> Result<Vec<corerouter_hal::neigh::Neighbor>, HalError> {
+            crate::neigh::neighbors()
+        }
+
+        fn neighbor_feed(
+            &mut self,
+        ) -> Result<Box<dyn corerouter_hal::neigh::NeighborFeed>, HalError> {
+            Ok(Box::new(crate::neigh::Feed::open()?))
+        }
+
+        fn neighbor_remove(
+            &mut self,
+            items: &[(IfName, std::net::IpAddr)],
+        ) -> Result<usize, HalError> {
+            crate::neigh::remove(items)
+        }
+
+        fn arp_pinger(
+            &mut self,
+            name: &IfName,
+        ) -> Result<Box<dyn corerouter_hal::neigh::ArpPinger>, HalError> {
+            Ok(Box::new(crate::neigh::Pinger::open(name)?))
         }
 
         fn xdp_status(&mut self, top: usize) -> Result<corerouter_hal::xdp::XdpStatus, HalError> {

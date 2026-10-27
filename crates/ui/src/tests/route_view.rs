@@ -319,3 +319,16 @@ fn the_prefix_search_asks_the_router() {
     assert!(crate::routes::valid_prefix("2001:db8::/32"));
     assert!(crate::routes::valid_prefix(" 8.8.8.8 "));
 }
+
+#[test]
+fn a_gateway_that_does_not_resolve_shows_an_amber_incomplete_chip() {
+    // G1.27d: routed, but nothing answers ARP/ND for the gateway.
+    let r = route(json!({"key": "*9", "id": "*9", "dst_address": "192.0.2.0/24",
+        "gateway": "10.0.0.77", "gateway_address": "10.0.0.77", "gateway_status": "incomplete",
+        "interface": "ether1", "distance": 1, "routing_table": "main", "state": "active",
+        "active": true, "origin": "static"}));
+    let cell = r.gateway_cell();
+    let (text, chips) = crate::chip::split(&cell);
+    assert_eq!(text, "10.0.0.77");
+    assert!(chips.contains(&(crate::chip::Kind::Amber, "incomplete")), "{chips:?}");
+}

@@ -78,6 +78,8 @@ pub struct VirtualHal {
     oslog: crate::oslog::LabOsLog,
     /// The simulated shaper's counters (G4.9g).
     shaper: crate::queue::lab::LabShaper,
+    /// The lab's neighbor tables (G1.27d).
+    neigh: crate::lab_neigh::LabNeigh,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -175,6 +177,7 @@ impl VirtualHal {
             exhausted_polls: 0,
             kernel: Arc::new(Mutex::new(kernel)),
             oslog: crate::oslog::LabOsLog::default(),
+            neigh: crate::lab_neigh::LabNeigh::default(),
             shaper: crate::queue::lab::LabShaper::default(),
         }
     }
@@ -637,9 +640,29 @@ impl Hal for VirtualHal {
             }
         }
         self.carry(from, to);
+        self.neigh.sync(to);
         self.applied = to.clone();
         self.applies = self.applies.saturating_add(1);
         Ok(())
+    }
+
+    fn neighbors(&mut self) -> Result<Vec<crate::neigh::Neighbor>, HalError> {
+        Ok(self.neigh.snapshot())
+    }
+
+    fn neighbor_feed(&mut self) -> Result<Box<dyn crate::neigh::NeighborFeed>, HalError> {
+        Ok(self.neigh.feed())
+    }
+
+    fn neighbor_remove(&mut self, items: &[(IfName, std::net::IpAddr)]) -> Result<usize, HalError> {
+        Ok(self.neigh.remove(items))
+    }
+
+    fn arp_pinger(&mut self, name: &IfName) -> Result<Box<dyn crate::neigh::ArpPinger>, HalError> {
+        if !self.applied.interfaces.contains_key(name) {
+            return Err(self.missing(name));
+        }
+        Ok(self.neigh.pinger(name))
     }
 
     /// A made-up server (G1.26): 16 CPUs in two NUMA nodes, 32 GiB.
