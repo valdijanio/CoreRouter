@@ -5743,3 +5743,37 @@ continuação indentadas).
 - 2026-10-27 — G3.3: Estado BGP: fechado pelas partes que já entraram. `routing.bgp.session.list` e a aba Sessions
   vieram na G3.2a; `routing.bgp.route.list` (recebidas e anunciadas, paginadas, com busca) e
   `routing.bgp.session.history` (quedas por sessão), na G3.2c.
+
+- 2026-10-27 — G3.2b: Políticas BGP no modelo do `/routing filter` do RouterOS v7 (`docs/bgp-policy.md`):
+
+  - **Modelo e comandos:** `routing.filter.rule.{add,set,remove,move,list,check}` (chain + texto da
+    regra: `if (dst in bogons || dst-len > 24) { reject } set bgp-local-pref 150; accept`),
+    `routing.filter.prefix-list.*` (formato `10.0.0.0/8 le 24`), `routing.filter.community-list.*`
+    (RFC 1997 e RFC 8092 na mesma lista), `routing.filter.status`, `routing.filter.preview`,
+    `routing.filter.impact`. Conexões e templates BGP ganham `input_filter`, `output_filter` e
+    `keep_received` (`soft-reconfiguration inbound`, padrão sim).
+  - **Linguagem:** matchers `dst`, `dst-len`, `afi`, `protocol`, `bgp-as-path` (regex do FRR),
+    `bgp-communities`/`bgp-large-communities` (`includes`, `any`, `equal`, `-list`); `&&`, `||`,
+    `not`, parênteses, `else if`; ações `accept`, `reject`, `return`, `jump`, `set bgp-local-pref`,
+    `set bgp-med`, `set bgp-path-prepend`, `set|append|delete bgp-communities` (e large). Ação
+    padrão reject (RouterOS). Erro com a coluna e "did you mean"; laço de `jump` recusado.
+  - **FRR:** cada chain vira `route-map CR-<chain>` com testes `on-match goto` só para a frente,
+    `jump` expandido e fim `deny 65535`; listas com nome pelo conteúdo (`CR-P-<hash>`); só contextos
+    `CR-` são do CoreRouter. Forma canônica conferida no FRR 10.7.1 (segundo sync vazio).
+  - **Prévia e impacto:** a chain pendente contra a em vigor nas mesmas rotas; no lab, 5 000 rotas
+    de amostra reproduzível por conexão; com o FRR, as rotas recebidas (antes da política) ou as
+    melhores (saída), lidas fora do lock pela thread do FRR do daemon. "this change withdraws N
+    prefixes announced to AS X" por conexão e direção.
+  - **RFC 8212:** eBGP sem chain não aceita nem envia (FRR `ebgp-requires-policy`); aviso na janela,
+    no modal da conexão e em `routing.filter.status`.
+  - **Janela Routing › Filters:** abas Rules (selos da chain por hash, condições, ações verde/
+    vermelho/azul, ▲▼, Preview), Prefix Lists, Community Lists e Preview; aviso RFC 8212 e impacto do
+    commit em cima; página Filters no modal da conexão BGP; ⓘ em inglês e português.
+
+  Como testar: `cargo test -p corerouter-proto-bgp` (parser, avaliador, render, proptest de
+  equivalência), `cargo test -p corerouter-engine --lib routing_filter`, `cargo test -p
+  corerouter-ui --lib tests::routing_filter`; com FRR real na VM: `cargo xtask vm-lab run --
+  scripts/frr-policy-live.sh` (RFC 8212 bloqueia e guarda as rotas; filtro descarta por lista,
+  community e tamanho; prepend e community chegam ao par; forma canônica; uma regra mudada = 14
+  linhas em 2,7 ms; prévia nas rotas lidas do bgpd = o que o bgpd fez — **medido**, 2026-10-27).
+  Na GUI: Routing › Filters.
