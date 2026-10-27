@@ -616,7 +616,12 @@ pub trait Hal: Send {
 
     /// Connections refused for lack of ports, and the ICMP sent about
     /// them, since the last call (G2.7).
-    fn cgnat_exhausted(&mut self) -> (Vec<(std::net::Ipv4Addr, cgnat::Hit)>, cgnat::ExhaustionStats) {
+    fn cgnat_exhausted(
+        &mut self,
+    ) -> (
+        Vec<(std::net::Ipv4Addr, cgnat::Hit)>,
+        cgnat::ExhaustionStats,
+    ) {
         (Vec::new(), cgnat::ExhaustionStats::default())
     }
 

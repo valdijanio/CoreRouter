@@ -799,7 +799,8 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
     c.ip.cgnat.settings.icmp_rate = 5;
     let mut hal = LinuxHal::new();
     hal.apply(&Config::default(), &c).unwrap();
-    let text = run(Command::new("nft").args(["list", "chain", "ip", "corerouter_cgnat", "exhausted"]));
+    let text =
+        run(Command::new("nft").args(["list", "chain", "ip", "corerouter_cgnat", "exhausted"]));
     assert!(text.contains("@full") && text.contains("bypass"), "{text}");
 
     let server = lab
@@ -847,7 +848,10 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
             .collect()
     });
     let seen = icmp_seen(&icmp, Duration::from_millis(600));
-    assert!(server.recv_from(&mut buf).is_err(), "nothing more got through");
+    assert!(
+        server.recv_from(&mut buf).is_err(),
+        "nothing more got through"
+    );
     assert_eq!(seen.len(), 5, "the burst, no more: {seen:?}");
     for (code, src, port, _) in &seen {
         assert_eq!(*code, 1, "host unreachable (RFC 6888 REQ-11b)");
@@ -866,7 +870,12 @@ fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
         "100.64.0.2:41000".parse().unwrap(),
         "192.0.2.2:7601".parse().unwrap(),
     );
-    assert!(layout_of(&p).forward(b).unwrap().contains(*seen_b.ip(), seen_b.port()));
+    assert!(
+        layout_of(&p)
+            .forward(b)
+            .unwrap()
+            .contains(*seen_b.ip(), seen_b.port())
+    );
     // .65 is not in the set: never queued.
     udp_seen(
         &lab,

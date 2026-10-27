@@ -460,13 +460,12 @@ mod linux {
             self.cgnat_exhaustion
                 .configure(set.icmp_unreachable, u32::from(set.icmp_rate));
             if cgnat
-                && let Err(e) =
-                    crate::cgnat::apply(
-                        &from.ip.cgnat,
-                        &to.ip.cgnat,
-                        &mut self.cgnat_blocks,
-                        &mut self.cgnat_full,
-                    )
+                && let Err(e) = crate::cgnat::apply(
+                    &from.ip.cgnat,
+                    &to.ip.cgnat,
+                    &mut self.cgnat_blocks,
+                    &mut self.cgnat_full,
+                )
             {
                 if firewall {
                     let dynamic = crate::nft::dynamic();
@@ -483,13 +482,12 @@ mod linux {
                 || (firewall && self.fastpath.active);
             if fast && let Err(e) = crate::fastpath::apply(to, &mut self.fastpath) {
                 if cgnat
-                    && let Err(back) =
-                        crate::cgnat::apply(
-                            &to.ip.cgnat,
-                            &from.ip.cgnat,
-                            &mut self.cgnat_blocks,
-                            &mut self.cgnat_full,
-                        )
+                    && let Err(back) = crate::cgnat::apply(
+                        &to.ip.cgnat,
+                        &from.ip.cgnat,
+                        &mut self.cgnat_blocks,
+                        &mut self.cgnat_full,
+                    )
                 {
                     log::error!("restoring the previous CGNAT table: {back}");
                 }
@@ -504,13 +502,12 @@ mod linux {
             }
             let undo_cgnat = |me: &mut Self| {
                 if cgnat
-                    && let Err(back) =
-                        crate::cgnat::apply(
-                            &to.ip.cgnat,
-                            &from.ip.cgnat,
-                            &mut me.cgnat_blocks,
-                            &mut me.cgnat_full,
-                        )
+                    && let Err(back) = crate::cgnat::apply(
+                        &to.ip.cgnat,
+                        &from.ip.cgnat,
+                        &mut me.cgnat_blocks,
+                        &mut me.cgnat_full,
+                    )
                 {
                     log::error!("restoring the previous CGNAT table: {back}");
                 }
@@ -751,8 +748,9 @@ mod linux {
 
         fn cgnat_queue(&mut self) -> Result<Box<dyn corerouter_hal::cgnat::CgnatQueue>, HalError> {
             let shared = self.cgnat_exhaustion.clone();
-            crate::nfqueue::Queue::open(corerouter_hal::cgnat::QUEUE_NUM)
-                .map(|q| Box::new(q.with_icmp(shared)) as Box<dyn corerouter_hal::cgnat::CgnatQueue>)
+            crate::nfqueue::Queue::open(corerouter_hal::cgnat::QUEUE_NUM).map(|q| {
+                Box::new(q.with_icmp(shared)) as Box<dyn corerouter_hal::cgnat::CgnatQueue>
+            })
         }
 
         fn cgnat_full(&mut self, subscribers: &[std::net::Ipv4Addr]) -> Result<(), HalError> {

@@ -865,6 +865,7 @@ impl Session {
             t.icmp = t.icmp.saturating_add(stats.icmp);
             t.limited = t.limited.saturating_add(stats.limited);
             t.untracked = t.untracked.saturating_add(stats.untracked);
+            t.overrun = t.overrun.saturating_add(stats.overrun);
             for (sub, hit) in hits {
                 if rt.alerts.len() >= MAX_ALERTS && !rt.alerts.contains_key(&sub) {
                     continue;

@@ -65,7 +65,6 @@ pub trait CgnatQueue: Send {
     }
 }
 
-
 // ---------------------------------------------------------------------------
 // G2.7: the answer when a subscriber's ports run out (RFC 6888 REQ-11).
 // ---------------------------------------------------------------------------
@@ -182,6 +181,9 @@ pub struct ExhaustionStats {
     pub limited: u64,
     /// Subscribers not counted because [`MAX_TRACKED`] were.
     pub untracked: u64,
+    /// Times a queue's socket overflowed in a storm: those packets went on
+    /// unchecked (fail-open; conntrack still refuses them, silently).
+    pub overrun: u64,
 }
 
 #[derive(Debug)]
@@ -244,11 +246,23 @@ impl Exhaustion {
         match i.hits.get_mut(&subscriber) {
             Some(h) => h.refused = h.refused.saturating_add(1),
             None if tracked < MAX_TRACKED => {
-                i.hits.insert(subscriber, Hit { refused: 1, icmp: 0 });
+                i.hits.insert(
+                    subscriber,
+                    Hit {
+                        refused: 1,
+                        icmp: 0,
+                    },
+                );
             }
             None => i.stats.untracked = i.stats.untracked.saturating_add(1),
         }
         send
+    }
+
+    /// A queue's socket overflowed `n` times.
+    pub fn overrun(&self, n: u64) {
+        let mut i = self.inner();
+        i.stats.overrun = i.stats.overrun.saturating_add(n);
     }
 
     /// The ICMP about `subscriber` went out.
@@ -317,10 +331,26 @@ mod tests {
         assert!(!e.refused(A, 10));
         e.passed();
         let (hits, stats) = e.take();
-        assert_eq!(hits, vec![(A, Hit { refused: 2, icmp: 1 })]);
+        assert_eq!(
+            hits,
+            vec![(
+                A,
+                Hit {
+                    refused: 2,
+                    icmp: 1
+                }
+            )]
+        );
         assert_eq!(
             stats,
-            ExhaustionStats { seen: 3, refused: 2, icmp: 1, limited: 1, untracked: 0 }
+            ExhaustionStats {
+                seen: 3,
+                refused: 2,
+                icmp: 1,
+                limited: 1,
+                untracked: 0,
+                overrun: 0
+            }
         );
         assert_eq!(e.take().1, ExhaustionStats::default(), "taken once");
         e.configure(false, 1);

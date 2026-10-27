@@ -5,7 +5,8 @@ log por conexão. Determinístico por padrão (RFC 7422); por blocos sob demanda
 (G2.3c). O "Quem era?" responde IP público + porta + data/hora → assinante, que é o que o Marco
 Civil (Lei 12.965/2014, art. 13) cobra do provedor de conexão.
 
-Estado: **G2.3a**, **G2.3b** e **G2.3c** (este documento descreve o que entrou e o plano das partes seguintes).
+Estado: **G2.3a–e** e **G2.7** (resposta quando as portas acabam, seção 1.9); este documento descreve
+o que entrou e o plano das partes seguintes.
 
 ## 1. Como funciona
 
@@ -217,8 +218,8 @@ mesma geometria da fórmula (`Layout::block`). A RFC 6888 §5 (REQ-13/14) e a RF
 - O pacote segue para o NAT e já acha o elemento. Medido em netns.
 - Sem ninguém atendendo a fila, o pacote **cai**. Ele nunca sai com o IP privado: a regra não tem
   `bypass`.
-- Sem bloco livre, ou com o assinante no máximo de blocos, o pacote cai também (RFC 6888 REQ-11). O
-  ICMP code 1 da REQ-11b é a G2.7.
+- Sem bloco livre, ou com o assinante no máximo de blocos, o pacote cai também (RFC 6888 REQ-11a), e o
+  assinante recebe o ICMP *host unreachable* da REQ-11b (G2.7, seção 1.9), com o mesmo limite de taxa.
 
 **Pareado (REQ-2):** todos os blocos de um assinante ficam no mesmo IP público. O primeiro vai para o
 IP com menos blocos.
@@ -229,10 +230,16 @@ outro, até `max_blocks`. As conexões novas vão para o novo; as velhas continu
 **Solta e segura:**
 
 - Um bloco sem conexão por `block_timeout` é liberado.
-- O bloco liberado não vai para ninguém por **120 s** (RFC 6888 REQ-8), para uma conexão atrasada não
-  cair noutro assinante.
-- Quando a geometria do pool muda (outras portas, outros IPs), os blocos velhos são liberados na hora,
-  sem quarentena, e as conexões deles são derrubadas, como num remapeamento determinístico.
+- As portas do bloco liberado não vão para ninguém por **120 s** (RFC 6888 REQ-8), para um pacote
+  atrasado de uma conexão antiga não cair noutro assinante. A quarentena é **por faixa de portas** do IP
+  público (G2.7), não pelo número do bloco, e vem do journal: sobrevive a um reinício.
+- Quando a geometria do pool muda (outras portas, outros IPs), os blocos velhos são liberados na hora e
+  as conexões deles derrubadas, como num remapeamento determinístico; as portas deles também ficam 120 s
+  em quarentena, e nenhum bloco novo que as cubra é entregue antes disso (G2.7; antes, a mudança de
+  geometria pulava a quarentena).
+- No modo determinístico a REQ-8 vale pelas exceções da própria RFC: a porta é sempre do mesmo assinante
+  (exceção b), o conntrack segue o estado do TCP (exceção a) e, sem EIF, só quem o assinante procurou
+  responde (exceção c). Um remapeamento (`pool.set`) derruba as conexões e esquece os mapeamentos UDP.
 
 **Log por bloco:**
 
@@ -271,7 +278,68 @@ distintas em uso, por protocolo; vale o protocolo mais cheio.
   - primeira e última vez.
 
 O kernel não avisa quando uma conexão nova não acha porta livre: só conta em `insert_failed`. O alerta
-mostra o crescimento desse contador desde o início.
+mostra o crescimento desse contador desde o início e, com a G2.7, quem foi recusado (seção 1.9):
+colunas `refused` e `icmp` por assinante, uma linha `no free port: …` no log por assinante que começa a
+ser recusado (no máximo uma por minuto).
+
+### 1.9 Sem portas: ICMP host unreachable (G2.7)
+
+A RFC 6888 REQ-11 diz o que fazer quando uma conexão nova não acha porta livre: (a) **MUST** descartar o
+pacote; (b) **SHOULD** mandar ao assinante um ICMP *destination unreachable* **código 1** (*host
+unreachable*). O código 1 é um erro "leve" (RFC 1122 §4.2.3.9): o TCP do assinante não desiste da
+conexão, e conecta quando uma porta se libera. O Linux sozinho cumpre só a (a), em silêncio.
+
+**Por que o kernel não avisa** (lido em `net/netfilter/nf_nat_core.c` e `nf_conntrack_core.c`):
+
+- a NAT nunca falha. `nf_nat_l4proto_unique_tuple` procura uma porta livre na faixa em até 128 + 64 + 32
+  + 16 tentativas contíguas a partir de pontos aleatórios; não achando, fica com uma tupla **já em uso**;
+- a conexão cai depois, no `__nf_conntrack_confirm`, que roda depois de todo gancho: conta
+  `insert_failed` e devolve `NF_DROP`;
+- por isso nenhuma regra nftables vê a falha (um `reject` não teria onde ficar), e nem XDP nem TC a veem
+  (a queda é dentro do netfilter; TC de saída nunca recebe o pacote).
+
+**Como fazemos:**
+
+1. O tick do engine (a cada 10 s, a mesma leitura do conntrack do alerta) põe no conjunto `full` da
+   tabela `ip corerouter_cgnat` os assinantes cuja faixa atual (o slot, ou o último bloco) está a
+   **80 %** ou mais no protocolo mais cheio. Como a busca do kernel desiste antes de varrer tudo, um
+   slot pode recusar antes de 100 %; abaixo de 80 % a chance é desprezível (**estimado**).
+2. Uma chain `filter` em `postrouting`, prioridade `srcnat + 5` (logo **depois** da NAT), manda à fila
+   só as conexões novas desses assinantes:
+   `ct state new ct original ip saddr @full queue num 7423-7426 bypass`.
+   Quem não está no conjunto nunca sai do kernel. `bypass`: sem ninguém atendendo, o kernel decide como
+   antes.
+3. Quatro threads do serviço `cgnat-icmp` do daemon (uma por fila; o kernel espalha as filas pelo hash
+   dos endereços) recebem cada pacote **com a conexão** (`NFQA_CFG_F_CONNTRACK`): a tupla de resposta
+   que a NAT escolheu. Uma consulta ao conntrack (`IPCTNL_MSG_CT_GET`; o kernel indexa as duas direções
+   de toda conexão) diz se ela já é de outra conexão:
+   - **livre**: o pacote segue intocado;
+   - **tomada**: o pacote é descartado ali (o que o `confirm` faria) e o assinante recebe o ICMP.
+4. O ICMP cita o pacote **como o assinante o mandou** (RFC 792; até 576 bytes no total, RFC 1812
+   §4.3.2.3): a fila o vê depois da NAT, então o IP e a porta (ou o id do ICMP) de origem voltam a ser
+   os privados, com os checksums ajustados (RFC 1624). Sai por um socket ICMP *raw*; o kernel põe como
+   origem o endereço do roteador do lado do assinante. Não se responde a erro ICMP nem a fragmento que
+   não é o primeiro (RFC 1812 §4.3.2.7).
+5. **Limite de taxa** (RFC 1812 §4.3.2.8): `icmp_rate` mensagens por segundo **por assinante** (padrão
+   2, também a rajada) e 1000 por segundo no roteador (o `icmp_msgs_per_sec` do Linux). O limitador
+   guarda no máximo 65 536 assinantes; uma tempestade de origens falsas não cresce a memória. Uma
+   tempestade de SYN de um assinante sem portas nunca vira amplificador: no máximo 2 ICMP/s para ele.
+6. No modo blocos, a fila 7422 (primeiro pacote sem bloco) também responde com o ICMP quando não há
+   bloco livre.
+
+**Comandos:** `ip.firewall.cgnat.set {icmp_unreachable?, icmp_rate?}`; `alert.list` traz `refused`,
+`icmp_sent`, `icmp_limited`, `full` (quantos estão sendo conferidos) e, por assinante, `refused`, `icmp`,
+`last_refused`. Na janela: aba Alerts (selos e coluna Refused, ⓘ "ICMP Unreachable").
+
+**Escolha do mecanismo (números na seção 6.7):**
+
+| Opção | Funciona? | Custo no caso normal | Observação |
+|---|---|---|---|
+| regra nftables com `reject` | não | — | a falha acontece no `confirm`, depois de todo gancho; `reject` nem vale em `postrouting` |
+| XDP / TC | não | — | a queda é dentro do netfilter; TC de saída não recebe o pacote; um programa num `kprobe`/tracepoint do `kfree_skb` exigiria root, BTF e ficaria fora do crate isolado de eBPF |
+| nfqueue de **todas** as conexões novas | sim | uma ida ao userspace por conexão nova (~255 mil/s hoje, seção 6.3) | inaceitável |
+| **nfqueue só de quem está perto do fim** (adotado) | sim | uma checagem `ct state new` por pacote; nada sai do kernel | 4 filas, uma thread cada, sem lock do `Session` |
+
 
 ## 2. Comandos
 
@@ -287,7 +355,8 @@ mostra o crescimento desse contador desde o início.
 | `ip.firewall.cgnat.rules {pool?}` | o nftables gerado |
 | `ip.firewall.cgnat.block.list {pool?, subscriber?}` | blocos ativos (modo blocos), o atual de cada assinante e há quanto tempo está ocioso |
 | `ip.firewall.cgnat.block.history {subscriber?, public?, port?, from?, to?}` | o log de blocos (alocação e liberação) |
-| `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel |
+| `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel; recusados e ICMP enviados (G2.7) |
+| `ip.firewall.cgnat.set {history_days?, icmp_unreachable?, icmp_rate?}` | retenção do histórico; ICMP quando as portas acabam e o limite por assinante (G2.7) |
 | `tool.ip-calc.cgnat.plan {inside, outside, ports_per_subscriber?, port_range?, mode?, preview?}` | o planner (Tools › IP Calculator): números, checagens, sugestões, prévia e os parâmetros do `pool.add`; aceita quantidades (`"4096"`) |
 | `tool.ip-calc.cgnat.export {…, format: csv \| text \| routeros \| nft}` | a tabela do plano em CSV, texto imprimível, script RouterOS ou o nftables |
 
@@ -335,7 +404,16 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
     bloco sobrevive à troca da tabela;
   - esgotamento (G2.3e, RFC 6888 REQ-3/11): com 64 portas, 80 fluxos dão exatamente 64, todos no slot
     do assinante (nunca uma porta do vizinho), e o kernel conta as recusas;
-  - remapear mata as conexões antigas mesmo com um ping no meio (o bug do #178).
+  - remapear mata as conexões antigas mesmo com um ping no meio (o bug do #178);
+  - sem portas (G2.7, RFC 6888 REQ-11): 10 fluxos além das 64 portas dão 10 recusas e exatamente 5
+    ICMP código 1 (a rajada do limite), cada um citando o IP e a porta **privados** do assinante; um
+    vizinho no conjunto `full` com portas livres sai normalmente, e quem não está nele nunca chega à fila.
+- **G2.7 sem kernel:** o ICMP montado (checksums de IP, UDP e TCP conferidos contra um cálculo novo,
+  citação limitada a 576 bytes, sem resposta a erro nem a fragmento), o limitador (proptest: nunca mais
+  que a taxa mais a rajada; memória limitada), o codec da fila com a conexão e a consulta de tupla, e no
+  engine (`cgnat_blocks.rs`): recusas chegando aos alertas e ao log, uma linha por minuto por
+  assinante, `icmp_unreachable=no` esvaziando o conjunto; quarentena de 120 s por faixa depois de mudar
+  a geometria.
 - **Bateria de propriedades (`crates/engine/tests/cgnat_battery.rs`, G2.3e):**
   - para formas aleatórias de pool, o que o planner diz que cabe é o que o pool criado com os
     parâmetros dele faz;
@@ -357,6 +435,8 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
 | G6.9a (feito) | Tools › IP Calculator: Subnet, IPv6/PD, CGNAT planner (criar pool, exportar, ver regras, script RouterOS); comandos `tool.ip-calc.*` |
 | G2.4a (feito) | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |
 | G2.3e (feito) | Bateria final de bugs e desempenho e o relatório (seção 6) |
+| G2.7 (feito) | Sem portas: ICMP *host unreachable* (RFC 6888 REQ-11b) com limite de taxa, fila só dos quase cheios; REQ-8 por faixa de portas (seção 1.9) |
+| G2.7b | Aba Capacity: pico p99 por assinante em 7 dias, quem bateu no limite, distribuição, sugestão de `ports_per_subscriber` com prévia e Safe Mode |
 
 ## 5. Pesquisa
 
@@ -445,6 +525,44 @@ Kernel:
 - `nf_nat_proto.c`: faixa aplicada ao id do ICMP;
 - [`nf_flowtable`](https://docs.kernel.org/networking/nf_flowtable.html) (G2.4).
 
+### Sem portas (G2.7)
+
+Como cada um responde quando o assinante esgota as portas:
+
+- **MikroTik RouterOS v7** ([NAT](https://help.mikrotik.com/docs/spaces/ROS/pages/3211299/NAT)): é o
+  netfilter do Linux; o pacote cai em silêncio. Não há opção de ICMP, contador por assinante nem
+  alerta; o operador descobre pela reclamação ("um site não abre").
+- **VyOS** ([CGNAT](https://docs.vyos.io/en/latest/configuration/nat/cgnat.html)): nftables, o mesmo
+  silêncio; `show nat cgnat allocation` mostra a faixa, não as recusas.
+- **Juniper MX/SRX**: log `RT_SRC_NAT_OUTOF_PORT` e contador "port-block exceeded" por SNMP, sem dizer
+  o assinante ([relato de operador na NANOG, 2024](https://lists.nanog.org/archives/list/nanog@lists.nanog.org/thread/5D2M5GXMCODNBN3L6X22EINQXDWT43YM/));
+  o Junos 24.4R1 acrescentou aviso de limiar de blocos por assinante
+  ([Feature Explorer](https://apps.juniper.net/feature-explorer/feature/8747)). Não achamos
+  documentação pública de ICMP na recusa.
+- **A10 Thunder CGN**: traps `axLsnIpAllPortExhausted` e `axLsnTrafficNatPortUnavailable`
+  ([MIB](https://mibs.observium.org/mib/A10-AX-CGN-TRAPS-V1/)), por pool e por IP público; ICMP na
+  recusa não documentado publicamente.
+- **Cisco IOS-XE**: nada público sobre a resposta ao assinante; contadores em `show ip nat statistics`.
+- **RFCs:** RFC 6888 REQ-11 (a: MUST descartar; b: SHOULD ICMP código 1, preferido ao 13 por ser erro
+  leve na RFC 1122) e REQ-8 (120 s, com as exceções a/b/c); a 6888 atualiza a RFC 4787 e não tem
+  "Updated by"; sem errata registrada para a 6888. A RFC 5382 (atualizada pela 7857) não fala de ICMP
+  na falta de mapeamento: só do RST ao abandonar conexões (§5) e do ICMP *port unreachable* ao SYN não
+  pedido (REQ-4). RFC 1812 §4.3.2.3 (citar até 576 bytes), §4.3.2.7 (sem erro sobre erro nem sobre
+  fragmento não inicial) e §4.3.2.8 (limitar a taxa); RFC 1624 (checksum incremental); RFC 7422 §2.2
+  (alarmes de utilização).
+- **Kernel:** `nf_nat_core.c` (`nf_nat_l4proto_unique_tuple`, `NF_NAT_MAX_ATTEMPTS` 128 e rodadas pela
+  metade; `nf_nat_used_tuple_harder` despeja TIME_WAIT nas últimas 32 tentativas),
+  `nf_conntrack_core.c` (`nf_ct_resolve_clash` → `insert_failed`), `nfnetlink_queue.c`
+  (`NFQA_CFG_F_CONNTRACK`, `NFQA_CFG_F_FAIL_OPEN`), `nft_queue.c` (filas por hash, `bypass`).
+
+**O que fizemos melhor:** o ICMP da REQ-11b (nenhum dos pesquisados documenta) sem custo para quem tem
+porta; o assinante recusado aparece pelo nome (IP), com contagem e ICMP, no alerta e no log; a
+quarentena da REQ-8 por faixa, que também cobre a mudança de geometria.
+
+**Ficou de fora:** ICMPv6 (o CGNAT é NAT44; NAT64 não existe ainda); responder já na primeira recusa de
+um assinante que encheu entre duas leituras de 10 s (o conjunto `full` é atualizado a cada leitura; o
+TCP repete o SYN em 1 s, 3 s…, e as repetições já recebem o ICMP).
+
 ### O que adotamos e o que melhoramos
 
 - **Adotado:**
@@ -461,9 +579,6 @@ Kernel:
   - prévia do nftables;
   - tudo transacional, com Safe Mode e rollback.
 - **Fica para depois (vira gap):**
-  - ICMP code 1 quando as portas acabam (RFC 6888 REQ-11b): o kernel descarta sem avisar, e
-    responder exige um caminho no plano de dados (nfqueue ou XDP, G2.5);
-  - porta liberada segura por 120 s (REQ-8) no modo blocos;
   - PCP (REQ-9);
   - login PPPoE no "Quem era?" (com o BNG);
   - testes em hardware real (seção 6).
@@ -539,6 +654,45 @@ fica no G2.3f: `sudo grep nf_conntrack /proc/slabinfo` (coluna `objsize`).
 
 Para 1 milhão de conexões, ~400 MB. Os mapas do CGNAT são ~200 B por assinante (**estimado**): 13 MB
 para 64 Ki assinantes.
+
+### 6.7 Sem portas (G2.7, bench `netns_cgnat_pps`, grupo `netns_cgnat_exhaustion`)
+
+**Medido** em 2026-10-27, build release, namespace sem root, a mesma máquina, com carga 15–40 de outras
+sessões.
+
+**Custo no caso normal** (ninguém sem portas). As três tabelas medidas em turnos alternados, nove
+rodadas, mediana, para a carga pesar igual em todas:
+
+| Tabela | conexões novas/s | pps estabelecidos |
+|---|---|---|
+| sem a chain `exhausted` (antes) | 280 557 | 746 648 |
+| com a chain, conjunto `full` vazio | 285 774 | 756 634 |
+| com a chain, 4096 **outros** assinantes no conjunto | 261 922 | 759 061 |
+
+- A chain vazia não tem custo mensurável: a diferença fica dentro do ruído das rodadas. Os pacotes
+  estabelecidos param no primeiro teste (`ct state new`); com o fast path (G2.4) eles nem passam pela
+  chain.
+- Com milhares no conjunto, a consulta ao hash custa no máximo ~7 % das conexões novas, só enquanto
+  houver tanta gente perto do limite. É um sinal de pool subdimensionado (aba Capacity, G2.7b).
+
+**Quando as portas acabam:**
+
+| Medida | Valor |
+|---|---|
+| do frame recusado ao ICMP de volta no assinante | 125 µs (média de 20 amostras; veth, NAT, fila, consulta ao conntrack, socket ICMP) |
+| tempestade de um assinante para um destino (uma fila só: o kernel escolhe a fila pelo hash dos endereços) | 188 mil frames recusados/s atendidos, sem perda (1,72 milhão examinados de 1,72 milhão enviados) |
+| tempestade de oito assinantes (quatro filas) | 174 mil/s: o mesmo teto |
+| ICMP numa tempestade de 20 mil recusas em 0,39 s | 14 enviados, 19 986 segurados pelo limite |
+
+- Uma thread dá conta de ~190 mil recusas/s (≤ 5,3 µs por pacote: a consulta ao conntrack é uma ida e
+  volta de netlink). O teto medido é o gerador: um núcleo que escreve na veth e faz no softirq dele a
+  NAT e o enfileiramento. Por isso quatro filas não aumentaram o número aqui.
+- As quatro filas, com uma thread cada, ficam para quando vários núcleos recebem (RSS numa placa de
+  verdade, G2.3f). Ociosas, as threads só esperam no `poll`.
+- Estouro do socket da fila (`ENOBUFS`) numa tempestade não é erro: com `F_FAIL_OPEN` o pacote segue e o
+  `confirm` o recusa como antes, sem ICMP. Conta em `overrun`, e o buffer de recepção é de 4 MB.
+- O limitador e as contagens ficam atrás de um `Mutex` compartilhado, uma vez por recusa, sem E/S
+  dentro: a 188 mil/s não apareceu disputa.
 
 ### 6.6 O que veth mede e o que só hardware mostra
 

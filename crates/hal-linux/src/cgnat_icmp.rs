@@ -210,54 +210,55 @@ mod io {
                 warned: false,
             })
         }
-
-        /// Whether this connection's reply tuple is already someone's.
-        fn clashes(&mut self, ct: &corerouter_hal::conntrack::Conn) -> bool {
-            match self.lookup.taken(&ct.reply, ct.protocol) {
-                Ok(t) => t,
-                Err(e) => {
-                    // Unsure: let the kernel decide, as without us.
-                    if !self.warned {
-                        log::warn!("cgnat: exhaustion queue {}: {e}", self.bound.num());
-                        self.warned = true;
-                    }
-                    false
-                }
-            }
-        }
     }
 
     impl ExhaustionQueue for ExhaustQueue {
         fn serve(&mut self, wait: Duration) -> Result<usize, HalError> {
-            // Copy what the batch needs out of the receive buffer, which the
-            // verdicts and lookups do not touch but the borrow does.
-            let batch: Vec<(u32, Vec<u8>, Option<corerouter_hal::conntrack::Conn>)> =
-                nfqueue::packets_with(self.bound.recv(wait)?)
-                    .into_iter()
-                    .map(|p| (p.id, p.payload.to_vec(), p.ct))
-                    .collect();
+            let len = self.bound.recv_len(wait)?;
+            let over = self.bound.take_overruns();
+            if over > 0 {
+                self.shared.overrun(over);
+            }
+            // Borrowed from the queue's buffer: no copy per packet. The
+            // verdicts, lookups and ICMP use other fields.
+            let batch = nfqueue::packets_with(self.bound.data(len));
             let n = batch.len();
-            for (id, payload, ct) in batch {
-                let Some(ct) = ct.filter(|c| c.reply.dst.is_ipv4()) else {
-                    self.bound.verdict(id, true)?;
+            for p in batch {
+                let Some(ct) = p.ct.as_ref().filter(|c| c.reply.dst.is_ipv4()) else {
+                    self.bound.verdict(p.id, true)?;
                     continue;
                 };
-                if !self.clashes(&ct) {
+                // Unsure (lookup failed): let the kernel decide, as without us.
+                let taken = match self.lookup.taken(&ct.reply, ct.protocol) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        if !self.warned {
+                            log::warn!("cgnat: exhaustion queue {}: {e}", self.bound.num());
+                            self.warned = true;
+                        }
+                        false
+                    }
+                };
+                if !taken {
                     self.shared.passed();
-                    self.bound.verdict(id, true)?;
+                    self.bound.verdict(p.id, true)?;
                     continue;
                 }
-                self.bound.verdict(id, false)?;
-                let IpAddr::V4(sub) = ct.orig.src else { continue };
+                self.bound.verdict(p.id, false)?;
+                let IpAddr::V4(sub) = ct.orig.src else {
+                    continue;
+                };
                 let ms = u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX);
                 if !self.shared.refused(sub, ms) {
                     continue;
                 }
-                let Some(sender) = self.sender.as_mut() else { continue };
+                let Some(sender) = self.sender.as_mut() else {
+                    continue;
+                };
                 // The NAT changed the source port (or ICMP id): give back
                 // the one the subscriber used.
                 let port = matches!(ct.protocol, 6 | 17 | 1).then_some(ct.orig.src_port);
-                let Some(msg) = super::unreachable(&payload, sub, port) else {
+                let Some(msg) = super::unreachable(p.payload, sub, port) else {
                     continue;
                 };
                 match sender.send(sub, &msg) {
@@ -315,7 +316,11 @@ mod tests {
         assert_eq!(q.len(), p.len());
         assert_eq!(&q[12..16], &[100, 64, 0, 1], "the private source back");
         assert_eq!(checksum(&q[..20]), 0, "IP header checksum redone");
-        assert_eq!(u16::from_be_bytes([q[20], q[21]]), 40000, "the original port");
+        assert_eq!(
+            u16::from_be_bytes([q[20], q[21]]),
+            40000,
+            "the original port"
+        );
         // RFC 1624: the incremental UDP checksum equals a fresh one.
         let fresh = l4_checksum(q, 17);
         assert_eq!(u16::from_be_bytes([q[26], q[27]]), fresh);
@@ -347,7 +352,10 @@ mod tests {
         assert!(unreachable(&err, sub, None).is_none(), "ICMP error");
         let mut frag = udp_after_nat();
         frag[7] = 1;
-        assert!(unreachable(&frag, sub, None).is_none(), "not the first fragment");
+        assert!(
+            unreachable(&frag, sub, None).is_none(),
+            "not the first fragment"
+        );
         assert!(unreachable(&[0x60, 0, 0, 0], sub, None).is_none(), "IPv6");
         assert!(unreachable(&[], sub, None).is_none());
         // An echo request does get one; its id goes back too.

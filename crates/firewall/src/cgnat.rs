@@ -895,11 +895,19 @@ mod tests {
         );
         assert!(matches!(
             r.exprs.last(),
-            Some(Expr::Queue { num: 7423, total: 4, bypass: true })
+            Some(Expr::Queue {
+                num: 7423,
+                total: 4,
+                bypass: true
+            })
         ));
         let ch = t.chains.iter().find(|ch| ch.name == "exhausted").unwrap();
         assert_eq!((ch.hook, ch.priority), (Hook::Postrouting, 105));
-        assert!(t.sets.iter().any(|s| s.name == FULL && s.elements.is_empty()));
+        assert!(
+            t.sets
+                .iter()
+                .any(|s| s.name == FULL && s.elements.is_empty())
+        );
         let mut off = c.clone();
         off.settings.icmp_unreachable = false;
         assert!(changed(&c, &off));
@@ -915,7 +923,11 @@ mod tests {
         let q = t.rules.iter().find(|r| r.chain == "blocks").unwrap();
         assert!(matches!(
             q.exprs.last(),
-            Some(Expr::Queue { num: QUEUE_NUM, total: 1, bypass: false })
+            Some(Expr::Queue {
+                num: QUEUE_NUM,
+                total: 1,
+                bypass: false
+            })
         ));
     }
 }

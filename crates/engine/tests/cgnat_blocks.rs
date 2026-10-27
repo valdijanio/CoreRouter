@@ -230,7 +230,11 @@ fn an_exhausted_pool_refuses_and_a_changed_pool_releases() {
     // the new geometry (late packets of the killed connections must not
     // reach another subscriber).
     s.tick(T0 + 4);
-    assert_eq!(blocks(&mut s).len(), 0, "every new block overlaps a held range");
+    assert_eq!(
+        blocks(&mut s).len(),
+        0,
+        "every new block overlaps a held range"
+    );
     s.tick(T0 + 3 + 121);
     assert_eq!(blocks(&mut s).len(), 4, "new geometry, four blocks now");
 }
@@ -252,7 +256,10 @@ fn refused_connections_reach_the_alerts_and_the_log() {
     }
     let a = ok(&mut s, "ip.firewall.cgnat.alert.list", json!({}));
     let full = a["full"].as_u64().unwrap();
-    assert!(full > 3, "the lab's heavy users (95 %) are nearly full: {a}");
+    assert!(
+        full > 3,
+        "the lab's heavy users (95 %) are nearly full: {a}"
+    );
     let refused: Vec<&Value> = a["rows"]
         .as_array()
         .unwrap()
@@ -284,16 +291,32 @@ fn refused_connections_reach_the_alerts_and_the_log() {
     );
     assert_eq!(log.as_array().unwrap().len(), refused.len());
 
-    let set = ok(&mut s, "ip.firewall.cgnat.set", json!({"icmp_unreachable": false, "icmp_rate": 7}));
-    assert_eq!(set, json!({"history_days": 365, "icmp_unreachable": false, "icmp_rate": 7}));
+    let set = ok(
+        &mut s,
+        "ip.firewall.cgnat.set",
+        json!({"icmp_unreachable": false, "icmp_rate": 7}),
+    );
+    assert_eq!(
+        set,
+        json!({"history_days": 365, "icmp_unreachable": false, "icmp_rate": 7})
+    );
     s.tick(T0 + 40);
     let a = ok(&mut s, "ip.firewall.cgnat.alert.list", json!({}));
     assert_eq!(a["full"], 0, "{a}");
     let get = ok(&mut s, "ip.firewall.cgnat.get", json!({}));
-    assert_eq!((get["icmp_unreachable"].clone(), get["icmp_rate"].clone()), (json!(false), json!(7)));
+    assert_eq!(
+        (get["icmp_unreachable"].clone(), get["icmp_rate"].clone()),
+        (json!(false), json!(7))
+    );
     // Out of range is a parameter error.
-    assert!(s.execute("ip.firewall.cgnat.set", &json!({"icmp_rate": 0})).is_err());
-    assert!(s.execute("ip.firewall.cgnat.set", &json!({"icmp_rate": 101})).is_err());
+    assert!(
+        s.execute("ip.firewall.cgnat.set", &json!({"icmp_rate": 0}))
+            .is_err()
+    );
+    assert!(
+        s.execute("ip.firewall.cgnat.set", &json!({"icmp_rate": 101}))
+            .is_err()
+    );
 }
 
 #[test]

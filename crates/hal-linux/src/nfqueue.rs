@@ -276,6 +276,10 @@ mod io {
         sock: Socket,
         num: u16,
         buf: Vec<u8>,
+        /// Times the kernel had more for us than the socket held
+        /// (`ENOBUFS`): those packets went on ([`super::F_FAIL_OPEN`]) or
+        /// were dropped, as without us.
+        overruns: u64,
     }
 
     impl Bound {
@@ -284,10 +288,17 @@ mod io {
         pub fn open(num: u16, copy: u32, flags: u32) -> Result<Self, HalError> {
             let mut sock = Socket::new(NETLINK_NETFILTER).map_err(io)?;
             sock.bind_auto().map_err(io)?;
+            // A storm queues faster than one thread answers: room for a
+            // few thousand packets before the kernel gives up on us.
+            use nix::sys::socket::{setsockopt, sockopt};
+            if setsockopt(&sock.as_fd(), sockopt::RcvBufForce, &(4usize << 20)).is_err() {
+                let _ = setsockopt(&sock.as_fd(), sockopt::RcvBuf, &(4usize << 20));
+            }
             let mut q = Self {
                 sock,
                 num,
                 buf: vec![0u8; 1 << 16],
+                overruns: 0,
             };
             let mut reqs = vec![
                 (1, super::bind_request(num, 1)),
@@ -357,16 +368,40 @@ mod io {
             Err(HalError::Io("netfilter queue: no ACK".into()))
         }
 
-        /// Wait at most `wait` for packets; the received bytes (parse them
-        /// with [`super::packets_with`]), empty when none came.
-        pub fn recv(&mut self, wait: Duration) -> Result<&[u8], HalError> {
+        /// Wait at most `wait` for packets; how many bytes came (read them
+        /// with [`Self::data`] and [`super::packets_with`]), 0 when none.
+        /// An overrun is counted, not an error.
+        pub fn recv_len(&mut self, wait: Duration) -> Result<usize, HalError> {
             let ms = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
             let mut fds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
             if poll(&mut fds, PollTimeout::from(ms)).map_err(io)? == 0 {
-                return Ok(&[]);
+                return Ok(0);
             }
-            let n = self.sock.recv(&mut &mut self.buf[..], 0).map_err(io)?;
-            Ok(self.buf.get(..n).unwrap_or(&[]))
+            match self.sock.recv(&mut &mut self.buf[..], 0) {
+                Ok(n) => Ok(n),
+                Err(e) if e.raw_os_error() == Some(nix::libc::ENOBUFS) => {
+                    self.overruns = self.overruns.saturating_add(1);
+                    Ok(0)
+                }
+                Err(e) => Err(io(e)),
+            }
+        }
+
+        /// The first `n` bytes of the last receive.
+        pub fn data(&self, n: usize) -> &[u8] {
+            self.buf.get(..n).unwrap_or(&[])
+        }
+
+        /// Overruns since the last call.
+        pub fn take_overruns(&mut self) -> u64 {
+            std::mem::take(&mut self.overruns)
+        }
+
+        /// Wait at most `wait` for packets; the received bytes (parse them
+        /// with [`super::packets_with`]), empty when none came.
+        pub fn recv(&mut self, wait: Duration) -> Result<&[u8], HalError> {
+            let n = self.recv_len(wait)?;
+            Ok(self.data(n))
         }
 
         pub fn verdict(&self, id: u32, accept: bool) -> Result<(), HalError> {
@@ -418,7 +453,10 @@ mod io {
             for p in super::packets_with(self.bound.recv(wait)?) {
                 match super::ipv4_source(p.payload) {
                     Some(subscriber) => {
-                        self.ready.push_back(Pending { id: p.id, subscriber });
+                        self.ready.push_back(Pending {
+                            id: p.id,
+                            subscriber,
+                        });
                         if self.icmp.is_some() {
                             self.heads.insert(p.id, p.payload.to_vec());
                         }
@@ -457,7 +495,9 @@ mod io {
                 return Ok(false);
             }
             // Before the NAT: the packet is as the subscriber sent it.
-            let Some(sender) = sender.as_mut() else { return Ok(false) };
+            let Some(sender) = sender.as_mut() else {
+                return Ok(false);
+            };
             let Some(msg) = crate::cgnat_icmp::unreachable(&head, sub, None) else {
                 return Ok(false);
             };
@@ -546,14 +586,20 @@ mod tests {
         let mut hdr = 9u32.to_be_bytes().to_vec();
         hdr.extend_from_slice(&0x0800u16.to_be_bytes());
         hdr.push(4);
-        let ip = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 203, 0, 113, 1, 192, 0, 2, 2];
+        let ip = vec![
+            0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 203, 0, 113, 1, 192, 0, 2, 2,
+        ];
         let m = msg(
             NFQNL_MSG_PACKET,
             0,
             2,
             7423,
             0,
-            &[(NFQA_PACKET_HDR, hdr), (NFQA_PAYLOAD, ip.clone()), (NFQA_CT, ct)],
+            &[
+                (NFQA_PACKET_HDR, hdr),
+                (NFQA_PAYLOAD, ip.clone()),
+                (NFQA_CT, ct),
+            ],
         );
         let got = packets_with(&m);
         assert_eq!(got.len(), 1);

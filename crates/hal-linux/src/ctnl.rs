@@ -485,7 +485,10 @@ mod tests {
             dst_port: 2100,
         };
         let req = get_request(&t, 17, 7);
-        assert_eq!(u16::from_ne_bytes([req[4], req[5]]), (1 << 8) | IPCTNL_MSG_CT_GET);
+        assert_eq!(
+            u16::from_ne_bytes([req[4], req[5]]),
+            (1 << 8) | IPCTNL_MSG_CT_GET
+        );
         assert_eq!(req[16], AF_INET);
         let answer = |kind: u16, code: Option<i32>| {
             let mut m = 0u32.to_ne_bytes().to_vec();

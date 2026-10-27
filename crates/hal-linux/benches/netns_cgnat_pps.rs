@@ -229,6 +229,14 @@ mod linux {
         /// Conntrack without NAT (the fast path's table alone turns the
         /// connection tracking on): the cost of a new connection itself.
         ConntrackOnly,
+        /// The pool without the G2.7 exhaustion chain (`icmp_unreachable`
+        /// off): the "before" of its cost.
+        CgnatNoIcmp,
+        /// The exhaustion chain with 4096 other subscribers in set `full`
+        /// (none of the measured ones).
+        CgnatFullOthers,
+        /// 64 ports per subscriber, for the exhaustion group.
+        Exhaust,
     }
 
     fn config(mode: Mode) -> Config {
@@ -244,11 +252,14 @@ mod linux {
         }
         let p: Pool = serde_json::from_value(serde_json::json!({
             "id": "*1", "name": "bench", "inside": ["100.64.0.0/24"], "outside": ["203.0.113.0/28"],
-            "ports_per_subscriber": 1000,
-            "endpoint_independent_mapping": mode != Mode::CgnatNoEim,
+            "ports_per_subscriber": if mode == Mode::Exhaust { 64 } else { 1000 },
+            "endpoint_independent_mapping": mode != Mode::CgnatNoEim && mode != Mode::Exhaust,
         }))
         .unwrap();
         c.ip.cgnat.pools = vec![p];
+        c.ip.cgnat.settings.icmp_unreachable = mode != Mode::CgnatNoIcmp;
+        // The latency samples must not wait for the limiter.
+        c.ip.cgnat.settings.icmp_rate = 100;
         if mode == Mode::CgnatFastPath {
             c.ip.fastpath.enabled = true;
             c.ip.fastpath.interfaces = vec!["fb".parse().unwrap(), "fo".parse().unwrap()];
@@ -256,7 +267,7 @@ mod linux {
         c
     }
 
-    struct Lab {
+    pub struct Lab {
         _server: Ns,
         tx: Socket,
         reply: Socket,
@@ -428,6 +439,15 @@ mod linux {
             let to = config(mode);
             self.hal.apply(&self.applied, &to).unwrap();
             self.applied = to;
+            if mode == Mode::CgnatFullOthers {
+                let others: Vec<Ipv4Addr> = (0..4096u32)
+                    .map(|i| Ipv4Addr::from(0x6440_1000 + i))
+                    .collect();
+                self.hal.cgnat_full(&others).unwrap();
+            }
+            if mode == Mode::Exhaust {
+                return;
+            }
             // Twice: a frame lost to a full queue would leave its flow out.
             self.burst(u64::from(FLOWS) * 2);
             if mode != Mode::Route {
@@ -479,7 +499,12 @@ mod linux {
         g.sample_size(15);
         for (mode, name) in [
             (Mode::Route, "udp64/route only (no conntrack)"),
+            (
+                Mode::CgnatNoIcmp,
+                "udp64/cgnat without the exhaustion chain",
+            ),
             (Mode::Cgnat, "udp64/cgnat"),
+            (Mode::CgnatFullOthers, "udp64/cgnat, 4096 others in full"),
             (Mode::CgnatFastPath, "udp64/cgnat + fast path (software)"),
         ] {
             lab.set(mode);
@@ -493,7 +518,15 @@ mod linux {
         g.sample_size(10);
         g.throughput(Throughput::Elements(NEW));
         for (mode, name) in [
+            (
+                Mode::CgnatNoIcmp,
+                "udp64/new connection each frame (cgnat without the exhaustion chain)",
+            ),
             (Mode::Cgnat, "udp64/new connection each frame (cgnat)"),
+            (
+                Mode::CgnatFullOthers,
+                "udp64/new connection each frame (cgnat, 4096 others in full)",
+            ),
             (
                 Mode::CgnatNoEim,
                 "udp64/new connection each frame (cgnat, EIM off)",
@@ -519,6 +552,205 @@ mod linux {
             eprintln!("{name}: {got} of {NEW} frames forwarded");
         }
         g.finish();
+        alternated(&mut lab);
+        exhaustion(c, &mut lab);
         lab.hal.apply(&lab.applied, &Config::default()).unwrap();
+    }
+
+    /// G2.7, the cost of the exhaustion chain when nobody is out of ports:
+    /// the three tables measured in turn, round after round, so a busy
+    /// machine weighs on all alike; the median of each.
+    fn alternated(lab: &mut Lab) {
+        let modes = [
+            (Mode::CgnatNoIcmp, "without the chain"),
+            (Mode::Cgnat, "chain, set empty"),
+            (Mode::CgnatFullOthers, "chain, 4096 others in set"),
+        ];
+        let mut new: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
+        let mut est: Vec<Vec<f64>> = vec![Vec::new(); modes.len()];
+        for _ in 0..9 {
+            for (i, (mode, _)) in modes.iter().enumerate() {
+                lab.set(*mode);
+                lab.forget_new();
+                let (t, got) = lab.new_connections(NEW);
+                new[i].push(got as f64 / t.as_secs_f64());
+                let (t, got) = lab.burst(BURST);
+                est[i].push(got as f64 / t.as_secs_f64());
+            }
+        }
+        let median = |v: &mut Vec<f64>| {
+            v.sort_by(f64::total_cmp);
+            v[v.len() / 2]
+        };
+        for (i, (_, name)) in modes.iter().enumerate() {
+            eprintln!(
+                "alternated, {name}: {:.0} new connections/s, {:.0} established pps (medians of 9)",
+                median(&mut new[i]),
+                median(&mut est[i])
+            );
+        }
+        lab.forget_new();
+    }
+
+    /// Frames one exhaustion storm sends.
+    const STORM: u64 = 20_000;
+    /// Subscribers run out of ports in the exhaustion group.
+    const EXHAUSTED: u8 = 8;
+
+    /// Serve the exhaustion queues, one thread each (as the daemon does),
+    /// until the flag drops.
+    fn serve(
+        hal: &mut LinuxHal,
+        on: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Vec<std::thread::JoinHandle<()>> {
+        (0..corerouter_hal::cgnat::EXHAUSTED_QUEUES)
+            .map(|i| {
+                let mut q = hal.cgnat_exhaustion_queue(i).unwrap();
+                let on = on.clone();
+                std::thread::Builder::new()
+                    .name(format!("cgnat-icmp-{i}"))
+                    .spawn(move || {
+                        while on.load(std::sync::atomic::Ordering::Relaxed) {
+                            q.serve(Duration::from_millis(50)).unwrap();
+                        }
+                    })
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// G2.7: subscribers out of ports. The time from a refused frame to its
+    /// ICMP back on `fa`, and how many refused frames per second the queue
+    /// threads handle in a storm (one subscriber to one destination lands
+    /// in one queue: the kernel hashes the addresses; eight spread).
+    pub fn exhaustion(c: &mut Criterion, lab: &mut Lab) {
+        lab.set(Mode::Exhaust);
+        let (fb, fa) = (lab.fb_mac, lab.fa_mac);
+        // Each of the first EXHAUSTED subscribers takes its 64 ports to its
+        // far end (unanswered UDP, 30 s of conntrack life: enough).
+        let fill: Vec<Vec<u8>> = (1..=EXHAUSTED)
+            .flat_map(|h| {
+                (0..64u16).map(move |k| frame(fb, fa, (subscriber(h), 50_000 + k), far_end(h)))
+            })
+            .collect();
+        let (_, through) = lab.send(fill.len() as u64, |i| fill[i as usize].clone());
+        assert_eq!(through, fill.len() as u64, "every slot filled");
+        let subs: Vec<Ipv4Addr> = (1..=EXHAUSTED).map(subscriber).collect();
+        lab.hal.cgnat_full(&subs).unwrap();
+        let on = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let threads = serve(&mut lab.hal, &on);
+        // The ICMP comes back to the subscriber through fb, to fa.
+        let (fa_link, _) = link("fa");
+        let rx = Socket::new(Domain::PACKET, Type::RAW, Some(Protocol::from(0x0300))).unwrap();
+        bind(rx.as_raw_fd(), &fa_link).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let rx = std::net::UdpSocket::from(rx);
+        let icmp_back = |rx: &std::net::UdpSocket| -> bool {
+            let mut b = [0u8; 1600];
+            while let Ok(n) = rx.recv(&mut b) {
+                // Ethernet, IPv4, protocol ICMP, type 3 code 1.
+                if n > 34 && b[12..14] == [8, 0] && b[23] == 1 && b[34] == 3 && b[35] == 1 {
+                    return true;
+                }
+            }
+            false
+        };
+        let mut port = 20_000u16;
+        let mut g = c.benchmark_group("netns_cgnat_exhaustion");
+        g.sample_size(20);
+        g.bench_function("udp64/refused frame to its ICMP", |b| {
+            b.iter_custom(|iters| {
+                let mut total = Duration::ZERO;
+                for _ in 0..iters {
+                    // Another subscriber each time keeps the limiter out of
+                    // the way (100/s each).
+                    let h = 1 + (port % u16::from(EXHAUSTED)) as u8;
+                    port = port.wrapping_add(1).max(20_000);
+                    let f = frame(fb, fa, (subscriber(h), port), far_end(h));
+                    let start = Instant::now();
+                    let _ = send(lab.tx.as_raw_fd(), &f, MsgFlags::empty());
+                    assert!(icmp_back(&rx), "the ICMP came back");
+                    total += start.elapsed();
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                total
+            })
+        });
+        let _ = lab.hal.cgnat_exhausted();
+        g.sample_size(10);
+        g.throughput(Throughput::Elements(STORM));
+        for (spread, name) in [
+            (1u8, "udp64/storm of refused frames, one subscriber"),
+            (
+                EXHAUSTED,
+                "udp64/storm of refused frames, eight subscribers",
+            ),
+        ] {
+            let mut handled = 0u64;
+            g.bench_function(name, |b| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let base = port;
+                        port = port.wrapping_add(STORM as u16).max(20_000);
+                        let start = Instant::now();
+                        let fd = lab.tx.as_raw_fd();
+                        for i in 0..STORM {
+                            let h = 1 + (i % u64::from(spread)) as u8;
+                            let p = base.wrapping_add(i as u16).max(1024);
+                            let f = frame(fb, fa, (subscriber(h), p), far_end(h));
+                            let _ = send(fd, &f, MsgFlags::empty());
+                        }
+                        // Until the queues answered all they will.
+                        let mut seen = 0;
+                        let mut quiet = 0;
+                        while seen < STORM && quiet < 20 {
+                            std::thread::sleep(Duration::from_millis(2));
+                            let (_, st) = lab.hal.cgnat_exhausted();
+                            if st.seen == 0 {
+                                quiet += 1;
+                            } else {
+                                quiet = 0;
+                            }
+                            seen += st.seen;
+                        }
+                        handled += seen;
+                        total += start.elapsed();
+                    }
+                    total
+                })
+            });
+            eprintln!("{name}: {handled} frames looked at by the queues in all");
+        }
+        g.finish();
+        // The limits held under the storm: count what went out in one.
+        let _ = lab.hal.cgnat_exhausted();
+        let start = Instant::now();
+        let fd = lab.tx.as_raw_fd();
+        for i in 0..STORM {
+            let f = frame(
+                fb,
+                fa,
+                (subscriber(1), 1024 + (i % 60_000) as u16),
+                far_end(1),
+            );
+            let _ = send(fd, &f, MsgFlags::empty());
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        let (_, st) = lab.hal.cgnat_exhausted();
+        let secs = start.elapsed().as_secs_f64();
+        eprintln!(
+            "storm from one subscriber: {} looked at, {} refused, {} ICMP sent, {} held back by the limiter, in {secs:.2} s",
+            st.seen, st.refused, st.icmp, st.limited
+        );
+        assert!(
+            st.icmp as f64 <= 100.0 + 100.0 * secs + 1.0,
+            "the per-subscriber limit held"
+        );
+        on.store(false, std::sync::atomic::Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
     }
 }

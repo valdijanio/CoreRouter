@@ -518,7 +518,10 @@ impl Hal for VirtualHal {
     /// refused and got 2 ICMP (the rate limit held back the rest).
     fn cgnat_exhausted(
         &mut self,
-    ) -> (Vec<(std::net::Ipv4Addr, crate::cgnat::Hit)>, crate::cgnat::ExhaustionStats) {
+    ) -> (
+        Vec<(std::net::Ipv4Addr, crate::cgnat::Hit)>,
+        crate::cgnat::ExhaustionStats,
+    ) {
         self.exhausted_polls = self.exhausted_polls.wrapping_add(1);
         if !self.exhausted_polls.is_multiple_of(10) {
             return (Vec::new(), crate::cgnat::ExhaustionStats::default());
@@ -527,7 +530,15 @@ impl Hal for VirtualHal {
             .cgnat_full
             .iter()
             .filter(|a| u32::from(**a).is_multiple_of(3))
-            .map(|a| (*a, crate::cgnat::Hit { refused: 4, icmp: 2 }))
+            .map(|a| {
+                (
+                    *a,
+                    crate::cgnat::Hit {
+                        refused: 4,
+                        icmp: 2,
+                    },
+                )
+            })
             .collect();
         let n = hits.len() as u64;
         (
@@ -538,6 +549,7 @@ impl Hal for VirtualHal {
                 icmp: n * 2,
                 limited: n * 2,
                 untracked: 0,
+                overrun: 0,
             },
         )
     }

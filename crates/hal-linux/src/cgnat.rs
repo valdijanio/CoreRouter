@@ -176,7 +176,12 @@ fn reinstall(to: &Cgnat, blocks: &mut Blocks) {
 }
 
 /// Bring the kernel from `from` to `to`.
-pub fn apply(from: &Cgnat, to: &Cgnat, blocks: &mut Blocks, full: &mut Full) -> Result<(), HalError> {
+pub fn apply(
+    from: &Cgnat,
+    to: &Cgnat,
+    blocks: &mut Blocks,
+    full: &mut Full,
+) -> Result<(), HalError> {
     let (old, new) = (table(from), table(to));
     match (&old, &new) {
         (_, None) => {
