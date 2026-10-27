@@ -11,6 +11,11 @@
 //!   pings the daemon over the TLS control channel from the host.
 //! - `check` (also a unit test, so `cargo xtask ci` runs it without
 //!   downloading anything) validates the configuration files.
+//! - G1.6c: `build` also makes the installer ISO (post-image.sh), the VM
+//!   images (`corerouter.qcow2`, `corerouter.ova`, with the host's
+//!   `qemu-img`) and checks that every ELF of the image finds its
+//!   libraries; `install-test` runs the installer and the VM images in
+//!   QEMU (`os/install.rs`).
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -22,6 +27,7 @@ use crate::Outcome;
 use crate::vm_lab::{download, sha256_file};
 
 mod ab;
+mod install;
 
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
 /// Free space the build wants before it starts (cold build: ~8 GB in
@@ -59,6 +65,14 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_DM_VERITY",
     "CONFIG_DM_INIT",
     "CONFIG_EFIVAR_FS",
+    // G1.6c: the installer's media (CD, USB stick), its unattended flag,
+    // the VMware/VirtualBox disks and ports.
+    "CONFIG_BLK_DEV_SR",
+    "CONFIG_USB_STORAGE",
+    "CONFIG_USB_XHCI_HCD",
+    "CONFIG_FW_CFG_SYSFS",
+    "CONFIG_ATA_PIIX",
+    "CONFIG_VMXNET3",
 ];
 /// Buildroot options the image's design rests on (docs/os-image.md).
 const REQUIRED_BR2: &[&str] = &[
@@ -70,7 +84,18 @@ const REQUIRED_BR2: &[&str] = &[
     "BR2_PACKAGE_COREROUTER=y",
     "BR2_PACKAGE_NFTABLES=y",
     "# BR2_TARGET_ENABLE_ROOT_LOGIN is not set",
+    "BR2_PACKAGE_FRR=y",
+    "BR2_PACKAGE_LIBCAP=y",
+    "BR2_PACKAGE_COREROUTER_INSTALLER=y",
 ];
+/// What the installer kernel's fragment must say (G1.6c).
+const INSTALLER_KERNEL: &[&str] = &[
+    "CONFIG_CMDLINE=\"console=tty0 console=ttyS0,115200 corerouter.mode=install panic=10 quiet\"",
+    "CONFIG_INITRAMFS_COMPRESSION_ZSTD=y",
+    "# CONFIG_DEBUG_INFO_BTF is not set",
+];
+/// The installer's boot image (El Torito counts 16-bit 512-byte sectors).
+const MAX_BOOT_IMAGE: u64 = 65535 * 512;
 const INIT_PATH: &str = "/usr/sbin/corerouter-init";
 /// eth0 on QEMU's user network (slirp: guest 10.0.2.15, gateway 10.0.2.2),
 /// set by the kernel before init (`CONFIG_IP_PNP`).
@@ -78,7 +103,7 @@ const GUEST_IP_ARG: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off";
 /// The daemon's TLS control port inside the image (corerouter-init's plan).
 const GUEST_TLS_PORT: u16 = 8729;
 
-const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|install-test [--tcg]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -89,6 +114,7 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         "build" => build(root, rest),
         "boot-test" => boot_test(root, rest),
         "ab-test" => images_dir(root).and_then(|i| ab::ab_test(root, &i, rest)),
+        "install-test" => images_dir(root).and_then(|i| install::install_test(root, &i, rest)),
         "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
         "check" => check(&root.join("os")).map(|n| eprintln!("ok: os/ configuration ({n} checks)")),
         "-h" | "--help" => {
@@ -368,6 +394,85 @@ pub fn check(os: &Path) -> Result<usize, String> {
         }
         n += 1;
     }
+    n += check_installer(os, &genimage, &version)?;
+    Ok(n)
+}
+
+/// G1.6c: the installer's kernel, boot image and payload stay consistent.
+fn check_installer(os: &Path, genimage: &str, version: &str) -> Result<usize, String> {
+    let read =
+        |rel: &str| std::fs::read_to_string(os.join(rel)).map_err(|e| format!("os/{rel}: {e}"));
+    let mut n = 0;
+    let frag = read("board/x86_64/installer.fragment")?;
+    for want in INSTALLER_KERNEL {
+        if !frag.lines().any(|l| l == *want) {
+            return Err(format!("installer.fragment: missing '{want}'"));
+        }
+        n += 1;
+    }
+    if frag
+        .lines()
+        .any(|l| !l.starts_with('#') && l.contains("root="))
+    {
+        return Err("installer.fragment: the installer runs from its initramfs (no root=)".into());
+    }
+    // The same kernel tarball as the image, with the same hash.
+    let main = kernel_hash(&read("patches/linux/linux.hash")?, version);
+    let inst = kernel_hash(
+        &read("package/corerouter-installer/corerouter-installer.hash")?,
+        version,
+    );
+    if main.is_none() || main != inst {
+        return Err(
+            "corerouter-installer.hash must have the kernel tarball's hash from linux.hash".into(),
+        );
+    }
+    n += 1;
+    let mk = read("package/corerouter-installer/corerouter-installer.mk")?;
+    if !mk.contains("COREROUTER_INSTALLER_DL_SUBDIR = linux") {
+        return Err(
+            "corerouter-installer.mk: share the kernel download (DL_SUBDIR = linux)".into(),
+        );
+    }
+    n += 1;
+    // The boot image: present, the installer kernel inside, under El
+    // Torito's limit; config.ext4 kept for the ISO.
+    let start = genimage
+        .find("image efiboot.vfat {")
+        .ok_or("genimage.cfg: no efiboot.vfat (the installer's boot image)")?;
+    let body = genimage.get(start..).unwrap_or("");
+    if !body.contains("image = \"installer/EFI\"") {
+        return Err("genimage.cfg: efiboot.vfat must hold installer/EFI".into());
+    }
+    let size = body
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("size = ")?
+                .strip_suffix('M')?
+                .parse::<u64>()
+                .ok()
+        })
+        .ok_or("genimage.cfg: efiboot.vfat needs a size in M")?;
+    if size << 20 > MAX_BOOT_IMAGE {
+        return Err(format!(
+            "genimage.cfg: efiboot.vfat of {size} MiB is over El Torito's {MAX_BOOT_IMAGE} bytes"
+        ));
+    }
+    let cfg_start = genimage.find("image config.ext4 {").unwrap_or(0);
+    let cfg_body = genimage.get(cfg_start..).unwrap_or("");
+    let cfg_end = cfg_body.find("\n}").unwrap_or(cfg_body.len());
+    if cfg_body
+        .get(..cfg_end)
+        .unwrap_or("")
+        .contains("temporary = true")
+    {
+        return Err("genimage.cfg: config.ext4 must be kept (the ISO carries it)".into());
+    }
+    if !read("board/x86_64/post-image.sh")?.contains("installer \"$BINARIES_DIR\"") {
+        return Err("post-image.sh: corerouter-image installer makes the ISO".into());
+    }
+    n += 3;
     Ok(n)
 }
 
@@ -524,6 +629,15 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
     // The workspace changes between builds; Buildroot only rebuilds a
     // package whose stamp is gone. cargo is incremental underneath.
     make(&["corerouter-dirclean"], None)?;
+    // G1.6c: the installer kernel embeds the init: rebuilt after it
+    // (kbuild relinks the initramfs and vmlinux only).
+    let installer_dir = d.out.join("build").join(format!(
+        "corerouter-installer-{}",
+        kernel_version(&defconfig_text)?
+    ));
+    for stamp in [".stamp_built", ".stamp_images_installed"] {
+        let _ = std::fs::remove_file(installer_dir.join(stamp));
+    }
     // Buildroot reads the kernel fragment only when it configures the
     // kernel: a changed fragment needs `linux-reconfigure` (the kernel's
     // own make is incremental underneath).
@@ -566,9 +680,30 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             lost.join(" ")
         ));
     }
+    let ic = std::fs::read_to_string(installer_dir.join(".config"))
+        .map_err(|e| format!("installer kernel .config: {e}"))?;
+    // (BTF disappears from .config altogether once debug info is off.)
+    for want in INSTALLER_KERNEL.iter().filter(|w| !w.contains("BTF")) {
+        if !ic.lines().any(|l| l == *want) {
+            return Err(format!("the installer kernel config lost '{want}'"));
+        }
+    }
+    if ic.lines().any(|l| l == "CONFIG_DEBUG_INFO_BTF=y") {
+        return Err("the installer kernel still has BTF".into());
+    }
+    let libs = check_needed(&d.out.join("target"))?;
     let images = d.out.join("images");
+    let boot = std::fs::metadata(images.join("installer/EFI/BOOT/BOOTX64.EFI"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    if boot + (1 << 20) > MAX_BOOT_IMAGE {
+        return Err(format!(
+            "the installer kernel ({boot} bytes) does not fit the boot image"
+        ));
+    }
+    vm_images(root, &images)?;
     eprintln!(
-        "\nimage ({} kernel options checked):",
+        "\nimage ({} kernel options checked, {libs} ELF files find their libraries):",
         fragment_symbols(&fragment).len()
     );
     for f in [
@@ -577,12 +712,16 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         "rootfs.squashfs",
         "rootfs.img",
         "corerouter.crpkg",
+        "installer/EFI/BOOT/BOOTX64.EFI",
+        "corerouter-install.iso",
+        "corerouter.qcow2",
+        "corerouter.ova",
     ] {
         let p = images.join(f);
         let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         let hash = sha256_file(&p).unwrap_or_default();
         eprintln!(
-            "  {f:<16} {:>8.1} MiB  sha256 {hash}",
+            "  {f:<30} {:>8.1} MiB  sha256 {hash}",
             len as f64 / 1048576.0
         );
     }
@@ -590,6 +729,135 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         "  built in {:.1} s → {}",
         started.elapsed().as_secs_f64(),
         images.display()
+    );
+    Ok(())
+}
+
+/// Every ELF file of the image finds each library it names (`DT_NEEDED`)
+/// in `/lib` or `/usr/lib`: post-build.sh removes what FRR's build pulled
+/// in and the image does not need (readline, ncurses, the C++ runtime);
+/// this catches one removal too many. Returns how many files were checked.
+fn check_needed(target: &Path) -> Result<usize, String> {
+    let mut files = Vec::new();
+    let mut stack = vec![target.to_owned()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(&dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .flatten()
+        {
+            let Ok(ft) = e.file_type() else { continue };
+            if ft.is_dir() {
+                stack.push(e.path());
+            } else if ft.is_file() {
+                let mut magic = [0u8; 4];
+                let is_elf = std::fs::File::open(e.path())
+                    .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+                    .is_ok()
+                    && magic == *b"\x7fELF";
+                if is_elf {
+                    files.push(e.path());
+                }
+            }
+        }
+    }
+    let present = |name: &str| {
+        ["lib", "usr/lib"].iter().any(|d| {
+            let p = target.join(d).join(name);
+            // A symlink must resolve inside the image.
+            std::fs::canonicalize(&p).is_ok_and(|r| r.starts_with(target))
+        })
+    };
+    let mut missing = Vec::new();
+    for f in &files {
+        let out = Command::new("readelf")
+            .arg("-d")
+            .arg(f)
+            .output()
+            .map_err(|e| format!("readelf: {e} (binutils)"))?;
+        for l in String::from_utf8_lossy(&out.stdout).lines() {
+            let Some(name) = l
+                .contains("(NEEDED)")
+                .then(|| l.rsplit('[').next()?.strip_suffix(']'))
+                .flatten()
+            else {
+                continue;
+            };
+            if !present(name) {
+                missing.push(format!(
+                    "{} needs {name}",
+                    f.strip_prefix(target).unwrap_or(f).display()
+                ));
+            }
+        }
+    }
+    if missing.is_empty() {
+        Ok(files.len())
+    } else {
+        Err(format!(
+            "libraries missing from the image: {}",
+            missing.join("; ")
+        ))
+    }
+}
+
+/// G1.6c: the VM images of `disk.img` (already the A/B layout; the first
+/// boot creates the boot entries): qcow2 for KVM/Proxmox (compressed
+/// clusters: a distribution image), and an OVA (streamOptimized VMDK +
+/// OVF) for VMware/VirtualBox. With the host's `qemu-img`; without it the
+/// build says so and goes on.
+fn vm_images(root: &Path, images: &Path) -> Result<(), String> {
+    let disk = images.join("disk.img");
+    let have = Command::new("qemu-img")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !have {
+        eprintln!("   no qemu-img on this host: corerouter.qcow2 and corerouter.ova not made");
+        return Ok(());
+    }
+    let t = Instant::now();
+    let conv = |args: &[&str], out: &Path| -> Result<(), String> {
+        let st = Command::new("qemu-img")
+            .args(["convert", "-q", "-f", "raw"])
+            .args(args)
+            .arg(&disk)
+            .arg(out)
+            .status()
+            .map_err(|e| format!("qemu-img: {e}"))?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(format!("qemu-img convert → {}: {st}", out.display()))
+        }
+    };
+    conv(
+        &["-O", "qcow2", "-c", "-o", "compression_type=zlib"],
+        &images.join("corerouter.qcow2"),
+    )?;
+    let tq = t.elapsed();
+    let vmdk = images.join("corerouter-disk1.vmdk");
+    conv(&["-O", "vmdk", "-o", "subformat=streamOptimized"], &vmdk)?;
+    let capacity = std::fs::metadata(&disk)
+        .map(|m| m.len())
+        .map_err(|e| e.to_string())?;
+    let tool = ab::tool(root)?;
+    ab::run_tool(
+        &tool,
+        &[
+            "ova",
+            "--vmdk",
+            &vmdk.display().to_string(),
+            "--capacity",
+            &capacity.to_string(),
+            "--out",
+            &images.join("corerouter.ova").display().to_string(),
+        ],
+    )?;
+    let _ = std::fs::remove_file(&vmdk);
+    eprintln!(
+        "   VM images: qcow2 in {:.1} s, OVA in {:.1} s",
+        tq.as_secs_f64(),
+        (t.elapsed() - tq).as_secs_f64()
     );
     Ok(())
 }

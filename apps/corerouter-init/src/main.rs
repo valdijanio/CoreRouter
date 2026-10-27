@@ -8,18 +8,31 @@
 //! and shuts down cleanly on the signals busybox `reboot`/`poweroff`/`halt`
 //! send. No shell unless the kernel command line asks for one on a terminal
 //! (`corerouter.shell=ttyS0`).
+//!
+//! G1.6c: it also starts FRR's daemons when the image has them, applies
+//! the installer's management address on the first boot, runs the console
+//! setup when no port has an address (`setup`), and is the installer when
+//! the installer ISO's kernel boots it (`corerouter.mode=install`).
 
+#[cfg(target_os = "linux")]
+mod console;
 #[cfg(target_os = "linux")]
 mod ctl;
 #[cfg(target_os = "linux")]
+mod install;
+#[cfg(target_os = "linux")]
 mod pid1;
 mod plan;
+#[cfg(target_os = "linux")]
+mod setup;
 
 #[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if args.first().map(String::as_str) == Some("run") {
-        std::process::exit(ctl::main(args.get(1..).unwrap_or(&[])));
+    match args.first().map(String::as_str) {
+        Some("run") => std::process::exit(ctl::main(args.get(1..).unwrap_or(&[]))),
+        Some("setup") => std::process::exit(setup::main(args.get(1..).unwrap_or(&[]))),
+        _ => {}
     }
     pid1::main();
 }

@@ -7,7 +7,9 @@
 //!   router after a slot is written).
 //! - [`efi`]: `Boot####`, `BootOrder`, `BootNext` in efivarfs — the UEFI
 //!   boot manager is the bootloader, `BootNext` the boot counter.
-//! - [`gpt`]: the slots and the ESP, found by partition name.
+//! - [`gpt`]: the slots and the ESP, found by partition name; a new table.
+//! - [`iso`], [`install`]: the installer's hybrid ISO and what it writes on
+//!   an empty disk (G1.6c).
 //! - [`state`]: the trial across the reboot, configuration snapshots.
 //! - [`ab`]: the operations (status, install, confirm, the boot-time
 //!   decision corerouter-init takes).
@@ -18,6 +20,9 @@
 pub mod ab;
 pub mod efi;
 pub mod gpt;
+#[cfg(unix)]
+pub mod install;
+pub mod iso;
 pub mod package;
 pub mod state;
 pub mod verity;

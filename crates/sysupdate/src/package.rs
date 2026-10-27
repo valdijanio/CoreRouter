@@ -245,6 +245,36 @@ pub fn sign(manifest: &Manifest, pkcs8: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// A detached signature of `msg` (G1.6c: the installer's payload index):
+/// the signing key's id (8 bytes) then the Ed25519 signature (64).
+pub fn sign_detached(msg: &[u8], pkcs8: &[u8]) -> Result<Vec<u8>, String> {
+    let pair = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|e| format!("signing key: {e}"))?;
+    let mut out = key_id(pair.public_key().as_ref()).to_vec();
+    out.extend_from_slice(pair.sign(msg).as_ref());
+    Ok(out)
+}
+
+/// The trusted key whose [`sign_detached`] signature `sig` is, or why none.
+pub fn verify_detached<'k>(msg: &[u8], sig: &[u8], keys: &'k [Key]) -> Result<&'k Key, String> {
+    let (Some(id), Some(s)) = (sig.get(..8), sig.get(8..)) else {
+        return Err("signature truncated".into());
+    };
+    if s.len() != 64 {
+        return Err(format!("signature of {} bytes", sig.len()));
+    }
+    let key = keys.iter().find(|k| k.id == id).ok_or_else(|| {
+        format!(
+            "signed by key {}, which this image does not trust ({} trusted)",
+            hex(id),
+            keys.len()
+        )
+    })?;
+    UnparsedPublicKey::new(&ED25519, &key.public)
+        .verify(msg, s)
+        .map_err(|_| format!("bad signature (key {})", key.id_hex()))?;
+    Ok(key)
+}
+
 pub fn public_hex(pkcs8: &[u8]) -> Result<String, String> {
     let pair = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|e| format!("signing key: {e}"))?;
     Ok(hex(pair.public_key().as_ref()))
@@ -430,6 +460,30 @@ pub(crate) mod tests {
         // Every truncation is an error, never a panic.
         for cut in 0..hdr.len() {
             assert!(Header::read(&mut &hdr[..cut]).is_err());
+        }
+    }
+
+    #[test]
+    fn detached_signature() {
+        let key = generate_key().unwrap();
+        let trusted = vec![Key::from_hex(&public_hex(&key).unwrap()).unwrap()];
+        let msg = br#"{"files":[]}"#;
+        let sig = sign_detached(msg, &key).unwrap();
+        assert_eq!(sig.len(), 72);
+        assert!(verify_detached(msg, &sig, &trusted).is_ok());
+        assert!(
+            verify_detached(b"{}", &sig, &trusted)
+                .unwrap_err()
+                .contains("bad signature")
+        );
+        let other = sign_detached(msg, &generate_key().unwrap()).unwrap();
+        assert!(
+            verify_detached(msg, &other, &trusted)
+                .unwrap_err()
+                .contains("does not trust")
+        );
+        for cut in 0..sig.len() {
+            assert!(verify_detached(msg, &sig[..cut], &trusted).is_err());
         }
     }
 

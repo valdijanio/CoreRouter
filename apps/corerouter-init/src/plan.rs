@@ -16,6 +16,129 @@ pub const CONFIG_DIR: &str = "/config";
 pub const CONFIG_PARTLABEL: &str = "config";
 /// Runtime files (control token); tmpfs.
 pub const RUNTIME_DIR: &str = "/run/corerouter";
+/// FRR's state directory (`/var/run/frr`, its compiled-in default: the vty
+/// sockets and `.pid` files hal-frr reads). `/var/run` is a link to `/run`.
+pub const FRR_DIR: &str = "/var/run/frr";
+/// The FRR daemons present in the image are started in this order (G1.6c):
+/// mgmtd first (the others are its back ends), zebra before the protocols.
+/// These are the ones hal-frr configures, plus staticd (mgmtd's static
+/// routes back end).
+pub const FRR_DAEMONS: &[&str] = &[
+    "mgmtd", "zebra", "staticd", "bgpd", "ospfd", "ospf6d", "ldpd", "bfdd",
+];
+/// Where the FRR daemons are installed.
+pub const FRR_SBIN: &str = "/usr/sbin";
+/// Marks that the installer's management address (`corerouter.mgmt=`) was
+/// applied once, so a later boot does not add it again.
+pub const MGMT_DONE: &str = "/config/.installer-mgmt-applied";
+
+/// The arguments of one FRR daemon: no TCP vty (`-P 0`: the sockets in
+/// [`FRR_DIR`] only), logs on stdout (the init's log file), a 90 MB netlink
+/// receive buffer for zebra (FRR's recommendation for full tables).
+pub fn frr_args(daemon: &str) -> Vec<String> {
+    let mut a: Vec<String> = ["-P", "0", "--log", "stdout", "--log-level", "notifications"]
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect();
+    if daemon == "zebra" {
+        a.extend(["-s".to_owned(), "90000000".to_owned()]);
+    }
+    a
+}
+
+/// What this boot is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// The router (the installed image).
+    Router,
+    /// The installer ISO's kernel (`corerouter.mode=install`, G1.6c).
+    Install,
+}
+
+/// A management address set by the installer for the first boot
+/// (`corerouter.mgmt=<port>,<address/prefix>[,<gateway>]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mgmt {
+    pub interface: String,
+    pub address: String,
+    pub gateway: Option<String>,
+}
+
+impl Mgmt {
+    /// Parses and checks the value (hostile: the command line).
+    pub fn parse(v: &str) -> Result<Mgmt, String> {
+        let mut it = v.split(',');
+        let (Some(i), Some(a)) = (it.next(), it.next()) else {
+            return Err("use <port>,<address/prefix>[,<gateway>]".into());
+        };
+        let g = it.next().filter(|g| !g.is_empty());
+        if it.next().is_some() {
+            return Err("use <port>,<address/prefix>[,<gateway>]".into());
+        }
+        let port_ok = !i.is_empty()
+            && i.len() <= 15
+            && i.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+        if !port_ok {
+            return Err(format!("'{}' is not a port name", clip(i)));
+        }
+        let (ip, len) = a
+            .split_once('/')
+            .ok_or_else(|| format!("'{}': address/prefix", clip(a)))?;
+        let ip: std::net::IpAddr = ip
+            .parse()
+            .map_err(|_| format!("'{}' is not an address", clip(ip)))?;
+        let max = if ip.is_ipv4() { 32 } else { 128 };
+        if !len.parse::<u8>().is_ok_and(|l| l <= max) {
+            return Err(format!("'/{}': prefix length 0..{max}", clip(len)));
+        }
+        if let Some(g) = g {
+            let gw: std::net::IpAddr = g
+                .parse()
+                .map_err(|_| format!("'{}' is not a gateway address", clip(g)))?;
+            if gw.is_ipv4() != ip.is_ipv4() {
+                return Err("address and gateway are of different families".into());
+            }
+        }
+        Ok(Mgmt {
+            interface: i.to_owned(),
+            address: a.to_owned(),
+            gateway: g.map(str::to_owned),
+        })
+    }
+
+    pub fn render(&self) -> String {
+        match &self.gateway {
+            Some(g) => format!("{},{},{g}", self.interface, self.address),
+            None => format!("{},{}", self.interface, self.address),
+        }
+    }
+
+    /// The commands that set it: the port enabled (a port discovered down
+    /// starts disabled), `ip.address.add`, a default route.
+    pub fn commands(&self) -> Vec<(&'static str, serde_json::Value)> {
+        let mut out = vec![
+            (
+                "interface.set",
+                serde_json::json!({"name": self.interface, "disabled": false}),
+            ),
+            (
+                "ip.address.add",
+                serde_json::json!({"address": self.address, "interface": self.interface,
+                "comment": "management (installer)"}),
+            ),
+        ];
+        if let Some(g) = &self.gateway {
+            let dst = if g.contains(':') { "::/0" } else { "0.0.0.0/0" };
+            out.push((
+                "ip.route.add",
+                serde_json::json!({"dst_address": dst, "gateway": g,
+                    "comment": "management (installer)"}),
+            ));
+        }
+        out
+    }
+}
 
 /// A filesystem mounted before anything else runs.
 pub struct Mount {
@@ -95,6 +218,8 @@ pub struct BootOptions {
     pub shell: Option<String>,
     /// `linux` (the default: the router drives this kernel) or `virtual`.
     pub backend: String,
+    pub mode: Mode,
+    pub mgmt: Option<Mgmt>,
     /// Complaints about the command line, logged once at boot.
     pub warnings: Vec<String>,
 }
@@ -106,6 +231,8 @@ impl BootOptions {
         let mut out = BootOptions {
             shell: None,
             backend: "linux".into(),
+            mode: Mode::Router,
+            mgmt: None,
             warnings: Vec::new(),
         };
         for word in cmdline.split_ascii_whitespace() {
@@ -137,6 +264,18 @@ impl BootOptions {
                         clip(value)
                     )),
                 },
+                "mode" => match value {
+                    "install" => out.mode = Mode::Install,
+                    "router" => out.mode = Mode::Router,
+                    _ => out.warnings.push(format!(
+                        "corerouter.mode={}: use install or router",
+                        clip(value)
+                    )),
+                },
+                "mgmt" => match Mgmt::parse(value) {
+                    Ok(m) => out.mgmt = Some(m),
+                    Err(e) => out.warnings.push(format!("corerouter.mgmt: {e}")),
+                },
                 _ => out
                     .warnings
                     .push(format!("corerouter.{}: unknown option", clip(key))),
@@ -151,9 +290,10 @@ fn clip(s: &str) -> String {
     s.chars().take(32).collect()
 }
 
-/// The daemon's arguments in the image.
-pub fn daemon_args(opts: &BootOptions) -> Vec<String> {
-    [
+/// The daemon's arguments in the image (`frr`: FRR is in the image and the
+/// init runs it, G1.6c).
+pub fn daemon_args(opts: &BootOptions, frr: bool) -> Vec<String> {
+    let mut a: Vec<String> = [
         "--backend",
         &opts.backend,
         "--config-dir",
@@ -165,7 +305,21 @@ pub fn daemon_args(opts: &BootOptions) -> Vec<String> {
     ]
     .iter()
     .map(|s| (*s).to_owned())
-    .collect()
+    .collect();
+    if frr {
+        a.extend(["--frr".to_owned(), FRR_DIR.to_owned()]);
+    }
+    a
+}
+
+/// The uid and gid of `user` in `/etc/passwd`.
+pub fn passwd_ids(passwd: &str, user: &str) -> Option<(u32, u32)> {
+    passwd.lines().find_map(|l| {
+        let mut f = l.split(':');
+        (f.next()? == user).then_some(())?;
+        let _ = f.next()?;
+        Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
+    })
 }
 
 /// Restart delay after the daemon dies: 0.5 s doubling up to 30 s, back to
@@ -243,6 +397,8 @@ mod tests {
             BootOptions {
                 shell: None,
                 backend: "linux".into(),
+                mode: Mode::Router,
+                mgmt: None,
                 warnings: vec![]
             }
         );
@@ -266,11 +422,65 @@ mod tests {
 
     #[test]
     fn daemon_command_line() {
-        let a = daemon_args(&BootOptions::parse(""));
+        let a = daemon_args(&BootOptions::parse(""), false);
         assert_eq!(
             a.join(" "),
             "--backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729"
         );
+        let a = daemon_args(&BootOptions::parse(""), true);
+        assert!(a.join(" ").ends_with("--frr /var/run/frr"));
+        assert_eq!(
+            frr_args("zebra").join(" "),
+            "-P 0 --log stdout --log-level notifications -s 90000000"
+        );
+        assert!(!frr_args("bgpd").contains(&"-s".to_owned()));
+        assert_eq!(FRR_DAEMONS.first(), Some(&"mgmtd"));
+    }
+
+    #[test]
+    fn install_mode_and_management_address() {
+        let o = BootOptions::parse(
+            "console=ttyS0 corerouter.mode=install corerouter.mgmt=eth0,10.0.2.15/24,10.0.2.2",
+        );
+        assert_eq!(o.mode, Mode::Install);
+        let m = o.mgmt.unwrap();
+        assert_eq!(m.render(), "eth0,10.0.2.15/24,10.0.2.2");
+        let c = m.commands();
+        assert_eq!(c[0].0, "interface.set");
+        assert_eq!(c[0].1["disabled"], false);
+        assert_eq!(c[1].0, "ip.address.add");
+        assert_eq!(c[1].1["interface"], "eth0");
+        assert_eq!(c[2].1["dst_address"], "0.0.0.0/0");
+        let v6 = Mgmt::parse("ether1,2001:db8::2/64,2001:db8::1").unwrap();
+        assert_eq!(v6.commands()[2].1["dst_address"], "::/0");
+        assert_eq!(
+            Mgmt::parse("eth0,192.0.2.1/24").unwrap().commands().len(),
+            2
+        );
+        for bad in [
+            "",
+            "eth0",
+            "eth0,10.0.0.1",
+            "eth0,10.0.0.1/33",
+            "eth0,10.0.0.1/24,::1",
+            "eth 0,10.0.0.1/24",
+            "eth0,10.0.0.1/24,10.0.0.254,x",
+            "../../x,10.0.0.1/24",
+        ] {
+            assert!(Mgmt::parse(bad).is_err(), "{bad}");
+        }
+        let o = BootOptions::parse("corerouter.mode=rescue corerouter.mgmt=nope");
+        assert_eq!(o.mode, Mode::Router);
+        assert_eq!(o.warnings.len(), 2);
+    }
+
+    #[test]
+    fn passwd_lookup() {
+        let p =
+            "root:x:0:0:root:/root:/bin/sh\nfrr:x:100:101:FRR user priv:/var/run/frr:/bin/false\n";
+        assert_eq!(passwd_ids(p, "frr"), Some((100, 101)));
+        assert_eq!(passwd_ids(p, "nobody"), None);
+        assert_eq!(passwd_ids("frr:x:a:b", "frr"), None);
     }
 
     #[test]
