@@ -33,7 +33,9 @@ pub struct Config {
     pub ip: CowArc<Ip>,
     /// `/ipv6` (G4.7b): DHCPv6 clients and the Router Advertisement policy.
     pub ipv6: Ipv6,
-    pub routing: Routing,
+    /// A shared section (G3.2a): with thousands of BGP connections, a
+    /// commit that does not touch routing neither copies nor serializes it.
+    pub routing: CowArc<Routing>,
     /// `/radius` (G4.3j): servers, incoming CoA/DM.
     #[serde(skip_serializing_if = "crate::radius::Radius::is_default")]
     pub radius: crate::radius::Radius,
@@ -377,6 +379,12 @@ fn default_distance() -> u8 {
 #[serde(default, deny_unknown_fields)]
 pub struct Routing {
     pub bgp: BTreeMap<String, BgpInstance>,
+    /// `/routing bgp template` (G3.2a, `crate::bgp`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub bgp_templates: BTreeMap<String, crate::bgp::BgpTemplate>,
+    /// `/routing bgp connection`: the neighbors, by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub bgp_connections: BTreeMap<String, crate::bgp::BgpConnection>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

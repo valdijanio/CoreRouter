@@ -11,7 +11,7 @@ use crate::{Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.bgp.session.list", "BGP Sessions", ["Routing", "BGP"], None,
-        "{instance?: string} → [{instance, vrf, remote_address, remote_as, local_as, remote_id, state, established, uptime_secs, prefix_count, prefix_sent, messages_received, messages_sent, reason, description}]",
+        "{instance?: string, connection?: string} → [{instance, vrf, remote_address, remote_as, local_as, remote_id, state, established, uptime_secs, prefix_count, prefix_sent, messages_received, messages_sent, reason, description, connection? (the routing.bgp.connection), hold_time?, keepalive_time? (negotiated, s), last_error?, flaps?, bfd?, afi?: [string], policy_in?, policy_out?}]",
         always, session_list),
     cmd!(query "routing.backend.get", "Routing Backend", ["Routing"], None,
         "{} → {backend, attached, updated, error, bgp_sessions}",
@@ -20,6 +20,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
 
 fn session_list(s: &mut Session, p: &Value) -> Result<Value> {
     let instance = opt_str(p, "instance")?;
+    let connection = opt_str(p, "connection")?;
     let Some(status) = s.routing_status() else {
         return Ok(json!([]));
     };
@@ -27,6 +28,7 @@ fn session_list(s: &mut Session, p: &Value) -> Result<Value> {
         .bgp_sessions
         .iter()
         .filter(|b| instance.is_none_or(|i| b.instance == i))
+        .filter(|b| connection.is_none_or(|c| b.connection.as_deref() == Some(c)))
         .map(|b| serde_json::to_value(b).unwrap_or(Value::Null))
         .collect();
     Ok(Value::Array(rows))

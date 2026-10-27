@@ -80,7 +80,7 @@ fn live_frr() {
         .insert("default".into(), instance(65000, "198.51.100.1"));
     let mut driver = base.clone();
     driver.apply(&Config::default(), &cfg).unwrap();
-    let want = corerouter_hal_frr::render::render(&cfg).unwrap();
+    let want = base.render(&cfg).unwrap();
     assert_eq!(diff(&running(&base), &want), Vec::<String>::new());
     let mut off = cfg.clone();
     if let Some(i) = off.routing.bgp.get_mut("default") {
