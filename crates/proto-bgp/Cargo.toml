@@ -10,6 +10,15 @@ repository.workspace = true
 
 [dependencies]
 corerouter-model.workspace = true
+ipnet.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "rpki"
+harness = false
 
 [lints]
 workspace = true
