@@ -8,6 +8,7 @@
 //! for each answer. A new connection starts in the view node.
 
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 use std::time::Duration;
@@ -58,6 +59,44 @@ pub fn code_name(code: u8) -> &'static str {
         15 => "no level up",
         16 => "no daemon",
         _ => "error",
+    }
+}
+
+/// FRR runs on Unix only; elsewhere (the daemon and the CLI build for
+/// Windows too) there is no stream and every connect is refused.
+#[cfg(not(unix))]
+enum UnixStream {}
+
+#[cfg(not(unix))]
+impl UnixStream {
+    fn connect(_: &Path) -> io::Result<Self> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "FRR is not supported on this platform",
+        ))
+    }
+    fn set_read_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+        match *self {}
+    }
+    fn set_write_timeout(&self, _: Option<Duration>) -> io::Result<()> {
+        match *self {}
+    }
+}
+
+#[cfg(not(unix))]
+impl Read for UnixStream {
+    fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+        match *self {}
+    }
+}
+
+#[cfg(not(unix))]
+impl Write for UnixStream {
+    fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+        match *self {}
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        match *self {}
     }
 }
 
@@ -142,6 +181,7 @@ impl Vty {
 }
 
 #[cfg(test)]
+#[cfg(unix)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
