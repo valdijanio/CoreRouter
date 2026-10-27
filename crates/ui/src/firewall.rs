@@ -20,7 +20,7 @@ use crate::dialog::{self, Buttons, Footer, Form, Head, Press, Status};
 use crate::firewall_assist::{Wizard, WizardForm};
 use crate::interfaces::{cascade, dialog_id};
 use crate::chip;
-use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment};
+use crate::table::{self, Icon, Menu, Row, Shortcut, TableState, action, col, comment, num};
 use crate::{CoreRouterUi, RequestId, Then, Win, value_text};
 
 /// Property windows opened at once from one selection.
@@ -252,6 +252,10 @@ pub(crate) enum Tab {
     Zones,
     /// The conntrack table (G2.2, `connections.rs`).
     Connections,
+    /// Packet tester and trace (G2.1c, `firewall_diag.rs`).
+    Test,
+    /// The nftables ruleset before the commit (G2.1c).
+    Diff,
 }
 
 impl Tab {
@@ -265,6 +269,8 @@ impl Tab {
             Tab::Addr => ("firewall.tab.address-list", "Address Lists"),
             Tab::Zones => ("firewall.tab.zones", "Zones"),
             Tab::Connections => ("firewall.tab.connections", "Connections"),
+            Tab::Test => ("firewall.tab.test", "Test"),
+            Tab::Diff => ("firewall.tab.diff", "Diff"),
         }
     }
 }
@@ -809,6 +815,8 @@ enum Act {
     Refresh,
     /// Open an assistant (G2.1b).
     Wizard(Wizard),
+    /// Zero the live counters of these rules (all of the table if empty).
+    ResetCounters(Vec<String>),
 }
 
 /// Colour of a rule by what it does (readable on both themes).
@@ -826,7 +834,7 @@ pub(crate) fn action_color(action: &str, dark: bool) -> Option<Color32> {
     Some(Color32::from_rgb(r, g, b))
 }
 
-const RULE_COLUMNS: [table::Column; 13] = [
+const RULE_COLUMNS: [table::Column; 17] = [
     col("#"),
     col(""),
     col("Chain"),
@@ -838,9 +846,70 @@ const RULE_COLUMNS: [table::Column; 13] = [
     col("Dst. Port"),
     col("In. Interface"),
     col("Out. Interface"),
+    // Live counters (G2.1c), read from the kernel while the window is open.
+    num("Packets").help("firewall.col.packets"),
+    num("Bytes").help("firewall.col.bytes"),
+    num("Rate").help("firewall.col.rate"),
+    col("Last Used").help("firewall.col.last-used"),
     col("Descrição"),
     comment(),
 ];
+
+/// "1.2 k", "3.4 M": counts the way WinBox shortens them.
+fn count(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..1_000_000 => format!("{:.1} k", n as f64 / 1e3),
+        1_000_000..1_000_000_000 => format!("{:.1} M", n as f64 / 1e6),
+        _ => format!("{:.1} G", n as f64 / 1e9),
+    }
+}
+
+fn bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u + 1 < UNITS.len() {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS.get(u).copied().unwrap_or("B"))
+    }
+}
+
+/// "now", "5 s", "3 min", "2 h", "4 d".
+pub(crate) fn ago(secs: u64) -> String {
+    match secs {
+        0..3 => "now".into(),
+        3..120 => format!("{secs} s"),
+        120..7_200 => format!("{} min", secs / 60),
+        7_200..172_800 => format!("{} h", secs / 3600),
+        _ => format!("{} d", secs / 86_400),
+    }
+}
+
+/// The four counter cells of a rule (empty before the first read; a
+/// rule unused for the stale period gets an amber `stale` chip).
+fn counter_cells(r: &Value) -> [String; 4] {
+    let Some(p) = r.get("packets").and_then(Value::as_u64) else {
+        return Default::default();
+    };
+    let b = r.get("bytes").and_then(Value::as_u64).unwrap_or(0);
+    let pps = r.get("pps").and_then(Value::as_f64).unwrap_or(0.0);
+    let idle = r.get("idle_secs").and_then(Value::as_u64).unwrap_or(0);
+    let used = r.get("last_used").is_some_and(|v| !v.is_null());
+    let last = if used { ago(idle) } else { format!("— ({})", ago(idle)) };
+    let last = if flag(r, "stale") {
+        chip::cell(&last, &[("stale", chip::Kind::Amber)])
+    } else {
+        last
+    };
+    let rate = if pps > 0.0 { format!("{pps:.1} pps") } else { String::new() };
+    [count(p), bytes(b), rate, last]
+}
 
 /// "10.0.0.0/8", "@blocked", or both.
 fn join(a: String, b: String) -> String {
@@ -964,7 +1033,7 @@ fn rule_row(r: &Value, positions: &HashMap<&str, &Value>, visuals: &egui::Visual
     };
     Row {
         key: text(r, "id"),
-        cells: vec![
+        cells: [
             text(r, "position"),
             flags,
             text(r, "chain"),
@@ -976,13 +1045,18 @@ fn rule_row(r: &Value, positions: &HashMap<&str, &Value>, visuals: &egui::Visual
             text(r, "dst_port"),
             iface_cell(r, "in_interface", "in_interface_list"),
             iface_cell(r, "out_interface", "out_interface_list"),
+        ]
+        .into_iter()
+        .chain(counter_cells(r))
+        .chain([
             if section {
                 String::new()
             } else {
                 description(r, positions)
             },
             text(r, "comment"),
-        ],
+        ])
+        .collect(),
         dimmed: flag(r, "disabled"),
         section,
         tint,
@@ -1167,6 +1241,8 @@ impl CoreRouterUi {
                 (Tab::Addr, "Address Lists"),
                 (Tab::Zones, "Zones"),
                 (Tab::Connections, "Connections"),
+                (Tab::Test, "Test"),
+                (Tab::Diff, "Diff"),
             ] {
                 ui.selectable_value(&mut self.fw.tab, tab, crate::i18n::tr_in("firewall", self.lang.labels, label));
             }
@@ -1185,6 +1261,8 @@ impl CoreRouterUi {
             Tab::Addr => self.simple_tab(ui, Feed::Addr),
             Tab::Zones => self.zones_tab(ui),
             Tab::Connections => self.connections_tab(ui),
+            Tab::Test => self.firewall_diag_tab(ui, crate::firewall_diag::View::Test),
+            Tab::Diff => self.firewall_diag_tab(ui, crate::firewall_diag::View::Diff),
         }
     }
 
@@ -1192,6 +1270,15 @@ impl CoreRouterUi {
     /// Connections panel asks for the table only then).
     pub(crate) fn firewall_tab_is_connections(&self) -> bool {
         self.fw.tab == Tab::Connections
+    }
+
+    /// The Test or Diff tab, when one is open (G2.1c).
+    pub(crate) fn firewall_diag_view(&self) -> Option<crate::firewall_diag::View> {
+        match self.fw.tab {
+            Tab::Test => Some(crate::firewall_diag::View::Test),
+            Tab::Diff => Some(crate::firewall_diag::View::Diff),
+            _ => None,
+        }
     }
 
     /// Interfaces › Interface List.
@@ -1301,6 +1388,15 @@ impl CoreRouterUi {
                     }
                 }
             });
+            let reset = t.cmd("reset-counters");
+            let what = if selection.is_empty() {
+                "Reset All Counters"
+            } else {
+                "Reset Counters"
+            };
+            if action(ui, what, can.check(&reset)) {
+                act = Some(Act::ResetCounters(selection.clone().into_vec()));
+            }
             let mut picked = chain.clone();
             let mut chains: Vec<String> = vec![String::new()];
             chains.extend(t.chains().iter().map(|c| (*c).to_owned()));
@@ -1718,6 +1814,19 @@ impl CoreRouterUi {
                 self.run(&t.cmd("move"), p);
             }
             Act::Wizard(w) => self.open_wizard(w),
+            Act::ResetCounters(keys) => {
+                if let Some(t) = f.table() {
+                    let cmd = t.cmd("reset-counters");
+                    if keys.is_empty() {
+                        self.run(&cmd, json!({}));
+                    } else {
+                        for k in keys {
+                            self.run(&cmd, json!({ "id": k }));
+                        }
+                    }
+                    self.cache.refreshed_at = None;
+                }
+            }
             Act::SelectAll => self.fw_table(f).select_all(rows),
             Act::Refresh => self.cache.refreshed_at = None,
         }
