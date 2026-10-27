@@ -20,6 +20,10 @@
 //! session it does not know, and they redial on B (stateless: phase 1).
 //! The time until every CPE is up again is printed (`docs/bng-ha.md`).
 //!
+//! G4.3hb: after a switchover, a RADIUS server that still sends its CoA
+//! and Disconnect-Request to A (now the standby) gets them applied by B
+//! through the sync link, and A's answer says what B did.
+//!
 //! Helpers outside `#[test]` fns may unwrap/panic too.
 #![cfg(target_os = "linux")]
 #![allow(
@@ -356,6 +360,8 @@ fn a_pair_serves_pppoe_stateless_and_hot_standby() {
     stateless_the_cpes_redial_on_the_new_active();
     teardown();
     hot_standby_keeps_every_session_when_the_active_dies();
+    teardown();
+    coa_to_the_old_active_reaches_the_new_one();
 }
 
 fn stateless_the_cpes_redial_on_the_new_active() {
@@ -399,4 +405,129 @@ fn hot_standby_keeps_every_session_when_the_active_dies() {
     assert_eq!(active(Some(b)), n, "B holds every session");
     let h = call(Some(b), "ppp.history", json!({"limit": 5})).unwrap();
     assert!(h.to_string().contains("takeover"), "{h}");
+}
+
+const COA_SECRET: &str = "segredo-do-coa";
+
+/// The RADIUS server's CoA client: 127.0.0.1 (a `/radius` entry on both
+/// nodes), sending to A's `/radius incoming` port.
+fn radius_incoming(netns: Option<u32>) {
+    ok(
+        netns,
+        "radius.add",
+        json!({"address": "127.0.0.1", "service": ["ppp"], "secret": COA_SECRET}),
+    );
+    ok(
+        netns,
+        "radius.incoming.set",
+        json!({"accept": true, "port": 3799}),
+    );
+}
+
+/// One CoA (rate) or Disconnect for `ip`: the reply's code and Error-Cause,
+/// and how long it took.
+fn coa_to_a(
+    sock: &std::net::UdpSocket,
+    id: u8,
+    ip: std::net::Ipv4Addr,
+    rate: Option<&str>,
+) -> (corerouter_proto_radius::packet::Code, Option<u32>, Duration) {
+    use corerouter_proto_radius::dynauth::{RequestKind, build_request};
+    use corerouter_proto_radius::packet::{AttrList, Packet, PushAttr, attr};
+    let mut l = AttrList::new();
+    l.push_ipv4(attr::FRAMED_IP_ADDRESS, ip).unwrap();
+    let kind = match rate {
+        Some(r) => {
+            l.push_vsa(14988, 8, r.as_bytes()).unwrap();
+            RequestKind::Coa
+        }
+        None => RequestKind::Disconnect,
+    };
+    let req = build_request(kind, id, &l, COA_SECRET.as_bytes(), true);
+    let t = Instant::now();
+    sock.send_to(&req, ("127.0.0.1", 3799)).unwrap();
+    let mut buf = [0u8; 4096];
+    let (n, _) = sock.recv_from(&mut buf).expect("no answer to the CoA");
+    let took = t.elapsed();
+    let p = Packet::parse(&buf[..n]).unwrap();
+    (p.code(), p.attr_u32(attr::ERROR_CAUSE), took)
+}
+
+fn addresses(netns: Option<u32>) -> Vec<(std::net::Ipv4Addr, Value)> {
+    let l = ok(netns, "ppp.active.list", json!({}));
+    l["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| Some((r["address"].as_str()?.parse().ok()?, r.clone())))
+        .collect()
+}
+
+fn coa_to_the_old_active_reaches_the_new_one() {
+    use corerouter_proto_radius::packet::Code;
+    let (_holder, _a, _b_daemon, mut cpes, b, n) = pair("hot-standby");
+    radius_incoming(None);
+    radius_incoming(Some(b));
+    wait_for("both listening for CoA", || {
+        [None, Some(b)].iter().all(|ns| {
+            call(*ns, "radius.incoming.get", json!({})).is_ok_and(|v| v["listening"].is_string())
+        })
+    });
+    wait_for("the replica", || {
+        call(Some(b), "ppp.redundancy.monitor", json!({}))
+            .is_ok_and(|m| m["sync"]["synced"].as_u64() == Some(n as u64) && m["in_sync"] == true)
+    });
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    sock.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    let on_a = addresses(None);
+    let (ip0, _) = on_a[0].clone();
+    // On the active: applied there.
+    let (code, _, local) = coa_to_a(&sock, 1, ip0, Some("7M/7M"));
+    assert_eq!(code, Code::CoaAck);
+
+    // Switchover: B active, A the standby; the server still knows A.
+    ok(None, "ppp.redundancy.switchover", json!({}));
+    wait_for("B active, A standby", || {
+        role(Some(b)) == "active" && role(None) == "standby"
+    });
+    wait_for("B holds every session", || active(Some(b)) == n);
+    cpes.run_until(3, |_| false);
+    // CoA to A: B applies it, A answers ACK.
+    let on_b = addresses(Some(b));
+    let mut times = Vec::new();
+    for (k, (ip, _)) in on_b.iter().take(20).enumerate() {
+        let (code, cause, t) = coa_to_a(&sock, 10 + k as u8, *ip, Some("9M/9M"));
+        assert_eq!(
+            (code, cause),
+            (Code::CoaAck, None),
+            "CoA {k} through the peer"
+        );
+        times.push(t);
+    }
+    times.sort();
+    let rate_on_b = addresses(Some(b))
+        .into_iter()
+        .filter(|(ip, _)| on_b.iter().take(20).any(|(x, _)| x == ip))
+        .filter(|(_, r)| r["rate_limit"] == "9M/9M")
+        .count();
+    assert_eq!(rate_on_b, 20.min(on_b.len()), "B applied the rate");
+    // An address nobody holds: NAK 503, through the peer.
+    let (code, cause, _) = coa_to_a(&sock, 40, "198.18.0.1".parse().unwrap(), None);
+    assert_eq!((code, cause), (Code::DisconnectNak, Some(503)));
+    // A Disconnect through A ends the session on B.
+    let (ip_end, _) = on_b[0].clone();
+    let (code, cause, _) = coa_to_a(&sock, 41, ip_end, None);
+    assert_eq!((code, cause), (Code::DisconnectAck, None));
+    wait_for("the session gone from B", || {
+        !addresses(Some(b)).iter().any(|(ip, _)| *ip == ip_end)
+    });
+    let inc = ok(None, "radius.incoming.get", json!({}));
+    eprintln!(
+        "CoA on the active {local:?}; to the old active, through the peer: median {:?}, max {:?} (20); A forwarded {} answered {}",
+        times[times.len() / 2],
+        times[times.len() - 1],
+        inc["forwarded"],
+        inc["forward_answered"]
+    );
+    assert_eq!(inc["forwarded"], 22, "{inc}");
 }

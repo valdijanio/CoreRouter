@@ -168,7 +168,10 @@ mesmo servidor (endereço, porta, VRF) duas vezes para o mesmo serviço, RadSec.
   §5), Event-Timestamp fora da janela também; a retransmissão recebe a mesma resposta do cache,
   sem aplicar de novo. O pedido conferido vai aos donos de sessão registrados
   (`AaaBackend::register_owner`, o ponto em que o G4.3d se pluga) e, sem dono que o aceite, volta
-  NAK com Error-Cause 503 (Session Context Not Found).
+  NAK com Error-Cause 503 (Session Context Not Found). Num par de BNGs em alta disponibilidade, o
+  nó que não atende os assinantes encaminha ao outro, pelo link de sync, o pedido que nenhuma
+  sessão dele reivindica. Ele responde ao servidor com o que o par disse (G4.3hb,
+  `docs/bng-ha.md` §2.11). Par mudo por 2 s: NAK 505.
 - **Log em português**, tópico `radius` (`servidor … fora do ar; usando o próximo da lista`,
   `… recusado por …`, `CoA de … aceito`).
 

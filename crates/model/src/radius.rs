@@ -607,6 +607,12 @@ pub struct IncomingMonitor {
     pub duplicates: u64,
     /// Session owners registered (PPP, IPoE…).
     pub owners: u64,
+    /// G4.3hb: requests no session here claimed, handed to the other BNG
+    /// of the pair, and the ones it answered for us.
+    #[serde(default)]
+    pub forwarded: u64,
+    #[serde(default)]
+    pub forward_answered: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
 }
