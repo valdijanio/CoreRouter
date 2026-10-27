@@ -112,7 +112,9 @@ fn thousands_of_neighbors_dump_with_their_states() {
     // Learned entries count against gc_thresh3 (1024 by default, a
     // global of the first namespace): most are permanent (exempt).
     for i in 0..N {
-        let state = match i % 10 {
+        // 200 learned, far under gc_thresh3 (1024): a full table would
+        // refuse the incomplete entry below ("neighbour table overflow").
+        let state = match i % 50 {
             0 => "reachable",
             1 => "stale",
             _ => "permanent",
@@ -141,19 +143,29 @@ fn thousands_of_neighbors_dump_with_their_states() {
         mine.iter()
             .filter(|n| n.state == NeighState::Permanent)
             .count(),
-        (N as usize) * 8 / 10
+        (N as usize) * 48 / 50
     );
     // An address nobody answers: the kernel asks, and the entry is
     // incomplete (RFC 4861 §7.3.2 INCOMPLETE; ARP the same in Linux).
     let s = UdpSocket::bind("10.20.0.1:0").unwrap();
-    let _ = s.send_to(b"x", "10.20.255.250:9");
     let lone: IpAddr = "10.20.255.250".parse().unwrap();
-    let n = LinuxHal::new()
-        .neighbors()
-        .unwrap()
-        .into_iter()
-        .find(|n| n.address == lone)
-        .expect("the kernel made an entry");
+    let t = Instant::now();
+    let n = loop {
+        let _ = s.send_to(b"x", "10.20.255.250:9");
+        if let Some(n) = LinuxHal::new()
+            .neighbors()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.address == lone)
+        {
+            break n;
+        }
+        assert!(
+            t.elapsed() < Duration::from_secs(3),
+            "the kernel made no entry"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert!(
         matches!(n.state, NeighState::Incomplete | NeighState::Failed),
         "{n:?}"
