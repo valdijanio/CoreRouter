@@ -67,6 +67,36 @@ pub const TOOLS: &[Tool] = &[
         source: Source::Apt,
         why: "NIC offloads and channels",
     },
+    // G3.1: FRR from the project's own repository (Ubuntu's 8.4 predates
+    // mgmtd). Hashes from deb.frrouting.org's `Packages` for noble, whose
+    // `InRelease` checks against the FRR signing key A90FC36D…AB194DBF.
+    Tool {
+        package: "libyang3",
+        version: "3.13.6",
+        source: Source::Deb {
+            url: "https://deb.frrouting.org/frr/pool/frr-stable/liby/libyang3/libyang3_3.13.6-1~ubuntu24.04u1_amd64.deb",
+            sha256: "03ffcf092652aa41a5f474de2a24902fc21502e2fe1c70ff22c15f7859ad166f",
+        },
+        why: "YANG library FRR 10 links against",
+    },
+    Tool {
+        package: "frr",
+        version: "10.7.1",
+        source: Source::Deb {
+            url: "https://deb.frrouting.org/frr/pool/frr-stable/f/frr/frr_10.7.1-0~ubuntu24.04.1_amd64.deb",
+            sha256: "05d17ad3abe56df9090f6637dfad9cd3fd84987df34ee2cd6e8d6928c730ec4b",
+        },
+        why: "FRRouting: bgpd/ospfd/zebra/mgmtd driven by hal-frr (G3.1)",
+    },
+    Tool {
+        package: "frr-pythontools",
+        version: "10.7.1",
+        source: Source::Deb {
+            url: "https://deb.frrouting.org/frr/pool/frr-stable/f/frr/frr-pythontools_10.7.1-0~ubuntu24.04.1_all.deb",
+            sha256: "c17efa8c84c7f63e63d8352dd90e50fd9c694625a1cf10f8e7261208dd529626",
+        },
+        why: "frr-reload.py, the baseline hal-frr is measured against (G3.1)",
+    },
 ];
 
 impl Tool {
@@ -185,12 +215,14 @@ mod tests {
     fn missing_reads_dpkg_query() {
         let dpkg = "bngblaster installed 1.0.1\nppp installed 2.4.9-1+1.1ubuntu3\n\
                     pppoe config-files 3.15-1\ntcpdump installed 4.99.4-3ubuntu4\n\
-                    ethtool installed 1:6.7-1build1\n";
+                    ethtool installed 1:6.7-1build1\n\
+                    libyang3 installed 3.13.6-1~ubuntu24.04u1\n\
+                    frr installed 10.7.1-0~ubuntu24.04.1\n";
         let names: Vec<&str> = missing(TOOLS, dpkg)
             .iter()
             .map(|(t, _)| t.package)
             .collect();
-        assert_eq!(names, ["pppoe", "iperf3"]);
+        assert_eq!(names, ["pppoe", "iperf3", "frr-pythontools"]);
         let old = missing(TOOLS, "bngblaster installed 0.9.30\n");
         let (t, have) = old.first().unwrap();
         assert_eq!((t.package, have.as_deref()), ("bngblaster", Some("0.9.30")));

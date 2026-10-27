@@ -43,6 +43,9 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-proto-radius", 2),
     // G4.3h: BNG high availability: sync protocol, role machine, fencing (sans-IO).
     ("corerouter-proto-ha", 2),
+    // G3.1: the FRR driver renders with the proto-* crates (L2), so it sits
+    // beside them; as a platform crate only the apps use it.
+    ("corerouter-hal-frr", 2),
     ("corerouter-engine", 3),
     ("corerouter-control", 4),
     ("corerouter-mcp", 4),
@@ -73,6 +76,8 @@ pub const SIDEWAYS_ALLOWED: &[(&str, &str)] = &[
     // The PPP authenticator reuses the RADIUS MS-CHAP/MPPE arithmetic and
     // the `Mikrotik-Rate-Limit` type of the session descriptor (G4.3a).
     ("corerouter-proto-pppoe", "corerouter-proto-radius"),
+    // The FRR driver renders the routing protocols' config (G3.1).
+    ("corerouter-hal-frr", "corerouter-proto-bgp"),
 ];
 
 pub const UI_CRATES: &[&str] = &[
