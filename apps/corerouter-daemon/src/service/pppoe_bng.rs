@@ -442,7 +442,9 @@ impl PppBackend for Backend {
     fn who_vlan(&self, ip: Ipv4Addr) -> Option<(String, u16)> {
         let sh = guard(&self.0);
         let id = sh.by_ip.get(&ip)?;
-        sh.active.get(id).map(|a| (a.name.clone(), a.vlan.unwrap_or(0)))
+        sh.active
+            .get(id)
+            .map(|a| (a.name.clone(), a.vlan.unwrap_or(0)))
     }
 
     fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {

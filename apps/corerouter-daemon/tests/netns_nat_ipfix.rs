@@ -119,7 +119,8 @@ fn take(got: &Shared, d: &mut Decoder, msg: &[u8], next: &mut Option<u32>) {
             g.nat_codes.push(c);
         }
     }
-    g.records.extend(m.records.iter().filter_map(|r| to_record(r, &m)));
+    g.records
+        .extend(m.records.iter().filter_map(|r| to_record(r, &m)));
 }
 
 /// Messages back to back on a byte stream, each framed by its own length
@@ -144,7 +145,11 @@ fn sctp_collector(port: u16) -> Shared {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let l = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::from(132))).unwrap();
     l.set_reuse_address(true).unwrap();
-    l.bind(&SockAddr::from(std::net::SocketAddr::from(([127, 0, 0, 1], port)))).unwrap();
+    l.bind(&SockAddr::from(std::net::SocketAddr::from((
+        [127, 0, 0, 1],
+        port,
+    ))))
+    .unwrap();
     l.listen(4).unwrap();
     let got: Shared = Arc::default();
     let g = got.clone();
@@ -285,7 +290,10 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
     }
     // A module the host has not loaded stays absent: socket(SCTP) would
     // fail with "protocol not supported".
-    for (m, var) in [("sctp", "COREROUTER_REQUIRE_SCTP"), ("nfnetlink_queue", "COREROUTER_REQUIRE_NFQUEUE")] {
+    for (m, var) in [
+        ("sctp", "COREROUTER_REQUIRE_SCTP"),
+        ("nfnetlink_queue", "COREROUTER_REQUIRE_NFQUEUE"),
+    ] {
         let required = std::env::var(var).is_ok_and(|v| v == "1");
         if !module(m) {
             assert!(!required, "the kernel module {m} is not loaded");
@@ -301,8 +309,18 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
     let b = namespace_b();
     let c = namespace_b();
     let (bp, cp) = (b.0.id(), c.0.id());
-    ip(None, &["link", "add", "lan0", "type", "veth", "peer", "name", "sub0"]);
-    ip(None, &["link", "add", "wan0", "type", "veth", "peer", "name", "srv0"]);
+    ip(
+        None,
+        &[
+            "link", "add", "lan0", "type", "veth", "peer", "name", "sub0",
+        ],
+    );
+    ip(
+        None,
+        &[
+            "link", "add", "wan0", "type", "veth", "peer", "name", "srv0",
+        ],
+    );
     ip(None, &["link", "set", "sub0", "netns", &bp.to_string()]);
     ip(None, &["link", "set", "srv0", "netns", &cp.to_string()]);
     // The subscribers: three addresses, and every address of
@@ -313,8 +331,14 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         ip(Some(bp), &["addr", "add", a, "dev", "sub0"]);
     }
     ip(Some(bp), &["link", "set", "sub0", "up"]);
-    ip(Some(bp), &["route", "add", "default", "via", "100.64.0.254"]);
-    ip(Some(bp), &["route", "add", "local", "100.64.128.0/17", "dev", "lo"]);
+    ip(
+        Some(bp),
+        &["route", "add", "default", "via", "100.64.0.254"],
+    );
+    ip(
+        Some(bp),
+        &["route", "add", "local", "100.64.128.0/17", "dev", "lo"],
+    );
     ip(Some(cp), &["link", "set", "lo", "up"]);
     ip(Some(cp), &["addr", "add", "192.0.2.2/24", "dev", "srv0"]);
     ip(Some(cp), &["link", "set", "srv0", "up"]);
@@ -324,7 +348,10 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         ip(None, &["link", "set", i, "up"]);
     }
     sh(None, "echo 1 > /proc/sys/net/ipv4/ip_forward");
-    sh(None, "echo 1 > /proc/sys/net/netfilter/nf_conntrack_udp_timeout");
+    sh(
+        None,
+        "echo 1 > /proc/sys/net/netfilter/nf_conntrack_udp_timeout",
+    );
 
     let pki = pki();
     let sctp = sctp_collector(4739);
@@ -335,13 +362,23 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
     let _ = std::fs::remove_dir_all(&dir);
     let log = std::fs::File::create(std::env::temp_dir().join("g44j-netns.log")).unwrap();
     let mut cmd = Command::new(DAEMON);
-    cmd.args(["--backend", "linux", "--no-discovery", "--control", PORT, "--config-dir"])
-        .arg(&dir)
-        .arg("--token-file")
-        .arg(common::token_file(None, &dir))
-        .env("RUST_LOG", std::env::var("COREROUTER_DAEMON_LOG").unwrap_or_else(|_| "info".into()))
-        .stdout(Stdio::null())
-        .stderr(log);
+    cmd.args([
+        "--backend",
+        "linux",
+        "--no-discovery",
+        "--control",
+        PORT,
+        "--config-dir",
+    ])
+    .arg(&dir)
+    .arg("--token-file")
+    .arg(common::token_file(None, &dir))
+    .env(
+        "RUST_LOG",
+        std::env::var("COREROUTER_DAEMON_LOG").unwrap_or_else(|_| "info".into()),
+    )
+    .stdout(Stdio::null())
+    .stderr(log);
     let daemon = Kill(cmd.spawn().unwrap());
     let dpid = daemon.0.id();
     wait_for("the daemon", || run("interface.list", json!({})).is_ok());
@@ -353,7 +390,8 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         json!({"name": "pba", "mode": "blocks", "inside": "100.64.0.0/24", "outside": "198.51.100.9", "ports_per_subscriber": 32256, "max_blocks": 1}),
     )
     .unwrap();
-    let pool_id = u32::from_str_radix(pool["id"].as_str().unwrap().trim_start_matches('*'), 16).unwrap();
+    let pool_id =
+        u32::from_str_radix(pool["id"].as_str().unwrap().trim_start_matches('*'), 16).unwrap();
     run(
         "ip.traffic-flow.target.add",
         json!({"dst_address": "127.0.0.1", "port": 4739, "transport": "sctp", "content": "nat"}),
@@ -379,7 +417,12 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         run("ip.traffic-flow.get", json!({})).unwrap()["state"] == "running"
     });
     wait("every collector connected", 20, || {
-        run("ip.traffic-flow.target.list", json!({})).unwrap().as_array().unwrap().iter().all(|t| t["state"] == "sending")
+        run("ip.traffic-flow.target.list", json!({}))
+            .unwrap()
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["state"] == "sending")
     });
 
     // Three subscribers, one datagram each, again every half second as a
@@ -398,15 +441,15 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
             && b.post_src == Ipv4Addr::new(198, 51, 100, 9) && b.ports == 32256
             && b.port_end - b.port_start + 1 == 32256 && b.step == 1 && b.pool == pool_id)
     };
-    let exhausted = |r: &Record| {
-        matches!(r, Record::NatLimit(l) if l.event == NatEventType::AddressesExhausted && l.pool == pool_id)
-    };
+    let exhausted = |r: &Record| matches!(r, Record::NatLimit(l) if l.event == NatEventType::AddressesExhausted && l.pool == pool_id);
     let session = |r: &Record| {
         matches!(r, Record::Nat(n) if n.event == NatEventType::Nat44SessionCreate
             && n.post_src == Ipv4Addr::new(198, 51, 100, 9) && n.protocol == 17
             && n.dst == Ipv4Addr::UNSPECIFIED)
     };
-    let count = |g: &Shared, f: &dyn Fn(&Record) -> bool| g.lock().unwrap().records.iter().filter(|r| f(r)).count();
+    let count = |g: &Shared, f: &dyn Fn(&Record) -> bool| {
+        g.lock().unwrap().records.iter().filter(|r| f(r)).count()
+    };
     let mut tries = 0;
     wait("the first blocks", 30, || {
         tries += 1;
@@ -416,10 +459,20 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         count(&sctp, &alloc) == 2
     });
     for (name, g) in [("sctp", &sctp), ("tls", &tls)] {
-        wait(&format!("{name}: two port blocks"), 30, || count(g, &alloc) == 2);
-        wait(&format!("{name}: the exhausted pool"), 30, || count(g, &exhausted) >= 1);
-        wait(&format!("{name}: the NAT44 sessions"), 30, || count(g, &session) >= 2);
-        assert_eq!(g.lock().unwrap().gaps, 0, "{name}: sequence numbers follow (RFC 7011 §3.1)");
+        wait(&format!("{name}: two port blocks"), 30, || {
+            count(g, &alloc) == 2
+        });
+        wait(&format!("{name}: the exhausted pool"), 30, || {
+            count(g, &exhausted) >= 1
+        });
+        wait(&format!("{name}: the NAT44 sessions"), 30, || {
+            count(g, &session) >= 2
+        });
+        assert_eq!(
+            g.lock().unwrap().gaps,
+            0,
+            "{name}: sequence numbers follow (RFC 7011 §3.1)"
+        );
     }
     // A second refused packet a little later: rate-limited (RFC 8158 §5.2).
     within(bp, || {
@@ -428,10 +481,15 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
     });
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(count(&sctp, &exhausted), 1, "one natEvent 3 per minute");
-    assert!(*authenticated.lock().unwrap() >= 1, "the router showed its certificate (RFC 7011 §11.3)");
+    assert!(
+        *authenticated.lock().unwrap() >= 1,
+        "the router showed its certificate (RFC 7011 §11.3)"
+    );
     // Legacy collector: the sessions as natEvent 1 (Historic), no blocks
     // renumbered.
-    wait("legacy: natEvent 1", 30, || legacy.lock().unwrap().nat_codes.contains(&1));
+    wait("legacy: natEvent 1", 30, || {
+        legacy.lock().unwrap().nat_codes.contains(&1)
+    });
     {
         let l = legacy.lock().unwrap();
         assert!(!l.nat_codes.contains(&4), "{:?}", l.nat_codes);
@@ -443,13 +501,19 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
     // The storm: N subscribers of a big blocks-mode pool send their first
     // packet as fast as one thread can; each one waits in the queue for
     // its block, and each block is one IPFIX record.
-    let n: u32 = std::env::var("COREROUTER_PBA_STORM").ok().and_then(|v| v.parse().ok()).unwrap_or(20_000);
+    let n: u32 = std::env::var("COREROUTER_PBA_STORM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20_000);
     run(
         "ip.firewall.cgnat.pool.add",
         json!({"name": "storm", "mode": "blocks", "inside": "100.64.128.0/17", "outside": "10.200.0.0/20", "ports_per_subscriber": 1000}),
     )
     .unwrap();
-    ip(Some(cp), &["route", "add", "10.200.0.0/20", "via", "192.0.2.1"]);
+    ip(
+        Some(cp),
+        &["route", "add", "10.200.0.0/20", "via", "192.0.2.1"],
+    );
     std::thread::sleep(Duration::from_secs(2));
     let storm = |r: &Record| matches!(r, Record::PortBlock(b) if b.src.octets()[2] >= 128 && b.event == NatEventType::PortBlockAllocation);
     let cpu0 = cpu_ms(dpid);
@@ -511,7 +575,10 @@ fn cgnat_blocks_and_limits_reach_sctp_tls_and_legacy_collectors() {
         st["nat_log_dropped"],
     );
     assert_eq!(st["nat_log_dropped"], 0, "{st}");
-    assert!(s_n >= n as usize * 99 / 100, "SCTP got {s_n} of {n} blocks: {st}");
+    assert!(
+        s_n >= n as usize * 99 / 100,
+        "SCTP got {s_n} of {n} blocks: {st}"
+    );
     assert_eq!(s_n, t_n, "both collectors got every block");
 
     drop(daemon);

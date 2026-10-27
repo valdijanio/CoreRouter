@@ -253,7 +253,10 @@ impl Exporter {
         let Some(slot) = self.templates.iter().position(|t| t.id == tid) else {
             return;
         };
-        let len = match (self.fixed.get(slot).copied().flatten(), self.templates.get(slot)) {
+        let len = match (
+            self.fixed.get(slot).copied().flatten(),
+            self.templates.get(slot),
+        ) {
             (Some(n), _) => n,
             (None, Some(t)) => t.row_len(row),
             (None, None) => return,

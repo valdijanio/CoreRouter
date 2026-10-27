@@ -253,7 +253,11 @@ fn conntrack_flows_with_nat_reach_both_collectors() {
         json!({"dst_address": "127.0.0.1", "port": 4739, "version": "ipfix", "transport": "tcp"}),
     )
     .unwrap();
-    run("ip.traffic-flow.set", json!({"enabled": true, "nat_events": true})).unwrap();
+    run(
+        "ip.traffic-flow.set",
+        json!({"enabled": true, "nat_events": true}),
+    )
+    .unwrap();
     wait("the exporter", 15, || {
         run("ip.traffic-flow.get", json!({})).unwrap()["state"] == "running"
     });

@@ -76,7 +76,13 @@ impl Template {
     pub fn record_len(&self) -> usize {
         self.fields
             .iter()
-            .map(|f| if f.len == VARIABLE { 1 } else { usize::from(f.len) })
+            .map(|f| {
+                if f.len == VARIABLE {
+                    1
+                } else {
+                    usize::from(f.len)
+                }
+            })
             .sum()
     }
 

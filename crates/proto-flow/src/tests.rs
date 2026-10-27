@@ -825,7 +825,11 @@ fn rfc_8158_templates_carry_the_mandatory_elements() {
         (
             "Table 9",
             template::NAT_ADDRESSES_EXHAUSTED,
-            &[id::OBSERVATION_TIME_MILLISECONDS, id::NAT_EVENT, id::NAT_POOL_ID],
+            &[
+                id::OBSERVATION_TIME_MILLISECONDS,
+                id::NAT_EVENT,
+                id::NAT_POOL_ID,
+            ],
         ),
         (
             "Table 13",
@@ -864,7 +868,10 @@ fn rfc_8158_templates_carry_the_mandatory_elements() {
     for (table, tid, mandatory) in tables {
         let have = template_ids(tid);
         for ie in mandatory {
-            assert!(have.contains(ie), "{table}: element {ie} missing from template {tid}");
+            assert!(
+                have.contains(ie),
+                "{table}: element {ie} missing from template {tid}"
+            );
         }
     }
 }
@@ -889,8 +896,14 @@ fn rfc_8158_event_values() {
     assert_eq!(quota::MAX_ENTRIES_PER_USER, 3);
     assert_eq!(threshold::ADDRESS_PORT_PER_USER_HIGH, 4);
     // The Historic 1/2 are read back as the NAT44 session events.
-    assert_eq!(NatEventType::from_code(1), Some(NatEventType::Nat44SessionCreate));
-    assert_eq!(NatEventType::from_code(2), Some(NatEventType::Nat44SessionDelete));
+    assert_eq!(
+        NatEventType::from_code(1),
+        Some(NatEventType::Nat44SessionCreate)
+    );
+    assert_eq!(
+        NatEventType::from_code(2),
+        Some(NatEventType::Nat44SessionDelete)
+    );
     assert_eq!(NatEventType::from_code(0), None, "0 is Reserved");
 }
 
@@ -933,7 +946,10 @@ fn a_port_block_record_on_the_wire() {
     want.extend([3, b'a', b'n', b'a']);
     assert_eq!(rec, want.as_slice());
     assert_eq!(&msg[16..18], &be16(template::PORT_BLOCK));
-    assert_eq!(usize::from(u16::from_be_bytes([msg[18], msg[19]])), 4 + want.len());
+    assert_eq!(
+        usize::from(u16::from_be_bytes([msg[18], msg[19]])),
+        4 + want.len()
+    );
 }
 
 #[test]
@@ -941,7 +957,10 @@ fn legacy_nat_events_go_out_as_1_and_2() {
     let mut cfg = exporter(Version::Ipfix).config().clone();
     cfg.legacy_nat = true;
     let mut e = Exporter::new(cfg);
-    let recs: Vec<Record> = sample_records().into_iter().filter(Record::is_nat).collect();
+    let recs: Vec<Record> = sample_records()
+        .into_iter()
+        .filter(Record::is_nat)
+        .collect();
     let mut out = Vec::new();
     e.encode(1_700_000_100_000, &recs, &mut out);
     let mut d = Decoder::new();
@@ -958,7 +977,10 @@ fn legacy_nat_events_go_out_as_1_and_2() {
 #[test]
 fn a_long_user_name_is_cut_at_a_character_boundary() {
     let long = "ç".repeat(200);
-    for (v, max) in [(Version::Ipfix, template::MAX_USER), (Version::V9, usize::from(template::V9_USER_LEN))] {
+    for (v, max) in [
+        (Version::Ipfix, template::MAX_USER),
+        (Version::V9, usize::from(template::V9_USER_LEN)),
+    ] {
         let mut e = exporter(v);
         let rec = Record::PortBlock(PortBlock {
             time_ms: 1,
@@ -976,7 +998,9 @@ fn a_long_user_name_is_cut_at_a_character_boundary() {
         let mut out = Vec::new();
         e.encode(1_700_000_100_000, &[rec], &mut out);
         let back = decode_all(&mut Decoder::new(), &out);
-        let Record::PortBlock(b) = &back[0] else { panic!() };
+        let Record::PortBlock(b) = &back[0] else {
+            panic!()
+        };
         assert_eq!(b.user, "ç".repeat(max / 2), "{v:?}: whole characters only");
     }
 }
@@ -992,7 +1016,10 @@ fn every_template_fits_the_smallest_message() {
         assert!(out.iter().all(|m| m.len() <= crate::MIN_MESSAGE), "{v:?}");
         let mut d = Decoder::new();
         let first = d.decode(&out[0]).unwrap();
-        assert_eq!(first.templates, TEMPLATES, "{v:?}: all templates in the first message");
+        assert_eq!(
+            first.templates, TEMPLATES,
+            "{v:?}: all templates in the first message"
+        );
     }
 }
 
@@ -1005,7 +1032,11 @@ fn templates_only_takes_the_sequence_of_the_next_message() {
     cfg.stream = true;
     let mut e = Exporter::new(cfg);
     let mut out = Vec::new();
-    e.encode(1_700_000_000_000, &[Record::Flow(flow(0)), Record::Flow(flow(1))], &mut out);
+    e.encode(
+        1_700_000_000_000,
+        &[Record::Flow(flow(0)), Record::Flow(flow(1))],
+        &mut out,
+    );
     e.encode(1_700_000_001_000, &[Record::Flow(flow(2))], &mut out);
     let before = e.counters();
     let mut t = e.templates_only(1_700_000_002_000);
@@ -1014,8 +1045,14 @@ fn templates_only_takes_the_sequence_of_the_next_message() {
     crate::export::set_sequence(&mut t, next);
     let mut d = Decoder::new();
     let m = d.decode(&t).unwrap();
-    assert_eq!((m.templates, m.records.len(), m.sequence), (TEMPLATES, 0, next));
+    assert_eq!(
+        (m.templates, m.records.len(), m.sequence),
+        (TEMPLATES, 0, next)
+    );
     let m = d.decode(&out[1]).unwrap();
-    assert_eq!(m.sequence, 3, "two flows and the sampling options record before");
+    assert_eq!(
+        m.sequence, 3,
+        "two flows and the sampling options record before"
+    );
     assert_eq!(decode_all(&mut d, &out[1..]), vec![Record::Flow(flow(2))]);
 }

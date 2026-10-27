@@ -27,7 +27,11 @@ fn crc32c(data: &[u8]) -> u32 {
     for b in data {
         crc ^= u32::from(*b);
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0x82f6_3b78 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0x82f6_3b78
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -39,7 +43,10 @@ fn ipv4(proto: u8, payload: &[u8]) -> Vec<u8> {
     h.extend(len.to_be_bytes());
     h.extend([0, 0, 0x40, 0, 64, proto, 0, 0]);
     h.extend([192, 0, 2, 1, 192, 0, 2, 10]);
-    let mut sum: u32 = h.chunks(2).map(|c| u32::from(u16::from_be_bytes([c[0], c[1]]))).sum();
+    let mut sum: u32 = h
+        .chunks(2)
+        .map(|c| u32::from(u16::from_be_bytes([c[0], c[1]])))
+        .sum();
     while sum > 0xffff {
         sum = (sum & 0xffff) + (sum >> 16);
     }
@@ -192,12 +199,25 @@ const FIELDS: &[&str] = &[
 /// tshark's answer: per frame, each field's values.
 fn decode(file: &std::path::Path) -> Vec<Vec<String>> {
     let mut cmd = Command::new("tshark");
-    cmd.arg("-r").arg(file).args(["-T", "fields", "-E", "separator=|", "-E", "occurrence=a", "-E", "aggregator=,"]);
+    cmd.arg("-r").arg(file).args([
+        "-T",
+        "fields",
+        "-E",
+        "separator=|",
+        "-E",
+        "occurrence=a",
+        "-E",
+        "aggregator=,",
+    ]);
     for f in FIELDS {
         cmd.args(["-e", f]);
     }
     let out = cmd.output().unwrap();
-    assert!(out.status.success(), "tshark: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "tshark: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .map(|l| l.split('|').map(str::to_owned).collect())
@@ -208,7 +228,10 @@ fn decode(file: &std::path::Path) -> Vec<Vec<String>> {
 fn tshark_decodes_the_nat_log_over_udp_and_sctp() {
     if Command::new("tshark").arg("-v").output().is_err() {
         let required = std::env::var("COREROUTER_REQUIRE_TSHARK").is_ok_and(|v| v == "1");
-        assert!(!required, "tshark is required (COREROUTER_REQUIRE_TSHARK=1)");
+        assert!(
+            !required,
+            "tshark is required (COREROUTER_REQUIRE_TSHARK=1)"
+        );
         eprintln!("skipped: tshark is not installed");
         return;
     }
@@ -235,21 +258,44 @@ fn tshark_decodes_the_nat_log_over_udp_and_sctp() {
     };
     for (i, transport) in [(0usize, "udp"), (1, "sctp")] {
         let f = &frames[i];
-        assert!(col(f, "frame.protocols").contains(transport) && col(f, "frame.protocols").contains("cflow"), "{f:?}");
+        assert!(
+            col(f, "frame.protocols").contains(transport)
+                && col(f, "frame.protocols").contains("cflow"),
+            "{f:?}"
+        );
         // RFC 8158 Table 2: 16 block, 13 quota, 18 threshold, 3 pool, 4 session.
-        assert_eq!(col(f, "cflow.nat_event"), "16,13,18,3,4", "{transport}: {f:?}");
+        assert_eq!(
+            col(f, "cflow.nat_event"),
+            "16,13,18,3,4",
+            "{transport}: {f:?}"
+        );
         assert_eq!(col(f, "cflow.port_range_start"), "2048");
         assert_eq!(col(f, "cflow.port_range_end"), "3071");
         assert_eq!(col(f, "cflow.port_range_num_ports"), "1024");
         assert_eq!(col(f, "cflow.nat_pool_id"), "3,3,3,3", "{f:?}");
         assert_eq!(col(f, "cflow.vlanid"), "210");
-        assert_eq!(col(f, "cflow.user_name"), "ana.lima@isp", "RFC 7011 §7 variable length");
+        assert_eq!(
+            col(f, "cflow.user_name"),
+            "ana.lima@isp",
+            "RFC 7011 §7 variable length"
+        );
         assert_eq!(col(f, "cflow.nat_quota_exceeded_event"), "3");
         assert_eq!(col(f, "cflow.max_entries_per_user"), "4096");
         assert_eq!(col(f, "cflow.nat_threshold_event"), "4");
-        assert_eq!(col(f, "cflow.addressport_mapping_per_user_highthreshold"), "90");
-        assert_eq!(col(f, "cflow.post_natsource_ipv4_address"), "203.0.113.1,203.0.113.1");
+        assert_eq!(
+            col(f, "cflow.addressport_mapping_per_user_highthreshold"),
+            "90"
+        );
+        assert_eq!(
+            col(f, "cflow.post_natsource_ipv4_address"),
+            "203.0.113.1,203.0.113.1"
+        );
     }
     // Legacy: the session is natEvent 1, the rest unchanged.
-    assert_eq!(col(&frames[2], "cflow.nat_event"), "16,13,18,3,1", "{:?}", frames[2]);
+    assert_eq!(
+        col(&frames[2], "cflow.nat_event"),
+        "16,13,18,3,1",
+        "{:?}",
+        frames[2]
+    );
 }
