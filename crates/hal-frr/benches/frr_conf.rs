@@ -64,6 +64,83 @@ fn bench(c: &mut Criterion) {
         x.iter(|| diff(black_box(&empty), black_box(&a)))
     });
     c.bench_function("frr_render_10k", |x| x.iter(|| black_box(&a).render()));
+
+    // G3.2a: 1 000 connections (5 000 lines), rendered by proto-bgp, parsed
+    // and diffed against the same with one neighbor changed.
+    let cfg = connections(1000, 500);
+    let changed = connections(1000, 501);
+    let text = corerouter_proto_bgp::render_all(&cfg.routing, &|_| None).unwrap_or_default();
+    let one = corerouter_proto_bgp::render_all(&changed.routing, &|_| None).unwrap_or_default();
+    let ca = Conf::parse(&text).unwrap_or_default();
+    let cb = Conf::parse(&one).unwrap_or_default();
+    c.bench_function("bgp_render_1000_connections", |x| {
+        x.iter(|| corerouter_proto_bgp::render_all(black_box(&cfg.routing), &|_| None))
+    });
+    c.bench_function("bgp_parse_1000_connections", |x| {
+        x.iter(|| Conf::parse(black_box(&text)))
+    });
+    c.bench_function("bgp_diff_one_of_1000_connections", |x| {
+        x.iter(|| diff(black_box(&ca), black_box(&cb)))
+    });
+    c.bench_function("bgp_diff_add_1000_connections", |x| {
+        let empty = Conf::default();
+        x.iter(|| diff(black_box(&empty), black_box(&ca)))
+    });
+}
+
+/// `n` connections over a template; connection `short` has a 30 s hold.
+fn connections(n: u32, short: u32) -> corerouter_model::Config {
+    use corerouter_model::bgp::{BgpConnection, BgpParams, BgpTemplate};
+    use corerouter_model::{Asn, BgpInstance, Config};
+    let mut cfg = Config::default();
+    cfg.routing.bgp.insert(
+        "default".into(),
+        BgpInstance {
+            name: "default".into(),
+            asn: Asn(65000),
+            router_id: [10, 0, 0, 1].into(),
+            disabled: false,
+            comment: String::new(),
+        },
+    );
+    cfg.routing.bgp_templates.insert(
+        "peers".into(),
+        BgpTemplate {
+            name: "peers".into(),
+            templates: Vec::new(),
+            params: BgpParams {
+                hold_time: Some(90),
+                max_prefix_ipv4: Some(1000),
+                ..Default::default()
+            },
+            comment: String::new(),
+        },
+    );
+    for i in 0..n {
+        let name = format!("n{i}");
+        cfg.routing.bgp_connections.insert(
+            name.clone(),
+            BgpConnection {
+                name,
+                instance: "default".into(),
+                remote_address: std::net::IpAddr::from([
+                    10,
+                    100 + (i / 65536) as u8,
+                    (i / 256 % 256) as u8,
+                    (i % 256) as u8,
+                ]),
+                templates: vec!["peers".into()],
+                params: BgpParams {
+                    remote_as: Some(Asn(64512 + i)),
+                    hold_time: (i == short).then_some(30),
+                    ..Default::default()
+                },
+                disabled: false,
+                comment: String::new(),
+            },
+        );
+    }
+    cfg
 }
 
 criterion_group!(benches, bench);

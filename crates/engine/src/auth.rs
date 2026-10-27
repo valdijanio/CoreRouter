@@ -41,6 +41,8 @@ pub const SECRET_KEYS: &[&str] = &[
     "psk",
     "private_key",
     "passphrase",
+    // BGP TCP MD5 key (G3.2a).
+    "tcp_md5_key",
 ];
 
 /// A `config.diff` path that ends in a secret field (`ip.dns_tsig.keys[*1].secret`).

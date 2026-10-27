@@ -21,7 +21,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::config::{Config, Ip};
+use std::collections::BTreeMap;
+
+use crate::config::{Config, Ip, Routing};
 use crate::address_lists::AddressLists;
 use crate::cow::CowArc;
 use crate::cow_list::CowList;
@@ -49,11 +51,12 @@ pub fn apply(base: &Config, delta: &Value) -> Result<Config, PersistError> {
     level(
         base,
         delta,
-        &["interfaces", "ip", "ppp", "queue"],
+        &["interfaces", "ip", "ppp", "queue", "routing"],
         |c| {
             let mut light = c.clone();
             light.interfaces = CowArc::default();
             light.ip = CowArc::default();
+            light.routing = CowArc::default();
             light.ppp = Ppp::default();
             light.queue = Queues::default();
             light
@@ -61,6 +64,7 @@ pub fn apply(base: &Config, delta: &Value) -> Result<Config, PersistError> {
         |out, base, key, op| {
             match key {
                 "interfaces" => out.interfaces = section(&base.interfaces, op)?,
+                "routing" => out.routing = section(&base.routing, op)?,
                 "ip" => {
                     out.ip = match op {
                         Op::Keep => base.ip.clone(),
@@ -255,6 +259,7 @@ fn diff_config(a: &Config, b: &Config) -> Result<Option<Value>, PersistError> {
         let mut l = c.clone();
         l.interfaces = CowArc::default();
         l.ip = CowArc::default();
+        l.routing = CowArc::default();
         l.ppp = Ppp::default();
         l.queue = Queues::default();
         l
@@ -263,6 +268,9 @@ fn diff_config(a: &Config, b: &Config) -> Result<Option<Value>, PersistError> {
         return whole(a, b);
     };
     p.section("interfaces", &a.interfaces, &b.interfaces, |_| true)?;
+    if !CowArc::ptr_eq(&a.routing, &b.routing) && *a.routing != *b.routing {
+        p.nested("routing", diff_routing(&a.routing, &b.routing)?);
+    }
     if !CowArc::ptr_eq(&a.ip, &b.ip) && *a.ip != *b.ip {
         p.nested("ip", diff_ip(&a.ip, &b.ip)?);
     }
@@ -302,6 +310,19 @@ fn diff_config(a: &Config, b: &Config) -> Result<Option<Value>, PersistError> {
             }
         }
     }
+    Ok(p.finish())
+}
+
+/// Routing (G3.2a): its maps by key, so changing one of 1 000 BGP
+/// connections stores that connection, not the section.
+fn diff_routing(a: &Routing, b: &Routing) -> Result<Option<Value>, PersistError> {
+    let mut p = Parts {
+        changed: Map::new(),
+        gone: Vec::new(),
+    };
+    p.map("bgp", &a.bgp, &b.bgp)?;
+    p.map("bgp_templates", &a.bgp_templates, &b.bgp_templates)?;
+    p.map("bgp_connections", &a.bgp_connections, &b.bgp_connections)?;
     Ok(p.finish())
 }
 
@@ -492,6 +513,57 @@ impl Parts {
                 Ok(())
             }
         }
+    }
+
+    /// A map by name: each changed entry stored whole, removed ones gone;
+    /// equal entries are compared, never serialized. An empty map may be
+    /// left out of the JSON (`skip_serializing_if`), so empty on one side
+    /// is the whole map or its removal.
+    fn map<T: Serialize + PartialEq>(
+        &mut self,
+        key: &str,
+        a: &BTreeMap<String, T>,
+        b: &BTreeMap<String, T>,
+    ) -> Result<(), PersistError> {
+        if a == b {
+            return Ok(());
+        }
+        if b.is_empty() {
+            self.gone.push(key.to_owned());
+            return Ok(());
+        }
+        if a.is_empty() {
+            let v = serde_json::to_value(b).map_err(malformed)?;
+            self.changed.insert(key.to_owned(), obj("=", v));
+            return Ok(());
+        }
+        let mut o = Map::new();
+        for (k, v) in b {
+            match a.get(k) {
+                Some(x) if x == v => {}
+                Some(x) => {
+                    if let Some(d) = whole(x, v)? {
+                        o.insert(k.clone(), d);
+                    }
+                }
+                None => {
+                    let v = serde_json::to_value(v).map_err(malformed)?;
+                    o.insert(k.clone(), obj("=", v));
+                }
+            }
+        }
+        let gone: Vec<Value> = a
+            .keys()
+            .filter(|k| !b.contains_key(*k))
+            .map(|k| Value::String(k.clone()))
+            .collect();
+        let mut m = Map::new();
+        m.insert("o".into(), Value::Object(o));
+        if !gone.is_empty() {
+            m.insert("d".into(), Value::Array(gone));
+        }
+        self.changed.insert(key.to_owned(), Value::Object(m));
+        Ok(())
     }
 
     fn nested(&mut self, key: &str, d: Option<Value>) {
@@ -914,6 +986,46 @@ mod tests {
     }
 
     use serde::Deserialize;
+
+    #[test]
+    fn bgp_connections_are_stored_one_by_one() {
+        use crate::bgp::{BgpConnection, BgpParams};
+        let conn = |i: u32| BgpConnection {
+            name: format!("n{i}"),
+            instance: "default".into(),
+            remote_address: std::net::IpAddr::from([10, 100, (i / 256) as u8, (i % 256) as u8]),
+            templates: Vec::new(),
+            params: BgpParams {
+                remote_as: Some(crate::Asn(64512 + i)),
+                ..Default::default()
+            },
+            disabled: false,
+            comment: String::new(),
+        };
+        let mut new = big();
+        for i in 0..200 {
+            new.routing.bgp_connections.insert(format!("n{i}"), conn(i));
+        }
+        let mut old = new.clone();
+        if let Some(c) = old.routing.bgp_connections.get_mut("n7") {
+            c.params.hold_time = Some(30);
+        }
+        old.routing.bgp_connections.remove("n9");
+        old.routing.bgp_connections.insert("x".into(), conn(999));
+        check(&old, &new);
+        let typed = diff(&new, &old).unwrap().to_string();
+        assert!(typed.len() < 600, "{typed}");
+        // From empty and back.
+        let mut empty = new.clone();
+        empty.routing = CowArc::default();
+        check(&empty, &new);
+        check(&new, &empty);
+        // A commit elsewhere shares the section.
+        let mut other = new.clone();
+        other.system.identity = "x".into();
+        let got = check(&other, &new);
+        assert!(CowArc::ptr_eq(&got.routing, &new.routing));
+    }
 
     #[test]
     fn untouched_sections_are_shared_and_the_result_is_exact() {

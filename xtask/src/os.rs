@@ -64,7 +64,6 @@ const REQUIRED_BR2: &[&str] = &[
     "BR2_PER_PACKAGE_DIRECTORIES=y",
     "BR2_PACKAGE_COREROUTER=y",
     "BR2_PACKAGE_NFTABLES=y",
-    "BR2_PACKAGE_JANSSON=y",
     "# BR2_TARGET_ENABLE_ROOT_LOGIN is not set",
 ];
 const INIT_PATH: &str = "/usr/sbin/corerouter-init";

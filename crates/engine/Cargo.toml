@@ -45,6 +45,10 @@ name = "execute"
 harness = false
 
 [[bench]]
+name = "bgp"
+harness = false
+
+[[bench]]
 name = "neighbors"
 harness = false
 

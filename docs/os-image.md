@@ -25,7 +25,7 @@ automática, G1.26h) e G1.6c (instalador ISO/USB, qcow2/OVA, FRR e firmware na i
 | Kernel | Linux **6.18.59** LTS (suporte projetado até dez/2028), `x86_64_defconfig` + fragmento; SHA-256 do `sha256sums.asc` assinado do kernel.org, conferido pelo Buildroot e de novo pelo xtask | `os/board/x86_64/linux.fragment`, `os/patches/linux/linux.hash` |
 | Init | `corerouter-init` (Rust, este workspace) | `apps/corerouter-init` |
 | Roteador | `corerouter-daemon --backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729` | `os/package/corerouter` |
-| Espaço de usuário | `nft` (nftables com JSON, pelo `nft -j` do hal-linux), glibc, busybox (só para o shell de manutenção) | defconfig |
+| Espaço de usuário | `nft` sem JSON (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
 
 Tudo que o roteador precisa no kernel é `=y` (sem módulos): eBPF/XDP com BTF e JIT sempre
 ligado, AF_XDP, nftables completo (NAT, conntrack, flowtable, fib, socket, synproxy), **VRF**

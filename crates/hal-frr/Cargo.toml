@@ -18,6 +18,7 @@ log.workspace = true
 
 [dev-dependencies]
 criterion.workspace = true
+corerouter-proto-bgp.workspace = true
 
 [[bench]]
 name = "frr_conf"

@@ -1,0 +1,116 @@
+# BGP (G3.2)
+
+O BGP do CoreRouter roda no FRR (decisão do G3.1, `docs/architecture.md` 1.3). O engine guarda a
+config no modelo do RouterOS v7, valida, rende para o `bgpd` e aplica só a diferença pelo
+socket vty (`crates/hal-frr`). O G3.2 foi dividido em três partes:
+
+| Parte | O quê |
+|---|---|
+| **G3.2a** (esta) | templates, conexões, sessões ao vivo, validação, janela Routing › BGP |
+| G3.2b | políticas: prefix-list, community normal e large, AS-path, `routing.filter.rule` com prévia |
+| G3.2c | RPKI (RFC 6811/8210) por padrão e "Por que essa rota?" |
+
+## Como usar
+
+```sh
+corerouter-cli run routing.bgp.instance.set '{"asn":65000,"router_id":"10.255.0.1"}'
+corerouter-cli run routing.bgp.template.add '{"name":"transit","local_role":"ebgp-customer","hold_time":90,"afi":"ip,ipv6","max_prefix_ipv4":1200000}'
+corerouter-cli run routing.bgp.connection.add '{"name":"upstream1","remote_address":"198.51.100.2","remote_as":65100,"templates":"transit","tcp_md5_key":"…"}'
+corerouter-cli run routing.bgp.session.list
+corerouter-cli run routing.bgp.session.refresh '{"connection":"upstream1"}'
+```
+
+| Comando | RouterOS v7 |
+|---|---|
+| `routing.bgp.template.{add,set,remove,list,check}` | `/routing bgp template` |
+| `routing.bgp.connection.{add,set,remove,list,check}` | `/routing bgp connection` |
+| `routing.bgp.session.list` | `/routing bgp session print` |
+| `routing.bgp.session.refresh` / `resend` / `clear` | `/routing bgp session refresh` / `resend` / `clear` |
+| `routing.bgp.connection.set {disabled: true}` | `disable` (shutdown) |
+
+Parâmetros de conexão e template (os mesmos nos dois): `remote_as`, `local_role` (`ibgp`,
+`ebgp`, `ebgp-provider`, `ebgp-customer`, `ebgp-peer`, `ebgp-rs`, `ebgp-rs-client`),
+`multihop`, `hold_time`, `keepalive_time`, `tcp_md5_key`, `afi` (`ip`, `ipv6`),
+`max_prefix_ipv4`, `max_prefix_ipv6`, `max_prefix_action` (`shutdown`, `warning`, `restart`),
+`max_prefix_restart`, `update_source` (o `local.address` do RouterOS) e `nexthop_choice`
+(`default`, `force-self`, `propagate`). Um parâmetro ausente herda do primeiro template que o
+define; `null` num `set` volta a herdar.
+
+## Pesquisa
+
+### MikroTik RouterOS v7
+
+- [BGP](https://help.mikrotik.com/docs/spaces/ROS/pages/328220/BGP) e a referência da CLI
+  [`/routing/bgp/connection`](https://manual.mikrotik.com/docs/7.25/cli-reference/routing/bgp/connection/)
+  e [`/routing/bgp/template`](https://manual.mikrotik.com/docs/7.24/cli-reference/routing/bgp/template).
+- O v7 separou o v6 (`peer`) em três menus: `template` (parâmetros do protocolo), `connection`
+  (o vizinho, que também expõe os parâmetros do template) e `session` (estado em cache, só
+  leitura, com `clear`/`refresh`/`resend`).
+- Nomes adotados: `remote.address`, `remote.as` (vazio: aprende do OPEN), `local.role`
+  (obrigatório no RouterOS; os papéis da RFC 9234), `templates`, `multihop`, `hold-time`
+  (3 s..65535 s ou infinity; padrão 3 min), `keepalive-time` (vazio: um terço do hold),
+  `tcp-md5-key`, `afi`, `nexthop-choice`, `input.limit-process-routes-ipv4/ipv6`.
+- O que o RouterOS faz pior: o `local.role` é obrigatório mesmo quando o AS remoto já diz o
+  tipo; o limite de prefixos só para de processar (não fecha a sessão nem avisa); a doc não diz
+  como a herança de vários templates se resolve.
+
+### Outros
+
+- **Junos**: `group` → `neighbor`, herança em dois níveis, `family inet unicast prefix-limit
+  maximum N teardown <pct> idle-timeout <min>` — ação e reinício por família, que adotamos.
+- **Cisco IOS-XE**: `template peer-session` e `peer-policy` com `inherit` (até 7 níveis), mais
+  os `peer-group` antigos; `neighbor X maximum-prefix N [threshold] [restart M | warning-only]`.
+- **Nokia SR Linux**: `group` com `neighbor`, `afi-safi` por grupo e por vizinho,
+  `prefix-limit max-received-routes` com `prevent-teardown`.
+- **VyOS / FRR**: `peer-group`; `neighbor X local-role` (RFC 9234), `maximum-prefix … restart |
+  warning-only`, `ebgp-multihop`, `update-source`, `password`.
+- Comum aos melhores: limite de prefixos com ação, herança em mais de um nível, papel RFC 9234
+  para pegar vazamento de rotas.
+
+### RFCs (base, atualizações e errata)
+
+- [RFC 4271](https://www.rfc-editor.org/info/rfc4271) (BGP-4), atualizada por 4724, 6286, 6608,
+  6793, 7606, 7607, 7705, 8212, 8654, 9072, 9687 e 9774. Errata verificadas: 9, das quais
+  técnicas a 1633 (§6.3), a 2838 (§8.2.2: HoldTimer_Expires em Established apaga as rotas) e a
+  4493 (§4.5: subcódigo 0). Aplicado: hold 0 ou ≥ 3 s (§4.2), keepalive menor que o hold e um
+  terço por padrão (§10), estados da §8.2.2 na coluna State.
+- [RFC 6793](https://www.rfc-editor.org/info/rfc6793) (AS de 4 bytes; obsoleta a 4893, sem
+  atualizações): asplain e asdot aceitos; AS_TRANS (23456) recusado como AS local ou remoto.
+- [RFC 7607](https://www.rfc-editor.org/info/rfc7607) (AS 0) e
+  [RFC 7300](https://www.rfc-editor.org/info/rfc7300) (65535, 4294967295): recusados.
+- [RFC 4760](https://www.rfc-editor.org/info/rfc4760) (multiprotocolo, atualizada pela 7606):
+  `afi` com IPv4 e IPv6 unicast; uma conexão sem família é recusada.
+- [RFC 7606](https://www.rfc-editor.org/info/rfc7606) (tratamento de erro revisado,
+  treat-as-withdraw): é do FRR, ligado por padrão; nada a configurar.
+- [RFC 8212](https://www.rfc-editor.org/info/rfc8212): eBGP sem política não aceita nem envia
+  (o `bgp ebgp-requires-policy` do FRR, mantido ligado); a janela diz isso no detalhe da
+  sessão e na prévia, e as políticas chegam no G3.2b.
+- [RFC 2385](https://www.rfc-editor.org/info/rfc2385) (TCP MD5): até 80 bytes
+  (`TCP_MD5SIG_MAXKEYLEN` do Linux); [RFC 9234](https://www.rfc-editor.org/info/rfc9234)
+  (papéis); [RFC 2918](https://www.rfc-editor.org/info/rfc2918) (ROUTE-REFRESH, usado pelo
+  `refresh`).
+
+### O que adotamos e o que melhoramos
+
+- Modelo e nomes do RouterOS v7, com herança de vários templates resolvida assim: valor da
+  conexão; senão, o primeiro template da lista que o define (cada template já com os pais
+  resolvidos). Laço e profundidade acima de 8 são recusados com a cadeia na mensagem.
+- `local.role` opcional: vazio, sai do AS remoto (o nosso → iBGP). `remote_as` vazio vira
+  `remote-as external`/`internal` no FRR.
+- Limite de prefixos por família com ação (`shutdown`, `warning`, `restart` + minutos), como
+  Junos e Cisco, em vez do "para de processar" do RouterOS.
+- Chave MD5 selada como as senhas PPP: nunca aparece em config, histórico, journal, logs,
+  respostas ou MCP; o modal a trata como campo só de escrita.
+- Prévia no modal (o mesmo comando `check` serve à CLI e ao MCP): valores em vigor, o que vem
+  de template, timers calculados, aviso de hold curto, de eBGP sem política e sem chave, e de
+  que mudanças reiniciam a sessão; a prévia de um template recusa a mudança que deixaria uma
+  conexão inválida.
+- Transação: mudar um vizinho não derruba os outros (teste com FRR real).
+
+### Ficou para depois
+
+- Políticas e o "quais rotas passam" (G3.2b); RPKI e "Por que essa rota?" (G3.2c).
+- BFD por conexão (`use-bfd`): a coluna BFD já lê o estado do FRR; ligar o BFD é do G3.6.
+- Send Hold Timer (RFC 9687) e TTL security (GTSM, RFC 5082) como parâmetros: o FRR suporta,
+  sem pedido ainda.
+- VRF por instância (hoje uma instância não `default` vira `view` do FRR).

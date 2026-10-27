@@ -21,7 +21,10 @@
 use std::fmt::Write as _;
 
 use corerouter_model::Config;
-use corerouter_model::firewall::Name;
+use corerouter_model::firewall::{AddrMatch, Name, PortRange, PortSet};
+
+use crate::bytecode as bc;
+use crate::program::{Chain, ChainType, Expr, FwSet, Hook, KeyKind, MetaKey, NatKind, Rule, Table};
 use corerouter_model::subscriber_notice::{
     GARDEN_LIST, Intercept, Mode, PROBE_LIST, Profile, SubscriberNotices, seen_list,
 };
@@ -60,12 +63,23 @@ pub fn lists(cfg: &Config) -> Vec<Name> {
     out
 }
 
-fn target(sn: &SubscriberNotices, v4: bool) -> String {
+fn one(p: u16) -> PortRange {
+    PortRange { first: p, last: p }
+}
+
+/// The statement that sends a member's HTTP to the portal.
+fn target(sn: &SubscriberNotices, v4: bool) -> (String, Vec<Expr>) {
     let port = sn.settings.port;
     match sn.settings.portal_address {
-        Some(std::net::IpAddr::V4(a)) if v4 => format!("dnat ip to {a}:{port}"),
-        Some(std::net::IpAddr::V6(a)) if !v4 => format!("dnat ip6 to [{a}]:{port}"),
-        _ => format!("redirect to :{port}"),
+        Some(a @ std::net::IpAddr::V4(v)) if v4 => (
+            format!("dnat ip to {v}:{port}"),
+            bc::nat_exprs(NatKind::Dnat, a, a, Some(one(port))),
+        ),
+        Some(a @ std::net::IpAddr::V6(v)) if !v4 => (
+            format!("dnat ip6 to [{v}]:{port}"),
+            bc::nat_exprs(NatKind::Dnat, a, a, Some(one(port))),
+        ),
+        _ => (format!("redirect to :{port}"), bc::redir_exprs(port)),
     }
 }
 
@@ -74,71 +88,177 @@ fn chain(kind: &str, p: &Profile, fam: &str) -> String {
     format!("notice_{kind}{fam}_{}", p.name)
 }
 
+/// One rule: its text, its expressions and its comment.
+type NoticeRule = (String, Vec<Expr>, Option<String>);
+
+/// `<ip> saddr|daddr @<set> <verdict>`.
+fn lookup_rule(v4: bool, src: bool, set: &str, verdict: Expr) -> NoticeRule {
+    let mut b = bc::RuleBuild::default();
+    let (ip, dir) = (
+        if v4 { "ip" } else { "ip6" },
+        if src { "saddr" } else { "daddr" },
+    );
+    b.need_nfproto(!v4);
+    b.push(
+        format!("{ip} {dir} @{set}"),
+        bc::addr_set_exprs(!v4, src, false, set),
+    );
+    let word = match &verdict {
+        Expr::Jump { chain } => format!("jump {chain}"),
+        _ => "return".to_owned(),
+    };
+    b.push(word, vec![verdict]);
+    let (text, exprs) = b.finish();
+    (text, exprs, None)
+}
+
+/// `[<probe>] tcp dport 80 fib daddr type != local counter <to> <tag>`.
+fn intercept_rule(sn: &SubscriberNotices, p: &Profile, v4: bool) -> NoticeRule {
+    let mut b = bc::RuleBuild::default();
+    let (ip, fam) = if v4 { ("ip", "4") } else { ("ip6", "6") };
+    if p.intercept == Intercept::Probes {
+        b.need_nfproto(!v4);
+        let set = format!("al{fam}_{PROBE_LIST}");
+        b.push(
+            format!("{ip} daddr @{set}"),
+            bc::addr_set_exprs(!v4, false, false, &set),
+        );
+    }
+    b.need_l4proto(6);
+    b.push(
+        "tcp dport 80",
+        bc::port_exprs(false, false, &PortSet(vec![one(80)])),
+    );
+    b.push("fib daddr type != local", bc::fib_not_local());
+    b.push("counter", vec![Expr::Counter]);
+    let (to, exprs) = target(sn, v4);
+    b.push(to, exprs);
+    let tag = format!("notice:{}", p.name);
+    b.push(format!("comment \"{tag}\""), Vec::new());
+    let (text, exprs) = b.finish();
+    (text, exprs, Some(tag))
+}
+
+/// The block chain's own rules (after the walled garden's returns).
+fn block_rules(p: &Profile) -> [NoticeRule; 3] {
+    let tag = format!("notice:{}", p.name);
+    let mut dns = bc::l4proto_set(&[6, 17]);
+    dns.extend(bc::port_exprs(false, false, &PortSet(vec![one(53)])));
+    dns.push(Expr::Return);
+    let mut rst = bc::meta_cmp(MetaKey::L4Proto, true, vec![6]);
+    rst.push(Expr::Counter);
+    rst.push(Expr::Reject {
+        kind: bc::REJECT_TCP_RST,
+        code: 0,
+    });
+    [
+        (
+            "meta l4proto { tcp, udp } th dport 53 return".to_owned(),
+            dns,
+            None,
+        ),
+        (
+            format!("meta l4proto tcp counter reject with tcp reset comment \"{tag}\""),
+            rst,
+            Some(tag.clone()),
+        ),
+        (
+            format!("counter reject with icmpx admin-prohibited comment \"{tag}\""),
+            vec![
+                Expr::Counter,
+                Expr::Reject {
+                    kind: bc::REJECT_ICMPX,
+                    code: bc::ICMPX_ADMIN_PROHIBITED,
+                },
+            ],
+            Some(tag),
+        ),
+    ]
+}
+
 /// One profile and family: the jump from each base chain (the only rule a
 /// non-member's packet meets: one set lookup) and the profile's own chains.
 fn rules(
     sn: &SubscriberNotices,
     p: &Profile,
     v4: bool,
-    base: &mut [Vec<String>; 2],
-    chains: &mut Vec<(String, Vec<String>)>,
+    base: &mut [Vec<NoticeRule>; 2],
+    chains: &mut Vec<(String, Vec<NoticeRule>)>,
 ) {
-    let (ip, fam) = if v4 { ("ip", "4") } else { ("ip6", "6") };
-    let member = format!("{ip} saddr @al{fam}_{}", p.address_list);
+    let fam = if v4 { "4" } else { "6" };
+    let member = format!("al{fam}_{}", p.address_list);
     let garden = [
-        format!("@al{fam}_{GARDEN_LIST}"),
-        format!("@{}", if v4 { GARDEN4 } else { GARDEN6 }),
+        format!("al{fam}_{GARDEN_LIST}"),
+        (if v4 { GARDEN4 } else { GARDEN6 }).to_owned(),
     ];
-    let tag = format!("comment \"notice:{}\"", p.name);
     let mut nat = Vec::new();
     for g in &garden {
-        nat.push(format!("{ip} daddr {g} return"));
+        nat.push(lookup_rule(v4, false, g, Expr::Return));
     }
     if p.mode != Mode::Block {
-        nat.push(format!("{ip} saddr @al{fam}_{} return", seen_list(&p.name)));
+        let seen = format!("al{fam}_{}", seen_list(&p.name));
+        nat.push(lookup_rule(v4, true, &seen, Expr::Return));
     }
-    let to = target(sn, v4);
-    match p.intercept {
-        Intercept::Http => nat.push(format!("tcp dport 80 fib daddr type != local counter {to} {tag}")),
-        Intercept::Probes => nat.push(format!(
-            "{ip} daddr @al{fam}_{PROBE_LIST} tcp dport 80 fib daddr type != local counter {to} {tag}"
-        )),
-    }
+    nat.push(intercept_rule(sn, p, v4));
     let name = chain("nat", p, fam);
-    base[0].push(format!("{member} jump {name}"));
+    base[0].push(lookup_rule(
+        v4,
+        true,
+        &member,
+        Expr::Jump {
+            chain: name.clone(),
+        },
+    ));
     chains.push((name, nat));
     if p.mode == Mode::Block {
         let mut fwd = Vec::new();
         for g in &garden {
-            fwd.push(format!("{ip} daddr {g} return"));
+            fwd.push(lookup_rule(v4, false, g, Expr::Return));
         }
-        fwd.push("meta l4proto { tcp, udp } th dport 53 return".to_owned());
-        fwd.push(format!(
-            "meta l4proto tcp counter reject with tcp reset {tag}"
-        ));
-        fwd.push(format!("counter reject with icmpx admin-prohibited {tag}"));
+        fwd.extend(block_rules(p));
         let name = chain("block", p, fam);
-        base[1].push(format!("{member} jump {name}"));
+        base[1].push(lookup_rule(
+            v4,
+            true,
+            &member,
+            Expr::Jump {
+                chain: name.clone(),
+            },
+        ));
         chains.push((name, fwd));
     }
 }
 
+fn add_rules(out: &mut String, t: &mut Table, chain: &str, rules: Vec<NoticeRule>) {
+    for (text, exprs, comment) in rules {
+        let _ = writeln!(out, "\t\t{text}");
+        t.rules.push(Rule {
+            chain: chain.to_owned(),
+            exprs,
+            text,
+            nft: None,
+            comment,
+        });
+    }
+}
+
 /// The sets and chains, inside `table inet corerouter { … }` (empty when
-/// no profile acts).
-pub fn render(cfg: &Config, out: &mut String) {
+/// no profile acts): the text, and the same objects into `t` (G2.8).
+pub fn render(cfg: &Config, out: &mut String, t: &mut Table) {
     if !on(cfg) {
         return;
     }
     let sn = &cfg.ip.subscriber_notice;
     for (set, ty, v4) in [(GARDEN4, "ipv4_addr", true), (GARDEN6, "ipv6_addr", false)] {
-        let items: Vec<String> = sn
+        let nets: Vec<AddrMatch> = sn
             .walled_garden
             .iter()
             .filter(|g| !g.disabled)
             .filter_map(|g| g.dst_address)
             .filter(|n| n.addr().is_ipv4() == v4)
-            .map(|n| n.to_string())
+            .map(AddrMatch::Net)
             .collect();
+        let items: Vec<String> = nets.iter().map(ToString::to_string).collect();
         let elems = if items.is_empty() {
             String::new()
         } else {
@@ -148,19 +268,35 @@ pub fn render(cfg: &Config, out: &mut String) {
             out,
             "\tset {set} {{\n\t\ttype {ty}\n\t\tflags interval\n\t\tauto-merge\n{elems}\t}}\n"
         );
+        let statics: Vec<&AddrMatch> = nets.iter().collect();
+        t.fw_sets.push(FwSet {
+            name: set.to_owned(),
+            key: if v4 { KeyKind::Ipv4 } else { KeyKind::Ipv6 },
+            interval: true,
+            timeout: false,
+            dynamic: false,
+            size: None,
+            auto_merge: true,
+            elements: bc::interval_elements(&statics, &[]),
+        });
     }
-    let mut base: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+    let mut base: [Vec<NoticeRule>; 2] = [Vec::new(), Vec::new()];
     let mut chains = Vec::new();
     for p in sn.active() {
         for v4 in [true, false] {
             rules(sn, p, v4, &mut base, &mut chains);
         }
     }
-    for (name, rules) in &chains {
+    for (name, rules) in chains {
         let _ = writeln!(out, "\tchain {name} {{");
-        for r in rules {
-            let _ = writeln!(out, "\t\t{r}");
-        }
+        t.chains.push(Chain {
+            name: name.clone(),
+            kind: ChainType::Filter,
+            hook: Hook::Regular,
+            priority: 0,
+            priority_text: String::new(),
+        });
+        add_rules(out, t, &name, rules);
         let _ = writeln!(out, "\t}}");
     }
     let [nat, fwd] = base;
@@ -168,18 +304,28 @@ pub fn render(cfg: &Config, out: &mut String) {
         out,
         "\tchain notice_dstnat {{\n\t\ttype nat hook prerouting priority dstnat - 5; policy accept;"
     );
-    for r in &nat {
-        let _ = writeln!(out, "\t\t{r}");
-    }
+    t.chains.push(Chain {
+        name: "notice_dstnat".into(),
+        kind: ChainType::Nat,
+        hook: Hook::Prerouting,
+        priority: -105,
+        priority_text: "dstnat - 5".into(),
+    });
+    add_rules(out, t, "notice_dstnat", nat);
     let _ = writeln!(out, "\t}}");
     if !fwd.is_empty() {
         let _ = writeln!(
             out,
             "\tchain notice_forward {{\n\t\ttype filter hook forward priority filter - 5; policy accept;"
         );
-        for r in &fwd {
-            let _ = writeln!(out, "\t\t{r}");
-        }
+        t.chains.push(Chain {
+            name: "notice_forward".into(),
+            kind: ChainType::Filter,
+            hook: Hook::Forward,
+            priority: -5,
+            priority_text: "filter - 5".into(),
+        });
+        add_rules(out, t, "notice_forward", fwd);
         let _ = writeln!(out, "\t}}");
     }
 }
@@ -219,7 +365,7 @@ mod tests {
     fn rules_per_mode() {
         let c = cfg();
         let mut out = String::new();
-        render(&c, &mut out);
+        render(&c, &mut out, &mut Table::default());
         assert!(out.contains("elements = { 203.0.113.0/24 }"), "{out}");
         // Block: every HTTP request, the rest refused at once.
         // One lookup per packet in each base chain, per profile and family.
@@ -276,7 +422,7 @@ mod tests {
         let mut c = cfg();
         c.ip.subscriber_notice.settings.portal_address = Some("10.0.0.1".parse().unwrap());
         let mut out = String::new();
-        render(&c, &mut out);
+        render(&c, &mut out, &mut Table::default());
         assert!(out.contains("dnat ip to 10.0.0.1:8880"), "{out}");
         let nat6 = out.split("chain notice_nat6_atraso {").nth(1).unwrap();
         assert!(
@@ -287,7 +433,7 @@ mod tests {
             p.disabled = true;
         }
         let mut out = String::new();
-        render(&c, &mut out);
+        render(&c, &mut out, &mut Table::default());
         assert!(out.is_empty() && lists(&c).is_empty());
     }
 }

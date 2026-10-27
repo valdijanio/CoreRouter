@@ -77,13 +77,21 @@ pub fn daemons_of(table: Owned, line: &str) -> &'static [Daemon] {
         .unwrap_or(&[])
 }
 
-/// What FRR should run for `cfg` (the owned part only).
-pub fn render(cfg: &Config) -> Result<Conf, ParseError> {
-    let mut text = String::new();
-    for inst in cfg.routing.bgp.values() {
-        text.push_str(&corerouter_proto_bgp::render_frr(inst));
-    }
-    Conf::parse(&text)
+/// Why a config cannot be rendered.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RenderError {
+    /// A `proto-*` render refused (a key that does not open).
+    #[error("{0}")]
+    Proto(String),
+    #[error("render: {0}")]
+    Parse(#[from] ParseError),
+}
+
+/// What FRR should run for `cfg` (the owned part only); `open` opens the
+/// sealed TCP MD5 keys.
+pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Conf, RenderError> {
+    let text = corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
+    Ok(Conf::parse(&text)?)
 }
 
 /// `conf` split by daemon: each daemon's part, in [`Daemon::ALL`] order,
@@ -122,7 +130,7 @@ mod tests {
                 comment: String::new(),
             },
         );
-        let conf = render(&cfg).unwrap();
+        let conf = render(&cfg, &|_| None).unwrap();
         assert_eq!(conf.nodes.len(), 1);
         assert_eq!(conf.nodes[0].line, "router bgp 65000");
         assert!(

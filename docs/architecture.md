@@ -116,7 +116,40 @@ netns sem root, 2026-10-23, `cargo bench -p corerouter-hal-linux --bench netns_c
   150 mil assinantes (**estimado**).
 - No roteador o daemon é root e o limite some.
 
-O firewall do G2.1 continua no `nft -f` por enquanto: a migração para o mesmo encoder é a G2.8.
+O firewall do G2.1 passou para o mesmo encoder na G2.8 (abaixo).
+
+**G2.8, o firewall (`inet corerouter`) por nfnetlink (medido).** Mesma máquina, kernel 7.0,
+nft 1.0.9, build release, netns sem root, 2026-10-27,
+`cargo bench -p corerouter-hal-linux --bench netns_firewall`. "nft" é o caminho de antes
+(`nft -j list` + `nft -f` do ruleset inteiro, com o texto antigo de sets anônimos):
+
+| Operação | nfnetlink | `nft` (antes) |
+|---|---|---|
+| carregar 100 / 1 000 / 10 000 regras | 17,4 / 24,6 / 112 ms | 22,8 / 49,3 ms / 4,09 s |
+| mudar 1 regra em 100 / 1 000 / 10 000 | 15,8 / 22,3 / 109 ms | 26,7 / 99,4 ms / 6,91 s |
+| 1 000 entradas dinâmicas | 0,92 ms (um lote) | 2,37 s (um `nft` por entrada) |
+| 100 000 entradas dinâmicas | 116 ms | não cabe ("Message too long"); 383 ms num `add element` único |
+| ler 1 000 / 100 000 entradas dinâmicas | 0,24 / 246 ms | 3,3 / 636 ms (`nft -j`) |
+
+- **Só a diferença:** o commit lê os handles do kernel (um dump), confere que a tabela é a que
+  carregamos e manda num lote só as regras que saíram (`DELRULE`), as que entraram no lugar
+  (`NEWRULE` com posição), os elementos e as chains/sets que mudaram. Regra igual mantém o handle
+  e os contadores. Tabela alterada por terceiros ou set com outra definição: troca inteira.
+- **O kernel é o gargalo do commit:** qualquer lote que remove algo espera um período de graça
+  RCU, 12–28 ms (o próprio `nft delete rule` leva isso); só acrescentar custa ~0,5 ms.
+- **Sets anônimos custam O(sets) cada no kernel** (nome e busca por nome varrem a lista da
+  tabela): 10 000 regras com `th dport { 22, 80, 443 }` levavam 22 s, com `ct state { … }` 3,2 s,
+  no `nft` e em nós. Listas de portas viraram sets nomeados compartilhados por conteúdo
+  (`ports_22_80_443`) e `ct state a,b` máscara (o estado é um bit): 77 ms e 63 ms.
+- **Paralelismo:** o programa antigo, o novo e o dump do kernel são independentes e rodam em
+  threads (10 000 regras: 15 + 15 + 38 ms em série). Os lotes não paralelizam: o nfnetlink segura
+  o mutex do nf_tables por lote inteiro; 100 000 entradas em 4 threads/4 sockets ≈ 1 lote só,
+  dentro do ruído, e com corrida entre lotes do mesmo set. Em 100 000 entradas o kernel leva
+  ~97 ms e o espaço de usuário ~8 ms (merge em `u128`, era 10 ms com `Vec<u8>`).
+- **O dump fica:** 12 500 regras são 6,3 MB e 25–28 ms só de kernel; é o que detecta a tabela
+  mexida por outro. Guardar handles e conferir o `genid` evitaria o dump, mas o genid muda a cada
+  commit de qualquer tabela (o CGNAT muda por assinante), então o cache quase nunca valeria.
+- O `nft` não roda mais em produção; a imagem perde o jansson (`nft -j`).
 
 #### 1.2.2 CGNAT sem portas: nfqueue só dos quase cheios (G2.7, **medido**)
 
@@ -202,7 +235,27 @@ backend.**
   daemon o envio é sequencial: ele atende um comando por vez por conexão, e o custo é dele.
 - **RFC 8212.** O perfil `traditional` do FRR liga `bgp ebgp-requires-policy` e o render não
   desliga. Uma sessão eBGP sem política não aceita nem anuncia rota (no teste com FRR real,
-  `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2.
+  `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2b.
+- **Vizinhos BGP no modelo RouterOS v7 (G3.2a, `docs/bgp.md`).** `routing.bgp_templates` e
+  `routing.bgp_connections` (`corerouter_model::bgp`). Os templates são **achatados** no render:
+  cada vizinho vai ao FRR com os valores em vigor, sem `peer-group`. Um template do RouterOS
+  tem vários pais e qualquer valor é sobrescrito na conexão; um peer-group tem um pai só, e
+  alguns parâmetros não se sobrescrevem por membro. Mudar um template digita as linhas que
+  mudaram em cada vizinho que herda o valor, e nada mais. Medido com FRR 10.7.1 real (VM do
+  laboratório, debug do nosso lado, 2026-10-27): 1 000 conexões aplicadas em 329 ms (5 006
+  comandos), uma mudada entre 1 000 em 28 ms (3 comandos), todas removidas em 197 ms.
+  - **Ordem do diff.** Um vizinho existe da linha `neighbor X remote-as` até `no neighbor X
+    remote-as`, que leva junto todas as outras linhas dele, nas famílias também. O diff define
+    os vizinhos novos antes das mudanças dentro das famílias (o `activate`) e remove os
+    vizinhos apagados por último, com um comando só.
+  - **Chave TCP MD5.** Fica selada (`sealing`, a mesma AES-256-GCM das senhas PPP). O backend
+    recebe do engine um `SecretOpener` ao ser ligado e abre a chave só no render. O
+    `hal-frr` mascara `password` em erro e log.
+  - **`routing` é uma seção `CowArc`, e o delta do histórico é por conexão.** Antes, a seção
+    era serializada inteira duas vezes em todo commit (o delta do histórico e o arquivo da
+    revisão anterior), até nos commits de firewall. Medido com 1 000 conexões, release:
+    mudar uma passou de 8,1 ms para 1,5 ms por commit (criterion, `engine/benches/bgp.rs`), e
+    um commit que não toca `routing` não copia nem serializa a seção.
 - **holo** (suíte de roteamento em Rust, modelo YANG) é o candidato a backend Rust-nativo do
   mesmo trait (G3.8) — sem mudar UI, comandos ou MCP.
 - FSMs próprias só para o **simulador** (sessões BGP/OSPF entre roteadores virtuais no lab, G3.7)

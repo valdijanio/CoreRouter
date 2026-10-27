@@ -5,7 +5,9 @@
 //! The virtual lab has no backend: commits only change the config and the
 //! session list is empty. The daemon attaches FRR (`service/frr.rs`).
 
-use corerouter_hal::routing::{RoutingDaemon, RoutingReader};
+use std::sync::Arc;
+
+use corerouter_hal::routing::{BgpClear, RoutingDaemon, RoutingReader};
 use corerouter_model::Config;
 use corerouter_model::routing_state::RoutingStatus;
 
@@ -23,8 +25,14 @@ impl Session {
     /// commit or [`Session::routing_resync`] tries again.
     pub fn attach_routing(
         &mut self,
-        daemon: Box<dyn RoutingDaemon>,
+        mut daemon: Box<dyn RoutingDaemon>,
     ) -> (Box<dyn RoutingReader>, Result<()>) {
+        // The render opens the sealed TCP MD5 keys (G3.2a) with the
+        // session's key; without it a sealed key refuses the commit.
+        match crate::sealing::key(self) {
+            Ok(key) => daemon.set_secrets(Arc::new(move |s| key.open(s))),
+            Err(e) => log::error!("routing: sealed BGP keys cannot be opened: {e}"),
+        }
         let reader = daemon.reader();
         if let Some(slot) = self.ext_mut::<RoutingBackend>() {
             *slot = RoutingBackend(Some(daemon));
@@ -42,6 +50,19 @@ impl Session {
                 .apply(&running, &running)
                 .map_err(|e| EngineError::Hal(format!("routing: {e}"))),
             _ => Ok(()),
+        }
+    }
+
+    /// Reset or refresh a BGP session on the routing daemons (a running
+    /// action; one vty command, ~1 ms, under the lock like a commit).
+    pub fn routing_bgp_clear(&mut self, instance: &str, neighbor: &str, how: BgpClear) -> Result<()> {
+        match self.ext_mut::<RoutingBackend>() {
+            Some(RoutingBackend(Some(d))) => d
+                .bgp_clear(instance, neighbor, how)
+                .map_err(|e| EngineError::Hal(format!("routing: {e}"))),
+            _ => Err(EngineError::Hal(
+                "routing: no routing daemon is attached (virtual lab, or the daemon runs without --frr)".into(),
+            )),
         }
     }
 

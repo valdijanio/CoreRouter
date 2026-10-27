@@ -14,7 +14,8 @@
 //! is big-endian, element and register data are packet-order bytes.
 
 use corerouter_firewall::program::{
-    Base, Chain, Dir, Element, Expr, FAMILY_IPV4, Family, Flowtable, NatKind, Rule, Set, Table,
+    AnonSet, Base, Chain, Dir, Element, Expr, FAMILY_IPV4, Family, Flowtable, FwSet, Hook,
+    KernelElement, NatKind, Rule, SET_ANONYMOUS, SET_CONSTANT, SET_INTERVAL, Set, Table,
 };
 
 const NLA_HDR: usize = 4;
@@ -32,8 +33,11 @@ const NFNL_MSG_BATCH_END: u16 = 17;
 const NFT_MSG_NEWTABLE: u16 = 0;
 const NFT_MSG_DELTABLE: u16 = 2;
 const NFT_MSG_NEWCHAIN: u16 = 3;
+const NFT_MSG_DELCHAIN: u16 = 5;
 const NFT_MSG_NEWRULE: u16 = 6;
+const NFT_MSG_DELRULE: u16 = 8;
 const NFT_MSG_NEWSET: u16 = 9;
+const NFT_MSG_DELSET: u16 = 11;
 const NFT_MSG_NEWSETELEM: u16 = 12;
 const NFT_MSG_DELSETELEM: u16 = 14;
 const NFT_MSG_NEWFLOWTABLE: u16 = 22;
@@ -48,7 +52,12 @@ const NFTA_HOOK_HOOKNUM: u16 = 1;
 const NFTA_HOOK_PRIORITY: u16 = 2;
 const NFTA_RULE_TABLE: u16 = 1;
 const NFTA_RULE_CHAIN: u16 = 2;
+const NFTA_RULE_HANDLE: u16 = 3;
 const NFTA_RULE_EXPRESSIONS: u16 = 4;
+const NFTA_RULE_POSITION: u16 = 6;
+const NFTA_RULE_USERDATA: u16 = 7;
+/// libnftnl's rule comment TLV (`NFTNL_UDATA_RULE_COMMENT`).
+const UDATA_RULE_COMMENT: u8 = 0;
 const NFTA_LIST_ELEM: u16 = 1;
 const NFTA_EXPR_NAME: u16 = 1;
 const NFTA_EXPR_DATA: u16 = 2;
@@ -70,12 +79,18 @@ const NFTA_SET_ELEM_LIST_ELEMENTS: u16 = 3;
 const NFTA_SET_ELEM_KEY: u16 = 1;
 const NFTA_SET_ELEM_DATA: u16 = 2;
 const NFTA_SET_ELEM_FLAGS: u16 = 3;
+const NFTA_SET_ELEM_TIMEOUT: u16 = 4;
+const NFTA_SET_ELEM_LIST_SET_ID: u16 = 4;
 const NFT_SET_ELEM_INTERVAL_END: u32 = 1;
 const NFTA_DATA_VALUE: u16 = 1;
 const NFTA_DATA_VERDICT: u16 = 2;
 const NFTA_VERDICT_CODE: u16 = 1;
+const NFTA_VERDICT_CHAIN: u16 = 2;
 const NF_ACCEPT: u32 = 1;
 const NF_DROP: u32 = 0;
+/// `NFT_JUMP` (-3) and `NFT_RETURN` (-5) as the kernel's u32.
+const NFT_JUMP: u32 = 0xffff_fffd;
+const NFT_RETURN: u32 = 0xffff_fffb;
 
 // Flowtables (`NFTA_FLOWTABLE_*`, `NFTA_FLOWTABLE_HOOK_*`).
 const NFTA_FLOWTABLE_TABLE: u16 = 1;
@@ -116,7 +131,29 @@ const NFTA_CT_DIRECTION: u16 = 3;
 const NFTA_LOOKUP_SET: u16 = 1;
 const NFTA_LOOKUP_SREG: u16 = 2;
 const NFTA_LOOKUP_DREG: u16 = 3;
+const NFTA_LOOKUP_SET_ID: u16 = 4;
 const NFTA_LOOKUP_FLAGS: u16 = 5;
+const NFTA_RANGE_SREG: u16 = 1;
+const NFTA_RANGE_OP: u16 = 2;
+const NFTA_RANGE_FROM_DATA: u16 = 3;
+const NFTA_RANGE_TO_DATA: u16 = 4;
+const NFTA_REJECT_TYPE: u16 = 1;
+const NFTA_REJECT_ICMP_CODE: u16 = 2;
+const NFTA_LOG_PREFIX: u16 = 2;
+const NFTA_CT_SREG: u16 = 4;
+const NFTA_MASQ_FLAGS: u16 = 1;
+const NFTA_MASQ_REG_PROTO_MIN: u16 = 2;
+const NFTA_MASQ_REG_PROTO_MAX: u16 = 3;
+const NFTA_REDIR_REG_PROTO_MIN: u16 = 1;
+const NFTA_REDIR_REG_PROTO_MAX: u16 = 2;
+const NFTA_REDIR_FLAGS: u16 = 3;
+const NFTA_NAT_FLAGS: u16 = 7;
+const NFTA_FIB_DREG: u16 = 1;
+const NFTA_FIB_RESULT: u16 = 2;
+const NFTA_FIB_FLAGS: u16 = 3;
+const NFTA_DYNSET_SET_ID: u16 = 2;
+const NFTA_DYNSET_TIMEOUT: u16 = 6;
+const NFT_DYNSET_OP_ADD: u32 = 0;
 const NFT_LOOKUP_F_INV: u32 = 1;
 const NFTA_QUEUE_NUM: u16 = 1;
 /// `NFT_QUEUE_FLAG_BYPASS`: no listener, the packet goes on.
@@ -161,6 +198,17 @@ pub struct Batch {
     set_ids: u32,
     /// `NFPROTO_*` of every nf_tables message (the table's family).
     family: u8,
+    /// Ids and names of the anonymous sets of the rule being written, in
+    /// order.
+    anon_ids: std::collections::VecDeque<(u32, String)>,
+    /// Name anonymous sets `__set<n>` from this number on, instead of
+    /// letting the kernel number them (`__set%d`): the kernel finds a free
+    /// number by scanning every set of the table, O(sets) per set, which
+    /// made 10 000 rules take 4 s (G2.8, **medido**).
+    anon_next: Option<u32>,
+    /// Ids of the named firewall sets created in this batch (nft names
+    /// them by id as well in the rules that follow).
+    named_ids: std::collections::BTreeMap<String, u32>,
 }
 
 impl Batch {
@@ -173,6 +221,9 @@ impl Batch {
             first: seq.wrapping_add(1),
             set_ids: 0,
             family: FAMILY_IPV4,
+            anon_ids: std::collections::VecDeque::new(),
+            anon_next: None,
+            named_ids: std::collections::BTreeMap::new(),
         };
         b.header(NFNL_MSG_BATCH_BEGIN, NLM_F_REQUEST, 0, NFNL_SUBSYS_NFTABLES);
         b.close_msg();
@@ -203,10 +254,13 @@ impl Batch {
         self.seq = self.seq.wrapping_add(1);
     }
 
-    /// Start an nf_tables message of type `msg`.
+    /// Start an nf_tables message of type `msg`. Only the last message of
+    /// the batch asks for an ACK ([`Self::finish`]): the kernel reports any
+    /// error anyway, and one ACK per message of a batch of thousands
+    /// overflowed the socket's receive buffer (`ENOBUFS`, G2.8).
     fn begin_msg(&mut self, msg: u16, flags: u16) {
         let kind = (NFNL_SUBSYS_NFTABLES << 8) | msg;
-        self.header(kind, NLM_F_REQUEST | NLM_F_ACK | flags, self.family, 0);
+        self.header(kind, NLM_F_REQUEST | flags, self.family, 0);
     }
 
     fn put(&mut self, kind: u16, data: &[u8]) {
@@ -292,12 +346,17 @@ impl Batch {
         self.begin_msg(NFT_MSG_NEWCHAIN, NLM_F_CREATE);
         self.str(NFTA_CHAIN_TABLE, table);
         self.str(NFTA_CHAIN_NAME, &c.name);
+        if c.hook == Hook::Regular {
+            self.close_msg();
+            return;
+        }
+        // nft's order: policy, type, hook.
+        self.be32(NFTA_CHAIN_POLICY, NF_ACCEPT);
+        self.str(NFTA_CHAIN_TYPE, c.kind.name());
         self.begin(NFTA_CHAIN_HOOK);
         self.be32(NFTA_HOOK_HOOKNUM, c.hook.number());
         self.put(NFTA_HOOK_PRIORITY, &c.priority.to_be_bytes());
         self.end();
-        self.be32(NFTA_CHAIN_POLICY, NF_ACCEPT);
-        self.str(NFTA_CHAIN_TYPE, c.kind.name());
         self.close_msg();
     }
 
@@ -383,15 +442,184 @@ impl Batch {
     }
 
     pub fn new_rule(&mut self, table: &str, r: &Rule) {
-        self.begin_msg(NFT_MSG_NEWRULE, NLM_F_CREATE | NLM_F_APPEND);
+        self.insert_rule(table, r, Place::End);
+    }
+
+    /// Rule `r` at `place` (G2.8): its anonymous sets first (they live in
+    /// the same transaction), then the rule with its comment.
+    pub fn insert_rule(&mut self, table: &str, r: &Rule, place: Place) {
+        self.anon_ids.clear();
+        for e in &r.exprs {
+            if let Expr::LookupAnon { set, .. } = e {
+                let named = self.anon_set(table, set);
+                self.anon_ids.push_back(named);
+            }
+        }
+        let flags = match place {
+            Place::End | Place::After(_) => NLM_F_CREATE | NLM_F_APPEND,
+            Place::Start => NLM_F_CREATE,
+        };
+        self.begin_msg(NFT_MSG_NEWRULE, flags);
         self.str(NFTA_RULE_TABLE, table);
         self.str(NFTA_RULE_CHAIN, &r.chain);
+        if let Place::After(handle) = place {
+            self.be64(NFTA_RULE_POSITION, handle);
+        }
         self.begin(NFTA_RULE_EXPRESSIONS);
         for e in &r.exprs {
             self.expr(e);
         }
         self.end();
+        if let Some(c) = &r.comment {
+            self.put(NFTA_RULE_USERDATA, &comment_udata(c));
+        }
         self.close_msg();
+    }
+
+    /// Name the anonymous sets that follow `__set<first>`, `__set<first+1>`…
+    /// (`first` above any number the table already uses).
+    pub fn name_anon_sets_from(&mut self, first: u32) {
+        self.anon_next = Some(first);
+    }
+
+    /// An anonymous set and its elements; its transaction id and name.
+    fn anon_set(&mut self, table: &str, a: &AnonSet) -> (u32, String) {
+        self.set_ids = self.set_ids.wrapping_add(1);
+        let id = self.set_ids;
+        let name = match self.anon_next {
+            Some(n) => {
+                self.anon_next = Some(n.wrapping_add(1));
+                format!("__set{n}")
+            }
+            None => ANON_SET_NAME.to_owned(),
+        };
+        let mut flags = SET_ANONYMOUS | SET_CONSTANT;
+        if a.interval {
+            flags |= SET_INTERVAL;
+        }
+        self.begin_msg(NFT_MSG_NEWSET, NLM_F_CREATE);
+        self.str(NFTA_SET_TABLE, table);
+        self.str(NFTA_SET_NAME, &name);
+        self.be32(NFTA_SET_FLAGS, flags);
+        self.be32(NFTA_SET_KEY_TYPE, a.key.nft_id());
+        self.be32(NFTA_SET_KEY_LEN, a.key.len());
+        self.be32(NFTA_SET_ID, id);
+        self.begin(NFTA_SET_DESC);
+        self.be32(
+            NFTA_SET_DESC_SIZE,
+            u32::try_from(a.elements.len()).unwrap_or(u32::MAX),
+        );
+        self.end();
+        self.put(NFTA_SET_USERDATA, &a.udata);
+        self.close_msg();
+        let items: Vec<KernelElement> = a
+            .elements
+            .iter()
+            .map(|(key, end)| KernelElement {
+                key: key.clone(),
+                end: *end,
+                timeout_ms: None,
+            })
+            .collect();
+        self.kernel_elements(table, &name, Some(id), &items, true);
+        (id, name)
+    }
+
+    /// Named set `s` of the firewall (G2.8), without its elements.
+    pub fn new_fw_set(&mut self, table: &str, s: &FwSet) -> u32 {
+        self.set_ids = self.set_ids.wrapping_add(1);
+        self.begin_msg(NFT_MSG_NEWSET, NLM_F_CREATE);
+        self.str(NFTA_SET_TABLE, table);
+        self.str(NFTA_SET_NAME, &s.name);
+        self.be32(NFTA_SET_FLAGS, s.flags());
+        self.be32(NFTA_SET_KEY_TYPE, s.key.nft_id());
+        self.be32(NFTA_SET_KEY_LEN, s.key.len());
+        self.be32(NFTA_SET_ID, self.set_ids);
+        if let Some(n) = s.size {
+            self.begin(NFTA_SET_DESC);
+            self.be32(NFTA_SET_DESC_SIZE, n);
+            self.end();
+        }
+        let mut udata = corerouter_firewall::bytecode::udata_byteorder(s.key.big_endian()).to_vec();
+        if s.auto_merge {
+            udata.extend_from_slice(&corerouter_firewall::bytecode::udata_merge());
+        }
+        self.put(NFTA_SET_USERDATA, &udata);
+        self.close_msg();
+        self.named_ids.insert(s.name.clone(), self.set_ids);
+        self.set_ids
+    }
+
+    /// Elements of set `set` as the kernel holds them, added or deleted,
+    /// in messages of at most [`ELEMENTS_PER_MESSAGE`].
+    pub fn kernel_elements(
+        &mut self,
+        table: &str,
+        set: &str,
+        set_id: Option<u32>,
+        items: &[KernelElement],
+        add: bool,
+    ) {
+        for chunk in items.chunks(ELEMENTS_PER_MESSAGE) {
+            let msg = if add {
+                NFT_MSG_NEWSETELEM
+            } else {
+                NFT_MSG_DELSETELEM
+            };
+            self.begin_msg(msg, if add { NLM_F_CREATE } else { 0 });
+            self.str(NFTA_SET_ELEM_LIST_TABLE, table);
+            self.str(NFTA_SET_ELEM_LIST_SET, set);
+            if let Some(id) = set_id {
+                self.be32(NFTA_SET_ELEM_LIST_SET_ID, id);
+            }
+            self.begin(NFTA_SET_ELEM_LIST_ELEMENTS);
+            for (i, e) in chunk.iter().enumerate() {
+                // libnftnl numbers the elements of a message from 1 (the
+                // kernel reads any type).
+                self.begin(u16::try_from(i + 1).unwrap_or(NFTA_LIST_ELEM));
+                // nft's order: flags, timeout, key.
+                if e.end {
+                    self.be32(NFTA_SET_ELEM_FLAGS, NFT_SET_ELEM_INTERVAL_END);
+                }
+                if let (Some(t), true) = (e.timeout_ms, add) {
+                    self.be64(NFTA_SET_ELEM_TIMEOUT, t);
+                }
+                self.value(NFTA_SET_ELEM_KEY, &e.key);
+                self.end();
+            }
+            self.close_msg();
+        }
+    }
+
+    /// Delete the rule `handle` of `chain` or, without a handle, every
+    /// rule of the chain.
+    pub fn del_rule(&mut self, table: &str, chain: &str, handle: Option<u64>) {
+        self.begin_msg(NFT_MSG_DELRULE, 0);
+        self.str(NFTA_RULE_TABLE, table);
+        self.str(NFTA_RULE_CHAIN, chain);
+        if let Some(h) = handle {
+            self.be64(NFTA_RULE_HANDLE, h);
+        }
+        self.close_msg();
+    }
+
+    pub fn del_chain(&mut self, table: &str, chain: &str) {
+        self.begin_msg(NFT_MSG_DELCHAIN, 0);
+        self.str(NFTA_CHAIN_TABLE, table);
+        self.str(NFTA_CHAIN_NAME, chain);
+        self.close_msg();
+    }
+
+    pub fn del_set(&mut self, table: &str, set: &str) {
+        self.begin_msg(NFT_MSG_DELSET, 0);
+        self.str(NFTA_SET_TABLE, table);
+        self.str(NFTA_SET_NAME, set);
+        self.close_msg();
+    }
+
+    /// The number of messages written so far (batch begin included).
+    pub fn messages(&self) -> u32 {
+        self.seq.wrapping_sub(self.first).wrapping_add(1)
     }
 
     fn expr(&mut self, e: &Expr) {
@@ -412,6 +640,20 @@ impl Batch {
             Expr::Immediate { .. } => "immediate",
             Expr::MetaSet { .. } => "meta",
             Expr::Limit { .. } => "limit",
+            Expr::Bitwise { .. } => "bitwise",
+            Expr::Order { .. } => "cmp",
+            Expr::Range { .. } => "range",
+            Expr::LookupAnon { .. } => "lookup",
+            Expr::Accept | Expr::Return | Expr::Jump { .. } => "immediate",
+            Expr::Reject { .. } => "reject",
+            Expr::Log { .. } => "log",
+            Expr::Notrack => "notrack",
+            Expr::CtSet { .. } => "ct",
+            Expr::Masq { .. } => "masq",
+            Expr::Redir { .. } => "redir",
+            Expr::NatRange { .. } => "nat",
+            Expr::Fib { .. } => "fib",
+            Expr::DynsetAdd { .. } => "dynset",
         };
         self.str(NFTA_EXPR_NAME, name);
         self.begin(NFTA_EXPR_DATA);
@@ -434,8 +676,9 @@ impl Batch {
                 self.be32(NFTA_PAYLOAD_LEN, *len);
             }
             Expr::Meta { key, dreg } => {
-                self.be32(NFTA_META_DREG, *dreg);
+                // nft's order: key, register.
                 self.be32(NFTA_META_KEY, key.number());
+                self.be32(NFTA_META_DREG, *dreg);
             }
             Expr::Cmp { sreg, eq, data } => {
                 self.be32(NFTA_CMP_SREG, *sreg);
@@ -450,10 +693,30 @@ impl Batch {
                 self.value(NFTA_BITWISE_XOR, &vec![0; mask.len()]);
             }
             Expr::Ct { key, dir, dreg } => {
-                self.be32(NFTA_CT_DREG, *dreg);
+                // nft's order: key, register.
                 self.be32(NFTA_CT_KEY, key.number());
+                self.be32(NFTA_CT_DREG, *dreg);
                 if let Some(d) = dir {
                     self.put(NFTA_CT_DIRECTION, &[if *d == Dir::Reply { 1 } else { 0 }]);
+                }
+            }
+            Expr::Lookup {
+                set,
+                sreg,
+                dreg,
+                inv,
+            } if self.named_ids.contains_key(set) => {
+                // A firewall set of this batch: nft's order and its id.
+                self.be32(NFTA_LOOKUP_SREG, *sreg);
+                self.str(NFTA_LOOKUP_SET, set);
+                if let Some(id) = self.named_ids.get(set).copied() {
+                    self.be32(NFTA_LOOKUP_SET_ID, id);
+                }
+                if let Some(d) = dreg {
+                    self.be32(NFTA_LOOKUP_DREG, *d);
+                }
+                if *inv {
+                    self.be32(NFTA_LOOKUP_FLAGS, NFT_LOOKUP_F_INV);
                 }
             }
             Expr::Lookup {
@@ -528,14 +791,152 @@ impl Batch {
                 self.be32(NFTA_LIMIT_BURST, *burst);
                 self.be32(NFTA_LIMIT_TYPE, 0); // NFT_LIMIT_PKTS
             }
-            Expr::Drop => {
-                self.be32(NFTA_IMMEDIATE_DREG, 0);
-                self.begin(NFTA_IMMEDIATE_DATA);
-                self.begin(NFTA_DATA_VERDICT);
-                self.be32(NFTA_VERDICT_CODE, NF_DROP);
-                self.end();
-                self.end();
+            Expr::Drop => self.verdict(NF_DROP, None),
+            Expr::Accept => self.verdict(NF_ACCEPT, None),
+            Expr::Return => self.verdict(NFT_RETURN, None),
+            Expr::Jump { chain } => self.verdict(NFT_JUMP, Some(chain)),
+            Expr::Bitwise {
+                sreg,
+                dreg,
+                mask,
+                xor,
+            } => {
+                self.be32(NFTA_BITWISE_SREG, *sreg);
+                self.be32(NFTA_BITWISE_DREG, *dreg);
+                self.be32(NFTA_BITWISE_LEN, u32::try_from(mask.len()).unwrap_or(4));
+                self.value(NFTA_BITWISE_MASK, mask);
+                self.value(NFTA_BITWISE_XOR, xor);
             }
+            Expr::Order { sreg, op, data } => {
+                self.be32(NFTA_CMP_SREG, *sreg);
+                self.be32(NFTA_CMP_OP, op.number());
+                self.value(NFTA_CMP_DATA, data);
+            }
+            Expr::Range { sreg, eq, from, to } => {
+                self.be32(NFTA_RANGE_SREG, *sreg);
+                self.be32(NFTA_RANGE_OP, if *eq { 0 } else { 1 });
+                self.value(NFTA_RANGE_FROM_DATA, from);
+                self.value(NFTA_RANGE_TO_DATA, to);
+            }
+            Expr::LookupAnon { sreg, inv, .. } => {
+                let (id, name) = self
+                    .anon_ids
+                    .pop_front()
+                    .unwrap_or_else(|| (0, ANON_SET_NAME.to_owned()));
+                self.be32(NFTA_LOOKUP_SREG, *sreg);
+                self.str(NFTA_LOOKUP_SET, &name);
+                self.be32(NFTA_LOOKUP_SET_ID, id);
+                if *inv {
+                    self.be32(NFTA_LOOKUP_FLAGS, NFT_LOOKUP_F_INV);
+                }
+            }
+            Expr::Reject { kind, code } => {
+                self.be32(NFTA_REJECT_TYPE, *kind);
+                self.put(NFTA_REJECT_ICMP_CODE, &[*code]);
+            }
+            Expr::Log { prefix } => {
+                if let Some(p) = prefix {
+                    self.str(NFTA_LOG_PREFIX, p);
+                }
+            }
+            Expr::Notrack => {}
+            Expr::CtSet { key, sreg } => {
+                self.be32(NFTA_CT_KEY, key.number());
+                self.be32(NFTA_CT_SREG, *sreg);
+            }
+            Expr::Masq {
+                proto_min,
+                proto_max,
+                flags,
+            } => {
+                if *flags != 0 {
+                    self.be32(NFTA_MASQ_FLAGS, *flags);
+                }
+                if let Some(r) = proto_min {
+                    self.be32(NFTA_MASQ_REG_PROTO_MIN, *r);
+                }
+                if let Some(r) = proto_max {
+                    self.be32(NFTA_MASQ_REG_PROTO_MAX, *r);
+                }
+            }
+            Expr::Redir {
+                proto_min,
+                proto_max,
+                flags,
+            } => {
+                if let Some(r) = proto_min {
+                    self.be32(NFTA_REDIR_REG_PROTO_MIN, *r);
+                }
+                if let Some(r) = proto_max {
+                    self.be32(NFTA_REDIR_REG_PROTO_MAX, *r);
+                }
+                if *flags != 0 {
+                    self.be32(NFTA_REDIR_FLAGS, *flags);
+                }
+            }
+            Expr::NatRange {
+                kind,
+                family,
+                addr_min,
+                addr_max,
+                proto_min,
+                proto_max,
+                flags,
+            } => {
+                self.be32(NFTA_NAT_TYPE, if *kind == NatKind::Snat { 0 } else { 1 });
+                self.be32(NFTA_NAT_FAMILY, u32::from(*family));
+                for (attr, reg) in [
+                    (NFTA_NAT_REG_ADDR_MIN, addr_min),
+                    (NFTA_NAT_REG_ADDR_MAX, addr_max),
+                    (NFTA_NAT_REG_PROTO_MIN, proto_min),
+                    (NFTA_NAT_REG_PROTO_MAX, proto_max),
+                ] {
+                    if let Some(r) = reg {
+                        self.be32(attr, *r);
+                    }
+                }
+                if *flags != 0 {
+                    self.be32(NFTA_NAT_FLAGS, *flags);
+                }
+            }
+            Expr::Fib {
+                flags,
+                result,
+                dreg,
+            } => {
+                self.be32(NFTA_FIB_DREG, *dreg);
+                self.be32(NFTA_FIB_RESULT, *result);
+                self.be32(NFTA_FIB_FLAGS, *flags);
+            }
+            Expr::DynsetAdd {
+                set,
+                sreg_key,
+                timeout_ms,
+            } => {
+                // nft's order.
+                self.be32(NFTA_DYNSET_SREG_KEY, *sreg_key);
+                self.be32(NFTA_DYNSET_OP, NFT_DYNSET_OP_ADD);
+                if let Some(t) = timeout_ms {
+                    self.be64(NFTA_DYNSET_TIMEOUT, *t);
+                }
+                self.str(NFTA_DYNSET_SET_NAME, set);
+                if let Some(id) = self.named_ids.get(set).copied() {
+                    self.be32(NFTA_DYNSET_SET_ID, id);
+                }
+            }
+        }
+        self.end();
+        self.end();
+    }
+
+    /// `immediate reg 0 <verdict> [-> chain]`.
+    fn verdict(&mut self, code: u32, chain: Option<&str>) {
+        self.be32(NFTA_IMMEDIATE_DREG, 0);
+        self.begin(NFTA_IMMEDIATE_DATA);
+        self.begin(NFTA_DATA_VERDICT);
+        self.be32(NFTA_VERDICT_CODE, code);
+        if let Some(c) = chain {
+            self.str(NFTA_VERDICT_CHAIN, c);
         }
         self.end();
         self.end();
@@ -544,10 +945,41 @@ impl Batch {
     /// Close the batch: its bytes and the sequence numbers that answer.
     pub fn finish(mut self) -> (Vec<u8>, std::ops::Range<u32>) {
         let last = self.seq;
+        if last != self.first
+            && let Some(f) = self.buf.get_mut(self.msg + 6..self.msg + 8)
+        {
+            let old = <[u8; 2]>::try_from(&f[..]).map_or(0, u16::from_ne_bytes);
+            f.copy_from_slice(&(old | NLM_F_ACK).to_ne_bytes());
+        }
         self.header(NFNL_MSG_BATCH_END, NLM_F_REQUEST, 0, NFNL_SUBSYS_NFTABLES);
         self.close_msg();
         (self.buf, self.first..last)
     }
+}
+
+/// Where a new rule goes in its chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Place {
+    End,
+    Start,
+    /// Right after the rule with this handle.
+    After(u64),
+}
+
+/// The name of an anonymous set in a batch (the kernel numbers it).
+pub const ANON_SET_NAME: &str = "__set%d";
+
+/// A rule comment as libnftnl stores it: type, length (with the NUL),
+/// the text and a NUL. At most 127 bytes of text.
+pub fn comment_udata(c: &str) -> Vec<u8> {
+    let text: Vec<u8> = c.bytes().take(127).collect();
+    let mut out = vec![
+        UDATA_RULE_COMMENT,
+        u8::try_from(text.len() + 1).unwrap_or(128),
+    ];
+    out.extend(text);
+    out.push(0);
+    out
 }
 
 /// The batch that replaces table `t` whole: create it (so the delete
@@ -555,9 +987,11 @@ impl Batch {
 pub fn replace(t: &Table, seq: u32) -> Batch {
     let mut b = Batch::new(seq);
     b.family(t.family);
+    // The table is new: its anonymous sets start from zero.
+    b.name_anon_sets_from(0);
     b.new_table(&t.name);
     b.del_table(&t.name);
-    if t.sets.is_empty() && t.chains.is_empty() && t.flowtables.is_empty() {
+    if t.sets.is_empty() && t.fw_sets.is_empty() && t.chains.is_empty() && t.flowtables.is_empty() {
         return b;
     }
     b.new_table(&t.name);
@@ -567,6 +1001,10 @@ pub fn replace(t: &Table, seq: u32) -> Batch {
     for s in &t.sets {
         b.new_set(&t.name, s);
         b.elements(&t.name, s, &s.elements, true);
+    }
+    for s in &t.fw_sets {
+        let id = b.new_fw_set(&t.name, s);
+        b.kernel_elements(&t.name, &s.name, Some(id), &s.encoded(), true);
     }
     for c in &t.chains {
         b.new_chain(&t.name, c);
@@ -684,6 +1122,168 @@ mod tests {
         assert_eq!((g, c), (vec![e(1, 1)], vec![]));
     }
 
+    /// G2.8: byte for byte what `nft --debug=mnl` sends for the same
+    /// table (`tests/fixtures/nft_mnl_g28.txt`): chains, sets with
+    /// timeouts and intervals, anonymous sets, rules with comments.
+    #[test]
+    fn firewall_messages_match_nft_byte_for_byte() {
+        use corerouter_firewall::bytecode as bc;
+        use corerouter_firewall::program::{
+            ChainType, FwSet, Hook, KeyKind, MetaKey, NatKind, Rule as PRule,
+        };
+        use corerouter_model::firewall::{AddrMatch, ConnState, Flags, Neg, PortSet};
+        let fixture = include_str!("../tests/fixtures/nft_mnl_g28.txt");
+        let want: Vec<(u16, String)> = fixture
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(|l| {
+                let (t, h) = l.split_once(' ').unwrap();
+                (t.parse().unwrap(), h.to_owned())
+            })
+            .collect();
+        let t = "corerouter";
+        let chain = |name: &str, kind, hook, priority| Chain {
+            name: name.into(),
+            kind,
+            hook,
+            priority,
+            priority_text: String::new(),
+        };
+        let a = |s: &str| s.parse::<AddrMatch>().unwrap();
+        let rule = |chain: &str, exprs: Vec<Expr>, c: &str| PRule {
+            chain: chain.into(),
+            exprs,
+            text: String::new(),
+            nft: None,
+            comment: Some(c.into()),
+        };
+        let set = |name: &str, key, interval, timeout, dynamic, size, merge| FwSet {
+            name: name.into(),
+            key,
+            interval,
+            timeout,
+            dynamic,
+            size,
+            auto_merge: merge,
+            elements: Vec::new(),
+        };
+        let mut b = Batch::new(0);
+        b.family(Family::Inet);
+        b.new_chain(t, &chain("c", ChainType::Filter, Hook::Regular, 0));
+        b.new_chain(t, &chain("filter_input", ChainType::Filter, Hook::Input, 0));
+        b.new_chain(
+            t,
+            &chain("nat_srcnat", ChainType::Nat, Hook::Postrouting, 100),
+        );
+        let mut s = set("s", KeyKind::Ipv4, true, true, false, None, true);
+        let (one, ten) = (a("1.2.3.4"), a("10.0.0.0/8"));
+        s.elements = bc::interval_elements(&[&one], &[(&ten, 60)]);
+        let id = b.new_fw_set(t, &s);
+        b.kernel_elements(t, "s", Some(id), &s.encoded(), true);
+        b.new_fw_set(
+            t,
+            &set("d6", KeyKind::Ipv6, false, true, true, Some(65536), false),
+        );
+        let mut il = set("il", KeyKind::IfName, false, false, false, None, false);
+        il.elements = vec![corerouter_firewall::program::FwElement {
+            key: bc::ifname_bytes("a"),
+            last: None,
+            timeout_ms: None,
+        }];
+        let id = b.new_fw_set(t, &il);
+        b.kernel_elements(t, "il", Some(id), &il.encoded(), true);
+        let ports = PortSet(vec!["22".parse().unwrap(), "1000-2000".parse().unwrap()]);
+        let ps = bc::port_set(&ports);
+        let id = b.new_fw_set(t, &ps);
+        b.kernel_elements(t, &ps.name, Some(id), &ps.encoded(), true);
+        b.new_fw_set(t, &set("s6", KeyKind::Ipv6, true, true, false, None, true));
+        let mut e = bc::port_exprs(false, false, &ports);
+        e.extend([
+            Expr::Counter,
+            Expr::Log {
+                prefix: Some("ab".into()),
+            },
+        ]);
+        b.new_rule(t, &rule("c", e, "x"));
+        // The one anonymous set we still send (subscriber notices).
+        let mut e = bc::l4proto_set(&[6, 17]);
+        e.extend(bc::port_exprs(
+            false,
+            false,
+            &PortSet(vec!["53".parse().unwrap()]),
+        ));
+        e.push(Expr::Return);
+        let mut r = rule("c", e, "");
+        r.comment = None;
+        b.new_rule(t, &r);
+        let mut e = bc::ct_state_exprs(&Neg {
+            not: false,
+            value: Flags(vec![ConnState::Established, ConnState::Related]),
+        });
+        e.extend([Expr::Counter, Expr::Accept]);
+        b.new_rule(t, &rule("filter_input", e, "cr:*2"));
+        let mut e = bc::meta_cmp(MetaKey::NfProto, true, vec![bc::NFPROTO_IPV4]);
+        e.extend(bc::addr_exprs(true, true, &a("10.0.0.0/8")));
+        e.extend(bc::meta_cmp(MetaKey::L4Proto, true, vec![6]));
+        e.extend(bc::ports_merged(1, 2));
+        e.extend([Expr::Counter, Expr::Jump { chain: "c".into() }]);
+        b.new_rule(t, &rule("filter_input", e, "cr:*3"));
+        let mut e = bc::meta_cmp(MetaKey::NfProto, true, vec![bc::NFPROTO_IPV6]);
+        e.extend(bc::addr_set_exprs(true, true, false, "s6"));
+        e.push(Expr::Counter);
+        let mut load = bc::addr_set_exprs(true, true, false, "d6");
+        load.pop();
+        e.extend(load);
+        e.push(Expr::DynsetAdd {
+            set: "d6".into(),
+            sreg_key: 1,
+            timeout_ms: Some(60_000),
+        });
+        b.new_rule(t, &rule("filter_input", e, "cr:*4"));
+        let mut e = bc::meta_cmp(MetaKey::L4Proto, true, vec![6]);
+        e.extend([
+            Expr::Counter,
+            Expr::Reject {
+                kind: bc::REJECT_TCP_RST,
+                code: 0,
+            },
+        ]);
+        b.new_rule(t, &rule("filter_input", e, "cr:*5"));
+        let mut e = bc::meta_cmp(MetaKey::NfProto, true, vec![bc::NFPROTO_IPV4]);
+        e.extend(bc::meta_cmp(MetaKey::L4Proto, true, vec![17]));
+        e.push(Expr::Counter);
+        e.extend(bc::nat_exprs(
+            NatKind::Snat,
+            "198.51.100.10".parse().unwrap(),
+            "198.51.100.12".parse().unwrap(),
+            Some("10000-20000".parse().unwrap()),
+        ));
+        b.new_rule(t, &rule("nat_srcnat", e, "cr:*F"));
+        let mut e = bc::meta_cmp(MetaKey::L4Proto, true, vec![6]);
+        e.push(Expr::Counter);
+        e.extend(bc::masq_exprs(Some("1000".parse().unwrap())));
+        b.new_rule(t, &rule("nat_srcnat", e, "cr:*E"));
+        let (bytes, _) = b.finish();
+        let mut got = Vec::new();
+        let mut at = 0;
+        while at < bytes.len() {
+            let len = u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            let kind = u16::from_ne_bytes(bytes[at + 4..at + 6].try_into().unwrap());
+            if [2563, 2566, 2569, 2572].contains(&kind) {
+                let body: String = bytes[at + 20..at + len]
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                got.push((kind, body));
+            }
+            at += len.div_ceil(4) * 4;
+        }
+        assert_eq!(got.len(), want.len());
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(g, w, "message {i}");
+        }
+    }
+
     /// Every message of a batch is framed: lengths add up, the end
     /// message closes it, each set's elements stay under the 16-bit
     /// attribute length.
@@ -771,7 +1371,9 @@ mod io {
                 io(e)
             }
         })?;
-        let mut pending: std::collections::BTreeSet<u32> = seqs.clone().collect();
+        // Only the last message answers on success (see `begin_msg`).
+        let mut pending: std::collections::BTreeSet<u32> =
+            seqs.clone().last().into_iter().collect();
         let start = Instant::now();
         let mut buf = vec![0u8; 1 << 16];
         let mut first_error: Option<(u32, i32)> = None;

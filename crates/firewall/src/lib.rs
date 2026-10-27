@@ -20,6 +20,7 @@
 //! It sits in L1 instead of L2 (`proto-*`) because `hal-linux` (L1) must
 //! render too and may not depend upward; it compiles everywhere (wasm too).
 
+pub mod bytecode;
 pub mod cgnat;
 pub mod describe;
 pub mod diff;

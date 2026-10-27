@@ -1,17 +1,11 @@
-//! nftables through the `nft` program (G2.1).
+//! The `nft` program, for tests and benchmarks only (G2.8).
 //!
-//! Why `nft -f -` and not netlink from Rust: the kernel's nftables API is a
-//! bytecode VM fed by netlink batches; the Rust crates that speak it either
-//! wrap libnftnl over FFI (C + `unsafe`) or cover only part of the
-//! expressions we render (sets with intervals and timeouts, `ct status`,
-//! NAT ranges). `nft` is the kernel project's reference user space: it
-//! compiles our text and sends it as **one netlink batch**, which the kernel
-//! commits atomically or rejects whole. So "replace our table" is atomic
-//! without a line of `unsafe`. The text we hand it is built only from
-//! validated values (see `corerouter_firewall::nft`), never from free input.
-//!
-//! Only table `inet corerouter` is ever named: rules of other owners
-//! (Docker, libvirt, the distribution's firewall) are not read or touched.
+//! The router never runs it: every table CoreRouter owns (the firewall,
+//! the CGNAT, the fast path, the packet trace) goes to the kernel over
+//! nfnetlink (`nfnl`, `firewall`) and is read back the same way
+//! (`nft_read`), so the system image needs neither `nft` nor nftables
+//! built with JSON. The tests load our text with `nft -f` to compare what
+//! the kernel holds, and the benchmarks measure `nft` against netlink.
 
 use std::io::{Read, Write as _};
 use std::path::PathBuf;
@@ -19,10 +13,6 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use corerouter_hal::HalError;
-use corerouter_model::firewall::{AddrMatch, DynamicAddress, Family, Name};
-use serde_json::Value;
-
-use corerouter_firewall::TABLE;
 
 /// Where `nft` lives: `$COREROUTER_NFT`, else the first of the usual paths.
 fn nft_bin() -> PathBuf {
@@ -143,154 +133,6 @@ pub fn run(script: &str) -> Result<(), HalError> {
             first_lines(&String::from_utf8_lossy(&out.stderr))
         )))
     }
-}
-
-/// `nft -j list table inet corerouter`, or `None` if the table is absent.
-pub fn list_json() -> Option<Value> {
-    let mut cmd = Command::new(nft_bin());
-    cmd.args(["-j", "list", "table", "inet", TABLE]);
-    let out = run_bounded(cmd, Vec::new(), DEADLINE).ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    serde_json::from_slice(&out.stdout).ok()
-}
-
-fn elem_addr(v: &Value) -> Option<AddrMatch> {
-    match v {
-        Value::String(s) => s.parse().ok(),
-        Value::Object(o) => {
-            if let Some(p) = o.get("prefix") {
-                let addr = p.get("addr")?.as_str()?;
-                let len = p.get("len")?.as_u64()?;
-                format!("{addr}/{len}").parse().ok()
-            } else if let Some(Value::Array(r)) = o.get("range") {
-                let a = r.first()?.as_str()?;
-                let b = r.get(1)?.as_str()?;
-                format!("{a}-{b}").parse().ok()
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// The dynamic entries of our address-list sets, kept across a table
-/// replace (`apply` re-adds them): entries with a timeout in the `al*`
-/// sets (added by `address-list.add timeout=…`), with the time left, and
-/// every entry of the `ad*` sets (added by `add-*-to-address-list` rules,
-/// with or without a timeout).
-pub fn dynamic() -> Vec<DynamicAddress> {
-    let Some(json) = list_json() else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    let items = json
-        .get("nftables")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for item in items {
-        let Some(set) = item.get("set") else { continue };
-        let Some(name) = set.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let (rest, by_rule) = match name.get(..4) {
-            Some("al4_" | "al6_") => (name.get(4..), false),
-            Some("ad4_" | "ad6_") => (name.get(4..), true),
-            _ => continue,
-        };
-        let Some(list) = rest.and_then(|l| l.parse::<Name>().ok()) else {
-            continue;
-        };
-        let elems = set
-            .get("elem")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        for e in elems {
-            let (val, left) = match e.get("elem") {
-                Some(inner) => (
-                    inner.get("val").cloned().unwrap_or(Value::Null),
-                    inner.get("expires").and_then(Value::as_u64),
-                ),
-                None => (e.clone(), None),
-            };
-            if left.is_none() && !by_rule {
-                continue;
-            }
-            let Some(address) = elem_addr(&val) else {
-                continue;
-            };
-            out.push(DynamicAddress {
-                list: list.clone(),
-                address,
-                timeout_secs: left.map_or(0, |l| l.max(1)),
-                added_by_rule: by_rule,
-            });
-        }
-    }
-    out
-}
-
-fn set_name(d: &DynamicAddress) -> (String, &'static str) {
-    match d.address.family() {
-        Family::Ipv6 => (format!("al6_{}", d.list), "ipv6_addr"),
-        _ => (format!("al4_{}", d.list), "ipv4_addr"),
-    }
-}
-
-/// Add one dynamic entry (creating our table and the set if needed).
-pub fn add_dynamic(d: &DynamicAddress) -> Result<(), HalError> {
-    let (set, ty) = set_name(d);
-    run(&format!(
-        "add table inet {TABLE}\n\
-         add set inet {TABLE} {set} {{ type {ty}; flags interval, timeout; auto-merge; }}\n\
-         add element inet {TABLE} {set} {{ {} timeout {}s }}\n",
-        d.address,
-        d.timeout_secs.max(1)
-    ))
-}
-
-/// Many adds and removals in one `nft` run (a script; nft applies it as
-/// one transaction).
-pub fn apply_dynamic(changes: &[(bool, &DynamicAddress)]) -> Result<(), HalError> {
-    if changes.is_empty() {
-        return Ok(());
-    }
-    let mut script = format!("add table inet {TABLE}\n");
-    let mut sets: Vec<String> = Vec::new();
-    for (add, d) in changes {
-        let (set, ty) = set_name(d);
-        if *add && !sets.contains(&set) {
-            script.push_str(&format!(
-                "add set inet {TABLE} {set} {{ type {ty}; flags interval, timeout; auto-merge; }}\n"
-            ));
-            sets.push(set.clone());
-        }
-        if *add {
-            script.push_str(&format!(
-                "add element inet {TABLE} {set} {{ {} timeout {}s }}\n",
-                d.address,
-                d.timeout_secs.max(1)
-            ));
-        } else {
-            script.push_str(&format!(
-                "delete element inet {TABLE} {set} {{ {} }}\n",
-                d.address
-            ));
-        }
-    }
-    run(&script)
-}
-
-pub fn remove_dynamic(d: &DynamicAddress) -> Result<(), HalError> {
-    let (set, _) = set_name(d);
-    run(&format!(
-        "delete element inet {TABLE} {set} {{ {} }}\n",
-        d.address
-    ))
 }
 
 #[cfg(test)]

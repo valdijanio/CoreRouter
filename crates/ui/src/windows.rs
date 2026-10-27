@@ -1,6 +1,6 @@
 //! The floating windows (WinBox MDI style) and the side menu layout.
 
-use egui::{Grid, TextEdit};
+use egui::Grid;
 use serde_json::{Value, json};
 
 use crate::table::action;
@@ -171,6 +171,7 @@ impl Win {
             Win::Panel(id) => crate::panel::find(id).map_or([380.0, 200.0], |(_, w)| w.size),
             Win::Vrf => [600.0, 260.0],
             Win::Firewall => [980.0, 420.0],
+            Win::Bgp => [980.0, 520.0],
             Win::InterfaceList => [520.0, 280.0],
             Win::Ping => [900.0, 700.0],
             // Tools open as tall as their form and grow with the results.
@@ -227,50 +228,9 @@ impl CoreRouterUi {
         });
     }
 
+    /// Routing › BGP: the panel `bgp.rs` (G3.2a) draws it.
     fn bgp(&mut self, ui: &mut egui::Ui) {
-        Grid::new("bgp").striped(true).show(ui, |ui| {
-            for h in ["Name", "AS", "Router ID", "Disabled"] {
-                ui.strong(h);
-            }
-            ui.end_row();
-            for row in &self.cache.bgp {
-                let get = |k: &str| row.get(k).map(value_text).unwrap_or_default();
-                ui.label(get("name"));
-                ui.label(get("asn"));
-                ui.label(get("router_id"));
-                ui.label(get("disabled"));
-                ui.end_row();
-            }
-        });
-        ui.separator();
-        let mut apply = false;
-        Grid::new("bgp-form").num_columns(2).show(ui, |ui| {
-            ui.label("Name");
-            ui.text_edit_singleline(&mut self.forms.bgp_name);
-            ui.end_row();
-            ui.label("AS");
-            ui.add(TextEdit::singleline(&mut self.forms.bgp_asn).hint_text("65000 or 1.10"));
-            ui.end_row();
-            ui.label("Router ID");
-            ui.add(TextEdit::singleline(&mut self.forms.bgp_router_id).hint_text("10.255.0.1"));
-            ui.end_row();
-        });
-        if action(ui, "Apply", self.can.check("routing.bgp.instance.set")) {
-            apply = true;
-        }
-        if apply {
-            let p = json!({
-                "name": self.forms.bgp_name.trim(),
-                "asn": self.forms.bgp_asn.trim(),
-                "router_id": self.forms.bgp_router_id.trim(),
-            });
-            self.run_then("routing.bgp.instance.set", p, crate::Then::ShowFrr);
-        }
-        if !self.forms.bgp_frr.is_empty() {
-            ui.separator();
-            ui.weak("Rendered for FRR bgpd:");
-            ui.monospace(&self.forms.bgp_frr);
-        }
+        self.with_panel(crate::bgp::NAME, |p, app| p.window(app, crate::bgp::WIN, ui));
     }
 
     fn identity(&mut self, ui: &mut egui::Ui) {
