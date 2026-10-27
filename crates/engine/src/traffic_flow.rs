@@ -13,15 +13,14 @@
 //!   storing a batch of records, the exporter's status.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 
 use corerouter_hal::conntrack::EventSource;
 use corerouter_model::Config;
 use corerouter_model::route::{self, Reach};
 use corerouter_model::traffic_flow::{TrafficFlow, TrafficFlowStatus};
 use corerouter_model::types::RoutingTable;
-use corerouter_model::logging::LogEvent;
-use corerouter_proto_flow::{NatEventType, PortBlock, Record, Router};
+use corerouter_proto_flow::{Record, Router};
 use ipnet::IpNet;
 use serde::Serialize;
 
@@ -221,37 +220,6 @@ impl Router for IfRouter {
     }
 }
 
-/// RFC 8158 port block events from the router's log: the `ALLOC` and
-/// `RELEASE` lines of the CGNAT in blocks mode (G2.3c, topic `cgnat`,
-/// with the block in `detail`).
-pub fn port_blocks(events: &[LogEvent]) -> Vec<Record> {
-    events
-        .iter()
-        .filter(|e| e.topics.iter().any(|t| t == "cgnat"))
-        .filter_map(|e| {
-            let d = &e.detail;
-            let event = match d.get("event")?.as_str()? {
-                "alloc" => NatEventType::PortBlockAllocation,
-                "release" => NatEventType::PortBlockDeallocation,
-                _ => return None,
-            };
-            let ip = |k: &str| d.get(k)?.as_str()?.parse::<Ipv4Addr>().ok();
-            let port = |k: &str| u16::try_from(d.get(k)?.as_u64()?).ok();
-            let (first, last) = (port("first_port")?, port("last_port")?);
-            Some(Record::PortBlock(PortBlock {
-                time_ms: e.time.saturating_mul(1000),
-                event,
-                src: ip("subscriber")?,
-                post_src: ip("public")?,
-                port_start: first,
-                port_end: last,
-                step: 1,
-                ports: last.saturating_sub(first).saturating_add(1),
-            }))
-        })
-        .collect()
-}
-
 /// Retention in ms and records, from the settings.
 pub fn retention(tf: &TrafficFlow) -> (u64, usize) {
     (
@@ -313,27 +281,6 @@ mod tests {
             end_reason: EndReason::End,
             direction: dir,
         })
-    }
-
-    #[test]
-    fn block_lines_of_the_log_become_port_block_events() {
-        let ev = |topics: &[&str], detail: serde_json::Value| LogEvent {
-            seq: 1,
-            time: 100,
-            topics: topics.iter().map(|t| (*t).to_owned()).collect(),
-            origin: String::new(),
-            message: String::new(),
-            detail,
-        };
-        let block = serde_json::json!({"event": "alloc", "subscriber": "100.64.0.9", "public": "203.0.113.1", "first_port": 2048, "last_port": 3071, "pool": "p"});
-        let out = port_blocks(&[
-            ev(&["cgnat", "info"], block.clone()),
-            ev(&["dhcp"], block),
-            ev(&["cgnat", "warning"], serde_json::json!({"alert": 1})),
-        ]);
-        assert_eq!(out.len(), 1);
-        let Record::PortBlock(b) = &out[0] else { panic!() };
-        assert_eq!((b.time_ms, b.event, b.port_start, b.port_end, b.ports), (100_000, NatEventType::PortBlockAllocation, 2048, 3071, 1024));
     }
 
     #[test]

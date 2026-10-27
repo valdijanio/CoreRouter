@@ -20,13 +20,12 @@
 //! messages wait in a bounded queue while it reconnects.
 
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use corerouter_engine::traffic_flow::{IfRouter, port_blocks};
+use corerouter_engine::traffic_flow::IfRouter;
 use corerouter_engine::{Shared, lock};
 use corerouter_hal::conntrack::{Event, EventSource, TableReader};
 use corerouter_model::traffic_flow::{
@@ -36,6 +35,8 @@ use corerouter_model::traffic_flow::{
 use corerouter_proto_flow::export::{Config as ExportConfig, DEFAULT_MESSAGE};
 use corerouter_proto_flow::{Exporter, Meta, Meter, MeterConfig, Record, Version};
 
+use super::traffic_flow_link::{Link, LinkStats, any_of};
+
 const TICK: Duration = Duration::from_millis(100);
 /// Events between the reader and the exporter (about 200 bytes each:
 /// 50 MB at most, **estimado**); one second of a very big CGNAT.
@@ -44,9 +45,8 @@ pub(crate) const QUEUE: usize = 262_144;
 const BATCH: usize = 4096;
 /// Events the exporter takes per tick (its work stays bounded).
 const DRAIN: usize = 200_000;
-/// Messages waiting for a TCP collector, in bytes.
-const TCP_QUEUE: usize = 8 << 20;
-const RECONNECT: Duration = Duration::from_secs(2);
+/// CGNAT events taken from the engine per tick (G4.4j).
+const NAT_DRAIN: usize = 262_144;
 /// The IPFIX observation domain / v9 source id of this router.
 const DOMAIN: u32 = 1;
 
@@ -132,14 +132,8 @@ fn read_events(mut src: Box<dyn EventSource>, queue: Arc<Queue>, stop: Arc<Atomi
 
 enum Sock {
     Udp(UdpSocket),
-    Tcp {
-        stream: Option<TcpStream>,
-        queue: VecDeque<Vec<u8>>,
-        bytes: usize,
-        /// Bytes of the front message already written.
-        sent: usize,
-        next_try: Instant,
-    },
+    /// TCP, SCTP or TLS: a sender thread of its own (G4.4j).
+    Stream(Link),
 }
 
 /// One collector: its exporter (templates, sequence) and socket.
@@ -150,15 +144,8 @@ struct Target {
     sock: Option<Sock>,
     st: TargetStatus,
     rate: Rate,
-}
-
-fn bind_any(dst: IpAddr, src: Option<IpAddr>) -> SocketAddr {
-    let ip = src.unwrap_or(if dst.is_ipv4() {
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-    } else {
-        IpAddr::V6(Ipv6Addr::UNSPECIFIED)
-    });
-    SocketAddr::new(ip, 0)
+    /// The stream sender's numbers already added to `st`.
+    seen: LinkStats,
 }
 
 impl Target {
@@ -172,9 +159,10 @@ impl Target {
             max_size: DEFAULT_MESSAGE,
             refresh_ms: u64::from(cfg.template_timeout) * 1000,
             refresh_packets: cfg.template_refresh,
-            stream: cfg.transport == FlowTransport::Tcp,
+            stream: cfg.transport.is_stream(),
             boot_ms,
             nat_destination,
+            legacy_nat: cfg.nat_events_legacy,
         });
         Self {
             st: TargetStatus {
@@ -196,6 +184,7 @@ impl Target {
             exp,
             sock: None,
             rate: Rate::default(),
+            seen: LinkStats::default(),
         }
     }
 
@@ -215,38 +204,50 @@ impl Target {
         }
         match self.cfg.transport {
             FlowTransport::Udp => {
-                let s = UdpSocket::bind(bind_any(self.cfg.dst_address, self.cfg.src_address))
+                let ip = self.cfg.src_address.unwrap_or_else(|| any_of(self.cfg.dst_address));
+                let s = UdpSocket::bind(SocketAddr::new(ip, 0))
                     .and_then(|s| s.connect(self.dst()).map(|()| s));
                 match s {
                     Ok(s) => self.sock = Some(Sock::Udp(s)),
                     Err(e) => self.fail(format!("cannot open the UDP socket: {e}")),
                 }
             }
-            FlowTransport::Tcp => {
-                self.sock = Some(Sock::Tcp {
-                    stream: None,
-                    queue: VecDeque::new(),
-                    bytes: 0,
-                    sent: 0,
-                    next_try: Instant::now(),
-                });
+            FlowTransport::Tcp | FlowTransport::Sctp | FlowTransport::Tls => {
+                match Link::start(self.cfg.clone()) {
+                    Ok(l) => {
+                        self.st.state = TargetState::Connecting;
+                        self.sock = Some(Sock::Stream(l));
+                    }
+                    Err(e) => self.fail(e),
+                }
             }
         }
     }
 
-    /// Encode `recs` and send them (or queue them, over TCP).
+    /// Encode this collector's share of `recs` and send it (or queue it,
+    /// for a stream).
     fn export(&mut self, now: u64, recs: &[Record], meta: &Meta) {
         self.open();
         self.exp.set_meta(meta.clone());
+        if let Some(Sock::Stream(l)) = &self.sock
+            && l.take_reconnected()
+        {
+            // A new connection got the template sets from the sender; the
+            // options records (sampling, interface names) come next.
+            self.exp.reset_stream();
+        }
         let before = self.exp.counters();
         let mut msgs = Vec::new();
-        self.exp.encode(now, recs, &mut msgs);
+        let content = self.cfg.content;
+        let mine = recs.iter().filter(|r| if r.is_nat() { content.wants_nat() } else { content.wants_flows() });
+        let n = mine.clone().count() as u64;
+        self.exp.encode_iter(now, mine, &mut msgs);
         let after = self.exp.counters();
-        if after.template_sends > before.template_sends {
+        let new_templates = after.template_sends > before.template_sends;
+        if new_templates {
             self.st.template_sends = after.template_sends;
             self.st.last_template = Some(now / 1000);
         }
-        let n = recs.len() as u64;
         match self.sock.as_mut() {
             Some(Sock::Udp(s)) => {
                 let mut failed = None;
@@ -274,126 +275,37 @@ impl Target {
                     }
                     None => {}
                 }
-                self.st.records += n;
             }
-            Some(Sock::Tcp { queue, bytes, .. }) => {
-                for m in msgs {
-                    if *bytes + m.len() > TCP_QUEUE {
-                        self.st.dropped += 1;
-                        continue;
-                    }
-                    *bytes += m.len();
-                    queue.push_back(m);
+            Some(Sock::Stream(l)) => {
+                if new_templates {
+                    l.set_templates(self.exp.templates_only(now));
                 }
-                self.st.records += n;
-                self.flush_tcp(now);
+                if !msgs.is_empty() {
+                    let exp = &self.exp;
+                    l.push(msgs, || exp.templates_only(now));
+                }
             }
             None => self.st.dropped += msgs.len() as u64,
         }
+        self.st.records += n;
         self.rate.add(now, n);
     }
 
-    /// Connect when due, then write what the queue holds without blocking.
-    fn flush_tcp(&mut self, now: u64) {
-        let dst = self.dst();
-        let mut error: Option<String> = None;
-        let due = matches!(
-            &self.sock,
-            Some(Sock::Tcp { stream: None, next_try, .. }) if Instant::now() >= *next_try
-        );
-        if due {
-            // std cannot bind a TCP client to `src_address`: the route
-            // picks the source.
-            let res = TcpStream::connect_timeout(&dst, Duration::from_millis(500));
-            let mut templates = Vec::new();
-            if res.is_ok() {
-                // RFC 7011 §8.1: a new connection gets the templates first.
-                self.exp.reset_stream();
-                self.exp.encode(now, &[], &mut templates);
-            }
-            if let Some(Sock::Tcp {
-                stream,
-                queue,
-                bytes,
-                sent,
-                next_try,
-            }) = self.sock.as_mut()
-            {
-                *next_try = Instant::now() + RECONNECT;
-                match res {
-                    Ok(s) => {
-                        let _ = s.set_nonblocking(true);
-                        let _ = s.set_nodelay(true);
-                        *stream = Some(s);
-                        *sent = 0;
-                        for m in templates.into_iter().rev() {
-                            *bytes += m.len();
-                            queue.push_front(m);
-                        }
-                    }
-                    Err(e) => error = Some(format!("connect to {dst}: {e}")),
-                }
-            }
+    /// The stream sender's numbers into the status.
+    fn poll(&mut self) {
+        let Some(Sock::Stream(l)) = &self.sock else { return };
+        let ls = l.stats();
+        self.st.messages += ls.messages.saturating_sub(self.seen.messages);
+        self.st.bytes += ls.bytes.saturating_sub(self.seen.bytes);
+        self.st.dropped += ls.dropped.saturating_sub(self.seen.dropped);
+        self.st.send_errors += ls.errors.saturating_sub(self.seen.errors);
+        self.st.queue = ls.queue;
+        self.st.state = if ls.connected { TargetState::Sending } else { TargetState::Connecting };
+        self.st.last_error.clone_from(&ls.last_error);
+        if ls.last_error.is_some() && !ls.connected && ls.connects == 0 {
+            self.st.state = TargetState::Error;
         }
-        let (mut msgs, mut wrote) = (0u64, 0u64);
-        let Some(Sock::Tcp {
-            stream,
-            queue,
-            bytes,
-            sent,
-            ..
-        }) = self.sock.as_mut()
-        else {
-            return;
-        };
-        if let Some(s) = stream.as_mut() {
-            while let Some(front) = queue.front() {
-                let rest = front.get(*sent..).unwrap_or(&[]);
-                match s.write(rest) {
-                    Ok(0) => {
-                        error = Some("the collector closed the connection".into());
-                        break;
-                    }
-                    Ok(w) => {
-                        *sent += w;
-                        if *sent >= front.len() {
-                            *bytes = bytes.saturating_sub(front.len());
-                            msgs += 1;
-                            wrote += front.len() as u64;
-                            queue.pop_front();
-                            *sent = 0;
-                        }
-                    }
-                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                    Err(e) if e.kind() == ErrorKind::Interrupted => {}
-                    Err(e) => {
-                        error = Some(format!("write to {dst}: {e}"));
-                        break;
-                    }
-                }
-            }
-            if error.is_some() {
-                *stream = None;
-                *sent = 0;
-            }
-        }
-        let up = stream.is_some();
-        self.st.queue = queue.len() as u64;
-        self.st.messages += msgs;
-        self.st.bytes += wrote;
-        match error {
-            Some(e) => {
-                self.fail(e);
-                if !up {
-                    self.st.state = TargetState::Connecting;
-                }
-            }
-            None if up => {
-                self.st.state = TargetState::Sending;
-                self.st.last_error = None;
-            }
-            None => self.st.state = TargetState::Connecting,
-        }
+        self.seen = ls;
     }
 }
 
@@ -441,7 +353,9 @@ struct Running {
     stop: Arc<AtomicBool>,
     queue: Arc<Queue>,
     lost: Arc<AtomicU64>,
-    table: Box<dyn TableReader>,
+    /// `None`: no flows nor NAT sessions wanted, the conntrack is not read
+    /// (a router that only logs the CGNAT's blocks and limits, G4.4j).
+    table: Option<Box<dyn TableReader>>,
     meter: Meter,
     targets: Vec<Target>,
     next_scan: Instant,
@@ -449,8 +363,10 @@ struct Running {
     source: String,
     accounting: (Option<bool>, Option<bool>),
     boot_ms: u64,
-    /// The router's log read up to here (CGNAT block events).
-    log_seq: u64,
+    /// What the engine's NAT queue was asked for (blocks, limits).
+    nat_want: (bool, bool),
+    /// Its totals (pushed, dropped), for the status.
+    nat_log: (u64, u64),
 }
 
 impl Drop for Running {
@@ -465,9 +381,27 @@ fn meter_config(tf: &TrafficFlow) -> MeterConfig {
         inactive_ms: u64::from(tf.inactive_flow_timeout) * 1000,
         sampling: tf.sampling_interval.max(1),
         max_entries: usize::try_from(tf.cache_entries).unwrap_or(usize::MAX),
-        flows: true,
+        flows: tf.flows,
         nat_events: tf.nat_events,
         nat_destination: tf.nat_events_destination,
+    }
+}
+
+/// Who each port block's subscriber is (G4.4j): the PPPoE or IPoE login
+/// and VLAN, asked of the PPP service outside the session lock (it has its
+/// own, and answers by an address index).
+fn identify(session: &Shared, recs: &mut [Record]) {
+    if !recs.iter().any(|r| matches!(r, Record::PortBlock(_))) {
+        return;
+    }
+    let Some(ppp) = lock(session).ppp_backend() else { return };
+    for r in recs {
+        if let Record::PortBlock(b) = r
+            && let Some((user, vlan)) = ppp.who_vlan(b.src)
+        {
+            b.user = user;
+            b.vlan = vlan;
+        }
     }
 }
 
@@ -478,21 +412,29 @@ fn scan_every(tf: &TrafficFlow) -> Duration {
     Duration::from_secs(u64::from(inactive.min(tf.active_flow_timeout.max(10))))
 }
 
+/// Whether the conntrack must be read: flows or NAT44 session events.
+fn needs_conntrack(tf: &TrafficFlow) -> bool {
+    tf.flows || tf.nat_events
+}
+
 impl Running {
     fn open(session: &Shared, health: &super::Health, tf: &TrafficFlow) -> Result<Self, String> {
-        let src = lock(session).traffic_flow_source()?;
-        let source = src.name().to_owned();
-        let accounting = src.accounting();
-        let table = src.table_reader();
         let stop = Arc::new(AtomicBool::new(false));
         let queue = Arc::new(Queue::default());
         let lost = Arc::new(AtomicU64::new(0));
-        {
+        let (table, source, accounting) = if needs_conntrack(tf) {
+            let src = lock(session).traffic_flow_source()?;
+            let source = src.name().to_owned();
+            let accounting = src.accounting();
+            let table = src.table_reader();
             let (stop, queue, lost) = (stop.clone(), queue.clone(), lost.clone());
             health
                 .spawn("traffic-flow-reader", move || read_events(src, queue, stop, lost))
                 .map_err(|e| format!("cannot start the reader: {e}"))?;
-        }
+            (Some(table), source, accounting)
+        } else {
+            (None, "cgnat".to_owned(), (None, None))
+        };
         Ok(Self {
             stop,
             queue,
@@ -505,7 +447,8 @@ impl Running {
             source,
             accounting,
             boot_ms: now_ms(),
-            log_seq: lock(session).log_seq(),
+            nat_want: (false, false),
+            nat_log: (0, 0),
         })
     }
 
@@ -522,18 +465,31 @@ impl Running {
         for e in &events {
             self.meter.event(e, now, router, &mut recs);
         }
-        if Instant::now() >= self.next_scan {
+        if let Some(table) = self.table.as_mut()
+            && Instant::now() >= self.next_scan
+        {
             self.next_scan = Instant::now() + scan_every(tf);
-            match self.table.read() {
+            match table.read() {
                 Ok((table, complete)) => self.meter.scan(&table, complete, now, router, &mut recs),
                 Err(e) => log::warn!("traffic-flow: reading the table: {e}"),
             }
         }
-        if tf.nat_events {
-            let log = lock(session).log_since(self.log_seq);
-            self.log_seq = log.last().map_or(self.log_seq, |e| e.seq);
-            recs.extend(port_blocks(&log));
+        // G4.4j: the CGNAT's block and limit events, from the engine's
+        // queue (one drain per tick under the lock it is already taking).
+        let want = (tf.nat_port_blocks, tf.nat_limits);
+        let first_nat = recs.len();
+        {
+            let mut s = lock(session);
+            if want != self.nat_want {
+                s.nat_log_want(want.0, want.1);
+                self.nat_want = want;
+            }
+            if want.0 || want.1 {
+                s.nat_log_take(NAT_DRAIN, &mut recs);
+            }
+            self.nat_log = s.nat_log().map_or((0, 0), |l| (l.pushed, l.dropped));
         }
+        identify(session, recs.get_mut(first_nat..).unwrap_or(&mut []));
         self.export(now, &recs, meta);
         // G4.4f: the same records to the ClickHouse exporter, if it wants them.
         super::analytics::submit_records(&recs, Some(router));
@@ -554,6 +510,11 @@ impl Running {
         let now = now_ms();
         let mut recs = Vec::new();
         self.meter.flush(now, &mut recs);
+        {
+            let mut s = lock(session);
+            s.nat_log_take(NAT_DRAIN, &mut recs);
+            s.nat_log_want(false, false);
+        }
         self.export(now, &recs, meta);
         super::analytics::submit_records(&recs, None);
         if !recs.is_empty() {
@@ -561,7 +522,10 @@ impl Running {
         }
     }
 
-    fn status(&self) -> TrafficFlowStatus {
+    fn status(&mut self) -> TrafficFlowStatus {
+        for t in &mut self.targets {
+            t.poll();
+        }
         let now = now_ms();
         let m = self.meter.stats();
         TrafficFlowStatus {
@@ -579,6 +543,8 @@ impl Running {
             vanished: m.vanished,
             flows: m.flows,
             nat_events: m.nat_events,
+            nat_log: self.nat_log.0,
+            nat_log_dropped: self.nat_log.1,
             records_per_min: self.rate.per_min(now),
             accounting: self.accounting.0,
             timestamps: self.accounting.1,
@@ -629,6 +595,13 @@ fn run(session: &Shared, health: &super::Health) {
             continue;
         }
         health.disabled(None);
+        // Flows or NAT sessions turned on or off: the conntrack reader
+        // starts or stops with them.
+        if running.as_ref().is_some_and(|r| r.table.is_some() != needs_conntrack(tf))
+            && let Some(r) = running.take()
+        {
+            r.finish(session, meta);
+        }
         if running.is_none() && Instant::now() >= retry {
             match Running::open(session, health, tf) {
                 Ok(r) => {
@@ -674,6 +647,7 @@ mod tests {
     use super::*;
     use corerouter_model::ItemId;
     use corerouter_hal::conntrack::{Conn, EventKind, Tuple};
+    use std::net::IpAddr;
 
     fn ev(i: u32) -> Event {
         let a: IpAddr = "100.64.0.1".parse().unwrap();

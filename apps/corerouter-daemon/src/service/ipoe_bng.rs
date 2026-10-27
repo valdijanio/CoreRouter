@@ -1454,11 +1454,20 @@ impl PppBackend for Sessions {
     }
 
     fn who(&self, ip: Ipv4Addr) -> Option<String> {
-        guard(&self.0.st)
-            .active
-            .values()
-            .find(|a| a.address == Some(ip))
-            .map(|a| a.name.clone())
+        self.who_vlan(ip).map(|(n, _)| n)
+    }
+
+    /// By the address index (O(1)): the old scan of every session cost
+    /// O(n) per lookup, and the CGNAT exporter asks once per port block
+    /// (G4.4j).
+    fn who_vlan(&self, ip: Ipv4Addr) -> Option<(String, u16)> {
+        let st = guard(&self.0.st);
+        let key = st.by_ip.get(&ip)?;
+        let id = &st.subs.get(key)?.id;
+        st.active
+            .get(id)
+            .filter(|a| a.address == Some(ip))
+            .map(|a| (a.name.clone(), a.vlan.unwrap_or(0)))
     }
 
     fn who_at(&self, ip: Ipv4Addr, at: u64) -> Option<String> {

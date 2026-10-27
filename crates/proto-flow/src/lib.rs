@@ -30,7 +30,9 @@ pub mod template;
 
 pub use export::{Exporter, MIN_MESSAGE};
 pub use meter::{Meter, MeterConfig, Router};
-pub use record::{Direction, EndReason, Flow, Meta, NatEvent, NatEventType, PortBlock, Record};
+pub use record::{
+    Direction, EndReason, Flow, Meta, NatEvent, NatEventType, NatLimit, PortBlock, Record,
+};
 pub use template::Version;
 
 #[cfg(test)]

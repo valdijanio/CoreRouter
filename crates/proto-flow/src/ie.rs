@@ -21,6 +21,9 @@ pub mod id {
     pub const INGRESS_INTERFACE: u16 = 10;
     /// unsigned16.
     pub const DESTINATION_TRANSPORT_PORT: u16 = 11;
+    /// unsigned16, the VLAN of the ingress interface (RFC 8158 §4.6
+    /// "vlanID").
+    pub const VLAN_ID: u16 = 58;
     /// ipv4Address.
     pub const DESTINATION_IPV4_ADDRESS: u16 = 12;
     /// unsigned32.
@@ -61,6 +64,8 @@ pub mod id {
     pub const NAT_EVENT: u16 = 230;
     /// unsigned8, RFC 5103: 1 initiator, 2 reverse initiator.
     pub const BIFLOW_DIRECTION: u16 = 239;
+    /// unsigned32, a locally unique id of the NAT pool.
+    pub const NAT_POOL_ID: u16 = 283;
     /// ipv6Address (NPTv6, NAT66).
     pub const POST_NAT_SOURCE_IPV6_ADDRESS: u16 = 281;
     /// ipv6Address.
@@ -73,6 +78,18 @@ pub mod id {
     pub const PORT_RANGE_END: u16 = 362;
     pub const PORT_RANGE_STEP_SIZE: u16 = 363;
     pub const PORT_RANGE_NUM_PORTS: u16 = 364;
+    /// string, the user name of the flow (a PPPoE login).
+    pub const USER_NAME: u16 = 371;
+    /// unsigned32, RFC 8158 §4.4 Table 3.
+    pub const NAT_QUOTA_EXCEEDED_EVENT: u16 = 466;
+    /// unsigned32, RFC 8158 §4.5 Table 4.
+    pub const NAT_THRESHOLD_EVENT: u16 = 467;
+    /// unsigned32 (RFC 8158 §4.6.7.3).
+    pub const MAX_ENTRIES_PER_USER: u16 = 473;
+    /// unsigned32. RFC 8158 Table 18 names `addressPortMappingHighThreshold`
+    /// (478) for the per-user event too; its §6 registered this one for the
+    /// per-user threshold, which says what the value is.
+    pub const ADDRESS_PORT_MAPPING_PER_USER_HIGH_THRESHOLD: u16 = 480;
 }
 
 /// A field specifier of a template: element number and length in octets.

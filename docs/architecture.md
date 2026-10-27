@@ -311,6 +311,20 @@ daemon sem otimização, 20 mil conexões com NAT saem em 0,24 s, a 4,7 µs de C
 perda. A interface de cada fluxo vem da tabela de rotas; a fonte XDP (G2.5) pode dar a interface
 real depois, sem mudar o codec.
 
+#### 1.4.2 IPFIX sobre SCTP e TLS em Rust (G4.4j, **medido**)
+
+| Opção | Decisão |
+|---|---|
+| **SCTP do kernel** por `socket2` (`socket(AF_INET, SOCK_STREAM, IPPROTO_SCTP)`) | Adotado. Sem `unsafe`, sem crate novo: o kernel faz associação, retransmissão, PMTU e SHUTDOWN; uma mensagem IPFIX por `send`. No CI completo o módulo `sctp` é carregado (`ci/kernel-modules/sctp`) |
+| SCTP em espaço de usuário (sobre UDP, RFC 6951) | Recusado: reimplementar SCTP é risco de bug sem ganho; coletores esperam SCTP nativo |
+| **TLS** com rustls (já no projeto, `custom_tls_config` do G4.4f) | Adotado: TLS 1.2/1.3, mútuo |
+| DTLS (UDP/SCTP) | Fora: rustls não tem DTLS; as alternativas em Rust são grandes e assíncronas (tokio) ou ligam OpenSSL. Gap G4.4k |
+
+Cada coletor de stream tem a sua thread de envio (`tf-send-<id>`) com fila limitada em bytes: a
+cifra de cada coletor roda num núcleo próprio e um coletor lento não segura os outros nem o
+exportador. Rajada de 100 mil conexões com NAT (release, netns): os 100 mil eventos de criação
+saíram pelo TCP 0,38 s após o início, 1,6 µs de CPU do daemon por registro, sem descarte.
+
 ## 2. Camadas do workspace
 
 Regra central: dependência só para baixo; nada abaixo de L5 depende de egui/eframe/winit/wgpu.

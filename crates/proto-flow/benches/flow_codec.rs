@@ -14,7 +14,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use corerouter_hal::conntrack::{Conn, Event, EventKind, Tuple, status};
 use corerouter_proto_flow::export::{Config, DEFAULT_MESSAGE};
 use corerouter_proto_flow::meter::AnyInterface;
-use corerouter_proto_flow::{Exporter, Meter, MeterConfig, Record, Version};
+use corerouter_proto_flow::{
+    Exporter, Meter, MeterConfig, NatEventType, PortBlock, Record, Version,
+};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 const N: u32 = 10_000;
@@ -113,6 +115,7 @@ fn bench(c: &mut Criterion) {
                 stream: false,
                 boot_ms: 0,
                 nat_destination: false,
+                legacy_nat: false,
             });
             let mut out = Vec::new();
             b.iter(|| {
@@ -122,6 +125,45 @@ fn bench(c: &mut Criterion) {
             });
         });
     }
+    // G4.4j: a storm of CGNAT port block events (every subscriber back
+    // after a reboot), with the PPPoE login in the variable-length
+    // `userName`, over a stream (TCP/SCTP/TLS).
+    let blocks: Vec<Record> = (0..N)
+        .map(|i| {
+            Record::PortBlock(PortBlock {
+                time_ms: 1_700_000_000_000 + u64::from(i),
+                event: NatEventType::PortBlockAllocation,
+                src: Ipv4Addr::from(0x6440_0000 + i),
+                post_src: Ipv4Addr::new(203, 0, 113, (i % 16) as u8),
+                port_start: 1024 + (i % 63) as u16 * 1000,
+                port_end: 2023 + (i % 63) as u16 * 1000,
+                step: 1,
+                ports: 1000,
+                user: format!("cliente{i}@provedor"),
+                vlan: 100 + (i % 3000) as u16,
+                pool: 1,
+            })
+        })
+        .collect();
+    g.bench_function("encode_port_blocks_10k", |b| {
+        let mut e = Exporter::new(Config {
+            version: Version::Ipfix,
+            domain: 1,
+            max_size: DEFAULT_MESSAGE,
+            refresh_ms: 0,
+            refresh_packets: 0,
+            stream: true,
+            boot_ms: 0,
+            nat_destination: false,
+            legacy_nat: false,
+        });
+        let mut out = Vec::new();
+        b.iter(|| {
+            out.clear();
+            e.encode(1_700_000_000_000, &blocks, &mut out);
+            black_box(out.len())
+        });
+    });
     g.finish();
 }
 

@@ -156,6 +156,8 @@ pub(crate) fn submit_records(
                     NatEventType::Nat44SessionDelete => "session_delete",
                     NatEventType::PortBlockAllocation => "block_alloc",
                     NatEventType::PortBlockDeallocation => "block_release",
+                    // Not session events: the meter never makes these.
+                    _ => continue,
                 };
                 submit_nat(NatEvent {
                     time_ms: n.time_ms,
@@ -1100,6 +1102,9 @@ pub(crate) mod tests {
             port_end: 2047,
             step: 1,
             ports: 1024,
+            user: String::new(),
+            vlan: 0,
+            pool: 1,
         };
         submit_records(&[Record::Flow(flow), Record::Nat(nat), Record::PortBlock(block)], None);
         let got = std::mem::take(&mut *items(inbox()));
