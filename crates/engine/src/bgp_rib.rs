@@ -7,10 +7,11 @@
 //! reads the table streaming (`hal-frr`), sorts and validates it
 //! (`proto_bgp::rib::Indexed`) and leaves it in a [`Slot`]. Later pages,
 //! searches and filters are answered from memory, under the lock, in
-//! milliseconds (**medido**, `benches/bgp_rib.rs`). Bounds: at most
+//! milliseconds (**medido**, `proto-bgp/benches/rpki.rs`). Bounds: at most
 //! [`MAX_TABLES`] tables are kept (the least recently used goes), one
-//! unused for [`KEEP_SECS`] is dropped, and a table is read again only on
-//! `refresh` or after [`STALE_SECS`].
+//! unused for [`KEEP_SECS`] is dropped, at most [`MAX_LOADING`] reads run at
+//! once ("busy" past that), and a table is read again only on `refresh` or
+//! after [`STALE_SECS`].
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -31,6 +32,10 @@ pub const MAX_TABLES: usize = 4;
 pub const KEEP_SECS: u64 = 600;
 /// A table older than this is read again on the next look.
 pub const STALE_SECS: u64 = 300;
+/// Table reads in flight at once: each one keeps bgpd printing for
+/// seconds; a window clicking through connections gets "busy" instead of
+/// piling them up.
+pub const MAX_LOADING: usize = 2;
 /// Explanations kept, and for how long.
 pub const MAX_EXPLAINS: usize = 32;
 pub const EXPLAIN_SECS: u64 = 30;
@@ -189,6 +194,14 @@ impl Session {
                 drop(s);
                 return Ok(Arc::clone(slot));
             }
+        }
+        let loading = self
+            .ext::<BgpRibs>()
+            .map_or(0, |r| r.tables.values().filter(|s| matches!(lock(s).load, Load::Loading)).count());
+        if loading >= MAX_LOADING {
+            return Err(EngineError::Hal(format!(
+                "busy: {loading} BGP tables are being read from the routing daemon; ask again in a moment"
+            )));
         }
         let mut reader = self.routing_reader()?;
         let slot: Shared<Indexed> = Arc::new(Mutex::new(Slot::new(now, generation)));

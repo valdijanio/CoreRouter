@@ -486,7 +486,7 @@ impl Frr {
                     let got = table(&mut vty, format!("{base} received-routes json"), &mut b)?;
                     if got.as_ref().is_some_and(|p| p.warning.is_some()) {
                         // No Adj-RIB-In: what was accepted, from the table.
-                        let mut acc = rib::Builder::new(false, Some(addr.to_string()));
+                        let mut acc = rib::Builder::new(false, Some(addr));
                         table(&mut vty, format!("{base} routes json"), &mut acc)?;
                         b.extend(acc.finish());
                         b.set_pre_policy(false);

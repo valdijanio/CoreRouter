@@ -489,6 +489,30 @@ mod tests {
         }
     }
 
+    /// Takes jobs and never runs them: reads stay `loading`.
+    struct Never;
+    impl Runner for Never {
+        fn spawn(&self, _: &str, _: Job) -> std::result::Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn reads_in_flight_are_bounded() {
+        let fake = Fake::default();
+        let mut s = session(&fake);
+        s.set_runner(Arc::new(Never));
+        for (c, d) in [("rr1", "received"), ("rr1", "advertised")] {
+            let r = s.execute("routing.bgp.route.list", &json!({"connection": c, "direction": d})).unwrap();
+            assert_eq!(r["state"], "loading");
+        }
+        // The same table again is the read in flight, not a new one.
+        let r = s.execute("routing.bgp.route.list", &json!({"connection": "rr1"})).unwrap();
+        assert_eq!(r["state"], "loading");
+        let e = s.execute("routing.bgp.route.list", &json!({"connection": "gone"})).unwrap_err();
+        assert!(e.to_string().contains("busy"), "{e}");
+    }
+
     #[test]
     fn explain_names_the_step() {
         let fake = Fake::default();

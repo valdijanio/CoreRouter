@@ -35,43 +35,58 @@ fn cut(s: &str) -> String {
 }
 
 /// One route as the compact tables print it (received/advertised: one
-/// object per prefix; `routes`: an array of paths per prefix).
+/// object per prefix; `routes`: an array of paths per prefix). The prefix
+/// is the map's key. Only what is kept is read into owned values: the
+/// addresses and the origin are parsed from the text as it streams by (no
+/// allocation), the AS path is the one string per route (**medido**:
+/// 1 M routes in `benches/frr_rib.rs`).
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct Compact {
-    network: Option<String>,
-    prefix: Option<String>,
-    prefix_len: Option<u8>,
-    addr_prefix: Option<String>,
-    next_hop: Option<String>,
+    #[serde(deserialize_with = "ip")]
+    next_hop: Option<IpAddr>,
     nexthops: Vec<Hop>,
     metric: Option<u32>,
     loc_prf: Option<u32>,
     weight: Option<u32>,
     path: Option<String>,
-    origin: Option<String>,
+    #[serde(deserialize_with = "origin")]
+    origin: Option<Origin>,
     best: Option<bool>,
-    bestpath: Option<serde_json::Value>,
-    peer_id: Option<String>,
+    bestpath: Option<bool>,
+    #[serde(deserialize_with = "ip")]
+    peer_id: Option<IpAddr>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct Hop {
-    ip: Option<String>,
+    #[serde(deserialize_with = "ip")]
+    ip: Option<IpAddr>,
 }
 
-impl Compact {
-    fn prefix(&self, key: &str) -> Option<IpNet> {
-        if let Some(n) = self.network.as_deref().and_then(|n| n.parse().ok()) {
-            return Some(n);
-        }
-        let addr = self.addr_prefix.as_deref().or(self.prefix.as_deref());
-        if let (Some(a), Some(l)) = (addr.and_then(|a| a.parse::<IpAddr>().ok()), self.prefix_len) {
-            return IpNet::new(a, l).ok();
-        }
-        key.parse().ok()
+/// A string read without keeping it: `f` turns it into the value.
+struct Text<T>(fn(&str) -> Option<T>);
+
+impl<'de, T> Visitor<'de> for Text<T> {
+    type Value = Option<T>;
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a string")
     }
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Option<T>, E> {
+        Ok((self.0)(v))
+    }
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Option<T>, E> {
+        Ok(None)
+    }
+}
+
+fn ip<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<IpAddr>, D::Error> {
+    d.deserialize_any(Text(|s| s.parse().ok()))
+}
+
+fn origin<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Origin>, D::Error> {
+    d.deserialize_any(Text(Origin::parse))
 }
 
 /// Builds a [`BgpRib`], interning attribute sets.
@@ -81,12 +96,12 @@ pub struct Builder {
     seen: HashMap<BgpAttrs, u32>,
     /// Keep only paths from this peer (a `routes` answer is the
     /// neighbor's; the check costs nothing and guards a format change).
-    peer: Option<String>,
+    peer: Option<IpAddr>,
     dropped: usize,
 }
 
 impl Builder {
-    pub fn new(pre_policy: bool, peer: Option<String>) -> Builder {
+    pub fn new(pre_policy: bool, peer: Option<IpAddr>) -> Builder {
         Builder {
             rib: BgpRib {
                 pre_policy,
@@ -113,23 +128,21 @@ impl Builder {
         {
             return;
         }
-        let Some(prefix) = c.prefix(key) else { return };
+        let Ok(prefix) = key.parse::<IpNet>() else {
+            return;
+        };
         if self.rib.routes.len() >= MAX_ROUTES {
             self.dropped += 1;
             return;
         }
-        let next_hop = c
-            .next_hop
-            .as_deref()
-            .or_else(|| c.nexthops.first().and_then(|h| h.ip.as_deref()))
-            .and_then(|h| h.parse().ok());
+        let next_hop = c.next_hop.or_else(|| c.nexthops.first().and_then(|h| h.ip));
+        let mut as_path = c.path.unwrap_or_default();
+        if as_path.len() > MAX_TEXT {
+            as_path = cut(&as_path);
+        }
         let attrs = BgpAttrs {
-            as_path: cut(c.path.as_deref().unwrap_or_default()),
-            origin: c
-                .origin
-                .as_deref()
-                .and_then(Origin::parse)
-                .unwrap_or_default(),
+            as_path,
+            origin: c.origin.unwrap_or_default(),
             next_hop,
             med: c.metric,
             local_pref: c.loc_prf,
@@ -137,10 +150,7 @@ impl Builder {
             communities: Vec::new(),
             large_communities: Vec::new(),
         };
-        let best = c.best.unwrap_or(false)
-            || c.bestpath
-                .as_ref()
-                .is_some_and(|b| b.as_bool() == Some(true));
+        let best = c.best.unwrap_or(false) || c.bestpath.unwrap_or(false);
         let attrs = self.intern(attrs);
         self.rib.routes.push(BgpRoute {
             prefix: prefix.trunc(),
@@ -295,6 +305,17 @@ pub fn parse_table(input: impl Read, b: &mut Builder) -> Result<Parsed, String> 
     let mut out = Parsed::default();
     let reader = std::io::BufReader::with_capacity(1 << 20, input);
     let mut de = serde_json::Deserializer::from_reader(reader);
+    Top { b, out: &mut out }
+        .deserialize(&mut de)
+        .map_err(|e| format!("bgpd route table: {e}"))?;
+    Ok(out)
+}
+
+/// Parse a whole answer held in memory (the benchmark compares it with
+/// the streaming [`parse_table`]).
+pub fn parse_slice(input: &[u8], b: &mut Builder) -> Result<Parsed, String> {
+    let mut out = Parsed::default();
+    let mut de = serde_json::Deserializer::from_slice(input);
     Top { b, out: &mut out }
         .deserialize(&mut de)
         .map_err(|e| format!("bgpd route table: {e}"))?;
@@ -529,12 +550,12 @@ mod tests {
 
     #[test]
     fn accepted_routes_keep_the_neighbor_s_paths() {
-        let mut b = Builder::new(false, Some("198.51.100.18".into()));
+        let mut b = Builder::new(false, "198.51.100.18".parse().ok());
         parse_table(ROUTES.as_bytes(), &mut b).unwrap();
         let rib = b.finish();
         assert_eq!(rib.routes.len(), 2);
         assert_eq!(rib.attrs.len(), 2);
-        let mut other = Builder::new(false, Some("198.51.100.99".into()));
+        let mut other = Builder::new(false, "198.51.100.99".parse().ok());
         parse_table(ROUTES.as_bytes(), &mut other).unwrap();
         assert_eq!(other.routes(), 0);
     }

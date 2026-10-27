@@ -162,6 +162,13 @@ fn bench(c: &mut Criterion) {
     g.bench_function("validate_1m_1thread", |b| {
         b.iter(|| black_box(validate_all(&t, &routes)))
     });
+    // In prefix order (what `Indexed` does): neighbours share trie paths,
+    // so the walk stays in cache.
+    let mut sorted = routes.clone();
+    sorted.sort_unstable_by_key(|(n, _)| (n.addr().is_ipv6(), n.network(), n.prefix_len()));
+    g.bench_function("validate_1m_sorted_1thread", |b| {
+        b.iter(|| black_box(validate_all(&t, &sorted)))
+    });
     for threads in [2usize, 4, 8] {
         g.bench_function(format!("validate_1m_{threads}threads"), |b| {
             b.iter(|| {

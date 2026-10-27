@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 use std::hint::black_box;
 
-use corerouter_hal_frr::rib::{Builder, parse_table};
+use corerouter_hal_frr::rib::{Builder, parse_slice, parse_table};
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 
 fn json(n: u32) -> String {
@@ -41,6 +41,13 @@ fn bench(c: &mut Criterion) {
         b.iter(|| {
             let mut builder = Builder::new(true, None);
             let p = parse_table(text.as_bytes(), &mut builder);
+            black_box((p.map(|p| p.routes), builder.finish().attrs.len()))
+        })
+    });
+    g.bench_function("parse_1m_from_slice", |b| {
+        b.iter(|| {
+            let mut builder = Builder::new(true, None);
+            let p = parse_slice(text.as_bytes(), &mut builder);
             black_box((p.map(|p| p.routes), builder.finish().attrs.len()))
         })
     });
