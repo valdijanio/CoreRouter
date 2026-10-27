@@ -14,7 +14,7 @@ a sessão da página de bloqueio com essa ideia do Detecção de portal do siste
 | Plano de dados (nftables, listas reservadas, rejeição rápida) | `crates/firewall/src/notice.rs` | G4.10b |
 | Servidor do portal, API RFC 8908, opção 114, webhook | `apps/corerouter-daemon/src/service/notice.rs` | G4.10c |
 | Janela Subscriber Notices | `crates/ui/src/subscriber_notice.rs` | G4.10d |
-| Laboratório (sondas simuladas por sistema, atrás de NAT e direto) | `tests/netns_notice.rs` | G4.10e |
+| Laboratório (sondas simuladas por sistema, atrás de NAT e direto) | `apps/corerouter-daemon/tests/netns_notice.rs`, `crates/hal-linux/tests/netns_notice.rs` | G4.10b, G4.10e |
 
 ## Como funciona
 
@@ -171,3 +171,48 @@ Decisões que saem dessa tabela:
 - **Portal**: servidor com número de conexões e de bytes por requisição limitados, threads
   nomeadas, lendo um retrato (perfis, páginas, membros) atualizado pelo tick, sem o lock da
   `Session` na E/S; marcar "visto" põe numa fila limitada aplicada no tick (G4.10c).
+
+## Laboratório e roteiro com celular (G4.10e)
+
+`apps/corerouter-daemon/tests/netns_notice.rs` roda em namespaces descartáveis, sem root
+(`cargo xtask netns`). A topologia tem:
+
+- um daemon `--backend linux`;
+- um assinante direto (IPoE/DHCP);
+- um celular atrás de um CPE com NAT;
+- uma "internet" que responde 204 a todo HTTP, aceita 443 e ecoa UDP 53.
+
+O teste confere:
+
+- **sondas:** as 21 sondas da tabela recebem o 302 do portal, direto e atrás da CPE (com o
+  endereço do roteador do lado de cada um);
+- **bloqueio:** HTTPS é recusado em menos de 200 ms; DNS passa; outro site HTTP recebe 511;
+  a página abre e entra no Log com a sonda que trouxe o assinante;
+- **liberação:** vale no próximo pedido. Medido no build de depuração: 39 ms do comando ao
+  pedido seguinte já sair;
+- **aviso:** só os IPs das sondas são desviados, os outros sites e o HTTPS funcionam, e
+  "Continuar" libera;
+- **redução:** cria a fila dinâmica do assinante;
+- **100 mil assinantes na lista:**
+  - carga de 10 lotes de 10 000 em 7,9 s (commit e kernel, build de depuração);
+  - a sonda de um membro respondida pelo portal em 10 ms;
+  - o HTTPS recusado em 34 µs;
+  - uma entrada dinâmica entra e sai em 31 ms.
+
+O roteiro manual com um celular de verdade está em `bash plan/hw-lab.sh notice` (só imprime o
+texto) e aqui:
+
+1. Com a lista `bloqueados` e o perfil `atraso` (`block`), ligar o celular no Wi-Fi de um CPE
+   na `ether1`:
+   - Android: "Fazer login na rede";
+   - iPhone: a folha de login abre sozinha;
+   - Windows: "Ação necessária".
+
+   Cada um abre a página e o Log mostra `via=android|apple|windows`.
+2. Um app (WhatsApp) falha na hora. Um site https dá erro de conexão imediato, **nunca** aviso
+   de certificado. Um site http mostra a página. O botão PIX abre o walled garden.
+3. Tirar da lista: o celular navega em segundos, e o aviso de login some sem desligar o Wi-Fi.
+4. Com `mode=notice`, o celular avisa, mas apps e https funcionam. "Continuar navegando" tira o
+   aviso até o `interval`.
+5. Com `mode=throttle rate-limit=1M/1M`, um speedtest fica perto de 1 Mbit/s.
+6. "Testar como cliente" e o Log batem com o que o celular mostrou.
