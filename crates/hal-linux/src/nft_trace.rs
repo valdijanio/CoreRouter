@@ -195,6 +195,7 @@ fn mark_rule(chain: &str, m: &Match, incoming: bool) -> Rule {
         exprs: e,
         text: text.join(" "),
         nft: None,
+        comment: None,
     }
 }
 

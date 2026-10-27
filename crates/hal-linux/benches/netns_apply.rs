@@ -1,5 +1,5 @@
 //! G0.9 — `LinuxHal::apply` of N addresses and routes (rtnetlink) and filter
-//! rules (`nft -f`, one transaction) against a real kernel, inside a throwaway
+//! rules (nfnetlink since G2.8, one batch) against a real kernel, inside a throwaway
 //! network namespace — no root, nothing reaches the host:
 //!
 //! ```sh
@@ -42,7 +42,7 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use corerouter_hal::Hal;
-    use corerouter_hal_linux::{LinuxHal, nft};
+    use corerouter_hal_linux::LinuxHal;
     use corerouter_model::Config;
     use criterion::{BenchmarkId, Criterion, SamplingMode, Throughput};
 
@@ -101,11 +101,7 @@ mod linux {
             ),
             ("routes", common::routes, false),
         ];
-        if nft::available() {
-            kinds.push(("filter_rules", common::filter_rules, false));
-        } else {
-            eprintln!("skipped filter_rules: the `nft` program (nftables) is not installed");
-        }
+        kinds.push(("filter_rules", common::filter_rules, false));
         let mut g = c.benchmark_group("hal_linux_apply");
         // One apply of 1000 items is milliseconds: few, equal samples.
         g.sampling_mode(SamplingMode::Flat)

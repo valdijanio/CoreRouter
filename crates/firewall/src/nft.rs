@@ -40,6 +40,7 @@ use corerouter_model::firewall::{
 use corerouter_model::{Config, IfName, ItemId};
 
 use crate::graph;
+use crate::program;
 use crate::validate::family;
 
 /// The only nftables table CoreRouter writes.
@@ -172,13 +173,7 @@ fn addr_text(a: &AddrMatch) -> String {
 fn ports_text(p: &PortSet) -> String {
     match p.0.as_slice() {
         [one] => one.to_string(),
-        many => format!(
-            "{{ {} }}",
-            many.iter()
-                .map(PortRange::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        _ => format!("@{}", crate::bytecode::port_set_name(p)),
     }
 }
 
@@ -208,7 +203,7 @@ fn states_text(f: &Neg<Flags<ConnState>>) -> String {
     } else if let [one] = names.as_slice() {
         format!("ct state {one}")
     } else {
-        format!("ct state {{ {} }}", names.join(", "))
+        format!("ct state {}", names.join(","))
     }
 }
 
@@ -260,203 +255,331 @@ enum Pick {
 }
 
 /// The nftables statements of rule `r` for one family (`Both` = no
-/// family match), matchers first, then counter, action and tag.
+/// family match), matchers first, then counter, action and tag: the text
+/// `nft list` prints and the expressions it is compiled into (G2.8, see
+/// [`crate::bytecode`]).
 fn statements(
     table: Table,
     r: &FirewallRule,
     fam: Family,
     filled: &BTreeSet<&Name>,
     picks: (Pick, Pick),
-) -> String {
+) -> KernelRule {
+    use crate::bytecode as bc;
+    use crate::program::{Expr, MetaKey, NatKind};
     let m = &r.matchers;
-    let mut s: Vec<String> = Vec::new();
+    let mut b = bc::RuleBuild::default();
     match fam {
-        Family::Ipv4 => s.push("meta nfproto ipv4".into()),
-        Family::Ipv6 => s.push("meta nfproto ipv6".into()),
+        Family::Ipv4 => b.push(
+            "meta nfproto ipv4",
+            bc::meta_cmp(MetaKey::NfProto, true, vec![bc::NFPROTO_IPV4]),
+        ),
+        Family::Ipv6 => b.push(
+            "meta nfproto ipv6",
+            bc::meta_cmp(MetaKey::NfProto, true, vec![bc::NFPROTO_IPV6]),
+        ),
         Family::Both => {}
     }
-    let ip = if fam == Family::Ipv6 { "ip6" } else { "ip" };
-    if let Some(i) = &m.in_interface {
-        s.push(format!("iifname {}{}", op(i), quoted(i.value.as_str())));
+    let v6 = fam == Family::Ipv6;
+    let ip = if v6 { "ip6" } else { "ip" };
+    for (out, name, list) in [
+        (false, &m.in_interface, &m.in_interface_list),
+        (true, &m.out_interface, &m.out_interface_list),
+    ] {
+        let kw = if out { "oifname" } else { "iifname" };
+        let key = if out {
+            MetaKey::OifName
+        } else {
+            MetaKey::IifName
+        };
+        if let Some(i) = name {
+            b.push(
+                format!("{kw} {}{}", op(i), quoted(i.value.as_str())),
+                bc::meta_cmp(key, !i.not, bc::ifname_bytes(i.value.as_str())),
+            );
+        }
+        if let Some(l) = list {
+            let set = set_if(&l.value);
+            b.push(
+                format!("{kw} {}@{set}", op(l)),
+                bc::ifname_set_exprs(out, l.not, &set),
+            );
+        }
     }
-    if let Some(l) = &m.in_interface_list {
-        s.push(format!("iifname {}@{}", op(l), set_if(&l.value)));
-    }
-    if let Some(i) = &m.out_interface {
-        s.push(format!("oifname {}{}", op(i), quoted(i.value.as_str())));
-    }
-    if let Some(l) = &m.out_interface_list {
-        s.push(format!("oifname {}@{}", op(l), set_if(&l.value)));
-    }
-    if let Some(a) = &m.src_address {
-        s.push(format!("{ip} saddr {}{}", op(a), addr_text(&a.value)));
-    }
-    if let Some(a) = &m.dst_address {
-        s.push(format!("{ip} daddr {}{}", op(a), addr_text(&a.value)));
+    for (src, a) in [(true, &m.src_address), (false, &m.dst_address)] {
+        let Some(a) = a else { continue };
+        let dir = if src { "saddr" } else { "daddr" };
+        b.need_nfproto(a.value.family() == Family::Ipv6);
+        b.push(
+            format!("{ip} {dir} {}{}", op(a), addr_text(&a.value)),
+            bc::addr_exprs(src, a.not, &a.value),
+        );
     }
     let set = |l: &Name| {
-        if fam == Family::Ipv6 {
-            set_v6(l)
-        } else {
-            set_v4(l)
-        }
+        if v6 { set_v6(l) } else { set_v4(l) }
     };
     let dyn_set = |l: &Name| {
-        if fam == Family::Ipv6 {
-            dyn_v6(l)
-        } else {
-            dyn_v4(l)
-        }
+        if v6 { dyn_v6(l) } else { dyn_v4(l) }
     };
-    for (dir, list, pick) in [
-        ("saddr", &m.src_address_list, picks.0),
-        ("daddr", &m.dst_address_list, picks.1),
+    for (src, list, pick) in [
+        (true, &m.src_address_list, picks.0),
+        (false, &m.dst_address_list, picks.1),
     ] {
         let Some(l) = list else { continue };
+        let dir = if src { "saddr" } else { "daddr" };
+        b.need_nfproto(v6);
+        let lookup = |b: &mut bc::RuleBuild, not: bool, s: String| {
+            b.push(
+                format!("{ip} {dir} {}@{s}", if not { "!= " } else { "" }),
+                bc::addr_set_exprs(v6, src, not, &s),
+            );
+        };
         if !filled.contains(&l.value) {
-            s.push(format!("{ip} {dir} {}@{}", op(l), set(&l.value)));
+            lookup(&mut b, l.not, set(&l.value));
         } else if l.not {
-            s.push(format!("{ip} {dir} != @{}", set(&l.value)));
-            s.push(format!("{ip} {dir} != @{}", dyn_set(&l.value)));
+            lookup(&mut b, true, set(&l.value));
+            lookup(&mut b, true, dyn_set(&l.value));
         } else if pick == Pick::Static {
-            s.push(format!("{ip} {dir} @{}", set(&l.value)));
+            lookup(&mut b, false, set(&l.value));
         } else {
-            s.push(format!("{ip} {dir} @{}", dyn_set(&l.value)));
-            s.push(format!("{ip} {dir} != @{}", set(&l.value)));
+            lookup(&mut b, false, dyn_set(&l.value));
+            lookup(&mut b, true, set(&l.value));
         }
     }
     if let Some(p) = &m.protocol {
-        s.push(format!("meta l4proto {}{}", op(p), proto_text(p.value)));
+        b.push(
+            format!("meta l4proto {}{}", op(p), proto_text(p.value)),
+            bc::meta_cmp(MetaKey::L4Proto, !p.not, vec![p.value.0]),
+        );
     }
-    if let Some(p) = &m.src_port {
-        s.push(format!("th sport {}{}", op(p), ports_text(&p.value)));
-    }
-    if let Some(p) = &m.dst_port {
-        s.push(format!("th dport {}{}", op(p), ports_text(&p.value)));
+    // nft merges `th sport X th dport Y` into one load.
+    let merged = match (&m.src_port, &m.dst_port) {
+        (Some(s), Some(d)) => bc::single_port(s).zip(bc::single_port(d)),
+        _ => None,
+    };
+    if let (Some((sp, dp)), Some(s), Some(d)) = (merged, &m.src_port, &m.dst_port) {
+        b.push(
+            format!(
+                "th sport {}{} th dport {}{}",
+                op(s),
+                ports_text(&s.value),
+                op(d),
+                ports_text(&d.value)
+            ),
+            bc::ports_merged(sp, dp),
+        );
+    } else {
+        for (src, p) in [(true, &m.src_port), (false, &m.dst_port)] {
+            let Some(p) = p else { continue };
+            b.push(
+                format!(
+                    "th {} {}{}",
+                    if src { "sport" } else { "dport" },
+                    op(p),
+                    ports_text(&p.value)
+                ),
+                bc::port_exprs(src, p.not, &p.value),
+            );
+        }
     }
     if let Some(i) = &m.icmp_options {
-        let v6 = m
+        let icmp6 = m
             .protocol
             .as_ref()
             .is_some_and(|p| p.value == Protocol::ICMPV6);
-        let kw = if v6 { "icmpv6" } else { "icmp" };
-        s.push(format!("{kw} type {}", i.kind));
+        let kw = if icmp6 { "icmpv6" } else { "icmp" };
+        b.need_l4proto(if icmp6 { 58 } else { 1 });
+        let mut text = format!("{kw} type {}", i.kind);
         if let Some(c) = i.code {
-            s.push(format!("{kw} code {c}"));
+            let _ = write!(text, " {kw} code {c}");
         }
+        b.push(text, bc::icmp_exprs(i.kind, i.code));
     }
     if let Some(f) = &m.connection_state {
-        s.push(states_text(f));
+        b.push(states_text(f), bc::ct_state_exprs(f));
     }
     if let Some(f) = &m.connection_nat_state {
-        s.push(nat_states_text(f));
+        b.push(nat_states_text(f), bc::ct_nat_exprs(f));
     }
     if let Some(n) = &m.connection_mark {
-        s.push(format!(
-            "ct mark {}0x{:08x}",
-            op(n),
-            mark_value(MarkKind::Connection, &n.value)
-        ));
+        let v = mark_value(MarkKind::Connection, &n.value);
+        b.push(
+            format!("ct mark {}0x{v:08x}", op(n)),
+            bc::ct_mark_match(n.not, v),
+        );
     }
-    if let Some(n) = &m.packet_mark {
-        s.push(format!(
-            "meta mark & 0x0000ffff {} 0x{:08x}",
-            if n.not { "!=" } else { "==" },
-            mark_value(MarkKind::Packet, &n.value)
-        ));
-    }
-    if let Some(n) = &m.routing_mark {
-        s.push(format!(
-            "meta mark & 0xffff0000 {} 0x{:08x}",
-            if n.not { "!=" } else { "==" },
-            mark_value(MarkKind::Routing, &n.value)
-        ));
+    for (n, mask, kind) in [
+        (&m.packet_mark, 0x0000_ffff_u32, MarkKind::Packet),
+        (&m.routing_mark, 0xffff_0000, MarkKind::Routing),
+    ] {
+        let Some(n) = n else { continue };
+        let v = mark_value(kind, &n.value);
+        b.push(
+            format!(
+                "meta mark & 0x{mask:08x} {} 0x{v:08x}",
+                if n.not { "!=" } else { "==" }
+            ),
+            bc::mark_match(mask, v, !n.not),
+        );
     }
     if let Some(l) = &m.limit {
-        s.push(format!(
-            "limit rate {}/{} burst {} packets",
-            l.count,
-            l.period.name(),
-            l.burst
-        ));
+        b.push(
+            format!(
+                "limit rate {}/{} burst {} packets",
+                l.count,
+                l.period.name(),
+                l.burst
+            ),
+            vec![Expr::Limit {
+                rate: u64::from(l.count),
+                unit_secs: u64::from(l.period.secs()),
+                burst: l.burst,
+            }],
+        );
     }
-    s.push("counter".into());
-    let stop = |pass: bool| {
+    b.push("counter", vec![Expr::Counter]);
+    let then_accept = |pass: bool| {
         if pass {
-            String::new()
+            (String::new(), Vec::new())
         } else {
-            " accept".into()
+            (" accept".to_owned(), vec![Expr::Accept])
         }
     };
-    let act = match &r.action {
-        Action::Accept => "accept".into(),
-        Action::Drop => "drop".into(),
+    let nat_kw = |t: &NatTarget| {
+        if t.family() == Family::Ipv6 {
+            "ip6"
+        } else {
+            "ip"
+        }
+    };
+    let reject = |code: u8, name: &str| {
+        (
+            format!("reject with icmpx type {name}"),
+            vec![Expr::Reject {
+                kind: bc::REJECT_ICMPX,
+                code,
+            }],
+        )
+    };
+    let (act, exprs): (String, Vec<Expr>) = match &r.action {
+        Action::Accept => ("accept".into(), vec![Expr::Accept]),
+        Action::Drop => ("drop".into(), vec![Expr::Drop]),
         Action::Reject { reject_with } => match reject_with {
-            RejectWith::TcpReset => "reject with tcp reset".into(),
-            RejectWith::IcmpNoRoute => "reject with icmpx type no-route".into(),
-            RejectWith::IcmpAdminProhibited => "reject with icmpx type admin-prohibited".into(),
-            RejectWith::IcmpAddressUnreachable => "reject with icmpx type host-unreachable".into(),
-            RejectWith::IcmpPortUnreachable => "reject with icmpx type port-unreachable".into(),
+            RejectWith::TcpReset => {
+                b.need_l4proto(6);
+                (
+                    "reject with tcp reset".into(),
+                    vec![Expr::Reject {
+                        kind: bc::REJECT_TCP_RST,
+                        code: 0,
+                    }],
+                )
+            }
+            RejectWith::IcmpNoRoute => reject(bc::ICMPX_NO_ROUTE, "no-route"),
+            RejectWith::IcmpAdminProhibited => {
+                reject(bc::ICMPX_ADMIN_PROHIBITED, "admin-prohibited")
+            }
+            RejectWith::IcmpAddressUnreachable => {
+                reject(bc::ICMPX_HOST_UNREACH, "host-unreachable")
+            }
+            RejectWith::IcmpPortUnreachable => reject(bc::ICMPX_PORT_UNREACH, "port-unreachable"),
         },
         Action::Jump { jump_target } => {
-            format!("jump {}", chain_name(table, jump_target.as_str()))
+            let chain = chain_name(table, jump_target.as_str());
+            (format!("jump {chain}"), vec![Expr::Jump { chain }])
         }
-        Action::Return => "return".into(),
-        Action::Log { log_prefix } if log_prefix.is_empty() => "log".into(),
-        Action::Log { log_prefix } => format!("log prefix {}", quoted(log_prefix)),
-        Action::Passthrough => String::new(),
+        Action::Return => ("return".into(), vec![Expr::Return]),
+        Action::Log { log_prefix } if log_prefix.is_empty() => {
+            ("log".into(), vec![Expr::Log { prefix: None }])
+        }
+        Action::Log { log_prefix } => {
+            let q = quoted(log_prefix);
+            let prefix = q.trim_matches('"').to_owned();
+            (
+                format!("log prefix {q}"),
+                vec![Expr::Log {
+                    prefix: Some(prefix),
+                }],
+            )
+        }
+        Action::Passthrough => (String::new(), Vec::new()),
         // RouterOS: notrack ends the raw chain like accept.
-        Action::Notrack => "notrack accept".into(),
-        Action::Masquerade { to_ports: None } => "masquerade".into(),
-        Action::Masquerade { to_ports: Some(p) } => format!("masquerade to :{p}"),
+        Action::Notrack => ("notrack accept".into(), vec![Expr::Notrack, Expr::Accept]),
+        Action::Masquerade { to_ports } => (
+            match to_ports {
+                None => "masquerade".into(),
+                Some(p) => format!("masquerade to :{p}"),
+            },
+            bc::masq_exprs(*to_ports),
+        ),
         Action::SrcNat {
             to_addresses,
             to_ports,
-        } => format!(
-            "snat {} to {}",
-            if to_addresses.family() == Family::Ipv6 {
-                "ip6"
-            } else {
-                "ip"
-            },
-            nat_to(to_addresses, *to_ports)
+        } => (
+            format!(
+                "snat {} to {}",
+                nat_kw(to_addresses),
+                nat_to(to_addresses, *to_ports)
+            ),
+            bc::nat_exprs(
+                NatKind::Snat,
+                to_addresses.first,
+                to_addresses.last,
+                *to_ports,
+            ),
         ),
         Action::DstNat {
             to_addresses,
             to_ports,
-        } => format!(
-            "dnat {} to {}",
-            if to_addresses.family() == Family::Ipv6 {
-                "ip6"
-            } else {
-                "ip"
-            },
-            nat_to(to_addresses, *to_ports)
+        } => (
+            format!(
+                "dnat {} to {}",
+                nat_kw(to_addresses),
+                nat_to(to_addresses, *to_ports)
+            ),
+            bc::nat_exprs(
+                NatKind::Dnat,
+                to_addresses.first,
+                to_addresses.last,
+                *to_ports,
+            ),
         ),
         Action::MarkConnection {
             new_connection_mark,
             passthrough,
-        } => format!(
-            "ct mark set 0x{:08x}{}",
-            mark_value(MarkKind::Connection, new_connection_mark),
-            stop(*passthrough)
-        ),
+        } => {
+            let v = mark_value(MarkKind::Connection, new_connection_mark);
+            let (t, mut e) = then_accept(*passthrough);
+            let mut exprs = bc::ct_mark_set(v);
+            exprs.append(&mut e);
+            (format!("ct mark set 0x{v:08x}{t}"), exprs)
+        }
         Action::MarkPacket {
             new_packet_mark,
             passthrough,
-        } => format!(
-            "meta mark set meta mark & 0xffff0000 | 0x{:08x}{}",
-            mark_value(MarkKind::Packet, new_packet_mark),
-            stop(*passthrough)
-        ),
+        } => {
+            let v = mark_value(MarkKind::Packet, new_packet_mark);
+            let (t, mut e) = then_accept(*passthrough);
+            let mut exprs = bc::mark_set(0xffff_0000, v);
+            exprs.append(&mut e);
+            (
+                format!("meta mark set meta mark & 0xffff0000 | 0x{v:08x}{t}"),
+                exprs,
+            )
+        }
         Action::MarkRouting {
             new_routing_mark,
             passthrough,
-        } => format!(
-            "meta mark set meta mark & 0x0000ffff | 0x{:08x}{}",
-            mark_value(MarkKind::Routing, new_routing_mark),
-            stop(*passthrough)
-        ),
+        } => {
+            let v = mark_value(MarkKind::Routing, new_routing_mark);
+            let (t, mut e) = then_accept(*passthrough);
+            let mut exprs = bc::mark_set(0x0000_ffff, v);
+            exprs.append(&mut e);
+            (
+                format!("meta mark set meta mark & 0x0000ffff | 0x{v:08x}{t}"),
+                exprs,
+            )
+        }
         Action::AddSrcToAddressList {
             address_list,
             address_list_timeout,
@@ -465,28 +588,46 @@ fn statements(
             address_list,
             address_list_timeout,
         } => {
-            let dir = if matches!(r.action, Action::AddSrcToAddressList { .. }) {
-                "saddr"
-            } else {
-                "daddr"
-            };
+            let src = matches!(r.action, Action::AddSrcToAddressList { .. });
+            let dir = if src { "saddr" } else { "daddr" };
             let timeout = address_list_timeout
                 .map(|t| format!(" timeout {}s", t.secs()))
                 .unwrap_or_default();
-            format!("add @{} {{ {ip} {dir}{timeout} }}", dyn_set(address_list))
+            let set = dyn_set(address_list);
+            let mut exprs = bc::addr_set_exprs(v6, src, false, &set);
+            exprs.pop();
+            exprs.push(Expr::DynsetAdd {
+                set: set.clone(),
+                sreg_key: crate::program::REG_1,
+                timeout_ms: address_list_timeout.map(|t| u64::from(t.secs()) * 1000),
+            });
+            (format!("add @{set} {{ {ip} {dir}{timeout} }}"), exprs)
         }
     };
-    if !act.is_empty() {
-        s.push(act);
+    b.push(act, exprs);
+    let tag = rule_tag(r.id);
+    b.push(format!("comment {}", quoted(&tag)), Vec::new());
+    let (text, exprs) = b.finish();
+    KernelRule {
+        text,
+        exprs,
+        comment: tag,
     }
-    s.push(format!("comment {}", quoted(&rule_tag(r.id))));
-    s.join(" ")
+}
+
+/// One kernel rule of a firewall rule: what `nft list` prints, its
+/// expressions and its comment (`cr:*N`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KernelRule {
+    pub text: String,
+    pub exprs: Vec<crate::program::Expr>,
+    pub comment: String,
 }
 
 /// Kernel rules for `r`: one, or one per family when it uses address lists
 /// and applies to both. Empty when it can never match (invalid families,
 /// which the validator reports).
-pub fn kernel_rules(table: Table, r: &FirewallRule, filled: &BTreeSet<&Name>) -> Vec<String> {
+pub fn kernel_rules(table: Table, r: &FirewallRule, filled: &BTreeSet<&Name>) -> Vec<KernelRule> {
     let Ok(fam) = family(r) else {
         return Vec::new();
     };
@@ -538,14 +679,72 @@ fn elements(items: &[String]) -> String {
     }
 }
 
+/// The base chain of `hook` named `prio` (nft's priority keywords).
+fn base_chain(name: String, ty: &str, hook: &str, prio: &str) -> program::Chain {
+    use program::{ChainType, Hook};
+    let kind = match ty {
+        "nat" => ChainType::Nat,
+        "route" => ChainType::Route,
+        _ => ChainType::Filter,
+    };
+    let hook = match hook {
+        "prerouting" => Hook::Prerouting,
+        "input" => Hook::Input,
+        "forward" => Hook::Forward,
+        "output" => Hook::Output,
+        _ => Hook::Postrouting,
+    };
+    let priority = match prio {
+        "raw" => -300,
+        "mangle" => -150,
+        "dstnat" => -100,
+        "srcnat" => 100,
+        _ => 0,
+    };
+    program::Chain {
+        name,
+        kind,
+        hook,
+        priority,
+        priority_text: prio.to_owned(),
+    }
+}
+
+fn regular_chain(name: String) -> program::Chain {
+    program::Chain {
+        name,
+        kind: program::ChainType::Filter,
+        hook: program::Hook::Regular,
+        priority: 0,
+        priority_text: String::new(),
+    }
+}
+
 /// The body of `table inet corerouter`, or `None` when the config has no
 /// firewall at all (no rules, no address-list entries, no dynamic entry from a command):
 /// then the table should not exist.
 pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
+    build(cfg, dynamic).map(|(text, _)| text)
+}
+
+/// The same table as nf_tables objects (G2.8): what `hal-linux` sends over
+/// nfnetlink. Its rules carry the text [`render`] prints.
+pub fn program(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<program::Table> {
+    build(cfg, dynamic).map(|(_, t)| t)
+}
+
+/// [`render`] and [`program`] in one pass, so they cannot disagree.
+pub fn build(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<(String, program::Table)> {
+    use program::{FwElement, FwSet, KeyKind};
     let fw = &cfg.ip.firewall;
     if fw.is_empty() && dynamic.iter().all(|d| d.added_by_rule) && !crate::notice::on(cfg) {
         return None;
     }
+    let mut t = program::Table {
+        family: program::Family::Inet,
+        name: TABLE.to_owned(),
+        ..program::Table::default()
+    };
     let mut out = String::new();
     let _ = writeln!(out, "table inet {TABLE} {{");
     let filled = filled_lists(cfg);
@@ -568,56 +767,71 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
     for list in lists {
         let list_statics = statics.get(list).unwrap_or(&none_s);
         let list_dynamic = dynamics.get(list).unwrap_or(&none_d);
-        for (fam, name, ty) in [
-            (Family::Ipv4, set_v4(list), "ipv4_addr"),
-            (Family::Ipv6, set_v6(list), "ipv6_addr"),
+        for (fam, name, ty, key) in [
+            (Family::Ipv4, set_v4(list), "ipv4_addr", KeyKind::Ipv4),
+            (Family::Ipv6, set_v6(list), "ipv6_addr", KeyKind::Ipv6),
         ] {
-            let mut items: Vec<String> = list_statics
+            let st: Vec<&AddrMatch> = list_statics
                 .iter()
                 .filter(|e| e.address.family() == fam)
-                .map(|e| addr_text(&e.address))
+                .map(|e| &e.address)
                 .collect();
             // Entries a rule added go back to the dynamic set below (and
             // are dropped once no rule fills the list).
+            let timed: Vec<(&AddrMatch, u64)> = list_dynamic
+                .iter()
+                .filter(|d| d.address.family() == fam)
+                .filter(|d| !d.added_by_rule)
+                .map(|d| (&d.address, d.timeout_secs.max(1)))
+                .collect();
+            let mut items: Vec<String> = st.iter().map(|a| addr_text(a)).collect();
             items.extend(
-                list_dynamic
+                timed
                     .iter()
-                    .filter(|d| d.address.family() == fam)
-                    .filter(|d| !d.added_by_rule)
-                    .map(|d| {
-                        format!(
-                            "{} timeout {}s",
-                            addr_text(&d.address),
-                            d.timeout_secs.max(1)
-                        )
-                    }),
+                    .map(|(a, s)| format!("{} timeout {s}s", addr_text(a))),
             );
             let _ = write!(
                 out,
                 "\tset {name} {{\n\t\ttype {ty}\n\t\tflags interval, timeout\n\t\tauto-merge\n{}\t}}\n",
                 elements(&items)
             );
+            t.fw_sets.push(FwSet {
+                name,
+                key,
+                interval: true,
+                timeout: true,
+                dynamic: false,
+                size: None,
+                auto_merge: true,
+                elements: crate::bytecode::interval_elements(&st, &timed),
+            });
         }
         if !filled.contains(list) {
             continue;
         }
-        for (fam, name, ty) in [
-            (Family::Ipv4, dyn_v4(list), "ipv4_addr"),
-            (Family::Ipv6, dyn_v6(list), "ipv6_addr"),
+        for (fam, name, ty, key) in [
+            (Family::Ipv4, dyn_v4(list), "ipv4_addr", KeyKind::Ipv4),
+            (Family::Ipv6, dyn_v6(list), "ipv6_addr", KeyKind::Ipv6),
         ] {
             // Only single addresses fit a plain set.
-            let items: Vec<String> = list_dynamic
+            let addrs: Vec<(std::net::IpAddr, u64)> = list_dynamic
                 .iter()
                 .filter(|d| d.added_by_rule && d.address.family() == fam)
                 .filter_map(|d| match d.address {
                     AddrMatch::Net(n) if n.prefix_len() == n.max_prefix_len() => {
-                        Some(if d.timeout_secs > 0 {
-                            format!("{} timeout {}s", n.addr(), d.timeout_secs)
-                        } else {
-                            n.addr().to_string()
-                        })
+                        Some((n.addr(), d.timeout_secs))
                     }
                     _ => None,
+                })
+                .collect();
+            let items: Vec<String> = addrs
+                .iter()
+                .map(|(a, secs)| {
+                    if *secs > 0 {
+                        format!("{a} timeout {secs}s")
+                    } else {
+                        a.to_string()
+                    }
                 })
                 .collect();
             let _ = write!(
@@ -625,22 +839,91 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
                 "\tset {name} {{\n\t\ttype {ty}\n\t\tsize {DYNAMIC_SET_SIZE}\n\t\tflags dynamic, timeout\n{}\t}}\n",
                 elements(&items)
             );
+            let mut elems: Vec<FwElement> = addrs
+                .iter()
+                .map(|(a, secs)| FwElement {
+                    key: match a {
+                        std::net::IpAddr::V4(v) => v.octets().to_vec(),
+                        std::net::IpAddr::V6(v) => v.octets().to_vec(),
+                    },
+                    last: None,
+                    timeout_ms: (*secs > 0).then(|| secs.saturating_mul(1000)),
+                })
+                .collect();
+            elems.sort();
+            elems.dedup_by(|a, b| a.key == b.key);
+            t.fw_sets.push(FwSet {
+                name,
+                key,
+                interval: false,
+                timeout: true,
+                dynamic: true,
+                size: Some(DYNAMIC_SET_SIZE),
+                auto_merge: false,
+                elements: elems,
+            });
         }
     }
     for list in &cfg.interface_lists.lists {
-        let items: Vec<String> = cfg
+        let names: BTreeSet<&str> = cfg
             .interface_lists
             .interfaces_of(list.name.as_str())
-            .map(|i: &IfName| quoted(i.as_str()))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
+            .map(|i: &IfName| i.as_str())
             .collect();
+        let items: Vec<String> = names.iter().map(|n| quoted(n)).collect();
         let _ = write!(
             out,
             "\tset {} {{\n\t\ttype ifname\n{}\t}}\n",
             set_if(&list.name),
             elements(&items)
         );
+        t.fw_sets.push(FwSet {
+            name: set_if(&list.name),
+            key: KeyKind::IfName,
+            interval: false,
+            timeout: false,
+            dynamic: false,
+            size: None,
+            auto_merge: false,
+            elements: names
+                .iter()
+                .map(|n| FwElement {
+                    key: crate::bytecode::ifname_bytes(n),
+                    last: None,
+                    timeout_ms: None,
+                })
+                .collect(),
+        });
+    }
+
+    // Port lists: one shared set per distinct list (see
+    // `bytecode::port_set_name`).
+    let mut port_sets: BTreeMap<String, FwSet> = BTreeMap::new();
+    for table in Table::ALL {
+        for r in fw.rules(table).iter().filter(|r| !r.disabled && !r.section) {
+            for p in [&r.matchers.src_port, &r.matchers.dst_port]
+                .into_iter()
+                .flatten()
+            {
+                if p.value.0.len() > 1 {
+                    let s = crate::bytecode::port_set(&p.value);
+                    port_sets.entry(s.name.clone()).or_insert(s);
+                }
+            }
+        }
+    }
+    for s in port_sets.into_values() {
+        let items: Vec<String> = crate::bytecode::merged_ports_of(&s)
+            .iter()
+            .map(PortRange::to_string)
+            .collect();
+        let _ = write!(
+            out,
+            "\tset {} {{\n\t\ttype inet_service\n\t\tflags interval\n{}\t}}\n",
+            s.name,
+            elements(&items)
+        );
+        t.fw_sets.push(s);
     }
 
     for table in Table::ALL {
@@ -662,24 +945,35 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
                 .map(|n| n.as_str().to_owned()),
         );
         for chain in chains {
-            let _ = writeln!(out, "\tchain {} {{", chain_name(table, &chain));
+            let kname = chain_name(table, &chain);
+            let _ = writeln!(out, "\tchain {kname} {{");
             if let Some((ty, hook, prio)) = base_hook(table, &chain) {
                 let _ = writeln!(
                     out,
                     "\t\ttype {ty} hook {hook} priority {prio}; policy accept;"
                 );
+                t.chains.push(base_chain(kname.clone(), ty, hook, prio));
+            } else {
+                t.chains.push(regular_chain(kname.clone()));
             }
             for r in live.get(chain.as_str()).into_iter().flatten() {
-                for line in kernel_rules(table, r, &filled) {
-                    let _ = writeln!(out, "\t\t{line}");
+                for k in kernel_rules(table, r, &filled) {
+                    let _ = writeln!(out, "\t\t{}", k.text);
+                    t.rules.push(program::Rule {
+                        chain: kname.clone(),
+                        exprs: k.exprs,
+                        text: k.text,
+                        nft: None,
+                        comment: Some(k.comment),
+                    });
                 }
             }
             let _ = writeln!(out, "\t}}");
         }
     }
-    crate::notice::render(cfg, &mut out);
+    crate::notice::render(cfg, &mut out, &mut t);
     let _ = writeln!(out, "}}");
-    Some(out)
+    Some((out, t))
 }
 
 /// Whether going from `from` to `to` changes the ruleset. `render` reads
@@ -687,10 +981,15 @@ pub fn render(cfg: &Config, dynamic: &[DynamicAddress]) -> Option<String> {
 /// neither does not render at all (both configs were rendered on every
 /// commit, ~1 ms per 1000 rules).
 pub fn changed(from: &Config, to: &Config) -> bool {
-    (from.ip.firewall != to.ip.firewall
+    inputs_changed(from, to) && render(from, &[]) != render(to, &[])
+}
+
+/// Whether anything [`render`] reads differs (a struct comparison, no
+/// render): `hal-linux` diffs the two programs itself (G2.8).
+pub fn inputs_changed(from: &Config, to: &Config) -> bool {
+    from.ip.firewall != to.ip.firewall
         || from.interface_lists != to.interface_lists
-        || from.ip.subscriber_notice != to.ip.subscriber_notice)
-        && render(from, &[]) != render(to, &[])
+        || from.ip.subscriber_notice != to.ip.subscriber_notice
 }
 
 /// The text `nft -f -` applies as one transaction: our table is replaced

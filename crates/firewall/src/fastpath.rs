@@ -59,6 +59,7 @@ pub fn table(fp: &FastPath, devices: &[String], hw_offload: bool) -> Option<Tabl
             exprs,
             text: format!("meta l4proto {name} ct state established flow add @{FLOWTABLE}"),
             nft: None,
+            comment: None,
         });
     }
     Some(t)

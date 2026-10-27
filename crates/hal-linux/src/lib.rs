@@ -73,6 +73,13 @@ pub mod ctnl;
 /// Firewall rule counters in one nfnetlink dump (G2.1c).
 pub mod nft_counters;
 
+/// Reading an nf_tables table back over nfnetlink (G2.8).
+pub mod nft_read;
+
+/// The firewall's table over nfnetlink, by difference (G2.8).
+#[cfg(target_os = "linux")]
+pub mod firewall;
+
 /// The packet trace (`meta nftrace`, G2.1c): trace table and event codec.
 pub mod nft_trace;
 
@@ -455,10 +462,9 @@ mod linux {
             );
             // nftables first (a refusal changes nothing), and only when the
             // firewall changed: a host without nftables still runs the rest.
-            let firewall = corerouter_firewall::nft::changed(from, to);
+            let firewall = corerouter_firewall::nft::inputs_changed(from, to);
             if firewall {
-                let dynamic = crate::nft::dynamic();
-                crate::nft::run(&corerouter_firewall::script(to, &dynamic))?;
+                crate::firewall::apply(from, to)?;
             }
             // CGNAT (G2.3): its own table, replaced whole in one batch.
             let cgnat = corerouter_firewall::cgnat::changed(&from.ip.cgnat, &to.ip.cgnat);
@@ -473,12 +479,8 @@ mod linux {
                     &mut self.cgnat_full,
                 )
             {
-                if firewall {
-                    let dynamic = crate::nft::dynamic();
-                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
-                    {
-                        log::error!("restoring the previous firewall: {back}");
-                    }
+                if firewall && let Err(back) = crate::firewall::apply(to, from) {
+                    log::error!("restoring the previous firewall: {back}");
                 }
                 return Err(e);
             }
@@ -497,12 +499,8 @@ mod linux {
                 {
                     log::error!("restoring the previous CGNAT table: {back}");
                 }
-                if firewall {
-                    let dynamic = crate::nft::dynamic();
-                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
-                    {
-                        log::error!("restoring the previous firewall: {back}");
-                    }
+                if firewall && let Err(back) = crate::firewall::apply(to, from) {
+                    log::error!("restoring the previous firewall: {back}");
                 }
                 return Err(e);
             }
@@ -530,12 +528,8 @@ mod linux {
             let cpu = (&from.system.tuning.cpu, &to.system.tuning.cpu);
             if let Err(e) = self.cpu.transition(cpu.0, cpu.1, &root) {
                 undo_cgnat(self);
-                if firewall {
-                    let dynamic = crate::nft::dynamic();
-                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
-                    {
-                        log::error!("restoring the previous firewall: {back}");
-                    }
+                if firewall && let Err(back) = crate::firewall::apply(to, from) {
+                    log::error!("restoring the previous firewall: {back}");
                 }
                 return Err(e);
             }
@@ -563,12 +557,8 @@ mod linux {
             if let Err(e) = tuned {
                 undo_cpu(self);
                 undo_cgnat(self);
-                if firewall {
-                    let dynamic = crate::nft::dynamic();
-                    if let Err(back) = crate::nft::run(&corerouter_firewall::script(from, &dynamic))
-                    {
-                        log::error!("restoring the previous firewall: {back}");
-                    }
+                if firewall && let Err(back) = crate::firewall::apply(to, from) {
+                    log::error!("restoring the previous firewall: {back}");
                 }
                 return Err(e);
             }
@@ -618,10 +608,7 @@ mod linux {
                     undo_cgnat(self);
                     if firewall {
                         // The links went back to `from`: so does the firewall.
-                        let dynamic = crate::nft::dynamic();
-                        if let Err(back) =
-                            crate::nft::run(&corerouter_firewall::script(from, &dynamic))
-                        {
+                        if let Err(back) = crate::firewall::apply(to, from) {
                             return Err(HalError::Rejected(format!(
                                 "{e}; restoring the previous firewall also failed: {back}"
                             )));
@@ -975,8 +962,8 @@ mod linux {
         fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {
             self.xdp.dynamic(change);
             match change {
-                DynamicChange::Add(d) => crate::nft::add_dynamic(d),
-                DynamicChange::Remove(d) => crate::nft::remove_dynamic(d),
+                DynamicChange::Add(d) => crate::firewall::apply_dynamic(&[(true, d)]),
+                DynamicChange::Remove(d) => crate::firewall::apply_dynamic(&[(false, d)]),
                 // The set's own timeout already removed them from the
                 // kernel: nothing to run (it was one `nft` process per
                 // entry, under the session lock).
@@ -997,7 +984,7 @@ mod linux {
                     DynamicChange::Expired(_) => {}
                 }
             }
-            crate::nft::apply_dynamic(&ops)
+            crate::firewall::apply_dynamic(&ops)
         }
 
         fn dhcp_port(
