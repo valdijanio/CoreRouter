@@ -1936,3 +1936,9 @@ AMD Ryzen AI MAX+ 395, kernel 7.0.
 - `netns_traffic_flow` (release, `COREROUTER_FLOW_BURST=100000`): 100 000 criações NAT pelo TCP
   (thread de envio) 0,38 s após o início; 300 000 registros, 1,6 µs de CPU por registro, RSS
   133 MB, sem descarte na fila nem no kernel.
+
+G1.27d OUI, AMD Ryzen AI MAX+ 395, build `bench`, 2026-10-27, **medido** (máquina com load 7–10 de
+outras sessões): uma busca de fabricante 75 ns (busca binária em 40 410 registros, nada
+alocado até achar); conferir a tabela inteira 0,76 ms (uma vez, no primeiro uso, ou ao instalar uma
+baixada); tabela embutida 709 KB (o CSV tem 3,9 MB). Página de `ip.arp.list` com 100 mil vizinhos
+e o nome do fabricante nas 500 linhas: 3,4 ms (a mesma carga dava 4,3 ms à busca por interface).
