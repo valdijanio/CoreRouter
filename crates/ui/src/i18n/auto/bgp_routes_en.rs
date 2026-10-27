@@ -15,6 +15,8 @@ When the daemon's choice cannot be reproduced step by step (deterministic-med, m
 The step where this path lost to the best one, with the two values compared (winner first). Red: by our comparison this path should have won (see the note on top)."##),
     (r##"bgp_routes.explain.path"##, r##"## What it is
 The neighbor (its connection) the path came from; `best` marks the chosen one."##),
+    (r##"bgp_routes.explain.routes"##, r##"## What it is
+The routes each BGP connection received and advertised (RouterOS `/routing route` for BGP), a page at a time, searched by prefix, AS path, community and RPKI state, with the RPKI badge of each route; and the flap history of the sessions. The table is read from FRR when asked (a full table takes a few seconds), then paged from memory."##),
     (r##"bgp_routes.history.connection"##, r##"## What it is
 The BGP connection (or the neighbor address for a session FRR runs that no connection names)."##),
     (r##"bgp_routes.history.event"##, r##"## What it is

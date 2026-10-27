@@ -117,7 +117,7 @@ fn received_routes_show_rpki_and_why_this_route() {
     h.app.open.clear();
     bgp_routes::open_routes(&mut h.app, "rr2", Tab::Received);
     refresh(&mut h);
-    assert!(h.has_text("BGP Routes"));
+    assert!(h.has_text("Routes"), "the BGP window's Routes tab");
     assert!(h.has_text("10.66.0.0/24"), "{:?}", h.app.panel_mut::<RoutesPanel>().unwrap().answer);
     assert!(h.has_text("filtered"));
     assert!(h.has_text_containing("invalid 50.0%"), "the share of each state");
@@ -161,7 +161,8 @@ fn received_routes_show_rpki_and_why_this_route() {
 fn rpki_window_shows_the_policy_and_checks_a_prefix() {
     let mut h = Harness::with_session(lab());
     h.app.open.clear();
-    h.app.open(Win::Panel(crate::rpki::WIN));
+    h.app.open(Win::Bgp);
+    h.app.panel_mut::<crate::bgp::BgpPanel>().unwrap().tab = crate::bgp::Tab::Rpki;
     refresh(&mut h);
     assert!(h.has_text("on: invalid routes rejected"));
     assert!(h.has_text("127.0.0.1:3323"));
@@ -177,4 +178,41 @@ fn rpki_window_shows_the_policy_and_checks_a_prefix() {
     let p = h.app.panel_mut::<RpkiPanel>().unwrap();
     assert_eq!(p.check.as_ref().unwrap()["state"], "invalid");
     assert!(h.has_text_containing("10.66.0.0/16-16 AS64502"));
+}
+
+#[test]
+fn session_detail_shows_the_rpki_share_and_links() {
+    let mut s = lab();
+    s.set_routing_status(RoutingStatus {
+        backend: "fake".into(),
+        updated: Some(1),
+        error: None,
+        bgp_sessions: vec![BgpSession {
+            instance: "default".into(),
+            remote_address: "198.51.100.18".into(),
+            connection: Some("rr2".into()),
+            state: "established".into(),
+            established: true,
+            ..BgpSession::default()
+        }],
+    });
+    let mut h = Harness::with_session(s);
+    h.app.open.clear();
+    h.app.open(Win::Bgp);
+    refresh(&mut h);
+    h.click(h.text("rr2"));
+    refresh(&mut h);
+    assert!(h.has_text("RPKI In"));
+    h.click(h.text("read the routes"));
+    refresh(&mut h);
+    assert!(h.has_text_containing("valid 50%"), "three badges once the table is read");
+    assert!(h.has_text_containing("invalid 50%"));
+    assert!(h.has_text_containing("unknown 0%"));
+    h.click(h.text("why this route?"));
+    refresh(&mut h);
+    assert!(h.has_text_containing("Type a prefix"));
+    h.click(h.text("received routes"));
+    refresh(&mut h);
+    assert_eq!(h.app.panel_mut::<crate::bgp::BgpPanel>().unwrap().tab, crate::bgp::Tab::Routes);
+    assert!(h.has_text("10.66.0.0/24"));
 }

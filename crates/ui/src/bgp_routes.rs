@@ -1,10 +1,12 @@
-//! Routing › BGP Routes (G3.2c, G3.3): the routes one connection received
+//! Routing › BGP › Routes (G3.2c, G3.3): the routes one connection received
 //! and advertised, a page at a time like IP › Routes, searched by prefix,
 //! AS path, community and RPKI state, with the RPKI badge of each route
 //! and the share of each state; the flap history of the sessions; and the
 //! "Why this route?" modal (`routing.bgp.route.explain`), which IP › Routes
-//! and the BGP session detail open too. `routing.bgp.route.*` decides;
-//! this only shows.
+//! and the BGP session detail open too; and the session detail's RPKI
+//! share and links (the approved mockup). A panel without a window of its
+//! own: `bgp.rs` draws it in its Routes tab. `routing.bgp.route.*`
+//! decides; this only shows.
 
 use egui::{Id, RichText, TextEdit, Ui};
 use serde_json::{Value, json};
@@ -13,12 +15,11 @@ use crate::backend::RequestId;
 use crate::chip::{self, Kind, cell};
 use crate::help::{self, HelpView};
 use crate::i18n::tr_in;
-use crate::panel::{Panel, PanelState, Query, WinDef};
+use crate::panel::{Panel, PanelState, Query};
 use crate::table::{self, Row, TableState, col, num};
 use crate::{CoreRouterUi, Win, value_text};
 
 pub(crate) const NAME: &str = "bgp-routes";
-pub(crate) const WIN: &str = "bgp-routes";
 const SCOPE: &str = "bgp_routes";
 const TABLE: &str = "bgp-routes-table";
 const HISTORY: &str = "bgp-history-table";
@@ -28,13 +29,7 @@ pub(crate) const PAGE: usize = 500;
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
-    windows: &[WinDef {
-        id: WIN,
-        group: "Routing",
-        title: "BGP Routes",
-        size: [1080.0, 620.0],
-        escape: true,
-    }],
+    windows: &[],
     new: || Box::<RoutesPanel>::default(),
 };
 
@@ -100,6 +95,8 @@ pub(crate) struct Search {
 /// An open "Why this route?".
 pub(crate) struct Explain {
     pub prefix: String,
+    /// The field, while typed (the prefix asked is `prefix`).
+    pub typed: String,
     pub answer: Option<Value>,
     table: TableState,
 }
@@ -108,6 +105,7 @@ impl Explain {
     pub(crate) fn new(prefix: &str) -> Self {
         Explain {
             prefix: prefix.trim().to_owned(),
+            typed: prefix.trim().to_owned(),
             answer: None,
             table: TableState::default(),
         }
@@ -134,6 +132,12 @@ pub(crate) struct RoutesPanel {
     help: Option<HelpView>,
     /// `routing.backend.get`: whether a routing daemon is attached.
     pub(crate) attached: Option<bool>,
+    /// The BGP window shows this panel's tab now.
+    pub(crate) active: bool,
+    /// `routing.bgp.route.summary`: the RPKI share of each table read.
+    pub(crate) summary: Vec<Value>,
+    /// Connections whose table the session detail asked to read.
+    pub(crate) wanted: Vec<String>,
 }
 
 fn s(r: &Value, k: &str) -> String {
@@ -153,7 +157,7 @@ pub(crate) fn rpki_kind(state: &str) -> Kind {
     match state {
         "valid" => Kind::Green,
         "invalid" => Kind::Red,
-        "unverified" => Kind::Amber,
+        "unknown" => Kind::Amber,
         _ => Kind::Neutral,
     }
 }
@@ -235,7 +239,8 @@ pub(crate) fn open_explain(app: &mut CoreRouterUi, prefix: &str) {
     app.cache.refreshed_at = None;
 }
 
-/// Open the window on `connection`'s routes (the BGP session detail).
+/// Show `connection`'s routes in the BGP window's Routes tab (the caller
+/// inside `bgp.rs` switches the tab itself).
 pub(crate) fn open_routes(app: &mut CoreRouterUi, connection: &str, tab: Tab) {
     if let Some(p) = app.panel_mut::<RoutesPanel>() {
         if p.connection != connection {
@@ -245,10 +250,98 @@ pub(crate) fn open_routes(app: &mut CoreRouterUi, connection: &str, tab: Tab) {
         p.connection = connection.to_owned();
         p.tab = tab;
     }
-    if !app.open.insert(Win::Panel(WIN)) {
-        app.floats.raise(crate::win_id(Win::Panel(WIN)));
+    if let Some(b) = app.panel_mut::<crate::bgp::BgpPanel>() {
+        b.tab = crate::bgp::Tab::Routes;
+    }
+    if !app.open.insert(Win::Bgp) {
+        app.floats.raise(crate::win_id(Win::Bgp));
     }
     app.cache.refreshed_at = None;
+}
+
+/// Which of the BGP window's G3.2c tabs is shown (their queries go out
+/// only then).
+pub(crate) fn show_tabs(app: &mut CoreRouterUi, rpki: bool, routes: bool) {
+    let mut changed = false;
+    if let Some(p) = app.panel_mut::<RoutesPanel>() {
+        changed |= p.active != routes;
+        p.active = routes;
+    }
+    if let Some(p) = app.panel_mut::<crate::rpki::RpkiPanel>() {
+        changed |= p.active != rpki;
+        p.active = rpki;
+    }
+    // A tab just shown asks at once, not at the next refresh.
+    if changed {
+        app.cache.refreshed_at = None;
+    }
+}
+
+/// Draw panel `name` inside the BGP window.
+pub(crate) fn draw(app: &mut CoreRouterUi, name: &'static str, ui: &mut Ui) {
+    app.with_panel(name, |p, app| p.window(app, "bgp", ui));
+}
+
+/// The session detail's "RPKI In": three badges with the share of each
+/// state among the routes it sent, once its table was read; else a link
+/// that reads it.
+pub(crate) fn session_rpki(app: &mut CoreRouterUi, ui: &mut Ui, connection: &str) {
+    let l = app.lang.labels;
+    let Some(p) = app.panel_mut::<RoutesPanel>() else { return };
+    let row = p
+        .summary
+        .iter()
+        .find(|r| s(r, "connection") == connection && s(r, "direction") == "received")
+        .cloned();
+    let v = ui.visuals().clone();
+    match row {
+        Some(r) if s(&r, "state") == "ready" => {
+            let n = r.get("rpki").cloned().unwrap_or_default();
+            let parts = [("valid", chip::GREEN.tone(&v)), ("unknown", chip::AMBER.tone(&v)), ("invalid", chip::RED.tone(&v))];
+            let total: u64 = ["valid", "unknown", "invalid", "unverified"].iter().map(|k| u(&n, k).unwrap_or(0)).sum();
+            if u(&n, "unverified").unwrap_or(0) == total && total > 0 {
+                chip::chip(ui, tr_in(SCOPE, l, "unverified"), chip::neutral_tone(&v))
+                    .on_hover_text(tr_in(SCOPE, l, "No validator in sync when the routes were read."));
+                return;
+            }
+            for (k, tone) in parts {
+                let c = u(&n, k).unwrap_or(0);
+                let pct = c as f64 * 100.0 / total.max(1) as f64;
+                chip::chip(ui, &format!("{} {pct:.0}%", tr_in(SCOPE, l, k)), tone).on_hover_text(format!("{c} {}", tr_in(SCOPE, l, "routes")));
+            }
+        }
+        Some(r) if s(&r, "state") == "loading" => {
+            ui.spinner();
+        }
+        _ => {
+            let reading = p.wanted.iter().any(|w| w == connection);
+            if !reading && ui.link(tr_in(SCOPE, l, "read the routes")).on_hover_text(tr_in(SCOPE, l, "Read this neighbor's routes from the routing daemon (a full table takes a few seconds)")).clicked() {
+                p.wanted.push(connection.to_owned());
+                app.cache.refreshed_at = None;
+            }
+        }
+    }
+}
+
+/// The session detail's links: received · advertised · history · why this
+/// route?. Returns the Routes tab to show, if one was clicked.
+pub(crate) fn session_links(app: &mut CoreRouterUi, ui: &mut Ui, _connection: &str) -> Option<Tab> {
+    let l = app.lang.labels;
+    let mut go = None;
+    ui.horizontal(|ui| {
+        for (i, (label, tab)) in [("received routes", Tab::Received), ("advertised", Tab::Advertised), ("history", Tab::History)].into_iter().enumerate() {
+            if i > 0 {
+                ui.weak("·");
+            }
+            if ui.link(tr_in(SCOPE, l, label)).clicked() {
+                go = Some(tab);
+            }
+        }
+    });
+    if ui.link(tr_in(SCOPE, l, "why this route?")).clicked() {
+        open_explain(app, "");
+    }
+    go
 }
 
 impl RoutesPanel {
@@ -388,7 +481,7 @@ impl RoutesPanel {
                 let tone = match state {
                     "valid" => chip::GREEN.tone(&v),
                     "invalid" => chip::RED.tone(&v),
-                    "unverified" => chip::AMBER.tone(&v),
+                    "unknown" => chip::AMBER.tone(&v),
                     _ => chip::neutral_tone(&v),
                 };
                 chip::chip(ui, &format!("{} {pct:.1}%", tr_in(SCOPE, l, state)), tone)
@@ -402,7 +495,7 @@ impl RoutesPanel {
                 let fill = match state {
                     "valid" => chip::GREEN.tone(&v).fill,
                     "invalid" => chip::RED.tone(&v).fill,
-                    "unverified" => chip::AMBER.tone(&v).fill,
+                    "unknown" => chip::AMBER.tone(&v).fill,
                     _ => chip::neutral_tone(&v).fill,
                 };
                 ui.painter()
@@ -526,7 +619,7 @@ impl RoutesPanel {
         let mut open = true;
         let mut help = None;
         let mut again = false;
-        egui::Window::new(format!("{} {}", tr_in(SCOPE, l, "Why this route?"), e.prefix))
+        egui::Window::new(format!("{} {}", tr_in(SCOPE, l, "Why this route?"), e.prefix).trim().to_owned())
             .id(Id::unique("bgp-explain"))
             .open(&mut open)
             .collapsible(false)
@@ -538,10 +631,20 @@ impl RoutesPanel {
                     if help::info_button(ui, Id::unique("bgp-explain-title"), tr_in(SCOPE, l, "Why this route?")).clicked() {
                         help = Some(("bgp_routes.explain", "Why this route?"));
                     }
-                    if ui.button(tr_in(SCOPE, l, "Ask Again")).clicked() {
+                    let r = ui.add(TextEdit::singleline(&mut e.typed).hint_text(tr_in(SCOPE, l, "prefix or address")).desired_width(180.0));
+                    let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if (ui.button(tr_in(SCOPE, l, "Explain")).clicked() || enter) && !e.typed.trim().is_empty() {
+                        e.prefix = e.typed.trim().to_owned();
+                        again = true;
+                    }
+                    if !e.prefix.is_empty() && ui.button(tr_in(SCOPE, l, "Ask Again")).clicked() {
                         again = true;
                     }
                 });
+                if e.prefix.is_empty() {
+                    ui.weak(tr_in(SCOPE, l, "Type a prefix or an address: every BGP path to it and why the best one won."));
+                    return;
+                }
                 let a = e.answer.clone().unwrap_or(Value::Null);
                 match a.get("state").and_then(Value::as_str) {
                     Some("ready") => {}
@@ -693,6 +796,7 @@ impl PanelState for RoutesPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
         let mut out = Vec::new();
         if let Some(e) = &self.explain
+            && !e.prefix.is_empty()
             && !e.ready()
             && app.has_command("routing.bgp.route.explain")
         {
@@ -702,7 +806,27 @@ impl PanelState for RoutesPanel {
                 params: json!({"prefix": e.prefix}),
             });
         }
-        if !app.open.contains(&Win::Panel(WIN)) {
+        if !app.open.contains(&Win::Bgp) {
+            return out;
+        }
+        if app.has_command("routing.bgp.route.summary") {
+            out.push(Query {
+                key: "summary",
+                command: "routing.bgp.route.summary",
+                params: json!({}),
+            });
+        }
+        // Tables the session detail asked for, until the summary has them.
+        for c in self.wanted.iter().filter(|c| !self.summary.iter().any(|r| s(r, "connection") == **c)) {
+            if app.has_command("routing.bgp.route.list") {
+                out.push(Query {
+                    key: "wanted",
+                    command: "routing.bgp.route.list",
+                    params: json!({"connection": c, "limit": 1}),
+                });
+            }
+        }
+        if !self.active {
             return out;
         }
         if app.has_command("routing.backend.get") {
@@ -765,6 +889,7 @@ impl PanelState for RoutesPanel {
             }
             "history" => self.history = value.as_array().cloned().unwrap_or_default(),
             "backend" => self.attached = value.get("attached").and_then(Value::as_bool),
+            "summary" => self.summary = value.as_array().cloned().unwrap_or_default(),
             "explain" => {
                 if let Some(e) = self.explain.as_mut() {
                     e.answer = Some(value);

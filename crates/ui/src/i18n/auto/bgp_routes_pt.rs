@@ -10,19 +10,24 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Choose a BGP connection to see its routes."##, r##"Escolha uma conexão BGP para ver as rotas dela."##),
     (r##"Chosen"##, r##"Escolhido"##),
     (r##"Connection"##, r##"Conexão"##),
+    (r##"Explain"##, r##"Explicar"##),
     (r##"History"##, r##"Histórico"##),
     (r##"Lost At"##, r##"Perdeu em"##),
     (r##"No route matches."##, r##"Nenhuma rota corresponde."##),
     (r##"No routing daemon is attached (the virtual lab, or the daemon runs without --frr): BGP routes are read from FRR."##, r##"Nenhum daemon de roteamento ligado (o laboratório virtual, ou o daemon roda sem --frr): as rotas BGP são lidas do FRR."##),
     (r##"No session went down since the daemon started."##, r##"Nenhuma sessão caiu desde que o daemon subiu."##),
+    (r##"No validator in sync when the routes were read."##, r##"Nenhum validador em sincronia quando as rotas foram lidas."##),
     (r##"Order:"##, r##"Ordem:"##),
     (r##"RPKI"##, r##"RPKI"##),
     (r##"Read Again"##, r##"Ler de novo"##),
+    (r##"Read this neighbor's routes from the routing daemon (a full table takes a few seconds)"##, r##"Lê as rotas deste vizinho do daemon de roteamento (uma tabela completa leva alguns segundos)"##),
     (r##"Reading the routes from the routing daemon… a full table takes a few seconds."##, r##"Lendo as rotas do daemon de roteamento… uma tabela completa leva alguns segundos."##),
     (r##"Received"##, r##"Recebidas"##),
     (r##"Search"##, r##"Buscar"##),
     (r##"The daemon chose differently from this step-by-step comparison (an option such as deterministic-med or multipath decided)."##, r##"O daemon escolheu diferente desta comparação passo a passo (decidiu uma opção como deterministic-med ou multipath)."##),
+    (r##"Type a prefix or an address: every BGP path to it and why the best one won."##, r##"Digite um prefixo ou endereço: todos os caminhos BGP até ele e por que o melhor venceu."##),
     (r##"Why this route?"##, r##"Por que essa rota?"##),
+    (r##"advertised"##, r##"anunciadas"##),
     (r##"against"##, r##"contra"##),
     (r##"as-path-length"##, r##"tamanho do AS path"##),
     (r##"choose…"##, r##"escolha…"##),
@@ -33,6 +38,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"filtered"##, r##"filtrada"##),
     (r##"filtered only"##, r##"só filtradas"##),
     (r##"flap"##, r##"oscilou"##),
+    (r##"history"##, r##"histórico"##),
     (r##"igp-metric"##, r##"métrica IGP"##),
     (r##"invalid"##, r##"inválida"##),
     (r##"local-pref"##, r##"local-pref"##),
@@ -46,6 +52,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"peer-type"##, r##"eBGP × iBGP"##),
     (r##"prefix or address"##, r##"prefixo ou endereço"##),
     (r##"read"##, r##"lida há"##),
+    (r##"read the routes"##, r##"ler as rotas"##),
+    (r##"received routes"##, r##"rotas recebidas"##),
     (r##"router-id"##, r##"router-id"##),
     (r##"routes"##, r##"rotas"##),
     (r##"stale"##, r##"obsoleto"##),
@@ -54,6 +62,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"up"##, r##"subiu"##),
     (r##"valid"##, r##"válida"##),
     (r##"weight"##, r##"weight"##),
+    (r##"why this route?"##, r##"por que essa rota?"##),
 ];
 
 /// Explanations: (key, Markdown).
@@ -70,6 +79,8 @@ Quando a escolha do daemon não se reproduz passo a passo (deterministic-med, mu
 O passo em que este caminho perdeu para o melhor, com os dois valores comparados (o vencedor primeiro). Vermelho: pela nossa comparação este caminho deveria ter vencido (veja o aviso no topo)."##),
     (r##"bgp_routes.explain.path"##, r##"## O que é
 O vizinho (a conexão dele) de onde o caminho veio; `best` marca o escolhido."##),
+    (r##"bgp_routes.explain.routes"##, r##"## O que é
+As rotas que cada conexão BGP recebeu e anunciou (o `/routing route` do RouterOS para o BGP), uma página por vez, com busca por prefixo, AS path, community e estado RPKI e o selo RPKI de cada rota; e o histórico de quedas das sessões. A tabela é lida do FRR quando pedida (uma tabela completa leva alguns segundos) e depois paginada da memória."##),
     (r##"bgp_routes.history.connection"##, r##"## O que é
 A conexão BGP (ou o endereço do vizinho, numa sessão do FRR que nenhuma conexão nomeia)."##),
     (r##"bgp_routes.history.event"##, r##"## O que é
