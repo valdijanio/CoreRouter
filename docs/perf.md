@@ -1659,3 +1659,37 @@ Um quadro da UI (1400×900, `cargo bench -p corerouter-ui --bench frames`):
 O "antes" era o modal de lista montando o texto dos comandos (o registro inteiro) a cada quadro,
 mesmo numa aba que não o mostra; nas abas ao vivo ele não é mais montado (−91%). As abas de
 formulário (General/Advanced) continuam pagando ~2 ms por quadro, como todo modal de edição hoje.
+
+### G4.10b — avisos ao assinante com 100 mil assinantes listados (**medido**, 2026-10-26)
+
+AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0.0, build release, namespace sem root.
+
+`cargo bench -p corerouter-hal-linux --bench netns_notice` (UDP de 64 B de um não membro, um núcleo, veth → dummy):
+
+| Caso | pps | Carga da tabela |
+|---|---|---|
+| sem firewall | 1,63 M | — |
+| 100 mil na lista, sem perfil | 1,64 M | 198 ms |
+| 100 mil, perfil `block` (cadeias com 5 lookups por regra, antes do salto) | 0,94 M | 235 ms |
+| 100 mil, perfil `block` com salto por perfil (o que entrou) | 1,24 M | 236 ms |
+| 100 mil + masquerade (conntrack ligado, a base justa de um provedor) | 1,40 M | 201 ms |
+| 100 mil + masquerade + perfil `block` | 1,24 M (−11%) | 227 ms |
+
+- **Por pacote:** a cadeia nat do perfil liga o conntrack sozinha. Contra uma base com
+  conntrack, o custo é −11% de pps: um lookup no conjunto e o gancho a mais, ~90 ns por pacote.
+- **Atualização:** um assinante entrar e sair da lista com 100 mil já nela leva 20,3 ms ida e
+  volta, isto é, dois processos `nft` de ~10 ms cada. Esse custo independe do tamanho do
+  conjunto.
+
+`cargo bench -p corerouter-engine --bench notice` (100 mil membros estáticos):
+
+| Medida | Antes | Depois |
+|---|---|---|
+| `notice_tick`, nada mudou | 50,7 ms | 0,38 µs |
+| `notice_tick`, todos novos | 56 ms | 26 ms |
+| `throttle_queues`, 100 mil membros | 97 ms | 90 ms, e agora só quando o plano é refeito (antes, todo segundo no `queue_sync`) |
+| `notice_profile_of`, membro | — | 59 ns |
+| `notice_profile_of`, não membro (varre prefixos) | — | 0,91 ms |
+
+`notice_profile_of` com não membro só roda em comando (`test`, `seen`); o portal lê o retrato
+da G4.10c.

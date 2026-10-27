@@ -5079,3 +5079,75 @@ continuação indentadas).
 
   O par soma ≈ 40 ms à rajada. O limite da rajada (≈ 2200 CoAs/s) é o caminho de CoA de C, que já
   existia, e não cresce com o número de sessões depois da correção dos índices.
+
+- 2026-10-27 — G4.10b: Avisos ao assinante, parte 2 (plano de dados), em `crates/firewall/src/notice.rs`. As cadeias
+  `notice_dstnat` e `notice_forward` ficam na própria tabela `inet corerouter`, então a lista do
+  perfil é o conjunto da address list. Entrar e sair da lista é um elemento, e as regras nunca
+  mudam por assinante. Cada perfil ganha um salto por família e gancho
+  (`notice_nat4_<perfil>`, `notice_block4_<perfil>`):
+
+  - no modo `block`, o walled garden (`sn-garden` e os prefixos fixos) e o DNS passam; TCP recebe
+    RST e o resto ICMP *administratively prohibited* na hora;
+  - a porta 80 vai para o portal: todo HTTP, ou só os IPs das sondas (`sn-probe`) com
+    `intercept=probes`;
+  - quem viu a página (`sn-seen-<perfil>`) fica livre no aviso e na redução;
+  - o endereço do próprio roteador nunca é redirecionado (`fib daddr type != local`);
+  - `portal_address` troca o `redirect` por `dnat` para um endereço fixo do roteador (PPPoE pelo
+    XDP).
+
+  O modo `throttle` vira uma fila dinâmica de origem `notice` por membro, que vence a do
+  lease. A taxa da sessão PPPoE/IPoE fica para a G4.10f.
+
+  `notice_tick` só compara membros quando a config ou as listas dinâmicas mudaram. O
+  `queue_sync` só monta as filas de redução quando o plano é refeito.
+
+  Os limites de entradas de address-list estáticas e dinâmicas sobem de 65 536 para 262 144.
+
+  Como testar:
+
+  ```sh
+  COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_notice
+  ```
+
+  Esse teste cobre:
+
+  - o membro tem a porta 80 levada ao portal com o próprio endereço de origem;
+  - o 443 é recusado em menos de 200 ms;
+  - a liberação vale no próximo pacote;
+  - no modo `notice`, só o IP da sonda é desviado e nada é recusado;
+  - quem já viu fica livre.
+
+  Testes do motor: `cargo test -p corerouter-engine --test subscriber_notice`.
+
+- 2026-10-27 — G4.10c: Avisos ao assinante, parte 3: o serviço `subscriber-notice` do daemon
+  (`apps/corerouter-daemon/src/service/notice.rs`).
+
+  O portal escuta na porta 8880, em IPv4 e IPv6. Uma thread de aceite entrega cada conexão a
+  4 workers por uma fila limitada a 256; com a fila cheia, a conexão fecha na hora. Cada
+  requisição é tratada como hostil: cabeçalho de até 8 KB lido em até 5 s, só `GET`/`HEAD`, nada
+  devolvido sem escape. O worker responde lendo o retrato (`Session::notice_snapshot`, refeito
+  pelo tick a cada 2 s), sem o lock da sessão; só uma visualização de página o toma, uma vez.
+
+  Respostas:
+
+  - **sonda do sistema de um membro:** `302` para a página, que é o que todo SO lê como portal.
+    A sonda nunca recebe 511, porque o Android trata 4xx/5xx como "sem internet".
+  - **outro HTTP:** `511` com a página no corpo (RFC 6585 §6), `Cache-Control: no-store`.
+  - **quem não é membro:** a resposta esperada de cada sistema (204, `Success`,
+    `Microsoft Connect Test`, …), para o SO sair do estado de portal na hora.
+  - **`/captive-portal/api`:** o JSON da RFC 8908.
+
+  O serviço também cuida de:
+
+  - opção DHCP 114 com `capport_url` (RFC 8910 §2.1: só a quem pede, e a opção 114 do operador
+    tem precedência);
+  - walled garden e nomes das sondas resolvidos pelo DNS do roteador a cada 5 min, gravados em
+    `sn-garden` / `sn-probe` com 15 min de vida;
+  - webhook com POST JSON por evento `entered`/`left`, fila de 1024 e 3 tentativas com espera
+    de 1, 2 e 4 s.
+
+  Como testar:
+
+  - `cargo test -p corerouter-daemon --bin corerouter-daemon notice`: as 21 sondas, a página e
+    o log, a resposta de quem não é membro, a API e as requisições hostis;
+  - `cargo test -p corerouter-proto-dhcp capport`.
