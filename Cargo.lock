@@ -1394,6 +1394,9 @@ dependencies = [
  "corerouter-model",
  "criterion",
  "ipnet",
+ "proptest",
+ "regex",
+ "regex-syntax",
  "serde",
 ]
 

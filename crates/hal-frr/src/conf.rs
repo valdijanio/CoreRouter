@@ -167,6 +167,15 @@ pub fn overwrite_key(line: &str) -> Option<String> {
         "description",
         "router-id",
         "ospf router-id",
+        // Route-map entries (G3.2b): one value each.
+        "on-match",
+        "set local-preference",
+        "set metric",
+        "set community",
+        "set large-community",
+        "set as-path prepend",
+        "set comm-list",
+        "set large-comm-list",
     ];
     for p in SINGLE {
         if line.starts_with(p) && line.as_bytes().get(p.len()) == Some(&b' ') {

@@ -27,6 +27,10 @@ name = "frr_conf"
 harness = false
 
 [[bench]]
+name = "filter_diff"
+harness = false
+
+[[bench]]
 name = "frr_rib"
 harness = false
 

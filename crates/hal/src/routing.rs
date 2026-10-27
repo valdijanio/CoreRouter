@@ -68,6 +68,20 @@ pub trait RoutingReader: Send {
     /// The BGP sessions of the instances of `cfg`.
     fn bgp_sessions(&mut self, cfg: &Config) -> Result<Vec<BgpSession>, HalError>;
 
+    /// The routes of BGP neighbor `neighbor` of instance `instance` for the
+    /// policy preview (G3.2b): `received` those it sent, before the input
+    /// chain; otherwise this router's best routes, before the output chain.
+    fn bgp_filter_routes(
+        &mut self,
+        cfg: &Config,
+        instance: &str,
+        neighbor: &str,
+        received: bool,
+    ) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
+        let _ = (cfg, instance, neighbor, received);
+        Err(HalError::Unsupported("BGP routes".into()))
+    }
+
     /// The backend's version line, e.g. "frr 10.7.1"; `Err` while it is down.
     fn version(&mut self) -> Result<String, HalError>;
 

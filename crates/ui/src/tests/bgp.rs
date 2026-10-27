@@ -156,7 +156,7 @@ fn the_modal_adds_a_connection_through_the_preview() {
     m.values.insert("hold_time", "30".into());
     m.values.insert("templates", "transit".into());
     settle(&mut h);
-    for t in ["keepalive 10 s, hold 30 s", "eBGP: no route is accepted or sent until a policy is set (RFC 8212)"] {
+    for t in ["keepalive 10 s, hold 30 s", "eBGP without input_filter and output_filter: no route is accepted or sent (RFC 8212); set the chains (Routing › Filters)"] {
         assert!(h.has_text(t), "{t}");
     }
     h.click(h.text("OK"));

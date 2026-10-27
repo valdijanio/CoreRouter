@@ -21,6 +21,7 @@
 pub mod conf;
 pub mod render;
 pub mod rib;
+pub mod routes;
 pub mod state;
 pub mod vty;
 
@@ -44,6 +45,10 @@ pub const TIMEOUT: Duration = Duration::from_secs(30);
 /// Largest answer read for a config or a session list (64 MiB: a running
 /// config of a million lines is ~40 MiB, **estimado**).
 pub const MAX_REPLY: usize = 64 << 20;
+/// Largest table read for the policy preview (G3.2b): a full table of
+/// ~1 M routes is ~400 MiB of `detail json`, **estimado**; past this the
+/// preview says so and runs on the sample.
+pub const MAX_ROUTES_REPLY: usize = 512 << 20;
 /// Longest error text kept from the daemon.
 const MAX_ERROR: usize = 400;
 
@@ -407,6 +412,71 @@ impl Frr {
     }
 }
 
+impl Frr {
+    /// The routes of `neighbor` (instance `instance`) for the policy
+    /// preview: `received`, what it sent before the input chain (needs
+    /// `keep_received`); otherwise our best routes, before the output chain.
+    pub fn bgp_filter_routes(
+        &self,
+        instance: &str,
+        neighbor: &str,
+        received: bool,
+    ) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
+        if neighbor.parse::<std::net::IpAddr>().is_err() {
+            return Err(HalError::Rejected(format!(
+                "{neighbor:?} is not a neighbor address"
+            )));
+        }
+        let view = if instance == corerouter_proto_bgp::DEFAULT_INSTANCE {
+            String::new()
+        } else {
+            corerouter_proto_bgp::filter::parse::check_name(instance)
+                .map_err(HalError::Rejected)?;
+            format!("view {instance} ")
+        };
+        let mut vty = Vty::connect(&self.socket(Daemon::Bgpd), self.timeout, MAX_ROUTES_REPLY)
+            .map_err(|e| HalError::Io(format!("FRR bgpd is not reachable: {e}")))?;
+        vty.run("enable").map_err(|e| io_err(Daemon::Bgpd, e))?;
+        let mut out = Vec::new();
+        for afi in ["ipv4", "ipv6"] {
+            if received {
+                let base =
+                    format!("show bgp {view}{afi} unicast neighbors {neighbor} received-routes");
+                let j = vty
+                    .run(&format!("{base} json"))
+                    .map_err(|e| io_err(Daemon::Bgpd, e))?;
+                let json = String::from_utf8_lossy(&j.output);
+                if json.contains("soft reconfiguration not enabled")
+                    || json.contains("Inbound soft reconfiguration")
+                {
+                    return Err(HalError::Rejected(format!(
+                        "neighbor {neighbor} does not keep its routes (keep_received is off): the preview needs them"
+                    )));
+                }
+                // Not a neighbor of this family: no table.
+                if !j.ok() || !json.trim_start().starts_with('{') {
+                    continue;
+                }
+                let t = vty
+                    .run(&format!("{base} detail"))
+                    .map_err(|e| io_err(Daemon::Bgpd, e))?;
+                out.extend(
+                    routes::received(&json, &String::from_utf8_lossy(&t.output))
+                        .map_err(HalError::Rejected)?,
+                );
+                continue;
+            }
+            let cmd = format!("show bgp {view}{afi} unicast detail json");
+            let r = vty.run(&cmd).map_err(|e| io_err(Daemon::Bgpd, e))?;
+            let text = String::from_utf8_lossy(&r.output);
+            if r.ok() && !text.trim().is_empty() {
+                out.extend(routes::best_json(&text).map_err(HalError::Rejected)?);
+            }
+        }
+        Ok(out)
+    }
+}
+
 /// How many contexts deep the vty is after running `script[i]`: a script
 /// indents each context's commands by one space under its header and
 /// leaves it with `exit`/`exit-address-family` at the header's indentation.
@@ -685,6 +755,16 @@ impl RoutingReader for FrrReader {
 
     fn incarnation(&mut self) -> Option<String> {
         self.0.incarnation()
+    }
+
+    fn bgp_filter_routes(
+        &mut self,
+        _cfg: &Config,
+        instance: &str,
+        neighbor: &str,
+        received: bool,
+    ) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
+        self.0.bgp_filter_routes(instance, neighbor, received)
     }
 
     fn bgp_routes(

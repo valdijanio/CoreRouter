@@ -129,7 +129,20 @@ fn run(session: &Shared, mut reader: Box<dyn RoutingReader>, synced: bool, healt
         // Copied before the lock is taken (126 µs for 1 000 sessions,
         // **medido**): under it only the move.
         let sample = status.clone();
-        lock(session).set_routing_status(sample);
+        let wanted = {
+            let mut s = lock(session);
+            s.set_routing_status(sample);
+            s.bgp_routes_wanted()
+        };
+        // G3.2b: the tables the filter preview asked for, read here (a
+        // full table takes seconds) and handed back under the lock.
+        for key in wanted {
+            let got = reader
+                .bgp_filter_routes(&Config::default(), &key.instance, &key.neighbor, key.received)
+                .map(corerouter_engine::bgp_routes::to_routes)
+                .map_err(|e| e.to_string());
+            lock(session).set_bgp_routes(key, got);
+        }
         if !health.sleep(TICK) {
             return;
         }

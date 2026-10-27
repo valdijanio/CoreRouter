@@ -263,7 +263,23 @@ backend.**
   por rota); as páginas saem da memória. Números em `docs/perf.md` (G3.2c).
 - **RFC 8212.** O perfil `traditional` do FRR liga `bgp ebgp-requires-policy` e o render não
   desliga. Uma sessão eBGP sem política não aceita nem anuncia rota (no teste com FRR real,
-  `prefix_count` é 0 com o par anunciando). As políticas chegam com a G3.2b.
+  `prefix_count` é 0 com o par anunciando). As políticas chegaram com a G3.2b (abaixo).
+- **Políticas BGP: `/routing filter` compilado para route-map (G3.2b, `docs/bgp-policy.md`).**
+  O texto das regras (linguagem do RouterOS v7) é parseado em Rust (`proto-bgp::filter`), avaliado
+  em Rust para a prévia e o impacto no commit, e **compilado** para route-maps do FRR (testes com
+  `on-match goto` só para a frente, `jump` expandido, fim `deny 65535`). Comparado: (a) render
+  ingênuo regra → entrada, que não exprime `if/else`, `||` nem `not`; (b) `call` do FRR para
+  `jump`, que não distingue "a chain chamada aceitou" de "caiu no fim" — o RouterOS distingue;
+  (c) avaliar só no FRR (sem avaliador próprio), que não dá prévia antes do commit. Ficamos com
+  avaliador + compilador e um proptest que exige que os dois deem o mesmo veredito e os mesmos
+  atributos (20 000 casos). Números (**medido**, 32 núcleos, release, 2026-10-27): prévia de 1 M
+  rotas 311 ms em 1 thread, 48 ms em 8, 30 ms em 16 (dividida por faixa de rotas, política
+  compartilhada sem lock); compilar 10 000 regras 30 ms (era 146 ms: regex checada só na
+  sintaxe e compilada uma vez, parse e regex em threads); render 15 ms (era 98 ms); diff no FRR
+  de 10 000 regras com uma mudada 14,6 ms; FRR real aplica a mudança de uma regra em 2,7 ms (14
+  linhas). As rotas da prévia com FRR são lidas pela thread do FRR do daemon, fora do lock
+  (`engine::bgp_routes`), e `keep_received` (`soft-reconfiguration inbound`, padrão sim, como o
+  RouterOS guarda as rejeitadas) mantém as recebidas antes da política.
 - **Vizinhos BGP no modelo RouterOS v7 (G3.2a, `docs/bgp.md`).** `routing.bgp_templates` e
   `routing.bgp_connections` (`corerouter_model::bgp`). Os templates são **achatados** no render:
   cada vizinho vai ao FRR com os valores em vigor, sem `peer-group`. Um template do RouterOS

@@ -58,6 +58,14 @@ impl Daemon {
 /// skipped lines the zebra copy still had).
 pub const OWNED: Owned = &[
     ("router bgp ", &[Daemon::Bgpd]),
+    // G3.2b: the `/routing filter` render, all named `CR-` (the operator's
+    // own lists and maps are left alone). Only bgpd filters with them.
+    ("ip prefix-list CR-", &[Daemon::Bgpd]),
+    ("ipv6 prefix-list CR-", &[Daemon::Bgpd]),
+    ("bgp as-path access-list CR-", &[Daemon::Bgpd]),
+    ("bgp community-list standard CR-", &[Daemon::Bgpd]),
+    ("bgp large-community-list standard CR-", &[Daemon::Bgpd]),
+    ("route-map CR-", &[Daemon::Bgpd]),
     // G3.2c: RPKI validators and the route-map that drops invalid routes;
     // `match rpki` exists only in bgpd (its rpki module).
     ("rpki", &[Daemon::Bgpd]),

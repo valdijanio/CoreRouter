@@ -7,7 +7,7 @@ socket vty (`crates/hal-frr`). O G3.2 foi dividido em três partes:
 | Parte | O quê |
 |---|---|
 | **G3.2a** (esta) | templates, conexões, sessões ao vivo, validação, janela Routing › BGP |
-| G3.2b | políticas: prefix-list, community normal e large, AS-path, `routing.filter.rule` com prévia |
+| G3.2b | políticas: prefix-list, community normal e large, AS-path, `routing.filter.rule` com prévia (`docs/bgp-policy.md`) |
 | G3.2c | RPKI (RFC 6811/8210) por padrão, "Por que essa rota?" e rotas por conexão (`docs/rpki.md`) |
 
 ## Como usar
