@@ -180,6 +180,15 @@ fn the_preview_diffs_running_and_candidate() {
         added.iter().any(|l| l.contains("ip saddr 192.0.2.0/24")),
         "{added:?}"
     );
+    // The tester sees the pending rule; with running=true it does not.
+    let probe = json!({"src": "192.0.2.9", "dst": "203.0.113.1", "dst_port": 443, "in_interface": "ether1"});
+    assert_eq!(
+        ok(&mut s, "ip.firewall.test", probe.clone())["fate"],
+        "dropped"
+    );
+    let mut run = probe;
+    run["running"] = json!(true);
+    assert_eq!(ok(&mut s, "ip.firewall.test", run)["fate"], "delivered");
     ok(&mut s, "config.commit", json!({}));
     assert_eq!(
         ok(&mut s, "ip.firewall.preview", json!({}))["changed"],
