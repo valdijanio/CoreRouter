@@ -1,12 +1,13 @@
 //! Where one packet ends in a chain: the rule that decides it, walking
 //! jumps and returns like the kernel does. The engine's lockout check uses
 //! it for the management connection (G2.1b); the packet tester of G2.1c
-//! will show the same walk.
+//! ([`crate::path`]) shows the same walk, chain after chain.
 //!
 //! What a config alone cannot know is assumed, always the same way:
 //!
 //! - the packet carries no connection, packet or routing mark;
-//! - the connection was not NATed (`connection_nat_state` sees none);
+//! - the connection was not NATed (`connection_nat_state` sees none),
+//!   unless the packet says so (`Packet::nat`, the tester after a dst-nat);
 //! - a `limit` is not exceeded (the rule matches);
 //! - address lists hold their static entries plus the dynamic ones the
 //!   caller passes; entries that rules added inside the kernel are unknown
@@ -15,8 +16,8 @@
 use std::net::IpAddr;
 
 use corerouter_model::firewall::{
-    Action, AddrMatch, ConnState, DynamicAddress, Family, FirewallRule, Flag, Flags, Name, Neg,
-    Protocol, Table,
+    Action, AddrMatch, ConnState, DynamicAddress, Family, FirewallRule, Flag, Flags, Name,
+    NatState, Neg, Protocol, Table,
 };
 use corerouter_model::{Config, ItemId};
 
@@ -35,6 +36,9 @@ pub struct Packet {
     pub in_interface: Option<String>,
     pub out_interface: Option<String>,
     pub state: ConnState,
+    /// What NAT did to the connection so far (the packet tester sets it
+    /// after a `dst-nat`; everyone else: none).
+    pub nat: Option<NatState>,
 }
 
 impl Packet {
@@ -147,7 +151,7 @@ pub fn matches(cfg: &Config, dynamic: &[DynamicAddress], r: &FirewallRule, p: &P
         && iface_list(&m.in_interface_list, p.in_interface.as_deref())
         && iface_list(&m.out_interface_list, p.out_interface.as_deref())
         && flags(&m.connection_state, Some(p.state))
-        && flags(&m.connection_nat_state, None)
+        && flags(&m.connection_nat_state, p.nat)
         && icmp
         && unmarked(&m.connection_mark)
         && unmarked(&m.packet_mark)
@@ -162,6 +166,27 @@ pub fn walk(
     table: Table,
     chain: &str,
     p: &Packet,
+) -> Outcome {
+    walk_traced(cfg, dynamic, table, chain, p, None)
+}
+
+/// A rule the packet matched on its way through a chain (G2.1c): jumps,
+/// returns, logs and marks that let it go on, and the one that decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hit {
+    pub rule: ItemId,
+    pub chain: Name,
+    pub action: &'static str,
+}
+
+/// [`walk`], also listing in `hits` every rule that matched, in order.
+pub fn walk_traced(
+    cfg: &Config,
+    dynamic: &[DynamicAddress],
+    table: Table,
+    chain: &str,
+    p: &Packet,
+    mut hits: Option<&mut Vec<Hit>>,
 ) -> Outcome {
     let rules: Vec<&FirewallRule> = cfg
         .ip
@@ -188,6 +213,13 @@ pub fn walk(
             }
             if r.chain.as_str() != current || !matches(cfg, dynamic, r, p) {
                 continue;
+            }
+            if let Some(h) = hits.as_deref_mut() {
+                h.push(Hit {
+                    rule: r.id,
+                    chain: r.chain.clone(),
+                    action: r.action.name(),
+                });
             }
             let decided = |verdict| Outcome {
                 verdict,
@@ -248,6 +280,7 @@ mod tests {
             in_interface: Some(iface.into()),
             out_interface: None,
             state,
+            nat: None,
         }
     }
 

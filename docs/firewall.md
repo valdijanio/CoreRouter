@@ -11,7 +11,7 @@ Entregue em três PRs:
 |---|---|---|
 | G2.1a | Modelo, comandos, listas de interfaces, address-lists, render nftables, aplicação atômica, janelas Firewall e Interface List | este documento |
 | G2.1b | Aviso de lockout, regras sombreadas, configuração inicial segura, modelos prontos, modo por zonas, descrição em português e cores; ação `add-src/dst-to-address-list` e matcher `limit` | este documento (§6–§11) |
-| G2.1c | Tabela raw (§13); testador de pacotes, contadores ao vivo com "último uso", rastrear pacote real, prévia do diff do nftables | raw: este documento (§13); o resto em andamento |
+| G2.1c | Tabela raw (§13); testador de pacotes, contadores ao vivo com "último uso", rastrear pacote real, prévia do diff do nftables (§14) | este documento (§13–§14) |
 
 ## 1. Diferenças em relação ao RouterOS
 
@@ -374,6 +374,83 @@ Desempenho (**medido**, `hal-linux/benches/netns_raw.rs`): 4096 fluxos UDP de 64
 encaminhados num netns sem root — com conntrack 1,17 Mpps, com `notrack` na raw 1,24 Mpps (+5 %);
 descartar a mesma inundação no filter `forward` 1,17 Mpps, na raw `prerouting` 1,55 Mpps (+32 %:
 o conntrack nem cria a entrada). Números em `docs/perf.md`.
+
+## 14. Diagnóstico (G2.1c)
+
+| Comando | Faz |
+|---|---|
+| `ip.firewall.test {src, dst, protocol?, src_port?, dst_port?, icmp_type?, icmp_code?, in_interface?, state?, running?}` | o caminho de um pacote inventado, chain por chain, com as regras que ele casa e a que decide; nada é enviado |
+| `ip.firewall.counters {table?, stale_days?}` | pacotes, bytes, pps, "último uso" e `stale` por regra (também nas linhas de `…list`) |
+| `ip.firewall.<tabela>.reset-counters {id?}` | zera o que aparece (uma regra, ou a tabela) — `reset-counters`/`reset-counters-all` do RouterOS |
+| `ip.firewall.trace.start {src?, dst?, protocol?, port?, in_interface?, duration?, max_events?}` / `trace.stop` / `trace.list` | rastreia pacotes **reais** que casam com o filtro |
+| `ip.firewall.preview` | o ruleset `inet corerouter` em execução × o candidato, linha a linha |
+
+**Testador** (`corerouter_firewall::path`). Ordem das prioridades do netfilter:
+
+1. prerouting: raw (-300), conntrack, mangle (-150), nat dstnat (-100);
+2. decisão de rota (o engine acha a interface de saída nas rotas e redes conectadas da tabela da
+   interface de entrada; destino do roteador = input);
+3. input/forward: mangle e filter;
+4. postrouting: mangle e srcnat.
+
+Sem `in_interface`, o pacote sai do roteador (output). O que o kernel faz entre as chains entra no
+modelo:
+
+- `notrack` muda o estado para `untracked`;
+- as chains de NAT só veem o primeiro pacote de uma conexão rastreada (`new`) e nunca um sem
+  rastreio;
+- `dst-nat` troca o destino antes da rota e marca a conexão (`connection-nat-state=dstnat` casa
+  depois).
+
+Por padrão o teste usa a config **candidata** (as mudanças pendentes valem); `running: true` usa a
+que está em execução. Suposições do `eval` (§6): sem marcas, `limit` não estourado, address-lists
+só com as entradas conhecidas pelo engine.
+
+**Contadores.** Toda regra já tem `counter` e `comment "cr:*N"` no kernel (§3).
+
+- **Leitura.** O serviço `fw-diag` do daemon faz **um** dump nfnetlink (`NFT_MSG_GETRULE`) da
+  tabela inteira e soma as regras do kernel de cada regra nossa.
+  - Só lê enquanto alguém olha: uma consulta de contadores ou de lista de regras nos últimos 30 s.
+  - No máximo a cada 2 s, com o lock do `Session` solto; ele é tomado só para entregar.
+- **Commit.** Ele troca a tabela e zera o kernel: um valor menor que o anterior é tratado como esse
+  recomeço, e os totais continuam. Perde-se o que contou entre a última leitura e o commit, até 2 s.
+- **Não persistidos.** Os contadores recomeçam com o daemon.
+- **"Último uso".** É quando os pacotes subiram pela última vez. `— (3 d)` quer dizer "não visto
+  desde que as leituras começaram".
+- **`stale`.** Selo âmbar para uma regra sem uso há `stale_days`, 30 dias por padrão.
+- **Lab.** No `--backend virtual` os números são inventados, com uma taxa por regra.
+
+**Rastrear pacote real.** É o `packet-trace` do Junos e o `nft monitor trace` do nftables; o
+RouterOS não tem.
+
+- **Marcação.** Um filtro é obrigatório (`src`, `dst`, `protocol`, `port` ou `in_interface`). Ele
+  vira a tabela própria `inet corerouter_trace`, com chains em prioridade -301 em `prerouting` e
+  `output`, que faz `meta nftrace set 1`.
+  - O kernel marca no máximo **20 pacotes/s** (`limit`), então uma inundação não inunda o trace.
+  - Um commit (que troca `inet corerouter`) não toca nessa tabela.
+- **Eventos.** O serviço lê os eventos `NFT_MSG_TRACE` (grupo `NFNLGRP_NFTRACE`) e mapeia o handle
+  de cada regra para a nossa pelo mesmo dump dos contadores (relido quando aparece um handle novo).
+- **Fim.** Termina sozinho no prazo (`duration`, 1–300 s, 60 por padrão), no teto de eventos
+  (`max_events`, até 10 000) ou com `trace.stop`, e a tabela é apagada.
+- **Lab.** Um pacote por segundo passa pelo testador.
+
+**Diff.** Mostra o `render` da config em execução contra o da candidata: corta o começo e o fim
+comuns e faz LCS no meio, com teto de 4 M células; acima disso, o meio inteiro sai e entra. Ao lado
+ficam as mudanças de `config.diff`. No modo imediato não há nada pendente.
+
+**GUI.**
+
+- Abas **Test** (formulário, caminho em selos coloridos pelo veredito, regra decisiva destacada,
+  tabela das regras casadas e o rastreio real logo abaixo) e **Diff** (só as mudanças com 3 linhas
+  de contexto, ou a tabela inteira).
+- Nas tabelas de regras, colunas **Packets / Bytes / Rate / Last Used** (com ⓘ), selo `stale` e
+  botão **Reset Counters** (as selecionadas) / **Reset All Counters**.
+- ⓘ das abas e de cada campo em `i18n/auto/firewall_*.rs`.
+
+Desempenho (**medido**, release, netns):
+
+- `ip.firewall.test` com 10 000 regras: 122 µs (1000 regras: 12 µs, linear);
+- ler os contadores de 10 000 regras: 10,7 ms por nfnetlink, contra 190 ms com `nft -j` e JSON.
 
 ## Histórico de revisão
 

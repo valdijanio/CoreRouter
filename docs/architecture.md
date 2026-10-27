@@ -634,6 +634,16 @@ modelos e zonas são comandos do engine (`cmd/firewall_assist.rs`, `cmd/firewall
 escrevem regras comuns pelo mesmo `add` dos comandos de regra; a GUI só junta parâmetros
 (`ui::firewall_assist`) e segura a recusa de lockout para o operador decidir (`ui::lockout`).
 
+G2.1c (diagnóstico): `corerouter_firewall::path` (o caminho de um pacote por raw, mangle, NAT, decisão
+de rota e filter; a rota vem do engine por closure, o crate segue puro) e `diff` (diff de linhas do
+ruleset). Contadores e trace **não** passam pelo `Hal`: o serviço `fw-diag` do daemon lê o kernel
+com o lock do `Session` solto (`hal-linux::nft_counters`, um dump `NFT_MSG_GETRULE` da tabela;
+`nft_trace`, tabela `inet corerouter_trace` + grupo `NFNLGRP_NFTRACE`) e entrega por
+`Session::firewall_counters_feed` / `firewall_trace_push` (estado em `ext`, `engine::firewall_diag`).
+Decisão medida (netns, 10 000 regras, release): **nfnetlink 10,7 ms × `nft -j` + JSON 190 ms**
+(17,7×) e sem processo externo por leitura; por isso o dump é próprio. A aplicação do ruleset
+continua por `nft -f` até o G2.8.
+
 ### Rotas estáticas e VRF (G1.5)
 
 - **Modelo:** `ip.routes` (`RouteEntry`: `dst_address`, `gateway`, `distance`, `routing_table`,

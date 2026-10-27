@@ -62,6 +62,10 @@ name = "netns_raw"
 harness = false
 
 [[bench]]
+name = "netns_fw_counters"
+harness = false
+
+[[bench]]
 name = "netns_cgnat"
 harness = false
 

@@ -70,13 +70,30 @@ pub fn mark_value(kind: MarkKind, name: &Name) -> u32 {
     }
 }
 
-/// The tag that ties kernel rules back to rule `id` (counters, PR 3).
+/// The tag that ties kernel rules back to rule `id` (counters, [`rule_of`]).
 pub fn rule_tag(id: ItemId) -> String {
     format!("cr:{id}")
 }
 
 pub fn chain_name(table: Table, chain: &str) -> String {
     format!("{}_{chain}", table.name())
+}
+
+/// The table and chain of kernel chain `name` (`filter_input` →
+/// filter/input); `None` for chains that are not a rule table's
+/// (subscriber notices). Reverse of [`chain_name`] (G2.1c).
+pub fn table_of_chain(name: &str) -> Option<(Table, &str)> {
+    let (t, chain) = name.split_once('_')?;
+    let table = t.parse::<Table>().ok()?;
+    (!chain.is_empty()).then_some((table, chain))
+}
+
+/// The rule behind a kernel rule: its chain and its `cr:*N` comment
+/// (G2.1c: counters and trace).
+pub fn rule_of(chain: &str, comment: Option<&str>) -> Option<(Table, ItemId)> {
+    let (table, _) = table_of_chain(chain)?;
+    let id = comment?.strip_prefix("cr:")?.parse().ok()?;
+    Some((table, id))
 }
 
 /// A string literal for nftables: only what cannot break out of quotes.
@@ -685,4 +702,26 @@ pub fn script(cfg: &Config, dynamic: &[DynamicAddress]) -> String {
         s.push_str(&body);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kernel_rules_map_back_to_ours() {
+        let id = ItemId(0x16);
+        assert_eq!(
+            rule_of("raw_prerouting", Some(&rule_tag(id))),
+            Some((Table::Raw, id))
+        );
+        assert_eq!(
+            rule_of("filter_my-chain", Some("cr:*1")),
+            Some((Table::Filter, ItemId(1)))
+        );
+        assert_eq!(rule_of("notice_dstnat", Some("cr:*1")), None);
+        assert_eq!(rule_of("filter_input", Some("docker")), None);
+        assert_eq!(rule_of("filter_input", None), None);
+        assert_eq!(table_of_chain("nat_srcnat"), Some((Table::Nat, "srcnat")));
+    }
 }

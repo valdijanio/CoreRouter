@@ -71,6 +71,8 @@ pub enum Hook {
     Prerouting,
     Forward,
     Postrouting,
+    /// Packets the router sends (the packet trace, G2.1c).
+    Output,
 }
 
 impl Hook {
@@ -80,6 +82,7 @@ impl Hook {
             Hook::Prerouting => 0,
             Hook::Forward => 2,
             Hook::Postrouting => 4,
+            Hook::Output => 3,
         }
     }
 
@@ -88,6 +91,7 @@ impl Hook {
             Hook::Prerouting => "prerouting",
             Hook::Forward => "forward",
             Hook::Postrouting => "postrouting",
+            Hook::Output => "output",
         }
     }
 }
@@ -276,6 +280,10 @@ pub fn merge(mut ranges: Vec<(Ipv4Addr, Ipv4Addr)>) -> Vec<(Ipv4Addr, Ipv4Addr)>
 pub enum MetaKey {
     L4Proto,
     OifName,
+    /// G2.1c (packet trace).
+    IifName,
+    NfProto,
+    NfTrace,
 }
 
 impl MetaKey {
@@ -284,6 +292,9 @@ impl MetaKey {
         match self {
             MetaKey::OifName => 7,
             MetaKey::L4Proto => 16,
+            MetaKey::IifName => 6,
+            MetaKey::NfProto => 15,
+            MetaKey::NfTrace => 12,
         }
     }
 }
@@ -395,6 +406,22 @@ pub enum Expr {
     /// flowtable.
     FlowAdd {
         table: String,
+    },
+    /// `dreg = data` (`immediate` with a value, G2.1c).
+    Immediate {
+        dreg: u32,
+        data: Vec<u8>,
+    },
+    /// `meta <key> set sreg` (`meta nftrace set 1`, G2.1c).
+    MetaSet {
+        key: MetaKey,
+        sreg: u32,
+    },
+    /// `limit rate <rate>/<unit_secs> burst <burst> packets` (G2.1c).
+    Limit {
+        rate: u64,
+        unit_secs: u64,
+        burst: u32,
     },
 }
 

@@ -1214,7 +1214,7 @@ impl CoreRouterUi {
                 firewall::Tab::Mangle => &mut self.tables.fw_mangle,
                 firewall::Tab::Raw => &mut self.tables.fw_raw,
                 firewall::Tab::Addr => &mut self.tables.fw_addr,
-                firewall::Tab::Zones => return false,
+                firewall::Tab::Zones | firewall::Tab::Test | firewall::Tab::Diff => return false,
                 firewall::Tab::Connections => {
                     return self
                         .with_panel(crate::connections::NAME, |s, _| s.escape("fw-connections"))

@@ -1168,6 +1168,7 @@ dependencies = [
  "corerouter-control",
  "corerouter-discovery",
  "corerouter-engine",
+ "corerouter-firewall",
  "corerouter-hal",
  "corerouter-hal-frr",
  "corerouter-hal-linux",
@@ -1260,6 +1261,7 @@ name = "corerouter-firewall"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+ "criterion",
  "proptest",
  "serde_json",
 ]
