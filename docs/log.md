@@ -5350,3 +5350,90 @@ continuação indentadas).
 
   - O apply em paralelo (um thread por daemon) tirou 50–65 % do tempo da mudança grande.
   - A memória do processo que aplica ficou em 4–16 MiB, contra 18–36 MiB.
+
+- 2026-10-27 — G1.6a: Imagem do sistema, parte 1: a imagem que boota. `os/` é uma árvore `BR2_EXTERNAL` do Buildroot
+  2025.02.19 (LTS, fixado por versão e SHA-256 em `os/buildroot.lock`), com toolchain Bootlin
+  glibc, kernel 6.18.59 LTS (SHA-256 do `sha256sums.asc` assinado do kernel.org, conferido pelo
+  Buildroot e de novo pelo xtask) e tudo que o roteador usa compilado dentro: eBPF/XDP com BTF,
+  nftables completo, VRF, MPLS, bonding, VLAN, bridge, PPPoE, WireGuard, filas e as placas
+  ixgbe/i40e/iavf/ice/mlx5/virtio. O `cargo xtask os build` confere que os 154 `=y` do fragmento
+  sobreviveram (pegou dois na primeira rodada: `SQUASHFS_DECOMP_MULTI_PERCPU` e `IAVF`, que no
+  6.18 se ligam por outros nomes). Disco GPT com GUIDs fixos: ESP com o kernel como
+  `BOOTX64.EFI` (sem bootloader), `rootfs-a` squashfs zstd só de leitura, `rootfs-b` vazio para o
+  G1.6b e `config` ext4. O PID 1 é o crate novo `apps/corerouter-init` (Rust, sem `unsafe`):
+  monta o sistema, sobe o `lo` por netlink, monta `/config` (tmpfs com aviso se faltar), supervisiona
+  o daemon com backoff, registra quando o canal de controle responde e a memória ociosa, e
+  desliga limpo pelos sinais do busybox `reboot`/`poweroff`. Sem shell, a não ser com
+  `corerouter.shell=ttyS0` na linha de comando do kernel. Pesquisa (MikroTik, VyOS, Junos,
+  Talos, Flatcar, RAUC × atualizador próprio) e decisões em `docs/os-image.md`.
+
+  Como testar: `cargo xtask os build` (frio: 15 min e ~360 MB de download na primeira vez),
+  `cargo xtask os boot-test` (KVM do usuário, sem root; `--tcg` sem KVM; `--efi` pelo OVMF e o disco
+  inteiro) e `cargo xtask os check` (também roda no `cargo xtask ci`, pelo teste
+  `os_tree_is_consistent`, sem baixar nada).
+
+- 2026-10-27 — G2.1c: Firewall, diagnóstico (PR 2 de 2, sobre a tabela raw):
+
+  - **Testador** `ip.firewall.test`. Mostra o caminho de um pacote inventado pela raw, mangle, NAT,
+    decisão de rota e filter, na ordem das prioridades do netfilter (`corerouter_firewall::path`).
+    Mostra também as regras casadas e a que decide. O modelo inclui `notrack` (vira `untracked`), NAT
+    só no primeiro pacote e `dst-nat` antes da rota, com `connection-nat-state=dstnat` depois. Usa a
+    config candidata, ou a em execução com `running`.
+  - **Contadores ao vivo.** São `ip.firewall.counters` e as colunas Packets/Bytes/Rate/Last Used.
+    - O serviço `fw-diag` do daemon faz **um** dump nfnetlink da tabela, fora do lock e só enquanto
+      alguém olha (a cada 2 s, no máximo).
+    - Os totais continuam depois de um commit.
+    - Uma regra sem uso há 30 dias ganha o selo `stale`.
+    - `ip.firewall.<tabela>.reset-counters` zera a contagem.
+  - **Rastreio de pacote real** `ip.firewall.trace.*`. Liga `meta nftrace` numa tabela própria, com
+    filtro obrigatório, até 20 pacotes/s marcados no kernel, prazo de até 300 s e teto de até 10 000
+    eventos. Os eventos `NFT_MSG_TRACE` são mapeados para as nossas regras.
+  - **Prévia** `ip.firewall.preview`. É o diff do ruleset que o próximo commit carrega, com o
+    `config.diff` ao lado.
+  - **GUI.** Abas Test e Diff, colunas de contadores com ⓘ e Reset Counters (`docs/firewall.md` §14).
+
+  Como testar: `cargo test -p corerouter-engine --test firewall_diag`; kernel real:
+  `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_fw_diag`
+  (contadores contam pacotes de verdade e batem com `nft -j`; o trace mostra o handle e o `drop` da
+  regra). No lab: IP › Firewall › Test.
+
+  Desempenho (**medido**): `test` com 10 000 regras em 122 µs; contadores de 10 000 regras em
+  10,7 ms por nfnetlink, contra 190 ms com `nft -j` (17,7×).
+
+- 2026-10-27 — G2.7: CGNAT, aba Capacity (G2.7b). Mostra quantas portas os assinantes usam de verdade e sugere
+  `ports_per_subscriber`.
+
+  - **Cartões:**
+    - limite e assinantes por IP público;
+    - pico p99 dos 7 dias com o %;
+    - quantos bateram no limite em 24 h, com recusas e ICMP enviados.
+  - **Distribuição** do pico por faixa.
+  - **Sugestão:**
+    - p99 + 25 %, em múltiplos de 64, nunca abaixo de 320;
+    - 1,5 × o valor de hoje quando mais de 1 % ficou sem porta;
+    - mostra o ganho em assinantes por IP e os IPs necessários.
+  - **Prévia** (`ip.firewall.cgnat.capacity.preview`): remapeados, conexões derrubadas e se cabe, sem
+    mudar nada.
+  - **Aplicar com Safe Mode**, só depois da prévia do mesmo valor.
+  - ⓘ em português em cada cartão, na distribuição, na sugestão e no aplicar.
+
+  A leitura do conntrack para o CGNAT saiu do lock do `Session`:
+
+  - o serviço novo `cgnat-scan` do daemon lê a tabela uma conexão por vez (`Hal::conntrack_scanner`);
+  - monta um vetor ordenado de 12 bytes por conexão;
+  - só depois pega o lock;
+  - os picos de 7 dias (anel de 20 bytes por assinante) e as recusas por hora vão ao journal
+    `journal-cgnat-capacity.log` a cada 10 min e voltam no boot.
+
+  **Como testar:**
+
+  - `cargo test -p corerouter-engine --test cgnat_capacity`;
+  - `cargo test -p corerouter-ui cgnat`;
+  - na GUI com o laboratório, IP › Firewall › CGNAT › Capacity.
+
+  **Números (medido, 2026-10-27, 64 Ki assinantes, 1,3 milhão de conexões):**
+
+  - montar o uso fora do lock: 51 ms (antes, com conjuntos e dentro do lock: 75 ms);
+  - lock segurado: 5,6 ms;
+  - consulta: 4,1 ms;
+  - picos: 2,8 MiB.

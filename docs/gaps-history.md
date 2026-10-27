@@ -177,3 +177,6 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G2.1c redefinido: inclui a tabela `/ip firewall raw` (aprovado pelo usuário), em dois PRs
 - 2026-10-27 — G2.7 feito (CGNAT avisa o assinante quando as portas acabam)
 - 2026-10-27 — G3.1 feito (hal-frr: FRR pelo socket vty, só a diferença, rollback)
+- 2026-10-27 — G1.6 dividido em G1.6a (imagem que boota), G1.6b (A/B e atualização segura) e G1.6c (instalador e imagens de VM); G1.6a feito; G1.6d nova (configuração padrão de primeiro boot)
+- 2026-10-27 — G2.1c feito (diagnóstico do firewall + tabela raw)
+- 2026-10-27 — G2.7 ganhou a aba Capacity (G2.7b) no mesmo trabalho, a pedido do usuário
