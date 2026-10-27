@@ -34,7 +34,7 @@ use crate::{EngineError, Result, Session};
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.firewall.test", "Test Packet", ["IP", "Firewall"], None,
-        "{src: ip, dst: ip, protocol?: tcp | udp | icmp | icmpv6 | 0..255 (default tcp), src_port?: u16, dst_port?: u16, icmp_type?: u8, icmp_code?: u8, in_interface?: interface (absent = sent by the router itself), state?: new | established | related | invalid (default new)} → {family, steps: [{table, chain, skipped (why the kernel does not run it, else null), verdict (accept | drop | reject | nat | notrack, null when skipped), rule (*hex that decided in this chain, null = policy), hits: [{id, chain, action}] (every rule it matched, in order)}], route: local | <interface> | unreachable, fate: delivered | sent | dropped | no-route, decided_by: {table, id, summary} | null, packet: {src, dst, src_port, dst_port, state, out_interface}} (assumes no marks, limits not exceeded, address lists without the kernel's own entries)",
+        "{src: ip, dst: ip, protocol?: tcp | udp | icmp | icmpv6 | 0..255 (default tcp), src_port?: u16, dst_port?: u16, icmp_type?: u8, icmp_code?: u8, in_interface?: interface (absent = sent by the router itself), state?: new | established | related | invalid (default new), running?: bool (test the running config instead of the candidate, which holds the pending changes)} → {family, steps: [{table, chain, skipped (why the kernel does not run it, else null), verdict (accept | drop | reject | nat | notrack, null when skipped), rule (*hex that decided in this chain, null = policy), hits: [{id, chain, action}] (every rule it matched, in order)}], route: local | <interface> | unreachable | null (dropped before routing), fate: delivered | sent | dropped | no-route, decided_by: {table, id, summary} | null, packet: {src, dst, src_port, dst_port, state, out_interface}} (assumes no marks, limits not exceeded, address lists without the kernel's own entries)",
         always, test),
     cmd!(query "ip.firewall.preview", "Ruleset Preview", ["IP", "Firewall"], None,
         "{} → {changed: bool, added, removed, lines: [{op: \" \" | + | -, text}], running: string, candidate: string} (the nftables table inet corerouter now and after config.commit)",
@@ -135,7 +135,12 @@ fn test_packet(s: &Session, p: &Value) -> Result<Packet> {
 
 fn test(s: &mut Session, p: &Value) -> Result<Value> {
     let packet = test_packet(s, p)?;
-    let cfg = s.store().candidate();
+    let running = super::args::opt_bool(p, "running")?.unwrap_or(false);
+    let cfg = if running {
+        s.store().running()
+    } else {
+        s.store().candidate()
+    };
     let dynamic = s.dynamic_now();
     let router = |dst: IpAddr, iif: Option<&str>| {
         if local_interface(cfg, dst).is_some() {
@@ -172,9 +177,10 @@ fn test(s: &mut Session, p: &Value) -> Result<Value> {
             .map(|r| json!({"table": t.name(), "id": id, "summary": super::firewall::summary(r)}))
     });
     let route = match &way.route {
-        Route::Local => "local".to_owned(),
-        Route::Out(i) => i.clone(),
-        Route::Unreachable => "unreachable".to_owned(),
+        Route::Local => Some("local".to_owned()),
+        Route::Out(i) => Some(i.clone()),
+        Route::Unreachable => Some("unreachable".to_owned()),
+        Route::NotRouted => None,
     };
     Ok(json!({
         "family": Family::of(packet.src).name(),

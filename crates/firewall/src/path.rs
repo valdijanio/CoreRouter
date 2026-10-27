@@ -38,6 +38,8 @@ pub enum Route {
     Out(String),
     /// No route: the kernel drops it (ICMP unreachable).
     Unreachable,
+    /// Dropped before the routing decision (raw, mangle or dstnat).
+    NotRouted,
 }
 
 /// The routing decision, from the caller: `(destination, interface the
@@ -247,11 +249,11 @@ pub fn path(cfg: &Config, dynamic: &[DynamicAddress], p: &Packet, router: &Route
     };
     let incoming = p.in_interface.is_some();
     if incoming {
-        if !w.chain(Table::Raw, "prerouting") || !w.chain(Table::Mangle, "prerouting") {
-            return w.done(Route::Unreachable, Fate::Dropped);
-        }
-        if !w.nat("dstnat") {
-            return w.done(Route::Unreachable, Fate::Dropped);
+        if !w.chain(Table::Raw, "prerouting")
+            || !w.chain(Table::Mangle, "prerouting")
+            || !w.nat("dstnat")
+        {
+            return w.done(Route::NotRouted, Fate::Dropped);
         }
         let route = router(w.p.dst, w.p.in_interface.as_deref());
         match route.clone() {
@@ -269,7 +271,7 @@ pub fn path(cfg: &Config, dynamic: &[DynamicAddress], p: &Packet, router: &Route
                 let fate = if ok { Fate::Sent } else { Fate::Dropped };
                 w.done(route, fate)
             }
-            Route::Unreachable => w.done(route, Fate::NoRoute),
+            Route::Unreachable | Route::NotRouted => w.done(route, Fate::NoRoute),
         }
     } else {
         let route = router(w.p.dst, None);
@@ -462,6 +464,7 @@ mod tests {
         );
         assert_eq!(chains(&p), ["raw/prerouting"]);
         assert_eq!(p.fate, Fate::Dropped);
+        assert_eq!(p.route, Route::NotRouted, "dropped before routing");
         assert_eq!(p.decided_by, Some((Table::Raw, ItemId(1))));
 
         let mut dns = pkt(

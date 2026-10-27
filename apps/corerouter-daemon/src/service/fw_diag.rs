@@ -308,19 +308,38 @@ fn lab_counters(cfg: &corerouter_model::Config, secs: u64) -> Vec<RuleCounter> {
 fn lab_events(s: &mut corerouter_engine::Session, job: &TraceJob, n: u64) -> Vec<TraceEvent> {
     use serde_json::json;
     let f = &job.filter;
-    let pick = |a: &Option<corerouter_model::firewall::AddrMatch>, def: &str| {
-        a.as_ref()
-            .map_or(def.to_owned(), |m| m.bounds().0.to_string())
+    // A host inside the filter's prefix (not its network address), else a
+    // made-up client; to the router's first address by default.
+    let pick = |a: &Option<corerouter_model::firewall::AddrMatch>, def: &str| match a {
+        Some(m) => {
+            let (lo, hi) = m.bounds();
+            match (lo, hi) {
+                (std::net::IpAddr::V4(l), std::net::IpAddr::V4(h)) if l != h => {
+                    let span = u32::from(h).saturating_sub(u32::from(l)).max(1);
+                    std::net::Ipv4Addr::from(u32::from(l).saturating_add((n as u32 % span).max(1))).to_string()
+                }
+                _ => lo.to_string(),
+            }
+        }
+        None => def.to_owned(),
     };
     let v6 = f.src.as_ref().or(f.dst.as_ref()).is_some_and(|a| a.bounds().0.is_ipv6());
+    let own = s
+        .store()
+        .running()
+        .ip
+        .addresses
+        .iter()
+        .find(|a| !a.disabled && a.address.addr().is_ipv6() == v6)
+        .map(|a| a.address.addr().to_string());
     let (src, dst) = if v6 {
-        (pick(&f.src, "2001:db8:1::50"), pick(&f.dst, "2001:db8::1"))
+        (pick(&f.src, "2001:db8:1::50"), pick(&f.dst, own.as_deref().unwrap_or("2001:db8::1")))
     } else {
-        (pick(&f.src, "203.0.113.50"), pick(&f.dst, "192.0.2.1"))
+        (pick(&f.src, "203.0.113.50"), pick(&f.dst, own.as_deref().unwrap_or("192.0.2.1")))
     };
     let protocol = f.protocol.map_or("tcp".to_owned(), |p| p.to_string());
     let iif = f.in_interface.clone().unwrap_or_else(|| "ether1".into());
-    let mut p = json!({"src": src, "dst": dst, "protocol": protocol, "in_interface": iif});
+    let mut p = json!({"src": src, "dst": dst, "protocol": protocol, "in_interface": iif, "running": true});
     if f.protocol.is_none_or(|p| p.has_ports())
         && let Some(o) = p.as_object_mut()
     {

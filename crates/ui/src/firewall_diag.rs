@@ -55,24 +55,25 @@ struct Diag {
     trace_error: Option<String>,
     preview: Value,
     pending: Value,
-    only_changes: bool,
+    /// Show the whole table, not only the changes and their context.
+    whole: bool,
     help: Option<HelpView>,
 }
 
 const TEST_FIELDS: [(&str, &str, &str); 7] = [
     ("src", "Src. Address", "203.0.113.9"),
     ("dst", "Dst. Address", "192.0.2.1"),
-    ("protocol", "Protocol", "tcp"),
+    ("protocol", "Protocol", "tcp (default)"),
     ("src_port", "Src. Port", "40000"),
     ("dst_port", "Dst. Port", "443"),
     ("in_interface", "In. Interface", "from the router"),
-    ("state", "State", "new"),
+    ("state", "State", "new (default)"),
 ];
 
 const TRACE_FIELDS: [(&str, &str, &str); 7] = [
     ("src", "Src. Address", "IP or prefix"),
     ("dst", "Dst. Address", "IP or prefix"),
-    ("protocol", "Protocol", "tcp"),
+    ("protocol", "Protocol", "any"),
     ("port", "Dst. Port", "22"),
     ("in_interface", "In. Interface", "any"),
     ("duration", "Duration", "60 (s, at most 300)"),
@@ -143,13 +144,14 @@ fn way(ui: &mut Ui, l: Lang, steps: &[Value], route: Option<&str>, fate: &str) {
             if !routed && let Some(r) = route
                 && !matches!(chain.as_str(), "prerouting" | "dstnat")
             {
-                step_chip(ui, &format!("route → {r}"), Kind::Neutral.tone(&v), tr_in("firewall", l, "Routing decision"));
+                step_chip(ui, &format!("route: {r}"), Kind::Neutral.tone(&v), tr_in("firewall", l, "Routing decision"));
                 ui.label("›");
                 routed = true;
             }
             let label = format!("{table} {chain}");
             match st.get("skipped").and_then(Value::as_str) {
                 Some(why) => {
+                    let label = format!("{label} (skipped)");
                     let tone = Tone {
                         fill: Color32::TRANSPARENT,
                         ink: v.weak_text_color(),
@@ -175,7 +177,7 @@ fn way(ui: &mut Ui, l: Lang, steps: &[Value], route: Option<&str>, fate: &str) {
             ui.label("›");
         }
         if !routed && let Some(r) = route {
-            step_chip(ui, &format!("route → {r}"), Kind::Neutral.tone(&v), tr_in("firewall", l, "Routing decision"));
+            step_chip(ui, &format!("route: {r}"), Kind::Neutral.tone(&v), tr_in("firewall", l, "Routing decision"));
             ui.label("›");
         }
         let fate_tone = verdict_tone(&v, fate);
@@ -274,7 +276,7 @@ impl Diag {
             }
             let p = r.get("packet").cloned().unwrap_or_default();
             ui.weak(format!(
-                "{}: {}:{} → {}:{} · {} · {}",
+                "{}: {}:{} -> {}:{} · {} · {}",
                 tr_in("firewall", l, "Leaves as"),
                 text(&p, "src"),
                 text(&p, "src_port"),
@@ -286,7 +288,7 @@ impl Diag {
             // Every rule the packet matched, chain by chain; the deciding
             // one highlighted.
             Grid::new("fw-test-hits").striped(true).num_columns(4).show(ui, |ui| {
-                for h in [tr_in("firewall", l, "Chain"), "#", "Action", tr_in("firewall", l, "Result")] {
+                for h in [tr_in("firewall", l, "Chain"), tr_in("firewall", l, "Rule"), "Action", tr_in("firewall", l, "Result")] {
                     ui.strong(h);
                 }
                 ui.end_row();
@@ -354,10 +356,10 @@ impl Diag {
             for p in packets.iter().rev().take(200) {
                 let ports = match (text(p, "sport").as_str(), text(p, "dport").as_str()) {
                     ("", "") => String::new(),
-                    (s, d) => format!(" {s} → {d}"),
+                    (s, d) => format!(" {s} -> {d}"),
                 };
                 ui.horizontal_wrapped(|ui| {
-                    ui.strong(format!("{} → {}", text(p, "src"), text(p, "dst")));
+                    ui.strong(format!("{} -> {}", text(p, "src"), text(p, "dst")));
                     ui.weak(format!("{}{ports} in {}", text(p, "protocol"), text(p, "iif")));
                 });
                 // Each event a step (rule events only name the rule).
@@ -389,35 +391,37 @@ impl Diag {
         ui.horizontal(|ui| {
             if changed {
                 chip::chip(ui, &format!("+{}", text(&self.preview, "added")), verdict_tone(&v, "accept"));
-                chip::chip(ui, &format!("−{}", text(&self.preview, "removed")), verdict_tone(&v, "drop"));
+                chip::chip(ui, &format!("-{}", text(&self.preview, "removed")), verdict_tone(&v, "drop"));
                 ui.label(tr_in("firewall", l, "lines of nftables change at the next commit"));
             } else {
                 chip::chip(ui, tr_in("firewall", l, "no change"), chip::neutral_tone(&v));
                 ui.label(tr_in("firewall", l, "The kernel already holds what the candidate config renders."));
             }
-            ui.checkbox(&mut self.only_changes, tr_in("firewall", l, "Only changes"));
+            ui.checkbox(&mut self.whole, tr_in("firewall", l, "Show whole table"));
         });
-        // The pending config changes (config.diff), one line each.
-        let pending: Vec<String> = match &self.pending {
-            Value::Array(a) => a.iter().map(|c| text(c, "summary")).filter(|s| !s.is_empty()).collect(),
-            Value::Object(o) => o
-                .get("changes")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|c| c.get("summary").or_else(|| c.get("path")).map(value_text).unwrap_or_default())
-                .collect(),
-            _ => Vec::new(),
-        };
+        // The pending config changes (config.diff): one line per field.
+        let pending: Vec<String> = self
+            .pending
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|c| match text(c, "op").as_str() {
+                "change" => format!("{}: {} -> {}", text(c, "path"), text(c, "from"), text(c, "to")),
+                op => format!("{op} {} = {}", text(c, "path"), text(c, "value")),
+            })
+            .collect();
         if !pending.is_empty() {
             ui.weak(format!("{} ({}):", tr_in("firewall", l, "Pending config changes"), pending.len()));
-            for p in pending.iter().take(20) {
-                ui.label(format!("• {p}"));
+            for p in pending.iter().take(12) {
+                ui.label(RichText::new(format!("• {p}")).small());
+            }
+            if pending.len() > 12 {
+                ui.weak(format!("… +{}", pending.len() - 12));
             }
         }
         ui.separator();
         let lines = self.preview.get("lines").and_then(Value::as_array).cloned().unwrap_or_default();
-        let keep: Vec<bool> = if self.only_changes {
+        let keep: Vec<bool> = if !self.whole {
             // A change and three lines around it.
             let near: Vec<bool> = lines.iter().map(|x| text(x, "op") != " ").collect();
             (0..lines.len())

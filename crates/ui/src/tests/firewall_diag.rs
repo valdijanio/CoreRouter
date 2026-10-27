@@ -60,7 +60,7 @@ fn the_test_tab_shows_the_way_and_the_deciding_rule() {
     }
     let screen = texts(&h);
     assert!(screen.contains("filter input"), "the chain chip: {screen}");
-    assert!(screen.contains("route → local"), "{screen}");
+    assert!(screen.contains("route: local"), "{screen}");
     assert!(screen.contains("DROPPED"), "{screen}");
     assert!(screen.contains("dst-port=22"), "the deciding rule: {screen}");
     assert!(screen.contains("decides"), "{screen}");
