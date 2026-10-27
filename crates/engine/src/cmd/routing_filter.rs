@@ -652,7 +652,9 @@ fn status(s: &mut Session, _: &Value) -> Result<Value> {
     let f = &routing.filter;
     let resolved = resolve_templates(&routing.bgp_templates);
     let (_, problems) = Policy::build(f);
-    let mut chains: BTreeMap<&str, (usize, usize, Vec<String>, Vec<String>)> = BTreeMap::new();
+    /// Rules, enabled rules, connections using it in, out.
+    type Use = (usize, usize, Vec<String>, Vec<String>);
+    let mut chains: BTreeMap<&str, Use> = BTreeMap::new();
     for r in &f.rules {
         let e = chains.entry(r.chain.as_str()).or_default();
         e.0 += 1;
@@ -851,11 +853,11 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let (new_policy, _) = Policy::build(&cand.routing.filter);
     let (old_policy, _) = Policy::build(&running.routing.filter);
-    if let (Some(ch), None) = (&new_chain, conn_name.as_ref()) {
-        if new_policy.chain(ch).is_none() {
-            let names: Vec<&str> = new_policy.chain_names().collect();
-            return Err(EngineError::bad("chain", format!("chain {ch:?} has no rules{}", parse::did_you_mean(ch, &names))));
-        }
+    if let (Some(ch), None) = (&new_chain, conn_name.as_ref())
+        && new_policy.chain(ch).is_none()
+    {
+        let names: Vec<&str> = new_policy.chain_names().collect();
+        return Err(EngineError::bad("chain", format!("chain {ch:?} has no rules{}", parse::did_you_mean(ch, &names))));
     }
     let side = |pol: &'_ Policy, ch: &Option<String>| -> (Option<usize>, bool) {
         match ch {

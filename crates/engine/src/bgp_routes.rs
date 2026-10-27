@@ -111,7 +111,7 @@ mod tests {
         let key = RouteKey { instance: "default".into(), neighbor: "192.0.2.1".into(), received: true };
         assert!(s.bgp_routes(&key).is_none());
         assert!(s.bgp_routes(&key).is_none());
-        assert_eq!(s.bgp_routes_wanted(), [key.clone()]);
+        assert_eq!(s.bgp_routes_wanted(), std::slice::from_ref(&key));
         assert!(s.bgp_routes_wanted().is_empty());
         let e = BgpRouteEntry {
             prefix: Some("192.0.2.0/24".parse().unwrap()),

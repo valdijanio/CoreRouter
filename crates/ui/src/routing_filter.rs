@@ -488,15 +488,15 @@ impl FilterPanel {
                 let pos = one.as_ref().and_then(|k| all.iter().position(|r| s(r, "id") == *k));
                 let can_move = |ok: bool| app.can().and("routing.filter.rule.move", if ok { Ok(()) } else { Err("Select one rule".into()) });
                 // Up: before the rule above it; Down: before the one two below.
-                if button(ui, tr_in(SCOPE, l, "Up"), tr_in(SCOPE, l, "Move Up"), can_move(pos.is_some_and(|p| p > 0))) {
-                    if let (Some(k), Some(p)) = (&one, pos) {
-                        moved = Some((k.clone(), all.get(p.saturating_sub(1)).map(|r| s(r, "id"))));
-                    }
+                if button(ui, tr_in(SCOPE, l, "Up"), tr_in(SCOPE, l, "Move Up"), can_move(pos.is_some_and(|p| p > 0)))
+                    && let (Some(k), Some(p)) = (&one, pos)
+                {
+                    moved = Some((k.clone(), all.get(p.saturating_sub(1)).map(|r| s(r, "id"))));
                 }
-                if button(ui, tr_in(SCOPE, l, "Down"), tr_in(SCOPE, l, "Move Down"), can_move(pos.is_some_and(|p| p + 1 < all.len()))) {
-                    if let (Some(k), Some(p)) = (&one, pos) {
-                        moved = Some((k.clone(), all.get(p + 2).map(|r| s(r, "id"))));
-                    }
+                if button(ui, tr_in(SCOPE, l, "Down"), tr_in(SCOPE, l, "Move Down"), can_move(pos.is_some_and(|p| p + 1 < all.len())))
+                    && let (Some(k), Some(p)) = (&one, pos)
+                {
+                    moved = Some((k.clone(), all.get(p + 2).map(|r| s(r, "id"))));
                 }
                 let chain = one.as_ref().and_then(|k| all.iter().find(|r| s(r, "id") == *k)).map(|r| s(r, "chain"));
                 let why = chain.as_ref().map(|_| ()).ok_or_else(|| "Select a rule: its chain is previewed".to_owned());

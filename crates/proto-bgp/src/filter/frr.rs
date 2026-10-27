@@ -728,10 +728,10 @@ fn optimize(mut v: Vec<Entry>) -> Vec<Entry> {
                 && v.get(i - 1)
                     .is_some_and(|p| p.always() && (p.exit != Exit::Next || !p.permit))
                 && !keep.get(i - 1).is_some_and(|k| !k);
-            if noop || dead {
-                if let Some(k) = keep.get_mut(i) {
-                    *k = false;
-                }
+            if (noop || dead)
+                && let Some(k) = keep.get_mut(i)
+            {
+                *k = false;
             }
         }
         if keep.iter().any(|k| !k) {
@@ -1340,9 +1340,9 @@ pub(crate) mod tests {
         let mut rules = vec![("in", "jump c0".to_owned())];
         // 3^12 copies of the last chain, within the jump depth.
         let names: Vec<String> = (0..13).map(|i| format!("c{i}")).collect();
-        for i in 0..12 {
+        for (i, name) in names.iter().enumerate().take(12) {
             rules.push((
-                names[i].as_str(),
+                name.as_str(),
                 format!("jump c{0}; jump c{0}; jump c{0}", i + 1),
             ));
         }
