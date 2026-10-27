@@ -5,9 +5,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use rustix::mount::{MountFlags, UnmountFlags};
@@ -18,7 +19,7 @@ use corerouter_sysupdate::SlotId;
 use corerouter_sysupdate::ab::{self, Boot};
 use corerouter_sysupdate::efi::Vars;
 
-use crate::plan::{self, Backoff, BootOptions};
+use crate::plan::{self, Backoff, BootOptions, Mode};
 
 /// One line on the console (the kernel gives PID 1 `/dev/console` as fds
 /// 0–2). Never panics, unlike `eprintln!`.
@@ -63,6 +64,14 @@ pub fn main() {
     }
     let cmdline = fs::read_to_string("/proc/cmdline").unwrap_or_default();
     let opts = BootOptions::parse(&cmdline);
+    if opts.mode == Mode::Install {
+        // G1.6c: the installer ISO's kernel, running from its initramfs.
+        if Path::new("/sys/firmware/efi").exists() {
+            mount_api(&plan::EFIVARS);
+        }
+        let _ = rustix::system::sethostname(b"corerouter-install");
+        crate::install::run(&opts, cmdline.trim());
+    }
     for w in &opts.warnings {
         log!("kernel command line: {w}");
     }
@@ -81,6 +90,12 @@ pub fn main() {
             log!("{dir}: {e}");
         }
     }
+    // /var is a tmpfs over the squashfs: the usual /var/run → /run link
+    // (FRR's compiled-in state directory is /var/run/frr).
+    if let Err(e) = std::os::unix::fs::symlink("/run", "/var/run") {
+        log!("/var/run: {e}");
+    }
+    let frr = prepare_frr();
     let action = Arc::new(AtomicUsize::new(RUN));
     for (sig, what) in [
         (signal_hook::consts::SIGTERM, REBOOT),
@@ -93,7 +108,135 @@ pub fn main() {
         }
     }
     log!("early boot done in {} ms", started.elapsed().as_millis());
-    supervise(&opts, &action, started, trial);
+    supervise(&opts, &action, started, trial, frr);
+}
+
+/// FRR's daemons, when the image has them (G1.6c): their state directory
+/// owned by the `frr` user they drop to.
+fn prepare_frr() -> Vec<Svc> {
+    if !Path::new(&format!("{}/zebra", plan::FRR_SBIN)).exists() {
+        return Vec::new();
+    }
+    let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+    let Some((uid, gid)) = plan::passwd_ids(&passwd, "frr") else {
+        log!("FRR: no frr user in /etc/passwd: not started");
+        return Vec::new();
+    };
+    if let Err(e) = fs::create_dir_all(plan::FRR_DIR) {
+        log!("{}: {e}", plan::FRR_DIR);
+    }
+    if let Err(e) = rustix::fs::chown(
+        plan::FRR_DIR,
+        Some(rustix::fs::Uid::from_raw(uid)),
+        Some(rustix::fs::Gid::from_raw(gid)),
+    ) {
+        log!("{}: chown: {e}", plan::FRR_DIR);
+    }
+    plan::FRR_DAEMONS
+        .iter()
+        .filter(|d| Path::new(&format!("{}/{d}", plan::FRR_SBIN)).exists())
+        .map(|d| Svc {
+            name: d,
+            pid: None,
+            since: Instant::now(),
+            restart_at: Instant::now(),
+            backoff: Backoff::new(),
+        })
+        .collect()
+}
+
+/// A supervised FRR daemon.
+struct Svc {
+    name: &'static str,
+    pid: Option<Pid>,
+    since: Instant,
+    restart_at: Instant,
+    backoff: Backoff,
+}
+
+impl Svc {
+    fn log_path(&self) -> String {
+        format!("/var/log/frr-{}.log", self.name)
+    }
+}
+
+fn spawn_frr(s: &Svc) -> Option<Pid> {
+    let path = format!("{}/{}", plan::FRR_SBIN, s.name);
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(s.log_path());
+    let (out, err) = match log_file.and_then(|f| Ok((f.try_clone()?, f))) {
+        Ok((a, b)) => (Stdio::from(a), Stdio::from(b)),
+        Err(_) => (Stdio::null(), Stdio::null()),
+    };
+    match Command::new(&path)
+        .args(plan::frr_args(s.name))
+        .env_clear()
+        .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
+        .stdin(Stdio::null())
+        .stdout(out)
+        .stderr(err)
+        .spawn()
+    {
+        Ok(c) => i32::try_from(c.id()).ok().and_then(Pid::from_raw),
+        Err(e) => {
+            log!("{path}: {e}");
+            None
+        }
+    }
+}
+
+/// After the first ready: the installer's management address (once), then
+/// whether the console setup is wanted (no address on any port).
+fn first_boot(opts: &BootOptions, want_setup: Arc<AtomicBool>) {
+    let mgmt = opts.mgmt.clone();
+    let spawned = std::thread::Builder::new()
+        .name("first-boot".into())
+        .spawn(move || {
+            if let Some(m) = mgmt
+                && !Path::new(plan::MGMT_DONE).exists()
+            {
+                for (cmd, params) in m.commands() {
+                    match crate::ctl::call(cmd, &params) {
+                        Ok(_) => log!("installer's management address: {cmd} {params}"),
+                        Err(e) => log!("installer's management address: {cmd}: {e}"),
+                    }
+                }
+                if let Err(e) = fs::write(plan::MGMT_DONE, m.render()) {
+                    log!("{}: {e}", plan::MGMT_DONE);
+                }
+            }
+            let n = crate::ctl::call("ip.address.list", &serde_json::json!({}))
+                .ok()
+                .and_then(|v| v.as_array().map(Vec::len));
+            if n == Some(0) {
+                log("no address on any port: first-boot setup on the console");
+                want_setup.store(true, Ordering::Relaxed);
+            }
+        });
+    if let Err(e) = spawned {
+        log!("first-boot thread: {e}");
+    }
+}
+
+fn spawn_setup(ttys: &[String]) -> Option<Pid> {
+    match Command::new("/proc/self/exe")
+        .arg("setup")
+        .args(ttys)
+        .env_clear()
+        .env("COREROUTER_RUNTIME_DIR", plan::RUNTIME_DIR)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit())
+        .spawn()
+    {
+        Ok(c) => i32::try_from(c.id()).ok().and_then(Pid::from_raw),
+        Err(e) => {
+            log!("console setup: {e}");
+            None
+        }
+    }
 }
 
 /// A trial boot of the A/B image (G1.6b) being watched: reboot into the
@@ -281,7 +424,13 @@ fn supervise(
     action: &AtomicUsize,
     boot: Instant,
     mut trial: Option<TrialWatch>,
+    mut frr: Vec<Svc>,
 ) -> ! {
+    let with_frr = !frr.is_empty();
+    let want_setup = Arc::new(AtomicBool::new(false));
+    let mut setup: Option<Pid> = None;
+    let mut setup_at = Instant::now();
+    let setup_ttys = crate::console::active(opts.shell.as_deref());
     let mut d = Daemon {
         pid: None,
         since: Instant::now(),
@@ -294,10 +443,11 @@ fn supervise(
     let mut idle_at: Option<Instant> = None;
     let mut idle_done = false;
     let mut next_rotate = Instant::now();
+    let mut frr_ready = !with_frr;
     loop {
         let what = action.load(Ordering::Relaxed);
         if what != RUN {
-            shutdown(what, d.pid, shell);
+            shutdown(what, d.pid, shell, &frr, setup);
         }
         // Reap every child that exited: ours and orphans reparented to PID 1.
         while let Ok(Some((pid, status))) = rustix::process::waitpid(None, WaitOptions::NOHANG) {
@@ -316,14 +466,61 @@ fn supervise(
             } else if Some(pid) == shell {
                 shell = None;
                 shell_at = Instant::now() + Duration::from_secs(1);
+            } else if Some(pid) == setup {
+                setup = None;
+                setup_at = Instant::now() + Duration::from_secs(5);
+                if status.exit_status() == Some(0) {
+                    want_setup.store(false, Ordering::Relaxed);
+                }
+            } else if let Some(s) = frr.iter_mut().find(|s| s.pid == Some(pid)) {
+                let ran = s.since.elapsed();
+                let delay = s.backoff.after_exit(ran);
+                log!(
+                    "FRR {} exited ({status:?}) after {:.1} s; restart in {:.1} s (log {})",
+                    s.name,
+                    ran.as_secs_f64(),
+                    delay.as_secs_f64(),
+                    s.log_path()
+                );
+                s.pid = None;
+                s.restart_at = Instant::now() + delay;
             }
         }
         let now = Instant::now();
+        // FRR first (mgmtd, zebra, the protocols): the daemon attaches to
+        // their vty sockets, and resyncs when they come back.
+        for s in frr.iter_mut() {
+            if s.pid.is_none() && now >= s.restart_at {
+                s.pid = spawn_frr(s);
+                s.since = now;
+                if s.pid.is_none() {
+                    s.restart_at = now + s.backoff.after_exit(Duration::ZERO);
+                }
+            }
+        }
         if d.pid.is_none() && now >= d.restart_at {
-            d.pid = spawn_daemon(opts);
+            d.pid = spawn_daemon(opts, with_frr);
             d.since = now;
             if d.pid.is_none() {
                 d.restart_at = now + d.backoff.after_exit(Duration::ZERO);
+            }
+        }
+        if !frr_ready && frr.iter().all(|s| s.pid.is_some()) {
+            let socks = fs::read_dir(plan::FRR_DIR)
+                .map(|d| {
+                    d.flatten()
+                        .filter(|e| e.file_name().to_string_lossy().ends_with(".vty"))
+                        .count()
+                })
+                .unwrap_or(0);
+            if socks >= frr.len() {
+                frr_ready = true;
+                let up = read_proc("/proc/uptime").and_then(|s| plan::uptime_secs(&s));
+                log!(
+                    "FRR up: {} daemons have their vty sockets, {:.3} s after kernel start",
+                    frr.len(),
+                    up.unwrap_or(-1.0)
+                );
             }
         }
         if d.pid.is_some() && !d.ready && probe() {
@@ -337,7 +534,12 @@ fn supervise(
             );
             if !idle_done {
                 idle_at.get_or_insert(now + IDLE_AFTER);
+                first_boot(opts, Arc::clone(&want_setup));
             }
+        }
+        if want_setup.load(Ordering::Relaxed) && setup.is_none() && now >= setup_at {
+            setup = spawn_setup(&setup_ttys);
+            setup_at = now + Duration::from_secs(5);
         }
         if idle_at.is_some_and(|t| now >= t) {
             idle_at = None;
@@ -369,11 +571,14 @@ fn supervise(
                     t.timeout_s,
                     t.from.as_str()
                 );
-                shutdown(REBOOT, d.pid, shell);
+                shutdown(REBOOT, d.pid, shell, &frr, setup);
             }
         }
         if now >= next_rotate {
-            rotate_log();
+            rotate_log(DAEMON_LOG);
+            for s in &frr {
+                rotate_log(&s.log_path());
+            }
             next_rotate = now + Duration::from_secs(5);
         }
         std::thread::sleep(TICK);
@@ -384,7 +589,7 @@ fn read_proc(path: &str) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-fn spawn_daemon(opts: &BootOptions) -> Option<Pid> {
+fn spawn_daemon(opts: &BootOptions, frr: bool) -> Option<Pid> {
     let log_file = OpenOptions::new()
         .create(true)
         .append(true)
@@ -397,7 +602,7 @@ fn spawn_daemon(opts: &BootOptions) -> Option<Pid> {
         }
     };
     let spawned = Command::new(plan::DAEMON)
-        .args(plan::daemon_args(opts))
+        .args(plan::daemon_args(opts, frr))
         .env_clear()
         .env("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
         .env("HOME", plan::CONFIG_DIR)
@@ -486,27 +691,33 @@ fn tail_log(n: usize) {
 
 /// Copy-truncate: the daemon keeps its `O_APPEND` descriptor and goes on
 /// writing at the new end.
-fn rotate_log() {
-    let Ok(meta) = fs::metadata(DAEMON_LOG) else {
+fn rotate_log(path: &str) {
+    let Ok(meta) = fs::metadata(path) else {
         return;
     };
     if meta.len() <= DAEMON_LOG_MAX {
         return;
     }
-    let _ = fs::copy(DAEMON_LOG, format!("{DAEMON_LOG}.1"));
-    if let Ok(f) = OpenOptions::new().write(true).open(DAEMON_LOG) {
+    let _ = fs::copy(path, format!("{path}.1"));
+    if let Ok(f) = OpenOptions::new().write(true).open(path) {
         let _ = f.set_len(0);
     }
 }
 
-fn shutdown(what: usize, daemon: Option<Pid>, shell: Option<Pid>) -> ! {
+fn shutdown(
+    what: usize,
+    daemon: Option<Pid>,
+    shell: Option<Pid>,
+    frr: &[Svc],
+    setup: Option<Pid>,
+) -> ! {
     let name = match what {
         POWEROFF => "power off",
         HALT => "halt",
         _ => "reboot",
     };
     log!("{name}: stopping services");
-    if let Some(p) = shell {
+    for p in [shell, setup].into_iter().flatten() {
         let _ = rustix::process::kill_process(p, Signal::HUP);
     }
     if let Some(p) = daemon {
@@ -527,6 +738,23 @@ fn shutdown(what: usize, daemon: Option<Pid>, shell: Option<Pid>) -> ! {
                 Ok(None) => std::thread::sleep(TICK),
             }
         }
+    }
+    // FRR keeps no state of its own (hal-frr pushes the configuration):
+    // a SIGTERM and a short wait.
+    for p in frr.iter().filter_map(|s| s.pid) {
+        let _ = rustix::process::kill_process(p, Signal::TERM);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while frr.iter().any(|s| {
+        s.pid.is_some_and(|p| {
+            matches!(
+                rustix::process::waitpid(Some(p), WaitOptions::NOHANG),
+                Ok(None)
+            )
+        })
+    }) && Instant::now() < deadline
+    {
+        std::thread::sleep(TICK);
     }
     rustix::fs::sync();
     if let Err(e) = rustix::mount::unmount(plan::CONFIG_DIR, UnmountFlags::empty()) {

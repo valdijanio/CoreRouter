@@ -190,3 +190,23 @@ CONFIG_MLX5_CORE=y
 CONFIG_MLX5_CORE_EN=y
 CONFIG_NET_VENDOR_REALTEK=y
 CONFIG_R8169=y
+
+# --- G1.6c: installer and VM images. The installer is a second kernel
+# (same config, its own built-in command line and an embedded initramfs,
+# os/package/corerouter-installer) booted from a CD (El Torito: SATA/IDE
+# CD-ROM) or a USB stick; it reads its payload from that medium. fw_cfg
+# carries the QEMU-only unattended-install flag (the test's). VMware and
+# VirtualBox (OVA): e1000/vmxnet3, AHCI/PIIX/PVSCSI.
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_ZSTD=y
+CONFIG_BLK_DEV_SR=y
+CONFIG_ATA_PIIX=y
+CONFIG_SCSI_VIRTIO=y
+CONFIG_VMWARE_PVSCSI=y
+CONFIG_VMXNET3=y
+CONFIG_USB_SUPPORT=y
+CONFIG_USB=y
+CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_STORAGE=y
+CONFIG_FW_CFG_SYSFS=y

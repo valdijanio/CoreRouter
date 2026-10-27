@@ -23,3 +23,33 @@ PRETTY_NAME="CoreRouter (${COREROUTER_COMMIT:-dev})"
 VERSION_ID=${COREROUTER_COMMIT:-dev}
 HOME_URL=https://github.com/valdijanio/CoreRouter
 EOR
+# G1.6c: FRR. corerouter-init starts the daemons hal-frr drives (no
+# frrinit.sh, watchfrr or bash); the daemon talks to their vty sockets
+# (no vtysh, which is the only FRR binary that links readline). Out of the
+# image: the scripts, vtysh/readline/bash (GPL-3.0, nothing needs them),
+# python tools (no python in the image) and the daemons CoreRouter does not
+# configure (docs/os-image.md, "FRR na imagem").
+rm -f "$T/usr/bin/vtysh" "$T/bin/bash" "$T/usr/lib/libreadline."* "$T/usr/lib/libhistory."*
+rm -f "$T/usr/sbin/frr" "$T/usr/sbin/frrinit.sh" "$T/usr/sbin/frrcommon.sh" \
+	"$T/usr/sbin/watchfrr" "$T/usr/sbin/watchfrr.sh" "$T/usr/sbin/frr-reload" \
+	"$T/usr/sbin/frr-reload.py" "$T/usr/sbin/frr_babeltrace.py" \
+	"$T/usr/sbin/generate_support_bundle.py" "$T/usr/sbin/fpm_listener"
+for d in babeld eigrpd fabricd isisd pathd pbrd pim6d pimd ripd ripngd vrrpd nhrpd sharpd; do
+	rm -f "$T/usr/sbin/$d"
+done
+rm -f "$T/usr/lib/frr/modules/pathd_pcep.so" "$T/usr/lib/frr/modules/zebra_cumulus_mlag.so" \
+	"$T/usr/lib/libstdc++.so.6.0.32-gdb.py"
+# /etc/frr is read-only: the configuration lives in /config and reaches FRR
+# through hal-frr; the daemons start empty. The files stay (the package's
+# permission table names them), emptied.
+for f in "$T"/etc/frr/*; do
+	echo "! CoreRouter: FRR is configured by corerouter-daemon (hal-frr), not from here." > "$f"
+done
+# What only those needed (readline's ncurses, the C++ runtime the toolchain
+# copies because FRR's configure wants a C++ compiler, PCRE2's POSIX layer).
+# `cargo xtask os build` checks every ELF's NEEDED is still in the image.
+rm -rf "$T/usr/share/terminfo"
+rm -f "$T"/usr/lib/libstdc++.so* "$T"/usr/lib/libgomp.so* "$T"/usr/lib/libncurses.so* \
+	"$T"/usr/lib/libcurses.so "$T"/usr/lib/libform.so* "$T"/usr/lib/libmenu.so* \
+	"$T"/usr/lib/libpanel.so* "$T"/usr/lib/libpcre2-posix.so* "$T/usr/bin/pcre2test" \
+	"$T/usr/bin/pcre2grep" "$T/usr/bin/yanglint" "$T/usr/bin/yangre" "$T/usr/bin/mtracebis"

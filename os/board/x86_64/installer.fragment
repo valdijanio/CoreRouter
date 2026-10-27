@@ -1,0 +1,13 @@
+# The installer's kernel (G1.6c, os/package/corerouter-installer): the
+# image's final .config with these on top. The command line has no root=:
+# the kernel runs /init from the embedded initramfs (corerouter-init,
+# which sees corerouter.mode=install). No BTF: the installer runs no eBPF,
+# and kbuild then has no pahole step (faster relink, smaller kernel).
+CONFIG_CMDLINE_BOOL=y
+CONFIG_CMDLINE="console=tty0 console=ttyS0,115200 corerouter.mode=install panic=10 quiet"
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_ZSTD=y
+CONFIG_INITRAMFS_COMPRESSION_ZSTD=y
+# CONFIG_DEBUG_INFO_BTF is not set
+# CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT is not set
+CONFIG_DEBUG_INFO_NONE=y

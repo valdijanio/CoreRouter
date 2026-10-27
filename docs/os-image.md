@@ -1,4 +1,4 @@
-# Imagem do sistema (G1.6a, G1.6b)
+# Imagem do sistema (G1.6a, G1.6b, G1.6c)
 
 A imagem que vai no disco do roteador: kernel LTS, rootfs squashfs só de leitura, `/config`
 gravável, `corerouter-init` como PID 1 e `corerouter-daemon` como único serviço. Construída
@@ -12,11 +12,12 @@ cargo xtask os boot-test --tcg       # sem KVM (emulação; ~3× mais lento)
 cargo xtask os boot-test --efi       # o mesmo, pelo firmware UEFI (OVMF) e o disco inteiro
 cargo xtask os boot-test --append corerouter.shell=ttyS0 --timeout 600   # com shell de manutenção na serial
 cargo xtask os ab-test               # G1.6b: os 4 cenários A/B no QEMU (UEFI, sem root)
+cargo xtask os install-test          # G1.6c: instalador (CD, USB, interativo), qcow2 e OVA no QEMU
 cargo xtask os package --out b.crpkg --version 0.1.1 --build 1800000000  # outro pacote deste build
 ```
 
-A/B e atualização: seção "A/B e atualização segura (G1.6b)" abaixo. Parte seguinte: G1.6c
-(instalador ISO/USB, qcow2/OVA, FRR e firmware na imagem).
+A/B e atualização: seção "A/B e atualização segura (G1.6b)" abaixo. Instalador, imagens de VM e
+FRR: seção "Instalador, imagens de VM e FRR (G1.6c)" no fim.
 
 ## O que entra na imagem
 
@@ -27,7 +28,8 @@ A/B e atualização: seção "A/B e atualização segura (G1.6b)" abaixo. Parte 
 | Kernel | Linux **6.18.59** LTS (suporte projetado até dez/2028), `x86_64_defconfig` + fragmento; SHA-256 do `sha256sums.asc` assinado do kernel.org, conferido pelo Buildroot e de novo pelo xtask | `os/board/x86_64/linux.fragment`, `os/patches/linux/linux.hash` |
 | Init | `corerouter-init` (Rust, este workspace) | `apps/corerouter-init` |
 | Roteador | `corerouter-daemon --backend linux --config-dir /config --control 7979 --listen 0.0.0.0:8729` | `os/package/corerouter` |
-| Espaço de usuário | `nft` sem JSON (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
+| Espaço de usuário | `nft` sem JSON e sem CLI interativa (só diagnóstico no shell de manutenção: o hal-linux fala nfnetlink, G2.8), glibc, busybox (só para o shell de manutenção) | defconfig |
+| Roteamento | FRR 10.3 (pacote do Buildroot): `mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`, `ospf6d`, `ldpd`, `bfdd`, iniciados pelo `corerouter-init`; sem `vtysh`, scripts nem bash (G1.6c) | defconfig, `post-build.sh` |
 
 Tudo que o roteador precisa no kernel é `=y` (sem módulos): eBPF/XDP com BTF e JIT sempre
 ligado, AF_XDP, nftables completo (NAT, conntrack, flowtable, fib, socket, synproxy), **VRF**
@@ -468,3 +470,225 @@ desenvolvimento do mesmo commit; o host tinha outras sessões rodando.
   na NVRAM, e o kernel na ESP não é assinado. Gap G1.6f.
 - **Instalador e imagens de VM** criando as entradas de boot na instalação: G1.6c (até lá, o
   primeiro boot de uma imagem gravada sobe sem verity, pelo fallback, e cria as entradas).
+
+## Instalador, imagens de VM e FRR (G1.6c)
+
+```sh
+cargo xtask os build          # também grava corerouter-install.iso, corerouter.qcow2 e corerouter.ova
+cargo xtask os install-test   # instala de CD e de USB num disco virtual, boota, confere; qcow2 e OVA
+```
+
+Saídas em `os/out/build/images/`:
+
+| Arquivo | Para quê |
+|---|---|
+| `corerouter-install.iso` | ISO híbrida: CD (El Torito UEFI) ou pendrive (`dd`, GPT com a partição EFI). Instala no disco do roteador |
+| `corerouter.qcow2` | KVM/Proxmox: o `disk.img` (já A/B) em qcow2 comprimido |
+| `corerouter.ova` | VMware/VirtualBox: OVF 1.0 + manifesto SHA-256 + VMDK streamOptimized |
+| `corerouter.crpkg` | o pacote de atualização (também dentro da ISO) |
+
+### Como o instalador funciona
+
+- **Um segundo kernel, não um bootloader.** O roteador boota sem bootloader (EFI stub, A/B por
+  `BootNext`), e a linha de comando embutida aponta para o `rootfs-a`. A ISO não pode usar essa
+  linha: num CD não há PARTUUID, e num disco com CoreRouter instalado o mesmo PARTUUID existiria
+  duas vezes. O pacote `os/package/corerouter-installer` compila o **mesmo** kernel (o mesmo
+  tarball e hash, o `.config` final da imagem) com `installer.fragment` por cima: outra linha de
+  comando (`corerouter.mode=install`, sem `root=`), um initramfs embutido e sem BTF. O
+  initramfs é uma lista do `gen_init_cpio` (donos e modos fixos: reprodutível) com o
+  `corerouter-init`, as bibliotecas que ele usa e as chaves públicas da imagem. Roda inteiro na
+  RAM: o pendrive pode sair depois.
+- **A ISO é escrita em Rust** (`crates/sysupdate/src/iso.rs`, `corerouter-image installer`):
+  ISO 9660 nível 2, El Torito com a entrada da plataforma EFI (0xEF) e, na área de sistema, MBR
+  protetor + GPT com uma partição EFI sobre a **mesma** imagem FAT (`efiboot.vfat`, do genimage).
+  Como CD, o firmware usa o El Torito; como disco (pendrive), a GPT. Sem xorriso nem GRUB.
+- **A carga** vai como arquivos da ISO: `INSTALL.JSON` (o layout lido do GPT do `disk.img` e o
+  SHA-256 de cada arquivo), `INSTALL.SIG` (assinatura Ed25519 do índice, com a mesma chave dos
+  pacotes), `COREROUTER.CRPKG` (o pacote: o rootfs vai para o slot A), `ESP.IMG` (a ESP sem os
+  blocos zerados do fim) e `CONFIG.IMG` (o ext4 vazio do `/config`, sem o fim zerado). O
+  instalador acha a mídia pelo volume id `COREROUTER_INSTALL` e lê os arquivos pelo diretório
+  raiz, direto do dispositivo (sem driver de ISO 9660).
+- **Gravação** (`crates/sysupdate/src/install.rs`): confere as duas assinaturas e o tamanho do
+  disco antes de escrever um byte; zera o primeiro e o último MiB (tabelas, rótulos de RAID/LVM
+  antigos); grava ESP, slot A e `/config` em fluxo (uma thread lê e calcula o SHA-256, outra
+  grava); `fsync`, descarta o cache e relê tudo em paralelo (ESP e `/config` pelo SHA-256, o slot
+  A recalculando a árvore do dm-verity contra o hash raiz assinado); **por último** a GPT
+  (primária e reserva), relida. Uma queda antes disso deixa um disco que o firmware não boota,
+  nunca um meio gravado que ele boota. O slot B fica para a primeira atualização.
+- **Entrada de boot:** `Boot####` "CoreRouter A" com a linha do slot (dm-verity, `corerouter.slot=a`,
+  `panic=10`) primeiro no `BootOrder`; uma "CoreRouter B" de instalação anterior sai. O primeiro
+  boot já é pelo dm-verity, e o disco instalado boota antes do pendrive que ficou espetado.
+- **Nunca grava sem confirmação nem na mídia.** A tabela mostra nome, tamanho, modelo, série,
+  barramento e o que o disco tem (vazio, GPT com as partições, CoreRouter). Não são oferecidos: a
+  mídia do instalador, drives ópticos, discos só de leitura, menores que a imagem ou com uma
+  imagem do instalador. Depois de escolher, o operador **digita o nome do disco**; outra coisa
+  volta sem gravar. O que foi digitado antes de cada pergunta é descartado. O alvo é aberto com
+  `O_EXCL` (recusado se algo o usa).
+- **Manter a configuração:** num disco com CoreRouter cuja partição `config` está no mesmo lugar,
+  o instalador pergunta se mantém (como o *keep old configuration* do Netinstall).
+- **Consoles:** VGA (`tty1`) e serial (`ttyS0`, 115200) ao mesmo tempo; a resposta vale do
+  console onde foi digitada.
+- **Endereço de gerência do primeiro boot:** o instalador pergunta (`eth0 192.0.2.10/24
+  192.0.2.1`, ou vazio) e grava `corerouter.mgmt=` na entrada do slot A. No primeiro boot o init
+  habilita a porta, aplica `ip.address.add` e a rota padrão pelo canal de controle e grava
+  `/config/.installer-mgmt-applied`: não reaplica depois (nem se a configuração for mantida numa
+  reinstalação). A atualização não leva o parâmetro para o slot B.
+- **Assistente de console** (`corerouter-init setup`): quando o roteador sobe sem endereço em
+  nenhuma porta (VM nova, disco sem `corerouter.mgmt=`), o console pede porta, endereço,
+  gateway e a senha do `admin` (sem ela o login pela rede é recusado), e aplica tudo como
+  comandos. A imagem não tem shell: sem isso, quem está no console de um roteador novo não podia
+  fazer nada.
+- **Instalação sem interação** só pelo hipervisor: `-fw_cfg
+  name=opt/org.corerouter/autoinstall,string=<json>` do QEMU, que nenhuma máquina física tem; o
+  JSON nomeia o disco duas vezes (`disk`, `confirm`), e `append` só aceita `console=`, `ip=` e
+  `corerouter.shell=`. É a flag do `install-test`.
+- **Só UEFI.** Ver a pesquisa abaixo.
+
+### FRR na imagem
+
+- **Pacote `frr` do Buildroot 2025.02.19 (FRR 10.3).** O G3.1 foi feito contra o 10.7.1; o
+  `install-test` confere que o hal-frr conversa com o 10.3: o serviço `frr` anexa, uma instância
+  BGP e um vizinho são aplicados e o estado da sessão vem do `bgpd` (`active`/`idle`), e depois
+  da reinstalação com a configuração mantida o daemon a reinstala no FRR novo ("running config
+  installed"). Ficar no pacote do Buildroot quer dizer correções de segurança junto com as
+  versões LTS do Buildroot, sem manter receita própria; um FRR mais novo é um
+  `FRR_OVERRIDE_SRCDIR` quando precisarmos (G3.x que exija ≥ 10.4).
+- **O `corerouter-init` inicia os daemons** (`mgmtd`, `zebra`, `staticd`, `bgpd`, `ospfd`,
+  `ospf6d`, `ldpd`, `bfdd`), em primeiro plano, com o mesmo backoff de reinício do daemon,
+  `-P 0` (sem vty TCP: só os sockets em `/var/run/frr`), log em `/var/log/frr-<daemon>.log` (com o
+  mesmo corte de 8 MiB) e `zebra -s 90000000` (buffer de netlink recomendado para tabela cheia).
+  Sem `watchfrr`/`frrinit.sh` (bash) nem `frr.conf`: a configuração mora no `/config` e chega
+  pelo hal-frr; os daemons sobem vazios e o daemon passa `--frr /var/run/frr`. Eles caem para o
+  usuário `frr` com as capacidades que precisam (`libcap`).
+- **Fora da imagem** (`post-build.sh`): `vtysh` (o único que liga readline), bash, readline,
+  ncurses, o runtime C++ que a toolchain copia, scripts Python e os daemons que o CoreRouter não
+  configura (rip, isis, pim, babel, eigrp, …). O `nft` deixa de ter CLI interativa (ela puxava
+  readline). Assim a imagem continua **sem GPL-3.0** (bash e readline são GPL-3.0). O `os build`
+  confere que todo ELF da imagem acha as bibliotecas que pede (uma remoção a mais falha o build).
+
+### Imagens de VM
+
+- **qcow2**: `qemu-img convert -c` (zlib) do `disk.img`, que já é a imagem instalada A/B. O
+  primeiro boot é pelo caminho de mídia removível e cria as entradas de boot (G1.6b).
+- **OVA** (`corerouter-image ova`): ustar com o `.ovf` primeiro, o `.mf` (SHA-256) e o disco
+  (DSP0243). VMDK streamOptimized pelo `qemu-img`. Máquina: 2 vCPUs, 1 GiB, SATA/AHCI, duas
+  e1000, `firmware=efi` (VMware). No VirtualBox, marcar "Enable EFI" depois de importar (o OVF não
+  tem como dizer isso ao VirtualBox sem o XML próprio dele).
+- **cloud-init: não agora.** O MikroTik CHR não usa cloud-init (sobe com DHCP na primeira porta);
+  o VyOS tem. Para o IP inicial, a configuração padrão de primeiro boot do G1.6d (cliente DHCP na
+  primeira porta, como o CHR) e o assistente de console resolvem Proxmox/VMware/VirtualBox; o
+  datasource NoCloud (o disco `cidata` do Proxmox) vira a gap G1.6h.
+
+### Pesquisa
+
+Fontes: [MikroTik Netinstall](https://help.mikrotik.com/docs/spaces/ROS/pages/24805390/Netinstall)
+e [pacote Netinstall v7](https://manual.mikrotik.com/docs/7.25/getting-started/installation-and-upgrade/netinstall/netinstall-package),
+[MikroTik CHR](https://help.mikrotik.com/docs/spaces/ROS/pages/18350234/Cloud+Hosted+Router+CHR),
+[VyOS: install](https://docs.vyos.io/en/rolling/_sources/installation/install.rst.txt),
+[Talos: ISO](https://docs.siderolabs.com/talos/v1.13/platform-specific-installations/bare-metal-platforms/iso),
+[OPNsense: instalação (Thomas-Krenn)](https://www.thomas-krenn.com/en/wiki/Install_OPNsense) e
+[Dasharo/Protectli](https://docs.dasharo.com/unified/protectli/os-installation-opnsense/),
+[AWS: boot UEFI/BIOS](https://aws.amazon.com/about-aws/whats-new/2023/03/amazon-ec2-create-amis-boot-uefi-legacy-bios),
+[UEFI 2.10 §5.3 (GPT) e §13.3 (El Torito)](https://uefi.org/specs/UEFI/2.10/),
+ECMA-119 (ISO 9660), El Torito 1.0, [DMTF DSP0243 (OVF)](https://www.dmtf.org/standards/ovf),
+[FRR: zebra `-s`](https://docs.frrouting.org/en/latest/zebra.html), manual do Buildroot
+(`<pkg>_DL_SUBDIR`, `<pkg>-rebuild`).
+
+| Sistema | Como instala | O que tiramos |
+|---|---|---|
+| **MikroTik Netinstall** | Pela rede (PXE/BOOTP) de um PC; *keep old configuration*; *configure script* que vira a configuração padrão; script de modo de uma vez (7.22+) | Manter a configuração; um ajuste de primeiro boot de uma vez (`corerouter.mgmt=`) |
+| **MikroTik CHR** | Imagens prontas (raw, VMDK, VHDX, qcow2/OVA); DHCP na primeira porta; sem cloud-init | Imagens de VM já instaladas; o IP inicial pelo G1.6d |
+| **VyOS** | Boota a ISO viva, `install image`: confirmação [y/N], nome da imagem, disco ≥ 2 GB, tamanho da raiz; cloud-init nas imagens de nuvem | Assistente no console; disco mínimo recusado; confirmação |
+| **OPNsense/pfSense** | Login `installer` na ISO, escolhe ZFS/UFS, escolhe o disco e **confirma de novo** | Duas etapas: escolher e confirmar |
+| **Talos** | ISO metal (BIOS e UEFI no x86; a de Secure Boot só UEFI); o instalador grava a imagem inteira | Imagem inteira e só leitura; o instalador é o próprio sistema |
+| **Flatcar** | `flatcar-install -d /dev/sdX` (exige o disco por nome) | Disco por nome, sem padrão |
+| **Junos/IOS-XE** | Mídia de instalação/USB de recuperação, `request system snapshot`/`install` | Mídia separada do sistema instalado |
+
+**Adotado:** ISO viva que roda da RAM (VyOS, Talos), disco escolhido e **nome digitado**
+(mais forte que o [y/N] do VyOS e a segunda confirmação do OPNsense: digitar o nome não sai
+por reflexo), manter a configuração (Netinstall), ajuste de primeiro boot aplicado uma vez
+(script de modo do Netinstall), imagens de VM prontas (CHR), assistente de console.
+
+**Melhor que os outros (o que o motor permite):** o instalador confere assinatura (índice e
+pacote) antes de escrever e **relê tudo** do disco (o VyOS e o Netinstall não releem); a GPT é
+o último passo; o primeiro boot já sobe no dm-verity pela entrada criada; o IP de gerência e o
+assistente são **comandos** pelo canal de controle (journal, mesmas validações do CLI/MCP); a
+instalação sem interação só existe dentro do hipervisor (fw_cfg), então um pendrive esquecido
+num roteador nunca apaga um disco sozinho.
+
+**ISO: genimage × xorriso × Rust.** O tipo `iso` do genimage chama o `genisoimage` (cdrkit)
+e não monta a GPT híbrida que o pendrive UEFI precisa. O xorriso está no
+Buildroot (`host-xorriso`, 1.5.4, GPL-3.0, download extra) e faz tudo, mas o Buildroot só o
+usa com GRUB/isolinux. Escrever a ISO em Rust deu ~540 linhas com testes (o leitor que o
+instalador usa vem junto), saída idêntica entre builds, sem download nem ferramenta GPL-3.0 no
+build. **Adotado: Rust**; o `file`, o `sfdisk` e o OVMF (CD e USB) aceitam a imagem.
+
+**BIOS legado: não agora.** A imagem instalada só boota por UEFI (EFI stub, A/B por
+`BootOrder`/`BootNext`, G1.6b); BIOS exigiria um bootloader (GRUB ou syslinux) e outro esquema
+de A/B só para ele. Quem ainda precisa: o Proxmox cria VMs com SeaBIOS por padrão (OVMF é uma
+opção na criação), algumas nuvens bootam imagens próprias por BIOS (a AWS só passou a aceitar
+imagem que boota nos dois em 2023), e servidores antigos sem UEFI. O Talos ainda faz ISO BIOS +
+UEFI no x86. Servidores atuais têm UEFI (e há fornecedores que já desligam o CSM). Fica a gap G1.6g, com o número do custo: um bootloader na
+ESP e o A/B por variável dele.
+
+**OVA:** `qemu-img` (VMDK streamOptimized, o único que uma OVA pode levar) + OVF e tar escritos
+em Rust (`corerouter-image ova`), datas fixas: o OVA é reprodutível.
+
+### Desempenho e paralelismo
+
+- **Gravação em fluxo:** o instalador usa o `package::copy` do G1.6b: uma thread lê da mídia e
+  calcula o SHA-256, outra grava (4 buffers de 1 MiB em voo). Conferir o hash **durante** a
+  gravação é o hash da origem em trânsito; a releitura do disco só pode vir depois do `fsync` e
+  do descarte do cache (senão confere a RAM, não o disco).
+- **Releitura em paralelo:** uma thread por região (ESP, slot A, `/config`), e a árvore do
+  dm-verity do slot A em N threads (G1.6b). Medido no bench `install` (ISO em memória → arquivo,
+  20 MiB de ESP, 20 MiB de rootfs, 64 MiB de `/config`, 109 MiB gravados; máquina compartilhada,
+  ±10%): sequencial e releitura serial **158 ms**; em fluxo e serial **127 ms**; sequencial e
+  releitura paralela **109 ms**; em fluxo e paralela **121 ms** (empate com o anterior dentro do
+  ruído). Os dois juntos ficam ligados: num disco real, com a mídia mais lenta que o disco (USB 2,
+  CD), o fluxo é o que esconde a leitura da mídia.
+- **No QEMU** (KVM, virtio, ISO como CD): 104 MiB gravados em 70–130 ms, relidos em 30–38 ms,
+  instalação inteira 0,1–0,3 s; do QEMU ligado ao desligado depois de instalar, **2,1–2,5 s**
+  (o firmware é ~1,5 s). Reinstalar mantendo a configuração grava 40 MiB em 35 ms.
+- **FRR no boot:** os 8 daemons sobem em paralelo com o daemon do CoreRouter (o init não espera
+  um pelo outro: o hal-frr reanexa quando os sockets aparecem). Kernel → daemon pronto
+  0,75–0,82 s (era 0,69–1,20 s sem FRR), kernel → os 8 sockets vty do FRR 0,77–0,78 s.
+- **Memória:** ociosa 93–98 MiB (era 48–58 MiB); RSS do FRR: mgmtd 11,5, zebra 14, staticd 8,
+  bgpd 17, ospfd 10,7, ospf6d 10, ldpd 8, bfdd 8,5 MiB (com as bibliotecas compartilhadas
+  contadas em cada um). Subir só os daemons configurados é a gap G1.6i.
+
+### Números
+
+**Medidos** em 2026-10-27, AMD Ryzen AI Max+ 395, KVM, 2 vCPUs, 1 GiB, build do mesmo commit, com
+outras sessões usando a máquina.
+
+| O quê | Valor |
+|---|---|
+| `rootfs.squashfs` com FRR | **19,3 MiB** (era 14,4–14,9 MiB: FRR acrescenta ~4,5 MiB comprimidos) |
+| `corerouter.crpkg` | 38,5 MiB (era 34,1) |
+| Kernel do instalador (com o initramfs) | 18,3 MiB, num FAT de 30 MiB |
+| `corerouter-install.iso` | **96,2 MiB** (pacote 38,5 + ESP 19,4 + boot 30 + `/config` 8,2) |
+| `corerouter.qcow2` | **38,9 MiB** (disco virtual de 705 MiB) |
+| `corerouter.ova` | **38,8 MiB** |
+| Montar ISO + índice (`corerouter-image installer`) | 0,35–0,41 s |
+| qcow2 / OVA a partir do `disk.img` | 0,5 s / 0,8 s |
+| Instalar (gravar + reler + GPT) | 0,1–0,3 s; QEMU ligado → desligado 2,1–3,3 s |
+| Boot do disco instalado: kernel → daemon / → FRR | 0,76–0,82 s / 0,77–0,78 s |
+| qcow2 e OVA: QEMU ligado → daemon pronto | 2,0–2,1 s |
+| `cargo xtask os install-test` (6 boots, 3 instalações) | 33,2 s |
+| Rebuild incremental da imagem (com o kernel do instalador) | 32–49 s |
+
+### O que ficou de fora e por quê
+
+- **BIOS legado:** gap G1.6g (acima).
+- **cloud-init (NoCloud/`cidata`):** gap G1.6h; o IP inicial pelo G1.6d e pelo assistente.
+- **Só os daemons do FRR configurados** (hoje sobem os 8, ~88 MiB de RSS somado): gap G1.6i.
+- **`/config` do tamanho do resto do disco:** o layout é o do `disk.img` (64 MiB); crescer a
+  partição e o ext4 na instalação fica para quando o `/config` precisar (logs persistentes).
+- **Dois discos CoreRouter na mesma caixa:** os PARTUUIDs são fixos (a linha de comando embutida
+  do fallback aponta para o `rootfs-a`); o instalador recusa um disco com a imagem do
+  instalador, mas não um segundo CoreRouter. Anotado como risco.
+- **`linux-firmware` (pacote DDP da `ice`)**: não entrou; a `ice` segue em modo seguro (G1.6a).
+  Gap G1.6j.
+- **Senha do `admin` no instalador:** não vai na linha de comando (fica na NVRAM); o assistente
+  de console do primeiro boot a pede.
