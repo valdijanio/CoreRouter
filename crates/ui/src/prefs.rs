@@ -67,6 +67,7 @@ impl CoreRouterUi {
         json!({
             "theme": theme_name(self.theme),
             "inline_comments": inline,
+            "interfaces_hidden_columns": self.tables.interfaces.hidden_columns,
             "labels_lang": self.lang.labels.code(),
             "help_lang": self.lang.help.code(),
             "menu": self.menu.prefs(),
@@ -103,6 +104,13 @@ impl CoreRouterUi {
         }
         if let Some(r) = v.get("resources") {
             crate::resources::apply_prefs(self, r);
+        }
+        if let Some(cols) = v.get("interfaces_hidden_columns").and_then(Value::as_array) {
+            self.tables.interfaces.hidden_columns = cols.iter()
+                .filter_map(Value::as_str)
+                .filter(|name| crate::interfaces::hideable_column(name))
+                .map(str::to_owned)
+                .collect();
         }
         if let Some(list) = v.get("inline_comments").and_then(Value::as_array) {
             let panels = self.panels.iter_mut().flatten().flat_map(|p| p.tables_mut());
@@ -223,6 +231,9 @@ mod tests {
         assert_eq!(a.theme(), ThemePreference::System);
         a.set_theme(ThemePreference::Light);
         a.tables.addresses.inline_comments = true;
+        a.tables.interfaces.inline_comments = true;
+        a.tables.interfaces.hidden_columns.insert("MTU".into());
+        a.tables.interfaces.hidden_columns.insert("Comment".into());
         a.lang.labels = Lang::Pt;
         a.lang.help = Lang::En;
         let saved = a.prefs();
@@ -231,9 +242,19 @@ mod tests {
         b.apply_prefs(&saved);
         assert_eq!(b.theme(), ThemePreference::Light);
         assert!(b.tables.addresses.inline_comments);
-        assert!(!b.tables.interfaces.inline_comments);
+        assert!(b.tables.interfaces.inline_comments);
+        assert!(b.tables.interfaces.hidden_columns.contains("MTU"));
+        assert!(b.tables.interfaces.hidden_columns.contains("Comment"));
         assert_eq!((b.lang.labels, b.lang.help), (Lang::Pt, Lang::En));
         assert_eq!(b.prefs(), saved);
+    }
+
+    #[test]
+    fn interface_columns_reject_unknown_and_required_columns() {
+        let mut a = app();
+        a.apply_prefs(r#"{"interfaces_hidden_columns":["Name","MTU","not-a-column",42]}"#);
+        assert_eq!(a.tables.interfaces.hidden_columns.len(), 1);
+        assert!(a.tables.interfaces.hidden_columns.contains("MTU"));
     }
 
     #[test]

@@ -2596,7 +2596,9 @@ mod tests {
                 // A selected item's comment takes the selection's text colour.
                 h.click(h.row("ether5"));
                 assert_eq!(h.text_color("reserva"), v.selection.stroke.color, "{why}");
-                h.click(h.row("ether5") + egui::vec2(0.0, 200.0));
+                // The summary below the table takes some of the old empty
+                // area; clear the selection in the remaining table space.
+                h.click(h.row("ether8") + egui::vec2(0.0, 25.0));
                 assert!(h.selected().is_empty());
             }
         }
