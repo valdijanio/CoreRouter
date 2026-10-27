@@ -3,22 +3,42 @@
 
 /// Labels: (English, Portuguese).
 pub(super) const LABELS: &[(&str, &str)] = &[
+    ("95th pct", r##"Percentil 95"##),
+    ("A dynamic queue comes from a session, a DHCP lease or a DHCP network: change its rate there.", r##"Uma fila dinâmica vem de uma sessão, de um lease ou de uma rede do DHCP: mude a taxa lá."##),
     ("Addresses", r##"Endereços"##),
+    ("Advanced", r##"Avançado"##),
+    ("At Limit", r##"No limite"##),
+    ("Average", r##"Média"##),
     ("BFIFO Limit", r##"Limite BFIFO"##),
     ("Bucket Size", r##"Tamanho do balde"##),
+    ("Burst", r##"Rajada"##),
+    ("Burst Average", r##"Média da rajada"##),
     ("Burst Limit", r##"Limite de rajada"##),
     ("Burst Threshold", r##"Limiar de rajada"##),
     ("Burst Time", r##"Tempo de rajada"##),
+    ("Bytes", r##"Bytes"##),
     ("CAKE RTT", r##"RTT do CAKE"##),
+    ("CSV", r##"CSV"##),
+    ("Current", r##"Atual"##),
+    ("Day", r##"Dia"##),
     ("Disabled", r##"Desativada"##),
+    ("Download", r##"Download"##),
+    ("Download Mode", r##"Modo de download"##),
     ("Drops", r##"Descartes"##),
+    ("Drops/s", r##"Descartes/s"##),
     ("FQ-CoDel ECN", r##"ECN do FQ-CoDel"##),
     ("FQ-CoDel Interval", r##"Intervalo do FQ-CoDel"##),
     ("FQ-CoDel Target", r##"Alvo do FQ-CoDel"##),
+    ("General", r##"Geral"##),
+    ("History", r##"Histórico"##),
+    ("Hour", r##"Hora"##),
     ("IPv6 Mask", r##"Máscara IPv6"##),
+    ("Keep History", r##"Guardar histórico"##),
+    ("Kept from now on: the first points come within a minute.", r##"Guardado a partir de agora: os primeiros pontos chegam em até um minuto."##),
     ("Kind", r##"Tipo"##),
     ("Limit At", r##"Garantido"##),
     ("Max Limit", r##"Limite máximo"##),
+    ("Maximum", r##"Máximo"##),
     ("Name", r##"Nome"##),
     ("New Per-IP Limit", r##"Novo limite por IP"##),
     ("New Per-IP Limit…", r##"Novo limite por IP…"##),
@@ -26,30 +46,60 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("New Queue Type…", r##"Novo tipo de fila…"##),
     ("New Simple Queue", r##"Nova fila simples"##),
     ("New Simple Queue…", r##"Nova fila simples…"##),
+    ("Not kept: the history would pass the graphing memory cap (Graphs → Settings).", r##"Não guardado: o histórico passaria do teto de memória dos gráficos (Graphs → Settings)."##),
     ("Origin", r##"Origem"##),
+    ("PCQ Addresses", r##"Endereços PCQ"##),
     ("PCQ Classifier", r##"Classificador PCQ"##),
     ("PCQ IPv6 Mask", r##"Máscara IPv6 do PCQ"##),
     ("PCQ Rate", r##"Taxa PCQ"##),
     ("PFIFO Limit", r##"Limite PFIFO"##),
+    ("Packet Rate", r##"Taxa de pacotes"##),
+    ("Packets", r##"Pacotes"##),
+    ("Pause", r##"Pausar"##),
     ("Per-IP (PCQ)", r##"Por IP (PCQ)"##),
     ("Per-IP Limit", r##"Limite por IP"##),
     ("Priority", r##"Prioridade"##),
+    ("Queue", r##"Fila"##),
     ("Queue (ms)", r##"Fila (ms)"##),
+    ("Queue Delay", r##"Atraso na fila"##),
     ("Queue Type", r##"Tipo de fila"##),
     ("Queue Types", r##"Tipos de fila"##),
+    ("Queued", r##"Espera na fila"##),
+    ("Queued p95", r##"Espera p95"##),
     ("Queues", r##"Filas"##),
     ("Rate", r##"Taxa"##),
     ("Rate Each", r##"Taxa de cada"##),
+    ("Resume", r##"Continuar"##),
     ("Settings", r##"Ajustes"##),
     ("Simple Queue", r##"Fila simples"##),
     ("Simple Queues", r##"Filas simples"##),
+    ("Sniffer", r##"Sniffer"##),
+    ("Statistics", r##"Estatísticas"##),
     ("Target", r##"Alvo"##),
+    ("This queue's history is not kept. Turn on Keep History to record it (the live Traffic tab works without it).", r##"O histórico desta fila não é guardado. Ligue Guardar histórico para gravá-lo (a aba Traffic ao vivo funciona sem ele)."##),
+    ("Torch", r##"Torch"##),
+    ("Traffic", r##"Tráfego"##),
+    ("Upload", r##"Upload"##),
     ("Used By", r##"Usado por"##),
+    ("Waiting for the router…", r##"Esperando o roteador…"##),
+    ("Week", r##"Semana"##),
+    ("Window", r##"Janela"##),
+    ("at limit", r##"no limite"##),
     ("built-in", r##"embutido"##),
+    ("bursting", r##"em rajada"##),
     ("dynamic", r##"dinâmicas"##),
     ("fixed", r##"fixas"##),
+    ("in total", r##"no total"##),
+    ("left", r##"restantes"##),
+    ("max-limit", r##"max-limit"##),
+    ("near limit", r##"perto do limite"##),
+    ("no limit", r##"sem limite"##),
+    ("of", r##"de"##),
+    ("off", r##"desligada"##),
     ("per-IP limits", r##"limites por IP"##),
     ("queues", r##"filas"##),
+    ("ready", r##"pronta"##),
+    ("spent", r##"esgotada"##),
     ("types", r##"tipos"##),
     ("with warnings", r##"com avisos"##),
 ];
@@ -166,7 +216,7 @@ Selo **D** = dinâmica: não se edita aqui, muda-se na origem. Uma dinâmica ven
     ),
     (
         "queues.simple.rate",
-        r##"Taxa no último segundo, `subida/descida`, medida pelos contadores do plano de dados."##,
+        r##"Taxa no último segundo, `subida/descida`, medida pelos contadores do plano de dados. O selo **near limit** (ícone de medidor) (perto do limite) aparece quando um dos sentidos está a 90 % do max-limit ou mais: o plano do cliente virou o gargalo. Abra a fila (duplo clique) para ver há quanto tempo, o atraso e os descartes."##,
     ),
     (
         "queues.simple.target",
@@ -249,4 +299,65 @@ Na descida o shaper EDT põe cada pacote na hora certa; o tipo decide quando des
         "queues.type.used_by",
         r##"As filas e os perfis PPP que usam este tipo. Um tipo em uso não pode ser removido nem renomeado."##,
     ),
+    ("queues.view", r##"## O que é
+A janela de uma fila só (duplo clique numa linha), como a do WinBox: **General** e **Advanced** são os ajustes (só leitura numa fila dinâmica: mude na origem), **Traffic** o tráfego ao vivo, **Statistics** os contadores e **History** o histórico de hora, dia e semana.
+
+## Custo
+Enquanto ela está aberta, o roteador é consultado sobre **esta fila** uma vez por segundo (`queue.simple.stats`), sem percorrer as outras; fechada, nada roda."##),
+    ("queues.view.advanced", r##"O garantido (limit-at), a prioridade, o tamanho do balde, o tipo de fila e **Guardar histórico**. O limit-at e a prioridade valem quando houver a árvore de filas (G4.9e)."##),
+    ("queues.view.at_limit", r##"Há quantos segundos seguidos a fila está a 95 % do max-limit ou mais. A partir de 10 s aparece o selo **no limite**: o plano do cliente é o gargalo."##),
+    ("queues.view.burst_average", r##"A média da taxa no burst-time contra o burst-threshold (0 = o max-limit). Entre parênteses, quantos segundos da janela já foram lidos desde que esta janela abriu."##),
+    ("queues.view.burst_state", r##"## Estados
+- **pronta**: a média está abaixo do burst-threshold; a fila pode passar do max-limit até o burst-limit.
+- **em rajada**: está passando do max-limit agora; ao lado, quantos segundos restam até a média alcançar o limiar.
+- **esgotada**: a média passou do limiar; a fila volta ao max-limit até a média baixar.
+- **desligada**: sem burst-limit.
+
+## Como é calculado
+Como no RouterOS: média da taxa no burst-time contra o burst-threshold. A média aqui vem das leituras de 1 s com a janela aberta (estimada; o plano de dados tem o relógio exato)."##),
+    ("queues.view.bytes", r##"Bytes contados pela fila desde que ela foi instalada no plano de dados (zera quando a fila é recriada)."##),
+    ("queues.view.csv", r##"Salva os pontos da janela mostrada (hora UTC, Unix, upload e download em bits/s, atraso em ms, descartes/s) num arquivo CSV."##),
+    ("queues.view.delay", r##"Quanto um pacote que entra agora na fila de download espera até sair, e o **p95** dos últimos 5 minutos. Alguns ms é normal numa fila no limite; dezenas de ms indicam bufferbloat (o CoDel do fq-codel/cake segura isso)."##),
+    ("queues.view.download", r##"O que chega ao alvo agora (bits/s) e quanto isso é do max-limit de download. O download é **moldado**: o que passa do limite espera na fila (e só é descartado se a fila encher)."##),
+    ("queues.view.download_mode", r##"Como o download desta sessão é limitado: **shaper** (fila: espera e sai no ritmo) ou **policer** (descarta o excesso). Vem do perfil PPP."##),
+    ("queues.view.dropped", r##"Pacotes descartados desde o início: no download quando a fila encheu ou o CoDel descartou; no upload quando passaram do policer. Entre parênteses, a fração de todos os pacotes."##),
+    ("queues.view.drops", r##"Pacotes descartados por segundo (os dois sentidos) e o total. Numa fila no limite, descartar é o esperado: é assim que o TCP do cliente aprende a taxa. O selo **no limite** aparece quando a fila fica acima de 95 % do max-limit por 10 s seguidos."##),
+    ("queues.view.general", r##"Nome, alvo, limite máximo e a rajada (burst) da fila. Numa fila dinâmica (sessão PPPoE/IPoE, lease ou rede do DHCP) os valores vêm do perfil, do RADIUS ou do DHCP e aparecem só para leitura."##),
+    ("queues.view.history", r##"## O que mostra
+O histórico da fila em **hora** (1 s), **dia** (1 min) e **semana** (5 min), com o máximo de cada intervalo e o **p95** (o valor que o tráfego passa só 5 % do tempo, o que se cobra num link).
+
+## Quando existe
+Só para as filas cujo histórico é guardado: as fixas (por padrão) e as dinâmicas que você marcar (**Guardar histórico**). Com 10 mil assinantes, guardar todos custaria GBs de memória (~440 KiB por fila); por isso as dinâmicas vêm desligadas."##),
+    ("queues.view.history.avg", r##"A média do intervalo."##),
+    ("queues.view.history.current", r##"O último valor do intervalo."##),
+    ("queues.view.history.max", r##"O maior valor do intervalo (o pico de cada ponto, não só a média)."##),
+    ("queues.view.history.p95", r##"O valor que o tráfego passa só 5 % do tempo no intervalo: ignora os picos curtos; é o que se usa para cobrar um link."##),
+    ("queues.view.keep", r##"## O que faz
+Guarda o histórico desta fila nos gráficos (`queue:<nome>`: taxas, descartes e atraso), para a aba History e para exportar.
+
+## Padrão
+Ligado nas filas fixas, desligado nas dinâmicas. Numa dinâmica a marca fica pelo nome (`<pppoe-ana>`): o cliente que reconecta continua no mesmo histórico.
+
+## Custo
+~440 KiB por fila (um ano de pontos), dentro do teto de memória dos gráficos; o que não couber fica de fora e aparece em Graphs → Settings."##),
+    ("queues.view.packets", r##"Pacotes contados pela fila desde que ela foi instalada no plano de dados."##),
+    ("queues.view.pause", r##"Congela o gráfico para olhar com calma. Os pontos continuam chegando por trás; Continuar volta ao agora."##),
+    ("queues.view.pcq", r##"Numa fila com tipo PCQ: quantos endereços (sub-fluxos) estão ativos agora, cada um com o seu limite."##),
+    ("queues.view.pps", r##"Pacotes por segundo, da diferença entre duas leituras dos contadores (aparece depois de dois segundos com a janela aberta)."##),
+    ("queues.view.queued", r##"Quanto um pacote que entra agora espera na fila (só o download tem fila; o upload é policiado)."##),
+    ("queues.view.queued_p95", r##"O p95 da espera nos últimos 5 minutos em que a janela esteve aberta: 95 % do tempo a espera ficou abaixo disso."##),
+    ("queues.view.rate", r##"Bits por segundo no último segundo, em cada sentido (upload = o que o alvo manda; download = o que ele recebe)."##),
+    ("queues.view.span", r##"O intervalo do histórico: a última hora (ponto de 1 s), o último dia (1 min) ou a última semana (5 min)."##),
+    ("queues.view.statistics", r##"Os contadores da fila em cada sentido: taxa, pacotes por segundo, bytes e pacotes desde o início, descartes (e a fração dos pacotes), a espera agora e o seu p95 dos últimos 5 min, há quanto tempo está no limite e o estado da rajada. Numa fila PCQ, quantos endereços estão ativos."##),
+    ("queues.view.tools", r##"Abre o **Torch** (quem está usando a banda agora, por fluxo) ou o **Sniffer** (captura de pacotes) já com o endereço do alvo desta fila e, numa sessão, a sua interface."##),
+    ("queues.view.traffic", r##"## O que mostra
+O tráfego da fila ao vivo, um ponto por segundo, nos últimos 1, 5 ou 15 minutos: **download** em azul e **upload** em vermelho, com o **max-limit** de cada lado tracejado.
+
+## Como ler
+Uma linha encostada no tracejado é uma fila **no limite**: o cliente quer mais do que o plano. O atraso na fila e os descartes dizem se isso está doendo (espera alta, descartes subindo).
+
+## De onde vem
+Dos contadores do plano de dados, lidos uma vez por segundo pelo serviço `queue`; os pontos ficam nesta janela (e o roteador guarda os últimos 15 min desta fila enquanto alguém olha)."##),
+    ("queues.view.upload", r##"O que o alvo manda agora (bits/s) e quanto isso é do max-limit de upload. O upload é **policiado**: o que passa do limite é descartado na entrada, sem fila."##),
+    ("queues.view.window", r##"Quantos minutos o gráfico mostra: 1, 5 ou 15. A janela guarda os últimos 15 min, então trocar não perde pontos."##),
 ];

@@ -33,6 +33,7 @@ pub mod rrd;
 use std::collections::{BTreeMap, BTreeSet};
 
 use corerouter_hal::LinkState;
+use corerouter_hal::queue::QueueCounters;
 use corerouter_hal::resources::Resources;
 use corerouter_model::IfName;
 use corerouter_model::graphing::Graphing;
@@ -56,6 +57,9 @@ pub const MAX_SERIES: usize = 4096;
 pub const SYSTEM: &str = "system";
 /// Prefix of an interface's series key (`interface:ether1`).
 pub const INTERFACE: &str = "interface:";
+/// Prefix of a queue's series key (`queue:camera`, `queue:<pppoe-ana>`,
+/// G4.9g).
+pub const QUEUE: &str = "queue:";
 
 /// What one value of a series means: its key, unit and whether it is a
 /// rate that adds up to a total.
@@ -93,13 +97,63 @@ pub const SYSTEM_SOURCES: [Source; 3] = [
     src("conntrack", "entries", None, 0.0),
 ];
 
+/// A queue's values (G4.9g): its rates each way (`up` = from the target),
+/// drops per second (both ways) and how long a packet entering the
+/// download queue waits, ms.
+pub const QUEUE_SOURCES: [Source; 4] = [
+    src("up_bps", "bps", Some("up_bytes"), 0.125),
+    src("down_bps", "bps", Some("down_bytes"), 0.125),
+    src("drops", "/s", Some("drops"), 1.0),
+    src("delay", "ms", None, 0.0),
+];
+
 /// The values of series `key`.
 pub fn sources(key: &str) -> &'static [Source] {
     if key == SYSTEM {
         &SYSTEM_SOURCES
+    } else if key.starts_with(QUEUE) {
+        &QUEUE_SOURCES
     } else {
         &INTERFACE_SOURCES
     }
+}
+
+/// The series key of the queue named `name`; `None` when it does not fit
+/// a series header ([`rrd::KEY_BYTES`]).
+pub fn queue_key(name: &str) -> Option<String> {
+    let key = format!("{QUEUE}{name}");
+    (key.len() <= rrd::KEY_BYTES && !name.is_empty()).then_some(key)
+}
+
+/// A queue name in a file name: letters, digits, `.`, `_` and `-` as they
+/// are, any other byte as `%XX` (names may hold `<`, `>`, spaces).
+fn escape(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+            out.push(char::from(b));
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn unescape(text: &str) -> Option<String> {
+    let mut out = Vec::with_capacity(text.len());
+    let mut bytes = text.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = char::from(bytes.next()?).to_digit(16)?;
+            let lo = char::from(bytes.next()?).to_digit(16)?;
+            out.push(u8::try_from(hi * 16 + lo).ok()?);
+        } else if b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-') {
+            out.push(b);
+        } else {
+            return None;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// File name of series `key`: `system.rrd`, `interface-ether1.rrd`
@@ -107,6 +161,9 @@ pub fn sources(key: &str) -> &'static [Source] {
 pub fn file_name(key: &str) -> Option<String> {
     if key == SYSTEM {
         return Some("system.rrd".into());
+    }
+    if let Some(q) = key.strip_prefix(QUEUE) {
+        return queue_key(q).map(|_| format!("queue-{}.rrd", escape(q)));
     }
     let name: IfName = key.strip_prefix(INTERFACE)?.parse().ok()?;
     Some(format!("interface-{name}.rrd"))
@@ -117,6 +174,9 @@ pub fn key_of_file(file: &str) -> Option<String> {
     let stem = file.strip_suffix(".rrd")?;
     if stem == SYSTEM {
         return Some(SYSTEM.into());
+    }
+    if let Some(q) = stem.strip_prefix("queue-") {
+        return queue_key(&unescape(q)?);
     }
     let name: IfName = stem.strip_prefix("interface-")?.parse().ok()?;
     Some(format!("{INTERFACE}{name}"))
@@ -159,6 +219,9 @@ struct Kept {
     new: bool,
     /// Since when nothing keeps it (dropped after [`GRACE`]).
     unkept_since: Option<u64>,
+    /// A queue's (G4.9g): the second it was last kept, and its dropped
+    /// packets then (drops per second are the difference).
+    queue_seen: Option<(u64, u64)>,
 }
 
 /// The counters of an interface at a time: rx/tx bytes, rx/tx packets,
@@ -175,6 +238,8 @@ pub struct GraphDb {
     series: BTreeMap<String, Kept>,
     /// Interfaces that would be kept but do not fit under the cap.
     refused: BTreeSet<IfName>,
+    /// Queues likewise (G4.9g): how many, the last second.
+    refused_queues: usize,
     readings: BTreeMap<IfName, Reading>,
     resources: Option<(u64, Resources)>,
     /// Files to delete at the next store.
@@ -249,6 +314,7 @@ impl GraphDb {
                 rrd,
                 new: false,
                 unkept_since: None,
+                queue_seen: None,
             },
         );
         Ok(())
@@ -381,6 +447,10 @@ impl GraphDb {
         let polled = links.iter().any(|l| l.live.is_some());
         let mut drop = Vec::new();
         for (key, kept) in &mut self.series {
+            if key.starts_with(QUEUE) {
+                // `sample_queues` keeps those.
+                continue;
+            }
             if kept_now.contains(key) {
                 kept.unkept_since = None;
             } else if polled || !key.starts_with(INTERFACE) {
@@ -406,6 +476,94 @@ impl GraphDb {
         log
     }
 
+    /// One second of the queues' history (G4.9g): `kept` are the queues
+    /// kept now (series key and counters). A queue not in it for
+    /// [`GRACE`] seconds is dropped (a session that reconnects within it
+    /// goes on in the same series). Returns lines for the log.
+    ///
+    /// Once a second under the session lock, so nothing is allocated per
+    /// queue: 10 000 queues past the cap cost 1,8 ms a second when their
+    /// names were collected (**medido**, G4.9g).
+    pub fn sample_queues(&mut self, now: u64, cfg: &Graphing, kept: &[(&str, QueueCounters)]) -> Vec<(bool, String)> {
+        let mut log = Vec::new();
+        let cap = cfg.max_memory_bytes();
+        let size = Rrd::size_for(QUEUE_SOURCES.len()) as u64;
+        let mut used = self.memory_bytes();
+        let mut refused = 0usize;
+        let mut first_refused: Option<&str> = None;
+        for (key, c) in kept {
+            if !self.series.contains_key(*key) {
+                if used.saturating_add(size) > cap || self.series.len() >= MAX_SERIES {
+                    refused += 1;
+                    first_refused.get_or_insert(key);
+                    continue;
+                }
+                used += size;
+                self.series.insert(
+                    (*key).to_owned(),
+                    Kept {
+                        rrd: Rrd::new(key, QUEUE_SOURCES.len()),
+                        new: self.persistent,
+                        unkept_since: None,
+                        queue_seen: None,
+                    },
+                );
+            }
+            let Some(k) = self.series.get_mut(*key) else { continue };
+            let dropped = c.dropped.iter().fold(0u64, |a, b| a.saturating_add(*b));
+            let drops = match k.queue_seen.replace((now, dropped)) {
+                Some((t, d)) if now > t && now - t <= HEARTBEAT && dropped >= d => (dropped - d) as f32 / (now - t) as f32,
+                _ => f32::NAN,
+            };
+            let [up, down] = c.rate_bps;
+            let delay = c.queued_us[QueueCounters::DOWNLOAD] as f32 / 1000.0;
+            k.unkept_since = None;
+            k.rrd.update(now, &[up as f32, down as f32, drops, delay]);
+        }
+        // One line when more are refused: 10 000 queues past the cap is
+        // not 10 000 lines.
+        if refused > self.refused_queues {
+            let first = first_refused.and_then(|k| k.strip_prefix(QUEUE)).unwrap_or_default();
+            log.push((
+                true,
+                format!(
+                    "graphing: {refused} queue{} not kept ({first}…), the history would pass max-memory {} MiB",
+                    if refused == 1 { "" } else { "s" },
+                    cfg.max_memory_mib
+                ),
+            ));
+        }
+        self.refused_queues = refused;
+        let mut drop = Vec::new();
+        for (key, k) in self.series.range_mut::<str, _>((std::ops::Bound::Included(QUEUE), std::ops::Bound::Unbounded)) {
+            if !key.starts_with(QUEUE) {
+                break;
+            }
+            if k.queue_seen.is_some_and(|(t, _)| t == now) {
+                continue;
+            }
+            let since = *k.unkept_since.get_or_insert(now);
+            if now.saturating_sub(since) >= GRACE {
+                drop.push(key.clone());
+            }
+        }
+        for key in drop {
+            self.series.remove(&key);
+            if self.persistent
+                && let Some(f) = file_name(&key)
+            {
+                self.removed.push(f);
+            }
+            log.push((false, format!("graphing: history of {key} dropped (no longer kept)")));
+        }
+        log
+    }
+
+    /// How many queues would be kept but did not fit under the cap.
+    pub fn refused_queues(&self) -> usize {
+        self.refused_queues
+    }
+
     /// Whether series `key` is (now) kept under the cap.
     fn admit(&mut self, key: &str, cap: u64, used: &mut u64) -> bool {
         if self.series.contains_key(key) {
@@ -422,6 +580,7 @@ impl GraphDb {
                 rrd: Rrd::new(key, sources(key).len()),
                 new: self.persistent,
                 unkept_since: None,
+                queue_seen: None,
             },
         );
         true
@@ -512,9 +671,11 @@ impl GraphDb {
         json!({
             "series": kept,
             "refused": self.refused,
+            "refused_queues": self.refused_queues,
             "memory_bytes": self.memory_bytes(),
             "max_memory_bytes": cfg.max_memory_bytes(),
             "series_bytes": Rrd::size_for(INTERFACE_SOURCES.len()),
+            "queue_series_bytes": Rrd::size_for(QUEUE_SOURCES.len()),
             "tiers": rrd::TIERS.iter().map(|t| json!({"step": t.step, "rows": t.rows, "window": t.window()})).collect::<Vec<_>>(),
             "disk": self.disk,
         })

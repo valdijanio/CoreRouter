@@ -206,3 +206,17 @@ fn file_names_round_trip() {
     assert_eq!(key_of_file("interface-..rrd"), None);
     assert_eq!(key_of_file("other.txt"), None);
 }
+
+#[test]
+fn queue_series_have_safe_file_names() {
+    for name in ["cam", "<pppoe-ana>", "dhcp-ds<pc 1>", "câmera"] {
+        let key = queue_key(name).unwrap();
+        let file = file_name(&key).unwrap();
+        assert!(file.bytes().all(|b| b.is_ascii_alphanumeric() || b"%._-".contains(&b)), "{file}");
+        assert_eq!(key_of_file(&file).as_deref(), Some(key.as_str()), "{file}");
+        assert_eq!(sources(&key).len(), QUEUE_SOURCES.len());
+    }
+    assert_eq!(queue_key(&"x".repeat(59)), None, "past the 64 bytes of a series header");
+    assert_eq!(key_of_file("queue-%zz.rrd"), None);
+    assert_eq!(key_of_file("queue-a b.rrd"), None);
+}
