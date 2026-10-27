@@ -18,6 +18,34 @@ use corerouter_model::radius::{
 
 use crate::Session;
 
+/// Class attributes a session keeps (RFC 2865 §5.25 sets no limit; the
+/// BNG pair's record holds as many, `proto_ha::record::MAX_CLASS`).
+pub const MAX_CLASS: usize = 4;
+
+/// RFC 2865 §5.25: the Class attributes of an Access-Accept, byte for byte
+/// and in order, for the session to echo in its Accounting-Requests
+/// (G4.3ha). They come from the packet (the decoded text shows a binary
+/// Class as hex); a reply that did not come off the wire (a backend in
+/// memory) gives its text ones.
+pub fn reply_classes(reply: &AuthReply) -> Vec<Vec<u8>> {
+    use corerouter_proto_radius::packet::{Packet, attr};
+    match Packet::parse(&reply.packet) {
+        Ok(p) => p
+            .attributes()
+            .filter(|a| a.typ == attr::CLASS)
+            .take(MAX_CLASS)
+            .map(|a| a.value.to_vec())
+            .collect(),
+        Err(_) => reply
+            .attributes
+            .iter()
+            .filter(|a| a.name == "Class")
+            .take(MAX_CLASS)
+            .map(|a| a.value.as_bytes().to_vec())
+            .collect(),
+    }
+}
+
 /// Where an Access-Request's answer goes (Accept, Reject or Timeout with
 /// the reply's attributes).
 pub type AuthDone = Box<dyn FnOnce(AuthReply) + Send>;

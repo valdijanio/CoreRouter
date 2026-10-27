@@ -72,6 +72,8 @@ pub struct VirtualHal {
     kernel: LabKernel,
     /// The lab's made-up OS log (G4.8b).
     oslog: crate::oslog::LabOsLog,
+    /// The simulated shaper's counters (G4.9g).
+    shaper: crate::queue::lab::LabShaper,
 }
 
 /// A lab port's own settings (G1.26b); `None`: the NIC has no such knob.
@@ -167,6 +169,7 @@ impl VirtualHal {
             blocks: BTreeMap::new(),
             kernel: Arc::new(Mutex::new(kernel)),
             oslog: crate::oslog::LabOsLog::default(),
+            shaper: crate::queue::lab::LabShaper::default(),
         }
     }
 
@@ -819,6 +822,16 @@ impl Hal for VirtualHal {
 
     fn now_unix(&self) -> Option<u64> {
         None
+    }
+
+    /// Counted, not shaped (G4.9g): the Queues window moves in the lab.
+    fn shaper_apply(&mut self, plan: &crate::queue::ShaperPlan) -> Result<(), HalError> {
+        self.shaper.apply(plan);
+        Ok(())
+    }
+
+    fn shaper_status(&mut self) -> crate::queue::ShaperStatus {
+        self.shaper.status()
     }
 
     fn features(&self) -> Features {

@@ -144,7 +144,7 @@ fn radius_makes_sessions_with_rates_and_accounting() {
     let starts: Vec<_> = accts.iter().filter(|r| r.status == AcctStatus::Start).collect();
     assert_eq!(starts.len(), 2);
     assert_eq!(starts[0].interim_secs, Some(300));
-    assert!(starts[0].attributes.iter().any(|x| x.name == "Class" && x.value == "plano-50"));
+    assert_eq!(starts[0].class, vec![b"plano-50".to_vec()]);
     // The XDP map: an IPoE entry per session, from the top slots.
     let ops = lab.core.take_ops();
     assert_eq!(ops.iter().filter(|o| matches!(o, XdpOp::Upsert { .. })).count(), 2, "{ops:?}");

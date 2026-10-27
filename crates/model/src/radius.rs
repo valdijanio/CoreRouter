@@ -485,6 +485,10 @@ pub struct AcctRequest {
     pub interim_secs: Option<u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attributes: Vec<Attribute>,
+    /// RFC 2865 §5.25: every Class of the Access-Accept, byte for byte
+    /// (opaque to the NAS: a binary one would not survive as text).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub class: Vec<Vec<u8>>,
 }
 
 // ---- CoA / Disconnect, as handed to the owner of the sessions ---------------

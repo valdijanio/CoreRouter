@@ -658,6 +658,10 @@ fn acct_attrs(dict: &Dictionary, spec: &LaneSpec, r: &AcctRequest) -> Result<Att
     {
         encode_attr(dict, &mut l, a)?;
     }
+    // RFC 2865 §5.25: the Class goes back unmodified, in every request.
+    for c in r.class.iter().take(corerouter_engine::radius::MAX_CLASS) {
+        l.push(attr::CLASS, c).map_err(e)?;
+    }
     Ok(l)
 }
 

@@ -498,10 +498,14 @@ fn slow_path_carries_ipv4_both_ways() {
     assert_eq!(lab.backend().who(ip).as_deref(), Some("u0"));
 }
 
+/// G4.3ha: the Class every RADIUS login of [`FakeAaa`] gets (binary: a NUL
+/// and 0xff, which no text form keeps).
+pub(super) const FAKE_CLASS: &[u8] = &[0x00, 0xff, b'p', b'l', b'a', b'n', b'o', 0x00];
+
 /// A RADIUS service that answers at once from a table.
 #[derive(Default)]
-struct FakeAaa {
-    accts: Mutex<Vec<AcctRequest>>,
+pub(super) struct FakeAaa {
+    pub(super) accts: Mutex<Vec<AcctRequest>>,
     asked: Mutex<Vec<AuthRequest>>,
 }
 
@@ -521,6 +525,10 @@ impl AaaBackend for FakeAaa {
                 ),
                 Attribute::new("Mikrotik-Rate-Limit", "5M/25M"),
             ];
+            // The Class is read from the packet, as it came (RFC 2865 §5.25).
+            let mut b = corerouter_proto_radius::packet::Builder::new(corerouter_proto_radius::packet::Code::AccessAccept, 1);
+            corerouter_proto_radius::packet::PushAttr::push(&mut b, corerouter_proto_radius::packet::attr::CLASS, FAKE_CLASS).unwrap();
+            reply.packet = b.into_unsigned();
         } else {
             reply.attributes = vec![Attribute::new("Reply-Message", "Inadimplente")];
         }
@@ -573,6 +581,8 @@ fn radius_users_get_framed_ip_rate_and_accounting() {
     assert_eq!(kinds, [AcctStatus::Start, AcctStatus::Stop]);
     assert_eq!(accts[1].terminate_cause, Some(6), "Admin-Reset (RFC 2866 §5.10)");
     assert_eq!(accts[0].session_id, accts[1].session_id);
+    // G4.3ha: the Accept's Class in the Start and the Stop, byte for byte.
+    assert!(accts.iter().all(|r| r.class == [FAKE_CLASS.to_vec()]), "{accts:?}");
     let _ = ClientPhase::Idle;
 }
 

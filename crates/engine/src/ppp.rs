@@ -43,6 +43,11 @@ pub trait PppBackend: Send + Sync {
         all.truncate(limit);
         (total, all)
     }
+    /// The session `id` (`queue.simple.stats` of its queue, G4.9g). The
+    /// default walks the table; a backend with a map by id answers in O(1).
+    fn session(&self, id: &str) -> Option<ActiveSession> {
+        self.active_page(&|a| a.id == id, 1).1.into_iter().next()
+    }
     /// Sessions up per server name.
     fn sessions_by_server(&self) -> std::collections::BTreeMap<String, usize> {
         let mut m = std::collections::BTreeMap::new();
@@ -117,6 +122,10 @@ impl PppBackend for Merged {
             }
         }
         t
+    }
+
+    fn session(&self, id: &str) -> Option<ActiveSession> {
+        self.0.iter().find_map(|b| b.session(id))
     }
 
     /// Each half's page, then the union sorted by (name, id) and cut to

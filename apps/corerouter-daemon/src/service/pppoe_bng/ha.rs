@@ -213,7 +213,7 @@ impl Bng {
             circuit_id: sub.circuit_id.as_deref().map(|c| c.as_bytes().into()),
             remote_id: sub.remote_id.as_deref().map(|c| c.as_bytes().into()),
             acct_session_id: sub.acct_id.as_str().into(),
-            class: Vec::new(),
+            class: sub.class.iter().map(|c| c.as_slice().into()).collect(),
             radius: sub.radius,
             acct_interim: sub.interim,
             profile: sub.effective.profile.as_str().into(),
@@ -486,6 +486,7 @@ impl Bng {
             rate: r.rate_limit.as_deref().map(str::to_owned),
             acct_id: r.acct_session_id.to_string(),
             interim: r.acct_interim,
+            class: r.class.iter().map(|c| c.to_vec()).collect(),
             xdp,
             up_at: Some(now.saturating_sub(age_ms)),
             limit_in: r.limit_in,
@@ -663,6 +664,7 @@ impl Bng {
                     at.extend(route_attributes(&adm.routes));
                     at
                 },
+                class: sub.class.clone(),
             };
             if let Err(e) = aaa.account(req, Some(src)) {
                 self.log(

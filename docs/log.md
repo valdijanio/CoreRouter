@@ -4916,3 +4916,93 @@ continuação indentadas).
     job, o nextest e o cargo já usam todos os núcleos (o padrão é o número de CPUs). Runner maior
     é pago e runner próprio na máquina do usuário rodaria código de PR de fork (repositório
     público): nenhum dos dois.
+
+- 2026-10-26 — G4.3ha: Class do RADIUS (RFC 2865 §5.25) na contabilização do PPPoE e do IPoE. O Class do Access-Accept
+  volta sem modificação no Start, nos Interims e no Stop. Ele é lido do pacote recebido
+  (`corerouter_engine::radius::reply_classes`), byte a byte, na ordem e até 4. Antes:
+  - o PPPoE não mandava o Class;
+  - o IPoE mandava o texto decodificado: um Class binário (o Windows NPS manda um assim) virava
+    "0x…" em hex, e um Class com mais de 64 bytes era cortado com "…".
+
+  Mudanças:
+  - `AcctRequest::class` novo (`crates/model`, aditivo). O serviço RADIUS o codifica como
+    atributo 25 cru.
+  - O registro do par em alta disponibilidade leva o Class (`SessionRecord::class`, que já
+    existia). O nó que assume manda o Interim e o Stop com o mesmo Class e o mesmo Acct-Session-Id.
+  - O servidor de teste do `proto-radius` registra o Class de cada Accounting-Request
+    (`AcctLog::class`).
+
+  Testes:
+  - `radius_aaa_tests::class_is_echoed_byte_for_byte_in_every_accounting_request`: servidor de
+    teste em UDP; um Class binário (NUL, 0xff) e um de texto que parece hex chegam iguais no Start,
+    no Interim e no Stop.
+  - `pppoe_bng_tests::radius_users_get_framed_ip_rate_and_accounting`: Start e Stop com o Class
+    binário.
+  - `pppoe_ha_tests::the_class_of_a_radius_session_survives_a_takeover`: o registro leva o Class;
+    no outro nó, o Interim da tomada e o Stop o levam, sem Start novo e com o mesmo
+    Acct-Session-Id.
+  - `ipoe_bng_tests`: o Start do IPoE com o Class.
+  - Laboratório `cargo xtask bng-lab --only ha`: cada usuário recebe um Class binário próprio. O
+    laboratório conta os registros sem o Class do usuário, os do nó novo incluídos (coluna nova).
+
+  Os testes do `pppoe_ha_tests` passam a rodar um de cada vez (`pair_lock`). Eles dividem o
+  `HA_ACTIVE` e a tomada global, e um teste via a tomada do outro.
+
+  **Medido**:
+  - Custo no link de sync: um TLV por Class, 3 B + o tamanho. O Class de 8 B do teste soma 11 B a
+    um registro de ≈ 180 B. Um Class típico de cobrança (10–30 B) soma 13–33 B por sessão, só no
+    upsert. Os contadores (50 B a cada 10 s) não mudam.
+  - Laboratório na VM `corerouter-lab` (8 vCPUs, release, BNG Blaster 1.0.1, sem root, caminho
+    lento, 2026-10-26, `cargo xtask bng-lab --only ha --scales 1000,10000`):
+
+  | Sessões | Tomada | Tráfego de volta | Sessões perdidas | Starts (ids únicos) | Stops | Com Interim do nó novo | Registros sem o Class do usuário |
+  |---:|---:|---:|---:|---:|---:|---:|---:|
+  | 1 000 | 1,14 s | 1,16 s | 0 | 1 000 (1 000) | 0 | 1 000 | 0 |
+  | 10 000 | 1,14 s | 1,17 s | 0 | 10 000 (10 000) | 0 | 10 000 | 0 |
+
+- 2026-10-26 — G4.9g: Filas, parte g: a janela de **uma fila** (aprovada pelo usuário em 2026-10-26). Duplo clique em
+  qualquer fila da janela Queues (fixa, PPPoE, IPoE, lease ou rede do DHCP, PCQ) abre "Queue <nome>"
+  com as abas do WinBox: General/Advanced (o formulário de edição da fila fixa; só leitura na
+  dinâmica), **Traffic** (1 s, 1/5/15 min, download e upload com o max-limit tracejado, cartões de
+  taxa com % do limite, atraso na fila com p95, descartes/s com o selo "at limit", pausa, CSV,
+  atalhos Torch e Sniffer), **Statistics** (por sentido: taxa, pps, bytes, pacotes, descartes com %,
+  espera agora e p95, tempo no limite, estado e tempo restante da rajada, endereços PCQ) e
+  **History** (hora, dia, semana com p95). A lista ganhou o selo "near limit" (ícone de medidor)
+  na coluna Rate quando um sentido está a 90% do max-limit ou mais, e a contagem no rodapé (pedido
+  do usuário durante o trabalho).
+
+  Engine: `queue.simple.stats {id}` (uma fila, sem resolver o plano: índice de nomes, mapa de
+  contadores por chave, `PppBackend::session` por id; anel de amostras só das filas olhadas,
+  `QueueWatch`, até 64, "busy" depois); `queue.simple.graph {id, graph}` (fixa: o campo novo
+  `graph` da fila, padrão sim; dinâmica: o nome em `system.graph.set queue_include`);
+  `system.graph.set` ganhou `queues` (liga/desliga todas) e `dynamic_queues` (todas as dinâmicas);
+  séries `queue:<nome>` (up_bps, down_bps, drops, delay) amostradas na rodada do serviço `queue`.
+  O laboratório virtual ganhou um shaper simulado (`hal::queue::lab`) para a janela e o histórico se
+  mexerem; nada é moldado e a lista continua dizendo isso. Detalhes em `docs/queues.md`.
+
+  Testar: `cargo run -p corerouter-daemon -- --control 7979`, depois
+  `corerouter-cli --connect 127.0.0.1:7979 run queue.simple.add '{"name":"ana","target":"10.0.0.5","max_limit":"10M/50M","burst_limit":"20M/80M","burst_threshold":"8M/40M","burst_time":"16s"}'`,
+  `corerouter-cli … run queue.simple.stats '{"id":"ana"}'` e, na GUI (`--connect`), Queues › duplo
+  clique na fila. Medido: `queue.simple.stats` 2,2 µs com 10 mil e com 100 mil filas; histórico
+  438 KiB por fila (10 mil marcadas = 4,18 GiB, não cabem: teto 4 GiB e 4096 séries).
+
+- 2026-10-26 — processo: Três testes instáveis da fila (2026-10-26), cada um pela causa real:
+  - `netns_pppoe_io` (bug de produção): os sockets `ETH_P_ALL` da porta PPPoE (`pppoe_io::bound` e
+    o tap do `bng0`) recebem quadros de **todas** as interfaces, sem filtro, entre o `socket()` e o
+    `bind`; o BNG lia esses quadros como PPPoE da porta (no CI, um relatório MLD de outra porta).
+    Agora a porta descarta o que ficou na fila depois do filtro e do bind, como os sockets do DHCP e
+    da captura já faziam. Teste novo `a_port_never_reads_another_interface`: abre a porta 50 vezes
+    com outra veth inundada de PPPoE. Sem a correção, 3.500 a 4.900 quadros alheios por rodada;
+    com ela, 0 (**medido**). O teste também passou a esperar a veth sair do qdisc `noop` (o caso 0
+    não lia nada no CI: o quadro saía antes do carrier).
+  - `netns` (`two_daemons_see_each_other`): o veth agora é apagado antes de o namespace de B
+    acabar. O kernel destrói o namespace depois, numa workqueue, e leva o veth junto; o `ip link
+    del` achava "Cannot find device". Com 300 ms entre os dois passos, a ordem antiga falha sempre
+    (**medido**).
+  - `netns_dns_zones`: o serviço DNS copia a config a cada 1 s, e o teste esperava o 3º de 5
+    registros, então a AXFR podia ler 4 de 5. Agora ele espera o SOA servido trazer o serial
+    confirmado (`ip.dns.zone.print`). Com uma pausa de 1,1 s depois do 3º registro, o teste antigo
+    falha (3 de 5) e o novo passa (**medido**).
+
+  Carga: 12 a 16 cópias em paralelo, com 32 núcleos ocupados. `netns_pppoe_io` foi de 1 falha em
+  160 a 0 em 160; `netns` e `netns_dns_zones` deram 0 em 60 cada (**medido**).

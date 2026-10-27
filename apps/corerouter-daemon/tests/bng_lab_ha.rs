@@ -24,7 +24,8 @@
 //!   downstream rides the routing protocol announcing the pool, outside
 //!   this lab;
 //! - **accounting**: one Start per session, no Stop, and C's Interim with
-//!   the same Acct-Session-Id after the takeover.
+//!   the same Acct-Session-Id after the takeover; every record with the
+//!   user's own Class (binary, RFC 2865 §5.25, G4.3ha), C's included.
 //!
 //! With `--root` (`BNG_LAB_ROOT=1`) both nodes run the XDP data plane on
 //! their ports (generic mode).
@@ -105,12 +106,23 @@ fn sysctl(ns: Option<u32>, key: &str, v: &str) {
         .status();
 }
 
+/// An accounting record: status, Acct-Session-Id, from, its Class
+/// attributes.
+type Acct = (u32, String, String, Vec<Vec<u8>>);
+
+/// The Class user `rad{i}` gets: binary (a NUL, 0xff) and its own.
+fn class_of(i: usize) -> Vec<u8> {
+    let mut c = vec![0x00, 0xff];
+    c.extend_from_slice(format!("plano-{i}").as_bytes());
+    c
+}
+
 /// A RADIUS test server on 10.8.0.1 that keeps every accounting record.
 struct Radius {
     stop: Arc<AtomicBool>,
     auth: u16,
     acct: u16,
-    log: Arc<Mutex<Vec<(u32, String, String)>>>,
+    log: Arc<Mutex<Vec<Acct>>>,
 }
 
 impl Radius {
@@ -123,7 +135,14 @@ impl Radius {
         );
         let mut srv = TestServer::new(SECRET.as_bytes(), 7);
         for i in 1..=users {
-            srv.add_user(&format!("rad{i}"), "test", AttrList::new());
+            let mut reply = AttrList::new();
+            corerouter_proto_radius::packet::PushAttr::push(
+                &mut reply,
+                corerouter_proto_radius::packet::attr::CLASS,
+                &class_of(i),
+            )
+            .unwrap();
+            srv.add_user(&format!("rad{i}"), "test", reply);
         }
         let stop = Arc::new(AtomicBool::new(false));
         let stop2 = stop.clone();
@@ -149,7 +168,7 @@ impl Radius {
                 if !srv.accounting.is_empty() {
                     let mut l = log2.lock().unwrap();
                     for a in srv.accounting.drain(..) {
-                        l.push((a.status, a.session_id, a.from.ip().to_string()));
+                        l.push((a.status, a.session_id, a.from.ip().to_string(), a.class));
                     }
                 }
             }
@@ -162,8 +181,8 @@ impl Radius {
         }
     }
 
-    /// (status, Acct-Session-Id, from) of every record so far.
-    fn records(&self) -> Vec<(u32, String, String)> {
+    /// Every record so far.
+    fn records(&self) -> Vec<Acct> {
         self.log.lock().unwrap().clone()
     }
 }
@@ -416,7 +435,7 @@ fn bng_lab_ha() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000]);
     let mut md = String::from(
-        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo |\n|---|---|---|---|---|---|---|---|---|---|\n",
+        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for n in scales {
         let row = run(n, &blaster, &out);
@@ -589,7 +608,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     std::thread::sleep(Duration::from_secs(10));
     let (_, flapped0) = b.counters();
     let rx0 = rx_sample(Some(cp));
-    let before: Vec<(u32, String, String)> = radius.records();
+    let before: Vec<Acct> = radius.records();
     let started: std::collections::HashSet<String> = before
         .iter()
         .filter(|r| r.0 == 1)
@@ -622,7 +641,26 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         None => "?",
     };
     let after = radius.records();
-    let new: Vec<&(u32, String, String)> = after.iter().skip(before.len()).collect();
+    let new: Vec<&Acct> = after.iter().skip(before.len()).collect();
+    // G4.3ha: the Class of each session's Start, then every record of it
+    // (C's Interim included) with that one, not empty and not another's.
+    let class_at_start: HashMap<&str, &Vec<Vec<u8>>> = after
+        .iter()
+        .filter(|r| r.0 == 1)
+        .map(|r| (r.1.as_str(), &r.3))
+        .collect();
+    let wrong_class = after
+        .iter()
+        .filter(|r| r.3.len() != 1 || class_at_start.get(r.1.as_str()).is_none_or(|c| **c != r.3))
+        .count();
+    let class_c = new
+        .iter()
+        .filter(|r| {
+            r.2 == "10.8.0.2"
+                && r.3.len() == 1
+                && r.3.first().is_some_and(|c| c.starts_with(&[0x00, 0xff]))
+        })
+        .count();
     let starts = after.iter().filter(|r| r.0 == 1).count();
     let unique: std::collections::HashSet<&str> = after
         .iter()
@@ -641,7 +679,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         .iter()
         .filter(|s| !interims_c.contains_key(s.as_str()))
         .count();
-    let tally = |v: &[&(u32, String, String)]| {
+    let tally = |v: &[&Acct]| {
         let mut m: std::collections::BTreeMap<
             (u32, String),
             (usize, std::collections::HashSet<String>),
@@ -658,11 +696,11 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
             .collect::<Vec<_>>()
             .join("; ")
     };
-    let before_refs: Vec<&(u32, String, String)> = before.iter().collect();
+    let before_refs: Vec<&Acct> = before.iter().collect();
     eprintln!("ha {n}: accounting before the cut: {}", tally(&before_refs));
     eprintln!("ha {n}: accounting after the cut: {}", tally(&new));
     eprintln!(
-        "ha {n}: takeover {takeover:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}",
+        "ha {n}: takeover {takeover:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
         interims_c.len()
     );
     drop(b);
@@ -695,7 +733,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();
     }
     format!(
-        "| {n} | {plane} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} |",
+        "| {n} | {plane} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {wrong_class} |",
         unique.len(),
         interims_c.len()
     )

@@ -107,7 +107,7 @@ pub fn resolve(db: &GraphDb, names: &[String]) -> Result<Vec<String>, String> {
     for n in names {
         let wanted: Vec<String> = if n == "interface:*" {
             db.keys().filter(|k| k.starts_with(INTERFACE)).map(str::to_owned).collect()
-        } else if n == SYSTEM || n.starts_with(INTERFACE) {
+        } else if n == SYSTEM || n.starts_with(INTERFACE) || n.starts_with(super::QUEUE) {
             vec![n.clone()]
         } else {
             vec![format!("{INTERFACE}{n}")]

@@ -525,6 +525,14 @@ pub struct SimpleQueue {
     pub disabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+    /// Keep a traffic history of it (`/tool graphing`, G4.9g): on by
+    /// default for a fixed queue.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub graph: bool,
+}
+
+fn is_yes(b: &bool) -> bool {
+    *b
 }
 
 impl SimpleQueue {
@@ -543,6 +551,7 @@ impl SimpleQueue {
             queue: default_types(),
             disabled: false,
             comment: String::new(),
+            graph: true,
         }
     }
 }
