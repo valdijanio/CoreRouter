@@ -28,6 +28,15 @@ BR2_LINUX_KERNEL_NEEDS_HOST_LIBELF=y
 BR2_LINUX_KERNEL_NEEDS_HOST_PAHOLE=y
 BR2_PACKAGE_NFTABLES=y
 BR2_PACKAGE_COREROUTER=y
+# G1.6c: FRR (G3.1) — the routing daemons hal-frr drives through their vty
+# sockets; corerouter-init starts them (no bash init scripts, no vtysh in the
+# image: post-build.sh). libcap: the daemons keep only the capabilities
+# they need after dropping to the frr user.
+BR2_PACKAGE_FRR=y
+BR2_PACKAGE_FRR_BFD=y
+BR2_PACKAGE_LIBCAP=y
+# G1.6c: the installer's kernel (the ISO, post-image.sh).
+BR2_PACKAGE_COREROUTER_INSTALLER=y
 BR2_TARGET_ROOTFS_SQUASHFS=y
 BR2_TARGET_ROOTFS_SQUASHFS4_ZSTD=y
 # BR2_TARGET_ROOTFS_TAR is not set

@@ -1572,6 +1572,7 @@ dependencies = [
 name = "corerouter-sysupdate"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "criterion",
  "ring",
  "rustix 1.1.5",

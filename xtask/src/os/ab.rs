@@ -42,7 +42,7 @@ pub fn tool(root: &Path) -> Result<PathBuf, String> {
     Ok(p)
 }
 
-fn run_tool(tool: &Path, args: &[&str]) -> Result<String, String> {
+pub(super) fn run_tool(tool: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new(tool)
         .args(args)
         .stderr(Stdio::inherit())
@@ -140,7 +140,7 @@ struct Ctx {
 }
 
 /// One QEMU run (it exits on the guest's reboot: `-no-reboot`).
-struct Vm {
+pub(super) struct Vm {
     child: Child,
     stdin: ChildStdin,
     rx: mpsc::Receiver<String>,
@@ -150,30 +150,72 @@ struct Vm {
 
 const SHELL_APPEND: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off corerouter.shell=ttyS0";
 
+/// The QEMU machine every image test boots: q35, 2 vCPUs, 1 GiB, serial
+/// console on stdio, OVMF with the NVRAM in `vars`, no reboot (a guest
+/// reboot ends the run).
+pub(super) fn qemu_base(kvm: bool, vars: &Path) -> Command {
+    let mut cmd = Command::new("qemu-system-x86_64");
+    let accel = if kvm {
+        "q35,accel=kvm"
+    } else {
+        "q35,accel=tcg"
+    };
+    cmd.args(["-machine", accel, "-cpu", if kvm { "host" } else { "max" }]);
+    cmd.args([
+        "-smp", "2", "-m", "1024", "-display", "none", "-monitor", "none",
+    ]);
+    cmd.args(["-serial", "stdio", "-no-reboot"]);
+    cmd.arg("-drive")
+        .arg(format!("if=pflash,format=raw,readonly=on,file={OVMF_CODE}"));
+    cmd.arg("-drive")
+        .arg(format!("if=pflash,format=raw,file={}", vars.display()));
+    cmd.args(["-device", "virtio-rng-pci"]);
+    cmd
+}
+
+/// A fresh copy of OVMF's empty NVRAM at `to`.
+pub(super) fn fresh_vars(to: &Path) -> Result<(), String> {
+    std::fs::copy(OVMF_VARS, to)
+        .map(|_| ())
+        .map_err(|e| format!("{OVMF_VARS}: {e} (package ovmf)"))
+}
+
+/// Starts `cmd` with its serial console read line by line.
+pub(super) fn start(log: &mut std::fs::File, name: &str, mut cmd: Command) -> Result<Vm, String> {
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
+    let stdin = child.stdin.take().ok_or("qemu stdin")?;
+    let stdout = child.stdout.take().ok_or("qemu stdout")?;
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("qemu-serial".into())
+        .spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    let _ = writeln!(log, "===== {name} =====");
+    eprintln!("   [{name}] qemu started");
+    Ok(Vm {
+        child,
+        stdin,
+        rx,
+        started: Instant::now(),
+        name: name.to_owned(),
+    })
+}
+
 impl Ctx {
     fn boot(&mut self, name: &str, first: bool, extra: &[&Path]) -> Result<Vm, String> {
-        let mut cmd = Command::new("qemu-system-x86_64");
-        let accel = if self.kvm {
-            "q35,accel=kvm"
-        } else {
-            "q35,accel=tcg"
-        };
-        cmd.args([
-            "-machine",
-            accel,
-            "-cpu",
-            if self.kvm { "host" } else { "max" },
-        ]);
-        cmd.args([
-            "-smp", "2", "-m", "1024", "-display", "none", "-monitor", "none",
-        ]);
-        cmd.args(["-serial", "stdio", "-no-reboot"]);
-        cmd.arg("-drive")
-            .arg(format!("if=pflash,format=raw,readonly=on,file={OVMF_CODE}"));
-        cmd.arg("-drive").arg(format!(
-            "if=pflash,format=raw,file={}",
-            self.work.join("vars.fd").display()
-        ));
+        let mut cmd = qemu_base(self.kvm, &self.work.join("vars.fd"));
         cmd.arg("-drive").arg(format!(
             "file={},if=virtio,format=qcow2",
             self.work.join("disk.qcow2").display()
@@ -185,8 +227,6 @@ impl Ctx {
             ));
         }
         cmd.args([
-            "-device",
-            "virtio-rng-pci",
             "-netdev",
             "user,id=n0",
             "-device",
@@ -200,35 +240,7 @@ impl Ctx {
             cmd.arg("-kernel").arg(self.images.join("bzImage"));
             cmd.arg("-append").arg(SHELL_APPEND);
         }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("qemu-system-x86_64: {e}"))?;
-        let stdin = child.stdin.take().ok_or("qemu stdin")?;
-        let stdout = child.stdout.take().ok_or("qemu stdout")?;
-        let (tx, rx) = mpsc::channel();
-        std::thread::Builder::new()
-            .name("qemu-serial".into())
-            .spawn(move || {
-                for line in BufReader::new(stdout).lines() {
-                    let Ok(line) = line else { break };
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            })
-            .map_err(|e| e.to_string())?;
-        let _ = writeln!(self.log, "===== {name} =====");
-        eprintln!("   [{name}] qemu started");
-        Ok(Vm {
-            child,
-            stdin,
-            rx,
-            started: Instant::now(),
-            name: name.to_owned(),
-        })
+        start(&mut self.log, name, cmd)
     }
 }
 
@@ -236,7 +248,7 @@ impl Vm {
     /// The next console line that contains one of `pats`; error on a
     /// timeout, on QEMU exiting, and on a kernel panic unless one of `pats`
     /// is "Kernel panic".
-    fn expect(
+    pub(super) fn expect(
         &mut self,
         log: &mut std::fs::File,
         pats: &[&str],
@@ -278,7 +290,7 @@ impl Vm {
 
     /// Waits until a line with each of `pats` went by, in any order;
     /// returns the lines, in `pats`' order.
-    fn expect_all(
+    pub(super) fn expect_all(
         &mut self,
         log: &mut std::fs::File,
         pats: &[&str],
@@ -307,8 +319,16 @@ impl Vm {
         Ok(got.into_iter().flatten().collect())
     }
 
+    /// Types `b` on the guest's serial console.
+    pub(super) fn stdin_write(&mut self, b: &[u8]) -> Result<(), String> {
+        self.stdin
+            .write_all(b)
+            .and_then(|_| self.stdin.flush())
+            .map_err(|e| format!("serial: {e}"))
+    }
+
     /// Runs a command in the guest's shell; the JSON answer.
-    fn run(
+    pub(super) fn run(
         &mut self,
         log: &mut std::fs::File,
         command: &str,
@@ -328,7 +348,7 @@ impl Vm {
         Ok(v)
     }
 
-    fn ok(
+    pub(super) fn ok(
         &mut self,
         log: &mut std::fs::File,
         command: &str,
@@ -342,7 +362,7 @@ impl Vm {
     }
 
     /// `system.package.print` until `pred` holds.
-    fn print_until(
+    pub(super) fn print_until(
         &mut self,
         log: &mut std::fs::File,
         secs: u64,
@@ -361,7 +381,11 @@ impl Vm {
         }
     }
 
-    fn wait_exit(&mut self, log: &mut std::fs::File, secs: u64) -> Result<Duration, String> {
+    pub(super) fn wait_exit(
+        &mut self,
+        log: &mut std::fs::File,
+        secs: u64,
+    ) -> Result<Duration, String> {
         let deadline = Instant::now() + Duration::from_secs(secs);
         loop {
             while let Ok(l) = self.rx.try_recv() {
@@ -381,7 +405,7 @@ impl Vm {
         }
     }
 
-    fn poweroff(&mut self, log: &mut std::fs::File) -> Result<(), String> {
+    pub(super) fn poweroff(&mut self, log: &mut std::fs::File) -> Result<(), String> {
         let _ = self.stdin.write_all(b"poweroff\n");
         let _ = self.stdin.flush();
         self.wait_exit(log, 60).map(|_| ())
@@ -396,23 +420,23 @@ impl Drop for Vm {
 }
 
 /// One measured number, printed at the end.
-struct Numbers(Vec<(String, String)>);
+pub(super) struct Numbers(pub(super) Vec<(String, String)>);
 
 impl Numbers {
-    fn put(&mut self, k: &str, v: impl Into<String>) {
+    pub(super) fn put(&mut self, k: &str, v: impl Into<String>) {
         let v = v.into();
         eprintln!("   = {k}: {v}");
         self.0.push((k.to_owned(), v));
     }
 }
 
-fn ready_s(line: &str) -> String {
+pub(super) fn ready_s(line: &str) -> String {
     super::parse_ready(line)
         .map(|s| format!("{s:.3} s"))
         .unwrap_or_else(|| "?".into())
 }
 
-fn slot<'a>(v: &'a Value, s: &str) -> &'a Value {
+pub(super) fn slot<'a>(v: &'a Value, s: &str) -> &'a Value {
     v.get("slots")
         .and_then(Value::as_array)
         .and_then(|a| {
@@ -422,7 +446,7 @@ fn slot<'a>(v: &'a Value, s: &str) -> &'a Value {
         .unwrap_or(&Value::Null)
 }
 
-fn check(cond: bool, what: impl Into<String>) -> Result<(), String> {
+pub(super) fn check(cond: bool, what: impl Into<String>) -> Result<(), String> {
     if cond { Ok(()) } else { Err(what.into()) }
 }
 
@@ -439,8 +463,7 @@ fn fresh(ctx: &mut Ctx, n: &mut Numbers, scenario: &str, extra: &[&Path]) -> Res
         .status()
         .map_err(|e| format!("qemu-img: {e}"))?;
     check(st.success(), "qemu-img create failed")?;
-    std::fs::copy(OVMF_VARS, ctx.work.join("vars.fd"))
-        .map_err(|e| format!("{OVMF_VARS}: {e} (package ovmf)"))?;
+    fresh_vars(&ctx.work.join("vars.fd"))?;
     let mut log = ctx.log.try_clone().map_err(|e| e.to_string())?;
     let mut vm = ctx.boot(&format!("{scenario}/factory"), true, &[])?;
     let r = vm.expect_all(&mut log, &["ready:", "maintenance shell"], 120)?;

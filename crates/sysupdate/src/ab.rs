@@ -1161,7 +1161,7 @@ fn open_slot(path: &Path) -> Result<File, String> {
 
 /// Drops `f`'s pages from the page cache, so a read-back comes from the
 /// disk and not from what was just written.
-fn drop_cache(f: &File) {
+pub(crate) fn drop_cache(f: &File) {
     #[cfg(target_os = "linux")]
     {
         let _ = rustix::fs::fadvise(f, 0, None, rustix::fs::Advice::DontNeed);
