@@ -267,6 +267,22 @@ fn options_of(
     out
 }
 
+/// RFC 8910 §2.1: option 114, the captive-portal API URI, when the
+/// subscriber notices have one (G4.10). Sent only when asked for (the
+/// client lists it in option 55), and an option 114 the operator set wins.
+fn with_capport(mut options: Vec<OptPlan>, cfg: &Config) -> Vec<OptPlan> {
+    let url = &cfg.ip.subscriber_notice.settings.capport_url;
+    // RFC 8910 §2: at most 255 bytes in DHCPv4.
+    if !url.is_empty() && url.len() <= 255 && !options.iter().any(|o| o.code == 114) {
+        options.push(OptPlan {
+            code: 114,
+            value: OptValue::Bytes(url.as_bytes().to_vec()),
+            force: false,
+        });
+    }
+    options
+}
+
 impl Plan {
     pub fn from_config(cfg: &Config) -> Self {
         let d = &cfg.ip.dhcp_server;
@@ -291,7 +307,7 @@ impl Plan {
                 always_broadcast: s.always_broadcast,
                 server_address: s.server_address,
                 relay: s.relay,
-                options: options_of(d, &[], s.dhcp_option_set.as_ref()),
+                options: with_capport(options_of(d, &[], s.dhcp_option_set.as_ref()), cfg),
                 address_lists: s
                     .address_lists
                     .iter()
