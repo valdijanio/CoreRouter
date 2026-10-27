@@ -732,16 +732,6 @@ fn lan_management(s: &mut Session, p: &Value) -> Result<Value> {
     Ok(json!({ "rules": ids }))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn default_ports_are_ssh_and_tls() {
-        assert_eq!(default_ports().to_string(), "22,8729");
-    }
-}
-
 /// Raw table template: drop reserved sources and port 0 from the WAN in
 /// `prerouting`, before connection tracking spends an entry on them (the
 /// MikroTik manual's DDoS advice: drop in raw, it costs less).
@@ -855,4 +845,14 @@ fn raw_bogons(s: &mut Session, p: &Value) -> Result<Value> {
     let anchor = top_of(s.store().candidate(), Table::Raw, "prerouting");
     let ids = insert(s, Table::Raw, anchor, rules)?;
     Ok(json!({ "rules": ids, "entries": entries, "list": list }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_ports_are_ssh_and_tls() {
+        assert_eq!(default_ports().to_string(), "22,8729");
+    }
 }
