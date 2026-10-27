@@ -655,6 +655,16 @@ impl BgpPanel {
             if button(ui, tr_in(SCOPE, l, label), tip, can.check("routing.bgp.connection.set")) {
                 app.run("routing.bgp.connection.set", json!({"id": name, "disabled": to}));
             }
+            // G3.2c: the session's routes (with RPKI) and its flap history.
+            ui.separator();
+            for (label, tab, tip) in [
+                ("Routes", crate::bgp_routes::Tab::Received, "The routes this neighbor sent and we sent it, with the RPKI state of each (Routing › BGP Routes)"),
+                ("History", crate::bgp_routes::Tab::History, "When this session went down and came back, and why"),
+            ] {
+                if button(ui, tr_in(SCOPE, l, label), tr_in(SCOPE, l, tip), can.check("routing.bgp.route.list")) {
+                    crate::bgp_routes::open_routes(app, &name, tab);
+                }
+            }
         });
     }
 

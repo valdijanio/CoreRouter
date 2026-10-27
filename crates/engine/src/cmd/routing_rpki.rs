@@ -38,6 +38,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.rpki.check", "RPKI Check", ["Routing", "RPKI"], None,
         "{prefix: cidr, origin_as: u32 | asdot string | path (the last AS of an AS path)} → {prefix, origin_as?, state: valid | invalid | unknown | unverified, covering: [{prefix, max_length, asn, matches}], reason}",
         always, check),
+    cmd!(query "routing.rpki.preview", "Check RPKI Validator", [], None,
+        "{id?: string (the validator being edited), name?: string, address?: string, port?: u16 | string, group?: string, refresh_interval?: u32 | string | null, retry_interval?: u32 | string | null, expire_interval?: u32 | string | null, preference?: u8 | string | null, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        always, preview),
     cmd!("routing.rpki.invalid.set", "RPKI Invalid Routes", [], None,
         "{connection?: string, template?: string (one of the two), invalid?: reject | accept | null (left out or null: inherit; the default is reject)} → {connection? | template?, invalid?, effective (connection: in force)}",
         always, invalid_set),
@@ -299,6 +302,83 @@ fn check(s: &mut Session, p: &Value) -> Result<Value> {
     }))
 }
 
+const NUMBERS: [&str; 5] = ["port", "refresh_interval", "retry_interval", "expire_interval", "preference"];
+
+/// Form texts as `add`/`set` take them: numbers as numbers, yes/no as
+/// bools, an empty optional field unset (`set`) or left out (`add`).
+fn normalize(p: &Value, editing: bool) -> Value {
+    let Some(o) = p.as_object() else {
+        return p.clone();
+    };
+    let mut out = serde_json::Map::new();
+    for (k, v) in o {
+        let text = v.as_str().map(str::trim);
+        let v = match text {
+            Some("") if NUMBERS.contains(&k.as_str()) && k != "port" => {
+                if editing {
+                    Value::Null
+                } else {
+                    continue;
+                }
+            }
+            Some("") if k == "port" || k == "group" => continue,
+            Some(t) if NUMBERS.contains(&k.as_str()) => t.parse::<u64>().map_or_else(|_| v.clone(), Value::from),
+            Some("yes") if k == "disabled" => Value::Bool(true),
+            Some("no") if k == "disabled" => Value::Bool(false),
+            _ => v.clone(),
+        };
+        out.insert(k.clone(), v);
+    }
+    if !editing {
+        out.remove("id");
+    }
+    Value::Object(out)
+}
+
+fn preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let id = raw.get("id").and_then(Value::as_str).map(str::to_owned);
+    let editing = id.is_some();
+    let p = normalize(raw, editing);
+    let mut routing = s.store().candidate().routing.clone();
+    let check = |level: &str, check: &str, message: String, param: &str| {
+        json!({"level": level, "check": check, "message": message, "param": param})
+    };
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    match apply(&mut routing, &p, id.as_deref()) {
+        Err(EngineError::BadParam { param, reason }) => {
+            checks.push(check("error", "param", reason, &param));
+        }
+        Err(e) => checks.push(check("error", "param", e.to_string(), "")),
+        Ok(name) => {
+            for i in corerouter_proto_bgp::rpki::validate(&routing) {
+                let param = i.path.rsplit('.').next().unwrap_or_default().to_owned();
+                checks.push(check("error", "rfc8210", i.message, &param));
+            }
+            if let Some(c) = routing.rpki.get(&name) {
+                computed.push(json!({"label": "Session", "value": format!("RTR to {}:{} (RFC 8210, falls back to RFC 6810)", c.address, c.port)}));
+                let t = |v: Option<u32>, d: &str| v.map_or_else(|| format!("the validator's ({d} s until it says)"), |v| format!("{v} s"));
+                computed.push(json!({"label": "Refresh", "value": t(c.refresh_interval, "3600")}));
+                computed.push(json!({"label": "Expire", "value": t(c.expire_interval, "7200")}));
+                if c.refresh_interval.is_some_and(|r| r > 3_600) {
+                    checks.push(check("info", "frr", "FRR polls at most every 3600 s; it gets 3600".into(), "refresh_interval"));
+                }
+                if c.port != DEFAULT_PORT {
+                    checks.push(check("info", "port", format!("{} is not the IANA RTR port 323 (Routinator uses 3323, StayRTR 8282)", c.port), "port"));
+                }
+            }
+            let was_on = !enabled(&s.store().candidate().routing).is_empty();
+            if !was_on && !enabled(&routing).is_empty() {
+                checks.push(check("warning", "policy", notice(&routing), ""));
+            }
+            let command = if editing { "routing.rpki.set" } else { "routing.rpki.add" };
+            commands.push(json!({"command": command, "params": p}));
+        }
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
+}
+
 fn invalid_set(s: &mut Session, p: &Value) -> Result<Value> {
     let conn = opt_str(p, "connection")?.map(str::to_owned);
     let tmpl = opt_str(p, "template")?.map(str::to_owned);
@@ -410,6 +490,25 @@ mod tests {
         assert!(s.store().running().routing.rpki.is_empty());
         assert!(s.execute("routing.rpki.invalid.set", &json!({"connection": "nope", "invalid": "accept"})).is_err());
         assert!(s.execute("routing.rpki.invalid.set", &json!({"connection": "rr1", "invalid": "maybe"})).is_err());
+    }
+
+    #[test]
+    fn the_preview_takes_form_texts() {
+        let mut s = session();
+        let r = s
+            .execute("routing.rpki.preview", &json!({"name": "rtr1", "address": "192.0.2.10", "port": "3323", "refresh_interval": "", "disabled": "no"}))
+            .unwrap();
+        assert_eq!(r["commands"][0]["command"], "routing.rpki.add");
+        assert_eq!(r["commands"][0]["params"]["port"], 3323);
+        assert!(r["commands"][0]["params"].get("refresh_interval").is_none());
+        assert!(r["checks"].as_array().unwrap().iter().any(|c| c["check"] == "policy"));
+        let r = s.execute("routing.rpki.preview", &json!({"name": "rtr1", "address": "x"})).unwrap();
+        assert_eq!(r["checks"][0]["param"], "address");
+        let r = s
+            .execute("routing.rpki.preview", &json!({"name": "rtr1", "address": "192.0.2.10", "expire_interval": "60"}))
+            .unwrap();
+        assert_eq!(r["checks"][0]["param"], "expire_interval");
+        assert!(s.store().candidate().routing.rpki.is_empty(), "the preview changes nothing");
     }
 
     #[test]

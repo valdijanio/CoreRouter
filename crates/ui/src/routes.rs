@@ -1201,6 +1201,16 @@ impl CoreRouterUi {
                 .filter(|(k, _)| k == key)
                 .map(|(_, v)| v);
             ui.separator();
+            // G3.2c: the BGP paths of this destination and why one won.
+            if let Some(dst) = self.route(key).map(|r| r.dst)
+                && self.has_command("routing.bgp.route.explain")
+                && ui
+                    .button(tr(langs.labels, "Why this route? (BGP)"))
+                    .on_hover_text(tr(langs.labels, "Every BGP path to this destination and the step of the decision that put each one behind"))
+                    .clicked()
+            {
+                crate::bgp_routes::open_explain(self, &dst);
+            }
             detail(ui, shown.as_ref(), langs);
         }
         // A click on an ECMP group's line opens or closes it.

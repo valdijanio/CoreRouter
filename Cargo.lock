@@ -1594,6 +1594,7 @@ dependencies = [
  "corerouter-engine",
  "corerouter-hal",
  "corerouter-model",
+ "corerouter-proto-bgp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
  "corerouter-shell",
