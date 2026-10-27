@@ -276,6 +276,7 @@ fn list(s: &mut Session, p: &Value, v4: bool) -> Result<Value> {
     let neigh = s.neigh_fresh();
     let cfg = s.store().candidate().clone();
     let t = neigh.lock();
+    let now = now.max(t.clock);
 
     // Static entries by (interface, address): they name kernel rows.
     let statics: HashMap<(&IfName, IpAddr), &ArpEntry> = if v4 {
