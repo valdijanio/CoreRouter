@@ -27,6 +27,48 @@ An idle block is released after this; then held 120 s (RFC 6888 REQ-8). Default 
 Port blocks in use and the block log.",
     ),
     (
+        "cgnat.capacity",
+        "## Capacity
+
+How many ports the pool's subscribers really use: each subscriber's daily peak over 7 days, read every 10 s outside the packet path.",
+    ),
+    (
+        "cgnat.capacity.apply",
+        "## Preview and Apply with Safe Mode
+
+Preview counts the subscribers remapped and the live connections that would be dropped; Apply turns Safe Mode on and sets ports_per_subscriber.",
+    ),
+    (
+        "cgnat.capacity.bands",
+        "## Peak distribution
+
+Subscribers per band of their 7-day peak, as a share of the limit.",
+    ),
+    (
+        "cgnat.capacity.hit",
+        "## Hit the limit, 24 h
+
+Subscribers with new connections refused for lack of a port in 24 h, the refusals and the ICMP sent (RFC 6888 REQ-11).",
+    ),
+    (
+        "cgnat.capacity.p99",
+        "## Peak p99, 7 days
+
+The 7-day peak (busiest protocol) that 99 % of the subscribers stay under, and its share of the limit.",
+    ),
+    (
+        "cgnat.capacity.ports",
+        "## Ports per Subscriber
+
+Each subscriber's limit (× max_blocks in blocks mode) and the subscribers per public address.",
+    ),
+    (
+        "cgnat.capacity.suggestion",
+        "## Suggestion
+
+p99 plus 25 %, rounded up to 64, at least 320; 1.5 × today when over 1 % ran out in 24 h. The gain in subscribers per public address and the public addresses needed.",
+    ),
+    (
         "cgnat.comment",
         "## Comment
 

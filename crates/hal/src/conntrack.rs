@@ -159,6 +159,15 @@ pub struct Event {
     pub stop_ns: Option<u64>,
 }
 
+/// A reader of the table for a thread outside the session lock (G2.7b):
+/// every connection is handed to `each` as it is read, so the table is
+/// never held whole in memory.
+pub trait Scanner: Send {
+    /// Call `each` for every connection (at most [`MAX_READ`]); the table's
+    /// counters after.
+    fn scan(&mut self, each: &mut dyn FnMut(&Conn)) -> Result<Stats, crate::HalError>;
+}
+
 /// A live feed of conntrack events (G4.4b): the kernel's, or the lab's.
 /// Its own sockets, used outside the session lock by the flow exporter.
 pub trait EventSource: Send {

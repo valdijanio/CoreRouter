@@ -341,6 +341,52 @@ conexão, e conecta quando uma porta se libera. O Linux sozinho cumpre só a (a)
 | **nfqueue só de quem está perto do fim** (adotado) | sim | uma checagem `ct state new` por pacote; nada sai do kernel | 4 filas, uma thread cada, sem lock do `Session` |
 
 
+### 1.10 Capacidade (G2.7b)
+
+Quantas portas os assinantes usam de verdade, e quantas portas por assinante isso pede. Fica na aba
+**Capacity** da janela CGNAT.
+
+**De onde vêm os números:**
+
+- A cada 10 s o serviço `cgnat-scan` do daemon lê o conntrack **fora do lock do `Session`**, uma
+  conexão por vez, sem guardar a tabela.
+- Ele monta um vetor ordenado de entradas de 12 bytes (assinante, IP público, protocolo, porta) e só
+  então pega o lock para entregar o resultado.
+- Com o lock, o trabalho é O(assinantes): blocos, alertas, conjunto `full` (G2.7) e os picos.
+- Sem esse serviço (o laboratório), o tick do engine lê sozinho.
+
+**O que se guarda:**
+
+- por assinante, o **pico de cada dia** dos últimos 7 dias, no protocolo mais cheio: um anel de
+  20 bytes por assinante;
+- por pool, as recusas e os ICMP de cada hora das últimas 24 h, e a hora da última recusa de cada
+  assinante;
+- tudo vai ao journal `journal-cgnat-capacity.log` a cada 10 min e volta no boot;
+- teto de 262 144 assinantes guardados.
+
+**Comandos:**
+
+- `ip.firewall.cgnat.capacity {pool}`:
+  - os cartões: limite e assinantes por IP, pico p99 dos 7 dias e seu %, quem bateu no limite em
+    24 h com recusas e ICMP;
+  - a distribuição do pico por faixa: 0–25, 25–50, 50–75, 75–90, 90–100 e 100 %;
+  - a **sugestão**, com o motivo (detalhes abaixo).
+- `ip.firewall.cgnat.capacity.preview {pool, ports_per_subscriber}`, que não muda nada:
+  - quantos assinantes seriam **remapeados** (mudar as portas remapeia o pool inteiro);
+  - quantas **conexões vivas** o commit derrubaria;
+  - se cabe nos IPs públicos e o comando que aplicaria.
+
+**A sugestão:**
+
+- o p99 mais 25 %, arredondado para cima em múltiplos de 64, nunca abaixo de 320;
+- se mais de 1 % dos assinantes vistos ficou sem porta em 24 h, pelo menos 1,5 × o valor de hoje;
+- traz o ganho (ou a perda) em assinantes por IP público e os IPs necessários;
+- no modo blocos não há sugestão: lá quem cresce é `max_blocks`.
+
+**Aplicar com Safe Mode:** o botão só aparece habilitado depois da prévia do mesmo valor. Ele liga o
+Safe Mode (`config.safe-mode.enter`) e roda `ip.firewall.cgnat.pool.set`. Sem confirmação, tudo volta.
+O "Quem era?" guarda a mudança com a hora (seção 1.5).
+
 ## 2. Comandos
 
 | Comando | O que faz |
@@ -356,6 +402,7 @@ conexão, e conecta quando uma porta se libera. O Linux sozinho cumpre só a (a)
 | `ip.firewall.cgnat.block.list {pool?, subscriber?}` | blocos ativos (modo blocos), o atual de cada assinante e há quanto tempo está ocioso |
 | `ip.firewall.cgnat.block.history {subscriber?, public?, port?, from?, to?}` | o log de blocos (alocação e liberação) |
 | `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel; recusados e ICMP enviados (G2.7) |
+| `ip.firewall.cgnat.capacity {pool}` / `capacity.preview {pool, ports_per_subscriber}` | uso real (pico p99 de 7 dias, distribuição, quem bateu no limite em 24 h), sugestão de portas por assinante e a prévia do que mudar derruba (G2.7b) |
 | `ip.firewall.cgnat.set {history_days?, icmp_unreachable?, icmp_rate?}` | retenção do histórico; ICMP quando as portas acabam e o limite por assinante (G2.7) |
 | `tool.ip-calc.cgnat.plan {inside, outside, ports_per_subscriber?, port_range?, mode?, preview?}` | o planner (Tools › IP Calculator): números, checagens, sugestões, prévia e os parâmetros do `pool.add`; aceita quantidades (`"4096"`) |
 | `tool.ip-calc.cgnat.export {…, format: csv \| text \| routeros \| nft}` | a tabela do plano em CSV, texto imprimível, script RouterOS ou o nftables |
@@ -421,6 +468,13 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
   - todo assinante volta pelo "Quem era?" a partir do próprio slot (primeira, última e porta do
     meio);
   - entrada hostil no planner, na exportação e no "Quem era?" vira erro de parâmetro, nunca panic.
+- **Capacidade (G2.7b):**
+  - `crates/engine/tests/cgnat_capacity.rs`: picos, p99, faixas, sugestão (1536 com recusas acima de
+    1 %), prévia (1024 remapeados, conexões contadas, "não cabe" sem mudar nada) e os números que
+    voltam depois de um reinício;
+  - proptest do anel de 7 dias e do journal hostil;
+  - teste da UI: cartões, distribuição, Prévia e Aplicar com Safe Mode;
+  - screenshots claro e escuro.
 - **Fast path (G2.4):** veja `docs/fastpath.md` §3.
 - **Desempenho:** seção 6 (benches `netns_cgnat`, `netns_cgnat_pps`, `cgnat_who_was`).
 
@@ -436,7 +490,7 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
 | G2.4a (feito) | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |
 | G2.3e (feito) | Bateria final de bugs e desempenho e o relatório (seção 6) |
 | G2.7 (feito) | Sem portas: ICMP *host unreachable* (RFC 6888 REQ-11b) com limite de taxa, fila só dos quase cheios; REQ-8 por faixa de portas (seção 1.9) |
-| G2.7b | Aba Capacity: pico p99 por assinante em 7 dias, quem bateu no limite, distribuição, sugestão de `ports_per_subscriber` com prévia e Safe Mode |
+| G2.7b (feito) | Aba Capacity: pico p99 por assinante em 7 dias, quem bateu no limite, distribuição, sugestão de `ports_per_subscriber` com prévia e Safe Mode; leitura do conntrack fora do lock (seção 1.10) |
 
 ## 5. Pesquisa
 
@@ -693,6 +747,31 @@ rodadas, mediana, para a carga pesar igual em todas:
   `confirm` o recusa como antes, sem ICMP. Conta em `overrun`, e o buffer de recepção é de 4 MB.
 - O limitador e as contagens ficam atrás de um `Mutex` compartilhado, uma vez por recusa, sem E/S
   dentro: a 188 mil/s não apareceu disputa.
+
+### 6.8 Capacidade com 64 Ki assinantes (G2.7b, bench `cgnat_capacity`, engine)
+
+**Medido** em 2026-10-27, build release, a mesma máquina (carga 4–9): 65 536 assinantes, 20 conexões
+cada, 1,3 milhão de conexões.
+
+| Etapa | Tempo | Onde |
+|---|---|---|
+| montar o uso (vetor ordenado de 12 bytes) | 51 ms | fora do lock |
+| o mesmo com um conjunto por assinante e protocolo (o método antes do G2.7b) | 75 ms | antes, **dentro** do lock, depois de ler a tabela inteira |
+| entregar ao engine (blocos, alertas, `full`, picos) | 5,6 ms | com o lock |
+| `ip.firewall.cgnat.capacity` do pool de 64 Ki | 4,1 ms | consulta |
+
+**Memória:**
+
+- os picos de 7 dias ocupam 2,8 MiB para 64 Ki assinantes;
+- o uso de uma leitura ocupa 15 MiB para 1,3 milhão de conexões, só enquanto é montado;
+- antes, a leitura guardava a tabela inteira como `Conn` (~100 bytes cada, **estimado**).
+
+**Paralelismo:**
+
+- montar o uso custa 51 ms a cada 10 s, 0,5 % de um núcleo, numa thread própria e fora do lock;
+- dividir por assinante entre threads não pagaria a coordenação;
+- o lock do `Session` fica 5,6 ms com 64 Ki assinantes, em vez de cobrir a leitura do conntrack
+  (~1 s para um milhão de conexões, **estimado** no G2.2).
 
 ### 6.6 O que veth mede e o que só hardware mostra
 

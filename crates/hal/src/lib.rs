@@ -614,6 +614,15 @@ pub trait Hal: Send {
         )))
     }
 
+    /// A reader of the conntrack table for a thread outside the session
+    /// lock (G2.7b: the CGNAT usage scan). Cheap to build.
+    fn conntrack_scanner(&self) -> Result<Box<dyn conntrack::Scanner>, HalError> {
+        Err(HalError::Unsupported(format!(
+            "{} has no connection tracking scanner",
+            self.describe()
+        )))
+    }
+
     /// Connections refused for lack of ports, and the ICMP sent about
     /// them, since the last call (G2.7).
     fn cgnat_exhausted(

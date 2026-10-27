@@ -588,7 +588,7 @@ mod tests {
 #[cfg(target_os = "linux")]
 pub use events::Events;
 #[cfg(target_os = "linux")]
-pub use io::{Lookup, delete, dump, renew, stats};
+pub use io::{Lookup, Scanner, delete, dump, renew, stats};
 
 #[cfg(target_os = "linux")]
 mod io {
@@ -740,6 +740,30 @@ mod io {
                 }
             }
             Err(HalError::Io("conntrack: no answer to a lookup".into()))
+        }
+    }
+
+    /// The table as it is read, one connection at a time (G2.7b): the
+    /// CGNAT usage scan keeps 12 bytes per connection, not a `Conn`.
+    pub struct Scanner;
+
+    impl corerouter_hal::conntrack::Scanner for Scanner {
+        fn scan(
+            &mut self,
+            each: &mut dyn FnMut(&Conn),
+        ) -> Result<corerouter_hal::conntrack::Stats, HalError> {
+            let mut sock = open()?;
+            let seq = 1;
+            sock.send(&super::dump_request(seq), 0).map_err(io)?;
+            let mut n = 0usize;
+            read(&mut sock, seq, |_, body| {
+                if let Some(c) = super::parse_conn(body) {
+                    each(&c);
+                    n += 1;
+                }
+                n < MAX_READ
+            })?;
+            stats()
         }
     }
 

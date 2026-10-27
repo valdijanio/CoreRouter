@@ -145,6 +145,8 @@ pub struct CgnatRuntime {
     /// The running pools at the last tick: a change releases the blocks
     /// whose geometry left at once, not at the next scan.
     pools_seen: Vec<Pool>,
+    /// The last scan the daemon read outside the lock (G2.7b).
+    fed_at: Option<u64>,
     /// `insert_failed` of the kernel at the last scan and the growth since
     /// the first: new connections that found no free NAT tuple.
     insert_failed: Option<(u64, u64)>,
@@ -372,6 +374,95 @@ fn public_port(c: &corerouter_hal::conntrack::Conn) -> u16 {
         c.reply.src_port
     } else {
         c.reply.dst_port
+    }
+}
+
+/// What one read of the connections says about CGNAT usage, built outside
+/// the session lock ([`UsageBuilder`]): the distinct public ports of each
+/// subscriber, sorted, 12 bytes each (a million connections: 12 MB while
+/// it lives; **estimado** from the layout).
+#[derive(Debug, Default)]
+pub struct Usage {
+    /// (subscriber, public address, protocol, public port), sorted, no
+    /// repeats.
+    entries: Vec<(u32, u32, u8, u16)>,
+    /// Distinct ports per subscriber: TCP, UDP, ICMP.
+    pub counts: HashMap<Ipv4Addr, [u32; 3]>,
+    pub stats: corerouter_hal::conntrack::Stats,
+}
+
+/// Builds a [`Usage`] one connection at a time (the scanner hands them
+/// over without keeping the table).
+#[derive(Debug, Default)]
+pub struct UsageBuilder {
+    entries: Vec<(u32, u32, u8, u16)>,
+}
+
+impl UsageBuilder {
+    pub fn add(&mut self, c: &corerouter_hal::conntrack::Conn) {
+        if !c.has(status::SRC_NAT) || !matches!(c.protocol, 6 | 17 | 1) {
+            return;
+        }
+        let (IpAddr::V4(sub), IpAddr::V4(public)) = (c.orig.src, c.reply.dst) else {
+            return;
+        };
+        self.entries.push((u32::from(sub), u32::from(public), c.protocol, public_port(c)));
+    }
+
+    pub fn finish(mut self, stats: corerouter_hal::conntrack::Stats) -> Usage {
+        self.entries.sort_unstable();
+        self.entries.dedup();
+        let mut counts: HashMap<Ipv4Addr, [u32; 3]> = HashMap::new();
+        for (sub, _, proto, _) in &self.entries {
+            let i = match proto {
+                6 => 0,
+                17 => 1,
+                _ => 2,
+            };
+            if let Some(n) = counts.entry(Ipv4Addr::from(*sub)).or_default().get_mut(i) {
+                *n = n.saturating_add(1);
+            }
+        }
+        Usage {
+            entries: self.entries,
+            counts,
+            stats,
+        }
+    }
+}
+
+impl Usage {
+    pub fn subscribers(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
+        self.counts.keys().copied()
+    }
+
+    /// Distinct ports of `sub`'s busiest protocol.
+    pub fn busiest(&self, sub: Ipv4Addr) -> u64 {
+        self.counts
+            .get(&sub)
+            .map_or(0, |c| u64::from(c.iter().copied().max().unwrap_or(0)))
+    }
+
+    /// Distinct ports of `sub`'s busiest protocol inside `slot`.
+    pub fn in_slot(&self, sub: Ipv4Addr, slot: Slot) -> u64 {
+        let (s, p) = (u32::from(sub), u32::from(slot.public));
+        [6u8, 17, 1]
+            .iter()
+            .map(|proto| {
+                let lo = self.entries.partition_point(|e| (e.0, e.1, e.2, e.3) < (s, p, *proto, slot.first_port));
+                let hi = self.entries.partition_point(|e| (e.0, e.1, e.2, e.3) <= (s, p, *proto, slot.last_port));
+                hi.saturating_sub(lo) as u64
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
     }
 }
 
@@ -640,11 +731,45 @@ impl Session {
         }
     }
 
-    /// Usage per subscriber from the kernel's connections.
+    /// Usage per subscriber from the kernel's connections, read here (the
+    /// lab, or no scanner service): the daemon's `cgnat-scan` service reads
+    /// them outside the session lock and calls [`Session::cgnat_scan_feed`].
     fn cgnat_scan(&mut self, now: u64) {
+        if self.ext::<CgnatRuntime>().and_then(|r| r.fed_at).is_some_and(|t| now.saturating_sub(t) < 3 * SCAN_SECS) {
+            return;
+        }
         let Ok((conns, stats)) = self.connections(false) else {
             return;
         };
+        let mut b = UsageBuilder::default();
+        for c in conns.iter() {
+            b.add(c);
+        }
+        self.cgnat_scan_with(now, b.finish(stats));
+    }
+
+    /// A scan read outside the session lock (G2.7b): applied now, and the
+    /// tick stops reading for itself while these keep coming.
+    pub fn cgnat_scan_feed(&mut self, now: u64, usage: Usage) {
+        self.blocks_load();
+        if let Some(r) = self.ext_mut::<CgnatRuntime>() {
+            r.fed_at = Some(now);
+            r.last_scan = Some(now);
+        }
+        self.blocks_forget_stale(now);
+        self.cgnat_scan_with(now, usage);
+        self.blocks_compact(now);
+    }
+
+    /// Whether a scan is worth reading: any enabled pool.
+    pub fn cgnat_scan_wanted(&self) -> bool {
+        self.store().running().ip.cgnat.pools.iter().any(|p| !p.disabled)
+    }
+
+    /// The work of a scan, on what one read found: O(subscribers) under
+    /// the lock (the per-connection work was done building `usage`).
+    fn cgnat_scan_with(&mut self, now: u64, usage: Usage) {
+        let stats = usage.stats;
         let cgnat = self.store().running().ip.cgnat.clone();
         let pools: Vec<(Pool, corerouter_model::cgnat::Layout)> = cgnat
             .pools
@@ -652,31 +777,8 @@ impl Session {
             .filter(|p| !p.disabled)
             .filter_map(|p| p.layout().ok().map(|l| (p.clone(), l)))
             .collect();
-        // Distinct public ports per (subscriber, protocol) and per
-        // (subscriber, slot).
-        let mut ports: HashMap<(Ipv4Addr, u8), HashSet<u16>> = HashMap::new();
-        let mut in_slot: HashMap<(Ipv4Addr, Ipv4Addr, u16), HashSet<(u8, u16)>> = HashMap::new();
-        for c in conns.iter().filter(|c| c.has(status::SRC_NAT)) {
-            let (IpAddr::V4(sub), IpAddr::V4(public)) = (c.orig.src, c.reply.dst) else {
-                continue;
-            };
-            let port = public_port(c);
-            ports.entry((sub, c.protocol)).or_default().insert(port);
-            if let Some((p, l)) = pools.iter().find(|(p, _)| p.mode == Mode::Blocks && p.inside.iter().any(|r| r.contains(sub)))
-                && let Some((a, b)) = l.locate(public, port)
-                && let Some(slot) = l.block(a, b)
-            {
-                let _ = p;
-                in_slot.entry((sub, slot.public, slot.first_port)).or_default().insert((c.protocol, port));
-            }
-        }
-        let busiest = |sub: Ipv4Addr| -> u64 {
-            [6u8, 17, 1]
-                .iter()
-                .map(|pr| ports.get(&(sub, *pr)).map_or(0, HashSet::len) as u64)
-                .max()
-                .unwrap_or(0)
-        };
+        let busiest = |sub: Ipv4Addr| -> u64 { usage.busiest(sub) };
+        let in_block = |sub: Ipv4Addr, slot: Slot| -> u64 { usage.in_slot(sub, slot) };
         // Blocks: grow, release, empty tracking.
         let mut grow: Vec<Ipv4Addr> = Vec::new();
         let mut release: Vec<(Ipv4Addr, Slot, &'static str)> = Vec::new();
@@ -685,12 +787,7 @@ impl Session {
                 let n = blocks.len();
                 for (i, b) in blocks.iter_mut().enumerate() {
                     let Some((p, _)) = pools.iter().find(|(p, _)| p.id == b.pool) else { continue };
-                    let used_set = in_slot.get(&(*sub, b.slot.public, b.slot.first_port));
-                    let used = [6u8, 17, 1]
-                        .iter()
-                        .map(|pr| used_set.map_or(0, |s| s.iter().filter(|(p, _)| p == pr).count()))
-                        .max()
-                        .unwrap_or(0) as u64;
+                    let used = in_block(*sub, b.slot);
                     if used == 0 {
                         let since = *b.empty_since.get_or_insert(now);
                         if now.saturating_sub(since) >= u64::from(p.block_timeout) {
@@ -719,7 +816,7 @@ impl Session {
         let mut full: Vec<Ipv4Addr> = Vec::new();
         if cgnat.settings.icmp_unreachable {
             let active = self.ext::<CgnatRuntime>().map(|r| &r.active);
-            for sub in ports.keys().map(|(s, _)| *s).collect::<HashSet<_>>() {
+            for sub in usage.subscribers() {
                 if cgnat.exception_of(sub).is_some() {
                     continue;
                 }
@@ -732,13 +829,7 @@ impl Session {
                         let Some(b) = active.and_then(|a| a.get(&sub)).and_then(|v| v.last()) else {
                             continue;
                         };
-                        let set = in_slot.get(&(sub, b.slot.public, b.slot.first_port));
-                        let used = [6u8, 17, 1]
-                            .iter()
-                            .map(|pr| set.map_or(0, |s| s.iter().filter(|(p, _)| p == pr).count()))
-                            .max()
-                            .unwrap_or(0) as u64;
-                        (used, u64::from(b.slot.ports()))
+                        (in_block(sub, b.slot), u64::from(b.slot.ports()))
                     }
                 };
                 if size > 0 && used.saturating_mul(100) >= size.saturating_mul(FULL_PERCENT) {
@@ -753,7 +844,12 @@ impl Session {
         // subscribers at their last allowed block.
         let mut crossed: Vec<Alert> = Vec::new();
         let active = self.ext::<CgnatRuntime>().map(|r| r.active.clone()).unwrap_or_default();
-        let subscribers: HashSet<Ipv4Addr> = ports.keys().map(|(s, _)| *s).collect();
+        let subscribers: Vec<Ipv4Addr> = usage.subscribers().collect();
+        // G2.7b: every subscriber's busiest protocol into its daily peak.
+        if let Some(store) = self.cgnat_capacity() {
+            store.record(now, usage.counts.iter().map(|(sub, c)| (sub, u64::from(c.iter().copied().max().unwrap_or(0)))));
+        }
+        self.cgnat_capacity_save(now);
         if let Some(rt) = self.ext_mut::<CgnatRuntime>() {
             for a in rt.alerts.values_mut() {
                 a.was_above = a.above;
@@ -858,6 +954,7 @@ impl Session {
         }
         let cgnat = self.store().running().ip.cgnat.clone();
         let mut lines = Vec::new();
+        let counted: Vec<(Ipv4Addr, corerouter_hal::cgnat::Hit)> = hits.clone();
         if let Some(rt) = self.ext_mut::<CgnatRuntime>() {
             let t = &mut rt.exhaustion;
             t.seen = t.seen.saturating_add(stats.seen);
@@ -895,6 +992,12 @@ impl Session {
                 a.icmp = a.icmp.saturating_add(hit.icmp);
                 a.last_refused = Some(now);
                 a.last = now;
+            }
+        }
+        if let Some(store) = self.cgnat_capacity() {
+            for (sub, hit) in &counted {
+                let pool = cgnat.pool_of(*sub).map(|p| p.name.clone()).unwrap_or_default();
+                store.refused(now, &pool, *sub, hit.refused, hit.icmp);
             }
         }
         for (sub, pool, hit) in lines {
@@ -959,6 +1062,12 @@ impl Session {
     /// service serves it outside the session lock).
     pub fn cgnat_queue(&mut self) -> Result<Box<dyn corerouter_hal::cgnat::CgnatQueue>, String> {
         self.hal_mut().cgnat_queue().map_err(|e| e.to_string())
+    }
+
+    /// A conntrack reader for the daemon's usage scan, outside the session
+    /// lock (G2.7b).
+    pub fn conntrack_scanner(&self) -> Result<Box<dyn corerouter_hal::conntrack::Scanner>, String> {
+        self.hal().conntrack_scanner().map_err(|e| e.to_string())
     }
 
     /// Exhaustion queue `index` of the data plane (G2.7), for a daemon
