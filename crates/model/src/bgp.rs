@@ -222,6 +222,13 @@ pub struct BgpParams {
     /// Unset on eBGP: nothing is sent (RFC 8212).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_filter: Option<String>,
+    /// Keep the routes the neighbor sends before the input chain (FRR
+    /// `soft-reconfiguration inbound`): the preview runs on them, and a new
+    /// input chain applies without asking the neighbor again. RouterOS keeps
+    /// rejected routes too. Unset: yes; it costs memory (one more copy of
+    /// each received route).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub keep_received: Option<bool>,
 }
 
 impl BgpParams {
@@ -247,6 +254,7 @@ impl BgpParams {
         take(&mut self.nexthop_choice, &parent.nexthop_choice);
         take(&mut self.input_filter, &parent.input_filter);
         take(&mut self.output_filter, &parent.output_filter);
+        take(&mut self.keep_received, &parent.keep_received);
     }
 
     /// The families in force: unset is IPv4 only, as in RouterOS.

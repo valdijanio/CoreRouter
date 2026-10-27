@@ -60,7 +60,70 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
         }
     }
     validate_neighbors(cfg, &mut out);
+    validate_filter(cfg, &mut out);
     out
+}
+
+/// `/routing filter` (G3.2b): every rule parses, every chain, list and
+/// jump it names exists, no jump loop, and each chain fits FRR.
+fn validate_filter(cfg: &Config, out: &mut Vec<Issue>) {
+    let routing = &cfg.routing;
+    let f = &routing.filter;
+    for issue in filter::validate_lists(f) {
+        out.push(issue);
+    }
+    let (_, problems) = filter::eval::Policy::build(f);
+    for p in problems {
+        out.push(Issue::new(format!("routing.filter.rules.{}", p.item), p.message));
+    }
+    let chains = f.chains();
+    let resolved = resolve_templates(&routing.bgp_templates);
+    for (key, c) in &routing.bgp_connections {
+        let Ok(eff) = c.effective(&resolved) else { continue };
+        for (param, chain) in [("input_filter", &eff.input_filter), ("output_filter", &eff.output_filter)] {
+            if let Some(chain) = chain
+                && !chains.contains(&chain.as_str())
+            {
+                let hint = filter::parse::did_you_mean(chain, &chains);
+                out.push(Issue::new(
+                    format!("routing.bgp_connections.{key}.params.{param}"),
+                    format!("chain {chain:?} has no rules (routing.filter.rule.add){hint}"),
+                ));
+            }
+        }
+    }
+    let (_, render_problems) = filter_render(routing);
+    for p in render_problems {
+        out.push(Issue::new(format!("routing.filter.rules.{}", p.item), p.message));
+    }
+}
+
+/// The chains the connections use, with the AS of their instance (one
+/// per chain; `None` when connections of instances with different ASes
+/// share it, or nothing tells).
+fn filter_render(routing: &Routing) -> (String, Vec<filter::eval::Problem>) {
+    if routing.filter.rules.is_empty() {
+        return (String::new(), Vec::new());
+    }
+    let resolved = resolve_templates(&routing.bgp_templates);
+    let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut asn: HashMap<String, Option<u32>> = HashMap::new();
+    for c in routing.bgp_connections.values() {
+        let Ok(eff) = c.effective(&resolved) else { continue };
+        let inst = routing.bgp.get(&c.instance).map(|i| i.asn.0);
+        for chain in [&eff.input_filter, &eff.output_filter].into_iter().flatten() {
+            used.insert(chain.clone());
+            let e = asn.entry(chain.clone()).or_insert(inst);
+            if *e != inst {
+                *e = None;
+            }
+        }
+    }
+    let only = (routing.bgp.len() == 1).then(|| routing.bgp.values().next().map(|i| i.asn.0)).flatten();
+    filter::frr::render(&routing.filter, &used, &|chain| match asn.get(chain) {
+        Some(a) => *a,
+        None => only,
+    })
 }
 
 fn validate_neighbors(cfg: &Config, out: &mut Vec<Issue>) {
@@ -203,7 +266,7 @@ pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String>
     for c in routing.bgp_connections.values() {
         by_inst.entry(c.instance.as_str()).or_default().push(c);
     }
-    let mut s = String::new();
+    let (mut s, _) = filter_render(routing);
     for inst in routing.bgp.values() {
         let conns = by_inst
             .get(inst.name.as_str())
@@ -380,6 +443,17 @@ fn neighbor_af(s: &mut String, c: &BgpConnection, p: &BgpParams, afi: Afi) {
             }
         }
     }
+    // G3.2b: the chains. Without one an eBGP neighbor gets and sends
+    // nothing (RFC 8212, FRR's `bgp ebgp-requires-policy`, on by default).
+    if p.keep_received.unwrap_or(true) {
+        let _ = writeln!(s, "  neighbor {a} soft-reconfiguration inbound");
+    }
+    if let Some(chain) = &p.input_filter {
+        let _ = writeln!(s, "  neighbor {a} route-map {} in", filter::frr::route_map(chain));
+    }
+    if let Some(chain) = &p.output_filter {
+        let _ = writeln!(s, "  neighbor {a} route-map {} out", filter::frr::route_map(chain));
+    }
 }
 
 #[cfg(test)]
@@ -494,10 +568,13 @@ mod tests {
              neighbor 192.0.2.1 local-role provider\n neighbor 192.0.2.1 ebgp-multihop\n \
              neighbor 192.0.2.1 timers 30 90\n neighbor 192.0.2.1 password s3cret\n \
              address-family ipv4 unicast\n  neighbor 2001:db8::1 activate\n  \
-             neighbor 2001:db8::1 next-hop-self\n  neighbor 192.0.2.1 activate\n  \
-             neighbor 192.0.2.1 maximum-prefix 1000 restart 5\n exit-address-family\n \
+             neighbor 2001:db8::1 next-hop-self\n  neighbor 2001:db8::1 soft-reconfiguration inbound\n  \
+             neighbor 192.0.2.1 activate\n  \
+             neighbor 192.0.2.1 maximum-prefix 1000 restart 5\n  \
+             neighbor 192.0.2.1 soft-reconfiguration inbound\n exit-address-family\n \
              address-family ipv6 unicast\n  neighbor 2001:db8::1 activate\n  \
-             neighbor 2001:db8::1 next-hop-self\n exit-address-family\nexit\n"
+             neighbor 2001:db8::1 next-hop-self\n  neighbor 2001:db8::1 soft-reconfiguration inbound\n \
+             exit-address-family\nexit\n"
         );
         // A key this router cannot open refuses the render, not a
         // neighbor without its key.

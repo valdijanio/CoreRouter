@@ -19,6 +19,8 @@ pub mod sample;
 
 use std::fmt;
 
+use corerouter_model::Issue;
+use corerouter_model::routing_filter::{MAX_COMMUNITIES, MAX_LISTS, MAX_PREFIX_ENTRIES, MAX_RULES, RoutingFilter};
 use ipnet::IpNet;
 
 /// A large community (RFC 8092 §3: global administrator, two local data
@@ -166,6 +168,64 @@ impl Route {
         }
         s
     }
+}
+
+/// The checks on names, sizes and list entries (the rules themselves are
+/// checked by [`eval::Policy::build`]).
+pub fn validate_lists(f: &RoutingFilter) -> Vec<Issue> {
+    let mut out = Vec::new();
+    if f.rules.len() > MAX_RULES {
+        out.push(Issue::new("routing.filter.rules", format!("at most {MAX_RULES} rules")));
+    }
+    let mut ids = std::collections::HashSet::new();
+    for r in &f.rules {
+        let path = format!("routing.filter.rules.{}", r.id);
+        if !ids.insert(r.id) {
+            out.push(Issue::new(&path, "the id is used twice"));
+        }
+        if let Err(e) = parse::check_chain(&r.chain) {
+            out.push(Issue::new(format!("{path}.chain"), e));
+        }
+    }
+    if f.prefix_lists.len() > MAX_LISTS || f.community_lists.len() > MAX_LISTS {
+        out.push(Issue::new("routing.filter", format!("at most {MAX_LISTS} lists of each kind")));
+    }
+    for (key, l) in &f.prefix_lists {
+        let path = format!("routing.filter.prefix_lists.{key}");
+        if l.name != *key {
+            out.push(Issue::new(&path, "list name does not match its key"));
+        }
+        if let Err(e) = parse::check_name(key) {
+            out.push(Issue::new(&path, e));
+        }
+        if l.entries.len() > MAX_PREFIX_ENTRIES {
+            out.push(Issue::new(format!("{path}.entries"), format!("at most {MAX_PREFIX_ENTRIES} entries")));
+        }
+    }
+    for (key, l) in &f.community_lists {
+        let path = format!("routing.filter.community_lists.{key}");
+        if l.name != *key {
+            out.push(Issue::new(&path, "list name does not match its key"));
+        }
+        if let Err(e) = parse::check_name(key) {
+            out.push(Issue::new(&path, e));
+        }
+        if l.communities.len() > MAX_COMMUNITIES {
+            out.push(Issue::new(format!("{path}.communities"), format!("at most {MAX_COMMUNITIES} communities")));
+        }
+        for c in &l.communities {
+            if let Err(e) = parse_community(c) {
+                out.push(Issue::new(format!("{path}.communities"), e));
+            }
+        }
+    }
+    out
+}
+
+/// The sample's seed for a connection and direction: the same routes on
+/// every preview of it.
+pub fn sample_seed(connection: &str, received: bool) -> u64 {
+    fnv(connection) ^ u64::from(received)
 }
 
 /// FNV-1a, 64 bits: stable names for the generated FRR lists (the same

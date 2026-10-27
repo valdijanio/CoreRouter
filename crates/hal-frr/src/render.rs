@@ -56,7 +56,17 @@ impl Daemon {
 /// ospfd). A daemon left out keeps a stale copy, and `vtysh`, which shows
 /// the copies merged, then hides the difference (measured: `frr-reload.py`
 /// skipped lines the zebra copy still had).
-pub const OWNED: Owned = &[("router bgp ", &[Daemon::Bgpd])];
+pub const OWNED: Owned = &[
+    ("router bgp ", &[Daemon::Bgpd]),
+    // G3.2b: the `/routing filter` render, all named `CR-` (the operator's
+    // own lists and maps are left alone). Only bgpd filters with them.
+    ("ip prefix-list CR-", &[Daemon::Bgpd]),
+    ("ipv6 prefix-list CR-", &[Daemon::Bgpd]),
+    ("bgp as-path access-list CR-", &[Daemon::Bgpd]),
+    ("bgp community-list standard CR-", &[Daemon::Bgpd]),
+    ("bgp large-community-list standard CR-", &[Daemon::Bgpd]),
+    ("route-map CR-", &[Daemon::Bgpd]),
+];
 
 /// A table of owned contexts: header prefix → daemons that take it.
 pub type Owned = &'static [(&'static str, &'static [Daemon])];
