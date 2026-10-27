@@ -72,7 +72,7 @@ The router answers ARP for this address with its own MAC when it routes it elsew
         "arp.source",
         "## Source
 
-dynamic (learned) or static (yours; permanent). published: a static entry the router answers for.",
+dynamic (learned), static (yours; permanent) or **dhcp** (a DHCP server with `add_arp` put it: goes with the lease). published: a static entry the router answers for.",
     ),
     (
         "arp.state",

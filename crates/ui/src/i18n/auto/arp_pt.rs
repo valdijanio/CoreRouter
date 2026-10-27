@@ -150,7 +150,7 @@ O roteador responde ARP por este endereço com o próprio MAC, quando tem rota p
         "arp.source",
         "## Source
 
-De onde a entrada vem: **dynamic** (o kernel aprendeu da rede) ou **static** (você cadastrou; fica `permanent`, nunca expira). **published** marca uma entrada estática que o roteador anuncia como proxy.",
+De onde a entrada vem: **dynamic** (o kernel aprendeu da rede) ou **static** (você cadastrou; fica `permanent`, nunca expira), ou **dhcp** (o servidor DHCP com `add_arp` pôs: some com a concessão). **published** marca uma entrada estática que o roteador anuncia como proxy.",
     ),
     (
         "arp.state",

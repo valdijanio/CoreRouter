@@ -140,7 +140,10 @@ fn bad_parameters_are_refused() {
     let mut s = lab();
     assert!(fails(&mut s, "ip.arp.list", json!({"limit": 0})).contains("1..=5000"));
     assert!(fails(&mut s, "ip.arp.list", json!({"state": "up"})).contains("not one of"));
-    assert!(fails(&mut s, "ip.arp.list", json!({"source": "dhcp6"})).contains("dynamic or static"));
+    assert!(
+        fails(&mut s, "ip.arp.list", json!({"source": "dhcp6"}))
+            .contains("dynamic, static or dhcp")
+    );
     assert!(fails(&mut s, "ip.arp.list", json!({"search": "x".repeat(100)})).contains("at most"));
     let add =
         |mac: &str, ip: &str, i: &str| json!({"address": ip, "mac_address": mac, "interface": i});

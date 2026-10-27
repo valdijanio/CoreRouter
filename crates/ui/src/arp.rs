@@ -292,7 +292,12 @@ pub(crate) fn row(r: &Value) -> Row {
         states.push(("router", Kind::Blue));
     }
     let source = s(r, "source");
-    let source_kind = if source == "static" { Kind::Blue } else { Kind::Neutral };
+    let source_kind = match source.as_str() {
+        "static" => Kind::Blue,
+        // DHCP add-arp: the lease put it there.
+        "dhcp" => Kind::Green,
+        _ => Kind::Neutral,
+    };
     let mut source_chips = vec![(source.as_str(), source_kind)];
     if s(r, "published") == "true" {
         source_chips.push(("published", Kind::Amber));
@@ -701,7 +706,11 @@ impl ArpPanel {
                 chip::chip(ui, &format!("{matched} {}", tr_in(SCOPE, l, "match")), chip::BLUE.tone(&v));
             }
             let sources = p.pointer("/counts/sources").cloned().unwrap_or(Value::Null);
-            for (k, tone) in [("static", chip::BLUE.tone(&v)), ("dynamic", chip::neutral_tone(&v))] {
+            for (k, tone) in [
+                ("static", chip::BLUE.tone(&v)),
+                ("dhcp", chip::GREEN.tone(&v)),
+                ("dynamic", chip::neutral_tone(&v)),
+            ] {
                 if let Some(c) = sources.get(k).and_then(Value::as_u64) {
                     chip::chip(ui, &format!("{c} {}", tr_in(SCOPE, l, k)), tone);
                 }

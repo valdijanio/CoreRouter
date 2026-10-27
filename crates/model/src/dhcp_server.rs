@@ -144,6 +144,12 @@ pub struct DhcpServer {
     /// Reply by broadcast even to clients that can take unicast.
     #[serde(default)]
     pub always_broadcast: bool,
+    /// RouterOS `add-arp` (G1.27d): each bound lease becomes a static
+    /// ARP entry on the server's interface, removed when the lease ends.
+    /// With the interface's `arp=reply-only`, only DHCP clients reach the
+    /// router (anti-spoofing).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub add_arp: bool,
     /// The address the server answers from and names itself with (option
     /// 54); `None` picks the interface's address inside the client's
     /// network.
@@ -231,6 +237,7 @@ impl DhcpServer {
             authoritative: Authoritative::Yes,
             conflict_detection: true,
             always_broadcast: false,
+            add_arp: false,
             server_address: None,
             relay: None,
             dhcp_option_set: None,

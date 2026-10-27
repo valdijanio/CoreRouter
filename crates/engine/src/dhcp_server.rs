@@ -378,6 +378,8 @@ impl Session {
     /// Follow the running config: the plan, the journal (first time), the
     /// sockets.
     fn dhcp_server_sync(&mut self, now: Now, fx: &mut Vec<(Effect, Option<u64>)>) {
+        // G1.27d: add-arp entries of servers that no longer want them.
+        self.dhcp_add_arp_sync();
         let rev = self.store().current_revision();
         let running = self.store().running();
         let empty = running.ip.dhcp_server.servers.is_empty() && running.ip.dhcp_server.alerts.is_empty();
@@ -558,6 +560,7 @@ impl Session {
             match e {
                 Effect::Bound(b) => {
                     self.dhcp_bound(&b, now);
+                    self.dhcp_add_arp_bound(&b);
                     self.dhcp_history_bound(&b.lease, b.new, now);
                     if self.ipoe_server(&b.lease.server)
                         && let Some(ipoe) = self.ipoe_backend()
@@ -568,6 +571,7 @@ impl Session {
                 }
                 Effect::Gone(l) => {
                     self.dhcp_gone(l.address, now);
+                    self.dhcp_add_arp_gone(l.address);
                     self.dhcp_history_gone(l.address, now);
                     if let Some(ipoe) = self.ipoe_backend() {
                         ipoe.gone(&l, l.state.as_str());
