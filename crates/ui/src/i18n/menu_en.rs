@@ -39,7 +39,6 @@ pub(super) const HELP: &[(&str, &str)] = &[
     ("menu.ipv6-settings", "## What it does\nGlobal IPv6 switches: forwarding between interfaces and whether router advertisements are accepted (SLAAC on the WAN)."),
     ("menu.log", "## What it does\nThe router's messages as they happen, by topic and severity, with search."),
     ("menu.logging", "## What it does\nWhere the messages go: rules by topic and actions (memory, disk, remote syslog)."),
-    ("menu.mpls", "## What it does\nMPLS label switching and LDP, for VPLS and L3VPN between sites. Not implemented yet."),
     ("menu.mtr", "## What it does\nTraceroute that keeps going (MTR) or one pass (Traceroute), over ICMP, UDP or TCP, with Paris to follow one ECMP path: each hop of the path with loss and latency over time, AS and operator of each hop. Shows where along the path a problem starts."),
     ("menu.neighbors", "## What it does\nDevices seen on the links by LLDP and the router's own discovery: name, address, platform and the port they are on."),
     ("menu.ntp-client", "## What it does\nKeeps the router's clock right from NTP servers. Logs, certificates and DHCP leases depend on the time being correct."),

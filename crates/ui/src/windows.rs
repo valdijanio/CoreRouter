@@ -17,7 +17,6 @@ pub enum Win {
     Firewall,
     Bgp,
     Ospf,
-    Mpls,
     Identity,
     History,
     Ping,
@@ -48,7 +47,9 @@ pub(crate) const MENU: &[(&str, &[Win])] = &[
     ),
     ("IPv6", &[]),
     ("Routing", &[Win::Bgp, Win::Ospf]),
-    ("MPLS", &[Win::Mpls]),
+    // MPLS › LDP and Forwarding Table are panels (`mpls_ldp.rs`,
+    // `mpls_forwarding.rs`, G3.5).
+    ("MPLS", &[]),
     // The CGNAT window is a panel (`cgnat.rs`, G2.3d).
     ("CGNAT", &[]),
     // The RADIUS window is a panel (`radius.rs`, G4.3j); RouterOS has it
@@ -96,7 +97,6 @@ impl Win {
         Win::Firewall,
         Win::Bgp,
         Win::Ospf,
-        Win::Mpls,
         Win::Identity,
         Win::History,
         Win::Ping,
@@ -127,7 +127,6 @@ impl Win {
             Win::Firewall => "Firewall",
             Win::Bgp => "BGP",
             Win::Ospf => "OSPF",
-            Win::Mpls => "MPLS",
             Win::Identity => "Identity",
             Win::History => "History",
             Win::Ping => "Ping",
@@ -139,7 +138,6 @@ impl Win {
     pub fn gap(self) -> Option<&'static str> {
         match self {
             Win::Ospf => Some("G3.4"),
-            Win::Mpls => Some("G3.5"),
             _ => None,
         }
     }

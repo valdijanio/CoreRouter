@@ -17,7 +17,7 @@ use corerouter_model::{Config, IfName};
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_str, opt_text, opt_u32, req_str};
-use super::mpls::mpls_supported;
+use super::mpls::{mpls_supported, normalize, preview_on};
 use super::{CommandSpec, always};
 use crate::{EngineError, Result, Session};
 
@@ -46,6 +46,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "mpls.ldp.interface.list", "LDP Interfaces", ["MPLS", "LDP", "Interface"], None,
         "{} → [{interface, hello_interval, hold_time, afi, disabled, comment, state (active | down | disabled | no daemon | unknown), adjacencies, igp_sync? (achieved | waiting), mtu, mtu_warning?}]",
         always, interface_list),
+    cmd!(query "mpls.ldp.interface.preview", "Check LDP Interface", [], None,
+        "{id?: string (the interface being edited), interface?: string, hello_interval?: u32 | string, hold_time?: u32 | string, afi?: string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        always, interface_preview),
     cmd!("mpls.ldp.neighbor.add", "Add LDP Neighbor", ["MPLS", "LDP", "Neighbor"], None,
         "{lsr_id: ipv4, targeted?: ip (send targeted Hellos there: a session to a router that is not adjacent), password?: string (TCP MD5, sealed at once), keepalive_hold?: u32 (s, 15..=65535), disabled?: bool, comment?: string} → {lsr_id}",
         mpls_supported, neighbor_add),
@@ -55,6 +58,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!("mpls.ldp.neighbor.remove", "Remove LDP Neighbor", [], None,
         "{id: ipv4 (the LSR id)} → {lsr_id}",
         always, neighbor_remove),
+    cmd!(query "mpls.ldp.neighbor.preview", "Check LDP Neighbor", [], None,
+        "{id?: string (the LSR id being edited), lsr_id?: string, targeted?: string, password?: string, keepalive_hold?: u32 | string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        always, neighbor_preview),
     cmd!(query "mpls.ldp.neighbor.list", "LDP Neighbors", ["MPLS", "LDP", "Neighbor"], None,
         "{} → [{lsr_id, dynamic (discovered, not configured), state, operational, afi?, transport?, uptime?, targeted?, password (set or not), keepalive_hold?, labels (FECs it sent a label for), in_use (of them, used), disabled, comment}]",
         always, neighbor_list),
@@ -281,7 +287,10 @@ fn if_name(cfg: &Config, p: &Value, key: &str) -> Result<IfName> {
 }
 
 fn interface_add(s: &mut Session, p: &Value) -> Result<Value> {
-    let cfg = s.store_mut().candidate_mut();
+    interface_add_cfg(s.store_mut().candidate_mut(), p)
+}
+
+fn interface_add_cfg(cfg: &mut Config, p: &Value) -> Result<Value> {
     let name = if_name(cfg, p, "interface")?;
     let m = &mut cfg.routing.mpls;
     if m.ldp_interfaces.contains_key(&name) {
@@ -307,7 +316,11 @@ fn existing_ldp_if(m: &mut Mpls, p: &Value) -> Result<IfName> {
 }
 
 fn interface_set(s: &mut Session, p: &Value) -> Result<Value> {
-    let m = &mut s.store_mut().candidate_mut().routing.mpls;
+    interface_set_cfg(s.store_mut().candidate_mut(), p)
+}
+
+fn interface_set_cfg(cfg: &mut Config, p: &Value) -> Result<Value> {
+    let m = &mut cfg.routing.mpls;
     let n = existing_ldp_if(m, p)?;
     if let Some(i) = m.ldp_interfaces.get_mut(&n) {
         apply_if(i, p)?;
@@ -422,9 +435,13 @@ fn apply_nbr(n: &mut LdpNeighbor, p: &Value, pw: Option<Option<Sealed>>) -> Resu
 }
 
 fn neighbor_add(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = v4_of(p, "lsr_id")?.ok_or_else(|| EngineError::bad("lsr_id", "is required"))?;
     let pw = password(s, p)?;
-    let m = &mut s.store_mut().candidate_mut().routing.mpls;
+    neighbor_add_cfg(s.store_mut().candidate_mut(), p, pw)
+}
+
+fn neighbor_add_cfg(cfg: &mut Config, p: &Value, pw: Option<Option<Sealed>>) -> Result<Value> {
+    let id = v4_of(p, "lsr_id")?.ok_or_else(|| EngineError::bad("lsr_id", "is required"))?;
+    let m = &mut cfg.routing.mpls;
     if m.ldp_neighbors.contains_key(&id) {
         return Err(EngineError::bad("lsr_id", format!("{id} is already configured (mpls.ldp.neighbor.set)")));
     }
@@ -449,9 +466,14 @@ fn nbr_id(m: &Mpls, p: &Value) -> Result<Ipv4Addr> {
 }
 
 fn neighbor_set(s: &mut Session, p: &Value) -> Result<Value> {
-    let id = nbr_id(&s.store().candidate().routing.mpls, p)?;
+    nbr_id(&s.store().candidate().routing.mpls, p)?;
     let pw = password(s, p)?;
-    let m = &mut s.store_mut().candidate_mut().routing.mpls;
+    neighbor_set_cfg(s.store_mut().candidate_mut(), p, pw)
+}
+
+fn neighbor_set_cfg(cfg: &mut Config, p: &Value, pw: Option<Option<Sealed>>) -> Result<Value> {
+    let id = nbr_id(&cfg.routing.mpls, p)?;
+    let m = &mut cfg.routing.mpls;
     if let Some(n) = m.ldp_neighbors.get_mut(&id) {
         apply_nbr(n, p, pw)?;
     }
@@ -505,4 +527,58 @@ fn neighbor_list(s: &mut Session, _: &Value) -> Result<Value> {
             })
             .collect(),
     ))
+}
+
+// ---- previews (the list modals) ----
+
+fn interface_preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let p = normalize(raw, &["hello_interval", "hold_time"], &[]);
+    let editing = raw.get("id").is_some_and(|v| !v.is_null());
+    let mut out = if editing {
+        let mut p = p;
+        if let Some(o) = p.as_object_mut() {
+            o.remove("interface");
+        }
+        preview_on(s, p, "mpls.ldp.interface.set", &interface_set_cfg)
+    } else {
+        preview_on(s, p, "mpls.ldp.interface.add", &interface_add_cfg)
+    };
+    // RFC 3032 §3: one label more on every packet out of it.
+    let cfg = s.store().candidate();
+    let name = raw.get("id").or_else(|| raw.get("interface")).and_then(Value::as_str).and_then(|n| n.parse::<IfName>().ok());
+    if let Some(i) = name.as_ref().and_then(|n| cfg.interfaces.get(n)) {
+        let payload = cfg.routing.mpls.settings.payload_mtu;
+        let mtu = u32::from(i.mtu);
+        let (level, message) = match corerouter_proto_mpls::mtu_warning(payload, 1, mtu) {
+            Some(w) => ("warning", w),
+            None => ("ok", format!("MTU {mtu} carries a {payload}-byte IP packet with one label")),
+        };
+        if let Some(c) = out.get_mut("checks").and_then(Value::as_array_mut) {
+            c.push(json!({"level": level, "check": "mtu", "message": message, "param": "interface"}));
+        }
+    }
+    Ok(out)
+}
+
+fn neighbor_preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let p = normalize(raw, &["keepalive_hold"], &["targeted"]);
+    let editing = raw.get("id").is_some_and(|v| !v.is_null());
+    let has_pw = p.get("password").and_then(Value::as_str).is_some_and(|k| !k.is_empty());
+    // A stand-in: the preview never seals (nor shows) the key.
+    let pw = has_pw.then(|| Some(Sealed::from_box(format!("{}preview", corerouter_model::sealed::PREFIX))));
+    if let Some(k) = p.get("password").and_then(Value::as_str)
+        && (k.len() > 80 || !k.bytes().all(|b| b.is_ascii_graphic()))
+        && !k.is_empty()
+    {
+        return Ok(json!({"computed": [], "commands": [], "checks": [{"level": "error", "check": "param", "param": "password", "message": "1..=80 printable characters without spaces (RFC 2385)"}]}));
+    }
+    Ok(if editing {
+        let mut p = p;
+        if let Some(o) = p.as_object_mut() {
+            o.remove("lsr_id");
+        }
+        preview_on(s, p, "mpls.ldp.neighbor.set", &|c, p| neighbor_set_cfg(c, p, pw.clone()))
+    } else {
+        preview_on(s, p, "mpls.ldp.neighbor.add", &|c, p| neighbor_add_cfg(c, p, pw.clone()))
+    })
 }

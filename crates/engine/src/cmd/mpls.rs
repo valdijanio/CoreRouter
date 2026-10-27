@@ -53,6 +53,9 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "mpls.static.list", "Static LSPs", ["MPLS", "Static"], None,
         "{} → [{label, nexthop, interface?, out_labels, out_label (text), disabled, comment}]",
         always, static_list),
+    cmd!(query "mpls.static.preview", "Check Static LSP", [], None,
+        "{id?: string (the label being edited), label?: u32 | string, nexthop?: string, interface?: string, out_labels?: [u32] | string, disabled?: bool | yes | no, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]} (form texts accepted; never an error: bad input is a check)",
+        always, static_preview),
     cmd!(query "mpls.forwarding-table.page", "MPLS Forwarding Table", ["MPLS", "Forwarding Table"], None,
         "{find?: string (FEC, label, next hop or interface contains it), origin?: string (ldp | static | bgp | other), unlabeled?: bool (only FECs without an outgoing label), offset?: u32, limit?: u32 (1..=5000, default 500)} → {total, offset, rows: [{fec?, in_label?, out_label, out_labels, nexthop?, interface?, peer?, origin, installed, igp_sync?, reason?, mtu?}], summary: {rows, fecs, labeled, unlabeled, egress, static, mtu_warnings, labels (kernel entries)}, ldp: {running, daemon (a routing daemon reports), error?}, note?, available, why?}",
         always, forwarding_page),
@@ -287,12 +290,15 @@ fn nexthop(p: &Value) -> Result<Option<IpAddr>> {
 }
 
 fn static_add(s: &mut Session, p: &Value) -> Result<Value> {
+    static_add_cfg(s.store_mut().candidate_mut(), p)
+}
+
+pub(super) fn static_add_cfg(cfg: &mut Config, p: &Value) -> Result<Value> {
     let label = opt_u32(p, "label")?.ok_or_else(|| EngineError::bad("label", "is required"))?;
     let nh = nexthop(p)?.ok_or_else(|| EngineError::bad("nexthop", "is required"))?;
     let out = stack(p, "out_labels")?.unwrap_or_default();
     let comment = opt_text(p, "comment", 256)?.unwrap_or_default();
     let disabled = opt_bool(p, "disabled")?.unwrap_or(false);
-    let cfg = s.store_mut().candidate_mut();
     let interface = match opt_str(p, "interface")? {
         Some(n) => Some(interface_of(cfg, "interface", n)?),
         None => None,
@@ -327,12 +333,15 @@ fn check_label(m: &corerouter_model::mpls::Mpls, label: u32) -> Result<()> {
 }
 
 fn static_set(s: &mut Session, p: &Value) -> Result<Value> {
+    static_set_cfg(s.store_mut().candidate_mut(), p)
+}
+
+pub(super) fn static_set_cfg(cfg: &mut Config, p: &Value) -> Result<Value> {
     let label = label_id(p)?;
     let nh = nexthop(p)?;
     let out = stack(p, "out_labels")?;
     let comment = opt_text(p, "comment", 256)?;
     let disabled = opt_bool(p, "disabled")?;
-    let cfg = s.store_mut().candidate_mut();
     let interface = match p.get("interface") {
         None => None,
         Some(Value::Null) => Some(None),
@@ -391,6 +400,84 @@ fn static_list(s: &mut Session, _: &Value) -> Result<Value> {
             })
             .collect(),
     ))
+}
+
+/// A form's texts as the commands take them: numbers from text, `yes`/`no`
+/// as booleans; an empty number is left out, an empty `nullable` is null.
+pub(super) fn normalize(raw: &Value, numeric: &[&str], nullable: &[&str]) -> Value {
+    let mut out = serde_json::Map::new();
+    if let Some(o) = raw.as_object() {
+        for (k, v) in o {
+            let v = match v {
+                Value::String(t) if numeric.contains(&k.as_str()) => {
+                    let t = t.trim();
+                    if t.is_empty() {
+                        continue;
+                    }
+                    t.parse::<u64>().map_or_else(|_| json!(t), |n| json!(n))
+                }
+                Value::String(t) if nullable.contains(&k.as_str()) && t.trim().is_empty() => Value::Null,
+                Value::String(t) if t == "yes" || t == "no" => json!(t == "yes"),
+                v => v.clone(),
+            };
+            out.insert(k.clone(), v);
+        }
+    }
+    Value::Object(out)
+}
+
+/// The preview of a list modal: `run` on a copy of the candidate, its
+/// error as a check under the field, then `/mpls` validation and what
+/// FRR would get; the command to send.
+pub(super) fn preview_on(
+    s: &Session,
+    p: Value,
+    command: &str,
+    run: &dyn Fn(&mut Config, &Value) -> Result<Value>,
+) -> Value {
+    let check = |level: &str, check: &str, message: String, param: &str| {
+        json!({"level": level, "check": check, "message": message, "param": param})
+    };
+    let mut cfg = s.store().candidate().clone();
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    match run(&mut cfg, &p) {
+        Err(EngineError::BadParam { param, reason }) => checks.push(check("error", "param", reason, &param)),
+        Err(e) => checks.push(check("error", "param", e.to_string(), "")),
+        Ok(_) => {
+            // Only what this change brings (the candidate's own issues are
+            // not this form's).
+            let before = corerouter_proto_mpls::validate(s.store().candidate());
+            for i in corerouter_proto_mpls::validate(&cfg) {
+                if before.contains(&i) {
+                    continue;
+                }
+                checks.push(check("error", "mpls", i.message, ""));
+            }
+            if let Ok(frr) = corerouter_proto_mpls::render_frr(&cfg.routing.mpls, &|_| Some("•••".into()))
+                && !frr.is_empty()
+            {
+                computed.push(json!({"label": "FRR ldpd", "value": frr.trim_end()}));
+            }
+            commands.push(json!({"command": command, "params": p}));
+        }
+    }
+    json!({"computed": computed, "checks": checks, "commands": commands})
+}
+
+fn static_preview(s: &mut Session, raw: &Value) -> Result<Value> {
+    let editing = raw.get("id").is_some_and(|v| !v.is_null());
+    let p = normalize(raw, &["label"], &["interface"]);
+    Ok(if editing {
+        let mut p = p;
+        if let Some(o) = p.as_object_mut() {
+            o.remove("label");
+        }
+        preview_on(s, p, "mpls.static.set", &static_set_cfg)
+    } else {
+        preview_on(s, p, "mpls.static.add", &static_add_cfg)
+    })
 }
 
 // ---- forwarding table ----
