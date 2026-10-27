@@ -23,8 +23,18 @@ const NFQNL_MSG_CONFIG: u16 = 2;
 const NFQA_PACKET_HDR: u16 = 1;
 const NFQA_VERDICT_HDR: u16 = 2;
 const NFQA_PAYLOAD: u16 = 10;
+const NFQA_CT: u16 = 11;
 const NFQA_CFG_CMD: u16 = 1;
 const NFQA_CFG_PARAMS: u16 = 2;
+const NFQA_CFG_QUEUE_MAXLEN: u16 = 3;
+const NFQA_CFG_MASK: u16 = 4;
+const NFQA_CFG_FLAGS: u16 = 5;
+/// `NFQA_CFG_F_FAIL_OPEN`: the queue full, packets go on instead of
+/// being dropped.
+pub const F_FAIL_OPEN: u32 = 1;
+/// `NFQA_CFG_F_CONNTRACK`: each packet comes with its connection
+/// (`NFQA_CT`), both tuples as the NAT left them.
+pub const F_CONNTRACK: u32 = 2;
 const NFQNL_CFG_CMD_BIND: u8 = 1;
 const NFQNL_COPY_PACKET: u8 = 2;
 const NLM_F_REQUEST: u16 = 0x1;
@@ -32,6 +42,12 @@ const NLM_F_ACK: u16 = 0x4;
 const AF_INET: u16 = 2;
 /// The bytes of each packet we look at: the IPv4 header.
 pub const COPY_RANGE: u32 = 20;
+/// The bytes kept of a packet that may be refused with an ICMP error: what
+/// RFC 1812 §4.3.2.3 lets the error quote (576 bytes in all).
+pub const COPY_QUOTE: u32 = 548;
+/// Packets one exhaustion queue holds at most (the kernel's limit;
+/// [`F_FAIL_OPEN`] lets the rest go on).
+pub const MAXLEN: u32 = 4096;
 pub const NF_DROP: u32 = 0;
 pub const NF_ACCEPT: u32 = 1;
 
@@ -94,6 +110,36 @@ pub fn params_request(num: u16, seq: u32) -> Vec<u8> {
     )
 }
 
+/// Copy the first `copy` bytes of each packet.
+pub fn params_request_with(num: u16, seq: u32, copy: u32) -> Vec<u8> {
+    let mut p = copy.to_be_bytes().to_vec();
+    p.push(NFQNL_COPY_PACKET);
+    msg(
+        NFQNL_MSG_CONFIG,
+        NLM_F_ACK,
+        0,
+        num,
+        seq,
+        &[(NFQA_CFG_PARAMS, p)],
+    )
+}
+
+/// Set `flags` (and the queue's length) on queue `num`.
+pub fn flags_request(num: u16, seq: u32, flags: u32, maxlen: u32) -> Vec<u8> {
+    msg(
+        NFQNL_MSG_CONFIG,
+        NLM_F_ACK,
+        0,
+        num,
+        seq,
+        &[
+            (NFQA_CFG_QUEUE_MAXLEN, maxlen.to_be_bytes().to_vec()),
+            (NFQA_CFG_FLAGS, flags.to_be_bytes().to_vec()),
+            (NFQA_CFG_MASK, flags.to_be_bytes().to_vec()),
+        ],
+    )
+}
+
 pub fn verdict_request(num: u16, id: u32, accept: bool) -> Vec<u8> {
     let mut v = (if accept { NF_ACCEPT } else { NF_DROP })
         .to_be_bytes()
@@ -146,17 +192,78 @@ pub fn packets(buf: &[u8]) -> Vec<(u32, Option<Ipv4Addr>)> {
     out
 }
 
+/// One queued packet with what came along.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Packet<'a> {
+    pub id: u32,
+    /// The first bytes of the packet (as it is at the hook: after the NAT
+    /// in postrouting).
+    pub payload: &'a [u8],
+    /// Its connection, when the queue asked for it ([`F_CONNTRACK`]).
+    pub ct: Option<corerouter_hal::conntrack::Conn>,
+}
+
+/// The packets of one `recv` buffer with payload and connection; hostile
+/// or truncated messages yield nothing, never a panic.
+pub fn packets_with(buf: &[u8]) -> Vec<Packet<'_>> {
+    let mut out = Vec::new();
+    let mut rest = buf;
+    while let Some(hdr) = rest.get(..16) {
+        let len = hdr
+            .get(..4)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u32::from_ne_bytes);
+        let kind = hdr
+            .get(4..6)
+            .and_then(|b| b.try_into().ok())
+            .map_or(0, u16::from_ne_bytes);
+        let len = usize::try_from(len).unwrap_or(0);
+        if len < 20 {
+            break;
+        }
+        let Some(m) = rest.get(..len) else { break };
+        rest = rest.get(len.div_ceil(4) * 4..).unwrap_or(&[]);
+        if kind != ((NFNL_SUBSYS_QUEUE << 8) | NFQNL_MSG_PACKET) {
+            continue;
+        }
+        let body = m.get(20..).unwrap_or(&[]);
+        let Some(id) = find(attrs(body), NFQA_PACKET_HDR)
+            .and_then(|a| a.data.get(..4).and_then(|b| b.try_into().ok()))
+            .map(u32::from_be_bytes)
+        else {
+            continue;
+        };
+        let payload = find(attrs(body), NFQA_PAYLOAD).map_or(&[][..], |a| a.data);
+        let ct = find(attrs(body), NFQA_CT).and_then(|a| crate::ctnl::parse_conn(a.data));
+        out.push(Packet { id, payload, ct });
+    }
+    out
+}
+
+/// The IPv4 source of a packet's first bytes.
+pub fn ipv4_source(payload: &[u8]) -> Option<Ipv4Addr> {
+    (payload.first().map(|v| v >> 4) == Some(4))
+        .then(|| {
+            payload
+                .get(12..16)
+                .and_then(|b| <[u8; 4]>::try_from(b).ok())
+                .map(Ipv4Addr::from)
+        })
+        .flatten()
+}
+
 #[cfg(target_os = "linux")]
-pub use io::Queue;
+pub use io::{Bound, Queue};
 
 #[cfg(target_os = "linux")]
 mod io {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::os::fd::AsFd;
-    use std::time::Duration;
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
 
     use corerouter_hal::HalError;
-    use corerouter_hal::cgnat::{CgnatQueue, Pending};
+    use corerouter_hal::cgnat::{CgnatQueue, Exhaustion, Pending};
     use netlink_sys::{Socket, protocols::NETLINK_NETFILTER};
     use nix::poll::{PollFd, PollFlags, PollTimeout, poll};
 
@@ -164,31 +271,40 @@ mod io {
         HalError::Io(format!("netfilter queue: {e}"))
     }
 
-    pub struct Queue {
+    /// A socket bound to one queue: receive packets, give verdicts.
+    pub struct Bound {
         sock: Socket,
         num: u16,
-        ready: VecDeque<Pending>,
         buf: Vec<u8>,
     }
 
-    impl Queue {
-        pub fn open(num: u16) -> Result<Self, HalError> {
+    impl Bound {
+        /// Bind to queue `num`, copying `copy` bytes of each packet, with
+        /// `flags` ([`super::F_CONNTRACK`], [`super::F_FAIL_OPEN`]) if any.
+        pub fn open(num: u16, copy: u32, flags: u32) -> Result<Self, HalError> {
             let mut sock = Socket::new(NETLINK_NETFILTER).map_err(io)?;
             sock.bind_auto().map_err(io)?;
             let mut q = Self {
                 sock,
                 num,
-                ready: VecDeque::new(),
                 buf: vec![0u8; 1 << 16],
             };
-            for (seq, req) in [
+            let mut reqs = vec![
                 (1, super::bind_request(num, 1)),
-                (2, super::params_request(num, 2)),
-            ] {
+                (2, super::params_request_with(num, 2, copy)),
+            ];
+            if flags != 0 {
+                reqs.push((3, super::flags_request(num, 3, flags, super::MAXLEN)));
+            }
+            for (seq, req) in reqs {
                 q.sock.send(&req, 0).map_err(io)?;
                 q.ack(seq)?;
             }
             Ok(q)
+        }
+
+        pub fn num(&self) -> u16 {
+            self.num
         }
 
         /// Wait for the ACK of `seq` (a refusal is the error: another
@@ -240,6 +356,57 @@ mod io {
             }
             Err(HalError::Io("netfilter queue: no ACK".into()))
         }
+
+        /// Wait at most `wait` for packets; the received bytes (parse them
+        /// with [`super::packets_with`]), empty when none came.
+        pub fn recv(&mut self, wait: Duration) -> Result<&[u8], HalError> {
+            let ms = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
+            let mut fds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
+            if poll(&mut fds, PollTimeout::from(ms)).map_err(io)? == 0 {
+                return Ok(&[]);
+            }
+            let n = self.sock.recv(&mut &mut self.buf[..], 0).map_err(io)?;
+            Ok(self.buf.get(..n).unwrap_or(&[]))
+        }
+
+        pub fn verdict(&self, id: u32, accept: bool) -> Result<(), HalError> {
+            self.sock
+                .send(&super::verdict_request(self.num, id, accept), 0)
+                .map(|_| ())
+                .map_err(io)
+        }
+    }
+
+    /// The blocks queue (G2.3c): first packets of subscribers without a
+    /// block. Keeps each held packet's first bytes so a refusal can quote
+    /// it in the ICMP (G2.7).
+    pub struct Queue {
+        bound: Bound,
+        ready: VecDeque<Pending>,
+        heads: HashMap<u32, Vec<u8>>,
+        icmp: Option<(Arc<Exhaustion>, Option<crate::cgnat_icmp::Sender>)>,
+        clock: Instant,
+    }
+
+    impl Queue {
+        pub fn open(num: u16) -> Result<Self, HalError> {
+            Ok(Self {
+                bound: Bound::open(num, super::COPY_QUOTE, 0)?,
+                ready: VecDeque::new(),
+                heads: HashMap::new(),
+                icmp: None,
+                clock: Instant::now(),
+            })
+        }
+
+        /// Refusals answer with ICMP within `shared`'s limits.
+        pub fn with_icmp(mut self, shared: Arc<Exhaustion>) -> Self {
+            let sender = crate::cgnat_icmp::Sender::open()
+                .map_err(|e| log::warn!("cgnat: no ICMP for refused subscribers: {e}"))
+                .ok();
+            self.icmp = Some((shared, sender));
+            self
+        }
     }
 
     impl CgnatQueue for Queue {
@@ -247,28 +414,63 @@ mod io {
             if let Some(p) = self.ready.pop_front() {
                 return Ok(Some(p));
             }
-            let ms = u16::try_from(wait.as_millis()).unwrap_or(u16::MAX);
-            let mut fds = [PollFd::new(self.sock.as_fd(), PollFlags::POLLIN)];
-            if poll(&mut fds, PollTimeout::from(ms)).map_err(io)? == 0 {
-                return Ok(None);
-            }
-            let n = self.sock.recv(&mut &mut self.buf[..], 0).map_err(io)?;
-            for (id, src) in super::packets(self.buf.get(..n).unwrap_or(&[])) {
-                match src {
-                    Some(subscriber) => self.ready.push_back(Pending { id, subscriber }),
+            let mut pass = Vec::new();
+            for p in super::packets_with(self.bound.recv(wait)?) {
+                match super::ipv4_source(p.payload) {
+                    Some(subscriber) => {
+                        self.ready.push_back(Pending { id: p.id, subscriber });
+                        if self.icmp.is_some() {
+                            self.heads.insert(p.id, p.payload.to_vec());
+                        }
+                    }
                     // Not IPv4 or unreadable: let it go (it is no CGNAT
                     // subscriber of ours).
-                    None => self.verdict(id, true)?,
+                    None => pass.push(p.id),
                 }
+            }
+            for id in pass {
+                self.bound.verdict(id, true)?;
             }
             Ok(self.ready.pop_front())
         }
 
         fn verdict(&mut self, id: u32, accept: bool) -> Result<(), HalError> {
-            self.sock
-                .send(&super::verdict_request(self.num, id, accept), 0)
-                .map(|_| ())
-                .map_err(io)
+            self.heads.remove(&id);
+            // Bounded by the queue: ids the daemon never answered.
+            if self.heads.len() > 4096 {
+                self.heads.clear();
+            }
+            self.bound.verdict(id, accept)
+        }
+
+        fn refuse(&mut self, id: u32) -> Result<bool, HalError> {
+            let head = self.heads.remove(&id);
+            self.bound.verdict(id, false)?;
+            let (Some((shared, sender)), Some(head)) = (self.icmp.as_mut(), head) else {
+                return Ok(false);
+            };
+            let Some(sub) = super::ipv4_source(&head) else {
+                return Ok(false);
+            };
+            let ms = u64::try_from(self.clock.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if !shared.refused(sub, ms) {
+                return Ok(false);
+            }
+            // Before the NAT: the packet is as the subscriber sent it.
+            let Some(sender) = sender.as_mut() else { return Ok(false) };
+            let Some(msg) = crate::cgnat_icmp::unreachable(&head, sub, None) else {
+                return Ok(false);
+            };
+            match sender.send(sub, &msg) {
+                Ok(()) => {
+                    shared.sent(sub);
+                    Ok(true)
+                }
+                Err(e) => {
+                    log::debug!("cgnat: ICMP to {sub}: {e}");
+                    Ok(false)
+                }
+            }
         }
     }
 }

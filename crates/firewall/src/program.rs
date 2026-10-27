@@ -367,10 +367,14 @@ pub enum Expr {
         dreg: Option<u32>,
         inv: bool,
     },
-    /// `queue num <num>` (no bypass: without a listener the packet is
-    /// dropped, never let through untranslated).
+    /// `queue num <num>[-<num + total - 1>] [bypass]`. Without `bypass` and
+    /// without a listener the packet is dropped (the blocks queue: never
+    /// let through untranslated); with it, it goes on as if not queued.
+    /// More than one queue: the kernel picks one by flow hash.
     Queue {
         num: u16,
+        total: u16,
+        bypass: bool,
     },
     Nat {
         kind: NatKind,
