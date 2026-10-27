@@ -53,6 +53,7 @@ fn table_allows(table: Table, action: &Action) -> bool {
                     | Action::MarkPacket { .. }
                     | Action::MarkRouting { .. }
             ),
+            Table::Raw => matches!(action, Action::Drop | Action::Notrack),
         }
 }
 
@@ -286,6 +287,23 @@ fn issues_in(
     }
     if let Err(e) = family(r) {
         out.push(e);
+    }
+    // Raw runs before connection tracking: nothing about the connection
+    // is known yet (RouterOS has no such matchers in raw either).
+    if table == Table::Raw {
+        for (field, set) in [
+            ("connection_state", m.connection_state.is_some()),
+            ("connection_nat_state", m.connection_nat_state.is_some()),
+            ("connection_mark", m.connection_mark.is_some()),
+            ("routing_mark", m.routing_mark.is_some()),
+        ] {
+            if set {
+                out.push((
+                    field,
+                    "raw runs before connection tracking: use it in filter or mangle".into(),
+                ));
+            }
+        }
     }
     let in_any = m.in_interface.is_some() || m.in_interface_list.is_some();
     let out_any = m.out_interface.is_some() || m.out_interface_list.is_some();

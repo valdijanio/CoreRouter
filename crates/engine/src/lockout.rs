@@ -6,6 +6,8 @@
 //! connection's packets are walked through the running and the candidate
 //! firewall (`corerouter_firewall::eval`):
 //!
+//! - its packets and our replies in raw `prerouting`/`output` (G2.1c; a
+//!   `notrack` there turns the filter's view into `untracked`),
 //! - its established packets in `input` (the session itself),
 //! - a new connection from the same address to the same port (logging in
 //!   again after this session ends),
@@ -165,10 +167,10 @@ pub fn access_addresses(cfg: &Config, link: &Link) -> Vec<(corerouter_model::Ite
         .collect()
 }
 
-fn probes(cfg: &Config, link: &Link) -> Vec<Probe> {
+fn probes(cfg: &Config, dynamic: &[DynamicAddress], link: &Link) -> Vec<Probe> {
     let (peer, local) = (plain(link.peer.ip()), plain(link.local.ip()));
     let iface = ingress_interface(cfg, peer, local);
-    let inbound = |state| Packet {
+    let packet = |state| Packet {
         src: peer,
         dst: local,
         protocol: Protocol::TCP,
@@ -179,7 +181,43 @@ fn probes(cfg: &Config, link: &Link) -> Vec<Probe> {
         out_interface: None,
         state,
     };
+    // A raw `notrack` makes the filter see the packets as untracked (an
+    // `accept established` no longer takes them).
+    let untracked = |chain, p: Packet| {
+        if walk(cfg, dynamic, Table::Raw, chain, &p).verdict == Verdict::Notrack {
+            Packet {
+                state: ConnState::Untracked,
+                ..p
+            }
+        } else {
+            p
+        }
+    };
+    let inbound = |state| untracked("prerouting", packet(state));
+    let reply = Packet {
+        src: local,
+        dst: peer,
+        protocol: Protocol::TCP,
+        src_port: Some(link.local.port()),
+        dst_port: Some(link.peer.port()),
+        icmp: None,
+        in_interface: None,
+        out_interface: iface.clone(),
+        state: ConnState::Established,
+    };
     vec![
+        Probe {
+            what: "would drop this connection before connection tracking",
+            table: Table::Raw,
+            chain: "prerouting",
+            packet: packet(ConnState::Established),
+        },
+        Probe {
+            what: "would drop the replies to this connection before connection tracking",
+            table: Table::Raw,
+            chain: "output",
+            packet: reply.clone(),
+        },
         Probe {
             what: "would drop this connection",
             table: Table::Filter,
@@ -190,17 +228,7 @@ fn probes(cfg: &Config, link: &Link) -> Vec<Probe> {
             what: "would drop the replies to this connection",
             table: Table::Filter,
             chain: "output",
-            packet: Packet {
-                src: local,
-                dst: peer,
-                protocol: Protocol::TCP,
-                src_port: Some(link.local.port()),
-                dst_port: Some(link.peer.port()),
-                icmp: None,
-                in_interface: None,
-                out_interface: iface.clone(),
-                state: ConnState::Established,
-            },
+            packet: untracked("output", reply),
         },
         Probe {
             what: "would refuse a new login from your address (after this session ends)",
@@ -327,8 +355,8 @@ impl Session {
         if same {
             return None;
         }
-        let was_probes = probes(before, &link);
-        for (probe, old) in probes(after, &link).into_iter().zip(was_probes) {
+        let was_probes = probes(before, dyn_before, &link);
+        for (probe, old) in probes(after, dyn_after, &link).into_iter().zip(was_probes) {
             let now = walk(after, dyn_after, probe.table, probe.chain, &probe.packet);
             let was = walk(before, dyn_before, old.table, old.chain, &old.packet);
             if !cut(probe.table, now) || cut(probe.table, was) {

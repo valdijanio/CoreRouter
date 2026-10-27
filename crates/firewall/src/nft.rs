@@ -101,6 +101,9 @@ fn base_hook(table: Table, chain: &str) -> Option<(&'static str, &'static str, &
         (Table::Mangle, "forward") => ("filter", "forward", "mangle"),
         (Table::Mangle, "output") => ("route", "output", "mangle"),
         (Table::Mangle, "postrouting") => ("filter", "postrouting", "mangle"),
+        // Priority raw (-300): before conntrack (-200), so notrack works.
+        (Table::Raw, "prerouting") => ("filter", "prerouting", "raw"),
+        (Table::Raw, "output") => ("filter", "output", "raw"),
         _ => return None,
     })
 }
@@ -385,6 +388,8 @@ fn statements(
         Action::Log { log_prefix } if log_prefix.is_empty() => "log".into(),
         Action::Log { log_prefix } => format!("log prefix {}", quoted(log_prefix)),
         Action::Passthrough => String::new(),
+        // RouterOS: notrack ends the raw chain like accept.
+        Action::Notrack => "notrack accept".into(),
         Action::Masquerade { to_ports: None } => "masquerade".into(),
         Action::Masquerade { to_ports: Some(p) } => format!("masquerade to :{p}"),
         Action::SrcNat {
