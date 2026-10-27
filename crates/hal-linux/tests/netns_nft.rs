@@ -8,8 +8,9 @@
 //!
 //! Same guard as `tests/netns.rs`: without the variable every test returns
 //! early; with it, the namespace must hold nothing but `lo` (so the host's
-//! own nftables rules are never in reach). Without the `nft` program the
-//! tests skip with a note (it is how `hal-linux` loads rulesets).
+//! own nftables rules are never in reach). The ruleset goes over nfnetlink
+//! (G2.8); the tests read it back with the `nft` program and skip without
+//! it.
 #![cfg(target_os = "linux")]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
@@ -106,7 +107,7 @@ fn firewall_is_applied_replaced_and_removed_atomically() {
         added_by_rule: false,
     };
     hal.address_list_dynamic(DynamicChange::Add(&d)).unwrap();
-    assert_eq!(nft::dynamic().len(), 1);
+    assert_eq!(corerouter_hal_linux::firewall::dynamic().unwrap().len(), 1);
     let mut changed = fw_only.clone();
     changed.ip.firewall.filter.retain(|r| r.id.0 != 2);
     hal.apply(&fw_only, &changed).unwrap();
@@ -201,7 +202,7 @@ fn rules_fill_address_lists_from_the_packet_path() {
     // A SYN to 2222: nothing listens (refused), but the input chain saw it.
     let addr: std::net::SocketAddr = "127.0.0.1:2222".parse().unwrap();
     let _ = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2));
-    let kept = nft::dynamic();
+    let kept = corerouter_hal_linux::firewall::dynamic().unwrap();
     assert!(
         kept.iter().any(|d| d.added_by_rule
             && d.list.as_str() == "knock"

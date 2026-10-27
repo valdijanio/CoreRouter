@@ -116,7 +116,40 @@ netns sem root, 2026-10-23, `cargo bench -p corerouter-hal-linux --bench netns_c
   150 mil assinantes (**estimado**).
 - No roteador o daemon é root e o limite some.
 
-O firewall do G2.1 continua no `nft -f` por enquanto: a migração para o mesmo encoder é a G2.8.
+O firewall do G2.1 passou para o mesmo encoder na G2.8 (abaixo).
+
+**G2.8, o firewall (`inet corerouter`) por nfnetlink (medido).** Mesma máquina, kernel 7.0,
+nft 1.0.9, build release, netns sem root, 2026-10-27,
+`cargo bench -p corerouter-hal-linux --bench netns_firewall`. "nft" é o caminho de antes
+(`nft -j list` + `nft -f` do ruleset inteiro, com o texto antigo de sets anônimos):
+
+| Operação | nfnetlink | `nft` (antes) |
+|---|---|---|
+| carregar 100 / 1 000 / 10 000 regras | 17,4 / 24,6 / 112 ms | 22,8 / 49,3 ms / 4,09 s |
+| mudar 1 regra em 100 / 1 000 / 10 000 | 15,8 / 22,3 / 109 ms | 26,7 / 99,4 ms / 6,91 s |
+| 1 000 entradas dinâmicas | 0,92 ms (um lote) | 2,37 s (um `nft` por entrada) |
+| 100 000 entradas dinâmicas | 116 ms | não cabe ("Message too long"); 383 ms num `add element` único |
+| ler 1 000 / 100 000 entradas dinâmicas | 0,24 / 246 ms | 3,3 / 636 ms (`nft -j`) |
+
+- **Só a diferença:** o commit lê os handles do kernel (um dump), confere que a tabela é a que
+  carregamos e manda num lote só as regras que saíram (`DELRULE`), as que entraram no lugar
+  (`NEWRULE` com posição), os elementos e as chains/sets que mudaram. Regra igual mantém o handle
+  e os contadores. Tabela alterada por terceiros ou set com outra definição: troca inteira.
+- **O kernel é o gargalo do commit:** qualquer lote que remove algo espera um período de graça
+  RCU, 12–28 ms (o próprio `nft delete rule` leva isso); só acrescentar custa ~0,5 ms.
+- **Sets anônimos custam O(sets) cada no kernel** (nome e busca por nome varrem a lista da
+  tabela): 10 000 regras com `th dport { 22, 80, 443 }` levavam 22 s, com `ct state { … }` 3,2 s,
+  no `nft` e em nós. Listas de portas viraram sets nomeados compartilhados por conteúdo
+  (`ports_22_80_443`) e `ct state a,b` máscara (o estado é um bit): 77 ms e 63 ms.
+- **Paralelismo:** o programa antigo, o novo e o dump do kernel são independentes e rodam em
+  threads (10 000 regras: 15 + 15 + 38 ms em série). Os lotes não paralelizam: o nfnetlink segura
+  o mutex do nf_tables por lote inteiro; 100 000 entradas em 4 threads/4 sockets ≈ 1 lote só,
+  dentro do ruído, e com corrida entre lotes do mesmo set. Em 100 000 entradas o kernel leva
+  ~97 ms e o espaço de usuário ~8 ms (merge em `u128`, era 10 ms com `Vec<u8>`).
+- **O dump fica:** 12 500 regras são 6,3 MB e 25–28 ms só de kernel; é o que detecta a tabela
+  mexida por outro. Guardar handles e conferir o `genid` evitaria o dump, mas o genid muda a cada
+  commit de qualquer tabela (o CGNAT muda por assinante), então o cache quase nunca valeria.
+- O `nft` não roda mais em produção; a imagem perde o jansson (`nft -j`).
 
 #### 1.2.2 CGNAT sem portas: nfqueue só dos quase cheios (G2.7, **medido**)
 
