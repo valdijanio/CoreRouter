@@ -186,3 +186,5 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G3.2 dividido em G3.2a (BGP base), G3.2b (políticas) e G3.2c (RPKI e "Por que essa rota?"); G3.2a feito
 - 2026-10-27 — G1.27d em andamento (parte a: leitura, eventos e comandos)
 - 2026-10-27 — G4.4j feito, redefinido para incluir o log de NAT do CGNAT (RFC 8158) e a aba Logging; G4.4k (DTLS) e G4.4l (identidade nas sessões, VRF) criados
+- 2026-10-27 — G1.27d parte b (janela IP › ARP)
+- 2026-10-27 — G1.27d parte c (add-arp do servidor DHCP)
