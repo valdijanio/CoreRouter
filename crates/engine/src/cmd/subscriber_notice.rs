@@ -40,6 +40,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.subscriber-notice.profile.print", "Notice Profiles", [], None,
         "{} → [{id, name, mode, address_list, page?, intercept, interval, interval_secs, timeout, timeout_secs, rate_limit?, kill_connections, webhook, disabled, comment?, behaviour, members}]",
         always, profile_print),
+    cmd!(query "ip.subscriber-notice.profile.preview", "Notice Profile Preview", [], None,
+        "{id?: string, name?: string, mode?: block|notice|throttle, address_list?: string, page?: string, intercept?: probes|http, interval?: duration, timeout?: duration, rate_limit?: string, kill_connections?: bool, webhook?: bool, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, profile_preview),
+    cmd!(query "ip.subscriber-notice.walled-garden.preview", "Walled Garden Preview", [], None,
+        "{id?: string, dst_host?: string, dst_address?: string, disabled?: bool, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}]}",
+        always, garden_preview),
     cmd!("ip.subscriber-notice.walled-garden.add", "Add Walled Garden", [], None,
         "{dst_host?: string (a domain the router resolves: the ISP's site, the bank's PIX page), dst_address?: prefix (allowed as is), disabled?: bool, comment?: string} → {id}",
         always, garden_add),
@@ -65,7 +71,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{id, name, title, text, color, logo_url?, button_text?, button_url?, continue_text?, comment?, used_by: [string]} (the built-in page is not listed: page.preview without a page shows it)]",
         always, page_print),
     cmd!(query "ip.subscriber-notice.page.preview", "Preview Notice Page", [], None,
-        "{page?: string (a page's name; default: the built-in one), title?: string, text?: string, color?: string, logo_url?: string, button_text?: string, button_url?: string, continue_text?: string (unsaved edits over the page), address?: ip (fill with this subscriber's variables; default: sample values)} → {html, problem?}",
+        "{page?: string (a page's name; default: the built-in one), title?: string, text?: string, color?: string, logo_url?: string, button_text?: string, button_url?: string, continue_text?: string (unsaved edits over the page), address?: ip (fill with this subscriber's variables; default: sample values)} → {html, problem?, title, color, paragraphs: [string], button_text, button_url, continue_text, logo_url} (the parts filled, for a preview drawn without HTML)",
         always, page_preview),
     cmd!(query "ip.subscriber-notice.active.list", "Notice Active", [], None,
         "{profile?: string, find?: string (in the address, login or comment), limit?: int 1..100000 (default 10000)} → {total, rows: [{address, profile, mode, source (static|dynamic), comment?, login?, since?, since_secs_ago?, seen, seen_secs_ago?}]}",
@@ -594,7 +600,12 @@ fn page_preview(s: &mut Session, p: &Value) -> Result<Value> {
     };
     let lookup = |k: &str| vars.get(k).cloned().or_else(|| if address.is_none() { sample(k) } else { None });
     let html = render(&pg, &lookup, Some("#"));
-    Ok(json!({"html": html, "problem": problem}))
+    let fill = |t: &str| corerouter_model::subscriber_notice::fill(t, &lookup);
+    let paragraphs: Vec<String> = fill(&pg.text).split("\n\n").map(|x| x.trim().to_owned()).filter(|x| !x.is_empty()).collect();
+    Ok(json!({
+        "html": html, "problem": problem, "title": fill(&pg.title), "color": pg.color, "paragraphs": paragraphs,
+        "button_text": pg.button_text, "button_url": fill(&pg.button_url), "continue_text": pg.continue_text, "logo_url": pg.logo_url,
+    }))
 }
 
 fn single(a: &AddrMatch) -> Option<IpAddr> {
@@ -854,4 +865,135 @@ fn login_remove(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn login_print(s: &mut Session, _: &Value) -> Result<Value> {
     Ok(Value::Array(cfg(s).logins.iter().map(|l| json!({"name": l.login, "profile": l.profile})).collect()))
+}
+
+fn check(level: &str, check: &str, message: impl Into<String>, param: Option<&str>) -> Value {
+    json!({"level": level, "check": check, "message": message.into(), "param": param})
+}
+
+/// `p` without the empty strings (a modal sends every field) and `id`.
+fn given(p: &Value) -> Value {
+    let mut q = p.clone();
+    if let Some(o) = q.as_object_mut() {
+        o.retain(|k, v| k != "id" && !matches!(v, Value::String(t) if t.trim().is_empty()));
+    }
+    q
+}
+
+fn bad_check(e: EngineError) -> Value {
+    match e {
+        EngineError::BadParam { param, reason } => check("error", "invalid", reason, Some(param.as_str())),
+        e => check("error", "invalid", e.to_string(), None),
+    }
+}
+
+fn profile_preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let sn = cfg(s).clone();
+    let id = opt_str(p, "id")?.map(str::trim).filter(|t| !t.is_empty());
+    let base = match id {
+        Some(raw) => match find_by(&json!({"id": raw}), sn.profiles.iter().map(|x| (x.id, x.name.to_string())), "profile") {
+            Ok(i) => sn.profiles.get(i).cloned(),
+            Err(e) => return Ok(json!({"computed": [], "checks": [bad_check(e)], "commands": []})),
+        },
+        None => None,
+    };
+    let q = given(p);
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    let made = match &base {
+        Some(b) => {
+            let mut pr = b.clone();
+            apply_profile(&mut pr, &q, &sn, false).map(|()| pr)
+        }
+        None => {
+            let need = ["name", "mode", "address_list"];
+            if let Some(k) = need.iter().find(|k| q.get(**k).is_none()) {
+                Err(EngineError::bad(k, "is required"))
+            } else {
+                (|| {
+                    let name = name_param(&q, "name")?.ok_or_else(|| EngineError::bad("name", "is required"))?;
+                    let mode = opt_mode(&q)?.ok_or_else(|| EngineError::bad("mode", "is required"))?;
+                    let list = name_param(&q, "address_list")?.ok_or_else(|| EngineError::bad("address_list", "is required"))?;
+                    if sn.profile(name.as_str()).is_some() {
+                        return Err(EngineError::bad("name", format!("profile {name} exists")));
+                    }
+                    let mut pr = Profile::new(ItemId(0), name, mode, list);
+                    apply_profile(&mut pr, &q, &sn, true)?;
+                    Ok(pr)
+                })()
+            }
+        }
+    };
+    match made {
+        Err(e) => checks.push(bad_check(e)),
+        Ok(pr) => {
+            let mut next = sn.clone();
+            match &base {
+                Some(b) => {
+                    if let Some(slot) = next.profiles.iter_mut().find(|x| x.id == b.id) {
+                        *slot = pr.clone();
+                    }
+                }
+                None => next.profiles.push(pr.clone()),
+            }
+            match next.problem() {
+                Some(why) => checks.push(check("error", "invalid", why, Some("address_list"))),
+                None => checks.push(check("ok", "valid", "ready", None)),
+            }
+            computed.push(json!({"label": "Behaviour", "value": pr.behaviour()}));
+            let members = s.notice_members().iter().filter(|m| base.as_ref().is_some_and(|b| b.name.as_str() == m.profile)).count();
+            let in_list = s.store().running().ip.firewall.address_lists.iter().filter(|e| e.list == pr.address_list).count()
+                + s.dynamic_addresses.entries().iter().filter(|e| e.list == pr.address_list).count();
+            computed.push(json!({"label": "Members", "value": format!("{} in list {} now", in_list.max(members), pr.address_list)}));
+            if pr.mode == Mode::Block && sn.walled_garden.iter().all(|g| g.disabled) {
+                checks.push(check("warning", "garden", "the walled garden is empty: a blocked subscriber reaches only the page (add the ISP's site and the payment pages)", None));
+            }
+            if pr.mode != Mode::Block && pr.intercept == Intercept::Http {
+                checks.push(check("info", "intercept", "every plain-HTTP request of a member goes to the page until it is seen (TVs and IoT that fetch over HTTP are caught too)", Some("intercept")));
+            }
+            let cmd = if base.is_some() { "ip.subscriber-notice.profile.set" } else { "ip.subscriber-notice.profile.add" };
+            let mut params = q.clone();
+            if let (Some(b), Some(o)) = (&base, params.as_object_mut()) {
+                o.insert("id".into(), json!(b.id));
+            }
+            commands.push(json!({"command": cmd, "params": params}));
+        }
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
+}
+
+fn garden_preview(s: &mut Session, p: &Value) -> Result<Value> {
+    let sn = cfg(s).clone();
+    let id: Option<ItemId> = opt_str(p, "id")?.map(str::trim).filter(|t| !t.is_empty()).and_then(|t| t.parse().ok());
+    let base = id.and_then(|id| sn.walled_garden.iter().find(|g| g.id == id).cloned());
+    let q = given(p);
+    let mut g = base.clone().unwrap_or(GardenEntry { id: ItemId(0), dst_host: String::new(), dst_address: None, disabled: false, comment: String::new() });
+    let mut checks = Vec::new();
+    let mut computed = Vec::new();
+    let mut commands = Vec::new();
+    match apply_garden(&mut g, &q) {
+        Err(e) => checks.push(bad_check(e)),
+        Ok(()) => {
+            let dup = sn.walled_garden.iter().any(|x| Some(x.id) != id && x.dst_host == g.dst_host && x.dst_address == g.dst_address);
+            if dup {
+                checks.push(check("error", "duplicate", "already in the walled garden", Some("dst_host")));
+            } else {
+                checks.push(check("ok", "valid", "ready", None));
+            }
+            let what = if g.dst_host.is_empty() {
+                format!("{} as is", g.dst_address.map(|n| n.to_string()).unwrap_or_default())
+            } else {
+                format!("the addresses {} resolves to, through the router's DNS every 5 min", g.dst_host)
+            };
+            computed.push(json!({"label": "Allows", "value": what}));
+            let cmd = if base.is_some() { "ip.subscriber-notice.walled-garden.set" } else { "ip.subscriber-notice.walled-garden.add" };
+            let mut params = q.clone();
+            if let (Some(b), Some(o)) = (&base, params.as_object_mut()) {
+                o.insert("id".into(), json!(b.id));
+            }
+            commands.push(json!({"command": cmd, "params": params}));
+        }
+    }
+    Ok(json!({"computed": computed, "checks": checks, "commands": commands}))
 }

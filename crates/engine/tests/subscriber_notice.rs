@@ -706,3 +706,85 @@ fn the_generated_ruleset_has_the_notice_chains() {
         "address",
     );
 }
+
+#[test]
+fn previews_for_the_modals() {
+    let mut s = lab();
+    let p = ok(
+        &mut s,
+        "ip.subscriber-notice.profile.preview",
+        json!({"name": "atraso", "mode": "", "address_list": "bloqueados"}),
+    );
+    assert_eq!(p["checks"][0]["param"], "mode", "{p}");
+    let p = ok(
+        &mut s,
+        "ip.subscriber-notice.profile.preview",
+        json!({"name": "atraso", "mode": "block", "address_list": "bloqueados"}),
+    );
+    assert_eq!(p["checks"][0]["level"], "ok", "{p}");
+    assert!(
+        p["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["check"] == "garden")
+    );
+    assert_eq!(
+        p["commands"][0]["command"],
+        "ip.subscriber-notice.profile.add"
+    );
+    assert!(
+        p["computed"][0]["value"]
+            .as_str()
+            .unwrap()
+            .contains("refused")
+    );
+    let p = ok(
+        &mut s,
+        "ip.subscriber-notice.profile.preview",
+        json!({"name": "x", "mode": "block", "address_list": "sn-x"}),
+    );
+    assert_eq!(p["checks"][0]["level"], "error");
+    ok(
+        &mut s,
+        "ip.subscriber-notice.profile.add",
+        json!({"name": "atraso", "mode": "block", "address_list": "bloqueados"}),
+    );
+    let p = ok(
+        &mut s,
+        "ip.subscriber-notice.profile.preview",
+        json!({"id": "atraso", "mode": "notice", "intercept": "http"}),
+    );
+    assert_eq!(
+        p["commands"][0]["command"],
+        "ip.subscriber-notice.profile.set"
+    );
+    assert!(
+        p["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["check"] == "intercept"),
+        "{p}"
+    );
+    let g = ok(
+        &mut s,
+        "ip.subscriber-notice.walled-garden.preview",
+        json!({"dst_host": "pix.banco.com.br"}),
+    );
+    assert!(
+        g["computed"][0]["value"]
+            .as_str()
+            .unwrap()
+            .contains("router's DNS")
+    );
+    let g = ok(
+        &mut s,
+        "ip.subscriber-notice.walled-garden.preview",
+        json!({"dst_host": "a b"}),
+    );
+    assert_eq!(g["checks"][0]["param"], "dst_host");
+    let pv = ok(&mut s, "ip.subscriber-notice.page.preview", json!({}));
+    assert_eq!(pv["title"], "Aviso do seu provedor");
+    assert!(pv["paragraphs"][0].as_str().unwrap().contains("joao.silva"));
+}
