@@ -59,7 +59,6 @@ mod linux {
     use std::time::{Duration, Instant};
 
     use corerouter_hal::Hal;
-    use corerouter_hal::neigh::NeighborFeed;
     use corerouter_hal_linux::LinuxHal;
     use criterion::{Criterion, Throughput};
 

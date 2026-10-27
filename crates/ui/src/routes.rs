@@ -193,7 +193,7 @@ impl Route {
     }
 
     /// Address, then the interface and reachability as chips.
-    fn gateway_cell(&self) -> String {
+    pub(crate) fn gateway_cell(&self) -> String {
         let link = self.interface.as_ref().or(self.gateway_interface.as_ref());
         let mut chips: Vec<(&str, Kind)> = Vec::new();
         let text = match (&self.gateway_address, link) {
@@ -208,6 +208,8 @@ impl Route {
         match self.gateway_status.as_deref() {
             Some("reachable") => chips.push(("reachable", Kind::Green)),
             Some("unreachable") if !self.disabled => chips.push(("unreachable", Kind::Red)),
+            // G1.27d: routed, but the gateway does not answer ARP/ND.
+            Some("incomplete") if !self.disabled => chips.push(("incomplete", Kind::Amber)),
             _ => {}
         }
         let check;

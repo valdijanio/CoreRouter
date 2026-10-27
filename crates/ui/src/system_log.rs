@@ -34,6 +34,7 @@ const MAX_TECH: usize = 400;
 /// Topics offered in the filter: what, not how bad.
 const TOPICS: &[&str] = &[
     "account",
+    "arp",
     "cgnat",
     "dhcp",
     "dns",

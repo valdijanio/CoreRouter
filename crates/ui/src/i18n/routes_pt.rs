@@ -26,6 +26,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("down for", "fora há"),
     ("exact", "exato"),
     ("inactive", "inativas"),
+    ("incomplete", "incompleto"),
     ("kernel agrees", "kernel confere"),
     ("kernel differs", "kernel difere"),
     ("kernel not checked", "kernel não consultado"),

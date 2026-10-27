@@ -194,7 +194,7 @@ fn age(i: &mut Inner) {
     let reads = i.reads;
     let mut changed = Vec::new();
     for (k, n) in i.table.iter_mut() {
-        let turn = (hash(&k.0, k.1) ^ reads) % AGE_EVERY == 0;
+        let turn = (hash(&k.0, k.1) ^ reads).is_multiple_of(AGE_EVERY);
         if !turn {
             continue;
         }
@@ -481,12 +481,16 @@ mod tests {
         lab.sync(&cfg());
         let mut ev = Vec::new();
         feed.recv(0, 10_000, &mut ev).unwrap();
-        assert!(
-            ev.iter()
-                .filter(|e| matches!(e, NeighEvent::Upsert(_)))
-                .count()
-                >= 13
-        );
+        // The 12 lab hosts of 10.0.0.0/24 (1–12 and 254, the router's
+        // .1 aside), some of them twice when aging took its turn.
+        let hosts: std::collections::BTreeSet<IpAddr> = ev
+            .iter()
+            .filter_map(|e| match e {
+                NeighEvent::Upsert(n) => Some(n.address),
+                NeighEvent::Remove { .. } => None,
+            })
+            .collect();
+        assert_eq!(hosts.len(), 12);
         ev.clear();
         for _ in 0..AGE_EVERY {
             feed.recv(0, 10_000, &mut ev).unwrap();

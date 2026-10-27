@@ -150,7 +150,7 @@ fn attr(buf: &mut Vec<u8>, kind: u16, data: &[u8]) {
     buf.extend_from_slice(&len.to_ne_bytes());
     buf.extend_from_slice(&kind.to_ne_bytes());
     buf.extend_from_slice(data);
-    while buf.len() % 4 != 0 {
+    while !buf.len().is_multiple_of(4) {
         buf.push(0);
     }
 }

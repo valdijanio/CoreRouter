@@ -32,7 +32,7 @@ const N: u32 = 100_000;
 
 fn neighbor(i: u32) -> Neighbor {
     let port = format!("ether{}", 1 + i % 8);
-    let address = if i % 20 == 0 {
+    let address = if i.is_multiple_of(20) {
         IpAddr::V6(Ipv6Addr::new(
             0x2001,
             0xdb8,
@@ -54,7 +54,7 @@ fn neighbor(i: u32) -> Neighbor {
     Neighbor {
         interface: port.parse().unwrap(),
         address,
-        mac: state.resolved().then(|| {
+        mac: state.resolved().then_some({
             [
                 0x02,
                 (i >> 24) as u8,
@@ -99,7 +99,7 @@ fn neigh_100k(c: &mut Criterion) {
         b.iter(|| {
             flip = flip.wrapping_add(1);
             let mut n = neighbor(flip % N);
-            n.state = if flip % 2 == 0 {
+            n.state = if flip.is_multiple_of(2) {
                 NeighState::Stale
             } else {
                 NeighState::Reachable

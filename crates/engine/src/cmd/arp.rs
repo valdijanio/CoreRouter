@@ -753,7 +753,7 @@ fn arp_ping(
     let (mut sent, mut got) = (0u32, 0u32);
     let mut rtts: Vec<f64> = Vec::new();
     let summary = |sent: u32, got: u32, rtts: &[f64]| {
-        let loss = if sent == 0 { 0 } else { (sent - got) * 100 / sent };
+        let loss = sent.saturating_sub(got).saturating_mul(100).checked_div(sent).unwrap_or(0);
         let avg = if rtts.is_empty() { None } else { Some(rtts.iter().sum::<f64>() / rtts.len() as f64) };
         json!({
             "sent": sent,
