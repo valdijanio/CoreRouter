@@ -562,7 +562,7 @@ pub(crate) fn show(
         .iter()
         .filter_map(|&i| {
             let c = columns.get(i)?;
-            let icon = if c.help.is_empty() { 0.0 } else { HELP_W };
+            let icon = if c.help.is_empty() { 0.0 } else { HELP_W + 10.0 };
             Some((i, icon + text_width(ui, c.title, &font)))
         })
         .collect();
@@ -625,9 +625,9 @@ pub(crate) fn show(
             for &(i, w) in &layout {
                 if let Some(c) = columns.get(i).filter(|c| !c.help.is_empty()) {
                     let left = if c.right {
-                        x + CELL_PAD
+                        x + CELL_PAD + 4.0
                     } else {
-                        x + CELL_PAD + text_width(ui, c.title, &font) + 2.0
+                        x + CELL_PAD + text_width(ui, c.title, &font) + 6.0
                     };
                     let at = Rect::from_min_size(pos2(left, head.top()), vec2(HELP_W, row_h));
                     let tip = format!("What is {}?", c.title);

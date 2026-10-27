@@ -21,3 +21,23 @@ fn columns_are_local_and_preserve_inline_comments() {
     assert!(restored.tables.interfaces.inline_comments);
     assert!(restored.tables.interfaces.hidden_columns.contains("MTU"));
 }
+
+#[test]
+fn summary_and_legend_render_in_both_themes_and_follow_columns() {
+    let mut h = Harness::new();
+    h.screen = egui::vec2(900.0, 600.0);
+    h.idle();
+    h.click(h.row("ether2"));
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        h.ctx.set_theme(theme);
+        h.idle();
+        h.idle();
+        assert!(h.has_text("up to 5 min"));
+        assert!(h.has_text("Rx"));
+        assert!(h.has_text("Tx"));
+        assert_eq!(h.selected(), ["ether2"]);
+    }
+    h.app.tables.interfaces.hidden_columns.insert("Traffic".into());
+    h.idle();
+    assert!(!h.has_text("up to 5 min"));
+}

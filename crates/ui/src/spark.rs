@@ -23,7 +23,7 @@ pub(crate) const NAME: &str = "spark";
 /// Starts a sparkline cell.
 pub(crate) const SEP: char = '\u{1e}';
 /// Width of the cell's drawing.
-pub(crate) const WIDTH: f32 = 72.0;
+pub(crate) const WIDTH: f32 = 96.0;
 /// Seconds shown and between points.
 const RANGE: u64 = 300;
 const STEP: u64 = 10;
@@ -108,7 +108,7 @@ pub(crate) fn cell(rx: &[Option<f64>], tx: &[Option<f64>]) -> String {
     };
     let last = |v: &[Option<f64>]| v.iter().rev().flatten().next().copied();
     let tip = format!(
-        "5 min: Rx {} / Tx {} (max {})",
+        "Up to 5 min: Rx {} / Tx {} (max {})",
         last(rx).map_or("–".into(), |v| crate::graphs::rate(v, "bps")),
         last(tx).map_or("–".into(), |v| crate::graphs::rate(v, "bps")),
         crate::graphs::rate(top, "bps"),
@@ -126,11 +126,18 @@ pub(crate) fn paint(painter: &Painter, rect: Rect, cell: &str) {
     let Some(body) = cell.strip_prefix(SEP) else { return };
     let mut parts = body.splitn(3, '/');
     let (Some(rx), Some(tx)) = (parts.next(), parts.next()) else { return };
-    let r = rect.shrink2(egui::vec2(4.0, 4.0));
+    let r = rect.shrink2(egui::vec2(4.0, 3.0));
+    // Both lines share the same time axis. Empty leading history takes no
+    // space, but gaps inside the available history remain visible.
+    let first = rx.chars().zip(tx.chars())
+        .position(|(a, b)| a.is_ascii_hexdigit() || b.is_ascii_hexdigit())
+        .or_else(|| rx.chars().position(|c| c.is_ascii_hexdigit()))
+        .or_else(|| tx.chars().position(|c| c.is_ascii_hexdigit()));
+    let Some(first) = first else { return };
+    let n = rx.chars().count().max(tx.chars().count()).saturating_sub(first + 1).max(1);
     for (levels, color) in [(rx, RX), (tx, TX)] {
-        let n = levels.chars().count().max(2) - 1;
         let mut run: Vec<egui::Pos2> = Vec::new();
-        for (i, c) in levels.chars().enumerate() {
+        for (i, c) in levels.chars().skip(first).enumerate() {
             match c.to_digit(16) {
                 Some(l) => {
                     let x = r.left() + r.width() * i as f32 / n as f32;
@@ -140,6 +147,8 @@ pub(crate) fn paint(painter: &Painter, rect: Rect, cell: &str) {
                 None => {
                     if run.len() > 1 {
                         painter.line(std::mem::take(&mut run), Stroke::new(1.2, color));
+                    } else if let Some(p) = run.pop() {
+                        painter.circle_filled(p, 1.2, color);
                     }
                     run.clear();
                 }
@@ -147,6 +156,49 @@ pub(crate) fn paint(painter: &Painter, rect: Rect, cell: &str) {
         }
         if run.len() > 1 {
             painter.line(run, Stroke::new(1.2, color));
+        } else if let Some(p) = run.pop() {
+            painter.circle_filled(p, 1.2, color);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn short_history_fills_width_without_connecting_internal_gaps() {
+        let ctx = egui::Context::default();
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(WIDTH, 24.0));
+            paint(ui.painter(), rect, "\u{1e}---12-34/---45-67/example");
+        });
+        frame.textures_delta.clear();
+        let paths: Vec<_> = frame.shapes.iter().filter_map(|s| match &s.shape {
+            egui::Shape::Path(p) => Some(p),
+            _ => None,
+        }).collect();
+        assert_eq!(paths.len(), 4, "two lines, each interrupted by a gap");
+        let first = paths.first().and_then(|p| p.points.first()).unwrap();
+        let last = paths.get(1).and_then(|p| p.points.last()).unwrap();
+        assert!((first.x - 4.0).abs() < 0.1);
+        assert!((last.x - (WIDTH - 4.0)).abs() < 0.1);
+    }
+
+    #[test]
+    fn a_single_sample_is_visible_and_empty_data_draws_nothing() {
+        let ctx = egui::Context::default();
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(WIDTH, 24.0));
+            paint(ui.painter(), rect, "\u{1e}---a/----/example");
+        });
+        frame.textures_delta.clear();
+        assert!(frame.shapes.iter().any(|s| matches!(s.shape, egui::Shape::Circle(_))));
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(WIDTH, 24.0));
+            paint(ui.painter(), rect, "\u{1e}----/----/example");
+        });
+        frame.textures_delta.clear();
+        assert!(frame.shapes.is_empty());
     }
 }
