@@ -1286,7 +1286,7 @@ fn run_ok(cmd: &mut Command) -> Result<(), String> {
     output(cmd).map(|_| ())
 }
 
-fn download(url: &str, to: &Path) -> Result<(), String> {
+pub(crate) fn download(url: &str, to: &Path) -> Result<(), String> {
     let status = Command::new("curl")
         .args(["-fSL", "--progress-bar", "--proto", "=https", "-o"])
         .arg(to)
@@ -1301,7 +1301,7 @@ fn download(url: &str, to: &Path) -> Result<(), String> {
     }
 }
 
-fn sha256_file(path: &Path) -> Result<String, String> {
+pub(crate) fn sha256_file(path: &Path) -> Result<String, String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 1 << 20];

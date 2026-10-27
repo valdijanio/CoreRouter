@@ -51,6 +51,8 @@ pub const LAYERS: &[(&str, u8)] = &[
     ("corerouter-shell", 4),
     ("corerouter-ui", 5),
     ("corerouter-daemon", 6),
+    // G1.6a: PID 1 of the OS image (mounts, /config, supervises the daemon).
+    ("corerouter-init", 6),
     ("corerouter-gui", 6),
     ("corerouter-cli", 6),
     ("xtask", 7),

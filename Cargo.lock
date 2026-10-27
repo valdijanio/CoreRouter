@@ -1322,6 +1322,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "corerouter-init"
+version = "0.1.0"
+dependencies = [
+ "netlink-sys",
+ "rustix 1.1.5",
+ "signal-hook",
+]
+
+[[package]]
 name = "corerouter-mcp"
 version = "0.1.0"
 dependencies = [
