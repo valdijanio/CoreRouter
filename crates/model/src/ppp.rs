@@ -455,15 +455,16 @@ impl PppService {
     }
 }
 
-/// RouterOS `/ppp secret`: a local subscriber. The password is kept in
-/// clear text because CHAP and MS-CHAP need it (RFC 1994 §4.1: the secret
-/// itself is hashed with the challenge); commands never read it back.
+/// RouterOS `/ppp secret`: a local subscriber. CHAP and MS-CHAP need the
+/// password itself (RFC 1994 §2.2: the secret is hashed with the
+/// challenge), so it is kept sealed, not hashed (`crate::sealed`, G4.3n);
+/// commands never read it back.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct PppSecret {
     pub id: ItemId,
     pub name: String,
-    pub password: String,
+    pub password: crate::sealed::Sealed,
     pub service: PppService,
     pub profile: String,
     /// Our side; wins over the profile's.

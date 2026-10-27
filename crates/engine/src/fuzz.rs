@@ -65,3 +65,39 @@ pub fn config_file(data: &[u8]) -> Result<(), String> {
     }
     Ok(())
 }
+
+/// A RouterOS export (G4.3n, `crate::rsc`) as `ppp.secret.import` reads it:
+/// the reader never panics, what it keeps stays in its bounds, and a dry
+/// run and a real import of it on a fresh lab answer without a panic. A
+/// password-like marker in the text never comes back in an error.
+pub fn routeros_export(data: &[u8]) -> Result<(), String> {
+    let text = String::from_utf8_lossy(data).into_owned();
+    if let Ok(script) = crate::rsc::parse(&text, |m| m == "ppp secret" || m == "ppp profile") {
+        for item in &script.items {
+            if item.args.len() > crate::rsc::MAX_ARGS {
+                return Err(format!("line {}: {} arguments kept", item.line, item.args.len()));
+            }
+            if let Some((k, _)) = item.args.iter().find(|(_, v)| v.len() > crate::rsc::MAX_VALUE + 4) {
+                return Err(format!("line {}: {k} longer than the bound", item.line));
+            }
+        }
+    }
+    let marked = format!("{text}\n/ppp secret\nadd name=fuzz password=Zz9-fuzz-marker\n");
+    let (errors, panicked) = panics(|| {
+        let mut s = Session::virtual_lab();
+        let mut errors = Vec::new();
+        for dry_run in [true, false] {
+            if let Err(e) = s.execute("ppp.secret.import", &json!({"text": marked, "dry_run": dry_run})) {
+                errors.push(e.to_string());
+            }
+        }
+        errors
+    });
+    if panicked > 0 {
+        return Err(format!("{panicked} panic(s) importing the text"));
+    }
+    if let Some(e) = errors.iter().find(|e| e.contains("Zz9-fuzz-marker")) {
+        return Err(format!("an error quotes a password: {e}"));
+    }
+    Ok(())
+}

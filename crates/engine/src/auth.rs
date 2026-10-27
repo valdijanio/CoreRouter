@@ -173,6 +173,25 @@ pub fn burn_verification(password: &str) {
     let _ = verify_password(phc, password);
 }
 
+/// Parameters that are secret for one command only: `ppp.secret.import`'s
+/// `text` is a whole export with every subscriber's password (G4.3n).
+pub const SECRET_PARAMS: &[(&str, &str)] = &[("ppp.secret.import", "text")];
+
+/// [`mask_secrets`] of the parameters of command `id`, and its own
+/// [`SECRET_PARAMS`] (the journal and the log keep this).
+pub fn mask_params(id: &str, params: &Value) -> Value {
+    let mut v = mask_secrets(params);
+    if let Some(o) = v.as_object_mut() {
+        for (_, key) in SECRET_PARAMS.iter().filter(|(c, _)| *c == id) {
+            if let Some(x) = o.get_mut(*key) {
+                let n = x.as_str().map_or(0, str::len);
+                *x = Value::String(format!("*** ({n} bytes)"));
+            }
+        }
+    }
+    v
+}
+
 /// A copy of command parameters with every secret replaced by `"***"`
 /// (journal, logs). Walks nested objects and arrays.
 pub fn mask_secrets(v: &Value) -> Value {

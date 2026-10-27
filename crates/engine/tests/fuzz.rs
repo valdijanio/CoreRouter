@@ -195,6 +195,11 @@ fn seeds_and_regressions_replay() {
             panic!("{name}: {e}");
         }
     }
+    for (name, data) in corpus("routeros_export") {
+        if let Err(e) = corerouter_engine::fuzz::routeros_export(&data) {
+            panic!("{name}: {e}");
+        }
+    }
 }
 
 /// The oracles would be blind without this: the guard catches the panic
@@ -248,6 +253,16 @@ proptest! {
             last["config"] = running;
         }
         if let Err(e) = config_file(v.to_string().as_bytes()) {
+            prop_assert!(false, "{e}");
+        }
+    }
+
+    /// G4.3n: export-shaped text with hostile quoting and bounds.
+    #[test]
+    fn routeros_exports_never_panic(
+        t in "(/ppp secret\n|/ppp profile\n|add |set |\\[ find name=|\\]|\\*0 |name=|password=|profile=|service=pppoe |caller-id=|\"|\\\\|\\\\\n    |\\\\C3\\\\A7|[a-z0-9 =;#\n])*",
+    ) {
+        if let Err(e) = corerouter_engine::fuzz::routeros_export(t.as_bytes()) {
             prop_assert!(false, "{e}");
         }
     }

@@ -4,11 +4,13 @@
 //! their own addresses. The list shows both, with the origin of each
 //! dynamic queue and the precedence warnings (`crate::queue`).
 
+use corerouter_model::simple_queues::SimpleQueues;
 use corerouter_model::ItemId;
 use corerouter_model::queue::{
     Kind, MAX_COMMENT, MAX_SIMPLE, Pair, Rates, SimpleQueue, Target, TypeNames, name_ok,
     parse_ratios, parse_targets, parse_times, rate_text, ratios_text, targets_text, times_text,
 };
+use ipnet::IpNet;
 use serde_json::{Value, json};
 
 use super::args::{opt_bool, opt_str, opt_text, opt_u32};
@@ -194,9 +196,9 @@ pub(super) fn index_of(s: &Session, raw: &str) -> Result<usize> {
     let simple = &s.store().candidate().queue.simple;
     let found = if raw.starts_with('*') {
         let id: ItemId = raw.parse().map_err(|e| EngineError::bad("id", format!("{e}")))?;
-        simple.iter().position(|q| q.id == id)
+        simple.position(id)
     } else {
-        simple.iter().position(|q| q.name == raw)
+        simple.position_of(raw)
     };
     found.ok_or_else(|| {
         let shown: String = raw.chars().take(64).collect();
@@ -229,7 +231,12 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::bad("target", "is required"));
     }
     let before = opt_str(p, "place_before")?.map(|b| index_of(s, b)).transpose()?;
-    let mut q = SimpleQueue::new(ItemId(0), queues.free_name(), Vec::new());
+    // The default name only when none is given.
+    let name = match opt_str(p, "name")? {
+        Some(_) => String::new(),
+        None => queues.free_name(),
+    };
+    let mut q = SimpleQueue::new(ItemId(0), name, Vec::new());
     apply(s, &mut q, p)?;
     if s.store().candidate().queue.simple_by_name(&q.name).is_some() {
         return Err(EngineError::bad("name", format!("queue '{}' exists", q.name)));
@@ -238,42 +245,84 @@ fn add(s: &mut Session, p: &Value) -> Result<Value> {
     let queues = &mut s.store_mut().candidate_mut().queue;
     q.id = queues.next_id();
     let out = json!({"id": q.id, "name": q.name});
+    let written = q.clone();
     match before {
         Some(i) if i <= queues.simple.len() => {
             queues.simple.insert(i, q);
         }
         _ => queues.simple.push(q),
     }
-    with_plan_warnings(s, out, w)
+    with_plan_warnings(s, &written, out, w)
 }
 
-/// The command's warnings plus what the plan says of the queue now
-/// (shadowed targets, overlaps with dynamic queues).
-fn with_plan_warnings(s: &Session, mut out: Value, mut w: Vec<String>) -> Result<Value> {
+/// The command's warnings plus what the plan says of the queue `q` now
+/// (shadowed targets, overlaps with dynamic queues). Both walks are O(n)
+/// (the queues above it, or the whole plan with dynamic queues), so they
+/// run only when [`may_warn`] says something touches `q`'s targets.
+fn with_plan_warnings(s: &Session, q: &SimpleQueue, mut out: Value, mut w: Vec<String>) -> Result<Value> {
     let id = out.get("id").and_then(Value::as_str).unwrap_or_default().to_owned();
     let dynamic = crate::queue::dhcp_dynamic(s);
-    if dynamic.is_empty() {
+    if !may_warn(&s.store().candidate().queue.simple, q, &dynamic) {
+        // Nothing touches its targets: no plan warning to look for.
+    } else if dynamic.is_empty() {
         let cfg = s.store().candidate();
-        if let Some(i) = cfg.queue.simple.iter().position(|q| q.id.to_string() == id) {
+        if let Some(i) = cfg.queue.simple.position(q.id) {
             for x in crate::queue::fixed_warnings(cfg, i) {
                 if !w.contains(&x) {
                     w.push(x);
                 }
             }
         }
-        if let Some(o) = out.as_object_mut() {
-            o.insert("warnings".into(), json!(w));
+    } else {
+        let plan = crate::queue::plan(s.store().candidate(), dynamic);
+        if let Some(i) = plan.queues.iter().position(|q| q.key == id) {
+            w.extend(plan.warnings_of(i).iter().cloned());
         }
-        return Ok(out);
-    }
-    let plan = crate::queue::plan(s.store().candidate(), dynamic);
-    if let Some(i) = plan.queues.iter().position(|q| q.key == id) {
-        w.extend(plan.warnings_of(i).iter().cloned());
     }
     if let Some(o) = out.as_object_mut() {
         o.insert("warnings".into(), json!(w));
     }
     Ok(out)
+}
+
+/// Whether the plan may warn about `q`, already in the candidate list:
+/// another enabled queue holds one of its targets or a prefix around one,
+/// its own targets overlap, or a dynamic queue's target overlaps one.
+/// `false` proves its plan warnings empty, in O(targets × prefix length)
+/// lookups (the list's target index) plus the dynamic queues.
+fn may_warn(simple: &SimpleQueues, q: &SimpleQueue, dynamic: &[crate::queue::Queue]) -> bool {
+    if q.disabled {
+        // The plan skips it.
+        return false;
+    }
+    let own = |t: &Target| q.target.iter().filter(|x| *x == t).count() as u32;
+    let overlap = |a: &IpNet, b: &IpNet| a.contains(&b.network()) || b.contains(&a.network());
+    for t in &q.target {
+        if own(t) > 1 {
+            return true;
+        }
+        let Target::Prefix(n) = t else {
+            if simple.holders(t) > own(t) {
+                return true;
+            }
+            continue;
+        };
+        let around = (0..=n.prefix_len()).filter_map(|len| IpNet::new(n.network(), len).ok().map(|p| Target::Prefix(p.trunc())));
+        for p in around {
+            if simple.holders(&p) > own(&p) {
+                return true;
+            }
+        }
+        let others = q.target.iter().filter(|o| *o != t);
+        if others.into_iter().any(|o| matches!(o, Target::Prefix(m) if overlap(m, n))) {
+            return true;
+        }
+        let dyn_targets = dynamic.iter().flat_map(|d| d.targets.iter());
+        if dyn_targets.into_iter().any(|o| matches!(o, Target::Prefix(m) if overlap(m, n))) {
+            return true;
+        }
+    }
+    false
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
@@ -287,10 +336,9 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let w = warnings(s, &q);
     let out = json!({"id": q.id, "name": q.name});
-    if let Some(slot) = s.store_mut().candidate_mut().queue.simple.get_mut(i) {
-        *slot = q;
-    }
-    with_plan_warnings(s, out, w)
+    let written = q.clone();
+    s.store_mut().candidate_mut().queue.simple.update(i, |slot| *slot = q);
+    with_plan_warnings(s, &written, out, w)
 }
 
 fn remove(s: &mut Session, p: &Value) -> Result<Value> {
@@ -311,10 +359,8 @@ fn toggle(s: &mut Session, p: &Value, disabled: bool) -> Result<Value> {
     let simple = &mut s.store_mut().candidate_mut().queue.simple;
     let mut changed = 0;
     for i in idx {
-        if let Some(q) = simple.get_mut(i)
-            && q.disabled != disabled
-        {
-            q.disabled = disabled;
+        let flipped = simple.update(i, |q| std::mem::replace(&mut q.disabled, disabled) != disabled);
+        if flipped == Some(true) {
             changed += 1;
         }
     }

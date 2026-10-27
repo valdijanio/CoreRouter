@@ -22,7 +22,10 @@
 //!
 //! Secrets never leave in plain text: a field whose name says it is one is
 //! replaced by a commented line, and so is a row missing a required `add`
-//! parameter (the router does not return passwords).
+//! parameter (the router does not return passwords). `/export
+//! show-sensitive` (G4.3n, group full) asks the prints that declare
+//! [`SHOW_SENSITIVE`] for them in clear, as RouterOS v7 does: the PPP
+//! secrets then export with their passwords, and import back.
 //!
 //! Layout, as RouterOS prints it: a command wider than the terminal goes on
 //! with ` \` and the next line indented four spaces ([`wrap`]), breaking
@@ -44,6 +47,17 @@ const SECRET_WORDS: &[&str] = &["password", "secret", "psk", "token", "private"]
 
 fn secret(key: &str) -> bool {
     SECRET_WORDS.iter().any(|w| key.contains(w))
+}
+
+/// The parameter of a print that returns its secrets in clear.
+pub const SHOW_SENSITIVE: &str = "show_sensitive";
+
+/// What a print returns in place of a secret it keeps.
+const MASK: &str = "***";
+
+/// A secret the router sent in clear (`show-sensitive`), not its mask.
+fn clear(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| s != MASK)
 }
 
 /// The read commands an export needs, by id.
@@ -103,13 +117,27 @@ fn dynamic(row: &Value) -> bool {
 
 /// Arguments of `cmd` taken from `row`: required ones always, optional ones
 /// unless empty (`all`: optional ones too, for one-object settings).
-fn args_of(cmd: &Command, row: &Value, all: bool) -> Result<Vec<(String, String)>, String> {
+fn args_of(
+    cmd: &Command,
+    row: &Value,
+    all: bool,
+    sensitive: bool,
+) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
     for p in &cmd.params {
         let v = row.get(&p.key).unwrap_or(&Value::Null);
+        if sensitive && secret(&p.key) && clear(v) {
+            if p.required || !empty(v) {
+                out.push((p.key.clone(), arg_text(v)));
+            }
+            continue;
+        }
         if secret(&p.key) {
             if p.required || !empty(v) {
-                return Err(format!("{} is not exported", kebab(&p.key)));
+                return Err(format!(
+                    "{} is not exported (export show-sensitive)",
+                    kebab(&p.key)
+                ));
             }
             continue;
         }
@@ -148,6 +176,7 @@ fn rows_of(
     menu: &Menu,
     generators: &[&str],
     value: &Value,
+    sensitive: bool,
     out: &mut Vec<Out>,
 ) {
     let Some(print) = menu.print() else { return };
@@ -156,16 +185,16 @@ fn rows_of(
         if let Some(set) = set
             && value.is_object()
         {
-            if args_of(set, value, true).is_err()
+            if args_of(set, value, true, sensitive).is_err()
                 && let Some(items) = set_items(set, value)
             {
                 // A settings object holding a list of entries, each one
                 // `set` (the zone matrix: `cells` of {from, to, action}).
                 for item in items {
-                    push(out, menu_path, set, item, false, false);
+                    push(out, menu_path, set, item, false, false, sensitive);
                 }
             } else {
-                push(out, menu_path, set, value, true, false);
+                push(out, menu_path, set, value, true, false, sensitive);
             }
         }
         return;
@@ -202,7 +231,7 @@ fn rows_of(
         let add = add.filter(|_| !preset);
         match (add, set) {
             (Some(add), _) => {
-                if !exported_below && !push(out, &add_path, add, row, false, true) {
+                if !exported_below && !push(out, &add_path, add, row, false, true, sensitive) {
                     continue;
                 }
                 // What `add` cannot take, `set` sets afterwards.
@@ -234,7 +263,7 @@ fn rows_of(
                 }
             }
             (None, Some(set)) => {
-                push(out, menu_path, set, row, false, false);
+                push(out, menu_path, set, row, false, false, sensitive);
             }
             (None, None) => {}
         }
@@ -272,8 +301,9 @@ fn push(
     row: &Value,
     all: bool,
     creates: bool,
+    sensitive: bool,
 ) -> bool {
-    match args_of(cmd, row, all) {
+    match args_of(cmd, row, all, sensitive) {
         Ok(args) => {
             let provides = if creates {
                 args.iter()
@@ -358,12 +388,14 @@ fn order(lines: Vec<Out>) -> Vec<Out> {
 }
 
 /// The script for the menus under `prefix` (all of them for `/`), from the
-/// replies to [`reads`] (by command id).
+/// replies to [`reads`] (by command id). `sensitive`: secrets the replies
+/// carry in clear are written out (`show-sensitive`).
 pub fn script(
     reg: &Registry,
     prefix: &[String],
     results: &BTreeMap<String, Value>,
     version: &str,
+    sensitive: bool,
 ) -> String {
     let mut all = Vec::new();
     let mut path = Vec::new();
@@ -388,7 +420,7 @@ pub fn script(
                     .collect()
             })
             .unwrap_or_default();
-        rows_of(&menu_path, menu, &generators, value, &mut lines);
+        rows_of(&menu_path, menu, &generators, value, sensitive, &mut lines);
     }
     let lines = order(lines);
     let mut s = String::new();
@@ -397,6 +429,11 @@ pub fn script(
         path_text(prefix)
     ));
     s.push_str("# Import with /import file=<name> (or paste it): it runs as one atomic batch.\n");
+    if sensitive {
+        s.push_str(
+            "# show-sensitive: passwords in clear below. Keep this file safe and delete it after use.\n",
+        );
+    }
     let mut cur: Option<Vec<String>> = None;
     for l in lines.iter().filter(|l| l.path.starts_with(prefix)) {
         if cur.as_ref() != Some(&l.path) {
@@ -426,7 +463,7 @@ pub fn script(
 /// or the row lacks a required parameter (a secret the router never sends).
 pub fn recreate(reg: &Registry, add_id: &str, row: &Value) -> Option<Value> {
     let (_, cmd) = reg.by_id(add_id)?;
-    let args = args_of(cmd, row, false).ok()?;
+    let args = args_of(cmd, row, false, false).ok()?;
     let mut out = serde_json::Map::new();
     for (k, _) in args {
         if let Some(v) = row.get(&k) {
@@ -592,7 +629,7 @@ mod tests {
                 {"name": "dyn", "type": "bridge", "dynamic": true},
             ]),
         );
-        let s = script(&reg, &[], &results, "t");
+        let s = script(&reg, &[], &results, "t", false);
         assert!(s.contains("set name=ether1 mtu=1500"), "{s}");
         assert!(s.contains("add name=br1"), "{s}");
         assert!(!s.contains("docker0") && !s.contains("dyn\n"), "{s}");

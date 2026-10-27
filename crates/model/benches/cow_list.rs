@@ -24,7 +24,7 @@ fn secret(i: u32) -> PppSecret {
     PppSecret {
         id: ItemId(i + 1),
         name: format!("cliente{i}@isp"),
-        password: format!("senha{i}"),
+        password: format!("senha{i}").into(),
         profile: "default".into(),
         ..PppSecret::default()
     }
