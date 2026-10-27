@@ -45,6 +45,15 @@ pub const SCAN_SECS: u64 = 10;
 pub const MAX_RECORDS: usize = 1_000_000;
 /// Alerts listed at most.
 pub const MAX_ALERTS: usize = 10_000;
+/// A subscriber whose current port range (slot, or last block) is this
+/// full goes into the kernel's set `full` (G2.7), so its new connections
+/// are checked for a free tuple. The kernel's search gives up after 240
+/// tries from random offsets (`nf_nat_l4proto_unique_tuple`), so a slot
+/// can refuse before it is 100 % used; below 80 % of 1000 ports the chance
+/// is nil (**estimado**: (0.8)^128 ≈ 4·10⁻¹³ per try round).
+pub const FULL_PERCENT: u64 = 80;
+/// A subscriber refused again within this many seconds is not logged again.
+pub const REFUSED_LOG_SECS: u64 = 60;
 const MAX_LINE: usize = 4096;
 
 /// One line of the block journal.
@@ -103,6 +112,12 @@ pub struct Alert {
     /// Above at the scan before (a crossing is "not then, now").
     #[serde(skip)]
     was_above: bool,
+    /// New connections refused for lack of a port (G2.7, RFC 6888 REQ-11a).
+    pub refused: u64,
+    /// ICMP host unreachable sent about them (REQ-11b).
+    pub icmp: u64,
+    /// The last refusal.
+    pub last_refused: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -116,8 +131,14 @@ pub struct CgnatRuntime {
     taken: HashSet<(ItemId, u64, u32)>,
     /// Blocks per public address of each pool (paired allocation).
     per_address: HashMap<ItemId, Vec<u32>>,
-    /// Released blocks held back until then.
-    hold: Vec<((ItemId, u64, u32), u64)>,
+    /// Released port ranges held back (RFC 6888 REQ-8), per public
+    /// address: (first, last, until). By range, not by block number, so a
+    /// pool whose geometry changed still holds the old ports.
+    hold: HashMap<Ipv4Addr, Vec<(u16, u16, u64)>>,
+    /// The subscribers last put in the kernel's set `full` (G2.7).
+    full: Vec<Ipv4Addr>,
+    /// Totals of the exhaustion queues since the start (G2.7).
+    exhaustion: corerouter_hal::cgnat::ExhaustionStats,
     records: Vec<Record>,
     alerts: BTreeMap<Ipv4Addr, Alert>,
     last_scan: Option<u64>,
@@ -225,8 +246,12 @@ impl CgnatRuntime {
                 }
                 if let Some(key) = freed {
                     self.untake(key);
-                    self.hold.push((key, e.t.saturating_add(HOLD_SECS)));
                 }
+                // RFC 6888 REQ-8: its ports go to nobody for 120 s, even
+                // when the pool's geometry left (late packets of the old
+                // connections must not reach another subscriber). Replayed
+                // from the journal too, so a restart keeps the hold.
+                self.hold_slot(slot, e.t.saturating_add(HOLD_SECS));
             }
             _ => {}
         }
@@ -255,8 +280,34 @@ impl CgnatRuntime {
         }
     }
 
-    fn held(&self, key: (ItemId, u64, u32), now: u64) -> bool {
-        self.hold.iter().any(|(k, until)| *k == key && *until > now)
+    /// Whether any port of `slot` is held at `now`.
+    fn held(&self, slot: Slot, now: u64) -> bool {
+        self.hold.get(&slot.public).is_some_and(|v| {
+            v.iter()
+                .any(|(f, l, until)| *until > now && *f <= slot.last_port && slot.first_port <= *l)
+        })
+    }
+
+    fn hold_slot(&mut self, slot: Slot, until: u64) {
+        self.hold
+            .entry(slot.public)
+            .or_default()
+            .push((slot.first_port, slot.last_port, until));
+    }
+
+    fn hold_prune(&mut self, now: u64) {
+        self.hold.retain(|_, v| {
+            v.retain(|(_, _, until)| *until > now);
+            !v.is_empty()
+        });
+    }
+
+    pub fn exhaustion(&self) -> corerouter_hal::cgnat::ExhaustionStats {
+        self.exhaustion
+    }
+
+    pub fn full(&self) -> &[Ipv4Addr] {
+        &self.full
     }
 
     /// A free block for a subscriber of `p`: on `address` if given (its
@@ -265,8 +316,8 @@ impl CgnatRuntime {
     fn free_block(&self, p: &Pool, l: &corerouter_model::cgnat::Layout, address: Option<u64>, now: u64) -> Option<(u64, u32)> {
         let on = |a: u64| {
             (0..l.per_address()).find(|b| {
-                let key = (p.id, a, *b);
-                !self.taken.contains(&key) && !self.held(key, now)
+                !self.taken.contains(&(p.id, a, *b))
+                    && l.block(a, *b).is_some_and(|slot| !self.held(slot, now))
             })
         };
         if let Some(a) = address {
@@ -423,7 +474,7 @@ impl Session {
         let Some(rt) = self.ext_mut::<CgnatRuntime>() else {
             return Err("no runtime".into());
         };
-        rt.hold.retain(|(_, until)| *until > now);
+        rt.hold_prune(now);
         let mine: Vec<Block> = rt.active.get(&subscriber).cloned().unwrap_or_default();
         if mine.len() >= usize::from(pool.max_blocks) {
             return Err(format!("{subscriber} holds {} blocks, the most allowed", mine.len()));
@@ -468,14 +519,9 @@ impl Session {
         Ok(slot)
     }
 
+    /// Release a block; its ports are held from anyone else for
+    /// [`HOLD_SECS`] (RFC 6888 REQ-8).
     fn release(&mut self, subscriber: Ipv4Addr, slot: Slot, now: u64, why: &str) {
-        self.release_with(subscriber, slot, now, why, true);
-    }
-
-    /// Release a block; `hold`: keep it from anyone else for [`HOLD_SECS`]
-    /// (RFC 6888 REQ-8). A block whose geometry left is not held: its
-    /// connections are killed instead (as a deterministic remap does).
-    fn release_with(&mut self, subscriber: Ipv4Addr, slot: Slot, now: u64, why: &str, hold: bool) {
         let pools = self.store().running().ip.cgnat.pools.clone();
         let Some(rt) = self.ext_mut::<CgnatRuntime>() else { return };
         let Some(b) = rt.active.get(&subscriber).and_then(|v| v.iter().find(|b| b.slot == slot)).cloned() else {
@@ -492,9 +538,6 @@ impl Session {
             why: why.into(),
         };
         rt.apply(&e, &pools);
-        if !hold {
-            rt.hold.retain(|(k, _)| *k != (b.pool, b.address, b.block));
-        }
         let next = rt.active.get(&subscriber).and_then(|v| v.last()).map(|b| b.slot);
         self.block_event(e);
         // The map points to the newest block left, or to nothing.
@@ -525,7 +568,7 @@ impl Session {
             .unwrap_or_default();
         let mut moved: Vec<Ipv4Addr> = Vec::new();
         for (sub, slot) in stale {
-            self.release_with(sub, slot, now, "pool changed", false);
+            self.release(sub, slot, now, "pool changed");
             moved.push(sub);
         }
         if !moved.is_empty()
@@ -578,6 +621,7 @@ impl Session {
                 r.pools_seen = pools;
             }
         }
+        self.exhaustion_drain(now);
         for w in self.hal_mut().cgnat_waiting() {
             if let Err(e) = self.allocate(w.subscriber, now, "first packet") {
                 log::debug!("cgnat: {e}");
@@ -670,6 +714,41 @@ impl Session {
                 log::debug!("cgnat: {e}");
             }
         }
+        // G2.7: who is near the end of its current range goes into the
+        // kernel's set `full`.
+        let mut full: Vec<Ipv4Addr> = Vec::new();
+        if cgnat.settings.icmp_unreachable {
+            let active = self.ext::<CgnatRuntime>().map(|r| &r.active);
+            for sub in ports.keys().map(|(s, _)| *s).collect::<HashSet<_>>() {
+                if cgnat.exception_of(sub).is_some() {
+                    continue;
+                }
+                let Some((p, _)) = pools.iter().find(|(p, _)| p.inside.iter().any(|r| r.contains(sub))) else {
+                    continue;
+                };
+                let (used, size) = match p.mode {
+                    Mode::Deterministic => (busiest(sub), u64::from(p.ports_per_subscriber)),
+                    Mode::Blocks => {
+                        let Some(b) = active.and_then(|a| a.get(&sub)).and_then(|v| v.last()) else {
+                            continue;
+                        };
+                        let set = in_slot.get(&(sub, b.slot.public, b.slot.first_port));
+                        let used = [6u8, 17, 1]
+                            .iter()
+                            .map(|pr| set.map_or(0, |s| s.iter().filter(|(p, _)| p == pr).count()))
+                            .max()
+                            .unwrap_or(0) as u64;
+                        (used, u64::from(b.slot.ports()))
+                    }
+                };
+                if size > 0 && used.saturating_mul(100) >= size.saturating_mul(FULL_PERCENT) {
+                    full.push(sub);
+                }
+            }
+            full.sort_unstable();
+        }
+        self.push_full(full);
+
         // Alerts: deterministic subscribers against their slot, blocks
         // subscribers at their last allowed block.
         let mut crossed: Vec<Alert> = Vec::new();
@@ -711,6 +790,9 @@ impl Session {
                     last: now,
                     above: false,
                     was_above: false,
+                    refused: 0,
+                    icmp: 0,
+                    last_refused: None,
                 });
                 let was = entry.was_above;
                 entry.used = used;
@@ -745,6 +827,84 @@ impl Session {
                     a.subscriber, a.used, a.ports, a.percent, a.pool
                 ),
                 json!({"subscriber": a.subscriber, "used": a.used, "ports": a.ports, "pool": a.pool}),
+            );
+        }
+    }
+
+    /// Put `full` in the kernel's set when it changed (G2.7).
+    fn push_full(&mut self, full: Vec<Ipv4Addr>) {
+        if self.ext::<CgnatRuntime>().is_some_and(|r| r.full == full) {
+            return;
+        }
+        match self.hal_mut().cgnat_full(&full) {
+            Ok(()) | Err(corerouter_hal::HalError::Unsupported(_)) => {}
+            Err(e) => {
+                log::warn!("cgnat: the kernel did not take the {} nearly full subscribers: {e}", full.len());
+                return;
+            }
+        }
+        if let Some(r) = self.ext_mut::<CgnatRuntime>() {
+            r.full = full;
+        }
+    }
+
+    /// What the exhaustion queues refused since the last tick (G2.7): into
+    /// the alerts, and one log line per subscriber that starts being
+    /// refused.
+    fn exhaustion_drain(&mut self, now: u64) {
+        let (hits, stats) = self.hal_mut().cgnat_exhausted();
+        if hits.is_empty() && stats == corerouter_hal::cgnat::ExhaustionStats::default() {
+            return;
+        }
+        let cgnat = self.store().running().ip.cgnat.clone();
+        let mut lines = Vec::new();
+        if let Some(rt) = self.ext_mut::<CgnatRuntime>() {
+            let t = &mut rt.exhaustion;
+            t.seen = t.seen.saturating_add(stats.seen);
+            t.refused = t.refused.saturating_add(stats.refused);
+            t.icmp = t.icmp.saturating_add(stats.icmp);
+            t.limited = t.limited.saturating_add(stats.limited);
+            t.untracked = t.untracked.saturating_add(stats.untracked);
+            for (sub, hit) in hits {
+                if rt.alerts.len() >= MAX_ALERTS && !rt.alerts.contains_key(&sub) {
+                    continue;
+                }
+                let pool = cgnat.pool_of(sub).map(|p| (p.name.clone(), u64::from(p.ports_per_subscriber) * u64::from(if p.mode == Mode::Blocks { p.max_blocks } else { 1 })));
+                let (pool, ports) = pool.unwrap_or_default();
+                let a = rt.alerts.entry(sub).or_insert_with(|| Alert {
+                    subscriber: sub,
+                    pool,
+                    used: ports,
+                    ports,
+                    percent: 100,
+                    peak: ports,
+                    crossings: 0,
+                    first: now,
+                    last: now,
+                    above: true,
+                    was_above: false,
+                    refused: 0,
+                    icmp: 0,
+                    last_refused: None,
+                });
+                if a.last_refused.is_none_or(|t| now.saturating_sub(t) >= REFUSED_LOG_SECS) {
+                    lines.push((sub, a.pool.clone(), hit));
+                }
+                a.refused = a.refused.saturating_add(hit.refused);
+                a.icmp = a.icmp.saturating_add(hit.icmp);
+                a.last_refused = Some(now);
+                a.last = now;
+            }
+        }
+        for (sub, pool, hit) in lines {
+            self.log_event(
+                &["cgnat", "warning"],
+                "cgnat",
+                format!(
+                    "no free port: {sub} in pool {pool}: {} new connections refused, {} ICMP host unreachable sent",
+                    hit.refused, hit.icmp
+                ),
+                json!({"subscriber": sub, "pool": pool, "refused": hit.refused, "icmp": hit.icmp}),
             );
         }
     }
@@ -798,6 +958,19 @@ impl Session {
     /// service serves it outside the session lock).
     pub fn cgnat_queue(&mut self) -> Result<Box<dyn corerouter_hal::cgnat::CgnatQueue>, String> {
         self.hal_mut().cgnat_queue().map_err(|e| e.to_string())
+    }
+
+    /// Exhaustion queue `index` of the data plane (G2.7), for a daemon
+    /// thread to serve outside the session lock.
+    pub fn cgnat_exhaustion_queue(&mut self, index: u16) -> Result<Box<dyn corerouter_hal::cgnat::ExhaustionQueue>, String> {
+        self.hal_mut().cgnat_exhaustion_queue(index).map_err(|e| e.to_string())
+    }
+
+    /// Whether the exhaustion queues should be served: an enabled pool and
+    /// the ICMP answer on (G2.7).
+    pub fn cgnat_exhaustion_wanted(&self) -> bool {
+        let c = &self.store().running().ip.cgnat;
+        c.settings.icmp_unreachable && c.pools.iter().any(|p| !p.disabled)
     }
 
     /// Whether any enabled pool hands out blocks.
