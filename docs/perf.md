@@ -1767,3 +1767,74 @@ usuário, release):
 
 O tempo que sobra no apply é do FRR (~170–270 µs por linha em cada daemon). O parse e o diff em
 Rust são menos de 0,1 % disso.
+
+### G1.6a — imagem do sistema: build, boot e memória (**medido**, AMD Ryzen AI Max+ 395, 32 threads, 62 GiB, NVMe, 2026-10-27)
+
+#### Build
+
+| Situação | Tempo de parede | Observação |
+|---|---|---|
+| Primeiro build, tudo frio (downloads de ~360 MB, ccache vazio, sem `-j` de topo) | 15 min 02 s | CPU somada 85 min (paralelismo médio ~5,7×) |
+| Build limpo (`os/out/build` apagado), ccache quente, **sem** `-j` de topo | 447 s | Rust frio 154 s (38%), kernel 64 s, ferramentas de host o resto |
+| Build limpo, ccache quente, **`--top-jobs 33`** | 207–219 s (3 rodadas) | **2,1×** do paralelismo entre pacotes (`BR2_PER_PACKAGE_DIRECTORIES`) |
+| Mudou o fragmento do kernel (`linux-reconfigure`) | 169 s | |
+| Sem mudança (quente) | 24–26 s | cargo sem trabalho, rootfs e disco regravados |
+
+Desde a medição do build limpo, o cache do Rust fica em `os/out/cargo-target`, fora do `O=`: um
+build limpo do Buildroot não recompila mais o Rust (o build seguinte levou 165 s sem `-j` de
+topo, com o cargo frio numa pasta nova).
+
+**Reprodutível:** dois builds limpos do mesmo commit, um terceiro com outro nível de `-j` e um
+quarto com o cache do cargo em outra pasta deram o **mesmo** `bzImage` (`40e26533…`), o mesmo
+`rootfs.squashfs` (`f8580cbe…`), a mesma ESP e o mesmo daemon. O `disk.img` ficou igual entre
+builds depois da correção do ext4.
+
+#### Tamanho
+
+| Peça | Tamanho |
+|---|---|
+| `rootfs.squashfs` (zstd) | **14,4 MiB** (38 MiB descomprimido) |
+| └ `corerouter-daemon` (sem símbolos) | 27 MiB |
+| └ glibc e bibliotecas (`/lib`, `/usr/lib`) | 9,2 MiB |
+| └ busybox / `corerouter-init` / `nft` | 0,7 MiB / 0,5 MiB / 24 KiB (+ libnftables) |
+| `bzImage` (com BTF, tudo `=y`) | 19,1 MiB |
+| `disk.img` | 609 MiB, quase todo partições vazias (rootfs-b e folga); 33 MiB com `zstd` |
+
+#### Boot (QEMU, 2 vCPUs, 1 GiB, virtio)
+
+| Modo | Kernel → daemon responde `ping` | Partida do QEMU → `ready` | Memória ociosa |
+|---|---|---|---|
+| KVM, `-kernel` (10 rodadas) | 0,69–1,20 s (mediana 0,74 s) | 0,98–1,87 s | 47–58 MiB |
+| KVM, UEFI (OVMF → EFI stub, disco inteiro) | 0,73 s | 3,74 s (o firmware leva ~3 s) | 49 MiB |
+| TCG (sem KVM) | 2,89 s | 3,78 s | 48 MiB |
+
+Dentro desse tempo: o init leva 7–23 ms (montagens, `lo`, `/config`), e o daemon, 52–126 ms
+da partida até o primeiro `pong`. O resto é o kernel até o PID 1 (~0,6 s, probe das placas e
+dos discos). O ping TLS do host, pelo encaminhamento de porta do QEMU, respondeu em 14–17 ms.
+
+G2.1c — diagnóstico do firewall (**medido**): AMD Ryzen AI MAX+ 395 (32 threads), kernel 7.0.0,
+nft 1.0.9, build release, 2026-10-27.
+
+| Benchmark | Resultado |
+|---|---|
+| `firewall_test/path/1000 rules` (`cargo bench -p corerouter-firewall --bench path`) | 12,1 µs |
+| `firewall_test/path/10000 rules` | 122,7 µs (~12 ns por regra, linear) |
+| `netns_fw_counters/10000 rules/nfnetlink dump` (`hal-linux/benches/netns_fw_counters.rs`, netns sem root) | 10,7 ms (931 mil regras/s) |
+| `netns_fw_counters/10000 rules/nft -j + JSON` | 190 ms (52 mil regras/s): 17,7× mais lento |
+
+O `path` percorre a tabela inteira por chain cruzada (10 000 regras no forward que não casam e a
+última que aceita). O dump inclui o kernel serializando as 10 000 regras; o `nft -j` soma criar o
+processo, montar o JSON e o parse.
+
+### G2.7b — capacidade do CGNAT (2026-10-27, **medido**)
+
+Ryzen AI MAX+ 395, build release, carga 4–9. Bench `cargo bench -p corerouter-engine --bench
+cgnat_capacity`; 65 536 assinantes × 20 conexões.
+
+| Medida | Valor |
+|---|---|
+| uso de 1,3 M conexões, vetor ordenado (fora do lock) | 51 ms |
+| o mesmo com conjuntos por assinante (antes, dentro do lock) | 75 ms |
+| entregar ao engine (lock segurado) | 5,6 ms |
+| `ip.firewall.cgnat.capacity.get` | 4,1 ms |
+| memória dos picos de 7 dias | 2,8 MiB |
