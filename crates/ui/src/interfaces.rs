@@ -281,11 +281,6 @@ impl CoreRouterUi {
             .iter()
             .filter(|i| selection.contains(&i.name))
             .collect();
-        ui.horizontal_wrapped(|ui| {
-            crate::chip::chip(ui, &format!("{} interfaces", ifaces.len()), crate::chip::neutral_tone(ui.visuals()));
-            let running = ifaces.iter().filter(|i| i.running && !i.disabled).count();
-            crate::chip::chip(ui, &format!("{running} up"), crate::chip::GREEN.tone(ui.visuals()));
-        });
         let bridges: Vec<String> = ifaces
             .iter()
             .filter(|i| i.kind == "bridge" && i.unmanaged.is_none())
@@ -361,6 +356,11 @@ impl CoreRouterUi {
             }
             table::find_field(ui, TABLE, &mut self.tables.interfaces);
         });
+        ui.horizontal_wrapped(|ui| {
+            crate::chip::chip(ui, &format!("{} interfaces", ifaces.len()), crate::chip::neutral_tone(ui.visuals()));
+            let running = ifaces.iter().filter(|i| i.running && !i.disabled).count();
+            crate::chip::chip(ui, &format!("{running} up"), crate::chip::GREEN.tone(ui.visuals()));
+        });
         ui.separator();
 
         self.tables.interfaces.open = self
@@ -374,7 +374,7 @@ impl CoreRouterUi {
         let out = table::show(
             ui,
             TABLE,
-            65.0,
+            90.0,
             &mut self.tables.interfaces,
             &COLUMNS,
             &rows,
@@ -398,24 +398,61 @@ impl CoreRouterUi {
                 panel.help = Some(crate::help::HelpView::new(key, title));
             }
         }
+        if !self.tables.interfaces.hidden_columns.contains("Traffic") {
+            let visuals = ui.visuals().clone();
+            ui.horizontal(|ui| {
+                ui.colored_label(crate::chip::BLUE.tone(&visuals).ink, "Rx");
+                ui.colored_label(crate::chip::RED.tone(&visuals).ink, "Tx");
+                ui.weak(crate::i18n::tr_in("interfaces", self.lang.labels, "up to 5 min"));
+            });
+        }
         if let [i] = picked.as_slice() {
             ui.separator();
+            let visuals = ui.visuals().clone();
+            let mut explain_link = false;
             ui.horizontal_wrapped(|ui| {
                 ui.strong(&i.name);
-                ui.label(format!("MTU {}", i.mtu));
-                if let Some(view) = self.nic.get(&i.name) {
-                    if let Some(m) = view.monitor_value()
+                let (status, tone) = if i.disabled {
+                    ("disabled", crate::chip::neutral_tone(&visuals))
+                } else if i.running {
+                    ("up", crate::chip::GREEN.tone(&visuals))
+                } else {
+                    ("no link", crate::chip::neutral_tone(&visuals))
+                };
+                crate::chip::chip(ui, crate::i18n::tr_in("interfaces", self.lang.labels, status), tone);
+                if let Some(view) = self.nic.get(&i.name)
+                    && let Some(m) = view.monitor_value()
                         && let Some(rate) = m.get("rate").and_then(Value::as_str) {
+                        ui.weak(crate::i18n::tr_in("interfaces", self.lang.labels, "Link"));
                         ui.label(rate);
-                    }
+                        if let Some(full) = m.get("full_duplex").and_then(Value::as_bool) {
+                            let duplex = if full { "full duplex" } else { "half duplex" };
+                            ui.label(crate::i18n::tr_in("interfaces", self.lang.labels, duplex));
+                        }
+                }
+                ui.weak("MTU");
+                ui.label(&i.mtu);
+                if let Some(view) = self.nic.get(&i.name) {
                     if let Some((rx, tx)) = view.live_rates() {
-                        ui.label(format!("Rx {} · Tx {}", crate::graphs::rate(rx, "bps"), crate::graphs::rate(tx, "bps")));
+                        ui.colored_label(crate::chip::BLUE.tone(&visuals).ink, "Rx");
+                        ui.label(crate::graphs::rate(rx, "bps"));
+                        ui.colored_label(crate::chip::RED.tone(&visuals).ink, "Tx");
+                        ui.label(crate::graphs::rate(tx, "bps"));
                     }
                     if let Some((rx, tx)) = view.recent_errors().filter(|(rx, tx)| *rx > 0 || *tx > 0) {
                         ui.label(format!("Rx errors +{rx} · Tx errors +{tx} (last sample)"));
                     }
                 }
+                explain_link = crate::help::info_button(
+                    ui, egui::Id::unique("interfaces-summary-help"), "Link",
+                ).clicked();
             });
+            if explain_link {
+                let title = crate::i18n::tr_in("interfaces", self.lang.labels, "Link");
+                if let Some(panel) = self.panel_mut::<crate::interface_list_help::InterfaceListHelp>() {
+                    panel.help = Some(crate::help::HelpView::new("interfaces.link", title));
+                }
+            }
         }
         if let Some(name) = out.opened {
             act = Some(Act::Open(vec![name]));

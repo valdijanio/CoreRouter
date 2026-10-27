@@ -8,6 +8,12 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Restore defaults", "Restaurar padrão"),
     ("Traffic", "Tráfego"),
     ("Type", "Tipo"),
+    ("disabled", "desativada"),
+    ("full duplex", "duplex completo"),
+    ("half duplex", "duplex parcial"),
+    ("no link", "sem enlace"),
+    ("up", "ativa"),
+    ("up to 5 min", "até 5 min"),
 ];
 pub(super) const HELP: &[(&str, &str)] = &[
     ("interfaces.columns", "Escolha as colunas exibidas neste dispositivo. O nome permanece visível. Restaurar padrão volta à seleção original. Os comentários em faixa são independentes da coluna Comment."),
