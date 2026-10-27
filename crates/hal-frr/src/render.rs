@@ -70,6 +70,9 @@ pub const OWNED: Owned = &[
     // `match rpki` exists only in bgpd (its rpki module).
     ("rpki", &[Daemon::Bgpd]),
     ("route-map CR-RPKI-", &[Daemon::Bgpd]),
+    // G3.5: LDP, and zebra's label block when `/mpls settings` narrows it.
+    ("mpls ldp", &[Daemon::Ldpd]),
+    ("mpls label dynamic-block", &[Daemon::Zebra]),
 ];
 
 /// A table of owned contexts: header prefix → daemons that take it.
@@ -104,8 +107,33 @@ pub enum RenderError {
 /// What FRR should run for `cfg` (the owned part only); `open` opens the
 /// sealed TCP MD5 keys.
 pub fn render(cfg: &Config, open: corerouter_proto_bgp::Opener<'_>) -> Result<Conf, RenderError> {
-    let text = corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
-    Ok(Conf::parse(&text)?)
+    let mut text =
+        corerouter_proto_bgp::render_all(&cfg.routing, open).map_err(RenderError::Proto)?;
+    text.push_str(
+        &corerouter_proto_mpls::render_frr(&cfg.routing.mpls, open).map_err(RenderError::Proto)?,
+    );
+    let mut conf = Conf::parse(&text)?;
+    ldp_sync(&mut conf, cfg);
+    Ok(conf)
+}
+
+/// G3.5, RFC 5443: LDP-IGP synchronization goes inside the IGP's own
+/// context (`router ospf`), whichever render made it.
+fn ldp_sync(conf: &mut Conf, cfg: &Config) {
+    let lines = corerouter_proto_mpls::igp_sync_lines(&cfg.routing.mpls);
+    if lines.is_empty() {
+        return;
+    }
+    for n in conf.nodes.iter_mut().filter(|n| n.line == "router ospf" || n.line.starts_with("router ospf ")) {
+        for l in &lines {
+            if !n.children.iter().any(|c| &c.line == l) {
+                n.children.push(crate::conf::Node {
+                    line: l.clone(),
+                    children: Vec::new(),
+                });
+            }
+        }
+    }
 }
 
 /// `conf` split by daemon: each daemon's part, in [`Daemon::ALL`] order,
@@ -157,6 +185,27 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].0, Daemon::Bgpd);
         assert!(owned("router bgp 65000 view x"));
+        assert!(owned("mpls ldp"));
         assert!(!owned("hostname r1"));
+    }
+
+    #[test]
+    fn ldp_goes_to_ldpd_and_sync_into_router_ospf() {
+        use corerouter_model::mpls::{LdpInstance, LdpInterface};
+        let mut cfg = Config::default();
+        let e1: corerouter_model::IfName = "ether1".parse().unwrap();
+        cfg.routing.mpls.ldp = Some(LdpInstance::new([10, 0, 0, 1].into()));
+        cfg.routing.mpls.ldp_interfaces.insert(e1, LdpInterface::default());
+        let conf = render(&cfg, &|_| None).unwrap();
+        let parts = by_daemon(OWNED, &conf);
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].0, Daemon::Ldpd);
+        assert_eq!(parts[0].1.nodes[0].line, "mpls ldp");
+        // With an OSPF context (G3.4 renders it), sync lands inside it.
+        let mut c2 = Conf::parse("router ospf\n ospf router-id 10.0.0.1\n").unwrap();
+        ldp_sync(&mut c2, &cfg);
+        assert!(c2.nodes[0].children.iter().any(|c| c.line == "mpls ldp-sync"));
+        ldp_sync(&mut c2, &cfg);
+        assert_eq!(c2.nodes[0].children.iter().filter(|c| c.line == "mpls ldp-sync").count(), 1);
     }
 }

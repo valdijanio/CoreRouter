@@ -28,7 +28,10 @@ impl Hal for NoVrf {
         None
     }
     fn features(&self) -> Features {
-        Features { vrf: false }
+        Features {
+            vrf: false,
+            mpls: false,
+        }
     }
 }
 

@@ -117,4 +117,14 @@ pub trait RoutingReader: Send {
     fn rpki_state(&mut self) -> Option<String> {
         None
     }
+
+    /// G3.5: LDP's neighbors, interfaces, bindings and IGP sync. `None`:
+    /// `cfg` runs no LDP (nothing to read).
+    fn ldp_state(
+        &mut self,
+        cfg: &Config,
+    ) -> Result<Option<corerouter_model::mpls_state::LdpState>, HalError> {
+        let _ = cfg;
+        Ok(None)
+    }
 }

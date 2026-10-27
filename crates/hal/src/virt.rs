@@ -915,7 +915,16 @@ impl Hal for VirtualHal {
     }
 
     fn features(&self) -> Features {
-        Features { vrf: true }
+        Features {
+            vrf: true,
+            mpls: true,
+        }
+    }
+
+    /// The lab's label table: the static entries applied (G3.5). The lab
+    /// runs no LDP, so none of LDP's.
+    fn mpls_routes(&mut self) -> Result<Vec<crate::mpls::MplsRoute>, HalError> {
+        Ok(crate::mpls::static_routes(&self.applied.routing.mpls))
     }
 
     fn address_list_dynamic(&mut self, change: DynamicChange<'_>) -> Result<(), HalError> {

@@ -251,7 +251,11 @@ pub(crate) fn features() -> Features {
     if !vrf {
         log::warn!("{NO_VRF}: ip.vrf.add is disabled");
     }
-    Features { vrf }
+    let mpls = crate::mpls::available();
+    if !mpls {
+        log::info!("{}: the MPLS commands are disabled", corerouter_hal::mpls::NO_MPLS);
+    }
+    Features { vrf, mpls }
 }
 
 /// Bound on one address or route dump (hostile input; **estimado**).
