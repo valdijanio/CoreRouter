@@ -477,6 +477,35 @@ mod tests {
     }
 
     #[test]
+    fn a_lookup_answer_says_found_or_not() {
+        let t = Tuple {
+            src: "192.0.2.2".parse().unwrap(),
+            dst: "203.0.113.1".parse().unwrap(),
+            src_port: 53,
+            dst_port: 2100,
+        };
+        let req = get_request(&t, 17, 7);
+        assert_eq!(u16::from_ne_bytes([req[4], req[5]]), (1 << 8) | IPCTNL_MSG_CT_GET);
+        assert_eq!(req[16], AF_INET);
+        let answer = |kind: u16, code: Option<i32>| {
+            let mut m = 0u32.to_ne_bytes().to_vec();
+            m.extend_from_slice(&kind.to_ne_bytes());
+            m.extend_from_slice(&0u16.to_ne_bytes());
+            m.extend_from_slice(&7u32.to_ne_bytes());
+            m.extend_from_slice(&0u32.to_ne_bytes());
+            m.extend_from_slice(&code.unwrap_or(0).to_ne_bytes());
+            let len = u32::try_from(m.len()).unwrap();
+            m[..4].copy_from_slice(&len.to_ne_bytes());
+            m
+        };
+        assert_eq!(get_answer(&answer(2, Some(-2)), 7), Some(Ok(false)));
+        assert_eq!(get_answer(&answer(256, None), 7), Some(Ok(true)));
+        assert_eq!(get_answer(&answer(2, Some(-1)), 7), Some(Err(1)));
+        assert_eq!(get_answer(&answer(256, None), 8), None, "not ours");
+        assert_eq!(get_answer(&[1, 2, 3], 7), None);
+    }
+
+    #[test]
     fn a_connection_round_trips() {
         let c = conn();
         let bytes = reply_bytes(&c);

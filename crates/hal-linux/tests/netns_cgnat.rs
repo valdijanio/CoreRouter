@@ -718,3 +718,173 @@ fn a_subscriber_out_of_ports_never_borrows_another_s() {
     drop(sockets);
     hal.apply(&c, &Config::default()).unwrap();
 }
+
+/// Serve the exhaustion queues of `hal` on a thread until `stop`.
+fn serve_exhaustion(
+    hal: &mut LinuxHal,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::thread::JoinHandle<usize> {
+    let mut queues: Vec<_> = (0..corerouter_hal::cgnat::EXHAUSTED_QUEUES)
+        .map(|i| hal.cgnat_exhaustion_queue(i).unwrap())
+        .collect();
+    std::thread::spawn(move || {
+        let mut n = 0;
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            for q in &mut queues {
+                n += q.serve(Duration::from_millis(5)).unwrap();
+            }
+        }
+        n
+    })
+}
+
+/// A raw ICMP socket in the subscribers' namespace (as a `UdpSocket`, whose
+/// `recv` reads any datagram socket safely).
+fn icmp_listener(lab: &Lab) -> UdpSocket {
+    lab.subs.within(|| {
+        let s = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::RAW,
+            Some(socket2::Protocol::ICMPV4),
+        )
+        .unwrap();
+        UdpSocket::from(s)
+    })
+}
+
+/// The ICMP unreachable messages `sock` sees within `wait`: (code, quoted
+/// source address, quoted source port, when).
+fn icmp_seen(sock: &UdpSocket, wait: Duration) -> Vec<(u8, Ipv4Addr, u16, Instant)> {
+    let mut out = Vec::new();
+    let deadline = Instant::now() + wait;
+    while let Some(left) = deadline.checked_duration_since(Instant::now()) {
+        sock.set_read_timeout(Some(left.max(Duration::from_millis(1))))
+            .unwrap();
+        let mut b = [0u8; 1500];
+        let Ok(n) = sock.recv(&mut b) else { break };
+        let at = Instant::now();
+        let b = &b[..n];
+        let ihl = usize::from(b[0] & 0x0f) * 4;
+        let icmp = &b[ihl..];
+        if icmp[0] != 3 {
+            continue;
+        }
+        let q = &icmp[8..];
+        let qihl = usize::from(q[0] & 0x0f) * 4;
+        out.push((
+            icmp[1],
+            Ipv4Addr::new(q[12], q[13], q[14], q[15]),
+            u16::from_be_bytes([q[qihl], q[qihl + 1]]),
+            at,
+        ));
+    }
+    out
+}
+
+/// G2.7, RFC 6888 REQ-11: a subscriber out of ports gets an ICMP host
+/// unreachable (code 1) quoting the datagram as it sent it (private
+/// address and port), at most the configured rate; a nearly full
+/// subscriber with ports left goes out as before; a subscriber not in the
+/// set never reaches the queue.
+#[test]
+fn a_subscriber_out_of_ports_gets_icmp_host_unreachable() {
+    if !ready() {
+        return;
+    }
+    let _one = KERNEL.lock().unwrap_or_else(|e| e.into_inner());
+    let lab = lab();
+    let mut p = pool(64);
+    p.endpoint_independent_mapping = false;
+    let mut c = cfg(p.clone(), vec![]);
+    c.ip.cgnat.settings.icmp_rate = 5;
+    let mut hal = LinuxHal::new();
+    hal.apply(&Config::default(), &c).unwrap();
+    let text = run(Command::new("nft").args(["list", "chain", "ip", "corerouter_cgnat", "exhausted"]));
+    assert!(text.contains("@full") && text.contains("bypass"), "{text}");
+
+    let server = lab
+        .net
+        .within(|| UdpSocket::bind("192.0.2.2:7600").unwrap());
+    server
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    // .1 takes its 64 ports to one destination.
+    let sockets: Vec<UdpSocket> = lab.subs.within(|| {
+        (0..64)
+            .map(|_| {
+                let s = UdpSocket::bind("100.64.0.1:0").unwrap();
+                s.send_to(b"x", "192.0.2.2:7600").unwrap();
+                s
+            })
+            .collect()
+    });
+    let mut buf = [0u8; 8];
+    let mut through = 0;
+    while server.recv_from(&mut buf).is_ok() {
+        through += 1;
+    }
+    assert_eq!(through, 64);
+
+    let a: Ipv4Addr = "100.64.0.1".parse().unwrap();
+    let b: Ipv4Addr = "100.64.0.2".parse().unwrap();
+    hal.cgnat_full(&[a, b]).unwrap();
+    let full = run(Command::new("nft").args(["list", "set", "ip", "corerouter_cgnat", "full"]));
+    assert!(full.contains("100.64.0.1"), "{full}");
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let serving = serve_exhaustion(&mut hal, stop.clone());
+    let icmp = icmp_listener(&lab);
+
+    // Ten more flows from .1: dropped, and ICMP code 1 about each, up to
+    // the rate (5 per second, burst 5).
+    let sent = Instant::now();
+    let ports: Vec<u16> = lab.subs.within(|| {
+        (0..10)
+            .map(|_| {
+                let s = UdpSocket::bind("100.64.0.1:0").unwrap();
+                s.send_to(b"y", "192.0.2.2:7600").unwrap();
+                s.local_addr().unwrap().port()
+            })
+            .collect()
+    });
+    let seen = icmp_seen(&icmp, Duration::from_millis(600));
+    assert!(server.recv_from(&mut buf).is_err(), "nothing more got through");
+    assert_eq!(seen.len(), 5, "the burst, no more: {seen:?}");
+    for (code, src, port, _) in &seen {
+        assert_eq!(*code, 1, "host unreachable (RFC 6888 REQ-11b)");
+        assert_eq!(*src, a, "the private source, as sent");
+        assert!(ports.contains(port), "the subscriber's own port {port}");
+    }
+    let first = seen.iter().map(|s| s.3).min().unwrap();
+    eprintln!(
+        "first ICMP {:?} after the datagram",
+        first.duration_since(sent)
+    );
+
+    // .2 is in the set but has ports: it goes out, no ICMP.
+    let seen_b = udp_seen(
+        &lab,
+        "100.64.0.2:41000".parse().unwrap(),
+        "192.0.2.2:7601".parse().unwrap(),
+    );
+    assert!(layout_of(&p).forward(b).unwrap().contains(*seen_b.ip(), seen_b.port()));
+    // .65 is not in the set: never queued.
+    udp_seen(
+        &lab,
+        "100.64.0.65:41000".parse().unwrap(),
+        "192.0.2.2:7602".parse().unwrap(),
+    );
+    assert!(icmp_seen(&icmp, Duration::from_millis(200)).is_empty());
+
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let served = serving.join().unwrap();
+    let (hits, stats) = hal.cgnat_exhausted();
+    eprintln!("served {served}, {stats:?}");
+    assert_eq!(served, 11, "ten from .1 and one from .2; .65 never");
+    assert_eq!(stats.refused, 10);
+    assert_eq!(stats.icmp, 5);
+    assert_eq!(stats.limited, 5);
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].0, a);
+    drop(sockets);
+    hal.apply(&c, &Config::default()).unwrap();
+}

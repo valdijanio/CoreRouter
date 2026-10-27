@@ -519,10 +519,59 @@ mod tests {
         );
     }
 
+    #[test]
+    fn packets_with_carry_payload_and_connection() {
+        // A connection nest as ctnetlink writes it: the get request's
+        // tuple encoder gives the same attributes.
+        let t = corerouter_hal::conntrack::Tuple {
+            src: "100.64.0.1".parse().unwrap(),
+            dst: "192.0.2.2".parse().unwrap(),
+            src_port: 40000,
+            dst_port: 53,
+        };
+        let r = corerouter_hal::conntrack::Tuple {
+            src: "192.0.2.2".parse().unwrap(),
+            dst: "203.0.113.1".parse().unwrap(),
+            src_port: 53,
+            dst_port: 2100,
+        };
+        let orig = crate::ctnl::get_request(&t, 17, 1);
+        let reply = crate::ctnl::get_request(&r, 17, 1);
+        // Strip the netlink + nfgenmsg headers; flip the reply's nest type
+        // from CTA_TUPLE_ORIG (1) to CTA_TUPLE_REPLY (2).
+        let mut ct = orig[20..].to_vec();
+        let mut rep = reply[20..].to_vec();
+        rep[2] = 2;
+        ct.extend_from_slice(&rep);
+        let mut hdr = 9u32.to_be_bytes().to_vec();
+        hdr.extend_from_slice(&0x0800u16.to_be_bytes());
+        hdr.push(4);
+        let ip = vec![0x45, 0, 0, 20, 0, 0, 0, 0, 64, 17, 0, 0, 203, 0, 113, 1, 192, 0, 2, 2];
+        let m = msg(
+            NFQNL_MSG_PACKET,
+            0,
+            2,
+            7423,
+            0,
+            &[(NFQA_PACKET_HDR, hdr), (NFQA_PAYLOAD, ip.clone()), (NFQA_CT, ct)],
+        );
+        let got = packets_with(&m);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, 9);
+        assert_eq!(got[0].payload, &ip[..]);
+        let c = got[0].ct.as_ref().expect("the connection came along");
+        assert_eq!((c.orig, c.reply, c.protocol), (t, r, 17));
+        assert_eq!(ipv4_source(&ip), Some(Ipv4Addr::new(203, 0, 113, 1)));
+        // The flags request names the flags twice (value and mask).
+        let f = flags_request(7423, 3, F_CONNTRACK | F_FAIL_OPEN, MAXLEN);
+        assert_eq!(&f[f.len() - 4..], &3u32.to_be_bytes());
+    }
+
     proptest! {
         #[test]
         fn hostile_bytes_never_panic(junk in proptest::collection::vec(any::<u8>(), 0..300)) {
             let _ = packets(&junk);
+            let _ = packets_with(&junk);
         }
     }
 }
