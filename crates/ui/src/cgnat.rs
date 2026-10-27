@@ -876,7 +876,7 @@ impl Cgnat {
             let small = format!(
                 "{} {} · ICMP {}",
                 text(&d, "refused_24h"),
-                tr(l, "refused"),
+                tr(l, "connections refused"),
                 text(&d, "icmp_24h")
             );
             let tone = if hit > 0 { chip::RED.tone(ui.visuals()) } else { chip::GREEN.tone(ui.visuals()) };
