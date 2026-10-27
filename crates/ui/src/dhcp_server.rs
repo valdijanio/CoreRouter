@@ -931,6 +931,9 @@ impl DhcpServerPanel {
                         lease_cmd = Some(cmd);
                     }
                 }
+                // G4.10: block with the notice page (a static lease).
+                let l = app.lang.labels;
+                crate::subscriber_notice::block_menu(ui, app, l, "ip.dhcp-server.lease.notice", "address", &selection);
                 ui.separator();
             }
             if tab == Tab::Alerts && action(ui, "Reset Alert", can.and("ip.dhcp-server.alert.reset-alert", picked.clone())) {

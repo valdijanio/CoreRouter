@@ -244,6 +244,8 @@ fn origin_chip(o: &str) -> (&'static str, Kind) {
         "ipoe" => ("IPoE", Kind::Blue),
         "dhcp-lease" => ("DHCP lease", Kind::Blue),
         "dhcp-network" => ("DHCP network", Kind::Blue),
+        // G4.10: a throttle profile of the subscriber notices.
+        "notice" => ("notice", Kind::Amber),
         _ => ("fixed", Kind::Neutral),
     }
 }
@@ -523,7 +525,7 @@ impl QueuesPanel {
             self.filters.chips(
                 ui,
                 "origin",
-                &[("fixed", "fixed"), ("pppoe", "PPPoE"), ("ipoe", "IPoE"), ("dhcp-lease", "DHCP lease"), ("dhcp-network", "DHCP network")],
+                &[("fixed", "fixed"), ("pppoe", "PPPoE"), ("ipoe", "IPoE"), ("dhcp-lease", "DHCP lease"), ("dhcp-network", "DHCP network"), ("notice", "notice")],
                 l,
             );
             table::find_field(ui, SIMPLE_TABLE, &mut self.simple_table);

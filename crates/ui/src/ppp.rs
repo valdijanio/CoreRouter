@@ -1009,6 +1009,14 @@ impl PppPanel {
                         }
                     }
                 }
+                // G4.10: block with the notice page, by login.
+                let logins: Vec<String> = sel
+                    .as_slice()
+                    .iter()
+                    .filter_map(|k| data.iter().find(|t| text(t, "id") == *k))
+                    .map(|t| text(t, "name"))
+                    .collect();
+                crate::subscriber_notice::block_menu(ui, app, l, "ppp.secret.notice", "name", &logins);
                 let c = &self.secret_count;
                 ui.weak(format!(
                     "{} {} · {} {}",
