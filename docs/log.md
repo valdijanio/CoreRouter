@@ -5251,3 +5251,102 @@ continuação indentadas).
       0 Stops, 1 000 com Interim do novo, todas renovaram no novo;
     - 3 000: 1,23 s e 1,35 s, 0 perdidas, 3 000 Interims;
     - o CoA mandado ao nó antigo, que voltou como espera, chega às sessões IPoE em C (1000/1000).
+
+- 2026-10-27 — G2.1c: Firewall, tabela raw (`/ip firewall raw` do RouterOS): `ip.firewall.raw.{add,set,remove,move,list}`
+  nas chains `prerouting` e `output`, ações `accept`, `drop`, `notrack`, `jump`, `return`, `log`,
+  `passthrough` e `add-*-to-address-list`; `notrack` termina a chain (como no RouterOS) e vira
+  `notrack accept` na chain base de prioridade `raw` (-300, antes do conntrack). Sem matchers de
+  conexão (o validador recusa `connection_*` e `routing_mark` na raw). O aviso de lockout passa a
+  conexão de gerência pela raw e, se ela leva `notrack`, testa o filter como `untracked`. Modelo
+  pronto `ip.firewall.template.raw-bogons` (origens reservadas da RFC 6890 e porta 0 vindas da WAN,
+  descartadas antes do conntrack; `private` acrescenta RFC 1918/6598/4193). GUI: aba Raw, assistente
+  "Drop Bogons Before Conntrack", ⓘ nas abas da janela Firewall (`docs/firewall.md` §13).
+
+  Como testar: `cargo test -p corerouter-engine --test firewall_raw`; no lab,
+  `corerouter-cli run ip.firewall.raw.add '{"action":"notrack","protocol":"udp","dst_port":"53"}'`
+  e IP › Firewall › Raw. Kernel real: `cargo xtask netns` (`netns_nft.rs` carrega a raw do golden).
+
+  Desempenho (**medido**): `notrack` +5 % de pps encaminhados (1,17 → 1,24 Mpps) e drop na raw
+  +32 % sobre o drop no filter (1,17 → 1,55 Mpps), 4096 fluxos UDP de 64 bytes num netns.
+
+- 2026-10-27 — G2.7: CGNAT sem portas (G2.7). Antes, um assinante sem porta livre tinha a conexão descartada em silêncio:
+  o kernel só contava `insert_failed`. Agora, pela RFC 6888 REQ-11, a conexão é descartada e o
+  assinante recebe um ICMP *destination unreachable*, código 1 (*host unreachable*), que cita o pacote
+  como ele o mandou (IP e porta privados). Há limite de `icmp_rate` por assinante (padrão 2/s) e de
+  1000/s no roteador.
+
+  - **Mecanismo** (`docs/cgnat.md` §1.9). A NAT do kernel nunca falha: sem porta livre ela fica com uma
+    tupla em uso, e o `confirm` derruba a conexão depois de todo gancho. Por isso nem um `reject` no
+    nftables nem XDP/TC enxergam a falha.
+    - O tick põe no conjunto `full` quem passou de 80 % da faixa.
+    - Logo depois da NAT, só as conexões novas desses assinantes vão a quatro filas (`queue num
+      7423-7426 bypass`).
+    - O serviço `cgnat-icmp` (uma thread por fila, sem o lock do `Session`) consulta a tupla de
+      resposta no conntrack: tomada, descarta e manda o ICMP; livre, deixa seguir.
+  - **Modo blocos:** a fila 7422 também responde com o ICMP quando não há bloco.
+  - **REQ-8:** a quarentena de 120 s passou a ser por faixa de portas do IP público e vale também
+    quando a geometria do pool muda (antes, a mudança pulava a quarentena). A busca da quarentena
+    deixou de ser linear.
+  - **Comandos:**
+    - `ip.firewall.cgnat.set {icmp_unreachable?, icmp_rate?}`;
+    - `alert.list` traz `refused`, `icmp_sent`, `icmp_limited` e `full`, e por assinante `refused`,
+      `icmp` e `last_refused`;
+    - uma linha `no free port: …` no log por assinante (no máximo uma por minuto);
+    - janela CGNAT › Alerts com selos, coluna Refused e ⓘ.
+  - **Como testar:**
+    - `COREROUTER_NETNS_TESTS=1 unshare --user --map-root-user --net -- cargo test -p corerouter-hal-linux --test netns_cgnat icmp`:
+      10 fluxos além das 64 portas dão 10 recusas e exatamente 5 ICMP (a rajada), cada um com o IP e a
+      porta privados; o vizinho com portas sai normalmente;
+    - `cargo test -p corerouter-engine --test cgnat_blocks`.
+  - **Números (medido, 2026-10-27):**
+    - custo no caso normal: dentro do ruído (280 557 × 285 774 conexões novas/s, sem × com a chain);
+    - latência até o ICMP: 125 µs;
+    - tempestade: 188 mil recusas/s atendidas sem perda;
+    - 14 ICMP em 20 mil recusas.
+
+- 2026-10-27 — G3.1: FRR como motor de roteamento. A cada commit que muda `routing`, o `hal-frr` faz três coisas.
+  Primeiro, renderiza a config pelos `proto-*`. Depois, lê o que cada daemon roda (`show
+  running-config` no socket `/var/run/frr/<daemon>.vty`). Por fim, digita só a diferença entre
+  `XFRR_start_configuration` e `XFRR_end_configuration`, com os daemons em paralelo. Se o FRR
+  recusar uma linha, o que foi digitado é desfeito, o engine desfaz o `Hal::apply` e o commit
+  falha com a linha e a mensagem do FRR. Não há processo externo e o FRR nunca é reiniciado:
+  sessões que o commit não muda continuam de pé.
+
+  O que entrou:
+  - O diff é contra a config que o daemon roda, então o mesmo caminho ressincroniza depois de um
+    restart do FRR. O serviço `frr` percebe o restart pelo PID dos daemons, mesmo quando ele cabe
+    entre duas leituras.
+  - Estado: `routing.bgp.session.list` (campos do `/routing bgp session print` do RouterOS v7) e
+    `routing.backend.get`. Os dois vêm da amostra que o serviço lê a cada 2 s numa thread
+    própria, fora do lock do `Session`. No laboratório virtual a lista fica vazia.
+  - O trait `RoutingDaemon` recebe configs inteiras, então um backend mgmtd ou holo (G3.8) cabe
+    sem mudar engine, comandos, UI ou MCP.
+  - Instâncias com nome diferente de `default` viram `router bgp <AS> view <nome>` até a G3.2
+    dar VRF às instâncias.
+  - RFC 8212: o `bgp ebgp-requires-policy` do FRR fica ligado.
+  - Para a G3.2: um filtro compartilhado (prefix-list, route-map) vai ao mgmtd, com `configure
+    terminal file-lock`, e a cada daemon de roteamento ainda não convertido. Esquecer um daemon
+    deixa uma cópia velha que o `vtysh` esconde.
+
+  Como testar:
+  - `cargo test -p corerouter-hal-frr` e `cargo test -p corerouter-engine routing`.
+  - Com FRR real, na VM (root só lá dentro): `cargo xtask vm-lab run -- scripts/frr-live.sh`. O
+    script sobe um par BGP num namespace e confere quatro coisas:
+    - a sessão estabelecida segue de pé depois de acrescentar e tirar 2000 entradas de
+      prefix-list e um vizinho;
+    - o rollback de um comando recusado volta exatamente à config anterior;
+    - a render é canônica (o diff de volta é vazio);
+    - de ponta a ponta, o daemon com `--frr` leva um commit da CLI ao bgpd e reinstala a config
+      depois de `systemctl restart frr`.
+  - Comparação das formas de falar com o FRR: `cargo xtask vm-lab run -- scripts/frr-compare.sh`.
+
+  Números (**medidos**, FRR 10.7.1, VM do laboratório com 8 vCPUs, release):
+
+  | Medida | socket vty em Rust | `frr-reload.py` / `vtysh -c` |
+  |---|---|---|
+  | mudança pequena | 1,1–7,2 ms | 0,14–0,98 s |
+  | 10 mil entradas de prefix-list | 1,65–1,77 s | 3,7–4,1 s |
+  | ler 100 sessões | 2,3–2,6 ms | 10–12 ms |
+
+  - O apply em paralelo (um thread por daemon) tirou 50–65 % do tempo da mudança grande.
+  - A memória do processo que aplica ficou em 4–16 MiB, contra 18–36 MiB.
