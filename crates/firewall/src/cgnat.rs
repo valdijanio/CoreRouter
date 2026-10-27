@@ -66,6 +66,7 @@ fn rule(chain: &str, exprs: Vec<Expr>, text: String) -> Rule {
         exprs,
         text,
         nft: None,
+        comment: None,
     }
 }
 

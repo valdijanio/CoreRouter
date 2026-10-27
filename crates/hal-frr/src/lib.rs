@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use corerouter_hal::HalError;
-use corerouter_hal::routing::{RoutingDaemon, RoutingReader};
+use corerouter_hal::routing::{BgpClear, RoutingDaemon, RoutingReader, SecretOpener};
 use corerouter_model::Config;
 use corerouter_model::routing_state::BgpSession;
 
@@ -46,12 +46,24 @@ pub const MAX_REPLY: usize = 64 << 20;
 const MAX_ERROR: usize = 400;
 
 /// The FRR suite, reached through its vty sockets in `dir`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Frr {
     dir: PathBuf,
     timeout: Duration,
     max_reply: usize,
     owned: render::Owned,
+    /// Opens the sealed TCP MD5 keys (the engine's, G3.2a).
+    secrets: Option<SecretOpener>,
+}
+
+impl std::fmt::Debug for Frr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Frr")
+            .field("dir", &self.dir)
+            .field("timeout", &self.timeout)
+            .field("owned", &self.owned)
+            .finish_non_exhaustive()
+    }
 }
 
 /// What one sync did, for the log and the benchmarks.
@@ -75,7 +87,17 @@ impl Frr {
             timeout: TIMEOUT,
             max_reply: MAX_REPLY,
             owned: render::OWNED,
+            secrets: None,
         }
+    }
+
+    /// What FRR should run for `cfg`, keys opened with the engine's opener.
+    pub fn render(&self, cfg: &Config) -> Result<Conf, HalError> {
+        let open = |s: &corerouter_model::sealed::Sealed| match &self.secrets {
+            Some(o) => o(s),
+            None => (!s.is_sealed()).then(|| s.stored().to_owned()),
+        };
+        render::render(cfg, &open).map_err(|e| HalError::Rejected(e.to_string()))
     }
 
     pub fn dir(&self) -> &Path {
@@ -169,7 +191,7 @@ impl Frr {
                         failed = Some(format!(
                             "FRR {} refused `{}`: {} ({})",
                             d.name(),
-                            cmd.trim_end(),
+                            conf::redact(cmd.trim_end()),
                             r.text(MAX_ERROR),
                             vty::code_name(r.code)
                         ));
@@ -308,7 +330,7 @@ impl Frr {
         let leftover = match self.running(&mut vty, d) {
             Ok(after) => conf::diff(&after, target)
                 .into_iter()
-                .map(|l| format!("{}: {l}", d.name()))
+                .map(|l| format!("{}: {}", d.name(), conf::redact(&l)))
                 .collect(),
             Err(_) => Vec::new(),
         };
@@ -442,7 +464,7 @@ impl RoutingDaemon for Frr {
     }
 
     fn apply(&mut self, _from: &Config, to: &Config) -> Result<(), HalError> {
-        let desired = render::render(to).map_err(|e| HalError::Rejected(e.to_string()))?;
+        let desired = self.render(to)?;
         let synced = self.sync(&desired)?;
         for (d, n) in &synced.commands {
             log::info!("FRR {}: {n} command(s) applied", d.name());
@@ -452,6 +474,50 @@ impl RoutingDaemon for Frr {
 
     fn reader(&self) -> Box<dyn RoutingReader> {
         Box::new(FrrReader(self.clone()))
+    }
+
+    fn set_secrets(&mut self, open: SecretOpener) {
+        self.secrets = Some(open);
+    }
+
+    fn bgp_clear(&mut self, instance: &str, neighbor: &str, how: BgpClear) -> Result<(), HalError> {
+        self.clear(instance, neighbor, how)
+    }
+}
+
+impl Frr {
+    /// `clear bgp [view V] NEIGHBOR [soft in|out]` on bgpd (the enable
+    /// node). `neighbor` must be an address: it goes on the vty.
+    pub fn clear(&self, instance: &str, neighbor: &str, how: BgpClear) -> Result<(), HalError> {
+        let addr: std::net::IpAddr = neighbor
+            .parse()
+            .map_err(|_| HalError::Rejected(format!("{neighbor:?} is not a neighbor address")))?;
+        let view = if instance == corerouter_proto_bgp::DEFAULT_INSTANCE {
+            String::new()
+        } else if instance
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            format!("view {instance} ")
+        } else {
+            return Err(HalError::Rejected(format!(
+                "bad instance name {instance:?}"
+            )));
+        };
+        let tail = match how {
+            BgpClear::Hard => "",
+            BgpClear::SoftIn => " soft in",
+            BgpClear::SoftOut => " soft out",
+        };
+        let cmd = format!("clear bgp {view}{addr}{tail}");
+        let mut vty = self.connect(Daemon::Bgpd)?;
+        let r = vty.run(&cmd).map_err(|e| io_err(Daemon::Bgpd, e))?;
+        let text = r.text(MAX_ERROR);
+        // bgpd answers a warning with success for an unknown neighbor.
+        if !r.ok() || text.contains("%") {
+            return Err(HalError::Rejected(format!("FRR bgpd: {cmd}: {text}")));
+        }
+        Ok(())
     }
 }
 
@@ -518,7 +584,7 @@ mod tests {
                 comment: String::new(),
             },
         );
-        let e = render::render(&cfg).map(|c| frr.sync(&c));
+        let e = frr.render(&cfg).map(|c| frr.sync(&c));
         assert!(matches!(e, Ok(Err(HalError::Io(m))) if m.contains("bgpd is not reachable")));
     }
 }

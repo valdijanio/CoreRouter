@@ -7,8 +7,10 @@ pub(super) const HELP: &[(&str, &str)] = &[
         "tuning.boot",
         r##"## Parâmetros de boot
 Vão na linha de comando do kernel da imagem do roteador e valem a partir do **próximo boot**. A imagem é imutável e A/B: um boot que falha volta sozinho para a imagem anterior, com a linha de comando dela.
-## Hoje
-A imagem A/B (G1.6) ainda não existe: os parâmetros ficam gravados na config e aparecem como pendentes; a imagem vai lê-los quando existir (G1.26h). "Running" é o que este boot usou (`/proc/cmdline`)."##,
+## Como são aplicados (G1.26h)
+**Apply on slot X and reboot** copia a imagem em uso para o outro slot A/B (pula a cópia se ele já a tem), grava os parâmetros na entrada de boot desse slot e reinicia nele **em teste**. A linha de comando do slot em uso nunca muda. Se o teste não sobe e não confirma no prazo (um parâmetro que impede o boot: o kernel entra em pânico e o `panic=10` reinicia), o firmware volta sozinho ao slot anterior, com a configuração que ele tinha.
+
+"Running" é o que este boot usou (`/proc/cmdline`); as linhas dos slots mostram o que cada entrada de boot carrega. Uma atualização (System › Packages) também leva estes parâmetros para o slot novo."##,
     ),
     (
         "tuning.boot.intel_idle.max_cstate",
@@ -662,6 +664,10 @@ Essa memória fica indisponível para os programas; mais de 5 % da RAM raramente
 /// Labels by their English text.
 pub(super) const LABELS: &[(&str, &str)] = &[
     (
+        "Apply on slot",
+        r##"Aplicar no slot"##,
+    ),
+    (
         "Apply to all ports with Safe Mode",
         r##"Aplicar em todas as portas com Safe Mode"##,
     ),
@@ -704,6 +710,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Control plane (TCP)",
         r##"Plano de controle (TCP)"##,
+    ),
+    (
+        "Copies the running image to slot",
+        r##"Copia a imagem em uso para o slot"##,
     ),
     (
         "Current",
@@ -842,6 +852,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Faixa"##,
     ),
     (
+        "Reboot now",
+        r##"Reiniciar agora"##,
+    ),
+    (
         "Recommended",
         r##"Recomendado"##,
     ),
@@ -884,6 +898,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Show differences",
         r##"Ver diferenças"##,
+    ),
+    (
+        "Slot",
+        r##"Slot"##,
     ),
     (
         "Speed",
@@ -950,8 +968,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"Usar o recomendado"##,
     ),
     (
-        "Valid from the next boot. The A/B image does not exist yet (G1.6): the parameters are saved in the config and wait for it (G1.26h).",
-        r##"Vale a partir do próximo boot. A imagem A/B ainda não existe (G1.6): os parâmetros ficam gravados na config e esperam por ela (G1.26h)."##,
+        "Valid from the next boot. Without the A/B image (here: not available) the parameters are saved in the config and wait for it.",
+        r##"Vale a partir do próximo boot. Sem a imagem A/B (aqui: indisponível), os parâmetros ficam gravados na config e esperam por ela."##,
     ),
     (
         "Valid from the next boot; a boot that fails goes back to the previous image.",
@@ -964,6 +982,10 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (
         "Why",
         r##"Motivo"##,
+    ),
+    (
+        "and reboot",
+        r##"e reiniciar"##,
     ),
     (
         "control plane",
@@ -998,6 +1020,14 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"próximo boot"##,
     ),
     (
+        "no image",
+        r##"sem imagem"##,
+    ),
+    (
+        "no tuning parameters",
+        r##"sem parâmetros de tuning"##,
+    ),
+    (
         "not applied",
         r##"não aplicado"##,
     ),
@@ -1010,8 +1040,16 @@ pub(super) const LABELS: &[(&str, &str)] = &[
         r##"parâmetros diferem deste perfil."##,
     ),
     (
+        "running",
+        r##"em uso"##,
+    ),
+    (
         "security risk",
         r##"risco de segurança"##,
+    ),
+    (
+        "the router reboots into it on trial and comes back by itself if it does not confirm.",
+        r##"o roteador reinicia nele em teste e volta sozinho se não confirmar."##,
     ),
     (
         "waiting for the router…",

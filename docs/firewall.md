@@ -100,26 +100,31 @@ Política das chains nativas: `accept` (o RouterOS aceita o que nenhuma regra de
 desativadas e seções não vão para o kernel. Duas marcas cujo número colide são recusadas pelo
 validador.
 
-Aplicação (`hal-linux`, módulo `nft`): quando o ruleset renderizado muda, o `LinuxHal` roda
-`nft -f -` com
+Aplicação (`hal-linux`, módulo `firewall`, G2.8): sem o programa `nft`. O mesmo `build` que
+escreve o texto acima monta `program::Table` (sets, chains e as expressões da VM do nf_tables,
+`corerouter_firewall::bytecode`), e o `hal-linux` a manda por **nfnetlink** num lote
+(`NFNL_MSG_BATCH_BEGIN`/`END`): o kernel aplica o lote inteiro ou nada.
 
-```
-table inet corerouter
-delete table inet corerouter
-table inet corerouter { … }
-```
-
-O `nft` compila o texto e manda **um** lote netlink, que o kernel aplica inteiro ou recusa inteiro
-— troca atômica. Por que o programa `nft` e não netlink direto do Rust: a API do nftables é uma
-VM de bytecode; os crates Rust ou embrulham a libnftnl em C (FFI, `unsafe`) ou não cobrem o que
-usamos (sets com intervalo e timeout, `ct status`, faixas de NAT). O texto é montado só com
-valores validados (nomes com charset restrito, `quoted()` ainda filtra aspas e barras).
+- **Commit por diferença:** lê os handles das regras do kernel (um dump, `nft_read`), confere que
+  a tabela é a que carregamos e manda só o que mudou: `DELRULE` das regras que saíram, `NEWRULE`
+  no lugar (posição pelo handle da regra anterior) das que entraram (diff de Myers por chain),
+  elementos de set que mudaram, chains e sets novos ou removidos. Regra que não mudou **mantém
+  handle e contadores**; os sets dinâmicos não são tocados.
+- **Troca inteira** quando o diff não serve (tabela mexida por outro, set com outra definição,
+  lote recusado): lê antes as entradas dinâmicas e as recoloca, também num lote só.
+- O bytecode imita o do `nft` byte a byte (vetores do `nft --debug=mnl` em
+  `tests/fixtures/nft_mnl_g28.txt`), e os testes netns carregam a mesma config pelo `nft -f` e por
+  nós e comparam o que o kernel guarda, objeto a objeto, e o `nft list`.
+- Lista de portas (`dst_port=22,80,443`) é um set nomeado compartilhado por conteúdo,
+  `ports_22_80_443` (`th dport @ports_22_80_443`), e `connection_state=established,related` é
+  `ct state established,related` (máscara): um set anônimo por regra custa ao kernel uma varredura
+  de todos os sets da tabela (10 000 regras levavam 22 s; agora 0,1 s, `docs/architecture.md`
+  §1.2.1).
 
 Ordem no commit: nftables primeiro (se recusar, nada mudou), depois o plano netlink (links,
-endereços, rotas); se o netlink falhar e desfazer, o ruleset anterior é recarregado. Sem
-firewall na config a tabela é apagada; sem mudança no firewall o `nft` nem é chamado (um host
-sem nftables continua funcionando para o resto). O `VirtualHal` guarda o script que aplicaria
-(`VirtualHal::ruleset`).
+endereços, rotas); se o netlink falhar e desfazer, o firewall volta pelo diff inverso. Sem
+firewall na config a tabela é apagada; sem mudança no firewall nada é enviado. O `VirtualHal`
+guarda o script que aplicaria (`VirtualHal::ruleset`).
 
 Golden: `crates/firewall/tests/golden/full.nft` (uma config que usa todo matcher e ação,
 `corerouter_firewall::sample`); `UPDATE_GOLDEN=1 cargo test -p corerouter-firewall` regenera.
@@ -133,12 +138,16 @@ Com `timeout` (`30s`, `5m`, `1h30m`, `1d`, até 35 dias) a entrada é **estado o
 os vizinhos: não entra na config nem no `running.json`, não gera revisão, some num reinício (o
 RouterOS faz igual com as dinâmicas). Ids `*D0000001…` para nunca colidir com as estáticas.
 
-- O engine manda cada uma ao data plane por `Hal::address_list_dynamic` (no Linux,
-  `add element … timeout Ns`), e o kernel a expira sozinho.
-- Uma troca de tabela (commit) lê antes os elementos com `expires` dos nossos sets
-  (`nft -j list table inet corerouter`) e os recoloca com o tempo que falta. Uma entrada que o
-  kernel acrescente entre a leitura e a troca (milissegundos) se perde: aceitável para listas de
-  bloqueio temporário.
+- O engine manda cada uma ao data plane por `Hal::address_list_dynamic` (no Linux, um
+  `NEWSETELEM` com timeout, G2.8), e o kernel a expira sozinho. Muitas de uma vez
+  (`address_list_dynamic_many`) vão num lote só: 100 000 entradas em 116 ms (**medido**; antes
+  era um processo `nft` por entrada, 2,4 s por 1 000).
+- Uma entrada que se sobrepõe ao que o set já tem faz o kernel recusar o lote (o set de intervalos
+  não aceita sobreposição; o `auto-merge` do nft era em espaço de usuário): o set é lido, mesclado
+  por nós (a parte estática vence, as temporárias se juntam com o maior prazo) e reescrito, num
+  lote.
+- Uma troca de tabela lê antes as entradas temporárias dos nossos sets (nfnetlink, `nft_read`) e
+  as recoloca com o tempo que falta. O commit por diferença nem toca nelas.
 - O engine espelha a tabela para `address-list.list` (`timeout` = segundos restantes) e expira no
   `Session::tick`. Sem relógio (wasm `?lab`) a contagem começa no primeiro tick.
 

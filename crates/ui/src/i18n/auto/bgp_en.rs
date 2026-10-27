@@ -1,0 +1,96 @@
+//! English explanations of the Routing › BGP window (G3.2a), sorted by key
+//! (registered by `build.rs`).
+
+/// Explanations: (key, Markdown).
+pub(super) const HELP: &[(&str, &str)] = &[
+    (r##"bgp.connection"##, r##"## What it is
+One BGP neighbor (RouterOS `/routing bgp connection`). Empty fields inherit from the templates, then the defaults. The preview shows the values in force and what the change does."##),
+    (r##"bgp.connection.disabled"##, r##"## What it is
+Shutdown: the session is closed with a NOTIFICATION Cease (administrative shutdown, RFC 4486/RFC 8203) and stays down; the connection stays in the config."##),
+    (r##"bgp.connection.instance"##, r##"## What it is
+The BGP instance (local AS and router id) this neighbor belongs to. `default` is the main routing table."##),
+    (r##"bgp.connection.name"##, r##"## What it is
+The connection's name; FRR gets it as the neighbor's description, which is how a live session finds its connection. Letters, digits, `-`, `_`, `.`."##),
+    (r##"bgp.connection.remote_address"##, r##"## What it is
+The neighbor's address (RouterOS `remote.address`), IPv4 or IPv6. One connection per address in an instance."##),
+    (r##"bgp.instance.asn"##, r##"## What it is
+Our AS, asplain or asdot, 4-byte (RFC 6793). Reserved values are refused."##),
+    (r##"bgp.instance.name"##, r##"## What it is
+The instance's name; `default` runs in the main table, another name is a separate FRR view."##),
+    (r##"bgp.instance.router_id"##, r##"## What it is
+Our BGP identifier, an IPv4 address unique in the AS (RFC 6286); usually the loopback."##),
+    (r##"bgp.param.afi"##, r##"## What it is
+RouterOS `afi`: the address families the session carries (multiprotocol BGP, RFC 4760): `ip` (IPv4 unicast), `ipv6`, or both. Default `ip`."##),
+    (r##"bgp.param.hold_time"##, r##"## What it is
+Seconds without a message from the neighbor before the session is closed (RFC 4271 §4.2). The smaller of the two sides' values is used.
+
+## Values
+0 (infinity) or 3..65535. Default 180 s."##),
+    (r##"bgp.param.keepalive_time"##, r##"## What it is
+Seconds between KEEPALIVEs. Empty: a third of the hold time (RFC 4271 §10). Must be shorter than the hold time."##),
+    (r##"bgp.param.local_role"##, r##"## What it is
+RouterOS `local.role`: `ibgp` (same AS) or `ebgp`; the `ebgp-provider`, `-customer`, `-peer`, `-rs`, `-rs-client` roles are announced in the OPEN (RFC 9234) and let both sides catch a route leak.
+
+## Default
+Empty: from the remote AS (ours → ibgp, other → ebgp)."##),
+    (r##"bgp.param.max_prefix"##, r##"## What it is
+The most prefixes accepted from the neighbor, per family (RouterOS `input.limit-process-routes`). Protects the router from a full table sent by mistake. Empty or 0: no limit."##),
+    (r##"bgp.param.max_prefix_action"##, r##"## What it is
+What happens over the limit: `shutdown` (close the session until it is cleared; default), `warning` (log only) or `restart` (close and try again after the restart time)."##),
+    (r##"bgp.param.max_prefix_restart"##, r##"## What it is
+Minutes before a session closed by the prefix limit is opened again (action `restart`). Default 5."##),
+    (r##"bgp.param.multihop"##, r##"## What it is
+The eBGP neighbor is more than one hop away (a loopback): FRR `ebgp-multihop` (TTL 255). iBGP is always multihop."##),
+    (r##"bgp.param.nexthop_choice"##, r##"## What it is
+RouterOS `nexthop-choice`: `default` (the protocol's rule), `force-self` (always our address, also to iBGP: FRR `next-hop-self`) or `propagate` (keep the received next hop, also to eBGP)."##),
+    (r##"bgp.param.remote_as"##, r##"## What it is
+The neighbor's AS (RouterOS `remote.as`), asplain (`65100`) or asdot (`1.10`), 4-byte (RFC 6793). Empty: any AS — FRR `remote-as external` (eBGP) or `internal` (iBGP), by the role.
+
+## Refused
+0 (RFC 7607), 23456 (AS_TRANS, RFC 6793), 65535 and 4294967295 (RFC 7300)."##),
+    (r##"bgp.param.tcp_md5_key"##, r##"## What it is
+The TCP MD5 signature key (RFC 2385), the same on both sides; RouterOS `tcp-md5-key`. Stored sealed: it never appears in the config, the history, the journal, the logs or MCP.
+
+## Editing
+Empty keeps the key; the CLI clears it with `tcp_md5_key=""`."##),
+    (r##"bgp.param.templates"##, r##"## What it is
+Templates to inherit from, comma-separated, first wins. A value set here always wins over the templates."##),
+    (r##"bgp.param.update_source"##, r##"## What it is
+RouterOS `local.address`: the address (or interface) the TCP session leaves from — a loopback for iBGP between routers."##),
+    (r##"bgp.session.bfd"##, r##"## What it is
+BFD's state for the neighbor (RFC 5880/5882), when BFD watches it: it detects a dead link in a fraction of a second, long before the hold time."##),
+    (r##"bgp.session.flaps"##, r##"## What it is
+Times the session went down after being established. A count that grows points to a flapping link or neighbor."##),
+    (r##"bgp.session.last_error"##, r##"## What it is
+The last NOTIFICATION sent or received (RFC 4271 §4.5), or why the session last went down ("Reached received prefix count": the prefix limit)."##),
+    (r##"bgp.session.messages"##, r##"## What it is
+BGP messages received and sent (OPEN, UPDATE, KEEPALIVE, NOTIFICATION, ROUTE-REFRESH)."##),
+    (r##"bgp.session.policy"##, r##"## What it is
+The route-map applied in each direction. Without one, an eBGP session accepts and sends nothing (RFC 8212, on by default); policies come with G3.2b."##),
+    (r##"bgp.session.prefixes_in"##, r##"## What it is
+Prefixes accepted from the neighbor, all families. With eBGP and no policy it stays 0 (RFC 8212)."##),
+    (r##"bgp.session.prefixes_out"##, r##"## What it is
+Prefixes sent to the neighbor, all families."##),
+    (r##"bgp.session.remote_id"##, r##"## What it is
+The neighbor's BGP identifier (its router id), from its OPEN."##),
+    (r##"bgp.session.state"##, r##"## What it is
+The session's state (RFC 4271 §8.2.2): `established` is up; `idle`, `connect`, `active`, `opensent` and `openconfirm` are on the way (or failing); `disabled` is shut down; `no daemon` means no routing daemon is attached (virtual lab)."##),
+    (r##"bgp.session.timers"##, r##"## What it is
+The negotiated hold time and keepalive (the smaller hold of the two sides, RFC 4271 §4.2); before the session is up, the configured ones."##),
+    (r##"bgp.session.uptime"##, r##"## What it is
+How long the session has been established."##),
+    (r##"bgp.tab.connections"##, r##"## What it is
+The neighbors, as RouterOS `/routing bgp connection`: address, AS, role and the templates each one inherits from. A change goes to FRR as only the lines that changed: the other sessions stay up."##),
+    (r##"bgp.tab.instances"##, r##"## What it is
+The local side: our AS (4-byte, RFC 6793) and router id. Connections belong to an instance (`default`)."##),
+    (r##"bgp.tab.sessions"##, r##"## What it shows
+The BGP sessions FRR runs now, one per connection, as RouterOS `/routing bgp session` (read-only, live every 2 s): state, uptime, prefixes received and sent, BFD. Select one for its last error, timers, policies, flaps and the actions Refresh, Resend, Clear and Shutdown."##),
+    (r##"bgp.tab.templates"##, r##"## What it is
+Shared parameters, as RouterOS `/routing bgp template`. A connection lists templates; each parameter it leaves empty comes from the first template that sets it, and a template may list parents of its own (loops are refused)."##),
+    (r##"bgp.template"##, r##"## What it is
+Parameters shared by many connections (RouterOS `/routing bgp template`). A change reaches every connection that inherits the value; the preview lists them and refuses a change that would make one invalid."##),
+    (r##"bgp.template.name"##, r##"## What it is
+The template's name, as connections and other templates list it. A rename follows everywhere it is listed."##),
+    (r##"bgp.template.used_by"##, r##"## What it is
+The connections and templates that list this template: who changes when it changes. A template in use cannot be removed."##),
+];

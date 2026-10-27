@@ -232,7 +232,10 @@ pub fn changed(a: &Config, b: &Config) -> Sections {
         mark(ip_rest(x) != ip_rest(y), Sections::IP_REST);
     }
     mark(a.ipv6 != b.ipv6, Sections::IPV6);
-    mark(a.routing != b.routing, Sections::ROUTING);
+    mark(
+        !CowArc::ptr_eq(&a.routing, &b.routing) && *a.routing != *b.routing,
+        Sections::ROUTING,
+    );
     mark(a.radius != b.radius, Sections::RADIUS);
     mark(a.ppp.secrets != b.ppp.secrets, Sections::PPP_SECRETS);
     mark(ppp_rest(&a.ppp) != ppp_rest(&b.ppp), Sections::PPP_REST);

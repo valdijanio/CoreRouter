@@ -190,6 +190,7 @@ pub fn overwrite_key(line: &str) -> Option<String> {
         "filter-list",
         "weight",
         "allowas-in",
+        "local-role",
     ];
     let mut words = line.split(' ');
     if words.next() == Some("neighbor") {
@@ -220,15 +221,42 @@ pub fn overwrite_key(line: &str) -> Option<String> {
 /// setting ([`overwrite_key`]) are entered over the old value. Order inside
 /// a context does not matter to FRR (route-map and prefix-list entries carry
 /// their sequence numbers), so lines are compared as a set.
+///
+/// BGP neighbors (G3.2a) add one dependency: a neighbor exists from its
+/// `neighbor X remote-as` line until `no neighbor X remote-as`, which also
+/// removes every other line of it, in every address family. So a new
+/// neighbor is defined before the changes inside the address families
+/// (its `activate`), a removed one is removed after them, and the other
+/// lines of a removed neighbor are not deleted one by one (FRR would refuse
+/// them: the neighbor is gone).
 pub fn diff(old: &Conf, new: &Conf) -> Vec<String> {
     let mut out = Vec::new();
-    diff_scope(&old.nodes, &new.nodes, true, &mut out);
+    diff_scope(&old.nodes, &new.nodes, true, &HashSet::new(), &mut out);
     out
 }
 
+/// The neighbor a line defines (`neighbor X remote-as …`).
+pub fn defines_peer(line: &str) -> Option<&str> {
+    let rest = line.strip_prefix("neighbor ")?;
+    let (peer, attr) = rest.split_once(' ')?;
+    attr.starts_with("remote-as ").then_some(peer)
+}
+
+/// The neighbor a line is about (`neighbor X …`).
+fn peer_of(line: &str) -> Option<&str> {
+    line.strip_prefix("neighbor ")?.split(' ').next()
+}
+
 /// Diff one context's children (`top`: the root, where every context has
-/// a `no` form).
-fn diff_scope(old: &[Node], new: &[Node], top: bool, out: &mut Vec<String>) {
+/// a `no` form). `gone`: neighbors removed by an enclosing context, whose
+/// lines here go with them.
+fn diff_scope(
+    old: &[Node],
+    new: &[Node],
+    top: bool,
+    gone: &HashSet<String>,
+    out: &mut Vec<String>,
+) {
     let new_by: HashMap<&str, &Node> = new.iter().map(|n| (n.line.as_str(), n)).collect();
     let old_by: HashMap<&str, &Node> = old.iter().map(|n| (n.line.as_str(), n)).collect();
     let replaced: HashSet<String> = new
@@ -236,8 +264,19 @@ fn diff_scope(old: &[Node], new: &[Node], top: bool, out: &mut Vec<String>) {
         .filter(|n| !old_by.contains_key(n.line.as_str()))
         .filter_map(|n| overwrite_key(&n.line))
         .collect();
+    // Neighbors removed in this context: defined before, not after.
+    let still: HashSet<&str> = new.iter().filter_map(|n| defines_peer(&n.line)).collect();
+    let mut removed: HashSet<String> = gone.clone();
+    removed.extend(
+        old.iter()
+            .filter_map(|n| defines_peer(&n.line))
+            .filter(|p| !still.contains(p))
+            .map(str::to_owned),
+    );
+    let of_removed = |line: &str| peer_of(line).is_some_and(|p| removed.contains(p));
     let body = out;
-    // 1. Deletions.
+    // 1. Deletions (a removed neighbor's own lines go with it, in 5).
+    let mut peer_removals = Vec::new();
     for n in old {
         if new_by.contains_key(n.line.as_str()) {
             continue;
@@ -245,30 +284,53 @@ fn diff_scope(old: &[Node], new: &[Node], top: bool, out: &mut Vec<String>) {
         if overwrite_key(&n.line).is_some_and(|k| replaced.contains(&k)) {
             continue;
         }
+        if n.children.is_empty() && of_removed(&n.line) {
+            if defines_peer(&n.line).is_some() && !gone.contains(peer_of(&n.line).unwrap_or("")) {
+                peer_removals.push(negate(&n.line));
+            }
+            continue;
+        }
         if n.children.is_empty() || top {
             body.push(negate(&n.line));
         } else {
             // A nested context (address-family) has no `no` form: empty it.
             let mut sub = Vec::new();
-            diff_scope(&n.children, &[], false, &mut sub);
+            diff_scope(&n.children, &[], false, &removed, &mut sub);
             wrap(&n.line, sub, body);
         }
     }
-    // 2. Changes inside the contexts both sides have.
+    // 2. New neighbors, before anything refers to them.
+    for n in new {
+        if !old_by.contains_key(n.line.as_str()) && defines_peer(&n.line).is_some() {
+            add_node(n, body);
+        }
+    }
+    // 3. Changes inside the contexts both sides have.
     for n in old {
         if let Some(m) = new_by.get(n.line.as_str())
             && (!n.children.is_empty() || !m.children.is_empty())
         {
             let mut sub = Vec::new();
-            diff_scope(&n.children, &m.children, false, &mut sub);
+            diff_scope(&n.children, &m.children, false, &removed, &mut sub);
             wrap(&n.line, sub, body);
         }
     }
-    // 3. Additions, whole contexts included.
+    // 4. Additions, whole contexts included.
     for n in new {
-        if !old_by.contains_key(n.line.as_str()) {
+        if !old_by.contains_key(n.line.as_str()) && defines_peer(&n.line).is_none() {
             add_node(n, body);
         }
+    }
+    // 5. Removed neighbors, last.
+    body.extend(peer_removals);
+}
+
+/// `line` with any secret it carries masked, for logs and errors
+/// (`neighbor X password KEY`).
+pub fn redact(line: &str) -> String {
+    match line.find(" password ") {
+        Some(i) => format!("{} password ***", line.get(..i).unwrap_or_default()),
+        None => line.to_owned(),
     }
 }
 
@@ -386,8 +448,8 @@ end
             diff(&a, &b),
             [
                 "router bgp 65000",
-                " bgp router-id 10.0.0.9",
                 " neighbor 192.0.2.2 remote-as 65002",
+                " bgp router-id 10.0.0.9",
                 "exit",
             ]
         );
@@ -451,6 +513,84 @@ end
                 "exit",
             ]
         );
+    }
+
+    const TWO_PEERS: &str = "router bgp 65000\n neighbor 192.0.2.2 remote-as 65001\n \
+         neighbor 192.0.2.2 description up1\n neighbor 192.0.2.2 timers 10 30\n \
+         address-family ipv4 unicast\n  neighbor 192.0.2.2 activate\n  \
+         neighbor 192.0.2.2 maximum-prefix 100\n exit-address-family\nexit\n";
+
+    #[test]
+    fn a_new_neighbor_exists_before_its_address_family_lines() {
+        let a = conf(TWO_PEERS);
+        let b = conf(
+            &TWO_PEERS
+                .replace(
+                    " address-family",
+                    " neighbor 192.0.2.6 remote-as 65002\n address-family",
+                )
+                .replace(
+                    "  neighbor 192.0.2.2 activate\n",
+                    "  neighbor 192.0.2.2 activate\n  neighbor 192.0.2.6 activate\n",
+                ),
+        );
+        assert_eq!(
+            diff(&a, &b),
+            [
+                "router bgp 65000",
+                " neighbor 192.0.2.6 remote-as 65002",
+                " address-family ipv4 unicast",
+                "  neighbor 192.0.2.6 activate",
+                " exit-address-family",
+                "exit",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_removed_neighbor_goes_with_one_command_and_others_stay() {
+        let b = conf(TWO_PEERS);
+        let a = conf(
+            &TWO_PEERS
+                .replace(
+                    " address-family",
+                    " neighbor 192.0.2.6 remote-as 65002\n neighbor 192.0.2.6 description up2\n \
+             neighbor 192.0.2.6 password k3y\n address-family",
+                )
+                .replace(
+                    "  neighbor 192.0.2.2 activate\n",
+                    "  neighbor 192.0.2.2 activate\n  neighbor 192.0.2.6 activate\n",
+                ),
+        );
+        assert_eq!(
+            diff(&a, &b),
+            [
+                "router bgp 65000",
+                " no neighbor 192.0.2.6 remote-as 65002",
+                "exit"
+            ]
+        );
+        // Changing one neighbor types that neighbor's lines only.
+        let c = conf(&TWO_PEERS.replace("maximum-prefix 100", "maximum-prefix 200 warning-only"));
+        assert_eq!(
+            diff(&b, &c),
+            [
+                "router bgp 65000",
+                " address-family ipv4 unicast",
+                "  neighbor 192.0.2.2 maximum-prefix 200 warning-only",
+                " exit-address-family",
+                "exit",
+            ]
+        );
+    }
+
+    #[test]
+    fn secrets_are_masked_for_logs() {
+        assert_eq!(
+            redact("neighbor 192.0.2.6 password k3y"),
+            "neighbor 192.0.2.6 password ***"
+        );
+        assert_eq!(redact("bgp router-id 1.1.1.1"), "bgp router-id 1.1.1.1");
     }
 
     #[test]

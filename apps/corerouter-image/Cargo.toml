@@ -1,0 +1,16 @@
+[package]
+name = "corerouter-image"
+description = "L6: seals the A/B system image and builds signed update packages (G1.6b); run by cargo xtask os and post-image.sh"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+corerouter-sysupdate.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

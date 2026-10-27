@@ -42,9 +42,14 @@ table inet corerouter {
 		type ifname
 		elements = { "ether1" }
 	}
+	set ports_22_8291 {
+		type inet_service
+		flags interval
+		elements = { 22, 8291 }
+	}
 	chain filter_input {
 		type filter hook input priority filter; policy accept;
-		ct state { established, related, untracked } counter accept comment "cr:*2"
+		ct state established,related,untracked counter accept comment "cr:*2"
 		ct state invalid counter drop comment "cr:*3"
 		meta nfproto ipv4 meta l4proto icmp icmp type 8 icmp code 0 counter accept comment "cr:*4"
 		iifname @il_LAN counter accept comment "cr:*5"
@@ -52,8 +57,8 @@ table inet corerouter {
 		meta nfproto ipv4 ip saddr @ad4_blocked ip saddr != @al4_blocked counter log prefix "blocked: " comment "cr:*6"
 		meta nfproto ipv6 ip6 saddr @al6_blocked counter log prefix "blocked: " comment "cr:*6"
 		meta nfproto ipv6 ip6 saddr @ad6_blocked ip6 saddr != @al6_blocked counter log prefix "blocked: " comment "cr:*6"
-		meta nfproto ipv4 ip saddr != @al4_mgmt meta l4proto tcp th dport { 22, 8291 } counter jump filter_ssh-guard comment "cr:*7"
-		meta nfproto ipv6 ip6 saddr != @al6_mgmt meta l4proto tcp th dport { 22, 8291 } counter jump filter_ssh-guard comment "cr:*7"
+		meta nfproto ipv4 ip saddr != @al4_mgmt meta l4proto tcp th dport @ports_22_8291 counter jump filter_ssh-guard comment "cr:*7"
+		meta nfproto ipv6 ip6 saddr != @al6_mgmt meta l4proto tcp th dport @ports_22_8291 counter jump filter_ssh-guard comment "cr:*7"
 		meta nfproto ipv4 meta l4proto tcp th dport 22 ct state new counter add @ad4_blocked { ip saddr timeout 60s } comment "cr:*15"
 		meta nfproto ipv6 meta l4proto tcp th dport 22 ct state new counter add @ad6_blocked { ip6 saddr timeout 60s } comment "cr:*15"
 		meta nfproto ipv4 meta l4proto icmp icmp type 8 icmp code 0 limit rate 5/second burst 10 packets counter accept comment "cr:*16"
