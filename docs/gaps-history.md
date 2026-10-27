@@ -191,3 +191,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G1.27d feito (fabricante pelo OUI; o usuário decidiu embutir a lista do IEEE e permitir atualização)
 - 2026-10-27 — G1.6c feito (instalador ISO/USB, imagens de VM, FRR na imagem); abertas G1.6g (BIOS legado), G1.6h (cloud-init NoCloud), G1.6i (só os daemons FRR configurados), G1.6j (linux-firmware)
 - 2026-10-27 — G3.2c feito (RPKI, "Por que essa rota?", rotas por conexão); G3.3 coberto pela G3.2a e pela G3.2c
+- 2026-10-27 — G3.3 feito (coberto pela G3.2a e pela G3.2c)
