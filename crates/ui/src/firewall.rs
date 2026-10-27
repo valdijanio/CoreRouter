@@ -32,6 +32,8 @@ pub(crate) enum FwTable {
     Filter,
     Nat,
     Mangle,
+    /// Before connection tracking (G2.1c).
+    Raw,
 }
 
 impl FwTable {
@@ -40,6 +42,7 @@ impl FwTable {
             FwTable::Filter => "filter",
             FwTable::Nat => "nat",
             FwTable::Mangle => "mangle",
+            FwTable::Raw => "raw",
         }
     }
 
@@ -48,6 +51,7 @@ impl FwTable {
             FwTable::Filter => "Filter Rule",
             FwTable::Nat => "NAT Rule",
             FwTable::Mangle => "Mangle Rule",
+            FwTable::Raw => "Raw Rule",
         }
     }
 
@@ -60,6 +64,7 @@ impl FwTable {
             FwTable::Filter => "fw-filter",
             FwTable::Nat => "fw-nat",
             FwTable::Mangle => "fw-mangle",
+            FwTable::Raw => "fw-raw",
         }
     }
 
@@ -68,6 +73,7 @@ impl FwTable {
             FwTable::Filter => &["input", "forward", "output"],
             FwTable::Nat => &["dstnat", "srcnat"],
             FwTable::Mangle => &["prerouting", "input", "forward", "output", "postrouting"],
+            FwTable::Raw => &["prerouting", "output"],
         }
     }
 
@@ -108,6 +114,17 @@ impl FwTable {
                 "add-src-to-address-list",
                 "add-dst-to-address-list",
             ],
+            FwTable::Raw => &[
+                "accept",
+                "drop",
+                "notrack",
+                "jump",
+                "return",
+                "log",
+                "passthrough",
+                "add-src-to-address-list",
+                "add-dst-to-address-list",
+            ],
         }
     }
 
@@ -116,6 +133,7 @@ impl FwTable {
             FwTable::Filter => Feed::Filter,
             FwTable::Nat => Feed::Nat,
             FwTable::Mangle => Feed::Mangle,
+            FwTable::Raw => Feed::Raw,
         }
     }
 }
@@ -126,6 +144,7 @@ pub(crate) enum Feed {
     Filter,
     Nat,
     Mangle,
+    Raw,
     Addr,
     Lists,
     Members,
@@ -134,10 +153,11 @@ pub(crate) enum Feed {
 }
 
 impl Feed {
-    pub(crate) const ALL: [Feed; 7] = [
+    pub(crate) const ALL: [Feed; 8] = [
         Feed::Filter,
         Feed::Nat,
         Feed::Mangle,
+        Feed::Raw,
         Feed::Addr,
         Feed::Lists,
         Feed::Members,
@@ -150,6 +170,7 @@ impl Feed {
             Feed::Filter => "ip.firewall.filter.list",
             Feed::Nat => "ip.firewall.nat.list",
             Feed::Mangle => "ip.firewall.mangle.list",
+            Feed::Raw => "ip.firewall.raw.list",
             Feed::Addr => "ip.firewall.address-list.list",
             Feed::Lists => "interface.list.list",
             Feed::Members => "interface.list.member.list",
@@ -162,6 +183,7 @@ impl Feed {
             Feed::Filter => Some(FwTable::Filter),
             Feed::Nat => Some(FwTable::Nat),
             Feed::Mangle => Some(FwTable::Mangle),
+            Feed::Raw => Some(FwTable::Raw),
             _ => None,
         }
     }
@@ -225,6 +247,7 @@ pub(crate) enum Tab {
     Filter,
     Nat,
     Mangle,
+    Raw,
     Addr,
     Zones,
     /// The conntrack table (G2.2, `connections.rs`).
@@ -254,7 +277,7 @@ pub(crate) struct State {
     /// Chain filter of each rule table ("" = all).
     chain: [String; 3],
     /// Shared, so a frame borrows a list instead of copying every rule.
-    rows: [Arc<Vec<Value>>; 7],
+    rows: [Arc<Vec<Value>>; 8],
     pub dialogs: Vec<FwDialogWin>,
     /// Items to open once a list sent after this request arrives.
     open_after: Vec<(RequestId, Feed, String)>,
@@ -269,6 +292,7 @@ fn feed_index(f: Feed) -> usize {
         Feed::Lists => 4,
         Feed::Members => 5,
         Feed::Zones => 6,
+        Feed::Raw => 7,
     }
 }
 
@@ -777,6 +801,8 @@ pub(crate) fn action_color(action: &str, dark: bool) -> Option<Color32> {
         "drop" | "reject" => ((235, 110, 100), (190, 40, 30)),
         "masquerade" | "src-nat" | "dst-nat" => ((110, 165, 245), (30, 95, 200)),
         "mark-connection" | "mark-packet" | "mark-routing" => ((190, 140, 240), (125, 60, 185)),
+        // Raw: skips connection tracking (G2.1c).
+        "notrack" => ((90, 200, 210), (0, 115, 125)),
         _ => return None,
     };
     let (r, g, b) = if dark { d } else { l };
@@ -1085,6 +1111,7 @@ impl CoreRouterUi {
             Feed::Filter => &mut self.tables.fw_filter,
             Feed::Nat => &mut self.tables.fw_nat,
             Feed::Mangle => &mut self.tables.fw_mangle,
+            Feed::Raw => &mut self.tables.fw_raw,
             Feed::Addr => &mut self.tables.fw_addr,
             Feed::Lists => &mut self.tables.if_lists,
             Feed::Members => &mut self.tables.if_members,
@@ -1119,6 +1146,7 @@ impl CoreRouterUi {
                 (Tab::Filter, "Filter Rules"),
                 (Tab::Nat, "NAT"),
                 (Tab::Mangle, "Mangle"),
+                (Tab::Raw, "Raw"),
                 (Tab::Addr, "Address Lists"),
                 (Tab::Zones, "Zones"),
                 (Tab::Connections, "Connections"),
@@ -1131,6 +1159,7 @@ impl CoreRouterUi {
             Tab::Filter => self.rules_tab(ui, FwTable::Filter),
             Tab::Nat => self.rules_tab(ui, FwTable::Nat),
             Tab::Mangle => self.rules_tab(ui, FwTable::Mangle),
+            Tab::Raw => self.rules_tab(ui, FwTable::Raw),
             Tab::Addr => self.simple_tab(ui, Feed::Addr),
             Tab::Zones => self.zones_tab(ui),
             Tab::Connections => self.connections_tab(ui),
@@ -1288,6 +1317,7 @@ impl CoreRouterUi {
         let state = match f {
             Feed::Filter => &mut self.tables.fw_filter,
             Feed::Nat => &mut self.tables.fw_nat,
+            Feed::Raw => &mut self.tables.fw_raw,
             _ => &mut self.tables.fw_mangle,
         };
         state.open = open;
@@ -2180,29 +2210,32 @@ fn body(
                             pick.lists,
                             "WAN",
                         );
-                        rule_combo(
-                            ui,
-                            f,
-                            form,
-                            "Connection State",
-                            "connection_state",
-                            &strings(&[
+                        // Raw runs before conntrack: no connection fields.
+                        if t != FwTable::Raw {
+                            rule_combo(
+                                ui,
+                                f,
+                                form,
+                                "Connection State",
+                                "connection_state",
+                                &strings(&[
+                                    "established,related",
+                                    "established,related,untracked",
+                                    "new",
+                                    "invalid",
+                                ]),
                                 "established,related",
-                                "established,related,untracked",
-                                "new",
-                                "invalid",
-                            ]),
-                            "established,related",
-                        );
-                        rule_combo(
-                            ui,
-                            f,
-                            form,
-                            "Connection NAT State",
-                            "connection_nat_state",
-                            &strings(&["srcnat", "dstnat", "!dstnat"]),
-                            "dstnat",
-                        );
+                            );
+                            rule_combo(
+                                ui,
+                                f,
+                                form,
+                                "Connection NAT State",
+                                "connection_nat_state",
+                                &strings(&["srcnat", "dstnat", "!dstnat"]),
+                                "dstnat",
+                            );
+                        }
                         f.text(ui, "Comment", "comment", &mut form.comment, "");
                     }
                     RuleTab::Advanced => {
@@ -2232,9 +2265,13 @@ fn body(
                             "icmp_options",
                             "8:0 (type:code)",
                         );
-                        rule_field(ui, f, form, "Connection Mark", "connection_mark", "name");
+                        if t != FwTable::Raw {
+                            rule_field(ui, f, form, "Connection Mark", "connection_mark", "name");
+                        }
                         rule_field(ui, f, form, "Packet Mark", "packet_mark", "name");
-                        rule_field(ui, f, form, "Routing Mark", "routing_mark", "name");
+                        if t != FwTable::Raw {
+                            rule_field(ui, f, form, "Routing Mark", "routing_mark", "name");
+                        }
                         rule_field(ui, f, form, "Limit", "limit", "5/1s,10 (count/time,burst)");
                     }
                     RuleTab::Action => {

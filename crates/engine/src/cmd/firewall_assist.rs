@@ -6,7 +6,7 @@
 //! lockout check sees the whole template at once.
 
 use corerouter_model::cow_list::CowList;
-use corerouter_model::firewall::{Action, FirewallRule, Limit, Name, PortSet, Table, Timeout};
+use corerouter_model::firewall::{Action, AddrMatch, FirewallRule, Limit, Name, PortSet, Table, Timeout};
 use corerouter_model::{Config, IfName, ItemId};
 use serde_json::{Map, Value, json};
 
@@ -72,6 +72,49 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         always,
         lan_management
     ),
+    cmd!(
+        "ip.firewall.template.raw-bogons",
+        "Drop Bogons Before Conntrack",
+        ["IP", "Firewall"],
+        None,
+        "{wan?: name (interface list the attacks come in on, default WAN), list?: name (address list of reserved sources, default bogons), private?: bool (also RFC 1918, 100.64.0.0/10 and fc00::/7; default false: an upstream on private space would be cut), replace?: bool (remove the rules and entries of an earlier run first), force?: bool} → {rules: [*hex], entries: count, list: name}",
+        always,
+        raw_bogons
+    ),
+];
+
+/// Comment prefix of the raw template's rules and entries.
+pub const RAWDEF: &str = "rawdef";
+
+/// Sources that never come from the internet (RFC 6890, RFC 5737,
+/// RFC 3849, RFC 4291 §2.5; multicast is never a source, RFC 1112 §4).
+const BOGONS: &[&str] = &[
+    "0.0.0.0/8",
+    "127.0.0.0/8",
+    "169.254.0.0/16",
+    "192.0.0.0/24",
+    "192.0.2.0/24",
+    "198.18.0.0/15",
+    "198.51.100.0/24",
+    "203.0.113.0/24",
+    "224.0.0.0/4",
+    "240.0.0.0/4",
+    "::/128",
+    "::1/128",
+    "::ffff:0:0/96",
+    "100::/64",
+    "2001:db8::/32",
+    "fec0::/10",
+    "ff00::/8",
+];
+
+/// Private space (RFC 1918, RFC 6598, RFC 4193): only with `private`.
+const PRIVATE: &[&str] = &[
+    "10.0.0.0/8",
+    "100.64.0.0/10",
+    "172.16.0.0/12",
+    "192.168.0.0/16",
+    "fc00::/7",
 ];
 
 /// Comment prefix of the safe defaults (as RouterOS' `defconf:`).
@@ -697,4 +740,119 @@ mod tests {
     fn default_ports_are_ssh_and_tls() {
         assert_eq!(default_ports().to_string(), "22,8729");
     }
+}
+
+/// Raw table template: drop reserved sources and port 0 from the WAN in
+/// `prerouting`, before connection tracking spends an entry on them (the
+/// MikroTik manual's DDoS advice: drop in raw, it costs less).
+fn raw_bogons(s: &mut Session, p: &Value) -> Result<Value> {
+    take_force(s, p)?;
+    let wan: Name = opt_parse(p, "wan")?.unwrap_or(fixed("WAN")?);
+    let list: Name = opt_parse(p, "list")?.unwrap_or(fixed("bogons")?);
+    let private = opt_bool(p, "private")?.unwrap_or(false);
+    let replace = opt_bool(p, "replace")?.unwrap_or(false);
+    let cfg = s.store().candidate();
+    if cfg.interface_lists.get(wan.as_str()).is_none() {
+        return Err(EngineError::bad(
+            "wan",
+            format!("the interface list {wan} does not exist (interface.list.add name={wan})"),
+        ));
+    }
+    if list_members(cfg, wan.as_str()).is_empty() {
+        return Err(EngineError::bad(
+            "wan",
+            format!(
+                "the {wan} list is empty: the rules would match nothing; add the WAN \
+                 interfaces in Interface List first"
+            ),
+        ));
+    }
+    let tagged = |c: &str| c.starts_with(RAWDEF);
+    let earlier: Vec<ItemId> = cfg
+        .ip
+        .firewall
+        .raw
+        .iter()
+        .filter(|r| tagged(&r.comment))
+        .map(|r| r.id)
+        .collect();
+    if !earlier.is_empty() {
+        if !replace {
+            let ids: Vec<String> = earlier.iter().map(ItemId::to_string).collect();
+            return Err(EngineError::bad(
+                "replace",
+                format!(
+                    "the raw template is already here (rules {}); replace=true removes it and \
+                     applies it again",
+                    ids.join(", ")
+                ),
+            ));
+        }
+        let fw = &mut s.store_mut().candidate_mut().ip.firewall;
+        fw.raw.retain(|r| !tagged(&r.comment));
+        let stale: Vec<usize> = fw
+            .address_lists
+            .iter()
+            .enumerate()
+            .filter(|(_, e)| e.list == list && tagged(&e.comment))
+            .map(|(i, _)| i)
+            .collect();
+        for i in stale.into_iter().rev() {
+            fw.address_lists.remove(i);
+        }
+    }
+    let mut entries = 0usize;
+    let sources = BOGONS
+        .iter()
+        .map(|a| (*a, "reservado"))
+        .chain(PRIVATE.iter().filter(|_| private).map(|a| (*a, "privado")));
+    for (address, kind) in sources {
+        let parsed: AddrMatch = address
+            .parse()
+            .map_err(|e: corerouter_model::ParseError| EngineError::Internal(e.to_string()))?;
+        if s.store().candidate().ip.firewall.address_lists.holders(&list, &parsed) > 0 {
+            continue;
+        }
+        al_add(
+            s,
+            &json!({ "list": list, "address": address, "comment": format!("{RAWDEF}: {kind}") }),
+        )?;
+        entries += 1;
+    }
+    let wan_s = wan.to_string();
+    let l = list.to_string();
+    let rules = vec![
+        section(&format!(
+            "{RAWDEF}: bogons e ataques, descartados antes do conntrack"
+        )),
+        spec(
+            "prerouting",
+            "drop",
+            &[("in_interface_list", &wan_s), ("src_address_list", &l)],
+            &format!("{RAWDEF}: origem reservada não vem da internet (RFC 6890)"),
+        ),
+        spec(
+            "prerouting",
+            "drop",
+            &[
+                ("in_interface_list", &wan_s),
+                ("protocol", "tcp"),
+                ("dst_port", "0"),
+            ],
+            &format!("{RAWDEF}: porta TCP 0 não existe (varredura ou ataque)"),
+        ),
+        spec(
+            "prerouting",
+            "drop",
+            &[
+                ("in_interface_list", &wan_s),
+                ("protocol", "udp"),
+                ("dst_port", "0"),
+            ],
+            &format!("{RAWDEF}: porta UDP 0 não existe (varredura ou ataque)"),
+        ),
+    ];
+    let anchor = top_of(s.store().candidate(), Table::Raw, "prerouting");
+    let ids = insert(s, Table::Raw, anchor, rules)?;
+    Ok(json!({ "rules": ids, "entries": entries, "list": list }))
 }

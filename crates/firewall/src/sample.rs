@@ -233,7 +233,27 @@ fn build() -> Option<Config> {
             act(r#"{"type": "mark-packet", "new_packet_mark": "bulk"}"#)?,
         )?,
     ]);
-    fw.next_rule_id = 22;
+    fw.raw = CowList::from(vec![
+        rule(
+            22,
+            "prerouting",
+            m(&[("in_interface_list", "WAN"), ("src_address_list", "blocked")])?,
+            Action::Drop,
+        )?,
+        rule(
+            23,
+            "prerouting",
+            m(&[("protocol", "udp"), ("dst_port", "53")])?,
+            act(r#"{"type": "notrack"}"#)?,
+        )?,
+        rule(
+            24,
+            "output",
+            m(&[("protocol", "udp"), ("src_port", "53")])?,
+            act(r#"{"type": "notrack"}"#)?,
+        )?,
+    ]);
+    fw.next_rule_id = 25;
     fw.next_address_list_id = 4;
     Some(cfg)
 }

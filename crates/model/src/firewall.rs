@@ -35,23 +35,25 @@ macro_rules! text_serde {
     };
 }
 
-/// The three rule tables.
+/// The rule tables. `raw` (G2.1c) runs before connection tracking.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Table {
     Filter,
     Nat,
     Mangle,
+    Raw,
 }
 
 impl Table {
-    pub const ALL: [Table; 3] = [Table::Filter, Table::Nat, Table::Mangle];
+    pub const ALL: [Table; 4] = [Table::Filter, Table::Nat, Table::Mangle, Table::Raw];
 
     pub fn name(self) -> &'static str {
         match self {
             Table::Filter => "filter",
             Table::Nat => "nat",
             Table::Mangle => "mangle",
+            Table::Raw => "raw",
         }
     }
 
@@ -61,6 +63,7 @@ impl Table {
             Table::Filter => &["input", "forward", "output"],
             Table::Nat => &["dstnat", "srcnat"],
             Table::Mangle => &["prerouting", "input", "forward", "output", "postrouting"],
+            Table::Raw => &["prerouting", "output"],
         }
     }
 }
@@ -72,10 +75,11 @@ impl FromStr for Table {
             "filter" => Ok(Table::Filter),
             "nat" => Ok(Table::Nat),
             "mangle" => Ok(Table::Mangle),
+            "raw" => Ok(Table::Raw),
             _ => Err(ParseError::new(
                 "table",
                 s,
-                "expected filter, nat or mangle",
+                "expected filter, nat, mangle or raw",
             )),
         }
     }
@@ -1072,11 +1076,14 @@ pub enum Action {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         address_list_timeout: Option<Timeout>,
     },
+    /// Raw table only: the packet skips connection tracking (filter sees
+    /// it as `untracked`) and leaves the raw chain, like accept.
+    Notrack,
 }
 
 impl Action {
     /// RouterOS action names, in menu order.
-    pub const NAMES: [&'static str; 15] = [
+    pub const NAMES: [&'static str; 16] = [
         "accept",
         "drop",
         "reject",
@@ -1092,6 +1099,7 @@ impl Action {
         "mark-routing",
         "add-src-to-address-list",
         "add-dst-to-address-list",
+        "notrack",
     ];
 
     pub fn name(&self) -> &'static str {
@@ -1111,6 +1119,7 @@ impl Action {
             Action::MarkRouting { .. } => "mark-routing",
             Action::AddSrcToAddressList { .. } => "add-src-to-address-list",
             Action::AddDstToAddressList { .. } => "add-dst-to-address-list",
+            Action::Notrack => "notrack",
         }
     }
 
@@ -1260,9 +1269,12 @@ pub struct Firewall {
     pub filter: CowList<FirewallRule>,
     pub nat: CowList<FirewallRule>,
     pub mangle: CowList<FirewallRule>,
+    /// Before connection tracking (G2.1c); absent from older configs.
+    #[serde(skip_serializing_if = "CowList::is_empty")]
+    pub raw: CowList<FirewallRule>,
     /// Static entries, with an index of what each list holds (G0.21).
     pub address_lists: crate::address_lists::AddressLists,
-    /// Next rule id (shared by the three tables; never reused).
+    /// Next rule id (shared by the tables; never reused).
     pub next_rule_id: u32,
     pub next_address_list_id: u32,
     /// The simple mode's zone matrix (G2.1b); its rules are the `zone`
@@ -1277,6 +1289,7 @@ impl Firewall {
             Table::Filter => &self.filter,
             Table::Nat => &self.nat,
             Table::Mangle => &self.mangle,
+            Table::Raw => &self.raw,
         }
     }
 
@@ -1285,6 +1298,7 @@ impl Firewall {
             Table::Filter => &mut self.filter,
             Table::Nat => &mut self.nat,
             Table::Mangle => &mut self.mangle,
+            Table::Raw => &mut self.raw,
         }
     }
 
@@ -1303,6 +1317,7 @@ impl Firewall {
         self.filter.is_empty()
             && self.nat.is_empty()
             && self.mangle.is_empty()
+            && self.raw.is_empty()
             && self.address_lists.is_empty()
     }
 }

@@ -247,6 +247,7 @@ fn action_colours_read_on_both_themes() {
             ("dst-nat", "blue"),
             ("masquerade", "blue"),
             ("mark-connection", "purple"),
+            ("notrack", "teal"),
         ] {
             let c = firewall::action_color(action, v.dark_mode).unwrap();
             let ratio = contrast(c, v.panel_fill);
@@ -255,6 +256,7 @@ fn action_colours_read_on_both_themes() {
                 "green" => c.g() > c.r() && c.g() > c.b(),
                 "red" => c.r() > c.g() && c.r() > c.b(),
                 "blue" => c.b() > c.r() && c.b() > c.g(),
+                "teal" => c.g() > c.r() && c.b() > c.r(),
                 _ => c.r() > c.g() && c.b() > c.g(),
             };
             assert!(ok, "{action} should look {hue}: {c:?}");

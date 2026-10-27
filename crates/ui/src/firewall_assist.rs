@@ -23,19 +23,22 @@ pub(crate) enum Wizard {
     BruteForce,
     PingLimit,
     LanManagement,
+    /// Raw table (G2.1c).
+    RawBogons,
 }
 
 /// One field: parameter, label, hint.
 type Field = (&'static str, &'static str, &'static str);
 
 impl Wizard {
-    pub(crate) const ALL: [Wizard; 6] = [
+    pub(crate) const ALL: [Wizard; 7] = [
         Wizard::Defaults,
         Wizard::PortForward,
         Wizard::Block,
         Wizard::BruteForce,
         Wizard::PingLimit,
         Wizard::LanManagement,
+        Wizard::RawBogons,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -46,6 +49,7 @@ impl Wizard {
             Wizard::BruteForce => "Brute Force Protection",
             Wizard::PingLimit => "Limit Ping",
             Wizard::LanManagement => "Management From LAN Only",
+            Wizard::RawBogons => "Drop Bogons Before Conntrack",
         }
     }
 
@@ -57,6 +61,7 @@ impl Wizard {
             Wizard::BruteForce => "ip.firewall.template.brute-force",
             Wizard::PingLimit => "ip.firewall.template.ping-limit",
             Wizard::LanManagement => "ip.firewall.template.lan-management",
+            Wizard::RawBogons => "ip.firewall.template.raw-bogons",
         }
     }
 
@@ -64,6 +69,7 @@ impl Wizard {
     pub(crate) fn feed(self) -> Feed {
         match self {
             Wizard::PortForward => Feed::Nat,
+            Wizard::RawBogons => Feed::Raw,
             _ => Feed::Filter,
         }
     }
@@ -103,6 +109,16 @@ impl Wizard {
                  roteador) e descarta o resto. Sem portas, valem 22, 8729 e a porta desta \
                  conexão. Se você está fora dessa lista, o roteador avisa antes de aplicar."
             }
+            Wizard::RawBogons => {
+                "Na tabela raw, antes do conntrack: descarta o que chega pela WAN com origem \
+                 reservada (RFC 6890: 0.0.0.0/8, 127/8, redes de documentação, multicast, \
+                 2001:db8::/32…) e pacotes para a porta 0 de TCP/UDP. Esses pacotes nunca \
+                 viram conexão, então um ataque com origem falsa não enche a tabela de \
+                 conexões. As origens ficam na address-list escolhida, editável. Marque \
+                 \u{201c}Private\u{201d} para incluir também as redes privadas (10/8, \
+                 172.16/12, 192.168/16, 100.64/10, fc00::/7): só se o seu provedor não usa \
+                 endereço privado na WAN."
+            }
         }
     }
 
@@ -140,6 +156,10 @@ impl Wizard {
                 ("dst_port", "Ports", "22,8729 + this connection's"),
                 ("list", "Allowed List", "LAN"),
             ],
+            Wizard::RawBogons => &[
+                ("wan", "WAN List", "WAN"),
+                ("list", "Address List", "bogons"),
+            ],
         }
     }
 
@@ -152,6 +172,7 @@ impl Wizard {
                 .map(|(k, _, _)| (*k, String::new()))
                 .collect(),
             replace: false,
+            private: false,
         }
     }
 }
@@ -160,8 +181,10 @@ impl Wizard {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WizardForm {
     pub fields: Vec<(&'static str, String)>,
-    /// Safe Defaults: remove an earlier apply first.
+    /// Safe Defaults, bogons: remove an earlier apply first.
     pub replace: bool,
+    /// Bogons: private space too.
+    pub private: bool,
 }
 
 impl WizardForm {
@@ -181,6 +204,9 @@ impl WizardForm {
         }
         if self.replace {
             p.insert("replace".into(), json!(true));
+        }
+        if self.private {
+            p.insert("private".into(), json!(true));
         }
         Value::Object(p)
     }
@@ -206,7 +232,15 @@ pub(crate) fn body<B>(
                     f.text(ui, label, param, v, hint);
                 }
             }
-            if kind == Wizard::Defaults {
+            if kind == Wizard::RawBogons {
+                ui.label("Private");
+                ui.checkbox(
+                    &mut form.private,
+                    "also RFC 1918, 100.64.0.0/10 and fc00::/7",
+                );
+                ui.end_row();
+            }
+            if matches!(kind, Wizard::Defaults | Wizard::RawBogons) {
                 ui.label("Replace");
                 ui.checkbox(
                     &mut form.replace,
