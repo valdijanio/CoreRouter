@@ -21,6 +21,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Hairpin", "Hairpin"),
     ("History", "Histórico"),
     ("History kept", "Histórico guardado"),
+    ("ICMP Unreachable", "ICMP inalcançável"),
     ("Inside", "Internos"),
     ("Last", "Última"),
     ("Mapping", "Mapeamento"),
@@ -29,6 +30,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Mode", "Modo"),
     ("New CGNAT Exception", "Nova exceção CGNAT"),
     ("New CGNAT Pool", "Novo pool CGNAT"),
+    ("New connections dropped for lack of a port (RFC 6888 REQ-11)", "Conexões novas descartadas por falta de porta (RFC 6888 REQ-11)"),
     ("New connections the kernel could not translate: no free port", "Conexões novas que o kernel não traduziu: sem porta livre"),
     ("Out. Interface", "Interface de saída"),
     ("Outside", "Públicos"),
@@ -40,9 +42,11 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Ports per Subscriber", "Portas por assinante"),
     ("Public", "Público"),
     ("Public Address", "IP público"),
+    ("Refused", "Recusadas"),
     ("Since", "Desde"),
     ("Subscriber or public", "Assinante ou público"),
     ("Subscribers", "Assinantes"),
+    ("Subscribers near the end of their ports: their new connections are checked for a free port", "Assinantes perto do fim das portas: as conexões novas deles são conferidas (há porta livre?)"),
     ("Times", "Vezes"),
     ("Until", "Até"),
     ("Used", "Em uso"),
@@ -69,9 +73,9 @@ Quando um assinante usa esta parte das suas portas (determinístico) ou do últi
         "cgnat.alerts",
         "## Alerts
 
-Assinantes que chegaram perto do limite de portas: quantas usam, o pico, quantas vezes cruzaram o limite e quando. Um assinante no limite não abre conexões novas — o kernel descarta em silêncio e só conta em `insert failed`.
+Assinantes que chegaram perto do limite de portas: quantas usam, o pico, quantas vezes cruzaram o limite e quando. **Recusadas:** conexões novas descartadas porque não havia porta livre, e quantos ICMP o assinante recebeu sobre elas (RFC 6888 REQ-11).
 
-**O que fazer:** mais portas por assinante, uma exceção 1:1, ou investigar (P2P, máquina infectada) pela aba Connections do Firewall.",
+**O que fazer:** mais portas por assinante (aba Capacity), uma exceção 1:1, ou investigar (P2P, máquina infectada) pela aba Connections do Firewall.",
     ),
     (
         "cgnat.block_timeout",
@@ -156,6 +160,18 @@ Um assinante alcança outro pelo IP:porta **público** (o mesmo endereço que um
 Quantos dias o roteador guarda o histórico de definições dos pools e o log de blocos, que respondem ao \"Quem era?\".
 
 **Padrão:** 365. O **Marco Civil** (Lei 12.965/2014, art. 13) obriga o provedor de conexão a guardar os registros de conexão por 1 ano. Mude com `ip.firewall.cgnat.set history_days=…`.",
+    ),
+    (
+        "cgnat.icmp_unreachable",
+        "## ICMP Unreachable
+
+**O que é:** quando um assinante abre uma conexão nova e não sobra porta livre na faixa dele, o roteador descarta o pacote (RFC 6888 REQ-11a) e **avisa o assinante** com um ICMP *destination unreachable*, código 1 (*host unreachable*), citando o pacote como ele o enviou (REQ-11b). Sem isso, o kernel descarta em silêncio e o aplicativo espera até o tempo esgotar.
+
+**Por que código 1:** é um erro \"leve\" (RFC 1122 §4.2.3.9): o TCP do assinante continua tentando, e conecta assim que uma porta se libera.
+
+**Como funciona:** só os assinantes perto do fim das portas (80 % da faixa, contado a cada 10 s) têm as conexões novas conferidas; os outros nunca saem do kernel. **Limite:** até `icmp_rate` mensagens por segundo por assinante (padrão 2) e 1000 por segundo no roteador, para uma rajada de SYN não virar amplificador.
+
+**Mudar:** `ip.firewall.cgnat.set icmp_unreachable=no` desliga; `icmp_rate=1..100`.",
     ),
     (
         "cgnat.inside",

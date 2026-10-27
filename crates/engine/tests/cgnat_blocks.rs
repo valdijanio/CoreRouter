@@ -226,7 +226,97 @@ fn an_exhausted_pool_refuses_and_a_changed_pool_releases() {
         json!({"topics": ["cgnat"], "find": "pool changed", "limit": 100}),
     );
     assert_eq!(log.as_array().unwrap().len(), 2, "{log}");
+    // RFC 6888 REQ-8: the old blocks' ports go to nobody for 120 s, even in
+    // the new geometry (late packets of the killed connections must not
+    // reach another subscriber).
+    s.tick(T0 + 4);
+    assert_eq!(
+        blocks(&mut s).len(),
+        0,
+        "every new block overlaps a held range"
+    );
+    s.tick(T0 + 3 + 121);
     assert_eq!(blocks(&mut s).len(), 4, "new geometry, four blocks now");
+}
+
+/// G2.7: the nearly full subscribers go into the kernel's set `full`;
+/// what the exhaustion queues refused lands in the alerts (refused, ICMP
+/// sent) with one log line per subscriber; turned off, the set empties.
+#[test]
+fn refused_connections_reach_the_alerts_and_the_log() {
+    let mut s = Session::virtual_lab();
+    s.tick(T0);
+    ok(
+        &mut s,
+        "ip.firewall.cgnat.pool.add",
+        json!({"name": "c1", "inside": "100.64.0.0/22", "outside": "203.0.113.0/28"}),
+    );
+    for t in 1..=12 {
+        s.tick(T0 + t);
+    }
+    let a = ok(&mut s, "ip.firewall.cgnat.alert.list", json!({}));
+    let full = a["full"].as_u64().unwrap();
+    assert!(
+        full > 3,
+        "the lab's heavy users (95 %) are nearly full: {a}"
+    );
+    let refused: Vec<&Value> = a["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["refused"].as_u64().unwrap() > 0)
+        .collect();
+    assert!(!refused.is_empty(), "{a}");
+    for r in &refused {
+        assert_eq!(r["icmp"], 2);
+        assert_eq!(r["refused"], 4);
+        assert!(r.get("last_refused").is_some());
+    }
+    assert_eq!(a["refused"].as_u64().unwrap(), 4 * refused.len() as u64);
+    assert_eq!(a["icmp_sent"].as_u64().unwrap(), 2 * refused.len() as u64);
+    let log = ok(
+        &mut s,
+        "log.print",
+        json!({"topics": ["cgnat"], "find": "no free port", "limit": 2000}),
+    );
+    assert_eq!(log.as_array().unwrap().len(), refused.len());
+    // Refused again within a minute: counted, not logged again.
+    for t in 13..=22 {
+        s.tick(T0 + t);
+    }
+    let log = ok(
+        &mut s,
+        "log.print",
+        json!({"topics": ["cgnat"], "find": "no free port", "limit": 2000}),
+    );
+    assert_eq!(log.as_array().unwrap().len(), refused.len());
+
+    let set = ok(
+        &mut s,
+        "ip.firewall.cgnat.set",
+        json!({"icmp_unreachable": false, "icmp_rate": 7}),
+    );
+    assert_eq!(
+        set,
+        json!({"history_days": 365, "icmp_unreachable": false, "icmp_rate": 7})
+    );
+    s.tick(T0 + 40);
+    let a = ok(&mut s, "ip.firewall.cgnat.alert.list", json!({}));
+    assert_eq!(a["full"], 0, "{a}");
+    let get = ok(&mut s, "ip.firewall.cgnat.get", json!({}));
+    assert_eq!(
+        (get["icmp_unreachable"].clone(), get["icmp_rate"].clone()),
+        (json!(false), json!(7))
+    );
+    // Out of range is a parameter error.
+    assert!(
+        s.execute("ip.firewall.cgnat.set", &json!({"icmp_rate": 0}))
+            .is_err()
+    );
+    assert!(
+        s.execute("ip.firewall.cgnat.set", &json!({"icmp_rate": 101}))
+            .is_err()
+    );
 }
 
 #[test]

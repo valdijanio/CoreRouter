@@ -107,6 +107,23 @@ netns sem root, 2026-10-23, `cargo bench -p corerouter-hal-linux --bench netns_c
 
 O firewall do G2.1 continua no `nft -f` por enquanto: a migração para o mesmo encoder é a G2.8.
 
+#### 1.2.2 CGNAT sem portas: nfqueue só dos quase cheios (G2.7, **medido**)
+
+A RFC 6888 REQ-11b pede um ICMP ao assinante cuja conexão nova não acha porta. O kernel derruba essa
+conexão no `confirm` do conntrack, depois de todo gancho. As opções comparadas:
+
+- **`reject` no nftables:** não vê a falha (e nem vale em `postrouting`). Descartado.
+- **XDP ou TC:** também não veem a falha. Um programa eBPF num tracepoint do `kfree_skb` exigiria
+  root e BTF e ficaria fora do crate isolado. Descartado.
+- **nfqueue de todas as conexões novas:** levaria ao userspace ~255 mil por segundo. Descartado.
+- **nfqueue só dos assinantes acima de 80 % da faixa** (adotado):
+  - Rust puro, sem processo externo;
+  - quatro filas com uma thread cada e consulta da tupla pelo ctnetlink;
+  - custo no caso normal dentro do ruído (280 557 × 285 774 conexões novas/s, sem × com a chain);
+  - 125 µs até o ICMP e 188 mil recusas/s por thread.
+
+Números e método em `docs/cgnat.md` §1.9 e §6.7.
+
 ### 1.3 Control plane (BGP, OSPF, MPLS/LDP, BFD)
 
 **Decisão: orquestrar FRRouting sob a camada transacional do engine; avaliar holo como segundo

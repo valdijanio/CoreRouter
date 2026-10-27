@@ -220,6 +220,20 @@ pub fn table(c: &Cgnat) -> Option<Table> {
             }
         }
     }
+    let exhaustion = c.settings.icmp_unreachable && !pools.is_empty();
+    if exhaustion {
+        // Filled by the engine with the subscribers near the end of their
+        // ports (G2.7); empty, the rule below matches nothing.
+        t.sets.push(Set {
+            name: FULL.into(),
+            key: Type::Addr,
+            data: None,
+            interval: false,
+            dynamic_timeout: None,
+            size: None,
+            elements: Vec::new(),
+        });
+    }
     t.chains.push(chain(
         "prerouting",
         ChainType::Nat,
@@ -250,6 +264,15 @@ pub fn table(c: &Cgnat) -> Option<Table> {
             Hook::Postrouting,
             90,
             "srcnat - 10",
+        ));
+    }
+    if exhaustion {
+        t.chains.push(chain(
+            "exhausted",
+            ChainType::Filter,
+            Hook::Postrouting,
+            105,
+            "srcnat + 5",
         ));
     }
     t.chains.push(chain(
@@ -498,11 +521,55 @@ pub fn table(c: &Cgnat) -> Option<Table> {
             });
             text.push_str(" ip saddr != @x_1to1");
         }
-        exprs.push(Expr::Queue { num: QUEUE_NUM });
+        exprs.push(Expr::Queue {
+            num: QUEUE_NUM,
+            total: 1,
+            bypass: false,
+        });
         t.rules.push(rule(
             "blocks",
             exprs,
             format!("{text} queue num {QUEUE_NUM}"),
+        ));
+    }
+
+    // Port exhaustion (G2.7, RFC 6888 REQ-11). The kernel's NAT never
+    // fails: with no free port in the slot it keeps a tuple already in use
+    // (nf_nat_core.c, `nf_nat_l4proto_unique_tuple`: 128 + 64 + 32 + 16
+    // tries), and conntrack drops the packet at confirmation, after every
+    // hook, counting only `insert_failed`. So right after the NAT, the new
+    // connections of the few subscribers near the end of their ports go to
+    // userspace, which looks the chosen reply tuple up: taken means refused,
+    // and the subscriber gets the ICMP (REQ-11b). `bypass`: nobody serving,
+    // the kernel decides as before. Everyone else never leaves the kernel.
+    if exhaustion {
+        let mut exprs = ct_bits(CtKey::State, CT_STATE_NEW).to_vec();
+        exprs.extend([
+            Expr::Ct {
+                key: CtKey::SrcIp,
+                dir: Some(Dir::Original),
+                dreg: REG_1,
+            },
+            Expr::Lookup {
+                set: FULL.into(),
+                sreg: REG_1,
+                dreg: None,
+                inv: false,
+            },
+            Expr::Queue {
+                num: EXHAUSTED_QUEUE,
+                total: EXHAUSTED_QUEUES,
+                bypass: true,
+            },
+        ]);
+        t.rules.push(rule(
+            "exhausted",
+            exprs,
+            format!(
+                "ct state new ct original ip saddr @{FULL} queue num {}-{} bypass",
+                EXHAUSTED_QUEUE,
+                EXHAUSTED_QUEUE + EXHAUSTED_QUEUES - 1
+            ),
         ));
     }
 
@@ -531,6 +598,14 @@ pub fn table(c: &Cgnat) -> Option<Table> {
 /// subscriber without a block until the daemon allocates one (RFC 7422,
 /// as a number to remember).
 pub const QUEUE_NUM: u16 = 7422;
+/// The first of the queues of nearly full subscribers' new connections
+/// (G2.7), right after [`QUEUE_NUM`].
+pub const EXHAUSTED_QUEUE: u16 = 7423;
+/// How many: the kernel spreads them by flow hash, the daemon serves each
+/// with a thread.
+pub const EXHAUSTED_QUEUES: u16 = 4;
+/// The set of subscribers near the end of their ports (G2.7).
+pub const FULL: &str = "full";
 
 /// The table every CGNAT object lives in.
 pub const TABLE: &str = "corerouter_cgnat";
@@ -638,7 +713,9 @@ pub fn remapped(from: &Cgnat, to: &Cgnat) -> Vec<Ipv4Addr> {
 
 /// Whether the part of the config the kernel sees changed.
 pub fn changed(from: &Cgnat, to: &Cgnat) -> bool {
-    from.pools != to.pools || from.exceptions != to.exceptions
+    from.pools != to.pools
+        || from.exceptions != to.exceptions
+        || from.settings.icmp_unreachable != to.settings.icmp_unreachable
 }
 
 #[cfg(test)]
@@ -690,8 +767,8 @@ mod tests {
             r.script
         );
         // exceptions in and out, hairpin dnat, EIM snat, formula, the
-        // mapping recorder, the forward drop.
-        assert_eq!(r.rules, 7, "{}", r.script);
+        // mapping recorder, the exhaustion queue, the forward drop.
+        assert_eq!(r.rules, 8, "{}", r.script);
         let t = table(&c).unwrap();
         let formula = t
             .rules
@@ -801,5 +878,56 @@ mod tests {
         let mut c = a.clone();
         c.pools[0].ports_per_subscriber = 2000;
         assert_eq!(table(&a).unwrap().skeleton(), table(&c).unwrap().skeleton());
+    }
+
+    /// G2.7: right after the NAT (srcnat + 5), only the new connections of
+    /// the subscribers in `full` go to the exhaustion queues, with bypass;
+    /// turned off, neither the set nor the chain exist.
+    #[test]
+    fn exhaustion_queues_only_the_full_subscribers() {
+        let mut c = Cgnat::default();
+        c.pools.push(pool(1, "100.64.0.0/30", "203.0.113.1", 1000));
+        let t = table(&c).unwrap();
+        let r = t.rules.iter().find(|r| r.chain == "exhausted").unwrap();
+        assert_eq!(
+            r.text,
+            "ct state new ct original ip saddr @full queue num 7423-7426 bypass"
+        );
+        assert!(matches!(
+            r.exprs.last(),
+            Some(Expr::Queue {
+                num: 7423,
+                total: 4,
+                bypass: true
+            })
+        ));
+        let ch = t.chains.iter().find(|ch| ch.name == "exhausted").unwrap();
+        assert_eq!((ch.hook, ch.priority), (Hook::Postrouting, 105));
+        assert!(
+            t.sets
+                .iter()
+                .any(|s| s.name == FULL && s.elements.is_empty())
+        );
+        let mut off = c.clone();
+        off.settings.icmp_unreachable = false;
+        assert!(changed(&c, &off));
+        let t = table(&off).unwrap();
+        assert!(t.rules.iter().all(|r| r.chain != "exhausted"));
+        assert!(t.sets.iter().all(|s| s.name != FULL));
+        // The blocks queue keeps no bypass: never out untranslated.
+        let mut b = Cgnat::default();
+        let mut p = pool(1, "100.64.0.0/30", "203.0.113.1", 1000);
+        p.mode = Mode::Blocks;
+        b.pools.push(p);
+        let t = table(&b).unwrap();
+        let q = t.rules.iter().find(|r| r.chain == "blocks").unwrap();
+        assert!(matches!(
+            q.exprs.last(),
+            Some(Expr::Queue {
+                num: QUEUE_NUM,
+                total: 1,
+                bypass: false
+            })
+        ));
     }
 }
