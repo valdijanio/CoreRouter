@@ -1311,6 +1311,7 @@ dependencies = [
  "corerouter-model",
  "corerouter-proto-bgp",
  "criterion",
+ "ipnet",
  "log",
  "serde_json",
  "thiserror 2.0.21",
@@ -1389,9 +1390,11 @@ name = "corerouter-proto-bgp"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+ "criterion",
  "ipnet",
  "proptest",
  "regex",
+ "regex-syntax",
 ]
 
 [[package]]
