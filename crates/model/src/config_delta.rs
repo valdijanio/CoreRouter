@@ -323,6 +323,21 @@ fn diff_routing(a: &Routing, b: &Routing) -> Result<Option<Value>, PersistError>
     p.map("bgp", &a.bgp, &b.bgp)?;
     p.map("bgp_templates", &a.bgp_templates, &b.bgp_templates)?;
     p.map("bgp_connections", &a.bgp_connections, &b.bgp_connections)?;
+    // G3.2b: rules are matched by id (`json_delta`), lists by name.
+    if a.filter != b.filter {
+        match (a.filter.is_empty(), b.filter.is_empty()) {
+            (_, true) => p.gone.push("filter".to_owned()),
+            (true, false) => {
+                let v = serde_json::to_value(&b.filter).map_err(malformed)?;
+                p.changed.insert("filter".to_owned(), obj("=", v));
+            }
+            (false, false) => {
+                if let Some(d) = whole(&a.filter, &b.filter)? {
+                    p.changed.insert("filter".to_owned(), d);
+                }
+            }
+        }
+    }
     Ok(p.finish())
 }
 

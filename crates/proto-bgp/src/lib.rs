@@ -16,6 +16,8 @@
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
+pub mod filter;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::net::IpAddr;

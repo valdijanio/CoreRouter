@@ -388,6 +388,9 @@ pub struct Routing {
     /// `/routing bgp connection`: the neighbors, by name.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub bgp_connections: BTreeMap<String, crate::bgp::BgpConnection>,
+    /// `/routing filter`: rules, prefix and community lists (G3.2b).
+    #[serde(skip_serializing_if = "crate::routing_filter::RoutingFilter::is_empty")]
+    pub filter: crate::routing_filter::RoutingFilter,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

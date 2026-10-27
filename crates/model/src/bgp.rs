@@ -214,6 +214,14 @@ pub struct BgpParams {
     pub update_source: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nexthop_choice: Option<NexthopChoice>,
+    /// RouterOS `input.filter`: the `/routing filter` chain received routes
+    /// go through (G3.2b). Unset on eBGP: nothing is accepted (RFC 8212).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_filter: Option<String>,
+    /// RouterOS `output.filter-chain`: the chain sent routes go through.
+    /// Unset on eBGP: nothing is sent (RFC 8212).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_filter: Option<String>,
 }
 
 impl BgpParams {
@@ -237,6 +245,8 @@ impl BgpParams {
         take(&mut self.max_prefix_restart, &parent.max_prefix_restart);
         take(&mut self.update_source, &parent.update_source);
         take(&mut self.nexthop_choice, &parent.nexthop_choice);
+        take(&mut self.input_filter, &parent.input_filter);
+        take(&mut self.output_filter, &parent.output_filter);
     }
 
     /// The families in force: unset is IPv4 only, as in RouterOS.

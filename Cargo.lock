@@ -1389,6 +1389,9 @@ name = "corerouter-proto-bgp"
 version = "0.1.0"
 dependencies = [
  "corerouter-model",
+ "ipnet",
+ "proptest",
+ "regex",
 ]
 
 [[package]]
