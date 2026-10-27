@@ -254,6 +254,21 @@ pub(crate) enum Tab {
     Connections,
 }
 
+impl Tab {
+    /// The explanation key and title of the tab's ⓘ.
+    fn help(self) -> (&'static str, &'static str) {
+        match self {
+            Tab::Filter => ("firewall.tab.filter", "Filter Rules"),
+            Tab::Nat => ("firewall.tab.nat", "NAT"),
+            Tab::Mangle => ("firewall.tab.mangle", "Mangle"),
+            Tab::Raw => ("firewall.tab.raw", "Raw"),
+            Tab::Addr => ("firewall.tab.address-list", "Address Lists"),
+            Tab::Zones => ("firewall.tab.zones", "Zones"),
+            Tab::Connections => ("firewall.tab.connections", "Connections"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum IfTab {
     #[default]
@@ -275,12 +290,14 @@ pub(crate) struct State {
     pub tab: Tab,
     pub if_tab: IfTab,
     /// Chain filter of each rule table ("" = all).
-    chain: [String; 3],
+    chain: [String; 8],
     /// Shared, so a frame borrows a list instead of copying every rule.
     rows: [Arc<Vec<Value>>; 8],
     pub dialogs: Vec<FwDialogWin>,
     /// Items to open once a list sent after this request arrives.
     open_after: Vec<(RequestId, Feed, String)>,
+    /// The ⓘ of the open tab (G2.1c).
+    help: Option<crate::help::HelpView>,
 }
 
 fn feed_index(f: Feed) -> usize {
@@ -1151,7 +1168,12 @@ impl CoreRouterUi {
                 (Tab::Zones, "Zones"),
                 (Tab::Connections, "Connections"),
             ] {
-                ui.selectable_value(&mut self.fw.tab, tab, label);
+                ui.selectable_value(&mut self.fw.tab, tab, crate::i18n::tr_in("firewall", self.lang.labels, label));
+            }
+            let (key, label) = self.fw.tab.help();
+            let title = crate::i18n::tr_in("firewall", self.lang.labels, label);
+            if crate::help::info_button(ui, egui::Id::unique("fw-tab-help"), title).clicked() {
+                self.fw.help = Some(crate::help::HelpView::new(key, title));
             }
         });
         ui.separator();
@@ -1826,6 +1848,7 @@ impl CoreRouterUi {
 
     /// Draw every open firewall / interface-list dialog.
     pub(crate) fn fw_dialogs(&mut self, ctx: &egui::Context, area: egui::Rect) {
+        crate::help::modal(ctx, self.lang, &mut self.fw.help);
         let mut dialogs = std::mem::take(&mut self.fw.dialogs);
         let lists = self.list_names();
         let addr_lists = self.address_list_names();

@@ -237,7 +237,10 @@ fn build() -> Option<Config> {
         rule(
             22,
             "prerouting",
-            m(&[("in_interface_list", "WAN"), ("src_address_list", "blocked")])?,
+            m(&[
+                ("in_interface_list", "WAN"),
+                ("src_address_list", "blocked"),
+            ])?,
             Action::Drop,
         )?,
         rule(

@@ -116,11 +116,7 @@ fn raw_refuses_what_needs_conntrack_and_notrack_elsewhere() {
             .any(|i| i.to_string().contains("before connection tracking")),
         "{issues:?}"
     );
-    let e = err(
-        &mut s,
-        "ip.firewall.raw.add",
-        json!({"action": "reject"}),
-    );
+    let e = err(&mut s, "ip.firewall.raw.add", json!({"action": "reject"}));
     assert!(e.contains("not a raw action"), "{e}");
     let e = err(
         &mut s,
