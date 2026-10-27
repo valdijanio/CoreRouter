@@ -61,6 +61,9 @@ pub struct Counters {
 pub struct Exporter {
     cfg: Config,
     templates: Vec<Template>,
+    /// Per template, its record's bytes when no field is variable: sized
+    /// without walking the fields for each record.
+    fixed: Vec<Option<usize>>,
     meta: Meta,
     seq: u32,
     last_templates: Option<u64>,
@@ -82,6 +85,15 @@ impl Exporter {
     pub fn new(mut cfg: Config) -> Self {
         cfg.max_size = cfg.max_size.clamp(MIN_MESSAGE, 65535);
         Self {
+            fixed: template::all(cfg.version)
+                .iter()
+                .map(|t| {
+                    t.fields
+                        .iter()
+                        .all(|f| f.len != crate::ie::VARIABLE)
+                        .then(|| t.record_len())
+                })
+                .collect(),
             templates: template::all(cfg.version),
             cfg,
             meta: Meta::default(),
@@ -231,10 +243,6 @@ impl Exporter {
         self.close_set(m);
     }
 
-    fn template(&self, id: u16) -> Option<&Template> {
-        self.templates.iter().find(|t| t.id == id)
-    }
-
     /// Append one data record, finishing the message first when it would
     /// not fit.
     fn add(&mut self, m: &mut Msg, row: Row<'_>, now_ms: u64, out: &mut Vec<Vec<u8>>) {
@@ -242,8 +250,14 @@ impl Exporter {
             Row::Nat(_) if !self.cfg.nat_destination => template::NAT44_SRC,
             _ => row.template(),
         };
-        let Some(t) = self.template(tid) else { return };
-        let len = t.row_len(row);
+        let Some(slot) = self.templates.iter().position(|t| t.id == tid) else {
+            return;
+        };
+        let len = match (self.fixed.get(slot).copied().flatten(), self.templates.get(slot)) {
+            (Some(n), _) => n,
+            (None, Some(t)) => t.row_len(row),
+            (None, None) => return,
+        };
         let same = matches!(m.set, Some((_, id)) if id == tid);
         let need = len + if same { 0 } else { 4 } + 3;
         if m.buf.len() + need > self.cfg.max_size && m.records > 0 {
@@ -260,7 +274,7 @@ impl Exporter {
             boot_ms: self.cfg.boot_ms,
             legacy_nat: self.cfg.legacy_nat,
         };
-        if let Some(t) = self.template(tid) {
+        if let Some(t) = self.templates.get(slot) {
             for field in &t.fields {
                 template::put(&mut m.buf, *field, row, how);
             }

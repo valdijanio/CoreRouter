@@ -387,6 +387,35 @@ Quantas portas os assinantes usam de verdade, e quantas portas por assinante iss
 Safe Mode (`config.safe-mode.enter`) e roda `ip.firewall.cgnat.pool.set`. Sem confirmação, tudo volta.
 O "Quem era?" guarda a mudança com a hora (seção 1.5).
 
+### 1.11 Log de NAT em IPFIX (G4.4j)
+
+O que o CGNAT faz também sai em IPFIX (RFC 8158), para um coletor externo guardar o ano que o Marco
+Civil pede. A janela IP › Firewall › CGNAT tem a aba **Logging**; os coletores e os interruptores são
+os do `/ip traffic-flow` (um exportador só, um socket por coletor; `docs/traffic-flow.md`).
+
+| Evento | `natEvent` | Quando | Campos |
+|---|---|---|---|
+| Bloco alocado / liberado (§4.6.10) | 16 / 17 | cada bloco do modo blocos | assinante, IP público, `portRangeStart/End/StepSize/NumPorts`, `natPoolId`, `vlanId` e `userName` (login PPPoE/IPoE, quando há sessão) |
+| Pool sem bloco livre (§4.6.5) | 3 | o alocador não acha bloco | `natPoolId` |
+| Assinante sem porta livre (§4.6.7.3) | 13, `natQuotaExceededEvent` 3 | a fila de exaustão do G2.7 recusou, ou o assinante tem `max_blocks` | assinante, `maxEntriesPerUser` (portas), `natPoolId` |
+| Assinante acima do alerta (§4.6.8.3) | 18, `natThresholdEvent` 4 | o alerta de portas (seção 1.8) cruzou | assinante, `addressPortMappingPerUserHighThreshold` (o `alert_percent`), `natPoolId` |
+| Sessão NAT44 criada / encerrada (§4.6.1) | 4 / 5 (ou 1/2 legado) | cada conexão, se ligado | origem antes e depois do NAT; destino só com `nat_events_destination` |
+
+- **Padrões:** blocos e limites ligados (`nat_port_blocks`, `nat_limits`), sessões desligadas
+  (`nat_events=no`, como no RouterOS). Os limites saem no máximo uma vez por minuto por pool ou
+  assinante (RFC 8158 §5.2).
+- **Só NAT:** com `flows=no` e sem sessões, o exportador nem lê a tabela de conexões do kernel.
+- **Fila própria:** os eventos vão do alocador ao exportador por uma fila do engine (262 144
+  eventos, descarte contado em `ip.traffic-flow.stats` → `nat_log_dropped`), não pelo log do
+  roteador, cuja janela recente tem 1024 linhas: uma tempestade de blocos perdia quase tudo.
+- **Identidade:** o login e a VLAN vêm do serviço PPPoE/IPoE pelo índice por endereço (O(1)),
+  fora do lock da sessão.
+- **Durabilidade:** o primeiro pacote do assinante só segue depois que a linha do bloco está no
+  journal (`fdatasync`). Desde o G4.4j os primeiros pacotes que esperam na fila 7422 são servidos
+  em lote: um lock e um `fdatasync` por lote, não por bloco.
+- **Determinístico:** não há bloco a registrar; a fórmula e o histórico das pools (seção 1.5) são o
+  registro (RFC 7422). Os limites (13, 18) valem nos dois modos.
+
 ## 2. Comandos
 
 | Comando | O que faz |
@@ -404,6 +433,7 @@ O "Quem era?" guarda a mudança com a hora (seção 1.5).
 | `ip.firewall.cgnat.alert.list` / `alert.clear` | assinantes no limite de portas e o `insert_failed` do kernel; recusados e ICMP enviados (G2.7) |
 | `ip.firewall.cgnat.capacity.get {pool}` / `capacity.preview {pool, ports_per_subscriber}` | uso real (pico p99 de 7 dias, distribuição, quem bateu no limite em 24 h), sugestão de portas por assinante e a prévia do que mudar derruba (G2.7b) |
 | `ip.firewall.cgnat.set {history_days?, icmp_unreachable?, icmp_rate?}` | retenção do histórico; ICMP quando as portas acabam e o limite por assinante (G2.7) |
+| `ip.traffic-flow.set {nat_port_blocks?, nat_limits?, nat_events?, flows?}` / `ip.traffic-flow.target.*` | o log de NAT em IPFIX (aba Logging, seção 1.11; G4.4j) |
 | `tool.ip-calc.cgnat.plan {inside, outside, ports_per_subscriber?, port_range?, mode?, preview?}` | o planner (Tools › IP Calculator): números, checagens, sugestões, prévia e os parâmetros do `pool.add`; aceita quantidades (`"4096"`) |
 | `tool.ip-calc.cgnat.export {…, format: csv \| text \| routeros \| nft}` | a tabela do plano em CSV, texto imprimível, script RouterOS ou o nftables |
 
@@ -490,6 +520,7 @@ cargo run -p corerouter-cli -- --connect 127.0.0.1:7979 run ip.firewall.cgnat.wh
 | G2.4a (feito) | Fast path (flowtable em software, offload em hardware mlx5) e a janela Fast path |
 | G2.3e (feito) | Bateria final de bugs e desempenho e o relatório (seção 6) |
 | G2.7 (feito) | Sem portas: ICMP *host unreachable* (RFC 6888 REQ-11b) com limite de taxa, fila só dos quase cheios; REQ-8 por faixa de portas (seção 1.9) |
+| G4.4j (feito) | Log de NAT em IPFIX (RFC 8158): blocos com pool, VLAN e login, limites, aba Logging; SCTP e TLS; alocação em lote com um `fdatasync` por lote (seção 1.11) |
 | G2.7b (feito) | Aba Capacity: pico p99 por assinante em 7 dias, quem bateu no limite, distribuição, sugestão de `ports_per_subscriber` com prévia e Safe Mode; leitura do conntrack fora do lock (seção 1.10) |
 
 ## 5. Pesquisa
@@ -772,6 +803,23 @@ cada, 1,3 milhão de conexões.
 - dividir por assinante entre threads não pagaria a coordenação;
 - o lock do `Session` fica 5,6 ms com 64 Ki assinantes, em vez de cobrir a leitura do conntrack
   (~1 s para um milhão de conexões, **estimado** no G2.2).
+
+### 6.9 Tempestade de blocos e o log de NAT (G4.4j, bench `cgnat_pba_storm` e `netns_nat_ipfix`)
+
+AMD Ryzen AI MAX+ 395, kernel 7.0, 2026-10-27, **medido**.
+
+- **Alocação no engine** (release, 10 000 assinantes num /17 sobre 4096 IPs públicos, storage em
+  memória): 11 µs por bloco antes, 4,4 µs depois (−60 %, 229 mil blocos/s). O alocador ordenava os
+  4096 endereços a cada bloco para achar o menos usado; agora acha o mínimo numa passada.
+- **Journal:** cada bloco fazia `open` + `write` + `fdatasync` sob o lock da sessão (~1,2 ms neste
+  NVMe). Em netns, com o daemon de teste (sem otimização), a tempestade de 20 000 primeiros pacotes
+  passou de 632 para 3 411 blocos/s com o lote, e de 313 para 147 µs de CPU por bloco.
+- **Release, ponta a ponta** (`netns_nat_ipfix`): 20 000 blocos chegaram aos coletores SCTP e TLS,
+  24 µs de CPU do daemon por bloco, nenhum descarte (`nat_log_dropped` 0). Drenar a fila do engine
+  custa 14 ns por registro (bench `drain_10k_records`).
+- **Fila do kernel:** a fila 7422 tinha o tamanho padrão de 1024 pacotes (o `MAXLEN` de 4096 só
+  ia para as filas com flags); 2 000 primeiros pacotes de uma vez perderam metade. Agora toda fila
+  pede 4096. O que passa disso cai e o cliente tenta de novo (o teste manda em rodadas).
 
 ### 6.6 O que veth mede e o que só hardware mostra
 
