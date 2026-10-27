@@ -173,3 +173,4 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G4.10c feito (serviço do portal dos avisos ao assinante)
 - 2026-10-27 — G4.10d feito (janela Subscriber Notices)
 - 2026-10-27 — G4.10e feito (laboratório dos avisos ao assinante); G4.10 em partes (faltam G4.10f–h)
+- 2026-10-27 — G4.3hd feito (IPoE no par em hot standby); G4.3fb criada (IPoE em escala com o BNG Blaster)
