@@ -89,6 +89,20 @@ if [ -n "${FRR_EXPLORE:-}" ]; then
     -c "neighbor 198.51.100.38 activate" -c "neighbor 198.51.100.38 soft-reconfiguration inbound" \
     -c "exit-address-family" -c "exit"
   sleep 12
+  if [ "${FRR_EXPLORE}" = 2 ]; then
+    vtysh -c "configure terminal" -c "router bgp 65000" -c "address-family ipv4 unicast" \
+      -c "neighbor 198.51.100.34 route-map T in" -c "exit-address-family" -c "exit"
+    sleep 6
+    for c in "show bgp ipv4 unicast neighbors 198.51.100.34 received-routes detail" \
+      "show bgp ipv4 unicast detail json" "show bgp ipv4 unicast 203.0.113.0/24 json" \
+      "show bgp ipv4 unicast neighbors 198.51.100.34 filtered-routes json" \
+      "show bgp ipv4 unicast neighbors 198.51.100.34 received-routes wide"; do
+      echo "===== $c"
+      vtysh -c "$c" | head -c 5000
+      echo
+    done
+    exit 0
+  fi
   for c in "show bgp ipv4 unicast summary" \
     "show bgp ipv4 unicast neighbors 198.51.100.34 received-routes json" \
     "show bgp ipv4 unicast neighbors 198.51.100.34 received-routes detail json" \

@@ -28,9 +28,13 @@ pub struct RouteKey {
     pub received: bool,
 }
 
+/// A table read: the routes, and how many of them came without their
+/// communities (FRR shows those only for accepted routes).
+pub type Table = (Arc<Vec<Route>>, usize);
+
 struct Entry {
     at: u64,
-    result: Result<Arc<Vec<Route>>, String>,
+    result: Result<Table, String>,
 }
 
 /// A [`Session`] extension.
@@ -38,6 +42,12 @@ struct Entry {
 pub struct BgpRouteCache {
     entries: HashMap<RouteKey, Entry>,
     wanted: Vec<RouteKey>,
+}
+
+/// The routes read from FRR, and how many lack their communities.
+pub fn to_routes(entries: Vec<BgpRouteEntry>) -> (Vec<Route>, usize) {
+    let partial = entries.iter().filter(|e| e.partial).count();
+    (entries.into_iter().filter_map(to_route).collect(), partial)
 }
 
 /// The policy's view of a route read from FRR (`None`: no prefix).
@@ -59,7 +69,7 @@ pub fn to_route(e: BgpRouteEntry) -> Option<Route> {
 impl Session {
     /// The routes of `key` if read recently; otherwise the request is
     /// filed for the FRR thread and the last result (stale) or `None`.
-    pub fn bgp_routes(&mut self, key: &RouteKey) -> Option<Result<Arc<Vec<Route>>, String>> {
+    pub fn bgp_routes(&mut self, key: &RouteKey) -> Option<Result<Table, String>> {
         let now = self.hal_now().unwrap_or(0);
         let cache = self.ext_mut::<BgpRouteCache>()?;
         let entry = cache.entries.get(key);
@@ -75,8 +85,8 @@ impl Session {
         self.ext_mut::<BgpRouteCache>().map(|c| std::mem::take(&mut c.wanted)).unwrap_or_default()
     }
 
-    /// What the FRR thread read for `key`.
-    pub fn set_bgp_routes(&mut self, key: RouteKey, result: Result<Vec<Route>, String>) {
+    /// What the FRR thread read for `key` (routes, how many are partial).
+    pub fn set_bgp_routes(&mut self, key: RouteKey, result: Result<(Vec<Route>, usize), String>) {
         let now = self.hal_now().unwrap_or(0);
         if let Some(c) = self.ext_mut::<BgpRouteCache>() {
             // Only the tables still asked about stay (bounded by MAX_WANTED
@@ -84,7 +94,7 @@ impl Session {
             if c.entries.len() >= MAX_WANTED * 4 {
                 c.entries.retain(|_, e| now.saturating_sub(e.at) < FRESH_SECS);
             }
-            c.entries.insert(key, Entry { at: now, result: result.map(Arc::new) });
+            c.entries.insert(key, Entry { at: now, result: result.map(|(r, n)| (Arc::new(r), n)) });
         }
     }
 }
@@ -109,9 +119,10 @@ mod tests {
             communities: vec![3, 1, 3],
             ..Default::default()
         };
-        s.set_bgp_routes(key.clone(), Ok(to_route(e).into_iter().collect()));
-        let got = s.bgp_routes(&key).unwrap().unwrap();
+        s.set_bgp_routes(key.clone(), Ok(to_routes(vec![e])));
+        let (got, partial) = s.bgp_routes(&key).unwrap().unwrap();
         assert_eq!(got[0].communities, [1, 3]);
+        assert_eq!(partial, 0);
         assert!(s.bgp_routes_wanted().is_empty());
     }
 }

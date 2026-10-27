@@ -17,4 +17,7 @@ pub struct BgpRouteEntry {
     pub large: Vec<(u32, u32, u32)>,
     pub med: Option<u32>,
     pub local_pref: Option<u32>,
+    /// The communities are not known (FRR 10 shows them only for the
+    /// received routes the input chain accepted).
+    pub partial: bool,
 }

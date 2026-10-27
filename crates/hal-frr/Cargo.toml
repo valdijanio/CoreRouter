@@ -13,6 +13,7 @@ corerouter-model.workspace = true
 corerouter-hal.workspace = true
 corerouter-proto-bgp.workspace = true
 serde_json.workspace = true
+ipnet.workspace = true
 thiserror.workspace = true
 log.workspace = true
 

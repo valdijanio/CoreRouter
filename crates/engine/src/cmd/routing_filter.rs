@@ -82,7 +82,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → {chains: [{chain, rules, enabled, used_in: [connection], used_out: [connection], errors}], rfc8212: [{connection, remote_address, remote_as?, missing: [in | out], message}]}",
         always, status),
     cmd!(query "routing.filter.preview", "Filter Preview", ["Routing", "Filters"], None,
-        "{chain?: string, connection?: string, direction?: in | out (default in), limit?: u32 (routes listed by kind, default 50, at most 500), threads?: u32} → {chain?, connection?, direction, source (sample | frr), pending (FRR's routes are being read: ask again), total, accepted, rejected, modified, compared (a policy is committed), newly_rejected, newly_accepted, attrs_changed, elapsed_us, threads, rows: [{prefix, as_path, communities, verdict (accept | reject), before? (accept | reject), change?}]} (the pending candidate against the running policy)",
+        "{chain?: string, connection?: string, direction?: in | out (default in), limit?: u32 (routes listed by kind, default 50, at most 500), threads?: u32} → {chain?, connection?, direction, source (sample | frr), pending (FRR's routes are being read: ask again), error? (why they could not be read), partial (routes read without their communities: FRR 10 shows them only for accepted routes), total, accepted, rejected, modified, compared (a policy is committed), newly_rejected, newly_accepted, attrs_changed, elapsed_us, threads, rows: [{prefix, as_path, communities, verdict (accept | reject), before? (accept | reject), change?}]} (the pending candidate against the running policy)",
         always, preview),
     cmd!(query "routing.filter.impact", "Filter Commit Impact", ["Routing", "Filters"], None,
         "{} → [{connection, remote_as?, direction (in | out), chain?, before_chain?, total, withdrawn, added, changed, source, message}] (what committing the pending changes does to each connection's routes; empty when nothing changes)",
@@ -696,6 +696,10 @@ struct Routes {
     routes: Arc<Vec<Route>>,
     source: &'static str,
     pending: bool,
+    /// Routes read without their communities.
+    partial: usize,
+    /// Why FRR's routes could not be read.
+    error: Option<String>,
 }
 
 /// The routes a connection's chain sees in `dir`: the virtual lab's
@@ -711,16 +715,15 @@ fn routes_for(s: &mut Session, c: Option<&BgpConnection>, dir: Dir) -> Routes {
             received: dir == Dir::In,
         };
         match s.bgp_routes(&key) {
-            Some(Ok(routes)) => return Routes { routes, source: "frr", pending: false },
-            Some(Err(_)) | None => {
-                return Routes { routes: Arc::new(Vec::new()), source: "frr", pending: true };
-            }
+            Some(Ok((routes, partial))) => return Routes { routes, source: "frr", pending: false, partial, error: None },
+            Some(Err(e)) => return Routes { routes: Arc::new(Vec::new()), source: "frr", pending: false, partial: 0, error: Some(e) },
+            None => return Routes { routes: Arc::new(Vec::new()), source: "frr", pending: true, partial: 0, error: None },
         }
     }
     let peer = c.and_then(|c| c.params.remote_as).map_or(64_500, |a| a.0);
     let seed = corerouter_proto_bgp::filter::sample_seed(c.map_or("", |c| c.name.as_str()), dir == Dir::In);
     let peer = if dir == Dir::In { peer } else { 64_496 };
-    Routes { routes: Arc::new(sample::routes(SAMPLE_ROUTES, seed, peer)), source: "sample", pending: false }
+    Routes { routes: Arc::new(sample::routes(SAMPLE_ROUTES, seed, peer)), source: "sample", pending: false, partial: 0, error: None }
 }
 
 fn row_json(r: &Row) -> Value {
@@ -882,6 +885,8 @@ fn preview(s: &mut Session, p: &Value) -> Result<Value> {
         "attrs_changed": pv.attrs_changed,
         "elapsed_us": u64::try_from(elapsed).unwrap_or(u64::MAX),
         "threads": threads,
+        "partial": src.partial,
+        "error": src.error,
         "rows": rows,
     }))
 }
