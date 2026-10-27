@@ -27,6 +27,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("ICMP Unreachable", "ICMP inalcançável"),
     ("Inside", "Internos"),
     ("Last", "Última"),
+    ("Logging", "Registros de NAT"),
     ("Mapping", "Mapeamento"),
     ("Mapping valid", "Mapeamento válido"),
     ("Max Blocks", "Máx. de blocos"),

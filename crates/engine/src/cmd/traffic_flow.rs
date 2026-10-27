@@ -357,12 +357,45 @@ fn apply_target(s: &Session, t: &mut FlowTarget, p: &Value) -> Result<()> {
     Ok(())
 }
 
+/// PEM pasted into a one-line field lost its line breaks (the GUI's field
+/// takes one line): the blocks again, the base64 in lines of 64 (RFC 7468
+/// §2). Text with line breaks is left as it is.
+fn reflow_pem(v: &str) -> String {
+    if v.contains('\n') {
+        return v.to_owned();
+    }
+    let mut out = String::new();
+    let mut rest = v;
+    while let Some(start) = rest.find("-----BEGIN ") {
+        let after = rest.get(start + 11..).unwrap_or("");
+        let Some(label_end) = after.find("-----") else { break };
+        let label = after.get(..label_end).unwrap_or("");
+        let body_from = after.get(label_end + 5..).unwrap_or("");
+        let end_tag = format!("-----END {label}-----");
+        let Some(body_end) = body_from.find(&end_tag) else { break };
+        let body: String = body_from.get(..body_end).unwrap_or("").chars().filter(|c| !c.is_whitespace()).collect();
+        out.push_str(&format!("-----BEGIN {label}-----\n"));
+        let mut chunk = body.as_str();
+        while !chunk.is_empty() {
+            let (line, more) = chunk.split_at(chunk.len().min(64));
+            out.push_str(line);
+            out.push('\n');
+            chunk = more;
+        }
+        out.push_str(&end_tag);
+        out.push('\n');
+        rest = body_from.get(body_end + end_tag.len()..).unwrap_or("");
+    }
+    if out.is_empty() { v.to_owned() } else { out }
+}
+
 /// A PEM text of one of `kinds` (`""` clears it).
 fn pem(p: &Value, key: &str, kinds: &[&str]) -> Result<Option<String>> {
     let Some(v) = opt_str(p, key)? else {
         return Ok(None);
     };
-    let v = v.trim();
+    let flowed = reflow_pem(v.trim());
+    let v = flowed.trim();
     if v.is_empty() {
         return Ok(Some(String::new()));
     }
@@ -912,6 +945,18 @@ mod tests {
         let g = ok(&mut s, "ip.traffic-flow.get", json!({}));
         assert_eq!((g["flows"].as_bool(), g["nat_port_blocks"].as_bool()), (Some(false), Some(false)));
         assert!(!TrafficFlow::default().nat_events, "RouterOS nat-events=no");
+    }
+
+    /// RFC 7468 §2: a certificate pasted into one line comes back as PEM.
+    #[test]
+    fn pem_pasted_on_one_line_is_reflowed() {
+        let body = "A".repeat(100);
+        let one = format!("-----BEGIN CERTIFICATE----- {body} -----END CERTIFICATE----- -----BEGIN CERTIFICATE-----BB-----END CERTIFICATE-----");
+        let out = reflow_pem(&one);
+        let want = format!("-----BEGIN CERTIFICATE-----\n{}\n{}\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nBB\n-----END CERTIFICATE-----\n", &body[..64], &body[64..]);
+        assert_eq!(out, want);
+        assert_eq!(reflow_pem("already\nlines"), "already\nlines");
+        assert_eq!(reflow_pem("-----BEGIN X----- no end"), "-----BEGIN X----- no end");
     }
 
     #[test]

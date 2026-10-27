@@ -152,6 +152,9 @@ pub struct CgnatRuntime {
     /// the first: new connections that found no free NAT tuple.
     insert_failed: Option<(u64, u64)>,
     pub error: Option<String>,
+    /// Journal lines of a batch not yet written (G4.4j): one append and one
+    /// `fdatasync` for the batch instead of one per block.
+    pending_journal: Option<String>,
 }
 
 impl CgnatRuntime {
@@ -327,13 +330,23 @@ impl CgnatRuntime {
             return on(a).map(|b| (a, b));
         }
         let counts = self.per_address.get(&p.id);
-        let mut order: Vec<u64> = (0..l.public_addresses()).collect();
-        order.sort_by_key(|a| {
+        let count = |a: &u64| {
             counts
                 .and_then(|c| c.get(usize::try_from(*a).unwrap_or(usize::MAX)))
                 .copied()
                 .unwrap_or(0)
-        });
+        };
+        // The least used address in one pass, no allocation (G4.4j: the
+        // sort of every address on each allocation was most of its cost;
+        // `cgnat_pba_storm`, **medido**). It has no free block only when
+        // its blocks are held (REQ-8): then the others, least used first.
+        let addresses = l.public_addresses();
+        let first = (0..addresses).min_by_key(count)?;
+        if let Some(b) = on(first) {
+            return Some((first, b));
+        }
+        let mut order: Vec<u64> = (0..addresses).filter(|a| *a != first).collect();
+        order.sort_by_key(count);
         order.into_iter().find_map(|a| on(a).map(|b| (a, b)))
     }
 
@@ -537,12 +550,53 @@ impl Session {
             },
             e.t,
         );
-        if let Err(err) = self.storage_mut().append_journal(JOURNAL, &format!("{line}\n")) {
+        if let Some(buf) = self.ext_mut::<CgnatRuntime>().and_then(|r| r.pending_journal.as_mut()) {
+            buf.push_str(&line);
+            buf.push('\n');
+            return;
+        }
+        self.journal_append(&format!("{line}\n"));
+    }
+
+    fn journal_append(&mut self, lines: &str) {
+        if let Err(err) = self.storage_mut().append_journal(JOURNAL, lines) {
             log::error!("cgnat block journal not saved: {err}");
             if let Some(rt) = self.ext_mut::<CgnatRuntime>() {
                 rt.error = Some(err.to_string());
             }
         }
+    }
+
+    /// From here to [`Self::cgnat_journal_flush`], block journal lines are
+    /// gathered and written (and synced) once.
+    fn cgnat_journal_batch(&mut self) {
+        if let Some(rt) = self.ext_mut::<CgnatRuntime>()
+            && rt.pending_journal.is_none()
+        {
+            rt.pending_journal = Some(String::new());
+        }
+    }
+
+    /// Write what the batch gathered.
+    fn cgnat_journal_flush(&mut self) {
+        let lines = self.ext_mut::<CgnatRuntime>().and_then(|r| r.pending_journal.take());
+        if let Some(lines) = lines.filter(|l| !l.is_empty()) {
+            self.journal_append(&lines);
+        }
+    }
+
+    /// [`Self::cgnat_block_for`] for every subscriber of a batch: the first
+    /// packets the queue holds, served under one lock and with one journal
+    /// write and sync for all of them (G4.4j: a sync per block capped a
+    /// storm at about 800 blocks/s and held the session lock meanwhile,
+    /// **medido**). The packets go on only after this returns, so every
+    /// mapping is on disk before its traffic leaves (Marco Civil).
+    pub fn cgnat_blocks_for(&mut self, subscribers: &[Ipv4Addr], now: u64) -> Vec<Result<Slot, String>> {
+        self.blocks_load();
+        self.cgnat_journal_batch();
+        let out = subscribers.iter().map(|s| self.cgnat_block_for(*s, now)).collect();
+        self.cgnat_journal_flush();
+        out
     }
 
     fn push_blocks(&mut self, changes: &[BlockChange]) {
@@ -740,6 +794,8 @@ impl Session {
             }
         }
         self.exhaustion_drain(now);
+        // One journal write for what this tick allocates and releases.
+        self.cgnat_journal_batch();
         for w in self.hal_mut().cgnat_waiting() {
             if let Err(e) = self.allocate(w.subscriber, now, "first packet") {
                 log::debug!("cgnat: {e}");
@@ -754,8 +810,10 @@ impl Session {
             }
             self.blocks_forget_stale(now);
             self.cgnat_scan(now);
+            self.cgnat_journal_flush();
             self.blocks_compact(now);
         }
+        self.cgnat_journal_flush();
     }
 
     /// Usage per subscriber from the kernel's connections, read here (the
@@ -783,8 +841,10 @@ impl Session {
             r.fed_at = Some(now);
             r.last_scan = Some(now);
         }
+        self.cgnat_journal_batch();
         self.blocks_forget_stale(now);
         self.cgnat_scan_with(now, usage);
+        self.cgnat_journal_flush();
         self.blocks_compact(now);
     }
 
