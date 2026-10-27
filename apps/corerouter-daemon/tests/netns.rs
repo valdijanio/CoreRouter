@@ -195,9 +195,14 @@ fn exchange(v4: bool) {
         "A lists nothing with discovery off"
     );
 
-    drop((a, b_daemon, holder));
-    // Deleting one end of the veth deletes both.
+    drop((a, b_daemon));
+    // Deleting one end of the veth deletes both. Before B's namespace
+    // goes: the kernel tears a namespace down later, in a workqueue, and
+    // takes the veth with it, so after `drop(holder)` our end may be gone
+    // already ("Cannot find device", CI 2026-10-26) or still there when the
+    // next exchange adds its own.
     ip(None, &["link", "del", "ether1"]);
+    drop(holder);
     for d in [dir_a, dir_b] {
         let _ = std::fs::remove_dir_all(d);
     }

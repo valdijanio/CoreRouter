@@ -83,6 +83,26 @@ fn transfer(from: [u8; 4], q: &[u8], id: u16, ixfr: bool) -> Result<Transfer, St
     }
 }
 
+/// The DNS service copies the running config once a second, so a zone
+/// built by five commands may be served with three of them for a while
+/// (each copy with its own serial): the AXFR read 4 records of 5 in CI
+/// (2026-10-26) after waiting for the third. True once the SOA served on
+/// port 53 carries the committed serial.
+fn served_is_committed() -> bool {
+    let Some(committed) = run("ip.dns.zone.print", json!({}))
+        .ok()
+        .and_then(|z| z[0]["serial"].as_u64())
+    else {
+        return false;
+    };
+    ask("example.com.", RecordType::SOA).is_some_and(|m| {
+        m.answers.iter().any(|r| match &r.data {
+            hickory_proto::rr::RData::SOA(soa) => u64::from(soa.serial) == committed,
+            _ => false,
+        })
+    })
+}
+
 fn dig(args: &[&str]) -> Option<String> {
     let out = Command::new("dig").args(args).output().ok()?;
     Some(String::from_utf8_lossy(&out.stdout).into_owned())
@@ -151,9 +171,7 @@ fn zones_are_served_and_transferred() {
             .extend(extra.as_object().unwrap().clone());
         run("ip.dns.zone.record.add", p).unwrap();
     }
-    wait_for("the zone", || {
-        ask("www.example.com.", RecordType::A).is_some_and(|m| m.metadata.authoritative)
-    });
+    wait_for("the zone, as committed", served_is_committed);
     let m = ask("www.example.com.", RecordType::A).unwrap();
     assert_eq!(m.answers[0].data.to_string(), "192.0.2.80");
     let m = ask("nope.example.com.", RecordType::A).unwrap();
@@ -174,9 +192,7 @@ fn zones_are_served_and_transferred() {
         json!({"zone": "example.com", "name": "new", "address": "192.0.2.50"}),
     )
     .unwrap();
-    wait_for("the change", || {
-        ask("new.example.com.", RecordType::A).is_some_and(|m| !m.answers.is_empty())
-    });
+    wait_for("the change", served_is_committed);
     let (id, q) = xfr::xfr_query("example.com", Some(&zone)).unwrap();
     let t = transfer(SECONDARY, &q, id, true).unwrap();
     let newer = t.finish(Some(&zone)).unwrap().unwrap();

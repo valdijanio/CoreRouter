@@ -64,6 +64,32 @@ fn ip(args: &[&str]) {
     );
 }
 
+/// A veth pair `a` ── `b`, up and passing frames. Until linkwatch sees
+/// the carrier the device keeps the noop qdisc, which drops what is sent:
+/// case 0 read nothing in CI (2026-10-26). Wait for both ends to be UP
+/// with their real qdisc.
+fn veth(a: &str, b: &str) {
+    ip(&["link", "add", a, "type", "veth", "peer", "name", b]);
+    ip(&["link", "set", a, "up"]);
+    ip(&["link", "set", b, "up"]);
+    let ready = |d: &str| {
+        let out = Command::new("ip")
+            .args(["-o", "link", "show", "dev", d])
+            .output()
+            .unwrap();
+        let line = String::from_utf8_lossy(&out.stdout).into_owned();
+        line.contains("state UP") && !line.contains("qdisc noop")
+    };
+    let t = Instant::now();
+    while !(ready(a) && ready(b)) {
+        assert!(
+            t.elapsed() < Duration::from_secs(10),
+            "{a}/{b} never came up"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn n(s: &str) -> IfName {
     s.parse().unwrap()
 }
@@ -102,11 +128,7 @@ fn every_tagging_reaches_its_socket_once_with_its_tags() {
         return;
     }
     ip(&["link", "set", "lo", "up"]);
-    ip(&[
-        "link", "add", "pioa", "type", "veth", "peer", "name", "piob",
-    ]);
-    ip(&["link", "set", "pioa", "up"]);
-    ip(&["link", "set", "piob", "up"]);
+    veth("pioa", "piob");
     let cpe = PppoePort::open(&n("pioa"), &[], true).unwrap();
     let mut bng = PppoePort::open_for(
         &n("piob"),
@@ -183,4 +205,45 @@ fn every_tagging_reaches_its_socket_once_with_its_tags() {
             ),
         }
     }
+}
+
+/// A port reads only its own interface, even what reached the socket
+/// before its filter and bind: PPPoE flooding another veth while the port
+/// opens never shows up (before the drain, frames of every interface
+/// queued between `socket()` and `bind`).
+#[test]
+fn a_port_never_reads_another_interface() {
+    if !in_netns() {
+        return;
+    }
+    veth("pioc", "piod");
+    veth("pioe", "piof");
+    let other = PppoePort::open(&n("pioc"), &[], true).unwrap();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flood = {
+        let stop = stop.clone();
+        std::thread::spawn(move || {
+            let f = frame([0xff; 6], &[], 0x8863);
+            let mut sent = 0u64;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                // ENOBUFS when the queue is full: try again.
+                if other.send(&f).is_ok() {
+                    sent += 1;
+                }
+            }
+            sent
+        })
+    };
+    let mut leaked = Vec::new();
+    for _ in 0..50 {
+        let mut port = PppoePort::open(&n("piof"), &[], true).unwrap();
+        port.recv(|f| leaked.push(f.to_vec())).unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(flood.join().unwrap() > 0, "the flood sent nothing");
+    assert!(
+        leaked.is_empty(),
+        "{} frames of piod read on piof",
+        leaked.len()
+    );
 }

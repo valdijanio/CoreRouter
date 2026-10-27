@@ -60,6 +60,8 @@ const FRAME_MAX: usize = 9216;
 /// the rest.
 const BUDGET: usize = 256;
 const RCVBUF: usize = 4 << 20;
+/// Frames dropped at most when a socket opens ([`drop_queued`]).
+const DRAIN: usize = 4096;
 /// `PACKET_OUTGOING`.
 const PACKET_OUTGOING: u8 = 4;
 
@@ -187,7 +189,25 @@ fn bound(link: &LinkAddr, protocol: u16, prog: &[Ins]) -> io::Result<Socket> {
     // with each frame read: `PppoePort::dropped`.
     let _ = nix::sys::socket::setsockopt(&sock, nix::sys::socket::sockopt::RxqOvfl, &1);
     bind(sock.as_raw_fd(), link).map_err(io_err)?;
+    drop_queued(&sock);
     Ok(sock)
+}
+
+/// Drop what a socket queued before its filter and its bind. An
+/// `ETH_P_ALL` socket reads every interface, unfiltered, from `socket()`
+/// on: an IPv6 MLD report of another port reached the BNG as a PPPoE frame
+/// of this one (the flaky `netns_pppoe_io`, 2026-10-26). The protocol
+/// cannot wait for the bind instead (0 at `socket()`, `ETH_P_ALL` in the
+/// bind address): nix builds no `sockaddr_ll` with a protocol without
+/// `unsafe`. libpcap drains the same way.
+fn drop_queued(sock: &Socket) {
+    let mut buf = [0u8; 64];
+    for _ in 0..DRAIN {
+        let mut iov = [IoSliceMut::new(&mut buf)];
+        if recvmsg::<LinkAddr>(sock.as_raw_fd(), &mut iov, None, MsgFlags::MSG_DONTWAIT).is_err() {
+            break;
+        }
+    }
 }
 
 struct Side {
@@ -432,6 +452,7 @@ impl SlowPath {
         crate::l2::rcvbuf(&tap, RCVBUF);
         tap.attach_filter(&filter(&outgoing_only()))?;
         bind(tap.as_raw_fd(), &info.link).map_err(io_err)?;
+        drop_queued(&tap);
         Ok(Self {
             raw,
             raw6,
