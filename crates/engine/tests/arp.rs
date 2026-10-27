@@ -457,3 +457,76 @@ fn a_gateway_that_does_not_resolve_is_incomplete_in_ip_routes() {
         .clone();
     assert_eq!(r["gateway_status"], "reachable");
 }
+
+#[test]
+fn the_modal_preview_checks_and_says_the_command() {
+    let mut s = lab();
+    let ok = run(
+        &mut s,
+        "ip.arp.check",
+        json!({"address": "10.0.0.50", "mac_address": "02:00:00:00:00:50", "interface": "ether1"}),
+    );
+    assert_eq!(ok["commands"][0]["command"], "ip.arp.add", "{ok}");
+    assert_eq!(ok["computed"][0]["value"], "10.0.0.1");
+    // Never fails on bad input: the problems are checks.
+    let bad = run(
+        &mut s,
+        "ip.arp.check",
+        json!({"address": "10.0.0", "mac_address": "FF:FF:FF:FF:FF:FF"}),
+    );
+    let params: Vec<&str> = bad["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["level"] == "error")
+        .map(|c| c["param"].as_str().unwrap())
+        .collect();
+    assert!(
+        params.contains(&"address") && params.contains(&"interface"),
+        "{bad}"
+    );
+    assert!(bad["commands"].as_array().unwrap().is_empty());
+    // Another MAC than the host answers with: a warning.
+    let row = list(&mut s, json!({"search": "10.0.0.5"}))["rows"][0].clone();
+    assert_ne!(row["mac_address"], "02:00:00:00:00:05");
+    let w = run(
+        &mut s,
+        "ip.arp.check",
+        json!({"address": "10.0.0.5", "mac_address": "02:00:00:00:00:05", "interface": "ether1"}),
+    );
+    assert!(
+        w["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["check"] == "learned" && c["level"] == "warning"),
+        "{w}"
+    );
+    // Editing: only the id and the changed field.
+    let id = run(
+        &mut s,
+        "ip.arp.add",
+        json!({"address": "10.0.0.50", "mac_address": "02:00:00:00:00:50", "interface": "ether1"}),
+    )["id"]
+        .clone();
+    let e = run(
+        &mut s,
+        "ip.arp.check",
+        json!({"id": id, "comment": "printer"}),
+    );
+    assert_eq!(e["commands"][0]["command"], "ip.arp.set", "{e}");
+    assert_eq!(e["commands"][0]["params"]["comment"], "printer");
+}
+
+#[test]
+fn the_detail_shows_routes_through_the_neighbor() {
+    let mut s = lab();
+    let d = run(&mut s, "ip.arp.detail", json!({"address": "10.0.0.254"}));
+    assert_eq!(d["row"]["address"], "10.0.0.254");
+    assert_eq!(d["routes"][0]["dst_address"], "0.0.0.0/0", "{d}");
+    assert_eq!(d["subnet"], "10.0.0.1");
+    assert!(
+        fails(&mut s, "ip.arp.detail", json!({"address": "10.9.9.9"}))
+            .contains("not in the neighbor table")
+    );
+}

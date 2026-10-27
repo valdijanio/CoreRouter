@@ -107,8 +107,13 @@ Notas completas com URL por afirmação: pasta de notas da sessão principal,
 - **Kernel:** [ip-sysctl](https://docs.kernel.org/networking/ip-sysctl.html) (`gc_thresh`
   128/512/1024, `proxy_arp`, `proxy_arp_pvlan`, `*_solicit`, `base_reachable_time_ms`).
 
-**O que ficou para depois:** a janela IP › Neighbors e os extras de tela (parte b), o
-fabricante pelo OUI (aguarda decisão de licença do usuário) e o `add-arp` do DHCP (parte c).
+**Janela (parte b):** IP › ARP, item próprio no menu como no MikroTik (IP › Neighbors continua
+sendo a descoberta LLDP/MNDP), com as abas ARP (IPv4), ND (IPv6) e Settings; IPv6 › Neighbors
+abre a lista ND. O nome do host vem do selo de identidade (G0.25: concessão DHCP, depois PTR das
+zonas locais), como OPNsense e pfSense fazem.
+
+**O que ficou para depois:** o fabricante pelo OUI (aguarda decisão de licença do usuário) e o
+`add-arp` do DHCP (parte c).
 
 ## Desempenho e paralelismo
 

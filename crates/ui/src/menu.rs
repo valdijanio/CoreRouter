@@ -68,6 +68,7 @@ const DNS: Option<&str> = Some("DNS");
 pub(crate) const CATALOG: &[Entry] = &[
     e("addresses", None, None, icons::MAP_PIN, "/ip address", &["ip.address"], &["ip address", "ipv4", "endereço", "endereco", "gateway", "subnet"]),
     e("analytics", None, None, icons::DATABASE, "", &["system.analytics"], &["clickhouse", "grafana", "export", "exportar", "métricas", "metrics", "logs", "histórico", "long term", "longo prazo", "timeseries", "netflow"]),
+    e("arp", None, None, icons::SHARE_NETWORK, "/ip arp", &["ip.arp"], &["neighbors", "vizinhos", "neighbor table", "tabela arp", "mac", "ndp", "nd", "ipv6 neighbor", "show ip arp", "arp cache", "proxy-arp", "reply-only", "arping", "arp ping", "flush"]),
     e("bandwidth", None, None, icons::GAUGE, "/tool bandwidth-test", &["tool.bandwidth-test", "tool.bandwidth-server"], &["iperf", "iperf3", "btest", "speed test", "teste de velocidade", "throughput", "vazão", "banda", "bandwidth server"]),
     e("bgp", None, None, icons::GLOBE_HEMISPHERE_WEST, "/routing bgp", &["routing.bgp"], &["peer", "asn", "ebgp", "ibgp", "transit", "trânsito", "upstream", "neighbor", "vizinho", "connection", "template", "peer-group", "session", "sessão"]),
     e("bonding", None, None, icons::LINK, "/interface bonding", &["interface.bonding"], &["lacp", "802.3ad", "bond", "link aggregation", "agregação"]),
@@ -95,6 +96,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("interfaces", None, None, icons::PLUGS, "/interface", &["interface.print", "interface.set", "interface.ethernet", "interface.vlan", "interface.bridge"], &["ethernet", "porta", "port", "vlan", "bridge", "mtu", "link"]),
     e("ip-calc", None, None, icons::SQUARES_FOUR, "/tool ip-calc", &["tool.ip-calc"], &["subnet", "sub-rede", "calculadora", "calculator", "cidr", "máscara", "mask", "wildcard", "broadcast", "summarize", "sumarizar", "supernet", "pd", "prefix delegation", "cgnat planner", "planejar cgnat"]),
     e("ip-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ip pool", &["ip.pool"], &["faixa", "range", "address pool", "ipv4"]),
+    e("ipv6-neighbors", None, Some("Neighbors"), icons::SHARE_NETWORK, "/ipv6 neighbor", &["ipv6.neighbor"], &["nd", "ndp", "vizinhos ipv6", "neighbor discovery", "show ipv6 neighbors", "ndisc"]),
     e("ipv6-pool", DHCP, Some("Pool"), icons::STACK_SIMPLE, "/ipv6 pool", &["ipv6.pool"], &["prefix", "prefixo", "prefix delegation"]),
     e("ipv6-settings", None, Some("Settings"), icons::GEAR_SIX, "/ipv6 settings", &["ipv6.settings"], &["forward", "ra", "accept router advertisements", "slaac"]),
     e("log", None, None, icons::SCROLL, "/log", &["log"], &["eventos", "messages", "mensagens"]),

@@ -110,6 +110,9 @@ pub struct NeighTable {
     /// What feeds it (`netlink`, `lab`), and changes it lost.
     pub source: &'static str,
     pub lost: u64,
+    /// The latest time a change was applied with (the feeding thread's
+    /// clock): a list never reads the table as older than its rows.
+    pub clock: u64,
     alerts: VecDeque<Alert>,
     /// The previous MAC of each address that changed (flip-flop check).
     before: HashMap<(u16, IpAddr), [u8; 6]>,
@@ -164,6 +167,7 @@ impl NeighTable {
 
     /// Replace everything with a dump (taken with no lock held).
     pub fn load(&mut self, dump: Vec<Neighbor>, now: u64) {
+        self.clock = self.clock.max(now);
         let old: HashMap<(u16, IpAddr), Row> = self
             .rows
             .drain(..)
@@ -218,6 +222,7 @@ impl NeighTable {
 
     /// Apply changes from the platform, O(1) each.
     pub fn apply(&mut self, events: &[NeighEvent], now: u64) {
+        self.clock = self.clock.max(now);
         for e in events {
             match e {
                 NeighEvent::Upsert(n) => self.upsert(n, now),
@@ -344,6 +349,12 @@ impl crate::Session {
         &mut self,
     ) -> std::result::Result<Box<dyn corerouter_hal::neigh::NeighborFeed>, String> {
         self.hal_mut().neighbor_feed().map_err(|e| e.to_string())
+    }
+
+    /// The clock the table's times are read against (`ip.arp.list`
+    /// subtracts them from it): the platform's, the lab's own.
+    pub fn neigh_clock(&self) -> Option<u64> {
+        self.now()
     }
 
     /// The kernel's ceiling of each table (`gc_thresh3`, IPv4 and IPv6).
