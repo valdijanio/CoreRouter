@@ -1298,6 +1298,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "corerouter-hal-frr"
+version = "0.1.0"
+dependencies = [
+ "corerouter-hal",
+ "corerouter-model",
+ "corerouter-proto-bgp",
+ "criterion",
+ "log",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "corerouter-hal-linux"
 version = "0.1.0"
 dependencies = [

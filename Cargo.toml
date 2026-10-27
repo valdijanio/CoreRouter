@@ -19,6 +19,7 @@ corerouter-buildinfo = { path = "crates/buildinfo" }
 corerouter-cgnat-map = { path = "crates/cgnat-map" }
 corerouter-hal = { path = "crates/hal" }
 corerouter-hal-linux = { path = "crates/hal-linux" }
+corerouter-hal-frr = { path = "crates/hal-frr" }
 corerouter-firewall = { path = "crates/firewall" }
 corerouter-proto-bgp = { path = "crates/proto-bgp" }
 corerouter-proto-ospf = { path = "crates/proto-ospf" }
