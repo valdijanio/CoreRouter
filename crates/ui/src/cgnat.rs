@@ -54,6 +54,8 @@ pub(crate) enum Tab {
     Blocks,
     Alerts,
     Capacity,
+    /// G4.4j: where the NAT log goes (IPFIX collectors).
+    Logging,
     History,
 }
 
@@ -168,6 +170,7 @@ pub(crate) struct Cgnat {
     pub(crate) history: Vec<Value>,
     pub(crate) who: WhoWas,
     pub(crate) capacity: CapacityView,
+    pub(crate) logging: crate::cgnat_logging::Logging,
     pools_t: TableState,
     exceptions_t: TableState,
     mapping_t: TableState,
@@ -1092,6 +1095,7 @@ impl PanelState for Cgnat {
                 }
             }
             Tab::History => out.push(q("history", "ip.firewall.cgnat.history.list", json!({}))),
+            Tab::Logging => out.extend(self.logging.queries(app)),
             _ => {}
         }
         out
@@ -1102,6 +1106,10 @@ impl PanelState for Cgnat {
             if let Some((_, m)) = self.modal.as_mut() {
                 m.arrived(value);
             }
+            return;
+        }
+        if key.starts_with("log_") {
+            self.logging.arrived(key, value);
             return;
         }
         match (key, value) {
@@ -1138,6 +1146,7 @@ impl PanelState for Cgnat {
                 (Tab::Blocks, "Blocks"),
                 (Tab::Alerts, "Alerts"),
                 (Tab::Capacity, "Capacity"),
+                (Tab::Logging, "Logging"),
                 (Tab::History, "History"),
             ] {
                 if tab == Tab::Blocks && !has_blocks {
@@ -1158,6 +1167,11 @@ impl PanelState for Cgnat {
             Tab::Blocks => self.blocks_tab(ui, l),
             Tab::Alerts => self.alerts_tab(app, ui, l),
             Tab::Capacity => self.capacity_tab(app, ui, l),
+            Tab::Logging => {
+                let mut help = self.help.take();
+                self.logging.show(app, ui, l, &mut help);
+                self.help = help;
+            }
             Tab::History => self.history_tab(ui, l),
         }
     }
@@ -1222,6 +1236,7 @@ impl PanelState for Cgnat {
             (BLOCKS, &self.blocks_t),
             (ALERTS, &self.alerts_t),
             (HISTORY, &self.history_t),
+            self.logging.table(),
         ]
     }
 
@@ -1233,6 +1248,7 @@ impl PanelState for Cgnat {
             (BLOCKS, &mut self.blocks_t),
             (ALERTS, &mut self.alerts_t),
             (HISTORY, &mut self.history_t),
+            self.logging.table_mut(),
         ]
     }
 }

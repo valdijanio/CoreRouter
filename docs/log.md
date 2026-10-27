@@ -5437,3 +5437,93 @@ continuação indentadas).
   - lock segurado: 5,6 ms;
   - consulta: 4,1 ms;
   - picos: 2,8 MiB.
+
+- 2026-10-27 — G1.26h: Tuning › Boot na imagem A/B. `system.tuning.boot.apply {confirm?, timeout?, reboot?, drill?}`
+  põe na fila a cópia da imagem em uso para o slot inativo (kernel + rootfs conferidos contra o
+  manifesto assinado; pulada quando o slot já tem a mesma imagem) e grava os parâmetros de
+  `system.tuning.boot` na linha de comando da entrada UEFI desse slot, que boota em teste. A linha
+  do slot em uso não muda; um parâmetro que impede o boot (pânico, `panic=10` sempre por último)
+  volta sozinho ao slot anterior. `drill=true` acrescenta um `init=` que não existe: prova a volta
+  numa caixa real. `system.tuning.boot.parameter.print` traz `image_ab`, o motivo quando não há, e
+  `slots` (os parâmetros de cada slot); a aba Boot mostra os dois slots e o botão "Apply on slot X
+  and reboot". Uma atualização (System › Packages) também leva os parâmetros ao slot novo.
+
+  Como testar: `cargo xtask os ab-test --scenario bad-param` (QEMU: `intel_idle.max_cstate=1` +
+  drill, o kernel de B entra em pânico e A volta em 11,6 s, **medido**); clonar o slot: 39 ms de
+  gravação e 13 ms de conferência.
+
+- 2026-10-27 — G1.6b: Imagem A/B e atualização segura. Cada slot boota pela sua entrada UEFI (`Boot####` com
+  `dm-mod.create`: raiz por dm-verity, sem initramfs); o teste é um `BootNext` (o firmware o apaga
+  ao usar: qualquer falha volta ao slot confirmado); confirmar reescreve o `BootOrder`. Pacote
+  `.crpkg` com manifesto assinado (Ed25519; a imagem só leva a chave pública, a privada fica fora
+  do repositório, `os/out/keys/` em desenvolvimento), gravado em fluxo com SHA-256 no caminho e
+  relido do disco com a árvore do verity recalculada. A configuração é copiada (com o
+  `format_version`) antes da troca e volta sozinha num teste que falha; um downgrade boota a cópia
+  do slot antigo. Comandos `system.package.print/update/downgrade/confirm/cancel/check/scrub`
+  (confirmação `auto`: daemon de pé há 10 s e as interfaces de gerência rodando; `manual`: pelo
+  operador, prazo de 30 a 3600 s). Janela System › Packages. Laboratório virtual com o mesmo
+  código (`--backend virtual --config-dir`). ESP passou de 32 para 128 MiB (dois kernels).
+  `docs/os-image.md` ("A/B e atualização segura"), `docs/architecture.md` §1.1.2.
+
+  Como testar: `cargo xtask os build && cargo xtask os ab-test` (QEMU como usuário, OVMF): A→B
+  confirmado; B que não confirma volta para A com a config; pacote de chave desconhecida e pacote
+  adulterado recusados; parâmetro de boot que impede o boot volta sozinho. 4 cenários, 13 boots,
+  94,5 s (**medido**, KVM). `cargo test -p corerouter-sysupdate` faz o ciclo inteiro em diretório.
+
+  Números (**medidos**, KVM, 2026-10-27): pacote 34,1 MiB; gravar 36–53 ms; reler e conferir
+  12–17 ms; `update` inteiro 115–143 ms; daemon pronto 0,70–0,73 s depois do kernel com verity
+  (0,72 s sem); teste confirmado 14,5 s depois da partida do QEMU (10 s de carência).
+
+- 2026-10-27 — G2.8: Firewall por nfnetlink, sem o programa `nft`. O mesmo `build` do texto de "Ver regras" monta
+  `program::Table` (expressões da VM do nf_tables em `corerouter_firewall::bytecode`, byte a byte
+  iguais às do `nft --debug=mnl`), e o `hal-linux` (`firewall.rs`) aplica num lote atômico:
+
+  - **commit por diferença:** lê os handles do kernel (`nft_read.rs`), confere que a tabela é a que
+    carregamos e manda só as regras que saíram/entraram (diff de Myers por chain, `NEWRULE` com
+    posição), elementos, chains e sets que mudaram; regra igual mantém handle e contadores;
+    tabela mexida por outro → troca inteira, com as entradas dinâmicas relidas e recolocadas;
+  - **entradas dinâmicas** (`address-list.add timeout=…` e `address_list_dynamic_many`): um lote de
+    `NEWSETELEM`/`DELSETELEM`; sobreposição recusada pelo kernel → o set é lido, mesclado e
+    reescrito num lote;
+  - **leitura** (`nft_read.rs`): chains, sets, elementos e regras decodificados de volta para
+    `program`; substitui o `nft -j`, e a imagem perde o jansson;
+  - listas de portas viraram sets nomeados compartilhados (`ports_22_80_443`) e `ct state {a, b}`
+    virou máscara (`ct state a,b`): um set anônimo por regra custava ao kernel O(sets) cada;
+  - `nfnl.rs`: ACK só na última mensagem do lote (um ACK por mensagem estourava o buffer com
+    milhares de mensagens: ENOBUFS), sets anônimos com nome explícito, ordem de atributos do nft.
+
+  Testes: `cargo test -p corerouter-firewall` (vetores do bytecode), `cargo test -p
+  corerouter-hal-linux --lib firewall_messages` (20 mensagens iguais às do nft), e em netns
+  (`cargo xtask netns`): `netns_fw_nfnl.rs` carrega a mesma config pelo `nft -f` e por nós e compara
+  o que o kernel guarda e o `nft list`; commit por diferença preserva handles; 1 000 entradas
+  dinâmicas, sobreposição, IPv6; proptest de regras aleatórias (render → nfnetlink → leitura →
+  igual, e igual ao que o nft carrega).
+
+  Números (**medido**, abaixo): 10 000 regras carregam em 112 ms (antes 4,09 s), mudar uma em
+  109 ms (antes 6,91 s), 100 000 entradas dinâmicas em 116 ms (antes um processo `nft` por entrada:
+  2,4 s por 1 000; num script só, nem cabia no buffer).
+
+- 2026-10-27 — G3.2a: BGP, parte 1 (`docs/bgp.md`). Templates (`routing.bgp.template.*`) e conexões
+  (`routing.bgp.connection.*`) no modelo do RouterOS v7, com herança de vários templates (laço e
+  template inexistente recusados), AS de 4 bytes, `local.role` com os papéis da RFC 9234,
+  multihop, hold/keepalive (RFC 4271 §4.2/§10), chave TCP MD5 selada (nunca em config, journal,
+  logs ou MCP), max-prefix por família com ação (`shutdown`, `warning`, `restart`), `afi`
+  IPv4/IPv6, local address e nexthop-choice. Validação: AS reservado (0, 23456, 65535,
+  4294967295), conexão sem família, template inexistente, laço de herança, iBGP com AS de fora,
+  endereço repetido. `routing.bgp.session.list` traz o nome da conexão, os timers negociados, o
+  último erro, as quedas, o BFD, as famílias e as políticas; `routing.bgp.session.refresh`,
+  `resend` e `clear` agem na sessão. O render vai ao FRR pelo `hal-frr` só com a diferença: o diff
+  agora define um vizinho novo antes das linhas dele nas famílias e remove um vizinho com um
+  comando só. Janela Routing › BGP com as abas Sessions (detalhe e ações), Connections, Templates
+  e Instances, no padrão de lista G0.24, com ⓘ em português.
+
+  Como testar: `cargo test -p corerouter-proto-bgp -p corerouter-hal-frr -p corerouter-model`,
+  `cargo test -p corerouter-engine routing_bgp`, `cargo test -p corerouter-ui bgp`; com FRR real,
+  `cargo xtask vm-lab run -- scripts/frr-live.sh` (dois pares: eBGP e iBGP com MD5 e 20
+  prefixos). Na GUI: Routing › BGP.
+
+  Números (**medido**, 2026-10-27): no FRR 10.7.1 real da VM (8 vCPUs, nosso lado em debug),
+  1 000 conexões aplicadas em 329 ms (5 006 comandos), uma mudada entre 1 000 em 28 ms (3
+  comandos), todas removidas em 197 ms, leitura de 1 000 sessões em 135 ms fora do lock. No
+  engine (release, criterion), mudar uma conexão entre 1 000 passou de 8,1 ms para 1,5 ms por
+  commit com a seção `routing` em `CowArc` e o delta do histórico por conexão.

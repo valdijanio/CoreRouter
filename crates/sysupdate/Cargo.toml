@@ -1,0 +1,28 @@
+[package]
+name = "corerouter-sysupdate"
+description = "L1: the A/B system image (G1.6b) — signed package, dm-verity tree, UEFI boot entries, trial boot and confirmation"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+# SHA-256 (SHA-NI/AVX2 assembly) and Ed25519, already in the image for TLS.
+ring.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "mount", "process"] }
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "sysupdate"
+harness = false
+
+[lints]
+workspace = true

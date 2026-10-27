@@ -93,6 +93,12 @@ const FIELDS: &[Field] = &[
     Field { param: "src_address", label: "Src. Address", help: "traffic-flow.target.src_address", input: Input::Text("route's address"), edit: true },
     Field { param: "template_refresh", label: "Template Refresh", help: "traffic-flow.target.template_refresh", input: Input::Text("20"), edit: true },
     Field { param: "template_timeout", label: "Template Timeout", help: "traffic-flow.target.template_timeout", input: Input::Text("600"), edit: true },
+    Field { param: "content", label: "Content", help: "traffic-flow.target.content", input: Input::Choice, edit: true },
+    Field { param: "nat_events_legacy", label: "Legacy NAT Events", help: "traffic-flow.target.nat_events_legacy", input: Input::Check, edit: true },
+    Field { param: "server_name", label: "Server Name", help: "traffic-flow.target.server_name", input: Input::Text("collector address"), edit: true },
+    Field { param: "certificate", label: "Certificate", help: "traffic-flow.target.certificate", input: Input::Text("-----BEGIN CERTIFICATE-----"), edit: true },
+    Field { param: "private_key", label: "Private Key", help: "traffic-flow.target.private_key", input: Input::Secret("-----BEGIN PRIVATE KEY-----"), edit: true },
+    Field { param: "ca_certificate", label: "CA Certificate", help: "traffic-flow.target.ca_certificate", input: Input::Text("public roots"), edit: true },
     Field { param: "comment", label: "Comment", help: "", input: Input::Text(""), edit: true },
 ];
 
@@ -115,8 +121,11 @@ pub(crate) struct Form {
     pub active_flow_timeout: String,
     pub inactive_flow_timeout: String,
     pub sampling_interval: String,
+    pub flows: bool,
     pub nat_events: bool,
     pub nat_events_destination: bool,
+    pub nat_port_blocks: bool,
+    pub nat_limits: bool,
     pub retention_hours: String,
     pub retention_records: String,
 }
@@ -157,8 +166,11 @@ impl Form {
             active_flow_timeout: text(v, "active_flow_timeout"),
             inactive_flow_timeout: text(v, "inactive_flow_timeout"),
             sampling_interval: text(v, "sampling_interval"),
+            flows: flag(v, "flows"),
             nat_events: flag(v, "nat_events"),
             nat_events_destination: flag(v, "nat_events_destination"),
+            nat_port_blocks: flag(v, "nat_port_blocks"),
+            nat_limits: flag(v, "nat_limits"),
             retention_hours: text(v, "retention_hours"),
             retention_records: text(v, "retention_records"),
         }
@@ -191,8 +203,11 @@ impl Form {
         let mut p = Map::new();
         for (k, now, was) in [
             ("enabled", self.enabled, base.enabled),
+            ("flows", self.flows, base.flows),
             ("nat_events", self.nat_events, base.nat_events),
             ("nat_events_destination", self.nat_events_destination, base.nat_events_destination),
+            ("nat_port_blocks", self.nat_port_blocks, base.nat_port_blocks),
+            ("nat_limits", self.nat_limits, base.nat_limits),
         ] {
             if now != was {
                 p.insert(k.into(), json!(now));
@@ -397,6 +412,15 @@ impl TrafficFlowPanel {
                 });
                 ui.end_row();
             }
+            label(ui, &mut help, l, "flows", "Flow Records");
+            ui.checkbox(&mut self.form.flows, tr(l, "one per connection and direction"));
+            ui.end_row();
+            label(ui, &mut help, l, "nat_port_blocks", "NAT Port Blocks");
+            ui.checkbox(&mut self.form.nat_port_blocks, tr(l, "CGNAT block allocated/released (natEvent 16/17)"));
+            ui.end_row();
+            label(ui, &mut help, l, "nat_limits", "NAT Limits");
+            ui.checkbox(&mut self.form.nat_limits, tr(l, "pool exhausted, quota, threshold (natEvent 3/13/18)"));
+            ui.end_row();
             label(ui, &mut help, l, "nat_events", "NAT Events");
             ui.checkbox(&mut self.form.nat_events, tr(l, "RFC 8158 session create/delete"));
             ui.end_row();
@@ -497,7 +521,31 @@ impl TrafficFlowPanel {
     }
 
     fn values(t: &Value) -> BTreeMap<&'static str, String> {
-        FIELDS.iter().map(|f| (f.param, text(t, f.param))).collect()
+        FIELDS
+            .iter()
+            .map(|f| {
+                let v = match f.input {
+                    Input::Check => if flag(t, f.param) { "yes" } else { "no" }.to_owned(),
+                    // Write-only: empty keeps it.
+                    Input::Secret(_) => String::new(),
+                    _ => text(t, f.param),
+                };
+                (f.param, v)
+            })
+            .collect()
+    }
+
+    /// A new collector for the CGNAT's NAT log (CGNAT › Logging, G4.4j):
+    /// the Targets tab with the modal filled for IPFIX over TLS, NAT only.
+    pub(crate) fn add_nat_target(&mut self, app: &mut CoreRouterUi) {
+        self.tab = Tab::Targets;
+        let mut v: BTreeMap<&'static str, String> = FIELDS.iter().map(|f| (f.param, String::new())).collect();
+        v.insert("version", "ipfix".to_owned());
+        v.insert("transport", "tls".to_owned());
+        v.insert("port", "4740".to_owned());
+        v.insert("content", "nat".to_owned());
+        v.insert("nat_events_legacy", "no".to_owned());
+        self.modal = Some(Modal::open(app, None, v));
     }
 
     fn act(&mut self, app: &mut CoreRouterUi, a: Act, rows: &[Row], ui: &Ui) {
@@ -507,6 +555,8 @@ impl TrafficFlowPanel {
                 let mut v = BTreeMap::new();
                 v.insert("version", "ipfix".to_owned());
                 v.insert("transport", "udp".to_owned());
+                v.insert("content", "all".to_owned());
+                v.insert("nat_events_legacy", "no".to_owned());
                 self.modal = Some(Modal::open(app, None, v));
                 return;
             }
@@ -736,7 +786,8 @@ impl PanelState for TrafficFlowPanel {
         let options = |p: &str| -> Vec<String> {
             match p {
                 "version" => vec!["ipfix".into(), "9".into()],
-                "transport" => vec!["udp".into(), "tcp".into()],
+                "transport" => vec!["udp".into(), "tcp".into(), "sctp".into(), "tls".into()],
+                "content" => vec!["all".into(), "nat".into(), "flows".into()],
                 _ => Vec::new(),
             }
         };

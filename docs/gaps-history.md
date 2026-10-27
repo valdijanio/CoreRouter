@@ -180,3 +180,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-27 — G1.6 dividido em G1.6a (imagem que boota), G1.6b (A/B e atualização segura) e G1.6c (instalador e imagens de VM); G1.6a feito; G1.6d nova (configuração padrão de primeiro boot)
 - 2026-10-27 — G2.1c feito (diagnóstico do firewall + tabela raw)
 - 2026-10-27 — G2.7 ganhou a aba Capacity (G2.7b) no mesmo trabalho, a pedido do usuário
+- 2026-10-27 — G1.26h feito (parâmetros de boot no slot inativo, com volta automática)
+- 2026-10-27 — G1.6b feito (imagem A/B, pacote assinado, dm-verity, atualização com teste de boot e volta automática)
+- 2026-10-27 — G2.8 feito (firewall por nfnetlink)
+- 2026-10-27 — G3.2 dividido em G3.2a (BGP base), G3.2b (políticas) e G3.2c (RPKI e "Por que essa rota?"); G3.2a feito

@@ -12,6 +12,9 @@ repository.workspace = true
 rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "mount", "process", "system"] }
 signal-hook.workspace = true
 netlink-sys = { version = "0.9.0", default-features = false }
+# G1.6b: the trial boot of the A/B image (state, boot variables).
+corerouter-sysupdate.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true

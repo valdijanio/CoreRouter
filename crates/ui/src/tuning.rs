@@ -17,7 +17,7 @@ use egui::{
 use serde_json::{Value, json};
 
 use crate::backend::RequestId;
-use crate::chip::{AMBER, BLUE, RED, chip, neutral_tone};
+use crate::chip::{AMBER, BLUE, GREEN, RED, chip, neutral_tone};
 use crate::help::{self, HelpView};
 use crate::i18n::{self, Lang, tr};
 use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
@@ -366,6 +366,8 @@ pub(crate) struct TuningPanel {
     /// confirmation `mitigations=off` asks for.
     pub(crate) boot_print: Option<Value>,
     pub(crate) boot_confirm: bool,
+    /// G1.26h: "Apply on slot X and reboot" waits for a second click.
+    pub(crate) boot_apply_ask: bool,
 }
 
 impl TuningPanel {
@@ -1266,7 +1268,7 @@ impl TuningPanel {
             } else {
                 tr(
                     l,
-                    "Valid from the next boot. The A/B image does not exist yet (G1.6): the parameters are saved in the config and wait for it (G1.26h).",
+                    "Valid from the next boot. Without the A/B image (here: not available) the parameters are saved in the config and wait for it.",
                 )
             });
             if help::info_button(ui, Id::unique("tuning-boot-help"), tr(l, "Boot")).clicked() {
@@ -1284,6 +1286,7 @@ impl TuningPanel {
                 ui.label(RichText::new(text("next_cmdline")).monospace().strong());
                 ui.end_row();
             });
+        self.boot_slots(app, ui, &data);
         ui.add_space(6.0);
         let rows: Vec<Value> = data
             .get("params")
@@ -1403,6 +1406,82 @@ impl TuningPanel {
             self.help = Some(view);
         }
         self.boot_editor(app, ui, &rows);
+    }
+
+    /// G1.26h: what each A/B slot boots with, and the button that writes
+    /// the configured parameters to the inactive one (the running slot's
+    /// command line never changes; a parameter that does not boot falls
+    /// back to it).
+    fn boot_slots(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, data: &Value) {
+        let l = app.lang.labels;
+        let ab = data.get("image_ab").and_then(Value::as_bool) == Some(true);
+        let slots: Vec<Value> = data.get("slots").and_then(Value::as_array).cloned().unwrap_or_default();
+        if !ab || slots.is_empty() {
+            if let Some(why) = data.get("image_ab_reason").and_then(Value::as_str) {
+                ui.weak(why);
+            }
+            return;
+        }
+        let v = ui.visuals().clone();
+        let mut inactive = String::new();
+        Grid::new("tuning-boot-slots").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            for sl in &slots {
+                let name = sl.get("slot").and_then(Value::as_str).unwrap_or("").to_uppercase();
+                let running = sl.get("running") == Some(&Value::Bool(true));
+                if !running {
+                    inactive = name.clone();
+                }
+                ui.horizontal(|ui| {
+                    chip(ui, &format!("{} {name}", tr(l, "Slot")), BLUE.tone(&v));
+                    if running {
+                        chip(ui, tr(l, "running"), GREEN.tone(&v));
+                    }
+                    if sl.get("next") == Some(&Value::Bool(true)) {
+                        chip(ui, tr(l, "next boot"), AMBER.tone(&v));
+                    }
+                });
+                let params: Vec<String> = sl
+                    .get("params")
+                    .and_then(Value::as_object)
+                    .map(|m| m.iter().map(|(k, x)| format!("{k}={}", x.as_str().unwrap_or(""))).collect())
+                    .unwrap_or_default();
+                if sl.get("has_entry") != Some(&Value::Bool(true)) {
+                    ui.weak(tr(l, "no image"));
+                } else if params.is_empty() {
+                    ui.weak(tr(l, "no tuning parameters"));
+                } else {
+                    ui.label(RichText::new(params.join(" ")).monospace());
+                }
+                ui.end_row();
+            }
+        });
+        let can = app.can().check("system.tuning.boot.apply");
+        ui.horizontal_wrapped(|ui| {
+            if self.boot_apply_ask {
+                ui.colored_label(
+                    ui.visuals().warn_fg_color,
+                    format!(
+                        "{} {inactive}: {}",
+                        tr(l, "Copies the running image to slot"),
+                        tr(l, "the router reboots into it on trial and comes back by itself if it does not confirm.")
+                    ),
+                );
+                if ui.button(tr(l, "Cancel")).clicked() {
+                    self.boot_apply_ask = false;
+                }
+                if ui.button(RichText::new(tr(l, "Reboot now")).strong()).clicked() {
+                    self.boot_apply_ask = false;
+                    self.waiting += 1;
+                    app.run_then(
+                        "system.tuning.boot.apply",
+                        serde_json::json!({}),
+                        crate::panel::then(NAME, Reply::Changed),
+                    );
+                }
+            } else if crate::table::action(ui, &format!("{} {inactive} {}", tr(l, "Apply on slot"), tr(l, "and reboot")), can) {
+                self.boot_apply_ask = true;
+            }
+        });
     }
 
     fn boot_editor(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, rows: &[Value]) {

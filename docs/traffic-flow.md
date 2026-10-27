@@ -1,10 +1,10 @@
-# Traffic Flow (G4.4b): IPFIX e NetFlow v9
+# Traffic Flow (G4.4b, G4.4j): IPFIX e NetFlow v9
 
 Exportação de fluxos como o `/ip traffic-flow` do RouterOS. Cada conexão que o kernel rastreia
 (conntrack) vira registros de fluxo, por sentido, com os endereços e portas **antes e depois do
-NAT**. Saem também os eventos de NAT da RFC 8158: a sessão NAT44 criada e encerrada e, no CGNAT em
-blocos (G2.3c), o bloco de portas alocado e liberado. Os destinos são até 16 coletores, em IPFIX
-(UDP ou TCP) ou NetFlow v9 (UDP). O roteador guarda os fluxos recentes para os top talkers, para o
+NAT**. Saem também os eventos de NAT da RFC 8158: a sessão NAT44 criada e encerrada e, do CGNAT
+(G4.4j), o bloco de portas alocado e liberado e os limites (pool esgotado, assinante sem portas,
+alerta). Os destinos são até 16 coletores, em IPFIX (UDP, TCP, SCTP ou TLS) ou NetFlow v9 (UDP). O roteador guarda os fluxos recentes para os top talkers, para o
 CSV e para outro exportador ler em lote.
 
 ## Como funciona
@@ -15,9 +15,10 @@ kernel: conntrack ──(ctnetlink NEW/DESTROY, multicast)──► leitor ─�
                                                               ▼            ▼
                                          medidor (proto-flow): fluxos + eventos NAT
                                                               │
-                     log do roteador (ALLOC/RELEASE do PBA) ──┤
+           CGNAT (blocos, limites) ──► fila do engine ┤ (262 144, descarte contado)
                                                               ▼
-                      um codificador por destino (IPFIX/v9, templates) ──► UDP / TCP
+                      um codificador por destino (IPFIX/v9, templates) ──► UDP (na hora)
+                                                              └──► fila por destino ──► thread tf-send-<id> ──► TCP / SCTP / TLS
                                                               │
                                     armazenamento local (24 h, teto) ──► top, CSV, records
 ```
@@ -32,13 +33,24 @@ kernel: conntrack ──(ctnetlink NEW/DESTROY, multicast)──► leitor ─�
 - **NAT:** o fluxo do iniciador leva `src → dst` e, depois do NAT, `post_src`/`post_src_port` (a
   tupla de resposta invertida). O fluxo de volta leva o destino público e o assinante em
   `post_dst`.
-- **Eventos NAT44 (RFC 8158 §4.2):** `natEvent` 4 (create) e 5 (delete), com o tempo em
+- **Eventos NAT44 (RFC 8158 §4.6.1):** `natEvent` 4 (create) e 5 (delete), com o tempo em
   `observationTimeMilliseconds`. O delete leva também o início da sessão (`flowStartMilliseconds`,
   campo que a RFC permite acrescentar). Assim ele sozinho é o registro completo, mesmo quando o
-  create se perdeu num estouro do kernel. **Sem destino por padrão** (veja "Marco Civil").
-- **Blocos de portas (RFC 8158 §4.2.10):** `natEvent` 16 e 17, com
-  `portRangeStart`/`End`/`StepSize`/`NumPorts`, lidos das linhas `ALLOC`/`RELEASE` do CGNAT em
-  blocos.
+  create se perdeu num estouro do kernel. **Desligados por padrão** desde o G4.4j (`nat_events`,
+  como o `nat-events=no` do RouterOS) e **sem destino por padrão** (veja "Marco Civil").
+- **Blocos de portas (RFC 8158 §4.6.10, `nat_port_blocks`):** `natEvent` 16 e 17, com
+  `portRangeStart`/`End`/`StepSize`/`NumPorts`, `natPoolId`, `vlanId` e `userName` (o login
+  PPPoE/IPoE; variável no IPFIX, RFC 7011 §7; 32 bytes no v9). Vêm do alocador do CGNAT por uma fila
+  do engine, não mais do log do roteador.
+- **Limites do CGNAT (`nat_limits`):** `natEvent` 3 (pool sem bloco, §4.6.5), 13 com
+  `natQuotaExceededEvent` 3 e `maxEntriesPerUser` (assinante sem portas, §4.6.7.3) e 18 com
+  `natThresholdEvent` 4 e `addressPortMappingPerUserHighThreshold` (alerta de portas, §4.6.8.3; a
+  tabela 18 da RFC cita o IE 478, a §6 registrou o 480 para o caso por usuário). Um por minuto por
+  pool ou assinante (§5.2). Detalhes em `docs/cgnat.md` §1.11.
+- **Legado por destino (`nat_events_legacy`):** as sessões saem com `natEvent` 1/2 (Historic,
+  §4.3) para coletores feitos para o ipt-netflow, Juniper e F5 antigos; blocos e limites não mudam.
+- **O que cada destino recebe (`content`):** `all`, `nat` (o servidor de log do Marco Civil) ou
+  `flows` (um analisador). Com `flows=no` e sem sessões, nem a tabela do kernel é lida.
 - **Amostragem:** com `sampling_interval=N`, uma conexão em N gera fluxos. A escolha é
   determinística, por um hash da tupla. Um registro de opções avisa o coletor
   (`samplingInterval`). Os eventos de NAT nunca são amostrados.
@@ -51,8 +63,8 @@ kernel: conntrack ──(ctnetlink NEW/DESTROY, multicast)──► leitor ─�
 
 | Comando | O que faz |
 |---|---|
-| `ip.traffic-flow.set` / `.get` | liga, interfaces, `cache_entries`, timeouts, amostragem, `nat_events`, `nat_events_destination`, retenção local |
-| `ip.traffic-flow.target.add/set/remove/list` | coletores: `dst_address`, `port` (2055), `src_address` (um endereço do roteador), `version` 9/ipfix, `transport` udp/tcp, `template_refresh` (20 pacotes), `template_timeout` (600 s); a lista traz estado, registros/min, templates, fila e perda |
+| `ip.traffic-flow.set` / `.get` | liga, interfaces, `cache_entries`, timeouts, amostragem, `flows`, `nat_events`, `nat_events_destination`, `nat_port_blocks`, `nat_limits`, retenção local |
+| `ip.traffic-flow.target.add/set/remove/list` | coletores: `dst_address`, `port` (2055), `src_address` (um endereço do roteador, em todos os transportes), `version` 9/ipfix, `transport` udp/tcp/sctp/tls, `template_refresh` (20 pacotes), `template_timeout` (600 s), `content` all/nat/flows, `nat_events_legacy`, e no TLS `certificate`, `private_key` (secreta), `ca_certificate`, `server_name`; a lista traz estado, registros/min, templates, fila e perda |
 | `ip.traffic-flow.stats` | eventos lidos, estouros do kernel, fila e descartes, cache, contadores |
 | `ip.traffic-flow.top` | top talkers dos últimos N minutos (5 por padrão), por bytes, pacotes ou conexões |
 | `ip.traffic-flow.records` | API em lote: registros depois de `since`, até 10 mil, com `next` para continuar (o exportador de ClickHouse, G4.4f, usa este) |
@@ -122,6 +134,43 @@ Fontes lidas em 2026-10-23; o relatório completo, com as tabelas, está nas not
   - STJ, REsp 1.784.156/SP (2019) e REsp 2.170.872/SP (2025): com IPv4 compartilhado, a porta de
     origem é indispensável e o dever alcança o provedor de conexão.
 
+### G4.4j: log de NAT em IPFIX nos outros (lido em 2026-10-27)
+
+- **RFC 8158** (sem errata) §4.3–§4.6: valores de `natEvent` (Tabela 2), sub-eventos de cota e de
+  limiar (Tabelas 3 e 4), templates mínimos (Tabelas 5, 9, 13, 18, 21), §5.2 limite de taxa, §7
+  logs cifrados. Registro IANA "IPFIX Information Elements" (CSV de 2026-10-27): IEs 58, 283, 371,
+  463–481. **RFC 7011** §10.2 (SCTP), §11 (TLS/DTLS, mútuo em §11.3), errata 4396 (sequência) e
+  7875 (redução de tamanho de inteiros com sinal); sem "Updated by". A RFC 8996 aposentou o TLS 1.1
+  que a §11.1 cita.
+- **MikroTik RouterOS v7** ([Traffic Flow](https://help.mikrotik.com/docs/spaces/ROS/pages/21102653/Traffic+Flow)):
+  `nat-events` em `/ip traffic-flow ipfix`, alvo só UDP; os códigos de `natEvent` não estão
+  documentados. Nada específico de CGNAT.
+- **Juniper MX/SRX** (`services jflow-log`, [eventos e códigos](https://www.juniper.net/documentation/us/en/software/junos/flow-monitoring/topics/concept/services-logging-flowmonitoring-format-nat-events.html),
+  [diretrizes](https://www.juniper.net/documentation/us/en/software/junos/flow-monitoring/topics/concept/services-logging-flowmonitoring-format-nat-guidelines.html)):
+  sessão, BIB, endereços e portas esgotados, cota, PBA alocação/liberação/ativo, mas com a
+  numeração do draft-ietf-behave-ipfix-nat-logging-02 (1/2 sessão NAT44, 14/15/16 PBA); só UDP;
+  `message-rate-limit` (10 000/s por PIC) para os eventos de erro; destino incluído na sessão.
+- **Cisco** (IOS-XR CGN `external-logging netflow version 9`; IOS-XE BPA `ip nat log translations
+  flow-export v9`): só NetFlow v9 por UDP; o registro de bloco leva `ingressVRFID` (234), passo e
+  tamanho do bloco, sem destino.
+- **A10 ACOS** (`netflow monitor` + `record nat44 / port-batch`, [registros](https://documentation.a10networks.com/ACOS-Docs/axapi/703/netflow_monitor_record.html)):
+  v9 ou IPFIX por UDP; partição como VRF; destino nos templates de sessão.
+- **F5 BIG-IP** ([templates IPFIX de CGNAT](https://techdocs.f5.com/en-us/bigip-15-1-0/big-ip-cgnat-implementations/ipfix-templates-for-cgnat-events.html)):
+  sessão, falha, cota, PBA alocação/liberação; `natEvent` 1/2 e valores próprios (13/14 PBA);
+  UDP ou TCP e **TLS sobre TCP** por perfil SSL; `ingressVRFID`/`egressVRFID`; delete desligado por
+  padrão.
+- **ipt-netflow** ([aabc/ipt-netflow](https://github.com/aabc/ipt-netflow)): `natevents=1`, `natEvent`
+  1/2, só UDP.
+- **Coletores:** o `tshark`/Wireshark decodifica IPFIX por UDP, TCP e SCTP (porta 4739; usado no
+  nosso teste de interoperabilidade); nProbe exporta por TLS e SCTP; pmacct tem DTLS; IPFIXcol2
+  recebe UDP e TCP.
+
+**G4.4j adotou:** os valores da RFC 8158 (não os do draft da Juniper nem os do F5), com o legado
+1/2 por destino; TLS mútuo (como o F5, e o que a RFC 8158 §7 pede) e SCTP (que nenhum roteador
+documenta para NAT); limites com limite de taxa (como a Juniper); identidade do assinante
+(`userName`, `vlanId`), que nenhum dos pesquisados documenta. Ficou de fora o `ingressVRFID`: o
+CGNAT não tem VRF por pool (gap G4.4l junto com a identidade nas sessões).
+
 **O que adotamos:**
 
 - Nomes e valores padrão do RouterOS (`template_refresh`/`template_timeout` sem o `v9_`, porque a
@@ -154,8 +203,20 @@ Fontes lidas em 2026-10-23; o relatório completo, com as tabelas, está nas not
   - O que estava sendo seguido e sumiu da tabela sai com `flowEndReason` 5 (falta de recursos).
 - **Coletor fora do ar.**
   - UDP: o socket conectado recebe o "port unreachable" e a janela mostra erro e perda.
-  - TCP: as mensagens esperam numa fila de 8 MiB e a conexão tenta de novo a cada 2 s, reenviando
-    os templates primeiro (RFC 7011 §8.1).
+  - TCP, SCTP, TLS: as mensagens esperam numa fila de 8 MiB e a conexão tenta de novo a cada 2 s,
+    numa thread por coletor (`tf-send-<id>`). Na conexão nova vão primeiro os templates, numa
+    mensagem sem dados com o número de sequência da mensagem seguinte (RFC 7011 §8.1 e §3.1,
+    errata 4396: o coletor não vê buraco); a mensagem que caiu no meio vai de novo inteira.
+- **Transportes (G4.4j).**
+  - **SCTP** (RFC 7011 §10.2, o transporte obrigatório do IPFIX): SCTP do kernel por `socket2`,
+    sem `unsafe`; uma mensagem IPFIX por mensagem SCTP, no stream 0 (§10.2.6 deixa escolher;
+    templates e dados no mesmo stream). O fim manda SHUTDOWN (§10.2.4).
+  - **TLS** (§11, porta 4740): rustls, TLS 1.2 ou 1.3 (a RFC 7011 cita o 1.1, que a RFC 8996
+    aposentou). Autenticação mútua (§11.3): o certificado do coletor confere com `ca_certificate`
+    e `server_name` (vazio: o IP do coletor), e o roteador mostra o seu. É o que a RFC 8158 §7 pede
+    para logs de NAT.
+  - **DTLS** (UDP e SCTP, §11.1) não entra: o rustls não tem DTLS e não há implementação madura em
+    Rust puro; o TLS sobre TCP cobre a confidencialidade. Gap G4.4k.
 - **Vazamento.** Só os destinos habilitados da config que está rodando têm socket. Um destino
   removido ou desligado perde o socket e a fila no tick seguinte. O teste em netns confere que ele
   não recebe mais nada. Não há nomes DNS, só endereços.
@@ -167,8 +228,8 @@ Fontes lidas em 2026-10-23; o relatório completo, com as tabelas, está nas not
 - Um user namespace recusa o `SO_RCVBUFFORCE`, e o buffer fica no `rmem_max` (8 MiB neste
   computador). Na rajada de 100 mil conexões abertas em 0,35 s, o kernel perdeu 18 % dos `NEW`.
   Os deletes e os fluxos chegaram todos. No roteador o daemon é root e pede 32 MiB.
-- SCTP e TLS/DTLS para IPFIX ficam para depois, assim como sFlow v5, a escolha de `natEvent` 1/2
-  para coletores antigos e a fonte XDP (gaps no arquivo de mudança).
+- SCTP, TLS e `natEvent` 1/2 entraram no G4.4j. DTLS fica no G4.4k; sFlow v5 e a fonte XDP no
+  G4.4i; a identidade (login, VLAN) nos eventos de sessão no G4.4l.
 
 ## Desempenho (**medido**)
 

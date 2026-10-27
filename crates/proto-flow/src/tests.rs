@@ -185,8 +185,12 @@ fn exporter(v: Version) -> Exporter {
         stream: false,
         boot_ms: 1_699_999_000_000,
         nat_destination: true,
+        legacy_nat: false,
     })
 }
+
+/// Templates and options templates of one full set.
+const TEMPLATES: usize = 10;
 
 fn sample_records() -> Vec<Record> {
     let mut v6 = flow(1);
@@ -221,6 +225,33 @@ fn sample_records() -> Vec<Record> {
             port_end: 3071,
             step: 1,
             ports: 1024,
+            user: "joão.silva@isp".into(),
+            vlan: 210,
+            pool: 3,
+        }),
+        Record::NatLimit(NatLimit {
+            time_ms: 1_700_000_000_600,
+            event: NatEventType::QuotaExceeded,
+            kind: quota::MAX_ENTRIES_PER_USER,
+            src: v4("100.64.0.9"),
+            pool: 3,
+            limit: 2048,
+        }),
+        Record::NatLimit(NatLimit {
+            time_ms: 1_700_000_000_700,
+            event: NatEventType::ThresholdReached,
+            kind: threshold::ADDRESS_PORT_PER_USER_HIGH,
+            src: v4("100.64.0.9"),
+            pool: 3,
+            limit: 80,
+        }),
+        Record::NatLimit(NatLimit {
+            time_ms: 1_700_000_000_800,
+            event: NatEventType::AddressesExhausted,
+            kind: 0,
+            src: Ipv4Addr::UNSPECIFIED,
+            pool: 3,
+            limit: 0,
         }),
     ]
 }
@@ -278,7 +309,7 @@ fn ipfix_sequence_counts_data_records_and_v9_counts_packets() {
             u32::try_from(i).unwrap(),
             "RFC 3954 §5.1: packets"
         );
-        let templates = if i == 0 { 7 } else { 0 };
+        let templates = if i == 0 { TEMPLATES } else { 0 };
         assert_eq!(usize::from(m.count), m.records.len() + templates);
     }
 }
@@ -294,17 +325,17 @@ fn templates_come_back_by_time_and_by_count() {
         e.encode(t, &one, &mut out);
         d.decode(&out[0]).unwrap().templates
     };
-    assert_eq!(sent(&mut e, t0), 7, "first message: every template");
+    assert_eq!(sent(&mut e, t0), TEMPLATES, "first message: every template");
     for i in 1..20 {
         assert_eq!(sent(&mut e, t0 + i), 0, "message {i}");
     }
     assert_eq!(
         sent(&mut e, t0 + 20),
-        7,
+        TEMPLATES,
         "after 20 messages (v9-template-refresh)"
     );
     assert_eq!(sent(&mut e, t0 + 30), 0);
-    assert_eq!(sent(&mut e, t0 + 600_030), 7, "after the timeout");
+    assert_eq!(sent(&mut e, t0 + 600_030), TEMPLATES, "after the timeout");
     // Nothing to send, but they are due: a message with only templates.
     let mut out = Vec::new();
     e.encode(t0 + 1_300_000, &[], &mut out);
@@ -760,4 +791,268 @@ proptest! {
         with_junk.extend_from_slice(&junk);
         let _ = d.decode(&with_junk);
     }
+}
+
+/// The element ids of template `tid` as exported.
+fn template_ids(tid: u16) -> Vec<u16> {
+    template::all(Version::Ipfix)
+        .into_iter()
+        .find(|t| t.id == tid)
+        .map(|t| t.fields.iter().map(|f| f.id).collect())
+        .unwrap()
+}
+
+/// RFC 8158 §4.6: "A NAT device that implements a given NAT event MUST
+/// support the mandatory IEs in the templates." Each table's mandatory
+/// rows (timeStamp is `observationTimeMilliseconds`, §4.2 Table 1).
+#[test]
+fn rfc_8158_templates_carry_the_mandatory_elements() {
+    let tables: [(&str, u16, &[u16]); 5] = [
+        // Table 5, without the optional destination (RFC 6888 / Marco Civil).
+        (
+            "Table 5",
+            template::NAT44_SRC,
+            &[
+                id::OBSERVATION_TIME_MILLISECONDS,
+                id::NAT_EVENT,
+                id::SOURCE_IPV4_ADDRESS,
+                id::POST_NAT_SOURCE_IPV4_ADDRESS,
+                id::PROTOCOL_IDENTIFIER,
+                id::SOURCE_TRANSPORT_PORT,
+                id::POST_NAPT_SOURCE_TRANSPORT_PORT,
+            ],
+        ),
+        (
+            "Table 9",
+            template::NAT_ADDRESSES_EXHAUSTED,
+            &[
+                id::OBSERVATION_TIME_MILLISECONDS,
+                id::NAT_EVENT,
+                id::NAT_POOL_ID,
+            ],
+        ),
+        (
+            "Table 13",
+            template::NAT_QUOTA_PER_USER,
+            &[
+                id::OBSERVATION_TIME_MILLISECONDS,
+                id::NAT_EVENT,
+                id::NAT_QUOTA_EXCEEDED_EVENT,
+                id::MAX_ENTRIES_PER_USER,
+                id::SOURCE_IPV4_ADDRESS,
+            ],
+        ),
+        (
+            "Table 18",
+            template::NAT_THRESHOLD_PER_USER,
+            &[
+                id::OBSERVATION_TIME_MILLISECONDS,
+                id::NAT_EVENT,
+                id::NAT_THRESHOLD_EVENT,
+                id::ADDRESS_PORT_MAPPING_PER_USER_HIGH_THRESHOLD,
+                id::SOURCE_IPV4_ADDRESS,
+            ],
+        ),
+        (
+            "Table 21",
+            template::PORT_BLOCK,
+            &[
+                id::OBSERVATION_TIME_MILLISECONDS,
+                id::NAT_EVENT,
+                id::SOURCE_IPV4_ADDRESS,
+                id::POST_NAT_SOURCE_IPV4_ADDRESS,
+                id::PORT_RANGE_START,
+            ],
+        ),
+    ];
+    for (table, tid, mandatory) in tables {
+        let have = template_ids(tid);
+        for ie in mandatory {
+            assert!(
+                have.contains(ie),
+                "{table}: element {ie} missing from template {tid}"
+            );
+        }
+    }
+}
+
+/// RFC 8158 §4.3 Table 2 and §4.4/§4.5 (Tables 3 and 4): the values on
+/// the wire.
+#[test]
+fn rfc_8158_event_values() {
+    let codes: Vec<u8> = [
+        NatEventType::AddressesExhausted,
+        NatEventType::Nat44SessionCreate,
+        NatEventType::Nat44SessionDelete,
+        NatEventType::QuotaExceeded,
+        NatEventType::PortBlockAllocation,
+        NatEventType::PortBlockDeallocation,
+        NatEventType::ThresholdReached,
+    ]
+    .iter()
+    .map(|e| e.code())
+    .collect();
+    assert_eq!(codes, [3, 4, 5, 13, 16, 17, 18]);
+    assert_eq!(quota::MAX_ENTRIES_PER_USER, 3);
+    assert_eq!(threshold::ADDRESS_PORT_PER_USER_HIGH, 4);
+    // The Historic 1/2 are read back as the NAT44 session events.
+    assert_eq!(
+        NatEventType::from_code(1),
+        Some(NatEventType::Nat44SessionCreate)
+    );
+    assert_eq!(
+        NatEventType::from_code(2),
+        Some(NatEventType::Nat44SessionDelete)
+    );
+    assert_eq!(NatEventType::from_code(0), None, "0 is Reserved");
+}
+
+/// RFC 8158 §4.6.10's port block record, byte by byte: 100.64.0.9 gets
+/// 203.0.113.1 ports 2048–3071 of pool 3, on VLAN 210, login "ana".
+#[test]
+fn a_port_block_record_on_the_wire() {
+    let mut e = exporter(Version::Ipfix);
+    let mut out = Vec::new();
+    e.encode(1_700_000_100_000, &[], &mut out);
+    let block = PortBlock {
+        time_ms: 0x0000_018b_cfe5_6800,
+        event: NatEventType::PortBlockAllocation,
+        src: v4("100.64.0.9"),
+        post_src: v4("203.0.113.1"),
+        port_start: 2048,
+        port_end: 3071,
+        step: 1,
+        ports: 1024,
+        user: "ana".into(),
+        vlan: 210,
+        pool: 3,
+    };
+    out.clear();
+    e.encode(1_700_000_100_000, &[Record::PortBlock(block)], &mut out);
+    let msg = &out[0];
+    // Header (16) + set header (4) + one record.
+    let rec = &msg[20..];
+    let mut want = Vec::new();
+    want.extend(0x0000_018b_cfe5_6800u64.to_be_bytes());
+    want.push(16);
+    want.extend([100, 64, 0, 9, 203, 0, 113, 1]);
+    want.extend(be16(2048));
+    want.extend(be16(3071));
+    want.extend(be16(1));
+    want.extend(be16(1024));
+    want.extend(be32(3));
+    want.extend(be16(210));
+    // RFC 7011 §7: variable length, one byte of length first.
+    want.extend([3, b'a', b'n', b'a']);
+    assert_eq!(rec, want.as_slice());
+    assert_eq!(&msg[16..18], &be16(template::PORT_BLOCK));
+    assert_eq!(
+        usize::from(u16::from_be_bytes([msg[18], msg[19]])),
+        4 + want.len()
+    );
+}
+
+#[test]
+fn legacy_nat_events_go_out_as_1_and_2() {
+    let mut cfg = exporter(Version::Ipfix).config().clone();
+    cfg.legacy_nat = true;
+    let mut e = Exporter::new(cfg);
+    let recs: Vec<Record> = sample_records()
+        .into_iter()
+        .filter(Record::is_nat)
+        .collect();
+    let mut out = Vec::new();
+    e.encode(1_700_000_100_000, &recs, &mut out);
+    let mut d = Decoder::new();
+    let mut codes = Vec::new();
+    for m in &out {
+        let m = d.decode(m).unwrap();
+        codes.extend(m.records.iter().filter_map(|r| r.uint(id::NAT_EVENT)));
+    }
+    assert_eq!(codes, [1, 16, 13, 18, 3], "only the session events change");
+    // And they still read back as what they are.
+    assert_eq!(decode_all(&mut Decoder::new(), &out), recs);
+}
+
+#[test]
+fn a_long_user_name_is_cut_at_a_character_boundary() {
+    let long = "ç".repeat(200);
+    for (v, max) in [
+        (Version::Ipfix, template::MAX_USER),
+        (Version::V9, usize::from(template::V9_USER_LEN)),
+    ] {
+        let mut e = exporter(v);
+        let rec = Record::PortBlock(PortBlock {
+            time_ms: 1,
+            event: NatEventType::PortBlockDeallocation,
+            src: v4("100.64.0.1"),
+            post_src: v4("203.0.113.1"),
+            port_start: 1024,
+            port_end: 2047,
+            step: 1,
+            ports: 1024,
+            user: long.clone(),
+            vlan: 0,
+            pool: 1,
+        });
+        let mut out = Vec::new();
+        e.encode(1_700_000_100_000, &[rec], &mut out);
+        let back = decode_all(&mut Decoder::new(), &out);
+        let Record::PortBlock(b) = &back[0] else {
+            panic!()
+        };
+        assert_eq!(b.user, "ç".repeat(max / 2), "{v:?}: whole characters only");
+    }
+}
+
+#[test]
+fn every_template_fits_the_smallest_message() {
+    for v in [Version::Ipfix, Version::V9] {
+        let mut cfg = exporter(v).config().clone();
+        cfg.max_size = crate::MIN_MESSAGE;
+        let mut e = Exporter::new(cfg);
+        let mut out = Vec::new();
+        e.encode(1_700_000_100_000, &sample_records(), &mut out);
+        assert!(out.iter().all(|m| m.len() <= crate::MIN_MESSAGE), "{v:?}");
+        let mut d = Decoder::new();
+        let first = d.decode(&out[0]).unwrap();
+        assert_eq!(
+            first.templates, TEMPLATES,
+            "{v:?}: all templates in the first message"
+        );
+    }
+}
+
+/// A stream reconnects: the templates go first with the sequence number of
+/// the message they precede, so the collector sees no gap (RFC 7011 §3.1,
+/// errata 4396: data records before this message).
+#[test]
+fn templates_only_takes_the_sequence_of_the_next_message() {
+    let mut cfg = exporter(Version::Ipfix).config().clone();
+    cfg.stream = true;
+    let mut e = Exporter::new(cfg);
+    let mut out = Vec::new();
+    e.encode(
+        1_700_000_000_000,
+        &[Record::Flow(flow(0)), Record::Flow(flow(1))],
+        &mut out,
+    );
+    e.encode(1_700_000_001_000, &[Record::Flow(flow(2))], &mut out);
+    let before = e.counters();
+    let mut t = e.templates_only(1_700_000_002_000);
+    assert_eq!(e.counters(), before, "the exporter is unchanged");
+    let next = crate::export::sequence(&out[1]).unwrap();
+    crate::export::set_sequence(&mut t, next);
+    let mut d = Decoder::new();
+    let m = d.decode(&t).unwrap();
+    assert_eq!(
+        (m.templates, m.records.len(), m.sequence),
+        (TEMPLATES, 0, next)
+    );
+    let m = d.decode(&out[1]).unwrap();
+    assert_eq!(
+        m.sequence, 3,
+        "two flows and the sampling options record before"
+    );
+    assert_eq!(decode_all(&mut d, &out[1..]), vec![Record::Flow(flow(2))]);
 }

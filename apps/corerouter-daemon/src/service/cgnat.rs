@@ -4,7 +4,8 @@
 //! engine allocated the block (`Session::cgnat_block_for`, which puts it
 //! in the kernel's map); then the packet goes on to the NAT. No block left
 //! (or the most blocks a subscriber may hold): the packet is dropped
-//! (RFC 6888 REQ-11). The periodic work (growing, releasing, alerts) is
+//! (RFC 6888 REQ-11). What waits is served in batches: one session lock
+//! and one sync of the block journal per batch (G4.4j). The periodic work (growing, releasing, alerts) is
 //! the session tick's.
 //!
 //! Only with a blocks-mode pool, and on a backend with a queue (Linux);
@@ -16,6 +17,9 @@ use corerouter_engine::{Shared, lock};
 
 /// How long `recv` waits before the loop looks at the config again.
 const WAIT: Duration = Duration::from_millis(250);
+/// First packets served in one batch at most (a storm: every subscriber
+/// back after a reboot).
+const BATCH: usize = 1024;
 /// Rest while there is no blocks-mode pool, or no queue to serve.
 const IDLE: Duration = Duration::from_secs(2);
 
@@ -72,10 +76,30 @@ fn run(session: &Shared, health: &super::Health) {
             }
             continue;
         };
-        match q.recv(WAIT) {
-            Ok(None) => {}
-            Ok(Some(p)) => {
-                let got = lock(session).cgnat_block_for(p.subscriber, unix_now());
+        // The packets waiting now, served as one batch: one lock and one
+        // journal sync for all of them (G4.4j).
+        let mut batch = Vec::new();
+        let mut failed = None;
+        loop {
+            let wait = if batch.is_empty() { WAIT } else { Duration::ZERO };
+            match q.recv(wait) {
+                Ok(Some(p)) => {
+                    batch.push(p);
+                    if batch.len() >= BATCH {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    failed = Some(e);
+                    break;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            let subs: Vec<_> = batch.iter().map(|p| p.subscriber).collect();
+            let got = lock(session).cgnat_blocks_for(&subs, unix_now());
+            for (p, got) in batch.iter().zip(got) {
                 // A 1:1 subscriber is translated by its exception rule; one
                 // without a block left is refused, with the ICMP of RFC 6888
                 // REQ-11b (G2.7).
@@ -88,14 +112,14 @@ fn run(session: &Shared, health: &super::Health) {
                     }
                 };
                 if let Err(e) = done {
-                    health.error(format!("queue verdict: {e}"));
-                    queue = None;
+                    failed = Some(e);
+                    break;
                 }
             }
-            Err(e) => {
-                health.error(format!("queue: {e}"));
-                queue = None;
-            }
+        }
+        if let Some(e) = failed {
+            health.error(format!("queue: {e}"));
+            queue = None;
         }
     }
 }

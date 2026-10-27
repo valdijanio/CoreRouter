@@ -1,9 +1,10 @@
 //! /system tuning boot (G1.26d): kernel command-line parameters of the
 //! image, valid from the next boot. The image is immutable and A/B
-//! (`docs/architecture.md`): there is no GRUB to edit. Until the A/B image
-//! exists (G1.6), the parameters are kept in the config, shown as pending
-//! and handed to the image's command line when it does (G1.26h); a failed
-//! boot then falls back to the previous image.
+//! (`docs/architecture.md`): there is no GRUB to edit. The parameters are
+//! kept in the config; `system.tuning.boot.apply` (G1.26h) copies the
+//! running image to the inactive slot with them on its command line and
+//! boots it on trial — the running slot's command line never changes, and a
+//! parameter that does not boot falls back to it by itself (G1.6b).
 
 use std::collections::BTreeMap;
 
@@ -20,7 +21,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{} → [{key, value}]",
         always, print_set),
     cmd!(query "system.tuning.boot.parameter.print", "Boot Tuning", [], None,
-        "{profile?: conservative|balanced|throughput|latency} → {profile, running_cmdline, next_cmdline, image_ab: bool, params: [{name, section, running, configured, recommended, why, why_id, why_args, kind, choices, min, max, danger}]}",
+        "{profile?: conservative|balanced|throughput|latency} → {profile, running_cmdline, next_cmdline, image_ab: bool, image_ab_reason?, slots: [{slot, running, primary, next, params: {name: value}}], params: [{name, section, running, configured, recommended, why, why_id, why_args, kind, choices, min, max, danger}]}",
         always, print),
     cmd!(
         "system.tuning.boot.set",
@@ -30,6 +31,15 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{key: string, value: string, confirm?: bool (needed for mitigations=off)} → {key, value, next_cmdline}",
         always,
         set
+    ),
+    cmd!(
+        "system.tuning.boot.apply",
+        "Apply Boot Parameters",
+        [],
+        None,
+        "{confirm?: auto|manual, timeout?: u32 (30..3600 s, default 300), reboot?: bool (default yes), drill?: bool (a rollback drill: the trial slot gets a parameter that does not boot)} → {job, kind}",
+        always,
+        apply
     ),
     cmd!(
         "system.tuning.boot.unset",
@@ -42,8 +52,50 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     ),
 ];
 
-/// Whether the A/B image that boots these parameters exists (G1.6).
-const IMAGE_AB: bool = false;
+/// Whether the A/B image that boots these parameters is here (G1.6b), and
+/// why not.
+fn image_ab(s: &Session) -> (bool, Option<String>) {
+    let st = crate::package::status(s);
+    let ok = st.get("supported").and_then(Value::as_bool) == Some(true);
+    let why = st.get("reason").and_then(Value::as_str).map(str::to_owned);
+    (ok, if ok { None } else { why })
+}
+
+/// The tuning parameters each slot's boot entry carries.
+fn slot_params(s: &Session) -> Vec<Value> {
+    let st = crate::package::status(s);
+    let names: Vec<&str> = BOOT_PARAMS.iter().map(|p| p.name).collect();
+    st.get("slots")
+        .and_then(Value::as_array)
+        .map(|slots| {
+            slots
+                .iter()
+                .map(|sl| {
+                    let line = sl.get("cmdline").and_then(Value::as_str).unwrap_or("");
+                    let params: serde_json::Map<String, Value> = parse_cmdline(line)
+                        .into_iter()
+                        .filter(|(k, _)| names.contains(&k.as_str()))
+                        .map(|(k, v)| (k, json!(v)))
+                        .collect();
+                    json!({
+                        "slot": sl.get("slot"),
+                        "running": sl.get("running"),
+                        "primary": sl.get("primary"),
+                        "next": sl.get("next"),
+                        "state": sl.get("state"),
+                        "has_entry": sl.get("boot_entry").is_some_and(|e| !e.is_null()),
+                        "params": params,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn apply(s: &mut Session, p: &Value) -> Result<Value> {
+    let drill = opt_bool(p, "drill")?.unwrap_or(false);
+    super::package::queue(s, crate::package::JobKind::BootParams { drill }, p)
+}
 
 fn profile_param(p: &Value) -> Result<Profile> {
     match opt_str(p, "profile")? {
@@ -90,6 +142,7 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
     let running = parse_cmdline(&running_text);
     let cfg = s.store().candidate().system.tuning.boot.clone();
     let recs = recommend(profile);
+    let (ab, ab_reason) = image_ab(s);
     let params: Vec<Value> = BOOT_PARAMS
         .iter()
         .map(|b| {
@@ -116,7 +169,9 @@ fn print(s: &mut Session, p: &Value) -> Result<Value> {
         "profile": profile.id(),
         "running_cmdline": running_text,
         "next_cmdline": cmdline(&cfg),
-        "image_ab": IMAGE_AB,
+        "image_ab": ab,
+        "image_ab_reason": ab_reason,
+        "slots": slot_params(s),
         "params": params,
     }))
 }
@@ -195,6 +250,7 @@ mod tests {
         let mut s = Session::virtual_lab();
         let v = run(&mut s, "system.tuning.boot.parameter.print", json!({"profile": "latency"})).unwrap();
         assert_eq!(v["image_ab"], false);
+        assert!(v["image_ab_reason"].is_string());
         assert!(v["running_cmdline"].as_str().unwrap().contains("corerouter-a"));
         let row = |v: &Value, k: &str| {
             v["params"].as_array().unwrap().iter().find(|r| r["name"] == k).unwrap().clone()
@@ -233,5 +289,33 @@ mod tests {
         run(&mut s, "system.tuning.boot.unset", json!({"key": "mitigations"})).unwrap();
         run(&mut s, "config.rollback", json!({"revision": rev})).unwrap();
         assert_eq!(s.store().running().system.tuning.boot.len(), 2);
+    }
+
+    /// G1.26h: apply queues the copy of the running image to the other slot
+    /// with the running configuration's parameters; each slot shows its own.
+    #[test]
+    fn apply_goes_to_the_inactive_slot() {
+        let mut s = Session::virtual_lab();
+        let e = run(&mut s, "system.tuning.boot.apply", json!({})).unwrap_err();
+        assert!(e.to_string().contains("not reported"), "{e}");
+        crate::package::feed_status(
+            &mut s,
+            json!({"supported": true, "running": "a", "trial": null, "slots": [
+                {"slot": "a", "running": true, "primary": true, "next": false, "boot_entry": "Boot0001",
+                 "cmdline": "root=/dev/dm-0 iommu=pt corerouter.slot=a panic=10"},
+                {"slot": "b", "running": false, "primary": false, "next": false, "boot_entry": null, "cmdline": null}]}),
+        );
+        run(&mut s, "system.tuning.boot.set", json!({"key": "isolcpus", "value": "2-3"})).unwrap();
+        let out = run(&mut s, "system.tuning.boot.apply", json!({"timeout": 120, "drill": true})).unwrap();
+        assert_eq!(out["kind"], "boot-params");
+        let job = crate::package::take_job(&mut s).unwrap();
+        assert_eq!(job.kind, crate::package::JobKind::BootParams { drill: true });
+        assert_eq!(job.tuning, [("isolcpus".to_owned(), "2-3".to_owned())]);
+        assert_eq!(job.timeout_s, 120);
+        let v = run(&mut s, "system.tuning.boot.parameter.print", json!({})).unwrap();
+        assert_eq!(v["image_ab"], true);
+        assert_eq!(v["slots"][0]["params"], json!({"iommu": "pt"}));
+        assert_eq!(v["slots"][1]["has_entry"], false);
+        assert!(run(&mut s, "system.tuning.boot.apply", json!({"timeout": 1})).is_err());
     }
 }

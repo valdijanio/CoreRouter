@@ -41,6 +41,10 @@ hickory-proto = { version = "0.26.3", default-features = false, features = ["std
 proptest.workspace = true
 
 [[bench]]
+name = "cgnat_pba_storm"
+harness = false
+
+[[bench]]
 name = "execute"
 harness = false
 

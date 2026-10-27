@@ -6,8 +6,10 @@ pub(super) const HELP: &[(&str, &str)] = &[
         "tuning.boot",
         r##"## Boot parameters
 They go on the kernel command line of the router's image and are valid from the **next boot**. The image is immutable and A/B: a boot that fails goes back to the previous image by itself, with its own command line.
-## Now
-The A/B image (G1.6) does not exist yet: the parameters are saved in the config and shown as pending; the image will read them when it does (G1.26h). "Running" is what this boot used (`/proc/cmdline`)."##,
+## How they are applied (G1.26h)
+**Apply on slot X and reboot** copies the running image to the other A/B slot (skipped when it already holds it), writes the parameters on that slot's boot entry and reboots into it **on trial**. The running slot's command line never changes. If the trial does not come up and confirm within the timeout (a parameter that does not boot: the kernel panics, `panic=10` resets), the firmware boots the previous slot by itself, with the configuration it had.
+
+"Running" is what this boot used (`/proc/cmdline`); the slot lines show what each boot entry carries. An update (System › Packages) also takes these parameters to the new slot."##,
     ),
     (
         "tuning.boot.intel_idle.max_cstate",

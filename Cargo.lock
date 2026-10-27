@@ -1185,6 +1185,7 @@ dependencies = [
  "corerouter-proto-radius",
  "corerouter-proto-syslog",
  "corerouter-storage-fs",
+ "corerouter-sysupdate",
  "criterion",
  "dhcproto",
  "env_logger",
@@ -1196,6 +1197,7 @@ dependencies = [
  "log",
  "nix 0.30.1",
  "rcgen",
+ "rustix 1.1.5",
  "rustls",
  "serde_json",
  "signal-hook",
@@ -1338,11 +1340,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "corerouter-image"
+version = "0.1.0"
+dependencies = [
+ "corerouter-sysupdate",
+ "serde_json",
+]
+
+[[package]]
 name = "corerouter-init"
 version = "0.1.0"
 dependencies = [
+ "corerouter-sysupdate",
  "netlink-sys",
  "rustix 1.1.5",
+ "serde_json",
  "signal-hook",
 ]
 
@@ -1551,6 +1563,17 @@ dependencies = [
  "corerouter-model",
  "criterion",
  "log",
+ "serde_json",
+]
+
+[[package]]
+name = "corerouter-sysupdate"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "ring",
+ "rustix 1.1.5",
+ "serde",
  "serde_json",
 ]
 

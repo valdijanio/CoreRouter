@@ -9,6 +9,13 @@ rm -rf "$T/var"; mkdir -p "$T/var"
 # No getty, no inittab, no rc scripts: corerouter-init is the only service
 # manager (init=/usr/sbin/corerouter-init on the kernel command line).
 rm -rf "$T/etc/init.d" "$T/etc/inittab"
+# G1.6b: the Ed25519 public keys a system package must be signed with
+# (`cargo xtask os build` exports the directory; the private key never
+# enters the tree nor the image).
+: "${CR_SEAL_IMAGE_KEYS_DIR:?run through cargo xtask os build}"
+rm -rf "$T/etc/corerouter/image-keys"
+mkdir -p "$T/etc/corerouter/image-keys"
+cp "$CR_SEAL_IMAGE_KEYS_DIR"/*.pub "$T/etc/corerouter/image-keys/"
 cat > "$T/etc/os-release" <<EOR
 NAME=CoreRouter
 ID=corerouter

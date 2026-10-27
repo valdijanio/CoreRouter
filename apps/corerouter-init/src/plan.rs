@@ -74,6 +74,16 @@ pub const MOUNTS: &[Mount] = &[
     m("tracefs", "/sys/kernel/tracing", "tracefs", "", true),
 ];
 
+/// efivarfs, mounted only on a UEFI boot (the A/B image's boot variables,
+/// G1.6b).
+pub const EFIVARS: Mount = m(
+    "efivarfs",
+    "/sys/firmware/efi/efivars",
+    "efivarfs",
+    "",
+    true,
+);
+
 /// Options read from the kernel command line (`corerouter.<key>=<value>`).
 /// Unknown keys are ignored (the command line belongs to the kernel too);
 /// bad values fall back to the default and are reported.
@@ -104,6 +114,8 @@ impl BootOptions {
             };
             let (key, value) = rest.split_once('=').unwrap_or((rest, ""));
             match key {
+                // The A/B slot of a boot entry, read by corerouter-sysupdate.
+                "slot" => {}
                 "shell" => {
                     let ok = !value.is_empty()
                         && value.len() <= MAX_TTY

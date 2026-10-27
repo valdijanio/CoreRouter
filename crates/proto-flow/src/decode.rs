@@ -13,7 +13,9 @@ use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::ie::{Field, VARIABLE, id};
-use crate::record::{Direction, EndReason, Flow, NatEvent, NatEventType, PortBlock, Record};
+use crate::record::{
+    Direction, EndReason, Flow, NatEvent, NatEventType, NatLimit, PortBlock, Record,
+};
 
 /// Templates one decoder remembers (all domains).
 pub const MAX_TEMPLATES: usize = 4096;
@@ -328,6 +330,30 @@ pub fn to_record(d: &DataRecord, m: &Message) -> Option<Record> {
     if let Some(ev) = d.uint(id::NAT_EVENT) {
         let event = NatEventType::from_code(u8::try_from(ev).ok()?)?;
         let time_ms = d.uint(id::OBSERVATION_TIME_MILLISECONDS)?;
+        let u32v = |ie| d.uint(ie).and_then(|v| u32::try_from(v).ok()).unwrap_or(0);
+        if matches!(
+            event,
+            NatEventType::AddressesExhausted
+                | NatEventType::QuotaExceeded
+                | NatEventType::ThresholdReached
+        ) {
+            return Some(Record::NatLimit(NatLimit {
+                time_ms,
+                event,
+                kind: d
+                    .uint(id::NAT_QUOTA_EXCEEDED_EVENT)
+                    .or_else(|| d.uint(id::NAT_THRESHOLD_EVENT))
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0),
+                src: v4(id::SOURCE_IPV4_ADDRESS).unwrap_or(Ipv4Addr::UNSPECIFIED),
+                pool: u32v(id::NAT_POOL_ID),
+                limit: d
+                    .uint(id::MAX_ENTRIES_PER_USER)
+                    .or_else(|| d.uint(id::ADDRESS_PORT_MAPPING_PER_USER_HIGH_THRESHOLD))
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0),
+            }));
+        }
         if d.get(id::PORT_RANGE_START).is_some() {
             return Some(Record::PortBlock(PortBlock {
                 time_ms,
@@ -338,6 +364,9 @@ pub fn to_record(d: &DataRecord, m: &Message) -> Option<Record> {
                 port_end: u16v(id::PORT_RANGE_END),
                 step: u16v(id::PORT_RANGE_STEP_SIZE),
                 ports: u16v(id::PORT_RANGE_NUM_PORTS),
+                user: d.string(id::USER_NAME).unwrap_or_default(),
+                vlan: u16v(id::VLAN_ID),
+                pool: u32v(id::NAT_POOL_ID),
             }));
         }
         return Some(Record::Nat(NatEvent {

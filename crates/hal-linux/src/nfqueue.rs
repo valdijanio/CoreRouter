@@ -304,9 +304,11 @@ mod io {
                 (1, super::bind_request(num, 1)),
                 (2, super::params_request_with(num, 2, copy)),
             ];
-            if flags != 0 {
-                reqs.push((3, super::flags_request(num, 3, flags, super::MAXLEN)));
-            }
+            // The queue's length too when there are no flags: the kernel's
+            // default is 1024, and a storm of first packets (every
+            // subscriber back after a reboot) lost half of 2000 sent at
+            // once in the netns test (G4.4j, **medido**).
+            reqs.push((3, super::flags_request(num, 3, flags, super::MAXLEN)));
             for (seq, req) in reqs {
                 q.sock.send(&req, 0).map_err(io)?;
                 q.ack(seq)?;

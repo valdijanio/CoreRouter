@@ -61,6 +61,12 @@ pub trait PppBackend: Send + Sync {
         let _ = ip;
         None
     }
+    /// The login of the session holding `ip` now and the VLAN it came in
+    /// on (the outer tag; 0 untagged): what a CGNAT port block record says
+    /// about its subscriber (G4.4j, IPFIX `userName` and `vlanId`).
+    fn who_vlan(&self, ip: std::net::Ipv4Addr) -> Option<(String, u16)> {
+        self.who(ip).map(|n| (n, 0))
+    }
     /// The login that held `ip` at Unix second `at` (CGNAT "Who was?"),
     /// from the history kept.
     fn who_at(&self, ip: std::net::Ipv4Addr, at: u64) -> Option<String> {
@@ -159,6 +165,10 @@ impl PppBackend for Merged {
 
     fn who(&self, ip: std::net::Ipv4Addr) -> Option<String> {
         self.0.iter().find_map(|b| b.who(ip))
+    }
+
+    fn who_vlan(&self, ip: std::net::Ipv4Addr) -> Option<(String, u16)> {
+        self.0.iter().find_map(|b| b.who_vlan(ip))
     }
 
     fn who_at(&self, ip: std::net::Ipv4Addr, at: u64) -> Option<String> {

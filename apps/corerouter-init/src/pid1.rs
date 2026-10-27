@@ -14,6 +14,10 @@ use rustix::mount::{MountFlags, UnmountFlags};
 use rustix::process::{Pid, Signal, WaitOptions};
 use rustix::system::RebootCommand;
 
+use corerouter_sysupdate::SlotId;
+use corerouter_sysupdate::ab::{self, Boot};
+use corerouter_sysupdate::efi::Vars;
+
 use crate::plan::{self, Backoff, BootOptions};
 
 /// One line on the console (the kernel gives PID 1 `/dev/console` as fds
@@ -71,6 +75,7 @@ pub fn main() {
         log!("lo up: {e} (the control channel listens on 127.0.0.1)");
     }
     mount_config();
+    let trial = trial_at_boot(&cmdline);
     for dir in [plan::RUNTIME_DIR, "/var/log", "/var/lib", "/var/tmp"] {
         if let Err(e) = fs::create_dir_all(dir) {
             log!("{dir}: {e}");
@@ -88,7 +93,53 @@ pub fn main() {
         }
     }
     log!("early boot done in {} ms", started.elapsed().as_millis());
-    supervise(&opts, &action, started);
+    supervise(&opts, &action, started, trial);
+}
+
+/// A trial boot of the A/B image (G1.6b) being watched: reboot into the
+/// previous slot unless the daemon confirms it before `deadline`.
+struct TrialWatch {
+    slot: SlotId,
+    from: SlotId,
+    timeout_s: u64,
+    deadline: Instant,
+    vars: Vars,
+    next_check: Instant,
+}
+
+/// efivarfs, then the boot step of the A/B image: marks a trial booted or
+/// records the failed one (restoring the configuration it ran with) before
+/// the daemon reads `/config`.
+fn trial_at_boot(cmdline: &str) -> Option<TrialWatch> {
+    if !std::path::Path::new("/sys/firmware/efi").exists() {
+        return None;
+    }
+    mount_api(&plan::EFIVARS);
+    let vars = Vars::efivarfs(plan::EFIVARS.target);
+    let (boot, lines) = ab::at_boot(
+        std::path::Path::new(plan::CONFIG_DIR),
+        &vars,
+        cmdline,
+        ab::fallback_partuuids(),
+    );
+    for l in &lines {
+        log!("{l}");
+    }
+    match boot {
+        Boot::Normal => None,
+        Boot::Trial {
+            slot,
+            from,
+            timeout_s,
+        } => Some(TrialWatch {
+            slot,
+            from,
+            timeout_s,
+            deadline: Instant::now() + Duration::from_secs(timeout_s),
+            vars,
+            next_check: Instant::now(),
+        }),
+    }
 }
 
 fn flags(m: &plan::Mount) -> MountFlags {
@@ -225,7 +276,12 @@ struct Daemon {
     ready: bool,
 }
 
-fn supervise(opts: &BootOptions, action: &AtomicUsize, boot: Instant) -> ! {
+fn supervise(
+    opts: &BootOptions,
+    action: &AtomicUsize,
+    boot: Instant,
+    mut trial: Option<TrialWatch>,
+) -> ! {
     let mut d = Daemon {
         pid: None,
         since: Instant::now(),
@@ -298,6 +354,23 @@ fn supervise(opts: &BootOptions, action: &AtomicUsize, boot: Instant) -> ! {
         {
             shell = spawn_shell(tty);
             shell_at = now + Duration::from_secs(5);
+        }
+        if let Some(t) = &mut trial
+            && now >= t.next_check
+        {
+            t.next_check = now + Duration::from_secs(1);
+            if ab::primary(&t.vars) == Some(t.slot) {
+                log!("trial boot of slot {} confirmed", t.slot.as_str());
+                trial = None;
+            } else if now >= t.deadline {
+                log!(
+                    "trial boot of slot {} not confirmed in {} s: rebooting into slot {}",
+                    t.slot.as_str(),
+                    t.timeout_s,
+                    t.from.as_str()
+                );
+                shutdown(REBOOT, d.pid, shell);
+            }
         }
         if now >= next_rotate {
             rotate_log();
