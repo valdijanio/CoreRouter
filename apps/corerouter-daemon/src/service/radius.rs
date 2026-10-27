@@ -33,6 +33,9 @@ fn start(ctx: &super::Ctx) -> Result<super::Run, String> {
     let session = ctx.session.clone();
     let (aaa, inbox) = radius_aaa::channel();
     lock(&session).set_aaa_backend(Arc::new(aaa.clone()));
+    // G4.3hb: unclaimed CoA/DM to the other BNG of a pair, and its to ours.
+    aaa.set_forward(Some(Arc::new(super::ppp_ha::PeerForward)));
+    super::ppp_ha::set_aaa(Some(aaa.clone()));
     Ok(Box::new(move |health: &super::Health| {
         run(&session, &aaa, &inbox, health)
     }))

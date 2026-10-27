@@ -320,6 +320,44 @@ sobe as mesmas 100 mil em 33 s.
 O tráfego de descida depende do protocolo de roteamento que anuncia o pool pelo nó ativo, fora do
 laboratório (gap G4.3hf).
 
+## 2.11 CoA e Disconnect pelo par (G4.3hb)
+
+O servidor RADIUS manda o CoA/DM ao NAS que conhece. Depois de uma tomada, esse NAS pode ser o
+nó que já não tem a sessão. Agora:
+
+- O `/radius incoming` de cada nó aplica o pedido nas sessões dele, como antes.
+- Se nenhuma sessão é dele, e este nó não é o que atende os assinantes (espera, cercado, cedendo),
+  o pedido decodificado vai ao par pelo link de sync (`Msg::Forward`, JSON do `CoaRequest`, até
+  64 KiB). Os donos de sessão do par o aplicam, e nunca o encaminham de novo. A resposta volta
+  (`Msg::ForwardReply`), e este nó responde ao servidor com o que o par disse (ACK, ou NAK com o
+  Error-Cause do par). A RFC 5176 §3.3 pede a resposta do endereço para onde o servidor mandou: por
+  isso quem responde é o nó antigo, e não o par.
+- O par também não tem a sessão: NAK 503 (Session Context Not Found), como sem par. O par não
+  responde em 2 s: NAK 505 (Other Proxy Processing Error, §3.5). Sem link de sync: NAK 503 na
+  hora.
+- Uma retransmissão do servidor enquanto o par responde não é encaminhada de novo: vai a resposta
+  do primeiro, e as seguintes saem do cache, como sempre.
+- Até 1024 pedidos encaminhados em voo; acima disso, NAK 503 na hora.
+- Compatível com a versão anterior do par: o Hello leva os recursos (`features`) nos bytes
+  reservados do cabeçalho, que a versão antiga ignora. O `Forward` só vai a um par que anunciou
+  o recurso.
+- O ativo não encaminha: ele tem todas as sessões, e perguntar ao standby só atrasaria o NAK.
+- `radius.incoming.get` mostra `forwarded` e `forward_answered`.
+
+**Medido** (debug, `tests/netns_ha_pppoe.rs`, dois daemons reais, 200 CPEs):
+
+- CoA de taxa por Framed-IP-Address no ativo: 0,19 ms.
+- Depois de um switchover, o mesmo CoA mandado ao nó antigo: mediana de 40 ms e máximo de 50 ms
+  em 20 pedidos. O nó novo aplica a taxa, e um Disconnect pelo nó antigo encerra a sessão no novo.
+
+Os 40 ms são as esperas dos laços, não trabalho:
+- até 20 ms do read da conexão de sync antes de escrever o que saiu;
+- até 10 ms do laço principal, em cada ponta.
+
+O trabalho em si custa 0,25 ms ponta a ponta, medido com o par em memória
+(`radius_aaa_tests`). Os pedidos andam em paralelo: uma rajada não espera um pelo outro (veja o
+laboratório).
+
 ## 3. Testes
 
 - Unidade (27): cada regra da máquina de papéis, codec, registro, hello, sync.
@@ -409,8 +447,11 @@ laboratório (gap G4.3hf).
   Duas portas no mesmo L2 fazem o switch mover o MAC de uma para a outra, e os quadros chegam pela
   porta errada (o laboratório achou isso com duas portas numa bridge só). Num ISP cada porta vai a
   uma OLT ou a um switch; MAC virtual por porta fica para uma gap, se alguém precisar.
-- **CoA/DM depois da tomada:** o servidor de cobrança manda o CoA ao endereço de NAS do nó antigo.
-  É preciso um endereço de NAS do par ou o encaminhamento pelo par (gap G4.3hb).
+- **CoA/DM depois da tomada (G4.3hb):** o servidor de cobrança continua mandando o CoA ao nó
+  antigo. Se ele está vivo (switchover, falha simulada, volta como espera), encaminha o pedido ao
+  par (§2.11). Se morreu, o pedido não chega a ninguém. O servidor precisa mandá-lo ao nó que manda
+  a contabilização da sessão: depois da tomada, o Interim sai do nó novo, do endereço dele. Um
+  endereço de CoA flutuante, que segue o papel, fica para a gap G4.3hg.
 - **Class (RFC 2865 §5.25, G4.3ha):** o PPPoE e o IPoE ecoam o Class do Accept, byte a byte, em
   todo Accounting-Request; o registro o carrega (um TLV: 3 B + o tamanho), e o nó que assume
   manda o Interim e o Stop com o mesmo Class. O laboratório `ha` dá a cada usuário um Class

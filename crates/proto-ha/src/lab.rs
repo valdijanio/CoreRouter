@@ -419,7 +419,7 @@ impl Lab {
             .into_iter()
             .filter_map(|e| match e {
                 Event::Role(t) => Some(t),
-                Event::PeerUp { .. } => None,
+                Event::PeerUp { .. } | Event::Forward { .. } | Event::ForwardReply { .. } => None,
             })
             .collect();
         n.transitions.extend(roles.iter().copied());
