@@ -167,3 +167,7 @@ no fim, quando ele é integrado (`cargo xtask docs fold`). **Não edite à mão.
 - 2026-10-26 — G4.3n feito (migrar secrets PPP com senha do MikroTik; senhas cifradas em repouso)
 - 2026-10-26 — G4.3ha feito (Class do RADIUS na contabilização e na tomada do par)
 - 2026-10-26 — G4.9g criado e feito (janela "Queue <nome>": Traffic, Statistics, History; queue.simple.stats; histórico por fila opt-in)
+- 2026-10-26 — G4.10 criado (avisos ao assinante: página de bloqueio e de aviso pela detecção de portal do sistema, aprovado em 2026-10-26), com as partes G4.10a–f; G4.10a feito
+- 2026-10-26 — G4.3hb feito (CoA/DM depois de uma tomada do par); G4.3hg criada (endereço de CoA flutuante)
+- 2026-10-27 — G4.10b feito (plano de dados dos avisos ao assinante)
+- 2026-10-27 — G4.10c feito (serviço do portal dos avisos ao assinante)

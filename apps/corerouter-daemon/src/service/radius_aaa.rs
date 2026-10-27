@@ -119,12 +119,43 @@ enum Msg {
         data: Vec<u8>,
     },
     Reload(Box<AaaConfig>),
+    /// G4.3hb: the peer's answer to a request we forwarded.
+    Forwarded {
+        id: u64,
+        outcome: Option<CoaOutcome>,
+    },
+    /// G4.3hb: a request the peer forwarded, for our owners only.
+    PeerCoa(Box<CoaRequest>, PeerDone),
     Stop,
 }
+
+/// What a forwarded CoA/Disconnect came back with (`None`: no answer).
+pub(crate) type CoaDone = Box<dyn FnOnce(Option<CoaOutcome>) + Send>;
+/// Where the answer to a request the peer forwarded goes.
+pub(crate) type PeerDone = Box<dyn FnOnce(CoaOutcome) + Send>;
+
+/// Where a CoA/Disconnect that no session here claims may go on (G4.3hb:
+/// the other BNG of a redundant pair, which holds the session after a
+/// takeover). RFC 5176 §3.3: the reply goes back from the address the
+/// server sent to, so this node answers with what the peer said.
+pub(crate) trait CoaForward: Send + Sync {
+    /// `true`: `done` will run (from another thread: it only posts);
+    /// `false`: nobody to ask, `done` dropped.
+    fn forward(&self, req: &CoaRequest, done: CoaDone) -> bool;
+}
+
+/// A peer that does not answer in this time: NAK 505 (Other Proxy
+/// Processing Error, RFC 5176 §3.5). **Estimado**: the link's round trip
+/// is milliseconds; RADIUS servers retransmit after 3–5 s.
+const FORWARD_TIMEOUT_MS: u64 = 2000;
+/// Forwarded requests waiting at once (a flood from a known client cannot
+/// grow the table): beyond, NAK 506.
+const MAX_FORWARDED: usize = 1024;
 
 struct Shared {
     status: Mutex<RadiusStatus>,
     owners: Mutex<Vec<Arc<dyn SessionOwner>>>,
+    forward: Mutex<Option<Arc<dyn CoaForward>>>,
     logs: Mutex<VecDeque<LogLine>>,
     queued: std::sync::atomic::AtomicUsize,
 }
@@ -174,6 +205,22 @@ impl Aaa {
 
     pub fn stop(&self) {
         let _ = self.tx.send(Msg::Stop);
+    }
+
+    /// G4.3hb: where unclaimed CoA/Disconnect requests go on.
+    pub(crate) fn set_forward(&self, f: Option<Arc<dyn CoaForward>>) {
+        *guard(&self.shared.forward) = f;
+    }
+
+    /// G4.3hb: a request the peer forwarded, applied by this node's owners
+    /// on the driver's thread (never forwarded again); `done` gets the
+    /// outcome there.
+    pub(crate) fn peer_coa(&self, req: CoaRequest, done: PeerDone) {
+        if let Err(mpsc::SendError(Msg::PeerCoa(_, done))) =
+            self.tx.send(Msg::PeerCoa(Box::new(req), done))
+        {
+            done(CoaOutcome::NotMine);
+        }
     }
 
     fn post(&self, m: Msg) -> bool {
@@ -226,6 +273,7 @@ pub fn channel() -> (Aaa, Arc<Inbox>) {
     let shared = Arc::new(Shared {
         status: Mutex::new(RadiusStatus::default()),
         owners: Mutex::new(Vec::new()),
+        forward: Mutex::new(None),
         logs: Mutex::new(VecDeque::new()),
         queued: std::sync::atomic::AtomicUsize::new(0),
     });
@@ -884,6 +932,17 @@ struct Driver<'a> {
     /// When [`Driver::sweep_cancelled`] last ran, and what it called off.
     last_sweep: Instant,
     cancelled: u64,
+    /// G4.3hb: requests handed to the peer, by id, waiting for its answer.
+    forwarded: HashMap<u64, Forwarded>,
+    next_forward: u64,
+    forward_count: u64,
+    forward_answered: u64,
+}
+
+struct Forwarded {
+    r: Box<DynAuthRequest>,
+    from: SocketAddr,
+    at_ms: u64,
 }
 
 struct DynAuth {
@@ -1295,68 +1354,155 @@ impl<'a> Driver<'a> {
         }
     }
 
+    /// What this node's session owners say of `req` (the first that
+    /// claims it).
+    fn local_coa(&self, req: &CoaRequest) -> CoaOutcome {
+        let owners: Vec<Arc<dyn SessionOwner>> = guard(&self.aaa.shared.owners).clone();
+        for o in &owners {
+            match o.handle(req) {
+                CoaOutcome::NotMine => {}
+                x => return x,
+            }
+        }
+        CoaOutcome::NotMine
+    }
+
     fn dyn_auth(&mut self, from: SocketAddr, data: &[u8]) {
         let now = self.ms();
         let unix = now_unix();
-        let owners: Vec<Arc<dyn SessionOwner>> = guard(&self.aaa.shared.owners).clone();
         let Some((d, srv)) = &mut self.dynauth else {
             return;
         };
         // A dual-stack socket sees IPv4 senders as ::ffff:a.b.c.d.
         let canon = SocketAddr::new(from.ip().to_canonical(), from.port());
-        let reply = match srv.handle(canon, data, unix, now) {
-            Ok(Incoming::Resend(bytes)) => bytes,
-            Ok(Incoming::Request(r)) => {
-                let outcome = match r.precheck {
-                    Some(c) => Outcome::Nak(c),
-                    None => {
-                        let req = coa_request(&self.dict, &r);
-                        let mut out = None;
-                        for o in &owners {
-                            match o.handle(&req) {
-                                CoaOutcome::NotMine => {}
-                                CoaOutcome::Ack => {
-                                    out = Some(Outcome::Ack);
-                                    break;
-                                }
-                                CoaOutcome::Nak(n) => {
-                                    out = Some(Outcome::Nak(
-                                        ErrorCause::from_u32(n)
-                                            .unwrap_or(ErrorCause::ResourcesUnavailable),
-                                    ));
-                                    break;
-                                }
-                            }
-                        }
-                        out.unwrap_or(Outcome::Nak(ErrorCause::SessionContextNotFound))
-                    }
-                };
-                let what = match r.kind {
-                    RequestKind::Coa => "CoA",
-                    RequestKind::Disconnect => "Disconnect",
-                };
-                let bytes = srv.respond(&r, outcome, &AttrList::new(), unix);
-                let msg = match outcome {
-                    Outcome::Ack | Outcome::AckResidualRemoved => {
-                        format!("RADIUS: {what} de {} aceito", canon.ip())
-                    }
-                    Outcome::Nak(c) => {
-                        format!(
-                            "RADIUS: {what} de {} recusado (Error-Cause {})",
-                            canon.ip(),
-                            c.value()
-                        )
-                    }
-                };
-                let sock = d.socket.clone();
-                let _ = sock.send_to(&bytes, from);
-                self.log("info", msg);
+        let r = match srv.handle(canon, data, unix, now) {
+            Ok(Incoming::Resend(bytes)) => {
+                let _ = d.socket.send_to(&bytes, from);
                 return;
             }
+            Ok(Incoming::Request(r)) => r,
             // RFC 5176 §5: dropped without a reply (counted).
             Err(_) => return,
         };
-        let _ = d.socket.send_to(&reply, from);
+        // A retransmission of one the peer is answering: its answer goes.
+        if self.forwarded.values().any(|f| {
+            f.r.from == r.from
+                && f.r.identifier == r.identifier
+                && f.r.authenticator == r.authenticator
+        }) {
+            return;
+        }
+        let outcome = match r.precheck {
+            Some(c) => Some(Outcome::Nak(c)),
+            None => {
+                let req = coa_request(&self.dict, &r);
+                match self.local_coa(&req) {
+                    CoaOutcome::Ack => Some(Outcome::Ack),
+                    CoaOutcome::Nak(n) => Some(Outcome::Nak(
+                        ErrorCause::from_u32(n).unwrap_or(ErrorCause::ResourcesUnavailable),
+                    )),
+                    // G4.3hb: not here; the other node of the pair may
+                    // hold it (a takeover after the server learned us).
+                    CoaOutcome::NotMine => match self.forward(&req) {
+                        Some(id) => {
+                            self.forwarded.insert(
+                                id,
+                                Forwarded {
+                                    r,
+                                    from,
+                                    at_ms: now,
+                                },
+                            );
+                            return;
+                        }
+                        None => Some(Outcome::Nak(ErrorCause::SessionContextNotFound)),
+                    },
+                }
+            }
+        };
+        if let Some(o) = outcome {
+            self.answer(&r, from, o, "");
+        }
+    }
+
+    /// Hands `req` to the pair's peer: the id its answer comes back with.
+    fn forward(&mut self, req: &CoaRequest) -> Option<u64> {
+        if self.forwarded.len() >= MAX_FORWARDED {
+            return None;
+        }
+        let f = guard(&self.aaa.shared.forward).clone()?;
+        self.next_forward += 1;
+        let id = self.next_forward;
+        let tx = self.aaa.tx.clone();
+        let done: CoaDone = Box::new(move |outcome| {
+            let _ = tx.send(Msg::Forwarded { id, outcome });
+        });
+        f.forward(req, done).then(|| {
+            self.forward_count += 1;
+            id
+        })
+    }
+
+    /// The peer answered forwarded request `id` (`None`: it could not).
+    fn forward_answer(&mut self, id: u64, outcome: Option<CoaOutcome>) {
+        let Some(f) = self.forwarded.remove(&id) else {
+            return; // Expired already: answered 505.
+        };
+        let o = match outcome {
+            Some(CoaOutcome::Ack) => Outcome::Ack,
+            Some(CoaOutcome::Nak(n)) => {
+                Outcome::Nak(ErrorCause::from_u32(n).unwrap_or(ErrorCause::ResourcesUnavailable))
+            }
+            Some(CoaOutcome::NotMine) => Outcome::Nak(ErrorCause::SessionContextNotFound),
+            None => Outcome::Nak(ErrorCause::OtherProxyProcessingError),
+        };
+        if outcome.is_some() {
+            self.forward_answered += 1;
+        }
+        self.answer(&f.r, f.from, o, " (pelo outro BNG do par)");
+    }
+
+    /// Forwarded requests the peer did not answer in time: NAK 505.
+    fn expire_forwarded(&mut self) {
+        if self.forwarded.is_empty() {
+            return;
+        }
+        let now = self.ms();
+        let late: Vec<u64> = self
+            .forwarded
+            .iter()
+            .filter(|(_, f)| now.saturating_sub(f.at_ms) >= FORWARD_TIMEOUT_MS)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in late {
+            self.forward_answer(id, None);
+        }
+    }
+
+    fn answer(&mut self, r: &DynAuthRequest, to: SocketAddr, outcome: Outcome, via: &str) {
+        let unix = now_unix();
+        let Some((d, srv)) = &mut self.dynauth else {
+            return;
+        };
+        let what = match r.kind {
+            RequestKind::Coa => "CoA",
+            RequestKind::Disconnect => "Disconnect",
+        };
+        let bytes = srv.respond(r, outcome, &AttrList::new(), unix);
+        let _ = d.socket.send_to(&bytes, to);
+        let ip = r.from.ip();
+        let msg = match outcome {
+            Outcome::Ack | Outcome::AckResidualRemoved => {
+                format!("RADIUS: {what} de {ip} aceito{via}")
+            }
+            Outcome::Nak(c) => {
+                format!(
+                    "RADIUS: {what} de {ip} recusado{via} (Error-Cause {})",
+                    c.value()
+                )
+            }
+        };
+        self.log("info", msg);
     }
 
     /// Send what the clients want sent, handle their timers and events.
@@ -1532,6 +1678,8 @@ impl<'a> Driver<'a> {
         inc.naks = d.naks;
         inc.dropped = d.dropped;
         inc.duplicates = d.duplicates;
+        inc.forwarded = self.forward_count;
+        inc.forward_answered = self.forward_answered;
         st.incoming = inc;
         *guard(&self.aaa.shared.status) = st;
         self.last_status = Instant::now();
@@ -1800,6 +1948,10 @@ pub fn run(aaa: &Aaa, inbox: &Inbox, stopping: &dyn Fn() -> bool) {
         last_status: Instant::now(),
         last_sweep: Instant::now(),
         cancelled: 0,
+        forwarded: HashMap::new(),
+        next_forward: 0,
+        forward_count: 0,
+        forward_answered: 0,
     };
     'outer: loop {
         let wait = d.next_wait();
@@ -1832,6 +1984,8 @@ pub fn run(aaa: &Aaa, inbox: &Inbox, stopping: &dyn Fn() -> bool) {
                         d.reload(*cfg);
                     }
                 }
+                Msg::Forwarded { id, outcome } => d.forward_answer(id, outcome),
+                Msg::PeerCoa(req, done) => done(d.local_coa(&req)),
                 Msg::Stop => break 'outer,
             }
             n += 1;
@@ -1841,6 +1995,7 @@ pub fn run(aaa: &Aaa, inbox: &Inbox, stopping: &dyn Fn() -> bool) {
             next = rx.try_recv().ok();
         }
         d.turn();
+        d.expire_forwarded();
         if d.last_status.elapsed() >= STATUS_EVERY {
             d.publish();
         }

@@ -51,7 +51,7 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
         "{accept?: bool (default no), port?: int 1..65535 (default 3799, RFC 5176; RouterOS uses 1700), vrf?: string, replay_window?: int 10..3600 (s, default 300), require_event_timestamp?: bool, require_message_auth?: bool} → {accept, port, vrf, replay_window, require_event_timestamp, require_message_auth, allowed}",
         always, incoming_set),
     cmd!(query "radius.incoming.get", "RADIUS Incoming", [], None,
-        "{} → {accept, port, vrf, replay_window, require_event_timestamp, require_message_auth, allowed (sources accepted: the enabled /radius entries), listening?, requests, acks, naks, dropped, duplicates, owners, last_error?, daemon}",
+        "{} → {accept, port, vrf, replay_window, require_event_timestamp, require_message_auth, allowed (sources accepted: the enabled /radius entries), listening?, requests, acks, naks, dropped, duplicates, owners, forwarded (unclaimed requests handed to the other BNG of the pair, G4.3hb), forward_answered, last_error?, daemon}",
         always, incoming_get),
     cmd!(query "radius.monitor", "RADIUS Monitor", [], None,
         "{id?: *hex} → [{id, address, state: up|down|probing|disabled|idle, pending, requests, accepts, rejects, acct_responses, resends, timeouts, bad_replies, unsolicited, last_request_rtt (ms), sockets}]",

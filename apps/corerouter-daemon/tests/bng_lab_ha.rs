@@ -25,7 +25,12 @@
 //!   this lab;
 //! - **accounting**: one Start per session, no Stop, and C's Interim with
 //!   the same Acct-Session-Id after the takeover; every record with the
-//!   user's own Class (binary, RFC 2865 §5.25, G4.3ha), C's included.
+//!   user's own Class (binary, RFC 2865 §5.25, G4.3ha), C's included;
+//! - **CoA to the old active** (G4.3hb): A's sync link and witness come
+//!   back (its access and uplink stay down), A rejoins as the standby, and
+//!   the RADIUS server, which still knows A, sends it a burst of CoAs
+//!   (a rate each, up to 1000 sessions): A hands them to C over the sync
+//!   link and answers what C did. ACKs, latency and C's rates are counted.
 //!
 //! With `--root` (`BNG_LAB_ROOT=1`) both nodes run the XDP data plane on
 //! their ports (generic mode).
@@ -360,6 +365,11 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
         "ppp.aaa.set",
         json!({"use_radius": true, "accounting": true, "interim_update": 300}),
     );
+    ok(
+        ns,
+        "radius.incoming.set",
+        json!({"accept": true, "port": 3799}),
+    );
     for i in 0..ports {
         ok(
             ns,
@@ -435,7 +445,7 @@ fn bng_lab_ha() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000]);
     let mut md = String::from(
-        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário |\n|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário | CoA ao nó antigo (ACK, mediana, p99, total) |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for n in scales {
         let row = run(n, &blaster, &out);
@@ -703,6 +713,11 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         "ha {n}: takeover {takeover:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
         interims_c.len()
     );
+    let coa = if single() {
+        "-".to_owned()
+    } else {
+        coa_burst(n, cp)
+    };
     drop(b);
     drop(a);
     drop(radius);
@@ -733,8 +748,108 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();
     }
     format!(
-        "| {n} | {plane} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {wrong_class} |",
+        "| {n} | {plane} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {wrong_class} | {coa} |",
         unique.len(),
         interims_c.len()
+    )
+}
+
+/// G4.3hb: A back as the standby, then a CoA per sampled session sent to
+/// it (the server still knows A), after the same burst straight to C for
+/// comparison; the cell for the summary.
+fn coa_burst(n: usize, cp: u32) -> String {
+    ip(None, &["link", "set", "sync0", "up"]);
+    ip(None, &["addr", "add", "10.99.0.1/24", "dev", "gw0"]);
+    let back = wait_secs(60, || monitor(None)["role"] == "standby").unwrap_or(f64::NAN);
+    let _ = wait_secs(120, || monitor(None)["in_sync"] == true);
+    eprintln!("ha {n}: A back as standby in {back:.2} s");
+    let direct = burst(n, cp, "10.8.0.2:3799", "13M/26M");
+    let via_a = burst(n, cp, "10.8.0.1:3799", "11M/22M");
+    let inc = call(None, "radius.incoming.get", json!({})).unwrap_or(Value::Null);
+    eprintln!(
+        "ha {n}: A forwarded {} answered {}",
+        inc["forwarded"], inc["forward_answered"]
+    );
+    format!("{via_a} (direto em C: {direct})")
+}
+
+/// A CoA (`rate`) per session of C's first 1000, sent to `to` at once:
+/// "ACK/sent (applied on C), median, p99, total".
+fn burst(n: usize, cp: u32, to: &str, rate: &str) -> String {
+    use corerouter_proto_radius::dynauth::{RequestKind, build_request};
+    use corerouter_proto_radius::packet::{AttrList, Code, Packet, PushAttr, attr};
+    let rows = call(Some(cp), "ppp.active.list", json!({"limit": 1000})).unwrap_or(Value::Null);
+    let ips: Vec<std::net::Ipv4Addr> = rows["rows"]
+        .as_array()
+        .map(|r| {
+            r.iter()
+                .filter_map(|x| x["address"].as_str()?.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    // 8 sockets: 256 identifiers each in flight at most.
+    let socks: Vec<UdpSocket> = (0..8)
+        .map(|_| {
+            let s = UdpSocket::bind("10.8.0.1:0").unwrap();
+            s.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+            s
+        })
+        .collect();
+    let t0 = Instant::now();
+    let mut sent_at: HashMap<(usize, u8), Instant> = HashMap::new();
+    for (k, ip) in ips.iter().enumerate() {
+        let mut l = AttrList::new();
+        l.push_ipv4(attr::FRAMED_IP_ADDRESS, *ip).unwrap();
+        l.push_vsa(14988, 8, rate.as_bytes()).unwrap();
+        let (si, id) = (k % socks.len(), (k / socks.len()) as u8);
+        let req = build_request(RequestKind::Coa, id, &l, SECRET.as_bytes(), true);
+        socks[si].send_to(&req, to).unwrap();
+        sent_at.insert((si, id), Instant::now());
+    }
+    let mut lat: Vec<f64> = Vec::new();
+    let mut acks = 0;
+    let mut buf = [0u8; 4096];
+    let until = Instant::now() + Duration::from_secs(20);
+    while lat.len() < ips.len() && Instant::now() < until {
+        for (si, s) in socks.iter().enumerate() {
+            while let Ok((len, _)) = s.recv_from(&mut buf) {
+                let Ok(p) = Packet::parse(&buf[..len]) else {
+                    continue;
+                };
+                if let Some(t) = sent_at.remove(&(si, p.identifier())) {
+                    lat.push(t.elapsed().as_secs_f64() * 1000.0);
+                    acks += usize::from(p.code() == Code::CoaAck);
+                }
+            }
+        }
+    }
+    let total = t0.elapsed().as_secs_f64();
+    lat.sort_by(f64::total_cmp);
+    let pct = |q: f64| {
+        lat.get(((lat.len() as f64 * q) as usize).min(lat.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(f64::NAN)
+    };
+    std::thread::sleep(Duration::from_secs(1));
+    let applied = call(Some(cp), "ppp.active.list", json!({"limit": 1000}))
+        .ok()
+        .and_then(|v| {
+            v["rows"]
+                .as_array()
+                .map(|r| r.iter().filter(|x| x["rate_limit"] == rate).count())
+        })
+        .unwrap_or(0);
+    eprintln!(
+        "ha {n}: {} CoAs to {to}: {acks} ACK, {} answered, median {:.1} ms, p99 {:.1} ms, all in {total:.2} s; C applied {applied}",
+        ips.len(),
+        lat.len(),
+        pct(0.5),
+        pct(0.99),
+    );
+    format!(
+        "{acks}/{} ({applied} em C), {:.0} ms, {:.0} ms, {total:.2} s",
+        ips.len(),
+        pct(0.5),
+        pct(0.99)
     )
 }

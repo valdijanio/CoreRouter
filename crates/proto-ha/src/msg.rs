@@ -5,6 +5,10 @@
 //! magic "CRHA" (4) | version (1) | kind (1) | reserved (2) | length (4, LE) | payload
 //! ```
 //!
+//! In a Hello frame the reserved bytes are its [`Hello::features`]: what
+//! else the sender understands. An older reader ignores them, and a message
+//! of a newer feature goes only to a peer that announced it.
+//!
 //! Payload integers are little-endian. A newer minor version may append
 //! fields at the end of a message; an older reader ignores what it does not
 //! know only inside a [`crate::record::SessionRecord`] (TLV), never in the
@@ -27,6 +31,11 @@ pub const MAX_KEY: usize = 32;
 pub const MAX_VALUE: usize = 8192;
 /// Operations in one delta and records in one chunk.
 pub const MAX_OPS: usize = 16_384;
+/// The body of one [`Msg::Forward`] or [`Msg::ForwardReply`] (a RADIUS
+/// CoA/DM, ≤ 4096 B, as the daemon serializes it).
+pub const MAX_FORWARD: usize = 64 << 10;
+/// [`Hello::features`]: the sender takes [`Msg::Forward`] (G4.3hb).
+pub const FEATURE_FORWARD: u16 = 1;
 /// Config sections compared for drift.
 pub const MAX_SECTIONS: usize = 32;
 
@@ -195,6 +204,8 @@ pub struct Hello {
     pub sessions: u32,
     /// Hashes of the config sections the pair must agree on.
     pub sections: Vec<Section>,
+    /// `FEATURE_*` bits, in the frame header's reserved bytes.
+    pub features: u16,
 }
 
 /// Liveness and role, every hello interval, both ways.
@@ -282,6 +293,18 @@ pub enum Msg {
         node_id: u64,
         mac: [u8; 32],
     },
+    /// A request for the peer's services, opaque to the pair (G4.3hb: a
+    /// RADIUS CoA/Disconnect the server sent to the node that no longer
+    /// holds the session). Only to a peer with [`FEATURE_FORWARD`].
+    Forward {
+        id: u64,
+        body: Vec<u8>,
+    },
+    /// The answer to [`Msg::Forward`] `id`.
+    ForwardReply {
+        id: u64,
+        body: Vec<u8>,
+    },
 }
 
 mod kind {
@@ -297,6 +320,8 @@ mod kind {
     pub const HANDOVER_REQUEST: u8 = 10;
     pub const CHALLENGE: u8 = 11;
     pub const PROOF: u8 = 12;
+    pub const FORWARD: u8 = 13;
+    pub const FORWARD_REPLY: u8 = 14;
 }
 
 mod op {
@@ -373,6 +398,8 @@ impl Msg {
             Msg::HandoverRequest { .. } => kind::HANDOVER_REQUEST,
             Msg::Challenge { .. } => kind::CHALLENGE,
             Msg::Proof { .. } => kind::PROOF,
+            Msg::Forward { .. } => kind::FORWARD,
+            Msg::ForwardReply { .. } => kind::FORWARD_REPLY,
         }
     }
 
@@ -383,7 +410,12 @@ impl Msg {
         out.extend_from_slice(&MAGIC);
         out.push(VERSION);
         out.push(self.kind());
-        out.extend_from_slice(&[0, 0, 0, 0, 0, 0]);
+        let flags = match self {
+            Msg::Hello(h) => h.features,
+            _ => 0,
+        };
+        out.extend_from_slice(&flags.to_le_bytes());
+        out.extend_from_slice(&[0, 0, 0, 0]);
         let r = self.payload(out);
         let len = out.len() - start - HEADER;
         if let Err(e) = r {
@@ -510,12 +542,29 @@ impl Msg {
                 put_u64(out, *node_id);
                 out.extend_from_slice(mac);
             }
+            Msg::Forward { id, body } | Msg::ForwardReply { id, body } => {
+                put_u64(out, *id);
+                if body.len() > MAX_FORWARD {
+                    return Err(Error::TooLong {
+                        what: "forward",
+                        len: body.len(),
+                        max: MAX_FORWARD,
+                    });
+                }
+                out.extend_from_slice(body);
+            }
         }
         Ok(())
     }
 
     /// Reads one frame's payload (`kind` from its header).
     pub fn decode(kind: u8, payload: &[u8]) -> Result<Msg> {
+        Self::decode_flagged(kind, 0, payload)
+    }
+
+    /// [`Msg::decode`] with the header's reserved bytes (a Hello's
+    /// features).
+    pub fn decode_flagged(kind: u8, flags: u16, payload: &[u8]) -> Result<Msg> {
         let mut r = Reader::new(payload);
         let m = match kind {
             kind::HELLO => {
@@ -556,6 +605,7 @@ impl Msg {
                     applied,
                     sessions,
                     sections,
+                    features: flags,
                 })
             }
             kind::HEARTBEAT => Msg::Heartbeat(Heartbeat {
@@ -643,6 +693,23 @@ impl Msg {
                 node_id: r.u64()?,
                 mac: r.array()?,
             },
+            kind::FORWARD | kind::FORWARD_REPLY => {
+                let id = r.u64()?;
+                let n = r.remaining();
+                if n > MAX_FORWARD {
+                    return Err(Error::TooLong {
+                        what: "forward",
+                        len: n,
+                        max: MAX_FORWARD,
+                    });
+                }
+                let body = r.take(n)?.to_vec();
+                if kind == kind::FORWARD {
+                    Msg::Forward { id, body }
+                } else {
+                    Msg::ForwardReply { id, body }
+                }
+            }
             k => return Err(Error::UnknownKind(k)),
         };
         r.end()?;
@@ -689,7 +756,7 @@ impl FrameReader {
             return Err(Error::BadMagic);
         }
         let kind = r.u8()?;
-        let _reserved = r.u16()?;
+        let flags = r.u16()?;
         let len = usize::try_from(r.u32()?).unwrap_or(usize::MAX);
         if len > MAX_FRAME {
             return Err(Error::TooLong {
@@ -701,7 +768,7 @@ impl FrameReader {
         let Some(payload) = avail.get(HEADER..HEADER + len) else {
             return Ok(None);
         };
-        let m = Msg::decode(kind, payload)?;
+        let m = Msg::decode_flagged(kind, flags, payload)?;
         self.start += HEADER + len;
         if self.start == self.buf.len() {
             self.buf.clear();
@@ -743,6 +810,7 @@ mod tests {
                     name: "ppp.profile".into(),
                     hash: 0xdead,
                 }],
+                features: FEATURE_FORWARD,
             }),
             Msg::Heartbeat(Heartbeat {
                 node_id: 7,
@@ -807,7 +875,44 @@ mod tests {
                 node_id: 9,
                 mac: [3; 32],
             },
+            Msg::Forward {
+                id: 5,
+                body: b"{\"kind\":\"coa\"}".to_vec(),
+            },
+            Msg::ForwardReply {
+                id: 5,
+                body: Vec::new(),
+            },
         ]
+    }
+
+    /// G4.3hb: an older reader (it ignored the reserved bytes) reads a
+    /// Hello with features as it was; a Forward is never sent to it.
+    #[test]
+    fn hello_features_ride_in_the_reserved_bytes() {
+        let Some(Msg::Hello(h)) = samples().into_iter().next() else {
+            panic!("the first sample is a Hello");
+        };
+        let mut b = Vec::new();
+        Msg::Hello(h.clone()).encode(&mut b).unwrap();
+        assert_eq!(&b[6..8], &FEATURE_FORWARD.to_le_bytes());
+        let payload = &b[HEADER..];
+        let Ok(Msg::Hello(old)) = Msg::decode(kind::HELLO, payload) else {
+            panic!("decodes without the header");
+        };
+        assert_eq!(old.features, 0);
+        assert_eq!(
+            Hello {
+                features: FEATURE_FORWARD,
+                ..old
+            },
+            h
+        );
+        let big = Msg::Forward {
+            id: 1,
+            body: vec![0; MAX_FORWARD + 1],
+        };
+        assert!(big.encode(&mut Vec::new()).is_err());
     }
 
     #[test]
