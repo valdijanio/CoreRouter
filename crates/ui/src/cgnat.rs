@@ -1,5 +1,7 @@
 //! CGNAT (G2.3d): the pools, the 1:1 exceptions, "who was", the mapping
-//! table, the port blocks and the port alerts, as tabs of one window (parts
+//! table, the port blocks, the port alerts and the capacity (G2.7b: how
+//! many ports the subscribers really use and the `ports_per_subscriber`
+//! that fits, applied under Safe Mode), as tabs of one window (parts
 //! of a window are tabs, `docs/ui-style.md`). Everything comes from
 //! `ip.firewall.cgnat.*`: the engine computes the formula, the capacity
 //! and the checks; this only shows and sends. Every field has an ⓘ.
@@ -51,6 +53,7 @@ pub(crate) enum Tab {
     Mapping,
     Blocks,
     Alerts,
+    Capacity,
     History,
 }
 
@@ -164,6 +167,7 @@ pub(crate) struct Cgnat {
     pub(crate) alerts: Value,
     pub(crate) history: Vec<Value>,
     pub(crate) who: WhoWas,
+    pub(crate) capacity: CapacityView,
     pools_t: TableState,
     exceptions_t: TableState,
     mapping_t: TableState,
@@ -186,9 +190,25 @@ pub(crate) struct WhoWas {
     pub lookup: Option<Result<Value, String>>,
 }
 
+/// The Capacity tab (G2.7b): the pool shown, its numbers, the ports to
+/// try and their preview.
+#[derive(Default)]
+pub(crate) struct CapacityView {
+    pub pool: String,
+    pub data: Value,
+    /// The value in the field (the suggestion until the operator types).
+    pub ports: String,
+    pub preview: Option<Result<Value, String>>,
+    /// The ports the preview was asked for: apply only what was previewed.
+    pub previewed: String,
+    pub applied: Option<Result<Value, String>>,
+}
+
 enum Reply {
     WhoWas,
     Lookup,
+    CapacityPreview,
+    CapacityApplied,
     Other,
 }
 
@@ -769,6 +789,234 @@ impl Cgnat {
         table::show(ui, ALERTS, 0.0, &mut self.alerts_t, &ALERT_COLUMNS, &rows, |_, _| {});
     }
 
+    /// The pool the Capacity tab shows: the chosen one, else the first.
+    fn capacity_pool(&self) -> String {
+        if !self.capacity.pool.is_empty() && self.pools.iter().any(|p| text(p, "name") == self.capacity.pool) {
+            return self.capacity.pool.clone();
+        }
+        self.pools.first().map(|p| text(p, "name")).unwrap_or_default()
+    }
+
+    fn info(&mut self, ui: &mut Ui, l: Lang, key: &'static str, title: &'static str) {
+        if help::info_button(ui, Id::unique(key), tr(l, title)).clicked() {
+            self.help = Some(HelpView::new(key, tr(l, title)));
+        }
+    }
+
+    fn capacity_tab(&mut self, app: &mut CoreRouterUi, ui: &mut Ui, l: Lang) {
+        let pool = self.capacity_pool();
+        if pool.is_empty() {
+            ui.weak(tr(l, "No pool yet."));
+            return;
+        }
+        ui.horizontal(|ui| {
+            ui.label(tr(l, "Pool"));
+            ComboBox::from_id_salt("cgnat-capacity-pool").selected_text(&pool).show_ui(ui, |ui| {
+                for p in &self.pools {
+                    let name = text(p, "name");
+                    if ui.selectable_label(name == pool, &name).clicked() && name != pool {
+                        self.capacity = CapacityView { pool: name, ..CapacityView::default() };
+                        app.cache.refreshed_at = None;
+                    }
+                }
+            });
+            self.info(ui, l, "cgnat.capacity", "Capacity");
+            let d = &self.capacity.data;
+            if d.get("seen").is_some() {
+                ui.weak(format!(
+                    "{} {} {} {} · {}",
+                    text(d, "seen"),
+                    tr(l, "of"),
+                    text(d, "subscribers"),
+                    tr(l, "subscribers seen"),
+                    tr(l, "peaks of the last 7 days")
+                ));
+            }
+        });
+        let d = self.capacity.data.clone();
+        if d.get("ports").is_none() {
+            ui.weak(tr(l, "Waiting for the router…"));
+            return;
+        }
+        ui.add_space(4.0);
+        // Three cards: the limit, the p99 peak, who hit the limit.
+        let width = ((ui.available_width() - 16.0) / 3.0).max(180.0);
+        ui.horizontal(|ui| {
+            let card = |me: &mut Self, ui: &mut Ui, key: &'static str, title: &'static str, big: String, small: String, tone: Option<chip::Tone>| {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.set_width(width - 14.0);
+                    ui.set_min_height(74.0);
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(tr(l, title));
+                            me.info(ui, l, key, title);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.heading(&big);
+                            if let Some(t) = tone {
+                                chip::chip(ui, &small, t);
+                            }
+                        });
+                        if tone.is_none() {
+                            ui.weak(&small);
+                        }
+                    });
+                });
+            };
+            let per = text(&d, "per_address");
+            card(self, ui, "cgnat.capacity.ports", "Ports per Subscriber", text(&d, "ports"), format!("{per} {}", tr(l, "per public address")), None);
+            let pct = d.get("p99_percent").and_then(Value::as_u64).unwrap_or(0);
+            let tone = match pct {
+                0..=74 => chip::GREEN.tone(ui.visuals()),
+                75..=89 => chip::AMBER.tone(ui.visuals()),
+                _ => chip::RED.tone(ui.visuals()),
+            };
+            card(self, ui, "cgnat.capacity.p99", "Peak p99, 7 days", text(&d, "p99"), format!("{pct} %"), Some(tone));
+            let hit = d.get("hit_24h").and_then(Value::as_u64).unwrap_or(0);
+            let small = format!(
+                "{} {} · ICMP {}",
+                text(&d, "refused_24h"),
+                tr(l, "connections refused"),
+                text(&d, "icmp_24h")
+            );
+            let tone = if hit > 0 { chip::RED.tone(ui.visuals()) } else { chip::GREEN.tone(ui.visuals()) };
+            card(self, ui, "cgnat.capacity.hit", "Hit the limit, 24 h", hit.to_string(), small, Some(tone));
+        });
+        ui.add_space(6.0);
+        // The distribution of the 7-day peaks.
+        ui.horizontal(|ui| {
+            ui.strong(tr(l, "Peak distribution"));
+            self.info(ui, l, "cgnat.capacity.bands", "Peak distribution");
+        });
+        let bands: Vec<(String, u64)> = d
+            .get("bands")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().map(|b| (text(b, "band"), b.get("count").and_then(Value::as_u64).unwrap_or(0))).collect())
+            .unwrap_or_default();
+        let most = bands.iter().map(|b| b.1).max().unwrap_or(0).max(1);
+        Grid::new("cgnat-capacity-bands").num_columns(3).spacing([10.0, 3.0]).show(ui, |ui| {
+            for (band, count) in &bands {
+                ui.label(if band == "100" { "100 %".to_owned() } else { format!("{band} %") });
+                let hue = match band.as_str() {
+                    "100" => &chip::RED,
+                    "90-100" => &chip::AMBER,
+                    _ => &chip::BLUE,
+                };
+                let tone = hue.tone(ui.visuals());
+                let full = 360.0;
+                let (rect, _) = ui.allocate_exact_size(egui::vec2(full, 14.0), egui::Sense::hover());
+                ui.painter().rect_filled(rect, 3.0, tone.fill);
+                let w = full * (*count as f32) / (most as f32);
+                let bar = egui::Rect::from_min_size(rect.min, egui::vec2(w.max(if *count > 0 { 2.0 } else { 0.0 }), rect.height()));
+                ui.painter().rect_filled(bar, 3.0, tone.ink);
+                ui.label(count.to_string());
+                ui.end_row();
+            }
+        });
+        ui.add_space(6.0);
+        // The suggestion, its preview and the apply under Safe Mode.
+        ui.horizontal(|ui| {
+            ui.strong(tr(l, "Suggestion"));
+            self.info(ui, l, "cgnat.capacity.suggestion", "Suggestion");
+        });
+        let Some(sug) = d.get("suggestion").cloned() else {
+            ui.weak(tr(l, "No suggestion: no readings yet, or a blocks-mode pool (grow max_blocks instead)."));
+            return;
+        };
+        let now = text(&d, "ports_per_subscriber");
+        Grid::new("cgnat-capacity-suggestion").num_columns(2).spacing([12.0, 4.0]).show(ui, |ui| {
+            ui.label(tr(l, "Ports per Subscriber"));
+            ui.horizontal(|ui| {
+                ui.label(format!("{now} ->"));
+                ui.add(TextEdit::singleline(&mut self.capacity.ports).desired_width(70.0));
+                chip::chip(ui, &format!("{} {}", tr(l, "suggested"), text(&sug, "ports_per_subscriber")), chip::BLUE.tone(ui.visuals()));
+            });
+            ui.end_row();
+            ui.label(tr(l, "Per public address"));
+            let gain = sug.get("gain_per_address").and_then(Value::as_i64).unwrap_or(0);
+            ui.horizontal(|ui| {
+                ui.label(format!("{} -> {}", text(&d, "per_address"), text(&sug, "per_address")));
+                let (label, hue) = if gain >= 0 { (format!("+{gain}"), &chip::GREEN) } else { (gain.to_string(), &chip::AMBER) };
+                chip::chip(ui, &label, hue.tone(ui.visuals()));
+            });
+            ui.end_row();
+            ui.label(tr(l, "Public addresses"));
+            let fits = sug.get("fits").and_then(Value::as_bool) == Some(true);
+            ui.horizontal(|ui| {
+                ui.label(format!("{} {} {}", text(&sug, "public_needed"), tr(l, "needed of"), text(&d, "public_addresses")));
+                if !fits {
+                    chip::chip(ui, tr(l, "does not fit"), chip::RED.tone(ui.visuals()));
+                }
+            });
+            ui.end_row();
+            ui.label(tr(l, "Why"));
+            ui.label(tr(l, static_reason(&text(&sug, "reason"))));
+            ui.end_row();
+        });
+        let ports = self.capacity.ports.trim().to_owned();
+        ui.horizontal(|ui| {
+            let can_preview = app.can().check("ip.firewall.cgnat.capacity.preview").is_ok() && !ports.is_empty();
+            if ui.add_enabled(can_preview, egui::Button::new(tr(l, "Preview"))).clicked() {
+                let n: u64 = ports.parse().unwrap_or(0);
+                self.capacity.previewed = ports.clone();
+                self.capacity.applied = None;
+                app.run_then(
+                    "ip.firewall.cgnat.capacity.preview",
+                    json!({"pool": pool, "ports_per_subscriber": n}),
+                    crate::panel::then(NAME, Reply::CapacityPreview),
+                );
+            }
+            let previewed_ok = self.capacity.previewed == ports
+                && matches!(&self.capacity.preview, Some(Ok(v)) if v.get("fits").and_then(Value::as_bool) == Some(true));
+            let can_apply = previewed_ok
+                && app.can().check("config.safe-mode.enter").is_ok()
+                && app.can().check("ip.firewall.cgnat.pool.set").is_ok();
+            let apply = ui
+                .add_enabled(can_apply, egui::Button::new(tr(l, "Apply with Safe Mode")))
+                .on_disabled_hover_text(tr(l, "Preview this value first"));
+            if apply.clicked() {
+                let n: u64 = ports.parse().unwrap_or(0);
+                app.run("config.safe-mode.enter", json!({}));
+                app.run_then(
+                    "ip.firewall.cgnat.pool.set",
+                    json!({"id": pool, "ports_per_subscriber": n}),
+                    crate::panel::then(NAME, Reply::CapacityApplied),
+                );
+            }
+            self.info(ui, l, "cgnat.capacity.apply", "Apply with Safe Mode");
+        });
+        match &self.capacity.preview {
+            Some(Ok(v)) => {
+                ui.horizontal(|ui| {
+                    chip::chip(ui, &format!("{} {}", text(v, "remapped"), tr(l, "subscribers remapped")), chip::AMBER.tone(ui.visuals()));
+                    chip::chip(ui, &format!("{} {}", text(v, "connections"), tr(l, "connections dropped")), chip::AMBER.tone(ui.visuals()));
+                    if v.get("fits").and_then(Value::as_bool) == Some(true) {
+                        chip::chip(ui, &format!("{} {}", text(v, "per_address"), tr(l, "per public address")), chip::GREEN.tone(ui.visuals()));
+                    } else {
+                        chip::chip(ui, tr(l, "does not fit"), chip::RED.tone(ui.visuals()));
+                        ui.weak(text(v, "error"));
+                    }
+                });
+            }
+            Some(Err(e)) => {
+                ui.colored_label(chip::RED.tone(ui.visuals()).ink, e);
+            }
+            None => {}
+        }
+        match &self.capacity.applied {
+            Some(Ok(_)) => {
+                ui.colored_label(
+                    chip::GREEN.tone(ui.visuals()).ink,
+                    tr(l, "Applied under Safe Mode: confirm with the Safe Mode button, or it rolls back."),
+                );
+            }
+            Some(Err(e)) => {
+                ui.colored_label(chip::RED.tone(ui.visuals()).ink, e);
+            }
+            None => {}
+        }
+    }
+
     fn history_tab(&mut self, ui: &mut Ui, l: Lang) {
         ui.horizontal(|ui| {
             ui.weak(tr(l, "Every change of the pools, with its time (RFC 7422 §3): who was reads the one in force."));
@@ -837,6 +1085,12 @@ impl PanelState for Cgnat {
                 out.push(q("block_history", "ip.firewall.cgnat.block.history", json!({"count": 500})));
             }
             Tab::Alerts => out.push(q("alerts", "ip.firewall.cgnat.alert.list", json!({}))),
+            Tab::Capacity => {
+                let pool = self.capacity_pool();
+                if !pool.is_empty() {
+                    out.push(q("capacity", "ip.firewall.cgnat.capacity.get", json!({"pool": pool})));
+                }
+            }
             Tab::History => out.push(q("history", "ip.firewall.cgnat.history.list", json!({}))),
             _ => {}
         }
@@ -858,6 +1112,15 @@ impl PanelState for Cgnat {
             ("blocks", v) => self.blocks = v,
             ("block_history", Value::Array(a)) => self.block_history = a,
             ("alerts", v) => self.alerts = v,
+            ("capacity", v) => {
+                // A new suggestion fills the field unless the operator typed.
+                let old = self.capacity.data.get("suggestion").map(|s| text(s, "ports_per_subscriber"));
+                let new = v.get("suggestion").map(|s| text(s, "ports_per_subscriber"));
+                if new.is_some() && (self.capacity.ports.is_empty() || self.capacity.ports == old.clone().unwrap_or_default()) {
+                    self.capacity.ports = new.unwrap_or_default();
+                }
+                self.capacity.data = v;
+            }
             ("history", Value::Array(a)) => self.history = a,
             _ => {}
         }
@@ -874,6 +1137,7 @@ impl PanelState for Cgnat {
                 (Tab::Mapping, "Mapping"),
                 (Tab::Blocks, "Blocks"),
                 (Tab::Alerts, "Alerts"),
+                (Tab::Capacity, "Capacity"),
                 (Tab::History, "History"),
             ] {
                 if tab == Tab::Blocks && !has_blocks {
@@ -893,6 +1157,7 @@ impl PanelState for Cgnat {
             Tab::Mapping => self.mapping_tab(app, ui, l),
             Tab::Blocks => self.blocks_tab(ui, l),
             Tab::Alerts => self.alerts_tab(app, ui, l),
+            Tab::Capacity => self.capacity_tab(app, ui, l),
             Tab::History => self.history_tab(ui, l),
         }
     }
@@ -929,6 +1194,12 @@ impl PanelState for Cgnat {
             match *r {
                 Reply::WhoWas => self.who.answer = Some(result.clone()),
                 Reply::Lookup => self.who.lookup = Some(result.clone()),
+                Reply::CapacityPreview => self.capacity.preview = Some(result.clone()),
+                Reply::CapacityApplied => {
+                    self.capacity.applied = Some(result.clone());
+                    self.capacity.preview = None;
+                    self.capacity.previewed.clear();
+                }
                 Reply::Other => {}
             }
         }
@@ -983,4 +1254,13 @@ fn in_range(range: &str, ip: &str) -> bool {
         return u32::from(a) & mask == ip & mask;
     }
     range.parse::<std::net::Ipv4Addr>().is_ok_and(|a| u32::from(a) == ip)
+}
+
+/// The engine's suggestion reasons, as `'static` keys for the translation.
+fn static_reason(r: &str) -> &'static str {
+    match r {
+        "already right" => "already right",
+        "more than 1 % of the subscribers ran out of ports in 24 h" => "more than 1 % of the subscribers ran out of ports in 24 h",
+        _ => "p99 of the 7-day peaks plus 25 %",
+    }
 }

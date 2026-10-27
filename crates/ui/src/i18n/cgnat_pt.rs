@@ -5,6 +5,8 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("A subscriber with a public address of its own (1:1), outside every pool.", "Assinante com IP público próprio (1:1), fora de qualquer pool."),
     ("Alert %", "Alerta %"),
     ("Alerts", "Alertas"),
+    ("Applied under Safe Mode: confirm with the Safe Mode button, or it rolls back.", "Aplicado em Safe Mode: confirme no botão Safe Mode, ou volta sozinho."),
+    ("Apply with Safe Mode", "Aplicar com Safe Mode"),
     ("Asked for (UTC)", "Pedido (UTC)"),
     ("Block Timeout", "Tempo do bloco ocioso"),
     ("Block log", "Log de blocos"),
@@ -21,6 +23,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("Hairpin", "Hairpin"),
     ("History", "Histórico"),
     ("History kept", "Histórico guardado"),
+    ("Hit the limit, 24 h", "Bateram no limite, 24 h"),
     ("ICMP Unreachable", "ICMP inalcançável"),
     ("Inside", "Internos"),
     ("Last", "Última"),
@@ -32,31 +35,55 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     ("New CGNAT Pool", "Novo pool CGNAT"),
     ("New connections dropped for lack of a port (RFC 6888 REQ-11)", "Conexões novas descartadas por falta de porta (RFC 6888 REQ-11)"),
     ("New connections the kernel could not translate: no free port", "Conexões novas que o kernel não traduziu: sem porta livre"),
+    ("No pool yet.", "Nenhum pool ainda."),
+    ("No suggestion: no readings yet, or a blocks-mode pool (grow max_blocks instead).", "Sem sugestão: ainda sem leituras, ou pool no modo blocos (aumente max_blocks)."),
     ("Out. Interface", "Interface de saída"),
     ("Outside", "Públicos"),
     ("Peak", "Pico"),
+    ("Peak distribution", "Distribuição do pico"),
+    ("Peak p99, 7 days", "Pico p99, 7 dias"),
     ("Per IP", "Por IP"),
+    ("Per public address", "Por IP público"),
     ("Pool", "Pool"),
     ("Pools", "Pools"),
     ("Port Range", "Faixa de portas"),
     ("Ports per Subscriber", "Portas por assinante"),
+    ("Preview", "Prévia"),
+    ("Preview this value first", "Faça a prévia deste valor antes"),
     ("Public", "Público"),
     ("Public Address", "IP público"),
+    ("Public addresses", "IPs públicos"),
     ("Refused", "Recusadas"),
     ("Since", "Desde"),
     ("Subscriber or public", "Assinante ou público"),
     ("Subscribers", "Assinantes"),
     ("Subscribers near the end of their ports: their new connections are checked for a free port", "Assinantes perto do fim das portas: as conexões novas deles são conferidas (há porta livre?)"),
+    ("Suggestion", "Sugestão"),
     ("Times", "Vezes"),
     ("Until", "Até"),
     ("Used", "Em uso"),
+    ("Waiting for the router…", "Esperando o roteador…"),
     ("Who Was", "Quem era?"),
     ("Who used a public address and port at a given time (Marco Civil, Lei 12.965/2014 art. 13).", "Quem usava um IP público e porta num dado momento (Marco Civil, Lei 12.965/2014 art. 13)."),
+    ("Why", "Motivo"),
+    ("already right", "já está certo"),
     ("blocks in use", "blocos em uso"),
+    ("connections dropped", "conexões derrubadas"),
+    ("connections refused", "conexões recusadas"),
     ("days", "dias"),
+    ("does not fit", "não cabe"),
     ("in force", "em vigor"),
+    ("more than 1 % of the subscribers ran out of ports in 24 h", "mais de 1 % dos assinantes ficou sem portas em 24 h"),
+    ("needed of", "necessários de"),
     ("now", "agora"),
+    ("of", "de"),
+    ("p99 of the 7-day peaks plus 25 %", "p99 dos picos de 7 dias mais 25 %"),
+    ("peaks of the last 7 days", "picos dos últimos 7 dias"),
+    ("per public address", "por IP público"),
     ("since", "desde"),
+    ("subscribers remapped", "assinantes remapeados"),
+    ("subscribers seen", "assinantes vistos"),
+    ("suggested", "sugerido"),
 ];
 
 /// Explanations: (key, Markdown).
@@ -90,6 +117,66 @@ Modo blocos: quanto tempo um bloco **sem nenhuma conexão** fica com o assinante
         "## Blocks
 
 Os blocos de portas em uso (modo blocos): de quem, em que IP, desde quando, qual é o atual (onde entram as conexões novas) e há quanto tempo um bloco está ocioso. Embaixo, o log de blocos (alocação e devolução), que o \"Quem era?\" consulta.",
+    ),
+    (
+        "cgnat.capacity",
+        "## Capacity
+
+**O que é:** quantas portas os assinantes deste pool usam de verdade, e quantas portas por assinante isso pede. A cada 10 s o roteador lê as conexões (fora do caminho dos pacotes) e guarda, por assinante, o **pico de cada dia** dos últimos 7 dias.
+
+**Para que serve:** dimensionar `ports_per_subscriber`. Portas demais desperdiçam IP público; de menos, o assinante fica sem conexão nova (\"um site não abre\").
+
+**Vistos:** só entram os assinantes que tiveram conexões nos 7 dias; os outros não pesam na conta.",
+    ),
+    (
+        "cgnat.capacity.apply",
+        "## Prévia e Aplicar com Safe Mode
+
+**Prévia:** conta, sem mudar nada, quantos assinantes **mudam de IP ou de portas** (mudar as portas por assinante remapeia o pool inteiro) e quantas **conexões vivas serão derrubadas** — o roteador as derruba no commit, para o \"Quem era?\" continuar exato.
+
+**Aplicar com Safe Mode:** liga o Safe Mode e muda `ports_per_subscriber`. Se a sessão cair ou você não confirmar no botão Safe Mode, tudo volta sozinho. O histórico do \"Quem era?\" guarda a mudança com a hora (RFC 7422 §3).
+
+**Cuidado:** os assinantes perdem as conexões em curso. Prefira a madrugada.",
+    ),
+    (
+        "cgnat.capacity.bands",
+        "## Distribuição do pico
+
+Quantos assinantes têm o pico de 7 dias em cada faixa do limite: até 25 %, 25–50 %, 50–75 %, 75–90 %, 90–100 % e **100 %** (encostaram no limite).
+
+Um pool bem dimensionado tem quase todos nas primeiras faixas e poucos acima de 90 %.",
+    ),
+    (
+        "cgnat.capacity.hit",
+        "## Bateram no limite, 24 h
+
+Assinantes que tiveram **conexão nova recusada por falta de porta** nas últimas 24 h (RFC 6888 REQ-11), quantas conexões foram recusadas e quantos **ICMP host unreachable** o roteador mandou a eles (com o limite de taxa por assinante).
+
+Zero é o normal. Muitos aqui pedem mais portas por assinante; um só costuma ser P2P ou máquina infectada: veja a aba Alerts e as Connections do Firewall.",
+    ),
+    (
+        "cgnat.capacity.p99",
+        "## Pico p99, 7 dias
+
+Pega o **maior uso de cada assinante** nos últimos 7 dias (no protocolo mais cheio: TCP, UDP ou ICMP) e mostra o valor que **99 %** deles não passam. O % é sobre o limite atual.
+
+**Verde** abaixo de 75 %, **âmbar** até 90 %, **vermelho** acima: o 1 % mais pesado já encosta no limite.",
+    ),
+    (
+        "cgnat.capacity.ports",
+        "## Ports per Subscriber
+
+O limite de cada assinante hoje: `ports_per_subscriber` (no modo blocos, vezes `max_blocks`), e quantos assinantes cabem em cada IP público com ele.",
+    ),
+    (
+        "cgnat.capacity.suggestion",
+        "## Sugestão
+
+**Como é calculada:** o pico p99 dos 7 dias mais 25 % de folga, arredondado para cima em múltiplos de 64, nunca abaixo de 320. Se mais de 1 % dos assinantes ficou sem porta em 24 h, pelo menos 1,5 × o valor de hoje.
+
+**Ganho:** quantos assinantes a mais (ou a menos) cabem em cada IP público, e quantos IPs públicos o pool passa a precisar. \"Não cabe\" quer dizer que faltam IPs públicos para todos os assinantes com esse valor.
+
+**Pode digitar outro valor** antes da prévia. O 1 % mais pesado pode continuar batendo no limite: uma exceção 1:1 resolve o caso dele sem gastar porta de todos.",
     ),
     (
         "cgnat.comment",

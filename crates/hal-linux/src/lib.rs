@@ -759,6 +759,12 @@ mod linux {
             })
         }
 
+        fn conntrack_scanner(
+            &self,
+        ) -> Result<Box<dyn corerouter_hal::conntrack::Scanner>, HalError> {
+            Ok(Box::new(crate::ctnl::Scanner))
+        }
+
         fn cgnat_full(&mut self, subscribers: &[std::net::Ipv4Addr]) -> Result<(), HalError> {
             let want: crate::cgnat::Full = subscribers.iter().copied().collect();
             if self.cgnat_full == want {

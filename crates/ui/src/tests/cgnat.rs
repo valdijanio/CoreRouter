@@ -123,3 +123,45 @@ fn blocks_and_alerts_of_a_blocks_pool() {
     let alerts = h.app.panel_mut::<Cgnat>().unwrap().alerts.clone();
     assert!(!alerts["rows"].as_array().unwrap().is_empty(), "heavy users at their one block: {alerts}");
 }
+
+/// G2.7b: the Capacity tab shows the cards, the distribution and the
+/// suggestion; Preview counts who moves; Apply enters Safe Mode and sets the
+/// ports.
+#[test]
+fn the_capacity_tab_previews_and_applies_under_safe_mode() {
+    let mut s = Session::virtual_lab();
+    s.tick(1_780_000_000);
+    s.execute(
+        "ip.firewall.cgnat.pool.add",
+        &json!({"name": "c1", "inside": "100.64.0.0/22", "outside": "203.0.113.0/27"}),
+    )
+    .unwrap();
+    for t in 1..=12 {
+        s.tick(1_780_000_000 + t);
+    }
+    let mut h = Harness::with_session(s);
+    h.app.open.clear();
+    h.app.open(Win::Panel(WIN));
+    refresh(&mut h);
+    // "Capacity" is also a column of the Pools tab: pick the tab itself.
+    h.app.panel_mut::<Cgnat>().unwrap().tab = Tab::Capacity;
+    refresh(&mut h);
+    assert!(h.has_text("Peak p99, 7 days"));
+    assert!(h.has_text("Hit the limit, 24 h"));
+    assert!(h.has_text("Peak distribution"));
+    assert!(h.has_text("90-100 %"));
+    assert!(h.has_text("suggested 1536"), "the engine's suggestion");
+    assert_eq!(h.app.panel_mut::<Cgnat>().unwrap().capacity.ports, "1536");
+    h.click(h.text("Preview"));
+    refresh(&mut h);
+    assert!(h.has_text("1024 subscribers remapped"));
+    let pv = h.app.panel_mut::<Cgnat>().unwrap().capacity.preview.clone().unwrap().unwrap();
+    let dropped = pv["connections"].as_u64().unwrap();
+    assert!(dropped > 1000, "{pv}");
+    assert!(h.has_text(&format!("{dropped} connections dropped")));
+    h.click(h.text("Apply with Safe Mode"));
+    refresh(&mut h);
+    let pools = h.app.panel_mut::<Cgnat>().unwrap().pools.clone();
+    assert_eq!(pools[0]["ports_per_subscriber"], 1536);
+    assert!(h.has_text("Applied under Safe Mode: confirm with the Safe Mode button, or it rolls back."));
+}
