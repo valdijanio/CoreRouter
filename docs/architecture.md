@@ -38,6 +38,26 @@ recomendação é um atualizador próprio em Rust em vez do RAUC (a atualizaçã
 comando com journal e Safe Mode; boot por EFI stub). Comparação, fontes e números em
 `docs/os-image.md`.
 
+#### 1.1.2 A/B e atualização (G1.6b)
+
+**Decisão: o gerenciador de boot da UEFI é o bootloader, e o `BootNext` é o contador de boot de
+uma tentativa.** Cada slot tem um `Boot####` com a sua linha de comando (dm-verity por
+`dm-mod.create`, sem initramfs; parâmetros do Tuning › Boot); `BootOrder` = confirmado, depois o
+outro; o teste é um `BootNext`, que o firmware apaga ao usá-lo: qualquer falha volta ao
+confirmado. Confirmar = reescrever o `BootOrder`. Comparado com um bootloader nosso (GRUB ou
+systemd-boot com contador): nenhum binário a mais no caminho do boot e nada a decrementar, ao
+custo de uma tentativa só (que é o que um roteador quer: cada tentativa ruim é tempo fora do ar)
+e de depender do firmware honrar o `BootNext` (o init detecta quando não honra).
+
+O código é o crate `corerouter-sysupdate` (L1, plataforma: só apps e xtask o usam): pacote
+`.crpkg` (manifesto JSON assinado com Ed25519 do `ring`), árvore do dm-verity (formato do
+`veritysetup`), variáveis por efivarfs, GPT, estado do teste em `/config/package/`. O engine só
+enfileira (`system.package.*`, `crate::package`); o serviço `package` do daemon faz a E/S fora do
+lock; o `corerouter-init` decide no boot (marca o teste, restaura a config depois de um teste
+que falhou) e reinicia no prazo. Atualizador próprio × RAUC reavaliado com números (passou de
+1.500 linhas): fica o próprio; comparação e números em `docs/os-image.md`, "A/B e atualização
+segura".
+
 ### 1.2 Data plane, firewall e CGNAT
 
 | Critério | Kernel nativo (Netlink + nftables) | **eBPF/XDP com `aya`** | DPDK / VPP |

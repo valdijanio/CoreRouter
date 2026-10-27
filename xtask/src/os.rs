@@ -21,6 +21,8 @@ use std::time::{Duration, Instant};
 use crate::Outcome;
 use crate::vm_lab::{download, sha256_file};
 
+mod ab;
+
 const DEFCONFIG: &str = "corerouter_x86_64_defconfig";
 /// Free space the build wants before it starts (cold build: ~8 GB in
 /// `os/out`, **medido**; the rest is headroom for parallel sessions).
@@ -54,6 +56,9 @@ const REQUIRED_KERNEL: &[&str] = &[
     "CONFIG_EXT4_FS",
     "CONFIG_EFI_STUB",
     "CONFIG_DEVTMPFS_MOUNT",
+    "CONFIG_DM_VERITY",
+    "CONFIG_DM_INIT",
+    "CONFIG_EFIVAR_FS",
 ];
 /// Buildroot options the image's design rests on (docs/os-image.md).
 const REQUIRED_BR2: &[&str] = &[
@@ -74,7 +79,7 @@ const GUEST_IP_ARG: &str = "ip=10.0.2.15::10.0.2.2:255.255.255.0::eth0:off";
 /// The daemon's TLS control port inside the image (corerouter-init's plan).
 const GUEST_TLS_PORT: u16 = 8729;
 
-const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|check>";
+const USAGE: &str = "usage: cargo xtask os <build [--jobs N] [--top-jobs N] [--key PKCS8] [--channel C]|boot-test [--efi] [--tcg] [--timeout S] [--append ARGS] [--keep-config]|ab-test [--tcg] [--scenario update|no-confirm|bad-signature|bad-param]|package --out FILE [--version V] [--build N] [--channel C] [--key PKCS8]|check>";
 
 pub fn main(root: &Path, args: &[String]) -> Outcome {
     let (sub, rest) = match args.split_first() {
@@ -84,6 +89,8 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
     let res = match sub {
         "build" => build(root, rest),
         "boot-test" => boot_test(root, rest),
+        "ab-test" => images_dir(root).and_then(|i| ab::ab_test(root, &i, rest)),
+        "package" => images_dir(root).and_then(|i| package_cmd(root, &i, rest)),
         "check" => check(&root.join("os")).map(|n| eprintln!("ok: os/ configuration ({n} checks)")),
         "-h" | "--help" => {
             eprintln!("{USAGE}");
@@ -95,6 +102,75 @@ pub fn main(root: &Path, args: &[String]) -> Outcome {
         Ok(()) => Outcome::Ok,
         Err(e) => Outcome::Fail(e),
     }
+}
+
+/// `os package`: another package of the sealed build (`corerouter-image package`).
+fn package_cmd(root: &Path, images: &Path, args: &[String]) -> Result<(), String> {
+    let tool = ab::tool(root)?;
+    let mut cmd = Command::new(&tool);
+    cmd.arg("package").arg("--images").arg(images);
+    if !args.iter().any(|a| a == "--key") {
+        cmd.arg("--keys").arg(root.join("os/out/keys"));
+    }
+    let st = cmd
+        .args(args)
+        .status()
+        .map_err(|e| format!("{}: {e}", tool.display()))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("corerouter-image package: {st}"))
+    }
+}
+
+fn images_dir(root: &Path) -> Result<PathBuf, String> {
+    let lock = parse_lock(
+        &std::fs::read_to_string(root.join("os/buildroot.lock")).map_err(|e| e.to_string())?,
+    )?;
+    Ok(dirs(root, &lock).out.join("images"))
+}
+
+/// `pub const FORMAT_VERSION: u32 = N;` of the model (the configuration
+/// schema the image's daemon writes), read from the source.
+fn config_format(root: &Path) -> Result<u32, String> {
+    let src = std::fs::read_to_string(root.join("crates/model/src/persist.rs"))
+        .map_err(|e| e.to_string())?;
+    src.lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("pub const FORMAT_VERSION: u32 = ")?
+                .strip_suffix(';')?
+                .parse()
+                .ok()
+        })
+        .ok_or_else(|| "crates/model/src/persist.rs: no FORMAT_VERSION".into())
+}
+
+/// The workspace version (`[workspace.package] version`).
+fn workspace_version(root: &Path) -> String {
+    std::fs::read_to_string(root.join("Cargo.toml"))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .skip_while(|l| l.trim() != "[workspace.package]")
+                .find_map(|l| {
+                    l.trim()
+                        .strip_prefix("version = ")
+                        .map(|v| v.trim_matches('"').to_owned())
+                })
+        })
+        .unwrap_or_else(|| "0.0.0".into())
+}
+
+/// The commit time of HEAD: orders package versions (`build`), reproducible.
+fn git_time(root: &Path) -> u64 {
+    Command::new("git")
+        .args(["log", "-1", "--format=%ct"])
+        .current_dir(root)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse().ok())
+        .unwrap_or(0)
 }
 
 // ---------------------------------------------------------------- config --
@@ -245,6 +321,32 @@ pub fn check(os: &Path) -> Result<usize, String> {
         ));
     }
     n += 1;
+    // The A/B boot entries are written after this line
+    // (`corerouter_sysupdate::BUILTIN_CMDLINE`, read from its source: the
+    // xtask uses no workspace crate).
+    let sysupdate = std::fs::read_to_string(os.join("../crates/sysupdate/src/lib.rs"))
+        .map_err(|e| format!("crates/sysupdate/src/lib.rs: {e}"))?;
+    let builtin = sysupdate
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("pub const BUILTIN_CMDLINE: &str = \"")?
+                .strip_suffix("\";")
+        })
+        .ok_or("crates/sysupdate/src/lib.rs: no BUILTIN_CMDLINE")?;
+    if cmdline != builtin {
+        return Err(format!(
+            "CONFIG_CMDLINE differs from corerouter_sysupdate::BUILTIN_CMDLINE (the A/B boot entries are written after it): '{cmdline}'"
+        ));
+    }
+    n += 1;
+    if !genimage.contains("image = \"rootfs.img\"") {
+        return Err(
+            "genimage.cfg: rootfs-a must be rootfs.img (squashfs + dm-verity tree, `corerouter-image seal`)"
+                .into(),
+        );
+    }
+    n += 1;
     if !cmdline
         .split_whitespace()
         .any(|w| w == format!("init={INIT_PATH}"))
@@ -302,11 +404,15 @@ fn dirs(root: &Path, lock: &Lock) -> Dirs {
 fn build(root: &Path, args: &[String]) -> Result<(), String> {
     let mut jobs: Option<String> = None;
     let mut top_jobs: Option<String> = None;
+    let mut key: Option<PathBuf> = None;
+    let mut channel = "development".to_owned();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
             "--jobs" => jobs = Some(it.next().ok_or("--jobs needs a number")?.clone()),
             "--top-jobs" => top_jobs = Some(it.next().ok_or("--top-jobs needs a number")?.clone()),
+            "--key" => key = Some(PathBuf::from(it.next().ok_or("--key needs a file")?)),
+            "--channel" => channel = it.next().ok_or("--channel needs a name")?.clone(),
             other => return Err(format!("unknown argument '{other}'\n{USAGE}")),
         }
     }
@@ -328,6 +434,29 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
 
     let cargo = which_cargo()?;
     let commit = git_commit(root);
+    const CHANNELS: &[&str] = &["stable", "testing", "long-term", "development"];
+    if !CHANNELS.contains(&channel.as_str()) {
+        return Err(format!("--channel {channel}: one of {CHANNELS:?}"));
+    }
+    // G1.6b: the image key (private: outside the tree and the image) and
+    // what `corerouter-image seal` puts in the manifest.
+    let image_tool = ab::tool(root)?;
+    let (image_key, image_keys_dir) = ab::ensure_key(root, &image_tool, key.as_deref())?;
+    let defconfig_text =
+        std::fs::read_to_string(d.os.join("configs").join(DEFCONFIG)).map_err(|e| e.to_string())?;
+    let seal_env = [
+        ("CR_SEAL_TOOL", image_tool.display().to_string()),
+        ("CR_SEAL_KEY", image_key.display().to_string()),
+        (
+            "CR_SEAL_IMAGE_KEYS_DIR",
+            image_keys_dir.display().to_string(),
+        ),
+        ("CR_SEAL_VERSION", workspace_version(root)),
+        ("CR_SEAL_BUILD", git_time(root).to_string()),
+        ("CR_SEAL_CHANNEL", channel.clone()),
+        ("CR_SEAL_KERNEL_VERSION", kernel_version(&defconfig_text)?),
+        ("CR_SEAL_CONFIG_FORMAT", config_format(root)?.to_string()),
+    ];
     let make = |targets: &[&str], parallel: Option<&String>| -> Result<(), String> {
         let mut cmd = Command::new("make");
         cmd.arg("-C")
@@ -354,6 +483,9 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
             cmd.env_remove(var);
         }
         cmd.env("COREROUTER_COMMIT", &commit);
+        for (k, v) in &seal_env {
+            cmd.env(k, v);
+        }
         let t = Instant::now();
         let st = cmd.status().map_err(|e| format!("make: {e}"))?;
         eprintln!(
@@ -440,7 +572,13 @@ fn build(root: &Path, args: &[String]) -> Result<(), String> {
         "\nimage ({} kernel options checked):",
         fragment_symbols(&fragment).len()
     );
-    for f in ["disk.img", "bzImage", "rootfs.squashfs"] {
+    for f in [
+        "disk.img",
+        "bzImage",
+        "rootfs.squashfs",
+        "rootfs.img",
+        "corerouter.crpkg",
+    ] {
         let p = images.join(f);
         let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
         let hash = sha256_file(&p).unwrap_or_default();

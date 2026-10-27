@@ -10,11 +10,17 @@
 //! (`corerouter.shell=ttyS0`).
 
 #[cfg(target_os = "linux")]
+mod ctl;
+#[cfg(target_os = "linux")]
 mod pid1;
 mod plan;
 
 #[cfg(target_os = "linux")]
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("run") {
+        std::process::exit(ctl::main(args.get(1..).unwrap_or(&[])));
+    }
     pid1::main();
 }
 

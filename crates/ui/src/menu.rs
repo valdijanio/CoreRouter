@@ -105,6 +105,7 @@ pub(crate) const CATALOG: &[Entry] = &[
     e("ntp-client", None, None, icons::CLOCK, "/system ntp client", &["system.ntp.client"], &["time", "hora", "relógio", "sntp", "clock"]),
     e("os-log", None, None, icons::TERMINAL_WINDOW, "", &["log.os"], &["dmesg", "kernel", "kmsg", "journal", "journalctl", "syslog", "sistema", "log do sistema", "drivers", "erros do kernel", "oom", "show log messages"]),
     e("ospf", None, None, icons::GRAPH, "/routing ospf", &[], &["area", "lsa", "igp"]),
+    e("packages", None, None, icons::STACK_SIMPLE, "/system package", &["system.package"], &["update", "upgrade", "atualizar", "atualização", "firmware", "imagem", "image", "a/b", "rollback", "downgrade", "voltar versão", "npk", "add system image", "install", "instalar", "dm-verity"]),
     e("ping", None, None, icons::PULSE, "/tool ping", &["tool.ping"], &["icmp", "latência", "latency", "mtu"]),
     e("ppp", None, None, icons::PLUGS, "/ppp", &["ppp", "interface.pppoe-server"], &["pppoe", "bng", "concentrador", "assinantes", "subscribers", "secrets", "profiles", "perfis", "active", "ativos", "online", "desconectar", "disconnect", "por que não sobe", "why", "accel-ppp", "pppoe-server", "rate limit", "plano"]),
     e("queues", None, None, icons::GAUGE, "/queue", &["queue"], &["queue", "fila", "filas", "simple queue", "pcq", "per-ip", "limite de banda", "bandwidth limit", "rate limit", "controle de banda", "shaper", "policer", "fq-codel", "cake", "bufferbloat", "plano", "velocidade"]),

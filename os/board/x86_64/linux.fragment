@@ -13,6 +13,16 @@ CONFIG_CMDLINE_BOOL=y
 CONFIG_CMDLINE="console=tty0 console=ttyS0,115200 root=PARTUUID=3e1088b8-5b4b-4fbb-b756-a271f641d018 rootfstype=squashfs rootwait ro init=/usr/sbin/corerouter-init panic=10 quiet"
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
+# --- A/B image (G1.6b, docs/os-image.md): each slot boots from a UEFI boot
+# entry whose options carry `dm-mod.create=` (dm-verity over the slot's
+# squashfs, built before the root is mounted: no initramfs), and the
+# updater writes Boot####/BootOrder/BootNext through efivarfs.
+CONFIG_MD=y
+CONFIG_BLK_DEV_DM=y
+CONFIG_DM_INIT=y
+CONFIG_DM_VERITY=y
+CONFIG_EFIVAR_FS=y
+CONFIG_CRYPTO_SHA256=y
 CONFIG_SQUASHFS=y
 CONFIG_SQUASHFS_ZSTD=y
 CONFIG_SQUASHFS_XATTR=y
