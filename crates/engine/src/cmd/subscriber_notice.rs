@@ -573,22 +573,6 @@ fn sample(k: &str) -> Option<String> {
     )
 }
 
-/// The page variables of `ip` for its profile: the ISP's values over what
-/// the router knows (login, address, profile).
-pub(crate) fn vars_of(s: &Session, ip: IpAddr, profile: &str) -> BTreeMap<String, String> {
-    let mut v = BTreeMap::new();
-    v.insert("endereco".to_owned(), ip.to_string());
-    v.insert("perfil".to_owned(), profile.to_owned());
-    if let IpAddr::V4(a) = ip
-        && let Some(sess) = s.ppp_active().into_iter().find(|x| x.address == Some(a))
-    {
-        v.insert("login".to_owned(), sess.name.clone());
-        v.insert("plano".to_owned(), sess.profile.clone());
-    }
-    v.extend(s.notice_vars(ip));
-    v
-}
-
 fn page_preview(s: &mut Session, p: &Value) -> Result<Value> {
     let sn = cfg(s).clone();
     let mut pg = match opt_str(p, "page")?.map(str::trim) {
@@ -605,7 +589,7 @@ fn page_preview(s: &mut Session, p: &Value) -> Result<Value> {
     let problem = apply_page(&mut pg, &edit).err().map(|e| e.to_string());
     let address: Option<IpAddr> = opt_parse(p, "address")?;
     let vars = match address {
-        Some(ip) => vars_of(s, ip, "preview"),
+        Some(ip) => crate::subscriber_notice::page_vars(s, ip, "preview"),
         None => BTreeMap::new(),
     };
     let lookup = |k: &str| vars.get(k).cloned().or_else(|| if address.is_none() { sample(k) } else { None });

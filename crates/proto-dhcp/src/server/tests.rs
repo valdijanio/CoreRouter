@@ -1665,3 +1665,20 @@ fn a_storm_past_the_limiter_table_is_still_served() {
     assert_eq!(lab.srv.stats().dropped_of(Drop::RateLimited), 0);
     assert!(lab.srv.stats().untracked >= 4_000);
 }
+
+/// G4.10c, RFC 8910 §2.1: the subscriber notices' API URI goes as option
+/// 114 (asked for, not forced), and an option 114 of the operator wins.
+#[test]
+fn capport_uri_is_option_114() {
+    let mut c = cfg();
+    let none = Plan::from_config(&c);
+    assert!(none.servers[0].options.iter().all(|o| o.code != 114));
+    c.ip.subscriber_notice.settings.capport_url = "https://aviso.provedor.com.br/api".into();
+    let p = Plan::from_config(&c);
+    let o = p.servers[0].options.iter().find(|o| o.code == 114).unwrap();
+    assert_eq!(
+        o.value,
+        super::plan::OptValue::Bytes(b"https://aviso.provedor.com.br/api".to_vec())
+    );
+    assert!(!o.force, "only to clients that ask (option 55)");
+}
