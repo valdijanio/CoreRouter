@@ -44,13 +44,19 @@ pub(crate) enum Tab {
     Connections,
     Templates,
     Instances,
+    /// G3.2c: the validators (`crate::rpki` draws it).
+    Rpki,
+    /// G3.2c: received/advertised routes and history (`crate::bgp_routes`).
+    Routes,
 }
 
-const TABS: [(Tab, &str, &str); 4] = [
+const TABS: [(Tab, &str, &str); 6] = [
     (Tab::Sessions, "Sessions", "bgp.tab.sessions"),
     (Tab::Connections, "Connections", "bgp.tab.connections"),
     (Tab::Templates, "Templates", "bgp.tab.templates"),
     (Tab::Instances, "Instances", "bgp.tab.instances"),
+    (Tab::Rpki, "RPKI", "rpki"),
+    (Tab::Routes, "Routes", "bgp_routes.explain.routes"),
 ];
 
 const CONN_CMDS: Cmds = Cmds {
@@ -611,10 +617,27 @@ impl BgpPanel {
             ("Families", "bgp.param.afi", if families.is_empty() { "–".into() } else { families }),
         ];
         let mut help = None;
-        ui.columns(2, |cols| {
-            let (left, right) = cols.split_at_mut(1);
+        let mut go = None;
+        let conn_name = r.connection.as_ref().map(|c| s(c, "name"));
+        // Mockup (G3.2c): errors and timers | RPKI and policies | flaps and
+        // the links to the routes.
+        let column = |label: &str| match label {
+            "Last Error" | "Hold / Keepalive" | "Remote ID" | "Messages" => 0,
+            "Policy In" | "Policy Out" => 1,
+            _ => 2,
+        };
+        ui.columns(3, |cols| {
+            if let (Some(ui), Some(name)) = (cols.get_mut(1), conn_name.as_deref()) {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(tr_in(SCOPE, l, "RPKI In")).weak());
+                    if help::info_button(ui, egui::Id::unique("bgp-detail-rpki"), tr_in(SCOPE, l, "RPKI In")).clicked() {
+                        help = Some(HelpView::new("bgp_routes.rpki_share", tr_in(SCOPE, l, "RPKI In")));
+                    }
+                    crate::bgp_routes::session_rpki(app, ui, name);
+                });
+            }
             for (i, (label, key, value)) in lines.iter().enumerate() {
-                let Some(ui) = (if i < 4 { left.first_mut() } else { right.first_mut() }) else {
+                let Some(ui) = cols.get_mut(column(label)) else {
                     continue;
                 };
                 ui.horizontal(|ui| {
@@ -627,9 +650,16 @@ impl BgpPanel {
                     ui.label(if red { text.color(ui.visuals().error_fg_color) } else { text });
                 });
             }
+            if let (Some(ui), Some(name)) = (cols.get_mut(2), conn_name.as_deref()) {
+                go = crate::bgp_routes::session_links(app, ui, name);
+            }
         });
         if help.is_some() {
             self.help = help;
+        }
+        if let (Some(tab), Some(name)) = (go, conn_name.as_deref()) {
+            self.tab = Tab::Routes;
+            crate::bgp_routes::open_routes(app, name, tab);
         }
         let Some(conn) = r.connection.as_ref() else {
             ui.weak(tr_in(SCOPE, l, "Not a CoreRouter connection (typed into FRR by hand)."));
@@ -1013,11 +1043,15 @@ impl PanelState for BgpPanel {
     fn window(&mut self, app: &mut CoreRouterUi, _win: &'static str, ui: &mut Ui) {
         self.tabs(app, ui);
         ui.separator();
+        // G3.2c: the RPKI and Routes tabs are other panels' drawing.
+        crate::bgp_routes::show_tabs(app, self.tab == Tab::Rpki, self.tab == Tab::Routes);
         match self.tab {
             Tab::Sessions => self.sessions_tab(app, ui),
             Tab::Connections => self.connections_tab(app, ui),
             Tab::Templates => self.templates_tab(app, ui),
             Tab::Instances => self.instances_tab(app, ui),
+            Tab::Rpki => crate::bgp_routes::draw(app, crate::rpki::NAME, ui),
+            Tab::Routes => crate::bgp_routes::draw(app, crate::bgp_routes::NAME, ui),
         }
     }
 
@@ -1071,7 +1105,7 @@ impl PanelState for BgpPanel {
             Tab::Sessions => self.session_table.escape(),
             Tab::Connections => self.conn_table.escape(),
             Tab::Templates => self.tpl_table.escape(),
-            Tab::Instances => false,
+            Tab::Instances | Tab::Rpki | Tab::Routes => false,
         }
     }
 

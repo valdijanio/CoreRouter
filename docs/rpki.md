@@ -4,11 +4,11 @@ Terceira parte do BGP (`docs/bgp.md`), mais o que faltava do G3.3 (estado BGP):
 
 | O quê | Comandos | Janela |
 |---|---|---|
-| Validadores RPKI (RTR) e a política de inválidas | `routing.rpki.{add,set,remove,list,preview}`, `routing.rpki.session.list`, `routing.rpki.invalid.set` | Routing › RPKI |
-| `rpki-check` de um prefixo | `routing.rpki.check` | Routing › RPKI |
-| Rotas recebidas e anunciadas por conexão | `routing.bgp.route.list`, `routing.bgp.route.summary` | Routing › BGP Routes |
-| "Por que essa rota?" | `routing.bgp.route.explain` | modal; botões em BGP Routes, no detalhe da sessão (Routing › BGP) e em IP › Routes |
-| Histórico de quedas | `routing.bgp.session.history` | Routing › BGP Routes › History |
+| Validadores RPKI (RTR) e a política de inválidas | `routing.rpki.{add,set,remove,list,preview}`, `routing.rpki.session.list`, `routing.rpki.invalid.set` | Routing › BGP › RPKI |
+| `rpki-check` de um prefixo | `routing.rpki.check` | Routing › BGP › RPKI |
+| Rotas recebidas e anunciadas por conexão | `routing.bgp.route.list`, `routing.bgp.route.summary` | Routing › BGP › Routes; % RPKI no detalhe da sessão |
+| "Por que essa rota?" | `routing.bgp.route.explain` | modal; aberto pela aba Routes, pelo link do detalhe da sessão e por IP › Routes |
+| Histórico de quedas | `routing.bgp.session.history` | Routing › BGP › Routes › History |
 
 ## Como usar
 

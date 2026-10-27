@@ -35,6 +35,7 @@ pub(super) const LABELS: &[(&str, &str)] = &[
     (r##"Policy Out"##, r##"Política de saída"##),
     (r##"Prefixes In"##, r##"Prefixos recebidos"##),
     (r##"Prefixes Out"##, r##"Prefixos enviados"##),
+    (r##"RPKI In"##, r##"RPKI entrada"##),
     (r##"Refresh"##, r##"Pedir rotas"##),
     (r##"Remote AS"##, r##"AS remoto"##),
     (r##"Remote Address"##, r##"Endereço remoto"##),

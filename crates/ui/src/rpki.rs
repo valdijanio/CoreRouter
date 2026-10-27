@@ -1,9 +1,11 @@
-//! Routing › RPKI (G3.2c), RouterOS v7 `/routing rpki`: the RTR validators
+//! Routing › BGP › RPKI (G3.2c), RouterOS v7 `/routing rpki`: the RTR validators
 //! in the list window pattern (G0.24) with their live sessions (state,
 //! protocol version, serial, VRPs), what the policy does on each BGP
 //! connection (reject or accept invalid routes, and the eBGP ones that wait
 //! for a policy), and `rpki-check` for one prefix and origin.
-//! `routing.rpki.*` decides; this only shows and sends.
+//! A panel without a window of its own: `bgp.rs` draws it in its RPKI tab
+//! (the approved mockup). `routing.rpki.*` decides; this only shows and
+//! sends.
 
 use std::collections::BTreeMap;
 
@@ -17,25 +19,18 @@ use crate::help::{self, HelpView};
 use crate::i18n::tr_in;
 use crate::list::{self, Act, Cmds, Item, Tools};
 use crate::list_modal::{self, Applied, Field, Input, Modal, Spec};
-use crate::panel::{Panel, PanelState, PanelThen, Query, WinDef};
+use crate::panel::{Panel, PanelState, PanelThen, Query};
 use crate::table::{self, Menu, Row, TableState, col, comment, num};
 use crate::{CoreRouterUi, Then, Win, value_text};
 
 
 pub(crate) const NAME: &str = "rpki";
-pub(crate) const WIN: &str = "rpki";
 const SCOPE: &str = "rpki";
 const TABLE: &str = "rpki-validators";
 
 pub(crate) const PANEL: Panel = Panel {
     name: NAME,
-    windows: &[WinDef {
-        id: WIN,
-        group: "Routing",
-        title: "RPKI",
-        size: [960.0, 560.0],
-        escape: true,
-    }],
+    windows: &[],
     new: || Box::<RpkiPanel>::default(),
 };
 
@@ -71,7 +66,7 @@ const FIELDS: &[Field] = &[
 
 const SPEC: Spec = Spec {
     panel: NAME,
-    parent: Win::Panel(WIN),
+    parent: Win::Bgp,
     new_title: "New RPKI Validator",
     edit_title: "RPKI Validator",
     help: "rpki",
@@ -102,6 +97,8 @@ pub(crate) struct RpkiPanel {
     pub(crate) origin: String,
     pub(crate) check: Option<Value>,
     help: Option<HelpView>,
+    /// The BGP window shows this panel's tab now.
+    pub(crate) active: bool,
 }
 
 fn s(r: &Value, k: &str) -> String {
@@ -321,7 +318,7 @@ struct Checked;
 
 impl PanelState for RpkiPanel {
     fn queries(&self, app: &CoreRouterUi) -> Vec<Query> {
-        if !app.open.contains(&Win::Panel(WIN)) {
+        if !self.active || !app.open.contains(&Win::Bgp) {
             return Vec::new();
         }
         [("validators", "routing.rpki.list"), ("sessions", "routing.rpki.session.list")]
