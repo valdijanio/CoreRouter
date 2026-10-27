@@ -21,20 +21,25 @@ pub(crate) const TABLE: &str = "interfaces";
 /// per item; a hundred at a time helps nobody).
 const MAX_OPEN: usize = 8;
 
-const COLUMNS: [table::Column; 11] = [
+const COLUMNS: [table::Column; 12] = [
     col(""),
-    col("Name"),
-    col("Type"),
-    num("MTU"),
-    num("Rx"),
-    num("Tx"),
-    num("Rx pkt"),
-    num("Tx pkt"),
+    col("Name").help("interfaces.name"),
+    col("Type").help("interfaces.type"),
+    col("Link").help("interfaces.link"),
+    num("MTU").help("interfaces.mtu"),
+    num("Rx").help("interfaces.rx"),
+    num("Tx").help("interfaces.tx"),
+    num("Rx pkt").help("interfaces.rx_pkt"),
+    num("Tx pkt").help("interfaces.tx_pkt"),
     // G4.5: the last five minutes, from the traffic history (`spark.rs`).
-    col("Traffic"),
-    col("Info"),
+    col("Traffic").help("interfaces.traffic"),
+    col("Info").help("interfaces.info"),
     comment(),
 ];
+
+pub(crate) fn hideable_column(name: &str) -> bool {
+    !name.is_empty() && name != "Name" && COLUMNS.iter().any(|c| c.title == name)
+}
 
 /// One row of `interface.list`, as the UI needs it for menus and dialogs.
 #[derive(Clone, Default)]
@@ -259,13 +264,28 @@ impl CoreRouterUi {
             .cache
             .interfaces
             .iter()
-            .map(|r| iface_row(r, &spark))
+            .map(|r| {
+                let mut row = iface_row(r, &spark);
+                if self.nic.get(&row.key).and_then(NicView::recent_errors)
+                    .is_some_and(|(rx, tx)| rx > 0 || tx > 0)
+                    && let Some(cell) = row.cells.get_mut(10)
+                {
+                    let existing = std::mem::take(cell);
+                    *cell = format!("{}{}aerrors", existing, crate::chip::SEP);
+                }
+                row
+            })
             .collect();
         let selection = self.tables.interfaces.selection(&rows);
         let picked: Vec<&Iface> = ifaces
             .iter()
             .filter(|i| selection.contains(&i.name))
             .collect();
+        ui.horizontal_wrapped(|ui| {
+            crate::chip::chip(ui, &format!("{} interfaces", ifaces.len()), crate::chip::neutral_tone(ui.visuals()));
+            let running = ifaces.iter().filter(|i| i.running && !i.disabled).count();
+            crate::chip::chip(ui, &format!("{running} up"), crate::chip::GREEN.tone(ui.visuals()));
+        });
         let bridges: Vec<String> = ifaces
             .iter()
             .filter(|i| i.kind == "bridge" && i.unmanaged.is_none())
@@ -316,6 +336,29 @@ impl CoreRouterUi {
                     });
                 }
             }
+            ui.menu_button(crate::i18n::tr_in("interfaces", self.lang.labels, "Columns"), |ui| {
+                for column in COLUMNS.iter().filter(|c| hideable_column(c.title)) {
+                    let mut visible = !self.tables.interfaces.hidden_columns.contains(column.title);
+                    if ui.checkbox(&mut visible, crate::i18n::tr_in("interfaces", self.lang.labels, column.title)).changed() {
+                        if visible {
+                            self.tables.interfaces.hidden_columns.remove(column.title);
+                        } else {
+                            self.tables.interfaces.hidden_columns.insert(column.title.to_owned());
+                        }
+                    }
+                }
+                ui.separator();
+                if ui.button(crate::i18n::tr_in("interfaces", self.lang.labels, "Restore defaults")).clicked() {
+                    self.tables.interfaces.hidden_columns.clear();
+                    ui.close();
+                }
+            });
+            if crate::help::info_button(ui, egui::Id::unique("interfaces-columns-help"), "Columns").clicked() {
+                let title = crate::i18n::tr_in("interfaces", self.lang.labels, "Columns");
+                if let Some(panel) = self.panel_mut::<crate::interface_list_help::InterfaceListHelp>() {
+                    panel.help = Some(crate::help::HelpView::new("interfaces.columns", title));
+                }
+            }
             table::find_field(ui, TABLE, &mut self.tables.interfaces);
         });
         ui.separator();
@@ -331,7 +374,7 @@ impl CoreRouterUi {
         let out = table::show(
             ui,
             TABLE,
-            0.0,
+            65.0,
             &mut self.tables.interfaces,
             &COLUMNS,
             &rows,
@@ -348,6 +391,32 @@ impl CoreRouterUi {
                 }
             },
         );
+        if let Some(key) = out.help {
+            let title = COLUMNS.iter().find(|c| c.help == key).map_or("", |c| c.title);
+            let title = crate::i18n::tr_in("interfaces", self.lang.labels, title);
+            if let Some(panel) = self.panel_mut::<crate::interface_list_help::InterfaceListHelp>() {
+                panel.help = Some(crate::help::HelpView::new(key, title));
+            }
+        }
+        if let [i] = picked.as_slice() {
+            ui.separator();
+            ui.horizontal_wrapped(|ui| {
+                ui.strong(&i.name);
+                ui.label(format!("MTU {}", i.mtu));
+                if let Some(view) = self.nic.get(&i.name) {
+                    if let Some(m) = view.monitor_value()
+                        && let Some(rate) = m.get("rate").and_then(Value::as_str) {
+                        ui.label(rate);
+                    }
+                    if let Some((rx, tx)) = view.live_rates() {
+                        ui.label(format!("Rx {} · Tx {}", crate::graphs::rate(rx, "bps"), crate::graphs::rate(tx, "bps")));
+                    }
+                    if let Some((rx, tx)) = view.recent_errors().filter(|(rx, tx)| *rx > 0 || *tx > 0) {
+                        ui.label(format!("Rx errors +{rx} · Tx errors +{tx} (last sample)"));
+                    }
+                }
+            });
+        }
         if let Some(name) = out.opened {
             act = Some(Act::Open(vec![name]));
         }
@@ -739,19 +808,41 @@ fn iface_row(row: &Value, spark: &std::collections::BTreeMap<String, String>) ->
         cells: vec![
             flag.to_owned(),
             i.name.clone(),
-            i.kernel_kind.clone(),
+            format!("{} {}", type_icon(&i.kind), i.kernel_kind),
+            crate::chip::cell("", &[(if i.disabled { "disabled" } else if i.running { "up" } else { "no link" }, if i.running && !i.disabled { crate::chip::Kind::Green } else { crate::chip::Kind::Neutral })]),
             i.mtu.clone(),
             human_bytes(n("rx_bytes")),
             human_bytes(n("tx_bytes")),
             n("rx_packets").to_string(),
             n("tx_packets").to_string(),
             spark.get(&i.name).cloned().unwrap_or_default(),
-            info(&i),
+            info_cell(&i),
             i.comment.clone(),
         ],
         dimmed: i.disabled || i.unmanaged.is_some(),
         section: false,
         tint: None,
+    }
+}
+
+fn type_icon(kind: &str) -> &'static str {
+    match kind {
+        "ether" => crate::icons::PLUGS,
+        "vlan" => crate::icons::TAG,
+        "bridge" => crate::icons::SHARE_NETWORK,
+        "bonding" => crate::icons::LINK,
+        "vrf" => crate::icons::FOLDERS,
+        _ => crate::icons::SQUARES_FOUR,
+    }
+}
+
+fn info_cell(i: &Iface) -> String {
+    if let Some(id) = &i.vlan_id {
+        let label = format!("VLAN {id}");
+        let hue = id.parse::<u64>().map(crate::chip::hashed).unwrap_or_else(|_| crate::chip::name_hue(id));
+        crate::chip::cell(&info(i), &[(&label, crate::chip::Kind::Hashed(hue))])
+    } else {
+        info(i)
     }
 }
 

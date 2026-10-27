@@ -226,6 +226,8 @@ pub(crate) struct TableState {
     pub filter: String,
     /// Comments as a band above each item instead of a column.
     pub inline_comments: bool,
+    /// Column names hidden by the operator; independent of inline comments.
+    pub hidden_columns: BTreeSet<String>,
     /// Rows can be dragged to a new place (order matters: firewall rules).
     pub reorder: bool,
     /// Items whose own window is open, set by the list before each frame:
@@ -542,6 +544,7 @@ pub(crate) fn show(
     let inline = state.inline_comments && note_col.is_some();
     let shown: Vec<usize> = (0..columns.len())
         .filter(|&i| !(inline && note_col == Some(i)))
+        .filter(|&i| columns.get(i).is_some_and(|c| !state.hidden_columns.contains(c.title)))
         .collect();
     let notes: Vec<Option<String>> = visible
         .iter()
@@ -1193,13 +1196,24 @@ fn chip_under_pointer(
 }
 
 fn text_width(ui: &Ui, text: &str, font: &egui::FontId) -> f32 {
+    let (icon, text) = split_icon(text);
     // A cell may carry chips after its text (`chip::cell`).
     let (text, chips) = crate::chip::split(text);
-    ui.painter()
+    (if icon.is_some() { CELL_ICON } else { 0.0 }) + ui.painter()
         .layout_no_wrap(text.to_owned(), font.clone(), egui::Color32::PLACEHOLDER)
         .size()
         .x
         + crate::chip::cell_chips_width(ui.painter(), &chips, crate::chip::cell_size(font))
+}
+
+/// Cells may begin with an icon from the project's Phosphor font.
+fn split_icon(text: &str) -> (Option<char>, &str) {
+    let Some(c) = text.chars().next() else { return (None, text) };
+    if ('\u{e000}'..='\u{f8ff}').contains(&c) {
+        (Some(c), text.get(c.len_utf8()..).unwrap_or("").trim_start())
+    } else {
+        (None, text)
+    }
 }
 
 /// Colours of one line of cells: `text` for plain cells, `note` the Comment
@@ -1252,7 +1266,8 @@ fn paint_cells<'a>(
             (Align2::LEFT_CENTER, pos2(x + CELL_PAD, rect.center().y))
         };
         let shown = shown_text(text(i));
-        let (cell, chips) = crate::chip::split(&shown);
+        let (icon, shown) = split_icon(&shown);
+        let (cell, chips) = crate::chip::split(shown);
         // A weak column greys plain text only (a selected, dimmed or
         // tinted row keeps its colour).
         let weak = columns.get(i).is_some_and(|c| c.weak) && color == ui.visuals().text_color();
@@ -1261,6 +1276,11 @@ fn paint_cells<'a>(
         } else {
             color
         };
+        let at = if let Some(icon) = icon {
+            let icon_rect = Rect::from_min_size(pos2(x + CELL_PAD, rect.top()), vec2(CELL_ICON, rect.height()));
+            crate::icons::paint(ui, icon_rect, &icon.to_string(), font.size, ink);
+            pos2(at.x + CELL_ICON, at.y)
+        } else { at };
         let drawn = ui.painter().text(at, anchor, cell, font.clone(), ink);
         if !chips.is_empty() {
             crate::chip::paint_cell_chips(
