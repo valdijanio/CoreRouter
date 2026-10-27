@@ -1902,3 +1902,37 @@ histórico duas vezes por commit (~2 ms cada com 1 000 conexões). Montar a resp
 `session.list` (1 000 linhas) custa 1,2 ms; clonar um `Value` pronto custaria 0,84 ms, então a
 resposta continua sendo montada na hora. O clone da amostra no serviço `frr` (126 µs) saiu de
 dentro do lock.
+
+G1.27d, AMD Ryzen AI MAX+ 395 (32 threads), build `bench` (release), 2026-10-27, **medido**:
+
+- Tabela do motor, 100 mil vizinhos em 8 portas (`cargo bench -p corerouter-engine --bench
+  neigh_table`): aplicar um evento 110 ns; carregar um dump 9,1 ms; memória residente ~123 B por
+  entrada (12,4 MB para 100 mil). Página de `ip.arp.list`: primeira página 7,26 → 2,70 ms
+  (contagem por vetor/ponteiro em vez de mapa por nome e ordenação sem alocar `String`), última
+  página 4,5 ms, CIDR /20 2,6 ms, prefixo de MAC 3,0 ms, estado 2,2 ms, texto 21,3 → 3,5 ms
+  (comparação sem alocar por linha).
+- Kernel, 100 mil entradas num namespace sem root (`netns_neigh`): dump `RTM_GETNEIGH` 25,0 ms
+  (4,0 M entradas/s) contra 161 ms do `ip -j neigh show` + JSON (6,4×).
+- Rajada de 20 mil mudanças sem root: o socket de eventos fica no `rmem_max` (o
+  `SO_RCVBUFFORCE` de 16 MiB exige root), o kernel descarta (`ENOBUFS`, 1 vez) e o serviço relê
+  a tabela (25 ms): nada se perde para a lista. Como root o buffer de 16 MiB comporta ~150 mil
+  eventos (**estimado**).
+- Paralelismo: o kernel serializa a tabela num socket (dump e eventos em ordem); aplicar um
+  evento custa 110 ns, então uma thread aplica ~9 M eventos/s, muito acima do que o kernel
+  entrega. Dividir em threads só acrescentaria lock na tabela. A lista é O(n) por consulta
+  (filtro) + O(k log k) da página; 100 mil linhas em 2–4 ms não justificam índice extra.
+
+### G4.4j: log de NAT do CGNAT em IPFIX (**medido**, 2026-10-27)
+
+AMD Ryzen AI MAX+ 395, kernel 7.0.
+
+- `cargo bench -p corerouter-engine --bench cgnat_pba_storm` (release): `allocate_10k_blocks`
+  109,5 ms → 43,7 ms (−60 %, 229 mil blocos/s); `drain_10k_records` 139 µs (14 ns por registro).
+- `cargo bench -p corerouter-proto-flow --bench flow_codec`: `encode_port_blocks_10k` (IPFIX,
+  `userName` variável) no grupo `flow`.
+- `netns_nat_ipfix` (release): 20 000 blocos por SCTP e TLS, 24 µs de CPU do daemon por bloco,
+  `nat_log_dropped` 0. Build de teste: 632 → 3 411 blocos/s com o lote do journal (313 → 147 µs
+  de CPU por bloco).
+- `netns_traffic_flow` (release, `COREROUTER_FLOW_BURST=100000`): 100 000 criações NAT pelo TCP
+  (thread de envio) 0,38 s após o início; 300 000 registros, 1,6 µs de CPU por registro, RSS
+  133 MB, sem descarte na fila nem no kernel.
