@@ -11,9 +11,10 @@
 //!
 //! The table is a path-compressed binary trie per family (one node per
 //! distinct VRP prefix and per branch point): a lookup walks only the
-//! prefixes that cover the route, ~5 nodes for a /24 in a real table
-//! (**medido** in `benches/rpki.rs`), instead of one hash probe per
-//! possible length.
+//! prefixes that cover the route and the branch points above them. 551 k
+//! VRPs build in 54 ms and 1 M routes validate in 81 ms in prefix order
+//! (746 ms in random order: the walk then leaves the cache), **medido** in
+//! `benches/rpki.rs`.
 
 use std::fmt;
 use std::fmt::Write as _;
