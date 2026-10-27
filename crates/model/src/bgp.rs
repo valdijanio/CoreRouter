@@ -229,6 +229,10 @@ pub struct BgpParams {
     /// each received route).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub keep_received: Option<bool>,
+    /// G3.2c: what to do with RPKI-invalid routes (unset: reject, once a
+    /// validator is configured; `crate::rpki`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rpki_invalid: Option<crate::rpki::RpkiInvalid>,
 }
 
 impl BgpParams {
@@ -255,6 +259,7 @@ impl BgpParams {
         take(&mut self.input_filter, &parent.input_filter);
         take(&mut self.output_filter, &parent.output_filter);
         take(&mut self.keep_received, &parent.keep_received);
+        take(&mut self.rpki_invalid, &parent.rpki_invalid);
     }
 
     /// The families in force: unset is IPv4 only, as in RouterOS.

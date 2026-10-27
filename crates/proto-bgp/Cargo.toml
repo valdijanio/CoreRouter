@@ -11,6 +11,7 @@ repository.workspace = true
 [dependencies]
 corerouter-model.workspace = true
 ipnet.workspace = true
+serde.workspace = true
 # AS-path expressions of `/routing filter` (G3.2b): linear time, no
 # backtracking (a hostile pattern cannot stall a commit or a preview).
 regex = { version = "1.13.1", default-features = false, features = ["std", "perf"] }
@@ -24,6 +25,10 @@ criterion.workspace = true
 
 [[bench]]
 name = "filter"
+harness = false
+
+[[bench]]
+name = "rpki"
 harness = false
 
 [lints]

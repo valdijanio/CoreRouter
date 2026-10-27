@@ -23,7 +23,9 @@ use serde_json::Value;
 /// part of the path.
 fn path_of(text: &str) -> Vec<u32> {
     let head = text.split(", ").next().unwrap_or_default();
-    head.split(|c: char| !c.is_ascii_digit()).filter_map(|t| t.parse().ok()).collect()
+    head.split(|c: char| !c.is_ascii_digit())
+        .filter_map(|t| t.parse().ok())
+        .collect()
 }
 
 fn communities(words: &str, e: &mut BgpRouteEntry) {
@@ -38,7 +40,11 @@ fn communities(words: &str, e: &mut BgpRouteEntry) {
 
 fn number_after(line: &str, key: &str) -> Option<u32> {
     let i = line.find(key)?;
-    line.get(i + key.len()..)?.split(|c: char| !c.is_ascii_digit()).next()?.parse().ok()
+    line.get(i + key.len()..)?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()?
+        .parse()
+        .ok()
 }
 
 /// The routes of `received-routes detail` (text).
@@ -52,13 +58,20 @@ pub fn received_text(text: &str) -> Vec<BgpRouteEntry> {
                 out.push(e);
             }
             let p = rest.split(',').next().unwrap_or_default().trim();
-            cur = Some(BgpRouteEntry { prefix: p.parse::<IpNet>().ok(), ..Default::default() });
+            cur = Some(BgpRouteEntry {
+                prefix: p.parse::<IpNet>().ok(),
+                ..Default::default()
+            });
             continue;
         }
         let Some(e) = cur.as_mut() else { continue };
         let t = line.trim();
         // The path is the line just above "<nexthop> from <peer> (<id>)".
-        if lines.get(i + 1).is_some_and(|n| n.trim_start().contains(" from ") && n.starts_with("    ")) && line.starts_with("  ") {
+        if lines
+            .get(i + 1)
+            .is_some_and(|n| n.trim_start().contains(" from ") && n.starts_with("    "))
+            && line.starts_with("  ")
+        {
             e.as_path = path_of(t);
         } else if let Some(rest) = t.strip_prefix("Large Community: ") {
             communities(rest, e);
@@ -79,24 +92,39 @@ pub fn received_text(text: &str) -> Vec<BgpRouteEntry> {
 /// `received-routes json` (every route, path and MED; no communities),
 /// completed with the communities of `received-routes detail` (`text`).
 pub fn received(json: &str, text: &str) -> Result<Vec<BgpRouteEntry>, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("bgpd answered bad JSON: {e}"))?;
-    let detail: std::collections::HashMap<IpNet, BgpRouteEntry> =
-        received_text(text).into_iter().filter_map(|e| Some((e.prefix?, e))).collect();
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| format!("bgpd answered bad JSON: {e}"))?;
+    let detail: std::collections::HashMap<IpNet, BgpRouteEntry> = received_text(text)
+        .into_iter()
+        .filter_map(|e| Some((e.prefix?, e)))
+        .collect();
     let Some(routes) = v.get("receivedRoutes").and_then(Value::as_object) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::with_capacity(routes.len());
     for (prefix, r) in routes {
-        let Ok(p) = prefix.parse::<IpNet>() else { continue };
+        let Ok(p) = prefix.parse::<IpNet>() else {
+            continue;
+        };
         if let Some(d) = detail.get(&p) {
             out.push(d.clone());
             continue;
         }
         out.push(BgpRouteEntry {
             prefix: Some(p),
-            as_path: r.get("path").and_then(Value::as_str).map(path_of).unwrap_or_default(),
-            med: r.get("metric").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
-            local_pref: r.get("locPrf").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()),
+            as_path: r
+                .get("path")
+                .and_then(Value::as_str)
+                .map(path_of)
+                .unwrap_or_default(),
+            med: r
+                .get("metric")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
+            local_pref: r
+                .get("locPrf")
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok()),
             partial: true,
             ..Default::default()
         });
@@ -107,21 +135,34 @@ pub fn received(json: &str, text: &str) -> Result<Vec<BgpRouteEntry>, String> {
 /// The best routes of `show bgp … detail json` (`{"routes": {prefix:
 /// [path…]}}`).
 pub fn best_json(json: &str) -> Result<Vec<BgpRouteEntry>, String> {
-    let v: Value = serde_json::from_str(json).map_err(|e| format!("bgpd answered bad JSON: {e}"))?;
+    let v: Value =
+        serde_json::from_str(json).map_err(|e| format!("bgpd answered bad JSON: {e}"))?;
     let Some(routes) = v.get("routes").and_then(Value::as_object) else {
         return Ok(Vec::new());
     };
     let mut out = Vec::with_capacity(routes.len());
     for (prefix, paths) in routes {
-        let Some(paths) = paths.as_array() else { continue };
+        let Some(paths) = paths.as_array() else {
+            continue;
+        };
         let best = paths.iter().find(|p| {
-            p.get("bestpath").is_some_and(|b| b.get("overall").and_then(Value::as_bool) == Some(true) || b.as_bool() == Some(true))
+            p.get("bestpath").is_some_and(|b| {
+                b.get("overall").and_then(Value::as_bool) == Some(true) || b.as_bool() == Some(true)
+            })
         });
         let Some(p) = best else { continue };
-        let mut e = BgpRouteEntry { prefix: prefix.parse().ok(), ..Default::default() };
+        let mut e = BgpRouteEntry {
+            prefix: prefix.parse().ok(),
+            ..Default::default()
+        };
         if let Some(segs) = p.pointer("/aspath/segments").and_then(Value::as_array) {
             for s in segs {
-                for a in s.get("list").and_then(Value::as_array).into_iter().flatten() {
+                for a in s
+                    .get("list")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     if let Some(n) = a.as_u64().and_then(|n| u32::try_from(n).ok()) {
                         e.as_path.push(n);
                     }
@@ -129,14 +170,25 @@ pub fn best_json(json: &str) -> Result<Vec<BgpRouteEntry>, String> {
             }
         }
         for key in ["/community/list", "/largeCommunity/list"] {
-            for c in p.pointer(key).and_then(Value::as_array).into_iter().flatten() {
+            for c in p
+                .pointer(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
                 if let Some(s) = c.as_str() {
                     communities(s, &mut e);
                 }
             }
         }
-        e.med = p.get("metric").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
-        e.local_pref = p.get("locPrf").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok());
+        e.med = p
+            .get("metric")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
+        e.local_pref = p
+            .get("locPrf")
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok());
         if e.prefix.is_some() {
             out.push(e);
         }
@@ -181,11 +233,17 @@ Total number of prefixes 2, total number of paths 0
         assert_eq!(r[0].as_path, [65200]);
         assert_eq!(r[0].communities, [65200 << 16 | 666]);
         assert_eq!(r[1].as_path, [65200, 64512, 64513, 64514]);
-        assert_eq!(r[1].communities, [65200 << 16 | 100, 65200 << 16 | 200, 0xFFFF_FF01]);
+        assert_eq!(
+            r[1].communities,
+            [65200 << 16 | 100, 65200 << 16 | 200, 0xFFFF_FF01]
+        );
         assert_eq!(r[1].large, [(65200, 1, 2)]);
         assert_eq!((r[1].med, r[1].local_pref), (Some(7), Some(120)));
         assert!(received_text("% Inbound soft reconfiguration not enabled\n").is_empty());
-        assert!(received_text("BGP routing table entry for nonsense, x\n  1\n    a from b\n").is_empty());
+        assert!(
+            received_text("BGP routing table entry for nonsense, x\n  1\n    a from b\n")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -199,7 +257,10 @@ Total number of prefixes 2, total number of paths 0
         assert_eq!(r.len(), 2);
         assert_eq!(r[0].communities, [65200 << 16 | 666]);
         assert!(!r[0].partial);
-        assert_eq!((r[1].as_path.clone(), r[1].med, r[1].partial), (vec![65200, 64512], Some(3), true));
+        assert_eq!(
+            (r[1].as_path.clone(), r[1].med, r[1].partial),
+            (vec![65200, 64512], Some(3), true)
+        );
         assert!(received("x", "").is_err());
     }
 

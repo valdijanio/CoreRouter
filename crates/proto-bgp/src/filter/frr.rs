@@ -109,15 +109,28 @@ pub struct Entry {
 
 impl Entry {
     fn reject() -> Self {
-        Entry { permit: false, matches: Vec::new(), sets: Vec::new(), exit: Exit::Done, description: None }
+        Entry {
+            permit: false,
+            matches: Vec::new(),
+            sets: Vec::new(),
+            exit: Exit::Done,
+            description: None,
+        }
     }
 
     fn accept() -> Self {
-        Entry { permit: true, ..Entry::reject() }
+        Entry {
+            permit: true,
+            ..Entry::reject()
+        }
     }
 
     fn goto(l: usize) -> Self {
-        Entry { permit: true, exit: Exit::Goto(l), ..Entry::reject() }
+        Entry {
+            permit: true,
+            exit: Exit::Goto(l),
+            ..Entry::reject()
+        }
     }
 
     /// No match: it always applies when reached.
@@ -171,7 +184,11 @@ enum Alt {
 /// The text of a matcher, for the entry's description.
 fn atom_text(a: &Atom) -> String {
     let vals = |arg: &CommArg| match arg {
-        CommArg::Values(v) => v.iter().map(ToString::to_string).collect::<Vec<_>>().join(","),
+        CommArg::Values(v) => v
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
         CommArg::List(n) => n.clone(),
     };
     match a {
@@ -184,13 +201,21 @@ fn atom_text(a: &Atom) -> String {
         Atom::Protocol(p) => format!("protocol {}", p.name()),
         Atom::AsPath(re) => format!("bgp-as-path {re}"),
         Atom::Comm { large, op, arg } => {
-            let list = if matches!(arg, CommArg::List(_)) { "-list" } else { "" };
+            let list = if matches!(arg, CommArg::List(_)) {
+                "-list"
+            } else {
+                ""
+            };
             let op = match op {
                 CommOp::Includes => "includes",
                 CommOp::Any => "any",
                 CommOp::Equal => "equal",
             };
-            let what = if *large { "bgp-large-communities" } else { "bgp-communities" };
+            let what = if *large {
+                "bgp-large-communities"
+            } else {
+                "bgp-communities"
+            };
             format!("{what} {op}{list} {}", vals(arg))
         }
     }
@@ -198,7 +223,11 @@ fn atom_text(a: &Atom) -> String {
 
 /// FRR keeps a description as typed; printable ASCII, bounded.
 fn description(s: &str) -> String {
-    let mut out: String = s.chars().filter(|c| c.is_ascii_graphic() || *c == ' ').take(80).collect();
+    let mut out: String = s
+        .chars()
+        .filter(|c| c.is_ascii_graphic() || *c == ' ')
+        .take(80)
+        .collect();
     out.truncate(out.trim_end().len());
     out
 }
@@ -247,22 +276,45 @@ impl<'a> Comp<'a> {
                 .filter
                 .community_lists
                 .get(name)
-                .map(|l| l.communities.iter().filter_map(|c| super::parse_community(c).ok()).collect())
+                .map(|l| {
+                    l.communities
+                        .iter()
+                        .filter_map(|c| super::parse_community(c).ok())
+                        .collect()
+                })
                 .unwrap_or_default(),
         }
     }
 
     fn normal(&mut self, arg: &CommArg) -> Vec<u32> {
-        let mut v: Vec<u32> =
-            self.comm_values(arg).into_iter().filter_map(|c| if let CommunityValue::Normal(n) = c { Some(n) } else { None }).collect();
+        let mut v: Vec<u32> = self
+            .comm_values(arg)
+            .into_iter()
+            .filter_map(|c| {
+                if let CommunityValue::Normal(n) = c {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
         v.sort_unstable();
         v.dedup();
         v
     }
 
     fn larges(&mut self, arg: &CommArg) -> Vec<Large> {
-        let mut v: Vec<Large> =
-            self.comm_values(arg).into_iter().filter_map(|c| if let CommunityValue::Large(n) = c { Some(n) } else { None }).collect();
+        let mut v: Vec<Large> = self
+            .comm_values(arg)
+            .into_iter()
+            .filter_map(|c| {
+                if let CommunityValue::Large(n) = c {
+                    Some(n)
+                } else {
+                    None
+                }
+            })
+            .collect();
         v.sort_unstable();
         v.dedup();
         v
@@ -272,20 +324,40 @@ impl<'a> Comp<'a> {
         let e = plist_entry(net, lo, hi);
         let v6 = matches!(net, IpNet::V6(_));
         let name = format!("CR-P-{:016x}", fnv(&e.to_string()));
-        let map = if v6 { &mut self.lists.prefix6 } else { &mut self.lists.prefix4 };
+        let map = if v6 {
+            &mut self.lists.prefix6
+        } else {
+            &mut self.lists.prefix4
+        };
         map.entry(name.clone()).or_insert_with(|| vec![e]);
         Match::Plist { v6, name }
     }
 
     fn comm_list(&mut self, entries: Vec<Vec<u32>>) -> String {
-        let key: Vec<String> = entries.iter().map(|e| e.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(" ")).collect();
+        let key: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                e.iter()
+                    .map(|c| c.to_string())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
         let name = format!("CR-C-{:016x}", fnv(&key.join("|")));
         self.lists.comm.entry(name.clone()).or_insert(entries);
         name
     }
 
     fn large_list(&mut self, entries: Vec<Vec<Large>>) -> String {
-        let key: Vec<String> = entries.iter().map(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ")).collect();
+        let key: Vec<String> = entries
+            .iter()
+            .map(|e| {
+                e.iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect();
         let name = format!("CR-LC-{:016x}", fnv(&key.join("|")));
         self.lists.large.entry(name.clone()).or_insert(entries);
         name
@@ -311,27 +383,52 @@ impl<'a> Comp<'a> {
                     return Alt::Never;
                 };
                 let name = format!("CR-L-{name}");
-                let (v4, v6): (Vec<PrefixEntry>, Vec<PrefixEntry>) = l.entries.iter().partition(|e| matches!(e.prefix, IpNet::V4(_)));
+                let (v4, v6): (Vec<PrefixEntry>, Vec<PrefixEntry>) = l
+                    .entries
+                    .iter()
+                    .partition(|e| matches!(e.prefix, IpNet::V4(_)));
                 let mut out = Vec::new();
                 for (v6flag, entries) in [(false, v4), (true, v6)] {
                     if entries.is_empty() {
                         continue;
                     }
-                    let map = if v6flag { &mut self.lists.prefix6 } else { &mut self.lists.prefix4 };
+                    let map = if v6flag {
+                        &mut self.lists.prefix6
+                    } else {
+                        &mut self.lists.prefix4
+                    };
                     map.insert(name.clone(), entries);
-                    out.push(Match::Plist { v6: v6flag, name: name.clone() });
+                    out.push(Match::Plist {
+                        v6: v6flag,
+                        name: name.clone(),
+                    });
                 }
-                if out.is_empty() { Alt::Never } else { Alt::Any(out) }
+                if out.is_empty() {
+                    Alt::Never
+                } else {
+                    Alt::Any(out)
+                }
             }
             Atom::AsPath(re) => {
                 let name = format!("CR-A-{:016x}", fnv(re));
-                self.lists.aspath.entry(name.clone()).or_insert_with(|| re.clone());
+                self.lists
+                    .aspath
+                    .entry(name.clone())
+                    .or_insert_with(|| re.clone());
                 Alt::Any(vec![Match::AsPath(name)])
             }
-            Atom::Comm { large: false, op, arg } => {
+            Atom::Comm {
+                large: false,
+                op,
+                arg,
+            } => {
                 let v = self.normal(arg);
                 if v.is_empty() {
-                    return if *op == CommOp::Includes { Alt::Always } else { Alt::Never };
+                    return if *op == CommOp::Includes {
+                        Alt::Always
+                    } else {
+                        Alt::Never
+                    };
                 }
                 let (entries, exact) = match op {
                     CommOp::Includes => (vec![v], false),
@@ -341,10 +438,18 @@ impl<'a> Comp<'a> {
                 let name = self.comm_list(entries);
                 Alt::Any(vec![Match::Comm { name, exact }])
             }
-            Atom::Comm { large: true, op, arg } => {
+            Atom::Comm {
+                large: true,
+                op,
+                arg,
+            } => {
                 let v = self.larges(arg);
                 if v.is_empty() {
-                    return if *op == CommOp::Includes { Alt::Always } else { Alt::Never };
+                    return if *op == CommOp::Includes {
+                        Alt::Always
+                    } else {
+                        Alt::Never
+                    };
                 }
                 let (entries, exact) = match op {
                     CommOp::Includes => (vec![v], false),
@@ -404,20 +509,36 @@ impl<'a> Comp<'a> {
                     return None;
                 }
             },
-            SetOp::Comm { large: false, how, arg } => {
+            SetOp::Comm {
+                large: false,
+                how,
+                arg,
+            } => {
                 let v = self.normal(arg);
                 if v.is_empty() && *how != CommHow::Set {
                     return None;
                 }
-                let name = if *how == CommHow::Delete { self.comm_list(v.iter().map(|c| vec![*c]).collect()) } else { String::new() };
+                let name = if *how == CommHow::Delete {
+                    self.comm_list(v.iter().map(|c| vec![*c]).collect())
+                } else {
+                    String::new()
+                };
                 Set::Comm(*how, v, name)
             }
-            SetOp::Comm { large: true, how, arg } => {
+            SetOp::Comm {
+                large: true,
+                how,
+                arg,
+            } => {
                 let v = self.larges(arg);
                 if v.is_empty() && *how != CommHow::Set {
                     return None;
                 }
-                let name = if *how == CommHow::Delete { self.large_list(v.iter().map(|c| vec![*c]).collect()) } else { String::new() };
+                let name = if *how == CommHow::Delete {
+                    self.large_list(v.iter().map(|c| vec![*c]).collect())
+                } else {
+                    String::new()
+                };
                 Set::Large(*how, v, name)
             }
         })
@@ -447,9 +568,16 @@ impl<'a> Comp<'a> {
                 Stmt::Jump(c) => {
                     let target = self.chains.get(c.as_str()).copied();
                     match target {
-                        Some(sub) if !self.stack.contains(&c.as_str()) && self.stack.len() <= MAX_JUMP_DEPTH => {
+                        Some(sub)
+                            if !self.stack.contains(&c.as_str())
+                                && self.stack.len() <= MAX_JUMP_DEPTH =>
+                        {
                             let back = self.label();
-                            self.stack.push(self.chains.get_key_value(c.as_str()).map_or("", |(k, _)| *k));
+                            self.stack.push(
+                                self.chains
+                                    .get_key_value(c.as_str())
+                                    .map_or("", |(k, _)| *k),
+                            );
                             self.stmts(sub, back);
                             self.stack.pop();
                             self.place(back);
@@ -460,7 +588,13 @@ impl<'a> Comp<'a> {
                 }
                 Stmt::Set(op) => {
                     if let Some(set) = self.set(op) {
-                        self.emit(Entry { permit: true, matches: Vec::new(), sets: vec![set], exit: Exit::Next, description: None });
+                        self.emit(Entry {
+                            permit: true,
+                            matches: Vec::new(),
+                            sets: vec![set],
+                            exit: Exit::Next,
+                            description: None,
+                        });
                     }
                 }
             }
@@ -545,7 +679,10 @@ fn optimize(mut v: Vec<Entry>) -> Vec<Entry> {
             if !t.always() || j <= i {
                 continue;
             }
-            let slots_free = t.sets.iter().all(|s| e.sets.iter().all(|x| x.slot() != s.slot()));
+            let slots_free = t
+                .sets
+                .iter()
+                .all(|s| e.sets.iter().all(|x| x.slot() != s.slot()));
             if !t.permit {
                 // Whatever was set, the route is rejected.
                 if let Some(e) = v.get_mut(i) {
@@ -584,10 +721,12 @@ fn optimize(mut v: Vec<Entry>) -> Vec<Entry> {
         for i in 0..last {
             let Some(e) = v.get(i) else { break };
             // Also a plain deny right before the final one.
-            let noop = (e.permit && e.sets.is_empty() && e.exit == Exit::Next) || (!e.permit && e.always() && i + 1 == last);
+            let noop = (e.permit && e.sets.is_empty() && e.exit == Exit::Next)
+                || (!e.permit && e.always() && i + 1 == last);
             let dead = i > 0
                 && !target.get(i).copied().unwrap_or(true)
-                && v.get(i - 1).is_some_and(|p| p.always() && (p.exit != Exit::Next || !p.permit))
+                && v.get(i - 1)
+                    .is_some_and(|p| p.always() && (p.exit != Exit::Next || !p.permit))
                 && !keep.get(i - 1).is_some_and(|k| !k);
             if noop || dead {
                 if let Some(k) = keep.get_mut(i) {
@@ -667,7 +806,10 @@ pub fn compile(
     let items = c.items;
     let v = optimize(resolve(items, end));
     if v.len() > MAX_ENTRIES + 1 {
-        problems.push(format!("chain {chain} compiles to {} route-map entries, more than FRR's {MAX_ENTRIES}", v.len()));
+        problems.push(format!(
+            "chain {chain} compiles to {} route-map entries, more than FRR's {MAX_ENTRIES}",
+            v.len()
+        ));
         return (vec![Entry::reject()], problems);
     }
     (v, problems)
@@ -675,12 +817,26 @@ pub fn compile(
 
 /// The sequence number of entry `i` of `n`.
 pub fn seq(i: usize, n: usize) -> u32 {
-    if i + 1 == n { END_SEQ } else { u32::try_from(i + FIRST_SEQ).unwrap_or(END_SEQ) }
+    if i + 1 == n {
+        END_SEQ
+    } else {
+        u32::try_from(i + FIRST_SEQ).unwrap_or(END_SEQ)
+    }
 }
 
 fn set_line(s: &Set) -> Option<String> {
-    let words = |v: &[u32]| v.iter().map(|c| community_text(*c)).collect::<Vec<_>>().join(" ");
-    let large = |v: &[Large]| v.iter().map(ToString::to_string).collect::<Vec<_>>().join(" ");
+    let words = |v: &[u32]| {
+        v.iter()
+            .map(|c| community_text(*c))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let large = |v: &[Large]| {
+        v.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
     Some(match s {
         Set::LocalPref(v) => format!("set local-preference {v}"),
         Set::Med(v) => format!("set metric {v}"),
@@ -707,8 +863,14 @@ fn match_line(m: &Match) -> String {
         Match::Plist { v6: false, name } => format!("match ip address prefix-list {name}"),
         Match::Plist { v6: true, name } => format!("match ipv6 address prefix-list {name}"),
         Match::AsPath(n) => format!("match as-path {n}"),
-        Match::Comm { name, exact } => format!("match community {name}{}", if *exact { " exact-match" } else { "" }),
-        Match::Large { name, exact } => format!("match large-community {name}{}", if *exact { " exact-match" } else { "" }),
+        Match::Comm { name, exact } => format!(
+            "match community {name}{}",
+            if *exact { " exact-match" } else { "" }
+        ),
+        Match::Large { name, exact } => format!(
+            "match large-community {name}{}",
+            if *exact { " exact-match" } else { "" }
+        ),
         Match::Proto(p) => format!("match source-protocol {}", p.name()),
     }
 }
@@ -718,7 +880,12 @@ pub fn map_text(chain: &str, entries: &[Entry], out: &mut String) {
     let name = route_map(chain);
     let n = entries.len();
     for (i, e) in entries.iter().enumerate() {
-        let _ = writeln!(out, "route-map {name} {} {}", if e.permit { "permit" } else { "deny" }, seq(i, n));
+        let _ = writeln!(
+            out,
+            "route-map {name} {} {}",
+            if e.permit { "permit" } else { "deny" },
+            seq(i, n)
+        );
         if let Some(d) = e.description.as_deref().filter(|d| !d.is_empty()) {
             let _ = writeln!(out, " description {d}");
         }
@@ -750,7 +917,11 @@ pub fn lists_text(l: &Lists, out: &mut String) {
     for (kw, map) in [("ip", &l.prefix4), ("ipv6", &l.prefix6)] {
         for (name, entries) in map {
             for (i, e) in entries.iter().enumerate() {
-                let _ = writeln!(out, "{kw} prefix-list {name} seq {} permit {e}", (i + 1) * 5);
+                let _ = writeln!(
+                    out,
+                    "{kw} prefix-list {name} seq {} permit {e}",
+                    (i + 1) * 5
+                );
             }
         }
     }
@@ -760,13 +931,23 @@ pub fn lists_text(l: &Lists, out: &mut String) {
     for (name, entries) in &l.comm {
         for (i, e) in entries.iter().enumerate() {
             let words: Vec<String> = e.iter().map(|c| community_text(*c)).collect();
-            let _ = writeln!(out, "bgp community-list standard {name} seq {} permit {}", (i + 1) * 5, words.join(" "));
+            let _ = writeln!(
+                out,
+                "bgp community-list standard {name} seq {} permit {}",
+                (i + 1) * 5,
+                words.join(" ")
+            );
         }
     }
     for (name, entries) in &l.large {
         for (i, e) in entries.iter().enumerate() {
             let words: Vec<String> = e.iter().map(ToString::to_string).collect();
-            let _ = writeln!(out, "bgp large-community-list standard {name} seq {} permit {}", (i + 1) * 5, words.join(" "));
+            let _ = writeln!(
+                out,
+                "bgp large-community-list standard {name} seq {} permit {}",
+                (i + 1) * 5,
+                words.join(" ")
+            );
         }
     }
 }
@@ -776,7 +957,11 @@ pub fn lists_text(l: &Lists, out: &mut String) {
 /// included, instead of 40 ms on one, **medido** in `benches/filter.rs`,
 /// 2026-10-27); one thread on wasm.
 fn render_parts<T: Send>(roots: &[&str], part: &(dyn Fn(&[&str]) -> T + Sync)) -> Vec<T> {
-    let threads = if roots.len() < 8 { 1 } else { super::eval::threads_for(usize::MAX) };
+    let threads = if roots.len() < 8 {
+        1
+    } else {
+        super::eval::threads_for(usize::MAX)
+    };
     if threads <= 1 {
         return vec![part(roots)];
     }
@@ -790,7 +975,11 @@ fn render_parts<T: Send>(roots: &[&str], part: &(dyn Fn(&[&str]) -> T + Sync)) -
         std::thread::scope(|scope| {
             let handles: Vec<_> = roots
                 .chunks(size)
-                .map(|c| std::thread::Builder::new().name("filter-render".into()).spawn_scoped(scope, move || part(c)))
+                .map(|c| {
+                    std::thread::Builder::new()
+                        .name("filter-render".into())
+                        .spawn_scoped(scope, move || part(c))
+                })
                 .collect();
             handles
                 .into_iter()
@@ -807,7 +996,11 @@ fn render_parts<T: Send>(roots: &[&str], part: &(dyn Fn(&[&str]) -> T + Sync)) -
 /// The whole `/routing filter` for FRR: the chains in `used` (those the
 /// connections name) and the chains no other chain jumps to, each with
 /// the AS `asn_of` gives it; the problems (with the chain's name).
-pub fn render(filter: &RoutingFilter, used: &BTreeSet<String>, asn_of: &dyn Fn(&str) -> Option<u32>) -> (String, Vec<Problem>) {
+pub fn render(
+    filter: &RoutingFilter,
+    used: &BTreeSet<String>,
+    asn_of: &dyn Fn(&str) -> Option<u32>,
+) -> (String, Vec<Problem>) {
     render_with(filter, used, asn_of, &|_| String::new())
 }
 
@@ -821,7 +1014,10 @@ pub fn render_with(
     prelude: &dyn Fn(&str) -> String,
 ) -> (String, Vec<Problem>) {
     let (parsed, _) = parsed_chains(filter);
-    let chains: HashMap<&str, &[Stmt]> = parsed.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+    let chains: HashMap<&str, &[Stmt]> = parsed
+        .iter()
+        .map(|(n, b)| (n.as_str(), b.as_slice()))
+        .collect();
     let mut jumped: BTreeSet<String> = BTreeSet::new();
     for (_, b) in &parsed {
         let mut j = Vec::new();
@@ -842,7 +1038,10 @@ pub fn render_with(
         for name in names {
             let asn = asns.get(name).copied().flatten();
             let (entries, probs) = compile(filter, &chains, name, asn, &mut lists);
-            problems.extend(probs.into_iter().map(|message| Problem { item: format!("chain {name}"), message }));
+            problems.extend(probs.into_iter().map(|message| Problem {
+                item: format!("chain {name}"),
+                message,
+            }));
             if let Some(p) = preludes.get(name) {
                 maps.push_str(p);
             }
@@ -882,19 +1081,36 @@ pub(crate) mod tests {
         let mut f = RoutingFilter::default();
         for (chain, rule) in rules {
             let id = f.next_id();
-            f.rules.push(FilterRule { id, chain: (*chain).into(), rule: (*rule).into(), disabled: false, comment: String::new() });
+            f.rules.push(FilterRule {
+                id,
+                chain: (*chain).into(),
+                rule: (*rule).into(),
+                disabled: false,
+                comment: String::new(),
+            });
         }
         f.prefix_lists.insert(
             "bogons".into(),
             PrefixList {
                 name: "bogons".into(),
-                entries: ["10.0.0.0/8 le 32", "192.168.0.0/16 le 32", "fc00::/7 le 128"].iter().map(|e| e.parse().unwrap()).collect(),
+                entries: [
+                    "10.0.0.0/8 le 32",
+                    "192.168.0.0/16 le 32",
+                    "fc00::/7 le 128",
+                ]
+                .iter()
+                .map(|e| e.parse().unwrap())
+                .collect(),
                 comment: String::new(),
             },
         );
         f.community_lists.insert(
             "cl".into(),
-            CommunityList { name: "cl".into(), communities: vec!["65000:1".into(), "65000:2".into(), "1:2:3".into()], comment: String::new() },
+            CommunityList {
+                name: "cl".into(),
+                communities: vec!["65000:1".into(), "65000:2".into(), "1:2:3".into()],
+                comment: String::new(),
+            },
         );
         f
     }
@@ -903,7 +1119,10 @@ pub(crate) mod tests {
         let f = filter(rules);
         let (parsed, probs) = parsed_chains(&f);
         assert_eq!(probs, []);
-        let chains: HashMap<&str, &[Stmt]> = parsed.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+        let chains: HashMap<&str, &[Stmt]> = parsed
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
         let mut lists = Lists::default();
         let (v, p) = compile(&f, &chains, "in", Some(65000), &mut lists);
         assert_eq!(p, Vec::<String>::new());
@@ -950,16 +1169,33 @@ pub(crate) mod tests {
             Match::Plist { v6, name } => {
                 let fam = matches!(r.prefix, IpNet::V6(_));
                 let map = if *v6 { &l.prefix6 } else { &l.prefix4 };
-                fam == *v6 && map.get(name).is_some_and(|e| PrefixSet::new(e).contains(&r.prefix))
+                fam == *v6
+                    && map
+                        .get(name)
+                        .is_some_and(|e| PrefixSet::new(e).contains(&r.prefix))
             }
-            Match::AsPath(n) => l.aspath.get(n).is_some_and(|re| compile_regex(re).unwrap().is_match(&r.path_text())),
+            Match::AsPath(n) => l
+                .aspath
+                .get(n)
+                .is_some_and(|re| compile_regex(re).unwrap().is_match(&r.path_text())),
             Match::Comm { name, exact } => l.comm.get(name).is_some_and(|es| {
-                es.iter().any(|e| if *exact { *e == r.communities } else { e.iter().all(|c| r.communities.contains(c)) })
+                es.iter().any(|e| {
+                    if *exact {
+                        *e == r.communities
+                    } else {
+                        e.iter().all(|c| r.communities.contains(c))
+                    }
+                })
             }),
-            Match::Large { name, exact } => l
-                .large
-                .get(name)
-                .is_some_and(|es| es.iter().any(|e| if *exact { *e == r.large } else { e.iter().all(|c| r.large.contains(c)) })),
+            Match::Large { name, exact } => l.large.get(name).is_some_and(|es| {
+                es.iter().any(|e| {
+                    if *exact {
+                        *e == r.large
+                    } else {
+                        e.iter().all(|c| r.large.contains(c))
+                    }
+                })
+            }),
             Match::Proto(p) => r.protocol == *p,
         }
     }
@@ -991,7 +1227,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_reject_test_is_one_deny_entry() {
-        let (v, lists, text) = one(&[("in", "if (dst in 10.0.0.0/8) { reject }"), ("in", "accept")]);
+        let (v, lists, text) = one(&[
+            ("in", "if (dst in 10.0.0.0/8) { reject }"),
+            ("in", "accept"),
+        ]);
         assert_eq!(v.len(), 3, "{text}");
         let name = lists.prefix4.keys().next().unwrap().clone();
         assert_eq!(
@@ -1001,14 +1240,23 @@ pub(crate) mod tests {
                  route-map CR-in permit 11\nexit\nroute-map CR-in deny 65535\nexit\n"
             )
         );
-        assert_eq!(lists.prefix4.get(&name).unwrap()[0].to_string(), "10.0.0.0/8 le 32");
+        assert_eq!(
+            lists.prefix4.get(&name).unwrap()[0].to_string(),
+            "10.0.0.0/8 le 32"
+        );
     }
 
     #[test]
     fn sets_merge_and_accept_ends_the_map() {
-        let (v, _, text) = one(&[("in", "if (bgp-communities includes 65000:1) { set bgp-local-pref 200; set bgp-med 10; accept }")]);
+        let (v, _, text) = one(&[(
+            "in",
+            "if (bgp-communities includes 65000:1) { set bgp-local-pref 200; set bgp-med 10; accept }",
+        )]);
         assert_eq!(v.len(), 2, "{text}");
-        assert!(text.contains(" set local-preference 200\n set metric 10\n"), "{text}");
+        assert!(
+            text.contains(" set local-preference 200\n set metric 10\n"),
+            "{text}"
+        );
         assert!(!text.contains("on-match"), "{text}");
     }
 
@@ -1042,21 +1290,35 @@ pub(crate) mod tests {
     /// Lines that open a context (no leading space), as a sanity check
     /// without depending on `hal-frr`.
     fn corerouter_model_free_parse(text: &str) -> usize {
-        text.lines().filter(|l| !l.starts_with(' ') && *l != "exit").count()
+        text.lines()
+            .filter(|l| !l.starts_with(' ') && *l != "exit")
+            .count()
     }
 
     #[test]
     fn jumps_are_inlined_and_return_comes_back() {
         let f = filter(&[
-            ("in", "jump tag; if (bgp-communities includes 65000:7) { accept }"),
-            ("tag", "if (dst-len > 24) { return } append bgp-communities 65000:7"),
+            (
+                "in",
+                "jump tag; if (bgp-communities includes 65000:7) { accept }",
+            ),
+            (
+                "tag",
+                "if (dst-len > 24) { return } append bgp-communities 65000:7",
+            ),
         ]);
         let (p, _) = Policy::build(&f);
         let (text, problems) = render(&f, &BTreeSet::new(), &|_| Some(1));
         assert_eq!(problems, []);
-        assert!(text.contains("route-map CR-in ") && !text.contains("route-map CR-tag "), "{text}");
+        assert!(
+            text.contains("route-map CR-in ") && !text.contains("route-map CR-tag "),
+            "{text}"
+        );
         let (parsed, _) = parsed_chains(&f);
-        let chains: HashMap<&str, &[Stmt]> = parsed.iter().map(|(n, b)| (n.as_str(), b.as_slice())).collect();
+        let chains: HashMap<&str, &[Stmt]> = parsed
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_slice()))
+            .collect();
         let mut lists = Lists::default();
         let (v, _) = compile(&f, &chains, "in", Some(1), &mut lists);
         for (pfx, want) in [("192.0.2.0/24", true), ("192.0.2.0/25", false)] {
@@ -1066,7 +1328,11 @@ pub(crate) mod tests {
         }
         // A chain both jumped to and used by a connection is rendered.
         let used: BTreeSet<String> = ["tag".to_owned()].into();
-        assert!(render(&f, &used, &|_| Some(1)).0.contains("route-map CR-tag "));
+        assert!(
+            render(&f, &used, &|_| Some(1))
+                .0
+                .contains("route-map CR-tag ")
+        );
     }
 
     #[test]
@@ -1075,13 +1341,19 @@ pub(crate) mod tests {
         // 3^12 copies of the last chain, within the jump depth.
         let names: Vec<String> = (0..13).map(|i| format!("c{i}")).collect();
         for i in 0..12 {
-            rules.push((names[i].as_str(), format!("jump c{0}; jump c{0}; jump c{0}", i + 1)));
+            rules.push((
+                names[i].as_str(),
+                format!("jump c{0}; jump c{0}; jump c{0}", i + 1),
+            ));
         }
         rules.push(("c12", "set bgp-med 1".into()));
         let pairs: Vec<(&str, &str)> = rules.iter().map(|(a, b)| (*a, b.as_str())).collect();
         let f = filter(&pairs);
         let (_, problems) = render(&f, &BTreeSet::new(), &|_| Some(1));
-        assert!(format!("{problems:?}").contains("more than"), "{problems:?}");
+        assert!(
+            format!("{problems:?}").contains("more than"),
+            "{problems:?}"
+        );
     }
 
     // ---- equivalence: eval == FRR's semantics over the render ----
@@ -1147,13 +1419,22 @@ pub(crate) mod tests {
     fn stmt() -> impl Strategy<Value = String> {
         let leaf = action();
         leaf.prop_recursive(3, 16, 3, |inner| {
-            (expr(), prop::collection::vec(inner.clone(), 0..3), prop::collection::vec(inner, 0..3)).prop_map(|(c, t, e)| {
-                if e.is_empty() {
-                    format!("if ({c}) {{ {} }}", t.join("; "))
-                } else {
-                    format!("if ({c}) {{ {} }} else {{ {} }}", t.join("; "), e.join("; "))
-                }
-            })
+            (
+                expr(),
+                prop::collection::vec(inner.clone(), 0..3),
+                prop::collection::vec(inner, 0..3),
+            )
+                .prop_map(|(c, t, e)| {
+                    if e.is_empty() {
+                        format!("if ({c}) {{ {} }}", t.join("; "))
+                    } else {
+                        format!(
+                            "if ({c}) {{ {} }} else {{ {} }}",
+                            t.join("; "),
+                            e.join("; ")
+                        )
+                    }
+                })
         })
     }
 
@@ -1173,13 +1454,23 @@ pub(crate) mod tests {
             Just("fd00::/8"),
             Just("::/0"),
         ];
-        let asn = prop_oneof![Just(64500u32), Just(64501), Just(64503), Just(65000), Just(7)];
+        let asn = prop_oneof![
+            Just(64500u32),
+            Just(64501),
+            Just(64503),
+            Just(65000),
+            Just(7)
+        ];
         (
             prefix,
             prop::collection::vec(asn, 1..4),
             prop::sample::subsequence(vec![65000 << 16 | 1, 65000 << 16 | 2, 0xFFFF_FF01], 0..3),
             prop::sample::subsequence(vec![Large(1, 2, 3), Large(1, 2, 4)], 0..2),
-            prop_oneof![Just(Protocol::Bgp), Just(Protocol::Static), Just(Protocol::Connected)],
+            prop_oneof![
+                Just(Protocol::Bgp),
+                Just(Protocol::Static),
+                Just(Protocol::Connected)
+            ],
         )
             .prop_map(|(p, path, comms, large, protocol)| {
                 let mut r = Route::bgp(p.parse().unwrap(), path);

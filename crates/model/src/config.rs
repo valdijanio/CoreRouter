@@ -391,6 +391,9 @@ pub struct Routing {
     /// `/routing filter`: rules, prefix and community lists (G3.2b).
     #[serde(skip_serializing_if = "crate::routing_filter::RoutingFilter::is_empty")]
     pub filter: crate::routing_filter::RoutingFilter,
+    /// `/routing rpki` (G3.2c, `crate::rpki`): the RTR validators, by name.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub rpki: BTreeMap<String, crate::rpki::RpkiCache>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

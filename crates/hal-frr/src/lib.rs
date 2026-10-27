@@ -20,6 +20,7 @@
 
 pub mod conf;
 pub mod render;
+pub mod rib;
 pub mod routes;
 pub mod state;
 pub mod vty;
@@ -30,6 +31,7 @@ use std::time::Duration;
 use corerouter_hal::HalError;
 use corerouter_hal::routing::{BgpClear, RoutingDaemon, RoutingReader, SecretOpener};
 use corerouter_model::Config;
+use corerouter_model::bgp_rib::{BgpPrefix, BgpRib, Direction};
 use corerouter_model::routing_state::BgpSession;
 
 use crate::conf::Conf;
@@ -414,14 +416,22 @@ impl Frr {
     /// The routes of `neighbor` (instance `instance`) for the policy
     /// preview: `received`, what it sent before the input chain (needs
     /// `keep_received`); otherwise our best routes, before the output chain.
-    pub fn bgp_filter_routes(&self, instance: &str, neighbor: &str, received: bool) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
+    pub fn bgp_filter_routes(
+        &self,
+        instance: &str,
+        neighbor: &str,
+        received: bool,
+    ) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
         if neighbor.parse::<std::net::IpAddr>().is_err() {
-            return Err(HalError::Rejected(format!("{neighbor:?} is not a neighbor address")));
+            return Err(HalError::Rejected(format!(
+                "{neighbor:?} is not a neighbor address"
+            )));
         }
         let view = if instance == corerouter_proto_bgp::DEFAULT_INSTANCE {
             String::new()
         } else {
-            corerouter_proto_bgp::filter::parse::check_name(instance).map_err(HalError::Rejected)?;
+            corerouter_proto_bgp::filter::parse::check_name(instance)
+                .map_err(HalError::Rejected)?;
             format!("view {instance} ")
         };
         let mut vty = Vty::connect(&self.socket(Daemon::Bgpd), self.timeout, MAX_ROUTES_REPLY)
@@ -430,10 +440,15 @@ impl Frr {
         let mut out = Vec::new();
         for afi in ["ipv4", "ipv6"] {
             if received {
-                let base = format!("show bgp {view}{afi} unicast neighbors {neighbor} received-routes");
-                let j = vty.run(&format!("{base} json")).map_err(|e| io_err(Daemon::Bgpd, e))?;
+                let base =
+                    format!("show bgp {view}{afi} unicast neighbors {neighbor} received-routes");
+                let j = vty
+                    .run(&format!("{base} json"))
+                    .map_err(|e| io_err(Daemon::Bgpd, e))?;
                 let json = String::from_utf8_lossy(&j.output);
-                if json.contains("soft reconfiguration not enabled") || json.contains("Inbound soft reconfiguration") {
+                if json.contains("soft reconfiguration not enabled")
+                    || json.contains("Inbound soft reconfiguration")
+                {
                     return Err(HalError::Rejected(format!(
                         "neighbor {neighbor} does not keep its routes (keep_received is off): the preview needs them"
                     )));
@@ -442,8 +457,13 @@ impl Frr {
                 if !j.ok() || !json.trim_start().starts_with('{') {
                     continue;
                 }
-                let t = vty.run(&format!("{base} detail")).map_err(|e| io_err(Daemon::Bgpd, e))?;
-                out.extend(routes::received(&json, &String::from_utf8_lossy(&t.output)).map_err(HalError::Rejected)?);
+                let t = vty
+                    .run(&format!("{base} detail"))
+                    .map_err(|e| io_err(Daemon::Bgpd, e))?;
+                out.extend(
+                    routes::received(&json, &String::from_utf8_lossy(&t.output))
+                        .map_err(HalError::Rejected)?,
+                );
                 continue;
             }
             let cmd = format!("show bgp {view}{afi} unicast detail json");
@@ -460,6 +480,154 @@ impl Frr {
 /// How many contexts deep the vty is after running `script[i]`: a script
 /// indents each context's commands by one space under its header and
 /// leaves it with `exit`/`exit-address-family` at the header's indentation.
+/// Largest route table read from bgpd (G3.2c): ~1 KiB per route of JSON
+/// at most, for [`rib::MAX_ROUTES`] routes, **estimado**.
+pub const MAX_TABLE: u64 = 4 << 30;
+
+impl Frr {
+    /// `view X ` for a non-default instance (a name CoreRouter validated;
+    /// checked again: it goes into a command line).
+    fn view(instance: &str) -> Result<String, HalError> {
+        if instance == corerouter_proto_bgp::DEFAULT_INSTANCE {
+            Ok(String::new())
+        } else if !instance.is_empty()
+            && instance.len() <= 64
+            && instance
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            Ok(format!("view {instance} "))
+        } else {
+            Err(HalError::Rejected(format!(
+                "bad instance name {instance:?}"
+            )))
+        }
+    }
+
+    /// The routes of `neighbor`, one way, IPv4 and IPv6 unicast, parsed as
+    /// bgpd prints them. Received: before the inbound policy when the
+    /// neighbor keeps its Adj-RIB-In (`soft-reconfiguration inbound`, which
+    /// CoreRouter turns on with RPKI), with the refused ones flagged; the
+    /// accepted ones otherwise.
+    pub fn bgp_routes(
+        &self,
+        instance: &str,
+        neighbor: &str,
+        direction: Direction,
+    ) -> Result<BgpRib, HalError> {
+        let addr: std::net::IpAddr = neighbor
+            .parse()
+            .map_err(|_| HalError::Rejected(format!("{neighbor:?} is not a neighbor address")))?;
+        let view = Self::view(instance)?;
+        let mut vty = self.connect(Daemon::Bgpd)?;
+        let io = |e: std::io::Error| io_err(Daemon::Bgpd, e);
+        // One table, streamed into `b`; `Ok(None)`: the family is not
+        // active with this neighbor (FRR says so in text).
+        let table = |vty: &mut Vty,
+                     cmd: String,
+                     b: &mut rib::Builder|
+         -> Result<Option<rib::Parsed>, HalError> {
+            let mut stream = vty.run_stream(&cmd, MAX_TABLE).map_err(io)?;
+            let mut first = [0u8; 1];
+            let n = std::io::Read::read(&mut stream, &mut first).map_err(io)?;
+            if n == 0 || first[0] != b'{' {
+                // Text, not JSON: "% No such neighbor or address family".
+                let code = stream.finish().map_err(io)?;
+                log::debug!("FRR bgpd: {cmd}: no table (code {code})");
+                return Ok(None);
+            }
+            let chained = std::io::Read::chain(&first[..], &mut stream);
+            let parsed = rib::parse_table(chained, b).map_err(HalError::Rejected)?;
+            let code = stream.finish().map_err(io)?;
+            if code != vty::CMD_SUCCESS {
+                b.warn(format!("{cmd}: {}", vty::code_name(code)));
+            }
+            Ok(Some(parsed))
+        };
+        let mut b = rib::Builder::new(direction == Direction::Received, None);
+        let mut filtered: Vec<ipnet::IpNet> = Vec::new();
+        for afi in ["ipv4", "ipv6"] {
+            let base = format!("show bgp {view}{afi} unicast neighbors {addr}");
+            match direction {
+                Direction::Advertised => {
+                    table(&mut vty, format!("{base} advertised-routes json"), &mut b)?;
+                }
+                Direction::Received => {
+                    let got = table(&mut vty, format!("{base} received-routes json"), &mut b)?;
+                    if got.as_ref().is_some_and(|p| p.warning.is_some()) {
+                        // No Adj-RIB-In: what was accepted, from the table.
+                        let mut acc = rib::Builder::new(false, Some(addr));
+                        table(&mut vty, format!("{base} routes json"), &mut acc)?;
+                        b.extend(acc.finish());
+                        b.set_pre_policy(false);
+                    } else if got.is_some() {
+                        let mut f = rib::Builder::new(false, None);
+                        table(&mut vty, format!("{base} filtered-routes json"), &mut f)?;
+                        filtered.extend(f.finish().routes.into_iter().map(|r| r.prefix));
+                    }
+                }
+            }
+        }
+        let mut out = b.finish();
+        if !filtered.is_empty() {
+            filtered.sort_unstable();
+            for r in &mut out.routes {
+                if filtered.binary_search(&r.prefix).is_ok() {
+                    r.flags |= corerouter_model::bgp_rib::BgpRoute::FILTERED;
+                    r.flags &= !corerouter_model::bgp_rib::BgpRoute::BEST;
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Every path of `prefix` (or the longest match of an address).
+    pub fn bgp_prefix(&self, instance: &str, prefix: &str) -> Result<BgpPrefix, HalError> {
+        let v6 = match prefix.parse::<ipnet::IpNet>() {
+            Ok(n) => n.addr().is_ipv6(),
+            Err(_) => prefix
+                .parse::<std::net::IpAddr>()
+                .map_err(|_| {
+                    HalError::Rejected(format!("{prefix:?} is not a prefix or an address"))
+                })?
+                .is_ipv6(),
+        };
+        let view = Self::view(instance)?;
+        let afi = if v6 { "ipv6" } else { "ipv4" };
+        let cmd = format!("show bgp {view}{afi} unicast {prefix} json");
+        let mut vty = self.connect(Daemon::Bgpd)?;
+        let r = vty.run(&cmd).map_err(|e| io_err(Daemon::Bgpd, e))?;
+        let text = String::from_utf8_lossy(&r.output);
+        let mut p = rib::parse_prefix(&text).map_err(HalError::Rejected)?;
+        // The table's default local-pref, for paths without one.
+        let head = vty
+            .run(&format!("show bgp {view}{afi} unicast summary json"))
+            .ok()
+            .map(|r| String::from_utf8_lossy(&r.output).into_owned())
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
+        let fam = head
+            .as_ref()
+            .and_then(|h| h.get(format!("{afi}Unicast")).or(Some(h)));
+        p.local_as = fam
+            .and_then(|f| f.get("as"))
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|a| u32::try_from(a).ok());
+        Ok(p)
+    }
+
+    /// bgpd's own RTR state, one line; `None` without the rpki module.
+    pub fn rpki_state(&self) -> Option<String> {
+        let mut vty = self.connect(Daemon::Bgpd).ok()?;
+        let r = vty.run("show rpki cache-connection").ok()?;
+        if !r.ok() {
+            return None;
+        }
+        let text = r.text(400);
+        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        (!line.is_empty()).then_some(line)
+    }
+}
+
 fn depth_after(script: &[String], i: usize) -> usize {
     let indent = |l: &str| l.len() - l.trim_start().len();
     let Some(line) = script.get(i) else { return 0 };
@@ -597,6 +765,23 @@ impl RoutingReader for FrrReader {
         received: bool,
     ) -> Result<Vec<corerouter_model::bgp_route::BgpRouteEntry>, HalError> {
         self.0.bgp_filter_routes(instance, neighbor, received)
+    }
+
+    fn bgp_routes(
+        &mut self,
+        instance: &str,
+        neighbor: &str,
+        direction: Direction,
+    ) -> Result<BgpRib, HalError> {
+        self.0.bgp_routes(instance, neighbor, direction)
+    }
+
+    fn bgp_prefix(&mut self, instance: &str, prefix: &str) -> Result<BgpPrefix, HalError> {
+        self.0.bgp_prefix(instance, prefix)
+    }
+
+    fn rpki_state(&mut self) -> Option<String> {
+        self.0.rpki_state()
     }
 }
 

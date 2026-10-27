@@ -66,6 +66,10 @@ pub const OWNED: Owned = &[
     ("bgp community-list standard CR-", &[Daemon::Bgpd]),
     ("bgp large-community-list standard CR-", &[Daemon::Bgpd]),
     ("route-map CR-", &[Daemon::Bgpd]),
+    // G3.2c: RPKI validators and the route-map that drops invalid routes;
+    // `match rpki` exists only in bgpd (its rpki module).
+    ("rpki", &[Daemon::Bgpd]),
+    ("route-map CR-RPKI-", &[Daemon::Bgpd]),
 ];
 
 /// A table of owned contexts: header prefix → daemons that take it.

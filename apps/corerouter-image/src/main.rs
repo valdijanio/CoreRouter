@@ -13,6 +13,11 @@
 //! - `package …`: another package of the sealed build.
 //! - `info <package>`: the manifest, as JSON.
 //! - `genkey <file>`: a fresh Ed25519 key (tests: a key nobody trusts).
+//! - `installer <images>` (G1.6c, post-image.sh): the signed install index
+//!   (layout of `disk.img`, payload hashes) and the hybrid installer ISO
+//!   `corerouter-install.iso` (El Torito + GPT over `efiboot.vfat`).
+//! - `ova --vmdk F --out F [--name N]`: an OVA (OVF 1.0 descriptor, SHA-256
+//!   manifest, the streamOptimized disk) for VMware/VirtualBox.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -21,7 +26,10 @@ use std::time::Instant;
 use corerouter_sysupdate::package::{self, Blob, Manifest, Rootfs};
 use corerouter_sysupdate::verity;
 
-const USAGE: &str = "usage: corerouter-image <seal IMAGES | key --keys DIR [--key PKCS8] | package --images DIR (--keys DIR | --key PKCS8) --out FILE [--version V] [--build N] [--channel C] [--squashfs FILE] | info PACKAGE | genkey FILE>";
+const USAGE: &str = "usage: corerouter-image <seal IMAGES | key --keys DIR [--key PKCS8] | package --images DIR (--keys DIR | --key PKCS8) --out FILE [--version V] [--build N] [--channel C] [--squashfs FILE] | info PACKAGE | genkey FILE | installer IMAGES | ova --vmdk FILE --capacity BYTES --out FILE [--name N]>";
+
+mod installer;
+mod ova;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -32,6 +40,8 @@ fn main() {
         Some("package") => package_cmd(rest),
         Some("info") => info(rest),
         Some("genkey") => genkey(rest),
+        Some("installer") => installer::main(rest),
+        Some("ova") => ova::main(rest),
         _ => Err(USAGE.into()),
     };
     if let Err(e) = res {
@@ -213,7 +223,7 @@ pub fn make_package(
     Ok((header, img))
 }
 
-fn read(p: &Path) -> Result<Vec<u8>, String> {
+pub(crate) fn read(p: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(p).map_err(|e| format!("{}: {e}", p.display()))
 }
 

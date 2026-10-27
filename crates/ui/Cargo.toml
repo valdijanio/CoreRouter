@@ -22,6 +22,7 @@ base64.workspace = true
 criterion.workspace = true
 corerouter-hal.workspace = true
 corerouter-model.workspace = true
+corerouter-proto-bgp.workspace = true
 corerouter-proto-dns.workspace = true
 corerouter-proto-flow.workspace = true
 

@@ -38,7 +38,12 @@ pub fn compile_regex(re: &str) -> Result<Regex, String> {
         .dfa_size_limit(REGEX_SIZE_LIMIT)
         .unicode(false)
         .build()
-        .map_err(|e| format!("not a regular expression: {}", parse::cut(&e.to_string().replace('\n', " "))))
+        .map_err(|e| {
+            format!(
+                "not a regular expression: {}",
+                parse::cut(&e.to_string().replace('\n', " "))
+            )
+        })
 }
 
 /// Compile `sources` (expression, chain), in order: on threads when there
@@ -46,7 +51,11 @@ pub fn compile_regex(re: &str) -> Result<Regex, String> {
 /// build in 30 ms on 8 threads instead of 90 ms on one (**medido**,
 /// `benches/filter.rs`, 2026-10-27).
 fn compile_all(sources: &[(String, String)]) -> Vec<Result<Regex, String>> {
-    let threads = if sources.len() < 64 { 1 } else { threads_for(usize::MAX) };
+    let threads = if sources.len() < 64 {
+        1
+    } else {
+        threads_for(usize::MAX)
+    };
     if threads <= 1 {
         return sources.iter().map(|(re, _)| compile_regex(re)).collect();
     }
@@ -63,7 +72,12 @@ fn compile_all(sources: &[(String, String)]) -> Vec<Result<Regex, String>> {
                 .map(|chunk| {
                     std::thread::Builder::new()
                         .name("filter-regex".into())
-                        .spawn_scoped(scope, move || chunk.iter().map(|(re, _)| compile_regex(re)).collect::<Vec<_>>())
+                        .spawn_scoped(scope, move || {
+                            chunk
+                                .iter()
+                                .map(|(re, _)| compile_regex(re))
+                                .collect::<Vec<_>>()
+                        })
                 })
                 .collect();
             handles
@@ -90,11 +104,19 @@ pub struct PrefixSet {
 }
 
 fn mask4(a: u32, l: u8) -> u32 {
-    if l == 0 { 0 } else { a & (u32::MAX << (32 - u32::from(l.min(32)))) }
+    if l == 0 {
+        0
+    } else {
+        a & (u32::MAX << (32 - u32::from(l.min(32))))
+    }
 }
 
 fn mask6(a: u128, l: u8) -> u128 {
-    if l == 0 { 0 } else { a & (u128::MAX << (128 - u32::from(l.min(128)))) }
+    if l == 0 {
+        0
+    } else {
+        a & (u128::MAX << (128 - u32::from(l.min(128))))
+    }
 }
 
 impl PrefixSet {
@@ -105,12 +127,16 @@ impl PrefixSet {
             match e.prefix {
                 IpNet::V4(n) => {
                     let l = n.prefix_len();
-                    s.v4.entry((u32::from(n.network()), l)).or_default().push(range);
+                    s.v4.entry((u32::from(n.network()), l))
+                        .or_default()
+                        .push(range);
                     s.lens4.push(l);
                 }
                 IpNet::V6(n) => {
                     let l = n.prefix_len();
-                    s.v6.entry((u128::from(n.network()), l)).or_default().push(range);
+                    s.v6.entry((u128::from(n.network()), l))
+                        .or_default()
+                        .push(range);
                     s.lens6.push(l);
                 }
             }
@@ -124,15 +150,23 @@ impl PrefixSet {
 
     pub fn contains(&self, net: &IpNet) -> bool {
         let len = net.prefix_len();
-        let fits = |ranges: Option<&Vec<(u8, u8)>>| ranges.is_some_and(|r| r.iter().any(|(lo, hi)| len >= *lo && len <= *hi));
+        let fits = |ranges: Option<&Vec<(u8, u8)>>| {
+            ranges.is_some_and(|r| r.iter().any(|(lo, hi)| len >= *lo && len <= *hi))
+        };
         match net {
             IpNet::V4(n) => {
                 let a = u32::from(n.network());
-                self.lens4.iter().take_while(|l| **l <= len).any(|l| fits(self.v4.get(&(mask4(a, *l), *l))))
+                self.lens4
+                    .iter()
+                    .take_while(|l| **l <= len)
+                    .any(|l| fits(self.v4.get(&(mask4(a, *l), *l))))
             }
             IpNet::V6(n) => {
                 let a = u128::from(n.network());
-                self.lens6.iter().take_while(|l| **l <= len).any(|l| fits(self.v6.get(&(mask6(a, *l), *l))))
+                self.lens6
+                    .iter()
+                    .take_while(|l| **l <= len)
+                    .any(|l| fits(self.v6.get(&(mask6(a, *l), *l))))
             }
         }
     }
@@ -213,7 +247,10 @@ pub fn parsed_chains(filter: &RoutingFilter) -> (Vec<(String, Vec<Stmt>)>, Vec<P
                     body.extend(stmts);
                 }
             }
-            Err(e) => problems.push(Problem { item: r.id.to_string(), message: e.to_string() }),
+            Err(e) => problems.push(Problem {
+                item: r.id.to_string(),
+                message: e.to_string(),
+            }),
         }
     }
     (chains, problems)
@@ -221,9 +258,17 @@ pub fn parsed_chains(filter: &RoutingFilter) -> (Vec<(String, Vec<Stmt>)>, Vec<P
 
 /// Every enabled rule parsed (`None`: disabled), in order; on threads when
 /// there are many (each rule is independent).
-fn parse_all(rules: &[corerouter_model::routing_filter::FilterRule]) -> Vec<Option<Result<Vec<Stmt>, parse::ParseError>>> {
-    let one = |r: &corerouter_model::routing_filter::FilterRule| (!r.disabled).then(|| parse::parse(&r.rule));
-    let threads = if rules.len() < 1_000 { 1 } else { threads_for(usize::MAX) };
+fn parse_all(
+    rules: &[corerouter_model::routing_filter::FilterRule],
+) -> Vec<Option<Result<Vec<Stmt>, parse::ParseError>>> {
+    let one = |r: &corerouter_model::routing_filter::FilterRule| {
+        (!r.disabled).then(|| parse::parse(&r.rule))
+    };
+    let threads = if rules.len() < 1_000 {
+        1
+    } else {
+        threads_for(usize::MAX)
+    };
     if threads <= 1 {
         return rules.iter().map(one).collect();
     }
@@ -237,7 +282,11 @@ fn parse_all(rules: &[corerouter_model::routing_filter::FilterRule]) -> Vec<Opti
         std::thread::scope(|scope| {
             let handles: Vec<_> = rules
                 .chunks(size)
-                .map(|c| std::thread::Builder::new().name("filter-parse".into()).spawn_scoped(scope, move || c.iter().map(one).collect::<Vec<_>>()))
+                .map(|c| {
+                    std::thread::Builder::new()
+                        .name("filter-parse".into())
+                        .spawn_scoped(scope, move || c.iter().map(one).collect::<Vec<_>>())
+                })
                 .collect();
             handles
                 .into_iter()
@@ -267,13 +316,19 @@ pub fn jumps(body: &[Stmt], out: &mut Vec<String>) {
 
 /// The chains in a jump loop (each reported once), as "a → b → a".
 pub fn loops(chains: &[(String, Vec<Stmt>)]) -> Vec<String> {
-    let index: HashMap<&str, usize> = chains.iter().enumerate().map(|(i, (n, _))| (n.as_str(), i)).collect();
+    let index: HashMap<&str, usize> = chains
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (n.as_str(), i))
+        .collect();
     let edges: Vec<Vec<usize>> = chains
         .iter()
         .map(|(_, b)| {
             let mut j = Vec::new();
             jumps(b, &mut j);
-            j.iter().filter_map(|c| index.get(c.as_str()).copied()).collect()
+            j.iter()
+                .filter_map(|c| index.get(c.as_str()).copied())
+                .collect()
         })
         .collect();
     // Iterative DFS with colors: 0 new, 1 on the stack, 2 done.
@@ -337,7 +392,10 @@ struct Builder<'a> {
 
 impl Builder<'_> {
     fn problem(&mut self, message: String) {
-        let p = Problem { item: format!("chain {}", self.chain), message };
+        let p = Problem {
+            item: format!("chain {}", self.chain),
+            message,
+        };
         if !self.problems.contains(&p) {
             self.problems.push(p);
         }
@@ -348,8 +406,15 @@ impl Builder<'_> {
             CommArg::Values(v) => v.clone(),
             CommArg::List(name) => match self.filter.community_lists.get(name) {
                 Some(l) => {
-                    let vals: Vec<CommunityValue> = l.communities.iter().filter_map(|c| super::parse_community(c).ok()).collect();
-                    if !vals.iter().any(|v| matches!(v, CommunityValue::Large(_)) == large) {
+                    let vals: Vec<CommunityValue> = l
+                        .communities
+                        .iter()
+                        .filter_map(|c| super::parse_community(c).ok())
+                        .collect();
+                    if !vals
+                        .iter()
+                        .any(|v| matches!(v, CommunityValue::Large(_)) == large)
+                    {
                         self.problem(format!(
                             "community list {name:?} has no {} communities",
                             if large { "large" } else { "normal" }
@@ -358,15 +423,38 @@ impl Builder<'_> {
                     vals
                 }
                 None => {
-                    let known: Vec<&str> = self.filter.community_lists.keys().map(String::as_str).collect();
+                    let known: Vec<&str> = self
+                        .filter
+                        .community_lists
+                        .keys()
+                        .map(String::as_str)
+                        .collect();
                     let hint = parse::did_you_mean(name, &known);
                     self.problem(format!("community list {name:?} does not exist{hint}"));
                     Vec::new()
                 }
             },
         };
-        let mut n: Vec<u32> = values.iter().filter_map(|v| if let CommunityValue::Normal(c) = v { Some(*c) } else { None }).collect();
-        let mut l: Vec<Large> = values.iter().filter_map(|v| if let CommunityValue::Large(c) = v { Some(*c) } else { None }).collect();
+        let mut n: Vec<u32> = values
+            .iter()
+            .filter_map(|v| {
+                if let CommunityValue::Normal(c) = v {
+                    Some(*c)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let mut l: Vec<Large> = values
+            .iter()
+            .filter_map(|v| {
+                if let CommunityValue::Large(c) = v {
+                    Some(*c)
+                } else {
+                    None
+                }
+            })
+            .collect();
         n.sort_unstable();
         n.dedup();
         l.sort_unstable();
@@ -394,7 +482,12 @@ impl Builder<'_> {
                         self.set_index.insert(name.clone(), i);
                         Test::DstSet(i)
                     } else {
-                        let known: Vec<&str> = self.filter.prefix_lists.keys().map(String::as_str).collect();
+                        let known: Vec<&str> = self
+                            .filter
+                            .prefix_lists
+                            .keys()
+                            .map(String::as_str)
+                            .collect();
                         let hint = parse::did_you_mean(name, &known);
                         self.problem(format!("prefix list {name:?} does not exist{hint}"));
                         self.sets.push(PrefixSet::default());
@@ -413,7 +506,11 @@ impl Builder<'_> {
                 }
                 Atom::Comm { large, op, arg } => {
                     let (n, l) = self.comm_values(arg, *large);
-                    if *large { Test::Large(*op, l) } else { Test::Comm(*op, n) }
+                    if *large {
+                        Test::Large(*op, l)
+                    } else {
+                        Test::Comm(*op, n)
+                    }
                 }
             }),
         }
@@ -444,7 +541,11 @@ impl Builder<'_> {
                     SetOp::Prepend(n) => SetC::Prepend(*n),
                     SetOp::Comm { large, how, arg } => {
                         let (n, l) = self.comm_values(arg, *large);
-                        if *large { SetC::Large(*how, l) } else { SetC::Comm(*how, n) }
+                        if *large {
+                            SetC::Large(*how, l)
+                        } else {
+                            SetC::Comm(*how, n)
+                        }
                     }
                 }),
             })
@@ -458,9 +559,16 @@ impl Policy {
     /// a broken rule is left out, a jump nowhere rejects.
     pub fn build(filter: &RoutingFilter) -> (Policy, Vec<Problem>) {
         let (parsed, mut problems) = parsed_chains(filter);
-        let names: HashMap<String, usize> = parsed.iter().enumerate().map(|(i, (n, _))| (n.clone(), i)).collect();
+        let names: HashMap<String, usize> = parsed
+            .iter()
+            .enumerate()
+            .map(|(i, (n, _))| (n.clone(), i))
+            .collect();
         for l in loops(&parsed) {
-            problems.push(Problem { item: "jump".into(), message: format!("chains jump in a loop: {l}") });
+            problems.push(Problem {
+                item: "jump".into(),
+                message: format!("chains jump in a loop: {l}"),
+            });
         }
         let mut b = Builder {
             filter,
@@ -486,12 +594,20 @@ impl Policy {
             match r {
                 Ok(r) => regexes.push(Some(r)),
                 Err(message) => {
-                    problems.push(Problem { item: format!("chain {chain}"), message });
+                    problems.push(Problem {
+                        item: format!("chain {chain}"),
+                        message,
+                    });
                     regexes.push(None);
                 }
             }
         }
-        let policy = Policy { names, chains, sets, regexes };
+        let policy = Policy {
+            names,
+            chains,
+            sets,
+            regexes,
+        };
         (policy, problems)
     }
 
@@ -505,12 +621,18 @@ impl Policy {
 
     /// Run chain `chain` on `route`; `asn` is ours (`bgp-path-prepend`).
     pub fn eval<'r>(&self, chain: usize, route: &'r Route, asn: u32) -> Outcome<'r> {
-        let mut ctx = Ctx { route: Cow::Borrowed(route), path: None };
+        let mut ctx = Ctx {
+            route: Cow::Borrowed(route),
+            path: None,
+        };
         let accepted = match self.run(chain, &mut ctx, asn, 0) {
             Flow::Accept => true,
             Flow::Reject | Flow::Next | Flow::Return => false,
         };
-        Outcome { accepted, route: ctx.route }
+        Outcome {
+            accepted,
+            route: ctx.route,
+        }
     }
 
     fn run(&self, chain: usize, ctx: &mut Ctx<'_>, asn: u32, depth: usize) -> Flow {
@@ -576,7 +698,10 @@ impl Policy {
                             ctx.path = Some(r.path_text());
                         }
                         let path = ctx.path.as_deref().unwrap_or("");
-                        self.regexes.get(*i).and_then(Option::as_ref).is_some_and(|re| re.is_match(path))
+                        self.regexes
+                            .get(*i)
+                            .and_then(Option::as_ref)
+                            .is_some_and(|re| re.is_match(path))
                     }
                 }
             }
@@ -585,7 +710,10 @@ impl Policy {
 }
 
 fn same_family(a: &IpNet, b: &IpNet) -> bool {
-    matches!((a, b), (IpNet::V4(_), IpNet::V4(_)) | (IpNet::V6(_), IpNet::V6(_)))
+    matches!(
+        (a, b),
+        (IpNet::V4(_), IpNet::V4(_)) | (IpNet::V6(_), IpNet::V6(_))
+    )
 }
 
 /// `have` is sorted without repeats, as `want`.
@@ -671,7 +799,10 @@ impl Side<'_> {
     pub fn run<'r>(&self, r: &'r Route) -> Outcome<'r> {
         match self.chain {
             Some(c) => self.policy.eval(c, r, self.asn),
-            None => Outcome { accepted: self.accept_without, route: Cow::Borrowed(r) },
+            None => Outcome {
+                accepted: self.accept_without,
+                route: Cow::Borrowed(r),
+            },
         }
     }
 }
@@ -731,8 +862,16 @@ impl Preview {
     }
 }
 
-fn preview_chunk(new: &Side<'_>, old: Option<&Side<'_>>, routes: &[Route], limit: usize) -> Preview {
-    let mut p = Preview { total: routes.len(), ..Preview::default() };
+fn preview_chunk(
+    new: &Side<'_>,
+    old: Option<&Side<'_>>,
+    routes: &[Route],
+    limit: usize,
+) -> Preview {
+    let mut p = Preview {
+        total: routes.len(),
+        ..Preview::default()
+    };
     for r in routes {
         let now = new.run(r);
         let then = old.map(|o| o.run(r));
@@ -773,7 +912,10 @@ fn preview_chunk(new: &Side<'_>, old: Option<&Side<'_>>, routes: &[Route], limit
                 accepted: now.accepted,
                 changed,
                 before: then.as_ref().map(|t| t.accepted),
-                before_changed: then.as_ref().filter(|t| t.modified()).map(|t| t.route.clone().into_owned()),
+                before_changed: then
+                    .as_ref()
+                    .filter(|t| t.modified())
+                    .map(|t| t.route.clone().into_owned()),
             });
         }
     }
@@ -800,7 +942,13 @@ pub fn threads_for(n: usize) -> usize {
 
 /// Run `new` (and `old`, the policy in force) over `routes` on `threads`
 /// threads, each a contiguous range; rows keep the order of `routes`.
-pub fn preview(new: &Side<'_>, old: Option<&Side<'_>>, routes: &[Route], limit: usize, threads: usize) -> Preview {
+pub fn preview(
+    new: &Side<'_>,
+    old: Option<&Side<'_>>,
+    routes: &[Route],
+    limit: usize,
+    threads: usize,
+) -> Preview {
     let threads = threads.clamp(1, 64);
     if threads == 1 || routes.len() < threads * 2 {
         return preview_chunk(new, old, routes, limit);
@@ -826,7 +974,9 @@ pub fn preview(new: &Side<'_>, old: Option<&Side<'_>>, routes: &[Route], limit: 
                 .zip(routes.chunks(size))
                 .map(|(h, chunk)| match h {
                     // A thread that could not start or died: that range here.
-                    Ok(h) => h.join().unwrap_or_else(|_| preview_chunk(new, old, chunk, limit)),
+                    Ok(h) => h
+                        .join()
+                        .unwrap_or_else(|_| preview_chunk(new, old, chunk, limit)),
                     Err(_) => preview_chunk(new, old, chunk, limit),
                 })
                 .collect()
@@ -869,7 +1019,13 @@ mod tests {
         let mut f = RoutingFilter::default();
         for (chain, rule) in rules {
             let id = f.next_id();
-            f.rules.push(FilterRule { id, chain: (*chain).into(), rule: (*rule).into(), disabled: false, comment: String::new() });
+            f.rules.push(FilterRule {
+                id,
+                chain: (*chain).into(),
+                rule: (*rule).into(),
+                disabled: false,
+                comment: String::new(),
+            });
         }
         f
     }
@@ -885,13 +1041,26 @@ mod tests {
         let mut f = filter(&[
             ("in", "if (dst in bogons) { reject }"),
             ("in", "if (dst-len > 24) { reject }"),
-            ("in", "if (bgp-as-path \"^64500_\") { set bgp-local-pref 200; jump tag }"),
+            (
+                "in",
+                "if (bgp-as-path \"^64500_\") { set bgp-local-pref 200; jump tag }",
+            ),
             ("in", "if (afi ipv4) { accept }"),
-            ("tag", "append bgp-communities 65000:1; if (bgp-communities includes 65000:666) { reject } return"),
+            (
+                "tag",
+                "append bgp-communities 65000:1; if (bgp-communities includes 65000:666) { reject } return",
+            ),
         ]);
         f.prefix_lists.insert(
             "bogons".into(),
-            PrefixList { name: "bogons".into(), entries: vec!["10.0.0.0/8 le 32".parse().unwrap(), "0.0.0.0/0".parse().unwrap()], comment: String::new() },
+            PrefixList {
+                name: "bogons".into(),
+                entries: vec![
+                    "10.0.0.0/8 le 32".parse().unwrap(),
+                    "0.0.0.0/0".parse().unwrap(),
+                ],
+                comment: String::new(),
+            },
         );
         let (p, problems) = Policy::build(&f);
         assert_eq!(problems, []);
@@ -915,7 +1084,10 @@ mod tests {
 
     #[test]
     fn prepend_and_regex_see_the_changed_path() {
-        let f = filter(&[("out", "set bgp-path-prepend 2; if (bgp-as-path \"^65000_65000_\") { accept }")]);
+        let f = filter(&[(
+            "out",
+            "set bgp-path-prepend 2; if (bgp-as-path \"^65000_65000_\") { accept }",
+        )]);
         let (p, _) = Policy::build(&f);
         let r = route("192.0.2.0/24", &[64500], &[]);
         let o = p.eval(0, &r, 65000);
@@ -933,7 +1105,14 @@ mod tests {
             ("e", "acept"),
             ("f", "if (bgp-communities any-list cl) { accept }"),
         ]);
-        f.community_lists.insert("cl".into(), CommunityList { name: "cl".into(), communities: vec!["1:2:3".into()], comment: String::new() });
+        f.community_lists.insert(
+            "cl".into(),
+            CommunityList {
+                name: "cl".into(),
+                communities: vec!["1:2:3".into()],
+                comment: String::new(),
+            },
+        );
         let (p, problems) = Policy::build(&f);
         let text = format!("{problems:?}");
         assert!(text.contains("loop: a → b → a"), "{text}");
@@ -951,10 +1130,15 @@ mod tests {
 
     #[test]
     fn prefix_sets_match_like_prefix_lists() {
-        let entries: Vec<PrefixEntry> = ["10.0.0.0/8 le 24", "192.0.2.0/24", "0.0.0.0/0 ge 25", "2001:db8::/32 le 48"]
-            .iter()
-            .map(|e| e.parse().unwrap())
-            .collect();
+        let entries: Vec<PrefixEntry> = [
+            "10.0.0.0/8 le 24",
+            "192.0.2.0/24",
+            "0.0.0.0/0 ge 25",
+            "2001:db8::/32 le 48",
+        ]
+        .iter()
+        .map(|e| e.parse().unwrap())
+        .collect();
         let s = PrefixSet::new(&entries);
         for (p, want) in [
             ("10.0.0.0/8", true),
@@ -975,9 +1159,17 @@ mod tests {
     #[test]
     fn preview_counts_and_compares_on_many_threads() {
         let (old, _) = Policy::build(&filter(&[("in", "accept")]));
-        let (new, _) = Policy::build(&filter(&[("in", "if (dst-len > 22) { reject } set bgp-med 5; accept")]));
+        let (new, _) = Policy::build(&filter(&[(
+            "in",
+            "if (dst-len > 22) { reject } set bgp-med 5; accept",
+        )]));
         let routes = super::super::sample::routes(50_000, 7, 64500);
-        let side = |p| Side { policy: p, chain: Some(0), accept_without: false, asn: 65000 };
+        let side = |p| Side {
+            policy: p,
+            chain: Some(0),
+            accept_without: false,
+            asn: 65000,
+        };
         let one = preview(&side(&new), Some(&side(&old)), &routes, 10, 1);
         let many = preview(&side(&new), Some(&side(&old)), &routes, 10, 4);
         assert_eq!(one, many);
@@ -988,7 +1180,12 @@ mod tests {
         assert!(one.attrs_changed <= one.accepted && one.attrs_changed > one.accepted * 9 / 10);
         assert_eq!(one.changes.len(), 10);
         // No chain on eBGP: nothing passes (RFC 8212).
-        let none = Side { policy: &new, chain: None, accept_without: false, asn: 65000 };
+        let none = Side {
+            policy: &new,
+            chain: None,
+            accept_without: false,
+            asn: 65000,
+        };
         assert_eq!(preview(&none, None, &routes, 0, 1).accepted, 0);
     }
 }

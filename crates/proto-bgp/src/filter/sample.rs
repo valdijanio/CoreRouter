@@ -60,7 +60,8 @@ pub fn routes(n: usize, seed: u64, peer_as: u32) -> Vec<Route> {
         let prefix = if rng.below(10) == 0 {
             // IPv6: 2000::/3, /32../48.
             let len = 32 + rng.below(17) as u8;
-            let hi = 0x2000_0000_0000_0000_0000_0000_0000_0000u128 | (u128::from(rng.next()) << 64 >> 3);
+            let hi =
+                0x2000_0000_0000_0000_0000_0000_0000_0000u128 | (u128::from(rng.next()) << 64 >> 3);
             match Ipv6Net::new(Ipv6Addr::from(hi), len) {
                 Ok(net) => IpNet::V6(net.trunc()),
                 Err(_) => continue,
@@ -129,10 +130,16 @@ mod tests {
         assert_eq!(a, routes(10_000, 42, 64500));
         assert_eq!(a.len(), 10_000);
         assert!(a.iter().all(|r| r.as_path.first() == Some(&64500)));
-        let v6 = a.iter().filter(|r| matches!(r.prefix, IpNet::V6(_))).count();
+        let v6 = a
+            .iter()
+            .filter(|r| matches!(r.prefix, IpNet::V6(_)))
+            .count();
         assert!((500..2_000).contains(&v6), "{v6}");
         assert!(a.iter().all(|r| r.prefix.trunc() == r.prefix));
-        assert!(a.iter().all(|r| r.communities.windows(2).all(|w| w[0] < w[1])));
+        assert!(
+            a.iter()
+                .all(|r| r.communities.windows(2).all(|w| w[0] < w[1]))
+        );
         assert_eq!(routes(3, 1, 1).len(), 3);
     }
 }

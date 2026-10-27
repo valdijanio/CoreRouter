@@ -16,7 +16,11 @@
 //! Contract shared by every `proto-*` crate: `validate` inspects the
 //! candidate and returns issues; the engine refuses to commit while any exist.
 
+pub mod decision;
 pub mod filter;
+pub mod rib;
+pub mod rpki;
+pub mod rtr;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -61,6 +65,7 @@ pub fn validate(cfg: &Config) -> Vec<Issue> {
     }
     validate_neighbors(cfg, &mut out);
     validate_filter(cfg, &mut out);
+    out.extend(rpki::validate(&cfg.routing));
     out
 }
 
@@ -74,13 +79,21 @@ fn validate_filter(cfg: &Config, out: &mut Vec<Issue>) {
     }
     let (_, problems) = filter::eval::Policy::build(f);
     for p in problems {
-        out.push(Issue::new(format!("routing.filter.rules.{}", p.item), p.message));
+        out.push(Issue::new(
+            format!("routing.filter.rules.{}", p.item),
+            p.message,
+        ));
     }
     let chains = f.chains();
     let resolved = resolve_templates(&routing.bgp_templates);
     for (key, c) in &routing.bgp_connections {
-        let Ok(eff) = c.effective(&resolved) else { continue };
-        for (param, chain) in [("input_filter", &eff.input_filter), ("output_filter", &eff.output_filter)] {
+        let Ok(eff) = c.effective(&resolved) else {
+            continue;
+        };
+        for (param, chain) in [
+            ("input_filter", &eff.input_filter),
+            ("output_filter", &eff.output_filter),
+        ] {
             if let Some(chain) = chain
                 && !chains.contains(&chain.as_str())
             {
@@ -92,9 +105,33 @@ fn validate_filter(cfg: &Config, out: &mut Vec<Issue>) {
             }
         }
     }
+    // One chain, one RPKI behavior: its route-map holds the RPKI entries
+    // for every connection that uses it.
+    let mut modes: HashMap<String, (corerouter_model::rpki::RpkiInvalid, &str)> = HashMap::new();
+    for (key, c) in &routing.bgp_connections {
+        let Ok(eff) = c.effective(&resolved) else {
+            continue;
+        };
+        if let Some(chain) = eff.input_filter.clone() {
+            let mode = eff.rpki_invalid.unwrap_or_default();
+            match modes.get(&chain) {
+                Some((m, other)) if *m != mode && !rpki::enabled(routing).is_empty() => out.push(Issue::new(
+                    format!("routing.bgp_connections.{key}.params.rpki_invalid"),
+                    format!("input chain {chain:?} is shared with connection {other:?}, which treats RPKI-invalid routes differently: give them separate chains"),
+                )),
+                Some(_) => {}
+                None => {
+                    modes.insert(chain, (mode, key.as_str()));
+                }
+            }
+        }
+    }
     let (_, render_problems) = filter_render(routing);
     for p in render_problems {
-        out.push(Issue::new(format!("routing.filter.rules.{}", p.item), p.message));
+        out.push(Issue::new(
+            format!("routing.filter.rules.{}", p.item),
+            p.message,
+        ));
     }
 }
 
@@ -108,10 +145,26 @@ fn filter_render(routing: &Routing) -> (String, Vec<filter::eval::Problem>) {
     let resolved = resolve_templates(&routing.bgp_templates);
     let mut used: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut asn: HashMap<String, Option<u32>> = HashMap::new();
+    // G3.2c: the input chains whose connections drop RPKI-invalid routes
+    // (with a validator, eBGP too: the chain is its policy) get the RPKI
+    // entries first (sequences 1..=9).
+    let validators = !rpki::enabled(routing).is_empty();
+    let mut rpki_in: HashMap<String, bool> = HashMap::new();
     for c in routing.bgp_connections.values() {
-        let Ok(eff) = c.effective(&resolved) else { continue };
+        let Ok(eff) = c.effective(&resolved) else {
+            continue;
+        };
         let inst = routing.bgp.get(&c.instance).map(|i| i.asn.0);
-        for chain in [&eff.input_filter, &eff.output_filter].into_iter().flatten() {
+        if let Some(chain) = &eff.input_filter {
+            let drops = validators
+                && eff.rpki_invalid.unwrap_or_default()
+                    == corerouter_model::rpki::RpkiInvalid::Reject;
+            *rpki_in.entry(chain.clone()).or_insert(drops) |= drops;
+        }
+        for chain in [&eff.input_filter, &eff.output_filter]
+            .into_iter()
+            .flatten()
+        {
             used.insert(chain.clone());
             let e = asn.entry(chain.clone()).or_insert(inst);
             if *e != inst {
@@ -119,11 +172,24 @@ fn filter_render(routing: &Routing) -> (String, Vec<filter::eval::Problem>) {
             }
         }
     }
-    let only = (routing.bgp.len() == 1).then(|| routing.bgp.values().next().map(|i| i.asn.0)).flatten();
-    filter::frr::render(&routing.filter, &used, &|chain| match asn.get(chain) {
-        Some(a) => *a,
-        None => only,
-    })
+    let only = (routing.bgp.len() == 1)
+        .then(|| routing.bgp.values().next().map(|i| i.asn.0))
+        .flatten();
+    filter::frr::render_with(
+        &routing.filter,
+        &used,
+        &|chain| match asn.get(chain) {
+            Some(a) => *a,
+            None => only,
+        },
+        &|chain| {
+            if rpki_in.get(chain).copied().unwrap_or(false) {
+                rpki::route_map_prelude(&filter::frr::route_map(chain))
+            } else {
+                String::new()
+            }
+        },
+    )
 }
 
 fn validate_neighbors(cfg: &Config, out: &mut Vec<Issue>) {
@@ -278,8 +344,10 @@ pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String>
                 .map_err(|e| format!("connection {}: {e}", c.name))?;
             eff.push((*c, p));
         }
-        render_instance(&mut s, inst, &eff, open)?;
+        render_instance(&mut s, inst, &eff, open, !rpki::enabled(routing).is_empty())?;
     }
+    // G3.2c: the `rpki` node and its route-map, after the instances.
+    s.push_str(&rpki::render_frr(routing));
     Ok(s)
 }
 
@@ -288,7 +356,7 @@ pub fn render_all(routing: &Routing, open: Opener<'_>) -> Result<String, String>
 pub fn render_frr(inst: &BgpInstance) -> String {
     let mut s = String::new();
     // No neighbors: no key to open.
-    let _ = render_instance(&mut s, inst, &[], &|_| None);
+    let _ = render_instance(&mut s, inst, &[], &|_| None, false);
     s
 }
 
@@ -303,6 +371,7 @@ fn render_instance(
     inst: &BgpInstance,
     neighbors: &[(&BgpConnection, BgpParams)],
     open: Opener<'_>,
+    rpki: bool,
 ) -> Result<(), String> {
     // Writing to a String cannot fail; ignore the fmt::Result.
     let _ = writeln!(s, "{}", frr_header(inst));
@@ -321,6 +390,21 @@ fn render_instance(
                 Afi::Ipv6 => &mut v6,
             };
             neighbor_af(af, c, p, afi);
+            // G3.2c: drop RPKI-invalid routes; the Adj-RIB-In is kept so
+            // FRR revalidates when the VRPs change (its rpki module needs
+            // it) and the received list shows what was dropped.
+            // With an input chain the RPKI entries go inside it (G3.2b,
+            // `filter_render`), and `keep_received` keeps the routes.
+            if rpki
+                && p.input_filter.is_none()
+                && rpki::drops_invalid_ibgp(role_of(inst, p).is_ibgp(), p)
+            {
+                let a = c.remote_address;
+                if !p.keep_received.unwrap_or(true) {
+                    let _ = writeln!(af, "  neighbor {a} soft-reconfiguration inbound");
+                }
+                let _ = writeln!(af, "  neighbor {a} route-map {} in", rpki::ROUTE_MAP_IN);
+            }
         }
     }
     for (name, body) in [("ipv4", v4), ("ipv6", v6)] {
@@ -449,10 +533,18 @@ fn neighbor_af(s: &mut String, c: &BgpConnection, p: &BgpParams, afi: Afi) {
         let _ = writeln!(s, "  neighbor {a} soft-reconfiguration inbound");
     }
     if let Some(chain) = &p.input_filter {
-        let _ = writeln!(s, "  neighbor {a} route-map {} in", filter::frr::route_map(chain));
+        let _ = writeln!(
+            s,
+            "  neighbor {a} route-map {} in",
+            filter::frr::route_map(chain)
+        );
     }
     if let Some(chain) = &p.output_filter {
-        let _ = writeln!(s, "  neighbor {a} route-map {} out", filter::frr::route_map(chain));
+        let _ = writeln!(
+            s,
+            "  neighbor {a} route-map {} out",
+            filter::frr::route_map(chain)
+        );
     }
 }
 

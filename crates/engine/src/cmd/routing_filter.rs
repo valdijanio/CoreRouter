@@ -1262,6 +1262,20 @@ mod tests {
     }
 
     #[test]
+    fn rpki_entries_go_first_in_the_input_chain() {
+        let mut s = session();
+        s.execute("routing.filter.rule.add", &json!({"chain": "up-in", "rule": "accept"})).unwrap();
+        s.execute("routing.bgp.connection.set", &json!({"id": "up1", "input_filter": "up-in"})).unwrap();
+        let text = corerouter_proto_bgp::render_all(&s.store().running().routing, &|_| None).unwrap();
+        assert!(!text.contains("rpki"), "no validator, no RPKI entries:\n{text}");
+        s.execute("routing.rpki.add", &json!({"name": "v1", "address": "192.0.2.50", "port": 3323})).unwrap();
+        let text = corerouter_proto_bgp::render_all(&s.store().running().routing, &|_| None).unwrap();
+        assert!(text.contains("route-map CR-up-in deny 1\n match rpki invalid\nexit\nroute-map CR-up-in permit 10\n"), "{text}");
+        // The chain carries it: no CR-RPKI-IN on this neighbor.
+        assert!(!text.contains("192.0.2.1 route-map CR-RPKI-IN"), "{text}");
+    }
+
+    #[test]
     fn rollback_restores_rules() {
         let mut s = session();
         s.execute("routing.filter.rule.add", &json!({"chain": "in", "rule": "accept"})).unwrap();

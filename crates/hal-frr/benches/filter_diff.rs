@@ -16,12 +16,28 @@ fn rules(changed: Option<u32>) -> RoutingFilter {
     for i in 0..10_000u32 {
         let pref = if Some(i) == changed { 999 } else { i % 300 };
         let rule = match i % 3 {
-            0 => format!("if (dst in 10.{}.{}.0/24) {{ set bgp-local-pref {pref}; accept }}", i / 256 % 256, i % 256),
-            1 => format!("if (bgp-communities includes 65000:{}) {{ reject }}", i % 65_000),
-            _ => format!("if (bgp-as-path \"_{}$\" && dst-len in 16-24) {{ set bgp-local-pref {pref} }}", 1 + i % 60_000),
+            0 => format!(
+                "if (dst in 10.{}.{}.0/24) {{ set bgp-local-pref {pref}; accept }}",
+                i / 256 % 256,
+                i % 256
+            ),
+            1 => format!(
+                "if (bgp-communities includes 65000:{}) {{ reject }}",
+                i % 65_000
+            ),
+            _ => format!(
+                "if (bgp-as-path \"_{}$\" && dst-len in 16-24) {{ set bgp-local-pref {pref} }}",
+                1 + i % 60_000
+            ),
         };
         let id = f.next_id();
-        f.rules.push(FilterRule { id, chain: format!("c{}", i / 100), rule, disabled: false, comment: String::new() });
+        f.rules.push(FilterRule {
+            id,
+            chain: format!("c{}", i / 100),
+            rule,
+            disabled: false,
+            comment: String::new(),
+        });
     }
     f
 }
@@ -36,7 +52,9 @@ fn bench(c: &mut Criterion) {
     let mut g = c.benchmark_group("filter_10k_rules_frr");
     g.sample_size(20);
     g.bench_function("parse", |x| x.iter(|| Conf::parse(black_box(&text))));
-    g.bench_function("diff_one_rule", |x| x.iter(|| diff(black_box(&a), black_box(&b))));
+    g.bench_function("diff_one_rule", |x| {
+        x.iter(|| diff(black_box(&a), black_box(&b)))
+    });
     g.finish();
 }
 

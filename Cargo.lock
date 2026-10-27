@@ -1173,6 +1173,7 @@ dependencies = [
  "corerouter-hal-frr",
  "corerouter-hal-linux",
  "corerouter-model",
+ "corerouter-proto-bgp",
  "corerouter-proto-dhcp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
@@ -1313,6 +1314,7 @@ dependencies = [
  "criterion",
  "ipnet",
  "log",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
 ]
@@ -1395,6 +1397,7 @@ dependencies = [
  "proptest",
  "regex",
  "regex-syntax",
+ "serde",
 ]
 
 [[package]]
@@ -1578,6 +1581,7 @@ dependencies = [
 name = "corerouter-sysupdate"
 version = "0.1.0"
 dependencies = [
+ "crc32fast",
  "criterion",
  "ring",
  "rustix 1.1.5",
@@ -1594,6 +1598,7 @@ dependencies = [
  "corerouter-engine",
  "corerouter-hal",
  "corerouter-model",
+ "corerouter-proto-bgp",
  "corerouter-proto-dns",
  "corerouter-proto-flow",
  "corerouter-shell",

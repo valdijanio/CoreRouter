@@ -1,6 +1,6 @@
 [package]
 name = "corerouter-init"
-description = "L6: PID 1 of the CoreRouter image (G1.6a) — mounts, /config, supervises corerouter-daemon, clean shutdown"
+description = "L6: PID 1 of the CoreRouter image (G1.6a) — mounts, /config, supervises corerouter-daemon and FRR, clean shutdown; the installer (G1.6c)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,13 +8,17 @@ publish.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[dependencies]
+serde_json.workspace = true
+
 [target.'cfg(target_os = "linux")'.dependencies]
-rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "mount", "process", "system"] }
+# termios: the installer and the first-boot setup read the consoles
+# (password prompts without echo).
+rustix = { version = "1.1.5", default-features = false, features = ["std", "fs", "mount", "process", "system", "termios"] }
 signal-hook.workspace = true
 netlink-sys = { version = "0.9.0", default-features = false }
 # G1.6b: the trial boot of the A/B image (state, boot variables).
 corerouter-sysupdate.workspace = true
-serde_json.workspace = true
 
 [lints]
 workspace = true

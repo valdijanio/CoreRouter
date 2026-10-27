@@ -1,0 +1,10 @@
+config BR2_PACKAGE_COREROUTER_INSTALLER
+	bool "corerouter-installer"
+	depends on BR2_LINUX_KERNEL
+	depends on BR2_PACKAGE_COREROUTER
+	help
+	  The installer's kernel (G1.6c): the image's kernel source and
+	  configuration with its own built-in command line, no BTF, and
+	  an initramfs with corerouter-init (installer mode) and the
+	  image keys. Boots from the ISO's El Torito/ESP image as
+	  EFI/BOOT/BOOTX64.EFI.

@@ -20,7 +20,9 @@ pub mod sample;
 use std::fmt;
 
 use corerouter_model::Issue;
-use corerouter_model::routing_filter::{MAX_COMMUNITIES, MAX_LISTS, MAX_PREFIX_ENTRIES, MAX_RULES, RoutingFilter};
+use corerouter_model::routing_filter::{
+    MAX_COMMUNITIES, MAX_LISTS, MAX_PREFIX_ENTRIES, MAX_RULES, RoutingFilter,
+};
 use ipnet::IpNet;
 
 /// A large community (RFC 8092 §3: global administrator, two local data
@@ -91,11 +93,20 @@ pub fn parse_community(s: &str) -> Result<CommunityValue, String> {
     match parts.as_slice() {
         [a, b] => {
             let a: u16 = a.parse().map_err(|_| format!("{}: the AS part of a normal community is 0..=65535 (larger AS: a large community)", parse::cut(t)))?;
-            let b: u16 = b.parse().map_err(|_| format!("{}: the value part is 0..=65535", parse::cut(t)))?;
+            let b: u16 = b
+                .parse()
+                .map_err(|_| format!("{}: the value part is 0..=65535", parse::cut(t)))?;
             Ok(CommunityValue::Normal((u32::from(a) << 16) | u32::from(b)))
         }
         [a, b, c] => {
-            let n = |x: &str| x.parse::<u32>().map_err(|_| format!("{}: each part of a large community is 0..=4294967295", parse::cut(t)));
+            let n = |x: &str| {
+                x.parse::<u32>().map_err(|_| {
+                    format!(
+                        "{}: each part of a large community is 0..=4294967295",
+                        parse::cut(t)
+                    )
+                })
+            };
             Ok(CommunityValue::Large(Large(n(a)?, n(b)?, n(c)?)))
         }
         _ => Err(bad()),
@@ -113,7 +124,13 @@ pub enum Protocol {
 }
 
 impl Protocol {
-    pub const ALL: [Protocol; 5] = [Protocol::Bgp, Protocol::Connected, Protocol::Static, Protocol::Ospf, Protocol::Rip];
+    pub const ALL: [Protocol; 5] = [
+        Protocol::Bgp,
+        Protocol::Connected,
+        Protocol::Static,
+        Protocol::Ospf,
+        Protocol::Rip,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -175,7 +192,10 @@ impl Route {
 pub fn validate_lists(f: &RoutingFilter) -> Vec<Issue> {
     let mut out = Vec::new();
     if f.rules.len() > MAX_RULES {
-        out.push(Issue::new("routing.filter.rules", format!("at most {MAX_RULES} rules")));
+        out.push(Issue::new(
+            "routing.filter.rules",
+            format!("at most {MAX_RULES} rules"),
+        ));
     }
     let mut ids = std::collections::HashSet::new();
     for r in &f.rules {
@@ -188,7 +208,10 @@ pub fn validate_lists(f: &RoutingFilter) -> Vec<Issue> {
         }
     }
     if f.prefix_lists.len() > MAX_LISTS || f.community_lists.len() > MAX_LISTS {
-        out.push(Issue::new("routing.filter", format!("at most {MAX_LISTS} lists of each kind")));
+        out.push(Issue::new(
+            "routing.filter",
+            format!("at most {MAX_LISTS} lists of each kind"),
+        ));
     }
     for (key, l) in &f.prefix_lists {
         let path = format!("routing.filter.prefix_lists.{key}");
@@ -199,7 +222,10 @@ pub fn validate_lists(f: &RoutingFilter) -> Vec<Issue> {
             out.push(Issue::new(&path, e));
         }
         if l.entries.len() > MAX_PREFIX_ENTRIES {
-            out.push(Issue::new(format!("{path}.entries"), format!("at most {MAX_PREFIX_ENTRIES} entries")));
+            out.push(Issue::new(
+                format!("{path}.entries"),
+                format!("at most {MAX_PREFIX_ENTRIES} entries"),
+            ));
         }
     }
     for (key, l) in &f.community_lists {
@@ -211,7 +237,10 @@ pub fn validate_lists(f: &RoutingFilter) -> Vec<Issue> {
             out.push(Issue::new(&path, e));
         }
         if l.communities.len() > MAX_COMMUNITIES {
-            out.push(Issue::new(format!("{path}.communities"), format!("at most {MAX_COMMUNITIES} communities")));
+            out.push(Issue::new(
+                format!("{path}.communities"),
+                format!("at most {MAX_COMMUNITIES} communities"),
+            ));
         }
         for c in &l.communities {
             if let Err(e) = parse_community(c) {
@@ -246,15 +275,38 @@ mod tests {
 
     #[test]
     fn communities_parse_and_print_like_frr() {
-        assert_eq!(parse_community("65000:100"), Ok(CommunityValue::Normal(65000 << 16 | 100)));
-        assert_eq!(parse_community("no-export"), Ok(CommunityValue::Normal(0xFFFF_FF01)));
-        assert_eq!(parse_community("local-as"), Ok(CommunityValue::Normal(0xFFFF_FF03)));
+        assert_eq!(
+            parse_community("65000:100"),
+            Ok(CommunityValue::Normal(65000 << 16 | 100))
+        );
+        assert_eq!(
+            parse_community("no-export"),
+            Ok(CommunityValue::Normal(0xFFFF_FF01))
+        );
+        assert_eq!(
+            parse_community("local-as"),
+            Ok(CommunityValue::Normal(0xFFFF_FF03))
+        );
         assert_eq!(community_text(0xFFFF_FF03), "local-AS");
         assert_eq!(community_text(0xFFFF_029A), "blackhole");
-        assert_eq!(parse_community("65535:666").map(|c| c.to_string()), Ok("blackhole".into()));
-        assert_eq!(parse_community("4200000000:1:2"), Ok(CommunityValue::Large(Large(4_200_000_000, 1, 2))));
-        assert!(parse_community("70000:1").unwrap_err().contains("large community"));
-        assert!(parse_community("no-exprot").unwrap_err().contains("did you mean \"no-export\""));
+        assert_eq!(
+            parse_community("65535:666").map(|c| c.to_string()),
+            Ok("blackhole".into())
+        );
+        assert_eq!(
+            parse_community("4200000000:1:2"),
+            Ok(CommunityValue::Large(Large(4_200_000_000, 1, 2)))
+        );
+        assert!(
+            parse_community("70000:1")
+                .unwrap_err()
+                .contains("large community")
+        );
+        assert!(
+            parse_community("no-exprot")
+                .unwrap_err()
+                .contains("did you mean \"no-export\"")
+        );
         assert!(parse_community("1:2:3:4").is_err());
     }
 }
