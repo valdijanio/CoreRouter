@@ -343,3 +343,100 @@ fn coa_changes_ipoe_routes() {
     lab.run(2);
     assert_eq!(lab.active().len(), 2, "no lease ended");
 }
+
+// ---- G4.3hd: the redundant pair ---------------------------------------------
+
+impl Lab {
+    /// A pair member in hot standby, its DHCP answering or not.
+    fn paired(answering: bool) -> Self {
+        let mut lab = Lab::new(json!({"use_radius": "yes"}));
+        ok(
+            &mut lab.s,
+            "ppp.redundancy.set",
+            json!({"enabled": true, "mode": "hot-standby", "peer": "10.9.0.2:8730", "secret": "segredo-do-par-123", "interfaces": ["ether2"], "witness": ["192.168.88.254"]}),
+        );
+        lab.configure();
+        lab.core.set_answering(answering);
+        lab
+    }
+
+    fn bound(&mut self) -> usize {
+        ok(&mut self.s, "ip.dhcp-server.lease.print", json!({"status": "bound"}))
+            .as_array()
+            .map_or(0, Vec::len)
+    }
+}
+
+fn ipoe_records(changes: &[super::ipoe_bng::ha::IpoeHaChange]) -> Vec<corerouter_proto_ha::record::SessionRecord> {
+    changes
+        .iter()
+        .filter_map(|c| match c {
+            super::ipoe_bng::ha::IpoeHaChange::Up(_, v) => corerouter_proto_ha::record::SessionRecord::decode(v).ok(),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_standby_is_silent_and_adopts_the_ipoe_sessions_with_their_leases() {
+    // A, the active: two RADIUS subscribers, published with their leases.
+    let mut a = Lab::paired(true);
+    a.run(20);
+    assert_eq!(a.active().len(), 2);
+    let published = ipoe_records(&a.core.ha_take());
+    assert_eq!(published.len(), 2, "one record per session");
+    for r in &published {
+        assert_eq!(r.kind, corerouter_proto_ha::record::Kind::Ipoe);
+        let l = r.lease.as_ref().expect("the DHCP binding");
+        assert!(l.expires > 1_700_000_000 && l.lease_time > 0, "{l:?}");
+        assert_eq!(r.class, vec![b"plano-50".to_vec().into_boxed_slice()]);
+    }
+    let starts = a.aaa.accts.lock().unwrap().iter().filter(|r| r.status == AcctStatus::Start).count();
+    assert_eq!(starts, 2);
+
+    // C, the standby: the same lab hosts ask, nobody is answered.
+    let mut c = Lab::paired(false);
+    c.run(20);
+    assert_eq!((c.active().len(), c.bound()), (0, 0), "the standby's DHCP stays silent");
+    assert!(c.aaa.asks.lock().unwrap().is_empty(), "nor asks RADIUS");
+
+    // A dies: C adopts the sessions and their bindings, then answers.
+    let done = c.core.adopt(1, &published);
+    assert_eq!((done.sessions, done.skipped), (2, 0));
+    assert_eq!(c.core.adopt(1, &published).sessions, 0, "a takeover is adopted once");
+    c.core.set_answering(true);
+    c.core.set_xdp(true);
+    let pings = super::ipoe_bng::Backend(c.core.clone());
+    assert_eq!(corerouter_engine::ipoe::IpoeBackend::pings(&pings).len(), 2, "an ARP ping to each adopted subscriber");
+    c.run(1);
+    assert_eq!(c.bound(), 2, "the bindings are the DHCP server's");
+    let rows = c.active();
+    assert_eq!(rows.len(), 2);
+    let mut x: Vec<_> = published.iter().map(|r| (r.ipv4, r.acct_session_id.to_string())).collect();
+    x.sort();
+    // The clients go on (renew, or start over and get the same address):
+    // no new session, no Start; one Interim each with the same id.
+    c.run(700);
+    assert_eq!(c.active().len(), 2, "the same two sessions");
+    let accts = c.aaa.accts.lock().unwrap().clone();
+    assert_eq!(accts.iter().filter(|r| r.status == AcctStatus::Start).count(), 0, "{accts:?}");
+    assert_eq!(accts.iter().filter(|r| r.status == AcctStatus::Stop).count(), 0, "{accts:?}");
+    let mut y: Vec<_> = accts
+        .iter()
+        .filter(|r| r.status == AcctStatus::InterimUpdate)
+        .map(|r| (r.attributes.iter().find(|a| a.name == "Framed-IP-Address").and_then(|a| a.value.parse().ok()), r.session_id.clone()))
+        .collect();
+    y.sort();
+    assert_eq!(x, y, "an Interim per adopted session, the same Acct-Session-Id");
+    assert!(accts.iter().all(|r| r.class == [b"plano-50".to_vec()]), "the Class goes on");
+    let h = ok(&mut c.s, "ppp.history", json!({}));
+    assert!(h.to_string().contains("takeover"), "{h}");
+    // C publishes them as its own.
+    assert_eq!(ipoe_records(&c.core.ha_take()).len(), 2);
+
+    // A, now the standby: its sessions end without a Stop.
+    a.core.abandon();
+    a.core.set_answering(false);
+    assert_eq!(a.active().len(), 0);
+    assert_eq!(a.aaa.accts.lock().unwrap().iter().filter(|r| r.status == AcctStatus::Stop).count(), 0);
+}

@@ -215,6 +215,16 @@ impl Session {
         heard |= self.dhcp6_server_poll(now);
         self.ipoe_refresh();
         let ipoe = self.ipoe_backend();
+        let ipoe_names: Vec<String> = self
+            .store()
+            .running()
+            .ip
+            .dhcp_server
+            .servers
+            .iter()
+            .filter(|s| s.sessions())
+            .map(|s| s.name.clone())
+            .collect();
         let Some(rt) = self.ext_mut::<DhcpServerRuntime>() else {
             return heard;
         };
@@ -222,6 +232,31 @@ impl Session {
         let Some(core) = rt.core.as_mut() else {
             return heard;
         };
+        // G4.3hd: a redundant pair's standby keeps the session servers'
+        // ports silent (what it hears is dropped); at a takeover the peer's
+        // bindings come in before this node answers.
+        let silent: Vec<IfName> = match &ipoe {
+            Some(b) if !b.answering() => core
+                .plan()
+                .servers
+                .iter()
+                .filter(|s| ipoe_names.contains(&s.name))
+                .map(|s| s.interface.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        if let Some((servers, leases)) = ipoe.as_ref().and_then(|b| b.takeover()) {
+            let n = leases.len();
+            fx.extend(core.adopt(&servers, leases).into_iter().map(|e| (e, None)));
+            rt.restore = true;
+            fx.push((
+                Effect::Log {
+                    level: Level::Info,
+                    text: format!("dhcp-server: {n} concessões assumidas do outro BNG do par"),
+                },
+                None,
+            ));
+        }
         // G4.3f: what the IPoE service decided since the last round.
         if let Some(b) = &ipoe {
             for (server, key, v) in b.verdicts() {
@@ -243,6 +278,9 @@ impl Session {
             }
         }
         for (iface, h) in relayed {
+            if silent.contains(&iface) {
+                continue;
+            }
             let t0 = clock_us();
             fx.extend(core.handle(now, &iface, &h).into_iter().map(|e| (e, Some(t0))));
         }
@@ -257,6 +295,7 @@ impl Session {
                     break;
                 }
                 match port.recv() {
+                    Ok(Some(_)) if silent.contains(iface) => heard = true,
                     Ok(Some(h)) => {
                         heard = true;
                         let t0 = clock_us();

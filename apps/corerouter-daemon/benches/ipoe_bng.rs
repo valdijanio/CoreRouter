@@ -138,5 +138,85 @@ fn bench(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench);
+/// G4.3hd: the hot standby's side. Publishing `n` sessions (one record
+/// each, encoded), and a takeover adopting them on a fresh core (the
+/// sessions, their XDP entries and the Interims' requests) and in the DHCP
+/// server (`Server::adopt`, the bindings).
+fn ha(c: &mut Criterion) {
+    let mut g = c.benchmark_group("ipoe_ha");
+    g.sample_size(10);
+    for n in [10_000usize, 100_000] {
+        let mut cfg = config(n);
+        cfg.ppp.redundancy.enabled = true;
+        let index = IpoeIndex::of(&cfg);
+        let view = IpoeView::new(&cfg, &index);
+        let active = Core::new();
+        active.configure(&cfg, None);
+        let b = Backend(active.clone());
+        for i in 0..n {
+            b.authorize(&ask(i), &view);
+            b.bound(&binding(i), &view);
+        }
+        g.throughput(Throughput::Elements(n as u64));
+        let records: Vec<_> = active
+            .ha_take()
+            .into_iter()
+            .filter_map(|ch| match ch {
+                ipoe_bng::ha::IpoeHaChange::Up(_, v) => {
+                    corerouter_proto_ha::record::SessionRecord::decode(&v).ok()
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(records.len(), n);
+        let bytes: usize = records
+            .iter()
+            .map(|r| r.to_bytes().map_or(0, |b| b.len()))
+            .sum();
+        eprintln!("ipoe_ha/{n}: {} B per record", bytes / n);
+        g.bench_function(format!("publish/{n}"), |bn| {
+            bn.iter(|| {
+                for i in 0..n {
+                    b.bound(&binding(i), &view);
+                }
+                black_box(active.ha_take().len())
+            });
+        });
+        let mut gen_ = 0;
+        g.bench_function(format!("adopt/{n}"), |bn| {
+            bn.iter_batched(
+                || {
+                    let c = Core::new();
+                    c.configure(&cfg, None);
+                    c.set_xdp(true);
+                    c
+                },
+                |c| {
+                    gen_ += 1;
+                    black_box(c.adopt(gen_, &records));
+                    black_box(c.take_ops().len())
+                },
+                BatchSize::PerIteration,
+            );
+        });
+        let plan = corerouter_proto_dhcp::server::plan::Plan::from_config(&cfg);
+        let leases: Vec<Lease> = (0..n).map(|i| binding(i).lease).collect();
+        let servers = vec!["dhcp1".to_owned()];
+        g.bench_function(format!("dhcp_adopt/{n}"), |bn| {
+            bn.iter_batched(
+                || {
+                    (
+                        corerouter_proto_dhcp::server::Server::new(plan.clone(), 1_800_000_000),
+                        leases.clone(),
+                    )
+                },
+                |(mut s, l)| black_box(s.adopt(&servers, l).len()),
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    g.finish();
+}
+
+criterion_group!(benches, bench, ha);
 criterion_main!(benches);

@@ -35,6 +35,10 @@
 //! With `--root` (`BNG_LAB_ROOT=1`) both nodes run the XDP data plane on
 //! their ports (generic mode).
 //!
+//! `BNG_LAB_HA_IPOE=1` (G4.3hd): IPoE subscribers instead (DHCPv4, one
+//! access port, a lease of 2 minutes so every client renews on C after
+//! the takeover; RADIUS accounting only, the MAC as User-Name).
+//!
 //! Results: `$BNG_LAB_OUT/ha-summary.md`. Helpers may unwrap/panic.
 #![cfg(target_os = "linux")]
 #![allow(
@@ -206,18 +210,19 @@ struct Blaster {
 
 impl Blaster {
     fn start(ns: u32, bin: &Path, out: &Path, n: usize) -> Self {
-        let ports = n.div_ceil(PER_PORT).max(1);
+        let ports = ports_for(n);
+        let kind = if ipoe() { "ipoe" } else { "pppoe" };
         let access: Vec<Value> = (0..ports)
-            .map(|i| json!({"interface": format!("cpe{i}"), "type": "pppoe", "vlan-mode": "N:1", "session-limit": PER_PORT}))
+            .map(|i| json!({"interface": format!("cpe{i}"), "type": kind, "vlan-mode": "N:1", "session-limit": if ipoe() { n } else { PER_PORT }}))
             .collect();
-        let cfg = json!({
+        let mut cfg = json!({
             "interfaces": {
                 "tx-interval": 1.0,
                 "rx-interval": 1.0,
                 "network": {"interface": "blnet", "address": "198.51.100.2/24", "gateway": "198.51.100.1"},
                 "access": access,
             },
-            "sessions": {"count": n, "max-outstanding": 4000, "start-rate": 5000, "stop-rate": 10000, "reconnect": true},
+            "sessions": {"count": n, "max-outstanding": rate_env("BNG_LAB_HA_OUTSTANDING", 4000), "start-rate": rate_env("BNG_LAB_HA_START_RATE", 5000), "stop-rate": 10000, "reconnect": true},
             "pppoe": {"reconnect": true, "discovery-timeout": 3, "discovery-retry": 30, "host-uniq": true},
             "ppp": {
                 "mru": 1492,
@@ -229,6 +234,22 @@ impl Blaster {
             "dhcpv6": {"enable": false},
             "session-traffic": {"autostart": n <= SAMPLE_ALL, "ipv4-pps": 1},
         });
+        if ipoe() {
+            // The gateway's MAC asked again every second: after the
+            // takeover it is C's (only the active answers ARP).
+            if let Some(o) = cfg.as_object_mut() {
+                o.remove("pppoe");
+                o.remove("ppp");
+                o.insert(
+                    "ipoe".into(),
+                    json!({"ipv4": true, "ipv6": false, "arp-interval": rate_env("BNG_LAB_HA_ARP_S", 30), "arp-timeout": 1}),
+                );
+                o.insert(
+                    "dhcp".into(),
+                    json!({"enable": true, "timeout": 5, "retry": 30}),
+                );
+            }
+        }
         let path = out.join(format!("ha-{n}.json"));
         std::fs::write(&path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
         let sock = PathBuf::from(format!("/tmp/crha-{}-{n}.sock", std::process::id()));
@@ -319,6 +340,32 @@ fn ok(ns: Option<u32>, command: &str, params: Value) -> Value {
     call(ns, command, params).unwrap_or_else(|e| panic!("{command} in {ns:?}: {e}"))
 }
 
+/// `BNG_LAB_HA_IPOE=1`: IPoE subscribers (G4.3hd).
+fn ipoe() -> bool {
+    std::env::var_os("BNG_LAB_HA_IPOE").is_some()
+}
+
+/// Access ports: PPPoE spreads [`PER_PORT`] a port; IPoE takes one (its
+/// subnet is the port's).
+fn ports_for(n: usize) -> usize {
+    if ipoe() {
+        1
+    } else {
+        n.div_ceil(PER_PORT).max(1)
+    }
+}
+
+/// A BNG Blaster rate from the environment (the lab's knobs).
+fn rate_env(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// IPoE: the lease (T1 at half: every client renews on C in the settling).
+const IPOE_LEASE: &str = "2m";
+
 /// `BNG_LAB_HA_SINGLE=1`: node A alone, no redundancy (the A/B of what
 /// the pair costs on the same machine).
 fn single() -> bool {
@@ -331,6 +378,14 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
         "ip.address.add",
         json!({"address": uplink, "interface": "wan0"}),
     );
+    if ipoe() {
+        // The same gateway on both nodes (only the active answers ARP).
+        ok(
+            ns,
+            "ip.address.add",
+            json!({"address": "100.64.0.1/14", "interface": "acc0"}),
+        );
+    }
     if std::env::var_os("BNG_LAB_ROOT").is_some() {
         // `--root`: the XDP data plane on both nodes (generic: veth); the
         // takeover then programs the adopted sessions into C's maps.
@@ -348,7 +403,7 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
     ok(
         ns,
         "ip.pool.add",
-        json!({"name": "clientes", "ranges": "100.64.0.0/14"}),
+        json!({"name": "clientes", "ranges": if ipoe() { "100.64.0.2-100.67.255.254" } else { "100.64.0.0/14" }}),
     );
     ok(
         ns,
@@ -358,7 +413,7 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
     ok(
         ns,
         "radius.add",
-        json!({"address": "10.8.0.1", "secret": SECRET, "service": "ppp", "authentication_port": r.auth, "accounting_port": r.acct}),
+        json!({"address": "10.8.0.1", "secret": SECRET, "service": "ppp,dhcp", "authentication_port": r.auth, "accounting_port": r.acct}),
     );
     ok(
         ns,
@@ -370,7 +425,19 @@ fn configure(ns: Option<u32>, uplink: &str, peer: &str, priority: u32, ports: us
         "radius.incoming.set",
         json!({"accept": true, "port": 3799}),
     );
-    for i in 0..ports {
+    if ipoe() {
+        ok(
+            ns,
+            "ip.dhcp-server.add",
+            json!({"name": "ipoe1", "interface": "acc0", "address_pool": "clientes", "lease_time": IPOE_LEASE, "use_radius": "accounting", "ipoe": true, "conflict_detection": false}),
+        );
+        ok(
+            ns,
+            "ip.dhcp-server.network.add",
+            json!({"address": "100.64.0.0/14", "gateway": "100.64.0.1", "dns_none": true}),
+        );
+    }
+    for i in (0..ports).filter(|_| !ipoe()) {
         ok(
             ns,
             "interface.pppoe-server.server.add",
@@ -445,7 +512,7 @@ fn bng_lab_ha() {
         .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect())
         .unwrap_or_else(|| vec![10_000]);
     let mut md = String::from(
-        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário | CoA ao nó antigo (ACK, mediana, p99, total) |\n|---|---|---|---|---|---|---|---|---|---|---|---|\n",
+        "# BNG em par (G4.3h): o ativo perde a energia\n\n| Sessões | Plano de dados | Tomada | Todas no nó novo | Tráfego de volta | Sessões perdidas | Na tabela do novo | Starts (ids únicos) | Stops na tomada | Sessões com Interim do novo | Sessões sem Interim do novo | Registros sem o Class do usuário | CoA ao nó antigo (ACK, mediana, p99, total) |\n|---|---|---|---|---|---|---|---|---|---|---|---|---|\n",
     );
     for n in scales {
         let row = run(n, &blaster, &out);
@@ -457,7 +524,7 @@ fn bng_lab_ha() {
 }
 
 fn run(n: usize, blaster: &Path, out: &Path) -> String {
-    let ports = n.div_ceil(PER_PORT).max(1);
+    let ports = ports_for(n);
     ip(None, &["link", "set", "lo", "up"]);
     let c = holder("crha-c");
     let bl = holder("crha-b");
@@ -547,6 +614,22 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         sysctl(ns, "net/ipv4/ip_forward", "1");
         sysctl(ns, "net/ipv4/conf/all/rp_filter", "0");
         sysctl(ns, "net/ipv4/conf/default/rp_filter", "0");
+        if ipoe() {
+            // An IPoE subscriber is a neighbour entry (ARP); the default
+            // table holds 1024 (`gc_thresh3`), and BNG Blaster's sessions
+            // stopped there.
+            for (k, v) in [
+                ("gc_thresh1", n),
+                ("gc_thresh2", 2 * n),
+                ("gc_thresh3", 4 * n),
+            ] {
+                sysctl(
+                    ns,
+                    &format!("net/ipv4/neigh/default/{k}"),
+                    &v.max(1024).to_string(),
+                );
+            }
+        }
     }
     ip(
         Some(bp),
@@ -576,7 +659,13 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
             "ha {n} single: setup {setup:?}, counters {:?}",
             b.counters()
         );
-        return format!("| {n} (nó sozinho) | — | — | — | — | — | — | — | — | — |");
+        if ipoe() {
+            eprintln!(
+                "ha {n} single: dhcp {}",
+                call(None, "ip.dhcp-server.statistics.print", json!({})).unwrap_or(Value::Null)
+            );
+        }
+        return format!("| {n} (nó sozinho) | — | — | — | — | — | — | — | — | — | — | — | — |");
     }
     wait_secs(60, || {
         monitor(None)["role"] == "active" && monitor(Some(cp))["role"] == "standby"
@@ -599,7 +688,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         m["sync"]["synced"].as_u64() == Some(n as u64) && m["in_sync"] == true
     })
     .expect("C's replica complete");
-    if n > SAMPLE_ALL {
+    if n > SAMPLE_ALL && !ipoe() {
         // Traffic on the sessions `rx_sample` reads on C after the
         // takeover (the first rows of `ppp.active.list` by name, the same
         // on both nodes: `rad{session id}`), picked on A, the active now.
@@ -635,10 +724,14 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     ip(None, &["link", "set", "sync0", "down"]);
     ip(None, &["addr", "del", "10.99.0.1/24", "dev", "gw0"]);
     let takeover = wait_secs(30, || monitor(Some(cp))["role"] == "active").unwrap_or(f64::NAN);
+    // G4.3hd: every session in C's table (adopted), from the cut.
+    let adopted = wait_secs(60, || active(Some(cp)) >= n as u64)
+        .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
     let back = wait_secs(60, || rx_sample(Some(cp)) > rx0)
         .map_or(f64::NAN, |_| cut.elapsed().as_secs_f64());
-    // Keepalive (5 s × 3 on BNG Blaster) and interims settle.
-    std::thread::sleep(Duration::from_secs(30));
+    // Keepalive (5 s × 3 on BNG Blaster) and interims settle; IPoE: past
+    // T1, every client renewed on C.
+    std::thread::sleep(Duration::from_secs(if ipoe() { 75 } else { 30 }));
     let (est, flapped1) = b.counters();
     let lost = flapped1.saturating_sub(flapped0);
     let held = active(Some(cp));
@@ -710,7 +803,7 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
     eprintln!("ha {n}: accounting before the cut: {}", tally(&before_refs));
     eprintln!("ha {n}: accounting after the cut: {}", tally(&new));
     eprintln!(
-        "ha {n}: takeover {takeover:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
+        "ha {n}: takeover {takeover:.2} s, all on C {adopted:.2} s, traffic back {back:.2} s, lost {lost}, C holds {held}, established {est}, starts {starts}, stops {stops}, C interims {}, without {without}, wrong Class {wrong_class} (C's records with it {class_c})",
         interims_c.len()
     );
     let coa = if single() {
@@ -748,9 +841,16 @@ fn run(n: usize, blaster: &Path, out: &Path) -> String {
         let _ = in_ns(None, "ip").args(["link", "del", l]).output();
     }
     format!(
-        "| {n} | {plane} | {takeover:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {wrong_class} | {coa} |",
+        "| {n}{} | {plane} | {takeover:.2} s | {adopted:.2} s | {back:.2} s | {lost} | {held} | {starts} ({}) | {stops} | {} | {without} | {} | {coa} |",
+        if ipoe() { " IPoE" } else { "" },
         unique.len(),
-        interims_c.len()
+        interims_c.len(),
+        // IPoE accounting only: no Access-Accept, no Class.
+        if ipoe() {
+            "—".to_owned()
+        } else {
+            wrong_class.to_string()
+        },
     )
 }
 

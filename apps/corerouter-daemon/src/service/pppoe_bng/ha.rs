@@ -231,6 +231,7 @@ impl Bng {
             fallback_profile: sub.fallback_profile.as_str().into(),
             started_at: self.cfg.unix_base + up / 1000,
             counters,
+            lease: None,
             extra: Vec::new(),
         })
     }
@@ -306,7 +307,7 @@ impl Bng {
         };
         let mine: Vec<&SessionRecord> = records
             .iter()
-            .filter(|r| mac_lane(r.client_mac, self.lanes) == self.lane)
+            .filter(|r| r.kind == Kind::Pppoe && mac_lane(r.client_mac, self.lanes) == self.lane)
             .collect();
         let done = self.adopt(now, &mine);
         if done.sessions + done.skipped > 0 {

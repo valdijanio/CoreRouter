@@ -21,6 +21,8 @@ use crate::wire::{Error, Reader, Result, put_bytes16, put_u16, put_u32, put_u64}
 pub const MAX_CLASS: usize = 4;
 /// Text and opaque fields (usernames, circuit ids, names).
 pub const MAX_FIELD: usize = 253;
+/// A DHCP option's value ([`Lease4`]: RFC 2132 §2, a length octet).
+pub const MAX_OPTION: usize = 255;
 /// IPv6 DNS servers (a profile lists at most 4).
 pub const MAX_DNS6: usize = 4;
 /// Routed blocks per session.
@@ -39,6 +41,25 @@ pub enum Kind {
 pub struct Prefix6 {
     pub addr: Ipv6Addr,
     pub len: u8,
+}
+
+/// The DHCPv4 binding of an IPoE session (G4.3hd), as the DHCP server
+/// keeps it: the node that takes over knows the client (its key is the
+/// client id, else `hw` or the MAC, RFC 2131 §4.2) and answers its renewal
+/// with the same lease.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Lease4 {
+    /// Unix seconds the lease ends; its length; the client's last message.
+    pub expires: u64,
+    pub lease_time: u32,
+    pub last_seen: u64,
+    /// Option 61 as sent.
+    pub client_id: Option<Box<[u8]>>,
+    /// Option 82 as received.
+    pub relay_info: Option<Box<[u8]>>,
+    /// `htype` + `chaddr` of a client that is not Ethernet.
+    pub hw: Option<Box<[u8]>>,
+    pub host_name: Box<[u8]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -116,6 +137,8 @@ pub struct SessionRecord {
     /// The counters when the record was written; [`crate::msg::Op::Counters`]
     /// updates them between records.
     pub counters: Counters,
+    /// IPoE: the DHCP binding (G4.3hd).
+    pub lease: Option<Lease4>,
     /// TLVs of a newer version, kept and written back unchanged.
     pub extra: Vec<(u8, Box<[u8]>)>,
 }
@@ -153,8 +176,14 @@ mod t {
     pub const ROUTE: u8 = 30;
     pub const LIMITS: u8 = 31;
     pub const FALLBACK: u8 = 32;
-    /// Types up to this one are known to version 1 (a newer one is kept).
-    pub const LAST_KNOWN: u8 = 32;
+    /// G4.3hd: [`super::Lease4`] (an older reader keeps them as `extra`).
+    pub const LEASE: u8 = 33;
+    pub const LEASE_CLIENT_ID: u8 = 34;
+    pub const LEASE_RELAY: u8 = 35;
+    pub const LEASE_HW: u8 = 36;
+    pub const LEASE_HOST: u8 = 37;
+    /// Types up to this one are known (a newer one is kept).
+    pub const LAST_KNOWN: u8 = 37;
     // The decoder's bitmask of seen types is a u64.
     const _: () = assert!(LAST_KNOWN < 64);
 }
@@ -162,6 +191,11 @@ mod t {
 fn tlv(out: &mut Vec<u8>, ty: u8, v: &[u8]) -> Result<()> {
     out.push(ty);
     put_bytes16(out, "field", v, MAX_FIELD.max(64))
+}
+
+fn tlv_option(out: &mut Vec<u8>, ty: u8, v: &[u8]) -> Result<()> {
+    out.push(ty);
+    put_bytes16(out, "option", v, MAX_OPTION)
 }
 
 fn tlv_with(out: &mut Vec<u8>, ty: u8, f: impl FnOnce(&mut Vec<u8>)) {
@@ -425,6 +459,25 @@ impl SessionRecord {
                 put_u64(o, self.counters.tx_packets);
             });
         }
+        if let Some(l) = &self.lease {
+            tlv_with(out, t::LEASE, |o| {
+                put_u64(o, l.expires);
+                put_u32(o, l.lease_time);
+                put_u64(o, l.last_seen);
+            });
+            for (ty, v) in [
+                (t::LEASE_CLIENT_ID, l.client_id.as_deref()),
+                (t::LEASE_RELAY, l.relay_info.as_deref()),
+                (t::LEASE_HW, l.hw.as_deref()),
+            ] {
+                if let Some(v) = v {
+                    tlv_option(out, ty, v)?;
+                }
+            }
+            if !l.host_name.is_empty() {
+                tlv_option(out, t::LEASE_HOST, &l.host_name)?;
+            }
+        }
         for (ty, v) in &self.extra {
             if *ty <= t::LAST_KNOWN {
                 return Err(Error::BadValue("extra type"));
@@ -448,7 +501,7 @@ impl SessionRecord {
         let mut seen: u64 = 0;
         while r.remaining() > 0 {
             let ty = r.u8()?;
-            let v = r.bytes16("field", MAX_FIELD.max(64))?;
+            let v = r.bytes16("field", MAX_OPTION)?;
             if ty <= t::LAST_KNOWN && ty != t::CLASS && ty != t::ROUTE {
                 let bit = 1u64 << ty;
                 if seen & bit != 0 {
@@ -508,6 +561,22 @@ impl SessionRecord {
                 t::RATE => s.rate_limit = Some(text(v, "rate limit")?),
                 t::SESSION_TIMEOUT => s.session_timeout = Some(u32_of(v)?),
                 t::IDLE_TIMEOUT => s.idle_timeout = Some(u32_of(v)?),
+                t::LEASE => {
+                    let mut c = Reader::new(v);
+                    let l = s.lease.get_or_insert_with(Lease4::default);
+                    l.expires = c.u64()?;
+                    l.lease_time = c.u32()?;
+                    l.last_seen = c.u64()?;
+                    c.end()?;
+                }
+                t::LEASE_CLIENT_ID => {
+                    s.lease.get_or_insert_with(Lease4::default).client_id = Some(v.into());
+                }
+                t::LEASE_RELAY => {
+                    s.lease.get_or_insert_with(Lease4::default).relay_info = Some(v.into());
+                }
+                t::LEASE_HW => s.lease.get_or_insert_with(Lease4::default).hw = Some(v.into()),
+                t::LEASE_HOST => s.lease.get_or_insert_with(Lease4::default).host_name = v.into(),
                 t::CIRCUIT => s.circuit_id = Some(v.into()),
                 t::REMOTE => s.remote_id = Some(v.into()),
                 t::ACCT_ID => s.acct_session_id = text(v, "acct session id")?,
@@ -663,8 +732,45 @@ mod tests {
                 rx_packets: 1,
                 tx_packets: 2,
             },
+            lease: None,
             extra: vec![],
         }
+    }
+
+    /// G4.3hd: an IPoE session and its DHCP binding go through the record
+    /// (a client id of 255 bytes, the most option 61 holds, included).
+    #[test]
+    fn an_ipoe_session_carries_its_dhcp_binding() {
+        let r = SessionRecord {
+            kind: Kind::Ipoe,
+            client_mac: [2, 0x1a, 0xb0, 2, 0, 1],
+            username: (*b"02:1A:B0:02:00:01").into(),
+            ipv4: Some(Ipv4Addr::new(10, 64, 0, 20)),
+            server: "ipoe1".into(),
+            acct_session_id: "6720ABCD0001".into(),
+            started_at: 1_700_000_000,
+            lease: Some(Lease4 {
+                expires: 1_700_000_600,
+                lease_time: 600,
+                last_seen: 1_700_000_300,
+                client_id: Some(vec![0xff; MAX_OPTION].into()),
+                relay_info: Some((*b"\x01\x04olt1").into()),
+                hw: None,
+                host_name: (*b"cpe-1").into(),
+            }),
+            ..SessionRecord::default()
+        };
+        let b = r.to_bytes().unwrap();
+        assert_eq!(SessionRecord::decode(&b).unwrap(), r);
+        let mut long = r.clone();
+        if let Some(l) = &mut long.lease {
+            l.client_id = Some(vec![0; MAX_OPTION + 1].into());
+        }
+        assert!(long.to_bytes().is_err());
+        // Without a lease (PPPoE) nothing of it is written.
+        let mut p = r.clone();
+        p.lease = None;
+        assert!(p.to_bytes().unwrap().len() < b.len() - MAX_OPTION);
     }
 
     #[test]

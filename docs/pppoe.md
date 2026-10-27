@@ -733,6 +733,10 @@ classificado (R-08), sessões IPoE IPv6 (DHCPv6/RA com a linha da RFC 6788) e FO
 
 ### 9.5 O serviço `ipoe` do daemon
 
+No par de BNGs em hot standby (G4.3hd), as sessões IPoE e as concessões delas passam ao outro nó.
+O DHCP do standby fica calado. Veja `docs/bng-ha.md` §2.12.
+
+
 `apps/corerouter-daemon/src/service/ipoe.rs` (o driver) e `ipoe_bng.rs` (o núcleo, sem E/S). No
 início o serviço se registra no engine como `IpoeBackend` (o servidor DHCP pergunta e avisa) e
 como a metade IPoE do `ppp.active` (`Session::set_ipoe_sessions`); no RADIUS, como dono de sessões

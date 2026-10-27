@@ -182,3 +182,24 @@ pub fn running(name: &IfName) -> bool {
         })
     })
 }
+
+/// G4.3hd: the standby of a pair shares the IPoE gateway's address with
+/// the active one, and must not answer ARP for it (the subscribers would
+/// send to it). `quiet`: `arp_ignore` 8 on the port (no ARP replies at
+/// all); else back to 0, the kernel's default. In this process's network
+/// namespace; the value written is checked.
+pub fn arp_quiet(name: &IfName, quiet: bool) -> io::Result<()> {
+    let n = name.as_str();
+    if n.is_empty() || n.contains('/') || n.starts_with('.') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "bad interface name",
+        ));
+    }
+    let path = format!("/proc/sys/net/ipv4/conf/{n}/arp_ignore");
+    let want = if quiet { "8" } else { "0" };
+    if std::fs::read_to_string(&path)?.trim() == want {
+        return Ok(());
+    }
+    std::fs::write(&path, want)
+}

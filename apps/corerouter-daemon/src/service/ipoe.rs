@@ -11,6 +11,10 @@
 //! once a second the XDP counters (accounting, the PPP window) and the
 //! keepalive. The session lock is taken only for those short steps, never
 //! while the core's own lock is held.
+//!
+//! G4.3hd, every tick: in a redundant pair, the takeover's IPoE sessions
+//! adopted before this node answers DHCP, the sessions ended quietly when
+//! the role goes to the peer, and the changes published (hot standby).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -70,6 +74,18 @@ fn kernel_routes(ops: &[KernelRoute]) -> Result<(), String> {
     if ops.is_empty() { Ok(()) } else { Err("routed blocks need Linux".into()) }
 }
 
+/// G4.3hd: no ARP replies on an IPoE port of a pair's standby (it has the
+/// gateway's address too).
+#[cfg(target_os = "linux")]
+fn arp_quiet(name: &IfName, quiet: bool) -> Result<(), String> {
+    corerouter_hal_linux::ha_io::arp_quiet(name, quiet).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn arp_quiet(_: &IfName, _: bool) -> Result<(), String> {
+    Ok(())
+}
+
 struct Driver {
     ports: Vec<IfName>,
     info: HashMap<IfName, (u32, [u8; 6])>,
@@ -78,6 +94,10 @@ struct Driver {
     /// may be attached to the ports later).
     tried: Option<Instant>,
     owner_of: Option<usize>,
+    /// G4.3hd: this node was the pair's active one at the last tick; the
+    /// ports' ARP state set last (quiet, for these ports).
+    was_active: bool,
+    arp: Option<(bool, Vec<IfName>)>,
 }
 
 /// How often a data plane that was refused is asked for again.
@@ -85,7 +105,7 @@ const RETRY: Duration = Duration::from_secs(30);
 
 fn run(session: &Shared, core: &Arc<Core>, health: &super::Health) -> Result<(), String> {
     let owner = Arc::new(Owner(core.clone()));
-    let mut d = Driver { ports: Vec::new(), info: HashMap::new(), plane: None, tried: None, owner_of: None };
+    let mut d = Driver { ports: Vec::new(), info: HashMap::new(), plane: None, tried: None, owner_of: None, was_active: false, arp: None };
     let mut last: Option<Instant> = None;
     while health.sleep(TICK) {
         health.beat();
@@ -94,12 +114,69 @@ fn run(session: &Shared, core: &Arc<Core>, health: &super::Health) -> Result<(),
             last = Some(Instant::now());
             d.second(session, core, &owner, health, secs);
         }
+        d.pair(core);
         d.apply(session, core);
     }
     Ok(())
 }
 
 impl Driver {
+    /// G4.3hd: the redundant pair's side of the IPoE sessions.
+    fn pair(&mut self, core: &Arc<Core>) {
+        use std::sync::atomic::Ordering;
+        use super::pppoe_bng::ha::{HaChange, TAKEOVER, TAKEOVER_GEN};
+        use super::ipoe_bng::ha::IpoeHaChange;
+        // The role first: `ppp-ha` raises the takeover's number before it
+        // lets this node answer, so an active node sees its takeover.
+        let active = super::pppoe_bng::HA_ACTIVE.load(Ordering::Acquire);
+        let gen_ = TAKEOVER_GEN.load(Ordering::Acquire);
+        if gen_ > core.ha_gen() {
+            let records = TAKEOVER.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+            core.adopt(gen_, records.as_deref().map_or(&[], Vec::as_slice));
+        }
+        if self.was_active && !active && core.ha_enabled() {
+            core.abandon();
+        }
+        self.was_active = active;
+        let answering = active && core.ha_gen() >= gen_;
+        core.set_answering(answering);
+        let quiet = core.ha_enabled() && !answering;
+        let ports = core.ports();
+        // A router without a pair keeps whatever it had.
+        let untouched = !core.ha_enabled() && self.arp.is_none();
+        if !untouched && self.arp.as_ref() != Some(&(quiet, ports.clone())) {
+            for p in &ports {
+                if let Err(e) = arp_quiet(p, quiet) {
+                    log::warn!("ipoe: arp_ignore on {p}: {e}");
+                }
+            }
+            self.arp = Some((quiet, ports));
+        }
+        let changes = core.ha_take();
+        if changes.is_empty() {
+            return;
+        }
+        let out: Vec<HaChange> = changes
+            .into_iter()
+            .map(|c| match c {
+                IpoeHaChange::Up(k, v) => HaChange::Up(k, v),
+                IpoeHaChange::Gone(k) => HaChange::Gone(k),
+                IpoeHaChange::Counters(k, c) => HaChange::Counters(k, c),
+            })
+            .collect();
+        if let Some(back) = super::ppp_ha::publish(out) {
+            core.ha_requeue(
+                back.into_iter()
+                    .map(|c| match c {
+                        HaChange::Up(k, v) => IpoeHaChange::Up(k, v),
+                        HaChange::Gone(k) => IpoeHaChange::Gone(k),
+                        HaChange::Counters(k, c) => IpoeHaChange::Counters(k, c),
+                    })
+                    .collect(),
+            );
+        }
+    }
+
     fn second(&mut self, session: &Shared, core: &Arc<Core>, owner: &Arc<Owner>, health: &super::Health, secs: u64) {
         let (cfg, aaa) = {
             let s = lock(session);
