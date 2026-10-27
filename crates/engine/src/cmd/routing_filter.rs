@@ -78,6 +78,12 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "routing.filter.community-list.list", "Community Lists", ["Routing", "Filters"], None,
         "{} → [{name, communities: [string], normal, large, used_by: [chain], comment}]",
         always, clist_list),
+    cmd!(query "routing.filter.prefix-list.check", "Check Prefix List", [], None,
+        "{id?: string (the list being edited), name?: string, entries?: [string] | string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
+        always, plist_check),
+    cmd!(query "routing.filter.community-list.check", "Check Community List", [], None,
+        "{id?: string (the list being edited), name?: string, communities?: [string] | string, comment?: string} → {computed: [{label, value}], checks: [{level, check, message, param}], commands: [{command, params}], risk}",
+        always, clist_check),
     cmd!(query "routing.filter.status", "Filter Status", ["Routing", "Filters"], None,
         "{} → {chains: [{chain, rules, enabled, used_in: [connection], used_out: [connection], errors}], rfc8212: [{connection, remote_address, remote_as?, missing: [in | out], message}]}",
         always, status),
@@ -963,6 +969,78 @@ fn impact(s: &mut Session, _: &Value) -> Result<Value> {
 }
 
 // ---- the modal ----
+
+/// The modal's preview of a list: the change on a copy, its entries
+/// counted, its users named; bad input is a check, never an error.
+fn list_check(s: &mut Session, raw: &Value, prefix: bool) -> Result<Value> {
+    let check = |level: &str, check: &str, message: String, param: &str| {
+        json!({"level": level, "check": check, "message": message, "param": param})
+    };
+    let id = opt_str(raw, "id").ok().flatten().filter(|i| !i.is_empty()).map(str::to_owned);
+    let mut p = raw.clone();
+    if let Some(o) = p.as_object_mut() {
+        if id.is_none() {
+            o.remove("id");
+        }
+        if id.is_some() && o.get("name").and_then(Value::as_str) == id.as_deref() {
+            o.remove("name");
+        }
+    }
+    let mut cfg: Config = s.store().candidate().clone();
+    let f = &mut cfg.routing.filter;
+    let applied = if prefix { plist_apply(f, &p, id.as_deref()) } else { clist_apply(f, &p, id.as_deref()) };
+    let mut computed = Vec::new();
+    let mut checks = Vec::new();
+    match applied {
+        Err(e) => {
+            let (param, msg) = match &e {
+                EngineError::BadParam { param, reason } => (param.clone(), reason.clone()),
+                other => (String::new(), other.to_string()),
+            };
+            checks.push(check("error", "params", msg, &param));
+        }
+        Ok(name) => {
+            if prefix && let Some(l) = cfg.routing.filter.prefix_lists.get(&name) {
+                let v4 = l.entries.iter().filter(|e| e.prefix.max_prefix_len() == 32).count();
+                computed.push(json!({"label": "Entries", "value": format!("{} ({v4} IPv4, {} IPv6)", l.entries.len(), l.entries.len() - v4)}));
+                if l.entries.is_empty() {
+                    checks.push(check("warning", "empty", "an empty list matches nothing".into(), "entries"));
+                }
+            }
+            if !prefix && let Some(l) = cfg.routing.filter.community_lists.get(&name) {
+                let large = l.communities.iter().filter(|c| c.matches(':').count() == 2).count();
+                computed.push(json!({"label": "Communities", "value": format!("{} normal, {large} large", l.communities.len() - large)}));
+            }
+            let users = chains_using(&cfg.routing.filter, &name, prefix);
+            if !users.is_empty() {
+                computed.push(json!({"label": "Used By", "value": users.join(", ")}));
+            }
+            let what = if prefix { "prefix_lists" } else { "community_lists" };
+            for issue in corerouter_proto_bgp::validate(&cfg) {
+                if issue.path.starts_with(&format!("routing.filter.{what}.{name}")) {
+                    checks.push(check("error", "validate", issue.message.clone(), if prefix { "entries" } else { "communities" }));
+                }
+            }
+        }
+    }
+    let ok = !checks.iter().any(|c| c.get("level").and_then(Value::as_str) == Some("error"));
+    let kind = if prefix { "prefix-list" } else { "community-list" };
+    let command = if id.is_some() { format!("routing.filter.{kind}.set") } else { format!("routing.filter.{kind}.add") };
+    Ok(json!({
+        "computed": computed,
+        "checks": checks,
+        "commands": if ok { vec![json!({"command": command, "params": p})] } else { Vec::new() },
+        "risk": null,
+    }))
+}
+
+fn plist_check(s: &mut Session, p: &Value) -> Result<Value> {
+    list_check(s, p, true)
+}
+
+fn clist_check(s: &mut Session, p: &Value) -> Result<Value> {
+    list_check(s, p, false)
+}
 
 fn rule_check(s: &mut Session, raw: &Value) -> Result<Value> {
     let check = |level: &str, check: &str, message: String, param: &str| {

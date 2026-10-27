@@ -66,11 +66,13 @@ pub fn routes(n: usize, seed: u64, peer_as: u32) -> Vec<Route> {
                 Err(_) => continue,
             }
         } else {
-            // IPv4: mostly /24 (about 60 % of a full table), then /16../23.
-            let len = match rng.below(10) {
-                0..=5 => 24,
-                6 => 16 + rng.below(4) as u8,
-                7..=8 => 20 + rng.below(4) as u8,
+            // IPv4: mostly /24 (about 60 % of a full table), then /16../23,
+            // and ~2 % longer than /24 (leaks a policy should catch).
+            let len = match rng.below(50) {
+                0 => 25 + rng.below(4) as u8,
+                1..=30 => 24,
+                31..=35 => 16 + rng.below(4) as u8,
+                36..=45 => 20 + rng.below(4) as u8,
                 _ => 8 + rng.below(8) as u8,
             };
             // Public-looking space: 1..=223, skipping 10/8 and 127/8.

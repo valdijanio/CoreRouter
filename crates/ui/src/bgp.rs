@@ -80,6 +80,8 @@ const fn field(param: &'static str, label: &'static str, help: &'static str, inp
 /// The shared parameters, in the modal's pages.
 const SESSION_PAGE: &[&str] = &["hold_time", "keepalive_time", "multihop", "update_source", "tcp_md5_key", "nexthop_choice"];
 const LIMITS_PAGE: &[&str] = &["afi", "max_prefix_ipv4", "max_prefix_ipv6", "max_prefix_action", "max_prefix_restart"];
+/// G3.2b: the `/routing filter` chains (RFC 8212: eBGP needs both).
+const FILTERS_PAGE: &[&str] = &["input_filter", "output_filter", "keep_received"];
 
 const CONN_FIELDS: &[Field] = &[
     field("name", "Name", "bgp.connection.name", Input::Text("upstream1")),
@@ -101,6 +103,9 @@ const CONN_FIELDS: &[Field] = &[
     field("max_prefix_ipv6", "Max Prefixes IPv6", "bgp.param.max_prefix", Input::Text("no limit")),
     field("max_prefix_action", "Over the Limit", "bgp.param.max_prefix_action", Input::Choice),
     field("max_prefix_restart", "Restart After", "bgp.param.max_prefix_restart", Input::Text("5 min")),
+    field("input_filter", "Input Filter", "bgp.param.input_filter", Input::Text("chain of received routes")),
+    field("output_filter", "Output Filter", "bgp.param.output_filter", Input::Text("chain of sent routes")),
+    field("keep_received", "Keep Received", "bgp.param.keep_received", Input::Choice),
 ];
 
 const TPL_FIELDS: &[Field] = &[
@@ -120,6 +125,9 @@ const TPL_FIELDS: &[Field] = &[
     field("max_prefix_ipv6", "Max Prefixes IPv6", "bgp.param.max_prefix", Input::Text("no limit")),
     field("max_prefix_action", "Over the Limit", "bgp.param.max_prefix_action", Input::Choice),
     field("max_prefix_restart", "Restart After", "bgp.param.max_prefix_restart", Input::Text("5 min")),
+    field("input_filter", "Input Filter", "bgp.param.input_filter", Input::Text("chain of received routes")),
+    field("output_filter", "Output Filter", "bgp.param.output_filter", Input::Text("chain of sent routes")),
+    field("keep_received", "Keep Received", "bgp.param.keep_received", Input::Choice),
 ];
 
 pub(crate) const CONN_SPEC: Spec = Spec {
@@ -459,6 +467,11 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
             "disabled" => if flag(r, "disabled") { "yes" } else { "no" }.to_owned(),
             // Write-only: never shown, empty keeps it.
             "tcp_md5_key" => String::new(),
+            "keep_received" => match own.get("keep_received").and_then(Value::as_bool) {
+                Some(true) => "yes".into(),
+                Some(false) => "no".into(),
+                None => String::new(),
+            },
             "multihop" => match own.get("multihop").and_then(Value::as_bool) {
                 Some(true) => "yes".into(),
                 Some(false) => "no".into(),
@@ -480,7 +493,7 @@ fn values_of(r: &Value, what: What) -> BTreeMap<&'static str, String> {
 fn options(param: &str, instances: &[String]) -> Vec<String> {
     let v: &[&str] = match param {
         "local_role" => &["", "ibgp", "ebgp", "ebgp-provider", "ebgp-customer", "ebgp-peer", "ebgp-rs", "ebgp-rs-client"],
-        "multihop" => &["", "yes", "no"],
+        "multihop" | "keep_received" => &["", "yes", "no"],
         "nexthop_choice" => &["", "default", "force-self", "propagate"],
         "afi" => &["", "ip", "ipv6", "ip,ipv6"],
         "max_prefix_action" => &["", "shutdown", "warning", "restart"],
@@ -1022,7 +1035,7 @@ impl PanelState for BgpPanel {
             let page = &mut self.page;
             let open = m.show_paged(app, ctx, area, spec, &|p| options(p, &instances), &mut |ui| {
                 ui.horizontal(|ui| {
-                    for (i, label) in ["General", "Session", "Limits"].iter().enumerate() {
+                    for (i, label) in ["General", "Session", "Limits", "Filters"].iter().enumerate() {
                         if ui.selectable_label(*page == i, tr_in(SCOPE, l, label)).clicked() {
                             *page = i;
                         }
@@ -1036,6 +1049,7 @@ impl PanelState for BgpPanel {
                 Some(match *page {
                     1 => SESSION_PAGE,
                     2 => LIMITS_PAGE,
+                    3 => FILTERS_PAGE,
                     _ => general,
                 })
             });
