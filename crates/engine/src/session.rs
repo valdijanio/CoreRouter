@@ -587,6 +587,18 @@ impl Session {
         self.hal
             .apply(from, to)
             .map_err(|e| EngineError::Hal(e.to_string()))?;
+        // G3.1: the routing daemons (FRR) take the routing part; when they
+        // refuse, the data plane goes back too and the commit fails.
+        if let Some(crate::routing_daemon::RoutingBackend(Some(daemon))) =
+            self.ext.get_mut::<crate::routing_daemon::RoutingBackend>()
+            && (from.routing != to.routing || self.storage_status.boot_apply_error.is_some())
+            && let Err(e) = daemon.apply(from, to)
+        {
+            if let Err(back) = self.hal.apply(to, from) {
+                log::error!("routing refused the commit and the data plane could not go back: {back}");
+            }
+            return Err(EngineError::Hal(format!("routing: {e}")));
+        }
         if self.storage_status.boot_apply_error.take().is_some() {
             log::info!("the whole config reached the data plane with this commit");
         }
