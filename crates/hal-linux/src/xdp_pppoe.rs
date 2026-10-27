@@ -330,10 +330,10 @@ impl XdpState {
             return Ok(());
         }
         self.pppoe.on = on;
-        let Some(cfg) = self.cfg.clone() else {
+        if self.cfg.is_none() {
             return Ok(());
-        };
-        let plan = corerouter_hal::xdp::XdpPlan::of(&cfg, &self.dynamic);
+        }
+        let plan = self.settings();
         // Force `reach` past its "nothing changed" shortcut.
         self.applied = corerouter_hal::xdp::XdpPlan::default();
         self.reach(plan)
@@ -357,10 +357,10 @@ impl XdpState {
             return Ok(());
         }
         self.pppoe.ipoe_ports = ports;
-        let Some(cfg) = self.cfg.clone() else {
+        if self.cfg.is_none() {
             return Ok(());
-        };
-        let plan = corerouter_hal::xdp::XdpPlan::of(&cfg, &self.dynamic);
+        }
+        let plan = self.settings();
         self.applied = corerouter_hal::xdp::XdpPlan::default();
         self.reach(plan)
     }

@@ -917,8 +917,8 @@ mod linux {
             changes: &[DynamicChange<'_>],
         ) -> Result<(), HalError> {
             let mut ops = Vec::with_capacity(changes.len());
+            self.xdp.dynamic_many(changes);
             for c in changes {
-                self.xdp.dynamic(*c);
                 match c {
                     DynamicChange::Add(d) => ops.push((true, *d)),
                     DynamicChange::Remove(d) => ops.push((false, *d)),

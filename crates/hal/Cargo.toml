@@ -25,5 +25,9 @@ proptest.workspace = true
 name = "apply"
 harness = false
 
+[[bench]]
+name = "xdp_prefixes"
+harness = false
+
 [lints]
 workspace = true

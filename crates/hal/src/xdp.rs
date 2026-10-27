@@ -2,9 +2,11 @@
 //! config ([`XdpPlan`], pure, shared by every backend) and what it reports
 //! back ([`XdpStatus`]).
 
+use std::collections::{BTreeSet, HashMap};
 use std::net::IpAddr;
 
-use corerouter_model::firewall::{AddrMatch, DynamicAddress, Name};
+use corerouter_model::cow_list::CowList;
+use corerouter_model::firewall::{AddrMatch, AddressListEntry, DynamicAddress, Name};
 use corerouter_model::xdp::XdpMode;
 use corerouter_model::{Config, IfName};
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
@@ -36,6 +38,19 @@ impl XdpPlan {
     /// What `cfg` (plus the dynamic address-list entries, which live in
     /// the data plane only) asks for. No interfaces: nothing to load.
     pub fn of(cfg: &Config, dynamic: &[DynamicAddress]) -> Self {
+        let mut plan = Self::settings_of(cfg);
+        if !plan.is_empty() {
+            let f = &cfg.ip.xdp.filter;
+            plan.block = prefixes(cfg, dynamic, &f.block_lists);
+            plan.allow = prefixes(cfg, dynamic, &f.allow_lists);
+        }
+        plan
+    }
+
+    /// [`XdpPlan::of`] without the prefixes (`block` and `allow` empty): a
+    /// backend that follows them with [`XdpPrefixes`] reads only the
+    /// entries that changed, not every address-list entry per commit.
+    pub fn settings_of(cfg: &Config) -> Self {
         let x = &cfg.ip.xdp;
         let f = &x.filter;
         let interfaces: Vec<(IfName, XdpMode)> = x
@@ -52,14 +67,216 @@ impl XdpPlan {
             drop_invalid_tcp_flags: f.drop_invalid_tcp_flags,
             rate_limit: u64::from(f.rate_limit),
             rate_burst: u64::from(f.burst()),
-            block: prefixes(cfg, dynamic, &f.block_lists),
-            allow: prefixes(cfg, dynamic, &f.allow_lists),
+            block: Vec::new(),
+            allow: Vec::new(),
             fast_nat: x.fast_nat,
         }
     }
 
     pub fn is_empty(&self) -> bool {
         self.interfaces.is_empty()
+    }
+}
+
+/// One side of [`XdpPrefixes`] (block or allow).
+#[derive(Debug, Clone, Default)]
+struct Side {
+    /// The config's `block_lists` (or `allow_lists`) the counts are for.
+    lists: Vec<Name>,
+    /// Prefix → (list index, entries of that list covering it with it),
+    /// lowest index first: the first is the one the data plane holds.
+    held: HashMap<IpNet, Vec<(u32, u32)>>,
+    /// Prefixes whose holder may have changed since the last
+    /// [`XdpPrefixes::take_changes`].
+    dirty: BTreeSet<IpNet>,
+}
+
+impl Side {
+    fn count(&mut self, list: &Name, a: &AddrMatch, up: bool) {
+        let Some(i) = self.lists.iter().position(|n| n == list) else {
+            return;
+        };
+        let i = i as u32;
+        for n in cover(a) {
+            let holders = self.held.entry(n).or_default();
+            match holders.binary_search_by_key(&i, |h| h.0) {
+                Ok(at) if up => {
+                    if let Some(h) = holders.get_mut(at) {
+                        h.1 = h.1.saturating_add(1);
+                    }
+                }
+                Ok(at) => {
+                    if let Some(h) = holders.get_mut(at) {
+                        h.1 = h.1.saturating_sub(1);
+                        if h.1 == 0 {
+                            holders.remove(at);
+                        }
+                    }
+                }
+                Err(at) if up => holders.insert(at, (i, 1)),
+                // Not counted (never seen): nothing to take back.
+                Err(_) => {}
+            }
+            if holders.is_empty() {
+                self.held.remove(&n);
+            }
+            self.dirty.insert(n);
+        }
+    }
+
+    fn changes(&mut self) -> Vec<(IpNet, Option<u32>)> {
+        std::mem::take(&mut self.dirty)
+            .into_iter()
+            .map(|n| (n, self.held.get(&n).and_then(|h| h.first()).map(|h| h.0)))
+            .collect()
+    }
+
+    fn all(&self) -> Vec<(IpNet, u32)> {
+        let mut v: Vec<(IpNet, u32)> = self
+            .held
+            .iter()
+            .filter_map(|(n, h)| h.first().map(|h| (*n, h.0)))
+            .collect();
+        v.sort();
+        v
+    }
+}
+
+/// The block and allow prefixes of the filter followed change by change
+/// (G0.22 × G2.5a), so a commit or a dynamic entry costs what it changed:
+/// [`XdpPlan::of`] walks every address-list entry, and a backend that
+/// called it per commit paid for 100 000 entries on every unrelated change
+/// (and per PPP session that came up with an address list). The static
+/// entries are diffed by block ([`CowList::shared_blocks`]); each prefix
+/// counts the entries of each list that cover it, so an entry twice, or in
+/// two lists, comes and goes exactly. [`XdpPrefixes::take_changes`] says
+/// which prefixes to write or remove; [`XdpPrefixes::all`] equals what
+/// [`XdpPlan::of`] puts in `block` and `allow`.
+#[derive(Debug, Clone, Default)]
+pub struct XdpPrefixes {
+    block: Side,
+    allow: Side,
+    /// The static entries counted (shares their blocks with the config).
+    statics: CowList<AddressListEntry>,
+}
+
+/// The changes [`XdpPrefixes::take_changes`] hands over: prefix → the list
+/// index to hold it with, or `None` to remove it.
+pub type PrefixChanges = Vec<(IpNet, Option<u32>)>;
+
+/// Prefixes with the list index that holds each, sorted (`XdpPlan::block`).
+pub type Held = Vec<(IpNet, u32)>;
+
+impl XdpPrefixes {
+    /// Follow `cfg`: its static entries (the blocks that changed since the
+    /// last call) and its list names. `dynamic` is every dynamic entry the
+    /// backend holds, read only when the list names changed (everything
+    /// is counted again then).
+    pub fn follow<'a>(
+        &mut self,
+        cfg: &Config,
+        dynamic: impl IntoIterator<Item = &'a DynamicAddress>,
+    ) {
+        let f = &cfg.ip.xdp.filter;
+        let lists = cfg.ip.firewall.address_lists.list();
+        if f.block_lists != self.block.lists || f.allow_lists != self.allow.lists {
+            for (side, names) in [
+                (&mut self.block, &f.block_lists),
+                (&mut self.allow, &f.allow_lists),
+            ] {
+                let old = std::mem::take(&mut side.held);
+                side.dirty.extend(old.into_keys());
+                side.lists = names.clone();
+            }
+            self.statics = lists.clone();
+            for e in lists.iter().filter(|e| !e.disabled) {
+                self.count(&e.list, &e.address, true);
+            }
+            for d in dynamic {
+                self.count(&d.list, &d.address, true);
+            }
+            return;
+        }
+        if CowList::ptr_eq(&self.statics, lists) {
+            return;
+        }
+        let old = std::mem::replace(&mut self.statics, lists.clone());
+        for (block, (_, shared)) in old.blocks().zip(old.shared_blocks(lists)) {
+            if shared.is_none() {
+                for e in block.iter().filter(|e| !e.disabled) {
+                    self.count(&e.list, &e.address, false);
+                }
+            }
+        }
+        for (block, (_, shared)) in lists.blocks().zip(lists.shared_blocks(&old)) {
+            if shared.is_none() {
+                for e in block.iter().filter(|e| !e.disabled) {
+                    self.count(&e.list, &e.address, true);
+                }
+            }
+        }
+    }
+
+    /// A dynamic entry came (`up`) or went. The caller counts each one
+    /// once: an entry added again (a new timeout) is not a second one.
+    pub fn dynamic(&mut self, d: &DynamicAddress, up: bool) {
+        self.count(&d.list, &d.address, up);
+    }
+
+    fn count(&mut self, list: &Name, a: &AddrMatch, up: bool) {
+        self.block.count(list, a, up);
+        self.allow.count(list, a, up);
+    }
+
+    /// Some prefix may have changed since the last [`Self::take_changes`].
+    pub fn pending(&self) -> bool {
+        !self.block.dirty.is_empty() || !self.allow.dirty.is_empty()
+    }
+
+    /// What changed since the last call, block then allow: the prefixes to
+    /// write (with their list index) or to remove.
+    pub fn take_changes(&mut self) -> (PrefixChanges, PrefixChanges) {
+        (self.block.changes(), self.allow.changes())
+    }
+
+    /// Changes taken but not written (the data plane refused): taken again
+    /// by the next [`Self::take_changes`].
+    pub fn retake(&mut self, block: &PrefixChanges, allow: &PrefixChanges) {
+        self.block.dirty.extend(block.iter().map(|c| c.0));
+        self.allow.dirty.extend(allow.iter().map(|c| c.0));
+    }
+
+    /// Forget the pending changes (the maps are written whole, or not at
+    /// all).
+    pub fn clear_changes(&mut self) {
+        self.block.dirty.clear();
+        self.allow.dirty.clear();
+    }
+
+    /// Every prefix with its list index, sorted: `block` and `allow` of
+    /// [`XdpPlan::of`].
+    pub fn all(&self) -> (Held, Held) {
+        (self.block.all(), self.allow.all())
+    }
+
+    /// The prefixes a map may hold: every one counted and every one
+    /// pending (removing them all empties it).
+    pub fn every_key(&self) -> (Vec<IpNet>, Vec<IpNet>) {
+        let keys = |s: &Side| {
+            s.held
+                .keys()
+                .chain(s.dirty.iter())
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect()
+        };
+        (keys(&self.block), keys(&self.allow))
+    }
+
+    /// Prefixes held: (block, allow).
+    pub fn len(&self) -> (usize, usize) {
+        (self.block.held.len(), self.allow.held.len())
     }
 }
 
@@ -304,5 +521,107 @@ mod tests {
             vec![(net("198.51.100.0/24"), 0), (net("2001:db8::/32"), 1)]
         );
         assert!(plan.allow.is_empty());
+    }
+
+    fn pool(k: u8) -> AddrMatch {
+        match k % 6 {
+            0 => AddrMatch::Net(net("10.0.0.0/24")),
+            1 => AddrMatch::Net(net("10.0.0.0/25")),
+            2 => AddrMatch::Range("10.0.0.1".parse().unwrap(), "10.0.0.6".parse().unwrap()),
+            3 => AddrMatch::Net(net("2001:db8::/32")),
+            4 => AddrMatch::Net(net(&format!("10.1.{k}.0/24"))),
+            _ => AddrMatch::Net(net(&format!("10.2.0.{k}/32"))),
+        }
+    }
+
+    fn list(k: u8) -> Name {
+        ["a", "b", "c"][usize::from(k % 3)].parse().unwrap()
+    }
+
+    proptest::proptest! {
+        /// The prefixes followed change by change, written to a mirror of
+        /// the data plane's maps, equal what [`XdpPlan::of`] computes from
+        /// scratch, after any series of static, dynamic and list-name
+        /// changes.
+        #[test]
+        fn followed_prefixes_equal_the_plan(ops in proptest::collection::vec((0u8..6, 0u16..400, 0u8..255), 1..50)) {
+            let mut cfg = Config::default();
+            cfg.ip.xdp.filter.block_lists = vec![list(0), list(1)];
+            cfg.ip.xdp.filter.allow_lists = vec![list(2)];
+            for i in 0..300u32 {
+                cfg.ip.firewall.address_lists.push(AddressListEntry {
+                    id: ItemId(i + 1),
+                    list: list(i as u8),
+                    address: pool((i % 251) as u8),
+                    disabled: i % 7 == 0,
+                    comment: String::new(),
+                });
+            }
+            let mut dynamic: HashMap<(Name, AddrMatch), DynamicAddress> = HashMap::new();
+            let mut x = XdpPrefixes::default();
+            let mut maps: [std::collections::BTreeMap<IpNet, u32>; 2] = Default::default();
+            let mut next = 1000u32;
+            for (op, at, v) in ops {
+                let lists = &mut cfg.ip.firewall.address_lists;
+                let at = usize::from(at) % lists.len().max(1);
+                match op {
+                    0 => {
+                        next += 1;
+                        lists.push(AddressListEntry {
+                            id: ItemId(next),
+                            list: list(v),
+                            address: pool(v / 3),
+                            disabled: v % 5 == 0,
+                            comment: String::new(),
+                        });
+                    }
+                    1 => {
+                        lists.remove(at);
+                    }
+                    2 => {
+                        lists.update(at, |e| e.disabled = !e.disabled);
+                    }
+                    3 => {
+                        let d = DynamicAddress { list: list(v), address: pool(v / 3), timeout_secs: 60, added_by_rule: false };
+                        if dynamic.insert((d.list.clone(), d.address), d.clone()).is_none() {
+                            x.dynamic(&d, true);
+                        }
+                    }
+                    4 => {
+                        if let Some(k) = dynamic.keys().nth(usize::from(v) % dynamic.len().max(1)).cloned()
+                            && let Some(d) = dynamic.remove(&k)
+                        {
+                            x.dynamic(&d, false);
+                        }
+                    }
+                    _ => {
+                        let f = &mut cfg.ip.xdp.filter;
+                        f.block_lists = (0..v % 3).map(|k| list(k + v)).collect();
+                        f.allow_lists = vec![list(v / 3)];
+                    }
+                }
+                x.follow(&cfg, dynamic.values());
+                let (b, a) = x.take_changes();
+                for (map, changes) in maps.iter_mut().zip([b, a]) {
+                    for (n, held) in changes {
+                        match held {
+                            Some(i) => map.insert(n, i),
+                            None => map.remove(&n),
+                        };
+                    }
+                }
+                let dynv: Vec<DynamicAddress> = dynamic.values().cloned().collect();
+                let f = &cfg.ip.xdp.filter;
+                let want_b = prefixes(&cfg, &dynv, &f.block_lists);
+                let want_a = prefixes(&cfg, &dynv, &f.allow_lists);
+                let got: [Vec<(IpNet, u32)>; 2] = [
+                    maps[0].iter().map(|(n, i)| (*n, *i)).collect(),
+                    maps[1].iter().map(|(n, i)| (*n, *i)).collect(),
+                ];
+                proptest::prop_assert_eq!(&got[0], &want_b);
+                proptest::prop_assert_eq!(&got[1], &want_a);
+                proptest::prop_assert_eq!(x.all(), (want_b, want_a));
+            }
+        }
     }
 }
