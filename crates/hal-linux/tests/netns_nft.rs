@@ -92,7 +92,10 @@ fn firewall_is_applied_replaced_and_removed_atomically() {
     hal.apply(&empty, &fw_only).unwrap();
     let text = ruleset();
     assert!(text.contains("table inet corerouter"), "{text}");
-    assert_eq!(text.matches("comment \"cr:").count(), 25, "{text}");
+    assert_eq!(text.matches("comment \"cr:").count(), 31, "{text}");
+    // Raw (G2.1c): before conntrack, and notrack ends the chain.
+    assert!(text.contains("hook prerouting priority raw"), "{text}");
+    assert!(text.contains("notrack accept"), "{text}");
     assert!(text.contains("table inet someone-else"));
 
     // A dynamic entry survives a replace of the table.

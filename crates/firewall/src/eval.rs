@@ -51,6 +51,9 @@ pub enum Verdict {
     Reject,
     /// `masquerade`, `src-nat` or `dst-nat` took it (nat table).
     Nat,
+    /// Raw table: accepted without connection tracking; later chains see
+    /// `connection_state=untracked`.
+    Notrack,
 }
 
 impl Verdict {
@@ -197,6 +200,7 @@ pub fn walk(
                 Action::Masquerade { .. } | Action::SrcNat { .. } | Action::DstNat { .. } => {
                     return decided(Verdict::Nat);
                 }
+                Action::Notrack => return decided(Verdict::Notrack),
                 Action::Return => break,
                 Action::Jump { jump_target } => {
                     if stack.len() + 2 > MAX_DEPTH {

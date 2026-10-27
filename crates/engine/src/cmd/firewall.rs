@@ -1,4 +1,4 @@
-//! /ip firewall — filter, nat, mangle and address-list (G2.1).
+//! /ip firewall — filter, nat, mangle, raw (G2.1c) and address-list (G2.1).
 //!
 //! RouterOS names and syntax (`chain`, `action`, `src_address=!10.0.0.0/8`,
 //! `dst_port=80,443`, `connection_state=established,related`); one list for
@@ -119,6 +119,15 @@ per_table!(
     mangle_list,
     has_mangle
 );
+per_table!(
+    Table::Raw,
+    raw_add,
+    raw_set,
+    raw_remove,
+    raw_move,
+    raw_list,
+    has_raw
+);
 
 pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(
@@ -238,6 +247,45 @@ pub(super) const COMMANDS: &[CommandSpec] = &[
     cmd!(query "ip.firewall.mangle.list", "Mangle Rules", ["IP", "Firewall"], None,
         "{chain?: string} → [{id, position, chain, family, action, flags, disabled, invalid, reason, shadowed_by, zone, section, comment, summary, description, …}]",
         always, mangle_list),
+    cmd!(
+        "ip.firewall.raw.add",
+        "Add Raw Rule",
+        ["IP", "Firewall"],
+        None,
+        "{chain?: prerouting | output | <custom>, action?: accept | drop | notrack | jump | return | log | passthrough | add-src-to-address-list | add-dst-to-address-list (default accept), family?: both | ipv4 | ipv6, src_address?: [!]ip | cidr | ip-ip, dst_address?: [!]ip | cidr | ip-ip, src_address_list?: [!]name, dst_address_list?: [!]name, protocol?: [!]tcp | udp | icmp | icmpv6 | 0..255, src_port?: [!]ports, dst_port?: [!]ports, in_interface?: [!]interface, out_interface?: [!]interface, in_interface_list?: [!]list, out_interface_list?: [!]list, icmp_options?: type[:code], packet_mark?: [!]name, limit?: count/time[,burst], jump_target?: chain, log_prefix?: string, address_list?: name, address_list_timeout?: duration, disabled?: bool, comment?: string, section?: string, place_before?: *hex, force?: bool} → {id} (before connection tracking: no connection_* matchers)",
+        always,
+        raw_add
+    ),
+    cmd!(
+        "ip.firewall.raw.set",
+        "Set Raw Rule",
+        [],
+        None,
+        "{id: *hex, chain?, action?, family?, src_address?, dst_address?, src_address_list?, dst_address_list?, protocol?, src_port?, dst_port?, in_interface?, out_interface?, in_interface_list?, out_interface_list?, icmp_options?, packet_mark?, limit?, jump_target?, log_prefix?, address_list?, address_list_timeout?, disabled?: bool, comment?: string, section?: string, force?: bool} → {id} (same syntax as add; \"\" clears a matcher)",
+        has_raw,
+        raw_set
+    ),
+    cmd!(
+        "ip.firewall.raw.remove",
+        "Remove Raw Rule",
+        [],
+        None,
+        "{id: *hex, force?: bool} → {id}",
+        has_raw,
+        raw_remove
+    ),
+    cmd!(
+        "ip.firewall.raw.move",
+        "Move Raw Rule",
+        [],
+        None,
+        "{id: *hex, destination?: *hex (moved above it; absent = to the end), force?: bool} → {id, position}",
+        has_raw,
+        raw_move
+    ),
+    cmd!(query "ip.firewall.raw.list", "Raw Rules", ["IP", "Firewall"], None,
+        "{chain?: string} → [{id, position, chain, family, action, flags, disabled, invalid, reason, shadowed_by, zone, section, comment, summary, description, …}]",
+        always, raw_list),
     cmd!(
         "ip.firewall.address-list.add",
         "Add Address List Entry",

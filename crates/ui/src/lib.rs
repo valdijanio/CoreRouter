@@ -118,6 +118,7 @@ struct Tables {
     fw_filter: table::TableState,
     fw_nat: table::TableState,
     fw_mangle: table::TableState,
+    fw_raw: table::TableState,
     fw_addr: table::TableState,
     if_members: table::TableState,
     if_lists: table::TableState,
@@ -126,7 +127,7 @@ struct Tables {
 impl Tables {
     /// Every table with the salt it is drawn with (stored preferences name
     /// tables by salt).
-    fn each(&mut self) -> [(&'static str, &mut table::TableState); 10] {
+    fn each(&mut self) -> [(&'static str, &mut table::TableState); 11] {
         [
             (interfaces::TABLE, &mut self.interfaces),
             ("addresses", &mut self.addresses),
@@ -135,6 +136,7 @@ impl Tables {
             (firewall::Feed::Filter.salt(), &mut self.fw_filter),
             (firewall::Feed::Nat.salt(), &mut self.fw_nat),
             (firewall::Feed::Mangle.salt(), &mut self.fw_mangle),
+            (firewall::Feed::Raw.salt(), &mut self.fw_raw),
             (firewall::Feed::Addr.salt(), &mut self.fw_addr),
             (firewall::Feed::Members.salt(), &mut self.if_members),
             (firewall::Feed::Lists.salt(), &mut self.if_lists),
@@ -151,6 +153,7 @@ impl Tables {
             (firewall::Feed::Filter.salt(), &self.fw_filter),
             (firewall::Feed::Nat.salt(), &self.fw_nat),
             (firewall::Feed::Mangle.salt(), &self.fw_mangle),
+            (firewall::Feed::Raw.salt(), &self.fw_raw),
             (firewall::Feed::Addr.salt(), &self.fw_addr),
             (firewall::Feed::Members.salt(), &self.if_members),
             (firewall::Feed::Lists.salt(), &self.if_lists),
@@ -1209,6 +1212,7 @@ impl CoreRouterUi {
                 firewall::Tab::Filter => &mut self.tables.fw_filter,
                 firewall::Tab::Nat => &mut self.tables.fw_nat,
                 firewall::Tab::Mangle => &mut self.tables.fw_mangle,
+                firewall::Tab::Raw => &mut self.tables.fw_raw,
                 firewall::Tab::Addr => &mut self.tables.fw_addr,
                 firewall::Tab::Zones => return false,
                 firewall::Tab::Connections => {

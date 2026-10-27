@@ -11,7 +11,7 @@ Entregue em três PRs:
 |---|---|---|
 | G2.1a | Modelo, comandos, listas de interfaces, address-lists, render nftables, aplicação atômica, janelas Firewall e Interface List | este documento |
 | G2.1b | Aviso de lockout, regras sombreadas, configuração inicial segura, modelos prontos, modo por zonas, descrição em português e cores; ação `add-src/dst-to-address-list` e matcher `limit` | este documento (§6–§11) |
-| G2.1c | Testador de pacotes, contadores ao vivo com "último uso", prévia do diff do nftables | aberto |
+| G2.1c | Tabela raw (§13); testador de pacotes, contadores ao vivo com "último uso", rastrear pacote real, prévia do diff do nftables | raw: este documento (§13); o resto em andamento |
 
 ## 1. Diferenças em relação ao RouterOS
 
@@ -336,6 +336,44 @@ Detalhes:
 - **Top subscribers.** Conta as conexões e as portas públicas distintas de cada assinante, por
   protocolo; vale o protocolo mais cheio. O selo fica âmbar a partir de 70 % do bloco e vermelho a partir
   de 90 %. Um clique filtra a tabela por aquele assinante.
+
+## 13. Raw (G2.1c)
+
+`/ip firewall raw` do RouterOS: regras que rodam **antes do conntrack**. Chains nativas
+`prerouting` (tudo que chega) e `output` (o que o roteador envia); chains próprias por `jump`.
+
+| Comando | Faz |
+|---|---|
+| `ip.firewall.raw.{add,set,remove,move,list}` | como as outras tabelas; chain padrão `prerouting` |
+| `ip.firewall.template.raw-bogons {wan?, list?, private?, replace?, force?}` | address-list `bogons` com as origens reservadas (RFC 6890, 5737, 3849, 4291 §2.5; multicast nunca é origem) e, com `private`, RFC 1918, 6598 e 4193; seção `rawdef:` no topo da raw `prerouting` com `drop` da lista e da porta 0 TCP/UDP, vindo da lista `WAN`. Recusa com a `WAN` vazia; de novo só com `replace` |
+
+- **Ações:** `accept`, `drop`, `notrack`, `jump`, `return`, `log`, `passthrough`,
+  `add-src/dst-to-address-list` (as do RouterOS 7). `notrack` só existe na raw; `reject` não
+  (RouterOS também não).
+- **`notrack` termina a chain raw**, como `accept` no RouterOS ("o pacote casou: a ação vale e
+  as regras seguintes da chain não", exceto `passthrough`/`log`/address-list). No nftables vira
+  `notrack accept`; o `accept` vale só para a chain base `raw_prerouting`, o filter roda depois.
+- **Matchers ausentes:** `connection_state`, `connection_nat_state`, `connection_mark`,
+  `routing_mark` não estão no contrato dos comandos raw e o validador recusa numa config carregada
+  ("raw runs before connection tracking"); `packet_mark` fica (o RouterOS também tem).
+- **nftables:** `chain raw_prerouting { type filter hook prerouting priority raw; }` e
+  `raw_output` (`priority raw` = -300, antes do conntrack em -200). Testado num kernel real
+  (`netns_nft.rs`).
+- **Lockout (§6):** o engine também passa a conexão de gerência pela raw `prerouting` (chegada) e
+  `output` (resposta); e, se a raw dá `notrack` nela, os testes do filter usam
+  `connection_state=untracked` — um `notrack` na porta de gerência com o filter aceitando só
+  `established` e descartando a WAN é recusado com a regra do filter que cortaria.
+- **Avaliador (`eval`):** veredito `Notrack` (aceito sem conntrack), o mesmo que o testador de
+  pacotes usará para mostrar o caminho.
+- **GUI:** aba **Raw** (mesma tabela e diálogo das outras, sem os campos de conexão; ação
+  `notrack` em verde-azulado nos dois temas), assistente **Drop Bogons Before Conntrack** em
+  Templates, e um ⓘ ao lado das abas com a explicação de cada uma (catálogo
+  `i18n/auto/firewall_*.rs`).
+
+Desempenho (**medido**, `hal-linux/benches/netns_raw.rs`): 4096 fluxos UDP de 64 bytes
+encaminhados num netns sem root — com conntrack 1,17 Mpps, com `notrack` na raw 1,24 Mpps (+5 %);
+descartar a mesma inundação no filter `forward` 1,17 Mpps, na raw `prerouting` 1,55 Mpps (+32 %:
+o conntrack nem cria a entrada). Números em `docs/perf.md`.
 
 ## Histórico de revisão
 
